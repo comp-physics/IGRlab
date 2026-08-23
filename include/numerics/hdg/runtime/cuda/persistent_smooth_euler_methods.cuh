@@ -859,7 +859,8 @@ BindArenaViews() noexcept
     view_.face_h = generic && shape_.igr_active
         ? take_d(generic_arena_layout_.face_h) : nullptr;
   view_.status = take_d(generic ? generic_arena_layout_.elements : maximum_rank_elements);
-  view_.scalar = take_d(11);
+  view_.scalar = take_d(generic ? igr_conservation_result_scalars :
+      legacy_scalar_workspace_scalars);
   // Append the borrowed-only stabilization slice after every frozen W8A
   // allocation.  False mode therefore preserves the exact legacy arena
   // partition, offsets, and resource evidence tokens.

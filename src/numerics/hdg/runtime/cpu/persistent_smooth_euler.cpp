@@ -4625,6 +4625,7 @@ struct detail::CpuNumericsCore::Implementation
     if (!IsBorrowed()) { return true; }
     std::array<double, 5> local_balance{};
     std::array<double, 5> local_scale{};
+    double local_domain_measure = 0.0;
     bool local_ok = Finite(dt) && dt > 0.0 && external_source != nullptr;
     try
     {
@@ -4691,6 +4692,7 @@ struct detail::CpuNumericsCore::Implementation
             local_ok = false;
             break;
           }
+          local_domain_measure += weight;
           for (int component = 0;
                component < cpu_conserved_components; ++component)
           {
@@ -4904,12 +4906,14 @@ struct detail::CpuNumericsCore::Implementation
       local_ok = false;
     }
     if (!CollectiveAll(local_ok && Finite(local_balance) &&
-                       Finite(local_scale)))
+                       Finite(local_scale) && Finite(local_domain_measure) &&
+                       local_domain_measure >= 0.0))
     {
       return false;
     }
     std::array<double, 5> global_balance{};
     std::array<double, 5> global_scale{};
+    double global_domain_measure = 0.0;
     const int balance_status = MPI_Allreduce(
         local_balance.data(), global_balance.data(),
         static_cast<int>(global_balance.size()), MPI_DOUBLE, MPI_SUM,
@@ -4918,9 +4922,15 @@ struct detail::CpuNumericsCore::Implementation
         local_scale.data(), global_scale.data(),
         static_cast<int>(global_scale.size()), MPI_DOUBLE, MPI_SUM,
         communicator);
+    const int measure_status = MPI_Allreduce(
+        &local_domain_measure, &global_domain_measure, 1, MPI_DOUBLE,
+        MPI_SUM, communicator);
     if (!CollectiveAll(balance_status == MPI_SUCCESS &&
                        scale_status == MPI_SUCCESS &&
-                       Finite(global_balance) && Finite(global_scale)))
+                       measure_status == MPI_SUCCESS &&
+                       Finite(global_balance) && Finite(global_scale) &&
+                       Finite(global_domain_measure) &&
+                       global_domain_measure > 0.0))
     {
       return false;
     }
@@ -4928,7 +4938,9 @@ struct detail::CpuNumericsCore::Implementation
     for (int component = 0; component < components; ++component)
     {
       const double error = std::abs(global_balance[component]);
-      const double relative = error / (1.0 + global_scale[component]);
+      const double relative =
+          dg::hdg::generic::EulerHdgConservationRelativeError(
+              error, global_scale[component], global_domain_measure);
       maximum_error = std::max(maximum_error, error);
       maximum_relative_error = std::max(maximum_relative_error, relative);
     }

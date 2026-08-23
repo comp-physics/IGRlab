@@ -45,8 +45,9 @@ struct CudaPreparedIgrConservationCapture
   std::vector<double> previous_interior{};
   std::vector<double> current_interior{};
   std::vector<double> current_local_trace{};
-  std::array<double, 11> production_local{};
-  std::array<double, 11> probed_production_local{};
+  std::array<double, igr_conservation_result_scalars> production_local{};
+  std::array<double, igr_conservation_result_scalars>
+      probed_production_local{};
 };
 
 // This accessor is defined only in the qualification translation unit.  The
@@ -662,7 +663,11 @@ struct CudaQualificationTestAccess
         engine.pending_.numerical.maximum_conservation_error;
     capture.lifecycle_maximum_relative_error =
         engine.pending_.numerical.maximum_conservation_relative_error;
-    local_valid = copied && capture.production_local[10] == 1.0 &&
+    local_valid = copied &&
+        capture.production_local[
+            igr_conservation_result_scalars - 1] == 1.0 &&
+        std::isfinite(capture.production_local[2 * igr_trace_components]) &&
+        capture.production_local[2 * igr_trace_components] >= 0.0 &&
         std::all_of(capture.production_local.begin(),
                     capture.production_local.end(),
                     [](const double value) { return std::isfinite(value); });
@@ -727,7 +732,10 @@ struct CudaQualificationTestAccess
     const bool restored_everywhere = numerics.CollectiveContinue(
         trace_restored && scalar_restored && restore_synchronized);
     const bool probe_finite = probe_copied_everywhere &&
-        capture.probed_production_local[10] == 1.0 &&
+        capture.probed_production_local[
+            igr_conservation_result_scalars - 1] == 1.0 &&
+        capture.probed_production_local[2 * igr_trace_components] ==
+            capture.production_local[2 * igr_trace_components] &&
         std::all_of(capture.probed_production_local.begin(),
                     capture.probed_production_local.end(),
                     [](const double value) { return std::isfinite(value); });
@@ -1150,6 +1158,7 @@ using dg::hdg::runtime::cuda_w8a::PersistentCudaSmoothEulerEngine;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedIgrConservationCapture;
 using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
+using dg::hdg::runtime::cuda_w8a::igr_trace_components;
 using dg::hdg::runtime::cuda_w8a::detail::qualification_density_gate;
 
 constexpr int components = dg::hdg::generic::euler_2d_conserved_components;
@@ -1627,6 +1636,12 @@ struct IndependentIgrConservationResult
   std::array<double, 5> production_scale{};
   std::array<double, 5> oracle_balance{};
   std::array<double, 5> oracle_scale{};
+  double production_domain_measure =
+      std::numeric_limits<double>::infinity();
+  double oracle_domain_measure =
+      std::numeric_limits<double>::infinity();
+  double domain_measure_discrepancy =
+      std::numeric_limits<double>::infinity();
   // Source components, Euler change, physical Euler flux, sigma/rho,
   // alpha*Q, and the physical auxiliary flux, respectively.
   std::array<double, 9> activity{};
@@ -1718,6 +1733,7 @@ bool VerifyIndependentIgrConservation(
   std::array<long double, 4> local_source_integral{};
   std::array<long double, 4> local_boundary_integral{};
   std::array<long double, 3> local_auxiliary_integral{};
+  long double local_domain_measure = 0.0L;
   long double local_probe_delta = 0.0L;
 
   try
@@ -1784,6 +1800,11 @@ bool VerifyIndependentIgrConservation(
         long double sigma = 0.0L;
         long double conservative_gradient[3][2] = {};
         local_valid = weight > 0.0L && std::isfinite(weight);
+        if (local_valid)
+        {
+          local_domain_measure += weight;
+          local_valid = std::isfinite(local_domain_measure);
+        }
         for (int scalar = 0;
              local_valid && scalar < capture.scalar_interior_dofs; ++scalar)
         {
@@ -2052,6 +2073,9 @@ bool VerifyIndependentIgrConservation(
   std::array<long double, 4> global_source_integral{};
   std::array<long double, 4> global_boundary_integral{};
   std::array<long double, 3> global_auxiliary_integral{};
+  const double production_local_domain_measure =
+      capture.production_local[2 * igr_trace_components];
+  long double global_domain_measure = 0.0L;
   const double production_local_probe_delta =
       capture.probed_production_local[4] - capture.production_local[4];
   long double global_probe_delta = 0.0L;
@@ -2066,6 +2090,12 @@ bool VerifyIndependentIgrConservation(
       MPI_SUM, request.communicator);
   const int oracle_scale_status = MPI_Allreduce(
       local_scale.data(), global_scale.data(), 5, MPI_LONG_DOUBLE,
+      MPI_SUM, request.communicator);
+  const int production_measure_status = MPI_Allreduce(
+      &production_local_domain_measure, &result.production_domain_measure,
+      1, MPI_DOUBLE, MPI_SUM, request.communicator);
+  const int oracle_measure_status = MPI_Allreduce(
+      &local_domain_measure, &global_domain_measure, 1, MPI_LONG_DOUBLE,
       MPI_SUM, request.communicator);
   const int activity_status = MPI_Allreduce(
       local_activity.data(), global_activity.data(), 9, MPI_LONG_DOUBLE,
@@ -2092,6 +2122,8 @@ bool VerifyIndependentIgrConservation(
       production_scale_status == MPI_SUCCESS &&
       oracle_balance_status == MPI_SUCCESS &&
       oracle_scale_status == MPI_SUCCESS &&
+      production_measure_status == MPI_SUCCESS &&
+      oracle_measure_status == MPI_SUCCESS &&
       activity_status == MPI_SUCCESS && change_status == MPI_SUCCESS &&
       source_status == MPI_SUCCESS && boundary_status == MPI_SUCCESS &&
       auxiliary_status == MPI_SUCCESS &&
@@ -2104,6 +2136,16 @@ bool VerifyIndependentIgrConservation(
   double production_maximum_relative_error = 0.0;
   result.maximum_balance_discrepancy = 0.0;
   result.maximum_scale_discrepancy = 0.0;
+  result.oracle_domain_measure = static_cast<double>(global_domain_measure);
+  result.domain_measure_discrepancy = std::abs(
+      result.production_domain_measure - result.oracle_domain_measure);
+  const double domain_measure_tolerance = 2.0e-11 *
+      (1.0 + std::abs(result.oracle_domain_measure));
+  parity = parity && std::isfinite(result.production_domain_measure) &&
+      result.production_domain_measure > 0.0 &&
+      std::isfinite(result.oracle_domain_measure) &&
+      result.oracle_domain_measure > 0.0 &&
+      result.domain_measure_discrepancy <= domain_measure_tolerance;
   std::array<double, 5> comparison_tolerance{};
   for (std::size_t component = 0; component < 5; ++component)
   {
@@ -2134,7 +2176,9 @@ bool VerifyIndependentIgrConservation(
         production_maximum_error, error);
     production_maximum_relative_error = std::max(
         production_maximum_relative_error,
-        error / (1.0 + result.production_scale[component]));
+        dg::hdg::generic::EulerHdgConservationRelativeError(
+            error, result.production_scale[component],
+            result.production_domain_measure));
   }
   for (std::size_t index = 0; index < result.activity.size(); ++index)
     result.activity[index] = static_cast<double>(global_activity[index]);

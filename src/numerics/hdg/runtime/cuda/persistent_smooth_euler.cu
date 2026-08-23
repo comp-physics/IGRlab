@@ -2020,13 +2020,14 @@ __global__ void MaximumWaveKernel(CudaDeviceView v,CudaMeshShape s,
 // thread deliberately accumulates in element/quadrature order so the device
 // result mirrors the CPU reference reduction without a second assembler or
 // nondeterministic atomics.  out[0:5] are balances, out[5:10] their scales,
-// and out[10] is the finite/admissibility flag.
+// out[10] is the domain measure, and out[11] is the validity flag.
 __global__ void IgrConservationKernel(CudaDeviceView v, CudaMeshShape s,
                                       const double dt, double* out)
 {
   if (blockIdx.x || threadIdx.x) return;
-  constexpr int components = 5;
-  for (int index = 0; index < 2 * components; ++index) out[index] = 0.0;
+  constexpr int components = igr_trace_components;
+  static_assert(igr_conservation_result_scalars == 2 * components + 2);
+  for (int index = 0; index < 2 * components + 1; ++index) out[index] = 0.0;
   bool valid = s.igr_active && isfinite(dt) && dt > 0.0 &&
       v.face_h != nullptr;
   const double degree_scale = static_cast<double>(
@@ -2070,6 +2071,7 @@ __global__ void IgrConservationKernel(CudaDeviceView v, CudaMeshShape s,
       valid = weight > 0.0 && isfinite(weight) &&
           current[0] > cuda_density_gate &&
           isfinite(sigma);
+      if (valid) out[2 * components] += weight;
       for (int component = 0;
            component < conserved_components && valid; ++component)
       {
@@ -2182,7 +2184,7 @@ __global__ void IgrConservationKernel(CudaDeviceView v, CudaMeshShape s,
   }
   for (int index = 0; index < 2 * components; ++index)
     valid = valid && isfinite(out[index]);
-  out[10] = valid ? 1.0 : 0.0;
+  out[igr_conservation_result_scalars - 1] = valid ? 1.0 : 0.0;
 }
 __global__ void HashKernel(const double* values,int count,std::uint64_t* out)
 {if(blockIdx.x||threadIdx.x)return;std::uint64_t h[4]={1469598103934665603ULL,1099511628211ULL^0x9e3779b97f4a7c15ULL,1469598103934665603ULL^0xd6e8feb86659fd93ULL,1099511628211ULL^0xa0761d6478bd642fULL};const unsigned char* bytes=reinterpret_cast<const unsigned char*>(values);for(int i=0;i<count*static_cast<int>(sizeof(double));++i)for(int lane=0;lane<4;++lane){h[lane]^=static_cast<std::uint64_t>(bytes[i]+17U*lane);h[lane]*=1099511628211ULL+2ULL*lane;}for(int lane=0;lane<4;++lane)out[lane]=h[lane];}

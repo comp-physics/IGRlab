@@ -105,6 +105,28 @@ constexpr int EulerHdgKrylovRestartDimension(
   return std::min(100, std::max(20, global_true_trace_size));
 }
 
+/**
+ * Normalize a global conservation defect by an extensive FP64 reference.
+ *
+ * The domain measure supplies the absolute part of the mixed scale.  Unlike
+ * a literal `1 + balance_scale`, both numerator and denominator therefore
+ * grow by the same factor when an otherwise identical problem is replicated
+ * over a larger domain.
+ */
+inline double EulerHdgConservationRelativeError(
+    const double absolute_error, const double balance_scale,
+    const double domain_measure) noexcept
+{
+  if (!std::isfinite(absolute_error) || absolute_error < 0.0 ||
+      !std::isfinite(balance_scale) || balance_scale < 0.0 ||
+      !std::isfinite(domain_measure) || !(domain_measure > 0.0))
+    return std::numeric_limits<double>::infinity();
+  const double denominator = domain_measure + balance_scale;
+  return std::isfinite(denominator) && denominator > 0.0
+      ? absolute_error / denominator
+      : std::numeric_limits<double>::infinity();
+}
+
 enum class ContractStatus : std::uint8_t
 {
   accepted,

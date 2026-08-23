@@ -1728,9 +1728,9 @@ public:
   {
     maximum_error = 0.0;
     maximum_relative_error = 0.0;
-    constexpr int components = 5;
-    constexpr int result_scalars = 2 * components + 1;
-    std::array<double, result_scalars> local{};
+    constexpr int components = igr_trace_components;
+    static_assert(igr_conservation_result_scalars == 2 * components + 2);
+    std::array<double, igr_conservation_result_scalars> local{};
     const bool launched = initialized_ && shape_.igr_active &&
         std::isfinite(dt) && dt > 0.0 &&
         CudaLaunchIgrConservation(view_, shape_, dt, view_.scalar) &&
@@ -1741,25 +1741,37 @@ public:
             CudaTransferCategory::scalar_diagnostic,
             CudaTransferSite::scalar_status) &&
         TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
-    bool local_valid = copied && local[2 * components] == 1.0;
-    for (int index = 0; local_valid && index < 2 * components; ++index)
+    bool local_valid = copied && local[2 * components + 1] == 1.0 &&
+        std::isfinite(local[2 * components]) &&
+        local[2 * components] >= 0.0;
+    for (int index = 0; local_valid && index <= 2 * components; ++index)
       local_valid = std::isfinite(local[static_cast<std::size_t>(index)]);
     if (!CollectiveContinue(local_valid)) return false;
     std::array<double, components> global_balance{};
     std::array<double, components> global_scale{};
+    double global_domain_measure = 0.0;
     const bool balance_reduced = MPI_Allreduce(
         local.data(), global_balance.data(), components, MPI_DOUBLE,
         MPI_SUM, communicator_) == MPI_SUCCESS;
     const bool scale_reduced = MPI_Allreduce(
         local.data() + components, global_scale.data(), components,
         MPI_DOUBLE, MPI_SUM, communicator_) == MPI_SUCCESS;
-    if (!CollectiveContinue(balance_reduced && scale_reduced)) return false;
+    const bool measure_reduced = MPI_Allreduce(
+        local.data() + 2 * components, &global_domain_measure, 1,
+        MPI_DOUBLE, MPI_SUM, communicator_) == MPI_SUCCESS;
+    if (!CollectiveContinue(balance_reduced && scale_reduced &&
+                            measure_reduced &&
+                            std::isfinite(global_domain_measure) &&
+                            global_domain_measure > 0.0))
+      return false;
     for (int component = 0; component < components; ++component)
     {
       const double error = std::abs(
           global_balance[static_cast<std::size_t>(component)]);
-      const double relative = error /
-          (1.0 + global_scale[static_cast<std::size_t>(component)]);
+      const double relative =
+          dg::hdg::generic::EulerHdgConservationRelativeError(
+              error, global_scale[static_cast<std::size_t>(component)],
+              global_domain_measure);
       maximum_error = std::max(maximum_error, error);
       maximum_relative_error = std::max(maximum_relative_error, relative);
     }
@@ -2100,16 +2112,20 @@ public:
     if (inject_at(CudaFailurePhase::diagnostics)) { return result; }
     if (shape_.igr_active)
     {
-      result.conservation = IgrConservationBalance(
+      const bool conservation_ready = IgrConservationBalance(
           attempt.dt, result.maximum_conservation_error,
-          result.maximum_conservation_relative_error) &&
-          result.maximum_conservation_relative_error <=
-              config.numerical_policy.conservation_relative_tolerance;
-      if (!CollectiveContinue(result.conservation))
+          result.maximum_conservation_relative_error);
+      if (!CollectiveContinue(conservation_ready))
       {
-        result.reason = FailureReason::success_gate;
+        result.candidate_ready = false;
+        result.conservation = false;
+        result.reason = FailureReason::backend_failure;
         return result;
       }
+      const bool local_conservation =
+          result.maximum_conservation_relative_error <=
+              config.numerical_policy.conservation_relative_tolerance;
+      result.conservation = CollectiveContinue(local_conservation);
     }
     const std::uint64_t current_allocation_events =
         AllocatorPolicy::AllocationEvents();
@@ -2140,7 +2156,8 @@ public:
         result.true_residual && result.conservation && result.telemetry;
     result.reason = result.success ? FailureReason::none :
         (!result.true_residual ? FailureReason::true_residual_gate
-                              : FailureReason::success_gate);
+         : !result.telemetry ? FailureReason::telemetry_gate
+                             : FailureReason::success_gate);
     if (!UpdateStateHashes(workspace))
     {
       result.success = false;
@@ -2938,7 +2955,8 @@ private:
           checked_add(doubles, layout.face_interior) && checked_add(doubles, layout.face_trace) &&
           checked_add(doubles, layout.face_weight) && checked_add(doubles, layout.face_normal) &&
           (!shape_.igr_active || checked_add(doubles, layout.face_h)) &&
-          checked_add(doubles, elements) && checked_add(doubles, 11) &&
+          checked_add(doubles, elements) &&
+          checked_add(doubles, igr_conservation_result_scalars) &&
           checked_add(doubles, layout.face_weight) &&
           (!shape_.borrowed_static_boundary_policies ||
            (checked_add(doubles, layout.boundary_reference) &&
