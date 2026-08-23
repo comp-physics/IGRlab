@@ -149,12 +149,14 @@ int main(int argc, char* argv[])
 #if DG_IGR_HAS_HDG_MAIN_BACKEND
   spec.make_hdg_case_data = [](const SmoothAdvectionOptions& opts,
                                 const dg_sim::CaseConfig& case_config,
-                                const dg_sim::CommonOptions&,
+                                const dg_sim::CommonOptions& options,
                                 const dg_sim::CaseContext& context)
   {
     MFEM_VERIFY(std::isfinite(opts.hdg_static_source),
                 "--hdg-static-source must be finite.");
     dg_sim::hdg::HdgEulerCaseData case_data;
+    case_data.numerical_policy =
+      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(options.order);
     case_data.initial_condition =
       MakeSmoothAdvectionInitialCondition(case_config.gamma);
     if (opts.hdg_static_source != 0.0)

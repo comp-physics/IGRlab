@@ -1,6 +1,7 @@
 #pragma once
 
 #include "numerics/hdg/generic/contract.hpp"
+#include "numerics/hdg/generic/session_contract.hpp"
 
 /**
  * @file numerics/hdg/runtime/cpu/persistent_smooth_euler.hpp
@@ -31,6 +32,8 @@ namespace dg::hdg::runtime::cpu
 
 namespace detail
 {
+
+struct CpuQualificationTestAccess;
 
 inline constexpr std::string_view cpu_runtime_layout_identity =
     "l2-interior.true-trace-owned.component-major.v1";
@@ -63,6 +66,11 @@ inline constexpr int cpu_maximum_newton_updates = 20;
 inline constexpr int cpu_maximum_line_search_trials = 13;
 inline constexpr double cpu_armijo_constant = 1.0e-4;
 inline constexpr double cpu_nonlinear_tolerance = 1.0e-10;
+// Zero retains the legacy size-derived GMRES cap for standalone routes.
+inline constexpr int cpu_maximum_linear_iterations = 0;
+inline constexpr double cpu_linear_relative_tolerance = 1.0e-12;
+inline constexpr double cpu_conservation_relative_tolerance =
+    cpu_nonlinear_tolerance;
 
 enum class CpuScenario : unsigned char
 {
@@ -123,6 +131,12 @@ struct CpuPersistentConfig
   double true_residual_tolerance = cpu_nonlinear_tolerance;
   bool allow_one_retry = true;
   bool force_private_scientific_gate_failure = false;
+  // These trailing controls leave all standalone aggregate/default routes on
+  // their exact pre-policy numerical settings.
+  int maximum_linear_iterations = cpu_maximum_linear_iterations;
+  double linear_relative_tolerance = cpu_linear_relative_tolerance;
+  double conservation_relative_tolerance =
+      cpu_conservation_relative_tolerance;
 };
 
 CpuPersistentConfig MakeCpuSmokeConfig() noexcept;
@@ -784,6 +798,18 @@ public:
                                 std::size_t&) const noexcept;
 
 private:
+  friend struct CpuQualificationTestAccess;
+  /**
+   * Central-difference audit of the live borrowed IGR assembler.  The
+   * qualification translation unit reaches it only through the private
+   * friend above; this method stages and publishes no solver state.
+   */
+  bool AuditBorrowedEulerAssemblerJacobian(
+      double relative_tolerance,
+      std::array<double, 6>& relative_errors) noexcept;
+  bool AuditLastBorrowedEulerConservation(
+      double& maximum_error, double& maximum_relative_error,
+      bool& gate) const noexcept;
   bool InitializeInternal(const CpuPersistentConfig&,
                           const RuntimeTupleDescriptor&,
                           const generic::EulerHdgRequest*,

@@ -170,10 +170,12 @@ int main(int argc, char* argv[])
 #if DG_IGR_HAS_HDG_MAIN_BACKEND
   spec.make_hdg_case_data = [](const SmoothAdvectionOptions& opts,
                                 const dg_sim::CaseConfig& case_config,
-                                const dg_sim::CommonOptions&,
+                                const dg_sim::CommonOptions& options,
                                 const dg_sim::CaseContext& context)
   {
     dg_sim::hdg::HdgEulerCaseData case_data;
+    case_data.numerical_policy =
+      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(options.order);
     case_data.initial_condition =
       MakeSmoothAdvectionInitialCondition(case_config.gamma);
     const auto markers = BuildSmoothAdvectionMarkers(context.Mesh());

@@ -14,6 +14,30 @@
 #include <utility>
 #include <vector>
 
+namespace dg::hdg::runtime::cpu::detail
+{
+
+struct CpuQualificationTestAccess
+{
+  static bool AuditLastConservation(
+      const CpuNumericsCore& core, double& maximum_error,
+      double& maximum_relative_error, bool& gate) noexcept
+  {
+    return core.AuditLastBorrowedEulerConservation(
+        maximum_error, maximum_relative_error, gate);
+  }
+
+  static bool VerifyAssemblerJacobian(
+      CpuNumericsCore& core, const double relative_tolerance,
+      std::array<double, 6>& relative_errors) noexcept
+  {
+    return core.AuditBorrowedEulerAssemblerJacobian(
+        relative_tolerance, relative_errors);
+  }
+};
+
+} // namespace dg::hdg::runtime::cpu::detail
+
 namespace
 {
 
@@ -64,6 +88,30 @@ bool NonperiodicExterior(const void* opaque,
       interior[2] * point.outward_normal[1];
   exterior[1] -= 2.0 * normal_velocity * point.outward_normal[0];
   exterior[2] -= 2.0 * normal_velocity * point.outward_normal[1];
+  return true;
+}
+
+bool FixedExteriorForAssemblerJacobianForTests(
+    const void* opaque,
+    const dg::hdg::generic::BoundaryPointView& point,
+    const double*, double* exterior) noexcept
+{
+  auto* const context = static_cast<BoundaryContext*>(const_cast<void*>(opaque));
+  if (context == nullptr || context->fail || point.space_dimension != 2 ||
+      point.position == nullptr || point.outward_normal == nullptr ||
+      point.boundary_attribute <= 0 || exterior == nullptr)
+  {
+    return false;
+  }
+  ++context->calls;
+  // The production physical-boundary Jacobian deliberately freezes the
+  // Euler exterior-state callback (Picard linearization).  Keep this test
+  // callback independent of the perturbed state so finite differences check
+  // that exact contract while still exercising every physical face row.
+  exterior[0] = 1.1;
+  exterior[1] = 0.03 * point.outward_normal[0];
+  exterior[2] = 0.03 * point.outward_normal[1];
+  exterior[3] = 2.9;
   return true;
 }
 
@@ -136,10 +184,41 @@ mfem::ParMesh MakePeriodicRankZeroOwnedBorrowedMesh(
   return mfem::ParMesh(communicator, periodic, partition.data());
 }
 
+struct ExactBorrowedEulerFields
+{
+  std::vector<double> initial;
+  std::vector<double> source;
+
+  ExactBorrowedEulerFields(const mfem::ParMesh& mesh, const int order,
+                           const std::array<double, 8>& initial_pattern,
+                           const std::array<double, 8>& source_pattern)
+  {
+    mfem::L2_FECollection collection(
+        order, 2, mfem::BasisType::GaussLegendre, mfem::FiniteElement::VALUE);
+    mfem::ParFiniteElementSpace space(
+        const_cast<mfem::ParMesh*>(&mesh), &collection, 4,
+        mfem::Ordering::byNODES);
+    const int scalar_dofs = space.GetVSize() / 4;
+    initial.resize(static_cast<std::size_t>(space.GetVSize()));
+    source.resize(static_cast<std::size_t>(space.GetVSize()));
+    for (int component = 0; component < 4; ++component)
+    {
+      for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+      {
+        const std::size_t destination = static_cast<std::size_t>(
+            component * scalar_dofs + scalar);
+        const std::size_t pattern = static_cast<std::size_t>(2 * component +
+                                                              scalar % 2);
+        initial[destination] = initial_pattern[pattern];
+        source[destination] = source_pattern[pattern];
+      }
+    }
+  }
+};
+
 EulerHdgRequest Request(const mfem::ParMesh& mesh, const int order,
                         BoundaryContext& boundary,
-                        const std::array<double, 8>& initial,
-                        const std::array<double, 8>& source)
+                        const ExactBorrowedEulerFields& fields)
 {
   EulerHdgRequest request{};
   request.mesh = &mesh;
@@ -147,9 +226,15 @@ EulerHdgRequest Request(const mfem::ParMesh& mesh, const int order,
   request.polynomial_order = order;
   request.backend = {BackendKind::cpu, -1};
   request.capabilities = cpu_capabilities;
-  request.initial_state = {initial.data(), initial.size(), 4};
-  request.source = {source.data(), source.size(), 4};
-  request.boundary = {&boundary, NonperiodicExterior};
+  request.initial_state = {fields.initial.empty() ? nullptr : fields.initial.data(),
+                           fields.initial.size(), 4};
+  request.initial_true_trace = {nullptr, 0, 4};
+  request.source = {fields.source.empty() ? nullptr : fields.source.data(),
+                    fields.source.size(), 4};
+  request.boundary = {
+      &boundary, NonperiodicExterior, {nullptr, 0, 0, 0.0}};
+  request.numerical_policy =
+      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
   return request;
 }
 
@@ -350,8 +435,12 @@ bool CheckBorrowedTraceRestrictsInterior()
         ? dg::hdg::generic::EulerFieldView{zero_local_initial.data(),
                                            zero_local_initial.size(), 4}
         : dg::hdg::generic::EulerFieldView{initial.data(), initial.size(), 4};
+    request.initial_true_trace = {nullptr, 0, 4};
     request.source = {nullptr, 0, 4};
-    request.boundary = {&boundary, NonperiodicExterior};
+    request.boundary = {
+        &boundary, NonperiodicExterior, {nullptr, 0, 0, 0.0}};
+    request.numerical_policy =
+        dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
     if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
         dg::hdg::generic::ContractStatus::accepted)
     {
@@ -359,8 +448,10 @@ bool CheckBorrowedTraceRestrictsInterior()
     }
     dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
     if (!core.InitializeBorrowedEuler(request)) return false;
-    if (core.evidence().tuple.stabilization.view() !=
-        "tau.llf.max-fixed-local.v1")
+    if (core.evidence().tuple.formulation.view() !=
+            "hdg.conventional.v1" ||
+        core.evidence().tuple.stabilization.view() !=
+            "tau.llf.max-fixed-local.v1")
     {
       return false;
     }
@@ -389,7 +480,8 @@ bool CheckOrdersAndDeterminism()
   for (int order = 1; order <= 3; ++order)
   {
     BoundaryContext context{};
-    EulerHdgRequest request = Request(mesh, order, context, initial, source);
+    ExactBorrowedEulerFields fields(mesh, order, initial, source);
+    EulerHdgRequest request = Request(mesh, order, context, fields);
     const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
     GenericEulerHdgCpuSession session;
     const auto initialized = session.Initialize(request);
@@ -482,8 +574,9 @@ bool CheckPreparedSessionLifecycle()
   const std::array<double, 8> source{{0.03, 0.04, 0.01, 0.02,
                                        0.00, 0.00, 0.05, 0.06}};
   BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
   GenericEulerHdgCpuSession session;
-  if (session.Initialize(Request(mesh, 1, boundary, initial, source)).status !=
+  if (session.Initialize(Request(mesh, 1, boundary, fields)).status !=
       GenericEulerCpuSessionStatus::initialized)
   {
     return false;
@@ -648,6 +741,141 @@ bool CheckPreparedSessionLifecycle()
   return true;
 }
 
+bool CheckCommittedExportLifecycle()
+{
+  GenericEulerHdgCpuSession uninitialized;
+  std::array<double, 4> unavailable{{1.0, 2.0, 3.0, 4.0}};
+  const auto unavailable_before = unavailable;
+  if (uninitialized.ExportCommittedInterior(
+          {unavailable.data(), unavailable.size()}) ||
+      unavailable != unavailable_before)
+  {
+    return false;
+  }
+
+  mfem::ParMesh mesh = MakeBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                        0.00, 0.01, 2.55, 2.62}};
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                       0.00, 0.00, 0.03, 0.04}};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  GenericEulerHdgCpuSession session;
+  if (session.Initialize(Request(mesh, 1, boundary, fields)).status !=
+      GenericEulerCpuSessionStatus::initialized)
+  {
+    return false;
+  }
+
+  const auto before_coordinates = session.coordinates();
+  std::vector<double> committed_before(fields.initial.size());
+  if (!session.ExportCommittedInterior(
+          {committed_before.data(), committed_before.size()}))
+  {
+    return false;
+  }
+
+  GenericEulerCpuPreparedStep prepared;
+  if (session.Prepare(0.005, prepared).status !=
+          GenericEulerCpuSessionStatus::prepared ||
+      session.coordinates().generation != before_coordinates.generation)
+  {
+    return false;
+  }
+  std::vector<double> committed_during_prepare(committed_before.size());
+  if (!session.ExportCommittedInterior(
+          {committed_during_prepare.data(), committed_during_prepare.size()}) ||
+      committed_during_prepare != committed_before ||
+      session.Abort(std::move(prepared)).status !=
+          GenericEulerCpuSessionStatus::aborted)
+  {
+    return false;
+  }
+
+  if (session.Advance(0.007).status != GenericEulerCpuSessionStatus::advanced)
+  {
+    return false;
+  }
+  std::vector<double> committed_after_first_export(committed_before.size());
+  if (!session.ExportCommittedInterior(
+          {committed_after_first_export.data(),
+           committed_after_first_export.size()}))
+  {
+    return false;
+  }
+  const auto after_coordinates = session.coordinates();
+  std::vector<double> committed_after_second_export(committed_before.size());
+  return after_coordinates.step == 1 &&
+      after_coordinates.generation == 1 && after_coordinates.dt == 0.007 &&
+      after_coordinates.time == 0.007 &&
+      session.ExportCommittedInterior(
+          {committed_after_second_export.data(),
+           committed_after_second_export.size()}) &&
+      committed_after_second_export == committed_after_first_export &&
+      session.coordinates().step == after_coordinates.step &&
+      session.coordinates().generation == after_coordinates.generation;
+}
+
+bool CheckCommittedExportZeroOwnedRank()
+{
+  mfem::ParMesh mesh = MakeRankZeroOwnedBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
+                                        0.0, 0.0, 2.5, 2.5}};
+  const std::array<double, 8> source{};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  GenericEulerHdgCpuSession session;
+  if (session.Initialize(Request(mesh, 1, boundary, fields)).status !=
+      GenericEulerCpuSessionStatus::initialized)
+  {
+    return false;
+  }
+  std::vector<double> committed(fields.initial.size(),
+                                std::numeric_limits<double>::quiet_NaN());
+  const bool exported = session.ExportCommittedInterior(
+      {committed.empty() ? nullptr : committed.data(), committed.size()});
+  return All(exported && committed == fields.initial);
+}
+
+bool CheckDefaultNumericalPolicyAdaptiveLinearCap()
+{
+  // p3 on this deliberately nontrivial mesh has a true trace larger than the
+  // historical literal 100 cap.  The default policy must preserve the older
+  // size-derived bound, while a positive request stays literal.
+  mfem::ParMesh mesh = MakeBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
+                                        0.0, 0.0, 2.5, 2.5}};
+  const std::array<double, 8> source{};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 3, initial, source);
+  EulerHdgRequest request = Request(mesh, 3, boundary, fields);
+  const auto default_policy = request.numerical_policy;
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  if (default_policy.maximum_linear_iterations != 0 ||
+      default_policy.linear_relative_tolerance != 1.0e-12 ||
+      default_policy.igr_assembly_quadrature_order != 12 ||
+      !core.InitializeBorrowedEuler(request))
+  {
+    return false;
+  }
+  const int global_true_trace = static_cast<int>(
+      core.evidence().global_owned_true_trace_coefficients);
+  if (global_true_trace <= 100 ||
+      dg::hdg::generic::ResolveEulerHdgMaximumLinearIterations(
+          default_policy.maximum_linear_iterations, global_true_trace) !=
+          global_true_trace)
+  {
+    return false;
+  }
+  constexpr int explicit_cap = 37;
+  request.numerical_policy.maximum_linear_iterations = explicit_cap;
+  return dg::hdg::generic::ValidEulerHdgNumericalPolicy(
+             request.numerical_policy) &&
+      dg::hdg::generic::ResolveEulerHdgMaximumLinearIterations(
+          request.numerical_policy.maximum_linear_iterations,
+          global_true_trace) == explicit_cap;
+}
+
 bool CheckPeriodicAnnotationsRemainTraceCouplings()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
@@ -655,7 +883,12 @@ bool CheckPeriodicAnnotationsRemainTraceCouplings()
                                        0.0, 0.0, 2.5, 2.5}};
   const std::array<double, 8> source{};
   BoundaryContext context{};
-  EulerHdgRequest request = Request(mesh, 1, context, initial, source);
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, context, fields);
+  request.numerical_policy.conventional_assembly_quadrature_order = 10;
+  request.numerical_policy.maximum_linear_iterations = 64;
+  request.numerical_policy.linear_relative_tolerance = 1.0e-11;
+  request.numerical_policy.true_residual_relative_tolerance = 1.0e-9;
   GenericEulerHdgCpuSession session;
   return session.Initialize(request).status ==
       GenericEulerCpuSessionStatus::initialized &&
@@ -664,7 +897,7 @@ bool CheckPeriodicAnnotationsRemainTraceCouplings()
       context.calls == 0;
 }
 
-bool CheckPrivateTracedScalarIgrLifecycle()
+bool CheckIgrExtensionLifecycle()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
   const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
@@ -672,8 +905,9 @@ bool CheckPrivateTracedScalarIgrLifecycle()
   const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
                                       0.00, 0.00, 0.03, 0.04}};
   BoundaryContext boundary{};
-  EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
-  request.regularization = {RegularizationKind::igr, 0.2, 0.4};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  request.numerical_policy.stabilization = {RegularizationKind::igr, 0.2, 0.4};
   GenericEulerHdgCpuSession session;
   const auto initialized = session.Initialize(request);
   if (initialized.status != GenericEulerCpuSessionStatus::initialized) return false;
@@ -703,10 +937,128 @@ bool CheckPrivateTracedScalarIgrLifecycle()
   return exported_before && exported_candidate && changed &&
       aborted.status == GenericEulerCpuSessionStatus::aborted && rollback &&
       committed.status == GenericEulerCpuSessionStatus::committed &&
-      second.status == GenericEulerCpuSessionStatus::advanced && boundary.calls == 0;
+      second.status == GenericEulerCpuSessionStatus::advanced &&
+      second.coordinates.step == 2 && second.coordinates.generation == 2 &&
+      boundary.calls == 0;
 }
 
-bool CheckPrivateTracedScalarIgrZeroLocal()
+bool CheckIgrExtensionConvergenceEvidence()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                       0.00, 0.01, 2.55, 2.62}};
+  // A nonzero static source exercises the conservative source balance rather
+  // than merely accepting the homogeneous periodic special case.
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                      0.00, 0.00, 0.03, 0.04}};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  request.numerical_policy.stabilization =
+      {RegularizationKind::igr, 0.2, 0.4};
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  if (!core.InitializeBorrowedEuler(request)) return false;
+  if (core.evidence().tuple.formulation.view() !=
+          "hdg.conventional.v1" ||
+      core.evidence().tuple.stabilization.view() !=
+          "igr.scalar.traced.alpha-beta.v1")
+  {
+    return false;
+  }
+  dg::hdg::runtime::StateCoordinates coordinates{};
+  std::uint64_t generation = 0;
+  if (!core.PrepareBorrowedEuler(0.001, coordinates, generation)) return false;
+  double maximum_wave_speed = 0.0;
+  double stable_dt = 0.0;
+  if (!core.CommitBorrowedEuler(generation, coordinates, maximum_wave_speed,
+                                stable_dt)) return false;
+  double maximum_conservation_error =
+      std::numeric_limits<double>::quiet_NaN();
+  double maximum_conservation_relative_error =
+      std::numeric_limits<double>::quiet_NaN();
+  bool conservation_gate = false;
+  const bool conservation_audited =
+      dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+          AuditLastConservation(
+              core, maximum_conservation_error,
+              maximum_conservation_relative_error, conservation_gate);
+  const auto& attempt = core.evidence().last_attempt;
+  return conservation_audited && conservation_gate && attempt.committed &&
+      attempt.nonlinear_updates > 1 &&
+      attempt.finite_gate && attempt.admissibility_gate &&
+      attempt.recovery_gate && attempt.nonlinear_gate &&
+      attempt.true_residual_gate &&
+      attempt.work.accepted_newton_updates ==
+          static_cast<std::uint64_t>(attempt.nonlinear_updates) &&
+      attempt.work.complete_factor_setups == attempt.work.complete_trace_solves &&
+      attempt.work.complete_trace_solves == attempt.work.complete_recoveries &&
+      attempt.final_nonlinear_residual <= attempt.initial_nonlinear_residual &&
+      std::isfinite(attempt.maximum_true_relative_residual) &&
+      attempt.maximum_true_relative_residual <= 1.0e-10 &&
+      std::isfinite(maximum_conservation_error) &&
+      std::isfinite(maximum_conservation_relative_error) &&
+      maximum_conservation_relative_error <= 1.0e-10 &&
+      boundary.calls == 0;
+}
+
+bool CheckIgrExtensionNumericalPolicy()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                       0.00, 0.01, 2.55, 2.62}};
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                      0.00, 0.00, 0.03, 0.04}};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  request.numerical_policy.stabilization =
+      {RegularizationKind::igr, 0.2, 0.4};
+  // Deliberately distinct policy controls ensure the IGR assembly,
+  // Krylov stopping, true-residual acceptance, and source conservation gates
+  // do not silently borrow the nonlinear tolerance or a helper default.
+  request.numerical_policy.igr_assembly_quadrature_order = 10;
+  request.numerical_policy.maximum_linear_iterations = 31;
+  request.numerical_policy.linear_relative_tolerance = 1.0e-12;
+  request.numerical_policy.true_residual_relative_tolerance = 1.0e-9;
+  request.numerical_policy.conservation_relative_tolerance = 1.0e-8;
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  if (!core.InitializeBorrowedEuler(request)) return false;
+  const bool selected_quadrature =
+      core.evidence().assembly_quadrature_order ==
+      request.numerical_policy.igr_assembly_quadrature_order;
+  dg::hdg::runtime::StateCoordinates coordinates{};
+  std::uint64_t generation = 0;
+  if (!core.PrepareBorrowedEuler(0.001, coordinates, generation)) return false;
+  double maximum_wave_speed = 0.0;
+  double stable_dt = 0.0;
+  if (!core.CommitBorrowedEuler(generation, coordinates, maximum_wave_speed,
+                                stable_dt)) return false;
+  double maximum_conservation_error =
+      std::numeric_limits<double>::quiet_NaN();
+  double maximum_conservation_relative_error =
+      std::numeric_limits<double>::quiet_NaN();
+  bool conservation_gate = false;
+  const bool conservation_audited =
+      dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+          AuditLastConservation(
+              core, maximum_conservation_error,
+              maximum_conservation_relative_error, conservation_gate);
+  const auto& attempt = core.evidence().last_attempt;
+  return selected_quadrature && conservation_audited && conservation_gate &&
+      std::isfinite(maximum_conservation_error) && attempt.committed &&
+      attempt.linear_iterations > 0 &&
+      attempt.linear_iterations <=
+          request.numerical_policy.maximum_linear_iterations *
+              static_cast<int>(attempt.work.complete_trace_solves) &&
+      attempt.maximum_true_relative_residual <=
+          request.numerical_policy.true_residual_relative_tolerance &&
+      maximum_conservation_relative_error <=
+          request.numerical_policy.conservation_relative_tolerance &&
+      maximum_conservation_relative_error >= 0.0 &&
+      boundary.calls == 0;
+}
+
+bool CheckIgrExtensionZeroLocal()
 {
   int ranks = 1;
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
@@ -716,8 +1068,9 @@ bool CheckPrivateTracedScalarIgrZeroLocal()
                                        0.0, 0.0, 2.5, 2.5}};
   const std::array<double, 8> source{};
   BoundaryContext boundary{};
-  EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
-  request.regularization = {RegularizationKind::igr, 0.2, 0.4};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  request.numerical_policy.stabilization = {RegularizationKind::igr, 0.2, 0.4};
   GenericEulerHdgCpuSession session;
   const auto initialized = session.Initialize(request);
   const auto advanced = initialized.status == GenericEulerCpuSessionStatus::initialized
@@ -728,10 +1081,11 @@ bool CheckPrivateTracedScalarIgrZeroLocal()
                                       MPI_MAX, mesh.GetComm());
   return initialized.status == GenericEulerCpuSessionStatus::initialized &&
       advanced.status == GenericEulerCpuSessionStatus::advanced &&
-      reduction == MPI_SUCCESS && any_empty == 1 && boundary.calls == 0;
+      reduction == MPI_SUCCESS && any_empty == 1 &&
+      boundary.calls == 0;
 }
 
-bool CheckPrivateTracedScalarIgrInitializationDeterminism()
+bool CheckIgrExtensionInitializationDeterminism()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
   const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
@@ -739,8 +1093,9 @@ bool CheckPrivateTracedScalarIgrInitializationDeterminism()
   const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
                                       0.00, 0.00, 0.03, 0.04}};
   BoundaryContext boundary{};
-  EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
-  request.regularization = {RegularizationKind::igr, 0.2, 0.4};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  request.numerical_policy.stabilization = {RegularizationKind::igr, 0.2, 0.4};
   mfem::L2_FECollection collection(1, 2, mfem::BasisType::GaussLegendre,
                                    mfem::FiniteElement::VALUE);
   mfem::ParFiniteElementSpace space(&mesh, &collection, 4,
@@ -764,6 +1119,58 @@ bool CheckPrivateTracedScalarIgrInitializationDeterminism()
   return first_ok && second_ok && first == second && boundary.calls == 0;
 }
 
+bool CheckUnifiedIgrAssemblerJacobianForTests()
+{
+  constexpr std::array<double, 8> initial{{
+      1.10, 1.12, 0.08, 0.09, -0.04, -0.03, 2.90, 2.95}};
+  constexpr std::array<double, 8> source{};
+  constexpr double relative_tolerance = 5.0e-5;
+  bool local = true;
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  for (int order = 1; order <= 3; ++order)
+    for (int boundary_case = 0; boundary_case < 2; ++boundary_case)
+    {
+      const bool physical_boundary = boundary_case != 0;
+      mfem::ParMesh mesh = physical_boundary
+          ? MakeBorrowedMesh() : MakePeriodicBorrowedMesh();
+      BoundaryContext boundary{};
+      ExactBorrowedEulerFields fields(mesh, order, initial, source);
+      EulerHdgRequest request = Request(mesh, order, boundary, fields);
+      request.boundary = {
+          &boundary, FixedExteriorForAssemblerJacobianForTests,
+          {nullptr, 0, 0, 0.0}};
+      request.numerical_policy.stabilization =
+          {RegularizationKind::igr, 0.2, 0.8};
+      dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+      std::array<double, 6> relative_errors{};
+      const bool initialized = core.InitializeBorrowedEuler(request);
+      const bool verified = initialized &&
+          dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+              VerifyAssemblerJacobian(
+                  core, relative_tolerance, relative_errors);
+      int global_boundary_calls = 0;
+      const bool calls_reduced = MPI_Allreduce(
+          &boundary.calls, &global_boundary_calls, 1, MPI_INT, MPI_SUM,
+          mesh.GetComm()) == MPI_SUCCESS;
+      const bool boundary_exercised = physical_boundary
+          ? global_boundary_calls > 0 : global_boundary_calls == 0;
+      if ((!verified || !calls_reduced || !boundary_exercised) && rank == 0)
+      {
+        std::cerr << "unified IGR assembler Jacobian check failed order="
+                  << order << " physical_boundary=" << physical_boundary
+                  << " initialized=" << initialized
+                  << " boundary_calls=" << global_boundary_calls
+                  << " errors=";
+        for (const double error : relative_errors)
+          std::cerr << ' ' << error;
+        std::cerr << '\n';
+      }
+      local = local && verified && calls_reduced && boundary_exercised;
+    }
+  return All(local);
+}
+
 bool CheckDynamicTauHighWaveTwoSteps()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
@@ -774,7 +1181,8 @@ bool CheckDynamicTauHighWaveTwoSteps()
   const std::array<double, 8> source{{0.03, 0.04, 0.01, 0.02,
                                        0.00, 0.00, 0.05, 0.06}};
   BoundaryContext context{};
-  EulerHdgRequest request = Request(mesh, 1, context, initial, source);
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, context, fields);
   const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
   GenericEulerHdgCpuSession session;
   return session.Initialize(request).status ==
@@ -794,13 +1202,18 @@ bool CheckClosedBoundaryPicardAssembly()
   const std::array<double, 8> source{{0.01, 0.02, 0.0, 0.0,
                                        0.0, 0.0, 0.03, 0.04}};
   BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
   const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
   dg::hdg::runtime::cpu::detail::ResetCpuGenericBoundaryPicardTestObservation();
-  const bool accepted = ExecuteGenericEulerHdgCpu(
-      Request(mesh, 1, boundary, initial, source));
-  // This executes the closed nonperiodic solve.  The production hook observes
-  // the actual assembled physical trace rows: one callback value per face
-  // quadrature point, C = 0, and a nonzero trace-mass D contribution.
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  request.numerical_policy.stabilization =
+      {RegularizationKind::igr, 0.2, 0.4};
+  const bool accepted = ExecuteGenericEulerHdgCpu(request);
+  // This executes the closed nonperiodic IGR-augmented solve.  The production
+  // hook observes the conventional Euler physical trace rows in the same
+  // system: one callback value per face quadrature point, C = 0, and a
+  // nonzero trace-mass D contribution.  The auxiliary trace row retains its
+  // homogeneous Neumann closure.
   return accepted && boundary.calls > 0 &&
       dg::hdg::runtime::cpu::detail::
           CpuGenericBoundaryPicardAssemblyObservedForTests() &&
@@ -817,8 +1230,9 @@ bool CheckZeroOwnedElementEngine()
                                         0.0, 0.0, 2.5, 2.5}};
   const std::array<double, 8> source{{}};
   BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
   const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
-  EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
   GenericEulerHdgCpuSession session;
   const bool accepted =
       session.Initialize(request).status ==
@@ -853,7 +1267,8 @@ bool CheckSubcommunicatorIsolation()
   {
     mfem::ParMesh mesh = MakeBorrowedMesh(subcommunicator);
     BoundaryContext boundary{};
-    EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+    ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+    EulerHdgRequest request = Request(mesh, 1, boundary, fields);
     const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
     GenericEulerHdgCpuSession session;
     GenericEulerCpuPreparedStep prepared;
@@ -909,7 +1324,8 @@ bool CheckBorrowedSessionDoesNotUseWorldCollectives()
     const std::array<double, 8> source{{}};
     mfem::ParMesh mesh = MakeBorrowedMesh(active_communicator);
     BoundaryContext boundary{};
-    EulerHdgRequest request = Request(mesh, 1, boundary, initial, source);
+    ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+    EulerHdgRequest request = Request(mesh, 1, boundary, fields);
     const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
     GenericEulerHdgCpuSession session;
     GenericEulerCpuPreparedStep prepared;
@@ -941,11 +1357,170 @@ bool CheckCollectiveMismatchAndAtomicFailure()
   int rank = 0;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   BoundaryContext boundary{};
-  EulerHdgRequest request = Request(mesh, rank == 0 ? 4 : 2, boundary,
-                                    initial, source);
+  const int order = rank == 0 ? 4 : 2;
+  ExactBorrowedEulerFields fields(mesh, order, initial, source);
+  EulerHdgRequest request = Request(mesh, order, boundary, fields);
   const bool rejected = !ExecuteGenericEulerHdgCpu(request);
   const bool restart_rejected = !RestartGenericEulerHdgCpu(request);
   return All(rejected && restart_rejected);
+}
+
+bool CheckCollectiveInitialTraceAdmission()
+{
+  int rank = 0;
+  int ranks = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  // This regression specifically exercises the two-rank split where a
+  // component-aligned external trace has the wrong local extent on one rank.
+  if (ranks != 2) { return true; }
+
+  mfem::ParMesh mesh = MakeBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
+                                        0.0, 0.0, 2.5, 2.5}};
+  const std::array<double, 8> source{{}};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
+
+  mfem::DG_Interface_FECollection trace_collection(
+      1, 2, mfem::FiniteElement::VALUE, mfem::BasisType::GaussLegendre);
+  mfem::ParFiniteElementSpace trace_space(
+      &mesh, &trace_collection, 4, mfem::Ordering::byNODES);
+  const std::size_t local_true_size = static_cast<std::size_t>(
+      trace_space.GetTrueVSize());
+  std::vector<double> supplied(local_true_size + (rank == 0 ? 4U : 0U), 0.0);
+  request.initial_true_trace = {
+      supplied.empty() ? nullptr : supplied.data(), supplied.size(), 4};
+
+  GenericEulerHdgCpuSession session;
+  const auto initialization = session.Initialize(request);
+  const auto coordinates = session.coordinates();
+  const bool rejected = initialization.status ==
+          GenericEulerCpuSessionStatus::rejected &&
+      coordinates.step == 0 && coordinates.generation == 0 &&
+      coordinates.time == 0.0 &&
+      session.Advance(0.013).status == GenericEulerCpuSessionStatus::rejected &&
+      SameBorrowedMesh(mesh, before, request.communicator);
+  return All(rejected);
+}
+
+bool CheckSuppliedInitialTraceWithZeroLocalExtent()
+{
+  int ranks = 1;
+  MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+  if (ranks != 2) { return true; }
+
+  mfem::ParMesh mesh = MakeRankZeroOwnedBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
+                                        0.0, 0.0, 2.5, 2.5}};
+  const std::array<double, 8> source{{}};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
+
+  mfem::DG_Interface_FECollection trace_collection(
+      1, 2, mfem::FiniteElement::VALUE, mfem::BasisType::GaussLegendre);
+  mfem::ParFiniteElementSpace trace_space(
+      &mesh, &trace_collection, 4, mfem::Ordering::byNODES);
+  const int local_true_size = trace_space.GetTrueVSize();
+  int has_empty_true_trace = local_true_size == 0 ? 1 : 0;
+  if (MPI_Allreduce(MPI_IN_PLACE, &has_empty_true_trace, 1, MPI_INT, MPI_MAX,
+                    mesh.GetComm()) != MPI_SUCCESS ||
+      has_empty_true_trace == 0)
+  {
+    return false;
+  }
+
+  // An external trace must be the same trace restriction used by the derived
+  // compatibility path.  A finite all-zero Uhat is shape-valid, but it is not
+  // admissible for this uniform positive Euler state.
+  mfem::L2_FECollection interior_collection(
+      1, 2, mfem::BasisType::GaussLegendre, mfem::FiniteElement::VALUE);
+  mfem::ParFiniteElementSpace interior_space(
+      &mesh, &interior_collection, 4, mfem::Ordering::byNODES);
+  mfem::ParGridFunction local_interior(&interior_space);
+  if (local_interior.Size() != static_cast<int>(fields.initial.size()))
+  {
+    return false;
+  }
+  for (int index = 0; index < local_interior.Size(); ++index)
+  {
+    local_interior[index] = fields.initial[static_cast<std::size_t>(index)];
+  }
+  mfem::ParGridFunction local_trace(&trace_space);
+  mfem::Vector projected_true_trace(local_true_size);
+  local_trace = 0.0;
+  for (int face = 0; face < mesh.GetNumFaces(); ++face)
+  {
+    mfem::FaceElementTransformations* const transformations =
+        mesh.GetFaceElementTransformations(face);
+    const mfem::FiniteElement* const trace_element =
+        trace_space.GetFaceElement(face);
+    if (!transformations || !trace_element || transformations->Elem1No < 0 ||
+        transformations->Elem1No >= mesh.GetNE())
+    {
+      return false;
+    }
+    const mfem::FiniteElement* const interior_element =
+        interior_space.GetFE(transformations->Elem1No);
+    mfem::Array<int> interior_vdofs;
+    mfem::Array<int> trace_vdofs;
+    interior_space.GetElementVDofs(transformations->Elem1No, interior_vdofs);
+    trace_space.GetFaceVDofs(face, trace_vdofs);
+    if (!interior_element ||
+        interior_vdofs.Size() != 4 * interior_element->GetDof() ||
+        trace_vdofs.Size() != 4 * trace_element->GetDof())
+    {
+      return false;
+    }
+    mfem::Vector shape(interior_element->GetDof());
+    const mfem::IntegrationRule& nodes = trace_element->GetNodes();
+    for (int scalar = 0; scalar < trace_element->GetDof(); ++scalar)
+    {
+      const mfem::IntegrationPoint& point = nodes.IntPoint(scalar);
+      transformations->SetAllIntPoints(&point);
+      interior_element->CalcShape(transformations->GetElement1IntPoint(), shape);
+      for (int component = 0; component < 4; ++component)
+      {
+        double restricted = 0.0;
+        for (int interior_scalar = 0;
+             interior_scalar < interior_element->GetDof(); ++interior_scalar)
+        {
+          double sign = 1.0;
+          const int dof = mfem::FiniteElementSpace::DecodeDof(
+              interior_vdofs[ByNodes(interior_scalar,
+                                     interior_element->GetDof(), component)],
+              sign);
+          if (dof < 0 || dof >= local_interior.Size()) return false;
+          restricted += shape[interior_scalar] * sign * local_interior[dof];
+        }
+        double sign = 1.0;
+        const int dof = mfem::FiniteElementSpace::DecodeDof(
+            trace_vdofs[ByNodes(scalar, trace_element->GetDof(), component)],
+            sign);
+        if (dof < 0 || dof >= local_trace.Size()) return false;
+        local_trace[dof] = sign * restricted;
+      }
+    }
+  }
+  local_trace.ParallelProject(projected_true_trace);
+  const double* const projected = projected_true_trace.HostRead();
+  if (projected == nullptr && projected_true_trace.Size() != 0) return false;
+  std::vector<double> supplied;
+  if (projected_true_trace.Size() != 0)
+  {
+    supplied.assign(projected, projected + projected_true_trace.Size());
+  }
+  request.initial_true_trace = {
+      supplied.empty() ? nullptr : supplied.data(), supplied.size(), 4};
+
+  GenericEulerHdgCpuSession session;
+  const bool initialized = session.Initialize(request).status ==
+      GenericEulerCpuSessionStatus::initialized;
+  return All(initialized && SameBorrowedMesh(mesh, before, request.communicator));
 }
 
 bool CheckAcceptedRequestRankLocalCallbackFailure()
@@ -961,8 +1536,9 @@ bool CheckAcceptedRequestRankLocalCallbackFailure()
   // The request itself is collectively admitted.  Only the boundary callback
   // fails on rank zero; every rank must return rather than entering a lone
   // neighbor exchange.
+  ExactBorrowedEulerFields fields(mesh, 2, initial, source);
   const bool rejected = !ExecuteGenericEulerHdgCpu(
-      Request(mesh, 2, boundary, initial, source));
+      Request(mesh, 2, boundary, fields));
   return All(rejected);
 }
 
@@ -975,24 +1551,43 @@ int main(int argc, char* argv[])
   const bool trace_restriction = CheckBorrowedTraceRestrictsInterior();
   const bool orders = CheckOrdersAndDeterminism();
   const bool prepared_lifecycle = CheckPreparedSessionLifecycle();
+  const bool committed_export = CheckCommittedExportLifecycle();
+  const bool committed_export_zero_owned =
+      CheckCommittedExportZeroOwnedRank();
+  const bool default_numerical_policy =
+      CheckDefaultNumericalPolicyAdaptiveLinearCap();
   const bool periodic = CheckPeriodicAnnotationsRemainTraceCouplings();
-  const bool private_igr = CheckPrivateTracedScalarIgrLifecycle();
-  const bool private_igr_zero_local = CheckPrivateTracedScalarIgrZeroLocal();
-  const bool private_igr_initialization =
-      CheckPrivateTracedScalarIgrInitializationDeterminism();
+  const bool igr_extension = CheckIgrExtensionLifecycle();
+  const bool igr_extension_convergence =
+      CheckIgrExtensionConvergenceEvidence();
+  const bool igr_extension_numerical_policy =
+      CheckIgrExtensionNumericalPolicy();
+  const bool igr_extension_zero_local = CheckIgrExtensionZeroLocal();
+  const bool igr_extension_initialization =
+      CheckIgrExtensionInitializationDeterminism();
+  const bool igr_assembler_jacobian =
+      CheckUnifiedIgrAssemblerJacobianForTests();
   const bool dynamic_tau = CheckDynamicTauHighWaveTwoSteps();
   const bool boundary_picard = CheckClosedBoundaryPicardAssembly();
   const bool zero_owned = CheckZeroOwnedElementEngine();
   const bool subcommunicator = CheckSubcommunicatorIsolation();
   const bool passive_world = CheckBorrowedSessionDoesNotUseWorldCollectives();
   const bool mismatch = CheckCollectiveMismatchAndAtomicFailure();
+  const bool initial_trace_admission = CheckCollectiveInitialTraceAdmission();
+  const bool initial_trace_zero_local =
+      CheckSuppliedInitialTraceWithZeroLocalExtent();
   const bool callback_failure = CheckAcceptedRequestRankLocalCallbackFailure();
   const bool local = boundary_semantics && trace_restriction && orders &&
       prepared_lifecycle &&
-      periodic && private_igr && private_igr_zero_local &&
-      private_igr_initialization && dynamic_tau && boundary_picard &&
+      committed_export && committed_export_zero_owned &&
+      default_numerical_policy &&
+      periodic && igr_extension && igr_extension_zero_local &&
+      igr_extension_convergence &&
+      igr_extension_numerical_policy &&
+      igr_extension_initialization && igr_assembler_jacobian && dynamic_tau &&
+      boundary_picard &&
       zero_owned && subcommunicator && passive_world && mismatch &&
-      callback_failure;
+      initial_trace_admission && initial_trace_zero_local && callback_failure;
   if (!All(local))
   {
     int rank = 0;
@@ -1001,16 +1596,27 @@ int main(int argc, char* argv[])
               << " boundary_semantics=" << boundary_semantics
               << " trace_restriction=" << trace_restriction
               << " orders=" << orders << " periodic=" << periodic
-              << " private_igr=" << private_igr
-              << " private_igr_zero_local=" << private_igr_zero_local
-              << " private_igr_initialization=" << private_igr_initialization
+              << " igr_extension=" << igr_extension
+              << " igr_extension_convergence=" << igr_extension_convergence
+              << " igr_extension_numerical_policy="
+              << igr_extension_numerical_policy
+              << " igr_extension_zero_local=" << igr_extension_zero_local
+              << " igr_extension_initialization="
+              << igr_extension_initialization
+              << " igr_assembler_jacobian=" << igr_assembler_jacobian
               << " prepared_lifecycle=" << prepared_lifecycle
+              << " committed_export=" << committed_export
+              << " committed_export_zero_owned="
+              << committed_export_zero_owned
+              << " default_numerical_policy=" << default_numerical_policy
               << " dynamic_tau=" << dynamic_tau
               << " boundary_picard=" << boundary_picard
               << " zero_owned=" << zero_owned
               << " passive_world=" << passive_world
               << " subcommunicator=" << subcommunicator
               << " mismatch=" << mismatch
+              << " initial_trace_admission=" << initial_trace_admission
+              << " initial_trace_zero_local=" << initial_trace_zero_local
               << " callback_failure=" << callback_failure << '\n';
     return 1;
   }

@@ -52,7 +52,7 @@ bool DGHyperbolicConservationLaws::BuildBoundaryPolicyData_()
   }
 
   face_bdr_type_by_attr_.SetSize(face_bdr_max_attr_ + 1);
-  face_bdr_type_by_attr_ = static_cast<int>(DeviceBoundaryType::Unsupported);
+  face_bdr_type_by_attr_ = static_cast<int>(DeviceBoundaryType::unsupported);
   face_bdr_gamma_by_attr_.SetSize(face_bdr_max_attr_ + 1);
   face_bdr_gamma_by_attr_ = 0.0;
   face_bdr_pressure_by_attr_.SetSize(face_bdr_max_attr_ + 1);
@@ -84,7 +84,7 @@ bool DGHyperbolicConservationLaws::BuildBoundaryPolicyData_()
     if (auto* inlet = dynamic_cast<const SupersonicInletState*>(&bc))
     {
       face_bdr_type_by_attr_[attr] =
-        static_cast<int>(DeviceBoundaryType::SupersonicInlet);
+        static_cast<int>(DeviceBoundaryType::supersonic_inlet);
       face_bdr_gamma_by_attr_(attr) = dgsem_gamma_;
       set_state(attr, inlet->GetInletState());
       continue;
@@ -92,14 +92,14 @@ bool DGHyperbolicConservationLaws::BuildBoundaryPolicyData_()
     if (dynamic_cast<const SupersonicOutletState*>(&bc))
     {
       face_bdr_type_by_attr_[attr] =
-        static_cast<int>(DeviceBoundaryType::SupersonicOutlet);
+        static_cast<int>(DeviceBoundaryType::supersonic_outlet);
       face_bdr_gamma_by_attr_(attr) = dgsem_gamma_;
       continue;
     }
     if (auto* outlet_p = dynamic_cast<const SubsonicOutletPressureState*>(&bc))
     {
       face_bdr_type_by_attr_[attr] =
-        static_cast<int>(DeviceBoundaryType::SubsonicOutletPressure);
+        static_cast<int>(DeviceBoundaryType::subsonic_outlet_pressure);
       face_bdr_gamma_by_attr_(attr) = outlet_p->GetGamma();
       face_bdr_pressure_by_attr_(attr) = outlet_p->GetOutletPressure();
       continue;
@@ -107,7 +107,7 @@ bool DGHyperbolicConservationLaws::BuildBoundaryPolicyData_()
     if (auto* outlet_nr = dynamic_cast<const NonReflectingOutletState*>(&bc))
     {
       face_bdr_type_by_attr_[attr] =
-        static_cast<int>(DeviceBoundaryType::NonReflectingOutlet);
+        static_cast<int>(DeviceBoundaryType::nonreflecting_outlet);
       face_bdr_gamma_by_attr_(attr) = outlet_nr->GetGamma();
       set_state(attr, outlet_nr->GetReferenceState());
       continue;
@@ -115,21 +115,23 @@ bool DGHyperbolicConservationLaws::BuildBoundaryPolicyData_()
     if (auto* inlet_sub = dynamic_cast<const SubsonicInletState*>(&bc))
     {
       face_bdr_type_by_attr_[attr] =
-        static_cast<int>(DeviceBoundaryType::SubsonicInlet);
+        static_cast<int>(DeviceBoundaryType::subsonic_inlet);
       face_bdr_gamma_by_attr_(attr) = inlet_sub->GetGamma();
       set_state(attr, inlet_sub->GetInletState());
       continue;
     }
     if (auto* far = dynamic_cast<const FarFieldState*>(&bc))
     {
-      face_bdr_type_by_attr_[attr] = static_cast<int>(DeviceBoundaryType::FarField);
+      face_bdr_type_by_attr_[attr] =
+        static_cast<int>(DeviceBoundaryType::far_field);
       face_bdr_gamma_by_attr_(attr) = far->GetGamma();
       set_state(attr, far->GetFarFieldState());
       continue;
     }
     if (dynamic_cast<const SlipWallState*>(&bc))
     {
-      face_bdr_type_by_attr_[attr] = static_cast<int>(DeviceBoundaryType::SlipWall);
+      face_bdr_type_by_attr_[attr] =
+        static_cast<int>(DeviceBoundaryType::slip_wall);
       face_bdr_gamma_by_attr_(attr) = dgsem_gamma_;
       continue;
     }
@@ -142,7 +144,7 @@ bool DGHyperbolicConservationLaws::BuildBoundaryPolicyData_()
   {
     const int attr = bdr_attr[i];
     if (attr <= 0 || attr > face_bdr_max_attr_ ||
-        bdr_type[attr] == static_cast<int>(DeviceBoundaryType::Unsupported))
+        bdr_type[attr] == static_cast<int>(DeviceBoundaryType::unsupported))
     {
       return false;
     }

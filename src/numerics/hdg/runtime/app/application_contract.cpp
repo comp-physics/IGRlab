@@ -129,9 +129,7 @@ bool ComputeApplicationConfigHashes(
   if (!scientific.Text(
           smooth_transition ? "DGIGR-HDG-W8C-SMOOTH-SCIENTIFIC-CONFIG-V2" :
           w8c_case ? "DGIGR-HDG-W8C-SCIENTIFIC-CONFIG-V1" :
-          scenario == ApplicationScenarioV1::scalar_igr_sc25_v3
-              ? "DGIGR-HDG-W8B-SCALAR-IGR-SCIENTIFIC-CONFIG-V1"
-              : "DGIGR-HDG-W8A-SCIENTIFIC-CONFIG-V1") ||
+          "DGIGR-HDG-W8A-SCIENTIFIC-CONFIG-V1") ||
       !scientific.Text(options.card_id) || !scientific.Text(options.case_id) ||
       !scientific.U8(static_cast<std::uint8_t>(scenario)) ||
       !scientific.U8(static_cast<std::uint8_t>(options.interior_space)) ||
@@ -173,9 +171,7 @@ bool ComputeApplicationConfigHashes(
   if (!run.Text(
           smooth_transition ? "DGIGR-HDG-W8C-SMOOTH-RUN-CONFIG-V2" :
           w8c_case ? "DGIGR-HDG-W8C-RUN-CONFIG-V1" :
-          scenario == ApplicationScenarioV1::scalar_igr_sc25_v3
-              ? "DGIGR-HDG-W8B-SCALAR-IGR-RUN-CONFIG-V1"
-              : "DGIGR-HDG-W8A-RUN-CONFIG-V1") ||
+          "DGIGR-HDG-W8A-RUN-CONFIG-V1") ||
       !run.Hash(hashes.scientific) ||
       !run.U8(static_cast<std::uint8_t>(options.run_role)) ||
       !HashPath(run, "output-directory", options.output_directory) ||
@@ -210,20 +206,13 @@ bool ComputeApplicationConfigHashes(
 
 bool ExactFrozenTuple(const ApplicationOptionsView& options) noexcept
 {
-  const bool conventional =
-      options.card_id == smooth_periodic_euler_v1_card_id &&
+  return options.card_id == smooth_periodic_euler_v1_card_id &&
       options.model_id == EulerCompressible2dTag::id &&
       options.formulation_id == ConventionalHdgTag::id &&
       options.trace_id == MfemDgInterfaceTraceTag::id &&
       options.stabilization_id == FixedScalarTauTag::id &&
-      options.time_treatment_id == BackwardEulerRuntimeTag::id;
-  const bool scalar = options.card_id == scalar_igr_sc25_v3_card_id &&
-      options.model_id == TracedScalarSc25ProjectionV3Tag::id &&
-      options.formulation_id == FullyHybridizedScalarSc25V3Tag::id &&
-      options.trace_id == DualConservativeScalarTraceV1Tag::id &&
-      options.stabilization_id == W7Tau25DensityHeightP2V3Tag::id &&
-      options.time_treatment_id == BackwardEulerMonolithicV1Tag::id;
-  return (conventional || scalar) && options.precision_id == Fp64RuntimeTag::id;
+      options.time_treatment_id == BackwardEulerRuntimeTag::id &&
+      options.precision_id == Fp64RuntimeTag::id;
 }
 
 bool ExactScientificIdentities(const ApplicationOptionsView& options) noexcept
@@ -232,21 +221,6 @@ bool ExactScientificIdentities(const ApplicationOptionsView& options) noexcept
       options.case_id == cpu::w8c::ExactJumpV1Case::case_id;
   const bool smooth_transition =
       options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id;
-  if (options.card_id == scalar_igr_sc25_v3_card_id)
-  {
-    return options.mesh_family_id == smooth_periodic_euler_v1_mesh_family_id &&
-        options.source_id ==
-            (smooth_transition
-                 ? cpu::w8c::SmoothTransitionV2Case::scalar_source_id
-                 : (exact_jump
-                        ? cpu::w8c::ExactJumpV1Case::scalar_source_id
-                        : scalar_igr_sc25_v3_source_id)) &&
-        options.flux_id == scalar_igr_sc25_v3_flux_id &&
-        options.time_rule_id == BackwardEulerMonolithicV1Tag::id &&
-        options.layout_id == scalar_igr_sc25_v3_layout_id &&
-        options.gamma == smooth_periodic_euler_v1_gamma &&
-        options.tau == smooth_periodic_euler_v1_tau;
-  }
   return options.mesh_family_id ==
           smooth_periodic_euler_v1_mesh_family_id &&
       options.source_id ==
@@ -270,24 +244,8 @@ bool SmoothTransitionScenarioId(const std::string_view scenario) noexcept
       scenario == cpu::w8c::SmoothTransitionN32Dt12Case::scenario_id;
 }
 
-RuntimeTupleDescriptor TupleForBackend(
-    const ApplicationBackend backend, const bool scalar) noexcept
+RuntimeTupleDescriptor TupleForBackend(const ApplicationBackend backend) noexcept
 {
-  if (scalar)
-  {
-    switch (backend)
-    {
-      case ApplicationBackend::cpu_serial:
-        return ScalarIgrCpuSerialRuntimeSelection::Descriptor();
-      case ApplicationBackend::cpu_rank2:
-        return ScalarIgrCpuRank2RuntimeSelection::Descriptor();
-      case ApplicationBackend::cuda_rank1_one_gpu:
-        return ScalarIgrCudaRank1RuntimeSelection::Descriptor();
-      case ApplicationBackend::cuda_rank2_one_gpu_host_staged:
-        return ScalarIgrCudaRank2RuntimeSelection::Descriptor();
-      case ApplicationBackend::unknown: return {};
-    }
-  }
   switch (backend)
   {
     case ApplicationBackend::cpu_serial:
@@ -389,8 +347,6 @@ std::uint64_t ScenarioCheckpointStep(
   }
   if (options.case_id == cpu::w8c::ExactJumpV1Case::case_id)
     return cpu::w8c::ExactJumpV1Case::checkpoint_step;
-  if (scenario == ApplicationScenarioV1::scalar_igr_sc25_v3)
-    return scalar_igr_sc25_v3_checkpoint_step;
   return scenario == ApplicationScenarioV1::smoke
       ? smooth_periodic_euler_v1_smoke_checkpoint_step
       : smooth_periodic_euler_v1_functional_checkpoint_step;
@@ -404,8 +360,6 @@ std::uint64_t ScenarioFailureTarget(
     return cpu::w8c::SmoothTransitionV2Case::failure_target_step;
   if (options.case_id == cpu::w8c::ExactJumpV1Case::case_id)
     return cpu::w8c::ExactJumpV1Case::failure_target_step;
-  if (scenario == ApplicationScenarioV1::scalar_igr_sc25_v3)
-    return scalar_igr_sc25_v3_failure_target_step;
   return scenario == ApplicationScenarioV1::smoke
       ? smooth_periodic_euler_v1_smoke_failure_target_step
       : smooth_periodic_euler_v1_functional_failure_target_step;
@@ -418,8 +372,6 @@ std::uint64_t ScenarioSeed(const ApplicationOptionsView& options,
     return cpu::w8c::SmoothTransitionV2Case::seed;
   if (options.case_id == cpu::w8c::ExactJumpV1Case::case_id)
     return cpu::w8c::ExactJumpV1Case::seed;
-  if (scenario == ApplicationScenarioV1::scalar_igr_sc25_v3)
-    return scalar_igr_sc25_v3_seed;
   return scenario == ApplicationScenarioV1::smoke
       ? smooth_periodic_euler_v1_smoke_seed
       : smooth_periodic_euler_v1_functional_seed;
@@ -476,46 +428,13 @@ ApplicationRejection ValidateRoleControls(
       options.injection.target_step ==
           ScenarioFailureTarget(options, scenario) &&
       options.injection.source_rank == deferred.required_injected_source_rank;
-  const bool scalar = scenario == ApplicationScenarioV1::scalar_igr_sc25_v3;
-  const bool scalar_cuda = scalar &&
-      (backend == ApplicationBackend::cuda_rank1_one_gpu ||
-       backend == ApplicationBackend::cuda_rank2_one_gpu_host_staged);
-  const bool scalar_source_valid =
-      options.injection.source_rank < deferred.required_mpi_rank_count;
-  const bool scalar_scheduled_retry = scalar_cuda && scalar_source_valid &&
-      options.injection.mode == FailureInjectionModeV1::prescribed &&
-      options.injection.target_step == checkpoint_step &&
-      options.retry_limit == scalar_igr_sc25_v3_retry_limit &&
-      (options.injection.phase == FailurePhase::CheckpointStaging ||
-       options.injection.phase == FailurePhase::OutputStaging ||
-       options.injection.phase == FailurePhase::AfterRecoveryBeforeCommit);
-  const bool scalar_terminal_post_publication =
-      scalar_cuda && scalar_source_valid &&
-      options.injection.mode == FailureInjectionModeV1::prescribed &&
-      options.injection.phase == FailurePhase::AfterRecoveryBeforeCommit &&
-      options.injection.target_step == options.accepted_steps &&
-      options.retry_limit == 0;
-  const bool scalar_fault_free = scalar_cuda && off &&
-      options.retry_limit == 0;
-  const bool scalar_writer_controls =
-      (prescribed_principal &&
-       options.retry_limit == scalar_igr_sc25_v3_retry_limit) ||
-      scalar_scheduled_retry || scalar_fault_free;
-  const bool scalar_uninterrupted_controls = scalar_writer_controls ||
-      scalar_terminal_post_publication;
-
   if (w8c_case)
   {
-    const bool rank2_smooth_scalar = scalar &&
-        options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id &&
-        options.scenario_id == cpu::w8c::SmoothTransitionV2Case::scenario_id &&
-        (backend == ApplicationBackend::cpu_rank2 ||
-         backend == ApplicationBackend::cuda_rank2_one_gpu_host_staged);
     const bool focused =
         options.injection.mode == FailureInjectionModeV1::prescribed &&
         options.injection.phase == FailurePhase::AfterRecoveryBeforeCommit &&
         options.injection.target_step == cpu::w8c::failure_target_step &&
-        options.injection.source_rank == (rank2_smooth_scalar ? 1U : 0U) &&
+        options.injection.source_rank == 0 &&
         options.retry_limit == cpu::w8c::retry_limit;
     const bool ordinary = off && options.retry_limit == 0;
     switch (options.run_role)
@@ -530,7 +449,7 @@ ApplicationRejection ValidateRoleControls(
       case ApplicationRunRoleV1::split_writer:
         return writes_checkpoint &&
                 options.stop_after_checkpoint == StopAfterCheckpointV1::yes &&
-                (ordinary || (rank2_smooth_scalar && focused)) &&
+                ordinary &&
                 options.seed == seed
             ? ApplicationRejection::none
             : ApplicationRejection::invalid_run_role;
@@ -556,8 +475,7 @@ ApplicationRejection ValidateRoleControls(
     case ApplicationRunRoleV1::uninterrupted_reference:
       if (!writes_checkpoint ||
           options.stop_after_checkpoint != StopAfterCheckpointV1::no ||
-          (scalar ? !scalar_uninterrupted_controls
-                  : (!off || options.retry_limit != 0)) ||
+          !off || options.retry_limit != 0 ||
           options.seed != seed)
       {
         return ApplicationRejection::invalid_run_role;
@@ -566,8 +484,7 @@ ApplicationRejection ValidateRoleControls(
     case ApplicationRunRoleV1::split_writer:
       if (!writes_checkpoint ||
           options.stop_after_checkpoint != StopAfterCheckpointV1::yes ||
-          (scalar ? !scalar_writer_controls
-                  : (!off || options.retry_limit != 0)) ||
+          !off || options.retry_limit != 0 ||
           options.seed != seed)
       {
         return ApplicationRejection::invalid_run_role;
@@ -576,10 +493,8 @@ ApplicationRejection ValidateRoleControls(
     case ApplicationRunRoleV1::split_reader:
       if (!reads_checkpoint ||
           options.stop_after_checkpoint != StopAfterCheckpointV1::no ||
-          (scalar ? (!off || options.retry_limit != 0)
-                  : (!prescribed_principal ||
-                     options.retry_limit !=
-                         smooth_periodic_euler_v1_retry_limit)) ||
+          !prescribed_principal ||
+          options.retry_limit != smooth_periodic_euler_v1_retry_limit ||
           options.seed != seed)
       {
         return ApplicationRejection::invalid_run_role;
@@ -705,49 +620,19 @@ ApplicationRejection ValidateFunctional(
   return ApplicationRejection::none;
 }
 
-ApplicationRejection ValidateScalarIgr(
-    const ApplicationOptionsView& options) noexcept
-{
-  if (options.polynomial_order != scalar_igr_sc25_v3_polynomial_order ||
-      options.mesh_n != scalar_igr_sc25_v3_mesh_n)
-    return ApplicationRejection::invalid_polynomial_mesh_pair;
-  if (options.q_a != scalar_igr_sc25_v3_q_a ||
-      options.q_e != scalar_igr_sc25_v3_q_e ||
-      options.q_e4 != scalar_igr_sc25_v3_q_e4 ||
-      options.q_o != scalar_igr_sc25_v3_q_o)
-    return ApplicationRejection::invalid_quadrature;
-  if (options.accepted_steps != scalar_igr_sc25_v3_steps)
-    return ApplicationRejection::invalid_step_count;
-  if (options.final_time != scalar_igr_sc25_v3_final_time ||
-      !ExactEndTime(options))
-    return ApplicationRejection::invalid_final_time;
-  if (options.output_steps != scalar_igr_sc25_v3_output_steps)
-    return ApplicationRejection::invalid_output_schedule;
-  if (options.checkpoint_id != scalar_igr_sc25_v3_checkpoint_id)
-    return ApplicationRejection::invalid_checkpoint_identity;
-  return ApplicationRejection::none;
-}
-
 template <typename Case>
 ApplicationRejection ValidateW8c(
     const ApplicationOptionsView& options,
     const ApplicationBackend backend) noexcept
 {
-  const bool rank2_smooth_scalar =
-      options.case_id == cpu::w8c::SmoothTransitionV2Case::case_id &&
-      options.scenario_id == cpu::w8c::SmoothTransitionV2Case::scenario_id &&
-      options.card_id == scalar_igr_sc25_v3_card_id &&
-      (backend == ApplicationBackend::cpu_rank2 ||
-       backend == ApplicationBackend::cuda_rank2_one_gpu_host_staged);
-  if (backend != ApplicationBackend::cpu_serial && !rank2_smooth_scalar)
+  if (backend != ApplicationBackend::cpu_serial)
     return ApplicationRejection::unknown_backend;
   if (options.case_id != Case::case_id || options.scenario_id != Case::scenario_id)
     return ApplicationRejection::unknown_scenario;
   if (options.polynomial_order != Case::polynomial_order ||
       options.mesh_n != Case::mesh_n)
     return ApplicationRejection::invalid_polynomial_mesh_pair;
-  const bool scalar = options.card_id == scalar_igr_sc25_v3_card_id;
-  if (options.q_a != (scalar ? Case::scalar_q_a : Case::conventional_q_a) ||
+  if (options.q_a != Case::conventional_q_a ||
       options.q_e != 0 || options.q_e4 != 0 ||
       options.q_o != Case::observable_q_o)
     return ApplicationRejection::invalid_quadrature;
@@ -761,9 +646,7 @@ ApplicationRejection ValidateW8c(
       0, Case::checkpoint_step, Case::accepted_steps}};
   if (options.output_steps != control_outputs)
     return ApplicationRejection::invalid_output_schedule;
-  const std::string_view checkpoint = scalar
-      ? Case::scalar_checkpoint_id : Case::conventional_checkpoint_id;
-  return options.checkpoint_id == checkpoint
+  return options.checkpoint_id == Case::conventional_checkpoint_id
       ? ApplicationRejection::none
       : ApplicationRejection::invalid_checkpoint_identity;
 }
@@ -844,10 +727,6 @@ ApplicationScenarioV1 ParseApplicationScenario(
   {
     return ApplicationScenarioV1::functional;
   }
-  if (id == scalar_igr_sc25_v3_scenario_id)
-  {
-    return ApplicationScenarioV1::scalar_igr_sc25_v3;
-  }
   return ApplicationScenarioV1::unknown;
 }
 
@@ -895,21 +774,17 @@ ApplicationValidation ValidateApplicationOptions(
   const auto reject = [](const ApplicationRejection reason) noexcept {
     return ApplicationValidation(reason);
   };
-  const bool scalar = options.card_id == scalar_igr_sc25_v3_card_id;
   const bool w8c_case = cpu::w8c::IsCaseId(options.case_id);
-  if (!scalar && options.card_id != smooth_periodic_euler_v1_card_id)
+  if (options.card_id != smooth_periodic_euler_v1_card_id)
   {
     return reject(ApplicationRejection::unknown_card);
   }
-  if (!w8c_case &&
-      options.case_id != (scalar ? scalar_igr_sc25_v3_case_id
-                                 : smooth_periodic_euler_v1_case_id))
+  if (!w8c_case && options.case_id != smooth_periodic_euler_v1_case_id)
   {
     return reject(ApplicationRejection::unknown_case);
   }
   const ApplicationScenarioV1 scenario = w8c_case
-      ? (scalar ? ApplicationScenarioV1::scalar_igr_sc25_v3
-                : ApplicationScenarioV1::smoke)
+      ? ApplicationScenarioV1::smoke
       : ParseApplicationScenario(options.scenario_id);
   if ((!w8c_case && scenario == ApplicationScenarioV1::unknown) ||
       (options.case_id == cpu::w8c::ExactJumpV1Case::case_id &&
@@ -919,10 +794,9 @@ ApplicationValidation ValidateApplicationOptions(
   {
     return reject(ApplicationRejection::unknown_scenario);
   }
-  const bool scenario_belongs_to_card = scalar
-      ? scenario == ApplicationScenarioV1::scalar_igr_sc25_v3
-      : (scenario == ApplicationScenarioV1::smoke ||
-         scenario == ApplicationScenarioV1::functional);
+  const bool scenario_belongs_to_card =
+      scenario == ApplicationScenarioV1::smoke ||
+      scenario == ApplicationScenarioV1::functional;
   if (!scenario_belongs_to_card)
   {
     return reject(ApplicationRejection::unknown_scenario);
@@ -956,24 +830,11 @@ ApplicationValidation ValidateApplicationOptions(
   {
     return reject(ApplicationRejection::unbuilt_backend);
   }
-  const bool scalar_backend_available =
-      (backend == ApplicationBackend::cpu_serial ||
-       backend == ApplicationBackend::cpu_rank2)
-          ? DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1
-          : (backend == ApplicationBackend::cuda_rank1_one_gpu
-                 ? DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 1
-                 : DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 1);
-  if (scalar && !scalar_backend_available)
-  {
-    return reject(ApplicationRejection::unbuilt_backend);
-  }
   if (!ExactScientificIdentities(options))
   {
     return reject(ApplicationRejection::invalid_scientific_identity);
   }
-  if (!w8c_case &&
-      options.dt != (scalar ? scalar_igr_sc25_v3_dt
-                            : smooth_periodic_euler_v1_dt))
+  if (!w8c_case && options.dt != smooth_periodic_euler_v1_dt)
   {
     return reject(ApplicationRejection::invalid_dt);
   }
@@ -988,10 +849,9 @@ ApplicationValidation ValidateApplicationOptions(
              : ValidateW8c<cpu::w8c::SmoothTransitionV2Case>(options, backend))
       : options.case_id == cpu::w8c::ExactJumpV1Case::case_id
       ? ValidateW8c<cpu::w8c::ExactJumpV1Case>(options, backend)
-      : (scalar ? ValidateScalarIgr(options)
-                : (scenario == ApplicationScenarioV1::smoke
-                       ? ValidateSmoke(options)
-                       : ValidateFunctional(options, backend)));
+      : (scenario == ApplicationScenarioV1::smoke
+             ? ValidateSmoke(options)
+             : ValidateFunctional(options, backend));
   if (scenario_rejection != ApplicationRejection::none)
   {
     return reject(scenario_rejection);
@@ -1015,7 +875,7 @@ ApplicationValidation ValidateApplicationOptions(
   {
     return reject(ApplicationRejection::invalid_source_rank_rule);
   }
-  const RuntimeTupleDescriptor tuple = TupleForBackend(backend, scalar);
+  const RuntimeTupleDescriptor tuple = TupleForBackend(backend);
   if (!tuple.Valid())
   {
     return reject(ApplicationRejection::unknown_tuple);
@@ -1045,8 +905,6 @@ HdgFormulationV1 FormulationFor(const std::string_view card) noexcept
 {
   if (card == smooth_periodic_euler_v1_card_id)
     return HdgFormulationV1::conventional;
-  if (card == scalar_igr_sc25_v3_card_id)
-    return HdgFormulationV1::traced_scalar_igr;
   return HdgFormulationV1::unknown;
 }
 
@@ -1056,8 +914,7 @@ HdgPeriodicCaseV1 PeriodicCaseFor(const std::string_view case_id) noexcept
     return HdgPeriodicCaseV1::exact_jump;
   if (case_id == cpu::w8c::SmoothTransitionV2Case::case_id)
     return HdgPeriodicCaseV1::smooth_transition;
-  if (case_id == smooth_periodic_euler_v1_case_id ||
-      case_id == scalar_igr_sc25_v3_case_id)
+  if (case_id == smooth_periodic_euler_v1_case_id)
     return HdgPeriodicCaseV1::smooth;
   return HdgPeriodicCaseV1::unknown;
 }
@@ -1071,10 +928,10 @@ struct ClosedCapabilityRowV1
 
 /*
  * This is deliberately a closed table.  Tuple-specific validation remains in
- * the existing W8A/W8B/W8C validators below it, which keeps the established
+ * the existing W8A/W8C validators below it, which keeps the established
  * error taxonomy and does not accidentally advertise a new numerical cell.
  */
-constexpr std::array<ClosedCapabilityRowV1, 14> closed_capability_rows_v1{{
+constexpr std::array<ClosedCapabilityRowV1, 6> closed_capability_rows_v1{{
     {HdgFormulationV1::conventional, ApplicationBackend::cpu_serial,
      HdgPeriodicCaseV1::smooth},
     {HdgFormulationV1::conventional, ApplicationBackend::cpu_rank2,
@@ -1084,27 +941,9 @@ constexpr std::array<ClosedCapabilityRowV1, 14> closed_capability_rows_v1{{
     {HdgFormulationV1::conventional,
      ApplicationBackend::cuda_rank2_one_gpu_host_staged,
      HdgPeriodicCaseV1::smooth},
-    {HdgFormulationV1::traced_scalar_igr, ApplicationBackend::cpu_serial,
-     HdgPeriodicCaseV1::smooth},
-    {HdgFormulationV1::traced_scalar_igr, ApplicationBackend::cpu_rank2,
-     HdgPeriodicCaseV1::smooth},
-    {HdgFormulationV1::traced_scalar_igr,
-     ApplicationBackend::cuda_rank1_one_gpu, HdgPeriodicCaseV1::smooth},
-    {HdgFormulationV1::traced_scalar_igr,
-     ApplicationBackend::cuda_rank2_one_gpu_host_staged,
-     HdgPeriodicCaseV1::smooth},
     {HdgFormulationV1::conventional, ApplicationBackend::cpu_serial,
      HdgPeriodicCaseV1::exact_jump},
-    {HdgFormulationV1::traced_scalar_igr, ApplicationBackend::cpu_serial,
-     HdgPeriodicCaseV1::exact_jump},
     {HdgFormulationV1::conventional, ApplicationBackend::cpu_serial,
-     HdgPeriodicCaseV1::smooth_transition},
-    {HdgFormulationV1::traced_scalar_igr, ApplicationBackend::cpu_serial,
-     HdgPeriodicCaseV1::smooth_transition},
-    {HdgFormulationV1::traced_scalar_igr, ApplicationBackend::cpu_rank2,
-     HdgPeriodicCaseV1::smooth_transition},
-    {HdgFormulationV1::traced_scalar_igr,
-     ApplicationBackend::cuda_rank2_one_gpu_host_staged,
      HdgPeriodicCaseV1::smooth_transition},
 }};
 
@@ -1189,6 +1028,13 @@ HdgMethodCapabilitiesV1 QueryHdgMethodCapabilitiesV1(
   const HdgPeriodicCaseV1 periodic_case = PeriodicCaseFor(options.case_id);
   HdgMethodCapabilitiesV1 result{formulation, backend, periodic_case, false,
                                  ApplicationRejection::unknown_tuple, {}};
+  if (formulation == HdgFormulationV1::unknown)
+  {
+    const ApplicationValidation validation = ValidateApplicationOptions(options);
+    result.reason = validation.rejection();
+    result.reason_text = CapabilityReasonText(result.reason);
+    return result;
+  }
   if (!InClosedCapabilityTable(formulation, backend, periodic_case))
   {
     result.reason = ApplicationRejection::unknown_backend;
@@ -1205,8 +1051,7 @@ HdgMethodCapabilitiesV1 QueryHdgMethodCapabilitiesV1(
 HdgMethodCapabilitiesV1 CapabilitiesForV1(
     const HdgRunConfigV1& config) noexcept
 {
-  const HdgFormulationV1 formulation = config.scalar_igr()
-      ? HdgFormulationV1::traced_scalar_igr : HdgFormulationV1::conventional;
+  const HdgFormulationV1 formulation = FormulationFor(config.card_id().view());
   const HdgPeriodicCaseV1 periodic_case = PeriodicCaseFor(config.case_id().view());
   const bool supported = InClosedCapabilityTable(formulation, config.backend(),
                                                   periodic_case);
@@ -1271,34 +1116,12 @@ bool DeriveSplitWriterRunConfigHashV1(
       split_reader.scenario_checkpoint_step());
   writer.restart_from = {};
   writer.stop_after_checkpoint = StopAfterCheckpointV1::yes;
-  const bool w8c_case = cpu::w8c::IsCaseId(split_reader.case_id().view());
-  const bool w8c_rank2_retry = split_reader.scalar_igr() &&
-      split_reader.case_id().view() ==
-          cpu::w8c::SmoothTransitionV2Case::case_id &&
-      split_reader.scenario_id().view() ==
-          cpu::w8c::SmoothTransitionV2Case::scenario_id &&
-      (split_reader.backend() == ApplicationBackend::cpu_rank2 ||
-       split_reader.backend() ==
-           ApplicationBackend::cuda_rank2_one_gpu_host_staged);
-  writer.injection = w8c_rank2_retry
-      ? FailureInjectionControlV1{
-            FailureInjectionModeV1::prescribed,
-            FailurePhase::AfterRecoveryBeforeCommit,
-            cpu::w8c::failure_target_step, 1}
-      : (split_reader.scalar_igr() && !w8c_case
-      ? FailureInjectionControlV1{
-            FailureInjectionModeV1::prescribed,
-            smooth_periodic_euler_v1_failure_phase,
-            scalar_igr_sc25_v3_failure_target_step,
-            split_reader.deferred_runtime().required_injected_source_rank}
-      : FailureInjectionControlV1{});
+  writer.injection = {};
   writer.restart_mode = split_reader.restart_mode();
   writer.restart_trajectory = split_reader.restart_trajectory();
   writer.rollback_obligation = split_reader.rollback_obligation();
   writer.source_rank_rule = split_reader.source_rank_rule();
-  writer.retry_limit = w8c_rank2_retry ? 1U :
-      (split_reader.scalar_igr() && !w8c_case
-          ? scalar_igr_sc25_v3_retry_limit : 0U);
+  writer.retry_limit = 0;
   writer.seed = split_reader.seed();
 
   ApplicationConfigHashes hashes{};

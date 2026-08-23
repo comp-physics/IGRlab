@@ -938,15 +938,6 @@ ResolveSolverRequest(const std::string& case_default_dg_backend,
     result.time_integrator = *time_integrator;
   }
 
-  if (result.discretization == Discretization::HDG &&
-      result.regularization == Regularization::IGR &&
-      result.device_backend != DeviceBackend::CPU)
-  {
-    result.status = SolverRequestResolutionStatus::UnsupportedRegularization;
-    result.message =
-      "Regularization 'igr' with HDG is available only on --device cpu.";
-    return result;
-  }
   if (result.discretization != Discretization::HDG &&
       result.time_integrator != TimeIntegrator::RK3SSP)
   {

@@ -14,6 +14,7 @@
 
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler_types.cuh"
 #include "numerics/hdg/trace/trace_dg_mpi.hpp"
+#include "physics/bc/boundary_state.hpp"
 
 #include <HYPRE_config.h>
 #include <cuda_runtime.h>
@@ -37,6 +38,11 @@
 
 namespace dg::hdg::runtime::cuda_w8a
 {
+
+namespace detail
+{
+struct CudaQualificationTestAccess;
+}
 
 /** Production W8-owned allocator. All explicit device allocation is routed here. */
 struct UmpireDeviceAllocatorPolicy
@@ -95,16 +101,24 @@ struct CudaTransportPolicy
 /** Real rank-1/rank-2 reduction policy consumed by PersistentRunContract. */
 struct CudaMpiCollectivePolicy
 {
-  static CollectiveAdmissionReport Admit(
+  explicit CudaMpiCollectivePolicy(
+      const MPI_Comm communicator = MPI_COMM_WORLD) noexcept
+      : communicator_(communicator)
+  {}
+
+  CollectiveAdmissionReport Admit(
       const AttemptCollectiveContext& context, bool prepared,
-      FailureReason reason, std::uint32_t expected_ranks) noexcept;
-  static CollectiveGateReport Reduce(
+      FailureReason reason, std::uint32_t expected_ranks) const noexcept;
+  CollectiveGateReport Reduce(
       const AttemptCollectiveContext& context, const GateReport& gates,
-      FailureReason reason, std::uint32_t expected_ranks) noexcept;
-  static CollectiveRestoreReport ReduceRestore(
+      FailureReason reason, std::uint32_t expected_ranks) const noexcept;
+  CollectiveRestoreReport ReduceRestore(
       const RestoreCollectiveContext& context,
       RestartCompatibility compatibility, FailureReason reason,
-      std::uint32_t expected_ranks) noexcept;
+      std::uint32_t expected_ranks) const noexcept;
+
+private:
+  MPI_Comm communicator_ = MPI_COMM_WORLD;
 };
 
 namespace detail
@@ -416,6 +430,7 @@ struct CudaNumericalResult
   bool admissible = false;
   bool recovery = false;
   bool true_residual = false;
+  bool conservation = true;
   bool telemetry = false;
   bool success = false;
   bool injected = false;
@@ -426,6 +441,8 @@ struct CudaNumericalResult
   double initial_residual = std::numeric_limits<double>::infinity();
   double final_residual = std::numeric_limits<double>::infinity();
   double true_relative_residual = std::numeric_limits<double>::infinity();
+  double maximum_conservation_error = 0.0;
+  double maximum_conservation_relative_error = 0.0;
   int nonlinear_updates = 0;
   int trace_solves = 0;
 };
@@ -486,7 +503,9 @@ public:
   using state_slot = typename contract_type::state_slot;
 
   explicit PersistentCudaSmoothEulerEngine(const CudaConfig& config) noexcept
-      : config_(config), facade_incarnation_(
+      : config_(config),
+        communicator_(CudaCollectiveCommunicator(config)),
+        facade_incarnation_(
             detail::AcquireCudaFacadeIncarnation())
   {
     static_assert(!std::is_polymorphic<Selection>::value,
@@ -526,15 +545,15 @@ public:
   bool Initialize(CudaRunEvidence& evidence) noexcept
   {
     evidence = {};
-    MPI_Comm_rank(MPI_COMM_WORLD, &evidence.rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &evidence.ranks);
+    MPI_Comm_rank(communicator_, &evidence.rank);
+    MPI_Comm_size(communicator_, &evidence.ranks);
     const bool descriptor_consensus = ConfigurationConsensus();
     const int local_config =
         ValidateConfig() && facade_incarnation_ != 0 ? 1 : 0;
     int global_config = 0;
     const bool validity_consensus = MPI_Allreduce(
         &local_config, &global_config, 1, MPI_INT, MPI_MIN,
-        MPI_COMM_WORLD) == MPI_SUCCESS && global_config == 1;
+        communicator_) == MPI_SUCCESS && global_config == 1;
     if (!descriptor_consensus || !validity_consensus)
     {
       ForgetBorrowedHostInputPointers();
@@ -563,7 +582,8 @@ public:
     StateCoordinates initial{};
     initial.dt = 0.0;
     contract_.emplace(numerics_.CommittedSlot(), numerics_.CandidateSlot(),
-                      initial, numerics_.Resources());
+                      initial, numerics_.Resources(), 0,
+                      CollectivePolicy(communicator_));
     if (contract_->status() != RunStatus::ready)
     {
       evidence.status = CudaRunStatus::setup_failure;
@@ -1005,14 +1025,16 @@ public:
     contract_.reset();
     StateCoordinates initial{};
     contract_.emplace(numerics_.CommittedSlot(), numerics_.CandidateSlot(),
-                      initial, numerics_.Resources(), restored_frontier);
+                      initial, numerics_.Resources(), restored_frontier,
+                      CollectivePolicy(communicator_));
     const RestoreOutcome restored =
         contract_->Restore(checkpoint.descriptor, loaded);
     if (!restored.restored)
     {
       contract_.reset();
       contract_.emplace(numerics_.CommittedSlot(), numerics_.CandidateSlot(),
-                        initial, numerics_.Resources(), 0);
+                        initial, numerics_.Resources(), 0,
+                        CollectivePolicy(communicator_));
       next_attempt_sequence_ = 0;
     }
     else
@@ -1089,12 +1111,16 @@ public:
   }
 
 private:
+  friend struct detail::CudaQualificationTestAccess;
+
   void ForgetBorrowedHostInputPointers() noexcept
   {
     config_.borrowed_initial.coefficients = nullptr;
+    config_.borrowed_initial_true_trace.coefficients = nullptr;
     config_.borrowed_source.coefficients = nullptr;
     config_.borrowed_boundary_policies.policies = nullptr;
     config_.borrowed_boundary_policies.count = 0;
+    config_.borrowed_boundary = {};
     config_.borrowed_global_topology = {};
   }
 
@@ -1120,12 +1146,12 @@ private:
     int minimum[2] = {local[0], local[1]};
     int maximum[2] = {local[0], local[1]};
     const bool minimum_ready = MPI_Allreduce(
-        local, minimum, 2, MPI_INT, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+        local, minimum, 2, MPI_INT, MPI_MIN, communicator_) == MPI_SUCCESS;
     const bool maximum_ready = MPI_Allreduce(
-        local, maximum, 2, MPI_INT, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+        local, maximum, 2, MPI_INT, MPI_MAX, communicator_) == MPI_SUCCESS;
     int ranks = 0;
     const bool size_ready =
-        MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS;
+        MPI_Comm_size(communicator_, &ranks) == MPI_SUCCESS;
     const bool agreed = minimum_ready && maximum_ready && size_ready &&
         ranks == config_.expected_rank_count && minimum[0] == maximum[0] &&
         minimum[1] == maximum[1] && minimum[0] != 0;
@@ -1236,8 +1262,8 @@ private:
   {
     const bool borrowed_generic_shape = config_.use_borrowed_topology &&
         config_.use_borrowed_host_inputs && config_.mesh_n >= 0 &&
-        (config_.order == smoke_polynomial_order ||
-         config_.order == functional_polynomial_order);
+        config_.order >= generic::minimum_polynomial_order &&
+        config_.order <= generic::maximum_polynomial_order;
     const bool smoke_shape = config_.order == smoke_polynomial_order &&
         config_.mesh_n == smoke_elements_per_direction;
     const bool functional_shape =
@@ -1271,10 +1297,27 @@ private:
              (config_.borrowed_source.coefficients != nullptr &&
               config_.borrowed_source.scalar_count != 0 &&
               config_.borrowed_source.components == conserved_components))
-        : empty_l2(config_.borrowed_initial) && empty_l2(config_.borrowed_source);
+        : empty_l2(config_.borrowed_initial) &&
+            empty_l2(config_.borrowed_initial_true_trace) &&
+            empty_l2(config_.borrowed_source);
+    const bool initial_trace_configuration = config_.use_borrowed_host_inputs
+        ? empty_l2(config_.borrowed_initial_true_trace) ||
+            (config_.borrowed_initial_true_trace.coefficients != nullptr &&
+             config_.borrowed_initial_true_trace.scalar_count != 0 &&
+             config_.borrowed_initial_true_trace.components ==
+                 conserved_components)
+        : empty_l2(config_.borrowed_initial_true_trace);
+    const bool generic_numerical_configuration =
+        config_.use_generic_numerical_policy
+        ? config_.use_borrowed_host_inputs &&
+            generic::ValidEulerHdgNumericalPolicy(config_.numerical_policy)
+        : !config_.use_borrowed_host_inputs ||
+            config_.numerical_policy.stabilization.kind ==
+                generic::RegularizationKind::none;
     const bool boundary_policy_configuration =
         config_.use_borrowed_host_inputs
-        ? ValidateCudaStaticBoundaryPolicyTable(config_.borrowed_boundary_policies)
+        ? ValidateCudaStaticBoundaryPolicyTable(
+              config_.borrowed_boundary_policies)
         : config_.borrowed_boundary_policies.policies == nullptr &&
             config_.borrowed_boundary_policies.count == 0;
     const bool borrowed_topology_identity = config_.use_borrowed_host_inputs
@@ -1292,6 +1335,9 @@ private:
         (borrowed_generic_shape || smoke_shape || functional_shape) &&
         topology_configuration &&
         generic_l2_configuration &&
+        initial_trace_configuration &&
+        generic_numerical_configuration &&
+        (!config_.use_generic_numerical_policy || borrowed_generic_shape) &&
         boundary_policy_configuration &&
         borrowed_topology_identity &&
         !fixed_oracle_requested_for_generic_storage &&
@@ -1385,8 +1431,46 @@ private:
       AppendConfigValue(descriptor, cursor, complete,
                         config_.borrowed_initial.components);
       AppendConfigValue(descriptor, cursor, complete,
+                        config_.borrowed_initial_true_trace.components);
+      append_bool(config_.borrowed_initial_true_trace.coefficients != nullptr);
+      AppendConfigValue(descriptor, cursor, complete,
                         config_.borrowed_source.components);
       append_bool(config_.borrowed_source.coefficients != nullptr);
+      append_bool(config_.use_generic_numerical_policy);
+      if (config_.use_generic_numerical_policy)
+      {
+        const auto& policy = config_.numerical_policy;
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.volume_projection_quadrature_order);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.true_trace_projection_quadrature_order);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.conventional_assembly_quadrature_order);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.igr_assembly_quadrature_order);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.maximum_nonlinear_updates);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.maximum_linear_iterations);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.maximum_line_search_trials);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.nonlinear_relative_tolerance);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.linear_relative_tolerance);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.true_residual_relative_tolerance);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.conservation_relative_tolerance);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.armijo_constant);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.stabilization.kind);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.stabilization.alpha);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.stabilization.beta);
+      }
     }
     append_bool(config_.capture_oracle);
     AppendConfigValue(descriptor, cursor, complete, config_.injection.phase);
@@ -1416,7 +1500,8 @@ private:
     // This collective is intentionally before MakeConfigDescriptor: that
     // descriptor has a borrowed-host-only branch and must never be entered
     // asymmetrically.
-    if (!CudaBorrowedHostModeConsensus(config_.use_borrowed_host_inputs,
+    if (!CudaBorrowedHostModeConsensus(communicator_,
+                                       config_.use_borrowed_host_inputs,
                                        borrowed_host_mode))
       return false;
     ConfigDescriptor local{};
@@ -1427,13 +1512,13 @@ private:
     maximum = local;
     int ranks = 0;
     const bool size_ready =
-        MPI_Comm_size(MPI_COMM_WORLD, &ranks) == MPI_SUCCESS;
+        MPI_Comm_size(communicator_, &ranks) == MPI_SUCCESS;
     const bool minimum_ready = MPI_Allreduce(
         local.data(), minimum.data(), static_cast<int>(local.size()),
-        MPI_UNSIGNED_CHAR, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+        MPI_UNSIGNED_CHAR, MPI_MIN, communicator_) == MPI_SUCCESS;
     const bool maximum_ready = MPI_Allreduce(
         local.data(), maximum.data(), static_cast<int>(local.size()),
-        MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+        MPI_UNSIGNED_CHAR, MPI_MAX, communicator_) == MPI_SUCCESS;
     const bool base_consensus = descriptor_complete && size_ready && minimum_ready &&
         maximum_ready && ranks == config_.expected_rank_count &&
         minimum == maximum;
@@ -1468,12 +1553,16 @@ private:
     maximum = local;
     const int complete_bit = complete ? 1 : 0;
     int all_complete = 0;
-    return MPI_Allreduce(&complete_bit, &all_complete, 1, MPI_INT, MPI_MIN,
-                         MPI_COMM_WORLD) == MPI_SUCCESS &&
-        MPI_Allreduce(local.data(), minimum.data(), static_cast<int>(local.size()),
-                      MPI_UNSIGNED_CHAR, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS &&
-        MPI_Allreduce(local.data(), maximum.data(), static_cast<int>(local.size()),
-                      MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS &&
+    const bool complete_ready = MPI_Allreduce(
+        &complete_bit, &all_complete, 1, MPI_INT, MPI_MIN,
+        communicator_) == MPI_SUCCESS;
+    const bool minimum_ready = MPI_Allreduce(
+        local.data(), minimum.data(), static_cast<int>(local.size()),
+        MPI_UNSIGNED_CHAR, MPI_MIN, communicator_) == MPI_SUCCESS;
+    const bool maximum_ready = MPI_Allreduce(
+        local.data(), maximum.data(), static_cast<int>(local.size()),
+        MPI_UNSIGNED_CHAR, MPI_MAX, communicator_) == MPI_SUCCESS;
+    return complete_ready && minimum_ready && maximum_ready &&
         all_complete == 1 && minimum == maximum;
   }
 
@@ -1494,6 +1583,7 @@ private:
       cursor += sizeof(value_type);
     };
     append(config_.borrowed_boundary_policies.count);
+    append(config_.borrowed_boundary_policies.gamma);
     const bool readable = config_.borrowed_boundary_policies.policies != nullptr &&
         config_.borrowed_boundary_policies.count <= maximum_static_boundary_policies;
     for (std::size_t index = 0; index < maximum_static_boundary_policies; ++index)
@@ -1506,17 +1596,22 @@ private:
       const std::uint8_t kind = static_cast<std::uint8_t>(policy.kind);
       append(kind);
       for (const double reference : policy.reference_state) append(reference);
+      append(policy.pressure_out);
     }
     minimum = local;
     maximum = local;
     const int complete_bit = complete ? 1 : 0;
     int all_complete = 0;
-    return MPI_Allreduce(&complete_bit, &all_complete, 1, MPI_INT, MPI_MIN,
-                         MPI_COMM_WORLD) == MPI_SUCCESS &&
-        MPI_Allreduce(local.data(), minimum.data(), static_cast<int>(local.size()),
-                      MPI_UNSIGNED_CHAR, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS &&
-        MPI_Allreduce(local.data(), maximum.data(), static_cast<int>(local.size()),
-                      MPI_UNSIGNED_CHAR, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS &&
+    const bool complete_ready = MPI_Allreduce(
+        &complete_bit, &all_complete, 1, MPI_INT, MPI_MIN,
+        communicator_) == MPI_SUCCESS;
+    const bool minimum_ready = MPI_Allreduce(
+        local.data(), minimum.data(), static_cast<int>(local.size()),
+        MPI_UNSIGNED_CHAR, MPI_MIN, communicator_) == MPI_SUCCESS;
+    const bool maximum_ready = MPI_Allreduce(
+        local.data(), maximum.data(), static_cast<int>(local.size()),
+        MPI_UNSIGNED_CHAR, MPI_MAX, communicator_) == MPI_SUCCESS;
+    return complete_ready && minimum_ready && maximum_ready &&
         all_complete == 1 && minimum == maximum;
   }
 
@@ -1867,6 +1962,7 @@ private:
   };
 
   CudaConfig config_{};
+  MPI_Comm communicator_ = MPI_COMM_WORLD;
   detail::CudaPersistentNumerics<AllocatorPolicy, TransportPolicy> numerics_{};
   std::optional<contract_type> contract_{};
   PendingAttempt pending_{};

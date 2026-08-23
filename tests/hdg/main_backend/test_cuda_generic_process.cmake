@@ -98,7 +98,7 @@ if(NOT _status EQUAL 0 OR
 endif()
 
 set(_collection
-  "dgsem_smooth_advection_periodic_hdg_cuda_p_${HDG_MAIN_ORDER}_n_${HDG_MAIN_N}")
+  "dgsem_smooth_advection_periodic_hdg_p_${HDG_MAIN_ORDER}_ref_${_refinement_levels}")
 set(_root "${HDG_MAIN_OUTPUT}/${_collection}")
 if(HDG_MAIN_NO_VTK)
   file(GLOB_RECURSE _artifacts LIST_DIRECTORIES FALSE

@@ -10,6 +10,7 @@
  * owned common ABI is accepted.
  */
 
+#include "numerics/hdg/generic/contract.hpp"
 #include "numerics/hdg/runtime/run_contract.hpp"
 
 #include <mfem.hpp>
@@ -43,6 +44,8 @@ inline constexpr int functional_checkpoint_step = 10;
 inline constexpr int functional_injected_step = 14;
 inline constexpr int accepted_steps = smoke_accepted_steps;
 inline constexpr int conserved_components = 4;
+inline constexpr int igr_interior_components = 7;
+inline constexpr int igr_trace_components = 5;
 inline constexpr int dimension = 2;
 // p1 values are retained for the Admission-02 oracle fixtures.  Runtime
 // kernels use the counts carried by CudaMeshShape; storage uses the maxima.
@@ -53,12 +56,21 @@ inline constexpr int interior_dofs_per_element =
     conserved_components * scalar_dofs_per_element;
 inline constexpr int trace_dofs_per_element =
     faces_per_element * conserved_components * scalar_dofs_per_face;
+// Frozen W8A DTO/oracle maxima remain p1/p2.  Generic borrowed mode uses its
+// checked dynamic arena and the separate p3/IGR per-element bounds below.
 inline constexpr int maximum_scalar_dofs_per_element = 9;
 inline constexpr int maximum_scalar_dofs_per_face = 3;
 inline constexpr int maximum_interior_dofs_per_element =
     conserved_components * maximum_scalar_dofs_per_element;
 inline constexpr int maximum_trace_dofs_per_element =
     faces_per_element * conserved_components * maximum_scalar_dofs_per_face;
+inline constexpr int generic_maximum_scalar_dofs_per_element = 16;
+inline constexpr int generic_maximum_scalar_dofs_per_face = 4;
+inline constexpr int generic_maximum_interior_dofs_per_element =
+    igr_interior_components * generic_maximum_scalar_dofs_per_element;
+inline constexpr int generic_maximum_trace_dofs_per_element =
+    faces_per_element * igr_trace_components *
+        generic_maximum_scalar_dofs_per_face;
 inline constexpr int maximum_rank_elements = 36;
 inline constexpr int maximum_local_trace_dofs = 864;
 inline constexpr int maximum_true_trace_dofs = 864;
@@ -155,11 +167,13 @@ enum class CudaStaticBoundaryPolicyKind : std::uint8_t
   supersonic_inlet = 1,
   supersonic_outlet = 2,
   slip_wall = 3,
-  // These spellings make unsupported caller intent explicit and rejectable.
   subsonic_inlet = 4,
-  subsonic_outlet = 5,
+  subsonic_outlet_pressure = 5,
   far_field = 6,
-  nonreflecting = 7
+  nonreflecting_outlet = 7,
+  // Retained reject-only spellings used by legacy negative-admission tests.
+  subsonic_outlet = 8,
+  nonreflecting = 9
 };
 
 /** Caller-borrowed initialization descriptor; values are copied immediately. */
@@ -169,6 +183,7 @@ struct CudaStaticBoundaryPolicy
   CudaStaticBoundaryPolicyKind kind = CudaStaticBoundaryPolicyKind::none;
   std::array<double, conserved_components> reference_state{{0.0, 0.0, 0.0,
                                                               0.0}};
+  double pressure_out = 0.0;
 };
 
 inline constexpr std::size_t maximum_static_boundary_policies = 32;
@@ -177,6 +192,7 @@ struct CudaStaticBoundaryPolicyTable
 {
   const CudaStaticBoundaryPolicy* policies = nullptr;
   std::size_t count = 0;
+  double gamma = 1.4;
 };
 
 inline bool IsCudaAdmittedStaticBoundaryPolicy(
@@ -184,7 +200,11 @@ inline bool IsCudaAdmittedStaticBoundaryPolicy(
 {
   return kind == CudaStaticBoundaryPolicyKind::supersonic_inlet ||
       kind == CudaStaticBoundaryPolicyKind::supersonic_outlet ||
-      kind == CudaStaticBoundaryPolicyKind::slip_wall;
+      kind == CudaStaticBoundaryPolicyKind::slip_wall ||
+      kind == CudaStaticBoundaryPolicyKind::subsonic_inlet ||
+      kind == CudaStaticBoundaryPolicyKind::subsonic_outlet_pressure ||
+      kind == CudaStaticBoundaryPolicyKind::far_field ||
+      kind == CudaStaticBoundaryPolicyKind::nonreflecting_outlet;
 }
 
 inline bool IsCudaPhysicalEulerState(
@@ -203,6 +223,9 @@ inline bool IsCudaPhysicalEulerState(
 inline bool ValidateCudaStaticBoundaryPolicyTable(
     const CudaStaticBoundaryPolicyTable& table) noexcept
 {
+  if (!std::isfinite(table.gamma) ||
+      generic::DoubleBits(table.gamma) != generic::DoubleBits(1.4))
+    return false;
   if (table.count == 0) return table.policies == nullptr;
   if (table.policies == nullptr || table.count > maximum_static_boundary_policies)
     return false;
@@ -212,31 +235,45 @@ inline bool ValidateCudaStaticBoundaryPolicyTable(
     if (policy.attribute <= 0 ||
         !IsCudaAdmittedStaticBoundaryPolicy(policy.kind))
       return false;
-    if (policy.kind == CudaStaticBoundaryPolicyKind::supersonic_inlet)
+    const bool needs_reference =
+        policy.kind == CudaStaticBoundaryPolicyKind::supersonic_inlet ||
+        policy.kind == CudaStaticBoundaryPolicyKind::subsonic_inlet ||
+        policy.kind == CudaStaticBoundaryPolicyKind::far_field ||
+        policy.kind == CudaStaticBoundaryPolicyKind::nonreflecting_outlet;
+    if (needs_reference)
     {
       if (!IsCudaPhysicalEulerState(policy.reference_state)) return false;
     }
     else
-    {
       for (const double value : policy.reference_state)
         if (value != 0.0 || std::signbit(value)) return false;
+    if (policy.kind == CudaStaticBoundaryPolicyKind::
+            subsonic_outlet_pressure)
+    {
+      if (!std::isfinite(policy.pressure_out) ||
+          !(policy.pressure_out > 0.0)) return false;
     }
+    else if (policy.pressure_out != 0.0 ||
+             std::signbit(policy.pressure_out))
+      return false;
     if (i != 0 && table.policies[i - 1].attribute >= policy.attribute)
       return false;
   }
   return true;
 }
 
-inline bool CudaBorrowedHostModeConsensus(const bool requested,
+inline bool CudaBorrowedHostModeConsensus(const MPI_Comm communicator,
+                                          const bool requested,
                                           bool& agreed_mode) noexcept
 {
+  if (communicator == MPI_COMM_NULL) return false;
   const int local = requested ? 1 : 0;
   int minimum = 0;
   int maximum = 0;
   const bool minimum_ready = MPI_Allreduce(&local, &minimum, 1, MPI_INT,
-      MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+      MPI_MIN, communicator) == MPI_SUCCESS;
   const bool maximum_ready = MPI_Allreduce(&local, &maximum, 1, MPI_INT,
-      MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+      MPI_MAX, communicator) == MPI_SUCCESS;
   const bool consensus_ok = minimum_ready && maximum_ready &&
       minimum == maximum && (minimum == 0 || minimum == 1);
   agreed_mode = consensus_ok && minimum == 1;
@@ -276,6 +313,10 @@ struct CudaConfig
   // manufactured interior/source bytes and behavior exactly intact.
   bool use_borrowed_host_inputs = false;
   CudaBorrowedHostL2Input borrowed_initial{};
+  // Optional independently projected Euler true-trace coordinates.  Empty
+  // retains the established derived-trace compatibility path.  IGR appends a
+  // private zero sigma-hat slab after these four public component slabs.
+  CudaBorrowedHostL2Input borrowed_initial_true_trace{};
   // The sole empty spelling is {nullptr, 0, 4}; it selects a zero source.
   CudaBorrowedHostL2Input borrowed_source{};
   // Nonempty only with a static physical-boundary policy table: this is the
@@ -286,10 +327,31 @@ struct CudaConfig
   // This descriptor is valid only for borrowed-host sessions.  Initialize
   // validates and copies it; no caller policy pointer survives publication.
   CudaStaticBoundaryPolicyTable borrowed_boundary_policies{};
+  // Host callback is used only while deriving a compatibility initial trace;
+  // device assembly consumes the copied value-only table above.
+  generic::BoundaryOperatorView borrowed_boundary{};
+  // Generic requests select the same engine with either 4/4 conventional or
+  // 7/5 IGR storage.  The policy is ignored by the frozen generated-topology
+  // route, preserving its exact behavior.
+  bool use_generic_numerical_policy = false;
+  generic::EulerHdgNumericalPolicy numerical_policy =
+      generic::DefaultEulerHdgNumericalPolicy(polynomial_order);
   bool capture_oracle = false;
   bool force_private_scientific_gate_failure = false;
   CudaInjection injection{};
 };
+
+/**
+ * Select the communicator that owns every collective in one CUDA engine.
+ * Borrowed generic sessions retain their request/mesh communicator for the
+ * full engine lifetime.  The frozen generated-topology/direct-config route
+ * remains MPI_COMM_WORLD-bound for compatibility.
+ */
+inline MPI_Comm CudaCollectiveCommunicator(const CudaConfig& config) noexcept
+{
+  return config.borrowed_communicator != MPI_COMM_NULL
+      ? config.borrowed_communicator : MPI_COMM_WORLD;
+}
 
 enum class CudaAllocationSite : unsigned char
 {

@@ -385,12 +385,9 @@ MFEM_HOST_DEVICE inline Status Assemble(const Input& input, Output& output) noex
       const double* quadrature = input.quadrature.segment_xw + 2 * point;
       double xi = 0., eta = 0., tangent[2] = {};
       FacePoint(face, quadrature[0], xi, eta, tangent);
-      double n[4] = {}, dr[8] = {}, d[8] = {};
+      double n[4] = {};
+      [[maybe_unused]] double dr[8] = {};
       Shapes(xi, eta, n, dr);
-      for (int a = 0; a < 4; ++a)
-        for (int direction = 0; direction < 2; ++direction)
-          d[2 * a + direction] = dr[2 * a] * inverse[direction] +
-            dr[2 * a + 1] * inverse[2 + direction];
       const double physical_tangent[2] = {j[0] * tangent[0] + j[2] * tangent[1],
                                           j[1] * tangent[0] + j[3] * tangent[1]};
       const double length = ScaledNorm2(physical_tangent[0], physical_tangent[1]);

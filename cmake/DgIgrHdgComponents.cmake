@@ -44,7 +44,8 @@ function(dg_igr_add_hdg_cxx17_component)
 
   set(_dg_igr_hdg_cxx_targets
       dg_igr_hdg_runtime_common
-      dg_igr_hdg_runtime_cpu
+      dg_igr_hdg_generic_cpu
+      dg_igr_hdg_sc25_oracle_cpu
       dg_igr_hdg_auxiliary_cpu)
   _dg_igr_hdg_require_canonical_target("${HDG_TARGET}"
                                        "${_dg_igr_hdg_cxx_targets}")
@@ -90,6 +91,48 @@ function(dg_igr_add_hdg_cxx17_component)
                             ${HDG_PRIVATE_LINK_LIBRARIES})
     endif()
   endif()
+endfunction()
+
+# Keep the general CPU reference path structurally independent from the
+# frozen SC25 oracle. This configure-time graph check rejects a CMake edge
+# before an executable can inherit the oracle archive.
+function(dg_igr_hdg_require_target_link_closure_absent target forbidden)
+  if(NOT TARGET "${target}" OR NOT TARGET "${forbidden}")
+    message(FATAL_ERROR
+            "HDG link-closure check requires existing targets '${target}' and '${forbidden}'.")
+  endif()
+
+  set(_dg_igr_hdg_pending "${target}")
+  set(_dg_igr_hdg_visited "")
+  while(_dg_igr_hdg_pending)
+    list(GET _dg_igr_hdg_pending 0 _dg_igr_hdg_current)
+    list(REMOVE_AT _dg_igr_hdg_pending 0)
+    list(FIND _dg_igr_hdg_visited "${_dg_igr_hdg_current}"
+         _dg_igr_hdg_visited_index)
+    if(NOT _dg_igr_hdg_visited_index EQUAL -1)
+      continue()
+    endif()
+    list(APPEND _dg_igr_hdg_visited "${_dg_igr_hdg_current}")
+
+    get_target_property(_dg_igr_hdg_current_links
+                        "${_dg_igr_hdg_current}" LINK_LIBRARIES)
+    get_target_property(_dg_igr_hdg_current_interface_links
+                        "${_dg_igr_hdg_current}" INTERFACE_LINK_LIBRARIES)
+    foreach(_dg_igr_hdg_link IN LISTS _dg_igr_hdg_current_links
+                                      _dg_igr_hdg_current_interface_links)
+      # PRIVATE static-library dependencies are represented as LINK_ONLY in
+      # the consumer interface. Recover the named target before walking it.
+      string(REGEX REPLACE "^\\$<LINK_ONLY:([^>]+)>$" "\\1"
+             _dg_igr_hdg_link "${_dg_igr_hdg_link}")
+      if(_dg_igr_hdg_link STREQUAL "${forbidden}")
+        message(FATAL_ERROR
+                "HDG target '${target}' link closure must not contain frozen oracle '${forbidden}'.")
+      endif()
+      if(TARGET "${_dg_igr_hdg_link}")
+        list(APPEND _dg_igr_hdg_pending "${_dg_igr_hdg_link}")
+      endif()
+    endforeach()
+  endwhile()
 endfunction()
 
 function(_dg_igr_hdg_require_hypre_cuda_umpire_config)
@@ -313,7 +356,8 @@ endfunction()
 function(dg_igr_configure_hdg_cuda_final_consumer target)
   set(_dg_igr_hdg_final_consumers
       dg_igr_hdg_runtime
-      hdg_smooth_periodic)
+      hdg_smooth_periodic
+      dgsem_smooth_advection)
   list(FIND _dg_igr_hdg_final_consumers "${target}"
        _dg_igr_hdg_final_consumer_index)
   if(_dg_igr_hdg_final_consumer_index EQUAL -1 OR NOT TARGET "${target}")

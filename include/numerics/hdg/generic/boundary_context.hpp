@@ -24,25 +24,6 @@ class EulerBoundaryPlan;
 namespace dg::hdg::generic
 {
 
-enum class EulerBoundaryPolicyKind : unsigned char
-{
-  periodic_topology,
-  supersonic_inlet,
-  subsonic_inlet,
-  supersonic_outlet,
-  subsonic_outlet_pressure,
-  far_field,
-  nonreflecting_outlet,
-  slip_wall
-};
-
-struct EulerBoundaryPolicy
-{
-  EulerBoundaryPolicyKind kind = EulerBoundaryPolicyKind::periodic_topology;
-  std::array<double, euler_2d_conserved_components> reference_state{};
-  double pressure_out = 0.0;
-};
-
 class EulerBoundaryContext
 {
 public:

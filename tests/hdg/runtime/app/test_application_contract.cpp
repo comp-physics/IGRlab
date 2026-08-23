@@ -36,15 +36,10 @@ static_assert(IsFrozenApplicationBackend<CpuSerialBackendTag>::value &&
                       CudaRank2OneGpuHostStagedBackendTag>::value &&
                   !IsFrozenApplicationBackend<int>::value,
               "the static boundary recognizes exactly four backends");
-static_assert(DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0 ||
-                  DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1,
-              "scalar-IGR CPU availability is a build-owned boolean");
-static_assert(DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 0 ||
-                  DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 1,
-              "scalar-IGR CUDA rank-1 availability is build-owned");
-static_assert(DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 0 ||
-                  DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 1,
-              "scalar-IGR CUDA rank-2 availability is build-owned");
+static_assert(DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0 &&
+                  DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 0 &&
+                  DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 0,
+              "the production application exposes no legacy scalar-IGR backend");
 
 bool Check(const bool condition, const char* name)
 {
@@ -281,19 +276,6 @@ ApplicationOptionsView SplitWriter(ApplicationOptionsView options)
   return options;
 }
 
-ApplicationOptionsView CanonicalScalarCheckpointWriter(
-    ApplicationOptionsView options)
-{
-  options = SplitWriter(options);
-  options.injection = {
-      FailureInjectionModeV1::prescribed,
-      smooth_periodic_euler_v1_failure_phase,
-      scalar_igr_sc25_v3_failure_target_step,
-      SourceRank(options.backend_id)};
-  options.retry_limit = scalar_igr_sc25_v3_retry_limit;
-  return options;
-}
-
 ApplicationOptionsView SplitReader(ApplicationOptionsView options)
 {
   const std::string_view checkpoint = options.checkpoint_out.canonical;
@@ -395,133 +377,70 @@ bool CheckExactAcceptedFieldsAndHashes()
 bool CheckW8cSmoothTransitionClosure()
 {
   bool passed = true;
-  for (const bool scalar : {false, true})
+  const ApplicationValidation smooth_validation =
+      ValidateApplicationOptions(W8cCase(false, true));
+  const ApplicationValidation exact_validation =
+      ValidateApplicationOptions(W8cCase(false, false));
+  const ValidatedApplicationConfig* smooth = smooth_validation.config();
+  const ValidatedApplicationConfig* exact = exact_validation.config();
+  passed = Check(smooth != nullptr && exact != nullptr &&
+                     smooth->backend() == ApplicationBackend::cpu_serial &&
+                     smooth->scenario() == ApplicationScenarioV1::smoke &&
+                     smooth->case_id().view() ==
+                         "periodic-smooth-transition-v2" &&
+                     smooth->scenario_checkpoint_step() == 32 &&
+                     Nonzero(smooth->scientific_config_sha256()) &&
+                     Nonzero(smooth->run_config_sha256()) &&
+                     smooth->scientific_config_sha256() !=
+                         exact->scientific_config_sha256() &&
+                     smooth->run_config_sha256() !=
+                         exact->run_config_sha256(),
+                 "smooth_case_private_scenario_and_hash_separation") &&
+      passed;
+
+  ApplicationOptionsView writer = W8cCase(false, true);
+  writer.run_role = ApplicationRunRoleV1::split_writer;
+  writer.stop_after_checkpoint = StopAfterCheckpointV1::yes;
+  passed = Check(ValidateApplicationOptions(writer).accepted() &&
+                     ValidateApplicationOptions(
+                         W8cSplitReader(W8cCase(false, true))).accepted(),
+                 "smooth_split_writer_reader_use_off_zero_controls") &&
+      passed;
+
+  ApplicationOptionsView crossed = W8cCase(false, true);
+  crossed.case_id = "periodic-double-riemann-v1";
+  passed = Check(!ValidateApplicationOptions(crossed).accepted(),
+                 "crossed_smooth_descriptor_exact_case_rejected") &&
+      passed;
+  crossed = W8cCase(false, true);
+  crossed.source_id = "source.euler.periodic-double-riemann.v1";
+  passed = Check(ValidateApplicationOptions(crossed).rejection() ==
+                     ApplicationRejection::invalid_scientific_identity,
+                 "crossed_smooth_source_identity_rejected") &&
+      passed;
+
+  ApplicationOptionsView rank2 = W8cCase(false, true);
+  rank2.backend_id = CpuRank2BackendTag::id;
+  passed = Check(ValidateApplicationOptions(rank2).rejection() ==
+                     ApplicationRejection::unknown_backend,
+                 "smooth_conventional_cpu_rank2_not_advertised") &&
+      passed;
+
+  for (const std::string_view backend :
+       {CpuSerialBackendTag::id, CpuRank2BackendTag::id,
+        CudaRank1OneGpuBackendTag::id,
+        CudaRank2OneGpuHostStagedBackendTag::id})
   {
-    const ApplicationValidation smooth_validation =
-        ValidateApplicationOptions(W8cCase(scalar, true));
-    const ApplicationValidation exact_validation =
-        ValidateApplicationOptions(W8cCase(scalar, false));
-    const ValidatedApplicationConfig* smooth = smooth_validation.config();
-    const ValidatedApplicationConfig* exact = exact_validation.config();
-#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0
-    if (scalar)
-    {
-      passed = Check(smooth == nullptr && exact == nullptr &&
-                         smooth_validation.rejection() ==
-                             ApplicationRejection::unbuilt_backend &&
-                         exact_validation.rejection() ==
-                             ApplicationRejection::unbuilt_backend,
-                     "smooth_and_exact_scalar_cases_unbuilt_together") &&
-          passed;
-      continue;
-    }
-#endif
-    passed = Check(smooth != nullptr && exact != nullptr &&
-                       smooth->backend() == ApplicationBackend::cpu_serial &&
-                       smooth->scenario() ==
-                           (scalar
-                                ? ApplicationScenarioV1::scalar_igr_sc25_v3
-                                : ApplicationScenarioV1::smoke) &&
-                       smooth->case_id().view() ==
-                           "periodic-smooth-transition-v2" &&
-                       smooth->scenario_checkpoint_step() == 32 &&
-                       Nonzero(smooth->scientific_config_sha256()) &&
-                       Nonzero(smooth->run_config_sha256()) &&
-                       smooth->scientific_config_sha256() !=
-                           exact->scientific_config_sha256() &&
-                       smooth->run_config_sha256() !=
-                           exact->run_config_sha256(),
-                   "smooth_case_private_scenario_and_hash_separation") &&
+    passed = Check(ValidateApplicationOptions(
+                       W8cCase(true, true, backend)).rejection() ==
+                       ApplicationRejection::unknown_card &&
+                       ValidateApplicationOptions(
+                           W8cCase(true, false, backend)).rejection() ==
+                       ApplicationRejection::unknown_card,
+                   "legacy_scalar_w8c_cards_not_admitted") &&
         passed;
-
-    ApplicationOptionsView writer = W8cCase(scalar, true);
-    writer.run_role = ApplicationRunRoleV1::split_writer;
-    writer.stop_after_checkpoint = StopAfterCheckpointV1::yes;
-    const ApplicationValidation writer_validation =
-        ValidateApplicationOptions(writer);
-    const ApplicationValidation reader_validation =
-        ValidateApplicationOptions(W8cSplitReader(W8cCase(scalar, true)));
-    passed = Check(writer_validation.accepted() &&
-                       reader_validation.accepted(),
-                   "smooth_split_writer_reader_use_off_zero_controls") &&
-        passed;
-
-    ApplicationOptionsView crossed = W8cCase(scalar, true);
-    crossed.case_id = "periodic-double-riemann-v1";
-    passed = Check(!ValidateApplicationOptions(crossed).accepted(),
-                   "crossed_smooth_descriptor_exact_case_rejected") &&
-        passed;
-    crossed = W8cCase(scalar, true);
-    crossed.source_id = scalar
-        ? "source.sc25.periodic-double-riemann.v3"
-        : "source.euler.periodic-double-riemann.v1";
-    passed = Check(ValidateApplicationOptions(crossed).rejection() ==
-                       ApplicationRejection::invalid_scientific_identity,
-                   "crossed_smooth_source_identity_rejected") &&
-        passed;
-
-    ApplicationOptionsView rank2 = W8cCase(scalar, true);
-    rank2.backend_id = CpuRank2BackendTag::id;
-    const ApplicationValidation rank2_validation =
-        ValidateApplicationOptions(rank2);
-    passed = Check(scalar ? rank2_validation.accepted()
-                          : rank2_validation.rejection() ==
-                                ApplicationRejection::unknown_backend,
-                   "smooth_scalar_cpu_rank2_is_frozen") &&
-        passed;
-    if (scalar)
-    {
-      rank2.scenario_id = "W8C-V2-N16-DT11";
-      passed = Check(ValidateApplicationOptions(rank2).rejection() ==
-                         ApplicationRejection::unknown_backend,
-                     "smooth_scalar_cpu_rank2_rejects_n16") &&
-          passed;
-    }
   }
 
-  ApplicationOptionsView cuda_rank2 = W8cCase(
-      true, true, CudaRank2OneGpuHostStagedBackendTag::id);
-  const ApplicationValidation cuda_rank2_validation =
-      ValidateApplicationOptions(cuda_rank2);
-#if DG_IGR_HDG_APP_HAS_CUDA_RANK2 && DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2
-  passed = Check(cuda_rank2_validation.accepted() &&
-                     cuda_rank2_validation.config() != nullptr &&
-                     cuda_rank2_validation.config()->backend() ==
-                         ApplicationBackend::cuda_rank2_one_gpu_host_staged,
-                 "smooth_scalar_cuda_rank2_is_frozen") &&
-      passed;
-  ApplicationOptionsView cuda_writer = SplitWriter(cuda_rank2);
-  cuda_writer.injection = {
-      FailureInjectionModeV1::prescribed,
-      FailurePhase::AfterRecoveryBeforeCommit,
-      scalar_igr_sc25_v3_failure_target_step, 1};
-  cuda_writer.retry_limit = scalar_igr_sc25_v3_retry_limit;
-  const ApplicationValidation cuda_reader_validation =
-      ValidateApplicationOptions(SplitReader(cuda_rank2));
-  StateHash cuda_writer_hash{};
-  passed = Check(ValidateApplicationOptions(cuda_writer).accepted() &&
-                     cuda_reader_validation.accepted() &&
-                     DeriveSplitWriterRunConfigHashV1(
-                         *cuda_reader_validation.config(), cuda_writer_hash),
-                 "smooth_scalar_cuda_rank2_retry_writer_reader_controls") &&
-      passed;
-  cuda_rank2.scenario_id = "W8C-V2-N16-DT11";
-  passed = Check(ValidateApplicationOptions(cuda_rank2).rejection() ==
-                     ApplicationRejection::unknown_backend,
-                 "smooth_scalar_cuda_rank2_rejects_n16") &&
-      passed;
-#else
-  passed = Check(cuda_rank2_validation.rejection() ==
-                     ApplicationRejection::unbuilt_backend,
-                 "smooth_scalar_cuda_rank2_unbuilt") &&
-      passed;
-#endif
-
-  const ApplicationValidation cuda_rank1 = ValidateApplicationOptions(
-      W8cCase(true, true, CudaRank1OneGpuBackendTag::id));
-  passed = Check(!cuda_rank1.accepted(),
-                 "smooth_scalar_cuda_rank1_rejected") &&
-      passed;
   const ApplicationValidation conventional_cuda_rank2 =
       ValidateApplicationOptions(W8cCase(
           false, true, CudaRank2OneGpuHostStagedBackendTag::id));
@@ -813,7 +732,7 @@ bool CheckCardScenarioTupleClosure()
   crossed = ScalarIgr(CpuSerialBackendTag::id);
   crossed.case_id = smooth_periodic_euler_v1_case_id;
   passed = Check(ValidateApplicationOptions(crossed).rejection() ==
-                     ApplicationRejection::unknown_case,
+                     ApplicationRejection::unknown_card,
                  "scalar_card_conventional_case_rejected") && passed;
   crossed = Smoke(CpuSerialBackendTag::id);
   SelectTuple(crossed, true);
@@ -823,7 +742,7 @@ bool CheckCardScenarioTupleClosure()
   crossed = ScalarIgr(CpuSerialBackendTag::id);
   SelectTuple(crossed, false);
   passed = Check(ValidateApplicationOptions(crossed).rejection() ==
-                     ApplicationRejection::unknown_tuple,
+                     ApplicationRejection::unknown_card,
                  "scalar_card_conventional_tuple_rejected") && passed;
   return passed;
 }
@@ -874,7 +793,9 @@ bool CheckMismatchedScenarioRoleFamilies()
       const ApplicationValidation validation = ValidateApplicationOptions(
           RoleForScenario(family.first, family.second, role));
       passed = Check(validation.rejection() ==
-                         ApplicationRejection::unknown_scenario,
+                         (family.first.card_id == scalar_igr_sc25_v3_card_id
+                              ? ApplicationRejection::unknown_card
+                              : ApplicationRejection::unknown_scenario),
                      "mismatched_card_scenario_role_rejected_early") &&
           passed;
     }
@@ -1051,316 +972,51 @@ bool CheckStaticEntryOffDiagonalMatrix()
   return passed;
 }
 
-bool CheckCoherentScalarIdentityEquivalence()
+bool CheckLegacyScalarCardQuarantine()
 {
-  struct BackendRow
-  {
-    std::string_view id;
-    ApplicationBackend backend;
-    bool scalar_available;
-    RuntimeTupleDescriptor tuple;
-  };
-  const std::array<BackendRow, 4> rows{{
-      {CpuSerialBackendTag::id, ApplicationBackend::cpu_serial,
-       DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1,
-       ScalarIgrCpuSerialRuntimeSelection::Descriptor()},
-      {CpuRank2BackendTag::id, ApplicationBackend::cpu_rank2,
-       DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1,
-       ScalarIgrCpuRank2RuntimeSelection::Descriptor()},
-      {CudaRank1OneGpuBackendTag::id,
-       ApplicationBackend::cuda_rank1_one_gpu,
-       DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 1,
-       ScalarIgrCudaRank1RuntimeSelection::Descriptor()},
-      {CudaRank2OneGpuHostStagedBackendTag::id,
-       ApplicationBackend::cuda_rank2_one_gpu_host_staged,
-       DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 1,
-       ScalarIgrCudaRank2RuntimeSelection::Descriptor()}}};
-  bool passed = true;
-  for (const BackendRow& row : rows)
-  {
-    const ApplicationOptionsView base = ScalarIgr(row.id);
-    const ApplicationValidation first = ValidateApplicationOptions(base);
-    const ApplicationValidation repeat = ValidateApplicationOptions(base);
-    if (!CompiledBackendAvailable(row.backend) || !row.scalar_available)
-    {
-      passed = Check(first.rejection() ==
-                         ApplicationRejection::unbuilt_backend,
-                     "coherent_scalar_unbuilt_rejection") && passed;
-      continue;
-    }
-    const ApplicationValidation writer = ValidateApplicationOptions(
-        CanonicalScalarCheckpointWriter(base));
-    const ApplicationValidation reader =
-        ValidateApplicationOptions(SplitReader(base));
-    StateHash derived_writer{};
-    const bool derived = reader.accepted() &&
-        DeriveSplitWriterRunConfigHashV1(*reader.config(), derived_writer);
-    CheckpointDescriptor checkpoint{};
-    if (first.accepted())
-    {
-      checkpoint.schema_version = checkpoint_schema_version;
-      checkpoint.tuple = first.config()->tuple();
-    }
-    passed = Check(
-                 first.accepted() && repeat.accepted() && writer.accepted() &&
-                     first.config()->scenario() ==
-                         ApplicationScenarioV1::scalar_igr_sc25_v3 &&
-                     first.config()->backend() == row.backend &&
-                     first.config()->tuple() == row.tuple &&
-                     first.config()->scientific_config_sha256() ==
-                         repeat.config()->scientific_config_sha256() &&
-                     first.config()->run_config_sha256() ==
-                         repeat.config()->run_config_sha256() &&
-                     writer.config()->scientific_config_sha256() ==
-                         first.config()->scientific_config_sha256() &&
-                     writer.config()->run_config_sha256() !=
-                         first.config()->run_config_sha256() &&
-                     derived &&
-                     derived_writer == writer.config()->run_config_sha256() &&
-                     checkpoint.schema_version == checkpoint_schema_version &&
-                     checkpoint.tuple == row.tuple,
-                 "coherent_scalar_hash_and_checkpoint_schema_equivalence") &&
-        passed;
-  }
-  return passed;
-}
+  bool passed = Check(
+      ParseApplicationScenario(scalar_igr_sc25_v3_scenario_id) ==
+          ApplicationScenarioV1::unknown,
+      "legacy_scalar_scenario_is_not_registered");
 
-bool CheckScalarIgrMatrix()
-{
-  bool passed = true;
-  const auto expected = [](const ApplicationBackend backend) {
-    return CompiledBackendAvailable(backend) &&
-        DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 1;
-  };
-  for (const auto& item : std::array<std::pair<std::string_view,
-                                               ApplicationBackend>, 2>{{
-           {CpuSerialBackendTag::id, ApplicationBackend::cpu_serial},
-           {CpuRank2BackendTag::id, ApplicationBackend::cpu_rank2}}})
-  {
-    const ApplicationValidation validation =
-        ValidateApplicationOptions(ScalarIgr(item.first));
-    passed = Check(expected(item.second) ? validation.accepted()
-                                        : validation.rejection() ==
-                                              ApplicationRejection::unbuilt_backend,
-                   "scalar_igr_cpu_static_matrix") && passed;
-    if (validation.accepted())
-      passed = Check(validation.config()->scalar_igr() &&
-                         validation.config()->scenario() ==
-                             ApplicationScenarioV1::scalar_igr_sc25_v3,
-                     "scalar_igr_exact_scenario") && passed;
-  }
-  for (const auto& item : std::array<std::pair<std::string_view, bool>, 2>{{
-           {CudaRank1OneGpuBackendTag::id,
-            DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK1 == 1},
-           {CudaRank2OneGpuHostStagedBackendTag::id,
-            DG_IGR_HDG_APP_HAS_SCALAR_IGR_CUDA_RANK2 == 1}}})
-  {
-    const ApplicationValidation validation =
-        ValidateApplicationOptions(ScalarIgr(item.first));
-    passed = Check(item.second ? validation.accepted()
-                               : validation.rejection() ==
-                                     ApplicationRejection::unbuilt_backend,
-                   "scalar_igr_cuda_static_matrix") && passed;
-    if (!item.second) continue;
-
-    const std::uint32_t rank_count =
-        item.first == CudaRank2OneGpuHostStagedBackendTag::id ? 2U : 1U;
-    ApplicationOptionsView fault_free = ScalarIgr(item.first);
-    fault_free.injection = {};
-    fault_free.retry_limit = 0;
-    const ApplicationValidation fault_free_validation =
-        ValidateApplicationOptions(fault_free);
-    const ApplicationValidation reader_validation =
-        ValidateApplicationOptions(SplitReader(fault_free));
-    StateHash expected_writer_hash{};
-    const bool expected_writer_ready = reader_validation.accepted() &&
-        DeriveSplitWriterRunConfigHashV1(
-            *reader_validation.config(), expected_writer_hash);
-    const auto canonical_writer_hash_matches =
-        [&](const ApplicationOptionsView& live)
-        {
-          const ApplicationValidation normalized =
-              ValidateApplicationOptions(CanonicalScalarCheckpointWriter(live));
-          return expected_writer_ready && normalized.accepted() &&
-              normalized.config()->run_config_sha256() ==
-                  expected_writer_hash;
-        };
-    const ApplicationValidation fault_free_public_writer =
-        ValidateApplicationOptions(SplitWriter(fault_free));
-    passed = Check(
-                 fault_free_validation.accepted() &&
-                     fault_free_public_writer.accepted() &&
-                     fault_free_public_writer.config()->run_config_sha256() !=
-                         expected_writer_hash &&
-                     canonical_writer_hash_matches(fault_free),
-                 "scalar_cuda_fault_free_checkpoint_writer_hash_normalizes") &&
-        passed;
-
-    for (std::uint32_t source = 0; source < rank_count; ++source)
-    {
-      for (const FailurePhase phase :
-           {FailurePhase::CheckpointStaging, FailurePhase::OutputStaging,
-            FailurePhase::AfterRecoveryBeforeCommit})
-      {
-        ApplicationOptionsView scheduled = ScalarIgr(item.first);
-        scheduled.injection = {FailureInjectionModeV1::prescribed, phase,
-                               scalar_igr_sc25_v3_checkpoint_step, source};
-        const ApplicationValidation scheduled_validation =
-            ValidateApplicationOptions(scheduled);
-        passed = Check(
-                     scheduled_validation.accepted() &&
-                         scheduled_validation.config()->injection() ==
-                             scheduled.injection &&
-                         scheduled_validation.config()->retry_limit() == 1 &&
-                         ValidateApplicationOptions(
-                             SplitWriter(scheduled)).accepted() &&
-                         canonical_writer_hash_matches(scheduled),
-                     "scalar_cuda_step10_scheduled_boundary_contract") &&
-            passed;
-      }
-
-      ApplicationOptionsView post_publication = ScalarIgr(item.first);
-      post_publication.injection = {
-          FailureInjectionModeV1::prescribed,
-          FailurePhase::AfterRecoveryBeforeCommit,
-          scalar_igr_sc25_v3_steps, source};
-      post_publication.retry_limit = 0;
-      const ApplicationValidation post_publication_validation =
-          ValidateApplicationOptions(post_publication);
-      const ApplicationValidation post_publication_writer_validation =
-          ValidateApplicationOptions(SplitWriter(post_publication));
-      passed = Check(
-                   post_publication_validation.accepted() &&
-                       post_publication_validation.config()->injection() ==
-                           post_publication.injection &&
-                       post_publication_validation.config()->retry_limit() ==
-                           0 &&
-                       post_publication_writer_validation.rejection() ==
-                           ApplicationRejection::invalid_run_role &&
-                       canonical_writer_hash_matches(post_publication),
-                   "scalar_cuda_step20_postpublication_boundary_contract") &&
-          passed;
-    }
-
-    ApplicationOptionsView malformed = ScalarIgr(item.first);
-    malformed.injection = {
-        FailureInjectionModeV1::prescribed,
-        FailurePhase::AfterRecoveryBeforeCommit,
-        scalar_igr_sc25_v3_checkpoint_step, rank_count};
-    passed = Check(ValidateApplicationOptions(malformed).rejection() ==
-                       ApplicationRejection::invalid_run_role,
-                   "scalar_cuda_rejects_out_of_range_scheduled_source") &&
-        passed;
-    malformed.injection.source_rank = 0;
-    malformed.retry_limit = 0;
-    passed = Check(ValidateApplicationOptions(malformed).rejection() ==
-                       ApplicationRejection::invalid_run_role,
-                   "scalar_cuda_rejects_terminal_step10_controls") && passed;
-    malformed.injection.target_step = scalar_igr_sc25_v3_steps;
-    malformed.retry_limit = scalar_igr_sc25_v3_retry_limit;
-    passed = Check(ValidateApplicationOptions(malformed).rejection() ==
-                       ApplicationRejection::invalid_run_role,
-                   "scalar_cuda_rejects_retrying_step20_controls") && passed;
-    malformed.injection.phase = FailurePhase::CheckpointStaging;
-    malformed.retry_limit = 0;
-    passed = Check(ValidateApplicationOptions(malformed).rejection() ==
-                       ApplicationRejection::invalid_run_role,
-                   "scalar_cuda_rejects_nonpublication_step20_phase") &&
-        passed;
-  }
-
-  ApplicationOptionsView h1 = ScalarIgr(CpuSerialBackendTag::id);
-  h1.interior_space = InteriorSpace::h1;
-  passed = Check(ValidateApplicationOptions(h1).rejection() ==
-                     ApplicationRejection::unsupported_h1,
-                 "scalar_igr_h1_honest_rejection") && passed;
-
-#if DG_IGR_HDG_APP_HAS_SCALAR_IGR_CPU == 0
   for (const std::string_view backend :
-       {CpuSerialBackendTag::id, CpuRank2BackendTag::id})
+       {CpuSerialBackendTag::id, CpuRank2BackendTag::id,
+        CudaRank1OneGpuBackendTag::id,
+        CudaRank2OneGpuHostStagedBackendTag::id})
   {
-    const ApplicationOptionsView scalar_reference = ScalarIgr(backend);
-    ApplicationOptionsView malformed_writer = SplitWriter(scalar_reference);
-    malformed_writer.injection = {};
-    malformed_writer.retry_limit = 0;
-    ApplicationOptionsView malformed_reader = SplitReader(scalar_reference);
-    malformed_reader.injection = {
-        FailureInjectionModeV1::prescribed,
-        smooth_periodic_euler_v1_failure_phase,
-        smooth_periodic_euler_v1_functional_failure_target_step,
-        SourceRank(backend)};
-    malformed_reader.retry_limit = smooth_periodic_euler_v1_retry_limit;
+    const ApplicationOptionsView base = ScalarIgr(backend);
+    ApplicationOptionsView h1 = base;
+    h1.interior_space = InteriorSpace::h1;
     for (const ApplicationOptionsView& request :
-         {SplitWriter(scalar_reference), SplitReader(scalar_reference),
-          malformed_writer, malformed_reader})
+         {base, SplitWriter(base), SplitReader(base), h1})
     {
-      passed = Check(
-                   ValidateApplicationOptions(request).rejection() ==
-                       ApplicationRejection::unbuilt_backend,
-                   "scalar_igr_unbuilt_cpu_roles_reject_explicitly") &&
+      const ApplicationValidation validation =
+          ValidateApplicationOptions(request);
+      const HdgMethodCapabilitiesV1 capabilities =
+          QueryHdgMethodCapabilitiesV1(request);
+      passed = Check(!validation.accepted() && validation.config() == nullptr &&
+                         validation.rejection() ==
+                             ApplicationRejection::unknown_card &&
+                         !capabilities.supported &&
+                         capabilities.formulation ==
+                             HdgFormulationV1::unknown &&
+                         capabilities.reason ==
+                             ApplicationRejection::unknown_card,
+                     "legacy_scalar_card_has_no_backend_or_role_admission") &&
           passed;
     }
   }
-  return passed;
-#else
-  const ApplicationOptionsView scalar_reference =
-      ScalarIgr(CpuSerialBackendTag::id);
-  passed = Check(
-               ValidateApplicationOptions(
-                   SplitWriter(scalar_reference)).accepted() &&
-                   ValidateApplicationOptions(
-                       SplitReader(scalar_reference)).accepted(),
-               "scalar_igr_writer_reader_role_matrix") && passed;
 
-  ApplicationOptionsView scalar_with_conventional_reference_controls =
-      scalar_reference;
-  scalar_with_conventional_reference_controls.injection = {};
-  scalar_with_conventional_reference_controls.retry_limit = 0;
-  passed = Check(
-               ValidateApplicationOptions(
-                   scalar_with_conventional_reference_controls).rejection() ==
-                   ApplicationRejection::invalid_run_role,
-               "scalar_igr_rejects_conventional_reference_controls") &&
+  const ApplicationValidation conventional =
+      ValidateApplicationOptions(Smoke(CpuSerialBackendTag::id));
+  passed = Check(conventional.accepted() &&
+                     conventional.config() != nullptr &&
+                     !conventional.config()->scalar_igr() &&
+                     CapabilitiesForV1(*conventional.config()).formulation ==
+                         HdgFormulationV1::conventional,
+                 "conventional_card_remains_the_only_application_formulation") &&
       passed;
-
-  ApplicationOptionsView scalar_with_conventional_reader_controls =
-      SplitReader(scalar_reference);
-  scalar_with_conventional_reader_controls.injection = {
-      FailureInjectionModeV1::prescribed,
-      smooth_periodic_euler_v1_failure_phase,
-      smooth_periodic_euler_v1_functional_failure_target_step,
-      0};
-  scalar_with_conventional_reader_controls.retry_limit =
-      smooth_periodic_euler_v1_retry_limit;
-  passed = Check(
-               ValidateApplicationOptions(
-                   scalar_with_conventional_reader_controls).rejection() ==
-                   ApplicationRejection::invalid_run_role,
-               "scalar_igr_rejects_conventional_reader_controls") && passed;
-
-  ApplicationOptionsView conventional_with_scalar_writer_controls =
-      SplitWriter(Functional(CpuSerialBackendTag::id));
-  conventional_with_scalar_writer_controls.injection =
-      scalar_reference.injection;
-  conventional_with_scalar_writer_controls.retry_limit =
-      scalar_igr_sc25_v3_retry_limit;
-  passed = Check(
-               ValidateApplicationOptions(
-                   conventional_with_scalar_writer_controls).rejection() ==
-                   ApplicationRejection::invalid_run_role,
-               "conventional_rejects_scalar_writer_controls") && passed;
-
-  ApplicationOptionsView conventional_with_scalar_reader_controls =
-      SplitReader(Functional(CpuSerialBackendTag::id));
-  conventional_with_scalar_reader_controls.injection = {};
-  conventional_with_scalar_reader_controls.retry_limit = 0;
-  passed = Check(
-               ValidateApplicationOptions(
-                   conventional_with_scalar_reader_controls).rejection() ==
-                   ApplicationRejection::invalid_run_role,
-               "conventional_rejects_scalar_reader_controls") && passed;
   return passed;
-#endif
 }
 
 } // namespace
@@ -1379,8 +1035,7 @@ int main()
   passed = CheckIntegrationSeamV1() && passed;
   passed = CheckClosedCapabilityQueryParityV1() && passed;
   passed = CheckStaticEntryOffDiagonalMatrix() && passed;
-  passed = CheckCoherentScalarIdentityEquivalence() && passed;
-  passed = CheckScalarIgrMatrix() && passed;
+  passed = CheckLegacyScalarCardQuarantine() && passed;
   if (passed)
   {
     std::cout << "HDG W8A typed application admission checks passed\n";

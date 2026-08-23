@@ -2001,7 +2001,7 @@ replace_cli_option(crossed_scalar_arguments crossed_scalar_arguments
                    --checkpoint-out
                    "${HDG_RUNTIME_TEST_OUTPUT}-crossed-scalar.checkpoint")
 require_pre_resource_rejection(
-  "scalar-card/conventional-case" unknown_case
+  "scalar-card/conventional-case" unknown_card
   "${HDG_RUNTIME_TEST_OUTPUT}-crossed-scalar"
   "${HDG_RUNTIME_TEST_OUTPUT}-crossed-scalar.checkpoint"
   ${crossed_scalar_arguments})
@@ -2014,7 +2014,7 @@ replace_cli_option(scalar_short_arguments scalar_short_arguments
                    --checkpoint-out
                    "${HDG_RUNTIME_TEST_OUTPUT}-scalar-three-step.checkpoint")
 require_pre_resource_rejection(
-  "scalar-card/three-step" unknown_scenario
+  "scalar-card/three-step" unknown_card
   "${HDG_RUNTIME_TEST_OUTPUT}-scalar-three-step"
   "${HDG_RUNTIME_TEST_OUTPUT}-scalar-three-step.checkpoint"
   ${scalar_short_arguments})
