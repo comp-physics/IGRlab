@@ -5,17 +5,128 @@ if(NOT DEFINED HDG_PERIODIC_EXECUTABLE OR
     "Periodic/nonperiodic generic HDG executables and a work directory are required.")
 endif()
 
+if(NOT DEFINED HDG_REPRESENTATIVE_DEVICE)
+  set(HDG_REPRESENTATIVE_DEVICE cpu)
+endif()
+if(NOT HDG_REPRESENTATIVE_DEVICE STREQUAL "cpu" AND
+   NOT HDG_REPRESENTATIVE_DEVICE STREQUAL "cuda")
+  message(FATAL_ERROR
+    "Representative HDG device must be cpu or cuda, got '${HDG_REPRESENTATIVE_DEVICE}'.")
+endif()
+if(NOT DEFINED HDG_REPRESENTATIVE_RANKS)
+  set(HDG_REPRESENTATIVE_RANKS 1)
+endif()
+if(HDG_REPRESENTATIVE_RANKS LESS 1)
+  message(FATAL_ERROR "Representative HDG rank count must be positive.")
+endif()
+
+set(_periodic_command "${HDG_PERIODIC_EXECUTABLE}")
+set(_nonperiodic_command "${HDG_NONPERIODIC_EXECUTABLE}")
+set(_command_postflags)
+if(HDG_REPRESENTATIVE_RANKS GREATER 1)
+  if(NOT DEFINED HDG_REPRESENTATIVE_MPIEXEC OR
+     NOT DEFINED HDG_REPRESENTATIVE_NUMPROC_FLAG)
+    message(FATAL_ERROR
+      "Representative rank-two HDG execution requires an MPI launcher.")
+  endif()
+  set(_periodic_command
+    "${HDG_REPRESENTATIVE_MPIEXEC}"
+    "${HDG_REPRESENTATIVE_NUMPROC_FLAG}"
+    "${HDG_REPRESENTATIVE_RANKS}"
+    ${HDG_REPRESENTATIVE_MPIEXEC_PREFLAGS}
+    "${HDG_PERIODIC_EXECUTABLE}")
+  set(_nonperiodic_command
+    "${HDG_REPRESENTATIVE_MPIEXEC}"
+    "${HDG_REPRESENTATIVE_NUMPROC_FLAG}"
+    "${HDG_REPRESENTATIVE_RANKS}"
+    ${HDG_REPRESENTATIVE_MPIEXEC_PREFLAGS}
+    "${HDG_NONPERIODIC_EXECUTABLE}")
+  set(_command_postflags ${HDG_REPRESENTATIVE_MPIEXEC_POSTFLAGS})
+endif()
+
+set(_periodic_mesh_arguments)
+if(DEFINED HDG_REPRESENTATIVE_PERIODIC_MESH)
+  if(NOT EXISTS "${HDG_REPRESENTATIVE_PERIODIC_MESH}")
+    message(FATAL_ERROR
+      "Representative periodic mesh does not exist: ${HDG_REPRESENTATIVE_PERIODIC_MESH}")
+  endif()
+  list(APPEND _periodic_mesh_arguments
+    --mesh "${HDG_REPRESENTATIVE_PERIODIC_MESH}")
+endif()
+set(_nonperiodic_mesh_arguments)
+if(DEFINED HDG_REPRESENTATIVE_NONPERIODIC_MESH)
+  if(NOT EXISTS "${HDG_REPRESENTATIVE_NONPERIODIC_MESH}")
+    message(FATAL_ERROR
+      "Representative physical mesh does not exist: ${HDG_REPRESENTATIVE_NONPERIODIC_MESH}")
+  endif()
+  list(APPEND _nonperiodic_mesh_arguments
+    --mesh "${HDG_REPRESENTATIVE_NONPERIODIC_MESH}")
+endif()
+if(HDG_REPRESENTATIVE_DEVICE STREQUAL "cuda" AND
+   (NOT DEFINED HDG_REPRESENTATIVE_PERIODIC_MESH OR
+    NOT DEFINED HDG_REPRESENTATIVE_NONPERIODIC_MESH))
+  message(FATAL_ERROR
+    "CUDA representative coverage requires explicitly bounded periodic and physical meshes.")
+endif()
+
 file(REMOVE_RECURSE "${HDG_REPRESENTATIVE_WORK}")
 file(MAKE_DIRECTORY "${HDG_REPRESENTATIVE_WORK}")
 
 set(_common_arguments
   --discretization hdg
-  --device cpu
+  --device "${HDG_REPRESENTATIVE_DEVICE}"
   --serial-refine 0
   --parallel-refine 0
   --time-step 0.00001
   --t-final 0.00001
   --no-glvis)
+
+# The CUDA gate deliberately uses bounded meshes and no VTK.  It reaches both
+# real application entry points through Solver::solve, exercises the periodic
+# source path with IGR, and covers every physical-boundary mode at p1.  The
+# separate CUDA qualification matrix carries the full p1-p3 order surface.
+if(HDG_REPRESENTATIVE_DEVICE STREQUAL "cuda")
+  execute_process(
+    COMMAND ${_periodic_command} ${_common_arguments}
+      ${_periodic_mesh_arguments}
+      --order 1
+      --regularization igr
+      --hdg-static-source 0.01
+      --no-vtk_save
+      ${_command_postflags}
+    RESULT_VARIABLE _periodic_status
+    OUTPUT_VARIABLE _periodic_stdout
+    ERROR_VARIABLE _periodic_stderr)
+  if(NOT _periodic_status EQUAL 0 OR
+     NOT _periodic_stdout MATCHES
+       "\\[hdg-main\\] status=Success.*regularization=igr" OR
+     NOT _periodic_stderr STREQUAL "")
+    message(FATAL_ERROR
+      "CUDA periodic p1 HDG IGR execution failed: ${_periodic_status}\\n${_periodic_stdout}\\n${_periodic_stderr}")
+  endif()
+
+  foreach(_boundary_mode IN ITEMS inlet-outlet all-outlet all-slip)
+    execute_process(
+      COMMAND ${_nonperiodic_command} ${_common_arguments}
+        ${_nonperiodic_mesh_arguments}
+        --order 1
+        --bc-mode ${_boundary_mode}
+        --regularization igr
+        --no-vtk_save
+        ${_command_postflags}
+      RESULT_VARIABLE _physical_status
+      OUTPUT_VARIABLE _physical_stdout
+      ERROR_VARIABLE _physical_stderr)
+    if(NOT _physical_status EQUAL 0 OR
+       NOT _physical_stdout MATCHES
+         "\\[hdg-main\\] status=Success.*regularization=igr" OR
+       NOT _physical_stderr STREQUAL "")
+      message(FATAL_ERROR
+        "CUDA physical-boundary ${_boundary_mode} p1 HDG IGR execution failed: ${_physical_status}\\n${_physical_stdout}\\n${_physical_stderr}")
+    endif()
+  endforeach()
+  return()
+endif()
 
 # Exercise the conventional source path while IGR augments the same solver.
 # Distinct final VTK payloads prove that the projected source reaches the
@@ -26,11 +137,12 @@ set(_source_output "${HDG_REPRESENTATIVE_WORK}/igr-nonzero-source")
 execute_process(
   COMMAND "${CMAKE_COMMAND}" -E env
     "DG_IGR_VTK_PREFIX_PATH=${_zero_output}"
-    "${HDG_PERIODIC_EXECUTABLE}" ${_common_arguments}
+    ${_periodic_command} ${_common_arguments} ${_periodic_mesh_arguments}
     --order 1
     --regularization igr
     --time-step-save 0.00001
     --vtk_save
+    ${_command_postflags}
   RESULT_VARIABLE _zero_status
   OUTPUT_VARIABLE _zero_stdout
   ERROR_VARIABLE _zero_stderr)
@@ -45,12 +157,13 @@ endif()
 execute_process(
   COMMAND "${CMAKE_COMMAND}" -E env
     "DG_IGR_VTK_PREFIX_PATH=${_source_output}"
-    "${HDG_PERIODIC_EXECUTABLE}" ${_common_arguments}
+    ${_periodic_command} ${_common_arguments} ${_periodic_mesh_arguments}
     --order 1
     --regularization igr
     --time-step-save 0.00001
     --vtk_save
     --hdg-static-source 0.01
+    ${_command_postflags}
   RESULT_VARIABLE _source_status
   OUTPUT_VARIABLE _source_stdout
   ERROR_VARIABLE _source_stderr)
@@ -78,10 +191,12 @@ if(_zero_payload STREQUAL _source_payload)
 endif()
 
 execute_process(
-  COMMAND "${HDG_NONPERIODIC_EXECUTABLE}" ${_common_arguments}
+  COMMAND ${_nonperiodic_command} ${_common_arguments}
+    ${_nonperiodic_mesh_arguments}
     --order 1
     --bc-mode inlet-outlet
     --no-vtk_save
+    ${_command_postflags}
   RESULT_VARIABLE _boundary_status
   OUTPUT_VARIABLE _boundary_stdout
   ERROR_VARIABLE _boundary_stderr)
@@ -99,11 +214,13 @@ endif()
 foreach(_boundary_mode IN ITEMS inlet-outlet all-outlet all-slip)
   foreach(_order IN ITEMS 1 2 3)
     execute_process(
-      COMMAND "${HDG_NONPERIODIC_EXECUTABLE}" ${_common_arguments}
+      COMMAND ${_nonperiodic_command} ${_common_arguments}
+        ${_nonperiodic_mesh_arguments}
         --order ${_order}
         --bc-mode ${_boundary_mode}
         --regularization igr
         --no-vtk_save
+        ${_command_postflags}
       RESULT_VARIABLE _igr_status
       OUTPUT_VARIABLE _igr_stdout
       ERROR_VARIABLE _igr_stderr)

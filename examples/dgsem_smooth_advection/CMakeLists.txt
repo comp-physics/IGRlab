@@ -1,9 +1,14 @@
 # Create the dgsem_smooth_advection executable
 add_executable(dgsem_smooth_advection dgsem_smooth_advection.cpp)
-if(TARGET dg_igr_hdg_main_backend_cpu)
-  # This case deliberately demonstrates the conventional CPU backend's
-  # physical-boundary semantics.  CUDA's periodic-only envelope is not opted
-  # in here.
+if(TARGET dg_igr_hdg_main_backend_cuda)
+  dg_igr_configure_hdg_cuda_final_consumer(dgsem_smooth_advection)
+  target_link_libraries(dgsem_smooth_advection PRIVATE
+    dg_igr_hdg_main_backend_cuda
+    igr_mfem)
+  target_compile_definitions(dgsem_smooth_advection PRIVATE
+    DG_IGR_HAS_HDG_MAIN_BACKEND=1
+    DG_IGR_HAS_HDG_MAIN_BACKEND_CUDA=1)
+elseif(TARGET dg_igr_hdg_main_backend_cpu)
   target_link_libraries(dgsem_smooth_advection dg_igr_hdg_main_backend_cpu)
   target_compile_definitions(dgsem_smooth_advection PRIVATE
     DG_IGR_HAS_HDG_MAIN_BACKEND=1

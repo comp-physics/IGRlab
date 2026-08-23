@@ -297,7 +297,8 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     target_link_libraries(dg_igr_hdg_sc25_oracle_cuda
       PUBLIC igr_mfem dg_igr_hdg_runtime_common
       PRIVATE umpire ${DG_IGR_REQUIRED_CUDA_TARGETS}
-              dg_igr_hdg_generic_cpu dg_igr_hdg_sc25_oracle_cpu)
+              dg_igr_hdg_runtime_cuda dg_igr_hdg_generic_cpu
+              dg_igr_hdg_sc25_oracle_cpu)
     dg_igr_hdg_require_target_link_closure_absent(
       dg_igr_hdg_runtime_cuda dg_igr_hdg_sc25_oracle_cuda)
     target_link_libraries(dg_igr_hdg_runtime_components INTERFACE

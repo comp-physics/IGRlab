@@ -34,7 +34,7 @@ void ValidateState(const mfem::Vector& state)
 
 EulerBoundaryPolicy PolicyFor(const dg_sim::EulerBoundaryPlanEntry& entry)
 {
-  EulerBoundaryPolicy policy;
+  EulerBoundaryPolicy policy{};
   switch (entry.kind)
   {
   case dg_sim::EulerBoundaryKind::Periodic:
@@ -45,9 +45,17 @@ EulerBoundaryPolicy PolicyFor(const dg_sim::EulerBoundaryPlanEntry& entry)
     {
       Reject("HDG boundary lowering requires an inlet state callback.");
     }
-    policy.kind = entry.inlet_model == dg_sim::EulerInletModel::Supersonic
-        ? EulerBoundaryPolicyKind::supersonic_inlet
-        : EulerBoundaryPolicyKind::subsonic_inlet;
+    switch (entry.inlet_model)
+    {
+    case dg_sim::EulerInletModel::Supersonic:
+      policy.kind = EulerBoundaryPolicyKind::supersonic_inlet;
+      break;
+    case dg_sim::EulerInletModel::Subsonic:
+      policy.kind = EulerBoundaryPolicyKind::subsonic_inlet;
+      break;
+    default:
+      Reject("HDG boundary lowering has an unsupported inlet model.");
+    }
     break;
   case dg_sim::EulerBoundaryKind::Outlet:
     switch (entry.outlet_model)

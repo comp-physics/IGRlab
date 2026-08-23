@@ -4,8 +4,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
     "${PROJECT_SOURCE_DIR}/include")
   if(MFEM_USE_CUDA)
     target_sources(hdg_smooth_periodic PRIVATE
-      "${PROJECT_SOURCE_DIR}/src/numerics/hdg/runtime/app/solver_cuda.cu"
-      $<TARGET_OBJECTS:dg_igr_hdg_runtime_scalar_cuda_rank2_app>)
+      "${PROJECT_SOURCE_DIR}/src/numerics/hdg/runtime/app/solver_cuda.cu")
     dg_igr_configure_hdg_cuda_final_consumer(hdg_smooth_periodic)
     target_link_libraries(hdg_smooth_periodic PRIVATE
       dg_igr_hdg_runtime_app_contract

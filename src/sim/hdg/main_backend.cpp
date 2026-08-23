@@ -200,15 +200,19 @@ FrozenBoundaryPlan FreezeBoundaryPlan(const EulerBoundaryPlan& source)
       {
         AppendDouble(key, state(component));
       }
-      if (entry.inlet_model == EulerInletModel::Supersonic)
+      switch (entry.inlet_model)
       {
+      case EulerInletModel::Supersonic:
         frozen.plan.AddSupersonicInlet(
             std::move(marker), [state] { return state; });
-      }
-      else
-      {
+        break;
+      case EulerInletModel::Subsonic:
         frozen.plan.AddSubsonicInlet(
             std::move(marker), [state] { return state; });
+        break;
+      default:
+        throw std::invalid_argument(
+            "HDG boundary plan has an unsupported inlet model");
       }
       break;
     }
@@ -315,8 +319,6 @@ std::string CanonicalNumericalPolicy(
          << policy.true_trace_projection_quadrature_order << ';'
          << policy.conventional_assembly_quadrature_order << ';'
          << policy.igr_assembly_quadrature_order << ';'
-         << policy.audit_quadrature_order << ';'
-         << policy.observable_quadrature_order << ';'
          << policy.maximum_nonlinear_updates << ';'
          << policy.maximum_linear_iterations << ';'
          << policy.maximum_line_search_trials << ';'

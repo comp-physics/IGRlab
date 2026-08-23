@@ -14,6 +14,30 @@
 #include <utility>
 #include <vector>
 
+namespace dg::hdg::runtime::cpu::detail
+{
+
+struct CpuQualificationTestAccess
+{
+  static bool AuditLastConservation(
+      const CpuNumericsCore& core, double& maximum_error,
+      double& maximum_relative_error, bool& gate) noexcept
+  {
+    return core.AuditLastBorrowedEulerConservation(
+        maximum_error, maximum_relative_error, gate);
+  }
+
+  static bool VerifyAssemblerJacobian(
+      CpuNumericsCore& core, const double relative_tolerance,
+      std::array<double, 6>& relative_errors) noexcept
+  {
+    return core.AuditBorrowedEulerAssemblerJacobian(
+        relative_tolerance, relative_errors);
+  }
+};
+
+} // namespace dg::hdg::runtime::cpu::detail
+
 namespace
 {
 
@@ -207,7 +231,8 @@ EulerHdgRequest Request(const mfem::ParMesh& mesh, const int order,
   request.initial_true_trace = {nullptr, 0, 4};
   request.source = {fields.source.empty() ? nullptr : fields.source.data(),
                     fields.source.size(), 4};
-  request.boundary = {&boundary, NonperiodicExterior};
+  request.boundary = {
+      &boundary, NonperiodicExterior, {nullptr, 0, 0, 0.0}};
   request.numerical_policy =
       dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
   return request;
@@ -412,7 +437,8 @@ bool CheckBorrowedTraceRestrictsInterior()
         : dg::hdg::generic::EulerFieldView{initial.data(), initial.size(), 4};
     request.initial_true_trace = {nullptr, 0, 4};
     request.source = {nullptr, 0, 4};
-    request.boundary = {&boundary, NonperiodicExterior};
+    request.boundary = {
+        &boundary, NonperiodicExterior, {nullptr, 0, 0, 0.0}};
     request.numerical_policy =
         dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
     if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
@@ -715,31 +741,17 @@ bool CheckPreparedSessionLifecycle()
   return true;
 }
 
-bool SameCommittedObservables(
-    const dg::hdg::generic::HdgEulerCommittedObservables& left,
-    const dg::hdg::generic::HdgEulerCommittedObservables& right)
+bool CheckCommittedExportLifecycle()
 {
-  return left.available == right.available &&
-      left.coordinates.time == right.coordinates.time &&
-      left.coordinates.dt == right.coordinates.dt &&
-      left.coordinates.step == right.coordinates.step &&
-      left.coordinates.generation == right.coordinates.generation &&
-      left.quadrature_order == right.quadrature_order &&
-      left.conserved_integrals == right.conserved_integrals &&
-      left.conserved_l2_norms == right.conserved_l2_norms &&
-      left.minimum_density == right.minimum_density &&
-      left.minimum_pressure == right.minimum_pressure;
-}
-
-bool CheckCommittedObservables()
-{
-  const dg::hdg::generic::HdgEulerCommittedObservables unavailable{};
-  if (dg::hdg::generic::IsValidHdgEulerCommittedObservables(unavailable, 0))
+  GenericEulerHdgCpuSession uninitialized;
+  std::array<double, 4> unavailable{{1.0, 2.0, 3.0, 4.0}};
+  const auto unavailable_before = unavailable;
+  if (uninitialized.ExportCommittedInterior(
+          {unavailable.data(), unavailable.size()}) ||
+      unavailable != unavailable_before)
   {
     return false;
   }
-  GenericEulerHdgCpuSession uninitialized;
-  if (uninitialized.ObserveCommitted().available) { return false; }
 
   mfem::ParMesh mesh = MakeBorrowedMesh();
   const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
@@ -748,27 +760,14 @@ bool CheckCommittedObservables()
                                        0.00, 0.00, 0.03, 0.04}};
   BoundaryContext boundary{};
   ExactBorrowedEulerFields fields(mesh, 1, initial, source);
-  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
-  if (request.numerical_policy.observable_quadrature_order != 4) { return false; }
-  request.numerical_policy.observable_quadrature_order = 9;
   GenericEulerHdgCpuSession session;
-  if (session.Initialize(request).status !=
+  if (session.Initialize(Request(mesh, 1, boundary, fields)).status !=
       GenericEulerCpuSessionStatus::initialized)
   {
     return false;
   }
+
   const auto before_coordinates = session.coordinates();
-  const auto before = session.ObserveCommitted();
-  if (!before.available || before.quadrature_order != 9 ||
-      !dg::hdg::generic::IsValidHdgEulerCommittedObservables(
-          before, session.capabilities()) ||
-      before.coordinates.time != before_coordinates.time ||
-      before.coordinates.dt != before_coordinates.dt ||
-      before.coordinates.step != before_coordinates.step ||
-      before.coordinates.generation != before_coordinates.generation)
-  {
-    return false;
-  }
   std::vector<double> committed_before(fields.initial.size());
   if (!session.ExportCommittedInterior(
           {committed_before.data(), committed_before.size()}))
@@ -779,7 +778,6 @@ bool CheckCommittedObservables()
   GenericEulerCpuPreparedStep prepared;
   if (session.Prepare(0.005, prepared).status !=
           GenericEulerCpuSessionStatus::prepared ||
-      !SameCommittedObservables(before, session.ObserveCommitted()) ||
       session.coordinates().generation != before_coordinates.generation)
   {
     return false;
@@ -789,8 +787,7 @@ bool CheckCommittedObservables()
           {committed_during_prepare.data(), committed_during_prepare.size()}) ||
       committed_during_prepare != committed_before ||
       session.Abort(std::move(prepared)).status !=
-          GenericEulerCpuSessionStatus::aborted ||
-      !SameCommittedObservables(before, session.ObserveCommitted()))
+          GenericEulerCpuSessionStatus::aborted)
   {
     return false;
   }
@@ -799,27 +796,27 @@ bool CheckCommittedObservables()
   {
     return false;
   }
-  std::vector<double> committed_after_before_observe(committed_before.size());
+  std::vector<double> committed_after_first_export(committed_before.size());
   if (!session.ExportCommittedInterior(
-          {committed_after_before_observe.data(),
-           committed_after_before_observe.size()}))
+          {committed_after_first_export.data(),
+           committed_after_first_export.size()}))
   {
     return false;
   }
-  const auto after = session.ObserveCommitted();
-  std::vector<double> committed_after(committed_before.size());
-  return after.available && after.quadrature_order == 9 &&
-      after.coordinates.step == 1 && after.coordinates.generation == 1 &&
-      after.coordinates.dt == 0.007 && after.coordinates.time == 0.007 &&
-      dg::hdg::generic::IsValidHdgEulerCommittedObservables(
-          after, session.capabilities()) &&
+  const auto after_coordinates = session.coordinates();
+  std::vector<double> committed_after_second_export(committed_before.size());
+  return after_coordinates.step == 1 &&
+      after_coordinates.generation == 1 && after_coordinates.dt == 0.007 &&
+      after_coordinates.time == 0.007 &&
       session.ExportCommittedInterior(
-          {committed_after.data(), committed_after.size()}) &&
-      committed_after == committed_after_before_observe &&
-      session.coordinates().step == after.coordinates.step;
+          {committed_after_second_export.data(),
+           committed_after_second_export.size()}) &&
+      committed_after_second_export == committed_after_first_export &&
+      session.coordinates().step == after_coordinates.step &&
+      session.coordinates().generation == after_coordinates.generation;
 }
 
-bool CheckCommittedObservablesZeroOwnedRank()
+bool CheckCommittedExportZeroOwnedRank()
 {
   mfem::ParMesh mesh = MakeRankZeroOwnedBorrowedMesh();
   const std::array<double, 8> initial{{1.0, 1.0, 0.0, 0.0,
@@ -833,10 +830,11 @@ bool CheckCommittedObservablesZeroOwnedRank()
   {
     return false;
   }
-  const auto observables = session.ObserveCommitted();
-  return observables.available &&
-      dg::hdg::generic::IsValidHdgEulerCommittedObservables(
-          observables, session.capabilities());
+  std::vector<double> committed(fields.initial.size(),
+                                std::numeric_limits<double>::quiet_NaN());
+  const bool exported = session.ExportCommittedInterior(
+      {committed.empty() ? nullptr : committed.data(), committed.size()});
+  return All(exported && committed == fields.initial);
 }
 
 bool CheckDefaultNumericalPolicyAdaptiveLinearCap()
@@ -974,11 +972,22 @@ bool CheckIgrExtensionConvergenceEvidence()
   double stable_dt = 0.0;
   if (!core.CommitBorrowedEuler(generation, coordinates, maximum_wave_speed,
                                 stable_dt)) return false;
+  double maximum_conservation_error =
+      std::numeric_limits<double>::quiet_NaN();
+  double maximum_conservation_relative_error =
+      std::numeric_limits<double>::quiet_NaN();
+  bool conservation_gate = false;
+  const bool conservation_audited =
+      dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+          AuditLastConservation(
+              core, maximum_conservation_error,
+              maximum_conservation_relative_error, conservation_gate);
   const auto& attempt = core.evidence().last_attempt;
-  return attempt.committed && attempt.nonlinear_updates > 1 &&
+  return conservation_audited && conservation_gate && attempt.committed &&
+      attempt.nonlinear_updates > 1 &&
       attempt.finite_gate && attempt.admissibility_gate &&
       attempt.recovery_gate && attempt.nonlinear_gate &&
-      attempt.true_residual_gate && attempt.conservation_gate &&
+      attempt.true_residual_gate &&
       attempt.work.accepted_newton_updates ==
           static_cast<std::uint64_t>(attempt.nonlinear_updates) &&
       attempt.work.complete_factor_setups == attempt.work.complete_trace_solves &&
@@ -986,9 +995,9 @@ bool CheckIgrExtensionConvergenceEvidence()
       attempt.final_nonlinear_residual <= attempt.initial_nonlinear_residual &&
       std::isfinite(attempt.maximum_true_relative_residual) &&
       attempt.maximum_true_relative_residual <= 1.0e-10 &&
-      std::isfinite(attempt.maximum_conservation_error) &&
-      std::isfinite(attempt.maximum_conservation_relative_error) &&
-      attempt.maximum_conservation_relative_error <= 1.0e-10 &&
+      std::isfinite(maximum_conservation_error) &&
+      std::isfinite(maximum_conservation_relative_error) &&
+      maximum_conservation_relative_error <= 1.0e-10 &&
       boundary.calls == 0;
 }
 
@@ -1024,17 +1033,28 @@ bool CheckIgrExtensionNumericalPolicy()
   double stable_dt = 0.0;
   if (!core.CommitBorrowedEuler(generation, coordinates, maximum_wave_speed,
                                 stable_dt)) return false;
+  double maximum_conservation_error =
+      std::numeric_limits<double>::quiet_NaN();
+  double maximum_conservation_relative_error =
+      std::numeric_limits<double>::quiet_NaN();
+  bool conservation_gate = false;
+  const bool conservation_audited =
+      dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+          AuditLastConservation(
+              core, maximum_conservation_error,
+              maximum_conservation_relative_error, conservation_gate);
   const auto& attempt = core.evidence().last_attempt;
-  return selected_quadrature && attempt.committed &&
+  return selected_quadrature && conservation_audited && conservation_gate &&
+      std::isfinite(maximum_conservation_error) && attempt.committed &&
       attempt.linear_iterations > 0 &&
       attempt.linear_iterations <=
           request.numerical_policy.maximum_linear_iterations *
               static_cast<int>(attempt.work.complete_trace_solves) &&
       attempt.maximum_true_relative_residual <=
           request.numerical_policy.true_residual_relative_tolerance &&
-      attempt.maximum_conservation_relative_error <=
+      maximum_conservation_relative_error <=
           request.numerical_policy.conservation_relative_tolerance &&
-      attempt.maximum_conservation_relative_error >= 0.0 &&
+      maximum_conservation_relative_error >= 0.0 &&
       boundary.calls == 0;
 }
 
@@ -1118,15 +1138,17 @@ bool CheckUnifiedIgrAssemblerJacobianForTests()
       ExactBorrowedEulerFields fields(mesh, order, initial, source);
       EulerHdgRequest request = Request(mesh, order, boundary, fields);
       request.boundary = {
-          &boundary, FixedExteriorForAssemblerJacobianForTests};
+          &boundary, FixedExteriorForAssemblerJacobianForTests,
+          {nullptr, 0, 0, 0.0}};
       request.numerical_policy.stabilization =
           {RegularizationKind::igr, 0.2, 0.8};
       dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
       std::array<double, 6> relative_errors{};
       const bool initialized = core.InitializeBorrowedEuler(request);
       const bool verified = initialized &&
-          core.VerifyBorrowedEulerAssemblerJacobianForTests(
-              relative_tolerance, relative_errors);
+          dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+              VerifyAssemblerJacobian(
+                  core, relative_tolerance, relative_errors);
       int global_boundary_calls = 0;
       const bool calls_reduced = MPI_Allreduce(
           &boundary.calls, &global_boundary_calls, 1, MPI_INT, MPI_SUM,
@@ -1529,9 +1551,9 @@ int main(int argc, char* argv[])
   const bool trace_restriction = CheckBorrowedTraceRestrictsInterior();
   const bool orders = CheckOrdersAndDeterminism();
   const bool prepared_lifecycle = CheckPreparedSessionLifecycle();
-  const bool committed_observables = CheckCommittedObservables();
-  const bool committed_observables_zero_owned =
-      CheckCommittedObservablesZeroOwnedRank();
+  const bool committed_export = CheckCommittedExportLifecycle();
+  const bool committed_export_zero_owned =
+      CheckCommittedExportZeroOwnedRank();
   const bool default_numerical_policy =
       CheckDefaultNumericalPolicyAdaptiveLinearCap();
   const bool periodic = CheckPeriodicAnnotationsRemainTraceCouplings();
@@ -1557,7 +1579,7 @@ int main(int argc, char* argv[])
   const bool callback_failure = CheckAcceptedRequestRankLocalCallbackFailure();
   const bool local = boundary_semantics && trace_restriction && orders &&
       prepared_lifecycle &&
-      committed_observables && committed_observables_zero_owned &&
+      committed_export && committed_export_zero_owned &&
       default_numerical_policy &&
       periodic && igr_extension && igr_extension_zero_local &&
       igr_extension_convergence &&
@@ -1583,9 +1605,9 @@ int main(int argc, char* argv[])
               << igr_extension_initialization
               << " igr_assembler_jacobian=" << igr_assembler_jacobian
               << " prepared_lifecycle=" << prepared_lifecycle
-              << " committed_observables=" << committed_observables
-              << " committed_observables_zero_owned="
-              << committed_observables_zero_owned
+              << " committed_export=" << committed_export
+              << " committed_export_zero_owned="
+              << committed_export_zero_owned
               << " default_numerical_policy=" << default_numerical_policy
               << " dynamic_tau=" << dynamic_tau
               << " boundary_picard=" << boundary_picard

@@ -327,8 +327,10 @@ struct CudaGenericArenaLayout
   std::size_t face_trace = 0;
   std::size_t face_weight = 0;
   std::size_t face_normal = 0;
+  std::size_t face_h = 0;
   std::size_t element_faces = 0;
   std::size_t boundary_reference = 0;
+  std::size_t boundary_pressure = 0;
   std::size_t solve_workspace = 0;
   std::size_t two_exchange_keys = 0;
 };
@@ -412,10 +414,13 @@ struct CudaDeviceView
   double* face_trace_shape = nullptr;
   double* face_weight = nullptr;
   double* face_normal = nullptr;
+  // Element-volume / face-measure length used by the IGR auxiliary closure.
+  double* face_h = nullptr;
   // Borrowed-host physical-boundary data.  A zero kind is an ordinary
   // periodic/shared/interior trace coupling; nonzero values select a copied
   // value-only exterior policy for this element-local face.
   double* boundary_reference = nullptr;
+  double* boundary_pressure = nullptr;
   double* status = nullptr;
   double* scalar = nullptr;
   std::uint64_t* hash_words = nullptr;
@@ -437,6 +442,8 @@ struct CudaDeviceView
 struct CudaMeshShape
 {
   int elements = 0;
+  int interior_components = conserved_components;
+  int trace_components = conserved_components;
   int scalar_interior_dofs = 0;
   int scalar_face_dofs = 0;
   int interior_dofs = 0;
@@ -454,6 +461,11 @@ struct CudaMeshShape
   int vector_owned_count = 0;
   int vector_send_count = 0;
   int vector_receive_count = 0;
+  int order = cuda_w8a::polynomial_order;
+  double igr_alpha = 0.0;
+  double igr_beta = 0.0;
+  double boundary_gamma = 1.4;
+  bool igr_active = false;
   bool borrowed_static_source = false;
   bool borrowed_host_inputs = false;
   bool borrowed_static_boundary_policies = false;
@@ -692,6 +704,9 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
                                   mfem::HypreILU& ilu,
                                   mfem::HypreGMRES& gmres,
                                   int ranks,
+                                  double relative_tolerance,
+                                  int maximum_iterations,
+                                  int krylov_dimension,
                                   std::uint64_t matrix_generation,
                                   CudaHypreSetupOrderEvidence& evidence)
     noexcept;
@@ -701,6 +716,10 @@ bool CudaRefreshFactorAndSolve(mfem::HypreParMatrix& matrix,
                                mfem::HypreILU& ilu,
                                mfem::HypreGMRES& gmres,
                                int ranks,
+                               MPI_Comm communicator,
+                               double relative_tolerance,
+                               int maximum_iterations,
+                               int krylov_dimension,
                                std::uint64_t matrix_generation,
                                CudaSolveDiagnostics& diagnostics) noexcept;
 bool CudaHypreDevicePolicyValid(mfem::HypreParMatrix& matrix,
@@ -753,6 +772,10 @@ bool CudaLaunchMaximumWave(const CudaDeviceView& view,
                            const double* interior,
                            const double* element_trace,
                            double* result) noexcept;
+bool CudaLaunchIgrConservation(const CudaDeviceView& view,
+                               const CudaMeshShape& shape,
+                               double dt, double* result) noexcept;
+
 bool CudaLaunchHash(const double* values, int count,
                     std::uint64_t* words) noexcept;
 
@@ -811,6 +834,7 @@ public:
   bool Initialize(const CudaConfig& config, CudaRunEvidence& evidence,
                   const RuntimeTupleDescriptor& tuple) noexcept
   {
+    communicator_ = CudaCollectiveCommunicator(config);
     oracle_capture_requested_ = config.capture_oracle;
     TransportPolicy::ResetLedger();
     CudaPolicyContext setup{};
@@ -838,6 +862,30 @@ public:
       ReportCudaSetupFailure(evidence.rank, "build-topology");
       return false;
     }
+    linear_relative_tolerance_ = config.use_generic_numerical_policy
+        ? config.numerical_policy.linear_relative_tolerance : 1.0e-13;
+    true_residual_relative_tolerance_ = config.use_generic_numerical_policy
+        ? config.numerical_policy.true_residual_relative_tolerance : 1.0e-10;
+    maximum_linear_iterations_ = config.use_generic_numerical_policy
+        ? generic::ResolveEulerHdgMaximumLinearIterations(
+              config.numerical_policy.maximum_linear_iterations,
+              shape_.global_true_trace_count)
+        : 400;
+    krylov_dimension_ = config.use_generic_numerical_policy
+        ? generic::EulerHdgKrylovRestartDimension(
+              shape_.global_true_trace_count)
+        : (ranks_ == 1 ? shape_.true_trace_count
+                       : shape_.global_true_trace_count);
+    if (!CollectiveContinue(linear_relative_tolerance_ > 0.0 &&
+                            std::isfinite(linear_relative_tolerance_) &&
+                            true_residual_relative_tolerance_ > 0.0 &&
+                            std::isfinite(true_residual_relative_tolerance_) &&
+                            maximum_linear_iterations_ > 0 &&
+                            krylov_dimension_ > 0))
+    {
+      ReportCudaSetupFailure(evidence.rank, "generic-linear-policy");
+      return false;
+    }
     if (!CollectiveContinue(InitializeBorrowedHostFields(config)))
     {
       ReportCudaSetupFailure(evidence.rank, "borrowed-host-fields");
@@ -848,7 +896,7 @@ public:
     std::array<int, 2> ghost_counts{};
     const bool ghost_census_ready = MPI_Allgather(
         &local_ghost_count, 1, MPI_INT, ghost_counts.data(), 1, MPI_INT,
-        MPI_COMM_WORLD) == MPI_SUCCESS;
+        communicator_) == MPI_SUCCESS;
     if (!CollectiveContinue(ghost_census_ready))
     {
       ReportCudaSetupFailure(evidence.rank, "ghost-census");
@@ -1010,9 +1058,9 @@ public:
     double global_hmin = local_hmin_;
     maximum_wave_speed = host_cfl_scalars_[0];
     const bool hmin_reduced = MPI_Allreduce(&local_hmin_, &global_hmin, 1,
-        MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD) == MPI_SUCCESS;
+        MPI_DOUBLE, MPI_MIN, communicator_) == MPI_SUCCESS;
     const bool wave_reduced = MPI_Allreduce(&host_cfl_scalars_[0],
-        &maximum_wave_speed, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD) == MPI_SUCCESS;
+        &maximum_wave_speed, 1, MPI_DOUBLE, MPI_MAX, communicator_) == MPI_SUCCESS;
     const double denominator = 2.0 * static_cast<double>(order) + 1.0;
     backend_stable_dt = maximum_wave_speed > 0.0
         ? global_hmin / (denominator * maximum_wave_speed)
@@ -1028,7 +1076,7 @@ public:
     int local_value = local ? 1 : 0;
     int global_value = 0;
     return MPI_Allreduce(&local_value, &global_value, 1, MPI_INT, MPI_MIN,
-                         MPI_COMM_WORLD) == MPI_SUCCESS && global_value == 1;
+                         communicator_) == MPI_SUCCESS && global_value == 1;
   }
 
   bool CollectiveCount(const bool local, int& count) const noexcept
@@ -1036,7 +1084,7 @@ public:
     const int local_value = local ? 1 : 0;
     count = 0;
     return MPI_Allreduce(&local_value, &count, 1, MPI_INT, MPI_SUM,
-                         MPI_COMM_WORLD) == MPI_SUCCESS;
+                         communicator_) == MPI_SUCCESS;
   }
 
   bool StageCheckpoint(const state_slot& frozen,
@@ -1270,6 +1318,420 @@ public:
     return DistributeCurrentTrace(workspace.trace.coefficients);
   }
 
+private:
+  /**
+   * Central-difference audit of the live device assembler.  This private
+   * implementation stages no output and publishes no slot; the qualification
+   * TU reaches it only through the private friend accessor.
+   */
+  bool AuditBorrowedEulerAssemblerJacobian(
+      const double relative_tolerance,
+      std::array<double, 6>& relative_errors) noexcept
+  {
+    relative_errors.fill(std::numeric_limits<double>::infinity());
+    const bool component_layout = shape_.igr_active
+        ? shape_.interior_components == igr_interior_components &&
+            shape_.trace_components == igr_trace_components
+        : shape_.interior_components == conserved_components &&
+            shape_.trace_components == conserved_components;
+    const bool admitted = initialized_ && shape_.borrowed_host_inputs &&
+        component_layout &&
+        std::isfinite(relative_tolerance) && relative_tolerance > 0.0;
+    if (!CollectiveContinue(admitted)) return false;
+
+    std::vector<double> base_interior, base_true_trace;
+    std::vector<double> interior_direction, true_trace_direction;
+    std::vector<double> element_trace_direction;
+    std::vector<double> matrix_a, matrix_b, matrix_c, matrix_d;
+    std::vector<double> a_direction, b_direction, c_direction, d_direction;
+    bool local_valid = true;
+    try
+    {
+      base_interior.resize(static_cast<std::size_t>(shape_.interior_count));
+      base_true_trace.resize(static_cast<std::size_t>(shape_.true_trace_count));
+      interior_direction.resize(base_interior.size());
+      true_trace_direction.resize(base_true_trace.size());
+      element_trace_direction.resize(static_cast<std::size_t>(shape_.elements) *
+                                     shape_.trace_dofs);
+      matrix_a.resize(static_cast<std::size_t>(shape_.elements) *
+                      shape_.interior_dofs * shape_.interior_dofs);
+      matrix_b.resize(static_cast<std::size_t>(shape_.elements) *
+                      shape_.interior_dofs * shape_.trace_dofs);
+      matrix_c.resize(static_cast<std::size_t>(shape_.elements) *
+                      shape_.trace_dofs * shape_.interior_dofs);
+      matrix_d.resize(static_cast<std::size_t>(shape_.elements) *
+                      shape_.trace_dofs * shape_.trace_dofs);
+      a_direction.assign(base_interior.size(), 0.0);
+      b_direction.assign(base_interior.size(), 0.0);
+      c_direction.assign(element_trace_direction.size(), 0.0);
+      d_direction.assign(element_trace_direction.size(), 0.0);
+    }
+    catch (...) { local_valid = false; }
+    if (!CollectiveContinue(local_valid)) return false;
+
+    const auto d2h = [](double* destination, const double* source,
+                        const std::size_t count) noexcept
+    {
+      return TransportPolicy::DeviceToHost(
+          destination, source, count * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export);
+    };
+    const auto h2d = [](double* destination, const double* source,
+                        const std::size_t count) noexcept
+    {
+      return TransportPolicy::HostToDevice(
+          destination, source, count * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export);
+    };
+    local_valid = d2h(base_interior.data(),
+                      committed_slot_.interior.coefficients,
+                      base_interior.size()) &&
+        d2h(base_true_trace.data(), committed_slot_.trace.coefficients,
+            base_true_trace.size()) &&
+        TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
+    if (!CollectiveContinue(local_valid)) return false;
+
+    const auto deterministic_unit = [](const std::size_t index,
+                                       const std::uint64_t salt) noexcept
+    {
+      std::uint64_t value =
+          (static_cast<std::uint64_t>(index) + 1U) *
+              11400714819323198485ULL +
+          salt * 7046029254386353131ULL;
+      value ^= value >> 29U;
+      const double magnitude = 0.25 + 0.75 *
+          static_cast<double>((value >> 8U) % 29U) / 28.0;
+      return (value & 1U) == 0U ? magnitude : -magnitude;
+    };
+    if (shape_.igr_active)
+      for (int element = 0; element < shape_.elements; ++element)
+        for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
+        {
+          const std::size_t base = static_cast<std::size_t>(element) *
+              shape_.interior_dofs;
+          const std::size_t ordinal = static_cast<std::size_t>(element) *
+              shape_.scalar_interior_dofs + scalar;
+          base_interior[base + scalar +
+              4 * shape_.scalar_interior_dofs] =
+              0.035 * deterministic_unit(ordinal, 11U);
+          base_interior[base + scalar +
+              5 * shape_.scalar_interior_dofs] =
+              0.025 * deterministic_unit(ordinal, 17U);
+          base_interior[base + scalar +
+              6 * shape_.scalar_interior_dofs] =
+              0.025 * deterministic_unit(ordinal, 23U);
+        }
+    const int true_trace_scalar = shape_.true_trace_count /
+        shape_.trace_components;
+    local_valid = true_trace_scalar * shape_.trace_components ==
+        shape_.true_trace_count;
+    if (shape_.igr_active)
+      for (int scalar = 0;
+           local_valid && scalar < true_trace_scalar; ++scalar)
+        base_true_trace[
+            static_cast<std::size_t>(4 * true_trace_scalar + scalar)] =
+            0.02 * deterministic_unit(
+                static_cast<std::size_t>(scalar), 31U);
+    for (std::size_t index = 0; index < base_interior.size(); ++index)
+      interior_direction[index] = deterministic_unit(index, 41U) *
+          std::max(1.0, std::abs(base_interior[index]));
+    for (std::size_t index = 0; index < base_true_trace.size(); ++index)
+      true_trace_direction[index] = deterministic_unit(index, 47U) *
+          std::max(1.0, std::abs(base_true_trace[index]));
+    if (!CollectiveContinue(local_valid)) return false;
+
+    const auto install_state = [&](const std::vector<double>& interior,
+                                   const std::vector<double>& trace) noexcept
+    {
+      const bool uploaded = h2d(view_.work_interior, interior.data(),
+                                interior.size()) &&
+          h2d(view_.work_true_trace, trace.data(), trace.size()) &&
+          TransportPolicy::Synchronize(
+              CudaTransferSite::generic_host_export);
+      if (!CollectiveContinue(uploaded)) return false;
+      return DistributeCurrentTrace(view_.work_true_trace);
+    };
+    const auto assemble = [&](const std::vector<double>& interior,
+                              const std::vector<double>& trace,
+                              std::vector<double>* residual_interior,
+                              std::vector<double>* residual_trace) noexcept
+    {
+      if (!install_state(interior, trace)) return false;
+      TransportPolicy::SetPhase(CudaFailurePhase::assembly,
+                                current_generation_);
+      const bool assembled = CudaLaunchAssembly(
+              view_, shape_, fixed_dt) &&
+          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+          StatusPassed();
+      if (!CollectiveContinue(assembled)) return false;
+      if (residual_interior == nullptr || residual_trace == nullptr)
+        return true;
+      bool copied = true;
+      try
+      {
+        residual_interior->resize(
+            static_cast<std::size_t>(shape_.interior_count));
+        residual_trace->resize(static_cast<std::size_t>(shape_.elements) *
+                               shape_.trace_dofs);
+      }
+      catch (...) { copied = false; }
+      if (!CollectiveContinue(copied)) return false;
+      copied = d2h(residual_interior->data(), view_.residual_r,
+                   residual_interior->size()) &&
+          d2h(residual_trace->data(), view_.residual_g,
+              residual_trace->size()) &&
+          TransportPolicy::Synchronize(
+              CudaTransferSite::generic_host_export);
+      return CollectiveContinue(copied);
+    };
+
+    local_valid = h2d(view_.old_interior, base_interior.data(),
+                      base_interior.size()) &&
+        TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
+    if (!CollectiveContinue(local_valid) ||
+        !install_state(base_interior, base_true_trace))
+      return false;
+    // Match the production conventional-Euler prepare sequence exactly:
+    // seed one lagged LLF stabilization field from the committed state, then
+    // hold it fixed through every nonlinear/Jacobian reassembly.  IGR owns no
+    // such conventional face field and continues directly to assembly.
+    if (!shape_.igr_active)
+    {
+      const bool tau_seeded = CudaLaunchSeedBorrowedLaggedLlfTau(
+              view_, shape_) &&
+          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+          StatusPassed();
+      if (!CollectiveContinue(tau_seeded)) return false;
+    }
+    if (!assemble(base_interior, base_true_trace, nullptr, nullptr))
+      return false;
+    local_valid = d2h(matrix_a.data(), view_.a, matrix_a.size()) &&
+        d2h(matrix_b.data(), view_.b, matrix_b.size()) &&
+        d2h(matrix_c.data(), view_.c, matrix_c.size()) &&
+        d2h(matrix_d.data(), view_.d, matrix_d.size()) &&
+        TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
+    if (!CollectiveContinue(local_valid)) return false;
+
+    // Use the production owner/ghost distribution to obtain the exact signed
+    // element-local trace direction consumed by B and D.
+    local_valid = h2d(view_.work_true_trace, true_trace_direction.data(),
+                      true_trace_direction.size()) &&
+        TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
+    if (!CollectiveContinue(local_valid) ||
+        !DistributeCurrentTrace(view_.work_true_trace))
+      return false;
+    local_valid = d2h(element_trace_direction.data(),
+                      view_.current_local_trace,
+                      element_trace_direction.size()) &&
+        TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
+    if (!CollectiveContinue(local_valid)) return false;
+
+    for (int element = 0; element < shape_.elements; ++element)
+    {
+      const std::size_t interior_offset =
+          static_cast<std::size_t>(element) * shape_.interior_dofs;
+      const std::size_t trace_offset =
+          static_cast<std::size_t>(element) * shape_.trace_dofs;
+      const std::size_t a_offset = interior_offset * shape_.interior_dofs;
+      const std::size_t b_offset = static_cast<std::size_t>(element) *
+          shape_.interior_dofs * shape_.trace_dofs;
+      const std::size_t c_offset = static_cast<std::size_t>(element) *
+          shape_.trace_dofs * shape_.interior_dofs;
+      const std::size_t d_offset = trace_offset * shape_.trace_dofs;
+      for (int row = 0; row < shape_.interior_dofs; ++row)
+      {
+        for (int column = 0; column < shape_.interior_dofs; ++column)
+          a_direction[interior_offset + row] += matrix_a[
+              a_offset + static_cast<std::size_t>(row) *
+                  shape_.interior_dofs + column] *
+              interior_direction[interior_offset + column];
+        for (int column = 0; column < shape_.trace_dofs; ++column)
+          b_direction[interior_offset + row] += matrix_b[
+              b_offset + static_cast<std::size_t>(row) *
+                  shape_.trace_dofs + column] *
+              element_trace_direction[trace_offset + column];
+      }
+      for (int row = 0; row < shape_.trace_dofs; ++row)
+      {
+        for (int column = 0; column < shape_.interior_dofs; ++column)
+          c_direction[trace_offset + row] += matrix_c[
+              c_offset + static_cast<std::size_t>(row) *
+                  shape_.interior_dofs + column] *
+              interior_direction[interior_offset + column];
+        for (int column = 0; column < shape_.trace_dofs; ++column)
+          d_direction[trace_offset + row] += matrix_d[
+              d_offset + static_cast<std::size_t>(row) *
+                  shape_.trace_dofs + column] *
+              element_trace_direction[trace_offset + column];
+      }
+    }
+
+    const double difference_step =
+        std::cbrt(std::numeric_limits<double>::epsilon());
+    const auto central_difference = [&](const bool perturb_interior,
+                                        const bool perturb_trace,
+                                        std::vector<double>& difference_r,
+                                        std::vector<double>& difference_g)
+        noexcept
+    {
+      std::vector<double> plus_interior, minus_interior;
+      std::vector<double> plus_trace, minus_trace;
+      std::vector<double> plus_r, plus_g, minus_r, minus_g;
+      bool ready = true;
+      try
+      {
+        plus_interior = base_interior;
+        minus_interior = base_interior;
+        plus_trace = base_true_trace;
+        minus_trace = base_true_trace;
+        if (perturb_interior)
+          for (std::size_t index = 0; index < base_interior.size(); ++index)
+          {
+            plus_interior[index] += difference_step *
+                interior_direction[index];
+            minus_interior[index] -= difference_step *
+                interior_direction[index];
+          }
+        if (perturb_trace)
+          for (std::size_t index = 0; index < base_true_trace.size(); ++index)
+          {
+            plus_trace[index] += difference_step * true_trace_direction[index];
+            minus_trace[index] -= difference_step * true_trace_direction[index];
+          }
+      }
+      catch (...) { ready = false; }
+      if (!CollectiveContinue(ready) ||
+          !assemble(plus_interior, plus_trace, &plus_r, &plus_g) ||
+          !assemble(minus_interior, minus_trace, &minus_r, &minus_g))
+        return false;
+      try
+      {
+        difference_r.resize(plus_r.size());
+        difference_g.resize(plus_g.size());
+        const double inverse_width = 0.5 / difference_step;
+        for (std::size_t index = 0; index < difference_r.size(); ++index)
+          difference_r[index] = inverse_width *
+              (plus_r[index] - minus_r[index]);
+        for (std::size_t index = 0; index < difference_g.size(); ++index)
+          difference_g[index] = inverse_width *
+              (plus_g[index] - minus_g[index]);
+      }
+      catch (...) { return CollectiveContinue(false); }
+      return CollectiveContinue(true);
+    };
+
+    std::vector<double> difference_a, difference_c;
+    std::vector<double> difference_b, difference_d;
+    std::vector<double> difference_combined_r, difference_combined_g;
+    if (!central_difference(true, false, difference_a, difference_c) ||
+        !central_difference(false, true, difference_b, difference_d) ||
+        !central_difference(true, true, difference_combined_r,
+                            difference_combined_g))
+      return false;
+    std::vector<double> combined_r(a_direction.size(), 0.0);
+    std::vector<double> combined_g(c_direction.size(), 0.0);
+    for (std::size_t index = 0; index < combined_r.size(); ++index)
+      combined_r[index] = a_direction[index] + b_direction[index];
+    for (std::size_t index = 0; index < combined_g.size(); ++index)
+      combined_g[index] = c_direction[index] + d_direction[index];
+
+    const auto relative_error = [&](const std::vector<double>& difference,
+                                    const std::vector<double>& linearized,
+                                    double& error) noexcept
+    {
+      if (!CollectiveContinue(difference.size() == linearized.size()))
+        return false;
+      std::array<double, 4> local{};
+      for (std::size_t index = 0; index < difference.size(); ++index)
+      {
+        const double delta = difference[index] - linearized[index];
+        local[0] += delta * delta;
+        local[1] += difference[index] * difference[index];
+        local[2] += linearized[index] * linearized[index];
+      }
+      local[3] = static_cast<double>(difference.size());
+      std::array<double, 4> global{};
+      const bool reduced = MPI_Allreduce(
+          local.data(), global.data(), static_cast<int>(global.size()),
+          MPI_DOUBLE, MPI_SUM, communicator_) == MPI_SUCCESS;
+      if (!CollectiveContinue(reduced)) return false;
+      const double denominator = std::max({
+          std::sqrt(global[1]), std::sqrt(global[2]),
+          difference_step * std::sqrt(std::max(1.0, global[3]))});
+      error = std::sqrt(global[0]) / denominator;
+      const double activity_floor = 1.0e-12 *
+          std::sqrt(std::max(1.0, global[3]));
+      return CollectiveContinue(std::isfinite(error) &&
+          std::sqrt(global[1]) > activity_floor &&
+          std::sqrt(global[2]) > activity_floor);
+    };
+    local_valid = relative_error(difference_a, a_direction,
+                                 relative_errors[0]) &&
+        relative_error(difference_b, b_direction, relative_errors[1]) &&
+        relative_error(difference_c, c_direction, relative_errors[2]) &&
+        relative_error(difference_d, d_direction, relative_errors[3]) &&
+        relative_error(difference_combined_r, combined_r,
+                       relative_errors[4]) &&
+        relative_error(difference_combined_g, combined_g,
+                       relative_errors[5]);
+    if (!local_valid) return false;
+
+    const bool restored = assemble(
+        base_interior, base_true_trace, nullptr, nullptr);
+    const bool within_tolerance = std::all_of(
+        relative_errors.begin(), relative_errors.end(),
+        [relative_tolerance](const double error)
+        { return std::isfinite(error) && error <= relative_tolerance; });
+    return restored && CollectiveContinue(within_tolerance);
+  }
+
+public:
+  bool IgrConservationBalance(const double dt, double& maximum_error,
+                              double& maximum_relative_error) noexcept
+  {
+    maximum_error = 0.0;
+    maximum_relative_error = 0.0;
+    constexpr int components = 5;
+    constexpr int result_scalars = 2 * components + 1;
+    std::array<double, result_scalars> local{};
+    const bool launched = initialized_ && shape_.igr_active &&
+        std::isfinite(dt) && dt > 0.0 &&
+        CudaLaunchIgrConservation(view_, shape_, dt, view_.scalar) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    if (!CollectiveContinue(launched)) return false;
+    const bool copied = TransportPolicy::DeviceToHost(
+            local.data(), view_.scalar, local.size() * sizeof(double),
+            CudaTransferCategory::scalar_diagnostic,
+            CudaTransferSite::scalar_status) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    bool local_valid = copied && local[2 * components] == 1.0;
+    for (int index = 0; local_valid && index < 2 * components; ++index)
+      local_valid = std::isfinite(local[static_cast<std::size_t>(index)]);
+    if (!CollectiveContinue(local_valid)) return false;
+    std::array<double, components> global_balance{};
+    std::array<double, components> global_scale{};
+    const bool balance_reduced = MPI_Allreduce(
+        local.data(), global_balance.data(), components, MPI_DOUBLE,
+        MPI_SUM, communicator_) == MPI_SUCCESS;
+    const bool scale_reduced = MPI_Allreduce(
+        local.data() + components, global_scale.data(), components,
+        MPI_DOUBLE, MPI_SUM, communicator_) == MPI_SUCCESS;
+    if (!CollectiveContinue(balance_reduced && scale_reduced)) return false;
+    for (int component = 0; component < components; ++component)
+    {
+      const double error = std::abs(
+          global_balance[static_cast<std::size_t>(component)]);
+      const double relative = error /
+          (1.0 + global_scale[static_cast<std::size_t>(component)]);
+      maximum_error = std::max(maximum_error, error);
+      maximum_relative_error = std::max(maximum_relative_error, relative);
+    }
+    return CollectiveContinue(std::isfinite(maximum_error) &&
+                              std::isfinite(maximum_relative_error));
+  }
+
   CudaNumericalResult Execute(const CudaConfig& config,
                               const AttemptIdentity& attempt,
                               state_slot& workspace) noexcept
@@ -1305,7 +1767,7 @@ public:
     // nonlinear update, then retain it unchanged through every assembly and
     // line-search reassembly.  The legacy manufactured W8A path deliberately
     // does not launch this kernel and continues to use its fixed arithmetic.
-    if (shape_.borrowed_host_inputs)
+    if (shape_.borrowed_host_inputs && !shape_.igr_active)
     {
       const bool tau_seeded = CudaLaunchSeedBorrowedLaggedLlfTau(view_, shape_) &&
           TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
@@ -1328,7 +1790,7 @@ public:
       const int local_claim = rank_ == config.injection.source_rank ? 1 : 0;
       int claims = 0;
       if (MPI_Allreduce(&local_claim, &claims, 1, MPI_INT, MPI_SUM,
-                        MPI_COMM_WORLD) != MPI_SUCCESS || claims != 1)
+                        communicator_) != MPI_SUCCESS || claims != 1)
       {
         injection_protocol_failure = true;
         result.reason = FailureReason::collective_protocol;
@@ -1351,18 +1813,31 @@ public:
       return result;
     }
     result.finite = std::isfinite(result.initial_residual) &&
-        result.initial_residual > 1.0e-8;
+        (config.use_generic_numerical_policy ||
+         result.initial_residual > 1.0e-8);
     result.final_residual = result.initial_residual;
-    const double target = 1.0e-10 * (1.0 + result.initial_residual);
+    const double nonlinear_relative_tolerance =
+        config.use_generic_numerical_policy
+            ? config.numerical_policy.nonlinear_relative_tolerance : 1.0e-10;
+    const double armijo_constant = config.use_generic_numerical_policy
+        ? config.numerical_policy.armijo_constant : 1.0e-4;
+    const int maximum_line_search_trials =
+        config.use_generic_numerical_policy
+            ? config.numerical_policy.maximum_line_search_trials : 13;
+    const double target = nonlinear_relative_tolerance *
+        (1.0 + result.initial_residual);
     // Physical boundary rows use the same value-only exterior-state Picard
     // linearization as the CPU path.  Match that bounded envelope without
     // changing the periodic generic or legacy W8A iteration limit.
-    const int maximum_nonlinear_updates =
-        shape_.borrowed_static_boundary_policies ? 80 : 20;
+    const int maximum_nonlinear_updates = config.use_generic_numerical_policy
+        ? config.numerical_policy.maximum_nonlinear_updates
+        : (shape_.borrowed_static_boundary_policies ? 80 : 20);
     std::uint64_t last_product_generation = 0;
     for (int iteration = 0; iteration < maximum_nonlinear_updates; ++iteration)
     {
-      if (result.nonlinear_updates >= 2 && result.final_residual <= target)
+      const bool minimum_update_witness = config.use_generic_numerical_policy ||
+          result.nonlinear_updates >= 2;
+      if (minimum_update_witness && result.final_residual <= target)
         break;
       if (inject_at(CudaFailurePhase::condensation)) { return result; }
       const bool condensed = CopyBase(workspace) &&
@@ -1413,7 +1888,7 @@ public:
       }
       last_product_generation = generation;
       bool accepted = false;
-      for (int trial = 0; trial <= 12; ++trial)
+      for (int trial = 0; trial < maximum_line_search_trials; ++trial)
       {
         const double alpha = std::ldexp(1.0, -trial);
         const bool trial_ready = CudaLaunchTrial(view_, shape_, alpha) &&
@@ -1450,7 +1925,7 @@ public:
           return result;
         }
         if (trial_residual <=
-            (1.0 - 1.0e-4 * alpha) * result.final_residual)
+            (1.0 - armijo_constant * alpha) * result.final_residual)
         {
           result.final_residual = trial_residual;
           ++result.nonlinear_updates;
@@ -1485,7 +1960,9 @@ public:
 
     // Freeze one coherent accepted linearization: A/B/C/D, Schur/RHS,
     // solution, and recovery all describe the same candidate generation.
-    const bool coherent_base = result.nonlinear_updates >= 2 &&
+    const bool coherent_base =
+        (config.use_generic_numerical_policy ||
+         result.nonlinear_updates >= 2) &&
         result.final_residual <= target && CopyBase(workspace) &&
         Ticket(CudaFailurePhase::condensation) &&
         CudaLaunchCondensation(view_, shape_) &&
@@ -1520,6 +1997,12 @@ public:
       result.reason = FailureReason::recovery_gate;
       return result;
     }
+    // A generic steady state may satisfy the nonlinear gate before its first
+    // Newton update.  The coherent condensation/trace-solve/recovery sequence
+    // above is still formed and validated; it is the recovery witness for
+    // that zero-update candidate.  Legacy W8A retains its two-update witness.
+    result.recovery = true;
+    result.candidate_ready = true;
     // Rank-two increment distribution reuses distributed_local_trace as its
     // host-staged ghost buffer.  Restore the accepted current trace before
     // oracle capture so current_local_trace, distributed_local_trace, and
@@ -1542,10 +2025,23 @@ public:
         StatusPassed();
     result.admissible = CollectiveContinue(local_admissible);
     result.true_residual = std::isfinite(result.true_relative_residual) &&
-        result.true_relative_residual <= 1.0e-10;
+        result.true_relative_residual <= true_residual_relative_tolerance_;
     if (config.force_private_scientific_gate_failure)
       result.true_residual = false;
     if (inject_at(CudaFailurePhase::diagnostics)) { return result; }
+    if (shape_.igr_active)
+    {
+      result.conservation = IgrConservationBalance(
+          attempt.dt, result.maximum_conservation_error,
+          result.maximum_conservation_relative_error) &&
+          result.maximum_conservation_relative_error <=
+              config.numerical_policy.conservation_relative_tolerance;
+      if (!CollectiveContinue(result.conservation))
+      {
+        result.reason = FailureReason::success_gate;
+        return result;
+      }
+    }
     const std::uint64_t current_allocation_events =
         AllocatorPolicy::AllocationEvents();
     bool allocation_plateau_exact =
@@ -1572,7 +2068,7 @@ public:
             baseline_deallocation_events_ &&
         allocation_plateau_exact;
     result.success = result.finite && result.admissible && result.recovery &&
-        result.true_residual && result.telemetry;
+        result.true_residual && result.conservation && result.telemetry;
     result.reason = result.success ? FailureReason::none :
         (!result.true_residual ? FailureReason::true_residual_gate
                               : FailureReason::success_gate);
@@ -1646,6 +2142,31 @@ public:
                       CudaMutableHostL2Output destination) noexcept;
 
 private:
+  friend struct CudaQualificationTestAccess;
+
+  static bool IgrActive(const CudaConfig& config) noexcept
+  {
+    return config.use_generic_numerical_policy &&
+        config.numerical_policy.stabilization.kind ==
+            generic::RegularizationKind::igr;
+  }
+
+  static int InteriorComponents(const CudaConfig& config) noexcept
+  { return IgrActive(config) ? igr_interior_components : conserved_components; }
+
+  static int TraceComponents(const CudaConfig& config) noexcept
+  { return IgrActive(config) ? igr_trace_components : conserved_components; }
+
+  static int AssemblyOrder(const CudaConfig& config) noexcept
+  {
+    if (config.use_generic_numerical_policy)
+      return IgrActive(config)
+          ? config.numerical_policy.igr_assembly_quadrature_order
+          : config.numerical_policy.conventional_assembly_quadrature_order;
+    return config.order == functional_polynomial_order
+        ? functional_assembly_quadrature_order : assembly_quadrature_order;
+  }
+
   static bool ExactTopologyShapeFitsCapacity(
       const CudaConfig& config, const mfem::ParMesh& mesh,
       const mfem::ParFiniteElementSpace& interior,
@@ -1673,11 +2194,10 @@ private:
     const int scalar_interior_dofs = fe->GetDof();
     const int scalar_face_dofs = face_fe->GetDof();
     const int interior_dofs =
-        conserved_components * scalar_interior_dofs;
+        InteriorComponents(config) * scalar_interior_dofs;
     const int trace_dofs =
-        faces_per_element * conserved_components * scalar_face_dofs;
-    const int assembly_order = config.order == functional_polynomial_order
-        ? functional_assembly_quadrature_order : assembly_quadrature_order;
+        faces_per_element * TraceComponents(config) * scalar_face_dofs;
+    const int assembly_order = AssemblyOrder(config);
     const int volume_points = mfem::IntRules.Get(
         fe->GetGeomType(), assembly_order).GetNPoints();
     const int face_points = mfem::IntRules.Get(
@@ -1685,11 +2205,19 @@ private:
     const bool common_shape = trace.GetVSize() > 0 && trace.GetTrueVSize() > 0 &&
         exchange.map.dofs.global_true_dof_count > 0 &&
         scalar_interior_dofs > 0 &&
-        scalar_interior_dofs <= maximum_scalar_dofs_per_element &&
+        scalar_interior_dofs <= (generic
+            ? generic_maximum_scalar_dofs_per_element
+            : maximum_scalar_dofs_per_element) &&
         scalar_face_dofs > 0 &&
-        scalar_face_dofs <= maximum_scalar_dofs_per_face &&
-        interior_dofs <= maximum_interior_dofs_per_element &&
-        trace_dofs <= maximum_trace_dofs_per_element &&
+        scalar_face_dofs <= (generic
+            ? generic_maximum_scalar_dofs_per_face
+            : maximum_scalar_dofs_per_face) &&
+        interior_dofs <= (generic
+            ? generic_maximum_interior_dofs_per_element
+            : maximum_interior_dofs_per_element) &&
+        trace_dofs <= (generic
+            ? generic_maximum_trace_dofs_per_element
+            : maximum_trace_dofs_per_element) &&
         volume_points <= maximum_volume_points &&
         face_points <= maximum_face_points;
     if (generic) return common_shape;
@@ -1712,10 +2240,11 @@ private:
           config.order, dimension, mfem::FiniteElement::VALUE,
           mfem::BasisType::GaussLegendre);
       mfem::ParFiniteElementSpace interior_space(
-          config.borrowed_mesh, &interior_collection, conserved_components,
+          config.borrowed_mesh, &interior_collection,
+          InteriorComponents(config),
           mfem::Ordering::byNODES);
       mfem::ParFiniteElementSpace trace_space(
-          config.borrowed_mesh, &trace_collection, conserved_components,
+          config.borrowed_mesh, &trace_collection, TraceComponents(config),
           mfem::Ordering::byNODES);
       interior_space.ExchangeFaceNbrData();
       trace_space.ExchangeFaceNbrData();
@@ -1733,13 +2262,17 @@ private:
   {
     const bool supported_rank = config.expected_rank_count == 1 ||
         config.expected_rank_count == 2;
-    const bool supported_order = config.order == smoke_polynomial_order ||
-        config.order == functional_polynomial_order;
-    int world_ranks = 0;
-    const bool world_ready =
-        MPI_Comm_size(MPI_COMM_WORLD, &world_ranks) == MPI_SUCCESS;
-    bool local_valid = supported_rank && supported_order && world_ready &&
-        world_ranks == config.expected_rank_count;
+    const bool supported_order = config.use_borrowed_topology &&
+            config.use_borrowed_host_inputs
+        ? config.order >= generic::minimum_polynomial_order &&
+            config.order <= generic::maximum_polynomial_order
+        : config.order == smoke_polynomial_order ||
+            config.order == functional_polynomial_order;
+    int collective_ranks = 0;
+    const bool communicator_ready = communicator_ != MPI_COMM_NULL &&
+        MPI_Comm_size(communicator_, &collective_ranks) == MPI_SUCCESS;
+    bool local_valid = supported_rank && supported_order && communicator_ready &&
+        collective_ranks == config.expected_rank_count;
     int local_elements = 0;
 
     if (config.use_borrowed_topology)
@@ -1756,13 +2289,14 @@ private:
               config.borrowed_global_topology));
       if (local_valid)
       {
-        int caller_world = MPI_UNEQUAL;
+        int caller_collective = MPI_UNEQUAL;
         int mesh_caller = MPI_UNEQUAL;
         const MPI_Comm mesh_communicator = config.borrowed_mesh->GetComm();
         local_valid =
-            MPI_Comm_compare(config.borrowed_communicator, MPI_COMM_WORLD,
-                             &caller_world) == MPI_SUCCESS &&
-            (caller_world == MPI_IDENT || caller_world == MPI_CONGRUENT) &&
+            MPI_Comm_compare(config.borrowed_communicator, communicator_,
+                             &caller_collective) == MPI_SUCCESS &&
+            (caller_collective == MPI_IDENT ||
+             caller_collective == MPI_CONGRUENT) &&
             MPI_Comm_compare(config.borrowed_communicator, mesh_communicator,
                              &mesh_caller) == MPI_SUCCESS &&
             (mesh_caller == MPI_IDENT || mesh_caller == MPI_CONGRUENT) &&
@@ -1874,15 +2408,18 @@ private:
     long long global_face_measure = 0;
     long long global_physical_faces = 0;
     const bool element_census = MPI_Allreduce(&local_element_count,
-        &global_elements, 1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+        &global_elements, 1, MPI_LONG_LONG_INT, MPI_SUM,
+        communicator_) == MPI_SUCCESS;
     const bool face_census = MPI_Allreduce(&local_face_measure,
-        &global_face_measure, 1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+        &global_face_measure, 1, MPI_LONG_LONG_INT, MPI_SUM,
+        communicator_) == MPI_SUCCESS;
     const bool boundary_census = MPI_Allreduce(&local_physical_faces,
-        &global_physical_faces, 1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+        &global_physical_faces, 1, MPI_LONG_LONG_INT, MPI_SUM,
+        communicator_) == MPI_SUCCESS;
     const bool policy_usage_census = MPI_Allreduce(local_policy_uses.data(),
         global_policy_uses.data(),
         static_cast<int>(global_policy_uses.size()), MPI_LONG_LONG_INT,
-        MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+        MPI_SUM, communicator_) == MPI_SUCCESS;
     bool every_policy_used = config.borrowed_boundary_policies.count == 0
         ? global_physical_faces == 0
         : global_physical_faces > 0;
@@ -1903,8 +2440,8 @@ private:
   bool ConfigureDeviceAndRanks(const CudaConfig& config,
                                CudaRunEvidence& evidence) noexcept
   {
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
-    MPI_Comm_size(MPI_COMM_WORLD, &ranks_);
+    MPI_Comm_rank(communicator_, &rank_);
+    MPI_Comm_size(communicator_, &ranks_);
     const bool rank_count_valid = ranks_ == config.expected_rank_count;
     const bool cuda_set_device_valid =
         cudaSetDevice(config.requested_device) == cudaSuccess;
@@ -2032,7 +2569,7 @@ private:
     {
       if (MPI_Allgather(gpu_uuid_.data(), 16, MPI_UNSIGNED_CHAR,
                         gathered.data(), 16, MPI_UNSIGNED_CHAR,
-                        MPI_COMM_WORLD) != MPI_SUCCESS)
+                        communicator_) != MPI_SUCCESS)
         return false;
       same_physical_gpu_ =
           std::equal(gathered.begin(), gathered.begin() + 16,
@@ -2074,7 +2611,7 @@ private:
         for (int element = 0; element < global_elements; ++element)
           partition[static_cast<std::size_t>(element)] =
               element * ranks_ / global_elements;
-        owned_mesh_.emplace(MPI_COMM_WORLD, serial_mesh_, partition.data());
+        owned_mesh_.emplace(communicator_, serial_mesh_, partition.data());
         mesh_ = &*owned_mesh_;
       }
       interior_collection_.emplace(
@@ -2084,8 +2621,9 @@ private:
           config.order, dimension, mfem::FiniteElement::VALUE,
           mfem::BasisType::GaussLegendre);
       interior_space_.emplace(mesh_, &*interior_collection_,
-                              conserved_components, mfem::Ordering::byNODES);
-      trace_space_.emplace(mesh_, &*trace_collection_, conserved_components,
+                              InteriorComponents(config),
+                              mfem::Ordering::byNODES);
+      trace_space_.emplace(mesh_, &*trace_collection_, TraceComponents(config),
                            mfem::Ordering::byNODES);
       interior_space_->ExchangeFaceNbrData();
       trace_space_->ExchangeFaceNbrData();
@@ -2108,12 +2646,20 @@ private:
         trace_space_->GetFaceElement(first_faces[0]);
     shape_.scalar_interior_dofs = fe == nullptr ? 0 : fe->GetDof();
     shape_.scalar_face_dofs = face_fe == nullptr ? 0 : face_fe->GetDof();
+    shape_.interior_components = InteriorComponents(config);
+    shape_.trace_components = TraceComponents(config);
     shape_.interior_dofs =
-        conserved_components * shape_.scalar_interior_dofs;
-    shape_.trace_dofs = faces_per_element * conserved_components *
+        shape_.interior_components * shape_.scalar_interior_dofs;
+    shape_.trace_dofs = faces_per_element * shape_.trace_components *
         shape_.scalar_face_dofs;
-    shape_.assembly_order = config.order == functional_polynomial_order
-        ? functional_assembly_quadrature_order : assembly_quadrature_order;
+    shape_.assembly_order = AssemblyOrder(config);
+    shape_.order = config.order;
+    shape_.igr_active = IgrActive(config);
+    shape_.igr_alpha = shape_.igr_active
+        ? config.numerical_policy.stabilization.alpha : 0.0;
+    shape_.igr_beta = shape_.igr_active
+        ? config.numerical_policy.stabilization.beta : 0.0;
+    shape_.boundary_gamma = config.borrowed_boundary_policies.gamma;
     const long long expected_interior = static_cast<long long>(shape_.elements) *
         static_cast<long long>(shape_.interior_dofs);
     const int interior_vsize = interior_space_->GetVSize();
@@ -2216,8 +2762,10 @@ private:
       layout.local_trace = local_trace;
       layout.true_trace = true_trace;
       layout.element_faces = element_faces;
+      layout.face_h = shape_.igr_active ? element_faces : 0;
       valid = valid && checked_product(element_faces, conserved_components,
                                        layout.boundary_reference);
+      layout.boundary_pressure = element_faces;
       if (!valid) return false;
       const std::size_t host_elements = generic ? layout.elements : maximum_rank_elements;
       const std::size_t host_interior = generic ? interior :
@@ -2252,8 +2800,13 @@ private:
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points, 0.0);
       host_face_normal_.assign(generic ? layout.face_normal :
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * dimension, 0.0);
+      host_face_h_.assign(generic && shape_.igr_active ? layout.face_h : 0,
+                          1.0);
       host_boundary_reference_.assign(generic &&
           shape_.borrowed_static_boundary_policies ? layout.boundary_reference : 0,
+          0.0);
+      host_boundary_pressure_.assign(generic &&
+          shape_.borrowed_static_boundary_policies ? layout.boundary_pressure : 0,
           0.0);
       host_boundary_policy_kind_.assign(generic &&
           shape_.borrowed_static_boundary_policies ? layout.element_faces : 0, 0);
@@ -2315,10 +2868,12 @@ private:
           checked_add(doubles, layout.volume_weight) && checked_add(doubles, layout.volume_position) &&
           checked_add(doubles, layout.face_interior) && checked_add(doubles, layout.face_trace) &&
           checked_add(doubles, layout.face_weight) && checked_add(doubles, layout.face_normal) &&
-          checked_add(doubles, elements) && checked_add(doubles, 8) &&
+          (!shape_.igr_active || checked_add(doubles, layout.face_h)) &&
+          checked_add(doubles, elements) && checked_add(doubles, 11) &&
           checked_add(doubles, layout.face_weight) &&
           (!shape_.borrowed_static_boundary_policies ||
-           checked_add(doubles, layout.boundary_reference));
+           (checked_add(doubles, layout.boundary_reference) &&
+            checked_add(doubles, layout.boundary_pressure)));
       std::size_t integers = 16;
       valid = valid && checked_add(integers, layout.element_trace) &&
           checked_add(integers, three_local_matrix) &&
@@ -2509,6 +3064,7 @@ private:
   bool no_fallback_ = true;
   bool oracle_captured_ = false;
   bool oracle_capture_requested_ = false;
+  MPI_Comm communicator_ = MPI_COMM_WORLD;
   int rank_ = -1;
   int ranks_ = 0;
   int device_ = -1;
@@ -2569,6 +3125,10 @@ private:
   double local_hmin_ = std::numeric_limits<double>::infinity();
   std::array<double, 2> host_cfl_scalars_{{0.0, 0.0}};
   bool allocation_plateau_sampled_ = false;
+  double linear_relative_tolerance_ = 1.0e-13;
+  double true_residual_relative_tolerance_ = 1.0e-10;
+  int maximum_linear_iterations_ = 400;
+  int krylov_dimension_ = 20;
   std::size_t host_exchange_bytes_ = 0;
   std::array<CudaDeviceTicket, maximum_device_tickets> tickets_{};
   std::size_t ticket_count_ = 0;
@@ -2588,7 +3148,9 @@ private:
   std::vector<double> host_face_trace_shape_{};
   std::vector<double> host_face_weight_{};
   std::vector<double> host_face_normal_{};
+  std::vector<double> host_face_h_{};
   std::vector<double> host_boundary_reference_{};
+  std::vector<double> host_boundary_pressure_{};
   std::vector<int> host_boundary_policy_kind_{};
   std::vector<double> host_exact_interior_{};
   std::vector<double> host_perturbed_interior_{};

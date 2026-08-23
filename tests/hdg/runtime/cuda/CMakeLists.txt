@@ -171,6 +171,131 @@ set_tests_properties(
     RESOURCE_LOCK dg_igr_sm120
     TIMEOUT 1800)
 
+# Qualification of IGR as an optional augmentation of the production generic
+# CUDA Euler session.  This target deliberately links no SC25/P1 oracle.
+add_executable(dg_igr_hdg_runtime_cuda_generic_euler_extension
+  test_generic_euler_extension.cu)
+target_include_directories(dg_igr_hdg_runtime_cuda_generic_euler_extension
+  PRIVATE
+    "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_hdg_runtime_cuda_generic_euler_extension
+  PRIVATE
+    dg_igr_hdg_runtime_cuda
+    mfem
+    MPI::MPI_CXX)
+target_compile_options(dg_igr_hdg_runtime_cuda_generic_euler_extension
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+set_target_properties(dg_igr_hdg_runtime_cuda_generic_euler_extension
+  PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_EXTENSIONS OFF
+    CUDA_ARCHITECTURES 120
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+foreach(_order IN ITEMS 1 2 3)
+  add_test(
+    NAME dg_igr_hdg_runtime_cuda_generic_euler_extension_p${_order}_rank1
+    COMMAND dg_igr_hdg_runtime_cuda_generic_euler_extension
+      --order ${_order})
+  add_test(
+    NAME dg_igr_hdg_runtime_cuda_generic_euler_extension_p${_order}_rank2
+    COMMAND
+      "${MPIEXEC_EXECUTABLE}"
+      "${MPIEXEC_NUMPROC_FLAG}" 2
+      ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_hdg_runtime_cuda_generic_euler_extension>
+      --order ${_order}
+      ${MPIEXEC_POSTFLAGS})
+  set_tests_properties(
+    dg_igr_hdg_runtime_cuda_generic_euler_extension_p${_order}_rank1
+    PROPERTIES
+      LABELS "hdg;runtime;cuda;generic-euler;extension;igr;conventional;p${_order};physical;periodic;source;initial-trace;lifecycle"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 3600)
+  set_tests_properties(
+    dg_igr_hdg_runtime_cuda_generic_euler_extension_p${_order}_rank2
+    PROPERTIES
+      LABELS "hdg;runtime;cuda;generic-euler;extension;igr;conventional;p${_order};physical;periodic;source;initial-trace;lifecycle;mpi"
+      PROCESSORS 2
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 3600)
+endforeach()
+
+# Borrowed generic sessions must use their request/mesh communicator.  Each
+# invocation leaves one MPI_COMM_WORLD rank passive while the active subgroup
+# performs a complete CUDA IGR transaction; the rank-2 case also proves an
+# asymmetric-null mesh rejection before device setup.
+add_executable(dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator
+  test_generic_euler_subcommunicator.cu)
+target_include_directories(
+  dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator
+  PRIVATE
+    "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(
+  dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator
+  PRIVATE
+    dg_igr_hdg_runtime_cuda
+    mfem
+    MPI::MPI_CXX)
+target_compile_options(
+  dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+set_target_properties(
+  dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator
+  PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_EXTENSIONS OFF
+    CUDA_ARCHITECTURES 120
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_rank1
+  COMMAND
+    "${MPIEXEC_EXECUTABLE}"
+    "${MPIEXEC_NUMPROC_FLAG}" 2
+    ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator>
+    --active-ranks 1
+    ${MPIEXEC_POSTFLAGS})
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_rank2
+  COMMAND
+    "${MPIEXEC_EXECUTABLE}"
+    "${MPIEXEC_NUMPROC_FLAG}" 3
+    ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator>
+    --active-ranks 2
+    ${MPIEXEC_POSTFLAGS})
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_rank1
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;generic-euler;igr;subcommunicator;rank1;mpi"
+    PROCESSORS 2
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 3600)
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_rank2
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;generic-euler;igr;subcommunicator;rank2;mpi;negative"
+    PROCESSORS 3
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 3600)
+
 get_target_property(_dg_igr_hdg_cuda_leaf_resolve
   dg_igr_hdg_runtime_cuda_w8a_leaf CUDA_RESOLVE_DEVICE_SYMBOLS)
 if(NOT _dg_igr_hdg_cuda_leaf_resolve STREQUAL "ON")
