@@ -75,6 +75,19 @@ bool CollectiveAll(const MPI_Comm communicator, const bool local) noexcept
                     communicator) == MPI_SUCCESS && output == 1;
 }
 
+bool ExactBoolConsensus(const MPI_Comm communicator,
+                        const bool value) noexcept
+{
+  int ranks = 0;
+  const int input = value ? 1 : 0;
+  int count = 0;
+  return communicator != MPI_COMM_NULL &&
+      MPI_Comm_size(communicator, &ranks) == MPI_SUCCESS && ranks > 0 &&
+      MPI_Allreduce(&input, &count, 1, MPI_INT, MPI_SUM,
+                    communicator) == MPI_SUCCESS &&
+      (count == 0 || count == ranks);
+}
+
 bool ExactDoubleConsensus(const MPI_Comm communicator,
                           const double value) noexcept
 {
@@ -722,13 +735,6 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       HdgEulerSessionStatus::initialized)
     return Reject(request, "generic CUDA session initialization failed");
   CudaMutableHostL2Output destination{};
-  if (!CollectiveAll(request.communicator,
-                     FreshOutputView(*published_state, scalar_count,
-                                     destination)))
-    return Reject(request, "initial CUDA committed-state output view failed");
-  local_ok = session.ExportCommittedInterior(destination);
-  if (!CollectiveAll(request.communicator, local_ok))
-    return Reject(request, "initial CUDA committed-state export failed");
 
   std::unique_ptr<HdgTransactionalTimeAdapter> time_driver;
   std::unique_ptr<HDGParaViewSeries> output;
@@ -773,16 +779,32 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   if (!CollectiveAll(request.communicator, time_driver != nullptr &&
       (!request.options.vtk_save || output != nullptr)))
     return Reject(request, "CUDA HDG time/output setup failed");
+
+  std::optional<HdgTransactionalTimeAdapter::OutputEvent> initial;
   try
   {
-    if (output)
-      if (const auto initial = time_driver->InitialOutput())
-        output->Write(Metadata(*initial, 0));
-    local_ok = true;
+    initial = time_driver->InitialOutput();
+    local_ok = !initial || output != nullptr;
   }
   catch (...) { local_ok = false; }
   if (!CollectiveAll(request.communicator, local_ok))
-    return Reject(request, "CUDA HDG initial ParaView output failed");
+    return Reject(request, "CUDA HDG initial output preview failed");
+  if (!ExactBoolConsensus(request.communicator, initial.has_value()))
+    return Reject(request, "CUDA HDG initial output differs between ranks");
+  if (initial)
+  {
+    if (!CollectiveAll(request.communicator,
+                       FreshOutputView(*published_state, scalar_count,
+                                       destination)))
+      return Reject(request, "initial CUDA committed-state output view failed");
+    local_ok = session.ExportCommittedInterior(destination);
+    if (!CollectiveAll(request.communicator, local_ok))
+      return Reject(request, "initial CUDA committed-state export failed");
+    try { output->Write(Metadata(*initial, 0)); local_ok = true; }
+    catch (...) { local_ok = false; }
+    if (!CollectiveAll(request.communicator, local_ok))
+      return Reject(request, "CUDA HDG initial ParaView output failed");
+  }
 
   while (!time_driver->Finished())
   {
@@ -821,37 +843,13 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       time_driver->RecordFailure(HdgStepFailurePhase::NonlinearSolve);
       return Reject(request, "generic CUDA prepared step failed");
     }
-    if (!CollectiveAll(request.communicator,
-                       FreshOutputView(*published_state, scalar_count,
-                                       destination)))
-    {
-      local_ok = AbortPrepared(session, authority, native_export);
-      time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
-      return Reject(request,
-          local_ok ? "CUDA prepared-state output view failed"
-                   : "CUDA prepared abort failed after output-view failure");
-    }
-    local_ok = session.ExportPreparedInterior(authority, native_export,
-                                              destination);
-    if (!CollectiveAll(request.communicator, local_ok))
-    {
-      local_ok = AbortPrepared(session, authority, native_export);
-      time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
-      return Reject(request,
-          local_ok ? "CUDA prepared-state export failed"
-                   : "CUDA prepared abort failed after export failure");
-    }
-    if (!session.AcknowledgePreparedOutput(authority, native_export))
-    {
-      local_ok = AbortPrepared(session, authority, native_export);
-      time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
-      return Reject(request,
-          local_ok ? "CUDA prepared output acknowledgement failed"
-                   : "CUDA prepared abort failed after acknowledgement failure");
-    }
 
     std::optional<HdgTransactionalTimeAdapter::OutputEvent> preview;
-    try { preview = time_driver->PreviewFinalizedOutput(); local_ok = true; }
+    try
+    {
+      preview = time_driver->PreviewFinalizedOutput();
+      local_ok = !preview || output != nullptr;
+    }
     catch (...) { local_ok = false; }
     if (!CollectiveAll(request.communicator, local_ok))
     {
@@ -861,14 +859,54 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
           local_ok ? "CUDA output preview failed"
                    : "CUDA prepared abort failed after preview failure");
     }
+    if (!ExactBoolConsensus(request.communicator, preview.has_value()))
+    {
+      local_ok = AbortPrepared(session, authority, native_export);
+      time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+      return Reject(request,
+          local_ok ? "CUDA output preview differs between ranks"
+                   : "CUDA prepared abort failed after preview disagreement");
+    }
+    if (preview)
+    {
+      if (!CollectiveAll(request.communicator,
+                         FreshOutputView(*published_state, scalar_count,
+                                         destination)))
+      {
+        local_ok = AbortPrepared(session, authority, native_export);
+        time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+        return Reject(request,
+            local_ok ? "CUDA prepared-state output view failed"
+                     : "CUDA prepared abort failed after output-view failure");
+      }
+      local_ok = session.ExportPreparedInterior(authority, native_export,
+                                                destination);
+      if (!CollectiveAll(request.communicator, local_ok))
+      {
+        local_ok = AbortPrepared(session, authority, native_export);
+        time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+        return Reject(request,
+            local_ok ? "CUDA prepared-state export failed"
+                     : "CUDA prepared abort failed after export failure");
+      }
+    }
+    if (!session.AcknowledgePreparedOutput(authority, native_export))
+    {
+      local_ok = AbortPrepared(session, authority, native_export);
+      time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+      return Reject(request,
+          local_ok ? "CUDA prepared output acknowledgement failed"
+                   : "CUDA prepared abort failed after acknowledgement failure");
+    }
     if (session.Commit(std::move(authority), native_export).status !=
         HdgEulerSessionStatus::committed)
       return Reject(request, "generic CUDA prepared commit failed");
-    // Publication remains post-commit.  ExportPreparedInterior copied the
-    // frozen candidate into this private host view, acknowledgement bound that
-    // export to the affine authority, and a successful Commit published that
-    // exact candidate without mutating the host bytes.  Keep those bytes for
-    // finalization/output instead of repeating the full device-to-host export.
+    // Publication remains post-commit.  On an output step the explicit export
+    // copied the frozen candidate into this private host view, acknowledgement
+    // bound that export to the affine authority, and Commit published that
+    // exact candidate without mutating the host bytes.  A no-output step needs
+    // only the already-staged native metadata acknowledgement and never
+    // materializes the full interior on the host.
 
     std::optional<HdgTransactionalTimeAdapter::OutputEvent> finalized;
     try { finalized = time_driver->FinalizeSuccess(); local_ok = true; }

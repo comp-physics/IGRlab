@@ -361,9 +361,7 @@ struct CudaContractStoragePolicy
           copy.trace, source.trace,
           CudaTransferCategory::generic_output_metadata_staging,
           CudaTransferSite::output_metadata_stage_trace);
-      const bool synchronized = TransportPolicy::Synchronize(
-          CudaTransferSite::output_metadata_stage_trace);
-      return interior && trace && synchronized;
+      return interior && trace;
     }
     return false;
   }

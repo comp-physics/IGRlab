@@ -1395,12 +1395,19 @@ __global__ void GatherKernel(const int* map, const int count,
 
 __global__ void AdmissibilityKernel(CudaDeviceView view, CudaMeshShape shape)
 {
-  const int element = blockIdx.x * blockDim.x + threadIdx.x;
+  const int element = blockIdx.x;
   if (element >= shape.elements) return;
-  view.status[element] = 1.0;
+  __shared__ int volume_failed;
+  __shared__ int face_failed;
+  if (threadIdx.x == 0)
+  {
+    volume_failed = 0;
+    face_failed = 0;
+  }
+  __syncthreads();
   const int ni0 = element * shape.interior_dofs;
   const int nt0 = element * shape.trace_dofs;
-  for (int q = 0; q < shape.volume_points; ++q)
+  for (int q = threadIdx.x; q < shape.volume_points; q += blockDim.x)
   {
     const int qp = element * shape.volume_points + q;
     double state[4] = {};
@@ -1411,10 +1418,13 @@ __global__ void AdmissibilityKernel(CudaDeviceView view, CudaMeshShape shape)
             view.work_interior[ni0 + ByNodes(
                 scalar, shape.scalar_interior_dofs, component)];
     if (!(shape.borrowed_host_inputs ? PhysicallyAdmissible(state) :
-          Admissible(state))) { view.status[element] = -1.0; return; }
+          Admissible(state))) atomicExch(&volume_failed, 1);
   }
-  for (int face = 0; face < faces_per_element; ++face)
-    for (int q = 0; q < shape.face_points; ++q)
+  const int face_points = faces_per_element * shape.face_points;
+  for (int fq = threadIdx.x; fq < face_points; fq += blockDim.x)
+  {
+      const int face = fq / shape.face_points;
+      const int q = fq - face * shape.face_points;
     {
       const int qp = (element*faces_per_element+face)*shape.face_points+q;
       const int offset =
@@ -1437,21 +1447,30 @@ __global__ void AdmissibilityKernel(CudaDeviceView view, CudaMeshShape shape)
             Admissible(interior)) ||
           !(shape.borrowed_host_inputs ? PhysicallyAdmissible(trace) :
             Admissible(trace)))
-      { view.status[element] = -2.0; return; }
+        atomicExch(&face_failed, 1);
     }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0)
+    view.status[element] = volume_failed ? -1.0 :
+        (face_failed ? -2.0 : 1.0);
 }
 
 __global__ void FreezeBorrowedCurrentLlfTauKernel(CudaDeviceView view,
                                                    CudaMeshShape shape)
 {
-  const int element = blockIdx.x * blockDim.x + threadIdx.x;
+  const int element = blockIdx.x;
   if (element >= shape.elements) return;
-  view.status[element] = 1.0;
+  __shared__ int failed;
+  if (threadIdx.x == 0) failed = 0;
+  __syncthreads();
   const int interior_offset = element * shape.interior_dofs;
   const int trace_offset = element * shape.trace_dofs;
-  for (int face = 0; face < faces_per_element; ++face)
-    for (int q = 0; q < shape.face_points; ++q)
+  const int face_points = faces_per_element * shape.face_points;
+  for (int fq = threadIdx.x; fq < face_points; fq += blockDim.x)
     {
+      const int face = fq / shape.face_points;
+      const int q = fq - face * shape.face_points;
       const int qp = (element * faces_per_element + face) *
           shape.face_points + q;
       const int face_offset = face * shape.trace_components *
@@ -1476,17 +1495,19 @@ __global__ void FreezeBorrowedCurrentLlfTauKernel(CudaDeviceView view,
           !LocalLlfSpeed(trace, view.face_normal[qp * dimension],
                          view.face_normal[qp * dimension + 1], trace_speed))
       {
-        view.status[element] = -3.0;
-        return;
+        atomicExch(&failed, 1);
+        continue;
       }
       const double tau = fmax(interior_speed, trace_speed);
       if (!(tau > 0.0) || !isfinite(tau))
       {
-        view.status[element] = -3.0;
-        return;
+        atomicExch(&failed, 1);
+        continue;
       }
       view.borrowed_lagged_llf_tau[qp] = tau;
     }
+  __syncthreads();
+  if (threadIdx.x == 0) view.status[element] = failed ? -3.0 : 1.0;
 }
 
 // Minimal phase-math port from W7 ac271a0: the signs and A/B/C/D weak
@@ -1602,384 +1623,552 @@ __global__ void AssemblyKernel(CudaDeviceView v, CudaMeshShape s,
   for(int i=0;i<nt;++i) v.g[e_t+i]=-v.residual_g[e_t+i];
 }
 
-// This is intentionally a separate instantiation from AssemblyKernel: the
-// legacy fixed-tau manufactured path above retains its arithmetic verbatim.
-// Conventional borrowed Euler evaluates tau from the current interior/trace
-// candidate at each face quadrature point, then holds that value fixed while
-// forming the residual and A/B/C/D (there are deliberately no d-tau terms).
-// The frozen_llf branch exists only for the private finite-difference audit.
-__global__ void BorrowedEulerAssemblyKernel(CudaDeviceView v,
-                                            CudaMeshShape s,
-                                            const double dt,
-                                            const bool frozen_llf)
+// AssemblyKernel above remains the fixed-tau manufactured path and keeps its
+// established arithmetic unchanged.  The live borrowed split kernels below
+// evaluate conventional LLF tau from the current interior and trace state at
+// each face quadrature point, then hold it fixed while forming the residual and
+// Jacobian blocks A/B/C/D; there are deliberately no d-tau terms.  Their
+// frozen_llf branch exists only for the private finite-difference audit.
+struct BorrowedVolumeCache
 {
-  const int e = blockIdx.x * blockDim.x + threadIdx.x;
-  if (e >= s.elements) return;
-  const int ni = s.interior_dofs, nt = s.trace_dofs;
-  const int si = s.scalar_interior_dofs, sf = s.scalar_face_dofs;
-  const int e_i = e * ni, e_t = e * nt;
-  const std::size_t ao = static_cast<std::size_t>(e) * ni * ni;
-  const std::size_t bo = static_cast<std::size_t>(e) * ni * nt;
-  const std::size_t co = static_cast<std::size_t>(e) * nt * ni;
-  const std::size_t doff = static_cast<std::size_t>(e) * nt * nt;
-  v.status[e] = 1.0;
-  for (int i = 0; i < ni; ++i) { v.residual_r[e_i+i] = 0; v.f[e_i+i] = 0; }
-  for (int i = 0; i < nt; ++i) { v.residual_g[e_t+i] = 0; v.g[e_t+i] = 0; }
-  for (int i = 0; i < ni * ni; ++i) v.a[ao+i] = 0;
-  for (int i = 0; i < ni * nt; ++i) v.b[bo+i] = 0;
-  for (int i = 0; i < nt * ni; ++i) v.c[co+i] = 0;
-  for (int i = 0; i < nt * nt; ++i) v.d[doff+i] = 0;
-  for (int q = 0; q < s.volume_points; ++q)
+  double weight;
+  double state[conserved_components];
+  double old[conserved_components];
+  double source[conserved_components];
+  double flux_x[conserved_components];
+  double flux_y[conserved_components];
+  double jacobian_x[conserved_components * igr_trace_components];
+  double jacobian_y[conserved_components * igr_trace_components];
+  double sigma;
+  double z[dimension];
+  double conservative_gradient[3][dimension];
+  double velocity_gradient[dimension][dimension];
+  double dq_dgradient[dimension][dimension];
+  double q_value;
+  int valid;
+};
+
+struct BorrowedFaceCache
+{
+  double weight;
+  double stabilization;
+  double interior[conserved_components];
+  double trace[conserved_components];
+  double flux[conserved_components];
+  double jacobian[conserved_components * igr_trace_components];
+  double exterior[conserved_components];
+  double sigma;
+  double sigma_hat;
+  double z[dimension];
+  double normal[dimension];
+  double tau;
+  double jump;
+  double z_hat_normal;
+  int physical_boundary;
+  int valid;
+};
+
+inline constexpr int borrowed_euler_group_threads = 4;
+inline constexpr int borrowed_euler_warp_threads = 32;
+inline constexpr int borrowed_euler_groups_per_warp =
+    borrowed_euler_warp_threads / borrowed_euler_group_threads;
+inline constexpr int borrowed_euler_warps_per_block = 4;
+inline constexpr int borrowed_euler_block_threads =
+    borrowed_euler_warp_threads * borrowed_euler_warps_per_block;
+inline constexpr int borrowed_euler_elements_per_block =
+    borrowed_euler_groups_per_warp * borrowed_euler_warps_per_block;
+inline constexpr unsigned borrowed_euler_group_mask =
+    (1u << borrowed_euler_group_threads) - 1u;
+
+static_assert(borrowed_euler_groups_per_warp == 8);
+static_assert(borrowed_euler_elements_per_block == 32);
+static_assert(borrowed_euler_group_threads == conserved_components);
+static_assert(sizeof(BorrowedVolumeCache) * borrowed_euler_elements_per_block <=
+              48 * 1024);
+static_assert(sizeof(BorrowedFaceCache) * borrowed_euler_elements_per_block <=
+              48 * 1024);
+
+__global__ void BorrowedEulerZeroKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int group=threadIdx.x/borrowed_euler_group_threads;
+  const int lane=threadIdx.x%borrowed_euler_group_threads;
+  const int e=blockIdx.x*borrowed_euler_elements_per_block+group;
+  if(e>=s.elements)return;
+  const int ni=s.interior_dofs,nt=s.trace_dofs;
+  const int e_i=e*ni,e_t=e*nt;
+  const std::size_t ao=static_cast<std::size_t>(e)*ni*ni;
+  const std::size_t bo=static_cast<std::size_t>(e)*ni*nt;
+  const std::size_t co=static_cast<std::size_t>(e)*nt*ni;
+  const std::size_t doff=static_cast<std::size_t>(e)*nt*nt;
+  for(int i=lane;i<ni;i+=borrowed_euler_group_threads)
+  {v.residual_r[e_i+i]=0.0;v.f[e_i+i]=0.0;}
+  for(int i=lane;i<nt;i+=borrowed_euler_group_threads)
+  {v.residual_g[e_t+i]=0.0;v.g[e_t+i]=0.0;}
+  for(int i=lane;i<ni*ni;i+=borrowed_euler_group_threads)v.a[ao+i]=0.0;
+  for(int i=lane;i<ni*nt;i+=borrowed_euler_group_threads)v.b[bo+i]=0.0;
+  for(int i=lane;i<nt*ni;i+=borrowed_euler_group_threads)v.c[co+i]=0.0;
+  for(int i=lane;i<nt*nt;i+=borrowed_euler_group_threads)v.d[doff+i]=0.0;
+  if(lane==0)v.status[e]=1.0;
+}
+
+// Each four-lane group owns one element.  Independent cache fields have one
+// lane writer and retain their scalar accumulation order; complete matrix rows
+// likewise remain lane-owned with their original q and column order.  Exact
+// masks and per-group caches isolate the eight groups within each warp.
+__global__ void BorrowedEulerVolumeKernel(CudaDeviceView v,CudaMeshShape s,
+                                          double dt)
+{
+  const int group=threadIdx.x/borrowed_euler_group_threads;
+  const int lane=threadIdx.x%borrowed_euler_group_threads;
+  const int warp_lane=threadIdx.x%borrowed_euler_warp_threads;
+  const unsigned group_mask=borrowed_euler_group_mask<<
+      (warp_lane-lane);
+  const int e=blockIdx.x*borrowed_euler_elements_per_block+group;
+  if(e>=s.elements)return;
+  const int ni=s.interior_dofs;
+  const int si=s.scalar_interior_dofs;
+  const int e_i=e*ni;
+  const std::size_t ao=static_cast<std::size_t>(e)*ni*ni;
+  __shared__ BorrowedVolumeCache caches[borrowed_euler_elements_per_block];
+  BorrowedVolumeCache& cache=caches[group];
+  for(int q=0;q<s.volume_points;++q)
   {
-    const int qp = e * s.volume_points + q;
-    const double w = v.volume_weight[qp];
-    double state[4] = {}, old[4] = {}, source[4] = {}, fx[4], fy[4];
-    double jx[conserved_components * igr_trace_components] = {};
-    double jy[conserved_components * igr_trace_components] = {};
-    double sigma = 0.0, z[dimension] = {};
-    double conservative_gradient[3][dimension] = {};
-    for (int a = 0; a < si; ++a) for (int k = 0; k < 4; ++k)
+    const int qp=e*s.volume_points+q;
+    if(lane==0)
     {
-      const double phi = v.volume_shape[qp * si + a];
-      state[k] += phi * v.work_interior[e_i + ByNodes(a, si, k)];
-      old[k] += phi * v.old_interior[e_i + ByNodes(a, si, k)];
-      if (s.borrowed_static_source)
-        source[k] += phi * v.static_source[e_i + ByNodes(a, si, k)];
+      cache.weight=v.volume_weight[qp];cache.q_value=0.0;cache.valid=1;
     }
-    if (s.igr_active)
-      for (int a = 0; a < si; ++a)
-      {
-        const double phi = v.volume_shape[qp * si + a];
-        sigma += phi * v.work_interior[e_i + ByNodes(a, si, 4)];
-        z[0] += phi * v.work_interior[e_i + ByNodes(a, si, 5)];
-        z[1] += phi * v.work_interior[e_i + ByNodes(a, si, 6)];
-        for (int component = 0; component < 3; ++component)
-          for (int direction = 0; direction < dimension; ++direction)
-            conservative_gradient[component][direction] +=
-                v.volume_derivative[(qp * si + a) * dimension + direction] *
-                v.work_interior[e_i + ByNodes(a, si, component)];
-      }
-    // A generic empty source is exactly zero.  Manufactured forcing belongs
-    // only to the frozen AssemblyKernel path above.
-    if (!(w > 0) || !(s.igr_active
-              ? RegularizedFluxJacobian(state, sigma, 1, 0, fx, jx) &&
-                    RegularizedFluxJacobian(state, sigma, 0, 1, fy, jy)
-              : FluxJacobian(state, 1, 0, fx, jx) &&
-                    FluxJacobian(state, 0, 1, fy, jy)))
-    { v.status[e] = -1; return; }
-    for (int row = 0; row < si; ++row)
+    // Lane c owns conserved field c and its two flux/Jacobian staging rows.
+    cache.state[lane]=0.0;cache.old[lane]=0.0;
+    cache.source[lane]=0.0;cache.flux_x[lane]=0.0;
+    cache.flux_y[lane]=0.0;
+    for(int entry=0;entry<igr_trace_components;++entry)
     {
-      const double phi = v.volume_shape[qp * si + row];
-      const double dx = v.volume_derivative[(qp * si + row) * 2];
-      const double dy = v.volume_derivative[(qp * si + row) * 2 + 1];
-      for (int rc = 0; rc < 4; ++rc)
+      cache.jacobian_x[lane*igr_trace_components+entry]=0.0;
+      cache.jacobian_y[lane*igr_trace_components+entry]=0.0;
+    }
+    for(int a=0;a<si;++a)
+    {
+      const double phi=v.volume_shape[qp*si+a];
+      cache.state[lane]+=phi*v.work_interior[
+          e_i+ByNodes(a,si,lane)];
+      cache.old[lane]+=phi*v.old_interior[e_i+ByNodes(a,si,lane)];
+      if(s.borrowed_static_source)
+        cache.source[lane]+=phi*v.static_source[
+            e_i+ByNodes(a,si,lane)];
+    }
+    if(s.igr_active)
+    {
+      // Lanes 0--2 own their conservative-gradient component; lane 3 owns
+      // sigma and both auxiliary z components.
+      if(lane<3)
       {
-        const int lr = ByNodes(row, si, rc);
-        v.residual_r[e_i+lr] += w * (phi * (state[rc]-old[rc]) / dt -
-            dx * fx[rc] - dy * fy[rc] - phi * source[rc]);
-        const int euler_columns = s.igr_active
-            ? igr_trace_components : conserved_components;
-        for (int col = 0; col < si; ++col)
-          for (int cc = 0; cc < euler_columns; ++cc)
-        {
-          const int lc = ByNodes(col, si, cc);
-          const double mass = rc == cc ? phi * v.volume_shape[qp*si+col] / dt : 0;
-          const int stride = s.igr_active
-              ? igr_trace_components : conserved_components;
-          const double flux = -(dx*jx[rc*stride+cc] +
-              dy*jy[rc*stride+cc]) *
-              v.volume_shape[qp*si+col];
-          v.a[ao+lr*ni+lc] += w * (mass + flux);
-        }
+        for(int direction=0;direction<dimension;++direction)
+          cache.conservative_gradient[lane][direction]=0.0;
+        for(int a=0;a<si;++a)
+          for(int direction=0;direction<dimension;++direction)
+            cache.conservative_gradient[lane][direction]+=
+                v.volume_derivative[(qp*si+a)*dimension+direction]*
+                v.work_interior[e_i+ByNodes(a,si,lane)];
       }
-
-      if (!s.igr_active) continue;
-      for (int direction = 0; direction < dimension; ++direction)
+      else
       {
-        const int lr = ByNodes(row, si, 4 + direction);
-        const double derivative = v.volume_derivative[
-            (qp * si + row) * dimension + direction];
-        v.residual_r[e_i + lr] += w *
-            (phi * state[0] * z[direction] + derivative * sigma);
-        for (int col = 0; col < si; ++col)
+        cache.sigma=0.0;cache.z[0]=0.0;cache.z[1]=0.0;
+        for(int a=0;a<si;++a)
         {
-          const double column_phi = v.volume_shape[qp * si + col];
-          v.a[ao + lr * ni + ByNodes(col, si, 0)] +=
-              w * phi * z[direction] * column_phi;
-          v.a[ao + lr * ni + ByNodes(col, si, 4)] +=
-              w * derivative * column_phi;
-          v.a[ao + lr * ni + ByNodes(col, si, 5 + direction)] +=
-              w * phi * state[0] * column_phi;
-        }
-      }
-
-      double velocity_gradient[dimension][dimension] = {};
-      for (int velocity = 0; velocity < dimension; ++velocity)
-        for (int direction = 0; direction < dimension; ++direction)
-          velocity_gradient[velocity][direction] =
-              conservative_gradient[1 + velocity][direction] / state[0] -
-              state[1 + velocity] * conservative_gradient[0][direction] /
-                  (state[0] * state[0]);
-      const double velocity_trace =
-          velocity_gradient[0][0] + velocity_gradient[1][1];
-      const double q_value =
-          velocity_gradient[0][0] * velocity_gradient[0][0] +
-          2.0 * velocity_gradient[0][1] * velocity_gradient[1][0] +
-          velocity_gradient[1][1] * velocity_gradient[1][1] +
-          velocity_trace * velocity_trace;
-      double dq_dgradient[dimension][dimension] = {};
-      for (int velocity = 0; velocity < dimension; ++velocity)
-        for (int direction = 0; direction < dimension; ++direction)
-          dq_dgradient[velocity][direction] =
-              2.0 * velocity_gradient[direction][velocity] +
-              (velocity == direction ? 2.0 * velocity_trace : 0.0);
-      const int sigma_row = ByNodes(row, si, 6);
-      v.residual_r[e_i + sigma_row] += w *
-          (phi * sigma / state[0] + s.igr_alpha *
-              (dx * z[0] + dy * z[1]) - s.igr_alpha * phi * q_value);
-      for (int col = 0; col < si; ++col)
-      {
-        const double column_phi = v.volume_shape[qp * si + col];
-        v.a[ao + sigma_row * ni + ByNodes(col, si, 4)] +=
-            w * phi * column_phi / state[0];
-        for (int direction = 0; direction < dimension; ++direction)
-          v.a[ao + sigma_row * ni + ByNodes(col, si, 5 + direction)] +=
-              w * s.igr_alpha * v.volume_derivative[
-                  (qp * si + row) * dimension + direction] * column_phi;
-        for (int variable = 0; variable < conserved_components; ++variable)
-        {
-          double dq = 0.0;
-          if (variable < 3)
-            for (int velocity = 0; velocity < dimension; ++velocity)
-              for (int direction = 0; direction < dimension; ++direction)
-              {
-                const double momentum = state[1 + velocity];
-                const double momentum_derivative =
-                    conservative_gradient[1 + velocity][direction];
-                const double density_derivative =
-                    conservative_gradient[0][direction];
-                const double delta_density = variable == 0 ? column_phi : 0.0;
-                const double delta_density_derivative = variable == 0
-                    ? v.volume_derivative[(qp * si + col) * dimension +
-                                          direction]
-                    : 0.0;
-                const double delta_momentum =
-                    variable == 1 + velocity ? column_phi : 0.0;
-                const double delta_momentum_derivative =
-                    variable == 1 + velocity
-                    ? v.volume_derivative[(qp * si + col) * dimension +
-                                          direction]
-                    : 0.0;
-                const double delta_gradient =
-                    delta_momentum_derivative / state[0] -
-                    momentum_derivative * delta_density /
-                        (state[0] * state[0]) -
-                    delta_momentum * density_derivative /
-                        (state[0] * state[0]) -
-                    momentum * delta_density_derivative /
-                        (state[0] * state[0]) +
-                    2.0 * momentum * density_derivative * delta_density /
-                        (state[0] * state[0] * state[0]);
-                dq += dq_dgradient[velocity][direction] * delta_gradient;
-              }
-          double derivative = -s.igr_alpha * phi * dq;
-          if (variable == 0)
-            derivative -= phi * sigma * column_phi /
-                (state[0] * state[0]);
-          v.a[ao + sigma_row * ni + ByNodes(col, si, variable)] +=
-              w * derivative;
+          const double phi=v.volume_shape[qp*si+a];
+          cache.sigma+=phi*v.work_interior[e_i+ByNodes(a,si,4)];
+          cache.z[0]+=phi*v.work_interior[e_i+ByNodes(a,si,5)];
+          cache.z[1]+=phi*v.work_interior[e_i+ByNodes(a,si,6)];
         }
       }
     }
+    // Publish every independently accumulated field before lane zero performs
+    // coupled flux, validity, and IGR derived-field work.
+    __syncwarp(group_mask);
+    if(lane==0)
+    {
+      const bool flux_ready=s.igr_active
+          ? RegularizedFluxJacobian(cache.state,cache.sigma,1.0,0.0,
+                                    cache.flux_x,cache.jacobian_x)&&
+            RegularizedFluxJacobian(cache.state,cache.sigma,0.0,1.0,
+                                    cache.flux_y,cache.jacobian_y)
+          : FluxJacobian(cache.state,1.0,0.0,cache.flux_x,
+                         cache.jacobian_x)&&
+            FluxJacobian(cache.state,0.0,1.0,cache.flux_y,
+                         cache.jacobian_y);
+      if(!(cache.weight>0.0)||!flux_ready)cache.valid=0;
+      if(cache.valid&&s.igr_active)
+      {
+        for(int velocity=0;velocity<dimension;++velocity)
+          for(int direction=0;direction<dimension;++direction)
+            cache.velocity_gradient[velocity][direction]=
+                cache.conservative_gradient[1+velocity][direction]/
+                    cache.state[0]-cache.state[1+velocity]*
+                cache.conservative_gradient[0][direction]/
+                    (cache.state[0]*cache.state[0]);
+        const double velocity_trace=cache.velocity_gradient[0][0]+
+            cache.velocity_gradient[1][1];
+        cache.q_value=cache.velocity_gradient[0][0]*
+                cache.velocity_gradient[0][0]+
+            2.0*cache.velocity_gradient[0][1]*
+                cache.velocity_gradient[1][0]+
+            cache.velocity_gradient[1][1]*
+                cache.velocity_gradient[1][1]+
+            velocity_trace*velocity_trace;
+        for(int velocity=0;velocity<dimension;++velocity)
+          for(int direction=0;direction<dimension;++direction)
+            cache.dq_dgradient[velocity][direction]=
+                2.0*cache.velocity_gradient[direction][velocity]+
+                (velocity==direction?2.0*velocity_trace:0.0);
+      }
+    }
+    __syncwarp(group_mask);
+    if(!cache.valid){if(lane==0)v.status[e]=-1.0;return;}
+    for(int lr=lane;lr<ni;lr+=borrowed_euler_group_threads)
+    {
+      const int component=lr/si,row=lr-component*si;
+      const double phi=v.volume_shape[qp*si+row];
+      const double dx=v.volume_derivative[(qp*si+row)*dimension];
+      const double dy=v.volume_derivative[(qp*si+row)*dimension+1];
+      const double w=cache.weight;
+      if(component<conserved_components)
+      {
+        v.residual_r[e_i+lr]+=w*(phi*(cache.state[component]-
+            cache.old[component])/dt-dx*cache.flux_x[component]-
+            dy*cache.flux_y[component]-phi*cache.source[component]);
+        const int columns=s.igr_active?igr_trace_components:
+            conserved_components;
+        for(int col=0;col<si;++col)for(int cc=0;cc<columns;++cc)
+        {
+          const double column_phi=v.volume_shape[qp*si+col];
+          const double mass=component==cc?phi*column_phi/dt:0.0;
+          const double flux=-(dx*cache.jacobian_x[component*columns+cc]+
+              dy*cache.jacobian_y[component*columns+cc])*column_phi;
+          v.a[ao+lr*ni+ByNodes(col,si,cc)]+=w*(mass+flux);
+        }
+      }
+      else if(s.igr_active&&component<6)
+      {
+        const int direction=component-4;
+        const double derivative=v.volume_derivative[
+            (qp*si+row)*dimension+direction];
+        v.residual_r[e_i+lr]+=w*(phi*cache.state[0]*cache.z[direction]+
+                                      derivative*cache.sigma);
+        for(int col=0;col<si;++col)
+        {
+          const double column_phi=v.volume_shape[qp*si+col];
+          v.a[ao+lr*ni+ByNodes(col,si,0)]+=
+              w*phi*cache.z[direction]*column_phi;
+          v.a[ao+lr*ni+ByNodes(col,si,4)]+=
+              w*derivative*column_phi;
+          v.a[ao+lr*ni+ByNodes(col,si,5+direction)]+=
+              w*phi*cache.state[0]*column_phi;
+        }
+      }
+      else if(s.igr_active&&component==6)
+      {
+        v.residual_r[e_i+lr]+=cache.weight*(phi*cache.sigma/cache.state[0]+
+            s.igr_alpha*(dx*cache.z[0]+dy*cache.z[1])-
+            s.igr_alpha*phi*cache.q_value);
+        for(int col=0;col<si;++col)
+        {
+          const double column_phi=v.volume_shape[qp*si+col];
+          v.a[ao+lr*ni+ByNodes(col,si,4)]+=
+              cache.weight*phi*column_phi/cache.state[0];
+          for(int direction=0;direction<dimension;++direction)
+            v.a[ao+lr*ni+ByNodes(col,si,5+direction)]+=
+                cache.weight*s.igr_alpha*v.volume_derivative[
+                    (qp*si+row)*dimension+direction]*column_phi;
+          for(int variable=0;variable<conserved_components;++variable)
+          {
+            double dq=0.0;
+            if(variable<3)
+              for(int velocity=0;velocity<dimension;++velocity)
+                for(int direction=0;direction<dimension;++direction)
+                {
+                  const double momentum=cache.state[1+velocity];
+                  const double momentum_derivative=
+                      cache.conservative_gradient[1+velocity][direction];
+                  const double density_derivative=
+                      cache.conservative_gradient[0][direction];
+                  const double delta_density=variable==0?column_phi:0.0;
+                  const double delta_density_derivative=variable==0?
+                      v.volume_derivative[(qp*si+col)*dimension+direction]:0.0;
+                  const double delta_momentum=variable==1+velocity?
+                      column_phi:0.0;
+                  const double delta_momentum_derivative=
+                      variable==1+velocity?
+                      v.volume_derivative[(qp*si+col)*dimension+direction]:0.0;
+                  const double delta_gradient=
+                      delta_momentum_derivative/cache.state[0]-
+                      momentum_derivative*delta_density/
+                          (cache.state[0]*cache.state[0])-
+                      delta_momentum*density_derivative/
+                          (cache.state[0]*cache.state[0])-
+                      momentum*delta_density_derivative/
+                          (cache.state[0]*cache.state[0])+
+                      2.0*momentum*density_derivative*delta_density/
+                          (cache.state[0]*cache.state[0]*cache.state[0]);
+                  dq+=cache.dq_dgradient[velocity][direction]*delta_gradient;
+                }
+            double derivative=-s.igr_alpha*phi*dq;
+            if(variable==0)derivative-=phi*cache.sigma*column_phi/
+                (cache.state[0]*cache.state[0]);
+            v.a[ao+lr*ni+ByNodes(col,si,variable)]+=
+                cache.weight*derivative;
+          }
+        }
+      }
+    }
+    __syncwarp(group_mask);
   }
-  for (int face = 0; face < faces_per_element; ++face)
-    for (int q = 0; q < s.face_points; ++q)
+}
+
+__global__ void BorrowedEulerFaceKernel(CudaDeviceView v,CudaMeshShape s,
+                                        bool frozen_llf)
+{
+  const int group=threadIdx.x/borrowed_euler_group_threads;
+  const int lane=threadIdx.x%borrowed_euler_group_threads;
+  const int warp_lane=threadIdx.x%borrowed_euler_warp_threads;
+  const unsigned group_mask=borrowed_euler_group_mask<<
+      (warp_lane-lane);
+  const int e=blockIdx.x*borrowed_euler_elements_per_block+group;
+  if(e>=s.elements||v.status[e]!=1.0)return;
+  const int ni=s.interior_dofs,nt=s.trace_dofs;
+  const int si=s.scalar_interior_dofs,sf=s.scalar_face_dofs;
+  const int e_i=e*ni,e_t=e*nt;
+  const std::size_t ao=static_cast<std::size_t>(e)*ni*ni;
+  const std::size_t bo=static_cast<std::size_t>(e)*ni*nt;
+  const std::size_t co=static_cast<std::size_t>(e)*nt*ni;
+  const std::size_t doff=static_cast<std::size_t>(e)*nt*nt;
+  __shared__ BorrowedFaceCache caches[borrowed_euler_elements_per_block];
+  BorrowedFaceCache& cache=caches[group];
+  for(int face=0;face<faces_per_element;++face)
+    for(int q=0;q<s.face_points;++q)
     {
-      const int qp = (e * faces_per_element + face) * s.face_points + q;
-      const int to = face * s.trace_components * sf;
-      const double w = v.face_weight[qp];
-      double stabilization = s.igr_beta;
-      const int boundary_kind = s.borrowed_static_boundary_policies
-          ? v.boundary_policy_kind[e * faces_per_element + face] : 0;
-      double u[4] = {}, l[4] = {}, flux[4];
-      double jac[conserved_components * igr_trace_components] = {};
-      double sigma = 0.0, sigma_hat = 0.0, z[dimension] = {};
-      for (int a = 0; a < si; ++a) for (int k = 0; k < 4; ++k)
-        u[k] += v.face_interior_shape[qp*si+a] *
-            v.work_interior[e_i+ByNodes(a,si,k)];
-      for (int a = 0; a < sf; ++a) for (int k = 0; k < 4; ++k)
-        l[k] += v.face_trace_shape[qp*sf+a] *
-            v.current_local_trace[e_t+to+ByNodes(a,sf,k)];
-      if (s.igr_active)
+      const int qp=(e*faces_per_element+face)*s.face_points+q;
+      const int to=face*s.trace_components*sf;
+      if(lane==0)
       {
-        for (int a = 0; a < si; ++a)
-        {
-          const double phi = v.face_interior_shape[qp * si + a];
-          sigma += phi * v.work_interior[e_i + ByNodes(a, si, 4)];
-          z[0] += phi * v.work_interior[e_i + ByNodes(a, si, 5)];
-          z[1] += phi * v.work_interior[e_i + ByNodes(a, si, 6)];
-        }
-        for (int a = 0; a < sf; ++a)
-          sigma_hat += v.face_trace_shape[qp * sf + a] *
-              v.current_local_trace[e_t + to + ByNodes(a, sf, 4)];
+        cache.weight=v.face_weight[qp];cache.stabilization=s.igr_beta;
+        cache.tau=0.0;cache.jump=0.0;cache.z_hat_normal=0.0;
+        cache.valid=1;
       }
-      const double nx = v.face_normal[qp * dimension];
-      const double ny = v.face_normal[qp * dimension + 1];
-      if (!s.igr_active)
+      // Lane c owns conserved interior/trace field c and its flux, exterior,
+      // and Jacobian staging row.
+      cache.interior[lane]=0.0;cache.trace[lane]=0.0;
+      cache.flux[lane]=0.0;cache.exterior[lane]=0.0;
+      for(int entry=0;entry<igr_trace_components;++entry)
+        cache.jacobian[lane*igr_trace_components+entry]=0.0;
+      for(int a=0;a<si;++a)
+        cache.interior[lane]+=v.face_interior_shape[qp*si+a]*
+            v.work_interior[e_i+ByNodes(a,si,lane)];
+      for(int a=0;a<sf;++a)
+        cache.trace[lane]+=v.face_trace_shape[qp*sf+a]*
+            v.current_local_trace[e_t+to+ByNodes(a,sf,lane)];
+      if(s.igr_active)
       {
-        if (frozen_llf)
+        // Auxiliary ownership is lane 0:sigma, 1:sigma_hat, 2:z0, 3:z1.
+        if(lane==0)
         {
-          stabilization = v.borrowed_lagged_llf_tau[qp];
+          cache.sigma=0.0;
+          for(int a=0;a<si;++a)
+            cache.sigma+=v.face_interior_shape[qp*si+a]*
+                v.work_interior[e_i+ByNodes(a,si,4)];
+        }
+        else if(lane==1)
+        {
+          cache.sigma_hat=0.0;
+          for(int a=0;a<sf;++a)
+            cache.sigma_hat+=v.face_trace_shape[qp*sf+a]*
+                v.current_local_trace[e_t+to+ByNodes(a,sf,4)];
         }
         else
         {
-          double interior_speed = 0.0, trace_speed = 0.0;
-          if (!LocalLlfSpeed(u, nx, ny, interior_speed) ||
-              !LocalLlfSpeed(l, nx, ny, trace_speed))
-          { v.status[e] = -2; return; }
-          stabilization = fmax(interior_speed, trace_speed);
+          const int direction=lane-2;
+          cache.z[direction]=0.0;
+          for(int a=0;a<si;++a)
+            cache.z[direction]+=v.face_interior_shape[qp*si+a]*
+                v.work_interior[e_i+ByNodes(a,si,5+direction)];
         }
       }
-      if (!(w > 0) || !(stabilization > 0) || !isfinite(stabilization) ||
-          !(s.igr_active
-                ? RegularizedFluxJacobian(
-                      l, sigma_hat, nx, ny, flux, jac)
-                : FluxJacobian(l, nx, ny, flux, jac)))
-      { v.status[e] = -2; return; }
-      double exterior[conserved_components] = {};
-      const bool physical_boundary = boundary_kind != 0;
-      if (physical_boundary && !StaticBoundaryExterior(boundary_kind,
-          v.boundary_reference + (e * faces_per_element + face) *
-              conserved_components,
-          v.boundary_pressure[e * faces_per_element + face],
-          s.boundary_gamma, u, nx, ny, exterior))
-      { v.status[e] = -3; return; }
-      double tau = 0.0, jump = 0.0, z_hat_normal = 0.0;
-      if (s.igr_active)
+      // Publish all component and auxiliary interpolants before lane zero
+      // performs coupled flux, boundary, stabilization, and validity work.
+      __syncwarp(group_mask);
+      if(lane==0)
       {
-        const double h = v.face_h[e * faces_per_element + face];
-        const double degree_scale =
-            static_cast<double>((s.order + 1) * (s.order + 1));
-        if (!(l[0] > cuda_density_gate) || !(h > 0.0) || !isfinite(h))
-        { v.status[e] = -4; return; }
-        tau = degree_scale / (l[0] * h);
-        jump = sigma - sigma_hat;
-        z_hat_normal = z[0] * nx + z[1] * ny - tau * jump;
-        if (!(tau > 0.0) || !isfinite(tau) || !isfinite(z_hat_normal))
-        { v.status[e] = -4; return; }
+        cache.normal[0]=v.face_normal[qp*dimension];
+        cache.normal[1]=v.face_normal[qp*dimension+1];
+        if(!s.igr_active)
+        {
+          if(frozen_llf)cache.stabilization=v.borrowed_lagged_llf_tau[qp];
+          else
+          {
+            double interior_speed=0.0,trace_speed=0.0;
+            if(!LocalLlfSpeed(cache.interior,cache.normal[0],cache.normal[1],
+                              interior_speed)||
+               !LocalLlfSpeed(cache.trace,cache.normal[0],cache.normal[1],
+                              trace_speed))cache.valid=-2;
+            else cache.stabilization=fmax(interior_speed,trace_speed);
+          }
+        }
+        const bool flux_ready=cache.valid==1&&(s.igr_active?
+            RegularizedFluxJacobian(cache.trace,cache.sigma_hat,
+                cache.normal[0],cache.normal[1],cache.flux,cache.jacobian):
+            FluxJacobian(cache.trace,cache.normal[0],cache.normal[1],
+                cache.flux,cache.jacobian));
+        if(cache.valid==1&&(!(cache.weight>0.0)||
+            !(cache.stabilization>0.0)||!isfinite(cache.stabilization)||
+            !flux_ready))cache.valid=-2;
+        const int boundary_kind=s.borrowed_static_boundary_policies?
+            v.boundary_policy_kind[e*faces_per_element+face]:0;
+        cache.physical_boundary=boundary_kind!=0;
+        if(cache.valid==1&&cache.physical_boundary&&
+           !StaticBoundaryExterior(boundary_kind,
+              v.boundary_reference+(e*faces_per_element+face)*
+                  conserved_components,
+              v.boundary_pressure[e*faces_per_element+face],s.boundary_gamma,
+              cache.interior,cache.normal[0],cache.normal[1],cache.exterior))
+          cache.valid=-3;
+        if(cache.valid==1&&s.igr_active)
+        {
+          const double h=v.face_h[e*faces_per_element+face];
+          const double degree_scale=static_cast<double>((s.order+1)*(s.order+1));
+          if(!(cache.trace[0]>cuda_density_gate)||!(h>0.0)||!isfinite(h))
+            cache.valid=-4;
+          else
+          {
+            cache.tau=degree_scale/(cache.trace[0]*h);
+            cache.jump=cache.sigma-cache.sigma_hat;
+            cache.z_hat_normal=cache.z[0]*cache.normal[0]+
+                cache.z[1]*cache.normal[1]-cache.tau*cache.jump;
+            if(!(cache.tau>0.0)||!isfinite(cache.tau)||
+               !isfinite(cache.z_hat_normal))cache.valid=-4;
+          }
+        }
       }
-      for (int row = 0; row < si; ++row)
+      __syncwarp(group_mask);
+      if(cache.valid!=1)
+      {if(lane==0)v.status[e]=static_cast<double>(cache.valid);return;}
+      for(int interior_row=lane;interior_row<ni;
+          interior_row+=borrowed_euler_group_threads)
       {
-        const double rp = v.face_interior_shape[qp*si+row];
-        for (int rc = 0; rc < 4; ++rc)
+        const int component=interior_row/si;
+        const int row=interior_row-component*si;
+        const double rp=v.face_interior_shape[qp*si+row];
+        if(component<conserved_components)
         {
-          const int lr = ByNodes(row,si,rc);
-          v.residual_r[e_i+lr] += w*rp*
-              (flux[rc]+stabilization*(u[rc]-l[rc]));
-          for (int col = 0; col < si; ++col)
-            v.a[ao+lr*ni+ByNodes(col,si,rc)] += w*rp*stabilization*
-                v.face_interior_shape[qp*si+col];
-          const int euler_columns = s.igr_active
-              ? igr_trace_components : conserved_components;
-          for (int col = 0; col < sf; ++col)
-            for (int cc = 0; cc < euler_columns; ++cc)
-            v.b[bo+lr*nt+to+ByNodes(col,sf,cc)] += w*rp*
-                v.face_trace_shape[qp*sf+col] *
-                (jac[rc*euler_columns+cc] -
-                 (rc == cc ? stabilization : 0));
+          v.residual_r[e_i+interior_row]+=cache.weight*rp*
+              (cache.flux[component]+cache.stabilization*
+                  (cache.interior[component]-cache.trace[component]));
+          for(int col=0;col<si;++col)
+            v.a[ao+interior_row*ni+ByNodes(col,si,component)]+=
+                cache.weight*rp*cache.stabilization*
+                    v.face_interior_shape[qp*si+col];
+          const int columns=s.igr_active?igr_trace_components:
+              conserved_components;
+          for(int col=0;col<sf;++col)for(int cc=0;cc<columns;++cc)
+            v.b[bo+interior_row*nt+to+ByNodes(col,sf,cc)]+=
+                cache.weight*rp*v.face_trace_shape[qp*sf+col]*
+                (cache.jacobian[component*columns+cc]-
+                 (component==cc?cache.stabilization:0.0));
+        }
+        else if(s.igr_active&&component<6)
+        {
+          const int direction=component-4;
+          const double normal=cache.normal[direction];
+          v.residual_r[e_i+interior_row]-=
+              cache.weight*rp*normal*cache.sigma_hat;
+          for(int col=0;col<sf;++col)
+            v.b[bo+interior_row*nt+to+ByNodes(col,sf,4)]-=
+                cache.weight*rp*normal*v.face_trace_shape[qp*sf+col];
+        }
+        else if(s.igr_active&&component==6)
+        {
+          v.residual_r[e_i+interior_row]-=
+              s.igr_alpha*cache.weight*rp*cache.z_hat_normal;
+          for(int col=0;col<si;++col)
+          {
+            const double cp=v.face_interior_shape[qp*si+col];
+            v.a[ao+interior_row*ni+ByNodes(col,si,4)]+=
+                s.igr_alpha*cache.weight*rp*cache.tau*cp;
+            v.a[ao+interior_row*ni+ByNodes(col,si,5)]-=
+                s.igr_alpha*cache.weight*rp*cache.normal[0]*cp;
+            v.a[ao+interior_row*ni+ByNodes(col,si,6)]-=
+                s.igr_alpha*cache.weight*rp*cache.normal[1]*cp;
+          }
+          for(int col=0;col<sf;++col)
+          {
+            const double cp=v.face_trace_shape[qp*sf+col];
+            v.b[bo+interior_row*nt+to+ByNodes(col,sf,4)]-=
+                s.igr_alpha*cache.weight*rp*cache.tau*cp;
+            v.b[bo+interior_row*nt+to+ByNodes(col,sf,0)]-=
+                s.igr_alpha*cache.weight*rp*cache.tau*cache.jump/
+                    cache.trace[0]*cp;
+          }
         }
       }
-      for (int row = 0; row < sf; ++row)
+      const int face_trace_dofs=s.trace_components*sf;
+      for(int local_trace_row=lane;local_trace_row<face_trace_dofs;
+          local_trace_row+=borrowed_euler_group_threads)
       {
-        const double rp = v.face_trace_shape[qp*sf+row];
-        for (int rc = 0; rc < 4; ++rc)
+        const int component=local_trace_row/sf;
+        const int row=local_trace_row-component*sf;
+        const int trace_row=to+local_trace_row;
+        const double rp=v.face_trace_shape[qp*sf+row];
+        if(component<conserved_components)
         {
-          const int lr = to + ByNodes(row,sf,rc);
-          v.residual_g[e_t+lr] += w*rp*(physical_boundary
-              ? l[rc] - exterior[rc]
-              : flux[rc]+stabilization*(u[rc]-l[rc]));
-          for (int col = 0; col < si; ++col)
-            if (!physical_boundary)
-              v.c[co+lr*ni+ByNodes(col,si,rc)] += w*rp*stabilization*
-                  v.face_interior_shape[qp*si+col];
-          const int euler_columns = s.igr_active
-              ? igr_trace_components : conserved_components;
-          for (int col = 0; col < sf; ++col)
-            for (int cc = 0; cc < euler_columns; ++cc)
-            v.d[doff+lr*nt+to+ByNodes(col,sf,cc)] += w*rp*
-                v.face_trace_shape[qp*sf+col] *
-                (physical_boundary
-                    ? (rc == cc ? 1.0 : 0.0)
-                    : jac[rc*euler_columns+cc] -
-                        (rc == cc ? stabilization : 0));
+          v.residual_g[e_t+trace_row]+=cache.weight*rp*
+              (cache.physical_boundary?
+                  cache.trace[component]-cache.exterior[component]:
+                  cache.flux[component]+cache.stabilization*
+                      (cache.interior[component]-cache.trace[component]));
+          if(!cache.physical_boundary)
+            for(int col=0;col<si;++col)
+              v.c[co+trace_row*ni+ByNodes(col,si,component)]+=
+                  cache.weight*rp*cache.stabilization*
+                      v.face_interior_shape[qp*si+col];
+          const int columns=s.igr_active?igr_trace_components:
+              conserved_components;
+          for(int col=0;col<sf;++col)for(int cc=0;cc<columns;++cc)
+            v.d[doff+trace_row*nt+to+ByNodes(col,sf,cc)]+=
+                cache.weight*rp*v.face_trace_shape[qp*sf+col]*
+                (cache.physical_boundary?(component==cc?1.0:0.0):
+                 cache.jacobian[component*columns+cc]-
+                    (component==cc?cache.stabilization:0.0));
         }
-      }
-
-      if (s.igr_active)
-      {
-        for (int row = 0; row < si; ++row)
+        else if(s.igr_active&&component==4)
         {
-          const double rp = v.face_interior_shape[qp * si + row];
-          for (int direction = 0; direction < dimension; ++direction)
+          v.residual_g[e_t+trace_row]+=
+              s.igr_alpha*cache.weight*rp*cache.z_hat_normal;
+          for(int col=0;col<si;++col)
           {
-            const double normal = direction == 0 ? nx : ny;
-            const int lr = ByNodes(row, si, 4 + direction);
-            v.residual_r[e_i + lr] -= w * rp * normal * sigma_hat;
-            for (int col = 0; col < sf; ++col)
-              v.b[bo + lr * nt + to + ByNodes(col, sf, 4)] -=
-                  w * rp * normal * v.face_trace_shape[qp * sf + col];
+            const double cp=v.face_interior_shape[qp*si+col];
+            v.c[co+trace_row*ni+ByNodes(col,si,4)]-=
+                s.igr_alpha*cache.weight*rp*cache.tau*cp;
+            v.c[co+trace_row*ni+ByNodes(col,si,5)]+=
+                s.igr_alpha*cache.weight*rp*cache.normal[0]*cp;
+            v.c[co+trace_row*ni+ByNodes(col,si,6)]+=
+                s.igr_alpha*cache.weight*rp*cache.normal[1]*cp;
           }
-          const int sigma_row = ByNodes(row, si, 6);
-          v.residual_r[e_i + sigma_row] -=
-              s.igr_alpha * w * rp * z_hat_normal;
-          for (int col = 0; col < si; ++col)
+          for(int col=0;col<sf;++col)
           {
-            const double cp = v.face_interior_shape[qp * si + col];
-            v.a[ao + sigma_row * ni + ByNodes(col, si, 4)] +=
-                s.igr_alpha * w * rp * tau * cp;
-            v.a[ao + sigma_row * ni + ByNodes(col, si, 5)] -=
-                s.igr_alpha * w * rp * nx * cp;
-            v.a[ao + sigma_row * ni + ByNodes(col, si, 6)] -=
-                s.igr_alpha * w * rp * ny * cp;
-          }
-          for (int col = 0; col < sf; ++col)
-          {
-            const double cp = v.face_trace_shape[qp * sf + col];
-            v.b[bo + sigma_row * nt + to + ByNodes(col, sf, 4)] -=
-                s.igr_alpha * w * rp * tau * cp;
-            v.b[bo + sigma_row * nt + to + ByNodes(col, sf, 0)] -=
-                s.igr_alpha * w * rp * tau * jump / l[0] * cp;
-          }
-        }
-        for (int row = 0; row < sf; ++row)
-        {
-          const double rp = v.face_trace_shape[qp * sf + row];
-          const int lr = to + ByNodes(row, sf, 4);
-          v.residual_g[e_t + lr] +=
-              s.igr_alpha * w * rp * z_hat_normal;
-          for (int col = 0; col < si; ++col)
-          {
-            const double cp = v.face_interior_shape[qp * si + col];
-            v.c[co + lr * ni + ByNodes(col, si, 4)] -=
-                s.igr_alpha * w * rp * tau * cp;
-            v.c[co + lr * ni + ByNodes(col, si, 5)] +=
-                s.igr_alpha * w * rp * nx * cp;
-            v.c[co + lr * ni + ByNodes(col, si, 6)] +=
-                s.igr_alpha * w * rp * ny * cp;
-          }
-          for (int col = 0; col < sf; ++col)
-          {
-            const double cp = v.face_trace_shape[qp * sf + col];
-            v.d[doff + lr * nt + to + ByNodes(col, sf, 4)] +=
-                s.igr_alpha * w * rp * tau * cp;
-            v.d[doff + lr * nt + to + ByNodes(col, sf, 0)] +=
-                s.igr_alpha * w * rp * tau * jump / l[0] * cp;
+            const double cp=v.face_trace_shape[qp*sf+col];
+            v.d[doff+trace_row*nt+to+ByNodes(col,sf,4)]+=
+                s.igr_alpha*cache.weight*rp*cache.tau*cp;
+            v.d[doff+trace_row*nt+to+ByNodes(col,sf,0)]+=
+                s.igr_alpha*cache.weight*rp*cache.tau*cache.jump/
+                    cache.trace[0]*cp;
           }
         }
       }
+      __syncwarp(group_mask);
     }
-  for (int i = 0; i < ni; ++i) v.f[e_i+i] = -v.residual_r[e_i+i];
-  for (int i = 0; i < nt; ++i) v.g[e_t+i] = -v.residual_g[e_t+i];
+  for(int i=lane;i<ni;i+=borrowed_euler_group_threads)
+    v.f[e_i+i]=-v.residual_r[e_i+i];
+  for(int i=lane;i<nt;i+=borrowed_euler_group_threads)
+    v.g[e_t+i]=-v.residual_g[e_t+i];
 }
 
 __global__ void CondenseKernel(CudaDeviceView v,CudaMeshShape s)
@@ -1997,6 +2186,123 @@ __global__ void CondenseKernel(CudaDeviceView v,CudaMeshShape s)
   if(!CudaFactorSolveRetained(lu,p,ni,w,cols)){v.status[e]=-1;return;}
   for(int r=0;r<nt;++r){double rhs=v.g[e*nt+r];for(int k=0;k<ni;++k)rhs-=v.c[co+r*ni+k]*w[k*cols+nt];v.condensed_rhs[e*nt+r]=rhs;for(int c=0;c<nt;++c){double x=v.d[so+r*nt+c];for(int k=0;k<ni;++k)x-=v.c[co+r*ni+k]*w[k*cols+c];v.schur[so+r*nt+c]=x;}}
   v.status[e]=1;
+}
+
+// Ordinary borrowed Euler uses one cooperative block per element.  The
+// barriers retain the scalar factor/solve ordering for every matrix and RHS
+// entry while distributing independent row, column, and RHS work across the
+// block.  Legacy fixed-shape execution keeps CondenseKernel above unchanged.
+__global__ void BorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;if(e>=s.elements)return;
+  const int ni=s.interior_dofs,nt=s.trace_dofs,cols=nt+1;
+  const std::size_t ao=static_cast<std::size_t>(e)*ni*ni;
+  const std::size_t bo=static_cast<std::size_t>(e)*ni*nt;
+  const std::size_t co=static_cast<std::size_t>(e)*nt*ni;
+  const std::size_t so=static_cast<std::size_t>(e)*nt*nt;
+  double* lu=v.lu+ao;double* pivots=v.pivots+e*ni;
+  double* w=v.solve_workspace+static_cast<std::size_t>(e)*ni*cols;
+  __shared__ double scale;
+  __shared__ int pivot_row;
+  __shared__ int failed;
+  for(int i=threadIdx.x;i<ni*ni;i+=blockDim.x)lu[i]=v.a[ao+i];
+  for(int i=threadIdx.x;i<ni*cols;i+=blockDim.x)
+  {
+    const int row=i/cols,column=i-row*cols;
+    w[i]=column<nt?v.b[bo+row*nt+column]:v.f[e*ni+row];
+  }
+  __syncthreads();
+  if(threadIdx.x==0)
+  {
+    scale=0.0;failed=0;
+    for(int i=0;i<ni*ni;++i)scale=fmax(scale,fabs(lu[i]));
+  }
+  __syncthreads();
+  for(int column=0;column<ni;++column)
+  {
+    if(threadIdx.x==0)
+    {
+      pivot_row=column;
+      for(int row=column+1;row<ni;++row)
+        if(fabs(lu[row*ni+column])>fabs(lu[pivot_row*ni+column]))
+          pivot_row=row;
+      pivots[column]=pivot_row;
+      if(!(fabs(lu[pivot_row*ni+column])>
+            64.0*2.2204460492503131e-16*scale))failed=1;
+    }
+    __syncthreads();
+    if(failed){if(threadIdx.x==0)v.status[e]=-1;return;}
+    if(pivot_row!=column)
+      for(int entry=threadIdx.x;entry<ni;entry+=blockDim.x)
+      {
+        const double value=lu[column*ni+entry];
+        lu[column*ni+entry]=lu[pivot_row*ni+entry];
+        lu[pivot_row*ni+entry]=value;
+      }
+    __syncthreads();
+    for(int row=column+1+threadIdx.x;row<ni;row+=blockDim.x)
+      lu[row*ni+column]/=lu[column*ni+column];
+    __syncthreads();
+    const int trailing=ni-column-1;
+    for(int item=threadIdx.x;item<trailing*trailing;item+=blockDim.x)
+    {
+      const int row=column+1+item/trailing;
+      const int entry=column+1+item%trailing;
+      lu[row*ni+entry]-=lu[row*ni+column]*lu[column*ni+entry];
+    }
+    __syncthreads();
+  }
+  for(int row=0;row<ni;++row)
+  {
+    const int pivot=static_cast<int>(pivots[row]);
+    if(pivot!=row)
+      for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
+      {
+        const double value=w[row*cols+rhs];
+        w[row*cols+rhs]=w[pivot*cols+rhs];
+        w[pivot*cols+rhs]=value;
+      }
+    __syncthreads();
+  }
+  for(int column=0;column<ni;++column)
+  {
+    const int remaining=ni-column-1;
+    for(int item=threadIdx.x;item<remaining*cols;item+=blockDim.x)
+    {
+      const int row=column+1+item/cols,rhs=item%cols;
+      w[row*cols+rhs]-=lu[row*ni+column]*w[column*cols+rhs];
+    }
+    __syncthreads();
+  }
+  for(int row=ni-1;row>=0;--row)
+  {
+    for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
+    {
+      double value=w[row*cols+rhs];
+      for(int column=row+1;column<ni;++column)
+        value-=lu[row*ni+column]*w[column*cols+rhs];
+      w[row*cols+rhs]=value/lu[row*ni+row];
+    }
+    __syncthreads();
+  }
+  for(int item=threadIdx.x;item<nt*(nt+1);item+=blockDim.x)
+  {
+    const int row=item/(nt+1),column=item-row*(nt+1);
+    if(column==nt)
+    {
+      double value=v.g[e*nt+row];
+      for(int k=0;k<ni;++k)value-=v.c[co+row*ni+k]*w[k*cols+nt];
+      v.condensed_rhs[e*nt+row]=value;
+    }
+    else
+    {
+      double value=v.d[so+row*nt+column];
+      for(int k=0;k<ni;++k)value-=v.c[co+row*ni+k]*w[k*cols+column];
+      v.schur[so+row*nt+column]=value;
+    }
+  }
+  __syncthreads();
+  if(threadIdx.x==0)v.status[e]=1;
 }
 
 __global__ void ZeroSystemKernel(CudaTrueMatrixDeviceView m,double* rhs,int n)
@@ -2019,6 +2325,9 @@ __global__ void OwnedVectorKernel(CudaDeviceView v,CudaMeshShape s,const double*
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)atomicAdd(truth+v.vector_owned_target[i],SignedVectorValue(v,s,values,v.vector_owned_source[i]));}
 __global__ void ZeroVectorKernel(double* values,int n)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)values[i]=0;}
+__global__ void StatusReductionKernel(const double* status,int count,
+                                      int* failure)
+{const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<count&&status[i]!=1.0)atomicExch(failure,1);}
 __global__ void GatherRemoteVectorKernel(CudaDeviceView v,CudaMeshShape s,const double* values,int n)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)v.remote_vector_send[i]=SignedVectorValue(v,s,values,v.vector_send_source[i]);}
 __global__ void ScatterRemoteVectorKernel(CudaDeviceView v,double* truth,int n)
@@ -2033,262 +2342,625 @@ __global__ void RecoverKernel(CudaDeviceView v,CudaMeshShape s)
                       v.f+e*ni,v.recovered_interior+e*ni);
   v.status[e]=1;
 }
+__global__ void BorrowedRecoverKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;if(e>=s.elements)return;
+  const int ni=s.interior_dofs,nt=s.trace_dofs;
+  const double* lu=v.lu+static_cast<std::size_t>(e)*ni*ni;
+  const double* pivots=v.pivots+e*ni;
+  double* recovered=v.recovered_interior+e*ni;
+  for(int row=threadIdx.x;row<ni;row+=blockDim.x)
+  {
+    double value=v.f[e*ni+row];
+    for(int column=0;column<nt;++column)
+      value-=v.b[(static_cast<std::size_t>(e)*ni+row)*nt+column]*
+          v.trace_increment_local[e*nt+column];
+    recovered[row]=value;
+  }
+  __syncthreads();
+  for(int row=0;row<ni;++row)
+  {
+    if(threadIdx.x==0)
+    {
+      const int pivot=static_cast<int>(pivots[row]);
+      if(pivot!=row)
+      {
+        const double value=recovered[row];
+        recovered[row]=recovered[pivot];recovered[pivot]=value;
+      }
+    }
+    __syncthreads();
+  }
+  for(int column=0;column<ni;++column)
+  {
+    for(int row=column+1+threadIdx.x;row<ni;row+=blockDim.x)
+      recovered[row]-=lu[row*ni+column]*recovered[column];
+    __syncthreads();
+  }
+  for(int row=ni-1;row>=0;--row)
+  {
+    if(threadIdx.x==0)
+    {
+      double value=recovered[row];
+      for(int column=row+1;column<ni;++column)
+        value-=lu[row*ni+column]*recovered[column];
+      recovered[row]=value/lu[row*ni+row];
+    }
+    __syncthreads();
+  }
+  if(threadIdx.x==0)v.status[e]=1;
+}
 __global__ void TrialKernel(CudaDeviceView v,CudaMeshShape s,double alpha)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<s.interior_count)v.work_interior[i]=v.base_interior[i]+alpha*v.recovered_interior[i];if(i<s.true_trace_count)v.work_true_trace[i]=v.base_true_trace[i]+alpha*v.true_solution[i];}
-__global__ void NormKernel(const double* a,int an,const double* b,int bn,double* out)
-{if(blockIdx.x||threadIdx.x)return;double sum=0;for(int i=0;i<an;++i)sum+=a[i]*a[i];for(int i=0;i<bn;++i)sum+=b[i]*b[i];out[0]=sum;}
+
+__global__ void PackInteriorOutputKernel(CudaMeshShape s,
+                                         const double* source,
+                                         double* packed)
+{
+  const int index=blockIdx.x*blockDim.x+threadIdx.x;
+  const int per_element=conserved_components*s.scalar_interior_dofs;
+  const int count=s.elements*per_element;
+  if(index>=count)return;
+  const int element=index/per_element;
+  const int local=index-element*per_element;
+  packed[index]=source[static_cast<std::size_t>(element)*s.interior_dofs+
+                       local];
+}
+
+inline constexpr int cooperative_reduction_threads = 256;
+inline constexpr int cooperative_wave_threads = 128;
+inline constexpr int cooperative_conservation_threads = 128;
+
+__global__ void NormPartialsKernel(const double* a,int an,const double* b,
+                                   int bn,double* partials)
+{
+  __shared__ double partial[cooperative_reduction_threads];
+  const int thread=threadIdx.x;
+  const int count=an+bn;
+  double sum=0.0;
+  // Treat the two inputs as one ordered sequence.  Each global lane follows a
+  // fixed grid-stride subsequence, and each block emits exactly one pairwise-
+  // reduced partial without atomics.
+  const int global_thread=blockIdx.x*blockDim.x+thread;
+  const int stride=gridDim.x*blockDim.x;
+  for(int index=global_thread;index<count;index+=stride)
+  {
+    const double value=index<an?a[index]:b[index-an];
+    sum+=value*value;
+  }
+  partial[thread]=sum;
+  __syncthreads();
+  for(int offset=blockDim.x/2;offset>0;offset/=2)
+  {
+    if(thread<offset)partial[thread]+=partial[thread+offset];
+    __syncthreads();
+  }
+  if(thread==0)partials[blockIdx.x]=partial[0];
+}
+
+__global__ void NormReduceKernel(const double* partials,int partial_count,
+                                 double* out)
+{
+  __shared__ double partial[cooperative_reduction_threads];
+  const int thread=threadIdx.x;
+  double sum=0.0;
+  for(int index=thread;index<partial_count;index+=blockDim.x)
+    sum+=partials[index];
+  partial[thread]=sum;
+  __syncthreads();
+  for(int offset=blockDim.x/2;offset>0;offset/=2)
+  {
+    if(thread<offset)partial[thread]+=partial[thread+offset];
+    __syncthreads();
+  }
+  if(thread==0)out[0]=partial[0];
+}
 __device__ double EulerWave(const double rho,const double mx,const double my,
                             const double energy)
 {if(!(rho>0.0)||!isfinite(rho)||!isfinite(mx)||!isfinite(my)||!isfinite(energy))return nan("");const double u=mx/rho,v=my/rho;const double p=0.4*(energy-0.5*(mx*mx+my*my)/rho);return p>0.0&&isfinite(p)?sqrt(u*u+v*v)+sqrt(1.4*p/rho):nan("");}
-__device__ void ObserveEulerWave(const double* state,double& maximum,bool& valid)
-{const double wave=EulerWave(state[0],state[1],state[2],state[3]);valid=valid&&isfinite(wave);if(valid&&wave>maximum)maximum=wave;}
 __global__ void MaximumWaveElementsKernel(CudaDeviceView v,CudaMeshShape s,
                                           const double* interior,
                                           const double* trace)
 {
-  const int e=blockIdx.x*blockDim.x+threadIdx.x;if(e>=s.elements)return;
-  double maximum=0.0;bool valid=true;
+  __shared__ double wave[cooperative_wave_threads];
+  const int e=blockIdx.x;if(e>=s.elements)return;
+  const int thread=threadIdx.x;
   const int ib=e*s.interior_dofs,tb=e*s.trace_dofs;
-  for(int q=0;q<s.volume_points;++q){const int qp=e*s.volume_points+q;double state[4]={};for(int a=0;a<s.scalar_interior_dofs;++a)for(int k=0;k<4;++k)state[k]+=v.volume_shape[qp*s.scalar_interior_dofs+a]*interior[ib+ByNodes(a,s.scalar_interior_dofs,k)];ObserveEulerWave(state,maximum,valid);}
-  for(int f=0;f<faces_per_element;++f)for(int q=0;q<s.face_points;++q){const int qp=(e*faces_per_element+f)*s.face_points+q,fo=f*s.trace_components*s.scalar_face_dofs;double volume_state[4]={},trace_state[4]={};for(int a=0;a<s.scalar_interior_dofs;++a)for(int k=0;k<4;++k)volume_state[k]+=v.face_interior_shape[qp*s.scalar_interior_dofs+a]*interior[ib+ByNodes(a,s.scalar_interior_dofs,k)];for(int a=0;a<s.scalar_face_dofs;++a)for(int k=0;k<4;++k)trace_state[k]+=v.face_trace_shape[qp*s.scalar_face_dofs+a]*trace[tb+fo+ByNodes(a,s.scalar_face_dofs,k)];ObserveEulerWave(volume_state,maximum,valid);ObserveEulerWave(trace_state,maximum,valid);}
+  const int face_sites=faces_per_element*s.face_points;
+  const int sites=s.volume_points+2*face_sites;
+  double value=0.0;
+  if(thread<s.volume_points)
+  {
+    const int qp=e*s.volume_points+thread;
+    double state[conserved_components]={};
+    for(int scalar=0;scalar<s.scalar_interior_dofs;++scalar)
+      for(int component=0;component<conserved_components;++component)
+        state[component]+=v.volume_shape[
+            qp*s.scalar_interior_dofs+scalar]*
+            interior[ib+ByNodes(scalar,s.scalar_interior_dofs,component)];
+    value=EulerWave(state[0],state[1],state[2],state[3]);
+  }
+  else if(thread<sites)
+  {
+    const int face_value=thread-s.volume_points;
+    const int face_site=face_value/2;
+    const bool trace_site=(face_value&1)!=0;
+    const int face=face_site/s.face_points;
+    const int q=face_site-face*s.face_points;
+    const int qp=(e*faces_per_element+face)*s.face_points+q;
+    const int face_offset=face*s.trace_components*s.scalar_face_dofs;
+    double state[conserved_components]={};
+    if(trace_site)
+    {
+      for(int scalar=0;scalar<s.scalar_face_dofs;++scalar)
+        for(int component=0;component<conserved_components;++component)
+          state[component]+=v.face_trace_shape[
+              qp*s.scalar_face_dofs+scalar]*
+              trace[tb+face_offset+ByNodes(
+                  scalar,s.scalar_face_dofs,component)];
+    }
+    else
+    {
+      for(int scalar=0;scalar<s.scalar_interior_dofs;++scalar)
+        for(int component=0;component<conserved_components;++component)
+          state[component]+=v.face_interior_shape[
+              qp*s.scalar_interior_dofs+scalar]*
+              interior[ib+ByNodes(
+                  scalar,s.scalar_interior_dofs,component)];
+    }
+    value=EulerWave(state[0],state[1],state[2],state[3]);
+  }
+  // Valid wave speeds are nonnegative.  Convert every invalid site to the
+  // existing finite sentinel before the fixed tree so validity propagation is
+  // independent of NaN comparison behavior.
+  wave[thread]=thread<sites&&(!isfinite(value)||value<0.0)?-1.0:value;
+  __syncthreads();
+  for(int offset=cooperative_wave_threads/2;offset>0;offset/=2)
+  {
+    if(thread<offset)
+    {
+      const double left=wave[thread],right=wave[thread+offset];
+      wave[thread]=(left<0.0||right<0.0)?-1.0:fmax(left,right);
+    }
+    __syncthreads();
+  }
   // Valid Euler wave speeds are nonnegative, so -1 is an unambiguous finite
   // sentinel and avoids relying on NaN behavior in the ordered reducer.
-  v.status[e]=valid?maximum:-1.0;
+  if(thread==0)v.status[e]=wave[0];
 }
 __global__ void MaximumWaveReduceKernel(const double* element_maxima,
                                         int elements,double* out)
 {
-  if(blockIdx.x||threadIdx.x)return;
-  double maximum=0.0;bool valid=true;
-  for(int e=0;e<elements;++e){const double value=element_maxima[e];valid=valid&&isfinite(value)&&value>=0.0;if(valid&&value>maximum)maximum=value;}
-  out[0]=maximum;out[1]=valid?1.0:0.0;
+  __shared__ double maximums[cooperative_reduction_threads];
+  __shared__ int validity[cooperative_reduction_threads];
+  const int thread=threadIdx.x;
+  double maximum=0.0;
+  int valid=1;
+  for(int e=thread;e<elements;e+=blockDim.x)
+  {
+    const double value=element_maxima[e];
+    if(!isfinite(value)||value<0.0)valid=0;
+    else maximum=fmax(maximum,value);
+  }
+  maximums[thread]=maximum;
+  validity[thread]=valid;
+  __syncthreads();
+  for(int offset=blockDim.x/2;offset>0;offset/=2)
+  {
+    if(thread<offset)
+    {
+      maximums[thread]=fmax(maximums[thread],maximums[thread+offset]);
+      validity[thread]=validity[thread]&&validity[thread+offset];
+    }
+    __syncthreads();
+  }
+  if(thread==0)
+  {
+    out[0]=maximums[0];
+    out[1]=validity[0]?1.0:0.0;
+  }
+}
+
+struct EulerConservationSite
+{
+  double balance[igr_trace_components];
+  double scale[igr_trace_components];
+  double measure;
+};
+
+__device__ __forceinline__ bool EulerConservationVolumeSite(
+    CudaDeviceView v, CudaMeshShape s, const int element, const int q,
+    const double dt, EulerConservationSite& site)
+{
+  const int interior_offset = element * s.interior_dofs;
+  const int qp = element * s.volume_points + q;
+  const double weight = v.volume_weight[qp];
+  double current[conserved_components] = {};
+  double previous[conserved_components] = {};
+  double source[conserved_components] = {};
+  double sigma = 0.0;
+  double conservative_gradient[3][dimension] = {};
+  for (int scalar = 0; scalar < s.scalar_interior_dofs; ++scalar)
+  {
+    const double phi =
+        v.volume_shape[qp * s.scalar_interior_dofs + scalar];
+    for (int component = 0; component < conserved_components; ++component)
+    {
+      const int index = interior_offset +
+          ByNodes(scalar, s.scalar_interior_dofs, component);
+      current[component] += phi * v.work_interior[index];
+      previous[component] += phi * v.old_interior[index];
+      source[component] += phi * v.static_source[index];
+    }
+    if (s.igr_active)
+    {
+      sigma += phi * v.work_interior[interior_offset +
+          ByNodes(scalar, s.scalar_interior_dofs, 4)];
+      for (int component = 0; component < 3; ++component)
+        for (int direction = 0; direction < dimension; ++direction)
+          conservative_gradient[component][direction] +=
+              v.volume_derivative[
+                  (qp * s.scalar_interior_dofs + scalar) * dimension +
+                  direction] *
+              v.work_interior[interior_offset +
+                  ByNodes(scalar, s.scalar_interior_dofs, component)];
+    }
+  }
+  if (!(weight > 0.0) || !isfinite(weight) ||
+      (s.igr_active &&
+       (!(current[0] > cuda_density_gate) || !isfinite(sigma))))
+    return false;
+  site.measure = weight;
+  for (int component = 0; component < conserved_components; ++component)
+  {
+    const double change =
+        weight * (current[component] - previous[component]);
+    const double forcing = dt * weight * source[component];
+    site.balance[component] = change - forcing;
+    site.scale[component] = fabs(change) + fabs(forcing);
+    if (!isfinite(change) || !isfinite(forcing) ||
+        !isfinite(site.balance[component]) ||
+        !isfinite(site.scale[component]))
+      return false;
+  }
+  if (s.igr_active)
+  {
+    double velocity_gradient[dimension][dimension] = {};
+    for (int velocity = 0; velocity < dimension; ++velocity)
+      for (int direction = 0; direction < dimension; ++direction)
+        velocity_gradient[velocity][direction] =
+            conservative_gradient[1 + velocity][direction] / current[0] -
+            current[1 + velocity] *
+                conservative_gradient[0][direction] /
+                (current[0] * current[0]);
+    const double velocity_trace =
+        velocity_gradient[0][0] + velocity_gradient[1][1];
+    const double q_value =
+        velocity_gradient[0][0] * velocity_gradient[0][0] +
+        2.0 * velocity_gradient[0][1] * velocity_gradient[1][0] +
+        velocity_gradient[1][1] * velocity_gradient[1][1] +
+        velocity_trace * velocity_trace;
+    const double sigma_contribution = weight * sigma / current[0];
+    const double q_contribution = weight * s.igr_alpha * q_value;
+    site.balance[4] = sigma_contribution - q_contribution;
+    site.scale[4] = fabs(sigma_contribution) + fabs(q_contribution);
+    if (!isfinite(q_value) || !isfinite(sigma_contribution) ||
+        !isfinite(q_contribution) || !isfinite(site.balance[4]) ||
+        !isfinite(site.scale[4]))
+      return false;
+  }
+  return true;
+}
+
+__device__ __forceinline__ bool EulerConservationFaceSite(
+    CudaDeviceView v, CudaMeshShape s, const int element, const int face,
+    const int q, const double dt, EulerConservationSite& site)
+{
+  const int element_face = element * faces_per_element + face;
+  const bool physical = v.boundary_policy_kind != nullptr &&
+      v.boundary_policy_kind[element_face] != 0;
+  if (!physical) return true;
+  const double h = s.igr_active ? v.face_h[element_face] : 1.0;
+  if (s.igr_active && (!(h > 0.0) || !isfinite(h))) return false;
+  const int qp = element_face * s.face_points + q;
+  const double weight = v.face_weight[qp];
+  const double normal[dimension] = {
+      v.face_normal[qp * dimension],
+      v.face_normal[qp * dimension + 1]};
+  const int interior_offset = element * s.interior_dofs;
+  const int trace_offset = element * s.trace_dofs;
+  const int face_offset =
+      face * s.trace_components * s.scalar_face_dofs;
+  double interior[conserved_components] = {};
+  double trace[conserved_components] = {};
+  double sigma = 0.0;
+  double sigma_hat = 0.0;
+  double z[dimension] = {};
+  for (int scalar = 0; scalar < s.scalar_interior_dofs; ++scalar)
+  {
+    const double phi =
+        v.face_interior_shape[qp * s.scalar_interior_dofs + scalar];
+    for (int component = 0; component < conserved_components; ++component)
+      interior[component] += phi * v.work_interior[interior_offset +
+          ByNodes(scalar, s.scalar_interior_dofs, component)];
+    if (s.igr_active)
+    {
+      sigma += phi * v.work_interior[interior_offset +
+          ByNodes(scalar, s.scalar_interior_dofs, 4)];
+      z[0] += phi * v.work_interior[interior_offset +
+          ByNodes(scalar, s.scalar_interior_dofs, 5)];
+      z[1] += phi * v.work_interior[interior_offset +
+          ByNodes(scalar, s.scalar_interior_dofs, 6)];
+    }
+  }
+  for (int scalar = 0; scalar < s.scalar_face_dofs; ++scalar)
+  {
+    const double phi =
+        v.face_trace_shape[qp * s.scalar_face_dofs + scalar];
+    for (int component = 0; component < conserved_components; ++component)
+      trace[component] += phi * v.current_local_trace[
+          trace_offset + face_offset +
+          ByNodes(scalar, s.scalar_face_dofs, component)];
+    if (s.igr_active)
+      sigma_hat += phi * v.current_local_trace[
+          trace_offset + face_offset +
+          ByNodes(scalar, s.scalar_face_dofs, 4)];
+  }
+  double flux[conserved_components] = {};
+  double jacobian[conserved_components * igr_trace_components] = {};
+  if (!(weight > 0.0) || !isfinite(weight) ||
+      !(s.igr_active
+            ? RegularizedFluxJacobian(
+                  trace, sigma_hat, normal[0], normal[1], flux, jacobian)
+            : EulerNormalFlux(trace, normal[0], normal[1], flux)))
+    return false;
+  double stabilization = s.igr_beta;
+  if (!s.igr_active)
+  {
+    double interior_speed = 0.0;
+    double trace_speed = 0.0;
+    if (!LocalLlfSpeed(
+            interior, normal[0], normal[1], interior_speed) ||
+        !LocalLlfSpeed(trace, normal[0], normal[1], trace_speed))
+      return false;
+    stabilization = fmax(interior_speed, trace_speed);
+    if (!(stabilization > 0.0) || !isfinite(stabilization)) return false;
+  }
+  for (int component = 0; component < conserved_components; ++component)
+  {
+    const double numerical_flux = flux[component] + stabilization *
+        (interior[component] - trace[component]);
+    const double contribution = dt * weight * numerical_flux;
+    site.balance[component] = contribution;
+    site.scale[component] = fabs(contribution);
+    if (!isfinite(contribution)) return false;
+  }
+  if (s.igr_active)
+  {
+    if (!(trace[0] > cuda_density_gate)) return false;
+    const double degree_scale = static_cast<double>(
+        (s.order + 1) * (s.order + 1));
+    const double tau = degree_scale / (trace[0] * h);
+    const double z_hat_normal =
+        z[0] * normal[0] + z[1] * normal[1] -
+        tau * (sigma - sigma_hat);
+    const double contribution = s.igr_alpha * weight * z_hat_normal;
+    site.balance[4] = -contribution;
+    site.scale[4] = fabs(contribution);
+    if (!(tau > 0.0) || !isfinite(tau) || !isfinite(contribution))
+      return false;
+  }
+  return true;
 }
 
 // Compact post-candidate balance used by the production borrowed-Euler
-// lifecycle.  IGR contributes its auxiliary balance and regularized physical
-// flux in the same kernel; conventional Euler uses its LLF numerical flux.
-// One thread deliberately accumulates in element/quadrature order so the
-// device result mirrors the CPU reference reduction without a second
-// assembler or nondeterministic atomics.  out[0:5] are balances, out[5:10]
-// their scales, out[10] is the domain measure, and out[11] is validity.
-__global__ void EulerConservationKernel(CudaDeviceView v, CudaMeshShape s,
-                                        const double dt, double* out)
+// lifecycle.  One block owns one element, and its lanes map the ordered site
+// sequence [volume q][face 0 q]...[face 3 q].  Nonphysical face sites are
+// exact zeros.  The fixed pairwise tree is deterministic and uses no atomics.
+// The first twelve entries of each element's f vector are temporary scratch;
+// the second stage restores their exact assembly invariant f=-residual_r.
+__global__ void EulerConservationElementsKernel(
+    CudaDeviceView v, CudaMeshShape s, const double dt)
 {
-  if (blockIdx.x || threadIdx.x) return;
   constexpr int components = igr_trace_components;
   static_assert(euler_conservation_result_scalars == 2 * components + 2);
-  for (int index = 0; index < 2 * components + 1; ++index) out[index] = 0.0;
+  __shared__ double balance[components][cooperative_conservation_threads];
+  __shared__ double scale[components][cooperative_conservation_threads];
+  __shared__ double measure[cooperative_conservation_threads];
+  __shared__ int validity[cooperative_conservation_threads];
+  const int element = blockIdx.x;
+  const int thread = threadIdx.x;
+  const int face_sites = faces_per_element * s.face_points;
+  const int sites = s.volume_points + face_sites;
+  EulerConservationSite site{};
   bool valid = s.borrowed_host_inputs && isfinite(dt) && dt > 0.0 &&
       (!s.igr_active || v.face_h != nullptr);
-  const double degree_scale = static_cast<double>(
-      (s.order + 1) * (s.order + 1));
-  for (int e = 0; e < s.elements && valid; ++e)
+  if (valid && thread < s.volume_points)
+    valid = EulerConservationVolumeSite(v, s, element, thread, dt, site);
+  else if (valid && thread < sites)
   {
-    const int interior_offset = e * s.interior_dofs;
-    const int trace_offset = e * s.trace_dofs;
-    for (int q = 0; q < s.volume_points && valid; ++q)
-    {
-      const int qp = e * s.volume_points + q;
-      const double weight = v.volume_weight[qp];
-      double current[conserved_components] = {};
-      double previous[conserved_components] = {};
-      double source[conserved_components] = {};
-      double sigma = 0.0;
-      double conservative_gradient[3][dimension] = {};
-      for (int scalar = 0; scalar < s.scalar_interior_dofs; ++scalar)
-      {
-        const double phi = v.volume_shape[
-            qp * s.scalar_interior_dofs + scalar];
-        for (int component = 0; component < conserved_components; ++component)
-        {
-          const int index = interior_offset + ByNodes(
-              scalar, s.scalar_interior_dofs, component);
-          current[component] += phi * v.work_interior[index];
-          previous[component] += phi * v.old_interior[index];
-          source[component] += phi * v.static_source[index];
-        }
-        if (s.igr_active)
-        {
-          sigma += phi * v.work_interior[interior_offset + ByNodes(
-              scalar, s.scalar_interior_dofs, 4)];
-          for (int component = 0; component < 3; ++component)
-            for (int direction = 0; direction < dimension; ++direction)
-              conservative_gradient[component][direction] +=
-                  v.volume_derivative[
-                      (qp * s.scalar_interior_dofs + scalar) * dimension +
-                      direction] *
-                  v.work_interior[interior_offset + ByNodes(
-                      scalar, s.scalar_interior_dofs, component)];
-        }
-      }
-      valid = weight > 0.0 && isfinite(weight) &&
-          (!s.igr_active ||
-           (current[0] > cuda_density_gate && isfinite(sigma)));
-      if (valid) out[2 * components] += weight;
-      for (int component = 0;
-           component < conserved_components && valid; ++component)
-      {
-        const double change = weight *
-            (current[component] - previous[component]);
-        const double forcing = dt * weight * source[component];
-        valid = isfinite(change) && isfinite(forcing);
-        out[component] += change - forcing;
-        out[components + component] += fabs(change) + fabs(forcing);
-      }
-      if (s.igr_active)
-      {
-        double velocity_gradient[dimension][dimension] = {};
-        for (int velocity = 0; velocity < dimension; ++velocity)
-          for (int direction = 0; direction < dimension; ++direction)
-            velocity_gradient[velocity][direction] =
-                conservative_gradient[1 + velocity][direction] /
-                    current[0] -
-                current[1 + velocity] *
-                    conservative_gradient[0][direction] /
-                    (current[0] * current[0]);
-        const double velocity_trace =
-            velocity_gradient[0][0] + velocity_gradient[1][1];
-        const double q_value =
-            velocity_gradient[0][0] * velocity_gradient[0][0] +
-            2.0 * velocity_gradient[0][1] * velocity_gradient[1][0] +
-            velocity_gradient[1][1] * velocity_gradient[1][1] +
-            velocity_trace * velocity_trace;
-        const double sigma_contribution = weight * sigma / current[0];
-        const double q_contribution = weight * s.igr_alpha * q_value;
-        valid = valid && isfinite(q_value) &&
-            isfinite(sigma_contribution) && isfinite(q_contribution);
-        out[4] += sigma_contribution - q_contribution;
-        out[9] += fabs(sigma_contribution) + fabs(q_contribution);
-      }
-    }
-
-    for (int face = 0; face < faces_per_element && valid; ++face)
-    {
-      const int element_face = e * faces_per_element + face;
-      const bool physical = v.boundary_policy_kind != nullptr &&
-          v.boundary_policy_kind[element_face] != 0;
-      if (!physical) continue;
-      const double h = s.igr_active ? v.face_h[element_face] : 1.0;
-      valid = !s.igr_active || (isfinite(h) && h > 0.0);
-      const int face_offset = face * s.trace_components * s.scalar_face_dofs;
-      for (int q = 0; q < s.face_points && valid; ++q)
-      {
-        const int qp = element_face * s.face_points + q;
-        const double weight = v.face_weight[qp];
-        const double normal[dimension] = {
-            v.face_normal[qp * dimension],
-            v.face_normal[qp * dimension + 1]};
-        double interior[conserved_components] = {};
-        double trace[conserved_components] = {};
-        double sigma = 0.0;
-        double sigma_hat = 0.0;
-        double z[dimension] = {};
-        for (int scalar = 0; scalar < s.scalar_interior_dofs; ++scalar)
-        {
-          const double phi = v.face_interior_shape[
-              qp * s.scalar_interior_dofs + scalar];
-          for (int component = 0; component < conserved_components;
-               ++component)
-            interior[component] += phi * v.work_interior[
-                interior_offset + ByNodes(
-                    scalar, s.scalar_interior_dofs, component)];
-          if (s.igr_active)
-          {
-            sigma += phi * v.work_interior[interior_offset + ByNodes(
-                scalar, s.scalar_interior_dofs, 4)];
-            z[0] += phi * v.work_interior[interior_offset + ByNodes(
-                scalar, s.scalar_interior_dofs, 5)];
-            z[1] += phi * v.work_interior[interior_offset + ByNodes(
-                scalar, s.scalar_interior_dofs, 6)];
-          }
-        }
-        for (int scalar = 0; scalar < s.scalar_face_dofs; ++scalar)
-        {
-          const double phi = v.face_trace_shape[
-              qp * s.scalar_face_dofs + scalar];
-          for (int component = 0; component < conserved_components;
-               ++component)
-            trace[component] += phi * v.current_local_trace[
-                trace_offset + face_offset + ByNodes(
-                    scalar, s.scalar_face_dofs, component)];
-          if (s.igr_active)
-            sigma_hat += phi * v.current_local_trace[
-                trace_offset + face_offset + ByNodes(
-                    scalar, s.scalar_face_dofs, 4)];
-        }
-        double flux[conserved_components] = {};
-        double jacobian[conserved_components * igr_trace_components] = {};
-        valid = weight > 0.0 && isfinite(weight) &&
-            (s.igr_active
-                 ? RegularizedFluxJacobian(
-                       trace, sigma_hat, normal[0], normal[1], flux,
-                       jacobian)
-                 : EulerNormalFlux(trace, normal[0], normal[1], flux));
-        double stabilization = s.igr_beta;
-        if (!s.igr_active && valid)
-        {
-          double interior_speed = 0.0;
-          double trace_speed = 0.0;
-          valid = LocalLlfSpeed(
-                      interior, normal[0], normal[1], interior_speed) &&
-              LocalLlfSpeed(trace, normal[0], normal[1], trace_speed);
-          stabilization = fmax(interior_speed, trace_speed);
-          valid = valid && isfinite(stabilization) && stabilization > 0.0;
-        }
-        for (int component = 0;
-             component < conserved_components && valid; ++component)
-        {
-          const double numerical_flux = flux[component] + stabilization *
-              (interior[component] - trace[component]);
-          const double contribution = dt * weight * numerical_flux;
-          valid = isfinite(contribution);
-          out[component] += contribution;
-          out[components + component] += fabs(contribution);
-        }
-        if (s.igr_active)
-        {
-          valid = valid && trace[0] > cuda_density_gate;
-          const double tau = degree_scale / (trace[0] * h);
-          const double z_hat_normal =
-              z[0] * normal[0] + z[1] * normal[1] -
-              tau * (sigma - sigma_hat);
-          const double contribution = s.igr_alpha * weight * z_hat_normal;
-          valid = valid && tau > 0.0 && isfinite(tau) &&
-              isfinite(contribution);
-          out[4] -= contribution;
-          out[9] += fabs(contribution);
-        }
-      }
-    }
+    const int face_site = thread - s.volume_points;
+    const int face = face_site / s.face_points;
+    const int q = face_site - face * s.face_points;
+    valid = EulerConservationFaceSite(v, s, element, face, q, dt, site);
   }
-  for (int index = 0; index < 2 * components; ++index)
-    valid = valid && isfinite(out[index]);
-  out[euler_conservation_result_scalars - 1] = valid ? 1.0 : 0.0;
+  for (int component = 0; component < components; ++component)
+  {
+    balance[component][thread] = valid ? site.balance[component] : 0.0;
+    scale[component][thread] = valid ? site.scale[component] : 0.0;
+  }
+  measure[thread] = valid ? site.measure : 0.0;
+  validity[thread] = valid ? 1 : 0;
+  __syncthreads();
+  for (int offset = cooperative_conservation_threads / 2;
+       offset > 0; offset /= 2)
+  {
+    if (thread < offset)
+    {
+      for (int component = 0; component < components; ++component)
+      {
+        balance[component][thread] +=
+            balance[component][thread + offset];
+        scale[component][thread] += scale[component][thread + offset];
+      }
+      measure[thread] += measure[thread + offset];
+      validity[thread] =
+          validity[thread] && validity[thread + offset];
+    }
+    __syncthreads();
+  }
+  if (thread == 0)
+  {
+    bool element_valid = validity[0] != 0 && isfinite(measure[0]);
+    for (int component = 0; component < components; ++component)
+      element_valid = element_valid && isfinite(balance[component][0]) &&
+          isfinite(scale[component][0]);
+    const int scratch = element * s.interior_dofs;
+    for (int component = 0; component < components; ++component)
+    {
+      v.f[scratch + component] =
+          element_valid ? balance[component][0] : 0.0;
+      v.f[scratch + components + component] =
+          element_valid ? scale[component][0] : 0.0;
+    }
+    v.f[scratch + 2 * components] = element_valid ? measure[0] : 0.0;
+    v.f[scratch + 2 * components + 1] = element_valid ? 1.0 : 0.0;
+  }
 }
+
+__global__ void EulerConservationReduceKernel(
+    CudaDeviceView v, CudaMeshShape s, double* out)
+{
+  constexpr int components = igr_trace_components;
+  __shared__ double balance[components][cooperative_conservation_threads];
+  __shared__ double scale[components][cooperative_conservation_threads];
+  __shared__ double measure[cooperative_conservation_threads];
+  __shared__ int validity[cooperative_conservation_threads];
+  const int thread = threadIdx.x;
+  EulerConservationSite total{};
+  bool valid = true;
+  for (int element = thread; element < s.elements;
+       element += blockDim.x)
+  {
+    const int scratch = element * s.interior_dofs;
+    valid = valid &&
+        v.f[scratch + euler_conservation_result_scalars - 1] == 1.0;
+    for (int component = 0; component < components; ++component)
+    {
+      const double element_balance = v.f[scratch + component];
+      const double element_scale = v.f[scratch + components + component];
+      total.balance[component] += element_balance;
+      total.scale[component] += element_scale;
+      valid = valid && isfinite(element_balance) &&
+          isfinite(element_scale) && isfinite(total.balance[component]) &&
+          isfinite(total.scale[component]);
+    }
+    const double element_measure = v.f[scratch + 2 * components];
+    total.measure += element_measure;
+    valid = valid && isfinite(element_measure) && isfinite(total.measure);
+    // Conservation is called only after coherent assembly/recovery, where the
+    // retained local RHS has the exact invariant f=-residual_r.  Restore every
+    // overwritten entry so later oracle export observes the original product.
+    for (int index = 0; index < euler_conservation_result_scalars; ++index)
+      v.f[scratch + index] = -v.residual_r[scratch + index];
+  }
+  for (int component = 0; component < components; ++component)
+  {
+    balance[component][thread] = total.balance[component];
+    scale[component][thread] = total.scale[component];
+  }
+  measure[thread] = total.measure;
+  validity[thread] = valid ? 1 : 0;
+  __syncthreads();
+  for (int offset = cooperative_conservation_threads / 2;
+       offset > 0; offset /= 2)
+  {
+    if (thread < offset)
+    {
+      for (int component = 0; component < components; ++component)
+      {
+        balance[component][thread] +=
+            balance[component][thread + offset];
+        scale[component][thread] += scale[component][thread + offset];
+      }
+      measure[thread] += measure[thread + offset];
+      validity[thread] =
+          validity[thread] && validity[thread + offset];
+    }
+    __syncthreads();
+  }
+  if (thread == 0)
+  {
+    bool final_valid = validity[0] != 0 && isfinite(measure[0]);
+    for (int component = 0; component < components; ++component)
+      final_valid = final_valid && isfinite(balance[component][0]) &&
+          isfinite(scale[component][0]);
+    for (int component = 0; component < components; ++component)
+    {
+      out[component] = final_valid ? balance[component][0] : 0.0;
+      out[components + component] =
+          final_valid ? scale[component][0] : 0.0;
+    }
+    out[2 * components] = final_valid ? measure[0] : 0.0;
+    out[2 * components + 1] = final_valid ? 1.0 : 0.0;
+  }
+}
+__device__ std::uint64_t HashBytesLane(const double* values,const int count,
+                                      const int lane)
+{const std::uint64_t seeds[4]={1469598103934665603ULL,1099511628211ULL^0x9e3779b97f4a7c15ULL,1469598103934665603ULL^0xd6e8feb86659fd93ULL,1099511628211ULL^0xa0761d6478bd642fULL};std::uint64_t h=seeds[lane];const unsigned char* bytes=reinterpret_cast<const unsigned char*>(values);for(int i=0;i<count*static_cast<int>(sizeof(double));++i){h^=static_cast<std::uint64_t>(bytes[i]+17U*lane);h*=1099511628211ULL+2ULL*lane;}return h;}
 __global__ void HashKernel(const double* values,int count,std::uint64_t* out)
-{const int lane=threadIdx.x;if(blockIdx.x||lane>=4)return;const std::uint64_t seeds[4]={1469598103934665603ULL,1099511628211ULL^0x9e3779b97f4a7c15ULL,1469598103934665603ULL^0xd6e8feb86659fd93ULL,1099511628211ULL^0xa0761d6478bd642fULL};std::uint64_t h=seeds[lane];const unsigned char* bytes=reinterpret_cast<const unsigned char*>(values);for(int i=0;i<count*static_cast<int>(sizeof(double));++i){h^=static_cast<std::uint64_t>(bytes[i]+17U*lane);h*=1099511628211ULL+2ULL*lane;}out[lane]=h;}
+{const int lane=threadIdx.x;if(blockIdx.x||lane>=4)return;out[lane]=HashBytesLane(values,count,lane);}
+__global__ void HashPairKernel(const double* first,int first_count,
+                               const double* second,int second_count,
+                               std::uint64_t* out)
+{const int lane=threadIdx.x;if(blockIdx.x||lane>=8)return;const bool use_second=lane>=4;const int hash_lane=lane&3;out[lane]=HashBytesLane(use_second?second:first,use_second?second_count:first_count,hash_lane);}
 
 bool LaunchOk() noexcept { return cudaPeekAtLastError() == cudaSuccess; }
 int Blocks(const int n) noexcept { return (n + 127) / 128; }
+bool LaunchBorrowedEulerStages(const CudaDeviceView& v,
+                               const CudaMeshShape& s,
+                               const double dt,
+                               const bool frozen_llf) noexcept
+{
+  const int blocks=(s.elements-1)/borrowed_euler_elements_per_block+1;
+  BorrowedEulerZeroKernel<<<blocks,borrowed_euler_block_threads>>>(v,s);
+  if(!LaunchOk())return false;
+  BorrowedEulerVolumeKernel<<<blocks,borrowed_euler_block_threads>>>(v,s,dt);
+  if(!LaunchOk())return false;
+  BorrowedEulerFaceKernel<<<blocks,borrowed_euler_block_threads>>>(
+      v,s,frozen_llf);
+  return LaunchOk();
+}
 } // namespace
 
 bool CudaLaunchTicket(int* words,const CudaFailurePhase phase,std::uint64_t attempt,std::uint64_t generation,int device) noexcept
 {TicketKernel<<<1,1>>>(words,static_cast<int>(phase),attempt,generation,device);return LaunchOk();}
+bool CudaLaunchStatusReduction(const double* status,const int count,
+                               int* failure_flag) noexcept
+{if(status==nullptr||failure_flag==nullptr||count<0)return false;if(cudaMemsetAsync(failure_flag,0,sizeof(int),nullptr)!=cudaSuccess)return false;if(count)StatusReductionKernel<<<Blocks(count),128>>>(status,count,failure_flag);return LaunchOk();}
 bool CudaLaunchGatherLocalTrace(const int* map,int count,const double* source,double* destination) noexcept
 {GatherKernel<<<Blocks(count),128>>>(map,count,source,destination);return LaunchOk();}
 bool CudaLaunchAdmissibility(const CudaDeviceView& v,const CudaMeshShape& s) noexcept
-{AdmissibilityKernel<<<Blocks(s.elements),128>>>(v,s);return LaunchOk();}
+{AdmissibilityKernel<<<s.elements,128>>>(v,s);return LaunchOk();}
 bool CudaLaunchFreezeBorrowedCurrentLlfTau(const CudaDeviceView& v,
                                            const CudaMeshShape& s) noexcept
-{FreezeBorrowedCurrentLlfTauKernel<<<Blocks(s.elements),128>>>(v,s);return LaunchOk();}
+{FreezeBorrowedCurrentLlfTauKernel<<<s.elements,128>>>(v,s);return LaunchOk();}
 bool CudaLaunchAssembly(const CudaDeviceView& v,const CudaMeshShape& s,double dt) noexcept
-{if(s.borrowed_host_inputs)BorrowedEulerAssemblyKernel<<<Blocks(s.elements),128>>>(v,s,dt,false);else AssemblyKernel<<<Blocks(s.elements),128>>>(v,s,dt);return LaunchOk();}
+{
+  if(!s.borrowed_host_inputs)
+  {AssemblyKernel<<<Blocks(s.elements),128>>>(v,s,dt);return LaunchOk();}
+  if(s.elements<=0)return false;
+  return LaunchBorrowedEulerStages(v,s,dt,false);
+}
 bool CudaLaunchFrozenBorrowedLlfAssembly(const CudaDeviceView& v,
                                          const CudaMeshShape& s,
                                          double dt) noexcept
-{if(!s.borrowed_host_inputs||s.igr_active)return false;BorrowedEulerAssemblyKernel<<<Blocks(s.elements),128>>>(v,s,dt,true);return LaunchOk();}
+{
+  if(!s.borrowed_host_inputs||s.igr_active||s.elements<=0)return false;
+  return LaunchBorrowedEulerStages(v,s,dt,true);
+}
 bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s) noexcept
-{CondenseKernel<<<Blocks(s.elements),128>>>(v,s);return LaunchOk();}
+{if(s.borrowed_host_inputs)BorrowedCondenseKernel<<<s.elements,128>>>(v,s);else CondenseKernel<<<Blocks(s.elements),128>>>(v,s);return LaunchOk();}
 bool CudaLaunchZeroTrueSystem(const CudaTrueMatrixDeviceView& m,double* rhs,int n) noexcept
 {const int count=std::max(std::max(m.diag_nonzeros,m.offd_nonzeros),n);ZeroSystemKernel<<<Blocks(count),128>>>(m,rhs,n);return LaunchOk();}
 bool CudaLaunchAssembleOwnedMatrix(const CudaDeviceView& v,const CudaTrueMatrixDeviceView& m,const CudaMeshShape& s) noexcept
@@ -2304,21 +2976,61 @@ bool CudaLaunchGatherRemoteVector(const CudaDeviceView& v,const CudaMeshShape& s
 bool CudaLaunchScatterRemoteVector(const CudaDeviceView& v,const CudaMeshShape& s,double* truth) noexcept
 {if(s.vector_receive_count)ScatterRemoteVectorKernel<<<Blocks(s.vector_receive_count),128>>>(v,truth,s.vector_receive_count);return LaunchOk();}
 bool CudaLaunchRecover(const CudaDeviceView& v,const CudaMeshShape& s) noexcept
-{RecoverKernel<<<Blocks(s.elements),128>>>(v,s);return LaunchOk();}
+{if(s.borrowed_host_inputs)BorrowedRecoverKernel<<<s.elements,128>>>(v,s);else RecoverKernel<<<Blocks(s.elements),128>>>(v,s);return LaunchOk();}
 bool CudaLaunchTrial(const CudaDeviceView& v,const CudaMeshShape& s,double alpha) noexcept
 {TrialKernel<<<Blocks(std::max(s.interior_count,s.true_trace_count)),128>>>(v,s,alpha);return LaunchOk();}
-bool CudaLaunchLocalSquaredNorm(const double* a,int an,const double* b,int bn,double* out) noexcept
-{NormKernel<<<1,1>>>(a,an,b,bn,out);return LaunchOk();}
+bool CudaLaunchPackInteriorOutput(const CudaMeshShape& s,
+                                  const double* source,
+                                  double* packed) noexcept
+{const int count=s.elements*conserved_components*s.scalar_interior_dofs;if(source==nullptr||packed==nullptr||count<=0)return false;PackInteriorOutputKernel<<<Blocks(count),128>>>(s,source,packed);return LaunchOk();}
+bool CudaLaunchLocalSquaredNorm(const double* a,int an,const double* b,int bn,
+                                double* scratch,int scratch_count,
+                                double* out) noexcept
+{
+  if(out==nullptr||an<0||bn<0||(an>0&&a==nullptr)||(bn>0&&b==nullptr)||
+     an>std::numeric_limits<int>::max()-bn)return false;
+  const int count=an+bn;
+  if(count==0)
+    return cudaMemsetAsync(out,0,sizeof(double),nullptr)==cudaSuccess;
+  if(scratch==nullptr||scratch==out||scratch_count<=0)return false;
+  const int needed_blocks=(count-1)/cooperative_reduction_threads+1;
+  const int blocks=std::min(needed_blocks,scratch_count);
+  NormPartialsKernel<<<blocks,cooperative_reduction_threads>>>(
+      a,an,b,bn,scratch);
+  if(!LaunchOk())return false;
+  NormReduceKernel<<<1,cooperative_reduction_threads>>>(scratch,blocks,out);
+  return LaunchOk();
+}
 bool CudaLaunchMaximumWave(const CudaDeviceView& v,const CudaMeshShape& s,
                            const double* interior,const double* trace,
                            double* out) noexcept
-{MaximumWaveElementsKernel<<<Blocks(s.elements),128>>>(v,s,interior,trace);if(!LaunchOk())return false;MaximumWaveReduceKernel<<<1,1>>>(v.status,s.elements,out);return LaunchOk();}
+{const int sites=s.volume_points+2*faces_per_element*s.face_points;if(s.elements<=0||sites<=0||sites>cooperative_wave_threads)return false;MaximumWaveElementsKernel<<<s.elements,cooperative_wave_threads>>>(v,s,interior,trace);if(!LaunchOk())return false;MaximumWaveReduceKernel<<<1,cooperative_reduction_threads>>>(v.status,s.elements,out);return LaunchOk();}
 bool CudaLaunchEulerConservation(const CudaDeviceView& v,
                                  const CudaMeshShape& s,
                                  const double dt, double* out) noexcept
-{EulerConservationKernel<<<1,1>>>(v,s,dt,out);return LaunchOk();}
+{
+  if(!s.borrowed_host_inputs||!isfinite(dt)||!(dt>0.0)||out==nullptr||
+     v.f==nullptr||v.residual_r==nullptr||s.elements<=0||
+     s.interior_dofs<euler_conservation_result_scalars||
+     s.interior_count<=0||s.elements>s.interior_count/s.interior_dofs||
+     s.volume_points<=0||s.volume_points>cooperative_conservation_threads||
+     s.face_points<=0||
+     s.face_points>(cooperative_conservation_threads-s.volume_points)/
+         faces_per_element||
+     (s.igr_active&&v.face_h==nullptr))return false;
+  EulerConservationElementsKernel<<<
+      s.elements,cooperative_conservation_threads>>>(v,s,dt);
+  if(!LaunchOk())return false;
+  EulerConservationReduceKernel<<<
+      1,cooperative_conservation_threads>>>(v,s,out);
+  return LaunchOk();
+}
 bool CudaLaunchHash(const double* values,int count,std::uint64_t* words) noexcept
 {HashKernel<<<1,4>>>(values,count,words);return LaunchOk();}
+bool CudaLaunchHashPair(const double* first,int first_count,
+                        const double* second,int second_count,
+                        std::uint64_t* words) noexcept
+{HashPairKernel<<<1,8>>>(first,first_count,second,second_count,words);return LaunchOk();}
 
 } // namespace detail
 } // namespace dg::hdg::runtime::cuda_w8a

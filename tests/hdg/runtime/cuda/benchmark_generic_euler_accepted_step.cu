@@ -26,7 +26,8 @@ namespace dg::hdg::runtime::cuda_w8a::detail
 
 // Test-only POD copied while the prepared authority is live.  Keeping this
 // observation in the benchmark translation unit avoids a production
-// diagnostic API and lets the timed lifecycle exclude the POD copy itself.
+// diagnostic API; its small host copy remains inside the reported full
+// Prepare-through-Commit wall interval so overlapping device work is counted.
 struct CudaAcceptedStepBenchmarkObservation
 {
   CudaStepEvidence evidence{};
@@ -185,6 +186,8 @@ using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using dg::hdg::runtime::cuda_w8a::CudaMutableHostL2Output;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
+using dg::hdg::runtime::cuda_w8a::CudaTransferTotals;
+using dg::hdg::runtime::cuda_w8a::CudaTransportPolicy;
 using dg::hdg::runtime::cuda_w8a::conserved_components;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaAcceptedStepBenchmarkObservation;
@@ -196,6 +199,9 @@ using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
 
 constexpr int order = 1;
 constexpr int principal_threads = 128;
+constexpr int principal_element_threads = 4;
+constexpr int principal_elements_per_block =
+    principal_threads / principal_element_threads;
 constexpr int default_mesh_n = 104;
 constexpr int warmup_steps = 1;
 constexpr int measured_steps = 5;
@@ -209,8 +215,10 @@ constexpr std::uint32_t cuda_capabilities =
     CapabilityBit(Capability::external_source) |
     CapabilityBit(Capability::numerical_boundary_operator);
 
-static_assert(default_mesh_n * default_mesh_n >= 10752,
-              "the default benchmark must saturate at least 84 blocks");
+static_assert(principal_elements_per_block == 32);
+static_assert(default_mesh_n * default_mesh_n >=
+                  84 * principal_elements_per_block,
+              "the principal assembly grid must saturate all 84 SMs");
 
 constexpr bool ValidDomainPeriods(const int mesh_n,
                                   const int domain_periods) noexcept
@@ -234,6 +242,7 @@ struct Options
   int mesh_n = default_mesh_n;
   int domain_periods = 1;
   double timestep = default_timestep;
+  bool export_interior = true;
   bool help = false;
 };
 
@@ -249,6 +258,7 @@ struct StepSample
   int measured_index = -1;
   double seconds = std::numeric_limits<double>::infinity();
   std::uint64_t exported_interior_checksum = 0;
+  CudaTransferTotals transfers{};
   CudaAcceptedStepBenchmarkObservation prepared{};
   CudaAcceptedStepCommittedHashes committed{};
   dg::hdg::generic::HdgEulerSessionCoordinates coordinates{};
@@ -317,6 +327,16 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
       options.regularization = RegularizationKind::none;
       continue;
     }
+    if (argument == "--export")
+    {
+      options.export_interior = true;
+      continue;
+    }
+    if (argument == "--no-export")
+    {
+      options.export_interior = false;
+      continue;
+    }
     if (argument == "--mode")
     {
       if (++index >= argc || !SelectMode(argv[index], options))
@@ -372,10 +392,10 @@ void PrintUsage(const char* executable)
 {
   std::cout << "Usage: " << executable
             << " [--mode conventional|igr] [--mesh-n N]"
-               " [--domain-periods K] [--dt DT]\n"
+               " [--domain-periods K] [--dt DT] [--export|--no-export]\n"
                "       " << executable
             << " [--conventional|--igr] [--mesh-n N]"
-               " [--domain-periods K] [--dt DT]\n";
+               " [--domain-periods K] [--dt DT] [--export|--no-export]\n";
 }
 
 mfem::ParMesh MakePeriodicMesh(const int n, const int domain_periods)
@@ -527,6 +547,7 @@ bool RunStep(GenericEulerHdgCudaSession& session,
              const BorrowedFields& fields,
              std::vector<double>& exported_interior,
              const double timestep,
+             const bool export_interior,
              const bool warmup, const int measured_index,
              StepSample& sample, std::string& error)
 {
@@ -539,24 +560,27 @@ bool RunStep(GenericEulerHdgCudaSession& session,
 
   const auto started = clock::now();
   const auto prepared = session.Prepare(timestep, authority, output);
-  const auto observation_started = clock::now();
   const bool observed = prepared.status == HdgEulerSessionStatus::prepared &&
       CudaQualificationTestAccess::CapturePrepared(session, sample.prepared);
-  const auto observation_finished = clock::now();
-  const bool exported = observed && session.ExportPreparedInterior(
-      authority, output, CudaMutableHostL2Output{
-          exported_interior.data(), fields.volume_scalar_count,
-          conserved_components});
+  const bool exported = observed && (!export_interior ||
+      session.ExportPreparedInterior(
+          authority, output, CudaMutableHostL2Output{
+              exported_interior.data(), fields.volume_scalar_count,
+              conserved_components}));
   const bool acknowledged = exported &&
       session.AcknowledgePreparedOutput(authority, output);
   const auto committed = acknowledged
       ? session.Commit(std::move(authority), output)
       : GenericEulerHdgCudaSession::result_type{};
   const auto finished = clock::now();
+  sample.transfers = CudaTransportPolicy::Accounting();
 
-  sample.seconds = std::chrono::duration<double>(
-      (observation_started - started) +
-      (finished - observation_finished)).count();
+  // Keep the prepared observation inside the wall-clock interval.  Prepare
+  // may deliberately return with same-stream metadata staging still in
+  // flight, so subtracting host observation time could also subtract real
+  // device work that overlaps it.
+  sample.seconds =
+      std::chrono::duration<double>(finished - started).count();
   if (!observed || !exported || !acknowledged ||
       committed.status != HdgEulerSessionStatus::committed ||
       !output.successful_commit)
@@ -567,10 +591,10 @@ bool RunStep(GenericEulerHdgCudaSession& session,
         std::to_string(static_cast<unsigned int>(committed.status));
     return false;
   }
-  // Hashing and committed-state observation are intentionally outside the
-  // timed Prepare + prepared D2H export + Acknowledge + Commit region.
-  sample.exported_interior_checksum =
-      StableFp64Checksum(exported_interior);
+  // The host checksum and committed-state observation below remain outside
+  // the timed transaction region.
+  sample.exported_interior_checksum = export_interior
+      ? StableFp64Checksum(exported_interior) : 0;
   if (!CudaQualificationTestAccess::CaptureCommitted(
           session, sample.committed))
   {
@@ -675,6 +699,20 @@ void PrintStep(const StepSample& sample)
             << ",\"line_search_trials\":" << evidence.line_search_trials
             << ",\"rejected_line_search_trials\":"
             << evidence.rejected_line_search_trials
+            << ",\"transfers\":{"
+            << "\"host_to_device_bytes\":"
+            << sample.transfers.host_to_device_bytes
+            << ",\"device_to_host_bytes\":"
+            << sample.transfers.device_to_host_bytes
+            << ",\"device_to_device_bytes\":"
+            << sample.transfers.device_to_device_bytes
+            << ",\"mpi_staging_bytes\":"
+            << sample.transfers.mpi_staging_bytes
+            << ",\"synchronization_events\":"
+            << sample.transfers.synchronization_events
+            << ",\"event_count\":" << sample.transfers.event_count
+            << ",\"complete\":" << std::boolalpha
+            << sample.transfers.complete << std::noboolalpha << '}'
             << ",\"gates\":{"
             << "\"candidate_ready\":" << std::boolalpha
             << sample.prepared.candidate_ready
@@ -708,7 +746,8 @@ int RunBenchmark(const Options& options)
       options.mesh_n, options.domain_periods);
   const int elements = mesh.GetNE();
   const int principal_blocks =
-      (elements + principal_threads - 1) / principal_threads;
+      (elements + principal_elements_per_block - 1) /
+      principal_elements_per_block;
   BorrowedFields fields = MakeFields(mesh, options.domain_periods);
   if (elements != options.mesh_n * options.mesh_n ||
       fields.volume_scalar_count == 0 ||
@@ -770,7 +809,8 @@ int RunBenchmark(const Options& options)
   for (int index = 0; index < total_steps; ++index)
   {
     const bool warmup = index < warmup_steps;
-    if (!RunStep(session, fields, exported_interior, options.timestep, warmup,
+    if (!RunStep(session, fields, exported_interior, options.timestep,
+                 options.export_interior, warmup,
                  warmup ? -1 : index - warmup_steps,
                  samples[static_cast<std::size_t>(index)], error))
     {
@@ -810,11 +850,20 @@ int RunBenchmark(const Options& options)
             << "\"gpu_sm_count\":"
             << device_properties.multiProcessorCount << ','
             << "\"principal_threads\":" << principal_threads << ','
+            << "\"principal_element_threads\":"
+            << principal_element_threads << ','
+            << "\"principal_elements_per_block\":"
+            << principal_elements_per_block << ','
             << "\"principal_blocks\":" << principal_blocks << ','
+            << "\"principal_execution\":"
+               "\"four_lane_subwarp_per_element\","
             << "\"dt\":" << options.timestep << ','
+            << "\"host_export\":"
+            << (options.export_interior ? "true" : "false") << ','
             << "\"initialization_timed\":false,"
-            << "\"timing_scope\":\"Prepare+ExportPreparedInteriorD2H+"
-               "AcknowledgePreparedOutput+Commit\","
+            << "\"timing_scope\":\"Prepare+CapturePreparedObservation+"
+            << (options.export_interior ? "ExportPreparedInteriorD2H+" : "")
+            << "AcknowledgePreparedOutput+Commit\","
             << "\"warmup_steps\":" << warmup_steps << ','
             << "\"measured_steps\":" << measured_steps << ','
             << "\"warmup_duration_seconds\":";

@@ -375,7 +375,9 @@ struct CudaDeviceView
   double* borrowed_lagged_llf_tau = nullptr;
   double* initial_current_interior = nullptr;
   double* base_interior = nullptr;
-  double* trial_interior = nullptr;
+  // Compact four-component element-local staging used only for host output.
+  // The nonlinear trial is written directly into work_interior.
+  double* output_interior = nullptr;
   double* delta_interior = nullptr;
   double* recovered_interior = nullptr;
   double* work_true_trace = nullptr;
@@ -425,6 +427,7 @@ struct CudaDeviceView
   double* scalar = nullptr;
   std::uint64_t* hash_words = nullptr;
   int* ticket_words = nullptr;
+  int* status_flag = nullptr;
   int* signed_element_trace = nullptr;
   int* boundary_policy_kind = nullptr;
   int* matrix_owned_source = nullptr;
@@ -756,6 +759,8 @@ bool CudaHypreDevicePolicyValid(mfem::HypreParMatrix& matrix,
 bool CudaLaunchTicket(int* words, CudaFailurePhase phase,
                       std::uint64_t attempt, std::uint64_t generation,
                       int device) noexcept;
+bool CudaLaunchStatusReduction(const double* status, int count,
+                               int* failure_flag) noexcept;
 bool CudaLaunchGatherLocalTrace(const int* signed_map, int count,
                                 const double* true_trace,
                                 double* local_trace) noexcept;
@@ -794,8 +799,12 @@ bool CudaLaunchRecover(const CudaDeviceView& view,
                        const CudaMeshShape& shape) noexcept;
 bool CudaLaunchTrial(const CudaDeviceView& view,
                      const CudaMeshShape& shape, double alpha) noexcept;
+bool CudaLaunchPackInteriorOutput(const CudaMeshShape& shape,
+                                  const double* source,
+                                  double* packed) noexcept;
 bool CudaLaunchLocalSquaredNorm(const double* first, int first_count,
                                 const double* second, int second_count,
+                                double* scratch, int scratch_count,
                                 double* result) noexcept;
 bool CudaLaunchMaximumWave(const CudaDeviceView& view,
                            const CudaMeshShape& shape,
@@ -808,6 +817,9 @@ bool CudaLaunchEulerConservation(const CudaDeviceView& view,
 
 bool CudaLaunchHash(const double* values, int count,
                     std::uint64_t* words) noexcept;
+bool CudaLaunchHashPair(const double* first, int first_count,
+                        const double* second, int second_count,
+                        std::uint64_t* words) noexcept;
 
 inline StateHash HashHostBytes(const void* data, const std::size_t bytes) noexcept
 {
@@ -1073,8 +1085,7 @@ public:
     const bool trace_ready = DistributeCurrentTrace(committed.trace.coefficients);
     const bool launched = trace_ready && CudaLaunchMaximumWave(
         view_, shape_, committed.interior.coefficients,
-        view_.current_local_trace, view_.scalar) &&
-        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+        view_.current_local_trace, view_.scalar);
     if (!CollectiveContinue(launched)) return false;
     const bool copied = TransportPolicy::DeviceToHost(
         host_cfl_scalars_.data(), view_.scalar,
@@ -1341,9 +1352,6 @@ public:
         workspace.trace.generation = current_generation_;
       }
     }
-    const bool synchronized =
-        TransportPolicy::Synchronize(CudaTransferSite::attempt_seed_trace);
-    local_ready = local_ready && synchronized;
     if (!CollectiveContinue(local_ready)) { return false; }
     return DistributeCurrentTrace(workspace.trace.coefficients);
   }
@@ -1496,7 +1504,6 @@ private:
               ? CudaLaunchFrozenBorrowedLlfAssembly(
                     view_, shape_, fixed_dt)
               : CudaLaunchAssembly(view_, shape_, fixed_dt)) &&
-          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
           StatusPassed();
       if (!CollectiveContinue(assembled)) return false;
       if (residual_interior == nullptr || residual_trace == nullptr)
@@ -1533,9 +1540,7 @@ private:
     if (!shape_.igr_active)
     {
       const bool tau_frozen = CudaLaunchFreezeBorrowedCurrentLlfTau(
-              view_, shape_) &&
-          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-          StatusPassed();
+              view_, shape_) && StatusPassed();
       if (!CollectiveContinue(tau_frozen)) return false;
     }
     if (!assemble(base_interior, base_true_trace, nullptr, nullptr))
@@ -1733,8 +1738,7 @@ public:
     std::array<double, euler_conservation_result_scalars> local{};
     const bool launched = initialized_ && shape_.borrowed_host_inputs &&
         std::isfinite(dt) && dt > 0.0 &&
-        CudaLaunchEulerConservation(view_, shape_, dt, view_.scalar) &&
-        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+        CudaLaunchEulerConservation(view_, shape_, dt, view_.scalar);
     if (!CollectiveContinue(launched)) return false;
     const bool copied = TransportPolicy::DeviceToHost(
             local.data(), view_.scalar, local.size() * sizeof(double),
@@ -1902,9 +1906,7 @@ public:
       if (inject_at(CudaFailurePhase::condensation)) { return result; }
       const bool condensed = CopyBase(workspace) &&
           Ticket(CudaFailurePhase::condensation) &&
-          CudaLaunchCondensation(view_, shape_) &&
-          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-          StatusPassed();
+          CudaLaunchCondensation(view_, shape_) && StatusPassed();
       if (!CollectiveContinue(condensed))
       {
         result.phase = CudaFailurePhase::condensation;
@@ -1936,12 +1938,17 @@ public:
       }
       ++result.trace_solves;
       const bool trace_distributed = DistributeTraceIncrement();
-      if (inject_at(CudaFailurePhase::recovery)) { return result; }
+      if (inject_at(CudaFailurePhase::recovery))
+      {
+        const bool distribution_complete = ranks_ != 1 ||
+            TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+        (void)CollectiveContinue(
+            trace_distributed && distribution_complete);
+        return result;
+      }
       const bool recovered = trace_distributed &&
           Ticket(CudaFailurePhase::recovery) &&
-          CudaLaunchRecover(view_, shape_) &&
-          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-          StatusPassed();
+          CudaLaunchRecover(view_, shape_) && StatusPassed();
       if (!CollectiveContinue(recovered))
       {
         result.phase = CudaFailurePhase::recovery;
@@ -1962,8 +1969,7 @@ public:
         // workspace.  The base snapshot remains immutable, so a rejected
         // trial is still restored transactionally without the former pair of
         // full-state device-to-device copies.
-        const bool trial_ready = CudaLaunchTrial(view_, shape_, alpha) &&
-            TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+        const bool trial_ready = CudaLaunchTrial(view_, shape_, alpha);
         if (!CollectiveContinue(trial_ready))
         {
           if (!CollectiveContinue(RestoreBase(workspace)))
@@ -1980,9 +1986,7 @@ public:
         }
         const bool trial_admissible =
             DistributeCurrentTrace(workspace.trace.coefficients) &&
-            CudaLaunchAdmissibility(view_, shape_) &&
-            TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-            StatusPassed();
+            CudaLaunchAdmissibility(view_, shape_) && StatusPassed();
         if (!CollectiveContinue(trial_admissible))
         {
           if (!CollectiveContinue(RestoreBase(workspace)))
@@ -2050,9 +2054,7 @@ public:
          result.nonlinear_updates >= 2) &&
         result.final_residual <= target && CopyBase(workspace) &&
         Ticket(CudaFailurePhase::condensation) &&
-        CudaLaunchCondensation(view_, shape_) &&
-        TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-        StatusPassed();
+        CudaLaunchCondensation(view_, shape_) && StatusPassed();
     if (!CollectiveContinue(coherent_base) || !AssembleTrueSystem())
     {
       result.reason = FailureReason::backend_failure;
@@ -2079,9 +2081,7 @@ public:
     }
     const bool coherent_solve = DistributeTraceIncrement() &&
         Ticket(CudaFailurePhase::recovery) &&
-        CudaLaunchRecover(view_, shape_) &&
-        TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-        StatusPassed();
+        CudaLaunchRecover(view_, shape_) && StatusPassed();
     if (!CollectiveContinue(coherent_solve))
     {
       result.reason = FailureReason::recovery_gate;
@@ -2110,9 +2110,8 @@ public:
                        last_product_generation,
                        last_product_generation,
                        0};
-    const bool local_admissible = CudaLaunchAdmissibility(view_, shape_) &&
-        TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-        StatusPassed();
+    const bool local_admissible =
+        CudaLaunchAdmissibility(view_, shape_) && StatusPassed();
     result.admissible = CollectiveContinue(local_admissible);
     result.true_residual = std::isfinite(result.true_relative_residual) &&
         result.true_relative_residual <= true_residual_relative_tolerance_;
@@ -2910,8 +2909,10 @@ private:
       host_exact_true_trace_.assign(host_true_trace, 0.0);
       host_perturbed_true_trace_.assign(host_true_trace, 0.0);
       host_static_source_.assign(host_interior, 0.0);
-      host_export_interior_.assign(host_interior, 0.0);
-      host_status_.assign(host_elements, 0.0);
+      host_export_interior_.assign(
+          static_cast<std::size_t>(shape_.elements) *
+              conserved_components * shape_.scalar_interior_dofs,
+          0.0);
       signed_element_interior_.assign(host_interior, 0);
       host_matrix_owned_source_.assign(host_matrix, 0);
       host_matrix_owned_section_.assign(host_matrix, 0);
@@ -2970,7 +2971,7 @@ private:
           (!shape_.borrowed_static_boundary_policies ||
            (checked_add(doubles, layout.boundary_reference) &&
             checked_add(doubles, layout.boundary_pressure)));
-      std::size_t integers = 16;
+      std::size_t integers = 17;
       valid = valid && checked_add(integers, layout.element_trace) &&
           checked_add(integers, three_local_matrix) &&
           checked_add(integers, three_local_matrix) &&
@@ -3123,7 +3124,8 @@ private:
   bool DistributeCurrentTrace(const double* true_values) noexcept;
   bool DistributeTraceIncrement() noexcept;
   bool AssembleTrueVector(const double* element_values,
-                          double* true_values) noexcept;
+                          double* true_values,
+                          bool completion_required) noexcept;
   bool AssembleTrueSystem() noexcept;
   bool SolveTrueSystem(double& true_relative_residual,
                        std::uint64_t matrix_generation,
@@ -3254,7 +3256,6 @@ private:
   std::vector<double> host_perturbed_true_trace_{};
   std::vector<double> host_static_source_{};
   std::vector<double> host_export_interior_{};
-  std::vector<double> host_status_{};
   std::vector<int> signed_element_interior_{};
   bool borrowed_host_inputs_ = false;
   std::vector<int> host_matrix_owned_source_{};

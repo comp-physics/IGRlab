@@ -707,11 +707,19 @@ ExportInterior(const CudaInteriorState& source,
           static_cast<std::size_t>(dof) < coefficient_count;
     }
   if (!CollectiveContinue(local_valid)) { return false; }
-  const bool copied = TransportPolicy::DeviceToHost(
-      host_export_interior_.data(), source.coefficients,
-      static_cast<std::size_t>(shape_.interior_count) * sizeof(double),
-      CudaTransferCategory::generic_host_bridge,
-      CudaTransferSite::generic_host_export) &&
+  const bool physical_layout_contiguous =
+      shape_.interior_components == conserved_components;
+  const bool packed = physical_layout_contiguous ||
+      CudaLaunchPackInteriorOutput(
+          shape_, source.coefficients, view_.output_interior);
+  const double* const device_export = physical_layout_contiguous
+      ? source.coefficients : view_.output_interior;
+  const bool copied = packed &&
+      TransportPolicy::DeviceToHost(
+          host_export_interior_.data(), device_export,
+          coefficient_count * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export) &&
       TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
   if (!CollectiveContinue(copied)) { return false; }
   for (int element = 0; element < shape_.elements; ++element)
@@ -724,7 +732,8 @@ ExportInterior(const CudaInteriorState& source,
           static_cast<std::size_t>(element) * shape_.interior_dofs + local],
           sign);
       destination.coefficients[dof] = sign * host_export_interior_[
-          static_cast<std::size_t>(element) * shape_.interior_dofs + local];
+          static_cast<std::size_t>(element) * conserved_components *
+              shape_.scalar_interior_dofs + local];
     }
   return true;
 }
@@ -808,7 +817,7 @@ BindArenaViews() noexcept
   view_.static_source = take_d(max_i);
   view_.initial_current_interior = take_d(max_i);
   view_.base_interior = take_d(max_i);
-  view_.trial_interior = take_d(max_i);
+  view_.output_interior = take_d(max_i);
   view_.delta_interior = take_d(max_i);
   view_.recovered_interior = take_d(max_i);
   view_.work_true_trace = take_d(max_tt);
@@ -880,10 +889,14 @@ BindArenaViews() noexcept
     return false;
 
   int* i = integer_arena_;
+  // The adjacent hash and ticket slices also provide one contiguous 64-byte
+  // result for the paired accepted-state hash after the last execution ticket.
   view_.hash_words = reinterpret_cast<std::uint64_t*>(i);
   i += 8;
   view_.ticket_words = i;
   i += 8;
+  view_.status_flag = i;
+  i += 1;
   view_.signed_element_trace = TakeArena(i, max_er);
   if (shape_.borrowed_static_boundary_policies)
     view_.boundary_policy_kind = TakeArena(i, generic ?
@@ -1467,8 +1480,7 @@ Ticket(const CudaFailurePhase phase) noexcept
 {
   TransportPolicy::SetPhase(phase, current_generation_);
   if (!CudaLaunchTicket(view_.ticket_words, phase, current_attempt_.sequence,
-                        current_generation_, device_) ||
-      !TransportPolicy::Synchronize(CudaTransferSite::scalar_status))
+                        current_generation_, device_))
     return false;
   std::array<int, 8> words{};
   if (!TransportPolicy::DeviceToHost(
@@ -1490,16 +1502,17 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 StatusPassed() noexcept
 {
+  if (!CudaLaunchStatusReduction(view_.status, shape_.elements,
+                                 view_.status_flag))
+    return false;
+  int failure = 1;
   if (!TransportPolicy::DeviceToHost(
-          host_status_.data(), view_.status,
-          static_cast<std::size_t>(shape_.elements) * sizeof(double),
+          &failure, view_.status_flag, sizeof(failure),
           CudaTransferCategory::scalar_diagnostic,
           CudaTransferSite::scalar_status) ||
       !TransportPolicy::Synchronize(CudaTransferSite::scalar_status))
     return false;
-  for (int element = 0; element < shape_.elements; ++element)
-    if (host_status_[static_cast<std::size_t>(element)] != 1.0) { return false; }
-  return true;
+  return failure == 0;
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
@@ -1510,8 +1523,7 @@ DistributeCurrentTrace(const double* true_values) noexcept
     return CollectiveContinue(CudaLaunchGatherLocalTrace(
         view_.signed_element_trace,
         shape_.elements * shape_.trace_dofs, true_values,
-        view_.current_local_trace) &&
-        TransportPolicy::Synchronize(CudaTransferSite::scalar_status));
+        view_.current_local_trace));
   double* owned_host = owned_stage_.HostWrite();
   const bool staged_out = TransportPolicy::DeviceToHost(
           owned_host, true_values,
@@ -1557,8 +1569,7 @@ DistributeTraceIncrement() noexcept
     return CollectiveContinue(CudaLaunchGatherLocalTrace(
         view_.signed_element_trace,
         shape_.elements * shape_.trace_dofs, solution,
-        view_.trace_increment_local) &&
-        TransportPolicy::Synchronize(CudaTransferSite::scalar_status));
+        view_.trace_increment_local));
   double* owned_host = owned_stage_.HostWrite();
   const bool staged_out = TransportPolicy::DeviceToHost(
           owned_host, solution,
@@ -1597,7 +1608,8 @@ DistributeTraceIncrement() noexcept
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
-AssembleTrueVector(const double* element_values, double* true_values) noexcept
+AssembleTrueVector(const double* element_values, double* true_values,
+                   const bool completion_required) noexcept
 {
   const bool local_gather = CudaLaunchAssembleOwnedVector(
       view_, shape_, element_values, true_values) &&
@@ -1640,6 +1652,8 @@ AssembleTrueVector(const double* element_values, double* true_values) noexcept
     if (!CollectiveContinue(scattered))
       return false;
   }
+  if (!completion_required)
+    return true;
   return CollectiveContinue(
       TransportPolicy::Synchronize(CudaTransferSite::rhs_remote_scatter));
 }
@@ -1690,7 +1704,8 @@ AssembleTrueSystem() noexcept
     if (!CollectiveContinue(scattered))
       return false;
   }
-  if (!AssembleTrueVector(view_.condensed_rhs, view_.true_rhs_scratch))
+  if (!AssembleTrueVector(
+          view_.condensed_rhs, view_.true_rhs_scratch, true))
     return false;
   true_matrix_->HypreRead();
   hypre_rhs_->HypreRead();
@@ -1735,15 +1750,17 @@ bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 AssembleAndNorm(state_slot&, const double dt, double& norm) noexcept
 {
   TransportPolicy::SetPhase(CudaFailurePhase::assembly, current_generation_);
-  const bool local_assembly = CudaLaunchAssembly(view_, shape_, dt) &&
-      TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-      StatusPassed();
+  const bool local_assembly =
+      CudaLaunchAssembly(view_, shape_, dt) && StatusPassed();
   if (!CollectiveContinue(local_assembly) ||
-      !AssembleTrueVector(view_.residual_g, view_.true_residual))
+      !AssembleTrueVector(view_.residual_g, view_.true_residual, false))
     return false;
+  // StatusPassed has consumed and synchronized every per-element assembly
+  // status.  Later condensation/admissibility/assembly phases overwrite the
+  // whole array before its next status use, so it is safe norm scratch here.
   const bool norm_launched = CudaLaunchLocalSquaredNorm(
       view_.residual_r, shape_.interior_count, view_.true_residual,
-      shape_.true_trace_count, view_.scalar);
+      shape_.true_trace_count, view_.status, shape_.elements, view_.scalar);
   if (!CollectiveContinue(norm_launched))
     return false;
   double local_squared = 0.0;
@@ -1783,9 +1800,7 @@ CopyBase(state_slot& workspace) noexcept
               shape_.trace_dofs * sizeof(double),
           CudaTransferCategory::attempt_history,
           CudaTransferSite::nonlinear_base_local_trace);
-  const bool synchronized = TransportPolicy::Synchronize(
-      CudaTransferSite::nonlinear_base_local_trace);
-  return interior && trace && local_trace && synchronized;
+  return interior && trace && local_trace;
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
@@ -1817,8 +1832,7 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 HashState(const double* values, const int count, StateHash& hash) noexcept
 {
-  if (!CudaLaunchHash(values, count, view_.hash_words) ||
-      !TransportPolicy::Synchronize(CudaTransferSite::state_hash))
+  if (!CudaLaunchHash(values, count, view_.hash_words))
     return false;
   std::array<std::uint64_t, 4> words{};
   if (!TransportPolicy::DeviceToHost(
@@ -1835,12 +1849,25 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 UpdateStateHashes(state_slot& workspace) noexcept
 {
-  const bool local_ready = HashState(
-      workspace.interior.coefficients, shape_.interior_count,
-      workspace.interior.local_hash) &&
-      HashState(workspace.trace.coefficients, shape_.true_trace_count,
-                workspace.trace.local_hash);
+  constexpr std::size_t words_per_hash = 4;
+  std::array<std::uint64_t, 2 * words_per_hash> words{};
+  const bool local_ready = CudaLaunchHashPair(
+          workspace.interior.coefficients, shape_.interior_count,
+          workspace.trace.coefficients, shape_.true_trace_count,
+          view_.hash_words) &&
+      TransportPolicy::DeviceToHost(
+          words.data(), view_.hash_words, sizeof(words),
+          CudaTransferCategory::scalar_diagnostic,
+          CudaTransferSite::state_hash) &&
+      TransportPolicy::Synchronize(CudaTransferSite::state_hash);
   if (!CollectiveContinue(local_ready)) { return false; }
+  static_assert(words_per_hash * sizeof(std::uint64_t) == 32,
+                "StateHash must remain exactly 32 bytes");
+  std::memcpy(workspace.interior.local_hash.bytes.data(), words.data(),
+              words_per_hash * sizeof(std::uint64_t));
+  std::memcpy(workspace.trace.local_hash.bytes.data(),
+              words.data() + words_per_hash,
+              words_per_hash * sizeof(std::uint64_t));
   return AggregateHash(workspace.interior.local_hash,
                        workspace.interior.hash) &&
       AggregateHash(workspace.trace.local_hash, workspace.trace.hash);
