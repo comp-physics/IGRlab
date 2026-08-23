@@ -1,6 +1,7 @@
 #include "numerics/hdg/generic/contract.hpp"
 #include "numerics/hdg/runtime/cpu/generic_euler.hpp"
 #include "numerics/hdg/runtime/cpu/persistent_smooth_euler.hpp"
+#include "numerics/hdg/runtime/runtime_selection.hpp"
 
 #include <mfem.hpp>
 #include <mpi.h>
@@ -33,6 +34,23 @@ struct CpuQualificationTestAccess
   {
     return core.AuditBorrowedEulerAssemblerJacobian(
         relative_tolerance, relative_errors);
+  }
+
+  static bool VerifyLlfPolicy(
+      CpuNumericsCore& core, double& base_stabilization,
+      double& refreshed_stabilization,
+      double& frozen_jacobian_relative_error,
+      double& refreshed_candidate_relative_difference) noexcept
+  {
+    return core.AuditBorrowedEulerLlfPolicy(
+        base_stabilization, refreshed_stabilization,
+        frozen_jacobian_relative_error,
+        refreshed_candidate_relative_difference);
+  }
+
+  static bool ArmExactZeroInitialResidual(CpuNumericsCore& core) noexcept
+  {
+    return core.ArmExactZeroInitialResidualForTests();
   }
 };
 
@@ -451,7 +469,7 @@ bool CheckBorrowedTraceRestrictsInterior()
     if (core.evidence().tuple.formulation.view() !=
             "hdg.conventional.v1" ||
         core.evidence().tuple.stabilization.view() !=
-            "tau.llf.max-fixed-local.v1")
+            dg::hdg::runtime::borrowed_euler_llf_stabilization_id)
     {
       return false;
     }
@@ -897,6 +915,150 @@ bool CheckPeriodicAnnotationsRemainTraceCouplings()
       context.calls == 0;
 }
 
+bool CheckNaturalFreeStreamPreservation()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> free_stream{{1.0, 1.0, 0.20, 0.20,
+                                           -0.10, -0.10, 2.60, 2.60}};
+  const std::array<double, 8> source{};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, free_stream, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  if (!core.InitializeBorrowedEuler(request) ||
+      core.evidence().tuple.formulation.view() !=
+          "hdg.conventional.v1" ||
+      core.evidence().tuple.stabilization.view() !=
+          dg::hdg::runtime::borrowed_euler_llf_stabilization_id)
+  {
+    return false;
+  }
+
+  std::vector<double> before(fields.initial.size(), 0.0);
+  std::vector<double> candidate(fields.initial.size(), 0.0);
+  std::vector<double> committed(fields.initial.size(), 0.0);
+  if (!core.ExportCommittedInterior(before.data(), before.size())) return false;
+
+  dg::hdg::runtime::StateCoordinates coordinates{};
+  std::uint64_t generation = 0;
+  if (!core.PrepareBorrowedEuler(0.001, coordinates, generation) ||
+      generation == 0 ||
+      !core.ExportPreparedInterior(
+          generation, candidate.data(), candidate.size()) ||
+      candidate != before)
+  {
+    return false;
+  }
+  double maximum_wave_speed = 0.0;
+  double stable_dt = 0.0;
+  if (!core.CommitBorrowedEuler(
+          generation, coordinates, maximum_wave_speed, stable_dt) ||
+      !core.ExportCommittedInterior(committed.data(), committed.size()))
+  {
+    return false;
+  }
+
+  const auto& attempt = core.evidence().last_attempt;
+  return committed == before && attempt.committed &&
+      attempt.status == dg::hdg::runtime::cpu::CpuAttemptStatus::success &&
+      attempt.nonlinear_updates == 0 &&
+      attempt.initial_nonlinear_residual <=
+          request.numerical_policy.nonlinear_relative_tolerance *
+              (1.0 + attempt.initial_nonlinear_residual) &&
+      attempt.final_nonlinear_residual ==
+          attempt.initial_nonlinear_residual &&
+      attempt.committed_interior_before == attempt.committed_interior_after &&
+      attempt.committed_trace_before == attempt.committed_trace_after &&
+      attempt.work.complete_assemblies == 1 &&
+      attempt.work.trial_reassemblies == 0 &&
+      attempt.work.accepted_newton_updates == 0 &&
+      attempt.work.complete_condensations == 1 &&
+      attempt.work.complete_factor_setups == 1 &&
+      attempt.work.complete_trace_solves == 1 &&
+      attempt.work.complete_recoveries == 1 &&
+      attempt.finite_gate && attempt.admissibility_gate &&
+      attempt.recovery_gate && attempt.nonlinear_gate &&
+      attempt.true_residual_gate &&
+      attempt.maximum_true_relative_residual <=
+          request.numerical_policy.true_residual_relative_tolerance &&
+      coordinates.step == 1 && coordinates.generation == 1 &&
+      coordinates.time == 0.001 && std::isfinite(maximum_wave_speed) &&
+      maximum_wave_speed > 0.0 && std::isfinite(stable_dt) &&
+      stable_dt > 0.0 && boundary.calls == 0;
+}
+
+bool CheckConventionalConservationEvidence()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                       0.00, 0.01, 2.55, 2.62}};
+  // A nonzero source makes the oracle check the full conservative balance,
+  // not only preservation of homogeneous periodic totals.
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                      0.00, 0.00, 0.03, 0.04}};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  if (request.numerical_policy.conservation_relative_tolerance != 1.0e-10)
+    return false;
+
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  if (!core.InitializeBorrowedEuler(request) ||
+      core.evidence().tuple.formulation.view() !=
+          "hdg.conventional.v1" ||
+      core.evidence().tuple.stabilization.view() !=
+          dg::hdg::runtime::borrowed_euler_llf_stabilization_id)
+  {
+    return false;
+  }
+  dg::hdg::runtime::StateCoordinates coordinates{};
+  std::uint64_t generation = 0;
+  if (!core.PrepareBorrowedEuler(0.001, coordinates, generation)) return false;
+  double maximum_wave_speed = 0.0;
+  double stable_dt = 0.0;
+  if (!core.CommitBorrowedEuler(generation, coordinates, maximum_wave_speed,
+                                stable_dt))
+  {
+    return false;
+  }
+
+  double maximum_conservation_error =
+      std::numeric_limits<double>::quiet_NaN();
+  double maximum_conservation_relative_error =
+      std::numeric_limits<double>::quiet_NaN();
+  bool conservation_gate = false;
+  const bool conservation_audited =
+      dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+          AuditLastConservation(
+              core, maximum_conservation_error,
+              maximum_conservation_relative_error, conservation_gate);
+  const auto& attempt = core.evidence().last_attempt;
+  return conservation_audited && conservation_gate && attempt.committed &&
+      attempt.status == dg::hdg::runtime::cpu::CpuAttemptStatus::success &&
+      attempt.finite_gate && attempt.admissibility_gate &&
+      attempt.recovery_gate && attempt.nonlinear_gate &&
+      attempt.true_residual_gate &&
+      attempt.work.accepted_newton_updates ==
+          static_cast<std::uint64_t>(attempt.nonlinear_updates) &&
+      attempt.work.complete_factor_setups == attempt.work.complete_trace_solves &&
+      attempt.work.complete_trace_solves == attempt.work.complete_recoveries &&
+      attempt.work.complete_trace_solves ==
+          attempt.work.accepted_newton_updates + 1 &&
+      attempt.final_nonlinear_residual <= attempt.initial_nonlinear_residual &&
+      std::isfinite(attempt.maximum_true_relative_residual) &&
+      attempt.maximum_true_relative_residual <=
+          request.numerical_policy.true_residual_relative_tolerance &&
+      std::isfinite(maximum_conservation_error) &&
+      maximum_conservation_error >= 0.0 &&
+      std::isfinite(maximum_conservation_relative_error) &&
+      maximum_conservation_relative_error <=
+          request.numerical_policy.conservation_relative_tolerance &&
+      coordinates.step == 1 && coordinates.generation == 1 &&
+      coordinates.time == 0.001 && std::isfinite(maximum_wave_speed) &&
+      maximum_wave_speed > 0.0 && std::isfinite(stable_dt) &&
+      stable_dt > 0.0 && boundary.calls == 0;
+}
+
 bool CheckIgrExtensionLifecycle()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
@@ -992,6 +1154,8 @@ bool CheckIgrExtensionConvergenceEvidence()
           static_cast<std::uint64_t>(attempt.nonlinear_updates) &&
       attempt.work.complete_factor_setups == attempt.work.complete_trace_solves &&
       attempt.work.complete_trace_solves == attempt.work.complete_recoveries &&
+      attempt.work.complete_trace_solves ==
+          attempt.work.accepted_newton_updates + 1 &&
       attempt.final_nonlinear_residual <= attempt.initial_nonlinear_residual &&
       std::isfinite(attempt.maximum_true_relative_residual) &&
       attempt.maximum_true_relative_residual <= 1.0e-10 &&
@@ -1169,6 +1333,107 @@ bool CheckUnifiedIgrAssemblerJacobianForTests()
       local = local && verified && calls_reduced && boundary_exercised;
     }
   return All(local);
+}
+
+bool CheckBorrowedLlfNoFloorAndFrozenRefresh()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.0, 0.10, 0.10,
+                                       0.00, 0.00, 2.55, 2.55}};
+  const std::array<double, 8> source{};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  if (!core.InitializeBorrowedEuler(request) ||
+      core.evidence().tuple.stabilization.view() !=
+          dg::hdg::runtime::borrowed_euler_llf_stabilization_id)
+  {
+    return false;
+  }
+
+  double base_stabilization = std::numeric_limits<double>::infinity();
+  double refreshed_stabilization = std::numeric_limits<double>::infinity();
+  double frozen_jacobian_error = std::numeric_limits<double>::infinity();
+  double refreshed_candidate_difference =
+      std::numeric_limits<double>::infinity();
+  const bool verified =
+      dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+          VerifyLlfPolicy(
+              core, base_stabilization, refreshed_stabilization,
+              frozen_jacobian_error, refreshed_candidate_difference);
+  return verified && base_stabilization > 0.0 &&
+      base_stabilization < dg::hdg::runtime::cpu::cpu_fixed_tau &&
+      std::abs(refreshed_stabilization - base_stabilization) > 1.0e-6 &&
+      frozen_jacobian_error <= 1.0e-7 &&
+      refreshed_candidate_difference >= 1.0e-4 && boundary.calls == 0;
+}
+
+bool CheckZeroUpdateFreeStreamFinalReconstruction()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> free_stream{{1.0, 1.0, 0.20, 0.20,
+                                           -0.10, -0.10, 2.60, 2.60}};
+  const std::array<double, 8> source{};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, free_stream, source);
+  EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  if (!core.InitializeBorrowedEuler(request)) { return false; }
+
+  std::vector<double> before(fields.initial.size(), 0.0);
+  std::vector<double> candidate(fields.initial.size(), 0.0);
+  std::vector<double> committed(fields.initial.size(), 0.0);
+  // Arm the private exact-zero residual seam after initializing a genuine
+  // admissible free stream.  The attempt must validate its final linearized
+  // reconstruction without applying any update to these bytes.
+  if (!core.ExportCommittedInterior(before.data(), before.size()) ||
+      !dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+          ArmExactZeroInitialResidual(core))
+  {
+    return false;
+  }
+
+  dg::hdg::runtime::StateCoordinates coordinates{};
+  std::uint64_t generation = 0;
+  if (!core.PrepareBorrowedEuler(0.001, coordinates, generation) ||
+      generation == 0 ||
+      !core.ExportPreparedInterior(
+          generation, candidate.data(), candidate.size()) ||
+      candidate != before)
+  {
+    return false;
+  }
+  double maximum_wave_speed = 0.0;
+  double stable_dt = 0.0;
+  if (!core.CommitBorrowedEuler(
+          generation, coordinates, maximum_wave_speed, stable_dt) ||
+      !core.ExportCommittedInterior(committed.data(), committed.size()))
+  {
+    return false;
+  }
+
+  const auto& attempt = core.evidence().last_attempt;
+  return committed == before && attempt.committed &&
+      attempt.status == dg::hdg::runtime::cpu::CpuAttemptStatus::success &&
+      attempt.nonlinear_updates == 0 && attempt.linear_iterations >= 0 &&
+      attempt.initial_nonlinear_residual == 0.0 &&
+      attempt.final_nonlinear_residual == 0.0 &&
+      attempt.committed_interior_before == attempt.committed_interior_after &&
+      attempt.committed_trace_before == attempt.committed_trace_after &&
+      attempt.work.complete_assemblies == 1 &&
+      attempt.work.trial_reassemblies == 0 &&
+      attempt.work.accepted_newton_updates == 0 &&
+      attempt.work.complete_condensations == 1 &&
+      attempt.work.complete_factor_setups == 1 &&
+      attempt.work.complete_trace_solves == 1 &&
+      attempt.work.complete_recoveries == 1 &&
+      attempt.finite_gate && attempt.admissibility_gate &&
+      attempt.recovery_gate && attempt.nonlinear_gate &&
+      attempt.true_residual_gate &&
+      coordinates.step == 1 && coordinates.generation == 1 &&
+      coordinates.time == 0.001 && std::isfinite(maximum_wave_speed) &&
+      std::isfinite(stable_dt) && stable_dt > 0.0 && boundary.calls == 0;
 }
 
 bool CheckDynamicTauHighWaveTwoSteps()
@@ -1557,6 +1822,9 @@ int main(int argc, char* argv[])
   const bool default_numerical_policy =
       CheckDefaultNumericalPolicyAdaptiveLinearCap();
   const bool periodic = CheckPeriodicAnnotationsRemainTraceCouplings();
+  const bool natural_free_stream = CheckNaturalFreeStreamPreservation();
+  const bool conventional_conservation =
+      CheckConventionalConservationEvidence();
   const bool igr_extension = CheckIgrExtensionLifecycle();
   const bool igr_extension_convergence =
       CheckIgrExtensionConvergenceEvidence();
@@ -1567,6 +1835,8 @@ int main(int argc, char* argv[])
       CheckIgrExtensionInitializationDeterminism();
   const bool igr_assembler_jacobian =
       CheckUnifiedIgrAssemblerJacobianForTests();
+  const bool llf_policy = CheckBorrowedLlfNoFloorAndFrozenRefresh();
+  const bool zero_update = CheckZeroUpdateFreeStreamFinalReconstruction();
   const bool dynamic_tau = CheckDynamicTauHighWaveTwoSteps();
   const bool boundary_picard = CheckClosedBoundaryPicardAssembly();
   const bool zero_owned = CheckZeroOwnedElementEngine();
@@ -1581,10 +1851,12 @@ int main(int argc, char* argv[])
       prepared_lifecycle &&
       committed_export && committed_export_zero_owned &&
       default_numerical_policy &&
-      periodic && igr_extension && igr_extension_zero_local &&
+      periodic && natural_free_stream && conventional_conservation &&
+      igr_extension && igr_extension_zero_local &&
       igr_extension_convergence &&
       igr_extension_numerical_policy &&
-      igr_extension_initialization && igr_assembler_jacobian && dynamic_tau &&
+      igr_extension_initialization && igr_assembler_jacobian && llf_policy &&
+      zero_update && dynamic_tau &&
       boundary_picard &&
       zero_owned && subcommunicator && passive_world && mismatch &&
       initial_trace_admission && initial_trace_zero_local && callback_failure;
@@ -1596,6 +1868,8 @@ int main(int argc, char* argv[])
               << " boundary_semantics=" << boundary_semantics
               << " trace_restriction=" << trace_restriction
               << " orders=" << orders << " periodic=" << periodic
+              << " natural_free_stream=" << natural_free_stream
+              << " conventional_conservation=" << conventional_conservation
               << " igr_extension=" << igr_extension
               << " igr_extension_convergence=" << igr_extension_convergence
               << " igr_extension_numerical_policy="
@@ -1604,6 +1878,8 @@ int main(int argc, char* argv[])
               << " igr_extension_initialization="
               << igr_extension_initialization
               << " igr_assembler_jacobian=" << igr_assembler_jacobian
+              << " llf_policy=" << llf_policy
+              << " zero_update=" << zero_update
               << " prepared_lifecycle=" << prepared_lifecycle
               << " committed_export=" << committed_export
               << " committed_export_zero_owned="

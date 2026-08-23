@@ -369,9 +369,9 @@ struct CudaDeviceView
   // Dedicated persistent slice for caller-supplied static L2 source values.
   // It is always allocated; legacy manufactured forcing ignores it.
   double* static_source = nullptr;
-  // One frozen local LLF speed for every element/face/quadrature point.  This
-  // slice is populated once from the committed state at Prepare and is never
-  // differentiated or updated during the nonlinear attempt.
+  // Borrowed-only face scratch for the private frozen-coefficient Jacobian
+  // audit.  Production assembly computes LLF speeds directly from its current
+  // candidate and never reads this slice.
   double* borrowed_lagged_llf_tau = nullptr;
   double* initial_current_interior = nullptr;
   double* base_interior = nullptr;
@@ -734,10 +734,13 @@ bool CudaLaunchGatherLocalTrace(const int* signed_map, int count,
                                 double* local_trace) noexcept;
 bool CudaLaunchAdmissibility(const CudaDeviceView& view,
                              const CudaMeshShape& shape) noexcept;
-bool CudaLaunchSeedBorrowedLaggedLlfTau(const CudaDeviceView& view,
-                                        const CudaMeshShape& shape) noexcept;
+bool CudaLaunchFreezeBorrowedCurrentLlfTau(const CudaDeviceView& view,
+                                           const CudaMeshShape& shape) noexcept;
 bool CudaLaunchAssembly(const CudaDeviceView& view,
                         const CudaMeshShape& shape, double dt) noexcept;
+bool CudaLaunchFrozenBorrowedLlfAssembly(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    double dt) noexcept;
 bool CudaLaunchCondensation(const CudaDeviceView& view,
                             const CudaMeshShape& shape) noexcept;
 bool CudaLaunchZeroTrueSystem(const CudaTrueMatrixDeviceView& matrix,
@@ -1456,13 +1459,16 @@ private:
     const auto assemble = [&](const std::vector<double>& interior,
                               const std::vector<double>& trace,
                               std::vector<double>* residual_interior,
-                              std::vector<double>* residual_trace) noexcept
+                              std::vector<double>* residual_trace,
+                              const bool frozen_llf = false) noexcept
     {
       if (!install_state(interior, trace)) return false;
       TransportPolicy::SetPhase(CudaFailurePhase::assembly,
                                 current_generation_);
-      const bool assembled = CudaLaunchAssembly(
-              view_, shape_, fixed_dt) &&
+      const bool assembled = (frozen_llf
+              ? CudaLaunchFrozenBorrowedLlfAssembly(
+                    view_, shape_, fixed_dt)
+              : CudaLaunchAssembly(view_, shape_, fixed_dt)) &&
           TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
           StatusPassed();
       if (!CollectiveContinue(assembled)) return false;
@@ -1493,17 +1499,17 @@ private:
     if (!CollectiveContinue(local_valid) ||
         !install_state(base_interior, base_true_trace))
       return false;
-    // Match the production conventional-Euler prepare sequence exactly:
-    // seed one lagged LLF stabilization field from the committed state, then
-    // hold it fixed through every nonlinear/Jacobian reassembly.  IGR owns no
-    // such conventional face field and continues directly to assembly.
+    // The production base assembly evaluates tau at this candidate.  Freeze
+    // that same candidate value only for the finite-difference perturbations
+    // below: A/B/C/D intentionally omit d-tau while every ordinary residual
+    // or line-search assembly refreshes tau from its own current candidate.
     if (!shape_.igr_active)
     {
-      const bool tau_seeded = CudaLaunchSeedBorrowedLaggedLlfTau(
+      const bool tau_frozen = CudaLaunchFreezeBorrowedCurrentLlfTau(
               view_, shape_) &&
           TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
           StatusPassed();
-      if (!CollectiveContinue(tau_seeded)) return false;
+      if (!CollectiveContinue(tau_frozen)) return false;
     }
     if (!assemble(base_interior, base_true_trace, nullptr, nullptr))
       return false;
@@ -1603,8 +1609,10 @@ private:
       }
       catch (...) { ready = false; }
       if (!CollectiveContinue(ready) ||
-          !assemble(plus_interior, plus_trace, &plus_r, &plus_g) ||
-          !assemble(minus_interior, minus_trace, &minus_r, &minus_g))
+          !assemble(plus_interior, plus_trace, &plus_r, &plus_g,
+                    !shape_.igr_active) ||
+          !assemble(minus_interior, minus_trace, &minus_r, &minus_g,
+                    !shape_.igr_active))
         return false;
       try
       {
@@ -1762,23 +1770,6 @@ public:
       result.reason = FailureReason::collective_protocol;
       return result;
     }
-    // The borrowed path owns a single stabilization field per prepared
-    // attempt.  Seed it from the committed interior/local trace before any
-    // nonlinear update, then retain it unchanged through every assembly and
-    // line-search reassembly.  The legacy manufactured W8A path deliberately
-    // does not launch this kernel and continues to use its fixed arithmetic.
-    if (shape_.borrowed_host_inputs && !shape_.igr_active)
-    {
-      const bool tau_seeded = CudaLaunchSeedBorrowedLaggedLlfTau(view_, shape_) &&
-          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-          StatusPassed();
-      if (!CollectiveContinue(tau_seeded))
-      {
-        result.phase = CudaFailurePhase::assembly;
-        result.reason = FailureReason::admissibility_gate;
-        return result;
-      }
-    }
     const bool injection_active = config.injection.enabled &&
         config.injection.target_step == attempt.committed_step + 1 &&
         attempt.retry_index == 0;
@@ -1832,6 +1823,30 @@ public:
     const int maximum_nonlinear_updates = config.use_generic_numerical_policy
         ? config.numerical_policy.maximum_nonlinear_updates
         : (shape_.borrowed_static_boundary_policies ? 80 : 20);
+    const auto record_linear_iterations = [&](const int iterations) noexcept
+    {
+      if (iterations < 0 ||
+          iterations > std::numeric_limits<int>::max() -
+              result.linear_iterations)
+        return false;
+      result.linear_iterations += iterations;
+      return true;
+    };
+    const auto record_line_search_trial = [&]() noexcept
+    {
+      if (result.line_search_trials == std::numeric_limits<int>::max())
+        return false;
+      ++result.line_search_trials;
+      return true;
+    };
+    const auto record_line_search_rejection = [&]() noexcept
+    {
+      if (result.rejected_line_search_trials ==
+          std::numeric_limits<int>::max())
+        return false;
+      ++result.rejected_line_search_trials;
+      return true;
+    };
     std::uint64_t last_product_generation = 0;
     for (int iteration = 0; iteration < maximum_nonlinear_updates; ++iteration)
     {
@@ -1865,9 +1880,11 @@ public:
         result.reason = FailureReason::true_residual_gate;
         return result;
       }
-      const bool solve_ok =
-          SolveTrueSystem(result.true_relative_residual, generation);
-      if (!CollectiveContinue(solve_ok))
+      int solve_iterations = 0;
+      const bool solve_ok = SolveTrueSystem(
+          result.true_relative_residual, generation, solve_iterations);
+      const bool solve_accounted = record_linear_iterations(solve_iterations);
+      if (!CollectiveContinue(solve_ok && solve_accounted))
       {
         result.reason = FailureReason::true_residual_gate;
         return result;
@@ -1890,6 +1907,11 @@ public:
       bool accepted = false;
       for (int trial = 0; trial < maximum_line_search_trials; ++trial)
       {
+        if (!record_line_search_trial())
+        {
+          result.reason = FailureReason::backend_failure;
+          return result;
+        }
         const double alpha = std::ldexp(1.0, -trial);
         const bool trial_ready = CudaLaunchTrial(view_, shape_, alpha) &&
             TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
@@ -1897,6 +1919,11 @@ public:
         if (!CollectiveContinue(trial_ready))
         {
           if (!CollectiveContinue(RestoreBase(workspace)))
+          {
+            result.reason = FailureReason::backend_failure;
+            return result;
+          }
+          if (!record_line_search_rejection())
           {
             result.reason = FailureReason::backend_failure;
             return result;
@@ -1911,6 +1938,11 @@ public:
         if (!CollectiveContinue(trial_admissible))
         {
           if (!CollectiveContinue(RestoreBase(workspace)))
+          {
+            result.reason = FailureReason::backend_failure;
+            return result;
+          }
+          if (!record_line_search_rejection())
           {
             result.reason = FailureReason::backend_failure;
             return result;
@@ -1933,6 +1965,11 @@ public:
           break;
         }
         if (!CollectiveContinue(RestoreBase(workspace)))
+        {
+          result.reason = FailureReason::backend_failure;
+          return result;
+        }
+        if (!record_line_search_rejection())
         {
           result.reason = FailureReason::backend_failure;
           return result;
@@ -1980,9 +2017,14 @@ public:
       result.reason = FailureReason::true_residual_gate;
       return result;
     }
+    int coherent_solve_iterations = 0;
     const bool coherent_solve_ok = SolveTrueSystem(
-        result.true_relative_residual, last_product_generation);
-    if (!CollectiveContinue(coherent_solve_ok))
+        result.true_relative_residual, last_product_generation,
+        coherent_solve_iterations);
+    const bool coherent_solve_accounted =
+        record_linear_iterations(coherent_solve_iterations);
+    if (!CollectiveContinue(
+            coherent_solve_ok && coherent_solve_accounted))
     {
       result.reason = FailureReason::true_residual_gate;
       return result;
@@ -3030,7 +3072,8 @@ private:
                           double* true_values) noexcept;
   bool AssembleTrueSystem() noexcept;
   bool SolveTrueSystem(double& true_relative_residual,
-                       std::uint64_t matrix_generation) noexcept;
+                       std::uint64_t matrix_generation,
+                       int& linear_iterations) noexcept;
   bool AssembleAndNorm(state_slot& workspace, double dt,
                        double& norm) noexcept;
   bool CopyBase(state_slot& workspace) noexcept;

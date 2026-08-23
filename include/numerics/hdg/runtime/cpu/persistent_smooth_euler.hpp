@@ -807,6 +807,11 @@ private:
   bool AuditBorrowedEulerAssemblerJacobian(
       double relative_tolerance,
       std::array<double, 6>& relative_errors) noexcept;
+  bool AuditBorrowedEulerLlfPolicy(
+      double& base_stabilization, double& refreshed_stabilization,
+      double& frozen_jacobian_relative_error,
+      double& refreshed_candidate_relative_difference) noexcept;
+  bool ArmExactZeroInitialResidualForTests() noexcept;
   bool AuditLastBorrowedEulerConservation(
       double& maximum_error, double& maximum_relative_error,
       bool& gate) const noexcept;

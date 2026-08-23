@@ -1696,8 +1696,10 @@ AssembleTrueSystem() noexcept
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 SolveTrueSystem(double& true_relative_residual,
-                const std::uint64_t matrix_generation) noexcept
+                const std::uint64_t matrix_generation,
+                int& linear_iterations) noexcept
 {
+  linear_iterations = 0;
   CudaSolveDiagnostics diagnostics{};
   const bool local_solve = CudaRefreshFactorAndSolve(
       *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
@@ -1706,7 +1708,9 @@ SolveTrueSystem(double& true_relative_residual,
           krylov_dimension_, matrix_generation, diagnostics) &&
       diagnostics.device_policy && diagnostics.configured_ilu0 &&
       diagnostics.matrix_generation == matrix_generation &&
-      diagnostics.converged && diagnostics.finite;
+      diagnostics.converged && diagnostics.finite &&
+      diagnostics.iterations >= 0;
+  linear_iterations = diagnostics.iterations;
   if (!CollectiveContinue(local_solve))
     return false;
   true_matrix_->Mult(*hypre_solution_, *hypre_action_);

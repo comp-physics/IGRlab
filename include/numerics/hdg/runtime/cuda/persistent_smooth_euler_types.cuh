@@ -538,6 +538,11 @@ struct CudaStepEvidence
   double true_relative_residual = std::numeric_limits<double>::infinity();
   int nonlinear_updates = 0;
   int trace_solves = 0;
+  // Work census copied from the internal numerical result without changing
+  // the public generic-session API.
+  int linear_iterations = 0;
+  int line_search_trials = 0;
+  int rejected_line_search_trials = 0;
   int source_rank = -1;
   std::array<CudaDeviceTicket, maximum_device_tickets> device_tickets{};
   std::size_t device_ticket_count = 0;

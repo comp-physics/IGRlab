@@ -1221,8 +1221,8 @@ __device__ bool PhysicallyAdmissible(const double* state)
 
 // Borrowed input admission is physical rather than the manufactured W8A
 // speed cap: rho, pressure, and sound speed must be finite and strictly
-// positive.  The local LLF field below is deliberately lagged, so it has no
-// derivative contribution to the Newton blocks.
+// positive.  A caller decides the lifetime of the returned LLF coefficient;
+// production assembly freezes it only across one residual and its A/B/C/D.
 __device__ bool LocalLlfSpeed(const double* state, const double nx,
                               const double ny, double& speed)
 {
@@ -1390,8 +1390,8 @@ __global__ void AdmissibilityKernel(CudaDeviceView view, CudaMeshShape shape)
     }
 }
 
-__global__ void SeedBorrowedLaggedLlfTauKernel(CudaDeviceView view,
-                                                CudaMeshShape shape)
+__global__ void FreezeBorrowedCurrentLlfTauKernel(CudaDeviceView view,
+                                                   CudaMeshShape shape)
 {
   const int element = blockIdx.x * blockDim.x + threadIdx.x;
   if (element >= shape.elements) return;
@@ -1405,24 +1405,24 @@ __global__ void SeedBorrowedLaggedLlfTauKernel(CudaDeviceView view,
           shape.face_points + q;
       const int face_offset = face * shape.trace_components *
           shape.scalar_face_dofs;
-      double old_interior[conserved_components] = {};
-      double old_trace[conserved_components] = {};
+      double interior[conserved_components] = {};
+      double trace[conserved_components] = {};
       for (int scalar = 0; scalar < shape.scalar_interior_dofs; ++scalar)
         for (int component = 0; component < conserved_components; ++component)
-          old_interior[component] += view.face_interior_shape[
+          interior[component] += view.face_interior_shape[
               qp * shape.scalar_interior_dofs + scalar] *
-              view.old_interior[interior_offset + ByNodes(
+              view.work_interior[interior_offset + ByNodes(
                   scalar, shape.scalar_interior_dofs, component)];
       for (int scalar = 0; scalar < shape.scalar_face_dofs; ++scalar)
         for (int component = 0; component < conserved_components; ++component)
-          old_trace[component] += view.face_trace_shape[
+          trace[component] += view.face_trace_shape[
               qp * shape.scalar_face_dofs + scalar] *
               view.current_local_trace[trace_offset + face_offset + ByNodes(
                   scalar, shape.scalar_face_dofs, component)];
       double interior_speed = 0.0, trace_speed = 0.0;
-      if (!LocalLlfSpeed(old_interior, view.face_normal[qp * dimension],
+      if (!LocalLlfSpeed(interior, view.face_normal[qp * dimension],
                          view.face_normal[qp * dimension + 1], interior_speed) ||
-          !LocalLlfSpeed(old_trace, view.face_normal[qp * dimension],
+          !LocalLlfSpeed(trace, view.face_normal[qp * dimension],
                          view.face_normal[qp * dimension + 1], trace_speed))
       {
         view.status[element] = -3.0;
@@ -1553,12 +1553,14 @@ __global__ void AssemblyKernel(CudaDeviceView v, CudaMeshShape s,
 
 // This is intentionally a separate instantiation from AssemblyKernel: the
 // legacy fixed-tau manufactured path above retains its arithmetic verbatim.
-// Here tau is a prepared-attempt-lagged coefficient, not a differentiated
-// state function, so every residual and A/B/C/D contribution reads the same
-// stored per-face quadrature value and adds no d-tau terms.
-__global__ void BorrowedLaggedLlfAssemblyKernel(CudaDeviceView v,
-                                                CudaMeshShape s,
-                                                const double dt)
+// Conventional borrowed Euler evaluates tau from the current interior/trace
+// candidate at each face quadrature point, then holds that value fixed while
+// forming the residual and A/B/C/D (there are deliberately no d-tau terms).
+// The frozen_llf branch exists only for the private finite-difference audit.
+__global__ void BorrowedEulerAssemblyKernel(CudaDeviceView v,
+                                            CudaMeshShape s,
+                                            const double dt,
+                                            const bool frozen_llf)
 {
   const int e = blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= s.elements) return;
@@ -1745,8 +1747,7 @@ __global__ void BorrowedLaggedLlfAssemblyKernel(CudaDeviceView v,
       const int qp = (e * faces_per_element + face) * s.face_points + q;
       const int to = face * s.trace_components * sf;
       const double w = v.face_weight[qp];
-      const double stabilization = s.igr_active
-          ? s.igr_beta : v.borrowed_lagged_llf_tau[qp];
+      double stabilization = s.igr_beta;
       const int boundary_kind = s.borrowed_static_boundary_policies
           ? v.boundary_policy_kind[e * faces_per_element + face] : 0;
       double u[4] = {}, l[4] = {}, flux[4];
@@ -1773,6 +1774,21 @@ __global__ void BorrowedLaggedLlfAssemblyKernel(CudaDeviceView v,
       }
       const double nx = v.face_normal[qp * dimension];
       const double ny = v.face_normal[qp * dimension + 1];
+      if (!s.igr_active)
+      {
+        if (frozen_llf)
+        {
+          stabilization = v.borrowed_lagged_llf_tau[qp];
+        }
+        else
+        {
+          double interior_speed = 0.0, trace_speed = 0.0;
+          if (!LocalLlfSpeed(u, nx, ny, interior_speed) ||
+              !LocalLlfSpeed(l, nx, ny, trace_speed))
+          { v.status[e] = -2; return; }
+          stabilization = fmax(interior_speed, trace_speed);
+        }
+      }
       if (!(w > 0) || !(stabilization > 0) || !isfinite(stabilization) ||
           !(s.igr_active
                 ? RegularizedFluxJacobian(
@@ -2161,11 +2177,15 @@ bool CudaLaunchGatherLocalTrace(const int* map,int count,const double* source,do
 {GatherKernel<<<Blocks(count),128>>>(map,count,source,destination);return LaunchOk();}
 bool CudaLaunchAdmissibility(const CudaDeviceView& v,const CudaMeshShape& s) noexcept
 {AdmissibilityKernel<<<Blocks(s.elements),128>>>(v,s);return LaunchOk();}
-bool CudaLaunchSeedBorrowedLaggedLlfTau(const CudaDeviceView& v,
-                                        const CudaMeshShape& s) noexcept
-{SeedBorrowedLaggedLlfTauKernel<<<Blocks(s.elements),128>>>(v,s);return LaunchOk();}
+bool CudaLaunchFreezeBorrowedCurrentLlfTau(const CudaDeviceView& v,
+                                           const CudaMeshShape& s) noexcept
+{FreezeBorrowedCurrentLlfTauKernel<<<Blocks(s.elements),128>>>(v,s);return LaunchOk();}
 bool CudaLaunchAssembly(const CudaDeviceView& v,const CudaMeshShape& s,double dt) noexcept
-{if(s.borrowed_host_inputs)BorrowedLaggedLlfAssemblyKernel<<<Blocks(s.elements),128>>>(v,s,dt);else AssemblyKernel<<<Blocks(s.elements),128>>>(v,s,dt);return LaunchOk();}
+{if(s.borrowed_host_inputs)BorrowedEulerAssemblyKernel<<<Blocks(s.elements),128>>>(v,s,dt,false);else AssemblyKernel<<<Blocks(s.elements),128>>>(v,s,dt);return LaunchOk();}
+bool CudaLaunchFrozenBorrowedLlfAssembly(const CudaDeviceView& v,
+                                         const CudaMeshShape& s,
+                                         double dt) noexcept
+{if(!s.borrowed_host_inputs||s.igr_active)return false;BorrowedEulerAssemblyKernel<<<Blocks(s.elements),128>>>(v,s,dt,true);return LaunchOk();}
 bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s) noexcept
 {CondenseKernel<<<Blocks(s.elements),128>>>(v,s);return LaunchOk();}
 bool CudaLaunchZeroTrueSystem(const CudaTrueMatrixDeviceView& m,double* rhs,int n) noexcept

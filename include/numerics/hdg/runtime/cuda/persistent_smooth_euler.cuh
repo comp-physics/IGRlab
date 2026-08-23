@@ -13,6 +13,7 @@
  */
 
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler_types.cuh"
+#include "numerics/hdg/runtime/runtime_selection.hpp"
 #include "numerics/hdg/trace/trace_dg_mpi.hpp"
 #include "physics/bc/boundary_state.hpp"
 
@@ -445,6 +446,12 @@ struct CudaNumericalResult
   double maximum_conservation_relative_error = 0.0;
   int nonlinear_updates = 0;
   int trace_solves = 0;
+  // Sum HYPRE GMRES iterations from every trace solve, including the final
+  // coherent reconstruction solve.  Line-search trials count every attempted
+  // alpha; rejected trials are the attempts restored before the next alpha.
+  int linear_iterations = 0;
+  int line_search_trials = 0;
+  int rejected_line_search_trials = 0;
 };
 
 template <typename AllocatorPolicy, typename TransportPolicy>
@@ -472,13 +479,14 @@ inline bool ExactSelection(const CudaConfig& config) noexcept
       ExactId(tuple.backend, "cuda.rank2.one_gpu.host_staged");
   const bool legacy_fixed = !config.use_borrowed_host_inputs &&
       ExactId(tuple.stabilization, "tau.fixed");
-  const bool borrowed_lagged_llf = config.use_borrowed_host_inputs &&
-      ExactId(tuple.stabilization, "tau.llf.local.lagged.borrowed-host.v1");
+  const bool borrowed_current_llf = config.use_borrowed_host_inputs &&
+      ExactId(tuple.stabilization,
+              borrowed_euler_llf_stabilization_id);
   return Selection::interior_space == InteriorSpace::l2 && tuple.Valid() &&
       ExactId(tuple.model, "euler.compressible.2d") &&
       ExactId(tuple.formulation, "hdg.conventional") &&
       ExactId(tuple.trace, "mfem.dg_interface.trace") &&
-      (legacy_fixed || borrowed_lagged_llf) &&
+      (legacy_fixed || borrowed_current_llf) &&
       ExactId(tuple.time_treatment, "backward_euler") &&
       ExactId(tuple.precision, "fp64") && (rank_one || rank_two);
 }
@@ -1726,6 +1734,10 @@ private:
     evidence.true_relative_residual = adjusted.true_relative_residual;
     evidence.nonlinear_updates = adjusted.nonlinear_updates;
     evidence.trace_solves = adjusted.trace_solves;
+    evidence.linear_iterations = adjusted.linear_iterations;
+    evidence.line_search_trials = adjusted.line_search_trials;
+    evidence.rejected_line_search_trials =
+        adjusted.rejected_line_search_trials;
     evidence.source_rank = adjusted.injection_source_rank;
     evidence.device_ticket_count = numerics_.TicketCount();
     std::copy_n(numerics_.Tickets().begin(), evidence.device_ticket_count,
@@ -1905,6 +1917,10 @@ private:
     evidence.true_relative_residual = numerical.true_relative_residual;
     evidence.nonlinear_updates = numerical.nonlinear_updates;
     evidence.trace_solves = numerical.trace_solves;
+    evidence.linear_iterations = numerical.linear_iterations;
+    evidence.line_search_trials = numerical.line_search_trials;
+    evidence.rejected_line_search_trials =
+        numerical.rejected_line_search_trials;
     evidence.source_rank = numerical.injection_source_rank;
     evidence.device_ticket_count = numerics_.TicketCount();
     std::copy_n(numerics_.Tickets().begin(), evidence.device_ticket_count,

@@ -50,8 +50,8 @@ struct CudaPreparedIgrConservationCapture
 };
 
 // This accessor is defined only in the qualification translation unit.  The
-// production engine and generic facade grant it private friendship but ship no
-// callable test API or test-only device kernel.
+// production engine and generic facade grant it private friendship; its
+// detail-only launch helpers publish no runtime diagnostic API or state.
 struct CudaQualificationTestAccess
 {
   template <typename Engine>
@@ -78,6 +78,504 @@ struct CudaQualificationTestAccess
       return VerifyAssemblerJacobian(
           *session.borrowed_rank2_, relative_tolerance, relative_errors);
     relative_errors.fill(std::numeric_limits<double>::infinity());
+    return false;
+  }
+
+  // Independent current-candidate LLF oracle.  It proves that production
+  // assembly agrees with tau=max(lambda_n(U),lambda_n(Uhat)), refreshes that
+  // value when either side changes, applies no historical fixed-tau floor,
+  // and uses the refreshed coefficient as frozen data in A/B/C/D.
+  template <typename Engine>
+  static bool VerifyCurrentCandidateLlfPolicy(
+      Engine& engine, std::array<double, 7>& evidence) noexcept
+  {
+    evidence.fill(std::numeric_limits<double>::infinity());
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    const auto committed = numerics.CommittedSlot();
+    const std::size_t tau_count = static_cast<std::size_t>(shape.elements) *
+        faces_per_element * shape.face_points;
+    bool local_valid = engine.initialized_ && !engine.pending_.active &&
+        engine.config_.use_generic_numerical_policy &&
+        engine.config_.numerical_policy.stabilization.kind ==
+            generic::RegularizationKind::none &&
+        shape.borrowed_host_inputs && !shape.igr_active &&
+        shape.interior_components == conserved_components &&
+        shape.trace_components == conserved_components &&
+        numerics.view_.borrowed_lagged_llf_tau != nullptr && tau_count != 0 &&
+        committed.interior.coefficients != nullptr &&
+        committed.trace.coefficients != nullptr;
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    std::vector<double> base_interior, base_true_trace;
+    std::vector<double> shifted_interior, shifted_true_trace;
+    std::vector<double> local_trace;
+    std::vector<double> base_tau, interior_tau, trace_tau;
+    try
+    {
+      base_interior.resize(committed.interior.count);
+      base_true_trace.resize(committed.trace.count);
+      shifted_interior.resize(committed.interior.count);
+      shifted_true_trace.resize(committed.trace.count);
+      local_trace.resize(static_cast<std::size_t>(shape.elements) *
+                         shape.trace_dofs);
+      base_tau.resize(tau_count);
+      interior_tau.resize(tau_count);
+      trace_tau.resize(tau_count);
+    }
+    catch (...) { local_valid = false; }
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    const auto d2h = [](double* destination, const double* source,
+                        const std::size_t count) noexcept
+    {
+      return CudaTransportPolicy::DeviceToHost(
+          destination, source, count * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export);
+    };
+    const auto h2d = [](double* destination, const double* source,
+                        const std::size_t count) noexcept
+    {
+      return CudaTransportPolicy::HostToDevice(
+          destination, source, count * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export);
+    };
+    local_valid = d2h(base_interior.data(),
+                      committed.interior.coefficients,
+                      base_interior.size()) &&
+        d2h(base_true_trace.data(), committed.trace.coefficients,
+            base_true_trace.size()) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    std::copy(base_interior.begin(), base_interior.end(),
+              shifted_interior.begin());
+    std::copy(base_true_trace.begin(), base_true_trace.end(),
+              shifted_true_trace.begin());
+    local_valid = h2d(numerics.view_.old_interior,
+                      base_interior.data(), base_interior.size()) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+    const auto galilean_shift = [](double& rho, double& momentum_x,
+                                   double& momentum_y, double& energy,
+                                   const double shift_x,
+                                   const double shift_y) noexcept
+    {
+      const double old_momentum_x = momentum_x;
+      const double old_momentum_y = momentum_y;
+      momentum_x += rho * shift_x;
+      momentum_y += rho * shift_y;
+      energy += shift_x * old_momentum_x + shift_y * old_momentum_y +
+          0.5 * rho * (shift_x * shift_x + shift_y * shift_y);
+    };
+    for (int element = 0; element < shape.elements; ++element)
+      for (int scalar = 0; scalar < shape.scalar_interior_dofs; ++scalar)
+      {
+        const std::size_t offset = static_cast<std::size_t>(element) *
+            shape.interior_dofs;
+        galilean_shift(
+            shifted_interior[offset + scalar],
+            shifted_interior[offset + shape.scalar_interior_dofs + scalar],
+            shifted_interior[offset + 2 * shape.scalar_interior_dofs + scalar],
+            shifted_interior[offset + 3 * shape.scalar_interior_dofs + scalar],
+            0.78, 0.34);
+      }
+    const int true_trace_scalars = shape.true_trace_count /
+        conserved_components;
+    local_valid = true_trace_scalars * conserved_components ==
+        shape.true_trace_count;
+    for (int scalar = 0; local_valid && scalar < true_trace_scalars; ++scalar)
+      galilean_shift(
+          shifted_true_trace[scalar],
+          shifted_true_trace[true_trace_scalars + scalar],
+          shifted_true_trace[2 * true_trace_scalars + scalar],
+          shifted_true_trace[3 * true_trace_scalars + scalar],
+          -0.73, 0.41);
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    const auto install = [&](const std::vector<double>& interior,
+                             const std::vector<double>& trace) noexcept
+    {
+      const bool uploaded = h2d(numerics.view_.work_interior,
+                                interior.data(), interior.size()) &&
+          h2d(numerics.view_.work_true_trace,
+              trace.data(), trace.size()) &&
+          CudaTransportPolicy::Synchronize(
+              CudaTransferSite::generic_host_export);
+      if (!numerics.CollectiveContinue(uploaded)) return false;
+      return numerics.DistributeCurrentTrace(
+          numerics.view_.work_true_trace);
+    };
+    const auto local_speed = [](const double* state, const double nx,
+                                const double ny, double& speed) noexcept
+    {
+      if (!(state[0] > 0.0) || !std::isfinite(state[0]) ||
+          !std::isfinite(state[1]) || !std::isfinite(state[2]) ||
+          !std::isfinite(state[3]) || !std::isfinite(nx) ||
+          !std::isfinite(ny) || (nx == 0.0 && ny == 0.0))
+        return false;
+      const double pressure = 0.4 *
+          (state[3] - 0.5 *
+              (state[1] * state[1] + state[2] * state[2]) / state[0]);
+      const double sound_squared = 1.4 * pressure / state[0];
+      if (!(pressure > 0.0) || !(sound_squared > 0.0) ||
+          !std::isfinite(pressure) || !std::isfinite(sound_squared))
+        return false;
+      speed = std::abs((state[1] * nx + state[2] * ny) / state[0]) +
+          std::sqrt(sound_squared);
+      return std::isfinite(speed) && speed > 0.0;
+    };
+    const auto capture_tau = [&](const std::vector<double>& interior,
+                                 const std::vector<double>& trace,
+                                 std::vector<double>& tau,
+                                 double& maximum_error) noexcept
+    {
+      maximum_error = 0.0;
+      if (!install(interior, trace)) return false;
+      const bool launched = CudaLaunchFreezeBorrowedCurrentLlfTau(
+              numerics.view_, shape) &&
+          CudaTransportPolicy::Synchronize(
+              CudaTransferSite::scalar_status) &&
+          numerics.StatusPassed();
+      if (!numerics.CollectiveContinue(launched)) return false;
+      const bool copied = d2h(tau.data(),
+                              numerics.view_.borrowed_lagged_llf_tau,
+                              tau.size()) &&
+          d2h(local_trace.data(), numerics.view_.current_local_trace,
+              local_trace.size()) &&
+          CudaTransportPolicy::Synchronize(
+              CudaTransferSite::generic_host_export);
+      if (!numerics.CollectiveContinue(copied)) return false;
+      bool valid = true;
+      for (int element = 0; valid && element < shape.elements; ++element)
+        for (int face = 0; valid && face < faces_per_element; ++face)
+          for (int q = 0; valid && q < shape.face_points; ++q)
+          {
+            const int qp = (element * faces_per_element + face) *
+                shape.face_points + q;
+            const std::size_t interior_offset =
+                static_cast<std::size_t>(element) * shape.interior_dofs;
+            const std::size_t trace_offset =
+                static_cast<std::size_t>(element) * shape.trace_dofs +
+                face * shape.scalar_face_dofs * conserved_components;
+            double interior_state[conserved_components]{};
+            double trace_state[conserved_components]{};
+            for (int scalar = 0;
+                 scalar < shape.scalar_interior_dofs; ++scalar)
+              for (int component = 0;
+                   component < conserved_components; ++component)
+                interior_state[component] += numerics.host_face_interior_shape_[
+                    static_cast<std::size_t>(qp) *
+                        shape.scalar_interior_dofs + scalar] *
+                    interior[interior_offset + scalar +
+                        shape.scalar_interior_dofs * component];
+            for (int scalar = 0; scalar < shape.scalar_face_dofs; ++scalar)
+              for (int component = 0;
+                   component < conserved_components; ++component)
+                trace_state[component] += numerics.host_face_trace_shape_[
+                    static_cast<std::size_t>(qp) *
+                        shape.scalar_face_dofs + scalar] *
+                    local_trace[trace_offset + scalar +
+                        shape.scalar_face_dofs * component];
+            const double nx = numerics.host_face_normal_[
+                static_cast<std::size_t>(qp) * dimension];
+            const double ny = numerics.host_face_normal_[
+                static_cast<std::size_t>(qp) * dimension + 1];
+            double interior_speed = 0.0, trace_speed = 0.0;
+            valid = local_speed(interior_state, nx, ny, interior_speed) &&
+                local_speed(trace_state, nx, ny, trace_speed);
+            const double expected = std::max(interior_speed, trace_speed);
+            valid = valid && std::isfinite(tau[qp]) && tau[qp] > 0.0;
+            maximum_error = std::max(
+                maximum_error, std::abs(tau[qp] - expected));
+          }
+      return numerics.CollectiveContinue(valid);
+    };
+    const auto assemble = [&](const std::vector<double>& interior,
+                              const std::vector<double>& trace,
+                              const bool frozen,
+                              std::vector<double>& residual_r,
+                              std::vector<double>& residual_g) noexcept
+    {
+      if (!install(interior, trace)) return false;
+      const bool launched = (frozen
+              ? CudaLaunchFrozenBorrowedLlfAssembly(
+                    numerics.view_, shape, fixed_dt)
+              : CudaLaunchAssembly(numerics.view_, shape, fixed_dt)) &&
+          CudaTransportPolicy::Synchronize(
+              CudaTransferSite::scalar_status) &&
+          numerics.StatusPassed();
+      if (!numerics.CollectiveContinue(launched)) return false;
+      bool ready = true;
+      try
+      {
+        residual_r.resize(static_cast<std::size_t>(shape.interior_count));
+        residual_g.resize(static_cast<std::size_t>(shape.elements) *
+                          shape.trace_dofs);
+      }
+      catch (...) { ready = false; }
+      if (!numerics.CollectiveContinue(ready)) return false;
+      const bool copied = d2h(residual_r.data(), numerics.view_.residual_r,
+                              residual_r.size()) &&
+          d2h(residual_g.data(), numerics.view_.residual_g,
+              residual_g.size()) &&
+          CudaTransportPolicy::Synchronize(
+              CudaTransferSite::generic_host_export);
+      return numerics.CollectiveContinue(copied);
+    };
+    const auto upload_tau = [&](const std::vector<double>& tau) noexcept
+    {
+      const bool uploaded = h2d(numerics.view_.borrowed_lagged_llf_tau,
+                                tau.data(), tau.size()) &&
+          CudaTransportPolicy::Synchronize(
+              CudaTransferSite::generic_host_export);
+      return numerics.CollectiveContinue(uploaded);
+    };
+
+    double base_error = 0.0, interior_error = 0.0, trace_error = 0.0;
+    std::vector<double> interior_stale_r, interior_stale_g;
+    std::vector<double> interior_current_r, interior_current_g;
+    std::vector<double> interior_frozen_r, interior_frozen_g;
+    std::vector<double> trace_stale_r, trace_stale_g;
+    std::vector<double> trace_current_r, trace_current_g;
+    std::vector<double> trace_frozen_r, trace_frozen_g;
+    const bool captured =
+        capture_tau(base_interior, base_true_trace, base_tau, base_error) &&
+        upload_tau(base_tau) &&
+        assemble(shifted_interior, base_true_trace, true,
+                 interior_stale_r, interior_stale_g) &&
+        capture_tau(shifted_interior, base_true_trace, interior_tau,
+                    interior_error) &&
+        assemble(shifted_interior, base_true_trace, false,
+                 interior_current_r, interior_current_g) &&
+        assemble(shifted_interior, base_true_trace, true,
+                 interior_frozen_r, interior_frozen_g) &&
+        upload_tau(base_tau) &&
+        assemble(base_interior, shifted_true_trace, true,
+                 trace_stale_r, trace_stale_g) &&
+        capture_tau(base_interior, shifted_true_trace, trace_tau,
+                    trace_error) &&
+        assemble(base_interior, shifted_true_trace, false,
+                 trace_current_r, trace_current_g) &&
+        assemble(base_interior, shifted_true_trace, true,
+                 trace_frozen_r, trace_frozen_g);
+    const bool restore_uploaded = h2d(
+            numerics.view_.work_interior, base_interior.data(),
+            base_interior.size()) &&
+        h2d(numerics.view_.work_true_trace, base_true_trace.data(),
+            base_true_trace.size()) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    const bool restored = numerics.CollectiveContinue(restore_uploaded) &&
+        numerics.DistributeCurrentTrace(numerics.view_.work_true_trace);
+    if (!captured || !restored) return false;
+
+    double local_base_maximum = 0.0;
+    double local_interior_tau_change = 0.0;
+    double local_trace_tau_change = 0.0;
+    for (std::size_t index = 0; index < base_tau.size(); ++index)
+    {
+      local_base_maximum = std::max(local_base_maximum, base_tau[index]);
+      local_interior_tau_change = std::max(
+          local_interior_tau_change,
+          std::abs(interior_tau[index] - base_tau[index]));
+      local_trace_tau_change = std::max(
+          local_trace_tau_change,
+          std::abs(trace_tau[index] - base_tau[index]));
+    }
+    const auto squared_pair = [](const std::vector<double>& first_r,
+                                 const std::vector<double>& first_g,
+                                 const std::vector<double>& second_r,
+                                 const std::vector<double>& second_g,
+                                 double& difference,
+                                 double& reference) noexcept
+    {
+      difference = 0.0;
+      reference = 0.0;
+      if (first_r.size() != second_r.size() ||
+          first_g.size() != second_g.size()) return false;
+      for (std::size_t index = 0; index < first_r.size(); ++index)
+      {
+        const double delta = first_r[index] - second_r[index];
+        difference += delta * delta;
+        reference += first_r[index] * first_r[index];
+      }
+      for (std::size_t index = 0; index < first_g.size(); ++index)
+      {
+        const double delta = first_g[index] - second_g[index];
+        difference += delta * delta;
+        reference += first_g[index] * first_g[index];
+      }
+      return std::isfinite(difference) && std::isfinite(reference);
+    };
+    std::array<double, 8> local_squares{};
+    local_valid = squared_pair(
+            interior_current_r, interior_current_g,
+            interior_stale_r, interior_stale_g,
+            local_squares[0], local_squares[1]) &&
+        squared_pair(trace_current_r, trace_current_g,
+                     trace_stale_r, trace_stale_g,
+                     local_squares[2], local_squares[3]) &&
+        squared_pair(interior_current_r, interior_current_g,
+                     interior_frozen_r, interior_frozen_g,
+                     local_squares[4], local_squares[5]) &&
+        squared_pair(trace_current_r, trace_current_g,
+                     trace_frozen_r, trace_frozen_g,
+                     local_squares[6], local_squares[7]);
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    std::array<double, 4> local_maxima{{
+        local_base_maximum,
+        std::max({base_error, interior_error, trace_error}),
+        local_interior_tau_change,
+        local_trace_tau_change}};
+    std::array<double, 4> global_maxima{};
+    std::array<double, 8> global_squares{};
+    const bool maxima_reduced = MPI_Allreduce(
+        local_maxima.data(), global_maxima.data(),
+        static_cast<int>(local_maxima.size()), MPI_DOUBLE, MPI_MAX,
+        numerics.communicator_) == MPI_SUCCESS;
+    const bool squares_reduced = MPI_Allreduce(
+        local_squares.data(), global_squares.data(),
+        static_cast<int>(local_squares.size()), MPI_DOUBLE, MPI_SUM,
+        numerics.communicator_) == MPI_SUCCESS;
+    if (!numerics.CollectiveContinue(maxima_reduced && squares_reduced))
+      return false;
+    const auto relative_norm = [](const double difference,
+                                  const double reference) noexcept
+    {
+      return std::sqrt(difference) /
+          std::max(1.0, std::sqrt(reference));
+    };
+    evidence[0] = global_maxima[0];
+    evidence[1] = global_maxima[1];
+    evidence[2] = global_maxima[2];
+    evidence[3] = global_maxima[3];
+    evidence[4] = relative_norm(global_squares[0], global_squares[1]);
+    evidence[5] = relative_norm(global_squares[2], global_squares[3]);
+    evidence[6] = std::max(
+        relative_norm(global_squares[4], global_squares[5]),
+        relative_norm(global_squares[6], global_squares[7]));
+    constexpr double historical_fixed_tau = 2.5;
+    const double arithmetic_tolerance = 4096.0 *
+        std::numeric_limits<double>::epsilon() *
+        (1.0 + evidence[0]);
+    return numerics.CollectiveContinue(
+        std::all_of(evidence.begin(), evidence.end(),
+                    [](const double value) { return std::isfinite(value); }) &&
+        evidence[0] < historical_fixed_tau &&
+        evidence[1] <= arithmetic_tolerance &&
+        evidence[2] > 1.0e-6 && evidence[3] > 1.0e-6 &&
+        evidence[4] > 1.0e-10 && evidence[5] > 1.0e-10 &&
+        evidence[6] <= arithmetic_tolerance);
+  }
+
+  static bool VerifyCurrentCandidateLlfPolicy(
+      cuda::GenericEulerHdgCudaSession& session,
+      std::array<double, 7>& evidence) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return VerifyCurrentCandidateLlfPolicy(
+          *session.borrowed_rank1_, evidence);
+    if (session.borrowed_rank2_)
+      return VerifyCurrentCandidateLlfPolicy(
+          *session.borrowed_rank2_, evidence);
+    evidence.fill(std::numeric_limits<double>::infinity());
+    return false;
+  }
+
+  template <typename Engine>
+  static bool VerifyPreparedWorkAccounting(
+      Engine& engine, const CudaStepEvidence& evidence,
+      const bool require_linear_activity,
+      std::array<int, 6>& counts) noexcept
+  {
+    counts.fill(-1);
+    const auto& pending = engine.pending_;
+    const auto& numerical = pending.numerical;
+    counts = {{numerical.nonlinear_updates,
+               numerical.trace_solves,
+               numerical.linear_iterations,
+               numerical.line_search_trials,
+               numerical.rejected_line_search_trials,
+               engine.numerics_.maximum_linear_iterations_}};
+    const bool evidence_exact =
+        evidence.nonlinear_updates == numerical.nonlinear_updates &&
+        evidence.trace_solves == numerical.trace_solves &&
+        evidence.linear_iterations == numerical.linear_iterations &&
+        evidence.line_search_trials == numerical.line_search_trials &&
+        evidence.rejected_line_search_trials ==
+            numerical.rejected_line_search_trials &&
+        pending.evidence.nonlinear_updates == numerical.nonlinear_updates &&
+        pending.evidence.trace_solves == numerical.trace_solves &&
+        pending.evidence.linear_iterations == numerical.linear_iterations &&
+        pending.evidence.line_search_trials == numerical.line_search_trials &&
+        pending.evidence.rejected_line_search_trials ==
+            numerical.rejected_line_search_trials;
+    const bool complete_work_relations =
+        numerical.nonlinear_updates >= 0 && numerical.trace_solves > 0 &&
+        numerical.linear_iterations >= 0 &&
+        numerical.line_search_trials >= 0 &&
+        numerical.rejected_line_search_trials >= 0 &&
+        numerical.trace_solves == numerical.nonlinear_updates + 1 &&
+        numerical.line_search_trials == numerical.nonlinear_updates +
+            numerical.rejected_line_search_trials;
+    const long long maximum_linear_work =
+        static_cast<long long>(engine.numerics_.maximum_linear_iterations_) *
+        static_cast<long long>(numerical.trace_solves);
+    const bool linear_work_bounded =
+        engine.numerics_.maximum_linear_iterations_ > 0 &&
+        static_cast<long long>(numerical.linear_iterations) <=
+            maximum_linear_work &&
+        (!require_linear_activity || numerical.linear_iterations > 0);
+    std::array<int, 6> minimum = counts;
+    std::array<int, 6> maximum = counts;
+    const bool minimum_ready = MPI_Allreduce(
+        counts.data(), minimum.data(), static_cast<int>(counts.size()),
+        MPI_INT, MPI_MIN, engine.numerics_.communicator_) == MPI_SUCCESS;
+    const bool maximum_ready = MPI_Allreduce(
+        counts.data(), maximum.data(), static_cast<int>(counts.size()),
+        MPI_INT, MPI_MAX, engine.numerics_.communicator_) == MPI_SUCCESS;
+    return engine.numerics_.CollectiveContinue(
+        engine.initialized_ && pending.active && pending.staging &&
+        pending.prestage_allowed && numerical.success && evidence_exact &&
+        complete_work_relations && linear_work_bounded && minimum_ready &&
+        maximum_ready && minimum == maximum);
+  }
+
+  template <typename Engine>
+  static bool VerifyZeroUpdateFinalReconstruction(Engine& engine) noexcept
+  {
+    const auto& pending = engine.pending_;
+    const auto& numerical = pending.numerical;
+    std::array<int, 6> work{};
+    const bool work_accounted = VerifyPreparedWorkAccounting(
+        engine, pending.evidence, false, work);
+    return work_accounted && engine.initialized_ && pending.active &&
+        pending.staging &&
+        pending.prestage_allowed && numerical.success &&
+        numerical.candidate_ready && numerical.finite &&
+        numerical.admissible && numerical.recovery &&
+        numerical.true_residual && numerical.nonlinear_updates == 0 &&
+        numerical.trace_solves == 1 && numerical.linear_iterations >= 0 &&
+        numerical.line_search_trials == 0 &&
+        numerical.rejected_line_search_trials == 0 &&
+        numerical.products.CoupledAndOrdered();
+  }
+
+  static bool VerifyZeroUpdateFinalReconstruction(
+      cuda::GenericEulerHdgCudaSession& session) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return VerifyZeroUpdateFinalReconstruction(
+          *session.borrowed_rank1_);
+    if (session.borrowed_rank2_)
+      return VerifyZeroUpdateFinalReconstruction(
+          *session.borrowed_rank2_);
     return false;
   }
 
@@ -1713,11 +2211,32 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
       PersistentCudaSmoothEulerEngine<Selection>>(config);
   CudaRunEvidence initialization{};
   std::array<double, 6> jacobian_errors{};
+  std::array<double, 7> llf_evidence{};
   std::array<double, 2> coupling_norms{};
+  std::array<int, 6> work_counts{};
   constexpr double jacobian_tolerance = 5.0e-5;
   const bool initialized = engine->Initialize(initialization);
   const bool initialized_everywhere = All(initialized, request.communicator);
   if (!initialized_everywhere) return false;
+  const bool igr = request.numerical_policy.stabilization.kind ==
+      RegularizationKind::igr;
+  const bool llf_policy = igr ||
+      CudaQualificationTestAccess::VerifyCurrentCandidateLlfPolicy(
+          *engine, llf_evidence);
+  const bool llf_policy_everywhere = All(llf_policy, request.communicator);
+  if (!llf_policy_everywhere)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+    {
+      std::cerr << "CUDA current-candidate LLF qualification failed order="
+                << order << " evidence=";
+      for (const double value : llf_evidence) std::cerr << ' ' << value;
+      std::cerr << '\n';
+    }
+    return false;
+  }
   const bool jacobian = CudaQualificationTestAccess::VerifyAssemblerJacobian(
       *engine, jacobian_tolerance, jacobian_errors);
   const bool jacobian_everywhere = All(jacobian, request.communicator);
@@ -1737,8 +2256,6 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
     }
     return false;
   }
-  const bool igr = request.numerical_policy.stabilization.kind ==
-      RegularizationKind::igr;
   const bool coupled = !igr ||
       CudaQualificationTestAccess::VerifyIgrCouplingBlocks(
           *engine, coupling_norms);
@@ -1760,6 +2277,25 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
   const bool prepared = engine->PrepareStep(false, dt, snapshot, step);
   const bool prepared_everywhere = All(prepared, request.communicator);
   if (!prepared_everywhere) return false;
+  const bool work_accounting =
+      CudaQualificationTestAccess::VerifyPreparedWorkAccounting(
+          *engine, step, true, work_counts);
+  const bool work_accounting_everywhere = All(
+      work_accounting, request.communicator);
+  if (!work_accounting_everywhere)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+    {
+      std::cerr << "CUDA prepared work accounting failed order=" << order
+                << " regularization=" << (igr ? "igr" : "none")
+                << " counts=";
+      for (const int count : work_counts) std::cerr << ' ' << count;
+      std::cerr << '\n';
+    }
+    return false;
+  }
 
   CudaPreparedOutputMetadataV1 output{};
   const bool staged = engine->StagePreparedOutputMetadata(output, step);
@@ -1778,7 +2314,14 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
       provisional, request.communicator);
   if (!provisional_everywhere) return false;
   const bool committed = engine->FinalizeCommit(output, step);
-  const bool passed = committed && output.successful_commit;
+  const bool committed_work_accounting =
+      step.nonlinear_updates == work_counts[0] &&
+      step.trace_solves == work_counts[1] &&
+      step.linear_iterations == work_counts[2] &&
+      step.line_search_trials == work_counts[3] &&
+      step.rejected_line_search_trials == work_counts[4];
+  const bool passed = committed && output.successful_commit &&
+      committed_work_accounting;
   if (!passed)
   {
     int rank = 0;
@@ -1788,9 +2331,13 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
       std::cerr << "CUDA Euler algebra qualification failed order=" << order
                 << " regularization=" << (igr ? "igr" : "none")
                 << " initialized=" << initialized
+                << " llf_policy=" << llf_policy
                 << " jacobian=" << jacobian
                 << " coupling=" << coupled
                 << " prepared=" << prepared
+                << " work_accounting=" << work_accounting
+                << " committed_work_accounting="
+                << committed_work_accounting
                 << " jacobian_errors=";
       for (const double error : jacobian_errors) std::cerr << ' ' << error;
       std::cerr << " coupling_norms=" << coupling_norms[0] << ' '
@@ -2204,6 +2751,63 @@ bool CheckEulerAlgebra(const int order, const int ranks)
   const bool igr_physical = check_physical(RegularizationKind::igr);
   return conventional_periodic && conventional_physical &&
       igr_periodic && igr_physical;
+}
+
+bool CheckZeroUpdateFinalReconstruction(const int order)
+{
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::empty, InitialMode::constant);
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::none);
+  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+      ContractStatus::accepted)
+    return false;
+
+  GenericEulerHdgCudaSession session;
+  const auto initialization = session.Initialize(request);
+  const bool initialized = All(
+      initialization.status == HdgEulerSessionStatus::initialized,
+      request.communicator);
+  if (!initialized) return false;
+
+  GenericEulerCudaPreparedStep authority;
+  GenericEulerHdgCudaSession::prepared_output_type output{};
+  constexpr double dt = 1.0e-5;
+  const auto prepared_result = session.Prepare(dt, authority, output);
+  const bool prepared = All(
+      prepared_result.status == HdgEulerSessionStatus::prepared,
+      request.communicator);
+  if (!prepared) return false;
+  const bool reconstruction =
+      CudaQualificationTestAccess::VerifyZeroUpdateFinalReconstruction(
+          session);
+  std::vector<double> candidate(fields.initial.size(),
+                                std::numeric_limits<double>::quiet_NaN());
+  const bool exported = session.ExportPreparedInterior(
+      authority, output,
+      CudaMutableHostL2Output{
+          candidate.data(), fields.volume_scalar_count, components});
+  const bool unchanged = candidate == fields.initial;
+  const auto aborted = session.Abort(std::move(authority), output);
+  const bool aborted_everywhere = All(
+      aborted.status == HdgEulerSessionStatus::aborted,
+      request.communicator);
+  const bool passed = All(
+      reconstruction && exported && unchanged && aborted_everywhere,
+      request.communicator);
+  if (!passed)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+      std::cerr << "CUDA zero-update final reconstruction failed order="
+                << order << " reconstruction=" << reconstruction
+                << " exported=" << exported << " unchanged=" << unchanged
+                << " aborted=" << aborted_everywhere << '\n';
+  }
+  return passed;
 }
 
 bool SameValues(const std::vector<double>& left,
@@ -2710,6 +3314,8 @@ int main(int argc, char* argv[])
   const bool independent_igr_conservation = order > 0 &&
       CheckIndependentIgrConservation(order);
   const bool euler_algebra = order > 0 && CheckEulerAlgebra(order, ranks);
+  const bool zero_update_final_reconstruction = order > 0 &&
+      CheckZeroUpdateFinalReconstruction(order);
   const bool conventional_periodic = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::none, SourceMode::nonzero,
       InitialMode::constant,
@@ -2756,7 +3362,7 @@ int main(int argc, char* argv[])
   const bool passed = (ranks == 1 || ranks == 2) && All(
       admission && copied_initial_trace && all_seven_boundary_policies &&
       mixed_boundary_policies && independent_igr_conservation &&
-      euler_algebra &&
+      euler_algebra && zero_update_final_reconstruction &&
       conventional_periodic && conventional_physical &&
       igr_periodic && igr_physical && boundary_effect && source_equivalence);
   if (!passed)
@@ -2771,6 +3377,8 @@ int main(int argc, char* argv[])
               << " independent_igr_conservation="
               << independent_igr_conservation
               << " euler_algebra=" << euler_algebra
+              << " zero_update_final_reconstruction="
+              << zero_update_final_reconstruction
               << " conventional_periodic=" << conventional_periodic
               << " conventional_physical=" << conventional_physical
               << " igr_periodic=" << igr_periodic

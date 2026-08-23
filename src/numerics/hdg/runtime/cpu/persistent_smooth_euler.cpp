@@ -3,6 +3,7 @@
 #include "hdg_cpu_serial_lifecycle.hpp"
 
 #include "numerics/hdg/core/host_reference.hpp"
+#include "numerics/hdg/runtime/runtime_selection.hpp"
 #include "numerics/hdg/trace/trace_dg_mpi.hpp"
 
 #include <mfem.hpp>
@@ -37,8 +38,6 @@ constexpr std::string_view expected_model = "euler.compressible.2d";
 constexpr std::string_view expected_formulation = "hdg.conventional";
 constexpr std::string_view expected_trace = "mfem.dg_interface.trace";
 constexpr std::string_view expected_stabilization = "tau.fixed";
-constexpr std::string_view generic_borrowed_stabilization =
-    "tau.llf.max-fixed-local.v1";
 constexpr std::string_view expected_time = "backward_euler";
 constexpr std::string_view expected_precision = "fp64";
 constexpr std::string_view expected_mfem_pin =
@@ -447,6 +446,21 @@ bool NormalSpectralRadius(const State& conservative,
       std::sqrt(cpu_gamma * primitive[3] / primitive[0]);
   radius = std::abs(normal_velocity) + sound_speed;
   return Finite(radius) && radius > 0.0;
+}
+
+bool BorrowedEulerLlfStabilization(
+    const State& interior, const State& trace,
+    const std::array<double, 2>& normal, double& stabilization) noexcept
+{
+  double interior_radius = 0.0;
+  double trace_radius = 0.0;
+  if (!NormalSpectralRadius(interior, normal, interior_radius) ||
+      !NormalSpectralRadius(trace, normal, trace_radius))
+  {
+    return false;
+  }
+  stabilization = std::max(interior_radius, trace_radius);
+  return Finite(stabilization) && stabilization > 0.0;
 }
 
 bool ManufacturedSource(const double x, const double y,
@@ -1919,6 +1933,9 @@ struct detail::CpuNumericsCore::Implementation
   StateHash active_candidate_state_hash{};
   bool publication_chain_authority = false;
   bool borrowed_prepare_active = false;
+  // Private qualification control.  It is armed only through friend test
+  // access and consumed by exactly one borrowed attempt.
+  bool exact_zero_initial_residual_for_tests = false;
   double borrowed_prepared_previous_dt = 0.0;
   bool CollectiveAll(const bool local) const noexcept
   {
@@ -3508,12 +3525,22 @@ struct detail::CpuNumericsCore::Implementation
   bool Assemble(const mfem::ParGridFunction& current_interior,
                 const mfem::ParGridFunction& current_trace,
                 LocalSystem& system, const int quadrature_order,
-                const bool consume_internal_test_hooks = true) noexcept
+                const bool consume_internal_test_hooks = true,
+                const std::vector<double>* const frozen_borrowed_llf = nullptr,
+                std::vector<double>* const evaluated_borrowed_llf = nullptr)
+      noexcept
   {
     system.Zero();
     try
     {
       const bool regularized = IsIgr();
+      if ((frozen_borrowed_llf || evaluated_borrowed_llf) &&
+          (!IsBorrowed() || regularized))
+      {
+        return false;
+      }
+      if (evaluated_borrowed_llf) { evaluated_borrowed_llf->clear(); }
+      std::size_t borrowed_llf_index = 0;
       const double alpha = regularized
           ? borrowed_request->numerical_policy.stabilization.alpha : 0.0;
       const double beta = regularized
@@ -3982,20 +4009,38 @@ struct detail::CpuNumericsCore::Implementation
             double stabilization = beta;
             if (!regularized)
             {
-              double interior_radius = 0.0;
-              double trace_radius = 0.0;
               if (IsBorrowed())
               {
-                if (!NormalSpectralRadius(interior_state, normal,
-                                          interior_radius) ||
-                    !NormalSpectralRadius(trace_state, normal,
-                                          trace_radius))
+                double evaluated_stabilization = 0.0;
+                if (!BorrowedEulerLlfStabilization(
+                        interior_state, trace_state, normal,
+                        evaluated_stabilization))
                 {
                   return false;
                 }
-                stabilization = std::max(
-                    cpu_fixed_tau,
-                    std::max(interior_radius, trace_radius));
+                if (evaluated_borrowed_llf)
+                  evaluated_borrowed_llf->push_back(
+                      evaluated_stabilization);
+                if (frozen_borrowed_llf)
+                {
+                  if (borrowed_llf_index >= frozen_borrowed_llf->size() ||
+                      !Finite((*frozen_borrowed_llf)[borrowed_llf_index]) ||
+                      !((*frozen_borrowed_llf)[borrowed_llf_index] > 0.0))
+                  {
+                    return false;
+                  }
+                  stabilization =
+                      (*frozen_borrowed_llf)[borrowed_llf_index];
+                }
+                else
+                {
+                  stabilization = evaluated_stabilization;
+                }
+                ++borrowed_llf_index;
+                // Evaluate LLF at this residual candidate.  Its value is
+                // deliberately frozen in A/B/C/D below: Newton and line
+                // search candidates refresh it only through a new Assemble
+                // call, never through a spectral-radius derivative.
               }
               else
               {
@@ -4346,6 +4391,12 @@ struct detail::CpuNumericsCore::Implementation
           trace_offset += scalar_trace_dofs * trace_components;
         }
         if (trace_offset != local_trace) { return false; }
+      }
+
+      if (frozen_borrowed_llf &&
+          borrowed_llf_index != frozen_borrowed_llf->size())
+      {
+        return false;
       }
 
       std::transform(system.residual_interior.begin(),
@@ -4812,15 +4863,8 @@ struct detail::CpuNumericsCore::Implementation
             double stabilization = beta;
             if (!regularized)
             {
-              double interior_radius = 0.0;
-              double trace_radius = 0.0;
-              local_ok = NormalSpectralRadius(
-                      interior, normal, interior_radius) &&
-                  NormalSpectralRadius(
-                      trace_state, normal, trace_radius);
-              stabilization = std::max(
-                  cpu_fixed_tau,
-                  std::max(interior_radius, trace_radius));
+              local_ok = BorrowedEulerLlfStabilization(
+                  interior, trace_state, normal, stabilization);
             }
             if (!local_ok) { break; }
             const double weight = face_point.weight * face_measure;
@@ -5202,7 +5246,11 @@ struct detail::CpuNumericsCore::Implementation
           generic::ResolveEulerHdgMaximumLinearIterations(
               config.maximum_linear_iterations,
               static_cast<int>(trace_space->GlobalTrueVSize()));
-      solved = factor_setup_current && iterations > 0 &&
+      // A coherent zero right-hand side is already solved by the zero initial
+      // guess and HYPRE reports zero iterations.  The rebuilt true residual
+      // below remains the acceptance authority for both zero and nonzero
+      // iteration counts.
+      solved = factor_setup_current && iterations >= 0 &&
           iterations <= maximum_iterations;
     }
     catch (...)
@@ -5681,7 +5729,8 @@ bool detail::CpuNumericsCore::InitializeBorrowedEuler(
   tuple.trace = StableIdentity::Copy("trace.dg.interface.v1");
   tuple.stabilization = StableIdentity::Copy(
       request.numerical_policy.stabilization.kind == generic::RegularizationKind::igr
-          ? "igr.scalar.traced.alpha-beta.v1" : generic_borrowed_stabilization);
+          ? "igr.scalar.traced.alpha-beta.v1"
+          : ::dg::hdg::runtime::borrowed_euler_llf_stabilization_id);
   tuple.time_treatment = StableIdentity::Copy("backward-euler.v1");
   tuple.backend = StableIdentity::Copy("cpu.host.v1");
   tuple.precision = StableIdentity::Copy("fp64.v1");
@@ -5695,6 +5744,166 @@ bool detail::CpuNumericsCore::InitializeBorrowedEuler(
   return true;
 }
 
+bool detail::CpuNumericsCore::AuditBorrowedEulerLlfPolicy(
+    double& base_stabilization, double& refreshed_stabilization,
+    double& frozen_jacobian_relative_error,
+    double& refreshed_candidate_relative_difference) noexcept
+{
+  base_stabilization = std::numeric_limits<double>::infinity();
+  refreshed_stabilization = std::numeric_limits<double>::infinity();
+  frozen_jacobian_relative_error =
+      std::numeric_limits<double>::infinity();
+  refreshed_candidate_relative_difference =
+      std::numeric_limits<double>::infinity();
+  if (!implementation_) { return false; }
+  const Implementation& state = *implementation_;
+  bool local_valid = state.initialized && state.IsBorrowed() &&
+      !state.IsIgr() &&
+      state.tuple.stabilization.view() ==
+          ::dg::hdg::runtime::borrowed_euler_llf_stabilization_id;
+  if (!state.CollectiveAll(local_valid)) { return false; }
+
+  // The trace state owns the maximum at this witness, and both radii are
+  // deliberately below the legacy manufactured-fixture value 2.5.
+  const State interior{{1.0, 0.10, -0.02, 2.55}};
+  const State trace{{0.90, 0.45, 0.03, 2.80}};
+  const State interior_direction{{0.04, -0.03, 0.02, 0.05}};
+  const State trace_direction{{-0.02, 0.35, -0.01, 0.08}};
+  constexpr std::array<double, 2> normal{{1.0, 0.0}};
+  double interior_radius = 0.0;
+  double trace_radius = 0.0;
+  local_valid = NormalSpectralRadius(interior, normal, interior_radius) &&
+      NormalSpectralRadius(trace, normal, trace_radius) &&
+      BorrowedEulerLlfStabilization(
+          interior, trace, normal, base_stabilization) &&
+      trace_radius > interior_radius &&
+      base_stabilization == std::max(interior_radius, trace_radius) &&
+      base_stabilization < cpu_fixed_tau;
+
+  State refreshed_interior{};
+  State refreshed_trace{};
+  constexpr double candidate_step = 0.25;
+  for (int component = 0; component < cpu_conserved_components; ++component)
+  {
+    refreshed_interior[component] = interior[component] +
+        candidate_step * interior_direction[component];
+    refreshed_trace[component] = trace[component] +
+        candidate_step * trace_direction[component];
+  }
+  local_valid = local_valid && BorrowedEulerLlfStabilization(
+      refreshed_interior, refreshed_trace, normal, refreshed_stabilization) &&
+      refreshed_stabilization != base_stabilization;
+  if (!state.CollectiveAll(local_valid)) { return false; }
+
+  Matrix4 trace_jacobian{};
+  local_valid = NormalFluxJacobian(trace, normal, trace_jacobian);
+  State frozen_action{};
+  for (int row = 0; row < cpu_conserved_components; ++row)
+  {
+    frozen_action[row] = base_stabilization *
+        (interior_direction[row] - trace_direction[row]);
+    for (int column = 0; column < cpu_conserved_components; ++column)
+      frozen_action[row] +=
+          trace_jacobian[row][column] * trace_direction[column];
+  }
+
+  const auto candidate_flux = [](const State& candidate_interior,
+                                 const State& candidate_trace,
+                                 const std::array<double, 2>& face_normal,
+                                 const double frozen_stabilization,
+                                 const bool refresh_stabilization,
+                                 State& numerical_flux) noexcept
+  {
+    double stabilization = frozen_stabilization;
+    if (refresh_stabilization &&
+        !BorrowedEulerLlfStabilization(
+            candidate_interior, candidate_trace, face_normal,
+            stabilization))
+    {
+      return false;
+    }
+    if (!NormalFlux(candidate_trace, face_normal, numerical_flux))
+      return false;
+    for (int component = 0; component < cpu_conserved_components; ++component)
+      numerical_flux[component] += stabilization *
+          (candidate_interior[component] - candidate_trace[component]);
+    return Finite(numerical_flux);
+  };
+  const double difference_step =
+      std::cbrt(std::numeric_limits<double>::epsilon());
+  State plus_interior{}, minus_interior{}, plus_trace{}, minus_trace{};
+  for (int component = 0; component < cpu_conserved_components; ++component)
+  {
+    plus_interior[component] = interior[component] +
+        difference_step * interior_direction[component];
+    minus_interior[component] = interior[component] -
+        difference_step * interior_direction[component];
+    plus_trace[component] = trace[component] +
+        difference_step * trace_direction[component];
+    minus_trace[component] = trace[component] -
+        difference_step * trace_direction[component];
+  }
+  State frozen_plus{}, frozen_minus{}, refreshed_plus{}, refreshed_minus{};
+  local_valid = local_valid && candidate_flux(
+      plus_interior, plus_trace, normal, base_stabilization, false,
+      frozen_plus) && candidate_flux(
+      minus_interior, minus_trace, normal, base_stabilization, false,
+      frozen_minus) && candidate_flux(
+      plus_interior, plus_trace, normal, base_stabilization, true,
+      refreshed_plus) && candidate_flux(
+      minus_interior, minus_trace, normal, base_stabilization, true,
+      refreshed_minus);
+  if (!state.CollectiveAll(local_valid)) { return false; }
+
+  double frozen_error_squared = 0.0;
+  double refreshed_difference_squared = 0.0;
+  double action_squared = 0.0;
+  const double inverse_width = 0.5 / difference_step;
+  for (int component = 0; component < cpu_conserved_components; ++component)
+  {
+    const double frozen_difference = inverse_width *
+        (frozen_plus[component] - frozen_minus[component]);
+    const double refreshed_difference = inverse_width *
+        (refreshed_plus[component] - refreshed_minus[component]);
+    const double frozen_error =
+        frozen_difference - frozen_action[component];
+    const double refreshed_error =
+        refreshed_difference - frozen_action[component];
+    frozen_error_squared += frozen_error * frozen_error;
+    refreshed_difference_squared += refreshed_error * refreshed_error;
+    action_squared += frozen_action[component] * frozen_action[component];
+  }
+  const double denominator = std::max(std::sqrt(action_squared),
+                                      difference_step);
+  frozen_jacobian_relative_error =
+      std::sqrt(frozen_error_squared) / denominator;
+  refreshed_candidate_relative_difference =
+      std::sqrt(refreshed_difference_squared) / denominator;
+  local_valid = Finite(frozen_jacobian_relative_error) &&
+      Finite(refreshed_candidate_relative_difference) &&
+      frozen_jacobian_relative_error <= 1.0e-7 &&
+      refreshed_candidate_relative_difference >= 1.0e-4;
+  if (!state.CollectiveAll(local_valid)) { return false; }
+
+  std::array<double, 6> assembled_relative_errors{};
+  constexpr double assembled_relative_tolerance = 5.0e-5;
+  return AuditBorrowedEulerAssemblerJacobian(
+      assembled_relative_tolerance, assembled_relative_errors);
+}
+
+bool detail::CpuNumericsCore::ArmExactZeroInitialResidualForTests() noexcept
+{
+  if (!implementation_) { return false; }
+  Implementation& state = *implementation_;
+  const bool local_valid = state.initialized && state.IsBorrowed() &&
+      !state.borrowed_prepare_active &&
+      state.active_candidate_generation == 0 &&
+      !state.exact_zero_initial_residual_for_tests;
+  if (!state.CollectiveAll(local_valid)) { return false; }
+  state.exact_zero_initial_residual_for_tests = true;
+  return true;
+}
+
 bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
     const double relative_tolerance,
     std::array<double, 6>& relative_errors) noexcept
@@ -5702,11 +5911,15 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
   relative_errors.fill(std::numeric_limits<double>::infinity());
   if (!implementation_) { return false; }
   Implementation& state = *implementation_;
+  const bool regularized = state.IsIgr();
   const CpuSlotStorage* const committed = state.Committed();
-  bool local_valid = state.initialized && state.IsIgr() && committed &&
+  bool local_valid = state.initialized && state.IsBorrowed() && committed &&
       state.mesh && state.interior_space && state.trace_space &&
-      state.exchange_plan && state.interior_components == igr_interior_components &&
-      state.trace_components == igr_trace_components &&
+      state.exchange_plan &&
+      state.interior_components ==
+          (regularized ? igr_interior_components : cpu_conserved_components) &&
+      state.trace_components ==
+          (regularized ? igr_trace_components : cpu_conserved_components) &&
       committed->interior.size() ==
           static_cast<std::size_t>(state.interior_space->GetVSize()) &&
       committed->trace.size() ==
@@ -5784,24 +5997,40 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
         (trace_values || trace_size == 0) &&
         (interior_delta || interior_size == 0) &&
         (trace_delta || trace_size == 0) &&
-        interior_size % igr_interior_components == 0 &&
-        trace_size % igr_trace_components == 0;
+        interior_size % state.interior_components == 0 &&
+        trace_size % state.trace_components == 0;
     const int interior_scalar = local_valid
-        ? interior_size / igr_interior_components : 0;
+        ? interior_size / state.interior_components : 0;
     const int trace_scalar = local_valid
-        ? trace_size / igr_trace_components : 0;
-    for (int scalar = 0; scalar < interior_scalar; ++scalar)
+        ? trace_size / state.trace_components : 0;
+    if (regularized)
     {
-      interior_values[4 * interior_scalar + scalar] =
-          0.035 * deterministic_unit(static_cast<std::size_t>(scalar), 11U);
-      interior_values[5 * interior_scalar + scalar] =
-          0.025 * deterministic_unit(static_cast<std::size_t>(scalar), 17U);
-      interior_values[6 * interior_scalar + scalar] =
-          0.025 * deterministic_unit(static_cast<std::size_t>(scalar), 23U);
+      for (int scalar = 0; scalar < interior_scalar; ++scalar)
+      {
+        interior_values[4 * interior_scalar + scalar] =
+            0.035 * deterministic_unit(static_cast<std::size_t>(scalar), 11U);
+        interior_values[5 * interior_scalar + scalar] =
+            0.025 * deterministic_unit(static_cast<std::size_t>(scalar), 17U);
+        interior_values[6 * interior_scalar + scalar] =
+            0.025 * deterministic_unit(static_cast<std::size_t>(scalar), 23U);
+      }
+      for (int scalar = 0; scalar < trace_scalar; ++scalar)
+        trace_values[4 * trace_scalar + scalar] =
+            0.02 * deterministic_unit(static_cast<std::size_t>(scalar), 31U);
     }
-    for (int scalar = 0; scalar < trace_scalar; ++scalar)
-      trace_values[4 * trace_scalar + scalar] =
-          0.02 * deterministic_unit(static_cast<std::size_t>(scalar), 31U);
+    else
+    {
+      // Keep the Euler trace admissible while making U-Uhat nonzero, so the
+      // refreshed-tau finite difference is observably distinct from the
+      // frozen-tau Jacobian at this exact linearization.
+      for (int scalar = 0; scalar < trace_scalar; ++scalar)
+      {
+        trace_values[trace_scalar + scalar] +=
+            0.08 * deterministic_unit(static_cast<std::size_t>(scalar), 31U);
+        trace_values[3 * trace_scalar + scalar] +=
+            0.04 * deterministic_unit(static_cast<std::size_t>(scalar), 37U);
+      }
+    }
     for (int index = 0; index < interior_size; ++index)
       interior_delta[index] =
           deterministic_unit(static_cast<std::size_t>(index), 41U) *
@@ -5829,10 +6058,23 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
     return false;
   }
 
-  const int quadrature_order =
-      state.borrowed_request->numerical_policy.igr_assembly_quadrature_order;
+  const auto& numerical_policy = state.borrowed_request->numerical_policy;
+  const int quadrature_order = regularized
+      ? numerical_policy.igr_assembly_quadrature_order
+      : numerical_policy.conventional_assembly_quadrature_order;
+  std::vector<double> frozen_borrowed_llf;
   local_valid = state.Assemble(*base_interior, *base_trace,
-                               state.current_system, quadrature_order, false);
+                               state.current_system, quadrature_order, false,
+                               nullptr,
+                               regularized ? nullptr : &frozen_borrowed_llf);
+  local_valid = local_valid &&
+      (regularized || (!frozen_borrowed_llf.empty() &&
+                       Finite(frozen_borrowed_llf) &&
+                       std::all_of(
+                           frozen_borrowed_llf.begin(),
+                           frozen_borrowed_llf.end(),
+                           [](const double stabilization)
+                           { return stabilization < cpu_fixed_tau; })));
   if (!state.CollectiveAll(local_valid)) { return false; }
 
   std::vector<double> matrix_a;
@@ -5962,6 +6204,7 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
 
   const double difference_step =
       std::cbrt(std::numeric_limits<double>::epsilon());
+  bool refreshed_tau_changed = false;
   const auto copy_with_perturbation = [](
       const mfem::Vector& base, const mfem::Vector& direction,
       const double factor, mfem::Vector& destination) noexcept
@@ -5982,8 +6225,10 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
       &base_interior, &plus_interior, &minus_interior, &base_true_trace,
       &plus_true_trace, &minus_true_trace, &interior_direction,
       &true_trace_direction, &plus_trace, &minus_trace, quadrature_order,
-      difference_step](const bool perturb_interior,
-                       const bool perturb_trace,
+      difference_step, regularized,
+      &frozen_borrowed_llf,
+      &refreshed_tau_changed](const bool perturb_interior,
+                       const bool perturb_trace, const bool freeze_llf,
                        std::vector<double>& interior_difference,
                        std::vector<double>& trace_difference) noexcept
   {
@@ -6016,10 +6261,24 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
     {
       return false;
     }
+    std::vector<double> plus_evaluated_llf;
+    std::vector<double> minus_evaluated_llf;
+    std::vector<double>* const plus_observation =
+        !regularized && !freeze_llf ? &plus_evaluated_llf : nullptr;
+    std::vector<double>* const minus_observation =
+        !regularized && !freeze_llf ? &minus_evaluated_llf : nullptr;
     local_ready = state.Assemble(
         *plus_interior, *plus_trace, state.trial_system, quadrature_order,
-        false);
+        false, regularized || !freeze_llf ? nullptr : &frozen_borrowed_llf,
+        plus_observation);
     if (!state.CollectiveAll(local_ready)) { return false; }
+    if (plus_observation)
+    {
+      refreshed_tau_changed =
+          plus_evaluated_llf.size() == frozen_borrowed_llf.size() &&
+          !std::equal(plus_evaluated_llf.begin(), plus_evaluated_llf.end(),
+                      frozen_borrowed_llf.begin());
+    }
     std::vector<double> plus_interior_residual;
     std::vector<double> plus_trace_residual;
     try
@@ -6034,8 +6293,17 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
     if (!state.CollectiveAll(local_ready)) { return false; }
     local_ready = state.Assemble(
         *minus_interior, *minus_trace, state.trial_system, quadrature_order,
-        false);
+        false, regularized || !freeze_llf ? nullptr : &frozen_borrowed_llf,
+        minus_observation);
     if (!state.CollectiveAll(local_ready)) { return false; }
+    if (minus_observation)
+    {
+      refreshed_tau_changed = refreshed_tau_changed ||
+          (minus_evaluated_llf.size() == frozen_borrowed_llf.size() &&
+           !std::equal(minus_evaluated_llf.begin(),
+                       minus_evaluated_llf.end(),
+                       frozen_borrowed_llf.begin()));
+    }
     try
     {
       interior_difference.resize(plus_interior_residual.size());
@@ -6066,16 +6334,23 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
   std::vector<double> difference_combined_interior;
   std::vector<double> difference_combined_trace;
   const bool interior_difference_ready =
-      central_difference(true, false, difference_a, difference_c);
+      central_difference(true, false, true, difference_a, difference_c);
   const bool trace_difference_ready =
-      central_difference(false, true, difference_b, difference_d);
+      central_difference(false, true, true, difference_b, difference_d);
   const bool combined_difference_ready = central_difference(
-      true, true, difference_combined_interior, difference_combined_trace);
+      true, true, true, difference_combined_interior,
+      difference_combined_trace);
   if (!interior_difference_ready || !trace_difference_ready ||
       !combined_difference_ready)
   {
     return false;
   }
+  std::vector<double> refreshed_combined_interior;
+  std::vector<double> refreshed_combined_trace;
+  const bool refreshed_difference_ready = regularized || central_difference(
+      true, true, false, refreshed_combined_interior,
+      refreshed_combined_trace);
+  if (!refreshed_difference_ready) { return false; }
 
   std::vector<double> combined_interior;
   std::vector<double> combined_trace;
@@ -6139,8 +6414,19 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
       difference_combined_interior, combined_interior, relative_errors[4]);
   const bool combined_trace_valid = relative_error(
       difference_combined_trace, combined_trace, relative_errors[5]);
+  double refreshed_interior_difference = 0.0;
+  double refreshed_trace_difference = 0.0;
+  const bool refreshed_policy_distinguished = regularized ||
+      (refreshed_tau_changed &&
+       relative_error(refreshed_combined_interior, combined_interior,
+                      refreshed_interior_difference) &&
+       relative_error(refreshed_combined_trace, combined_trace,
+                      refreshed_trace_difference) &&
+       std::max(refreshed_interior_difference,
+                refreshed_trace_difference) >= 1.0e-4);
   local_valid = a_valid && b_valid && c_valid && d_valid &&
-      combined_interior_valid && combined_trace_valid;
+      combined_interior_valid && combined_trace_valid &&
+      refreshed_policy_distinguished;
   if (!state.CollectiveAll(local_valid)) { return false; }
 
   // Leave the reusable primary system at the unperturbed linearization.  No
@@ -6165,7 +6451,7 @@ bool detail::CpuNumericsCore::AuditLastBorrowedEulerConservation(
   if (!implementation_) { return false; }
   const Implementation& state = *implementation_;
   const CpuAttemptWorkspace& workspace = state.active_evidence;
-  const bool local_valid = state.initialized && state.IsIgr() &&
+  const bool local_valid = state.initialized && state.IsBorrowed() &&
       workspace.attempt.committed &&
       Finite(workspace.maximum_conservation_error) &&
       workspace.maximum_conservation_error >= 0.0 &&
@@ -7066,6 +7352,12 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     return result;
   };
 
+  // The private arm operation established collective agreement; consuming
+  // the flag here must add no collective or other work to production runs.
+  const bool exact_zero_initial_residual_for_tests =
+      state.exact_zero_initial_residual_for_tests;
+  state.exact_zero_initial_residual_for_tests = false;
+
   const bool local_entry_ready = state.initialized && state.Committed() &&
       state.Candidate() &&
       state.Candidate()->interior == state.Committed()->interior &&
@@ -7137,10 +7429,24 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   {
     return fail(CpuFailurePhase::assembly);
   }
+  if (exact_zero_initial_residual_for_tests)
+  {
+    // Qualification-only control: retain the assembled A/B/C/D blocks while
+    // supplying an exact-zero residual and right-hand side to isolate the
+    // ordinary attempt lifecycle's zero-update branch.
+    std::fill(state.current_system.residual_interior.begin(),
+              state.current_system.residual_interior.end(), 0.0);
+    std::fill(state.current_system.residual_trace.begin(),
+              state.current_system.residual_trace.end(), 0.0);
+    std::fill(state.current_system.f.begin(), state.current_system.f.end(),
+              0.0);
+    std::fill(state.current_system.g.begin(), state.current_system.g.end(),
+              0.0);
+  }
   ++evidence.work.complete_assemblies;
   state.CompletePhase();
   double residual = state.ResidualNorm(state.current_system);
-  if (!Finite(residual) || !(residual > 0.0))
+  if (!Finite(residual) || residual < 0.0)
   {
     return fail(CpuFailurePhase::assembly);
   }
@@ -7154,11 +7460,15 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
 
   int updates = 0;
   bool recovered = false;
+  bool final_reconstruction_validated = false;
   double maximum_true_residual = 0.0;
-  while (updates < state.config.maximum_newton_updates)
+  while (true)
   {
-    if (updates > 0 && residual <= state.config.nonlinear_tolerance *
-                                      (1.0 + evidence.initial_nonlinear_residual))
+    const bool candidate_converged =
+        residual <= state.config.nonlinear_tolerance *
+            (1.0 + evidence.initial_nonlinear_residual);
+    if (!candidate_converged &&
+        updates >= state.config.maximum_newton_updates)
     {
       break;
     }
@@ -7278,6 +7588,28 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       return fail(CpuFailurePhase::recovery);
     }
 
+    if (candidate_converged)
+    {
+      // A converged candidate is publication-ready only after its own
+      // A/B/C/D blocks, condensation, trace solve, and recovery have formed
+      // one coherent chain.  Recovery computes (and validates) the final
+      // Newton direction but deliberately does not apply another update.
+      current_newton.candidate_generation =
+          state.next_candidate_generation++;
+      current_newton.candidate_state_hash = HashPair(
+          HashVector(*state.iterate_interior),
+          HashVector(state.iterate_true_trace));
+      if (!state.CollectiveAll(
+              Finite(*state.iterate_interior) &&
+              Finite(state.iterate_true_trace)))
+      {
+        return fail(CpuFailurePhase::recovery);
+      }
+      current_newton.accepted = true;
+      final_reconstruction_validated = true;
+      break;
+    }
+
     bool accepted = false;
     bool admissible_trial = false;
     for (int trial = 0;
@@ -7347,18 +7679,24 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   evidence.nonlinear_updates = updates;
   evidence.final_nonlinear_residual = residual;
   evidence.maximum_true_relative_residual = maximum_true_residual;
-  const bool nonlinear_converged = updates > 0 &&
+  const bool nonlinear_converged =
       residual <= state.config.nonlinear_tolerance *
           (1.0 + evidence.initial_nonlinear_residual);
+  const std::uint64_t expected_reconstructions =
+      static_cast<std::uint64_t>(updates) + 1U;
   const bool factor_setup_census_exact =
       evidence.work.complete_factor_setups ==
           evidence.work.complete_trace_solves &&
       evidence.work.complete_factor_setups ==
-          evidence.work.accepted_newton_updates &&
+          evidence.work.complete_condensations &&
       evidence.work.complete_factor_setups ==
+          evidence.work.complete_recoveries &&
+      evidence.work.complete_factor_setups == expected_reconstructions &&
+      evidence.work.accepted_newton_updates ==
           static_cast<std::uint64_t>(updates);
   if (!state.CollectiveAll(
-          nonlinear_converged && recovered && factor_setup_census_exact))
+          nonlinear_converged && recovered &&
+          final_reconstruction_validated && factor_setup_census_exact))
   {
     return fail(CpuFailurePhase::recovery);
   }
@@ -7409,7 +7747,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   workspace.maximum_conservation_error = 0.0;
   workspace.maximum_conservation_relative_error = 0.0;
   workspace.conservation_gate = false;
-  if (state.IsIgr())
+  if (state.IsBorrowed())
   {
     double conservation_error = 0.0;
     double conservation_relative_error = 0.0;
@@ -7457,7 +7795,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
                   evidence.recovery_gate, evidence.true_residual_gate,
                   true,
                   evidence.nonlinear_gate &&
-                      (!state.IsIgr() || workspace.conservation_gate)};
+                      (!state.IsBorrowed() || workspace.conservation_gate)};
   result.originating_failure = FailureReason::none;
   return result;
 }
