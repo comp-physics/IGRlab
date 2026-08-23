@@ -45,13 +45,32 @@ struct CudaPreparedIgrConservationCapture
   std::vector<double> previous_interior{};
   std::vector<double> current_interior{};
   std::vector<double> current_local_trace{};
-  std::array<double, 11> production_local{};
-  std::array<double, 11> probed_production_local{};
+  std::array<double, euler_conservation_result_scalars> production_local{};
+  std::array<double, euler_conservation_result_scalars>
+      probed_production_local{};
+};
+
+struct CudaPreparedEulerConservationGateCapture
+{
+  std::array<double, euler_conservation_result_scalars> production_local{};
+  double lifecycle_maximum_error =
+      std::numeric_limits<double>::infinity();
+  double lifecycle_maximum_relative_error =
+      std::numeric_limits<double>::infinity();
+  int nonlinear_updates = -1;
+  FailureReason reason = FailureReason::none;
+  CudaFailurePhase phase = CudaFailurePhase::setup;
+  bool candidate_ready = false;
+  bool conservation = false;
+  bool success = false;
+  bool pending_active = false;
+  bool staging_retained = false;
+  bool prestage_allowed = false;
 };
 
 // This accessor is defined only in the qualification translation unit.  The
-// production engine and generic facade grant it private friendship but ship no
-// callable test API or test-only device kernel.
+// production engine and generic facade grant it private friendship; its
+// detail-only launch helpers publish no runtime diagnostic API or state.
 struct CudaQualificationTestAccess
 {
   template <typename Engine>
@@ -78,6 +97,523 @@ struct CudaQualificationTestAccess
       return VerifyAssemblerJacobian(
           *session.borrowed_rank2_, relative_tolerance, relative_errors);
     relative_errors.fill(std::numeric_limits<double>::infinity());
+    return false;
+  }
+
+  // Independent current-candidate LLF oracle.  It proves that production
+  // assembly agrees with tau=max(lambda_n(U),lambda_n(Uhat)), refreshes that
+  // value when either side changes, applies no historical fixed-tau floor,
+  // and uses the refreshed coefficient as frozen data in A/B/C/D.
+  template <typename Engine>
+  static bool VerifyCurrentCandidateLlfPolicy(
+      Engine& engine, std::array<double, 7>& evidence) noexcept
+  {
+    evidence.fill(std::numeric_limits<double>::infinity());
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    const auto committed = numerics.CommittedSlot();
+    const std::size_t tau_count = static_cast<std::size_t>(shape.elements) *
+        faces_per_element * shape.face_points;
+    bool local_valid = engine.initialized_ && !engine.pending_.active &&
+        engine.config_.use_generic_numerical_policy &&
+        engine.config_.numerical_policy.stabilization.kind ==
+            generic::RegularizationKind::none &&
+        shape.borrowed_host_inputs && !shape.igr_active &&
+        shape.interior_components == conserved_components &&
+        shape.trace_components == conserved_components &&
+        numerics.view_.borrowed_lagged_llf_tau != nullptr && tau_count != 0 &&
+        committed.interior.coefficients != nullptr &&
+        committed.trace.coefficients != nullptr;
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    std::vector<double> base_interior, base_true_trace;
+    std::vector<double> shifted_interior, shifted_true_trace;
+    std::vector<double> local_trace;
+    std::vector<double> base_tau, interior_tau, trace_tau;
+    try
+    {
+      base_interior.resize(committed.interior.count);
+      base_true_trace.resize(committed.trace.count);
+      shifted_interior.resize(committed.interior.count);
+      shifted_true_trace.resize(committed.trace.count);
+      local_trace.resize(static_cast<std::size_t>(shape.elements) *
+                         shape.trace_dofs);
+      base_tau.resize(tau_count);
+      interior_tau.resize(tau_count);
+      trace_tau.resize(tau_count);
+    }
+    catch (...) { local_valid = false; }
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    const auto d2h = [](double* destination, const double* source,
+                        const std::size_t count) noexcept
+    {
+      return CudaTransportPolicy::DeviceToHost(
+          destination, source, count * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export);
+    };
+    const auto h2d = [](double* destination, const double* source,
+                        const std::size_t count) noexcept
+    {
+      return CudaTransportPolicy::HostToDevice(
+          destination, source, count * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export);
+    };
+    local_valid = d2h(base_interior.data(),
+                      committed.interior.coefficients,
+                      base_interior.size()) &&
+        d2h(base_true_trace.data(), committed.trace.coefficients,
+            base_true_trace.size()) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    std::copy(base_interior.begin(), base_interior.end(),
+              shifted_interior.begin());
+    std::copy(base_true_trace.begin(), base_true_trace.end(),
+              shifted_true_trace.begin());
+    local_valid = h2d(numerics.view_.old_interior,
+                      base_interior.data(), base_interior.size()) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+    const auto galilean_shift = [](double& rho, double& momentum_x,
+                                   double& momentum_y, double& energy,
+                                   const double shift_x,
+                                   const double shift_y) noexcept
+    {
+      const double old_momentum_x = momentum_x;
+      const double old_momentum_y = momentum_y;
+      momentum_x += rho * shift_x;
+      momentum_y += rho * shift_y;
+      energy += shift_x * old_momentum_x + shift_y * old_momentum_y +
+          0.5 * rho * (shift_x * shift_x + shift_y * shift_y);
+    };
+    for (int element = 0; element < shape.elements; ++element)
+      for (int scalar = 0; scalar < shape.scalar_interior_dofs; ++scalar)
+      {
+        const std::size_t offset = static_cast<std::size_t>(element) *
+            shape.interior_dofs;
+        galilean_shift(
+            shifted_interior[offset + scalar],
+            shifted_interior[offset + shape.scalar_interior_dofs + scalar],
+            shifted_interior[offset + 2 * shape.scalar_interior_dofs + scalar],
+            shifted_interior[offset + 3 * shape.scalar_interior_dofs + scalar],
+            0.78, 0.34);
+      }
+    const int true_trace_scalars = shape.true_trace_count /
+        conserved_components;
+    local_valid = true_trace_scalars * conserved_components ==
+        shape.true_trace_count;
+    for (int scalar = 0; local_valid && scalar < true_trace_scalars; ++scalar)
+      galilean_shift(
+          shifted_true_trace[scalar],
+          shifted_true_trace[true_trace_scalars + scalar],
+          shifted_true_trace[2 * true_trace_scalars + scalar],
+          shifted_true_trace[3 * true_trace_scalars + scalar],
+          -0.73, 0.41);
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    const auto install = [&](const std::vector<double>& interior,
+                             const std::vector<double>& trace) noexcept
+    {
+      const bool uploaded = h2d(numerics.view_.work_interior,
+                                interior.data(), interior.size()) &&
+          h2d(numerics.view_.work_true_trace,
+              trace.data(), trace.size()) &&
+          CudaTransportPolicy::Synchronize(
+              CudaTransferSite::generic_host_export);
+      if (!numerics.CollectiveContinue(uploaded)) return false;
+      return numerics.DistributeCurrentTrace(
+          numerics.view_.work_true_trace);
+    };
+    const auto local_speed = [](const double* state, const double nx,
+                                const double ny, double& speed) noexcept
+    {
+      if (!(state[0] > 0.0) || !std::isfinite(state[0]) ||
+          !std::isfinite(state[1]) || !std::isfinite(state[2]) ||
+          !std::isfinite(state[3]) || !std::isfinite(nx) ||
+          !std::isfinite(ny) || (nx == 0.0 && ny == 0.0))
+        return false;
+      const double pressure = 0.4 *
+          (state[3] - 0.5 *
+              (state[1] * state[1] + state[2] * state[2]) / state[0]);
+      const double sound_squared = 1.4 * pressure / state[0];
+      if (!(pressure > 0.0) || !(sound_squared > 0.0) ||
+          !std::isfinite(pressure) || !std::isfinite(sound_squared))
+        return false;
+      speed = std::abs((state[1] * nx + state[2] * ny) / state[0]) +
+          std::sqrt(sound_squared);
+      return std::isfinite(speed) && speed > 0.0;
+    };
+    const auto capture_tau = [&](const std::vector<double>& interior,
+                                 const std::vector<double>& trace,
+                                 std::vector<double>& tau,
+                                 double& maximum_error) noexcept
+    {
+      maximum_error = 0.0;
+      if (!install(interior, trace)) return false;
+      const bool launched = CudaLaunchFreezeBorrowedCurrentLlfTau(
+              numerics.view_, shape) &&
+          CudaTransportPolicy::Synchronize(
+              CudaTransferSite::scalar_status) &&
+          numerics.StatusPassed();
+      if (!numerics.CollectiveContinue(launched)) return false;
+      const bool copied = d2h(tau.data(),
+                              numerics.view_.borrowed_lagged_llf_tau,
+                              tau.size()) &&
+          d2h(local_trace.data(), numerics.view_.current_local_trace,
+              local_trace.size()) &&
+          CudaTransportPolicy::Synchronize(
+              CudaTransferSite::generic_host_export);
+      if (!numerics.CollectiveContinue(copied)) return false;
+      bool valid = true;
+      for (int element = 0; valid && element < shape.elements; ++element)
+        for (int face = 0; valid && face < faces_per_element; ++face)
+          for (int q = 0; valid && q < shape.face_points; ++q)
+          {
+            const int qp = (element * faces_per_element + face) *
+                shape.face_points + q;
+            const std::size_t interior_offset =
+                static_cast<std::size_t>(element) * shape.interior_dofs;
+            const std::size_t trace_offset =
+                static_cast<std::size_t>(element) * shape.trace_dofs +
+                face * shape.scalar_face_dofs * conserved_components;
+            double interior_state[conserved_components]{};
+            double trace_state[conserved_components]{};
+            for (int scalar = 0;
+                 scalar < shape.scalar_interior_dofs; ++scalar)
+              for (int component = 0;
+                   component < conserved_components; ++component)
+                interior_state[component] += numerics.host_face_interior_shape_[
+                    static_cast<std::size_t>(qp) *
+                        shape.scalar_interior_dofs + scalar] *
+                    interior[interior_offset + scalar +
+                        shape.scalar_interior_dofs * component];
+            for (int scalar = 0; scalar < shape.scalar_face_dofs; ++scalar)
+              for (int component = 0;
+                   component < conserved_components; ++component)
+                trace_state[component] += numerics.host_face_trace_shape_[
+                    static_cast<std::size_t>(qp) *
+                        shape.scalar_face_dofs + scalar] *
+                    local_trace[trace_offset + scalar +
+                        shape.scalar_face_dofs * component];
+            const double nx = numerics.host_face_normal_[
+                static_cast<std::size_t>(qp) * dimension];
+            const double ny = numerics.host_face_normal_[
+                static_cast<std::size_t>(qp) * dimension + 1];
+            double interior_speed = 0.0, trace_speed = 0.0;
+            valid = local_speed(interior_state, nx, ny, interior_speed) &&
+                local_speed(trace_state, nx, ny, trace_speed);
+            const double expected = std::max(interior_speed, trace_speed);
+            valid = valid && std::isfinite(tau[qp]) && tau[qp] > 0.0;
+            maximum_error = std::max(
+                maximum_error, std::abs(tau[qp] - expected));
+          }
+      return numerics.CollectiveContinue(valid);
+    };
+    const auto assemble = [&](const std::vector<double>& interior,
+                              const std::vector<double>& trace,
+                              const bool frozen,
+                              std::vector<double>& residual_r,
+                              std::vector<double>& residual_g) noexcept
+    {
+      if (!install(interior, trace)) return false;
+      const bool launched = (frozen
+              ? CudaLaunchFrozenBorrowedLlfAssembly(
+                    numerics.view_, shape, fixed_dt)
+              : CudaLaunchAssembly(numerics.view_, shape, fixed_dt)) &&
+          CudaTransportPolicy::Synchronize(
+              CudaTransferSite::scalar_status) &&
+          numerics.StatusPassed();
+      if (!numerics.CollectiveContinue(launched)) return false;
+      bool ready = true;
+      try
+      {
+        residual_r.resize(static_cast<std::size_t>(shape.interior_count));
+        residual_g.resize(static_cast<std::size_t>(shape.elements) *
+                          shape.trace_dofs);
+      }
+      catch (...) { ready = false; }
+      if (!numerics.CollectiveContinue(ready)) return false;
+      const bool copied = d2h(residual_r.data(), numerics.view_.residual_r,
+                              residual_r.size()) &&
+          d2h(residual_g.data(), numerics.view_.residual_g,
+              residual_g.size()) &&
+          CudaTransportPolicy::Synchronize(
+              CudaTransferSite::generic_host_export);
+      return numerics.CollectiveContinue(copied);
+    };
+    const auto upload_tau = [&](const std::vector<double>& tau) noexcept
+    {
+      const bool uploaded = h2d(numerics.view_.borrowed_lagged_llf_tau,
+                                tau.data(), tau.size()) &&
+          CudaTransportPolicy::Synchronize(
+              CudaTransferSite::generic_host_export);
+      return numerics.CollectiveContinue(uploaded);
+    };
+
+    double base_error = 0.0, interior_error = 0.0, trace_error = 0.0;
+    std::vector<double> interior_stale_r, interior_stale_g;
+    std::vector<double> interior_current_r, interior_current_g;
+    std::vector<double> interior_frozen_r, interior_frozen_g;
+    std::vector<double> trace_stale_r, trace_stale_g;
+    std::vector<double> trace_current_r, trace_current_g;
+    std::vector<double> trace_frozen_r, trace_frozen_g;
+    const bool captured =
+        capture_tau(base_interior, base_true_trace, base_tau, base_error) &&
+        upload_tau(base_tau) &&
+        assemble(shifted_interior, base_true_trace, true,
+                 interior_stale_r, interior_stale_g) &&
+        capture_tau(shifted_interior, base_true_trace, interior_tau,
+                    interior_error) &&
+        assemble(shifted_interior, base_true_trace, false,
+                 interior_current_r, interior_current_g) &&
+        assemble(shifted_interior, base_true_trace, true,
+                 interior_frozen_r, interior_frozen_g) &&
+        upload_tau(base_tau) &&
+        assemble(base_interior, shifted_true_trace, true,
+                 trace_stale_r, trace_stale_g) &&
+        capture_tau(base_interior, shifted_true_trace, trace_tau,
+                    trace_error) &&
+        assemble(base_interior, shifted_true_trace, false,
+                 trace_current_r, trace_current_g) &&
+        assemble(base_interior, shifted_true_trace, true,
+                 trace_frozen_r, trace_frozen_g);
+    const bool restore_uploaded = h2d(
+            numerics.view_.work_interior, base_interior.data(),
+            base_interior.size()) &&
+        h2d(numerics.view_.work_true_trace, base_true_trace.data(),
+            base_true_trace.size()) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    const bool restored = numerics.CollectiveContinue(restore_uploaded) &&
+        numerics.DistributeCurrentTrace(numerics.view_.work_true_trace);
+    if (!captured || !restored) return false;
+
+    double local_base_maximum = 0.0;
+    double local_interior_tau_change = 0.0;
+    double local_trace_tau_change = 0.0;
+    for (std::size_t index = 0; index < base_tau.size(); ++index)
+    {
+      local_base_maximum = std::max(local_base_maximum, base_tau[index]);
+      local_interior_tau_change = std::max(
+          local_interior_tau_change,
+          std::abs(interior_tau[index] - base_tau[index]));
+      local_trace_tau_change = std::max(
+          local_trace_tau_change,
+          std::abs(trace_tau[index] - base_tau[index]));
+    }
+    const auto squared_pair = [](const std::vector<double>& first_r,
+                                 const std::vector<double>& first_g,
+                                 const std::vector<double>& second_r,
+                                 const std::vector<double>& second_g,
+                                 double& difference,
+                                 double& reference) noexcept
+    {
+      difference = 0.0;
+      reference = 0.0;
+      if (first_r.size() != second_r.size() ||
+          first_g.size() != second_g.size()) return false;
+      for (std::size_t index = 0; index < first_r.size(); ++index)
+      {
+        const double delta = first_r[index] - second_r[index];
+        difference += delta * delta;
+        reference += first_r[index] * first_r[index];
+      }
+      for (std::size_t index = 0; index < first_g.size(); ++index)
+      {
+        const double delta = first_g[index] - second_g[index];
+        difference += delta * delta;
+        reference += first_g[index] * first_g[index];
+      }
+      return std::isfinite(difference) && std::isfinite(reference);
+    };
+    std::array<double, 8> local_squares{};
+    local_valid = squared_pair(
+            interior_current_r, interior_current_g,
+            interior_stale_r, interior_stale_g,
+            local_squares[0], local_squares[1]) &&
+        squared_pair(trace_current_r, trace_current_g,
+                     trace_stale_r, trace_stale_g,
+                     local_squares[2], local_squares[3]) &&
+        squared_pair(interior_current_r, interior_current_g,
+                     interior_frozen_r, interior_frozen_g,
+                     local_squares[4], local_squares[5]) &&
+        squared_pair(trace_current_r, trace_current_g,
+                     trace_frozen_r, trace_frozen_g,
+                     local_squares[6], local_squares[7]);
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    std::array<double, 4> local_maxima{{
+        local_base_maximum,
+        std::max({base_error, interior_error, trace_error}),
+        local_interior_tau_change,
+        local_trace_tau_change}};
+    std::array<double, 4> global_maxima{};
+    std::array<double, 8> global_squares{};
+    const bool maxima_reduced = MPI_Allreduce(
+        local_maxima.data(), global_maxima.data(),
+        static_cast<int>(local_maxima.size()), MPI_DOUBLE, MPI_MAX,
+        numerics.communicator_) == MPI_SUCCESS;
+    const bool squares_reduced = MPI_Allreduce(
+        local_squares.data(), global_squares.data(),
+        static_cast<int>(local_squares.size()), MPI_DOUBLE, MPI_SUM,
+        numerics.communicator_) == MPI_SUCCESS;
+    if (!numerics.CollectiveContinue(maxima_reduced && squares_reduced))
+      return false;
+    const auto relative_norm = [](const double difference,
+                                  const double reference) noexcept
+    {
+      return std::sqrt(difference) /
+          std::max(1.0, std::sqrt(reference));
+    };
+    evidence[0] = global_maxima[0];
+    evidence[1] = global_maxima[1];
+    evidence[2] = global_maxima[2];
+    evidence[3] = global_maxima[3];
+    evidence[4] = relative_norm(global_squares[0], global_squares[1]);
+    evidence[5] = relative_norm(global_squares[2], global_squares[3]);
+    evidence[6] = std::max(
+        relative_norm(global_squares[4], global_squares[5]),
+        relative_norm(global_squares[6], global_squares[7]));
+    constexpr double historical_fixed_tau = 2.5;
+    const double arithmetic_tolerance = 4096.0 *
+        std::numeric_limits<double>::epsilon() *
+        (1.0 + evidence[0]);
+    return numerics.CollectiveContinue(
+        std::all_of(evidence.begin(), evidence.end(),
+                    [](const double value) { return std::isfinite(value); }) &&
+        evidence[0] < historical_fixed_tau &&
+        evidence[1] <= arithmetic_tolerance &&
+        evidence[2] > 1.0e-6 && evidence[3] > 1.0e-6 &&
+        evidence[4] > 1.0e-10 && evidence[5] > 1.0e-10 &&
+        evidence[6] <= arithmetic_tolerance);
+  }
+
+  static bool VerifyCurrentCandidateLlfPolicy(
+      cuda::GenericEulerHdgCudaSession& session,
+      std::array<double, 7>& evidence) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return VerifyCurrentCandidateLlfPolicy(
+          *session.borrowed_rank1_, evidence);
+    if (session.borrowed_rank2_)
+      return VerifyCurrentCandidateLlfPolicy(
+          *session.borrowed_rank2_, evidence);
+    evidence.fill(std::numeric_limits<double>::infinity());
+    return false;
+  }
+
+  template <typename Engine>
+  static bool VerifyPreparedWorkAccounting(
+      Engine& engine, const CudaStepEvidence& evidence,
+      const bool require_linear_activity,
+      std::array<int, 6>& counts) noexcept
+  {
+    counts.fill(-1);
+    const auto& pending = engine.pending_;
+    const auto& numerical = pending.numerical;
+    counts = {{numerical.nonlinear_updates,
+               numerical.trace_solves,
+               numerical.linear_iterations,
+               numerical.line_search_trials,
+               numerical.rejected_line_search_trials,
+               engine.numerics_.maximum_linear_iterations_}};
+    const bool evidence_exact =
+        evidence.nonlinear_updates == numerical.nonlinear_updates &&
+        evidence.trace_solves == numerical.trace_solves &&
+        evidence.linear_iterations == numerical.linear_iterations &&
+        evidence.line_search_trials == numerical.line_search_trials &&
+        evidence.rejected_line_search_trials ==
+            numerical.rejected_line_search_trials &&
+        pending.evidence.nonlinear_updates == numerical.nonlinear_updates &&
+        pending.evidence.trace_solves == numerical.trace_solves &&
+        pending.evidence.linear_iterations == numerical.linear_iterations &&
+        pending.evidence.line_search_trials == numerical.line_search_trials &&
+        pending.evidence.rejected_line_search_trials ==
+            numerical.rejected_line_search_trials;
+    const bool complete_work_relations =
+        numerical.nonlinear_updates >= 0 && numerical.trace_solves > 0 &&
+        numerical.linear_iterations >= 0 &&
+        numerical.line_search_trials >= 0 &&
+        numerical.rejected_line_search_trials >= 0 &&
+        numerical.trace_solves == numerical.nonlinear_updates + 1 &&
+        numerical.line_search_trials == numerical.nonlinear_updates +
+            numerical.rejected_line_search_trials;
+    const long long maximum_linear_work =
+        static_cast<long long>(engine.numerics_.maximum_linear_iterations_) *
+        static_cast<long long>(numerical.trace_solves);
+    const bool linear_work_bounded =
+        engine.numerics_.maximum_linear_iterations_ > 0 &&
+        static_cast<long long>(numerical.linear_iterations) <=
+            maximum_linear_work &&
+        (!require_linear_activity || numerical.linear_iterations > 0);
+    std::array<int, 6> minimum = counts;
+    std::array<int, 6> maximum = counts;
+    const bool minimum_ready = MPI_Allreduce(
+        counts.data(), minimum.data(), static_cast<int>(counts.size()),
+        MPI_INT, MPI_MIN, engine.numerics_.communicator_) == MPI_SUCCESS;
+    const bool maximum_ready = MPI_Allreduce(
+        counts.data(), maximum.data(), static_cast<int>(counts.size()),
+        MPI_INT, MPI_MAX, engine.numerics_.communicator_) == MPI_SUCCESS;
+    return engine.numerics_.CollectiveContinue(
+        engine.initialized_ && pending.active && pending.staging &&
+        pending.prestage_allowed && numerical.success && evidence_exact &&
+        complete_work_relations && linear_work_bounded && minimum_ready &&
+        maximum_ready && minimum == maximum);
+  }
+
+  static bool VerifyPreparedWorkAccounting(
+      cuda::GenericEulerHdgCudaSession& session,
+      const bool require_linear_activity,
+      std::array<int, 6>& counts) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return VerifyPreparedWorkAccounting(
+          *session.borrowed_rank1_,
+          session.borrowed_rank1_->pending_.evidence,
+          require_linear_activity, counts);
+    if (session.borrowed_rank2_)
+      return VerifyPreparedWorkAccounting(
+          *session.borrowed_rank2_,
+          session.borrowed_rank2_->pending_.evidence,
+          require_linear_activity, counts);
+    counts.fill(-1);
+    return false;
+  }
+
+  template <typename Engine>
+  static bool VerifyZeroUpdateFinalReconstruction(Engine& engine) noexcept
+  {
+    const auto& pending = engine.pending_;
+    const auto& numerical = pending.numerical;
+    std::array<int, 6> work{};
+    const bool work_accounted = VerifyPreparedWorkAccounting(
+        engine, pending.evidence, false, work);
+    return work_accounted && engine.initialized_ && pending.active &&
+        pending.staging &&
+        pending.prestage_allowed && numerical.success &&
+        numerical.candidate_ready && numerical.finite &&
+        numerical.admissible && numerical.recovery &&
+        numerical.true_residual && numerical.nonlinear_updates == 0 &&
+        numerical.trace_solves == 1 && numerical.linear_iterations >= 0 &&
+        numerical.line_search_trials == 0 &&
+        numerical.rejected_line_search_trials == 0 &&
+        numerical.products.CoupledAndOrdered();
+  }
+
+  static bool VerifyZeroUpdateFinalReconstruction(
+      cuda::GenericEulerHdgCudaSession& session) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return VerifyZeroUpdateFinalReconstruction(
+          *session.borrowed_rank1_);
+    if (session.borrowed_rank2_)
+      return VerifyZeroUpdateFinalReconstruction(
+          *session.borrowed_rank2_);
     return false;
   }
 
@@ -119,7 +655,7 @@ struct CudaQualificationTestAccess
     catch (...) { local_valid = false; }
 
     if (!numerics.CollectiveContinue(local_valid)) return false;
-    const bool launched = CudaLaunchIgrConservation(
+    const bool launched = CudaLaunchEulerConservation(
             numerics.view_, shape, engine.pending_.attempt.dt,
             numerics.view_.scalar) &&
         CudaTransportPolicy::Synchronize(CudaTransferSite::scalar_status);
@@ -164,7 +700,11 @@ struct CudaQualificationTestAccess
         engine.pending_.numerical.maximum_conservation_error;
     capture.lifecycle_maximum_relative_error =
         engine.pending_.numerical.maximum_conservation_relative_error;
-    local_valid = copied && capture.production_local[10] == 1.0 &&
+    local_valid = copied &&
+        capture.production_local[
+            euler_conservation_result_scalars - 1] == 1.0 &&
+        std::isfinite(capture.production_local[2 * igr_trace_components]) &&
+        capture.production_local[2 * igr_trace_components] >= 0.0 &&
         std::all_of(capture.production_local.begin(),
                     capture.production_local.end(),
                     [](const double value) { return std::isfinite(value); });
@@ -193,7 +733,7 @@ struct CudaQualificationTestAccess
     const bool probe_installed_everywhere =
         numerics.CollectiveContinue(probe_installed);
     const bool probe_launched = probe_installed_everywhere &&
-        CudaLaunchIgrConservation(
+        CudaLaunchEulerConservation(
             numerics.view_, shape, engine.pending_.attempt.dt,
             numerics.view_.scalar) &&
         CudaTransportPolicy::Synchronize(
@@ -229,7 +769,10 @@ struct CudaQualificationTestAccess
     const bool restored_everywhere = numerics.CollectiveContinue(
         trace_restored && scalar_restored && restore_synchronized);
     const bool probe_finite = probe_copied_everywhere &&
-        capture.probed_production_local[10] == 1.0 &&
+        capture.probed_production_local[
+            euler_conservation_result_scalars - 1] == 1.0 &&
+        capture.probed_production_local[2 * igr_trace_components] ==
+            capture.production_local[2 * igr_trace_components] &&
         std::all_of(capture.probed_production_local.begin(),
                     capture.probed_production_local.end(),
                     [](const double value) { return std::isfinite(value); });
@@ -248,6 +791,57 @@ struct CudaQualificationTestAccess
       return CapturePreparedIgrConservation(
           *session.borrowed_rank2_, capture);
     return false;
+  }
+
+  template <typename Engine>
+  static bool CapturePreparedEulerConservationGate(
+      Engine& engine,
+      CudaPreparedEulerConservationGateCapture& capture) noexcept
+  {
+    capture = {};
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    const auto& pending = engine.pending_;
+    bool local_valid = engine.initialized_ && pending.active &&
+        pending.staging.has_value() &&
+        engine.config_.use_generic_numerical_policy &&
+        engine.config_.numerical_policy.stabilization.kind ==
+            generic::RegularizationKind::none &&
+        shape.borrowed_host_inputs && !shape.igr_active &&
+        std::isfinite(pending.attempt.dt) && pending.attempt.dt > 0.0 &&
+        numerics.view_.scalar != nullptr;
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+    const bool launched = CudaLaunchEulerConservation(
+            numerics.view_, shape, pending.attempt.dt,
+            numerics.view_.scalar) &&
+        CudaTransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    if (!numerics.CollectiveContinue(launched)) return false;
+    const bool copied = CudaTransportPolicy::DeviceToHost(
+            capture.production_local.data(), numerics.view_.scalar,
+            capture.production_local.size() * sizeof(double),
+            CudaTransferCategory::scalar_diagnostic,
+            CudaTransferSite::scalar_status) &&
+        CudaTransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    capture.lifecycle_maximum_error =
+        pending.numerical.maximum_conservation_error;
+    capture.lifecycle_maximum_relative_error =
+        pending.numerical.maximum_conservation_relative_error;
+    capture.nonlinear_updates = pending.numerical.nonlinear_updates;
+    capture.reason = pending.numerical.reason;
+    capture.phase = pending.numerical.phase;
+    capture.candidate_ready = pending.numerical.candidate_ready;
+    capture.conservation = pending.numerical.conservation;
+    capture.success = pending.numerical.success;
+    capture.pending_active = pending.active;
+    capture.staging_retained = pending.staging.has_value();
+    capture.prestage_allowed = pending.prestage_allowed;
+    local_valid = copied &&
+        capture.production_local[euler_conservation_result_scalars - 1] ==
+            1.0 &&
+        std::all_of(capture.production_local.begin(),
+                    capture.production_local.end(),
+                    [](const double value) { return std::isfinite(value); });
+    return numerics.CollectiveContinue(local_valid);
   }
 
   template <typename Engine>
@@ -635,12 +1229,15 @@ using dg::hdg::generic::ContractStatus;
 using dg::hdg::generic::EulerBoundaryPolicy;
 using dg::hdg::generic::EulerBoundaryPolicyKind;
 using dg::hdg::generic::EulerHdgRequest;
+using dg::hdg::generic::HdgEulerHostInteriorFields;
 using dg::hdg::generic::HdgEulerSessionStatus;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using dg::hdg::runtime::BorrowedCudaRank1OneGpuRuntimeSelection;
 using dg::hdg::runtime::BorrowedCudaRank2OneGpuHostStagedRuntimeSelection;
+using dg::hdg::runtime::FailureReason;
+using dg::hdg::runtime::RunStatus;
 using dg::hdg::runtime::cuda_w8a::CudaConfig;
 using dg::hdg::runtime::cuda_w8a::CudaBorrowedHostL2Input;
 using dg::hdg::runtime::cuda_w8a::CudaMutableHostL2Output;
@@ -648,10 +1245,15 @@ using dg::hdg::runtime::cuda_w8a::CudaPrecommitSnapshot;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
 using dg::hdg::runtime::cuda_w8a::CudaRunEvidence;
 using dg::hdg::runtime::cuda_w8a::CudaStepEvidence;
+using dg::hdg::runtime::cuda_w8a::CudaTransferTotals;
+using dg::hdg::runtime::cuda_w8a::CudaTransportPolicy;
 using dg::hdg::runtime::cuda_w8a::PersistentCudaSmoothEulerEngine;
+using dg::hdg::runtime::cuda_w8a::detail::
+    CudaPreparedEulerConservationGateCapture;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedIgrConservationCapture;
 using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
+using dg::hdg::runtime::cuda_w8a::igr_trace_components;
 using dg::hdg::runtime::cuda_w8a::detail::qualification_density_gate;
 
 constexpr int components = dg::hdg::generic::euler_2d_conserved_components;
@@ -1129,6 +1731,12 @@ struct IndependentIgrConservationResult
   std::array<double, 5> production_scale{};
   std::array<double, 5> oracle_balance{};
   std::array<double, 5> oracle_scale{};
+  double production_domain_measure =
+      std::numeric_limits<double>::infinity();
+  double oracle_domain_measure =
+      std::numeric_limits<double>::infinity();
+  double domain_measure_discrepancy =
+      std::numeric_limits<double>::infinity();
   // Source components, Euler change, physical Euler flux, sigma/rho,
   // alpha*Q, and the physical auxiliary flux, respectively.
   std::array<double, 9> activity{};
@@ -1220,6 +1828,7 @@ bool VerifyIndependentIgrConservation(
   std::array<long double, 4> local_source_integral{};
   std::array<long double, 4> local_boundary_integral{};
   std::array<long double, 3> local_auxiliary_integral{};
+  long double local_domain_measure = 0.0L;
   long double local_probe_delta = 0.0L;
 
   try
@@ -1286,6 +1895,11 @@ bool VerifyIndependentIgrConservation(
         long double sigma = 0.0L;
         long double conservative_gradient[3][2] = {};
         local_valid = weight > 0.0L && std::isfinite(weight);
+        if (local_valid)
+        {
+          local_domain_measure += weight;
+          local_valid = std::isfinite(local_domain_measure);
+        }
         for (int scalar = 0;
              local_valid && scalar < capture.scalar_interior_dofs; ++scalar)
         {
@@ -1554,6 +2168,9 @@ bool VerifyIndependentIgrConservation(
   std::array<long double, 4> global_source_integral{};
   std::array<long double, 4> global_boundary_integral{};
   std::array<long double, 3> global_auxiliary_integral{};
+  const double production_local_domain_measure =
+      capture.production_local[2 * igr_trace_components];
+  long double global_domain_measure = 0.0L;
   const double production_local_probe_delta =
       capture.probed_production_local[4] - capture.production_local[4];
   long double global_probe_delta = 0.0L;
@@ -1568,6 +2185,12 @@ bool VerifyIndependentIgrConservation(
       MPI_SUM, request.communicator);
   const int oracle_scale_status = MPI_Allreduce(
       local_scale.data(), global_scale.data(), 5, MPI_LONG_DOUBLE,
+      MPI_SUM, request.communicator);
+  const int production_measure_status = MPI_Allreduce(
+      &production_local_domain_measure, &result.production_domain_measure,
+      1, MPI_DOUBLE, MPI_SUM, request.communicator);
+  const int oracle_measure_status = MPI_Allreduce(
+      &local_domain_measure, &global_domain_measure, 1, MPI_LONG_DOUBLE,
       MPI_SUM, request.communicator);
   const int activity_status = MPI_Allreduce(
       local_activity.data(), global_activity.data(), 9, MPI_LONG_DOUBLE,
@@ -1594,6 +2217,8 @@ bool VerifyIndependentIgrConservation(
       production_scale_status == MPI_SUCCESS &&
       oracle_balance_status == MPI_SUCCESS &&
       oracle_scale_status == MPI_SUCCESS &&
+      production_measure_status == MPI_SUCCESS &&
+      oracle_measure_status == MPI_SUCCESS &&
       activity_status == MPI_SUCCESS && change_status == MPI_SUCCESS &&
       source_status == MPI_SUCCESS && boundary_status == MPI_SUCCESS &&
       auxiliary_status == MPI_SUCCESS &&
@@ -1606,6 +2231,16 @@ bool VerifyIndependentIgrConservation(
   double production_maximum_relative_error = 0.0;
   result.maximum_balance_discrepancy = 0.0;
   result.maximum_scale_discrepancy = 0.0;
+  result.oracle_domain_measure = static_cast<double>(global_domain_measure);
+  result.domain_measure_discrepancy = std::abs(
+      result.production_domain_measure - result.oracle_domain_measure);
+  const double domain_measure_tolerance = 2.0e-11 *
+      (1.0 + std::abs(result.oracle_domain_measure));
+  parity = parity && std::isfinite(result.production_domain_measure) &&
+      result.production_domain_measure > 0.0 &&
+      std::isfinite(result.oracle_domain_measure) &&
+      result.oracle_domain_measure > 0.0 &&
+      result.domain_measure_discrepancy <= domain_measure_tolerance;
   std::array<double, 5> comparison_tolerance{};
   for (std::size_t component = 0; component < 5; ++component)
   {
@@ -1636,7 +2271,9 @@ bool VerifyIndependentIgrConservation(
         production_maximum_error, error);
     production_maximum_relative_error = std::max(
         production_maximum_relative_error,
-        error / (1.0 + result.production_scale[component]));
+        dg::hdg::generic::EulerHdgConservationRelativeError(
+            error, result.production_scale[component],
+            result.production_domain_measure));
   }
   for (std::size_t index = 0; index < result.activity.size(); ++index)
     result.activity[index] = static_cast<double>(global_activity[index]);
@@ -1713,11 +2350,32 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
       PersistentCudaSmoothEulerEngine<Selection>>(config);
   CudaRunEvidence initialization{};
   std::array<double, 6> jacobian_errors{};
+  std::array<double, 7> llf_evidence{};
   std::array<double, 2> coupling_norms{};
+  std::array<int, 6> work_counts{};
   constexpr double jacobian_tolerance = 5.0e-5;
   const bool initialized = engine->Initialize(initialization);
   const bool initialized_everywhere = All(initialized, request.communicator);
   if (!initialized_everywhere) return false;
+  const bool igr = request.numerical_policy.stabilization.kind ==
+      RegularizationKind::igr;
+  const bool llf_policy = igr ||
+      CudaQualificationTestAccess::VerifyCurrentCandidateLlfPolicy(
+          *engine, llf_evidence);
+  const bool llf_policy_everywhere = All(llf_policy, request.communicator);
+  if (!llf_policy_everywhere)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+    {
+      std::cerr << "CUDA current-candidate LLF qualification failed order="
+                << order << " evidence=";
+      for (const double value : llf_evidence) std::cerr << ' ' << value;
+      std::cerr << '\n';
+    }
+    return false;
+  }
   const bool jacobian = CudaQualificationTestAccess::VerifyAssemblerJacobian(
       *engine, jacobian_tolerance, jacobian_errors);
   const bool jacobian_everywhere = All(jacobian, request.communicator);
@@ -1737,8 +2395,6 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
     }
     return false;
   }
-  const bool igr = request.numerical_policy.stabilization.kind ==
-      RegularizationKind::igr;
   const bool coupled = !igr ||
       CudaQualificationTestAccess::VerifyIgrCouplingBlocks(
           *engine, coupling_norms);
@@ -1760,6 +2416,25 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
   const bool prepared = engine->PrepareStep(false, dt, snapshot, step);
   const bool prepared_everywhere = All(prepared, request.communicator);
   if (!prepared_everywhere) return false;
+  const bool work_accounting =
+      CudaQualificationTestAccess::VerifyPreparedWorkAccounting(
+          *engine, step, true, work_counts);
+  const bool work_accounting_everywhere = All(
+      work_accounting, request.communicator);
+  if (!work_accounting_everywhere)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+    {
+      std::cerr << "CUDA prepared work accounting failed order=" << order
+                << " regularization=" << (igr ? "igr" : "none")
+                << " counts=";
+      for (const int count : work_counts) std::cerr << ' ' << count;
+      std::cerr << '\n';
+    }
+    return false;
+  }
 
   CudaPreparedOutputMetadataV1 output{};
   const bool staged = engine->StagePreparedOutputMetadata(output, step);
@@ -1778,7 +2453,14 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
       provisional, request.communicator);
   if (!provisional_everywhere) return false;
   const bool committed = engine->FinalizeCommit(output, step);
-  const bool passed = committed && output.successful_commit;
+  const bool committed_work_accounting =
+      step.nonlinear_updates == work_counts[0] &&
+      step.trace_solves == work_counts[1] &&
+      step.linear_iterations == work_counts[2] &&
+      step.line_search_trials == work_counts[3] &&
+      step.rejected_line_search_trials == work_counts[4];
+  const bool passed = committed && output.successful_commit &&
+      committed_work_accounting;
   if (!passed)
   {
     int rank = 0;
@@ -1788,9 +2470,13 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
       std::cerr << "CUDA Euler algebra qualification failed order=" << order
                 << " regularization=" << (igr ? "igr" : "none")
                 << " initialized=" << initialized
+                << " llf_policy=" << llf_policy
                 << " jacobian=" << jacobian
                 << " coupling=" << coupled
                 << " prepared=" << prepared
+                << " work_accounting=" << work_accounting
+                << " committed_work_accounting="
+                << committed_work_accounting
                 << " jacobian_errors=";
       for (const double error : jacobian_errors) std::cerr << ' ' << error;
       std::cerr << " coupling_norms=" << coupling_norms[0] << ' '
@@ -2126,6 +2812,173 @@ bool CheckIndependentIgrConservation(const int order)
   return passed;
 }
 
+bool CheckConventionalConservationGateRollback(const int order,
+                                               const int ranks)
+{
+  // One focused rank-one/p1 case gives an analytic, source-only defect.  The
+  // ordinary p1-p3/rank-one/rank-two lifecycle cases below retain the broad
+  // supported-surface coverage without repeating this rollback fixture.
+  if (order != 1 || ranks != 1) return true;
+
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::nonzero, InitialMode::constant);
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::none);
+  // This admits the initial iterate as the nonlinear candidate.  With a
+  // periodic constant state, no physical boundary flux exists and U^n=U^{n+1};
+  // the four conservation balances are therefore exactly -dt*integral(S).
+  request.numerical_policy.nonlinear_relative_tolerance = 2.0;
+  constexpr double dt = 1.0e-5;
+
+  const auto run = [&](const double conservation_tolerance,
+                       const bool expect_conservation,
+                       CudaPreparedEulerConservationGateCapture& capture,
+                       CudaStepEvidence& rollback) -> bool
+  {
+    request.numerical_policy.conservation_relative_tolerance =
+        conservation_tolerance;
+    if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+        ContractStatus::accepted)
+      return false;
+    CudaConfig config = MakeDirectConfig(request, ranks, order);
+    auto engine = std::make_unique<PersistentCudaSmoothEulerEngine<
+        BorrowedCudaRank1OneGpuRuntimeSelection>>(config);
+    CudaRunEvidence initialization{};
+    if (!All(engine->Initialize(initialization), request.communicator) ||
+        engine->contract() == nullptr)
+      return false;
+    std::vector<double> committed_before(fields.initial.size(), -1.0);
+    const bool exported_before = engine->ExportCommittedInterior(
+        CudaMutableHostL2Output{
+            committed_before.data(), fields.volume_scalar_count, components});
+    const auto before = engine->contract()->coordinates();
+    CudaPrecommitSnapshot snapshot{};
+    CudaStepEvidence step{};
+    const bool prepared = engine->PrepareStep(false, dt, snapshot, step);
+    if (!All(prepared, request.communicator)) return false;
+    const bool captured = prepared &&
+        CudaQualificationTestAccess::CapturePreparedEulerConservationGate(
+            *engine, capture);
+    const bool gate_state = captured && snapshot.numerical_candidate_ready &&
+        capture.pending_active && capture.staging_retained &&
+        capture.candidate_ready && capture.nonlinear_updates == 0 &&
+        capture.conservation == expect_conservation &&
+        capture.success == expect_conservation &&
+        capture.prestage_allowed == expect_conservation &&
+        capture.reason == (expect_conservation
+            ? FailureReason::none : FailureReason::success_gate);
+
+    CudaPreparedOutputMetadataV1 output{};
+    const bool staged = engine->StagePreparedOutputMetadata(output, step);
+    const bool staging_state = staged == expect_conservation;
+    const bool aborted = engine->AbortPrepared(
+        output, FailureReason::backend_failure, rollback);
+    const auto after = engine->contract()->coordinates();
+    std::vector<double> committed_after(fields.initial.size(), -2.0);
+    const bool exported_after = engine->ExportCommittedInterior(
+        CudaMutableHostL2Output{
+            committed_after.data(), fields.volume_scalar_count, components});
+    const auto& telemetry = engine->contract()->telemetry();
+    const bool rolled_back = aborted && !rollback.committed &&
+        rollback.retry_available && rollback.coordinates_preserved &&
+        rollback.committed_bytes_preserved &&
+        rollback.before_interior_hash == rollback.after_interior_hash &&
+        rollback.before_trace_hash == rollback.after_trace_hash &&
+        dg::hdg::runtime::detail::SameCoordinates(before, after) &&
+        dg::hdg::runtime::detail::SameCoordinates(
+            rollback.before, rollback.after) &&
+        exported_before && exported_after &&
+        committed_before == fields.initial &&
+        committed_after == committed_before &&
+        engine->contract()->status() == RunStatus::retry_available &&
+        telemetry.commits == 0 && telemetry.rollbacks == 1 &&
+        !output.candidate_frozen && !output.checkpoint_staged &&
+        !output.output_staged && !output.successful_commit;
+    return All(
+        prepared && captured && gate_state && staging_state && rolled_back,
+        request.communicator);
+  };
+
+  CudaPreparedEulerConservationGateCapture relaxed{};
+  CudaStepEvidence relaxed_rollback{};
+  const bool relaxed_run = run(1.0e-4, true, relaxed, relaxed_rollback);
+  const std::array<double, 5> expected_balance{{
+      -2.5e-6, -1.25e-6, 1.875e-6, -3.75e-6, 0.0}};
+  const std::array<double, 5> expected_scale{{
+      2.5e-6, 1.25e-6, 1.875e-6, 3.75e-6, 0.0}};
+  const auto close = [](const double actual, const double expected)
+  {
+    return std::isfinite(actual) &&
+        std::abs(actual - expected) <=
+            2.0e-12 * (1.0 + std::abs(expected));
+  };
+  bool analytic = relaxed_run && close(relaxed.production_local[10], 1.0) &&
+      relaxed.production_local[11] == 1.0;
+  double production_maximum_error = 0.0;
+  double production_maximum_relative_error = 0.0;
+  for (std::size_t component = 0; analytic && component < 5; ++component)
+  {
+    analytic = close(relaxed.production_local[component],
+                     expected_balance[component]) &&
+        close(relaxed.production_local[5 + component],
+              expected_scale[component]);
+    if (component < 4)
+    {
+      const double error = std::abs(relaxed.production_local[component]);
+      production_maximum_error = std::max(
+          production_maximum_error, error);
+      production_maximum_relative_error = std::max(
+          production_maximum_relative_error,
+          dg::hdg::generic::EulerHdgConservationRelativeError(
+              error, relaxed.production_local[5 + component],
+              relaxed.production_local[10]));
+    }
+  }
+  analytic = analytic && production_maximum_relative_error > 1.0e-8 &&
+      production_maximum_relative_error < 1.0e-4 &&
+      relaxed.production_local[4] == 0.0 &&
+      relaxed.production_local[9] == 0.0 &&
+      close(relaxed.lifecycle_maximum_error, production_maximum_error) &&
+      close(relaxed.lifecycle_maximum_relative_error,
+            production_maximum_relative_error);
+
+  CudaPreparedEulerConservationGateCapture tight{};
+  CudaStepEvidence tight_rollback{};
+  const double tight_tolerance =
+      0.25 * production_maximum_relative_error;
+  const bool tight_run = analytic && tight_tolerance > 0.0 &&
+      run(tight_tolerance, false, tight, tight_rollback);
+  bool tight_balance_parity = tight_run;
+  for (std::size_t index = 0;
+       tight_balance_parity && index < tight.production_local.size(); ++index)
+    tight_balance_parity = close(
+        tight.production_local[index], relaxed.production_local[index]);
+  const bool rejected_by_measured_gate = tight_balance_parity &&
+      close(tight.lifecycle_maximum_error, production_maximum_error) &&
+      close(tight.lifecycle_maximum_relative_error,
+            production_maximum_relative_error) &&
+      tight.lifecycle_maximum_relative_error > tight_tolerance;
+  const bool passed = All(
+      analytic && rejected_by_measured_gate, request.communicator);
+  if (!passed)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+      std::cerr << "CUDA conventional conservation gate/rollback failed"
+                << " relaxed_run=" << relaxed_run
+                << " analytic=" << analytic
+                << " tight_run=" << tight_run
+                << " measured=" << production_maximum_relative_error
+                << " tight_tolerance=" << tight_tolerance
+                << " tight_lifecycle="
+                << tight.lifecycle_maximum_relative_error << '\n';
+  }
+  return passed;
+}
+
 bool CheckEulerAlgebra(const int order, const int ranks)
 {
   mfem::ParMesh periodic_mesh = MakePeriodicMesh();
@@ -2206,6 +3059,63 @@ bool CheckEulerAlgebra(const int order, const int ranks)
       igr_periodic && igr_physical;
 }
 
+bool CheckZeroUpdateFinalReconstruction(const int order)
+{
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::empty, InitialMode::constant);
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::none);
+  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+      ContractStatus::accepted)
+    return false;
+
+  GenericEulerHdgCudaSession session;
+  const auto initialization = session.Initialize(request);
+  const bool initialized = All(
+      initialization.status == HdgEulerSessionStatus::initialized,
+      request.communicator);
+  if (!initialized) return false;
+
+  GenericEulerCudaPreparedStep authority;
+  GenericEulerHdgCudaSession::prepared_output_type output{};
+  constexpr double dt = 1.0e-5;
+  const auto prepared_result = session.Prepare(dt, authority, output);
+  const bool prepared = All(
+      prepared_result.status == HdgEulerSessionStatus::prepared,
+      request.communicator);
+  if (!prepared) return false;
+  const bool reconstruction =
+      CudaQualificationTestAccess::VerifyZeroUpdateFinalReconstruction(
+          session);
+  std::vector<double> candidate(fields.initial.size(),
+                                std::numeric_limits<double>::quiet_NaN());
+  const bool exported = session.ExportPreparedInterior(
+      authority, output,
+      CudaMutableHostL2Output{
+          candidate.data(), fields.volume_scalar_count, components});
+  const bool unchanged = candidate == fields.initial;
+  const auto aborted = session.Abort(std::move(authority), output);
+  const bool aborted_everywhere = All(
+      aborted.status == HdgEulerSessionStatus::aborted,
+      request.communicator);
+  const bool passed = All(
+      reconstruction && exported && unchanged && aborted_everywhere,
+      request.communicator);
+  if (!passed)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+      std::cerr << "CUDA zero-update final reconstruction failed order="
+                << order << " reconstruction=" << reconstruction
+                << " exported=" << exported << " unchanged=" << unchanged
+                << " aborted=" << aborted_everywhere << '\n';
+  }
+  return passed;
+}
+
 bool SameValues(const std::vector<double>& left,
                 const std::vector<double>& right)
 {
@@ -2234,6 +3144,35 @@ bool DifferentValues(const std::vector<double>& left,
 {
   return left.size() == right.size() &&
       !std::equal(left.begin(), left.end(), right.begin());
+}
+
+bool SameTransferAccounting(const CudaTransferTotals& before,
+                            const CudaTransferTotals& after)
+{
+  return before.host_to_device_bytes == after.host_to_device_bytes &&
+      before.device_to_host_bytes == after.device_to_host_bytes &&
+      before.device_to_device_bytes == after.device_to_device_bytes &&
+      before.mpi_staging_bytes == after.mpi_staging_bytes &&
+      before.synchronization_events == after.synchronization_events &&
+      before.event_count == after.event_count &&
+      before.complete == after.complete;
+}
+
+bool ExactIgrFieldExportTransfer(const CudaTransferTotals& before,
+                                 const CudaTransferTotals& after,
+                                 const std::size_t scalar_count)
+{
+  constexpr std::size_t published_components = components + 1;
+  const std::size_t expected_bytes =
+      published_components * scalar_count * sizeof(double);
+  return before.complete && after.complete &&
+      after.host_to_device_bytes == before.host_to_device_bytes &&
+      after.device_to_host_bytes ==
+          before.device_to_host_bytes + expected_bytes &&
+      after.device_to_device_bytes == before.device_to_device_bytes &&
+      after.mpi_staging_bytes == before.mpi_staging_bytes &&
+      after.synchronization_events == before.synchronization_events + 1 &&
+      after.event_count == before.event_count + 1;
 }
 
 bool GlobalSourceOnlyResponseNorm(
@@ -2542,15 +3481,88 @@ bool CheckLifecycle(const int order, const bool physical,
 
   GenericEulerHdgCudaSession session;
   const auto initialized = session.Initialize(request);
+  const bool igr = kind == RegularizationKind::igr;
+  const double unwritten = std::numeric_limits<double>::quiet_NaN();
+  const auto finite = [](const std::vector<double>& values)
+  {
+    return std::all_of(values.begin(), values.end(),
+        [](const double value) { return std::isfinite(value); });
+  };
+  const auto export_committed =
+      [&](std::vector<double>& conservative, std::vector<double>& sigma,
+          bool& exact_transfer)
+  {
+    if (!igr)
+    {
+      exact_transfer = true;
+      return session.ExportCommittedInterior(
+          CudaMutableHostL2Output{conservative.data(),
+                                  fields.volume_scalar_count, components});
+    }
+    const CudaTransferTotals before = CudaTransportPolicy::Accounting();
+    const bool exported = session.ExportCommittedFields(
+        HdgEulerHostInteriorFields{conservative.data(), sigma.data(),
+                                   fields.volume_scalar_count});
+    const CudaTransferTotals after = CudaTransportPolicy::Accounting();
+    exact_transfer = ExactIgrFieldExportTransfer(
+        before, after, fields.volume_scalar_count);
+    return exported;
+  };
+  const auto export_prepared =
+      [&](const GenericEulerCudaPreparedStep& authority,
+          const GenericEulerHdgCudaSession::prepared_output_type& output,
+          std::vector<double>& conservative, std::vector<double>& sigma,
+          bool& exact_transfer)
+  {
+    if (!igr)
+    {
+      exact_transfer = true;
+      return session.ExportPreparedInterior(
+          authority, output,
+          CudaMutableHostL2Output{conservative.data(),
+                                  fields.volume_scalar_count, components});
+    }
+    const CudaTransferTotals before = CudaTransportPolicy::Accounting();
+    const bool exported = session.ExportPreparedFields(
+        authority, output,
+        HdgEulerHostInteriorFields{conservative.data(), sigma.data(),
+                                   fields.volume_scalar_count});
+    const CudaTransferTotals after = CudaTransportPolicy::Accounting();
+    exact_transfer = ExactIgrFieldExportTransfer(
+        before, after, fields.volume_scalar_count);
+    return exported;
+  };
   std::vector<double> committed_initial(expected_initial.size(), -1.0);
+  std::vector<double> sigma_initial(
+      igr ? fields.volume_scalar_count : 0, unwritten);
   const bool initialized_everywhere = All(
       initialized.status == HdgEulerSessionStatus::initialized,
       request.communicator);
   if (!initialized_everywhere) return false;
-  const bool initial_export = session.ExportCommittedInterior(
-      CudaMutableHostL2Output{
-          committed_initial.data(), fields.volume_scalar_count, components});
-  if (!All(initial_export && SameValues(committed_initial, expected_initial),
+  bool initial_transfer = false;
+  const bool initial_export = export_committed(
+      committed_initial, sigma_initial, initial_transfer);
+  bool rejected_bad_extent = true;
+  if (igr)
+  {
+    std::vector<double> bad_conservative(expected_initial.size(), 17.0);
+    std::vector<double> bad_sigma(fields.volume_scalar_count, 19.0);
+    const CudaTransferTotals before = CudaTransportPolicy::Accounting();
+    const bool bad_export = fields.volume_scalar_count == 0 ||
+        session.ExportCommittedFields(HdgEulerHostInteriorFields{
+            bad_conservative.data(), bad_sigma.data(),
+            fields.volume_scalar_count - 1});
+    const CudaTransferTotals after = CudaTransportPolicy::Accounting();
+    rejected_bad_extent = fields.volume_scalar_count > 0 && !bad_export &&
+        std::all_of(bad_conservative.begin(), bad_conservative.end(),
+                    [](const double value) { return value == 17.0; }) &&
+        std::all_of(bad_sigma.begin(), bad_sigma.end(),
+                    [](const double value) { return value == 19.0; }) &&
+        SameTransferAccounting(before, after);
+  }
+  if (!All(initial_export && initial_transfer && rejected_bad_extent &&
+               SameValues(committed_initial, expected_initial) &&
+               (!igr || finite(sigma_initial)),
            request.communicator))
   {
     return false;
@@ -2570,21 +3582,24 @@ bool CheckLifecycle(const int order, const bool physical,
   const auto first_prepared = session.Prepare(
       dt, first_authority, first_output);
   std::vector<double> first_candidate(expected_initial.size(), -2.0);
+  std::vector<double> sigma_first_candidate(
+      igr ? fields.volume_scalar_count : 0, unwritten);
   const bool first_prepared_everywhere = All(
       first_prepared.status == HdgEulerSessionStatus::prepared,
       request.communicator);
   if (!first_prepared_everywhere) return false;
-  const bool first_export = session.ExportPreparedInterior(
-      first_authority, first_output,
-      CudaMutableHostL2Output{first_candidate.data(),
-                             fields.volume_scalar_count, components});
+  bool first_transfer = false;
+  const bool first_export = export_prepared(
+      first_authority, first_output, first_candidate,
+      sigma_first_candidate, first_transfer);
   const bool expected_update = physical
       ? (source_mode != SourceMode::nonzero ||
          DifferentValues(first_candidate, committed_initial))
       : ExpectedPeriodicSourceResponse(
             first_candidate, committed_initial, expected_source,
             fields.volume_scalar_count, source_mode, initial_mode, dt);
-  if (!All(first_export && expected_update,
+  if (!All(first_export && first_transfer && expected_update &&
+               (!igr || finite(sigma_first_candidate)),
            request.communicator))
   {
     return false;
@@ -2592,14 +3607,18 @@ bool CheckLifecycle(const int order, const bool physical,
   const auto aborted = session.Abort(
       std::move(first_authority), first_output);
   std::vector<double> after_abort(expected_initial.size(), -3.0);
+  std::vector<double> sigma_after_abort(
+      igr ? fields.volume_scalar_count : 0, unwritten);
   const bool aborted_everywhere = All(
       aborted.status == HdgEulerSessionStatus::aborted,
       request.communicator);
   if (!aborted_everywhere) return false;
-  const bool abort_export = session.ExportCommittedInterior(
-      CudaMutableHostL2Output{
-          after_abort.data(), fields.volume_scalar_count, components});
-  if (!All(abort_export && SameValues(after_abort, committed_initial) &&
+  bool abort_transfer = false;
+  const bool abort_export = export_committed(
+      after_abort, sigma_after_abort, abort_transfer);
+  if (!All(abort_export && abort_transfer &&
+               SameValues(after_abort, committed_initial) &&
+               (!igr || SameValues(sigma_after_abort, sigma_initial)) &&
                session.coordinates().step == before.step &&
                session.coordinates().generation == before.generation &&
                session.coordinates().time == before.time,
@@ -2613,15 +3632,20 @@ bool CheckLifecycle(const int order, const bool physical,
   const auto retry_prepared = session.Prepare(
       dt, retry_authority, retry_output);
   std::vector<double> retry_candidate(expected_initial.size(), -4.0);
+  std::vector<double> sigma_retry_candidate(
+      igr ? fields.volume_scalar_count : 0, unwritten);
   const bool retry_prepared_everywhere = All(
       retry_prepared.status == HdgEulerSessionStatus::prepared,
       request.communicator);
   if (!retry_prepared_everywhere) return false;
-  const bool retry_export = session.ExportPreparedInterior(
-      retry_authority, retry_output,
-      CudaMutableHostL2Output{retry_candidate.data(),
-                             fields.volume_scalar_count, components});
-  if (!All(retry_export && NearValues(first_candidate, retry_candidate),
+  bool retry_transfer = false;
+  const bool retry_export = export_prepared(
+      retry_authority, retry_output, retry_candidate,
+      sigma_retry_candidate, retry_transfer);
+  if (!All(retry_export && retry_transfer &&
+               NearValues(first_candidate, retry_candidate) &&
+               (!igr || NearValues(sigma_first_candidate,
+                                   sigma_retry_candidate)),
            request.communicator))
   {
     return false;
@@ -2632,18 +3656,23 @@ bool CheckLifecycle(const int order, const bool physical,
   const auto committed = session.Commit(
       std::move(retry_authority), retry_output);
   std::vector<double> committed_final(expected_initial.size(), -5.0);
+  std::vector<double> sigma_committed_final(
+      igr ? fields.volume_scalar_count : 0, unwritten);
   const bool committed_everywhere = All(
       committed.status == HdgEulerSessionStatus::committed,
       request.communicator);
   if (!committed_everywhere) return false;
-  const bool final_export = session.ExportCommittedInterior(
-      CudaMutableHostL2Output{
-          committed_final.data(), fields.volume_scalar_count, components});
+  bool final_transfer = false;
+  const bool final_export = export_committed(
+      committed_final, sigma_committed_final, final_transfer);
   const auto after = session.coordinates();
   const bool boundary_coverage = BoundaryCoverage(
       boundary, physical, request.communicator);
   const bool passed = All(
-      final_export && SameValues(committed_final, retry_candidate) &&
+      final_export && final_transfer &&
+          SameValues(committed_final, retry_candidate) &&
+          (!igr || SameValues(sigma_committed_final,
+                              sigma_retry_candidate)) &&
           after.step == before.step + 1 &&
           after.generation == before.generation + 1 &&
           after.time == before.time + dt &&
@@ -2656,6 +3685,270 @@ bool CheckLifecycle(const int order, const bool physical,
   const bool qualified = All(passed && response_ready, request.communicator);
   if (qualified) committed_result = std::move(committed_final);
   return qualified;
+}
+
+bool CheckRejectedArmijoRollback(const int order, const int ranks)
+{
+  // The direct-to-workspace trial kernel is shared by every generic order and
+  // rank count.  Exercise its rejected-trial restoration once, without
+  // duplicating the existing p1-p3/rank1-rank2 lifecycle matrix.
+  if (order != 1 || ranks != 1) return true;
+
+  constexpr double dt = 0.2;
+  constexpr double control_armijo_constant = 1.0e-4;
+  constexpr double strict_armijo_constant = 0.99;
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::nonzero, InitialMode::smooth_periodic);
+  const std::vector<double> expected_initial = fields.initial;
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::none);
+  request.numerical_policy.armijo_constant = control_armijo_constant;
+  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+      ContractStatus::accepted)
+    return false;
+
+  std::array<int, 6> control_work{};
+  {
+    GenericEulerHdgCudaSession control;
+    const auto initialized = control.Initialize(request);
+    if (!All(initialized.status == HdgEulerSessionStatus::initialized,
+             request.communicator))
+      return false;
+
+    GenericEulerCudaPreparedStep authority;
+    GenericEulerHdgCudaSession::prepared_output_type output{};
+    const auto prepared = control.Prepare(dt, authority, output);
+    if (!All(prepared.status == HdgEulerSessionStatus::prepared,
+             request.communicator))
+    {
+      std::cerr << "CUDA rejected-Armijo control prepare status="
+                << static_cast<int>(prepared.status) << '\n';
+      return false;
+    }
+    const bool accounted =
+        CudaQualificationTestAccess::VerifyPreparedWorkAccounting(
+            control, true, control_work);
+    const auto aborted = control.Abort(std::move(authority), output);
+    if (!All(accounted && control_work[0] > 0 && control_work[2] > 0 &&
+                 control_work[3] == control_work[0] &&
+                 control_work[4] == 0 &&
+                 aborted.status == HdgEulerSessionStatus::aborted,
+             request.communicator))
+    {
+      std::cerr << "CUDA rejected-Armijo control work="
+                << control_work[0] << '/' << control_work[1] << '/'
+                << control_work[2] << '/' << control_work[3] << '/'
+                << control_work[4] << '/' << control_work[5]
+                << " accounted=" << accounted << " abort="
+                << static_cast<int>(aborted.status) << '\n';
+      return false;
+    }
+  }
+
+  // The control and strict runs are otherwise identical.  Therefore their
+  // first differing line-search decision is an Armijo decision: candidate
+  // admissibility does not depend on this coefficient.
+  request.numerical_policy.armijo_constant = strict_armijo_constant;
+  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+      ContractStatus::accepted)
+    return false;
+
+  GenericEulerHdgCudaSession session;
+  const auto initialized = session.Initialize(request);
+  if (!All(initialized.status == HdgEulerSessionStatus::initialized,
+           request.communicator))
+    return false;
+
+  std::vector<double> committed_initial(expected_initial.size(), -1.0);
+  const bool initial_export = session.ExportCommittedInterior(
+      CudaMutableHostL2Output{committed_initial.data(),
+                              fields.volume_scalar_count, components});
+  if (!All(initial_export && SameValues(committed_initial, expected_initial),
+           request.communicator))
+    return false;
+
+  const auto before = session.coordinates();
+  GenericEulerCudaPreparedStep first_authority;
+  GenericEulerHdgCudaSession::prepared_output_type first_output{};
+  const auto first_prepared = session.Prepare(
+      dt, first_authority, first_output);
+  if (!All(first_prepared.status == HdgEulerSessionStatus::prepared,
+           request.communicator))
+  {
+    std::cerr << "CUDA rejected-Armijo strict prepare status="
+              << static_cast<int>(first_prepared.status) << '\n';
+    return false;
+  }
+
+  std::array<int, 6> first_work{};
+  const bool first_work_accounted =
+      CudaQualificationTestAccess::VerifyPreparedWorkAccounting(
+          session, true, first_work);
+  std::vector<double> first_candidate(expected_initial.size(), -2.0);
+  const bool first_export = session.ExportPreparedInterior(
+      first_authority, first_output,
+      CudaMutableHostL2Output{first_candidate.data(),
+                              fields.volume_scalar_count, components});
+  const auto first_descriptor = first_output.descriptor;
+  const auto first_local_interior_hash = first_output.local_interior_hash;
+  const auto first_local_trace_hash = first_output.local_trace_hash;
+  const dg::hdg::runtime::StateHash empty_hash{};
+  const bool rejected_armijo = first_work_accounted &&
+      first_work[0] > 0 && first_work[2] > 0 && first_work[4] > 0 &&
+      first_work[3] == first_work[0] + first_work[4] &&
+      first_work[1] == first_work[0] + 1;
+  const bool first_identity = first_export &&
+      first_output.candidate_frozen && first_output.checkpoint_staged &&
+      first_output.staging_range.complete &&
+      !first_output.output_staged && !first_output.successful_commit &&
+      first_descriptor.successful_commit &&
+      first_descriptor.interior_hash != empty_hash &&
+      first_descriptor.trace_hash != empty_hash &&
+      first_local_interior_hash != empty_hash &&
+      first_local_trace_hash != empty_hash;
+  const auto aborted = session.Abort(
+      std::move(first_authority), first_output);
+  if (!All(rejected_armijo && first_identity &&
+               aborted.status == HdgEulerSessionStatus::aborted,
+           request.communicator))
+  {
+    std::cerr << "CUDA rejected-Armijo strict work="
+              << first_work[0] << '/' << first_work[1] << '/'
+              << first_work[2] << '/' << first_work[3] << '/'
+              << first_work[4] << '/' << first_work[5]
+              << " accounted=" << first_work_accounted
+              << " identity=" << first_identity << " abort="
+              << static_cast<int>(aborted.status) << '\n';
+    return false;
+  }
+
+  std::vector<double> after_abort(expected_initial.size(), -3.0);
+  const bool abort_export = session.ExportCommittedInterior(
+      CudaMutableHostL2Output{after_abort.data(),
+                              fields.volume_scalar_count, components});
+  const auto after_abort_coordinates = session.coordinates();
+  if (!All(abort_export && SameValues(after_abort, committed_initial) &&
+               after_abort_coordinates.time == before.time &&
+               after_abort_coordinates.dt == before.dt &&
+               after_abort_coordinates.step == before.step &&
+               after_abort_coordinates.generation == before.generation,
+           request.communicator))
+  {
+    std::cerr << "CUDA rejected-Armijo abort rollback=" << abort_export
+              << '/' << SameValues(after_abort, committed_initial) << ' '
+              << after_abort_coordinates.time << '/'
+              << after_abort_coordinates.dt << '/'
+              << after_abort_coordinates.step << '/'
+              << after_abort_coordinates.generation << " expected="
+              << before.time << '/' << before.dt << '/' << before.step
+              << '/' << before.generation << '\n';
+    return false;
+  }
+
+  GenericEulerCudaPreparedStep retry_authority;
+  GenericEulerHdgCudaSession::prepared_output_type retry_output{};
+  const auto retry_prepared = session.Prepare(
+      dt, retry_authority, retry_output);
+  if (!All(retry_prepared.status == HdgEulerSessionStatus::prepared,
+           request.communicator))
+  {
+    std::cerr << "CUDA rejected-Armijo retry prepare status="
+              << static_cast<int>(retry_prepared.status) << '\n';
+    return false;
+  }
+
+  std::array<int, 6> retry_work{};
+  const bool retry_work_accounted =
+      CudaQualificationTestAccess::VerifyPreparedWorkAccounting(
+          session, true, retry_work);
+  std::vector<double> retry_candidate(expected_initial.size(), -4.0);
+  const bool retry_export = session.ExportPreparedInterior(
+      retry_authority, retry_output,
+      CudaMutableHostL2Output{retry_candidate.data(),
+                              fields.volume_scalar_count, components});
+  auto normalized_retry_descriptor = retry_output.descriptor;
+  normalized_retry_descriptor.cursor = first_descriptor.cursor;
+  normalized_retry_descriptor.coordinates.cursor =
+      first_descriptor.coordinates.cursor;
+  normalized_retry_descriptor.coordinate_fingerprint =
+      first_descriptor.coordinate_fingerprint;
+  const bool expected_retry_identity =
+      first_output.attempt.retry_index == 0 &&
+      retry_output.attempt.retry_index == 1 &&
+      retry_output.attempt.sequence == first_output.attempt.sequence + 1 &&
+      retry_output.attempt.committed_step ==
+          first_output.attempt.committed_step &&
+      retry_output.attempt.committed_generation ==
+          first_output.attempt.committed_generation &&
+      dg::hdg::runtime::detail::DoubleBits(retry_output.attempt.dt) ==
+          dg::hdg::runtime::detail::DoubleBits(first_output.attempt.dt) &&
+      first_descriptor.cursor == first_output.attempt.sequence &&
+      first_descriptor.coordinates.cursor == first_output.attempt.sequence &&
+      retry_output.descriptor.cursor == retry_output.attempt.sequence &&
+      retry_output.descriptor.coordinates.cursor ==
+          retry_output.attempt.sequence;
+  const bool retry_identity = retry_work_accounted &&
+      retry_work == first_work && retry_export &&
+      SameValues(retry_candidate, first_candidate) &&
+      expected_retry_identity &&
+      dg::hdg::runtime::detail::SameCheckpoint(
+          normalized_retry_descriptor, first_descriptor) &&
+      retry_output.local_interior_hash == first_local_interior_hash &&
+      retry_output.local_trace_hash == first_local_trace_hash;
+  if (!All(retry_identity, request.communicator))
+  {
+    std::cerr << "CUDA rejected-Armijo retry identity="
+              << retry_work_accounted << '/' << (retry_work == first_work)
+              << '/' << retry_export << '/'
+              << SameValues(retry_candidate, first_candidate) << '/'
+              << expected_retry_identity << '/'
+              << dg::hdg::runtime::detail::SameCheckpoint(
+                     normalized_retry_descriptor, first_descriptor)
+              << '/' << (retry_output.local_interior_hash ==
+                          first_local_interior_hash)
+              << '/' << (retry_output.local_trace_hash ==
+                          first_local_trace_hash) << '\n';
+    (void)session.Abort(std::move(retry_authority), retry_output);
+    return false;
+  }
+
+  const bool acknowledged = session.AcknowledgePreparedOutput(
+      retry_authority, retry_output);
+  if (!All(acknowledged, request.communicator))
+  {
+    std::cerr << "CUDA rejected-Armijo retry acknowledge failed\n";
+    (void)session.Abort(std::move(retry_authority), retry_output);
+    return false;
+  }
+  const auto committed = session.Commit(
+      std::move(retry_authority), retry_output);
+  if (!All(committed.status == HdgEulerSessionStatus::committed,
+           request.communicator))
+  {
+    std::cerr << "CUDA rejected-Armijo commit status="
+              << static_cast<int>(committed.status) << '\n';
+    return false;
+  }
+
+  std::vector<double> committed_final(expected_initial.size(), -5.0);
+  const bool final_export = session.ExportCommittedInterior(
+      CudaMutableHostL2Output{committed_final.data(),
+                              fields.volume_scalar_count, components});
+  const auto after = session.coordinates();
+  const bool final_ready = final_export &&
+      SameValues(committed_final, retry_candidate) &&
+      retry_output.successful_commit && after.step == before.step + 1 &&
+      after.generation == before.generation + 1 &&
+      after.time == before.time + dt && after.dt == dt;
+  if (!All(final_ready, request.communicator))
+    std::cerr << "CUDA rejected-Armijo final=" << final_export << '/'
+              << SameValues(committed_final, retry_candidate) << '/'
+              << retry_output.successful_commit << ' ' << after.time << '/'
+              << after.dt << '/' << after.step << '/' << after.generation
+              << '\n';
+  return All(final_ready, request.communicator);
 }
 
 int ParseOrder(const int argc, char* argv[])
@@ -2709,7 +4002,13 @@ int main(int argc, char* argv[])
       CheckMixedLoweredBoundaryPolicies(order);
   const bool independent_igr_conservation = order > 0 &&
       CheckIndependentIgrConservation(order);
+  const bool conventional_conservation_rollback = order > 0 &&
+      CheckConventionalConservationGateRollback(order, ranks);
   const bool euler_algebra = order > 0 && CheckEulerAlgebra(order, ranks);
+  const bool zero_update_final_reconstruction = order > 0 &&
+      CheckZeroUpdateFinalReconstruction(order);
+  const bool rejected_armijo_rollback = order > 0 &&
+      CheckRejectedArmijoRollback(order, ranks);
   const bool conventional_periodic = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::none, SourceMode::nonzero,
       InitialMode::constant,
@@ -2756,7 +4055,9 @@ int main(int argc, char* argv[])
   const bool passed = (ranks == 1 || ranks == 2) && All(
       admission && copied_initial_trace && all_seven_boundary_policies &&
       mixed_boundary_policies && independent_igr_conservation &&
-      euler_algebra &&
+      conventional_conservation_rollback &&
+      euler_algebra && zero_update_final_reconstruction &&
+      rejected_armijo_rollback &&
       conventional_periodic && conventional_physical &&
       igr_periodic && igr_physical && boundary_effect && source_equivalence);
   if (!passed)
@@ -2770,7 +4071,13 @@ int main(int argc, char* argv[])
               << " mixed_boundary_policies=" << mixed_boundary_policies
               << " independent_igr_conservation="
               << independent_igr_conservation
+              << " conventional_conservation_rollback="
+              << conventional_conservation_rollback
               << " euler_algebra=" << euler_algebra
+              << " zero_update_final_reconstruction="
+              << zero_update_final_reconstruction
+              << " rejected_armijo_rollback="
+              << rejected_armijo_rollback
               << " conventional_periodic=" << conventional_periodic
               << " conventional_physical=" << conventional_physical
               << " igr_periodic=" << igr_periodic

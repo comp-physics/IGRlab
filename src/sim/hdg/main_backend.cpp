@@ -17,6 +17,7 @@
 #include "numerics/hdg/generic/contract.hpp"
 #include "numerics/hdg/runtime/cpu/generic_euler.hpp"
 #include "sim/context/case_context.hpp"
+#include "sim/hdg/euler_output_fields.hpp"
 #include "sim/hdg/parallel_vtk.hpp"
 #include "sim/hdg/resolved_euler_case.hpp"
 #include "sim/hdg/state_io.hpp"
@@ -781,12 +782,6 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     {
       return Reject(request, "generic CPU session initialization failed");
     }
-    local_ok = session->ExportCommittedInterior(*published_state);
-    if (!CollectiveAll(request.communicator, local_ok))
-    {
-      return Reject(request, "initial committed-state export failed");
-    }
-
     std::unique_ptr<HdgTransactionalTimeAdapter> time_driver;
     try
     {
@@ -826,6 +821,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
                     "HDG time/output planner construction failed on at least one rank");
     }
 
+    std::unique_ptr<HdgEulerParaViewFields> output_fields;
     std::unique_ptr<HDGParaViewSeries> output;
     if (request.options.vtk_save)
     {
@@ -834,9 +830,29 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         : request.options.order + 1;
       try
       {
+        const int output_size = initial_state->Size();
+        if (output_size < 0 || published_state->Size() != output_size)
+        {
+          throw std::runtime_error("HDG Euler output-state extent mismatch");
+        }
+        if (output_size != 0)
+        {
+          const double* const source = initial_state->HostRead();
+          double* const destination = published_state->HostWrite();
+          if (source == nullptr || destination == nullptr)
+          {
+            throw std::runtime_error("HDG Euler output-state storage is null");
+          }
+          std::copy_n(source, output_size, destination);
+        }
+        output_fields = std::make_unique<HdgEulerParaViewFields>(
+            context->Mesh(), *collection, *published_state,
+            regularization.kind == RegularizationKind::igr,
+            request.case_config.gamma,
+            request.case_config.rk3_config.rho_min);
         const HDGParaViewRequest output_request{
           context->Mesh(),
-          {{"conservative", *published_state}},
+          output_fields->Fields(),
           {resolved_plan.output.prefix_path,
            resolved_plan.output.collection_name, vtk.format, levels,
            vtk.high_order_output}};
@@ -854,7 +870,35 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       }
       if (const auto initial = time_driver->InitialOutput())
       {
-        output->Write(Metadata(*initial, /*solver_step=*/0));
+        dg::hdg::generic::HdgEulerHostInteriorFields destination{};
+        local_ok = output_fields->FreshHostOutput(destination);
+        if (!CollectiveAll(request.communicator, local_ok))
+        {
+          return Reject(request,
+                        "initial Euler/IGR output view construction failed");
+        }
+        local_ok = session->ExportCommittedFields(destination);
+        if (!CollectiveAll(request.communicator, local_ok))
+        {
+          return Reject(request,
+                        "initial committed Euler/IGR field export failed");
+        }
+        local_ok = output_fields->UpdateDerived();
+        if (!CollectiveAll(request.communicator, local_ok))
+        {
+          return Reject(request,
+                        "initial derived Euler field construction failed");
+        }
+        try
+        {
+          output->Write(Metadata(*initial, /*solver_step=*/0));
+          local_ok = true;
+        }
+        catch (...) { local_ok = false; }
+        if (!CollectiveAll(request.communicator, local_ok))
+        {
+          return Reject(request, "initial HDG ParaView output failed");
+        }
       }
     }
 
@@ -901,25 +945,6 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         return Reject(request, "generic CPU prepared step failed");
       }
 
-      // Keep the pure time cursor pending until the candidate state has been
-      // staged in memory.  All ranks own a valid prepared token from here
-      // until the same collective Commit or Abort consumes it.
-      local_ok = session->ExportPreparedInterior(prepared, *published_state);
-      if (!CollectiveAll(request.communicator, local_ok))
-      {
-        local_ok = session->Abort(std::move(prepared)).status ==
-            GenericEulerCpuSessionStatus::aborted;
-        if (!CollectiveAll(request.communicator, local_ok))
-        {
-          time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
-          return Reject(
-              request,
-              "generic CPU prepared-step abort failed after export failure");
-        }
-        time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
-        return Reject(request, "prepared-state export failed");
-      }
-
       std::optional<HdgTransactionalTimeAdapter::OutputEvent> preview;
       try
       {
@@ -943,6 +968,56 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         }
         time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
         return Reject(request, "HDG output preview failed");
+      }
+      if (preview)
+      {
+        dg::hdg::generic::HdgEulerHostInteriorFields destination{};
+        local_ok = output_fields &&
+            output_fields->FreshHostOutput(destination);
+        if (!CollectiveAll(request.communicator, local_ok))
+        {
+          local_ok = session->Abort(std::move(prepared)).status ==
+              GenericEulerCpuSessionStatus::aborted;
+          if (!CollectiveAll(request.communicator, local_ok))
+          {
+            time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+            return Reject(
+                request,
+                "generic CPU prepared-step abort failed after field-export failure");
+          }
+          time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+          return Reject(request, "prepared Euler/IGR output view failed");
+        }
+        local_ok = session->ExportPreparedFields(prepared, destination);
+        if (!CollectiveAll(request.communicator, local_ok))
+        {
+          local_ok = session->Abort(std::move(prepared)).status ==
+              GenericEulerCpuSessionStatus::aborted;
+          if (!CollectiveAll(request.communicator, local_ok))
+          {
+            time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+            return Reject(
+                request,
+                "generic CPU prepared-step abort failed after field-export failure");
+          }
+          time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+          return Reject(request, "prepared Euler/IGR field export failed");
+        }
+        local_ok = output_fields->UpdateDerived();
+        if (!CollectiveAll(request.communicator, local_ok))
+        {
+          local_ok = session->Abort(std::move(prepared)).status ==
+              GenericEulerCpuSessionStatus::aborted;
+          if (!CollectiveAll(request.communicator, local_ok))
+          {
+            time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+            return Reject(
+                request,
+                "generic CPU prepared-step abort failed after derived-field failure");
+          }
+          time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+          return Reject(request, "prepared derived Euler field update failed");
+        }
       }
       local_ok = session->Commit(std::move(prepared)).status ==
           GenericEulerCpuSessionStatus::committed;

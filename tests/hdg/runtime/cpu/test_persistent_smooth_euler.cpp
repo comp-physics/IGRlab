@@ -1420,10 +1420,12 @@ bool AcceptedStepPasses(const CpuAcceptedEvidence& accepted,
       step.work.complete_assemblies ==
           1 + step.work.trial_reassemblies &&
       step.work.complete_condensations ==
-          step.work.accepted_newton_updates &&
+          step.work.accepted_newton_updates + 1 &&
       step.work.complete_factor_setups == step.work.complete_trace_solves &&
-      step.work.complete_trace_solves == step.work.accepted_newton_updates &&
-      step.work.complete_recoveries == step.work.accepted_newton_updates &&
+      step.work.complete_trace_solves ==
+          step.work.accepted_newton_updates + 1 &&
+      step.work.complete_recoveries ==
+          step.work.accepted_newton_updates + 1 &&
       step.transfers.host_to_device_bytes == 0 &&
       step.transfers.device_to_host_bytes == 0 &&
       step.transfers.mpi_staging_bytes == 0 &&
@@ -1791,7 +1793,7 @@ int RunFunctionalTuple(MPI_Comm communicator, const int rank, const int ranks,
                      functional_first.work.complete_factor_setups ==
                          functional_first.work.complete_trace_solves &&
                      functional_first.work.complete_trace_solves ==
-                         functional_first.work.accepted_newton_updates,
+                         functional_first.work.accepted_newton_updates + 1,
                  "functional step-1 solver-linked scientific/accounting gates");
 
   CpuCheckpoint uninterrupted_checkpoint;
@@ -2076,7 +2078,7 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
                      first_accepted.work.complete_factor_setups ==
                          first_accepted.work.complete_trace_solves &&
                      first_accepted.work.complete_trace_solves ==
-                         first_accepted.work.accepted_newton_updates &&
+                         first_accepted.work.accepted_newton_updates + 1 &&
                      first_accepted.finite_gate &&
                      first_accepted.admissibility_gate &&
                      first_accepted.recovery_gate &&
@@ -2186,15 +2188,15 @@ int RunTuple(MPI_Comm communicator, const int rank, const int ranks)
   checks.Require(accepted.work.complete_assemblies ==
                          1 + accepted.work.trial_reassemblies &&
                      accepted.work.complete_condensations ==
-                         accepted.work.accepted_newton_updates &&
+                         accepted.work.accepted_newton_updates + 1 &&
                      accepted.work.complete_factor_setups ==
                          accepted.work.complete_trace_solves &&
                      accepted.work.complete_factor_setups ==
-                         accepted.work.accepted_newton_updates &&
+                         accepted.work.accepted_newton_updates + 1 &&
                      accepted.work.complete_trace_solves ==
-                         accepted.work.accepted_newton_updates &&
+                         accepted.work.accepted_newton_updates + 1 &&
                      accepted.work.complete_recoveries ==
-                         accepted.work.accepted_newton_updates &&
+                         accepted.work.accepted_newton_updates + 1 &&
                      accepted.candidate_generation != 0 &&
                      accepted.committed_interior_after ==
                          terminal.accepted.interior_hash &&

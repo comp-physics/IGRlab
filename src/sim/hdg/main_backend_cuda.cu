@@ -18,6 +18,7 @@
 #include "numerics/hdg/generic/session_contract.hpp"
 #include "numerics/hdg/runtime/cuda/generic_euler.cuh"
 #include "sim/context/case_context.hpp"
+#include "sim/hdg/euler_output_fields.hpp"
 #include "sim/hdg/parallel_vtk.hpp"
 #include "sim/hdg/resolved_euler_case.hpp"
 #include "sim/hdg/state_io.hpp"
@@ -38,7 +39,6 @@ using dg::hdg::generic::RegularizationKind;
 using dg::hdg::generic::RegularizationSelection;
 using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
-using dg::hdg::runtime::cuda_w8a::CudaMutableHostL2Output;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
 
 bool IsRoot(const MPI_Comm communicator) noexcept
@@ -73,6 +73,19 @@ bool CollectiveAll(const MPI_Comm communicator, const bool local) noexcept
   return communicator != MPI_COMM_NULL &&
       MPI_Allreduce(&input, &output, 1, MPI_INT, MPI_MIN,
                     communicator) == MPI_SUCCESS && output == 1;
+}
+
+bool ExactBoolConsensus(const MPI_Comm communicator,
+                        const bool value) noexcept
+{
+  int ranks = 0;
+  const int input = value ? 1 : 0;
+  int count = 0;
+  return communicator != MPI_COMM_NULL &&
+      MPI_Comm_size(communicator, &ranks) == MPI_SUCCESS && ranks > 0 &&
+      MPI_Allreduce(&input, &count, 1, MPI_INT, MPI_SUM,
+                    communicator) == MPI_SUCCESS &&
+      (count == 0 || count == ranks);
 }
 
 bool ExactDoubleConsensus(const MPI_Comm communicator,
@@ -437,36 +450,6 @@ bool AbortPrepared(GenericEulerHdgCudaSession& session,
       HdgEulerSessionStatus::aborted;
 }
 
-bool FreshOutputView(mfem::ParGridFunction& published_state,
-                     const std::size_t scalar_count,
-                     CudaMutableHostL2Output& destination) noexcept
-{
-  destination = {};
-  try
-  {
-    constexpr std::size_t components =
-        dg::hdg::generic::euler_2d_conserved_components;
-    if (scalar_count > std::numeric_limits<std::size_t>::max() / components ||
-        published_state.Size() < 0 ||
-        static_cast<std::size_t>(published_state.Size()) !=
-            scalar_count * components)
-    {
-      return false;
-    }
-    if (scalar_count == 0)
-    {
-      destination = {nullptr, 0,
-                     dg::hdg::generic::euler_2d_conserved_components};
-      return true;
-    }
-    double* const coefficients = published_state.HostWrite();
-    destination = {coefficients, scalar_count,
-                   dg::hdg::generic::euler_2d_conserved_components};
-    return coefficients != nullptr;
-  }
-  catch (...) { return false; }
-}
-
 } // namespace
 
 int RunEulerMainBackend(const HdgEulerMainRequest& request)
@@ -694,9 +677,6 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     return Reject(request,
                   "CUDA HDG state projection or boundary lowering failed");
 
-  const std::size_t scalar_count = static_cast<std::size_t>(
-      volume_space->GetVSize() /
-      dg::hdg::generic::euler_2d_conserved_components);
   const BackendSelection backend{BackendKind::cuda, 0};
   ResolvedHdgEulerCasePlan resolved_plan{};
   resolved_plan.request = EulerHdgRequest{
@@ -721,16 +701,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   if (session.Initialize(resolved_plan.request).status !=
       HdgEulerSessionStatus::initialized)
     return Reject(request, "generic CUDA session initialization failed");
-  CudaMutableHostL2Output destination{};
-  if (!CollectiveAll(request.communicator,
-                     FreshOutputView(*published_state, scalar_count,
-                                     destination)))
-    return Reject(request, "initial CUDA committed-state output view failed");
-  local_ok = session.ExportCommittedInterior(destination);
-  if (!CollectiveAll(request.communicator, local_ok))
-    return Reject(request, "initial CUDA committed-state export failed");
-
   std::unique_ptr<HdgTransactionalTimeAdapter> time_driver;
+  std::unique_ptr<HdgEulerParaViewFields> output_fields;
   std::unique_ptr<HDGParaViewSeries> output;
   try
   {
@@ -762,8 +734,24 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     {
       const int levels = vtk.levels_of_detail >= 0 ? vtk.levels_of_detail
                                                      : request.options.order + 1;
+      const int output_size = initial_state->Size();
+      if (output_size < 0 || published_state->Size() != output_size)
+        throw std::runtime_error("CUDA HDG output-state extent mismatch");
+      if (output_size != 0)
+      {
+        const double* const source = initial_state->HostRead();
+        double* const destination = published_state->HostWrite();
+        if (source == nullptr || destination == nullptr)
+          throw std::runtime_error("CUDA HDG output-state storage is null");
+        std::copy_n(source, output_size, destination);
+      }
+      output_fields = std::make_unique<HdgEulerParaViewFields>(
+          context->Mesh(), *collection, *published_state,
+          regularization.kind == RegularizationKind::igr,
+          request.case_config.gamma,
+          request.case_config.rk3_config.rho_min);
       output = std::make_unique<HDGParaViewSeries>(HDGParaViewRequest{
-          context->Mesh(), {{"conservative", *published_state}},
+          context->Mesh(), output_fields->Fields(),
           {resolved_plan.output.prefix_path,
            resolved_plan.output.collection_name, vtk.format, levels,
            vtk.high_order_output}});
@@ -773,16 +761,35 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   if (!CollectiveAll(request.communicator, time_driver != nullptr &&
       (!request.options.vtk_save || output != nullptr)))
     return Reject(request, "CUDA HDG time/output setup failed");
+
+  std::optional<HdgTransactionalTimeAdapter::OutputEvent> initial;
   try
   {
-    if (output)
-      if (const auto initial = time_driver->InitialOutput())
-        output->Write(Metadata(*initial, 0));
-    local_ok = true;
+    initial = time_driver->InitialOutput();
+    local_ok = !initial || output != nullptr;
   }
   catch (...) { local_ok = false; }
   if (!CollectiveAll(request.communicator, local_ok))
-    return Reject(request, "CUDA HDG initial ParaView output failed");
+    return Reject(request, "CUDA HDG initial output preview failed");
+  if (!ExactBoolConsensus(request.communicator, initial.has_value()))
+    return Reject(request, "CUDA HDG initial output differs between ranks");
+  if (initial)
+  {
+    dg::hdg::generic::HdgEulerHostInteriorFields destination{};
+    local_ok = output_fields && output_fields->FreshHostOutput(destination);
+    if (!CollectiveAll(request.communicator, local_ok))
+      return Reject(request, "initial CUDA committed-state output view failed");
+    local_ok = session.ExportCommittedFields(destination);
+    if (!CollectiveAll(request.communicator, local_ok))
+      return Reject(request, "initial CUDA committed-state export failed");
+    local_ok = output_fields->UpdateDerived();
+    if (!CollectiveAll(request.communicator, local_ok))
+      return Reject(request, "initial CUDA derived Euler field update failed");
+    try { output->Write(Metadata(*initial, 0)); local_ok = true; }
+    catch (...) { local_ok = false; }
+    if (!CollectiveAll(request.communicator, local_ok))
+      return Reject(request, "CUDA HDG initial ParaView output failed");
+  }
 
   while (!time_driver->Finished())
   {
@@ -821,37 +828,13 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       time_driver->RecordFailure(HdgStepFailurePhase::NonlinearSolve);
       return Reject(request, "generic CUDA prepared step failed");
     }
-    if (!CollectiveAll(request.communicator,
-                       FreshOutputView(*published_state, scalar_count,
-                                       destination)))
-    {
-      local_ok = AbortPrepared(session, authority, native_export);
-      time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
-      return Reject(request,
-          local_ok ? "CUDA prepared-state output view failed"
-                   : "CUDA prepared abort failed after output-view failure");
-    }
-    local_ok = session.ExportPreparedInterior(authority, native_export,
-                                              destination);
-    if (!CollectiveAll(request.communicator, local_ok))
-    {
-      local_ok = AbortPrepared(session, authority, native_export);
-      time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
-      return Reject(request,
-          local_ok ? "CUDA prepared-state export failed"
-                   : "CUDA prepared abort failed after export failure");
-    }
-    if (!session.AcknowledgePreparedOutput(authority, native_export))
-    {
-      local_ok = AbortPrepared(session, authority, native_export);
-      time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
-      return Reject(request,
-          local_ok ? "CUDA prepared output acknowledgement failed"
-                   : "CUDA prepared abort failed after acknowledgement failure");
-    }
 
     std::optional<HdgTransactionalTimeAdapter::OutputEvent> preview;
-    try { preview = time_driver->PreviewFinalizedOutput(); local_ok = true; }
+    try
+    {
+      preview = time_driver->PreviewFinalizedOutput();
+      local_ok = !preview || output != nullptr;
+    }
     catch (...) { local_ok = false; }
     if (!CollectiveAll(request.communicator, local_ok))
     {
@@ -861,20 +844,63 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
           local_ok ? "CUDA output preview failed"
                    : "CUDA prepared abort failed after preview failure");
     }
+    if (!ExactBoolConsensus(request.communicator, preview.has_value()))
+    {
+      local_ok = AbortPrepared(session, authority, native_export);
+      time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+      return Reject(request,
+          local_ok ? "CUDA output preview differs between ranks"
+                   : "CUDA prepared abort failed after preview disagreement");
+    }
+    if (preview)
+    {
+      dg::hdg::generic::HdgEulerHostInteriorFields destination{};
+      local_ok = output_fields && output_fields->FreshHostOutput(destination);
+      if (!CollectiveAll(request.communicator, local_ok))
+      {
+        local_ok = AbortPrepared(session, authority, native_export);
+        time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+        return Reject(request,
+            local_ok ? "CUDA prepared-state output view failed"
+                     : "CUDA prepared abort failed after output-view failure");
+      }
+      local_ok = session.ExportPreparedFields(authority, native_export,
+                                              destination);
+      if (!CollectiveAll(request.communicator, local_ok))
+      {
+        local_ok = AbortPrepared(session, authority, native_export);
+        time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+        return Reject(request,
+            local_ok ? "CUDA prepared-state export failed"
+                     : "CUDA prepared abort failed after export failure");
+      }
+      local_ok = output_fields->UpdateDerived();
+      if (!CollectiveAll(request.communicator, local_ok))
+      {
+        local_ok = AbortPrepared(session, authority, native_export);
+        time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+        return Reject(request,
+            local_ok ? "CUDA prepared derived-field update failed"
+                     : "CUDA prepared abort failed after derived-field failure");
+      }
+    }
+    if (!session.AcknowledgePreparedOutput(authority, native_export))
+    {
+      local_ok = AbortPrepared(session, authority, native_export);
+      time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+      return Reject(request,
+          local_ok ? "CUDA prepared output acknowledgement failed"
+                   : "CUDA prepared abort failed after acknowledgement failure");
+    }
     if (session.Commit(std::move(authority), native_export).status !=
         HdgEulerSessionStatus::committed)
       return Reject(request, "generic CUDA prepared commit failed");
-    // Publication remains post-commit: replace the staged physical candidate
-    // with the engine's committed bytes before finalizing time/output.
-    if (!CollectiveAll(request.communicator,
-                       FreshOutputView(*published_state, scalar_count,
-                                       destination)))
-      return Reject(request,
-                    "CUDA committed-state output view failed after commit");
-    local_ok = session.ExportCommittedInterior(destination);
-    if (!CollectiveAll(request.communicator, local_ok))
-      return Reject(request,
-                    "CUDA committed-state export failed after commit");
+    // Publication remains post-commit.  On an output step the explicit export
+    // copied the frozen candidate into this private host view, acknowledgement
+    // bound that export to the affine authority, and Commit published that
+    // exact candidate without mutating the host bytes.  A no-output step needs
+    // only the already-staged native metadata acknowledgement and never
+    // materializes the full interior on the host.
 
     std::optional<HdgTransactionalTimeAdapter::OutputEvent> finalized;
     try { finalized = time_driver->FinalizeSuccess(); local_ok = true; }

@@ -3,6 +3,7 @@
 #include <mfem.hpp>
 
 #include <array>
+#include <cmath>
 #include <limits>
 #include <type_traits>
 #include <vector>
@@ -17,6 +18,7 @@ using dg::hdg::generic::ContractStatus;
 using dg::hdg::generic::EulerBoundaryPolicy;
 using dg::hdg::generic::EulerBoundaryPolicyKind;
 using dg::hdg::generic::EulerHdgRequest;
+using dg::hdg::generic::EulerHdgConservationRelativeError;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::generic::ValidateEulerHdgRequest;
 
@@ -128,6 +130,22 @@ bool CheckPODSurface()
   return std::is_trivial<EulerHdgRequest>::value &&
       std::is_standard_layout<EulerHdgRequest>::value &&
       !std::is_polymorphic<EulerHdgRequest>::value;
+}
+
+bool CheckConservationNormalization()
+{
+  constexpr double error = 0.25;
+  constexpr double scale = 0.5;
+  constexpr double measure = 1.0;
+  constexpr double replication = 8.0;
+  const double unit = EulerHdgConservationRelativeError(
+      error, scale, measure);
+  const double replicated = EulerHdgConservationRelativeError(
+      replication * error, replication * scale,
+      replication * measure);
+  return unit == replicated && unit == 1.0 / 6.0 &&
+      std::isinf(EulerHdgConservationRelativeError(error, scale, 0.0)) &&
+      std::isinf(EulerHdgConservationRelativeError(-error, scale, measure));
 }
 
 bool CheckAcceptAndReject()
@@ -639,6 +657,7 @@ int main(int argc, char* argv[])
 {
   mfem::MPI_Session mpi(argc, argv);
   bool ok = CheckPODSurface();
+  const bool conservation_normalization = CheckConservationNormalization();
   const bool basic = CheckAcceptAndReject();
   const bool triangle = CheckTriangleRejection();
   const bool boundary = CheckBoundaryPolicyAdmission();
@@ -650,7 +669,8 @@ int main(int argc, char* argv[])
   const bool asymmetric_null = CheckAsymmetricNullMeshConvergence();
   const bool mismatch = CheckCollectiveFailureConvergence();
   const bool geometry = CheckCollectiveGeometryConvergence();
-  ok = ok && basic && triangle && boundary && boundary_mismatch &&
+  ok = ok && conservation_normalization && basic && triangle && boundary &&
+      boundary_mismatch &&
       mixed_boundary && igr && empty && physical_empty && asymmetric_null &&
       mismatch && geometry;
   return ok ? 0 : 1;

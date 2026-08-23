@@ -711,7 +711,8 @@ enum class CpuBorrowedEulerOperation : unsigned char
   commit = 1,
   abort = 2,
   export_prepared_buffer = 3,
-  export_prepared_grid_function = 4
+  export_prepared_grid_function = 4,
+  export_prepared_fields = 5
 };
 
 class CpuNumericsCore
@@ -754,6 +755,10 @@ public:
   bool ExportPreparedInterior(std::uint64_t, double*, std::size_t) const noexcept;
   bool ExportPreparedInterior(std::uint64_t,
                               mfem::ParGridFunction&) const noexcept;
+  bool ExportCommittedFields(
+      generic::HdgEulerHostInteriorFields) const noexcept;
+  bool ExportPreparedFields(
+      std::uint64_t, generic::HdgEulerHostInteriorFields) const noexcept;
   bool AdmitInitialization(bool facade_empty,
                            const CpuPersistentConfig&,
                            const RuntimeTupleDescriptor&) const noexcept;
@@ -807,6 +812,11 @@ private:
   bool AuditBorrowedEulerAssemblerJacobian(
       double relative_tolerance,
       std::array<double, 6>& relative_errors) noexcept;
+  bool AuditBorrowedEulerLlfPolicy(
+      double& base_stabilization, double& refreshed_stabilization,
+      double& frozen_jacobian_relative_error,
+      double& refreshed_candidate_relative_difference) noexcept;
+  bool ArmExactZeroInitialResidualForTests() noexcept;
   bool AuditLastBorrowedEulerConservation(
       double& maximum_error, double& maximum_relative_error,
       bool& gate) const noexcept;

@@ -11,6 +11,41 @@ namespace
 using namespace dg::hdg::runtime;
 using namespace dg::hdg::runtime::cuda_w8a;
 
+constexpr bool TrueResidualAuthorityPolicy() noexcept
+{
+  dg::hdg::runtime::cuda_w8a::detail::CudaSolveDiagnostics diagnostics{};
+  diagnostics.device_policy = true;
+  diagnostics.configured_ilu0 = true;
+  diagnostics.finite = true;
+  diagnostics.iterations = 0;
+  diagnostics.reported_residual = 1.1286157960703033e-12;
+  diagnostics.reported_tolerance_met = false;
+  const bool reported_tolerance_is_not_a_gate =
+      dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(diagnostics, 8);
+  diagnostics.iterations = 8;
+  const bool cap_is_inclusive =
+      dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(diagnostics, 8);
+  diagnostics.iterations = -1;
+  const bool negative_iteration_is_rejected =
+      !dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(diagnostics, 8);
+  diagnostics.iterations = 9;
+  const bool over_cap_is_rejected =
+      !dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(diagnostics, 8);
+  return reported_tolerance_is_not_a_gate && cap_is_inclusive &&
+      negative_iteration_is_rejected && over_cap_is_rejected;
+}
+
+static_assert(TrueResidualAuthorityPolicy(),
+              "the rebuilt true residual must remain authoritative");
+static_assert(
+    dg::hdg::runtime::cuda_w8a::detail::CudaIluLocalReordering(false) == 0 &&
+    dg::hdg::runtime::cuda_w8a::detail::CudaIluLocalReordering(true) == 1,
+    "only coupled IGR uses local RCM ordering");
+
 struct ModelTag { inline static constexpr std::string_view id = "euler.compressible.2d"; };
 struct FormulationTag { inline static constexpr std::string_view id = "hdg.conventional"; };
 struct TraceTag { inline static constexpr std::string_view id = "mfem.dg_interface.trace"; };

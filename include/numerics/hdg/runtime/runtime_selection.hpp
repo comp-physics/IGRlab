@@ -73,14 +73,18 @@ struct FixedScalarTauTag
   static constexpr std::string_view id = "tau.fixed";
 };
 
+inline constexpr std::string_view borrowed_euler_llf_stabilization_id =
+    "tau.llf.max-interior-trace.frozen-jacobian.v1";
+
 /**
- * Borrowed L2 data uses a separate, attempt-lagged local LLF selection.  It
- * must never alias the frozen manufactured W8A fixed-tau descriptor.
+ * Borrowed Euler data evaluates the local LLF speed from the current interior
+ * and trace candidate at each residual assembly.  The selected speed is held
+ * fixed only while that residual and its A/B/C/D blocks are formed.
  */
-struct BorrowedHostLocalLaggedLlfTauTag
+struct BorrowedEulerCurrentLlfTauTag
 {
   static constexpr std::string_view id =
-      "tau.llf.local.lagged.borrowed-host.v1";
+      borrowed_euler_llf_stabilization_id;
 };
 
 struct BackwardEulerRuntimeTag
@@ -135,19 +139,19 @@ using CudaRank2OneGpuHostStagedRuntimeSelection =
         CudaRank2OneGpuHostStagedBackendTag>;
 
 template <typename BackendTag>
-using BorrowedEulerLocalLaggedLlfSelection =
+using BorrowedEulerCurrentLlfSelection =
     StaticRunSelection<EulerCompressible2dTag,
                        ConventionalHdgTag,
                        MfemDgInterfaceTraceTag,
-                       BorrowedHostLocalLaggedLlfTauTag,
+                       BorrowedEulerCurrentLlfTauTag,
                        BackwardEulerRuntimeTag,
                        BackendTag,
                        Fp64RuntimeTag>;
 
 using BorrowedCudaRank1OneGpuRuntimeSelection =
-    BorrowedEulerLocalLaggedLlfSelection<CudaRank1OneGpuBackendTag>;
+    BorrowedEulerCurrentLlfSelection<CudaRank1OneGpuBackendTag>;
 using BorrowedCudaRank2OneGpuHostStagedRuntimeSelection =
-    BorrowedEulerLocalLaggedLlfSelection<
+    BorrowedEulerCurrentLlfSelection<
         CudaRank2OneGpuHostStagedBackendTag>;
 
 template <typename BackendTag>

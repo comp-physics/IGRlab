@@ -254,6 +254,28 @@ bool GenericEulerHdgCpuSession::ExportPreparedInterior(
                                        destination);
 }
 
+bool GenericEulerHdgCpuSession::ExportCommittedFields(
+    const generic::HdgEulerHostInteriorFields destination) const noexcept
+{
+  return initialized_ && core_ && core_->ExportCommittedFields(destination);
+}
+
+bool GenericEulerHdgCpuSession::ExportPreparedFields(
+    const GenericEulerCpuPreparedStep& token,
+    const generic::HdgEulerHostInteriorFields destination) const noexcept
+{
+  if (!initialized_ || !core_) { return false; }
+  if (!core_->AdmitBorrowedEulerOperation(
+          detail::CpuBorrowedEulerOperation::export_prepared_fields))
+  {
+    return false;
+  }
+  const bool local_token_valid = token.valid_ && token.owner_ == this &&
+      token.epoch_ == session_epoch_;
+  return core_->ExportPreparedFields(
+      local_token_valid ? token.generation_ : 0, destination);
+}
+
 bool ExecuteGenericEulerHdgCpu(const generic::EulerHdgRequest& request) noexcept
 {
   GenericEulerHdgCpuSession session;

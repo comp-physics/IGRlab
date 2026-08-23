@@ -229,6 +229,83 @@ foreach(_order IN ITEMS 1 2 3)
       TIMEOUT 3600)
 endforeach()
 
+# Direct rank-one CPU/CUDA field agreement closes the numerical-reference gap
+# without duplicating the existing p1-p3, rank-two, boundary-lowering, and
+# lifecycle matrices.  It also carries the positive IGR contact qualifications.
+add_executable(dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+  test_cpu_cuda_numerical_alignment.cu)
+target_include_directories(
+  dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+  PRIVATE
+    "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(
+  dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+  PRIVATE
+    dg_igr_hdg_runtime_cuda
+    dg_igr_hdg_generic_cpu
+    mfem
+    MPI::MPI_CXX)
+target_compile_options(
+  dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+set_target_properties(
+  dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+  PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_EXTENSIONS OFF
+    CUDA_ARCHITECTURES 120
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rank1
+  COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment)
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rank1
+  PROPERTIES
+    LABELS "hdg;runtime;cpu;cuda;generic-euler;alignment;igr;contact;physical;periodic;conservation;trajectory"
+    PROCESSORS 1
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 3600)
+
+# Standalone test-only performance observability for the ordinary FP64 CUDA
+# accepted-step lifecycle.  This is intentionally a build target, not a CTest:
+# its default 10,816-element workload performs one warmup and five samples.
+add_executable(dg_igr_hdg_runtime_cuda_accepted_step_benchmark
+  benchmark_generic_euler_accepted_step.cu)
+target_include_directories(
+  dg_igr_hdg_runtime_cuda_accepted_step_benchmark
+  PRIVATE
+    "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(
+  dg_igr_hdg_runtime_cuda_accepted_step_benchmark
+  PRIVATE
+    dg_igr_hdg_runtime_cuda
+    mfem
+    MPI::MPI_CXX)
+target_compile_options(
+  dg_igr_hdg_runtime_cuda_accepted_step_benchmark
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+set_target_properties(
+  dg_igr_hdg_runtime_cuda_accepted_step_benchmark
+  PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_EXTENSIONS OFF
+    CUDA_ARCHITECTURES 120
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
 # Borrowed generic sessions must use their request/mesh communicator.  Each
 # invocation leaves one MPI_COMM_WORLD rank passive while the active subgroup
 # performs a complete CUDA IGR transaction; the rank-2 case also proves an

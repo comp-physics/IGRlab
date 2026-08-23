@@ -205,6 +205,26 @@ foreach(_ranks IN ITEMS 1 2 3)
     TIMEOUT 180)
 endforeach()
 
+add_executable(dg_igr_hdg_generic_euler_convergence_cpu_test
+  test_generic_euler_convergence.cpp)
+target_include_directories(dg_igr_hdg_generic_euler_convergence_cpu_test
+  PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_hdg_generic_euler_convergence_cpu_test PRIVATE
+  dg_igr_hdg_generic_cpu mfem MPI::MPI_CXX)
+target_compile_options(dg_igr_hdg_generic_euler_convergence_cpu_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+set_target_properties(dg_igr_hdg_generic_euler_convergence_cpu_test PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
+add_test(NAME hdg_generic_euler_cpu_convergence
+  COMMAND dg_igr_hdg_generic_euler_convergence_cpu_test)
+set_tests_properties(hdg_generic_euler_cpu_convergence PROPERTIES
+  PROCESSORS 1
+  RESOURCE_LOCK hdg_generic_euler_cpu
+  LABELS "hdg;generic;cpu;convergence;spatial;backward-euler"
+  TIMEOUT 1800)
+
 add_executable(dg_igr_hdg_traced_scalar_igr_p1_local_test
   test_traced_scalar_igr_p1_local.cpp
   "${PROJECT_SOURCE_DIR}/src/numerics/hdg/runtime/cpu/traced_scalar_igr_p1_local.cpp")

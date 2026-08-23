@@ -369,13 +369,15 @@ struct CudaDeviceView
   // Dedicated persistent slice for caller-supplied static L2 source values.
   // It is always allocated; legacy manufactured forcing ignores it.
   double* static_source = nullptr;
-  // One frozen local LLF speed for every element/face/quadrature point.  This
-  // slice is populated once from the committed state at Prepare and is never
-  // differentiated or updated during the nonlinear attempt.
+  // Borrowed-only face scratch for the private frozen-coefficient Jacobian
+  // audit.  Production assembly computes LLF speeds directly from its current
+  // candidate and never reads this slice.
   double* borrowed_lagged_llf_tau = nullptr;
   double* initial_current_interior = nullptr;
   double* base_interior = nullptr;
-  double* trial_interior = nullptr;
+  // Compact four-component element-local staging used only for host output.
+  // The nonlinear trial is written directly into work_interior.
+  double* output_interior = nullptr;
   double* delta_interior = nullptr;
   double* recovered_interior = nullptr;
   double* work_true_trace = nullptr;
@@ -425,6 +427,7 @@ struct CudaDeviceView
   double* scalar = nullptr;
   std::uint64_t* hash_words = nullptr;
   int* ticket_words = nullptr;
+  int* status_flag = nullptr;
   int* signed_element_trace = nullptr;
   int* boundary_policy_kind = nullptr;
   int* matrix_owned_source = nullptr;
@@ -477,7 +480,7 @@ enum class CudaHypreSetupAction : std::uint8_t
   set_operator,
   ilu_type0,
   ilu_fill0,
-  ilu_reorder0,
+  ilu_reordering,
   ilu_maxiter1,
   ilu_tol0,
   ilu_print0,
@@ -494,6 +497,7 @@ struct CudaHypreSetupOrderEvidence
   std::uint64_t matrix_generation = 0;
   std::array<CudaHypreSetupAction, solved_action_count> actions{};
   std::size_t action_count = 0;
+  int ilu_local_reordering = -1;
   bool overflow = false;
 
   constexpr bool Record(const CudaHypreSetupAction action) noexcept
@@ -508,23 +512,28 @@ struct CudaHypreSetupOrderEvidence
   }
 
   constexpr bool ConfigurationExactForGeneration(
-      const std::uint64_t expected_generation) const noexcept
+      const std::uint64_t expected_generation,
+      const int expected_local_reordering) const noexcept
   {
     return action_count == configured_action_count &&
-        PrefixExactForGeneration(expected_generation);
+        PrefixExactForGeneration(expected_generation,
+                                 expected_local_reordering);
   }
 
   constexpr bool SolveExactForGeneration(
-      const std::uint64_t expected_generation) const noexcept
+      const std::uint64_t expected_generation,
+      const int expected_local_reordering) const noexcept
   {
     return action_count == solved_action_count &&
-        PrefixExactForGeneration(expected_generation) &&
+        PrefixExactForGeneration(expected_generation,
+                                 expected_local_reordering) &&
         actions[configured_action_count] == CudaHypreSetupAction::mult;
   }
 
 private:
   constexpr bool PrefixExactForGeneration(
-      const std::uint64_t expected_generation) const noexcept
+      const std::uint64_t expected_generation,
+      const int expected_local_reordering) const noexcept
   {
     constexpr std::array<CudaHypreSetupAction, configured_action_count>
         expected{{
@@ -532,13 +541,15 @@ private:
           CudaHypreSetupAction::set_operator,
           CudaHypreSetupAction::ilu_type0,
           CudaHypreSetupAction::ilu_fill0,
-          CudaHypreSetupAction::ilu_reorder0,
+          CudaHypreSetupAction::ilu_reordering,
           CudaHypreSetupAction::ilu_maxiter1,
           CudaHypreSetupAction::ilu_tol0,
           CudaHypreSetupAction::ilu_print0,
           CudaHypreSetupAction::rebind_preconditioner,
           CudaHypreSetupAction::gmres_settings}};
     if (overflow || matrix_generation != expected_generation ||
+        ilu_local_reordering != expected_local_reordering ||
+        (expected_local_reordering != 0 && expected_local_reordering != 1) ||
         action_count < expected.size())
       return false;
     for (std::size_t action = 0; action < expected.size(); ++action)
@@ -568,12 +579,29 @@ struct CudaSolveDiagnostics
 {
   bool device_policy = false;
   bool configured_ilu0 = false;
-  bool converged = false;
+  bool reported_tolerance_met = false;
   bool finite = false;
   std::uint64_t matrix_generation = 0;
   int iterations = 0;
   double reported_residual = std::numeric_limits<double>::infinity();
 };
+
+constexpr bool CudaTraceSolveReadyForTrueResidualVerification(
+    const CudaSolveDiagnostics& diagnostics,
+    const int maximum_iterations) noexcept
+{
+  return diagnostics.device_policy && diagnostics.configured_ilu0 &&
+      diagnostics.iterations >= 0 && diagnostics.iterations <=
+          maximum_iterations;
+}
+
+// Keep conventional Euler's qualified natural ordering.  The component-major
+// coupled IGR trace block uses the established HYPRE RCM ordering used by the
+// other coupled-IGR paths before applying the same ILU(0) factorization.
+constexpr int CudaIluLocalReordering(const bool igr_active) noexcept
+{
+  return igr_active ? 1 : 0;
+}
 
 using CudaCopyOutFunction = bool (*)(
     void*, const void*, std::size_t, CudaTransferCategory,
@@ -704,6 +732,7 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
                                   mfem::HypreILU& ilu,
                                   mfem::HypreGMRES& gmres,
                                   int ranks,
+                                  int local_reordering,
                                   double relative_tolerance,
                                   int maximum_iterations,
                                   int krylov_dimension,
@@ -717,6 +746,7 @@ bool CudaRefreshFactorAndSolve(mfem::HypreParMatrix& matrix,
                                mfem::HypreGMRES& gmres,
                                int ranks,
                                MPI_Comm communicator,
+                               int local_reordering,
                                double relative_tolerance,
                                int maximum_iterations,
                                int krylov_dimension,
@@ -729,15 +759,20 @@ bool CudaHypreDevicePolicyValid(mfem::HypreParMatrix& matrix,
 bool CudaLaunchTicket(int* words, CudaFailurePhase phase,
                       std::uint64_t attempt, std::uint64_t generation,
                       int device) noexcept;
+bool CudaLaunchStatusReduction(const double* status, int count,
+                               int* failure_flag) noexcept;
 bool CudaLaunchGatherLocalTrace(const int* signed_map, int count,
                                 const double* true_trace,
                                 double* local_trace) noexcept;
 bool CudaLaunchAdmissibility(const CudaDeviceView& view,
                              const CudaMeshShape& shape) noexcept;
-bool CudaLaunchSeedBorrowedLaggedLlfTau(const CudaDeviceView& view,
-                                        const CudaMeshShape& shape) noexcept;
+bool CudaLaunchFreezeBorrowedCurrentLlfTau(const CudaDeviceView& view,
+                                           const CudaMeshShape& shape) noexcept;
 bool CudaLaunchAssembly(const CudaDeviceView& view,
                         const CudaMeshShape& shape, double dt) noexcept;
+bool CudaLaunchFrozenBorrowedLlfAssembly(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    double dt) noexcept;
 bool CudaLaunchCondensation(const CudaDeviceView& view,
                             const CudaMeshShape& shape) noexcept;
 bool CudaLaunchZeroTrueSystem(const CudaTrueMatrixDeviceView& matrix,
@@ -764,20 +799,28 @@ bool CudaLaunchRecover(const CudaDeviceView& view,
                        const CudaMeshShape& shape) noexcept;
 bool CudaLaunchTrial(const CudaDeviceView& view,
                      const CudaMeshShape& shape, double alpha) noexcept;
+bool CudaLaunchPackInteriorOutput(const CudaMeshShape& shape,
+                                  const double* source,
+                                  double* packed,
+                                  int output_components) noexcept;
 bool CudaLaunchLocalSquaredNorm(const double* first, int first_count,
                                 const double* second, int second_count,
+                                double* scratch, int scratch_count,
                                 double* result) noexcept;
 bool CudaLaunchMaximumWave(const CudaDeviceView& view,
                            const CudaMeshShape& shape,
                            const double* interior,
                            const double* element_trace,
                            double* result) noexcept;
-bool CudaLaunchIgrConservation(const CudaDeviceView& view,
-                               const CudaMeshShape& shape,
-                               double dt, double* result) noexcept;
+bool CudaLaunchEulerConservation(const CudaDeviceView& view,
+                                 const CudaMeshShape& shape,
+                                 double dt, double* result) noexcept;
 
 bool CudaLaunchHash(const double* values, int count,
                     std::uint64_t* words) noexcept;
+bool CudaLaunchHashPair(const double* first, int first_count,
+                        const double* second, int second_count,
+                        std::uint64_t* words) noexcept;
 
 inline StateHash HashHostBytes(const void* data, const std::size_t bytes) noexcept
 {
@@ -1043,8 +1086,7 @@ public:
     const bool trace_ready = DistributeCurrentTrace(committed.trace.coefficients);
     const bool launched = trace_ready && CudaLaunchMaximumWave(
         view_, shape_, committed.interior.coefficients,
-        view_.current_local_trace, view_.scalar) &&
-        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+        view_.current_local_trace, view_.scalar);
     if (!CollectiveContinue(launched)) return false;
     const bool copied = TransportPolicy::DeviceToHost(
         host_cfl_scalars_.data(), view_.scalar,
@@ -1311,9 +1353,6 @@ public:
         workspace.trace.generation = current_generation_;
       }
     }
-    const bool synchronized =
-        TransportPolicy::Synchronize(CudaTransferSite::attempt_seed_trace);
-    local_ready = local_ready && synchronized;
     if (!CollectiveContinue(local_ready)) { return false; }
     return DistributeCurrentTrace(workspace.trace.coefficients);
   }
@@ -1456,14 +1495,16 @@ private:
     const auto assemble = [&](const std::vector<double>& interior,
                               const std::vector<double>& trace,
                               std::vector<double>* residual_interior,
-                              std::vector<double>* residual_trace) noexcept
+                              std::vector<double>* residual_trace,
+                              const bool frozen_llf = false) noexcept
     {
       if (!install_state(interior, trace)) return false;
       TransportPolicy::SetPhase(CudaFailurePhase::assembly,
                                 current_generation_);
-      const bool assembled = CudaLaunchAssembly(
-              view_, shape_, fixed_dt) &&
-          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+      const bool assembled = (frozen_llf
+              ? CudaLaunchFrozenBorrowedLlfAssembly(
+                    view_, shape_, fixed_dt)
+              : CudaLaunchAssembly(view_, shape_, fixed_dt)) &&
           StatusPassed();
       if (!CollectiveContinue(assembled)) return false;
       if (residual_interior == nullptr || residual_trace == nullptr)
@@ -1493,17 +1534,15 @@ private:
     if (!CollectiveContinue(local_valid) ||
         !install_state(base_interior, base_true_trace))
       return false;
-    // Match the production conventional-Euler prepare sequence exactly:
-    // seed one lagged LLF stabilization field from the committed state, then
-    // hold it fixed through every nonlinear/Jacobian reassembly.  IGR owns no
-    // such conventional face field and continues directly to assembly.
+    // The production base assembly evaluates tau at this candidate.  Freeze
+    // that same candidate value only for the finite-difference perturbations
+    // below: A/B/C/D intentionally omit d-tau while every ordinary residual
+    // or line-search assembly refreshes tau from its own current candidate.
     if (!shape_.igr_active)
     {
-      const bool tau_seeded = CudaLaunchSeedBorrowedLaggedLlfTau(
-              view_, shape_) &&
-          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-          StatusPassed();
-      if (!CollectiveContinue(tau_seeded)) return false;
+      const bool tau_frozen = CudaLaunchFreezeBorrowedCurrentLlfTau(
+              view_, shape_) && StatusPassed();
+      if (!CollectiveContinue(tau_frozen)) return false;
     }
     if (!assemble(base_interior, base_true_trace, nullptr, nullptr))
       return false;
@@ -1603,8 +1642,10 @@ private:
       }
       catch (...) { ready = false; }
       if (!CollectiveContinue(ready) ||
-          !assemble(plus_interior, plus_trace, &plus_r, &plus_g) ||
-          !assemble(minus_interior, minus_trace, &minus_r, &minus_g))
+          !assemble(plus_interior, plus_trace, &plus_r, &plus_g,
+                    !shape_.igr_active) ||
+          !assemble(minus_interior, minus_trace, &minus_r, &minus_g,
+                    !shape_.igr_active))
         return false;
       try
       {
@@ -1688,43 +1729,56 @@ private:
   }
 
 public:
-  bool IgrConservationBalance(const double dt, double& maximum_error,
-                              double& maximum_relative_error) noexcept
+  bool EulerConservationBalance(const double dt, double& maximum_error,
+                                double& maximum_relative_error) noexcept
   {
     maximum_error = 0.0;
     maximum_relative_error = 0.0;
-    constexpr int components = 5;
-    constexpr int result_scalars = 2 * components + 1;
-    std::array<double, result_scalars> local{};
-    const bool launched = initialized_ && shape_.igr_active &&
+    constexpr int components = igr_trace_components;
+    static_assert(euler_conservation_result_scalars == 2 * components + 2);
+    std::array<double, euler_conservation_result_scalars> local{};
+    const bool launched = initialized_ && shape_.borrowed_host_inputs &&
         std::isfinite(dt) && dt > 0.0 &&
-        CudaLaunchIgrConservation(view_, shape_, dt, view_.scalar) &&
-        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+        CudaLaunchEulerConservation(view_, shape_, dt, view_.scalar);
     if (!CollectiveContinue(launched)) return false;
     const bool copied = TransportPolicy::DeviceToHost(
             local.data(), view_.scalar, local.size() * sizeof(double),
             CudaTransferCategory::scalar_diagnostic,
             CudaTransferSite::scalar_status) &&
         TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
-    bool local_valid = copied && local[2 * components] == 1.0;
-    for (int index = 0; local_valid && index < 2 * components; ++index)
+    bool local_valid = copied && local[2 * components + 1] == 1.0 &&
+        std::isfinite(local[2 * components]) &&
+        local[2 * components] >= 0.0;
+    for (int index = 0; local_valid && index <= 2 * components; ++index)
       local_valid = std::isfinite(local[static_cast<std::size_t>(index)]);
     if (!CollectiveContinue(local_valid)) return false;
     std::array<double, components> global_balance{};
     std::array<double, components> global_scale{};
+    double global_domain_measure = 0.0;
     const bool balance_reduced = MPI_Allreduce(
         local.data(), global_balance.data(), components, MPI_DOUBLE,
         MPI_SUM, communicator_) == MPI_SUCCESS;
     const bool scale_reduced = MPI_Allreduce(
         local.data() + components, global_scale.data(), components,
         MPI_DOUBLE, MPI_SUM, communicator_) == MPI_SUCCESS;
-    if (!CollectiveContinue(balance_reduced && scale_reduced)) return false;
-    for (int component = 0; component < components; ++component)
+    const bool measure_reduced = MPI_Allreduce(
+        local.data() + 2 * components, &global_domain_measure, 1,
+        MPI_DOUBLE, MPI_SUM, communicator_) == MPI_SUCCESS;
+    if (!CollectiveContinue(balance_reduced && scale_reduced &&
+                            measure_reduced &&
+                            std::isfinite(global_domain_measure) &&
+                            global_domain_measure > 0.0))
+      return false;
+    const int active_components = shape_.igr_active
+        ? components : conserved_components;
+    for (int component = 0; component < active_components; ++component)
     {
       const double error = std::abs(
           global_balance[static_cast<std::size_t>(component)]);
-      const double relative = error /
-          (1.0 + global_scale[static_cast<std::size_t>(component)]);
+      const double relative =
+          dg::hdg::generic::EulerHdgConservationRelativeError(
+              error, global_scale[static_cast<std::size_t>(component)],
+              global_domain_measure);
       maximum_error = std::max(maximum_error, error);
       maximum_relative_error = std::max(maximum_relative_error, relative);
     }
@@ -1737,6 +1791,10 @@ public:
                               state_slot& workspace) noexcept
   {
     CudaNumericalResult result{};
+    // The frozen non-borrowed lifecycle has no Euler conservation contract.
+    // Borrowed Euler attempts remain fail-closed until their measured balance
+    // has passed below.
+    result.conservation = !shape_.borrowed_host_inputs;
     // The application may perform unrelated MFEM output work between solver
     // attempts, and MFEM/HYPRE may grow their opaque shared Umpire pool while
     // doing so.  Admit no growth caused by a warm solver attempt.  The first
@@ -1761,23 +1819,6 @@ public:
       result.phase = CudaFailurePhase::setup;
       result.reason = FailureReason::collective_protocol;
       return result;
-    }
-    // The borrowed path owns a single stabilization field per prepared
-    // attempt.  Seed it from the committed interior/local trace before any
-    // nonlinear update, then retain it unchanged through every assembly and
-    // line-search reassembly.  The legacy manufactured W8A path deliberately
-    // does not launch this kernel and continues to use its fixed arithmetic.
-    if (shape_.borrowed_host_inputs && !shape_.igr_active)
-    {
-      const bool tau_seeded = CudaLaunchSeedBorrowedLaggedLlfTau(view_, shape_) &&
-          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-          StatusPassed();
-      if (!CollectiveContinue(tau_seeded))
-      {
-        result.phase = CudaFailurePhase::assembly;
-        result.reason = FailureReason::admissibility_gate;
-        return result;
-      }
     }
     const bool injection_active = config.injection.enabled &&
         config.injection.target_step == attempt.committed_step + 1 &&
@@ -1832,6 +1873,30 @@ public:
     const int maximum_nonlinear_updates = config.use_generic_numerical_policy
         ? config.numerical_policy.maximum_nonlinear_updates
         : (shape_.borrowed_static_boundary_policies ? 80 : 20);
+    const auto record_linear_iterations = [&](const int iterations) noexcept
+    {
+      if (iterations < 0 ||
+          iterations > std::numeric_limits<int>::max() -
+              result.linear_iterations)
+        return false;
+      result.linear_iterations += iterations;
+      return true;
+    };
+    const auto record_line_search_trial = [&]() noexcept
+    {
+      if (result.line_search_trials == std::numeric_limits<int>::max())
+        return false;
+      ++result.line_search_trials;
+      return true;
+    };
+    const auto record_line_search_rejection = [&]() noexcept
+    {
+      if (result.rejected_line_search_trials ==
+          std::numeric_limits<int>::max())
+        return false;
+      ++result.rejected_line_search_trials;
+      return true;
+    };
     std::uint64_t last_product_generation = 0;
     for (int iteration = 0; iteration < maximum_nonlinear_updates; ++iteration)
     {
@@ -1842,9 +1907,7 @@ public:
       if (inject_at(CudaFailurePhase::condensation)) { return result; }
       const bool condensed = CopyBase(workspace) &&
           Ticket(CudaFailurePhase::condensation) &&
-          CudaLaunchCondensation(view_, shape_) &&
-          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-          StatusPassed();
+          CudaLaunchCondensation(view_, shape_) && StatusPassed();
       if (!CollectiveContinue(condensed))
       {
         result.phase = CudaFailurePhase::condensation;
@@ -1865,21 +1928,28 @@ public:
         result.reason = FailureReason::true_residual_gate;
         return result;
       }
-      const bool solve_ok =
-          SolveTrueSystem(result.true_relative_residual, generation);
-      if (!CollectiveContinue(solve_ok))
+      int solve_iterations = 0;
+      const bool solve_ok = SolveTrueSystem(
+          result.true_relative_residual, generation, solve_iterations);
+      const bool solve_accounted = record_linear_iterations(solve_iterations);
+      if (!CollectiveContinue(solve_ok && solve_accounted))
       {
         result.reason = FailureReason::true_residual_gate;
         return result;
       }
       ++result.trace_solves;
       const bool trace_distributed = DistributeTraceIncrement();
-      if (inject_at(CudaFailurePhase::recovery)) { return result; }
+      if (inject_at(CudaFailurePhase::recovery))
+      {
+        const bool distribution_complete = ranks_ != 1 ||
+            TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+        (void)CollectiveContinue(
+            trace_distributed && distribution_complete);
+        return result;
+      }
       const bool recovered = trace_distributed &&
           Ticket(CudaFailurePhase::recovery) &&
-          CudaLaunchRecover(view_, shape_) &&
-          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-          StatusPassed();
+          CudaLaunchRecover(view_, shape_) && StatusPassed();
       if (!CollectiveContinue(recovered))
       {
         result.phase = CudaFailurePhase::recovery;
@@ -1890,13 +1960,25 @@ public:
       bool accepted = false;
       for (int trial = 0; trial < maximum_line_search_trials; ++trial)
       {
+        if (!record_line_search_trial())
+        {
+          result.reason = FailureReason::backend_failure;
+          return result;
+        }
         const double alpha = std::ldexp(1.0, -trial);
-        const bool trial_ready = CudaLaunchTrial(view_, shape_, alpha) &&
-            TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-            SwapTrialIntoWorkspace(workspace);
+        // TrialKernel writes the candidate directly into the persistent
+        // workspace.  The base snapshot remains immutable, so a rejected
+        // trial is still restored transactionally without the former pair of
+        // full-state device-to-device copies.
+        const bool trial_ready = CudaLaunchTrial(view_, shape_, alpha);
         if (!CollectiveContinue(trial_ready))
         {
           if (!CollectiveContinue(RestoreBase(workspace)))
+          {
+            result.reason = FailureReason::backend_failure;
+            return result;
+          }
+          if (!record_line_search_rejection())
           {
             result.reason = FailureReason::backend_failure;
             return result;
@@ -1905,12 +1987,15 @@ public:
         }
         const bool trial_admissible =
             DistributeCurrentTrace(workspace.trace.coefficients) &&
-            CudaLaunchAdmissibility(view_, shape_) &&
-            TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-            StatusPassed();
+            CudaLaunchAdmissibility(view_, shape_) && StatusPassed();
         if (!CollectiveContinue(trial_admissible))
         {
           if (!CollectiveContinue(RestoreBase(workspace)))
+          {
+            result.reason = FailureReason::backend_failure;
+            return result;
+          }
+          if (!record_line_search_rejection())
           {
             result.reason = FailureReason::backend_failure;
             return result;
@@ -1933,6 +2018,11 @@ public:
           break;
         }
         if (!CollectiveContinue(RestoreBase(workspace)))
+        {
+          result.reason = FailureReason::backend_failure;
+          return result;
+        }
+        if (!record_line_search_rejection())
         {
           result.reason = FailureReason::backend_failure;
           return result;
@@ -1965,9 +2055,7 @@ public:
          result.nonlinear_updates >= 2) &&
         result.final_residual <= target && CopyBase(workspace) &&
         Ticket(CudaFailurePhase::condensation) &&
-        CudaLaunchCondensation(view_, shape_) &&
-        TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-        StatusPassed();
+        CudaLaunchCondensation(view_, shape_) && StatusPassed();
     if (!CollectiveContinue(coherent_base) || !AssembleTrueSystem())
     {
       result.reason = FailureReason::backend_failure;
@@ -1980,18 +2068,21 @@ public:
       result.reason = FailureReason::true_residual_gate;
       return result;
     }
+    int coherent_solve_iterations = 0;
     const bool coherent_solve_ok = SolveTrueSystem(
-        result.true_relative_residual, last_product_generation);
-    if (!CollectiveContinue(coherent_solve_ok))
+        result.true_relative_residual, last_product_generation,
+        coherent_solve_iterations);
+    const bool coherent_solve_accounted =
+        record_linear_iterations(coherent_solve_iterations);
+    if (!CollectiveContinue(
+            coherent_solve_ok && coherent_solve_accounted))
     {
       result.reason = FailureReason::true_residual_gate;
       return result;
     }
     const bool coherent_solve = DistributeTraceIncrement() &&
         Ticket(CudaFailurePhase::recovery) &&
-        CudaLaunchRecover(view_, shape_) &&
-        TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-        StatusPassed();
+        CudaLaunchRecover(view_, shape_) && StatusPassed();
     if (!CollectiveContinue(coherent_solve))
     {
       result.reason = FailureReason::recovery_gate;
@@ -2020,27 +2111,30 @@ public:
                        last_product_generation,
                        last_product_generation,
                        0};
-    const bool local_admissible = CudaLaunchAdmissibility(view_, shape_) &&
-        TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
-        StatusPassed();
+    const bool local_admissible =
+        CudaLaunchAdmissibility(view_, shape_) && StatusPassed();
     result.admissible = CollectiveContinue(local_admissible);
     result.true_residual = std::isfinite(result.true_relative_residual) &&
         result.true_relative_residual <= true_residual_relative_tolerance_;
     if (config.force_private_scientific_gate_failure)
       result.true_residual = false;
     if (inject_at(CudaFailurePhase::diagnostics)) { return result; }
-    if (shape_.igr_active)
+    if (shape_.borrowed_host_inputs)
     {
-      result.conservation = IgrConservationBalance(
+      const bool conservation_ready = EulerConservationBalance(
           attempt.dt, result.maximum_conservation_error,
-          result.maximum_conservation_relative_error) &&
-          result.maximum_conservation_relative_error <=
-              config.numerical_policy.conservation_relative_tolerance;
-      if (!CollectiveContinue(result.conservation))
+          result.maximum_conservation_relative_error);
+      if (!CollectiveContinue(conservation_ready))
       {
-        result.reason = FailureReason::success_gate;
+        result.candidate_ready = false;
+        result.conservation = false;
+        result.reason = FailureReason::backend_failure;
         return result;
       }
+      const bool local_conservation =
+          result.maximum_conservation_relative_error <=
+              config.numerical_policy.conservation_relative_tolerance;
+      result.conservation = CollectiveContinue(local_conservation);
     }
     const std::uint64_t current_allocation_events =
         AllocatorPolicy::AllocationEvents();
@@ -2071,7 +2165,8 @@ public:
         result.true_residual && result.conservation && result.telemetry;
     result.reason = result.success ? FailureReason::none :
         (!result.true_residual ? FailureReason::true_residual_gate
-                              : FailureReason::success_gate);
+         : !result.telemetry ? FailureReason::telemetry_gate
+                             : FailureReason::success_gate);
     if (!UpdateStateHashes(workspace))
     {
       result.success = false;
@@ -2140,6 +2235,9 @@ public:
   /** Map one device element-local state back to a validated byNODES L2 view. */
   bool ExportInterior(const CudaInteriorState& source,
                       CudaMutableHostL2Output destination) noexcept;
+  bool ExportFields(
+      const CudaInteriorState& source,
+      generic::HdgEulerHostInteriorFields destination) noexcept;
 
 private:
   friend struct CudaQualificationTestAccess;
@@ -2815,8 +2913,12 @@ private:
       host_exact_true_trace_.assign(host_true_trace, 0.0);
       host_perturbed_true_trace_.assign(host_true_trace, 0.0);
       host_static_source_.assign(host_interior, 0.0);
-      host_export_interior_.assign(host_interior, 0.0);
-      host_status_.assign(host_elements, 0.0);
+      host_export_interior_.assign(
+          static_cast<std::size_t>(shape_.elements) *
+              (shape_.igr_active ? igr_published_components
+                                 : conserved_components) *
+              shape_.scalar_interior_dofs,
+          0.0);
       signed_element_interior_.assign(host_interior, 0);
       host_matrix_owned_source_.assign(host_matrix, 0);
       host_matrix_owned_section_.assign(host_matrix, 0);
@@ -2869,12 +2971,13 @@ private:
           checked_add(doubles, layout.face_interior) && checked_add(doubles, layout.face_trace) &&
           checked_add(doubles, layout.face_weight) && checked_add(doubles, layout.face_normal) &&
           (!shape_.igr_active || checked_add(doubles, layout.face_h)) &&
-          checked_add(doubles, elements) && checked_add(doubles, 11) &&
+          checked_add(doubles, elements) &&
+          checked_add(doubles, euler_conservation_result_scalars) &&
           checked_add(doubles, layout.face_weight) &&
           (!shape_.borrowed_static_boundary_policies ||
            (checked_add(doubles, layout.boundary_reference) &&
             checked_add(doubles, layout.boundary_pressure)));
-      std::size_t integers = 16;
+      std::size_t integers = 17;
       valid = valid && checked_add(integers, layout.element_trace) &&
           checked_add(integers, three_local_matrix) &&
           checked_add(integers, three_local_matrix) &&
@@ -3027,15 +3130,16 @@ private:
   bool DistributeCurrentTrace(const double* true_values) noexcept;
   bool DistributeTraceIncrement() noexcept;
   bool AssembleTrueVector(const double* element_values,
-                          double* true_values) noexcept;
+                          double* true_values,
+                          bool completion_required) noexcept;
   bool AssembleTrueSystem() noexcept;
   bool SolveTrueSystem(double& true_relative_residual,
-                       std::uint64_t matrix_generation) noexcept;
+                       std::uint64_t matrix_generation,
+                       int& linear_iterations) noexcept;
   bool AssembleAndNorm(state_slot& workspace, double dt,
                        double& norm) noexcept;
   bool CopyBase(state_slot& workspace) noexcept;
   bool RestoreBase(state_slot& workspace) noexcept;
-  bool SwapTrialIntoWorkspace(state_slot& workspace) noexcept;
   bool UpdateStateHashes(state_slot& workspace) noexcept;
   bool HashState(const double* values, int count, StateHash& hash) noexcept;
   bool AggregateHash(const StateHash& local, StateHash& aggregate) const
@@ -3158,7 +3262,6 @@ private:
   std::vector<double> host_perturbed_true_trace_{};
   std::vector<double> host_static_source_{};
   std::vector<double> host_export_interior_{};
-  std::vector<double> host_status_{};
   std::vector<int> signed_element_interior_{};
   bool borrowed_host_inputs_ = false;
   std::vector<int> host_matrix_owned_source_{};

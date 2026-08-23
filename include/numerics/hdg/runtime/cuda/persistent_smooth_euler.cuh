@@ -13,6 +13,7 @@
  */
 
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler_types.cuh"
+#include "numerics/hdg/runtime/runtime_selection.hpp"
 #include "numerics/hdg/trace/trace_dg_mpi.hpp"
 #include "physics/bc/boundary_state.hpp"
 
@@ -126,7 +127,7 @@ namespace detail
 
 // Stable private prestage-denial mask (bit set means the named predicate
 // failed): finite, admissible, recovery, true residual, telemetry,
-// no-fallback, success, not-injected, and the existing collective result.
+// no-fallback, success, not-injected, collective result, and conservation.
 enum CudaPrestageFailureBit : std::uint64_t
 {
   prestage_finite_failure = std::uint64_t{1} << 0U,
@@ -137,19 +138,22 @@ enum CudaPrestageFailureBit : std::uint64_t
   prestage_no_fallback_failure = std::uint64_t{1} << 5U,
   prestage_success_failure = std::uint64_t{1} << 6U,
   prestage_injected_failure = std::uint64_t{1} << 7U,
-  prestage_collective_failure = std::uint64_t{1} << 8U
+  prestage_collective_failure = std::uint64_t{1} << 8U,
+  prestage_conservation_failure = std::uint64_t{1} << 9U
 };
 
 inline constexpr std::uint64_t CudaPrestageFailureMask(
     const bool finite, const bool admissible, const bool recovery,
-    const bool true_residual, const bool telemetry, const bool no_fallback,
-    const bool success, const bool injected,
+    const bool true_residual, const bool conservation,
+    const bool telemetry, const bool no_fallback, const bool success,
+    const bool injected,
     const bool collective_result) noexcept
 {
   return (!finite ? prestage_finite_failure : 0) |
       (!admissible ? prestage_admissible_failure : 0) |
       (!recovery ? prestage_recovery_failure : 0) |
       (!true_residual ? prestage_true_residual_failure : 0) |
+      (!conservation ? prestage_conservation_failure : 0) |
       (!telemetry ? prestage_telemetry_failure : 0) |
       (!no_fallback ? prestage_no_fallback_failure : 0) |
       (!success ? prestage_success_failure : 0) |
@@ -162,7 +166,10 @@ static inline void ReportCudaPrestageDenial(
     const FailureReason reason, const CudaFailurePhase phase,
     const double initial_residual, const double final_residual,
     const double true_relative_residual, const int nonlinear_updates,
-    const int trace_solves, const CudaTransferTotals& transfers,
+    const int trace_solves, const bool conservation,
+    const double maximum_conservation_error,
+    const double maximum_conservation_relative_error,
+    const CudaTransferTotals& transfers,
     const std::uint64_t allocation_current,
     const std::uint64_t allocation_baseline,
     const std::uint64_t allocation_calls_current,
@@ -171,12 +178,16 @@ static inline void ReportCudaPrestageDenial(
   std::fprintf(stderr,
       "CUDA_PRESTAGE_DENY rank=%d mask=0x%llx reason=%u phase=%u "
       "residuals=%.17g/%.17g/%.17g updates=%d solves=%d "
+      "conservation=%u/%.17g/%.17g "
       "transfer=%u/%llu/%llu/%llu/%llu/%llu/%llu alloc=%llu/%llu "
       "calls=%llu/%llu\n",
       rank, static_cast<unsigned long long>(failure_mask),
       static_cast<unsigned>(reason), static_cast<unsigned>(phase),
       initial_residual, final_residual, true_relative_residual,
-      nonlinear_updates, trace_solves, transfers.complete ? 1U : 0U,
+      nonlinear_updates, trace_solves, conservation ? 1U : 0U,
+      maximum_conservation_error,
+      maximum_conservation_relative_error,
+      transfers.complete ? 1U : 0U,
       static_cast<unsigned long long>(transfers.event_count),
       static_cast<unsigned long long>(transfers.synchronization_events),
       static_cast<unsigned long long>(transfers.host_to_device_bytes),
@@ -350,9 +361,7 @@ struct CudaContractStoragePolicy
           copy.trace, source.trace,
           CudaTransferCategory::generic_output_metadata_staging,
           CudaTransferSite::output_metadata_stage_trace);
-      const bool synchronized = TransportPolicy::Synchronize(
-          CudaTransferSite::output_metadata_stage_trace);
-      return interior && trace && synchronized;
+      return interior && trace;
     }
     return false;
   }
@@ -430,7 +439,7 @@ struct CudaNumericalResult
   bool admissible = false;
   bool recovery = false;
   bool true_residual = false;
-  bool conservation = true;
+  bool conservation = false;
   bool telemetry = false;
   bool success = false;
   bool injected = false;
@@ -445,6 +454,12 @@ struct CudaNumericalResult
   double maximum_conservation_relative_error = 0.0;
   int nonlinear_updates = 0;
   int trace_solves = 0;
+  // Sum HYPRE GMRES iterations from every trace solve, including the final
+  // coherent reconstruction solve.  Line-search trials count every attempted
+  // alpha; rejected trials are the attempts restored before the next alpha.
+  int linear_iterations = 0;
+  int line_search_trials = 0;
+  int rejected_line_search_trials = 0;
 };
 
 template <typename AllocatorPolicy, typename TransportPolicy>
@@ -472,13 +487,14 @@ inline bool ExactSelection(const CudaConfig& config) noexcept
       ExactId(tuple.backend, "cuda.rank2.one_gpu.host_staged");
   const bool legacy_fixed = !config.use_borrowed_host_inputs &&
       ExactId(tuple.stabilization, "tau.fixed");
-  const bool borrowed_lagged_llf = config.use_borrowed_host_inputs &&
-      ExactId(tuple.stabilization, "tau.llf.local.lagged.borrowed-host.v1");
+  const bool borrowed_current_llf = config.use_borrowed_host_inputs &&
+      ExactId(tuple.stabilization,
+              borrowed_euler_llf_stabilization_id);
   return Selection::interior_space == InteriorSpace::l2 && tuple.Valid() &&
       ExactId(tuple.model, "euler.compressible.2d") &&
       ExactId(tuple.formulation, "hdg.conventional") &&
       ExactId(tuple.trace, "mfem.dg_interface.trace") &&
-      (legacy_fixed || borrowed_lagged_llf) &&
+      (legacy_fixed || borrowed_current_llf) &&
       ExactId(tuple.time_treatment, "backward_euler") &&
       ExactId(tuple.precision, "fp64") && (rank_one || rank_two);
 }
@@ -1071,6 +1087,14 @@ public:
                                     destination);
   }
 
+  bool ExportCommittedFields(
+      generic::HdgEulerHostInteriorFields destination) noexcept
+  {
+    if (!initialized_ || pending_.active) { return false; }
+    return numerics_.ExportFields(numerics_.CommittedSlot().interior,
+                                  destination);
+  }
+
   bool CachedBorrowedEulerDiagnostics(double& maximum_wave_speed,
                                       double& backend_stable_dt) const noexcept
   {
@@ -1087,6 +1111,16 @@ public:
       return false;
     return numerics_.ExportInterior(numerics_.WorkspaceSlot().interior,
                                     destination);
+  }
+
+  bool ExportPreparedFields(
+      generic::HdgEulerHostInteriorFields destination) noexcept
+  {
+    if (!initialized_ || !pending_.active || !pending_.staging ||
+        !pending_.prestage_allowed || !pending_.checkpoint_staged)
+      return false;
+    return numerics_.ExportFields(numerics_.WorkspaceSlot().interior,
+                                  destination);
   }
 
   CudaReuseEvidence ReuseEvidence() const noexcept
@@ -1726,6 +1760,10 @@ private:
     evidence.true_relative_residual = adjusted.true_relative_residual;
     evidence.nonlinear_updates = adjusted.nonlinear_updates;
     evidence.trace_solves = adjusted.trace_solves;
+    evidence.linear_iterations = adjusted.linear_iterations;
+    evidence.line_search_trials = adjusted.line_search_trials;
+    evidence.rejected_line_search_trials =
+        adjusted.rejected_line_search_trials;
     evidence.source_rank = adjusted.injection_source_rank;
     evidence.device_ticket_count = numerics_.TicketCount();
     std::copy_n(numerics_.Tickets().begin(), evidence.device_ticket_count,
@@ -1772,7 +1810,7 @@ private:
       const CudaReuseEvidence reuse = numerics_.ReuseEvidence();
       const std::uint64_t failure_mask = detail::CudaPrestageFailureMask(
           adjusted.finite, adjusted.admissible, adjusted.recovery,
-          adjusted.true_residual, adjusted.telemetry,
+          adjusted.true_residual, adjusted.conservation, adjusted.telemetry,
           numerics_.NoFallback(), adjusted.success, adjusted.injected,
           collective_prestage_allowed);
       // A requested one-shot injection is an expected rollback stimulus, not
@@ -1784,7 +1822,9 @@ private:
             numerics_.rank(), failure_mask, adjusted.reason, adjusted.phase,
             adjusted.initial_residual, adjusted.final_residual,
             adjusted.true_relative_residual, adjusted.nonlinear_updates,
-            adjusted.trace_solves, totals,
+            adjusted.trace_solves, adjusted.conservation,
+            adjusted.maximum_conservation_error,
+            adjusted.maximum_conservation_relative_error, totals,
             reuse.baseline_allocation_events +
                 reuse.post_baseline_allocation_events,
             reuse.baseline_allocation_events,
@@ -1905,6 +1945,10 @@ private:
     evidence.true_relative_residual = numerical.true_relative_residual;
     evidence.nonlinear_updates = numerical.nonlinear_updates;
     evidence.trace_solves = numerical.trace_solves;
+    evidence.linear_iterations = numerical.linear_iterations;
+    evidence.line_search_trials = numerical.line_search_trials;
+    evidence.rejected_line_search_trials =
+        numerical.rejected_line_search_trials;
     evidence.source_rank = numerical.injection_source_rank;
     evidence.device_ticket_count = numerics_.TicketCount();
     std::copy_n(numerics_.Tickets().begin(), evidence.device_ticket_count,
