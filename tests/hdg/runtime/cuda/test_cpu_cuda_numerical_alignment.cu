@@ -484,7 +484,6 @@ Trajectory RunCpu(const EulerHdgRequest& request,
     double conservation_error = 0.0;
     double conservation_relative_error = 0.0;
     const bool conservation_ready =
-        specification.regularization != RegularizationKind::igr ||
         dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
             AuditLastConservation(
                 core, conservation_error, conservation_relative_error,
@@ -578,8 +577,7 @@ Trajectory RunCuda(const EulerHdgRequest& request,
         CudaQualificationTestAccess::CapturePreparedHealth(session, health);
     const bool healthy = captured && health.success && health.finite &&
         health.admissible && health.recovery && health.true_residual &&
-        (specification.regularization != RegularizationKind::igr ||
-         health.conservation) &&
+        health.conservation &&
         health.nonlinear_updates >= 0 &&
         health.nonlinear_updates <=
             request.numerical_policy.maximum_nonlinear_updates &&
@@ -591,9 +589,8 @@ Trajectory RunCuda(const EulerHdgRequest& request,
                 (1.0 + health.initial_residual) &&
         health.true_relative_residual <=
             request.numerical_policy.true_residual_relative_tolerance &&
-        (specification.regularization != RegularizationKind::igr ||
-         health.maximum_conservation_relative_error <=
-             request.numerical_policy.conservation_relative_tolerance);
+        health.maximum_conservation_relative_error <=
+            request.numerical_policy.conservation_relative_tolerance;
     if (!healthy || !session.AcknowledgePreparedOutput(authority, output) ||
         session.Commit(std::move(authority), output).status !=
             dg::hdg::generic::HdgEulerSessionStatus::committed)
@@ -639,6 +636,17 @@ bool CompareTrajectory(const Case& specification,
               comparison_absolute_tolerance +
               comparison_relative_tolerance * scale;
     };
+    // Both backends independently enforce the same 1e-10 acceptance policy.
+    // Their ordered local accumulation is identical, but MPI and host/device
+    // FP64 instruction ordering may differ; 4096 eps isolates that justified
+    // arithmetic freedom without weakening either backend's gate.
+    const auto near_conservation = [](const double left, const double right)
+    {
+      constexpr double tolerance = 4096.0 *
+          std::numeric_limits<double>::epsilon();
+      return std::isfinite(left) && std::isfinite(right) &&
+          std::abs(left - right) <= tolerance;
+    };
     const bool state_passed = interior.passed && trace.passed &&
         reference.trace_components == device.trace_components &&
         reference.step == device.step &&
@@ -647,7 +655,12 @@ bool CompareTrajectory(const Case& specification,
         near_scalar(reference.maximum_wave_speed,
                     device.maximum_wave_speed) &&
         near_scalar(reference.backend_stable_dt,
-                    device.backend_stable_dt);
+                    device.backend_stable_dt) &&
+        near_conservation(reference.maximum_conservation_error,
+                          device.maximum_conservation_error) &&
+        near_conservation(
+            reference.maximum_conservation_relative_error,
+            device.maximum_conservation_relative_error);
     passed = state_passed && passed;
     if (!state_passed)
     {
@@ -662,7 +675,13 @@ bool CompareTrajectory(const Case& specification,
                 << " wave=" << reference.maximum_wave_speed
                 << '/' << device.maximum_wave_speed
                 << " stable_dt=" << reference.backend_stable_dt
-                << '/' << device.backend_stable_dt << '\n';
+                << '/' << device.backend_stable_dt
+                << " conservation="
+                << reference.maximum_conservation_error << '/'
+                << device.maximum_conservation_error
+                << " conservation_relative="
+                << reference.maximum_conservation_relative_error << '/'
+                << device.maximum_conservation_relative_error << '\n';
     }
   }
   return passed;

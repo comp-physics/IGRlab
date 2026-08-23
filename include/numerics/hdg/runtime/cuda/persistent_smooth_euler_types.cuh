@@ -47,7 +47,7 @@ inline constexpr int conserved_components = 4;
 inline constexpr int igr_interior_components = 7;
 inline constexpr int igr_trace_components = 5;
 inline constexpr int legacy_scalar_workspace_scalars = 11;
-inline constexpr int igr_conservation_result_scalars =
+inline constexpr int euler_conservation_result_scalars =
     2 * igr_trace_components + 2;
 inline constexpr int dimension = 2;
 // p1 values are retained for the Admission-02 oracle fixtures.  Runtime

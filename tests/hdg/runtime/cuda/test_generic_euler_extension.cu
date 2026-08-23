@@ -45,9 +45,27 @@ struct CudaPreparedIgrConservationCapture
   std::vector<double> previous_interior{};
   std::vector<double> current_interior{};
   std::vector<double> current_local_trace{};
-  std::array<double, igr_conservation_result_scalars> production_local{};
-  std::array<double, igr_conservation_result_scalars>
+  std::array<double, euler_conservation_result_scalars> production_local{};
+  std::array<double, euler_conservation_result_scalars>
       probed_production_local{};
+};
+
+struct CudaPreparedEulerConservationGateCapture
+{
+  std::array<double, euler_conservation_result_scalars> production_local{};
+  double lifecycle_maximum_error =
+      std::numeric_limits<double>::infinity();
+  double lifecycle_maximum_relative_error =
+      std::numeric_limits<double>::infinity();
+  int nonlinear_updates = -1;
+  FailureReason reason = FailureReason::none;
+  CudaFailurePhase phase = CudaFailurePhase::setup;
+  bool candidate_ready = false;
+  bool conservation = false;
+  bool success = false;
+  bool pending_active = false;
+  bool staging_retained = false;
+  bool prestage_allowed = false;
 };
 
 // This accessor is defined only in the qualification translation unit.  The
@@ -618,7 +636,7 @@ struct CudaQualificationTestAccess
     catch (...) { local_valid = false; }
 
     if (!numerics.CollectiveContinue(local_valid)) return false;
-    const bool launched = CudaLaunchIgrConservation(
+    const bool launched = CudaLaunchEulerConservation(
             numerics.view_, shape, engine.pending_.attempt.dt,
             numerics.view_.scalar) &&
         CudaTransportPolicy::Synchronize(CudaTransferSite::scalar_status);
@@ -665,7 +683,7 @@ struct CudaQualificationTestAccess
         engine.pending_.numerical.maximum_conservation_relative_error;
     local_valid = copied &&
         capture.production_local[
-            igr_conservation_result_scalars - 1] == 1.0 &&
+            euler_conservation_result_scalars - 1] == 1.0 &&
         std::isfinite(capture.production_local[2 * igr_trace_components]) &&
         capture.production_local[2 * igr_trace_components] >= 0.0 &&
         std::all_of(capture.production_local.begin(),
@@ -696,7 +714,7 @@ struct CudaQualificationTestAccess
     const bool probe_installed_everywhere =
         numerics.CollectiveContinue(probe_installed);
     const bool probe_launched = probe_installed_everywhere &&
-        CudaLaunchIgrConservation(
+        CudaLaunchEulerConservation(
             numerics.view_, shape, engine.pending_.attempt.dt,
             numerics.view_.scalar) &&
         CudaTransportPolicy::Synchronize(
@@ -733,7 +751,7 @@ struct CudaQualificationTestAccess
         trace_restored && scalar_restored && restore_synchronized);
     const bool probe_finite = probe_copied_everywhere &&
         capture.probed_production_local[
-            igr_conservation_result_scalars - 1] == 1.0 &&
+            euler_conservation_result_scalars - 1] == 1.0 &&
         capture.probed_production_local[2 * igr_trace_components] ==
             capture.production_local[2 * igr_trace_components] &&
         std::all_of(capture.probed_production_local.begin(),
@@ -754,6 +772,57 @@ struct CudaQualificationTestAccess
       return CapturePreparedIgrConservation(
           *session.borrowed_rank2_, capture);
     return false;
+  }
+
+  template <typename Engine>
+  static bool CapturePreparedEulerConservationGate(
+      Engine& engine,
+      CudaPreparedEulerConservationGateCapture& capture) noexcept
+  {
+    capture = {};
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    const auto& pending = engine.pending_;
+    bool local_valid = engine.initialized_ && pending.active &&
+        pending.staging.has_value() &&
+        engine.config_.use_generic_numerical_policy &&
+        engine.config_.numerical_policy.stabilization.kind ==
+            generic::RegularizationKind::none &&
+        shape.borrowed_host_inputs && !shape.igr_active &&
+        std::isfinite(pending.attempt.dt) && pending.attempt.dt > 0.0 &&
+        numerics.view_.scalar != nullptr;
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+    const bool launched = CudaLaunchEulerConservation(
+            numerics.view_, shape, pending.attempt.dt,
+            numerics.view_.scalar) &&
+        CudaTransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    if (!numerics.CollectiveContinue(launched)) return false;
+    const bool copied = CudaTransportPolicy::DeviceToHost(
+            capture.production_local.data(), numerics.view_.scalar,
+            capture.production_local.size() * sizeof(double),
+            CudaTransferCategory::scalar_diagnostic,
+            CudaTransferSite::scalar_status) &&
+        CudaTransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    capture.lifecycle_maximum_error =
+        pending.numerical.maximum_conservation_error;
+    capture.lifecycle_maximum_relative_error =
+        pending.numerical.maximum_conservation_relative_error;
+    capture.nonlinear_updates = pending.numerical.nonlinear_updates;
+    capture.reason = pending.numerical.reason;
+    capture.phase = pending.numerical.phase;
+    capture.candidate_ready = pending.numerical.candidate_ready;
+    capture.conservation = pending.numerical.conservation;
+    capture.success = pending.numerical.success;
+    capture.pending_active = pending.active;
+    capture.staging_retained = pending.staging.has_value();
+    capture.prestage_allowed = pending.prestage_allowed;
+    local_valid = copied &&
+        capture.production_local[euler_conservation_result_scalars - 1] ==
+            1.0 &&
+        std::all_of(capture.production_local.begin(),
+                    capture.production_local.end(),
+                    [](const double value) { return std::isfinite(value); });
+    return numerics.CollectiveContinue(local_valid);
   }
 
   template <typename Engine>
@@ -1147,6 +1216,8 @@ using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using dg::hdg::runtime::BorrowedCudaRank1OneGpuRuntimeSelection;
 using dg::hdg::runtime::BorrowedCudaRank2OneGpuHostStagedRuntimeSelection;
+using dg::hdg::runtime::FailureReason;
+using dg::hdg::runtime::RunStatus;
 using dg::hdg::runtime::cuda_w8a::CudaConfig;
 using dg::hdg::runtime::cuda_w8a::CudaBorrowedHostL2Input;
 using dg::hdg::runtime::cuda_w8a::CudaMutableHostL2Output;
@@ -1155,6 +1226,8 @@ using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
 using dg::hdg::runtime::cuda_w8a::CudaRunEvidence;
 using dg::hdg::runtime::cuda_w8a::CudaStepEvidence;
 using dg::hdg::runtime::cuda_w8a::PersistentCudaSmoothEulerEngine;
+using dg::hdg::runtime::cuda_w8a::detail::
+    CudaPreparedEulerConservationGateCapture;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedIgrConservationCapture;
 using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
@@ -2717,6 +2790,173 @@ bool CheckIndependentIgrConservation(const int order)
   return passed;
 }
 
+bool CheckConventionalConservationGateRollback(const int order,
+                                               const int ranks)
+{
+  // One focused rank-one/p1 case gives an analytic, source-only defect.  The
+  // ordinary p1-p3/rank-one/rank-two lifecycle cases below retain the broad
+  // supported-surface coverage without repeating this rollback fixture.
+  if (order != 1 || ranks != 1) return true;
+
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::nonzero, InitialMode::constant);
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::none);
+  // This admits the initial iterate as the nonlinear candidate.  With a
+  // periodic constant state, no physical boundary flux exists and U^n=U^{n+1};
+  // the four conservation balances are therefore exactly -dt*integral(S).
+  request.numerical_policy.nonlinear_relative_tolerance = 2.0;
+  constexpr double dt = 1.0e-5;
+
+  const auto run = [&](const double conservation_tolerance,
+                       const bool expect_conservation,
+                       CudaPreparedEulerConservationGateCapture& capture,
+                       CudaStepEvidence& rollback) -> bool
+  {
+    request.numerical_policy.conservation_relative_tolerance =
+        conservation_tolerance;
+    if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+        ContractStatus::accepted)
+      return false;
+    CudaConfig config = MakeDirectConfig(request, ranks, order);
+    auto engine = std::make_unique<PersistentCudaSmoothEulerEngine<
+        BorrowedCudaRank1OneGpuRuntimeSelection>>(config);
+    CudaRunEvidence initialization{};
+    if (!All(engine->Initialize(initialization), request.communicator) ||
+        engine->contract() == nullptr)
+      return false;
+    std::vector<double> committed_before(fields.initial.size(), -1.0);
+    const bool exported_before = engine->ExportCommittedInterior(
+        CudaMutableHostL2Output{
+            committed_before.data(), fields.volume_scalar_count, components});
+    const auto before = engine->contract()->coordinates();
+    CudaPrecommitSnapshot snapshot{};
+    CudaStepEvidence step{};
+    const bool prepared = engine->PrepareStep(false, dt, snapshot, step);
+    if (!All(prepared, request.communicator)) return false;
+    const bool captured = prepared &&
+        CudaQualificationTestAccess::CapturePreparedEulerConservationGate(
+            *engine, capture);
+    const bool gate_state = captured && snapshot.numerical_candidate_ready &&
+        capture.pending_active && capture.staging_retained &&
+        capture.candidate_ready && capture.nonlinear_updates == 0 &&
+        capture.conservation == expect_conservation &&
+        capture.success == expect_conservation &&
+        capture.prestage_allowed == expect_conservation &&
+        capture.reason == (expect_conservation
+            ? FailureReason::none : FailureReason::success_gate);
+
+    CudaPreparedOutputMetadataV1 output{};
+    const bool staged = engine->StagePreparedOutputMetadata(output, step);
+    const bool staging_state = staged == expect_conservation;
+    const bool aborted = engine->AbortPrepared(
+        output, FailureReason::backend_failure, rollback);
+    const auto after = engine->contract()->coordinates();
+    std::vector<double> committed_after(fields.initial.size(), -2.0);
+    const bool exported_after = engine->ExportCommittedInterior(
+        CudaMutableHostL2Output{
+            committed_after.data(), fields.volume_scalar_count, components});
+    const auto& telemetry = engine->contract()->telemetry();
+    const bool rolled_back = aborted && !rollback.committed &&
+        rollback.retry_available && rollback.coordinates_preserved &&
+        rollback.committed_bytes_preserved &&
+        rollback.before_interior_hash == rollback.after_interior_hash &&
+        rollback.before_trace_hash == rollback.after_trace_hash &&
+        dg::hdg::runtime::detail::SameCoordinates(before, after) &&
+        dg::hdg::runtime::detail::SameCoordinates(
+            rollback.before, rollback.after) &&
+        exported_before && exported_after &&
+        committed_before == fields.initial &&
+        committed_after == committed_before &&
+        engine->contract()->status() == RunStatus::retry_available &&
+        telemetry.commits == 0 && telemetry.rollbacks == 1 &&
+        !output.candidate_frozen && !output.checkpoint_staged &&
+        !output.output_staged && !output.successful_commit;
+    return All(
+        prepared && captured && gate_state && staging_state && rolled_back,
+        request.communicator);
+  };
+
+  CudaPreparedEulerConservationGateCapture relaxed{};
+  CudaStepEvidence relaxed_rollback{};
+  const bool relaxed_run = run(1.0e-4, true, relaxed, relaxed_rollback);
+  const std::array<double, 5> expected_balance{{
+      -2.5e-6, -1.25e-6, 1.875e-6, -3.75e-6, 0.0}};
+  const std::array<double, 5> expected_scale{{
+      2.5e-6, 1.25e-6, 1.875e-6, 3.75e-6, 0.0}};
+  const auto close = [](const double actual, const double expected)
+  {
+    return std::isfinite(actual) &&
+        std::abs(actual - expected) <=
+            2.0e-12 * (1.0 + std::abs(expected));
+  };
+  bool analytic = relaxed_run && close(relaxed.production_local[10], 1.0) &&
+      relaxed.production_local[11] == 1.0;
+  double production_maximum_error = 0.0;
+  double production_maximum_relative_error = 0.0;
+  for (std::size_t component = 0; analytic && component < 5; ++component)
+  {
+    analytic = close(relaxed.production_local[component],
+                     expected_balance[component]) &&
+        close(relaxed.production_local[5 + component],
+              expected_scale[component]);
+    if (component < 4)
+    {
+      const double error = std::abs(relaxed.production_local[component]);
+      production_maximum_error = std::max(
+          production_maximum_error, error);
+      production_maximum_relative_error = std::max(
+          production_maximum_relative_error,
+          dg::hdg::generic::EulerHdgConservationRelativeError(
+              error, relaxed.production_local[5 + component],
+              relaxed.production_local[10]));
+    }
+  }
+  analytic = analytic && production_maximum_relative_error > 1.0e-8 &&
+      production_maximum_relative_error < 1.0e-4 &&
+      relaxed.production_local[4] == 0.0 &&
+      relaxed.production_local[9] == 0.0 &&
+      close(relaxed.lifecycle_maximum_error, production_maximum_error) &&
+      close(relaxed.lifecycle_maximum_relative_error,
+            production_maximum_relative_error);
+
+  CudaPreparedEulerConservationGateCapture tight{};
+  CudaStepEvidence tight_rollback{};
+  const double tight_tolerance =
+      0.25 * production_maximum_relative_error;
+  const bool tight_run = analytic && tight_tolerance > 0.0 &&
+      run(tight_tolerance, false, tight, tight_rollback);
+  bool tight_balance_parity = tight_run;
+  for (std::size_t index = 0;
+       tight_balance_parity && index < tight.production_local.size(); ++index)
+    tight_balance_parity = close(
+        tight.production_local[index], relaxed.production_local[index]);
+  const bool rejected_by_measured_gate = tight_balance_parity &&
+      close(tight.lifecycle_maximum_error, production_maximum_error) &&
+      close(tight.lifecycle_maximum_relative_error,
+            production_maximum_relative_error) &&
+      tight.lifecycle_maximum_relative_error > tight_tolerance;
+  const bool passed = All(
+      analytic && rejected_by_measured_gate, request.communicator);
+  if (!passed)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+      std::cerr << "CUDA conventional conservation gate/rollback failed"
+                << " relaxed_run=" << relaxed_run
+                << " analytic=" << analytic
+                << " tight_run=" << tight_run
+                << " measured=" << production_maximum_relative_error
+                << " tight_tolerance=" << tight_tolerance
+                << " tight_lifecycle="
+                << tight.lifecycle_maximum_relative_error << '\n';
+  }
+  return passed;
+}
+
 bool CheckEulerAlgebra(const int order, const int ranks)
 {
   mfem::ParMesh periodic_mesh = MakePeriodicMesh();
@@ -3357,6 +3597,8 @@ int main(int argc, char* argv[])
       CheckMixedLoweredBoundaryPolicies(order);
   const bool independent_igr_conservation = order > 0 &&
       CheckIndependentIgrConservation(order);
+  const bool conventional_conservation_rollback = order > 0 &&
+      CheckConventionalConservationGateRollback(order, ranks);
   const bool euler_algebra = order > 0 && CheckEulerAlgebra(order, ranks);
   const bool zero_update_final_reconstruction = order > 0 &&
       CheckZeroUpdateFinalReconstruction(order);
@@ -3406,6 +3648,7 @@ int main(int argc, char* argv[])
   const bool passed = (ranks == 1 || ranks == 2) && All(
       admission && copied_initial_trace && all_seven_boundary_policies &&
       mixed_boundary_policies && independent_igr_conservation &&
+      conventional_conservation_rollback &&
       euler_algebra && zero_update_final_reconstruction &&
       conventional_periodic && conventional_physical &&
       igr_periodic && igr_physical && boundary_effect && source_equivalence);
@@ -3420,6 +3663,8 @@ int main(int argc, char* argv[])
               << " mixed_boundary_policies=" << mixed_boundary_policies
               << " independent_igr_conservation="
               << independent_igr_conservation
+              << " conventional_conservation_rollback="
+              << conventional_conservation_rollback
               << " euler_algebra=" << euler_algebra
               << " zero_update_final_reconstruction="
               << zero_update_final_reconstruction

@@ -441,7 +441,7 @@ struct CudaNumericalResult
   bool admissible = false;
   bool recovery = false;
   bool true_residual = false;
-  bool conservation = true;
+  bool conservation = false;
   bool telemetry = false;
   bool success = false;
   bool injected = false;

@@ -802,9 +802,9 @@ bool CudaLaunchMaximumWave(const CudaDeviceView& view,
                            const double* interior,
                            const double* element_trace,
                            double* result) noexcept;
-bool CudaLaunchIgrConservation(const CudaDeviceView& view,
-                               const CudaMeshShape& shape,
-                               double dt, double* result) noexcept;
+bool CudaLaunchEulerConservation(const CudaDeviceView& view,
+                                 const CudaMeshShape& shape,
+                                 double dt, double* result) noexcept;
 
 bool CudaLaunchHash(const double* values, int count,
                     std::uint64_t* words) noexcept;
@@ -1723,17 +1723,17 @@ private:
   }
 
 public:
-  bool IgrConservationBalance(const double dt, double& maximum_error,
-                              double& maximum_relative_error) noexcept
+  bool EulerConservationBalance(const double dt, double& maximum_error,
+                                double& maximum_relative_error) noexcept
   {
     maximum_error = 0.0;
     maximum_relative_error = 0.0;
     constexpr int components = igr_trace_components;
-    static_assert(igr_conservation_result_scalars == 2 * components + 2);
-    std::array<double, igr_conservation_result_scalars> local{};
-    const bool launched = initialized_ && shape_.igr_active &&
+    static_assert(euler_conservation_result_scalars == 2 * components + 2);
+    std::array<double, euler_conservation_result_scalars> local{};
+    const bool launched = initialized_ && shape_.borrowed_host_inputs &&
         std::isfinite(dt) && dt > 0.0 &&
-        CudaLaunchIgrConservation(view_, shape_, dt, view_.scalar) &&
+        CudaLaunchEulerConservation(view_, shape_, dt, view_.scalar) &&
         TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
     if (!CollectiveContinue(launched)) return false;
     const bool copied = TransportPolicy::DeviceToHost(
@@ -1764,7 +1764,9 @@ public:
                             std::isfinite(global_domain_measure) &&
                             global_domain_measure > 0.0))
       return false;
-    for (int component = 0; component < components; ++component)
+    const int active_components = shape_.igr_active
+        ? components : conserved_components;
+    for (int component = 0; component < active_components; ++component)
     {
       const double error = std::abs(
           global_balance[static_cast<std::size_t>(component)]);
@@ -1784,6 +1786,10 @@ public:
                               state_slot& workspace) noexcept
   {
     CudaNumericalResult result{};
+    // The frozen non-borrowed lifecycle has no Euler conservation contract.
+    // Borrowed Euler attempts remain fail-closed until their measured balance
+    // has passed below.
+    result.conservation = !shape_.borrowed_host_inputs;
     // The application may perform unrelated MFEM output work between solver
     // attempts, and MFEM/HYPRE may grow their opaque shared Umpire pool while
     // doing so.  Admit no growth caused by a warm solver attempt.  The first
@@ -2110,9 +2116,9 @@ public:
     if (config.force_private_scientific_gate_failure)
       result.true_residual = false;
     if (inject_at(CudaFailurePhase::diagnostics)) { return result; }
-    if (shape_.igr_active)
+    if (shape_.borrowed_host_inputs)
     {
-      const bool conservation_ready = IgrConservationBalance(
+      const bool conservation_ready = EulerConservationBalance(
           attempt.dt, result.maximum_conservation_error,
           result.maximum_conservation_relative_error);
       if (!CollectiveContinue(conservation_ready))
@@ -2956,7 +2962,7 @@ private:
           checked_add(doubles, layout.face_weight) && checked_add(doubles, layout.face_normal) &&
           (!shape_.igr_active || checked_add(doubles, layout.face_h)) &&
           checked_add(doubles, elements) &&
-          checked_add(doubles, igr_conservation_result_scalars) &&
+          checked_add(doubles, euler_conservation_result_scalars) &&
           checked_add(doubles, layout.face_weight) &&
           (!shape_.borrowed_static_boundary_policies ||
            (checked_add(doubles, layout.boundary_reference) &&

@@ -1107,6 +1107,7 @@ __device__ bool FluxJacobian(const double* state, const double nx,
       (!isfinite(nx) || !isfinite(ny)) || (nx == 0.0 && ny == 0.0))
     return false;
   const double rho = state[0], mx = state[1], my = state[2], e = state[3];
+  if (!isfinite(mx / rho) || !isfinite(my / rho)) return false;
   const double kinetic = 0.5 * (mx * mx + my * my) / rho;
   const double pressure = (cuda_gamma - 1.0) * (e - kinetic);
   if (!(pressure > 0.0) || !isfinite(pressure)) { return false; }
@@ -1136,6 +1137,33 @@ __device__ bool FluxJacobian(const double* state, const double nx,
   jacobian[15] = (1.0 + pe) * q / rho;
   return Finite4(flux) && Finite4(jacobian) && Finite4(jacobian + 4) &&
       Finite4(jacobian + 8) && Finite4(jacobian + 12);
+}
+
+// Flux-only form used by post-candidate conservation.  Its admission matches
+// the CPU NormalFlux policy exactly and deliberately does not add Jacobian
+// finiteness as a stronger diagnostic gate.
+__device__ bool EulerNormalFlux(const double* state, const double nx,
+                                const double ny, double* flux)
+{
+  if (!Finite4(state) || !(state[0] > 0.0) || !isfinite(nx) ||
+      !isfinite(ny) || (nx == 0.0 && ny == 0.0))
+    return false;
+  const double rho = state[0];
+  const double mx = state[1];
+  const double my = state[2];
+  const double energy = state[3];
+  const double velocity_x = mx / rho;
+  const double velocity_y = my / rho;
+  if (!isfinite(velocity_x) || !isfinite(velocity_y)) return false;
+  const double kinetic = 0.5 * (mx * mx + my * my) / rho;
+  const double pressure = (cuda_gamma - 1.0) * (energy - kinetic);
+  if (!(pressure > 0.0) || !isfinite(pressure)) return false;
+  const double normal_momentum = mx * nx + my * ny;
+  flux[0] = normal_momentum;
+  flux[1] = mx * normal_momentum / rho + pressure * nx;
+  flux[2] = my * normal_momentum / rho + pressure * ny;
+  flux[3] = (energy + pressure) * normal_momentum / rho;
+  return Finite4(flux);
 }
 
 // Euler flux augmented by the scalar IGR stress.  The 4x5 Jacobian has
@@ -1231,6 +1259,8 @@ __device__ bool Admissible(const double* state)
 __device__ bool PhysicallyAdmissible(const double* state)
 {
   if (!Finite4(state) || !(state[0] > 0.0)) return false;
+  if (!isfinite(state[1] / state[0]) ||
+      !isfinite(state[2] / state[0])) return false;
   const double kinetic = 0.5 *
       (state[1] * state[1] + state[2] * state[2]) / state[0];
   const double pressure = (cuda_gamma - 1.0) * (state[3] - kinetic);
@@ -1250,6 +1280,7 @@ __device__ bool LocalLlfSpeed(const double* state, const double nx,
       !isfinite(ny) || (nx == 0.0 && ny == 0.0)) return false;
   const double rho = state[0];
   const double mx = state[1], my = state[2], energy = state[3];
+  if (!isfinite(mx / rho) || !isfinite(my / rho)) return false;
   const double pressure = (cuda_gamma - 1.0) *
       (energy - 0.5 * (mx * mx + my * my) / rho);
   const double sound_squared = cuda_gamma * pressure / rho;
@@ -2016,20 +2047,22 @@ __global__ void MaximumWaveKernel(CudaDeviceView v,CudaMeshShape s,
                                   const double* trace,double* out)
 {if(blockIdx.x||threadIdx.x)return;double maximum=0.0;bool valid=true;for(int e=0;e<s.elements;++e){const int ib=e*s.interior_dofs,tb=e*s.trace_dofs;for(int q=0;q<s.volume_points;++q){const int qp=e*s.volume_points+q;double state[4]={};for(int a=0;a<s.scalar_interior_dofs;++a)for(int k=0;k<4;++k)state[k]+=v.volume_shape[qp*s.scalar_interior_dofs+a]*interior[ib+ByNodes(a,s.scalar_interior_dofs,k)];ObserveEulerWave(state,maximum,valid);}for(int f=0;f<faces_per_element;++f)for(int q=0;q<s.face_points;++q){const int qp=(e*faces_per_element+f)*s.face_points+q,fo=f*s.trace_components*s.scalar_face_dofs;double volume_state[4]={},trace_state[4]={};for(int a=0;a<s.scalar_interior_dofs;++a)for(int k=0;k<4;++k)volume_state[k]+=v.face_interior_shape[qp*s.scalar_interior_dofs+a]*interior[ib+ByNodes(a,s.scalar_interior_dofs,k)];for(int a=0;a<s.scalar_face_dofs;++a)for(int k=0;k<4;++k)trace_state[k]+=v.face_trace_shape[qp*s.scalar_face_dofs+a]*trace[tb+fo+ByNodes(a,s.scalar_face_dofs,k)];ObserveEulerWave(volume_state,maximum,valid);ObserveEulerWave(trace_state,maximum,valid);}}out[0]=maximum;out[1]=valid?1.0:0.0;}
 
-// Compact post-candidate balance used by the production IGR lifecycle.  One
-// thread deliberately accumulates in element/quadrature order so the device
-// result mirrors the CPU reference reduction without a second assembler or
-// nondeterministic atomics.  out[0:5] are balances, out[5:10] their scales,
-// out[10] is the domain measure, and out[11] is the validity flag.
-__global__ void IgrConservationKernel(CudaDeviceView v, CudaMeshShape s,
-                                      const double dt, double* out)
+// Compact post-candidate balance used by the production borrowed-Euler
+// lifecycle.  IGR contributes its auxiliary balance and regularized physical
+// flux in the same kernel; conventional Euler uses its LLF numerical flux.
+// One thread deliberately accumulates in element/quadrature order so the
+// device result mirrors the CPU reference reduction without a second
+// assembler or nondeterministic atomics.  out[0:5] are balances, out[5:10]
+// their scales, out[10] is the domain measure, and out[11] is validity.
+__global__ void EulerConservationKernel(CudaDeviceView v, CudaMeshShape s,
+                                        const double dt, double* out)
 {
   if (blockIdx.x || threadIdx.x) return;
   constexpr int components = igr_trace_components;
-  static_assert(igr_conservation_result_scalars == 2 * components + 2);
+  static_assert(euler_conservation_result_scalars == 2 * components + 2);
   for (int index = 0; index < 2 * components + 1; ++index) out[index] = 0.0;
-  bool valid = s.igr_active && isfinite(dt) && dt > 0.0 &&
-      v.face_h != nullptr;
+  bool valid = s.borrowed_host_inputs && isfinite(dt) && dt > 0.0 &&
+      (!s.igr_active || v.face_h != nullptr);
   const double degree_scale = static_cast<double>(
       (s.order + 1) * (s.order + 1));
   for (int e = 0; e < s.elements && valid; ++e)
@@ -2057,20 +2090,23 @@ __global__ void IgrConservationKernel(CudaDeviceView v, CudaMeshShape s,
           previous[component] += phi * v.old_interior[index];
           source[component] += phi * v.static_source[index];
         }
-        sigma += phi * v.work_interior[interior_offset + ByNodes(
-            scalar, s.scalar_interior_dofs, 4)];
-        for (int component = 0; component < 3; ++component)
-          for (int direction = 0; direction < dimension; ++direction)
-            conservative_gradient[component][direction] +=
-                v.volume_derivative[
-                    (qp * s.scalar_interior_dofs + scalar) * dimension +
-                    direction] *
-                v.work_interior[interior_offset + ByNodes(
-                    scalar, s.scalar_interior_dofs, component)];
+        if (s.igr_active)
+        {
+          sigma += phi * v.work_interior[interior_offset + ByNodes(
+              scalar, s.scalar_interior_dofs, 4)];
+          for (int component = 0; component < 3; ++component)
+            for (int direction = 0; direction < dimension; ++direction)
+              conservative_gradient[component][direction] +=
+                  v.volume_derivative[
+                      (qp * s.scalar_interior_dofs + scalar) * dimension +
+                      direction] *
+                  v.work_interior[interior_offset + ByNodes(
+                      scalar, s.scalar_interior_dofs, component)];
+        }
       }
       valid = weight > 0.0 && isfinite(weight) &&
-          current[0] > cuda_density_gate &&
-          isfinite(sigma);
+          (!s.igr_active ||
+           (current[0] > cuda_density_gate && isfinite(sigma)));
       if (valid) out[2 * components] += weight;
       for (int component = 0;
            component < conserved_components && valid; ++component)
@@ -2082,27 +2118,31 @@ __global__ void IgrConservationKernel(CudaDeviceView v, CudaMeshShape s,
         out[component] += change - forcing;
         out[components + component] += fabs(change) + fabs(forcing);
       }
-      double velocity_gradient[dimension][dimension] = {};
-      for (int velocity = 0; velocity < dimension; ++velocity)
-        for (int direction = 0; direction < dimension; ++direction)
-          velocity_gradient[velocity][direction] =
-              conservative_gradient[1 + velocity][direction] / current[0] -
-              current[1 + velocity] *
-                  conservative_gradient[0][direction] /
-                  (current[0] * current[0]);
-      const double velocity_trace =
-          velocity_gradient[0][0] + velocity_gradient[1][1];
-      const double q_value =
-          velocity_gradient[0][0] * velocity_gradient[0][0] +
-          2.0 * velocity_gradient[0][1] * velocity_gradient[1][0] +
-          velocity_gradient[1][1] * velocity_gradient[1][1] +
-          velocity_trace * velocity_trace;
-      const double sigma_contribution = weight * sigma / current[0];
-      const double q_contribution = weight * s.igr_alpha * q_value;
-      valid = valid && isfinite(q_value) && isfinite(sigma_contribution) &&
-          isfinite(q_contribution);
-      out[4] += sigma_contribution - q_contribution;
-      out[9] += fabs(sigma_contribution) + fabs(q_contribution);
+      if (s.igr_active)
+      {
+        double velocity_gradient[dimension][dimension] = {};
+        for (int velocity = 0; velocity < dimension; ++velocity)
+          for (int direction = 0; direction < dimension; ++direction)
+            velocity_gradient[velocity][direction] =
+                conservative_gradient[1 + velocity][direction] /
+                    current[0] -
+                current[1 + velocity] *
+                    conservative_gradient[0][direction] /
+                    (current[0] * current[0]);
+        const double velocity_trace =
+            velocity_gradient[0][0] + velocity_gradient[1][1];
+        const double q_value =
+            velocity_gradient[0][0] * velocity_gradient[0][0] +
+            2.0 * velocity_gradient[0][1] * velocity_gradient[1][0] +
+            velocity_gradient[1][1] * velocity_gradient[1][1] +
+            velocity_trace * velocity_trace;
+        const double sigma_contribution = weight * sigma / current[0];
+        const double q_contribution = weight * s.igr_alpha * q_value;
+        valid = valid && isfinite(q_value) &&
+            isfinite(sigma_contribution) && isfinite(q_contribution);
+        out[4] += sigma_contribution - q_contribution;
+        out[9] += fabs(sigma_contribution) + fabs(q_contribution);
+      }
     }
 
     for (int face = 0; face < faces_per_element && valid; ++face)
@@ -2111,8 +2151,8 @@ __global__ void IgrConservationKernel(CudaDeviceView v, CudaMeshShape s,
       const bool physical = v.boundary_policy_kind != nullptr &&
           v.boundary_policy_kind[element_face] != 0;
       if (!physical) continue;
-      const double h = v.face_h[element_face];
-      valid = isfinite(h) && h > 0.0;
+      const double h = s.igr_active ? v.face_h[element_face] : 1.0;
+      valid = !s.igr_active || (isfinite(h) && h > 0.0);
       const int face_offset = face * s.trace_components * s.scalar_face_dofs;
       for (int q = 0; q < s.face_points && valid; ++q)
       {
@@ -2135,12 +2175,15 @@ __global__ void IgrConservationKernel(CudaDeviceView v, CudaMeshShape s,
             interior[component] += phi * v.work_interior[
                 interior_offset + ByNodes(
                     scalar, s.scalar_interior_dofs, component)];
-          sigma += phi * v.work_interior[interior_offset + ByNodes(
-              scalar, s.scalar_interior_dofs, 4)];
-          z[0] += phi * v.work_interior[interior_offset + ByNodes(
-              scalar, s.scalar_interior_dofs, 5)];
-          z[1] += phi * v.work_interior[interior_offset + ByNodes(
-              scalar, s.scalar_interior_dofs, 6)];
+          if (s.igr_active)
+          {
+            sigma += phi * v.work_interior[interior_offset + ByNodes(
+                scalar, s.scalar_interior_dofs, 4)];
+            z[0] += phi * v.work_interior[interior_offset + ByNodes(
+                scalar, s.scalar_interior_dofs, 5)];
+            z[1] += phi * v.work_interior[interior_offset + ByNodes(
+                scalar, s.scalar_interior_dofs, 6)];
+          }
         }
         for (int scalar = 0; scalar < s.scalar_face_dofs; ++scalar)
         {
@@ -2151,40 +2194,59 @@ __global__ void IgrConservationKernel(CudaDeviceView v, CudaMeshShape s,
             trace[component] += phi * v.current_local_trace[
                 trace_offset + face_offset + ByNodes(
                     scalar, s.scalar_face_dofs, component)];
-          sigma_hat += phi * v.current_local_trace[
-              trace_offset + face_offset + ByNodes(
-                  scalar, s.scalar_face_dofs, 4)];
+          if (s.igr_active)
+            sigma_hat += phi * v.current_local_trace[
+                trace_offset + face_offset + ByNodes(
+                    scalar, s.scalar_face_dofs, 4)];
         }
         double flux[conserved_components] = {};
         double jacobian[conserved_components * igr_trace_components] = {};
         valid = weight > 0.0 && isfinite(weight) &&
-            RegularizedFluxJacobian(trace, sigma_hat, normal[0], normal[1],
-                                    flux, jacobian);
+            (s.igr_active
+                 ? RegularizedFluxJacobian(
+                       trace, sigma_hat, normal[0], normal[1], flux,
+                       jacobian)
+                 : EulerNormalFlux(trace, normal[0], normal[1], flux));
+        double stabilization = s.igr_beta;
+        if (!s.igr_active && valid)
+        {
+          double interior_speed = 0.0;
+          double trace_speed = 0.0;
+          valid = LocalLlfSpeed(
+                      interior, normal[0], normal[1], interior_speed) &&
+              LocalLlfSpeed(trace, normal[0], normal[1], trace_speed);
+          stabilization = fmax(interior_speed, trace_speed);
+          valid = valid && isfinite(stabilization) && stabilization > 0.0;
+        }
         for (int component = 0;
              component < conserved_components && valid; ++component)
         {
-          const double numerical_flux = flux[component] + s.igr_beta *
+          const double numerical_flux = flux[component] + stabilization *
               (interior[component] - trace[component]);
           const double contribution = dt * weight * numerical_flux;
           valid = isfinite(contribution);
           out[component] += contribution;
           out[components + component] += fabs(contribution);
         }
-        valid = valid && trace[0] > cuda_density_gate;
-        const double tau = degree_scale / (trace[0] * h);
-        const double z_hat_normal = z[0] * normal[0] + z[1] * normal[1] -
-            tau * (sigma - sigma_hat);
-        const double contribution = s.igr_alpha * weight * z_hat_normal;
-        valid = valid && tau > 0.0 && isfinite(tau) &&
-            isfinite(contribution);
-        out[4] -= contribution;
-        out[9] += fabs(contribution);
+        if (s.igr_active)
+        {
+          valid = valid && trace[0] > cuda_density_gate;
+          const double tau = degree_scale / (trace[0] * h);
+          const double z_hat_normal =
+              z[0] * normal[0] + z[1] * normal[1] -
+              tau * (sigma - sigma_hat);
+          const double contribution = s.igr_alpha * weight * z_hat_normal;
+          valid = valid && tau > 0.0 && isfinite(tau) &&
+              isfinite(contribution);
+          out[4] -= contribution;
+          out[9] += fabs(contribution);
+        }
       }
     }
   }
   for (int index = 0; index < 2 * components; ++index)
     valid = valid && isfinite(out[index]);
-  out[igr_conservation_result_scalars - 1] = valid ? 1.0 : 0.0;
+  out[euler_conservation_result_scalars - 1] = valid ? 1.0 : 0.0;
 }
 __global__ void HashKernel(const double* values,int count,std::uint64_t* out)
 {if(blockIdx.x||threadIdx.x)return;std::uint64_t h[4]={1469598103934665603ULL,1099511628211ULL^0x9e3779b97f4a7c15ULL,1469598103934665603ULL^0xd6e8feb86659fd93ULL,1099511628211ULL^0xa0761d6478bd642fULL};const unsigned char* bytes=reinterpret_cast<const unsigned char*>(values);for(int i=0;i<count*static_cast<int>(sizeof(double));++i)for(int lane=0;lane<4;++lane){h[lane]^=static_cast<std::uint64_t>(bytes[i]+17U*lane);h[lane]*=1099511628211ULL+2ULL*lane;}for(int lane=0;lane<4;++lane)out[lane]=h[lane];}
@@ -2234,10 +2296,10 @@ bool CudaLaunchMaximumWave(const CudaDeviceView& v,const CudaMeshShape& s,
                            const double* interior,const double* trace,
                            double* out) noexcept
 {MaximumWaveKernel<<<1,1>>>(v,s,interior,trace,out);return LaunchOk();}
-bool CudaLaunchIgrConservation(const CudaDeviceView& v,
-                               const CudaMeshShape& s,
-                               const double dt, double* out) noexcept
-{IgrConservationKernel<<<1,1>>>(v,s,dt,out);return LaunchOk();}
+bool CudaLaunchEulerConservation(const CudaDeviceView& v,
+                                 const CudaMeshShape& s,
+                                 const double dt, double* out) noexcept
+{EulerConservationKernel<<<1,1>>>(v,s,dt,out);return LaunchOk();}
 bool CudaLaunchHash(const double* values,int count,std::uint64_t* words) noexcept
 {HashKernel<<<1,1>>>(values,count,words);return LaunchOk();}
 
