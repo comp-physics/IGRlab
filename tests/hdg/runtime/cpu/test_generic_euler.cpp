@@ -1077,28 +1077,70 @@ bool CheckIgrExtensionLifecycle()
                                    mfem::FiniteElement::VALUE);
   mfem::ParFiniteElementSpace space(&mesh, &collection, 4,
                                     mfem::Ordering::byNODES);
+  const std::size_t scalar_count =
+      static_cast<std::size_t>(space.GetVSize() / 4);
   std::vector<double> before(static_cast<std::size_t>(space.GetVSize()), 0.0);
-  const bool exported_before = session.ExportCommittedInterior(
-      {before.data(), before.size()});
+  std::vector<double> sigma_before(
+      scalar_count, std::numeric_limits<double>::quiet_NaN());
+  const bool exported_before = session.ExportCommittedFields(
+      {before.data(), sigma_before.data(), scalar_count});
+  // The auxiliary field is initialized to the neutral IGR state.  It is
+  // therefore allowed to be identically zero before the first nonlinear
+  // solve, but it must be a finite member of the same committed transaction.
+  const bool finite_initial_sigma = std::all_of(
+      sigma_before.begin(), sigma_before.end(),
+      [](const double value) { return std::isfinite(value); });
+  std::vector<double> bad_state(before.size(), 17.0);
+  std::vector<double> bad_sigma(sigma_before.size(), 19.0);
+  const bool rejected_bad_extent = scalar_count > 0 &&
+      !session.ExportCommittedFields(
+          {bad_state.data(), bad_sigma.data(), scalar_count - 1}) &&
+      std::all_of(bad_state.begin(), bad_state.end(),
+                  [](const double value) { return value == 17.0; }) &&
+      std::all_of(bad_sigma.begin(), bad_sigma.end(),
+                  [](const double value) { return value == 19.0; });
   GenericEulerCpuPreparedStep first;
   const auto prepared = session.Prepare(0.001, first);
   std::vector<double> candidate(before.size(), 0.0);
+  std::vector<double> sigma_candidate(scalar_count, 0.0);
   const bool exported_candidate = prepared.status == GenericEulerCpuSessionStatus::prepared &&
-      session.ExportPreparedInterior(first, {candidate.data(), candidate.size()});
-  const bool changed = candidate != before;
+      session.ExportPreparedFields(
+          first, {candidate.data(), sigma_candidate.data(), scalar_count});
+  const bool finite_candidate_sigma = std::all_of(
+      sigma_candidate.begin(), sigma_candidate.end(),
+      [](const double value) { return std::isfinite(value); });
+  const bool changed = candidate != before || sigma_candidate != sigma_before;
   const auto aborted = prepared.status == GenericEulerCpuSessionStatus::prepared
       ? session.Abort(std::move(first)) : decltype(session.Abort(std::move(first))){ };
   std::vector<double> after_abort(before.size(), 0.0);
-  const bool rollback = session.ExportCommittedInterior({after_abort.data(), after_abort.size()}) &&
-      after_abort == before;
+  std::vector<double> sigma_after_abort(scalar_count, 0.0);
+  const bool rollback = session.ExportCommittedFields(
+      {after_abort.data(), sigma_after_abort.data(), scalar_count}) &&
+      after_abort == before && sigma_after_abort == sigma_before;
   GenericEulerCpuPreparedStep retry;
   const auto retried = session.Prepare(0.001, retry);
+  std::vector<double> retry_candidate(before.size(), 0.0);
+  std::vector<double> sigma_retry_candidate(scalar_count, 0.0);
+  const bool exported_retry =
+      retried.status == GenericEulerCpuSessionStatus::prepared &&
+      session.ExportPreparedFields(
+          retry,
+          {retry_candidate.data(), sigma_retry_candidate.data(), scalar_count});
   const auto committed = retried.status == GenericEulerCpuSessionStatus::prepared
       ? session.Commit(std::move(retry)) : decltype(session.Commit(std::move(retry))){ };
+  std::vector<double> after_commit(before.size(), 0.0);
+  std::vector<double> sigma_after_commit(scalar_count, 0.0);
+  const bool committed_identity = session.ExportCommittedFields(
+      {after_commit.data(), sigma_after_commit.data(), scalar_count}) &&
+      after_commit == retry_candidate &&
+      sigma_after_commit == sigma_retry_candidate;
   const auto second = session.Advance(0.001);
-  return exported_before && exported_candidate && changed &&
+  return exported_before && finite_initial_sigma && rejected_bad_extent &&
+      exported_candidate && finite_candidate_sigma && changed &&
       aborted.status == GenericEulerCpuSessionStatus::aborted && rollback &&
+      exported_retry &&
       committed.status == GenericEulerCpuSessionStatus::committed &&
+      committed_identity &&
       second.status == GenericEulerCpuSessionStatus::advanced &&
       second.coordinates.step == 2 && second.coordinates.generation == 2 &&
       boundary.calls == 0;

@@ -711,7 +711,8 @@ ExportInterior(const CudaInteriorState& source,
       shape_.interior_components == conserved_components;
   const bool packed = physical_layout_contiguous ||
       CudaLaunchPackInteriorOutput(
-          shape_, source.coefficients, view_.output_interior);
+          shape_, source.coefficients, view_.output_interior,
+          conserved_components);
   const double* const device_export = physical_layout_contiguous
       ? source.coefficients : view_.output_interior;
   const bool copied = packed &&
@@ -734,6 +735,87 @@ ExportInterior(const CudaInteriorState& source,
       destination.coefficients[dof] = sign * host_export_interior_[
           static_cast<std::size_t>(element) * conserved_components *
               shape_.scalar_interior_dofs + local];
+    }
+  return true;
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+ExportFields(const CudaInteriorState& source,
+             const generic::HdgEulerHostInteriorFields destination) noexcept
+{
+  const std::size_t scalar_count =
+      static_cast<std::size_t>(interior_space_->GetVSize() /
+                               shape_.interior_components);
+  const bool sigma_requested = destination.sigma_coefficients != nullptr;
+  const int output_components = sigma_requested
+      ? igr_published_components : conserved_components;
+  const std::size_t coefficient_count = scalar_count *
+      static_cast<std::size_t>(output_components);
+  bool local_valid = initialized_ && borrowed_host_inputs_ &&
+      source.coefficients != nullptr && source.count ==
+          static_cast<std::size_t>(shape_.interior_count) &&
+      destination.scalar_count == scalar_count &&
+      (destination.conservative_coefficients != nullptr || scalar_count == 0) &&
+      (!sigma_requested || shape_.igr_active);
+  // Validate the complete reverse scatter before launching or transferring,
+  // so a rejected request cannot partially overwrite either caller field.
+  for (int element = 0; local_valid && element < shape_.elements; ++element)
+    for (int component = 0;
+         local_valid && component < output_components; ++component)
+      for (int scalar = 0;
+           local_valid && scalar < shape_.scalar_interior_dofs; ++scalar)
+    {
+      const int local = scalar + shape_.scalar_interior_dofs * component;
+      double sign = 1.0;
+      const int dof = CudaDecodeSigned(signed_element_interior_[
+          static_cast<std::size_t>(element) * shape_.interior_dofs + local],
+          sign);
+      const std::size_t lower = static_cast<std::size_t>(component) *
+          scalar_count;
+      const std::size_t upper = lower + scalar_count;
+      local_valid = dof >= 0 && static_cast<std::size_t>(dof) >= lower &&
+          static_cast<std::size_t>(dof) < upper;
+    }
+  if (!CollectiveContinue(local_valid)) { return false; }
+  const bool layout_contiguous =
+      shape_.interior_components == output_components;
+  const bool packed = layout_contiguous ||
+      CudaLaunchPackInteriorOutput(
+          shape_, source.coefficients, view_.output_interior,
+          output_components);
+  const double* const device_export = layout_contiguous
+      ? source.coefficients : view_.output_interior;
+  const bool copied = packed &&
+      TransportPolicy::DeviceToHost(
+          host_export_interior_.data(), device_export,
+          coefficient_count * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export) &&
+      TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
+  if (!CollectiveContinue(copied)) { return false; }
+  for (int element = 0; element < shape_.elements; ++element)
+    for (int component = 0; component < output_components; ++component)
+      for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
+    {
+      const int local = scalar + shape_.scalar_interior_dofs * component;
+      double sign = 1.0;
+      const int dof = CudaDecodeSigned(signed_element_interior_[
+          static_cast<std::size_t>(element) * shape_.interior_dofs + local],
+          sign);
+      const double value = sign * host_export_interior_[
+          static_cast<std::size_t>(element) * output_components *
+              shape_.scalar_interior_dofs + local];
+      if (component < conserved_components)
+      {
+        destination.conservative_coefficients[dof] = value;
+      }
+      else
+      {
+        destination.sigma_coefficients[
+            dof - static_cast<int>(conserved_components * scalar_count)] =
+                value;
+      }
     }
   return true;
 }

@@ -5662,7 +5662,7 @@ bool detail::CpuNumericsCore::AdmitBorrowedEulerOperation(
   const bool known = local_operation >=
           static_cast<int>(CpuBorrowedEulerOperation::prepare) &&
       local_operation <= static_cast<int>(
-          CpuBorrowedEulerOperation::export_prepared_grid_function);
+          CpuBorrowedEulerOperation::export_prepared_fields);
   return state.CollectiveAll(
       state.initialized && state.IsBorrowed() &&
       minimum_status == MPI_SUCCESS && maximum_status == MPI_SUCCESS && known &&
@@ -8115,6 +8115,42 @@ bool detail::CpuNumericsCore::ExportCommittedInterior(
   return true;
 }
 
+bool detail::CpuNumericsCore::ExportCommittedFields(
+    const generic::HdgEulerHostInteriorFields destination) const noexcept
+{
+  const Implementation& state = *implementation_;
+  const CpuSlotStorage* const committed = state.Committed();
+  const std::size_t scalar_count =
+      committed && state.interior_components > 0 &&
+          committed->interior.size() %
+              static_cast<std::size_t>(state.interior_components) == 0
+      ? committed->interior.size() /
+            static_cast<std::size_t>(state.interior_components)
+      : 0;
+  const bool sigma_requested = destination.sigma_coefficients != nullptr;
+  if (!state.initialized || !state.IsBorrowed() || !committed ||
+      destination.scalar_count != scalar_count ||
+      (destination.conservative_coefficients == nullptr && scalar_count != 0) ||
+      (sigma_requested && state.interior_components != igr_interior_components))
+  {
+    return false;
+  }
+  if (scalar_count != 0)
+  {
+    std::memcpy(destination.conservative_coefficients,
+                committed->interior.data(),
+                scalar_count * cpu_conserved_components * sizeof(double));
+    if (sigma_requested)
+    {
+      std::memcpy(destination.sigma_coefficients,
+                  committed->interior.data() +
+                      scalar_count * cpu_conserved_components,
+                  scalar_count * sizeof(double));
+    }
+  }
+  return true;
+}
+
 bool detail::CpuNumericsCore::ExportPreparedInterior(
     const std::uint64_t generation, double* const destination,
     const std::size_t size) const noexcept
@@ -8191,6 +8227,56 @@ bool detail::CpuNumericsCore::ExportPreparedInterior(
   {
     std::memcpy(values, candidate->interior.data(),
                 public_size * sizeof(double));
+  }
+  return true;
+}
+
+bool detail::CpuNumericsCore::ExportPreparedFields(
+    const std::uint64_t generation,
+    const generic::HdgEulerHostInteriorFields destination) const noexcept
+{
+  const Implementation& state = *implementation_;
+  std::uint64_t minimum_generation = 0;
+  std::uint64_t maximum_generation = 0;
+  const int minimum_status = MPI_Allreduce(
+      &generation, &minimum_generation, 1, MPI_UINT64_T, MPI_MIN,
+      state.communicator);
+  const int maximum_status = MPI_Allreduce(
+      &generation, &maximum_generation, 1, MPI_UINT64_T, MPI_MAX,
+      state.communicator);
+  const bool generation_consensus = minimum_status == MPI_SUCCESS &&
+      maximum_status == MPI_SUCCESS && minimum_generation == maximum_generation;
+  const CpuSlotStorage* const candidate = state.Candidate();
+  const std::size_t scalar_count =
+      candidate && state.interior_components > 0 &&
+          candidate->interior.size() %
+              static_cast<std::size_t>(state.interior_components) == 0
+      ? candidate->interior.size() /
+            static_cast<std::size_t>(state.interior_components)
+      : 0;
+  const bool sigma_requested = destination.sigma_coefficients != nullptr;
+  const bool local_valid = state.initialized && state.IsBorrowed() &&
+      state.borrowed_prepare_active && CandidateGenerationActive(generation) &&
+      candidate && destination.scalar_count == scalar_count &&
+      (destination.conservative_coefficients != nullptr || scalar_count == 0) &&
+      (!sigma_requested ||
+       state.interior_components == igr_interior_components);
+  if (!state.CollectiveAll(generation_consensus && local_valid))
+  {
+    return false;
+  }
+  if (scalar_count != 0)
+  {
+    std::memcpy(destination.conservative_coefficients,
+                candidate->interior.data(),
+                scalar_count * cpu_conserved_components * sizeof(double));
+    if (sigma_requested)
+    {
+      std::memcpy(destination.sigma_coefficients,
+                  candidate->interior.data() +
+                      scalar_count * cpu_conserved_components,
+                  scalar_count * sizeof(double));
+    }
   }
   return true;
 }

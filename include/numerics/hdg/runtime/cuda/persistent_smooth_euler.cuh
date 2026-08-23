@@ -1087,6 +1087,14 @@ public:
                                     destination);
   }
 
+  bool ExportCommittedFields(
+      generic::HdgEulerHostInteriorFields destination) noexcept
+  {
+    if (!initialized_ || pending_.active) { return false; }
+    return numerics_.ExportFields(numerics_.CommittedSlot().interior,
+                                  destination);
+  }
+
   bool CachedBorrowedEulerDiagnostics(double& maximum_wave_speed,
                                       double& backend_stable_dt) const noexcept
   {
@@ -1103,6 +1111,16 @@ public:
       return false;
     return numerics_.ExportInterior(numerics_.WorkspaceSlot().interior,
                                     destination);
+  }
+
+  bool ExportPreparedFields(
+      generic::HdgEulerHostInteriorFields destination) noexcept
+  {
+    if (!initialized_ || !pending_.active || !pending_.staging ||
+        !pending_.prestage_allowed || !pending_.checkpoint_staged)
+      return false;
+    return numerics_.ExportFields(numerics_.WorkspaceSlot().interior,
+                                  destination);
   }
 
   CudaReuseEvidence ReuseEvidence() const noexcept

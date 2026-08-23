@@ -139,6 +139,16 @@ public:
   bool ExportPreparedInterior(const GenericEulerCpuPreparedStep&,
                               mfem::ParGridFunction&) const noexcept;
 
+  /**
+   * Export the semantic Euler volume fields from one state transaction.
+   * Sigma is optional and valid only for an IGR session; z and trace unknowns
+   * remain private implementation details.
+   */
+  bool ExportCommittedFields(
+      generic::HdgEulerHostInteriorFields) const noexcept;
+  bool ExportPreparedFields(const GenericEulerCpuPreparedStep&,
+                            generic::HdgEulerHostInteriorFields) const noexcept;
+
 private:
   std::unique_ptr<detail::CpuNumericsCore> core_;
   generic::EulerHdgRequest request_{};

@@ -1229,6 +1229,7 @@ using dg::hdg::generic::ContractStatus;
 using dg::hdg::generic::EulerBoundaryPolicy;
 using dg::hdg::generic::EulerBoundaryPolicyKind;
 using dg::hdg::generic::EulerHdgRequest;
+using dg::hdg::generic::HdgEulerHostInteriorFields;
 using dg::hdg::generic::HdgEulerSessionStatus;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
@@ -1244,6 +1245,8 @@ using dg::hdg::runtime::cuda_w8a::CudaPrecommitSnapshot;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
 using dg::hdg::runtime::cuda_w8a::CudaRunEvidence;
 using dg::hdg::runtime::cuda_w8a::CudaStepEvidence;
+using dg::hdg::runtime::cuda_w8a::CudaTransferTotals;
+using dg::hdg::runtime::cuda_w8a::CudaTransportPolicy;
 using dg::hdg::runtime::cuda_w8a::PersistentCudaSmoothEulerEngine;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedEulerConservationGateCapture;
@@ -3143,6 +3146,35 @@ bool DifferentValues(const std::vector<double>& left,
       !std::equal(left.begin(), left.end(), right.begin());
 }
 
+bool SameTransferAccounting(const CudaTransferTotals& before,
+                            const CudaTransferTotals& after)
+{
+  return before.host_to_device_bytes == after.host_to_device_bytes &&
+      before.device_to_host_bytes == after.device_to_host_bytes &&
+      before.device_to_device_bytes == after.device_to_device_bytes &&
+      before.mpi_staging_bytes == after.mpi_staging_bytes &&
+      before.synchronization_events == after.synchronization_events &&
+      before.event_count == after.event_count &&
+      before.complete == after.complete;
+}
+
+bool ExactIgrFieldExportTransfer(const CudaTransferTotals& before,
+                                 const CudaTransferTotals& after,
+                                 const std::size_t scalar_count)
+{
+  constexpr std::size_t published_components = components + 1;
+  const std::size_t expected_bytes =
+      published_components * scalar_count * sizeof(double);
+  return before.complete && after.complete &&
+      after.host_to_device_bytes == before.host_to_device_bytes &&
+      after.device_to_host_bytes ==
+          before.device_to_host_bytes + expected_bytes &&
+      after.device_to_device_bytes == before.device_to_device_bytes &&
+      after.mpi_staging_bytes == before.mpi_staging_bytes &&
+      after.synchronization_events == before.synchronization_events + 1 &&
+      after.event_count == before.event_count + 1;
+}
+
 bool GlobalSourceOnlyResponseNorm(
     mfem::ParMesh& mesh, const int order,
     const std::vector<double>& candidate,
@@ -3449,15 +3481,88 @@ bool CheckLifecycle(const int order, const bool physical,
 
   GenericEulerHdgCudaSession session;
   const auto initialized = session.Initialize(request);
+  const bool igr = kind == RegularizationKind::igr;
+  const double unwritten = std::numeric_limits<double>::quiet_NaN();
+  const auto finite = [](const std::vector<double>& values)
+  {
+    return std::all_of(values.begin(), values.end(),
+        [](const double value) { return std::isfinite(value); });
+  };
+  const auto export_committed =
+      [&](std::vector<double>& conservative, std::vector<double>& sigma,
+          bool& exact_transfer)
+  {
+    if (!igr)
+    {
+      exact_transfer = true;
+      return session.ExportCommittedInterior(
+          CudaMutableHostL2Output{conservative.data(),
+                                  fields.volume_scalar_count, components});
+    }
+    const CudaTransferTotals before = CudaTransportPolicy::Accounting();
+    const bool exported = session.ExportCommittedFields(
+        HdgEulerHostInteriorFields{conservative.data(), sigma.data(),
+                                   fields.volume_scalar_count});
+    const CudaTransferTotals after = CudaTransportPolicy::Accounting();
+    exact_transfer = ExactIgrFieldExportTransfer(
+        before, after, fields.volume_scalar_count);
+    return exported;
+  };
+  const auto export_prepared =
+      [&](const GenericEulerCudaPreparedStep& authority,
+          const GenericEulerHdgCudaSession::prepared_output_type& output,
+          std::vector<double>& conservative, std::vector<double>& sigma,
+          bool& exact_transfer)
+  {
+    if (!igr)
+    {
+      exact_transfer = true;
+      return session.ExportPreparedInterior(
+          authority, output,
+          CudaMutableHostL2Output{conservative.data(),
+                                  fields.volume_scalar_count, components});
+    }
+    const CudaTransferTotals before = CudaTransportPolicy::Accounting();
+    const bool exported = session.ExportPreparedFields(
+        authority, output,
+        HdgEulerHostInteriorFields{conservative.data(), sigma.data(),
+                                   fields.volume_scalar_count});
+    const CudaTransferTotals after = CudaTransportPolicy::Accounting();
+    exact_transfer = ExactIgrFieldExportTransfer(
+        before, after, fields.volume_scalar_count);
+    return exported;
+  };
   std::vector<double> committed_initial(expected_initial.size(), -1.0);
+  std::vector<double> sigma_initial(
+      igr ? fields.volume_scalar_count : 0, unwritten);
   const bool initialized_everywhere = All(
       initialized.status == HdgEulerSessionStatus::initialized,
       request.communicator);
   if (!initialized_everywhere) return false;
-  const bool initial_export = session.ExportCommittedInterior(
-      CudaMutableHostL2Output{
-          committed_initial.data(), fields.volume_scalar_count, components});
-  if (!All(initial_export && SameValues(committed_initial, expected_initial),
+  bool initial_transfer = false;
+  const bool initial_export = export_committed(
+      committed_initial, sigma_initial, initial_transfer);
+  bool rejected_bad_extent = true;
+  if (igr)
+  {
+    std::vector<double> bad_conservative(expected_initial.size(), 17.0);
+    std::vector<double> bad_sigma(fields.volume_scalar_count, 19.0);
+    const CudaTransferTotals before = CudaTransportPolicy::Accounting();
+    const bool bad_export = fields.volume_scalar_count == 0 ||
+        session.ExportCommittedFields(HdgEulerHostInteriorFields{
+            bad_conservative.data(), bad_sigma.data(),
+            fields.volume_scalar_count - 1});
+    const CudaTransferTotals after = CudaTransportPolicy::Accounting();
+    rejected_bad_extent = fields.volume_scalar_count > 0 && !bad_export &&
+        std::all_of(bad_conservative.begin(), bad_conservative.end(),
+                    [](const double value) { return value == 17.0; }) &&
+        std::all_of(bad_sigma.begin(), bad_sigma.end(),
+                    [](const double value) { return value == 19.0; }) &&
+        SameTransferAccounting(before, after);
+  }
+  if (!All(initial_export && initial_transfer && rejected_bad_extent &&
+               SameValues(committed_initial, expected_initial) &&
+               (!igr || finite(sigma_initial)),
            request.communicator))
   {
     return false;
@@ -3477,21 +3582,24 @@ bool CheckLifecycle(const int order, const bool physical,
   const auto first_prepared = session.Prepare(
       dt, first_authority, first_output);
   std::vector<double> first_candidate(expected_initial.size(), -2.0);
+  std::vector<double> sigma_first_candidate(
+      igr ? fields.volume_scalar_count : 0, unwritten);
   const bool first_prepared_everywhere = All(
       first_prepared.status == HdgEulerSessionStatus::prepared,
       request.communicator);
   if (!first_prepared_everywhere) return false;
-  const bool first_export = session.ExportPreparedInterior(
-      first_authority, first_output,
-      CudaMutableHostL2Output{first_candidate.data(),
-                             fields.volume_scalar_count, components});
+  bool first_transfer = false;
+  const bool first_export = export_prepared(
+      first_authority, first_output, first_candidate,
+      sigma_first_candidate, first_transfer);
   const bool expected_update = physical
       ? (source_mode != SourceMode::nonzero ||
          DifferentValues(first_candidate, committed_initial))
       : ExpectedPeriodicSourceResponse(
             first_candidate, committed_initial, expected_source,
             fields.volume_scalar_count, source_mode, initial_mode, dt);
-  if (!All(first_export && expected_update,
+  if (!All(first_export && first_transfer && expected_update &&
+               (!igr || finite(sigma_first_candidate)),
            request.communicator))
   {
     return false;
@@ -3499,14 +3607,18 @@ bool CheckLifecycle(const int order, const bool physical,
   const auto aborted = session.Abort(
       std::move(first_authority), first_output);
   std::vector<double> after_abort(expected_initial.size(), -3.0);
+  std::vector<double> sigma_after_abort(
+      igr ? fields.volume_scalar_count : 0, unwritten);
   const bool aborted_everywhere = All(
       aborted.status == HdgEulerSessionStatus::aborted,
       request.communicator);
   if (!aborted_everywhere) return false;
-  const bool abort_export = session.ExportCommittedInterior(
-      CudaMutableHostL2Output{
-          after_abort.data(), fields.volume_scalar_count, components});
-  if (!All(abort_export && SameValues(after_abort, committed_initial) &&
+  bool abort_transfer = false;
+  const bool abort_export = export_committed(
+      after_abort, sigma_after_abort, abort_transfer);
+  if (!All(abort_export && abort_transfer &&
+               SameValues(after_abort, committed_initial) &&
+               (!igr || SameValues(sigma_after_abort, sigma_initial)) &&
                session.coordinates().step == before.step &&
                session.coordinates().generation == before.generation &&
                session.coordinates().time == before.time,
@@ -3520,15 +3632,20 @@ bool CheckLifecycle(const int order, const bool physical,
   const auto retry_prepared = session.Prepare(
       dt, retry_authority, retry_output);
   std::vector<double> retry_candidate(expected_initial.size(), -4.0);
+  std::vector<double> sigma_retry_candidate(
+      igr ? fields.volume_scalar_count : 0, unwritten);
   const bool retry_prepared_everywhere = All(
       retry_prepared.status == HdgEulerSessionStatus::prepared,
       request.communicator);
   if (!retry_prepared_everywhere) return false;
-  const bool retry_export = session.ExportPreparedInterior(
-      retry_authority, retry_output,
-      CudaMutableHostL2Output{retry_candidate.data(),
-                             fields.volume_scalar_count, components});
-  if (!All(retry_export && NearValues(first_candidate, retry_candidate),
+  bool retry_transfer = false;
+  const bool retry_export = export_prepared(
+      retry_authority, retry_output, retry_candidate,
+      sigma_retry_candidate, retry_transfer);
+  if (!All(retry_export && retry_transfer &&
+               NearValues(first_candidate, retry_candidate) &&
+               (!igr || NearValues(sigma_first_candidate,
+                                   sigma_retry_candidate)),
            request.communicator))
   {
     return false;
@@ -3539,18 +3656,23 @@ bool CheckLifecycle(const int order, const bool physical,
   const auto committed = session.Commit(
       std::move(retry_authority), retry_output);
   std::vector<double> committed_final(expected_initial.size(), -5.0);
+  std::vector<double> sigma_committed_final(
+      igr ? fields.volume_scalar_count : 0, unwritten);
   const bool committed_everywhere = All(
       committed.status == HdgEulerSessionStatus::committed,
       request.communicator);
   if (!committed_everywhere) return false;
-  const bool final_export = session.ExportCommittedInterior(
-      CudaMutableHostL2Output{
-          committed_final.data(), fields.volume_scalar_count, components});
+  bool final_transfer = false;
+  const bool final_export = export_committed(
+      committed_final, sigma_committed_final, final_transfer);
   const auto after = session.coordinates();
   const bool boundary_coverage = BoundaryCoverage(
       boundary, physical, request.communicator);
   const bool passed = All(
-      final_export && SameValues(committed_final, retry_candidate) &&
+      final_export && final_transfer &&
+          SameValues(committed_final, retry_candidate) &&
+          (!igr || SameValues(sigma_committed_final,
+                              sigma_retry_candidate)) &&
           after.step == before.step + 1 &&
           after.generation == before.generation + 1 &&
           after.time == before.time + dt &&

@@ -8,13 +8,30 @@
  * operator, output writer, restart payload, or virtual dispatch surface.
  */
 
-#include <cstdint>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <type_traits>
 
 namespace dg::hdg::generic
 {
+
+/**
+ * Caller-owned host views of the semantic Euler HDG interior fields.
+ *
+ * The conservative coefficients contain four component-major, byNODES L2
+ * slabs.  A non-null @ref sigma_coefficients requests the scalar IGR field;
+ * the private auxiliary gradient and every trace field remain unexposed.
+ * Backends may use any internal layout, but must fill both requested views
+ * from the same committed or prepared state transaction.
+ */
+struct HdgEulerHostInteriorFields
+{
+  double* conservative_coefficients = nullptr;
+  double* sigma_coefficients = nullptr;
+  std::size_t scalar_count = 0;
+};
 
 enum class HdgEulerSessionCapability : std::uint32_t
 {

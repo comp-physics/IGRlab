@@ -12,6 +12,23 @@ if(NOT HDG_MAIN_DEVICE STREQUAL "cpu" AND
   message(FATAL_ERROR
     "HDG main device must be cpu or cuda, got '${HDG_MAIN_DEVICE}'.")
 endif()
+if(NOT DEFINED HDG_MAIN_REGULARIZATION)
+  set(HDG_MAIN_REGULARIZATION none)
+endif()
+if(NOT HDG_MAIN_REGULARIZATION STREQUAL "none" AND
+   NOT HDG_MAIN_REGULARIZATION STREQUAL "igr")
+  message(FATAL_ERROR
+    "HDG regularization must be none or igr, got '${HDG_MAIN_REGULARIZATION}'.")
+endif()
+
+function(require_euler_field text_variable tag field components context)
+  set(_text "${${text_variable}}")
+  if(NOT _text MATCHES
+      "<${tag}[^>]*(Name=\"${field}\"[^>]*NumberOfComponents=\"${components}\"|NumberOfComponents=\"${components}\"[^>]*Name=\"${field}\")[^>]*>")
+    message(FATAL_ERROR
+      "${context} misses ${components}-component Euler field '${field}'")
+  endif()
+endfunction()
 
 if(NOT DEFINED HDG_MAIN_ORDER)
   set(HDG_MAIN_ORDER 1)
@@ -66,6 +83,7 @@ file(REMOVE_RECURSE "${HDG_MAIN_OUTPUT}")
 set(_arguments
   --discretization hdg
   --device "${HDG_MAIN_DEVICE}"
+  --regularization "${HDG_MAIN_REGULARIZATION}"
   --mesh "${HDG_MAIN_MESH}"
   --order "${HDG_MAIN_ORDER}"
   --serial-refine "${HDG_MAIN_SERIAL_REFINE}"
@@ -160,9 +178,26 @@ foreach(_index RANGE 0 ${_last_output_index})
     message(FATAL_ERROR "CUDA HDG PVD misses committed time ${_time} cycle ${_cycle}")
   endif()
   file(READ "${_root}/Cycle${_cycle}/data.pvtu" _pvtu_text)
-  if(NOT _pvtu_text MATCHES
-      "<PDataArray[^>]*(Name=\\\"conservative\\\"[^>]*NumberOfComponents=\\\"4\\\"|NumberOfComponents=\\\"4\\\"[^>]*Name=\\\"conservative\\\")[^>]*>")
-    message(FATAL_ERROR "CUDA HDG PVTU cycle ${_cycle} misses four-component conservative data")
+  require_euler_field(_pvtu_text PDataArray density 1
+    "HDG PVTU cycle ${_cycle}")
+  require_euler_field(_pvtu_text PDataArray momentum 2
+    "HDG PVTU cycle ${_cycle}")
+  require_euler_field(_pvtu_text PDataArray energy 1
+    "HDG PVTU cycle ${_cycle}")
+  require_euler_field(_pvtu_text PDataArray velocity 2
+    "HDG PVTU cycle ${_cycle}")
+  require_euler_field(_pvtu_text PDataArray pressure 1
+    "HDG PVTU cycle ${_cycle}")
+  if(HDG_MAIN_REGULARIZATION STREQUAL "igr")
+    require_euler_field(_pvtu_text PDataArray sigma 1
+      "IGR HDG PVTU cycle ${_cycle}")
+  elseif(_pvtu_text MATCHES "Name=\\\"sigma\\\"")
+    message(FATAL_ERROR
+      "conventional HDG PVTU cycle ${_cycle} unexpectedly contains sigma")
+  endif()
+  if(_pvtu_text MATCHES "Name=\\\"conservative\\\"")
+    message(FATAL_ERROR
+      "HDG PVTU cycle ${_cycle} exposes obsolete packed conservative data")
   endif()
   string(REGEX MATCHALL
     "<Piece[^>]*>"
@@ -200,10 +235,26 @@ foreach(_index RANGE 0 ${_last_output_index})
     string(REGEX REPLACE "NumberOfCells=\"([0-9]+)\"" "\\1"
       _piece_cells "${_piece_cell_field}")
     math(EXPR _cycle_cell_total "${_cycle_cell_total} + ${_piece_cells}")
-    if(NOT _vtu_text MATCHES
-        "<DataArray[^>]*(Name=\\\"conservative\\\"[^>]*NumberOfComponents=\\\"4\\\"|NumberOfComponents=\\\"4\\\"[^>]*Name=\\\"conservative\\\")[^>]*>")
+    require_euler_field(_vtu_text DataArray density 1
+      "HDG VTU rank ${_rank} cycle ${_cycle}")
+    require_euler_field(_vtu_text DataArray momentum 2
+      "HDG VTU rank ${_rank} cycle ${_cycle}")
+    require_euler_field(_vtu_text DataArray energy 1
+      "HDG VTU rank ${_rank} cycle ${_cycle}")
+    require_euler_field(_vtu_text DataArray velocity 2
+      "HDG VTU rank ${_rank} cycle ${_cycle}")
+    require_euler_field(_vtu_text DataArray pressure 1
+      "HDG VTU rank ${_rank} cycle ${_cycle}")
+    if(HDG_MAIN_REGULARIZATION STREQUAL "igr")
+      require_euler_field(_vtu_text DataArray sigma 1
+        "IGR HDG VTU rank ${_rank} cycle ${_cycle}")
+    elseif(_vtu_text MATCHES "Name=\\\"sigma\\\"")
       message(FATAL_ERROR
-        "CUDA HDG VTU piece for rank ${_rank} cycle ${_cycle} misses four-component conservative data")
+        "conventional HDG VTU rank ${_rank} cycle ${_cycle} unexpectedly contains sigma")
+    endif()
+    if(_vtu_text MATCHES "Name=\\\"conservative\\\"")
+      message(FATAL_ERROR
+        "HDG VTU rank ${_rank} cycle ${_cycle} exposes obsolete conservative data")
     endif()
   endforeach()
   if(NOT _cycle_cell_total EQUAL _expected_global_cells)

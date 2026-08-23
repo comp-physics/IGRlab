@@ -380,14 +380,49 @@ bool CheckRankTwoCollectiveAdmission(const int ranks)
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
   GenericEulerHdgCudaSession session;
-  const auto initialized = session.Initialize(BorrowedConfig(
-      mesh, ranks, smoke_polynomial_order, smoke_elements_per_direction));
+  const CudaConfig config = BorrowedConfig(
+      mesh, ranks, smoke_polynomial_order, smoke_elements_per_direction);
+  const auto initialized = session.Initialize(config);
   if (initialized.status !=
       HdgEulerSessionStatus::initialized)
+    return false;
+  const std::size_t scalar_count = config.borrowed_initial.scalar_count;
+  std::vector<double> legacy_committed(
+      conserved_components * scalar_count, -11.0);
+  std::vector<double> fields_committed(
+      conserved_components * scalar_count, -13.0);
+  const bool crossed_committed_export = rank == 0
+      ? session.ExportCommittedInterior(
+          {legacy_committed.data(), scalar_count, conserved_components})
+      : session.ExportCommittedFields(
+          {fields_committed.data(), nullptr, scalar_count});
+  if (!All(!crossed_committed_export &&
+           std::all_of(legacy_committed.begin(), legacy_committed.end(),
+                       [](const double value) { return value == -11.0; }) &&
+           std::all_of(fields_committed.begin(), fields_committed.end(),
+                       [](const double value) { return value == -13.0; })))
     return false;
   GenericEulerCudaPreparedStep authority{};
   GenericPreparedOutput native_export{};
   const auto staged = session.Prepare(authority, native_export);
+  std::vector<double> legacy_prepared(
+      conserved_components * scalar_count, -17.0);
+  std::vector<double> fields_prepared(
+      conserved_components * scalar_count, -19.0);
+  const bool crossed_prepared_export = rank == 0
+      ? session.ExportPreparedInterior(
+          authority, native_export,
+          {legacy_prepared.data(), scalar_count, conserved_components})
+      : session.ExportPreparedFields(
+          authority, native_export,
+          {fields_prepared.data(), nullptr, scalar_count});
+  if (!All(staged.status == HdgEulerSessionStatus::prepared &&
+           !crossed_prepared_export &&
+           std::all_of(legacy_prepared.begin(), legacy_prepared.end(),
+                       [](const double value) { return value == -17.0; }) &&
+           std::all_of(fields_prepared.begin(), fields_prepared.end(),
+                       [](const double value) { return value == -19.0; })))
+    return false;
   const GenericPreparedOutput before_tamper = native_export;
   // This passes facade authority matching but makes one rank's checkpoint
   // descriptor stale, exercising engine-side collective atomicity.

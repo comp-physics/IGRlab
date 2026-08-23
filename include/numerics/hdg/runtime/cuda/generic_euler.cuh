@@ -475,6 +475,19 @@ public:
     { return engine.ExportCommittedInterior(destination); });
   }
 
+  /** Export conservative values and optional IGR sigma in one host bridge. */
+  bool ExportCommittedFields(
+      generic::HdgEulerHostInteriorFields destination) noexcept
+  {
+    const bool local_valid = initialized_ && !failed_ && !prepared_active_ &&
+        (destination.conservative_coefficients != nullptr ||
+         destination.scalar_count == 0);
+    if (!AdmitOperation(operation_tag::export_committed_fields, local_valid))
+      return false;
+    return Dispatch([&](auto& engine)
+    { return engine.ExportCommittedFields(destination); });
+  }
+
   /**
    * Export a physical candidate only while its affine authority is live.
    * This does not acknowledge or publish it: Commit still requires the
@@ -496,6 +509,24 @@ public:
       return false;
     return Dispatch([&](auto& engine)
     { return engine.ExportPreparedInterior(destination); });
+  }
+
+  template <typename StagedOutput>
+  bool ExportPreparedFields(
+      const GenericEulerCudaPreparedStep& authority,
+      const StagedOutput& native_export,
+      generic::HdgEulerHostInteriorFields destination) noexcept
+  {
+    static_assert(IsSupportedOutput<StagedOutput>(),
+                  "CUDA prepared output must be checkpoint or metadata");
+    const bool local_valid = OutputMatchesMode<StagedOutput>() &&
+        Matches(authority, native_export) &&
+        (destination.conservative_coefficients != nullptr ||
+         destination.scalar_count == 0);
+    if (!AdmitOperation(operation_tag::export_prepared_fields, local_valid))
+      return false;
+    return Dispatch([&](auto& engine)
+    { return engine.ExportPreparedFields(destination); });
   }
 
   /** The caller attests that the staged native export is ready for publication. */
@@ -617,7 +648,9 @@ private:
     commit = 4,
     abort = 5,
     export_committed = 6,
-    export_prepared = 7
+    export_prepared = 7,
+    export_committed_fields = 8,
+    export_prepared_fields = 9
   };
 
   using rank1_engine = cuda_w8a::PersistentCudaSmoothEulerEngine<

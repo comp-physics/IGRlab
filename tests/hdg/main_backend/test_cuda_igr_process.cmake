@@ -75,7 +75,7 @@ endfunction()
 
 # This is the production main-backend route, not the frozen SC25/P1 oracle.
 # All supported orders share the same generic IC/trace projection, source,
-# time adapter, nonlinear lifecycle, condensation, and Euler-only publication.
+# time adapter, nonlinear lifecycle, condensation, and optional IGR fields.
 run_cuda_igr_success(1 1 1)
 run_cuda_igr_success(1 0.2 0.8
   --hdg-igr-alpha 0.2 --hdg-igr-beta 0.8)

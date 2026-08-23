@@ -1,3 +1,4 @@
+#include "sim/hdg/euler_output_fields.hpp"
 #include "sim/hdg/parallel_vtk.hpp"
 
 #include <mpi.h>
@@ -9,6 +10,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -91,26 +93,48 @@ bool Run(const std::filesystem::path& output)
   }
   MPI_Barrier(MPI_COMM_WORLD);
 
+  // Keep one globally owned cell.  In the rank-two gate this deliberately
+  // leaves rank one empty and exercises the standard Euler field views and
+  // writer without assuming that a zero-size MFEM Vector has non-null data.
   mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
-      2, 1, mfem::Element::QUADRILATERAL, false, 2.0, 1.0, false);
-  mfem::ParMesh mesh(MPI_COMM_WORLD, serial_mesh);
+      1, 1, mfem::Element::QUADRILATERAL, false, 1.0, 1.0, false);
+  const std::vector<int> partition(
+      static_cast<std::size_t>(serial_mesh.GetNE()), 0);
+  mfem::ParMesh mesh(MPI_COMM_WORLD, serial_mesh, partition.data());
   mfem::L2_FECollection collection(1, 2, mfem::BasisType::GaussLegendre);
-  mfem::ParFiniteElementSpace scalar_space(&mesh, &collection);
-  mfem::ParFiniteElementSpace momentum_space(
-      &mesh, &collection, 2, mfem::Ordering::byNODES);
-  mfem::ParGridFunction density(&scalar_space);
-  mfem::ParGridFunction momentum(&momentum_space);
-  density = static_cast<double>(10 + rank);
-  double* const momentum_values = momentum.HostWrite();
-  if (momentum_values == nullptr) { return false; }
-  for (int i = 0; i < momentum.Size(); ++i)
+  mfem::ParFiniteElementSpace conservative_space(
+      &mesh, &collection, 4, mfem::Ordering::byNODES);
+  mfem::ParGridFunction conservative(&conservative_space);
+  const int scalar_count = conservative.Size() / 4;
+  double* const conservative_values = conservative.HostWrite();
+  if (scalar_count != 0 && conservative_values == nullptr) { return false; }
+  for (int i = 0; i < scalar_count; ++i)
   {
-    momentum_values[i] = 100.0 * static_cast<double>(rank + 1) + i;
+    conservative_values[i] = 1.0 + 0.01 * rank;
+    conservative_values[scalar_count + i] = 0.1;
+    conservative_values[2 * scalar_count + i] = -0.05;
+    conservative_values[3 * scalar_count + i] = 2.5;
   }
+  dg_sim::hdg::HdgEulerParaViewFields output_fields(
+      mesh, collection, conservative, /*igr_active=*/true,
+      /*gamma=*/1.4, /*density_floor=*/1.0e-16);
+  dg::hdg::generic::HdgEulerHostInteriorFields destination{};
+  if (!output_fields.FreshHostOutput(destination) ||
+      destination.scalar_count != static_cast<std::size_t>(scalar_count) ||
+      (scalar_count != 0 && (destination.conservative_coefficients == nullptr ||
+                            destination.sigma_coefficients == nullptr)))
+  {
+    return false;
+  }
+  for (int i = 0; i < scalar_count; ++i)
+  {
+    destination.sigma_coefficients[i] = 0.25;
+  }
+  if (!output_fields.UpdateDerived()) { return false; }
 
   dg_sim::hdg::HDGParaViewRequest request{
       mesh,
-      {{"density", density}, {"momentum", momentum}},
+      output_fields.Fields(),
       {output.string(), "hdg_physical", mfem::VTKFormat::ASCII, 1, false}};
   dg_sim::hdg::HDGParaViewSeries publisher(request);
   publisher.Write({3, 20, 1.25});
@@ -134,6 +158,10 @@ bool Run(const std::filesystem::path& output)
       std::filesystem::exists(second_local_vtu) &&
       Contains(local_text, "Name=\"density\"") &&
       Contains(local_text, "Name=\"momentum\"") &&
+      Contains(local_text, "Name=\"energy\"") &&
+      Contains(local_text, "Name=\"velocity\"") &&
+      Contains(local_text, "Name=\"sigma\"") &&
+      Contains(local_text, "Name=\"pressure\"") &&
       Contains(local_text, "NumberOfComponents=\"2\"") &&
       Contains(local_text, local_cells);
   passed = AllRanks(MPI_COMM_WORLD, passed);

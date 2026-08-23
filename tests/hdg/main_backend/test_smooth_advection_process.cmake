@@ -7,6 +7,15 @@ if(NOT DEFINED HDG_MAIN_EXECUTABLE OR
     "HDG main executable, output, ranks, and MPI launcher are required.")
 endif()
 
+function(require_euler_field text_variable tag field components context)
+  set(_text "${${text_variable}}")
+  if(NOT _text MATCHES
+      "<${tag}[^>]*(Name=\"${field}\"[^>]*NumberOfComponents=\"${components}\"|NumberOfComponents=\"${components}\"[^>]*Name=\"${field}\")[^>]*>")
+    message(FATAL_ERROR
+      "${context} misses ${components}-component Euler field '${field}'")
+  endif()
+endfunction()
+
 set(_arguments
   --discretization hdg
   --device cpu
@@ -69,6 +78,33 @@ foreach(_index RANGE 0 3)
   if(HDG_MAIN_RANKS EQUAL 2 AND
      NOT EXISTS "${_root}/Cycle${_cycle}/proc000001.vtu")
     message(FATAL_ERROR "missing rank-one VTU for HDG cycle ${_cycle}")
+  endif()
+  file(READ "${_root}/Cycle${_cycle}/data.pvtu" _pvtu_text)
+  file(READ "${_root}/Cycle${_cycle}/proc000000.vtu" _vtu_text)
+  require_euler_field(_pvtu_text PDataArray density 1
+    "CPU HDG PVTU cycle ${_cycle}")
+  require_euler_field(_pvtu_text PDataArray momentum 2
+    "CPU HDG PVTU cycle ${_cycle}")
+  require_euler_field(_pvtu_text PDataArray energy 1
+    "CPU HDG PVTU cycle ${_cycle}")
+  require_euler_field(_pvtu_text PDataArray velocity 2
+    "CPU HDG PVTU cycle ${_cycle}")
+  require_euler_field(_pvtu_text PDataArray pressure 1
+    "CPU HDG PVTU cycle ${_cycle}")
+  require_euler_field(_vtu_text DataArray density 1
+    "CPU HDG VTU cycle ${_cycle}")
+  require_euler_field(_vtu_text DataArray momentum 2
+    "CPU HDG VTU cycle ${_cycle}")
+  require_euler_field(_vtu_text DataArray energy 1
+    "CPU HDG VTU cycle ${_cycle}")
+  require_euler_field(_vtu_text DataArray velocity 2
+    "CPU HDG VTU cycle ${_cycle}")
+  require_euler_field(_vtu_text DataArray pressure 1
+    "CPU HDG VTU cycle ${_cycle}")
+  if(_pvtu_text MATCHES "Name=\\\"(sigma|conservative)\\\"" OR
+     _vtu_text MATCHES "Name=\\\"(sigma|conservative)\\\"")
+    message(FATAL_ERROR
+      "conventional CPU HDG cycle ${_cycle} exposes a nonstandard point field")
   endif()
 endforeach()
 

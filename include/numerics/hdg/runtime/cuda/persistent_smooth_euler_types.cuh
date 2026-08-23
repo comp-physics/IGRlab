@@ -11,6 +11,7 @@
  */
 
 #include "numerics/hdg/generic/contract.hpp"
+#include "numerics/hdg/generic/session_contract.hpp"
 #include "numerics/hdg/runtime/run_contract.hpp"
 
 #include <mfem.hpp>
@@ -44,6 +45,7 @@ inline constexpr int functional_checkpoint_step = 10;
 inline constexpr int functional_injected_step = 14;
 inline constexpr int accepted_steps = smoke_accepted_steps;
 inline constexpr int conserved_components = 4;
+inline constexpr int igr_published_components = 5;
 inline constexpr int igr_interior_components = 7;
 inline constexpr int igr_trace_components = 5;
 inline constexpr int legacy_scalar_workspace_scalars = 11;

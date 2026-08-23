@@ -801,7 +801,8 @@ bool CudaLaunchTrial(const CudaDeviceView& view,
                      const CudaMeshShape& shape, double alpha) noexcept;
 bool CudaLaunchPackInteriorOutput(const CudaMeshShape& shape,
                                   const double* source,
-                                  double* packed) noexcept;
+                                  double* packed,
+                                  int output_components) noexcept;
 bool CudaLaunchLocalSquaredNorm(const double* first, int first_count,
                                 const double* second, int second_count,
                                 double* scratch, int scratch_count,
@@ -2234,6 +2235,9 @@ public:
   /** Map one device element-local state back to a validated byNODES L2 view. */
   bool ExportInterior(const CudaInteriorState& source,
                       CudaMutableHostL2Output destination) noexcept;
+  bool ExportFields(
+      const CudaInteriorState& source,
+      generic::HdgEulerHostInteriorFields destination) noexcept;
 
 private:
   friend struct CudaQualificationTestAccess;
@@ -2911,7 +2915,9 @@ private:
       host_static_source_.assign(host_interior, 0.0);
       host_export_interior_.assign(
           static_cast<std::size_t>(shape_.elements) *
-              conserved_components * shape_.scalar_interior_dofs,
+              (shape_.igr_active ? igr_published_components
+                                 : conserved_components) *
+              shape_.scalar_interior_dofs,
           0.0);
       signed_element_interior_.assign(host_interior, 0);
       host_matrix_owned_source_.assign(host_matrix, 0);

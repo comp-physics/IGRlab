@@ -86,6 +86,32 @@ foreach(_ranks IN ITEMS 1 2)
       TIMEOUT 1200)
 endforeach()
 
+add_test(NAME dg_igr_hdg_main_backend_igr_vtk_cpu_rank1
+  COMMAND "${CMAKE_COMMAND}"
+    "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+    "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cpu-igr-vtk-rank1-output"
+    "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+    "-DHDG_MAIN_DEVICE=cpu"
+    "-DHDG_MAIN_REGULARIZATION=igr"
+    "-DHDG_MAIN_ORDER=1"
+    "-DHDG_MAIN_N=3"
+    "-DHDG_MAIN_RANKS=1"
+    "-DHDG_MAIN_DT=0.00001"
+    "-DHDG_MAIN_T_FINAL=0.00001"
+    "-DHDG_MAIN_DT_SAVE=0.00001"
+    "-DHDG_MAIN_EXPECTED_STEPS=1"
+    "-DHDG_MAIN_EXPECTED_FINAL_TIME=1e-05"
+    "-DHDG_MAIN_EXPECTED_CYCLES=000000,000001"
+    "-DHDG_MAIN_EXPECTED_TIMES=0,1e-05"
+    "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+    "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+set_tests_properties(dg_igr_hdg_main_backend_igr_vtk_cpu_rank1 PROPERTIES
+  LABELS "hdg;main-backend;cpu;igr;vtk;fields;process"
+  PROCESSORS 1
+  RESOURCE_LOCK hdg_generic_euler_cpu
+  TIMEOUT 1200)
+
 foreach(_ranks IN ITEMS 1 2)
   add_test(NAME dg_igr_hdg_main_backend_igr_cpu_rank${_ranks}_n3
     COMMAND "${CMAKE_COMMAND}"
@@ -281,6 +307,33 @@ if(MFEM_USE_CUDA)
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 1200)
   endforeach()
+
+  add_test(NAME dg_igr_hdg_main_backend_cuda_igr_vtk_rank1
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-igr-vtk-rank1-output"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+      "-DHDG_MAIN_DEVICE=cuda"
+      "-DHDG_MAIN_REGULARIZATION=igr"
+      "-DHDG_MAIN_ORDER=1"
+      "-DHDG_MAIN_N=3"
+      "-DHDG_MAIN_RANKS=1"
+      "-DHDG_MAIN_DT=0.00001"
+      "-DHDG_MAIN_T_FINAL=0.00001"
+      "-DHDG_MAIN_DT_SAVE=0.00001"
+      "-DHDG_MAIN_EXPECTED_STEPS=1"
+      "-DHDG_MAIN_EXPECTED_FINAL_TIME=1e-05"
+      "-DHDG_MAIN_EXPECTED_CYCLES=000000,000001"
+      "-DHDG_MAIN_EXPECTED_TIMES=0,1e-05"
+      "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+  set_tests_properties(dg_igr_hdg_main_backend_cuda_igr_vtk_rank1 PROPERTIES
+    LABELS "hdg;main-backend;cuda;igr;vtk;fields;process"
+    PROCESSORS 1
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 1200)
+
   # The runtime session gate proves exact prepared/committed byte identity and
   # abort/retry preservation.  The dependent main gates prove that those
   # acknowledged bytes are published only after commit; rank 1 also repeats

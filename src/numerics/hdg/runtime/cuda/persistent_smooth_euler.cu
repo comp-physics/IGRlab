@@ -2395,10 +2395,11 @@ __global__ void TrialKernel(CudaDeviceView v,CudaMeshShape s,double alpha)
 
 __global__ void PackInteriorOutputKernel(CudaMeshShape s,
                                          const double* source,
-                                         double* packed)
+                                         double* packed,
+                                         int output_components)
 {
   const int index=blockIdx.x*blockDim.x+threadIdx.x;
-  const int per_element=conserved_components*s.scalar_interior_dofs;
+  const int per_element=output_components*s.scalar_interior_dofs;
   const int count=s.elements*per_element;
   if(index>=count)return;
   const int element=index/per_element;
@@ -2981,8 +2982,9 @@ bool CudaLaunchTrial(const CudaDeviceView& v,const CudaMeshShape& s,double alpha
 {TrialKernel<<<Blocks(std::max(s.interior_count,s.true_trace_count)),128>>>(v,s,alpha);return LaunchOk();}
 bool CudaLaunchPackInteriorOutput(const CudaMeshShape& s,
                                   const double* source,
-                                  double* packed) noexcept
-{const int count=s.elements*conserved_components*s.scalar_interior_dofs;if(source==nullptr||packed==nullptr||count<=0)return false;PackInteriorOutputKernel<<<Blocks(count),128>>>(s,source,packed);return LaunchOk();}
+                                  double* packed,
+                                  int output_components) noexcept
+{const int count=s.elements*output_components*s.scalar_interior_dofs;if(source==nullptr||packed==nullptr||output_components<=0||output_components>s.interior_components||count<=0)return false;PackInteriorOutputKernel<<<Blocks(count),128>>>(s,source,packed,output_components);return LaunchOk();}
 bool CudaLaunchLocalSquaredNorm(const double* a,int an,const double* b,int bn,
                                 double* scratch,int scratch_count,
                                 double* out) noexcept
