@@ -200,45 +200,13 @@ std::uint32_t GenericEulerHdgCpuSession::capabilities() const noexcept
       generic::HdgEulerSessionCapabilityBit(
           generic::HdgEulerSessionCapability::committed_cfl_diagnostics) |
       generic::HdgEulerSessionCapabilityBit(
-          generic::HdgEulerSessionCapability::generic_borrowed_inputs) |
-      generic::HdgEulerSessionCapabilityBit(
-          generic::HdgEulerSessionCapability::committed_observables) |
-      generic::HdgEulerSessionCapabilityBit(
-          generic::HdgEulerSessionCapability::committed_nonlinear_residual_audit);
+          generic::HdgEulerSessionCapability::generic_borrowed_inputs);
 }
 
 generic::HdgEulerCommittedDiagnostics
 GenericEulerHdgCpuSession::diagnostics() const noexcept
 {
   return diagnostics_;
-}
-
-generic::HdgEulerCommittedResidualAudit
-GenericEulerHdgCpuSession::committed_residual_audit() const noexcept
-{
-  return core_ ? core_->CommittedBorrowedEulerResidualAudit()
-               : generic::HdgEulerCommittedResidualAudit{};
-}
-
-generic::HdgEulerCommittedObservables
-GenericEulerHdgCpuSession::ObserveCommitted() noexcept
-{
-  generic::HdgEulerCommittedObservables observables{};
-  if (!initialized_ || !core_ ||
-      !core_->AdmitBorrowedEulerOperation(
-          detail::CpuBorrowedEulerOperation::observe_committed) ||
-      !core_->ObserveCommittedBorrowedEuler(observables))
-  {
-    return {};
-  }
-  observables.coordinates = {coordinates_.time, coordinates_.dt,
-                             coordinates_.step, coordinates_.generation};
-  if (!generic::IsValidHdgEulerCommittedObservables(observables,
-                                                      capabilities()))
-  {
-    return {};
-  }
-  return observables;
 }
 
 bool GenericEulerHdgCpuSession::ExportCommittedInterior(

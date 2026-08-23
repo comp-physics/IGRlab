@@ -1,6 +1,7 @@
 #pragma once
 
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
+#include "physics/bc/detail/euler_boundary_state.hpp"
 #include "physics/igr/igr_flux.hpp"
 #include "utils/config/env_flags.hpp"
 

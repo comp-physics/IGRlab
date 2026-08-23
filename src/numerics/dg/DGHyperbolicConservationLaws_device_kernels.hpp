@@ -6,350 +6,30 @@
 namespace
 {
 
-enum class DeviceBoundaryType : int
-{
-  Unsupported = 0,
-  SupersonicInlet = 1,
-  SupersonicOutlet = 2,
-  SubsonicOutletPressure = 3,
-  NonReflectingOutlet = 4,
-  SubsonicInlet = 5,
-  FarField = 6,
-  SlipWall = 7
-};
+using DeviceBoundaryType = detail::EulerBoundaryStateKind;
 
 #ifdef DG_IGR_HAS_ACCEL_FORALL
-constexpr real_t kBoundaryRhoFloor = 1.0e-12;
-constexpr real_t kBoundaryPFloor = 1.0e-12;
-
-struct PrimitiveNormalState_
+MFEM_HOST_DEVICE inline bool EvalBoundaryGhostEuler_(
+  const int boundary_type,
+  const int dimension,
+  const int equations,
+  const real_t gamma,
+  const real_t pressure_out,
+  const real_t* reference_state,
+  const real_t* normal,
+  const real_t* interior,
+  real_t* exterior)
 {
-  real_t rho = 1.0;
-  real_t p = 1.0;
-  real_t un = 0.0;
-  real_t ut = 0.0;
-  real_t c = 1.0;
-};
-
-MFEM_HOST_DEVICE inline void BuildNormalTangential_(const real_t* normal,
-                                                     int dim,
-                                                     real_t* nhat,
-                                                     real_t* that)
-{
-  real_t nrm2 = 0.0;
-  for (int d = 0; d < dim; ++d)
-  {
-    nhat[d] = normal[d];
-    nrm2 += normal[d] * normal[d];
-    that[d] = 0.0;
-  }
-  const real_t nrm = sqrt(nrm2);
-  if (nrm > 0.0)
-  {
-    const real_t inv_nrm = 1.0 / nrm;
-    for (int d = 0; d < dim; ++d)
-    {
-      nhat[d] *= inv_nrm;
-    }
-  }
-  else
-  {
-    for (int d = 0; d < dim; ++d)
-    {
-      nhat[d] = 0.0;
-    }
-    nhat[0] = 1.0;
-  }
-
-  if (dim == 2)
-  {
-    that[0] = -nhat[1];
-    that[1] = nhat[0];
-  }
-}
-
-MFEM_HOST_DEVICE inline PrimitiveNormalState_ ConservativeToPrimitiveNormal_(
-  const real_t* U,
-  int dim,
-  real_t gamma,
-  const real_t* nhat,
-  const real_t* that)
-{
-  PrimitiveNormalState_ out;
-  const real_t rho = fmax(U[0], kBoundaryRhoFloor);
-  real_t vel[3] = {0.0, 0.0, 0.0};
-  real_t vel2 = 0.0;
-  for (int d = 0; d < dim; ++d)
-  {
-    vel[d] = U[1 + d] / rho;
-    vel2 += vel[d] * vel[d];
-  }
-
-  const real_t E = U[1 + dim] / rho;
-  const real_t kinetic = 0.5 * vel2;
-  const real_t p = fmax((gamma - 1.0) * rho * (E - kinetic), kBoundaryPFloor);
-  const real_t c = sqrt(fmax(gamma * p / rho, 0.0));
-
-  out.rho = rho;
-  out.p = p;
-  out.c = c;
-  out.un = 0.0;
-  out.ut = 0.0;
-  for (int d = 0; d < dim; ++d)
-  {
-    out.un += vel[d] * nhat[d];
-  }
-  if (dim == 2)
-  {
-    out.ut = vel[0] * that[0] + vel[1] * that[1];
-  }
-  return out;
-}
-
-MFEM_HOST_DEVICE inline void PrimitiveNormalToConservative_(
-  const PrimitiveNormalState_& prim,
-  int dim,
-  real_t gamma,
-  const real_t* nhat,
-  const real_t* that,
-  real_t* U)
-{
-  real_t vel[3] = {0.0, 0.0, 0.0};
-  if (dim == 1)
-  {
-    vel[0] = prim.un;
-  }
-  else
-  {
-    vel[0] = prim.un * nhat[0] + prim.ut * that[0];
-    vel[1] = prim.un * nhat[1] + prim.ut * that[1];
-  }
-
-  U[0] = prim.rho;
-  real_t vel2 = 0.0;
-  for (int d = 0; d < dim; ++d)
-  {
-    U[1 + d] = prim.rho * vel[d];
-    vel2 += vel[d] * vel[d];
-  }
-  const real_t E = prim.p / ((gamma - 1.0) * prim.rho) + 0.5 * vel2;
-  U[1 + dim] = prim.rho * E;
-}
-
-MFEM_HOST_DEVICE inline real_t EntropyLike_(real_t p, real_t rho, real_t gamma)
-{
-  return p / pow(fmax(rho, kBoundaryRhoFloor), gamma);
-}
-
-MFEM_HOST_DEVICE inline PrimitiveNormalState_ SubsonicOutletPressureClosure_(
-  const PrimitiveNormalState_& inner,
-  real_t gamma,
-  real_t p_out)
-{
-  PrimitiveNormalState_ out = inner;
-  if (inner.un >= inner.c || inner.un <= -inner.c)
-  {
-    return out;
-  }
-
-  const real_t g1 = gamma - 1.0;
-  const real_t s = EntropyLike_(inner.p, inner.rho, gamma);
-  const real_t p = fmax(p_out, kBoundaryPFloor);
-  const real_t rho = pow(p / s, 1.0 / gamma);
-  const real_t c = sqrt(fmax(gamma * p / rho, 0.0));
-  const real_t j_plus = inner.un + 2.0 * inner.c / g1;
-  const real_t un = j_plus - 2.0 * c / g1;
-
-  out.rho = fmax(rho, kBoundaryRhoFloor);
-  out.p = p;
-  out.c = c;
-  out.un = un;
-  out.ut = inner.ut;
-  return out;
-}
-
-MFEM_HOST_DEVICE inline PrimitiveNormalState_ NonReflectingOutletClosure_(
-  const PrimitiveNormalState_& inner,
-  const PrimitiveNormalState_& ref,
-  real_t gamma)
-{
-  PrimitiveNormalState_ out = inner;
-  if (inner.un >= inner.c || inner.un <= -inner.c)
-  {
-    return out;
-  }
-
-  const real_t g1 = gamma - 1.0;
-  const real_t j_plus = inner.un + 2.0 * inner.c / g1;
-  const real_t j_minus_ref = ref.un - 2.0 * ref.c / g1;
-  const real_t un = 0.5 * (j_plus + j_minus_ref);
-  const real_t c = 0.25 * g1 * (j_plus - j_minus_ref);
-  if (!(c > 0.0))
-  {
-    return out;
-  }
-
-  const real_t s_ref = EntropyLike_(ref.p, ref.rho, gamma);
-  const real_t rho =
-    pow((c * c) / fmax(gamma * s_ref, kBoundaryPFloor), 1.0 / g1);
-  const real_t p = s_ref * pow(fmax(rho, kBoundaryRhoFloor), gamma);
-
-  out.rho = fmax(rho, kBoundaryRhoFloor);
-  out.p = fmax(p, kBoundaryPFloor);
-  out.c = c;
-  out.un = un;
-  out.ut = inner.ut;
-  return out;
-}
-
-MFEM_HOST_DEVICE inline PrimitiveNormalState_ SubsonicInletClosure_(
-  const PrimitiveNormalState_& inner,
-  const PrimitiveNormalState_& target,
-  real_t gamma)
-{
-  PrimitiveNormalState_ out = target;
-  if (inner.un <= -inner.c)
-  {
-    return out;
-  }
-  if (inner.un >= inner.c)
-  {
-    return inner;
-  }
-
-  const real_t g1 = gamma - 1.0;
-  const real_t j_plus_inner = inner.un + 2.0 * inner.c / g1;
-  const real_t j_minus_target = target.un - 2.0 * target.c / g1;
-  const real_t un = 0.5 * (j_plus_inner + j_minus_target);
-  const real_t c = 0.25 * g1 * (j_plus_inner - j_minus_target);
-  if (!(c > 0.0))
-  {
-    return target;
-  }
-
-  const real_t s_target = EntropyLike_(target.p, target.rho, gamma);
-  const real_t rho =
-    pow((c * c) / fmax(gamma * s_target, kBoundaryPFloor), 1.0 / g1);
-  const real_t p = s_target * pow(fmax(rho, kBoundaryRhoFloor), gamma);
-
-  out.rho = fmax(rho, kBoundaryRhoFloor);
-  out.p = fmax(p, kBoundaryPFloor);
-  out.c = c;
-  out.un = un;
-  out.ut = target.ut;
-  return out;
-}
-
-MFEM_HOST_DEVICE inline bool EvalBoundaryGhostEuler_(int bdr_type,
-                                                      int dim,
-                                                      int neq,
-                                                      real_t gamma,
-                                                      real_t p_out,
-                                                      const real_t* state_ref,
-                                                      const real_t* normal,
-                                                      const real_t* u_minus,
-                                                      real_t* u_plus)
-{
-  if (neq != dim + 2)
-  {
-    return false;
-  }
-
-  if (bdr_type == static_cast<int>(DeviceBoundaryType::SupersonicInlet))
-  {
-    for (int eq = 0; eq < neq; ++eq)
-    {
-      u_plus[eq] = state_ref[eq];
-    }
-    return true;
-  }
-  if (bdr_type == static_cast<int>(DeviceBoundaryType::SupersonicOutlet))
-  {
-    for (int eq = 0; eq < neq; ++eq)
-    {
-      u_plus[eq] = u_minus[eq];
-    }
-    return true;
-  }
-  if (bdr_type == static_cast<int>(DeviceBoundaryType::SlipWall))
-  {
-    for (int eq = 0; eq < neq; ++eq)
-    {
-      u_plus[eq] = u_minus[eq];
-    }
-    const real_t rho = fmax(u_minus[0], kBoundaryRhoFloor);
-    real_t nhat[3] = {0.0, 0.0, 0.0};
-    real_t that[3] = {0.0, 0.0, 0.0};
-    BuildNormalTangential_(normal, dim, nhat, that);
-    real_t un = 0.0;
-    for (int d = 0; d < dim; ++d)
-    {
-      un += (u_minus[1 + d] / rho) * nhat[d];
-    }
-    for (int d = 0; d < dim; ++d)
-    {
-      const real_t uprime = (u_minus[1 + d] / rho) - 2.0 * un * nhat[d];
-      u_plus[1 + d] = rho * uprime;
-    }
-    return true;
-  }
-
-  real_t nhat[3] = {0.0, 0.0, 0.0};
-  real_t that[3] = {0.0, 0.0, 0.0};
-  BuildNormalTangential_(normal, dim, nhat, that);
-
-  const PrimitiveNormalState_ inner =
-    ConservativeToPrimitiveNormal_(u_minus, dim, gamma, nhat, that);
-
-  PrimitiveNormalState_ bnd = inner;
-  if (bdr_type ==
-      static_cast<int>(DeviceBoundaryType::SubsonicOutletPressure))
-  {
-    bnd = SubsonicOutletPressureClosure_(inner, gamma, p_out);
-  }
-  else if (bdr_type ==
-           static_cast<int>(DeviceBoundaryType::NonReflectingOutlet))
-  {
-    const PrimitiveNormalState_ ref =
-      ConservativeToPrimitiveNormal_(state_ref, dim, gamma, nhat, that);
-    bnd = NonReflectingOutletClosure_(inner, ref, gamma);
-  }
-  else if (bdr_type == static_cast<int>(DeviceBoundaryType::SubsonicInlet))
-  {
-    const PrimitiveNormalState_ target =
-      ConservativeToPrimitiveNormal_(state_ref, dim, gamma, nhat, that);
-    bnd = SubsonicInletClosure_(inner, target, gamma);
-  }
-  else if (bdr_type == static_cast<int>(DeviceBoundaryType::FarField))
-  {
-    const PrimitiveNormalState_ far =
-      ConservativeToPrimitiveNormal_(state_ref, dim, gamma, nhat, that);
-    if (inner.un <= -inner.c)
-    {
-      for (int eq = 0; eq < neq; ++eq)
-      {
-        u_plus[eq] = state_ref[eq];
-      }
-      return true;
-    }
-    if (inner.un >= inner.c)
-    {
-      for (int eq = 0; eq < neq; ++eq)
-      {
-        u_plus[eq] = u_minus[eq];
-      }
-      return true;
-    }
-    bnd = (inner.un < 0.0) ? SubsonicInletClosure_(inner, far, gamma)
-                           : NonReflectingOutletClosure_(inner, far, gamma);
-  }
-  else
-  {
-    return false;
-  }
-
-  PrimitiveNormalToConservative_(bnd, dim, gamma, nhat, that, u_plus);
-  return true;
+  return detail::EvaluateEulerBoundaryState(
+    static_cast<DeviceBoundaryType>(boundary_type),
+    dimension,
+    equations,
+    gamma,
+    pressure_out,
+    reference_state,
+    normal,
+    interior,
+    exterior);
 }
 
 MFEM_HOST_DEVICE inline void ComputeEulerFluxDotN_(const real_t* state,
@@ -885,7 +565,7 @@ struct PackedBoundaryFaceEulerRusanovKernel
     }
 
     const int bdr_type = bdr_type_by_attr[attr];
-    if (bdr_type == static_cast<int>(DeviceBoundaryType::Unsupported))
+    if (bdr_type == static_cast<int>(DeviceBoundaryType::unsupported))
     {
       face_speed[f] = 0.0;
       return;
@@ -1343,7 +1023,7 @@ struct PackedBoundaryFaceEulerRusanovQKernel
     }
 
     const int bdr_type = bdr_type_by_attr[attr];
-    if (bdr_type == static_cast<int>(DeviceBoundaryType::Unsupported))
+    if (bdr_type == static_cast<int>(DeviceBoundaryType::unsupported))
     {
       face_speed_q[fq] = 0.0;
       return;

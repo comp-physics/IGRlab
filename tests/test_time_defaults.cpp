@@ -286,9 +286,12 @@ int RunTimeDefaultsTests(TestContext& ctx)
     const dg_sim::SolverRequestResolution hdg_igr_cuda =
       dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "igr", "",
                                    true, false, true, false, "cuda");
-    ctx.Check(hdg_igr_cuda.status ==
-                dg_sim::SolverRequestResolutionStatus::UnsupportedRegularization,
-              "request: HDG CUDA IGR is rejected during resolution");
+    ctx.Check(hdg_igr_cuda.IsResolved() &&
+                hdg_igr_cuda.regularization == dg_sim::Regularization::IGR &&
+                hdg_igr_cuda.time_integrator ==
+                  dg_sim::TimeIntegrator::BackwardEuler &&
+                hdg_igr_cuda.device_backend == dg_sim::DeviceBackend::CUDA,
+              "request: HDG CUDA IGR resolves to backward-euler");
 
     const dg_sim::SolverRequestResolution hdg_cuda_none =
       dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "none", "",

@@ -23,6 +23,7 @@
 #include <array>
 #include <cstddef>
 #include <type_traits>
+#include <vector>
 
 #include <mfem.hpp>
 #include <mpi.h>
@@ -154,11 +155,15 @@ inline bool ProjectEulerTrueTraceCoefficientL2Local(
     if (quadrature_order <= 0 || coefficient.GetVDim() != hdg_euler_2d_components ||
         trace_space.GetVDim() != hdg_euler_2d_components ||
         trace_space.GetOrdering() != mfem::Ordering::byNODES ||
-        local_trace.ParFESpace() != &trace_space || trace_space.GetParMesh() == nullptr)
+        local_trace.ParFESpace() != &trace_space ||
+        trace_space.GetParMesh() == nullptr || !trace_space.Conforming())
     {
       return false;
     }
-    local_trace = 0.0;
+    double* const local_values = local_trace.HostWrite();
+    if (local_values == nullptr && local_trace.Size() != 0) return false;
+    if (local_trace.Size() != 0)
+      std::fill_n(local_values, local_trace.Size(), 0.0);
     for (int face = 0; face < trace_space.GetParMesh()->GetNumFaces(); ++face)
     {
       const mfem::FiniteElement* const finite_element =
@@ -212,7 +217,8 @@ inline bool ProjectEulerTrueTraceCoefficientL2Local(
           const int signed_dof = vdofs[scalar + scalar_dofs * component];
           const int dof = signed_dof >= 0 ? signed_dof : -1 - signed_dof;
           if (dof < 0 || dof >= local_trace.Size()) { return false; }
-          local_trace[dof] = (signed_dof >= 0 ? 1.0 : -1.0) * solution[scalar];
+          local_values[dof] =
+              (signed_dof >= 0 ? 1.0 : -1.0) * solution[scalar];
         }
       }
     }
@@ -255,10 +261,44 @@ inline bool ProjectEulerTrueTraceCoefficientL2(
   bool output_ready = false;
   try
   {
-    local_trace.ParallelProject(true_trace);
-    output_ready = true_trace.Size() == trace_space.GetTrueVSize();
-    for (int index = 0; output_ready && index < true_trace.Size(); ++index)
-      output_ready = std::isfinite(true_trace[index]);
+    // ParallelProject builds MFEM's HYPRE-backed restriction matrix.  The
+    // persistent HDG engine deliberately owns HYPRE initialization, so use
+    // MFEM's conforming local-to-owned-true metadata directly here.  For this
+    // DG interface space the restriction is the one-to-one master-row copy;
+    // local_trace already contains the signed physical face coordinates.
+    const int local_size = trace_space.GetVSize();
+    const int true_size = trace_space.GetTrueVSize();
+    output_ready = local_size >= 0 && true_size >= 0 &&
+        trace_space.Conforming() && local_trace.Size() == local_size;
+    std::vector<unsigned char> assigned(
+        output_ready ? static_cast<std::size_t>(true_size) : 0, 0);
+    const double* const local_values = output_ready
+        ? local_trace.HostRead() : nullptr;
+    double* const true_values = output_ready ? true_trace.HostWrite() : nullptr;
+    output_ready = output_ready &&
+        ((local_values != nullptr || local_size == 0) &&
+         (true_values != nullptr || true_size == 0));
+    for (int local = 0; output_ready && local < local_size; ++local)
+    {
+      const int owned = trace_space.GetLocalTDofNumber(local);
+      if (owned == -1) continue;
+      if (owned < 0 || owned >= true_size ||
+          !std::isfinite(local_values[local]))
+      {
+        output_ready = false;
+        break;
+      }
+      const std::size_t index = static_cast<std::size_t>(owned);
+      if (assigned[index] != 0)
+      {
+        output_ready = false;
+        break;
+      }
+      true_values[owned] = local_values[local];
+      assigned[index] = 1;
+    }
+    output_ready = output_ready &&
+        std::find(assigned.begin(), assigned.end(), 0) == assigned.end();
   }
   catch (...) { output_ready = false; }
   return detail::CollectiveTraceProjectionReady(communicator, output_ready);

@@ -48,7 +48,9 @@ bool NeedsReferenceState(const EulerBoundaryPolicyKind kind) noexcept
 
 BoundaryOperatorView EulerBoundaryContext::View() const noexcept
 {
-  return {this, Evaluate};
+  return {this, Evaluate,
+          {policies_.empty() ? nullptr : policies_.data(), policies_.size(),
+           space_dimension_, gamma_}};
 }
 
 bool EulerBoundaryContext::IsPeriodicTopologyAttribute(const int attribute) const noexcept

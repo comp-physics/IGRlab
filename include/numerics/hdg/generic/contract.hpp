@@ -2,7 +2,7 @@
 
 /**
  * @file numerics/hdg/generic/contract.hpp
- * @brief Borrowed-input admission contract for a future 2D Euler HDG engine.
+ * @brief Borrowed-input admission contract for a 2D Euler HDG engine.
  *
  * This header intentionally owns neither an MFEM mesh nor state.  It is an
  * admission boundary only; time integration, output, solver lifetime, and
@@ -12,6 +12,7 @@
 #include <mfem.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cmath>
 #include <cstdint>
@@ -34,7 +35,7 @@ enum class BackendKind : std::uint8_t
   cuda
 };
 
-/** Private numerical regularization selected by a borrowed Euler request. */
+/** Optional numerical augmentation selected by a borrowed Euler request. */
 enum class RegularizationKind : std::uint8_t
 {
   none = 0,
@@ -60,8 +61,6 @@ struct EulerHdgNumericalPolicy
   int true_trace_projection_quadrature_order;
   int conventional_assembly_quadrature_order;
   int igr_assembly_quadrature_order;
-  int audit_quadrature_order;
-  int observable_quadrature_order;
   int maximum_nonlinear_updates;
   // Zero selects the legacy adaptive cap: max(100, global true-trace size).
   // A positive value is an exact per-solve iteration cap.
@@ -80,9 +79,10 @@ constexpr EulerHdgNumericalPolicy DefaultEulerHdgNumericalPolicy(
     const int p) noexcept
 {
   const int quadrature = 2 * p + 2;
-  // The private p1 IGR helper predated this policy and used order 12.
-  return {quadrature, quadrature, quadrature, 12, quadrature,
-          quadrature, 80, 0, 13, 1.0e-10, 1.0e-12, 1.0e-10,
+  // Keep the inactive default IGR quadrature field stable for conventional
+  // requests; the order-general extension deliberately overintegrates at 12.
+  return {quadrature, quadrature, quadrature, 12, 80, 0, 13,
+          1.0e-10, 1.0e-12, 1.0e-10,
           1.0e-10, 1.0e-4, {RegularizationKind::none, 0.0, 0.0}};
 }
 
@@ -158,7 +158,7 @@ struct EulerFieldView
   int components;
 };
 
-/** Point data supplied to a numerical boundary callback by a future engine. */
+/** Point data supplied to a host numerical boundary callback by an engine. */
 struct BoundaryPointView
 {
   const double* position;
@@ -168,9 +168,11 @@ struct BoundaryPointView
 };
 
 /**
- * A borrowed numerical boundary operator.  The callback may inspect only the
- * supplied point and interior state and writes one four-component exterior
- * state.  It receives no mesh, solver, lifecycle, or state-owner handle.
+ * A borrowed host numerical boundary operator.  The callback may inspect only
+ * the supplied point and interior state and writes one four-component exterior
+ * state.  It receives no mesh, solver, lifecycle, or state-owner handle.  The
+ * companion attribute-indexed POD table carries the same resolved policy data
+ * for device backends; it is copied during Initialize and never retained.
  */
 using NumericalBoundaryState = bool (*) (
     const void* context,
@@ -178,10 +180,44 @@ using NumericalBoundaryState = bool (*) (
     const double* interior_state,
     double* exterior_state) noexcept;
 
+/** Backend-neutral, attribute-indexed Euler boundary policy. */
+enum class EulerBoundaryPolicyKind : std::uint8_t
+{
+  periodic_topology,
+  supersonic_inlet,
+  subsonic_inlet,
+  supersonic_outlet,
+  subsonic_outlet_pressure,
+  far_field,
+  nonreflecting_outlet,
+  slip_wall
+};
+
+/**
+ * POD boundary data shared by host callbacks and device lowering.  Entry zero
+ * describes boundary attribute one.  The table is borrowed for Initialize;
+ * an engine must copy it before retaining numerical state.
+ */
+struct EulerBoundaryPolicy
+{
+  EulerBoundaryPolicyKind kind;
+  std::array<double, euler_2d_conserved_components> reference_state;
+  double pressure_out;
+};
+
+struct EulerBoundaryPolicyTableView
+{
+  const EulerBoundaryPolicy* policies;
+  std::size_t count;
+  int space_dimension;
+  double gamma;
+};
+
 struct BoundaryOperatorView
 {
   const void* context;
   NumericalBoundaryState exterior_state;
+  EulerBoundaryPolicyTableView policies;
 };
 
 /**
@@ -217,6 +253,12 @@ static_assert(std::is_standard_layout<BoundaryPointView>::value &&
 static_assert(std::is_standard_layout<BoundaryOperatorView>::value &&
                   std::is_trivial<BoundaryOperatorView>::value,
               "generic HDG boundary views must stay POD");
+static_assert(std::is_standard_layout<EulerBoundaryPolicy>::value &&
+                  std::is_trivial<EulerBoundaryPolicy>::value,
+              "generic HDG boundary policies must stay POD");
+static_assert(std::is_standard_layout<EulerBoundaryPolicyTableView>::value &&
+                  std::is_trivial<EulerBoundaryPolicyTableView>::value,
+              "generic HDG boundary-policy views must stay POD");
 static_assert(std::is_standard_layout<RegularizationSelection>::value &&
                   std::is_trivial<RegularizationSelection>::value,
               "generic HDG regularization must stay POD");
@@ -241,6 +283,170 @@ inline std::uint64_t DoubleBits(const double value) noexcept
   return bits;
 }
 
+constexpr bool IsKnownEulerBoundaryPolicyKind(
+    const EulerBoundaryPolicyKind kind) noexcept
+{
+  switch (kind)
+  {
+  case EulerBoundaryPolicyKind::periodic_topology:
+  case EulerBoundaryPolicyKind::supersonic_inlet:
+  case EulerBoundaryPolicyKind::subsonic_inlet:
+  case EulerBoundaryPolicyKind::supersonic_outlet:
+  case EulerBoundaryPolicyKind::subsonic_outlet_pressure:
+  case EulerBoundaryPolicyKind::far_field:
+  case EulerBoundaryPolicyKind::nonreflecting_outlet:
+  case EulerBoundaryPolicyKind::slip_wall:
+    return true;
+  }
+  return false;
+}
+
+inline bool IsAbsentEulerBoundaryPolicyTable(
+    const EulerBoundaryPolicyTableView& table) noexcept
+{
+  return table.policies == nullptr && table.count == 0 &&
+      table.space_dimension == 0 && DoubleBits(table.gamma) == 0;
+}
+
+inline bool IsValidEulerBoundaryPolicyTable(
+    const EulerBoundaryPolicyTableView& table,
+    const int expected_space_dimension,
+    const int expected_attribute_count,
+    const int retained_attribute_count,
+    const std::vector<unsigned char>& physical_attribute_mask) noexcept
+{
+  // Preserve the original callback-only generic contract.  CUDA application
+  // requests supply the table; a backend that needs device lowering may reject
+  // this compatibility spelling during its own admission.
+  if (IsAbsentEulerBoundaryPolicyTable(table)) return true;
+  const bool physical_boundary_present = std::any_of(
+      physical_attribute_mask.begin(), physical_attribute_mask.end(),
+      [](const unsigned char value) { return value != 0; });
+  const bool empty_periodic_table = !physical_boundary_present &&
+      table.count == 0;
+  const bool exact_retained_table = table.count ==
+      static_cast<std::size_t>(retained_attribute_count);
+  if (expected_space_dimension != 2 || table.space_dimension != 2 ||
+      expected_attribute_count < 0 || retained_attribute_count < 0 ||
+      physical_attribute_mask.size() !=
+          static_cast<std::size_t>(retained_attribute_count) ||
+      expected_attribute_count != (physical_boundary_present
+          ? retained_attribute_count : 0) ||
+      (!empty_periodic_table && !exact_retained_table) ||
+      !std::isfinite(table.gamma) || table.gamma <= 1.0)
+  {
+    return false;
+  }
+  if (table.count == 0) return table.policies == nullptr;
+  if (table.policies == nullptr) return false;
+  for (std::size_t index = 0; index < table.count; ++index)
+  {
+    const EulerBoundaryPolicy& policy = table.policies[index];
+    const bool physical_attribute = physical_attribute_mask[index] != 0;
+    const bool periodic_policy =
+        policy.kind == EulerBoundaryPolicyKind::periodic_topology;
+    if (!IsKnownEulerBoundaryPolicyKind(policy.kind) ||
+        physical_attribute == periodic_policy ||
+        !std::isfinite(policy.pressure_out))
+    {
+      return false;
+    }
+    for (const double value : policy.reference_state)
+    {
+      if (!std::isfinite(value)) return false;
+    }
+  }
+  return true;
+}
+
+/** Exact collective identity for optional attribute-indexed policy data. */
+inline bool ExactEulerBoundaryPolicyConsensus(
+    const MPI_Comm communicator,
+    const EulerBoundaryPolicyTableView& table) noexcept
+{
+  if (communicator == MPI_COMM_NULL) return false;
+  const std::uint64_t local_count = static_cast<std::uint64_t>(table.count);
+  std::uint64_t minimum_count = 0;
+  std::uint64_t maximum_count = 0;
+  const int local_dimension = table.space_dimension;
+  int minimum_dimension = 0;
+  int maximum_dimension = 0;
+  const std::uint64_t local_gamma = DoubleBits(table.gamma);
+  std::uint64_t minimum_gamma = 0;
+  std::uint64_t maximum_gamma = 0;
+  const int locally_accessible =
+      (table.count == 0 ? table.policies == nullptr
+                        : table.policies != nullptr) ? 1 : 0;
+  int globally_accessible = 0;
+  const int minimum_count_status = MPI_Allreduce(
+      &local_count, &minimum_count, 1, MPI_UINT64_T, MPI_MIN, communicator);
+  const int maximum_count_status = MPI_Allreduce(
+      &local_count, &maximum_count, 1, MPI_UINT64_T, MPI_MAX, communicator);
+  const int minimum_dimension_status = MPI_Allreduce(
+      &local_dimension, &minimum_dimension, 1, MPI_INT, MPI_MIN, communicator);
+  const int maximum_dimension_status = MPI_Allreduce(
+      &local_dimension, &maximum_dimension, 1, MPI_INT, MPI_MAX, communicator);
+  const int minimum_gamma_status = MPI_Allreduce(
+      &local_gamma, &minimum_gamma, 1, MPI_UINT64_T, MPI_MIN, communicator);
+  const int maximum_gamma_status = MPI_Allreduce(
+      &local_gamma, &maximum_gamma, 1, MPI_UINT64_T, MPI_MAX, communicator);
+  const int accessible_status = MPI_Allreduce(
+      &locally_accessible, &globally_accessible, 1, MPI_INT, MPI_MIN,
+      communicator);
+  const bool metadata_ready = minimum_count_status == MPI_SUCCESS &&
+      maximum_count_status == MPI_SUCCESS &&
+      minimum_dimension_status == MPI_SUCCESS &&
+      maximum_dimension_status == MPI_SUCCESS &&
+      minimum_gamma_status == MPI_SUCCESS &&
+      maximum_gamma_status == MPI_SUCCESS && accessible_status == MPI_SUCCESS;
+  if (!metadata_ready || minimum_count != maximum_count ||
+      minimum_dimension != maximum_dimension || minimum_gamma != maximum_gamma ||
+      globally_accessible != 1)
+  {
+    return false;
+  }
+
+  for (std::size_t index = 0; index < table.count; ++index)
+  {
+    const EulerBoundaryPolicy& policy = table.policies[index];
+    const int local_kind = static_cast<int>(policy.kind);
+    int minimum_kind = 0;
+    int maximum_kind = 0;
+    std::uint64_t local_values[euler_2d_conserved_components + 1]{};
+    std::uint64_t minimum_values[euler_2d_conserved_components + 1]{};
+    std::uint64_t maximum_values[euler_2d_conserved_components + 1]{};
+    for (int component = 0; component < euler_2d_conserved_components;
+         ++component)
+    {
+      local_values[component] = DoubleBits(
+          policy.reference_state[static_cast<std::size_t>(component)]);
+    }
+    local_values[euler_2d_conserved_components] =
+        DoubleBits(policy.pressure_out);
+    const int minimum_kind_status = MPI_Allreduce(
+        &local_kind, &minimum_kind, 1, MPI_INT, MPI_MIN, communicator);
+    const int maximum_kind_status = MPI_Allreduce(
+        &local_kind, &maximum_kind, 1, MPI_INT, MPI_MAX, communicator);
+    const int minimum_values_status = MPI_Allreduce(
+        local_values, minimum_values, euler_2d_conserved_components + 1,
+        MPI_UINT64_T, MPI_MIN, communicator);
+    const int maximum_values_status = MPI_Allreduce(
+        local_values, maximum_values, euler_2d_conserved_components + 1,
+        MPI_UINT64_T, MPI_MAX, communicator);
+    if (minimum_kind_status != MPI_SUCCESS ||
+        maximum_kind_status != MPI_SUCCESS ||
+        minimum_values_status != MPI_SUCCESS ||
+        maximum_values_status != MPI_SUCCESS ||
+        minimum_kind != maximum_kind ||
+        !std::equal(std::begin(minimum_values), std::end(minimum_values),
+                    std::begin(maximum_values)))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 inline bool ValidRegularizationSelection(
     const RegularizationSelection selection) noexcept
 {
@@ -261,8 +467,6 @@ inline bool ValidEulerHdgNumericalPolicy(
       policy.true_trace_projection_quadrature_order,
       policy.conventional_assembly_quadrature_order,
       policy.igr_assembly_quadrature_order,
-      policy.audit_quadrature_order,
-      policy.observable_quadrature_order,
       policy.maximum_nonlinear_updates,
       policy.maximum_line_search_trials};
   for (const int value : positive_integers)
@@ -285,45 +489,144 @@ inline bool ValidEulerHdgNumericalPolicy(
 
 /**
  * Periodic MFEM meshes retain boundary-element annotations for faces that
- * become interior (or rank-shared) after periodic identification.  IGR has
- * no physical boundary treatment, so distinguish those annotations from a
- * true physical boundary face rather than using GetNBE() directly.
+ * become interior (or rank-shared) after periodic identification.  This
+ * helper distinguishes those annotations from a true physical boundary face
+ * rather than using GetNBE() directly.
  */
-inline bool HasPhysicalBoundaryFace(const mfem::ParMesh& mesh) noexcept
+inline bool LocalPhysicalBoundaryAttributeMask(
+    const mfem::ParMesh& mesh, int& retained_attribute_count,
+    std::vector<int>& physical_attribute_mask) noexcept
 {
+  retained_attribute_count = 0;
+  physical_attribute_mask.clear();
   try
   {
     const int faces = mesh.GetNumFaces();
-    if (faces < 0) { return true; }
-    std::vector<bool> shared(static_cast<std::size_t>(faces), false);
+    const int boundary_elements = mesh.GetNBE();
     const int shared_faces = mesh.GetNSharedFaces();
-    if (shared_faces < 0) { return true; }
+    if (faces < 0 || boundary_elements < 0 || shared_faces < 0)
+      return false;
+    retained_attribute_count = mesh.bdr_attributes.Size() == 0
+        ? 0 : mesh.bdr_attributes.Max();
+    if (retained_attribute_count < 0) return false;
+
+    std::vector<unsigned char> shared(
+        static_cast<std::size_t>(faces), 0);
+    std::vector<int> face_to_boundary(
+        static_cast<std::size_t>(faces), -1);
+    physical_attribute_mask.assign(
+        static_cast<std::size_t>(retained_attribute_count), 0);
     for (int shared_face = 0; shared_face < shared_faces; ++shared_face)
     {
       const int face = mesh.GetSharedFace(shared_face);
-      if (face < 0 || face >= faces) { return true; }
-      shared[static_cast<std::size_t>(face)] = true;
+      if (face < 0 || face >= faces) return false;
+      shared[static_cast<std::size_t>(face)] = 1;
     }
-    for (int boundary = 0; boundary < mesh.GetNBE(); ++boundary)
+    for (int boundary = 0; boundary < boundary_elements; ++boundary)
     {
       const int face = mesh.GetBdrElementFaceIndex(boundary);
-      if (face < 0 || face >= faces) { return true; }
+      const int attribute = mesh.GetBdrAttribute(boundary);
+      if (face < 0 || face >= faces || attribute <= 0 ||
+          attribute > retained_attribute_count)
+        return false;
+      face_to_boundary[static_cast<std::size_t>(face)] = boundary;
     }
-
     for (int face = 0; face < faces; ++face)
     {
-      if (!mesh.FaceIsInterior(face) &&
-          !shared[static_cast<std::size_t>(face)])
-      {
-        return true;
-      }
+      const bool physical = !mesh.FaceIsInterior(face) &&
+          shared[static_cast<std::size_t>(face)] == 0;
+      if (!physical) continue;
+      const int boundary =
+          face_to_boundary[static_cast<std::size_t>(face)];
+      if (boundary < 0 || boundary >= boundary_elements) return false;
+      const int attribute = mesh.GetBdrAttribute(boundary);
+      if (attribute <= 0 || attribute > retained_attribute_count)
+        return false;
+      physical_attribute_mask[
+          static_cast<std::size_t>(attribute - 1)] = 1;
     }
-    return false;
-  }
-  catch (...)
-  {
     return true;
   }
+  catch (...) { return false; }
+}
+
+/**
+ * Resolve the attribute-table extent for physical faces collectively.
+ *
+ * MFEM preserves the original boundary attributes after periodic vertex
+ * identification, so bdr_attributes.Max() alone cannot distinguish a fully
+ * periodic mesh from a physical-boundary mesh.  Conversely, an MPI rank may
+ * own no physical face even though another rank does.  Use the request
+ * communicator to make both decisions global before validating the shared
+ * attribute-indexed policy table.
+ */
+inline bool GlobalPhysicalBoundaryAttributeCount(
+    const mfem::ParMesh& mesh, const MPI_Comm communicator,
+    int& attribute_count, int& retained_attribute_count,
+    std::vector<unsigned char>& physical_attribute_mask) noexcept
+{
+  if (communicator == MPI_COMM_NULL) return false;
+  attribute_count = 0;
+  retained_attribute_count = 0;
+  physical_attribute_mask.clear();
+  int local_maximum = 0;
+  std::vector<int> local_physical_attributes;
+  const int local_topology_ready = LocalPhysicalBoundaryAttributeMask(
+      mesh, local_maximum, local_physical_attributes) ? 1 : 0;
+  int global_topology_ready = 0;
+  int global_maximum = 0;
+  const bool topology_ready = MPI_Allreduce(
+      &local_topology_ready, &global_topology_ready, 1, MPI_INT, MPI_MIN,
+      communicator) == MPI_SUCCESS;
+  const bool maximum_ready = MPI_Allreduce(
+      &local_maximum, &global_maximum, 1, MPI_INT, MPI_MAX,
+      communicator) == MPI_SUCCESS;
+  if (!topology_ready || !maximum_ready || global_topology_ready != 1 ||
+      global_maximum < 0)
+  {
+    return false;
+  }
+
+  int local_storage_ready = 1;
+  std::vector<int> global_physical_attributes;
+  try
+  {
+    local_physical_attributes.resize(
+        static_cast<std::size_t>(global_maximum), 0);
+    global_physical_attributes.assign(
+        static_cast<std::size_t>(global_maximum), 0);
+    physical_attribute_mask.assign(
+        static_cast<std::size_t>(global_maximum), 0);
+  }
+  catch (...) { local_storage_ready = 0; }
+  int global_storage_ready = 0;
+  if (MPI_Allreduce(&local_storage_ready, &global_storage_ready, 1, MPI_INT,
+                    MPI_MIN, communicator) != MPI_SUCCESS ||
+      global_storage_ready != 1)
+    return false;
+
+  int dummy_send = 0;
+  int dummy_receive = 0;
+  const int mask_status = MPI_Allreduce(
+      global_maximum == 0 ? &dummy_send : local_physical_attributes.data(),
+      global_maximum == 0 ? &dummy_receive
+                          : global_physical_attributes.data(),
+      global_maximum, MPI_INT, MPI_MAX, communicator);
+  if (mask_status != MPI_SUCCESS) return false;
+  bool physical_boundary_present = false;
+  for (int attribute = 0; attribute < global_maximum; ++attribute)
+  {
+    const int value = global_physical_attributes[
+        static_cast<std::size_t>(attribute)];
+    if (value < 0 || value > 1) return false;
+    physical_attribute_mask[static_cast<std::size_t>(attribute)] =
+        static_cast<unsigned char>(value);
+    physical_boundary_present = physical_boundary_present || value != 0;
+  }
+  if (physical_boundary_present && global_maximum == 0) return false;
+  attribute_count = physical_boundary_present ? global_maximum : 0;
+  retained_attribute_count = global_maximum;
+  return true;
 }
 
 constexpr std::uint32_t RequiredCapabilities(
@@ -415,8 +718,6 @@ inline bool ExactNumericalPolicyConsensus(
       policy.true_trace_projection_quadrature_order,
       policy.conventional_assembly_quadrature_order,
       policy.igr_assembly_quadrature_order,
-      policy.audit_quadrature_order,
-      policy.observable_quadrature_order,
       policy.maximum_nonlinear_updates,
       policy.maximum_linear_iterations,
       policy.maximum_line_search_trials,
@@ -433,18 +734,23 @@ inline bool ExactNumericalPolicyConsensus(
   int maximum_integers[sizeof(integers) / sizeof(*integers)]{};
   std::uint64_t minimum_reals[sizeof(reals) / sizeof(*reals)]{};
   std::uint64_t maximum_reals[sizeof(reals) / sizeof(*reals)]{};
-  return MPI_Allreduce(integers, minimum_integers,
-                       static_cast<int>(sizeof(integers) / sizeof(*integers)),
-                       MPI_INT, MPI_MIN, communicator) == MPI_SUCCESS &&
-      MPI_Allreduce(integers, maximum_integers,
-                    static_cast<int>(sizeof(integers) / sizeof(*integers)),
-                    MPI_INT, MPI_MAX, communicator) == MPI_SUCCESS &&
-      MPI_Allreduce(reals, minimum_reals,
-                    static_cast<int>(sizeof(reals) / sizeof(*reals)),
-                    MPI_UINT64_T, MPI_MIN, communicator) == MPI_SUCCESS &&
-      MPI_Allreduce(reals, maximum_reals,
-                    static_cast<int>(sizeof(reals) / sizeof(*reals)),
-                    MPI_UINT64_T, MPI_MAX, communicator) == MPI_SUCCESS &&
+  const int integer_count =
+      static_cast<int>(sizeof(integers) / sizeof(*integers));
+  const int real_count = static_cast<int>(sizeof(reals) / sizeof(*reals));
+  const bool minimum_integers_ready = MPI_Allreduce(
+      integers, minimum_integers, integer_count, MPI_INT, MPI_MIN,
+      communicator) == MPI_SUCCESS;
+  const bool maximum_integers_ready = MPI_Allreduce(
+      integers, maximum_integers, integer_count, MPI_INT, MPI_MAX,
+      communicator) == MPI_SUCCESS;
+  const bool minimum_reals_ready = MPI_Allreduce(
+      reals, minimum_reals, real_count, MPI_UINT64_T, MPI_MIN,
+      communicator) == MPI_SUCCESS;
+  const bool maximum_reals_ready = MPI_Allreduce(
+      reals, maximum_reals, real_count, MPI_UINT64_T, MPI_MAX,
+      communicator) == MPI_SUCCESS;
+  return minimum_integers_ready && maximum_integers_ready &&
+      minimum_reals_ready && maximum_reals_ready &&
       std::equal(std::begin(minimum_integers), std::end(minimum_integers),
                  std::begin(maximum_integers)) &&
       std::equal(std::begin(minimum_reals), std::end(minimum_reals),
@@ -454,8 +760,6 @@ inline bool ExactNumericalPolicyConsensus(
 inline ContractStatus ValidateEulerHdgRequest(
     const EulerHdgRequest& request) noexcept
 {
-  if (request.mesh == nullptr) { return ContractStatus::null_mesh; }
-
   int mpi_initialized = 0;
   int mpi_finalized = 0;
   if (MPI_Initialized(&mpi_initialized) != MPI_SUCCESS || !mpi_initialized ||
@@ -463,22 +767,35 @@ inline ContractStatus ValidateEulerHdgRequest(
   {
     return ContractStatus::incompatible_communicator;
   }
+  if (request.communicator == MPI_COMM_NULL)
+  {
+    return ContractStatus::null_communicator;
+  }
+  // The request communicator is the sole collective authority.  Establish
+  // mesh presence on it before any rank dereferences a borrowed mesh: one
+  // rank-local null must reject the complete request instead of letting the
+  // null rank return while its peers enter mesh collectives.
+  const int local_mesh_present = request.mesh == nullptr ? 0 : 1;
+  int every_mesh_present = 0;
+  if (MPI_Allreduce(&local_mesh_present, &every_mesh_present, 1, MPI_INT,
+                    MPI_MIN, request.communicator) != MPI_SUCCESS)
+  {
+    return ContractStatus::collective_failure;
+  }
+  if (every_mesh_present != 1) { return ContractStatus::null_mesh; }
+
   const MPI_Comm mesh_communicator = request.mesh->GetComm();
   ContractStatus local_status = ContractStatus::accepted;
   int comparison = MPI_UNEQUAL;
-  if (request.communicator == MPI_COMM_NULL)
-  {
-    RecordFailure(local_status, ContractStatus::null_communicator);
-  }
-  else if (MPI_Comm_compare(request.communicator, mesh_communicator,
-                            &comparison) != MPI_SUCCESS ||
-           (comparison != MPI_IDENT && comparison != MPI_CONGRUENT))
+  if (MPI_Comm_compare(request.communicator, mesh_communicator,
+                       &comparison) != MPI_SUCCESS ||
+      (comparison != MPI_IDENT && comparison != MPI_CONGRUENT))
   {
     RecordFailure(local_status, ContractStatus::incompatible_communicator);
   }
   // Keep this fixed sequence even for malformed local input: validation is
   // collective, and every numerical choice has exact rank agreement.
-  if (!ExactNumericalPolicyConsensus(mesh_communicator,
+  if (!ExactNumericalPolicyConsensus(request.communicator,
                                      request.numerical_policy) ||
       !ValidEulerHdgNumericalPolicy(request.numerical_policy))
   {
@@ -516,13 +833,9 @@ inline ContractStatus ValidateEulerHdgRequest(
   {
     RecordFailure(local_status, ContractStatus::unsupported_polynomial_order);
   }
-  if (request.numerical_policy.stabilization.kind == RegularizationKind::igr &&
-      (request.backend.kind != BackendKind::cpu ||
-       request.polynomial_order != minimum_polynomial_order ||
-       HasPhysicalBoundaryFace(*request.mesh)))
-  {
-    RecordFailure(local_status, ContractStatus::invalid_regularization);
-  }
+  // IGR is an augmentation selected inside either conventional backend; it
+  // does not select another Euler solver or narrow the admitted order and
+  // physical-boundary surface.
   if ((request.backend.kind == BackendKind::cpu &&
        request.backend.device_ordinal != -1) ||
       (request.backend.kind == BackendKind::cuda &&
@@ -547,11 +860,31 @@ inline ContractStatus ValidateEulerHdgRequest(
   {
     RecordFailure(local_status, ContractStatus::invalid_source);
   }
-  if (request.boundary.exterior_state == nullptr)
+  int boundary_attribute_count = 0;
+  int retained_boundary_attribute_count = 0;
+  std::vector<unsigned char> physical_boundary_attribute_mask;
+  const bool boundary_attribute_count_ready =
+      GlobalPhysicalBoundaryAttributeCount(
+          *request.mesh, request.communicator, boundary_attribute_count,
+          retained_boundary_attribute_count,
+          physical_boundary_attribute_mask);
+  // Do not short-circuit this collective on a rank-local malformed table.
+  // Every mesh rank enters the same metadata/payload sequence and receives the
+  // same invalid-boundary disposition for unequal policy bits.
+  const bool exact_boundary_policy = ExactEulerBoundaryPolicyConsensus(
+      request.communicator, request.boundary.policies);
+  const bool valid_boundary_policy = IsValidEulerBoundaryPolicyTable(
+      request.boundary.policies, request.mesh->SpaceDimension(),
+      boundary_attribute_count, retained_boundary_attribute_count,
+      physical_boundary_attribute_mask);
+  if (!boundary_attribute_count_ready ||
+      request.boundary.exterior_state == nullptr ||
+      !exact_boundary_policy || !valid_boundary_policy)
   {
     RecordFailure(local_status, ContractStatus::invalid_boundary_operator);
   }
-  return CollectAdmissionStatus(mesh_communicator, local_status, local_elements);
+  return CollectAdmissionStatus(
+      request.communicator, local_status, local_elements);
 }
 
 }  // namespace dg::hdg::generic

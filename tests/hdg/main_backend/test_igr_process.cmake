@@ -19,8 +19,8 @@ set(_base_arguments
   --no-vtk_save
   --no-glvis)
 
-function(run_igr_success expected_alpha expected_beta)
-  set(_arguments ${_base_arguments} --order 1 ${ARGN})
+function(run_igr_success order expected_alpha expected_beta)
+  set(_arguments ${_base_arguments} --order ${order} ${ARGN})
   if(HDG_MAIN_RANKS EQUAL 1)
     execute_process(
       COMMAND "${HDG_MAIN_EXECUTABLE}" ${_arguments}
@@ -42,7 +42,7 @@ function(run_igr_success expected_alpha expected_beta)
        "\\[hdg-main\\] status=Success.*regularization=igr.*alpha=${expected_alpha}.*beta=${expected_beta}" OR
      NOT _stderr STREQUAL "")
     message(FATAL_ERROR
-      "HDG IGR execution failed: ${_status}\\n${_stdout}\\n${_stderr}")
+      "HDG p${order} IGR execution failed: ${_status}\\n${_stdout}\\n${_stderr}")
   endif()
 endfunction()
 
@@ -71,12 +71,14 @@ function(expect_igr_rejection expected_diagnostic)
   endif()
 endfunction()
 
-# Both schedules use the same periodic n3/p1 no-VTK lifecycle.  The explicit
-# tuple confirms that the CLI fields, not legacy IGR options, reach the request.
-run_igr_success(1 1)
-run_igr_success(1.25 0.75 --hdg-igr-alpha 1.25 --hdg-igr-beta 0.75)
+# Every supported order uses the same periodic no-VTK Euler lifecycle.  The
+# explicit p1 tuple confirms that the CLI fields, not legacy IGR options,
+# reach the optional augmentation request.
+run_igr_success(1 1 1)
+run_igr_success(1 1.25 0.75 --hdg-igr-alpha 1.25 --hdg-igr-beta 0.75)
+run_igr_success(2 1 1)
+run_igr_success(3 1 1)
 expect_igr_rejection("HDG IGR alpha and beta must be finite and positive"
   --order 1 --hdg-igr-alpha 0)
 expect_igr_rejection("HDG IGR alpha and beta must be finite and positive"
   --order 1 --hdg-igr-beta 0)
-expect_igr_rejection("HDG IGR supports only polynomial order one" --order 2)

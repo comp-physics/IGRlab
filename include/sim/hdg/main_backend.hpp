@@ -59,9 +59,10 @@ struct HdgEulerMainRequest
  * completion.
  *
  * The CPU profile and the CUDA profile provide distinct definitions of this
- * symbol and are never linked together.  The CUDA definition is deliberately
- * narrower: it admits only the fixed periodic W8A borrowed-data envelope.
- * Generic restart, CFL, IMEX, and GLVis remain outside both main adapters.
+ * symbol and are never linked together.  Both lower the same generic Euler
+ * request, including optional IGR augmentation, generic initial/source fields,
+ * conventional Euler boundary policies, and numerical controls.  Generic
+ * restart, IMEX, and GLVis remain outside both main adapters.
  * This is a collective call: every member of @p request.communicator must
  * enter it with a live, congruent communicator and rank-consistent resolved
  * configuration and mesh content.  It invokes request.make_case_data only

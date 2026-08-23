@@ -965,14 +965,15 @@ private:
       StoragePolicy::HashInterior(std::declval<const InteriorState&>()));
   using trace_hash_result = decltype(
       StoragePolicy::HashTrace(std::declval<const TraceState&>()));
-  using admission_result = decltype(CollectivePolicy::Admit(
+  using admission_result = decltype(std::declval<CollectivePolicy&>().Admit(
       std::declval<const AttemptCollectiveContext&>(), bool{},
       std::declval<FailureReason>(), std::declval<std::uint32_t>()));
-  using collective_result = decltype(CollectivePolicy::Reduce(
+  using collective_result = decltype(std::declval<CollectivePolicy&>().Reduce(
       std::declval<const AttemptCollectiveContext&>(),
       std::declval<const GateReport&>(), std::declval<FailureReason>(),
       std::declval<std::uint32_t>()));
-  using restore_collective_result = decltype(CollectivePolicy::ReduceRestore(
+  using restore_collective_result = decltype(
+      std::declval<CollectivePolicy&>().ReduceRestore(
       std::declval<const RestoreCollectiveContext&>(),
       std::declval<RestartCompatibility>(),
       std::declval<FailureReason>(), std::declval<std::uint32_t>()));
@@ -1049,18 +1050,18 @@ private:
                     std::declval<const state_slot&>(),
                     std::declval<const state_slot&>())),
                 "Disjoint must be noexcept");
-  static_assert(noexcept(CollectivePolicy::Admit(
+  static_assert(noexcept(std::declval<CollectivePolicy&>().Admit(
                     std::declval<const AttemptCollectiveContext&>(), bool{},
                     std::declval<FailureReason>(),
                     std::declval<std::uint32_t>())),
                 "collective Admit must be noexcept");
-  static_assert(noexcept(CollectivePolicy::Reduce(
+  static_assert(noexcept(std::declval<CollectivePolicy&>().Reduce(
                     std::declval<const AttemptCollectiveContext&>(),
                     std::declval<const GateReport&>(),
                     std::declval<FailureReason>(),
                     std::declval<std::uint32_t>())),
                 "collective Reduce must be noexcept");
-  static_assert(noexcept(CollectivePolicy::ReduceRestore(
+  static_assert(noexcept(std::declval<CollectivePolicy&>().ReduceRestore(
                     std::declval<const RestoreCollectiveContext&>(),
                     std::declval<RestartCompatibility>(),
                     std::declval<FailureReason>(),
@@ -1357,11 +1358,13 @@ public:
                         state_slot candidate,
                         const StateCoordinates coordinates,
                         const PersistentResourceDescriptor resources,
-                        const std::uint64_t initial_attempt_sequence = 0)
+                        const std::uint64_t initial_attempt_sequence = 0,
+                        CollectivePolicy collective_policy = {})
       : committed_(std::move(committed)),
         candidate_(std::move(candidate)),
         coordinates_(coordinates),
         resources_(resources),
+        collective_policy_(std::move(collective_policy)),
         attempt_sequence_(initial_attempt_sequence),
         incarnation_(detail::AcquireContractIncarnation())
   {
@@ -1722,7 +1725,7 @@ public:
 
     const AttemptCollectiveContext local_context{
         attempt, token.entry_, token.target_, token.target_.cursor};
-    const CollectiveGateReport collective = CollectivePolicy::Reduce(
+    const CollectiveGateReport collective = collective_policy_.Reduce(
         local_context, local_gates, local_reason, resources_.rank_count);
     const FailureReason reason = ResolveGateCollective(
         local_context, local_gates, local_reason, collective);
@@ -1987,7 +1990,7 @@ public:
         pending_dt_};
     const AttemptCollectiveContext local_context{
         attempt, coordinates_, target, report.candidate_cursor};
-    const CollectiveGateReport collective = CollectivePolicy::Reduce(
+    const CollectiveGateReport collective = collective_policy_.Reduce(
         local_context, local_gates, local_reason, resources_.rank_count);
     const FailureReason reason = ResolveGateCollective(
         local_context, local_gates, local_reason, collective);
@@ -2158,10 +2161,10 @@ public:
     // Unconditional: corrupt descriptors, buffers, local storage, and busy
     // status all participate in exactly one restore reduction before publish.
     const CollectiveRestoreReport collective =
-        CollectivePolicy::ReduceRestore(local_context,
-                                        local_compatibility,
-                                        local_reason,
-                                        resources_.rank_count);
+        collective_policy_.ReduceRestore(local_context,
+                                         local_compatibility,
+                                         local_reason,
+                                         resources_.rank_count);
     const RestartCompatibility compatibility = ResolveRestoreCollective(
         local_context, local_compatibility, local_reason, collective);
     if (compatibility != RestartCompatibility::compatible)
@@ -2448,7 +2451,7 @@ private:
     // one admission collective even when any local validation/preparation fails.
     const AttemptCollectiveContext local_context{
         proposed, coordinates_, target, coordinates_.cursor};
-    const CollectiveAdmissionReport admission = CollectivePolicy::Admit(
+    const CollectiveAdmissionReport admission = collective_policy_.Admit(
         local_context, local_prepared, local_reason, resources_.rank_count);
     const FailureReason reason = ResolveAdmissionCollective(
         local_context, local_prepared, local_reason, admission);
@@ -2836,6 +2839,7 @@ private:
   state_slot candidate_{};
   StateCoordinates coordinates_{};
   PersistentResourceDescriptor resources_{};
+  CollectivePolicy collective_policy_{};
   RunTelemetry telemetry_{};
   StateCoordinates prepared_target_{};
   AttemptTelemetry prepared_telemetry_{};

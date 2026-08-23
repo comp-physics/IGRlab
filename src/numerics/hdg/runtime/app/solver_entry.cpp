@@ -23,6 +23,14 @@ ApplicationRunResult RejectStaticEntryMismatch() noexcept
   return result;
 }
 
+bool IsConventionalStaticEntry(
+    const ApplicationOptionsView& request,
+    const std::string_view expected_backend) noexcept
+{
+  return request.backend_id == expected_backend &&
+      request.card_id == smooth_periodic_euler_v1_card_id;
+}
+
 HdgMethodResultV1 RejectMethodRequest(
     const HdgMethodCapabilitiesV1 capabilities) noexcept
 {
@@ -119,7 +127,7 @@ ApplicationRunResult RunSmoothPeriodicEulerV1(
     CpuSerialBackendTag tag, const ApplicationOptionsView& request,
     MpiApplicationContextV1& context)
 {
-  if (request.backend_id != CpuSerialBackendTag::id)
+  if (!IsConventionalStaticEntry(request, CpuSerialBackendTag::id))
     return RejectStaticEntryMismatch();
   return detail::RunSmoothPeriodicEulerV1Downstream(tag, request, context);
 }
@@ -128,7 +136,7 @@ ApplicationRunResult RunSmoothPeriodicEulerV1(
     CpuRank2BackendTag tag, const ApplicationOptionsView& request,
     MpiApplicationContextV1& context)
 {
-  if (request.backend_id != CpuRank2BackendTag::id)
+  if (!IsConventionalStaticEntry(request, CpuRank2BackendTag::id))
     return RejectStaticEntryMismatch();
   return detail::RunSmoothPeriodicEulerV1Downstream(tag, request, context);
 }
@@ -138,7 +146,8 @@ ApplicationRunResult RunSmoothPeriodicEulerV1(
     CudaRank1OneGpuBackendTag tag, const ApplicationOptionsView& request,
     CudaApplicationContextV1& context)
 {
-  if (request.backend_id != CudaRank1OneGpuBackendTag::id)
+  if (!IsConventionalStaticEntry(
+          request, CudaRank1OneGpuBackendTag::id))
     return RejectStaticEntryMismatch();
   return detail::RunSmoothPeriodicEulerV1Downstream(tag, request, context);
 }
@@ -150,7 +159,8 @@ ApplicationRunResult RunSmoothPeriodicEulerV1(
     const ApplicationOptionsView& request,
     CudaApplicationContextV1& context)
 {
-  if (request.backend_id != CudaRank2OneGpuHostStagedBackendTag::id)
+  if (!IsConventionalStaticEntry(
+          request, CudaRank2OneGpuHostStagedBackendTag::id))
     return RejectStaticEntryMismatch();
   return detail::RunSmoothPeriodicEulerV1Downstream(tag, request, context);
 }

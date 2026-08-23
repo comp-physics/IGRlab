@@ -121,10 +121,112 @@ endif()
 
 if(MFEM_USE_CUDA)
   if(NOT TARGET dg_igr_hdg_main_backend_cuda OR
-     NOT TARGET dgsem_smooth_advection_periodic)
+     NOT TARGET dgsem_smooth_advection_periodic OR
+     NOT TARGET dgsem_smooth_advection)
     message(FATAL_ERROR
-      "The CUDA generic HDG main backend and opted-in example are required.")
+      "The CUDA generic HDG main backend and periodic/physical examples are required.")
   endif()
+
+  # These are real application-entry gates, not direct backend fixtures.  The
+  # periodic case carries an IGR-augmented source and the physical case covers
+  # each of its selectable Euler boundary plans on the same CUDA HDG lifecycle.
+  # Explicit small meshes keep every rank within the bounded CUDA arena.
+  foreach(_ranks IN ITEMS 1 2)
+    add_test(NAME dg_igr_hdg_main_backend_representative_cases_cuda_rank${_ranks}_p1
+      COMMAND "${CMAKE_COMMAND}"
+        "-DHDG_PERIODIC_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+        "-DHDG_NONPERIODIC_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection>"
+        "-DHDG_REPRESENTATIVE_WORK=${CMAKE_CURRENT_BINARY_DIR}/cuda-representative-rank${_ranks}"
+        "-DHDG_REPRESENTATIVE_DEVICE=cuda"
+        "-DHDG_REPRESENTATIVE_RANKS=${_ranks}"
+        "-DHDG_REPRESENTATIVE_PERIODIC_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+        "-DHDG_REPRESENTATIVE_NONPERIODIC_MESH=${CMAKE_CURRENT_SOURCE_DIR}/smooth_advection_physical_n2.mesh"
+        "-DHDG_REPRESENTATIVE_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+        "-DHDG_REPRESENTATIVE_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+        "-DHDG_REPRESENTATIVE_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+        "-DHDG_REPRESENTATIVE_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/test_representative_case_process.cmake")
+    set_tests_properties(
+      dg_igr_hdg_main_backend_representative_cases_cuda_rank${_ranks}_p1 PROPERTIES
+        LABELS "hdg;main-backend;cuda;real-application;igr;source;periodic;physical;boundary;p1;no-vtk;mpi"
+        PROCESSORS ${_ranks}
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 3600)
+  endforeach()
+
+  # A production-main fixture over a seven-attribute mesh covers every
+  # conventional semantic Euler boundary policy in one solve.  IGR remains a
+  # request option on that same main backend; no SC25/P1 oracle is linked.
+  add_executable(dg_igr_hdg_main_backend_cuda_physical_extension_test
+    test_cuda_physical_extension.cu)
+  target_include_directories(
+    dg_igr_hdg_main_backend_cuda_physical_extension_test PRIVATE
+      "${PROJECT_SOURCE_DIR}/include")
+  target_compile_definitions(
+    dg_igr_hdg_main_backend_cuda_physical_extension_test PRIVATE
+      DG_IGR_HDG_REPOSITORY_ROOT="${PROJECT_SOURCE_DIR}"
+      DG_IGR_HDG_CUDA_PHYSICAL_MESH="${CMAKE_CURRENT_SOURCE_DIR}/cuda_physical_boundaries.mesh")
+  target_link_libraries(
+    dg_igr_hdg_main_backend_cuda_physical_extension_test PRIVATE
+      dg_igr_hdg_main_backend_cuda
+      igr_mfem
+      mfem
+      MPI::MPI_CXX)
+  target_compile_options(
+    dg_igr_hdg_main_backend_cuda_physical_extension_test PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  set_target_properties(
+    dg_igr_hdg_main_backend_cuda_physical_extension_test PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON
+      CUDA_EXTENSIONS OFF
+      CUDA_ARCHITECTURES 120
+      CUDA_SEPARABLE_COMPILATION ON
+      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+  add_test(NAME dg_igr_hdg_main_backend_cuda_physical_extension_rank1
+    COMMAND dg_igr_hdg_main_backend_cuda_physical_extension_test)
+  add_test(NAME dg_igr_hdg_main_backend_cuda_physical_extension_rank2
+    COMMAND
+      "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 2
+      ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_hdg_main_backend_cuda_physical_extension_test>
+      ${MPIEXEC_POSTFLAGS})
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_physical_extension_rank1 PROPERTIES
+      LABELS "hdg;main-backend;cuda;physical;all-euler-boundaries;igr;conventional;p1-p3;source;initial-trace"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 3600)
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_physical_extension_rank2 PROPERTIES
+      LABELS "hdg;main-backend;cuda;physical;all-euler-boundaries;igr;conventional;p1-p3;source;initial-trace;mpi"
+      PROCESSORS 2
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 3600)
+
+  foreach(_ranks IN ITEMS 1 2)
+    add_test(NAME dg_igr_hdg_main_backend_cuda_igr_rank${_ranks}_p1_p3
+      COMMAND "${CMAKE_COMMAND}"
+        "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+        "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+        "-DHDG_MAIN_RANKS=${_ranks}"
+        "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+        "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+        "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+        "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_igr_process.cmake")
+    set_tests_properties(
+      dg_igr_hdg_main_backend_cuda_igr_rank${_ranks}_p1_p3 PROPERTIES
+        LABELS "hdg;main-backend;cuda;igr;periodic;p1-p3;source;initial-trace;mpi;process"
+        PROCESSORS ${_ranks}
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 3600)
+  endforeach()
 
   foreach(_ranks IN ITEMS 1 2)
     add_test(NAME dg_igr_hdg_main_backend_cuda_rank${_ranks}_n3

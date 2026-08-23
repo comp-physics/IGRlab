@@ -29,9 +29,9 @@ struct CommonOptions
   std::string regularization;
   ///< Regularization selector: none | igr; empty retains the case default.
   double hdg_igr_alpha = 1.0;
-  ///< HDG private IGR alpha; used only with --discretization hdg --regularization igr.
+  ///< HDG IGR-extension alpha; used only with --discretization hdg --regularization igr.
   double hdg_igr_beta = 1.0;
-  ///< HDG private IGR beta; used only with --discretization hdg --regularization igr.
+  ///< HDG IGR-extension beta; used only with --discretization hdg --regularization igr.
   std::string time_integrator;
   ///< Time-integrator selector; empty selects the discretization default.
   std::string zhang_shu_points =
@@ -119,11 +119,11 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.hdg_igr_alpha,
                  "-hia",
                  "--hdg-igr-alpha",
-                 "HDG private IGR alpha (finite and positive; default 1.0).");
+                 "HDG IGR-extension alpha (finite and positive; default 1.0).");
   args.AddOption(&opts.hdg_igr_beta,
                  "-hib",
                  "--hdg-igr-beta",
-                 "HDG private IGR beta (finite and positive; default 1.0).");
+                 "HDG IGR-extension beta (finite and positive; default 1.0).");
   args.AddOption(&opts.time_integrator,
                  "-ti",
                  "--time-integrator",

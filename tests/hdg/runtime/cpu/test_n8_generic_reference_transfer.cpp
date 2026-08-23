@@ -13,7 +13,6 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
-#include <type_traits>
 #include <vector>
 
 namespace dg::hdg::runtime::cpu::sc25::w8c_internal
@@ -32,13 +31,6 @@ namespace cpu = dg::hdg::runtime::cpu;
 namespace sc25 = dg::hdg::runtime::cpu::sc25;
 namespace transfer = dg_igr_hdg_reference_transfer_test;
 
-using Observable = generic::HdgEulerCommittedObservables;
-
-static_assert(std::is_standard_layout<Observable>::value &&
-                  std::is_trivially_copyable<Observable>::value &&
-                  !std::is_polymorphic<Observable>::value,
-              "committed observables must remain a history-free POD snapshot");
-
 constexpr std::uint32_t generic_cpu_capabilities =
     generic::CapabilityBit(generic::Capability::conforming_quadrilateral_mesh) |
     generic::CapabilityBit(generic::Capability::polynomial_order_one_to_three) |
@@ -50,8 +42,6 @@ constexpr std::uint32_t generic_cpu_capabilities =
 // These are reference-transfer acceptance tolerances, not scientific-error
 // tolerances. They compare the generic CPU path to the retained frozen SC25
 // oracle on the same N8/p1/dt trajectory.
-constexpr double production_observable_absolute_tolerance = 2.0e-10;
-constexpr double production_observable_relative_tolerance = 2.0e-9;
 constexpr double transfer_observable_absolute_tolerance = 5.0e-8;
 constexpr double transfer_observable_relative_tolerance = 5.0e-7;
 constexpr double transfer_state_absolute_tolerance = 5.0e-8;
@@ -94,8 +84,6 @@ generic::EulerHdgRequest MakeRequest(
       cpu::w8c::SmoothTransitionV2Case::conventional_q_a;
   policy.igr_assembly_quadrature_order =
       cpu::w8c::SmoothTransitionV2Case::scalar_q_a;
-  policy.audit_quadrature_order = transfer::n8_projection_quadrature_order;
-  policy.observable_quadrature_order = transfer::n8_observable_quadrature_order;
   policy.maximum_nonlinear_updates = sc25::persistent_newton_maximum_iterations;
   policy.maximum_linear_iterations = sc25::persistent_trace_maximum_iterations;
   policy.maximum_line_search_trials = sc25::persistent_line_search_trials;
@@ -115,7 +103,7 @@ generic::EulerHdgRequest MakeRequest(
           {initial.data(), initial.size(), 4},
           {true_trace.data(), true_trace.size(), 4},
           {source.data(), source.size(), 4},
-          {nullptr, PeriodicExterior},
+          {nullptr, PeriodicExterior, {nullptr, 0, 0, 0.0}},
           policy};
 }
 
@@ -123,32 +111,6 @@ bool Sc25Accepted(const sc25::TrajectoryStatus status) noexcept
 {
   return status == sc25::TrajectoryStatus::HdgSc25Accepted ||
       status == sc25::TrajectoryStatus::HdgSc25AcceptedAfterOneRetry;
-}
-
-bool ObservableMatchesOracle(
-    const Observable& production,
-    const transfer::EulerCommittedObservableOracle& independent) noexcept
-{
-  if (!production.available || !independent.available ||
-      production.quadrature_order != transfer::n8_observable_quadrature_order ||
-      independent.quadrature_order != transfer::n8_observable_quadrature_order)
-    return false;
-  for (int component = 0; component < 4; ++component)
-    if (!Close(production.conserved_integrals[static_cast<std::size_t>(component)],
-               independent.conserved_integrals[static_cast<std::size_t>(component)],
-               production_observable_absolute_tolerance,
-               production_observable_relative_tolerance) ||
-        !Close(production.conserved_l2_norms[static_cast<std::size_t>(component)],
-               independent.conserved_l2_norms[static_cast<std::size_t>(component)],
-               production_observable_absolute_tolerance,
-               production_observable_relative_tolerance))
-      return false;
-  return Close(production.minimum_density, independent.minimum_density,
-               production_observable_absolute_tolerance,
-               production_observable_relative_tolerance) &&
-      Close(production.minimum_pressure, independent.minimum_pressure,
-            production_observable_absolute_tolerance,
-            production_observable_relative_tolerance);
 }
 
 bool ObservablesTransferMatch(
@@ -213,7 +175,6 @@ bool CheckTransferCheckpoint(
     const std::uint64_t step)
 {
   const bool exported = generic_session.ExportCommittedInterior(generic_field);
-  const Observable production = generic_session.ObserveCommitted();
   transfer::EulerCommittedObservableOracle generic_oracle{};
   transfer::EulerCommittedObservableOracle scalar_oracle{};
   double maximum_absolute_error = 0.0;
@@ -229,18 +190,15 @@ bool CheckTransferCheckpoint(
           generic_field, sc25_state, maximum_absolute_error,
           maximum_relative_error);
   const bool coordinates = CoordinatesMatch(generic_session.coordinates(), step) &&
-      CoordinatesMatch(production.coordinates, step) &&
       Sc25CoordinatesMatch(sc25_coordinates, step, generic_mesh.GetNRanks());
-  const bool production_matches =
-      ObservableMatchesOracle(production, generic_oracle);
   const bool transfer_matches =
       ObservablesTransferMatch(generic_oracle, scalar_oracle);
   const bool state_absolute_matches =
       maximum_absolute_error <= transfer_state_absolute_tolerance;
   const bool state_relative_matches =
       maximum_relative_error <= transfer_state_relative_tolerance;
-  const bool passed = oracle_ready && coordinates && production_matches &&
-      transfer_matches && state_absolute_matches && state_relative_matches;
+  const bool passed = oracle_ready && coordinates && transfer_matches &&
+      state_absolute_matches && state_relative_matches;
   if (!passed)
   {
     int rank = -1;
@@ -249,10 +207,7 @@ bool CheckTransferCheckpoint(
       std::cerr << "N8 reference-transfer checkpoint failed step=" << step
                 << " oracle=" << oracle_ready
                 << " coordinates=" << coordinates
-                << " production_observables=" << production_matches
                 << " transfer_observables=" << transfer_matches
-                << " production_available=" << production.available
-                << " production_q=" << production.quadrature_order
                 << " generic_oracle_available=" << generic_oracle.available
                 << " scalar_oracle_available=" << scalar_oracle.available
                 << " state_abs=" << maximum_absolute_error

@@ -33,6 +33,8 @@ namespace dg::hdg::runtime::cpu
 namespace detail
 {
 
+struct CpuQualificationTestAccess;
+
 inline constexpr std::string_view cpu_runtime_layout_identity =
     "l2-interior.true-trace-owned.component-major.v1";
 
@@ -249,11 +251,6 @@ struct CpuAttemptEvidence
   double initial_nonlinear_residual = 0.0;
   double final_nonlinear_residual = 0.0;
   double maximum_true_relative_residual = 0.0;
-  // Periodic IGR attempts publish only after the conservative p1 update is
-  // balanced against the integrated static source over the accepted step.
-  // These are compact terminal scalars, not per-iteration history.
-  double maximum_conservation_error = 0.0;
-  double maximum_conservation_relative_error = 0.0;
   double minimum_density = 0.0;
   double minimum_pressure = 0.0;
   double maximum_wave_speed = 0.0;
@@ -271,7 +268,6 @@ struct CpuAttemptEvidence
   bool recovery_gate = false;
   bool nonlinear_gate = false;
   bool true_residual_gate = false;
-  bool conservation_gate = false;
   bool rollback_byte_equal = false;
   bool committed = false;
 };
@@ -715,8 +711,7 @@ enum class CpuBorrowedEulerOperation : unsigned char
   commit = 1,
   abort = 2,
   export_prepared_buffer = 3,
-  export_prepared_grid_function = 4,
-  observe_committed = 5
+  export_prepared_grid_function = 4
 };
 
 class CpuNumericsCore
@@ -750,15 +745,6 @@ public:
                            double&) noexcept;
   /** Scan the committed borrowed interior and trace for CFL diagnostics. */
   bool CommittedBorrowedEulerDiagnostics(double&, double&) noexcept;
-  /** Fresh collective volume-only observables for the committed slot. */
-  bool ObserveCommittedBorrowedEuler(
-      generic::HdgEulerCommittedObservables&) noexcept;
-  /** Stored committed audit accessor; no collective occurs on access. */
-  generic::HdgEulerCommittedResidualAudit
-  CommittedBorrowedEulerResidualAudit() const noexcept;
-  /** Internal preparation of the core-owned optional candidate audit. */
-  bool AuditPreparedBorrowedEulerResidual(
-      generic::HdgEulerCommittedResidualAudit&) noexcept;
   /** Discard exactly one active prepared candidate. */
   bool AbortBorrowedEuler(std::uint64_t,
                           const StateCoordinates&) noexcept;
@@ -812,6 +798,18 @@ public:
                                 std::size_t&) const noexcept;
 
 private:
+  friend struct CpuQualificationTestAccess;
+  /**
+   * Central-difference audit of the live borrowed IGR assembler.  The
+   * qualification translation unit reaches it only through the private
+   * friend above; this method stages and publishes no solver state.
+   */
+  bool AuditBorrowedEulerAssemblerJacobian(
+      double relative_tolerance,
+      std::array<double, 6>& relative_errors) noexcept;
+  bool AuditLastBorrowedEulerConservation(
+      double& maximum_error, double& maximum_relative_error,
+      bool& gate) const noexcept;
   bool InitializeInternal(const CpuPersistentConfig&,
                           const RuntimeTupleDescriptor&,
                           const generic::EulerHdgRequest*,
