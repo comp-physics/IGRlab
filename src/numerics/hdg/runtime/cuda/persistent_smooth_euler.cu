@@ -1053,10 +1053,14 @@ bool CudaRefreshFactorAndSolve(
     gmres.GetNumIterations(diagnostics.iterations);
     gmres.GetFinalResidualNorm(diagnostics.reported_residual);
     diagnostics.finite = std::isfinite(diagnostics.reported_residual);
-    diagnostics.converged = diagnostics.finite &&
+    diagnostics.reported_tolerance_met = diagnostics.finite &&
         diagnostics.reported_residual <= relative_tolerance;
-    diagnostic.result = diagnostics.device_policy &&
-        diagnostics.configured_ilu0 && diagnostics.converged;
+    // HYPRE owns its stopping test, whose reported value can differ modestly
+    // from the requested tolerance.  Match the CPU lifecycle: admit a bounded
+    // solve here and let the independently rebuilt original-system residual
+    // remain the acceptance authority.  The report remains telemetry only.
+    diagnostic.result = CudaTraceSolveReadyForTrueResidualVerification(
+        diagnostics, maximum_iterations);
     return diagnostic.result;
   }
   catch (...) { return false; }

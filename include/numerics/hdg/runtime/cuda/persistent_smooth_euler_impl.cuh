@@ -568,12 +568,21 @@ struct CudaSolveDiagnostics
 {
   bool device_policy = false;
   bool configured_ilu0 = false;
-  bool converged = false;
+  bool reported_tolerance_met = false;
   bool finite = false;
   std::uint64_t matrix_generation = 0;
   int iterations = 0;
   double reported_residual = std::numeric_limits<double>::infinity();
 };
+
+constexpr bool CudaTraceSolveReadyForTrueResidualVerification(
+    const CudaSolveDiagnostics& diagnostics,
+    const int maximum_iterations) noexcept
+{
+  return diagnostics.device_policy && diagnostics.configured_ilu0 &&
+      diagnostics.iterations >= 0 && diagnostics.iterations <=
+          maximum_iterations;
+}
 
 using CudaCopyOutFunction = bool (*)(
     void*, const void*, std::size_t, CudaTransferCategory,

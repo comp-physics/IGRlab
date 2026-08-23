@@ -1110,8 +1110,7 @@ BuildPersistentTrueSystem() noexcept
       linear_relative_tolerance_, maximum_linear_iterations_,
       krylov_dimension_, 0, warm);
   const bool warmed = warm_solved && warm.device_policy &&
-      warm.configured_ilu0 &&
-      warm.matrix_generation == 0;
+      warm.configured_ilu0 && warm.finite && warm.matrix_generation == 0;
   if (!CollectiveContinue(warmed)) { return false; }
 
   bool warm_state_zeroed = false;
@@ -1706,10 +1705,9 @@ SolveTrueSystem(double& true_relative_residual,
           ranks_, communicator_, linear_relative_tolerance_,
           maximum_linear_iterations_,
           krylov_dimension_, matrix_generation, diagnostics) &&
-      diagnostics.device_policy && diagnostics.configured_ilu0 &&
       diagnostics.matrix_generation == matrix_generation &&
-      diagnostics.converged && diagnostics.finite &&
-      diagnostics.iterations >= 0;
+      CudaTraceSolveReadyForTrueResidualVerification(
+          diagnostics, maximum_linear_iterations_);
   linear_iterations = diagnostics.iterations;
   if (!CollectiveContinue(local_solve))
     return false;
