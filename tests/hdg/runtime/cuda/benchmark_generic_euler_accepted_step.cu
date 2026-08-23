@@ -157,7 +157,7 @@ constexpr int default_mesh_n = 104;
 constexpr int warmup_steps = 1;
 constexpr int measured_steps = 5;
 constexpr int total_steps = warmup_steps + measured_steps;
-constexpr double timestep = 1.0e-5;
+constexpr double default_timestep = 1.0e-5;
 constexpr std::uint32_t cuda_capabilities =
     CapabilityBit(Capability::conforming_quadrilateral_mesh) |
     CapabilityBit(Capability::polynomial_order_one_to_three) |
@@ -173,6 +173,7 @@ struct Options
 {
   RegularizationKind regularization = RegularizationKind::none;
   int mesh_n = default_mesh_n;
+  double timestep = default_timestep;
   bool help = false;
 };
 
@@ -201,6 +202,19 @@ bool ParsePositiveInt(const std::string_view text, int& value) noexcept
       text.data(), text.data() + text.size(), parsed);
   if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
       parsed < 2 || parsed > 46340)
+    return false;
+  value = parsed;
+  return true;
+}
+
+bool ParsePositiveDouble(const std::string_view text, double& value) noexcept
+{
+  double parsed = 0.0;
+  const auto result = std::from_chars(
+      text.data(), text.data() + text.size(), parsed,
+      std::chars_format::general);
+  if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
+      !std::isfinite(parsed) || parsed <= 0.0)
     return false;
   value = parsed;
   return true;
@@ -260,6 +274,16 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
       }
       continue;
     }
+    if (argument == "--dt")
+    {
+      if (++index >= argc ||
+          !ParsePositiveDouble(argv[index], options.timestep))
+      {
+        error = "--dt requires a finite positive FP64 value";
+        return false;
+      }
+      continue;
+    }
     error = "unknown argument: " + std::string(argument);
     return false;
   }
@@ -269,9 +293,9 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
 void PrintUsage(const char* executable)
 {
   std::cout << "Usage: " << executable
-            << " [--mode conventional|igr] [--mesh-n N]\n"
+            << " [--mode conventional|igr] [--mesh-n N] [--dt DT]\n"
                "       " << executable
-            << " [--conventional|--igr] [--mesh-n N]\n";
+            << " [--conventional|--igr] [--mesh-n N] [--dt DT]\n";
 }
 
 mfem::ParMesh MakePeriodicMesh(const int n)
@@ -414,6 +438,7 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation) noexcept
 bool RunStep(GenericEulerHdgCudaSession& session,
              const BorrowedFields& fields,
              std::vector<double>& exported_interior,
+             const double timestep,
              const bool warmup, const int measured_index,
              StepSample& sample, std::string& error)
 {
@@ -448,7 +473,10 @@ bool RunStep(GenericEulerHdgCudaSession& session,
       committed.status != HdgEulerSessionStatus::committed ||
       !output.successful_commit)
   {
-    error = "accepted-step transaction failed";
+    error = "accepted-step transaction failed: prepare_status=" +
+        std::to_string(static_cast<unsigned int>(prepared.status)) +
+        ", commit_status=" +
+        std::to_string(static_cast<unsigned int>(committed.status));
     return false;
   }
   // Hashing and committed-state observation are intentionally outside the
@@ -609,7 +637,7 @@ int RunBenchmark(const Options& options)
   for (int index = 0; index < total_steps; ++index)
   {
     const bool warmup = index < warmup_steps;
-    if (!RunStep(session, fields, exported_interior, warmup,
+    if (!RunStep(session, fields, exported_interior, options.timestep, warmup,
                  warmup ? -1 : index - warmup_steps,
                  samples[static_cast<std::size_t>(index)], error))
     {
@@ -638,7 +666,7 @@ int RunBenchmark(const Options& options)
             << "\"elements\":" << elements << ','
             << "\"principal_threads\":" << principal_threads << ','
             << "\"principal_blocks\":" << principal_blocks << ','
-            << "\"dt\":" << timestep << ','
+            << "\"dt\":" << options.timestep << ','
             << "\"initialization_timed\":false,"
             << "\"timing_scope\":\"Prepare+ExportPreparedInteriorD2H+"
                "AcknowledgePreparedOutput+Commit\","
