@@ -1,6 +1,7 @@
 #include "numerics/hdg/generic/session_contract.hpp"
 #include "numerics/hdg/runtime/cuda/generic_euler.cuh"
 
+#include <cuda_runtime_api.h>
 #include <mfem.hpp>
 
 #include <algorithm>
@@ -53,6 +54,19 @@ struct CudaAcceptedStepCommittedHashes
   StateHash local_trace{};
   std::uint64_t generation = 0;
   bool valid = false;
+};
+
+struct CudaAcceptedStepProblemMetadata
+{
+  int elements = 0;
+  int interior_components = 0;
+  int trace_components = 0;
+  int scalar_interior_dofs = 0;
+  int scalar_face_dofs = 0;
+  int interior_unknowns = 0;
+  int true_trace_unknowns = 0;
+  int global_true_trace_unknowns = 0;
+  bool igr_active = false;
 };
 
 // The production facade and engine already grant this exact qualification
@@ -124,6 +138,33 @@ struct CudaQualificationTestAccess
     return session.borrowed_rank1_ && !session.borrowed_rank2_ &&
         CaptureCommitted(*session.borrowed_rank1_, hashes);
   }
+
+  template <typename Engine>
+  static bool CaptureProblemMetadata(
+      Engine& engine, CudaAcceptedStepProblemMetadata& metadata) noexcept
+  {
+    metadata = {};
+    if (!engine.initialized_) return false;
+    const auto& shape = engine.numerics_.shape_;
+    metadata.elements = shape.elements;
+    metadata.interior_components = shape.interior_components;
+    metadata.trace_components = shape.trace_components;
+    metadata.scalar_interior_dofs = shape.scalar_interior_dofs;
+    metadata.scalar_face_dofs = shape.scalar_face_dofs;
+    metadata.interior_unknowns = shape.interior_count;
+    metadata.true_trace_unknowns = shape.true_trace_count;
+    metadata.global_true_trace_unknowns = shape.global_true_trace_count;
+    metadata.igr_active = shape.igr_active;
+    return true;
+  }
+
+  static bool CaptureProblemMetadata(
+      cuda::GenericEulerHdgCudaSession& session,
+      CudaAcceptedStepProblemMetadata& metadata) noexcept
+  {
+    return session.borrowed_rank1_ && !session.borrowed_rank2_ &&
+        CaptureProblemMetadata(*session.borrowed_rank1_, metadata);
+  }
 };
 
 } // namespace dg::hdg::runtime::cuda_w8a::detail
@@ -149,6 +190,8 @@ using dg::hdg::runtime::cuda_w8a::detail::
     CudaAcceptedStepBenchmarkObservation;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaAcceptedStepCommittedHashes;
+using dg::hdg::runtime::cuda_w8a::detail::
+    CudaAcceptedStepProblemMetadata;
 using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
 
 constexpr int order = 1;
@@ -169,10 +212,27 @@ constexpr std::uint32_t cuda_capabilities =
 static_assert(default_mesh_n * default_mesh_n >= 10752,
               "the default benchmark must saturate at least 84 blocks");
 
+constexpr bool ValidDomainPeriods(const int mesh_n,
+                                  const int domain_periods) noexcept
+{
+  return mesh_n >= 2 && domain_periods > 0 && domain_periods <= mesh_n &&
+      mesh_n % domain_periods == 0;
+}
+
+static_assert(ValidDomainPeriods(default_mesh_n, 1),
+              "the default unit domain must remain valid");
+static_assert(ValidDomainPeriods(104, 26),
+              "the fixed-h saturated IGR workload must remain valid");
+static_assert(!ValidDomainPeriods(104, 0) &&
+              !ValidDomainPeriods(104, 105) &&
+              !ValidDomainPeriods(104, 25),
+              "invalid domain replication must be rejected");
+
 struct Options
 {
   RegularizationKind regularization = RegularizationKind::none;
   int mesh_n = default_mesh_n;
+  int domain_periods = 1;
   double timestep = default_timestep;
   bool help = false;
 };
@@ -195,13 +255,14 @@ struct StepSample
   dg::hdg::generic::HdgEulerCommittedDiagnostics diagnostics{};
 };
 
-bool ParsePositiveInt(const std::string_view text, int& value) noexcept
+bool ParsePositiveInt(const std::string_view text, const int minimum,
+                      int& value) noexcept
 {
   int parsed = 0;
   const auto result = std::from_chars(
       text.data(), text.data() + text.size(), parsed);
   if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
-      parsed < 2 || parsed > 46340)
+      parsed < minimum || parsed > 46340)
     return false;
   value = parsed;
   return true;
@@ -267,9 +328,20 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     }
     if (argument == "--mesh-n")
     {
-      if (++index >= argc || !ParsePositiveInt(argv[index], options.mesh_n))
+      if (++index >= argc ||
+          !ParsePositiveInt(argv[index], 2, options.mesh_n))
       {
         error = "--mesh-n requires an integer in [2,46340]";
+        return false;
+      }
+      continue;
+    }
+    if (argument == "--domain-periods")
+    {
+      if (++index >= argc ||
+          !ParsePositiveInt(argv[index], 1, options.domain_periods))
+      {
+        error = "--domain-periods requires an integer in [1,46340]";
         return false;
       }
       continue;
@@ -287,38 +359,51 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     error = "unknown argument: " + std::string(argument);
     return false;
   }
+  if (!ValidDomainPeriods(options.mesh_n, options.domain_periods))
+  {
+    error = "--domain-periods must be positive, no greater than --mesh-n, "
+            "and divide --mesh-n exactly";
+    return false;
+  }
   return true;
 }
 
 void PrintUsage(const char* executable)
 {
   std::cout << "Usage: " << executable
-            << " [--mode conventional|igr] [--mesh-n N] [--dt DT]\n"
+            << " [--mode conventional|igr] [--mesh-n N]"
+               " [--domain-periods K] [--dt DT]\n"
                "       " << executable
-            << " [--conventional|--igr] [--mesh-n N] [--dt DT]\n";
+            << " [--conventional|--igr] [--mesh-n N]"
+               " [--domain-periods K] [--dt DT]\n";
 }
 
-mfem::ParMesh MakePeriodicMesh(const int n)
+mfem::ParMesh MakePeriodicMesh(const int n, const int domain_periods)
 {
+  const double domain_length = static_cast<double>(domain_periods);
   mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
-      n, n, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+      n, n, mfem::Element::QUADRILATERAL, true,
+      domain_length, domain_length);
   std::vector<mfem::Vector> translations(2, mfem::Vector(2));
   translations[0] = 0.0;
   translations[1] = 0.0;
-  translations[0][0] = 1.0;
-  translations[1][1] = 1.0;
+  translations[0][0] = domain_length;
+  translations[1][1] = domain_length;
   mfem::Mesh periodic = mfem::Mesh::MakePeriodic(
       serial, serial.CreatePeriodicVertexMapping(translations));
   return mfem::ParMesh(MPI_COMM_WORLD, periodic);
 }
 
-void SmoothPeriodicState(const mfem::Vector& point, mfem::Vector& state)
+void SmoothPeriodicState(const mfem::Vector& point, const bool wrap_period,
+                         mfem::Vector& state)
 {
   constexpr double pi = 3.141592653589793238462643383279502884;
-  const double sx = std::sin(2.0 * pi * point[0]);
-  const double sy = std::sin(2.0 * pi * point[1]);
-  const double cx = std::cos(2.0 * pi * point[0]);
-  const double cy = std::cos(2.0 * pi * point[1]);
+  const double x = wrap_period ? point[0] - std::floor(point[0]) : point[0];
+  const double y = wrap_period ? point[1] - std::floor(point[1]) : point[1];
+  const double sx = std::sin(2.0 * pi * x);
+  const double sy = std::sin(2.0 * pi * y);
+  const double cx = std::cos(2.0 * pi * x);
+  const double cy = std::cos(2.0 * pi * y);
   const double density = 1.0 + 0.04 * sx * sy;
   const double velocity_x = 0.18 + 0.02 * cx * sy;
   const double velocity_y = -0.09 + 0.015 * sx * cy;
@@ -331,7 +416,7 @@ void SmoothPeriodicState(const mfem::Vector& point, mfem::Vector& state)
       (velocity_x * velocity_x + velocity_y * velocity_y);
 }
 
-BorrowedFields MakeFields(mfem::ParMesh& mesh)
+BorrowedFields MakeFields(mfem::ParMesh& mesh, const int domain_periods)
 {
   BorrowedFields fields;
   mfem::L2_FECollection collection(
@@ -340,8 +425,11 @@ BorrowedFields MakeFields(mfem::ParMesh& mesh)
   mfem::ParFiniteElementSpace space(
       &mesh, &collection, conserved_components, mfem::Ordering::byNODES);
   mfem::ParGridFunction projected(&space);
+  const auto evaluator = [wrap_period = domain_periods > 1](
+      const mfem::Vector& point, mfem::Vector& state)
+  { SmoothPeriodicState(point, wrap_period, state); };
   mfem::VectorFunctionCoefficient coefficient(
-      conserved_components, SmoothPeriodicState);
+      conserved_components, evaluator);
   projected.ProjectCoefficient(coefficient);
   fields.volume_scalar_count = static_cast<std::size_t>(
       space.GetVSize() / conserved_components);
@@ -605,11 +693,23 @@ void PrintStep(const StepSample& sample)
 int RunBenchmark(const Options& options)
 {
   mfem::Device device("cuda");
-  mfem::ParMesh mesh = MakePeriodicMesh(options.mesh_n);
+  int active_device = -1;
+  cudaDeviceProp device_properties{};
+  if (cudaGetDevice(&active_device) != cudaSuccess || active_device < 0 ||
+      cudaGetDeviceProperties(&device_properties, active_device) !=
+          cudaSuccess || device_properties.multiProcessorCount <= 0)
+  {
+    std::cerr << "{\"schema\":1,\"success\":false,"
+                 "\"error\":\"CUDA device metadata query failed\"}\n";
+    return 1;
+  }
+
+  mfem::ParMesh mesh = MakePeriodicMesh(
+      options.mesh_n, options.domain_periods);
   const int elements = mesh.GetNE();
   const int principal_blocks =
       (elements + principal_threads - 1) / principal_threads;
-  BorrowedFields fields = MakeFields(mesh);
+  BorrowedFields fields = MakeFields(mesh, options.domain_periods);
   if (elements != options.mesh_n * options.mesh_n ||
       fields.volume_scalar_count == 0 ||
       fields.initial.size() !=
@@ -628,6 +728,39 @@ int RunBenchmark(const Options& options)
   {
     std::cerr << "{\"schema\":1,\"success\":false,"
                  "\"error\":\"CUDA session initialization failed\"}\n";
+    return 1;
+  }
+
+  CudaAcceptedStepProblemMetadata problem{};
+  const bool problem_captured =
+      CudaQualificationTestAccess::CaptureProblemMetadata(session, problem);
+  const int expected_interior_components =
+      options.regularization == RegularizationKind::igr
+      ? dg::hdg::runtime::cuda_w8a::igr_interior_components
+      : conserved_components;
+  const int expected_trace_components =
+      options.regularization == RegularizationKind::igr
+      ? dg::hdg::runtime::cuda_w8a::igr_trace_components
+      : conserved_components;
+  const std::int64_t expected_interior_unknowns =
+      static_cast<std::int64_t>(elements) *
+      problem.scalar_interior_dofs * expected_interior_components;
+  const std::int64_t expected_true_trace_unknowns =
+      2LL * options.mesh_n * options.mesh_n *
+      problem.scalar_face_dofs * expected_trace_components;
+  if (!problem_captured ||
+      problem.elements != elements || problem.scalar_interior_dofs <= 0 ||
+      problem.scalar_face_dofs <= 0 ||
+      problem.interior_components != expected_interior_components ||
+      problem.trace_components != expected_trace_components ||
+      problem.igr_active !=
+          (options.regularization == RegularizationKind::igr) ||
+      problem.interior_unknowns != expected_interior_unknowns ||
+      problem.true_trace_unknowns != expected_true_trace_unknowns ||
+      problem.true_trace_unknowns != problem.global_true_trace_unknowns)
+  {
+    std::cerr << "{\"schema\":1,\"success\":false,"
+                 "\"error\":\"CUDA problem metadata validation failed\"}\n";
     return 1;
   }
 
@@ -663,7 +796,19 @@ int RunBenchmark(const Options& options)
             << "\"rank_count\":1,"
             << "\"polynomial_order\":" << order << ','
             << "\"mesh_n\":" << options.mesh_n << ','
+            << "\"domain_periods\":" << options.domain_periods << ','
+            << "\"domain_length\":" << options.domain_periods << ','
+            << "\"cells_per_period\":"
+            << options.mesh_n / options.domain_periods << ','
+            << "\"element_h\":"
+            << static_cast<double>(options.domain_periods) /
+                static_cast<double>(options.mesh_n) << ','
             << "\"elements\":" << elements << ','
+            << "\"interior_unknowns\":" << problem.interior_unknowns << ','
+            << "\"true_trace_unknowns\":"
+            << problem.true_trace_unknowns << ','
+            << "\"gpu_sm_count\":"
+            << device_properties.multiProcessorCount << ','
             << "\"principal_threads\":" << principal_threads << ','
             << "\"principal_blocks\":" << principal_blocks << ','
             << "\"dt\":" << options.timestep << ','
