@@ -477,7 +477,7 @@ enum class CudaHypreSetupAction : std::uint8_t
   set_operator,
   ilu_type0,
   ilu_fill0,
-  ilu_reorder0,
+  ilu_reordering,
   ilu_maxiter1,
   ilu_tol0,
   ilu_print0,
@@ -494,6 +494,7 @@ struct CudaHypreSetupOrderEvidence
   std::uint64_t matrix_generation = 0;
   std::array<CudaHypreSetupAction, solved_action_count> actions{};
   std::size_t action_count = 0;
+  int ilu_local_reordering = -1;
   bool overflow = false;
 
   constexpr bool Record(const CudaHypreSetupAction action) noexcept
@@ -508,23 +509,28 @@ struct CudaHypreSetupOrderEvidence
   }
 
   constexpr bool ConfigurationExactForGeneration(
-      const std::uint64_t expected_generation) const noexcept
+      const std::uint64_t expected_generation,
+      const int expected_local_reordering) const noexcept
   {
     return action_count == configured_action_count &&
-        PrefixExactForGeneration(expected_generation);
+        PrefixExactForGeneration(expected_generation,
+                                 expected_local_reordering);
   }
 
   constexpr bool SolveExactForGeneration(
-      const std::uint64_t expected_generation) const noexcept
+      const std::uint64_t expected_generation,
+      const int expected_local_reordering) const noexcept
   {
     return action_count == solved_action_count &&
-        PrefixExactForGeneration(expected_generation) &&
+        PrefixExactForGeneration(expected_generation,
+                                 expected_local_reordering) &&
         actions[configured_action_count] == CudaHypreSetupAction::mult;
   }
 
 private:
   constexpr bool PrefixExactForGeneration(
-      const std::uint64_t expected_generation) const noexcept
+      const std::uint64_t expected_generation,
+      const int expected_local_reordering) const noexcept
   {
     constexpr std::array<CudaHypreSetupAction, configured_action_count>
         expected{{
@@ -532,13 +538,15 @@ private:
           CudaHypreSetupAction::set_operator,
           CudaHypreSetupAction::ilu_type0,
           CudaHypreSetupAction::ilu_fill0,
-          CudaHypreSetupAction::ilu_reorder0,
+          CudaHypreSetupAction::ilu_reordering,
           CudaHypreSetupAction::ilu_maxiter1,
           CudaHypreSetupAction::ilu_tol0,
           CudaHypreSetupAction::ilu_print0,
           CudaHypreSetupAction::rebind_preconditioner,
           CudaHypreSetupAction::gmres_settings}};
     if (overflow || matrix_generation != expected_generation ||
+        ilu_local_reordering != expected_local_reordering ||
+        (expected_local_reordering != 0 && expected_local_reordering != 1) ||
         action_count < expected.size())
       return false;
     for (std::size_t action = 0; action < expected.size(); ++action)
@@ -582,6 +590,14 @@ constexpr bool CudaTraceSolveReadyForTrueResidualVerification(
   return diagnostics.device_policy && diagnostics.configured_ilu0 &&
       diagnostics.iterations >= 0 && diagnostics.iterations <=
           maximum_iterations;
+}
+
+// Keep conventional Euler's qualified natural ordering.  The component-major
+// coupled IGR trace block uses the established HYPRE RCM ordering used by the
+// other coupled-IGR paths before applying the same ILU(0) factorization.
+constexpr int CudaIluLocalReordering(const bool igr_active) noexcept
+{
+  return igr_active ? 1 : 0;
 }
 
 using CudaCopyOutFunction = bool (*)(
@@ -713,6 +729,7 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
                                   mfem::HypreILU& ilu,
                                   mfem::HypreGMRES& gmres,
                                   int ranks,
+                                  int local_reordering,
                                   double relative_tolerance,
                                   int maximum_iterations,
                                   int krylov_dimension,
@@ -726,6 +743,7 @@ bool CudaRefreshFactorAndSolve(mfem::HypreParMatrix& matrix,
                                mfem::HypreGMRES& gmres,
                                int ranks,
                                MPI_Comm communicator,
+                               int local_reordering,
                                double relative_tolerance,
                                int maximum_iterations,
                                int krylov_dimension,

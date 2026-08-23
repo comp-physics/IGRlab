@@ -1049,9 +1049,11 @@ BuildPersistentTrueSystem() noexcept
       CudaHypreSetupOrderEvidence initial_setup{};
       local_objects_ready = CudaConfigurePersistentHypre(
           *true_matrix_, *ilu_, *gmres_, ranks_,
+          CudaIluLocalReordering(shape_.igr_active),
           linear_relative_tolerance_, maximum_linear_iterations_,
           krylov_dimension_, 0, initial_setup) &&
-          initial_setup.ConfigurationExactForGeneration(0);
+          initial_setup.ConfigurationExactForGeneration(
+              0, CudaIluLocalReordering(shape_.igr_active));
     }
     if (local_objects_ready)
     {
@@ -1107,6 +1109,7 @@ BuildPersistentTrueSystem() noexcept
   const bool warm_solved = CudaRefreshFactorAndSolve(
       *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_, ranks_,
       communicator_,
+      CudaIluLocalReordering(shape_.igr_active),
       linear_relative_tolerance_, maximum_linear_iterations_,
       krylov_dimension_, 0, warm);
   const bool warmed = warm_solved && warm.device_policy &&
@@ -1150,9 +1153,11 @@ BuildPersistentTrueSystem() noexcept
     CudaHypreSetupOrderEvidence persistent_setup{};
     persistent_configured = CudaConfigurePersistentHypre(
         *true_matrix_, *ilu_, *gmres_, ranks_,
+        CudaIluLocalReordering(shape_.igr_active),
         linear_relative_tolerance_, maximum_linear_iterations_,
         krylov_dimension_, 0, persistent_setup) &&
-        persistent_setup.ConfigurationExactForGeneration(0);
+        persistent_setup.ConfigurationExactForGeneration(
+            0, CudaIluLocalReordering(shape_.igr_active));
   }
   catch (...) { persistent_configured = false; }
   ReportCudaWarmLifetimeMarker(
@@ -1702,7 +1707,8 @@ SolveTrueSystem(double& true_relative_residual,
   CudaSolveDiagnostics diagnostics{};
   const bool local_solve = CudaRefreshFactorAndSolve(
       *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
-          ranks_, communicator_, linear_relative_tolerance_,
+          ranks_, communicator_, CudaIluLocalReordering(shape_.igr_active),
+          linear_relative_tolerance_,
           maximum_linear_iterations_,
           krylov_dimension_, matrix_generation, diagnostics) &&
       diagnostics.matrix_generation == matrix_generation &&

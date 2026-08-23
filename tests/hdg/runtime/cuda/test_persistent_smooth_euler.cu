@@ -41,6 +41,10 @@ constexpr bool TrueResidualAuthorityPolicy() noexcept
 
 static_assert(TrueResidualAuthorityPolicy(),
               "the rebuilt true residual must remain authoritative");
+static_assert(
+    dg::hdg::runtime::cuda_w8a::detail::CudaIluLocalReordering(false) == 0 &&
+    dg::hdg::runtime::cuda_w8a::detail::CudaIluLocalReordering(true) == 1,
+    "only coupled IGR uses local RCM ordering");
 
 struct ModelTag { inline static constexpr std::string_view id = "euler.compressible.2d"; };
 struct FormulationTag { inline static constexpr std::string_view id = "hdg.conventional"; };

@@ -931,6 +931,7 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
                                   mfem::HypreILU& ilu,
                                   mfem::HypreGMRES& gmres,
                                   const int ranks,
+                                  const int local_reordering,
                                   const double relative_tolerance,
                                   const int maximum_iterations,
                                   const int krylov_dimension,
@@ -943,6 +944,7 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
                                            matrix_generation);
   evidence = {};
   evidence.matrix_generation = matrix_generation;
+  evidence.ilu_local_reordering = local_reordering;
   try
   {
     // Pinned MFEM v4.9 HypreGMRES::SetOperator forwards the new matrix to the
@@ -957,8 +959,9 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
     evidence.Record(CudaHypreSetupAction::ilu_type0);
     ilu.SetLevelOfFill(0);
     evidence.Record(CudaHypreSetupAction::ilu_fill0);
-    ilu.SetLocalReordering(0);
-    evidence.Record(CudaHypreSetupAction::ilu_reorder0);
+    if (local_reordering != 0 && local_reordering != 1) return false;
+    ilu.SetLocalReordering(local_reordering);
+    evidence.Record(CudaHypreSetupAction::ilu_reordering);
     ilu.SetMaxIter(1);
     evidence.Record(CudaHypreSetupAction::ilu_maxiter1);
     ilu.SetTol(0.0);
@@ -981,8 +984,18 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
     gmres.SetPrintLevel(0);
     gmres.SetZeroInitialIterate();
     evidence.Record(CudaHypreSetupAction::gmres_settings);
-    diagnostic.result =
-        evidence.ConfigurationExactForGeneration(matrix_generation);
+    auto* const ilu_data = reinterpret_cast<hypre_ParILUData*>(
+        static_cast<HYPRE_Solver>(ilu));
+    const bool effective_ilu0 = ilu_data != nullptr &&
+        hypre_ParILUDataIluType(ilu_data) == 0 &&
+        hypre_ParILUDataLfil(ilu_data) == 0 &&
+        hypre_ParILUDataReorderingType(ilu_data) == local_reordering &&
+        hypre_ParILUDataMaxIter(ilu_data) == 1 &&
+        hypre_ParILUDataTol(ilu_data) == 0.0 &&
+        hypre_ParILUDataPrintLevel(ilu_data) == 0;
+    diagnostic.result = effective_ilu0 &&
+        evidence.ConfigurationExactForGeneration(matrix_generation,
+                                                  local_reordering);
     return diagnostic.result;
   }
   catch (...) { return false; }
@@ -1013,6 +1026,7 @@ bool CudaRefreshFactorAndSolve(
     mfem::HypreParVector& solution, mfem::HypreILU& ilu,
     mfem::HypreGMRES& gmres, const int ranks,
     const MPI_Comm communicator,
+    const int local_reordering,
     const double relative_tolerance, const int maximum_iterations,
     const int krylov_dimension,
     const std::uint64_t matrix_generation,
@@ -1027,6 +1041,7 @@ bool CudaRefreshFactorAndSolve(
   {
     policy_ready = CudaHypreDevicePolicyValid(matrix, rhs, solution) &&
         CudaConfigurePersistentHypre(matrix, ilu, gmres, ranks,
+                                     local_reordering,
                                      relative_tolerance, maximum_iterations,
                                      krylov_dimension,
                                      matrix_generation, setup_order);
@@ -1049,7 +1064,8 @@ bool CudaRefreshFactorAndSolve(
     diagnostics.device_policy =
         CudaHypreDevicePolicyValid(matrix, rhs, solution);
     diagnostics.configured_ilu0 =
-        setup_order.SolveExactForGeneration(matrix_generation);
+        setup_order.SolveExactForGeneration(matrix_generation,
+                                            local_reordering);
     gmres.GetNumIterations(diagnostics.iterations);
     gmres.GetFinalResidualNorm(diagnostics.reported_residual);
     diagnostics.finite = std::isfinite(diagnostics.reported_residual);
