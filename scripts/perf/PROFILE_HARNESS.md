@@ -87,7 +87,9 @@ application semantics:
   harness-side candidate and cache;
 - target processes are exactly `application-only`, kernel-name base is
   `demangled`, no set or section is accepted, and `--ncu-launch-count` is
-  positive.
+  positive. Qualification requires `--ncu-launch-skip` to remain at its zero
+  default so the declared launch count always covers the complete selected
+  range.
 
 `--ncu-qualification-kind tensor-instructions` is the native-instruction
 proof. Its only metrics are
@@ -95,7 +97,10 @@ proof. Its only metrics are
 `gpu__time_duration.avg`; its kernel filter is exactly
 `regex:.*TensorBorrowedCondenseKernel.*`; and its only NVTX include is
 `HDG\/condensation/`. After capture, the harness imports the native report
-itself with `ncu --import REPORT --csv --page raw`. The imported table must
+itself with
+`ncu --import REPORT --csv --page raw --print-units base`. Explicit base units
+prevent Nsight Compute release defaults from rescaling the duration metric. The
+imported table must
 contain exactly the requested number of `TensorBorrowedCondenseKernel`
 launches, no numeric rows from another kernel, and positive FP64 DMMA and
 GPU-duration values for every launch.
@@ -103,7 +108,8 @@ GPU-duration values for every launch.
 `--ncu-qualification-kind accepted-step-attribution` is the all-kernel
 accepted-step view. Its only metric is `gpu__time_duration.avg`; it forbids a
 kernel filter; and its only NVTX include is
-`HDG\/profiled-accepted-step/`. The imported raw table must expose one
+`HDG\/profiled-accepted-step/`. Its report import also requests
+`--print-units base`. The imported raw table must expose one
 unambiguous NVTX push/pop column, nanosecond durations, and at least one row but
 strictly fewer rows than the declared launch limit, all inside that outer
 range. Reaching the limit is treated as possible truncation, not a complete

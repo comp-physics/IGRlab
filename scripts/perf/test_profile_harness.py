@@ -177,6 +177,8 @@ if arguments == ["--version"]:
     print("NVIDIA (R) Nsight Compute Command Line Profiler")
     print("Version 2026.1")
 elif "--import" in arguments:
+    if arguments[-2:] != ["--print-units", "base"]:
+        raise SystemExit(19)
     if os.environ.get("FAKE_NCU_ATTRIBUTION"):
         print('"ID","Kernel Name","NVTX Push/Pop_Range","gpu__time_duration.avg"')
         print('"","","","nsecond"')
@@ -333,6 +335,9 @@ else:
         assert proof["matched_launches"] == 3
         assert proof["dmma_instruction_total"] == 18144.0
         assert proof["dmma_instruction_minimum"] == 6048.0
+        assert proof["duration_unit"] == "nanoseconds"
+        assert proof["raw_duration_unit_field"] == "nsecond"
+        assert proof["import_command"][-2:] == ["--print-units", "base"]
         bound = qualification_manifest["identity"]["qualification"]
         assert bound["gpu"]["uuid"] == "GPU-QUALIFICATION"
         assert bound["gpu"]["compute_capability"] == "12.0"
@@ -346,6 +351,9 @@ else:
             if item["path"] == "ncu-tensor-proof.csv"
         )
         assert "--import" in proof_artifact["generating_command"]
+        assert proof_artifact["generating_command"][-2:] == [
+            "--print-units", "base",
+        ]
 
         attribution_out = root / "qualification-attribution"
         run(
@@ -363,6 +371,9 @@ else:
         assert attribution["matched_launches"] == 9
         assert attribution["total_gpu_kernel_duration_ns"] == 11900.0
         assert attribution["tensor_condensation"]["duration_ns"] == 2000.0
+        assert attribution["import_command"][-2:] == [
+            "--print-units", "base",
+        ]
         assert math.isclose(
             attribution["tensor_condensation"][
                 "fraction_of_gpu_kernel_duration"
@@ -378,6 +389,9 @@ else:
             if item["path"] == "ncu-accepted-step-attribution.csv"
         )
         assert "--import" in attribution_artifact["generating_command"]
+        assert attribution_artifact["generating_command"][-2:] == [
+            "--print-units", "base",
+        ]
 
         truncated_attribution_arguments = qualification_arguments(
             root / "qualification-attribution-at-cap",
@@ -397,6 +411,16 @@ else:
                 root / "qualification-attribution-at-cap"
             )["detail"]
         assert truncated_attribution.returncode == 6
+
+        skipped_qualification_arguments = qualification_arguments(
+            root / "qualification-launch-skip"
+        )
+        skipped_qualification_arguments.extend(("--ncu-launch-skip", "1"))
+        assert "forbids --ncu-launch-skip" in run(
+            *skipped_qualification_arguments,
+            expected=2,
+            env=qualification_env,
+        ).stderr
 
         missing_category_out = root / "qualification-attribution-missing"
         run(

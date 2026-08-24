@@ -736,6 +736,8 @@ def validate_ncu_qualification_inputs(parser: argparse.ArgumentParser,
     normalized_nvtx = args.ncu_nvtx_include.replace("\\/", "/")
     if args.ncu_launch_count <= 0:
         parser.error("NCU qualification requires a positive --ncu-launch-count")
+    if args.ncu_launch_skip != 0:
+        parser.error("NCU qualification forbids --ncu-launch-skip")
     if args.ncu_qualification_kind == "tensor-instructions":
         if set(args.ncu_metric) != {NCU_DMMA_METRIC, NCU_DURATION_METRIC} or \
                 len(args.ncu_metric) != 2:
@@ -1076,6 +1078,14 @@ def positive_float(value: str, label: str) -> float:
     return parsed
 
 
+def ncu_import_command(tool: str, report: Path) -> list[str]:
+    """Import raw NCU CSV in stable PerfWorks base units."""
+    return [
+        tool, "--import", str(report), "--csv", "--page", "raw",
+        "--print-units", "base",
+    ]
+
+
 def parse_ncu_tensor_csv(data: bytes, expected_launches: int) -> dict[str, Any]:
     try:
         text = data.decode("utf-8", errors="strict")
@@ -1095,6 +1105,15 @@ def parse_ncu_tensor_csv(data: bytes, expected_launches: int) -> dict[str, Any]:
     kernel_column = header.index("Kernel Name")
     dmma_column = header.index(NCU_DMMA_METRIC)
     duration_column = header.index(NCU_DURATION_METRIC)
+    duration_unit = ""
+    if header_index + 1 < len(rows) and \
+            len(rows[header_index + 1]) > duration_column:
+        duration_unit = rows[header_index + 1][duration_column].strip()
+    if duration_unit not in {"", "nsecond", "ns"}:
+        raise RuntimeError(
+            "NCU tensor-proof duration unit is not nanoseconds: "
+            f"{duration_unit!r}"
+        )
     last_column = max(kernel_column, dmma_column, duration_column)
     matched: list[dict[str, Any]] = []
     other_data_kernels: list[str] = []
@@ -1140,6 +1159,8 @@ def parse_ncu_tensor_csv(data: bytes, expected_launches: int) -> dict[str, Any]:
         "dmma_instruction_total": sum(dmma_values),
         "dmma_instruction_minimum": min(dmma_values),
         "duration_metric": NCU_DURATION_METRIC,
+        "duration_unit": "nanoseconds",
+        "raw_duration_unit_field": duration_unit or "empty (NCU 2024.1)",
         "duration_total": sum(duration_values),
         "duration_minimum": min(duration_values),
     }
@@ -1150,7 +1171,7 @@ def import_ncu_tensor_proof(args: argparse.Namespace, tool: str) -> tuple[
     report = args.out_dir / NCU_REPORT
     csv_path = args.out_dir / "ncu-tensor-proof.csv"
     stderr_path = args.out_dir / "ncu-tensor-proof.stderr.txt"
-    command = [tool, "--import", str(report), "--csv", "--page", "raw"]
+    command = ncu_import_command(tool, report)
     try:
         with open_exclusive_binary(csv_path) as stdout_stream, \
                 open_exclusive_binary(stderr_path) as stderr_stream:
@@ -1344,7 +1365,7 @@ def import_ncu_attribution(args: argparse.Namespace, tool: str) -> tuple[
     report = args.out_dir / NCU_REPORT
     csv_path = args.out_dir / "ncu-accepted-step-attribution.csv"
     stderr_path = args.out_dir / "ncu-accepted-step-attribution.stderr.txt"
-    command = [tool, "--import", str(report), "--csv", "--page", "raw"]
+    command = ncu_import_command(tool, report)
     try:
         with open_exclusive_binary(csv_path) as stdout_stream, \
                 open_exclusive_binary(stderr_path) as stderr_stream:
@@ -1642,10 +1663,9 @@ def main() -> int:
                                     args.out_dir /
                                     "ncu-accepted-step-attribution.stderr.txt",
                                 ]
-                            import_command = [
-                                tool, "--import", str(args.out_dir / NCU_REPORT),
-                                "--csv", "--page", "raw",
-                            ]
+                            import_command = ncu_import_command(
+                                tool, args.out_dir / NCU_REPORT
+                            )
                             artifacts.extend(proof_paths)
                             artifact_commands.update(
                                 {path: import_command for path in proof_paths}
