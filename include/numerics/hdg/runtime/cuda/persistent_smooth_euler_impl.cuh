@@ -28,8 +28,10 @@ static inline void ReportCudaWarmLifetimeMarker(
 // MFEM CUDA allowed, MFEM debug-device disabled, zero incoming HYPRE error,
 // normal Hypre::Init return, zero error captured immediately after Init, Hypre
 // GPU selection, HYPRE memory query, HYPRE execution query, device memory,
-// device execution, and zero post-policy HYPRE error.  Materialized MFEM and
-// HYPRE Umpire pools are admitted only after their first real allocations.
+// device execution, zero post-policy HYPRE error, and an admitted SM120
+// tensor-core target when that explicit engine is selected.  Materialized
+// MFEM and HYPRE Umpire pools are admitted only after their first real
+// allocations.
 enum CudaBackendFailureBit : std::uint64_t
 {
   backend_rank_count_failure = std::uint64_t{1} << 0U,
@@ -47,7 +49,8 @@ enum CudaBackendFailureBit : std::uint64_t
   backend_hypre_execution_query_failure = std::uint64_t{1} << 12U,
   backend_hypre_memory_device_failure = std::uint64_t{1} << 13U,
   backend_hypre_execution_device_failure = std::uint64_t{1} << 14U,
-  backend_hypre_policy_error_failure = std::uint64_t{1} << 15U
+  backend_hypre_policy_error_failure = std::uint64_t{1} << 15U,
+  backend_tensor_core_hardware_failure = std::uint64_t{1} << 16U
 };
 
 static inline void ReportCudaBackendFailure(
@@ -58,6 +61,15 @@ static inline void ReportCudaBackendFailure(
     std::fprintf(stderr, "CUDA_BACKEND_FAIL rank0_mask=0x%llx\n",
                  static_cast<unsigned long long>(failure_mask));
   }
+}
+
+static inline void ReportCudaTensorCoreAdmissionFailure(
+    const int rank, const int architecture) noexcept
+{
+  if (rank == 0)
+    std::fprintf(stderr,
+                 "CUDA_TENSOR_CORE_UNSUPPORTED required_sm=120 actual_sm=%d\n",
+                 architecture);
 }
 
 // Private teardown diagnostics.  MFEM's DEVICE_UMPIRE Wrap(..., own=false)
@@ -558,6 +570,61 @@ private:
   }
 };
 
+struct CudaDiagScaleSetupOrderEvidence
+{
+  inline static constexpr std::size_t configured_action_count = 4;
+  inline static constexpr std::size_t solved_action_count = 5;
+
+  std::uint64_t matrix_generation = 0;
+  std::array<CudaHypreSetupAction, solved_action_count> actions{};
+  std::size_t action_count = 0;
+  bool overflow = false;
+
+  constexpr bool Record(const CudaHypreSetupAction action) noexcept
+  {
+    if (action_count >= actions.size())
+    {
+      overflow = true;
+      return false;
+    }
+    actions[action_count++] = action;
+    return true;
+  }
+
+  constexpr bool ConfigurationExactForGeneration(
+      const std::uint64_t expected_generation) const noexcept
+  {
+    return action_count == configured_action_count &&
+        PrefixExactForGeneration(expected_generation);
+  }
+
+  constexpr bool SolveExactForGeneration(
+      const std::uint64_t expected_generation) const noexcept
+  {
+    return action_count == solved_action_count &&
+        PrefixExactForGeneration(expected_generation) &&
+        actions[configured_action_count] == CudaHypreSetupAction::mult;
+  }
+
+private:
+  constexpr bool PrefixExactForGeneration(
+      const std::uint64_t expected_generation) const noexcept
+  {
+    constexpr std::array<CudaHypreSetupAction, configured_action_count>
+        expected{{
+          CudaHypreSetupAction::bind_preconditioner,
+          CudaHypreSetupAction::set_operator,
+          CudaHypreSetupAction::rebind_preconditioner,
+          CudaHypreSetupAction::gmres_settings}};
+    if (overflow || matrix_generation != expected_generation ||
+        action_count < expected.size())
+      return false;
+    for (std::size_t action = 0; action < expected.size(); ++action)
+      if (actions[action] != expected[action]) { return false; }
+    return true;
+  }
+};
+
 constexpr bool CudaTicketWordsValid(
     const std::array<int, 8>& words, const CudaFailurePhase phase,
     const std::uint64_t attempt, const std::uint64_t generation,
@@ -578,10 +645,14 @@ constexpr bool CudaTicketWordsValid(
 struct CudaSolveDiagnostics
 {
   bool device_policy = false;
+  bool configured_preconditioner = false;
   bool configured_ilu0 = false;
+  bool configured_diagonal = false;
   bool reported_tolerance_met = false;
   bool finite = false;
   std::uint64_t matrix_generation = 0;
+  CudaTracePreconditionerKind trace_preconditioner =
+      CudaTracePreconditionerKind::unconfigured;
   int iterations = 0;
   double reported_residual = std::numeric_limits<double>::infinity();
 };
@@ -590,7 +661,14 @@ constexpr bool CudaTraceSolveReadyForTrueResidualVerification(
     const CudaSolveDiagnostics& diagnostics,
     const int maximum_iterations) noexcept
 {
-  return diagnostics.device_policy && diagnostics.configured_ilu0 &&
+  return diagnostics.device_policy && diagnostics.configured_preconditioner &&
+      (diagnostics.configured_ilu0 != diagnostics.configured_diagonal) &&
+      ((diagnostics.configured_ilu0 &&
+        diagnostics.trace_preconditioner ==
+            CudaTracePreconditionerKind::hypre_ilu0) ||
+       (diagnostics.configured_diagonal &&
+        diagnostics.trace_preconditioner ==
+            CudaTracePreconditionerKind::hypre_diag_scale)) &&
       diagnostics.iterations >= 0 && diagnostics.iterations <=
           maximum_iterations;
 }
@@ -739,6 +817,15 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
                                   std::uint64_t matrix_generation,
                                   CudaHypreSetupOrderEvidence& evidence)
     noexcept;
+bool CudaConfigurePersistentDiagonal(mfem::HypreParMatrix& matrix,
+                                     mfem::HypreDiagScale& diagonal,
+                                     mfem::HypreGMRES& gmres,
+                                     double relative_tolerance,
+                                     int maximum_iterations,
+                                     int krylov_dimension,
+                                     std::uint64_t matrix_generation,
+                                     CudaDiagScaleSetupOrderEvidence& evidence)
+    noexcept;
 bool CudaRefreshFactorAndSolve(mfem::HypreParMatrix& matrix,
                                mfem::HypreParVector& rhs,
                                mfem::HypreParVector& solution,
@@ -752,6 +839,17 @@ bool CudaRefreshFactorAndSolve(mfem::HypreParMatrix& matrix,
                                int krylov_dimension,
                                std::uint64_t matrix_generation,
                                CudaSolveDiagnostics& diagnostics) noexcept;
+bool CudaRefreshDiagonalAndSolve(mfem::HypreParMatrix& matrix,
+                                 mfem::HypreParVector& rhs,
+                                 mfem::HypreParVector& solution,
+                                 mfem::HypreDiagScale& diagonal,
+                                 mfem::HypreGMRES& gmres,
+                                 MPI_Comm communicator,
+                                 double relative_tolerance,
+                                 int maximum_iterations,
+                                 int krylov_dimension,
+                                 std::uint64_t matrix_generation,
+                                 CudaSolveDiagnostics& diagnostics) noexcept;
 bool CudaHypreDevicePolicyValid(mfem::HypreParMatrix& matrix,
                                 mfem::HypreParVector& rhs,
                                 mfem::HypreParVector& solution) noexcept;
@@ -774,7 +872,9 @@ bool CudaLaunchFrozenBorrowedLlfAssembly(
     const CudaDeviceView& view, const CudaMeshShape& shape,
     double dt) noexcept;
 bool CudaLaunchCondensation(const CudaDeviceView& view,
-                            const CudaMeshShape& shape) noexcept;
+                            const CudaMeshShape& shape,
+                            generic::CudaEngineKind engine,
+                            std::uint64_t& tensor_mma_tiles) noexcept;
 bool CudaLaunchZeroTrueSystem(const CudaTrueMatrixDeviceView& matrix,
                               double* rhs, int rhs_count) noexcept;
 bool CudaLaunchAssembleOwnedMatrix(const CudaDeviceView& view,
@@ -878,6 +978,9 @@ public:
                   const RuntimeTupleDescriptor& tuple) noexcept
   {
     communicator_ = CudaCollectiveCommunicator(config);
+    cuda_engine_ = config.cuda_engine;
+    trace_preconditioner_ = CudaTracePreconditionerKind::unconfigured;
+    evidence.tensor_core.selected_engine = cuda_engine_;
     oracle_capture_requested_ = config.capture_oracle;
     TransportPolicy::ResetLedger();
     CudaPolicyContext setup{};
@@ -979,6 +1082,15 @@ public:
                              "build-persistent-true-system");
       return false;
     }
+    const bool trace_preconditioner_ready = trace_preconditioner_ ==
+        CudaTracePreconditionerForEngine(cuda_engine_);
+    if (!CollectiveContinue(trace_preconditioner_ready))
+    {
+      ReportCudaSetupFailure(evidence.rank, "trace-preconditioner-selection");
+      return false;
+    }
+    evidence.tensor_core.trace_preconditioner = trace_preconditioner_;
+    evidence.tensor_core.trace_preconditioner_configured = true;
     if (!CollectiveContinue(BindStateSlots()))
     {
       ReportCudaSetupFailure(evidence.rank, "bind-state-slots");
@@ -1062,6 +1174,15 @@ public:
   int rank() const noexcept { return rank_; }
   bool NoFallback() const noexcept { return no_fallback_; }
   bool DeviceResident() const noexcept { return device_resident_; }
+  bool TensorCoreHardwareSupported() const noexcept
+  { return tensor_core_hardware_supported_; }
+  CudaTracePreconditionerKind TracePreconditioner() const noexcept
+  { return trace_preconditioner_; }
+  bool TracePreconditionerConfigured() const noexcept
+  {
+    return trace_preconditioner_ ==
+        CudaTracePreconditionerForEngine(cuda_engine_);
+  }
   const StateHash& LocalMeshHash() const noexcept { return local_mesh_hash_; }
   const StateHash& LocalPartitionHash() const noexcept
   { return local_partition_hash_; }
@@ -1250,8 +1371,12 @@ public:
     value.double_arena_token = reinterpret_cast<std::uintptr_t>(double_arena_);
     value.integer_arena_token = reinterpret_cast<std::uintptr_t>(integer_arena_);
     value.matrix_token = reinterpret_cast<std::uintptr_t>(true_matrix_.get());
-    value.factor_token = reinterpret_cast<std::uintptr_t>(
-        ilu_ ? static_cast<HYPRE_Solver>(*ilu_) : nullptr);
+    value.preconditioner_token = ilu_
+        ? reinterpret_cast<std::uintptr_t>(
+              static_cast<HYPRE_Solver>(*ilu_))
+        : (diagonal_
+              ? reinterpret_cast<std::uintptr_t>(&*diagonal_)
+              : std::uintptr_t{0});
     value.workspace_token = reinterpret_cast<std::uintptr_t>(view_.a);
     value.interior_slot_tokens = {{committed_slot_.interior.storage_token,
                                    candidate_slot_.interior.storage_token}};
@@ -1281,7 +1406,15 @@ public:
         rank_, "reuse-owned-call-sampling", "after", true);
     ReportCudaWarmLifetimeMarker(
         rank_, "reuse-persistence-predicates", "before", false);
-    value.persistent_graph = true_matrix_ && local_trace_matrix_;
+    const bool selected_preconditioner_ready = gmres_ &&
+        ((cuda_engine_ == generic::CudaEngineKind::ordinary && ilu_ &&
+          !diagonal_ && trace_preconditioner_ ==
+              CudaTracePreconditionerKind::hypre_ilu0) ||
+         (cuda_engine_ == generic::CudaEngineKind::tensor_core && diagonal_ &&
+          !ilu_ && trace_preconditioner_ ==
+              CudaTracePreconditionerKind::hypre_diag_scale));
+    value.persistent_graph = true_matrix_ && local_trace_matrix_ &&
+        selected_preconditioner_ready;
     value.persistent_slots = committed_slot_.interior.coefficients !=
             candidate_slot_.interior.coefficients &&
         committed_slot_.trace.coefficients != candidate_slot_.trace.coefficients;
@@ -1790,7 +1923,21 @@ public:
                               const AttemptIdentity& attempt,
                               state_slot& workspace) noexcept
   {
+    ::dg_igr::NVTXRange accepted_step_profile_region(
+        ::dg_igr::observability::RegionId::hdg_accepted_step);
     CudaNumericalResult result{};
+    result.tensor_core.selected_engine = cuda_engine_;
+    result.tensor_core.trace_preconditioner = trace_preconditioner_;
+    result.tensor_core.trace_preconditioner_configured =
+        trace_preconditioner_ == CudaTracePreconditionerForEngine(cuda_engine_);
+    result.tensor_core.hardware_supported =
+        tensor_core_hardware_supported_;
+    result.tensor_core.fallback_accounting_complete = true;
+    // This production leaf has no mixed-precision or correction route.  Emit
+    // that fact from the numerical attempt itself so benchmark accounting is
+    // not synthesized by the harness.
+    result.precision_work.all_fp64_policy = true;
+    result.precision_work.accounting_complete = true;
     // The frozen non-borrowed lifecycle has no Euler conservation contract.
     // Borrowed Euler attempts remain fail-closed until their measured balance
     // has passed below.
@@ -1897,6 +2044,27 @@ public:
       ++result.rejected_line_search_trials;
       return true;
     };
+    const auto launch_condensation = [&]() noexcept
+    {
+      ::dg_igr::NVTXRange profile_region(
+          ::dg_igr::observability::RegionId::hdg_condensation);
+      if (cuda_engine_ == generic::CudaEngineKind::tensor_core &&
+          result.tensor_core.condensation_launches ==
+              std::numeric_limits<std::uint64_t>::max())
+        return false;
+      std::uint64_t mma_tiles = 0;
+      if (!CudaLaunchCondensation(view_, shape_, cuda_engine_, mma_tiles))
+        return false;
+      if (cuda_engine_ == generic::CudaEngineKind::tensor_core)
+      {
+        if (mma_tiles > std::numeric_limits<std::uint64_t>::max() -
+                result.tensor_core.mma_tiles)
+          return false;
+        ++result.tensor_core.condensation_launches;
+        result.tensor_core.mma_tiles += mma_tiles;
+      }
+      return true;
+    };
     std::uint64_t last_product_generation = 0;
     for (int iteration = 0; iteration < maximum_nonlinear_updates; ++iteration)
     {
@@ -1907,7 +2075,7 @@ public:
       if (inject_at(CudaFailurePhase::condensation)) { return result; }
       const bool condensed = CopyBase(workspace) &&
           Ticket(CudaFailurePhase::condensation) &&
-          CudaLaunchCondensation(view_, shape_) && StatusPassed();
+          launch_condensation() && StatusPassed();
       if (!CollectiveContinue(condensed))
       {
         result.phase = CudaFailurePhase::condensation;
@@ -1947,9 +2115,14 @@ public:
             trace_distributed && distribution_complete);
         return result;
       }
-      const bool recovered = trace_distributed &&
-          Ticket(CudaFailurePhase::recovery) &&
-          CudaLaunchRecover(view_, shape_) && StatusPassed();
+      bool recovery_launched = false;
+      if (trace_distributed && Ticket(CudaFailurePhase::recovery))
+      {
+        ::dg_igr::NVTXRange profile_region(
+            ::dg_igr::observability::RegionId::hdg_interior_recovery);
+        recovery_launched = CudaLaunchRecover(view_, shape_);
+      }
+      const bool recovered = recovery_launched && StatusPassed();
       if (!CollectiveContinue(recovered))
       {
         result.phase = CudaFailurePhase::recovery;
@@ -1970,7 +2143,12 @@ public:
         // workspace.  The base snapshot remains immutable, so a rejected
         // trial is still restored transactionally without the former pair of
         // full-state device-to-device copies.
-        const bool trial_ready = CudaLaunchTrial(view_, shape_, alpha);
+        bool trial_ready = false;
+        {
+          ::dg_igr::NVTXRange profile_region(
+              ::dg_igr::observability::RegionId::hdg_nonlinear_update);
+          trial_ready = CudaLaunchTrial(view_, shape_, alpha);
+        }
         if (!CollectiveContinue(trial_ready))
         {
           if (!CollectiveContinue(RestoreBase(workspace)))
@@ -1985,9 +2163,17 @@ public:
           }
           continue;
         }
+        const bool trace_ready =
+            DistributeCurrentTrace(workspace.trace.coefficients);
+        bool admissibility_launched = false;
+        if (trace_ready)
+        {
+          ::dg_igr::NVTXRange profile_region(
+              ::dg_igr::observability::RegionId::hdg_validation);
+          admissibility_launched = CudaLaunchAdmissibility(view_, shape_);
+        }
         const bool trial_admissible =
-            DistributeCurrentTrace(workspace.trace.coefficients) &&
-            CudaLaunchAdmissibility(view_, shape_) && StatusPassed();
+            admissibility_launched && StatusPassed();
         if (!CollectiveContinue(trial_admissible))
         {
           if (!CollectiveContinue(RestoreBase(workspace)))
@@ -2055,7 +2241,7 @@ public:
          result.nonlinear_updates >= 2) &&
         result.final_residual <= target && CopyBase(workspace) &&
         Ticket(CudaFailurePhase::condensation) &&
-        CudaLaunchCondensation(view_, shape_) && StatusPassed();
+        launch_condensation() && StatusPassed();
     if (!CollectiveContinue(coherent_base) || !AssembleTrueSystem())
     {
       result.reason = FailureReason::backend_failure;
@@ -2080,9 +2266,16 @@ public:
       result.reason = FailureReason::true_residual_gate;
       return result;
     }
-    const bool coherent_solve = DistributeTraceIncrement() &&
-        Ticket(CudaFailurePhase::recovery) &&
-        CudaLaunchRecover(view_, shape_) && StatusPassed();
+    const bool coherent_trace_distributed = DistributeTraceIncrement();
+    bool coherent_recovery_launched = false;
+    if (coherent_trace_distributed && Ticket(CudaFailurePhase::recovery))
+    {
+      ::dg_igr::NVTXRange profile_region(
+          ::dg_igr::observability::RegionId::hdg_interior_recovery);
+      coherent_recovery_launched = CudaLaunchRecover(view_, shape_);
+    }
+    const bool coherent_solve =
+        coherent_recovery_launched && StatusPassed();
     if (!CollectiveContinue(coherent_solve))
     {
       result.reason = FailureReason::recovery_gate;
@@ -2111,8 +2304,13 @@ public:
                        last_product_generation,
                        last_product_generation,
                        0};
-    const bool local_admissible =
-        CudaLaunchAdmissibility(view_, shape_) && StatusPassed();
+    bool admissibility_launched = false;
+    {
+      ::dg_igr::NVTXRange profile_region(
+          ::dg_igr::observability::RegionId::hdg_validation);
+      admissibility_launched = CudaLaunchAdmissibility(view_, shape_);
+    }
+    const bool local_admissible = admissibility_launched && StatusPassed();
     result.admissible = CollectiveContinue(local_admissible);
     result.true_residual = std::isfinite(result.true_relative_residual) &&
         result.true_relative_residual <= true_residual_relative_tolerance_;
@@ -2121,9 +2319,14 @@ public:
     if (inject_at(CudaFailurePhase::diagnostics)) { return result; }
     if (shape_.borrowed_host_inputs)
     {
-      const bool conservation_ready = EulerConservationBalance(
-          attempt.dt, result.maximum_conservation_error,
-          result.maximum_conservation_relative_error);
+      bool conservation_ready = false;
+      {
+        ::dg_igr::NVTXRange profile_region(
+            ::dg_igr::observability::RegionId::hdg_validation);
+        conservation_ready = EulerConservationBalance(
+            attempt.dt, result.maximum_conservation_error,
+            result.maximum_conservation_relative_error);
+      }
       if (!CollectiveContinue(conservation_ready))
       {
         result.candidate_ready = false;
@@ -2358,6 +2561,12 @@ private:
 
   bool ValidateTopologyBeforeDevice(const CudaConfig& config) const noexcept
   {
+    const bool known_engine =
+        generic::IsKnownCudaEngineKind(config.cuda_engine);
+    const bool tensor_request_valid =
+        config.cuda_engine != generic::CudaEngineKind::tensor_core ||
+        (config.use_borrowed_topology && config.use_borrowed_host_inputs &&
+         config.use_generic_numerical_policy);
     const bool supported_rank = config.expected_rank_count == 1 ||
         config.expected_rank_count == 2;
     const bool supported_order = config.use_borrowed_topology &&
@@ -2369,7 +2578,8 @@ private:
     int collective_ranks = 0;
     const bool communicator_ready = communicator_ != MPI_COMM_NULL &&
         MPI_Comm_size(communicator_, &collective_ranks) == MPI_SUCCESS;
-    bool local_valid = supported_rank && supported_order && communicator_ready &&
+    bool local_valid = known_engine && tensor_request_valid &&
+        supported_rank && supported_order && communicator_ready &&
         collective_ranks == config.expected_rank_count;
     int local_elements = 0;
 
@@ -2661,6 +2871,19 @@ private:
     const bool uuid_ready =
         cudaGetDeviceProperties(&properties, device_) == cudaSuccess;
     if (!CollectiveContinue(uuid_ready)) { return false; }
+    const int device_architecture = 10 * properties.major + properties.minor;
+    tensor_core_hardware_supported_ = device_architecture == 120;
+    evidence.tensor_core.selected_engine = cuda_engine_;
+    evidence.tensor_core.hardware_supported =
+        tensor_core_hardware_supported_;
+    if (cuda_engine_ == generic::CudaEngineKind::tensor_core &&
+        !CollectiveContinue(tensor_core_hardware_supported_))
+    {
+      backend_failure_mask |= backend_tensor_core_hardware_failure;
+      ReportCudaTensorCoreAdmissionFailure(rank_, device_architecture);
+      ReportCudaBackendFailure(rank_, backend_failure_mask);
+      return false;
+    }
     std::memcpy(gpu_uuid_.data(), properties.uuid.bytes, gpu_uuid_.size());
     std::array<unsigned char, 32> gathered{};
     if (ranks_ == 2)
@@ -3166,8 +3389,11 @@ private:
   bool device_resident_ = false;
   bool hypre_policy_valid_ = false;
   bool no_fallback_ = true;
+  bool tensor_core_hardware_supported_ = false;
   bool oracle_captured_ = false;
   bool oracle_capture_requested_ = false;
+  generic::CudaEngineKind cuda_engine_ =
+      generic::CudaEngineKind::ordinary;
   MPI_Comm communicator_ = MPI_COMM_WORLD;
   int rank_ = -1;
   int ranks_ = 0;
@@ -3213,7 +3439,10 @@ private:
   std::optional<mfem::HypreParVector> hypre_solution_{};
   std::optional<mfem::HypreParVector> hypre_action_{};
   std::optional<mfem::HypreILU> ilu_{};
+  std::optional<mfem::HypreDiagScale> diagonal_{};
   std::optional<mfem::HypreGMRES> gmres_{};
+  CudaTracePreconditionerKind trace_preconditioner_ =
+      CudaTracePreconditionerKind::unconfigured;
   mfem::Vector owned_stage_{};
   mfem::Vector local_stage_{};
   state_slot committed_slot_{};

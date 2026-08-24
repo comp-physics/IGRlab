@@ -12,6 +12,26 @@ if(NOT HDG_MAIN_DEVICE STREQUAL "cpu" AND
   message(FATAL_ERROR
     "HDG main device must be cpu or cuda, got '${HDG_MAIN_DEVICE}'.")
 endif()
+if(NOT DEFINED HDG_MAIN_CUDA_ENGINE)
+  set(HDG_MAIN_CUDA_ENGINE ordinary)
+endif()
+if(NOT DEFINED HDG_MAIN_OMIT_CUDA_ENGINE)
+  set(HDG_MAIN_OMIT_CUDA_ENGINE OFF)
+endif()
+if(NOT HDG_MAIN_CUDA_ENGINE STREQUAL "ordinary" AND
+   NOT HDG_MAIN_CUDA_ENGINE STREQUAL "tensor")
+  message(FATAL_ERROR
+    "HDG CUDA engine must be ordinary or tensor, got '${HDG_MAIN_CUDA_ENGINE}'.")
+endif()
+if(HDG_MAIN_DEVICE STREQUAL "cpu" AND
+   NOT HDG_MAIN_CUDA_ENGINE STREQUAL "ordinary")
+  message(FATAL_ERROR "CPU HDG process tests require the ordinary CUDA selector.")
+endif()
+if(HDG_MAIN_OMIT_CUDA_ENGINE AND
+   NOT HDG_MAIN_CUDA_ENGINE STREQUAL "ordinary")
+  message(FATAL_ERROR
+    "Only the ordinary-default process gate may omit --hdg-cuda-engine.")
+endif()
 if(NOT DEFINED HDG_MAIN_REGULARIZATION)
   set(HDG_MAIN_REGULARIZATION none)
 endif()
@@ -91,6 +111,20 @@ set(_arguments
   --time-step "${HDG_MAIN_DT}"
   --t-final "${HDG_MAIN_T_FINAL}"
   --no-glvis)
+if(NOT HDG_MAIN_OMIT_CUDA_ENGINE)
+  list(APPEND _arguments --hdg-cuda-engine "${HDG_MAIN_CUDA_ENGINE}")
+endif()
+set(_success_pattern
+  "\\[hdg-main\\] status=Success.*step=${HDG_MAIN_EXPECTED_STEPS}.*time=${HDG_MAIN_EXPECTED_FINAL_TIME}")
+if(HDG_MAIN_DEVICE STREQUAL "cuda")
+  if(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor")
+    set(_expected_trace_preconditioner hypre_diag_scale)
+  else()
+    set(_expected_trace_preconditioner hypre_ilu0)
+  endif()
+  string(APPEND _success_pattern
+    ".*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*trace_preconditioner=${_expected_trace_preconditioner}")
+endif()
 if(DEFINED HDG_MAIN_CFL)
   list(APPEND _arguments --cfl-number "${HDG_MAIN_CFL}")
 endif()
@@ -118,7 +152,7 @@ else()
 endif()
 
 if(NOT _status EQUAL 0 OR
-   NOT _stdout MATCHES "\\[hdg-main\\] status=Success.*step=${HDG_MAIN_EXPECTED_STEPS}.*time=${HDG_MAIN_EXPECTED_FINAL_TIME}" OR
+   NOT _stdout MATCHES "${_success_pattern}" OR
    NOT _stderr STREQUAL "")
   message(FATAL_ERROR
     "generic HDG main execution failed: ${_status}\n${_stdout}\n${_stderr}")
@@ -135,16 +169,20 @@ if(HDG_MAIN_VERIFY_REPEATABLE_OUTPUT AND NOT HDG_MAIN_NO_VTK)
     OUTPUT_VARIABLE _repeat_stdout
     ERROR_VARIABLE _repeat_stderr)
   if(NOT _repeat_status EQUAL 0 OR
-     NOT _repeat_stdout MATCHES
-       "\\[hdg-main\\] status=Success.*step=${HDG_MAIN_EXPECTED_STEPS}.*time=${HDG_MAIN_EXPECTED_FINAL_TIME}" OR
+     NOT _repeat_stdout MATCHES "${_success_pattern}" OR
      NOT _repeat_stderr STREQUAL "")
     message(FATAL_ERROR
       "repeated HDG main execution failed: ${_repeat_status}\n${_repeat_stdout}\n${_repeat_stderr}")
   endif()
 endif()
 
-set(_collection
-  "dgsem_smooth_advection_periodic_hdg_p_${HDG_MAIN_ORDER}_ref_${_refinement_levels}")
+if(HDG_MAIN_DEVICE STREQUAL "cuda")
+  set(_collection
+    "dgsem_smooth_advection_periodic_hdg_cuda_${HDG_MAIN_CUDA_ENGINE}_p_${HDG_MAIN_ORDER}_ref_${_refinement_levels}")
+else()
+  set(_collection
+    "dgsem_smooth_advection_periodic_hdg_p_${HDG_MAIN_ORDER}_ref_${_refinement_levels}")
+endif()
 set(_root "${HDG_MAIN_OUTPUT}/${_collection}")
 if(HDG_MAIN_NO_VTK)
   file(GLOB_RECURSE _artifacts LIST_DIRECTORIES FALSE

@@ -31,6 +31,7 @@ namespace
 {
 
 using dg::hdg::generic::BackendKind;
+using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::BackendSelection;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::generic::RegularizationKind;
@@ -738,7 +739,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
                     "HDG state projection or boundary lowering failed on at least one rank");
     }
 
-    const BackendSelection backend{BackendKind::cpu, -1};
+    const BackendSelection backend{
+        BackendKind::cpu, -1, CudaEngineKind::ordinary};
     ResolvedHdgEulerCasePlan resolved_plan{};
     resolved_plan.request = EulerHdgRequest{
       &context->Mesh(),

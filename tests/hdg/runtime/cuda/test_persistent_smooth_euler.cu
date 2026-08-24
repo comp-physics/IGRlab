@@ -15,7 +15,10 @@ constexpr bool TrueResidualAuthorityPolicy() noexcept
 {
   dg::hdg::runtime::cuda_w8a::detail::CudaSolveDiagnostics diagnostics{};
   diagnostics.device_policy = true;
+  diagnostics.configured_preconditioner = true;
   diagnostics.configured_ilu0 = true;
+  diagnostics.trace_preconditioner =
+      CudaTracePreconditionerKind::hypre_ilu0;
   diagnostics.finite = true;
   diagnostics.iterations = 0;
   diagnostics.reported_residual = 1.1286157960703033e-12;
@@ -23,6 +26,29 @@ constexpr bool TrueResidualAuthorityPolicy() noexcept
   const bool reported_tolerance_is_not_a_gate =
       dg::hdg::runtime::cuda_w8a::detail::
           CudaTraceSolveReadyForTrueResidualVerification(diagnostics, 8);
+  diagnostics.configured_ilu0 = false;
+  diagnostics.configured_diagonal = true;
+  diagnostics.trace_preconditioner =
+      CudaTracePreconditionerKind::hypre_diag_scale;
+  const bool diagonal_is_valid =
+      dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(diagnostics, 8);
+  diagnostics.configured_preconditioner = false;
+  diagnostics.configured_diagonal = false;
+  diagnostics.trace_preconditioner =
+      CudaTracePreconditionerKind::unconfigured;
+  const bool neither_is_rejected =
+      !dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(diagnostics, 8);
+  diagnostics.configured_preconditioner = true;
+  diagnostics.configured_ilu0 = true;
+  diagnostics.configured_diagonal = true;
+  diagnostics.trace_preconditioner =
+      CudaTracePreconditionerKind::hypre_ilu0;
+  const bool both_are_rejected =
+      !dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(diagnostics, 8);
+  diagnostics.configured_diagonal = false;
   diagnostics.iterations = 8;
   const bool cap_is_inclusive =
       dg::hdg::runtime::cuda_w8a::detail::
@@ -35,12 +61,38 @@ constexpr bool TrueResidualAuthorityPolicy() noexcept
   const bool over_cap_is_rejected =
       !dg::hdg::runtime::cuda_w8a::detail::
           CudaTraceSolveReadyForTrueResidualVerification(diagnostics, 8);
-  return reported_tolerance_is_not_a_gate && cap_is_inclusive &&
+  return reported_tolerance_is_not_a_gate && diagonal_is_valid &&
+      neither_is_rejected && both_are_rejected && cap_is_inclusive &&
       negative_iteration_is_rejected && over_cap_is_rejected;
 }
 
 static_assert(TrueResidualAuthorityPolicy(),
               "the rebuilt true residual must remain authoritative");
+
+constexpr bool DiagScaleSetupOrderPolicy() noexcept
+{
+  dg::hdg::runtime::cuda_w8a::detail::CudaDiagScaleSetupOrderEvidence
+      evidence{};
+  evidence.matrix_generation = 17;
+  return evidence.Record(
+             dg::hdg::runtime::cuda_w8a::detail::
+                 CudaHypreSetupAction::bind_preconditioner) &&
+      evidence.Record(dg::hdg::runtime::cuda_w8a::detail::
+                          CudaHypreSetupAction::set_operator) &&
+      evidence.Record(dg::hdg::runtime::cuda_w8a::detail::
+                          CudaHypreSetupAction::rebind_preconditioner) &&
+      evidence.Record(dg::hdg::runtime::cuda_w8a::detail::
+                          CudaHypreSetupAction::gmres_settings) &&
+      evidence.ConfigurationExactForGeneration(17) &&
+      !evidence.SolveExactForGeneration(17) &&
+      evidence.Record(dg::hdg::runtime::cuda_w8a::detail::
+                          CudaHypreSetupAction::mult) &&
+      evidence.SolveExactForGeneration(17) &&
+      !evidence.SolveExactForGeneration(18);
+}
+
+static_assert(DiagScaleSetupOrderPolicy(),
+              "diagonal scaling must be rebound for each matrix generation");
 static_assert(
     dg::hdg::runtime::cuda_w8a::detail::CudaIluLocalReordering(false) == 0 &&
     dg::hdg::runtime::cuda_w8a::detail::CudaIluLocalReordering(true) == 1,
@@ -84,6 +136,10 @@ bool CompactRange(const CudaStepEvidence& evidence,
 bool SetupValid(const CudaRunEvidence& setup, const int ranks) noexcept
 {
   return setup.status == CudaRunStatus::ready && setup.ranks == ranks &&
+      setup.tensor_core.trace_preconditioner_configured &&
+      setup.tensor_core.trace_preconditioner ==
+          CudaTracePreconditionerForEngine(
+              setup.tensor_core.selected_engine) &&
       setup.mfem_device_valid && setup.hypre_cuda_umpire_device &&
       setup.same_physical_gpu && setup.no_host_solver_fallback &&
       setup.reuse.persistent_graph && setup.reuse.persistent_slots &&

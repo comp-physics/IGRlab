@@ -37,6 +37,7 @@ RUN_TESTS=1
 TEST_REGEX=""
 RUN_SMOKE=0
 CALIPER=0
+NVTX_PROFILE=0
 HDG_EULER_EXPERIMENT="OFF"
 HDG_EULER_DEVICE_EXPERIMENT="OFF"
 HDG_RUNTIME="OFF"
@@ -151,6 +152,8 @@ Modes:
 
 Options:
   --caliper         Build the CPU-only Caliper observability profile.
+  --nvtx-profile    Compile GPU profiler binaries with runtime-default-off
+                    NVTX observability regions.
   --hdg-euler-experiment
                     Enable the CPU-only experimental HDG Euler path.
   --hdg-euler-device-experiment
@@ -193,6 +196,7 @@ while (($#)); do
     --cpu|--cpu-only) MODE="cpu" ;;
     --gpu) MODE="gpu" ;;
     --caliper) CALIPER=1 ;;
+    --nvtx-profile) NVTX_PROFILE=1 ;;
     --hdg-euler-experiment) HDG_EULER_EXPERIMENT="ON" ;;
     --hdg-euler-device-experiment) HDG_EULER_DEVICE_EXPERIMENT="ON" ;;
     --hdg-runtime) HDG_RUNTIME="ON" ;;
@@ -2288,6 +2292,10 @@ if [[ "${MODE}" == "gpu" && "${CALIPER}" == "1" ]]; then
   echo "ERROR: --caliper is only valid with --cpu-only." >&2
   exit 2
 fi
+if [[ "${MODE}" != "gpu" && "${NVTX_PROFILE}" == "1" ]]; then
+  echo "ERROR: --nvtx-profile is only valid with --gpu." >&2
+  exit 2
+fi
 if [[ "${MODE}" == "gpu" && -n "${CUDA_ARCHS+x}" ]]; then
   echo "ERROR: CUDA_ARCHS is ambiguous and is rejected in GPU mode." >&2
   echo "       Use MFEM_CUDA_ARCHS for MFEM and APP_CUDA_ARCHS for project sources." >&2
@@ -2370,7 +2378,7 @@ echo "[build-plan] mode=${MODE} profile=${PROFILE} dependency_cuda_arch=${DEPEND
 echo "[build-plan] output_root=${OUTPUT_ROOT} worktree_id=${WORKTREE_ID} scope=${OUTPUT_SCOPE}"
 echo "[build-plan] env=${SPACK_ENV} app_build=${APP_BUILD} app_install=${APP_INSTALL}"
 echo "[build-plan] temp_root=${TEMP_ROOT} temp_source=${TEMP_ROOT_SOURCE} temp_env=TMPDIR,TEMP,TMP"
-echo "[build-plan] hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT}"
+echo "[build-plan] hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT} nvtx_profile=${NVTX_PROFILE}"
 echo "[build-plan] mfem_source=${MFEM_SOURCE_ROOT} mfem_build=${MFEM_BUILD} mfem_install=${MFEM_INSTALL} mfem_tuple_state=${MFEM_TUPLE_STATE} mfem_reuse_state=${MFEM_REUSE_STATE}"
 if [[ "${MFEM_FRESH_FROM_SEED}" == "1" ]]; then
   echo "[build-plan] mfem_route=external-fresh-from-seed seed=${MFEM_FRESH_SEED_ROOT} target=${MFEM_FRESH_TARGET_ROOT}"
@@ -2460,7 +2468,18 @@ if ((CLEAN)); then
   rm -rf "${APP_BUILD}" "${APP_INSTALL}"
 fi
 
-echo "[build] configuring app (${MODE}, hdg_runtime=${HDG_RUNTIME}, hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT}, hdg_euler_experiment=${HDG_EULER_EXPERIMENT}, hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT})"
+APP_OBSERVABILITY="OFF"
+APP_OBSERVABILITY_NVTX="OFF"
+APP_OBSERVABILITY_CALIPER="OFF"
+if ((CALIPER)); then
+  APP_OBSERVABILITY="ON"
+  APP_OBSERVABILITY_CALIPER="ON"
+elif ((NVTX_PROFILE)); then
+  APP_OBSERVABILITY="ON"
+  APP_OBSERVABILITY_NVTX="ON"
+fi
+
+echo "[build] configuring app (${MODE}, hdg_runtime=${HDG_RUNTIME}, hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT}, hdg_euler_experiment=${HDG_EULER_EXPERIMENT}, hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT}, nvtx_profile=${NVTX_PROFILE})"
 app_cmake_args=(
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   -DCMAKE_CXX_COMPILER="${MPI_PREFIX}/bin/mpicxx"
@@ -2472,13 +2491,13 @@ app_cmake_args=(
   -DDG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT="${HDG_EULER_DEVICE_EXPERIMENT}"
   -DDG_IGR_ENABLE_HDG_RUNTIME="${HDG_RUNTIME}"
   -DDG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT="${HDG_AUXILIARY_EXPERIMENT}"
+  -DDG_IGR_ENABLE_OBSERVABILITY="${APP_OBSERVABILITY}"
+  -DDG_IGR_OBSERVABILITY_USE_NVTX="${APP_OBSERVABILITY_NVTX}"
+  -DDG_IGR_OBSERVABILITY_USE_CALIPER="${APP_OBSERVABILITY_CALIPER}"
 )
 if ((CALIPER)); then
   app_cmake_args+=(
     -DCMAKE_PREFIX_PATH="${SPACK_VIEW}"
-    -DDG_IGR_ENABLE_OBSERVABILITY=ON
-    -DDG_IGR_OBSERVABILITY_USE_NVTX=OFF
-    -DDG_IGR_OBSERVABILITY_USE_CALIPER=ON
   )
 fi
 if [[ "${MODE}" == "gpu" ]]; then
@@ -2552,4 +2571,4 @@ if ((RUN_SMOKE)); then
     "${smoke_exe}" "${smoke_args[@]}"
 fi
 
-echo "[build] complete: profile=${PROFILE} hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT} build=${APP_BUILD} install=${APP_INSTALL}"
+echo "[build] complete: profile=${PROFILE} hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT} nvtx_profile=${NVTX_PROFILE} build=${APP_BUILD} install=${APP_INSTALL}"

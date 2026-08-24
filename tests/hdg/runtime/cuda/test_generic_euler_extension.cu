@@ -68,11 +68,145 @@ struct CudaPreparedEulerConservationGateCapture
   bool prestage_allowed = false;
 };
 
+struct CudaPreparedLocalCondensationCapture
+{
+  int elements = 0;
+  int interior_dofs = 0;
+  int trace_dofs = 0;
+  std::uint64_t tensor_mma_tiles = 0;
+  std::vector<double> ordinary_schur{};
+  std::vector<double> ordinary_rhs{};
+  std::vector<double> tensor_schur{};
+  std::vector<double> tensor_rhs{};
+};
+
 // This accessor is defined only in the qualification translation unit.  The
 // production engine and generic facade grant it private friendship; its
 // detail-only launch helpers publish no runtime diagnostic API or state.
 struct CudaQualificationTestAccess
 {
+  template <typename Engine>
+  static bool VerifyPreparedCudaEngine(
+      Engine& engine, const generic::CudaEngineKind expected) noexcept
+  {
+    if (!engine.initialized_ || !engine.pending_.active ||
+        !engine.pending_.staging)
+      return false;
+    const auto& evidence = engine.pending_.evidence;
+    const auto& tensor = evidence.tensor_core;
+    return tensor.selected_engine == expected &&
+        tensor.trace_preconditioner_configured &&
+        tensor.trace_preconditioner ==
+            CudaTracePreconditionerForEngine(expected) &&
+        tensor.fallback_count == 0 && evidence.no_fallback &&
+        (expected == generic::CudaEngineKind::ordinary
+             ? tensor.condensation_launches == 0 && tensor.mma_tiles == 0
+             : tensor.hardware_supported &&
+                   tensor.condensation_launches > 0 && tensor.mma_tiles > 0);
+  }
+
+  static bool VerifyPreparedCudaEngine(
+      cuda::GenericEulerHdgCudaSession& session,
+      const generic::CudaEngineKind expected) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return VerifyPreparedCudaEngine(*session.borrowed_rank1_, expected);
+    if (session.borrowed_rank2_)
+      return VerifyPreparedCudaEngine(*session.borrowed_rank2_, expected);
+    return false;
+  }
+
+  // Compare the two production condensation leaves from one coherent
+  // prepared tensor candidate.  The relaunches reuse exactly the same
+  // element-local A/B/C/D/F/G products, so nonlinear trajectory differences
+  // cannot obscure Schur/RHS agreement.  The tensor result is restored before
+  // the ordinary prepared/commit qualification resumes.
+  template <typename Engine>
+  static bool CapturePreparedLocalCondensationPair(
+      Engine& engine,
+      CudaPreparedLocalCondensationCapture& capture) noexcept
+  {
+    capture = {};
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    bool local_valid = engine.initialized_ && engine.pending_.active &&
+        engine.pending_.staging && engine.pending_.numerical.success &&
+        engine.config_.cuda_engine == generic::CudaEngineKind::tensor_core &&
+        numerics.cuda_engine_ == generic::CudaEngineKind::tensor_core &&
+        shape.borrowed_host_inputs && shape.elements > 0 &&
+        shape.interior_dofs > 0 && shape.trace_dofs > 0 &&
+        numerics.view_.schur != nullptr &&
+        numerics.view_.condensed_rhs != nullptr &&
+        engine.pending_.evidence.tensor_core.selected_engine ==
+            generic::CudaEngineKind::tensor_core &&
+        engine.pending_.evidence.tensor_core.trace_preconditioner_configured &&
+        engine.pending_.evidence.tensor_core.trace_preconditioner ==
+            CudaTracePreconditionerKind::hypre_diag_scale &&
+        engine.pending_.evidence.tensor_core.fallback_count == 0 &&
+        engine.pending_.evidence.no_fallback;
+    const std::size_t schur_count = local_valid
+        ? static_cast<std::size_t>(shape.elements) * shape.trace_dofs *
+              shape.trace_dofs
+        : 0;
+    const std::size_t rhs_count = local_valid
+        ? static_cast<std::size_t>(shape.elements) * shape.trace_dofs
+        : 0;
+    try
+    {
+      capture.tensor_schur.resize(schur_count);
+      capture.ordinary_schur.resize(schur_count);
+      capture.tensor_rhs.resize(rhs_count);
+      capture.ordinary_rhs.resize(rhs_count);
+    }
+    catch (...) { local_valid = false; }
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    const auto copy_products = [&](std::vector<double>& schur,
+                                   std::vector<double>& rhs) noexcept
+    {
+      return CudaTransportPolicy::DeviceToHost(
+                 schur.data(), numerics.view_.schur,
+                 schur.size() * sizeof(double),
+                 CudaTransferCategory::generic_host_bridge,
+                 CudaTransferSite::generic_host_export) &&
+          CudaTransportPolicy::DeviceToHost(
+                 rhs.data(), numerics.view_.condensed_rhs,
+                 rhs.size() * sizeof(double),
+                 CudaTransferCategory::generic_host_bridge,
+                 CudaTransferSite::generic_host_export) &&
+          CudaTransportPolicy::Synchronize(
+              CudaTransferSite::generic_host_export);
+    };
+
+    const bool tensor_copied = numerics.CollectiveContinue(
+        copy_products(capture.tensor_schur, capture.tensor_rhs));
+
+    std::uint64_t ordinary_tiles = 0;
+    const bool ordinary_launched = numerics.CollectiveContinue(
+        CudaLaunchCondensation(
+            numerics.view_, shape, generic::CudaEngineKind::ordinary,
+            ordinary_tiles) &&
+        numerics.StatusPassed());
+    const bool ordinary_copied = ordinary_launched &&
+        numerics.CollectiveContinue(
+            copy_products(capture.ordinary_schur, capture.ordinary_rhs));
+
+    std::uint64_t restored_tensor_tiles = 0;
+    const bool tensor_restored = numerics.CollectiveContinue(
+        CudaLaunchCondensation(
+            numerics.view_, shape, generic::CudaEngineKind::tensor_core,
+            restored_tensor_tiles) &&
+        numerics.StatusPassed());
+
+    capture.elements = shape.elements;
+    capture.interior_dofs = shape.interior_dofs;
+    capture.trace_dofs = shape.trace_dofs;
+    capture.tensor_mma_tiles = restored_tensor_tiles;
+    return tensor_copied && ordinary_launched && ordinary_copied &&
+        tensor_restored && ordinary_tiles == 0 &&
+        restored_tensor_tiles > 0;
+  }
+
   template <typename Engine>
   static bool VerifyAssemblerJacobian(
       Engine& engine, const double relative_tolerance,
@@ -1226,6 +1360,7 @@ using dg::hdg::generic::BackendKind;
 using dg::hdg::generic::Capability;
 using dg::hdg::generic::CapabilityBit;
 using dg::hdg::generic::ContractStatus;
+using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::EulerBoundaryPolicy;
 using dg::hdg::generic::EulerBoundaryPolicyKind;
 using dg::hdg::generic::EulerHdgRequest;
@@ -1252,6 +1387,8 @@ using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedEulerConservationGateCapture;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedIgrConservationCapture;
+using dg::hdg::runtime::cuda_w8a::detail::
+    CudaPreparedLocalCondensationCapture;
 using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
 using dg::hdg::runtime::cuda_w8a::igr_trace_components;
 using dg::hdg::runtime::cuda_w8a::detail::qualification_density_gate;
@@ -1267,6 +1404,8 @@ constexpr std::uint32_t cuda_capabilities =
 constexpr std::uint32_t cpu_capabilities =
     (cuda_capabilities & ~CapabilityBit(Capability::cuda)) |
     CapabilityBit(Capability::cpu);
+
+CudaEngineKind selected_cuda_engine = CudaEngineKind::ordinary;
 
 bool All(const bool local, const MPI_Comm communicator = MPI_COMM_WORLD)
 {
@@ -1665,7 +1804,7 @@ EulerHdgRequest MakeRequest(
   request.mesh = &mesh;
   request.communicator = mesh.GetComm();
   request.polynomial_order = order;
-  request.backend = {BackendKind::cuda, 0};
+  request.backend = {BackendKind::cuda, 0, selected_cuda_engine};
   request.capabilities = cuda_capabilities;
   request.initial_state = {
       fields.initial.empty() ? nullptr : fields.initial.data(),
@@ -1700,6 +1839,7 @@ CudaConfig MakeDirectConfig(const EulerHdgRequest& request,
   config.order = order;
   config.mesh_n = 0;
   config.requested_device = 0;
+  config.cuda_engine = request.backend.cuda_engine;
   config.expected_rank_count = ranks;
   config.require_host_staged_rank2 = ranks == 2;
   config.use_borrowed_topology = true;
@@ -2339,6 +2479,92 @@ bool VerifyIndependentIgrConservation(
   return All(result.passed, request.communicator);
 }
 
+bool VerifyLocalCondensationAgreement(
+    const CudaPreparedLocalCondensationCapture& capture,
+    double& maximum_schur_scaled_error,
+    double& maximum_rhs_scaled_error,
+    double& maximum_trace_action_scaled_error) noexcept
+{
+  maximum_schur_scaled_error = std::numeric_limits<double>::infinity();
+  maximum_rhs_scaled_error = std::numeric_limits<double>::infinity();
+  maximum_trace_action_scaled_error =
+      std::numeric_limits<double>::infinity();
+  if (capture.elements <= 0 || capture.interior_dofs <= 0 ||
+      capture.trace_dofs <= 0 || capture.tensor_mma_tiles == 0 ||
+      capture.ordinary_schur.empty() || capture.ordinary_rhs.empty() ||
+      capture.ordinary_schur.size() != capture.tensor_schur.size() ||
+      capture.ordinary_rhs.size() != capture.tensor_rhs.size())
+    return false;
+
+  const auto maximum_scaled_error = [](const std::vector<double>& ordinary,
+                                       const std::vector<double>& tensor,
+                                       double& maximum) noexcept
+  {
+    maximum = 0.0;
+    for (std::size_t index = 0; index < ordinary.size(); ++index)
+    {
+      if (!std::isfinite(ordinary[index]) || !std::isfinite(tensor[index]))
+        return false;
+      const double scale = std::max(
+          {1.0, std::abs(ordinary[index]), std::abs(tensor[index])});
+      maximum = std::max(
+          maximum, std::abs(ordinary[index] - tensor[index]) / scale);
+    }
+    return true;
+  };
+  const bool finite = maximum_scaled_error(
+          capture.ordinary_schur, capture.tensor_schur,
+          maximum_schur_scaled_error) &&
+      maximum_scaled_error(
+          capture.ordinary_rhs, capture.tensor_rhs,
+          maximum_rhs_scaled_error);
+  bool action_finite = finite;
+  maximum_trace_action_scaled_error = 0.0;
+  const std::size_t trace_dofs =
+      static_cast<std::size_t>(capture.trace_dofs);
+  for (int element = 0; action_finite && element < capture.elements;
+       ++element)
+  {
+    const std::size_t matrix_offset =
+        static_cast<std::size_t>(element) * trace_dofs * trace_dofs;
+    for (std::size_t row = 0; row < trace_dofs; ++row)
+    {
+      double ordinary_action = 0.0;
+      double tensor_action = 0.0;
+      for (std::size_t column = 0; column < trace_dofs; ++column)
+      {
+        const double probe =
+            0.125 * static_cast<double>(static_cast<int>(column % 11) - 5) +
+            0.01 * static_cast<double>(element % 3);
+        const std::size_t index = matrix_offset + row * trace_dofs + column;
+        ordinary_action += capture.ordinary_schur[index] * probe;
+        tensor_action += capture.tensor_schur[index] * probe;
+      }
+      action_finite = action_finite && std::isfinite(ordinary_action) &&
+          std::isfinite(tensor_action);
+      const double scale = std::max(
+          {1.0, std::abs(ordinary_action), std::abs(tensor_action)});
+      maximum_trace_action_scaled_error = std::max(
+          maximum_trace_action_scaled_error,
+          std::abs(ordinary_action - tensor_action) / scale);
+    }
+  }
+  // Both leaves retain the same FP64 pivoted LU/triangular solve.  Their only
+  // ordering difference is the length-interior_dofs FP64 scalar reduction
+  // versus m8n8k4 MMA reduction.  The deterministic Schur-vector probe also
+  // qualifies the local true-trace action used by the global assembly; the
+  // lifecycle tests independently compare the assembled solve and true
+  // residual.  Use dimension-scaled roundoff envelopes for both reductions.
+  const double tolerance = 512.0 * std::numeric_limits<double>::epsilon() *
+      static_cast<double>(std::max(1, capture.interior_dofs));
+  const double action_tolerance = tolerance *
+      static_cast<double>(std::max(1, capture.trace_dofs));
+  return finite && action_finite &&
+      maximum_schur_scaled_error <= tolerance &&
+      maximum_rhs_scaled_error <= tolerance &&
+      maximum_trace_action_scaled_error <= action_tolerance;
+}
+
 template <typename Selection>
 bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
                                    const int ranks,
@@ -2416,6 +2642,34 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
   const bool prepared = engine->PrepareStep(false, dt, snapshot, step);
   const bool prepared_everywhere = All(prepared, request.communicator);
   if (!prepared_everywhere) return false;
+  CudaPreparedLocalCondensationCapture condensation_capture{};
+  double schur_scaled_error = 0.0;
+  double rhs_scaled_error = 0.0;
+  double trace_action_scaled_error = 0.0;
+  const bool condensation_pair =
+      config.cuda_engine != CudaEngineKind::tensor_core ||
+      (CudaQualificationTestAccess::CapturePreparedLocalCondensationPair(
+           *engine, condensation_capture) &&
+       VerifyLocalCondensationAgreement(
+           condensation_capture, schur_scaled_error, rhs_scaled_error,
+           trace_action_scaled_error));
+  const bool condensation_pair_everywhere = All(
+      condensation_pair, request.communicator);
+  if (!condensation_pair_everywhere)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+      std::cerr << "CUDA ordinary/tensor local condensation mismatch order="
+                << order << " regularization=" << (igr ? "igr" : "none")
+                << " schur_scaled_error=" << schur_scaled_error
+                << " rhs_scaled_error=" << rhs_scaled_error
+                << " trace_action_scaled_error="
+                << trace_action_scaled_error
+                << " tensor_mma_tiles="
+                << condensation_capture.tensor_mma_tiles << '\n';
+    return false;
+  }
   const bool work_accounting =
       CudaQualificationTestAccess::VerifyPreparedWorkAccounting(
           *engine, step, true, work_counts);
@@ -2474,6 +2728,7 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
                 << " jacobian=" << jacobian
                 << " coupling=" << coupled
                 << " prepared=" << prepared
+                << " condensation_pair=" << condensation_pair
                 << " work_accounting=" << work_accounting
                 << " committed_work_accounting="
                 << committed_work_accounting
@@ -3398,7 +3653,8 @@ bool CheckContractAdmission(const int order)
       RegularizationKind::none);
   if (ranks == 2 && rank == 0)
   {
-    crossed_backend.backend = {BackendKind::cpu, -1};
+    crossed_backend.backend = {
+        BackendKind::cpu, -1, CudaEngineKind::ordinary};
     crossed_backend.capabilities = cpu_capabilities;
   }
 
@@ -3429,7 +3685,7 @@ bool CheckContractAdmission(const int order)
       dg::hdg::generic::ValidateEulerHdgRequest(mismatched) !=
           ContractStatus::accepted;
   const bool crossed_backend_contract = ranks != 2 ||
-      dg::hdg::generic::ValidateEulerHdgRequest(crossed_backend) ==
+      dg::hdg::generic::ValidateEulerHdgRequest(crossed_backend) !=
           ContractStatus::accepted;
 
   // The public session repeats the generic contract before any device or
@@ -3588,6 +3844,10 @@ bool CheckLifecycle(const int order, const bool physical,
       first_prepared.status == HdgEulerSessionStatus::prepared,
       request.communicator);
   if (!first_prepared_everywhere) return false;
+  const bool first_engine_evidence =
+      CudaQualificationTestAccess::VerifyPreparedCudaEngine(
+          session, request.backend.cuda_engine);
+  if (!All(first_engine_evidence, request.communicator)) return false;
   bool first_transfer = false;
   const bool first_export = export_prepared(
       first_authority, first_output, first_candidate,
@@ -3638,6 +3898,10 @@ bool CheckLifecycle(const int order, const bool physical,
       retry_prepared.status == HdgEulerSessionStatus::prepared,
       request.communicator);
   if (!retry_prepared_everywhere) return false;
+  const bool retry_engine_evidence =
+      CudaQualificationTestAccess::VerifyPreparedCudaEngine(
+          session, request.backend.cuda_engine);
+  if (!All(retry_engine_evidence, request.communicator)) return false;
   bool retry_transfer = false;
   const bool retry_export = export_prepared(
       retry_authority, retry_output, retry_candidate,
@@ -3951,18 +4215,40 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
   return All(final_ready, request.communicator);
 }
 
-int ParseOrder(const int argc, char* argv[])
+struct Options
 {
-  if (argc != 3 || std::string(argv[1]) != "--order") return -1;
-  try
+  int order = -1;
+  CudaEngineKind engine = CudaEngineKind::ordinary;
+};
+
+bool ParseOptions(const int argc, char* argv[], Options& options)
+{
+  for (int index = 1; index < argc; ++index)
   {
-    const int order = std::stoi(argv[2]);
-    return order >= dg::hdg::generic::minimum_polynomial_order &&
-            order <= dg::hdg::generic::maximum_polynomial_order
-        ? order
-        : -1;
+    const std::string argument(argv[index]);
+    if (argument == "--order")
+    {
+      if (++index >= argc) return false;
+      try { options.order = std::stoi(argv[index]); }
+      catch (...) { return false; }
+      continue;
+    }
+    if (argument == "--engine")
+    {
+      if (++index >= argc) return false;
+      const std::string engine(argv[index]);
+      if (engine == "ordinary")
+        options.engine = CudaEngineKind::ordinary;
+      else if (engine == "tensor")
+        options.engine = CudaEngineKind::tensor_core;
+      else
+        return false;
+      continue;
+    }
+    return false;
   }
-  catch (...) { return -1; }
+  return options.order >= dg::hdg::generic::minimum_polynomial_order &&
+      options.order <= dg::hdg::generic::maximum_polynomial_order;
 }
 
 } // namespace
@@ -3974,7 +4260,17 @@ int main(int argc, char* argv[])
   int rank = -1;
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  const int order = ParseOrder(argc, argv);
+  Options options;
+  const bool options_ready = ParseOptions(argc, argv, options);
+  if (!options_ready)
+  {
+    if (rank == 0)
+      std::cerr << "Usage: " << argv[0]
+                << " --order 1|2|3 [--engine ordinary|tensor]\n";
+    return 2;
+  }
+  const int order = options.order;
+  selected_cuda_engine = options.engine;
   const bool admission = order > 0 && CheckContractAdmission(order);
   mfem::Device device("cuda");
   (void)device;
@@ -4064,6 +4360,9 @@ int main(int argc, char* argv[])
   {
     std::cerr << "generic CUDA Euler-extension qualification failed rank="
               << rank << " ranks=" << ranks << " order=" << order
+              << " engine="
+              << (selected_cuda_engine == CudaEngineKind::tensor_core
+                      ? "tensor" : "ordinary")
               << " admission=" << admission
               << " copied_initial_trace=" << copied_initial_trace
               << " all_seven_boundary_policies="

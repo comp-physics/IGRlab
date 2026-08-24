@@ -13,18 +13,61 @@
 #include <utility>
 #include <vector>
 
+namespace dg::hdg::runtime::cuda_w8a::detail
+{
+
+// Test-only friend access keeps engine-selection evidence attached to the
+// existing subcommunicator lifecycle instead of adding a production API.
+struct CudaQualificationTestAccess
+{
+  template <typename Engine>
+  static bool VerifyPreparedCudaEngine(
+      Engine& engine, const generic::CudaEngineKind expected) noexcept
+  {
+    if (!engine.initialized_ || !engine.pending_.active ||
+        !engine.pending_.staging)
+      return false;
+    const auto& evidence = engine.pending_.evidence;
+    const auto& tensor = evidence.tensor_core;
+    return tensor.selected_engine == expected &&
+        tensor.trace_preconditioner_configured &&
+        tensor.trace_preconditioner ==
+            CudaTracePreconditionerForEngine(expected) &&
+        tensor.fallback_count == 0 && evidence.no_fallback &&
+        (expected == generic::CudaEngineKind::ordinary
+             ? tensor.condensation_launches == 0 && tensor.mma_tiles == 0
+             : tensor.hardware_supported &&
+                   tensor.condensation_launches > 0 && tensor.mma_tiles > 0);
+  }
+
+  static bool VerifyPreparedCudaEngine(
+      cuda::GenericEulerHdgCudaSession& session,
+      const generic::CudaEngineKind expected) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return VerifyPreparedCudaEngine(*session.borrowed_rank1_, expected);
+    if (session.borrowed_rank2_)
+      return VerifyPreparedCudaEngine(*session.borrowed_rank2_, expected);
+    return false;
+  }
+};
+
+} // namespace dg::hdg::runtime::cuda_w8a::detail
+
 namespace
 {
 
 using dg::hdg::generic::BackendKind;
 using dg::hdg::generic::Capability;
 using dg::hdg::generic::CapabilityBit;
+using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::generic::HdgEulerSessionStatus;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
+using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
 
 constexpr int components = dg::hdg::generic::euler_2d_conserved_components;
 constexpr std::uint32_t cuda_capabilities =
@@ -126,13 +169,14 @@ BorrowedFields MakeFields(mfem::ParMesh& mesh)
 }
 
 EulerHdgRequest MakeRequest(const mfem::ParMesh& mesh,
-                            BorrowedFields& fields)
+                            BorrowedFields& fields,
+                            const CudaEngineKind engine)
 {
   EulerHdgRequest request{};
   request.mesh = &mesh;
   request.communicator = mesh.GetComm();
   request.polynomial_order = 1;
-  request.backend = {BackendKind::cuda, 0};
+  request.backend = {BackendKind::cuda, 0, engine};
   request.capabilities = cuda_capabilities;
   request.initial_state = {
       fields.initial.empty() ? nullptr : fields.initial.data(),
@@ -152,7 +196,8 @@ EulerHdgRequest MakeRequest(const mfem::ParMesh& mesh,
 }
 
 bool CheckActiveSubcommunicator(const MPI_Comm communicator,
-                                const int active_ranks)
+                                const int active_ranks,
+                                const CudaEngineKind engine)
 {
   int rank = -1;
   int ranks = 0;
@@ -165,7 +210,7 @@ bool CheckActiveSubcommunicator(const MPI_Comm communicator,
   mfem::ParMesh mesh(communicator, serial);
   BorrowedFields fields = MakeFields(mesh);
   if (!All(communicator, HYPRE_GetError() == 0)) return false;
-  EulerHdgRequest request = MakeRequest(mesh, fields);
+  EulerHdgRequest request = MakeRequest(mesh, fields, engine);
 
   if (ranks == 2)
   {
@@ -187,11 +232,48 @@ bool CheckActiveSubcommunicator(const MPI_Comm communicator,
   const bool prepared = session.Prepare(0.025, authority, output).status ==
       HdgEulerSessionStatus::prepared;
   if (!All(communicator, prepared)) return false;
+  const bool engine_evidence =
+      CudaQualificationTestAccess::VerifyPreparedCudaEngine(session, engine);
+  if (!All(communicator, engine_evidence)) return false;
   const bool acknowledged = session.AcknowledgePreparedOutput(authority, output);
   if (!All(communicator, acknowledged)) return false;
   const bool committed = session.Commit(std::move(authority), output).status ==
       HdgEulerSessionStatus::committed;
   return All(communicator, committed && session.coordinates().step == 1);
+}
+
+struct Options
+{
+  int active_ranks = 0;
+  CudaEngineKind engine = CudaEngineKind::ordinary;
+};
+
+bool ParseOptions(const int argc, char* argv[], Options& options) noexcept
+{
+  for (int index = 1; index < argc; ++index)
+  {
+    const std::string_view argument(argv[index]);
+    if (argument == "--active-ranks")
+    {
+      if (++index >= argc) return false;
+      options.active_ranks = std::atoi(argv[index]);
+      continue;
+    }
+    if (argument == "--engine")
+    {
+      if (++index >= argc) return false;
+      const std::string_view engine(argv[index]);
+      if (engine == "ordinary")
+        options.engine = CudaEngineKind::ordinary;
+      else if (engine == "tensor")
+        options.engine = CudaEngineKind::tensor_core;
+      else
+        return false;
+      continue;
+    }
+    return false;
+  }
+  return options.active_ranks == 1 || options.active_ranks == 2;
 }
 
 } // namespace
@@ -201,16 +283,16 @@ int main(int argc, char* argv[])
   mfem::MPI_Session mpi(argc, argv);
   mfem::Device device("cuda");
   (void)device;
-  int active_ranks = 0;
-  if (argc == 3 && std::string_view(argv[1]) == "--active-ranks")
-    active_ranks = std::atoi(argv[2]);
+  Options options{};
+  const bool options_ready = ParseOptions(argc, argv, options);
+  const int active_ranks = options.active_ranks;
 
   int world_rank = -1;
   int world_ranks = 0;
   const bool world_ready =
       MPI_Comm_rank(MPI_COMM_WORLD, &world_rank) == MPI_SUCCESS &&
       MPI_Comm_size(MPI_COMM_WORLD, &world_ranks) == MPI_SUCCESS;
-  bool local = world_ready && (active_ranks == 1 || active_ranks == 2) &&
+  bool local = options_ready && world_ready &&
       world_ranks == active_ranks + 1;
 
   MPI_Comm active = MPI_COMM_NULL;
@@ -222,7 +304,11 @@ int main(int argc, char* argv[])
   }
   if (local && active != MPI_COMM_NULL)
   {
-    try { local = CheckActiveSubcommunicator(active, active_ranks); }
+    try
+    {
+      local = CheckActiveSubcommunicator(
+          active, active_ranks, options.engine);
+    }
     catch (...) { local = false; }
   }
   if (active != MPI_COMM_NULL)

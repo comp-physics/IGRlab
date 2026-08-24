@@ -7,9 +7,24 @@ if(NOT DEFINED HDG_MAIN_EXECUTABLE OR
     "CUDA HDG executable, mesh, ranks, and MPI launcher are required.")
 endif()
 
+if(NOT DEFINED HDG_MAIN_CUDA_ENGINE)
+  set(HDG_MAIN_CUDA_ENGINE ordinary)
+endif()
+if(NOT HDG_MAIN_CUDA_ENGINE STREQUAL "ordinary" AND
+   NOT HDG_MAIN_CUDA_ENGINE STREQUAL "tensor")
+  message(FATAL_ERROR
+    "CUDA HDG engine must be ordinary or tensor, got '${HDG_MAIN_CUDA_ENGINE}'.")
+endif()
+if(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor")
+  set(_expected_trace_preconditioner hypre_diag_scale)
+else()
+  set(_expected_trace_preconditioner hypre_ilu0)
+endif()
+
 set(_base_arguments
   --discretization hdg
   --device cuda
+  --hdg-cuda-engine "${HDG_MAIN_CUDA_ENGINE}"
   --regularization igr
   --serial-refine 0
   --parallel-refine 0
@@ -40,7 +55,7 @@ function(run_cuda_igr_success order expected_alpha expected_beta)
   endif()
   if(NOT _status EQUAL 0 OR
      NOT _stdout MATCHES
-       "\\[hdg-main\\] status=Success.*regularization=igr.*alpha=${expected_alpha}.*beta=${expected_beta}" OR
+       "\\[hdg-main\\] status=Success.*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*trace_preconditioner=${_expected_trace_preconditioner}.*regularization=igr.*alpha=${expected_alpha}.*beta=${expected_beta}" OR
      NOT _stderr STREQUAL "")
     message(FATAL_ERROR
       "CUDA HDG p${order} IGR execution failed: ${_status}\n${_stdout}\n${_stderr}")

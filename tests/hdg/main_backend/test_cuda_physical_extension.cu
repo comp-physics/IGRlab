@@ -119,7 +119,8 @@ bool All(const bool local)
 }
 
 bool RunCase(const int order,
-             const dg::hdg::generic::RegularizationKind regularization)
+             const dg::hdg::generic::RegularizationKind regularization,
+             const dg::hdg::generic::CudaEngineKind cuda_engine)
 {
   dg_sim::CaseConfig case_config;
   case_config.case_name = "cuda_physical_extension";
@@ -133,6 +134,10 @@ bool RunCase(const int order,
   options.order = order;
   options.device = "cuda";
   options.discretization = "hdg";
+  options.hdg_cuda_engine = cuda_engine ==
+          dg::hdg::generic::CudaEngineKind::tensor_core
+      ? "tensor"
+      : "ordinary";
   options.regularization = regularization ==
           dg::hdg::generic::RegularizationKind::igr
       ? "igr"
@@ -155,6 +160,29 @@ bool RunCase(const int order,
   return dg_sim::hdg::RunEulerMainBackend(request) == 0;
 }
 
+bool ParseEngine(const int argc, char* argv[],
+                 dg::hdg::generic::CudaEngineKind& engine,
+                 bool& rank_mismatch)
+{
+  engine = dg::hdg::generic::CudaEngineKind::ordinary;
+  rank_mismatch = false;
+  if (argc == 1) return true;
+  if (argc == 2 && std::string(argv[1]) == "--rank-engine-mismatch")
+  {
+    rank_mismatch = true;
+    return true;
+  }
+  if (argc != 3 || std::string(argv[1]) != "--engine") return false;
+  const std::string value(argv[2]);
+  if (value == "ordinary") return true;
+  if (value == "tensor")
+  {
+    engine = dg::hdg::generic::CudaEngineKind::tensor_core;
+    return true;
+  }
+  return false;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -166,6 +194,26 @@ int main(int argc, char* argv[])
   int rank = -1;
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  dg::hdg::generic::CudaEngineKind cuda_engine =
+      dg::hdg::generic::CudaEngineKind::ordinary;
+  bool rank_engine_mismatch = false;
+  if (!ParseEngine(argc, argv, cuda_engine, rank_engine_mismatch))
+  {
+    if (rank == 0)
+      std::cerr << "Usage: " << argv[0]
+                << " [--engine ordinary|tensor] [--rank-engine-mismatch]\n";
+    return 2;
+  }
+  if (rank_engine_mismatch)
+  {
+    if (ranks != 2) return 2;
+    cuda_engine = rank == 0
+        ? dg::hdg::generic::CudaEngineKind::ordinary
+        : dg::hdg::generic::CudaEngineKind::tensor_core;
+    const bool rejected = !RunCase(
+        1, dg::hdg::generic::RegularizationKind::none, cuda_engine);
+    return All(rejected) ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
 
   bool conventional = true;
   bool igr = true;
@@ -175,10 +223,10 @@ int main(int argc, char* argv[])
     // Do not short-circuit collective runs after a prior failure: every rank
     // must enter the complete qualification matrix in the same order.
     const bool conventional_order = RunCase(
-        order, dg::hdg::generic::RegularizationKind::none);
+        order, dg::hdg::generic::RegularizationKind::none, cuda_engine);
     conventional = conventional && conventional_order;
     const bool igr_order = RunCase(
-        order, dg::hdg::generic::RegularizationKind::igr);
+        order, dg::hdg::generic::RegularizationKind::igr, cuda_engine);
     igr = igr && igr_order;
   }
   const bool passed = (ranks == 1 || ranks == 2) &&
@@ -187,6 +235,10 @@ int main(int argc, char* argv[])
   {
     std::cerr << "CUDA physical-boundary extension qualification failed rank="
               << rank << " ranks=" << ranks
+              << " engine="
+              << (cuda_engine == dg::hdg::generic::CudaEngineKind::tensor_core
+                      ? "tensor"
+                      : "ordinary")
               << " conventional=" << conventional << " igr=" << igr
               << '\n';
     return EXIT_FAILURE;

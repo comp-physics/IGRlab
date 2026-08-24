@@ -147,6 +147,7 @@ public:
     bool lowered = request.mesh != nullptr &&
         request.backend.kind == generic::BackendKind::cuda &&
         request.backend.device_ordinal >= 0 &&
+        generic::IsKnownCudaEngineKind(request.backend.cuda_engine) &&
         generic::HasCapabilities(
             request.capabilities,
             generic::RequiredCapabilities(request.backend)) &&
@@ -245,6 +246,7 @@ public:
     config.mesh_n = 0;
     config.dt = cuda_w8a::fixed_dt;
     config.requested_device = lowered ? request.backend.device_ordinal : -1;
+    config.cuda_engine = request.backend.cuda_engine;
     config.expected_rank_count = ranks;
     config.require_host_staged_rank2 = ranks == 2;
     config.use_borrowed_topology = true;
@@ -895,6 +897,7 @@ private:
     AppendConfigValue(local, cursor, complete, config.mesh_n);
     AppendConfigValue(local, cursor, complete, config.dt);
     AppendConfigValue(local, cursor, complete, config.requested_device);
+    AppendConfigValue(local, cursor, complete, config.cuda_engine);
     AppendConfigValue(local, cursor, complete, config.expected_rank_count);
     append_bool(config.require_host_staged_rank2);
     append_bool(config.use_borrowed_topology);
@@ -1155,6 +1158,7 @@ private:
     int borrowed_mesh = MPI_UNEQUAL;
     bool local = config.use_borrowed_topology && config.borrowed_mesh != nullptr &&
         config.borrowed_communicator != MPI_COMM_NULL &&
+        generic::IsKnownCudaEngineKind(config.cuda_engine) &&
         borrowed_data_abi &&
         initial_trace_abi && numerical_policy_abi &&
         boundary_policy_abi &&

@@ -8,6 +8,8 @@
 #include <umpire/ResourceManager.hpp>
 #include <umpire/Umpire.hpp>
 
+#include <mma.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -520,6 +522,8 @@ bool CudaTransportPolicy::HostToDevice(
     const std::size_t source_capacity,
     const std::size_t destination_capacity) noexcept
 {
+  [[maybe_unused]] ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_device_transfer);
   const bool trace_touch = true_system_diagnostic_active &&
       category == CudaTransferCategory::initial_state &&
       site == CudaTransferSite::initial_trace_upload;
@@ -551,6 +555,8 @@ bool CudaTransportPolicy::DeviceToHost(
     const std::size_t source_capacity,
     const std::size_t destination_capacity) noexcept
 {
+  [[maybe_unused]] ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_device_transfer);
   const bool true_structure_copy = true_system_diagnostic_active &&
       category == CudaTransferCategory::topology &&
       site == CudaTransferSite::map_upload;
@@ -573,6 +579,8 @@ bool CudaTransportPolicy::DeviceToDevice(
     const std::size_t source_capacity,
     const std::size_t destination_capacity) noexcept
 {
+  [[maybe_unused]] ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_device_transfer);
   const bool success = Copy(destination, source, bytes, cudaMemcpyDeviceToDevice);
   RecordTransfer(CudaTransferDirection::device_to_device, category, site,
                  source, destination, bytes, source_capacity,
@@ -586,6 +594,8 @@ bool CudaTransportPolicy::RecordMpiStaging(
     const void* destination, const std::size_t source_capacity,
     const std::size_t destination_capacity, const bool success) noexcept
 {
+  [[maybe_unused]] ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_device_transfer);
   const bool sparse_staging = true_system_diagnostic_active &&
       category == CudaTransferCategory::topology &&
       site == CudaTransferSite::map_upload;
@@ -603,6 +613,8 @@ bool CudaTransportPolicy::RecordMpiStaging(
 
 bool CudaTransportPolicy::Synchronize(const CudaTransferSite site) noexcept
 {
+  [[maybe_unused]] ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_synchronization);
   const bool true_system_sync = true_system_diagnostic_active &&
       (site == CudaTransferSite::map_upload ||
        site == CudaTransferSite::initial_trace_upload);
@@ -1001,6 +1013,46 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
   catch (...) { return false; }
 }
 
+bool CudaConfigurePersistentDiagonal(
+    mfem::HypreParMatrix& matrix, mfem::HypreDiagScale& diagonal,
+    mfem::HypreGMRES& gmres, const double relative_tolerance,
+    const int maximum_iterations, const int krylov_dimension,
+    const std::uint64_t matrix_generation,
+    CudaDiagScaleSetupOrderEvidence& evidence) noexcept
+{
+  CudaTrueSystemDiagnosticScope diagnostic("diagonal-configure",
+                                           matrix_generation);
+  evidence = {};
+  evidence.matrix_generation = matrix_generation;
+  try
+  {
+    gmres.SetPreconditioner(diagonal);
+    evidence.Record(CudaHypreSetupAction::bind_preconditioner);
+    gmres.SetOperator(matrix);
+    evidence.Record(CudaHypreSetupAction::set_operator);
+    gmres.SetPreconditioner(diagonal);
+    evidence.Record(CudaHypreSetupAction::rebind_preconditioner);
+    if (!(relative_tolerance > 0.0) ||
+        !std::isfinite(relative_tolerance) || maximum_iterations <= 0 ||
+        krylov_dimension <= 0)
+      return false;
+    gmres.SetTol(relative_tolerance);
+    gmres.SetAbsTol(0.0);
+    gmres.SetMaxIter(maximum_iterations);
+    gmres.SetKDim(krylov_dimension);
+    gmres.SetLogging(1);
+    gmres.SetPrintLevel(0);
+    gmres.SetZeroInitialIterate();
+    evidence.Record(CudaHypreSetupAction::gmres_settings);
+    const auto& configured_diagonal =
+        static_cast<const mfem::HypreDiagScale&>(diagonal);
+    diagnostic.result = configured_diagonal.GetData() == &matrix &&
+        evidence.ConfigurationExactForGeneration(matrix_generation);
+    return diagnostic.result;
+  }
+  catch (...) { return false; }
+}
+
 bool CudaHypreDevicePolicyValid(mfem::HypreParMatrix& matrix,
                                 mfem::HypreParVector& rhs,
                                 mfem::HypreParVector& solution) noexcept
@@ -1066,6 +1118,10 @@ bool CudaRefreshFactorAndSolve(
     diagnostics.configured_ilu0 =
         setup_order.SolveExactForGeneration(matrix_generation,
                                             local_reordering);
+    diagnostics.configured_preconditioner = diagnostics.configured_ilu0;
+    diagnostics.trace_preconditioner = diagnostics.configured_ilu0
+        ? CudaTracePreconditionerKind::hypre_ilu0
+        : CudaTracePreconditionerKind::unconfigured;
     gmres.GetNumIterations(diagnostics.iterations);
     gmres.GetFinalResidualNorm(diagnostics.reported_residual);
     diagnostics.finite = std::isfinite(diagnostics.reported_residual);
@@ -1075,6 +1131,64 @@ bool CudaRefreshFactorAndSolve(
     // from the requested tolerance.  Match the CPU lifecycle: admit a bounded
     // solve here and let the independently rebuilt original-system residual
     // remain the acceptance authority.  The report remains telemetry only.
+    diagnostic.result = CudaTraceSolveReadyForTrueResidualVerification(
+        diagnostics, maximum_iterations);
+    return diagnostic.result;
+  }
+  catch (...) { return false; }
+}
+
+bool CudaRefreshDiagonalAndSolve(
+    mfem::HypreParMatrix& matrix, mfem::HypreParVector& rhs,
+    mfem::HypreParVector& solution, mfem::HypreDiagScale& diagonal,
+    mfem::HypreGMRES& gmres, const MPI_Comm communicator,
+    const double relative_tolerance, const int maximum_iterations,
+    const int krylov_dimension, const std::uint64_t matrix_generation,
+    CudaSolveDiagnostics& diagnostics) noexcept
+{
+  CudaTrueSystemDiagnosticScope diagnostic("diagonal-solve",
+                                           matrix_generation);
+  diagnostics = {};
+  diagnostics.matrix_generation = matrix_generation;
+  CudaDiagScaleSetupOrderEvidence setup_order{};
+  bool policy_ready = false;
+  try
+  {
+    policy_ready = CudaHypreDevicePolicyValid(matrix, rhs, solution) &&
+        CudaConfigurePersistentDiagonal(
+            matrix, diagonal, gmres, relative_tolerance,
+            maximum_iterations, krylov_dimension, matrix_generation,
+            setup_order);
+  }
+  catch (...) { policy_ready = false; }
+  if (!AllRanksReady(policy_ready, communicator)) { return false; }
+  bool vectors_ready = false;
+  try
+  {
+    solution = 0.0;
+    solution.HypreReadWrite();
+    vectors_ready = true;
+  }
+  catch (...) { vectors_ready = false; }
+  if (!AllRanksReady(vectors_ready, communicator)) { return false; }
+  try
+  {
+    gmres.Mult(rhs, solution);
+    if (!setup_order.Record(CudaHypreSetupAction::mult)) { return false; }
+    diagnostics.device_policy =
+        CudaHypreDevicePolicyValid(matrix, rhs, solution);
+    diagnostics.configured_diagonal =
+        setup_order.SolveExactForGeneration(matrix_generation);
+    diagnostics.configured_preconditioner =
+        diagnostics.configured_diagonal;
+    diagnostics.trace_preconditioner = diagnostics.configured_diagonal
+        ? CudaTracePreconditionerKind::hypre_diag_scale
+        : CudaTracePreconditionerKind::unconfigured;
+    gmres.GetNumIterations(diagnostics.iterations);
+    gmres.GetFinalResidualNorm(diagnostics.reported_residual);
+    diagnostics.finite = std::isfinite(diagnostics.reported_residual);
+    diagnostics.reported_tolerance_met = diagnostics.finite &&
+        diagnostics.reported_residual <= relative_tolerance;
     diagnostic.result = CudaTraceSolveReadyForTrueResidualVerification(
         diagnostics, maximum_iterations);
     return diagnostic.result;
@@ -2305,6 +2419,171 @@ __global__ void BorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
   if(threadIdx.x==0)v.status[e]=1;
 }
 
+// The tensor leaf deliberately retains the ordinary FP64 pivoted LU and
+// triangular solves.  Only the material C*A^{-1}*[B f] product is tiled onto
+// FP64 tensor cores.  Per-warp shared tiles give every admitted p1-p3
+// conventional/IGR shape an aligned m8n8k4 operand, with explicit zero fill
+// for row, column, and inner-dimension tails.
+__global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  const int e=blockIdx.x;if(e>=s.elements)return;
+  const int ni=s.interior_dofs,nt=s.trace_dofs,cols=nt+1;
+  const std::size_t ao=static_cast<std::size_t>(e)*ni*ni;
+  const std::size_t bo=static_cast<std::size_t>(e)*ni*nt;
+  const std::size_t co=static_cast<std::size_t>(e)*nt*ni;
+  const std::size_t so=static_cast<std::size_t>(e)*nt*nt;
+  double* lu=v.lu+ao;double* pivots=v.pivots+e*ni;
+  double* w=v.solve_workspace+static_cast<std::size_t>(e)*ni*cols;
+  __shared__ double scale;
+  __shared__ int pivot_row;
+  __shared__ int failed;
+  __shared__ __align__(32) double tensor_a[4][8*4];
+  __shared__ __align__(32) double tensor_b[4][4*8];
+  __shared__ __align__(32) double tensor_product[4][8*8];
+  for(int i=threadIdx.x;i<ni*ni;i+=blockDim.x)lu[i]=v.a[ao+i];
+  for(int i=threadIdx.x;i<ni*cols;i+=blockDim.x)
+  {
+    const int row=i/cols,column=i-row*cols;
+    w[i]=column<nt?v.b[bo+row*nt+column]:v.f[e*ni+row];
+  }
+  __syncthreads();
+  if(threadIdx.x==0)
+  {
+    scale=0.0;failed=0;
+    for(int i=0;i<ni*ni;++i)scale=fmax(scale,fabs(lu[i]));
+  }
+  __syncthreads();
+  for(int column=0;column<ni;++column)
+  {
+    if(threadIdx.x==0)
+    {
+      pivot_row=column;
+      for(int row=column+1;row<ni;++row)
+        if(fabs(lu[row*ni+column])>fabs(lu[pivot_row*ni+column]))
+          pivot_row=row;
+      pivots[column]=pivot_row;
+      if(!(fabs(lu[pivot_row*ni+column])>
+            64.0*2.2204460492503131e-16*scale))failed=1;
+    }
+    __syncthreads();
+    if(failed){if(threadIdx.x==0)v.status[e]=-1;return;}
+    if(pivot_row!=column)
+      for(int entry=threadIdx.x;entry<ni;entry+=blockDim.x)
+      {
+        const double value=lu[column*ni+entry];
+        lu[column*ni+entry]=lu[pivot_row*ni+entry];
+        lu[pivot_row*ni+entry]=value;
+      }
+    __syncthreads();
+    for(int row=column+1+threadIdx.x;row<ni;row+=blockDim.x)
+      lu[row*ni+column]/=lu[column*ni+column];
+    __syncthreads();
+    const int trailing=ni-column-1;
+    for(int item=threadIdx.x;item<trailing*trailing;item+=blockDim.x)
+    {
+      const int row=column+1+item/trailing;
+      const int entry=column+1+item%trailing;
+      lu[row*ni+entry]-=lu[row*ni+column]*lu[column*ni+entry];
+    }
+    __syncthreads();
+  }
+  for(int row=0;row<ni;++row)
+  {
+    const int pivot=static_cast<int>(pivots[row]);
+    if(pivot!=row)
+      for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
+      {
+        const double value=w[row*cols+rhs];
+        w[row*cols+rhs]=w[pivot*cols+rhs];
+        w[pivot*cols+rhs]=value;
+      }
+    __syncthreads();
+  }
+  for(int column=0;column<ni;++column)
+  {
+    const int remaining=ni-column-1;
+    for(int item=threadIdx.x;item<remaining*cols;item+=blockDim.x)
+    {
+      const int row=column+1+item/cols,rhs=item%cols;
+      w[row*cols+rhs]-=lu[row*ni+column]*w[column*cols+rhs];
+    }
+    __syncthreads();
+  }
+  for(int row=ni-1;row>=0;--row)
+  {
+    for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
+    {
+      double value=w[row*cols+rhs];
+      for(int column=row+1;column<ni;++column)
+        value-=lu[row*ni+column]*w[column*cols+rhs];
+      w[row*cols+rhs]=value/lu[row*ni+row];
+    }
+    __syncthreads();
+  }
+
+  const int warp=threadIdx.x/warpSize,lane=threadIdx.x%warpSize;
+  const int row_tiles=(nt+7)/8,column_tiles=(cols+7)/8;
+  for(int tile=warp;tile<row_tiles*column_tiles;tile+=4)
+  {
+    const int row_base=(tile/column_tiles)*8;
+    const int column_base=(tile%column_tiles)*8;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator,8,8,4,double>
+        accumulator;
+    nvcuda::wmma::fill_fragment(accumulator,0.0);
+    for(int inner_base=0;inner_base<ni;inner_base+=4)
+    {
+      for(int item=lane;item<8*4;item+=warpSize)
+      {
+        const int local_row=item/4,local_inner=item%4;
+        const int row=row_base+local_row,inner=inner_base+local_inner;
+        tensor_a[warp][item]=row<nt&&inner<ni
+            ?v.c[co+row*ni+inner]:0.0;
+      }
+      for(int item=lane;item<4*8;item+=warpSize)
+      {
+        // Row-major B keeps each solved-workspace row coalesced.
+        const int local_inner=item/8,local_column=item%8;
+        const int column=column_base+local_column;
+        const int inner=inner_base+local_inner;
+        tensor_b[warp][item]=column<cols&&inner<ni
+            ?w[inner*cols+column]:0.0;
+      }
+      __syncwarp();
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,8,8,4,double,
+                            nvcuda::wmma::row_major> matrix_a;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
+                            nvcuda::wmma::row_major> matrix_b;
+      nvcuda::wmma::load_matrix_sync(matrix_a,tensor_a[warp],4);
+      nvcuda::wmma::load_matrix_sync(matrix_b,tensor_b[warp],8);
+      nvcuda::wmma::mma_sync(accumulator,matrix_a,matrix_b,accumulator);
+      __syncwarp();
+    }
+    nvcuda::wmma::store_matrix_sync(
+        tensor_product[warp],accumulator,8,nvcuda::wmma::mem_row_major);
+    __syncwarp();
+    for(int item=lane;item<8*8;item+=warpSize)
+    {
+      const int row=row_base+item/8,column=column_base+item%8;
+      if(row<nt&&column<cols)
+      {
+        const double product=tensor_product[warp][item];
+        if(column==nt)
+          v.condensed_rhs[e*nt+row]=v.g[e*nt+row]-product;
+        else
+          v.schur[so+row*nt+column]=
+              v.d[so+row*nt+column]-product;
+      }
+    }
+    __syncwarp();
+  }
+  __syncthreads();
+  if(threadIdx.x==0)v.status[e]=1;
+#else
+  if(threadIdx.x==0&&blockIdx.x<s.elements)v.status[blockIdx.x]=-2;
+#endif
+}
+
 __global__ void ZeroSystemKernel(CudaTrueMatrixDeviceView m,double* rhs,int n)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<m.diag_nonzeros)m.diag_values[i]=0;if(i<m.offd_nonzeros)m.offd_values[i]=0;if(i<n)rhs[i]=0;}
 
@@ -2960,8 +3239,46 @@ bool CudaLaunchFrozenBorrowedLlfAssembly(const CudaDeviceView& v,
   if(!s.borrowed_host_inputs||s.igr_active||s.elements<=0)return false;
   return LaunchBorrowedEulerStages(v,s,dt,true);
 }
-bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s) noexcept
-{if(s.borrowed_host_inputs)BorrowedCondenseKernel<<<s.elements,128>>>(v,s);else CondenseKernel<<<Blocks(s.elements),128>>>(v,s);return LaunchOk();}
+bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
+                            const generic::CudaEngineKind engine,
+                            std::uint64_t& tensor_mma_tiles) noexcept
+{
+  tensor_mma_tiles=0;
+  if(engine==generic::CudaEngineKind::ordinary)
+  {
+    if(s.borrowed_host_inputs)BorrowedCondenseKernel<<<s.elements,128>>>(v,s);
+    else CondenseKernel<<<Blocks(s.elements),128>>>(v,s);
+    return LaunchOk();
+  }
+  if(engine!=generic::CudaEngineKind::tensor_core||
+     !s.borrowed_host_inputs||s.elements<=0||s.interior_dofs<=0||
+     s.trace_dofs<=0||
+     s.interior_dofs>generic_maximum_interior_dofs_per_element||
+     s.trace_dofs>generic_maximum_trace_dofs_per_element)
+    return false;
+  const std::uint64_t row_tiles=
+      static_cast<std::uint64_t>((s.trace_dofs+7)/8);
+  const std::uint64_t column_tiles=
+      static_cast<std::uint64_t>((s.trace_dofs+1+7)/8);
+  const std::uint64_t inner_tiles=
+      static_cast<std::uint64_t>((s.interior_dofs+3)/4);
+  const std::uint64_t elements=static_cast<std::uint64_t>(s.elements);
+  if(column_tiles!=0&&
+     row_tiles>std::numeric_limits<std::uint64_t>::max()/column_tiles)
+    return false;
+  const std::uint64_t output_tiles=row_tiles*column_tiles;
+  if(inner_tiles!=0&&
+     output_tiles>std::numeric_limits<std::uint64_t>::max()/inner_tiles)
+    return false;
+  const std::uint64_t per_element=output_tiles*inner_tiles;
+  if(elements!=0&&
+     per_element>std::numeric_limits<std::uint64_t>::max()/elements)
+    return false;
+  TensorBorrowedCondenseKernel<<<s.elements,128>>>(v,s);
+  if(!LaunchOk())return false;
+  tensor_mma_tiles=per_element*elements;
+  return true;
+}
 bool CudaLaunchZeroTrueSystem(const CudaTrueMatrixDeviceView& m,double* rhs,int n) noexcept
 {const int count=std::max(std::max(m.diag_nonzeros,m.offd_nonzeros),n);ZeroSystemKernel<<<Blocks(count),128>>>(m,rhs,n);return LaunchOk();}
 bool CudaLaunchAssembleOwnedMatrix(const CudaDeviceView& v,const CudaTrueMatrixDeviceView& m,const CudaMeshShape& s) noexcept

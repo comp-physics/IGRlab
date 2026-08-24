@@ -285,6 +285,29 @@ inline bool CudaBorrowedHostModeConsensus(const MPI_Comm communicator,
   return consensus_ok;
 }
 
+inline bool CudaEngineKindConsensus(
+    const MPI_Comm communicator,
+    const generic::CudaEngineKind requested,
+    generic::CudaEngineKind& agreed_engine) noexcept
+{
+  if (communicator == MPI_COMM_NULL) return false;
+  const int local = static_cast<int>(requested);
+  int minimum = 0;
+  int maximum = 0;
+  const bool minimum_ready = MPI_Allreduce(&local, &minimum, 1, MPI_INT,
+      MPI_MIN, communicator) == MPI_SUCCESS;
+  const bool maximum_ready = MPI_Allreduce(&local, &maximum, 1, MPI_INT,
+      MPI_MAX, communicator) == MPI_SUCCESS;
+  const bool consensus_ok = minimum_ready && maximum_ready &&
+      minimum == maximum &&
+      generic::IsKnownCudaEngineKind(
+          static_cast<generic::CudaEngineKind>(minimum));
+  agreed_engine = consensus_ok
+      ? static_cast<generic::CudaEngineKind>(minimum)
+      : generic::CudaEngineKind::ordinary;
+  return consensus_ok;
+}
+
 inline bool IsCudaBorrowedGlobalTopologyIdentity(
     const StableIdentity& value) noexcept
 {
@@ -304,6 +327,7 @@ struct CudaConfig
   int mesh_n = elements_per_direction;
   double dt = fixed_dt;
   int requested_device = 0;
+  generic::CudaEngineKind cuda_engine = generic::CudaEngineKind::ordinary;
   int expected_rank_count = 1;
   bool require_host_staged_rank2 = false;
   // The generic CUDA topology path borrows these objects for the complete
@@ -469,7 +493,10 @@ struct CudaReuseEvidence
   std::uintptr_t double_arena_token = 0;
   std::uintptr_t integer_arena_token = 0;
   std::uintptr_t matrix_token = 0;
-  std::uintptr_t factor_token = 0;
+  // Identity of the selected persistent trace preconditioner.  Ordinary
+  // CUDA stores the HYPRE ILU handle; tensor CUDA stores its diagonal-scale
+  // object because that preconditioner has no separately allocated handle.
+  std::uintptr_t preconditioner_token = 0;
   std::uintptr_t workspace_token = 0;
   std::array<std::uintptr_t, 2> interior_slot_tokens{{0, 0}};
   std::array<std::uintptr_t, 2> trace_slot_tokens{{0, 0}};
@@ -523,6 +550,62 @@ struct CudaTransferLedgerRangeV1
   bool complete = false;
 };
 
+/** Exact trace-preconditioner policy selected behind the shared FP64 GMRES. */
+enum class CudaTracePreconditionerKind : std::uint8_t
+{
+  unconfigured = 0,
+  hypre_ilu0 = 1,
+  hypre_diag_scale = 2
+};
+
+constexpr CudaTracePreconditionerKind CudaTracePreconditionerForEngine(
+    const generic::CudaEngineKind engine) noexcept
+{
+  return engine == generic::CudaEngineKind::tensor_core
+      ? CudaTracePreconditionerKind::hypre_diag_scale
+      : CudaTracePreconditionerKind::hypre_ilu0;
+}
+
+constexpr const char* CudaTracePreconditionerName(
+    const CudaTracePreconditionerKind kind) noexcept
+{
+  switch (kind)
+  {
+  case CudaTracePreconditionerKind::hypre_ilu0:
+    return "hypre_ilu0";
+  case CudaTracePreconditionerKind::hypre_diag_scale:
+    return "hypre_diag_scale";
+  case CudaTracePreconditionerKind::unconfigured:
+    break;
+  }
+  return "unconfigured";
+}
+
+/** Production tensor-leaf selection and work census for one scope. */
+struct CudaTensorCoreEvidence
+{
+  generic::CudaEngineKind selected_engine =
+      generic::CudaEngineKind::ordinary;
+  CudaTracePreconditionerKind trace_preconditioner =
+      CudaTracePreconditionerKind::unconfigured;
+  std::uint64_t condensation_launches = 0;
+  std::uint64_t mma_tiles = 0;
+  std::uint64_t fallback_count = 0;
+  bool hardware_supported = false;
+  bool trace_preconditioner_configured = false;
+  bool fallback_accounting_complete = false;
+};
+
+/** Precision/correction work emitted by the numerical engine for one attempt. */
+struct CudaPrecisionWorkEvidence
+{
+  std::uint64_t iterative_refinement_steps = 0;
+  std::uint64_t residual_replacements = 0;
+  std::uint64_t precision_corrections = 0;
+  bool all_fp64_policy = false;
+  bool accounting_complete = false;
+};
+
 struct CudaStepEvidence
 {
   CudaRunStatus status = CudaRunStatus::ready;
@@ -536,6 +619,8 @@ struct CudaStepEvidence
   StateHash after_interior_hash{};
   StateHash after_trace_hash{};
   CudaProductEvidence products{};
+  CudaTensorCoreEvidence tensor_core{};
+  CudaPrecisionWorkEvidence precision_work{};
   CudaTransferTotals transfers{};
   CudaTransferLedgerRangeV1 transfer_range{};
   double initial_residual = std::numeric_limits<double>::infinity();
@@ -660,6 +745,9 @@ struct CudaRunEvidence
   int ranks = 0;
   int device = -1;
   std::array<unsigned char, 16> physical_gpu_uuid{};
+  // Initialization/admission evidence only. Per-attempt launch and MMA work
+  // is carried by CudaStepEvidence and is not accumulated into this record.
+  CudaTensorCoreEvidence tensor_core{};
   bool same_physical_gpu = false;
   bool mfem_device_valid = false;
   bool hypre_cuda_umpire_device = false;

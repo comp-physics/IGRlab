@@ -525,14 +525,11 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
         local_trace->Size() != shape_.local_trace_count)
       throw 0;
     *local_trace = 0.0;
-    std::vector<unsigned char> shared_faces(
-        static_cast<std::size_t>(mesh_->GetNumFaces()), 0);
-    for (int index = 0; index < mesh_->GetNSharedFaces(); ++index)
-    {
-      const int face = mesh_->GetSharedFace(index);
-      if (face < 0 || face >= static_cast<int>(shared_faces.size())) throw 0;
-      shared_faces[static_cast<std::size_t>(face)] = 1;
-    }
+    // The compatibility empty-trace route has the same public semantics as
+    // the CPU runtime: restrict the supplied committed interior state onto
+    // every trace face.  Boundary policies are residual closures, not an
+    // alternate initial-trace state.  Explicit supplied traces continue to
+    // bypass this projection above.
     for (int face = 0; face < mesh_->GetNumFaces(); ++face)
     {
       mfem::FaceElementTransformations* transformations =
@@ -555,21 +552,6 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
           trace_vdofs.Size() != shape_.trace_components *
               trace_element->GetDof())
         throw 0;
-      const int boundary_element = mesh_->GetFaceToBdrElMap()[face];
-      const bool physical_boundary = shape_.borrowed_static_boundary_policies &&
-          shared_faces[static_cast<std::size_t>(face)] == 0 &&
-          transformations->Elem2No < 0 && boundary_element >= 0;
-      const CudaStaticBoundaryPolicy* boundary_policy = nullptr;
-      if (physical_boundary)
-      {
-        const int attribute = mesh_->GetBdrAttribute(boundary_element);
-        for (std::size_t policy = 0;
-             policy < config.borrowed_boundary_policies.count; ++policy)
-          if (config.borrowed_boundary_policies.policies[policy].attribute == attribute)
-            boundary_policy = config.borrowed_boundary_policies.policies + policy;
-        if (boundary_policy == nullptr ||
-            !IsCudaAdmittedStaticBoundaryPolicy(boundary_policy->kind)) throw 0;
-      }
       mfem::Vector shape(interior_element->GetDof());
       const mfem::IntegrationRule& nodes = trace_element->GetNodes();
       for (int scalar = 0; scalar < trace_element->GetDof(); ++scalar)
@@ -594,31 +576,6 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
                 initial[static_cast<std::size_t>(dof)];
           }
         }
-        std::array<double, conserved_components> exterior = restricted;
-        if (physical_boundary)
-        {
-          mfem::Vector scaled_normal(dimension), position(dimension);
-          mfem::CalcOrtho(transformations->Face->Jacobian(), scaled_normal);
-          const double normal_norm = scaled_normal.Norml2();
-          if (!(normal_norm > 0.0) || !std::isfinite(normal_norm)) throw 0;
-          std::array<double, dimension> normal{{
-              scaled_normal[0] / normal_norm,
-              scaled_normal[1] / normal_norm}};
-          transformations->Face->Transform(point, position);
-          const generic::BoundaryPointView boundary_point{
-              position.HostRead(), normal.data(), dimension,
-              mesh_->GetBdrAttribute(boundary_element)};
-          const bool exterior_ready =
-              config.borrowed_boundary.exterior_state != nullptr
-              ? config.borrowed_boundary.exterior_state(
-                    config.borrowed_boundary.context, boundary_point,
-                    restricted.data(), exterior.data())
-              : CudaEvaluateStaticExteriorStateHost(
-                    *boundary_policy, restricted, normal,
-                    config.borrowed_boundary_policies.gamma, exterior);
-          if (!exterior_ready) throw 0;
-          if (!IsCudaPhysicalEulerState(exterior)) throw 0;
-        }
         for (int component = 0; component < shape_.trace_components; ++component)
         {
           double sign = 1.0;
@@ -626,7 +583,7 @@ InitializeBorrowedHostFields(const CudaConfig& config) noexcept
               scalar + trace_element->GetDof() * component], sign);
           if (dof < 0 || dof >= local_trace->Size()) { throw 0; }
           (*local_trace)[dof] = component < conserved_components
-              ? sign * exterior[static_cast<std::size_t>(component)] : 0.0;
+              ? sign * restricted[static_cast<std::size_t>(component)] : 0.0;
           local_trace_assigned[static_cast<std::size_t>(dof)] = 1;
         }
       }
@@ -1140,16 +1097,31 @@ BuildPersistentTrueSystem() noexcept
       hypre_rhs_.emplace(*true_matrix_);
       hypre_solution_.emplace(*true_matrix_);
       hypre_action_.emplace(*true_matrix_);
-      ilu_.emplace();
+      if (cuda_engine_ == generic::CudaEngineKind::ordinary)
+        ilu_.emplace();
+      else
+        diagonal_.emplace();
       gmres_.emplace(*true_matrix_);
-      CudaHypreSetupOrderEvidence initial_setup{};
-      local_objects_ready = CudaConfigurePersistentHypre(
-          *true_matrix_, *ilu_, *gmres_, ranks_,
-          CudaIluLocalReordering(shape_.igr_active),
-          linear_relative_tolerance_, maximum_linear_iterations_,
-          krylov_dimension_, 0, initial_setup) &&
-          initial_setup.ConfigurationExactForGeneration(
-              0, CudaIluLocalReordering(shape_.igr_active));
+      if (cuda_engine_ == generic::CudaEngineKind::ordinary)
+      {
+        CudaHypreSetupOrderEvidence initial_setup{};
+        local_objects_ready = CudaConfigurePersistentHypre(
+            *true_matrix_, *ilu_, *gmres_, ranks_,
+            CudaIluLocalReordering(shape_.igr_active),
+            linear_relative_tolerance_, maximum_linear_iterations_,
+            krylov_dimension_, 0, initial_setup) &&
+            initial_setup.ConfigurationExactForGeneration(
+                0, CudaIluLocalReordering(shape_.igr_active));
+      }
+      else
+      {
+        CudaDiagScaleSetupOrderEvidence initial_setup{};
+        local_objects_ready = CudaConfigurePersistentDiagonal(
+            *true_matrix_, *diagonal_, *gmres_,
+            linear_relative_tolerance_, maximum_linear_iterations_,
+            krylov_dimension_, 0, initial_setup) &&
+            initial_setup.ConfigurationExactForGeneration(0);
+      }
     }
     if (local_objects_ready)
     {
@@ -1202,14 +1174,20 @@ BuildPersistentTrueSystem() noexcept
   *hypre_rhs_ = 1.0;
   *hypre_solution_ = 0.0;
   CudaSolveDiagnostics warm{};
-  const bool warm_solved = CudaRefreshFactorAndSolve(
-      *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_, ranks_,
-      communicator_,
-      CudaIluLocalReordering(shape_.igr_active),
-      linear_relative_tolerance_, maximum_linear_iterations_,
-      krylov_dimension_, 0, warm);
+  const bool warm_solved =
+      cuda_engine_ == generic::CudaEngineKind::ordinary
+      ? CudaRefreshFactorAndSolve(
+            *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
+            ranks_, communicator_, CudaIluLocalReordering(shape_.igr_active),
+            linear_relative_tolerance_, maximum_linear_iterations_,
+            krylov_dimension_, 0, warm)
+      : CudaRefreshDiagonalAndSolve(
+            *true_matrix_, *hypre_rhs_, *hypre_solution_, *diagonal_,
+            *gmres_, communicator_, linear_relative_tolerance_,
+            maximum_linear_iterations_, krylov_dimension_, 0, warm);
   const bool warmed = warm_solved && warm.device_policy &&
-      warm.configured_ilu0 && warm.finite && warm.matrix_generation == 0;
+      warm.configured_preconditioner && warm.finite &&
+      warm.matrix_generation == 0;
   if (!CollectiveContinue(warmed)) { return false; }
 
   bool warm_state_zeroed = false;
@@ -1234,28 +1212,48 @@ BuildPersistentTrueSystem() noexcept
   ReportCudaWarmLifetimeMarker(
       rank_, "gmres-retirement", "after", !gmres_);
   ReportCudaWarmLifetimeMarker(
-      rank_, "ilu-retirement", "before", false);
+      rank_, "trace-preconditioner-retirement", "before", false);
   ilu_.reset();
+  diagonal_.reset();
+  trace_preconditioner_ = CudaTracePreconditionerKind::unconfigured;
   ReportCudaWarmLifetimeMarker(
-      rank_, "ilu-retirement", "after", !ilu_);
+      rank_, "trace-preconditioner-retirement", "after",
+      !ilu_ && !diagonal_);
 
   bool persistent_configured = false;
   ReportCudaWarmLifetimeMarker(
       rank_, "persistent-recreation-configuration", "before", false);
   try
   {
-    ilu_.emplace();
+    if (cuda_engine_ == generic::CudaEngineKind::ordinary)
+      ilu_.emplace();
+    else
+      diagonal_.emplace();
     gmres_.emplace(*true_matrix_);
-    CudaHypreSetupOrderEvidence persistent_setup{};
-    persistent_configured = CudaConfigurePersistentHypre(
-        *true_matrix_, *ilu_, *gmres_, ranks_,
-        CudaIluLocalReordering(shape_.igr_active),
-        linear_relative_tolerance_, maximum_linear_iterations_,
-        krylov_dimension_, 0, persistent_setup) &&
-        persistent_setup.ConfigurationExactForGeneration(
-            0, CudaIluLocalReordering(shape_.igr_active));
+    if (cuda_engine_ == generic::CudaEngineKind::ordinary)
+    {
+      CudaHypreSetupOrderEvidence persistent_setup{};
+      persistent_configured = CudaConfigurePersistentHypre(
+          *true_matrix_, *ilu_, *gmres_, ranks_,
+          CudaIluLocalReordering(shape_.igr_active),
+          linear_relative_tolerance_, maximum_linear_iterations_,
+          krylov_dimension_, 0, persistent_setup) &&
+          persistent_setup.ConfigurationExactForGeneration(
+              0, CudaIluLocalReordering(shape_.igr_active));
+    }
+    else
+    {
+      CudaDiagScaleSetupOrderEvidence persistent_setup{};
+      persistent_configured = CudaConfigurePersistentDiagonal(
+          *true_matrix_, *diagonal_, *gmres_, linear_relative_tolerance_,
+          maximum_linear_iterations_, krylov_dimension_, 0,
+          persistent_setup) &&
+          persistent_setup.ConfigurationExactForGeneration(0);
+    }
   }
   catch (...) { persistent_configured = false; }
+  if (persistent_configured)
+    trace_preconditioner_ = CudaTracePreconditionerForEngine(cuda_engine_);
   ReportCudaWarmLifetimeMarker(
       rank_, "persistent-recreation-configuration", "after",
       persistent_configured);
@@ -1584,6 +1582,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 StatusPassed() noexcept
 {
+  ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_reduction);
   if (!CudaLaunchStatusReduction(view_.status, shape_.elements,
                                  view_.status_flag))
     return false;
@@ -1601,6 +1601,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 DistributeCurrentTrace(const double* true_values) noexcept
 {
+  ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_packing);
   if (ranks_ == 1)
     return CollectiveContinue(CudaLaunchGatherLocalTrace(
         view_.signed_element_trace,
@@ -1645,6 +1647,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 DistributeTraceIncrement() noexcept
 {
+  ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_packing);
   const double* solution =
       static_cast<const mfem::Vector&>(*hypre_solution_).Read();
   if (ranks_ == 1)
@@ -1693,6 +1697,8 @@ bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 AssembleTrueVector(const double* element_values, double* true_values,
                    const bool completion_required) noexcept
 {
+  ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_trace_assembly);
   const bool local_gather = CudaLaunchAssembleOwnedVector(
       view_, shape_, element_values, true_values) &&
       CudaLaunchGatherRemoteVector(view_, shape_, element_values);
@@ -1744,6 +1750,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 AssembleTrueSystem() noexcept
 {
+  ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_trace_assembly);
   const bool local_gather = CudaLaunchZeroTrueSystem(
       true_device_, view_.true_rhs_scratch, shape_.true_trace_count) &&
       CudaLaunchAssembleOwnedMatrix(view_, true_device_, shape_) &&
@@ -1801,14 +1809,22 @@ SolveTrueSystem(double& true_relative_residual,
                 const std::uint64_t matrix_generation,
                 int& linear_iterations) noexcept
 {
+  ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_trace_solve);
   linear_iterations = 0;
   CudaSolveDiagnostics diagnostics{};
-  const bool local_solve = CudaRefreshFactorAndSolve(
-      *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
-          ranks_, communicator_, CudaIluLocalReordering(shape_.igr_active),
-          linear_relative_tolerance_,
-          maximum_linear_iterations_,
-          krylov_dimension_, matrix_generation, diagnostics) &&
+  const bool solved = cuda_engine_ == generic::CudaEngineKind::ordinary
+      ? CudaRefreshFactorAndSolve(
+            *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
+            ranks_, communicator_, CudaIluLocalReordering(shape_.igr_active),
+            linear_relative_tolerance_, maximum_linear_iterations_,
+            krylov_dimension_, matrix_generation, diagnostics)
+      : CudaRefreshDiagonalAndSolve(
+            *true_matrix_, *hypre_rhs_, *hypre_solution_, *diagonal_,
+            *gmres_, communicator_, linear_relative_tolerance_,
+            maximum_linear_iterations_, krylov_dimension_,
+            matrix_generation, diagnostics);
+  const bool local_solve = solved &&
       diagnostics.matrix_generation == matrix_generation &&
       CudaTraceSolveReadyForTrueResidualVerification(
           diagnostics, maximum_linear_iterations_);
@@ -1832,40 +1848,51 @@ bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 AssembleAndNorm(state_slot&, const double dt, double& norm) noexcept
 {
   TransportPolicy::SetPhase(CudaFailurePhase::assembly, current_generation_);
-  const bool local_assembly =
-      CudaLaunchAssembly(view_, shape_, dt) && StatusPassed();
+  bool assembly_launched = false;
+  {
+    ::dg_igr::NVTXRange profile_region(
+        ::dg_igr::observability::RegionId::hdg_local_assembly);
+    assembly_launched = CudaLaunchAssembly(view_, shape_, dt);
+  }
+  const bool local_assembly = assembly_launched && StatusPassed();
   if (!CollectiveContinue(local_assembly) ||
       !AssembleTrueVector(view_.residual_g, view_.true_residual, false))
     return false;
   // StatusPassed has consumed and synchronized every per-element assembly
   // status.  Later condensation/admissibility/assembly phases overwrite the
   // whole array before its next status use, so it is safe norm scratch here.
-  const bool norm_launched = CudaLaunchLocalSquaredNorm(
-      view_.residual_r, shape_.interior_count, view_.true_residual,
-      shape_.true_trace_count, view_.status, shape_.elements, view_.scalar);
-  if (!CollectiveContinue(norm_launched))
-    return false;
-  double local_squared = 0.0;
-  const bool scalar_ready = TransportPolicy::DeviceToHost(
-          &local_squared, view_.scalar, sizeof(double),
-          CudaTransferCategory::scalar_diagnostic,
-          CudaTransferSite::scalar_status) &&
-      TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
-  if (!CollectiveContinue(scalar_ready))
-    return false;
-  double global_squared = local_squared;
-  if (ranks_ > 1 && MPI_Allreduce(&local_squared, &global_squared, 1,
-                                  MPI_DOUBLE, MPI_SUM,
-                                  communicator_) != MPI_SUCCESS)
-    return false;
-  norm = std::sqrt(global_squared);
-  return std::isfinite(norm);
+  {
+    ::dg_igr::NVTXRange profile_region(
+        ::dg_igr::observability::RegionId::hdg_reduction);
+    const bool norm_launched = CudaLaunchLocalSquaredNorm(
+        view_.residual_r, shape_.interior_count, view_.true_residual,
+        shape_.true_trace_count, view_.status, shape_.elements, view_.scalar);
+    if (!CollectiveContinue(norm_launched))
+      return false;
+    double local_squared = 0.0;
+    const bool scalar_ready = TransportPolicy::DeviceToHost(
+            &local_squared, view_.scalar, sizeof(double),
+            CudaTransferCategory::scalar_diagnostic,
+            CudaTransferSite::scalar_status) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    if (!CollectiveContinue(scalar_ready))
+      return false;
+    double global_squared = local_squared;
+    if (ranks_ > 1 && MPI_Allreduce(&local_squared, &global_squared, 1,
+                                    MPI_DOUBLE, MPI_SUM,
+                                    communicator_) != MPI_SUCCESS)
+      return false;
+    norm = std::sqrt(global_squared);
+    return std::isfinite(norm);
+  }
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 CopyBase(state_slot& workspace) noexcept
 {
+  ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_packing);
   const bool interior = TransportPolicy::DeviceToDevice(
              view_.base_interior, workspace.interior.coefficients,
              workspace.interior.count * sizeof(double),
@@ -1889,6 +1916,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 RestoreBase(state_slot& workspace) noexcept
 {
+  ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_packing);
   const bool interior = TransportPolicy::DeviceToDevice(
       workspace.interior.coefficients, view_.base_interior,
       workspace.interior.count * sizeof(double),
@@ -1914,6 +1943,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 HashState(const double* values, const int count, StateHash& hash) noexcept
 {
+  ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_validation);
   if (!CudaLaunchHash(values, count, view_.hash_words))
     return false;
   std::array<std::uint64_t, 4> words{};
@@ -1931,6 +1962,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 UpdateStateHashes(state_slot& workspace) noexcept
 {
+  ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_validation);
   constexpr std::size_t words_per_hash = 4;
   std::array<std::uint64_t, 2 * words_per_hash> words{};
   const bool local_ready = CudaLaunchHashPair(

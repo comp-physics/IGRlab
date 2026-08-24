@@ -76,6 +76,13 @@ enum class DeviceBackend
   CUDA
 };
 
+/// @brief Explicit CUDA execution engine for the generic HDG lifecycle.
+enum class HdgCudaEngine
+{
+  Ordinary,
+  TensorCore
+};
+
 /// @brief Regularization selection for the Euler solver request.
 enum class Regularization
 {
@@ -132,9 +139,11 @@ enum class SolverRequestResolutionStatus
   InvalidDiscretization,
   InvalidDGBackend,
   InvalidDeviceBackend,
+  InvalidHdgCudaEngine,
   Conflict,
   InvalidRegularization,
   InvalidTimeIntegrator,
+  UnsupportedHdgCudaEngine,
   UnsupportedRegularization,
   UnsupportedTimeIntegrator
 };
@@ -147,6 +156,7 @@ struct SolverRequestResolution
     DiscretizationProvenance::CaseDefault;
   std::optional<DGBackend> dg_backend = DGBackend::DG;
   DeviceBackend device_backend = DeviceBackend::CPU;
+  HdgCudaEngine hdg_cuda_engine = HdgCudaEngine::Ordinary;
   Regularization regularization = Regularization::None;
   TimeIntegrator time_integrator = TimeIntegrator::RK3SSP;
   SolverRequestResolutionStatus status =
@@ -225,6 +235,7 @@ struct RunConfig
   DiscretizationProvenance discretization_provenance =
     DiscretizationProvenance::CaseDefault;
   DGBackend dg_backend = DGBackend::DG;
+  HdgCudaEngine hdg_cuda_engine = HdgCudaEngine::Ordinary;
   Regularization regularization = Regularization::IGR;
   TimeIntegrator time_integrator = TimeIntegrator::RK3SSP;
   DGSEMStabilization dgsem_stab = DGSEMStabilization::None;
@@ -733,12 +744,16 @@ SolverRequestResolutionStatusToString(SolverRequestResolutionStatus status)
     return "invalid-dg-backend";
   case SolverRequestResolutionStatus::InvalidDeviceBackend:
     return "invalid-device-backend";
+  case SolverRequestResolutionStatus::InvalidHdgCudaEngine:
+    return "invalid-hdg-cuda-engine";
   case SolverRequestResolutionStatus::Conflict:
     return "conflict";
   case SolverRequestResolutionStatus::InvalidRegularization:
     return "invalid-regularization";
   case SolverRequestResolutionStatus::InvalidTimeIntegrator:
     return "invalid-time-integrator";
+  case SolverRequestResolutionStatus::UnsupportedHdgCudaEngine:
+    return "unsupported-hdg-cuda-engine";
   case SolverRequestResolutionStatus::UnsupportedRegularization:
     return "unsupported-regularization";
   case SolverRequestResolutionStatus::UnsupportedTimeIntegrator:
@@ -857,6 +872,21 @@ TryParseDeviceBackend(const std::string& value)
   return std::nullopt;
 }
 
+inline std::optional<HdgCudaEngine>
+TryParseHdgCudaEngine(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "ordinary")
+  {
+    return HdgCudaEngine::Ordinary;
+  }
+  if (lower == "tensor")
+  {
+    return HdgCudaEngine::TensorCore;
+  }
+  return std::nullopt;
+}
+
 /// @brief Resolve every solver selector without constructing runtime state.
 inline SolverRequestResolution
 ResolveSolverRequest(const std::string& case_default_dg_backend,
@@ -869,7 +899,8 @@ ResolveSolverRequest(const std::string& case_default_dg_backend,
                      bool dg_backend_overridden,
                      bool regularization_overridden,
                      bool time_integrator_overridden,
-                     const std::string& device_value = "cpu")
+                     const std::string& device_value = "cpu",
+                     const std::string& hdg_cuda_engine_value = "ordinary")
 {
   SolverRequestResolution result;
   const DiscretizationResolution discretization =
@@ -903,6 +934,26 @@ ResolveSolverRequest(const std::string& case_default_dg_backend,
     return result;
   }
   result.device_backend = *device;
+
+  const std::optional<HdgCudaEngine> hdg_cuda_engine =
+    TryParseHdgCudaEngine(hdg_cuda_engine_value);
+  if (!hdg_cuda_engine)
+  {
+    result.status = SolverRequestResolutionStatus::InvalidHdgCudaEngine;
+    result.message = "Invalid HDG CUDA engine '" + hdg_cuda_engine_value +
+                     "'. Use 'ordinary' or 'tensor'.";
+    return result;
+  }
+  result.hdg_cuda_engine = *hdg_cuda_engine;
+  if (result.hdg_cuda_engine == HdgCudaEngine::TensorCore &&
+      (result.discretization != Discretization::HDG ||
+       result.device_backend != DeviceBackend::CUDA))
+  {
+    result.status = SolverRequestResolutionStatus::UnsupportedHdgCudaEngine;
+    result.message = "HDG CUDA engine 'tensor' requires '--discretization hdg "
+                     "--device cuda'.";
+    return result;
+  }
 
   result.regularization = case_default_use_igr ? Regularization::IGR
                                                 : Regularization::None;
@@ -968,6 +1019,19 @@ inline DeviceBackend ParseDeviceBackend(const std::string& value)
               "Invalid device backend '" << value
                                          << "'. Use 'cpu' or 'cuda'.");
   return DeviceBackend::CPU;
+}
+
+inline HdgCudaEngine ParseHdgCudaEngine(const std::string& value)
+{
+  if (const std::optional<HdgCudaEngine> engine =
+        TryParseHdgCudaEngine(value))
+  {
+    return *engine;
+  }
+  MFEM_VERIFY(false,
+              "Invalid HDG CUDA engine '"
+                << value << "'. Use 'ordinary' or 'tensor'.");
+  return HdgCudaEngine::Ordinary;
 }
 
 inline bool IsL2IGRSpaceName(const std::string& value)
@@ -1364,6 +1428,18 @@ inline const char* DeviceBackendToString(DeviceBackend backend)
   return "cpu";
 }
 
+inline const char* HdgCudaEngineToString(HdgCudaEngine engine)
+{
+  switch (engine)
+  {
+  case HdgCudaEngine::Ordinary:
+    return "ordinary";
+  case HdgCudaEngine::TensorCore:
+    return "tensor";
+  }
+  return "unknown";
+}
+
 inline std::string CaseDirFromFile(const char* file)
 {
   return std::filesystem::path(file).parent_path().string();
@@ -1583,6 +1659,7 @@ inline RunConfig MakeRunConfig(
   run_cfg.opts.zhang_shu_points = ZhangShuPointSetToString(zhang_shu_points);
   run_cfg.igr_opts = igr_opts;
   run_cfg.device_backend = ParseDeviceBackend(opts.device);
+  run_cfg.hdg_cuda_engine = ParseHdgCudaEngine(opts.hdg_cuda_engine);
   run_cfg.discretization = opts.discretization.empty()
                               ? DiscretizationForDGBackend(
                                   ParseDGBackend(opts.dg_backend))

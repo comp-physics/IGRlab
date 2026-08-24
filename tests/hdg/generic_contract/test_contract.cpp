@@ -15,6 +15,7 @@ using dg::hdg::generic::BackendKind;
 using dg::hdg::generic::Capability;
 using dg::hdg::generic::CapabilityBit;
 using dg::hdg::generic::ContractStatus;
+using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::EulerBoundaryPolicy;
 using dg::hdg::generic::EulerBoundaryPolicyKind;
 using dg::hdg::generic::EulerHdgRequest;
@@ -94,7 +95,7 @@ EulerHdgRequest ValidRequest(const mfem::ParMesh& mesh,
   request.mesh = &mesh;
   request.communicator = mesh.GetComm();
   request.polynomial_order = 2;
-  request.backend = {BackendKind::cpu, -1};
+  request.backend = {BackendKind::cpu, -1, CudaEngineKind::ordinary};
   request.capabilities = all_cpu_capabilities;
   request.initial_state = {initial.data(), initial.size(), 4};
   request.initial_true_trace = {initial.data(), initial.size(), 4};
@@ -129,7 +130,8 @@ bool CheckPODSurface()
 {
   return std::is_trivial<EulerHdgRequest>::value &&
       std::is_standard_layout<EulerHdgRequest>::value &&
-      !std::is_polymorphic<EulerHdgRequest>::value;
+      !std::is_polymorphic<EulerHdgRequest>::value &&
+      std::is_trivial<dg::hdg::generic::BackendSelection>::value;
 }
 
 bool CheckConservationNormalization()
@@ -177,18 +179,36 @@ bool CheckAcceptAndReject()
     return false;
   }
   request.capabilities = all_cuda_capabilities;
-  request.backend = {BackendKind::cuda, 0};
+  request.backend = {BackendKind::cuda, 0, CudaEngineKind::ordinary};
+  if (request.backend.cuda_engine != CudaEngineKind::ordinary ||
+      ValidateEulerHdgRequest(request) != ContractStatus::accepted)
+  {
+    return false;
+  }
+  request.backend.cuda_engine = CudaEngineKind::tensor_core;
   if (ValidateEulerHdgRequest(request) != ContractStatus::accepted)
   {
     return false;
   }
+  request.backend.cuda_engine = static_cast<CudaEngineKind>(255);
+  if (ValidateEulerHdgRequest(request) != ContractStatus::invalid_backend)
+  {
+    return false;
+  }
+  request.backend.cuda_engine = CudaEngineKind::ordinary;
   request.backend.device_ordinal = -1;
   if (ValidateEulerHdgRequest(request) != ContractStatus::invalid_backend)
   {
     return false;
   }
-  request.backend = {BackendKind::cpu, -1};
+  request.backend = {BackendKind::cpu, -1, CudaEngineKind::ordinary};
   request.capabilities = all_cpu_capabilities;
+  request.backend.cuda_engine = CudaEngineKind::tensor_core;
+  if (ValidateEulerHdgRequest(request) != ContractStatus::invalid_backend)
+  {
+    return false;
+  }
+  request.backend.cuda_engine = CudaEngineKind::ordinary;
   request.initial_state = {nullptr, initial.size(), 4};
   if (ValidateEulerHdgRequest(request) != ContractStatus::invalid_initial_state)
   {
@@ -452,10 +472,10 @@ bool CheckIgrSelectionAdmission()
   request.numerical_policy =
       dg::hdg::generic::DefaultEulerHdgNumericalPolicy(1);
   request.numerical_policy.stabilization = {RegularizationKind::igr, 0.25, 0.5};
-  request.backend = {BackendKind::cuda, 0};
+  request.backend = {BackendKind::cuda, 0, CudaEngineKind::ordinary};
   request.capabilities = all_cuda_capabilities;
   const ContractStatus cuda = ValidateEulerHdgRequest(request);
-  request.backend = {BackendKind::cpu, -1};
+  request.backend = {BackendKind::cpu, -1, CudaEngineKind::ordinary};
   request.capabilities = all_cpu_capabilities;
   int rank = 0, ranks = 0;
   MPI_Comm_rank(mesh.GetComm(), &rank);
@@ -522,6 +542,42 @@ bool CheckZeroOwnedElementAdmission()
   return has_empty_rank == 1 && status == ContractStatus::accepted &&
       minimum_status == static_cast<int>(ContractStatus::accepted) &&
       maximum_status == static_cast<int>(ContractStatus::accepted);
+}
+
+bool CheckCudaEngineCollectiveMismatch()
+{
+  int rank = 0;
+  int ranks = 0;
+  if (MPI_Comm_rank(MPI_COMM_WORLD, &rank) != MPI_SUCCESS ||
+      MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS)
+  {
+    return false;
+  }
+  mfem::ParMesh mesh =
+      MakeRankZeroOwnedParallelMesh(mfem::Element::QUADRILATERAL);
+  const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
+  EulerHdgRequest request = ValidRequest(mesh, initial);
+  if (mesh.GetNE() == 0)
+  {
+    request.initial_state = {nullptr, 0, 4};
+    request.initial_true_trace = {nullptr, 0, 4};
+  }
+  request.backend = {
+      BackendKind::cuda, 0,
+      rank == 0 ? CudaEngineKind::ordinary : CudaEngineKind::tensor_core};
+  request.capabilities = all_cuda_capabilities;
+  const ContractStatus status = ValidateEulerHdgRequest(request);
+  int minimum = static_cast<int>(status);
+  int maximum = minimum;
+  const int minimum_result = MPI_Allreduce(
+      MPI_IN_PLACE, &minimum, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+  const int maximum_result = MPI_Allreduce(
+      MPI_IN_PLACE, &maximum, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+  const ContractStatus expected = ranks == 1
+      ? ContractStatus::accepted
+      : ContractStatus::invalid_backend;
+  return status == expected && minimum_result == MPI_SUCCESS &&
+      maximum_result == MPI_SUCCESS && minimum == maximum;
 }
 
 bool CheckAsymmetricNullMeshConvergence()
@@ -665,13 +721,15 @@ int main(int argc, char* argv[])
   const bool mixed_boundary = CheckMixedBoundaryPolicyAdmission();
   const bool igr = CheckIgrSelectionAdmission();
   const bool empty = CheckZeroOwnedElementAdmission();
+  const bool cuda_engine_mismatch = CheckCudaEngineCollectiveMismatch();
   const bool physical_empty = CheckPhysicalPolicyWithZeroOwnedRank();
   const bool asymmetric_null = CheckAsymmetricNullMeshConvergence();
   const bool mismatch = CheckCollectiveFailureConvergence();
   const bool geometry = CheckCollectiveGeometryConvergence();
   ok = ok && conservation_normalization && basic && triangle && boundary &&
       boundary_mismatch &&
-      mixed_boundary && igr && empty && physical_empty && asymmetric_null &&
+      mixed_boundary && igr && empty && cuda_engine_mismatch &&
+      physical_empty && asymmetric_null &&
       mismatch && geometry;
   return ok ? 0 : 1;
 }

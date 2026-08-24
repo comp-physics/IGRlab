@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -31,6 +32,17 @@ def read_manifest(directory: Path) -> dict:
     return json.loads((directory / "profile-manifest.json").read_text(encoding="utf-8"))
 
 
+def git(root: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return result.stdout.strip()
+
+
 def common(app: Path, output: Path) -> list[str]:
     return ["--scenario", "generic-case", "--exe", str(app), "--out-dir", str(output), "--arg=--input", "--arg", "case.yaml"]
 
@@ -51,6 +63,409 @@ def main() -> int:
         assert l0_manifest["source_dirty_state"]["status"] == "available"
         assert l0_manifest["identity"]["executable"]["bytes"] == app.stat().st_size
         assert len(l0_manifest["identity"]["executable"]["sha256"]) == 64
+        exact_source = root / "exact-source"
+        exact_source.mkdir()
+        git(exact_source, "init")
+        git(exact_source, "config", "user.name", "Profile Harness Test")
+        git(exact_source, "config", "user.email", "profile-harness@example.invalid")
+        exact_app = exact_source / "app"
+        executable(exact_app, "print('exact app')\n")
+        build_manifest = exact_source / "CMakeCache.txt"
+        build_manifest.write_text("CMAKE_BUILD_TYPE:STRING=Release\n", encoding="utf-8")
+        git(exact_source, "add", "app", "CMakeCache.txt")
+        git(exact_source, "commit", "-m", "exact fixture")
+        exact_commit = git(exact_source, "rev-parse", "HEAD")
+        exact_tree = git(exact_source, "rev-parse", "HEAD^{tree}")
+        exact_out = root / "exact"
+        run("--level", "l0", *common(exact_app, exact_out),
+            "--source-root", str(exact_source),
+            "--expected-commit", exact_commit, "--expected-tree", exact_tree,
+            "--require-clean-source", "--build-manifest", str(build_manifest))
+        exact_identity = read_manifest(exact_out)["identity"]
+        assert exact_identity["source_binding"]["expected_commit"] == exact_commit
+        assert exact_identity["source_binding"]["expected_tree"] == exact_tree
+        assert exact_identity["source_binding"]["clean_source_required"] is True
+        assert exact_identity["source_binding"]["source"]["status"]["value"] == "clean"
+        assert exact_identity["build_manifest"]["path"] == str(build_manifest)
+        assert len(exact_identity["build_manifest"]["sha256"]) == 64
+        mismatch_out = root / "exact-mismatch"
+        run("--level", "l0", *common(exact_app, mismatch_out),
+            "--source-root", str(exact_source), "--expected-commit", "0" * 40,
+            "--expected-tree", exact_tree, "--require-clean-source",
+            "--build-manifest", str(build_manifest), expected=6)
+        mismatch_manifest = read_manifest(mismatch_out)
+        assert mismatch_manifest["outcome"] == "validation_failure"
+        assert "source revision mismatch" in mismatch_manifest["detail"]
+
+        qualification_source = root / "qualification-source"
+        qualification_source.mkdir()
+        git(qualification_source, "init")
+        git(qualification_source, "config", "user.name", "Profile Harness Test")
+        git(
+            qualification_source, "config", "user.email",
+            "profile-harness@example.invalid",
+        )
+        (qualification_source / "tpl/mfem").mkdir(parents=True)
+        (qualification_source / "tpl/mfem/pin.txt").write_text(
+            "fixture\n", encoding="utf-8"
+        )
+        qualification_build = qualification_source / "build"
+        qualification_build.mkdir()
+        qualification_app = (
+            qualification_build /
+            "dg_igr_hdg_runtime_cuda_accepted_step_benchmark"
+        )
+        executable(qualification_app, "print('qualification benchmark')\n")
+        qualification_cache = qualification_build / "CMakeCache.txt"
+        qualification_cache.write_text(
+            "\n".join((
+                "CMAKE_BUILD_TYPE:STRING=Release",
+                "CMAKE_CUDA_ARCHITECTURES:STRING=120",
+                "CMAKE_CUDA_COMPILER:FILEPATH=/opt/cuda/bin/nvcc",
+                "CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/g++",
+                "MFEM_DIR:PATH=/opt/mfem/lib/cmake/mfem",
+                "DG_IGR_ENABLE_HDG_RUNTIME:BOOL=ON",
+                "DG_IGR_ENABLE_OBSERVABILITY:BOOL=ON",
+                "DG_IGR_OBSERVABILITY_USE_NVTX:BOOL=ON",
+                f"CMAKE_HOME_DIRECTORY:INTERNAL={qualification_source}",
+                "",
+            )),
+            encoding="utf-8",
+        )
+        qualification_mfem = (
+            qualification_build / "dg-igr-mfem-identity-v1.txt"
+        )
+        qualification_mfem.write_text(
+            "\n".join((
+                "schema=dg-igr-mfem-identity",
+                "version=1",
+                "mfem_pin=fixture-pin",
+                f"source_root={qualification_source / 'tpl/mfem'}",
+                "install_root=/opt/mfem",
+                "mode=gpu",
+                "profile=cuda-sm120",
+                "build_type=Release",
+                "compiler=gcc@14.2.0",
+                "hypre_spec=hypre@2.32.0+cuda cuda_arch=120",
+                "dependency_cuda_arch=120",
+                "mfem_cuda_archs=80-virtual",
+                "",
+            )),
+            encoding="utf-8",
+        )
+        git(qualification_source, "add", ".")
+        git(qualification_source, "commit", "-m", "qualification fixture")
+        qualification_commit = git(qualification_source, "rev-parse", "HEAD")
+        qualification_tree = git(
+            qualification_source, "rev-parse", "HEAD^{tree}"
+        )
+
+        qualification_tools = root / "qualification-tools"
+        qualification_tools.mkdir()
+        fake_ncu = qualification_tools / "ncu"
+        profiler_version = (
+            "NVIDIA (R) Nsight Compute Command Line Profiler\nVersion 2026.1"
+        )
+        executable(
+            fake_ncu,
+            """import os
+import pathlib
+import sys
+
+arguments = sys.argv[1:]
+if arguments == ["--version"]:
+    print("NVIDIA (R) Nsight Compute Command Line Profiler")
+    print("Version 2026.1")
+elif "--import" in arguments:
+    if os.environ.get("FAKE_NCU_ATTRIBUTION"):
+        print('"ID","Kernel Name","NVTX Push/Pop_Range","gpu__time_duration.avg"')
+        print('"","","","nsecond"')
+        categories = [
+            ("BorrowedEulerVolumeKernel", "local-assembly", 8000),
+            ("TensorBorrowedCondenseKernel", "condensation", 2000),
+            ("OwnedMatrixKernel", "trace-assembly", 500),
+            ("hypreGPUKernel_DiagScaleVector", "trace-solve", 700),
+            ("BorrowedRecoverKernel", "interior-recovery", 400),
+            ("SquaredNormKernel", "reduction", 100),
+            ("AdmissibilityKernel", "validation", 100),
+            ("GatherKernel", "packing", 50),
+            ("TrialKernel", "nonlinear-update", 50),
+        ]
+        if os.environ.get("FAKE_NCU_MISSING_CATEGORY"):
+            categories = categories[:-1]
+        for launch, (kernel, category, duration) in enumerate(categories):
+            ranges = ("HDG/profiled-accepted-step HDG/accepted-step "
+                      f"HDG/{category}")
+            print(f'"{launch}","void {kernel}()","{ranges}","{duration}"')
+    else:
+        print('"ID","Kernel Name","sm__inst_executed_pipe_fp64_op_dmma.sum","gpu__time_duration.avg"')
+        print('"","","inst","nsecond"')
+        value = "0" if os.environ.get("FAKE_NCU_ZERO") else "6048"
+        for launch in range(3):
+            print(f'"{launch}","void TensorBorrowedCondenseKernel<double>()","{value}","226912"')
+else:
+    stem = pathlib.Path(arguments[arguments.index("--export") + 1])
+    payload = (b"not-a-native-report" if os.environ.get("FAKE_NCU_BAD_REPORT")
+               else b"NVR\\x00synthetic-native-report")
+    stem.with_suffix(".ncu-rep").write_bytes(payload)
+""",
+        )
+        fake_nvidia_smi = qualification_tools / "nvidia-smi"
+        executable(
+            fake_nvidia_smi,
+            "print('0, GPU-QUALIFICATION, NVIDIA RTX PRO, 999.1, 12.0')\n",
+        )
+        fake_qualification_nsys = qualification_tools / "nsys"
+        nsys_profiler_version = "NVIDIA Nsight Systems version 2026.1"
+        executable(
+            fake_qualification_nsys,
+            """import pathlib
+import sys
+
+arguments = sys.argv[1:]
+if arguments == ["--version"]:
+    print("NVIDIA Nsight Systems version 2026.1")
+else:
+    stem = pathlib.Path(arguments[arguments.index("--output") + 1])
+    stem.with_suffix(".nsys-rep").write_bytes(
+        b"NVIDIA Tegra Profiler Report synthetic"
+    )
+""",
+        )
+
+        def qualification_arguments(
+                output: Path,
+                kind: str = "tensor-instructions") -> list[str]:
+            application = [
+                "--arg=--mode", "--arg", "igr",
+                "--arg=--engine", "--arg", "tensor",
+                "--arg=--order", "--arg", "3",
+                "--arg=--mesh-n", "--arg", "52",
+                "--arg=--domain-periods", "--arg", "1",
+                "--arg=--dt", "--arg", "1e-5",
+                "--arg=--profile-measured-step", "--arg", "2",
+                "--arg=--no-export",
+                "--arg=--expected-source-revision", "--arg",
+                qualification_commit,
+                "--arg=--expected-source-tree", "--arg", qualification_tree,
+                "--arg=--expected-source-status", "--arg", "clean",
+                "--arg=--expected-build-directory", "--arg",
+                str(qualification_build.resolve()),
+                "--arg=--expected-cmake-cache", "--arg",
+                str(qualification_cache.resolve()),
+            ]
+            ncu_arguments = (
+                [
+                    "--ncu-metric",
+                    "sm__inst_executed_pipe_fp64_op_dmma.sum",
+                    "--ncu-metric", "gpu__time_duration.avg",
+                    "--ncu-kernel-name-base", "demangled",
+                    "--ncu-kernel-name",
+                    "regex:.*TensorBorrowedCondenseKernel.*",
+                    "--ncu-launch-count", "3",
+                    "--ncu-nvtx-include", "HDG\\/condensation/",
+                ]
+                if kind == "tensor-instructions" else
+                [
+                    "--ncu-metric", "gpu__time_duration.avg",
+                    "--ncu-kernel-name-base", "demangled",
+                    "--ncu-launch-count", "20",
+                    "--ncu-nvtx-include",
+                    "HDG\\/profiled-accepted-step/",
+                ]
+            )
+            return [
+                "--level", "l2-ncu", "--evidence-mode", "qualification",
+                "--scenario", f"igr-p3-{kind}",
+                "--exe", str(qualification_app), "--out-dir", str(output),
+                "--source-root", str(qualification_source),
+                "--expected-commit", qualification_commit,
+                "--expected-tree", qualification_tree,
+                "--require-clean-source",
+                "--build-manifest", str(qualification_cache),
+                "--mfem-identity", str(qualification_mfem),
+                "--gpu-identity", "GPU-QUALIFICATION", "--gpu-index", "0",
+                "--nvidia-smi-executable", str(fake_nvidia_smi),
+                "--environment", "CUDA_VISIBLE_DEVICES",
+                "--tool-executable", str(fake_ncu),
+                "--tool-version", profiler_version,
+                "--ncu-target-processes", "application-only",
+                "--ncu-qualification-kind", kind,
+                *ncu_arguments,
+                "--require-data", "report=capture.ncu-rep",
+                *application,
+            ]
+
+        qualification_env = {
+            **os.environ, "CUDA_VISIBLE_DEVICES": "0",
+        }
+        qualification_out = root / "qualification"
+        run(*qualification_arguments(qualification_out), env=qualification_env)
+        qualification_manifest = read_manifest(qualification_out)
+        assert qualification_manifest["outcome"] == "success"
+        assert qualification_manifest["evidence_mode"] == "qualification"
+        proof = qualification_manifest["qualification"][
+            "tensor_instruction_proof"
+        ]
+        assert proof["status"] == "positive_tensor_instruction_proof"
+        assert proof["matched_launches"] == 3
+        assert proof["dmma_instruction_total"] == 18144.0
+        assert proof["dmma_instruction_minimum"] == 6048.0
+        bound = qualification_manifest["identity"]["qualification"]
+        assert bound["gpu"]["uuid"] == "GPU-QUALIFICATION"
+        assert bound["gpu"]["compute_capability"] == "12.0"
+        assert bound["profiler"]["version"] == profiler_version
+        assert len(bound["profiler"]["executable"]["sha256"]) == 64
+        assert bound["build"]["validated_cmake_values"][
+            "DG_IGR_OBSERVABILITY_USE_NVTX"
+        ] == "ON"
+        proof_artifact = next(
+            item for item in qualification_manifest["artifacts"]
+            if item["path"] == "ncu-tensor-proof.csv"
+        )
+        assert "--import" in proof_artifact["generating_command"]
+
+        attribution_out = root / "qualification-attribution"
+        run(
+            *qualification_arguments(
+                attribution_out, "accepted-step-attribution"
+            ),
+            env={**qualification_env, "FAKE_NCU_ATTRIBUTION": "1"},
+        )
+        attribution_manifest = read_manifest(attribution_out)
+        attribution = attribution_manifest["qualification"][
+            "accepted_step_attribution"
+        ]
+        assert attribution["status"] == \
+            "positive_accepted_step_attribution"
+        assert attribution["matched_launches"] == 9
+        assert attribution["total_gpu_kernel_duration_ns"] == 11900.0
+        assert attribution["tensor_condensation"]["duration_ns"] == 2000.0
+        assert math.isclose(
+            attribution["tensor_condensation"][
+                "fraction_of_gpu_kernel_duration"
+            ],
+            2000.0 / 11900.0,
+        )
+        assert set(attribution["required_categories"]) <= {
+            item["category"] for item in attribution["categories"]
+            if item["launches"] > 0
+        }
+        attribution_artifact = next(
+            item for item in attribution_manifest["artifacts"]
+            if item["path"] == "ncu-accepted-step-attribution.csv"
+        )
+        assert "--import" in attribution_artifact["generating_command"]
+
+        missing_category_out = root / "qualification-attribution-missing"
+        run(
+            *qualification_arguments(
+                missing_category_out, "accepted-step-attribution"
+            ),
+            expected=6,
+            env={
+                **qualification_env,
+                "FAKE_NCU_ATTRIBUTION": "1",
+                "FAKE_NCU_MISSING_CATEGORY": "1",
+            },
+        )
+        missing_category_manifest = read_manifest(missing_category_out)
+        assert missing_category_manifest["outcome"] == "validation_failure"
+        assert "missing material accepted-step categories" in \
+            missing_category_manifest["detail"]
+
+        nsys_application = [
+            "--arg=--mode", "--arg", "conventional",
+            "--arg=--engine", "--arg", "tensor",
+            "--arg=--order", "--arg", "2",
+            "--arg=--mesh-n", "--arg", "52",
+            "--arg=--domain-periods", "--arg", "1",
+            "--arg=--dt", "--arg", "1e-5",
+            "--arg=--profile-measured-step", "--arg", "2",
+            "--arg=--no-export",
+            "--arg=--expected-source-revision", "--arg",
+            qualification_commit,
+            "--arg=--expected-source-tree", "--arg", qualification_tree,
+            "--arg=--expected-source-status", "--arg", "clean",
+            "--arg=--expected-build-directory", "--arg",
+            str(qualification_build.resolve()),
+            "--arg=--expected-cmake-cache", "--arg",
+            str(qualification_cache.resolve()),
+        ]
+        nsys_qualification_out = root / "qualification-nsys"
+        nsys_qualification_arguments = [
+            "--level", "l2-nsys", "--evidence-mode", "qualification",
+            "--scenario", "conventional-p2-accepted-step-nsys",
+            "--exe", str(qualification_app),
+            "--out-dir", str(nsys_qualification_out),
+            "--source-root", str(qualification_source),
+            "--expected-commit", qualification_commit,
+            "--expected-tree", qualification_tree,
+            "--require-clean-source",
+            "--build-manifest", str(qualification_cache),
+            "--mfem-identity", str(qualification_mfem),
+            "--gpu-identity", "GPU-QUALIFICATION", "--gpu-index", "0",
+            "--nvidia-smi-executable", str(fake_nvidia_smi),
+            "--environment", "CUDA_VISIBLE_DEVICES",
+            "--tool-executable", str(fake_qualification_nsys),
+            "--tool-version", nsys_profiler_version,
+            "--nsys-trace", "cuda,nvtx", "--nsys-sample", "none",
+            "--nsys-capture-range", "cudaProfilerApi",
+            "--nsys-capture-range-end", "stop",
+            "--require-data", "report=capture.nsys-rep",
+            *nsys_application,
+        ]
+        run(*nsys_qualification_arguments, env=qualification_env)
+        nsys_qualification_manifest = read_manifest(nsys_qualification_out)
+        assert nsys_qualification_manifest["outcome"] == "success"
+        assert nsys_qualification_manifest["qualification"]["status"] == \
+            "success"
+        assert nsys_qualification_manifest["identity"]["qualification"][
+            "profiler"
+        ]["version"] == nsys_profiler_version
+
+        wrong_nsys_application = list(nsys_qualification_arguments)
+        wrong_nsys_application[
+            wrong_nsys_application.index("tensor")
+        ] = "ordinary"
+        wrong_nsys_application[
+            wrong_nsys_application.index(str(nsys_qualification_out))
+        ] = str(root / "qualification-nsys-wrong-engine")
+        assert "expected 'tensor'" in run(
+            *wrong_nsys_application, expected=2, env=qualification_env
+        ).stderr
+
+        zero_out = root / "qualification-zero"
+        run(
+            *qualification_arguments(zero_out), expected=6,
+            env={**qualification_env, "FAKE_NCU_ZERO": "1"},
+        )
+        zero_manifest = read_manifest(zero_out)
+        assert zero_manifest["outcome"] == "validation_failure"
+        assert zero_manifest["qualification"]["status"] == "failure"
+        assert "must be finite and positive" in zero_manifest["detail"]
+
+        bad_report_out = root / "qualification-bad-report"
+        run(
+            *qualification_arguments(bad_report_out), expected=6,
+            env={**qualification_env, "FAKE_NCU_BAD_REPORT": "1"},
+        )
+        bad_report_manifest = read_manifest(bad_report_out)
+        assert bad_report_manifest["qualification"]["status"] == "failure"
+        assert "expected native ncu report signature" in \
+            bad_report_manifest["detail"]
+
+        wrong_kernel_arguments = qualification_arguments(
+            root / "qualification-wrong-kernel"
+        )
+        kernel_index = wrong_kernel_arguments.index(
+            "regex:.*TensorBorrowedCondenseKernel.*"
+        )
+        wrong_kernel_arguments[kernel_index] = "regex:.*OtherKernel.*"
+        assert "exact tensor condensation kernel filter" in run(
+            *wrong_kernel_arguments, expected=2, env=qualification_env,
+        ).stderr
+
         l1 = root / "l1"
         run("--level", "l1", *common(app, l1), "--warmups", "1", "--repetitions", "5")
         l1_manifest = read_manifest(l1)
@@ -61,8 +476,10 @@ def main() -> int:
         nsys = root / "fake-nsys"
         executable(nsys, "import pathlib, sys\na=sys.argv\nstem=pathlib.Path(a[a.index('--output') + 1])\nstem.with_suffix('.nsys-rep').write_text('report')\n(pathlib.Path.cwd() / 'nvtx.csv').write_text('table')\n")
         nsys_out = root / "nsys"
-        run("--level", "l2-nsys", *common(app, nsys_out), "--tool-executable", os.path.relpath(nsys, ROOT),
+        run("--level", "l2-nsys", "--evidence-mode", "smoke", *common(app, nsys_out), "--tool-executable", os.path.relpath(nsys, ROOT),
             "--nsys-trace", "cuda,nvtx", "--nsys-sample", "none", "--require-data", "nvtx=nvtx.csv",
+            "--nsys-capture-range", "cudaProfilerApi",
+            "--nsys-capture-range-end", "stop",
             "--mfem-identity", "mfem-test", "--gpu-identity", "gpu-test")
         nsys_manifest = read_manifest(nsys_out)
         assert nsys_manifest["outcome"] == "success" and nsys_manifest["identity"]["mfem"] == "mfem-test"
@@ -70,46 +487,92 @@ def main() -> int:
         assert nsys_command[0] == str(nsys.resolve())
         assert nsys_command[nsys_command.index("--trace") + 1] == "cuda,nvtx"
         assert nsys_command[nsys_command.index("--sample") + 1] == "none"
+        assert nsys_command[nsys_command.index("--capture-range") + 1] == \
+            "cudaProfilerApi"
+        assert nsys_command[nsys_command.index("--capture-range-end") + 1] == \
+            "stop"
         assert any(item["path"] == "nvtx.csv" for item in nsys_manifest["artifacts"])
+        nsys_nvtx = root / "nsys-nvtx"
+        run("--level", "l2-nsys", "--evidence-mode", "smoke", *common(app, nsys_nvtx),
+            "--tool-executable", str(nsys), "--nsys-trace", "cuda,nvtx",
+            "--nsys-sample", "none", "--nsys-capture-range", "nvtx",
+            "--nsys-capture-range-end", "repeat::defer",
+            "--nsys-nvtx-capture", "accepted-step@dg-igr",
+            "--require-data", "nvtx=nvtx.csv", "--dry-run")
+        nsys_nvtx_command = read_manifest(nsys_nvtx)["generating_command"]
+        assert nsys_nvtx_command[nsys_nvtx_command.index("--capture-range") + 1] == "nvtx"
+        assert nsys_nvtx_command[nsys_nvtx_command.index("--capture-range-end") + 1] == "repeat::defer"
+        assert nsys_nvtx_command[nsys_nvtx_command.index("--nvtx-capture") + 1] == "accepted-step@dg-igr"
+        missing_capture_range = root / "missing-capture-range"
+        assert "requires --nsys-capture-range" in run(
+            "--level", "l2-nsys", "--evidence-mode", "smoke", *common(app, missing_capture_range),
+            "--tool-executable", str(nsys), "--nsys-trace", "cuda",
+            "--nsys-sample", "none", "--nsys-capture-range-end", "stop",
+            "--require-data", "nvtx=nvtx.csv", expected=2,
+        ).stderr
+        missing_nvtx_trigger = root / "missing-nvtx-trigger"
+        assert "requires --nsys-nvtx-capture" in run(
+            "--level", "l2-nsys", "--evidence-mode", "smoke", *common(app, missing_nvtx_trigger),
+            "--tool-executable", str(nsys), "--nsys-trace", "cuda,nvtx",
+            "--nsys-sample", "none", "--nsys-capture-range", "nvtx",
+            "--nsys-capture-range-end", "stop",
+            "--require-data", "nvtx=nvtx.csv", expected=2,
+        ).stderr
         ncu = root / "fake-ncu"
         executable(ncu, "import pathlib\n(pathlib.Path.cwd() / 'summary.txt').write_text('summary')\n")
         ncu_out = root / "ncu"
-        run("--level", "l2-ncu", *common(app, ncu_out), "--tool-executable", str(ncu),
+        run("--level", "l2-ncu", "--evidence-mode", "smoke", *common(app, ncu_out), "--tool-executable", str(ncu),
             "--ncu-target-processes", "all",
             "--ncu-set", "basic", "--ncu-section", "Occupancy", "--ncu-kernel-name-base", "demangled",
+            "--ncu-metric", "sm__inst_executed_pipe_fp64_op_dmma.sum",
+            "--ncu-metric", "gpu__time_duration.avg",
             "--ncu-kernel-name", "kernel.*", "--ncu-launch-count", "3", "--ncu-launch-skip", "2",
             "--ncu-nvtx-include", "DG/*", "--require-data", "summary=summary.txt")
         ncu_command = read_manifest(ncu_out)["generating_command"]
-        for option in ("--set", "--section", "--kernel-name-base", "--kernel-name", "--launch-count", "--launch-skip", "--nvtx", "--nvtx-include"):
+        for option in ("--set", "--section", "--metrics", "--kernel-name-base", "--kernel-name", "--launch-count", "--launch-skip", "--nvtx", "--nvtx-include"):
             assert option in ncu_command
         assert ncu_command[ncu_command.index("--target-processes") + 1] == "all"
+        assert ncu_command[ncu_command.index("--metrics") + 1] == (
+            "sm__inst_executed_pipe_fp64_op_dmma.sum,gpu__time_duration.avg"
+        )
         ncu_dry = root / "ncu-dry"
-        run("--level", "l2-ncu", *common(app, ncu_dry), "--tool-executable", str(ncu),
-            "--ncu-target-processes", "application-only", "--ncu-set", "basic",
+        run("--level", "l2-ncu", "--evidence-mode", "smoke", *common(app, ncu_dry), "--tool-executable", str(ncu),
+            "--ncu-target-processes", "application-only",
+            "--ncu-metric", "sm__inst_executed_pipe_fp64_op_dmma.sum",
             "--require-data", "summary=summary.txt", "--dry-run")
         dry_ncu_command = read_manifest(ncu_dry)["generating_command"]
         assert dry_ncu_command[dry_ncu_command.index("--target-processes") + 1] == "application-only"
+        assert dry_ncu_command[dry_ncu_command.index("--metrics") + 1] == \
+            "sm__inst_executed_pipe_fp64_op_dmma.sum"
+        duplicate_metric = root / "duplicate-metric"
+        assert "duplicate --ncu-metric" in run(
+            "--level", "l2-ncu", "--evidence-mode", "smoke", *common(app, duplicate_metric),
+            "--tool-executable", str(ncu), "--ncu-target-processes", "all",
+            "--ncu-metric", "gpu__time_duration.avg",
+            "--ncu-metric", "gpu__time_duration.avg",
+            "--require-data", "summary=summary.txt", expected=2,
+        ).stderr
         missing_ncu_target = root / "missing-ncu-target"
-        assert "ncu-target-processes" in run("--level", "l2-ncu", *common(app, missing_ncu_target),
+        assert "ncu-target-processes" in run("--level", "l2-ncu", "--evidence-mode", "smoke", *common(app, missing_ncu_target),
                                                "--tool-executable", str(ncu), "--ncu-set", "basic",
                                                "--require-data", "summary=summary.txt", expected=2).stderr
         dry = root / "dry"
-        run("--level", "l2-nsys", *common(app, dry), "--tool-executable", str(root / "not-installed"),
+        run("--level", "l2-nsys", "--evidence-mode", "smoke", *common(app, dry), "--tool-executable", str(root / "not-installed"),
             "--nsys-trace", "cuda", "--nsys-sample", "none", "--require-data", "table=table.csv", "--dry-run")
         assert read_manifest(dry)["outcome"] == "dry_run"
         missing_tool = root / "missing-tool"
-        run("--level", "l2-nsys", *common(app, missing_tool), "--tool-executable", str(root / "no-nsys"),
+        run("--level", "l2-nsys", "--evidence-mode", "smoke", *common(app, missing_tool), "--tool-executable", str(root / "no-nsys"),
             "--nsys-trace", "cuda", "--nsys-sample", "none", "--require-data", "table=table.csv", expected=3)
         assert read_manifest(missing_tool)["outcome"] == "tool_unavailable"
         missing_data = root / "missing-data"
-        run("--level", "l2-ncu", *common(app, missing_data), "--tool-executable", str(ncu),
+        run("--level", "l2-ncu", "--evidence-mode", "smoke", *common(app, missing_data), "--tool-executable", str(ncu),
             "--ncu-target-processes", "all",
             "--ncu-set", "basic", "--require-data", "missing=missing.csv", expected=4)
         assert read_manifest(missing_data)["outcome"] == "data_unavailable"
         empty_ncu = root / "fake-empty-ncu"
         executable(empty_ncu, "import pathlib\n(pathlib.Path.cwd() / 'empty.csv').write_text('')\n")
         empty_data = root / "empty-data"
-        run("--level", "l2-ncu", *common(app, empty_data), "--tool-executable", str(empty_ncu),
+        run("--level", "l2-ncu", "--evidence-mode", "smoke", *common(app, empty_data), "--tool-executable", str(empty_ncu),
             "--ncu-target-processes", "all",
             "--ncu-set", "basic", "--require-data", "empty=empty.csv", expected=4)
         assert read_manifest(empty_data)["outcome"] == "data_unavailable"
@@ -126,10 +589,10 @@ def main() -> int:
         assert read_manifest(launch_failure)["outcome"] == "execution_failure"
         assert "could not execute command" in read_manifest(launch_failure)["detail"]
         rejected = root / "rejected"
-        assert "relative path" in run("--level", "l2-nsys", *common(app, rejected), "--tool-executable", str(nsys),
+        assert "relative path" in run("--level", "l2-nsys", "--evidence-mode", "smoke", *common(app, rejected), "--tool-executable", str(nsys),
                                        "--nsys-trace", "cuda", "--nsys-sample", "none", "--require-data", "bad=../escape.csv", expected=2).stderr
         log_alias = root / "log-alias"
-        assert "reserve" in run("--level", "l2-nsys", *common(app, log_alias), "--tool-executable", str(nsys),
+        assert "reserve" in run("--level", "l2-nsys", "--evidence-mode", "smoke", *common(app, log_alias), "--tool-executable", str(nsys),
                                  "--nsys-trace", "cuda", "--nsys-sample", "none",
                                  "--require-data", "log=execution.log", expected=2).stderr
         secret = "do-not-write-this-secret"
@@ -159,7 +622,7 @@ def main() -> int:
         symlink_ncu = root / "symlink-ncu"
         executable(symlink_ncu, "import os\nos.symlink(os.environ['VICTIM'], 'outside.csv')\n")
         symlink_data = root / "symlink-data"
-        run("--level", "l2-ncu", *common(app, symlink_data), "--tool-executable", str(symlink_ncu),
+        run("--level", "l2-ncu", "--evidence-mode", "smoke", *common(app, symlink_data), "--tool-executable", str(symlink_ncu),
             "--ncu-target-processes", "all", "--ncu-set", "basic", "--require-data", "outside=outside.csv",
             expected=4, env={**os.environ, "VICTIM": str(victim)})
         assert victim.read_text(encoding="utf-8") == "unchanged"
@@ -167,20 +630,20 @@ def main() -> int:
         delete_pin = root / "delete-pin-ncu"
         executable(delete_pin, "import pathlib\np=pathlib.Path.cwd()\n(p / 'summary.txt').write_text('ok')\n(p / 'profile-provenance.json').unlink()\n")
         deleted_pin = root / "deleted-pin"
-        run("--level", "l2-ncu", *common(app, deleted_pin), "--tool-executable", str(delete_pin),
+        run("--level", "l2-ncu", "--evidence-mode", "smoke", *common(app, deleted_pin), "--tool-executable", str(delete_pin),
             "--ncu-target-processes", "all", "--ncu-set", "basic", "--require-data", "summary=summary.txt", expected=6)
         assert read_manifest(deleted_pin)["outcome"] == "validation_failure"
         replace_pin = root / "replace-pin-ncu"
         executable(replace_pin, "import pathlib\np=pathlib.Path.cwd()\n(p / 'summary.txt').write_text('ok')\n(p / 'profile-provenance.json').write_text('{}')\n")
         replaced_pin = root / "replaced-pin"
-        run("--level", "l2-ncu", *common(app, replaced_pin), "--tool-executable", str(replace_pin),
+        run("--level", "l2-ncu", "--evidence-mode", "smoke", *common(app, replaced_pin), "--tool-executable", str(replace_pin),
             "--ncu-target-processes", "all", "--ncu-set", "basic", "--require-data", "summary=summary.txt", expected=6)
         replacement_manifest = read_manifest(replaced_pin)
         assert replacement_manifest["outcome"] == "validation_failure"
         recreate_pin = root / "recreate-pin-ncu"
         executable(recreate_pin, "import pathlib\np=pathlib.Path.cwd()\ncontents=(p / 'profile-provenance.json').read_bytes()\n(p / 'summary.txt').write_text('ok')\n(p / 'profile-provenance.json').unlink()\n(p / 'profile-provenance.json').write_bytes(contents)\n")
         recreated_pin = root / "recreated-pin"
-        run("--level", "l2-ncu", *common(app, recreated_pin), "--tool-executable", str(recreate_pin),
+        run("--level", "l2-ncu", "--evidence-mode", "smoke", *common(app, recreated_pin), "--tool-executable", str(recreate_pin),
             "--ncu-target-processes", "all", "--ncu-set", "basic", "--require-data", "summary=summary.txt", expected=6)
         assert read_manifest(recreated_pin)["outcome"] == "validation_failure"
     print("profile-harness-test: pass")

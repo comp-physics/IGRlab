@@ -33,6 +33,7 @@ namespace
 
 using dg::hdg::generic::BackendKind;
 using dg::hdg::generic::BackendSelection;
+using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::generic::HdgEulerSessionStatus;
 using dg::hdg::generic::RegularizationKind;
@@ -40,6 +41,8 @@ using dg::hdg::generic::RegularizationSelection;
 using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
+using dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerForEngine;
+using dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerName;
 
 bool IsRoot(const MPI_Comm communicator) noexcept
 {
@@ -107,7 +110,9 @@ int Reject(const HdgEulerMainRequest& request,
            const std::string& reason) noexcept
 {
   if (IsRoot(request.communicator))
-    std::cerr << "[hdg-main] status=Rejected reason=" << reason << '\n';
+    std::cerr << "[hdg-main] status=Rejected reason=" << reason
+              << " cuda_engine="
+              << request.options.hdg_cuda_engine << '\n';
   return 1;
 }
 
@@ -266,6 +271,32 @@ RegularizationSelection CanonicalRegularization(
       "HDG regularization must resolve to 'none' or 'igr'");
 }
 
+CudaEngineKind CanonicalCudaEngine(const HdgEulerMainRequest& request)
+{
+  const std::optional<HdgCudaEngine> engine =
+      TryParseHdgCudaEngine(request.options.hdg_cuda_engine);
+  if (!engine)
+  {
+    throw std::invalid_argument(
+        "HDG CUDA engine must resolve to 'ordinary' or 'tensor'");
+  }
+  return *engine == HdgCudaEngine::TensorCore
+      ? CudaEngineKind::tensor_core
+      : CudaEngineKind::ordinary;
+}
+
+const char* CudaEngineName(const CudaEngineKind engine) noexcept
+{
+  switch (engine)
+  {
+  case CudaEngineKind::ordinary:
+    return "ordinary";
+  case CudaEngineKind::tensor_core:
+    return "tensor";
+  }
+  return "unknown";
+}
+
 std::string CanonicalNumericalPolicy(
     const dg::hdg::generic::EulerHdgNumericalPolicy& policy)
 {
@@ -290,13 +321,17 @@ std::string CanonicalNumericalPolicy(
 
 std::string ConsensusText(const HdgEulerMainRequest& request,
                           const std::string& mesh_path,
-                          const RegularizationSelection regularization)
+                          const RegularizationSelection regularization,
+                          const CudaEngineKind cuda_engine)
 {
   std::ostringstream stream;
   const mfem::io::VTKOutputConfig vtk = MakeCaseVTKConfig(request.case_config);
   AppendText(stream, request.case_config.case_name);
   AppendText(stream, mesh_path);
   AppendText(stream, ToLowerCopy(request.options.device));
+  AppendText(stream, CudaEngineName(cuda_engine));
+  AppendText(stream, CudaTracePreconditionerName(
+      CudaTracePreconditionerForEngine(cuda_engine)));
   AppendText(stream, request.options.restart_vtk);
   AppendText(stream, vtk.prefix_path);
   stream << request.options.order << ';'
@@ -369,7 +404,8 @@ bool ExactTextConsensus(const MPI_Comm communicator,
 }
 
 std::string Validate(const HdgEulerMainRequest& request,
-                     const RegularizationSelection regularization)
+                     const RegularizationSelection regularization,
+                     const CudaEngineKind cuda_engine)
 {
   if (!LiveSupportedCommunicator(request.communicator))
     return "CUDA HDG requires a live one- or two-rank MPI communicator";
@@ -377,6 +413,8 @@ std::string Validate(const HdgEulerMainRequest& request,
     return "CUDA HDG case physics factory is empty";
   if (ToLowerCopy(request.options.device) != "cuda")
     return "generic CUDA HDG requires --device cuda";
+  if (!dg::hdg::generic::IsKnownCudaEngineKind(cuda_engine))
+    return "generic CUDA HDG rejects an invalid CUDA engine";
   if (!dg::hdg::generic::ValidRegularizationSelection(regularization))
     return "HDG IGR alpha and beta must be finite and positive";
   if (!request.options.restart_vtk.empty() || request.options.restart_cycle >= 0 ||
@@ -424,9 +462,11 @@ std::string ValidateCaseData(const HdgEulerCaseData& case_data,
   return {};
 }
 
-std::string CollectionName(const HdgEulerMainRequest& request)
+std::string CollectionName(const HdgEulerMainRequest& request,
+                           const CudaEngineKind cuda_engine)
 {
-  return request.case_config.case_name + "_hdg_p_" +
+  return request.case_config.case_name + "_hdg_cuda_" +
+      CudaEngineName(cuda_engine) + "_p_" +
       std::to_string(request.options.order) + "_ref_" +
       std::to_string(request.options.ser_ref_levels +
                      request.options.par_ref_levels);
@@ -461,10 +501,12 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
 
   std::string reason;
   RegularizationSelection regularization{};
+  CudaEngineKind cuda_engine = CudaEngineKind::ordinary;
   try
   {
     regularization = CanonicalRegularization(request);
-    reason = Validate(request, regularization);
+    cuda_engine = CanonicalCudaEngine(request);
+    reason = Validate(request, regularization, cuda_engine);
   }
   catch (...) { reason = "rank-local CUDA HDG request validation failed"; }
   if (!CollectiveAll(request.communicator, reason.empty()))
@@ -476,7 +518,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   try
   {
     mesh_path = ResolveCaseMesh(request.case_config, request.options.mesh_file);
-    consensus = ConsensusText(request, mesh_path, regularization);
+    consensus = ConsensusText(request, mesh_path, regularization, cuda_engine);
   }
   catch (...) { reason = "CUDA HDG configuration resolution failed"; }
   if (!CollectiveAll(request.communicator, !consensus.empty()))
@@ -677,7 +719,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     return Reject(request,
                   "CUDA HDG state projection or boundary lowering failed");
 
-  const BackendSelection backend{BackendKind::cuda, 0};
+  const BackendSelection backend{BackendKind::cuda, 0, cuda_engine};
   ResolvedHdgEulerCasePlan resolved_plan{};
   resolved_plan.request = EulerHdgRequest{
       &context->Mesh(), context->Comm(), request.options.order, backend,
@@ -725,7 +767,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         : HdgEulerTimeMode::FixedBackwardEuler;
     const mfem::io::VTKOutputConfig vtk = MakeCaseVTKConfig(request.case_config);
     resolved_plan.output = {request.options.vtk_save, vtk.prefix_path,
-                            CollectionName(request)};
+                            CollectionName(request, cuda_engine)};
     time_driver = std::make_unique<HdgTransactionalTimeAdapter>(
         resolved_plan.time_control, resolved_plan.output_schedule,
         cfl_control ? HdgTimeControlMode::CFLBackwardEuler
@@ -929,7 +971,11 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   if (IsRoot(request.communicator))
     std::cout << "[hdg-main] status=Success step=" << time_driver->solver_step()
               << " time=" << time_driver->time() << " output_cycle="
-              << time_driver->output_cycle() << " regularization="
+              << time_driver->output_cycle() << " cuda_engine="
+              << CudaEngineName(cuda_engine) << " trace_preconditioner="
+              << CudaTracePreconditionerName(
+                     CudaTracePreconditionerForEngine(cuda_engine))
+              << " regularization="
               << (regularization.kind == RegularizationKind::igr ? "igr" : "none")
               << " alpha=" << regularization.alpha
               << " beta=" << regularization.beta << '\n';

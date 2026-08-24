@@ -28,6 +28,8 @@ struct CommonOptions
   ///< General discretization selector; empty retains the per-case default.
   std::string regularization;
   ///< Regularization selector: none | igr; empty retains the case default.
+  std::string hdg_cuda_engine = "ordinary";
+  ///< CUDA HDG engine: ordinary | tensor; ordinary remains the default.
   double hdg_igr_alpha = 1.0;
   ///< HDG IGR-extension alpha; used only with --discretization hdg --regularization igr.
   double hdg_igr_beta = 1.0;
@@ -116,6 +118,11 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-reg",
                  "--regularization",
                  "Regularization: none | igr (case support required).");
+  args.AddOption(&opts.hdg_cuda_engine,
+                 "-hce",
+                 "--hdg-cuda-engine",
+                 "CUDA HDG engine: ordinary | tensor (ordinary is the default; "
+                 "tensor requires --discretization hdg --device cuda).");
   args.AddOption(&opts.hdg_igr_alpha,
                  "-hia",
                  "--hdg-igr-alpha",

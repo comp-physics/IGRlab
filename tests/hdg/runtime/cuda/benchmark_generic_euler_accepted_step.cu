@@ -1,8 +1,13 @@
 #include "numerics/hdg/generic/session_contract.hpp"
 #include "numerics/hdg/runtime/cuda/generic_euler.cuh"
+#include "utils/profiling/nvtx.hpp"
 
+#include <_hypre_utilities.h>
+#include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>
 #include <mfem.hpp>
+#include <umpire/ResourceManager.hpp>
+#include <umpire/Umpire.hpp>
 
 #include <algorithm>
 #include <array>
@@ -15,6 +20,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -177,6 +183,7 @@ using dg::hdg::generic::BackendKind;
 using dg::hdg::generic::BoundaryPointView;
 using dg::hdg::generic::Capability;
 using dg::hdg::generic::CapabilityBit;
+using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::EulerBoundaryPolicyTableView;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::generic::HdgEulerSessionStatus;
@@ -186,6 +193,8 @@ using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using dg::hdg::runtime::cuda_w8a::CudaMutableHostL2Output;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
+using dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerForEngine;
+using dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerName;
 using dg::hdg::runtime::cuda_w8a::CudaTransferTotals;
 using dg::hdg::runtime::cuda_w8a::CudaTransportPolicy;
 using dg::hdg::runtime::cuda_w8a::conserved_components;
@@ -197,7 +206,6 @@ using dg::hdg::runtime::cuda_w8a::detail::
     CudaAcceptedStepProblemMetadata;
 using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
 
-constexpr int order = 1;
 constexpr int principal_threads = 128;
 constexpr int principal_element_threads = 4;
 constexpr int principal_elements_per_block =
@@ -207,6 +215,15 @@ constexpr int warmup_steps = 1;
 constexpr int measured_steps = 5;
 constexpr int total_steps = warmup_steps + measured_steps;
 constexpr double default_timestep = 1.0e-5;
+constexpr double benchmark_gamma = 1.4;
+
+#if !defined(DG_IGR_BENCHMARK_SOURCE_REVISION) || \
+    !defined(DG_IGR_BENCHMARK_SOURCE_TREE) || \
+    !defined(DG_IGR_BENCHMARK_SOURCE_STATUS) || \
+    !defined(DG_IGR_BENCHMARK_BUILD_DIRECTORY) || \
+    !defined(DG_IGR_BENCHMARK_CMAKE_CACHE)
+#error "accepted-step benchmark source/build identity is not configured"
+#endif
 constexpr std::uint32_t cuda_capabilities =
     CapabilityBit(Capability::conforming_quadrilateral_mesh) |
     CapabilityBit(Capability::polynomial_order_one_to_three) |
@@ -239,10 +256,18 @@ static_assert(!ValidDomainPeriods(104, 0) &&
 struct Options
 {
   RegularizationKind regularization = RegularizationKind::none;
+  CudaEngineKind engine = CudaEngineKind::ordinary;
+  int order = 1;
   int mesh_n = default_mesh_n;
   int domain_periods = 1;
+  int profile_measured_step = -1;
   double timestep = default_timestep;
-  bool export_interior = true;
+  std::string expected_source_revision{};
+  std::string expected_source_tree{};
+  std::string expected_source_status{};
+  std::string expected_build_directory{};
+  std::string expected_cmake_cache{};
+  bool export_interior = false;
   bool help = false;
 };
 
@@ -263,6 +288,24 @@ struct StepSample
   CudaAcceptedStepCommittedHashes committed{};
   dg::hdg::generic::HdgEulerSessionCoordinates coordinates{};
   dg::hdg::generic::HdgEulerCommittedDiagnostics diagnostics{};
+};
+
+struct DeviceMemorySnapshot
+{
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  bool available = false;
+};
+
+struct UmpireHighWatermarkSnapshot
+{
+  std::size_t mfem_bytes = 0;
+  std::size_t hypre_bytes = 0;
+  std::size_t sum_bytes = 0;
+  bool mfem_available = false;
+  bool hypre_available = false;
+  bool sum_available = false;
+  bool available = false;
 };
 
 bool ParsePositiveInt(const std::string_view text, const int minimum,
@@ -306,6 +349,26 @@ bool SelectMode(const std::string_view text, Options& options) noexcept
   return false;
 }
 
+bool SelectEngine(const std::string_view text, Options& options) noexcept
+{
+  if (text == "ordinary")
+  {
+    options.engine = CudaEngineKind::ordinary;
+    return true;
+  }
+  if (text == "tensor")
+  {
+    options.engine = CudaEngineKind::tensor_core;
+    return true;
+  }
+  return false;
+}
+
+const char* EngineName(const CudaEngineKind engine) noexcept
+{
+  return engine == CudaEngineKind::tensor_core ? "tensor" : "ordinary";
+}
+
 bool ParseOptions(const int argc, char* argv[], Options& options,
                   std::string& error)
 {
@@ -346,6 +409,26 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
       }
       continue;
     }
+    if (argument == "--engine")
+    {
+      if (++index >= argc || !SelectEngine(argv[index], options))
+      {
+        error = "--engine requires ordinary or tensor";
+        return false;
+      }
+      continue;
+    }
+    if (argument == "--order")
+    {
+      if (++index >= argc ||
+          !ParsePositiveInt(argv[index], 1, options.order) ||
+          options.order > 3)
+      {
+        error = "--order requires 1, 2, or 3";
+        return false;
+      }
+      continue;
+    }
     if (argument == "--mesh-n")
     {
       if (++index >= argc ||
@@ -366,12 +449,76 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
       }
       continue;
     }
+    if (argument == "--profile-measured-step")
+    {
+      if (++index >= argc ||
+          !ParsePositiveInt(argv[index], 0,
+                            options.profile_measured_step) ||
+          options.profile_measured_step >= measured_steps)
+      {
+        error = "--profile-measured-step requires an integer in [0,4]";
+        return false;
+      }
+      continue;
+    }
     if (argument == "--dt")
     {
       if (++index >= argc ||
           !ParsePositiveDouble(argv[index], options.timestep))
       {
         error = "--dt requires a finite positive FP64 value";
+        return false;
+      }
+      continue;
+    }
+    const auto parse_expected = [&](std::string& value) -> bool
+    {
+      if (++index >= argc || std::string_view(argv[index]).empty())
+        return false;
+      value = argv[index];
+      return true;
+    };
+    if (argument == "--expected-source-revision")
+    {
+      if (!parse_expected(options.expected_source_revision))
+      {
+        error = "--expected-source-revision requires a value";
+        return false;
+      }
+      continue;
+    }
+    if (argument == "--expected-source-tree")
+    {
+      if (!parse_expected(options.expected_source_tree))
+      {
+        error = "--expected-source-tree requires a value";
+        return false;
+      }
+      continue;
+    }
+    if (argument == "--expected-source-status")
+    {
+      if (!parse_expected(options.expected_source_status))
+      {
+        error = "--expected-source-status requires a value";
+        return false;
+      }
+      continue;
+    }
+    if (argument == "--expected-build-directory")
+    {
+      if (!parse_expected(options.expected_build_directory))
+      {
+        error = "--expected-build-directory requires a value";
+        return false;
+      }
+      continue;
+    }
+    if (argument == "--expected-cmake-cache")
+    {
+      if (!parse_expected(options.expected_cmake_cache))
+      {
+        error = "--expected-cmake-cache requires a value";
         return false;
       }
       continue;
@@ -385,17 +532,46 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
             "and divide --mesh-n exactly";
     return false;
   }
+  const std::array<bool, 5> expected_supplied{{
+      !options.expected_source_revision.empty(),
+      !options.expected_source_tree.empty(),
+      !options.expected_source_status.empty(),
+      !options.expected_build_directory.empty(),
+      !options.expected_cmake_cache.empty()}};
+  if (std::any_of(expected_supplied.begin(), expected_supplied.end(),
+                  [](const bool supplied) { return supplied; }) &&
+      !std::all_of(expected_supplied.begin(), expected_supplied.end(),
+                   [](const bool supplied) { return supplied; }))
+  {
+    error = "all expected source/build identity options are required together";
+    return false;
+  }
   return true;
+}
+
+bool ExactExpectedBuildIdentity(const Options& options) noexcept
+{
+  if (options.expected_source_revision.empty()) return true;
+  return options.expected_source_revision ==
+          DG_IGR_BENCHMARK_SOURCE_REVISION &&
+      options.expected_source_tree == DG_IGR_BENCHMARK_SOURCE_TREE &&
+      options.expected_source_status == DG_IGR_BENCHMARK_SOURCE_STATUS &&
+      options.expected_build_directory == DG_IGR_BENCHMARK_BUILD_DIRECTORY &&
+      options.expected_cmake_cache == DG_IGR_BENCHMARK_CMAKE_CACHE;
 }
 
 void PrintUsage(const char* executable)
 {
   std::cout << "Usage: " << executable
-            << " [--mode conventional|igr] [--mesh-n N]"
-               " [--domain-periods K] [--dt DT] [--export|--no-export]\n"
+            << " [--mode conventional|igr] [--engine ordinary|tensor]"
+               " [--order 1|2|3] [--mesh-n N]"
+               " [--domain-periods K] [--dt DT] [--export|--no-export]"
+               " [--profile-measured-step 0|1|2|3|4]\n"
                "       " << executable
-            << " [--conventional|--igr] [--mesh-n N]"
-               " [--domain-periods K] [--dt DT] [--export|--no-export]\n";
+            << " [--conventional|--igr] [--engine ordinary|tensor]"
+               " [--order 1|2|3] [--mesh-n N]"
+               " [--domain-periods K] [--dt DT] [--export|--no-export]"
+               " [--profile-measured-step 0|1|2|3|4]\n";
 }
 
 mfem::ParMesh MakePeriodicMesh(const int n, const int domain_periods)
@@ -436,7 +612,8 @@ void SmoothPeriodicState(const mfem::Vector& point, const bool wrap_period,
       (velocity_x * velocity_x + velocity_y * velocity_y);
 }
 
-BorrowedFields MakeFields(mfem::ParMesh& mesh, const int domain_periods)
+BorrowedFields MakeFields(mfem::ParMesh& mesh, const int domain_periods,
+                          const int order)
 {
   BorrowedFields fields;
   mfem::L2_FECollection collection(
@@ -469,13 +646,14 @@ bool PeriodicExterior(const void*, const BoundaryPointView&,
 
 EulerHdgRequest MakeRequest(const mfem::ParMesh& mesh,
                             const BorrowedFields& fields,
-                            const RegularizationKind regularization)
+                            const RegularizationKind regularization,
+                            const int order, const CudaEngineKind engine)
 {
   EulerHdgRequest request{};
   request.mesh = &mesh;
   request.communicator = mesh.GetComm();
   request.polynomial_order = order;
-  request.backend = {BackendKind::cuda, 0};
+  request.backend = {BackendKind::cuda, 0, engine};
   request.capabilities = cuda_capabilities;
   request.initial_state = {
       fields.initial.data(), fields.initial.size(), conserved_components};
@@ -486,7 +664,7 @@ EulerHdgRequest MakeRequest(const mfem::ParMesh& mesh,
   request.boundary.context = nullptr;
   request.boundary.exterior_state = PeriodicExterior;
   request.boundary.policies = EulerBoundaryPolicyTableView{
-      nullptr, 0, 2, 1.4};
+      nullptr, 0, 2, benchmark_gamma};
   request.numerical_policy =
       dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
   if (regularization == RegularizationKind::igr)
@@ -525,9 +703,20 @@ std::uint64_t StableFp64Checksum(const std::vector<double>& values) noexcept
   return checksum;
 }
 
-bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation) noexcept
+bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
+             const CudaEngineKind engine) noexcept
 {
   const auto& evidence = observation.evidence;
+  const auto& tensor = evidence.tensor_core;
+  const bool expected_engine = tensor.selected_engine == engine &&
+      tensor.trace_preconditioner_configured &&
+      tensor.trace_preconditioner == CudaTracePreconditionerForEngine(engine) &&
+      tensor.fallback_count == 0 && tensor.fallback_accounting_complete &&
+      evidence.no_fallback &&
+      (engine == CudaEngineKind::ordinary
+           ? tensor.condensation_launches == 0 && tensor.mma_tiles == 0
+           : tensor.hardware_supported && tensor.condensation_launches > 0 &&
+                 tensor.mma_tiles > 0);
   return observation.candidate_ready && observation.finite &&
       observation.admissible && observation.recovery &&
       observation.true_residual && observation.conservation &&
@@ -540,7 +729,7 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation) noexcept
       std::isfinite(observation.maximum_conservation_relative_error) &&
       evidence.nonlinear_updates >= 0 && evidence.trace_solves > 0 &&
       evidence.linear_iterations >= 0 && evidence.line_search_trials >= 0 &&
-      evidence.rejected_line_search_trials >= 0;
+      evidence.rejected_line_search_trials >= 0 && expected_engine;
 }
 
 bool RunStep(GenericEulerHdgCudaSession& session,
@@ -548,6 +737,7 @@ bool RunStep(GenericEulerHdgCudaSession& session,
              std::vector<double>& exported_interior,
              const double timestep,
              const bool export_interior,
+             const CudaEngineKind engine,
              const bool warmup, const int measured_index,
              StepSample& sample, std::string& error)
 {
@@ -573,6 +763,10 @@ bool RunStep(GenericEulerHdgCudaSession& session,
       ? session.Commit(std::move(authority), output)
       : GenericEulerHdgCudaSession::result_type{};
   const auto finished = clock::now();
+  // Prepare begins a new transactional attempt and resets the attempt-local
+  // transport ledger.  The ledger after Commit is therefore already the
+  // exact accepted-step total; subtracting the previous attempt would make
+  // this evidence non-monotone and incorrectly mark it incomplete.
   sample.transfers = CudaTransportPolicy::Accounting();
 
   // Keep the prepared observation inside the wall-clock interval.  Prepare
@@ -603,7 +797,7 @@ bool RunStep(GenericEulerHdgCudaSession& session,
   }
   sample.coordinates = session.coordinates();
   sample.diagnostics = session.diagnostics();
-  if (!Healthy(sample.prepared))
+  if (!Healthy(sample.prepared, engine))
   {
     error = "accepted-step prepared numerical gates failed";
     return false;
@@ -659,9 +853,104 @@ void PrintJsonNumber(const double value)
   else std::cout << "null";
 }
 
+std::string CudaUuidString(const cudaUUID_t& uuid)
+{
+  static constexpr int group_ends[] = {4, 6, 8, 10};
+  std::ostringstream stream;
+  stream << "GPU-" << std::hex << std::setfill('0');
+  for (int index = 0; index < 16; ++index)
+  {
+    if (std::find(std::begin(group_ends), std::end(group_ends), index) !=
+        std::end(group_ends))
+      stream << '-';
+    stream << std::setw(2)
+           << static_cast<unsigned int>(
+                  static_cast<unsigned char>(uuid.bytes[index]));
+  }
+  return stream.str();
+}
+
+DeviceMemorySnapshot CaptureDeviceMemory() noexcept
+{
+  DeviceMemorySnapshot snapshot;
+  snapshot.available = cudaMemGetInfo(
+      &snapshot.free_bytes, &snapshot.total_bytes) == cudaSuccess;
+  if (!snapshot.available) snapshot = {};
+  return snapshot;
+}
+
+UmpireHighWatermarkSnapshot CaptureUmpireHighWatermarks() noexcept
+{
+  UmpireHighWatermarkSnapshot snapshot{};
+#if defined(MFEM_USE_UMPIRE) && defined(HYPRE_USING_UMPIRE)
+  try
+  {
+    auto& manager = umpire::ResourceManager::getInstance();
+    const char* const mfem_name =
+        mfem::MemoryManager::GetUmpireDeviceAllocatorName();
+    const char* const hypre_name =
+        hypre_HandleUmpireDevicePoolName(hypre_handle());
+    snapshot.mfem_available = mfem_name != nullptr && mfem_name[0] != '\0' &&
+        manager.isAllocator(mfem_name);
+    snapshot.hypre_available =
+        hypre_name != nullptr && hypre_name[0] != '\0' &&
+        manager.isAllocator(hypre_name);
+    if (snapshot.mfem_available)
+      snapshot.mfem_bytes =
+          manager.getAllocator(mfem_name).getHighWatermark();
+    if (snapshot.hypre_available)
+      snapshot.hypre_bytes =
+          manager.getAllocator(hypre_name).getHighWatermark();
+    snapshot.sum_available = snapshot.mfem_available &&
+        snapshot.hypre_available &&
+        snapshot.mfem_bytes <= std::numeric_limits<std::size_t>::max() -
+            snapshot.hypre_bytes;
+    if (snapshot.sum_available)
+      snapshot.sum_bytes = snapshot.mfem_bytes + snapshot.hypre_bytes;
+    snapshot.available = snapshot.sum_available;
+  }
+  catch (...) { snapshot = {}; }
+#endif
+  return snapshot;
+}
+
+void PrintMemorySnapshot(const DeviceMemorySnapshot& snapshot)
+{
+  if (!snapshot.available)
+  {
+    std::cout << "null";
+    return;
+  }
+  std::cout << "{\"free_bytes\":" << snapshot.free_bytes
+            << ",\"total_bytes\":" << snapshot.total_bytes
+            << ",\"used_bytes\":"
+            << snapshot.total_bytes - snapshot.free_bytes << '}';
+}
+
+void PrintUmpireHighWatermarks(
+    const UmpireHighWatermarkSnapshot& snapshot)
+{
+  std::cout << std::boolalpha
+            << "{\"available\":" << snapshot.available
+            << ",\"mfem_available\":" << snapshot.mfem_available
+            << ",\"hypre_available\":" << snapshot.hypre_available
+            << ",\"sum_available\":" << snapshot.sum_available
+            << std::noboolalpha << ",\"mfem_bytes\":";
+  if (snapshot.mfem_available) std::cout << snapshot.mfem_bytes;
+  else std::cout << "null";
+  std::cout << ",\"hypre_bytes\":";
+  if (snapshot.hypre_available) std::cout << snapshot.hypre_bytes;
+  else std::cout << "null";
+  std::cout << ",\"sum_bytes\":";
+  if (snapshot.sum_available) std::cout << snapshot.sum_bytes;
+  else std::cout << "null";
+  std::cout << '}';
+}
+
 void PrintStep(const StepSample& sample)
 {
   const auto& evidence = sample.prepared.evidence;
+  const auto& precision_work = evidence.precision_work;
   std::cout << "{\"phase\":\""
             << (sample.warmup ? "warmup" : "measured") << "\","
             << "\"measured_index\":" << sample.measured_index << ','
@@ -693,12 +982,53 @@ void PrintStep(const StepSample& sample)
   PrintJsonNumber(sample.diagnostics.maximum_wave_speed);
   std::cout << ",\"backend_stable_dt\":";
   PrintJsonNumber(sample.diagnostics.backend_stable_dt);
-  std::cout << ",\"nonlinear_updates\":" << evidence.nonlinear_updates
+  std::cout << ",\"attempt_sequence\":" << evidence.attempt.sequence
+            << ",\"retry_index\":"
+            << static_cast<unsigned int>(evidence.attempt.retry_index)
+            << ",\"device_ticket_count\":"
+            << evidence.device_ticket_count
+            << ",\"nonlinear_updates\":" << evidence.nonlinear_updates
             << ",\"trace_solves\":" << evidence.trace_solves
             << ",\"linear_iterations\":" << evidence.linear_iterations
             << ",\"line_search_trials\":" << evidence.line_search_trials
             << ",\"rejected_line_search_trials\":"
             << evidence.rejected_line_search_trials
+            << ",\"iterative_refinement_steps\":"
+            << precision_work.iterative_refinement_steps
+            << ",\"residual_replacements\":"
+            << precision_work.residual_replacements
+            << ",\"precision_corrections\":"
+            << precision_work.precision_corrections
+            << ",\"all_fp64_policy\":" << std::boolalpha
+            << precision_work.all_fp64_policy
+            << ",\"correction_accounting_complete\":"
+            << precision_work.accounting_complete << std::noboolalpha
+            << ",\"product_generations\":{"
+            << "\"residual\":" << evidence.products.residual_generation
+            << ",\"matrix\":" << evidence.products.matrix_generation
+            << ",\"factor\":" << evidence.products.factor_generation
+            << ",\"solution\":" << evidence.products.solution_generation
+            << ",\"issued_mask\":"
+            << static_cast<unsigned int>(evidence.products.issued_mask) << '}'
+            << ",\"tensor_core\":{"
+            << "\"selected_engine\":\""
+            << EngineName(evidence.tensor_core.selected_engine) << "\","
+            << "\"trace_preconditioner\":\""
+            << CudaTracePreconditionerName(
+                   evidence.tensor_core.trace_preconditioner) << "\","
+            << "\"trace_preconditioner_configured\":" << std::boolalpha
+            << evidence.tensor_core.trace_preconditioner_configured << ','
+            << "\"hardware_supported\":" << std::boolalpha
+            << evidence.tensor_core.hardware_supported
+            << ",\"condensation_launches\":"
+            << evidence.tensor_core.condensation_launches
+            << ",\"mma_tiles\":" << evidence.tensor_core.mma_tiles
+            << ",\"fallback_count\":"
+            << evidence.tensor_core.fallback_count
+            << ",\"fallback_accounting_complete\":"
+            << evidence.tensor_core.fallback_accounting_complete
+            << ",\"no_fallback\":" << evidence.no_fallback
+            << std::noboolalpha << '}'
             << ",\"transfers\":{"
             << "\"host_to_device_bytes\":"
             << sample.transfers.host_to_device_bytes
@@ -730,17 +1060,24 @@ void PrintStep(const StepSample& sample)
 
 int RunBenchmark(const Options& options)
 {
+  using clock = std::chrono::steady_clock;
+  const auto initialization_started = clock::now();
   mfem::Device device("cuda");
   int active_device = -1;
+  int driver_version = 0;
+  int runtime_version = 0;
   cudaDeviceProp device_properties{};
   if (cudaGetDevice(&active_device) != cudaSuccess || active_device < 0 ||
       cudaGetDeviceProperties(&device_properties, active_device) !=
-          cudaSuccess || device_properties.multiProcessorCount <= 0)
+          cudaSuccess || device_properties.multiProcessorCount <= 0 ||
+      cudaDriverGetVersion(&driver_version) != cudaSuccess ||
+      cudaRuntimeGetVersion(&runtime_version) != cudaSuccess)
   {
-    std::cerr << "{\"schema\":1,\"success\":false,"
+    std::cerr << "{\"schema\":2,\"success\":false,"
                  "\"error\":\"CUDA device metadata query failed\"}\n";
     return 1;
   }
+  const DeviceMemorySnapshot memory_before_problem = CaptureDeviceMemory();
 
   mfem::ParMesh mesh = MakePeriodicMesh(
       options.mesh_n, options.domain_periods);
@@ -748,27 +1085,35 @@ int RunBenchmark(const Options& options)
   const int principal_blocks =
       (elements + principal_elements_per_block - 1) /
       principal_elements_per_block;
-  BorrowedFields fields = MakeFields(mesh, options.domain_periods);
+  BorrowedFields fields = MakeFields(
+      mesh, options.domain_periods, options.order);
   if (elements != options.mesh_n * options.mesh_n ||
       fields.volume_scalar_count == 0 ||
       fields.initial.size() !=
           fields.volume_scalar_count * conserved_components)
   {
-    std::cerr << "{\"schema\":1,\"success\":false,"
+    std::cerr << "{\"schema\":2,\"success\":false,"
                  "\"error\":\"benchmark field initialization failed\"}\n";
     return 1;
   }
 
   GenericEulerHdgCudaSession session;
   const EulerHdgRequest request = MakeRequest(
-      mesh, fields, options.regularization);
+      mesh, fields, options.regularization, options.order, options.engine);
   if (session.Initialize(request).status !=
-      HdgEulerSessionStatus::initialized)
+          HdgEulerSessionStatus::initialized ||
+      cudaDeviceSynchronize() != cudaSuccess)
   {
-    std::cerr << "{\"schema\":1,\"success\":false,"
+    std::cerr << "{\"schema\":2,\"success\":false,"
                  "\"error\":\"CUDA session initialization failed\"}\n";
     return 1;
   }
+  const auto initialization_finished = clock::now();
+  const double initialization_seconds =
+      std::chrono::duration<double>(
+          initialization_finished - initialization_started).count();
+  const DeviceMemorySnapshot memory_after_initialization =
+      CaptureDeviceMemory();
 
   CudaAcceptedStepProblemMetadata problem{};
   const bool problem_captured =
@@ -798,23 +1143,62 @@ int RunBenchmark(const Options& options)
       problem.true_trace_unknowns != expected_true_trace_unknowns ||
       problem.true_trace_unknowns != problem.global_true_trace_unknowns)
   {
-    std::cerr << "{\"schema\":1,\"success\":false,"
+    std::cerr << "{\"schema\":2,\"success\":false,"
                  "\"error\":\"CUDA problem metadata validation failed\"}\n";
     return 1;
   }
 
-  std::vector<double> exported_interior(fields.initial.size(), 0.0);
+  std::vector<double> exported_interior(
+      options.export_interior ? fields.initial.size() : 0, 0.0);
   std::array<StepSample, total_steps> samples{};
   std::string error;
   for (int index = 0; index < total_steps; ++index)
   {
     const bool warmup = index < warmup_steps;
-    if (!RunStep(session, fields, exported_interior, options.timestep,
-                 options.export_interior, warmup,
-                 warmup ? -1 : index - warmup_steps,
-                 samples[static_cast<std::size_t>(index)], error))
+    const int measured_index = warmup ? -1 : index - warmup_steps;
+    const bool profile_this_step = options.profile_measured_step >= 0 &&
+        measured_index == options.profile_measured_step;
+    const auto run_step = [&]()
     {
-      std::cerr << "{\"schema\":1,\"success\":false,\"step_index\":"
+      return RunStep(session, fields, exported_interior, options.timestep,
+                     options.export_interior, options.engine, warmup,
+                     measured_index,
+                     samples[static_cast<std::size_t>(index)], error);
+    };
+    bool step_succeeded = false;
+    if (profile_this_step)
+    {
+      dg_igr::observability::set_runtime_enabled(true);
+      if (cudaProfilerStart() != cudaSuccess)
+      {
+        dg_igr::observability::set_runtime_enabled(false);
+        std::cerr << "{\"schema\":2,\"success\":false,"
+                     "\"error\":\"CUDA profiler start failed\"}\n";
+        return 1;
+      }
+      {
+        [[maybe_unused]] dg_igr::NVTXRange accepted_step_range(
+            "HDG/profiled-accepted-step");
+        step_succeeded = run_step();
+      }
+      const cudaError_t profile_sync_status = cudaDeviceSynchronize();
+      const cudaError_t profile_stop_status = cudaProfilerStop();
+      dg_igr::observability::set_runtime_enabled(false);
+      if (profile_sync_status != cudaSuccess ||
+          profile_stop_status != cudaSuccess)
+      {
+        std::cerr << "{\"schema\":2,\"success\":false,"
+                     "\"error\":\"CUDA profiler completion failed\"}\n";
+        return 1;
+      }
+    }
+    else
+    {
+      step_succeeded = run_step();
+    }
+    if (!step_succeeded)
+    {
+      std::cerr << "{\"schema\":2,\"success\":false,\"step_index\":"
                 << index << ",\"error\":\"" << error << "\"}\n";
       return 1;
     }
@@ -824,17 +1208,31 @@ int RunBenchmark(const Options& options)
   for (int index = 0; index < measured_steps; ++index)
     durations[static_cast<std::size_t>(index)] =
         samples[static_cast<std::size_t>(index + warmup_steps)].seconds;
+  const DeviceMemorySnapshot memory_after_samples = CaptureDeviceMemory();
+  const UmpireHighWatermarkSnapshot umpire_high_watermarks =
+      CaptureUmpireHighWatermarks();
 
   std::cout << std::setprecision(17)
-            << "{\"schema\":1,"
-            << "\"benchmark\":\"dg_igr_hdg_cuda_accepted_step_fp64\","
+            << "{\"schema\":2,"
+            << "\"benchmark\":\"dg_igr_hdg_cuda_accepted_step\","
             << "\"success\":true,"
+            << "\"backend\":\"cuda\","
+            << "\"cuda_engine\":\"" << EngineName(options.engine)
+            << "\","
+            << "\"trace_preconditioner\":\""
+            << CudaTracePreconditionerName(
+                   samples[static_cast<std::size_t>(warmup_steps)]
+                       .prepared.evidence.tensor_core.trace_preconditioner)
+            << "\","
             << "\"mode\":\""
             << (options.regularization == RegularizationKind::igr
                     ? "igr" : "conventional") << "\","
             << "\"precision\":\"fp64\","
+            << "\"time_integrator\":\"backward_euler\","
+            << "\"time_step_policy\":\"fixed\","
+            << "\"gamma\":" << benchmark_gamma << ','
             << "\"rank_count\":1,"
-            << "\"polynomial_order\":" << order << ','
+            << "\"polynomial_order\":" << options.order << ','
             << "\"mesh_n\":" << options.mesh_n << ','
             << "\"domain_periods\":" << options.domain_periods << ','
             << "\"domain_length\":" << options.domain_periods << ','
@@ -844,11 +1242,22 @@ int RunBenchmark(const Options& options)
             << static_cast<double>(options.domain_periods) /
                 static_cast<double>(options.mesh_n) << ','
             << "\"elements\":" << elements << ','
+            << "\"interior_components\":"
+            << problem.interior_components << ','
+            << "\"trace_components\":" << problem.trace_components << ','
             << "\"interior_unknowns\":" << problem.interior_unknowns << ','
             << "\"true_trace_unknowns\":"
             << problem.true_trace_unknowns << ','
             << "\"gpu_sm_count\":"
             << device_properties.multiProcessorCount << ','
+            << "\"gpu_name\":\"" << device_properties.name << "\","
+            << "\"gpu_device_ordinal\":" << active_device << ','
+            << "\"gpu_uuid\":\""
+            << CudaUuidString(device_properties.uuid) << "\","
+            << "\"gpu_compute_capability\":"
+            << 10 * device_properties.major + device_properties.minor << ','
+            << "\"cuda_driver_version\":" << driver_version << ','
+            << "\"cuda_runtime_version\":" << runtime_version << ','
             << "\"principal_threads\":" << principal_threads << ','
             << "\"principal_element_threads\":"
             << principal_element_threads << ','
@@ -857,10 +1266,93 @@ int RunBenchmark(const Options& options)
             << "\"principal_blocks\":" << principal_blocks << ','
             << "\"principal_execution\":"
                "\"four_lane_subwarp_per_element\","
+            << "\"initial_state_kind\":"
+               "\"projected_smooth_periodic\","
+            << "\"initial_trace_kind\":"
+               "\"projected_from_committed_interior\","
+            << "\"source_kind\":\"zero\","
+            << "\"boundary_kind\":\"periodic_topology\","
+            << "\"precision_policy\":{"
+               "\"external_state\":\"fp64\","
+               "\"local_lu\":\"fp64\","
+               "\"local_triangular_solve\":\"fp64\","
+               "\"tensor_operands\":\"fp64\","
+               "\"tensor_accumulation\":\"fp64\","
+               "\"acceptance_gates\":\"fp64\","
+               "\"mixed_precision_enabled\":false,"
+               "\"iterative_refinement_enabled\":false,"
+               "\"residual_replacement_enabled\":false,"
+               "\"precision_correction_enabled\":false},"
+            << "\"numerical_policy\":{"
+            << "\"volume_projection_quadrature_order\":"
+            << request.numerical_policy.volume_projection_quadrature_order
+            << ",\"true_trace_projection_quadrature_order\":"
+            << request.numerical_policy.true_trace_projection_quadrature_order
+            << ",\"conventional_assembly_quadrature_order\":"
+            << request.numerical_policy.conventional_assembly_quadrature_order
+            << ",\"igr_assembly_quadrature_order\":"
+            << request.numerical_policy.igr_assembly_quadrature_order
+            << ",\"maximum_nonlinear_updates\":"
+            << request.numerical_policy.maximum_nonlinear_updates
+            << ",\"requested_maximum_linear_iterations\":"
+            << request.numerical_policy.maximum_linear_iterations
+            << ",\"resolved_maximum_linear_iterations\":"
+            << dg::hdg::generic::ResolveEulerHdgMaximumLinearIterations(
+                   request.numerical_policy.maximum_linear_iterations,
+                   problem.global_true_trace_unknowns)
+            << ",\"krylov_restart_dimension\":"
+            << dg::hdg::generic::EulerHdgKrylovRestartDimension(
+                   problem.global_true_trace_unknowns)
+            << ",\"maximum_line_search_trials\":"
+            << request.numerical_policy.maximum_line_search_trials
+            << ",\"nonlinear_relative_tolerance\":"
+            << request.numerical_policy.nonlinear_relative_tolerance
+            << ",\"linear_relative_tolerance\":"
+            << request.numerical_policy.linear_relative_tolerance
+            << ",\"true_residual_relative_tolerance\":"
+            << request.numerical_policy.true_residual_relative_tolerance
+            << ",\"conservation_relative_tolerance\":"
+            << request.numerical_policy.conservation_relative_tolerance
+            << ",\"armijo_constant\":"
+            << request.numerical_policy.armijo_constant
+            << ",\"regularization\":\""
+            << (request.numerical_policy.stabilization.kind ==
+                        RegularizationKind::igr ? "igr" : "none")
+            << "\",\"igr_alpha\":"
+            << request.numerical_policy.stabilization.alpha
+            << ",\"igr_beta\":"
+            << request.numerical_policy.stabilization.beta << "},"
             << "\"dt\":" << options.timestep << ','
             << "\"host_export\":"
             << (options.export_interior ? "true" : "false") << ','
-            << "\"initialization_timed\":false,"
+            << "\"build_identity\":{"
+            << "\"source_revision\":\""
+            << DG_IGR_BENCHMARK_SOURCE_REVISION << "\","
+            << "\"source_tree\":\""
+            << DG_IGR_BENCHMARK_SOURCE_TREE << "\","
+            << "\"source_status\":\""
+            << DG_IGR_BENCHMARK_SOURCE_STATUS << "\","
+            << "\"build_directory\":\""
+            << DG_IGR_BENCHMARK_BUILD_DIRECTORY << "\","
+            << "\"cmake_cache\":\""
+            << DG_IGR_BENCHMARK_CMAKE_CACHE << "\"},"
+            << "\"profiling_observability\":"
+            << (options.profile_measured_step >= 0 ? "true" : "false")
+            << ",\"profile_measured_step\":"
+            << options.profile_measured_step << ','
+            << "\"initialization_in_primary_timing\":false,"
+            << "\"initialization_duration_seconds\":";
+  PrintJsonNumber(initialization_seconds);
+  std::cout << ",\"device_memory_snapshots\":{"
+            << "\"after_device_selection_before_problem\":";
+  PrintMemorySnapshot(memory_before_problem);
+  std::cout << ",\"after_initialization\":";
+  PrintMemorySnapshot(memory_after_initialization);
+  std::cout << ",\"after_samples\":";
+  PrintMemorySnapshot(memory_after_samples);
+  std::cout << "},\"umpire_allocator_high_watermarks_after_samples\":";
+  PrintUmpireHighWatermarks(umpire_high_watermarks);
+  std::cout << ','
             << "\"timing_scope\":\"Prepare+CapturePreparedObservation+"
             << (options.export_interior ? "ExportPreparedInteriorD2H+" : "")
             << "AcknowledgePreparedOutput+Commit\","
@@ -915,5 +1407,31 @@ int main(int argc, char* argv[])
                  "\"error\":\"benchmark requires exactly one MPI rank\"}\n";
     return 2;
   }
-  return RunBenchmark(options);
+  if (!ExactExpectedBuildIdentity(options))
+  {
+    std::cerr << "{\"schema\":2,\"success\":false,"
+                 "\"error\":\"benchmark source/build identity mismatch\"}\n";
+    return 2;
+  }
+  if (options.profile_measured_step >= 0 &&
+      !dg_igr::observability::nvtx_backend_enabled)
+  {
+    std::cerr << "{\"schema\":2,\"success\":false,"
+                 "\"error\":\"NVTX profiler build required\"}\n";
+    return 2;
+  }
+  const int result = RunBenchmark(options);
+  // Flush CUDA activity records after every benchmark route.  This runs only
+  // after the session, mesh, and MFEM device have been destroyed and remains
+  // outside initialization and accepted-step timing.  In particular, it lets
+  // profiler captures retain short-lived kernel and transfer activity rather
+  // than depending on process-exit cleanup.
+  const cudaError_t reset_status = cudaDeviceReset();
+  if (result == 0 && reset_status != cudaSuccess)
+  {
+    std::cerr << "{\"schema\":2,\"success\":false,"
+                 "\"error\":\"CUDA device reset failed\"}\n";
+    return 1;
+  }
+  return result;
 }

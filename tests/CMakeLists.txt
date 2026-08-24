@@ -10,6 +10,42 @@ set_tests_properties(dg_igr_cuda_build_policy PROPERTIES
   TIMEOUT 30
 )
 
+add_test(NAME dg_igr_hdg_tensor_campaign_python
+  COMMAND /usr/bin/env python3
+          ${CMAKE_SOURCE_DIR}/scripts/perf/test_hdg_tensor_campaign.py
+)
+set_tests_properties(dg_igr_hdg_tensor_campaign_python PROPERTIES
+  LABELS "hdg;tensor;campaign;python;no-gpu"
+  TIMEOUT 180
+)
+
+add_test(NAME dg_igr_profile_harness_python
+  COMMAND /usr/bin/env python3
+          ${CMAKE_SOURCE_DIR}/scripts/perf/test_profile_harness.py
+)
+set_tests_properties(dg_igr_profile_harness_python PROPERTIES
+  LABELS "profiling;provenance;python;no-gpu"
+  TIMEOUT 180
+)
+
+add_test(NAME dg_igr_gpu_memory_control_python
+  COMMAND /usr/bin/env python3
+          ${CMAKE_SOURCE_DIR}/scripts/perf/test_gpu_memory_control.py
+)
+set_tests_properties(dg_igr_gpu_memory_control_python PROPERTIES
+  LABELS "hdg;tensor;memory;campaign;python;no-gpu"
+  TIMEOUT 180
+)
+
+add_test(NAME dg_igr_hdg_tensor_memory_campaign_python
+  COMMAND /usr/bin/env python3
+          ${CMAKE_SOURCE_DIR}/scripts/perf/test_hdg_tensor_memory_campaign.py
+)
+set_tests_properties(dg_igr_hdg_tensor_memory_campaign_python PROPERTIES
+  LABELS "hdg;tensor;memory;campaign;python;no-gpu"
+  TIMEOUT 180
+)
+
 function(dg_igr_add_observability_test target_name compile_enabled caliper_enabled)
   add_executable(${target_name} test_observability.cpp)
   set_target_properties(${target_name} PROPERTIES
