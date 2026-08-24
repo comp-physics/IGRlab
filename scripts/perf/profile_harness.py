@@ -50,6 +50,7 @@ NCU_CONDENSATION_KERNEL = "TensorBorrowedCondenseKernel"
 NCU_CONDENSATION_FILTER = f"regex:.*{NCU_CONDENSATION_KERNEL}.*"
 NCU_CONDENSATION_NVTX_RANGE = "HDG/condensation/"
 NCU_ACCEPTED_STEP_NVTX_RANGE = "HDG/profiled-accepted-step/"
+PRODUCTION_TRACE_POLICY = "engine-default"
 NCU_ATTRIBUTION_RANGES = {
     "HDG/local-assembly": "local_assembly",
     "HDG/local-factorization": "local_factorization",
@@ -662,7 +663,7 @@ def required_application_value(parser: argparse.ArgumentParser,
     positions = [index for index, value in enumerate(args.arg) if value == option]
     if len(positions) != 1:
         parser.error(
-            f"NCU qualification requires exactly one application {option}"
+            f"profiler qualification requires exactly one application {option}"
         )
     position = positions[0]
     if position + 1 >= len(args.arg) or args.arg[position + 1].startswith("--"):
@@ -678,6 +679,7 @@ def validate_accepted_step_qualification_application(
         )
     expected_application = {
         "--engine": "tensor",
+        "--trace-policy": PRODUCTION_TRACE_POLICY,
         "--expected-source-revision": args.expected_commit,
         "--expected-source-tree": args.expected_tree,
         "--expected-source-status": "clean",

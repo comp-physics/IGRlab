@@ -263,6 +263,7 @@ else:
             application = [
                 "--arg=--mode", "--arg", "igr",
                 "--arg=--engine", "--arg", "tensor",
+                "--arg=--trace-policy", "--arg", "engine-default",
                 "--arg=--order", "--arg", "3",
                 "--arg=--mesh-n", "--arg", "52",
                 "--arg=--domain-periods", "--arg", "1",
@@ -422,6 +423,36 @@ else:
             env=qualification_env,
         ).stderr
 
+        missing_trace_policy_arguments = qualification_arguments(
+            root / "qualification-missing-trace-policy"
+        )
+        trace_policy_index = missing_trace_policy_arguments.index(
+            "--arg=--trace-policy"
+        )
+        del missing_trace_policy_arguments[
+            trace_policy_index:trace_policy_index + 3
+        ]
+        assert "requires exactly one application --trace-policy" in run(
+            *missing_trace_policy_arguments,
+            expected=2,
+            env=qualification_env,
+        ).stderr
+
+        ablation_trace_policy_arguments = qualification_arguments(
+            root / "qualification-ablation-trace-policy"
+        )
+        ablation_trace_policy_arguments[
+            ablation_trace_policy_arguments.index("engine-default")
+        ] = "common-fast"
+        ablation_trace_policy_error = run(
+            *ablation_trace_policy_arguments,
+            expected=2,
+            env=qualification_env,
+        ).stderr
+        assert "application --trace-policy='common-fast'" in \
+            ablation_trace_policy_error
+        assert "expected 'engine-default'" in ablation_trace_policy_error
+
         missing_category_out = root / "qualification-attribution-missing"
         run(
             *qualification_arguments(
@@ -442,6 +473,7 @@ else:
         nsys_application = [
             "--arg=--mode", "--arg", "conventional",
             "--arg=--engine", "--arg", "tensor",
+            "--arg=--trace-policy", "--arg", "engine-default",
             "--arg=--order", "--arg", "2",
             "--arg=--mesh-n", "--arg", "52",
             "--arg=--domain-periods", "--arg", "1",
@@ -553,6 +585,21 @@ else:
         assert "expected 'tensor'" in run(
             *wrong_nsys_application, expected=2, env=qualification_env
         ).stderr
+
+        wrong_nsys_trace_policy = list(nsys_qualification_arguments)
+        wrong_nsys_trace_policy[
+            wrong_nsys_trace_policy.index("engine-default")
+        ] = "common-fast"
+        wrong_nsys_trace_policy[
+            wrong_nsys_trace_policy.index(str(nsys_qualification_out))
+        ] = str(root / "qualification-nsys-ablation-trace-policy")
+        wrong_nsys_trace_policy_error = run(
+            *wrong_nsys_trace_policy, expected=2, env=qualification_env
+        ).stderr
+        assert "application --trace-policy='common-fast'" in \
+            wrong_nsys_trace_policy_error
+        assert "expected 'engine-default'" in \
+            wrong_nsys_trace_policy_error
 
         zero_out = root / "qualification-zero"
         run(
