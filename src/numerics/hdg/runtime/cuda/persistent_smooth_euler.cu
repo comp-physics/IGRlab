@@ -1,4 +1,5 @@
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler.cuh"
+#include "numerics/hdg/runtime/cuda/native_rank1_trace_solver.cuh"
 #include "physics/bc/detail/euler_boundary_state.hpp"
 
 #include <HYPRE_krylov.h>
@@ -930,16 +931,195 @@ bool CudaGetTrueMatrixDeviceView(mfem::HypreParMatrix& matrix,
                                  CudaTrueMatrixDeviceView& view) noexcept
 {
   CudaTrueSystemDiagnosticScope diagnostic("true-device-view");
-  hypre_ParCSRMatrix* raw = matrix;
-  auto* diag = hypre_ParCSRMatrixDiag(raw);
-  auto* offd = hypre_ParCSRMatrixOffd(raw);
-  view.diag_values = hypre_CSRMatrixData(diag);
-  view.offd_values = hypre_CSRMatrixData(offd);
-  view.diag_nonzeros = hypre_CSRMatrixNumNonzeros(diag);
-  view.offd_nonzeros = hypre_CSRMatrixNumNonzeros(offd);
-  diagnostic.result = view.diag_values != nullptr &&
-      (view.offd_nonzeros == 0 || view.offd_values != nullptr);
-  return diagnostic.result;
+  view = {};
+  try
+  {
+    // Callers establish device residency before borrowing these identities.
+    // Do not invoke an MFEM access transition here: this helper also runs on
+    // the ordinary HYPRE reuse path, where identity validation must add no
+    // recurring migration or synchronization work.
+    hypre_ParCSRMatrix* raw = matrix;
+    if (raw == nullptr) return false;
+    auto* diag = hypre_ParCSRMatrixDiag(raw);
+    auto* offd = hypre_ParCSRMatrixOffd(raw);
+    if (diag == nullptr || offd == nullptr) return false;
+    view.diag_offsets = hypre_CSRMatrixI(diag);
+    view.diag_columns = hypre_CSRMatrixJ(diag);
+    view.diag_values = hypre_CSRMatrixData(diag);
+    view.offd_offsets = hypre_CSRMatrixI(offd);
+    view.offd_columns = hypre_CSRMatrixJ(offd);
+    view.offd_values = hypre_CSRMatrixData(offd);
+    view.rows = hypre_CSRMatrixNumRows(diag);
+    view.diag_columns_count = hypre_CSRMatrixNumCols(diag);
+    view.diag_nonzeros = hypre_CSRMatrixNumNonzeros(diag);
+    view.offd_nonzeros = hypre_CSRMatrixNumNonzeros(offd);
+    diagnostic.result = view.rows > 0 && view.diag_columns_count > 0 &&
+        view.diag_nonzeros > 0 && view.offd_nonzeros >= 0 &&
+        view.diag_offsets != nullptr && view.diag_columns != nullptr &&
+        view.diag_values != nullptr && view.offd_offsets != nullptr &&
+        (view.offd_nonzeros == 0 ||
+         (view.offd_columns != nullptr && view.offd_values != nullptr));
+    return diagnostic.result;
+  }
+  catch (...) { return false; }
+}
+
+bool CudaQueryNativeRankOneTraceResources(
+    const int rows, const int krylov_dimension, const bool igr_active,
+    CudaNativeTraceWorkspaceRequirements& requirements,
+    CudaNativeTraceCooperativeSupport& support) noexcept
+{
+  requirements = {};
+  support = {};
+  const NativeTraceCooperativeSupport native_support =
+      QueryNativeRankOneTraceCooperativeSupport(
+          rows, krylov_dimension, igr_active);
+  support.supported = native_support.supported;
+  support.device = native_support.device;
+  support.compute_major = native_support.compute_major;
+  support.compute_minor = native_support.compute_minor;
+  support.multiprocessors = native_support.multiprocessors;
+  support.threads_per_block = native_support.threads_per_block;
+  support.maximum_active_blocks_per_multiprocessor =
+      native_support.maximum_active_blocks_per_multiprocessor;
+  support.cooperative_blocks = native_support.cooperative_blocks;
+  if (!support.supported || support.cooperative_blocks <= 0)
+    return false;
+  const NativeTraceWorkspaceRequirements native_requirements =
+      QueryNativeTraceWorkspaceRequirements(
+          rows, krylov_dimension, support.cooperative_blocks, igr_active);
+  requirements.valid = native_requirements.valid;
+  requirements.basis_doubles = native_requirements.basis_doubles;
+  requirements.vector_doubles = native_requirements.vector_doubles;
+  requirements.reduction_doubles = native_requirements.reduction_doubles;
+  requirements.small_doubles = native_requirements.small_doubles;
+  requirements.permutation_integers =
+      native_requirements.permutation_integers;
+  requirements.control_double_slots =
+      native_requirements.control_double_slots;
+  static_assert(NativeTraceControlDoubleSlots() <=
+                native_trace_host_control_double_capacity);
+  return requirements.valid &&
+      requirements.control_double_slots ==
+          NativeTraceControlDoubleSlots();
+}
+
+bool CudaLaunchNativeRankOneTraceSolver(
+    const CudaTrueMatrixDeviceView& matrix, const double* const rhs,
+    double* const solution, const bool igr_active,
+    const CudaNativeIlu0FactorView& ilu_factor,
+    const CudaNativeTraceWorkspaceView& workspace,
+    const CudaNativeTraceCooperativeSupport& support,
+    const double relative_tolerance, const int maximum_iterations,
+    const int krylov_dimension, const cudaStream_t stream) noexcept
+{
+  NativeTraceSystemView system{};
+  system.matrix = {matrix.diag_offsets, matrix.diag_columns,
+                   matrix.diag_values, matrix.rows,
+                   matrix.diag_columns_count, matrix.diag_nonzeros};
+  system.rhs = rhs;
+  system.solution = solution;
+
+  NativeTracePreconditionerView preconditioner{};
+  preconditioner.kind = igr_active
+      ? NativeTracePreconditionerKind::ilu0_rcm_jacobi
+      : NativeTracePreconditionerKind::diagonal;
+  if (igr_active)
+  {
+    preconditioner.ilu0.factor = {
+        ilu_factor.offsets, ilu_factor.columns, ilu_factor.values,
+        ilu_factor.rows, ilu_factor.rows, ilu_factor.nonzeros};
+    preconditioner.ilu0.permutation = ilu_factor.permutation;
+    preconditioner.ilu0.inverse_diagonal =
+        ilu_factor.inverse_diagonal;
+    preconditioner.ilu0.lower_jacobi_iterations =
+        ilu_factor.lower_jacobi_iterations;
+    preconditioner.ilu0.upper_jacobi_iterations =
+        ilu_factor.upper_jacobi_iterations;
+  }
+
+  NativeTraceWorkspaceView native_workspace{};
+  native_workspace.basis = workspace.basis;
+  native_workspace.basis_doubles = workspace.basis_doubles;
+  native_workspace.vectors = workspace.vectors;
+  native_workspace.vector_doubles = workspace.vector_doubles;
+  native_workspace.reduction = workspace.reduction;
+  native_workspace.reduction_doubles = workspace.reduction_doubles;
+  native_workspace.small = workspace.small;
+  native_workspace.small_doubles = workspace.small_doubles;
+  native_workspace.permutation_marks = workspace.permutation_marks;
+  native_workspace.permutation_integers = workspace.permutation_integers;
+  native_workspace.device_control =
+      reinterpret_cast<NativeTraceSolveControl*>(workspace.device_control);
+
+  NativeTraceSolvePolicy policy{};
+  policy.rank_count = 1;
+  policy.krylov_dimension = krylov_dimension;
+  policy.maximum_iterations = maximum_iterations;
+  policy.relative_tolerance = relative_tolerance;
+  policy.absolute_tolerance = 0.0;
+
+  NativeTraceCooperativeSupport native_support{};
+  native_support.supported = support.supported;
+  native_support.device = support.device;
+  native_support.compute_major = support.compute_major;
+  native_support.compute_minor = support.compute_minor;
+  native_support.multiprocessors = support.multiprocessors;
+  native_support.threads_per_block = support.threads_per_block;
+  native_support.maximum_active_blocks_per_multiprocessor =
+      support.maximum_active_blocks_per_multiprocessor;
+  native_support.cooperative_blocks = support.cooperative_blocks;
+  return LaunchNativeRankOneTraceSolve(
+      system, preconditioner, native_workspace, policy, native_support,
+      stream);
+}
+
+bool CudaDecodeNativeRankOneTraceControl(
+    const double* const host_control,
+    const std::size_t host_control_double_slots,
+    const double relative_tolerance, const int maximum_iterations,
+    const int krylov_dimension,
+    CudaNativeTraceSolveObservation& observation) noexcept
+{
+  observation = {};
+  if (host_control == nullptr ||
+      host_control_double_slots != NativeTraceControlDoubleSlots() ||
+      host_control_double_slots >
+          native_trace_host_control_double_capacity)
+    return false;
+  NativeTraceSolveControl native_result{};
+  std::memcpy(&native_result, host_control, sizeof(native_result));
+  NativeTraceSolvePolicy policy{};
+  policy.rank_count = 1;
+  policy.krylov_dimension = krylov_dimension;
+  policy.maximum_iterations = maximum_iterations;
+  policy.relative_tolerance = relative_tolerance;
+  policy.absolute_tolerance = 0.0;
+  observation.status = static_cast<int>(native_result.status);
+  observation.failure_mask = native_result.failure_mask;
+  observation.iterations = native_result.iterations;
+  observation.restart_cycles = native_result.restart_cycles;
+  observation.preconditioner_applications =
+      native_result.preconditioner_applications;
+  observation.actual_residual_checks =
+      native_result.actual_residual_checks;
+  observation.rhs_norm = native_result.rhs_norm;
+  observation.initial_residual_norm =
+      native_result.initial_residual_norm;
+  observation.estimated_residual_norm =
+      native_result.estimated_residual_norm;
+  observation.actual_residual_norm = native_result.actual_residual_norm;
+  observation.relative_residual_norm =
+      native_result.relative_residual_norm;
+  observation.finite =
+      std::isfinite(observation.rhs_norm) &&
+      std::isfinite(observation.initial_residual_norm) &&
+      std::isfinite(observation.estimated_residual_norm) &&
+      std::isfinite(observation.actual_residual_norm) &&
+      std::isfinite(observation.relative_residual_norm);
+  observation.ready_for_true_residual = observation.finite &&
+      NativeTraceResultIsReadyForTrueResidual(native_result, policy);
+  return true;
 }
 
 bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
@@ -1180,10 +1360,23 @@ bool CudaStableTrueMatrixExact(
           reinterpret_cast<std::uintptr_t>(&matrix) &&
       (state.hypre_matrix_token == 0 ||
        state.hypre_matrix_token == identity.hypre_matrix_token) &&
+      (state.diag_offsets_token == 0 ||
+       state.diag_offsets_token ==
+           reinterpret_cast<std::uintptr_t>(current.diag_offsets)) &&
+      (state.diag_columns_token == 0 ||
+       state.diag_columns_token ==
+           reinterpret_cast<std::uintptr_t>(current.diag_columns)) &&
       state.diag_values_token ==
           reinterpret_cast<std::uintptr_t>(current.diag_values) &&
+      (state.offd_offsets_token == 0 ||
+       state.offd_offsets_token ==
+           reinterpret_cast<std::uintptr_t>(current.offd_offsets)) &&
+      (state.offd_columns_token == 0 ||
+       state.offd_columns_token ==
+           reinterpret_cast<std::uintptr_t>(current.offd_columns)) &&
       state.offd_values_token ==
           reinterpret_cast<std::uintptr_t>(current.offd_values) &&
+      (state.matrix_rows == 0 || state.matrix_rows == current.rows) &&
       state.diag_nonzeros == current.diag_nonzeros &&
       state.offd_nonzeros == current.offd_nonzeros;
 }
@@ -1353,6 +1546,276 @@ bool CudaRetainedIluFactorExact(
 }
 } // namespace
 
+bool CudaPrepareNativeRankOneIluFactor(
+    mfem::HypreParMatrix& matrix, mfem::HypreParVector& rhs,
+    mfem::HypreParVector& solution, mfem::HypreILU& ilu,
+    const CudaTracePolicyDescriptor& policy,
+    const AttemptIdentity& attempt,
+    const std::uint64_t matrix_generation,
+    double* const inverse_diagonal,
+    const std::size_t inverse_diagonal_count,
+    CudaIluAttemptFactorState& factor_state,
+    CudaNativeIlu0FactorView& factor_view,
+    CudaSolveDiagnostics& diagnostics) noexcept
+{
+  CudaTrueSystemDiagnosticScope diagnostic("native-ilu-factor",
+                                           matrix_generation);
+  diagnostics = {};
+  diagnostics.matrix_generation = matrix_generation;
+  diagnostics.trace_solver = CudaTraceSolverKind::native_rank1_fp64;
+  diagnostics.trace_preconditioner = policy.trace_preconditioner;
+  diagnostics.igr_active = policy.igr_active;
+  diagnostics.ilu_type = policy.ilu_type;
+  diagnostics.ilu_level_of_fill = policy.ilu_level_of_fill;
+  diagnostics.ilu_local_reordering = policy.ilu_local_reordering;
+  diagnostics.ilu_application_iterations =
+      policy.ilu_application_iterations;
+  diagnostics.ilu_triangular_solve_kind =
+      policy.ilu_triangular_solve_kind;
+  diagnostics.ilu_lower_jacobi_iterations =
+      policy.ilu_lower_jacobi_iterations;
+  diagnostics.ilu_upper_jacobi_iterations =
+      policy.ilu_upper_jacobi_iterations;
+  diagnostics.ilu_accounting_kind =
+      CudaIluAccountingKind::derived_bounds_v1;
+  diagnostics.ilu_factor_reuse_policy =
+      policy.ilu_factor_reuse_policy;
+  factor_view = {};
+
+  CudaTrueMatrixDeviceView matrix_view{};
+  hypre_MemoryLocation inverse_location = hypre_MEMORY_UNDEFINED;
+  const bool exact_policy = CudaTracePolicyDescriptorIsExact(policy) &&
+      policy.selected_engine == generic::CudaEngineKind::tensor_core &&
+      policy.igr_active &&
+      policy.trace_preconditioner ==
+          CudaTracePreconditionerKind::hypre_ilu0 &&
+      policy.ilu_type == 0 && policy.ilu_level_of_fill == 0 &&
+      policy.ilu_local_reordering == 1 &&
+      policy.ilu_application_iterations == 1 &&
+      policy.ilu_triangular_solve_kind ==
+          CudaIluTriangularSolveKind::iterative_jacobi &&
+      policy.ilu_lower_jacobi_iterations ==
+          native_trace_ilu_jacobi_iterations &&
+      policy.ilu_upper_jacobi_iterations ==
+          native_trace_ilu_jacobi_iterations &&
+      policy.ilu_factor_reuse_policy ==
+          CudaIluFactorReusePolicy::first_trace_solve_per_attempt;
+  const bool matrix_ready = CudaHypreDevicePolicyValid(
+          matrix, rhs, solution) &&
+      CudaGetTrueMatrixDeviceView(matrix, matrix_view) &&
+      matrix_view.rows > 0 &&
+      matrix_view.rows == matrix_view.diag_columns_count &&
+      matrix_view.offd_nonzeros == 0 &&
+      inverse_diagonal_count ==
+          static_cast<std::size_t>(matrix_view.rows) &&
+      inverse_diagonal != nullptr &&
+      hypre_GetPointerLocation(inverse_diagonal, &inverse_location) == 0 &&
+      inverse_location == hypre_MEMORY_DEVICE;
+  const bool state_ready = exact_policy && matrix_ready &&
+      CudaIluFactorAttemptMatches(
+          factor_state, attempt, policy.ilu_factor_reuse_policy) &&
+      factor_state.matrix_object_token ==
+          reinterpret_cast<std::uintptr_t>(&matrix) &&
+      factor_state.diag_values_token ==
+          reinterpret_cast<std::uintptr_t>(matrix_view.diag_values) &&
+      factor_state.offd_values_token ==
+          reinterpret_cast<std::uintptr_t>(matrix_view.offd_values) &&
+      factor_state.diag_nonzeros == matrix_view.diag_nonzeros &&
+      factor_state.offd_nonzeros == 0 &&
+      (!factor_state.factor_ready ||
+       (factor_state.diag_offsets_token ==
+            reinterpret_cast<std::uintptr_t>(matrix_view.diag_offsets) &&
+        factor_state.diag_columns_token ==
+            reinterpret_cast<std::uintptr_t>(matrix_view.diag_columns) &&
+        factor_state.offd_offsets_token ==
+            reinterpret_cast<std::uintptr_t>(matrix_view.offd_offsets) &&
+        factor_state.offd_columns_token ==
+            reinterpret_cast<std::uintptr_t>(matrix_view.offd_columns) &&
+        factor_state.matrix_rows == matrix_view.rows));
+  if (!state_ready || HYPRE_GetError() != 0) return false;
+
+  const bool refresh_factor = CudaIluFactorRefreshRequired(factor_state);
+  const bool generation_ready = refresh_factor
+      ? !factor_state.factor_ready &&
+          factor_state.hypre_matrix_token == 0 &&
+          factor_state.ilu_handle_token == 0 &&
+          factor_state.factor_matrix_token == 0 &&
+          factor_state.factor_offsets_token == 0 &&
+          factor_state.factor_columns_token == 0 &&
+          factor_state.factor_values_token == 0 &&
+          factor_state.factor_permutation_token == 0 &&
+          factor_state.native_inverse_diagonal_token == 0 &&
+          factor_state.factor_generation == 0 &&
+          factor_state.last_solve_generation == 0
+      : factor_state.factor_ready &&
+          factor_state.factor_generation <=
+              factor_state.last_solve_generation &&
+          matrix_generation > factor_state.last_solve_generation;
+  if (!generation_ready) return false;
+
+  bool setup_ready = true;
+  try
+  {
+    if (refresh_factor)
+    {
+      ilu.SetOperator(matrix);
+      ilu.SetType(policy.ilu_type);
+      ilu.SetLevelOfFill(policy.ilu_level_of_fill);
+      ilu.SetLocalReordering(policy.ilu_local_reordering);
+      const HYPRE_Solver raw_ilu = static_cast<HYPRE_Solver>(ilu);
+      setup_ready = raw_ilu != nullptr &&
+          HYPRE_ILUSetTriSolve(raw_ilu, 0) == 0 &&
+          HYPRE_ILUSetLowerJacobiIters(
+              raw_ilu, policy.ilu_lower_jacobi_iterations) == 0 &&
+          HYPRE_ILUSetUpperJacobiIters(
+              raw_ilu, policy.ilu_upper_jacobi_iterations) == 0;
+      if (setup_ready)
+      {
+        ilu.SetMaxIter(policy.ilu_application_iterations);
+        ilu.SetTol(0.0);
+        ilu.SetPrintLevel(0);
+        hypre_ParCSRMatrix* const raw_matrix = matrix;
+        hypre_ParVector* const raw_rhs = rhs;
+        hypre_ParVector* const raw_solution = solution;
+        setup_ready = raw_matrix != nullptr && raw_rhs != nullptr &&
+            raw_solution != nullptr &&
+            HYPRE_ILUSetup(raw_ilu, raw_matrix, raw_rhs, raw_solution) == 0 &&
+            HYPRE_GetError() == 0;
+      }
+    }
+  }
+  catch (...) { setup_ready = false; }
+  if (!setup_ready) return false;
+
+  const HYPRE_Solver raw_ilu = static_cast<HYPRE_Solver>(ilu);
+  auto* const ilu_data =
+      reinterpret_cast<hypre_ParILUData*>(raw_ilu);
+  hypre_ParCSRMatrix* const raw_matrix = matrix;
+  hypre_CSRMatrix* const factor = ilu_data == nullptr ? nullptr :
+      hypre_ParILUDataMatBILUDevice(ilu_data);
+  HYPRE_Int* const permutation = ilu_data == nullptr ? nullptr :
+      hypre_ParILUDataPerm(ilu_data);
+  const int factor_rows = factor == nullptr ? 0 :
+      hypre_CSRMatrixNumRows(factor);
+  const int factor_columns = factor == nullptr ? 0 :
+      hypre_CSRMatrixNumCols(factor);
+  const int factor_nonzeros = factor == nullptr ? 0 :
+      hypre_CSRMatrixNumNonzeros(factor);
+  const int* const factor_offsets = factor == nullptr ? nullptr :
+      hypre_CSRMatrixI(factor);
+  const int* const factor_column_indices = factor == nullptr ? nullptr :
+      hypre_CSRMatrixJ(factor);
+  const double* const factor_values = factor == nullptr ? nullptr :
+      hypre_CSRMatrixData(factor);
+  hypre_MemoryLocation permutation_location = hypre_MEMORY_UNDEFINED;
+  const bool live_factor_ready = raw_ilu != nullptr && ilu_data != nullptr &&
+      raw_matrix != nullptr &&
+      hypre_ParILUDataMatA(ilu_data) == raw_matrix &&
+      hypre_ParILUDataIluType(ilu_data) == policy.ilu_type &&
+      hypre_ParILUDataLfil(ilu_data) == policy.ilu_level_of_fill &&
+      hypre_ParILUDataReorderingType(ilu_data) ==
+          policy.ilu_local_reordering &&
+      hypre_ParILUDataMaxIter(ilu_data) ==
+          policy.ilu_application_iterations &&
+      hypre_ParILUDataTol(ilu_data) == 0.0 &&
+      hypre_ParILUDataPrintLevel(ilu_data) == 0 &&
+      hypre_ParILUDataTriSolve(ilu_data) == 0 &&
+      hypre_ParILUDataLowerJacobiIters(ilu_data) ==
+          policy.ilu_lower_jacobi_iterations &&
+      hypre_ParILUDataUpperJacobiIters(ilu_data) ==
+          policy.ilu_upper_jacobi_iterations &&
+      hypre_ParILUDataIterativeSetupType(ilu_data) == 0 &&
+      factor != nullptr &&
+      hypre_CSRMatrixMemoryLocation(factor) == HYPRE_MEMORY_DEVICE &&
+      factor_rows == matrix_view.rows && factor_columns == factor_rows &&
+      factor_nonzeros >= factor_rows && factor_offsets != nullptr &&
+      factor_column_indices != nullptr && factor_values != nullptr &&
+      permutation != nullptr &&
+      hypre_GetPointerLocation(permutation, &permutation_location) == 0 &&
+      permutation_location == hypre_MEMORY_DEVICE &&
+      HYPRE_GetError() == 0;
+  if (!live_factor_ready) return false;
+
+  if (refresh_factor &&
+      (hypre_CSRMatrixExtractDiagonalDevice(
+           factor, inverse_diagonal, 2) != 0 ||
+       HYPRE_GetError() != 0))
+    return false;
+
+  const bool retained_exact = !refresh_factor
+      ? factor_state.hypre_matrix_token ==
+              reinterpret_cast<std::uintptr_t>(raw_matrix) &&
+          factor_state.ilu_handle_token ==
+              reinterpret_cast<std::uintptr_t>(raw_ilu) &&
+          factor_state.factor_matrix_token ==
+              reinterpret_cast<std::uintptr_t>(factor) &&
+          factor_state.factor_offsets_token ==
+              reinterpret_cast<std::uintptr_t>(factor_offsets) &&
+          factor_state.factor_columns_token ==
+              reinterpret_cast<std::uintptr_t>(factor_column_indices) &&
+          factor_state.factor_values_token ==
+              reinterpret_cast<std::uintptr_t>(factor_values) &&
+          factor_state.factor_permutation_token ==
+              reinterpret_cast<std::uintptr_t>(permutation) &&
+          factor_state.native_inverse_diagonal_token ==
+              reinterpret_cast<std::uintptr_t>(inverse_diagonal) &&
+          factor_state.factor_rows == factor_rows &&
+          factor_state.factor_nonzeros == factor_nonzeros
+      : true;
+  if (!retained_exact) return false;
+
+  factor_view.offsets = factor_offsets;
+  factor_view.columns = factor_column_indices;
+  factor_view.values = factor_values;
+  factor_view.permutation = permutation;
+  factor_view.inverse_diagonal = inverse_diagonal;
+  factor_view.rows = factor_rows;
+  factor_view.nonzeros = factor_nonzeros;
+  factor_view.lower_jacobi_iterations =
+      policy.ilu_lower_jacobi_iterations;
+  factor_view.upper_jacobi_iterations =
+      policy.ilu_upper_jacobi_iterations;
+
+  if (refresh_factor)
+  {
+    factor_state.hypre_matrix_token =
+        reinterpret_cast<std::uintptr_t>(raw_matrix);
+    factor_state.diag_offsets_token =
+        reinterpret_cast<std::uintptr_t>(matrix_view.diag_offsets);
+    factor_state.diag_columns_token =
+        reinterpret_cast<std::uintptr_t>(matrix_view.diag_columns);
+    factor_state.offd_offsets_token =
+        reinterpret_cast<std::uintptr_t>(matrix_view.offd_offsets);
+    factor_state.offd_columns_token =
+        reinterpret_cast<std::uintptr_t>(matrix_view.offd_columns);
+    factor_state.matrix_rows = matrix_view.rows;
+    factor_state.ilu_handle_token =
+        reinterpret_cast<std::uintptr_t>(raw_ilu);
+    factor_state.factor_matrix_token =
+        reinterpret_cast<std::uintptr_t>(factor);
+    factor_state.factor_offsets_token =
+        reinterpret_cast<std::uintptr_t>(factor_offsets);
+    factor_state.factor_columns_token =
+        reinterpret_cast<std::uintptr_t>(factor_column_indices);
+    factor_state.factor_values_token =
+        reinterpret_cast<std::uintptr_t>(factor_values);
+    factor_state.factor_permutation_token =
+        reinterpret_cast<std::uintptr_t>(permutation);
+    factor_state.native_inverse_diagonal_token =
+        reinterpret_cast<std::uintptr_t>(inverse_diagonal);
+    factor_state.factor_rows = factor_rows;
+    factor_state.factor_nonzeros = factor_nonzeros;
+    factor_state.factor_generation = matrix_generation;
+    factor_state.factor_ready = true;
+  }
+  diagnostics.ilu_factor_setups = refresh_factor ? 1 : 0;
+  diagnostics.ilu_factor_reuses = refresh_factor ? 0 : 1;
+  diagnostics.ilu_factor_age_generations = refresh_factor ? 0 :
+      matrix_generation - factor_state.factor_generation;
+  diagnostic.result = true;
+  return true;
+}
+
 bool CudaSolveWithIluFactorPolicy(
     mfem::HypreParMatrix& matrix, mfem::HypreParVector& rhs,
     mfem::HypreParVector& solution, mfem::HypreILU& ilu,
@@ -1374,6 +1837,9 @@ bool CudaSolveWithIluFactorPolicy(
       policy.ilu_factor_reuse_policy;
   diagnostics = {};
   diagnostics.matrix_generation = matrix_generation;
+  diagnostics.trace_solver = ranks == 2
+      ? CudaTraceSolverKind::hypre_host_staged_rank2
+      : CudaTraceSolverKind::hypre_parcsr_gmres;
   diagnostics.trace_preconditioner = kind;
   diagnostics.igr_active = igr_active;
   diagnostics.ilu_type = policy.ilu_type;
@@ -1697,6 +2163,9 @@ bool CudaRefreshDiagonalAndSolve(
                                            matrix_generation);
   diagnostics = {};
   diagnostics.matrix_generation = matrix_generation;
+  diagnostics.trace_solver = ranks == 2
+      ? CudaTraceSolverKind::hypre_host_staged_rank2
+      : CudaTraceSolverKind::hypre_parcsr_gmres;
   CudaDiagScaleSetupState setup_order{};
   const bool incoming_hypre_clean = HYPRE_GetError() == 0;
   if (!AllRanksReady(incoming_hypre_clean, communicator, ranks)) return false;

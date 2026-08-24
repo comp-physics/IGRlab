@@ -311,10 +311,130 @@ struct CudaTrueMatrixStructure
   std::vector<std::int64_t> offd_columns{};
 };
 
+// Private post-consensus implementation selection.  It is deliberately not a
+// CudaConfig field: the public engine remains ordinary CUDA or tensor CUDA,
+// and this leaf is resolved from that typed engine plus the admitted rank and
+// generic-lifecycle shape.
+enum class CudaTraceSolverKind : unsigned char
+{
+  unconfigured,
+  hypre_parcsr_gmres,
+  hypre_host_staged_rank2,
+  native_rank1_fp64
+};
+
+constexpr bool IsKnownCudaTraceSolverKind(
+    const CudaTraceSolverKind kind) noexcept
+{
+  return kind == CudaTraceSolverKind::hypre_parcsr_gmres ||
+      kind == CudaTraceSolverKind::hypre_host_staged_rank2 ||
+      kind == CudaTraceSolverKind::native_rank1_fp64;
+}
+
+constexpr CudaTraceSolverKind ResolveCudaTraceSolverKind(
+    const generic::CudaEngineKind engine, const int ranks,
+    const bool host_staged_rank2, const bool borrowed_topology,
+    const bool borrowed_host_inputs,
+    const bool generic_numerical_policy) noexcept
+{
+  if (!generic::IsKnownCudaEngineKind(engine) ||
+      (ranks != 1 && ranks != 2) ||
+      (ranks == 2 && !host_staged_rank2))
+    return CudaTraceSolverKind::unconfigured;
+  if (ranks == 2)
+    return CudaTraceSolverKind::hypre_host_staged_rank2;
+  if (engine == generic::CudaEngineKind::tensor_core && ranks == 1 &&
+      borrowed_topology && borrowed_host_inputs &&
+      generic_numerical_policy)
+    return CudaTraceSolverKind::native_rank1_fp64;
+  if (engine == generic::CudaEngineKind::tensor_core)
+    return CudaTraceSolverKind::unconfigured;
+  return CudaTraceSolverKind::hypre_parcsr_gmres;
+}
+
+// Private translation seam to the source-only native solver ABI.  Keeping
+// these primitive PODs here prevents the native CUDA leaf header from becoming
+// part of the public persistent-engine include surface.
+struct CudaNativeTraceWorkspaceRequirements
+{
+  bool valid = false;
+  std::size_t basis_doubles = 0;
+  std::size_t vector_doubles = 0;
+  std::size_t reduction_doubles = 0;
+  std::size_t small_doubles = 0;
+  std::size_t permutation_integers = 0;
+  std::size_t control_double_slots = 0;
+};
+
+struct CudaNativeTraceCooperativeSupport
+{
+  bool supported = false;
+  int device = -1;
+  int compute_major = 0;
+  int compute_minor = 0;
+  int multiprocessors = 0;
+  int threads_per_block = 0;
+  int maximum_active_blocks_per_multiprocessor = 0;
+  int cooperative_blocks = 0;
+};
+
+struct CudaNativeTraceWorkspaceView
+{
+  double* basis = nullptr;
+  std::size_t basis_doubles = 0;
+  double* vectors = nullptr;
+  std::size_t vector_doubles = 0;
+  double* reduction = nullptr;
+  std::size_t reduction_doubles = 0;
+  double* small = nullptr;
+  std::size_t small_doubles = 0;
+  int* permutation_marks = nullptr;
+  std::size_t permutation_integers = 0;
+  double* device_control = nullptr;
+};
+
+struct CudaNativeIlu0FactorView
+{
+  const int* offsets = nullptr;
+  const int* columns = nullptr;
+  const double* values = nullptr;
+  const int* permutation = nullptr;
+  const double* inverse_diagonal = nullptr;
+  int rows = 0;
+  int nonzeros = 0;
+  int lower_jacobi_iterations = 0;
+  int upper_jacobi_iterations = 0;
+};
+
+struct CudaNativeTraceSolveObservation
+{
+  int status = 0;
+  std::uint32_t failure_mask = 0;
+  int iterations = 0;
+  int restart_cycles = 0;
+  int preconditioner_applications = 0;
+  int actual_residual_checks = 0;
+  double rhs_norm = std::numeric_limits<double>::infinity();
+  double initial_residual_norm = std::numeric_limits<double>::infinity();
+  double estimated_residual_norm = std::numeric_limits<double>::infinity();
+  double actual_residual_norm = std::numeric_limits<double>::infinity();
+  double relative_residual_norm = std::numeric_limits<double>::infinity();
+  bool ready_for_true_residual = false;
+  bool finite = false;
+};
+
+inline constexpr std::size_t native_trace_host_control_double_capacity = 16;
+
 struct CudaTrueMatrixDeviceView
 {
+  const int* diag_offsets = nullptr;
+  const int* diag_columns = nullptr;
   double* diag_values = nullptr;
+  const int* offd_offsets = nullptr;
+  const int* offd_columns = nullptr;
   double* offd_values = nullptr;
+  int rows = 0;
+  int diag_columns_count = 0;
   int diag_nonzeros = 0;
   int offd_nonzeros = 0;
 };
@@ -331,16 +451,26 @@ struct CudaIluAttemptFactorState
       CudaIluFactorReusePolicy::not_applicable;
   std::uintptr_t matrix_object_token = 0;
   std::uintptr_t hypre_matrix_token = 0;
+  std::uintptr_t diag_offsets_token = 0;
+  std::uintptr_t diag_columns_token = 0;
   std::uintptr_t diag_values_token = 0;
+  std::uintptr_t offd_offsets_token = 0;
+  std::uintptr_t offd_columns_token = 0;
   std::uintptr_t offd_values_token = 0;
   std::uintptr_t ilu_handle_token = 0;
   std::uintptr_t factor_matrix_token = 0;
+  std::uintptr_t factor_offsets_token = 0;
+  std::uintptr_t factor_columns_token = 0;
   std::uintptr_t factor_values_token = 0;
   std::uintptr_t factor_permutation_token = 0;
+  std::uintptr_t native_inverse_diagonal_token = 0;
   std::uintptr_t jacobi_diagonal_vector_token = 0;
   std::uintptr_t jacobi_diagonal_values_token = 0;
+  int matrix_rows = 0;
   int diag_nonzeros = 0;
   int offd_nonzeros = 0;
+  int factor_rows = 0;
+  int factor_nonzeros = 0;
   std::uint64_t factor_generation = 0;
   std::uint64_t last_solve_generation = 0;
   bool active = false;
@@ -450,6 +580,7 @@ struct CudaGenericArenaLayout
   std::size_t element_faces = 0;
   std::size_t boundary_reference = 0;
   std::size_t boundary_pressure = 0;
+  std::size_t native_ilu_inverse_diagonal = 0;
   std::size_t solve_workspace = 0;
   std::size_t two_exchange_keys = 0;
 };
@@ -985,9 +1116,12 @@ struct CudaSolveDiagnostics
   bool configured_preconditioner = false;
   bool configured_ilu = false;
   bool configured_diagonal = false;
+  bool configured_native_solver = false;
   bool reported_tolerance_met = false;
   bool finite = false;
   std::uint64_t matrix_generation = 0;
+  CudaTraceSolverKind trace_solver =
+      CudaTraceSolverKind::unconfigured;
   CudaTracePreconditionerKind trace_preconditioner =
       CudaTracePreconditionerKind::unconfigured;
   int ilu_type = -1;
@@ -1023,7 +1157,16 @@ constexpr bool CudaTraceSolveReadyForTrueResidualVerification(
     const CudaSolveDiagnostics& diagnostics,
     const int maximum_iterations) noexcept
 {
-  return diagnostics.device_policy && diagnostics.configured_preconditioner &&
+  const bool solver_exact = diagnostics.trace_solver ==
+          CudaTraceSolverKind::native_rank1_fp64
+      ? diagnostics.configured_native_solver
+      : (diagnostics.trace_solver ==
+             CudaTraceSolverKind::hypre_parcsr_gmres ||
+         diagnostics.trace_solver ==
+             CudaTraceSolverKind::hypre_host_staged_rank2) &&
+          !diagnostics.configured_native_solver;
+  return solver_exact && diagnostics.device_policy &&
+      diagnostics.configured_preconditioner &&
       (diagnostics.configured_ilu != diagnostics.configured_diagonal) &&
       ((diagnostics.configured_ilu &&
         CudaTracePreconditionerIsIlu(
@@ -1461,6 +1604,32 @@ bool CudaGetTrueMatrixStructure(mfem::HypreParMatrix& matrix,
                                 CudaSynchronizeFunction synchronize) noexcept;
 bool CudaGetTrueMatrixDeviceView(mfem::HypreParMatrix& matrix,
                                  CudaTrueMatrixDeviceView& view) noexcept;
+bool CudaQueryNativeRankOneTraceResources(
+    int rows, int krylov_dimension, bool igr_active,
+    CudaNativeTraceWorkspaceRequirements& requirements,
+    CudaNativeTraceCooperativeSupport& support) noexcept;
+bool CudaLaunchNativeRankOneTraceSolver(
+    const CudaTrueMatrixDeviceView& matrix, const double* rhs,
+    double* solution, bool igr_active,
+    const CudaNativeIlu0FactorView& ilu_factor,
+    const CudaNativeTraceWorkspaceView& workspace,
+    const CudaNativeTraceCooperativeSupport& support,
+    double relative_tolerance, int maximum_iterations,
+    int krylov_dimension, cudaStream_t stream) noexcept;
+bool CudaDecodeNativeRankOneTraceControl(
+    const double* host_control, std::size_t host_control_double_slots,
+    double relative_tolerance, int maximum_iterations,
+    int krylov_dimension,
+    CudaNativeTraceSolveObservation& observation) noexcept;
+bool CudaPrepareNativeRankOneIluFactor(
+    mfem::HypreParMatrix& matrix, mfem::HypreParVector& rhs,
+    mfem::HypreParVector& solution, mfem::HypreILU& ilu,
+    const CudaTracePolicyDescriptor& policy,
+    const AttemptIdentity& attempt, std::uint64_t matrix_generation,
+    double* inverse_diagonal, std::size_t inverse_diagonal_count,
+    CudaIluAttemptFactorState& factor_state,
+    CudaNativeIlu0FactorView& factor_view,
+    CudaSolveDiagnostics& diagnostics) noexcept;
 bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
                                   mfem::HypreILU& ilu,
                                   mfem::HypreGMRES& gmres,
@@ -1660,6 +1829,12 @@ public:
             generic::RegularizationKind::igr;
     trace_policy_descriptor_ = ResolveCudaTracePolicy(
         cuda_engine_, igr_requested, trace_policy);
+    trace_solver_kind_ = CudaTraceSolverKind::unconfigured;
+    native_trace_requirements_ = {};
+    native_trace_support_ = {};
+    native_trace_workspace_ = {};
+    native_ilu_inverse_diagonal_ = nullptr;
+    native_trace_host_control_.fill(0.0);
     trace_preconditioner_ = CudaTracePreconditionerKind::unconfigured;
     ilu_factor_state_ = {};
     initialization_tensor_core_evidence_ = {};
@@ -1714,6 +1889,39 @@ public:
                             krylov_dimension_ > 0))
     {
       ReportCudaSetupFailure(evidence.rank, "generic-linear-policy");
+      return false;
+    }
+    trace_solver_kind_ = ResolveCudaTraceSolverKind(
+        cuda_engine_, ranks_, host_staged_rank2_, borrowed_topology_,
+        shape_.borrowed_host_inputs, config.use_generic_numerical_policy);
+    bool trace_solver_ready = IsKnownCudaTraceSolverKind(trace_solver_kind_);
+    if (trace_solver_ready && trace_solver_kind_ ==
+            CudaTraceSolverKind::native_rank1_fp64)
+    {
+      trace_solver_ready = CudaQueryNativeRankOneTraceResources(
+          shape_.true_trace_count, krylov_dimension_, shape_.igr_active,
+          native_trace_requirements_, native_trace_support_) &&
+          native_trace_requirements_.valid &&
+          native_trace_support_.supported &&
+          native_trace_support_.device == device_ &&
+          native_trace_support_.compute_major == 12 &&
+          native_trace_support_.compute_minor == 0 &&
+          native_trace_support_.threads_per_block == 256 &&
+          native_trace_support_.cooperative_blocks > 0 &&
+          native_trace_requirements_.control_double_slots > 0 &&
+          native_trace_requirements_.control_double_slots <=
+              native_trace_host_control_.size();
+    }
+    if (!CollectiveContinue(trace_solver_ready))
+    {
+      ReportCudaSetupFailure(evidence.rank, "trace-solver-admission");
+      return false;
+    }
+    const bool topology_storage_ready = AllocateTopologyStorage() &&
+        BuildHostGeometryAndMaps(config) && BuildLocalTraceGraph();
+    if (!CollectiveContinue(topology_storage_ready))
+    {
+      ReportCudaSetupFailure(evidence.rank, "build-topology-storage");
       return false;
     }
     if (!CollectiveContinue(InitializeBorrowedHostFields(config)))
@@ -1822,6 +2030,20 @@ public:
         initialization_tensor_core_evidence_.ilu_factor_age_generations;
     evidence.tensor_core.ilu_accounting_complete =
         initialization_tensor_core_evidence_.ilu_accounting_complete;
+    evidence.tensor_core.native_rank1_trace_solve_calls =
+        initialization_tensor_core_evidence_.native_rank1_trace_solve_calls;
+    evidence.tensor_core.hypre_trace_solve_calls =
+        initialization_tensor_core_evidence_.hypre_trace_solve_calls;
+    evidence.tensor_core.native_rank1_trace_solver_configured =
+        initialization_tensor_core_evidence_.
+            native_rank1_trace_solver_configured;
+    evidence.tensor_core.
+        hypre_host_staged_rank2_trace_solver_configured =
+            initialization_tensor_core_evidence_.
+                hypre_host_staged_rank2_trace_solver_configured;
+    evidence.tensor_core.trace_solver_accounting_complete =
+        initialization_tensor_core_evidence_.
+            trace_solver_accounting_complete;
     if (!CollectiveContinue(BindStateSlots()))
     {
       ReportCudaSetupFailure(evidence.rank, "bind-state-slots");
@@ -2149,20 +2371,34 @@ public:
         rank_, "reuse-persistence-predicates", "before", false);
     const CudaTracePreconditionerKind selected_preconditioner =
         trace_policy_descriptor_.trace_preconditioner;
-    const bool selected_preconditioner_ready = gmres_ &&
-        ((CudaTracePreconditionerIsIlu(selected_preconditioner) &&
-          ilu_ && !diagonal_ && trace_preconditioner_ ==
-              selected_preconditioner) ||
-         (selected_preconditioner ==
-              CudaTracePreconditionerKind::hypre_diag_scale &&
-          diagonal_ && !ilu_ && trace_preconditioner_ ==
-              selected_preconditioner));
+    const bool selected_preconditioner_ready = trace_solver_kind_ ==
+            CudaTraceSolverKind::native_rank1_fp64
+        ? !gmres_ && !diagonal_ &&
+            (CudaTracePreconditionerIsIlu(selected_preconditioner) ==
+                 static_cast<bool>(ilu_)) &&
+            trace_preconditioner_ == selected_preconditioner &&
+            native_trace_requirements_.valid &&
+            native_trace_support_.supported &&
+            native_trace_workspace_.device_control != nullptr
+        : gmres_ &&
+            ((CudaTracePreconditionerIsIlu(selected_preconditioner) &&
+              ilu_ && !diagonal_ && trace_preconditioner_ ==
+                  selected_preconditioner) ||
+             (selected_preconditioner ==
+                  CudaTracePreconditionerKind::hypre_diag_scale &&
+              diagonal_ && !ilu_ && trace_preconditioner_ ==
+                  selected_preconditioner));
     value.persistent_graph = true_matrix_ && local_trace_matrix_ &&
         selected_preconditioner_ready;
     value.persistent_slots = committed_slot_.interior.coefficients !=
             candidate_slot_.interior.coefficients &&
         committed_slot_.trace.coefficients != candidate_slot_.trace.coefficients;
-    value.persistent_workspace = view_.a != nullptr && view_.schur != nullptr;
+    value.persistent_workspace = view_.a != nullptr && view_.schur != nullptr &&
+        (trace_solver_kind_ != CudaTraceSolverKind::native_rank1_fp64 ||
+         (native_trace_workspace_.basis != nullptr &&
+          native_trace_workspace_.vectors != nullptr &&
+          native_trace_workspace_.reduction != nullptr &&
+          native_trace_workspace_.small != nullptr));
     ReportCudaWarmLifetimeMarker(
         rank_, "reuse-persistence-predicates", "after", true);
     ReportCudaWarmLifetimeMarker(
@@ -2687,6 +2923,14 @@ public:
         CudaTracePolicyDescriptorIsExact(trace_policy_descriptor_) &&
         trace_policy_descriptor_.igr_active == shape_.igr_active &&
         trace_preconditioner_ == trace_policy_descriptor_.trace_preconditioner;
+    result.tensor_core.native_rank1_trace_solver_configured =
+        trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64;
+    result.tensor_core.
+        hypre_host_staged_rank2_trace_solver_configured =
+            trace_solver_kind_ ==
+                CudaTraceSolverKind::hypre_host_staged_rank2;
+    result.tensor_core.trace_solver_accounting_complete =
+        IsKnownCudaTraceSolverKind(trace_solver_kind_);
     // Aggregate-accounting failure is sticky in the evidence but does not
     // redefine the independently verified live preconditioner configuration.
     (void)CudaInitializeIluEvidence(
@@ -3120,7 +3364,22 @@ public:
         accepted_allocation_events_ = current_allocation_events;
       allocation_plateau_sampled_ = true;
     }
+    const std::uint64_t completed_trace_solves =
+        static_cast<std::uint64_t>(result.trace_solves);
+    result.tensor_core.trace_solver_accounting_complete =
+        result.tensor_core.trace_solver_accounting_complete &&
+        ((trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64 &&
+          result.tensor_core.native_rank1_trace_solve_calls ==
+              completed_trace_solves &&
+          result.tensor_core.hypre_trace_solve_calls == 0) ||
+         ((trace_solver_kind_ == CudaTraceSolverKind::hypre_parcsr_gmres ||
+           trace_solver_kind_ ==
+               CudaTraceSolverKind::hypre_host_staged_rank2) &&
+          result.tensor_core.hypre_trace_solve_calls ==
+              completed_trace_solves &&
+          result.tensor_core.native_rank1_trace_solve_calls == 0));
     result.telemetry = DeviceResident() && NoFallback() &&
+        result.tensor_core.trace_solver_accounting_complete &&
         AllocatorPolicy::W8OwnedAllocationCalls() ==
             baseline_w8_owned_allocation_calls_ &&
         AllocatorPolicy::DeallocationEvents() ==
@@ -3771,8 +4030,7 @@ private:
     if (shape_.volume_points > maximum_volume_points ||
         shape_.face_points > maximum_face_points)
       return false;
-    return AllocateTopologyStorage() && BuildHostGeometryAndMaps(config) &&
-        BuildLocalTraceGraph();
+    return true;
   }
 
   bool BuildHostGeometryAndMaps(const CudaConfig&) noexcept;
@@ -3781,6 +4039,14 @@ private:
     try
     {
       const bool generic = borrowed_topology_ && shape_.borrowed_host_inputs;
+      const bool native_trace = trace_solver_kind_ ==
+          CudaTraceSolverKind::native_rank1_fp64;
+      if ((native_trace && (!generic || !native_trace_requirements_.valid ||
+                            !native_trace_support_.supported)) ||
+          (!native_trace &&
+           (native_trace_requirements_.valid ||
+            native_trace_support_.supported)))
+        return false;
       const auto checked_product = [](const std::size_t a,
                                       const std::size_t b,
                                       std::size_t& result)
@@ -3850,6 +4116,8 @@ private:
       valid = valid && checked_product(element_faces, conserved_components,
                                        layout.boundary_reference);
       layout.boundary_pressure = element_faces;
+      layout.native_ilu_inverse_diagonal =
+          native_trace && shape_.igr_active ? true_trace : 0;
       if (!valid) return false;
       const std::size_t host_elements = generic ? layout.elements : maximum_rank_elements;
       const std::size_t host_interior = generic ? interior :
@@ -3962,14 +4230,29 @@ private:
           checked_add(doubles, layout.face_weight) &&
           (!shape_.borrowed_static_boundary_policies ||
            (checked_add(doubles, layout.boundary_reference) &&
-            checked_add(doubles, layout.boundary_pressure)));
+            checked_add(doubles, layout.boundary_pressure))) &&
+          (!native_trace ||
+           (checked_add(doubles, layout.native_ilu_inverse_diagonal) &&
+            checked_add(doubles,
+                        native_trace_requirements_.basis_doubles) &&
+            checked_add(doubles,
+                        native_trace_requirements_.vector_doubles) &&
+            checked_add(doubles,
+                        native_trace_requirements_.reduction_doubles) &&
+            checked_add(doubles,
+                        native_trace_requirements_.small_doubles) &&
+            checked_add(doubles,
+                        native_trace_requirements_.control_double_slots)));
       std::size_t integers = 17;
       valid = valid && checked_add(integers, layout.element_trace) &&
           checked_add(integers, three_local_matrix) &&
           checked_add(integers, three_local_matrix) &&
           checked_add(integers, four_element_trace) &&
           (!shape_.borrowed_static_boundary_policies ||
-           checked_add(integers, layout.element_faces));
+           checked_add(integers, layout.element_faces)) &&
+          (!native_trace || checked_add(
+              integers,
+              native_trace_requirements_.permutation_integers));
       if (!valid || doubles > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
           integers > static_cast<std::size_t>(std::numeric_limits<int>::max()))
         return false;
@@ -4119,6 +4402,10 @@ private:
                           double* true_values,
                           bool completion_required) noexcept;
   bool AssembleTrueSystem() noexcept;
+  bool LaunchAndObserveNativeRankOneTraceSolve(
+      const CudaNativeIlu0FactorView& factor,
+      std::uint64_t matrix_generation,
+      CudaSolveDiagnostics& diagnostics) noexcept;
   bool SolveTrueSystem(double& true_relative_residual,
                        std::uint64_t matrix_generation,
                        int& linear_iterations,
@@ -4158,6 +4445,8 @@ private:
   bool oracle_capture_requested_ = false;
   generic::CudaEngineKind cuda_engine_ =
       generic::CudaEngineKind::ordinary;
+  CudaTraceSolverKind trace_solver_kind_ =
+      CudaTraceSolverKind::unconfigured;
   CudaTracePolicyDescriptor trace_policy_descriptor_{};
   MPI_Comm communicator_ = MPI_COMM_WORLD;
   int rank_ = -1;
@@ -4174,6 +4463,12 @@ private:
   CudaDeviceView view_{};
   CudaTrueMatrixStructure true_structure_{};
   CudaTrueMatrixDeviceView true_device_{};
+  CudaNativeTraceWorkspaceRequirements native_trace_requirements_{};
+  CudaNativeTraceCooperativeSupport native_trace_support_{};
+  CudaNativeTraceWorkspaceView native_trace_workspace_{};
+  double* native_ilu_inverse_diagonal_ = nullptr;
+  std::array<double, native_trace_host_control_double_capacity>
+      native_trace_host_control_{};
   std::vector<double> host_true_diag_values_{};
   std::vector<double> host_true_offd_values_{};
   double* double_arena_ = nullptr;

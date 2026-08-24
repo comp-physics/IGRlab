@@ -1,4 +1,5 @@
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler.cuh"
+#include "numerics/hdg/runtime/cuda/native_rank1_trace_solver.cuh"
 
 #include <mfem.hpp>
 
@@ -21,6 +22,9 @@ constexpr bool TrueResidualAuthorityPolicy() noexcept
 {
   dg::hdg::runtime::cuda_w8a::detail::CudaSolveDiagnostics diagnostics{};
   diagnostics.device_policy = true;
+  diagnostics.trace_solver =
+      dg::hdg::runtime::cuda_w8a::detail::CudaTraceSolverKind::
+          hypre_parcsr_gmres;
   diagnostics.configured_preconditioner = true;
   diagnostics.configured_ilu = true;
   diagnostics.trace_preconditioner =
@@ -51,6 +55,20 @@ constexpr bool TrueResidualAuthorityPolicy() noexcept
   const bool malformed_aggregate_is_not_a_gate =
       dg::hdg::runtime::cuda_w8a::detail::
           CudaTraceSolveReadyForTrueResidualVerification(diagnostics, 8);
+  auto unconfigured = diagnostics;
+  unconfigured.trace_solver =
+      dg::hdg::runtime::cuda_w8a::detail::CudaTraceSolverKind::unconfigured;
+  const bool unconfigured_solver_is_rejected =
+      !dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(unconfigured, 8);
+  auto native = diagnostics;
+  native.trace_solver =
+      dg::hdg::runtime::cuda_w8a::detail::CudaTraceSolverKind::
+          native_rank1_fp64;
+  native.configured_native_solver = true;
+  const bool native_solver_is_admitted =
+      dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(native, 8);
   diagnostics.configured_ilu = false;
   diagnostics.configured_diagonal = true;
   diagnostics.trace_preconditioner =
@@ -87,13 +105,110 @@ constexpr bool TrueResidualAuthorityPolicy() noexcept
       !dg::hdg::runtime::cuda_w8a::detail::
           CudaTraceSolveReadyForTrueResidualVerification(diagnostics, 8);
   return reported_tolerance_is_not_a_gate &&
-      malformed_aggregate_is_not_a_gate && diagonal_is_valid &&
+      malformed_aggregate_is_not_a_gate &&
+      unconfigured_solver_is_rejected && native_solver_is_admitted &&
+      diagonal_is_valid &&
       neither_is_rejected && both_are_rejected && cap_is_inclusive &&
       negative_iteration_is_rejected && over_cap_is_rejected;
 }
 
 static_assert(TrueResidualAuthorityPolicy(),
               "the rebuilt true residual must remain authoritative");
+
+constexpr bool TraceSolverSelectionPolicy() noexcept
+{
+  using dg::hdg::generic::CudaEngineKind;
+  using dg::hdg::runtime::cuda_w8a::detail::CudaTraceSolverKind;
+  using dg::hdg::runtime::cuda_w8a::detail::ResolveCudaTraceSolverKind;
+  return ResolveCudaTraceSolverKind(
+             CudaEngineKind::ordinary, 1, false, true, true, true) ==
+          CudaTraceSolverKind::hypre_parcsr_gmres &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::ordinary, 2, true, true, true, true) ==
+          CudaTraceSolverKind::hypre_host_staged_rank2 &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 1, false, true, true, true) ==
+          CudaTraceSolverKind::native_rank1_fp64 &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 1, false, false, false, false) ==
+          CudaTraceSolverKind::unconfigured &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 2, true, true, true, true) ==
+          CudaTraceSolverKind::hypre_host_staged_rank2 &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 2, false, true, true, true) ==
+          CudaTraceSolverKind::unconfigured;
+}
+
+static_assert(TraceSolverSelectionPolicy(),
+              "trace solver selection must be typed and fail closed");
+
+bool NativeBoundedResultPolicy() noexcept
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  NativeTraceSolvePolicy policy{};
+  policy.rank_count = 1;
+  policy.krylov_dimension = 4;
+  policy.maximum_iterations = 8;
+  policy.relative_tolerance = 1.0e-6;
+  NativeTraceSolveControl result{};
+  result.schema = native_trace_control_schema;
+  result.status = NativeTraceSolveStatus::maximum_iterations;
+  result.iterations = 8;
+  result.restart_cycles = 2;
+  result.preconditioner_applications = 10;
+  result.actual_residual_checks = 2;
+  result.rhs_norm = 1.0;
+  result.initial_residual_norm = 1.0;
+  result.estimated_residual_norm = 1.0e-3;
+  result.actual_residual_norm = 1.0e-3;
+  result.relative_residual_norm = 1.0e-3;
+  const bool bounded_maximum_reaches_true_gate =
+      NativeTraceResultIsReadyForTrueResidual(result, policy);
+  result.status = NativeTraceSolveStatus::converged;
+  const bool false_internal_convergence_is_rejected =
+      !NativeTraceResultIsReadyForTrueResidual(result, policy);
+  result.status = NativeTraceSolveStatus::maximum_iterations;
+  result.iterations = 7;
+  const bool premature_maximum_is_rejected =
+      !NativeTraceResultIsReadyForTrueResidual(result, policy);
+  result.status =
+      NativeTraceSolveStatus::bounded_real_residual_stagnation;
+  const bool bounded_stagnation_reaches_true_gate =
+      NativeTraceResultIsReadyForTrueResidual(result, policy);
+  result.iterations = 0;
+  const bool fabricated_stagnation_is_rejected =
+      !NativeTraceResultIsReadyForTrueResidual(result, policy);
+  result.iterations = 7;
+  result.failure_mask = 1;
+  const bool failed_stagnation_is_rejected =
+      !NativeTraceResultIsReadyForTrueResidual(result, policy);
+  return bounded_maximum_reaches_true_gate &&
+      false_internal_convergence_is_rejected &&
+      premature_maximum_is_rejected &&
+      bounded_stagnation_reaches_true_gate &&
+      fabricated_stagnation_is_rejected &&
+      failed_stagnation_is_rejected;
+}
+
+bool NativeWorkspaceRequirementsPolicy() noexcept
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  const NativeTraceWorkspaceRequirements conventional =
+      QueryNativeTraceWorkspaceRequirements(10, 4, 2, false);
+  const NativeTraceWorkspaceRequirements igr =
+      QueryNativeTraceWorkspaceRequirements(10, 4, 2, true);
+  return conventional.valid && igr.valid &&
+      conventional.basis_doubles == 50 && igr.basis_doubles == 50 &&
+      conventional.vector_doubles == 10 && igr.vector_doubles == 30 &&
+      conventional.reduction_doubles == 2 &&
+      igr.reduction_doubles == 2 &&
+      conventional.small_doubles == 33 && igr.small_doubles == 33 &&
+      conventional.permutation_integers == 0 &&
+      igr.permutation_integers == 10 &&
+      conventional.control_double_slots == NativeTraceControlDoubleSlots() &&
+      igr.control_double_slots == NativeTraceControlDoubleSlots();
+}
 
 constexpr bool IluSetupOrderPolicy() noexcept
 {
@@ -510,6 +625,11 @@ IluDiagnostics(const bool igr_active,
   using namespace dg::hdg::runtime::cuda_w8a::detail;
   CudaSolveDiagnostics diagnostics{};
   diagnostics.device_policy = true;
+  diagnostics.trace_solver = engine == CudaEngineKind::tensor_core
+      ? CudaTraceSolverKind::native_rank1_fp64
+      : CudaTraceSolverKind::hypre_parcsr_gmres;
+  diagnostics.configured_native_solver =
+      diagnostics.trace_solver == CudaTraceSolverKind::native_rank1_fp64;
   diagnostics.configured_preconditioner = true;
   diagnostics.configured_ilu = true;
   diagnostics.trace_preconditioner =
@@ -816,13 +936,20 @@ bool IluFactorStateLifecyclePolicy() noexcept
       !::dg::hdg::runtime::detail::SameAttempt(
           state.attempt, empty_attempt) ||
       state.matrix_object_token != 0 || state.hypre_matrix_token != 0 ||
+      state.diag_offsets_token != 0 || state.diag_columns_token != 0 ||
       state.diag_values_token != 0 || state.offd_values_token != 0 ||
+      state.offd_offsets_token != 0 || state.offd_columns_token != 0 ||
       state.ilu_handle_token != 0 || state.factor_matrix_token != 0 ||
+      state.factor_offsets_token != 0 ||
+      state.factor_columns_token != 0 ||
       state.factor_values_token != 0 ||
       state.factor_permutation_token != 0 ||
+      state.native_inverse_diagonal_token != 0 ||
       state.jacobi_diagonal_vector_token != 0 ||
       state.jacobi_diagonal_values_token != 0 ||
+      state.matrix_rows != 0 ||
       state.diag_nonzeros != 0 || state.offd_nonzeros != 0 ||
+      state.factor_rows != 0 || state.factor_nonzeros != 0 ||
       state.factor_generation != 0 || state.last_solve_generation != 0)
     return false;
 
@@ -848,10 +975,19 @@ bool IluFactorStateLifecyclePolicy() noexcept
           CudaIluFactorReusePolicy::first_trace_solve_per_attempt) &&
       CudaIluFactorRefreshRequired(state) && !state.factor_ready &&
       state.hypre_matrix_token == 0 && state.ilu_handle_token == 0 &&
+      state.diag_offsets_token == 0 && state.diag_columns_token == 0 &&
+      state.diag_values_token == 201 &&
+      state.offd_offsets_token == 0 && state.offd_columns_token == 0 &&
+      state.offd_values_token == 301 &&
       state.factor_matrix_token == 0 && state.factor_values_token == 0 &&
+      state.factor_offsets_token == 0 &&
+      state.factor_columns_token == 0 &&
       state.factor_permutation_token == 0 &&
+      state.native_inverse_diagonal_token == 0 &&
       state.jacobi_diagonal_vector_token == 0 &&
       state.jacobi_diagonal_values_token == 0 &&
+      state.matrix_rows == 0 && state.factor_rows == 0 &&
+      state.factor_nonzeros == 0 &&
       state.factor_generation == 0 && state.last_solve_generation == 0;
 }
 
@@ -1263,7 +1399,9 @@ int main(int argc, char** argv)
   const std::string_view mode = argc == 2 ? argv[1] : "";
   const bool known_mode = mode.empty() || mode == "--token-negatives" ||
       mode == "--functional";
-  const bool pass = IluFactorStateLifecyclePolicy() && known_mode && (ranks == 1
+  const bool pass = NativeBoundedResultPolicy() &&
+      NativeWorkspaceRequirementsPolicy() &&
+      IluFactorStateLifecyclePolicy() && known_mode && (ranks == 1
       ? (mode == "--functional" ? FunctionalRestart<RankOneTag>(ranks)
          : mode == "--token-negatives" ? TokenFaults<RankOneTag>(ranks)
          : LifecycleAndRecovery<RankOneTag>(ranks))

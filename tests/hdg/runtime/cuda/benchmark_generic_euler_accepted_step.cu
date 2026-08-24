@@ -407,6 +407,20 @@ const char* EngineName(const CudaEngineKind engine) noexcept
   return engine == CudaEngineKind::tensor_core ? "tensor" : "ordinary";
 }
 
+const char* TraceSolverName(const CudaTensorCoreEvidence& evidence) noexcept
+{
+  if (evidence.native_rank1_trace_solver_configured &&
+      !evidence.hypre_host_staged_rank2_trace_solver_configured)
+    return "native-rank1-fp64";
+  if (!evidence.native_rank1_trace_solver_configured &&
+      evidence.hypre_host_staged_rank2_trace_solver_configured)
+    return "hypre-host-staged-rank2";
+  if (!evidence.native_rank1_trace_solver_configured &&
+      !evidence.hypre_host_staged_rank2_trace_solver_configured)
+    return "hypre-parcsr-gmres";
+  return "invalid";
+}
+
 bool ParseOptions(const int argc, char* argv[], Options& options,
                   std::string& error)
 {
@@ -967,13 +981,24 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
             tensor.ilu_jacobi_factor_spmv_updates_upper_bound == 0 &&
             tensor.ilu_factor_age_generations == 0 &&
             tensor.ilu_accounting_complete;
+  const bool expected_native_solver =
+      engine == CudaEngineKind::tensor_core;
+  const bool trace_solver_consistent =
+      tensor.trace_solver_accounting_complete &&
+      tensor.native_rank1_trace_solver_configured ==
+          expected_native_solver &&
+      !tensor.hypre_host_staged_rank2_trace_solver_configured &&
+      tensor.native_rank1_trace_solve_calls ==
+          (expected_native_solver ? trace_solves : 0) &&
+      tensor.hypre_trace_solve_calls ==
+          (expected_native_solver ? 0 : trace_solves);
   const bool expected_engine =
       CudaTracePolicyDescriptorIsExact(expected_policy) &&
       tensor.selected_engine == engine &&
       tensor.trace_policy == trace_policy &&
       tensor.trace_preconditioner_configured &&
       tensor.trace_preconditioner == expected_preconditioner &&
-      ilu_work_consistent &&
+      ilu_work_consistent && trace_solver_consistent &&
       tensor.fallback_count == 0 && tensor.fallback_accounting_complete &&
       evidence.no_fallback &&
       (engine == CudaEngineKind::ordinary
@@ -1286,6 +1311,8 @@ void PrintStep(const StepSample& sample)
             << "\"trace_preconditioner\":\""
             << CudaTracePreconditionerName(
                    evidence.tensor_core.trace_preconditioner) << "\","
+            << "\"trace_solver\":\""
+            << TraceSolverName(evidence.tensor_core) << "\","
             << "\"ilu_type\":" << evidence.tensor_core.ilu_type << ','
             << "\"ilu_level_of_fill\":"
             << evidence.tensor_core.ilu_level_of_fill << ','
@@ -1330,6 +1357,19 @@ void PrintStep(const StepSample& sample)
             << evidence.tensor_core.ilu_factor_age_generations << ','
             << "\"ilu_accounting_complete\":" << std::boolalpha
             << evidence.tensor_core.ilu_accounting_complete << ','
+            << "\"native_rank1_trace_solve_calls\":"
+            << evidence.tensor_core.native_rank1_trace_solve_calls << ','
+            << "\"hypre_trace_solve_calls\":"
+            << evidence.tensor_core.hypre_trace_solve_calls << ','
+            << "\"native_rank1_trace_solver_configured\":"
+            << std::boolalpha
+            << evidence.tensor_core.native_rank1_trace_solver_configured
+            << ','
+            << "\"hypre_host_staged_rank2_trace_solver_configured\":"
+            << evidence.tensor_core.
+                   hypre_host_staged_rank2_trace_solver_configured << ','
+            << "\"trace_solver_accounting_complete\":"
+            << evidence.tensor_core.trace_solver_accounting_complete << ','
             << "\"trace_preconditioner_configured\":" << std::boolalpha
             << evidence.tensor_core.trace_preconditioner_configured << ','
             << "\"hardware_supported\":" << std::boolalpha

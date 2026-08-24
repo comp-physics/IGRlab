@@ -923,6 +923,31 @@ BindArenaViews() noexcept
     view_.boundary_pressure = take_d(generic ?
         generic_arena_layout_.boundary_pressure : 0);
   }
+  if (trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64)
+  {
+    native_ilu_inverse_diagonal_ =
+        generic_arena_layout_.native_ilu_inverse_diagonal == 0
+        ? nullptr
+        : take_d(generic_arena_layout_.native_ilu_inverse_diagonal);
+    native_trace_workspace_.basis =
+        take_d(native_trace_requirements_.basis_doubles);
+    native_trace_workspace_.basis_doubles =
+        native_trace_requirements_.basis_doubles;
+    native_trace_workspace_.vectors =
+        take_d(native_trace_requirements_.vector_doubles);
+    native_trace_workspace_.vector_doubles =
+        native_trace_requirements_.vector_doubles;
+    native_trace_workspace_.reduction =
+        take_d(native_trace_requirements_.reduction_doubles);
+    native_trace_workspace_.reduction_doubles =
+        native_trace_requirements_.reduction_doubles;
+    native_trace_workspace_.small =
+        take_d(native_trace_requirements_.small_doubles);
+    native_trace_workspace_.small_doubles =
+        native_trace_requirements_.small_doubles;
+    native_trace_workspace_.device_control =
+        take_d(native_trace_requirements_.control_double_slots);
+  }
   if (static_cast<std::size_t>(d - double_arena_) >
       double_arena_capacity_)
     return false;
@@ -950,6 +975,15 @@ BindArenaViews() noexcept
   view_.vector_owned_target = TakeArena(i, max_er);
   view_.vector_send_source = TakeArena(i, max_er);
   view_.vector_receive_target = TakeArena(i, max_er);
+  if (trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64)
+  {
+    native_trace_workspace_.permutation_marks =
+        native_trace_requirements_.permutation_integers == 0
+        ? nullptr
+        : TakeArena(i, native_trace_requirements_.permutation_integers);
+    native_trace_workspace_.permutation_integers =
+        native_trace_requirements_.permutation_integers;
+  }
   if (static_cast<std::size_t>(i - integer_arena_) >
       integer_arena_capacity_)
     return false;
@@ -1071,11 +1105,25 @@ BuildPersistentTrueSystem() noexcept
       trace_policy.trace_preconditioner;
   const bool use_ilu =
       CudaTracePreconditionerIsIlu(selected_preconditioner);
+  const bool use_native = trace_solver_kind_ ==
+      CudaTraceSolverKind::native_rank1_fp64;
+  if (!IsKnownCudaTraceSolverKind(trace_solver_kind_) ||
+      (use_native && (ranks_ != 1 || !borrowed_topology_ ||
+                      !shape_.borrowed_host_inputs)))
+    return false;
   initialization_tensor_core_evidence_ = {};
   initialization_tensor_core_evidence_.selected_engine = cuda_engine_;
   initialization_tensor_core_evidence_.trace_policy = trace_policy.selection;
   initialization_tensor_core_evidence_.trace_preconditioner =
       selected_preconditioner;
+  initialization_tensor_core_evidence_.native_rank1_trace_solver_configured =
+      use_native;
+  initialization_tensor_core_evidence_.
+      hypre_host_staged_rank2_trace_solver_configured =
+          trace_solver_kind_ ==
+              CudaTraceSolverKind::hypre_host_staged_rank2;
+  initialization_tensor_core_evidence_.trace_solver_accounting_complete =
+      true;
   // Aggregate work evidence is qualification-only.  The independently
   // verified HYPRE configuration below remains the setup authority if
   // bookkeeping cannot be initialized.
@@ -1093,6 +1141,31 @@ BuildPersistentTrueSystem() noexcept
                                    &TransportPolicy::DeviceToHost,
                                    &TransportPolicy::Synchronize) &&
         CudaGetTrueMatrixDeviceView(*true_matrix_, true_device_);
+    if (local_objects_ready && use_native)
+    {
+      bool diagonal_first = true_structure_.rows == shape_.true_trace_count &&
+          true_device_.rows == shape_.true_trace_count &&
+          true_device_.diag_columns_count == shape_.true_trace_count &&
+          true_structure_.offd_nonzeros == 0 &&
+          true_device_.offd_nonzeros == 0 &&
+          true_structure_.diag_offsets.size() ==
+              static_cast<std::size_t>(shape_.true_trace_count) + 1 &&
+          true_structure_.diag_columns.size() ==
+              static_cast<std::size_t>(true_structure_.diag_nonzeros);
+      for (int row = 0; diagonal_first && row < shape_.true_trace_count;
+           ++row)
+      {
+        const int begin = true_structure_.diag_offsets[
+            static_cast<std::size_t>(row)];
+        const int end = true_structure_.diag_offsets[
+            static_cast<std::size_t>(row + 1)];
+        diagonal_first = begin >= 0 && begin < end &&
+            end <= true_structure_.diag_nonzeros &&
+            true_structure_.diag_columns[
+                static_cast<std::size_t>(begin)] == row;
+      }
+      local_objects_ready = diagonal_first;
+    }
     if (local_objects_ready && oracle_capture_requested_)
     {
       local_objects_ready = true_structure_.diag_nonzeros >= 0 &&
@@ -1118,10 +1191,11 @@ BuildPersistentTrueSystem() noexcept
       hypre_action_.emplace(*true_matrix_);
       if (use_ilu)
         ilu_.emplace();
-      else
+      else if (!use_native)
         diagonal_.emplace();
-      gmres_.emplace(*true_matrix_);
-      if (use_ilu)
+      if (!use_native)
+        gmres_.emplace(*true_matrix_);
+      if (!use_native && use_ilu)
       {
         CudaHypreSetupState initial_setup{};
         local_objects_ready = CudaConfigurePersistentHypre(
@@ -1131,7 +1205,7 @@ BuildPersistentTrueSystem() noexcept
             initial_setup.ConfigurationExactForGeneration(
                 0, trace_policy);
       }
-      else
+      else if (!use_native)
       {
         CudaDiagScaleSetupState initial_setup{};
         local_objects_ready = CudaConfigurePersistentDiagonal(
@@ -1194,24 +1268,62 @@ BuildPersistentTrueSystem() noexcept
   *hypre_rhs_ = 1.0;
   *hypre_solution_ = 0.0;
   CudaSolveDiagnostics warm{};
-  const bool warm_solved =
-      use_ilu
-      ? CudaRefreshFactorAndSolve(
-            *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
-            ranks_, communicator_, trace_policy,
-            linear_relative_tolerance_, maximum_linear_iterations_,
-            krylov_dimension_, 0, warm)
-      : CudaRefreshDiagonalAndSolve(
-            *true_matrix_, *hypre_rhs_, *hypre_solution_, *diagonal_,
-            *gmres_, ranks_, communicator_, trace_policy,
-            linear_relative_tolerance_,
-            maximum_linear_iterations_, krylov_dimension_, 0, warm);
+  bool warm_solved = false;
+  if (use_native)
+  {
+    CudaNativeIlu0FactorView warm_factor{};
+    CudaIluAttemptFactorState warm_factor_state{};
+    const AttemptIdentity warm_attempt{};
+    bool warm_factor_ready = !use_ilu;
+    if (use_ilu)
+    {
+      warm_factor_ready = CudaBeginIluFactorAttempt(
+          warm_factor_state, warm_attempt,
+          trace_policy.ilu_factor_reuse_policy,
+          reinterpret_cast<std::uintptr_t>(true_matrix_.get()),
+          reinterpret_cast<std::uintptr_t>(true_device_.diag_values),
+          reinterpret_cast<std::uintptr_t>(true_device_.offd_values),
+          true_device_.diag_nonzeros, true_device_.offd_nonzeros) &&
+          CudaPrepareNativeRankOneIluFactor(
+              *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_,
+              trace_policy, warm_attempt, 0,
+              native_ilu_inverse_diagonal_,
+              generic_arena_layout_.native_ilu_inverse_diagonal,
+              warm_factor_state, warm_factor, warm);
+    }
+    warm_solved = warm_factor_ready &&
+        LaunchAndObserveNativeRankOneTraceSolve(warm_factor, 0, warm);
+  }
+  else
+  {
+    warm_solved = use_ilu
+        ? CudaRefreshFactorAndSolve(
+              *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
+              ranks_, communicator_, trace_policy,
+              linear_relative_tolerance_, maximum_linear_iterations_,
+              krylov_dimension_, 0, warm)
+        : CudaRefreshDiagonalAndSolve(
+              *true_matrix_, *hypre_rhs_, *hypre_solution_, *diagonal_,
+              *gmres_, ranks_, communicator_, trace_policy,
+              linear_relative_tolerance_,
+              maximum_linear_iterations_, krylov_dimension_, 0, warm);
+  }
   if (use_ilu && warm_solved)
     (void)CudaAccumulateIluSolveEvidence(
         initialization_tensor_core_evidence_, warm);
+  if (warm_solved)
+  {
+    if (use_native)
+      initialization_tensor_core_evidence_.
+          native_rank1_trace_solve_calls = 1;
+    else
+      initialization_tensor_core_evidence_.hypre_trace_solve_calls = 1;
+  }
   const bool warmed = warm_solved && warm.device_policy &&
       warm.configured_preconditioner && warm.finite &&
-      warm.matrix_generation == 0;
+      warm.matrix_generation == 0 &&
+      warm.trace_solver == trace_solver_kind_ &&
+      warm.configured_native_solver == use_native;
   if (!CollectiveContinue(warmed)) { return false; }
 
   bool warm_state_zeroed = false;
@@ -1249,31 +1361,66 @@ BuildPersistentTrueSystem() noexcept
       rank_, "persistent-recreation-configuration", "before", false);
   try
   {
-    if (use_ilu)
-      ilu_.emplace();
-    else
-      diagonal_.emplace();
-    gmres_.emplace(*true_matrix_);
-    if (use_ilu)
+    if (use_native)
     {
-      CudaHypreSetupState persistent_setup{};
-      persistent_configured = CudaConfigurePersistentHypre(
-          *true_matrix_, *ilu_, *gmres_, ranks_, trace_policy,
-          linear_relative_tolerance_, maximum_linear_iterations_,
-          krylov_dimension_, 0, persistent_setup) &&
-          persistent_setup.ConfigurationExactForGeneration(
-              0, trace_policy);
+      if (use_ilu)
+        ilu_.emplace();
+      persistent_configured = !gmres_ && !diagonal_ &&
+          (use_ilu == static_cast<bool>(ilu_)) &&
+          native_trace_requirements_.valid &&
+          native_trace_support_.supported &&
+          native_trace_workspace_.basis != nullptr &&
+          native_trace_workspace_.vectors != nullptr &&
+          native_trace_workspace_.reduction != nullptr &&
+          native_trace_workspace_.small != nullptr &&
+          native_trace_workspace_.device_control != nullptr &&
+          native_trace_workspace_.basis_doubles ==
+              native_trace_requirements_.basis_doubles &&
+          native_trace_workspace_.vector_doubles ==
+              native_trace_requirements_.vector_doubles &&
+          native_trace_workspace_.reduction_doubles ==
+              native_trace_requirements_.reduction_doubles &&
+          native_trace_workspace_.small_doubles ==
+              native_trace_requirements_.small_doubles &&
+          native_trace_workspace_.permutation_integers ==
+              native_trace_requirements_.permutation_integers &&
+          (!use_ilu ||
+           (native_ilu_inverse_diagonal_ != nullptr &&
+            generic_arena_layout_.native_ilu_inverse_diagonal ==
+                static_cast<std::size_t>(shape_.true_trace_count) &&
+            native_trace_workspace_.permutation_marks != nullptr)) &&
+          (use_ilu ||
+           (native_ilu_inverse_diagonal_ == nullptr &&
+            native_trace_workspace_.permutation_marks == nullptr));
     }
     else
     {
-      CudaDiagScaleSetupState persistent_setup{};
-      persistent_configured = CudaConfigurePersistentDiagonal(
-          *true_matrix_, *diagonal_, *gmres_, trace_policy,
-          linear_relative_tolerance_,
-          maximum_linear_iterations_, krylov_dimension_, 0,
-          persistent_setup) &&
-          persistent_setup.ConfigurationExactForGeneration(
-              0, trace_policy);
+      if (use_ilu)
+        ilu_.emplace();
+      else
+        diagonal_.emplace();
+      gmres_.emplace(*true_matrix_);
+      if (use_ilu)
+      {
+        CudaHypreSetupState persistent_setup{};
+        persistent_configured = CudaConfigurePersistentHypre(
+            *true_matrix_, *ilu_, *gmres_, ranks_, trace_policy,
+            linear_relative_tolerance_, maximum_linear_iterations_,
+            krylov_dimension_, 0, persistent_setup) &&
+            persistent_setup.ConfigurationExactForGeneration(
+                0, trace_policy);
+      }
+      else
+      {
+        CudaDiagScaleSetupState persistent_setup{};
+        persistent_configured = CudaConfigurePersistentDiagonal(
+            *true_matrix_, *diagonal_, *gmres_, trace_policy,
+            linear_relative_tolerance_,
+            maximum_linear_iterations_, krylov_dimension_, 0,
+            persistent_setup) &&
+            persistent_setup.ConfigurationExactForGeneration(
+                0, trace_policy);
+      }
     }
   }
   catch (...) { persistent_configured = false; }
@@ -1834,6 +1981,174 @@ AssembleTrueSystem() noexcept
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+LaunchAndObserveNativeRankOneTraceSolve(
+    const CudaNativeIlu0FactorView& factor,
+    const std::uint64_t matrix_generation,
+    CudaSolveDiagnostics& diagnostics) noexcept
+{
+  if (trace_solver_kind_ != CudaTraceSolverKind::native_rank1_fp64 ||
+      ranks_ != 1 || !true_matrix_ || !hypre_rhs_ || !hypre_solution_ ||
+      !native_trace_requirements_.valid ||
+      !native_trace_support_.supported ||
+      native_trace_requirements_.control_double_slots == 0 ||
+      native_trace_requirements_.control_double_slots >
+          native_trace_host_control_.size())
+    return false;
+  const bool use_ilu = shape_.igr_active;
+  const bool factor_exact = use_ilu
+      ? factor.offsets != nullptr && factor.columns != nullptr &&
+          factor.values != nullptr && factor.permutation != nullptr &&
+          factor.inverse_diagonal == native_ilu_inverse_diagonal_ &&
+          factor.rows == shape_.true_trace_count &&
+          factor.nonzeros >= factor.rows &&
+          factor.lower_jacobi_iterations ==
+              trace_policy_descriptor_.ilu_lower_jacobi_iterations &&
+          factor.upper_jacobi_iterations ==
+              trace_policy_descriptor_.ilu_upper_jacobi_iterations
+      : factor.offsets == nullptr && factor.columns == nullptr &&
+          factor.values == nullptr && factor.permutation == nullptr &&
+          factor.inverse_diagonal == nullptr && factor.rows == 0 &&
+          factor.nonzeros == 0;
+  CudaTrueMatrixDeviceView current_matrix{};
+  const bool matrix_exact = factor_exact &&
+      CudaGetTrueMatrixDeviceView(*true_matrix_, current_matrix) &&
+      current_matrix.rows == shape_.true_trace_count &&
+      current_matrix.diag_columns_count == shape_.true_trace_count &&
+      current_matrix.offd_nonzeros == 0 &&
+      current_matrix.diag_offsets == true_device_.diag_offsets &&
+      current_matrix.diag_columns == true_device_.diag_columns &&
+      current_matrix.diag_values == true_device_.diag_values &&
+      current_matrix.diag_nonzeros == true_device_.diag_nonzeros;
+  if (!matrix_exact) return false;
+  // HYPRE may issue factor/extracted-diagonal work on its configured compute
+  // stream.  The one first-factor-per-attempt refresh must complete before
+  // the application-owned cooperative stream borrows those pointers.
+  if (use_ilu && diagnostics.ilu_factor_setups == 1 &&
+      !TransportPolicy::Synchronize(CudaTransferSite::scalar_status))
+    return false;
+
+  bool vectors_ready = false;
+  try
+  {
+    *hypre_solution_ = 0.0;
+    hypre_rhs_->HypreReadWrite();
+    hypre_solution_->HypreReadWrite();
+    vectors_ready = CudaHypreDevicePolicyValid(
+        *true_matrix_, *hypre_rhs_, *hypre_solution_) &&
+        view_.true_rhs_scratch ==
+            static_cast<mfem::Vector&>(*hypre_rhs_).ReadWrite() &&
+        view_.true_solution ==
+            static_cast<mfem::Vector&>(*hypre_solution_).ReadWrite() &&
+        HYPRE_GetError() == 0;
+  }
+  catch (...) { vectors_ready = false; }
+  if (!vectors_ready) return false;
+
+  native_trace_host_control_.fill(0.0);
+  const bool launched = CudaLaunchNativeRankOneTraceSolver(
+      current_matrix, view_.true_rhs_scratch, view_.true_solution,
+      use_ilu, factor, native_trace_workspace_, native_trace_support_,
+      linear_relative_tolerance_, maximum_linear_iterations_,
+      krylov_dimension_, nullptr);
+  const std::size_t control_bytes =
+      native_trace_requirements_.control_double_slots * sizeof(double);
+  const bool observed = launched && TransportPolicy::DeviceToHost(
+      native_trace_host_control_.data(),
+      native_trace_workspace_.device_control, control_bytes,
+      CudaTransferCategory::scalar_diagnostic,
+      CudaTransferSite::scalar_status, control_bytes,
+      native_trace_host_control_.size() * sizeof(double)) &&
+      TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+  CudaNativeTraceSolveObservation observation{};
+  const bool decoded = observed && CudaDecodeNativeRankOneTraceControl(
+      native_trace_host_control_.data(),
+      native_trace_requirements_.control_double_slots,
+      linear_relative_tolerance_, maximum_linear_iterations_,
+      krylov_dimension_, observation);
+
+  diagnostics.matrix_generation = matrix_generation;
+  diagnostics.trace_solver = CudaTraceSolverKind::native_rank1_fp64;
+  diagnostics.trace_preconditioner =
+      trace_policy_descriptor_.trace_preconditioner;
+  diagnostics.igr_active = shape_.igr_active;
+  diagnostics.krylov_dimension = krylov_dimension_;
+  diagnostics.iterations = observation.iterations;
+  diagnostics.reported_residual = observation.relative_residual_norm;
+  diagnostics.device_policy = decoded && CudaHypreDevicePolicyValid(
+      *true_matrix_, *hypre_rhs_, *hypre_solution_);
+  diagnostics.configured_native_solver = decoded &&
+      observation.ready_for_true_residual;
+  diagnostics.configured_ilu = use_ilu && factor_exact;
+  diagnostics.configured_diagonal = !use_ilu && factor_exact;
+  diagnostics.configured_preconditioner =
+      diagnostics.configured_native_solver && factor_exact;
+  diagnostics.finite = decoded && observation.finite;
+  diagnostics.reported_tolerance_met = diagnostics.finite &&
+      diagnostics.reported_residual <= linear_relative_tolerance_;
+
+  bool native_accounting_ready = true;
+  if (use_ilu)
+  {
+    diagnostics.ilu_type = trace_policy_descriptor_.ilu_type;
+    diagnostics.ilu_level_of_fill =
+        trace_policy_descriptor_.ilu_level_of_fill;
+    diagnostics.ilu_local_reordering =
+        trace_policy_descriptor_.ilu_local_reordering;
+    diagnostics.ilu_application_iterations =
+        trace_policy_descriptor_.ilu_application_iterations;
+    diagnostics.ilu_triangular_solve_kind =
+        trace_policy_descriptor_.ilu_triangular_solve_kind;
+    diagnostics.ilu_lower_jacobi_iterations =
+        trace_policy_descriptor_.ilu_lower_jacobi_iterations;
+    diagnostics.ilu_upper_jacobi_iterations =
+        trace_policy_descriptor_.ilu_upper_jacobi_iterations;
+    diagnostics.ilu_accounting_kind =
+        CudaIluAccountingKind::derived_bounds_v1;
+    diagnostics.ilu_factor_reuse_policy =
+        trace_policy_descriptor_.ilu_factor_reuse_policy;
+    const std::uint64_t jacobi_updates =
+        static_cast<std::uint64_t>(
+            diagnostics.ilu_lower_jacobi_iterations - 1) +
+        static_cast<std::uint64_t>(
+            diagnostics.ilu_upper_jacobi_iterations - 1);
+    const CudaDerivedIluAccountingBoundsV1 bounds =
+        observation.iterations >= 0
+        ? CudaDeriveIluAccountingBoundsV1(
+              static_cast<std::uint64_t>(observation.iterations),
+              static_cast<std::uint64_t>(krylov_dimension_),
+              static_cast<std::uint64_t>(
+                  diagnostics.ilu_application_iterations),
+              jacobi_updates)
+        : CudaDerivedIluAccountingBoundsV1{};
+    diagnostics.ilu_preconditioner_callbacks_lower_bound =
+        bounds.ilu_preconditioner_callbacks_lower_bound;
+    diagnostics.ilu_preconditioner_callbacks_upper_bound =
+        bounds.ilu_preconditioner_callbacks_upper_bound;
+    diagnostics.ilu_inner_iterations_lower_bound =
+        bounds.ilu_inner_iterations_lower_bound;
+    diagnostics.ilu_inner_iterations_upper_bound =
+        bounds.ilu_inner_iterations_upper_bound;
+    diagnostics.ilu_jacobi_factor_spmv_updates_lower_bound =
+        bounds.ilu_jacobi_factor_spmv_updates_lower_bound;
+    diagnostics.ilu_jacobi_factor_spmv_updates_upper_bound =
+        bounds.ilu_jacobi_factor_spmv_updates_upper_bound;
+    const std::uint64_t applications =
+        observation.preconditioner_applications >= 0
+        ? static_cast<std::uint64_t>(
+              observation.preconditioner_applications)
+        : std::numeric_limits<std::uint64_t>::max();
+    native_accounting_ready = bounds.ilu_accounting_complete &&
+        applications >= bounds.ilu_preconditioner_callbacks_lower_bound &&
+        applications <= bounds.ilu_preconditioner_callbacks_upper_bound;
+    diagnostics.ilu_accounting_complete = native_accounting_ready;
+  }
+  return native_accounting_ready && diagnostics.finite &&
+      CudaTraceSolveReadyForTrueResidualVerification(
+          diagnostics, maximum_linear_iterations_);
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 SolveTrueSystem(double& true_relative_residual,
                 const std::uint64_t matrix_generation,
                 int& linear_iterations,
@@ -1845,27 +2160,70 @@ SolveTrueSystem(double& true_relative_residual,
   CudaSolveDiagnostics diagnostics{};
   const bool use_ilu = CudaTracePreconditionerIsIlu(
       trace_preconditioner_);
-  const bool solved = use_ilu
-      ? CudaSolveWithIluFactorPolicy(
-            *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
-            ranks_, communicator_, trace_policy_descriptor_, current_attempt_,
-            linear_relative_tolerance_, maximum_linear_iterations_,
-            krylov_dimension_, matrix_generation, ilu_factor_state_,
-            diagnostics)
-      : CudaRefreshDiagonalAndSolve(
-            *true_matrix_, *hypre_rhs_, *hypre_solution_, *diagonal_,
-            *gmres_, ranks_, communicator_, trace_policy_descriptor_,
-            linear_relative_tolerance_,
-            maximum_linear_iterations_, krylov_dimension_,
-            matrix_generation, diagnostics);
+  bool solved = false;
+  if (trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64)
+  {
+    CudaNativeIlu0FactorView factor{};
+    const bool factor_ready = !use_ilu ||
+        CudaPrepareNativeRankOneIluFactor(
+            *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_,
+            trace_policy_descriptor_, current_attempt_, matrix_generation,
+            native_ilu_inverse_diagonal_,
+            generic_arena_layout_.native_ilu_inverse_diagonal,
+            ilu_factor_state_, factor, diagnostics);
+    solved = factor_ready && LaunchAndObserveNativeRankOneTraceSolve(
+        factor, matrix_generation, diagnostics);
+    if (solved && use_ilu)
+    {
+      const bool state_generation_ready = ilu_factor_state_.factor_ready &&
+          ilu_factor_state_.factor_generation <= matrix_generation &&
+          matrix_generation > ilu_factor_state_.last_solve_generation;
+      if (state_generation_ready)
+        ilu_factor_state_.last_solve_generation = matrix_generation;
+      else
+        solved = false;
+    }
+  }
+  else if (trace_solver_kind_ == CudaTraceSolverKind::hypre_parcsr_gmres ||
+           trace_solver_kind_ ==
+               CudaTraceSolverKind::hypre_host_staged_rank2)
+  {
+    solved = use_ilu
+        ? CudaSolveWithIluFactorPolicy(
+              *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
+              ranks_, communicator_, trace_policy_descriptor_,
+              current_attempt_, linear_relative_tolerance_,
+              maximum_linear_iterations_, krylov_dimension_,
+              matrix_generation, ilu_factor_state_, diagnostics)
+        : CudaRefreshDiagonalAndSolve(
+              *true_matrix_, *hypre_rhs_, *hypre_solution_, *diagonal_,
+              *gmres_, ranks_, communicator_, trace_policy_descriptor_,
+              linear_relative_tolerance_, maximum_linear_iterations_,
+              krylov_dimension_, matrix_generation, diagnostics);
+  }
   if (use_ilu && solved)
     (void)CudaAccumulateIluSolveEvidence(
         tensor_core_evidence, diagnostics);
+  if (solved)
+  {
+    std::uint64_t* const calls = trace_solver_kind_ ==
+            CudaTraceSolverKind::native_rank1_fp64
+        ? &tensor_core_evidence.native_rank1_trace_solve_calls
+        : &tensor_core_evidence.hypre_trace_solve_calls;
+    if (*calls == std::numeric_limits<std::uint64_t>::max())
+    {
+      tensor_core_evidence.trace_solver_accounting_complete = false;
+      solved = false;
+    }
+    else
+      ++*calls;
+  }
   // Policy/factor/configuration mismatches already fail `solved`.  Aggregate
   // accounting remains qualification evidence only; the FP64 current-matrix
   // true residual below is the numerical acceptance authority.
   const bool local_solve = solved &&
       diagnostics.matrix_generation == matrix_generation &&
+      diagnostics.trace_solver == trace_solver_kind_ &&
       CudaTraceSolveReadyForTrueResidualVerification(
           diagnostics, maximum_linear_iterations_);
   linear_iterations = diagnostics.iterations;

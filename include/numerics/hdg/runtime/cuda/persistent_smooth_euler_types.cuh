@@ -939,8 +939,15 @@ struct CudaTensorCoreEvidence
   std::uint64_t condensation_launches = 0;
   std::uint64_t mma_tiles = 0;
   std::uint64_t fallback_count = 0;
+  // Constant-size trace-solver provenance.  These are aggregate counters and
+  // configuration predicates, never a per-solve history or event stream.
+  std::uint64_t native_rank1_trace_solve_calls = 0;
+  std::uint64_t hypre_trace_solve_calls = 0;
   bool hardware_supported = false;
   bool trace_preconditioner_configured = false;
+  bool native_rank1_trace_solver_configured = false;
+  bool hypre_host_staged_rank2_trace_solver_configured = false;
+  bool trace_solver_accounting_complete = false;
   bool ilu_accounting_complete = false;
   bool fallback_accounting_complete = false;
 };

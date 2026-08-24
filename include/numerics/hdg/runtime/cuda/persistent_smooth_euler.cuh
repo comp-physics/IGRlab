@@ -7,10 +7,11 @@
  * Numerical provenance: the pointwise Euler flux/source, W7 weak signs,
  * A/B/C/D condensation, trace solve, and recovery equations are a minimal port
  * of accepted W7 commit ac271a038c9d26648fce8f2ebf6afb0113a92495.  Ordinary
- * CUDA and tensor IGR use HypreGMRES+HypreILU(0); tensor IGR refreshes once
- * at the first trace solve of each attempt and then reuses that exact factor.
- * Tensor conventional uses HypreGMRES+HypreDiagScale behind the same
- * lifecycle. Ordinary CUDA refreshes ILU(0) for every trace solve.
+ * CUDA uses the established HYPRE GMRES path.  Borrowed generic tensor rank
+ * one uses the private cooperative FP64 trace solver: conventional operation
+ * applies diagonal scaling, while IGR borrows one exact HYPRE ILU(0)+RCM
+ * factor per attempt and applies its 5+5 Jacobi triangular policy in the
+ * native solve.  Rank two remains explicitly HYPRE host-staged.
  * The W7 monolithic RunSmoothEulerDeviceFullExperiment lifecycle is neither
  * included nor called.  Persistence, contract publication, retry, policies,
  * and exported POD are W8A-owned code.

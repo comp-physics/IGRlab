@@ -45,7 +45,8 @@ enum class NativeTraceSolveStatus : std::int32_t
   nonfinite_input = 8,
   numerical_breakdown = 9,
   maximum_iterations = 10,
-  launch_failure = 11
+  bounded_real_residual_stagnation = 11,
+  launch_failure = 12
 };
 
 /** A borrowed, rank-local FP64 CSR matrix in device memory. */
@@ -190,18 +191,37 @@ inline const char* NativeTraceSolveStatusName(
     return "numerical_breakdown";
   case NativeTraceSolveStatus::maximum_iterations:
     return "maximum_iterations";
+  case NativeTraceSolveStatus::bounded_real_residual_stagnation:
+    return "bounded_real_residual_stagnation";
   case NativeTraceSolveStatus::launch_failure: return "launch_failure";
   }
   return "unknown";
 }
 
-/** Pure host acceptance of the bounded native result before the app true gate. */
+/**
+ * Pure host admission of a converged or bounded non-hard terminal result.
+ * Maximum-iteration and nondecreasing-real-residual exits retain distinct
+ * statuses and do not claim internal convergence.  The application
+ * independently rebuilds the authoritative FP64 true residual after this
+ * structural/finite admission.
+ */
 inline bool NativeTraceResultIsReadyForTrueResidual(
     const NativeTraceSolveControl& result,
     const NativeTraceSolvePolicy& policy) noexcept
 {
+  const bool converged =
+      result.status == NativeTraceSolveStatus::converged;
+  const bool bounded_maximum =
+      result.status == NativeTraceSolveStatus::maximum_iterations &&
+      result.iterations == policy.maximum_iterations;
+  const bool bounded_real_residual_stagnation =
+      result.status ==
+          NativeTraceSolveStatus::bounded_real_residual_stagnation &&
+      result.iterations > 0 && result.restart_cycles > 0 &&
+      result.actual_residual_checks >= 2;
   if (result.schema != native_trace_control_schema ||
-      result.status != NativeTraceSolveStatus::converged ||
+      (!converged && !bounded_maximum &&
+       !bounded_real_residual_stagnation) ||
       result.failure_mask != 0 || policy.rank_count != 1 ||
       policy.krylov_dimension <= 0 || policy.maximum_iterations <= 0 ||
       result.iterations < 0 ||
@@ -236,7 +256,7 @@ inline bool NativeTraceResultIsReadyForTrueResidual(
   const double consistency_tolerance =
       64.0 * std::numeric_limits<double>::epsilon() * consistency_scale;
   return std::isfinite(tolerance) &&
-      result.actual_residual_norm <= tolerance &&
+      (!converged || result.actual_residual_norm <= tolerance) &&
       std::abs(result.relative_residual_norm - expected_relative) <=
           consistency_tolerance;
 }

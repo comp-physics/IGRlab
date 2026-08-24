@@ -775,9 +775,8 @@ __global__ void NativeRankOneTraceSolveKernel(
       if (actual >= real_residual_norm_old)
       {
         if (grid.thread_rank() == 0)
-          MarkFailure(control, failure_numerical_breakdown);
-        grid.sync();
-        FinishOnFailure(grid, control);
+          control->status =
+              NativeTraceSolveStatus::bounded_real_residual_stagnation;
         return;
       }
       residual_norm = actual;
@@ -820,12 +819,23 @@ __global__ void NativeRankOneTraceSolveKernel(
     }
   }
 
+  // Match the established bounded HYPRE lifecycle: publish one final actual
+  // residual for a maximum-iteration exit, then let the application rebuild
+  // the authoritative FP64 true residual from the current matrix.
+  ComputeActualResidual(system, first_basis, control, grid);
+  const double actual = GridNorm(first_basis, rows, workspace, control,
+                                 grid, block_scratch);
+  if (grid.thread_rank() == 0)
+  {
+    ++control->actual_residual_checks;
+    SetFinalResidualMetadata(control, actual);
+  }
+  grid.sync();
+  if (FinishOnFailure(grid, control)) return;
   if (grid.thread_rank() == 0)
   {
     control->iterations = iteration;
     control->estimated_residual_norm = residual_norm;
-    control->relative_residual_norm = rhs_norm > 0.0
-        ? residual_norm / rhs_norm : residual_norm;
     control->status = NativeTraceSolveStatus::maximum_iterations;
   }
 }
@@ -856,7 +866,7 @@ QueryNativeTraceWorkspaceRequirements(const int rows,
       !CheckedMultiply(row_count, igr_active ? 3U : 1U,
                        result.vector_doubles) ||
       !CheckedMultiply(dimension_plus_one, dimension, hessenberg) ||
-      !CheckedMultiply(dimension, 3, scalar_vectors) ||
+      !CheckedMultiply(dimension, 2, scalar_vectors) ||
       !CheckedAdd(scalar_vectors, dimension_plus_one, scalar_vectors) ||
       !CheckedAdd(hessenberg, scalar_vectors, small))
     return NativeTraceWorkspaceRequirements{};
@@ -954,11 +964,27 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
       workspace.device_control, 1, sizeof(NativeTraceSolveControl));
   const AddressRange double_ranges[] = {
       basis_range, vector_range, reduction_range, small_range, control_range};
+  const std::size_t system_rows = system.matrix.rows > 0
+      ? static_cast<std::size_t>(system.matrix.rows) : 0;
+  const std::size_t system_nonzeros = system.matrix.nonzeros > 0
+      ? static_cast<std::size_t>(system.matrix.nonzeros) : 0;
+  const AddressRange system_ranges[] = {
+      MakeAddressRange(system.matrix.row_offsets, system_rows + 1,
+                       sizeof(int)),
+      MakeAddressRange(system.matrix.columns, system_nonzeros, sizeof(int)),
+      MakeAddressRange(system.matrix.values, system_nonzeros, sizeof(double)),
+      MakeAddressRange(system.rhs, system_rows, sizeof(double)),
+      MakeAddressRange(system.solution, system_rows, sizeof(double))};
   bool workspace_overlap = false;
   for (std::size_t left = 0; left < 5; ++left)
+  {
     for (std::size_t right = left + 1; right < 5; ++right)
       workspace_overlap = workspace_overlap ||
           AddressRangesOverlap(double_ranges[left], double_ranges[right]);
+    for (const AddressRange& borrowed : system_ranges)
+      workspace_overlap = workspace_overlap ||
+          AddressRangesOverlap(double_ranges[left], borrowed);
+  }
   if (igr)
   {
     const AddressRange permutation_range = MakeAddressRange(
@@ -967,6 +993,31 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
     for (const AddressRange& range : double_ranges)
       workspace_overlap = workspace_overlap ||
           AddressRangesOverlap(permutation_range, range);
+    for (const AddressRange& borrowed : system_ranges)
+      workspace_overlap = workspace_overlap ||
+          AddressRangesOverlap(permutation_range, borrowed);
+
+    const NativeTraceIlu0View& ilu0 = preconditioner.ilu0;
+    const std::size_t factor_rows = ilu0.factor.rows > 0
+        ? static_cast<std::size_t>(ilu0.factor.rows) : 0;
+    const std::size_t factor_nonzeros = ilu0.factor.nonzeros > 0
+        ? static_cast<std::size_t>(ilu0.factor.nonzeros) : 0;
+    const AddressRange factor_ranges[] = {
+        MakeAddressRange(ilu0.factor.row_offsets, factor_rows + 1,
+                         sizeof(int)),
+        MakeAddressRange(ilu0.factor.columns, factor_nonzeros, sizeof(int)),
+        MakeAddressRange(ilu0.factor.values, factor_nonzeros, sizeof(double)),
+        MakeAddressRange(ilu0.permutation, factor_rows, sizeof(int)),
+        MakeAddressRange(ilu0.inverse_diagonal, factor_rows,
+                         sizeof(double))};
+    for (const AddressRange& borrowed : factor_ranges)
+    {
+      workspace_overlap = workspace_overlap ||
+          AddressRangesOverlap(permutation_range, borrowed);
+      for (const AddressRange& range : double_ranges)
+        workspace_overlap = workspace_overlap ||
+            AddressRangesOverlap(range, borrowed);
+    }
   }
   int current_device = -1;
   if (!requirements.valid || workspace_overlap || !support.supported ||

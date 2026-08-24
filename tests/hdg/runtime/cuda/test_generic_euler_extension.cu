@@ -278,12 +278,19 @@ struct CudaQualificationTestAccess
         ::dg::hdg::runtime::detail::SameAttempt(
             state.attempt, empty_attempt) &&
         state.matrix_object_token == 0 && state.hypre_matrix_token == 0 &&
+        state.diag_offsets_token == 0 && state.diag_columns_token == 0 &&
         state.diag_values_token == 0 && state.offd_values_token == 0 &&
+        state.offd_offsets_token == 0 && state.offd_columns_token == 0 &&
         state.ilu_handle_token == 0 && state.factor_matrix_token == 0 &&
+        state.factor_offsets_token == 0 &&
+        state.factor_columns_token == 0 &&
         state.factor_values_token == 0 &&
         state.factor_permutation_token == 0 &&
+        state.native_inverse_diagonal_token == 0 &&
         state.jacobi_diagonal_vector_token == 0 &&
         state.jacobi_diagonal_values_token == 0 &&
+        state.matrix_rows == 0 && state.factor_rows == 0 &&
+        state.factor_nonzeros == 0 &&
         state.diag_nonzeros == 0 && state.offd_nonzeros == 0 &&
         state.factor_generation == 0 && state.last_solve_generation == 0;
   }
