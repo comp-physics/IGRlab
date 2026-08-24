@@ -24,6 +24,11 @@
 #include <string_view>
 #include <type_traits>
 
+namespace dg::hdg::runtime::cuda
+{
+class GenericEulerHdgCudaSession;
+}
+
 namespace dg::hdg::runtime::cuda_w8a
 {
 
@@ -317,6 +322,33 @@ inline bool IsCudaAbsentBorrowedGlobalTopologyIdentity(
     const StableIdentity& value) noexcept
 {
   return value.empty();
+}
+
+/** Benchmark-only selection of the trace-solver policy under comparison. */
+enum class CudaTracePolicyKind : std::uint8_t
+{
+  engine_default = 0,
+  common_fast = 1
+};
+
+constexpr bool IsKnownCudaTracePolicyKind(
+    const CudaTracePolicyKind kind) noexcept
+{
+  return kind == CudaTracePolicyKind::engine_default ||
+      kind == CudaTracePolicyKind::common_fast;
+}
+
+constexpr const char* CudaTracePolicyKindName(
+    const CudaTracePolicyKind kind) noexcept
+{
+  switch (kind)
+  {
+  case CudaTracePolicyKind::engine_default:
+    return "engine-default";
+  case CudaTracePolicyKind::common_fast:
+    return "common-fast";
+  }
+  return "unknown";
 }
 
 struct CudaConfig
@@ -773,11 +805,113 @@ constexpr const char* CudaTracePreconditionerName(
   return "unconfigured";
 }
 
+/** Exact, scalar trace-solver policy resolved before device initialization. */
+struct CudaTracePolicyDescriptor
+{
+  generic::CudaEngineKind selected_engine =
+      generic::CudaEngineKind::ordinary;
+  CudaTracePolicyKind selection = CudaTracePolicyKind::engine_default;
+  bool igr_active = false;
+  CudaTracePreconditionerKind trace_preconditioner =
+      CudaTracePreconditionerKind::unconfigured;
+  int ilu_type = -1;
+  int ilu_level_of_fill = -1;
+  int ilu_local_reordering = -1;
+  int ilu_application_iterations = 0;
+  CudaIluTriangularSolveKind ilu_triangular_solve_kind =
+      CudaIluTriangularSolveKind::not_applicable;
+  int ilu_lower_jacobi_iterations = 0;
+  int ilu_upper_jacobi_iterations = 0;
+  CudaIluAccountingKind ilu_accounting_kind =
+      CudaIluAccountingKind::unavailable;
+  CudaIluFactorReusePolicy ilu_factor_reuse_policy =
+      CudaIluFactorReusePolicy::not_applicable;
+  bool valid = false;
+};
+
+constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
+    const generic::CudaEngineKind engine, const bool igr_active,
+    const CudaTracePolicyKind selection) noexcept
+{
+  CudaTracePolicyDescriptor result{};
+  result.selected_engine = engine;
+  result.selection = selection;
+  result.igr_active = igr_active;
+  if (!generic::IsKnownCudaEngineKind(engine) ||
+      !IsKnownCudaTracePolicyKind(selection))
+    return result;
+
+  // common-fast deliberately gives both CUDA engines the already-qualified
+  // tensor trace policy.  This changes only the benchmark trace leaf; the
+  // selected CUDA engine continues to control condensation and tensor work.
+  const generic::CudaEngineKind policy_engine =
+      selection == CudaTracePolicyKind::common_fast
+      ? generic::CudaEngineKind::tensor_core : engine;
+  result.trace_preconditioner =
+      CudaTracePreconditionerForEngine(policy_engine, igr_active);
+  result.ilu_type = CudaIluType(result.trace_preconditioner);
+  result.ilu_level_of_fill =
+      CudaIluLevelOfFill(result.trace_preconditioner);
+  result.ilu_local_reordering =
+      CudaIluLocalReordering(result.trace_preconditioner, igr_active);
+  result.ilu_application_iterations =
+      CudaIluApplicationIterations(result.trace_preconditioner);
+  result.ilu_triangular_solve_kind =
+      CudaIluTriangularSolveKindForEngine(policy_engine, igr_active);
+  result.ilu_lower_jacobi_iterations =
+      CudaIluLowerJacobiIterations(policy_engine, igr_active);
+  result.ilu_upper_jacobi_iterations =
+      CudaIluUpperJacobiIterations(policy_engine, igr_active);
+  result.ilu_accounting_kind = CudaTracePreconditionerIsIlu(
+      result.trace_preconditioner)
+      ? CudaIluAccountingKind::derived_bounds_v1
+      : CudaIluAccountingKind::unavailable;
+  result.ilu_factor_reuse_policy =
+      CudaIluFactorReusePolicyForEngine(policy_engine, igr_active);
+  result.valid = true;
+  return result;
+}
+
+constexpr bool CudaTracePolicyDescriptorExact(
+    const CudaTracePolicyDescriptor& actual,
+    const CudaTracePolicyDescriptor& expected) noexcept
+{
+  return actual.selected_engine == expected.selected_engine &&
+      actual.selection == expected.selection &&
+      actual.igr_active == expected.igr_active &&
+      actual.trace_preconditioner == expected.trace_preconditioner &&
+      actual.ilu_type == expected.ilu_type &&
+      actual.ilu_level_of_fill == expected.ilu_level_of_fill &&
+      actual.ilu_local_reordering == expected.ilu_local_reordering &&
+      actual.ilu_application_iterations ==
+          expected.ilu_application_iterations &&
+      actual.ilu_triangular_solve_kind ==
+          expected.ilu_triangular_solve_kind &&
+      actual.ilu_lower_jacobi_iterations ==
+          expected.ilu_lower_jacobi_iterations &&
+      actual.ilu_upper_jacobi_iterations ==
+          expected.ilu_upper_jacobi_iterations &&
+      actual.ilu_accounting_kind == expected.ilu_accounting_kind &&
+      actual.ilu_factor_reuse_policy ==
+          expected.ilu_factor_reuse_policy &&
+      actual.valid == expected.valid;
+}
+
+constexpr bool CudaTracePolicyDescriptorIsExact(
+    const CudaTracePolicyDescriptor& descriptor) noexcept
+{
+  return descriptor.valid && CudaTracePolicyDescriptorExact(
+      descriptor, ResolveCudaTracePolicy(
+          descriptor.selected_engine, descriptor.igr_active,
+          descriptor.selection));
+}
+
 /** Production tensor-leaf selection and work census for one scope. */
 struct CudaTensorCoreEvidence
 {
   generic::CudaEngineKind selected_engine =
       generic::CudaEngineKind::ordinary;
+  CudaTracePolicyKind trace_policy = CudaTracePolicyKind::engine_default;
   CudaTracePreconditionerKind trace_preconditioner =
       CudaTracePreconditionerKind::unconfigured;
   int ilu_type = -1;

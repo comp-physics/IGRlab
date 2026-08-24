@@ -946,9 +946,7 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
                                   mfem::HypreILU& ilu,
                                   mfem::HypreGMRES& gmres,
                                   const int ranks,
-                                  const generic::CudaEngineKind engine,
-                                  const CudaTracePreconditionerKind kind,
-                                  const bool igr_active,
+                                  const CudaTracePolicyDescriptor& policy,
                                   const double relative_tolerance,
                                   const int maximum_iterations,
                                   const int krylov_dimension,
@@ -959,20 +957,21 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
   (void)ranks;
   CudaTrueSystemDiagnosticScope diagnostic("object-configure",
                                            matrix_generation);
-  const int ilu_type = CudaIluType(kind);
-  const int level_of_fill = CudaIluLevelOfFill(kind);
-  const int local_reordering =
-      CudaIluLocalReordering(kind, igr_active);
-  const int application_iterations =
-      CudaIluApplicationIterations(kind);
-  const int triangular_solve =
-      CudaIluTriangularSolve(engine, igr_active);
+  const CudaTracePreconditionerKind kind = policy.trace_preconditioner;
+  const int ilu_type = policy.ilu_type;
+  const int level_of_fill = policy.ilu_level_of_fill;
+  const int local_reordering = policy.ilu_local_reordering;
+  const int application_iterations = policy.ilu_application_iterations;
   const CudaIluTriangularSolveKind triangular_solve_kind =
-      CudaIluTriangularSolveKindForEngine(engine, igr_active);
+      policy.ilu_triangular_solve_kind;
+  const int triangular_solve = triangular_solve_kind ==
+          CudaIluTriangularSolveKind::direct
+      ? 1 : triangular_solve_kind ==
+              CudaIluTriangularSolveKind::iterative_jacobi ? 0 : -1;
   const int lower_jacobi_iterations =
-      CudaIluLowerJacobiIterations(engine, igr_active);
+      policy.ilu_lower_jacobi_iterations;
   const int upper_jacobi_iterations =
-      CudaIluUpperJacobiIterations(engine, igr_active);
+      policy.ilu_upper_jacobi_iterations;
   evidence = {};
   evidence.matrix_generation = matrix_generation;
   evidence.trace_preconditioner = kind;
@@ -983,9 +982,7 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
   evidence.ilu_triangular_solve_kind = triangular_solve_kind;
   evidence.ilu_lower_jacobi_iterations = lower_jacobi_iterations;
   evidence.ilu_upper_jacobi_iterations = upper_jacobi_iterations;
-  const bool exact_kind =
-      generic::IsKnownCudaEngineKind(engine) &&
-      kind == CudaTracePreconditionerForEngine(engine, igr_active) &&
+  const bool exact_kind = CudaTracePolicyDescriptorIsExact(policy) &&
       kind == CudaTracePreconditionerKind::hypre_ilu0;
   if (!exact_kind || ilu_type != 0 || level_of_fill != 0 ||
       (local_reordering != 0 && local_reordering != 1) ||
@@ -1076,8 +1073,7 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
             upper_jacobi_iterations &&
         hypre_ParILUDataIterativeSetupType(ilu_data) == 0;
     diagnostic.result = effective_ilu &&
-        evidence.ConfigurationExactForGeneration(matrix_generation,
-                                                  engine, kind, igr_active);
+        evidence.ConfigurationExactForGeneration(matrix_generation, policy);
     return diagnostic.result;
   }
   catch (...) { return false; }
@@ -1085,8 +1081,7 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
 
 bool CudaConfigurePersistentDiagonal(
     mfem::HypreParMatrix& matrix, mfem::HypreDiagScale& diagonal,
-    mfem::HypreGMRES& gmres, const generic::CudaEngineKind engine,
-    const CudaTracePreconditionerKind kind, const bool igr_active,
+    mfem::HypreGMRES& gmres, const CudaTracePolicyDescriptor& policy,
     const double relative_tolerance, const int maximum_iterations,
     const int krylov_dimension,
     const std::uint64_t matrix_generation,
@@ -1094,14 +1089,16 @@ bool CudaConfigurePersistentDiagonal(
 {
   CudaTrueSystemDiagnosticScope diagnostic("diagonal-configure",
                                            matrix_generation);
+  const generic::CudaEngineKind engine = policy.selected_engine;
+  const CudaTracePreconditionerKind kind = policy.trace_preconditioner;
+  const bool igr_active = policy.igr_active;
   evidence = {};
   evidence.matrix_generation = matrix_generation;
   evidence.selected_engine = engine;
   evidence.trace_preconditioner = kind;
   evidence.igr_active = igr_active;
-  const bool exact_kind = generic::IsKnownCudaEngineKind(engine) &&
-      engine == generic::CudaEngineKind::tensor_core && !igr_active &&
-      kind == CudaTracePreconditionerForEngine(engine, igr_active) &&
+  const bool exact_kind = CudaTracePolicyDescriptorIsExact(policy) &&
+      !igr_active &&
       kind == CudaTracePreconditionerKind::hypre_diag_scale;
   if (!exact_kind) return false;
   try
@@ -1128,7 +1125,7 @@ bool CudaConfigurePersistentDiagonal(
         static_cast<const mfem::HypreDiagScale&>(diagonal);
     diagnostic.result = configured_diagonal.GetData() == &matrix &&
         evidence.ConfigurationExactForGeneration(
-            matrix_generation, engine, kind, igr_active);
+            matrix_generation, policy);
     return diagnostic.result;
   }
   catch (...) { return false; }
@@ -1193,13 +1190,14 @@ bool CudaStableTrueMatrixExact(
 
 bool CudaExactIluGmresConfiguration(
     mfem::HypreParMatrix& matrix, mfem::HypreILU& ilu,
-    mfem::HypreGMRES& gmres, const generic::CudaEngineKind engine,
-    const CudaTracePreconditionerKind kind,
-    const bool igr_active, const double relative_tolerance,
+    mfem::HypreGMRES& gmres, const CudaTracePolicyDescriptor& policy,
+    const double relative_tolerance,
     const int maximum_iterations, const int krylov_dimension,
     const bool factor_required,
     CudaLiveIluFactorIdentity& identity) noexcept
 {
+  const CudaTracePreconditionerKind kind = policy.trace_preconditioner;
+  const bool igr_active = policy.igr_active;
   hypre_ParCSRMatrix* const raw_matrix = matrix;
   const HYPRE_Solver raw_ilu = static_cast<HYPRE_Solver>(ilu);
   const HYPRE_Solver raw_gmres = static_cast<HYPRE_Solver>(gmres);
@@ -1209,15 +1207,18 @@ bool CudaExactIluGmresConfiguration(
       reinterpret_cast<hypre_GMRESData*>(raw_gmres);
   if (raw_matrix == nullptr || raw_ilu == nullptr || raw_gmres == nullptr ||
       ilu_data == nullptr || gmres_data == nullptr ||
+      !CudaTracePolicyDescriptorIsExact(policy) ||
       kind != CudaTracePreconditionerKind::hypre_ilu0)
     return false;
 
-  const int triangular_solve =
-      CudaIluTriangularSolve(engine, igr_active);
+  const int triangular_solve = policy.ilu_triangular_solve_kind ==
+          CudaIluTriangularSolveKind::direct
+      ? 1 : policy.ilu_triangular_solve_kind ==
+              CudaIluTriangularSolveKind::iterative_jacobi ? 0 : -1;
   const int lower_jacobi_iterations =
-      CudaIluLowerJacobiIterations(engine, igr_active);
+      policy.ilu_lower_jacobi_iterations;
   const int upper_jacobi_iterations =
-      CudaIluUpperJacobiIterations(engine, igr_active);
+      policy.ilu_upper_jacobi_iterations;
 
   HYPRE_Real configured_tolerance = 0.0;
   HYPRE_Real configured_absolute_tolerance = 0.0;
@@ -1307,12 +1308,12 @@ bool CudaExactIluGmresConfiguration(
       configured_relative_change == 0 &&
       configured_logging == 1 && configured_print_level == 0 &&
       configured_preconditioner == raw_ilu &&
-      hypre_ParILUDataIluType(ilu_data) == CudaIluType(kind) &&
-      hypre_ParILUDataLfil(ilu_data) == CudaIluLevelOfFill(kind) &&
+      hypre_ParILUDataIluType(ilu_data) == policy.ilu_type &&
+      hypre_ParILUDataLfil(ilu_data) == policy.ilu_level_of_fill &&
       hypre_ParILUDataReorderingType(ilu_data) ==
-          CudaIluLocalReordering(kind, igr_active) &&
+          policy.ilu_local_reordering &&
       hypre_ParILUDataMaxIter(ilu_data) ==
-          CudaIluApplicationIterations(kind) &&
+          policy.ilu_application_iterations &&
       hypre_ParILUDataTol(ilu_data) == 0.0 &&
       hypre_ParILUDataPrintLevel(ilu_data) == 0 &&
       hypre_ParILUDataTriSolve(ilu_data) == triangular_solve &&
@@ -1326,9 +1327,8 @@ bool CudaExactIluGmresConfiguration(
 
 bool CudaRetainedIluFactorExact(
     mfem::HypreParMatrix& matrix, mfem::HypreILU& ilu,
-    mfem::HypreGMRES& gmres, const generic::CudaEngineKind engine,
-    const CudaTracePreconditionerKind kind,
-    const bool igr_active, const double relative_tolerance,
+    mfem::HypreGMRES& gmres, const CudaTracePolicyDescriptor& policy,
+    const double relative_tolerance,
     const int maximum_iterations, const int krylov_dimension,
     const CudaIluAttemptFactorState& state,
     CudaLiveIluFactorIdentity& identity) noexcept
@@ -1337,7 +1337,7 @@ bool CudaRetainedIluFactorExact(
   const bool matrix_exact =
       CudaStableTrueMatrixExact(matrix, state, matrix_identity);
   const bool configuration_exact = CudaExactIluGmresConfiguration(
-      matrix, ilu, gmres, engine, kind, igr_active, relative_tolerance,
+      matrix, ilu, gmres, policy, relative_tolerance,
       maximum_iterations, krylov_dimension, true, identity);
   return matrix_exact && configuration_exact && state.factor_ready &&
       state.hypre_matrix_token == identity.hypre_matrix_token &&
@@ -1358,10 +1358,7 @@ bool CudaSolveWithIluFactorPolicy(
     mfem::HypreParVector& solution, mfem::HypreILU& ilu,
     mfem::HypreGMRES& gmres, const int ranks,
     const MPI_Comm communicator,
-    const generic::CudaEngineKind engine,
-    const CudaTracePreconditionerKind kind,
-    const bool igr_active,
-    const CudaIluFactorReusePolicy factor_reuse_policy,
+    const CudaTracePolicyDescriptor& policy,
     const AttemptIdentity& attempt,
     const double relative_tolerance, const int maximum_iterations,
     const int krylov_dimension,
@@ -1371,22 +1368,25 @@ bool CudaSolveWithIluFactorPolicy(
 {
   CudaTrueSystemDiagnosticScope diagnostic("ilu-factor-policy-solve",
                                            matrix_generation);
+  const CudaTracePreconditionerKind kind = policy.trace_preconditioner;
+  const bool igr_active = policy.igr_active;
+  const CudaIluFactorReusePolicy factor_reuse_policy =
+      policy.ilu_factor_reuse_policy;
   diagnostics = {};
   diagnostics.matrix_generation = matrix_generation;
   diagnostics.trace_preconditioner = kind;
   diagnostics.igr_active = igr_active;
-  diagnostics.ilu_type = CudaIluType(kind);
-  diagnostics.ilu_level_of_fill = CudaIluLevelOfFill(kind);
-  diagnostics.ilu_local_reordering =
-      CudaIluLocalReordering(kind, igr_active);
+  diagnostics.ilu_type = policy.ilu_type;
+  diagnostics.ilu_level_of_fill = policy.ilu_level_of_fill;
+  diagnostics.ilu_local_reordering = policy.ilu_local_reordering;
   diagnostics.ilu_application_iterations =
-      CudaIluApplicationIterations(kind);
+      policy.ilu_application_iterations;
   diagnostics.ilu_triangular_solve_kind =
-      CudaIluTriangularSolveKindForEngine(engine, igr_active);
+      policy.ilu_triangular_solve_kind;
   diagnostics.ilu_lower_jacobi_iterations =
-      CudaIluLowerJacobiIterations(engine, igr_active);
+      policy.ilu_lower_jacobi_iterations;
   diagnostics.ilu_upper_jacobi_iterations =
-      CudaIluUpperJacobiIterations(engine, igr_active);
+      policy.ilu_upper_jacobi_iterations;
   diagnostics.krylov_dimension = krylov_dimension;
   diagnostics.ilu_accounting_kind =
       CudaIluAccountingKind::derived_bounds_v1;
@@ -1424,11 +1424,8 @@ bool CudaSolveWithIluFactorPolicy(
           factor_state.factor_generation == 0 &&
           factor_state.last_solve_generation == 0;
   const bool local_policy_exact = ranks > 0 &&
-      generic::IsKnownCudaEngineKind(engine) &&
-      kind == CudaTracePreconditionerForEngine(engine, igr_active) &&
+      CudaTracePolicyDescriptorIsExact(policy) &&
       kind == CudaTracePreconditionerKind::hypre_ilu0 &&
-      factor_reuse_policy ==
-          CudaIluFactorReusePolicyForEngine(engine, igr_active) &&
       factor_reuse_policy != CudaIluFactorReusePolicy::not_applicable &&
       (factor_reuse_policy !=
            CudaIluFactorReusePolicy::first_trace_solve_per_attempt ||
@@ -1439,9 +1436,9 @@ bool CudaSolveWithIluFactorPolicy(
   if (!AllRanksReady(local_policy_exact, communicator, ranks))
     return false;
 
-  // Ordinary CUDA's typed refresh-each policy has one possible branch on
-  // every rank.  Only attempt-retained tensor IGR factors require a collective
-  // refresh/reuse decision.
+  // A typed refresh-each policy has one possible branch on every rank.  Only
+  // an explicitly selected first-per-attempt factor lifetime requires a
+  // collective refresh/reuse decision.
   bool refresh_factor = true;
   if (CudaIluRefreshDecisionRequiresConsensus(factor_reuse_policy))
   {
@@ -1472,12 +1469,12 @@ bool CudaSolveWithIluFactorPolicy(
     if (policy_ready && refresh_factor)
     {
       policy_ready = CudaConfigurePersistentHypre(
-          matrix, ilu, gmres, ranks, engine, kind, igr_active,
+          matrix, ilu, gmres, ranks, policy,
           relative_tolerance, maximum_iterations, krylov_dimension,
           matrix_generation, setup_order) &&
           CudaStableTrueMatrixExact(matrix, factor_state, before_factor) &&
           CudaExactIluGmresConfiguration(
-              matrix, ilu, gmres, engine, kind, igr_active,
+              matrix, ilu, gmres, policy,
               relative_tolerance,
               maximum_iterations, krylov_dimension, false, before_factor) &&
           before_factor.factor_matrix_token == 0 &&
@@ -1492,7 +1489,7 @@ bool CudaSolveWithIluFactorPolicy(
       // SetOperator call, callback replacement, or adaptive refresh exists on
       // this branch.
       policy_ready = CudaRetainedIluFactorExact(
-          matrix, ilu, gmres, engine, kind, igr_active,
+          matrix, ilu, gmres, policy,
           relative_tolerance,
           maximum_iterations, krylov_dimension, factor_state,
           before_factor);
@@ -1545,12 +1542,12 @@ bool CudaSolveWithIluFactorPolicy(
     const bool stable_matrix =
         CudaStableTrueMatrixExact(matrix, factor_state, after_factor);
     const bool exact_live_factor = CudaExactIluGmresConfiguration(
-        matrix, ilu, gmres, engine, kind, igr_active, relative_tolerance,
+        matrix, ilu, gmres, policy, relative_tolerance,
         maximum_iterations, krylov_dimension, true, after_factor);
     const bool factor_operation_exact = refresh_factor
         ? setup_order.Advance(CudaHypreSetupTransition::mult) &&
             setup_order.SolveExactForGeneration(
-                matrix_generation, engine, kind, igr_active)
+                matrix_generation, policy)
         : before_factor.hypre_matrix_token ==
                 after_factor.hypre_matrix_token &&
             before_factor.ilu_handle_token ==
@@ -1566,7 +1563,7 @@ bool CudaSolveWithIluFactorPolicy(
             before_factor.jacobi_diagonal_values_token ==
                 after_factor.jacobi_diagonal_values_token &&
             CudaRetainedIluFactorExact(
-                matrix, ilu, gmres, engine, kind, igr_active,
+                matrix, ilu, gmres, policy,
                 relative_tolerance,
                 maximum_iterations, krylov_dimension, factor_state,
                 after_factor);
@@ -1662,10 +1659,7 @@ bool CudaRefreshFactorAndSolve(
     mfem::HypreParVector& solution, mfem::HypreILU& ilu,
     mfem::HypreGMRES& gmres, const int ranks,
     const MPI_Comm communicator,
-    const generic::CudaEngineKind engine,
-    const CudaTracePreconditionerKind kind,
-    const bool igr_active,
-    const CudaIluFactorReusePolicy factor_reuse_policy,
+    const CudaTracePolicyDescriptor& policy,
     const double relative_tolerance, const int maximum_iterations,
     const int krylov_dimension,
     const std::uint64_t matrix_generation,
@@ -1676,15 +1670,16 @@ bool CudaRefreshFactorAndSolve(
   const AttemptIdentity initialization_attempt{};
   if (!CudaGetTrueMatrixDeviceView(matrix, view) ||
       !CudaBeginIluFactorAttempt(
-          factor_state, initialization_attempt, factor_reuse_policy,
+          factor_state, initialization_attempt,
+          policy.ilu_factor_reuse_policy,
           reinterpret_cast<std::uintptr_t>(&matrix),
           reinterpret_cast<std::uintptr_t>(view.diag_values),
           reinterpret_cast<std::uintptr_t>(view.offd_values),
           view.diag_nonzeros, view.offd_nonzeros))
     return false;
   return CudaSolveWithIluFactorPolicy(
-      matrix, rhs, solution, ilu, gmres, ranks, communicator, engine, kind,
-      igr_active, factor_reuse_policy, initialization_attempt,
+      matrix, rhs, solution, ilu, gmres, ranks, communicator, policy,
+      initialization_attempt,
       relative_tolerance, maximum_iterations, krylov_dimension,
       matrix_generation, factor_state, diagnostics);
 }
@@ -1693,8 +1688,7 @@ bool CudaRefreshDiagonalAndSolve(
     mfem::HypreParMatrix& matrix, mfem::HypreParVector& rhs,
     mfem::HypreParVector& solution, mfem::HypreDiagScale& diagonal,
     mfem::HypreGMRES& gmres, const int ranks, const MPI_Comm communicator,
-    const generic::CudaEngineKind engine,
-    const CudaTracePreconditionerKind kind, const bool igr_active,
+    const CudaTracePolicyDescriptor& policy,
     const double relative_tolerance, const int maximum_iterations,
     const int krylov_dimension, const std::uint64_t matrix_generation,
     CudaSolveDiagnostics& diagnostics) noexcept
@@ -1711,7 +1705,7 @@ bool CudaRefreshDiagonalAndSolve(
   {
     policy_ready = CudaHypreDevicePolicyValid(matrix, rhs, solution) &&
         CudaConfigurePersistentDiagonal(
-            matrix, diagonal, gmres, engine, kind, igr_active,
+            matrix, diagonal, gmres, policy,
             relative_tolerance,
             maximum_iterations, krylov_dimension, matrix_generation,
             setup_order) &&
@@ -1761,7 +1755,7 @@ bool CudaRefreshDiagonalAndSolve(
         CudaHypreDevicePolicyValid(matrix, rhs, solution);
     diagnostics.configured_diagonal =
         setup_order.SolveExactForGeneration(
-            matrix_generation, engine, kind, igr_active);
+            matrix_generation, policy);
     diagnostics.configured_preconditioner =
         diagnostics.configured_diagonal;
     diagnostics.trace_preconditioner = diagnostics.configured_diagonal

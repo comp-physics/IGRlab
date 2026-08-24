@@ -644,13 +644,31 @@ struct CudaHypreSetupState
 
   constexpr bool ConfigurationExactForGeneration(
       const std::uint64_t expected_generation,
+      const CudaTracePolicyDescriptor& expected_policy) const noexcept
+  {
+    return next_transition == configured_transition_count &&
+        PrefixExactForGeneration(expected_generation, expected_policy);
+  }
+
+  constexpr bool SolveExactForGeneration(
+      const std::uint64_t expected_generation,
+      const CudaTracePolicyDescriptor& expected_policy) const noexcept
+  {
+    return next_transition == solved_transition_count &&
+        PrefixExactForGeneration(expected_generation, expected_policy);
+  }
+
+  // Compatibility overloads retain the established engine-default test seam.
+  constexpr bool ConfigurationExactForGeneration(
+      const std::uint64_t expected_generation,
       const generic::CudaEngineKind expected_engine,
       const CudaTracePreconditionerKind expected_kind,
       const bool igr_active) const noexcept
   {
-    return next_transition == configured_transition_count &&
-        PrefixExactForGeneration(expected_generation,
-                                 expected_engine, expected_kind, igr_active);
+    const CudaTracePolicyDescriptor policy = ResolveCudaTracePolicy(
+        expected_engine, igr_active, CudaTracePolicyKind::engine_default);
+    return expected_kind == policy.trace_preconditioner &&
+        ConfigurationExactForGeneration(expected_generation, policy);
   }
 
   constexpr bool SolveExactForGeneration(
@@ -659,9 +677,10 @@ struct CudaHypreSetupState
       const CudaTracePreconditionerKind expected_kind,
       const bool igr_active) const noexcept
   {
-    return next_transition == solved_transition_count &&
-        PrefixExactForGeneration(expected_generation,
-                                 expected_engine, expected_kind, igr_active);
+    const CudaTracePolicyDescriptor policy = ResolveCudaTracePolicy(
+        expected_engine, igr_active, CudaTracePolicyKind::engine_default);
+    return expected_kind == policy.trace_preconditioner &&
+        SolveExactForGeneration(expected_generation, policy);
   }
 
 private:
@@ -707,26 +726,24 @@ private:
 
   constexpr bool PrefixExactForGeneration(
       const std::uint64_t expected_generation,
-      const generic::CudaEngineKind expected_engine,
-      const CudaTracePreconditionerKind expected_kind,
-      const bool igr_active) const noexcept
+      const CudaTracePolicyDescriptor& expected_policy) const noexcept
   {
-    const int expected_type = CudaIluType(expected_kind);
-    const int expected_fill = CudaIluLevelOfFill(expected_kind);
+    const CudaTracePreconditionerKind expected_kind =
+        expected_policy.trace_preconditioner;
+    const int expected_type = expected_policy.ilu_type;
+    const int expected_fill = expected_policy.ilu_level_of_fill;
     const int expected_reordering =
-        CudaIluLocalReordering(expected_kind, igr_active);
+        expected_policy.ilu_local_reordering;
     const int expected_application_iterations =
-        CudaIluApplicationIterations(expected_kind);
+        expected_policy.ilu_application_iterations;
     const CudaIluTriangularSolveKind expected_triangular_solve_kind =
-        CudaIluTriangularSolveKindForEngine(expected_engine, igr_active);
+        expected_policy.ilu_triangular_solve_kind;
     const int expected_lower_jacobi_iterations =
-        CudaIluLowerJacobiIterations(expected_engine, igr_active);
+        expected_policy.ilu_lower_jacobi_iterations;
     const int expected_upper_jacobi_iterations =
-        CudaIluUpperJacobiIterations(expected_engine, igr_active);
+        expected_policy.ilu_upper_jacobi_iterations;
     const bool selected_policy_valid =
-        generic::IsKnownCudaEngineKind(expected_engine) &&
-        expected_kind == CudaTracePreconditionerForEngine(
-            expected_engine, igr_active) &&
+        CudaTracePolicyDescriptorIsExact(expected_policy) &&
         expected_kind == CudaTracePreconditionerKind::hypre_ilu0;
     if (invalid_transition || matrix_generation != expected_generation ||
         !selected_policy_valid || trace_preconditioner != expected_kind ||
@@ -782,13 +799,32 @@ struct CudaDiagScaleSetupState
 
   constexpr bool ConfigurationExactForGeneration(
       const std::uint64_t expected_generation,
+      const CudaTracePolicyDescriptor& expected_policy) const noexcept
+  {
+    return next_transition == configured_transition_count &&
+        PrefixExactForGeneration(expected_generation, expected_policy);
+  }
+
+  constexpr bool SolveExactForGeneration(
+      const std::uint64_t expected_generation,
+      const CudaTracePolicyDescriptor& expected_policy) const noexcept
+  {
+    return next_transition == solved_transition_count &&
+        PrefixExactForGeneration(expected_generation, expected_policy);
+  }
+
+  // Compatibility overloads retain the established engine-default test seam.
+  constexpr bool ConfigurationExactForGeneration(
+      const std::uint64_t expected_generation,
       const generic::CudaEngineKind expected_engine,
       const CudaTracePreconditionerKind expected_kind,
       const bool expected_igr_active) const noexcept
   {
-    return next_transition == configured_transition_count &&
-        PrefixExactForGeneration(expected_generation, expected_engine,
-                                 expected_kind, expected_igr_active);
+    const CudaTracePolicyDescriptor policy = ResolveCudaTracePolicy(
+        expected_engine, expected_igr_active,
+        CudaTracePolicyKind::engine_default);
+    return expected_kind == policy.trace_preconditioner &&
+        ConfigurationExactForGeneration(expected_generation, policy);
   }
 
   constexpr bool SolveExactForGeneration(
@@ -797,9 +833,11 @@ struct CudaDiagScaleSetupState
       const CudaTracePreconditionerKind expected_kind,
       const bool expected_igr_active) const noexcept
   {
-    return next_transition == solved_transition_count &&
-        PrefixExactForGeneration(expected_generation, expected_engine,
-                                 expected_kind, expected_igr_active);
+    const CudaTracePolicyDescriptor policy = ResolveCudaTracePolicy(
+        expected_engine, expected_igr_active,
+        CudaTracePolicyKind::engine_default);
+    return expected_kind == policy.trace_preconditioner &&
+        SolveExactForGeneration(expected_generation, policy);
   }
 
 private:
@@ -826,16 +864,16 @@ private:
 
   constexpr bool PrefixExactForGeneration(
       const std::uint64_t expected_generation,
-      const generic::CudaEngineKind expected_engine,
-      const CudaTracePreconditionerKind expected_kind,
-      const bool expected_igr_active) const noexcept
+      const CudaTracePolicyDescriptor& expected_policy) const noexcept
   {
+    const generic::CudaEngineKind expected_engine =
+        expected_policy.selected_engine;
+    const CudaTracePreconditionerKind expected_kind =
+        expected_policy.trace_preconditioner;
+    const bool expected_igr_active = expected_policy.igr_active;
     const bool selected_policy_valid =
-        generic::IsKnownCudaEngineKind(expected_engine) &&
-        expected_engine == generic::CudaEngineKind::tensor_core &&
+        CudaTracePolicyDescriptorIsExact(expected_policy) &&
         !expected_igr_active &&
-        expected_kind == CudaTracePreconditionerForEngine(
-            expected_engine, expected_igr_active) &&
         expected_kind == CudaTracePreconditionerKind::hypre_diag_scale;
     if (invalid_transition || matrix_generation != expected_generation ||
         !selected_policy_valid || selected_engine != expected_engine ||
@@ -1002,13 +1040,12 @@ constexpr bool CudaInitializeIluEvidence(
     const CudaTracePreconditionerKind kind,
     const bool igr_active) noexcept
 {
-  const bool selection_exact =
-      generic::IsKnownCudaEngineKind(evidence.selected_engine) &&
-      kind == CudaTracePreconditionerForEngine(
-          evidence.selected_engine, igr_active);
+  const CudaTracePolicyDescriptor policy = ResolveCudaTracePolicy(
+      evidence.selected_engine, igr_active, evidence.trace_policy);
+  const bool selection_exact = CudaTracePolicyDescriptorIsExact(policy) &&
+      kind == policy.trace_preconditioner;
   const CudaIluFactorReusePolicy factor_reuse_policy =
-      CudaIluFactorReusePolicyForEngine(
-          evidence.selected_engine, igr_active);
+      policy.ilu_factor_reuse_policy;
   if (!CudaTracePreconditionerIsIlu(kind))
   {
     const bool empty = selection_exact && evidence.ilu_type == -1 &&
@@ -1036,19 +1073,16 @@ constexpr bool CudaInitializeIluEvidence(
     evidence.ilu_accounting_complete = empty;
     return empty;
   }
-  const int ilu_type = CudaIluType(kind);
-  const int level_of_fill = CudaIluLevelOfFill(kind);
-  const int local_reordering =
-      CudaIluLocalReordering(kind, igr_active);
-  const int application_iterations =
-      CudaIluApplicationIterations(kind);
+  const int ilu_type = policy.ilu_type;
+  const int level_of_fill = policy.ilu_level_of_fill;
+  const int local_reordering = policy.ilu_local_reordering;
+  const int application_iterations = policy.ilu_application_iterations;
   const CudaIluTriangularSolveKind triangular_solve_kind =
-      CudaIluTriangularSolveKindForEngine(
-          evidence.selected_engine, igr_active);
-  const int lower_jacobi_iterations = CudaIluLowerJacobiIterations(
-      evidence.selected_engine, igr_active);
-  const int upper_jacobi_iterations = CudaIluUpperJacobiIterations(
-      evidence.selected_engine, igr_active);
+      policy.ilu_triangular_solve_kind;
+  const int lower_jacobi_iterations =
+      policy.ilu_lower_jacobi_iterations;
+  const int upper_jacobi_iterations =
+      policy.ilu_upper_jacobi_iterations;
   const bool exact_kind = selection_exact &&
       kind == CudaTracePreconditionerKind::hypre_ilu0;
   const bool empty = evidence.ilu_accounting_kind ==
@@ -1131,21 +1165,19 @@ constexpr bool CudaAccumulateIluSolveEvidence(
       diagnostics.trace_preconditioner, diagnostics.igr_active);
   const int expected_application_iterations =
       CudaIluApplicationIterations(diagnostics.trace_preconditioner);
+  const CudaTracePolicyDescriptor policy = ResolveCudaTracePolicy(
+      evidence.selected_engine, diagnostics.igr_active,
+      evidence.trace_policy);
   const CudaIluTriangularSolveKind expected_triangular_solve_kind =
-      CudaIluTriangularSolveKindForEngine(
-          evidence.selected_engine, diagnostics.igr_active);
+      policy.ilu_triangular_solve_kind;
   const int expected_lower_jacobi_iterations =
-      CudaIluLowerJacobiIterations(
-          evidence.selected_engine, diagnostics.igr_active);
+      policy.ilu_lower_jacobi_iterations;
   const int expected_upper_jacobi_iterations =
-      CudaIluUpperJacobiIterations(
-          evidence.selected_engine, diagnostics.igr_active);
+      policy.ilu_upper_jacobi_iterations;
   const CudaIluFactorReusePolicy expected_factor_reuse_policy =
-      CudaIluFactorReusePolicyForEngine(
-          evidence.selected_engine, diagnostics.igr_active);
-  const bool exact_policy =
-      diagnostics.trace_preconditioner == CudaTracePreconditionerForEngine(
-          evidence.selected_engine, diagnostics.igr_active) &&
+      policy.ilu_factor_reuse_policy;
+  const bool exact_policy = CudaTracePolicyDescriptorIsExact(policy) &&
+      diagnostics.trace_preconditioner == policy.trace_preconditioner &&
       diagnostics.trace_preconditioner ==
           CudaTracePreconditionerKind::hypre_ilu0 &&
       diagnostics.ilu_factor_reuse_policy ==
@@ -1433,9 +1465,7 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
                                   mfem::HypreILU& ilu,
                                   mfem::HypreGMRES& gmres,
                                   int ranks,
-                                  generic::CudaEngineKind engine,
-                                  CudaTracePreconditionerKind kind,
-                                  bool igr_active,
+                                  const CudaTracePolicyDescriptor& policy,
                                   double relative_tolerance,
                                   int maximum_iterations,
                                   int krylov_dimension,
@@ -1445,9 +1475,7 @@ bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
 bool CudaConfigurePersistentDiagonal(mfem::HypreParMatrix& matrix,
                                      mfem::HypreDiagScale& diagonal,
                                      mfem::HypreGMRES& gmres,
-                                     generic::CudaEngineKind engine,
-                                     CudaTracePreconditionerKind kind,
-                                     bool igr_active,
+                                     const CudaTracePolicyDescriptor& policy,
                                      double relative_tolerance,
                                      int maximum_iterations,
                                      int krylov_dimension,
@@ -1461,10 +1489,7 @@ bool CudaRefreshFactorAndSolve(mfem::HypreParMatrix& matrix,
                                mfem::HypreGMRES& gmres,
                                int ranks,
                                MPI_Comm communicator,
-                               generic::CudaEngineKind engine,
-                               CudaTracePreconditionerKind kind,
-                               bool igr_active,
-                               CudaIluFactorReusePolicy factor_reuse_policy,
+                               const CudaTracePolicyDescriptor& policy,
                                double relative_tolerance,
                                int maximum_iterations,
                                int krylov_dimension,
@@ -1478,10 +1503,7 @@ bool CudaSolveWithIluFactorPolicy(
     mfem::HypreGMRES& gmres,
     int ranks,
     MPI_Comm communicator,
-    generic::CudaEngineKind engine,
-    CudaTracePreconditionerKind kind,
-    bool igr_active,
-    CudaIluFactorReusePolicy factor_reuse_policy,
+    const CudaTracePolicyDescriptor& policy,
     const AttemptIdentity& attempt,
     double relative_tolerance,
     int maximum_iterations,
@@ -1496,9 +1518,7 @@ bool CudaRefreshDiagonalAndSolve(mfem::HypreParMatrix& matrix,
                                  mfem::HypreGMRES& gmres,
                                  int ranks,
                                  MPI_Comm communicator,
-                                 generic::CudaEngineKind engine,
-                                 CudaTracePreconditionerKind kind,
-                                 bool igr_active,
+                                 const CudaTracePolicyDescriptor& policy,
                                  double relative_tolerance,
                                  int maximum_iterations,
                                  int krylov_dimension,
@@ -1628,15 +1648,23 @@ public:
   CudaPersistentNumerics(const CudaPersistentNumerics&) = delete;
   CudaPersistentNumerics& operator=(const CudaPersistentNumerics&) = delete;
 
-  bool Initialize(const CudaConfig& config, CudaRunEvidence& evidence,
+  bool Initialize(const CudaConfig& config,
+                  const CudaTracePolicyKind trace_policy,
+                  CudaRunEvidence& evidence,
                   const RuntimeTupleDescriptor& tuple) noexcept
   {
     communicator_ = CudaCollectiveCommunicator(config);
     cuda_engine_ = config.cuda_engine;
+    const bool igr_requested = config.use_generic_numerical_policy &&
+        config.numerical_policy.stabilization.kind ==
+            generic::RegularizationKind::igr;
+    trace_policy_descriptor_ = ResolveCudaTracePolicy(
+        cuda_engine_, igr_requested, trace_policy);
     trace_preconditioner_ = CudaTracePreconditionerKind::unconfigured;
     ilu_factor_state_ = {};
     initialization_tensor_core_evidence_ = {};
     evidence.tensor_core.selected_engine = cuda_engine_;
+    evidence.tensor_core.trace_policy = trace_policy;
     oracle_capture_requested_ = config.capture_oracle;
     TransportPolicy::ResetLedger();
     CudaPolicyContext setup{};
@@ -1738,8 +1766,11 @@ public:
                              "build-persistent-true-system");
       return false;
     }
-    const bool trace_preconditioner_ready = trace_preconditioner_ ==
-        CudaTracePreconditionerForEngine(cuda_engine_, shape_.igr_active);
+    const bool trace_preconditioner_ready =
+        CudaTracePolicyDescriptorIsExact(trace_policy_descriptor_) &&
+        trace_policy_descriptor_.igr_active == shape_.igr_active &&
+        trace_preconditioner_ ==
+            trace_policy_descriptor_.trace_preconditioner;
     if (!CollectiveContinue(trace_preconditioner_ready))
     {
       ReportCudaSetupFailure(evidence.rank, "trace-preconditioner-selection");
@@ -1880,8 +1911,9 @@ public:
   { return trace_preconditioner_; }
   bool TracePreconditionerConfigured() const noexcept
   {
-    return trace_preconditioner_ ==
-        CudaTracePreconditionerForEngine(cuda_engine_, shape_.igr_active);
+    return CudaTracePolicyDescriptorIsExact(trace_policy_descriptor_) &&
+        trace_policy_descriptor_.igr_active == shape_.igr_active &&
+        trace_preconditioner_ == trace_policy_descriptor_.trace_preconditioner;
   }
   const StateHash& LocalMeshHash() const noexcept { return local_mesh_hash_; }
   const StateHash& LocalPartitionHash() const noexcept
@@ -2116,7 +2148,7 @@ public:
     ReportCudaWarmLifetimeMarker(
         rank_, "reuse-persistence-predicates", "before", false);
     const CudaTracePreconditionerKind selected_preconditioner =
-        CudaTracePreconditionerForEngine(cuda_engine_, shape_.igr_active);
+        trace_policy_descriptor_.trace_preconditioner;
     const bool selected_preconditioner_ready = gmres_ &&
         ((CudaTracePreconditionerIsIlu(selected_preconditioner) &&
           ilu_ && !diagonal_ && trace_preconditioner_ ==
@@ -2146,8 +2178,7 @@ public:
     ticket_count_ = 0;
     TransportPolicy::SetPhase(CudaFailurePhase::setup, current_generation_);
     const CudaIluFactorReusePolicy factor_reuse_policy =
-        CudaIluFactorReusePolicyForEngine(
-            cuda_engine_, shape_.igr_active);
+        trace_policy_descriptor_.ilu_factor_reuse_policy;
     const bool factor_attempt_ready = true_matrix_ &&
         CudaBeginIluFactorAttempt(
             ilu_factor_state_, attempt, factor_reuse_policy,
@@ -2650,10 +2681,12 @@ public:
     CudaIluFactorAttemptEndGuard end_factor_attempt(ilu_factor_state_);
     CudaNumericalResult result{};
     result.tensor_core.selected_engine = cuda_engine_;
+    result.tensor_core.trace_policy = trace_policy_descriptor_.selection;
     result.tensor_core.trace_preconditioner = trace_preconditioner_;
     result.tensor_core.trace_preconditioner_configured =
-        trace_preconditioner_ == CudaTracePreconditionerForEngine(
-            cuda_engine_, shape_.igr_active);
+        CudaTracePolicyDescriptorIsExact(trace_policy_descriptor_) &&
+        trace_policy_descriptor_.igr_active == shape_.igr_active &&
+        trace_preconditioner_ == trace_policy_descriptor_.trace_preconditioner;
     // Aggregate-accounting failure is sticky in the evidence but does not
     // redefine the independently verified live preconditioner configuration.
     (void)CudaInitializeIluEvidence(
@@ -3603,6 +3636,7 @@ private:
     const int device_architecture = 10 * properties.major + properties.minor;
     tensor_core_hardware_supported_ = device_architecture == 120;
     evidence.tensor_core.selected_engine = cuda_engine_;
+    evidence.tensor_core.trace_policy = trace_policy_descriptor_.selection;
     evidence.tensor_core.hardware_supported =
         tensor_core_hardware_supported_;
     if (cuda_engine_ == generic::CudaEngineKind::tensor_core &&
@@ -4124,6 +4158,7 @@ private:
   bool oracle_capture_requested_ = false;
   generic::CudaEngineKind cuda_engine_ =
       generic::CudaEngineKind::ordinary;
+  CudaTracePolicyDescriptor trace_policy_descriptor_{};
   MPI_Comm communicator_ = MPI_COMM_WORLD;
   int rank_ = -1;
   int ranks_ = 0;

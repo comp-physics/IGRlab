@@ -136,6 +136,7 @@ struct CudaQualificationTestAccess
     const auto& tensor = evidence.tensor_core;
     const bool igr_active = engine.numerics_.shape_.igr_active;
     return tensor.selected_engine == expected &&
+        tensor.trace_policy == CudaTracePolicyKind::engine_default &&
         tensor.trace_preconditioner_configured &&
         tensor.trace_preconditioner ==
             CudaTracePreconditionerForEngine(expected, igr_active) &&

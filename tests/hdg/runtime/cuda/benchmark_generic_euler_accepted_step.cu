@@ -77,10 +77,20 @@ struct CudaAcceptedStepProblemMetadata
 };
 
 // The production facade and engine already grant this exact qualification
-// friend.  This executable defines only the two narrow observations needed to
-// keep performance work counts and numerical identity bound to every sample.
+// friend.  This executable defines only the narrow initialization and
+// observation seams needed to bind the ablation policy, work counts, and
+// numerical identity to every sample.
 struct CudaQualificationTestAccess
 {
+  static cuda::GenericEulerHdgCudaSession::result_type
+  InitializeBenchmarkTracePolicy(
+      cuda::GenericEulerHdgCudaSession& session,
+      const ::dg::hdg::generic::EulerHdgRequest& request,
+      const CudaTracePolicyKind trace_policy) noexcept
+  {
+    return session.InitializeRequest(request, trace_policy);
+  }
+
   template <typename Engine>
   static bool CapturePrepared(
       Engine& engine,
@@ -195,18 +205,17 @@ using dg::hdg::runtime::cuda_w8a::CudaMutableHostL2Output;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
 using dg::hdg::runtime::cuda_w8a::CudaIluAccountingKind;
 using dg::hdg::runtime::cuda_w8a::CudaIluAccountingKindName;
-using dg::hdg::runtime::cuda_w8a::CudaIluApplicationIterations;
 using dg::hdg::runtime::cuda_w8a::CudaIluFactorReusePolicy;
-using dg::hdg::runtime::cuda_w8a::CudaIluFactorReusePolicyForEngine;
 using dg::hdg::runtime::cuda_w8a::CudaIluFactorReusePolicyName;
-using dg::hdg::runtime::cuda_w8a::CudaIluLowerJacobiIterations;
 using dg::hdg::runtime::cuda_w8a::CudaIluTriangularSolveKind;
-using dg::hdg::runtime::cuda_w8a::CudaIluTriangularSolveKindForEngine;
 using dg::hdg::runtime::cuda_w8a::CudaIluTriangularSolveKindName;
-using dg::hdg::runtime::cuda_w8a::CudaIluUpperJacobiIterations;
-using dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerForEngine;
 using dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerIsIlu;
 using dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerName;
+using dg::hdg::runtime::cuda_w8a::CudaTracePolicyDescriptor;
+using dg::hdg::runtime::cuda_w8a::CudaTracePolicyDescriptorIsExact;
+using dg::hdg::runtime::cuda_w8a::CudaTracePolicyKind;
+using dg::hdg::runtime::cuda_w8a::CudaTracePolicyKindName;
+using dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy;
 using dg::hdg::runtime::cuda_w8a::CudaTransferTotals;
 using dg::hdg::runtime::cuda_w8a::CudaTransportPolicy;
 using dg::hdg::runtime::cuda_w8a::conserved_components;
@@ -269,6 +278,7 @@ struct Options
 {
   RegularizationKind regularization = RegularizationKind::none;
   CudaEngineKind engine = CudaEngineKind::ordinary;
+  CudaTracePolicyKind trace_policy = CudaTracePolicyKind::engine_default;
   int order = 1;
   int mesh_n = default_mesh_n;
   int domain_periods = 1;
@@ -376,6 +386,22 @@ bool SelectEngine(const std::string_view text, Options& options) noexcept
   return false;
 }
 
+bool SelectTracePolicy(
+    const std::string_view text, Options& options) noexcept
+{
+  if (text == "engine-default")
+  {
+    options.trace_policy = CudaTracePolicyKind::engine_default;
+    return true;
+  }
+  if (text == "common-fast")
+  {
+    options.trace_policy = CudaTracePolicyKind::common_fast;
+    return true;
+  }
+  return false;
+}
+
 const char* EngineName(const CudaEngineKind engine) noexcept
 {
   return engine == CudaEngineKind::tensor_core ? "tensor" : "ordinary";
@@ -426,6 +452,15 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
       if (++index >= argc || !SelectEngine(argv[index], options))
       {
         error = "--engine requires ordinary or tensor";
+        return false;
+      }
+      continue;
+    }
+    if (argument == "--trace-policy")
+    {
+      if (++index >= argc || !SelectTracePolicy(argv[index], options))
+      {
+        error = "--trace-policy requires engine-default or common-fast";
         return false;
       }
       continue;
@@ -576,11 +611,13 @@ void PrintUsage(const char* executable)
 {
   std::cout << "Usage: " << executable
             << " [--mode conventional|igr] [--engine ordinary|tensor]"
+               " [--trace-policy engine-default|common-fast]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--export|--no-export]"
                " [--profile-measured-step 0|1|2|3|4]\n"
                "       " << executable
             << " [--conventional|--igr] [--engine ordinary|tensor]"
+               " [--trace-policy engine-default|common-fast]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--export|--no-export]"
                " [--profile-measured-step 0|1|2|3|4]\n";
@@ -828,27 +865,30 @@ static_assert(!IluDerivedBoundsAreConsistent(
 
 bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
              const CudaEngineKind engine, const bool igr_active,
+             const CudaTracePolicyKind trace_policy,
              const std::uint64_t krylov_restart_dimension) noexcept
 {
   const auto& evidence = observation.evidence;
   const auto& tensor = evidence.tensor_core;
+  const CudaTracePolicyDescriptor expected_policy =
+      ResolveCudaTracePolicy(engine, igr_active, trace_policy);
   const auto expected_preconditioner =
-      CudaTracePreconditionerForEngine(engine, igr_active);
+      expected_policy.trace_preconditioner;
   const bool ilu_policy = CudaTracePreconditionerIsIlu(
       expected_preconditioner);
   const auto expected_factor_reuse_policy =
-      CudaIluFactorReusePolicyForEngine(engine, igr_active);
-  const int expected_ilu_iterations = ilu_policy
-      ? CudaIluApplicationIterations(engine, igr_active) : 0;
-  const int expected_ilu_fill = ilu_policy ? 0 : -1;
-  const int expected_ilu_reordering = ilu_policy
-      ? (igr_active ? 1 : 0) : -1;
+      expected_policy.ilu_factor_reuse_policy;
+  const int expected_ilu_iterations =
+      expected_policy.ilu_application_iterations;
+  const int expected_ilu_fill = expected_policy.ilu_level_of_fill;
+  const int expected_ilu_reordering =
+      expected_policy.ilu_local_reordering;
   const auto expected_triangular_solve_kind =
-      CudaIluTriangularSolveKindForEngine(engine, igr_active);
+      expected_policy.ilu_triangular_solve_kind;
   const int expected_lower_jacobi_iterations =
-      CudaIluLowerJacobiIterations(engine, igr_active);
+      expected_policy.ilu_lower_jacobi_iterations;
   const int expected_upper_jacobi_iterations =
-      CudaIluUpperJacobiIterations(engine, igr_active);
+      expected_policy.ilu_upper_jacobi_iterations;
   const std::uint64_t expected_factor_spmv_updates_per_application =
       expected_triangular_solve_kind ==
           CudaIluTriangularSolveKind::iterative_jacobi
@@ -884,7 +924,7 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
               expected_lower_jacobi_iterations == 5 &&
               expected_upper_jacobi_iterations == 5)) &&
             tensor.ilu_accounting_kind ==
-                CudaIluAccountingKind::derived_bounds_v1 &&
+                expected_policy.ilu_accounting_kind &&
             tensor.ilu_factor_reuse_policy ==
                 expected_factor_reuse_policy &&
             tensor.ilu_accounting_complete &&
@@ -914,7 +954,7 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
             tensor.ilu_lower_jacobi_iterations == 0 &&
             tensor.ilu_upper_jacobi_iterations == 0 &&
             tensor.ilu_accounting_kind ==
-                CudaIluAccountingKind::unavailable &&
+                expected_policy.ilu_accounting_kind &&
             tensor.ilu_factor_reuse_policy ==
                 CudaIluFactorReusePolicy::not_applicable &&
             tensor.ilu_factor_setups == 0 &&
@@ -927,7 +967,10 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
             tensor.ilu_jacobi_factor_spmv_updates_upper_bound == 0 &&
             tensor.ilu_factor_age_generations == 0 &&
             tensor.ilu_accounting_complete;
-  const bool expected_engine = tensor.selected_engine == engine &&
+  const bool expected_engine =
+      CudaTracePolicyDescriptorIsExact(expected_policy) &&
+      tensor.selected_engine == engine &&
+      tensor.trace_policy == trace_policy &&
       tensor.trace_preconditioner_configured &&
       tensor.trace_preconditioner == expected_preconditioner &&
       ilu_work_consistent &&
@@ -959,6 +1002,7 @@ bool RunStep(GenericEulerHdgCudaSession& session,
              const bool export_interior,
              const CudaEngineKind engine,
              const bool igr_active,
+             const CudaTracePolicyKind trace_policy,
              const std::uint64_t krylov_restart_dimension,
              const bool warmup, const int measured_index,
              StepSample& sample, std::string& error)
@@ -1019,7 +1063,7 @@ bool RunStep(GenericEulerHdgCudaSession& session,
   }
   sample.coordinates = session.coordinates();
   sample.diagnostics = session.diagnostics();
-  if (!Healthy(sample.prepared, engine, igr_active,
+  if (!Healthy(sample.prepared, engine, igr_active, trace_policy,
                krylov_restart_dimension))
   {
     error = "accepted-step prepared numerical gates failed";
@@ -1236,6 +1280,9 @@ void PrintStep(const StepSample& sample)
             << ",\"tensor_core\":{"
             << "\"selected_engine\":\""
             << EngineName(evidence.tensor_core.selected_engine) << "\","
+            << "\"trace_policy\":\""
+            << CudaTracePolicyKindName(evidence.tensor_core.trace_policy)
+            << "\","
             << "\"trace_preconditioner\":\""
             << CudaTracePreconditionerName(
                    evidence.tensor_core.trace_preconditioner) << "\","
@@ -1367,7 +1414,8 @@ int RunBenchmark(const Options& options)
   GenericEulerHdgCudaSession session;
   const EulerHdgRequest request = MakeRequest(
       mesh, fields, options.regularization, options.order, options.engine);
-  if (session.Initialize(request).status !=
+  if (CudaQualificationTestAccess::InitializeBenchmarkTracePolicy(
+          session, request, options.trace_policy).status !=
           HdgEulerSessionStatus::initialized ||
       cudaDeviceSynchronize() != cudaSuccess)
   {
@@ -1439,6 +1487,7 @@ int RunBenchmark(const Options& options)
       return RunStep(session, fields, exported_interior, options.timestep,
                      options.export_interior, options.engine,
                      options.regularization == RegularizationKind::igr,
+                     options.trace_policy,
                      static_cast<std::uint64_t>(krylov_restart_dimension), warmup,
                      measured_index,
                      samples[static_cast<std::size_t>(index)], error);
@@ -1497,9 +1546,13 @@ int RunBenchmark(const Options& options)
             << "{\"schema\":2,"
             << "\"benchmark\":\"dg_igr_hdg_cuda_accepted_step\","
             << "\"success\":true,"
+            << "\"variant\":\"ablation\","
+            << "\"production_selectable\":false,"
             << "\"backend\":\"cuda\","
             << "\"cuda_engine\":\"" << EngineName(options.engine)
             << "\","
+            << "\"trace_policy\":\""
+            << CudaTracePolicyKindName(options.trace_policy) << "\","
             << "\"trace_preconditioner\":\""
             << CudaTracePreconditionerName(
                    reported_trace_policy.trace_preconditioner)

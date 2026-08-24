@@ -526,7 +526,16 @@ public:
   using state_slot = typename contract_type::state_slot;
 
   explicit PersistentCudaSmoothEulerEngine(const CudaConfig& config) noexcept
+      : PersistentCudaSmoothEulerEngine(
+            config, CudaTracePolicyKind::engine_default)
+  {}
+
+private:
+  PersistentCudaSmoothEulerEngine(
+      const CudaConfig& config,
+      const CudaTracePolicyKind trace_policy) noexcept
       : config_(config),
+        trace_policy_(trace_policy),
         communicator_(CudaCollectiveCommunicator(config)),
         facade_incarnation_(
             detail::AcquireCudaFacadeIncarnation())
@@ -560,6 +569,10 @@ public:
                   "provisional-commit authority must remain affine");
   }
 
+  friend class ::dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
+
+public:
+
   PersistentCudaSmoothEulerEngine(const PersistentCudaSmoothEulerEngine&) =
       delete;
   PersistentCudaSmoothEulerEngine& operator=(
@@ -569,6 +582,7 @@ public:
   {
     evidence = {};
     evidence.tensor_core.selected_engine = config_.cuda_engine;
+    evidence.tensor_core.trace_policy = trace_policy_;
     MPI_Comm_rank(communicator_, &evidence.rank);
     MPI_Comm_size(communicator_, &evidence.ranks);
     const bool descriptor_consensus = ConfigurationConsensus();
@@ -592,7 +606,7 @@ public:
     }
     AllocatorPolicy::ResetLedger();
     const bool numerics_initialized = numerics_.Initialize(
-        config_, evidence, Selection::Descriptor());
+        config_, trace_policy_, evidence, Selection::Descriptor());
     // The numerical setup has copied every admitted host coefficient into
     // engine-owned arrays.  Retain only the borrowed topology thereafter.
     ForgetBorrowedHostInputPointers();
@@ -1382,6 +1396,13 @@ private:
          (config_.use_borrowed_topology &&
           config_.use_borrowed_host_inputs &&
           config_.use_generic_numerical_policy));
+    const bool trace_policy_configuration =
+        IsKnownCudaTracePolicyKind(trace_policy_) &&
+        (trace_policy_ == CudaTracePolicyKind::engine_default ||
+         (config_.expected_rank_count == 1 &&
+          config_.use_borrowed_topology &&
+          config_.use_borrowed_host_inputs &&
+          config_.use_generic_numerical_policy));
     return config_.experiment == StableIdentity::Copy(experiment_id) &&
         (borrowed_generic_shape || smoke_shape || functional_shape) &&
         topology_configuration &&
@@ -1397,6 +1418,7 @@ private:
          std::memcmp(&config_.dt, &fixed_dt, sizeof(double)) == 0) &&
         config_.requested_device == 0 &&
         cuda_engine_configuration &&
+        trace_policy_configuration &&
         (config_.expected_rank_count == 1 ||
          config_.expected_rank_count == 2) &&
         (config_.expected_rank_count == 1 ||
@@ -1546,6 +1568,8 @@ private:
     // The zero-valued ordinary discriminator preserves default semantics;
     // tensor_core remains a distinct, rank-consensed configuration identity.
     AppendConfigValue(descriptor, cursor, complete, config_.cuda_engine);
+    // Append-only so the engine-default descriptor prefix stays byte-identical.
+    AppendConfigValue(descriptor, cursor, complete, trace_policy_);
     return complete;
   }
 
@@ -1681,20 +1705,21 @@ private:
   {
     evidence = {};
     evidence.selected_engine = config_.cuda_engine;
+    evidence.trace_policy = trace_policy_;
     evidence.hardware_supported =
         numerics_.TensorCoreHardwareSupported();
     const bool igr_active = config_.use_generic_numerical_policy &&
         config_.numerical_policy.stabilization.kind ==
             generic::RegularizationKind::igr;
+    const CudaTracePolicyDescriptor trace_policy = ResolveCudaTracePolicy(
+        config_.cuda_engine, igr_active, trace_policy_);
     const CudaTracePreconditionerKind selected_preconditioner = initialized_
         ? numerics_.TracePreconditioner()
-        : CudaTracePreconditionerForEngine(
-              config_.cuda_engine, igr_active);
+        : trace_policy.trace_preconditioner;
     evidence.trace_preconditioner = selected_preconditioner;
     const bool selected_policy_ready =
-        generic::IsKnownCudaEngineKind(config_.cuda_engine) &&
-        selected_preconditioner == CudaTracePreconditionerForEngine(
-            config_.cuda_engine, igr_active);
+        CudaTracePolicyDescriptorIsExact(trace_policy) &&
+        selected_preconditioner == trace_policy.trace_preconditioner;
     (void)detail::CudaInitializeIluEvidence(
         evidence, selected_preconditioner, igr_active);
     evidence.trace_preconditioner_configured = initialized_ &&
@@ -2072,6 +2097,7 @@ private:
   };
 
   CudaConfig config_{};
+  CudaTracePolicyKind trace_policy_ = CudaTracePolicyKind::engine_default;
   MPI_Comm communicator_ = MPI_COMM_WORLD;
   detail::CudaPersistentNumerics<AllocatorPolicy, TransportPolicy> numerics_{};
   std::optional<contract_type> contract_{};

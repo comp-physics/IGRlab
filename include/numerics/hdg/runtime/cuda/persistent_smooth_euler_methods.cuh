@@ -1063,15 +1063,17 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 BuildPersistentTrueSystem() noexcept
 {
+  const CudaTracePolicyDescriptor& trace_policy = trace_policy_descriptor_;
+  if (!CudaTracePolicyDescriptorIsExact(trace_policy) ||
+      trace_policy.igr_active != shape_.igr_active)
+    return false;
   const CudaTracePreconditionerKind selected_preconditioner =
-      CudaTracePreconditionerForEngine(cuda_engine_, shape_.igr_active);
-  const CudaIluFactorReusePolicy factor_reuse_policy =
-      CudaIluFactorReusePolicyForEngine(
-          cuda_engine_, shape_.igr_active);
+      trace_policy.trace_preconditioner;
   const bool use_ilu =
       CudaTracePreconditionerIsIlu(selected_preconditioner);
   initialization_tensor_core_evidence_ = {};
   initialization_tensor_core_evidence_.selected_engine = cuda_engine_;
+  initialization_tensor_core_evidence_.trace_policy = trace_policy.selection;
   initialization_tensor_core_evidence_.trace_preconditioner =
       selected_preconditioner;
   // Aggregate work evidence is qualification-only.  The independently
@@ -1123,25 +1125,22 @@ BuildPersistentTrueSystem() noexcept
       {
         CudaHypreSetupState initial_setup{};
         local_objects_ready = CudaConfigurePersistentHypre(
-            *true_matrix_, *ilu_, *gmres_, ranks_, cuda_engine_,
-            selected_preconditioner, shape_.igr_active,
+            *true_matrix_, *ilu_, *gmres_, ranks_, trace_policy,
             linear_relative_tolerance_, maximum_linear_iterations_,
             krylov_dimension_, 0, initial_setup) &&
             initial_setup.ConfigurationExactForGeneration(
-                0, cuda_engine_, selected_preconditioner,
-                shape_.igr_active);
+                0, trace_policy);
       }
       else
       {
         CudaDiagScaleSetupState initial_setup{};
         local_objects_ready = CudaConfigurePersistentDiagonal(
             *true_matrix_, *diagonal_, *gmres_,
-            cuda_engine_, selected_preconditioner, shape_.igr_active,
+            trace_policy,
             linear_relative_tolerance_, maximum_linear_iterations_,
             krylov_dimension_, 0, initial_setup) &&
             initial_setup.ConfigurationExactForGeneration(
-                0, cuda_engine_, selected_preconditioner,
-                shape_.igr_active);
+                0, trace_policy);
       }
     }
     if (local_objects_ready)
@@ -1199,14 +1198,13 @@ BuildPersistentTrueSystem() noexcept
       use_ilu
       ? CudaRefreshFactorAndSolve(
             *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
-            ranks_, communicator_, cuda_engine_, selected_preconditioner,
-            shape_.igr_active, factor_reuse_policy,
+            ranks_, communicator_, trace_policy,
             linear_relative_tolerance_, maximum_linear_iterations_,
             krylov_dimension_, 0, warm)
       : CudaRefreshDiagonalAndSolve(
             *true_matrix_, *hypre_rhs_, *hypre_solution_, *diagonal_,
-            *gmres_, ranks_, communicator_, cuda_engine_,
-            selected_preconditioner, shape_.igr_active, linear_relative_tolerance_,
+            *gmres_, ranks_, communicator_, trace_policy,
+            linear_relative_tolerance_,
             maximum_linear_iterations_, krylov_dimension_, 0, warm);
   if (use_ilu && warm_solved)
     (void)CudaAccumulateIluSolveEvidence(
@@ -1260,26 +1258,22 @@ BuildPersistentTrueSystem() noexcept
     {
       CudaHypreSetupState persistent_setup{};
       persistent_configured = CudaConfigurePersistentHypre(
-          *true_matrix_, *ilu_, *gmres_, ranks_, cuda_engine_,
-          selected_preconditioner, shape_.igr_active,
+          *true_matrix_, *ilu_, *gmres_, ranks_, trace_policy,
           linear_relative_tolerance_, maximum_linear_iterations_,
           krylov_dimension_, 0, persistent_setup) &&
           persistent_setup.ConfigurationExactForGeneration(
-              0, cuda_engine_, selected_preconditioner,
-              shape_.igr_active);
+              0, trace_policy);
     }
     else
     {
       CudaDiagScaleSetupState persistent_setup{};
       persistent_configured = CudaConfigurePersistentDiagonal(
-          *true_matrix_, *diagonal_, *gmres_, cuda_engine_,
-          selected_preconditioner, shape_.igr_active,
+          *true_matrix_, *diagonal_, *gmres_, trace_policy,
           linear_relative_tolerance_,
           maximum_linear_iterations_, krylov_dimension_, 0,
           persistent_setup) &&
           persistent_setup.ConfigurationExactForGeneration(
-              0, cuda_engine_, selected_preconditioner,
-              shape_.igr_active);
+              0, trace_policy);
     }
   }
   catch (...) { persistent_configured = false; }
@@ -1851,21 +1845,16 @@ SolveTrueSystem(double& true_relative_residual,
   CudaSolveDiagnostics diagnostics{};
   const bool use_ilu = CudaTracePreconditionerIsIlu(
       trace_preconditioner_);
-  const CudaIluFactorReusePolicy factor_reuse_policy =
-      CudaIluFactorReusePolicyForEngine(
-          cuda_engine_, shape_.igr_active);
   const bool solved = use_ilu
       ? CudaSolveWithIluFactorPolicy(
             *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
-            ranks_, communicator_, cuda_engine_, trace_preconditioner_,
-            shape_.igr_active, factor_reuse_policy, current_attempt_,
+            ranks_, communicator_, trace_policy_descriptor_, current_attempt_,
             linear_relative_tolerance_, maximum_linear_iterations_,
             krylov_dimension_, matrix_generation, ilu_factor_state_,
             diagnostics)
       : CudaRefreshDiagonalAndSolve(
             *true_matrix_, *hypre_rhs_, *hypre_solution_, *diagonal_,
-            *gmres_, ranks_, communicator_, cuda_engine_,
-            trace_preconditioner_, shape_.igr_active,
+            *gmres_, ranks_, communicator_, trace_policy_descriptor_,
             linear_relative_tolerance_,
             maximum_linear_iterations_, krylov_dimension_,
             matrix_generation, diagnostics);
