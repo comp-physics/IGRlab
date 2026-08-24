@@ -203,6 +203,7 @@ using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using dg::hdg::runtime::cuda_w8a::CudaMutableHostL2Output;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
+using dg::hdg::runtime::cuda_w8a::CudaTensorCoreEvidence;
 using dg::hdg::runtime::cuda_w8a::CudaIluAccountingKind;
 using dg::hdg::runtime::cuda_w8a::CudaIluAccountingKindName;
 using dg::hdg::runtime::cuda_w8a::CudaIluFactorReusePolicy;

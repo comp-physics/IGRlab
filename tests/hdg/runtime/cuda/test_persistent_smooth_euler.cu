@@ -625,7 +625,8 @@ IluDiagnostics(const bool igr_active,
   using namespace dg::hdg::runtime::cuda_w8a::detail;
   CudaSolveDiagnostics diagnostics{};
   diagnostics.device_policy = true;
-  diagnostics.trace_solver = engine == CudaEngineKind::tensor_core
+  diagnostics.trace_solver =
+      engine == dg::hdg::generic::CudaEngineKind::tensor_core
       ? CudaTraceSolverKind::native_rank1_fp64
       : CudaTraceSolverKind::hypre_parcsr_gmres;
   diagnostics.configured_native_solver =
