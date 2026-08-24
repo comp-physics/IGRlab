@@ -50,7 +50,8 @@ SCHEMA1_WORKLOAD_SUMMARY_FIELDS = {
     "gpu_sm_count", "dt", "host_export",
 }
 SCHEMA2_ONLY_SUMMARY_FIELDS = {
-    "trace_preconditioner", "trace_ilu_policy", "trace_preconditioners",
+    "trace_policy", "trace_policies", "trace_preconditioner",
+    "trace_ilu_policy", "trace_preconditioners",
     "tensor_core", "trace_and_tensor_accounting",
     "trace_policy_metadata_status", "precision_policy", "numerical_policy",
     "initialization_duration_seconds", "initialization_in_primary_timing",
@@ -60,7 +61,8 @@ SCHEMA2_ONLY_SUMMARY_FIELDS = {
     "cuda_runtime_version",
 }
 SCHEMA2_ONLY_RECORD_FIELDS = {
-    "backend", "cuda_engine", "trace_preconditioner", "trace_ilu_type",
+    "backend", "cuda_engine", "trace_policy", "trace_preconditioner",
+    "trace_ilu_type",
     "trace_ilu_level_of_fill", "trace_ilu_local_reordering",
     "trace_ilu_application_iterations", "trace_ilu_accounting_kind",
     "trace_ilu_factor_reuse_policy", "trace_ilu_triangular_solve_kind",
@@ -92,6 +94,10 @@ import statistics
 parser = argparse.ArgumentParser()
 parser.add_argument("--mode", required=True, choices=("conventional", "igr"))
 parser.add_argument("--engine", default="ordinary", choices=("ordinary", "tensor"))
+parser.add_argument(
+    "--trace-policy", default="engine-default",
+    choices=("engine-default", "common-fast"),
+)
 parser.add_argument("--order", required=True, type=int)
 parser.add_argument("--mesh-n", required=True, type=int)
 parser.add_argument("--domain-periods", required=True, type=int)
@@ -107,10 +113,11 @@ parser.set_defaults(export=False)
 args = parser.parse_args()
 
 is_frozen = "frozen" in str(Path(__file__))
+common_fast = args.trace_policy == "common-fast"
 trace_preconditioner = (
     "hypre_diag_scale"
-    if args.engine == "tensor" and args.mode == "conventional"
-    else "hypre_ilu0"
+    if args.mode == "conventional" and
+    (common_fast or args.engine == "tensor") else "hypre_ilu0"
 )
 ilu_policy = (
     (-1, -1, -1, 0)
@@ -121,20 +128,20 @@ ilu_factor_reuse_policy = (
     "not_applicable"
     if ilu_policy[3] == 0
     else "first_trace_solve_per_attempt"
-    if args.engine == "tensor" and args.mode == "igr"
+    if args.mode == "igr" and (common_fast or args.engine == "tensor")
     else "refresh_each_trace_solve"
 )
 ilu_triangular_policy = (
     ("not_applicable", 0, 0, 0)
     if not ilu_policy[3]
     else ("iterative_jacobi", 5, 5, 8)
-    if args.engine == "tensor" and args.mode == "igr"
+    if args.mode == "igr" and (common_fast or args.engine == "tensor")
     else ("direct", 0, 0, 0)
 )
 if is_frozen:
     scale = 2.5
 elif args.engine == "ordinary":
-    scale = 2.0
+    scale = 1.5 if common_fast else 2.0
 else:
     scale = 1.0
 scale *= 1.0 + 0.1 * (args.order - 1)
@@ -214,6 +221,7 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
         callback_upper = 14 if ilu_active else 0
         sample["tensor_core"] = {
             "selected_engine": args.engine,
+            "trace_policy": args.trace_policy,
             "trace_preconditioner": trace_preconditioner,
             "ilu_type": ilu_policy[0],
             "ilu_level_of_fill": ilu_policy[1],
@@ -280,6 +288,7 @@ payload = {
     "success": True,
     "backend": "cuda",
     "cuda_engine": args.engine,
+    "trace_policy": args.trace_policy,
     "trace_preconditioner": trace_preconditioner,
     "trace_ilu_type": ilu_policy[0],
     "trace_ilu_level_of_fill": ilu_policy[1],
@@ -418,7 +427,7 @@ payload = {
 }
 if is_frozen:
     for field in (
-        "backend", "cuda_engine", "trace_preconditioner",
+        "backend", "cuda_engine", "trace_policy", "trace_preconditioner",
         "trace_ilu_type", "trace_ilu_level_of_fill",
         "trace_ilu_local_reordering", "trace_ilu_application_iterations",
         "trace_ilu_triangular_solve_kind",
@@ -925,6 +934,25 @@ def main() -> int:
         assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
             "tensor", "igr"
         ) == "first_trace_solve_per_attempt"
+        for engine in ("ordinary", "tensor"):
+            assert CAMPAIGN.expected_trace_preconditioner(
+                engine, "conventional", "common-fast"
+            ) == "hypre_diag_scale"
+            assert CAMPAIGN.expected_trace_ilu_policy(
+                engine, "conventional", "common-fast"
+            ) == (-1, -1, -1, 0)
+            assert CAMPAIGN.expected_trace_preconditioner(
+                engine, "igr", "common-fast"
+            ) == "hypre_ilu0"
+            assert CAMPAIGN.expected_trace_ilu_policy(
+                engine, "igr", "common-fast"
+            ) == (0, 0, 1, 1)
+            assert CAMPAIGN.expected_trace_ilu_triangular_solve_policy(
+                engine, "igr", "common-fast"
+            ) == ("iterative_jacobi", 5, 5, 8)
+            assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
+                engine, "igr", "common-fast"
+            ) == "first_trace_solve_per_attempt"
         for cell_key, result in campaign["final_tree_results"].items():
             comparison = result["paired_comparison"]
             assert math.isclose(comparison["speedup"]["median"], 2.0)
@@ -986,6 +1014,7 @@ def main() -> int:
             ]
             for engine in ("ordinary", "tensor"):
                 work = result["engines"][engine]["solver_work"]
+                assert work["trace_policies"] == ["engine-default"]
                 ilu_active = engine == "ordinary" or cell_key.startswith("igr_")
                 assert work["linear_iterations"]["total"] == 70
                 assert work["linear_iterations_by_invocation"] == [
@@ -1078,6 +1107,11 @@ def main() -> int:
             assert "--mesh-n" in item["command"]
             assert "--domain-periods" in item["command"]
             assert "--dt" in item["command"]
+            if item["phase"] != "ordinary_frozen_comparison":
+                assert item["trace_policy"] == "engine-default"
+                assert item["command"][
+                    item["command"].index("--trace-policy") + 1
+                ] == "engine-default"
             for path_field, identity_field in (
                 ("raw_json", "raw_json_identity"),
                 ("stderr", "stderr_identity"),
@@ -1090,6 +1124,7 @@ def main() -> int:
                     artifact.read_bytes()
                 ).hexdigest()
             summary = item["benchmark_summary"]
+            assert summary["trace_policy"] == "engine-default"
             expected_preconditioner = CAMPAIGN.expected_trace_preconditioner(
                 item["comparison_member"], item["mode"]
             )
@@ -1193,6 +1228,121 @@ def main() -> int:
             "clocks.current.sm"
         ] == "2100"
 
+        ablation_output = root / "same-policy-attribution"
+        ablation_command = list(command)
+        ablation_command[
+            ablation_command.index(str(output))
+        ] = str(ablation_output)
+        ablation_command[
+            ablation_command.index("--pairs") + 1
+        ] = "3"
+        ablation_command.extend((
+            "--comparison-mode", "same-policy-attribution",
+        ))
+        previous_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        try:
+            ablation_completed = run(ablation_command, root)
+        finally:
+            if previous_visible_devices is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = previous_visible_devices
+        assert json.loads(ablation_completed.stdout)[
+            "execution_completed"
+        ] is True
+        ablation = json.loads(
+            (ablation_output / "campaign.json").read_text(encoding="utf-8")
+        )
+        assert ablation["comparison_mode"] == "same-policy-attribution"
+        assert ablation["attribution_status"] == \
+            "provisional_non_promotion_attribution"
+        assert ablation["promotion_qualification"] is False
+        assert "final_tree_results" not in ablation
+        assert "frozen_control_results" not in ablation
+        assert len(ablation["same_policy_attribution_results"]) == 6
+        assert len(ablation["invocations"]) == 54
+        assert len(list((ablation_output / "raw").rglob("*.json"))) == 54
+        assert ablation["export_control"] == {
+            "status": "not_run",
+            "reason": "bounded_same_policy_attribution_primary_only",
+        }
+        assert ablation["performance_disposition"][
+            "promotion_performance_pass"
+        ] is False
+        assert ablation["performance_disposition"][
+            "promotion_performance_disposition"
+        ] == "provisional_same_policy_attribution_not_a_promotion_gate"
+        assert ablation["performance_disposition"][
+            "promotion_eligible"
+        ] is False
+        ablation_primary = [
+            item for item in ablation["invocations"]
+            if item["phase"] == "same_policy_attribution" and
+            item["mode"] == "conventional" and item["order"] == 1
+        ]
+        assert [item["comparison_member"] for item in ablation_primary] == [
+            "O_base", "O_common", "T_common",
+            "O_common", "T_common", "O_base",
+            "T_common", "O_base", "O_common",
+        ]
+        for item in ablation["invocations"]:
+            selection = CAMPAIGN.SAME_POLICY_MEMBERS[
+                item["comparison_member"]
+            ]
+            assert item["trace_policy"] == selection["trace_policy"]
+            assert item["command"][item["command"].index("--engine") + 1] == \
+                selection["engine"]
+            assert item["command"][
+                item["command"].index("--trace-policy") + 1
+            ] == selection["trace_policy"]
+            summary = item["benchmark_summary"]
+            assert summary["trace_policy"] == selection["trace_policy"]
+            assert all(
+                sample["trace_policy"] == selection["trace_policy"]
+                for sample in summary["measured_sample_work"]
+            )
+        for key, result in ablation[
+                "same_policy_attribution_results"].items():
+            assert result["promotion_eligible"] is False
+            assert result["attribution"]["common_fast_policy_exactly_matched"] \
+                is True
+            assert result["members"]["O_common"][
+                "trace_policy_configuration"
+            ] == result["members"]["T_common"][
+                "trace_policy_configuration"
+            ]
+            assert result["members"]["O_base"]["engine"] == "ordinary"
+            assert result["members"]["O_base"]["trace_policy"] == \
+                "engine-default"
+            comparisons = result["comparisons"]
+            assert math.isclose(
+                comparisons["policy_gain"]["ratio"]["median"], 4.0 / 3.0
+            )
+            assert math.isclose(
+                comparisons["tensor_local_gain"]["ratio"]["median"], 1.5
+            )
+            assert math.isclose(
+                comparisons["package_gain"]["ratio"]["median"], 2.0
+            )
+            assert comparisons["policy_gain"][
+                "median_ratio_95_percent_confidence_interval"
+            ]["resamples"] == 100
+            assert len(result["triplets"]) == 3
+            assert all(
+                set(triplet["raw_durations_seconds"]) ==
+                set(CAMPAIGN.SAME_POLICY_MEMBER_ORDER) and
+                all(len(values) == 5 for values in
+                    triplet["raw_durations_seconds"].values()) and
+                triplet["common_fast_policy_exactly_matched"] is True
+                for triplet in result["triplets"]
+            )
+            expected_common = "hypre_ilu0" if key.startswith("igr_") \
+                else "hypre_diag_scale"
+            assert result["members"]["O_common"][
+                "trace_policy_configuration"
+            ]["trace_preconditioner"] == expected_common
+
         ordinary_invocation = next(
             item for item in campaign["invocations"]
             if item["phase"] == "final_tree_primary" and
@@ -1265,6 +1415,17 @@ def main() -> int:
         bad_transfers = copy.deepcopy(ordinary_record)
         bad_transfers["samples"][1]["transfers"]["complete"] = False
         assert rejected(bad_transfers)
+        bad_trace_policy = copy.deepcopy(ordinary_record)
+        bad_trace_policy["trace_policy"] = "common-fast"
+        assert rejected(bad_trace_policy)
+        bad_sample_trace_policy = copy.deepcopy(ordinary_record)
+        bad_sample_trace_policy["samples"][1]["tensor_core"][
+            "trace_policy"
+        ] = "common-fast"
+        assert rejected(bad_sample_trace_policy)
+        boolean_ilu_policy = copy.deepcopy(ordinary_record)
+        boolean_ilu_policy["trace_ilu_application_iterations"] = True
+        assert rejected(boolean_ilu_policy)
         bad_ordinary_reuse_top_level = copy.deepcopy(ordinary_record)
         bad_ordinary_reuse_top_level[
             "trace_ilu_factor_reuse_policy"
@@ -1309,6 +1470,45 @@ def main() -> int:
             "GPU-00000000-0000-0000-0000-000000000002"
         )
         assert rejected(bad_uuid)
+
+        ordinary_common_invocation = next(
+            item for item in ablation["invocations"]
+            if item["comparison_member"] == "O_common" and
+            item["mode"] == "igr"
+        )
+        ordinary_common_record = json.loads(
+            (ablation_output / ordinary_common_invocation["raw_json"])
+            .read_text(encoding="utf-8")
+        )
+        common_validation_arguments = {
+            **validation_arguments,
+            "mode": "igr",
+            "order": ordinary_common_invocation["order"],
+            "trace_policy": "common-fast",
+            "expected_build": ordinary_common_record["build_identity"],
+        }
+        CAMPAIGN.validate_record(
+            ordinary_common_record, **common_validation_arguments
+        )
+        assert ordinary_common_record["trace_ilu_triangular_solve_kind"] == \
+            "iterative_jacobi"
+        assert ordinary_common_record[
+            "trace_ilu_factor_reuse_policy"
+        ] == "first_trace_solve_per_attempt"
+        bad_common_top_level = copy.deepcopy(ordinary_common_record)
+        bad_common_top_level[
+            "trace_ilu_triangular_solve_kind"
+        ] = "direct"
+        try:
+            CAMPAIGN.validate_record(
+                bad_common_top_level, **common_validation_arguments
+            )
+        except CAMPAIGN.CampaignError:
+            pass
+        else:
+            raise AssertionError(
+                "common-fast ordinary IGR accepted mismatched trace metadata"
+            )
 
         tensor_igr_invocation = next(
             item for item in campaign["invocations"]
@@ -1681,6 +1881,40 @@ def main() -> int:
             except CAMPAIGN.CampaignError:
                 return
             raise AssertionError("campaign evidence binding unexpectedly succeeded")
+
+        ablation_arguments = CAMPAIGN.parser().parse_args(
+            ablation_command[2:]
+        )
+        invalid_ablation_pairs = copy.copy(ablation_arguments)
+        invalid_ablation_pairs.pairs = 2
+        invalid_ablation_pairs.output_dir = str(root / "bad-ablation-pairs")
+        expect_campaign_error(
+            lambda: CAMPAIGN.run_campaign(invalid_ablation_pairs)
+        )
+        invalid_ablation_evidence = copy.copy(ablation_arguments)
+        invalid_ablation_evidence.evidence_mode = "qualification"
+        invalid_ablation_evidence.output_dir = str(
+            root / "bad-ablation-qualification"
+        )
+        expect_campaign_error(
+            lambda: CAMPAIGN.run_campaign(invalid_ablation_evidence)
+        )
+        invalid_ablation_dirty = copy.copy(ablation_arguments)
+        invalid_ablation_dirty.allow_dirty = True
+        invalid_ablation_dirty.output_dir = str(root / "bad-ablation-dirty")
+        expect_campaign_error(
+            lambda: CAMPAIGN.run_campaign(invalid_ablation_dirty)
+        )
+        invalid_ablation_frozen = copy.copy(ablation_arguments)
+        invalid_ablation_frozen.output_dir = str(root / "bad-ablation-frozen")
+        invalid_ablation_frozen.frozen_benchmark = str(frozen)
+        invalid_ablation_frozen.frozen_source_root = str(frozen_source)
+        invalid_ablation_frozen.frozen_build_label = "synthetic-frozen"
+        invalid_ablation_frozen.frozen_build_manifest = str(frozen_cache)
+        invalid_ablation_frozen.frozen_mfem_identity = str(frozen_mfem)
+        expect_campaign_error(
+            lambda: CAMPAIGN.run_campaign(invalid_ablation_frozen)
+        )
 
         for workload_class in ("saturated", "break-even"):
             CAMPAIGN.validate_qualification_profile(

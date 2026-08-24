@@ -78,8 +78,9 @@ profiling. Each requires the production
 `dg_igr_hdg_runtime_cuda_accepted_step_benchmark`, with exactly these
 application semantics:
 
-- `--engine tensor`, `--mode conventional|igr`, `--order 1|2|3`, a valid
-  explicit periodic `--mesh-n`/`--domain-periods`, positive `--dt`, one
+- `--engine tensor`, `--trace-policy engine-default`,
+  `--mode conventional|igr`, `--order 1|2|3`, a valid explicit periodic
+  `--mesh-n`/`--domain-periods`, positive `--dt`, one
   `--profile-measured-step 0|1|2|3|4`, and exactly one `--no-export`;
 - application-side `--expected-source-revision`,
   `--expected-source-tree`, `--expected-source-status clean`,
@@ -90,6 +91,17 @@ application semantics:
   positive. Qualification requires `--ncu-launch-skip` to remain at its zero
   default so the declared launch count always covers the complete selected
   range.
+
+Profiler qualification remains bound to the tensor engine's production
+`engine-default` trace policy. The accepted-step benchmark's
+`--trace-policy common-fast` option exists only for the separate bounded
+`hdg_tensor_campaign.py --comparison-mode same-policy-attribution` ablation.
+That O_base/O_common/T_common result is provisional and cannot become profiler
+or promotion qualification evidence. A diagnostic smoke capture may profile
+it when the caller supplies the option explicitly, but it does not change the
+NCU/SASS proof required for the production engine package. The ablation keeps
+only bounded benchmark samples and aggregate policy/work metadata; neither the
+campaign nor this profiler harness is a flight recorder or replay facility.
 
 `--ncu-qualification-kind tensor-instructions` is the native-instruction
 proof. Its only metrics are
@@ -156,6 +168,7 @@ python3 scripts/perf/profile_harness.py \
   --ncu-launch-count 3 --ncu-nvtx-include 'HDG\/condensation/' \
   --require-data report=capture.ncu-rep \
   --arg=--mode --arg igr --arg=--engine --arg tensor \
+  --arg=--trace-policy --arg engine-default \
   --arg=--order --arg 3 --arg=--mesh-n --arg 52 \
   --arg=--domain-periods --arg 1 --arg=--dt --arg 1e-5 \
   --arg=--profile-measured-step --arg 2 --arg=--no-export \

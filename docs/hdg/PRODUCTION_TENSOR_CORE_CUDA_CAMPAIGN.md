@@ -68,6 +68,46 @@ Per-sample observed outer iterations, exact factor setup/reuse counts, maximum
 aggregate factor age, and derived ILU/Jacobi work bounds expose recurring
 solver work without removing it from the accepted-step timing.
 
+### Provisional same-policy attribution
+
+The existing accepted-step campaign also has a bounded
+`--comparison-mode same-policy-attribution` ablation. It does not replace
+either promotion control. For every conventional/IGR x p1/p2/p3 cell it runs
+this exact triplet from one final tree and build:
+
+- `O_base`: ordinary CUDA with `--trace-policy engine-default`;
+- `O_common`: ordinary CUDA with `--trace-policy common-fast`;
+- `T_common`: tensor CUDA with `--trace-policy common-fast`.
+
+`--trace-policy` is a benchmark-only attribution control. It is not an
+application configuration option, environment selector, hidden production
+fallback, or new engine. `engine-default` leaves the typed production policies
+unchanged. `common-fast` selects diagonal scaling for both conventional
+engines. For IGR it selects the same ILU0+RCM, five-lower/five-upper iterative-
+Jacobi application, and first-factor-per-attempt lifetime for both engines.
+The benchmark emits the selected policy at top level and in every bounded
+sample. The driver validates every preconditioner, ILU, triangular-solve,
+accounting, and factor-lifetime dimension exactly, then requires `O_common`
+and `T_common` metadata to match before computing a ratio.
+
+Triplet order rotates `O_base/O_common/T_common`,
+`O_common/T_common/O_base`, and `T_common/O_base/O_common`; cell order also
+alternates. The triplet count is at least three and divisible by three so each
+member occupies each launch position equally. Raw five-step samples and
+artifact hashes are retained for every invocation. Paired-bootstrap intervals
+are reported for policy gain (`O_base/O_common`), tensor-local gain
+(`O_common/T_common`), and the disclosed package check (`O_base/T_common`).
+The latter equals the product of the first two within each triplet.
+
+This ablation is deliberately smoke-mode, provisional, and ineligible for
+promotion even when an interval excludes one. It requires a clean exact
+commit/tree, canonical build identity, live SM120 identity, and the exclusive
+GPU selection, but runs neither the frozen control nor the export control.
+Its retained data are bounded benchmark samples and aggregate solver metadata,
+not callback history or a live event stream. It adds no flight recorder,
+replay path, every-event capture, or public diagnostic API. Separate NCU/SASS
+evidence is still required to attribute any `T_common` gain to MMA execution.
+
 ## Capability baseline at the frozen tree
 
 At the frozen tree, CPU and ordinary CUDA were peers behind the generic Euler
