@@ -2250,7 +2250,8 @@ AssembleAndNorm(state_slot&, const double dt, double& norm) noexcept
   {
     ::dg_igr::NVTXRange profile_region(
         ::dg_igr::observability::RegionId::hdg_local_assembly);
-    assembly_launched = CudaLaunchAssembly(view_, shape_, dt);
+    assembly_launched = CudaLaunchAssembly(
+        view_, shape_, dt, cuda_engine_);
   }
   const bool local_assembly = assembly_launched && StatusPassed();
   if (!CollectiveContinue(local_assembly) ||

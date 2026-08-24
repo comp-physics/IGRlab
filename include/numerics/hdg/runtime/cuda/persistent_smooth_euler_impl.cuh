@@ -1709,8 +1709,20 @@ bool CudaLaunchAdmissibility(const CudaDeviceView& view,
                              const CudaMeshShape& shape) noexcept;
 bool CudaLaunchFreezeBorrowedCurrentLlfTau(const CudaDeviceView& view,
                                            const CudaMeshShape& shape) noexcept;
+// Private numerical-leaf selection.  This is intentionally narrower than the
+// application CUDA-engine selector and is exposed only inside the persistent
+// implementation and its qualification friend.
+enum class CudaBorrowedAssemblyKind : std::uint8_t
+{
+  ordinary_split = 0,
+  tensor_fused = 1
+};
+bool CudaLaunchBorrowedAssembly(
+    const CudaDeviceView& view, const CudaMeshShape& shape, double dt,
+    CudaBorrowedAssemblyKind kind) noexcept;
 bool CudaLaunchAssembly(const CudaDeviceView& view,
-                        const CudaMeshShape& shape, double dt) noexcept;
+                        const CudaMeshShape& shape, double dt,
+                        generic::CudaEngineKind engine) noexcept;
 bool CudaLaunchFrozenBorrowedLlfAssembly(
     const CudaDeviceView& view, const CudaMeshShape& shape,
     double dt) noexcept;
@@ -2626,7 +2638,8 @@ private:
       const bool assembled = (frozen_llf
               ? CudaLaunchFrozenBorrowedLlfAssembly(
                     view_, shape_, fixed_dt)
-              : CudaLaunchAssembly(view_, shape_, fixed_dt)) &&
+              : CudaLaunchAssembly(
+                    view_, shape_, fixed_dt, cuda_engine_)) &&
           StatusPassed();
       if (!CollectiveContinue(assembled)) return false;
       if (residual_interior == nullptr || residual_trace == nullptr)

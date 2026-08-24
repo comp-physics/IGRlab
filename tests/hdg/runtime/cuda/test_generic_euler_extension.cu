@@ -186,6 +186,26 @@ struct CudaPreparedLocalCondensationCapture
   std::vector<double> tensor_rhs{};
 };
 
+struct CudaBorrowedAssemblyFusionAudit
+{
+  // residual_r, residual_g, A, B, C, D, f, g in that order.
+  std::array<double, 8> maximum_absolute_errors{{
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity()}};
+  std::array<bool, 8> bitwise_equal{};
+  int elements = 0;
+  int interior_dofs = 0;
+  int trace_dofs = 0;
+  bool status_bitwise_equal = false;
+  bool status_all_passed = false;
+};
+
 struct CudaPreparedRecoveryAudit
 {
   int elements = 0;
@@ -271,6 +291,176 @@ bool SolveRecoveryReference(std::vector<double>& matrix,
 // detail-only launch helpers publish no runtime diagnostic API or state.
 struct CudaQualificationTestAccess
 {
+  template <typename Engine>
+  static bool AuditBorrowedAssemblyFusion(
+      Engine& engine, CudaBorrowedAssemblyFusionAudit& audit) noexcept
+  {
+    audit = {};
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    bool local_valid = engine.initialized_ && !engine.pending_.active &&
+        engine.config_.use_generic_numerical_policy &&
+        engine.config_.cuda_engine == generic::CudaEngineKind::tensor_core &&
+        numerics.cuda_engine_ == generic::CudaEngineKind::tensor_core &&
+        shape.borrowed_host_inputs && shape.elements > 0 &&
+        shape.interior_dofs > 0 && shape.trace_dofs > 0 &&
+        numerics.view_.initial_current_interior != nullptr &&
+        numerics.view_.initial_current_true_trace != nullptr &&
+        numerics.view_.work_interior != nullptr &&
+        numerics.view_.old_interior != nullptr &&
+        numerics.view_.work_true_trace != nullptr &&
+        numerics.view_.current_local_trace != nullptr &&
+        numerics.view_.residual_r != nullptr &&
+        numerics.view_.residual_g != nullptr && numerics.view_.a != nullptr &&
+        numerics.view_.b != nullptr && numerics.view_.c != nullptr &&
+        numerics.view_.d != nullptr && numerics.view_.f != nullptr &&
+        numerics.view_.g != nullptr && numerics.view_.status != nullptr;
+    const std::size_t elements = local_valid
+        ? static_cast<std::size_t>(shape.elements) : 0;
+    const std::size_t interior = local_valid
+        ? elements * static_cast<std::size_t>(shape.interior_dofs) : 0;
+    const std::size_t trace = local_valid
+        ? elements * static_cast<std::size_t>(shape.trace_dofs) : 0;
+    const std::size_t a_count = local_valid
+        ? interior * static_cast<std::size_t>(shape.interior_dofs) : 0;
+    const std::size_t b_count = local_valid
+        ? interior * static_cast<std::size_t>(shape.trace_dofs) : 0;
+    const std::size_t c_count = local_valid
+        ? trace * static_cast<std::size_t>(shape.interior_dofs) : 0;
+    const std::size_t d_count = local_valid
+        ? trace * static_cast<std::size_t>(shape.trace_dofs) : 0;
+
+    struct Products
+    {
+      std::vector<double> residual_r, residual_g, a, b, c, d, f, g, status;
+    };
+    Products split, fused;
+    const auto resize = [&](Products& products)
+    {
+      products.residual_r.resize(interior);
+      products.residual_g.resize(trace);
+      products.a.resize(a_count);
+      products.b.resize(b_count);
+      products.c.resize(c_count);
+      products.d.resize(d_count);
+      products.f.resize(interior);
+      products.g.resize(trace);
+      products.status.resize(elements);
+    };
+    try { resize(split); resize(fused); }
+    catch (...) { local_valid = false; }
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    // Recreate the first-attempt borrowed state in scratch without changing a
+    // committed slot.  Both leaves consume these same immutable inputs.
+    const bool seeded = CudaTransportPolicy::DeviceToDevice(
+            numerics.view_.work_interior,
+            numerics.view_.initial_current_interior,
+            interior * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToDevice(
+            numerics.view_.old_interior,
+            numerics.view_.initial_current_interior,
+            interior * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToDevice(
+            numerics.view_.work_true_trace,
+            numerics.view_.initial_current_true_trace,
+            static_cast<std::size_t>(shape.true_trace_count) * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        numerics.DistributeCurrentTrace(
+            numerics.view_.initial_current_true_trace);
+    if (!numerics.CollectiveContinue(seeded)) return false;
+
+    const auto d2h = [](double* destination, const double* source,
+                        const std::size_t count) noexcept
+    {
+      return CudaTransportPolicy::DeviceToHost(
+          destination, source, count * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export);
+    };
+    const auto launch_and_copy = [&](const CudaBorrowedAssemblyKind kind,
+                                     Products& products) noexcept
+    {
+      const bool launched = CudaLaunchBorrowedAssembly(
+              numerics.view_, shape, fixed_dt, kind) &&
+          numerics.StatusPassed();
+      if (!numerics.CollectiveContinue(launched)) return false;
+      const bool copied = d2h(products.residual_r.data(),
+                              numerics.view_.residual_r,
+                              products.residual_r.size()) &&
+          d2h(products.residual_g.data(), numerics.view_.residual_g,
+              products.residual_g.size()) &&
+          d2h(products.a.data(), numerics.view_.a, products.a.size()) &&
+          d2h(products.b.data(), numerics.view_.b, products.b.size()) &&
+          d2h(products.c.data(), numerics.view_.c, products.c.size()) &&
+          d2h(products.d.data(), numerics.view_.d, products.d.size()) &&
+          d2h(products.f.data(), numerics.view_.f, products.f.size()) &&
+          d2h(products.g.data(), numerics.view_.g, products.g.size()) &&
+          d2h(products.status.data(), numerics.view_.status,
+              products.status.size()) &&
+          CudaTransportPolicy::Synchronize(
+              CudaTransferSite::generic_host_export);
+      return numerics.CollectiveContinue(copied);
+    };
+    if (!launch_and_copy(CudaBorrowedAssemblyKind::ordinary_split, split) ||
+        !launch_and_copy(CudaBorrowedAssemblyKind::tensor_fused, fused))
+      return false;
+
+    const std::array<const std::vector<double>*, 8> split_products{{
+        &split.residual_r, &split.residual_g, &split.a, &split.b,
+        &split.c, &split.d, &split.f, &split.g}};
+    const std::array<const std::vector<double>*, 8> fused_products{{
+        &fused.residual_r, &fused.residual_g, &fused.a, &fused.b,
+        &fused.c, &fused.d, &fused.f, &fused.g}};
+    bool exact = true;
+    for (std::size_t product = 0; product < split_products.size(); ++product)
+    {
+      const auto& left = *split_products[product];
+      const auto& right = *fused_products[product];
+      audit.maximum_absolute_errors[product] = 0.0;
+      audit.bitwise_equal[product] = left == right;
+      bool finite = left.size() == right.size();
+      for (std::size_t index = 0; finite && index < left.size(); ++index)
+      {
+        finite = std::isfinite(left[index]) && std::isfinite(right[index]);
+        if (finite)
+          audit.maximum_absolute_errors[product] = std::max(
+              audit.maximum_absolute_errors[product],
+              std::abs(left[index] - right[index]));
+      }
+      if (!finite)
+        audit.maximum_absolute_errors[product] =
+            std::numeric_limits<double>::infinity();
+      audit.bitwise_equal[product] = audit.bitwise_equal[product] && finite;
+      exact = exact && audit.bitwise_equal[product];
+    }
+    audit.status_bitwise_equal = split.status == fused.status;
+    audit.status_all_passed = std::all_of(
+        fused.status.begin(), fused.status.end(),
+        [](const double value) { return value == 1.0; });
+    audit.elements = shape.elements;
+    audit.interior_dofs = shape.interior_dofs;
+    audit.trace_dofs = shape.trace_dofs;
+    return exact && audit.status_bitwise_equal && audit.status_all_passed;
+  }
+
+  static bool AuditBorrowedAssemblyFusion(
+      cuda::GenericEulerHdgCudaSession& session,
+      CudaBorrowedAssemblyFusionAudit& audit) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return AuditBorrowedAssemblyFusion(*session.borrowed_rank1_, audit);
+    if (session.borrowed_rank2_)
+      return AuditBorrowedAssemblyFusion(*session.borrowed_rank2_, audit);
+    audit = {};
+    return false;
+  }
+
   template <typename Engine>
   static bool IluFactorAuthorityInactive(const Engine& engine) noexcept
   {
@@ -933,7 +1123,9 @@ struct CudaQualificationTestAccess
       const bool launched = (frozen
               ? CudaLaunchFrozenBorrowedLlfAssembly(
                     numerics.view_, shape, fixed_dt)
-              : CudaLaunchAssembly(numerics.view_, shape, fixed_dt)) &&
+              : CudaLaunchAssembly(
+                    numerics.view_, shape, fixed_dt,
+                    numerics.cuda_engine_)) &&
           CudaTransportPolicy::Synchronize(
               CudaTransferSite::scalar_status) &&
           numerics.StatusPassed();
@@ -1864,6 +2056,8 @@ using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedIgrConservationCapture;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedLocalCondensationCapture;
+using dg::hdg::runtime::cuda_w8a::detail::
+    CudaBorrowedAssemblyFusionAudit;
 using dg::hdg::runtime::cuda_w8a::detail::CudaPreparedRecoveryAudit;
 using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
 using dg::hdg::runtime::cuda_w8a::igr_trace_components;
@@ -3067,6 +3261,36 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
   if (!initialized_everywhere) return false;
   const bool igr = request.numerical_policy.stabilization.kind ==
       RegularizationKind::igr;
+  CudaBorrowedAssemblyFusionAudit assembly_fusion_audit{};
+  const bool assembly_fusion =
+      config.cuda_engine != CudaEngineKind::tensor_core ||
+      CudaQualificationTestAccess::AuditBorrowedAssemblyFusion(
+          *engine, assembly_fusion_audit);
+  const bool assembly_fusion_everywhere = All(
+      assembly_fusion, request.communicator);
+  if (!assembly_fusion_everywhere)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+    {
+      std::cerr << "CUDA split/fused borrowed assembly mismatch order="
+                << order << " regularization=" << (igr ? "igr" : "none")
+                << " dimensions=" << assembly_fusion_audit.elements << 'x'
+                << assembly_fusion_audit.interior_dofs << 'x'
+                << assembly_fusion_audit.trace_dofs << " maxima=";
+      for (const double error :
+           assembly_fusion_audit.maximum_absolute_errors)
+        std::cerr << ' ' << error;
+      std::cerr << " exact=";
+      for (const bool exact : assembly_fusion_audit.bitwise_equal)
+        std::cerr << ' ' << exact;
+      std::cerr << " status="
+                << assembly_fusion_audit.status_bitwise_equal << '/'
+                << assembly_fusion_audit.status_all_passed << '\n';
+    }
+    return false;
+  }
   const bool llf_policy = igr ||
       CudaQualificationTestAccess::VerifyCurrentCandidateLlfPolicy(
           *engine, llf_evidence);
@@ -3996,7 +4220,12 @@ bool CheckEulerAlgebra(const int order, const int ranks)
     const bool initialized = All(
         initialization.status == HdgEulerSessionStatus::initialized,
         request.communicator);
-    const bool verified = initialized &&
+    CudaBorrowedAssemblyFusionAudit assembly_fusion_audit{};
+    const bool assembly_fusion = initialized &&
+        (selected_cuda_engine != CudaEngineKind::tensor_core ||
+         CudaQualificationTestAccess::AuditBorrowedAssemblyFusion(
+             session, assembly_fusion_audit));
+    const bool verified = assembly_fusion &&
         CudaQualificationTestAccess::VerifyAssemblerJacobian(
             session, jacobian_tolerance, relative_errors);
     const bool passed = All(verified, request.communicator);
@@ -4010,6 +4239,12 @@ bool CheckEulerAlgebra(const int order, const int ranks)
                   << order << " regularization="
                   << (kind == RegularizationKind::igr ? "igr" : "none")
                   << " initialized=" << initialized
+                  << " assembly_fusion=" << assembly_fusion
+                  << " assembly_maxima=";
+        for (const double error :
+             assembly_fusion_audit.maximum_absolute_errors)
+          std::cerr << ' ' << error;
+        std::cerr
                   << " relative_errors=";
         for (const double error : relative_errors) std::cerr << ' ' << error;
         std::cerr << '\n';

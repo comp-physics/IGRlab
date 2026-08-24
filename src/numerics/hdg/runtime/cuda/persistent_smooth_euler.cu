@@ -2787,11 +2787,13 @@ __global__ void AssemblyKernel(CudaDeviceView v, CudaMeshShape s,
 }
 
 // AssemblyKernel above remains the fixed-tau manufactured path and keeps its
-// established arithmetic unchanged.  The live borrowed split kernels below
-// evaluate conventional LLF tau from the current interior and trace state at
-// each face quadrature point, then hold it fixed while forming the residual and
-// Jacobian blocks A/B/C/D; there are deliberately no d-tau terms.  Their
-// frozen_llf branch exists only for the private finite-difference audit.
+// established arithmetic unchanged.  The live borrowed element bodies below
+// are used by both the ordinary split launches and the tensor-selected fused
+// launch.  They evaluate conventional LLF tau from the current interior and
+// trace state at each face quadrature point, then hold it fixed while forming
+// the residual and Jacobian blocks A/B/C/D; there are deliberately no d-tau
+// terms.  Their frozen_llf branch exists only for the private finite-difference
+// audit.
 struct BorrowedVolumeCache
 {
   double weight;
@@ -2850,13 +2852,18 @@ static_assert(sizeof(BorrowedVolumeCache) * borrowed_euler_elements_per_block <=
               48 * 1024);
 static_assert(sizeof(BorrowedFaceCache) * borrowed_euler_elements_per_block <=
               48 * 1024);
+// The fused leaf intentionally keeps distinct volume and face cache objects.
+// Their lifetimes are sequential, but a byte/union overlay would make object
+// lifetime correctness depend on CUDA C++ active-union behavior.  The bounded
+// aggregate fits the established 48 KiB launch envelope, so the safer layout
+// is preferable until profiling justifies a separately qualified overlay.
+static_assert((sizeof(BorrowedVolumeCache) + sizeof(BorrowedFaceCache)) *
+                  borrowed_euler_elements_per_block <=
+              48 * 1024);
 
-__global__ void BorrowedEulerZeroKernel(CudaDeviceView v,CudaMeshShape s)
+__device__ void BorrowedEulerZeroElement(CudaDeviceView v,CudaMeshShape s,
+                                         const int e,const int lane)
 {
-  const int group=threadIdx.x/borrowed_euler_group_threads;
-  const int lane=threadIdx.x%borrowed_euler_group_threads;
-  const int e=blockIdx.x*borrowed_euler_elements_per_block+group;
-  if(e>=s.elements)return;
   const int ni=s.interior_dofs,nt=s.trace_dofs;
   const int e_i=e*ni,e_t=e*nt;
   const std::size_t ao=static_cast<std::size_t>(e)*ni*ni;
@@ -2874,26 +2881,27 @@ __global__ void BorrowedEulerZeroKernel(CudaDeviceView v,CudaMeshShape s)
   if(lane==0)v.status[e]=1.0;
 }
 
+__global__ void BorrowedEulerZeroKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int group=threadIdx.x/borrowed_euler_group_threads;
+  const int lane=threadIdx.x%borrowed_euler_group_threads;
+  const int e=blockIdx.x*borrowed_euler_elements_per_block+group;
+  if(e>=s.elements)return;
+  BorrowedEulerZeroElement(v,s,e,lane);
+}
+
 // Each four-lane group owns one element.  Independent cache fields have one
 // lane writer and retain their scalar accumulation order; complete matrix rows
 // likewise remain lane-owned with their original q and column order.  Exact
 // masks and per-group caches isolate the eight groups within each warp.
-__global__ void BorrowedEulerVolumeKernel(CudaDeviceView v,CudaMeshShape s,
-                                          double dt)
+__device__ bool BorrowedEulerVolumeElement(
+    CudaDeviceView v,CudaMeshShape s,double dt,const int e,const int lane,
+    const unsigned group_mask,BorrowedVolumeCache& cache)
 {
-  const int group=threadIdx.x/borrowed_euler_group_threads;
-  const int lane=threadIdx.x%borrowed_euler_group_threads;
-  const int warp_lane=threadIdx.x%borrowed_euler_warp_threads;
-  const unsigned group_mask=borrowed_euler_group_mask<<
-      (warp_lane-lane);
-  const int e=blockIdx.x*borrowed_euler_elements_per_block+group;
-  if(e>=s.elements)return;
   const int ni=s.interior_dofs;
   const int si=s.scalar_interior_dofs;
   const int e_i=e*ni;
   const std::size_t ao=static_cast<std::size_t>(e)*ni*ni;
-  __shared__ BorrowedVolumeCache caches[borrowed_euler_elements_per_block];
-  BorrowedVolumeCache& cache=caches[group];
   for(int q=0;q<s.volume_points;++q)
   {
     const int qp=e*s.volume_points+q;
@@ -2987,7 +2995,7 @@ __global__ void BorrowedEulerVolumeKernel(CudaDeviceView v,CudaMeshShape s,
       }
     }
     __syncwarp(group_mask);
-    if(!cache.valid){if(lane==0)v.status[e]=-1.0;return;}
+    if(!cache.valid){if(lane==0)v.status[e]=-1.0;return false;}
     for(int lr=lane;lr<ni;lr+=borrowed_euler_group_threads)
     {
       const int component=lr/si,row=lr-component*si;
@@ -3086,10 +3094,11 @@ __global__ void BorrowedEulerVolumeKernel(CudaDeviceView v,CudaMeshShape s,
     }
     __syncwarp(group_mask);
   }
+  return true;
 }
 
-__global__ void BorrowedEulerFaceKernel(CudaDeviceView v,CudaMeshShape s,
-                                        bool frozen_llf)
+__global__ void BorrowedEulerVolumeKernel(CudaDeviceView v,CudaMeshShape s,
+                                          double dt)
 {
   const int group=threadIdx.x/borrowed_euler_group_threads;
   const int lane=threadIdx.x%borrowed_euler_group_threads;
@@ -3097,7 +3106,17 @@ __global__ void BorrowedEulerFaceKernel(CudaDeviceView v,CudaMeshShape s,
   const unsigned group_mask=borrowed_euler_group_mask<<
       (warp_lane-lane);
   const int e=blockIdx.x*borrowed_euler_elements_per_block+group;
-  if(e>=s.elements||v.status[e]!=1.0)return;
+  if(e>=s.elements)return;
+  __shared__ BorrowedVolumeCache caches[borrowed_euler_elements_per_block];
+  (void)BorrowedEulerVolumeElement(
+      v,s,dt,e,lane,group_mask,caches[group]);
+}
+
+__device__ bool BorrowedEulerFaceElement(
+    CudaDeviceView v,CudaMeshShape s,const bool frozen_llf,const int e,
+    const int lane,const unsigned group_mask,BorrowedFaceCache& cache)
+{
+  if(v.status[e]!=1.0)return false;
   const int ni=s.interior_dofs,nt=s.trace_dofs;
   const int si=s.scalar_interior_dofs,sf=s.scalar_face_dofs;
   const int e_i=e*ni,e_t=e*nt;
@@ -3105,8 +3124,6 @@ __global__ void BorrowedEulerFaceKernel(CudaDeviceView v,CudaMeshShape s,
   const std::size_t bo=static_cast<std::size_t>(e)*ni*nt;
   const std::size_t co=static_cast<std::size_t>(e)*nt*ni;
   const std::size_t doff=static_cast<std::size_t>(e)*nt*nt;
-  __shared__ BorrowedFaceCache caches[borrowed_euler_elements_per_block];
-  BorrowedFaceCache& cache=caches[group];
   for(int face=0;face<faces_per_element;++face)
     for(int q=0;q<s.face_points;++q)
     {
@@ -3213,7 +3230,7 @@ __global__ void BorrowedEulerFaceKernel(CudaDeviceView v,CudaMeshShape s,
       }
       __syncwarp(group_mask);
       if(cache.valid!=1)
-      {if(lane==0)v.status[e]=static_cast<double>(cache.valid);return;}
+      {if(lane==0)v.status[e]=static_cast<double>(cache.valid);return false;}
       for(int interior_row=lane;interior_row<ni;
           interior_row+=borrowed_euler_group_threads)
       {
@@ -3332,6 +3349,56 @@ __global__ void BorrowedEulerFaceKernel(CudaDeviceView v,CudaMeshShape s,
     v.f[e_i+i]=-v.residual_r[e_i+i];
   for(int i=lane;i<nt;i+=borrowed_euler_group_threads)
     v.g[e_t+i]=-v.residual_g[e_t+i];
+  return true;
+}
+
+__global__ void BorrowedEulerFaceKernel(CudaDeviceView v,CudaMeshShape s,
+                                        bool frozen_llf)
+{
+  const int group=threadIdx.x/borrowed_euler_group_threads;
+  const int lane=threadIdx.x%borrowed_euler_group_threads;
+  const int warp_lane=threadIdx.x%borrowed_euler_warp_threads;
+  const unsigned group_mask=borrowed_euler_group_mask<<
+      (warp_lane-lane);
+  const int e=blockIdx.x*borrowed_euler_elements_per_block+group;
+  if(e>=s.elements)return;
+  __shared__ BorrowedFaceCache caches[borrowed_euler_elements_per_block];
+  (void)BorrowedEulerFaceElement(
+      v,s,frozen_llf,e,lane,group_mask,caches[group]);
+}
+
+// Tensor selection fuses only the element-local Zero -> Volume -> Face
+// sequence.  The explicit group barriers replace the grid-wide launch
+// boundaries for the one element owned by each four-lane group; no product is
+// shared between elements.  Condensation deliberately remains a separate
+// launch because its one-block-per-element mapping and synchronization domain
+// do not match this assembly mapping.
+__global__ void BorrowedEulerFusedAssemblyKernel(
+    CudaDeviceView v,CudaMeshShape s,double dt)
+{
+  const int group=threadIdx.x/borrowed_euler_group_threads;
+  const int lane=threadIdx.x%borrowed_euler_group_threads;
+  const int warp_lane=threadIdx.x%borrowed_euler_warp_threads;
+  const unsigned group_mask=borrowed_euler_group_mask<<
+      (warp_lane-lane);
+  const int e=blockIdx.x*borrowed_euler_elements_per_block+group;
+  if(e>=s.elements)return;
+  __shared__ BorrowedVolumeCache volume_caches[
+      borrowed_euler_elements_per_block];
+  __shared__ BorrowedFaceCache face_caches[
+      borrowed_euler_elements_per_block];
+  BorrowedEulerZeroElement(v,s,e,lane);
+  // Zeroing is lane-striped; all products and status must be visible to the
+  // group before any volume accumulation begins.
+  __syncwarp(group_mask);
+  if(!BorrowedEulerVolumeElement(
+         v,s,dt,e,lane,group_mask,volume_caches[group]))return;
+  // The volume helper ends every quadrature point with this same barrier.  An
+  // explicit stage barrier documents and enforces the Volume -> Face edge if
+  // that helper's loop is later specialized for a zero-point shape.
+  __syncwarp(group_mask);
+  (void)BorrowedEulerFaceElement(
+      v,s,false,e,lane,group_mask,face_caches[group]);
 }
 
 __global__ void CondenseKernel(CudaDeviceView v,CudaMeshShape s)
@@ -4425,6 +4492,15 @@ bool LaunchBorrowedEulerStages(const CudaDeviceView& v,
       v,s,frozen_llf);
   return LaunchOk();
 }
+bool LaunchFusedBorrowedEulerAssembly(const CudaDeviceView& v,
+                                      const CudaMeshShape& s,
+                                      const double dt) noexcept
+{
+  const int blocks=(s.elements-1)/borrowed_euler_elements_per_block+1;
+  BorrowedEulerFusedAssemblyKernel<<<
+      blocks,borrowed_euler_block_threads>>>(v,s,dt);
+  return LaunchOk();
+}
 } // namespace
 
 bool CudaLaunchTicket(int* words,const CudaFailurePhase phase,std::uint64_t attempt,std::uint64_t generation,int device) noexcept
@@ -4439,12 +4515,34 @@ bool CudaLaunchAdmissibility(const CudaDeviceView& v,const CudaMeshShape& s) noe
 bool CudaLaunchFreezeBorrowedCurrentLlfTau(const CudaDeviceView& v,
                                            const CudaMeshShape& s) noexcept
 {FreezeBorrowedCurrentLlfTauKernel<<<s.elements,128>>>(v,s);return LaunchOk();}
-bool CudaLaunchAssembly(const CudaDeviceView& v,const CudaMeshShape& s,double dt) noexcept
+bool CudaLaunchBorrowedAssembly(
+    const CudaDeviceView& v,const CudaMeshShape& s,const double dt,
+    const CudaBorrowedAssemblyKind kind) noexcept
+{
+  if(!s.borrowed_host_inputs||s.elements<=0)return false;
+  if(kind==CudaBorrowedAssemblyKind::ordinary_split)
+    return LaunchBorrowedEulerStages(v,s,dt,false);
+  if(kind==CudaBorrowedAssemblyKind::tensor_fused)
+    return LaunchFusedBorrowedEulerAssembly(v,s,dt);
+  return false;
+}
+bool CudaLaunchAssembly(const CudaDeviceView& v,const CudaMeshShape& s,
+                        const double dt,
+                        const generic::CudaEngineKind engine) noexcept
 {
   if(!s.borrowed_host_inputs)
-  {AssemblyKernel<<<Blocks(s.elements),128>>>(v,s,dt);return LaunchOk();}
-  if(s.elements<=0)return false;
-  return LaunchBorrowedEulerStages(v,s,dt,false);
+  {
+    if(engine!=generic::CudaEngineKind::ordinary)return false;
+    AssemblyKernel<<<Blocks(s.elements),128>>>(v,s,dt);
+    return LaunchOk();
+  }
+  if(engine==generic::CudaEngineKind::ordinary)
+    return CudaLaunchBorrowedAssembly(
+        v,s,dt,CudaBorrowedAssemblyKind::ordinary_split);
+  if(engine==generic::CudaEngineKind::tensor_core)
+    return CudaLaunchBorrowedAssembly(
+        v,s,dt,CudaBorrowedAssemblyKind::tensor_fused);
+  return false;
 }
 bool CudaLaunchFrozenBorrowedLlfAssembly(const CudaDeviceView& v,
                                          const CudaMeshShape& s,
