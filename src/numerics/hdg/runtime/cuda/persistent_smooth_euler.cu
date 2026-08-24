@@ -3253,49 +3253,21 @@ __global__ void RecoverKernel(CudaDeviceView v,CudaMeshShape s)
 __global__ void BorrowedRecoverKernel(CudaDeviceView v,CudaMeshShape s)
 {
   const int e=blockIdx.x;if(e>=s.elements)return;
-  const int ni=s.interior_dofs,nt=s.trace_dofs;
-  const double* lu=v.lu+static_cast<std::size_t>(e)*ni*ni;
-  const double* pivots=v.pivots+e*ni;
+  const int ni=s.interior_dofs,nt=s.trace_dofs,cols=nt+1;
+  const double* solved=v.solve_workspace+
+      static_cast<std::size_t>(e)*ni*cols;
   double* recovered=v.recovered_interior+e*ni;
   for(int row=threadIdx.x;row<ni;row+=blockDim.x)
   {
-    double value=v.f[e*ni+row];
+    // Condensation retains A^{-1}[B f] for this exact local linearization.
+    // Reuse it to form A^{-1}(f-B*dhat), avoiding a second triangular solve.
+    double value=solved[row*cols+nt];
     for(int column=0;column<nt;++column)
-      value-=v.b[(static_cast<std::size_t>(e)*ni+row)*nt+column]*
+      value-=solved[row*cols+column]*
           v.trace_increment_local[e*nt+column];
     recovered[row]=value;
   }
   __syncthreads();
-  for(int row=0;row<ni;++row)
-  {
-    if(threadIdx.x==0)
-    {
-      const int pivot=static_cast<int>(pivots[row]);
-      if(pivot!=row)
-      {
-        const double value=recovered[row];
-        recovered[row]=recovered[pivot];recovered[pivot]=value;
-      }
-    }
-    __syncthreads();
-  }
-  for(int column=0;column<ni;++column)
-  {
-    for(int row=column+1+threadIdx.x;row<ni;row+=blockDim.x)
-      recovered[row]-=lu[row*ni+column]*recovered[column];
-    __syncthreads();
-  }
-  for(int row=ni-1;row>=0;--row)
-  {
-    if(threadIdx.x==0)
-    {
-      double value=recovered[row];
-      for(int column=row+1;column<ni;++column)
-        value-=lu[row*ni+column]*recovered[column];
-      recovered[row]=value/lu[row*ni+row];
-    }
-    __syncthreads();
-  }
   if(threadIdx.x==0)v.status[e]=1;
 }
 __global__ void TrialKernel(CudaDeviceView v,CudaMeshShape s,double alpha)

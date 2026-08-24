@@ -186,6 +186,82 @@ struct CudaPreparedLocalCondensationCapture
   std::vector<double> tensor_rhs{};
 };
 
+struct CudaPreparedRecoveryAudit
+{
+  int elements = 0;
+  int interior_dofs = 0;
+  int trace_dofs = 0;
+  double maximum_direct_scaled_error =
+      std::numeric_limits<double>::infinity();
+  double maximum_workspace_scaled_error =
+      std::numeric_limits<double>::infinity();
+  double maximum_scaled_residual =
+      std::numeric_limits<double>::infinity();
+  double tolerance = 0.0;
+};
+
+bool SolveRecoveryReference(std::vector<double>& matrix,
+                            std::vector<double>& right_hand_side,
+                            const int size) noexcept
+{
+  if (size <= 0 ||
+      matrix.size() != static_cast<std::size_t>(size) * size ||
+      right_hand_side.size() != static_cast<std::size_t>(size))
+    return false;
+  double scale = 0.0;
+  for (const double value : matrix)
+  {
+    if (!std::isfinite(value)) return false;
+    scale = std::max(scale, std::abs(value));
+  }
+  for (const double value : right_hand_side)
+    if (!std::isfinite(value)) return false;
+  for (int column = 0; column < size; ++column)
+  {
+    int pivot = column;
+    for (int row = column + 1; row < size; ++row)
+      if (std::abs(matrix[static_cast<std::size_t>(row) * size + column]) >
+          std::abs(matrix[static_cast<std::size_t>(pivot) * size + column]))
+        pivot = row;
+    const double diagonal =
+        matrix[static_cast<std::size_t>(pivot) * size + column];
+    if (!(std::abs(diagonal) >
+          64.0 * std::numeric_limits<double>::epsilon() * scale))
+      return false;
+    if (pivot != column)
+    {
+      for (int entry = 0; entry < size; ++entry)
+        std::swap(matrix[static_cast<std::size_t>(column) * size + entry],
+                  matrix[static_cast<std::size_t>(pivot) * size + entry]);
+      std::swap(right_hand_side[column], right_hand_side[pivot]);
+    }
+    const double factor_diagonal =
+        matrix[static_cast<std::size_t>(column) * size + column];
+    for (int row = column + 1; row < size; ++row)
+    {
+      const double multiplier =
+          matrix[static_cast<std::size_t>(row) * size + column] /
+          factor_diagonal;
+      matrix[static_cast<std::size_t>(row) * size + column] = multiplier;
+      for (int entry = column + 1; entry < size; ++entry)
+        matrix[static_cast<std::size_t>(row) * size + entry] -= multiplier *
+            matrix[static_cast<std::size_t>(column) * size + entry];
+      right_hand_side[row] -= multiplier * right_hand_side[column];
+    }
+  }
+  for (int row = size - 1; row >= 0; --row)
+  {
+    double value = right_hand_side[row];
+    for (int column = row + 1; column < size; ++column)
+      value -= matrix[static_cast<std::size_t>(row) * size + column] *
+          right_hand_side[column];
+    right_hand_side[row] = value /
+        matrix[static_cast<std::size_t>(row) * size + row];
+    if (!std::isfinite(right_hand_side[row])) return false;
+  }
+  return true;
+}
+
 // This accessor is defined only in the qualification translation unit.  The
 // production engine and generic facade grant it private friendship; its
 // detail-only launch helpers publish no runtime diagnostic API or state.
@@ -246,6 +322,168 @@ struct CudaQualificationTestAccess
     if (session.borrowed_rank2_)
       return VerifyPreparedCudaEngine(*session.borrowed_rank2_, expected);
     return false;
+  }
+
+  template <typename Engine>
+  static bool AuditPreparedRecovery(
+      Engine& engine, CudaPreparedRecoveryAudit& audit) noexcept
+  {
+    // Test-only D2H capture: compare the production retained-W result with an
+    // independent pivoted FP64 solve and with the original local equation.
+    audit = {};
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    bool local_valid = engine.initialized_ && engine.pending_.active &&
+        engine.pending_.staging && engine.pending_.numerical.success &&
+        shape.borrowed_host_inputs && shape.elements > 0 &&
+        shape.interior_dofs > 0 && shape.trace_dofs > 0 &&
+        numerics.view_.a != nullptr && numerics.view_.b != nullptr &&
+        numerics.view_.f != nullptr &&
+        numerics.view_.solve_workspace != nullptr &&
+        numerics.view_.trace_increment_local != nullptr &&
+        numerics.view_.recovered_interior != nullptr;
+    const std::size_t elements = local_valid
+        ? static_cast<std::size_t>(shape.elements) : 0;
+    const std::size_t ni = local_valid
+        ? static_cast<std::size_t>(shape.interior_dofs) : 0;
+    const std::size_t nt = local_valid
+        ? static_cast<std::size_t>(shape.trace_dofs) : 0;
+    std::vector<double> matrix, coupling, forcing, workspace;
+    std::vector<double> trace_increment, recovered;
+    std::vector<double> direct_matrix, direct_solution;
+    try
+    {
+      matrix.resize(elements * ni * ni);
+      coupling.resize(elements * ni * nt);
+      forcing.resize(elements * ni);
+      workspace.resize(elements * ni * (nt + 1));
+      trace_increment.resize(elements * nt);
+      recovered.resize(elements * ni);
+      direct_matrix.resize(ni * ni);
+      direct_solution.resize(ni);
+    }
+    catch (...) { local_valid = false; }
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+    const bool copied = CudaTransportPolicy::DeviceToHost(
+            matrix.data(), numerics.view_.a, matrix.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            coupling.data(), numerics.view_.b,
+            coupling.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            forcing.data(), numerics.view_.f,
+            forcing.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            workspace.data(), numerics.view_.solve_workspace,
+            workspace.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            trace_increment.data(), numerics.view_.trace_increment_local,
+            trace_increment.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            recovered.data(), numerics.view_.recovered_interior,
+            recovered.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    if (!numerics.CollectiveContinue(copied)) return false;
+
+    audit.elements = shape.elements;
+    audit.interior_dofs = shape.interior_dofs;
+    audit.trace_dofs = shape.trace_dofs;
+    audit.maximum_direct_scaled_error = 0.0;
+    audit.maximum_workspace_scaled_error = 0.0;
+    audit.maximum_scaled_residual = 0.0;
+    // A dimension-scaled roundoff envelope; this does not modify any solver or
+    // lifecycle tolerance and remains below the legacy 3e-10 oracle gate.
+    audit.tolerance = 4096.0 * std::numeric_limits<double>::epsilon() *
+        static_cast<double>(std::max(1, shape.interior_dofs + shape.trace_dofs));
+    bool finite = true;
+    for (std::size_t element = 0; finite && element < elements; ++element)
+    {
+      const std::size_t matrix_offset = element * ni * ni;
+      const std::size_t coupling_offset = element * ni * nt;
+      const std::size_t interior_offset = element * ni;
+      const std::size_t trace_offset = element * nt;
+      const std::size_t workspace_offset = element * ni * (nt + 1);
+      std::copy_n(matrix.data() + matrix_offset, ni * ni,
+                  direct_matrix.data());
+      for (std::size_t row = 0; row < ni; ++row)
+      {
+        double value = forcing[interior_offset + row];
+        for (std::size_t column = 0; column < nt; ++column)
+          value -= coupling[coupling_offset + row * nt + column] *
+              trace_increment[trace_offset + column];
+        direct_solution[row] = value;
+      }
+      if (!SolveRecoveryReference(direct_matrix, direct_solution,
+                                  shape.interior_dofs))
+      {
+        finite = false;
+        break;
+      }
+      for (std::size_t row = 0; row < ni; ++row)
+      {
+        double workspace_value =
+            workspace[workspace_offset + row * (nt + 1) + nt];
+        for (std::size_t column = 0; column < nt; ++column)
+          workspace_value -=
+              workspace[workspace_offset + row * (nt + 1) + column] *
+              trace_increment[trace_offset + column];
+        const double production = recovered[interior_offset + row];
+        finite = finite && std::isfinite(workspace_value) &&
+            std::isfinite(production) && std::isfinite(direct_solution[row]);
+        if (!finite) break;
+        const double scale = std::max(
+            {1.0, std::abs(production), std::abs(workspace_value),
+             std::abs(direct_solution[row])});
+        audit.maximum_direct_scaled_error = std::max(
+            audit.maximum_direct_scaled_error,
+            std::abs(production - direct_solution[row]) / scale);
+        audit.maximum_workspace_scaled_error = std::max(
+            audit.maximum_workspace_scaled_error,
+            std::abs(production - workspace_value) / scale);
+
+        long double residual = -static_cast<long double>(
+            forcing[interior_offset + row]);
+        long double residual_scale = std::abs(static_cast<long double>(
+            forcing[interior_offset + row]));
+        for (std::size_t column = 0; column < ni; ++column)
+        {
+          const long double term = static_cast<long double>(
+              matrix[matrix_offset + row * ni + column]) *
+              recovered[interior_offset + column];
+          residual += term;
+          residual_scale += std::abs(term);
+        }
+        for (std::size_t column = 0; column < nt; ++column)
+        {
+          const long double term = static_cast<long double>(
+              coupling[coupling_offset + row * nt + column]) *
+              trace_increment[trace_offset + column];
+          residual += term;
+          residual_scale += std::abs(term);
+        }
+        const double scaled_residual = static_cast<double>(
+            std::abs(residual) / std::max(1.0L, residual_scale));
+        finite = finite && std::isfinite(scaled_residual);
+        audit.maximum_scaled_residual = std::max(
+            audit.maximum_scaled_residual, scaled_residual);
+      }
+    }
+    return finite &&
+        audit.maximum_direct_scaled_error <= audit.tolerance &&
+        audit.maximum_workspace_scaled_error <= audit.tolerance &&
+        audit.maximum_scaled_residual <= audit.tolerance;
   }
 
   // Compare the two production condensation leaves from one coherent
@@ -1522,6 +1760,7 @@ using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedIgrConservationCapture;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedLocalCondensationCapture;
+using dg::hdg::runtime::cuda_w8a::detail::CudaPreparedRecoveryAudit;
 using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
 using dg::hdg::runtime::cuda_w8a::igr_trace_components;
 using dg::hdg::runtime::cuda_w8a::detail::qualification_density_gate;
@@ -2775,6 +3014,32 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
   const bool prepared = engine->PrepareStep(false, dt, snapshot, step);
   const bool prepared_everywhere = All(prepared, request.communicator);
   if (!prepared_everywhere) return false;
+  CudaPreparedRecoveryAudit recovery_audit{};
+  const bool recovery = CudaQualificationTestAccess::AuditPreparedRecovery(
+      *engine, recovery_audit);
+  const bool recovery_everywhere = All(recovery, request.communicator);
+  if (!recovery_everywhere)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+      std::cerr << "CUDA retained-workspace recovery mismatch order=" << order
+                << " regularization=" << (igr ? "igr" : "none")
+                << " engine="
+                << (config.cuda_engine == CudaEngineKind::tensor_core
+                        ? "tensor" : "ordinary")
+                << " dimensions=" << recovery_audit.elements << 'x'
+                << recovery_audit.interior_dofs << 'x'
+                << recovery_audit.trace_dofs
+                << " direct_scaled_error="
+                << recovery_audit.maximum_direct_scaled_error
+                << " workspace_scaled_error="
+                << recovery_audit.maximum_workspace_scaled_error
+                << " scaled_residual="
+                << recovery_audit.maximum_scaled_residual
+                << " tolerance=" << recovery_audit.tolerance << '\n';
+    return false;
+  }
   CudaPreparedLocalCondensationCapture condensation_capture{};
   double schur_scaled_error = 0.0;
   double rhs_scaled_error = 0.0;
