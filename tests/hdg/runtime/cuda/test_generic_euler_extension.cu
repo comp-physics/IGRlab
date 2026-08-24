@@ -195,6 +195,10 @@ struct CudaPreparedRecoveryAudit
       std::numeric_limits<double>::infinity();
   double maximum_workspace_scaled_error =
       std::numeric_limits<double>::infinity();
+  double maximum_factor_scaled_residual =
+      std::numeric_limits<double>::infinity();
+  double maximum_workspace_solve_scaled_residual =
+      std::numeric_limits<double>::infinity();
   double maximum_scaled_residual =
       std::numeric_limits<double>::infinity();
   double tolerance = 0.0;
@@ -335,8 +339,9 @@ struct CudaQualificationTestAccess
   static bool AuditPreparedRecovery(
       Engine& engine, CudaPreparedRecoveryAudit& audit) noexcept
   {
-    // Test-only D2H capture: compare the production retained-W result with an
-    // independent pivoted FP64 solve and with the original local equation.
+    // Test-only D2H capture: check P*A=L*U, every genuine [B f] solve, and the
+    // retained-W recovery against an independent pivoted FP64 solve and the
+    // original local equation.
     audit = {};
     auto& numerics = engine.numerics_;
     const CudaMeshShape& shape = numerics.shape_;
@@ -345,7 +350,8 @@ struct CudaQualificationTestAccess
         shape.borrowed_host_inputs && shape.elements > 0 &&
         shape.interior_dofs > 0 && shape.trace_dofs > 0 &&
         numerics.view_.a != nullptr && numerics.view_.b != nullptr &&
-        numerics.view_.f != nullptr &&
+        numerics.view_.f != nullptr && numerics.view_.lu != nullptr &&
+        numerics.view_.pivots != nullptr &&
         numerics.view_.solve_workspace != nullptr &&
         numerics.view_.trace_increment_local != nullptr &&
         numerics.view_.recovered_interior != nullptr;
@@ -355,19 +361,22 @@ struct CudaQualificationTestAccess
         ? static_cast<std::size_t>(shape.interior_dofs) : 0;
     const std::size_t nt = local_valid
         ? static_cast<std::size_t>(shape.trace_dofs) : 0;
-    std::vector<double> matrix, coupling, forcing, workspace;
+    std::vector<double> matrix, coupling, forcing, factors, pivots, workspace;
     std::vector<double> trace_increment, recovered;
-    std::vector<double> direct_matrix, direct_solution;
+    std::vector<double> direct_matrix, direct_solution, permuted_matrix;
     try
     {
       matrix.resize(elements * ni * ni);
       coupling.resize(elements * ni * nt);
       forcing.resize(elements * ni);
+      factors.resize(elements * ni * ni);
+      pivots.resize(elements * ni);
       workspace.resize(elements * ni * (nt + 1));
       trace_increment.resize(elements * nt);
       recovered.resize(elements * ni);
       direct_matrix.resize(ni * ni);
       direct_solution.resize(ni);
+      permuted_matrix.resize(ni * ni);
     }
     catch (...) { local_valid = false; }
     if (!numerics.CollectiveContinue(local_valid)) return false;
@@ -383,6 +392,16 @@ struct CudaQualificationTestAccess
         CudaTransportPolicy::DeviceToHost(
             forcing.data(), numerics.view_.f,
             forcing.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            factors.data(), numerics.view_.lu,
+            factors.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            pivots.data(), numerics.view_.pivots,
+            pivots.size() * sizeof(double),
             CudaTransferCategory::generic_host_bridge,
             CudaTransferSite::generic_host_export) &&
         CudaTransportPolicy::DeviceToHost(
@@ -409,6 +428,8 @@ struct CudaQualificationTestAccess
     audit.trace_dofs = shape.trace_dofs;
     audit.maximum_direct_scaled_error = 0.0;
     audit.maximum_workspace_scaled_error = 0.0;
+    audit.maximum_factor_scaled_residual = 0.0;
+    audit.maximum_workspace_solve_scaled_residual = 0.0;
     audit.maximum_scaled_residual = 0.0;
     // A dimension-scaled roundoff envelope; this does not modify any solver or
     // lifecycle tolerance and remains below the legacy 3e-10 oracle gate.
@@ -422,6 +443,80 @@ struct CudaQualificationTestAccess
       const std::size_t interior_offset = element * ni;
       const std::size_t trace_offset = element * nt;
       const std::size_t workspace_offset = element * ni * (nt + 1);
+      const std::size_t factor_offset = element * ni * ni;
+      const std::size_t pivot_offset = element * ni;
+      std::copy_n(matrix.data() + matrix_offset, ni * ni,
+                  permuted_matrix.data());
+      for (std::size_t column = 0; finite && column < ni; ++column)
+      {
+        const double encoded_pivot = pivots[pivot_offset + column];
+        const bool pivot_representable = std::isfinite(encoded_pivot) &&
+            encoded_pivot >= static_cast<double>(column) &&
+            encoded_pivot < static_cast<double>(ni);
+        const int pivot = pivot_representable
+            ? static_cast<int>(encoded_pivot) : -1;
+        finite = pivot_representable &&
+            encoded_pivot == static_cast<double>(pivot) &&
+            pivot >= static_cast<int>(column);
+        if (finite && pivot != static_cast<int>(column))
+          for (std::size_t entry = 0; entry < ni; ++entry)
+            std::swap(permuted_matrix[column * ni + entry],
+                      permuted_matrix[static_cast<std::size_t>(pivot) * ni +
+                                      entry]);
+      }
+      for (std::size_t row = 0; finite && row < ni; ++row)
+        for (std::size_t column = 0; finite && column < ni; ++column)
+        {
+          const long double reference = static_cast<long double>(
+              permuted_matrix[row * ni + column]);
+          long double reconstruction = 0.0L;
+          long double factor_scale = std::abs(reference);
+          const std::size_t last = std::min(row, column);
+          for (std::size_t inner = 0; inner <= last; ++inner)
+          {
+            const double lower = inner == row ? 1.0 :
+                factors[factor_offset + row * ni + inner];
+            const double upper =
+                factors[factor_offset + inner * ni + column];
+            finite = finite && std::isfinite(lower) && std::isfinite(upper);
+            const long double term =
+                static_cast<long double>(lower) * upper;
+            reconstruction += term;
+            factor_scale += std::abs(term);
+          }
+          const double scaled_factor_residual = static_cast<double>(
+              std::abs(reference - reconstruction) /
+              std::max(1.0L, factor_scale));
+          finite = finite && std::isfinite(scaled_factor_residual);
+          audit.maximum_factor_scaled_residual = std::max(
+              audit.maximum_factor_scaled_residual,
+              scaled_factor_residual);
+        }
+      for (std::size_t rhs = 0; finite && rhs < nt + 1; ++rhs)
+        for (std::size_t row = 0; finite && row < ni; ++row)
+        {
+          const double reference = rhs < nt
+              ? coupling[coupling_offset + row * nt + rhs]
+              : forcing[interior_offset + row];
+          long double residual = -static_cast<long double>(reference);
+          long double residual_scale = std::abs(
+              static_cast<long double>(reference));
+          for (std::size_t column = 0; column < ni; ++column)
+          {
+            const long double term = static_cast<long double>(
+                matrix[matrix_offset + row * ni + column]) *
+                workspace[workspace_offset + column * (nt + 1) + rhs];
+            residual += term;
+            residual_scale += std::abs(term);
+          }
+          const double scaled_solve_residual = static_cast<double>(
+              std::abs(residual) / std::max(1.0L, residual_scale));
+          finite = finite && std::isfinite(scaled_solve_residual);
+          audit.maximum_workspace_solve_scaled_residual = std::max(
+              audit.maximum_workspace_solve_scaled_residual,
+              scaled_solve_residual);
+        }
+      if (!finite) break;
       std::copy_n(matrix.data() + matrix_offset, ni * ni,
                   direct_matrix.data());
       for (std::size_t row = 0; row < ni; ++row)
@@ -490,6 +585,8 @@ struct CudaQualificationTestAccess
     return finite &&
         audit.maximum_direct_scaled_error <= audit.tolerance &&
         audit.maximum_workspace_scaled_error <= audit.tolerance &&
+        audit.maximum_factor_scaled_residual <= audit.tolerance &&
+        audit.maximum_workspace_solve_scaled_residual <= audit.tolerance &&
         audit.maximum_scaled_residual <= audit.tolerance;
   }
 
@@ -2874,6 +2971,12 @@ bool VerifyLocalCondensationAgreement(
       capture.ordinary_schur.size() != capture.tensor_schur.size() ||
       capture.ordinary_rhs.size() != capture.tensor_rhs.size())
     return false;
+  const std::uint64_t schur_only_tiles =
+      static_cast<std::uint64_t>(capture.elements) *
+      static_cast<std::uint64_t>((capture.trace_dofs + 7) / 8) *
+      static_cast<std::uint64_t>((capture.trace_dofs + 7) / 8) *
+      static_cast<std::uint64_t>((capture.interior_dofs + 3) / 4);
+  if (capture.tensor_mma_tiles <= schur_only_tiles) return false;
 
   const auto maximum_scaled_error = [](const std::vector<double>& ordinary,
                                        const std::vector<double>& tensor,
@@ -2928,12 +3031,12 @@ bool VerifyLocalCondensationAgreement(
           std::abs(ordinary_action - tensor_action) / scale);
     }
   }
-  // Both leaves retain the same FP64 pivoted LU/triangular solve.  Their only
-  // ordering difference is the length-interior_dofs FP64 scalar reduction
-  // versus m8n8k4 MMA reduction.  The deterministic Schur-vector probe also
-  // qualifies the local true-trace action used by the global assembly; the
-  // lifecycle tests independently compare the assembled solve and true
-  // residual.  Use dimension-scaled roundoff envelopes for both reductions.
+  // The tensor leaf reorders the FP64 factor, multi-RHS solves, and Schur
+  // contraction into scalar diagonal panels plus m8n8k4 updates.  The
+  // deterministic Schur-vector probe also qualifies the local true-trace
+  // action used by global assembly; lifecycle tests independently compare the
+  // assembled solve and true residual.  Retain the established strict
+  // dimension-scaled roundoff envelopes for both leaves.
   const double tolerance = 512.0 * std::numeric_limits<double>::epsilon() *
       static_cast<double>(std::max(1, capture.interior_dofs));
   const double action_tolerance = tolerance *
@@ -3030,7 +3133,7 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
     int rank = 0;
     MPI_Comm_rank(request.communicator, &rank);
     if (rank == 0)
-      std::cerr << "CUDA retained-workspace recovery mismatch order=" << order
+      std::cerr << "CUDA local-algebra/recovery mismatch order=" << order
                 << " regularization=" << (igr ? "igr" : "none")
                 << " engine="
                 << (config.cuda_engine == CudaEngineKind::tensor_core
@@ -3042,6 +3145,10 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
                 << recovery_audit.maximum_direct_scaled_error
                 << " workspace_scaled_error="
                 << recovery_audit.maximum_workspace_scaled_error
+                << " factor_scaled_residual="
+                << recovery_audit.maximum_factor_scaled_residual
+                << " workspace_solve_scaled_residual="
+                << recovery_audit.maximum_workspace_solve_scaled_residual
                 << " scaled_residual="
                 << recovery_audit.maximum_scaled_residual
                 << " tolerance=" << recovery_audit.tolerance << '\n';

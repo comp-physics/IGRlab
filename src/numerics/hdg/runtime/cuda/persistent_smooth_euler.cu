@@ -3468,18 +3468,107 @@ __global__ void BorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
   if(threadIdx.x==0)v.status[e]=1;
 }
 
-// The tensor leaf deliberately retains the ordinary FP64 pivoted LU and
-// triangular solves.  Only the material C*A^{-1}*[B f] product is tiled onto
-// FP64 tensor cores.  Per-warp shared tiles give every admitted p1-p3
-// conventional/IGR shape an aligned m8n8k4 operand, with explicit zero fill
-// for row, column, and inner-dimension tails.  Each warp owns a balanced,
-// contiguous output-tile range and reuses one staged A operand across two
-// adjacent, row-bounded output-column tiles.  The RHS shares a tensor tile when
-// it occupies the Schur matrix's final partial column tile; otherwise its
-// scalar contraction avoids launching a tensor tile with seven padded columns.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+static __device__ __forceinline__ void TensorSubtractBlockedProduct(
+    double* destination,const int destination_stride,
+    const double* left,const int left_stride,
+    const double* right,const int right_stride,
+    const int rows,const int columns,const int inner,
+    double* tensor_a,double* tensor_b,double* tensor_product)
+{
+  constexpr int tensor_warps_per_block=4;
+  constexpr int tensor_column_batch_tiles=2;
+  const int warp=threadIdx.x/warpSize,lane=threadIdx.x%warpSize;
+  const int row_tiles=(rows+7)/8,column_tiles=(columns+7)/8;
+  const int output_tiles=row_tiles*column_tiles;
+  const int first_tile=output_tiles*warp/tensor_warps_per_block;
+  const int last_tile=output_tiles*(warp+1)/tensor_warps_per_block;
+  double* warp_a=tensor_a+warp*8*4;
+  double* warp_b=tensor_b+warp*tensor_column_batch_tiles*4*8;
+  double* warp_product=tensor_product+warp*8*8;
+  for(int tile=first_tile;tile<last_tile;)
+  {
+    const int row_tile=tile/column_tiles;
+    const int column_tile=tile-row_tile*column_tiles;
+    int batch_width=tensor_column_batch_tiles;
+    const int range_remaining=last_tile-tile;
+    const int row_remaining=column_tiles-column_tile;
+    if(batch_width>range_remaining)batch_width=range_remaining;
+    if(batch_width>row_remaining)batch_width=row_remaining;
+    const int row_base=row_tile*8;
+    using TensorAccumulator=nvcuda::wmma::fragment<
+        nvcuda::wmma::accumulator,8,8,4,double>;
+    TensorAccumulator accumulators[tensor_column_batch_tiles];
+#pragma unroll
+    for(int slot=0;slot<tensor_column_batch_tiles;++slot)
+      nvcuda::wmma::fill_fragment(accumulators[slot],0.0);
+    for(int inner_base=0;inner_base<inner;inner_base+=4)
+    {
+      const int local_row=lane/4,local_inner=lane%4;
+      const int row=row_base+local_row,column=inner_base+local_inner;
+      warp_a[lane]=row<rows&&column<inner
+          ?left[row*left_stride+column]:0.0;
+#pragma unroll
+      for(int slot=0;slot<tensor_column_batch_tiles;++slot)
+        if(slot<batch_width)
+        {
+          const int local_inner=lane/8,local_column=lane%8;
+          const int right_row=inner_base+local_inner;
+          const int right_column=(column_tile+slot)*8+local_column;
+          warp_b[slot*4*8+lane]=right_row<inner&&right_column<columns
+              ?right[right_row*right_stride+right_column]:0.0;
+        }
+      __syncwarp();
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,8,8,4,double,
+                            nvcuda::wmma::row_major> matrix_a;
+      nvcuda::wmma::load_matrix_sync(matrix_a,warp_a,4);
+#pragma unroll
+      for(int slot=0;slot<tensor_column_batch_tiles;++slot)
+        if(slot<batch_width)
+        {
+          nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
+                                nvcuda::wmma::row_major> matrix_b;
+          nvcuda::wmma::load_matrix_sync(
+              matrix_b,warp_b+slot*4*8,8);
+          nvcuda::wmma::mma_sync(accumulators[slot],matrix_a,matrix_b,
+                                 accumulators[slot]);
+        }
+    }
+#pragma unroll
+    for(int slot=0;slot<tensor_column_batch_tiles;++slot)
+      if(slot<batch_width)
+      {
+        const int column_base=(column_tile+slot)*8;
+        nvcuda::wmma::store_matrix_sync(
+            warp_product,accumulators[slot],8,
+            nvcuda::wmma::mem_row_major);
+        __syncwarp();
+        for(int item=lane;item<8*8;item+=warpSize)
+        {
+          const int output_row=row_base+item/8;
+          const int output_column=column_base+item%8;
+          if(output_row<rows&&output_column<columns)
+            destination[output_row*destination_stride+output_column]-=
+                warp_product[item];
+        }
+        __syncwarp();
+      }
+    tile+=batch_width;
+  }
+}
+#endif
+
+// The tensor leaf uses an eight-column pivoted FP64 LU panel.  Scalar panel
+// work preserves the ordinary scaling, threshold, pivot search, and complete
+// row swaps; FP64 m8n8k4 MMA performs each material right-looking A22 update.
+// The retained 33--81 genuine [B f] right-hand sides use scalar diagonal-block
+// solves and tensor off-diagonal updates.  The existing tensor Schur product
+// then consumes the same retained W used by borrowed recovery.  Only incomplete
+// edge tiles are zero padded; no admitted p1-p3 shape routes to ordinary CUDA.
 __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  constexpr int lu_panel_columns=8;
   constexpr int tensor_warps_per_block=4;
   constexpr int tensor_column_batch_tiles=2;
   const int e=blockIdx.x;if(e>=s.elements)return;
@@ -3512,38 +3601,66 @@ __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
     for(int i=0;i<ni*ni;++i)scale=fmax(scale,fabs(lu[i]));
   }
   __syncthreads();
-  for(int column=0;column<ni;++column)
+  for(int panel_start=0;panel_start<ni;panel_start+=lu_panel_columns)
   {
-    if(threadIdx.x==0)
+    const int panel_limit=panel_start+lu_panel_columns;
+    const int panel_end=panel_limit<ni?panel_limit:ni;
+    for(int column=panel_start;column<panel_end;++column)
     {
-      pivot_row=column;
-      for(int row=column+1;row<ni;++row)
-        if(fabs(lu[row*ni+column])>fabs(lu[pivot_row*ni+column]))
-          pivot_row=row;
-      pivots[column]=pivot_row;
-      if(!(fabs(lu[pivot_row*ni+column])>
-            64.0*2.2204460492503131e-16*scale))failed=1;
-    }
-    __syncthreads();
-    if(failed){if(threadIdx.x==0)v.status[e]=-1;return;}
-    if(pivot_row!=column)
-      for(int entry=threadIdx.x;entry<ni;entry+=blockDim.x)
+      if(threadIdx.x==0)
       {
-        const double value=lu[column*ni+entry];
-        lu[column*ni+entry]=lu[pivot_row*ni+entry];
-        lu[pivot_row*ni+entry]=value;
+        pivot_row=column;
+        for(int row=column+1;row<ni;++row)
+          if(fabs(lu[row*ni+column])>fabs(lu[pivot_row*ni+column]))
+            pivot_row=row;
+        pivots[column]=pivot_row;
+        if(!(fabs(lu[pivot_row*ni+column])>
+              64.0*2.2204460492503131e-16*scale))failed=1;
       }
-    __syncthreads();
-    for(int row=column+1+threadIdx.x;row<ni;row+=blockDim.x)
-      lu[row*ni+column]/=lu[column*ni+column];
-    __syncthreads();
-    const int trailing=ni-column-1;
-    for(int item=threadIdx.x;item<trailing*trailing;item+=blockDim.x)
-    {
-      const int row=column+1+item/trailing;
-      const int entry=column+1+item%trailing;
-      lu[row*ni+entry]-=lu[row*ni+column]*lu[column*ni+entry];
+      __syncthreads();
+      if(failed){if(threadIdx.x==0)v.status[e]=-1;return;}
+      if(pivot_row!=column)
+        for(int entry=threadIdx.x;entry<ni;entry+=blockDim.x)
+        {
+          const double value=lu[column*ni+entry];
+          lu[column*ni+entry]=lu[pivot_row*ni+entry];
+          lu[pivot_row*ni+entry]=value;
+        }
+      __syncthreads();
+      for(int row=column+1+threadIdx.x;row<ni;row+=blockDim.x)
+        lu[row*ni+column]/=lu[column*ni+column];
+      __syncthreads();
+      const int panel_remaining=panel_end-column-1;
+      const int rows_remaining=ni-column-1;
+      if(panel_remaining>0)
+        for(int item=threadIdx.x;item<rows_remaining*panel_remaining;
+            item+=blockDim.x)
+        {
+          const int row=column+1+item/panel_remaining;
+          const int entry=column+1+item%panel_remaining;
+          lu[row*ni+entry]-=lu[row*ni+column]*lu[column*ni+entry];
+        }
+      __syncthreads();
     }
+    for(int row=panel_start;row<panel_end;++row)
+    {
+      for(int entry=panel_end+threadIdx.x;entry<ni;entry+=blockDim.x)
+      {
+        double value=lu[row*ni+entry];
+        for(int column=panel_start;column<row;++column)
+          value-=lu[row*ni+column]*lu[column*ni+entry];
+        lu[row*ni+entry]=value;
+      }
+      __syncthreads();
+    }
+    const int panel_width=panel_end-panel_start;
+    const int trailing=ni-panel_end;
+    TensorSubtractBlockedProduct(
+        lu+panel_end*ni+panel_end,ni,
+        lu+panel_end*ni+panel_start,ni,
+        lu+panel_start*ni+panel_end,ni,
+        trailing,trailing,panel_width,
+        &tensor_a[0][0],&tensor_b[0][0][0],&tensor_product[0][0]);
     __syncthreads();
   }
   for(int row=0;row<ni;++row)
@@ -3558,25 +3675,52 @@ __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
       }
     __syncthreads();
   }
-  for(int column=0;column<ni;++column)
+  for(int panel_start=0;panel_start<ni;panel_start+=lu_panel_columns)
   {
-    const int remaining=ni-column-1;
-    for(int item=threadIdx.x;item<remaining*cols;item+=blockDim.x)
+    const int panel_limit=panel_start+lu_panel_columns;
+    const int panel_end=panel_limit<ni?panel_limit:ni;
+    for(int row=panel_start;row<panel_end;++row)
     {
-      const int row=column+1+item/cols,rhs=item%cols;
-      w[row*cols+rhs]-=lu[row*ni+column]*w[column*cols+rhs];
+      for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
+      {
+        double value=w[row*cols+rhs];
+        for(int column=panel_start;column<row;++column)
+          value-=lu[row*ni+column]*w[column*cols+rhs];
+        w[row*cols+rhs]=value;
+      }
+      __syncthreads();
     }
+    const int panel_width=panel_end-panel_start;
+    const int trailing=ni-panel_end;
+    TensorSubtractBlockedProduct(
+        w+panel_end*cols,cols,
+        lu+panel_end*ni+panel_start,ni,
+        w+panel_start*cols,cols,
+        trailing,cols,panel_width,
+        &tensor_a[0][0],&tensor_b[0][0][0],&tensor_product[0][0]);
     __syncthreads();
   }
-  for(int row=ni-1;row>=0;--row)
+  for(int panel_start=((ni-1)/lu_panel_columns)*lu_panel_columns;
+      panel_start>=0;panel_start-=lu_panel_columns)
   {
-    for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
+    const int panel_limit=panel_start+lu_panel_columns;
+    const int panel_end=panel_limit<ni?panel_limit:ni;
+    for(int row=panel_end-1;row>=panel_start;--row)
     {
-      double value=w[row*cols+rhs];
-      for(int column=row+1;column<ni;++column)
-        value-=lu[row*ni+column]*w[column*cols+rhs];
-      w[row*cols+rhs]=value/lu[row*ni+row];
+      for(int rhs=threadIdx.x;rhs<cols;rhs+=blockDim.x)
+      {
+        double value=w[row*cols+rhs];
+        for(int column=row+1;column<panel_end;++column)
+          value-=lu[row*ni+column]*w[column*cols+rhs];
+        w[row*cols+rhs]=value/lu[row*ni+row];
+      }
+      __syncthreads();
     }
+    const int panel_width=panel_end-panel_start;
+    TensorSubtractBlockedProduct(
+        w,cols,lu+panel_start,ni,w+panel_start*cols,cols,
+        panel_start,cols,panel_width,
+        &tensor_a[0][0],&tensor_b[0][0][0],&tensor_product[0][0]);
     __syncthreads();
   }
 
@@ -4326,21 +4470,49 @@ bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
      s.interior_dofs>generic_maximum_interior_dofs_per_element||
      s.trace_dofs>generic_maximum_trace_dofs_per_element)
     return false;
-  const std::uint64_t row_tiles=
-      static_cast<std::uint64_t>((s.trace_dofs+7)/8);
-  const std::uint64_t column_tiles=
-      static_cast<std::uint64_t>((s.trace_dofs+7)/8);
-  const std::uint64_t inner_tiles=
-      static_cast<std::uint64_t>((s.interior_dofs+3)/4);
+  constexpr int lu_panel_columns=8;
+  const auto tiles8=[](const int count) noexcept
+  {return static_cast<std::uint64_t>((count+7)/8);};
+  const auto tiles4=[](const int count) noexcept
+  {return static_cast<std::uint64_t>((count+3)/4);};
+  // Existing bounded evidence counts every production m8n8k4 instruction:
+  // Schur contraction plus factor, forward-solve, and backward-solve updates.
+  std::uint64_t per_element=0;
+  const auto add_tile_product=[&per_element](
+      const std::uint64_t first,const std::uint64_t second,
+      const std::uint64_t third) noexcept
+  {
+    if(first!=0&&second>std::numeric_limits<std::uint64_t>::max()/first)
+      return false;
+    const std::uint64_t pair=first*second;
+    if(pair!=0&&third>std::numeric_limits<std::uint64_t>::max()/pair)
+      return false;
+    const std::uint64_t product=pair*third;
+    if(product>std::numeric_limits<std::uint64_t>::max()-per_element)
+      return false;
+    per_element+=product;
+    return true;
+  };
+  const std::uint64_t schur_rows=tiles8(s.trace_dofs);
+  const std::uint64_t schur_columns=tiles8(s.trace_dofs);
+  const std::uint64_t schur_inner=tiles4(s.interior_dofs);
+  if(!add_tile_product(schur_rows,schur_columns,schur_inner))return false;
+  const std::uint64_t rhs_tiles=tiles8(s.trace_dofs+1);
+  for(int panel_start=0;panel_start<s.interior_dofs;
+      panel_start+=lu_panel_columns)
+  {
+    const int panel_limit=panel_start+lu_panel_columns;
+    const int panel_end=panel_limit<s.interior_dofs
+        ?panel_limit:s.interior_dofs;
+    const std::uint64_t panel_inner=tiles4(panel_end-panel_start);
+    const std::uint64_t trailing_rows=tiles8(s.interior_dofs-panel_end);
+    const std::uint64_t prefix_rows=tiles8(panel_start);
+    if(!add_tile_product(trailing_rows,trailing_rows,panel_inner)||
+       !add_tile_product(trailing_rows,rhs_tiles,panel_inner)||
+       !add_tile_product(prefix_rows,rhs_tiles,panel_inner))
+      return false;
+  }
   const std::uint64_t elements=static_cast<std::uint64_t>(s.elements);
-  if(column_tiles!=0&&
-     row_tiles>std::numeric_limits<std::uint64_t>::max()/column_tiles)
-    return false;
-  const std::uint64_t output_tiles=row_tiles*column_tiles;
-  if(inner_tiles!=0&&
-     output_tiles>std::numeric_limits<std::uint64_t>::max()/inner_tiles)
-    return false;
-  const std::uint64_t per_element=output_tiles*inner_tiles;
   if(elements!=0&&
      per_element>std::numeric_limits<std::uint64_t>::max()/elements)
     return false;
