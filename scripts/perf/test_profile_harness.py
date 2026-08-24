@@ -219,12 +219,34 @@ else:
         nsys_profiler_version = "NVIDIA Nsight Systems version 2026.1"
         executable(
             fake_qualification_nsys,
-            """import pathlib
+            """import os
+import pathlib
 import sys
 
 arguments = sys.argv[1:]
 if arguments == ["--version"]:
     print("NVIDIA Nsight Systems version 2026.1")
+elif arguments and arguments[0] == "stats":
+    expected_reports = {
+        "nvtx_sum", "cuda_api_sum", "cuda_gpu_mem_time_sum",
+        "cuda_gpu_mem_size_sum",
+    }
+    report = arguments[arguments.index("--report") + 1]
+    expected = [
+        "stats", "--report", report, "--format", "csv", "--output", "-",
+        "--force-export", "true", str(pathlib.Path.cwd() / "capture.nsys-rep"),
+    ]
+    if report not in expected_reports or arguments != expected:
+        raise SystemExit(17)
+    if os.environ.get("FAKE_NSYS_STATS_FAIL"):
+        raise SystemExit(18)
+    if os.environ.get("FAKE_NSYS_STATS_EMPTY"):
+        raise SystemExit(0)
+    if os.environ.get("FAKE_NSYS_STATS_TAMPER") and \
+            report == "cuda_gpu_mem_size_sum":
+        (pathlib.Path.cwd() / "nsys-nvtx-sum.csv").write_text("tampered")
+    print('"Report","Time (%)","Total Time (ns)","Instances"')
+    print(f'"{report}","100.0","1234","2"')
 else:
     stem = pathlib.Path(arguments[arguments.index("--output") + 1])
     stem.with_suffix(".nsys-rep").write_bytes(
@@ -357,6 +379,25 @@ else:
         )
         assert "--import" in attribution_artifact["generating_command"]
 
+        truncated_attribution_arguments = qualification_arguments(
+            root / "qualification-attribution-at-cap",
+            "accepted-step-attribution",
+        )
+        launch_count_index = truncated_attribution_arguments.index(
+            "--ncu-launch-count"
+        ) + 1
+        truncated_attribution_arguments[launch_count_index] = "9"
+        truncated_attribution = run(
+            *truncated_attribution_arguments,
+            expected=6,
+            env={**qualification_env, "FAKE_NCU_ATTRIBUTION": "1"},
+        )
+        assert "strictly fewer than the declared capture limit" in \
+            read_manifest(
+                root / "qualification-attribution-at-cap"
+            )["detail"]
+        assert truncated_attribution.returncode == 6
+
         missing_category_out = root / "qualification-attribution-missing"
         run(
             *qualification_arguments(
@@ -420,9 +461,63 @@ else:
         assert nsys_qualification_manifest["outcome"] == "success"
         assert nsys_qualification_manifest["qualification"]["status"] == \
             "success"
+        nsys_summaries = nsys_qualification_manifest["qualification"][
+            "nsys_summaries"
+        ]
+        assert set(nsys_summaries) == {
+            "nvtx_sum", "cuda_api_sum", "cuda_gpu_mem_time_sum",
+            "cuda_gpu_mem_size_sum",
+        }
+        for report_name, summary in nsys_summaries.items():
+            assert summary["status"] == "generated_from_native_report"
+            assert summary["csv"]["bytes"] > 0
+            assert len(summary["csv"]["sha256"]) == 64
+            assert summary["command"][1:] == [
+                "stats", "--report", report_name,
+                "--format", "csv", "--output", "-",
+                "--force-export", "true",
+                str(nsys_qualification_out / "capture.nsys-rep"),
+            ]
+        nsys_artifact_paths = {
+            artifact["path"]
+            for artifact in nsys_qualification_manifest["artifacts"]
+        }
+        assert {
+            "nsys-nvtx-sum.csv", "nsys-cuda-api-sum.csv",
+            "nsys-cuda-gpu-mem-time-sum.csv",
+            "nsys-cuda-gpu-mem-size-sum.csv",
+        } <= nsys_artifact_paths
         assert nsys_qualification_manifest["identity"]["qualification"][
             "profiler"
         ]["version"] == nsys_profiler_version
+
+        wrong_nsys_scope = list(nsys_qualification_arguments)
+        wrong_nsys_scope[
+            wrong_nsys_scope.index("stop")
+        ] = "repeat"
+        wrong_nsys_scope[
+            wrong_nsys_scope.index(str(nsys_qualification_out))
+        ] = str(root / "qualification-nsys-wrong-scope")
+        assert "requires accepted-step cudaProfilerApi capture" in run(
+            *wrong_nsys_scope, expected=2, env=qualification_env
+        ).stderr
+
+        for suffix, environment, expected_detail in (
+            ("stats-fail", "FAKE_NSYS_STATS_FAIL", "summary exited 18"),
+            ("stats-empty", "FAKE_NSYS_STATS_EMPTY", "summary is empty"),
+            ("stats-tamper", "FAKE_NSYS_STATS_TAMPER", "changed after validation"),
+        ):
+            negative_arguments = list(nsys_qualification_arguments)
+            negative_arguments[
+                negative_arguments.index(str(nsys_qualification_out))
+            ] = str(root / f"qualification-nsys-{suffix}")
+            run(
+                *negative_arguments, expected=6,
+                env={**qualification_env, environment: "1"},
+            )
+            assert expected_detail in read_manifest(
+                root / f"qualification-nsys-{suffix}"
+            )["detail"]
 
         wrong_nsys_application = list(nsys_qualification_arguments)
         wrong_nsys_application[

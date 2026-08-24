@@ -25,6 +25,64 @@ if MODULE_SPEC is None or MODULE_SPEC.loader is None:
 CAMPAIGN = importlib.util.module_from_spec(MODULE_SPEC)
 MODULE_SPEC.loader.exec_module(CAMPAIGN)
 
+SYNTHETIC_HYPRE_HASH = "eofobxw4pr2efngtgfbdmp5lks5yex7i"
+SYNTHETIC_HYPRE_REVISION = "7e247a231e000000000000000000000000000000"
+SCHEMA1_SAMPLE_SUMMARY_FIELDS = {
+    "measured_index", "nonlinear_updates", "trace_solves",
+    "linear_iterations", "line_search_trials",
+    "rejected_line_search_trials", "transfers", "gates",
+}
+SCHEMA1_WORK_SUMMARY_FIELDS = {
+    "linear_iterations_by_invocation", "nonlinear_updates", "trace_solves",
+    "linear_iterations", "line_search_trials",
+    "rejected_line_search_trials", "transfers", "acceptance_gates",
+}
+SCHEMA1_RECORD_SUMMARY_FIELDS = {
+    "schema", "workload_identity", "median_seconds_recomputed",
+    "raw_duration_count", "measured_sample_work",
+    "measured_linear_iterations_total", "gpu_sm_count", "timing_scope",
+    "initialization_timed",
+}
+SCHEMA1_WORKLOAD_SUMMARY_FIELDS = {
+    "mode", "polynomial_order", "mesh_n", "domain_periods",
+    "domain_length", "cells_per_period", "element_h", "elements",
+    "interior_unknowns", "true_trace_unknowns", "principal_blocks",
+    "gpu_sm_count", "dt", "host_export",
+}
+SCHEMA2_ONLY_SUMMARY_FIELDS = {
+    "trace_preconditioner", "trace_ilu_policy", "trace_preconditioners",
+    "tensor_core", "trace_and_tensor_accounting",
+    "trace_policy_metadata_status", "precision_policy", "numerical_policy",
+    "initialization_duration_seconds", "initialization_in_primary_timing",
+    "device_memory_snapshots",
+    "umpire_allocator_high_watermarks_after_samples", "gpu_name",
+    "gpu_compute_capability", "cuda_driver_version",
+    "cuda_runtime_version",
+}
+SCHEMA2_ONLY_RECORD_FIELDS = {
+    "backend", "cuda_engine", "trace_preconditioner", "trace_ilu_type",
+    "trace_ilu_level_of_fill", "trace_ilu_local_reordering",
+    "trace_ilu_application_iterations", "trace_ilu_accounting_kind",
+    "trace_ilu_factor_reuse_policy", "trace_ilu_triangular_solve_kind",
+    "trace_ilu_lower_jacobi_iterations",
+    "trace_ilu_upper_jacobi_iterations", "time_integrator",
+    "time_step_policy", "gamma", "interior_components",
+    "trace_components", "gpu_name", "gpu_device_ordinal", "gpu_uuid",
+    "gpu_compute_capability", "cuda_driver_version",
+    "cuda_runtime_version", "initial_state_kind", "initial_trace_kind",
+    "source_kind", "boundary_kind", "precision_policy",
+    "numerical_policy", "initialization_in_primary_timing",
+    "profiling_observability", "profile_measured_step",
+    "initialization_duration_seconds", "device_memory_snapshots",
+    "umpire_allocator_high_watermarks_after_samples", "build_identity",
+}
+SCHEMA2_ONLY_SAMPLE_FIELDS = {
+    "attempt_sequence", "retry_index", "device_ticket_count",
+    "iterative_refinement_steps", "residual_replacements",
+    "precision_corrections", "all_fp64_policy",
+    "correction_accounting_complete", "product_generations", "tensor_core",
+}
+
 FAKE_BENCHMARK = r'''#!/usr/bin/env python3
 import argparse
 import json
@@ -49,6 +107,30 @@ parser.set_defaults(export=False)
 args = parser.parse_args()
 
 is_frozen = "frozen" in str(Path(__file__))
+trace_preconditioner = (
+    "hypre_diag_scale"
+    if args.engine == "tensor" and args.mode == "conventional"
+    else "hypre_ilu0"
+)
+ilu_policy = (
+    (-1, -1, -1, 0)
+    if trace_preconditioner == "hypre_diag_scale"
+    else (0, 0, 1 if args.mode == "igr" else 0, 1)
+)
+ilu_factor_reuse_policy = (
+    "not_applicable"
+    if ilu_policy[3] == 0
+    else "first_trace_solve_per_attempt"
+    if args.engine == "tensor" and args.mode == "igr"
+    else "refresh_each_trace_solve"
+)
+ilu_triangular_policy = (
+    ("not_applicable", 0, 0, 0)
+    if not ilu_policy[3]
+    else ("iterative_jacobi", 5, 5, 8)
+    if args.engine == "tensor" and args.mode == "igr"
+    else ("direct", 0, 0, 0)
+)
 if is_frozen:
     scale = 2.5
 elif args.engine == "ordinary":
@@ -118,12 +200,59 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
         },
     }
     if not is_frozen:
+        ilu_active = ilu_policy[3] > 0
+        krylov_restart_dimension = min(
+            100,
+            max(20, 2 * args.mesh_n * args.mesh_n * (args.order + 1) *
+                (5 if args.mode == "igr" else 4)),
+        )
+        callback_lower = (
+            7 + (7 + krylov_restart_dimension - 1) //
+            krylov_restart_dimension
+            if ilu_active else 0
+        )
+        callback_upper = 14 if ilu_active else 0
         sample["tensor_core"] = {
             "selected_engine": args.engine,
-            "trace_preconditioner": (
-                "hypre_ilu0"
-                if args.engine == "ordinary"
-                else "hypre_diag_scale"
+            "trace_preconditioner": trace_preconditioner,
+            "ilu_type": ilu_policy[0],
+            "ilu_level_of_fill": ilu_policy[1],
+            "ilu_local_reordering": ilu_policy[2],
+            "ilu_application_iterations": ilu_policy[3],
+            "ilu_triangular_solve_kind": ilu_triangular_policy[0],
+            "ilu_lower_jacobi_iterations": ilu_triangular_policy[1],
+            "ilu_upper_jacobi_iterations": ilu_triangular_policy[2],
+            "ilu_factor_reuse_policy": ilu_factor_reuse_policy,
+            "ilu_factor_setups": (
+                1 if ilu_factor_reuse_policy ==
+                "first_trace_solve_per_attempt"
+                else 2 if ilu_active else 0
+            ),
+            "ilu_factor_reuses": (
+                1 if ilu_factor_reuse_policy ==
+                "first_trace_solve_per_attempt" else 0
+            ),
+            "ilu_accounting_kind": (
+                "derived_bounds_v1" if ilu_active else "unavailable"
+            ),
+            "ilu_preconditioner_callbacks_lower_bound": callback_lower,
+            "ilu_preconditioner_callbacks_upper_bound": callback_upper,
+            "ilu_inner_iterations_lower_bound": (
+                callback_lower * ilu_policy[3]
+            ),
+            "ilu_inner_iterations_upper_bound": (
+                callback_upper * ilu_policy[3]
+            ),
+            "ilu_jacobi_factor_spmv_updates_lower_bound": (
+                callback_lower * ilu_policy[3] * ilu_triangular_policy[3]
+            ),
+            "ilu_jacobi_factor_spmv_updates_upper_bound": (
+                callback_upper * ilu_policy[3] * ilu_triangular_policy[3]
+            ),
+            "ilu_accounting_complete": True,
+            "ilu_factor_age_generations": (
+                1 if ilu_factor_reuse_policy ==
+                "first_trace_solve_per_attempt" else 0
             ),
             "trace_preconditioner_configured": True,
             "hardware_supported": True,
@@ -133,6 +262,14 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
             "fallback_accounting_complete": True,
             "no_fallback": True,
         }
+    else:
+        for field in (
+            "attempt_sequence", "retry_index", "device_ticket_count",
+            "iterative_refinement_steps", "residual_replacements",
+            "precision_corrections", "all_fp64_policy",
+            "correction_accounting_complete", "product_generations",
+        ):
+            del sample[field]
     samples.append(sample)
 payload = {
     "schema": 1 if is_frozen else 2,
@@ -143,9 +280,18 @@ payload = {
     "success": True,
     "backend": "cuda",
     "cuda_engine": args.engine,
-    "trace_preconditioner": (
-        "hypre_ilu0" if args.engine == "ordinary" else "hypre_diag_scale"
+    "trace_preconditioner": trace_preconditioner,
+    "trace_ilu_type": ilu_policy[0],
+    "trace_ilu_level_of_fill": ilu_policy[1],
+    "trace_ilu_local_reordering": ilu_policy[2],
+    "trace_ilu_application_iterations": ilu_policy[3],
+    "trace_ilu_triangular_solve_kind": ilu_triangular_policy[0],
+    "trace_ilu_lower_jacobi_iterations": ilu_triangular_policy[1],
+    "trace_ilu_upper_jacobi_iterations": ilu_triangular_policy[2],
+    "trace_ilu_accounting_kind": (
+        "derived_bounds_v1" if ilu_policy[3] else "unavailable"
     ),
+    "trace_ilu_factor_reuse_policy": ilu_factor_reuse_policy,
     "mode": args.mode,
     "precision": "fp64",
     "time_integrator": "backward_euler",
@@ -271,8 +417,26 @@ payload = {
     "samples": samples,
 }
 if is_frozen:
-    del payload["cuda_engine"]
-    del payload["trace_preconditioner"]
+    for field in (
+        "backend", "cuda_engine", "trace_preconditioner",
+        "trace_ilu_type", "trace_ilu_level_of_fill",
+        "trace_ilu_local_reordering", "trace_ilu_application_iterations",
+        "trace_ilu_triangular_solve_kind",
+        "trace_ilu_lower_jacobi_iterations",
+        "trace_ilu_upper_jacobi_iterations",
+        "trace_ilu_accounting_kind", "trace_ilu_factor_reuse_policy",
+        "time_integrator", "time_step_policy", "gamma",
+        "interior_components", "trace_components", "gpu_name",
+        "gpu_device_ordinal", "gpu_uuid", "gpu_compute_capability",
+        "cuda_driver_version", "cuda_runtime_version",
+        "initial_state_kind", "initial_trace_kind", "source_kind",
+        "boundary_kind", "precision_policy", "numerical_policy",
+        "initialization_in_primary_timing", "profiling_observability",
+        "profile_measured_step", "initialization_duration_seconds",
+        "device_memory_snapshots",
+        "umpire_allocator_high_watermarks_after_samples",
+    ):
+        del payload[field]
 else:
     payload["build_identity"] = {
         "source_revision": args.expected_source_revision,
@@ -361,8 +525,17 @@ def write_build_provenance(root: Path, source: Path,
             "profile=cuda-sm120",
             "build_type=Release",
             "hypre_spec=hypre@develop+mpi+cuda cuda_arch=120",
+            f"hypre_hash={SYNTHETIC_HYPRE_HASH}",
+            "hypre_prefix=/fake/spack/hypre-develop-"
+            f"{SYNTHETIC_HYPRE_HASH}",
+            f"hypre_source_revision={SYNTHETIC_HYPRE_REVISION}",
+            "hypre_configuration=mpi+cuda+device-memory+sm120",
             "dependency_cuda_arch=120",
             "mfem_cuda_archs=80-virtual",
+            "reuse_abi=build_type=Release;"
+            "hypre_spec=hypre@develop+mpi+cuda cuda_arch=120;"
+            f"hypre={SYNTHETIC_HYPRE_HASH};"
+            "dependency_arch=120;mfem_arch=80-virtual",
             "",
         )),
         encoding="utf-8",
@@ -370,7 +543,122 @@ def write_build_provenance(root: Path, source: Path,
     return cache, mfem
 
 
+def rewrite_manifest(source: Path, destination: Path, *,
+                     replacements: dict[str, str] | None = None,
+                     omitted: set[str] | None = None) -> Path:
+    replacements = replacements or {}
+    omitted = omitted or set()
+    observed: set[str] = set()
+    output: list[str] = []
+    for line in source.read_text(encoding="utf-8").splitlines():
+        key, separator, _ = line.partition("=")
+        if not separator:
+            output.append(line)
+        elif key in omitted:
+            observed.add(key)
+        elif key in replacements:
+            output.append(f"{key}={replacements[key]}")
+            observed.add(key)
+        else:
+            output.append(line)
+    expected = set(replacements) | omitted
+    if observed != expected:
+        raise AssertionError(
+            f"manifest rewrite missed keys: {sorted(expected - observed)}"
+        )
+    destination.write_text("\n".join((*output, "")), encoding="utf-8")
+    return destination
+
+
 def main() -> int:
+    assert CAMPAIGN._ilu_derived_bounds_are_valid(
+        7, 1, 5, 1, 9, 14, 9, 14
+    )
+    assert CAMPAIGN._ilu_derived_bounds_are_valid(
+        0, 1, 5, 1, 0, 0, 0, 0
+    )
+    assert CAMPAIGN._ilu_derived_bounds_are_valid(
+        7, 2, 5, 1, 10, 14, 10, 14
+    )
+    assert not CAMPAIGN._ilu_derived_bounds_are_valid(
+        7, 1, 5, 1, 6, 14, 6, 14
+    )
+    assert not CAMPAIGN._ilu_derived_bounds_are_valid(
+        7, 1, 5, 1, 7, 14, 7, 14
+    )
+    assert not CAMPAIGN._ilu_derived_bounds_are_valid(
+        7, 1, 5, 1, 8, 14, 8, 14
+    )
+    assert not CAMPAIGN._ilu_derived_bounds_are_valid(
+        7, 1, 5, 1, 9, 13, 9, 13
+    )
+    assert not CAMPAIGN._ilu_derived_bounds_are_valid(
+        7, 1, 5, 1, 9, 15, 9, 15
+    )
+    assert not CAMPAIGN._ilu_derived_bounds_are_valid(
+        7, 1, 5, 2, 9, 14, 9, 28
+    )
+    assert CAMPAIGN._ilu_derived_bounds_are_valid(
+        CAMPAIGN.UINT64_MAX // 2, 1,
+        CAMPAIGN.UINT64_MAX // 2, 1,
+        CAMPAIGN.UINT64_MAX // 2 + 1, CAMPAIGN.UINT64_MAX - 1,
+        CAMPAIGN.UINT64_MAX // 2 + 1, CAMPAIGN.UINT64_MAX - 1,
+    )
+    assert not CAMPAIGN._ilu_derived_bounds_are_valid(
+        CAMPAIGN.UINT64_MAX // 2, 1,
+        CAMPAIGN.UINT64_MAX // 2, 2,
+        CAMPAIGN.UINT64_MAX // 2 + 1, CAMPAIGN.UINT64_MAX - 1,
+        CAMPAIGN.UINT64_MAX, CAMPAIGN.UINT64_MAX,
+    )
+    assert not CAMPAIGN._ilu_derived_bounds_are_valid(
+        -1, 1, 5, 1, 0, 0, 0, 0
+    )
+    assert not CAMPAIGN._ilu_derived_bounds_are_valid(
+        1, 1, 0, 1, 1, 2, 1, 2
+    )
+    assert not CAMPAIGN._ilu_derived_bounds_are_valid(
+        1, 0, 5, 1, 2, 2, 2, 2
+    )
+    assert CAMPAIGN._ilu_jacobi_factor_spmv_bounds_are_valid(
+        9, 14, 1, 8, 72, 112
+    )
+    assert CAMPAIGN._ilu_jacobi_factor_spmv_bounds_are_valid(
+        9, 14, 1, 0, 0, 0
+    )
+    assert not CAMPAIGN._ilu_jacobi_factor_spmv_bounds_are_valid(
+        9, 14, 1, 8, 71, 112
+    )
+    assert not CAMPAIGN._ilu_jacobi_factor_spmv_bounds_are_valid(
+        9, CAMPAIGN.UINT64_MAX, 1, 8, 72, CAMPAIGN.UINT64_MAX
+    )
+    assert not CAMPAIGN._ilu_jacobi_factor_spmv_bounds_are_valid(
+        9, 14, 0, 8, 0, 0
+    )
+    assert CAMPAIGN._ilu_factor_accounting_is_valid(
+        2, "refresh_each_trace_solve", 2, 0, 0
+    )
+    assert CAMPAIGN._ilu_factor_accounting_is_valid(
+        1, "first_trace_solve_per_attempt", 1, 0, 0
+    )
+    assert CAMPAIGN._ilu_factor_accounting_is_valid(
+        2, "first_trace_solve_per_attempt", 1, 1, 1
+    )
+    assert CAMPAIGN._ilu_factor_accounting_is_valid(
+        2, "not_applicable", 0, 0, 0
+    )
+    assert not CAMPAIGN._ilu_factor_accounting_is_valid(
+        2, "refresh_each_trace_solve", 1, 1, 1
+    )
+    assert not CAMPAIGN._ilu_factor_accounting_is_valid(
+        2, "first_trace_solve_per_attempt", 1, 1, 0
+    )
+    assert not CAMPAIGN._ilu_factor_accounting_is_valid(
+        1, "first_trace_solve_per_attempt", 1, 0, 1
+    )
+    assert not CAMPAIGN._ilu_factor_accounting_is_valid(
+        2, "not_applicable", 0, 1, 0
+    )
+
     with tempfile.TemporaryDirectory(prefix="hdg-tensor-campaign-test-") as temp:
         root = Path(temp)
         source = root / "source"
@@ -439,6 +727,101 @@ def main() -> int:
         final = build_cache.parent / CAMPAIGN.BENCHMARK_BUILD_RELATIVE_PATH
         final.parent.mkdir(parents=True)
         write_executable(final, FAKE_BENCHMARK)
+
+        build_provenance = CAMPAIGN.validated_build_provenance(
+            source_root=source,
+            cmake_cache_path=str(build_cache),
+            mfem_identity_path=str(mfem_identity),
+        )
+        hypre_identity = build_provenance["validated_hypre_identity"]
+        assert hypre_identity["spack_spec"] == \
+            "hypre@develop+mpi+cuda cuda_arch=120"
+        assert hypre_identity["spack_dag_hash"] == SYNTHETIC_HYPRE_HASH
+        assert hypre_identity["reuse_abi_binding"] == {
+            "hypre_spec": "hypre@develop+mpi+cuda cuda_arch=120",
+            "hypre": SYNTHETIC_HYPRE_HASH,
+        }
+        assert hypre_identity["manifest_fields"][
+            "hypre_source_revision"
+        ] == SYNTHETIC_HYPRE_REVISION
+        assert hypre_identity["manifest_fields"][
+            "hypre_configuration"
+        ] == "mpi+cuda+device-memory+sm120"
+        minimal_hypre_manifest = rewrite_manifest(
+            mfem_identity, root / "mfem-no-optional-hypre-fields.txt",
+            omitted={"hypre_source_revision", "hypre_configuration"},
+        )
+        minimal_hypre_identity = CAMPAIGN.validated_build_provenance(
+            source_root=source,
+            cmake_cache_path=str(build_cache),
+            mfem_identity_path=str(minimal_hypre_manifest),
+        )["validated_hypre_identity"]
+        assert minimal_hypre_identity["manifest_fields"] == {
+            "hypre_hash": SYNTHETIC_HYPRE_HASH,
+            "hypre_prefix": "/fake/spack/hypre-develop-"
+            f"{SYNTHETIC_HYPRE_HASH}",
+            "hypre_spec": "hypre@develop+mpi+cuda cuda_arch=120",
+        }
+
+        def provenance_rejected(path: Path) -> bool:
+            try:
+                CAMPAIGN.validated_build_provenance(
+                    source_root=source,
+                    cmake_cache_path=str(build_cache),
+                    mfem_identity_path=str(path),
+                )
+            except CAMPAIGN.CampaignError:
+                return True
+            return False
+
+        bad_provenance_cases = (
+            rewrite_manifest(
+                mfem_identity, root / "mfem-missing-hypre-hash.txt",
+                omitted={"hypre_hash"},
+            ),
+            rewrite_manifest(
+                mfem_identity, root / "mfem-malformed-hypre-hash.txt",
+                replacements={"hypre_hash": "not-a-spack-dag-hash"},
+            ),
+            rewrite_manifest(
+                mfem_identity, root / "mfem-mismatched-hypre-prefix.txt",
+                replacements={
+                    "hypre_prefix": "/fake/spack/hypre-develop-"
+                    + "a" * 32,
+                },
+            ),
+            rewrite_manifest(
+                mfem_identity, root / "mfem-unbound-hypre-reuse.txt",
+                replacements={
+                    "reuse_abi": "build_type=Release;"
+                    "hypre_spec=hypre@develop+mpi+cuda cuda_arch=120;"
+                    f"hypre={'a' * 32};dependency_arch=120;"
+                    "mfem_arch=80-virtual",
+                },
+            ),
+            rewrite_manifest(
+                mfem_identity, root / "mfem-unsupported-hypre-config.txt",
+                replacements={
+                    "hypre_spec": "hypre@develop+mpi~cuda cuda_arch=120",
+                },
+            ),
+            rewrite_manifest(
+                mfem_identity, root / "mfem-wrong-hypre-architecture.txt",
+                replacements={
+                    "hypre_spec": "hypre@develop+mpi+cuda cuda_arch=1200",
+                },
+            ),
+            rewrite_manifest(
+                mfem_identity, root / "mfem-empty-hypre-revision.txt",
+                replacements={"hypre_source_revision": ""},
+            ),
+            rewrite_manifest(
+                mfem_identity, root / "mfem-symbolic-hypre-revision.txt",
+                replacements={"hypre_source_revision": "develop"},
+            ),
+        )
+        assert all(provenance_rejected(path) for path in bad_provenance_cases)
+
         output = root / "evidence"
         command = [
             sys.executable,
@@ -480,30 +863,195 @@ def main() -> int:
         assert campaign["performance_disposition"][
             "promotion_performance_disposition"
         ] == "characterization_only_not_a_promotion_gate"
+        assert campaign["performance_disposition"][
+            "tensor_vs_final_tree_ordinary"
+        ]["attribution_by_mode"]["igr"]["trace_policy_matched"] is False
+        assert campaign["export_control"]["attribution"][
+            "tensor_trace_preconditioner"
+        ] == "hypre_ilu0"
+        assert campaign["export_control"]["attribution"][
+            "mma_contribution_requires_separate_profiler_attribution"
+        ] is True
         assert campaign["source_start"] == campaign["source_end"]
         assert len(campaign["final_tree_results"]) == 6
         assert "frozen_control_results" not in campaign
         assert len(campaign["invocations"]) == 26
         assert len(list((output / "raw").rglob("*.json"))) == 26
-        for result in campaign["final_tree_results"].values():
+        assert CAMPAIGN.expected_trace_preconditioner(
+            "ordinary", "conventional"
+        ) == "hypre_ilu0"
+        assert CAMPAIGN.expected_trace_preconditioner(
+            "ordinary", "igr"
+        ) == "hypre_ilu0"
+        assert CAMPAIGN.expected_trace_preconditioner(
+            "tensor", "conventional"
+        ) == "hypre_diag_scale"
+        assert CAMPAIGN.expected_trace_preconditioner(
+            "tensor", "igr"
+        ) == "hypre_ilu0"
+        assert CAMPAIGN.expected_trace_ilu_policy(
+            "ordinary", "conventional"
+        ) == (0, 0, 0, 1)
+        assert CAMPAIGN.expected_trace_ilu_policy(
+            "ordinary", "igr"
+        ) == (0, 0, 1, 1)
+        assert CAMPAIGN.expected_trace_ilu_policy(
+            "tensor", "conventional"
+        ) == (-1, -1, -1, 0)
+        assert CAMPAIGN.expected_trace_ilu_policy(
+            "tensor", "igr"
+        ) == (0, 0, 1, 1)
+        assert CAMPAIGN.expected_trace_ilu_triangular_solve_policy(
+            "ordinary", "conventional"
+        ) == ("direct", 0, 0, 0)
+        assert CAMPAIGN.expected_trace_ilu_triangular_solve_policy(
+            "ordinary", "igr"
+        ) == ("direct", 0, 0, 0)
+        assert CAMPAIGN.expected_trace_ilu_triangular_solve_policy(
+            "tensor", "conventional"
+        ) == ("not_applicable", 0, 0, 0)
+        assert CAMPAIGN.expected_trace_ilu_triangular_solve_policy(
+            "tensor", "igr"
+        ) == ("iterative_jacobi", 5, 5, 8)
+        assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
+            "ordinary", "conventional"
+        ) == "refresh_each_trace_solve"
+        assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
+            "ordinary", "igr"
+        ) == "refresh_each_trace_solve"
+        assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
+            "tensor", "conventional"
+        ) == "not_applicable"
+        assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
+            "tensor", "igr"
+        ) == "first_trace_solve_per_attempt"
+        for cell_key, result in campaign["final_tree_results"].items():
             comparison = result["paired_comparison"]
             assert math.isclose(comparison["speedup"]["median"], 2.0)
             assert comparison[
                 "median_speedup_95_percent_confidence_interval"
             ]["resamples"] == 100
+            mode = "igr" if cell_key.startswith("igr_") else "conventional"
+            attribution = comparison["attribution"]
+            assert attribution["scope"] == "complete_engine_package"
+            assert attribution["ordinary_trace_preconditioner"] == "hypre_ilu0"
+            assert attribution["tensor_trace_preconditioner"] == (
+                "hypre_ilu0" if mode == "igr"
+                else "hypre_diag_scale"
+            )
+            assert attribution[
+                "trace_preconditioner_configuration_matched"
+            ] is False
+            assert attribution["trace_policy_matched"] is False
+            assert attribution[
+                "ordinary_ilu_factor_reuse_policy"
+            ] == "refresh_each_trace_solve"
+            assert attribution["tensor_ilu_factor_reuse_policy"] == (
+                "first_trace_solve_per_attempt" if mode == "igr"
+                else "not_applicable"
+            )
+            assert attribution[
+                "ordinary_ilu_triangular_solve_policy"
+            ] == {
+                "kind": "direct",
+                "lower_jacobi_iterations": 0,
+                "upper_jacobi_iterations": 0,
+                "jacobi_factor_spmv_updates_per_application": 0,
+            }
+            assert attribution[
+                "tensor_ilu_triangular_solve_policy"
+            ] == ({
+                "kind": "iterative_jacobi",
+                "lower_jacobi_iterations": 5,
+                "upper_jacobi_iterations": 5,
+                "jacobi_factor_spmv_updates_per_application": 8,
+            } if mode == "igr" else {
+                "kind": "not_applicable",
+                "lower_jacobi_iterations": 0,
+                "upper_jacobi_iterations": 0,
+                "jacobi_factor_spmv_updates_per_application": 0,
+            })
+            assert attribution["includes_tensor_condensation"] is True
+            assert attribution[
+                "mma_contribution_requires_separate_profiler_attribution"
+            ] is True
             assert result["engines"]["ordinary"]["solver_work"][
                 "trace_preconditioners"
             ] == ["hypre_ilu0"]
             assert result["engines"]["tensor"]["solver_work"][
                 "trace_preconditioners"
-            ] == ["hypre_diag_scale"]
+            ] == [
+                "hypre_ilu0" if cell_key.startswith("igr_")
+                else "hypre_diag_scale"
+            ]
             for engine in ("ordinary", "tensor"):
                 work = result["engines"][engine]["solver_work"]
+                ilu_active = engine == "ordinary" or cell_key.startswith("igr_")
                 assert work["linear_iterations"]["total"] == 70
                 assert work["linear_iterations_by_invocation"] == [
                     [7, 7, 7, 7, 7], [7, 7, 7, 7, 7]
                 ]
                 assert work["tensor_core"]["all_no_fallback"] is True
+                assert work["tensor_core"][
+                    "ilu_accounting_kinds"
+                ] == ["derived_bounds_v1" if ilu_active else "unavailable"]
+                assert work["tensor_core"][
+                    "ilu_accounting_all_complete"
+                ] is True
+                tensor_igr = engine == "tensor" and mode == "igr"
+                expected_triangular_policy = (
+                    ["iterative_jacobi", 5, 5] if tensor_igr
+                    else ["direct", 0, 0] if ilu_active
+                    else ["not_applicable", 0, 0]
+                )
+                assert work["tensor_core"][
+                    "ilu_triangular_solve_policies"
+                ] == [expected_triangular_policy]
+                expected_factor_setups = (
+                    10 if tensor_igr else 20 if ilu_active else 0
+                )
+                expected_factor_reuses = 10 if tensor_igr else 0
+                expected_factor_age = 1 if tensor_igr else 0
+                expected_factor_policy = (
+                    "first_trace_solve_per_attempt" if tensor_igr
+                    else "refresh_each_trace_solve" if ilu_active
+                    else "not_applicable"
+                )
+                assert work["tensor_core"][
+                    "ilu_factor_reuse_policies"
+                ] == [expected_factor_policy]
+                expected_callback_lower = 80 if ilu_active else 0
+                expected_callback_upper = 140 if ilu_active else 0
+                assert work["tensor_core"][
+                    "ilu_factor_setups"
+                ]["total"] == expected_factor_setups
+                assert work["tensor_core"][
+                    "ilu_factor_reuses"
+                ]["total"] == expected_factor_reuses
+                assert work["tensor_core"][
+                    "ilu_factor_age_generations"
+                ]["maximum"] == expected_factor_age
+                assert "total" not in work["tensor_core"][
+                    "ilu_factor_age_generations"
+                ]
+                assert work["tensor_core"][
+                    "ilu_preconditioner_callbacks_lower_bound"
+                ]["total"] == expected_callback_lower
+                assert work["tensor_core"][
+                    "ilu_preconditioner_callbacks_upper_bound"
+                ]["total"] == expected_callback_upper
+                assert work["tensor_core"][
+                    "ilu_inner_iterations_lower_bound"
+                ]["total"] == expected_callback_lower
+                assert work["tensor_core"][
+                    "ilu_inner_iterations_upper_bound"
+                ]["total"] == expected_callback_upper
+                assert work["tensor_core"][
+                    "ilu_jacobi_factor_spmv_updates_lower_bound"
+                ]["total"] == (640 if tensor_igr else 0)
+                assert work["tensor_core"][
+                    "ilu_jacobi_factor_spmv_updates_upper_bound"
+                ]["total"] == (1120 if tensor_igr else 0)
                 assert all(work["acceptance_gates"].values())
                 assert work["transfers"]["all_complete"] is True
                 memory = result["engines"][engine][
@@ -542,10 +1090,8 @@ def main() -> int:
                     artifact.read_bytes()
                 ).hexdigest()
             summary = item["benchmark_summary"]
-            expected_preconditioner = (
-                "hypre_diag_scale"
-                if item["comparison_member"] == "tensor"
-                else "hypre_ilu0"
+            expected_preconditioner = CAMPAIGN.expected_trace_preconditioner(
+                item["comparison_member"], item["mode"]
             )
             assert summary["trace_preconditioner"] == expected_preconditioner
             assert summary["measured_linear_iterations_total"] == 35
@@ -557,6 +1103,77 @@ def main() -> int:
             )
             assert all(
                 sample["trace_preconditioner_configured"] is True
+                for sample in summary["measured_sample_work"]
+            )
+            ilu_active = item["comparison_member"] == "ordinary" or \
+                item["mode"] == "igr"
+            expected_accounting_kind = (
+                "derived_bounds_v1" if ilu_active else "unavailable"
+            )
+            expected_ilu_policy = CAMPAIGN.expected_trace_ilu_policy(
+                item["comparison_member"], item["mode"]
+            )
+            expected_factor_reuse_policy = \
+                CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
+                    item["comparison_member"], item["mode"]
+                )
+            expected_triangular_policy = \
+                CAMPAIGN.expected_trace_ilu_triangular_solve_policy(
+                    item["comparison_member"], item["mode"]
+                )
+            assert (
+                summary["trace_ilu_policy"]["type"],
+                summary["trace_ilu_policy"]["level_of_fill"],
+                summary["trace_ilu_policy"]["local_reordering"],
+                summary["trace_ilu_policy"]["application_iterations"],
+            ) == expected_ilu_policy
+            assert summary["trace_ilu_policy"][
+                "accounting_kind"
+            ] == expected_accounting_kind
+            assert summary["trace_ilu_policy"][
+                "factor_reuse_policy"
+            ] == expected_factor_reuse_policy
+            assert (
+                summary["trace_ilu_policy"]["triangular_solve_kind"],
+                summary["trace_ilu_policy"]["lower_jacobi_iterations"],
+                summary["trace_ilu_policy"]["upper_jacobi_iterations"],
+            ) == expected_triangular_policy[:3]
+            expected_factor_setups = (
+                1 if expected_factor_reuse_policy ==
+                "first_trace_solve_per_attempt"
+                else 2 if ilu_active else 0
+            )
+            expected_factor_reuses = (
+                1 if expected_factor_reuse_policy ==
+                "first_trace_solve_per_attempt" else 0
+            )
+            expected_factor_age = expected_factor_reuses
+            assert all(
+                sample["ilu_accounting_kind"] == expected_accounting_kind and
+                sample["ilu_accounting_complete"] is True and
+                sample["ilu_factor_reuse_policy"] ==
+                expected_factor_reuse_policy and
+                sample["ilu_factor_setups"] == expected_factor_setups and
+                sample["ilu_factor_reuses"] == expected_factor_reuses and
+                sample["ilu_factor_age_generations"] == expected_factor_age and
+                sample["ilu_triangular_solve_kind"] ==
+                expected_triangular_policy[0] and
+                sample["ilu_lower_jacobi_iterations"] ==
+                expected_triangular_policy[1] and
+                sample["ilu_upper_jacobi_iterations"] ==
+                expected_triangular_policy[2] and
+                sample["ilu_preconditioner_callbacks_lower_bound"] ==
+                (8 if ilu_active else 0) and
+                sample["ilu_preconditioner_callbacks_upper_bound"] ==
+                (14 if ilu_active else 0) and
+                sample["ilu_inner_iterations_lower_bound"] ==
+                (8 if ilu_active else 0) and
+                sample["ilu_inner_iterations_upper_bound"] ==
+                (14 if ilu_active else 0) and
+                sample["ilu_jacobi_factor_spmv_updates_lower_bound"] ==
+                8 * expected_ilu_policy[3] * expected_triangular_policy[3] and
+                sample["ilu_jacobi_factor_spmv_updates_upper_bound"] ==
+                14 * expected_ilu_policy[3] * expected_triangular_policy[3]
                 for sample in summary["measured_sample_work"]
             )
             assert summary["device_memory_snapshots"][
@@ -583,6 +1200,29 @@ def main() -> int:
         )
         ordinary_record = json.loads(
             (output / ordinary_invocation["raw_json"]).read_text()
+        )
+        assert ordinary_record[
+            "trace_ilu_factor_reuse_policy"
+        ] == "refresh_each_trace_solve"
+        assert ordinary_record["trace_ilu_triangular_solve_kind"] == "direct"
+        assert ordinary_record["trace_ilu_lower_jacobi_iterations"] == 0
+        assert ordinary_record["trace_ilu_upper_jacobi_iterations"] == 0
+        assert all(
+            sample["tensor_core"]["ilu_factor_reuse_policy"] ==
+            "refresh_each_trace_solve" and
+            sample["tensor_core"]["ilu_factor_setups"] == 2 and
+            sample["tensor_core"]["ilu_factor_reuses"] == 0 and
+            sample["tensor_core"]["ilu_factor_age_generations"] == 0 and
+            sample["tensor_core"]["ilu_triangular_solve_kind"] == "direct" and
+            sample["tensor_core"]["ilu_lower_jacobi_iterations"] == 0 and
+            sample["tensor_core"]["ilu_upper_jacobi_iterations"] == 0 and
+            sample["tensor_core"][
+                "ilu_jacobi_factor_spmv_updates_lower_bound"
+            ] == 0 and
+            sample["tensor_core"][
+                "ilu_jacobi_factor_spmv_updates_upper_bound"
+            ] == 0
+            for sample in ordinary_record["samples"]
         )
         validation_arguments = {
             "source": "final",
@@ -625,6 +1265,41 @@ def main() -> int:
         bad_transfers = copy.deepcopy(ordinary_record)
         bad_transfers["samples"][1]["transfers"]["complete"] = False
         assert rejected(bad_transfers)
+        bad_ordinary_reuse_top_level = copy.deepcopy(ordinary_record)
+        bad_ordinary_reuse_top_level[
+            "trace_ilu_factor_reuse_policy"
+        ] = "first_trace_solve_per_attempt"
+        assert rejected(bad_ordinary_reuse_top_level)
+        bad_ordinary_factor_setups = copy.deepcopy(ordinary_record)
+        bad_ordinary_factor_setups["samples"][1]["tensor_core"][
+            "ilu_factor_setups"
+        ] = 1
+        assert rejected(bad_ordinary_factor_setups)
+        bad_ordinary_factor_reuses = copy.deepcopy(ordinary_record)
+        bad_ordinary_factor_reuses["samples"][1]["tensor_core"][
+            "ilu_factor_reuses"
+        ] = 1
+        assert rejected(bad_ordinary_factor_reuses)
+        bad_ordinary_factor_age = copy.deepcopy(ordinary_record)
+        bad_ordinary_factor_age["samples"][1]["tensor_core"][
+            "ilu_factor_age_generations"
+        ] = 1
+        assert rejected(bad_ordinary_factor_age)
+        bad_ordinary_triangular_top_level = copy.deepcopy(ordinary_record)
+        bad_ordinary_triangular_top_level[
+            "trace_ilu_triangular_solve_kind"
+        ] = "iterative_jacobi"
+        assert rejected(bad_ordinary_triangular_top_level)
+        bad_ordinary_jacobi_iterations = copy.deepcopy(ordinary_record)
+        bad_ordinary_jacobi_iterations["samples"][1]["tensor_core"][
+            "ilu_lower_jacobi_iterations"
+        ] = 5
+        assert rejected(bad_ordinary_jacobi_iterations)
+        bad_ordinary_jacobi_updates = copy.deepcopy(ordinary_record)
+        bad_ordinary_jacobi_updates["samples"][1]["tensor_core"][
+            "ilu_jacobi_factor_spmv_updates_lower_bound"
+        ] = 1
+        assert rejected(bad_ordinary_jacobi_updates)
 
         bad_build = copy.deepcopy(ordinary_record)
         bad_build["build_identity"]["source_revision"] = "0" * 40
@@ -634,6 +1309,319 @@ def main() -> int:
             "GPU-00000000-0000-0000-0000-000000000002"
         )
         assert rejected(bad_uuid)
+
+        tensor_igr_invocation = next(
+            item for item in campaign["invocations"]
+            if item["phase"] == "final_tree_primary" and
+            item["comparison_member"] == "tensor" and
+            item["mode"] == "igr"
+        )
+        tensor_igr_record = json.loads(
+            (output / tensor_igr_invocation["raw_json"]).read_text()
+        )
+        tensor_igr_validation_arguments = {
+            **validation_arguments,
+            "mode": "igr",
+            "order": tensor_igr_invocation["order"],
+            "engine": "tensor",
+            "expected_build": tensor_igr_record["build_identity"],
+        }
+        assert tensor_igr_record[
+            "trace_preconditioner"
+        ] == "hypre_ilu0"
+        assert tensor_igr_record["trace_ilu_type"] == 0
+        assert tensor_igr_record["trace_ilu_level_of_fill"] == 0
+        assert tensor_igr_record["trace_ilu_application_iterations"] == 1
+        assert tensor_igr_record["trace_ilu_local_reordering"] == 1
+        assert tensor_igr_record[
+            "trace_ilu_accounting_kind"
+        ] == "derived_bounds_v1"
+        assert tensor_igr_record[
+            "trace_ilu_factor_reuse_policy"
+        ] == "first_trace_solve_per_attempt"
+        assert tensor_igr_record[
+            "trace_ilu_triangular_solve_kind"
+        ] == "iterative_jacobi"
+        assert tensor_igr_record["trace_ilu_lower_jacobi_iterations"] == 5
+        assert tensor_igr_record["trace_ilu_upper_jacobi_iterations"] == 5
+        assert all(
+            sample["tensor_core"]["trace_preconditioner"] ==
+            "hypre_ilu0" and
+            sample["tensor_core"]["ilu_type"] == 0 and
+            sample["tensor_core"]["ilu_level_of_fill"] == 0 and
+            sample["tensor_core"]["ilu_application_iterations"] == 1 and
+            sample["tensor_core"]["ilu_local_reordering"] == 1 and
+            sample["tensor_core"]["ilu_accounting_kind"] ==
+            "derived_bounds_v1" and
+            sample["tensor_core"]["ilu_factor_reuse_policy"] ==
+            "first_trace_solve_per_attempt" and
+            sample["tensor_core"]["ilu_factor_setups"] == 1 and
+            sample["tensor_core"]["ilu_factor_reuses"] == 1 and
+            sample["tensor_core"]["ilu_factor_age_generations"] == 1 and
+            sample["tensor_core"]["ilu_triangular_solve_kind"] ==
+            "iterative_jacobi" and
+            sample["tensor_core"]["ilu_lower_jacobi_iterations"] == 5 and
+            sample["tensor_core"]["ilu_upper_jacobi_iterations"] == 5 and
+            sample["tensor_core"]["ilu_accounting_complete"] is True and
+            sample["tensor_core"][
+                "ilu_preconditioner_callbacks_lower_bound"
+            ] == 8 and
+            sample["tensor_core"][
+                "ilu_preconditioner_callbacks_upper_bound"
+            ] == 14 and
+            sample["tensor_core"]["ilu_inner_iterations_lower_bound"] == 8 and
+            sample["tensor_core"]["ilu_inner_iterations_upper_bound"] == 14 and
+            sample["tensor_core"][
+                "ilu_jacobi_factor_spmv_updates_lower_bound"
+            ] == 64 and
+            sample["tensor_core"][
+                "ilu_jacobi_factor_spmv_updates_upper_bound"
+            ] == 112
+            for sample in tensor_igr_record["samples"]
+        )
+
+        def tensor_igr_rejected(record: dict) -> bool:
+            try:
+                CAMPAIGN.validate_record(
+                    record, **tensor_igr_validation_arguments
+                )
+            except CAMPAIGN.CampaignError:
+                return True
+            return False
+
+        wrong_tensor_igr_top_level = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_top_level[
+            "trace_preconditioner"
+        ] = "hypre_diag_scale"
+        assert tensor_igr_rejected(wrong_tensor_igr_top_level)
+        wrong_tensor_igr_sample = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_sample["samples"][1]["tensor_core"][
+            "trace_preconditioner"
+        ] = "hypre_diag_scale"
+        assert tensor_igr_rejected(wrong_tensor_igr_sample)
+        wrong_tensor_igr_top_level_iterations = copy.deepcopy(
+            tensor_igr_record
+        )
+        wrong_tensor_igr_top_level_iterations[
+            "trace_ilu_application_iterations"
+        ] = 2
+        assert tensor_igr_rejected(wrong_tensor_igr_top_level_iterations)
+        wrong_tensor_igr_top_level_kind = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_top_level_kind[
+            "trace_ilu_accounting_kind"
+        ] = "unavailable"
+        assert tensor_igr_rejected(wrong_tensor_igr_top_level_kind)
+        wrong_tensor_igr_top_level_reuse = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_top_level_reuse[
+            "trace_ilu_factor_reuse_policy"
+        ] = "refresh_each_trace_solve"
+        assert tensor_igr_rejected(wrong_tensor_igr_top_level_reuse)
+        wrong_tensor_igr_top_level_triangular = copy.deepcopy(
+            tensor_igr_record
+        )
+        wrong_tensor_igr_top_level_triangular[
+            "trace_ilu_triangular_solve_kind"
+        ] = "direct"
+        assert tensor_igr_rejected(wrong_tensor_igr_top_level_triangular)
+        wrong_tensor_igr_top_level_lower_jacobi = copy.deepcopy(
+            tensor_igr_record
+        )
+        wrong_tensor_igr_top_level_lower_jacobi[
+            "trace_ilu_lower_jacobi_iterations"
+        ] = 4
+        assert tensor_igr_rejected(wrong_tensor_igr_top_level_lower_jacobi)
+        wrong_tensor_igr_sample_iterations = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_sample_iterations["samples"][1]["tensor_core"][
+            "ilu_application_iterations"
+        ] = 2
+        assert tensor_igr_rejected(wrong_tensor_igr_sample_iterations)
+        wrong_tensor_igr_top_level_fill = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_top_level_fill[
+            "trace_ilu_level_of_fill"
+        ] = 1
+        assert tensor_igr_rejected(wrong_tensor_igr_top_level_fill)
+        wrong_tensor_igr_sample_fill = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_sample_fill["samples"][1]["tensor_core"][
+            "ilu_level_of_fill"
+        ] = 1
+        assert tensor_igr_rejected(wrong_tensor_igr_sample_fill)
+        wrong_tensor_igr_top_level_type = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_top_level_type["trace_ilu_type"] = 1
+        assert tensor_igr_rejected(wrong_tensor_igr_top_level_type)
+        wrong_tensor_igr_sample_reordering = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_sample_reordering["samples"][1]["tensor_core"][
+            "ilu_local_reordering"
+        ] = 0
+        assert tensor_igr_rejected(wrong_tensor_igr_sample_reordering)
+        wrong_tensor_igr_kind = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_kind["samples"][1]["tensor_core"][
+            "ilu_accounting_kind"
+        ] = "unavailable"
+        assert tensor_igr_rejected(wrong_tensor_igr_kind)
+        incomplete_tensor_igr = copy.deepcopy(tensor_igr_record)
+        incomplete_tensor_igr["samples"][1]["tensor_core"][
+            "ilu_accounting_complete"
+        ] = False
+        assert tensor_igr_rejected(incomplete_tensor_igr)
+        wrong_tensor_igr_factor_setups = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_factor_setups["samples"][1]["tensor_core"][
+            "ilu_factor_setups"
+        ] += 1
+        assert tensor_igr_rejected(wrong_tensor_igr_factor_setups)
+        wrong_tensor_igr_reuse_policy = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_reuse_policy["samples"][1]["tensor_core"][
+            "ilu_factor_reuse_policy"
+        ] = "refresh_each_trace_solve"
+        assert tensor_igr_rejected(wrong_tensor_igr_reuse_policy)
+        wrong_tensor_igr_reuses = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_reuses["samples"][1]["tensor_core"][
+            "ilu_factor_reuses"
+        ] = 0
+        assert tensor_igr_rejected(wrong_tensor_igr_reuses)
+        zero_tensor_igr_factor_age = copy.deepcopy(tensor_igr_record)
+        zero_tensor_igr_factor_age["samples"][1]["tensor_core"][
+            "ilu_factor_age_generations"
+        ] = 0
+        assert tensor_igr_rejected(zero_tensor_igr_factor_age)
+        low_tensor_igr_callback_bound = copy.deepcopy(tensor_igr_record)
+        low_tensor_igr_sample = low_tensor_igr_callback_bound[
+            "samples"
+        ][1]["tensor_core"]
+        low_tensor_igr_sample[
+            "ilu_preconditioner_callbacks_lower_bound"
+        ] = 6
+        low_tensor_igr_sample["ilu_inner_iterations_lower_bound"] = 6
+        assert tensor_igr_rejected(low_tensor_igr_callback_bound)
+        wrong_exact_tensor_igr_lower = copy.deepcopy(tensor_igr_record)
+        wrong_exact_tensor_igr_sample = wrong_exact_tensor_igr_lower[
+            "samples"
+        ][1]["tensor_core"]
+        wrong_exact_tensor_igr_sample[
+            "ilu_preconditioner_callbacks_lower_bound"
+        ] = 10
+        wrong_exact_tensor_igr_sample["ilu_inner_iterations_lower_bound"] = 10
+        wrong_exact_tensor_igr_sample[
+            "ilu_jacobi_factor_spmv_updates_lower_bound"
+        ] = 80
+        assert tensor_igr_rejected(wrong_exact_tensor_igr_lower)
+        nonexact_tensor_igr_callback_bound = copy.deepcopy(tensor_igr_record)
+        nonexact_tensor_igr_sample = nonexact_tensor_igr_callback_bound[
+            "samples"
+        ][1]["tensor_core"]
+        nonexact_tensor_igr_sample[
+            "ilu_preconditioner_callbacks_upper_bound"
+        ] = 13
+        nonexact_tensor_igr_sample["ilu_inner_iterations_upper_bound"] = 13
+        assert tensor_igr_rejected(nonexact_tensor_igr_callback_bound)
+        overflowing_tensor_igr_bound = copy.deepcopy(tensor_igr_record)
+        overflowing_tensor_igr_bound["samples"][1]["tensor_core"][
+            "ilu_preconditioner_callbacks_upper_bound"
+        ] = CAMPAIGN.UINT64_MAX + 1
+        assert tensor_igr_rejected(overflowing_tensor_igr_bound)
+        wrong_tensor_igr_inner_bound = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_inner_bound["samples"][1]["tensor_core"][
+            "ilu_inner_iterations_lower_bound"
+        ] += 1
+        assert tensor_igr_rejected(wrong_tensor_igr_inner_bound)
+        wrong_tensor_igr_triangular_kind = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_triangular_kind["samples"][1]["tensor_core"][
+            "ilu_triangular_solve_kind"
+        ] = "direct"
+        assert tensor_igr_rejected(wrong_tensor_igr_triangular_kind)
+        wrong_tensor_igr_jacobi_iterations = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_jacobi_iterations["samples"][1]["tensor_core"][
+            "ilu_upper_jacobi_iterations"
+        ] = 4
+        assert tensor_igr_rejected(wrong_tensor_igr_jacobi_iterations)
+        wrong_tensor_igr_jacobi_update_bound = copy.deepcopy(
+            tensor_igr_record
+        )
+        wrong_tensor_igr_jacobi_update_bound["samples"][1]["tensor_core"][
+            "ilu_jacobi_factor_spmv_updates_lower_bound"
+        ] -= 1
+        assert tensor_igr_rejected(wrong_tensor_igr_jacobi_update_bound)
+
+        tensor_conventional_invocation = next(
+            item for item in campaign["invocations"]
+            if item["phase"] == "final_tree_primary" and
+            item["comparison_member"] == "tensor" and
+            item["mode"] == "conventional"
+        )
+        tensor_conventional_record = json.loads(
+            (output / tensor_conventional_invocation["raw_json"]).read_text()
+        )
+        tensor_conventional_validation_arguments = {
+            **validation_arguments,
+            "mode": "conventional",
+            "order": tensor_conventional_invocation["order"],
+            "engine": "tensor",
+            "expected_build": tensor_conventional_record["build_identity"],
+        }
+        assert tensor_conventional_record[
+            "trace_ilu_factor_reuse_policy"
+        ] == "not_applicable"
+        assert tensor_conventional_record[
+            "trace_ilu_triangular_solve_kind"
+        ] == "not_applicable"
+        assert tensor_conventional_record[
+            "trace_ilu_lower_jacobi_iterations"
+        ] == 0
+        assert tensor_conventional_record[
+            "trace_ilu_upper_jacobi_iterations"
+        ] == 0
+        assert all(
+            sample["tensor_core"]["ilu_factor_reuse_policy"] ==
+            "not_applicable" and
+            sample["tensor_core"]["ilu_factor_setups"] == 0 and
+            sample["tensor_core"]["ilu_factor_reuses"] == 0 and
+            sample["tensor_core"]["ilu_factor_age_generations"] == 0 and
+            sample["tensor_core"]["ilu_triangular_solve_kind"] ==
+            "not_applicable" and
+            sample["tensor_core"]["ilu_lower_jacobi_iterations"] == 0 and
+            sample["tensor_core"]["ilu_upper_jacobi_iterations"] == 0 and
+            sample["tensor_core"][
+                "ilu_jacobi_factor_spmv_updates_lower_bound"
+            ] == 0 and
+            sample["tensor_core"][
+                "ilu_jacobi_factor_spmv_updates_upper_bound"
+            ] == 0
+            for sample in tensor_conventional_record["samples"]
+        )
+
+        def tensor_conventional_rejected(record: dict) -> bool:
+            try:
+                CAMPAIGN.validate_record(
+                    record, **tensor_conventional_validation_arguments
+                )
+            except CAMPAIGN.CampaignError:
+                return True
+            return False
+
+        bad_tensor_conventional_top_level = copy.deepcopy(
+            tensor_conventional_record
+        )
+        bad_tensor_conventional_top_level[
+            "trace_ilu_factor_reuse_policy"
+        ] = "refresh_each_trace_solve"
+        assert tensor_conventional_rejected(
+            bad_tensor_conventional_top_level
+        )
+        bad_tensor_conventional_reuse = copy.deepcopy(
+            tensor_conventional_record
+        )
+        bad_tensor_conventional_reuse["samples"][1]["tensor_core"][
+            "ilu_factor_reuses"
+        ] = 1
+        assert tensor_conventional_rejected(bad_tensor_conventional_reuse)
+        bad_tensor_conventional_triangular = copy.deepcopy(
+            tensor_conventional_record
+        )
+        bad_tensor_conventional_triangular["samples"][1]["tensor_core"][
+            "ilu_triangular_solve_kind"
+        ] = "direct"
+        assert tensor_conventional_rejected(
+            bad_tensor_conventional_triangular
+        )
 
         frozen_cache, frozen_mfem = write_build_provenance(
             root, frozen_source, "frozen-build"
@@ -813,6 +1801,9 @@ def main() -> int:
         assert qualification["workload"]["pairs_per_cell"] == 6
         assert qualification["export_control"]["mode"] == "igr"
         assert qualification["export_control"]["order"] == 3
+        assert qualification["export_control"]["attribution"][
+            "trace_policy_matched"
+        ] is False
         assert set(qualification["final_tree_results"]) == expected_cells
         assert set(qualification["frozen_control_results"]) == expected_cells
         assert len(qualification["invocations"]) == 146
@@ -841,6 +1832,35 @@ def main() -> int:
             "final_tree_ordinary_vs_frozen_control"
         ]
         assert tensor_disposition["all_six_cells_disclosed"] is True
+        assert tensor_disposition["attribution_by_mode"]["igr"][
+            "tensor_trace_preconditioner"
+        ] == "hypre_ilu0"
+        assert tensor_disposition["attribution_by_mode"]["igr"][
+            "trace_policy_matched"
+        ] is False
+        assert tensor_disposition["attribution_by_mode"]["igr"][
+            "trace_preconditioner_configuration_matched"
+        ] is False
+        assert tensor_disposition["attribution_by_mode"]["igr"][
+            "ordinary_ilu_factor_reuse_policy"
+        ] == "refresh_each_trace_solve"
+        assert tensor_disposition["attribution_by_mode"]["igr"][
+            "tensor_ilu_factor_reuse_policy"
+        ] == "first_trace_solve_per_attempt"
+        assert tensor_disposition["attribution_by_mode"]["igr"][
+            "ordinary_ilu_triangular_solve_policy"
+        ]["kind"] == "direct"
+        assert tensor_disposition["attribution_by_mode"]["igr"][
+            "tensor_ilu_triangular_solve_policy"
+        ] == {
+            "kind": "iterative_jacobi",
+            "lower_jacobi_iterations": 5,
+            "upper_jacobi_iterations": 5,
+            "jacobi_factor_spmv_updates_per_application": 8,
+        }
+        assert tensor_disposition["attribution_by_mode"]["igr"][
+            "mma_contribution_requires_separate_profiler_attribution"
+        ] is True
         assert len(tensor_disposition["cells"]) == 6
         assert tensor_disposition["saturated_pass"] is True
         assert tensor_disposition["disposition"] == \
@@ -897,6 +1917,12 @@ def main() -> int:
             if item["comparison_member"] == "frozen_ordinary"
         ]
         assert len(frozen_invocations) == 36
+        for result in qualification["frozen_control_results"].values():
+            frozen_work = result["controls"]["frozen_ordinary"][
+                "solver_work"
+            ]
+            assert set(frozen_work) == SCHEMA1_WORK_SUMMARY_FIELDS
+            assert not SCHEMA2_ONLY_SUMMARY_FIELDS.intersection(frozen_work)
         for invocation in frozen_invocations:
             record = json.loads(
                 (qualification_output / invocation["raw_json"]).read_text(
@@ -904,8 +1930,41 @@ def main() -> int:
                 )
             )
             assert record["schema"] == 1
-            assert "cuda_engine" not in record
-            assert "build_identity" not in record
+            assert not SCHEMA2_ONLY_RECORD_FIELDS.intersection(record)
+            assert all(
+                not SCHEMA2_ONLY_SAMPLE_FIELDS.intersection(sample)
+                for sample in record["samples"]
+            )
+            summary = invocation["benchmark_summary"]
+            assert summary["schema"] == 1
+            assert set(summary) == SCHEMA1_RECORD_SUMMARY_FIELDS
+            assert not SCHEMA2_ONLY_SUMMARY_FIELDS.intersection(summary)
+            assert set(summary["workload_identity"]) == \
+                SCHEMA1_WORKLOAD_SUMMARY_FIELDS
+            assert all(
+                value is not None
+                for value in summary["workload_identity"].values()
+            )
+            assert all(
+                set(sample) == SCHEMA1_SAMPLE_SUMMARY_FIELDS
+                for sample in summary["measured_sample_work"]
+            )
+
+        expect_campaign_error(lambda: CAMPAIGN.work_summary([
+            ordinary_record, record,
+        ]))
+        unknown_schema = copy.deepcopy(record)
+        unknown_schema["schema"] = 3
+        expect_campaign_error(lambda: CAMPAIGN.record_summary(unknown_schema))
+
+        for build in (final_build, frozen_build):
+            retained_hypre = build["provenance"][
+                "validated_hypre_identity"
+            ]
+            assert retained_hypre["spack_dag_hash"] == SYNTHETIC_HYPRE_HASH
+            assert retained_hypre["manifest_fields"][
+                "hypre_source_revision"
+            ] == SYNTHETIC_HYPRE_REVISION
     print("hdg_tensor_campaign smoke and qualification tests passed")
     return 0
 

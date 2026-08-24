@@ -1063,6 +1063,23 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 BuildPersistentTrueSystem() noexcept
 {
+  const CudaTracePreconditionerKind selected_preconditioner =
+      CudaTracePreconditionerForEngine(cuda_engine_, shape_.igr_active);
+  const CudaIluFactorReusePolicy factor_reuse_policy =
+      CudaIluFactorReusePolicyForEngine(
+          cuda_engine_, shape_.igr_active);
+  const bool use_ilu =
+      CudaTracePreconditionerIsIlu(selected_preconditioner);
+  initialization_tensor_core_evidence_ = {};
+  initialization_tensor_core_evidence_.selected_engine = cuda_engine_;
+  initialization_tensor_core_evidence_.trace_preconditioner =
+      selected_preconditioner;
+  // Aggregate work evidence is qualification-only.  The independently
+  // verified HYPRE configuration below remains the setup authority if
+  // bookkeeping cannot be initialized.
+  (void)CudaInitializeIluEvidence(
+      initialization_tensor_core_evidence_, selected_preconditioner,
+      shape_.igr_active);
   bool local_objects_ready = false;
   try
   {
@@ -1097,30 +1114,34 @@ BuildPersistentTrueSystem() noexcept
       hypre_rhs_.emplace(*true_matrix_);
       hypre_solution_.emplace(*true_matrix_);
       hypre_action_.emplace(*true_matrix_);
-      if (cuda_engine_ == generic::CudaEngineKind::ordinary)
+      if (use_ilu)
         ilu_.emplace();
       else
         diagonal_.emplace();
       gmres_.emplace(*true_matrix_);
-      if (cuda_engine_ == generic::CudaEngineKind::ordinary)
+      if (use_ilu)
       {
-        CudaHypreSetupOrderEvidence initial_setup{};
+        CudaHypreSetupState initial_setup{};
         local_objects_ready = CudaConfigurePersistentHypre(
-            *true_matrix_, *ilu_, *gmres_, ranks_,
-            CudaIluLocalReordering(shape_.igr_active),
+            *true_matrix_, *ilu_, *gmres_, ranks_, cuda_engine_,
+            selected_preconditioner, shape_.igr_active,
             linear_relative_tolerance_, maximum_linear_iterations_,
             krylov_dimension_, 0, initial_setup) &&
             initial_setup.ConfigurationExactForGeneration(
-                0, CudaIluLocalReordering(shape_.igr_active));
+                0, cuda_engine_, selected_preconditioner,
+                shape_.igr_active);
       }
       else
       {
-        CudaDiagScaleSetupOrderEvidence initial_setup{};
+        CudaDiagScaleSetupState initial_setup{};
         local_objects_ready = CudaConfigurePersistentDiagonal(
             *true_matrix_, *diagonal_, *gmres_,
+            cuda_engine_, selected_preconditioner, shape_.igr_active,
             linear_relative_tolerance_, maximum_linear_iterations_,
             krylov_dimension_, 0, initial_setup) &&
-            initial_setup.ConfigurationExactForGeneration(0);
+            initial_setup.ConfigurationExactForGeneration(
+                0, cuda_engine_, selected_preconditioner,
+                shape_.igr_active);
       }
     }
     if (local_objects_ready)
@@ -1175,16 +1196,21 @@ BuildPersistentTrueSystem() noexcept
   *hypre_solution_ = 0.0;
   CudaSolveDiagnostics warm{};
   const bool warm_solved =
-      cuda_engine_ == generic::CudaEngineKind::ordinary
+      use_ilu
       ? CudaRefreshFactorAndSolve(
             *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
-            ranks_, communicator_, CudaIluLocalReordering(shape_.igr_active),
+            ranks_, communicator_, cuda_engine_, selected_preconditioner,
+            shape_.igr_active, factor_reuse_policy,
             linear_relative_tolerance_, maximum_linear_iterations_,
             krylov_dimension_, 0, warm)
       : CudaRefreshDiagonalAndSolve(
             *true_matrix_, *hypre_rhs_, *hypre_solution_, *diagonal_,
-            *gmres_, communicator_, linear_relative_tolerance_,
+            *gmres_, ranks_, communicator_, cuda_engine_,
+            selected_preconditioner, shape_.igr_active, linear_relative_tolerance_,
             maximum_linear_iterations_, krylov_dimension_, 0, warm);
+  if (use_ilu && warm_solved)
+    (void)CudaAccumulateIluSolveEvidence(
+        initialization_tensor_core_evidence_, warm);
   const bool warmed = warm_solved && warm.device_policy &&
       warm.configured_preconditioner && warm.finite &&
       warm.matrix_generation == 0;
@@ -1225,35 +1251,44 @@ BuildPersistentTrueSystem() noexcept
       rank_, "persistent-recreation-configuration", "before", false);
   try
   {
-    if (cuda_engine_ == generic::CudaEngineKind::ordinary)
+    if (use_ilu)
       ilu_.emplace();
     else
       diagonal_.emplace();
     gmres_.emplace(*true_matrix_);
-    if (cuda_engine_ == generic::CudaEngineKind::ordinary)
+    if (use_ilu)
     {
-      CudaHypreSetupOrderEvidence persistent_setup{};
+      CudaHypreSetupState persistent_setup{};
       persistent_configured = CudaConfigurePersistentHypre(
-          *true_matrix_, *ilu_, *gmres_, ranks_,
-          CudaIluLocalReordering(shape_.igr_active),
+          *true_matrix_, *ilu_, *gmres_, ranks_, cuda_engine_,
+          selected_preconditioner, shape_.igr_active,
           linear_relative_tolerance_, maximum_linear_iterations_,
           krylov_dimension_, 0, persistent_setup) &&
           persistent_setup.ConfigurationExactForGeneration(
-              0, CudaIluLocalReordering(shape_.igr_active));
+              0, cuda_engine_, selected_preconditioner,
+              shape_.igr_active);
     }
     else
     {
-      CudaDiagScaleSetupOrderEvidence persistent_setup{};
+      CudaDiagScaleSetupState persistent_setup{};
       persistent_configured = CudaConfigurePersistentDiagonal(
-          *true_matrix_, *diagonal_, *gmres_, linear_relative_tolerance_,
+          *true_matrix_, *diagonal_, *gmres_, cuda_engine_,
+          selected_preconditioner, shape_.igr_active,
+          linear_relative_tolerance_,
           maximum_linear_iterations_, krylov_dimension_, 0,
           persistent_setup) &&
-          persistent_setup.ConfigurationExactForGeneration(0);
+          persistent_setup.ConfigurationExactForGeneration(
+              0, cuda_engine_, selected_preconditioner,
+              shape_.igr_active);
     }
   }
   catch (...) { persistent_configured = false; }
   if (persistent_configured)
-    trace_preconditioner_ = CudaTracePreconditionerForEngine(cuda_engine_);
+  {
+    trace_preconditioner_ = selected_preconditioner;
+    initialization_tensor_core_evidence_.trace_preconditioner_configured =
+        true;
+  }
   ReportCudaWarmLifetimeMarker(
       rank_, "persistent-recreation-configuration", "after",
       persistent_configured);
@@ -1807,23 +1842,39 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 SolveTrueSystem(double& true_relative_residual,
                 const std::uint64_t matrix_generation,
-                int& linear_iterations) noexcept
+                int& linear_iterations,
+                CudaTensorCoreEvidence& tensor_core_evidence) noexcept
 {
   ::dg_igr::NVTXRange profile_region(
       ::dg_igr::observability::RegionId::hdg_trace_solve);
   linear_iterations = 0;
   CudaSolveDiagnostics diagnostics{};
-  const bool solved = cuda_engine_ == generic::CudaEngineKind::ordinary
-      ? CudaRefreshFactorAndSolve(
+  const bool use_ilu = CudaTracePreconditionerIsIlu(
+      trace_preconditioner_);
+  const CudaIluFactorReusePolicy factor_reuse_policy =
+      CudaIluFactorReusePolicyForEngine(
+          cuda_engine_, shape_.igr_active);
+  const bool solved = use_ilu
+      ? CudaSolveWithIluFactorPolicy(
             *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
-            ranks_, communicator_, CudaIluLocalReordering(shape_.igr_active),
+            ranks_, communicator_, cuda_engine_, trace_preconditioner_,
+            shape_.igr_active, factor_reuse_policy, current_attempt_,
             linear_relative_tolerance_, maximum_linear_iterations_,
-            krylov_dimension_, matrix_generation, diagnostics)
+            krylov_dimension_, matrix_generation, ilu_factor_state_,
+            diagnostics)
       : CudaRefreshDiagonalAndSolve(
             *true_matrix_, *hypre_rhs_, *hypre_solution_, *diagonal_,
-            *gmres_, communicator_, linear_relative_tolerance_,
+            *gmres_, ranks_, communicator_, cuda_engine_,
+            trace_preconditioner_, shape_.igr_active,
+            linear_relative_tolerance_,
             maximum_linear_iterations_, krylov_dimension_,
             matrix_generation, diagnostics);
+  if (use_ilu && solved)
+    (void)CudaAccumulateIluSolveEvidence(
+        tensor_core_evidence, diagnostics);
+  // Policy/factor/configuration mismatches already fail `solved`.  Aggregate
+  // accounting remains qualification evidence only; the FP64 current-matrix
+  // true residual below is the numerical acceptance authority.
   const bool local_solve = solved &&
       diagnostics.matrix_generation == matrix_generation &&
       CudaTraceSolveReadyForTrueResidualVerification(

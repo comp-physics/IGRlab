@@ -302,9 +302,8 @@ inline bool CudaEngineKindConsensus(
       minimum == maximum &&
       generic::IsKnownCudaEngineKind(
           static_cast<generic::CudaEngineKind>(minimum));
-  agreed_engine = consensus_ok
-      ? static_cast<generic::CudaEngineKind>(minimum)
-      : generic::CudaEngineKind::ordinary;
+  if (consensus_ok)
+    agreed_engine = static_cast<generic::CudaEngineKind>(minimum);
   return consensus_ok;
 }
 
@@ -493,9 +492,9 @@ struct CudaReuseEvidence
   std::uintptr_t double_arena_token = 0;
   std::uintptr_t integer_arena_token = 0;
   std::uintptr_t matrix_token = 0;
-  // Identity of the selected persistent trace preconditioner.  Ordinary
-  // CUDA stores the HYPRE ILU handle; tensor CUDA stores its diagonal-scale
-  // object because that preconditioner has no separately allocated handle.
+  // Identity of the selected persistent trace preconditioner.  ILU policies
+  // store the HYPRE handle; conventional tensor CUDA stores its diagonal-
+  // scale object because that preconditioner has no allocated HYPRE handle.
   std::uintptr_t preconditioner_token = 0;
   std::uintptr_t workspace_token = 0;
   std::array<std::uintptr_t, 2> interior_slot_tokens{{0, 0}};
@@ -558,12 +557,205 @@ enum class CudaTracePreconditionerKind : std::uint8_t
   hypre_diag_scale = 2
 };
 
-constexpr CudaTracePreconditionerKind CudaTracePreconditionerForEngine(
-    const generic::CudaEngineKind engine) noexcept
+/** Deterministic lifetime policy for a selected HYPRE ILU(0) factor. */
+enum class CudaIluFactorReusePolicy : std::uint8_t
 {
-  return engine == generic::CudaEngineKind::tensor_core
+  not_applicable = 0,
+  refresh_each_trace_solve = 1,
+  first_trace_solve_per_attempt = 2
+};
+
+/** Fixed triangular-application policy for a selected HYPRE ILU factor. */
+enum class CudaIluTriangularSolveKind : std::uint8_t
+{
+  not_applicable = 0,
+  direct = 1,
+  iterative_jacobi = 2
+};
+
+constexpr const char* CudaIluTriangularSolveKindName(
+    const CudaIluTriangularSolveKind kind) noexcept
+{
+  switch (kind)
+  {
+  case CudaIluTriangularSolveKind::direct:
+    return "direct";
+  case CudaIluTriangularSolveKind::iterative_jacobi:
+    return "iterative_jacobi";
+  case CudaIluTriangularSolveKind::not_applicable:
+    break;
+  }
+  return "not_applicable";
+}
+
+constexpr const char* CudaIluFactorReusePolicyName(
+    const CudaIluFactorReusePolicy policy) noexcept
+{
+  switch (policy)
+  {
+  case CudaIluFactorReusePolicy::refresh_each_trace_solve:
+    return "refresh_each_trace_solve";
+  case CudaIluFactorReusePolicy::first_trace_solve_per_attempt:
+    return "first_trace_solve_per_attempt";
+  case CudaIluFactorReusePolicy::not_applicable:
+    break;
+  }
+  return "not_applicable";
+}
+
+/** Nonintrusive ILU-work accounting carried by aggregate solve evidence. */
+enum class CudaIluAccountingKind : std::uint8_t
+{
+  unavailable = 0,
+  derived_bounds_v1 = 1
+};
+
+constexpr const char* CudaIluAccountingKindName(
+    const CudaIluAccountingKind kind) noexcept
+{
+  switch (kind)
+  {
+  case CudaIluAccountingKind::derived_bounds_v1:
+    return "derived_bounds_v1";
+  case CudaIluAccountingKind::unavailable:
+    break;
+  }
+  return "unavailable";
+}
+
+constexpr CudaTracePreconditionerKind CudaTracePreconditionerForEngine(
+    const generic::CudaEngineKind engine, const bool igr_active) noexcept
+{
+  // Diagonal scaling removes recurring ILU setup from the conventional
+  // tensor engine, whose trace systems converge in a handful of iterations.
+  // Both ordinary modes and coupled tensor-IGR retain the qualified ILU(0)
+  // policy; IGR selects RCM through the kind-typed reordering helper below.
+  // This is a typed, deterministic engine-and-mode policy, never a solve-time
+  // fallback.
+  return engine == generic::CudaEngineKind::tensor_core && !igr_active
       ? CudaTracePreconditionerKind::hypre_diag_scale
       : CudaTracePreconditionerKind::hypre_ilu0;
+}
+
+constexpr bool CudaTracePreconditionerIsIlu(
+    const CudaTracePreconditionerKind kind) noexcept
+{
+  return kind == CudaTracePreconditionerKind::hypre_ilu0;
+}
+
+constexpr CudaIluFactorReusePolicy CudaIluFactorReusePolicyForEngine(
+    const generic::CudaEngineKind engine, const bool igr_active) noexcept
+{
+  if (!CudaTracePreconditionerIsIlu(
+          CudaTracePreconditionerForEngine(engine, igr_active)))
+    return CudaIluFactorReusePolicy::not_applicable;
+  return engine == generic::CudaEngineKind::tensor_core && igr_active
+      ? CudaIluFactorReusePolicy::first_trace_solve_per_attempt
+      : CudaIluFactorReusePolicy::refresh_each_trace_solve;
+}
+
+constexpr int CudaIluType(
+    const CudaTracePreconditionerKind kind) noexcept
+{
+  return CudaTracePreconditionerIsIlu(kind) ? 0 : -1;
+}
+
+constexpr int CudaIluLevelOfFill(
+    const CudaTracePreconditionerKind kind) noexcept
+{
+  switch (kind)
+  {
+  case CudaTracePreconditionerKind::hypre_ilu0:
+    return 0;
+  case CudaTracePreconditionerKind::hypre_diag_scale:
+  case CudaTracePreconditionerKind::unconfigured:
+    break;
+  }
+  return -1;
+}
+
+constexpr int CudaIluLocalReordering(
+    const CudaTracePreconditionerKind kind,
+    const bool igr_active) noexcept
+{
+  switch (kind)
+  {
+  case CudaTracePreconditionerKind::hypre_ilu0:
+    return igr_active ? 1 : 0;
+  case CudaTracePreconditionerKind::hypre_diag_scale:
+  case CudaTracePreconditionerKind::unconfigured:
+    break;
+  }
+  return -1;
+}
+
+constexpr int CudaIluApplicationIterations(
+    const CudaTracePreconditionerKind kind) noexcept
+{
+  return CudaTracePreconditionerIsIlu(kind) ? 1 : 0;
+}
+
+// Compatibility overload for existing application provenance call sites;
+// production solver configuration consumes the kind-typed overload above.
+constexpr int CudaIluApplicationIterations(
+    const generic::CudaEngineKind engine, const bool igr_active) noexcept
+{
+  return CudaIluApplicationIterations(
+      CudaTracePreconditionerForEngine(engine, igr_active));
+}
+
+// HYPRE's direct sparse triangular solve is the qualified ordinary-CUDA
+// policy.  The coupled tensor engine uses HYPRE's deterministic iterative
+// triangular solve so its recurring ILU applications avoid the dependency-
+// limited sparse SpSM path.  This is a fixed engine/mode policy, never an
+// adaptive fallback.
+constexpr CudaIluTriangularSolveKind CudaIluTriangularSolveKindForEngine(
+    const generic::CudaEngineKind engine, const bool igr_active) noexcept
+{
+  if (!CudaTracePreconditionerIsIlu(
+          CudaTracePreconditionerForEngine(engine, igr_active)))
+    return CudaIluTriangularSolveKind::not_applicable;
+  return engine == generic::CudaEngineKind::tensor_core && igr_active
+      ? CudaIluTriangularSolveKind::iterative_jacobi
+      : CudaIluTriangularSolveKind::direct;
+}
+
+constexpr int CudaIluTriangularSolve(
+    const generic::CudaEngineKind engine, const bool igr_active) noexcept
+{
+  switch (CudaIluTriangularSolveKindForEngine(engine, igr_active))
+  {
+  case CudaIluTriangularSolveKind::iterative_jacobi:
+    return 0;
+  case CudaIluTriangularSolveKind::direct:
+    return 1;
+  case CudaIluTriangularSolveKind::not_applicable:
+    break;
+  }
+  return -1;
+}
+
+constexpr int CudaIluLowerJacobiIterations(
+    const generic::CudaEngineKind engine, const bool igr_active) noexcept
+{
+  return CudaIluTriangularSolve(engine, igr_active) == 0 ? 5 : 0;
+}
+
+constexpr int CudaIluUpperJacobiIterations(
+    const generic::CudaEngineKind engine, const bool igr_active) noexcept
+{
+  return CudaIluTriangularSolve(engine, igr_active) == 0 ? 5 : 0;
+}
+
+constexpr int CudaIluJacobiFactorSpmvUpdatesPerApplication(
+    const generic::CudaEngineKind engine, const bool igr_active) noexcept
+{
+  const int lower = CudaIluLowerJacobiIterations(engine, igr_active);
+  const int upper = CudaIluUpperJacobiIterations(engine, igr_active);
+  // HYPRE's zero-start first iterate is a pointwise transform; only the
+  // remaining iterates launch factor SpMVs.
+  return (lower > 0 ? lower - 1 : 0) +
+      (upper > 0 ? upper - 1 : 0);
 }
 
 constexpr const char* CudaTracePreconditionerName(
@@ -588,11 +780,34 @@ struct CudaTensorCoreEvidence
       generic::CudaEngineKind::ordinary;
   CudaTracePreconditionerKind trace_preconditioner =
       CudaTracePreconditionerKind::unconfigured;
+  int ilu_type = -1;
+  int ilu_level_of_fill = -1;
+  int ilu_local_reordering = -1;
+  int ilu_application_iterations = 0;
+  CudaIluTriangularSolveKind ilu_triangular_solve_kind =
+      CudaIluTriangularSolveKind::not_applicable;
+  int ilu_lower_jacobi_iterations = 0;
+  int ilu_upper_jacobi_iterations = 0;
+  CudaIluAccountingKind ilu_accounting_kind =
+      CudaIluAccountingKind::unavailable;
+  CudaIluFactorReusePolicy ilu_factor_reuse_policy =
+      CudaIluFactorReusePolicy::not_applicable;
+  std::uint64_t ilu_factor_setups = 0;
+  std::uint64_t ilu_factor_reuses = 0;
+  std::uint64_t ilu_preconditioner_callbacks_lower_bound = 0;
+  std::uint64_t ilu_preconditioner_callbacks_upper_bound = 0;
+  std::uint64_t ilu_inner_iterations_lower_bound = 0;
+  std::uint64_t ilu_inner_iterations_upper_bound = 0;
+  std::uint64_t ilu_jacobi_factor_spmv_updates_lower_bound = 0;
+  std::uint64_t ilu_jacobi_factor_spmv_updates_upper_bound = 0;
+  // Maximum factor age observed in this aggregate scope, never a history.
+  std::uint64_t ilu_factor_age_generations = 0;
   std::uint64_t condensation_launches = 0;
   std::uint64_t mma_tiles = 0;
   std::uint64_t fallback_count = 0;
   bool hardware_supported = false;
   bool trace_preconditioner_configured = false;
+  bool ilu_accounting_complete = false;
   bool fallback_accounting_complete = false;
 };
 

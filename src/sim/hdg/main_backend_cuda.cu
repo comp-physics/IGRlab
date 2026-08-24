@@ -40,8 +40,21 @@ using dg::hdg::generic::RegularizationKind;
 using dg::hdg::generic::RegularizationSelection;
 using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
+using dg::hdg::runtime::cuda_w8a::CudaIluAccountingKind;
+using dg::hdg::runtime::cuda_w8a::CudaIluAccountingKindName;
+using dg::hdg::runtime::cuda_w8a::CudaIluApplicationIterations;
+using dg::hdg::runtime::cuda_w8a::CudaIluFactorReusePolicyForEngine;
+using dg::hdg::runtime::cuda_w8a::CudaIluFactorReusePolicyName;
+using dg::hdg::runtime::cuda_w8a::CudaIluLevelOfFill;
+using dg::hdg::runtime::cuda_w8a::CudaIluLocalReordering;
+using dg::hdg::runtime::cuda_w8a::CudaIluLowerJacobiIterations;
+using dg::hdg::runtime::cuda_w8a::CudaIluTriangularSolveKindForEngine;
+using dg::hdg::runtime::cuda_w8a::CudaIluTriangularSolveKindName;
+using dg::hdg::runtime::cuda_w8a::CudaIluType;
+using dg::hdg::runtime::cuda_w8a::CudaIluUpperJacobiIterations;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
 using dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerForEngine;
+using dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerIsIlu;
 using dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerName;
 
 bool IsRoot(const MPI_Comm communicator) noexcept
@@ -330,8 +343,33 @@ std::string ConsensusText(const HdgEulerMainRequest& request,
   AppendText(stream, mesh_path);
   AppendText(stream, ToLowerCopy(request.options.device));
   AppendText(stream, CudaEngineName(cuda_engine));
-  AppendText(stream, CudaTracePreconditionerName(
-      CudaTracePreconditionerForEngine(cuda_engine)));
+  const bool igr_active = regularization.kind == RegularizationKind::igr;
+  const auto trace_preconditioner =
+      CudaTracePreconditionerForEngine(cuda_engine, igr_active);
+  const bool trace_uses_ilu =
+      CudaTracePreconditionerIsIlu(trace_preconditioner);
+  const auto ilu_accounting_kind = trace_uses_ilu
+      ? CudaIluAccountingKind::derived_bounds_v1
+      : CudaIluAccountingKind::unavailable;
+  const auto ilu_factor_reuse_policy =
+      CudaIluFactorReusePolicyForEngine(cuda_engine, igr_active);
+  const auto ilu_triangular_solve_kind =
+      CudaIluTriangularSolveKindForEngine(cuda_engine, igr_active);
+  const int ilu_lower_jacobi_iterations =
+      CudaIluLowerJacobiIterations(cuda_engine, igr_active);
+  const int ilu_upper_jacobi_iterations =
+      CudaIluUpperJacobiIterations(cuda_engine, igr_active);
+  AppendText(stream, CudaTracePreconditionerName(trace_preconditioner));
+  stream << CudaIluType(trace_preconditioner) << ';'
+         << CudaIluLevelOfFill(trace_preconditioner) << ';'
+         << CudaIluLocalReordering(trace_preconditioner, igr_active) << ';'
+         << CudaIluApplicationIterations(trace_preconditioner) << ';';
+  AppendText(stream, CudaIluAccountingKindName(ilu_accounting_kind));
+  AppendText(stream, CudaIluFactorReusePolicyName(ilu_factor_reuse_policy));
+  AppendText(stream,
+             CudaIluTriangularSolveKindName(ilu_triangular_solve_kind));
+  stream << ilu_lower_jacobi_iterations << ';'
+         << ilu_upper_jacobi_iterations << ';';
   AppendText(stream, request.options.restart_vtk);
   AppendText(stream, vtk.prefix_path);
   stream << request.options.order << ';'
@@ -969,16 +1007,52 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   }
 
   if (IsRoot(request.communicator))
+  {
+    const bool igr_active =
+        regularization.kind == RegularizationKind::igr;
+    const auto trace_preconditioner =
+        CudaTracePreconditionerForEngine(cuda_engine, igr_active);
+    const bool trace_uses_ilu =
+        CudaTracePreconditionerIsIlu(trace_preconditioner);
+    const auto ilu_accounting_kind = trace_uses_ilu
+        ? CudaIluAccountingKind::derived_bounds_v1
+        : CudaIluAccountingKind::unavailable;
+    const auto ilu_factor_reuse_policy =
+        CudaIluFactorReusePolicyForEngine(cuda_engine, igr_active);
+    const auto ilu_triangular_solve_kind =
+        CudaIluTriangularSolveKindForEngine(cuda_engine, igr_active);
+    const int ilu_lower_jacobi_iterations =
+        CudaIluLowerJacobiIterations(cuda_engine, igr_active);
+    const int ilu_upper_jacobi_iterations =
+        CudaIluUpperJacobiIterations(cuda_engine, igr_active);
     std::cout << "[hdg-main] status=Success step=" << time_driver->solver_step()
               << " time=" << time_driver->time() << " output_cycle="
               << time_driver->output_cycle() << " cuda_engine="
               << CudaEngineName(cuda_engine) << " trace_preconditioner="
-              << CudaTracePreconditionerName(
-                     CudaTracePreconditionerForEngine(cuda_engine))
+              << CudaTracePreconditionerName(trace_preconditioner)
+              << " trace_ilu_type="
+              << CudaIluType(trace_preconditioner)
+              << " trace_ilu_level_of_fill="
+              << CudaIluLevelOfFill(trace_preconditioner)
+              << " trace_ilu_local_reordering="
+              << CudaIluLocalReordering(trace_preconditioner, igr_active)
+              << " trace_ilu_application_iterations="
+              << CudaIluApplicationIterations(trace_preconditioner)
+              << " trace_ilu_accounting_kind="
+              << CudaIluAccountingKindName(ilu_accounting_kind)
+              << " trace_ilu_factor_reuse_policy="
+              << CudaIluFactorReusePolicyName(ilu_factor_reuse_policy)
+              << " trace_ilu_triangular_solve_kind="
+              << CudaIluTriangularSolveKindName(ilu_triangular_solve_kind)
+              << " trace_ilu_lower_jacobi_iterations="
+              << ilu_lower_jacobi_iterations
+              << " trace_ilu_upper_jacobi_iterations="
+              << ilu_upper_jacobi_iterations
               << " regularization="
               << (regularization.kind == RegularizationKind::igr ? "igr" : "none")
               << " alpha=" << regularization.alpha
               << " beta=" << regularization.beta << '\n';
+  }
   return 0;
 }
 

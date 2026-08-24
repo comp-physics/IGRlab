@@ -42,16 +42,31 @@ must retain the exact overlay diff and SHA-256, the frozen build manifest, and
 the frozen executable SHA-256. The declared historical application identity
 remains the commit and tree above; the executable provenance must also disclose
 the harness overlay rather than representing it as a pristine checkout.
+The historical schema-1 stream predates typed trace-policy and tensor-work
+accounting. Frozen summaries retain their schema-1 shape and omit those fields;
+they do not synthesize null policies, false fallback flags, tensor subsections,
+or other schema-2 metadata.
 
 Performance has two controls:
 
 1. tensor CUDA versus ordinary CUDA built from the same final candidate tree;
 2. final-tree ordinary CUDA versus the frozen commit above.
 
-The first isolates the final-tree engine package, including its tensor
-condensation leaf and explicitly different trace preconditioner; it does not
-isolate MMA instructions alone. The second detects shared refactoring that
+The first measures the complete final-tree engine package, including the
+tensor condensation leaf. In IGR mode both engines use explicitly recorded
+BJ-ILU0+RCM with one preconditioner application per callback, but ordinary
+CUDA uses direct factor triangular solves and refreshes the factor for every
+trace solve, while tensor CUDA uses fixed five-iteration lower and upper
+Jacobi solves and reuses the first factor within an attempt. Conventional
+tensor CUDA retains its separately recorded diagonal trace policy. Neither
+paired engine comparison represents the contribution of MMA instructions
+alone; final profiler attribution must quantify that contribution separately,
+and both the triangular-solve and factor-lifetime differences remain explicit
+in every IGR comparison. The second control detects shared refactoring that
 slows ordinary CUDA and would otherwise manufacture a tensor speedup.
+Per-sample observed outer iterations, exact factor setup/reuse counts, maximum
+aggregate factor age, and derived ILU/Jacobi work bounds expose recurring
+solver work without removing it from the accepted-step timing.
 
 ## Capability baseline at the frozen tree
 
@@ -169,14 +184,104 @@ tails are explicitly zero-filled, so the same kernel admits every current
 conventional `U4/Uhat4` and IGR `U7/Uhat5` p1-p3 shape.  Schur and condensed
 right-hand-side products remain binary64.
 
-The tensor engine also selects HYPRE diagonal scaling for the recurring
-true-trace GMRES solve, while ordinary CUDA deliberately retains the frozen
-ILU0 policy.  This is an explicit engine-level algorithmic decision, recorded
-for every accepted attempt.  Final attribution therefore separates the
-tensor condensation kernel from trace-solve/preconditioner effects: an
-end-to-end tensor-engine speedup is not represented as the speedup of the MMA
-kernel alone.  Nonlinear, Krylov, line-search, transfer, tensor-tile, and
-fallback work are retained with every benchmark sample.
+The recurring true-trace GMRES preconditioner is selected by both CUDA engine
+and mathematical mode:
+
+| CUDA engine | Conventional | IGR |
+| --- | --- | --- |
+| Ordinary | HYPRE BJ-ILU0, natural, one application, direct factor solves, refresh each solve | HYPRE BJ-ILU0, RCM, one application, direct factor solves, refresh each solve |
+| Tensor | HYPRE diagonal scaling | HYPRE BJ-ILU0, RCM, one application, five lower and five upper Jacobi iterations, first factor per attempt |
+
+This is an explicit numerical policy recorded for every accepted attempt.
+Conventional attribution therefore separates the tensor condensation kernel
+from the independent diagonal-scaling effect. Tensor and ordinary IGR both use
+external policy name `hypre_ilu0`, with exact metadata type 0, fill level 0,
+local RCM reordering 1, and one application iteration. Their factor triangular
+solve is nevertheless an explicit typed difference: ordinary IGR records
+`direct` with zero Jacobi iterations, while tensor IGR records
+`iterative_jacobi` with five lower and five upper iterations. Tensor IGR also
+uses typed factor policy `first_trace_solve_per_attempt`; the ordinary policies
+use `refresh_each_trace_solve`, and diagonal scaling records both factor and
+triangular-solve policies as `not_applicable`.
+Exact factor setups and reuses, maximum aggregate factor age, observed outer
+Krylov iterations, derived callback/inner-work and Jacobi factor-SpMV bounds,
+nonlinear work, line
+searches, transfers, tensor tiles, and fallback work are retained in each
+aggregate benchmark sample. MMA contribution is established separately from
+profiler and SASS evidence; an end-to-end engine speedup is never represented
+as the speedup of MMA alone or as a factor-reuse-only result.
+
+HYPRE exposes the completed GMRES outer-iteration count but neither a
+cumulative preconditioner-callback count nor a restart-cycle count. Its ILU
+iteration getter reports only the most recent application. Intercepting the
+GMRES callbacks to manufacture cumulative counters was rejected because it
+would replace HYPRE's function/data association and add recurring bookkeeping
+inside the timed solver. Production accounting therefore leaves the MFEM/
+HYPRE call path untouched and reports the explicit
+`ilu_accounting_kind=derived_bounds_v1` contract.
+
+For each successful ILU-preconditioned trace solve with `I` observed outer
+iterations, fixed GMRES restart dimension `K`, and configured ILU application
+count `M`, the pinned implementation derives:
+
+- zero callback and inner-work bounds when `I=0`;
+- callback lower bound `I + ceil(I/K)` and upper bound `2*I` when `I>0`;
+- inner-work lower and upper bounds equal to the corresponding callback bound
+  times `M`.
+
+For tensor IGR, each ILU application performs five fixed lower-Jacobi and five
+fixed upper-Jacobi iterations. HYPRE starts each side from zero, so the first
+iterate elides the factor SpMV; the bounded recurring factor work is therefore
+`(5-1) + (5-1) = 8` factor-SpMV updates per application. The fields
+`ilu_jacobi_factor_spmv_updates_lower_bound` and
+`ilu_jacobi_factor_spmv_updates_upper_bound` are exactly the corresponding
+callback bound times `M` times 8. Direct ordinary ILU and diagonal tensor
+samples report both update bounds as zero.
+
+Every addition and product is checked for `uint64_t` overflow. Bounds are
+derived and accumulated separately for every trace solve; they are never
+recomputed from an accepted step's aggregate outer-iteration count because
+the ceiling term is not additive. Each accepted step records the fixed restart
+dimension `K` and its number of trace solves. The independent aggregate
+validator requires the reported restart-cycle count (callback lower bound
+minus aggregate outer work) to be feasible for a partition of that work over
+at most the reported number of positive solves. It retains no per-solve
+partition or event history. The callback upper bound remains exactly `2*I`;
+a zero aggregate requires all four bounds to be exactly zero. Inner bounds
+must be the exact callback bounds times `M`, with checked overflow. Factor
+operations are exact
+aggregate counts under the typed lifetime policy: refresh-per-solve requires
+one setup per trace solve, zero reuses, and zero maximum age; first-solve-per-
+attempt requires one setup and `trace_solves-1` reuses, with maximum age equal
+to `trace_solves-1` because each completed solve advances one generation. The age is
+one aggregate maximum, never an event history. These counts do not require
+replacing a solve callback. The sample reports
+`ilu_accounting_complete=true` only when both factor and derived-bound
+contracts hold, including the triangular-solve policy and Jacobi factor-SpMV
+bounds.
+Diagonal-preconditioned samples report `ilu_accounting_kind=unavailable`, zero
+ILU bounds/setups/reuses/age, factor policy `not_applicable`, and complete
+accounting because no ILU work is applicable.
+This is bounded aggregate scalar provenance only. It does not retain callback
+events or per-solve history and introduces no flight recorder, trace/event
+stream, replay facility, every-event capture, or public production evidence
+API. Final call-structure and instruction evidence comes from external,
+one-off profiler captures.
+
+A provisional rank-one p2 tuning diagnostic also evaluated three Jacobi
+iterations per factor side. The reduced local work increased outer Krylov work
+and regressed accepted-step time relative to the selected five-per-side policy,
+so it was rejected rather than promoted. The unbound provisional samples are
+not final-candidate qualification evidence and no exact diagnostic timing or
+iteration result is promoted by this document.
+
+An attempted tensor-IGR `hypre_bj_iluk1_rcm` policy was also rejected. Source
+inspection of the pinned HYPRE CUDA path and direct setup reproduction showed
+that device-memory ILU setup does not support fill level greater than zero;
+continuing after that rejection left null factor data and crashed. Production
+therefore retains the supported ILU0 configuration rather than hiding an
+ordinary-CUDA or other
+preconditioner fallback. No fill-level-1 result is admissible campaign evidence.
 
 ### Precision and acceptance policy
 
@@ -292,9 +397,11 @@ solver work, transfer and fallback counts, initialization, memory observations,
 build identity, and hardware identity.
 
 Final-tree records use the schema-2 contract. Each measured sample must carry
-complete solver-sourced nonlinear, Krylov, line-search, retry, recovery,
-reduction, transfer, synchronization, acceptance-gate, condensation-launch,
-and MMA-tile accounting. Precision-correction accounting must be complete and
+complete aggregate nonlinear, observed outer-Krylov, derived ILU callback,
+inner-iteration, and Jacobi factor-SpMV bounds,
+line-search, retry, recovery, reduction, transfer, synchronization,
+acceptance-gate, condensation-launch, and MMA-tile accounting.
+Precision-correction accounting must be complete and
 all-FP64 with every mixed-precision/refinement/replacement/correction count
 zero. Fallback accounting must be complete with count zero. Tensor records
 must report supported hardware and positive production condensation/MMA work;
@@ -319,9 +426,15 @@ one backend-neutral periodic workload:
 The 85-block/84-SM geometry is the predeclared saturation basis; it is not
 selected after inspecting results. Mesh, timestep, mathematical mode,
 tolerances, stopping rules, output settings, executable build, GPU lease, and
-hardware conditions are identical within each paired comparison. The ordinary
-and tensor engines intentionally differ in the recorded trace preconditioner
-described above.
+hardware conditions are identical within each paired comparison. The recorded
+trace policy follows the mode-aware table above. In IGR, type 0, fill level 0,
+RCM ordering, and the one-application count are identical between the engines;
+the explicitly reported direct-versus-five-per-side-Jacobi triangular policy
+and factor-lifetime policy differ. All
+recurring trace work remains inside the accepted-step timing; aggregate
+solver-work records disclose exact factor work and derived solve bounds, while
+profiler evidence separately attributes the tensor-condensation MMA
+contribution.
 
 A second, separate break-even campaign uses `mesh_n=4`,
 `domain_periods=1`, and `dt=1e-5`, with the same six-cell, six-pair, no-export
@@ -341,6 +454,15 @@ frozen-control source/overlay/build/executable relationship, live
 `nvidia-smi` metadata, and `CUDA_VISIBLE_DEVICES` equal to the exclusive GPU
 index. Source, executables, build inputs, raw benchmark streams, driver, and
 hardware identity are rechecked before a completed manifest is admitted.
+The MFEM identity must expose a concrete HYPRE MPI/CUDA SM120 spec, its exact
+32-character Spack DAG hash, a hash-bound installation prefix, and the same
+spec/hash pair in the canonical reuse-ABI record. The admitted campaign retains
+that identity explicitly. Any HYPRE source revision or configuration fields
+exposed by the canonical manifest are also retained and must be nonempty. This
+binding is part of the derived GMRES/ILU accounting contract: any exposed
+revision must be an exact commit identity and any exposed SHA-256 must be
+complete. A version label such as `develop` without the exact DAG identity is
+insufficient.
 
 `status=completed` means that the declared run finished; it is not the
 performance disposition. The saturated promotion gate is positive only when
@@ -415,7 +537,7 @@ selected wins cannot suppress regressions or indeterminate cells.
 Accepted-step attribution must separate at least:
 
 - residual/Jacobian assembly;
-- local factorization/algebra and condensation;
+- the fused local factorization/algebra/condensation kernel category;
 - true-trace assembly and solve;
 - recovery;
 - reductions and validation;
@@ -441,11 +563,18 @@ the outer profiled-accepted-step NVTX range, duration-only metric, no kernel
 filter, and a positive launch limit. It imports the native raw table, requires
 the material HDG categories and positive tensor-condensation work, and retains
 category/kernel totals plus the tensor kernel's fraction of captured GPU
-kernel duration. The latter excludes host/MPI, CUDA-API, and memcpy time and is
-not DMMA proof, so both NCU kinds are required. The Nsys qualification route
-validates the same exact tensor accepted-step application arguments, identities,
-and native report but does not semantically validate an Nsys statistics table.
-Smoke-mode completion has none of these qualification meanings.
+kernel duration. The local pivoted LU, triangular solves, and Schur/RHS product
+execute in one production kernel and therefore remain one fused attribution
+category; the native kernel table and DMMA proof quantify that category without
+pretending an artificial kernel boundary exists. The captured fraction excludes
+host/MPI, CUDA-API, and memcpy time and is not DMMA proof, so both NCU kinds are
+required. The Nsys qualification route validates the same exact tensor
+accepted-step application arguments, identities, and native report, then
+generates and hash-binds separate `nvtx_sum`, `cuda_api_sum`,
+`cuda_gpu_mem_time_sum`, and `cuda_gpu_mem_size_sum` CSV tables. It requires
+nonempty native-tool output but does not turn those descriptive tables into an
+unjustified numerical pass gate. Smoke-mode completion has none of these
+qualification meanings.
 
 The content-addressed profiler bundle retains these exact derivatives:
 
@@ -480,12 +609,18 @@ the default regardless of selected tensor wins.
 - Tensor instructions accelerate the local condensation product only. The
   existing residual/Jacobian assembly, global trace operations, recovery, and
   acceptance gates remain ordinary FP64 CUDA kernels.
-- HYPRE diagonal scaling in tensor mode is an independent algorithmic effect;
-  end-to-end speedup is attributed separately from the MMA kernel. Ordinary
-  CUDA retains ILU0 as both the same-tree and historical control policy.
-- Preliminary profiling identified residual/Jacobian assembly as the dominant
-  accepted-step hotspot. That observation motivates whole-step attribution but
-  is not final-candidate performance evidence.
+- HYPRE diagonal scaling in tensor-conventional mode is an independent
+  algorithmic effect and its work is reported separately from MMA. Tensor IGR
+  matches ordinary IGR's type-0, fill-0, RCM, one-application `hypre_ilu0`
+  base configuration but uses five-per-side iterative Jacobi instead of direct
+  factor solves and a different, explicitly counted factor lifetime. Any IGR
+  end-to-end effect from iterative triangular solves or within-attempt factor
+  reuse is therefore disclosed separately from tensor-condensation MMA
+  attribution. The rejected three-per-side and unsupported fill-level-1 tuning paths are not
+  part of the production engine, and neither may silently fall back.
+- Preliminary external profiling identified sparse direct triangular solve as
+  the dominant tensor-IGR accepted-step hotspot. That observation motivated the
+  fixed iterative policy but is not final-candidate performance evidence.
 - p1-p3 all use zero-filled 8-by-8/inner-dimension tails. Tile utilization and
   fixed launch costs are therefore degree- and size-dependent; the mesh-4
   campaign defines the disclosed break-even region, including small IGR

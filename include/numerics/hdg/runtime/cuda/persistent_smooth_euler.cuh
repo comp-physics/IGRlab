@@ -2,11 +2,15 @@
 
 /**
  * @file numerics/hdg/runtime/cuda/persistent_smooth_euler.cuh
- * @brief Persistent conventional smooth-Euler CUDA smoke/functional engine.
+ * @brief Persistent general Euler HDG CUDA leaf for conventional and IGR modes.
  *
  * Numerical provenance: the pointwise Euler flux/source, W7 weak signs,
- * A/B/C/D condensation, HypreGMRES+HypreILU(0), and recovery equations are a
- * minimal port of accepted W7 commit ac271a038c9d26648fce8f2ebf6afb0113a92495.
+ * A/B/C/D condensation, trace solve, and recovery equations are a minimal port
+ * of accepted W7 commit ac271a038c9d26648fce8f2ebf6afb0113a92495.  Ordinary
+ * CUDA and tensor IGR use HypreGMRES+HypreILU(0); tensor IGR refreshes once
+ * at the first trace solve of each attempt and then reuses that exact factor.
+ * Tensor conventional uses HypreGMRES+HypreDiagScale behind the same
+ * lifecycle. Ordinary CUDA refreshes ILU(0) for every trace solve.
  * The W7 monolithic RunSmoothEulerDeviceFullExperiment lifecycle is neither
  * included nor called.  Persistence, contract publication, retry, policies,
  * and exported POD are W8A-owned code.
@@ -995,14 +999,10 @@ public:
                CudaStepEvidence& evidence) noexcept
   {
     evidence = {};
-    evidence.tensor_core.selected_engine = config_.cuda_engine;
-    evidence.tensor_core.hardware_supported =
-        numerics_.TensorCoreHardwareSupported();
-    evidence.tensor_core.trace_preconditioner =
-        numerics_.TracePreconditioner();
-    evidence.tensor_core.trace_preconditioner_configured =
-        numerics_.TracePreconditionerConfigured();
-    if (!initialized_ || pending_.active) { return false; }
+    const bool zero_work_evidence_ready =
+        InitializeZeroWorkTensorCoreEvidence(evidence.tensor_core);
+    if (!zero_work_evidence_ready || !initialized_ || pending_.active)
+      return false;
     evidence.before = contract_->coordinates();
     const StateCoordinates restored_coordinates =
         checkpoint.descriptor.coordinates;
@@ -1676,17 +1676,38 @@ private:
         all_complete == 1 && minimum == maximum;
   }
 
+  bool InitializeZeroWorkTensorCoreEvidence(
+      CudaTensorCoreEvidence& evidence) const noexcept
+  {
+    evidence = {};
+    evidence.selected_engine = config_.cuda_engine;
+    evidence.hardware_supported =
+        numerics_.TensorCoreHardwareSupported();
+    const bool igr_active = config_.use_generic_numerical_policy &&
+        config_.numerical_policy.stabilization.kind ==
+            generic::RegularizationKind::igr;
+    const CudaTracePreconditionerKind selected_preconditioner = initialized_
+        ? numerics_.TracePreconditioner()
+        : CudaTracePreconditionerForEngine(
+              config_.cuda_engine, igr_active);
+    evidence.trace_preconditioner = selected_preconditioner;
+    const bool selected_policy_ready =
+        generic::IsKnownCudaEngineKind(config_.cuda_engine) &&
+        selected_preconditioner == CudaTracePreconditionerForEngine(
+            config_.cuda_engine, igr_active);
+    (void)detail::CudaInitializeIluEvidence(
+        evidence, selected_preconditioner, igr_active);
+    evidence.trace_preconditioner_configured = initialized_ &&
+        numerics_.TracePreconditionerConfigured() && selected_policy_ready;
+    return selected_policy_ready;
+  }
+
   bool PreparePending(const bool retry, const double dt,
                       CudaStepEvidence& evidence) noexcept
   {
     evidence = {};
-    evidence.tensor_core.selected_engine = config_.cuda_engine;
-    evidence.tensor_core.hardware_supported =
-        numerics_.TensorCoreHardwareSupported();
-    evidence.tensor_core.trace_preconditioner =
-        numerics_.TracePreconditioner();
-    evidence.tensor_core.trace_preconditioner_configured =
-        numerics_.TracePreconditionerConfigured();
+    const bool zero_work_evidence_ready =
+        InitializeZeroWorkTensorCoreEvidence(evidence.tensor_core);
     evidence.before = contract_->coordinates();
     CudaPolicyContext context{};
     context.attempt_sequence = ++next_attempt_sequence_;
@@ -1697,7 +1718,8 @@ private:
     pending_.ledger_begin = TransportPolicy::Ledger().observed_count + 1;
     pending_.w8_owned_allocation_begin =
         AllocatorPolicy::W8OwnedAllocationCalls();
-    const bool dt_valid = std::isfinite(dt) && dt > 0.0 &&
+    const bool dt_valid = zero_work_evidence_ready &&
+        std::isfinite(dt) && dt > 0.0 &&
         (config_.use_borrowed_host_inputs ||
          std::memcmp(&dt, &fixed_dt, sizeof(double)) == 0) &&
         (!retry || std::memcmp(&dt, &retained_retry_dt_, sizeof(double)) == 0);
@@ -1712,6 +1734,9 @@ private:
       evidence.after = contract_->coordinates();
       return false;
     }
+    // Every started attempt owns its exact timestep through any retryable
+    // exit, including failures before a candidate can be frozen.
+    retained_retry_dt_ = begin.attempt.dt;
     if (begin.attempt.sequence != context.attempt_sequence)
     {
       return FinishBackendFailure(begin.attempt, evidence,
@@ -1779,7 +1804,6 @@ private:
     pending_.active = true;
     pending_.prestage_allowed = false;
     pending_.attempt = begin.attempt;
-    retained_retry_dt_ = begin.attempt.dt;
     pending_.report = report;
     pending_.bundle = std::move(bundle);
     pending_.numerical = adjusted;

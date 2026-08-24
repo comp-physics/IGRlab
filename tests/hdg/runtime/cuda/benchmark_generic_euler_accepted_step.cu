@@ -193,7 +193,19 @@ using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using dg::hdg::runtime::cuda_w8a::CudaMutableHostL2Output;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
+using dg::hdg::runtime::cuda_w8a::CudaIluAccountingKind;
+using dg::hdg::runtime::cuda_w8a::CudaIluAccountingKindName;
+using dg::hdg::runtime::cuda_w8a::CudaIluApplicationIterations;
+using dg::hdg::runtime::cuda_w8a::CudaIluFactorReusePolicy;
+using dg::hdg::runtime::cuda_w8a::CudaIluFactorReusePolicyForEngine;
+using dg::hdg::runtime::cuda_w8a::CudaIluFactorReusePolicyName;
+using dg::hdg::runtime::cuda_w8a::CudaIluLowerJacobiIterations;
+using dg::hdg::runtime::cuda_w8a::CudaIluTriangularSolveKind;
+using dg::hdg::runtime::cuda_w8a::CudaIluTriangularSolveKindForEngine;
+using dg::hdg::runtime::cuda_w8a::CudaIluTriangularSolveKindName;
+using dg::hdg::runtime::cuda_w8a::CudaIluUpperJacobiIterations;
 using dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerForEngine;
+using dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerIsIlu;
 using dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerName;
 using dg::hdg::runtime::cuda_w8a::CudaTransferTotals;
 using dg::hdg::runtime::cuda_w8a::CudaTransportPolicy;
@@ -703,14 +715,222 @@ std::uint64_t StableFp64Checksum(const std::vector<double>& values) noexcept
   return checksum;
 }
 
+static constexpr bool IluDerivedBoundsAreConsistent(
+    const std::uint64_t callbacks_lower_bound,
+    const std::uint64_t callbacks_upper_bound,
+    const std::uint64_t krylov_restart_dimension,
+    const int configured_iterations,
+    const std::uint64_t inner_iterations_lower_bound,
+    const std::uint64_t inner_iterations_upper_bound,
+    const std::uint64_t factor_spmv_updates_per_application,
+    const std::uint64_t factor_spmv_updates_lower_bound,
+    const std::uint64_t factor_spmv_updates_upper_bound,
+    const int observed_linear_iterations,
+    const int observed_trace_solves) noexcept
+{
+  if (krylov_restart_dimension == 0 || configured_iterations <= 0 ||
+      observed_linear_iterations < 0 || observed_trace_solves < 0 ||
+      callbacks_lower_bound > callbacks_upper_bound)
+    return false;
+  const std::uint64_t iterations =
+      static_cast<std::uint64_t>(observed_linear_iterations);
+  if (iterations == 0)
+  {
+    if (callbacks_lower_bound != 0 || callbacks_upper_bound != 0 ||
+        inner_iterations_lower_bound != 0 ||
+        inner_iterations_upper_bound != 0 ||
+        factor_spmv_updates_lower_bound != 0 ||
+        factor_spmv_updates_upper_bound != 0)
+      return false;
+  }
+  else
+  {
+    if (observed_trace_solves == 0 ||
+        iterations > std::numeric_limits<std::uint64_t>::max()/2 ||
+        callbacks_lower_bound <= iterations ||
+        callbacks_upper_bound != 2*iterations)
+      return false;
+    // The producer derives I_s + ceil(I_s/K) for every successful trace
+    // solve and then accumulates those bounds.  The ceiling is nonadditive,
+    // so validate that the aggregate cycle count is feasible for some
+    // partition of I across at most `observed_trace_solves` positive solves;
+    // retaining that partition would be per-solve history.
+    const std::uint64_t restart_cycles = callbacks_lower_bound-iterations;
+    const std::uint64_t trace_solves =
+        static_cast<std::uint64_t>(observed_trace_solves);
+    const std::uint64_t positive_solves =
+        std::min(trace_solves, std::min(iterations, restart_cycles));
+    if (positive_solves == 0 ||
+        restart_cycles >
+            std::numeric_limits<std::uint64_t>::max()/
+                krylov_restart_dimension)
+      return false;
+    const std::uint64_t maximum_partition_iterations =
+        restart_cycles*krylov_restart_dimension;
+    const std::uint64_t minimum_partition_iterations =
+        (restart_cycles-positive_solves)*krylov_restart_dimension+
+        positive_solves;
+    if (iterations < minimum_partition_iterations ||
+        iterations > maximum_partition_iterations)
+      return false;
+  }
+  const std::uint64_t multiplier =
+      static_cast<std::uint64_t>(configured_iterations);
+  return callbacks_lower_bound <=
+          std::numeric_limits<std::uint64_t>::max()/multiplier &&
+      callbacks_upper_bound <=
+          std::numeric_limits<std::uint64_t>::max()/multiplier &&
+      inner_iterations_lower_bound == callbacks_lower_bound*multiplier &&
+      inner_iterations_upper_bound == callbacks_upper_bound*multiplier &&
+      (factor_spmv_updates_per_application == 0 ||
+       (inner_iterations_lower_bound <=
+            std::numeric_limits<std::uint64_t>::max()/
+                factor_spmv_updates_per_application &&
+        inner_iterations_upper_bound <=
+            std::numeric_limits<std::uint64_t>::max()/
+                factor_spmv_updates_per_application)) &&
+      factor_spmv_updates_lower_bound ==
+          inner_iterations_lower_bound*factor_spmv_updates_per_application &&
+      factor_spmv_updates_upper_bound ==
+          inner_iterations_upper_bound*factor_spmv_updates_per_application;
+}
+
+static_assert(IluDerivedBoundsAreConsistent(
+    0, 0, 20, 1, 0, 0, 0, 0, 0, 0, 1));
+static_assert(IluDerivedBoundsAreConsistent(
+    21, 40, 20, 1, 21, 40, 0, 0, 0, 20, 1));
+static_assert(IluDerivedBoundsAreConsistent(
+    21, 40, 20, 1, 21, 40, 8, 168, 320, 20, 1));
+static_assert(IluDerivedBoundsAreConsistent(
+    23, 42, 20, 2, 46, 84, 8, 368, 672, 21, 1));
+static_assert(IluDerivedBoundsAreConsistent(
+    22, 40, 20, 1, 22, 40, 0, 0, 0, 20, 2));
+static_assert(!IluDerivedBoundsAreConsistent(
+    19, 40, 20, 1, 19, 40, 0, 0, 0, 20, 1));
+static_assert(!IluDerivedBoundsAreConsistent(
+    20, 40, 20, 1, 20, 40, 0, 0, 0, 20, 1));
+static_assert(!IluDerivedBoundsAreConsistent(
+    22, 40, 20, 1, 22, 40, 0, 0, 0, 20, 1));
+static_assert(!IluDerivedBoundsAreConsistent(
+    21, 39, 20, 1, 21, 39, 0, 0, 0, 20, 1));
+static_assert(!IluDerivedBoundsAreConsistent(
+    21, 41, 20, 1, 21, 41, 0, 0, 0, 20, 1));
+static_assert(!IluDerivedBoundsAreConsistent(
+    21, 40, 20, 1, 21, 40, 8, 167, 320, 20, 1));
+static_assert(!IluDerivedBoundsAreConsistent(
+    std::numeric_limits<std::uint64_t>::max()/2+1,
+    std::numeric_limits<std::uint64_t>::max(), 20, 2,
+    0, 0, 0, 0, 0, 1, 1));
+static_assert(!IluDerivedBoundsAreConsistent(
+    1, 2, 20, 0, 0, 0, 0, 0, 0, 1, 1));
+static_assert(!IluDerivedBoundsAreConsistent(
+    1, 2, 0, 1, 1, 2, 0, 0, 0, 1, 1));
+
 bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
-             const CudaEngineKind engine) noexcept
+             const CudaEngineKind engine, const bool igr_active,
+             const std::uint64_t krylov_restart_dimension) noexcept
 {
   const auto& evidence = observation.evidence;
   const auto& tensor = evidence.tensor_core;
+  const auto expected_preconditioner =
+      CudaTracePreconditionerForEngine(engine, igr_active);
+  const bool ilu_policy = CudaTracePreconditionerIsIlu(
+      expected_preconditioner);
+  const auto expected_factor_reuse_policy =
+      CudaIluFactorReusePolicyForEngine(engine, igr_active);
+  const int expected_ilu_iterations = ilu_policy
+      ? CudaIluApplicationIterations(engine, igr_active) : 0;
+  const int expected_ilu_fill = ilu_policy ? 0 : -1;
+  const int expected_ilu_reordering = ilu_policy
+      ? (igr_active ? 1 : 0) : -1;
+  const auto expected_triangular_solve_kind =
+      CudaIluTriangularSolveKindForEngine(engine, igr_active);
+  const int expected_lower_jacobi_iterations =
+      CudaIluLowerJacobiIterations(engine, igr_active);
+  const int expected_upper_jacobi_iterations =
+      CudaIluUpperJacobiIterations(engine, igr_active);
+  const std::uint64_t expected_factor_spmv_updates_per_application =
+      expected_triangular_solve_kind ==
+          CudaIluTriangularSolveKind::iterative_jacobi
+      ? 8 : 0;
+  const std::uint64_t trace_solves = evidence.trace_solves >= 0
+      ? static_cast<std::uint64_t>(evidence.trace_solves) : 0;
+  const bool refresh_each_solve = expected_factor_reuse_policy ==
+      CudaIluFactorReusePolicy::refresh_each_trace_solve;
+  const bool first_solve_per_attempt = expected_factor_reuse_policy ==
+      CudaIluFactorReusePolicy::first_trace_solve_per_attempt;
+  const std::uint64_t expected_setups = refresh_each_solve
+      ? trace_solves : first_solve_per_attempt && trace_solves > 0 ? 1 : 0;
+  const std::uint64_t expected_reuses = first_solve_per_attempt &&
+      trace_solves > 0 ? trace_solves - 1 : 0;
+  const bool ilu_work_consistent = ilu_policy
+      ? evidence.trace_solves >= 0 && evidence.linear_iterations >= 0 &&
+            tensor.ilu_type == 0 &&
+            tensor.ilu_level_of_fill == expected_ilu_fill &&
+            tensor.ilu_local_reordering == expected_ilu_reordering &&
+            tensor.ilu_application_iterations == expected_ilu_iterations &&
+            tensor.ilu_triangular_solve_kind ==
+                expected_triangular_solve_kind &&
+            tensor.ilu_lower_jacobi_iterations ==
+                expected_lower_jacobi_iterations &&
+            tensor.ilu_upper_jacobi_iterations ==
+                expected_upper_jacobi_iterations &&
+            ((expected_triangular_solve_kind ==
+                  CudaIluTriangularSolveKind::direct &&
+              expected_lower_jacobi_iterations == 0 &&
+              expected_upper_jacobi_iterations == 0) ||
+             (expected_triangular_solve_kind ==
+                  CudaIluTriangularSolveKind::iterative_jacobi &&
+              expected_lower_jacobi_iterations == 5 &&
+              expected_upper_jacobi_iterations == 5)) &&
+            tensor.ilu_accounting_kind ==
+                CudaIluAccountingKind::derived_bounds_v1 &&
+            tensor.ilu_factor_reuse_policy ==
+                expected_factor_reuse_policy &&
+            tensor.ilu_accounting_complete &&
+            tensor.ilu_factor_setups == expected_setups &&
+            tensor.ilu_factor_reuses == expected_reuses &&
+            tensor.ilu_factor_setups + tensor.ilu_factor_reuses ==
+                trace_solves &&
+            IluDerivedBoundsAreConsistent(
+                tensor.ilu_preconditioner_callbacks_lower_bound,
+                tensor.ilu_preconditioner_callbacks_upper_bound,
+                krylov_restart_dimension,
+                expected_ilu_iterations,
+                tensor.ilu_inner_iterations_lower_bound,
+                tensor.ilu_inner_iterations_upper_bound,
+                expected_factor_spmv_updates_per_application,
+                tensor.ilu_jacobi_factor_spmv_updates_lower_bound,
+                tensor.ilu_jacobi_factor_spmv_updates_upper_bound,
+                evidence.linear_iterations, evidence.trace_solves) &&
+            tensor.ilu_factor_age_generations == expected_reuses
+      : tensor.ilu_type == -1 && tensor.ilu_level_of_fill == -1 &&
+            tensor.ilu_local_reordering == -1 &&
+            tensor.ilu_application_iterations == 0 &&
+            expected_triangular_solve_kind ==
+                CudaIluTriangularSolveKind::not_applicable &&
+            tensor.ilu_triangular_solve_kind ==
+                expected_triangular_solve_kind &&
+            tensor.ilu_lower_jacobi_iterations == 0 &&
+            tensor.ilu_upper_jacobi_iterations == 0 &&
+            tensor.ilu_accounting_kind ==
+                CudaIluAccountingKind::unavailable &&
+            tensor.ilu_factor_reuse_policy ==
+                CudaIluFactorReusePolicy::not_applicable &&
+            tensor.ilu_factor_setups == 0 &&
+            tensor.ilu_factor_reuses == 0 &&
+            tensor.ilu_preconditioner_callbacks_lower_bound == 0 &&
+            tensor.ilu_preconditioner_callbacks_upper_bound == 0 &&
+            tensor.ilu_inner_iterations_lower_bound == 0 &&
+            tensor.ilu_inner_iterations_upper_bound == 0 &&
+            tensor.ilu_jacobi_factor_spmv_updates_lower_bound == 0 &&
+            tensor.ilu_jacobi_factor_spmv_updates_upper_bound == 0 &&
+            tensor.ilu_factor_age_generations == 0 &&
+            tensor.ilu_accounting_complete;
   const bool expected_engine = tensor.selected_engine == engine &&
       tensor.trace_preconditioner_configured &&
-      tensor.trace_preconditioner == CudaTracePreconditionerForEngine(engine) &&
+      tensor.trace_preconditioner == expected_preconditioner &&
+      ilu_work_consistent &&
       tensor.fallback_count == 0 && tensor.fallback_accounting_complete &&
       evidence.no_fallback &&
       (engine == CudaEngineKind::ordinary
@@ -738,6 +958,8 @@ bool RunStep(GenericEulerHdgCudaSession& session,
              const double timestep,
              const bool export_interior,
              const CudaEngineKind engine,
+             const bool igr_active,
+             const std::uint64_t krylov_restart_dimension,
              const bool warmup, const int measured_index,
              StepSample& sample, std::string& error)
 {
@@ -797,7 +1019,8 @@ bool RunStep(GenericEulerHdgCudaSession& session,
   }
   sample.coordinates = session.coordinates();
   sample.diagnostics = session.diagnostics();
-  if (!Healthy(sample.prepared, engine))
+  if (!Healthy(sample.prepared, engine, igr_active,
+               krylov_restart_dimension))
   {
     error = "accepted-step prepared numerical gates failed";
     return false;
@@ -1016,6 +1239,50 @@ void PrintStep(const StepSample& sample)
             << "\"trace_preconditioner\":\""
             << CudaTracePreconditionerName(
                    evidence.tensor_core.trace_preconditioner) << "\","
+            << "\"ilu_type\":" << evidence.tensor_core.ilu_type << ','
+            << "\"ilu_level_of_fill\":"
+            << evidence.tensor_core.ilu_level_of_fill << ','
+            << "\"ilu_local_reordering\":"
+            << evidence.tensor_core.ilu_local_reordering << ','
+            << "\"ilu_application_iterations\":"
+            << evidence.tensor_core.ilu_application_iterations << ','
+            << "\"ilu_triangular_solve_kind\":\""
+            << CudaIluTriangularSolveKindName(
+                   evidence.tensor_core.ilu_triangular_solve_kind) << "\","
+            << "\"ilu_lower_jacobi_iterations\":"
+            << evidence.tensor_core.ilu_lower_jacobi_iterations << ','
+            << "\"ilu_upper_jacobi_iterations\":"
+            << evidence.tensor_core.ilu_upper_jacobi_iterations << ','
+            << "\"ilu_accounting_kind\":\""
+            << CudaIluAccountingKindName(
+                   evidence.tensor_core.ilu_accounting_kind) << "\","
+            << "\"ilu_factor_reuse_policy\":\""
+            << CudaIluFactorReusePolicyName(
+                   evidence.tensor_core.ilu_factor_reuse_policy) << "\","
+            << "\"ilu_factor_setups\":"
+            << evidence.tensor_core.ilu_factor_setups << ','
+            << "\"ilu_factor_reuses\":"
+            << evidence.tensor_core.ilu_factor_reuses << ','
+            << "\"ilu_preconditioner_callbacks_lower_bound\":"
+            << evidence.tensor_core.
+                   ilu_preconditioner_callbacks_lower_bound << ','
+            << "\"ilu_preconditioner_callbacks_upper_bound\":"
+            << evidence.tensor_core.
+                   ilu_preconditioner_callbacks_upper_bound << ','
+            << "\"ilu_inner_iterations_lower_bound\":"
+            << evidence.tensor_core.ilu_inner_iterations_lower_bound << ','
+            << "\"ilu_inner_iterations_upper_bound\":"
+            << evidence.tensor_core.ilu_inner_iterations_upper_bound << ','
+            << "\"ilu_jacobi_factor_spmv_updates_lower_bound\":"
+            << evidence.tensor_core.
+                   ilu_jacobi_factor_spmv_updates_lower_bound << ','
+            << "\"ilu_jacobi_factor_spmv_updates_upper_bound\":"
+            << evidence.tensor_core.
+                   ilu_jacobi_factor_spmv_updates_upper_bound << ','
+            << "\"ilu_factor_age_generations\":"
+            << evidence.tensor_core.ilu_factor_age_generations << ','
+            << "\"ilu_accounting_complete\":" << std::boolalpha
+            << evidence.tensor_core.ilu_accounting_complete << ','
             << "\"trace_preconditioner_configured\":" << std::boolalpha
             << evidence.tensor_core.trace_preconditioner_configured << ','
             << "\"hardware_supported\":" << std::boolalpha
@@ -1147,6 +1414,15 @@ int RunBenchmark(const Options& options)
                  "\"error\":\"CUDA problem metadata validation failed\"}\n";
     return 1;
   }
+  const int krylov_restart_dimension =
+      dg::hdg::generic::EulerHdgKrylovRestartDimension(
+          problem.global_true_trace_unknowns);
+  if (krylov_restart_dimension <= 0)
+  {
+    std::cerr << "{\"schema\":2,\"success\":false,"
+                 "\"error\":\"invalid Krylov restart dimension\"}\n";
+    return 1;
+  }
 
   std::vector<double> exported_interior(
       options.export_interior ? fields.initial.size() : 0, 0.0);
@@ -1161,7 +1437,9 @@ int RunBenchmark(const Options& options)
     const auto run_step = [&]()
     {
       return RunStep(session, fields, exported_interior, options.timestep,
-                     options.export_interior, options.engine, warmup,
+                     options.export_interior, options.engine,
+                     options.regularization == RegularizationKind::igr,
+                     static_cast<std::uint64_t>(krylov_restart_dimension), warmup,
                      measured_index,
                      samples[static_cast<std::size_t>(index)], error);
     };
@@ -1211,6 +1489,9 @@ int RunBenchmark(const Options& options)
   const DeviceMemorySnapshot memory_after_samples = CaptureDeviceMemory();
   const UmpireHighWatermarkSnapshot umpire_high_watermarks =
       CaptureUmpireHighWatermarks();
+  const auto& reported_trace_policy =
+      samples[static_cast<std::size_t>(warmup_steps)]
+          .prepared.evidence.tensor_core;
 
   std::cout << std::setprecision(17)
             << "{\"schema\":2,"
@@ -1221,9 +1502,28 @@ int RunBenchmark(const Options& options)
             << "\","
             << "\"trace_preconditioner\":\""
             << CudaTracePreconditionerName(
-                   samples[static_cast<std::size_t>(warmup_steps)]
-                       .prepared.evidence.tensor_core.trace_preconditioner)
+                   reported_trace_policy.trace_preconditioner)
             << "\","
+            << "\"trace_ilu_type\":" << reported_trace_policy.ilu_type
+            << ",\"trace_ilu_level_of_fill\":"
+            << reported_trace_policy.ilu_level_of_fill
+            << ",\"trace_ilu_local_reordering\":"
+            << reported_trace_policy.ilu_local_reordering
+            << ",\"trace_ilu_application_iterations\":"
+            << reported_trace_policy.ilu_application_iterations
+            << ",\"trace_ilu_triangular_solve_kind\":\""
+            << CudaIluTriangularSolveKindName(
+                   reported_trace_policy.ilu_triangular_solve_kind) << "\","
+            << "\"trace_ilu_lower_jacobi_iterations\":"
+            << reported_trace_policy.ilu_lower_jacobi_iterations
+            << ",\"trace_ilu_upper_jacobi_iterations\":"
+            << reported_trace_policy.ilu_upper_jacobi_iterations
+            << ",\"trace_ilu_accounting_kind\":\""
+            << CudaIluAccountingKindName(
+                   reported_trace_policy.ilu_accounting_kind) << "\","
+            << "\"trace_ilu_factor_reuse_policy\":\""
+            << CudaIluFactorReusePolicyName(
+                   reported_trace_policy.ilu_factor_reuse_policy) << "\","
             << "\"mode\":\""
             << (options.regularization == RegularizationKind::igr
                     ? "igr" : "conventional") << "\","
@@ -1301,8 +1601,7 @@ int RunBenchmark(const Options& options)
                    request.numerical_policy.maximum_linear_iterations,
                    problem.global_true_trace_unknowns)
             << ",\"krylov_restart_dimension\":"
-            << dg::hdg::generic::EulerHdgKrylovRestartDimension(
-                   problem.global_true_trace_unknowns)
+            << krylov_restart_dimension
             << ",\"maximum_line_search_trials\":"
             << request.numerical_policy.maximum_line_search_trials
             << ",\"nonlinear_relative_tolerance\":"

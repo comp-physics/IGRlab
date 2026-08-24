@@ -40,6 +40,112 @@ struct CpuQualificationTestAccess
 namespace dg::hdg::runtime::cuda_w8a::detail
 {
 
+constexpr bool CudaPreparedIluAccountingValid(
+    const CudaTensorCoreEvidence& tensor, const int trace_solves,
+    const int linear_iterations, const generic::CudaEngineKind engine,
+    const bool igr_active) noexcept
+{
+  const auto preconditioner =
+      CudaTracePreconditionerForEngine(engine, igr_active);
+  const bool ilu = CudaTracePreconditionerIsIlu(preconditioner);
+  const auto factor_reuse_policy =
+      CudaIluFactorReusePolicyForEngine(engine, igr_active);
+  const auto triangular_solve_kind =
+      CudaIluTriangularSolveKindForEngine(engine, igr_active);
+  const int lower_jacobi_iterations =
+      CudaIluLowerJacobiIterations(engine, igr_active);
+  const int upper_jacobi_iterations =
+      CudaIluUpperJacobiIterations(engine, igr_active);
+  if (!ilu)
+    return preconditioner == CudaTracePreconditionerKind::hypre_diag_scale &&
+        tensor.ilu_type == -1 && tensor.ilu_level_of_fill == -1 &&
+        tensor.ilu_local_reordering == -1 &&
+        tensor.ilu_application_iterations == 0 &&
+        triangular_solve_kind ==
+            CudaIluTriangularSolveKind::not_applicable &&
+        tensor.ilu_triangular_solve_kind == triangular_solve_kind &&
+        tensor.ilu_lower_jacobi_iterations == 0 &&
+        tensor.ilu_upper_jacobi_iterations == 0 &&
+        tensor.ilu_accounting_kind == CudaIluAccountingKind::unavailable &&
+        factor_reuse_policy == CudaIluFactorReusePolicy::not_applicable &&
+        tensor.ilu_factor_reuse_policy == factor_reuse_policy &&
+        tensor.ilu_factor_setups == 0 &&
+        tensor.ilu_factor_reuses == 0 &&
+        tensor.ilu_preconditioner_callbacks_lower_bound == 0 &&
+        tensor.ilu_preconditioner_callbacks_upper_bound == 0 &&
+        tensor.ilu_inner_iterations_lower_bound == 0 &&
+        tensor.ilu_inner_iterations_upper_bound == 0 &&
+        tensor.ilu_jacobi_factor_spmv_updates_lower_bound == 0 &&
+        tensor.ilu_jacobi_factor_spmv_updates_upper_bound == 0 &&
+        tensor.ilu_factor_age_generations == 0 &&
+        tensor.ilu_accounting_complete;
+  const int expected_fill = 0;
+  const int expected_reordering = igr_active ? 1 : 0;
+  if (trace_solves <= 0 || linear_iterations < 0 || tensor.ilu_type != 0 ||
+      tensor.ilu_level_of_fill != expected_fill ||
+      tensor.ilu_local_reordering != expected_reordering ||
+      tensor.ilu_application_iterations != 1 ||
+      tensor.ilu_triangular_solve_kind != triangular_solve_kind ||
+      tensor.ilu_lower_jacobi_iterations != lower_jacobi_iterations ||
+      tensor.ilu_upper_jacobi_iterations != upper_jacobi_iterations ||
+      (triangular_solve_kind == CudaIluTriangularSolveKind::direct &&
+       (lower_jacobi_iterations != 0 || upper_jacobi_iterations != 0)) ||
+      (triangular_solve_kind ==
+           CudaIluTriangularSolveKind::iterative_jacobi &&
+       (lower_jacobi_iterations != 5 || upper_jacobi_iterations != 5)) ||
+      tensor.ilu_accounting_kind !=
+          CudaIluAccountingKind::derived_bounds_v1 ||
+      !tensor.ilu_accounting_complete ||
+      tensor.ilu_preconditioner_callbacks_lower_bound >
+          tensor.ilu_preconditioner_callbacks_upper_bound)
+    return false;
+  const std::uint64_t solves = static_cast<std::uint64_t>(trace_solves);
+  const bool factor_work = factor_reuse_policy ==
+          CudaIluFactorReusePolicy::refresh_each_trace_solve
+      ? tensor.ilu_factor_reuse_policy == factor_reuse_policy &&
+            tensor.ilu_factor_setups == solves &&
+            tensor.ilu_factor_reuses == 0 &&
+            tensor.ilu_factor_age_generations == 0
+      : factor_reuse_policy ==
+              CudaIluFactorReusePolicy::first_trace_solve_per_attempt &&
+            tensor.ilu_factor_reuse_policy == factor_reuse_policy &&
+            tensor.ilu_factor_setups == 1 &&
+            tensor.ilu_factor_reuses == solves - 1 &&
+            tensor.ilu_factor_age_generations == solves - 1;
+  if (!factor_work) return false;
+  const std::uint64_t iterations =
+      static_cast<std::uint64_t>(linear_iterations);
+  const std::uint64_t lower =
+      tensor.ilu_preconditioner_callbacks_lower_bound;
+  const std::uint64_t upper =
+      tensor.ilu_preconditioner_callbacks_upper_bound;
+  const bool callback_bounds = iterations == 0
+      ? lower == 0 && upper == 0
+      : iterations <= std::numeric_limits<std::uint64_t>::max()/2 &&
+            iterations < lower && upper == 2*iterations;
+  const std::uint64_t multiplier = static_cast<std::uint64_t>(
+      tensor.ilu_application_iterations);
+  const std::uint64_t factor_spmv_multiplier =
+      triangular_solve_kind == CudaIluTriangularSolveKind::iterative_jacobi
+      ? 8 : 0;
+  return callback_bounds &&
+      lower <= std::numeric_limits<std::uint64_t>::max()/multiplier &&
+      upper <= std::numeric_limits<std::uint64_t>::max()/multiplier &&
+      tensor.ilu_inner_iterations_lower_bound == lower*multiplier &&
+      tensor.ilu_inner_iterations_upper_bound == upper*multiplier &&
+      (factor_spmv_multiplier == 0 ||
+       (tensor.ilu_inner_iterations_lower_bound <=
+            std::numeric_limits<std::uint64_t>::max()/
+                factor_spmv_multiplier &&
+        tensor.ilu_inner_iterations_upper_bound <=
+            std::numeric_limits<std::uint64_t>::max()/
+                factor_spmv_multiplier)) &&
+      tensor.ilu_jacobi_factor_spmv_updates_lower_bound ==
+          tensor.ilu_inner_iterations_lower_bound*factor_spmv_multiplier &&
+      tensor.ilu_jacobi_factor_spmv_updates_upper_bound ==
+          tensor.ilu_inner_iterations_upper_bound*factor_spmv_multiplier;
+}
+
 struct CrossBackendPreparedHealth
 {
   double initial_residual = std::numeric_limits<double>::infinity();
@@ -822,7 +928,13 @@ Trajectory RunCuda(const EulerHdgRequest& request,
         health.tensor_core.trace_preconditioner_configured &&
         health.tensor_core.trace_preconditioner ==
             dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerForEngine(
-                request.backend.cuda_engine) &&
+                request.backend.cuda_engine,
+                specification.regularization == RegularizationKind::igr) &&
+        dg::hdg::runtime::cuda_w8a::detail::
+            CudaPreparedIluAccountingValid(
+                health.tensor_core, health.trace_solves,
+                health.linear_iterations, request.backend.cuda_engine,
+                specification.regularization == RegularizationKind::igr) &&
         health.tensor_core.fallback_count == 0 && health.no_fallback &&
         (request.backend.cuda_engine == CudaEngineKind::ordinary
              ? health.tensor_core.condensation_launches == 0 &&

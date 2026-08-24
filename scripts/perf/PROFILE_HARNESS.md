@@ -104,8 +104,10 @@ GPU-duration values for every launch.
 accepted-step view. Its only metric is `gpu__time_duration.avg`; it forbids a
 kernel filter; and its only NVTX include is
 `HDG\/profiled-accepted-step/`. The imported raw table must expose one
-unambiguous NVTX push/pop column, nanosecond durations, and between one and the
-declared launch-limit rows, all inside that outer range. It requires positive
+unambiguous NVTX push/pop column, nanosecond durations, and at least one row but
+strictly fewer rows than the declared launch limit, all inside that outer
+range. Reaching the limit is treated as possible truncation, not a complete
+capture. It requires positive
 material rows for local assembly, condensation, trace assembly, trace solve,
 interior recovery, reductions, validation, packing/conversion, and nonlinear
 update, plus a positive `TensorBorrowedCondenseKernel` row. The manifest retains
@@ -177,11 +179,15 @@ Nsys qualification uses the same exact source/build/MFEM/tool/GPU binding and
 requires a native `capture.nsys-rep`. It also requires the same production
 accepted-step benchmark and exact tensor/no-export mode, order, mesh,
 timestep, profiled step, source, and build application arguments as NCU
-qualification. The caller still selects `--nsys-trace`, `--nsys-sample`, and
-any `cudaProfilerApi` or NVTX capture trigger explicitly. The harness does not
-import or semantically validate an Nsys statistics table. Any derived NVTX or
-CUDA-API table therefore needs its own retained extraction command and
-integrity record.
+qualification. Qualification fixes exactly `--nsys-trace cuda,nvtx`,
+`--nsys-sample none`, `--nsys-capture-range cudaProfilerApi`, and
+`--nsys-capture-range-end stop`, so the native report is scoped to the selected
+accepted step. From that native report the harness force-exports and hash-binds
+separate `nvtx_sum`, `cuda_api_sum`, `cuda_gpu_mem_time_sum`, and
+`cuda_gpu_mem_size_sum` CSV tables, their stderr files, and every extraction
+command. Nonempty native-tool output and unchanged identities are required;
+the descriptive tables are not reinterpreted as a tensor-instruction or
+numerical-acceptance proof.
 
 On the authorized WSL path, Nsys is useful for host, NVTX, CUDA API, and
 transfer structure but does not provide a usable GPU-kernel timeline. NCU is

@@ -36,6 +36,12 @@ RESERVED_ARTIFACTS = frozenset({
     "ncu-tensor-proof.csv", "ncu-tensor-proof.stderr.txt",
     "ncu-accepted-step-attribution.csv",
     "ncu-accepted-step-attribution.stderr.txt",
+    "nsys-nvtx-sum.csv", "nsys-nvtx-sum.stderr.txt",
+    "nsys-cuda-api-sum.csv", "nsys-cuda-api-sum.stderr.txt",
+    "nsys-cuda-gpu-mem-time-sum.csv",
+    "nsys-cuda-gpu-mem-time-sum.stderr.txt",
+    "nsys-cuda-gpu-mem-size-sum.csv",
+    "nsys-cuda-gpu-mem-size-sum.stderr.txt",
 })
 EXIT_VALIDATION_FAILURE = 6
 NCU_DMMA_METRIC = "sm__inst_executed_pipe_fp64_op_dmma.sum"
@@ -65,6 +71,12 @@ NCU_REQUIRED_ATTRIBUTION_CATEGORIES = frozenset({
 })
 NCU_REPORT = Path("capture.ncu-rep")
 NSYS_REPORT = Path("capture.nsys-rep")
+NSYS_QUALIFICATION_SUMMARIES = (
+    ("nvtx_sum", "nsys-nvtx-sum"),
+    ("cuda_api_sum", "nsys-cuda-api-sum"),
+    ("cuda_gpu_mem_time_sum", "nsys-cuda-gpu-mem-time-sum"),
+    ("cuda_gpu_mem_size_sum", "nsys-cuda-gpu-mem-size-sum"),
+)
 
 
 def safe_relative_path(value: str) -> Path:
@@ -883,6 +895,20 @@ def validate_inputs(parser: argparse.ArgumentParser, args: argparse.Namespace) -
         validate_ncu_qualification_inputs(parser, args)
     if args.evidence_mode == "qualification" and args.level == "l2-nsys":
         validate_accepted_step_qualification_application(parser, args)
+        trace_apis = {item.strip() for item in args.nsys_trace.split(",")}
+        if trace_apis != {"cuda", "nvtx"}:
+            parser.error(
+                "Nsys qualification requires exactly CUDA and NVTX tracing"
+            )
+        if args.nsys_sample != "none":
+            parser.error("Nsys qualification requires --nsys-sample none")
+        if args.nsys_capture_range != "cudaProfilerApi" or \
+                args.nsys_capture_range_end != "stop" or \
+                args.nsys_nvtx_capture:
+            parser.error(
+                "Nsys qualification requires accepted-step cudaProfilerApi "
+                "capture with range-end stop"
+            )
 
 
 def build_command(args: argparse.Namespace, tool: str | None) -> list[str]:
@@ -1249,10 +1275,14 @@ def parse_ncu_attribution_csv(data: bytes,
             "NCU attribution contains launch data outside the exact accepted-step "
             "NVTX selection: " + ", ".join(outside_ranges[:3])
         )
-    if launches <= 0 or launches > launch_limit:
+    # A launch limit is a profiler stop condition, not merely an upper bound.
+    # Equality cannot distinguish a complete accepted-step capture from a
+    # capture truncated at the declared cap, so qualification fails closed.
+    if launches <= 0 or launches >= launch_limit:
         raise RuntimeError(
-            f"NCU attribution contains {launches} launches; expected 1 through "
-            f"the declared capture limit {launch_limit}"
+            f"NCU attribution contains {launches} launches; expected at least "
+            f"one and strictly fewer than the declared capture limit "
+            f"{launch_limit}"
         )
     missing_categories = sorted(
         category for category in NCU_REQUIRED_ATTRIBUTION_CATEGORIES
@@ -1340,6 +1370,56 @@ def import_ncu_attribution(args: argparse.Namespace, tool: str) -> tuple[
     return attribution, artifacts, {path: command for path in artifacts}
 
 
+def import_nsys_summaries(args: argparse.Namespace, tool: str) -> tuple[
+        dict[str, Any], list[Path], dict[Path, list[str]]]:
+    """Derive bounded, static tables from the already captured native report.
+
+    These files are profiler-report summaries, not application instrumentation:
+    no callback, event stream, or production recorder is installed.
+    """
+    report = args.out_dir / NSYS_REPORT
+    summaries: dict[str, Any] = {}
+    artifacts: list[Path] = []
+    artifact_commands: dict[Path, list[str]] = {}
+    for report_name, artifact_stem in NSYS_QUALIFICATION_SUMMARIES:
+        csv_path = args.out_dir / f"{artifact_stem}.csv"
+        stderr_path = args.out_dir / f"{artifact_stem}.stderr.txt"
+        command = [
+            tool, "stats", "--report", report_name,
+            "--format", "csv", "--output", "-",
+            "--force-export", "true", str(report),
+        ]
+        try:
+            with open_exclusive_binary(csv_path) as stdout_stream, \
+                    open_exclusive_binary(stderr_path) as stderr_stream:
+                result = subprocess.run(
+                    command, cwd=args.out_dir, stdout=stdout_stream,
+                    stderr=stderr_stream,
+                )
+        except OSError as exc:
+            raise RuntimeError(
+                f"could not generate Nsys {report_name} summary: {exc}"
+            ) from exc
+        if result.returncode:
+            raise RuntimeError(
+                f"Nsys {report_name} summary exited {result.returncode}"
+            )
+        csv_data = regular_bytes(csv_path, args.out_dir)
+        if not csv_data.strip():
+            raise RuntimeError(f"Nsys {report_name} summary is empty")
+        summaries[report_name] = {
+            "status": "generated_from_native_report",
+            "command": command,
+            "report": file_identity(report),
+            "csv": file_identity(csv_path),
+            "stderr": file_identity(stderr_path),
+        }
+        artifacts.extend((csv_path, stderr_path))
+        artifact_commands[csv_path] = command
+        artifact_commands[stderr_path] = command
+    return summaries, artifacts, artifact_commands
+
+
 def qualification_evidence_unchanged(args: argparse.Namespace,
                                      qualification: dict[str, Any] | None
                                      ) -> tuple[bool, str]:
@@ -1361,6 +1441,21 @@ def qualification_evidence_unchanged(args: argparse.Namespace,
                 if not isinstance(identity, dict) or \
                         file_identity(Path(identity.get("path", ""))) != identity:
                     return False, f"NCU {proof_name} {key} changed after validation"
+        elif args.level == "l2-nsys":
+            summaries = qualification.get("nsys_summaries", {})
+            if set(summaries) != {
+                    report for report, _ in NSYS_QUALIFICATION_SUMMARIES}:
+                return False, "Nsys qualification summary set is incomplete"
+            for report_name, summary in summaries.items():
+                for key in ("report", "csv", "stderr"):
+                    identity = summary.get(key)
+                    if not isinstance(identity, dict) or \
+                            file_identity(
+                                Path(identity.get("path", ""))
+                            ) != identity:
+                        return False, (
+                            f"Nsys {report_name} {key} changed after validation"
+                        )
     except (OSError, RuntimeError, ValueError) as exc:
         return False, f"could not revalidate qualification evidence: {exc}"
     return True, ""
@@ -1584,8 +1679,21 @@ def main() -> int:
                                     "condensation fraction"
                                 )
                         else:
-                            qualification["status"] = "success"
-                            detail = "qualified native Nsight Systems report"
+                            assert tool is not None
+                            summaries, summary_paths, summary_commands = \
+                                import_nsys_summaries(args, tool)
+                            artifacts.extend(summary_paths)
+                            artifact_commands.update(summary_commands)
+                            qualification = {
+                                "status": "success",
+                                "native_report": native_report,
+                                "nsys_summaries": summaries,
+                            }
+                            detail = (
+                                "qualified native Nsight Systems report with "
+                                "hashed NVTX, CUDA API, and GPU memory-operation "
+                                "summaries"
+                            )
                     except (OSError, RuntimeError, ValueError) as exc:
                         outcome, detail, exit_code = (
                             "validation_failure",
