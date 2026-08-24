@@ -4466,9 +4466,49 @@ __global__ void EulerConservationReduceKernel(
     out[2 * components + 1] = final_valid ? 1.0 : 0.0;
   }
 }
+__device__ __forceinline__ std::uint64_t HashDoubleWordLane(
+    std::uint64_t hash,const double value,const unsigned int lane_bias,
+    const std::uint64_t prime)
+{
+  // CUDA global-memory double words are naturally eight-byte aligned and
+  // little endian.  __double_as_longlong is a bit cast, so signed zero and
+  // every NaN payload retain the exact bytes consumed by the former byte load.
+  const std::uint64_t word=static_cast<std::uint64_t>(
+      __double_as_longlong(value));
+#pragma unroll
+  for(int byte=0;byte<static_cast<int>(sizeof(double));++byte)
+  {
+    const unsigned int current=static_cast<unsigned int>(
+        (word>>(8*byte))&0xffULL);
+    hash^=static_cast<std::uint64_t>(current+lane_bias);
+    hash*=prime;
+  }
+  return hash;
+}
 __device__ std::uint64_t HashBytesLane(const double* values,const int count,
                                       const int lane)
-{const std::uint64_t seeds[4]={1469598103934665603ULL,1099511628211ULL^0x9e3779b97f4a7c15ULL,1469598103934665603ULL^0xd6e8feb86659fd93ULL,1099511628211ULL^0xa0761d6478bd642fULL};std::uint64_t h=seeds[lane];const unsigned char* bytes=reinterpret_cast<const unsigned char*>(values);for(int i=0;i<count*static_cast<int>(sizeof(double));++i){h^=static_cast<std::uint64_t>(bytes[i]+17U*lane);h*=1099511628211ULL+2ULL*lane;}return h;}
+{
+  const std::uint64_t seeds[4]={
+      1469598103934665603ULL,
+      1099511628211ULL^0x9e3779b97f4a7c15ULL,
+      1469598103934665603ULL^0xd6e8feb86659fd93ULL,
+      1099511628211ULL^0xa0761d6478bd642fULL};
+  std::uint64_t hash=seeds[lane];
+  const unsigned int lane_bias=17U*static_cast<unsigned int>(lane);
+  const std::uint64_t prime=1099511628211ULL+2ULL*lane;
+  const int grouped_count=count>0?count-count%4:0;
+  int word=0;
+  for(;word<grouped_count;word+=4)
+  {
+    hash=HashDoubleWordLane(hash,values[word],lane_bias,prime);
+    hash=HashDoubleWordLane(hash,values[word+1],lane_bias,prime);
+    hash=HashDoubleWordLane(hash,values[word+2],lane_bias,prime);
+    hash=HashDoubleWordLane(hash,values[word+3],lane_bias,prime);
+  }
+  for(;word<count;++word)
+    hash=HashDoubleWordLane(hash,values[word],lane_bias,prime);
+  return hash;
+}
 __global__ void HashKernel(const double* values,int count,std::uint64_t* out)
 {const int lane=threadIdx.x;if(blockIdx.x||lane>=4)return;out[lane]=HashBytesLane(values,count,lane);}
 __global__ void HashPairKernel(const double* first,int first_count,

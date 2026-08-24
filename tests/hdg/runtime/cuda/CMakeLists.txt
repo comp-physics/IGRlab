@@ -29,6 +29,41 @@ set_target_properties(dg_igr_hdg_runtime_cuda_w8a_leaf
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
+add_executable(dg_igr_hdg_runtime_cuda_hash_exact
+  test_hash_exact.cu)
+target_include_directories(dg_igr_hdg_runtime_cuda_hash_exact
+  PRIVATE
+    "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_hdg_runtime_cuda_hash_exact
+  PRIVATE
+    dg_igr_hdg_runtime_cuda
+    mfem
+    MPI::MPI_CXX)
+target_compile_options(dg_igr_hdg_runtime_cuda_hash_exact
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+set_target_properties(dg_igr_hdg_runtime_cuda_hash_exact
+  PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_EXTENSIONS OFF
+    CUDA_ARCHITECTURES 120
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_hash_exact
+  COMMAND dg_igr_hdg_runtime_cuda_hash_exact)
+set_tests_properties(dg_igr_hdg_runtime_cuda_hash_exact
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;hash;exact"
+    PROCESSORS 1
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 300)
+
 add_executable(dg_igr_hdg_runtime_cuda_generic_external_topology
   test_generic_external_topology.cu)
 target_include_directories(dg_igr_hdg_runtime_cuda_generic_external_topology
