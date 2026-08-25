@@ -23,6 +23,7 @@ inline constexpr std::uint32_t failure_invalid_workspace = 1U << 3;
 inline constexpr std::uint32_t failure_nonfinite = 1U << 4;
 inline constexpr std::uint32_t failure_invalid_permutation = 1U << 5;
 inline constexpr std::uint32_t failure_numerical_breakdown = 1U << 6;
+inline constexpr int native_trace_projection_tile = 8;
 
 bool CheckedAdd(const std::size_t left, const std::size_t right,
                 std::size_t& result) noexcept
@@ -285,6 +286,134 @@ __device__ void AxpyVector(double* destination, const double scale,
   grid.sync();
 }
 
+__device__ void GridBasisDotTile(
+    const double* basis, const double* values, const int size,
+    const int basis_begin, const int basis_count, double* coefficients,
+    const NativeTraceWorkspaceView workspace,
+    NativeTraceSolveControl* control, const cg::grid_group& grid,
+    double* block_scratch) noexcept
+{
+  double local[native_trace_projection_tile] = {};
+  const int thread = GlobalThreadIndex();
+  const int stride = GlobalThreadStride();
+  for (int index = thread; index < size; index += stride)
+  {
+    const double value = values[index];
+#pragma unroll
+    for (int offset = 0; offset < native_trace_projection_tile; ++offset)
+      if (offset < basis_count)
+        local[offset] += basis[
+            static_cast<std::size_t>(basis_begin + offset) * size + index] *
+            value;
+  }
+
+  for (int offset = 0; offset < basis_count; ++offset)
+  {
+    block_scratch[threadIdx.x] = local[offset];
+    __syncthreads();
+    for (int reduction_offset = native_trace_cooperative_threads / 2;
+         reduction_offset > 0; reduction_offset /= 2)
+    {
+      if (static_cast<int>(threadIdx.x) < reduction_offset)
+        block_scratch[threadIdx.x] +=
+            block_scratch[threadIdx.x + reduction_offset];
+      __syncthreads();
+    }
+    if (threadIdx.x == 0)
+      workspace.reduction[
+          static_cast<std::size_t>(offset) * gridDim.x + blockIdx.x] =
+          block_scratch[0];
+    __syncthreads();
+  }
+  grid.sync();
+
+  if (blockIdx.x == 0)
+  {
+    for (int offset = 0; offset < basis_count; ++offset)
+    {
+      double block_total = 0.0;
+      for (int block = static_cast<int>(threadIdx.x);
+           block < static_cast<int>(gridDim.x);
+           block += native_trace_cooperative_threads)
+        block_total += workspace.reduction[
+            static_cast<std::size_t>(offset) * gridDim.x + block];
+      block_scratch[threadIdx.x] = block_total;
+      __syncthreads();
+      for (int reduction_offset = native_trace_cooperative_threads / 2;
+           reduction_offset > 0; reduction_offset /= 2)
+      {
+        if (static_cast<int>(threadIdx.x) < reduction_offset)
+          block_scratch[threadIdx.x] +=
+              block_scratch[threadIdx.x + reduction_offset];
+        __syncthreads();
+      }
+      if (threadIdx.x == 0)
+      {
+        const double coefficient = block_scratch[0];
+        coefficients[basis_begin + offset] = coefficient;
+        if (!isfinite(coefficient))
+          MarkFailure(control, failure_numerical_breakdown);
+      }
+      __syncthreads();
+    }
+  }
+  grid.sync();
+}
+
+__device__ void ProjectBasisSpace(
+    double* values, const double* basis, const double* coefficients,
+    const int basis_count, const int size, double* hessenberg,
+    const int hessenberg_stride, const int column, const bool accumulate,
+    NativeTraceSolveControl* control,
+    const cg::grid_group& grid) noexcept
+{
+  if (grid.thread_rank() == 0)
+  {
+    for (int basis_index = 0; basis_index < basis_count; ++basis_index)
+    {
+      double& entry = hessenberg[
+          static_cast<std::size_t>(basis_index) * hessenberg_stride + column];
+      entry = accumulate ? entry + coefficients[basis_index]
+                         : coefficients[basis_index];
+      if (!isfinite(entry))
+        MarkFailure(control, failure_numerical_breakdown);
+    }
+  }
+
+  const int thread = GlobalThreadIndex();
+  const int stride = GlobalThreadStride();
+  for (int index = thread; index < size; index += stride)
+  {
+    double projection = 0.0;
+    for (int basis_index = 0; basis_index < basis_count; ++basis_index)
+      projection += coefficients[basis_index] * basis[
+          static_cast<std::size_t>(basis_index) * size + index];
+    values[index] -= projection;
+    if (!isfinite(values[index])) MarkFailure(control, failure_nonfinite);
+  }
+  grid.sync();
+}
+
+__device__ void FormBasisLinearCombination(
+    double* destination, const double* basis, const double* coefficients,
+    const int basis_count, const int size,
+    NativeTraceSolveControl* control,
+    const cg::grid_group& grid) noexcept
+{
+  const int thread = GlobalThreadIndex();
+  const int stride = GlobalThreadStride();
+  for (int index = thread; index < size; index += stride)
+  {
+    double value = 0.0;
+    for (int basis_index = 0; basis_index < basis_count; ++basis_index)
+      value += coefficients[basis_index] * basis[
+          static_cast<std::size_t>(basis_index) * size + index];
+    destination[index] = value;
+    if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
+  }
+  grid.sync();
+}
+
 __device__ void SparseMatrixVector(
     const NativeTraceCsrView matrix, const double* input, double* output,
     NativeTraceSolveControl* control,
@@ -509,6 +638,13 @@ __global__ void NativeRankOneTraceSolveKernel(
   double* const residual_scalars = sine + krylov_dimension;
   double* const work = workspace.vectors;
   double* const first_basis = workspace.basis;
+  const std::size_t projection_partial_doubles =
+      static_cast<std::size_t>(
+          krylov_dimension < native_trace_projection_tile
+              ? krylov_dimension : native_trace_projection_tile) *
+      gridDim.x;
+  double* const projection_coefficients =
+      workspace.reduction + projection_partial_doubles;
 
   for (int row = thread; row < rows; row += stride)
   {
@@ -603,22 +739,41 @@ __global__ void NativeRankOneTraceSolveKernel(
       SparseMatrixVector(system.matrix, work, next_basis, control, grid);
       if (FinishOnFailure(grid, control)) return;
 
-      // Pinned HYPRE modified Gram-Schmidt, one deterministic reduction per
-      // basis vector and the same update order.
-      for (int basis_index = 0; basis_index < restart_size; ++basis_index)
+      // Deterministic FP64 CGS2.  Each bounded tile shares one pair of grid
+      // barriers for all its dot products, then each pass applies the complete
+      // basis projection in one vector traversal.
+      for (int basis_begin = 0; basis_begin < restart_size;
+           basis_begin += native_trace_projection_tile)
       {
-        const double* const basis = workspace.basis +
-            static_cast<std::size_t>(basis_index) * rows;
-        const double inner = GridDot(basis, next_basis, rows, workspace,
-                                     control, grid, block_scratch);
-        if (!isfinite(inner)) MarkFailure(control, failure_numerical_breakdown);
-        if (grid.thread_rank() == 0)
-          hessenberg[static_cast<std::size_t>(basis_index) *
-              krylov_dimension + column] = inner;
-        grid.sync();
-        if (FinishOnFailure(grid, control)) return;
-        AxpyVector(next_basis, -inner, basis, rows, control, grid);
+        const int basis_count =
+            restart_size - basis_begin < native_trace_projection_tile
+                ? restart_size - basis_begin
+                : native_trace_projection_tile;
+        GridBasisDotTile(workspace.basis, next_basis, rows, basis_begin,
+                         basis_count, projection_coefficients, workspace,
+                         control, grid, block_scratch);
       }
+      ProjectBasisSpace(next_basis, workspace.basis,
+                        projection_coefficients, restart_size, rows,
+                        hessenberg, krylov_dimension, column, false,
+                        control, grid);
+      if (FinishOnFailure(grid, control)) return;
+      for (int basis_begin = 0; basis_begin < restart_size;
+           basis_begin += native_trace_projection_tile)
+      {
+        const int basis_count =
+            restart_size - basis_begin < native_trace_projection_tile
+                ? restart_size - basis_begin
+                : native_trace_projection_tile;
+        GridBasisDotTile(workspace.basis, next_basis, rows, basis_begin,
+                         basis_count, projection_coefficients, workspace,
+                         control, grid, block_scratch);
+      }
+      ProjectBasisSpace(next_basis, workspace.basis,
+                        projection_coefficients, restart_size, rows,
+                        hessenberg, krylov_dimension, column, true,
+                        control, grid);
+      if (FinishOnFailure(grid, control)) return;
 
       const double next_norm = GridNorm(next_basis, rows, workspace, control,
                                         grid, block_scratch);
@@ -734,19 +889,8 @@ __global__ void NativeRankOneTraceSolveKernel(
     grid.sync();
     if (FinishOnFailure(grid, control)) return;
 
-    const double* const last_basis = workspace.basis +
-        static_cast<std::size_t>(restart_size - 1) * rows;
-    for (int row = thread; row < rows; row += stride)
-      work[row] = residual_scalars[restart_size - 1] * last_basis[row];
-    grid.sync();
-    for (int basis_index = restart_size - 2;
-         basis_index >= 0; --basis_index)
-    {
-      const double* const basis = workspace.basis +
-          static_cast<std::size_t>(basis_index) * rows;
-      AxpyVector(work, residual_scalars[basis_index], basis, rows,
-                 control, grid);
-    }
+    FormBasisLinearCombination(work, workspace.basis, residual_scalars,
+                               restart_size, rows, control, grid);
     ApplyPreconditioner(system, preconditioner, workspace,
                         work, work, control, grid);
     if (FinishOnFailure(grid, control)) return;
@@ -799,22 +943,9 @@ __global__ void NativeRankOneTraceSolveKernel(
         }
       }
       grid.sync();
-      double* const last_restart_basis = workspace.basis +
-          static_cast<std::size_t>(restart_size) * rows;
-      AxpyVector(last_restart_basis,
-                 residual_scalars[restart_size] - 1.0,
-                 last_restart_basis, rows, control, grid);
-      for (int basis_index = restart_size - 1;
-           basis_index > 0; --basis_index)
-      {
-        const double* const basis = workspace.basis +
-            static_cast<std::size_t>(basis_index) * rows;
-        AxpyVector(last_restart_basis, residual_scalars[basis_index],
-                   basis, rows, control, grid);
-      }
-      AxpyVector(first_basis, residual_scalars[0] - 1.0,
-                 first_basis, rows, control, grid);
-      AxpyVector(first_basis, 1.0, last_restart_basis, rows, control, grid);
+      FormBasisLinearCombination(first_basis, workspace.basis,
+                                 residual_scalars, restart_size + 1,
+                                 rows, control, grid);
       if (FinishOnFailure(grid, control)) return;
     }
   }
@@ -860,6 +991,10 @@ QueryNativeTraceWorkspaceRequirements(const int rows,
   std::size_t hessenberg = 0;
   std::size_t scalar_vectors = 0;
   std::size_t small = 0;
+  std::size_t projection_partials = 0;
+  std::size_t projection_reduction = 0;
+  const std::size_t projection_tile = std::min(
+      dimension, static_cast<std::size_t>(native_trace_projection_tile));
   if (!CheckedAdd(dimension, 1, dimension_plus_one) ||
       !CheckedMultiply(row_count, dimension_plus_one,
                        result.basis_doubles) ||
@@ -868,10 +1003,14 @@ QueryNativeTraceWorkspaceRequirements(const int rows,
       !CheckedMultiply(dimension_plus_one, dimension, hessenberg) ||
       !CheckedMultiply(dimension, 2, scalar_vectors) ||
       !CheckedAdd(scalar_vectors, dimension_plus_one, scalar_vectors) ||
-      !CheckedAdd(hessenberg, scalar_vectors, small))
+      !CheckedAdd(hessenberg, scalar_vectors, small) ||
+      !CheckedMultiply(projection_tile,
+                       static_cast<std::size_t>(cooperative_blocks),
+                       projection_partials) ||
+      !CheckedAdd(projection_partials, dimension, projection_reduction))
     return NativeTraceWorkspaceRequirements{};
 
-  result.reduction_doubles = static_cast<std::size_t>(cooperative_blocks);
+  result.reduction_doubles = projection_reduction;
   result.small_doubles = small;
   result.permutation_integers = igr_active ? row_count : 0;
   result.control_double_slots = NativeTraceControlDoubleSlots();

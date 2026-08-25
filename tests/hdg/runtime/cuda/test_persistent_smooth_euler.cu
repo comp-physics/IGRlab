@@ -207,8 +207,8 @@ bool NativeWorkspaceRequirementsPolicy() noexcept
   return conventional.valid && igr.valid &&
       conventional.basis_doubles == 50 && igr.basis_doubles == 50 &&
       conventional.vector_doubles == 10 && igr.vector_doubles == 30 &&
-      conventional.reduction_doubles == 2 &&
-      igr.reduction_doubles == 2 &&
+      conventional.reduction_doubles == 12 &&
+      igr.reduction_doubles == 12 &&
       conventional.small_doubles == 33 && igr.small_doubles == 33 &&
       conventional.permutation_integers == 0 &&
       igr.permutation_integers == 10 &&
