@@ -2108,8 +2108,8 @@ LaunchAndObserveNativeRankOneTraceSolve(
       current_matrix.diag_nonzeros == true_device_.diag_nonzeros;
   if (!matrix_exact) return false;
   // HYPRE may issue factor/extracted-diagonal work on its configured compute
-  // stream.  The one first-factor-per-attempt refresh must complete before
-  // the application-owned cooperative stream borrows those pointers.
+  // stream.  Every current-generation refresh must complete before the
+  // application-owned cooperative stream borrows those pointers.
   if (use_ilu && diagnostics.ilu_factor_setups == 1 &&
       !TransportPolicy::Synchronize(CudaTransferSite::scalar_status))
     return false;

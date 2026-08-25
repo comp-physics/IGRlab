@@ -133,8 +133,6 @@ ilu_policy = (
 ilu_factor_reuse_policy = (
     "not_applicable"
     if ilu_policy[3] == 0
-    else "first_trace_solve_per_attempt"
-    if args.mode == "igr" and (common_fast or args.engine == "tensor")
     else "refresh_each_trace_solve"
 )
 ilu_triangular_policy = (
@@ -959,7 +957,7 @@ def main() -> int:
         ) == "not_applicable"
         assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
             "tensor", "igr"
-        ) == "first_trace_solve_per_attempt"
+        ) == "refresh_each_trace_solve"
         for engine in ("ordinary", "tensor"):
             assert CAMPAIGN.expected_trace_preconditioner(
                 engine, "conventional", "common-fast"
@@ -978,7 +976,7 @@ def main() -> int:
             ) == ("iterative_jacobi", 5, 5, 8)
             assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
                 engine, "igr", "common-fast"
-            ) == "first_trace_solve_per_attempt"
+            ) == "refresh_each_trace_solve"
         for cell_key, result in campaign["final_tree_results"].items():
             comparison = result["paired_comparison"]
             assert math.isclose(comparison["speedup"]["median"], 2.0)
@@ -1001,7 +999,7 @@ def main() -> int:
                 "ordinary_ilu_factor_reuse_policy"
             ] == "refresh_each_trace_solve"
             assert attribution["tensor_ilu_factor_reuse_policy"] == (
-                "first_trace_solve_per_attempt" if mode == "igr"
+                "refresh_each_trace_solve" if mode == "igr"
                 else "not_applicable"
             )
             assert attribution[
@@ -1085,14 +1083,11 @@ def main() -> int:
                 assert work["tensor_core"][
                     "ilu_triangular_solve_policies"
                 ] == [expected_triangular_policy]
-                expected_factor_setups = (
-                    10 if tensor_igr else 20 if ilu_active else 0
-                )
-                expected_factor_reuses = 10 if tensor_igr else 0
-                expected_factor_age = 1 if tensor_igr else 0
+                expected_factor_setups = 20 if ilu_active else 0
+                expected_factor_reuses = 0
+                expected_factor_age = 0
                 expected_factor_policy = (
-                    "first_trace_solve_per_attempt" if tensor_igr
-                    else "refresh_each_trace_solve" if ilu_active
+                    "refresh_each_trace_solve" if ilu_active
                     else "not_applicable"
                 )
                 assert work["tensor_core"][
@@ -1598,7 +1593,7 @@ def main() -> int:
             "iterative_jacobi"
         assert ordinary_common_record[
             "trace_ilu_factor_reuse_policy"
-        ] == "first_trace_solve_per_attempt"
+        ] == "refresh_each_trace_solve"
         bad_common_top_level = copy.deepcopy(ordinary_common_record)
         bad_common_top_level[
             "trace_ilu_triangular_solve_kind"
@@ -1642,7 +1637,7 @@ def main() -> int:
         ] == "derived_bounds_v1"
         assert tensor_igr_record[
             "trace_ilu_factor_reuse_policy"
-        ] == "first_trace_solve_per_attempt"
+        ] == "refresh_each_trace_solve"
         assert tensor_igr_record[
             "trace_ilu_triangular_solve_kind"
         ] == "iterative_jacobi"
@@ -1658,10 +1653,10 @@ def main() -> int:
             sample["tensor_core"]["ilu_accounting_kind"] ==
             "derived_bounds_v1" and
             sample["tensor_core"]["ilu_factor_reuse_policy"] ==
-            "first_trace_solve_per_attempt" and
-            sample["tensor_core"]["ilu_factor_setups"] == 1 and
-            sample["tensor_core"]["ilu_factor_reuses"] == 1 and
-            sample["tensor_core"]["ilu_factor_age_generations"] == 1 and
+            "refresh_each_trace_solve" and
+            sample["tensor_core"]["ilu_factor_setups"] == 2 and
+            sample["tensor_core"]["ilu_factor_reuses"] == 0 and
+            sample["tensor_core"]["ilu_factor_age_generations"] == 0 and
             sample["tensor_core"]["ilu_triangular_solve_kind"] ==
             "iterative_jacobi" and
             sample["tensor_core"]["ilu_lower_jacobi_iterations"] == 5 and
@@ -2184,7 +2179,7 @@ def main() -> int:
         ] == "refresh_each_trace_solve"
         assert tensor_disposition["attribution_by_mode"]["igr"][
             "tensor_ilu_factor_reuse_policy"
-        ] == "first_trace_solve_per_attempt"
+        ] == "refresh_each_trace_solve"
         assert tensor_disposition["attribution_by_mode"]["igr"][
             "ordinary_ilu_triangular_solve_policy"
         ]["kind"] == "direct"

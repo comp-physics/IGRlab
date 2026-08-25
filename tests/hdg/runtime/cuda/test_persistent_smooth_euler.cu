@@ -1022,7 +1022,7 @@ constexpr bool TracePreconditionerPolicy() noexcept
       CudaIluFactorReusePolicyForEngine(CudaEngineKind::tensor_core, false) ==
           CudaIluFactorReusePolicy::not_applicable &&
       CudaIluFactorReusePolicyForEngine(CudaEngineKind::tensor_core, true) ==
-          CudaIluFactorReusePolicy::first_trace_solve_per_attempt &&
+          CudaIluFactorReusePolicy::refresh_each_trace_solve &&
       CudaIluTriangularSolveKindForEngine(
           CudaEngineKind::ordinary, false) ==
           CudaIluTriangularSolveKind::direct &&
@@ -1110,7 +1110,7 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       tensor_igr_default.ilu_lower_jacobi_iterations == 5 &&
       tensor_igr_default.ilu_upper_jacobi_iterations == 5 &&
       tensor_igr_default.ilu_factor_reuse_policy ==
-          CudaIluFactorReusePolicy::first_trace_solve_per_attempt &&
+          CudaIluFactorReusePolicy::refresh_each_trace_solve &&
       CudaTracePolicyDescriptorIsExact(ordinary_conventional_common) &&
       CudaTracePolicyDescriptorIsExact(tensor_conventional_common) &&
       ordinary_conventional_common.trace_preconditioner ==
@@ -1144,7 +1144,7 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       ordinary_igr_common.ilu_accounting_kind ==
           CudaIluAccountingKind::derived_bounds_v1 &&
       ordinary_igr_common.ilu_factor_reuse_policy ==
-          CudaIluFactorReusePolicy::first_trace_solve_per_attempt &&
+          CudaIluFactorReusePolicy::refresh_each_trace_solve &&
       tensor_igr_common.ilu_local_reordering ==
           ordinary_igr_common.ilu_local_reordering &&
       tensor_igr_common.ilu_triangular_solve_kind ==
@@ -1363,21 +1363,27 @@ constexpr bool IluWorkAccumulationPolicy() noexcept
           tensor_igr_evidence,
           CudaTracePreconditionerKind::hypre_ilu0, true))
     return false;
-  const auto first = IluDiagnostics(
+  const auto tensor_refresh = IluDiagnostics(
       true, CudaEngineKind::tensor_core,
-      CudaIluFactorReusePolicy::first_trace_solve_per_attempt,
+      CudaIluFactorReusePolicy::refresh_each_trace_solve,
       1, 0, 0, 9);
-  const auto reuse = IluDiagnostics(
+  const auto second_tensor_refresh = IluDiagnostics(
+      true, CudaEngineKind::tensor_core,
+      CudaIluFactorReusePolicy::refresh_each_trace_solve,
+      1, 0, 0, 0);
+  const auto invalid_reuse = IluDiagnostics(
       true, CudaEngineKind::tensor_core,
       CudaIluFactorReusePolicy::first_trace_solve_per_attempt,
       0, 1, 1, 0);
-  if (!CudaAccumulateIluSolveEvidence(tensor_igr_evidence, first) ||
-      !CudaAccumulateIluSolveEvidence(tensor_igr_evidence, reuse) ||
+  if (!CudaAccumulateIluSolveEvidence(
+          tensor_igr_evidence, tensor_refresh) ||
+      !CudaAccumulateIluSolveEvidence(
+          tensor_igr_evidence, second_tensor_refresh) ||
       tensor_igr_evidence.ilu_factor_reuse_policy !=
-          CudaIluFactorReusePolicy::first_trace_solve_per_attempt ||
-      tensor_igr_evidence.ilu_factor_setups != 1 ||
-      tensor_igr_evidence.ilu_factor_reuses != 1 ||
-      tensor_igr_evidence.ilu_factor_age_generations != 1 ||
+          CudaIluFactorReusePolicy::refresh_each_trace_solve ||
+      tensor_igr_evidence.ilu_factor_setups != 2 ||
+      tensor_igr_evidence.ilu_factor_reuses != 0 ||
+      tensor_igr_evidence.ilu_factor_age_generations != 0 ||
       tensor_igr_evidence.ilu_triangular_solve_kind !=
           CudaIluTriangularSolveKind::iterative_jacobi ||
       tensor_igr_evidence.ilu_lower_jacobi_iterations != 5 ||
@@ -1399,17 +1405,17 @@ constexpr bool IluWorkAccumulationPolicy() noexcept
           common_ordinary_igr_evidence,
           CudaTracePreconditionerKind::hypre_ilu0, true) ||
       !CudaAccumulateIluSolveEvidence(
-          common_ordinary_igr_evidence, first) ||
+          common_ordinary_igr_evidence, tensor_refresh) ||
       !CudaAccumulateIluSolveEvidence(
-          common_ordinary_igr_evidence, reuse) ||
+          common_ordinary_igr_evidence, second_tensor_refresh) ||
       common_ordinary_igr_evidence.ilu_factor_reuse_policy !=
-          CudaIluFactorReusePolicy::first_trace_solve_per_attempt ||
+          CudaIluFactorReusePolicy::refresh_each_trace_solve ||
       common_ordinary_igr_evidence.ilu_triangular_solve_kind !=
           CudaIluTriangularSolveKind::iterative_jacobi ||
       common_ordinary_igr_evidence.ilu_lower_jacobi_iterations != 5 ||
       common_ordinary_igr_evidence.ilu_upper_jacobi_iterations != 5 ||
-      common_ordinary_igr_evidence.ilu_factor_setups != 1 ||
-      common_ordinary_igr_evidence.ilu_factor_reuses != 1 ||
+      common_ordinary_igr_evidence.ilu_factor_setups != 2 ||
+      common_ordinary_igr_evidence.ilu_factor_reuses != 0 ||
       !common_ordinary_igr_evidence.ilu_accounting_complete)
     return false;
 
@@ -1419,7 +1425,7 @@ constexpr bool IluWorkAccumulationPolicy() noexcept
           incomplete_evidence,
           CudaTracePreconditionerKind::hypre_ilu0, true))
     return false;
-  auto malformed_bounds = first;
+  auto malformed_bounds = tensor_refresh;
   malformed_bounds.ilu_preconditioner_callbacks_lower_bound = 11;
   malformed_bounds.ilu_inner_iterations_lower_bound = 11;
   malformed_bounds.ilu_accounting_complete = false;
@@ -1439,10 +1445,11 @@ constexpr bool IluWorkAccumulationPolicy() noexcept
       incomplete_evidence.ilu_jacobi_factor_spmv_updates_upper_bound != 0 ||
       incomplete_evidence.ilu_accounting_complete)
     return false;
-  if (!CudaAccumulateIluSolveEvidence(incomplete_evidence, reuse) ||
-      incomplete_evidence.ilu_factor_setups != 1 ||
-      incomplete_evidence.ilu_factor_reuses != 1 ||
-      incomplete_evidence.ilu_factor_age_generations != 1 ||
+  if (!CudaAccumulateIluSolveEvidence(
+          incomplete_evidence, second_tensor_refresh) ||
+      incomplete_evidence.ilu_factor_setups != 2 ||
+      incomplete_evidence.ilu_factor_reuses != 0 ||
+      incomplete_evidence.ilu_factor_age_generations != 0 ||
       incomplete_evidence.ilu_preconditioner_callbacks_lower_bound != 0 ||
       incomplete_evidence.ilu_preconditioner_callbacks_upper_bound != 0 ||
       incomplete_evidence.ilu_inner_iterations_lower_bound != 0 ||
@@ -1457,7 +1464,8 @@ constexpr bool IluWorkAccumulationPolicy() noexcept
   if (!CudaInitializeIluEvidence(
           hard_failure_evidence,
           CudaTracePreconditionerKind::hypre_ilu0, true) ||
-      CudaAccumulateIluSolveEvidence(hard_failure_evidence, reuse))
+      CudaAccumulateIluSolveEvidence(
+          hard_failure_evidence, invalid_reuse))
     return false;
   return hard_failure_evidence.ilu_factor_setups == 0 &&
       hard_failure_evidence.ilu_factor_reuses == 0 &&
@@ -1565,10 +1573,45 @@ bool IluFactorStateLifecyclePolicy() noexcept
   if (!CudaBeginIluFactorAttempt(
           refresh_each, first,
           CudaIluFactorReusePolicy::refresh_each_trace_solve,
-          102, 202, 0, 9, 0))
+          102, 202, 0, 9, 0) ||
+      !CudaNativeIluFactorAuthorityCanRefresh(refresh_each, 0))
     return false;
   refresh_each.factor_ready = true;
-  if (!CudaIluFactorRefreshRequired(refresh_each)) return false;
+  if (!CudaIluFactorRefreshRequired(refresh_each) ||
+      CudaNativeIluFactorAuthorityCanRefresh(refresh_each, 18))
+    return false;
+  refresh_each.hypre_matrix_token = 401;
+  refresh_each.diag_offsets_token = 203;
+  refresh_each.diag_columns_token = 204;
+  refresh_each.ilu_handle_token = 501;
+  refresh_each.factor_matrix_token = 601;
+  refresh_each.factor_offsets_token = 602;
+  refresh_each.factor_columns_token = 603;
+  refresh_each.factor_values_token = 604;
+  refresh_each.factor_permutation_token = 605;
+  refresh_each.native_inverse_diagonal_token = 606;
+  refresh_each.matrix_rows = 9;
+  refresh_each.factor_rows = 9;
+  refresh_each.factor_nonzeros = 17;
+  refresh_each.factor_generation = 17;
+  refresh_each.last_solve_generation = 17;
+  if (!CudaNativeIluFactorAuthorityCanRefresh(refresh_each, 18) ||
+      CudaNativeIluFactorAuthorityCanRefresh(refresh_each, 17))
+    return false;
+  // Emulate the bounded metadata replacement performed after HYPRE setup:
+  // the next generation must be authorized by the new, not stale, handles.
+  refresh_each.ilu_handle_token = 511;
+  refresh_each.factor_matrix_token = 611;
+  refresh_each.factor_offsets_token = 612;
+  refresh_each.factor_columns_token = 613;
+  refresh_each.factor_values_token = 614;
+  refresh_each.factor_permutation_token = 615;
+  refresh_each.factor_generation = 18;
+  refresh_each.last_solve_generation = 18;
+  if (!CudaNativeIluFactorAuthorityCanRefresh(refresh_each, 19) ||
+      refresh_each.ilu_handle_token != 511 ||
+      refresh_each.factor_values_token != 614)
+    return false;
 
   if (!CudaBeginIluFactorAttempt(
           state, retry,

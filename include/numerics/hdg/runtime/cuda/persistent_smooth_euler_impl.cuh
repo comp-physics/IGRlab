@@ -549,6 +549,51 @@ constexpr bool CudaIluFactorRefreshRequired(
       !state.factor_ready;
 }
 
+/**
+ * Admit exactly one native ILU authority replacement for a newer matrix
+ * generation.  This is constant-size lifecycle state, not solve history.
+ */
+constexpr bool CudaNativeIluFactorAuthorityCanRefresh(
+    const CudaIluAttemptFactorState& state,
+    const std::uint64_t matrix_generation) noexcept
+{
+  if (!state.active || state.policy !=
+          CudaIluFactorReusePolicy::refresh_each_trace_solve ||
+      state.matrix_object_token == 0 || state.diag_values_token == 0 ||
+      state.diag_nonzeros <= 0 || state.offd_nonzeros != 0)
+    return false;
+  if (!state.factor_ready)
+  {
+    return state.hypre_matrix_token == 0 &&
+        state.diag_offsets_token == 0 &&
+        state.diag_columns_token == 0 &&
+        state.offd_offsets_token == 0 &&
+        state.offd_columns_token == 0 &&
+        state.ilu_handle_token == 0 &&
+        state.factor_matrix_token == 0 &&
+        state.factor_offsets_token == 0 &&
+        state.factor_columns_token == 0 &&
+        state.factor_values_token == 0 &&
+        state.factor_permutation_token == 0 &&
+        state.native_inverse_diagonal_token == 0 &&
+        state.matrix_rows == 0 && state.factor_rows == 0 &&
+        state.factor_nonzeros == 0 && state.factor_generation == 0 &&
+        state.last_solve_generation == 0;
+  }
+  return state.hypre_matrix_token != 0 &&
+      state.diag_offsets_token != 0 && state.diag_columns_token != 0 &&
+      state.ilu_handle_token != 0 && state.factor_matrix_token != 0 &&
+      state.factor_offsets_token != 0 &&
+      state.factor_columns_token != 0 &&
+      state.factor_values_token != 0 &&
+      state.factor_permutation_token != 0 &&
+      state.native_inverse_diagonal_token != 0 &&
+      state.matrix_rows > 0 && state.factor_rows == state.matrix_rows &&
+      state.factor_nonzeros >= state.factor_rows &&
+      state.factor_generation == state.last_solve_generation &&
+      matrix_generation > state.last_solve_generation;
+}
+
 constexpr bool CudaIluRefreshDecisionRequiresConsensus(
     const CudaIluFactorReusePolicy policy) noexcept
 {
