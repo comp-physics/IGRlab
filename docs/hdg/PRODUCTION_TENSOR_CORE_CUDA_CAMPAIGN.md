@@ -260,10 +260,11 @@ blocks, apply the trace operator matrix-free, build face/element Schwarz from
 those blocks, and use communication-avoiding blocks of Krylov vectors so dense
 FP64 MMA tiles are materially occupied. It is not silently enabled in this
 candidate. Direct true-trace scatter and additional recovery fusion were also
-considered, but exact-current attribution limits their individual accepted-
-step ceilings to about one percent or less; the dominant IGR target is Krylov
-work, while the dominant conventional targets are assembly, validation, and
-local tensor algebra.
+considered; precursor attribution estimates their individual accepted-step
+ceilings at about one percent or less. Final-candidate profiling remains the
+authority for those fractions. The dominant IGR target is Krylov work, while
+the dominant conventional targets are assembly, validation, and local tensor
+algebra.
 
 ### Implemented tensor numerical leaf
 
@@ -281,9 +282,11 @@ fits (currently IGR p2); the other supported shapes perform that final vector
 contraction with scalar FP64 work in the same tensor leaf. A four-warp element
 block processes 8-by-8 output tiles; row, column, and inner tails are explicitly
 zero-filled, so the same kernel admits every current conventional `U4/Uhat4`
-and IGR `U7/Uhat5` p1-p3 shape. The retained solved workspace is consumed
-directly by recovery, eliminating the former second triangular solve. All
-local products remain binary64.
+and IGR `U7/Uhat5` p1-p3 shape. Tensor recovery consumes the retained solved
+workspace directly, eliminating its former second triangular solve. Ordinary
+CUDA retains the frozen direct-LU recovery arithmetic so shared refactoring
+does not perturb its historical numerical or performance control. All local
+products remain binary64.
 
 Blocked LU and solve updates guard their optional second eight-column tensor
 batch with a real warp-uniform loop edge.  The Schur contraction instead

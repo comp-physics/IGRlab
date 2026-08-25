@@ -534,8 +534,8 @@ struct CudaQualificationTestAccess
       Engine& engine, CudaPreparedRecoveryAudit& audit) noexcept
   {
     // Test-only D2H capture: check P*A=L*U, every genuine [B f] solve, and the
-    // retained-W recovery against an independent pivoted FP64 solve and the
-    // original local equation.
+    // selected ordinary direct-LU or tensor retained-W recovery against an
+    // independent pivoted FP64 solve and the original local equation.
     audit = {};
     auto& numerics = engine.numerics_;
     const CudaMeshShape& shape = numerics.shape_;
@@ -2054,6 +2054,9 @@ using dg::hdg::runtime::cuda_w8a::CudaStepEvidence;
 using dg::hdg::runtime::cuda_w8a::CudaTransferTotals;
 using dg::hdg::runtime::cuda_w8a::CudaTransportPolicy;
 using dg::hdg::runtime::cuda_w8a::PersistentCudaSmoothEulerEngine;
+using dg::hdg::runtime::cuda_w8a::detail::CudaBorrowedRecoveryForEngine;
+using dg::hdg::runtime::cuda_w8a::detail::CudaBorrowedRecoveryKind;
+using dg::hdg::runtime::cuda_w8a::detail::CudaRecoveryRouteSupported;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedEulerConservationGateCapture;
 using dg::hdg::runtime::cuda_w8a::detail::
@@ -5278,6 +5281,26 @@ bool ParseOptions(const int argc, char* argv[], Options& options)
       options.order <= dg::hdg::generic::maximum_polynomial_order;
 }
 
+bool CheckRecoveryDispatchAdmission() noexcept
+{
+  static_assert(CudaBorrowedRecoveryForEngine(CudaEngineKind::ordinary) ==
+                CudaBorrowedRecoveryKind::ordinary_direct_lu);
+  static_assert(CudaBorrowedRecoveryForEngine(CudaEngineKind::tensor_core) ==
+                CudaBorrowedRecoveryKind::tensor_retained_solve);
+  constexpr auto invalid_engine = static_cast<CudaEngineKind>(
+      std::numeric_limits<std::uint8_t>::max());
+  static_assert(CudaBorrowedRecoveryForEngine(invalid_engine) ==
+                CudaBorrowedRecoveryKind::invalid);
+  static_assert(CudaRecoveryRouteSupported(CudaEngineKind::ordinary, true));
+  static_assert(CudaRecoveryRouteSupported(CudaEngineKind::ordinary, false));
+  static_assert(CudaRecoveryRouteSupported(CudaEngineKind::tensor_core, true));
+  static_assert(!CudaRecoveryRouteSupported(CudaEngineKind::tensor_core,
+                                            false));
+  static_assert(!CudaRecoveryRouteSupported(invalid_engine, true));
+  static_assert(!CudaRecoveryRouteSupported(invalid_engine, false));
+  return true;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -5301,6 +5324,7 @@ int main(int argc, char* argv[])
   const bool admission = order > 0 && CheckContractAdmission(order);
   mfem::Device device("cuda");
   (void)device;
+  const bool recovery_dispatch_admission = CheckRecoveryDispatchAdmission();
   std::vector<double> conventional_periodic_state;
   std::vector<double> conventional_physical_state;
   std::vector<double> igr_periodic_state;
@@ -5378,7 +5402,8 @@ int main(int argc, char* argv[])
       BoundaryResponseSeparated(igr_periodic_response,
                                 igr_physical_response);
   const bool passed = (ranks == 1 || ranks == 2) && All(
-      admission && copied_initial_trace && all_seven_boundary_policies &&
+      admission && recovery_dispatch_admission && copied_initial_trace &&
+      all_seven_boundary_policies &&
       mixed_boundary_policies && independent_igr_conservation &&
       conventional_conservation_rollback &&
       tensor_diagonal_convergence_warning_rollback &&
@@ -5394,6 +5419,8 @@ int main(int argc, char* argv[])
               << (selected_cuda_engine == CudaEngineKind::tensor_core
                       ? "tensor" : "ordinary")
               << " admission=" << admission
+              << " recovery_dispatch_admission="
+              << recovery_dispatch_admission
               << " copied_initial_trace=" << copied_initial_trace
               << " all_seven_boundary_policies="
               << all_seven_boundary_policies

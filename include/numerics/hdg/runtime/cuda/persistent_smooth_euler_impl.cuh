@@ -1717,6 +1717,29 @@ enum class CudaBorrowedAssemblyKind : std::uint8_t
   ordinary_split = 0,
   tensor_fused = 1
 };
+enum class CudaBorrowedRecoveryKind : std::uint8_t
+{
+  ordinary_direct_lu = 0,
+  tensor_retained_solve = 1,
+  invalid = 2
+};
+constexpr CudaBorrowedRecoveryKind CudaBorrowedRecoveryForEngine(
+    const generic::CudaEngineKind engine) noexcept
+{
+  return engine == generic::CudaEngineKind::ordinary
+      ? CudaBorrowedRecoveryKind::ordinary_direct_lu
+      : engine == generic::CudaEngineKind::tensor_core
+      ? CudaBorrowedRecoveryKind::tensor_retained_solve
+      : CudaBorrowedRecoveryKind::invalid;
+}
+constexpr bool CudaRecoveryRouteSupported(
+    const generic::CudaEngineKind engine,
+    const bool borrowed_host_inputs) noexcept
+{
+  return engine == generic::CudaEngineKind::ordinary ||
+      (borrowed_host_inputs &&
+       engine == generic::CudaEngineKind::tensor_core);
+}
 bool CudaLaunchBorrowedAssembly(
     const CudaDeviceView& view, const CudaMeshShape& shape, double dt,
     CudaBorrowedAssemblyKind kind) noexcept;
@@ -1751,7 +1774,8 @@ bool CudaLaunchScatterRemoteVector(const CudaDeviceView& view,
                                    const CudaMeshShape& shape,
                                    double* true_vector) noexcept;
 bool CudaLaunchRecover(const CudaDeviceView& view,
-                       const CudaMeshShape& shape) noexcept;
+                       const CudaMeshShape& shape,
+                       generic::CudaEngineKind engine) noexcept;
 bool CudaLaunchTrial(const CudaDeviceView& view,
                      const CudaMeshShape& shape, double alpha) noexcept;
 bool CudaLaunchPackInteriorOutput(const CudaMeshShape& shape,
@@ -3139,7 +3163,7 @@ public:
       {
         ::dg_igr::NVTXRange profile_region(
             ::dg_igr::observability::RegionId::hdg_interior_recovery);
-        recovery_launched = CudaLaunchRecover(view_, shape_);
+        recovery_launched = CudaLaunchRecover(view_, shape_, cuda_engine_);
       }
       const bool recovered = recovery_launched && StatusPassed();
       if (!CollectiveContinue(recovered))
@@ -3291,7 +3315,8 @@ public:
     {
       ::dg_igr::NVTXRange profile_region(
           ::dg_igr::observability::RegionId::hdg_interior_recovery);
-      coherent_recovery_launched = CudaLaunchRecover(view_, shape_);
+      coherent_recovery_launched =
+          CudaLaunchRecover(view_, shape_, cuda_engine_);
     }
     const bool coherent_solve =
         coherent_recovery_launched && StatusPassed();

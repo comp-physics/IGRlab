@@ -3719,8 +3719,9 @@ static __device__ __forceinline__ void TensorSchurTileBatch(
 // row swaps; FP64 m8n8k4 MMA performs each material right-looking A22 update.
 // The retained 33--81 genuine [B f] right-hand sides use scalar diagonal-block
 // solves and tensor off-diagonal updates.  The existing tensor Schur product
-// then consumes the same retained W used by borrowed recovery.  Only incomplete
-// edge tiles are zero padded; no admitted p1-p3 shape routes to ordinary CUDA.
+// then consumes the same retained W used by tensor borrowed recovery.  Only
+// incomplete edge tiles are zero padded; no admitted p1-p3 shape routes to
+// ordinary CUDA.
 __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -3973,7 +3974,57 @@ __global__ void RecoverKernel(CudaDeviceView v,CudaMeshShape s)
                       v.f+e*ni,v.recovered_interior+e*ni);
   v.status[e]=1;
 }
-__global__ void BorrowedRecoverKernel(CudaDeviceView v,CudaMeshShape s)
+__global__ void OrdinaryBorrowedRecoverKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;if(e>=s.elements)return;
+  const int ni=s.interior_dofs,nt=s.trace_dofs;
+  const double* lu=v.lu+static_cast<std::size_t>(e)*ni*ni;
+  const double* pivots=v.pivots+e*ni;
+  double* recovered=v.recovered_interior+e*ni;
+  for(int row=threadIdx.x;row<ni;row+=blockDim.x)
+  {
+    // Preserve the frozen ordinary-CUDA arithmetic: form f-B*dhat first,
+    // then apply the retained pivoted LU factors cooperatively.
+    double value=v.f[e*ni+row];
+    for(int column=0;column<nt;++column)
+      value-=v.b[(static_cast<std::size_t>(e)*ni+row)*nt+column]*
+          v.trace_increment_local[e*nt+column];
+    recovered[row]=value;
+  }
+  __syncthreads();
+  for(int row=0;row<ni;++row)
+  {
+    if(threadIdx.x==0)
+    {
+      const int pivot=static_cast<int>(pivots[row]);
+      if(pivot!=row)
+      {
+        const double value=recovered[row];
+        recovered[row]=recovered[pivot];recovered[pivot]=value;
+      }
+    }
+    __syncthreads();
+  }
+  for(int column=0;column<ni;++column)
+  {
+    for(int row=column+1+threadIdx.x;row<ni;row+=blockDim.x)
+      recovered[row]-=lu[row*ni+column]*recovered[column];
+    __syncthreads();
+  }
+  for(int row=ni-1;row>=0;--row)
+  {
+    if(threadIdx.x==0)
+    {
+      double value=recovered[row];
+      for(int column=row+1;column<ni;++column)
+        value-=lu[row*ni+column]*recovered[column];
+      recovered[row]=value/lu[row*ni+row];
+    }
+    __syncthreads();
+  }
+  if(threadIdx.x==0)v.status[e]=1;
+}
+__global__ void TensorBorrowedRecoverKernel(CudaDeviceView v,CudaMeshShape s)
 {
   const int e=blockIdx.x;if(e>=s.elements)return;
   const int ni=s.interior_dofs,nt=s.trace_dofs,cols=nt+1;
@@ -4732,8 +4783,27 @@ bool CudaLaunchGatherRemoteVector(const CudaDeviceView& v,const CudaMeshShape& s
 {if(s.vector_send_count)GatherRemoteVectorKernel<<<Blocks(s.vector_send_count),128>>>(v,s,values,s.vector_send_count);return LaunchOk();}
 bool CudaLaunchScatterRemoteVector(const CudaDeviceView& v,const CudaMeshShape& s,double* truth) noexcept
 {if(s.vector_receive_count)ScatterRemoteVectorKernel<<<Blocks(s.vector_receive_count),128>>>(v,truth,s.vector_receive_count);return LaunchOk();}
-bool CudaLaunchRecover(const CudaDeviceView& v,const CudaMeshShape& s) noexcept
-{if(s.borrowed_host_inputs)BorrowedRecoverKernel<<<s.elements,128>>>(v,s);else RecoverKernel<<<Blocks(s.elements),128>>>(v,s);return LaunchOk();}
+bool CudaLaunchRecover(const CudaDeviceView& v,const CudaMeshShape& s,
+                       const generic::CudaEngineKind engine) noexcept
+{
+  // Admission is explicit and fail-closed: the legacy non-borrowed storage
+  // has no tensor recovery leaf and must never disguise ordinary work.
+  if(!CudaRecoveryRouteSupported(engine,s.borrowed_host_inputs))return false;
+  if(s.borrowed_host_inputs)
+  {
+    const auto recovery=CudaBorrowedRecoveryForEngine(engine);
+    if(recovery==CudaBorrowedRecoveryKind::ordinary_direct_lu)
+      OrdinaryBorrowedRecoverKernel<<<s.elements,128>>>(v,s);
+    else if(recovery==CudaBorrowedRecoveryKind::tensor_retained_solve)
+      TensorBorrowedRecoverKernel<<<s.elements,128>>>(v,s);
+    else return false;
+  }
+  else
+  {
+    RecoverKernel<<<Blocks(s.elements),128>>>(v,s);
+  }
+  return LaunchOk();
+}
 bool CudaLaunchTrial(const CudaDeviceView& v,const CudaMeshShape& s,double alpha) noexcept
 {TrialKernel<<<Blocks(std::max(s.interior_count,s.true_trace_count)),128>>>(v,s,alpha);return LaunchOk();}
 bool CudaLaunchPackInteriorOutput(const CudaMeshShape& s,
