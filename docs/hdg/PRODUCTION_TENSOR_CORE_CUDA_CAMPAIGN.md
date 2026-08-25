@@ -285,10 +285,14 @@ and IGR `U7/Uhat5` p1-p3 shape. The retained solved workspace is consumed
 directly by recovery, eliminating the former second triangular solve. All
 local products remain binary64.
 
-The optional second eight-column tensor batch crosses a real warp-uniform loop
-edge. This prevents predicated-off edge batches from issuing non-material DMMA
-instructions while preserving the same padded operands, outputs, and planned
-material-tile accounting.
+Blocked LU and solve updates guard their optional second eight-column tensor
+batch with a real warp-uniform loop edge.  The Schur contraction instead
+schedules complete two-column jobs and sends a genuine odd-column tail through
+a separately compiled one-column body.  A warp boundary therefore cannot split
+a Schur pair, and the tail contains no optional second MMA for the compiler to
+predicate.  Both routes prevent non-material DMMA instructions while
+preserving the same padded operands, outputs, and planned material-tile
+accounting.
 
 For production `engine-default`, the recurring true-trace solver is selected
 from the typed CUDA engine and admitted rank surface:

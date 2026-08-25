@@ -3633,6 +3633,85 @@ static __device__ __forceinline__ void TensorSubtractBlockedProduct(
     tile+=batch_width;
   }
 }
+
+template <int BatchWidth>
+static __device__ __forceinline__ void TensorSchurTileBatch(
+    const double* c,const double* solved,const double* d,const double* g,
+    double* schur,double* condensed_rhs,
+    const int interior_dofs,const int trace_dofs,const int solved_columns,
+    const int row_tile,const int first_column_tile,
+    double* tensor_a,double* tensor_b,double* tensor_product)
+{
+  static_assert(BatchWidth==1||BatchWidth==2,
+                "tensor Schur batch width must be one or two tiles");
+  constexpr int tensor_column_batch_tiles=2;
+  const int warp=threadIdx.x/warpSize,lane=threadIdx.x%warpSize;
+  const int row_base=row_tile*8;
+  double* warp_a=tensor_a+warp*8*4;
+  double* warp_b=tensor_b+warp*tensor_column_batch_tiles*4*8;
+  double* warp_product=tensor_product+warp*8*8;
+  using TensorAccumulator=nvcuda::wmma::fragment<
+      nvcuda::wmma::accumulator,8,8,4,double>;
+  TensorAccumulator accumulators[BatchWidth];
+#pragma unroll
+  for(int slot=0;slot<BatchWidth;++slot)
+    nvcuda::wmma::fill_fragment(accumulators[slot],0.0);
+  for(int inner_base=0;inner_base<interior_dofs;inner_base+=4)
+  {
+    const int local_row=lane/4,local_inner=lane%4;
+    const int row=row_base+local_row,inner=inner_base+local_inner;
+    warp_a[lane]=row<trace_dofs&&inner<interior_dofs
+        ?c[row*interior_dofs+inner]:0.0;
+#pragma unroll
+    for(int slot=0;slot<BatchWidth;++slot)
+    {
+      // Row-major B keeps each solved-workspace row coalesced.
+      const int b_local_inner=lane/8,b_local_column=lane%8;
+      const int column=(first_column_tile+slot)*8+b_local_column;
+      const int b_inner=inner_base+b_local_inner;
+      warp_b[slot*4*8+lane]=
+          column<solved_columns&&b_inner<interior_dofs
+          ?solved[b_inner*solved_columns+column]:0.0;
+    }
+    __syncwarp();
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,8,8,4,double,
+                          nvcuda::wmma::row_major> matrix_a;
+    nvcuda::wmma::load_matrix_sync(matrix_a,warp_a,4);
+#pragma unroll
+    for(int slot=0;slot<BatchWidth;++slot)
+    {
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
+                            nvcuda::wmma::row_major> matrix_b;
+      nvcuda::wmma::load_matrix_sync(
+          matrix_b,warp_b+slot*4*8,8);
+      nvcuda::wmma::mma_sync(accumulators[slot],matrix_a,matrix_b,
+                             accumulators[slot]);
+    }
+  }
+#pragma unroll
+  for(int slot=0;slot<BatchWidth;++slot)
+  {
+    const int column_base=(first_column_tile+slot)*8;
+    nvcuda::wmma::store_matrix_sync(
+        warp_product,accumulators[slot],8,
+        nvcuda::wmma::mem_row_major);
+    __syncwarp();
+    for(int item=lane;item<8*8;item+=warpSize)
+    {
+      const int row=row_base+item/8,column=column_base+item%8;
+      if(row<trace_dofs&&column<solved_columns)
+      {
+        const double product=warp_product[item];
+        if(column==trace_dofs)
+          condensed_rhs[row]=g[row]-product;
+        else
+          schur[row*trace_dofs+column]=
+              d[row*trace_dofs+column]-product;
+      }
+    }
+    __syncwarp();
+  }
+}
 #endif
 
 // The tensor leaf uses an eight-column pivoted FP64 LU panel.  Scalar panel
@@ -3801,101 +3880,46 @@ __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
     __syncthreads();
   }
 
-  const int warp=threadIdx.x/warpSize,lane=threadIdx.x%warpSize;
+  const int warp=threadIdx.x/warpSize;
   const int row_tiles=(nt+7)/8,column_tiles=(nt+7)/8;
   const bool tensorize_rhs=(cols+7)/8==column_tiles;
-  const int output_tiles=row_tiles*column_tiles;
-  const int first_tile=output_tiles*warp/tensor_warps_per_block;
-  const int last_tile=output_tiles*(warp+1)/tensor_warps_per_block;
-  for(int tile=first_tile;tile<last_tile;)
+  // Schedule complete two-column jobs so a warp boundary can never split a
+  // material pair.  The genuine odd-column tail has a distinct compile-time
+  // one-tile body; there is no optional second MMA for nvcc to predicate and
+  // count on that path.
+  const int column_pairs=column_tiles/2;
+  const int paired_jobs=row_tiles*column_pairs;
+  const int first_paired_job=
+      paired_jobs*warp/tensor_warps_per_block;
+  const int last_paired_job=
+      paired_jobs*(warp+1)/tensor_warps_per_block;
+  if(column_pairs>0)
+    for(int job=first_paired_job;job<last_paired_job;++job)
+    {
+      const int row_tile=job/column_pairs;
+      const int column_pair=job-row_tile*column_pairs;
+      TensorSchurTileBatch<2>(
+          v.c+co,w,v.d+so,v.g+e*nt,
+          v.schur+so,v.condensed_rhs+e*nt,
+          ni,nt,cols,row_tile,2*column_pair,
+          &tensor_a[0][0],&tensor_b[0][0][0],
+          &tensor_product[0][0]);
+    }
+  if(column_tiles%2!=0)
   {
-    const int row_tile=tile/column_tiles;
-    const int column_tile=tile-row_tile*column_tiles;
-    int batch_width=tensor_column_batch_tiles;
-    const int range_remaining=last_tile-tile;
-    const int row_remaining=column_tiles-column_tile;
-    if(batch_width>range_remaining)batch_width=range_remaining;
-    if(batch_width>row_remaining)batch_width=row_remaining;
-    const int row_base=row_tile*8;
-    using TensorAccumulator=nvcuda::wmma::fragment<
-        nvcuda::wmma::accumulator,8,8,4,double>;
-    TensorAccumulator accumulators[tensor_column_batch_tiles];
-#pragma unroll
-    for(int slot=0;slot<tensor_column_batch_tiles;++slot)
-      nvcuda::wmma::fill_fragment(accumulators[slot],0.0);
-    for(int inner_base=0;inner_base<ni;inner_base+=4)
+    const int first_tail_row=
+        row_tiles*warp/tensor_warps_per_block;
+    const int last_tail_row=
+        row_tiles*(warp+1)/tensor_warps_per_block;
+    for(int row_tile=first_tail_row;row_tile<last_tail_row;++row_tile)
     {
-      const int local_row=lane/4,local_inner=lane%4;
-      const int row=row_base+local_row,inner=inner_base+local_inner;
-      tensor_a[warp][lane]=row<nt&&inner<ni
-          ?v.c[co+row*ni+inner]:0.0;
-#pragma unroll
-      for(int slot=0;slot<tensor_column_batch_tiles;++slot)
-      {
-        if(slot<batch_width)
-        {
-          // Row-major B keeps each solved-workspace row coalesced.
-          const int b_local_inner=lane/8,b_local_column=lane%8;
-          const int column=(column_tile+slot)*8+b_local_column;
-          const int b_inner=inner_base+b_local_inner;
-          tensor_b[warp][slot][lane]=column<cols&&b_inner<ni
-              ?w[b_inner*cols+column]:0.0;
-        }
-      }
-      __syncwarp();
-      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,8,8,4,double,
-                            nvcuda::wmma::row_major> matrix_a;
-      nvcuda::wmma::load_matrix_sync(matrix_a,tensor_a[warp],4);
-      // Slot zero is material for every nonempty warp range.  The optional
-      // slot-one contraction must cross an actual uniform loop edge rather
-      // than an unrolled predicate, otherwise its DMMA is still issued for a
-      // one-tile edge batch.
-      {
-        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
-                              nvcuda::wmma::row_major> matrix_b;
-        nvcuda::wmma::load_matrix_sync(
-            matrix_b,tensor_b[warp][0],8);
-        nvcuda::wmma::mma_sync(accumulators[0],matrix_a,matrix_b,
-                               accumulators[0]);
-      }
-#pragma unroll 1
-      for(int active_slot=1;active_slot<batch_width;++active_slot)
-      {
-        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
-                              nvcuda::wmma::row_major> matrix_b;
-        nvcuda::wmma::load_matrix_sync(
-            matrix_b,tensor_b[warp][1],8);
-        nvcuda::wmma::mma_sync(accumulators[1],matrix_a,matrix_b,
-                               accumulators[1]);
-      }
+      TensorSchurTileBatch<1>(
+          v.c+co,w,v.d+so,v.g+e*nt,
+          v.schur+so,v.condensed_rhs+e*nt,
+          ni,nt,cols,row_tile,column_tiles-1,
+          &tensor_a[0][0],&tensor_b[0][0][0],
+          &tensor_product[0][0]);
     }
-#pragma unroll
-    for(int slot=0;slot<tensor_column_batch_tiles;++slot)
-    {
-      if(slot<batch_width)
-      {
-        const int column_base=(column_tile+slot)*8;
-        nvcuda::wmma::store_matrix_sync(
-            tensor_product[warp],accumulators[slot],8,
-            nvcuda::wmma::mem_row_major);
-        __syncwarp();
-        for(int item=lane;item<8*8;item+=warpSize)
-        {
-          const int row=row_base+item/8,column=column_base+item%8;
-          if(row<nt&&column<cols)
-          {
-            const double product=tensor_product[warp][item];
-            if(column==nt)
-              v.condensed_rhs[e*nt+row]=v.g[e*nt+row]-product;
-            else
-              v.schur[so+row*nt+column]=
-                  v.d[so+row*nt+column]-product;
-          }
-        }
-        __syncwarp();
-      }
-    }
-    tile+=batch_width;
   }
   if(!tensorize_rhs)
     for(int row=threadIdx.x;row<nt;row+=blockDim.x)
