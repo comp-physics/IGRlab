@@ -562,6 +562,7 @@ __device__ void SetFinalResidualMetadata(
       ? residual / control->rhs_norm : residual;
 }
 
+template <bool UseCgs2>
 __global__ void NativeRankOneTraceSolveKernel(
     const NativeTraceSystemView system,
     const NativeTracePreconditionerView preconditioner,
@@ -638,13 +639,6 @@ __global__ void NativeRankOneTraceSolveKernel(
   double* const residual_scalars = sine + krylov_dimension;
   double* const work = workspace.vectors;
   double* const first_basis = workspace.basis;
-  const std::size_t projection_partial_doubles =
-      static_cast<std::size_t>(
-          krylov_dimension < native_trace_projection_tile
-              ? krylov_dimension : native_trace_projection_tile) *
-      gridDim.x;
-  double* const projection_coefficients =
-      workspace.reduction + projection_partial_doubles;
 
   for (int row = thread; row < rows; row += stride)
   {
@@ -739,41 +733,73 @@ __global__ void NativeRankOneTraceSolveKernel(
       SparseMatrixVector(system.matrix, work, next_basis, control, grid);
       if (FinishOnFailure(grid, control)) return;
 
-      // Deterministic FP64 CGS2.  Each bounded tile shares one pair of grid
-      // barriers for all its dot products, then each pass applies the complete
-      // basis projection in one vector traversal.
-      for (int basis_begin = 0; basis_begin < restart_size;
-           basis_begin += native_trace_projection_tile)
+      if constexpr (UseCgs2)
       {
-        const int basis_count =
-            restart_size - basis_begin < native_trace_projection_tile
-                ? restart_size - basis_begin
-                : native_trace_projection_tile;
-        GridBasisDotTile(workspace.basis, next_basis, rows, basis_begin,
-                         basis_count, projection_coefficients, workspace,
-                         control, grid, block_scratch);
+        const std::size_t projection_partial_doubles =
+            static_cast<std::size_t>(
+                krylov_dimension < native_trace_projection_tile
+                    ? krylov_dimension : native_trace_projection_tile) *
+            gridDim.x;
+        double* const projection_coefficients =
+            workspace.reduction + projection_partial_doubles;
+        // Deterministic FP64 CGS2 for the long ILU-preconditioned IGR solve.
+        // Each bounded tile shares one pair of grid barriers for all its dot
+        // products, then each pass applies the complete basis projection in
+        // one vector traversal.
+        for (int basis_begin = 0; basis_begin < restart_size;
+             basis_begin += native_trace_projection_tile)
+        {
+          const int basis_count =
+              restart_size - basis_begin < native_trace_projection_tile
+                  ? restart_size - basis_begin
+                  : native_trace_projection_tile;
+          GridBasisDotTile(workspace.basis, next_basis, rows, basis_begin,
+                           basis_count, projection_coefficients, workspace,
+                           control, grid, block_scratch);
+        }
+        ProjectBasisSpace(next_basis, workspace.basis,
+                          projection_coefficients, restart_size, rows,
+                          hessenberg, krylov_dimension, column, false,
+                          control, grid);
+        if (FinishOnFailure(grid, control)) return;
+        for (int basis_begin = 0; basis_begin < restart_size;
+             basis_begin += native_trace_projection_tile)
+        {
+          const int basis_count =
+              restart_size - basis_begin < native_trace_projection_tile
+                  ? restart_size - basis_begin
+                  : native_trace_projection_tile;
+          GridBasisDotTile(workspace.basis, next_basis, rows, basis_begin,
+                           basis_count, projection_coefficients, workspace,
+                           control, grid, block_scratch);
+        }
+        ProjectBasisSpace(next_basis, workspace.basis,
+                          projection_coefficients, restart_size, rows,
+                          hessenberg, krylov_dimension, column, true,
+                          control, grid);
+        if (FinishOnFailure(grid, control)) return;
       }
-      ProjectBasisSpace(next_basis, workspace.basis,
-                        projection_coefficients, restart_size, rows,
-                        hessenberg, krylov_dimension, column, false,
-                        control, grid);
-      if (FinishOnFailure(grid, control)) return;
-      for (int basis_begin = 0; basis_begin < restart_size;
-           basis_begin += native_trace_projection_tile)
+      else
       {
-        const int basis_count =
-            restart_size - basis_begin < native_trace_projection_tile
-                ? restart_size - basis_begin
-                : native_trace_projection_tile;
-        GridBasisDotTile(workspace.basis, next_basis, rows, basis_begin,
-                         basis_count, projection_coefficients, workspace,
-                         control, grid, block_scratch);
+        // The conventional diagonal-preconditioned solve converges in very
+        // few iterations.  Preserve the lower-register pinned-HYPRE MGS path;
+        // CGS2's extra pass and register footprint regress this short solve.
+        for (int basis_index = 0; basis_index < restart_size; ++basis_index)
+        {
+          const double* const basis = workspace.basis +
+              static_cast<std::size_t>(basis_index) * rows;
+          const double inner = GridDot(basis, next_basis, rows, workspace,
+                                       control, grid, block_scratch);
+          if (!isfinite(inner))
+            MarkFailure(control, failure_numerical_breakdown);
+          if (grid.thread_rank() == 0)
+            hessenberg[static_cast<std::size_t>(basis_index) *
+                krylov_dimension + column] = inner;
+          grid.sync();
+          if (FinishOnFailure(grid, control)) return;
+          AxpyVector(next_basis, -inner, basis, rows, control, grid);
+        }
       }
-      ProjectBasisSpace(next_basis, workspace.basis,
-                        projection_coefficients, restart_size, rows,
-                        hessenberg, krylov_dimension, column, true,
-                        control, grid);
-      if (FinishOnFailure(grid, control)) return;
 
       const double next_norm = GridNorm(next_basis, rows, workspace, control,
                                         grid, block_scratch);
@@ -889,8 +915,25 @@ __global__ void NativeRankOneTraceSolveKernel(
     grid.sync();
     if (FinishOnFailure(grid, control)) return;
 
-    FormBasisLinearCombination(work, workspace.basis, residual_scalars,
-                               restart_size, rows, control, grid);
+    if constexpr (UseCgs2)
+      FormBasisLinearCombination(work, workspace.basis, residual_scalars,
+                                 restart_size, rows, control, grid);
+    else
+    {
+      const double* const last_basis = workspace.basis +
+          static_cast<std::size_t>(restart_size - 1) * rows;
+      for (int row = thread; row < rows; row += stride)
+        work[row] = residual_scalars[restart_size - 1] * last_basis[row];
+      grid.sync();
+      for (int basis_index = restart_size - 2;
+           basis_index >= 0; --basis_index)
+      {
+        const double* const basis = workspace.basis +
+            static_cast<std::size_t>(basis_index) * rows;
+        AxpyVector(work, residual_scalars[basis_index], basis, rows,
+                   control, grid);
+      }
+    }
     ApplyPreconditioner(system, preconditioner, workspace,
                         work, work, control, grid);
     if (FinishOnFailure(grid, control)) return;
@@ -943,9 +986,29 @@ __global__ void NativeRankOneTraceSolveKernel(
         }
       }
       grid.sync();
-      FormBasisLinearCombination(first_basis, workspace.basis,
-                                 residual_scalars, restart_size + 1,
-                                 rows, control, grid);
+      if constexpr (UseCgs2)
+        FormBasisLinearCombination(first_basis, workspace.basis,
+                                   residual_scalars, restart_size + 1,
+                                   rows, control, grid);
+      else
+      {
+        double* const last_restart_basis = workspace.basis +
+            static_cast<std::size_t>(restart_size) * rows;
+        AxpyVector(last_restart_basis,
+                   residual_scalars[restart_size] - 1.0,
+                   last_restart_basis, rows, control, grid);
+        for (int basis_index = restart_size - 1;
+             basis_index > 0; --basis_index)
+        {
+          const double* const basis = workspace.basis +
+              static_cast<std::size_t>(basis_index) * rows;
+          AxpyVector(last_restart_basis, residual_scalars[basis_index],
+                     basis, rows, control, grid);
+        }
+        AxpyVector(first_basis, residual_scalars[0] - 1.0,
+                   first_basis, rows, control, grid);
+        AxpyVector(first_basis, 1.0, last_restart_basis, rows, control, grid);
+      }
       if (FinishOnFailure(grid, control)) return;
     }
   }
@@ -991,10 +1054,6 @@ QueryNativeTraceWorkspaceRequirements(const int rows,
   std::size_t hessenberg = 0;
   std::size_t scalar_vectors = 0;
   std::size_t small = 0;
-  std::size_t projection_partials = 0;
-  std::size_t projection_reduction = 0;
-  const std::size_t projection_tile = std::min(
-      dimension, static_cast<std::size_t>(native_trace_projection_tile));
   if (!CheckedAdd(dimension, 1, dimension_plus_one) ||
       !CheckedMultiply(row_count, dimension_plus_one,
                        result.basis_doubles) ||
@@ -1003,14 +1062,23 @@ QueryNativeTraceWorkspaceRequirements(const int rows,
       !CheckedMultiply(dimension_plus_one, dimension, hessenberg) ||
       !CheckedMultiply(dimension, 2, scalar_vectors) ||
       !CheckedAdd(scalar_vectors, dimension_plus_one, scalar_vectors) ||
-      !CheckedAdd(hessenberg, scalar_vectors, small) ||
-      !CheckedMultiply(projection_tile,
-                       static_cast<std::size_t>(cooperative_blocks),
-                       projection_partials) ||
-      !CheckedAdd(projection_partials, dimension, projection_reduction))
+      !CheckedAdd(hessenberg, scalar_vectors, small))
     return NativeTraceWorkspaceRequirements{};
 
-  result.reduction_doubles = projection_reduction;
+  if (igr_active)
+  {
+    std::size_t projection_partials = 0;
+    const std::size_t projection_tile = std::min(
+        dimension, static_cast<std::size_t>(native_trace_projection_tile));
+    if (!CheckedMultiply(projection_tile,
+                         static_cast<std::size_t>(cooperative_blocks),
+                         projection_partials) ||
+        !CheckedAdd(projection_partials, dimension,
+                    result.reduction_doubles))
+      return NativeTraceWorkspaceRequirements{};
+  }
+  else
+    result.reduction_doubles = static_cast<std::size_t>(cooperative_blocks);
   result.small_doubles = small;
   result.permutation_integers = igr_active ? row_count : 0;
   result.control_double_slots = NativeTraceControlDoubleSlots();
@@ -1023,7 +1091,6 @@ QueryNativeRankOneTraceCooperativeSupport(const int rows,
                                           const int krylov_dimension,
                                           const bool igr_active) noexcept
 {
-  (void)igr_active;
   NativeTraceCooperativeSupport result{};
   if (rows <= 0 || krylov_dimension <= 0 ||
       krylov_dimension == std::numeric_limits<int>::max())
@@ -1043,11 +1110,17 @@ QueryNativeRankOneTraceCooperativeSupport(const int rows,
       cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
                              device) != cudaSuccess ||
       cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount,
-                             device) != cudaSuccess ||
-      cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &active_blocks, NativeRankOneTraceSolveKernel,
-          native_trace_cooperative_threads, 0) != cudaSuccess)
+                             device) != cudaSuccess)
     return NativeTraceCooperativeSupport{};
+
+  const cudaError_t occupancy = igr_active
+      ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &active_blocks, NativeRankOneTraceSolveKernel<true>,
+            native_trace_cooperative_threads, 0)
+      : cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &active_blocks, NativeRankOneTraceSolveKernel<false>,
+            native_trace_cooperative_threads, 0);
+  if (occupancy != cudaSuccess) return NativeTraceCooperativeSupport{};
 
   // This leaf is an SM120 tensor-backend implementation, not a generic CUDA
   // fallback.  A different device is rejected rather than silently rerouted.
@@ -1235,8 +1308,11 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
   void* arguments[] = {&system_argument, &preconditioner_argument,
                        &workspace_argument, &policy_argument,
                        &support_argument};
+  const void* const kernel = igr
+      ? reinterpret_cast<const void*>(NativeRankOneTraceSolveKernel<true>)
+      : reinterpret_cast<const void*>(NativeRankOneTraceSolveKernel<false>);
   const cudaError_t launch = cudaLaunchCooperativeKernel(
-      reinterpret_cast<const void*>(NativeRankOneTraceSolveKernel),
+      kernel,
       dim3(static_cast<unsigned int>(support.cooperative_blocks)),
       dim3(static_cast<unsigned int>(native_trace_cooperative_threads)),
       arguments, 0, stream);

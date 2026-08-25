@@ -207,7 +207,7 @@ bool NativeWorkspaceRequirementsPolicy() noexcept
   return conventional.valid && igr.valid &&
       conventional.basis_doubles == 50 && igr.basis_doubles == 50 &&
       conventional.vector_doubles == 10 && igr.vector_doubles == 30 &&
-      conventional.reduction_doubles == 12 &&
+      conventional.reduction_doubles == 2 &&
       igr.reduction_doubles == 12 &&
       conventional.small_doubles == 33 && igr.small_doubles == 33 &&
       conventional.permutation_integers == 0 &&
@@ -663,6 +663,84 @@ NativeSolveFixture MakeIgrFixture()
   return fixture;
 }
 
+NativeSolveFixture MakeIgrCgs2TileFixture(const int krylov_dimension)
+{
+  // A defective upper-Jordan operator with a dense right-hand side produces a
+  // long, nonnormal Krylov sequence.  The identity factor deliberately keeps
+  // the right preconditioner neutral while selecting the production IGR/CGS2
+  // specialization, including its permutation and five-sweep ILU path.
+  constexpr int rows = 32;
+  constexpr double superdiagonal = 0.75;
+  std::vector<double> matrix(static_cast<std::size_t>(rows) * rows, 0.0);
+  std::vector<double> identity(static_cast<std::size_t>(rows) * rows, 0.0);
+  for (int row = 0; row < rows; ++row)
+  {
+    matrix[static_cast<std::size_t>(row) * rows + row] = 1.0;
+    identity[static_cast<std::size_t>(row) * rows + row] = 1.0;
+    if (row + 1 < rows)
+      matrix[static_cast<std::size_t>(row) * rows + row + 1] =
+          superdiagonal;
+  }
+
+  NativeSolveFixture fixture{};
+  fixture.matrix = DenseToDiagonalFirstCsr(matrix, rows);
+  fixture.right_hand_side.assign(static_cast<std::size_t>(rows), 1.0);
+  fixture.ilu.factor = DenseToDiagonalFirstCsr(identity, rows);
+  fixture.ilu.permutation.resize(static_cast<std::size_t>(rows));
+  fixture.ilu.inverse_diagonal.assign(static_cast<std::size_t>(rows), 1.0);
+  for (int row = 0; row < rows; ++row)
+    fixture.ilu.permutation[static_cast<std::size_t>(row)] = rows - 1 - row;
+  fixture.policy.rank_count = 1;
+  fixture.policy.krylov_dimension = krylov_dimension;
+  fixture.policy.maximum_iterations = 256;
+  fixture.policy.relative_tolerance = 1.0e-10;
+  fixture.policy.absolute_tolerance = 0.0;
+  fixture.igr = true;
+  return fixture;
+}
+
+bool IgrCgs2TileFixtureHostContract(const NativeSolveFixture& fixture)
+{
+  constexpr double superdiagonal = 0.75;
+  if (!fixture.igr || fixture.matrix.rows != 32) return false;
+  const std::vector<double> dense = CsrToDense(fixture.matrix);
+  if (dense.size() != static_cast<std::size_t>(fixture.matrix.rows) *
+          fixture.matrix.rows ||
+      dense[1] != superdiagonal || dense[fixture.matrix.rows] != 0.0)
+    return false;
+
+  std::vector<double> direct;
+  if (!SolveDenseReference(dense, fixture.right_hand_side, direct))
+    return false;
+  std::vector<double> expected(
+      static_cast<std::size_t>(fixture.matrix.rows), 1.0);
+  for (int row = fixture.matrix.rows - 2; row >= 0; --row)
+    expected[static_cast<std::size_t>(row)] =
+        1.0 - superdiagonal * expected[static_cast<std::size_t>(row + 1)];
+  return MaximumScaledDifference(direct, expected) == 0.0;
+}
+
+bool SameNativeSolveResult(
+    const dg::hdg::runtime::cuda_w8a::detail::NativeTraceSolveControl& first,
+    const dg::hdg::runtime::cuda_w8a::detail::NativeTraceSolveControl& second)
+    noexcept
+{
+  // reduction_value is transient reduction scratch, not part of the solve
+  // result contract.  Every externally meaningful fixed scalar must repeat.
+  return first.schema == second.schema && first.status == second.status &&
+      first.failure_mask == second.failure_mask &&
+      first.iterations == second.iterations &&
+      first.restart_cycles == second.restart_cycles &&
+      first.preconditioner_applications ==
+          second.preconditioner_applications &&
+      first.actual_residual_checks == second.actual_residual_checks &&
+      first.rhs_norm == second.rhs_norm &&
+      first.initial_residual_norm == second.initial_residual_norm &&
+      first.estimated_residual_norm == second.estimated_residual_norm &&
+      first.actual_residual_norm == second.actual_residual_norm &&
+      first.relative_residual_norm == second.relative_residual_norm;
+}
+
 bool NativeConvergedFixtureExact(const NativeSolveFixture& fixture,
                                  const NativeSolveFixtureResult& result,
                                  const bool require_restart,
@@ -700,6 +778,38 @@ bool NativeConvergedFixtureExact(const NativeSolveFixture& fixture,
           metadata_tolerance &&
       std::abs(result.control.relative_residual_norm -
                residual_norm / rhs_norm) <= metadata_tolerance;
+}
+
+bool NativeIgrCgs2TileFixturesExact()
+{
+  constexpr std::array<int, 4> dimensions{{7, 8, 9, 20}};
+  for (const int dimension : dimensions)
+  {
+    const NativeSolveFixture fixture = MakeIgrCgs2TileFixture(dimension);
+    NativeSolveFixtureResult first{};
+    NativeSolveFixtureResult second{};
+    const bool qualified = IgrCgs2TileFixtureHostContract(fixture) &&
+        RunNativeSolveFixture(fixture, first) &&
+        RunNativeSolveFixture(fixture, second) &&
+        NativeConvergedFixtureExact(fixture, first, true, -1) &&
+        NativeConvergedFixtureExact(fixture, second, true, -1) &&
+        MaximumScaledDifference(first.solution, second.solution) == 0.0 &&
+        SameNativeSolveResult(first.control, second.control);
+    if (!qualified)
+    {
+      std::cerr << "native trace IGR CGS2 tile fixture failed kdim="
+                << dimension << " first_status="
+                << dg::hdg::runtime::cuda_w8a::detail::
+                       NativeTraceSolveStatusName(first.control.status)
+                << " second_status="
+                << dg::hdg::runtime::cuda_w8a::detail::
+                       NativeTraceSolveStatusName(second.control.status)
+                << " first_iterations=" << first.control.iterations
+                << " second_iterations=" << second.control.iterations << '\n';
+      return false;
+    }
+  }
+  return true;
 }
 
 bool NativeMaximumIterationFixtureExact(
@@ -792,6 +902,8 @@ bool NativeTraceDeviceFixtures() noexcept
                 << " iterations=" << igr_result.control.iterations << '\n';
       return false;
     }
+
+    if (!NativeIgrCgs2TileFixturesExact()) return false;
 
     const NativeSolveFixture maximum =
         MakeConventionalFixture(1, 1, 1.0e-30);

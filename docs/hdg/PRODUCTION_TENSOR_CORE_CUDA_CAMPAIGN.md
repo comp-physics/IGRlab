@@ -310,6 +310,21 @@ product and two communicator inner products to rebuild the authoritative true
 residual. The complete trace-solve phase is therefore not claimed to be one
 kernel launch.
 
+The native leaf has two compile-time-specialized entry points selected by the
+typed preconditioner/mode contract. Conventional diagonal-preconditioned solves
+retain deterministic modified Gram-Schmidt in the pinned HYPRE update order;
+their short Krylov trajectories do not amortize an additional projection pass.
+IGR ILU-preconditioned solves use deterministic FP64 classical Gram-Schmidt
+with one reorthogonalization pass. The IGR specialization reduces basis dots in
+bounded tiles of eight, applies each complete basis projection in one vector
+traversal, and forms the solution and restart basis combinations in one
+traversal apiece. Its projection scratch is fixed at
+`min(K,8) * cooperative_blocks + K` doubles and is overwritten within one
+solve. The two specializations are distinct SASS functions with independent
+occupancy admission; this is an explicit numerical specialization, not an
+ordinary-CUDA fallback. CGS2 reduces synchronization and vector traffic but is
+still FP64 SIMT solver fusion, not tensor-core execution.
+
 The MFEM/HYPRE ParCSR object retains matrix-storage ownership. In tensor IGR,
 HYPRE also performs ILU0+RCM factor setup on the first trace solve of an
 attempt and populates the application-owned inverse-diagonal buffer. That
@@ -783,6 +798,16 @@ the default regardless of selected tensor wins.
   median with 1052--1066 outer iterations, versus approximately 4.57 s and
   about 1067 iterations with retained first-factor reuse. The extra setup did
   not buy a meaningful convergence reduction and regressed end-to-end time.
+- Applying tiled CGS2 indiscriminately to both tensor modes was also rejected.
+  A pre-freeze saturated p3 tuning probe reduced tensor IGR from the retained-
+  factor MGS control's approximately 4.57 s and 1067 outer iterations to a
+  2.184369 s accepted-step median and 452--463 iterations, with all independent
+  FP64 true-residual and acceptance gates positive. The same kernel increased
+  conventional p3 from approximately 0.07631 s to 0.09599 s while leaving its
+  eleven iterations unchanged. The selected mode-specialized entry points
+  retain the IGR CGS2 dataflow and restore conventional MGS; the restored
+  conventional probe was 0.076536 s. These tuning probes explain the numerical
+  policy but are not final paired campaign evidence.
 - Preliminary external profiling of the earlier HYPRE-solve prototype
   identified sparse direct triangular solve as the dominant tensor-IGR
   accepted-step hotspot. That observation motivated the native fused trace
