@@ -1,5 +1,5 @@
 foreach(_required IN ITEMS TEST_EXECUTABLE CUOBJDUMP_EXECUTABLE
-                           EXPECTED_KERNEL_SUBSTRING)
+                           EXPECTED_KERNEL_SUBSTRING EVIDENCE_OUTPUT_DIR)
   if(NOT DEFINED ${_required} OR "${${_required}}" STREQUAL "")
     message(FATAL_ERROR "missing generic tensor SASS argument ${_required}")
   endif()
@@ -10,9 +10,41 @@ if(NOT EXISTS "${TEST_EXECUTABLE}")
     "production-linked tensor evidence binary does not exist: ${TEST_EXECUTABLE}")
 endif()
 
+get_filename_component(_test_executable_real_path
+  "${TEST_EXECUTABLE}" REALPATH)
+get_filename_component(_cuobjdump_real_path
+  "${CUOBJDUMP_EXECUTABLE}" REALPATH)
+file(MAKE_DIRECTORY "${EVIDENCE_OUTPUT_DIR}")
+get_filename_component(_evidence_output_real_path
+  "${EVIDENCE_OUTPUT_DIR}" REALPATH)
+file(SHA256 "${_test_executable_real_path}" _test_executable_sha256)
+file(SHA256 "${_cuobjdump_real_path}" _cuobjdump_sha256)
+
 execute_process(
-  COMMAND "${CUOBJDUMP_EXECUTABLE}" --dump-elf-symbols
-          --gpu-architecture sm_120 "${TEST_EXECUTABLE}"
+  COMMAND "${_cuobjdump_real_path}" --version
+  RESULT_VARIABLE _version_result
+  OUTPUT_VARIABLE _version_output
+  ERROR_VARIABLE _version_error
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_STRIP_TRAILING_WHITESPACE)
+if(NOT _version_result EQUAL 0)
+  message(FATAL_ERROR
+    "cuobjdump --version failed for ${_cuobjdump_real_path}: ${_version_error}")
+endif()
+set(_cuobjdump_version "${_version_output}")
+if(NOT _version_error STREQUAL "")
+  if(NOT _cuobjdump_version STREQUAL "")
+    string(APPEND _cuobjdump_version "\n")
+  endif()
+  string(APPEND _cuobjdump_version "${_version_error}")
+endif()
+if(_cuobjdump_version STREQUAL "")
+  message(FATAL_ERROR "cuobjdump --version returned no identity")
+endif()
+
+execute_process(
+  COMMAND "${_cuobjdump_real_path}" --dump-elf-symbols
+          --gpu-architecture sm_120 "${_test_executable_real_path}"
   RESULT_VARIABLE _result
   OUTPUT_VARIABLE _symbols
   ERROR_VARIABLE _error)
@@ -42,9 +74,9 @@ if(_kernel_symbol STREQUAL "")
 endif()
 
 execute_process(
-  COMMAND "${CUOBJDUMP_EXECUTABLE}" --dump-sass
+  COMMAND "${_cuobjdump_real_path}" --dump-sass
           --gpu-architecture sm_120 --function "${_kernel_symbol}"
-          "${TEST_EXECUTABLE}"
+          "${_test_executable_real_path}"
   RESULT_VARIABLE _result
   OUTPUT_VARIABLE _function_sass
   ERROR_VARIABLE _error)
@@ -74,5 +106,50 @@ if(_dmma_count LESS 1)
     "${EXPECTED_KERNEL_SUBSTRING} has no DMMA.8x8x4 instruction")
 endif()
 
+# Retain one finite, static exact-function artifact in the canonical build
+# tree.  This is post-build disassembly, not application instrumentation or an
+# event stream.  The companion manifest binds the production executable,
+# cuobjdump identity/commands, exact native symbol, and artifact hash.
+set(_sass_artifact
+  "${_evidence_output_real_path}/tensor-fused-local-algebra-sm120.sass")
+set(_evidence_manifest
+  "${_evidence_output_real_path}/tensor-sass-evidence-v1.txt")
+file(WRITE "${_sass_artifact}" "${_function_sass}")
+file(SHA256 "${_sass_artifact}" _sass_artifact_sha256)
+file(SHA256 "${_test_executable_real_path}" _test_executable_sha256_after)
+file(SHA256 "${_cuobjdump_real_path}" _cuobjdump_sha256_after)
+if(NOT "${_test_executable_sha256_after}" STREQUAL
+       "${_test_executable_sha256}" OR
+   NOT "${_cuobjdump_sha256_after}" STREQUAL "${_cuobjdump_sha256}")
+  message(FATAL_ERROR
+    "tensor SASS executable or cuobjdump changed during disassembly")
+endif()
+string(REPLACE "\n" "\\n" _cuobjdump_version_field
+  "${_cuobjdump_version}")
+set(_symbols_command
+  "${_cuobjdump_real_path} --dump-elf-symbols --gpu-architecture sm_120 ${_test_executable_real_path}")
+set(_sass_command
+  "${_cuobjdump_real_path} --dump-sass --gpu-architecture sm_120 --function ${_kernel_symbol} ${_test_executable_real_path}")
+file(WRITE "${_evidence_manifest}"
+  "schema=dg-igr-hdg-tensor-sass-evidence\n"
+  "version=1\n"
+  "scope=fused-local-algebra-condensation\n"
+  "architecture=sm_120\n"
+  "executable=${_test_executable_real_path}\n"
+  "executable_sha256=${_test_executable_sha256}\n"
+  "cuobjdump=${_cuobjdump_real_path}\n"
+  "cuobjdump_sha256=${_cuobjdump_sha256}\n"
+  "cuobjdump_version=${_cuobjdump_version_field}\n"
+  "symbols_command=${_symbols_command}\n"
+  "sass_command=${_sass_command}\n"
+  "kernel=${_kernel_symbol}\n"
+  "fp64_tensor_instruction=DMMA.8x8x4\n"
+  "fp64_tensor_static_instruction_sites=${_dmma_count}\n"
+  "sass_artifact=${_sass_artifact}\n"
+  "sass_artifact_sha256=${_sass_artifact_sha256}\n"
+  "source_contract_intended_fused_stages=blocked-lu-trailing-update,blocked-forward-rhs-update,blocked-backward-rhs-update,schur-contraction\n"
+  "assembly_contract=fused-simt-no-tensor-instruction-claim\n")
+file(SHA256 "${_evidence_manifest}" _evidence_manifest_sha256)
+
 message(STATUS
-  "GENERIC_TENSOR_SASS_PASS executable=${TEST_EXECUTABLE} kernel=${_kernel_symbol} fp64_tensor_instructions=${_dmma_count}")
+  "GENERIC_TENSOR_SASS_PASS executable=${_test_executable_real_path} executable_sha256=${_test_executable_sha256} cuobjdump=${_cuobjdump_real_path} cuobjdump_sha256=${_cuobjdump_sha256} kernel=${_kernel_symbol} fp64_tensor_static_instruction_sites=${_dmma_count} sass_artifact=${_sass_artifact} sass_artifact_sha256=${_sass_artifact_sha256} manifest=${_evidence_manifest} manifest_sha256=${_evidence_manifest_sha256}")

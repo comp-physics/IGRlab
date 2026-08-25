@@ -1160,6 +1160,7 @@ def parse_ncu_tensor_csv(data: bytes, expected_launches: int) -> dict[str, Any]:
         "dmma_metric": NCU_DMMA_METRIC,
         "dmma_instruction_total": sum(dmma_values),
         "dmma_instruction_minimum": min(dmma_values),
+        "dmma_instruction_maximum": max(dmma_values),
         "duration_metric": NCU_DURATION_METRIC,
         "duration_unit": "nanoseconds",
         "raw_duration_unit_field": duration_unit or "empty (NCU 2024.1)",
@@ -1168,7 +1169,209 @@ def parse_ncu_tensor_csv(data: bytes, expected_launches: int) -> dict[str, Any]:
     }
 
 
-def import_ncu_tensor_proof(args: argparse.Namespace, tool: str) -> tuple[
+def exact_nonnegative_integer(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RuntimeError(f"{label} must be a nonnegative integer")
+    return value
+
+
+def application_argument(args: argparse.Namespace, option: str) -> str:
+    """Return one already-validated accepted-step application argument."""
+    positions = [index for index, value in enumerate(args.arg) if value == option]
+    if len(positions) != 1 or positions[0] + 1 >= len(args.arg):
+        raise RuntimeError(f"profiled application argument {option} is unavailable")
+    return args.arg[positions[0] + 1]
+
+
+def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
+    """Validate one bounded benchmark summary from the profiled process.
+
+    This consumes the existing finite execution log after the process exits. It
+    adds no application callback, event stream, or production instrumentation.
+    """
+    log_path = args.out_dir / "execution.log"
+    try:
+        text = regular_bytes(log_path, args.out_dir).decode(
+            "utf-8", errors="strict"
+        )
+    except UnicodeError as exc:
+        raise RuntimeError(
+            f"profile execution log is not UTF-8: {exc}"
+        ) from exc
+    records: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        object_start = line.find("{")
+        if object_start < 0:
+            continue
+        try:
+            candidate = json.loads(line[object_start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and candidate.get("benchmark") == \
+                "dg_igr_hdg_cuda_accepted_step":
+            records.append(candidate)
+    if len(records) != 1:
+        raise RuntimeError(
+            "qualification requires exactly one accepted-step benchmark "
+            f"summary in the execution log; observed {len(records)}"
+        )
+    record = records[0]
+    measured_step = int(application_argument(
+        args, "--profile-measured-step"
+    ))
+    expected_mode = application_argument(args, "--mode")
+    expected_order = int(application_argument(args, "--order"))
+    expected_mesh_n = int(application_argument(args, "--mesh-n"))
+    expected_periods = int(application_argument(args, "--domain-periods"))
+    expected_timestep = float(application_argument(args, "--dt"))
+    exact_record = (
+        record.get("schema") == 2 and record.get("success") is True and
+        record.get("variant") == "production" and
+        record.get("production_selectable") is True and
+        record.get("backend") == "cuda" and
+        record.get("cuda_engine") == "tensor" and
+        record.get("trace_policy") == PRODUCTION_TRACE_POLICY and
+        record.get("mode") == expected_mode and
+        record.get("polynomial_order") == expected_order and
+        record.get("mesh_n") == expected_mesh_n and
+        record.get("domain_periods") == expected_periods and
+        record.get("dt") == expected_timestep and
+        record.get("rank_count") == 1 and
+        record.get("profiling_observability") is True and
+        record.get("profile_measured_step") == measured_step and
+        record.get("host_export") is False
+    )
+    if not exact_record:
+        raise RuntimeError(
+            "profiled benchmark summary does not match the qualified production "
+            "tensor accepted-step selection"
+        )
+    samples = record.get("samples")
+    if not isinstance(samples, list):
+        raise RuntimeError("profiled benchmark summary has no sample array")
+    selected = [
+        sample for sample in samples
+        if isinstance(sample, dict) and
+        sample.get("measured_index") == measured_step
+    ]
+    if len(selected) != 1 or selected[0].get("phase") != "measured":
+        raise RuntimeError(
+            "profiled benchmark summary does not identify exactly one selected "
+            "measured step"
+        )
+    tensor = selected[0].get("tensor_core")
+    if not isinstance(tensor, dict):
+        raise RuntimeError("selected benchmark sample has no tensor work summary")
+    condensation_launches = exact_nonnegative_integer(
+        tensor.get("condensation_launches"), "condensation launch count"
+    )
+    mma_tiles = exact_nonnegative_integer(
+        tensor.get("mma_tiles"), "planned MMA tile count"
+    )
+    if condensation_launches <= 0 or mma_tiles <= 0:
+        raise RuntimeError(
+            "selected benchmark sample has no material tensor condensation work"
+        )
+    if not (
+        tensor.get("selected_engine") == "tensor" and
+        tensor.get("hardware_supported") is True and
+        tensor.get("fallback_count") == 0 and
+        tensor.get("fallback_accounting_complete") is True and
+        tensor.get("no_fallback") is True
+    ):
+        raise RuntimeError(
+            "selected benchmark sample does not prove an admitted no-fallback "
+            "tensor engine"
+        )
+
+    elements = exact_nonnegative_integer(record.get("elements"), "element count")
+    interior_components = exact_nonnegative_integer(
+        record.get("interior_components"), "interior component count"
+    )
+    trace_components = exact_nonnegative_integer(
+        record.get("trace_components"), "trace component count"
+    )
+    if elements <= 0 or interior_components <= 0 or trace_components <= 0:
+        raise RuntimeError("profiled tensor shape is empty")
+    expected_components = (4, 4) if expected_mode == "conventional" else (7, 5)
+    if elements != expected_mesh_n * expected_mesh_n or \
+            (interior_components, trace_components) != expected_components:
+        raise RuntimeError(
+            "profiled benchmark shape does not match the periodic quadrilateral "
+            "Euler/IGR contract"
+        )
+    scalar_interior_dofs = (expected_order + 1) ** 2
+    scalar_trace_dofs = 4 * (expected_order + 1)
+    interior_dofs = interior_components * scalar_interior_dofs
+    trace_dofs = trace_components * scalar_trace_dofs
+    expected_interior_unknowns = elements * interior_dofs
+    if record.get("interior_unknowns") != expected_interior_unknowns:
+        raise RuntimeError(
+            "profiled benchmark interior shape is inconsistent with its order, "
+            "components, and element count"
+        )
+
+    def tiles(count: int, width: int) -> int:
+        return (count + width - 1) // width
+
+    # Independent test-side reproduction of the fixed fused-kernel work
+    # decomposition. These are four scalar totals, not per-event telemetry.
+    schur = tiles(trace_dofs, 8) ** 2 * tiles(interior_dofs, 4)
+    blocked_lu = 0
+    blocked_forward = 0
+    blocked_backward = 0
+    rhs_tiles = tiles(trace_dofs + 1, 8)
+    for panel_start in range(0, interior_dofs, 8):
+        panel_end = min(panel_start + 8, interior_dofs)
+        panel_inner = tiles(panel_end - panel_start, 4)
+        trailing_rows = tiles(interior_dofs - panel_end, 8)
+        prefix_rows = tiles(panel_start, 8)
+        blocked_lu += trailing_rows * trailing_rows * panel_inner
+        blocked_forward += trailing_rows * rhs_tiles * panel_inner
+        blocked_backward += prefix_rows * rhs_tiles * panel_inner
+    per_element = {
+        "blocked_lu_trailing_update": blocked_lu,
+        "blocked_forward_rhs_update": blocked_forward,
+        "blocked_backward_rhs_update": blocked_backward,
+        "schur_contraction": schur,
+    }
+    if any(value <= 0 for value in per_element.values()):
+        raise RuntimeError(
+            "qualified p1-p3 tensor shape does not exercise every intended "
+            "fused local-algebra DMMA stage"
+        )
+    per_launch = {
+        stage: value * elements for stage, value in per_element.items()
+    }
+    selected_step = {
+        stage: value * condensation_launches
+        for stage, value in per_launch.items()
+    }
+    expected_mma_tiles = sum(selected_step.values())
+    if mma_tiles != expected_mma_tiles:
+        raise RuntimeError(
+            f"benchmark planned MMA total {mma_tiles} does not match the "
+            f"independent fused-stage total {expected_mma_tiles}"
+        )
+    return {
+        "status": "complete_profiled_tensor_work",
+        "profile_measured_step": measured_step,
+        "mode": expected_mode,
+        "polynomial_order": expected_order,
+        "elements": elements,
+        "interior_dofs_per_element": interior_dofs,
+        "trace_dofs_per_element": trace_dofs,
+        "condensation_launches": condensation_launches,
+        "planned_mma_tiles": mma_tiles,
+        "planned_mma_tiles_by_fused_stage": selected_step,
+        "all_intended_fused_stages_material": True,
+        "fallback_count": 0,
+        "execution_log": file_identity(log_path),
+    }
+
+
+def import_ncu_tensor_proof(args: argparse.Namespace, tool: str,
+                            application_work: dict[str, Any]) -> tuple[
         dict[str, Any], list[Path], dict[Path, list[str]]]:
     report = args.out_dir / NCU_REPORT
     csv_path = args.out_dir / "ncu-tensor-proof.csv"
@@ -1186,8 +1389,37 @@ def import_ncu_tensor_proof(args: argparse.Namespace, tool: str) -> tuple[
     if result.returncode:
         raise RuntimeError(f"NCU report import exited {result.returncode}")
     csv_data = regular_bytes(csv_path, args.out_dir)
-    proof = parse_ncu_tensor_csv(csv_data, args.ncu_launch_count)
+    expected_launches = int(application_work["condensation_launches"])
+    if args.ncu_launch_count != expected_launches:
+        raise RuntimeError(
+            f"NCU launch count {args.ncu_launch_count} does not match the "
+            f"profiled accepted step's {expected_launches} tensor launches"
+        )
+    proof = parse_ncu_tensor_csv(csv_data, expected_launches)
+    expected_instructions = int(application_work["planned_mma_tiles"])
+    expected_per_launch, remainder = divmod(
+        expected_instructions, expected_launches
+    )
+    exact_dmma_work = (
+        expected_instructions <= 2 ** 53 and remainder == 0 and
+        proof["dmma_instruction_total"] == float(expected_instructions) and
+        proof["dmma_instruction_minimum"] == float(expected_per_launch) and
+        proof["dmma_instruction_maximum"] == float(expected_per_launch)
+    )
+    if not exact_dmma_work:
+        raise RuntimeError(
+            "NCU DMMA total does not exactly match the profiled accepted step's "
+            "complete planned MMA work on every launch: observed total/min/max "
+            f"{proof['dmma_instruction_total']}/"
+            f"{proof['dmma_instruction_minimum']}/"
+            f"{proof['dmma_instruction_maximum']}, expected "
+            f"{expected_instructions}/{expected_per_launch}/"
+            f"{expected_per_launch}"
+        )
     proof.update({
+        "complete_planned_dmma_match": True,
+        "planned_dmma_by_fused_stage":
+            application_work["planned_mma_tiles_by_fused_stage"],
         "import_command": command,
         "report": file_identity(report),
         "csv": file_identity(csv_path),
@@ -1362,7 +1594,8 @@ def parse_ncu_attribution_csv(data: bytes,
     }
 
 
-def import_ncu_attribution(args: argparse.Namespace, tool: str) -> tuple[
+def import_ncu_attribution(args: argparse.Namespace, tool: str,
+                           application_work: dict[str, Any]) -> tuple[
         dict[str, Any], list[Path], dict[Path, list[str]]]:
     report = args.out_dir / NCU_REPORT
     csv_path = args.out_dir / "ncu-accepted-step-attribution.csv"
@@ -1383,6 +1616,15 @@ def import_ncu_attribution(args: argparse.Namespace, tool: str) -> tuple[
     attribution = parse_ncu_attribution_csv(
         csv_data, args.ncu_launch_count
     )
+    expected_tensor_launches = int(application_work["condensation_launches"])
+    if attribution["tensor_condensation"]["launches"] != \
+            expected_tensor_launches:
+        raise RuntimeError(
+            "NCU accepted-step attribution tensor launch count does not match "
+            f"the profiled benchmark: observed "
+            f"{attribution['tensor_condensation']['launches']}, expected "
+            f"{expected_tensor_launches}"
+        )
     attribution.update({
         "import_command": command,
         "report": file_identity(report),
@@ -1452,6 +1694,12 @@ def qualification_evidence_unchanged(args: argparse.Namespace,
         current_report = validate_native_report(args)
         if current_report != qualification.get("native_report"):
             return False, "native profiler report changed after validation"
+        application_work = qualification.get("application_work", {})
+        execution_log = application_work.get("execution_log")
+        if not isinstance(execution_log, dict) or \
+                file_identity(Path(execution_log.get("path", ""))) != \
+                execution_log:
+            return False, "profiled benchmark execution log changed after validation"
         if args.level == "l2-ncu":
             proof_name = (
                 "tensor_instruction_proof"
@@ -1646,9 +1894,11 @@ def main() -> int:
                 if args.evidence_mode == "qualification":
                     try:
                         native_report = validate_native_report(args)
+                        application_work = profiled_tensor_work(args)
                         qualification = {
                             "status": "native_report_validated",
                             "native_report": native_report,
+                            "application_work": application_work,
                         }
                         if args.level == "l2-ncu":
                             assert tool is not None
@@ -1675,24 +1925,27 @@ def main() -> int:
                             if args.ncu_qualification_kind == \
                                     "tensor-instructions":
                                 tensor_proof, _, _ = import_ncu_tensor_proof(
-                                    args, tool
+                                    args, tool, application_work
                                 )
                                 qualification = {
                                     "status": "success",
                                     "native_report": native_report,
+                                    "application_work": application_work,
                                     "tensor_instruction_proof": tensor_proof,
                                 }
                                 detail = (
-                                    "qualified native NCU report proves positive "
-                                    "DMMA execution in tensor condensation kernel"
+                                    "qualified native NCU report proves complete "
+                                    "planned DMMA execution in the fused tensor "
+                                    "local-algebra/condensation kernel"
                                 )
                             else:
                                 attribution, _, _ = import_ncu_attribution(
-                                    args, tool
+                                    args, tool, application_work
                                 )
                                 qualification = {
                                     "status": "success",
                                     "native_report": native_report,
+                                    "application_work": application_work,
                                     "accepted_step_attribution": attribution,
                                 }
                                 detail = (
@@ -1709,6 +1962,7 @@ def main() -> int:
                             qualification = {
                                 "status": "success",
                                 "native_report": native_report,
+                                "application_work": application_work,
                                 "nsys_summaries": summaries,
                             }
                             detail = (

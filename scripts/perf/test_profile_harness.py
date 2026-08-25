@@ -168,7 +168,8 @@ def main() -> int:
         )
         executable(
             fake_ncu,
-            """import os
+            """import json
+import os
 import pathlib
 import sys
 
@@ -185,8 +186,10 @@ elif "--import" in arguments:
         categories = [
             ("BorrowedEulerVolumeKernel", "local-assembly", 8000),
             ("TensorBorrowedCondenseKernel", "condensation", 2000),
+            ("TensorBorrowedCondenseKernel", "condensation", 2000),
+            ("TensorBorrowedCondenseKernel", "condensation", 2000),
             ("OwnedMatrixKernel", "trace-assembly", 500),
-            ("hypreGPUKernel_DiagScaleVector", "trace-solve", 700),
+            ("NativeRankOneTraceSolveKernel", "trace-solve", 700),
             ("BorrowedRecoverKernel", "interior-recovery", 400),
             ("SquaredNormKernel", "reduction", 100),
             ("AdmissibilityKernel", "validation", 100),
@@ -202,7 +205,9 @@ elif "--import" in arguments:
     else:
         print('"ID","Kernel Name","sm__inst_executed_pipe_fp64_op_dmma.sum","gpu__time_duration.avg"')
         print('"","","inst","nsecond"')
-        value = "0" if os.environ.get("FAKE_NCU_ZERO") else "6048"
+        value = ("0" if os.environ.get("FAKE_NCU_ZERO") else
+                 "22827167" if os.environ.get("FAKE_NCU_WRONG_TOTAL") else
+                 "22827168")
         for launch in range(3):
             print(f'"{launch}","void TensorBorrowedCondenseKernel<double>()","{value}","226912"')
 else:
@@ -210,6 +215,43 @@ else:
     payload = (b"not-a-native-report" if os.environ.get("FAKE_NCU_BAD_REPORT")
                else b"NVR\\x00synthetic-native-report")
     stem.with_suffix(".ncu-rep").write_bytes(payload)
+    launches = int(os.environ.get("FAKE_APP_CONDENSATION_LAUNCHES", "3"))
+    print(json.dumps({
+        "schema": 2,
+        "benchmark": "dg_igr_hdg_cuda_accepted_step",
+        "success": True,
+        "variant": "production",
+        "production_selectable": True,
+        "backend": "cuda",
+        "cuda_engine": "tensor",
+        "trace_policy": "engine-default",
+        "mode": "igr",
+        "rank_count": 1,
+        "polynomial_order": 3,
+        "mesh_n": 52,
+        "domain_periods": 1,
+        "dt": 1e-5,
+        "elements": 2704,
+        "interior_components": 7,
+        "trace_components": 5,
+        "interior_unknowns": 302848,
+        "profiling_observability": True,
+        "profile_measured_step": 2,
+        "host_export": False,
+        "samples": [{
+            "phase": "measured",
+            "measured_index": 2,
+            "tensor_core": {
+                "selected_engine": "tensor",
+                "hardware_supported": True,
+                "condensation_launches": launches,
+                "mma_tiles": 22827168 * launches,
+                "fallback_count": 0,
+                "fallback_accounting_complete": True,
+                "no_fallback": True,
+            },
+        }],
+    }, separators=(",", ":")))
 """,
         )
         fake_nvidia_smi = qualification_tools / "nvidia-smi"
@@ -221,7 +263,8 @@ else:
         nsys_profiler_version = "NVIDIA Nsight Systems version 2026.1"
         executable(
             fake_qualification_nsys,
-            """import os
+            """import json
+import os
 import pathlib
 import sys
 
@@ -254,6 +297,42 @@ else:
     stem.with_suffix(".nsys-rep").write_bytes(
         b"NVIDIA Tegra Profiler Report synthetic"
     )
+    print(json.dumps({
+        "schema": 2,
+        "benchmark": "dg_igr_hdg_cuda_accepted_step",
+        "success": True,
+        "variant": "production",
+        "production_selectable": True,
+        "backend": "cuda",
+        "cuda_engine": "tensor",
+        "trace_policy": "engine-default",
+        "mode": "conventional",
+        "rank_count": 1,
+        "polynomial_order": 2,
+        "mesh_n": 52,
+        "domain_periods": 1,
+        "dt": 1e-5,
+        "elements": 2704,
+        "interior_components": 4,
+        "trace_components": 4,
+        "interior_unknowns": 97344,
+        "profiling_observability": True,
+        "profile_measured_step": 2,
+        "host_export": False,
+        "samples": [{
+            "phase": "measured",
+            "measured_index": 2,
+            "tensor_core": {
+                "selected_engine": "tensor",
+                "hardware_supported": True,
+                "condensation_launches": 3,
+                "mma_tiles": 5159232,
+                "fallback_count": 0,
+                "fallback_accounting_complete": True,
+                "no_fallback": True,
+            },
+        }],
+    }, separators=(",", ":")))
 """,
         )
 
@@ -334,8 +413,22 @@ else:
         ]
         assert proof["status"] == "positive_tensor_instruction_proof"
         assert proof["matched_launches"] == 3
-        assert proof["dmma_instruction_total"] == 18144.0
-        assert proof["dmma_instruction_minimum"] == 6048.0
+        assert proof["dmma_instruction_total"] == 68481504.0
+        assert proof["dmma_instruction_minimum"] == 22827168.0
+        assert proof["dmma_instruction_maximum"] == 22827168.0
+        assert proof["complete_planned_dmma_match"] is True
+        assert proof["planned_dmma_by_fused_stage"] == {
+            "blocked_backward_rhs_update": 16240224,
+            "blocked_forward_rhs_update": 16240224,
+            "blocked_lu_trailing_update": 13287456,
+            "schur_contraction": 22713600,
+        }
+        application_work = qualification_manifest["qualification"][
+            "application_work"
+        ]
+        assert application_work["condensation_launches"] == 3
+        assert application_work["planned_mma_tiles"] == 68481504
+        assert application_work["all_intended_fused_stages_material"] is True
         assert proof["duration_unit"] == "nanoseconds"
         assert proof["raw_duration_unit_field"] == "nsecond"
         assert proof["import_command"][-2:] == ["--print-units", "base"]
@@ -369,9 +462,10 @@ else:
         ]
         assert attribution["status"] == \
             "positive_accepted_step_attribution"
-        assert attribution["matched_launches"] == 9
-        assert attribution["total_gpu_kernel_duration_ns"] == 11900.0
-        assert attribution["tensor_condensation"]["duration_ns"] == 2000.0
+        assert attribution["matched_launches"] == 11
+        assert attribution["total_gpu_kernel_duration_ns"] == 15900.0
+        assert attribution["tensor_condensation"]["launches"] == 3
+        assert attribution["tensor_condensation"]["duration_ns"] == 6000.0
         assert attribution["import_command"][-2:] == [
             "--print-units", "base",
         ]
@@ -379,7 +473,7 @@ else:
             attribution["tensor_condensation"][
                 "fraction_of_gpu_kernel_duration"
             ],
-            2000.0 / 11900.0,
+            6000.0 / 15900.0,
         )
         assert set(attribution["required_categories"]) <= {
             item["category"] for item in attribution["categories"]
@@ -610,6 +704,26 @@ else:
         assert zero_manifest["outcome"] == "validation_failure"
         assert zero_manifest["qualification"]["status"] == "failure"
         assert "must be finite and positive" in zero_manifest["detail"]
+
+        wrong_total_out = root / "qualification-wrong-dmma-total"
+        run(
+            *qualification_arguments(wrong_total_out), expected=6,
+            env={**qualification_env, "FAKE_NCU_WRONG_TOTAL": "1"},
+        )
+        assert "complete planned MMA work" in read_manifest(
+            wrong_total_out
+        )["detail"]
+
+        truncated_out = root / "qualification-truncated-launches"
+        run(
+            *qualification_arguments(truncated_out), expected=6,
+            env={
+                **qualification_env,
+                "FAKE_APP_CONDENSATION_LAUNCHES": "4",
+            },
+        )
+        assert "does not match the profiled accepted step's 4 tensor launches" \
+            in read_manifest(truncated_out)["detail"]
 
         bad_report_out = root / "qualification-bad-report"
         run(

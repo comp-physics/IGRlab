@@ -227,14 +227,22 @@ provided it is private to the numerical leaf.
 ### Implemented tensor numerical leaf
 
 The production tensor selection retains the existing FP64 residual/Jacobian,
-global true-trace assembly, recovery, validation, and transactional code.  Its
-local condensation leaf keeps the ordinary engine's pivoted FP64 LU and
-triangular solves, then evaluates the material
-`C * A^{-1} * [B f]` product with native FP64 WMMA `m8n8k4` operations.  A
-four-warp element block processes 8-by-8 output tiles; row, column, and inner
-tails are explicitly zero-filled, so the same kernel admits every current
-conventional `U4/Uhat4` and IGR `U7/Uhat5` p1-p3 shape.  Schur and condensed
-right-hand-side products remain binary64.
+global true-trace assembly, recovery, validation, and transactional code. Its
+assembly launch fuses the element-local zero, volume, and face stages as one
+SIMT kernel; assembly currently makes no tensor-instruction claim. Its fused
+local-algebra/condensation kernel uses an eight-column pivoted FP64 LU panel.
+Scalar panel and diagonal-block solve work preserve the ordinary pivot and
+threshold semantics, while native FP64 WMMA `m8n8k4` performs the material
+blocked-LU trailing updates, forward and backward off-diagonal updates for the
+retained `[B f]` right-hand sides, and the `C * A^{-1} * B` Schur contraction.
+The condensed `C * A^{-1} * f` product shares a padded Schur edge tile when it
+fits (currently IGR p2); the other supported shapes perform that final vector
+contraction with scalar FP64 work in the same tensor leaf. A four-warp element
+block processes 8-by-8 output tiles; row, column, and inner tails are explicitly
+zero-filled, so the same kernel admits every current conventional `U4/Uhat4`
+and IGR `U7/Uhat5` p1-p3 shape. The retained solved workspace is consumed
+directly by recovery, eliminating the former second triangular solve. All
+local products remain binary64.
 
 The recurring true-trace GMRES preconditioner is selected by both CUDA engine
 and mathematical mode:
@@ -610,15 +618,22 @@ benchmark, tensor engine, no-export measured step, and one explicit proof kind.
 `tensor-instructions` fixes the condensation NVTX range, demangled
 `TensorBorrowedCondenseKernel` filter, launch count, and exact FP64
 DMMA/duration metrics; it rejects zero DMMA, zero duration, missing launches,
-or numeric rows from another kernel. `accepted-step-attribution` instead fixes
+or numeric rows from another kernel. It additionally binds that count to the
+selected benchmark sample, independently reconstructs positive planned tile
+totals for blocked LU, forward/backward RHS updates, and Schur contraction,
+and requires their sum to equal both the benchmark MMA total and the NCU DMMA
+total. `accepted-step-attribution` instead fixes
 the outer profiled-accepted-step NVTX range, duration-only metric, no kernel
 filter, and a positive launch limit. It imports the native raw table, requires
 the material HDG categories and positive tensor-condensation work, and retains
 category/kernel totals plus the tensor kernel's fraction of captured GPU
-kernel duration. The local pivoted LU, triangular solves, and Schur/RHS product
-execute in one production kernel and therefore remain one fused attribution
-category; the native kernel table and DMMA proof quantify that category without
-pretending an artificial kernel boundary exists. The captured fraction excludes
+kernel duration; its tensor launch count must match the same selected sample.
+The local pivoted LU, triangular solves, and Schur product execute in one
+production kernel and therefore remain one fused attribution category; the
+native kernel table and complete aggregate DMMA proof quantify that category
+without pretending an artificial kernel boundary exists. The fused SIMT
+assembly kernel is attributed separately by duration and is not mislabeled as
+tensor execution. The captured fraction excludes
 host/MPI, CUDA-API, and memcpy time and is not DMMA proof, so both NCU kinds are
 required. The Nsys qualification route validates the same exact tensor
 accepted-step application arguments, identities, and native report, then
@@ -644,8 +659,11 @@ The content-addressed profiler bundle retains these exact derivatives:
 - Nsys reports and derived NVTX/CUDA-API tables for representative conventional
   and IGR accepted steps, including every extraction command and artifact hash;
 - an exact production-linked SASS dump or canonical SASS-test log containing
-  the selected native sm_120 function, cuobjdump path/version and command,
-  profiled binary hash, `DMMA.8x8x4` count, and retained artifact hash.
+  the selected native sm_120 function, cuobjdump path/hash/version and command,
+  profiled binary hash, `DMMA.8x8x4` static-site count, and retained artifact
+  hash. The canonical SASS test writes the finite exact-function dump and its
+  hash-bound key/value manifest below the canonical build directory; it does
+  not instrument or record the running application.
 
 Every derived CSV or text summary is hashed beside the raw report and records
 the tool/import command that produced it. Diagnostic MMA tile counters establish

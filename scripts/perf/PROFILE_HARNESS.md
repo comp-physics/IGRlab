@@ -115,7 +115,18 @@ prevent Nsight Compute release defaults from rescaling the duration metric. The
 imported table must
 contain exactly the requested number of `TensorBorrowedCondenseKernel`
 launches, no numeric rows from another kernel, and positive FP64 DMMA and
-GPU-duration values for every launch.
+GPU-duration values for every launch. The harness also parses the benchmark's
+one finite schema-2 summary from the existing execution log and requires the
+selected measured sample to be the production tensor engine on supported
+hardware with zero fallback. The caller's launch count must equal that sample's
+condensation-launch count. An independent test-side shape calculation splits
+the planned work into four positive scalar totals—blocked-LU trailing updates,
+blocked forward-RHS updates, blocked backward-RHS updates, and Schur
+contraction—and their sum must equal both the sample's MMA-tile total and the
+NCU DMMA total, with the complete per-launch total observed on every selected
+launch. The condensed RHS shares a padded Schur edge tile only when it fits;
+otherwise its final contraction is scalar. This closes prefix-truncation and
+partial-work ambiguities while preserving the fused production kernel boundary.
 
 `--ncu-qualification-kind accepted-step-attribution` is the all-kernel
 accepted-step view. Its only metric is `gpu__time_duration.avg`; it forbids a
@@ -131,12 +142,17 @@ interior recovery, reductions, validation, packing/conversion, and nonlinear
 update, plus a positive `TensorBorrowedCondenseKernel` row. The manifest retains
 per-category and per-kernel launch/duration totals, fractions of captured GPU
 kernel duration, the tensor-condensation fraction, and any unclassified outer-
-range work. Local factorization, device transfer, and synchronization
+range work. Its tensor-kernel launch count must also equal the selected
+benchmark sample's condensation-launch count. Local factorization, device
+transfer, and synchronization
 categories are retained when present but are not mandatory positive categories
 for every capture.
 
 For either kind, the raw report, imported CSV, import stderr, commands, sizes,
-and SHA-256 identities are retained. The accepted-step attribution contains
+SHA-256 identities, and the fixed selected-step tensor-work summary are
+retained. This is bounded post-run validation of one finite benchmark log; it
+does not add callbacks, event capture, replay, or production instrumentation.
+The accepted-step attribution contains
 GPU kernel duration only; CUDA API and memcpy time require Nsys, and host/MPI
 time is not included. Its positive tensor-kernel duration is not instruction
 proof, so promotion requires the separate tensor-instructions capture. A
@@ -165,7 +181,8 @@ python3 scripts/perf/profile_harness.py \
   --ncu-metric gpu__time_duration.avg \
   --ncu-kernel-name-base demangled \
   --ncu-kernel-name 'regex:.*TensorBorrowedCondenseKernel.*' \
-  --ncu-launch-count 3 --ncu-nvtx-include 'HDG\/condensation/' \
+  --ncu-launch-count "$CONDENSATION_LAUNCHES" \
+  --ncu-nvtx-include 'HDG\/condensation/' \
   --require-data report=capture.ncu-rep \
   --arg=--mode --arg igr --arg=--engine --arg tensor \
   --arg=--trace-policy --arg engine-default \
@@ -178,6 +195,11 @@ python3 scripts/perf/profile_harness.py \
   --arg=--expected-build-directory --arg "$BUILD" \
   --arg=--expected-cmake-cache --arg "$BUILD/CMakeCache.txt"
 ```
+
+`CONDENSATION_LAUNCHES` is taken from an unprofiled exact-candidate run of the
+same accepted-step selection. Qualification then checks it again against the
+profiled sample and fails if nonlinear work changed or the capture was only a
+prefix.
 
 The accepted-step attribution uses the same exact candidate, benchmark, GPU,
 application, report, and tool bindings, replacing only the NCU selection with:
@@ -248,7 +270,8 @@ execution, then revalidated unchanged afterward.
 `profile-manifest.json` is sorted JSON containing deterministic artifact paths,
 byte counts, SHA-256 identities, generating commands, executable/build/MFEM/
 tool/GPU bindings, environment availability facts, source dirty-state facts,
-the qualification disposition, and any L0/L1 timings. It does not hash itself.
+the qualification disposition, the fixed profiled-step tensor-work summary,
+and any L0/L1 timings. It does not hash itself.
 Explicit executable, output, source-root, and slash-containing profiler paths
 are resolved before the runner changes its working directory.
 

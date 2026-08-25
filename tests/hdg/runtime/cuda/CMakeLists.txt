@@ -521,9 +521,10 @@ if(DG_IGR_GENERIC_TENSOR_CUOBJDUMP_EXECUTABLE)
       "-DTEST_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime_cuda_accepted_step_benchmark>"
       "-DCUOBJDUMP_EXECUTABLE=${DG_IGR_GENERIC_TENSOR_CUOBJDUMP_EXECUTABLE}"
       "-DEXPECTED_KERNEL_SUBSTRING=TensorBorrowedCondenseKernel"
+      "-DEVIDENCE_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/tensor-sass-evidence"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/check_generic_tensor_sass.cmake"
     DEPENDS dg_igr_hdg_runtime_cuda_accepted_step_benchmark
-    COMMENT "Checking production generic tensor-condensation FP64 SASS"
+    COMMENT "Checking production fused tensor local-algebra FP64 SASS"
     VERBATIM)
   add_test(
     NAME dg_igr_hdg_runtime_cuda_tensor_sass_evidence
@@ -532,10 +533,13 @@ if(DG_IGR_GENERIC_TENSOR_CUOBJDUMP_EXECUTABLE)
       "-DTEST_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime_cuda_accepted_step_benchmark>"
       "-DCUOBJDUMP_EXECUTABLE=${DG_IGR_GENERIC_TENSOR_CUOBJDUMP_EXECUTABLE}"
       "-DEXPECTED_KERNEL_SUBSTRING=TensorBorrowedCondenseKernel"
+      "-DEVIDENCE_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/tensor-sass-evidence"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/check_generic_tensor_sass.cmake")
   set_tests_properties(
     dg_igr_hdg_runtime_cuda_tensor_sass_evidence
-    PROPERTIES LABELS "hdg;runtime;cuda;tensor;sass")
+    PROPERTIES
+      LABELS "hdg;runtime;cuda;tensor;sass"
+      TIMEOUT 300)
 else()
   message(STATUS
     "Generic tensor SASS evidence target disabled: cuobjdump was not found.")
