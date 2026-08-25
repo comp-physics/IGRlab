@@ -4466,55 +4466,150 @@ __global__ void EulerConservationReduceKernel(
     out[2 * components + 1] = final_valid ? 1.0 : 0.0;
   }
 }
-__device__ __forceinline__ std::uint64_t HashDoubleWordLane(
-    std::uint64_t hash,const double value,const unsigned int lane_bias,
-    const std::uint64_t prime)
+constexpr int hash_lanes=4;
+constexpr int hash_jump_bytes=3;
+constexpr int hash_residue_bits=9;
+constexpr int hash_residue_states=1<<hash_residue_bits;
+constexpr int hash_jump_table_entries=
+    hash_lanes*hash_jump_bytes*hash_residue_states;
+constexpr int hash_jump_threads=256;
+constexpr std::uint64_t hash_residue_mask=hash_residue_states-1;
+constexpr std::uint64_t hash_quotient_mask=(std::uint64_t{1}<<55)-1;
+static_assert(hash_jump_table_entries*sizeof(std::uint64_t)==48*1024,
+              "exact hash jump table must remain the 48 KiB SM120 slice");
+static_assert(1099511628211ULL==(std::uint64_t{1}<<40)+435ULL,
+              "historical FNV prime decomposition changed");
+
+__device__ __forceinline__ std::uint64_t HashPrime(const int lane)
+{return 1099511628211ULL+2ULL*static_cast<std::uint64_t>(lane);}
+__device__ __forceinline__ unsigned int HashPrimeLow(const int lane)
+{return 435U+2U*static_cast<unsigned int>(lane);}
+__device__ __forceinline__ int HashJumpTableIndex(
+    const int lane,const int position,const unsigned int residue)
+{return (lane*hash_jump_bytes+position)*hash_residue_states+
+    static_cast<int>(residue);}
+
+__device__ void InitializeHashJumpTable(std::uint64_t* table)
 {
-  // CUDA global-memory double words are naturally eight-byte aligned and
-  // little endian.  __double_as_longlong is a bit cast, so signed zero and
-  // every NaN payload retain the exact bytes consumed by the former byte load.
+  for(int entry=threadIdx.x;entry<hash_jump_table_entries;
+      entry+=blockDim.x)
+  {
+    const unsigned int residue=static_cast<unsigned int>(
+        entry%hash_residue_states);
+    const int lane_position=entry/hash_residue_states;
+    const int position=lane_position%hash_jump_bytes;
+    const int lane=lane_position/hash_jump_bytes;
+    const std::uint64_t prime=HashPrime(lane);
+    const unsigned int prime_low=HashPrimeLow(lane);
+    const std::uint64_t carry=
+        (static_cast<std::uint64_t>(residue)<<31)+
+        (static_cast<std::uint64_t>(prime_low)*residue>>hash_residue_bits);
+    const std::uint64_t coefficient=position==0
+        ? (prime*prime)&hash_quotient_mask
+        : (position==1?prime:std::uint64_t{1});
+    table[entry]=(coefficient*carry)&hash_quotient_mask;
+  }
+}
+
+__device__ __forceinline__ std::uint64_t HashJumpGroupLane(
+    const std::uint64_t hash,const std::uint64_t word,const int first_byte,
+    const int byte_count,const int lane,const unsigned int lane_bias,
+    const unsigned int prime_low,const std::uint64_t prime_power,
+    const std::uint64_t* table)
+{
+  std::uint64_t quotient=hash>>hash_residue_bits;
+  unsigned int residue=static_cast<unsigned int>(hash&hash_residue_mask);
+  std::uint64_t contribution=0;
+  const int first_position=hash_jump_bytes-byte_count;
+#pragma unroll
+  for(int byte=0;byte<hash_jump_bytes;++byte)
+  {
+    if(byte<byte_count)
+    {
+      const unsigned int current=static_cast<unsigned int>(
+          (word>>(8*(first_byte+byte)))&0xffULL)+lane_bias;
+      const unsigned int mixed=residue^current;
+      contribution+=table[HashJumpTableIndex(
+          lane,first_position+byte,mixed)];
+      residue=(prime_low*mixed)&static_cast<unsigned int>(hash_residue_mask);
+    }
+  }
+  quotient=(quotient*prime_power+contribution)&hash_quotient_mask;
+  return (quotient<<hash_residue_bits)|residue;
+}
+
+__device__ __forceinline__ std::uint64_t HashDoubleWordLane(
+    std::uint64_t hash,const double value,const int lane,
+    const unsigned int lane_bias,const unsigned int prime_low,
+    const std::uint64_t prime_squared,const std::uint64_t prime_cubed,
+    const std::uint64_t* table)
+{
+  // The historical lane update is (h xor x)*p modulo 2^64, where
+  // x=byte+17*lane is below 512 and p=2^40+(435+2*lane).  Split h=512*q+r.
+  // One byte then has the exact recurrence
+  //   y=r xor x
+  //   r'=(435+2*lane)*y mod 512
+  //   q'=p*q+y*2^31+floor((435+2*lane)*y/512) mod 2^55.
+  // The shared table holds the ordered carry terms for three-byte jumps.  Two
+  // three-byte jumps and one two-byte jump therefore preserve every historical
+  // FNV byte while shortening eight dependent 64-bit multiplies to three.
+  // __double_as_longlong is a bit cast, preserving signed zero and NaN payloads.
   const std::uint64_t word=static_cast<std::uint64_t>(
       __double_as_longlong(value));
-#pragma unroll
-  for(int byte=0;byte<static_cast<int>(sizeof(double));++byte)
-  {
-    const unsigned int current=static_cast<unsigned int>(
-        (word>>(8*byte))&0xffULL);
-    hash^=static_cast<std::uint64_t>(current+lane_bias);
-    hash*=prime;
-  }
-  return hash;
+  hash=HashJumpGroupLane(hash,word,0,3,lane,lane_bias,prime_low,
+                         prime_cubed,table);
+  hash=HashJumpGroupLane(hash,word,3,3,lane,lane_bias,prime_low,
+                         prime_cubed,table);
+  return HashJumpGroupLane(hash,word,6,2,lane,lane_bias,prime_low,
+                           prime_squared,table);
 }
+
 __device__ std::uint64_t HashBytesLane(const double* values,const int count,
-                                      const int lane)
+                                      const int lane,
+                                      const std::uint64_t* table)
 {
-  const std::uint64_t seeds[4]={
+  const std::uint64_t seeds[hash_lanes]={
       1469598103934665603ULL,
       1099511628211ULL^0x9e3779b97f4a7c15ULL,
       1469598103934665603ULL^0xd6e8feb86659fd93ULL,
       1099511628211ULL^0xa0761d6478bd642fULL};
   std::uint64_t hash=seeds[lane];
+  const std::uint64_t prime=HashPrime(lane);
+  const std::uint64_t prime_squared=(prime*prime)&hash_quotient_mask;
+  const std::uint64_t prime_cubed=
+      (prime_squared*prime)&hash_quotient_mask;
   const unsigned int lane_bias=17U*static_cast<unsigned int>(lane);
-  const std::uint64_t prime=1099511628211ULL+2ULL*lane;
-  const int grouped_count=count>0?count-count%4:0;
-  int word=0;
-  for(;word<grouped_count;word+=4)
-  {
-    hash=HashDoubleWordLane(hash,values[word],lane_bias,prime);
-    hash=HashDoubleWordLane(hash,values[word+1],lane_bias,prime);
-    hash=HashDoubleWordLane(hash,values[word+2],lane_bias,prime);
-    hash=HashDoubleWordLane(hash,values[word+3],lane_bias,prime);
-  }
-  for(;word<count;++word)
-    hash=HashDoubleWordLane(hash,values[word],lane_bias,prime);
+  const unsigned int prime_low=HashPrimeLow(lane);
+  for(int word=0;word<count;++word)
+    hash=HashDoubleWordLane(hash,values[word],lane,lane_bias,prime_low,
+                            prime_squared,prime_cubed,table);
   return hash;
 }
+
 __global__ void HashKernel(const double* values,int count,std::uint64_t* out)
-{const int lane=threadIdx.x;if(blockIdx.x||lane>=4)return;out[lane]=HashBytesLane(values,count,lane);}
+{
+  // Fixed arithmetic lookup only: no state sample, event, or history is kept.
+  __shared__ std::uint64_t table[hash_jump_table_entries];
+  InitializeHashJumpTable(table);
+  __syncthreads();
+  const int lane=threadIdx.x;
+  if(blockIdx.x||lane>=hash_lanes)return;
+  out[lane]=HashBytesLane(values,count,lane,table);
+}
 __global__ void HashPairKernel(const double* first,int first_count,
                                const double* second,int second_count,
                                std::uint64_t* out)
-{const int lane=threadIdx.x;if(blockIdx.x||lane>=8)return;const bool use_second=lane>=4;const int hash_lane=lane&3;out[lane]=HashBytesLane(use_second?second:first,use_second?second_count:first_count,hash_lane);}
+{
+  __shared__ std::uint64_t table[hash_jump_table_entries];
+  InitializeHashJumpTable(table);
+  __syncthreads();
+  const int lane=threadIdx.x;
+  if(blockIdx.x||lane>=2*hash_lanes)return;
+  const bool use_second=lane>=hash_lanes;
+  const int hash_lane=lane&(hash_lanes-1);
+  out[lane]=HashBytesLane(use_second?second:first,
+                          use_second?second_count:first_count,hash_lane,table);
+}
 
 bool LaunchOk() noexcept { return cudaPeekAtLastError() == cudaSuccess; }
 int Blocks(const int n) noexcept { return (n + 127) / 128; }
@@ -4725,11 +4820,11 @@ bool CudaLaunchEulerConservation(const CudaDeviceView& v,
   return LaunchOk();
 }
 bool CudaLaunchHash(const double* values,int count,std::uint64_t* words) noexcept
-{HashKernel<<<1,4>>>(values,count,words);return LaunchOk();}
+{HashKernel<<<1,hash_jump_threads>>>(values,count,words);return LaunchOk();}
 bool CudaLaunchHashPair(const double* first,int first_count,
                         const double* second,int second_count,
                         std::uint64_t* words) noexcept
-{HashPairKernel<<<1,8>>>(first,first_count,second,second_count,words);return LaunchOk();}
+{HashPairKernel<<<1,hash_jump_threads>>>(first,first_count,second,second_count,words);return LaunchOk();}
 
 } // namespace detail
 } // namespace dg::hdg::runtime::cuda_w8a

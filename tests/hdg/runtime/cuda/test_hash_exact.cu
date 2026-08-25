@@ -116,7 +116,7 @@ bool CheckPair(const double* first_host, const int first_count,
                   actual.data() + 4, "pair-second", first_count, second_count);
 }
 
-std::vector<double> MakeExactValues()
+std::vector<double> MakeExactValues(const std::size_t count)
 {
   std::vector<std::uint64_t> bits{{
       0x0000000000000000ULL, // +0
@@ -136,7 +136,7 @@ std::vector<double> MakeExactValues()
       0x0123456789abcdefULL,
       0xfedcba9876543210ULL}};
   std::uint64_t state = 0x6a09e667f3bcc909ULL;
-  while (bits.size() < 193)
+  while (bits.size() < count)
   {
     state ^= state << 13U;
     state ^= state >> 7U;
@@ -159,7 +159,16 @@ int main()
     return 2;
   }
 
-  const std::vector<double> values = MakeExactValues();
+  // These counts match the largest rank-one mesh-52 p3 conventional and IGR
+  // accepted-state fields used by the saturated campaign.  They ensure the
+  // exactness oracle covers the production-sized jump loop, not only tails.
+  constexpr int conventional_p3_interior_count = 52 * 52 * 64;
+  constexpr int conventional_p3_trace_count = 2 * 52 * 52 * 4 * 4;
+  constexpr int igr_p3_interior_count = 52 * 52 * 112;
+  constexpr int igr_p3_trace_count = 2 * 52 * 52 * 4 * 5;
+  constexpr int maximum_long_offset = 5;
+  const std::vector<double> values = MakeExactValues(
+      static_cast<std::size_t>(igr_p3_interior_count+maximum_long_offset));
   DeviceAllocation<double> device_values;
   DeviceAllocation<std::uint64_t> device_words;
   if (!device_values.Allocate(values.size()) || !device_words.Allocate(8) ||
@@ -210,5 +219,19 @@ int main()
                    device_words.data()))
       return 6;
   }
+  constexpr std::array<PairCase, 2> saturated_pairs{{
+      {0,conventional_p3_interior_count,1,conventional_p3_trace_count},
+      {3,igr_p3_interior_count,5,igr_p3_trace_count}}};
+  for (const PairCase& pair : saturated_pairs)
+    if (!CheckPair(values.data()+pair.first_offset,pair.first_count,
+                   device_values.data()+pair.first_offset,
+                   values.data()+pair.second_offset,pair.second_count,
+                   device_values.data()+pair.second_offset,
+                   device_words.data()))
+      return 7;
+  if (!CheckSingle(values.data()+3,igr_p3_interior_count,
+                   device_values.data()+3,igr_p3_interior_count,
+                   device_words.data()))
+    return 8;
   return 0;
 }
