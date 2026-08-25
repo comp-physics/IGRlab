@@ -229,9 +229,8 @@ int main()
                    device_values.data()+pair.second_offset,
                    device_words.data()))
       return 7;
-  if (!CheckSingle(values.data()+3,igr_p3_interior_count,
-                   device_values.data()+3,igr_p3_interior_count,
-                   device_words.data()))
+  if (!CheckSingle(values.data()+3,device_values.data()+3,
+                   igr_p3_interior_count,device_words.data()))
     return 8;
   return 0;
 }
