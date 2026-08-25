@@ -1713,7 +1713,7 @@ def main() -> int:
         wrong_tensor_igr_top_level_reuse = copy.deepcopy(tensor_igr_record)
         wrong_tensor_igr_top_level_reuse[
             "trace_ilu_factor_reuse_policy"
-        ] = "refresh_each_trace_solve"
+        ] = "first_trace_solve_per_attempt"
         assert tensor_igr_rejected(wrong_tensor_igr_top_level_reuse)
         wrong_tensor_igr_top_level_triangular = copy.deepcopy(
             tensor_igr_record
@@ -1770,18 +1770,18 @@ def main() -> int:
         wrong_tensor_igr_reuse_policy = copy.deepcopy(tensor_igr_record)
         wrong_tensor_igr_reuse_policy["samples"][1]["tensor_core"][
             "ilu_factor_reuse_policy"
-        ] = "refresh_each_trace_solve"
+        ] = "first_trace_solve_per_attempt"
         assert tensor_igr_rejected(wrong_tensor_igr_reuse_policy)
         wrong_tensor_igr_reuses = copy.deepcopy(tensor_igr_record)
         wrong_tensor_igr_reuses["samples"][1]["tensor_core"][
             "ilu_factor_reuses"
-        ] = 0
+        ] = 1
         assert tensor_igr_rejected(wrong_tensor_igr_reuses)
-        zero_tensor_igr_factor_age = copy.deepcopy(tensor_igr_record)
-        zero_tensor_igr_factor_age["samples"][1]["tensor_core"][
+        nonzero_tensor_igr_factor_age = copy.deepcopy(tensor_igr_record)
+        nonzero_tensor_igr_factor_age["samples"][1]["tensor_core"][
             "ilu_factor_age_generations"
-        ] = 0
-        assert tensor_igr_rejected(zero_tensor_igr_factor_age)
+        ] = 1
+        assert tensor_igr_rejected(nonzero_tensor_igr_factor_age)
         low_tensor_igr_callback_bound = copy.deepcopy(tensor_igr_record)
         low_tensor_igr_sample = low_tensor_igr_callback_bound[
             "samples"
