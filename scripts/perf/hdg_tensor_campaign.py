@@ -1898,6 +1898,20 @@ def summarized_sample_work(sample: dict[str, Any], *, schema: int) -> dict[str, 
         "product_generations": sample["product_generations"],
         "selected_engine": tensor["selected_engine"],
         "trace_policy": tensor["trace_policy"],
+        "trace_solver": tensor["trace_solver"],
+        "native_rank1_trace_solve_calls": tensor[
+            "native_rank1_trace_solve_calls"
+        ],
+        "hypre_trace_solve_calls": tensor["hypre_trace_solve_calls"],
+        "native_rank1_trace_solver_configured": tensor[
+            "native_rank1_trace_solver_configured"
+        ],
+        "hypre_host_staged_rank2_trace_solver_configured": tensor[
+            "hypre_host_staged_rank2_trace_solver_configured"
+        ],
+        "trace_solver_accounting_complete": tensor[
+            "trace_solver_accounting_complete"
+        ],
         "trace_preconditioner": tensor["trace_preconditioner"],
         "trace_preconditioner_configured": tensor[
             "trace_preconditioner_configured"
@@ -1995,6 +2009,7 @@ def record_summary(record: dict[str, Any]) -> dict[str, Any]:
     else:
         summary.update({
             "trace_policy": record["trace_policy"],
+            "trace_solver": record["trace_solver"],
             "precision_policy": record["precision_policy"],
             "numerical_policy": record["numerical_policy"],
             "initialization_duration_seconds": record[
@@ -2078,6 +2093,10 @@ def work_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         ],
     }
     if schema == 2:
+        summary["trace_solvers"] = sorted({
+            record["trace_solver"] for record in record_list
+            if isinstance(record.get("trace_solver"), str)
+        })
         summary["trace_policies"] = sorted({
             record["trace_policy"] for record in record_list
             if isinstance(record.get("trace_policy"), str)
@@ -2106,6 +2125,8 @@ def work_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "ilu_inner_iterations_upper_bound",
         "ilu_jacobi_factor_spmv_updates_lower_bound",
         "ilu_jacobi_factor_spmv_updates_upper_bound",
+        "native_rank1_trace_solve_calls",
+        "hypre_trace_solve_calls",
         "condensation_launches",
         "mma_tiles",
         "fallback_count",
@@ -2121,6 +2142,30 @@ def work_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 tensor.get("trace_policy") for tensor in tensor_samples
                 if isinstance(tensor.get("trace_policy"), str)
             }),
+            "trace_solvers": sorted({
+                tensor.get("trace_solver") for tensor in tensor_samples
+                if isinstance(tensor.get("trace_solver"), str)
+            }),
+            "native_rank1_trace_solver_configured_values": sorted({
+                tensor.get("native_rank1_trace_solver_configured")
+                for tensor in tensor_samples
+                if isinstance(
+                    tensor.get("native_rank1_trace_solver_configured"), bool
+                )
+            }),
+            "hypre_host_staged_rank2_trace_solver_configured_values": sorted({
+                tensor.get("hypre_host_staged_rank2_trace_solver_configured")
+                for tensor in tensor_samples
+                if isinstance(
+                    tensor.get(
+                        "hypre_host_staged_rank2_trace_solver_configured"
+                    ), bool
+                )
+            }),
+            "trace_solver_accounting_all_complete": bool(tensor_samples) and all(
+                tensor.get("trace_solver_accounting_complete") is True
+                for tensor in tensor_samples
+            ),
             "ilu_policies": sorted({
                 (
                     tensor.get("ilu_type"),

@@ -98,6 +98,9 @@ The record also names the configured rank-one trace solver, and every sample
 contains fixed scalar native/HYPRE solve-call counts. The validator requires
 ordinary CUDA calls to be entirely HYPRE and tensor CUDA calls to be entirely
 native; neither path can borrow the other's recurring solve work unnoticed.
+The same fixed fields and their aggregate totals are retained in the bounded
+campaign manifest, so promotion disposition does not depend on reopening raw
+samples to establish solver routing.
 
 Triplet order rotates `O_base/O_common/T_common`,
 `O_common/T_common/O_base`, and `T_common/O_base/O_common`; cell order also

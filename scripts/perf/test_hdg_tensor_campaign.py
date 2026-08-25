@@ -50,7 +50,8 @@ SCHEMA1_WORKLOAD_SUMMARY_FIELDS = {
     "gpu_sm_count", "dt", "host_export",
 }
 SCHEMA2_ONLY_SUMMARY_FIELDS = {
-    "trace_policy", "trace_policies", "trace_preconditioner",
+    "trace_policy", "trace_policies", "trace_solver", "trace_solvers",
+    "trace_preconditioner",
     "trace_ilu_policy", "trace_preconditioners",
     "tensor_core", "trace_and_tensor_accounting",
     "trace_policy_metadata_status", "precision_policy", "numerical_policy",
@@ -84,6 +85,10 @@ SCHEMA2_ONLY_SAMPLE_FIELDS = {
     "iterative_refinement_steps", "residual_replacements",
     "precision_corrections", "all_fp64_policy",
     "correction_accounting_complete", "product_generations", "tensor_core",
+    "trace_solver", "native_rank1_trace_solve_calls",
+    "hypre_trace_solve_calls", "native_rank1_trace_solver_configured",
+    "hypre_host_staged_rank2_trace_solver_configured",
+    "trace_solver_accounting_complete",
 }
 
 FAKE_BENCHMARK = r'''#!/usr/bin/env python3
@@ -1036,6 +1041,29 @@ def main() -> int:
             for engine in ("ordinary", "tensor"):
                 work = result["engines"][engine]["solver_work"]
                 assert work["trace_policies"] == ["engine-default"]
+                expected_trace_solver = (
+                    "native-rank1-fp64"
+                    if engine == "tensor" else "hypre-parcsr-gmres"
+                )
+                assert work["trace_solvers"] == [expected_trace_solver]
+                assert work["tensor_core"]["trace_solvers"] == [
+                    expected_trace_solver
+                ]
+                assert work["tensor_core"][
+                    "native_rank1_trace_solve_calls"
+                ]["total"] == (20 if engine == "tensor" else 0)
+                assert work["tensor_core"][
+                    "hypre_trace_solve_calls"
+                ]["total"] == (0 if engine == "tensor" else 20)
+                assert work["tensor_core"][
+                    "native_rank1_trace_solver_configured_values"
+                ] == [engine == "tensor"]
+                assert work["tensor_core"][
+                    "hypre_host_staged_rank2_trace_solver_configured_values"
+                ] == [False]
+                assert work["tensor_core"][
+                    "trace_solver_accounting_all_complete"
+                ] is True
                 ilu_active = engine == "ordinary" or cell_key.startswith("igr_")
                 assert work["linear_iterations"]["total"] == 70
                 assert work["linear_iterations_by_invocation"] == [
@@ -1146,6 +1174,12 @@ def main() -> int:
                 ).hexdigest()
             summary = item["benchmark_summary"]
             assert summary["trace_policy"] == "engine-default"
+            expected_trace_solver = (
+                "native-rank1-fp64"
+                if item["comparison_member"] == "tensor"
+                else "hypre-parcsr-gmres"
+            )
+            assert summary["trace_solver"] == expected_trace_solver
             expected_preconditioner = CAMPAIGN.expected_trace_preconditioner(
                 item["comparison_member"], item["mode"]
             )
@@ -1159,6 +1193,22 @@ def main() -> int:
             )
             assert all(
                 sample["trace_preconditioner_configured"] is True
+                for sample in summary["measured_sample_work"]
+            )
+            assert all(
+                sample["trace_solver"] == expected_trace_solver and
+                sample["native_rank1_trace_solve_calls"] ==
+                (sample["trace_solves"]
+                 if item["comparison_member"] == "tensor" else 0) and
+                sample["hypre_trace_solve_calls"] ==
+                (0 if item["comparison_member"] == "tensor"
+                 else sample["trace_solves"]) and
+                sample["native_rank1_trace_solver_configured"] is
+                (item["comparison_member"] == "tensor") and
+                sample[
+                    "hypre_host_staged_rank2_trace_solver_configured"
+                ] is False and
+                sample["trace_solver_accounting_complete"] is True
                 for sample in summary["measured_sample_work"]
             )
             ilu_active = item["comparison_member"] == "ordinary" or \
@@ -1319,8 +1369,15 @@ def main() -> int:
             ] == selection["trace_policy"]
             summary = item["benchmark_summary"]
             assert summary["trace_policy"] == selection["trace_policy"]
+            expected_trace_solver = (
+                "native-rank1-fp64"
+                if selection["engine"] == "tensor"
+                else "hypre-parcsr-gmres"
+            )
+            assert summary["trace_solver"] == expected_trace_solver
             assert all(
-                sample["trace_policy"] == selection["trace_policy"]
+                sample["trace_policy"] == selection["trace_policy"] and
+                sample["trace_solver"] == expected_trace_solver
                 for sample in summary["measured_sample_work"]
             )
         for key, result in ablation[
@@ -1447,6 +1504,16 @@ def main() -> int:
             "native_rank1_trace_solve_calls"
         ] = bad_native_calls["samples"][1]["trace_solves"]
         assert rejected(bad_native_calls)
+        for field, value in (
+            ("trace_solver", "native-rank1-fp64"),
+            ("hypre_trace_solve_calls", 0),
+            ("native_rank1_trace_solver_configured", True),
+            ("hypre_host_staged_rank2_trace_solver_configured", True),
+            ("trace_solver_accounting_complete", False),
+        ):
+            bad_solver_accounting = copy.deepcopy(ordinary_record)
+            bad_solver_accounting["samples"][1]["tensor_core"][field] = value
+            assert rejected(bad_solver_accounting)
         bad_variant = copy.deepcopy(ordinary_record)
         bad_variant["variant"] = "ablation"
         assert rejected(bad_variant)
