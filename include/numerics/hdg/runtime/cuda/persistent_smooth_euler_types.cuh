@@ -681,10 +681,9 @@ constexpr CudaIluFactorReusePolicy CudaIluFactorReusePolicyForEngine(
   if (!CudaTracePreconditionerIsIlu(
           CudaTracePreconditionerForEngine(engine, igr_active)))
     return CudaIluFactorReusePolicy::not_applicable;
-  // Every selected tensor-IGR trace matrix receives a current-generation
-  // ILU(0) factor. Ordinary CUDA already uses this policy; conventional
-  // tensor CUDA uses diagonal scaling and therefore remains not-applicable.
-  return CudaIluFactorReusePolicy::refresh_each_trace_solve;
+  return engine == generic::CudaEngineKind::tensor_core && igr_active
+      ? CudaIluFactorReusePolicy::first_trace_solve_per_attempt
+      : CudaIluFactorReusePolicy::refresh_each_trace_solve;
 }
 
 constexpr int CudaIluType(

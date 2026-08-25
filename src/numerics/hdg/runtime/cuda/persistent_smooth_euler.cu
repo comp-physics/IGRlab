@@ -1545,82 +1545,6 @@ bool CudaRetainedIluFactorExact(
           identity.jacobi_diagonal_values_token;
 }
 
-bool CudaRetainedNativeIluFactorAuthorityExact(
-    mfem::HypreParMatrix& matrix, mfem::HypreILU& ilu,
-    const CudaTracePolicyDescriptor& policy,
-    double* const inverse_diagonal,
-    const CudaIluAttemptFactorState& state) noexcept
-{
-  if (!state.factor_ready) return true;
-  hypre_ParCSRMatrix* const raw_matrix = matrix;
-  const HYPRE_Solver raw_ilu = static_cast<HYPRE_Solver>(ilu);
-  auto* const ilu_data = reinterpret_cast<hypre_ParILUData*>(raw_ilu);
-  hypre_CSRMatrix* const factor = ilu_data == nullptr ? nullptr :
-      hypre_ParILUDataMatBILUDevice(ilu_data);
-  HYPRE_Int* const permutation = ilu_data == nullptr ? nullptr :
-      hypre_ParILUDataPerm(ilu_data);
-  const int factor_rows = factor == nullptr ? 0 :
-      hypre_CSRMatrixNumRows(factor);
-  const int factor_nonzeros = factor == nullptr ? 0 :
-      hypre_CSRMatrixNumNonzeros(factor);
-  const int* const factor_offsets = factor == nullptr ? nullptr :
-      hypre_CSRMatrixI(factor);
-  const int* const factor_columns = factor == nullptr ? nullptr :
-      hypre_CSRMatrixJ(factor);
-  const double* const factor_values = factor == nullptr ? nullptr :
-      hypre_CSRMatrixData(factor);
-  hypre_MemoryLocation permutation_location = hypre_MEMORY_UNDEFINED;
-  hypre_MemoryLocation inverse_location = hypre_MEMORY_UNDEFINED;
-  return CudaTracePolicyDescriptorIsExact(policy) &&
-      policy.igr_active &&
-      policy.trace_preconditioner ==
-          CudaTracePreconditionerKind::hypre_ilu0 &&
-      policy.ilu_factor_reuse_policy ==
-          CudaIluFactorReusePolicy::refresh_each_trace_solve &&
-      raw_matrix != nullptr && raw_ilu != nullptr && ilu_data != nullptr &&
-      hypre_ParILUDataMatA(ilu_data) == raw_matrix && factor != nullptr &&
-      hypre_CSRMatrixMemoryLocation(factor) == HYPRE_MEMORY_DEVICE &&
-      hypre_ParILUDataIluType(ilu_data) == policy.ilu_type &&
-      hypre_ParILUDataLfil(ilu_data) == policy.ilu_level_of_fill &&
-      hypre_ParILUDataReorderingType(ilu_data) ==
-          policy.ilu_local_reordering &&
-      hypre_ParILUDataMaxIter(ilu_data) ==
-          policy.ilu_application_iterations &&
-      hypre_ParILUDataTol(ilu_data) == 0.0 &&
-      hypre_ParILUDataPrintLevel(ilu_data) == 0 &&
-      hypre_ParILUDataTriSolve(ilu_data) == 0 &&
-      hypre_ParILUDataLowerJacobiIters(ilu_data) ==
-          policy.ilu_lower_jacobi_iterations &&
-      hypre_ParILUDataUpperJacobiIters(ilu_data) ==
-          policy.ilu_upper_jacobi_iterations &&
-      hypre_ParILUDataIterativeSetupType(ilu_data) == 0 &&
-      factor_rows == state.factor_rows &&
-      factor_nonzeros == state.factor_nonzeros &&
-      factor_offsets != nullptr && factor_columns != nullptr &&
-      factor_values != nullptr && permutation != nullptr &&
-      hypre_GetPointerLocation(permutation, &permutation_location) == 0 &&
-      permutation_location == hypre_MEMORY_DEVICE &&
-      inverse_diagonal != nullptr &&
-      hypre_GetPointerLocation(inverse_diagonal, &inverse_location) == 0 &&
-      inverse_location == hypre_MEMORY_DEVICE &&
-      state.hypre_matrix_token ==
-          reinterpret_cast<std::uintptr_t>(raw_matrix) &&
-      state.ilu_handle_token ==
-          reinterpret_cast<std::uintptr_t>(raw_ilu) &&
-      state.factor_matrix_token ==
-          reinterpret_cast<std::uintptr_t>(factor) &&
-      state.factor_offsets_token ==
-          reinterpret_cast<std::uintptr_t>(factor_offsets) &&
-      state.factor_columns_token ==
-          reinterpret_cast<std::uintptr_t>(factor_columns) &&
-      state.factor_values_token ==
-          reinterpret_cast<std::uintptr_t>(factor_values) &&
-      state.factor_permutation_token ==
-          reinterpret_cast<std::uintptr_t>(permutation) &&
-      state.native_inverse_diagonal_token ==
-          reinterpret_cast<std::uintptr_t>(inverse_diagonal) &&
-      HYPRE_GetError() == 0;
-}
 } // namespace
 
 bool CudaPrepareNativeRankOneIluFactor(
@@ -1676,7 +1600,7 @@ bool CudaPrepareNativeRankOneIluFactor(
       policy.ilu_upper_jacobi_iterations ==
           native_trace_ilu_jacobi_iterations &&
       policy.ilu_factor_reuse_policy ==
-          CudaIluFactorReusePolicy::refresh_each_trace_solve;
+          CudaIluFactorReusePolicy::first_trace_solve_per_attempt;
   const bool matrix_ready = CudaHypreDevicePolicyValid(
           matrix, rhs, solution) &&
       CudaGetTrueMatrixDeviceView(matrix, matrix_view) &&
@@ -1712,13 +1636,23 @@ bool CudaPrepareNativeRankOneIluFactor(
   if (!state_ready || HYPRE_GetError() != 0) return false;
 
   const bool refresh_factor = CudaIluFactorRefreshRequired(factor_state);
-  const bool generation_ready = refresh_factor &&
-      CudaNativeIluFactorAuthorityCanRefresh(
-          factor_state, matrix_generation);
-  const bool retained_authority_exact = generation_ready &&
-      CudaRetainedNativeIluFactorAuthorityExact(
-          matrix, ilu, policy, inverse_diagonal, factor_state);
-  if (!retained_authority_exact) return false;
+  const bool generation_ready = refresh_factor
+      ? !factor_state.factor_ready &&
+          factor_state.hypre_matrix_token == 0 &&
+          factor_state.ilu_handle_token == 0 &&
+          factor_state.factor_matrix_token == 0 &&
+          factor_state.factor_offsets_token == 0 &&
+          factor_state.factor_columns_token == 0 &&
+          factor_state.factor_values_token == 0 &&
+          factor_state.factor_permutation_token == 0 &&
+          factor_state.native_inverse_diagonal_token == 0 &&
+          factor_state.factor_generation == 0 &&
+          factor_state.last_solve_generation == 0
+      : factor_state.factor_ready &&
+          factor_state.factor_generation <=
+              factor_state.last_solve_generation &&
+          matrix_generation > factor_state.last_solve_generation;
+  if (!generation_ready) return false;
 
   bool setup_ready = true;
   try

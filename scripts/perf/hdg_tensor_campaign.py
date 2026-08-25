@@ -53,11 +53,11 @@ TRACE_ILU_FACTOR_REUSE_BY_POLICY_ENGINE_AND_MODE = {
         "refresh_each_trace_solve",
     ("engine-default", "ordinary", "igr"): "refresh_each_trace_solve",
     ("engine-default", "tensor", "conventional"): "not_applicable",
-    ("engine-default", "tensor", "igr"): "refresh_each_trace_solve",
+    ("engine-default", "tensor", "igr"): "first_trace_solve_per_attempt",
     ("common-fast", "ordinary", "conventional"): "not_applicable",
-    ("common-fast", "ordinary", "igr"): "refresh_each_trace_solve",
+    ("common-fast", "ordinary", "igr"): "first_trace_solve_per_attempt",
     ("common-fast", "tensor", "conventional"): "not_applicable",
-    ("common-fast", "tensor", "igr"): "refresh_each_trace_solve",
+    ("common-fast", "tensor", "igr"): "first_trace_solve_per_attempt",
 }
 TRACE_ILU_TRIANGULAR_SOLVE_BY_POLICY_ENGINE_AND_MODE = {
     ("engine-default", "ordinary", "conventional"): ("direct", 0, 0, 0),
