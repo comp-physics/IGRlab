@@ -3,12 +3,18 @@
 
 #include <mfem.hpp>
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace
 {
@@ -208,6 +214,607 @@ bool NativeWorkspaceRequirementsPolicy() noexcept
       igr.permutation_integers == 10 &&
       conventional.control_double_slots == NativeTraceControlDoubleSlots() &&
       igr.control_double_slots == NativeTraceControlDoubleSlots();
+}
+
+template <typename T>
+class NativeDeviceAllocation
+{
+ public:
+  NativeDeviceAllocation() = default;
+  NativeDeviceAllocation(const NativeDeviceAllocation&) = delete;
+  NativeDeviceAllocation& operator=(const NativeDeviceAllocation&) = delete;
+  ~NativeDeviceAllocation()
+  {
+    if (pointer_ != nullptr) (void)cudaFree(pointer_);
+  }
+
+  bool Allocate(const std::size_t count) noexcept
+  {
+    if (pointer_ != nullptr) return false;
+    count_ = count;
+    return count == 0 ||
+        cudaMalloc(reinterpret_cast<void**>(&pointer_), count * sizeof(T)) ==
+            cudaSuccess;
+  }
+
+  bool CopyFrom(const std::vector<T>& values) noexcept
+  {
+    return Allocate(values.size()) &&
+        (values.empty() ||
+         cudaMemcpy(pointer_, values.data(), values.size() * sizeof(T),
+                    cudaMemcpyHostToDevice) == cudaSuccess);
+  }
+
+  bool CopyTo(std::vector<T>& values) const noexcept
+  {
+    return values.size() == count_ &&
+        (values.empty() ||
+         cudaMemcpy(values.data(), pointer_, values.size() * sizeof(T),
+                    cudaMemcpyDeviceToHost) == cudaSuccess);
+  }
+
+  bool CopyOneTo(T& value) const noexcept
+  {
+    return count_ == 1 && pointer_ != nullptr &&
+        cudaMemcpy(&value, pointer_, sizeof(T), cudaMemcpyDeviceToHost) ==
+            cudaSuccess;
+  }
+
+  T* data() noexcept { return pointer_; }
+  const T* data() const noexcept { return pointer_; }
+
+ private:
+  T* pointer_ = nullptr;
+  std::size_t count_ = 0;
+};
+
+struct NativeCsrFixture
+{
+  int rows = 0;
+  std::vector<int> offsets{};
+  std::vector<int> columns{};
+  std::vector<double> values{};
+};
+
+struct NativeIluFixture
+{
+  NativeCsrFixture factor{};
+  std::vector<int> permutation{};
+  std::vector<double> inverse_diagonal{};
+};
+
+struct NativeSolveFixture
+{
+  NativeCsrFixture matrix{};
+  std::vector<double> right_hand_side{};
+  NativeIluFixture ilu{};
+  dg::hdg::runtime::cuda_w8a::detail::NativeTraceSolvePolicy policy{};
+  bool igr = false;
+};
+
+struct NativeSolveFixtureResult
+{
+  dg::hdg::runtime::cuda_w8a::detail::NativeTraceSolveControl control{};
+  std::vector<double> solution{};
+};
+
+NativeCsrFixture DenseToDiagonalFirstCsr(const std::vector<double>& dense,
+                                         const int rows)
+{
+  NativeCsrFixture result{};
+  if (rows <= 0 || dense.size() != static_cast<std::size_t>(rows) * rows)
+    return result;
+  result.rows = rows;
+  result.offsets.reserve(static_cast<std::size_t>(rows) + 1);
+  result.columns.reserve(dense.size());
+  result.values.reserve(dense.size());
+  result.offsets.push_back(0);
+  for (int row = 0; row < rows; ++row)
+  {
+    result.columns.push_back(row);
+    result.values.push_back(dense[static_cast<std::size_t>(row) * rows + row]);
+    for (int column = 0; column < rows; ++column)
+      if (column != row)
+      {
+        result.columns.push_back(column);
+        result.values.push_back(
+            dense[static_cast<std::size_t>(row) * rows + column]);
+      }
+    result.offsets.push_back(static_cast<int>(result.columns.size()));
+  }
+  return result;
+}
+
+bool NativeCsrFixtureIsValid(const NativeCsrFixture& matrix) noexcept
+{
+  if (matrix.rows <= 0 ||
+      matrix.offsets.size() != static_cast<std::size_t>(matrix.rows) + 1 ||
+      matrix.columns.size() != matrix.values.size() ||
+      matrix.offsets.front() != 0 ||
+      matrix.offsets.back() != static_cast<int>(matrix.values.size()))
+    return false;
+  for (int row = 0; row < matrix.rows; ++row)
+  {
+    const int begin = matrix.offsets[static_cast<std::size_t>(row)];
+    const int end = matrix.offsets[static_cast<std::size_t>(row) + 1];
+    if (begin < 0 || end <= begin ||
+        end > static_cast<int>(matrix.values.size()) ||
+        matrix.columns[static_cast<std::size_t>(begin)] != row)
+      return false;
+    int diagonal_count = 0;
+    for (int entry = begin; entry < end; ++entry)
+    {
+      const int column = matrix.columns[static_cast<std::size_t>(entry)];
+      const double value = matrix.values[static_cast<std::size_t>(entry)];
+      if (column < 0 || column >= matrix.rows || !std::isfinite(value))
+        return false;
+      if (column == row) ++diagonal_count;
+    }
+    if (diagonal_count != 1) return false;
+  }
+  return true;
+}
+
+std::vector<double> CsrToDense(const NativeCsrFixture& matrix)
+{
+  std::vector<double> dense(
+      static_cast<std::size_t>(matrix.rows) * matrix.rows, 0.0);
+  for (int row = 0; row < matrix.rows; ++row)
+    for (int entry = matrix.offsets[static_cast<std::size_t>(row)];
+         entry < matrix.offsets[static_cast<std::size_t>(row) + 1]; ++entry)
+      dense[static_cast<std::size_t>(row) * matrix.rows +
+            matrix.columns[static_cast<std::size_t>(entry)]] =
+          matrix.values[static_cast<std::size_t>(entry)];
+  return dense;
+}
+
+bool SolveDenseReference(std::vector<double> matrix,
+                         std::vector<double> right_hand_side,
+                         std::vector<double>& solution)
+{
+  const int rows = static_cast<int>(right_hand_side.size());
+  if (rows <= 0 ||
+      matrix.size() != static_cast<std::size_t>(rows) * rows)
+    return false;
+  double scale = 0.0;
+  for (const double value : matrix)
+  {
+    if (!std::isfinite(value)) return false;
+    scale = std::max(scale, std::abs(value));
+  }
+  for (const double value : right_hand_side)
+    if (!std::isfinite(value)) return false;
+  const double pivot_floor = 128.0 * std::numeric_limits<double>::epsilon() *
+      std::max(1.0, scale);
+  for (int column = 0; column < rows; ++column)
+  {
+    int pivot = column;
+    for (int row = column + 1; row < rows; ++row)
+      if (std::abs(matrix[static_cast<std::size_t>(row) * rows + column]) >
+          std::abs(matrix[static_cast<std::size_t>(pivot) * rows + column]))
+        pivot = row;
+    if (!(std::abs(matrix[static_cast<std::size_t>(pivot) * rows + column]) >
+          pivot_floor))
+      return false;
+    if (pivot != column)
+    {
+      for (int entry = 0; entry < rows; ++entry)
+        std::swap(matrix[static_cast<std::size_t>(column) * rows + entry],
+                  matrix[static_cast<std::size_t>(pivot) * rows + entry]);
+      std::swap(right_hand_side[static_cast<std::size_t>(column)],
+                right_hand_side[static_cast<std::size_t>(pivot)]);
+    }
+    const double diagonal =
+        matrix[static_cast<std::size_t>(column) * rows + column];
+    for (int row = column + 1; row < rows; ++row)
+    {
+      const double multiplier =
+          matrix[static_cast<std::size_t>(row) * rows + column] / diagonal;
+      matrix[static_cast<std::size_t>(row) * rows + column] = 0.0;
+      for (int entry = column + 1; entry < rows; ++entry)
+        matrix[static_cast<std::size_t>(row) * rows + entry] -= multiplier *
+            matrix[static_cast<std::size_t>(column) * rows + entry];
+      right_hand_side[static_cast<std::size_t>(row)] -=
+          multiplier * right_hand_side[static_cast<std::size_t>(column)];
+    }
+  }
+  solution.assign(static_cast<std::size_t>(rows), 0.0);
+  for (int row = rows - 1; row >= 0; --row)
+  {
+    double value = right_hand_side[static_cast<std::size_t>(row)];
+    for (int column = row + 1; column < rows; ++column)
+      value -= matrix[static_cast<std::size_t>(row) * rows + column] *
+          solution[static_cast<std::size_t>(column)];
+    const double diagonal = matrix[static_cast<std::size_t>(row) * rows + row];
+    solution[static_cast<std::size_t>(row)] = value / diagonal;
+    if (!std::isfinite(solution[static_cast<std::size_t>(row)])) return false;
+  }
+  return true;
+}
+
+double VectorNorm(const std::vector<double>& values) noexcept
+{
+  long double square = 0.0L;
+  for (const double value : values)
+    square += static_cast<long double>(value) * value;
+  return static_cast<double>(std::sqrt(square));
+}
+
+bool CsrResidualNorm(const NativeCsrFixture& matrix,
+                     const std::vector<double>& right_hand_side,
+                     const std::vector<double>& solution,
+                     double& norm) noexcept
+{
+  if (!NativeCsrFixtureIsValid(matrix) ||
+      right_hand_side.size() != static_cast<std::size_t>(matrix.rows) ||
+      solution.size() != right_hand_side.size())
+    return false;
+  long double square = 0.0L;
+  for (int row = 0; row < matrix.rows; ++row)
+  {
+    long double residual = right_hand_side[static_cast<std::size_t>(row)];
+    for (int entry = matrix.offsets[static_cast<std::size_t>(row)];
+         entry < matrix.offsets[static_cast<std::size_t>(row) + 1]; ++entry)
+      residual -= static_cast<long double>(
+          matrix.values[static_cast<std::size_t>(entry)]) *
+          solution[static_cast<std::size_t>(
+              matrix.columns[static_cast<std::size_t>(entry)])];
+    square += residual * residual;
+  }
+  norm = static_cast<double>(std::sqrt(square));
+  return std::isfinite(norm);
+}
+
+double MaximumScaledDifference(const std::vector<double>& first,
+                               const std::vector<double>& second) noexcept
+{
+  if (first.size() != second.size())
+    return std::numeric_limits<double>::infinity();
+  double maximum = 0.0;
+  for (std::size_t index = 0; index < first.size(); ++index)
+  {
+    if (!std::isfinite(first[index]) || !std::isfinite(second[index]))
+      return std::numeric_limits<double>::infinity();
+    maximum = std::max(maximum, std::abs(first[index] - second[index]) /
+        std::max({1.0, std::abs(first[index]), std::abs(second[index])}));
+  }
+  return maximum;
+}
+
+bool RunNativeSolveFixture(const NativeSolveFixture& fixture,
+                           NativeSolveFixtureResult& result)
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  result = {};
+  const int rows = fixture.matrix.rows;
+  const bool ilu_shape = !fixture.igr ||
+      (NativeCsrFixtureIsValid(fixture.ilu.factor) &&
+       fixture.ilu.factor.rows == rows &&
+       fixture.ilu.permutation.size() == static_cast<std::size_t>(rows) &&
+       fixture.ilu.inverse_diagonal.size() == static_cast<std::size_t>(rows));
+  if (!NativeCsrFixtureIsValid(fixture.matrix) || !ilu_shape ||
+      fixture.right_hand_side.size() != static_cast<std::size_t>(rows) ||
+      fixture.policy.rank_count != 1 || fixture.policy.krylov_dimension <= 0 ||
+      fixture.policy.maximum_iterations <= 0)
+    return false;
+
+  const NativeTraceCooperativeSupport support =
+      QueryNativeRankOneTraceCooperativeSupport(
+          rows, fixture.policy.krylov_dimension, fixture.igr);
+  if (!support.supported || support.cooperative_blocks <= 0) return false;
+  const NativeTraceWorkspaceRequirements requirements =
+      QueryNativeTraceWorkspaceRequirements(
+          rows, fixture.policy.krylov_dimension, support.cooperative_blocks,
+          fixture.igr);
+  if (!requirements.valid) return false;
+
+  NativeDeviceAllocation<int> matrix_offsets;
+  NativeDeviceAllocation<int> matrix_columns;
+  NativeDeviceAllocation<double> matrix_values;
+  NativeDeviceAllocation<double> right_hand_side;
+  NativeDeviceAllocation<double> solution;
+  NativeDeviceAllocation<int> factor_offsets;
+  NativeDeviceAllocation<int> factor_columns;
+  NativeDeviceAllocation<double> factor_values;
+  NativeDeviceAllocation<int> permutation;
+  NativeDeviceAllocation<double> inverse_diagonal;
+  NativeDeviceAllocation<double> basis;
+  NativeDeviceAllocation<double> vectors;
+  NativeDeviceAllocation<double> reduction;
+  NativeDeviceAllocation<double> small;
+  NativeDeviceAllocation<int> permutation_marks;
+  NativeDeviceAllocation<NativeTraceSolveControl> control;
+  if (!matrix_offsets.CopyFrom(fixture.matrix.offsets) ||
+      !matrix_columns.CopyFrom(fixture.matrix.columns) ||
+      !matrix_values.CopyFrom(fixture.matrix.values) ||
+      !right_hand_side.CopyFrom(fixture.right_hand_side) ||
+      !solution.Allocate(static_cast<std::size_t>(rows)) ||
+      !basis.Allocate(requirements.basis_doubles) ||
+      !vectors.Allocate(requirements.vector_doubles) ||
+      !reduction.Allocate(requirements.reduction_doubles) ||
+      !small.Allocate(requirements.small_doubles) ||
+      !permutation_marks.Allocate(requirements.permutation_integers) ||
+      !control.Allocate(1))
+    return false;
+  if (fixture.igr &&
+      (!factor_offsets.CopyFrom(fixture.ilu.factor.offsets) ||
+       !factor_columns.CopyFrom(fixture.ilu.factor.columns) ||
+       !factor_values.CopyFrom(fixture.ilu.factor.values) ||
+       !permutation.CopyFrom(fixture.ilu.permutation) ||
+       !inverse_diagonal.CopyFrom(fixture.ilu.inverse_diagonal)))
+    return false;
+
+  NativeTraceSystemView system{};
+  system.matrix = {matrix_offsets.data(), matrix_columns.data(),
+                   matrix_values.data(), rows, rows,
+                   static_cast<int>(fixture.matrix.values.size())};
+  system.rhs = right_hand_side.data();
+  system.solution = solution.data();
+  NativeTracePreconditionerView preconditioner{};
+  if (fixture.igr)
+  {
+    preconditioner.kind =
+        NativeTracePreconditionerKind::ilu0_rcm_jacobi;
+    preconditioner.ilu0.factor = {
+        factor_offsets.data(), factor_columns.data(), factor_values.data(),
+        rows, rows, static_cast<int>(fixture.ilu.factor.values.size())};
+    preconditioner.ilu0.permutation = permutation.data();
+    preconditioner.ilu0.inverse_diagonal = inverse_diagonal.data();
+    preconditioner.ilu0.lower_jacobi_iterations =
+        native_trace_ilu_jacobi_iterations;
+    preconditioner.ilu0.upper_jacobi_iterations =
+        native_trace_ilu_jacobi_iterations;
+  }
+  NativeTraceWorkspaceView workspace{};
+  workspace.basis = basis.data();
+  workspace.basis_doubles = requirements.basis_doubles;
+  workspace.vectors = vectors.data();
+  workspace.vector_doubles = requirements.vector_doubles;
+  workspace.reduction = reduction.data();
+  workspace.reduction_doubles = requirements.reduction_doubles;
+  workspace.small = small.data();
+  workspace.small_doubles = requirements.small_doubles;
+  workspace.permutation_marks = permutation_marks.data();
+  workspace.permutation_integers = requirements.permutation_integers;
+  workspace.device_control = control.data();
+
+  const bool launched = LaunchNativeRankOneTraceSolve(
+      system, preconditioner, workspace, fixture.policy, support, nullptr);
+  if (!launched || cudaDeviceSynchronize() != cudaSuccess) return false;
+  result.solution.resize(static_cast<std::size_t>(rows));
+  return solution.CopyTo(result.solution) &&
+      control.CopyOneTo(result.control);
+}
+
+std::vector<double> ConventionalFixtureMatrix()
+{
+  return {4.0, -1.0, 0.0, 0.0, 0.0,
+          -1.0, 4.0, -1.0, 0.0, 0.0,
+          0.0, -1.0, 4.0, -1.0, 0.0,
+          0.0, 0.0, -1.0, 4.0, -1.0,
+          0.0, 0.0, 0.0, -1.0, 3.0};
+}
+
+NativeSolveFixture MakeConventionalFixture(const int krylov_dimension,
+                                            const int maximum_iterations,
+                                            const double tolerance)
+{
+  NativeSolveFixture fixture{};
+  fixture.matrix = DenseToDiagonalFirstCsr(ConventionalFixtureMatrix(), 5);
+  fixture.right_hand_side = {1.0, 2.0, -1.0, 0.5, 3.0};
+  fixture.policy.rank_count = 1;
+  fixture.policy.krylov_dimension = krylov_dimension;
+  fixture.policy.maximum_iterations = maximum_iterations;
+  fixture.policy.relative_tolerance = tolerance;
+  fixture.policy.absolute_tolerance = 0.0;
+  return fixture;
+}
+
+NativeSolveFixture MakeIgrFixture()
+{
+  // Form A = P^T L U P with HYPRE's gather permutation.  Five zero-start
+  // Jacobi sweeps are exact for these four-row triangular factors, so the
+  // native right preconditioner should reduce GMRES to one iteration.
+  constexpr int rows = 4;
+  const std::array<int, rows> permutation{{2, 0, 3, 1}};
+  const std::vector<double> lower{{
+      1.0, 0.0, 0.0, 0.0,
+      0.10, 1.0, 0.0, 0.0,
+      0.0, -0.20, 1.0, 0.0,
+      0.0, 0.0, 0.15, 1.0}};
+  const std::vector<double> upper{{
+      2.0, 0.25, 0.0, 0.0,
+      0.0, 3.0, -0.30, 0.0,
+      0.0, 0.0, 4.0, 0.40,
+      0.0, 0.0, 0.0, 5.0}};
+  std::vector<double> permuted_matrix(rows * rows, 0.0);
+  for (int row = 0; row < rows; ++row)
+    for (int column = 0; column < rows; ++column)
+      for (int inner = 0; inner < rows; ++inner)
+        permuted_matrix[static_cast<std::size_t>(row) * rows + column] +=
+            lower[static_cast<std::size_t>(row) * rows + inner] *
+            upper[static_cast<std::size_t>(inner) * rows + column];
+  std::vector<double> matrix(rows * rows, 0.0);
+  for (int row = 0; row < rows; ++row)
+    for (int column = 0; column < rows; ++column)
+      matrix[static_cast<std::size_t>(permutation[row]) * rows +
+             permutation[column]] =
+          permuted_matrix[static_cast<std::size_t>(row) * rows + column];
+  std::vector<double> combined_factor(rows * rows, 0.0);
+  for (int row = 0; row < rows; ++row)
+    for (int column = 0; column < rows; ++column)
+      combined_factor[static_cast<std::size_t>(row) * rows + column] =
+          column < row
+          ? lower[static_cast<std::size_t>(row) * rows + column]
+          : upper[static_cast<std::size_t>(row) * rows + column];
+
+  NativeSolveFixture fixture{};
+  fixture.matrix = DenseToDiagonalFirstCsr(matrix, rows);
+  fixture.right_hand_side = {1.0, -2.0, 0.5, 3.0};
+  fixture.ilu.factor = DenseToDiagonalFirstCsr(combined_factor, rows);
+  fixture.ilu.permutation.assign(permutation.begin(), permutation.end());
+  fixture.ilu.inverse_diagonal = {0.5, 1.0 / 3.0, 0.25, 0.2};
+  fixture.policy.rank_count = 1;
+  fixture.policy.krylov_dimension = 2;
+  fixture.policy.maximum_iterations = 12;
+  fixture.policy.relative_tolerance = 1.0e-12;
+  fixture.policy.absolute_tolerance = 0.0;
+  fixture.igr = true;
+  return fixture;
+}
+
+bool NativeConvergedFixtureExact(const NativeSolveFixture& fixture,
+                                 const NativeSolveFixtureResult& result,
+                                 const bool require_restart,
+                                 const int exact_iterations)
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  std::vector<double> direct_solution;
+  double residual_norm = std::numeric_limits<double>::infinity();
+  const bool direct = SolveDenseReference(
+      CsrToDense(fixture.matrix), fixture.right_hand_side, direct_solution);
+  const bool residual = CsrResidualNorm(
+      fixture.matrix, fixture.right_hand_side, result.solution, residual_norm);
+  const double rhs_norm = VectorNorm(fixture.right_hand_side);
+  const double metadata_scale = std::max(
+      {1.0, residual_norm, result.control.actual_residual_norm});
+  const double metadata_tolerance = 4096.0 *
+      std::numeric_limits<double>::epsilon() *
+      static_cast<double>(fixture.matrix.rows) * metadata_scale;
+  const bool iteration_exact = exact_iterations < 0
+      ? result.control.iterations > fixture.policy.krylov_dimension
+      : result.control.iterations == exact_iterations;
+  return direct && residual &&
+      result.control.schema == native_trace_control_schema &&
+      result.control.status == NativeTraceSolveStatus::converged &&
+      result.control.failure_mask == 0 && iteration_exact &&
+      result.control.iterations <= fixture.policy.maximum_iterations &&
+      (!require_restart || result.control.restart_cycles >= 2) &&
+      result.control.preconditioner_applications ==
+          result.control.iterations + result.control.restart_cycles &&
+      result.control.actual_residual_checks >= 2 &&
+      NativeTraceResultIsReadyForTrueResidual(result.control, fixture.policy) &&
+      MaximumScaledDifference(result.solution, direct_solution) <= 1.0e-9 &&
+      residual_norm <= 4.0 * fixture.policy.relative_tolerance * rhs_norm &&
+      std::abs(result.control.actual_residual_norm - residual_norm) <=
+          metadata_tolerance &&
+      std::abs(result.control.relative_residual_norm -
+               residual_norm / rhs_norm) <= metadata_tolerance;
+}
+
+bool NativeMaximumIterationFixtureExact(
+    const NativeSolveFixture& fixture,
+    const NativeSolveFixtureResult& result) noexcept
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  double residual_norm = std::numeric_limits<double>::infinity();
+  const double rhs_norm = VectorNorm(fixture.right_hand_side);
+  if (!CsrResidualNorm(fixture.matrix, fixture.right_hand_side,
+                       result.solution, residual_norm))
+    return false;
+  const double metadata_scale = std::max(
+      {1.0, residual_norm, result.control.actual_residual_norm});
+  const double metadata_tolerance = 4096.0 *
+      std::numeric_limits<double>::epsilon() *
+      static_cast<double>(fixture.matrix.rows) * metadata_scale;
+  return result.control.schema == native_trace_control_schema &&
+      result.control.status == NativeTraceSolveStatus::maximum_iterations &&
+      result.control.failure_mask == 0 &&
+      result.control.iterations == fixture.policy.maximum_iterations &&
+      result.control.restart_cycles == 1 &&
+      result.control.preconditioner_applications == 2 &&
+      result.control.actual_residual_checks >= 2 &&
+      NativeTraceResultIsReadyForTrueResidual(result.control, fixture.policy) &&
+      residual_norm > fixture.policy.relative_tolerance * rhs_norm &&
+      std::abs(result.control.actual_residual_norm - residual_norm) <=
+          metadata_tolerance &&
+      std::abs(result.control.relative_residual_norm -
+               residual_norm / rhs_norm) <= metadata_tolerance;
+}
+
+bool NativeBreakdownFixtureExact()
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  NativeSolveFixture fixture{};
+  // D^{-1}b lies in A's nullspace.  Arnoldi therefore produces an exact zero
+  // first column and the guarded triangular solve must reject the result.
+  fixture.matrix = DenseToDiagonalFirstCsr(
+      {1.0, -1.0, 1.0, -1.0}, 2);
+  fixture.right_hand_side = {1.0, -1.0};
+  fixture.policy.rank_count = 1;
+  fixture.policy.krylov_dimension = 1;
+  fixture.policy.maximum_iterations = 4;
+  fixture.policy.relative_tolerance = 1.0e-12;
+  NativeSolveFixtureResult result{};
+  return RunNativeSolveFixture(fixture, result) &&
+      result.control.schema == native_trace_control_schema &&
+      result.control.status == NativeTraceSolveStatus::numerical_breakdown &&
+      result.control.failure_mask != 0 && result.control.iterations == 1 &&
+      result.control.restart_cycles == 1 &&
+      !NativeTraceResultIsReadyForTrueResidual(
+          result.control, fixture.policy);
+}
+
+bool NativeTraceDeviceFixtures() noexcept
+{
+  try
+  {
+    // A generic five-row system cannot finish within one GMRES(2) cycle;
+    // compare its restarted native result with an independent pivoted solve.
+    const NativeSolveFixture conventional =
+        MakeConventionalFixture(2, 64, 1.0e-12);
+    NativeSolveFixtureResult conventional_result{};
+    const bool conventional_ready = RunNativeSolveFixture(
+            conventional, conventional_result) &&
+        NativeConvergedFixtureExact(
+            conventional, conventional_result, true, -1);
+    if (!conventional_ready)
+    {
+      std::cerr << "native trace conventional fixture failed status="
+                << dg::hdg::runtime::cuda_w8a::detail::
+                       NativeTraceSolveStatusName(
+                           conventional_result.control.status)
+                << " iterations=" << conventional_result.control.iterations
+                << " restarts=" << conventional_result.control.restart_cycles
+                << '\n';
+      return false;
+    }
+
+    const NativeSolveFixture igr = MakeIgrFixture();
+    NativeSolveFixtureResult igr_result{};
+    const bool igr_ready = RunNativeSolveFixture(igr, igr_result) &&
+        NativeConvergedFixtureExact(igr, igr_result, false, 1);
+    if (!igr_ready)
+    {
+      std::cerr << "native trace IGR fixture failed status="
+                << dg::hdg::runtime::cuda_w8a::detail::
+                       NativeTraceSolveStatusName(igr_result.control.status)
+                << " iterations=" << igr_result.control.iterations << '\n';
+      return false;
+    }
+
+    const NativeSolveFixture maximum =
+        MakeConventionalFixture(1, 1, 1.0e-30);
+    NativeSolveFixtureResult maximum_result{};
+    const bool maximum_ready = RunNativeSolveFixture(maximum, maximum_result) &&
+        NativeMaximumIterationFixtureExact(maximum, maximum_result);
+    if (!maximum_ready)
+    {
+      std::cerr << "native trace maximum-iteration fixture failed status="
+                << dg::hdg::runtime::cuda_w8a::detail::
+                       NativeTraceSolveStatusName(maximum_result.control.status)
+                << " iterations=" << maximum_result.control.iterations << '\n';
+      return false;
+    }
+
+    if (!NativeBreakdownFixtureExact())
+    {
+      std::cerr << "native trace numerical-breakdown fixture failed\n";
+      return false;
+    }
+    return true;
+  }
+  catch (...) { return false; }
 }
 
 constexpr bool IluSetupOrderPolicy() noexcept
@@ -1400,9 +2007,10 @@ int main(int argc, char** argv)
   const std::string_view mode = argc == 2 ? argv[1] : "";
   const bool known_mode = mode.empty() || mode == "--token-negatives" ||
       mode == "--functional";
-  const bool pass = NativeBoundedResultPolicy() &&
+  const bool policies = NativeBoundedResultPolicy() &&
       NativeWorkspaceRequirementsPolicy() &&
-      IluFactorStateLifecyclePolicy() && known_mode && (ranks == 1
+      IluFactorStateLifecyclePolicy();
+  const bool lifecycle = known_mode && (ranks == 1
       ? (mode == "--functional" ? FunctionalRestart<RankOneTag>(ranks)
          : mode == "--token-negatives" ? TokenFaults<RankOneTag>(ranks)
          : LifecycleAndRecovery<RankOneTag>(ranks))
@@ -1411,6 +2019,9 @@ int main(int argc, char** argv)
          : mode == "--token-negatives" ? TokenFaults<RankTwoTag>(ranks)
          : LifecycleAndRecovery<RankTwoTag>(ranks))
       : false);
+  const bool native_device_fixtures = ranks != 1 || !mode.empty() ||
+      (lifecycle && NativeTraceDeviceFixtures());
+  const bool pass = policies && lifecycle && native_device_fixtures;
   if (!pass && rank == 0)
     std::cerr << "compact CUDA W8A audit failed\n";
   return pass ? 0 : 1;
