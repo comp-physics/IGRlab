@@ -375,7 +375,7 @@ foreach(_order IN ITEMS 1 2 3)
   set_tests_properties(
     dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p${_order}_rank1
     PROPERTIES
-      LABELS "hdg;runtime;cpu;cuda;generic-euler;alignment;ordinary;tensor;igr;contact;physical;periodic;conservation;trajectory;p${_order}"
+      LABELS "hdg;runtime;cpu;cuda;generic-euler;alignment;ordinary;tensor;igr;contact;physical;periodic;source;initial-trace;conservation;trajectory;p${_order}"
       PROCESSORS 1
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 7200)

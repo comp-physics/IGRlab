@@ -280,6 +280,19 @@ foreach(_ranks IN ITEMS 1 2)
       RESOURCE_LOCK hdg_generic_euler_cpu
       TIMEOUT 1200)
 endforeach()
+
+add_test(NAME dg_igr_hdg_main_backend_cpu_rejects_unsupported_state_routes
+  COMMAND "${CMAKE_COMMAND}"
+    "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+    "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+    "-DHDG_MAIN_DEVICE=cpu"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_unsupported_state_process.cmake")
+set_tests_properties(
+  dg_igr_hdg_main_backend_cpu_rejects_unsupported_state_routes PROPERTIES
+    LABELS "hdg;main-backend;cpu;negative;restart;state-file;process"
+    PROCESSORS 1
+    RESOURCE_LOCK hdg_generic_euler_cpu
+    TIMEOUT 300)
 endif()
 
 if(MFEM_USE_CUDA)
@@ -905,6 +918,7 @@ if(MFEM_USE_CUDA)
     COMMAND "${CMAKE_COMMAND}"
       "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
       "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+      "-DHDG_MAIN_DEVICE=cuda"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_unsupported_state_process.cmake")
   set_tests_properties(
     dg_igr_hdg_main_backend_cuda_rejects_unsupported_state_routes PROPERTIES

@@ -298,6 +298,7 @@ std::string CanonicalMainRequest(
          << request.options.restart_step << ';'
          << request.options.vtk_save << ';'
          << request.options.glvis << ';'
+         << request.options.save_state_files << ';'
          << static_cast<int>(vtk.format) << ';'
          << vtk.high_order_output << ';'
          << vtk.levels_of_detail << ';';
@@ -386,9 +387,10 @@ std::string Validate(const HdgEulerMainRequest& request,
     return "HDG IGR alpha and beta must be finite and positive";
   }
   if (!request.options.restart_vtk.empty() ||
-      request.options.restart_cycle >= 0 || request.options.restart_step >= 0)
+      request.options.restart_cycle >= 0 ||
+      request.options.restart_step >= 0 || request.options.save_state_files)
   {
-    return "generic HDG restart is deferred and unsupported";
+    return "generic HDG restart/state-file routes are unsupported";
   }
   if (request.options.glvis)
   {

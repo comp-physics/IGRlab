@@ -1,6 +1,7 @@
 #include "numerics/hdg/generic/contract.hpp"
 #include "numerics/hdg/runtime/cpu/persistent_smooth_euler.hpp"
 #include "numerics/hdg/runtime/cuda/generic_euler.cuh"
+#include "sim/hdg/state_io.hpp"
 
 #include <mfem.hpp>
 #include <mpi.h>
@@ -312,6 +313,7 @@ struct Case
   double dt = 1.0e-5;
   bool require_localized_sigma = false;
   double static_source_scale = 0.0;
+  bool supply_initial_true_trace = false;
 };
 
 struct BoundaryContext
@@ -323,6 +325,7 @@ struct BoundaryContext
 struct BorrowedFields
 {
   std::vector<double> initial;
+  std::vector<double> initial_true_trace;
   std::vector<double> source;
   std::size_t scalar_count = 0;
 };
@@ -441,8 +444,36 @@ void EvaluateInitial(const InitialMode mode, const mfem::Vector& point,
           (velocity_x * velocity_x + velocity_y * velocity_y);
 }
 
+void EvaluateSuppliedTrace(const InitialMode mode, const mfem::Vector& point,
+                           mfem::Vector& state)
+{
+  EvaluateInitial(mode, point, state);
+  constexpr double pi = 3.141592653589793238462643383279502884;
+  const double base_density = state[0];
+  const double base_velocity_x = state[1] / base_density;
+  const double base_velocity_y = state[2] / base_density;
+  const double base_pressure = 0.4 *
+      (state[3] - 0.5 * base_density *
+          (base_velocity_x * base_velocity_x +
+           base_velocity_y * base_velocity_y));
+  const double density = base_density *
+      (1.0 + 2.0e-4 * std::cos(2.0 * pi * point[0]));
+  const double velocity_x = base_velocity_x +
+      1.0e-4 * std::sin(2.0 * pi * point[1]);
+  const double velocity_y = base_velocity_y -
+      1.0e-4 * std::cos(2.0 * pi * (point[0] + point[1]));
+  const double pressure = base_pressure *
+      (1.0 + 1.5e-4 * std::sin(2.0 * pi * point[0]));
+  state[0] = density;
+  state[1] = density * velocity_x;
+  state[2] = density * velocity_y;
+  state[3] = pressure / 0.4 + 0.5 * density *
+      (velocity_x * velocity_x + velocity_y * velocity_y);
+}
+
 BorrowedFields MakeFields(mfem::ParMesh& mesh, const InitialMode mode,
-                          const int order, const double source_scale)
+                          const int order, const double source_scale,
+                          const bool supply_initial_true_trace)
 {
   BorrowedFields fields;
   mfem::L2_FECollection collection(
@@ -470,6 +501,50 @@ BorrowedFields MakeFields(mfem::ParMesh& mesh, const InitialMode mode,
         fields.source[static_cast<std::size_t>(component) *
                           fields.scalar_count + scalar] =
             source_scale * source_components[component];
+  }
+  if (supply_initial_true_trace)
+  {
+    mfem::DG_Interface_FECollection trace_collection(
+        order, 2, mfem::FiniteElement::VALUE,
+        mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace trace_space(
+        &mesh, &trace_collection, components, mfem::Ordering::byNODES);
+    mfem::ParGridFunction local_trace(&trace_space);
+    const auto trace_evaluator = [mode](const mfem::Vector& point,
+                                        mfem::Vector& state)
+    { EvaluateSuppliedTrace(mode, point, state); };
+    mfem::VectorFunctionCoefficient trace_coefficient(
+        components, trace_evaluator);
+    mfem::Vector true_trace;
+    const auto policy =
+        dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
+    if (!dg_sim::hdg::ProjectEulerTrueTraceCoefficientL2(
+            trace_space, local_trace, true_trace, trace_coefficient,
+            policy.true_trace_projection_quadrature_order) ||
+        true_trace.Size() <= 0)
+      return {};
+    const double* const trace_values = true_trace.HostRead();
+    if (trace_values == nullptr) return {};
+    fields.initial_true_trace.assign(
+        trace_values, trace_values + true_trace.Size());
+
+    // Independently project the volume initial-state function to the trace
+    // space and prove that the supplied coefficients are not merely the
+    // compatibility projection under another pointer.
+    mfem::VectorFunctionCoefficient projected_coefficient(
+        components, evaluator);
+    mfem::Vector projected_true_trace;
+    if (!dg_sim::hdg::ProjectEulerTrueTraceCoefficientL2(
+            trace_space, local_trace, projected_true_trace,
+            projected_coefficient,
+            policy.true_trace_projection_quadrature_order) ||
+        projected_true_trace.Size() != true_trace.Size())
+      return {};
+    const double* const projected_values = projected_true_trace.HostRead();
+    if (projected_values == nullptr || std::equal(
+            fields.initial_true_trace.begin(),
+            fields.initial_true_trace.end(), projected_values))
+      return {};
   }
   return fields;
 }
@@ -519,9 +594,10 @@ EulerHdgRequest MakeRequest(
       backend == BackendKind::cuda ? Capability::cuda : Capability::cpu);
   request.initial_state = {
       fields.initial.data(), fields.initial.size(), components};
-  // Deliberately exercise the common projected-trace path.  Supplied traces
-  // already have independent p1-p3 coverage in the generic extension suite.
-  request.initial_true_trace = {nullptr, 0, components};
+  request.initial_true_trace = {
+      fields.initial_true_trace.empty()
+          ? nullptr : fields.initial_true_trace.data(),
+      fields.initial_true_trace.size(), components};
   request.source = {
       fields.source.empty() ? nullptr : fields.source.data(),
       fields.source.size(), components};
@@ -1142,9 +1218,19 @@ Trajectory RunCase(const Case& specification, const BackendKind backend,
   mfem::ParMesh mesh = MakeMesh(specification.physical);
   BorrowedFields fields = MakeFields(
       mesh, specification.initial_mode, order,
-      specification.static_source_scale);
+      specification.static_source_scale,
+      specification.supply_initial_true_trace);
   if (fields.initial.size() != fields.scalar_count * components ||
       !PhysicalCoefficients(fields.initial, fields.scalar_count) ||
+      ((specification.static_source_scale != 0.0) !=
+       !fields.source.empty()) ||
+      (specification.supply_initial_true_trace !=
+       !fields.initial_true_trace.empty()) ||
+      (specification.supply_initial_true_trace &&
+       (fields.initial_true_trace.size() % components != 0 ||
+        !PhysicalCoefficients(
+            fields.initial_true_trace,
+            fields.initial_true_trace.size() / components))) ||
       (specification.initial_mode == InitialMode::localized_igr_contact &&
        !HasIgrContactAndVelocityTransition(fields)))
     return {};
@@ -1191,25 +1277,29 @@ int main(int argc, char* argv[])
                  "rank-two correctness has separate generic coverage\n";
     return 2;
   }
-  const std::array<Case, 5> cases{{
+  constexpr std::size_t case_count = 6;
+  const std::array<Case, case_count> cases{{
       {"conventional-smooth-short-trajectory", InitialMode::smooth_periodic,
-       RegularizationKind::none, false, 3, 1.0e-5, false, 0.0},
+       RegularizationKind::none, false, 3, 1.0e-5, false, 0.0, false},
       {"conventional-smooth-slip-source-trajectory",
        InitialMode::smooth_periodic, RegularizationKind::none, true, 2,
-       1.0e-5, false, 1.0},
+       1.0e-5, false, 1.0, false},
       {"igr-smooth-short-trajectory", InitialMode::smooth_periodic,
-       RegularizationKind::igr, false, 3, 1.0e-5, false, 0.0},
+       RegularizationKind::igr, false, 3, 1.0e-5, false, 0.0, false},
+      {"igr-smooth-source-supplied-trace-trajectory",
+       InitialMode::smooth_periodic, RegularizationKind::igr, false, 2,
+       1.0e-5, false, 1.0, true},
       {"igr-periodic-localized-contact", InitialMode::localized_igr_contact,
-       RegularizationKind::igr, false, 2, 1.0e-5, true, 0.0},
+       RegularizationKind::igr, false, 2, 1.0e-5, true, 0.0, false},
       {"igr-slip-boundary-localized-contact",
        InitialMode::localized_igr_contact,
-       RegularizationKind::igr, true, 2, 1.0e-5, true, 0.0}}};
+       RegularizationKind::igr, true, 2, 1.0e-5, true, 0.0, false}}};
 
   // MFEM and HYPRE device selection is process-global.  Form every CPU
   // reference trajectory under the default host policy first, then select
   // CUDA once and form all device trajectories.  Interleaving the policies
   // in one process would make backend agreement depend on global setup order.
-  std::array<Trajectory, 5> cpu_trajectories{};
+  std::array<Trajectory, case_count> cpu_trajectories{};
   for (std::size_t index = 0; index < cases.size(); ++index)
     cpu_trajectories[index] = RunCase(
         cases[index], BackendKind::cpu, order);
@@ -1235,8 +1325,8 @@ int main(int argc, char* argv[])
   }
 
   mfem::Device device("cuda");
-  std::array<Trajectory, 5> ordinary_trajectories{};
-  std::array<Trajectory, 5> tensor_trajectories{};
+  std::array<Trajectory, case_count> ordinary_trajectories{};
+  std::array<Trajectory, case_count> tensor_trajectories{};
   for (std::size_t index = 0; index < cases.size(); ++index)
     ordinary_trajectories[index] = RunCase(
         cases[index], BackendKind::cuda, order,

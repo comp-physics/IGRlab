@@ -1,10 +1,23 @@
-if(NOT DEFINED HDG_MAIN_EXECUTABLE OR NOT DEFINED HDG_MAIN_MESH)
-  message(FATAL_ERROR "CUDA HDG executable and bounded mesh are required.")
+if(NOT DEFINED HDG_MAIN_EXECUTABLE OR NOT DEFINED HDG_MAIN_MESH OR
+   NOT DEFINED HDG_MAIN_DEVICE)
+  message(FATAL_ERROR
+    "HDG executable, bounded mesh, and backend device are required.")
+endif()
+
+string(TOLOWER "${HDG_MAIN_DEVICE}" _device)
+if(_device STREQUAL "cpu")
+  set(_engines cpu)
+  set(_expected_reason
+    "\\[hdg-main\\] status=Rejected reason=generic HDG restart/state-file routes are unsupported")
+elseif(_device STREQUAL "cuda")
+  set(_engines ordinary tensor)
+else()
+  message(FATAL_ERROR "Unsupported HDG test device '${HDG_MAIN_DEVICE}'.")
 endif()
 
 set(_base_arguments
   --discretization hdg
-  --device cuda
+  --device "${_device}"
   --regularization none
   --mesh "${HDG_MAIN_MESH}"
   --order 1
@@ -15,7 +28,15 @@ set(_base_arguments
   --no-vtk_save
   --no-glvis)
 
-foreach(_engine IN ITEMS ordinary tensor)
+foreach(_engine IN LISTS _engines)
+  if(_device STREQUAL "cuda")
+    set(_engine_arguments --hdg-cuda-engine "${_engine}")
+    set(_route_expected_reason
+      "\\[hdg-main\\] status=Rejected reason=generic CUDA HDG restart/state-file routes are unsupported cuda_engine=${_engine}")
+  else()
+    set(_engine_arguments)
+    set(_route_expected_reason "${_expected_reason}")
+  endif()
   foreach(_route IN ITEMS restart state-file)
     if(_route STREQUAL "restart")
       set(_route_arguments --restart-vtk unsupported-state.pvd)
@@ -24,15 +45,14 @@ foreach(_engine IN ITEMS ordinary tensor)
     endif()
     execute_process(
       COMMAND "${HDG_MAIN_EXECUTABLE}" ${_base_arguments}
-        --hdg-cuda-engine "${_engine}" ${_route_arguments}
+        ${_engine_arguments} ${_route_arguments}
       RESULT_VARIABLE _status
       OUTPUT_VARIABLE _stdout
       ERROR_VARIABLE _stderr)
     if(_status EQUAL 0 OR
-       NOT _stderr MATCHES
-         "\\[hdg-main\\] status=Rejected reason=generic CUDA HDG restart/state-file routes are unsupported cuda_engine=${_engine}")
+       NOT _stderr MATCHES "${_route_expected_reason}")
       message(FATAL_ERROR
-        "CUDA HDG ${_engine} ${_route} route was not rejected atomically: "
+        "HDG ${_device}/${_engine} ${_route} route was not rejected atomically: "
         "${_status}\n${_stdout}\n${_stderr}")
     endif()
   endforeach()

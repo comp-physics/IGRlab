@@ -4904,11 +4904,13 @@ bool CheckLifecycle(const int order, const bool physical,
   return qualified;
 }
 
-bool CheckRejectedArmijoRollback(const int order, const int ranks)
+bool CheckRejectedArmijoRollbackForSelection(
+    const int order, const int ranks, const RegularizationKind kind)
 {
   // The direct-to-workspace trial kernel is shared by every generic order and
-  // rank count.  Exercise its rejected-trial restoration once, without
-  // duplicating the existing p1-p3/rank1-rank2 lifecycle matrix.
+  // rank count.  Exercise its rejected-trial restoration once for each
+  // mathematical mode, without duplicating the existing p1-p3/rank1-rank2
+  // lifecycle matrix.
   if (order != 1 || ranks != 1) return true;
 
   constexpr double dt = 0.2;
@@ -4918,9 +4920,17 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
   BorrowedFields fields = MakeBorrowedFields(
       mesh, order, SourceMode::nonzero, InitialMode::smooth_periodic);
   const std::vector<double> expected_initial = fields.initial;
+  const bool igr = kind == RegularizationKind::igr;
+  const char* const mode_name = igr ? "igr" : "conventional";
+  const double unwritten = std::numeric_limits<double>::quiet_NaN();
+  const auto finite = [](const std::vector<double>& values)
+  {
+    return std::all_of(values.begin(), values.end(),
+        [](const double value) { return std::isfinite(value); });
+  };
   BoundaryContext boundary{};
   EulerHdgRequest request = MakeRequest(
-      mesh, order, fields, boundary, false, RegularizationKind::none);
+      mesh, order, fields, boundary, false, kind);
   request.numerical_policy.armijo_constant = control_armijo_constant;
   if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
       ContractStatus::accepted)
@@ -4940,7 +4950,8 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
     if (!All(prepared.status == HdgEulerSessionStatus::prepared,
              request.communicator))
     {
-      std::cerr << "CUDA rejected-Armijo control prepare status="
+      std::cerr << "CUDA rejected-Armijo control mode=" << mode_name
+                << " prepare_status="
                 << static_cast<int>(prepared.status) << '\n';
       return false;
     }
@@ -4954,7 +4965,8 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
                  aborted.status == HdgEulerSessionStatus::aborted,
              request.communicator))
     {
-      std::cerr << "CUDA rejected-Armijo control work="
+      std::cerr << "CUDA rejected-Armijo control mode=" << mode_name
+                << " work="
                 << control_work[0] << '/' << control_work[1] << '/'
                 << control_work[2] << '/' << control_work[3] << '/'
                 << control_work[4] << '/' << control_work[5]
@@ -4978,11 +4990,39 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
            request.communicator))
     return false;
 
+  const auto export_committed =
+      [&](std::vector<double>& conservative, std::vector<double>& sigma)
+  {
+    return igr
+        ? session.ExportCommittedFields(HdgEulerHostInteriorFields{
+              conservative.data(), sigma.data(),
+              fields.volume_scalar_count})
+        : session.ExportCommittedInterior(CudaMutableHostL2Output{
+              conservative.data(), fields.volume_scalar_count, components});
+  };
+  const auto export_prepared =
+      [&](const GenericEulerCudaPreparedStep& authority,
+          const GenericEulerHdgCudaSession::prepared_output_type& output,
+          std::vector<double>& conservative, std::vector<double>& sigma)
+  {
+    return igr
+        ? session.ExportPreparedFields(
+              authority, output, HdgEulerHostInteriorFields{
+                  conservative.data(), sigma.data(),
+                  fields.volume_scalar_count})
+        : session.ExportPreparedInterior(
+              authority, output, CudaMutableHostL2Output{
+                  conservative.data(), fields.volume_scalar_count,
+                  components});
+  };
+
   std::vector<double> committed_initial(expected_initial.size(), -1.0);
-  const bool initial_export = session.ExportCommittedInterior(
-      CudaMutableHostL2Output{committed_initial.data(),
-                              fields.volume_scalar_count, components});
-  if (!All(initial_export && SameValues(committed_initial, expected_initial),
+  std::vector<double> sigma_initial(
+      igr ? fields.volume_scalar_count : 0, unwritten);
+  const bool initial_export = export_committed(
+      committed_initial, sigma_initial);
+  if (!All(initial_export && SameValues(committed_initial, expected_initial) &&
+               (!igr || finite(sigma_initial)),
            request.communicator))
     return false;
 
@@ -4994,7 +5034,8 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
   if (!All(first_prepared.status == HdgEulerSessionStatus::prepared,
            request.communicator))
   {
-    std::cerr << "CUDA rejected-Armijo strict prepare status="
+    std::cerr << "CUDA rejected-Armijo strict mode=" << mode_name
+              << " prepare_status="
               << static_cast<int>(first_prepared.status) << '\n';
     return false;
   }
@@ -5004,10 +5045,11 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
       CudaQualificationTestAccess::VerifyPreparedWorkAccounting(
           session, true, first_work);
   std::vector<double> first_candidate(expected_initial.size(), -2.0);
-  const bool first_export = session.ExportPreparedInterior(
-      first_authority, first_output,
-      CudaMutableHostL2Output{first_candidate.data(),
-                              fields.volume_scalar_count, components});
+  std::vector<double> sigma_first_candidate(
+      igr ? fields.volume_scalar_count : 0, unwritten);
+  const bool first_export = export_prepared(
+      first_authority, first_output, first_candidate,
+      sigma_first_candidate);
   const auto first_descriptor = first_output.descriptor;
   const auto first_local_interior_hash = first_output.local_interior_hash;
   const auto first_local_trace_hash = first_output.local_trace_hash;
@@ -5017,6 +5059,7 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
       first_work[3] == first_work[0] + first_work[4] &&
       first_work[1] == first_work[0] + 1;
   const bool first_identity = first_export &&
+      (!igr || finite(sigma_first_candidate)) &&
       first_output.candidate_frozen && first_output.checkpoint_staged &&
       first_output.staging_range.complete &&
       !first_output.output_staged && !first_output.successful_commit &&
@@ -5031,7 +5074,8 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
                aborted.status == HdgEulerSessionStatus::aborted,
            request.communicator))
   {
-    std::cerr << "CUDA rejected-Armijo strict work="
+    std::cerr << "CUDA rejected-Armijo strict mode=" << mode_name
+              << " work="
               << first_work[0] << '/' << first_work[1] << '/'
               << first_work[2] << '/' << first_work[3] << '/'
               << first_work[4] << '/' << first_work[5]
@@ -5042,19 +5086,22 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
   }
 
   std::vector<double> after_abort(expected_initial.size(), -3.0);
-  const bool abort_export = session.ExportCommittedInterior(
-      CudaMutableHostL2Output{after_abort.data(),
-                              fields.volume_scalar_count, components});
+  std::vector<double> sigma_after_abort(
+      igr ? fields.volume_scalar_count : 0, unwritten);
+  const bool abort_export = export_committed(after_abort, sigma_after_abort);
   const auto after_abort_coordinates = session.coordinates();
   if (!All(abort_export && SameValues(after_abort, committed_initial) &&
+               (!igr || SameValues(sigma_after_abort, sigma_initial)) &&
                after_abort_coordinates.time == before.time &&
                after_abort_coordinates.dt == before.dt &&
                after_abort_coordinates.step == before.step &&
                after_abort_coordinates.generation == before.generation,
            request.communicator))
   {
-    std::cerr << "CUDA rejected-Armijo abort rollback=" << abort_export
+    std::cerr << "CUDA rejected-Armijo abort mode=" << mode_name
+              << " rollback=" << abort_export
               << '/' << SameValues(after_abort, committed_initial) << ' '
+              << (!igr || SameValues(sigma_after_abort, sigma_initial)) << ' '
               << after_abort_coordinates.time << '/'
               << after_abort_coordinates.dt << '/'
               << after_abort_coordinates.step << '/'
@@ -5071,7 +5118,8 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
   if (!All(retry_prepared.status == HdgEulerSessionStatus::prepared,
            request.communicator))
   {
-    std::cerr << "CUDA rejected-Armijo retry prepare status="
+    std::cerr << "CUDA rejected-Armijo retry mode=" << mode_name
+              << " prepare_status="
               << static_cast<int>(retry_prepared.status) << '\n';
     return false;
   }
@@ -5081,10 +5129,11 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
       CudaQualificationTestAccess::VerifyPreparedWorkAccounting(
           session, true, retry_work);
   std::vector<double> retry_candidate(expected_initial.size(), -4.0);
-  const bool retry_export = session.ExportPreparedInterior(
-      retry_authority, retry_output,
-      CudaMutableHostL2Output{retry_candidate.data(),
-                              fields.volume_scalar_count, components});
+  std::vector<double> sigma_retry_candidate(
+      igr ? fields.volume_scalar_count : 0, unwritten);
+  const bool retry_export = export_prepared(
+      retry_authority, retry_output, retry_candidate,
+      sigma_retry_candidate);
   auto normalized_retry_descriptor = retry_output.descriptor;
   normalized_retry_descriptor.cursor = first_descriptor.cursor;
   normalized_retry_descriptor.coordinates.cursor =
@@ -5109,6 +5158,8 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
   const bool retry_identity = retry_work_accounted &&
       retry_work == first_work && retry_export &&
       SameValues(retry_candidate, first_candidate) &&
+      (!igr || NearValues(sigma_retry_candidate,
+                          sigma_first_candidate)) &&
       expected_retry_identity &&
       dg::hdg::runtime::detail::SameCheckpoint(
           normalized_retry_descriptor, first_descriptor) &&
@@ -5116,10 +5167,13 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
       retry_output.local_trace_hash == first_local_trace_hash;
   if (!All(retry_identity, request.communicator))
   {
-    std::cerr << "CUDA rejected-Armijo retry identity="
+    std::cerr << "CUDA rejected-Armijo retry mode=" << mode_name
+              << " identity="
               << retry_work_accounted << '/' << (retry_work == first_work)
               << '/' << retry_export << '/'
               << SameValues(retry_candidate, first_candidate) << '/'
+              << (!igr || NearValues(sigma_retry_candidate,
+                                     sigma_first_candidate)) << '/'
               << expected_retry_identity << '/'
               << dg::hdg::runtime::detail::SameCheckpoint(
                      normalized_retry_descriptor, first_descriptor)
@@ -5135,7 +5189,8 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
       retry_authority, retry_output);
   if (!All(acknowledged, request.communicator))
   {
-    std::cerr << "CUDA rejected-Armijo retry acknowledge failed\n";
+    std::cerr << "CUDA rejected-Armijo retry mode=" << mode_name
+              << " acknowledge failed\n";
     (void)session.Abort(std::move(retry_authority), retry_output);
     return false;
   }
@@ -5144,28 +5199,43 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
   if (!All(committed.status == HdgEulerSessionStatus::committed,
            request.communicator))
   {
-    std::cerr << "CUDA rejected-Armijo commit status="
+    std::cerr << "CUDA rejected-Armijo mode=" << mode_name
+              << " commit_status="
               << static_cast<int>(committed.status) << '\n';
     return false;
   }
 
   std::vector<double> committed_final(expected_initial.size(), -5.0);
-  const bool final_export = session.ExportCommittedInterior(
-      CudaMutableHostL2Output{committed_final.data(),
-                              fields.volume_scalar_count, components});
+  std::vector<double> sigma_committed_final(
+      igr ? fields.volume_scalar_count : 0, unwritten);
+  const bool final_export = export_committed(
+      committed_final, sigma_committed_final);
   const auto after = session.coordinates();
   const bool final_ready = final_export &&
       SameValues(committed_final, retry_candidate) &&
+      (!igr || SameValues(sigma_committed_final,
+                          sigma_retry_candidate)) &&
       retry_output.successful_commit && after.step == before.step + 1 &&
       after.generation == before.generation + 1 &&
       after.time == before.time + dt && after.dt == dt;
   if (!All(final_ready, request.communicator))
-    std::cerr << "CUDA rejected-Armijo final=" << final_export << '/'
+    std::cerr << "CUDA rejected-Armijo final mode=" << mode_name
+              << " values=" << final_export << '/'
               << SameValues(committed_final, retry_candidate) << '/'
+              << (!igr || SameValues(sigma_committed_final,
+                                     sigma_retry_candidate)) << '/'
               << retry_output.successful_commit << ' ' << after.time << '/'
               << after.dt << '/' << after.step << '/' << after.generation
               << '\n';
   return All(final_ready, request.communicator);
+}
+
+bool CheckRejectedArmijoRollback(const int order, const int ranks)
+{
+  return CheckRejectedArmijoRollbackForSelection(
+             order, ranks, RegularizationKind::none) &&
+      CheckRejectedArmijoRollbackForSelection(
+             order, ranks, RegularizationKind::igr);
 }
 
 struct Options
