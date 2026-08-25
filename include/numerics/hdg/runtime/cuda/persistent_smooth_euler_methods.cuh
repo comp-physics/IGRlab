@@ -1124,6 +1124,12 @@ BuildPersistentTrueSystem() noexcept
               CudaTraceSolverKind::hypre_host_staged_rank2;
   initialization_tensor_core_evidence_.trace_solver_accounting_complete =
       true;
+  // Native IGR keeps one allocator-prime ILU factor alive while the
+  // production ILU object materializes its own fixed-shape factor below.
+  // This bounded overlap establishes the recurring HYPRE/Umpire replacement
+  // footprint before the allocation baseline.  It is initialization work,
+  // not an accepted-step allocation allowance.
+  std::optional<mfem::HypreILU> native_allocator_prime_ilu;
   // Aggregate work evidence is qualification-only.  The independently
   // verified HYPRE configuration below remains the setup authority if
   // bookkeeping cannot be initialized.
@@ -1190,7 +1196,12 @@ BuildPersistentTrueSystem() noexcept
       hypre_solution_.emplace(*true_matrix_);
       hypre_action_.emplace(*true_matrix_);
       if (use_ilu)
-        ilu_.emplace();
+      {
+        if (use_native)
+          native_allocator_prime_ilu.emplace();
+        else
+          ilu_.emplace();
+      }
       else if (!use_native)
         diagonal_.emplace();
       if (!use_native)
@@ -1261,14 +1272,18 @@ BuildPersistentTrueSystem() noexcept
   // Materialize the exact Krylov/factor allocation footprint before the
   // allocation baseline. The topology matrix is deliberately diagonally
   // dominant here; each real generation overwrites only its already-fixed
-  // numerical values. The warmed solver objects are retired below so their
-  // released pool blocks back the subsequently recreated persistent pair.
-  // A deterministic nonzero RHS forces the setup path to materialize the
-  // persistent solver workspace instead of accepting an identity no-op.
+  // numerical values. Ordinary and rank-two warm objects are retired below.
+  // Native IGR instead keeps this setup-only factor live until the production
+  // factor has been built, so the pool baseline includes the exact bounded
+  // replacement overlap observed on a later fixed-shape refresh. A
+  // deterministic nonzero RHS forces every executed warm solve to
+  // materialize its persistent workspace instead of accepting an identity
+  // no-op.
   *hypre_rhs_ = 1.0;
   *hypre_solution_ = 0.0;
   CudaSolveDiagnostics warm{};
   bool warm_solved = false;
+  bool native_allocator_prime_ready = false;
   if (use_native)
   {
     CudaNativeIlu0FactorView warm_factor{};
@@ -1277,22 +1292,27 @@ BuildPersistentTrueSystem() noexcept
     bool warm_factor_ready = !use_ilu;
     if (use_ilu)
     {
-      warm_factor_ready = CudaBeginIluFactorAttempt(
-          warm_factor_state, warm_attempt,
-          trace_policy.ilu_factor_reuse_policy,
-          reinterpret_cast<std::uintptr_t>(true_matrix_.get()),
-          reinterpret_cast<std::uintptr_t>(true_device_.diag_values),
-          reinterpret_cast<std::uintptr_t>(true_device_.offd_values),
-          true_device_.diag_nonzeros, true_device_.offd_nonzeros) &&
+      warm_factor_ready = native_allocator_prime_ilu &&
+          CudaBeginIluFactorAttempt(
+              warm_factor_state, warm_attempt,
+              trace_policy.ilu_factor_reuse_policy,
+              reinterpret_cast<std::uintptr_t>(true_matrix_.get()),
+              reinterpret_cast<std::uintptr_t>(true_device_.diag_values),
+              reinterpret_cast<std::uintptr_t>(true_device_.offd_values),
+              true_device_.diag_nonzeros, true_device_.offd_nonzeros) &&
           CudaPrepareNativeRankOneIluFactor(
-              *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_,
+              *true_matrix_, *hypre_rhs_, *hypre_solution_,
+              *native_allocator_prime_ilu,
               trace_policy, warm_attempt, 0,
               native_ilu_inverse_diagonal_,
               generic_arena_layout_.native_ilu_inverse_diagonal,
               warm_factor_state, warm_factor, warm);
+      native_allocator_prime_ready = warm_factor_ready &&
+          warm.ilu_factor_setups == 1 && warm.ilu_factor_reuses == 0;
     }
-    warm_solved = warm_factor_ready &&
-        LaunchAndObserveNativeRankOneTraceSolve(warm_factor, 0, warm);
+    warm_solved = use_ilu ? native_allocator_prime_ready :
+        warm_factor_ready &&
+            LaunchAndObserveNativeRankOneTraceSolve(warm_factor, 0, warm);
   }
   else
   {
@@ -1308,10 +1328,10 @@ BuildPersistentTrueSystem() noexcept
               linear_relative_tolerance_,
               maximum_linear_iterations_, krylov_dimension_, 0, warm);
   }
-  if (use_ilu && warm_solved)
+  if (use_ilu && warm_solved && !use_native)
     (void)CudaAccumulateIluSolveEvidence(
         initialization_tensor_core_evidence_, warm);
-  if (warm_solved)
+  if (warm_solved && !(use_native && use_ilu))
   {
     if (use_native)
       initialization_tensor_core_evidence_.
@@ -1319,11 +1339,13 @@ BuildPersistentTrueSystem() noexcept
     else
       initialization_tensor_core_evidence_.hypre_trace_solve_calls = 1;
   }
-  const bool warmed = warm_solved && warm.device_policy &&
-      warm.configured_preconditioner && warm.finite &&
-      warm.matrix_generation == 0 &&
-      warm.trace_solver == trace_solver_kind_ &&
-      warm.configured_native_solver == use_native;
+  const bool warmed = use_native && use_ilu
+      ? native_allocator_prime_ready
+      : warm_solved && warm.device_policy &&
+          warm.configured_preconditioner && warm.finite &&
+          warm.matrix_generation == 0 &&
+          warm.trace_solver == trace_solver_kind_ &&
+          warm.configured_native_solver == use_native;
   if (!CollectiveContinue(warmed)) { return false; }
 
   bool warm_state_zeroed = false;
@@ -1392,6 +1414,71 @@ BuildPersistentTrueSystem() noexcept
           (use_ilu ||
            (native_ilu_inverse_diagonal_ == nullptr &&
             native_trace_workspace_.permutation_marks == nullptr));
+      if (persistent_configured && use_ilu)
+      {
+        // Build and validate the production factor while the allocator-prime
+        // factor is still live.  The persistent object remains factored; the
+        // prime object is destroyed only after this synchronized setup.
+        *hypre_rhs_ = 1.0;
+        *hypre_solution_ = 0.0;
+        CudaNativeIlu0FactorView persistent_warm_factor{};
+        CudaIluAttemptFactorState persistent_warm_factor_state{};
+        const AttemptIdentity persistent_warm_attempt{};
+        CudaSolveDiagnostics persistent_warm{};
+        persistent_configured = CudaBeginIluFactorAttempt(
+            persistent_warm_factor_state, persistent_warm_attempt,
+            trace_policy.ilu_factor_reuse_policy,
+            reinterpret_cast<std::uintptr_t>(true_matrix_.get()),
+            reinterpret_cast<std::uintptr_t>(true_device_.diag_values),
+            reinterpret_cast<std::uintptr_t>(true_device_.offd_values),
+            true_device_.diag_nonzeros, true_device_.offd_nonzeros) &&
+            CudaPrepareNativeRankOneIluFactor(
+                *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_,
+                trace_policy, persistent_warm_attempt, 0,
+                native_ilu_inverse_diagonal_,
+                generic_arena_layout_.native_ilu_inverse_diagonal,
+                persistent_warm_factor_state, persistent_warm_factor,
+                persistent_warm) &&
+            LaunchAndObserveNativeRankOneTraceSolve(
+                persistent_warm_factor, 0, persistent_warm) &&
+            persistent_warm.device_policy &&
+            persistent_warm.configured_preconditioner &&
+            persistent_warm.finite &&
+            persistent_warm.matrix_generation == 0 &&
+            persistent_warm.trace_solver == trace_solver_kind_ &&
+            persistent_warm.configured_native_solver;
+        if (persistent_configured)
+        {
+          const bool persistent_warm_accounted =
+              CudaAccumulateIluSolveEvidence(
+                  initialization_tensor_core_evidence_, persistent_warm) &&
+              initialization_tensor_core_evidence_.ilu_factor_setups !=
+                  std::numeric_limits<std::uint64_t>::max();
+          if (persistent_warm_accounted)
+          {
+            // The allocator-prime factor was a setup-only authority.  Count
+            // it explicitly; only the persistent factor ran a trace solve.
+            ++initialization_tensor_core_evidence_.ilu_factor_setups;
+          }
+          else
+            initialization_tensor_core_evidence_.ilu_accounting_complete =
+                false;
+          initialization_tensor_core_evidence_.
+              native_rank1_trace_solve_calls = 1;
+        }
+        bool persistent_warm_zeroed = false;
+        try
+        {
+          *hypre_rhs_ = 0.0;
+          *hypre_solution_ = 0.0;
+          persistent_warm_zeroed = true;
+        }
+        catch (...) { persistent_warm_zeroed = false; }
+        persistent_configured = persistent_configured &&
+            persistent_warm_zeroed &&
+            TransportPolicy::Synchronize(
+                CudaTransferSite::initial_trace_upload);
+      }
     }
     else
     {
