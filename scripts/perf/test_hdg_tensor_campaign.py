@@ -62,7 +62,7 @@ SCHEMA2_ONLY_SUMMARY_FIELDS = {
 }
 SCHEMA2_ONLY_RECORD_FIELDS = {
     "variant", "production_selectable", "backend", "cuda_engine",
-    "trace_policy", "trace_preconditioner",
+    "trace_policy", "trace_solver", "trace_preconditioner",
     "trace_ilu_type",
     "trace_ilu_level_of_fill", "trace_ilu_local_reordering",
     "trace_ilu_application_iterations", "trace_ilu_accounting_kind",
@@ -223,6 +223,19 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
         sample["tensor_core"] = {
             "selected_engine": args.engine,
             "trace_policy": args.trace_policy,
+            "trace_solver": (
+                "native-rank1-fp64"
+                if args.engine == "tensor" else "hypre-parcsr-gmres"
+            ),
+            "native_rank1_trace_solve_calls": (
+                sample["trace_solves"] if args.engine == "tensor" else 0
+            ),
+            "hypre_trace_solve_calls": (
+                0 if args.engine == "tensor" else sample["trace_solves"]
+            ),
+            "native_rank1_trace_solver_configured": args.engine == "tensor",
+            "hypre_host_staged_rank2_trace_solver_configured": False,
+            "trace_solver_accounting_complete": True,
             "trace_preconditioner": trace_preconditioner,
             "ilu_type": ilu_policy[0],
             "ilu_level_of_fill": ilu_policy[1],
@@ -290,6 +303,10 @@ payload = {
     "backend": "cuda",
     "cuda_engine": args.engine,
     "trace_policy": args.trace_policy,
+    "trace_solver": (
+        "native-rank1-fp64"
+        if args.engine == "tensor" else "hypre-parcsr-gmres"
+    ),
     "trace_preconditioner": trace_preconditioner,
     "trace_ilu_type": ilu_policy[0],
     "trace_ilu_level_of_fill": ilu_policy[1],
@@ -428,7 +445,8 @@ payload = {
 }
 if is_frozen:
     for field in (
-        "backend", "cuda_engine", "trace_policy", "trace_preconditioner",
+        "backend", "cuda_engine", "trace_policy", "trace_solver",
+        "trace_preconditioner",
         "trace_ilu_type", "trace_ilu_level_of_fill",
         "trace_ilu_local_reordering", "trace_ilu_application_iterations",
         "trace_ilu_triangular_solve_kind",
@@ -1421,6 +1439,14 @@ def main() -> int:
         bad_trace_policy = copy.deepcopy(ordinary_record)
         bad_trace_policy["trace_policy"] = "common-fast"
         assert rejected(bad_trace_policy)
+        bad_trace_solver = copy.deepcopy(ordinary_record)
+        bad_trace_solver["trace_solver"] = "native-rank1-fp64"
+        assert rejected(bad_trace_solver)
+        bad_native_calls = copy.deepcopy(ordinary_record)
+        bad_native_calls["samples"][1]["tensor_core"][
+            "native_rank1_trace_solve_calls"
+        ] = bad_native_calls["samples"][1]["trace_solves"]
+        assert rejected(bad_native_calls)
         bad_variant = copy.deepcopy(ordinary_record)
         bad_variant["variant"] = "ablation"
         assert rejected(bad_variant)

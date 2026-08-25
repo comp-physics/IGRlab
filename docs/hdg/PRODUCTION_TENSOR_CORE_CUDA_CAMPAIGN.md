@@ -94,6 +94,10 @@ and `T_common` metadata to match before computing a ratio.
 `production_selectable=false`. The campaign validator rejects either label if
 it disagrees with the explicit trace-policy selection, so attribution records
 cannot be mistaken for production-engine evidence.
+The record also names the configured rank-one trace solver, and every sample
+contains fixed scalar native/HYPRE solve-call counts. The validator requires
+ordinary CUDA calls to be entirely HYPRE and tensor CUDA calls to be entirely
+native; neither path can borrow the other's recurring solve work unnoticed.
 
 Triplet order rotates `O_base/O_common/T_common`,
 `O_common/T_common/O_base`, and `T_common/O_base/O_common`; cell order also

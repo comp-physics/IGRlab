@@ -1599,6 +1599,8 @@ int RunBenchmark(const Options& options)
             << "\","
             << "\"trace_policy\":\""
             << CudaTracePolicyKindName(options.trace_policy) << "\","
+            << "\"trace_solver\":\""
+            << TraceSolverName(reported_trace_policy) << "\","
             << "\"trace_preconditioner\":\""
             << CudaTracePreconditionerName(
                    reported_trace_policy.trace_preconditioner)

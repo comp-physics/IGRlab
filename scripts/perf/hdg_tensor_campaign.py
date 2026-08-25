@@ -1176,6 +1176,34 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str,
         raise CampaignError(
             "sample trace-policy evidence differs from the explicit selection"
         )
+    expected_trace_solver = (
+        "native-rank1-fp64" if engine == "tensor" else "hypre-parcsr-gmres"
+    )
+    if tensor.get("trace_solver") != expected_trace_solver:
+        raise CampaignError(
+            f"sample trace_solver={tensor.get('trace_solver')!r}; expected "
+            f"{expected_trace_solver!r} for rank-one {engine!r}"
+        )
+    native_trace_solves = checked_uint64(
+        tensor.get("native_rank1_trace_solve_calls"),
+        "samples.tensor_core.native_rank1_trace_solve_calls",
+    )
+    hypre_trace_solves = checked_uint64(
+        tensor.get("hypre_trace_solve_calls"),
+        "samples.tensor_core.hypre_trace_solve_calls",
+    )
+    expected_native = engine == "tensor"
+    if tensor.get("native_rank1_trace_solver_configured") is not \
+            expected_native or \
+            tensor.get("hypre_host_staged_rank2_trace_solver_configured") \
+            is not False or \
+            tensor.get("trace_solver_accounting_complete") is not True or \
+            native_trace_solves != (work["trace_solves"] if expected_native else 0) or \
+            hypre_trace_solves != (0 if expected_native else work["trace_solves"]):
+        raise CampaignError(
+            "sample recurring trace-solver accounting does not match the "
+            f"rank-one {engine!r} engine contract"
+        )
     if tensor.get("trace_preconditioner_configured") is not True:
         raise CampaignError("sample trace preconditioner was not configured")
     if tensor.get("trace_preconditioner") != expected_preconditioner:
@@ -1628,6 +1656,15 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
         expected_preconditioner = expected_trace_preconditioner(
             engine, mode, trace_policy
         )
+        expected_trace_solver = (
+            "native-rank1-fp64"
+            if engine == "tensor" else "hypre-parcsr-gmres"
+        )
+        if record.get("trace_solver") != expected_trace_solver:
+            raise CampaignError(
+                f"benchmark trace_solver={record.get('trace_solver')!r}; "
+                f"expected {expected_trace_solver!r} for rank-one {engine!r}"
+            )
         if record.get("trace_preconditioner") != expected_preconditioner:
             raise CampaignError(
                 "benchmark trace_preconditioner="
