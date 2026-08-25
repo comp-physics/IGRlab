@@ -1579,6 +1579,14 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
             f"expected {trace_policy!r}"
         )
     if source == "final":
+        production_selectable = trace_policy == "engine-default"
+        expected_variant = "production" if production_selectable else "ablation"
+        if record.get("variant") != expected_variant or \
+                record.get("production_selectable") is not production_selectable:
+            raise CampaignError(
+                "benchmark production/ablation provenance does not match "
+                f"trace policy {trace_policy!r}"
+            )
         if expected_build is None or expected_gpu is None:
             raise CampaignError("final benchmark validation lacks build/GPU binding")
         if record.get("benchmark") != FINAL_BENCHMARK_NAME or \

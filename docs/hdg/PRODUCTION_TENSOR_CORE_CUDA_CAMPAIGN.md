@@ -89,6 +89,11 @@ The benchmark emits the selected policy at top level and in every bounded
 sample. The driver validates every preconditioner, ILU, triangular-solve,
 accounting, and factor-lifetime dimension exactly, then requires `O_common`
 and `T_common` metadata to match before computing a ratio.
+`engine-default` records `variant=production` and
+`production_selectable=true`; `common-fast` records `variant=ablation` and
+`production_selectable=false`. The campaign validator rejects either label if
+it disagrees with the explicit trace-policy selection, so attribution records
+cannot be mistaken for production-engine evidence.
 
 Triplet order rotates `O_base/O_common/T_common`,
 `O_common/T_common/O_base`, and `T_common/O_base/O_common`; cell order also

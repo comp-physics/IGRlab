@@ -61,7 +61,8 @@ SCHEMA2_ONLY_SUMMARY_FIELDS = {
     "cuda_runtime_version",
 }
 SCHEMA2_ONLY_RECORD_FIELDS = {
-    "backend", "cuda_engine", "trace_policy", "trace_preconditioner",
+    "variant", "production_selectable", "backend", "cuda_engine",
+    "trace_policy", "trace_preconditioner",
     "trace_ilu_type",
     "trace_ilu_level_of_fill", "trace_ilu_local_reordering",
     "trace_ilu_application_iterations", "trace_ilu_accounting_kind",
@@ -447,6 +448,8 @@ if is_frozen:
     ):
         del payload[field]
 else:
+    payload["variant"] = "ablation" if common_fast else "production"
+    payload["production_selectable"] = not common_fast
     payload["build_identity"] = {
         "source_revision": args.expected_source_revision,
         "source_tree": args.expected_source_tree,
@@ -1418,6 +1421,12 @@ def main() -> int:
         bad_trace_policy = copy.deepcopy(ordinary_record)
         bad_trace_policy["trace_policy"] = "common-fast"
         assert rejected(bad_trace_policy)
+        bad_variant = copy.deepcopy(ordinary_record)
+        bad_variant["variant"] = "ablation"
+        assert rejected(bad_variant)
+        bad_production_selection = copy.deepcopy(ordinary_record)
+        bad_production_selection["production_selectable"] = False
+        assert rejected(bad_production_selection)
         bad_sample_trace_policy = copy.deepcopy(ordinary_record)
         bad_sample_trace_policy["samples"][1]["tensor_core"][
             "trace_policy"
@@ -1490,6 +1499,8 @@ def main() -> int:
         CAMPAIGN.validate_record(
             ordinary_common_record, **common_validation_arguments
         )
+        assert ordinary_common_record["variant"] == "ablation"
+        assert ordinary_common_record["production_selectable"] is False
         assert ordinary_common_record["trace_ilu_triangular_solve_kind"] == \
             "iterative_jacobi"
         assert ordinary_common_record[

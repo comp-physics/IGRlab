@@ -1582,13 +1582,18 @@ int RunBenchmark(const Options& options)
   const auto& reported_trace_policy =
       samples[static_cast<std::size_t>(warmup_steps)]
           .prepared.evidence.tensor_core;
+  const bool production_selectable =
+      options.trace_policy == CudaTracePolicyKind::engine_default;
 
   std::cout << std::setprecision(17)
             << "{\"schema\":2,"
             << "\"benchmark\":\"dg_igr_hdg_cuda_accepted_step\","
             << "\"success\":true,"
-            << "\"variant\":\"ablation\","
-            << "\"production_selectable\":false,"
+            << "\"variant\":\""
+            << (production_selectable ? "production" : "ablation")
+            << "\","
+            << "\"production_selectable\":"
+            << (production_selectable ? "true" : "false") << ','
             << "\"backend\":\"cuda\","
             << "\"cuda_engine\":\"" << EngineName(options.engine)
             << "\","
