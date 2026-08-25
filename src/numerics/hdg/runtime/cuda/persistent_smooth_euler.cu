@@ -4551,9 +4551,25 @@ __global__ void EulerConservationReduceKernel(
     out[2 * components + 1] = final_valid ? 1.0 : 0.0;
   }
 }
+__device__ __forceinline__ std::uint64_t MultiplyHistoricalHashPrime(
+    const std::uint64_t hash,const std::uint32_t low_prime)
+{
+  // The historical lane prime is 2^40 + low_prime.  Spell out the modular
+  // product in 32-bit halves so SM120 can issue one wide low-half multiply
+  // and accumulate the two high-half terms without a generic 64-bit product.
+  const std::uint32_t hash_low=static_cast<std::uint32_t>(hash);
+  const std::uint32_t hash_high=static_cast<std::uint32_t>(hash>>32);
+  const std::uint64_t low_product=
+      static_cast<std::uint64_t>(hash_low)*low_prime;
+  std::uint32_t product_high=static_cast<std::uint32_t>(low_product>>32);
+  product_high+=hash_high*low_prime;
+  product_high+=hash_low<<8;
+  return static_cast<std::uint32_t>(low_product)|
+      (static_cast<std::uint64_t>(product_high)<<32);
+}
 __device__ __forceinline__ std::uint64_t HashDoubleWordLane(
     std::uint64_t hash,const double value,const unsigned int lane_bias,
-    const std::uint64_t prime)
+    const std::uint32_t prime_low)
 {
   // CUDA global-memory double words are naturally eight-byte aligned and
   // little endian.  __double_as_longlong is a bit cast, so signed zero and
@@ -4566,7 +4582,7 @@ __device__ __forceinline__ std::uint64_t HashDoubleWordLane(
     const unsigned int current=static_cast<unsigned int>(
         (word>>(8*byte))&0xffULL);
     hash^=static_cast<std::uint64_t>(current+lane_bias);
-    hash*=prime;
+    hash=MultiplyHistoricalHashPrime(hash,prime_low);
   }
   return hash;
 }
@@ -4580,18 +4596,18 @@ __device__ std::uint64_t HashBytesLane(const double* values,const int count,
       1099511628211ULL^0xa0761d6478bd642fULL};
   std::uint64_t hash=seeds[lane];
   const unsigned int lane_bias=17U*static_cast<unsigned int>(lane);
-  const std::uint64_t prime=1099511628211ULL+2ULL*lane;
+  const std::uint32_t prime_low=435U+2U*static_cast<unsigned int>(lane);
   const int grouped_count=count>0?count-count%4:0;
   int word=0;
   for(;word<grouped_count;word+=4)
   {
-    hash=HashDoubleWordLane(hash,values[word],lane_bias,prime);
-    hash=HashDoubleWordLane(hash,values[word+1],lane_bias,prime);
-    hash=HashDoubleWordLane(hash,values[word+2],lane_bias,prime);
-    hash=HashDoubleWordLane(hash,values[word+3],lane_bias,prime);
+    hash=HashDoubleWordLane(hash,values[word],lane_bias,prime_low);
+    hash=HashDoubleWordLane(hash,values[word+1],lane_bias,prime_low);
+    hash=HashDoubleWordLane(hash,values[word+2],lane_bias,prime_low);
+    hash=HashDoubleWordLane(hash,values[word+3],lane_bias,prime_low);
   }
   for(;word<count;++word)
-    hash=HashDoubleWordLane(hash,values[word],lane_bias,prime);
+    hash=HashDoubleWordLane(hash,values[word],lane_bias,prime_low);
   return hash;
 }
 __global__ void HashKernel(const double* values,int count,std::uint64_t* out)
