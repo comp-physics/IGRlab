@@ -462,9 +462,10 @@ struct CudaNumericalResult
   double maximum_conservation_relative_error = 0.0;
   int nonlinear_updates = 0;
   int trace_solves = 0;
-  // Sum HYPRE GMRES iterations from every trace solve, including the final
-  // coherent reconstruction solve.  Line-search trials count every attempted
-  // alpha; rejected trials are the attempts restored before the next alpha.
+  // Sum outer GMRES iterations from the configured native or HYPRE trace
+  // solver, including the final coherent reconstruction solve. Line-search
+  // trials count every attempted alpha; rejected trials are the attempts
+  // restored before the next alpha.
   int linear_iterations = 0;
   int line_search_trials = 0;
   int rejected_line_search_trials = 0;

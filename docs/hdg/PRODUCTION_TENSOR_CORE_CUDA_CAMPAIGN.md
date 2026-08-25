@@ -240,11 +240,12 @@ implementation plan defers whole-timestep fusion beyond per-stage residency.
 
 The transferable principle is operator/dataflow reformulation, not a promise
 that one kernel can cross every solver boundary. The HDG tensor leaf already
-fuses zero/volume/face assembly, performs pivoted local factorization,
-multi-right-hand-side solves, condensation, and Schur contraction in one
-element kernel, retains solved `[B f]` work for recovery, and keeps the rank-one
-Krylov loop and its preconditioner/vector algebra inside one cooperative
-kernel. HYPRE does not execute that recurring rank-one loop.
+fuses zero/volume/face assembly in one SIMT kernel and, in a separate
+one-block-per-element kernel, performs pivoted local factorization,
+multi-right-hand-side solves, condensation, and Schur contraction. It retains
+solved `[B f]` work for recovery and keeps the rank-one Krylov loop and its
+preconditioner/vector algebra inside one cooperative kernel. HYPRE does not
+execute that recurring rank-one loop.
 
 General HDG additionally has an unstructured, globally coupled nonsymmetric
 trace skeleton. True-trace assembly, communicator reductions, the independent
