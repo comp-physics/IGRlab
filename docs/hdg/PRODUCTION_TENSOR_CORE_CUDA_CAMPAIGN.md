@@ -244,25 +244,46 @@ and IGR `U7/Uhat5` p1-p3 shape. The retained solved workspace is consumed
 directly by recovery, eliminating the former second triangular solve. All
 local products remain binary64.
 
-The recurring true-trace GMRES preconditioner is selected by both CUDA engine
-and mathematical mode:
+For production `engine-default`, the recurring true-trace solver is selected
+from the typed CUDA engine and admitted rank surface:
 
-| CUDA engine | Conventional | IGR |
+| CUDA route | Conventional | IGR |
 | --- | --- | --- |
-| Ordinary | HYPRE BJ-ILU0, natural, one application, direct factor solves, refresh each solve | HYPRE BJ-ILU0, RCM, one application, direct factor solves, refresh each solve |
-| Tensor | HYPRE diagonal scaling | HYPRE BJ-ILU0, RCM, one application, five lower and five upper Jacobi iterations, first factor per attempt |
+| Ordinary rank one | HYPRE ParCSR GMRES with BJ-ILU0, natural ordering, one application, direct factor solves, refresh each solve | HYPRE ParCSR GMRES with BJ-ILU0, RCM, one application, direct factor solves, refresh each solve |
+| Tensor rank one | One native cooperative FP64 GMRES kernel; its diagonal preconditioner reads the diagonal directly from the borrowed device ParCSR matrix | One native cooperative FP64 GMRES kernel; HYPRE builds an ILU0+RCM device factor on the first trace solve of the accepted-step attempt, then the native kernel borrows the HYPRE-owned factor CSR and permutation plus an application-owned extracted inverse diagonal and applies five lower and five upper zero-start Jacobi iterations |
+| Either engine, supported rank two | Host-staged rank-two path with HYPRE ParCSR GMRES and the engine/mode preconditioner policy; no native rank-one kernel | Host-staged rank-two path with HYPRE ParCSR GMRES and the engine/mode preconditioner policy; no native rank-one kernel |
 
-This is an explicit numerical policy recorded for every accepted attempt.
-Conventional attribution therefore separates the tensor condensation kernel
-from the independent diagonal-scaling effect. Tensor and ordinary IGR both use
-external policy name `hypre_ilu0`, with exact metadata type 0, fill level 0,
-local RCM reordering 1, and one application iteration. Their factor triangular
-solve is nevertheless an explicit typed difference: ordinary IGR records
-`direct` with zero Jacobi iterations, while tensor IGR records
-`iterative_jacobi` with five lower and five upper iterations. Tensor IGR also
-uses typed factor policy `first_trace_solve_per_attempt`; the ordinary policies
-use `refresh_each_trace_solve`, and diagonal scaling records both factor and
-triangular-solve policies as `not_applicable`.
+The native tensor rank-one GMRES leaf keeps its restarted loop, native CSR
+SpMV over the borrowed rank-one ParCSR diagonal block, preconditioner
+applications, reductions, vector updates, small Hessenberg work, and
+kernel-internal residual checks inside one cooperative kernel launch per trace
+solve. It is a fused FP64 SIMT sparse-solver leaf; no tensor-instruction claim
+is made for it. After that launch, the application copies and synchronizes one
+fixed control result, then uses the current MFEM/HYPRE ParCSR matrix-vector
+product and two communicator inner products to rebuild the authoritative true
+residual. The complete trace-solve phase is therefore not claimed to be one
+kernel launch.
+
+The MFEM/HYPRE ParCSR object retains matrix-storage ownership. In tensor IGR,
+HYPRE also performs ILU0+RCM factor setup on the first trace solve of each
+accepted-step attempt and populates the application-owned inverse-diagonal
+buffer; the setup and synchronization required before borrowing those device
+pointers remain inside the timed accepted-step region. HYPRE does not execute
+the recurring rank-one tensor GMRES loop or its preconditioner applications.
+Tensor rank-one admission fails closed if the cooperative launch, borrowed
+topology, or exact SM120 resource contract is unavailable.
+
+The preconditioner is an explicit numerical policy recorded for every accepted
+attempt. Tensor and ordinary IGR both retain external policy name
+`hypre_ilu0`, exact metadata type 0, fill level 0, local RCM reordering 1, and
+one application iteration because the tensor route deliberately reuses the
+pinned HYPRE factor contract. Their factor application is nevertheless an
+explicit typed difference: ordinary IGR records `direct` with zero Jacobi
+iterations, while tensor IGR records `iterative_jacobi` with five lower and
+five upper iterations executed by the native kernel. Tensor IGR also uses
+typed factor policy `first_trace_solve_per_attempt`; the ordinary policies use
+`refresh_each_trace_solve`, and tensor conventional diagonal scaling records
+both factor and triangular-solve policies as `not_applicable`.
 Exact factor setups and reuses, maximum aggregate factor age, observed outer
 Krylov iterations, derived callback/inner-work and Jacobi factor-SpMV bounds,
 nonlinear work, line
@@ -271,14 +292,18 @@ aggregate benchmark sample. MMA contribution is established separately from
 profiler and SASS evidence; an end-to-end engine speedup is never represented
 as the speedup of MMA alone or as a factor-reuse-only result.
 
-HYPRE exposes the completed GMRES outer-iteration count but neither a
-cumulative preconditioner-callback count nor a restart-cycle count. Its ILU
-iteration getter reports only the most recent application. Intercepting the
-GMRES callbacks to manufacture cumulative counters was rejected because it
-would replace HYPRE's function/data association and add recurring bookkeeping
-inside the timed solver. Production accounting therefore leaves the MFEM/
-HYPRE call path untouched and reports the explicit
-`ilu_accounting_kind=derived_bounds_v1` contract.
+The ordinary and rank-two HYPRE routes expose the completed GMRES
+outer-iteration count but neither a cumulative preconditioner-callback count
+nor a restart-cycle count. Their ILU iteration getter reports only the most
+recent application. Intercepting HYPRE callbacks to manufacture cumulative
+counters was rejected because it would replace HYPRE's function/data
+association and add recurring bookkeeping inside the timed solver. Those
+paths therefore leave the MFEM/HYPRE call path untouched and report the
+explicit `ilu_accounting_kind=derived_bounds_v1` contract. The tensor rank-one
+kernel instead returns one fixed scalar control result containing iterations,
+restart cycles, preconditioner applications, and actual-residual checks. Its
+exact application count is checked against the same aggregate bounds before
+the solve is admitted; no callback or per-event history is retained.
 
 For each successful ILU-preconditioned trace solve with `I` observed outer
 iterations, fixed GMRES restart dimension `K`, and configured ILU application
@@ -289,10 +314,11 @@ count `M`, the pinned implementation derives:
 - inner-work lower and upper bounds equal to the corresponding callback bound
   times `M`.
 
-For tensor IGR, each ILU application performs five fixed lower-Jacobi and five
-fixed upper-Jacobi iterations. HYPRE starts each side from zero, so the first
-iterate elides the factor SpMV; the bounded recurring factor work is therefore
-`(5-1) + (5-1) = 8` factor-SpMV updates per application. The fields
+For tensor IGR, each native ILU application performs five fixed lower-Jacobi
+and five fixed upper-Jacobi iterations. Each side starts from zero, matching
+the selected HYPRE policy, so the first iterate elides the factor SpMV; the
+bounded recurring factor work is therefore `(5-1) + (5-1) = 8` factor-SpMV
+updates per application. The fields
 `ilu_jacobi_factor_spmv_updates_lower_bound` and
 `ilu_jacobi_factor_spmv_updates_upper_bound` are exactly the corresponding
 callback bound times `M` times 8. Direct ordinary ILU and diagonal tensor
@@ -385,8 +411,9 @@ execute the ordinary-CUDA kernel, and ordinary-CUDA work does not count as
 tensor acceleration. The promotion candidate requires zero fallback
 executions in every qualifying tensor run.
 
-The rank-two tensor surface remains the existing one-GPU host-staged
-correctness path. It does not broaden the hardware or MPI claim.
+The rank-two tensor surface remains the existing one-GPU, two-rank,
+host-staged HYPRE correctness path. It is not the native rank-one solver and
+does not establish multi-GPU execution, CUDA-aware MPI, or scaling.
 
 ## Numerical qualification contract
 
@@ -676,21 +703,28 @@ the default regardless of selected tensor wins.
 
 ### Interpretation limits
 
-- Tensor instructions accelerate the local condensation product only. The
-  existing residual/Jacobian assembly, global trace operations, recovery, and
-  acceptance gates remain ordinary FP64 CUDA kernels.
-- HYPRE diagonal scaling in tensor-conventional mode is an independent
-  algorithmic effect and its work is reported separately from MMA. Tensor IGR
-  matches ordinary IGR's type-0, fill-0, RCM, one-application `hypre_ilu0`
-  base configuration but uses five-per-side iterative Jacobi instead of direct
-  factor solves and a different, explicitly counted factor lifetime. Any IGR
-  end-to-end effect from iterative triangular solves or within-attempt factor
-  reuse is therefore disclosed separately from tensor-condensation MMA
-  attribution. The rejected three-per-side and unsupported fill-level-1 tuning paths are not
-  part of the production engine, and neither may silently fall back.
-- Preliminary external profiling identified sparse direct triangular solve as
-  the dominant tensor-IGR accepted-step hotspot. That observation motivated the
-  fixed iterative policy but is not final-candidate performance evidence.
+- Tensor instructions accelerate the fused local-algebra/condensation kernel
+  only. Residual/Jacobian assembly is fused SIMT; the rank-one tensor trace
+  solver uses one cooperative FP64 SIMT GMRES leaf followed by fixed control
+  transfer and MFEM/HYPRE true-residual verification; and recovery remains
+  FP64 CUDA work. No DMMA claim is made for those non-condensation stages.
+- The native rank-one solver is an independent algorithmic effect and its work
+  is reported separately from MMA. Tensor conventional applies a diagonal
+  preconditioner directly from the borrowed ParCSR matrix. Tensor IGR matches
+  ordinary IGR's type-0, fill-0, RCM, one-application `hypre_ilu0` factor
+  contract. Within that preconditioner, HYPRE performs the first-per-attempt
+  factor setup and diagonal extraction; the native cooperative kernel performs
+  five-per-side iterative Jacobi, reuses the factor within the attempt, and
+  executes GMRES. Post-launch MFEM/HYPRE true-residual verification remains the
+  acceptance authority in both tensor modes. Those effects are disclosed
+  separately from tensor-condensation MMA attribution. The rejected
+  three-per-side and unsupported fill-level-1 tuning paths are not part of the
+  production engine, and neither may silently fall back.
+- Preliminary external profiling of the earlier HYPRE-solve prototype
+  identified sparse direct triangular solve as the dominant tensor-IGR
+  accepted-step hotspot. That observation motivated the native fused trace
+  leaf and fixed iterative preconditioner, but it is not final-candidate
+  performance evidence.
 - p1-p3 all use zero-filled 8-by-8/inner-dimension tails. Tile utilization and
   fixed launch costs are therefore degree- and size-dependent; the mesh-4
   campaign defines the disclosed break-even region, including small IGR
