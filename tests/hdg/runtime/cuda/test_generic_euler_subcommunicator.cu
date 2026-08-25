@@ -1,6 +1,7 @@
 #include "numerics/hdg/generic/contract.hpp"
 #include "numerics/hdg/runtime/cuda/generic_euler.cuh"
 #include "sim/hdg/state_io.hpp"
+#include "test_cuda_trace_solver_routing.hpp"
 
 #include <mfem.hpp>
 #include <mpi.h>
@@ -144,6 +145,9 @@ struct CudaQualificationTestAccess
         CudaPreparedIluAccountingValid(
             tensor, evidence.trace_solves, evidence.linear_iterations,
             expected, igr_active) &&
+        CudaPreparedTraceSolverRoutingValid(
+            tensor, evidence.trace_solves, expected,
+            engine.config_.expected_rank_count) &&
         tensor.fallback_count == 0 && evidence.no_fallback &&
         (expected == generic::CudaEngineKind::ordinary
              ? tensor.condensation_launches == 0 && tensor.mma_tiles == 0
