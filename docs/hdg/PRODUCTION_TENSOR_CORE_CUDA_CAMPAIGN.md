@@ -225,6 +225,44 @@ Conventional and IGR dimensions are mathematical/external contracts, not
 mandatory internal storage layouts. Padding or transformed storage is allowed
 provided it is private to the numerical leaf.
 
+### Fusion scope and compact-operator transfer
+
+The tensor design explicitly considered the compact finite-volume/finite-
+difference strategy represented by `sbryngelson/compact-igr` snapshot
+`ad42b0afa9fd34c1e073e0d015694dd9e8209f01`. That implementation precomputes
+the fixed structured-grid derivative `D1 = T^-1 R`, applies many grid pencils
+as dense GEMMs, fuses selected pointwise flux and divergence broadcasts, and
+keeps the time step device resident. Its matrix-free elliptic CG loop still
+uses separate operator applications, reductions, and vector updates; its own
+implementation plan defers whole-timestep fusion beyond per-stage residency.
+
+The transferable principle is operator/dataflow reformulation, not a promise
+that one kernel can cross every solver boundary. The HDG tensor leaf already
+fuses zero/volume/face assembly, performs pivoted local factorization,
+multi-right-hand-side solves, condensation, and Schur contraction in one
+element kernel, retains solved `[B f]` work for recovery, and keeps the rank-one
+Krylov loop and its preconditioner/vector algebra inside one cooperative
+kernel. HYPRE does not execute that recurring rank-one loop.
+
+General HDG additionally has an unstructured, globally coupled nonsymmetric
+trace skeleton. True-trace assembly, communicator reductions, the independent
+FP64 true-residual check, and nonlinear admissibility/Armijo/rollback decisions
+are mathematical or lifecycle synchronization boundaries. Combining local
+condensation and the global cooperative solve into one launch would also mix
+incompatible shared-memory and residency requirements. The production target
+is therefore dataflow fusion across stream-ordered leaves while preserving
+those gates, rather than launch-count-only monolithic fusion.
+
+A deeper tensor route remains technically coherent: retain element Schur
+blocks, apply the trace operator matrix-free, build face/element Schwarz from
+those blocks, and use communication-avoiding blocks of Krylov vectors so dense
+FP64 MMA tiles are materially occupied. It is not silently enabled in this
+candidate. Direct true-trace scatter and additional recovery fusion were also
+considered, but exact-current attribution limits their individual accepted-
+step ceilings to about one percent or less; the dominant IGR target is Krylov
+work, while the dominant conventional targets are assembly, validation, and
+local tensor algebra.
+
 ### Implemented tensor numerical leaf
 
 The production tensor selection retains the existing FP64 residual/Jacobian,
@@ -244,6 +282,11 @@ zero-filled, so the same kernel admits every current conventional `U4/Uhat4`
 and IGR `U7/Uhat5` p1-p3 shape. The retained solved workspace is consumed
 directly by recovery, eliminating the former second triangular solve. All
 local products remain binary64.
+
+The optional second eight-column tensor batch crosses a real warp-uniform loop
+edge. This prevents predicated-off edge batches from issuing non-material DMMA
+instructions while preserving the same padded operands, outputs, and planned
+material-tile accounting.
 
 For production `engine-default`, the recurring true-trace solver is selected
 from the typed CUDA engine and admitted rank surface:
@@ -369,6 +412,15 @@ continuing after that rejection left null factor data and crashed. Production
 therefore retains the supported ILU0 configuration rather than hiding an
 ordinary-CUDA or other
 preconditioner fallback. No fill-level-1 result is admissible campaign evidence.
+
+The exact transaction fingerprint remains the historical four-lane FNV-derived
+binary64-byte protocol. A residue/jump-table experiment preserved every hash
+value but regressed saturated p3 accepted-step time and was reverted. The
+selected implementation instead decomposes multiplication by each lane prime
+`2^40 + (435 + 2*lane)` into exact modulo-`2^64` 32-bit-half products. It
+changes neither bytes, values, checkpoint compatibility, nor lifecycle state;
+final paired timing determines whether its shorter SM120 instruction sequence
+is retained in the frozen candidate.
 
 ### Precision and acceptance policy
 
@@ -518,7 +570,7 @@ hardware conditions are identical within each paired comparison. The recorded
 trace policy follows the mode-aware table above. In IGR, type 0, fill level 0,
 RCM ordering, and the one-application count are identical between the engines;
 the explicitly reported direct-versus-five-per-side-Jacobi triangular policy
-and factor-lifetime policy differ. All
+differs, while both factor lifetimes refresh each trace solve. All
 recurring trace work remains inside the accepted-step timing; aggregate
 solver-work records disclose exact factor work and derived solve bounds, while
 profiler evidence separately attributes the tensor-condensation MMA
