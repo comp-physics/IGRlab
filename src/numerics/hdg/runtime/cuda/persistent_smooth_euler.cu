@@ -3589,17 +3589,26 @@ static __device__ __forceinline__ void TensorSubtractBlockedProduct(
       nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,8,8,4,double,
                             nvcuda::wmma::row_major> matrix_a;
       nvcuda::wmma::load_matrix_sync(matrix_a,warp_a,4);
-#pragma unroll
-      for(int slot=0;slot<tensor_column_batch_tiles;++slot)
-        if(slot<batch_width)
-        {
-          nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
-                                nvcuda::wmma::row_major> matrix_b;
-          nvcuda::wmma::load_matrix_sync(
-              matrix_b,warp_b+slot*4*8,8);
-          nvcuda::wmma::mma_sync(accumulators[slot],matrix_a,matrix_b,
-                                 accumulators[slot]);
-        }
+      // Every nonempty tile range has slot zero.  Keep its fragments at a
+      // compile-time index, then use a real uniform loop edge for the optional
+      // second tile.  An unrolled slot<batch_width guard makes nvcc issue the
+      // slot-one warp MMA even when that uniform predicate is false.
+      {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
+                              nvcuda::wmma::row_major> matrix_b;
+        nvcuda::wmma::load_matrix_sync(matrix_b,warp_b,8);
+        nvcuda::wmma::mma_sync(accumulators[0],matrix_a,matrix_b,
+                               accumulators[0]);
+      }
+#pragma unroll 1
+      for(int active_slot=1;active_slot<batch_width;++active_slot)
+      {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
+                              nvcuda::wmma::row_major> matrix_b;
+        nvcuda::wmma::load_matrix_sync(matrix_b,warp_b+4*8,8);
+        nvcuda::wmma::mma_sync(accumulators[1],matrix_a,matrix_b,
+                               accumulators[1]);
+      }
     }
 #pragma unroll
     for(int slot=0;slot<tensor_column_batch_tiles;++slot)
@@ -3836,18 +3845,27 @@ __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
       nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,8,8,4,double,
                             nvcuda::wmma::row_major> matrix_a;
       nvcuda::wmma::load_matrix_sync(matrix_a,tensor_a[warp],4);
-#pragma unroll
-      for(int slot=0;slot<tensor_column_batch_tiles;++slot)
+      // Slot zero is material for every nonempty warp range.  The optional
+      // slot-one contraction must cross an actual uniform loop edge rather
+      // than an unrolled predicate, otherwise its DMMA is still issued for a
+      // one-tile edge batch.
       {
-        if(slot<batch_width)
-        {
-          nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
-                                nvcuda::wmma::row_major> matrix_b;
-          nvcuda::wmma::load_matrix_sync(
-              matrix_b,tensor_b[warp][slot],8);
-          nvcuda::wmma::mma_sync(accumulators[slot],matrix_a,matrix_b,
-                                 accumulators[slot]);
-        }
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
+                              nvcuda::wmma::row_major> matrix_b;
+        nvcuda::wmma::load_matrix_sync(
+            matrix_b,tensor_b[warp][0],8);
+        nvcuda::wmma::mma_sync(accumulators[0],matrix_a,matrix_b,
+                               accumulators[0]);
+      }
+#pragma unroll 1
+      for(int active_slot=1;active_slot<batch_width;++active_slot)
+      {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
+                              nvcuda::wmma::row_major> matrix_b;
+        nvcuda::wmma::load_matrix_sync(
+            matrix_b,tensor_b[warp][1],8);
+        nvcuda::wmma::mma_sync(accumulators[1],matrix_a,matrix_b,
+                               accumulators[1]);
       }
     }
 #pragma unroll
