@@ -2275,18 +2275,44 @@ SolveTrueSystem(double& true_relative_residual,
            trace_solver_kind_ ==
                CudaTraceSolverKind::hypre_host_staged_rank2)
   {
-    solved = use_ilu
-        ? CudaSolveWithIluFactorPolicy(
-              *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
-              ranks_, communicator_, trace_policy_descriptor_,
-              current_attempt_, linear_relative_tolerance_,
-              maximum_linear_iterations_, krylov_dimension_,
-              matrix_generation, ilu_factor_state_, diagnostics)
-        : CudaRefreshDiagonalAndSolve(
-              *true_matrix_, *hypre_rhs_, *hypre_solution_, *diagonal_,
-              *gmres_, ranks_, communicator_, trace_policy_descriptor_,
-              linear_relative_tolerance_, maximum_linear_iterations_,
-              krylov_dimension_, matrix_generation, diagnostics);
+    if (use_ilu)
+    {
+      const bool ordinary_rank1_refresh = ranks_ == 1 &&
+          CudaOrdinaryRankOneRefreshPolicyIsExact(
+              trace_policy_descriptor_);
+      if (ordinary_rank1_refresh)
+      {
+        const bool attempt_ready =
+            CudaOrdinaryRankOneRefreshAttemptIsExact(
+                ilu_factor_state_, current_attempt_,
+                reinterpret_cast<std::uintptr_t>(true_matrix_.get()),
+                reinterpret_cast<std::uintptr_t>(true_device_.diag_values),
+                reinterpret_cast<std::uintptr_t>(true_device_.offd_values),
+                true_device_.diag_nonzeros, true_device_.offd_nonzeros);
+        solved = attempt_ready && CudaOrdinaryRankOneRefreshFactorAndSolve(
+            *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
+            ranks_, communicator_, trace_policy_descriptor_,
+            linear_relative_tolerance_, maximum_linear_iterations_,
+            krylov_dimension_, matrix_generation, diagnostics);
+      }
+      else
+      {
+        solved = CudaSolveWithIluFactorPolicy(
+            *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
+            ranks_, communicator_, trace_policy_descriptor_,
+            current_attempt_, linear_relative_tolerance_,
+            maximum_linear_iterations_, krylov_dimension_,
+            matrix_generation, ilu_factor_state_, diagnostics);
+      }
+    }
+    else
+    {
+      solved = CudaRefreshDiagonalAndSolve(
+          *true_matrix_, *hypre_rhs_, *hypre_solution_, *diagonal_,
+          *gmres_, ranks_, communicator_, trace_policy_descriptor_,
+          linear_relative_tolerance_, maximum_linear_iterations_,
+          krylov_dimension_, matrix_generation, diagnostics);
+    }
   }
   if (use_ilu && solved)
     (void)CudaAccumulateIluSolveEvidence(

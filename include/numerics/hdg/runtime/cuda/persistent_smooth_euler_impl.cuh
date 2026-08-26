@@ -541,6 +541,41 @@ inline bool CudaIluFactorAttemptMatches(
       ::dg::hdg::runtime::detail::SameAttempt(state.attempt, attempt);
 }
 
+inline bool CudaOrdinaryRankOneRefreshAttemptIsExact(
+    const CudaIluAttemptFactorState& state,
+    const AttemptIdentity& attempt,
+    const std::uintptr_t matrix_object_token,
+    const std::uintptr_t diag_values_token,
+    const std::uintptr_t offd_values_token,
+    const int diag_nonzeros, const int offd_nonzeros) noexcept
+{
+  return CudaIluFactorAttemptMatches(
+          state, attempt,
+          CudaIluFactorReusePolicy::refresh_each_trace_solve) &&
+      state.matrix_object_token == matrix_object_token &&
+      state.diag_values_token == diag_values_token &&
+      state.offd_values_token == offd_values_token &&
+      state.diag_nonzeros == diag_nonzeros &&
+      state.offd_nonzeros == offd_nonzeros &&
+      state.hypre_matrix_token == 0 &&
+      state.diag_offsets_token == 0 &&
+      state.diag_columns_token == 0 &&
+      state.offd_offsets_token == 0 &&
+      state.offd_columns_token == 0 &&
+      state.ilu_handle_token == 0 &&
+      state.factor_matrix_token == 0 &&
+      state.factor_offsets_token == 0 &&
+      state.factor_columns_token == 0 &&
+      state.factor_values_token == 0 &&
+      state.factor_permutation_token == 0 &&
+      state.native_inverse_diagonal_token == 0 &&
+      state.jacobi_diagonal_vector_token == 0 &&
+      state.jacobi_diagonal_values_token == 0 &&
+      state.matrix_rows == 0 && state.factor_rows == 0 &&
+      state.factor_nonzeros == 0 && state.factor_generation == 0 &&
+      state.last_solve_generation == 0 && !state.factor_ready;
+}
+
 constexpr bool CudaIluFactorRefreshRequired(
     const CudaIluAttemptFactorState& state) noexcept
 {
@@ -1651,6 +1686,20 @@ bool CudaConfigurePersistentDiagonal(mfem::HypreParMatrix& matrix,
                                      std::uint64_t matrix_generation,
                                      CudaDiagScaleSetupState& state)
     noexcept;
+bool CudaOrdinaryRankOneRefreshFactorAndSolve(
+    mfem::HypreParMatrix& matrix,
+    mfem::HypreParVector& rhs,
+    mfem::HypreParVector& solution,
+    mfem::HypreILU& ilu,
+    mfem::HypreGMRES& gmres,
+    int ranks,
+    MPI_Comm communicator,
+    const CudaTracePolicyDescriptor& policy,
+    double relative_tolerance,
+    int maximum_iterations,
+    int krylov_dimension,
+    std::uint64_t matrix_generation,
+    CudaSolveDiagnostics& diagnostics) noexcept;
 bool CudaRefreshFactorAndSolve(mfem::HypreParMatrix& matrix,
                                mfem::HypreParVector& rhs,
                                mfem::HypreParVector& solution,

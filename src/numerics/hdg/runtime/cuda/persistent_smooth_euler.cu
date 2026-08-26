@@ -2121,6 +2121,153 @@ bool CudaSolveWithIluFactorPolicy(
   catch (...) { return false; }
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+// Keep the ordinary rank-one refresh path physically separate from the
+// retained-factor policy solver.  Its factor lifetime is exactly one solve,
+// so retained HYPRE handle/configuration interrogation is inapplicable work.
+bool CudaOrdinaryRankOneRefreshFactorAndSolve(
+    mfem::HypreParMatrix& matrix, mfem::HypreParVector& rhs,
+    mfem::HypreParVector& solution, mfem::HypreILU& ilu,
+    mfem::HypreGMRES& gmres, const int ranks,
+    const MPI_Comm communicator,
+    const CudaTracePolicyDescriptor& policy,
+    const double relative_tolerance, const int maximum_iterations,
+    const int krylov_dimension,
+    const std::uint64_t matrix_generation,
+    CudaSolveDiagnostics& diagnostics) noexcept
+{
+  CudaTrueSystemDiagnosticScope diagnostic(
+      "ordinary-rank1-refresh-each-ilu-solve", matrix_generation);
+  diagnostics = {};
+  diagnostics.matrix_generation = matrix_generation;
+  diagnostics.trace_solver = CudaTraceSolverKind::hypre_parcsr_gmres;
+  diagnostics.trace_preconditioner = policy.trace_preconditioner;
+  diagnostics.igr_active = policy.igr_active;
+  diagnostics.ilu_type = policy.ilu_type;
+  diagnostics.ilu_level_of_fill = policy.ilu_level_of_fill;
+  diagnostics.ilu_local_reordering = policy.ilu_local_reordering;
+  diagnostics.ilu_application_iterations =
+      policy.ilu_application_iterations;
+  diagnostics.ilu_triangular_solve_kind =
+      policy.ilu_triangular_solve_kind;
+  diagnostics.ilu_lower_jacobi_iterations =
+      policy.ilu_lower_jacobi_iterations;
+  diagnostics.ilu_upper_jacobi_iterations =
+      policy.ilu_upper_jacobi_iterations;
+  diagnostics.krylov_dimension = krylov_dimension;
+  diagnostics.ilu_accounting_kind =
+      CudaIluAccountingKind::derived_bounds_v1;
+  diagnostics.ilu_factor_reuse_policy =
+      CudaIluFactorReusePolicy::refresh_each_trace_solve;
+
+  const bool exact_refresh_policy = ranks == 1 &&
+      communicator != MPI_COMM_NULL &&
+      CudaOrdinaryRankOneRefreshPolicyIsExact(policy);
+  if (!AllRanksReady(exact_refresh_policy, communicator, ranks)) return false;
+
+  CudaHypreSetupState setup_order{};
+  const bool incoming_hypre_clean = HYPRE_GetError() == 0;
+  if (!AllRanksReady(incoming_hypre_clean, communicator, ranks)) return false;
+  bool policy_ready = false;
+  try
+  {
+    policy_ready = CudaHypreDevicePolicyValid(matrix, rhs, solution) &&
+        CudaConfigurePersistentHypre(
+            matrix, ilu, gmres, ranks, policy,
+            relative_tolerance, maximum_iterations, krylov_dimension,
+            matrix_generation, setup_order) &&
+        HYPRE_GetError() == 0;
+  }
+  catch (...) { policy_ready = false; }
+  if (!AllRanksReady(policy_ready, communicator, ranks)) return false;
+
+  bool vectors_ready = false;
+  try
+  {
+    solution = 0.0;
+    solution.HypreReadWrite();
+    vectors_ready = HYPRE_GetError() == 0;
+  }
+  catch (...) { vectors_ready = false; }
+  if (!AllRanksReady(vectors_ready, communicator, ranks)) return false;
+
+  try
+  {
+    bool mult_returned = false;
+    try
+    {
+      gmres.Mult(rhs, solution);
+      mult_returned = true;
+    }
+    catch (...) {}
+    const HYPRE_Int terminal_hypre_error = HYPRE_GetError();
+    const bool terminal_clean = AllRanksReady(
+        terminal_hypre_error == 0, communicator, ranks);
+    const bool terminal_pure_convergence = AllRanksReady(
+        terminal_hypre_error == HYPRE_ERROR_CONV, communicator, ranks);
+    bool terminal_error_cleared = terminal_clean && HYPRE_GetError() == 0;
+    if (terminal_pure_convergence)
+    {
+      terminal_error_cleared =
+          HYPRE_ClearError(HYPRE_ERROR_CONV) == 0 && HYPRE_GetError() == 0;
+    }
+    const bool lifecycle_ready = mult_returned &&
+        (terminal_clean != terminal_pure_convergence) &&
+        terminal_error_cleared;
+    if (!AllRanksReady(lifecycle_ready, communicator, ranks)) return false;
+
+    diagnostics.device_policy =
+        CudaHypreDevicePolicyValid(matrix, rhs, solution);
+    diagnostics.configured_ilu =
+        setup_order.Advance(CudaHypreSetupTransition::mult) &&
+        setup_order.SolveExactForGeneration(matrix_generation, policy);
+    diagnostics.configured_preconditioner = diagnostics.configured_ilu;
+    if (!diagnostics.configured_preconditioner)
+      diagnostics.trace_preconditioner =
+          CudaTracePreconditionerKind::unconfigured;
+    gmres.GetNumIterations(diagnostics.iterations);
+    gmres.GetFinalResidualNorm(diagnostics.reported_residual);
+    const bool solve_observations_clean = HYPRE_GetError() == 0;
+    const bool accounting_inputs_valid = solve_observations_clean &&
+        diagnostics.iterations >= 0 && krylov_dimension > 0 &&
+        diagnostics.ilu_application_iterations > 0;
+    const CudaDerivedIluAccountingBoundsV1 bounds = accounting_inputs_valid
+        ? CudaDeriveIluAccountingBoundsV1(
+              static_cast<std::uint64_t>(diagnostics.iterations),
+              static_cast<std::uint64_t>(krylov_dimension),
+              static_cast<std::uint64_t>(
+                  diagnostics.ilu_application_iterations), 0)
+        : CudaDerivedIluAccountingBoundsV1{};
+    diagnostics.ilu_factor_setups = 1;
+    diagnostics.ilu_factor_reuses = 0;
+    diagnostics.ilu_factor_age_generations = 0;
+    diagnostics.ilu_preconditioner_callbacks_lower_bound =
+        bounds.ilu_preconditioner_callbacks_lower_bound;
+    diagnostics.ilu_preconditioner_callbacks_upper_bound =
+        bounds.ilu_preconditioner_callbacks_upper_bound;
+    diagnostics.ilu_inner_iterations_lower_bound =
+        bounds.ilu_inner_iterations_lower_bound;
+    diagnostics.ilu_inner_iterations_upper_bound =
+        bounds.ilu_inner_iterations_upper_bound;
+    diagnostics.ilu_jacobi_factor_spmv_updates_lower_bound =
+        bounds.ilu_jacobi_factor_spmv_updates_lower_bound;
+    diagnostics.ilu_jacobi_factor_spmv_updates_upper_bound =
+        bounds.ilu_jacobi_factor_spmv_updates_upper_bound;
+    diagnostics.ilu_accounting_complete = bounds.ilu_accounting_complete;
+    diagnostics.finite = solve_observations_clean &&
+        std::isfinite(diagnostics.reported_residual);
+    diagnostics.reported_tolerance_met = diagnostics.finite &&
+        diagnostics.reported_residual <= relative_tolerance;
+    diagnostic.result = solve_observations_clean &&
+        CudaTraceSolveReadyForTrueResidualVerification(
+            diagnostics, maximum_iterations);
+    return diagnostic.result;
+  }
+  catch (...) { return false; }
+}
+
 bool CudaRefreshFactorAndSolve(
     mfem::HypreParMatrix& matrix, mfem::HypreParVector& rhs,
     mfem::HypreParVector& solution, mfem::HypreILU& ilu,
@@ -2132,6 +2279,12 @@ bool CudaRefreshFactorAndSolve(
     const std::uint64_t matrix_generation,
     CudaSolveDiagnostics& diagnostics) noexcept
 {
+  if (ranks == 1 && CudaOrdinaryRankOneRefreshPolicyIsExact(policy))
+    return CudaOrdinaryRankOneRefreshFactorAndSolve(
+        matrix, rhs, solution, ilu, gmres, ranks, communicator, policy,
+        relative_tolerance, maximum_iterations, krylov_dimension,
+        matrix_generation, diagnostics);
+
   CudaTrueMatrixDeviceView view{};
   CudaIluAttemptFactorState factor_state{};
   const AttemptIdentity initialization_attempt{};

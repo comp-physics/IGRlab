@@ -1030,6 +1030,34 @@ constexpr bool IluSetupOrderPolicy() noexcept
 static_assert(IluSetupOrderPolicy(),
               "ILU setup and application work must be generation-exact");
 
+constexpr bool OrdinaryRankOneRefreshRoutingPolicy() noexcept
+{
+  using dg::hdg::generic::CudaEngineKind;
+  return CudaOrdinaryRankOneRefreshPolicyIsExact(
+             ResolveCudaTracePolicy(
+                 CudaEngineKind::ordinary, false,
+                 CudaTracePolicyKind::engine_default)) &&
+      CudaOrdinaryRankOneRefreshPolicyIsExact(
+          ResolveCudaTracePolicy(
+              CudaEngineKind::ordinary, true,
+              CudaTracePolicyKind::engine_default)) &&
+      !CudaOrdinaryRankOneRefreshPolicyIsExact(
+          ResolveCudaTracePolicy(
+              CudaEngineKind::ordinary, true,
+              CudaTracePolicyKind::common_fast)) &&
+      !CudaOrdinaryRankOneRefreshPolicyIsExact(
+          ResolveCudaTracePolicy(
+              CudaEngineKind::tensor_core, false,
+              CudaTracePolicyKind::engine_default)) &&
+      !CudaOrdinaryRankOneRefreshPolicyIsExact(
+          ResolveCudaTracePolicy(
+              CudaEngineKind::tensor_core, true,
+              CudaTracePolicyKind::engine_default));
+}
+
+static_assert(OrdinaryRankOneRefreshRoutingPolicy(),
+              "only exact ordinary refresh-each policies use the lean solve");
+
 constexpr bool DiagScaleSetupOrderPolicy() noexcept
 {
   using dg::hdg::generic::CudaEngineKind;

@@ -906,6 +906,21 @@ constexpr bool CudaTracePolicyDescriptorIsExact(
           descriptor.selection));
 }
 
+constexpr bool CudaOrdinaryRankOneRefreshPolicyIsExact(
+    const CudaTracePolicyDescriptor& descriptor) noexcept
+{
+  return descriptor.selected_engine == generic::CudaEngineKind::ordinary &&
+      CudaTracePolicyDescriptorIsExact(descriptor) &&
+      descriptor.trace_preconditioner ==
+          CudaTracePreconditionerKind::hypre_ilu0 &&
+      descriptor.ilu_factor_reuse_policy ==
+          CudaIluFactorReusePolicy::refresh_each_trace_solve &&
+      descriptor.ilu_triangular_solve_kind ==
+          CudaIluTriangularSolveKind::direct &&
+      descriptor.ilu_lower_jacobi_iterations == 0 &&
+      descriptor.ilu_upper_jacobi_iterations == 0;
+}
+
 /** Production tensor-leaf selection and work census for one scope. */
 struct CudaTensorCoreEvidence
 {
