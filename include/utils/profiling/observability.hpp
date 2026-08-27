@@ -109,6 +109,7 @@ enum class RegionId : std::uint16_t
   igr_chebyshev_diagonal = 244,
   igr_warm_start_residual_guard = 245,
   igr_krylov_solve = 246,
+  hdg_accepted_step = 299,
   hdg_local_assembly = 300,
   hdg_local_factorization = 301,
   hdg_condensation = 302,
@@ -116,7 +117,12 @@ enum class RegionId : std::uint16_t
   hdg_trace_assembly = 304,
   hdg_interior_recovery = 305,
   hdg_packing = 306,
-  hdg_device_transfer = 307
+  hdg_device_transfer = 307,
+  hdg_trace_solve = 308,
+  hdg_reduction = 309,
+  hdg_validation = 310,
+  hdg_nonlinear_update = 311,
+  hdg_synchronization = 312
 };
 
 /** Stable counter IDs reserved for shared core performance measurements. */
@@ -171,6 +177,7 @@ constexpr const char* region_name(const RegionId id) noexcept
     case RegionId::igr_chebyshev_diagonal: return "IGR/chebyshev-diagonal";
     case RegionId::igr_warm_start_residual_guard: return "IGR/warm-start-residual-guard";
     case RegionId::igr_krylov_solve: return "IGR/krylov-solve";
+    case RegionId::hdg_accepted_step: return "HDG/accepted-step";
     case RegionId::hdg_local_assembly: return "HDG/local-assembly";
     case RegionId::hdg_local_factorization: return "HDG/local-factorization";
     case RegionId::hdg_condensation: return "HDG/condensation";
@@ -179,6 +186,11 @@ constexpr const char* region_name(const RegionId id) noexcept
     case RegionId::hdg_interior_recovery: return "HDG/interior-recovery";
     case RegionId::hdg_packing: return "HDG/packing";
     case RegionId::hdg_device_transfer: return "HDG/device-transfer";
+    case RegionId::hdg_trace_solve: return "HDG/trace-solve";
+    case RegionId::hdg_reduction: return "HDG/reduction";
+    case RegionId::hdg_validation: return "HDG/validation";
+    case RegionId::hdg_nonlinear_update: return "HDG/nonlinear-update";
+    case RegionId::hdg_synchronization: return "HDG/synchronization";
     case RegionId::unknown: return "core/unknown";
   }
   return "core/unknown";

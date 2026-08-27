@@ -13,6 +13,35 @@ if(NOT HDG_REPRESENTATIVE_DEVICE STREQUAL "cpu" AND
   message(FATAL_ERROR
     "Representative HDG device must be cpu or cuda, got '${HDG_REPRESENTATIVE_DEVICE}'.")
 endif()
+if(NOT DEFINED HDG_MAIN_CUDA_ENGINE)
+  set(HDG_MAIN_CUDA_ENGINE ordinary)
+endif()
+if(NOT HDG_MAIN_CUDA_ENGINE STREQUAL "ordinary" AND
+   NOT HDG_MAIN_CUDA_ENGINE STREQUAL "tensor")
+  message(FATAL_ERROR
+    "Representative CUDA engine must be ordinary or tensor, got '${HDG_MAIN_CUDA_ENGINE}'.")
+endif()
+if(HDG_REPRESENTATIVE_DEVICE STREQUAL "cpu" AND
+   NOT HDG_MAIN_CUDA_ENGINE STREQUAL "ordinary")
+  message(FATAL_ERROR
+    "CPU representative coverage requires the ordinary CUDA selector.")
+endif()
+# Every CUDA representative case below is IGR and shares the qualified ILU(0)
+# trace policy across both CUDA engines.
+set(_expected_trace_preconditioner hypre_ilu0)
+set(_expected_ilu_fill 0)
+set(_expected_ilu_iterations 1)
+if(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor")
+  set(_expected_ilu_factor_reuse_policy first_trace_solve_per_attempt)
+  set(_expected_ilu_triangular_solve_kind iterative_jacobi)
+  set(_expected_ilu_lower_jacobi_iterations 5)
+  set(_expected_ilu_upper_jacobi_iterations 5)
+else()
+  set(_expected_ilu_factor_reuse_policy refresh_each_trace_solve)
+  set(_expected_ilu_triangular_solve_kind direct)
+  set(_expected_ilu_lower_jacobi_iterations 0)
+  set(_expected_ilu_upper_jacobi_iterations 0)
+endif()
 if(NOT DEFINED HDG_REPRESENTATIVE_RANKS)
   set(HDG_REPRESENTATIVE_RANKS 1)
 endif()
@@ -80,6 +109,10 @@ set(_common_arguments
   --time-step 0.00001
   --t-final 0.00001
   --no-glvis)
+if(HDG_REPRESENTATIVE_DEVICE STREQUAL "cuda")
+  list(APPEND _common_arguments
+    --hdg-cuda-engine "${HDG_MAIN_CUDA_ENGINE}")
+endif()
 
 # The CUDA gate deliberately uses bounded meshes and no VTK.  It reaches both
 # real application entry points through Solver::solve, exercises the periodic
@@ -99,7 +132,7 @@ if(HDG_REPRESENTATIVE_DEVICE STREQUAL "cuda")
     ERROR_VARIABLE _periodic_stderr)
   if(NOT _periodic_status EQUAL 0 OR
      NOT _periodic_stdout MATCHES
-       "\\[hdg-main\\] status=Success.*regularization=igr" OR
+       "\\[hdg-main\\] status=Success.*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*trace_preconditioner=${_expected_trace_preconditioner}.*trace_ilu_type=0.*trace_ilu_level_of_fill=${_expected_ilu_fill}.*trace_ilu_local_reordering=1.*trace_ilu_application_iterations=${_expected_ilu_iterations}.*trace_ilu_accounting_kind=derived_bounds_v1.*trace_ilu_factor_reuse_policy=${_expected_ilu_factor_reuse_policy}.*trace_ilu_triangular_solve_kind=${_expected_ilu_triangular_solve_kind}.*trace_ilu_lower_jacobi_iterations=${_expected_ilu_lower_jacobi_iterations}.*trace_ilu_upper_jacobi_iterations=${_expected_ilu_upper_jacobi_iterations}.*regularization=igr" OR
      NOT _periodic_stderr STREQUAL "")
     message(FATAL_ERROR
       "CUDA periodic p1 HDG IGR execution failed: ${_periodic_status}\\n${_periodic_stdout}\\n${_periodic_stderr}")
@@ -119,7 +152,7 @@ if(HDG_REPRESENTATIVE_DEVICE STREQUAL "cuda")
       ERROR_VARIABLE _physical_stderr)
     if(NOT _physical_status EQUAL 0 OR
        NOT _physical_stdout MATCHES
-         "\\[hdg-main\\] status=Success.*regularization=igr" OR
+         "\\[hdg-main\\] status=Success.*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*trace_preconditioner=${_expected_trace_preconditioner}.*trace_ilu_type=0.*trace_ilu_level_of_fill=${_expected_ilu_fill}.*trace_ilu_local_reordering=1.*trace_ilu_application_iterations=${_expected_ilu_iterations}.*trace_ilu_accounting_kind=derived_bounds_v1.*trace_ilu_factor_reuse_policy=${_expected_ilu_factor_reuse_policy}.*trace_ilu_triangular_solve_kind=${_expected_ilu_triangular_solve_kind}.*trace_ilu_lower_jacobi_iterations=${_expected_ilu_lower_jacobi_iterations}.*trace_ilu_upper_jacobi_iterations=${_expected_ilu_upper_jacobi_iterations}.*regularization=igr" OR
        NOT _physical_stderr STREQUAL "")
       message(FATAL_ERROR
         "CUDA physical-boundary ${_boundary_mode} p1 HDG IGR execution failed: ${_physical_status}\\n${_physical_stdout}\\n${_physical_stderr}")

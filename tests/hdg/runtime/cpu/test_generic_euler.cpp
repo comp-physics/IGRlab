@@ -60,6 +60,7 @@ namespace
 {
 
 using dg::hdg::generic::BackendKind;
+using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::Capability;
 using dg::hdg::generic::CapabilityBit;
 using dg::hdg::generic::EulerHdgRequest;
@@ -242,7 +243,7 @@ EulerHdgRequest Request(const mfem::ParMesh& mesh, const int order,
   request.mesh = &mesh;
   request.communicator = mesh.GetComm();
   request.polynomial_order = order;
-  request.backend = {BackendKind::cpu, -1};
+  request.backend = {BackendKind::cpu, -1, CudaEngineKind::ordinary};
   request.capabilities = cpu_capabilities;
   request.initial_state = {fields.initial.empty() ? nullptr : fields.initial.data(),
                            fields.initial.size(), 4};
@@ -447,7 +448,7 @@ bool CheckBorrowedTraceRestrictsInterior()
     request.mesh = &mesh;
     request.communicator = mesh.GetComm();
     request.polynomial_order = order;
-    request.backend = {BackendKind::cpu, -1};
+    request.backend = {BackendKind::cpu, -1, CudaEngineKind::ordinary};
     request.capabilities = cpu_capabilities;
     request.initial_state = initial.empty()
         ? dg::hdg::generic::EulerFieldView{zero_local_initial.data(),

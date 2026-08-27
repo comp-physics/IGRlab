@@ -35,6 +35,19 @@ enum class BackendKind : std::uint8_t
   cuda
 };
 
+/** Explicit CUDA numerical leaf selected behind the shared HDG lifecycle. */
+enum class CudaEngineKind : std::uint8_t
+{
+  ordinary = 0,
+  tensor_core = 1
+};
+
+constexpr bool IsKnownCudaEngineKind(const CudaEngineKind kind) noexcept
+{
+  return kind == CudaEngineKind::ordinary ||
+      kind == CudaEngineKind::tensor_core;
+}
+
 /** Optional numerical augmentation selected by a borrowed Euler request. */
 enum class RegularizationKind : std::uint8_t
 {
@@ -170,6 +183,9 @@ struct BackendSelection
 {
   BackendKind kind;
   int device_ordinal;
+  // ordinary is zero so existing two-member aggregate initializers retain the
+  // production default while the contract remains a trivial POD.
+  CudaEngineKind cuda_engine;
 };
 
 /** A non-owning component-major or engine-defined Euler field view. */
@@ -779,6 +795,24 @@ inline bool ExactNumericalPolicyConsensus(
                  std::begin(maximum_reals));
 }
 
+inline bool ExactBackendSelectionConsensus(
+    const MPI_Comm communicator, const BackendSelection backend) noexcept
+{
+  const int local[] = {
+      static_cast<int>(backend.kind), backend.device_ordinal,
+      static_cast<int>(backend.cuda_engine)};
+  int minimum[sizeof(local) / sizeof(*local)]{};
+  int maximum[sizeof(local) / sizeof(*local)]{};
+  const int count = static_cast<int>(sizeof(local) / sizeof(*local));
+  const bool minimum_ready = MPI_Allreduce(
+      local, minimum, count, MPI_INT, MPI_MIN, communicator) == MPI_SUCCESS;
+  const bool maximum_ready = MPI_Allreduce(
+      local, maximum, count, MPI_INT, MPI_MAX, communicator) == MPI_SUCCESS;
+  return minimum_ready && maximum_ready &&
+      std::equal(std::begin(minimum), std::end(minimum),
+                 std::begin(maximum));
+}
+
 inline ContractStatus ValidateEulerHdgRequest(
     const EulerHdgRequest& request) noexcept
 {
@@ -823,8 +857,12 @@ inline ContractStatus ValidateEulerHdgRequest(
   {
     RecordFailure(local_status, ContractStatus::invalid_numerical_policy);
   }
-  if (request.backend.kind != BackendKind::cpu &&
-      request.backend.kind != BackendKind::cuda)
+  if (!ExactBackendSelectionConsensus(request.communicator, request.backend) ||
+      (request.backend.kind != BackendKind::cpu &&
+       request.backend.kind != BackendKind::cuda) ||
+      !IsKnownCudaEngineKind(request.backend.cuda_engine) ||
+      (request.backend.kind == BackendKind::cpu &&
+       request.backend.cuda_engine != CudaEngineKind::ordinary))
   {
     RecordFailure(local_status, ContractStatus::invalid_backend);
   }

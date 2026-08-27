@@ -27,6 +27,15 @@ function(expect_early_rejection expected_diagnostic)
 endfunction()
 
 expect_early_rejection(
+  "Invalid HDG CUDA engine 'invalid'\\. Use 'ordinary' or 'tensor'\\."
+  --hdg-cuda-engine invalid)
+expect_early_rejection(
+  "HDG CUDA engine 'tensor' requires '--discretization hdg --device cuda'\\."
+  --discretization hdg --device cpu --hdg-cuda-engine tensor)
+expect_early_rejection(
+  "HDG CUDA engine 'tensor' requires '--discretization hdg --device cuda'\\."
+  --discretization dg --device cuda --hdg-cuda-engine tensor)
+expect_early_rejection(
   "Case 'discretization-cli-boundary' does not provide an HDG backend adapter\\."
   --discretization hdg)
 expect_early_rejection(

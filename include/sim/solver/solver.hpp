@@ -121,13 +121,14 @@ enum class SolverRequestAdmission
 inline SolverRequestAdmission
 AdmitSolverRequest(const SolverRequestResolution& request)
 {
-  constexpr int tuple_size = 7;
+  constexpr int tuple_size = 8;
   const int local[tuple_size] = {
     static_cast<int>(request.status),
     static_cast<int>(request.discretization),
     static_cast<int>(request.discretization_provenance),
     request.dg_backend ? static_cast<int>(*request.dg_backend) : -1,
     static_cast<int>(request.device_backend),
+    static_cast<int>(request.hdg_cuda_engine),
     static_cast<int>(request.regularization),
     static_cast<int>(request.time_integrator)};
   int minimum[tuple_size] = {};
@@ -514,7 +515,8 @@ struct Solver
       HasDGBackendOptionOverride(argc, argv),
       HasRegularizationOptionOverride(argc, argv),
       HasTimeIntegratorOptionOverride(argc, argv),
-      cli_opts.device);
+      cli_opts.device,
+      cli_opts.hdg_cuda_engine);
     const detail::SolverRequestAdmission request_admission =
       detail::AdmitSolverRequest(request_resolution);
     if (request_admission != detail::SolverRequestAdmission::Accepted)
@@ -541,6 +543,8 @@ struct Solver
     cli_opts.discretization =
       DiscretizationToString(request_resolution.discretization);
     cli_opts.device = DeviceBackendToString(request_resolution.device_backend);
+    cli_opts.hdg_cuda_engine =
+      HdgCudaEngineToString(request_resolution.hdg_cuda_engine);
     cli_opts.regularization =
       RegularizationToString(request_resolution.regularization);
     cli_opts.time_integrator =
@@ -575,7 +579,8 @@ struct Solver
         mfem::Device hdg_cuda_device("cuda");
         if (mfem::Mpi::Root())
         {
-          std::cout << "[device] requested=cuda\n";
+          std::cout << "[device] requested=cuda hdg_cuda_engine="
+                    << cli_opts.hdg_cuda_engine << '\n';
           hdg_cuda_device.Print();
         }
         return hdg::RunEulerMainBackend(hdg_request);

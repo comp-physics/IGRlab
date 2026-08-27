@@ -3,6 +3,109 @@ if(NOT TARGET dgsem_smooth_advection_periodic)
     "The opted-in generic HDG main-backend example is required.")
 endif()
 
+# Keep the production-main CFL matrix on the shared process fixture.  Its
+# arguments remain explicit so the selected device, CUDA engine,
+# regularization mode, polynomial order, and rank count are visible in CTest.
+function(add_hdg_main_cfl_process_test test_name output_tag device
+         cuda_engine regularization order ranks expected_steps)
+  add_test(NAME ${test_name}
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/${output_tag}-output"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+      "-DHDG_MAIN_DEVICE=${device}"
+      "-DHDG_MAIN_CUDA_ENGINE=${cuda_engine}"
+      "-DHDG_MAIN_REGULARIZATION=${regularization}"
+      "-DHDG_MAIN_ORDER=${order}"
+      "-DHDG_MAIN_N=3"
+      "-DHDG_MAIN_RANKS=${ranks}"
+      "-DHDG_MAIN_DT=0"
+      "-DHDG_MAIN_CFL=0.25"
+      "-DHDG_MAIN_T_FINAL=0.02"
+      "-DHDG_MAIN_EXPECTED_STEPS=${expected_steps}"
+      "-DHDG_MAIN_EXPECTED_FINAL_TIME=0\\.02"
+      "-DHDG_MAIN_NO_VTK=ON"
+      "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+      "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+
+  if(regularization STREQUAL "igr")
+    set(_mode_label igr)
+  else()
+    set(_mode_label conventional)
+  endif()
+  if(device STREQUAL "cuda")
+    set(_device_labels "cuda;${cuda_engine}")
+    set(_resource_lock dg_igr_sm120)
+  else()
+    set(_device_labels cpu)
+    set(_resource_lock hdg_generic_euler_cpu)
+  endif()
+  set_tests_properties(${test_name} PROPERTIES
+    LABELS
+      "hdg;main-backend;${_device_labels};${_mode_label};p${order};rank${ranks};mpi;process;generic-borrowed;cfl;no-vtk"
+    PROCESSORS ${ranks}
+    RESOURCE_LOCK ${_resource_lock}
+    TIMEOUT 1200)
+endfunction()
+
+# Refinement stays in the same application process fixture and intentionally
+# publishes VTK: the fixture validates the global refined-cell census as well
+# as the committed trajectory and mode-specific Euler/IGR field surface.
+function(add_hdg_main_cuda_refinement_process_test test_name output_tag
+         cuda_engine regularization order refinement_mode)
+  if(refinement_mode STREQUAL "serial")
+    set(_serial_refine 1)
+    set(_parallel_refine 0)
+    set(_ranks 1)
+  elseif(refinement_mode STREQUAL "parallel")
+    set(_serial_refine 0)
+    set(_parallel_refine 1)
+    set(_ranks 2)
+  else()
+    message(FATAL_ERROR
+      "Unknown HDG production-main refinement mode '${refinement_mode}'.")
+  endif()
+  if(regularization STREQUAL "igr")
+    set(_mode_label igr)
+  else()
+    set(_mode_label conventional)
+  endif()
+
+  add_test(NAME ${test_name}
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/${output_tag}-output"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n6.mesh"
+      "-DHDG_MAIN_DEVICE=cuda"
+      "-DHDG_MAIN_CUDA_ENGINE=${cuda_engine}"
+      "-DHDG_MAIN_REGULARIZATION=${regularization}"
+      "-DHDG_MAIN_ORDER=${order}"
+      "-DHDG_MAIN_N=6"
+      "-DHDG_MAIN_RANKS=${_ranks}"
+      "-DHDG_MAIN_SERIAL_REFINE=${_serial_refine}"
+      "-DHDG_MAIN_PARALLEL_REFINE=${_parallel_refine}"
+      "-DHDG_MAIN_DT=0.005"
+      "-DHDG_MAIN_T_FINAL=0.01"
+      "-DHDG_MAIN_DT_SAVE=0.005"
+      "-DHDG_MAIN_EXPECTED_STEPS=2"
+      "-DHDG_MAIN_EXPECTED_FINAL_TIME=0\\.01"
+      "-DHDG_MAIN_EXPECTED_TIMES=0,0.005,0.01"
+      "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+      "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+  set_tests_properties(${test_name} PROPERTIES
+    LABELS
+      "hdg;main-backend;cuda;${cuda_engine};${_mode_label};p${order};rank${_ranks};${refinement_mode}-refinement;mpi;process;generic-borrowed;fixed-step;vtk;refinement"
+    PROCESSORS ${_ranks}
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 1200)
+endfunction()
+
 if(NOT MFEM_USE_CUDA)
 if(NOT TARGET dg_igr_hdg_main_backend_cpu)
   message(FATAL_ERROR "The generic CPU HDG main backend is required.")
@@ -35,32 +138,37 @@ set_tests_properties(
 
 # Exercise the CPU application entry's committed-state CFL proposal, shared
 # time planner, clipped final step, and transactional no-output path.  The
-# matching CUDA gates use this same process fixture below.
-add_test(NAME dg_igr_hdg_main_backend_cpu_rank2_cfl
-  COMMAND "${CMAKE_COMMAND}"
-    "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
-    "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cpu-rank2-cfl-output"
-    "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
-    "-DHDG_MAIN_DEVICE=cpu"
-    "-DHDG_MAIN_ORDER=1"
-    "-DHDG_MAIN_N=3"
-    "-DHDG_MAIN_RANKS=2"
-    "-DHDG_MAIN_DT=0"
-    "-DHDG_MAIN_CFL=0.25"
-    "-DHDG_MAIN_T_FINAL=0.02"
-    "-DHDG_MAIN_EXPECTED_STEPS=3"
-    "-DHDG_MAIN_EXPECTED_FINAL_TIME=0\\.02"
-    "-DHDG_MAIN_NO_VTK=ON"
-    "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
-    "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
-    "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
-    "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
-    -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
-set_tests_properties(dg_igr_hdg_main_backend_cpu_rank2_cfl PROPERTIES
-  LABELS "hdg;main-backend;cpu;mpi;process;generic-borrowed;cfl"
-  PROCESSORS 2
-  RESOURCE_LOCK hdg_generic_euler_cpu
-  TIMEOUT 1200)
+# matching CUDA gates use this same process fixture below.  Rank one spans the
+# supported p1-p3 selection; the established rank-two p1 representatives keep
+# their original CTest names.  For this n3 fixture, the production proposal
+# cfl*hmin/((2*p+1)*maximum_wave_speed) gives 3/4/6 accepted steps at p1/p2/p3,
+# including the planner's clipped final step.
+foreach(_order IN ITEMS 1 2 3)
+  if(_order EQUAL 1)
+    set(_expected_cfl_steps 3)
+  elseif(_order EQUAL 2)
+    set(_expected_cfl_steps 4)
+  else()
+    set(_expected_cfl_steps 6)
+  endif()
+  add_hdg_main_cfl_process_test(
+    dg_igr_hdg_main_backend_cpu_conventional_p${_order}_rank1_cfl
+    cpu-conventional-p${_order}-rank1-cfl
+    cpu ordinary none ${_order} 1 ${_expected_cfl_steps})
+  add_hdg_main_cfl_process_test(
+    dg_igr_hdg_main_backend_cpu_igr_p${_order}_rank1_cfl
+    cpu-igr-p${_order}-rank1-cfl
+    cpu ordinary igr ${_order} 1 ${_expected_cfl_steps})
+endforeach()
+
+add_hdg_main_cfl_process_test(
+  dg_igr_hdg_main_backend_cpu_rank2_cfl
+  cpu-rank2-cfl
+  cpu ordinary none 1 2 3)
+add_hdg_main_cfl_process_test(
+  dg_igr_hdg_main_backend_cpu_igr_rank2_cfl
+  cpu-igr-rank2-cfl
+  cpu ordinary igr 1 2 3)
 
 if(NOT TARGET dgsem_smooth_advection OR
    NOT TARGET hdg_smooth_transition_research)
@@ -172,6 +280,19 @@ foreach(_ranks IN ITEMS 1 2)
       RESOURCE_LOCK hdg_generic_euler_cpu
       TIMEOUT 1200)
 endforeach()
+
+add_test(NAME dg_igr_hdg_main_backend_cpu_rejects_unsupported_state_routes
+  COMMAND "${CMAKE_COMMAND}"
+    "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+    "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+    "-DHDG_MAIN_DEVICE=cpu"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_unsupported_state_process.cmake")
+set_tests_properties(
+  dg_igr_hdg_main_backend_cpu_rejects_unsupported_state_routes PROPERTIES
+    LABELS "hdg;main-backend;cpu;negative;restart;state-file;process"
+    PROCESSORS 1
+    RESOURCE_LOCK hdg_generic_euler_cpu
+    TIMEOUT 300)
 endif()
 
 if(MFEM_USE_CUDA)
@@ -204,6 +325,27 @@ if(MFEM_USE_CUDA)
     set_tests_properties(
       dg_igr_hdg_main_backend_representative_cases_cuda_rank${_ranks}_p1 PROPERTIES
         LABELS "hdg;main-backend;cuda;real-application;igr;source;periodic;physical;boundary;p1;no-vtk;mpi"
+        PROCESSORS ${_ranks}
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 3600)
+    add_test(NAME dg_igr_hdg_main_backend_representative_cases_cuda_tensor_rank${_ranks}_p1
+      COMMAND "${CMAKE_COMMAND}"
+        "-DHDG_PERIODIC_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+        "-DHDG_NONPERIODIC_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection>"
+        "-DHDG_REPRESENTATIVE_WORK=${CMAKE_CURRENT_BINARY_DIR}/cuda-tensor-representative-rank${_ranks}"
+        "-DHDG_REPRESENTATIVE_DEVICE=cuda"
+        "-DHDG_MAIN_CUDA_ENGINE=tensor"
+        "-DHDG_REPRESENTATIVE_RANKS=${_ranks}"
+        "-DHDG_REPRESENTATIVE_PERIODIC_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+        "-DHDG_REPRESENTATIVE_NONPERIODIC_MESH=${CMAKE_CURRENT_SOURCE_DIR}/smooth_advection_physical_n2.mesh"
+        "-DHDG_REPRESENTATIVE_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+        "-DHDG_REPRESENTATIVE_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+        "-DHDG_REPRESENTATIVE_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+        "-DHDG_REPRESENTATIVE_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/test_representative_case_process.cmake")
+    set_tests_properties(
+      dg_igr_hdg_main_backend_representative_cases_cuda_tensor_rank${_ranks}_p1 PROPERTIES
+        LABELS "hdg;main-backend;cuda;tensor;real-application;igr;source;periodic;physical;boundary;p1;no-vtk;mpi"
         PROCESSORS ${_ranks}
         RESOURCE_LOCK dg_igr_sm120
         TIMEOUT 3600)
@@ -251,6 +393,23 @@ if(MFEM_USE_CUDA)
       ${MPIEXEC_PREFLAGS}
       $<TARGET_FILE:dg_igr_hdg_main_backend_cuda_physical_extension_test>
       ${MPIEXEC_POSTFLAGS})
+  add_test(NAME dg_igr_hdg_main_backend_cuda_physical_extension_tensor_rank1
+    COMMAND dg_igr_hdg_main_backend_cuda_physical_extension_test
+      --engine tensor)
+  add_test(NAME dg_igr_hdg_main_backend_cuda_physical_extension_tensor_rank2
+    COMMAND
+      "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 2
+      ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_hdg_main_backend_cuda_physical_extension_test>
+      --engine tensor
+      ${MPIEXEC_POSTFLAGS})
+  add_test(NAME dg_igr_hdg_main_backend_cuda_engine_mismatch_rank2
+    COMMAND
+      "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 2
+      ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_hdg_main_backend_cuda_physical_extension_test>
+      --rank-engine-mismatch
+      ${MPIEXEC_POSTFLAGS})
   set_tests_properties(
     dg_igr_hdg_main_backend_cuda_physical_extension_rank1 PROPERTIES
       LABELS "hdg;main-backend;cuda;physical;all-euler-boundaries;igr;conventional;p1-p3;source;initial-trace"
@@ -263,6 +422,24 @@ if(MFEM_USE_CUDA)
       PROCESSORS 2
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 3600)
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_physical_extension_tensor_rank1 PROPERTIES
+      LABELS "hdg;main-backend;cuda;tensor;physical;all-euler-boundaries;igr;conventional;p1-p3;source;initial-trace"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 3600)
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_physical_extension_tensor_rank2 PROPERTIES
+      LABELS "hdg;main-backend;cuda;tensor;physical;all-euler-boundaries;igr;conventional;p1-p3;source;initial-trace;mpi;host-staged"
+      PROCESSORS 2
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 3600)
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_engine_mismatch_rank2 PROPERTIES
+      LABELS "hdg;main-backend;cuda;negative;consensus;ordinary;tensor;mpi"
+      PROCESSORS 2
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 300)
 
   foreach(_ranks IN ITEMS 1 2)
     add_test(NAME dg_igr_hdg_main_backend_cuda_igr_rank${_ranks}_p1_p3
@@ -281,13 +458,32 @@ if(MFEM_USE_CUDA)
         PROCESSORS ${_ranks}
         RESOURCE_LOCK dg_igr_sm120
         TIMEOUT 3600)
+    add_test(NAME dg_igr_hdg_main_backend_cuda_igr_tensor_rank${_ranks}_p1_p3
+      COMMAND "${CMAKE_COMMAND}"
+        "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+        "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+        "-DHDG_MAIN_CUDA_ENGINE=tensor"
+        "-DHDG_MAIN_RANKS=${_ranks}"
+        "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+        "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+        "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+        "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_igr_process.cmake")
+    set_tests_properties(
+      dg_igr_hdg_main_backend_cuda_igr_tensor_rank${_ranks}_p1_p3 PROPERTIES
+        LABELS "hdg;main-backend;cuda;tensor;igr;periodic;p1-p3;source;initial-trace;mpi;process"
+        PROCESSORS ${_ranks}
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 3600)
   endforeach()
 
   foreach(_ranks IN ITEMS 1 2)
     if(_ranks EQUAL 1)
       set(_verify_repeatable_output ON)
+      set(_omit_cuda_engine ON)
     else()
       set(_verify_repeatable_output OFF)
+      set(_omit_cuda_engine OFF)
     endif()
     add_test(NAME dg_igr_hdg_main_backend_cuda_rank${_ranks}_n3
       COMMAND "${CMAKE_COMMAND}"
@@ -300,12 +496,32 @@ if(MFEM_USE_CUDA)
         "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
         "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
         "-DHDG_MAIN_VERIFY_REPEATABLE_OUTPUT=${_verify_repeatable_output}"
+        "-DHDG_MAIN_OMIT_CUDA_ENGINE=${_omit_cuda_engine}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
     set_tests_properties(dg_igr_hdg_main_backend_cuda_rank${_ranks}_n3 PROPERTIES
       LABELS "hdg;main-backend;cuda;mpi;process;generic-borrowed"
       PROCESSORS ${_ranks}
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 1200)
+    add_test(NAME dg_igr_hdg_main_backend_cuda_tensor_rank${_ranks}_n3
+      COMMAND "${CMAKE_COMMAND}"
+        "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+        "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-tensor-rank${_ranks}-n3-output"
+        "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+        "-DHDG_MAIN_CUDA_ENGINE=tensor"
+        "-DHDG_MAIN_RANKS=${_ranks}"
+        "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+        "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+        "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+        "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+        "-DHDG_MAIN_VERIFY_REPEATABLE_OUTPUT=${_verify_repeatable_output}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+    set_tests_properties(
+      dg_igr_hdg_main_backend_cuda_tensor_rank${_ranks}_n3 PROPERTIES
+        LABELS "hdg;main-backend;cuda;tensor;conventional;fixed-step;vtk;mpi;process;generic-borrowed"
+        PROCESSORS ${_ranks}
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 1200)
   endforeach()
 
   add_test(NAME dg_igr_hdg_main_backend_cuda_igr_vtk_rank1
@@ -333,6 +549,33 @@ if(MFEM_USE_CUDA)
     PROCESSORS 1
     RESOURCE_LOCK dg_igr_sm120
     TIMEOUT 1200)
+  add_test(NAME dg_igr_hdg_main_backend_cuda_igr_vtk_tensor_rank1
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-igr-vtk-tensor-rank1-output"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+      "-DHDG_MAIN_DEVICE=cuda"
+      "-DHDG_MAIN_CUDA_ENGINE=tensor"
+      "-DHDG_MAIN_REGULARIZATION=igr"
+      "-DHDG_MAIN_ORDER=1"
+      "-DHDG_MAIN_N=3"
+      "-DHDG_MAIN_RANKS=1"
+      "-DHDG_MAIN_DT=0.00001"
+      "-DHDG_MAIN_T_FINAL=0.00001"
+      "-DHDG_MAIN_DT_SAVE=0.00001"
+      "-DHDG_MAIN_EXPECTED_STEPS=1"
+      "-DHDG_MAIN_EXPECTED_FINAL_TIME=1e-05"
+      "-DHDG_MAIN_EXPECTED_CYCLES=000000,000001"
+      "-DHDG_MAIN_EXPECTED_TIMES=0,1e-05"
+      "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_igr_vtk_tensor_rank1 PROPERTIES
+      LABELS "hdg;main-backend;cuda;tensor;igr;vtk;sigma;fields;process"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1200)
 
   # The runtime session gate proves exact prepared/committed byte identity and
   # abort/retry preservation.  The dependent main gates prove that those
@@ -344,6 +587,12 @@ if(MFEM_USE_CUDA)
   set_tests_properties(
     dg_igr_hdg_main_backend_cuda_rank2_n3 PROPERTIES
       DEPENDS dg_igr_hdg_runtime_cuda_generic_euler_session_rank2)
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_tensor_rank1_n3 PROPERTIES
+      DEPENDS dg_igr_hdg_runtime_cuda_generic_euler_session_tensor_rank1)
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_tensor_rank2_n3 PROPERTIES
+      DEPENDS dg_igr_hdg_runtime_cuda_generic_euler_session_tensor_rank2)
 
   # Arbitrary fixed dt must clip both output and final boundaries without the
   # old .05/integral-grid admission restriction.
@@ -385,8 +634,108 @@ if(MFEM_USE_CUDA)
         "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
     set_tests_properties(dg_igr_hdg_main_backend_cuda_rank${_ranks}_cfl PROPERTIES
-      LABELS "hdg;main-backend;cuda;mpi;process;generic-borrowed;cfl"
+      LABELS "hdg;main-backend;cuda;ordinary;conventional;p1;rank${_ranks};mpi;process;generic-borrowed;cfl;no-vtk"
       PROCESSORS ${_ranks} RESOURCE_LOCK dg_igr_sm120 TIMEOUT 1200)
+    add_test(NAME dg_igr_hdg_main_backend_cuda_tensor_rank${_ranks}_cfl
+      COMMAND "${CMAKE_COMMAND}"
+        "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+        "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-tensor-rank${_ranks}-cfl-output"
+        "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+        "-DHDG_MAIN_CUDA_ENGINE=tensor"
+        "-DHDG_MAIN_RANKS=${_ranks}"
+        "-DHDG_MAIN_DT=0"
+        "-DHDG_MAIN_CFL=0.25"
+        "-DHDG_MAIN_T_FINAL=0.02"
+        "-DHDG_MAIN_EXPECTED_STEPS=3"
+        "-DHDG_MAIN_EXPECTED_FINAL_TIME=0\\.02"
+        "-DHDG_MAIN_NO_VTK=ON"
+        "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+        "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+        "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+        "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+    set_tests_properties(
+      dg_igr_hdg_main_backend_cuda_tensor_rank${_ranks}_cfl PROPERTIES
+        LABELS "hdg;main-backend;cuda;tensor;conventional;p1;rank${_ranks};mpi;process;generic-borrowed;cfl;no-vtk"
+        PROCESSORS ${_ranks}
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 1200)
+    add_test(NAME dg_igr_hdg_main_backend_cuda_igr_rank${_ranks}_cfl
+      COMMAND "${CMAKE_COMMAND}"
+        "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+        "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-igr-rank${_ranks}-cfl-output"
+        "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+        "-DHDG_MAIN_REGULARIZATION=igr"
+        "-DHDG_MAIN_RANKS=${_ranks}"
+        "-DHDG_MAIN_DT=0"
+        "-DHDG_MAIN_CFL=0.25"
+        "-DHDG_MAIN_T_FINAL=0.02"
+        "-DHDG_MAIN_EXPECTED_STEPS=3"
+        "-DHDG_MAIN_EXPECTED_FINAL_TIME=0\\.02"
+        "-DHDG_MAIN_NO_VTK=ON"
+        "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+        "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+        "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+        "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+    set_tests_properties(
+      dg_igr_hdg_main_backend_cuda_igr_rank${_ranks}_cfl PROPERTIES
+        LABELS "hdg;main-backend;cuda;ordinary;igr;p1;rank${_ranks};mpi;process;generic-borrowed;cfl;no-vtk"
+        PROCESSORS ${_ranks}
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 1200)
+    add_test(NAME dg_igr_hdg_main_backend_cuda_igr_tensor_rank${_ranks}_cfl
+      COMMAND "${CMAKE_COMMAND}"
+        "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+        "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-igr-tensor-rank${_ranks}-cfl-output"
+        "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+        "-DHDG_MAIN_CUDA_ENGINE=tensor"
+        "-DHDG_MAIN_REGULARIZATION=igr"
+        "-DHDG_MAIN_RANKS=${_ranks}"
+        "-DHDG_MAIN_DT=0"
+        "-DHDG_MAIN_CFL=0.25"
+        "-DHDG_MAIN_T_FINAL=0.02"
+        "-DHDG_MAIN_EXPECTED_STEPS=3"
+        "-DHDG_MAIN_EXPECTED_FINAL_TIME=0\\.02"
+        "-DHDG_MAIN_NO_VTK=ON"
+        "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+        "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+        "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+        "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+    set_tests_properties(
+      dg_igr_hdg_main_backend_cuda_igr_tensor_rank${_ranks}_cfl PROPERTIES
+        LABELS "hdg;main-backend;cuda;tensor;igr;p1;rank${_ranks};mpi;process;generic-borrowed;cfl;no-vtk"
+        PROCESSORS ${_ranks}
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 1200)
+  endforeach()
+
+  # The established names above remain the rank-one/rank-two p1
+  # representatives.  Higher-order CFL gates are rank-one and explicitly
+  # encode engine, mathematical mode, and order in both name and labels.
+  foreach(_order IN ITEMS 2 3)
+    if(_order EQUAL 2)
+      set(_expected_cfl_steps 4)
+    else()
+      set(_expected_cfl_steps 6)
+    endif()
+    add_hdg_main_cfl_process_test(
+      dg_igr_hdg_main_backend_cuda_ordinary_conventional_p${_order}_rank1_cfl
+      cuda-ordinary-conventional-p${_order}-rank1-cfl
+      cuda ordinary none ${_order} 1 ${_expected_cfl_steps})
+    add_hdg_main_cfl_process_test(
+      dg_igr_hdg_main_backend_cuda_tensor_conventional_p${_order}_rank1_cfl
+      cuda-tensor-conventional-p${_order}-rank1-cfl
+      cuda tensor none ${_order} 1 ${_expected_cfl_steps})
+    add_hdg_main_cfl_process_test(
+      dg_igr_hdg_main_backend_cuda_ordinary_igr_p${_order}_rank1_cfl
+      cuda-ordinary-igr-p${_order}-rank1-cfl
+      cuda ordinary igr ${_order} 1 ${_expected_cfl_steps})
+    add_hdg_main_cfl_process_test(
+      dg_igr_hdg_main_backend_cuda_tensor_igr_p${_order}_rank1_cfl
+      cuda-tensor-igr-p${_order}-rank1-cfl
+      cuda tensor igr ${_order} 1 ${_expected_cfl_steps})
   endforeach()
 
   # Keep p2 serial and parallel refinement as independent process gates.
@@ -424,10 +773,69 @@ if(MFEM_USE_CUDA)
         -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
     set_tests_properties(
       dg_igr_hdg_main_backend_cuda_p2_${_refine_mode}_refine_small_dt PROPERTIES
-      LABELS "hdg;main-backend;cuda;mpi;process;generic-borrowed;p2;refinement"
+      LABELS "hdg;main-backend;cuda;ordinary;conventional;p2;rank${_ranks};${_refine_mode}-refinement;mpi;process;generic-borrowed;fixed-step;vtk;refinement"
       PROCESSORS ${_ranks}
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 1200)
+    add_test(NAME dg_igr_hdg_main_backend_cuda_tensor_p2_${_refine_mode}_refine_small_dt
+      COMMAND "${CMAKE_COMMAND}"
+        "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+        "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-tensor-p2-${_refine_mode}-refine-small-dt-output"
+        "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n6.mesh"
+        "-DHDG_MAIN_CUDA_ENGINE=tensor"
+        "-DHDG_MAIN_ORDER=2"
+        "-DHDG_MAIN_N=6"
+        "-DHDG_MAIN_RANKS=${_ranks}"
+        "-DHDG_MAIN_SERIAL_REFINE=${_serial_refine}"
+        "-DHDG_MAIN_PARALLEL_REFINE=${_parallel_refine}"
+        "-DHDG_MAIN_DT=0.005"
+        "-DHDG_MAIN_T_FINAL=0.01"
+        "-DHDG_MAIN_DT_SAVE=0.005"
+        "-DHDG_MAIN_EXPECTED_STEPS=2"
+        "-DHDG_MAIN_EXPECTED_FINAL_TIME=0\\.01"
+        "-DHDG_MAIN_EXPECTED_TIMES=0,0.005,0.01"
+        "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+        "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+        "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+        "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+    set_tests_properties(
+      dg_igr_hdg_main_backend_cuda_tensor_p2_${_refine_mode}_refine_small_dt
+      PROPERTIES
+        LABELS "hdg;main-backend;cuda;tensor;conventional;p2;rank${_ranks};${_refine_mode}-refinement;mpi;process;generic-borrowed;fixed-step;vtk;refinement"
+        PROCESSORS ${_ranks}
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 1200)
+  endforeach()
+
+  # Fill the remaining rank-one serial p1-p3 cross-product.  The conventional
+  # p2 ordinary/tensor cells retain their established names above.
+  foreach(_order IN ITEMS 1 2 3)
+    foreach(_cuda_engine IN ITEMS ordinary tensor)
+      foreach(_regularization IN ITEMS none igr)
+        if(_order EQUAL 2 AND _regularization STREQUAL "none")
+          continue()
+        endif()
+        if(_regularization STREQUAL "igr")
+          set(_mode_tag igr)
+        else()
+          set(_mode_tag conventional)
+        endif()
+        add_hdg_main_cuda_refinement_process_test(
+          dg_igr_hdg_main_backend_cuda_${_cuda_engine}_${_mode_tag}_p${_order}_rank1_serial_refine_small_dt
+          cuda-${_cuda_engine}-${_mode_tag}-p${_order}-rank1-serial-refine-small-dt
+          ${_cuda_engine} ${_regularization} ${_order} serial)
+      endforeach()
+    endforeach()
+  endforeach()
+
+  # Rank two retains a single p2 parallel-refinement representative per
+  # engine and mathematical mode.  Conventional names are preserved above.
+  foreach(_cuda_engine IN ITEMS ordinary tensor)
+    add_hdg_main_cuda_refinement_process_test(
+      dg_igr_hdg_main_backend_cuda_${_cuda_engine}_igr_p2_rank2_parallel_refine_small_dt
+      cuda-${_cuda_engine}-igr-p2-rank2-parallel-refine-small-dt
+      ${_cuda_engine} igr 2 parallel)
   endforeach()
 
   foreach(_ranks IN ITEMS 1 2)
@@ -505,6 +913,19 @@ if(MFEM_USE_CUDA)
     LABELS "hdg;main-backend;cuda;negative;profile"
     RESOURCE_LOCK dg_igr_sm120
     TIMEOUT 300)
+
+  add_test(NAME dg_igr_hdg_main_backend_cuda_rejects_unsupported_state_routes
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+      "-DHDG_MAIN_DEVICE=cuda"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_unsupported_state_process.cmake")
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_rejects_unsupported_state_routes PROPERTIES
+      LABELS "hdg;main-backend;cuda;ordinary;tensor;negative;restart;state-file;process"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 300)
 
   add_test(NAME dg_igr_hdg_main_backend_preserves_dgsem_cuda_profile
     COMMAND "${CMAKE_COMMAND}"

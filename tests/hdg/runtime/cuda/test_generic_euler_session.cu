@@ -1,5 +1,6 @@
 #include "numerics/hdg/generic/session_contract.hpp"
 #include "numerics/hdg/runtime/cuda/generic_euler.cuh"
+#include "test_cuda_trace_solver_routing.hpp"
 
 #include <mfem.hpp>
 
@@ -14,8 +15,162 @@
 #include <type_traits>
 #include <vector>
 
+namespace dg::hdg::runtime::cuda_w8a::detail
+{
+
+constexpr bool CudaPreparedIluAccountingValid(
+    const CudaTensorCoreEvidence& tensor, const int trace_solves,
+    const int linear_iterations, const generic::CudaEngineKind engine,
+    const bool igr_active) noexcept
+{
+  const auto preconditioner =
+      CudaTracePreconditionerForEngine(engine, igr_active);
+  const bool ilu = CudaTracePreconditionerIsIlu(preconditioner);
+  const auto factor_reuse_policy =
+      CudaIluFactorReusePolicyForEngine(engine, igr_active);
+  const auto triangular_solve_kind =
+      CudaIluTriangularSolveKindForEngine(engine, igr_active);
+  const int lower_jacobi_iterations =
+      CudaIluLowerJacobiIterations(engine, igr_active);
+  const int upper_jacobi_iterations =
+      CudaIluUpperJacobiIterations(engine, igr_active);
+  if (!ilu)
+    return preconditioner == CudaTracePreconditionerKind::hypre_diag_scale &&
+        tensor.ilu_type == -1 && tensor.ilu_level_of_fill == -1 &&
+        tensor.ilu_local_reordering == -1 &&
+        tensor.ilu_application_iterations == 0 &&
+        triangular_solve_kind ==
+            CudaIluTriangularSolveKind::not_applicable &&
+        tensor.ilu_triangular_solve_kind == triangular_solve_kind &&
+        tensor.ilu_lower_jacobi_iterations == 0 &&
+        tensor.ilu_upper_jacobi_iterations == 0 &&
+        tensor.ilu_accounting_kind == CudaIluAccountingKind::unavailable &&
+        factor_reuse_policy == CudaIluFactorReusePolicy::not_applicable &&
+        tensor.ilu_factor_reuse_policy == factor_reuse_policy &&
+        tensor.ilu_factor_setups == 0 &&
+        tensor.ilu_factor_reuses == 0 &&
+        tensor.ilu_preconditioner_callbacks_lower_bound == 0 &&
+        tensor.ilu_preconditioner_callbacks_upper_bound == 0 &&
+        tensor.ilu_inner_iterations_lower_bound == 0 &&
+        tensor.ilu_inner_iterations_upper_bound == 0 &&
+        tensor.ilu_jacobi_factor_spmv_updates_lower_bound == 0 &&
+        tensor.ilu_jacobi_factor_spmv_updates_upper_bound == 0 &&
+        tensor.ilu_factor_age_generations == 0 &&
+        tensor.ilu_accounting_complete;
+  const int expected_fill = 0;
+  const int expected_reordering = igr_active ? 1 : 0;
+  if (trace_solves <= 0 || linear_iterations < 0 || tensor.ilu_type != 0 ||
+      tensor.ilu_level_of_fill != expected_fill ||
+      tensor.ilu_local_reordering != expected_reordering ||
+      tensor.ilu_application_iterations != 1 ||
+      tensor.ilu_triangular_solve_kind != triangular_solve_kind ||
+      tensor.ilu_lower_jacobi_iterations != lower_jacobi_iterations ||
+      tensor.ilu_upper_jacobi_iterations != upper_jacobi_iterations ||
+      (triangular_solve_kind == CudaIluTriangularSolveKind::direct &&
+       (lower_jacobi_iterations != 0 || upper_jacobi_iterations != 0)) ||
+      (triangular_solve_kind ==
+           CudaIluTriangularSolveKind::iterative_jacobi &&
+       (lower_jacobi_iterations != 5 || upper_jacobi_iterations != 5)) ||
+      tensor.ilu_accounting_kind !=
+          CudaIluAccountingKind::derived_bounds_v1 ||
+      !tensor.ilu_accounting_complete ||
+      tensor.ilu_preconditioner_callbacks_lower_bound >
+          tensor.ilu_preconditioner_callbacks_upper_bound)
+    return false;
+  const std::uint64_t solves = static_cast<std::uint64_t>(trace_solves);
+  const bool factor_work = factor_reuse_policy ==
+          CudaIluFactorReusePolicy::refresh_each_trace_solve
+      ? tensor.ilu_factor_reuse_policy == factor_reuse_policy &&
+            tensor.ilu_factor_setups == solves &&
+            tensor.ilu_factor_reuses == 0 &&
+            tensor.ilu_factor_age_generations == 0
+      : factor_reuse_policy ==
+              CudaIluFactorReusePolicy::first_trace_solve_per_attempt &&
+            tensor.ilu_factor_reuse_policy == factor_reuse_policy &&
+            tensor.ilu_factor_setups == 1 &&
+            tensor.ilu_factor_reuses == solves - 1 &&
+            tensor.ilu_factor_age_generations == solves - 1;
+  if (!factor_work) return false;
+  const std::uint64_t iterations =
+      static_cast<std::uint64_t>(linear_iterations);
+  const std::uint64_t lower =
+      tensor.ilu_preconditioner_callbacks_lower_bound;
+  const std::uint64_t upper =
+      tensor.ilu_preconditioner_callbacks_upper_bound;
+  const bool callback_bounds = iterations == 0
+      ? lower == 0 && upper == 0
+      : iterations <= std::numeric_limits<std::uint64_t>::max()/2 &&
+            iterations < lower && upper == 2*iterations;
+  const std::uint64_t multiplier = static_cast<std::uint64_t>(
+      tensor.ilu_application_iterations);
+  const std::uint64_t factor_spmv_multiplier =
+      triangular_solve_kind == CudaIluTriangularSolveKind::iterative_jacobi
+      ? 8 : 0;
+  return callback_bounds &&
+      lower <= std::numeric_limits<std::uint64_t>::max()/multiplier &&
+      upper <= std::numeric_limits<std::uint64_t>::max()/multiplier &&
+      tensor.ilu_inner_iterations_lower_bound == lower*multiplier &&
+      tensor.ilu_inner_iterations_upper_bound == upper*multiplier &&
+      (factor_spmv_multiplier == 0 ||
+       (tensor.ilu_inner_iterations_lower_bound <=
+            std::numeric_limits<std::uint64_t>::max()/
+                factor_spmv_multiplier &&
+        tensor.ilu_inner_iterations_upper_bound <=
+            std::numeric_limits<std::uint64_t>::max()/
+                factor_spmv_multiplier)) &&
+      tensor.ilu_jacobi_factor_spmv_updates_lower_bound ==
+          tensor.ilu_inner_iterations_lower_bound*factor_spmv_multiplier &&
+      tensor.ilu_jacobi_factor_spmv_updates_upper_bound ==
+          tensor.ilu_inner_iterations_upper_bound*factor_spmv_multiplier;
+}
+
+struct CudaQualificationTestAccess
+{
+  template <typename Engine>
+  static bool VerifyPreparedCudaEngine(
+      Engine& engine, const generic::CudaEngineKind expected) noexcept
+  {
+    if (!engine.initialized_ || !engine.pending_.active ||
+        !engine.pending_.staging)
+      return false;
+    const auto& evidence = engine.pending_.evidence;
+    const auto& tensor = evidence.tensor_core;
+    const bool igr_active = engine.numerics_.shape_.igr_active;
+    return tensor.selected_engine == expected &&
+        tensor.trace_policy == CudaTracePolicyKind::engine_default &&
+        tensor.trace_preconditioner_configured &&
+        tensor.trace_preconditioner ==
+            CudaTracePreconditionerForEngine(expected, igr_active) &&
+        CudaPreparedIluAccountingValid(
+            tensor, evidence.trace_solves, evidence.linear_iterations,
+            expected, igr_active) &&
+        CudaPreparedTraceSolverRoutingValid(
+            tensor, evidence.trace_solves, expected,
+            engine.config_.expected_rank_count) &&
+        tensor.fallback_count == 0 && evidence.no_fallback &&
+        (expected == generic::CudaEngineKind::ordinary
+             ? tensor.condensation_launches == 0 && tensor.mma_tiles == 0
+             : tensor.hardware_supported &&
+                   tensor.condensation_launches > 0 && tensor.mma_tiles > 0);
+  }
+
+  static bool VerifyPreparedCudaEngine(
+      cuda::GenericEulerHdgCudaSession& session,
+      const generic::CudaEngineKind expected) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return VerifyPreparedCudaEngine(*session.borrowed_rank1_, expected);
+    if (session.borrowed_rank2_)
+      return VerifyPreparedCudaEngine(*session.borrowed_rank2_, expected);
+    return false;
+  }
+};
+
+} // namespace dg::hdg::runtime::cuda_w8a::detail
+
 namespace
 {
+using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::HdgEulerSessionCapability;
 using dg::hdg::generic::HdgEulerSessionCapabilityBit;
 using dg::hdg::generic::HdgEulerSessionStatus;
@@ -25,11 +180,14 @@ using dg::hdg::runtime::FailureReason;
 using dg::hdg::runtime::StableIdentity;
 using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
+using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
 using namespace dg::hdg::runtime::cuda_w8a;
 using GenericPreparedOutput = CudaPreparedOutputMetadataV1;
 
 inline constexpr std::string_view nonperiodic_topology_identity =
     "cuda.generic.quad.physical-boundary.v1";
+
+CudaEngineKind selected_cuda_engine = CudaEngineKind::ordinary;
 
 bool All(const bool local) noexcept
 {
@@ -88,6 +246,7 @@ CudaConfig BorrowedConfig(mfem::ParMesh& mesh, const int ranks,
   config.order = order;
   config.mesh_n = n;
   config.requested_device = 0;
+  config.cuda_engine = selected_cuda_engine;
   config.expected_rank_count = ranks;
   config.require_host_staged_rank2 = ranks == 2;
   config.use_borrowed_topology = true;
@@ -97,6 +256,12 @@ CudaConfig BorrowedConfig(mfem::ParMesh& mesh, const int ranks,
   config.borrowed_initial = {initial.data(), scalar_count,
                              conserved_components};
   config.borrowed_source = {nullptr, 0, conserved_components};
+  if (selected_cuda_engine == CudaEngineKind::tensor_core)
+  {
+    config.use_generic_numerical_policy = true;
+    config.numerical_policy =
+        dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
+  }
   return config;
 }
 
@@ -165,6 +330,7 @@ CudaConfig BorrowedDataConfig(mfem::ParMesh& mesh, const int ranks,
   config.order = order;
   config.mesh_n = n;
   config.requested_device = 0;
+  config.cuda_engine = selected_cuda_engine;
   config.expected_rank_count = ranks;
   config.require_host_staged_rank2 = ranks == 2;
   config.use_borrowed_topology = true;
@@ -177,6 +343,12 @@ CudaConfig BorrowedDataConfig(mfem::ParMesh& mesh, const int ranks,
       ? CudaBorrowedHostL2Input{nullptr, 0, conserved_components}
       : CudaBorrowedHostL2Input{fields.source.data(), fields.scalar_count,
                                 conserved_components};
+  if (selected_cuda_engine == CudaEngineKind::tensor_core)
+  {
+    config.use_generic_numerical_policy = true;
+    config.numerical_policy =
+        dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
+  }
   return config;
 }
 
@@ -184,6 +356,7 @@ CudaConfig LegacyBorrowedConfig(mfem::ParMesh& mesh, const int ranks,
                                 const int order, const int n)
 {
   CudaConfig config = BorrowedConfig(mesh, ranks, order, n);
+  config.cuda_engine = CudaEngineKind::ordinary;
   config.use_borrowed_host_inputs = false;
   config.borrowed_initial = {nullptr, 0, conserved_components};
   config.borrowed_source = {nullptr, 0, conserved_components};
@@ -749,6 +922,9 @@ bool CheckBorrowedDataBridge(const int ranks, const int order, const int n)
     GenericEulerCudaPreparedStep authority{};
     GenericPreparedOutput native_export{};
     const auto prepared = session.Prepare(authority, native_export);
+    const bool engine_evidence =
+        CudaQualificationTestAccess::VerifyPreparedCudaEngine(
+            session, selected_cuda_engine);
     candidate.assign(initial_before.size(), -9.0);
     const bool prepared_export = session.ExportPreparedInterior(
         authority, native_export,
@@ -761,6 +937,7 @@ bool CheckBorrowedDataBridge(const int ranks, const int order, const int n)
     const bool committed_after_export = session.ExportCommittedInterior(
         {committed_after.data(), zero.scalar_count, conserved_components});
     if (!All(prepared.status == HdgEulerSessionStatus::prepared &&
+             engine_evidence &&
              prepared_export && FullyFiniteOverwritten(candidate, -9.0) &&
              acknowledged &&
              committed_step.status == HdgEulerSessionStatus::committed &&
@@ -790,6 +967,9 @@ bool CheckBorrowedDataBridge(const int ranks, const int order, const int n)
   GenericPreparedOutput forced_export{};
   const auto forced_prepared = forced_session.Prepare(forced_authority,
                                                        forced_export);
+  const bool forced_engine_evidence =
+      CudaQualificationTestAccess::VerifyPreparedCudaEngine(
+          forced_session, selected_cuda_engine);
   std::vector<double> forced_candidate(candidate.size(), -9.0);
   const bool forced_output = forced_session.ExportPreparedInterior(
       forced_authority, forced_export,
@@ -798,6 +978,7 @@ bool CheckBorrowedDataBridge(const int ranks, const int order, const int n)
                                                     forced_export);
   return All(forced_initialized.status == HdgEulerSessionStatus::initialized &&
              forced_prepared.status == HdgEulerSessionStatus::prepared &&
+             forced_engine_evidence &&
              forced_output && FullyFiniteOverwritten(forced_candidate, -9.0) &&
              forced_aborted.status ==
                  HdgEulerSessionStatus::aborted &&
@@ -1436,6 +1617,53 @@ bool CheckNegatives(const int ranks)
   }
   return All(rejected);
 }
+enum class TestMode
+{
+  smoke,
+  p2,
+  negatives
+};
+
+struct Options
+{
+  TestMode mode = TestMode::smoke;
+  CudaEngineKind engine = CudaEngineKind::ordinary;
+};
+
+bool ParseOptions(const int argc, char** argv, Options& options) noexcept
+{
+  bool mode_selected = false;
+  bool engine_selected = false;
+  for (int index = 1; index < argc; ++index)
+  {
+    const std::string_view argument(argv[index]);
+    if (argument == "--p2" || argument == "--negatives")
+    {
+      if (mode_selected) return false;
+      options.mode = argument == "--p2" ? TestMode::p2
+                                          : TestMode::negatives;
+      mode_selected = true;
+      continue;
+    }
+    if (argument == "--engine")
+    {
+      if (engine_selected || ++index >= argc) return false;
+      const std::string_view engine(argv[index]);
+      if (engine == "ordinary")
+        options.engine = CudaEngineKind::ordinary;
+      else if (engine == "tensor")
+        options.engine = CudaEngineKind::tensor_core;
+      else
+        return false;
+      engine_selected = true;
+      continue;
+    }
+    return false;
+  }
+  return options.mode != TestMode::negatives ||
+      options.engine == CudaEngineKind::ordinary;
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -1443,10 +1671,11 @@ int main(int argc, char** argv)
   mfem::Mpi::Init(argc, argv);
   int ranks = 0;
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
-  const std::string_view mode = argc == 2 ? argv[1] : "";
-  const bool known_mode = mode.empty() || mode == "--p2" || mode == "--negatives";
+  Options options;
+  const bool known_mode = ParseOptions(argc, argv, options);
+  selected_cuda_engine = options.engine;
   bool pass = false;
-  if (mode == "--negatives")
+  if (known_mode && options.mode == TestMode::negatives)
   {
     const bool device_unconfigured_before = !mfem::Device::IsConfigured();
     const bool negatives = CheckNegatives(ranks);
@@ -1458,7 +1687,7 @@ int main(int argc, char** argv)
   {
     mfem::Device device("cuda");
     (void)device;
-    if (mode == "--p2")
+    if (options.mode == TestMode::p2)
     {
       const bool admission = CheckP2Admission(ranks);
       const bool host_data = CheckBorrowedDataBridge(
@@ -1481,7 +1710,9 @@ int main(int argc, char** argv)
       const bool address_reuse = CheckAddressReuseAba(ranks);
       const bool session_identity = CheckRankTwoSessionIdentityAdmission(ranks);
       const bool rank_two = CheckRankTwoCollectiveAdmission(ranks);
-      const bool legacy_facade = CheckLegacyFacadeAdmission(ranks);
+      const bool legacy_facade =
+          selected_cuda_engine == CudaEngineKind::ordinary
+          ? CheckLegacyFacadeAdmission(ranks) : true;
       const bool host_data = CheckBorrowedDataBridge(
           ranks, smoke_polynomial_order, smoke_elements_per_direction);
       const bool high_wave = CheckBorrowedLaggedLlfHighWave(
@@ -1496,6 +1727,8 @@ int main(int argc, char** argv)
     }
   }
   if (!pass && ranks > 0)
-    std::cerr << "CUDA generic Euler session audit failed\n";
+    std::cerr << "CUDA generic Euler session audit failed engine="
+              << (selected_cuda_engine == CudaEngineKind::tensor_core
+                      ? "tensor" : "ordinary") << '\n';
   return pass ? 0 : 1;
 }

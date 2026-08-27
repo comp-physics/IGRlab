@@ -33,6 +33,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "Zhang-Shu defaults: consumer point set selected");
     ctx.Check(opts.hdg_igr_alpha == 1.0 && opts.hdg_igr_beta == 1.0,
               "HDG IGR defaults: alpha and beta are one");
+    ctx.Check(opts.hdg_cuda_engine == "ordinary",
+              "HDG CUDA engine defaults to ordinary");
     ctx.Check(dg_sim::ParseZhangShuPointSet("consumer") ==
                 mfem::ZhangShuPointSet::kConsumer,
               "Zhang-Shu options: parse consumer point set");
@@ -167,6 +169,13 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "request: device parser and metadata name are stable");
     ctx.Check(!dg_sim::TryParseDeviceBackend("invalid"),
               "request: invalid device backend is not parsed");
+    ctx.Check(dg_sim::TryParseHdgCudaEngine("TENSOR") ==
+                dg_sim::HdgCudaEngine::TensorCore &&
+                std::string(dg_sim::HdgCudaEngineToString(
+                  dg_sim::HdgCudaEngine::Ordinary)) == "ordinary",
+              "request: HDG CUDA engine parser and metadata name are stable");
+    ctx.Check(!dg_sim::TryParseHdgCudaEngine("invalid"),
+              "request: invalid HDG CUDA engine is not parsed");
     ctx.Check(std::string(dg_sim::SolverRequestResolutionStatusToString(
                 dg_sim::SolverRequestResolutionStatus::UnsupportedTimeIntegrator)) ==
                 "unsupported-time-integrator",
@@ -175,9 +184,19 @@ int RunTimeDefaultsTests(TestContext& ctx)
                 dg_sim::SolverRequestResolutionStatus::InvalidDeviceBackend)) ==
                 "invalid-device-backend",
               "request: device failure status has a stable metadata name");
+    ctx.Check(std::string(dg_sim::SolverRequestResolutionStatusToString(
+                dg_sim::SolverRequestResolutionStatus::InvalidHdgCudaEngine)) ==
+                "invalid-hdg-cuda-engine" &&
+                std::string(dg_sim::SolverRequestResolutionStatusToString(
+                  dg_sim::SolverRequestResolutionStatus::
+                    UnsupportedHdgCudaEngine)) ==
+                  "unsupported-hdg-cuda-engine",
+              "request: HDG CUDA engine statuses have stable metadata names");
     const dg_sim::SolverRequestResolution fail_safe_request;
     ctx.Check(fail_safe_request.regularization == dg_sim::Regularization::None &&
-                fail_safe_request.device_backend == dg_sim::DeviceBackend::CPU,
+                fail_safe_request.device_backend == dg_sim::DeviceBackend::CPU &&
+                fail_safe_request.hdg_cuda_engine ==
+                  dg_sim::HdgCudaEngine::Ordinary,
               "request: default-constructed request is fail-safe");
 
     const dg_sim::SolverRequestResolution dg_default =
@@ -209,8 +228,39 @@ int RunTimeDefaultsTests(TestContext& ctx)
       dg_sim::ResolveSolverRequest("dg", false, "", "dg", "", "",
                                    false, false, false, false, "cuda");
     ctx.Check(cuda_request.IsResolved() &&
-                cuda_request.device_backend == dg_sim::DeviceBackend::CUDA,
+                cuda_request.device_backend == dg_sim::DeviceBackend::CUDA &&
+                cuda_request.hdg_cuda_engine ==
+                  dg_sim::HdgCudaEngine::Ordinary,
               "request: valid device reaches the resolved request");
+
+    const dg_sim::SolverRequestResolution tensor_hdg_cuda =
+      dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "", "",
+                                   true, false, false, false, "cuda", "tensor");
+    ctx.Check(tensor_hdg_cuda.IsResolved() &&
+                tensor_hdg_cuda.hdg_cuda_engine ==
+                  dg_sim::HdgCudaEngine::TensorCore,
+              "request: tensor CUDA is an explicit HDG engine peer");
+
+    const dg_sim::SolverRequestResolution invalid_hdg_cuda_engine =
+      dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "", "",
+                                   true, false, false, false, "cuda", "invalid");
+    ctx.Check(invalid_hdg_cuda_engine.status ==
+                dg_sim::SolverRequestResolutionStatus::InvalidHdgCudaEngine,
+              "request: invalid HDG CUDA engine is rejected");
+
+    const dg_sim::SolverRequestResolution tensor_hdg_cpu =
+      dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "", "",
+                                   true, false, false, false, "cpu", "tensor");
+    ctx.Check(tensor_hdg_cpu.status ==
+                dg_sim::SolverRequestResolutionStatus::UnsupportedHdgCudaEngine,
+              "request: tensor engine is rejected for CPU HDG");
+
+    const dg_sim::SolverRequestResolution tensor_dg_cuda =
+      dg_sim::ResolveSolverRequest("dg", false, "dg", "dg", "", "",
+                                   true, false, false, false, "cuda", "tensor");
+    ctx.Check(tensor_dg_cuda.status ==
+                dg_sim::SolverRequestResolutionStatus::UnsupportedHdgCudaEngine,
+              "request: tensor engine is rejected outside HDG");
 
     const dg_sim::SolverRequestResolution invalid_device =
       dg_sim::ResolveSolverRequest("dg", false, "", "dg", "", "",

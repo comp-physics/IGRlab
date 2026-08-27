@@ -100,7 +100,8 @@ endif()
 if(DG_IGR_ENABLE_HDG_RUNTIME)
   if(MFEM_USE_CUDA)
     set(_dg_igr_hdg_runtime_cuda_production_sources
-        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/persistent_smooth_euler.cu")
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/persistent_smooth_euler.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/native_rank1_trace_solver.cu")
     set(_dg_igr_hdg_frozen_test_only_cuda_sources
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda/hdg_sc25_periodic_v3_device.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda/hdg_sc25_periodic_v3_rank2_device.cu"

@@ -132,6 +132,15 @@ public:
    */
   result_type Initialize(const generic::EulerHdgRequest& request) noexcept
   {
+    return InitializeRequest(
+        request, cuda_w8a::CudaTracePolicyKind::engine_default);
+  }
+
+private:
+  result_type InitializeRequest(
+      const generic::EulerHdgRequest& request,
+      const cuda_w8a::CudaTracePolicyKind trace_policy) noexcept
+  {
     communicator_ = request.communicator;
     const bool one_shot = !initialization_attempted_ &&
         session_collective_id_ == unassigned_session_collective_id;
@@ -147,6 +156,7 @@ public:
     bool lowered = request.mesh != nullptr &&
         request.backend.kind == generic::BackendKind::cuda &&
         request.backend.device_ordinal >= 0 &&
+        generic::IsKnownCudaEngineKind(request.backend.cuda_engine) &&
         generic::HasCapabilities(
             request.capabilities,
             generic::RequiredCapabilities(request.backend)) &&
@@ -245,6 +255,7 @@ public:
     config.mesh_n = 0;
     config.dt = cuda_w8a::fixed_dt;
     config.requested_device = lowered ? request.backend.device_ordinal : -1;
+    config.cuda_engine = request.backend.cuda_engine;
     config.expected_rank_count = ranks;
     config.require_host_staged_rank2 = ranks == 2;
     config.use_borrowed_topology = true;
@@ -275,8 +286,10 @@ public:
     config.borrowed_boundary = request.boundary;
     config.use_generic_numerical_policy = true;
     config.numerical_policy = request.numerical_policy;
-    return InitializeAdmitted(config);
+    return InitializeAdmitted(config, trace_policy);
   }
+
+public:
 
   /**
    * Admit the borrowed conforming-quad topology plus its complete static
@@ -297,15 +310,18 @@ public:
     {
       return Result(generic::HdgEulerSessionStatus::rejected);
     }
-    return InitializeAdmitted(config);
+    return InitializeAdmitted(
+        config, cuda_w8a::CudaTracePolicyKind::engine_default);
   }
 
 private:
-  result_type InitializeAdmitted(const cuda_w8a::CudaConfig& config) noexcept
+  result_type InitializeAdmitted(
+      const cuda_w8a::CudaConfig& config,
+      const cuda_w8a::CudaTracePolicyKind trace_policy) noexcept
   {
     // Once every rank has agreed on Initialize, this admission is deliberately
     // evaluated everywhere, then gated again before allocation.
-    const bool admitted = PreDeviceAdmission(config);
+    const bool admitted = PreDeviceAdmission(config, trace_policy);
     if (!CollectiveAll(admitted))
     {
       return Result(generic::HdgEulerSessionStatus::rejected);
@@ -325,12 +341,13 @@ private:
       {
         if (config.use_borrowed_host_inputs)
         {
-          borrowed_rank1_ = std::make_unique<borrowed_rank1_engine>(config);
+          borrowed_rank1_.reset(
+              new borrowed_rank1_engine(config, trace_policy));
           allocated = borrowed_rank1_ != nullptr;
         }
         else
         {
-          rank1_ = std::make_unique<rank1_engine>(config);
+          rank1_.reset(new rank1_engine(config, trace_policy));
           allocated = rank1_ != nullptr;
         }
       }
@@ -338,12 +355,13 @@ private:
       {
         if (config.use_borrowed_host_inputs)
         {
-          borrowed_rank2_ = std::make_unique<borrowed_rank2_engine>(config);
+          borrowed_rank2_.reset(
+              new borrowed_rank2_engine(config, trace_policy));
           allocated = borrowed_rank2_ != nullptr;
         }
         else
         {
-          rank2_ = std::make_unique<rank2_engine>(config);
+          rank2_.reset(new rank2_engine(config, trace_policy));
           allocated = rank2_ != nullptr;
         }
       }
@@ -859,7 +877,9 @@ private:
     cursor += sizeof(Value);
   }
 
-  bool ConfigConsensus(const cuda_w8a::CudaConfig& config) const noexcept
+  bool ConfigConsensus(
+      const cuda_w8a::CudaConfig& config,
+      const cuda_w8a::CudaTracePolicyKind trace_policy) const noexcept
   {
     bool borrowed_host_mode = false;
     // This min/max pair is unconditional and precedes every descriptor whose
@@ -895,6 +915,7 @@ private:
     AppendConfigValue(local, cursor, complete, config.mesh_n);
     AppendConfigValue(local, cursor, complete, config.dt);
     AppendConfigValue(local, cursor, complete, config.requested_device);
+    AppendConfigValue(local, cursor, complete, config.cuda_engine);
     AppendConfigValue(local, cursor, complete, config.expected_rank_count);
     append_bool(config.require_host_staged_rank2);
     append_bool(config.use_borrowed_topology);
@@ -955,6 +976,8 @@ private:
     AppendConfigValue(local, cursor, complete, config.injection.source_rank);
     append_bool(config.injection.enabled);
     AppendConfigValue(local, cursor, complete, config.injection.token_fault);
+    // Append-only so the engine-default prefix stays byte-identical.
+    AppendConfigValue(local, cursor, complete, trace_policy);
 
     config_descriptor minimum = local;
     config_descriptor maximum = local;
@@ -1093,14 +1116,16 @@ private:
     return true;
   }
 
-  bool PreDeviceAdmission(const cuda_w8a::CudaConfig& config) const noexcept
+  bool PreDeviceAdmission(
+      const cuda_w8a::CudaConfig& config,
+      const cuda_w8a::CudaTracePolicyKind trace_policy) const noexcept
   {
     int mpi_initialized = 0;
     int mpi_finalized = 0;
     if (MPI_Initialized(&mpi_initialized) != MPI_SUCCESS || !mpi_initialized ||
         MPI_Finalized(&mpi_finalized) != MPI_SUCCESS || mpi_finalized)
       return false;
-    const bool config_consensus = ConfigConsensus(config);
+    const bool config_consensus = ConfigConsensus(config, trace_policy);
     const bool empty_borrowed_fields =
         config.borrowed_initial.coefficients == nullptr &&
         config.borrowed_initial.scalar_count == 0 &&
@@ -1155,6 +1180,13 @@ private:
     int borrowed_mesh = MPI_UNEQUAL;
     bool local = config.use_borrowed_topology && config.borrowed_mesh != nullptr &&
         config.borrowed_communicator != MPI_COMM_NULL &&
+        generic::IsKnownCudaEngineKind(config.cuda_engine) &&
+        cuda_w8a::IsKnownCudaTracePolicyKind(trace_policy) &&
+        (trace_policy ==
+             cuda_w8a::CudaTracePolicyKind::engine_default ||
+         (config.expected_rank_count == 1 &&
+          config.use_borrowed_host_inputs &&
+          config.use_generic_numerical_policy)) &&
         borrowed_data_abi &&
         initial_trace_abi && numerical_policy_abi &&
         boundary_policy_abi &&

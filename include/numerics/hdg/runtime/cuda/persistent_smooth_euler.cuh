@@ -2,11 +2,16 @@
 
 /**
  * @file numerics/hdg/runtime/cuda/persistent_smooth_euler.cuh
- * @brief Persistent conventional smooth-Euler CUDA smoke/functional engine.
+ * @brief Persistent general Euler HDG CUDA leaf for conventional and IGR modes.
  *
  * Numerical provenance: the pointwise Euler flux/source, W7 weak signs,
- * A/B/C/D condensation, HypreGMRES+HypreILU(0), and recovery equations are a
- * minimal port of accepted W7 commit ac271a038c9d26648fce8f2ebf6afb0113a92495.
+ * A/B/C/D condensation, trace solve, and recovery equations are a minimal port
+ * of accepted W7 commit ac271a038c9d26648fce8f2ebf6afb0113a92495.  Ordinary
+ * CUDA uses the established HYPRE GMRES path.  Borrowed generic tensor rank
+ * one uses the private cooperative FP64 trace solver: conventional operation
+ * applies diagonal scaling, while IGR borrows one exact HYPRE ILU(0)+RCM
+ * factor per attempt and applies its 5+5 Jacobi triangular policy in the
+ * native solve.  Rank two remains explicitly HYPRE host-staged.
  * The W7 monolithic RunSmoothEulerDeviceFullExperiment lifecycle is neither
  * included nor called.  Persistence, contract publication, retry, policies,
  * and exported POD are W8A-owned code.
@@ -16,6 +21,7 @@
 #include "numerics/hdg/runtime/runtime_selection.hpp"
 #include "numerics/hdg/trace/trace_dg_mpi.hpp"
 #include "physics/bc/boundary_state.hpp"
+#include "utils/profiling/nvtx.hpp"
 
 #include <HYPRE_config.h>
 #include <cuda_runtime.h>
@@ -447,6 +453,8 @@ struct CudaNumericalResult
   CudaFailurePhase phase = CudaFailurePhase::setup;
   FailureReason reason = FailureReason::backend_failure;
   CudaProductEvidence products{};
+  CudaTensorCoreEvidence tensor_core{};
+  CudaPrecisionWorkEvidence precision_work{};
   double initial_residual = std::numeric_limits<double>::infinity();
   double final_residual = std::numeric_limits<double>::infinity();
   double true_relative_residual = std::numeric_limits<double>::infinity();
@@ -454,9 +462,10 @@ struct CudaNumericalResult
   double maximum_conservation_relative_error = 0.0;
   int nonlinear_updates = 0;
   int trace_solves = 0;
-  // Sum HYPRE GMRES iterations from every trace solve, including the final
-  // coherent reconstruction solve.  Line-search trials count every attempted
-  // alpha; rejected trials are the attempts restored before the next alpha.
+  // Sum outer GMRES iterations from the configured native or HYPRE trace
+  // solver, including the final coherent reconstruction solve. Line-search
+  // trials count every attempted alpha; rejected trials are the attempts
+  // restored before the next alpha.
   int linear_iterations = 0;
   int line_search_trials = 0;
   int rejected_line_search_trials = 0;
@@ -519,7 +528,16 @@ public:
   using state_slot = typename contract_type::state_slot;
 
   explicit PersistentCudaSmoothEulerEngine(const CudaConfig& config) noexcept
+      : PersistentCudaSmoothEulerEngine(
+            config, CudaTracePolicyKind::engine_default)
+  {}
+
+private:
+  PersistentCudaSmoothEulerEngine(
+      const CudaConfig& config,
+      const CudaTracePolicyKind trace_policy) noexcept
       : config_(config),
+        trace_policy_(trace_policy),
         communicator_(CudaCollectiveCommunicator(config)),
         facade_incarnation_(
             detail::AcquireCudaFacadeIncarnation())
@@ -553,6 +571,10 @@ public:
                   "provisional-commit authority must remain affine");
   }
 
+  friend class ::dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
+
+public:
+
   PersistentCudaSmoothEulerEngine(const PersistentCudaSmoothEulerEngine&) =
       delete;
   PersistentCudaSmoothEulerEngine& operator=(
@@ -561,6 +583,8 @@ public:
   bool Initialize(CudaRunEvidence& evidence) noexcept
   {
     evidence = {};
+    evidence.tensor_core.selected_engine = config_.cuda_engine;
+    evidence.tensor_core.trace_policy = trace_policy_;
     MPI_Comm_rank(communicator_, &evidence.rank);
     MPI_Comm_size(communicator_, &evidence.ranks);
     const bool descriptor_consensus = ConfigurationConsensus();
@@ -584,7 +608,7 @@ public:
     }
     AllocatorPolicy::ResetLedger();
     const bool numerics_initialized = numerics_.Initialize(
-        config_, evidence, Selection::Descriptor());
+        config_, trace_policy_, evidence, Selection::Descriptor());
     // The numerical setup has copied every admitted host coefficient into
     // engine-owned arrays.  Retain only the borrowed topology thereafter.
     ForgetBorrowedHostInputPointers();
@@ -991,7 +1015,10 @@ public:
                CudaStepEvidence& evidence) noexcept
   {
     evidence = {};
-    if (!initialized_ || pending_.active) { return false; }
+    const bool zero_work_evidence_ready =
+        InitializeZeroWorkTensorCoreEvidence(evidence.tensor_core);
+    if (!zero_work_evidence_ready || !initialized_ || pending_.active)
+      return false;
     evidence.before = contract_->coordinates();
     const StateCoordinates restored_coordinates =
         checkpoint.descriptor.coordinates;
@@ -1365,6 +1392,19 @@ private:
     const bool fixed_oracle_requested_for_generic_storage =
         config_.use_borrowed_topology && config_.use_borrowed_host_inputs &&
         config_.capture_oracle;
+    const bool cuda_engine_configuration =
+        generic::IsKnownCudaEngineKind(config_.cuda_engine) &&
+        (config_.cuda_engine != generic::CudaEngineKind::tensor_core ||
+         (config_.use_borrowed_topology &&
+          config_.use_borrowed_host_inputs &&
+          config_.use_generic_numerical_policy));
+    const bool trace_policy_configuration =
+        IsKnownCudaTracePolicyKind(trace_policy_) &&
+        (trace_policy_ == CudaTracePolicyKind::engine_default ||
+         (config_.expected_rank_count == 1 &&
+          config_.use_borrowed_topology &&
+          config_.use_borrowed_host_inputs &&
+          config_.use_generic_numerical_policy));
     return config_.experiment == StableIdentity::Copy(experiment_id) &&
         (borrowed_generic_shape || smoke_shape || functional_shape) &&
         topology_configuration &&
@@ -1379,6 +1419,8 @@ private:
         (config_.use_borrowed_host_inputs ||
          std::memcmp(&config_.dt, &fixed_dt, sizeof(double)) == 0) &&
         config_.requested_device == 0 &&
+        cuda_engine_configuration &&
+        trace_policy_configuration &&
         (config_.expected_rank_count == 1 ||
          config_.expected_rank_count == 2) &&
         (config_.expected_rank_count == 1 ||
@@ -1525,11 +1567,22 @@ private:
     AppendConfigId(descriptor, cursor, complete, tuple.precision);
     AppendConfigValue(descriptor, cursor, complete,
                       Selection::interior_space);
+    // The zero-valued ordinary discriminator preserves default semantics;
+    // tensor_core remains a distinct, rank-consensed configuration identity.
+    AppendConfigValue(descriptor, cursor, complete, config_.cuda_engine);
+    // Append-only so the engine-default descriptor prefix stays byte-identical.
+    AppendConfigValue(descriptor, cursor, complete, trace_policy_);
     return complete;
   }
 
   bool ConfigurationConsensus() const noexcept
   {
+    generic::CudaEngineKind agreed_engine =
+        generic::CudaEngineKind::ordinary;
+    if (!CudaEngineKindConsensus(communicator_, config_.cuda_engine,
+                                 agreed_engine) ||
+        agreed_engine != config_.cuda_engine)
+      return false;
     bool borrowed_host_mode = false;
     // This collective is intentionally before MakeConfigDescriptor: that
     // descriptor has a borrowed-host-only branch and must never be entered
@@ -1649,10 +1702,39 @@ private:
         all_complete == 1 && minimum == maximum;
   }
 
+  bool InitializeZeroWorkTensorCoreEvidence(
+      CudaTensorCoreEvidence& evidence) const noexcept
+  {
+    evidence = {};
+    evidence.selected_engine = config_.cuda_engine;
+    evidence.trace_policy = trace_policy_;
+    evidence.hardware_supported =
+        numerics_.TensorCoreHardwareSupported();
+    const bool igr_active = config_.use_generic_numerical_policy &&
+        config_.numerical_policy.stabilization.kind ==
+            generic::RegularizationKind::igr;
+    const CudaTracePolicyDescriptor trace_policy = ResolveCudaTracePolicy(
+        config_.cuda_engine, igr_active, trace_policy_);
+    const CudaTracePreconditionerKind selected_preconditioner = initialized_
+        ? numerics_.TracePreconditioner()
+        : trace_policy.trace_preconditioner;
+    evidence.trace_preconditioner = selected_preconditioner;
+    const bool selected_policy_ready =
+        CudaTracePolicyDescriptorIsExact(trace_policy) &&
+        selected_preconditioner == trace_policy.trace_preconditioner;
+    (void)detail::CudaInitializeIluEvidence(
+        evidence, selected_preconditioner, igr_active);
+    evidence.trace_preconditioner_configured = initialized_ &&
+        numerics_.TracePreconditionerConfigured() && selected_policy_ready;
+    return selected_policy_ready;
+  }
+
   bool PreparePending(const bool retry, const double dt,
                       CudaStepEvidence& evidence) noexcept
   {
     evidence = {};
+    const bool zero_work_evidence_ready =
+        InitializeZeroWorkTensorCoreEvidence(evidence.tensor_core);
     evidence.before = contract_->coordinates();
     CudaPolicyContext context{};
     context.attempt_sequence = ++next_attempt_sequence_;
@@ -1663,7 +1745,8 @@ private:
     pending_.ledger_begin = TransportPolicy::Ledger().observed_count + 1;
     pending_.w8_owned_allocation_begin =
         AllocatorPolicy::W8OwnedAllocationCalls();
-    const bool dt_valid = std::isfinite(dt) && dt > 0.0 &&
+    const bool dt_valid = zero_work_evidence_ready &&
+        std::isfinite(dt) && dt > 0.0 &&
         (config_.use_borrowed_host_inputs ||
          std::memcmp(&dt, &fixed_dt, sizeof(double)) == 0) &&
         (!retry || std::memcmp(&dt, &retained_retry_dt_, sizeof(double)) == 0);
@@ -1678,6 +1761,9 @@ private:
       evidence.after = contract_->coordinates();
       return false;
     }
+    // Every started attempt owns its exact timestep through any retryable
+    // exit, including failures before a candidate can be frozen.
+    retained_retry_dt_ = begin.attempt.dt;
     if (begin.attempt.sequence != context.attempt_sequence)
     {
       return FinishBackendFailure(begin.attempt, evidence,
@@ -1701,6 +1787,9 @@ private:
 
     const detail::CudaNumericalResult numerical = numerics_.Execute(
         config_, begin.attempt, workspace);
+    // Preserve launched tensor work even if a later contract-product or
+    // candidate-storage operation fails before the normal evidence copy.
+    evidence.tensor_core = numerical.tensor_core;
     typename contract_type::ProductBundle bundle{};
     detail::CudaNumericalResult adjusted = numerical;
     IssueProducts(begin.attempt, adjusted, bundle);
@@ -1742,7 +1831,6 @@ private:
     pending_.active = true;
     pending_.prestage_allowed = false;
     pending_.attempt = begin.attempt;
-    retained_retry_dt_ = begin.attempt.dt;
     pending_.report = report;
     pending_.bundle = std::move(bundle);
     pending_.numerical = adjusted;
@@ -1754,6 +1842,8 @@ private:
     evidence.contract_reason = adjusted.reason;
     evidence.after = evidence.before;
     evidence.products = adjusted.products;
+    evidence.tensor_core = adjusted.tensor_core;
+    evidence.precision_work = adjusted.precision_work;
     evidence.transfers = totals;
     evidence.initial_residual = adjusted.initial_residual;
     evidence.final_residual = adjusted.final_residual;
@@ -1893,6 +1983,7 @@ private:
     pending_.report = report;
     pending_.bundle = {};
     pending_.numerical = {};
+    pending_.numerical.tensor_core = evidence.tensor_core;
     pending_.numerical.phase = phase;
     evidence.phase = phase;
     evidence.status = CudaRunStatus::ready;
@@ -1939,6 +2030,8 @@ private:
     evidence.contract_reason = reason;
     evidence.after = evidence.before;
     evidence.products = numerical.products;
+    evidence.tensor_core = numerical.tensor_core;
+    evidence.precision_work = numerical.precision_work;
     evidence.transfers = totals;
     evidence.initial_residual = numerical.initial_residual;
     evidence.final_residual = numerical.final_residual;
@@ -2006,6 +2099,7 @@ private:
   };
 
   CudaConfig config_{};
+  CudaTracePolicyKind trace_policy_ = CudaTracePolicyKind::engine_default;
   MPI_Comm communicator_ = MPI_COMM_WORLD;
   detail::CudaPersistentNumerics<AllocatorPolicy, TransportPolicy> numerics_{};
   std::optional<contract_type> contract_{};
