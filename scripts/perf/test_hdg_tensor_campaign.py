@@ -381,7 +381,8 @@ payload = {
         "volume_projection_quadrature_order": 2 * args.order + 2,
         "true_trace_projection_quadrature_order": 2 * args.order + 2,
         "conventional_assembly_quadrature_order": 2 * args.order + 2,
-        "igr_assembly_quadrature_order": 12,
+        "igr_volume_assembly_quadrature_order": 12,
+        "igr_face_assembly_quadrature_order": 12,
         "maximum_nonlinear_updates": 80,
         "requested_maximum_linear_iterations": 0,
         "resolved_maximum_linear_iterations": max(

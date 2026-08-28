@@ -137,6 +137,9 @@ struct CpuPersistentConfig
   double linear_relative_tolerance = cpu_linear_relative_tolerance;
   double conservation_relative_tolerance =
       cpu_conservation_relative_tolerance;
+  // Zero preserves the frozen standalone policy by inheriting the volume
+  // order. Generic requests always select an explicit positive face order.
+  int face_assembly_quadrature_order = 0;
 };
 
 CpuPersistentConfig MakeCpuSmokeConfig() noexcept;

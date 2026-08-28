@@ -233,6 +233,20 @@ bool CheckAcceptAndReject()
     return false;
   }
   request = ValidRequest(mesh, initial);
+  request.numerical_policy.igr_assembly_quadrature_orders.volume_order = 0;
+  if (ValidateEulerHdgRequest(request) !=
+      ContractStatus::invalid_numerical_policy)
+  {
+    return false;
+  }
+  request = ValidRequest(mesh, initial);
+  request.numerical_policy.igr_assembly_quadrature_orders.face_order = 0;
+  if (ValidateEulerHdgRequest(request) !=
+      ContractStatus::invalid_numerical_policy)
+  {
+    return false;
+  }
+  request = ValidRequest(mesh, initial);
   request.boundary.exterior_state = nullptr;
   if (ValidateEulerHdgRequest(request) !=
       ContractStatus::invalid_boundary_operator)
@@ -480,6 +494,11 @@ bool CheckIgrSelectionAdmission()
   int rank = 0, ranks = 0;
   MPI_Comm_rank(mesh.GetComm(), &rank);
   MPI_Comm_size(mesh.GetComm(), &ranks);
+  request.numerical_policy.igr_assembly_quadrature_orders.face_order =
+      rank == 0 ? 12 : 10;
+  const ContractStatus quadrature_mismatch =
+      ValidateEulerHdgRequest(request);
+  request.numerical_policy.igr_assembly_quadrature_orders.face_order = 12;
   request.numerical_policy.stabilization.alpha = rank == 0 ? 0.25 : 0.5;
   const ContractStatus mismatch = ValidateEulerHdgRequest(request);
   int min_status = static_cast<int>(mismatch), max_status = min_status;
@@ -502,6 +521,9 @@ bool CheckIgrSelectionAdmission()
       physical_p2 == ContractStatus::accepted &&
       physical_p3 == ContractStatus::accepted &&
       cuda == ContractStatus::accepted &&
+      quadrature_mismatch ==
+          (ranks == 1 ? ContractStatus::accepted
+                      : ContractStatus::invalid_numerical_policy) &&
       mismatch == (ranks == 1 ? ContractStatus::accepted
                               : ContractStatus::invalid_numerical_policy) &&
       min_result == MPI_SUCCESS && max_result == MPI_SUCCESS &&

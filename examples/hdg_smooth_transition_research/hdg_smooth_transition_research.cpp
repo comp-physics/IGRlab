@@ -96,7 +96,7 @@ int main(int argc, char* argv[])
     data.numerical_policy.volume_projection_quadrature_order = 14;
     data.numerical_policy.true_trace_projection_quadrature_order = 14;
     data.numerical_policy.conventional_assembly_quadrature_order = 11;
-    data.numerical_policy.igr_assembly_quadrature_order = 12;
+    data.numerical_policy.igr_assembly_quadrature_orders = {12, 12};
     data.numerical_policy.maximum_nonlinear_updates = 20;
     data.numerical_policy.maximum_linear_iterations = 200;
     data.initial_condition =

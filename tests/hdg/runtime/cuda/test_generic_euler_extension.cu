@@ -141,7 +141,8 @@ struct CudaPreparedIgrConservationCapture
   int volume_points = 0;
   int face_points = 0;
   int order = 0;
-  int assembly_order = 0;
+  int volume_assembly_order = 0;
+  int face_assembly_order = 0;
   double alpha = 0.0;
   double beta = 0.0;
   double dt = 0.0;
@@ -1497,7 +1498,8 @@ struct CudaQualificationTestAccess
     capture.volume_points = shape.volume_points;
     capture.face_points = shape.face_points;
     capture.order = shape.order;
-    capture.assembly_order = shape.assembly_order;
+    capture.volume_assembly_order = shape.volume_assembly_order;
+    capture.face_assembly_order = shape.face_assembly_order;
     capture.alpha = shape.igr_alpha;
     capture.beta = shape.igr_beta;
     capture.dt = engine.pending_.attempt.dt;
@@ -2613,6 +2615,8 @@ bool VerifyIndependentIgrConservation(
     IndependentIgrConservationResult& result)
 {
   result = {};
+  const auto requested_orders =
+      request.numerical_policy.igr_assembly_quadrature_orders;
   const bool locally_admitted = request.mesh != nullptr &&
       request.source.data != nullptr &&
       request.source.components == components &&
@@ -2622,8 +2626,8 @@ bool VerifyIndependentIgrConservation(
       capture.interior_dofs == capture.scalar_interior_dofs * 7 &&
       capture.trace_dofs == 4 * capture.scalar_face_dofs * 5 &&
       capture.order == request.polynomial_order &&
-      capture.assembly_order ==
-          request.numerical_policy.igr_assembly_quadrature_order &&
+      capture.volume_assembly_order == requested_orders.volume_order &&
+      capture.face_assembly_order == requested_orders.face_order &&
       capture.alpha == request.numerical_policy.stabilization.alpha &&
       capture.beta == request.numerical_policy.stabilization.beta &&
       capture.dt > 0.0 && std::isfinite(capture.dt);
@@ -2691,7 +2695,7 @@ bool VerifyIndependentIgrConservation(
       if (!local_valid) break;
 
       const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
-          finite_element->GetGeomType(), capture.assembly_order);
+          finite_element->GetGeomType(), capture.volume_assembly_order);
       local_valid = volume_rule.GetNPoints() == capture.volume_points;
       mfem::Vector volume_shape(capture.scalar_interior_dofs);
       mfem::DenseMatrix volume_derivative(
@@ -2844,7 +2848,7 @@ bool VerifyIndependentIgrConservation(
         if (!local_valid) break;
 
         const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
-            trace_element->GetGeomType(), capture.assembly_order);
+            trace_element->GetGeomType(), capture.face_assembly_order);
         local_valid = face_rule.GetNPoints() == capture.face_points;
         long double face_measure = 0.0L;
         for (int q = 0; local_valid && q < face_rule.GetNPoints(); ++q)
@@ -3747,6 +3751,9 @@ bool CheckIndependentIgrConservation(const int order)
   EulerHdgRequest request = MakeRequest(
       mesh, order, fields, unused_boundary, false,
       RegularizationKind::igr);
+  // A deliberately split policy proves that the production CUDA route does
+  // not silently reuse the element rule for faces.
+  request.numerical_policy.igr_assembly_quadrature_orders = {10, 8};
   AllSevenBoundaryContext boundary{};
   ConfigureAllSevenPolicies(boundary);
   request.boundary.context = &boundary;

@@ -1431,6 +1431,16 @@ CollectiveRestoreReport CpuWorldCollectivePolicy::ReduceRestore(
 namespace
 {
 
+generic::EulerHdgAssemblyQuadratureOrders EffectiveAssemblyQuadratureOrders(
+    const CpuPersistentConfig& config) noexcept
+{
+  return {
+      config.assembly_quadrature_order,
+      config.face_assembly_quadrature_order > 0
+          ? config.face_assembly_quadrature_order
+          : config.assembly_quadrature_order};
+}
+
 struct LocalSystem
 {
   int elements = 0;
@@ -1618,7 +1628,8 @@ bool ExactConfig(const CpuPersistentConfig& config) noexcept
               cpu_conservation_relative_tolerance) &&
       config.allow_one_retry &&
       !config.force_private_scientific_gate_failure;
-  return w8a_config || (w8c_config && common_controls);
+  return config.face_assembly_quadrature_order == 0 &&
+      (w8a_config || (w8c_config && common_controls));
 }
 
 bool IsW8cConfig(const CpuPersistentConfig& config) noexcept
@@ -1660,11 +1671,12 @@ bool ExactRankShape(const CpuPersistentConfig& config,
 
 bool ExactConfigConsensus(const CpuPersistentConfig& config) noexcept
 {
-  const std::array<std::uint64_t, 15> local{{
+  const std::array<std::uint64_t, 16> local{{
       static_cast<std::uint64_t>(config.scenario),
       static_cast<std::uint64_t>(config.polynomial_order),
       static_cast<std::uint64_t>(config.elements_per_direction),
       static_cast<std::uint64_t>(config.assembly_quadrature_order),
+      static_cast<std::uint64_t>(config.face_assembly_quadrature_order),
       static_cast<std::uint64_t>(config.maximum_newton_updates),
       static_cast<std::uint64_t>(config.maximum_linear_iterations),
       static_cast<std::uint64_t>(config.maximum_line_search_trials),
@@ -1678,7 +1690,7 @@ bool ExactConfigConsensus(const CpuPersistentConfig& config) noexcept
       static_cast<std::uint64_t>(config.allow_one_retry),
       static_cast<std::uint64_t>(
           config.force_private_scientific_gate_failure)}};
-  std::array<std::uint64_t, 15> minimum{}, maximum{};
+  std::array<std::uint64_t, 16> minimum{}, maximum{};
   return MPI_Allreduce(local.data(), minimum.data(),
                        static_cast<int>(local.size()), MPI_UINT64_T, MPI_MIN,
                        MPI_COMM_WORLD) == MPI_SUCCESS &&
@@ -3308,10 +3320,11 @@ struct detail::CpuNumericsCore::Implementation
       scaled_normal_workspace.SetSize(cpu_dimension);
       element_trace_dofs_workspace.SetSize(local_trace);
       local_schur_workspace.SetSize(local_trace);
+      const auto assembly_orders = EffectiveAssemblyQuadratureOrders(config);
       if (mfem::IntRules.Get(mfem::Geometry::SQUARE,
-                             config.assembly_quadrature_order).GetNPoints() <= 0 ||
+                             assembly_orders.volume_order).GetNPoints() <= 0 ||
           mfem::IntRules.Get(mfem::Geometry::SEGMENT,
-                             config.assembly_quadrature_order).GetNPoints() <= 0)
+                             assembly_orders.face_order).GetNPoints() <= 0)
       {
         return false;
       }
@@ -3524,7 +3537,9 @@ struct detail::CpuNumericsCore::Implementation
 
   bool Assemble(const mfem::ParGridFunction& current_interior,
                 const mfem::ParGridFunction& current_trace,
-                LocalSystem& system, const int quadrature_order,
+                LocalSystem& system,
+                const generic::EulerHdgAssemblyQuadratureOrders
+                    quadrature_orders,
                 const bool consume_internal_test_hooks = true,
                 const std::vector<double>* const frozen_borrowed_llf = nullptr,
                 std::vector<double>* const evaluated_borrowed_llf = nullptr)
@@ -3566,7 +3581,7 @@ struct detail::CpuNumericsCore::Implementation
         const int* interior_vdofs = element_interior_vdofs.data() +
             static_cast<std::size_t>(element) * local_interior;
         const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
-            finite_element->GetGeomType(), quadrature_order);
+            finite_element->GetGeomType(), quadrature_orders.volume_order);
         const std::size_t element_ni =
             static_cast<std::size_t>(element) * local_interior;
         const std::size_t element_nt =
@@ -3888,7 +3903,7 @@ struct detail::CpuNumericsCore::Implementation
           const int* face_trace_vdofs = signed_trace_dofs.data() +
               static_cast<std::size_t>(element) * local_trace + trace_offset;
           const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
-              trace_element->GetGeomType(), quadrature_order);
+              trace_element->GetGeomType(), quadrature_orders.face_order);
 
           double face_volume = 0.0;
           if (regularized)
@@ -4523,6 +4538,7 @@ struct detail::CpuNumericsCore::Implementation
                  double& minimum_density, double& minimum_pressure,
                  double& maximum_wave_speed) noexcept
   {
+    const auto assembly_orders = EffectiveAssemblyQuadratureOrders(config);
     double local_density = std::numeric_limits<double>::infinity();
     double local_pressure = std::numeric_limits<double>::infinity();
     double local_wave = 0.0;
@@ -4536,7 +4552,7 @@ struct detail::CpuNumericsCore::Implementation
         const int* interior_vdofs = element_interior_vdofs.data() +
             static_cast<std::size_t>(element) * local_interior;
         const mfem::IntegrationRule& rule = mfem::IntRules.Get(
-            finite_element->GetGeomType(), config.assembly_quadrature_order);
+            finite_element->GetGeomType(), assembly_orders.volume_order);
         for (int q = 0; q < rule.GetNPoints() && local_ok; ++q)
         {
           finite_element->CalcShape(rule.IntPoint(q),
@@ -4560,7 +4576,7 @@ struct detail::CpuNumericsCore::Implementation
               static_cast<std::size_t>(element) * local_trace +
               local_face * scalar_trace_dofs * trace_components;
           const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
-              trace_element->GetGeomType(), config.assembly_quadrature_order);
+              trace_element->GetGeomType(), assembly_orders.face_order);
           for (int q = 0; q < face_rule.GetNPoints() && local_ok; ++q)
           {
             const mfem::IntegrationPoint& point = face_rule.IntPoint(q);
@@ -4620,6 +4636,7 @@ struct detail::CpuNumericsCore::Implementation
       double& maximum_error,
       double& maximum_relative_error) noexcept
   {
+    const auto assembly_orders = EffectiveAssemblyQuadratureOrders(config);
     maximum_error = 0.0;
     maximum_relative_error = 0.0;
     if (!IsBorrowed()) { return true; }
@@ -4651,7 +4668,7 @@ struct detail::CpuNumericsCore::Implementation
         const int* interior_vdofs = element_interior_vdofs.data() +
             static_cast<std::size_t>(element) * local_interior;
         const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
-            finite_element->GetGeomType(), config.assembly_quadrature_order);
+            finite_element->GetGeomType(), assembly_orders.volume_order);
         for (int q = 0; q < volume_rule.GetNPoints() && local_ok; ++q)
         {
           const mfem::IntegrationPoint& point = volume_rule.IntPoint(q);
@@ -4777,7 +4794,7 @@ struct detail::CpuNumericsCore::Implementation
               trace_offset;
           const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
               trace_element->GetGeomType(),
-              config.assembly_quadrature_order);
+              assembly_orders.face_order);
           double face_volume = 0.0;
           for (int measure_q = 0;
                measure_q < face_rule.GetNPoints(); ++measure_q)
@@ -5712,11 +5729,11 @@ bool detail::CpuNumericsCore::InitializeBorrowedEuler(
   // This is not a Cartesian-grid request.  Keep standalone grid provenance
   // inapplicable instead of inventing an elements-per-direction value.
   config.elements_per_direction = 0;
-  config.assembly_quadrature_order =
-      request.numerical_policy.stabilization.kind ==
-              generic::RegularizationKind::igr
-          ? request.numerical_policy.igr_assembly_quadrature_order
-          : request.numerical_policy.conventional_assembly_quadrature_order;
+  const auto assembly_orders =
+      generic::ResolveEulerHdgAssemblyQuadratureOrders(
+          request.numerical_policy);
+  config.assembly_quadrature_order = assembly_orders.volume_order;
+  config.face_assembly_quadrature_order = assembly_orders.face_order;
   // The value-only physical boundary is a frozen-exterior Picard row, so its
   // outer update is intentionally inexact rather than a differentiated
   // Newton step.  Retain the same engine while allowing that convergent outer
@@ -6071,12 +6088,11 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
   }
 
   const auto& numerical_policy = state.borrowed_request->numerical_policy;
-  const int quadrature_order = regularized
-      ? numerical_policy.igr_assembly_quadrature_order
-      : numerical_policy.conventional_assembly_quadrature_order;
+  const auto quadrature_orders =
+      generic::ResolveEulerHdgAssemblyQuadratureOrders(numerical_policy);
   std::vector<double> frozen_borrowed_llf;
   local_valid = state.Assemble(*base_interior, *base_trace,
-                               state.current_system, quadrature_order, false,
+                               state.current_system, quadrature_orders, false,
                                nullptr,
                                regularized ? nullptr : &frozen_borrowed_llf);
   local_valid = local_valid &&
@@ -6236,7 +6252,7 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
   const auto central_difference = [&state, &copy_with_perturbation,
       &base_interior, &plus_interior, &minus_interior, &base_true_trace,
       &plus_true_trace, &minus_true_trace, &interior_direction,
-      &true_trace_direction, &plus_trace, &minus_trace, quadrature_order,
+      &true_trace_direction, &plus_trace, &minus_trace, quadrature_orders,
       difference_step, regularized,
       &frozen_borrowed_llf,
       &refreshed_tau_changed](const bool perturb_interior,
@@ -6280,7 +6296,7 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
     std::vector<double>* const minus_observation =
         !regularized && !freeze_llf ? &minus_evaluated_llf : nullptr;
     local_ready = state.Assemble(
-        *plus_interior, *plus_trace, state.trial_system, quadrature_order,
+        *plus_interior, *plus_trace, state.trial_system, quadrature_orders,
         false, regularized || !freeze_llf ? nullptr : &frozen_borrowed_llf,
         plus_observation);
     if (!state.CollectiveAll(local_ready)) { return false; }
@@ -6304,7 +6320,7 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
     }
     if (!state.CollectiveAll(local_ready)) { return false; }
     local_ready = state.Assemble(
-        *minus_interior, *minus_trace, state.trial_system, quadrature_order,
+        *minus_interior, *minus_trace, state.trial_system, quadrature_orders,
         false, regularized || !freeze_llf ? nullptr : &frozen_borrowed_llf,
         minus_observation);
     if (!state.CollectiveAll(local_ready)) { return false; }
@@ -6445,7 +6461,7 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
   // state slot, trace vector, candidate authority, or solver lifecycle state
   // is published by this test-only check.
   local_valid = state.Assemble(*base_interior, *base_trace,
-                               state.current_system, quadrature_order, false);
+                               state.current_system, quadrature_orders, false);
   if (!state.CollectiveAll(local_valid)) { return false; }
   return state.CollectiveAll(std::all_of(
       relative_errors.begin(), relative_errors.end(),
@@ -7245,8 +7261,7 @@ bool detail::CpuNumericsCore::InitializeInternal(
       static_cast<std::uint64_t>(state.mesh->GetNE()), state.communicator));
   state.evidence.polynomial_order = config.polynomial_order;
   state.evidence.elements_per_direction = config.elements_per_direction;
-  state.evidence.assembly_quadrature_order =
-      config.assembly_quadrature_order;
+  state.evidence.assembly_quadrature_order = config.assembly_quadrature_order;
   state.evidence.dt = config.dt;
   state.evidence.local_owned_interior_coefficients =
       state.Committed()->interior.size();
@@ -7432,7 +7447,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   }
   bool assembled = state.Assemble(
       *state.iterate_interior, *state.iterate_trace, state.current_system,
-      state.config.assembly_quadrature_order);
+      EffectiveAssemblyQuadratureOrders(state.config));
   const bool assembly_fault = ConsumeOwnedCollectiveTestFault(
       detail::CpuCollectiveTestFault::assembly_completion, state.rank,
       state.incarnation);
@@ -7641,7 +7656,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       admissible_trial = true;
       const bool trial_assembled = state.Assemble(
           *state.trial_interior, *state.trial_trace, state.trial_system,
-          state.config.assembly_quadrature_order);
+          EffectiveAssemblyQuadratureOrders(state.config));
       if (!state.CollectiveAll(trial_assembled))
       {
         return fail(CpuFailurePhase::assembly);

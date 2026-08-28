@@ -26,6 +26,7 @@ using generic::BackendKind;
 using generic::Capability;
 using generic::CapabilityBit;
 using generic::CudaEngineKind;
+using generic::EulerHdgAssemblyQuadratureOrders;
 using generic::EulerBoundaryPolicyTableView;
 using generic::EulerHdgRequest;
 using generic::RegularizationKind;
@@ -60,6 +61,7 @@ struct CaseSelection
 {
   int order = 0;
   RegularizationKind regularization = RegularizationKind::none;
+  EulerHdgAssemblyQuadratureOrders igr_assembly_quadrature_orders{0, 0};
 };
 
 inline bool ParseOrder(const std::string_view text, int& order) noexcept
@@ -73,12 +75,25 @@ inline bool ParseOrder(const std::string_view text, int& order) noexcept
       order <= generic::maximum_polynomial_order;
 }
 
+inline bool ParseQuadratureOrder(
+    const std::string_view text, int& order) noexcept
+{
+  order = 0;
+  const char* const begin = text.data();
+  const char* const end = begin + text.size();
+  const auto parsed = std::from_chars(begin, end, order);
+  return parsed.ec == std::errc{} && parsed.ptr == end &&
+      order >= 1 && order <= 14;
+}
+
 inline bool ParseCaseSelection(const int argc, char* argv[],
                                CaseSelection& selection) noexcept
 {
   selection = {};
   bool have_order = false;
   bool have_regularization = false;
+  bool have_igr_volume_order = false;
+  bool have_igr_face_order = false;
   for (int argument = 1; argument < argc; ++argument)
   {
     const std::string_view option{argv[argument]};
@@ -99,12 +114,31 @@ inline bool ParseCaseSelection(const int argc, char* argv[],
         return false;
       have_regularization = true;
     }
+    else if (option == "--igr-volume-quadrature-order" &&
+             argument + 1 < argc && !have_igr_volume_order)
+    {
+      have_igr_volume_order = ParseQuadratureOrder(
+          argv[++argument],
+          selection.igr_assembly_quadrature_orders.volume_order);
+      if (!have_igr_volume_order) return false;
+    }
+    else if (option == "--igr-face-quadrature-order" &&
+             argument + 1 < argc && !have_igr_face_order)
+    {
+      have_igr_face_order = ParseQuadratureOrder(
+          argv[++argument],
+          selection.igr_assembly_quadrature_orders.face_order);
+      if (!have_igr_face_order) return false;
+    }
     else
     {
       return false;
     }
   }
-  return have_order && have_regularization;
+  return have_order && have_regularization &&
+      have_igr_volume_order == have_igr_face_order &&
+      (!have_igr_volume_order ||
+       selection.regularization == RegularizationKind::igr);
 }
 
 /**
@@ -213,7 +247,8 @@ inline EulerHdgRequest MakeRequest(
     const mfem::ParGridFunction& initial,
     const mfem::ParGridFunction& source, BoundaryAudit& boundary,
     const ExecutionSelection execution,
-    const RegularizationKind regularization)
+    const RegularizationKind regularization,
+    const EulerHdgAssemblyQuadratureOrders igr_assembly_quadrature_orders)
 {
   EulerHdgRequest request{};
   request.mesh = &mesh;
@@ -236,6 +271,9 @@ inline EulerHdgRequest MakeRequest(
       &boundary, PeriodicExterior,
       EulerBoundaryPolicyTableView{nullptr, 0, dimension, gamma}};
   request.numerical_policy = generic::DefaultEulerHdgNumericalPolicy(order);
+  if (igr_assembly_quadrature_orders.volume_order > 0)
+    request.numerical_policy.igr_assembly_quadrature_orders =
+        igr_assembly_quadrature_orders;
   request.numerical_policy.stabilization =
       regularization == RegularizationKind::igr
       ? generic::RegularizationSelection{RegularizationKind::igr, 0.2, 0.8}
@@ -612,7 +650,8 @@ bool RunComparisonCase(
       if (!ProjectInitialState(spatial_wave, initial)) return false;
       const EulerHdgRequest request = MakeRequest(
           mesh, order, initial, source, boundary,
-          executions[execution], regularization);
+          executions[execution], regularization,
+          test_case.igr_assembly_quadrature_orders);
       const bool advanced = runner.Advance(
           request, 1, spatial_final_time, committed);
       if (!CollectiveAll(advanced && boundary.calls == 0, communicator))
@@ -646,8 +685,8 @@ bool RunComparisonCase(
       BoundaryAudit boundary{};
       const EulerHdgRequest request = MakeRequest(
           temporal_mesh, order, temporal_initial, temporal_source, boundary,
-          executions[execution],
-          regularization);
+          executions[execution], regularization,
+          test_case.igr_assembly_quadrature_orders);
       const bool advanced = runner.Advance(
           request, step_ladder[level], dt, *solutions[level]);
       if (!CollectiveAll(advanced && boundary.calls == 0, communicator))

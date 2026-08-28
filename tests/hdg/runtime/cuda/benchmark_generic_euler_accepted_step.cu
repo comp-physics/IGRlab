@@ -286,7 +286,8 @@ struct Options
   int profile_measured_step = -1;
   double timestep = default_timestep;
   double linear_relative_tolerance = 0.0;
-  int igr_assembly_quadrature_order = 0;
+  int igr_volume_assembly_quadrature_order = 0;
+  int igr_face_assembly_quadrature_order = 0;
   std::string expected_source_revision{};
   std::string expected_source_tree{};
   std::string expected_source_status{};
@@ -546,14 +547,28 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
       }
       continue;
     }
-    if (argument == "--igr-quadrature-order")
+    if (argument == "--igr-volume-quadrature-order")
     {
       if (++index >= argc ||
           !ParsePositiveInt(argv[index], 1,
-                            options.igr_assembly_quadrature_order) ||
-          options.igr_assembly_quadrature_order > 14)
+                            options.igr_volume_assembly_quadrature_order) ||
+          options.igr_volume_assembly_quadrature_order > 14)
       {
-        error = "--igr-quadrature-order requires an integer in [1,14]";
+        error =
+            "--igr-volume-quadrature-order requires an integer in [1,14]";
+        return false;
+      }
+      continue;
+    }
+    if (argument == "--igr-face-quadrature-order")
+    {
+      if (++index >= argc ||
+          !ParsePositiveInt(argv[index], 1,
+                            options.igr_face_assembly_quadrature_order) ||
+          options.igr_face_assembly_quadrature_order > 14)
+      {
+        error =
+            "--igr-face-quadrature-order requires an integer in [1,14]";
         return false;
       }
       continue;
@@ -619,10 +634,20 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
             "and divide --mesh-n exactly";
     return false;
   }
-  if (options.regularization != RegularizationKind::igr &&
-      options.igr_assembly_quadrature_order != 0)
+  const bool have_igr_volume_order =
+      options.igr_volume_assembly_quadrature_order != 0;
+  const bool have_igr_face_order =
+      options.igr_face_assembly_quadrature_order != 0;
+  if (have_igr_volume_order != have_igr_face_order)
   {
-    error = "--igr-quadrature-order requires --mode igr";
+    error = "the IGR volume and face quadrature options must be supplied "
+            "together";
+    return false;
+  }
+  if (options.regularization != RegularizationKind::igr &&
+      have_igr_volume_order)
+  {
+    error = "the IGR quadrature options require --mode igr";
     return false;
   }
   const std::array<bool, 5> expected_supplied{{
@@ -660,14 +685,16 @@ void PrintUsage(const char* executable)
                " [--trace-policy engine-default|common-fast]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
-               " [--igr-quadrature-order Q] [--export|--no-export]"
+               " [--igr-volume-quadrature-order Q]"
+               " [--igr-face-quadrature-order Q] [--export|--no-export]"
                " [--profile-measured-step 0|1|2|3|4]\n"
                "       " << executable
             << " [--conventional|--igr] [--engine ordinary|tensor]"
                " [--trace-policy engine-default|common-fast]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
-               " [--igr-quadrature-order Q] [--export|--no-export]"
+               " [--igr-volume-quadrature-order Q]"
+               " [--igr-face-quadrature-order Q] [--export|--no-export]"
                " [--profile-measured-step 0|1|2|3|4]\n";
 }
 
@@ -766,9 +793,10 @@ EulerHdgRequest MakeRequest(const mfem::ParMesh& mesh,
   if (options.linear_relative_tolerance > 0.0)
     request.numerical_policy.linear_relative_tolerance =
         options.linear_relative_tolerance;
-  if (options.igr_assembly_quadrature_order > 0)
-    request.numerical_policy.igr_assembly_quadrature_order =
-        options.igr_assembly_quadrature_order;
+  if (options.igr_volume_assembly_quadrature_order > 0)
+    request.numerical_policy.igr_assembly_quadrature_orders = {
+        options.igr_volume_assembly_quadrature_order,
+        options.igr_face_assembly_quadrature_order};
   if (options.regularization == RegularizationKind::igr)
     request.numerical_policy.stabilization = {
         RegularizationKind::igr, 0.2, 0.8};
@@ -1729,8 +1757,12 @@ int RunBenchmark(const Options& options)
             << request.numerical_policy.true_trace_projection_quadrature_order
             << ",\"conventional_assembly_quadrature_order\":"
             << request.numerical_policy.conventional_assembly_quadrature_order
-            << ",\"igr_assembly_quadrature_order\":"
-            << request.numerical_policy.igr_assembly_quadrature_order
+            << ",\"igr_volume_assembly_quadrature_order\":"
+            << request.numerical_policy.igr_assembly_quadrature_orders
+                   .volume_order
+            << ",\"igr_face_assembly_quadrature_order\":"
+            << request.numerical_policy.igr_assembly_quadrature_orders
+                   .face_order
             << ",\"maximum_nonlinear_updates\":"
             << request.numerical_policy.maximum_nonlinear_updates
             << ",\"requested_maximum_linear_iterations\":"

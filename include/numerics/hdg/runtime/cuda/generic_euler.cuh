@@ -944,7 +944,9 @@ private:
         AppendConfigValue(local, cursor, complete,
                           policy.conventional_assembly_quadrature_order);
         AppendConfigValue(local, cursor, complete,
-                          policy.igr_assembly_quadrature_order);
+                          policy.igr_assembly_quadrature_orders.volume_order);
+        AppendConfigValue(local, cursor, complete,
+                          policy.igr_assembly_quadrature_orders.face_order);
         AppendConfigValue(local, cursor, complete,
                           policy.maximum_nonlinear_updates);
         AppendConfigValue(local, cursor, complete,

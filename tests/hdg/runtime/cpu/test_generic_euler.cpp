@@ -872,7 +872,8 @@ bool CheckDefaultNumericalPolicyAdaptiveLinearCap()
   dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
   if (default_policy.maximum_linear_iterations != 0 ||
       default_policy.linear_relative_tolerance != 1.0e-12 ||
-      default_policy.igr_assembly_quadrature_order != 12 ||
+      default_policy.igr_assembly_quadrature_orders.volume_order != 12 ||
+      default_policy.igr_assembly_quadrature_orders.face_order != 12 ||
       !core.InitializeBorrowedEuler(request))
   {
     return false;
@@ -1223,16 +1224,17 @@ bool CheckIgrExtensionNumericalPolicy()
   // Deliberately distinct policy controls ensure the IGR assembly,
   // Krylov stopping, true-residual acceptance, and source conservation gates
   // do not silently borrow the nonlinear tolerance or a helper default.
-  request.numerical_policy.igr_assembly_quadrature_order = 10;
+  request.numerical_policy.igr_assembly_quadrature_orders = {10, 8};
   request.numerical_policy.maximum_linear_iterations = 31;
   request.numerical_policy.linear_relative_tolerance = 1.0e-12;
   request.numerical_policy.true_residual_relative_tolerance = 1.0e-9;
   request.numerical_policy.conservation_relative_tolerance = 1.0e-8;
   dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
   if (!core.InitializeBorrowedEuler(request)) return false;
+  const auto requested_orders =
+      request.numerical_policy.igr_assembly_quadrature_orders;
   const bool selected_quadrature =
-      core.evidence().assembly_quadrature_order ==
-      request.numerical_policy.igr_assembly_quadrature_order;
+      core.evidence().assembly_quadrature_order == requested_orders.volume_order;
   dg::hdg::runtime::StateCoordinates coordinates{};
   std::uint64_t generation = 0;
   if (!core.PrepareBorrowedEuler(0.001, coordinates, generation)) return false;

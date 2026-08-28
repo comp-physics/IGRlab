@@ -1523,7 +1523,9 @@ private:
         AppendConfigValue(descriptor, cursor, complete,
                           policy.conventional_assembly_quadrature_order);
         AppendConfigValue(descriptor, cursor, complete,
-                          policy.igr_assembly_quadrature_order);
+                          policy.igr_assembly_quadrature_orders.volume_order);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.igr_assembly_quadrature_orders.face_order);
         AppendConfigValue(descriptor, cursor, complete,
                           policy.maximum_nonlinear_updates);
         AppendConfigValue(descriptor, cursor, complete,

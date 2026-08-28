@@ -66,6 +66,13 @@ struct RegularizationSelection
   double beta;
 };
 
+/** Independent MFEM integration-rule orders for element and face assembly. */
+struct EulerHdgAssemblyQuadratureOrders
+{
+  int volume_order;
+  int face_order;
+};
+
 /** Rank-identical numerical choices for one Euler HDG invocation. */
 struct EulerHdgNumericalPolicy
 {
@@ -73,7 +80,7 @@ struct EulerHdgNumericalPolicy
   int volume_projection_quadrature_order;
   int true_trace_projection_quadrature_order;
   int conventional_assembly_quadrature_order;
-  int igr_assembly_quadrature_order;
+  EulerHdgAssemblyQuadratureOrders igr_assembly_quadrature_orders;
   int maximum_nonlinear_updates;
   // Zero selects the legacy adaptive cap: max(100, global true-trace size).
   // A positive value is an exact per-solve iteration cap.
@@ -94,9 +101,21 @@ constexpr EulerHdgNumericalPolicy DefaultEulerHdgNumericalPolicy(
   const int quadrature = 2 * p + 2;
   // Keep the inactive default IGR quadrature field stable for conventional
   // requests; the order-general extension deliberately overintegrates at 12.
-  return {quadrature, quadrature, quadrature, 12, 80, 0, 13,
+  return {quadrature, quadrature, quadrature, {12, 12}, 80, 0, 13,
           1.0e-10, 1.0e-12, 1.0e-10,
           1.0e-10, 1.0e-4, {RegularizationKind::none, 0.0, 0.0}};
+}
+
+/** Resolve the active assembly rules without duplicating engine policy. */
+constexpr EulerHdgAssemblyQuadratureOrders
+ResolveEulerHdgAssemblyQuadratureOrders(
+    const EulerHdgNumericalPolicy& policy) noexcept
+{
+  return policy.stabilization.kind == RegularizationKind::igr
+      ? policy.igr_assembly_quadrature_orders
+      : EulerHdgAssemblyQuadratureOrders{
+            policy.conventional_assembly_quadrature_order,
+            policy.conventional_assembly_quadrature_order};
 }
 
 /** Resolve the documented adaptive linear cap for a true-trace system. */
@@ -300,6 +319,10 @@ static_assert(std::is_standard_layout<EulerBoundaryPolicyTableView>::value &&
 static_assert(std::is_standard_layout<RegularizationSelection>::value &&
                   std::is_trivial<RegularizationSelection>::value,
               "generic HDG regularization must stay POD");
+static_assert(
+    std::is_standard_layout<EulerHdgAssemblyQuadratureOrders>::value &&
+        std::is_trivial<EulerHdgAssemblyQuadratureOrders>::value,
+    "generic HDG assembly quadrature orders must stay POD");
 static_assert(std::is_standard_layout<EulerHdgNumericalPolicy>::value &&
                   std::is_trivial<EulerHdgNumericalPolicy>::value,
               "generic HDG numerical policy must stay POD");
@@ -504,7 +527,8 @@ inline bool ValidEulerHdgNumericalPolicy(
       policy.volume_projection_quadrature_order,
       policy.true_trace_projection_quadrature_order,
       policy.conventional_assembly_quadrature_order,
-      policy.igr_assembly_quadrature_order,
+      policy.igr_assembly_quadrature_orders.volume_order,
+      policy.igr_assembly_quadrature_orders.face_order,
       policy.maximum_nonlinear_updates,
       policy.maximum_line_search_trials};
   for (const int value : positive_integers)
@@ -755,7 +779,8 @@ inline bool ExactNumericalPolicyConsensus(
       policy.volume_projection_quadrature_order,
       policy.true_trace_projection_quadrature_order,
       policy.conventional_assembly_quadrature_order,
-      policy.igr_assembly_quadrature_order,
+      policy.igr_assembly_quadrature_orders.volume_order,
+      policy.igr_assembly_quadrature_orders.face_order,
       policy.maximum_nonlinear_updates,
       policy.maximum_linear_iterations,
       policy.maximum_line_search_trials,

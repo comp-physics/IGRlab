@@ -736,7 +736,8 @@ struct CudaMeshShape
   int scalar_face_dofs = 0;
   int interior_dofs = 0;
   int trace_dofs = 0;
-  int assembly_order = 0;
+  int volume_assembly_order = 0;
+  int face_assembly_order = 0;
   int interior_count = 0;
   int local_trace_count = 0;
   int true_trace_count = 0;
@@ -3566,14 +3567,15 @@ private:
   static int TraceComponents(const CudaConfig& config) noexcept
   { return IgrActive(config) ? igr_trace_components : conserved_components; }
 
-  static int AssemblyOrder(const CudaConfig& config) noexcept
+  static generic::EulerHdgAssemblyQuadratureOrders AssemblyOrders(
+      const CudaConfig& config) noexcept
   {
     if (config.use_generic_numerical_policy)
-      return IgrActive(config)
-          ? config.numerical_policy.igr_assembly_quadrature_order
-          : config.numerical_policy.conventional_assembly_quadrature_order;
-    return config.order == functional_polynomial_order
+      return generic::ResolveEulerHdgAssemblyQuadratureOrders(
+          config.numerical_policy);
+    const int order = config.order == functional_polynomial_order
         ? functional_assembly_quadrature_order : assembly_quadrature_order;
+    return {order, order};
   }
 
   static bool ExactTopologyShapeFitsCapacity(
@@ -3606,11 +3608,11 @@ private:
         InteriorComponents(config) * scalar_interior_dofs;
     const int trace_dofs =
         faces_per_element * TraceComponents(config) * scalar_face_dofs;
-    const int assembly_order = AssemblyOrder(config);
+    const auto assembly_orders = AssemblyOrders(config);
     const int volume_points = mfem::IntRules.Get(
-        fe->GetGeomType(), assembly_order).GetNPoints();
+        fe->GetGeomType(), assembly_orders.volume_order).GetNPoints();
     const int face_points = mfem::IntRules.Get(
-        face_fe->GetGeomType(), assembly_order).GetNPoints();
+        face_fe->GetGeomType(), assembly_orders.face_order).GetNPoints();
     const bool common_shape = trace.GetVSize() > 0 && trace.GetTrueVSize() > 0 &&
         exchange.map.dofs.global_true_dof_count > 0 &&
         scalar_interior_dofs > 0 &&
@@ -4082,7 +4084,9 @@ private:
         shape_.interior_components * shape_.scalar_interior_dofs;
     shape_.trace_dofs = faces_per_element * shape_.trace_components *
         shape_.scalar_face_dofs;
-    shape_.assembly_order = AssemblyOrder(config);
+    const auto assembly_orders = AssemblyOrders(config);
+    shape_.volume_assembly_order = assembly_orders.volume_order;
+    shape_.face_assembly_order = assembly_orders.face_order;
     shape_.order = config.order;
     shape_.igr_active = IgrActive(config);
     shape_.igr_alpha = shape_.igr_active
@@ -4111,9 +4115,9 @@ private:
                                         *trace_space_, exchange_plan_))
       return false;
     shape_.volume_points = mfem::IntRules.Get(
-        fe->GetGeomType(), shape_.assembly_order).GetNPoints();
+        fe->GetGeomType(), shape_.volume_assembly_order).GetNPoints();
     shape_.face_points = mfem::IntRules.Get(
-        face_fe->GetGeomType(), shape_.assembly_order).GetNPoints();
+        face_fe->GetGeomType(), shape_.face_assembly_order).GetNPoints();
     if (shape_.volume_points > maximum_volume_points ||
         shape_.face_points > maximum_face_points)
       return false;

@@ -193,7 +193,7 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
       }
     }
     const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
-        fe->GetGeomType(), shape_.assembly_order);
+        fe->GetGeomType(), shape_.volume_assembly_order);
     mfem::Vector shape(shape_.scalar_interior_dofs), physical(dimension);
     mfem::DenseMatrix derivative(shape_.scalar_interior_dofs, dimension);
     for (int q = 0; q < shape_.volume_points; ++q)
@@ -299,7 +299,7 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
         }
       }
       const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
-          trace_fe->GetGeomType(), shape_.assembly_order);
+          trace_fe->GetGeomType(), shape_.face_assembly_order);
       if (shape_.igr_active)
       {
         double face_measure = 0.0;

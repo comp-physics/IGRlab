@@ -163,7 +163,9 @@ int main(int argc, char* argv[])
   {
     if (ranks == 1)
       std::cerr << "Usage: " << argv[0]
-                << " --order 1|2|3 --regularization conventional|igr\n";
+                << " --order 1|2|3 --regularization conventional|igr"
+                   " [--igr-volume-quadrature-order Q"
+                   " --igr-face-quadrature-order Q]\n";
     else
       std::cerr << "Three-engine convergence qualification is rank-one; "
                    "rank-two CUDA correctness has separate coverage\n";
