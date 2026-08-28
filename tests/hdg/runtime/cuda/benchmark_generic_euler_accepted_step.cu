@@ -285,6 +285,8 @@ struct Options
   int domain_periods = 1;
   int profile_measured_step = -1;
   double timestep = default_timestep;
+  double linear_relative_tolerance = 0.0;
+  int igr_assembly_quadrature_order = 0;
   std::string expected_source_revision{};
   std::string expected_source_tree{};
   std::string expected_source_status{};
@@ -533,6 +535,29 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
       }
       continue;
     }
+    if (argument == "--linear-rtol")
+    {
+      if (++index >= argc ||
+          !ParsePositiveDouble(argv[index],
+                               options.linear_relative_tolerance))
+      {
+        error = "--linear-rtol requires a finite positive FP64 value";
+        return false;
+      }
+      continue;
+    }
+    if (argument == "--igr-quadrature-order")
+    {
+      if (++index >= argc ||
+          !ParsePositiveInt(argv[index], 1,
+                            options.igr_assembly_quadrature_order) ||
+          options.igr_assembly_quadrature_order > 14)
+      {
+        error = "--igr-quadrature-order requires an integer in [1,14]";
+        return false;
+      }
+      continue;
+    }
     const auto parse_expected = [&](std::string& value) -> bool
     {
       if (++index >= argc || std::string_view(argv[index]).empty())
@@ -594,6 +619,12 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
             "and divide --mesh-n exactly";
     return false;
   }
+  if (options.regularization != RegularizationKind::igr &&
+      options.igr_assembly_quadrature_order != 0)
+  {
+    error = "--igr-quadrature-order requires --mode igr";
+    return false;
+  }
   const std::array<bool, 5> expected_supplied{{
       !options.expected_source_revision.empty(),
       !options.expected_source_tree.empty(),
@@ -628,13 +659,15 @@ void PrintUsage(const char* executable)
             << " [--mode conventional|igr] [--engine ordinary|tensor]"
                " [--trace-policy engine-default|common-fast]"
                " [--order 1|2|3] [--mesh-n N]"
-               " [--domain-periods K] [--dt DT] [--export|--no-export]"
+               " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
+               " [--igr-quadrature-order Q] [--export|--no-export]"
                " [--profile-measured-step 0|1|2|3|4]\n"
                "       " << executable
             << " [--conventional|--igr] [--engine ordinary|tensor]"
                " [--trace-policy engine-default|common-fast]"
                " [--order 1|2|3] [--mesh-n N]"
-               " [--domain-periods K] [--dt DT] [--export|--no-export]"
+               " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
+               " [--igr-quadrature-order Q] [--export|--no-export]"
                " [--profile-measured-step 0|1|2|3|4]\n";
 }
 
@@ -710,14 +743,13 @@ bool PeriodicExterior(const void*, const BoundaryPointView&,
 
 EulerHdgRequest MakeRequest(const mfem::ParMesh& mesh,
                             const BorrowedFields& fields,
-                            const RegularizationKind regularization,
-                            const int order, const CudaEngineKind engine)
+                            const Options& options)
 {
   EulerHdgRequest request{};
   request.mesh = &mesh;
   request.communicator = mesh.GetComm();
-  request.polynomial_order = order;
-  request.backend = {BackendKind::cuda, 0, engine};
+  request.polynomial_order = options.order;
+  request.backend = {BackendKind::cuda, 0, options.engine};
   request.capabilities = cuda_capabilities;
   request.initial_state = {
       fields.initial.data(), fields.initial.size(), conserved_components};
@@ -730,8 +762,14 @@ EulerHdgRequest MakeRequest(const mfem::ParMesh& mesh,
   request.boundary.policies = EulerBoundaryPolicyTableView{
       nullptr, 0, 2, benchmark_gamma};
   request.numerical_policy =
-      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
-  if (regularization == RegularizationKind::igr)
+      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(options.order);
+  if (options.linear_relative_tolerance > 0.0)
+    request.numerical_policy.linear_relative_tolerance =
+        options.linear_relative_tolerance;
+  if (options.igr_assembly_quadrature_order > 0)
+    request.numerical_policy.igr_assembly_quadrature_order =
+        options.igr_assembly_quadrature_order;
+  if (options.regularization == RegularizationKind::igr)
     request.numerical_policy.stabilization = {
         RegularizationKind::igr, 0.2, 0.8};
   return request;
@@ -1454,7 +1492,7 @@ int RunBenchmark(const Options& options)
 
   GenericEulerHdgCudaSession session;
   const EulerHdgRequest request = MakeRequest(
-      mesh, fields, options.regularization, options.order, options.engine);
+      mesh, fields, options);
   if (CudaQualificationTestAccess::InitializeBenchmarkTracePolicy(
           session, request, options.trace_policy).status !=
           HdgEulerSessionStatus::initialized ||
