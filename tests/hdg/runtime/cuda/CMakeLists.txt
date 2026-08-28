@@ -432,6 +432,26 @@ foreach(_regularization IN ITEMS conventional igr)
   endforeach()
 endforeach()
 
+# CPU/ordinary-CUDA/tensor-CUDA alignment for the same bounded IGR
+# quadrature candidate used by the CPU-only convergence registration.
+foreach(_order IN ITEMS 1 2 3)
+  math(EXPR _igr_volume_quadrature_order "2 * ${_order} + 4")
+  math(EXPR _igr_face_quadrature_order "2 * ${_order} + 2")
+  add_test(
+    NAME dg_igr_hdg_runtime_cuda_generic_euler_convergence_igr_reduced_quadrature_p${_order}_rank1
+    COMMAND dg_igr_hdg_runtime_cuda_generic_euler_convergence
+      --order ${_order} --regularization igr
+      --igr-volume-quadrature-order ${_igr_volume_quadrature_order}
+      --igr-face-quadrature-order ${_igr_face_quadrature_order})
+  set_tests_properties(
+    dg_igr_hdg_runtime_cuda_generic_euler_convergence_igr_reduced_quadrature_p${_order}_rank1
+    PROPERTIES
+      LABELS "hdg;runtime;cpu;cuda;generic-euler;convergence;spatial;backward-euler;ordinary;tensor;igr;quadrature-candidate;p${_order};alignment"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 7200)
+endforeach()
+
 # Standalone test-only performance observability for ordinary and tensor FP64
 # CUDA accepted-step lifecycles at p1-p3.  This is intentionally a build
 # target, not a CTest: its default no-export 10,816-element workload performs
