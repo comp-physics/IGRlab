@@ -1381,10 +1381,12 @@ constexpr bool CudaAccumulateIluSolveEvidence(
                 diagnostics.ilu_factor_reuses == 1 &&
                 evidence.ilu_factor_reuses <
                     std::numeric_limits<std::uint64_t>::max() &&
-                evidence.ilu_factor_age_generations ==
+                evidence.ilu_factor_age_generations <=
                     evidence.ilu_factor_reuses &&
-                diagnostics.ilu_factor_age_generations ==
-                    evidence.ilu_factor_reuses + 1);
+                diagnostics.ilu_factor_age_generations >=
+                    evidence.ilu_factor_age_generations &&
+                diagnostics.ilu_factor_age_generations <=
+                    evidence.ilu_factor_age_generations + 1);
   const bool policy_integrity = exact_policy && factor_operation_exact &&
       diagnostics.configured_preconditioner &&
       diagnostics.configured_ilu && !diagnostics.configured_diagonal;
@@ -1665,7 +1667,8 @@ bool CudaPrepareNativeRankOneIluFactor(
     double* inverse_diagonal, std::size_t inverse_diagonal_count,
     CudaIluAttemptFactorState& factor_state,
     CudaNativeIlu0FactorView& factor_view,
-    CudaSolveDiagnostics& diagnostics) noexcept;
+    CudaSolveDiagnostics& diagnostics,
+    bool same_matrix_retry = false) noexcept;
 bool CudaConfigurePersistentHypre(mfem::HypreParMatrix& matrix,
                                   mfem::HypreILU& ilu,
                                   mfem::HypreGMRES& gmres,
@@ -1729,7 +1732,8 @@ bool CudaSolveWithIluFactorPolicy(
     int krylov_dimension,
     std::uint64_t matrix_generation,
     CudaIluAttemptFactorState& factor_state,
-    CudaSolveDiagnostics& diagnostics) noexcept;
+    CudaSolveDiagnostics& diagnostics,
+    bool same_matrix_retry = false) noexcept;
 bool CudaRefreshDiagonalAndSolve(mfem::HypreParMatrix& matrix,
                                  mfem::HypreParVector& rhs,
                                  mfem::HypreParVector& solution,
@@ -1953,8 +1957,20 @@ public:
       ReportCudaSetupFailure(evidence.rank, "build-topology");
       return false;
     }
-    linear_relative_tolerance_ = config.use_generic_numerical_policy
-        ? config.numerical_policy.linear_relative_tolerance : 1.0e-13;
+    newton_correction_linear_relative_tolerance_ =
+        config.use_generic_numerical_policy
+        ? config.numerical_policy.
+              newton_correction_linear_relative_tolerance
+        : 1.0e-13;
+    final_coherent_linear_relative_tolerance_ =
+        config.use_generic_numerical_policy
+        ? config.numerical_policy.final_coherent_linear_relative_tolerance
+        : 1.0e-13;
+    true_residual_tightening_linear_relative_tolerance_ =
+        config.use_generic_numerical_policy
+        ? config.numerical_policy.
+              true_residual_tightening_linear_relative_tolerance
+        : 1.0e-13;
     true_residual_relative_tolerance_ = config.use_generic_numerical_policy
         ? config.numerical_policy.true_residual_relative_tolerance : 1.0e-10;
     maximum_linear_iterations_ = config.use_generic_numerical_policy
@@ -1967,8 +1983,21 @@ public:
               shape_.global_true_trace_count)
         : (ranks_ == 1 ? shape_.true_trace_count
                        : shape_.global_true_trace_count);
-    if (!CollectiveContinue(linear_relative_tolerance_ > 0.0 &&
-                            std::isfinite(linear_relative_tolerance_) &&
+    if (!CollectiveContinue(
+                            newton_correction_linear_relative_tolerance_ > 0.0 &&
+                            std::isfinite(
+                                newton_correction_linear_relative_tolerance_) &&
+                            final_coherent_linear_relative_tolerance_ > 0.0 &&
+                            std::isfinite(
+                                final_coherent_linear_relative_tolerance_) &&
+                            true_residual_tightening_linear_relative_tolerance_ >
+                                0.0 &&
+                            std::isfinite(
+                                true_residual_tightening_linear_relative_tolerance_) &&
+                            true_residual_tightening_linear_relative_tolerance_ <=
+                                newton_correction_linear_relative_tolerance_ &&
+                            true_residual_tightening_linear_relative_tolerance_ <=
+                                final_coherent_linear_relative_tolerance_ &&
                             true_residual_relative_tolerance_ > 0.0 &&
                             std::isfinite(true_residual_relative_tolerance_) &&
                             maximum_linear_iterations_ > 0 &&
@@ -3112,13 +3141,29 @@ public:
     const int maximum_nonlinear_updates = config.use_generic_numerical_policy
         ? config.numerical_policy.maximum_nonlinear_updates
         : (shape_.borrowed_static_boundary_policies ? 80 : 20);
-    const auto record_linear_iterations = [&](const int iterations) noexcept
+    const auto record_linear_work = [&] (
+        const generic::EulerHdgLinearSolveRole role,
+        const int iterations, const int solve_attempts,
+        const int true_residual_tightenings) noexcept
     {
-      if (iterations < 0 ||
+      int& role_iterations =
+          role == generic::EulerHdgLinearSolveRole::newton_correction
+          ? result.newton_correction_linear_iterations
+          : result.final_coherent_linear_iterations;
+      if (iterations < 0 || solve_attempts < 0 ||
+          true_residual_tightenings < 0 ||
           iterations > std::numeric_limits<int>::max() -
-              result.linear_iterations)
+              result.linear_iterations ||
+          iterations > std::numeric_limits<int>::max() - role_iterations ||
+          solve_attempts > std::numeric_limits<int>::max() -
+              result.linear_solve_attempts ||
+          true_residual_tightenings > std::numeric_limits<int>::max() -
+              result.true_residual_tightenings)
         return false;
       result.linear_iterations += iterations;
+      role_iterations += iterations;
+      result.linear_solve_attempts += solve_attempts;
+      result.true_residual_tightenings += true_residual_tightenings;
       return true;
     };
     const auto record_line_search_trial = [&]() noexcept
@@ -3189,10 +3234,15 @@ public:
         return result;
       }
       int solve_iterations = 0;
+      int solve_attempts = 0;
+      int true_residual_tightenings = 0;
       const bool solve_ok = SolveTrueSystem(
+          generic::EulerHdgLinearSolveRole::newton_correction,
           result.true_relative_residual, generation, solve_iterations,
-          result.tensor_core);
-      const bool solve_accounted = record_linear_iterations(solve_iterations);
+          solve_attempts, true_residual_tightenings, result.tensor_core);
+      const bool solve_accounted = record_linear_work(
+          generic::EulerHdgLinearSolveRole::newton_correction,
+          solve_iterations, solve_attempts, true_residual_tightenings);
       if (!CollectiveContinue(solve_ok && solve_accounted))
       {
         result.reason = FailureReason::true_residual_gate;
@@ -3348,11 +3398,18 @@ public:
       return result;
     }
     int coherent_solve_iterations = 0;
+    int coherent_solve_attempts = 0;
+    int coherent_true_residual_tightenings = 0;
     const bool coherent_solve_ok = SolveTrueSystem(
+        generic::EulerHdgLinearSolveRole::final_coherent,
         result.true_relative_residual, last_product_generation,
-        coherent_solve_iterations, result.tensor_core);
+        coherent_solve_iterations, coherent_solve_attempts,
+        coherent_true_residual_tightenings, result.tensor_core);
     const bool coherent_solve_accounted =
-        record_linear_iterations(coherent_solve_iterations);
+        record_linear_work(generic::EulerHdgLinearSolveRole::final_coherent,
+                           coherent_solve_iterations,
+                           coherent_solve_attempts,
+                           coherent_true_residual_tightenings);
     if (!CollectiveContinue(
             coherent_solve_ok && coherent_solve_accounted))
     {
@@ -3452,19 +3509,26 @@ public:
         accepted_allocation_events_ = current_allocation_events;
       allocation_plateau_sampled_ = true;
     }
-    const std::uint64_t completed_trace_solves =
-        static_cast<std::uint64_t>(result.trace_solves);
+    const std::uint64_t completed_linear_solve_attempts =
+        static_cast<std::uint64_t>(result.linear_solve_attempts);
+    const bool linear_work_accounting_complete =
+        result.linear_iterations ==
+            result.newton_correction_linear_iterations +
+                result.final_coherent_linear_iterations &&
+        result.linear_solve_attempts ==
+            result.trace_solves + result.true_residual_tightenings;
     result.tensor_core.trace_solver_accounting_complete =
         result.tensor_core.trace_solver_accounting_complete &&
+        linear_work_accounting_complete &&
         ((trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64 &&
           result.tensor_core.native_rank1_trace_solve_calls ==
-              completed_trace_solves &&
+              completed_linear_solve_attempts &&
           result.tensor_core.hypre_trace_solve_calls == 0) ||
          ((trace_solver_kind_ == CudaTraceSolverKind::hypre_parcsr_gmres ||
            trace_solver_kind_ ==
                CudaTraceSolverKind::hypre_host_staged_rank2) &&
           result.tensor_core.hypre_trace_solve_calls ==
-              completed_trace_solves &&
+              completed_linear_solve_attempts &&
           result.tensor_core.native_rank1_trace_solve_calls == 0));
     result.telemetry = DeviceResident() && NoFallback() &&
         result.tensor_core.trace_solver_accounting_complete &&
@@ -4496,10 +4560,20 @@ private:
   bool LaunchAndObserveNativeRankOneTraceSolve(
       const CudaNativeIlu0FactorView& factor,
       std::uint64_t matrix_generation,
+      double requested_relative_tolerance,
       CudaSolveDiagnostics& diagnostics) noexcept;
-  bool SolveTrueSystem(double& true_relative_residual,
+  bool SolveTrueSystemAttempt(double& true_relative_residual,
+                       std::uint64_t matrix_generation,
+                       double requested_relative_tolerance,
+                       bool same_matrix_retry,
+                       int& linear_iterations,
+                       CudaTensorCoreEvidence& tensor_core_evidence) noexcept;
+  bool SolveTrueSystem(generic::EulerHdgLinearSolveRole role,
+                       double& true_relative_residual,
                        std::uint64_t matrix_generation,
                        int& linear_iterations,
+                       int& linear_solve_attempts,
+                       int& true_residual_tightenings,
                        CudaTensorCoreEvidence& tensor_core_evidence) noexcept;
   bool AssembleAndNorm(state_slot& workspace, double dt,
                        double& norm) noexcept;
@@ -4611,7 +4685,9 @@ private:
   double local_hmin_ = std::numeric_limits<double>::infinity();
   std::array<double, 2> host_cfl_scalars_{{0.0, 0.0}};
   bool allocation_plateau_sampled_ = false;
-  double linear_relative_tolerance_ = 1.0e-13;
+  double newton_correction_linear_relative_tolerance_ = 1.0e-13;
+  double final_coherent_linear_relative_tolerance_ = 1.0e-13;
+  double true_residual_tightening_linear_relative_tolerance_ = 1.0e-13;
   double true_residual_relative_tolerance_ = 1.0e-10;
   int maximum_linear_iterations_ = 400;
   int krylov_dimension_ = 20;

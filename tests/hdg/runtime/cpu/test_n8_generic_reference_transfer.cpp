@@ -89,7 +89,9 @@ generic::EulerHdgRequest MakeRequest(
   policy.maximum_linear_iterations = sc25::persistent_trace_maximum_iterations;
   policy.maximum_line_search_trials = sc25::persistent_line_search_trials;
   policy.nonlinear_relative_tolerance = 1.0e-12;
-  policy.linear_relative_tolerance = 1.0e-12;
+  policy.newton_correction_linear_relative_tolerance = 1.0e-12;
+  policy.final_coherent_linear_relative_tolerance = 1.0e-12;
+  policy.true_residual_tightening_linear_relative_tolerance = 1.0e-12;
   policy.true_residual_relative_tolerance = 1.0e-12;
   policy.conservation_relative_tolerance = 1.0e-10;
   policy.armijo_constant = 1.0e-4;

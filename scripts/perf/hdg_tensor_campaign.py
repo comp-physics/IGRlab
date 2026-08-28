@@ -957,14 +957,14 @@ def checked_uint64(value: Any, field: str) -> int:
 
 
 def _ilu_derived_bounds_are_valid(
-        outer_iterations: int, trace_solves: int,
+        outer_iterations: int, linear_solve_attempts: int,
         krylov_restart_dimension: int,
         configured_iterations: int,
         callback_lower: int, callback_upper: int,
         inner_lower: int, inner_upper: int) -> bool:
     """Validate the pinned-GMRES derived bounds without uint64 overflow."""
     values = (
-        outer_iterations, trace_solves, krylov_restart_dimension,
+        outer_iterations, linear_solve_attempts, krylov_restart_dimension,
         callback_lower, callback_upper,
         inner_lower, inner_upper,
     )
@@ -974,7 +974,7 @@ def _ilu_derived_bounds_are_valid(
     if outer_iterations == 0:
         return not any((callback_lower, callback_upper,
                         inner_lower, inner_upper))
-    if trace_solves == 0 or outer_iterations > UINT64_MAX // 2 or \
+    if linear_solve_attempts == 0 or outer_iterations > UINT64_MAX // 2 or \
             callback_lower <= outer_iterations or \
             callback_upper != 2 * outer_iterations:
         return False
@@ -982,7 +982,9 @@ def _ilu_derived_bounds_are_valid(
     # whether the aggregate restart-cycle count is feasible without retaining
     # the per-solve iteration partition (which would be event history).
     restart_cycles = callback_lower - outer_iterations
-    positive_solves = min(trace_solves, outer_iterations, restart_cycles)
+    positive_solves = min(
+        linear_solve_attempts, outer_iterations, restart_cycles
+    )
     if positive_solves == 0 or \
             restart_cycles > UINT64_MAX // krylov_restart_dimension:
         return False
@@ -1030,18 +1032,21 @@ def _ilu_jacobi_factor_spmv_bounds_are_valid(
 
 
 def _ilu_factor_accounting_is_valid(
-        trace_solves: int, policy: str, factor_setups: int,
+        trace_solves: int, linear_solve_attempts: int, policy: str,
+        factor_setups: int,
         factor_reuses: int, maximum_factor_age: int) -> bool:
     """Validate aggregate counts for the typed factor-lifetime policy."""
-    if trace_solves <= 0:
+    if trace_solves <= 0 or linear_solve_attempts < trace_solves:
         return False
     if policy == "not_applicable":
         return not any((factor_setups, factor_reuses, maximum_factor_age))
     if policy == "refresh_each_trace_solve":
-        return factor_setups == trace_solves and factor_reuses == 0 and \
+        return factor_setups == linear_solve_attempts and \
+            factor_reuses == 0 and \
             maximum_factor_age == 0
     if policy == "first_trace_solve_per_attempt":
-        return factor_setups == 1 and factor_reuses == trace_solves - 1 and \
+        return factor_setups == 1 and \
+            factor_reuses == linear_solve_attempts - 1 and \
             maximum_factor_age == trace_solves - 1
     return False
 
@@ -1122,6 +1127,10 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str,
             "nonlinear_updates",
             "trace_solves",
             "linear_iterations",
+            "linear_solve_attempts",
+            "newton_correction_linear_iterations",
+            "final_coherent_linear_iterations",
+            "true_residual_tightenings",
             "line_search_trials",
             "rejected_line_search_trials",
             "iterative_refinement_steps",
@@ -1132,6 +1141,12 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str,
     checked_int(sample.get("attempt_sequence"), "samples.attempt_sequence", 1)
     if work["trace_solves"] <= 0:
         raise CampaignError("accepted sample reported no true-trace solve")
+    if work["linear_iterations"] != \
+            work["newton_correction_linear_iterations"] + \
+            work["final_coherent_linear_iterations"] or \
+            work["linear_solve_attempts"] != \
+            work["trace_solves"] + work["true_residual_tightenings"]:
+        raise CampaignError("role-specific linear work accounting is invalid")
     if work["rejected_line_search_trials"] > work["line_search_trials"]:
         raise CampaignError("rejected line-search work exceeds total trials")
     if any(work[field] != 0 for field in (
@@ -1198,8 +1213,10 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str,
             tensor.get("hypre_host_staged_rank2_trace_solver_configured") \
             is not False or \
             tensor.get("trace_solver_accounting_complete") is not True or \
-            native_trace_solves != (work["trace_solves"] if expected_native else 0) or \
-            hypre_trace_solves != (0 if expected_native else work["trace_solves"]):
+            native_trace_solves != (work["linear_solve_attempts"]
+                                     if expected_native else 0) or \
+            hypre_trace_solves != (0 if expected_native
+                                   else work["linear_solve_attempts"]):
         raise CampaignError(
             "sample recurring trace-solver accounting does not match the "
             f"rank-one {engine!r} engine contract"
@@ -1297,17 +1314,19 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str,
         raise CampaignError("sample ILU accounting contract is incomplete")
     if ilu_iterations == 0:
         if not _ilu_factor_accounting_is_valid(
-                work["trace_solves"], expected_factor_reuse,
+                work["trace_solves"], work["linear_solve_attempts"],
+                expected_factor_reuse,
                 factor_setups, factor_reuses, factor_age) or \
                 any((callback_lower, callback_upper,
                      inner_lower, inner_upper,
                      jacobi_update_lower, jacobi_update_upper)):
             raise CampaignError("non-ILU sample reported ILU work")
     elif not _ilu_factor_accounting_is_valid(
-            work["trace_solves"], expected_factor_reuse,
+            work["trace_solves"], work["linear_solve_attempts"],
+            expected_factor_reuse,
             factor_setups, factor_reuses, factor_age) or \
             not _ilu_derived_bounds_are_valid(
-                work["linear_iterations"], work["trace_solves"],
+                work["linear_iterations"], work["linear_solve_attempts"],
                 krylov_restart_dimension,
                 ilu_iterations,
                 callback_lower, callback_upper, inner_lower, inner_upper
@@ -1548,7 +1567,9 @@ def validate_final_policy(record: dict[str, Any], *, mode: str,
             )
     expected_reals = {
         "nonlinear_relative_tolerance": 1.0e-10,
-        "linear_relative_tolerance": 1.0e-12,
+        "newton_correction_linear_relative_tolerance": 1.0e-12,
+        "final_coherent_linear_relative_tolerance": 1.0e-12,
+        "true_residual_tightening_linear_relative_tolerance": 1.0e-12,
         "true_residual_relative_tolerance": 1.0e-10,
         "conservation_relative_tolerance": 1.0e-10,
         "armijo_constant": 1.0e-4,
@@ -1893,6 +1914,14 @@ def summarized_sample_work(sample: dict[str, Any], *, schema: int) -> dict[str, 
         "attempt_sequence": sample["attempt_sequence"],
         "retry_index": sample["retry_index"],
         "device_ticket_count": sample["device_ticket_count"],
+        "linear_solve_attempts": sample["linear_solve_attempts"],
+        "newton_correction_linear_iterations": sample[
+            "newton_correction_linear_iterations"
+        ],
+        "final_coherent_linear_iterations": sample[
+            "final_coherent_linear_iterations"
+        ],
+        "true_residual_tightenings": sample["true_residual_tightenings"],
         "iterative_refinement_steps": sample["iterative_refinement_steps"],
         "residual_replacements": sample["residual_replacements"],
         "precision_corrections": sample["precision_corrections"],
@@ -2076,6 +2105,10 @@ def work_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "nonlinear_updates",
         "trace_solves",
         "linear_iterations",
+        "linear_solve_attempts",
+        "newton_correction_linear_iterations",
+        "final_coherent_linear_iterations",
+        "true_residual_tightenings",
         "line_search_trials",
         "rejected_line_search_trials",
         "retry_index",

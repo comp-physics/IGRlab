@@ -1002,6 +1002,10 @@ struct CudaStepEvidence
   // Work census copied from the internal numerical result without changing
   // the public generic-session API.
   int linear_iterations = 0;
+  int linear_solve_attempts = 0;
+  int newton_correction_linear_iterations = 0;
+  int final_coherent_linear_iterations = 0;
+  int true_residual_tightenings = 0;
   int line_search_trials = 0;
   int rejected_line_search_trials = 0;
   int source_rank = -1;

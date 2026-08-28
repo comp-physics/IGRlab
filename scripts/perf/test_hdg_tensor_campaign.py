@@ -82,6 +82,8 @@ SCHEMA2_ONLY_RECORD_FIELDS = {
 }
 SCHEMA2_ONLY_SAMPLE_FIELDS = {
     "attempt_sequence", "retry_index", "device_ticket_count",
+    "linear_solve_attempts", "newton_correction_linear_iterations",
+    "final_coherent_linear_iterations", "true_residual_tightenings",
     "iterative_refinement_steps", "residual_replacements",
     "precision_corrections", "all_fp64_policy",
     "correction_accounting_complete", "product_generations", "tensor_core",
@@ -213,6 +215,10 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
         },
     }
     if not is_frozen:
+        sample["linear_solve_attempts"] = 2
+        sample["newton_correction_linear_iterations"] = 4
+        sample["final_coherent_linear_iterations"] = 3
+        sample["true_residual_tightenings"] = 0
         ilu_active = ilu_policy[3] > 0
         krylov_restart_dimension = min(
             100,
@@ -397,7 +403,9 @@ payload = {
         ),
         "maximum_line_search_trials": 13,
         "nonlinear_relative_tolerance": 1.0e-10,
-        "linear_relative_tolerance": 1.0e-12,
+        "newton_correction_linear_relative_tolerance": 1.0e-12,
+        "final_coherent_linear_relative_tolerance": 1.0e-12,
+        "true_residual_tightening_linear_relative_tolerance": 1.0e-12,
         "true_residual_relative_tolerance": 1.0e-10,
         "conservation_relative_tolerance": 1.0e-10,
         "armijo_constant": 1.0e-4,
@@ -671,28 +679,28 @@ def main() -> int:
         9, 14, 0, 8, 0, 0
     )
     assert CAMPAIGN._ilu_factor_accounting_is_valid(
-        2, "refresh_each_trace_solve", 2, 0, 0
+        2, 2, "refresh_each_trace_solve", 2, 0, 0
     )
     assert CAMPAIGN._ilu_factor_accounting_is_valid(
-        1, "first_trace_solve_per_attempt", 1, 0, 0
+        1, 1, "first_trace_solve_per_attempt", 1, 0, 0
     )
     assert CAMPAIGN._ilu_factor_accounting_is_valid(
-        2, "first_trace_solve_per_attempt", 1, 1, 1
+        2, 2, "first_trace_solve_per_attempt", 1, 1, 1
     )
     assert CAMPAIGN._ilu_factor_accounting_is_valid(
-        2, "not_applicable", 0, 0, 0
+        2, 2, "not_applicable", 0, 0, 0
     )
     assert not CAMPAIGN._ilu_factor_accounting_is_valid(
-        2, "refresh_each_trace_solve", 1, 1, 1
+        2, 2, "refresh_each_trace_solve", 1, 1, 1
     )
     assert not CAMPAIGN._ilu_factor_accounting_is_valid(
-        2, "first_trace_solve_per_attempt", 1, 1, 0
+        2, 2, "first_trace_solve_per_attempt", 1, 1, 0
     )
     assert not CAMPAIGN._ilu_factor_accounting_is_valid(
-        1, "first_trace_solve_per_attempt", 1, 0, 1
+        1, 1, "first_trace_solve_per_attempt", 1, 0, 1
     )
     assert not CAMPAIGN._ilu_factor_accounting_is_valid(
-        2, "not_applicable", 0, 1, 0
+        2, 2, "not_applicable", 0, 1, 0
     )
 
     with tempfile.TemporaryDirectory(prefix="hdg-tensor-campaign-test-") as temp:

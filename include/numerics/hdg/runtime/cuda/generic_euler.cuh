@@ -956,7 +956,12 @@ private:
         AppendConfigValue(local, cursor, complete,
                           policy.nonlinear_relative_tolerance);
         AppendConfigValue(local, cursor, complete,
-                          policy.linear_relative_tolerance);
+                          policy.newton_correction_linear_relative_tolerance);
+        AppendConfigValue(local, cursor, complete,
+                          policy.final_coherent_linear_relative_tolerance);
+        AppendConfigValue(
+            local, cursor, complete,
+            policy.true_residual_tightening_linear_relative_tolerance);
         AppendConfigValue(local, cursor, complete,
                           policy.true_residual_relative_tolerance);
         AppendConfigValue(local, cursor, complete,

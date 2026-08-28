@@ -1557,7 +1557,8 @@ bool CudaPrepareNativeRankOneIluFactor(
     const std::size_t inverse_diagonal_count,
     CudaIluAttemptFactorState& factor_state,
     CudaNativeIlu0FactorView& factor_view,
-    CudaSolveDiagnostics& diagnostics) noexcept
+    CudaSolveDiagnostics& diagnostics,
+    const bool same_matrix_retry) noexcept
 {
   CudaTrueSystemDiagnosticScope diagnostic("native-ilu-factor",
                                            matrix_generation);
@@ -1651,7 +1652,9 @@ bool CudaPrepareNativeRankOneIluFactor(
       : factor_state.factor_ready &&
           factor_state.factor_generation <=
               factor_state.last_solve_generation &&
-          matrix_generation > factor_state.last_solve_generation;
+          (same_matrix_retry
+               ? matrix_generation == factor_state.last_solve_generation
+               : matrix_generation > factor_state.last_solve_generation);
   if (!generation_ready) return false;
 
   bool setup_ready = true;
@@ -1828,7 +1831,8 @@ bool CudaSolveWithIluFactorPolicy(
     const int krylov_dimension,
     const std::uint64_t matrix_generation,
     CudaIluAttemptFactorState& factor_state,
-    CudaSolveDiagnostics& diagnostics) noexcept
+    CudaSolveDiagnostics& diagnostics,
+    const bool same_matrix_retry) noexcept
 {
   CudaTrueSystemDiagnosticScope diagnostic("ilu-factor-policy-solve",
                                            matrix_generation);
@@ -1880,7 +1884,9 @@ bool CudaSolveWithIluFactorPolicy(
                    factor_state.jacobi_diagonal_values_token == 0) &&
           factor_state.factor_generation <=
               factor_state.last_solve_generation &&
-          matrix_generation > factor_state.last_solve_generation
+          (same_matrix_retry
+               ? matrix_generation == factor_state.last_solve_generation
+               : matrix_generation > factor_state.last_solve_generation)
       : factor_state.hypre_matrix_token == 0 &&
           factor_state.ilu_handle_token == 0 &&
           factor_state.factor_matrix_token == 0 &&
@@ -1952,10 +1958,12 @@ bool CudaSolveWithIluFactorPolicy(
     }
     else if (policy_ready)
     {
-      // Reuse is a direct Mult on the already-set-up MFEM GMRES.  No setter,
-      // SetOperator call, callback replacement, or adaptive refresh exists on
-      // this branch.
-      policy_ready = CudaRetainedIluFactorExact(
+      // Only the role-specific GMRES stopping tolerance may change while the
+      // already-set-up factor remains live.  The exact retained-factor check
+      // below proves that no SetOperator, callback replacement, or factor
+      // refresh accompanied this bounded retune.
+      gmres.SetTol(relative_tolerance);
+      policy_ready = HYPRE_GetError() == 0 && CudaRetainedIluFactorExact(
           matrix, ilu, gmres, policy,
           relative_tolerance,
           maximum_iterations, krylov_dimension, factor_state,

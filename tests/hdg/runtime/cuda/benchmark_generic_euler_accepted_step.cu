@@ -285,7 +285,11 @@ struct Options
   int domain_periods = 1;
   int profile_measured_step = -1;
   double timestep = default_timestep;
+  // Backward-compatible common override plus role-specific policy controls.
   double linear_relative_tolerance = 0.0;
+  double newton_correction_linear_relative_tolerance = 0.0;
+  double final_coherent_linear_relative_tolerance = 0.0;
+  double true_residual_tightening_linear_relative_tolerance = 0.0;
   int igr_volume_assembly_quadrature_order = 0;
   int igr_face_assembly_quadrature_order = 0;
   std::string expected_source_revision{};
@@ -547,6 +551,42 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
       }
       continue;
     }
+    if (argument == "--newton-linear-rtol")
+    {
+      if (++index >= argc ||
+          !ParsePositiveDouble(
+              argv[index],
+              options.newton_correction_linear_relative_tolerance))
+      {
+        error = "--newton-linear-rtol requires a finite positive FP64 value";
+        return false;
+      }
+      continue;
+    }
+    if (argument == "--final-linear-rtol")
+    {
+      if (++index >= argc ||
+          !ParsePositiveDouble(
+              argv[index], options.final_coherent_linear_relative_tolerance))
+      {
+        error = "--final-linear-rtol requires a finite positive FP64 value";
+        return false;
+      }
+      continue;
+    }
+    if (argument == "--true-residual-tightening-linear-rtol")
+    {
+      if (++index >= argc ||
+          !ParsePositiveDouble(
+              argv[index],
+              options.true_residual_tightening_linear_relative_tolerance))
+      {
+        error = "--true-residual-tightening-linear-rtol requires a finite "
+                "positive FP64 value";
+        return false;
+      }
+      continue;
+    }
     if (argument == "--igr-volume-quadrature-order")
     {
       if (++index >= argc ||
@@ -685,6 +725,8 @@ void PrintUsage(const char* executable)
                " [--trace-policy engine-default|common-fast]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
+               " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
+               " [--true-residual-tightening-linear-rtol RTOL]"
                " [--igr-volume-quadrature-order Q]"
                " [--igr-face-quadrature-order Q] [--export|--no-export]"
                " [--profile-measured-step 0|1|2|3|4]\n"
@@ -693,6 +735,8 @@ void PrintUsage(const char* executable)
                " [--trace-policy engine-default|common-fast]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
+               " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
+               " [--true-residual-tightening-linear-rtol RTOL]"
                " [--igr-volume-quadrature-order Q]"
                " [--igr-face-quadrature-order Q] [--export|--no-export]"
                " [--profile-measured-step 0|1|2|3|4]\n";
@@ -791,8 +835,25 @@ EulerHdgRequest MakeRequest(const mfem::ParMesh& mesh,
   request.numerical_policy =
       dg::hdg::generic::DefaultEulerHdgNumericalPolicy(options.order);
   if (options.linear_relative_tolerance > 0.0)
-    request.numerical_policy.linear_relative_tolerance =
+  {
+    request.numerical_policy.newton_correction_linear_relative_tolerance =
         options.linear_relative_tolerance;
+    request.numerical_policy.final_coherent_linear_relative_tolerance =
+        options.linear_relative_tolerance;
+    request.numerical_policy.
+        true_residual_tightening_linear_relative_tolerance =
+            options.linear_relative_tolerance;
+  }
+  if (options.newton_correction_linear_relative_tolerance > 0.0)
+    request.numerical_policy.newton_correction_linear_relative_tolerance =
+        options.newton_correction_linear_relative_tolerance;
+  if (options.final_coherent_linear_relative_tolerance > 0.0)
+    request.numerical_policy.final_coherent_linear_relative_tolerance =
+        options.final_coherent_linear_relative_tolerance;
+  if (options.true_residual_tightening_linear_relative_tolerance > 0.0)
+    request.numerical_policy.
+        true_residual_tightening_linear_relative_tolerance =
+            options.true_residual_tightening_linear_relative_tolerance;
   if (options.igr_volume_assembly_quadrature_order > 0)
     request.numerical_policy.igr_assembly_quadrature_orders = {
         options.igr_volume_assembly_quadrature_order,
@@ -844,10 +905,11 @@ static constexpr bool IluDerivedBoundsAreConsistent(
     const std::uint64_t factor_spmv_updates_lower_bound,
     const std::uint64_t factor_spmv_updates_upper_bound,
     const int observed_linear_iterations,
-    const int observed_trace_solves) noexcept
+    const int observed_linear_solve_attempts) noexcept
 {
   if (krylov_restart_dimension == 0 || configured_iterations <= 0 ||
-      observed_linear_iterations < 0 || observed_trace_solves < 0 ||
+      observed_linear_iterations < 0 ||
+      observed_linear_solve_attempts < 0 ||
       callbacks_lower_bound > callbacks_upper_bound)
     return false;
   const std::uint64_t iterations =
@@ -863,7 +925,7 @@ static constexpr bool IluDerivedBoundsAreConsistent(
   }
   else
   {
-    if (observed_trace_solves == 0 ||
+    if (observed_linear_solve_attempts == 0 ||
         iterations > std::numeric_limits<std::uint64_t>::max()/2 ||
         callbacks_lower_bound <= iterations ||
         callbacks_upper_bound != 2*iterations)
@@ -871,13 +933,14 @@ static constexpr bool IluDerivedBoundsAreConsistent(
     // The producer derives I_s + ceil(I_s/K) for every successful trace
     // solve and then accumulates those bounds.  The ceiling is nonadditive,
     // so validate that the aggregate cycle count is feasible for some
-    // partition of I across at most `observed_trace_solves` positive solves;
+    // partition of I across at most `observed_linear_solve_attempts` positive
+    // solver invocations;
     // retaining that partition would be per-solve history.
     const std::uint64_t restart_cycles = callbacks_lower_bound-iterations;
-    const std::uint64_t trace_solves =
-        static_cast<std::uint64_t>(observed_trace_solves);
+    const std::uint64_t solve_attempts =
+        static_cast<std::uint64_t>(observed_linear_solve_attempts);
     const std::uint64_t positive_solves =
-        std::min(trace_solves, std::min(iterations, restart_cycles));
+        std::min(solve_attempts, std::min(iterations, restart_cycles));
     if (positive_solves == 0 ||
         restart_cycles >
             std::numeric_limits<std::uint64_t>::max()/
@@ -976,14 +1039,18 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
       ? 8 : 0;
   const std::uint64_t trace_solves = evidence.trace_solves >= 0
       ? static_cast<std::uint64_t>(evidence.trace_solves) : 0;
+  const std::uint64_t linear_solve_attempts =
+      evidence.linear_solve_attempts >= 0
+      ? static_cast<std::uint64_t>(evidence.linear_solve_attempts) : 0;
   const bool refresh_each_solve = expected_factor_reuse_policy ==
       CudaIluFactorReusePolicy::refresh_each_trace_solve;
   const bool first_solve_per_attempt = expected_factor_reuse_policy ==
       CudaIluFactorReusePolicy::first_trace_solve_per_attempt;
   const std::uint64_t expected_setups = refresh_each_solve
-      ? trace_solves : first_solve_per_attempt && trace_solves > 0 ? 1 : 0;
+      ? linear_solve_attempts
+      : first_solve_per_attempt && linear_solve_attempts > 0 ? 1 : 0;
   const std::uint64_t expected_reuses = first_solve_per_attempt &&
-      trace_solves > 0 ? trace_solves - 1 : 0;
+      linear_solve_attempts > 0 ? linear_solve_attempts - 1 : 0;
   const bool ilu_work_consistent = ilu_policy
       ? evidence.trace_solves >= 0 && evidence.linear_iterations >= 0 &&
             tensor.ilu_type == 0 &&
@@ -1012,7 +1079,7 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
             tensor.ilu_factor_setups == expected_setups &&
             tensor.ilu_factor_reuses == expected_reuses &&
             tensor.ilu_factor_setups + tensor.ilu_factor_reuses ==
-                trace_solves &&
+                linear_solve_attempts &&
             IluDerivedBoundsAreConsistent(
                 tensor.ilu_preconditioner_callbacks_lower_bound,
                 tensor.ilu_preconditioner_callbacks_upper_bound,
@@ -1023,8 +1090,10 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
                 expected_factor_spmv_updates_per_application,
                 tensor.ilu_jacobi_factor_spmv_updates_lower_bound,
                 tensor.ilu_jacobi_factor_spmv_updates_upper_bound,
-                evidence.linear_iterations, evidence.trace_solves) &&
-            tensor.ilu_factor_age_generations == expected_reuses
+                evidence.linear_iterations,
+                evidence.linear_solve_attempts) &&
+            tensor.ilu_factor_age_generations ==
+                (trace_solves > 0 ? trace_solves - 1 : 0)
       : tensor.ilu_type == -1 && tensor.ilu_level_of_fill == -1 &&
             tensor.ilu_local_reordering == -1 &&
             tensor.ilu_application_iterations == 0 &&
@@ -1056,9 +1125,9 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
           expected_native_solver &&
       !tensor.hypre_host_staged_rank2_trace_solver_configured &&
       tensor.native_rank1_trace_solve_calls ==
-          (expected_native_solver ? trace_solves : 0) &&
+          (expected_native_solver ? linear_solve_attempts : 0) &&
       tensor.hypre_trace_solve_calls ==
-          (expected_native_solver ? 0 : trace_solves);
+          (expected_native_solver ? 0 : linear_solve_attempts);
   const bool expected_engine =
       CudaTracePolicyDescriptorIsExact(expected_policy) &&
       tensor.selected_engine == engine &&
@@ -1083,7 +1152,17 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
       std::isfinite(observation.maximum_conservation_error) &&
       std::isfinite(observation.maximum_conservation_relative_error) &&
       evidence.nonlinear_updates >= 0 && evidence.trace_solves > 0 &&
-      evidence.linear_iterations >= 0 && evidence.line_search_trials >= 0 &&
+      evidence.linear_iterations >= 0 &&
+      evidence.linear_solve_attempts >= evidence.trace_solves &&
+      evidence.newton_correction_linear_iterations >= 0 &&
+      evidence.final_coherent_linear_iterations >= 0 &&
+      evidence.true_residual_tightenings >= 0 &&
+      evidence.linear_iterations ==
+          evidence.newton_correction_linear_iterations +
+              evidence.final_coherent_linear_iterations &&
+      evidence.linear_solve_attempts ==
+          evidence.trace_solves + evidence.true_residual_tightenings &&
+      evidence.line_search_trials >= 0 &&
       evidence.rejected_line_search_trials >= 0 && expected_engine;
 }
 
@@ -1349,6 +1428,14 @@ void PrintStep(const StepSample& sample)
             << ",\"nonlinear_updates\":" << evidence.nonlinear_updates
             << ",\"trace_solves\":" << evidence.trace_solves
             << ",\"linear_iterations\":" << evidence.linear_iterations
+            << ",\"linear_solve_attempts\":"
+            << evidence.linear_solve_attempts
+            << ",\"newton_correction_linear_iterations\":"
+            << evidence.newton_correction_linear_iterations
+            << ",\"final_coherent_linear_iterations\":"
+            << evidence.final_coherent_linear_iterations
+            << ",\"true_residual_tightenings\":"
+            << evidence.true_residual_tightenings
             << ",\"line_search_trials\":" << evidence.line_search_trials
             << ",\"rejected_line_search_trials\":"
             << evidence.rejected_line_search_trials
@@ -1777,8 +1864,15 @@ int RunBenchmark(const Options& options)
             << request.numerical_policy.maximum_line_search_trials
             << ",\"nonlinear_relative_tolerance\":"
             << request.numerical_policy.nonlinear_relative_tolerance
-            << ",\"linear_relative_tolerance\":"
-            << request.numerical_policy.linear_relative_tolerance
+            << ",\"newton_correction_linear_relative_tolerance\":"
+            << request.numerical_policy.
+                   newton_correction_linear_relative_tolerance
+            << ",\"final_coherent_linear_relative_tolerance\":"
+            << request.numerical_policy.
+                   final_coherent_linear_relative_tolerance
+            << ",\"true_residual_tightening_linear_relative_tolerance\":"
+            << request.numerical_policy.
+                   true_residual_tightening_linear_relative_tolerance
             << ",\"true_residual_relative_tolerance\":"
             << request.numerical_policy.true_residual_relative_tolerance
             << ",\"conservation_relative_tolerance\":"

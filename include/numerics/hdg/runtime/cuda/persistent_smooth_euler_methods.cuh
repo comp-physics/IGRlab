@@ -1211,7 +1211,8 @@ BuildPersistentTrueSystem() noexcept
         CudaHypreSetupState initial_setup{};
         local_objects_ready = CudaConfigurePersistentHypre(
             *true_matrix_, *ilu_, *gmres_, ranks_, trace_policy,
-            linear_relative_tolerance_, maximum_linear_iterations_,
+            final_coherent_linear_relative_tolerance_,
+            maximum_linear_iterations_,
             krylov_dimension_, 0, initial_setup) &&
             initial_setup.ConfigurationExactForGeneration(
                 0, trace_policy);
@@ -1222,7 +1223,8 @@ BuildPersistentTrueSystem() noexcept
         local_objects_ready = CudaConfigurePersistentDiagonal(
             *true_matrix_, *diagonal_, *gmres_,
             trace_policy,
-            linear_relative_tolerance_, maximum_linear_iterations_,
+            final_coherent_linear_relative_tolerance_,
+            maximum_linear_iterations_,
             krylov_dimension_, 0, initial_setup) &&
             initial_setup.ConfigurationExactForGeneration(
                 0, trace_policy);
@@ -1312,7 +1314,9 @@ BuildPersistentTrueSystem() noexcept
     }
     warm_solved = use_ilu ? native_allocator_prime_ready :
         warm_factor_ready &&
-            LaunchAndObserveNativeRankOneTraceSolve(warm_factor, 0, warm);
+            LaunchAndObserveNativeRankOneTraceSolve(
+                warm_factor, 0, final_coherent_linear_relative_tolerance_,
+                warm);
   }
   else
   {
@@ -1320,12 +1324,13 @@ BuildPersistentTrueSystem() noexcept
         ? CudaRefreshFactorAndSolve(
               *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
               ranks_, communicator_, trace_policy,
-              linear_relative_tolerance_, maximum_linear_iterations_,
+              final_coherent_linear_relative_tolerance_,
+              maximum_linear_iterations_,
               krylov_dimension_, 0, warm)
         : CudaRefreshDiagonalAndSolve(
               *true_matrix_, *hypre_rhs_, *hypre_solution_, *diagonal_,
               *gmres_, ranks_, communicator_, trace_policy,
-              linear_relative_tolerance_,
+              final_coherent_linear_relative_tolerance_,
               maximum_linear_iterations_, krylov_dimension_, 0, warm);
   }
   if (use_ilu && warm_solved && !use_native)
@@ -1440,7 +1445,9 @@ BuildPersistentTrueSystem() noexcept
                 persistent_warm_factor_state, persistent_warm_factor,
                 persistent_warm) &&
             LaunchAndObserveNativeRankOneTraceSolve(
-                persistent_warm_factor, 0, persistent_warm) &&
+                persistent_warm_factor, 0,
+                final_coherent_linear_relative_tolerance_,
+                persistent_warm) &&
             persistent_warm.device_policy &&
             persistent_warm.configured_preconditioner &&
             persistent_warm.finite &&
@@ -1492,7 +1499,8 @@ BuildPersistentTrueSystem() noexcept
         CudaHypreSetupState persistent_setup{};
         persistent_configured = CudaConfigurePersistentHypre(
             *true_matrix_, *ilu_, *gmres_, ranks_, trace_policy,
-            linear_relative_tolerance_, maximum_linear_iterations_,
+            final_coherent_linear_relative_tolerance_,
+            maximum_linear_iterations_,
             krylov_dimension_, 0, persistent_setup) &&
             persistent_setup.ConfigurationExactForGeneration(
                 0, trace_policy);
@@ -1502,7 +1510,7 @@ BuildPersistentTrueSystem() noexcept
         CudaDiagScaleSetupState persistent_setup{};
         persistent_configured = CudaConfigurePersistentDiagonal(
             *true_matrix_, *diagonal_, *gmres_, trace_policy,
-            linear_relative_tolerance_,
+            final_coherent_linear_relative_tolerance_,
             maximum_linear_iterations_, krylov_dimension_, 0,
             persistent_setup) &&
             persistent_setup.ConfigurationExactForGeneration(
@@ -2071,6 +2079,7 @@ bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 LaunchAndObserveNativeRankOneTraceSolve(
     const CudaNativeIlu0FactorView& factor,
     const std::uint64_t matrix_generation,
+    const double requested_relative_tolerance,
     CudaSolveDiagnostics& diagnostics) noexcept
 {
   if (trace_solver_kind_ != CudaTraceSolverKind::native_rank1_fp64 ||
@@ -2135,7 +2144,7 @@ LaunchAndObserveNativeRankOneTraceSolve(
   const bool launched = CudaLaunchNativeRankOneTraceSolver(
       current_matrix, view_.true_rhs_scratch, view_.true_solution,
       use_ilu, factor, native_trace_workspace_, native_trace_support_,
-      linear_relative_tolerance_, maximum_linear_iterations_,
+      requested_relative_tolerance, maximum_linear_iterations_,
       krylov_dimension_, nullptr);
   const std::size_t control_bytes =
       native_trace_requirements_.control_double_slots * sizeof(double);
@@ -2150,7 +2159,7 @@ LaunchAndObserveNativeRankOneTraceSolve(
   const bool decoded = observed && CudaDecodeNativeRankOneTraceControl(
       native_trace_host_control_.data(),
       native_trace_requirements_.control_double_slots,
-      linear_relative_tolerance_, maximum_linear_iterations_,
+      requested_relative_tolerance, maximum_linear_iterations_,
       krylov_dimension_, observation);
 
   diagnostics.matrix_generation = matrix_generation;
@@ -2171,7 +2180,7 @@ LaunchAndObserveNativeRankOneTraceSolve(
       diagnostics.configured_native_solver && factor_exact;
   diagnostics.finite = decoded && observation.finite;
   diagnostics.reported_tolerance_met = diagnostics.finite &&
-      diagnostics.reported_residual <= linear_relative_tolerance_;
+      diagnostics.reported_residual <= requested_relative_tolerance;
 
   bool native_accounting_ready = true;
   if (use_ilu)
@@ -2236,8 +2245,10 @@ LaunchAndObserveNativeRankOneTraceSolve(
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
-SolveTrueSystem(double& true_relative_residual,
+SolveTrueSystemAttempt(double& true_relative_residual,
                 const std::uint64_t matrix_generation,
+                const double requested_relative_tolerance,
+                const bool same_matrix_retry,
                 int& linear_iterations,
                 CudaTensorCoreEvidence& tensor_core_evidence) noexcept
 {
@@ -2257,14 +2268,17 @@ SolveTrueSystem(double& true_relative_residual,
             trace_policy_descriptor_, current_attempt_, matrix_generation,
             native_ilu_inverse_diagonal_,
             generic_arena_layout_.native_ilu_inverse_diagonal,
-            ilu_factor_state_, factor, diagnostics);
+            ilu_factor_state_, factor, diagnostics, same_matrix_retry);
     solved = factor_ready && LaunchAndObserveNativeRankOneTraceSolve(
-        factor, matrix_generation, diagnostics);
+        factor, matrix_generation, requested_relative_tolerance,
+        diagnostics);
     if (solved && use_ilu)
     {
       const bool state_generation_ready = ilu_factor_state_.factor_ready &&
           ilu_factor_state_.factor_generation <= matrix_generation &&
-          matrix_generation > ilu_factor_state_.last_solve_generation;
+          (same_matrix_retry
+               ? matrix_generation == ilu_factor_state_.last_solve_generation
+               : matrix_generation > ilu_factor_state_.last_solve_generation);
       if (state_generation_ready)
         ilu_factor_state_.last_solve_generation = matrix_generation;
       else
@@ -2292,7 +2306,7 @@ SolveTrueSystem(double& true_relative_residual,
         solved = attempt_ready && CudaOrdinaryRankOneRefreshFactorAndSolve(
             *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
             ranks_, communicator_, trace_policy_descriptor_,
-            linear_relative_tolerance_, maximum_linear_iterations_,
+            requested_relative_tolerance, maximum_linear_iterations_,
             krylov_dimension_, matrix_generation, diagnostics);
       }
       else
@@ -2300,9 +2314,10 @@ SolveTrueSystem(double& true_relative_residual,
         solved = CudaSolveWithIluFactorPolicy(
             *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_, *gmres_,
             ranks_, communicator_, trace_policy_descriptor_,
-            current_attempt_, linear_relative_tolerance_,
+            current_attempt_, requested_relative_tolerance,
             maximum_linear_iterations_, krylov_dimension_,
-            matrix_generation, ilu_factor_state_, diagnostics);
+            matrix_generation, ilu_factor_state_, diagnostics,
+            same_matrix_retry);
       }
     }
     else
@@ -2310,7 +2325,7 @@ SolveTrueSystem(double& true_relative_residual,
       solved = CudaRefreshDiagonalAndSolve(
           *true_matrix_, *hypre_rhs_, *hypre_solution_, *diagonal_,
           *gmres_, ranks_, communicator_, trace_policy_descriptor_,
-          linear_relative_tolerance_, maximum_linear_iterations_,
+          requested_relative_tolerance, maximum_linear_iterations_,
           krylov_dimension_, matrix_generation, diagnostics);
     }
   }
@@ -2350,7 +2365,54 @@ SolveTrueSystem(double& true_relative_residual,
       communicator_, *hypre_rhs_, *hypre_rhs_);
   true_relative_residual = std::sqrt(residual_squared) /
       std::max(std::sqrt(rhs_squared), 1.0e-300);
-  return std::isfinite(true_relative_residual) &&
+  return std::isfinite(true_relative_residual);
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+SolveTrueSystem(const generic::EulerHdgLinearSolveRole role,
+                double& true_relative_residual,
+                const std::uint64_t matrix_generation,
+                int& linear_iterations,
+                int& linear_solve_attempts,
+                int& true_residual_tightenings,
+                CudaTensorCoreEvidence& tensor_core_evidence) noexcept
+{
+  linear_iterations = 0;
+  linear_solve_attempts = 0;
+  true_residual_tightenings = 0;
+  const double requested_tolerance =
+      role == generic::EulerHdgLinearSolveRole::newton_correction
+      ? newton_correction_linear_relative_tolerance_
+      : final_coherent_linear_relative_tolerance_;
+  const auto invoke = [&](const double tolerance,
+                          const bool same_matrix_retry) noexcept
+  {
+    int invocation_iterations = 0;
+    const bool solved = SolveTrueSystemAttempt(
+        true_relative_residual, matrix_generation, tolerance,
+        same_matrix_retry, invocation_iterations, tensor_core_evidence);
+    const bool bounded = invocation_iterations >= 0 &&
+        linear_iterations <= std::numeric_limits<int>::max() -
+            invocation_iterations &&
+        linear_solve_attempts != std::numeric_limits<int>::max();
+    if (bounded)
+    {
+      linear_iterations += invocation_iterations;
+      ++linear_solve_attempts;
+    }
+    return solved && bounded;
+  };
+
+  if (!invoke(requested_tolerance, false)) return false;
+  if (true_relative_residual <= true_residual_relative_tolerance_)
+    return true;
+  const bool tighten =
+      true_residual_tightening_linear_relative_tolerance_ <
+          requested_tolerance;
+  if (!CollectiveContinue(tighten)) return false;
+  ++true_residual_tightenings;
+  return invoke(true_residual_tightening_linear_relative_tolerance_, true) &&
       true_relative_residual <= true_residual_relative_tolerance_;
 }
 

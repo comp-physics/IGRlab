@@ -4171,7 +4171,12 @@ bool CheckTensorDiagonalConvergenceWarningRollback(const int order,
   EulerHdgRequest request = MakeRequest(
       mesh, order, fields, boundary, false, RegularizationKind::none);
   request.numerical_policy.maximum_linear_iterations = 1;
-  request.numerical_policy.linear_relative_tolerance = 1.0e-30;
+  request.numerical_policy.newton_correction_linear_relative_tolerance =
+      1.0e-30;
+  request.numerical_policy.final_coherent_linear_relative_tolerance =
+      1.0e-30;
+  request.numerical_policy.
+      true_residual_tightening_linear_relative_tolerance = 1.0e-30;
   request.numerical_policy.true_residual_relative_tolerance = 1.0e-30;
   const bool admitted =
       dg::hdg::generic::ValidateEulerHdgRequest(request) ==

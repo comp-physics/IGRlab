@@ -1599,9 +1599,17 @@ bool ExactConfig(const CpuPersistentConfig& config) noexcept
           ::dg::hdg::runtime::detail::DoubleBits(cpu_nonlinear_tolerance) &&
       config.maximum_linear_iterations == cpu_maximum_linear_iterations &&
       ::dg::hdg::runtime::detail::DoubleBits(
-          config.linear_relative_tolerance) ==
+          config.newton_correction_linear_relative_tolerance) ==
           ::dg::hdg::runtime::detail::DoubleBits(
-              cpu_linear_relative_tolerance) &&
+              cpu_newton_correction_linear_relative_tolerance) &&
+      ::dg::hdg::runtime::detail::DoubleBits(
+          config.final_coherent_linear_relative_tolerance) ==
+          ::dg::hdg::runtime::detail::DoubleBits(
+              cpu_final_coherent_linear_relative_tolerance) &&
+      ::dg::hdg::runtime::detail::DoubleBits(
+          config.true_residual_tightening_linear_relative_tolerance) ==
+          ::dg::hdg::runtime::detail::DoubleBits(
+              cpu_true_residual_tightening_linear_relative_tolerance) &&
       ::dg::hdg::runtime::detail::DoubleBits(
           config.conservation_relative_tolerance) ==
           ::dg::hdg::runtime::detail::DoubleBits(
@@ -1619,9 +1627,17 @@ bool ExactConfig(const CpuPersistentConfig& config) noexcept
           ::dg::hdg::runtime::detail::DoubleBits(cpu_nonlinear_tolerance) &&
       config.maximum_linear_iterations == cpu_maximum_linear_iterations &&
       ::dg::hdg::runtime::detail::DoubleBits(
-          config.linear_relative_tolerance) ==
+          config.newton_correction_linear_relative_tolerance) ==
           ::dg::hdg::runtime::detail::DoubleBits(
-              cpu_linear_relative_tolerance) &&
+              cpu_newton_correction_linear_relative_tolerance) &&
+      ::dg::hdg::runtime::detail::DoubleBits(
+          config.final_coherent_linear_relative_tolerance) ==
+          ::dg::hdg::runtime::detail::DoubleBits(
+              cpu_final_coherent_linear_relative_tolerance) &&
+      ::dg::hdg::runtime::detail::DoubleBits(
+          config.true_residual_tightening_linear_relative_tolerance) ==
+          ::dg::hdg::runtime::detail::DoubleBits(
+              cpu_true_residual_tightening_linear_relative_tolerance) &&
       ::dg::hdg::runtime::detail::DoubleBits(
           config.conservation_relative_tolerance) ==
           ::dg::hdg::runtime::detail::DoubleBits(
@@ -1671,7 +1687,7 @@ bool ExactRankShape(const CpuPersistentConfig& config,
 
 bool ExactConfigConsensus(const CpuPersistentConfig& config) noexcept
 {
-  const std::array<std::uint64_t, 16> local{{
+  const std::array<std::uint64_t, 18> local{{
       static_cast<std::uint64_t>(config.scenario),
       static_cast<std::uint64_t>(config.polynomial_order),
       static_cast<std::uint64_t>(config.elements_per_direction),
@@ -1683,14 +1699,19 @@ bool ExactConfigConsensus(const CpuPersistentConfig& config) noexcept
       ::dg::hdg::runtime::detail::DoubleBits(config.dt),
       ::dg::hdg::runtime::detail::DoubleBits(config.armijo_constant),
       ::dg::hdg::runtime::detail::DoubleBits(config.nonlinear_tolerance),
-      ::dg::hdg::runtime::detail::DoubleBits(config.linear_relative_tolerance),
+      ::dg::hdg::runtime::detail::DoubleBits(
+          config.newton_correction_linear_relative_tolerance),
+      ::dg::hdg::runtime::detail::DoubleBits(
+          config.final_coherent_linear_relative_tolerance),
+      ::dg::hdg::runtime::detail::DoubleBits(
+          config.true_residual_tightening_linear_relative_tolerance),
       ::dg::hdg::runtime::detail::DoubleBits(config.true_residual_tolerance),
       ::dg::hdg::runtime::detail::DoubleBits(
           config.conservation_relative_tolerance),
       static_cast<std::uint64_t>(config.allow_one_retry),
       static_cast<std::uint64_t>(
           config.force_private_scientific_gate_failure)}};
-  std::array<std::uint64_t, 16> minimum{}, maximum{};
+  std::array<std::uint64_t, 18> minimum{}, maximum{};
   return MPI_Allreduce(local.data(), minimum.data(),
                        static_cast<int>(local.size()), MPI_UINT64_T, MPI_MIN,
                        MPI_COMM_WORLD) == MPI_SUCCESS &&
@@ -3472,7 +3493,7 @@ struct detail::CpuNumericsCore::Implementation
     bool solver_configuration_ready = true;
     try
     {
-      gmres->SetTol(config.linear_relative_tolerance);
+      gmres->SetTol(config.final_coherent_linear_relative_tolerance);
       gmres->SetAbsTol(0.0);
       const int global_trace_size =
           static_cast<int>(trace_space->GlobalTrueVSize());
@@ -5224,7 +5245,9 @@ struct detail::CpuNumericsCore::Implementation
   }
 
   bool SolveTrace(const std::uint64_t expected_matrix_refresh_generation,
+                  const generic::EulerHdgLinearSolveRole role,
                   double& true_relative_residual, int& iterations,
+                  int& solve_attempts, int& true_residual_tightenings,
                   StateHash& factor_hash,
                   StateHash& solution_hash,
                   std::uint64_t& factor_setup_generation,
@@ -5232,6 +5255,15 @@ struct detail::CpuNumericsCore::Implementation
   {
     factor_setup_generation = 0;
     factor_setup_current = false;
+    iterations = 0;
+    solve_attempts = 0;
+    true_residual_tightenings = 0;
+    const double requested_tolerance =
+        role == generic::EulerHdgLinearSolveRole::newton_correction
+        ? config.newton_correction_linear_relative_tolerance
+        : config.final_coherent_linear_relative_tolerance;
+    const double tightening_tolerance =
+        config.true_residual_tightening_linear_relative_tolerance;
     bool rhs_ready = true;
     try
     {
@@ -5254,7 +5286,6 @@ struct detail::CpuNumericsCore::Implementation
         std::memcpy(rhs_destination, rhs_source,
                     static_cast<std::size_t>(true_trace_rhs.Size()) *
                         sizeof(double));
-        *hypre_solution = 0.0;
       }
     }
     catch (...)
@@ -5263,32 +5294,10 @@ struct detail::CpuNumericsCore::Implementation
     }
     if (!CollectiveAll(rhs_ready)) { return false; }
 
-    bool solved = true;
-    try
-    {
-      gmres->Mult(*hypre_rhs, *hypre_solution);
-      factor_setup_generation = pending_factor_setup_generation;
-      factor_setup_current = factor_setup_generation ==
-          expected_matrix_refresh_generation;
-      gmres->GetNumIterations(iterations);
-      const int maximum_iterations =
-          generic::ResolveEulerHdgMaximumLinearIterations(
-              config.maximum_linear_iterations,
-              static_cast<int>(trace_space->GlobalTrueVSize()));
-      // A coherent zero right-hand side is already solved by the zero initial
-      // guess and HYPRE reports zero iterations.  The rebuilt true residual
-      // below remains the acceptance authority for both zero and nonzero
-      // iteration counts.
-      solved = factor_setup_current && iterations >= 0 &&
-          iterations <= maximum_iterations;
-    }
-    catch (...)
-    {
-      solved = false;
-    }
-    if (!CollectiveAll(solved)) { return false; }
-    complete_factor_setup_generation = factor_setup_generation;
-    pending_factor_setup_generation = 0;
+    factor_setup_generation = pending_factor_setup_generation;
+    factor_setup_current = factor_setup_generation ==
+        expected_matrix_refresh_generation;
+    if (!CollectiveAll(factor_setup_current)) { return false; }
 
     // This attests the exact Schur input and frozen ILU configuration only;
     // HYPRE does not expose stable factor bytes for hashing.
@@ -5298,71 +5307,106 @@ struct detail::CpuNumericsCore::Implementation
         HashDoubles(schur),
         HashBytes(factor_input_config.data(), factor_input_config.size()));
 
-    bool residual_ready = true;
-    try
+    const int maximum_iterations =
+        generic::ResolveEulerHdgMaximumLinearIterations(
+            config.maximum_linear_iterations,
+            static_cast<int>(trace_space->GlobalTrueVSize()));
+    double current_tolerance = requested_tolerance;
+    for (int invocation = 0; invocation < 2; ++invocation)
     {
-      true_matrix->Mult(*hypre_solution, *hypre_residual);
-      *hypre_residual -= *hypre_rhs;
-      residual_ready = Finite(*hypre_residual) && Finite(*hypre_rhs);
-    }
-    catch (...)
-    {
-      residual_ready = false;
-    }
-    if (!CollectiveAll(residual_ready)) { return false; }
+      int invocation_iterations = 0;
+      bool solved = true;
+      try
+      {
+        *hypre_solution = 0.0;
+        gmres->SetTol(current_tolerance);
+        gmres->Mult(*hypre_rhs, *hypre_solution);
+        gmres->GetNumIterations(invocation_iterations);
+        solved = invocation_iterations >= 0 &&
+            invocation_iterations <= maximum_iterations &&
+            iterations <= std::numeric_limits<int>::max() -
+                invocation_iterations &&
+            solve_attempts != std::numeric_limits<int>::max();
+      }
+      catch (...) { solved = false; }
+      if (solved)
+      {
+        iterations += invocation_iterations;
+        ++solve_attempts;
+      }
+      if (!CollectiveAll(solved))
+      {
+        complete_factor_setup_generation = factor_setup_generation;
+        pending_factor_setup_generation = 0;
+        return false;
+      }
 
-    double residual_squared = std::numeric_limits<double>::quiet_NaN();
-    double rhs_squared = std::numeric_limits<double>::quiet_NaN();
-    bool residual_reduced = true;
-    bool rhs_reduced = true;
-    try
-    {
-      residual_squared = mfem::InnerProduct(
-          communicator, *hypre_residual, *hypre_residual);
-    }
-    catch (...)
-    {
-      residual_reduced = false;
-    }
-    try
-    {
-      rhs_squared = mfem::InnerProduct(
-          communicator, *hypre_rhs, *hypre_rhs);
-    }
-    catch (...)
-    {
-      rhs_reduced = false;
-    }
-    bool solution_ready = residual_reduced && rhs_reduced &&
-        Finite(residual_squared) && Finite(rhs_squared) &&
-        residual_squared >= 0.0 && rhs_squared >= 0.0;
-    try
-    {
-      true_relative_residual = std::sqrt(residual_squared) /
-          std::max(std::sqrt(rhs_squared), 1.0e-300);
-      const double* solution = hypre_solution->HostRead();
-      double* increment = true_increment.HostWrite();
-      if ((!solution || !increment) && true_increment.Size() != 0)
+      bool residual_ready = true;
+      double residual_squared = std::numeric_limits<double>::quiet_NaN();
+      double rhs_squared = std::numeric_limits<double>::quiet_NaN();
+      try
       {
-        solution_ready = false;
+        true_matrix->Mult(*hypre_solution, *hypre_residual);
+        *hypre_residual -= *hypre_rhs;
+        residual_ready = Finite(*hypre_residual) && Finite(*hypre_rhs);
+        if (residual_ready)
+        {
+          residual_squared = mfem::InnerProduct(
+              communicator, *hypre_residual, *hypre_residual);
+          rhs_squared = mfem::InnerProduct(
+              communicator, *hypre_rhs, *hypre_rhs);
+          residual_ready = Finite(residual_squared) && Finite(rhs_squared) &&
+              residual_squared >= 0.0 && rhs_squared >= 0.0;
+        }
+        if (residual_ready)
+        {
+          true_relative_residual = std::sqrt(residual_squared) /
+              std::max(std::sqrt(rhs_squared), 1.0e-300);
+          residual_ready = Finite(true_relative_residual);
+        }
       }
-      if (solution_ready)
+      catch (...) { residual_ready = false; }
+      if (!CollectiveAll(residual_ready))
       {
-        std::memcpy(increment, solution,
-                    static_cast<std::size_t>(true_increment.Size()) *
-                        sizeof(double));
-        solution_hash = HashBytes(
-            solution, static_cast<std::size_t>(true_increment.Size()) *
-                          sizeof(double));
+        complete_factor_setup_generation = factor_setup_generation;
+        pending_factor_setup_generation = 0;
+        return false;
       }
-      solution_ready = solution_ready && Finite(true_relative_residual) &&
-          true_relative_residual <= config.true_residual_tolerance;
+
+      if (true_relative_residual <= config.true_residual_tolerance)
+      {
+        bool solution_ready = true;
+        try
+        {
+          const double* solution = hypre_solution->HostRead();
+          double* increment = true_increment.HostWrite();
+          if ((!solution || !increment) && true_increment.Size() != 0)
+            solution_ready = false;
+          if (solution_ready)
+          {
+            std::memcpy(increment, solution,
+                        static_cast<std::size_t>(true_increment.Size()) *
+                            sizeof(double));
+            solution_hash = HashBytes(
+                solution, static_cast<std::size_t>(true_increment.Size()) *
+                              sizeof(double));
+          }
+        }
+        catch (...) { solution_ready = false; }
+        complete_factor_setup_generation = factor_setup_generation;
+        pending_factor_setup_generation = 0;
+        return CollectiveAll(solution_ready);
+      }
+
+      const bool tighten = invocation == 0 &&
+          tightening_tolerance < requested_tolerance;
+      if (!CollectiveAll(tighten)) break;
+      current_tolerance = tightening_tolerance;
+      ++true_residual_tightenings;
     }
-    catch (...)
-    {
-      solution_ready = false;
-    }
-    return CollectiveAll(solution_ready);
+    complete_factor_setup_generation = factor_setup_generation;
+    pending_factor_setup_generation = 0;
+    return false;
   }
 
   bool Recover() noexcept
@@ -5746,8 +5790,13 @@ bool detail::CpuNumericsCore::InitializeBorrowedEuler(
   config.armijo_constant = request.numerical_policy.armijo_constant;
   config.nonlinear_tolerance =
       request.numerical_policy.nonlinear_relative_tolerance;
-  config.linear_relative_tolerance =
-      request.numerical_policy.linear_relative_tolerance;
+  config.newton_correction_linear_relative_tolerance =
+      request.numerical_policy.newton_correction_linear_relative_tolerance;
+  config.final_coherent_linear_relative_tolerance =
+      request.numerical_policy.final_coherent_linear_relative_tolerance;
+  config.true_residual_tightening_linear_relative_tolerance =
+      request.numerical_policy.
+          true_residual_tightening_linear_relative_tolerance;
   config.true_residual_tolerance =
       request.numerical_policy.true_residual_relative_tolerance;
   config.conservation_relative_tolerance =
@@ -7543,22 +7592,49 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     }
     double true_residual = 0.0;
     int linear_iterations = 0;
+    int linear_solve_attempts = 0;
+    int true_residual_tightenings = 0;
     StateHash factor_hash{}, solution_hash{};
     std::uint64_t factor_setup_generation = 0;
     bool factor_setup_current = false;
     const bool trace_solved = state.SolveTrace(
-        matrix_refresh_generation, true_residual, linear_iterations,
+        matrix_refresh_generation,
+        candidate_converged
+            ? generic::EulerHdgLinearSolveRole::final_coherent
+            : generic::EulerHdgLinearSolveRole::newton_correction,
+        true_residual, linear_iterations, linear_solve_attempts,
+        true_residual_tightenings,
         factor_hash, solution_hash, factor_setup_generation,
         factor_setup_current);
     if (factor_setup_current)
     {
       ++evidence.work.complete_factor_setups;
     }
+    const bool work_bounded = linear_iterations >= 0 &&
+        linear_solve_attempts >= 0 && true_residual_tightenings >= 0 &&
+        evidence.linear_iterations <= std::numeric_limits<int>::max() -
+            linear_iterations &&
+        evidence.linear_solve_attempts <= std::numeric_limits<int>::max() -
+            linear_solve_attempts &&
+        evidence.true_residual_tightenings <=
+            std::numeric_limits<int>::max() - true_residual_tightenings &&
+        (candidate_converged
+             ? evidence.final_coherent_linear_iterations
+             : evidence.newton_correction_linear_iterations) <=
+            std::numeric_limits<int>::max() - linear_iterations;
+    if (!state.CollectiveAll(work_bounded))
+      return fail(CpuFailurePhase::trace_solve);
+    evidence.linear_iterations += linear_iterations;
+    evidence.linear_solve_attempts += linear_solve_attempts;
+    evidence.true_residual_tightenings += true_residual_tightenings;
+    if (candidate_converged)
+      evidence.final_coherent_linear_iterations += linear_iterations;
+    else
+      evidence.newton_correction_linear_iterations += linear_iterations;
     if (!state.CollectiveAll(trace_solved && Finite(state.true_increment)))
     {
       return fail(CpuFailurePhase::trace_solve);
     }
-    evidence.linear_iterations += linear_iterations;
     maximum_true_residual = std::max(maximum_true_residual, true_residual);
     ++evidence.work.complete_trace_solves;
     state.CompletePhase();
@@ -7721,9 +7797,17 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       evidence.work.complete_factor_setups == expected_reconstructions &&
       evidence.work.accepted_newton_updates ==
           static_cast<std::uint64_t>(updates);
+  const bool linear_work_census_exact =
+      evidence.linear_iterations ==
+          evidence.newton_correction_linear_iterations +
+              evidence.final_coherent_linear_iterations &&
+      evidence.linear_solve_attempts ==
+          static_cast<int>(evidence.work.complete_trace_solves) +
+              evidence.true_residual_tightenings;
   if (!state.CollectiveAll(
           nonlinear_converged && recovered &&
-          final_reconstruction_validated && factor_setup_census_exact))
+          final_reconstruction_validated && factor_setup_census_exact &&
+          linear_work_census_exact))
   {
     return fail(CpuFailurePhase::recovery);
   }

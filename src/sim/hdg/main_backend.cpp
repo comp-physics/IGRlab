@@ -328,7 +328,11 @@ std::string CanonicalNumericalPolicy(
          << policy.maximum_line_search_trials << ';'
          << static_cast<int>(policy.stabilization.kind) << ';';
   AppendDouble(stream, policy.nonlinear_relative_tolerance);
-  AppendDouble(stream, policy.linear_relative_tolerance);
+  AppendDouble(stream,
+               policy.newton_correction_linear_relative_tolerance);
+  AppendDouble(stream, policy.final_coherent_linear_relative_tolerance);
+  AppendDouble(
+      stream, policy.true_residual_tightening_linear_relative_tolerance);
   AppendDouble(stream, policy.true_residual_relative_tolerance);
   AppendDouble(stream, policy.conservation_relative_tolerance);
   AppendDouble(stream, policy.armijo_constant);

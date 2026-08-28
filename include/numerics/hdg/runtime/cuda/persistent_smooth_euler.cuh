@@ -467,6 +467,10 @@ struct CudaNumericalResult
   // trials count every attempted alpha; rejected trials are the attempts
   // restored before the next alpha.
   int linear_iterations = 0;
+  int linear_solve_attempts = 0;
+  int newton_correction_linear_iterations = 0;
+  int final_coherent_linear_iterations = 0;
+  int true_residual_tightenings = 0;
   int line_search_trials = 0;
   int rejected_line_search_trials = 0;
 };
@@ -1535,7 +1539,12 @@ private:
         AppendConfigValue(descriptor, cursor, complete,
                           policy.nonlinear_relative_tolerance);
         AppendConfigValue(descriptor, cursor, complete,
-                          policy.linear_relative_tolerance);
+                          policy.newton_correction_linear_relative_tolerance);
+        AppendConfigValue(descriptor, cursor, complete,
+                          policy.final_coherent_linear_relative_tolerance);
+        AppendConfigValue(
+            descriptor, cursor, complete,
+            policy.true_residual_tightening_linear_relative_tolerance);
         AppendConfigValue(descriptor, cursor, complete,
                           policy.true_residual_relative_tolerance);
         AppendConfigValue(descriptor, cursor, complete,
@@ -1853,6 +1862,13 @@ private:
     evidence.nonlinear_updates = adjusted.nonlinear_updates;
     evidence.trace_solves = adjusted.trace_solves;
     evidence.linear_iterations = adjusted.linear_iterations;
+    evidence.linear_solve_attempts = adjusted.linear_solve_attempts;
+    evidence.newton_correction_linear_iterations =
+        adjusted.newton_correction_linear_iterations;
+    evidence.final_coherent_linear_iterations =
+        adjusted.final_coherent_linear_iterations;
+    evidence.true_residual_tightenings =
+        adjusted.true_residual_tightenings;
     evidence.line_search_trials = adjusted.line_search_trials;
     evidence.rejected_line_search_trials =
         adjusted.rejected_line_search_trials;
@@ -2041,6 +2057,13 @@ private:
     evidence.nonlinear_updates = numerical.nonlinear_updates;
     evidence.trace_solves = numerical.trace_solves;
     evidence.linear_iterations = numerical.linear_iterations;
+    evidence.linear_solve_attempts = numerical.linear_solve_attempts;
+    evidence.newton_correction_linear_iterations =
+        numerical.newton_correction_linear_iterations;
+    evidence.final_coherent_linear_iterations =
+        numerical.final_coherent_linear_iterations;
+    evidence.true_residual_tightenings =
+        numerical.true_residual_tightenings;
     evidence.line_search_trials = numerical.line_search_trials;
     evidence.rejected_line_search_trials =
         numerical.rejected_line_search_trials;
