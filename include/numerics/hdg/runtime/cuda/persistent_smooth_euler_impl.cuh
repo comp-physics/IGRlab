@@ -320,7 +320,8 @@ enum class CudaTraceSolverKind : unsigned char
   unconfigured,
   hypre_parcsr_gmres,
   hypre_host_staged_rank2,
-  native_rank1_fp64
+  native_rank1_fp64,
+  hypre_fgmres_mgr_rank1
 };
 
 constexpr bool IsKnownCudaTraceSolverKind(
@@ -328,19 +329,28 @@ constexpr bool IsKnownCudaTraceSolverKind(
 {
   return kind == CudaTraceSolverKind::hypre_parcsr_gmres ||
       kind == CudaTraceSolverKind::hypre_host_staged_rank2 ||
-      kind == CudaTraceSolverKind::native_rank1_fp64;
+      kind == CudaTraceSolverKind::native_rank1_fp64 ||
+      kind == CudaTraceSolverKind::hypre_fgmres_mgr_rank1;
 }
 
 constexpr CudaTraceSolverKind ResolveCudaTraceSolverKind(
     const generic::CudaEngineKind engine, const int ranks,
     const bool host_staged_rank2, const bool borrowed_topology,
     const bool borrowed_host_inputs,
-    const bool generic_numerical_policy) noexcept
+    const bool generic_numerical_policy,
+    const CudaTracePolicyKind trace_policy) noexcept
 {
   if (!generic::IsKnownCudaEngineKind(engine) ||
+      !IsKnownCudaTracePolicyKind(trace_policy) ||
       (ranks != 1 && ranks != 2) ||
       (ranks == 2 && !host_staged_rank2))
     return CudaTraceSolverKind::unconfigured;
+  if (trace_policy == CudaTracePolicyKind::equilibrated_mgr)
+    return engine == generic::CudaEngineKind::tensor_core && ranks == 1 &&
+            borrowed_topology && borrowed_host_inputs &&
+            generic_numerical_policy
+        ? CudaTraceSolverKind::hypre_fgmres_mgr_rank1
+        : CudaTraceSolverKind::unconfigured;
   if (ranks == 2)
     return CudaTraceSolverKind::hypre_host_staged_rank2;
   if (engine == generic::CudaEngineKind::tensor_core && ranks == 1 &&
@@ -437,6 +447,56 @@ struct CudaTrueMatrixDeviceView
   int diag_columns_count = 0;
   int diag_nonzeros = 0;
   int offd_nonzeros = 0;
+};
+
+inline constexpr int cuda_rank1_equilibration_passes = 2;
+inline constexpr double cuda_rank1_equilibration_minimum_scale =
+    0x1p-40;
+inline constexpr double cuda_rank1_equilibration_maximum_scale =
+    0x1p40;
+inline constexpr std::size_t cuda_rank1_equilibration_control_doubles = 4;
+
+/** One bounded observation of an FP64 two-sided equilibration build. */
+struct CudaEquilibrationObservation
+{
+  int passes = 0;
+  double minimum_left_scale = std::numeric_limits<double>::infinity();
+  double maximum_left_scale = 0.0;
+  double minimum_right_scale = std::numeric_limits<double>::infinity();
+  double maximum_right_scale = 0.0;
+  bool finite = false;
+};
+
+/**
+ * Private persistent ownership for the explicit rank-one FlexGMRES/MGR leaf.
+ * The vectors are fixed-size configuration storage required by HYPRE; the
+ * scalar generation/object identities bind one retained setup and are not a
+ * solve history. No per-iteration records are retained.
+ */
+struct CudaRankOneMgrState
+{
+  HYPRE_Solver fgmres = nullptr;
+  HYPRE_Solver mgr = nullptr;
+  HYPRE_Solver f_ilu = nullptr;
+  HYPRE_Solver coarse_amg = nullptr;
+  std::vector<HYPRE_Int> point_markers{};
+  std::array<HYPRE_Int, 1> coarse_point_counts{{1}};
+  std::array<HYPRE_Int, 1> coarse_point_indexes{{4}};
+  std::array<HYPRE_Int*, 1> coarse_point_index_levels{{nullptr}};
+  std::array<HYPRE_Int, 1> f_relax_types{{32}};
+  std::array<HYPRE_Int, 1> coarse_grid_methods{{3}};
+  std::uint64_t setup_calls = 0;
+  std::uint64_t preconditioner_applications = 0;
+  std::uint64_t pending_matrix_generation = 0;
+  std::uint64_t last_setup_matrix_generation = 0;
+  std::uintptr_t setup_matrix_token = 0;
+  std::uintptr_t setup_rhs_token = 0;
+  std::uintptr_t setup_solution_token = 0;
+  double configured_relative_tolerance =
+      std::numeric_limits<double>::infinity();
+  bool setup_generation_pending = false;
+  bool has_setup_generation = false;
+  bool configured = false;
 };
 
 /**
@@ -1153,6 +1213,7 @@ struct CudaSolveDiagnostics
   bool configured_ilu = false;
   bool configured_diagonal = false;
   bool configured_native_solver = false;
+  bool configured_mgr = false;
   bool reported_tolerance_met = false;
   bool finite = false;
   std::uint64_t matrix_generation = 0;
@@ -1185,6 +1246,11 @@ struct CudaSolveDiagnostics
   // One solve's age; the public aggregate retains only the maximum.
   std::uint64_t ilu_factor_age_generations = 0;
   bool ilu_accounting_complete = false;
+  std::uint64_t mgr_setup_calls = 0;
+  std::uint64_t mgr_preconditioner_applications = 0;
+  std::uint64_t mgr_f_ilu_setups = 0;
+  std::uint64_t mgr_f_ilu_applications = 0;
+  bool mgr_setup_reused = false;
   int iterations = 0;
   double reported_residual = std::numeric_limits<double>::infinity();
 };
@@ -1195,21 +1261,44 @@ constexpr bool CudaTraceSolveReadyForTrueResidualVerification(
 {
   const bool solver_exact = diagnostics.trace_solver ==
           CudaTraceSolverKind::native_rank1_fp64
-      ? diagnostics.configured_native_solver
-      : (diagnostics.trace_solver ==
-             CudaTraceSolverKind::hypre_parcsr_gmres ||
-         diagnostics.trace_solver ==
-             CudaTraceSolverKind::hypre_host_staged_rank2) &&
-          !diagnostics.configured_native_solver;
-  return solver_exact && diagnostics.device_policy &&
+      ? diagnostics.configured_native_solver &&
+          !diagnostics.configured_mgr
+      : diagnostics.trace_solver ==
+            CudaTraceSolverKind::hypre_fgmres_mgr_rank1
+          ? diagnostics.configured_mgr &&
+              !diagnostics.configured_native_solver
+          : (diagnostics.trace_solver ==
+                 CudaTraceSolverKind::hypre_parcsr_gmres ||
+             diagnostics.trace_solver ==
+                 CudaTraceSolverKind::hypre_host_staged_rank2) &&
+              !diagnostics.configured_native_solver &&
+              !diagnostics.configured_mgr;
+  const bool mgr_work_exact = diagnostics.trace_solver !=
+          CudaTraceSolverKind::hypre_fgmres_mgr_rank1 ||
+      (((diagnostics.mgr_setup_calls == 1 &&
+         !diagnostics.mgr_setup_reused) ||
+        (diagnostics.mgr_setup_calls == 0 &&
+         diagnostics.mgr_setup_reused)) &&
+       diagnostics.mgr_f_ilu_setups == diagnostics.mgr_setup_calls &&
+       diagnostics.mgr_f_ilu_applications ==
+           diagnostics.mgr_preconditioner_applications &&
+       (diagnostics.iterations == 0 ||
+        diagnostics.mgr_preconditioner_applications > 0));
+  const bool preconditioner_exact = diagnostics.trace_preconditioner ==
+          CudaTracePreconditionerKind::hypre_mgr_field_split
+      ? diagnostics.configured_mgr && !diagnostics.configured_ilu &&
+          !diagnostics.configured_diagonal
+      : (diagnostics.configured_ilu !=
+             diagnostics.configured_diagonal) &&
+          ((diagnostics.configured_ilu &&
+            CudaTracePreconditionerIsIlu(
+                diagnostics.trace_preconditioner)) ||
+           (diagnostics.configured_diagonal &&
+            diagnostics.trace_preconditioner ==
+                CudaTracePreconditionerKind::hypre_diag_scale));
+  return solver_exact && mgr_work_exact && diagnostics.device_policy &&
       diagnostics.configured_preconditioner &&
-      (diagnostics.configured_ilu != diagnostics.configured_diagonal) &&
-      ((diagnostics.configured_ilu &&
-        CudaTracePreconditionerIsIlu(
-            diagnostics.trace_preconditioner)) ||
-       (diagnostics.configured_diagonal &&
-        diagnostics.trace_preconditioner ==
-            CudaTracePreconditionerKind::hypre_diag_scale)) &&
+      preconditioner_exact &&
       diagnostics.iterations >= 0 && diagnostics.iterations <=
           maximum_iterations;
 }
@@ -1659,6 +1748,29 @@ bool CudaDecodeNativeRankOneTraceControl(
     double relative_tolerance, int maximum_iterations,
     int krylov_dimension,
     CudaNativeTraceSolveObservation& observation) noexcept;
+void CudaDestroyRankOneMgrState(CudaRankOneMgrState& state) noexcept;
+bool CudaConfigureRankOneMgrState(
+    CudaRankOneMgrState& state, MPI_Comm communicator, int rows,
+    int scalar_trace_dofs, double relative_tolerance,
+    int maximum_iterations, int krylov_dimension) noexcept;
+bool CudaLaunchBuildRankOneEquilibratedSystem(
+    const CudaTrueMatrixDeviceView& original,
+    const CudaTrueMatrixDeviceView& equilibrated,
+    const double* original_rhs, double* equilibrated_rhs,
+    double* left_scale, double* right_scale, double* row_norm,
+    double* column_norm, double* control, int* status, int passes,
+    cudaStream_t stream) noexcept;
+bool CudaLaunchUnscaleRankOneSolution(
+    double* solution, const double* right_scale, int rows,
+    cudaStream_t stream) noexcept;
+bool CudaSolveRankOneMgr(
+    CudaRankOneMgrState& state, mfem::HypreParMatrix& matrix,
+    mfem::HypreParVector& rhs, mfem::HypreParVector& solution,
+    const CudaTracePolicyDescriptor& policy, double relative_tolerance,
+    int maximum_iterations, int krylov_dimension,
+    std::uint64_t matrix_generation,
+    CudaSolveDiagnostics& diagnostics,
+    bool same_matrix_retry = false) noexcept;
 bool CudaPrepareNativeRankOneIluFactor(
     mfem::HypreParMatrix& matrix, mfem::HypreParVector& rhs,
     mfem::HypreParVector& solution, mfem::HypreILU& ilu,
@@ -1893,6 +2005,7 @@ public:
   CudaPersistentNumerics() noexcept = default;
   ~CudaPersistentNumerics() noexcept
   {
+    CudaDestroyRankOneMgrState(rank_one_mgr_state_);
     const CudaArenaReleasePass first = ReleaseArenas();
     const CudaArenaReleasePass second = ReleaseArenas();
     if (first.complete && (!second.complete || !second.idempotent))
@@ -2008,7 +2121,8 @@ public:
     }
     trace_solver_kind_ = ResolveCudaTraceSolverKind(
         cuda_engine_, ranks_, host_staged_rank2_, borrowed_topology_,
-        shape_.borrowed_host_inputs, config.use_generic_numerical_policy);
+        shape_.borrowed_host_inputs, config.use_generic_numerical_policy,
+        trace_policy);
     bool trace_solver_ready = IsKnownCudaTraceSolverKind(trace_solver_kind_);
     if (trace_solver_ready && trace_solver_kind_ ==
             CudaTraceSolverKind::native_rank1_fp64)
@@ -2149,9 +2263,33 @@ public:
         initialization_tensor_core_evidence_.native_rank1_trace_solve_calls;
     evidence.tensor_core.hypre_trace_solve_calls =
         initialization_tensor_core_evidence_.hypre_trace_solve_calls;
+    evidence.tensor_core.equilibration_builds =
+        initialization_tensor_core_evidence_.equilibration_builds;
+    evidence.tensor_core.equilibration_passes =
+        initialization_tensor_core_evidence_.equilibration_passes;
+    evidence.tensor_core.mgr_setup_calls =
+        initialization_tensor_core_evidence_.mgr_setup_calls;
+    evidence.tensor_core.mgr_preconditioner_applications =
+        initialization_tensor_core_evidence_.
+            mgr_preconditioner_applications;
+    evidence.tensor_core.mgr_f_ilu_setups =
+        initialization_tensor_core_evidence_.mgr_f_ilu_setups;
+    evidence.tensor_core.mgr_f_ilu_applications =
+        initialization_tensor_core_evidence_.mgr_f_ilu_applications;
+    evidence.tensor_core.minimum_left_scale =
+        initialization_tensor_core_evidence_.minimum_left_scale;
+    evidence.tensor_core.maximum_left_scale =
+        initialization_tensor_core_evidence_.maximum_left_scale;
+    evidence.tensor_core.minimum_right_scale =
+        initialization_tensor_core_evidence_.minimum_right_scale;
+    evidence.tensor_core.maximum_right_scale =
+        initialization_tensor_core_evidence_.maximum_right_scale;
     evidence.tensor_core.native_rank1_trace_solver_configured =
         initialization_tensor_core_evidence_.
             native_rank1_trace_solver_configured;
+    evidence.tensor_core.hypre_mgr_rank1_trace_solver_configured =
+        initialization_tensor_core_evidence_.
+            hypre_mgr_rank1_trace_solver_configured;
     evidence.tensor_core.
         hypre_host_staged_rank2_trace_solver_configured =
             initialization_tensor_core_evidence_.
@@ -2454,7 +2592,10 @@ public:
               static_cast<HYPRE_Solver>(*ilu_))
         : (diagonal_
               ? reinterpret_cast<std::uintptr_t>(&*diagonal_)
-              : std::uintptr_t{0});
+              : (rank_one_mgr_state_.configured
+                    ? reinterpret_cast<std::uintptr_t>(
+                          rank_one_mgr_state_.mgr)
+                    : std::uintptr_t{0}));
     value.workspace_token = reinterpret_cast<std::uintptr_t>(view_.a);
     value.interior_slot_tokens = {{committed_slot_.interior.storage_token,
                                    candidate_slot_.interior.storage_token}};
@@ -2495,7 +2636,24 @@ public:
             native_trace_requirements_.valid &&
             native_trace_support_.supported &&
             native_trace_workspace_.device_control != nullptr
-        : gmres_ &&
+        : trace_solver_kind_ ==
+                  CudaTraceSolverKind::hypre_fgmres_mgr_rank1
+            ? !gmres_ && !ilu_ && !diagonal_ &&
+                selected_preconditioner ==
+                    CudaTracePreconditionerKind::hypre_mgr_field_split &&
+                trace_preconditioner_ == selected_preconditioner &&
+                rank_one_mgr_state_.configured &&
+                rank_one_mgr_state_.fgmres != nullptr &&
+                rank_one_mgr_state_.mgr != nullptr &&
+                rank_one_mgr_state_.f_ilu != nullptr &&
+                rank_one_mgr_state_.coarse_amg != nullptr &&
+                equilibrated_true_matrix_ &&
+                hypre_equilibrated_rhs_ &&
+                std::isfinite(
+                    rank_one_mgr_state_.configured_relative_tolerance) &&
+                equilibration_left_device_ != nullptr &&
+                equilibration_right_device_ != nullptr
+            : gmres_ &&
             ((CudaTracePreconditionerIsIlu(selected_preconditioner) &&
               ilu_ && !diagonal_ && trace_preconditioner_ ==
                   selected_preconditioner) ||
@@ -2513,7 +2671,13 @@ public:
          (native_trace_workspace_.basis != nullptr &&
           native_trace_workspace_.vectors != nullptr &&
           native_trace_workspace_.reduction != nullptr &&
-          native_trace_workspace_.small != nullptr));
+          native_trace_workspace_.small != nullptr)) &&
+        (trace_solver_kind_ !=
+                 CudaTraceSolverKind::hypre_fgmres_mgr_rank1 ||
+         (equilibration_row_norm_device_ != nullptr &&
+          equilibration_column_norm_device_ != nullptr &&
+          equilibration_control_device_ != nullptr &&
+          equilibrated_rhs_device_ != nullptr));
     ReportCudaWarmLifetimeMarker(
         rank_, "reuse-persistence-predicates", "after", true);
     ReportCudaWarmLifetimeMarker(
@@ -3041,6 +3205,9 @@ public:
         trace_preconditioner_ == trace_policy_descriptor_.trace_preconditioner;
     result.tensor_core.native_rank1_trace_solver_configured =
         trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64;
+    result.tensor_core.hypre_mgr_rank1_trace_solver_configured =
+        trace_solver_kind_ ==
+            CudaTraceSolverKind::hypre_fgmres_mgr_rank1;
     result.tensor_core.
         hypre_host_staged_rank2_trace_solver_configured =
             trace_solver_kind_ ==
@@ -3511,6 +3678,8 @@ public:
     }
     const std::uint64_t completed_linear_solve_attempts =
         static_cast<std::uint64_t>(result.linear_solve_attempts);
+    const std::uint64_t completed_trace_solves =
+        static_cast<std::uint64_t>(result.trace_solves);
     const bool linear_work_accounting_complete =
         result.linear_iterations ==
             result.newton_correction_linear_iterations +
@@ -3526,10 +3695,45 @@ public:
           result.tensor_core.hypre_trace_solve_calls == 0) ||
          ((trace_solver_kind_ == CudaTraceSolverKind::hypre_parcsr_gmres ||
            trace_solver_kind_ ==
-               CudaTraceSolverKind::hypre_host_staged_rank2) &&
+               CudaTraceSolverKind::hypre_host_staged_rank2 ||
+           trace_solver_kind_ ==
+               CudaTraceSolverKind::hypre_fgmres_mgr_rank1) &&
           result.tensor_core.hypre_trace_solve_calls ==
               completed_linear_solve_attempts &&
-          result.tensor_core.native_rank1_trace_solve_calls == 0));
+          result.tensor_core.native_rank1_trace_solve_calls == 0)) &&
+        (trace_solver_kind_ ==
+                 CudaTraceSolverKind::hypre_fgmres_mgr_rank1
+             ? result.tensor_core.equilibration_builds ==
+                       completed_trace_solves &&
+                   result.tensor_core.equilibration_passes ==
+                       completed_trace_solves *
+                           static_cast<std::uint64_t>(
+                               cuda_rank1_equilibration_passes) &&
+                   result.tensor_core.mgr_setup_calls ==
+                       completed_trace_solves &&
+                   result.tensor_core.mgr_f_ilu_setups ==
+                       result.tensor_core.mgr_setup_calls &&
+                   result.tensor_core.mgr_f_ilu_applications ==
+                       result.tensor_core.
+                           mgr_preconditioner_applications &&
+                   (result.linear_iterations == 0 ||
+                    result.tensor_core.
+                            mgr_preconditioner_applications > 0) &&
+                   std::isfinite(
+                       result.tensor_core.minimum_left_scale) &&
+                   std::isfinite(
+                       result.tensor_core.maximum_left_scale) &&
+                   std::isfinite(
+                       result.tensor_core.minimum_right_scale) &&
+                   std::isfinite(
+                       result.tensor_core.maximum_right_scale)
+             : result.tensor_core.equilibration_builds == 0 &&
+                   result.tensor_core.equilibration_passes == 0 &&
+                   result.tensor_core.mgr_setup_calls == 0 &&
+                   result.tensor_core.
+                           mgr_preconditioner_applications == 0 &&
+                   result.tensor_core.mgr_f_ilu_setups == 0 &&
+                   result.tensor_core.mgr_f_ilu_applications == 0);
     result.telemetry = DeviceResident() && NoFallback() &&
         result.tensor_core.trace_solver_accounting_complete &&
         AllocatorPolicy::W8OwnedAllocationCalls() ==
@@ -4422,6 +4626,8 @@ private:
   bool BuildLocalTraceGraph() noexcept;
   bool BuildPersistentTrueSystem() noexcept;
   bool BuildSparseStagingPlan() noexcept;
+  bool BuildAndObserveRankOneEquilibratedSystem(
+      CudaEquilibrationObservation& observation) noexcept;
 
   bool AllocateArenas() noexcept
   {
@@ -4628,12 +4834,15 @@ private:
   CudaDeviceView view_{};
   CudaTrueMatrixStructure true_structure_{};
   CudaTrueMatrixDeviceView true_device_{};
+  CudaTrueMatrixDeviceView equilibrated_true_device_{};
   CudaNativeTraceWorkspaceRequirements native_trace_requirements_{};
   CudaNativeTraceCooperativeSupport native_trace_support_{};
   CudaNativeTraceWorkspaceView native_trace_workspace_{};
   double* native_ilu_inverse_diagonal_ = nullptr;
   std::array<double, native_trace_host_control_double_capacity>
       native_trace_host_control_{};
+  std::array<double, cuda_rank1_equilibration_control_doubles>
+      rank_one_equilibration_host_control_{};
   std::vector<double> host_true_diag_values_{};
   std::vector<double> host_true_offd_values_{};
   double* double_arena_ = nullptr;
@@ -4659,13 +4868,27 @@ private:
   dg::hdg::trace::DGInterfaceTraceExchangePlan exchange_plan_{};
   std::optional<mfem::SparseMatrix> local_trace_matrix_{};
   std::unique_ptr<mfem::HypreParMatrix> true_matrix_{};
+  std::unique_ptr<mfem::HypreParMatrix> equilibrated_true_matrix_{};
   std::array<std::optional<mfem::HypreParVector>, 2> trace_slots_{};
   std::optional<mfem::HypreParVector> hypre_rhs_{};
   std::optional<mfem::HypreParVector> hypre_solution_{};
   std::optional<mfem::HypreParVector> hypre_action_{};
+  std::optional<mfem::HypreParVector> hypre_equilibrated_rhs_{};
   std::optional<mfem::HypreILU> ilu_{};
   std::optional<mfem::HypreDiagScale> diagonal_{};
   std::optional<mfem::HypreGMRES> gmres_{};
+  mfem::Vector equilibration_left_{};
+  mfem::Vector equilibration_right_{};
+  mfem::Vector equilibration_row_norm_{};
+  mfem::Vector equilibration_column_norm_{};
+  mfem::Vector equilibration_control_{};
+  double* equilibration_left_device_ = nullptr;
+  double* equilibration_right_device_ = nullptr;
+  double* equilibration_row_norm_device_ = nullptr;
+  double* equilibration_column_norm_device_ = nullptr;
+  double* equilibration_control_device_ = nullptr;
+  double* equilibrated_rhs_device_ = nullptr;
+  CudaRankOneMgrState rank_one_mgr_state_{};
   CudaTracePreconditionerKind trace_preconditioner_ =
       CudaTracePreconditionerKind::unconfigured;
   CudaIluAttemptFactorState ilu_factor_state_{};

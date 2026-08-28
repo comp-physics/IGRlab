@@ -407,6 +407,11 @@ bool SelectTracePolicy(
     options.trace_policy = CudaTracePolicyKind::common_fast;
     return true;
   }
+  if (text == "equilibrated-mgr")
+  {
+    options.trace_policy = CudaTracePolicyKind::equilibrated_mgr;
+    return true;
+  }
   return false;
 }
 
@@ -418,12 +423,19 @@ const char* EngineName(const CudaEngineKind engine) noexcept
 const char* TraceSolverName(const CudaTensorCoreEvidence& evidence) noexcept
 {
   if (evidence.native_rank1_trace_solver_configured &&
+      !evidence.hypre_mgr_rank1_trace_solver_configured &&
       !evidence.hypre_host_staged_rank2_trace_solver_configured)
     return "native-rank1-fp64";
   if (!evidence.native_rank1_trace_solver_configured &&
+      !evidence.hypre_mgr_rank1_trace_solver_configured &&
       evidence.hypre_host_staged_rank2_trace_solver_configured)
     return "hypre-host-staged-rank2";
   if (!evidence.native_rank1_trace_solver_configured &&
+      evidence.hypre_mgr_rank1_trace_solver_configured &&
+      !evidence.hypre_host_staged_rank2_trace_solver_configured)
+    return "hypre-fgmres-mgr-rank1";
+  if (!evidence.native_rank1_trace_solver_configured &&
+      !evidence.hypre_mgr_rank1_trace_solver_configured &&
       !evidence.hypre_host_staged_rank2_trace_solver_configured)
     return "hypre-parcsr-gmres";
   return "invalid";
@@ -482,7 +494,8 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     {
       if (++index >= argc || !SelectTracePolicy(argv[index], options))
       {
-        error = "--trace-policy requires engine-default or common-fast";
+        error = "--trace-policy requires engine-default, common-fast, or "
+                "equilibrated-mgr";
         return false;
       }
       continue;
@@ -722,7 +735,7 @@ void PrintUsage(const char* executable)
 {
   std::cout << "Usage: " << executable
             << " [--mode conventional|igr] [--engine ordinary|tensor]"
-               " [--trace-policy engine-default|common-fast]"
+               " [--trace-policy engine-default|common-fast|equilibrated-mgr]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
@@ -732,7 +745,7 @@ void PrintUsage(const char* executable)
                " [--profile-measured-step 0|1|2|3|4]\n"
                "       " << executable
             << " [--conventional|--igr] [--engine ordinary|tensor]"
-               " [--trace-policy engine-default|common-fast]"
+               " [--trace-policy engine-default|common-fast|equilibrated-mgr]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
@@ -1117,12 +1130,39 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
             tensor.ilu_jacobi_factor_spmv_updates_upper_bound == 0 &&
             tensor.ilu_factor_age_generations == 0 &&
             tensor.ilu_accounting_complete;
+  const bool expected_mgr_solver =
+      trace_policy == CudaTracePolicyKind::equilibrated_mgr;
   const bool expected_native_solver =
-      engine == CudaEngineKind::tensor_core;
+      engine == CudaEngineKind::tensor_core && !expected_mgr_solver;
+  const bool mgr_work_consistent = expected_mgr_solver
+      ? tensor.equilibration_builds == trace_solves &&
+            tensor.equilibration_passes == 2 * trace_solves &&
+            tensor.mgr_setup_calls == trace_solves &&
+            tensor.mgr_f_ilu_setups == tensor.mgr_setup_calls &&
+            tensor.mgr_f_ilu_applications ==
+                tensor.mgr_preconditioner_applications &&
+            (evidence.linear_iterations == 0 ||
+             tensor.mgr_preconditioner_applications > 0) &&
+            std::isfinite(tensor.minimum_left_scale) &&
+            std::isfinite(tensor.maximum_left_scale) &&
+            std::isfinite(tensor.minimum_right_scale) &&
+            std::isfinite(tensor.maximum_right_scale) &&
+            tensor.minimum_left_scale > 0.0 &&
+            tensor.minimum_left_scale <= tensor.maximum_left_scale &&
+            tensor.minimum_right_scale > 0.0 &&
+            tensor.minimum_right_scale <= tensor.maximum_right_scale
+      : tensor.equilibration_builds == 0 &&
+            tensor.equilibration_passes == 0 &&
+            tensor.mgr_setup_calls == 0 &&
+            tensor.mgr_preconditioner_applications == 0 &&
+            tensor.mgr_f_ilu_setups == 0 &&
+            tensor.mgr_f_ilu_applications == 0;
   const bool trace_solver_consistent =
       tensor.trace_solver_accounting_complete &&
       tensor.native_rank1_trace_solver_configured ==
           expected_native_solver &&
+      tensor.hypre_mgr_rank1_trace_solver_configured ==
+          expected_mgr_solver &&
       !tensor.hypre_host_staged_rank2_trace_solver_configured &&
       tensor.native_rank1_trace_solve_calls ==
           (expected_native_solver ? linear_solve_attempts : 0) &&
@@ -1134,7 +1174,8 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
       tensor.trace_policy == trace_policy &&
       tensor.trace_preconditioner_configured &&
       tensor.trace_preconditioner == expected_preconditioner &&
-      ilu_work_consistent && trace_solver_consistent &&
+      ilu_work_consistent && mgr_work_consistent &&
+      trace_solver_consistent &&
       tensor.fallback_count == 0 && tensor.fallback_accounting_complete &&
       evidence.no_fallback &&
       (engine == CudaEngineKind::ordinary
@@ -1515,10 +1556,33 @@ void PrintStep(const StepSample& sample)
             << evidence.tensor_core.native_rank1_trace_solve_calls << ','
             << "\"hypre_trace_solve_calls\":"
             << evidence.tensor_core.hypre_trace_solve_calls << ','
+            << "\"equilibration_builds\":"
+            << evidence.tensor_core.equilibration_builds << ','
+            << "\"equilibration_passes\":"
+            << evidence.tensor_core.equilibration_passes << ','
+            << "\"mgr_setup_calls\":"
+            << evidence.tensor_core.mgr_setup_calls << ','
+            << "\"mgr_preconditioner_applications\":"
+            << evidence.tensor_core.mgr_preconditioner_applications << ','
+            << "\"mgr_f_ilu_setups\":"
+            << evidence.tensor_core.mgr_f_ilu_setups << ','
+            << "\"mgr_f_ilu_applications\":"
+            << evidence.tensor_core.mgr_f_ilu_applications << ','
+            << "\"minimum_left_scale\":"
+            << evidence.tensor_core.minimum_left_scale << ','
+            << "\"maximum_left_scale\":"
+            << evidence.tensor_core.maximum_left_scale << ','
+            << "\"minimum_right_scale\":"
+            << evidence.tensor_core.minimum_right_scale << ','
+            << "\"maximum_right_scale\":"
+            << evidence.tensor_core.maximum_right_scale << ','
             << "\"native_rank1_trace_solver_configured\":"
             << std::boolalpha
             << evidence.tensor_core.native_rank1_trace_solver_configured
             << ','
+            << "\"hypre_mgr_rank1_trace_solver_configured\":"
+            << evidence.tensor_core.
+                   hypre_mgr_rank1_trace_solver_configured << ','
             << "\"hypre_host_staged_rank2_trace_solver_configured\":"
             << evidence.tensor_core.
                    hypre_host_staged_rank2_trace_solver_configured << ','

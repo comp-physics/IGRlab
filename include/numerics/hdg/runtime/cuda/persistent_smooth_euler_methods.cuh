@@ -1107,9 +1107,18 @@ BuildPersistentTrueSystem() noexcept
       CudaTracePreconditionerIsIlu(selected_preconditioner);
   const bool use_native = trace_solver_kind_ ==
       CudaTraceSolverKind::native_rank1_fp64;
+  const bool use_mgr = trace_solver_kind_ ==
+      CudaTraceSolverKind::hypre_fgmres_mgr_rank1;
   if (!IsKnownCudaTraceSolverKind(trace_solver_kind_) ||
       (use_native && (ranks_ != 1 || !borrowed_topology_ ||
-                      !shape_.borrowed_host_inputs)))
+                      !shape_.borrowed_host_inputs)) ||
+      (use_mgr &&
+       (ranks_ != 1 || !borrowed_topology_ ||
+        !shape_.borrowed_host_inputs || !shape_.igr_active ||
+        selected_preconditioner !=
+            CudaTracePreconditionerKind::hypre_mgr_field_split)) ||
+      (!use_mgr && selected_preconditioner ==
+          CudaTracePreconditionerKind::hypre_mgr_field_split))
     return false;
   initialization_tensor_core_evidence_ = {};
   initialization_tensor_core_evidence_.selected_engine = cuda_engine_;
@@ -1118,6 +1127,8 @@ BuildPersistentTrueSystem() noexcept
       selected_preconditioner;
   initialization_tensor_core_evidence_.native_rank1_trace_solver_configured =
       use_native;
+  initialization_tensor_core_evidence_.
+      hypre_mgr_rank1_trace_solver_configured = use_mgr;
   initialization_tensor_core_evidence_.
       hypre_host_staged_rank2_trace_solver_configured =
           trace_solver_kind_ ==
@@ -1172,6 +1183,103 @@ BuildPersistentTrueSystem() noexcept
       }
       local_objects_ready = diagonal_first;
     }
+    if (local_objects_ready && use_mgr)
+    {
+      const int scalar_trace_dofs =
+          shape_.true_trace_count / igr_trace_components;
+      const int scalar_local_trace_dofs =
+          shape_.local_trace_count / igr_trace_components;
+      std::vector<unsigned char> true_marker_seen(
+          static_cast<std::size_t>(shape_.true_trace_count), 0);
+      bool component_ordering_exact = scalar_trace_dofs > 0 &&
+          scalar_local_trace_dofs > 0 && trace_space_ != nullptr &&
+          trace_space_->GetOrdering() == mfem::Ordering::byNODES &&
+          trace_space_->GetNDofs() == scalar_local_trace_dofs &&
+          scalar_trace_dofs * igr_trace_components ==
+              shape_.true_trace_count &&
+          scalar_local_trace_dofs * igr_trace_components ==
+              shape_.local_trace_count;
+      for (const dg::hdg::trace::TraceMapEntry& entry :
+           exchange_plan_.map.dofs.entries)
+      {
+        if (!component_ordering_exact) break;
+        const bool entry_exact = entry.local_dof >= 0 &&
+            entry.local_dof < shape_.local_trace_count &&
+            entry.local_true_dof >= 0 &&
+            entry.local_true_dof < shape_.true_trace_count &&
+            entry.ownership == dg::hdg::Ownership::owned &&
+            entry.local_dof / scalar_local_trace_dofs ==
+                entry.local_true_dof / scalar_trace_dofs;
+        if (!entry_exact)
+        {
+          component_ordering_exact = false;
+          break;
+        }
+        true_marker_seen[static_cast<std::size_t>(
+            entry.local_true_dof)] = 1;
+      }
+      component_ordering_exact = component_ordering_exact &&
+          std::find(true_marker_seen.begin(), true_marker_seen.end(), 0) ==
+              true_marker_seen.end();
+      equilibrated_true_matrix_ =
+          std::make_unique<mfem::HypreParMatrix>(*true_matrix_);
+      local_objects_ready =
+          shape_.trace_components == igr_trace_components &&
+          component_ordering_exact &&
+          scalar_trace_dofs > 0 &&
+          scalar_trace_dofs * igr_trace_components ==
+              shape_.true_trace_count &&
+          true_device_.rows == shape_.true_trace_count &&
+          true_device_.diag_columns_count == shape_.true_trace_count &&
+          true_device_.offd_nonzeros == 0 &&
+          equilibrated_true_matrix_ &&
+          CudaGetTrueMatrixDeviceView(
+              *equilibrated_true_matrix_, equilibrated_true_device_) &&
+          equilibrated_true_device_.rows == true_device_.rows &&
+          equilibrated_true_device_.diag_columns_count ==
+              true_device_.diag_columns_count &&
+          equilibrated_true_device_.diag_nonzeros ==
+              true_device_.diag_nonzeros &&
+          equilibrated_true_device_.offd_nonzeros == 0 &&
+          equilibrated_true_device_.diag_values != true_device_.diag_values;
+      if (local_objects_ready)
+      {
+        equilibration_left_.SetSize(shape_.true_trace_count);
+        equilibration_right_.SetSize(shape_.true_trace_count);
+        equilibration_row_norm_.SetSize(shape_.true_trace_count);
+        equilibration_column_norm_.SetSize(shape_.true_trace_count);
+        equilibration_control_.SetSize(
+            static_cast<int>(cuda_rank1_equilibration_control_doubles));
+        equilibration_left_.UseDevice(true);
+        equilibration_right_.UseDevice(true);
+        equilibration_row_norm_.UseDevice(true);
+        equilibration_column_norm_.UseDevice(true);
+        equilibration_control_.UseDevice(true);
+        equilibration_left_device_ = equilibration_left_.Write();
+        equilibration_right_device_ = equilibration_right_.Write();
+        equilibration_row_norm_device_ = equilibration_row_norm_.Write();
+        equilibration_column_norm_device_ =
+            equilibration_column_norm_.Write();
+        equilibration_control_device_ = equilibration_control_.Write();
+        local_objects_ready = equilibration_left_device_ != nullptr &&
+            equilibration_right_device_ != nullptr &&
+            equilibration_row_norm_device_ != nullptr &&
+            equilibration_column_norm_device_ != nullptr &&
+            equilibration_control_device_ != nullptr &&
+            CudaConfigureRankOneMgrState(
+                rank_one_mgr_state_, communicator_,
+                shape_.true_trace_count, scalar_trace_dofs,
+                final_coherent_linear_relative_tolerance_,
+                maximum_linear_iterations_,
+                krylov_dimension_);
+        for (int row = 0; local_objects_ready &&
+             row < shape_.true_trace_count; ++row)
+          local_objects_ready =
+              rank_one_mgr_state_.point_markers[
+                  static_cast<std::size_t>(row)] ==
+              static_cast<HYPRE_Int>(row / scalar_trace_dofs);
+      }
+    }
     if (local_objects_ready && oracle_capture_requested_)
     {
       local_objects_ready = true_structure_.diag_nonzeros >= 0 &&
@@ -1195,6 +1303,8 @@ BuildPersistentTrueSystem() noexcept
       hypre_rhs_.emplace(*true_matrix_);
       hypre_solution_.emplace(*true_matrix_);
       hypre_action_.emplace(*true_matrix_);
+      if (use_mgr)
+        hypre_equilibrated_rhs_.emplace(*equilibrated_true_matrix_);
       if (use_ilu)
       {
         if (use_native)
@@ -1202,9 +1312,9 @@ BuildPersistentTrueSystem() noexcept
         else
           ilu_.emplace();
       }
-      else if (!use_native)
+      else if (!use_native && !use_mgr)
         diagonal_.emplace();
-      if (!use_native)
+      if (!use_native && !use_mgr)
         gmres_.emplace(*true_matrix_);
       if (!use_native && use_ilu)
       {
@@ -1217,7 +1327,7 @@ BuildPersistentTrueSystem() noexcept
             initial_setup.ConfigurationExactForGeneration(
                 0, trace_policy);
       }
-      else if (!use_native)
+      else if (!use_native && !use_mgr)
       {
         CudaDiagScaleSetupState initial_setup{};
         local_objects_ready = CudaConfigurePersistentDiagonal(
@@ -1251,13 +1361,19 @@ BuildPersistentTrueSystem() noexcept
       hypre_rhs_->UseDevice(true);
       hypre_solution_->UseDevice(true);
       hypre_action_->UseDevice(true);
+      if (use_mgr) hypre_equilibrated_rhs_->UseDevice(true);
       hypre_rhs_->HypreReadWrite();
       hypre_solution_->HypreReadWrite();
       hypre_action_->HypreReadWrite();
+      if (use_mgr) hypre_equilibrated_rhs_->HypreReadWrite();
       view_.true_rhs_scratch =
           static_cast<mfem::Vector&>(*hypre_rhs_).ReadWrite();
       view_.true_solution =
           static_cast<mfem::Vector&>(*hypre_solution_).ReadWrite();
+      if (use_mgr)
+        equilibrated_rhs_device_ =
+            static_cast<mfem::Vector&>(
+                *hypre_equilibrated_rhs_).ReadWrite();
       owned_stage_.SetSize(shape_.true_trace_count);
       local_stage_.SetSize(shape_.local_trace_count);
     }
@@ -1318,6 +1434,47 @@ BuildPersistentTrueSystem() noexcept
                 warm_factor, 0, final_coherent_linear_relative_tolerance_,
                 warm);
   }
+  else if (use_mgr)
+  {
+    CudaEquilibrationObservation equilibration{};
+    warm_solved = BuildAndObserveRankOneEquilibratedSystem(
+                      equilibration) &&
+        CudaSolveRankOneMgr(
+            rank_one_mgr_state_, *equilibrated_true_matrix_,
+            *hypre_equilibrated_rhs_, *hypre_solution_, trace_policy,
+            final_coherent_linear_relative_tolerance_,
+            maximum_linear_iterations_,
+            krylov_dimension_, 0, warm) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+        CudaLaunchUnscaleRankOneSolution(
+            view_.true_solution, equilibration_right_device_,
+            shape_.true_trace_count, nullptr) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    if (warm_solved)
+    {
+      initialization_tensor_core_evidence_.equilibration_builds = 1;
+      initialization_tensor_core_evidence_.equilibration_passes =
+          static_cast<std::uint64_t>(equilibration.passes);
+      initialization_tensor_core_evidence_.minimum_left_scale =
+          equilibration.minimum_left_scale;
+      initialization_tensor_core_evidence_.maximum_left_scale =
+          equilibration.maximum_left_scale;
+      initialization_tensor_core_evidence_.minimum_right_scale =
+          equilibration.minimum_right_scale;
+      initialization_tensor_core_evidence_.maximum_right_scale =
+          equilibration.maximum_right_scale;
+      initialization_tensor_core_evidence_.mgr_setup_calls =
+          rank_one_mgr_state_.setup_calls;
+      initialization_tensor_core_evidence_.
+          mgr_preconditioner_applications =
+              rank_one_mgr_state_.preconditioner_applications;
+      initialization_tensor_core_evidence_.mgr_f_ilu_setups =
+          initialization_tensor_core_evidence_.mgr_setup_calls;
+      initialization_tensor_core_evidence_.mgr_f_ilu_applications =
+          initialization_tensor_core_evidence_.
+              mgr_preconditioner_applications;
+    }
+  }
   else
   {
     warm_solved = use_ilu
@@ -1350,7 +1507,8 @@ BuildPersistentTrueSystem() noexcept
           warm.configured_preconditioner && warm.finite &&
           warm.matrix_generation == 0 &&
           warm.trace_solver == trace_solver_kind_ &&
-          warm.configured_native_solver == use_native;
+          warm.configured_native_solver == use_native &&
+          warm.configured_mgr == use_mgr;
   if (!CollectiveContinue(warmed)) { return false; }
 
   bool warm_state_zeroed = false;
@@ -1358,6 +1516,8 @@ BuildPersistentTrueSystem() noexcept
   {
     *hypre_rhs_ = 0.0;
     *hypre_solution_ = 0.0;
+    *hypre_action_ = 0.0;
+    if (use_mgr) *hypre_equilibrated_rhs_ = 0.0;
     warm_state_zeroed = true;
   }
   catch (...) { warm_state_zeroed = false; }
@@ -1486,6 +1646,26 @@ BuildPersistentTrueSystem() noexcept
             TransportPolicy::Synchronize(
                 CudaTransferSite::initial_trace_upload);
       }
+    }
+    else if (use_mgr)
+    {
+      persistent_configured = !gmres_ && !ilu_ && !diagonal_ &&
+          equilibrated_true_matrix_ && hypre_equilibrated_rhs_ &&
+          rank_one_mgr_state_.configured &&
+          rank_one_mgr_state_.fgmres != nullptr &&
+          rank_one_mgr_state_.mgr != nullptr &&
+          rank_one_mgr_state_.f_ilu != nullptr &&
+          rank_one_mgr_state_.coarse_amg != nullptr &&
+          rank_one_mgr_state_.point_markers.size() ==
+              static_cast<std::size_t>(shape_.true_trace_count) &&
+          equilibration_left_device_ != nullptr &&
+          equilibration_right_device_ != nullptr &&
+          equilibration_row_norm_device_ != nullptr &&
+          equilibration_column_norm_device_ != nullptr &&
+          equilibration_control_device_ != nullptr &&
+          equilibrated_rhs_device_ != nullptr &&
+          equilibrated_true_device_.rows == shape_.true_trace_count &&
+          equilibrated_true_device_.offd_nonzeros == 0;
     }
     else
     {
@@ -1817,7 +1997,13 @@ bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 VerifyResidencyAndTicket(CudaRunEvidence&) noexcept
 {
   hypre_policy_valid_ = CudaHypreDevicePolicyValid(
-      *true_matrix_, *hypre_rhs_, *hypre_solution_);
+      *true_matrix_, *hypre_rhs_, *hypre_solution_) &&
+      (trace_solver_kind_ !=
+               CudaTraceSolverKind::hypre_fgmres_mgr_rank1 ||
+       (equilibrated_true_matrix_ && hypre_equilibrated_rhs_ &&
+        CudaHypreDevicePolicyValid(
+            *equilibrated_true_matrix_, *hypre_equilibrated_rhs_,
+            *hypre_solution_)));
   device_resident_ = double_memory_.DeviceIsValid() &&
       integer_memory_.DeviceIsValid() &&
       trace_slots_[0]->GetMemory().DeviceIsValid() &&
@@ -2076,6 +2262,120 @@ AssembleTrueSystem() noexcept
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+BuildAndObserveRankOneEquilibratedSystem(
+    CudaEquilibrationObservation& observation) noexcept
+{
+  observation = {};
+  if (trace_solver_kind_ !=
+          CudaTraceSolverKind::hypre_fgmres_mgr_rank1 ||
+      ranks_ != 1 || !shape_.igr_active || !true_matrix_ ||
+      !equilibrated_true_matrix_ || !hypre_rhs_ || !hypre_solution_ ||
+      !hypre_equilibrated_rhs_ || !rank_one_mgr_state_.configured ||
+      view_.true_rhs_scratch == nullptr ||
+      equilibrated_rhs_device_ == nullptr ||
+      equilibration_left_device_ == nullptr ||
+      equilibration_right_device_ == nullptr ||
+      equilibration_row_norm_device_ == nullptr ||
+      equilibration_column_norm_device_ == nullptr ||
+      equilibration_control_device_ == nullptr)
+    return false;
+
+  CudaTrueMatrixDeviceView original{};
+  CudaTrueMatrixDeviceView equilibrated{};
+  bool vectors_exact = false;
+  try
+  {
+    hypre_rhs_->HypreRead();
+    hypre_equilibrated_rhs_->HypreReadWrite();
+    vectors_exact = view_.true_rhs_scratch ==
+            static_cast<const mfem::Vector&>(*hypre_rhs_).Read() &&
+        equilibrated_rhs_device_ ==
+            static_cast<mfem::Vector&>(
+                *hypre_equilibrated_rhs_).ReadWrite();
+  }
+  catch (...) { vectors_exact = false; }
+  const bool matrices_exact = vectors_exact &&
+      CudaGetTrueMatrixDeviceView(*true_matrix_, original) &&
+      CudaGetTrueMatrixDeviceView(*equilibrated_true_matrix_, equilibrated) &&
+      original.rows == shape_.true_trace_count &&
+      original.rows == original.diag_columns_count &&
+      original.offd_nonzeros == 0 &&
+      original.diag_offsets == true_device_.diag_offsets &&
+      original.diag_columns == true_device_.diag_columns &&
+      original.diag_values == true_device_.diag_values &&
+      original.diag_nonzeros == true_device_.diag_nonzeros &&
+      equilibrated.rows == original.rows &&
+      equilibrated.diag_columns_count == original.diag_columns_count &&
+      equilibrated.diag_nonzeros == original.diag_nonzeros &&
+      equilibrated.offd_nonzeros == 0 &&
+      equilibrated.diag_offsets == equilibrated_true_device_.diag_offsets &&
+      equilibrated.diag_columns == equilibrated_true_device_.diag_columns &&
+      equilibrated.diag_values == equilibrated_true_device_.diag_values;
+  if (!matrices_exact) return false;
+
+  rank_one_equilibration_host_control_.fill(0.0);
+  int status = -1;
+  const bool launched = CudaLaunchBuildRankOneEquilibratedSystem(
+      original, equilibrated, view_.true_rhs_scratch,
+      equilibrated_rhs_device_, equilibration_left_device_,
+      equilibration_right_device_, equilibration_row_norm_device_,
+      equilibration_column_norm_device_, equilibration_control_device_,
+      view_.status_flag, cuda_rank1_equilibration_passes, nullptr);
+  const std::size_t control_bytes =
+      cuda_rank1_equilibration_control_doubles * sizeof(double);
+  const bool observed = launched && TransportPolicy::DeviceToHost(
+      rank_one_equilibration_host_control_.data(),
+      equilibration_control_device_, control_bytes,
+      CudaTransferCategory::scalar_diagnostic,
+      CudaTransferSite::scalar_status, control_bytes,
+      rank_one_equilibration_host_control_.size() * sizeof(double)) &&
+      TransportPolicy::DeviceToHost(
+          &status, view_.status_flag, sizeof(status),
+          CudaTransferCategory::scalar_diagnostic,
+          CudaTransferSite::scalar_status) &&
+      TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+  if (!observed || status != 0) return false;
+
+  observation.passes = cuda_rank1_equilibration_passes;
+  observation.minimum_left_scale =
+      rank_one_equilibration_host_control_[0];
+  observation.maximum_left_scale =
+      rank_one_equilibration_host_control_[1];
+  observation.minimum_right_scale =
+      rank_one_equilibration_host_control_[2];
+  observation.maximum_right_scale =
+      rank_one_equilibration_host_control_[3];
+  observation.finite =
+      std::isfinite(observation.minimum_left_scale) &&
+      std::isfinite(observation.maximum_left_scale) &&
+      std::isfinite(observation.minimum_right_scale) &&
+      std::isfinite(observation.maximum_right_scale) &&
+      observation.minimum_left_scale >=
+          cuda_rank1_equilibration_minimum_scale &&
+      observation.maximum_left_scale <=
+          cuda_rank1_equilibration_maximum_scale &&
+      observation.minimum_right_scale >=
+          cuda_rank1_equilibration_minimum_scale &&
+      observation.maximum_right_scale <=
+          cuda_rank1_equilibration_maximum_scale &&
+      observation.minimum_left_scale <=
+          observation.maximum_left_scale &&
+      observation.minimum_right_scale <=
+          observation.maximum_right_scale;
+  if (!observation.finite) return false;
+  // MGR restriction construction may have materialized transpose caches on
+  // the previous generation. Numerical values have just changed in place,
+  // so invalidate those caches before the new setup is allowed to inspect A.
+  equilibrated_true_matrix_->ResetTranspose();
+  equilibrated_true_matrix_->HypreRead();
+  hypre_equilibrated_rhs_->HypreRead();
+  return CudaHypreDevicePolicyValid(
+      *equilibrated_true_matrix_, *hypre_equilibrated_rhs_,
+      *hypre_solution_);
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 LaunchAndObserveNativeRankOneTraceSolve(
     const CudaNativeIlu0FactorView& factor,
     const std::uint64_t matrix_generation,
@@ -2283,6 +2583,88 @@ SolveTrueSystemAttempt(double& true_relative_residual,
         ilu_factor_state_.last_solve_generation = matrix_generation;
       else
         solved = false;
+    }
+  }
+  else if (trace_solver_kind_ ==
+           CudaTraceSolverKind::hypre_fgmres_mgr_rank1)
+  {
+    CudaEquilibrationObservation equilibration{};
+    const bool equilibration_ready = same_matrix_retry ||
+        BuildAndObserveRankOneEquilibratedSystem(equilibration);
+    solved = equilibration_ready &&
+        CudaSolveRankOneMgr(
+            rank_one_mgr_state_, *equilibrated_true_matrix_,
+            *hypre_equilibrated_rhs_, *hypre_solution_,
+            trace_policy_descriptor_, requested_relative_tolerance,
+            maximum_linear_iterations_, krylov_dimension_,
+            matrix_generation, diagnostics, same_matrix_retry) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+        CudaLaunchUnscaleRankOneSolution(
+            view_.true_solution, equilibration_right_device_,
+            shape_.true_trace_count, nullptr) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    const auto checked_add = [](std::uint64_t& target,
+                                const std::uint64_t value) noexcept
+    {
+      if (value > std::numeric_limits<std::uint64_t>::max() - target)
+        return false;
+      target += value;
+      return true;
+    };
+    if (solved)
+    {
+      const bool new_equilibration = !same_matrix_retry;
+      const bool first_equilibration = new_equilibration &&
+          tensor_core_evidence.equilibration_builds == 0;
+      const bool accounted =
+          (!new_equilibration ||
+           (checked_add(tensor_core_evidence.equilibration_builds, 1) &&
+            checked_add(tensor_core_evidence.equilibration_passes,
+                        static_cast<std::uint64_t>(
+                            equilibration.passes)))) &&
+          checked_add(tensor_core_evidence.mgr_setup_calls,
+                      diagnostics.mgr_setup_calls) &&
+          checked_add(
+              tensor_core_evidence.mgr_preconditioner_applications,
+              diagnostics.mgr_preconditioner_applications) &&
+          checked_add(tensor_core_evidence.mgr_f_ilu_setups,
+                      diagnostics.mgr_f_ilu_setups) &&
+          checked_add(tensor_core_evidence.mgr_f_ilu_applications,
+                      diagnostics.mgr_f_ilu_applications);
+      if (!accounted)
+      {
+        tensor_core_evidence.trace_solver_accounting_complete = false;
+        solved = false;
+      }
+      else
+      {
+        if (first_equilibration)
+        {
+          tensor_core_evidence.minimum_left_scale =
+              equilibration.minimum_left_scale;
+          tensor_core_evidence.maximum_left_scale =
+              equilibration.maximum_left_scale;
+          tensor_core_evidence.minimum_right_scale =
+              equilibration.minimum_right_scale;
+          tensor_core_evidence.maximum_right_scale =
+              equilibration.maximum_right_scale;
+        }
+        else if (new_equilibration)
+        {
+          tensor_core_evidence.minimum_left_scale = std::min(
+              tensor_core_evidence.minimum_left_scale,
+              equilibration.minimum_left_scale);
+          tensor_core_evidence.maximum_left_scale = std::max(
+              tensor_core_evidence.maximum_left_scale,
+              equilibration.maximum_left_scale);
+          tensor_core_evidence.minimum_right_scale = std::min(
+              tensor_core_evidence.minimum_right_scale,
+              equilibration.minimum_right_scale);
+          tensor_core_evidence.maximum_right_scale = std::max(
+              tensor_core_evidence.maximum_right_scale,
+              equilibration.maximum_right_scale);
+        }
+      }
     }
   }
   else if (trace_solver_kind_ == CudaTraceSolverKind::hypre_parcsr_gmres ||

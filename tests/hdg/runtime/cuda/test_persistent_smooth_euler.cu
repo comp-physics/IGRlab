@@ -75,6 +75,49 @@ constexpr bool TrueResidualAuthorityPolicy() noexcept
   const bool native_solver_is_admitted =
       dg::hdg::runtime::cuda_w8a::detail::
           CudaTraceSolveReadyForTrueResidualVerification(native, 8);
+  auto mgr = diagnostics;
+  mgr.trace_solver =
+      dg::hdg::runtime::cuda_w8a::detail::CudaTraceSolverKind::
+          hypre_fgmres_mgr_rank1;
+  mgr.configured_ilu = false;
+  mgr.configured_mgr = true;
+  mgr.trace_preconditioner =
+      CudaTracePreconditionerKind::hypre_mgr_field_split;
+  mgr.mgr_setup_calls = 1;
+  mgr.mgr_f_ilu_setups = 1;
+  const bool mgr_solver_is_admitted =
+      dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(mgr, 8);
+  auto mgr_retry = mgr;
+  mgr_retry.mgr_setup_calls = 0;
+  mgr_retry.mgr_f_ilu_setups = 0;
+  mgr_retry.mgr_setup_reused = true;
+  const bool mgr_retry_is_admitted =
+      dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(mgr_retry, 8);
+  mgr_retry.mgr_setup_reused = false;
+  const bool mgr_skipped_setup_is_rejected =
+      !dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(mgr_retry, 8);
+  mgr_retry = mgr;
+  mgr_retry.mgr_setup_reused = true;
+  const bool mgr_false_reuse_is_rejected =
+      !dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(mgr_retry, 8);
+  mgr.iterations = 1;
+  const bool mgr_zero_application_is_rejected =
+      !dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(mgr, 8);
+  mgr.mgr_preconditioner_applications = 1;
+  mgr.mgr_f_ilu_applications = 1;
+  const bool mgr_positive_application_is_admitted =
+      dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(mgr, 8);
+  mgr.iterations = 0;
+  mgr.configured_diagonal = true;
+  const bool mgr_mixed_preconditioner_is_rejected =
+      !dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(mgr, 8);
   diagnostics.configured_ilu = false;
   diagnostics.configured_diagonal = true;
   diagnostics.trace_preconditioner =
@@ -113,6 +156,11 @@ constexpr bool TrueResidualAuthorityPolicy() noexcept
   return reported_tolerance_is_not_a_gate &&
       malformed_aggregate_is_not_a_gate &&
       unconfigured_solver_is_rejected && native_solver_is_admitted &&
+      mgr_solver_is_admitted && mgr_retry_is_admitted &&
+      mgr_skipped_setup_is_rejected && mgr_false_reuse_is_rejected &&
+      mgr_zero_application_is_rejected &&
+      mgr_positive_application_is_admitted &&
+      mgr_mixed_preconditioner_is_rejected &&
       diagonal_is_valid &&
       neither_is_rejected && both_are_rejected && cap_is_inclusive &&
       negative_iteration_is_rejected && over_cap_is_rejected;
@@ -127,22 +175,40 @@ constexpr bool TraceSolverSelectionPolicy() noexcept
   using dg::hdg::runtime::cuda_w8a::detail::CudaTraceSolverKind;
   using dg::hdg::runtime::cuda_w8a::detail::ResolveCudaTraceSolverKind;
   return ResolveCudaTraceSolverKind(
-             CudaEngineKind::ordinary, 1, false, true, true, true) ==
+             CudaEngineKind::ordinary, 1, false, true, true, true,
+             CudaTracePolicyKind::engine_default) ==
           CudaTraceSolverKind::hypre_parcsr_gmres &&
       ResolveCudaTraceSolverKind(
-          CudaEngineKind::ordinary, 2, true, true, true, true) ==
+          CudaEngineKind::ordinary, 2, true, true, true, true,
+          CudaTracePolicyKind::engine_default) ==
           CudaTraceSolverKind::hypre_host_staged_rank2 &&
       ResolveCudaTraceSolverKind(
-          CudaEngineKind::tensor_core, 1, false, true, true, true) ==
+          CudaEngineKind::tensor_core, 1, false, true, true, true,
+          CudaTracePolicyKind::engine_default) ==
           CudaTraceSolverKind::native_rank1_fp64 &&
       ResolveCudaTraceSolverKind(
-          CudaEngineKind::tensor_core, 1, false, false, false, false) ==
+          CudaEngineKind::tensor_core, 1, false, false, false, false,
+          CudaTracePolicyKind::engine_default) ==
           CudaTraceSolverKind::unconfigured &&
       ResolveCudaTraceSolverKind(
-          CudaEngineKind::tensor_core, 2, true, true, true, true) ==
+          CudaEngineKind::tensor_core, 2, true, true, true, true,
+          CudaTracePolicyKind::engine_default) ==
           CudaTraceSolverKind::hypre_host_staged_rank2 &&
       ResolveCudaTraceSolverKind(
-          CudaEngineKind::tensor_core, 2, false, true, true, true) ==
+          CudaEngineKind::tensor_core, 2, false, true, true, true,
+          CudaTracePolicyKind::engine_default) ==
+          CudaTraceSolverKind::unconfigured &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 1, false, true, true, true,
+          CudaTracePolicyKind::equilibrated_mgr) ==
+          CudaTraceSolverKind::hypre_fgmres_mgr_rank1 &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::ordinary, 1, false, true, true, true,
+          CudaTracePolicyKind::equilibrated_mgr) ==
+          CudaTraceSolverKind::unconfigured &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 2, true, true, true, true,
+          CudaTracePolicyKind::equilibrated_mgr) ==
           CudaTraceSolverKind::unconfigured;
 }
 
@@ -296,6 +362,20 @@ struct NativeSolveFixtureResult
 {
   dg::hdg::runtime::cuda_w8a::detail::NativeTraceSolveControl control{};
   std::vector<double> solution{};
+};
+
+class RankOneMgrStateOwner
+{
+ public:
+  RankOneMgrStateOwner() = default;
+  RankOneMgrStateOwner(const RankOneMgrStateOwner&) = delete;
+  RankOneMgrStateOwner& operator=(const RankOneMgrStateOwner&) = delete;
+  ~RankOneMgrStateOwner()
+  {
+    dg::hdg::runtime::cuda_w8a::detail::CudaDestroyRankOneMgrState(state);
+  }
+
+  dg::hdg::runtime::cuda_w8a::detail::CudaRankOneMgrState state{};
 };
 
 NativeCsrFixture DenseToDiagonalFirstCsr(const std::vector<double>& dense,
@@ -479,6 +559,432 @@ double MaximumScaledDifference(const std::vector<double>& first,
         std::max({1.0, std::abs(first[index]), std::abs(second[index])}));
   }
   return maximum;
+}
+
+bool ValuesClose(const double first, const double second,
+                 const double multiplier = 256.0) noexcept
+{
+  return std::isfinite(first) && std::isfinite(second) &&
+      std::abs(first - second) <= multiplier *
+          std::numeric_limits<double>::epsilon() *
+          std::max({1.0, std::abs(first), std::abs(second)});
+}
+
+NativeCsrFixture MakeMgrFieldSplitMatrix(const double perturbation)
+{
+  constexpr int scalar_trace_dofs = 2;
+  constexpr int components = 5;
+  constexpr int rows = scalar_trace_dofs * components;
+  std::vector<double> dense(static_cast<std::size_t>(rows) * rows, 0.0);
+  for (int row = 0; row < rows; ++row)
+  {
+    const int component = row / scalar_trace_dofs;
+    const int scalar = row % scalar_trace_dofs;
+    dense[static_cast<std::size_t>(row) * rows + row] =
+        (2.5 + 0.4 * component + 0.2 * scalar) *
+        (1.0 + (perturbation - 1.0) * 0.04 * (row + 1));
+    for (int column = row + 1; column < rows; ++column)
+    {
+      const int column_component = column / scalar_trace_dofs;
+      const int column_scalar = column % scalar_trace_dofs;
+      double coupling = 0.0;
+      if (component == column_component)
+        coupling = -0.08;
+      else if (scalar == column_scalar &&
+               (component == components - 1 ||
+                column_component == components - 1))
+        coupling = 0.04;
+      else if (column == row + 1)
+        coupling = -0.015;
+      coupling *= 1.0 + (perturbation - 1.0) *
+          0.02 * (row + column + 1);
+      dense[static_cast<std::size_t>(row) * rows + column] = coupling;
+      dense[static_cast<std::size_t>(column) * rows + row] = coupling;
+    }
+  }
+  return DenseToDiagonalFirstCsr(dense, rows);
+}
+
+std::unique_ptr<mfem::HypreParMatrix> MakeRankOneHypreMatrix(
+    const NativeCsrFixture& fixture)
+{
+  if (!NativeCsrFixtureIsValid(fixture)) return nullptr;
+  try
+  {
+    std::vector<HYPRE_BigInt> global_columns(fixture.columns.begin(),
+                                              fixture.columns.end());
+    std::array<HYPRE_BigInt, 2> partition{{0, fixture.rows}};
+    return std::make_unique<mfem::HypreParMatrix>(
+        MPI_COMM_SELF, fixture.rows, fixture.rows, fixture.rows,
+        fixture.offsets.data(), global_columns.data(), fixture.values.data(),
+        partition.data(), partition.data());
+  }
+  catch (...) { return nullptr; }
+}
+
+bool CopyDeviceValues(const double* const source, const std::size_t count,
+                      std::vector<double>& values) noexcept
+{
+  values.assign(count, 0.0);
+  return count == 0 || (source != nullptr &&
+      cudaMemcpy(values.data(), source, count * sizeof(double),
+                 cudaMemcpyDeviceToHost) == cudaSuccess);
+}
+
+bool RankOneEquilibratedMgrFixture()
+{
+  using dg::hdg::generic::CudaEngineKind;
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  constexpr int scalar_trace_dofs = 2;
+  constexpr int rows = scalar_trace_dofs * igr_trace_components;
+  constexpr double relative_tolerance = 1.0e-12;
+  constexpr int maximum_iterations = 50;
+  constexpr int krylov_dimension = 10;
+
+  const NativeCsrFixture first_fixture = MakeMgrFieldSplitMatrix(1.0);
+  const NativeCsrFixture second_fixture = MakeMgrFieldSplitMatrix(1.125);
+  const std::vector<double> first_rhs{
+      1.0, -0.5, 0.25, 1.5, -1.0, 0.75, 2.0, -1.25, 0.5, 1.0};
+  const std::vector<double> second_rhs{
+      -0.75, 1.25, 0.5, -1.0, 1.75, 0.25, -0.5, 2.0, 1.0, -1.5};
+  if (!NativeCsrFixtureIsValid(first_fixture) ||
+      !NativeCsrFixtureIsValid(second_fixture) ||
+      first_fixture.rows != rows || second_fixture.rows != rows)
+    return false;
+
+  auto first_original = MakeRankOneHypreMatrix(first_fixture);
+  auto second_original = MakeRankOneHypreMatrix(second_fixture);
+  if (!first_original || !second_original) return false;
+  auto first_equilibrated =
+      std::make_unique<mfem::HypreParMatrix>(*first_original);
+  auto second_equilibrated =
+      std::make_unique<mfem::HypreParMatrix>(*second_original);
+  auto first_original_rhs =
+      std::make_unique<mfem::HypreParVector>(*first_original);
+  auto first_equilibrated_rhs =
+      std::make_unique<mfem::HypreParVector>(*first_equilibrated);
+  auto first_solution =
+      std::make_unique<mfem::HypreParVector>(*first_equilibrated);
+  auto second_original_rhs =
+      std::make_unique<mfem::HypreParVector>(*second_original);
+  auto second_equilibrated_rhs =
+      std::make_unique<mfem::HypreParVector>(*second_equilibrated);
+  auto second_solution =
+      std::make_unique<mfem::HypreParVector>(*second_equilibrated);
+
+  std::copy(first_rhs.begin(), first_rhs.end(),
+            first_original_rhs->HostWrite());
+  std::copy(second_rhs.begin(), second_rhs.end(),
+            second_original_rhs->HostWrite());
+  *first_equilibrated_rhs = 0.0;
+  *first_solution = 0.0;
+  *second_equilibrated_rhs = 0.0;
+  *second_solution = 0.0;
+
+  RankOneMgrStateOwner owner;
+  auto& state = owner.state;
+  const CudaTracePolicyDescriptor policy = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, true,
+      CudaTracePolicyKind::equilibrated_mgr);
+  if (!CudaTracePolicyDescriptorIsExact(policy) ||
+      !CudaConfigureRankOneMgrState(
+          state, MPI_COMM_SELF, rows, scalar_trace_dofs,
+          relative_tolerance, maximum_iterations, krylov_dimension) ||
+      !state.configured || state.fgmres == nullptr || state.mgr == nullptr ||
+      state.f_ilu == nullptr || state.coarse_amg == nullptr ||
+      state.configured_relative_tolerance != relative_tolerance ||
+      state.point_markers.size() != static_cast<std::size_t>(rows))
+    return false;
+  for (int row = 0; row < rows; ++row)
+    if (state.point_markers[static_cast<std::size_t>(row)] !=
+            row / scalar_trace_dofs)
+      return false;
+  if (state.coarse_point_counts[0] != 1 ||
+      state.coarse_point_indexes[0] != igr_trace_components - 1)
+    return false;
+  const HYPRE_Solver f_ilu_identity = state.f_ilu;
+
+  const auto run_generation = [&state, &policy](
+      mfem::HypreParMatrix& original,
+      mfem::HypreParMatrix& equilibrated,
+      mfem::HypreParVector& original_rhs,
+      mfem::HypreParVector& equilibrated_rhs,
+      mfem::HypreParVector& solution,
+      const NativeCsrFixture& fixture,
+      const std::vector<double>& expected_rhs,
+      const std::uint64_t generation,
+      CudaSolveDiagnostics& diagnostics) noexcept
+  {
+    NativeDeviceAllocation<double> left_scale;
+    NativeDeviceAllocation<double> right_scale;
+    NativeDeviceAllocation<double> row_norm;
+    NativeDeviceAllocation<double> column_norm;
+    NativeDeviceAllocation<double> control;
+    NativeDeviceAllocation<int> status;
+    if (!left_scale.Allocate(static_cast<std::size_t>(fixture.rows)) ||
+        !right_scale.Allocate(static_cast<std::size_t>(fixture.rows)) ||
+        !row_norm.Allocate(static_cast<std::size_t>(fixture.rows)) ||
+        !column_norm.Allocate(static_cast<std::size_t>(fixture.rows)) ||
+        !control.Allocate(cuda_rank1_equilibration_control_doubles) ||
+        !status.Allocate(1))
+      return false;
+
+    original.HypreRead();
+    equilibrated.HypreReadWrite();
+    original_rhs.HypreRead();
+    equilibrated_rhs.HypreReadWrite();
+    solution.HypreReadWrite();
+    CudaTrueMatrixDeviceView original_view{};
+    CudaTrueMatrixDeviceView equilibrated_view{};
+    const double* const original_rhs_device =
+        static_cast<const mfem::Vector&>(original_rhs).Read();
+    double* const equilibrated_rhs_device =
+        static_cast<mfem::Vector&>(equilibrated_rhs).ReadWrite();
+    double* const solution_device =
+        static_cast<mfem::Vector&>(solution).ReadWrite();
+    if (!CudaGetTrueMatrixDeviceView(original, original_view) ||
+        !CudaGetTrueMatrixDeviceView(equilibrated, equilibrated_view) ||
+        original_view.rows != fixture.rows ||
+        original_view.offd_nonzeros != 0 ||
+        equilibrated_view.offd_nonzeros != 0 ||
+        original_rhs_device == nullptr || equilibrated_rhs_device == nullptr ||
+        solution_device == nullptr)
+      return false;
+
+    std::vector<double> original_values_before;
+    std::vector<double> original_rhs_before;
+    if (!CopyDeviceValues(
+            original_view.diag_values,
+            static_cast<std::size_t>(original_view.diag_nonzeros),
+            original_values_before) ||
+        !CopyDeviceValues(original_rhs_device,
+                          static_cast<std::size_t>(fixture.rows),
+                          original_rhs_before))
+      return false;
+    const bool launched = CudaLaunchBuildRankOneEquilibratedSystem(
+        original_view, equilibrated_view, original_rhs_device,
+        equilibrated_rhs_device, left_scale.data(), right_scale.data(),
+        row_norm.data(), column_norm.data(), control.data(), status.data(),
+        cuda_rank1_equilibration_passes, nullptr);
+    if (!launched || cudaDeviceSynchronize() != cudaSuccess) return false;
+
+    int status_value = -1;
+    std::vector<double> left(static_cast<std::size_t>(fixture.rows));
+    std::vector<double> right(static_cast<std::size_t>(fixture.rows));
+    std::vector<double> observed_control(
+        cuda_rank1_equilibration_control_doubles);
+    std::vector<double> scaled_rhs(static_cast<std::size_t>(fixture.rows));
+    std::vector<double> scaled_values;
+    std::vector<double> original_values_after;
+    std::vector<double> original_rhs_after;
+    if (!status.CopyOneTo(status_value) || status_value != 0 ||
+        !left_scale.CopyTo(left) || !right_scale.CopyTo(right) ||
+        !control.CopyTo(observed_control) ||
+        !CopyDeviceValues(equilibrated_rhs_device, scaled_rhs.size(),
+                          scaled_rhs) ||
+        !CopyDeviceValues(
+            equilibrated_view.diag_values,
+            static_cast<std::size_t>(equilibrated_view.diag_nonzeros),
+            scaled_values) ||
+        !CopyDeviceValues(
+            original_view.diag_values,
+            static_cast<std::size_t>(original_view.diag_nonzeros),
+            original_values_after) ||
+        !CopyDeviceValues(original_rhs_device,
+                          static_cast<std::size_t>(fixture.rows),
+                          original_rhs_after) ||
+        original_values_before != original_values_after ||
+        original_rhs_before != original_rhs_after ||
+        original_rhs_after != expected_rhs)
+      return false;
+
+    std::vector<int> offsets(static_cast<std::size_t>(fixture.rows) + 1);
+    std::vector<int> columns(original_values_before.size());
+    if (cudaMemcpy(offsets.data(), original_view.diag_offsets,
+                   offsets.size() * sizeof(int), cudaMemcpyDeviceToHost) !=
+            cudaSuccess ||
+        cudaMemcpy(columns.data(), original_view.diag_columns,
+                   columns.size() * sizeof(int), cudaMemcpyDeviceToHost) !=
+            cudaSuccess)
+      return false;
+    for (int row = 0; row < fixture.rows; ++row)
+    {
+      if (!(left[static_cast<std::size_t>(row)] >=
+                cuda_rank1_equilibration_minimum_scale &&
+            left[static_cast<std::size_t>(row)] <=
+                cuda_rank1_equilibration_maximum_scale &&
+            right[static_cast<std::size_t>(row)] >=
+                cuda_rank1_equilibration_minimum_scale &&
+            right[static_cast<std::size_t>(row)] <=
+                cuda_rank1_equilibration_maximum_scale) ||
+          !ValuesClose(
+              scaled_rhs[static_cast<std::size_t>(row)],
+              left[static_cast<std::size_t>(row)] *
+                  expected_rhs[static_cast<std::size_t>(row)]))
+        return false;
+      for (int entry = offsets[static_cast<std::size_t>(row)];
+           entry < offsets[static_cast<std::size_t>(row) + 1]; ++entry)
+      {
+        const int column = columns[static_cast<std::size_t>(entry)];
+        if (column < 0 || column >= fixture.rows ||
+            !ValuesClose(
+                scaled_values[static_cast<std::size_t>(entry)],
+                left[static_cast<std::size_t>(row)] *
+                    original_values_before[static_cast<std::size_t>(entry)] *
+                    right[static_cast<std::size_t>(column)]))
+          return false;
+      }
+    }
+    const bool nonunit_scale = std::any_of(
+        left.begin(), left.end(), [](const double value)
+        { return !ValuesClose(value, 1.0); }) ||
+        std::any_of(right.begin(), right.end(), [](const double value)
+        { return !ValuesClose(value, 1.0); });
+    if (!nonunit_scale) return false;
+    if (!ValuesClose(observed_control[0],
+                     *std::min_element(left.begin(), left.end())) ||
+        !ValuesClose(observed_control[1],
+                     *std::max_element(left.begin(), left.end())) ||
+        !ValuesClose(observed_control[2],
+                     *std::min_element(right.begin(), right.end())) ||
+        !ValuesClose(observed_control[3],
+                     *std::max_element(right.begin(), right.end())))
+      return false;
+
+    equilibrated.ResetTranspose();
+    equilibrated.HypreRead();
+    if (!CudaSolveRankOneMgr(
+            state, equilibrated, equilibrated_rhs, solution, policy,
+            relative_tolerance, maximum_iterations, krylov_dimension,
+            generation, diagnostics) ||
+        diagnostics.mgr_setup_calls != 1 ||
+        diagnostics.mgr_setup_reused ||
+        diagnostics.mgr_f_ilu_setups != 1 ||
+        diagnostics.iterations <= 0 ||
+        diagnostics.mgr_preconditioner_applications == 0 ||
+        diagnostics.mgr_f_ilu_applications !=
+            diagnostics.mgr_preconditioner_applications ||
+        !CudaTraceSolveReadyForTrueResidualVerification(
+            diagnostics, maximum_iterations))
+      return false;
+
+    // The one-shot true-residual tightening path changes only the outer
+    // FlexGMRES tolerance.  It retains this exact scaled system and the
+    // current-generation MGR hierarchy/F-ILU factor.
+    const double tightening_tolerance = relative_tolerance * 0.1;
+    const std::uint64_t setup_before_retry = state.setup_calls;
+    const std::uint64_t applications_before_retry =
+        state.preconditioner_applications;
+    CudaSolveDiagnostics retry_diagnostics{};
+    if (!CudaSolveRankOneMgr(
+            state, equilibrated, equilibrated_rhs, solution, policy,
+            tightening_tolerance, maximum_iterations, krylov_dimension,
+            generation, retry_diagnostics, true) ||
+        state.configured_relative_tolerance != tightening_tolerance ||
+        state.setup_calls != setup_before_retry ||
+        retry_diagnostics.mgr_setup_calls != 0 ||
+        !retry_diagnostics.mgr_setup_reused ||
+        retry_diagnostics.mgr_f_ilu_setups != 0 ||
+        retry_diagnostics.iterations <= 0 ||
+        retry_diagnostics.mgr_preconditioner_applications == 0 ||
+        retry_diagnostics.mgr_f_ilu_applications !=
+            retry_diagnostics.mgr_preconditioner_applications ||
+        state.preconditioner_applications <= applications_before_retry ||
+        !CudaTraceSolveReadyForTrueResidualVerification(
+            retry_diagnostics, maximum_iterations))
+      return false;
+
+    std::vector<double> equilibrated_solution(
+        static_cast<std::size_t>(fixture.rows));
+    if (!CopyDeviceValues(solution_device, equilibrated_solution.size(),
+                          equilibrated_solution) ||
+        !CudaLaunchUnscaleRankOneSolution(
+            solution_device, right_scale.data(), fixture.rows, nullptr) ||
+        cudaDeviceSynchronize() != cudaSuccess)
+      return false;
+    std::vector<double> unscaled_solution;
+    if (!CopyDeviceValues(solution_device,
+                          static_cast<std::size_t>(fixture.rows),
+                          unscaled_solution))
+      return false;
+    for (int row = 0; row < fixture.rows; ++row)
+      if (!ValuesClose(
+              unscaled_solution[static_cast<std::size_t>(row)],
+              right[static_cast<std::size_t>(row)] *
+                  equilibrated_solution[static_cast<std::size_t>(row)]))
+        return false;
+
+    double residual_norm = std::numeric_limits<double>::infinity();
+    if (!CsrResidualNorm(
+            fixture, expected_rhs, unscaled_solution, residual_norm) ||
+        residual_norm > 1.0e-8 * std::max(1.0, VectorNorm(expected_rhs)))
+      return false;
+    auto original_residual =
+        std::make_unique<mfem::HypreParVector>(original);
+    original.Mult(solution, *original_residual);
+    *original_residual -= original_rhs;
+    const double rebuilt_original_residual = original_residual->Norml2();
+    return std::isfinite(rebuilt_original_residual) &&
+        rebuilt_original_residual <=
+            1.0e-8 * std::max(1.0, VectorNorm(expected_rhs)) &&
+        ValuesClose(rebuilt_original_residual, residual_norm, 8192.0);
+  };
+
+  CudaSolveDiagnostics first_diagnostics{};
+  if (!run_generation(
+          *first_original, *first_equilibrated, *first_original_rhs,
+          *first_equilibrated_rhs, *first_solution, first_fixture, first_rhs,
+          41, first_diagnostics) ||
+      state.setup_calls != 1 || !state.has_setup_generation ||
+      state.last_setup_matrix_generation != 41 ||
+      state.setup_generation_pending || state.f_ilu != f_ilu_identity)
+    return false;
+  const std::uint64_t first_applications =
+      state.preconditioner_applications;
+
+  // Retry authority is bound to the exact retained matrix/RHS/solution
+  // objects as well as the generation; a same-number foreign system fails
+  // before changing setup or application aggregates.
+  CudaSolveDiagnostics foreign_retry_diagnostics{};
+  if (CudaSolveRankOneMgr(
+          state, *second_equilibrated, *second_equilibrated_rhs,
+          *second_solution, policy, relative_tolerance, maximum_iterations,
+          krylov_dimension, 41, foreign_retry_diagnostics, true) ||
+      state.setup_calls != 1 ||
+      state.preconditioner_applications != first_applications)
+    return false;
+
+  // The setup generation is a strict matrix-generation authority. Reusing a
+  // generation fails closed before HYPRE setup and cannot change aggregates.
+  CudaSolveDiagnostics duplicate_diagnostics{};
+  if (CudaSolveRankOneMgr(
+          state, *first_equilibrated, *first_equilibrated_rhs,
+          *first_solution, policy, relative_tolerance, maximum_iterations,
+          krylov_dimension, 41, duplicate_diagnostics, false) ||
+      state.setup_calls != 1 ||
+      state.preconditioner_applications != first_applications)
+    return false;
+
+  CudaSolveDiagnostics second_diagnostics{};
+  if (!run_generation(
+          *second_original, *second_equilibrated, *second_original_rhs,
+          *second_equilibrated_rhs, *second_solution, second_fixture,
+          second_rhs, 42, second_diagnostics) ||
+      state.setup_calls != 2 || !state.has_setup_generation ||
+      state.last_setup_matrix_generation != 42 ||
+      state.setup_generation_pending || state.f_ilu != f_ilu_identity ||
+      state.preconditioner_applications <= first_applications)
+    return false;
+
+  CudaDestroyRankOneMgrState(state);
+  return !state.configured && state.fgmres == nullptr &&
+      state.mgr == nullptr && state.f_ilu == nullptr &&
+      state.coarse_amg == nullptr && state.point_markers.empty() &&
+      state.setup_calls == 0 && state.preconditioner_applications == 0 &&
+      state.setup_matrix_token == 0 && state.setup_rhs_token == 0 &&
+      state.setup_solution_token == 0 &&
+      !std::isfinite(state.configured_relative_tolerance) &&
+      !state.has_setup_generation && !state.setup_generation_pending;
 }
 
 bool RunNativeSolveFixture(const NativeSolveFixture& fixture,
@@ -1222,6 +1728,15 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
   const auto tensor_igr_common = ResolveCudaTracePolicy(
       CudaEngineKind::tensor_core, true,
       CudaTracePolicyKind::common_fast);
+  const auto tensor_igr_mgr = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, true,
+      CudaTracePolicyKind::equilibrated_mgr);
+  const auto tensor_conventional_mgr = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, false,
+      CudaTracePolicyKind::equilibrated_mgr);
+  const auto ordinary_igr_mgr = ResolveCudaTracePolicy(
+      CudaEngineKind::ordinary, true,
+      CudaTracePolicyKind::equilibrated_mgr);
   const auto unknown = ResolveCudaTracePolicy(
       CudaEngineKind::ordinary, false,
       static_cast<CudaTracePolicyKind>(255));
@@ -1291,11 +1806,32 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
           ordinary_igr_common.ilu_triangular_solve_kind &&
       tensor_igr_common.ilu_factor_reuse_policy ==
           ordinary_igr_common.ilu_factor_reuse_policy &&
+      CudaTracePolicyDescriptorIsExact(tensor_igr_mgr) &&
+      tensor_igr_mgr.trace_preconditioner ==
+          CudaTracePreconditionerKind::hypre_mgr_field_split &&
+      tensor_igr_mgr.ilu_type == -1 &&
+      tensor_igr_mgr.ilu_level_of_fill == -1 &&
+      tensor_igr_mgr.ilu_local_reordering == -1 &&
+      tensor_igr_mgr.ilu_application_iterations == 0 &&
+      tensor_igr_mgr.ilu_triangular_solve_kind ==
+          CudaIluTriangularSolveKind::not_applicable &&
+      tensor_igr_mgr.ilu_factor_reuse_policy ==
+          CudaIluFactorReusePolicy::not_applicable &&
+      !tensor_conventional_mgr.valid &&
+      !CudaTracePolicyDescriptorIsExact(tensor_conventional_mgr) &&
+      !ordinary_igr_mgr.valid &&
+      !CudaTracePolicyDescriptorIsExact(ordinary_igr_mgr) &&
       !unknown.valid && !CudaTracePolicyDescriptorIsExact(unknown) &&
       std::string_view(CudaTracePolicyKindName(
           CudaTracePolicyKind::engine_default)) == "engine-default" &&
       std::string_view(CudaTracePolicyKindName(
-          CudaTracePolicyKind::common_fast)) == "common-fast";
+          CudaTracePolicyKind::common_fast)) == "common-fast" &&
+      std::string_view(CudaTracePolicyKindName(
+          CudaTracePolicyKind::equilibrated_mgr)) ==
+          "equilibrated-mgr" &&
+      std::string_view(CudaTracePreconditionerName(
+          CudaTracePreconditionerKind::hypre_mgr_field_split)) ==
+          "hypre_mgr_field_split";
 }
 
 static_assert(TracePolicyAblationDescriptorPolicy(),
@@ -2161,7 +2697,10 @@ int main(int argc, char** argv)
       : false);
   const bool native_device_fixtures = ranks != 1 || !mode.empty() ||
       (lifecycle && NativeTraceDeviceFixtures());
-  const bool pass = policies && lifecycle && native_device_fixtures;
+  const bool mgr_device_fixture = ranks != 1 || !mode.empty() ||
+      (native_device_fixtures && RankOneEquilibratedMgrFixture());
+  const bool pass = policies && lifecycle && native_device_fixtures &&
+      mgr_device_fixture;
   if (!pass && rank == 0)
     std::cerr << "compact CUDA W8A audit failed\n";
   return pass ? 0 : 1;

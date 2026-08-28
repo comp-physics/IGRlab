@@ -88,6 +88,25 @@ unchanged. `common-fast` selects diagonal scaling for both conventional
 engines. For IGR it selects the same ILU0+RCM, five-lower/five-upper iterative-
 Jacobi application, and first-trace-solve-per-attempt lifetime for both
 engines.
+
+`equilibrated-mgr` is a separate explicit rank-one tensor-IGR baseline. It
+performs two deterministic FP64 two-sided Ruiz passes, solves the scaled
+system with FlexGMRES preconditioned by one MGR reduction from Uhat4 to the
+retained sigmahat field, and converts the solution back to the physical trace
+before the unchanged FP64 original-system true-residual gate. It is invalid
+for ordinary CUDA, conventional mode, and rank two. Its fixed MGR tuple uses
+one explicitly owned ILU0 F-relaxation application with zero tolerance and
+direct triangular solves, CPR-like restriction, Jacobi interpolation, and one
+BoomerAMG coarse application. The F factor is refreshed by every current-
+generation MGR setup. A one-shot tighter true-residual retry retunes only the
+outer FlexGMRES tolerance and reuses that exact scaled matrix, retained scaled
+right-hand side, MGR hierarchy, and F factor; no HYPRE tolerance-driven inner
+solve is left implicit.
+There is no ordinary-CUDA fallback, Schwarz level, mixed precision, or
+adaptive policy in this baseline. Setup/application counts and scale extrema
+are constant-size aggregates; no iteration history or event stream is
+retained.
+
 The benchmark emits the selected policy at top level and in every bounded
 sample. The driver validates every preconditioner, ILU, triangular-solve,
 accounting, and factor-lifetime dimension exactly, then requires `O_common`

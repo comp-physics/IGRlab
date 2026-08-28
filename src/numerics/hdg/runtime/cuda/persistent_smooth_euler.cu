@@ -3,6 +3,7 @@
 #include "physics/bc/detail/euler_boundary_state.hpp"
 
 #include <HYPRE_krylov.h>
+#include <HYPRE_parcsr_ls.h>
 #include <HYPRE_utilities.h>
 #include <_hypre_parcsr_ls.h>
 #include <_hypre_utilities.h>
@@ -959,6 +960,352 @@ bool CudaGetTrueMatrixDeviceView(mfem::HypreParMatrix& matrix,
         view.diag_values != nullptr && view.offd_offsets != nullptr &&
         (view.offd_nonzeros == 0 ||
          (view.offd_columns != nullptr && view.offd_values != nullptr));
+    return diagnostic.result;
+  }
+  catch (...) { return false; }
+}
+
+namespace
+{
+HYPRE_Int CudaRankOneMgrSetupCallback(
+    HYPRE_Solver opaque_state, HYPRE_ParCSRMatrix matrix,
+    HYPRE_ParVector rhs, HYPRE_ParVector solution)
+{
+  auto* const state = reinterpret_cast<CudaRankOneMgrState*>(opaque_state);
+  if (state == nullptr || !state->configured || state->mgr == nullptr ||
+      !state->setup_generation_pending ||
+      state->setup_calls == std::numeric_limits<std::uint64_t>::max())
+    return HYPRE_ERROR_GENERIC;
+  const HYPRE_Int result = HYPRE_MGRSetup(
+      state->mgr, matrix, rhs, solution);
+  if (result == 0 && HYPRE_GetError() == 0)
+  {
+    ++state->setup_calls;
+    state->last_setup_matrix_generation =
+        state->pending_matrix_generation;
+    state->has_setup_generation = true;
+  }
+  state->setup_generation_pending = false;
+  return result;
+}
+
+HYPRE_Int CudaRankOneMgrSolveCallback(
+    HYPRE_Solver opaque_state, HYPRE_ParCSRMatrix matrix,
+    HYPRE_ParVector rhs, HYPRE_ParVector solution)
+{
+  auto* const state = reinterpret_cast<CudaRankOneMgrState*>(opaque_state);
+  if (state == nullptr || !state->configured || state->mgr == nullptr ||
+      state->preconditioner_applications ==
+          std::numeric_limits<std::uint64_t>::max())
+    return HYPRE_ERROR_GENERIC;
+  ++state->preconditioner_applications;
+  return HYPRE_MGRSolve(state->mgr, matrix, rhs, solution);
+}
+} // namespace
+
+void CudaDestroyRankOneMgrState(CudaRankOneMgrState& state) noexcept
+{
+  // FlexGMRES and MGR retain, but do not own, their configured subordinate
+  // solver handles. Destroy in dependency order while every matrix/vector
+  // object that may have participated in setup is still alive.
+  if (state.fgmres != nullptr)
+    (void)HYPRE_ParCSRFlexGMRESDestroy(state.fgmres);
+  if (state.mgr != nullptr)
+    (void)HYPRE_MGRDestroy(state.mgr);
+  if (state.f_ilu != nullptr)
+    (void)HYPRE_ILUDestroy(state.f_ilu);
+  if (state.coarse_amg != nullptr)
+    (void)HYPRE_BoomerAMGDestroy(state.coarse_amg);
+  state = {};
+}
+
+bool CudaConfigureRankOneMgrState(
+    CudaRankOneMgrState& state, const MPI_Comm communicator,
+    const int rows, const int scalar_trace_dofs,
+    const double relative_tolerance, const int maximum_iterations,
+    const int krylov_dimension) noexcept
+{
+  CudaDestroyRankOneMgrState(state);
+  const bool inputs_exact = communicator != MPI_COMM_NULL && rows > 0 &&
+      scalar_trace_dofs > 0 &&
+      scalar_trace_dofs * igr_trace_components == rows &&
+      std::isfinite(relative_tolerance) && relative_tolerance > 0.0 &&
+      maximum_iterations > 0 && krylov_dimension > 0 &&
+      HYPRE_GetError() == 0;
+  if (!inputs_exact) return false;
+
+  try
+  {
+    state.point_markers.resize(static_cast<std::size_t>(rows));
+    for (int row = 0; row < rows; ++row)
+      state.point_markers[static_cast<std::size_t>(row)] =
+          static_cast<HYPRE_Int>(row / scalar_trace_dofs);
+    state.coarse_point_index_levels[0] =
+        state.coarse_point_indexes.data();
+
+    bool ok = HYPRE_ParCSRFlexGMRESCreate(
+                  communicator, &state.fgmres) == 0 &&
+        HYPRE_MGRCreate(&state.mgr) == 0 &&
+        HYPRE_ILUCreate(&state.f_ilu) == 0 &&
+        HYPRE_BoomerAMGCreate(&state.coarse_amg) == 0;
+    ok = ok && state.fgmres != nullptr && state.mgr != nullptr &&
+        state.f_ilu != nullptr && state.coarse_amg != nullptr &&
+        HYPRE_ParCSRFlexGMRESSetKDim(
+            state.fgmres, static_cast<HYPRE_Int>(krylov_dimension)) == 0 &&
+        HYPRE_ParCSRFlexGMRESSetTol(
+            state.fgmres, static_cast<HYPRE_Real>(relative_tolerance)) == 0 &&
+        HYPRE_ParCSRFlexGMRESSetAbsoluteTol(state.fgmres, 0.0) == 0 &&
+        HYPRE_ParCSRFlexGMRESSetMaxIter(
+            state.fgmres,
+            static_cast<HYPRE_Int>(maximum_iterations)) == 0 &&
+        HYPRE_ParCSRFlexGMRESSetLogging(state.fgmres, 1) == 0 &&
+        HYPRE_ParCSRFlexGMRESSetPrintLevel(state.fgmres, 0) == 0;
+
+    // The externally owned level-0 F solver removes HYPRE type-32's hidden
+    // tolerance-driven defaults. Every MGR application now has one fixed
+    // ILU(0) application with direct triangular solves; MGR setup refreshes
+    // that factor once for each current matrix generation.
+    ok = ok && HYPRE_ILUSetType(state.f_ilu, 0) == 0 &&
+        HYPRE_ILUSetLevelOfFill(state.f_ilu, 0) == 0 &&
+        HYPRE_ILUSetLocalReordering(state.f_ilu, 0) == 0 &&
+        HYPRE_ILUSetIterativeSetupType(state.f_ilu, 0) == 0 &&
+        HYPRE_ILUSetMaxIter(state.f_ilu, 1) == 0 &&
+        HYPRE_ILUSetTol(state.f_ilu, 0.0) == 0 &&
+        HYPRE_ILUSetTriSolve(state.f_ilu, 1) == 0 &&
+        HYPRE_ILUSetLowerJacobiIters(state.f_ilu, 0) == 0 &&
+        HYPRE_ILUSetUpperJacobiIters(state.f_ilu, 0) == 0 &&
+        HYPRE_ILUSetPrintLevel(state.f_ilu, 0) == 0 &&
+        HYPRE_ILUSetLogging(state.f_ilu, 0) == 0;
+    const auto* const f_ilu_data =
+        reinterpret_cast<const hypre_ParILUData*>(state.f_ilu);
+    ok = ok && f_ilu_data != nullptr &&
+        hypre_ParILUDataIluType(f_ilu_data) == 0 &&
+        hypre_ParILUDataLfil(f_ilu_data) == 0 &&
+        hypre_ParILUDataReorderingType(f_ilu_data) == 0 &&
+        hypre_ParILUDataIterativeSetupType(f_ilu_data) == 0 &&
+        hypre_ParILUDataMaxIter(f_ilu_data) == 1 &&
+        hypre_ParILUDataTol(f_ilu_data) == 0.0 &&
+        hypre_ParILUDataTriSolve(f_ilu_data) == 1 &&
+        hypre_ParILUDataLowerJacobiIters(f_ilu_data) == 0 &&
+        hypre_ParILUDataUpperJacobiIters(f_ilu_data) == 0 &&
+        hypre_ParILUDataPrintLevel(f_ilu_data) == 0;
+
+    // byNODES is component-major: Uhat occupies markers 0..3 and sigmahat
+    // marker 4. One MGR reduction retains sigmahat as the C field and treats
+    // every non-C point as an F point. The fixed tuple is intentionally an
+    // explicit baseline, not an adaptive or hidden fallback policy.
+    ok = ok && HYPRE_MGRSetCpointsByPointMarkerArray(
+        state.mgr, igr_trace_components, 1,
+        state.coarse_point_counts.data(),
+        state.coarse_point_index_levels.data(),
+        state.point_markers.data()) == 0 &&
+        HYPRE_MGRSetNonCpointsToFpoints(state.mgr, 1) == 0 &&
+        HYPRE_MGRSetMaxCoarseLevels(state.mgr, 1) == 0 &&
+        HYPRE_MGRSetFSolverAtLevel(
+            state.mgr, state.f_ilu, 0) == 0 &&
+        HYPRE_MGRSetBlockSize(state.mgr, igr_trace_components) == 0 &&
+        HYPRE_MGRSetLevelFRelaxType(
+            state.mgr, state.f_relax_types.data()) == 0 &&
+        HYPRE_MGRSetCoarseGridMethod(
+            state.mgr, state.coarse_grid_methods.data()) == 0 &&
+        HYPRE_MGRSetRestrictType(state.mgr, 13) == 0 &&
+        HYPRE_MGRSetInterpType(state.mgr, 2) == 0 &&
+        HYPRE_MGRSetNumRelaxSweeps(state.mgr, 1) == 0 &&
+        HYPRE_MGRSetMaxIter(state.mgr, 1) == 0 &&
+        HYPRE_MGRSetTol(state.mgr, 0.0) == 0 &&
+        HYPRE_MGRSetLogging(state.mgr, 0) == 0 &&
+        HYPRE_MGRSetPrintLevel(state.mgr, 0) == 0;
+
+    ok = ok && HYPRE_BoomerAMGSetMaxIter(state.coarse_amg, 1) == 0 &&
+        HYPRE_BoomerAMGSetTol(state.coarse_amg, 0.0) == 0 &&
+        HYPRE_BoomerAMGSetPrintLevel(state.coarse_amg, 0) == 0 &&
+        HYPRE_BoomerAMGSetLogging(state.coarse_amg, 0) == 0 &&
+        HYPRE_MGRSetCoarseSolver(
+            state.mgr, HYPRE_BoomerAMGSolve, HYPRE_BoomerAMGSetup,
+            state.coarse_amg) == 0;
+
+    // The callback data is this constant-size owner, allowing aggregate
+    // setup/application counts without retaining a callback event stream.
+    state.configured = ok && HYPRE_GetError() == 0;
+    ok = state.configured && HYPRE_ParCSRFlexGMRESSetPrecond(
+        state.fgmres, CudaRankOneMgrSolveCallback,
+        CudaRankOneMgrSetupCallback,
+        reinterpret_cast<HYPRE_Solver>(&state)) == 0 &&
+        HYPRE_GetError() == 0;
+    state.configured = ok;
+    if (ok)
+      state.configured_relative_tolerance = relative_tolerance;
+    if (!ok) CudaDestroyRankOneMgrState(state);
+    return ok;
+  }
+  catch (...)
+  {
+    CudaDestroyRankOneMgrState(state);
+    return false;
+  }
+}
+
+bool CudaSolveRankOneMgr(
+    CudaRankOneMgrState& state, mfem::HypreParMatrix& matrix,
+    mfem::HypreParVector& rhs, mfem::HypreParVector& solution,
+    const CudaTracePolicyDescriptor& policy,
+    const double relative_tolerance, const int maximum_iterations,
+    const int krylov_dimension, const std::uint64_t matrix_generation,
+    CudaSolveDiagnostics& diagnostics,
+    const bool same_matrix_retry) noexcept
+{
+  CudaTrueSystemDiagnosticScope diagnostic("rank1-equilibrated-mgr-solve",
+                                           matrix_generation);
+  diagnostics = {};
+  diagnostics.matrix_generation = matrix_generation;
+  diagnostics.trace_solver = CudaTraceSolverKind::hypre_fgmres_mgr_rank1;
+  diagnostics.trace_preconditioner = policy.trace_preconditioner;
+  diagnostics.igr_active = policy.igr_active;
+  diagnostics.krylov_dimension = krylov_dimension;
+  const bool exact_policy = CudaTracePolicyDescriptorIsExact(policy) &&
+      policy.selection == CudaTracePolicyKind::equilibrated_mgr &&
+      policy.selected_engine == generic::CudaEngineKind::tensor_core &&
+      policy.igr_active && policy.trace_preconditioner ==
+          CudaTracePreconditionerKind::hypre_mgr_field_split &&
+      std::isfinite(relative_tolerance) && relative_tolerance > 0.0 &&
+      maximum_iterations > 0 && krylov_dimension > 0;
+  const bool state_ready = exact_policy && state.configured &&
+      state.fgmres != nullptr && state.mgr != nullptr &&
+      state.f_ilu != nullptr && state.coarse_amg != nullptr &&
+      HYPRE_GetError() == 0 &&
+      !state.setup_generation_pending &&
+      (same_matrix_retry
+           ? state.has_setup_generation &&
+               matrix_generation == state.last_setup_matrix_generation
+           : !state.has_setup_generation ||
+               matrix_generation > state.last_setup_matrix_generation) &&
+      CudaHypreDevicePolicyValid(matrix, rhs, solution);
+  if (!state_ready) return false;
+
+  try
+  {
+    matrix.HypreRead();
+    rhs.HypreRead();
+    solution.HypreReadWrite();
+    const std::uint64_t setup_before = state.setup_calls;
+    const std::uint64_t applications_before =
+        state.preconditioner_applications;
+    HYPRE_ParCSRMatrix raw_matrix = reinterpret_cast<HYPRE_ParCSRMatrix>(
+        static_cast<hypre_ParCSRMatrix*>(matrix));
+    HYPRE_ParVector raw_rhs = reinterpret_cast<HYPRE_ParVector>(
+        static_cast<hypre_ParVector*>(rhs));
+    HYPRE_ParVector raw_solution = reinterpret_cast<HYPRE_ParVector>(
+        static_cast<hypre_ParVector*>(solution));
+    const std::uintptr_t matrix_token =
+        reinterpret_cast<std::uintptr_t>(raw_matrix);
+    const std::uintptr_t rhs_token =
+        reinterpret_cast<std::uintptr_t>(raw_rhs);
+    const std::uintptr_t solution_token =
+        reinterpret_cast<std::uintptr_t>(raw_solution);
+    const bool retained_objects_exact = !same_matrix_retry ||
+        (matrix_token != 0 && rhs_token != 0 && solution_token != 0 &&
+         state.setup_matrix_token == matrix_token &&
+         state.setup_rhs_token == rhs_token &&
+         state.setup_solution_token == solution_token);
+    if (!retained_objects_exact) return false;
+    const bool tolerance_configured =
+        HYPRE_ParCSRFlexGMRESSetTol(
+            state.fgmres,
+            static_cast<HYPRE_Real>(relative_tolerance)) == 0 &&
+        HYPRE_GetError() == 0;
+    if (!tolerance_configured) return false;
+    state.configured_relative_tolerance = relative_tolerance;
+    solution = 0.0;
+    solution.HypreReadWrite();
+    HYPRE_Int setup_result = 0;
+    if (!same_matrix_retry)
+    {
+      state.pending_matrix_generation = matrix_generation;
+      state.setup_generation_pending = true;
+      setup_result = HYPRE_ParCSRFlexGMRESSetup(
+          state.fgmres, raw_matrix, raw_rhs, raw_solution);
+    }
+    const bool setup_generation_exact = same_matrix_retry
+        ? !state.setup_generation_pending &&
+            state.has_setup_generation &&
+            state.last_setup_matrix_generation == matrix_generation &&
+            state.setup_calls == setup_before
+        : !state.setup_generation_pending &&
+            state.has_setup_generation &&
+            state.last_setup_matrix_generation == matrix_generation &&
+            setup_before != std::numeric_limits<std::uint64_t>::max() &&
+            state.setup_calls == setup_before + 1;
+    if (setup_result != 0 || HYPRE_GetError() != 0 ||
+        !setup_generation_exact)
+    {
+      state.setup_generation_pending = false;
+      return false;
+    }
+    if (!same_matrix_retry)
+    {
+      state.setup_matrix_token = matrix_token;
+      state.setup_rhs_token = rhs_token;
+      state.setup_solution_token = solution_token;
+    }
+    const HYPRE_Int solve_result = HYPRE_ParCSRFlexGMRESSolve(
+        state.fgmres, raw_matrix, raw_rhs, raw_solution);
+    const HYPRE_Int terminal_hypre_error = HYPRE_GetError();
+    const bool terminal_clean = terminal_hypre_error == 0 &&
+        solve_result == 0;
+    const bool terminal_pure_convergence =
+        terminal_hypre_error == HYPRE_ERROR_CONV &&
+        solve_result == HYPRE_ERROR_CONV;
+    bool terminal_error_cleared = terminal_clean && HYPRE_GetError() == 0;
+    if (terminal_pure_convergence)
+      terminal_error_cleared =
+          HYPRE_ClearError(HYPRE_ERROR_CONV) == 0 &&
+          HYPRE_GetError() == 0;
+    if (!(terminal_clean != terminal_pure_convergence) ||
+        !terminal_error_cleared)
+      return false;
+
+    HYPRE_Int iterations = -1;
+    HYPRE_Real reported_residual =
+        std::numeric_limits<HYPRE_Real>::infinity();
+    const bool observations_ready =
+        HYPRE_ParCSRFlexGMRESGetNumIterations(
+            state.fgmres, &iterations) == 0 &&
+        HYPRE_ParCSRFlexGMRESGetFinalRelativeResidualNorm(
+            state.fgmres, &reported_residual) == 0 &&
+        HYPRE_GetError() == 0;
+    const std::uint64_t application_delta =
+        state.preconditioner_applications - applications_before;
+    const bool callbacks_exact =
+        state.setup_calls == setup_before +
+            static_cast<std::uint64_t>(!same_matrix_retry) &&
+        state.preconditioner_applications >= applications_before &&
+        (iterations == 0 || application_delta > 0);
+    diagnostics.iterations = static_cast<int>(iterations);
+    diagnostics.reported_residual =
+        static_cast<double>(reported_residual);
+    diagnostics.mgr_setup_calls = state.setup_calls - setup_before;
+    diagnostics.mgr_preconditioner_applications =
+        application_delta;
+    // One reduction level plus MGR maxiter=1/type32 and the externally owned
+    // maxiter=1 ILU make these one-for-one fixed-control derivations from the
+    // observed outer MGR setup/application callbacks.
+    diagnostics.mgr_f_ilu_setups = diagnostics.mgr_setup_calls;
+    diagnostics.mgr_f_ilu_applications =
+        diagnostics.mgr_preconditioner_applications;
+    diagnostics.mgr_setup_reused = same_matrix_retry;
+    diagnostics.device_policy = observations_ready &&
+        CudaHypreDevicePolicyValid(matrix, rhs, solution);
+    diagnostics.configured_mgr = callbacks_exact &&
+        state.configured_relative_tolerance == relative_tolerance;
+    diagnostics.configured_preconditioner =
+        diagnostics.configured_mgr;
+    diagnostics.finite = observations_ready &&
+        std::isfinite(diagnostics.reported_residual);
+    diagnostics.reported_tolerance_met = diagnostics.finite &&
+        diagnostics.reported_residual <= relative_tolerance;
+    diagnostic.result = diagnostics.finite &&
+        CudaTraceSolveReadyForTrueResidualVerification(
+            diagnostics, maximum_iterations);
     return diagnostic.result;
   }
   catch (...) { return false; }
@@ -2413,6 +2760,167 @@ constexpr double cuda_gamma = 1.4;
 constexpr double cuda_tau = 2.5;
 constexpr double cuda_density_gate = 1.0e-8;
 constexpr double cuda_pi = 3.141592653589793238462643383279502884;
+
+__device__ void AtomicMaximumPositiveDouble(double* const address,
+                                            const double value)
+{
+  atomicMax(reinterpret_cast<unsigned long long*>(address),
+            __double_as_longlong(value));
+}
+
+__device__ void AtomicMinimumPositiveDouble(double* const address,
+                                            const double value)
+{
+  atomicMin(reinterpret_cast<unsigned long long*>(address),
+            __double_as_longlong(value));
+}
+
+__global__ void InitializeRankOneEquilibrationKernel(
+    double* const left_scale, double* const right_scale,
+    double* const row_norm, double* const column_norm,
+    double* const control, int* const status, const int rows)
+{
+  for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < rows;
+       row += blockDim.x * gridDim.x)
+  {
+    left_scale[row] = 1.0;
+    right_scale[row] = 1.0;
+    row_norm[row] = 0.0;
+    column_norm[row] = 0.0;
+  }
+  if (blockIdx.x == 0 && threadIdx.x == 0)
+  {
+    control[0] = CUDART_INF;
+    control[1] = 0.0;
+    control[2] = CUDART_INF;
+    control[3] = 0.0;
+    *status = 0;
+  }
+}
+
+__global__ void ZeroRankOneEquilibrationNormsKernel(
+    double* const row_norm, double* const column_norm, const int rows)
+{
+  for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < rows;
+       row += blockDim.x * gridDim.x)
+  {
+    row_norm[row] = 0.0;
+    column_norm[row] = 0.0;
+  }
+}
+
+__global__ void AccumulateRankOneEquilibrationNormsKernel(
+    const CudaTrueMatrixDeviceView matrix, const double* const left_scale,
+    const double* const right_scale, double* const row_norm,
+    double* const column_norm, int* const status)
+{
+  for (int row = blockIdx.x * blockDim.x + threadIdx.x;
+       row < matrix.rows; row += blockDim.x * gridDim.x)
+  {
+    const double left = left_scale[row];
+    double maximum = 0.0;
+    for (int entry = matrix.diag_offsets[row];
+         entry < matrix.diag_offsets[row + 1]; ++entry)
+    {
+      const int column = matrix.diag_columns[entry];
+      if (column < 0 || column >= matrix.rows)
+      {
+        atomicOr(status, 1);
+        continue;
+      }
+      const double magnitude = fabs(
+          left * matrix.diag_values[entry] * right_scale[column]);
+      if (!isfinite(magnitude))
+      {
+        atomicOr(status, 1);
+        continue;
+      }
+      maximum = fmax(maximum, magnitude);
+      AtomicMaximumPositiveDouble(column_norm + column, magnitude);
+    }
+    row_norm[row] = maximum;
+  }
+}
+
+__global__ void UpdateRankOneEquilibrationScalesKernel(
+    double* const left_scale, double* const right_scale,
+    const double* const row_norm, const double* const column_norm,
+    int* const status, const int rows)
+{
+  for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < rows;
+       row += blockDim.x * gridDim.x)
+  {
+    const double row_value = row_norm[row];
+    const double column_value = column_norm[row];
+    const double next_left = left_scale[row] / sqrt(row_value);
+    const double next_right = right_scale[row] / sqrt(column_value);
+    const bool valid = row_value > 0.0 && column_value > 0.0 &&
+        isfinite(next_left) && isfinite(next_right) &&
+        next_left >= cuda_rank1_equilibration_minimum_scale &&
+        next_left <= cuda_rank1_equilibration_maximum_scale &&
+        next_right >= cuda_rank1_equilibration_minimum_scale &&
+        next_right <= cuda_rank1_equilibration_maximum_scale;
+    if (!valid)
+    {
+      atomicOr(status, 2);
+      continue;
+    }
+    left_scale[row] = next_left;
+    right_scale[row] = next_right;
+  }
+}
+
+__global__ void BuildRankOneEquilibratedSystemKernel(
+    const CudaTrueMatrixDeviceView original,
+    const CudaTrueMatrixDeviceView equilibrated,
+    const double* const original_rhs, double* const equilibrated_rhs,
+    const double* const left_scale, const double* const right_scale,
+    double* const control, int* const status)
+{
+  for (int row = blockIdx.x * blockDim.x + threadIdx.x;
+       row < original.rows; row += blockDim.x * gridDim.x)
+  {
+    if (*status != 0) continue;
+    const double left = left_scale[row];
+    const double right = right_scale[row];
+    const double scaled_rhs = left * original_rhs[row];
+    if (!isfinite(left) || !isfinite(right) || !isfinite(scaled_rhs))
+    {
+      atomicOr(status, 4);
+      continue;
+    }
+    equilibrated_rhs[row] = scaled_rhs;
+    for (int entry = original.diag_offsets[row];
+         entry < original.diag_offsets[row + 1]; ++entry)
+    {
+      const int column = original.diag_columns[entry];
+      if (column < 0 || column >= original.rows)
+      {
+        atomicOr(status, 4);
+        continue;
+      }
+      const double value =
+          left * original.diag_values[entry] * right_scale[column];
+      if (!isfinite(value))
+        atomicOr(status, 4);
+      else
+        equilibrated.diag_values[entry] = value;
+    }
+    AtomicMinimumPositiveDouble(control + 0, left);
+    AtomicMaximumPositiveDouble(control + 1, left);
+    AtomicMinimumPositiveDouble(control + 2, right);
+    AtomicMaximumPositiveDouble(control + 3, right);
+  }
+}
+
+__global__ void UnscaleRankOneSolutionKernel(
+    double* const solution, const double* const right_scale,
+    const int rows)
+{
+  for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < rows;
+       row += blockDim.x * gridDim.x)
+    solution[row] *= right_scale[row];
+}
 
 __device__ int ByNodes(const int scalar, const int count,
                        const int component)
@@ -4929,6 +5437,63 @@ bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
   if(!LaunchOk())return false;
   tensor_mma_tiles=per_element*elements;
   return true;
+}
+bool CudaLaunchBuildRankOneEquilibratedSystem(
+    const CudaTrueMatrixDeviceView& original,
+    const CudaTrueMatrixDeviceView& equilibrated,
+    const double* const original_rhs, double* const equilibrated_rhs,
+    double* const left_scale, double* const right_scale,
+    double* const row_norm, double* const column_norm,
+    double* const control, int* const status, const int passes,
+    const cudaStream_t stream) noexcept
+{
+  const bool exact = original.rows > 0 &&
+      original.rows == original.diag_columns_count &&
+      original.rows == equilibrated.rows &&
+      original.diag_columns_count == equilibrated.diag_columns_count &&
+      original.diag_nonzeros > 0 &&
+      original.diag_nonzeros == equilibrated.diag_nonzeros &&
+      original.offd_nonzeros == 0 && equilibrated.offd_nonzeros == 0 &&
+      original.diag_offsets != nullptr && original.diag_columns != nullptr &&
+      original.diag_values != nullptr &&
+      equilibrated.diag_offsets != nullptr &&
+      equilibrated.diag_columns != nullptr &&
+      equilibrated.diag_values != nullptr &&
+      original.diag_values != equilibrated.diag_values &&
+      original_rhs != nullptr && equilibrated_rhs != nullptr &&
+      original_rhs != equilibrated_rhs && left_scale != nullptr &&
+      right_scale != nullptr && row_norm != nullptr &&
+      column_norm != nullptr && control != nullptr && status != nullptr &&
+      passes == cuda_rank1_equilibration_passes;
+  if (!exact) return false;
+  const int blocks = Blocks(original.rows);
+  InitializeRankOneEquilibrationKernel<<<blocks,128,0,stream>>>(
+      left_scale, right_scale, row_norm, column_norm, control, status,
+      original.rows);
+  for (int pass = 0; pass < passes; ++pass)
+  {
+    ZeroRankOneEquilibrationNormsKernel<<<blocks,128,0,stream>>>(
+        row_norm, column_norm, original.rows);
+    AccumulateRankOneEquilibrationNormsKernel<<<blocks,128,0,stream>>>(
+        original, left_scale, right_scale, row_norm, column_norm, status);
+    UpdateRankOneEquilibrationScalesKernel<<<blocks,128,0,stream>>>(
+        left_scale, right_scale, row_norm, column_norm, status,
+        original.rows);
+  }
+  BuildRankOneEquilibratedSystemKernel<<<blocks,128,0,stream>>>(
+      original, equilibrated, original_rhs, equilibrated_rhs, left_scale,
+      right_scale, control, status);
+  return LaunchOk();
+}
+bool CudaLaunchUnscaleRankOneSolution(
+    double* const solution, const double* const right_scale,
+    const int rows, const cudaStream_t stream) noexcept
+{
+  if (solution == nullptr || right_scale == nullptr || rows <= 0)
+    return false;
+  UnscaleRankOneSolutionKernel<<<Blocks(rows),128,0,stream>>>(
+      solution, right_scale, rows);
+  return LaunchOk();
 }
 bool CudaLaunchZeroTrueSystem(const CudaTrueMatrixDeviceView& m,double* rhs,int n) noexcept
 {const int count=std::max(std::max(m.diag_nonzeros,m.offd_nonzeros),n);ZeroSystemKernel<<<Blocks(count),128>>>(m,rhs,n);return LaunchOk();}

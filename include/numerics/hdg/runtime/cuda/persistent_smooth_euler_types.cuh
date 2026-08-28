@@ -328,14 +328,16 @@ inline bool IsCudaAbsentBorrowedGlobalTopologyIdentity(
 enum class CudaTracePolicyKind : std::uint8_t
 {
   engine_default = 0,
-  common_fast = 1
+  common_fast = 1,
+  equilibrated_mgr = 2
 };
 
 constexpr bool IsKnownCudaTracePolicyKind(
     const CudaTracePolicyKind kind) noexcept
 {
   return kind == CudaTracePolicyKind::engine_default ||
-      kind == CudaTracePolicyKind::common_fast;
+      kind == CudaTracePolicyKind::common_fast ||
+      kind == CudaTracePolicyKind::equilibrated_mgr;
 }
 
 constexpr const char* CudaTracePolicyKindName(
@@ -347,6 +349,8 @@ constexpr const char* CudaTracePolicyKindName(
     return "engine-default";
   case CudaTracePolicyKind::common_fast:
     return "common-fast";
+  case CudaTracePolicyKind::equilibrated_mgr:
+    return "equilibrated-mgr";
   }
   return "unknown";
 }
@@ -586,7 +590,8 @@ enum class CudaTracePreconditionerKind : std::uint8_t
 {
   unconfigured = 0,
   hypre_ilu0 = 1,
-  hypre_diag_scale = 2
+  hypre_diag_scale = 2,
+  hypre_mgr_field_split = 3
 };
 
 /** Deterministic lifetime policy for a selected HYPRE ILU(0) factor. */
@@ -700,6 +705,7 @@ constexpr int CudaIluLevelOfFill(
   case CudaTracePreconditionerKind::hypre_ilu0:
     return 0;
   case CudaTracePreconditionerKind::hypre_diag_scale:
+  case CudaTracePreconditionerKind::hypre_mgr_field_split:
   case CudaTracePreconditionerKind::unconfigured:
     break;
   }
@@ -715,6 +721,7 @@ constexpr int CudaIluLocalReordering(
   case CudaTracePreconditionerKind::hypre_ilu0:
     return igr_active ? 1 : 0;
   case CudaTracePreconditionerKind::hypre_diag_scale:
+  case CudaTracePreconditionerKind::hypre_mgr_field_split:
   case CudaTracePreconditionerKind::unconfigured:
     break;
   }
@@ -799,6 +806,8 @@ constexpr const char* CudaTracePreconditionerName(
     return "hypre_ilu0";
   case CudaTracePreconditionerKind::hypre_diag_scale:
     return "hypre_diag_scale";
+  case CudaTracePreconditionerKind::hypre_mgr_field_split:
+    return "hypre_mgr_field_split";
   case CudaTracePreconditionerKind::unconfigured:
     break;
   }
@@ -840,6 +849,19 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
   if (!generic::IsKnownCudaEngineKind(engine) ||
       !IsKnownCudaTracePolicyKind(selection))
     return result;
+
+  // The field-split baseline is an explicit rank-one tensor-IGR experiment.
+  // Rank/topology admission is performed by the private solver router; every
+  // other engine/mode tuple fails here before any device or HYPRE work.
+  if (selection == CudaTracePolicyKind::equilibrated_mgr)
+  {
+    if (engine != generic::CudaEngineKind::tensor_core || !igr_active)
+      return result;
+    result.trace_preconditioner =
+        CudaTracePreconditionerKind::hypre_mgr_field_split;
+    result.valid = true;
+    return result;
+  }
 
   // common-fast deliberately gives both CUDA engines the already-qualified
   // tensor trace policy.  This changes only the benchmark trace leaf; the
@@ -958,9 +980,20 @@ struct CudaTensorCoreEvidence
   // configuration predicates, never a per-solve history or event stream.
   std::uint64_t native_rank1_trace_solve_calls = 0;
   std::uint64_t hypre_trace_solve_calls = 0;
+  std::uint64_t equilibration_builds = 0;
+  std::uint64_t equilibration_passes = 0;
+  std::uint64_t mgr_setup_calls = 0;
+  std::uint64_t mgr_preconditioner_applications = 0;
+  std::uint64_t mgr_f_ilu_setups = 0;
+  std::uint64_t mgr_f_ilu_applications = 0;
+  double minimum_left_scale = 0.0;
+  double maximum_left_scale = 0.0;
+  double minimum_right_scale = 0.0;
+  double maximum_right_scale = 0.0;
   bool hardware_supported = false;
   bool trace_preconditioner_configured = false;
   bool native_rank1_trace_solver_configured = false;
+  bool hypre_mgr_rank1_trace_solver_configured = false;
   bool hypre_host_staged_rank2_trace_solver_configured = false;
   bool trace_solver_accounting_complete = false;
   bool ilu_accounting_complete = false;
