@@ -381,6 +381,100 @@ foreach(_order IN ITEMS 1 2 3)
       TIMEOUT 7200)
 endforeach()
 
+# Exact tensor-IGR optimization candidate: retain all six conventional/IGR,
+# periodic/physical, supplied/source, and localized-contact cases in the same
+# shared CPU/ordinary-CUDA/tensor-CUDA fixture as the legacy controls above.
+foreach(_order IN ITEMS 1 2 3)
+  math(EXPR _igr_volume_quadrature_order "2 * ${_order} + 4")
+  math(EXPR _igr_face_quadrature_order "2 * ${_order} + 2")
+  add_test(
+    NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_candidate_p${_order}_rank1
+    COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+      --order ${_order}
+      --igr-volume-quadrature-order ${_igr_volume_quadrature_order}
+      --igr-face-quadrature-order ${_igr_face_quadrature_order}
+      --newton-linear-rtol 1e-10
+      --final-linear-rtol 3e-11
+      --true-residual-tightening-linear-rtol 1e-12
+      --tensor-igr-trace-policy
+        native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64)
+  set_tests_properties(
+    dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_candidate_p${_order}_rank1
+    PROPERTIES
+      LABELS "hdg;runtime;cpu;cuda;generic-euler;alignment;ordinary;tensor;igr;contact;physical;periodic;source;initial-trace;conservation;trajectory;quadrature-candidate;role-tolerance-candidate;warp-field-split;p${_order}"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 7200)
+endforeach()
+
+# Parse and validate candidate policies without selecting a CUDA device.  The
+# same executable subsequently applies one policy to every CPU/ordinary/tensor
+# trajectory; these fast checks cover malformed input before that shared
+# numerical suite starts.
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_options_default
+  COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+    --validate-options-only)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_options_candidate
+  COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+    --order 3
+    --igr-volume-quadrature-order 10
+    --igr-face-quadrature-order 8
+    --newton-linear-rtol 1e-10
+    --final-linear-rtol 3e-11
+    --true-residual-tightening-linear-rtol 1e-12
+    --tensor-igr-trace-policy
+      native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64
+    --validate-options-only)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rejects_nonfinite_tolerance
+  COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+    --newton-linear-rtol nan --validate-options-only)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rejects_nonpositive_tolerance
+  COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+    --final-linear-rtol 0 --validate-options-only)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rejects_duplicate_tolerance
+  COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+    --newton-linear-rtol 1e-10 --newton-linear-rtol 1e-10
+    --validate-options-only)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rejects_invalid_tolerance_order
+  COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+    --newton-linear-rtol 1e-10 --final-linear-rtol 3e-11
+    --true-residual-tightening-linear-rtol 1e-9
+    --validate-options-only)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rejects_incomplete_quadrature
+  COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+    --igr-volume-quadrature-order 10 --validate-options-only)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rejects_duplicate_trace_policy
+  COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+    --tensor-igr-trace-policy engine-default
+    --tensor-igr-trace-policy common-fast --validate-options-only)
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_options_default
+  dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_options_candidate
+  PROPERTIES
+    LABELS "hdg;runtime;cpu;cuda;generic-euler;alignment;argument-validation"
+    PROCESSORS 1
+    TIMEOUT 30)
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rejects_nonfinite_tolerance
+  dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rejects_nonpositive_tolerance
+  dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rejects_duplicate_tolerance
+  dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rejects_invalid_tolerance_order
+  dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rejects_incomplete_quadrature
+  dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rejects_duplicate_trace_policy
+  PROPERTIES
+    LABELS "hdg;runtime;cpu;cuda;generic-euler;alignment;argument-validation"
+    PROCESSORS 1
+    TIMEOUT 30
+    WILL_FAIL TRUE)
+
 # The original entropy-wave convergence fixture is shared by CPU, ordinary
 # CUDA, and tensor CUDA.  Each rank-one case forms the complete CPU reference
 # first, selects MFEM CUDA once, then forms both CUDA engine ladders and

@@ -42,33 +42,70 @@ struct CpuQualificationTestAccess
 namespace dg::hdg::runtime::cuda_w8a::detail
 {
 
+constexpr bool CudaPreparedIluFactorAccountingValid(
+    const CudaIluFactorReusePolicy policy, const int trace_solves,
+    const int linear_solve_attempts, const std::uint64_t setups,
+    const std::uint64_t reuses,
+    const std::uint64_t maximum_factor_age) noexcept
+{
+  if (trace_solves <= 0 || linear_solve_attempts < trace_solves)
+    return false;
+  const std::uint64_t solves =
+      static_cast<std::uint64_t>(linear_solve_attempts);
+  switch (policy)
+  {
+  case CudaIluFactorReusePolicy::refresh_each_trace_solve:
+    return setups == solves && reuses == 0 && maximum_factor_age == 0;
+  case CudaIluFactorReusePolicy::first_trace_solve_per_attempt:
+    // A true-residual tightening is a same-matrix solve attempt: it reuses
+    // the factor but cannot increase matrix-generation age.  Consequently
+    // reuse count follows attempts while maximum age follows logical solves.
+    return setups == 1 && reuses == solves - 1 &&
+        maximum_factor_age ==
+            static_cast<std::uint64_t>(trace_solves - 1);
+  case CudaIluFactorReusePolicy::not_applicable:
+    return setups == 0 && reuses == 0 && maximum_factor_age == 0;
+  }
+  return false;
+}
+
+static_assert(CudaPreparedIluFactorAccountingValid(
+    CudaIluFactorReusePolicy::refresh_each_trace_solve,
+    1, 2, 2, 0, 0));
+static_assert(CudaPreparedIluFactorAccountingValid(
+    CudaIluFactorReusePolicy::first_trace_solve_per_attempt,
+    1, 2, 1, 1, 0));
+static_assert(CudaPreparedIluFactorAccountingValid(
+    CudaIluFactorReusePolicy::first_trace_solve_per_attempt,
+    2, 3, 1, 2, 1));
+static_assert(!CudaPreparedIluFactorAccountingValid(
+    CudaIluFactorReusePolicy::first_trace_solve_per_attempt,
+    1, 2, 1, 1, 1));
+
 constexpr bool CudaPreparedIluAccountingValid(
     const CudaTensorCoreEvidence& tensor, const int trace_solves,
-    const int linear_iterations, const generic::CudaEngineKind engine,
-    const bool igr_active) noexcept
+    const int linear_iterations, const int linear_solve_attempts,
+    const CudaTracePolicyDescriptor& policy) noexcept
 {
-  const auto preconditioner =
-      CudaTracePreconditionerForEngine(engine, igr_active);
+  const auto preconditioner = policy.trace_preconditioner;
   const bool ilu = CudaTracePreconditionerIsIlu(preconditioner);
-  const auto factor_reuse_policy =
-      CudaIluFactorReusePolicyForEngine(engine, igr_active);
-  const auto triangular_solve_kind =
-      CudaIluTriangularSolveKindForEngine(engine, igr_active);
-  const int lower_jacobi_iterations =
-      CudaIluLowerJacobiIterations(engine, igr_active);
-  const int upper_jacobi_iterations =
-      CudaIluUpperJacobiIterations(engine, igr_active);
+  const auto factor_reuse_policy = policy.ilu_factor_reuse_policy;
+  const auto triangular_solve_kind = policy.ilu_triangular_solve_kind;
+  const int lower_jacobi_iterations = policy.ilu_lower_jacobi_iterations;
+  const int upper_jacobi_iterations = policy.ilu_upper_jacobi_iterations;
+  if (!CudaTracePolicyDescriptorIsExact(policy)) return false;
   if (!ilu)
-    return preconditioner == CudaTracePreconditionerKind::hypre_diag_scale &&
-        tensor.ilu_type == -1 && tensor.ilu_level_of_fill == -1 &&
+    return tensor.ilu_type == policy.ilu_type &&
+        tensor.ilu_level_of_fill == policy.ilu_level_of_fill &&
         tensor.ilu_local_reordering == -1 &&
-        tensor.ilu_application_iterations == 0 &&
+        tensor.ilu_application_iterations ==
+            policy.ilu_application_iterations &&
         triangular_solve_kind ==
             CudaIluTriangularSolveKind::not_applicable &&
         tensor.ilu_triangular_solve_kind == triangular_solve_kind &&
         tensor.ilu_lower_jacobi_iterations == 0 &&
         tensor.ilu_upper_jacobi_iterations == 0 &&
-        tensor.ilu_accounting_kind == CudaIluAccountingKind::unavailable &&
+        tensor.ilu_accounting_kind == policy.ilu_accounting_kind &&
         factor_reuse_policy == CudaIluFactorReusePolicy::not_applicable &&
         tensor.ilu_factor_reuse_policy == factor_reuse_policy &&
         tensor.ilu_factor_setups == 0 &&
@@ -81,12 +118,12 @@ constexpr bool CudaPreparedIluAccountingValid(
         tensor.ilu_jacobi_factor_spmv_updates_upper_bound == 0 &&
         tensor.ilu_factor_age_generations == 0 &&
         tensor.ilu_accounting_complete;
-  const int expected_fill = 0;
-  const int expected_reordering = igr_active ? 1 : 0;
-  if (trace_solves <= 0 || linear_iterations < 0 || tensor.ilu_type != 0 ||
-      tensor.ilu_level_of_fill != expected_fill ||
-      tensor.ilu_local_reordering != expected_reordering ||
-      tensor.ilu_application_iterations != 1 ||
+  if (trace_solves <= 0 || linear_iterations < 0 ||
+      linear_solve_attempts < trace_solves || tensor.ilu_type != 0 ||
+      tensor.ilu_level_of_fill != policy.ilu_level_of_fill ||
+      tensor.ilu_local_reordering != policy.ilu_local_reordering ||
+      tensor.ilu_application_iterations !=
+          policy.ilu_application_iterations ||
       tensor.ilu_triangular_solve_kind != triangular_solve_kind ||
       tensor.ilu_lower_jacobi_iterations != lower_jacobi_iterations ||
       tensor.ilu_upper_jacobi_iterations != upper_jacobi_iterations ||
@@ -95,25 +132,17 @@ constexpr bool CudaPreparedIluAccountingValid(
       (triangular_solve_kind ==
            CudaIluTriangularSolveKind::iterative_jacobi &&
        (lower_jacobi_iterations != 5 || upper_jacobi_iterations != 5)) ||
-      tensor.ilu_accounting_kind !=
-          CudaIluAccountingKind::derived_bounds_v1 ||
+      tensor.ilu_accounting_kind != policy.ilu_accounting_kind ||
       !tensor.ilu_accounting_complete ||
       tensor.ilu_preconditioner_callbacks_lower_bound >
           tensor.ilu_preconditioner_callbacks_upper_bound)
     return false;
-  const std::uint64_t solves = static_cast<std::uint64_t>(trace_solves);
-  const bool factor_work = factor_reuse_policy ==
-          CudaIluFactorReusePolicy::refresh_each_trace_solve
-      ? tensor.ilu_factor_reuse_policy == factor_reuse_policy &&
-            tensor.ilu_factor_setups == solves &&
-            tensor.ilu_factor_reuses == 0 &&
-            tensor.ilu_factor_age_generations == 0
-      : factor_reuse_policy ==
-              CudaIluFactorReusePolicy::first_trace_solve_per_attempt &&
-            tensor.ilu_factor_reuse_policy == factor_reuse_policy &&
-            tensor.ilu_factor_setups == 1 &&
-            tensor.ilu_factor_reuses == solves - 1 &&
-            tensor.ilu_factor_age_generations == solves - 1;
+  const bool factor_work =
+      tensor.ilu_factor_reuse_policy == factor_reuse_policy &&
+      CudaPreparedIluFactorAccountingValid(
+          factor_reuse_policy, trace_solves, linear_solve_attempts,
+          tensor.ilu_factor_setups, tensor.ilu_factor_reuses,
+          tensor.ilu_factor_age_generations);
   if (!factor_work) return false;
   const std::uint64_t iterations =
       static_cast<std::uint64_t>(linear_iterations);
@@ -148,6 +177,114 @@ constexpr bool CudaPreparedIluAccountingValid(
           tensor.ilu_inner_iterations_upper_bound*factor_spmv_multiplier;
 }
 
+bool CudaPreparedTracePolicyValid(
+    const CudaTensorCoreEvidence& tensor, const int trace_solves,
+    const int linear_iterations, const int linear_solve_attempts,
+    const generic::CudaEngineKind engine, const bool igr_active,
+    const CudaTracePolicyKind trace_policy) noexcept
+{
+  const CudaTracePolicyDescriptor expected = ResolveCudaTracePolicy(
+      engine, igr_active, trace_policy);
+  if (!CudaTracePolicyDescriptorIsExact(expected) || trace_solves <= 0 ||
+      linear_iterations < 0 || linear_solve_attempts < trace_solves ||
+      !CudaPreparedIluAccountingValid(
+          tensor, trace_solves, linear_iterations, linear_solve_attempts,
+          expected))
+    return false;
+
+  const std::uint64_t solves = static_cast<std::uint64_t>(trace_solves);
+  const std::uint64_t attempts =
+      static_cast<std::uint64_t>(linear_solve_attempts);
+  const bool expected_mgr =
+      trace_policy == CudaTracePolicyKind::equilibrated_mgr;
+  const bool expected_matrix_free =
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(trace_policy);
+  const bool expected_element_schwarz = trace_policy ==
+          CudaTracePolicyKind::native_element_schwarz_fp64 ||
+      expected_matrix_free || trace_policy == CudaTracePolicyKind::
+          native_element_schwarz_equilibrated_field_split_fp64;
+  const bool expected_equilibrated_field_split = trace_policy ==
+          CudaTracePolicyKind::
+              native_element_schwarz_equilibrated_field_split_fp64 ||
+      trace_policy == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_fp64 ||
+      trace_policy == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
+  const bool expected_native_solver =
+      engine == generic::CudaEngineKind::tensor_core && !expected_mgr;
+  const bool mgr_work = expected_mgr
+      ? tensor.equilibration_builds == solves &&
+            tensor.equilibration_passes == 2 * solves &&
+            tensor.mgr_setup_calls == solves &&
+            tensor.mgr_f_ilu_setups == tensor.mgr_setup_calls &&
+            tensor.mgr_f_ilu_applications ==
+                tensor.mgr_preconditioner_applications &&
+            (linear_iterations == 0 ||
+             tensor.mgr_preconditioner_applications > 0) &&
+            std::isfinite(tensor.minimum_left_scale) &&
+            std::isfinite(tensor.maximum_left_scale) &&
+            std::isfinite(tensor.minimum_right_scale) &&
+            std::isfinite(tensor.maximum_right_scale) &&
+            tensor.minimum_left_scale > 0.0 &&
+            tensor.minimum_left_scale <= tensor.maximum_left_scale &&
+            tensor.minimum_right_scale > 0.0 &&
+            tensor.minimum_right_scale <= tensor.maximum_right_scale
+      : expected_equilibrated_field_split
+          ? tensor.equilibration_builds == solves &&
+                tensor.equilibration_passes ==
+                    native_element_schwarz_equilibration_passes * solves &&
+                tensor.mgr_setup_calls == 0 &&
+                tensor.mgr_preconditioner_applications == 0 &&
+                tensor.mgr_f_ilu_setups == 0 &&
+                tensor.mgr_f_ilu_applications == 0
+          : tensor.equilibration_builds == 0 &&
+                tensor.equilibration_passes == 0 &&
+                tensor.mgr_setup_calls == 0 &&
+                tensor.mgr_preconditioner_applications == 0 &&
+                tensor.mgr_f_ilu_setups == 0 &&
+                tensor.mgr_f_ilu_applications == 0;
+  const bool element_schwarz_work = expected_element_schwarz
+      ? tensor.native_element_schwarz_configured &&
+            tensor.element_schwarz_patch_setups == solves &&
+            (linear_iterations == 0 ||
+             tensor.element_schwarz_preconditioner_applications > 0) &&
+            (tensor.element_schwarz_patch_rows == 40 ||
+             tensor.element_schwarz_patch_rows == 60 ||
+             tensor.element_schwarz_patch_rows == 80) &&
+            tensor.element_schwarz_minimum_multiplicity >= 1 &&
+            tensor.element_schwarz_maximum_multiplicity >=
+                tensor.element_schwarz_minimum_multiplicity &&
+            tensor.element_schwarz_maximum_multiplicity <= 2
+      : !tensor.native_element_schwarz_configured &&
+            tensor.element_schwarz_patch_setups == 0 &&
+            tensor.element_schwarz_preconditioner_applications == 0 &&
+            tensor.element_schwarz_patch_rows == 0 &&
+            tensor.element_schwarz_minimum_multiplicity == 0 &&
+            tensor.element_schwarz_maximum_multiplicity == 0;
+  const bool matrix_free_work = expected_matrix_free
+      ? tensor.native_matrix_free_trace_operator_configured &&
+            tensor.native_matrix_free_trace_operator_applications >=
+                static_cast<std::uint64_t>(linear_iterations) &&
+            ((linear_iterations == 0) ==
+             (tensor.native_matrix_free_trace_operator_applications == 0))
+      : !tensor.native_matrix_free_trace_operator_configured &&
+            tensor.native_matrix_free_trace_operator_applications == 0;
+  return tensor.selected_engine == engine &&
+      tensor.trace_policy == trace_policy &&
+      tensor.trace_preconditioner_configured &&
+      tensor.trace_preconditioner == expected.trace_preconditioner &&
+      mgr_work && element_schwarz_work && matrix_free_work &&
+      tensor.trace_solver_accounting_complete &&
+      tensor.native_rank1_trace_solver_configured == expected_native_solver &&
+      tensor.hypre_mgr_rank1_trace_solver_configured == expected_mgr &&
+      !tensor.hypre_host_staged_rank2_trace_solver_configured &&
+      tensor.native_rank1_trace_solve_calls ==
+          (expected_native_solver ? attempts : 0) &&
+      tensor.hypre_trace_solve_calls ==
+          (expected_native_solver ? 0 : attempts) &&
+      tensor.fallback_accounting_complete;
+}
+
 struct CrossBackendPreparedHealth
 {
   double initial_residual = std::numeric_limits<double>::infinity();
@@ -160,6 +297,8 @@ struct CrossBackendPreparedHealth
   int nonlinear_updates = -1;
   int trace_solves = -1;
   int linear_iterations = -1;
+  int linear_solve_attempts = -1;
+  int true_residual_tightenings = -1;
   int line_search_trials = -1;
   int rejected_line_search_trials = -1;
   CudaTensorCoreEvidence tensor_core{};
@@ -195,6 +334,9 @@ struct CudaQualificationTestAccess
     health.nonlinear_updates = numerical.nonlinear_updates;
     health.trace_solves = numerical.trace_solves;
     health.linear_iterations = numerical.linear_iterations;
+    health.linear_solve_attempts = numerical.linear_solve_attempts;
+    health.true_residual_tightenings =
+        numerical.true_residual_tightenings;
     health.line_search_trials = numerical.line_search_trials;
     health.rejected_line_search_trials =
         numerical.rejected_line_search_trials;
@@ -220,6 +362,14 @@ struct CudaQualificationTestAccess
   {
     return session.borrowed_rank1_ &&
         CapturePreparedHealth(*session.borrowed_rank1_, health);
+  }
+
+  static dg::hdg::generic::HdgEulerSessionResult InitializeTracePolicy(
+      cuda::GenericEulerHdgCudaSession& session,
+      const dg::hdg::generic::EulerHdgRequest& request,
+      const CudaTracePolicyKind trace_policy) noexcept
+  {
+    return session.InitializeRequest(request, trace_policy);
   }
 
   template <typename Engine>
@@ -274,6 +424,8 @@ using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::EulerBoundaryPolicy;
 using dg::hdg::generic::EulerBoundaryPolicyKind;
 using dg::hdg::generic::EulerBoundaryPolicyTableView;
+using dg::hdg::generic::EulerHdgAssemblyQuadratureOrders;
+using dg::hdg::generic::EulerHdgNumericalPolicy;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::runtime::StateCoordinates;
@@ -283,6 +435,8 @@ using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using dg::hdg::runtime::cuda_w8a::detail::CrossBackendPreparedHealth;
 using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
+using dg::hdg::runtime::cuda_w8a::CudaTracePolicyKind;
+using dg::hdg::runtime::cuda_w8a::CudaTracePolicyKindName;
 
 constexpr int components = dg::hdg::generic::euler_2d_conserved_components;
 constexpr double comparison_relative_tolerance = 5.0e-8;
@@ -295,6 +449,22 @@ constexpr double igr_transition_width = 0.06;
 constexpr double igr_localization_half_width = 0.25;
 constexpr double igr_minimum_near_far_energy_ratio = 1.5;
 constexpr double igr_minimum_near_energy_fraction = 0.60;
+
+struct AlignmentSelection
+{
+  int order = 1;
+  EulerHdgAssemblyQuadratureOrders igr_assembly_quadrature_orders{0, 0};
+  // Zero retains DefaultEulerHdgNumericalPolicy.  Parsing admits only finite
+  // positive overrides and the complete policy validator enforces ordering.
+  double newton_correction_linear_relative_tolerance = 0.0;
+  double final_coherent_linear_relative_tolerance = 0.0;
+  double true_residual_tightening_linear_relative_tolerance = 0.0;
+  // This private selector is applied only to tensor-IGR cases.  Conventional
+  // tensor cases and both controls retain engine-default trace policy.
+  CudaTracePolicyKind tensor_igr_trace_policy =
+      CudaTracePolicyKind::engine_default;
+  bool validate_options_only = false;
+};
 
 constexpr std::uint32_t common_capabilities =
     CapabilityBit(Capability::conforming_quadrilateral_mesh) |
@@ -584,17 +754,55 @@ void ConfigureBoundary(BoundaryContext& boundary)
     policy = {EulerBoundaryPolicyKind::slip_wall, unused, 0.0};
 }
 
+EulerHdgNumericalPolicy SelectedNumericalPolicy(
+    const AlignmentSelection& selection,
+    const RegularizationKind regularization) noexcept
+{
+  EulerHdgNumericalPolicy policy =
+      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(selection.order);
+  if (selection.newton_correction_linear_relative_tolerance > 0.0)
+    policy.newton_correction_linear_relative_tolerance =
+        selection.newton_correction_linear_relative_tolerance;
+  if (selection.final_coherent_linear_relative_tolerance > 0.0)
+    policy.final_coherent_linear_relative_tolerance =
+        selection.final_coherent_linear_relative_tolerance;
+  if (selection.true_residual_tightening_linear_relative_tolerance > 0.0)
+    policy.true_residual_tightening_linear_relative_tolerance =
+        selection.true_residual_tightening_linear_relative_tolerance;
+  if (regularization == RegularizationKind::igr &&
+      selection.igr_assembly_quadrature_orders.volume_order > 0)
+    policy.igr_assembly_quadrature_orders =
+        selection.igr_assembly_quadrature_orders;
+  policy.stabilization = regularization == RegularizationKind::igr
+      ? dg::hdg::generic::RegularizationSelection{
+            RegularizationKind::igr, 0.2, 0.8}
+      : dg::hdg::generic::RegularizationSelection{
+            RegularizationKind::none, 0.0, 0.0};
+  return policy;
+}
+
+CudaTracePolicyKind SelectedCudaTracePolicy(
+    const AlignmentSelection& selection,
+    const CudaEngineKind engine,
+    const RegularizationKind regularization) noexcept
+{
+  return engine == CudaEngineKind::tensor_core &&
+          regularization == RegularizationKind::igr
+      ? selection.tensor_igr_trace_policy
+      : CudaTracePolicyKind::engine_default;
+}
+
 EulerHdgRequest MakeRequest(
     const mfem::ParMesh& mesh, const BorrowedFields& fields,
     BoundaryContext& boundary, const Case& specification,
-    const BackendKind backend, const int order,
+    const BackendKind backend, const AlignmentSelection& selection,
     const CudaEngineKind cuda_engine)
 {
   ConfigureBoundary(boundary);
   EulerHdgRequest request{};
   request.mesh = &mesh;
   request.communicator = mesh.GetComm();
-  request.polynomial_order = order;
+  request.polynomial_order = selection.order;
   request.backend = {backend, backend == BackendKind::cuda ? 0 : -1,
                      backend == BackendKind::cuda
                          ? cuda_engine : CudaEngineKind::ordinary};
@@ -615,14 +823,8 @@ EulerHdgRequest MakeRequest(
       ? EulerBoundaryPolicyTableView{
             boundary.policies.data(), boundary.policies.size(), 2, 1.4}
       : EulerBoundaryPolicyTableView{nullptr, 0, 2, 1.4};
-  request.numerical_policy =
-      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
-  request.numerical_policy.stabilization =
-      specification.regularization == RegularizationKind::igr
-      ? dg::hdg::generic::RegularizationSelection{
-            RegularizationKind::igr, 0.2, 0.8}
-      : dg::hdg::generic::RegularizationSelection{
-            RegularizationKind::none, 0.0, 0.0};
+  request.numerical_policy = SelectedNumericalPolicy(
+      selection, specification.regularization);
   return request;
 }
 
@@ -981,13 +1183,15 @@ bool CaptureCudaState(GenericEulerHdgCudaSession& session,
 
 Trajectory RunCuda(const EulerHdgRequest& request,
                    mfem::ParMesh& mesh, const BorrowedFields& fields,
-                   const Case& specification)
+                   const Case& specification,
+                   const CudaTracePolicyKind trace_policy)
 {
   Trajectory trajectory;
   GenericEulerHdgCudaSession session;
   if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
           ContractStatus::accepted ||
-      session.Initialize(request).status !=
+      CudaQualificationTestAccess::InitializeTracePolicy(
+          session, request, trace_policy).status !=
           dg::hdg::generic::HdgEulerSessionStatus::initialized)
     return trajectory;
   StepState initial;
@@ -1009,16 +1213,13 @@ Trajectory RunCuda(const EulerHdgRequest& request,
         CudaQualificationTestAccess::CapturePreparedHealth(session, health);
     const bool expected_engine =
         health.tensor_core.selected_engine == request.backend.cuda_engine &&
-        health.tensor_core.trace_preconditioner_configured &&
-        health.tensor_core.trace_preconditioner ==
-            dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerForEngine(
-                request.backend.cuda_engine,
-                specification.regularization == RegularizationKind::igr) &&
         dg::hdg::runtime::cuda_w8a::detail::
-            CudaPreparedIluAccountingValid(
+            CudaPreparedTracePolicyValid(
                 health.tensor_core, health.trace_solves,
-                health.linear_iterations, request.backend.cuda_engine,
-                specification.regularization == RegularizationKind::igr) &&
+                health.linear_iterations, health.linear_solve_attempts,
+                request.backend.cuda_engine,
+                specification.regularization == RegularizationKind::igr,
+                trace_policy) &&
         health.tensor_core.fallback_count == 0 && health.no_fallback &&
         health.tensor_volume_evidence_valid &&
         (request.backend.cuda_engine == CudaEngineKind::ordinary
@@ -1034,7 +1235,11 @@ Trajectory RunCuda(const EulerHdgRequest& request,
         health.nonlinear_updates <=
             request.numerical_policy.maximum_nonlinear_updates &&
         health.trace_solves >= 1 &&
-        health.linear_iterations >= 0 && health.line_search_trials >= 0 &&
+        health.linear_iterations >= 0 &&
+        health.linear_solve_attempts ==
+            health.trace_solves + health.true_residual_tightenings &&
+        health.true_residual_tightenings >= 0 &&
+        health.line_search_trials >= 0 &&
         health.rejected_line_search_trials >= 0 &&
         std::isfinite(health.initial_residual) &&
         std::isfinite(health.final_residual) &&
@@ -1227,10 +1432,11 @@ bool CompareTrajectory(const Case& specification,
 }
 
 Trajectory RunCase(const Case& specification, const BackendKind backend,
-                   const int order,
+                   const AlignmentSelection& selection,
                    const CudaEngineKind cuda_engine =
                        CudaEngineKind::ordinary)
 {
+  const int order = selection.order;
   mfem::ParMesh mesh = MakeMesh(specification.physical);
   BorrowedFields fields = MakeFields(
       mesh, specification.initial_mode, order,
@@ -1252,26 +1458,185 @@ Trajectory RunCase(const Case& specification, const BackendKind backend,
     return {};
   BoundaryContext boundary{};
   const EulerHdgRequest request = MakeRequest(
-      mesh, fields, boundary, specification, backend, order, cuda_engine);
+      mesh, fields, boundary, specification, backend, selection,
+      cuda_engine);
   return backend == BackendKind::cpu
       ? RunCpu(request, mesh, fields, specification)
-      : RunCuda(request, mesh, fields, specification);
+      : RunCuda(
+            request, mesh, fields, specification,
+            SelectedCudaTracePolicy(
+                selection, cuda_engine, specification.regularization));
 }
 
-bool ParseOrder(const int argc, char* argv[], int& order) noexcept
+bool ParseOrder(const std::string_view text, int& order) noexcept
 {
-  order = 1;
-  if (argc == 1) return true;
-  if (argc != 3 || std::string_view(argv[1]) != "--order") return false;
-  int parsed = 0;
-  const std::string_view value(argv[2]);
+  order = 0;
   const auto result = std::from_chars(
-      value.data(), value.data() + value.size(), parsed);
-  if (result.ec != std::errc{} ||
-      result.ptr != value.data() + value.size() || parsed < 1 || parsed > 3)
-    return false;
-  order = parsed;
-  return true;
+      text.data(), text.data() + text.size(), order);
+  return result.ec == std::errc{} &&
+      result.ptr == text.data() + text.size() && order >= 1 && order <= 3;
+}
+
+bool ParseQuadratureOrder(const std::string_view text, int& order) noexcept
+{
+  order = 0;
+  const auto result = std::from_chars(
+      text.data(), text.data() + text.size(), order);
+  return result.ec == std::errc{} &&
+      result.ptr == text.data() + text.size() && order >= 1 && order <= 14;
+}
+
+bool ParsePositiveDouble(
+    const std::string_view text, double& value) noexcept
+{
+  value = 0.0;
+  const auto result = std::from_chars(
+      text.data(), text.data() + text.size(), value,
+      std::chars_format::general);
+  return result.ec == std::errc{} &&
+      result.ptr == text.data() + text.size() &&
+      std::isfinite(value) && value > 0.0;
+}
+
+bool ParseCudaTracePolicy(
+    const std::string_view text, CudaTracePolicyKind& policy) noexcept
+{
+  constexpr std::array<CudaTracePolicyKind, 8> policies{{
+      CudaTracePolicyKind::engine_default,
+      CudaTracePolicyKind::common_fast,
+      CudaTracePolicyKind::equilibrated_mgr,
+      CudaTracePolicyKind::native_element_schwarz_fp64,
+      CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64,
+      CudaTracePolicyKind::
+          native_element_schwarz_equilibrated_field_split_fp64,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_fp64,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64}};
+  for (const CudaTracePolicyKind candidate : policies)
+    if (text == CudaTracePolicyKindName(candidate))
+    {
+      policy = candidate;
+      return true;
+    }
+  return false;
+}
+
+bool ValidAlignmentSelection(
+    const AlignmentSelection& selection) noexcept
+{
+  const EulerHdgNumericalPolicy conventional = SelectedNumericalPolicy(
+      selection, RegularizationKind::none);
+  const EulerHdgNumericalPolicy igr = SelectedNumericalPolicy(
+      selection, RegularizationKind::igr);
+  const auto tensor_igr_trace =
+      dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+          CudaEngineKind::tensor_core, true,
+          selection.tensor_igr_trace_policy);
+  return dg::hdg::generic::ValidEulerHdgNumericalPolicy(conventional) &&
+      dg::hdg::generic::ValidEulerHdgNumericalPolicy(igr) &&
+      dg::hdg::runtime::cuda_w8a::CudaTracePolicyDescriptorIsExact(
+          tensor_igr_trace);
+}
+
+bool ParseSelection(const int argc, char* argv[],
+                    AlignmentSelection& selection) noexcept
+{
+  selection = {};
+  bool have_order = false;
+  bool have_igr_volume_order = false;
+  bool have_igr_face_order = false;
+  bool have_newton_tolerance = false;
+  bool have_final_tolerance = false;
+  bool have_tightening_tolerance = false;
+  bool have_tensor_igr_trace_policy = false;
+  bool have_validate_options_only = false;
+  for (int argument = 1; argument < argc; ++argument)
+  {
+    const std::string_view option{argv[argument]};
+    if (option == "--order" && argument + 1 < argc && !have_order)
+    {
+      have_order = ParseOrder(argv[++argument], selection.order);
+      if (!have_order) return false;
+    }
+    else if (option == "--igr-volume-quadrature-order" &&
+             argument + 1 < argc && !have_igr_volume_order)
+    {
+      have_igr_volume_order = ParseQuadratureOrder(
+          argv[++argument],
+          selection.igr_assembly_quadrature_orders.volume_order);
+      if (!have_igr_volume_order) return false;
+    }
+    else if (option == "--igr-face-quadrature-order" &&
+             argument + 1 < argc && !have_igr_face_order)
+    {
+      have_igr_face_order = ParseQuadratureOrder(
+          argv[++argument],
+          selection.igr_assembly_quadrature_orders.face_order);
+      if (!have_igr_face_order) return false;
+    }
+    else if (option == "--newton-linear-rtol" &&
+             argument + 1 < argc && !have_newton_tolerance)
+    {
+      have_newton_tolerance = ParsePositiveDouble(
+          argv[++argument],
+          selection.newton_correction_linear_relative_tolerance);
+      if (!have_newton_tolerance) return false;
+    }
+    else if (option == "--final-linear-rtol" &&
+             argument + 1 < argc && !have_final_tolerance)
+    {
+      have_final_tolerance = ParsePositiveDouble(
+          argv[++argument],
+          selection.final_coherent_linear_relative_tolerance);
+      if (!have_final_tolerance) return false;
+    }
+    else if (option == "--true-residual-tightening-linear-rtol" &&
+             argument + 1 < argc && !have_tightening_tolerance)
+    {
+      have_tightening_tolerance = ParsePositiveDouble(
+          argv[++argument],
+          selection.true_residual_tightening_linear_relative_tolerance);
+      if (!have_tightening_tolerance) return false;
+    }
+    else if (option == "--tensor-igr-trace-policy" &&
+             argument + 1 < argc && !have_tensor_igr_trace_policy)
+    {
+      have_tensor_igr_trace_policy = ParseCudaTracePolicy(
+          argv[++argument], selection.tensor_igr_trace_policy);
+      if (!have_tensor_igr_trace_policy) return false;
+    }
+    else if (option == "--validate-options-only" &&
+             !have_validate_options_only)
+    {
+      selection.validate_options_only = true;
+      have_validate_options_only = true;
+    }
+    else
+    {
+      return false;
+    }
+  }
+  if (have_igr_volume_order != have_igr_face_order) return false;
+  return ValidAlignmentSelection(selection);
+}
+
+void PrintUsage(const char* const executable)
+{
+  std::cerr
+      << "Usage: " << executable
+      << " [--order 1|2|3]"
+         " [--igr-volume-quadrature-order Q"
+         " --igr-face-quadrature-order Q]"
+         " [--newton-linear-rtol R] [--final-linear-rtol R]"
+         " [--true-residual-tightening-linear-rtol R]"
+         " [--tensor-igr-trace-policy engine-default|common-fast|"
+         "equilibrated-mgr|native-element-schwarz-fp64|"
+         "native-element-schwarz-matrix-free-fp64|"
+         "native-element-schwarz-equilibrated-field-split-fp64|"
+         "native-element-schwarz-matrix-free-equilibrated-field-split-fp64|"
+         "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+         "fp64] [--validate-options-only]\n";
 }
 
 } // namespace
@@ -1281,17 +1646,35 @@ int main(int argc, char* argv[])
   mfem::MPI_Session mpi(argc, argv);
   int ranks = 0;
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
-  int order = 1;
-  if (!ParseOrder(argc, argv, order))
+  AlignmentSelection selection;
+  if (!ParseSelection(argc, argv, selection))
   {
-    std::cerr << "Usage: " << argv[0] << " [--order 1|2|3]\n";
+    PrintUsage(argv[0]);
     return 2;
   }
+  const int order = selection.order;
   if (ranks != 1)
   {
     std::cerr << "CPU/CUDA numerical-alignment qualification is rank-one; "
                  "rank-two correctness has separate generic coverage\n";
     return 2;
+  }
+  if (selection.validate_options_only)
+  {
+    const EulerHdgNumericalPolicy igr = SelectedNumericalPolicy(
+        selection, RegularizationKind::igr);
+    std::cout << "HDG numerical-alignment option validation passed order="
+              << order << " igr_quadrature="
+              << igr.igr_assembly_quadrature_orders.volume_order << '/'
+              << igr.igr_assembly_quadrature_orders.face_order
+              << " linear_tolerances="
+              << igr.newton_correction_linear_relative_tolerance << '/'
+              << igr.final_coherent_linear_relative_tolerance << '/'
+              << igr.true_residual_tightening_linear_relative_tolerance
+              << " tensor_igr_trace_policy="
+              << CudaTracePolicyKindName(
+                     selection.tensor_igr_trace_policy) << '\n';
+    return 0;
   }
   constexpr std::size_t case_count = 6;
   const std::array<Case, case_count> cases{{
@@ -1318,7 +1701,7 @@ int main(int argc, char* argv[])
   std::array<Trajectory, case_count> cpu_trajectories{};
   for (std::size_t index = 0; index < cases.size(); ++index)
     cpu_trajectories[index] = RunCase(
-        cases[index], BackendKind::cpu, order);
+        cases[index], BackendKind::cpu, selection);
   bool cpu_phase_ready = true;
   for (const Trajectory& trajectory : cpu_trajectories)
     cpu_phase_ready = trajectory.passed && cpu_phase_ready;
@@ -1345,7 +1728,7 @@ int main(int argc, char* argv[])
   std::array<Trajectory, case_count> tensor_trajectories{};
   for (std::size_t index = 0; index < cases.size(); ++index)
     ordinary_trajectories[index] = RunCase(
-        cases[index], BackendKind::cuda, order,
+        cases[index], BackendKind::cuda, selection,
         CudaEngineKind::ordinary);
   const bool ordinary_phase_ready = std::all_of(
       ordinary_trajectories.begin(), ordinary_trajectories.end(),
@@ -1365,7 +1748,7 @@ int main(int argc, char* argv[])
   }
   for (std::size_t index = 0; index < cases.size(); ++index)
     tensor_trajectories[index] = RunCase(
-        cases[index], BackendKind::cuda, order,
+        cases[index], BackendKind::cuda, selection,
         CudaEngineKind::tensor_core);
   const bool tensor_phase_ready = std::all_of(
       tensor_trajectories.begin(), tensor_trajectories.end(),
@@ -1408,8 +1791,21 @@ int main(int argc, char* argv[])
   }
   passed = All(passed);
   if (passed)
+  {
+    const EulerHdgNumericalPolicy igr = SelectedNumericalPolicy(
+        selection, RegularizationKind::igr);
     std::cout << "HDG CPU/ordinary-CUDA/tensor-CUDA numerical alignment and "
                  "IGR discontinuity qualification passed order="
-              << order << '\n';
+              << order << " igr_quadrature="
+              << igr.igr_assembly_quadrature_orders.volume_order << '/'
+              << igr.igr_assembly_quadrature_orders.face_order
+              << " linear_tolerances="
+              << igr.newton_correction_linear_relative_tolerance << '/'
+              << igr.final_coherent_linear_relative_tolerance << '/'
+              << igr.true_residual_tightening_linear_relative_tolerance
+              << " tensor_igr_trace_policy="
+              << CudaTracePolicyKindName(
+                     selection.tensor_igr_trace_policy) << '\n';
+  }
   return passed ? 0 : 1;
 }
