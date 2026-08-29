@@ -44,9 +44,9 @@ set(_expected_ilu_accounting_kind derived_bounds_v1)
 if(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor" AND
    HDG_REPRESENTATIVE_RANKS EQUAL 1)
   set(_expected_trace_preconditioner
-    native_element_schwarz_warp_equilibrated_field_split_fp64)
+    native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64)
   set(_expected_resolved_trace_policy
-    native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64)
+    native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi10-fp64)
   set(_expected_trace_solver native-rank1-fp64)
   set(_expected_ilu_type -1)
   set(_expected_ilu_fill -1)

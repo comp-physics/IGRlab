@@ -195,9 +195,14 @@ args = parser.parse_args()
 is_frozen = "frozen" in str(Path(__file__))
 common_fast = args.trace_policy == "common-fast"
 resolved_trace_policy = (
-    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64"
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi10-fp64"
     if args.trace_policy == "engine-default" and
-    args.engine == "tensor" and args.mode == "igr"
+    args.engine == "tensor" and args.mode == "igr" and args.order <= 2
+    else "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi2-fp64"
+    if args.trace_policy == "engine-default" and
+    args.engine == "tensor" and args.mode == "igr" and args.order == 3
     else args.trace_policy
 )
 equilibrated_mgr = resolved_trace_policy == "equilibrated-mgr"
@@ -2041,11 +2046,12 @@ def main() -> int:
         ] == "characterization_only_not_a_promotion_gate"
         assert campaign["performance_disposition"][
             "tensor_vs_final_tree_ordinary"
-        ]["attribution_by_mode"]["igr"]["trace_policy_matched"] is False
+        ]["attribution_by_cell"]["igr_p3"]["trace_policy_matched"] is False
         assert campaign["export_control"]["attribution"][
             "tensor_trace_preconditioner"
         ] == (
-            "native_element_schwarz_warp_equilibrated_field_split_fp64"
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi2_fp64"
         )
         assert campaign["export_control"]["attribution"][
             "mma_contribution_requires_separate_profiler_attribution"
@@ -2064,9 +2070,27 @@ def main() -> int:
         assert CAMPAIGN.expected_trace_preconditioner(
             "tensor", "conventional"
         ) == "hypre_diag_scale"
-        assert CAMPAIGN.expected_trace_preconditioner(
-            "tensor", "igr"
-        ) == "native_element_schwarz_warp_equilibrated_field_split_fp64"
+        for order, sweeps in ((1, 10), (2, 10), (3, 2)):
+            policy, descriptor = CAMPAIGN.production_tensor_igr_trace_policy(
+                order
+            )
+            assert descriptor.sweeps == sweeps
+            assert descriptor.warp is True
+            assert CAMPAIGN.expected_resolved_trace_policy(
+                "tensor", "igr", order=order
+            ) == policy
+            assert CAMPAIGN.expected_trace_preconditioner(
+                "tensor", "igr", order=order
+            ) == descriptor.preconditioner
+        for invalid_order in (None, False, 0, 4):
+            try:
+                CAMPAIGN.production_tensor_igr_trace_policy(invalid_order)
+            except CAMPAIGN.CampaignError:
+                pass
+            else:
+                raise AssertionError(
+                    "production tensor-IGR routing admitted invalid order"
+                )
         assert CAMPAIGN.expected_trace_ilu_policy(
             "ordinary", "conventional"
         ) == (0, 0, 0, 1)
@@ -2225,11 +2249,15 @@ def main() -> int:
                 "median_speedup_95_percent_confidence_interval"
             ]["resamples"] == 100
             mode = "igr" if cell_key.startswith("igr_") else "conventional"
+            order = int(cell_key.rsplit("_p", 1)[1])
             attribution = comparison["attribution"]
             assert attribution["scope"] == "complete_engine_package"
+            assert attribution["polynomial_order"] == order
             assert attribution["ordinary_trace_preconditioner"] == "hypre_ilu0"
             assert attribution["tensor_trace_preconditioner"] == (
-                "native_element_schwarz_warp_equilibrated_field_split_fp64"
+                CAMPAIGN.expected_trace_preconditioner(
+                    "tensor", "igr", order=order
+                )
                 if mode == "igr"
                 else "hypre_diag_scale"
             )
@@ -2269,7 +2297,9 @@ def main() -> int:
             assert result["engines"]["tensor"]["solver_work"][
                 "trace_preconditioners"
             ] == [
-                "native_element_schwarz_warp_equilibrated_field_split_fp64"
+                CAMPAIGN.expected_trace_preconditioner(
+                    "tensor", "igr", order=order
+                )
                 if cell_key.startswith("igr_")
                 else "hypre_diag_scale"
             ]
@@ -2281,6 +2311,7 @@ def main() -> int:
                         engine,
                         "igr" if cell_key.startswith("igr_")
                         else "conventional",
+                        order=order,
                     )
                 ]
                 expected_trace_solver = (
@@ -2390,7 +2421,6 @@ def main() -> int:
             assert result["engines"]["tensor"]["solver_work"][
                 "tensor_core"
             ]["mma_tiles"]["total"] == 640
-            order = int(cell_key.rsplit("_p", 1)[1])
             volume_points = 49 if mode == "igr" else (order + 2) ** 2
             volume_plan = CAMPAIGN.tensor_volume_work_plan(
                 mode=mode,
@@ -2438,7 +2468,8 @@ def main() -> int:
             assert summary["requested_trace_policy"] == "engine-default"
             assert summary["resolved_trace_policy"] == \
                 CAMPAIGN.expected_resolved_trace_policy(
-                    item["comparison_member"], item["mode"]
+                    item["comparison_member"], item["mode"],
+                    order=item["order"],
                 )
             expected_trace_solver = (
                 "native-rank1-fp64"
@@ -2447,7 +2478,8 @@ def main() -> int:
             )
             assert summary["trace_solver"] == expected_trace_solver
             expected_preconditioner = CAMPAIGN.expected_trace_preconditioner(
-                item["comparison_member"], item["mode"]
+                item["comparison_member"], item["mode"],
+                order=item["order"],
             )
             assert summary["trace_preconditioner"] == expected_preconditioner
             assert summary["measured_linear_iterations_total"] == 35
@@ -2639,7 +2671,7 @@ def main() -> int:
             assert summary["resolved_trace_policy"] == \
                 CAMPAIGN.expected_resolved_trace_policy(
                     selection["engine"], item["mode"],
-                    selection["trace_policy"]
+                    selection["trace_policy"], order=item["order"],
                 )
             expected_trace_solver = (
                 "native-rank1-fp64"
@@ -2653,7 +2685,7 @@ def main() -> int:
                 sample["resolved_trace_policy"] ==
                     CAMPAIGN.expected_resolved_trace_policy(
                         selection["engine"], item["mode"],
-                        selection["trace_policy"]
+                        selection["trace_policy"], order=item["order"],
                     ) and
                 sample["trace_solver"] == expected_trace_solver
                 for sample in summary["measured_sample_work"]
@@ -2929,14 +2961,21 @@ def main() -> int:
             "engine": "tensor",
             "expected_build": tensor_igr_record["build_identity"],
         }
+        tensor_igr_policy, tensor_igr_descriptor = \
+            CAMPAIGN.production_tensor_igr_trace_policy(
+                tensor_igr_invocation["order"]
+            )
         assert tensor_igr_record[
             "trace_preconditioner"
-        ] == "native_element_schwarz_warp_equilibrated_field_split_fp64"
+        ] == tensor_igr_descriptor.preconditioner
         assert tensor_igr_record["requested_trace_policy"] == "engine-default"
-        assert tensor_igr_record["resolved_trace_policy"] == (
-            "native-element-schwarz-matrix-free-warp-"
-            "equilibrated-field-split-fp64"
-        )
+        assert tensor_igr_record["resolved_trace_policy"] == tensor_igr_policy
+        assert tensor_igr_record[
+            "trace_field_split_sigma_jacobi_sweeps"
+        ] == tensor_igr_descriptor.sweeps
+        assert tensor_igr_record[
+            "trace_field_split_sigma_jacobi_damping"
+        ] == 2.0 / 3.0
         assert tensor_igr_record["trace_ilu_type"] == -1
         assert tensor_igr_record["trace_ilu_level_of_fill"] == -1
         assert tensor_igr_record["trace_ilu_application_iterations"] == 0
@@ -2954,12 +2993,19 @@ def main() -> int:
         assert tensor_igr_record["trace_ilu_upper_jacobi_iterations"] == 0
         assert all(
             sample["tensor_core"]["trace_preconditioner"] ==
-            "native_element_schwarz_warp_equilibrated_field_split_fp64" and
+            tensor_igr_descriptor.preconditioner and
             sample["tensor_core"]["requested_trace_policy"] ==
             "engine-default" and
             sample["tensor_core"]["resolved_trace_policy"] ==
-            "native-element-schwarz-matrix-free-warp-"
-            "equilibrated-field-split-fp64" and
+            tensor_igr_policy and
+            sample["tensor_core"]["field_split_sigma_jacobi_sweeps"] ==
+            tensor_igr_descriptor.sweeps and
+            sample["tensor_core"]["field_split_sigma_jacobi_damping"] ==
+            2.0 / 3.0 and
+            sample["tensor_core"]["field_split_sigma_jacobi_updates"] ==
+            sample["tensor_core"][
+                "element_schwarz_preconditioner_applications"
+            ] * tensor_igr_descriptor.sweeps and
             sample["tensor_core"]["ilu_type"] == -1 and
             sample["tensor_core"]["ilu_level_of_fill"] == -1 and
             sample["tensor_core"]["ilu_application_iterations"] == 0 and
@@ -3479,35 +3525,39 @@ def main() -> int:
             "final_tree_ordinary_vs_frozen_control"
         ]
         assert tensor_disposition["all_six_cells_disclosed"] is True
-        assert tensor_disposition["attribution_by_mode"]["igr"][
-            "tensor_trace_preconditioner"
-        ] == "native_element_schwarz_warp_equilibrated_field_split_fp64"
-        assert tensor_disposition["attribution_by_mode"]["igr"][
-            "trace_policy_matched"
-        ] is False
-        assert tensor_disposition["attribution_by_mode"]["igr"][
-            "trace_preconditioner_configuration_matched"
-        ] is False
-        assert tensor_disposition["attribution_by_mode"]["igr"][
-            "ordinary_ilu_factor_reuse_policy"
-        ] == "refresh_each_trace_solve"
-        assert tensor_disposition["attribution_by_mode"]["igr"][
-            "tensor_ilu_factor_reuse_policy"
-        ] == "not_applicable"
-        assert tensor_disposition["attribution_by_mode"]["igr"][
-            "ordinary_ilu_triangular_solve_policy"
-        ]["kind"] == "direct"
-        assert tensor_disposition["attribution_by_mode"]["igr"][
-            "tensor_ilu_triangular_solve_policy"
-        ] == {
-            "kind": "not_applicable",
-            "lower_jacobi_iterations": 0,
-            "upper_jacobi_iterations": 0,
-            "jacobi_factor_spmv_updates_per_application": 0,
-        }
-        assert tensor_disposition["attribution_by_mode"]["igr"][
-            "mma_contribution_requires_separate_profiler_attribution"
-        ] is True
+        attribution_by_cell = tensor_disposition["attribution_by_cell"]
+        assert set(attribution_by_cell) == expected_cells
+        for order in (1, 2, 3):
+            _, descriptor = CAMPAIGN.production_tensor_igr_trace_policy(order)
+            igr_attribution = attribution_by_cell[f"igr_p{order}"]
+            assert igr_attribution["polynomial_order"] == order
+            assert igr_attribution[
+                "tensor_trace_preconditioner"
+            ] == descriptor.preconditioner
+            assert igr_attribution["trace_policy_matched"] is False
+            assert igr_attribution[
+                "trace_preconditioner_configuration_matched"
+            ] is False
+            assert igr_attribution[
+                "ordinary_ilu_factor_reuse_policy"
+            ] == "refresh_each_trace_solve"
+            assert igr_attribution[
+                "tensor_ilu_factor_reuse_policy"
+            ] == "not_applicable"
+            assert igr_attribution[
+                "ordinary_ilu_triangular_solve_policy"
+            ]["kind"] == "direct"
+            assert igr_attribution[
+                "tensor_ilu_triangular_solve_policy"
+            ] == {
+                "kind": "not_applicable",
+                "lower_jacobi_iterations": 0,
+                "upper_jacobi_iterations": 0,
+                "jacobi_factor_spmv_updates_per_application": 0,
+            }
+            assert igr_attribution[
+                "mma_contribution_requires_separate_profiler_attribution"
+            ] is True
         assert len(tensor_disposition["cells"]) == 6
         assert tensor_disposition["saturated_pass"] is True
         assert tensor_disposition["disposition"] == \

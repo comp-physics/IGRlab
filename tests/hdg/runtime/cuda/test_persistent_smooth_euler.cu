@@ -3085,11 +3085,21 @@ constexpr bool ProductionTracePolicyResolutionPolicy() noexcept
   using dg::hdg::generic::CudaEngineKind;
   using dg::hdg::runtime::cuda_w8a::detail::CudaTraceSolverKind;
   using dg::hdg::runtime::cuda_w8a::detail::ResolveCudaTraceSolverKind;
-  constexpr CudaTracePolicyKind warp = CudaTracePolicyKind::
-      native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
   for (int order = dg::hdg::generic::minimum_polynomial_order;
        order <= dg::hdg::generic::maximum_polynomial_order; ++order)
   {
+    const CudaTracePolicyKind expected_policy = order <= 2
+        ? CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi10_fp64
+        : CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi2_fp64;
+    const CudaTracePreconditionerKind expected_preconditioner = order <= 2
+        ? CudaTracePreconditionerKind::
+              native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64
+        : CudaTracePreconditionerKind::
+              native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64;
+    const int expected_sweeps = order <= 2
+        ? native_element_schwarz_sigma_jacobi_maximum_sweeps : 2;
     const auto tensor_rank1 =
         dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
             CudaEngineKind::tensor_core, true, 1, order,
@@ -3097,11 +3107,18 @@ constexpr bool ProductionTracePolicyResolutionPolicy() noexcept
     if (!CudaTracePolicyDescriptorIsExact(tensor_rank1) ||
         tensor_rank1.requested_selection !=
             CudaTracePolicyKind::engine_default ||
-        tensor_rank1.resolved_selection != warp ||
+        tensor_rank1.resolved_selection != expected_policy ||
         tensor_rank1.rank_count != 1 ||
         tensor_rank1.polynomial_order != order ||
-        tensor_rank1.trace_preconditioner != CudaTracePreconditionerKind::
-            native_element_schwarz_warp_equilibrated_field_split_fp64 ||
+        tensor_rank1.trace_preconditioner != expected_preconditioner ||
+        !CudaTracePolicyUsesNativeElementMatrixFreeWarpEquilibratedFieldSplit(
+            tensor_rank1.resolved_selection) ||
+        !CudaTracePreconditionerUsesFixedSigmaJacobi(
+            tensor_rank1.trace_preconditioner) ||
+        CudaTracePolicyFixedSigmaJacobiSweeps(
+            tensor_rank1.resolved_selection) != expected_sweeps ||
+        CudaTracePreconditionerFixedSigmaJacobiSweeps(
+            tensor_rank1.trace_preconditioner) != expected_sweeps ||
         ResolveCudaTraceSolverKind(
             tensor_rank1.selected_engine, tensor_rank1.rank_count, false,
             true, true, true, tensor_rank1.resolved_selection) !=
@@ -3127,7 +3144,7 @@ constexpr bool ProductionTracePolicyResolutionPolicy() noexcept
 
     const auto rejected_rank2_explicit =
         dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
-            CudaEngineKind::tensor_core, true, 2, order, warp);
+            CudaEngineKind::tensor_core, true, 2, order, expected_policy);
     if (rejected_rank2_explicit.valid ||
         CudaTracePolicyDescriptorIsExact(rejected_rank2_explicit))
       return false;
@@ -3149,6 +3166,21 @@ constexpr bool ProductionTracePolicyResolutionPolicy() noexcept
                 CudaTracePreconditionerKind::hypre_ilu0)
           return false;
       }
+    }
+    for (const int ranks : {1, 2})
+    {
+      const auto tensor_conventional =
+          dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+              CudaEngineKind::tensor_core, false, ranks, order,
+              CudaTracePolicyKind::engine_default);
+      if (!CudaTracePolicyDescriptorIsExact(tensor_conventional) ||
+          tensor_conventional.requested_selection !=
+              CudaTracePolicyKind::engine_default ||
+          tensor_conventional.resolved_selection !=
+              CudaTracePolicyKind::engine_default ||
+          tensor_conventional.trace_preconditioner !=
+              CudaTracePreconditionerKind::hypre_diag_scale)
+        return false;
     }
   }
   return !dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
@@ -3343,9 +3375,15 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       tensor_igr_default.requested_selection ==
           CudaTracePolicyKind::engine_default &&
       tensor_igr_default.resolved_selection == CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64 &&
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi10_fp64 &&
       tensor_igr_default.trace_preconditioner == CudaTracePreconditionerKind::
-          native_element_schwarz_warp_equilibrated_field_split_fp64 &&
+          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64 &&
+      CudaTracePolicyFixedSigmaJacobiSweeps(
+          tensor_igr_default.resolved_selection) ==
+          native_element_schwarz_sigma_jacobi_maximum_sweeps &&
+      CudaTracePreconditionerFixedSigmaJacobiSweeps(
+          tensor_igr_default.trace_preconditioner) ==
+          native_element_schwarz_sigma_jacobi_maximum_sweeps &&
       tensor_igr_default.ilu_local_reordering == -1 &&
       tensor_igr_default.ilu_triangular_solve_kind ==
           CudaIluTriangularSolveKind::not_applicable &&

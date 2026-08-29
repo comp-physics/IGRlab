@@ -141,10 +141,17 @@ if(HDG_MAIN_DEVICE STREQUAL "cuda")
   elseif(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor" AND
          HDG_MAIN_REGULARIZATION STREQUAL "igr" AND
          HDG_MAIN_RANKS EQUAL 1)
-    set(_expected_trace_preconditioner
-      native_element_schwarz_warp_equilibrated_field_split_fp64)
-    set(_expected_resolved_trace_policy
-      native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64)
+    if(HDG_MAIN_ORDER LESS_EQUAL 2)
+      set(_expected_trace_preconditioner
+        native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64)
+      set(_expected_resolved_trace_policy
+        native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi10-fp64)
+    else()
+      set(_expected_trace_preconditioner
+        native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64)
+      set(_expected_resolved_trace_policy
+        native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi2-fp64)
+    endif()
     set(_expected_ilu_type -1)
     set(_expected_ilu_fill -1)
     set(_expected_ilu_iterations 0)

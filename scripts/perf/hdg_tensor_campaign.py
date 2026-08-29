@@ -32,8 +32,6 @@ TRACE_PRECONDITIONER_BY_POLICY_ENGINE_AND_MODE = {
     ("engine-default", "ordinary", "conventional"): "hypre_ilu0",
     ("engine-default", "ordinary", "igr"): "hypre_ilu0",
     ("engine-default", "tensor", "conventional"): "hypre_diag_scale",
-    ("engine-default", "tensor", "igr"):
-        "native_element_schwarz_warp_equilibrated_field_split_fp64",
     ("common-fast", "ordinary", "conventional"): "hypre_diag_scale",
     ("common-fast", "ordinary", "igr"): "hypre_ilu0",
     ("common-fast", "tensor", "conventional"): "hypre_diag_scale",
@@ -336,6 +334,20 @@ FIXED_SIGMA_JACOBI_POLICY = {
         True,
     ),
 }
+PRODUCTION_TENSOR_IGR_TRACE_POLICY_BY_ORDER = {
+    1: (
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi10-fp64"
+    ),
+    2: (
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi10-fp64"
+    ),
+    3: (
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi2-fp64"
+    ),
+}
 for _fixed_policy, (_fixed_sweeps, _fixed_preconditioner, _fixed_warp) in \
         FIXED_SIGMA_JACOBI_POLICY.items():
     _fixed_key = (_fixed_policy, "tensor", "igr")
@@ -354,6 +366,23 @@ def fixed_sigma_jacobi_policy(trace_policy: str) -> FixedSigmaJacobiPolicy:
     return FIXED_SIGMA_JACOBI_POLICY.get(
         trace_policy, NO_FIXED_SIGMA_JACOBI_POLICY
     )
+
+
+def production_tensor_igr_trace_policy(
+        order: int | None) -> tuple[str, FixedSigmaJacobiPolicy]:
+    """Return the exact rank-one engine-default winner for one p1--p3 cell."""
+    if isinstance(order, bool):
+        raise CampaignError("production tensor-IGR policy order is invalid")
+    try:
+        policy = PRODUCTION_TENSOR_IGR_TRACE_POLICY_BY_ORDER[order]
+    except (KeyError, TypeError) as error:
+        raise CampaignError(
+            "production tensor-IGR policy requires polynomial order 1, 2, or 3"
+        ) from error
+    descriptor = fixed_sigma_jacobi_policy(policy)
+    if descriptor.sweeps <= 0 or not descriptor.warp:
+        raise CampaignError("production tensor-IGR policy table is inconsistent")
+    return policy, descriptor
 
 
 SAME_POLICY_MEMBERS = {
@@ -432,22 +461,24 @@ class CampaignError(RuntimeError):
 
 def expected_resolved_trace_policy(
         engine: str, mode: str,
-        requested_trace_policy: str = "engine-default") -> str:
+        requested_trace_policy: str = "engine-default", *,
+        order: int | None = None) -> str:
     """Return the deterministic rank-one production policy resolution."""
     if requested_trace_policy != "engine-default":
         return requested_trace_policy
     if engine == "tensor" and mode == "igr":
-        return (
-            "native-element-schwarz-matrix-free-warp-"
-            "equilibrated-field-split-fp64"
-        )
+        return production_tensor_igr_trace_policy(order)[0]
     return "engine-default"
 
 
 def expected_trace_preconditioner(
         engine: str, mode: str,
-        trace_policy: str = "engine-default") -> str:
+        trace_policy: str = "engine-default", *,
+        order: int | None = None) -> str:
     """Return the exact typed engine-and-mode trace policy."""
+    if trace_policy == "engine-default" and engine == "tensor" and \
+            mode == "igr":
+        return production_tensor_igr_trace_policy(order)[1].preconditioner
     try:
         return TRACE_PRECONDITIONER_BY_POLICY_ENGINE_AND_MODE[
             (trace_policy, engine, mode)
@@ -519,10 +550,14 @@ def expected_trace_solver_configuration(
         ) from error
 
 
-def tensor_comparison_attribution(mode: str) -> dict[str, Any]:
+def tensor_comparison_attribution(mode: str, order: int) -> dict[str, Any]:
     """Describe the policy scope of an ordinary-versus-tensor speedup."""
-    ordinary_preconditioner = expected_trace_preconditioner("ordinary", mode)
-    tensor_preconditioner = expected_trace_preconditioner("tensor", mode)
+    ordinary_preconditioner = expected_trace_preconditioner(
+        "ordinary", mode, order=order
+    )
+    tensor_preconditioner = expected_trace_preconditioner(
+        "tensor", mode, order=order
+    )
     ordinary_ilu = expected_trace_ilu_policy("ordinary", mode)
     tensor_ilu = expected_trace_ilu_policy("tensor", mode)
     ordinary_reuse = expected_trace_ilu_factor_reuse_policy("ordinary", mode)
@@ -540,6 +575,7 @@ def tensor_comparison_attribution(mode: str) -> dict[str, Any]:
     )
     return {
         "scope": "complete_engine_package",
+        "polynomial_order": order,
         "ordinary_trace_policy": "engine-default",
         "tensor_trace_policy": "engine-default",
         "ordinary_trace_preconditioner": ordinary_preconditioner,
@@ -567,21 +603,22 @@ def tensor_comparison_attribution(mode: str) -> dict[str, Any]:
 
 
 def trace_policy_configuration(
-        engine: str, mode: str, trace_policy: str) -> dict[str, Any]:
+        engine: str, mode: str, trace_policy: str, *,
+        order: int) -> dict[str, Any]:
     """Return the exact policy dimensions required from one benchmark run."""
     ilu = expected_trace_ilu_policy(engine, mode, trace_policy)
     triangular = expected_trace_ilu_triangular_solve_policy(
         engine, mode, trace_policy
     )
     resolved_trace_policy = expected_resolved_trace_policy(
-        engine, mode, trace_policy
+        engine, mode, trace_policy, order=order
     )
     return {
         "trace_policy": trace_policy,
         "requested_trace_policy": trace_policy,
         "resolved_trace_policy": resolved_trace_policy,
         "trace_preconditioner": expected_trace_preconditioner(
-            engine, mode, trace_policy
+            engine, mode, trace_policy, order=order
         ),
         "ilu_type": ilu[0],
         "ilu_level_of_fill": ilu[1],
@@ -629,13 +666,14 @@ def record_trace_policy_configuration(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def same_policy_attribution(mode: str) -> dict[str, Any]:
+def same_policy_attribution(mode: str, order: int) -> dict[str, Any]:
     """Describe the bounded, provisional three-member attribution contract."""
     members = {
         name: {
             **selection,
             "configuration": trace_policy_configuration(
-                selection["engine"], mode, selection["trace_policy"]
+                selection["engine"], mode, selection["trace_policy"],
+                order=order
             ),
         }
         for name, selection in SAME_POLICY_MEMBERS.items()
@@ -1662,7 +1700,7 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
     if tensor.get("selected_engine") != engine:
         raise CampaignError("sample engine evidence differs from selection")
     resolved_trace_policy = expected_resolved_trace_policy(
-        engine, mode, trace_policy
+        engine, mode, trace_policy, order=order
     )
     if tensor.get("requested_trace_policy") != trace_policy:
         raise CampaignError(
@@ -2290,7 +2328,7 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
         )
     if source == "final":
         resolved_trace_policy = expected_resolved_trace_policy(
-            engine, mode, trace_policy
+            engine, mode, trace_policy, order=order
         )
         if record.get("requested_trace_policy") != trace_policy or \
                 record.get("resolved_trace_policy") != resolved_trace_policy:
@@ -2347,7 +2385,7 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
             raise CampaignError("benchmark warmup/measured policy is invalid")
         validate_memory_controls(record)
         expected_preconditioner = expected_trace_preconditioner(
-            engine, mode, trace_policy
+            engine, mode, trace_policy, order=order
         )
         expected_trace_solver = expected_trace_solver_configuration(
             engine, mode, trace_policy
@@ -2422,7 +2460,7 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
                 f"{expected_factor_reuse!r} for {engine!r}/{mode!r}"
             )
         expected_configuration = trace_policy_configuration(
-            engine, mode, trace_policy
+            engine, mode, trace_policy, order=order
         )
         observed_configuration = record_trace_policy_configuration(record)
         if observed_configuration != expected_configuration:
@@ -3330,7 +3368,9 @@ def final_command(executable: Path, *, engine: str, mode: str, order: int,
     # Fail before launching the benchmark when the explicit policy is not
     # defined for this exact engine/mode tuple.  The MGR and native element-
     # Schwarz experiments are tensor+IGR rank-one policies only.
-    expected_trace_solver_configuration(engine, mode, trace_policy)
+    trace_policy_configuration(
+        engine, mode, trace_policy, order=order
+    )
     return [
         str(executable),
         "--mode", mode,
@@ -3363,7 +3403,8 @@ def frozen_command(executable: Path, *, mode: str, order: int, mesh_n: int,
 
 
 def summarize_tensor_cell(records: dict[str, dict[int, dict[str, Any]]],
-                          *, mode: str, bootstrap_resamples: int,
+                          *, mode: str, order: int,
+                          bootstrap_resamples: int,
                           bootstrap_seed: int) -> dict[str, Any]:
     result: dict[str, Any] = {"engines": {}}
     for engine in ("ordinary", "tensor"):
@@ -3401,7 +3442,7 @@ def summarize_tensor_cell(records: dict[str, dict[int, dict[str, Any]]],
     )
     result["paired_comparison"] = {
         "speedup_definition": "ordinary invocation median / tensor invocation median",
-        "attribution": tensor_comparison_attribution(mode),
+        "attribution": tensor_comparison_attribution(mode, order),
         "pairs": pair_details,
         "speedup": sample_statistics(speedups),
         "median_speedup_95_percent_confidence_interval": interval,
@@ -3432,12 +3473,13 @@ def _ratio_summary(values: Sequence[float], *, definition: str,
 
 def summarize_same_policy_cell(
         records: dict[str, dict[int, dict[str, Any]]], *, mode: str,
+        order: int,
         bootstrap_resamples: int, bootstrap_seed: int) -> dict[str, Any]:
     """Summarize one bounded O_base/O_common/T_common triplet cell."""
     result: dict[str, Any] = {
         "status": "provisional_non_promotion_attribution",
         "promotion_eligible": False,
-        "attribution": same_policy_attribution(mode),
+        "attribution": same_policy_attribution(mode, order),
         "members": {},
     }
     for member in SAME_POLICY_MEMBER_ORDER:
@@ -3457,7 +3499,8 @@ def summarize_same_policy_cell(
             )
         selection = SAME_POLICY_MEMBERS[member]
         expected_configuration = trace_policy_configuration(
-            selection["engine"], mode, selection["trace_policy"]
+            selection["engine"], mode, selection["trace_policy"],
+            order=order
         )
         if configurations[0] != expected_configuration:
             raise CampaignError(
@@ -3702,9 +3745,9 @@ def performance_disposition(manifest: dict[str, Any], *,
         "workload_class": workload_class,
         "tensor_vs_final_tree_ordinary": {
             "speedup_definition": "ordinary / tensor",
-            "attribution_by_mode": {
-                mode: tensor_comparison_attribution(mode)
-                for mode in ("conventional", "igr")
+            "attribution_by_cell": {
+                f"{mode}_p{order}": tensor_comparison_attribution(mode, order)
+                for mode, order in CELLS
             },
             "required_cells": list(expected_cells),
             "cells": tensor_cells,
@@ -4401,6 +4444,7 @@ def run_campaign(arguments: argparse.Namespace) -> Path:
                 manifest["final_tree_results"][key] = summarize_tensor_cell(
                     final_records[(mode, order)],
                     mode=mode,
+                    order=order,
                     bootstrap_resamples=arguments.bootstrap_resamples,
                     bootstrap_seed=arguments.bootstrap_seed + cell_index,
                 )
@@ -4417,7 +4461,8 @@ def run_campaign(arguments: argparse.Namespace) -> Path:
                 "tensor": record_summary(export_records["tensor"]),
                 "ordinary_over_tensor_speedup": ordinary_export / tensor_export,
                 "attribution": tensor_comparison_attribution(
-                    arguments.export_control_mode
+                    arguments.export_control_mode,
+                    arguments.export_control_order,
                 ),
             }
             if frozen_executable is not None:
@@ -4445,6 +4490,7 @@ def run_campaign(arguments: argparse.Namespace) -> Path:
                     summarize_same_policy_cell(
                         final_records[(mode, order)],
                         mode=mode,
+                        order=order,
                         bootstrap_resamples=arguments.bootstrap_resamples,
                         bootstrap_seed=arguments.bootstrap_seed + cell_index,
                     )

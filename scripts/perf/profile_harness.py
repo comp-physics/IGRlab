@@ -198,6 +198,20 @@ FIXED_SIGMA_JACOBI_PROFILE_POLICIES = {
         True,
     ),
 }
+PRODUCTION_TENSOR_IGR_TRACE_POLICY_BY_ORDER = {
+    1: (
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi10-fp64"
+    ),
+    2: (
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi10-fp64"
+    ),
+    3: (
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi2-fp64"
+    ),
+}
 
 
 class ProfileTracePolicyContract(NamedTuple):
@@ -210,21 +224,22 @@ class ProfileTracePolicyContract(NamedTuple):
 
 
 def _profile_trace_policy_contract(
-        requested: str, mode: str) -> ProfileTracePolicyContract:
+        requested: str, mode: str, order: int) -> ProfileTracePolicyContract:
     if mode not in {"conventional", "igr"}:
         raise RuntimeError("profiled trace policy mode is invalid")
+    if isinstance(order, bool) or order not in {1, 2, 3}:
+        raise RuntimeError("profiled trace policy order is invalid")
     if requested == PRODUCTION_TRACE_POLICY:
-        resolved = (
-            "native-element-schwarz-matrix-free-warp-"
-            "equilibrated-field-split-fp64"
-            if mode == "igr" else PRODUCTION_TRACE_POLICY
-        )
-        preconditioner = (
-            "native_element_schwarz_warp_equilibrated_field_split_fp64"
-            if mode == "igr" else "hypre_diag_scale"
-        )
+        if mode == "igr":
+            resolved = PRODUCTION_TENSOR_IGR_TRACE_POLICY_BY_ORDER[order]
+            fixed = FIXED_SIGMA_JACOBI_PROFILE_POLICIES[resolved]
+            preconditioner = fixed.preconditioner
+        else:
+            resolved = PRODUCTION_TRACE_POLICY
+            preconditioner = "hypre_diag_scale"
+            fixed = None
         return ProfileTracePolicyContract(
-            requested, resolved, preconditioner, "production", True, None
+            requested, resolved, preconditioner, "production", True, fixed
         )
     fixed = FIXED_SIGMA_JACOBI_PROFILE_POLICIES.get(requested)
     if fixed is None or mode != "igr":
@@ -1489,7 +1504,7 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
     expected_timestep = float(application_argument(args, "--dt"))
     requested_trace_policy = application_argument(args, "--trace-policy")
     trace_policy_contract = _profile_trace_policy_contract(
-        requested_trace_policy, expected_mode
+        requested_trace_policy, expected_mode, expected_order
     )
     exact_record = (
         record.get("schema") == 2 and record.get("success") is True and

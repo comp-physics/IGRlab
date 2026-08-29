@@ -1723,16 +1723,23 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
     return result;
 
   // Production selection is deliberately deterministic and fail closed.  A
-  // rank-one tensor-IGR request resolves engine-default to the qualified
-  // cooperative matrix-free field split before consensus or allocation.
-  // Rank two retains the explicitly reported host-staged HYPRE route.  Every
-  // non-default selector remains a rank-one benchmark ablation.
+  // rank-one tensor-IGR request resolves engine-default before consensus or
+  // allocation to the bounded, same-hardware sweep winner measured for its
+  // polynomial order: p1/p2 use cooperative sigma-J10 and p3 uses
+  // cooperative sigma-J2.  J10 was the tested sweep cap for p1/p2, so this is
+  // a qualified production selection, not a claim of a global optimum beyond
+  // the measured J1--J10 surface.  Rank two retains the explicitly reported
+  // host-staged HYPRE route.  Every non-default selector remains a rank-one
+  // benchmark ablation.
   if (requested_selection == CudaTracePolicyKind::engine_default &&
       engine == generic::CudaEngineKind::tensor_core && igr_active &&
       rank_count == 1)
   {
-    result.resolved_selection = CudaTracePolicyKind::
-        native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
+    result.resolved_selection = polynomial_order <= 2
+        ? CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi10_fp64
+        : CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi2_fp64;
   }
   else if (requested_selection != CudaTracePolicyKind::engine_default &&
            rank_count != 1)
@@ -1819,9 +1826,10 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
   }
 
   // Cooperative-patch policies retain the exact FP64 matrix-free operator and
-  // outer GMRES.  The base policy is the rank-one tensor-IGR production
-  // resolution; the separately typed ablations add the same bounded
-  // sigma-row corrections as the scalar ablations.
+  // outer GMRES.  Engine-default reaches the order-selected fixed-sigma
+  // policy above; explicitly requested base and fixed-sweep policies remain
+  // separately typed ablations with the same bounded sigma-row corrections as
+  // the scalar variants.
   if (selection == CudaTracePolicyKind::
           native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64 ||
       selection == CudaTracePolicyKind::

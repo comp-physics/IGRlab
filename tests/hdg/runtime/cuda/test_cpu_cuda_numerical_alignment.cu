@@ -211,10 +211,8 @@ bool CudaPreparedTracePolicyValid(
   const bool expected_equilibrated_field_split = resolved_trace_policy ==
           CudaTracePolicyKind::
               native_element_schwarz_equilibrated_field_split_fp64 ||
-      resolved_trace_policy == CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_equilibrated_field_split_fp64 ||
-      resolved_trace_policy == CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
+      CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
+          resolved_trace_policy);
   const bool expected_native_solver =
       engine == generic::CudaEngineKind::tensor_core && !expected_mgr;
   const bool mgr_work = expected_mgr

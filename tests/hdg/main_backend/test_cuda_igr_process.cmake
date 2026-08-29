@@ -26,9 +26,9 @@ set(_expected_ilu_iterations 1)
 set(_expected_ilu_accounting_kind derived_bounds_v1)
 if(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor" AND HDG_MAIN_RANKS EQUAL 1)
   set(_expected_trace_preconditioner
-    native_element_schwarz_warp_equilibrated_field_split_fp64)
+    native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64)
   set(_expected_resolved_trace_policy
-    native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64)
+    native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi10-fp64)
   set(_expected_trace_solver native-rank1-fp64)
   set(_expected_ilu_type -1)
   set(_expected_ilu_fill -1)
@@ -70,6 +70,17 @@ set(_base_arguments
 
 function(run_cuda_igr_success order expected_alpha expected_beta)
   set(_arguments ${_base_arguments} --order ${order} ${ARGN})
+  set(_run_expected_trace_preconditioner
+    "${_expected_trace_preconditioner}")
+  set(_run_expected_resolved_trace_policy
+    "${_expected_resolved_trace_policy}")
+  if(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor" AND
+     HDG_MAIN_RANKS EQUAL 1 AND order EQUAL 3)
+    set(_run_expected_trace_preconditioner
+      native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64)
+    set(_run_expected_resolved_trace_policy
+      native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi2-fp64)
+  endif()
   if(HDG_MAIN_RANKS EQUAL 1)
     execute_process(
       COMMAND "${HDG_MAIN_EXECUTABLE}" ${_arguments}
@@ -89,7 +100,7 @@ function(run_cuda_igr_success order expected_alpha expected_beta)
   endif()
   if(NOT _status EQUAL 0 OR
      NOT _stdout MATCHES
-       "\\[hdg-main\\] status=Success.*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*requested_trace_policy=${_expected_requested_trace_policy}.*resolved_trace_policy=${_expected_resolved_trace_policy}.*trace_solver=${_expected_trace_solver}.*fallback_count=0.*trace_preconditioner=${_expected_trace_preconditioner}.*trace_ilu_type=${_expected_ilu_type}.*trace_ilu_level_of_fill=${_expected_ilu_fill}.*trace_ilu_local_reordering=${_expected_ilu_reordering}.*trace_ilu_application_iterations=${_expected_ilu_iterations}.*trace_ilu_accounting_kind=${_expected_ilu_accounting_kind}.*trace_ilu_factor_reuse_policy=${_expected_ilu_factor_reuse_policy}.*trace_ilu_triangular_solve_kind=${_expected_ilu_triangular_solve_kind}.*trace_ilu_lower_jacobi_iterations=${_expected_ilu_lower_jacobi_iterations}.*trace_ilu_upper_jacobi_iterations=${_expected_ilu_upper_jacobi_iterations}.*regularization=igr.*alpha=${expected_alpha}.*beta=${expected_beta}" OR
+       "\\[hdg-main\\] status=Success.*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*requested_trace_policy=${_expected_requested_trace_policy}.*resolved_trace_policy=${_run_expected_resolved_trace_policy}.*trace_solver=${_expected_trace_solver}.*fallback_count=0.*trace_preconditioner=${_run_expected_trace_preconditioner}.*trace_ilu_type=${_expected_ilu_type}.*trace_ilu_level_of_fill=${_expected_ilu_fill}.*trace_ilu_local_reordering=${_expected_ilu_reordering}.*trace_ilu_application_iterations=${_expected_ilu_iterations}.*trace_ilu_accounting_kind=${_expected_ilu_accounting_kind}.*trace_ilu_factor_reuse_policy=${_expected_ilu_factor_reuse_policy}.*trace_ilu_triangular_solve_kind=${_expected_ilu_triangular_solve_kind}.*trace_ilu_lower_jacobi_iterations=${_expected_ilu_lower_jacobi_iterations}.*trace_ilu_upper_jacobi_iterations=${_expected_ilu_upper_jacobi_iterations}.*regularization=igr.*alpha=${expected_alpha}.*beta=${expected_beta}" OR
      NOT _stderr STREQUAL "")
     message(FATAL_ERROR
       "CUDA HDG p${order} IGR execution failed: ${_status}\n${_stdout}\n${_stderr}")

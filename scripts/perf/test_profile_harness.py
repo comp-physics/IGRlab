@@ -200,23 +200,23 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
     }
     assert len(expected) == 20
     assert PROFILE.FIXED_SIGMA_JACOBI_PROFILE_POLICIES == expected
-    conventional_default = PROFILE._profile_trace_policy_contract(
-        "engine-default", "conventional"
-    )
-    assert conventional_default == (
-        "engine-default", "engine-default", "hypre_diag_scale",
-        "production", True, None,
-    )
-    igr_default = PROFILE._profile_trace_policy_contract(
-        "engine-default", "igr"
-    )
-    assert igr_default == (
-        "engine-default",
-        "native-element-schwarz-matrix-free-warp-"
-        "equilibrated-field-split-fp64",
-        "native_element_schwarz_warp_equilibrated_field_split_fp64",
-        "production", True, None,
-    )
+    for order in (1, 2, 3):
+        conventional_default = PROFILE._profile_trace_policy_contract(
+            "engine-default", "conventional", order
+        )
+        assert conventional_default == (
+            "engine-default", "engine-default", "hypre_diag_scale",
+            "production", True, None,
+        )
+        resolved = PROFILE.PRODUCTION_TENSOR_IGR_TRACE_POLICY_BY_ORDER[order]
+        descriptor = PROFILE.FIXED_SIGMA_JACOBI_PROFILE_POLICIES[resolved]
+        igr_default = PROFILE._profile_trace_policy_contract(
+            "engine-default", "igr", order
+        )
+        assert igr_default == (
+            "engine-default", resolved, descriptor.preconditioner,
+            "production", True, descriptor,
+        )
 
     def rejected(function: object, *arguments: object) -> bool:
         try:
@@ -230,21 +230,31 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
         "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
         "sigma-jacobi10-fp64-extra",
         "igr",
+        2,
     )
     assert rejected(
         PROFILE._profile_trace_policy_contract,
         "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
         "sigma-jacobi11-fp64",
         "igr",
+        2,
     )
+    for invalid_order in (False, 0, 4):
+        assert rejected(
+            PROFILE._profile_trace_policy_contract,
+            "engine-default", "igr", invalid_order,
+        )
     for policy, descriptor in expected.items():
-        contract = PROFILE._profile_trace_policy_contract(policy, "igr")
+        contract = PROFILE._profile_trace_policy_contract(policy, "igr", 2)
         assert contract == (
             policy, policy, descriptor[1], "ablation", False,
             PROFILE.FixedSigmaJacobiProfilePolicy(*descriptor),
         )
         assert rejected(
-            PROFILE._profile_trace_policy_contract, policy, "conventional"
+            PROFILE._profile_trace_policy_contract,
+            policy,
+            "conventional",
+            2,
         )
         tensor = {
             "element_schwarz_preconditioner_applications": 9,
@@ -484,10 +494,22 @@ else:
     interior_unknowns = 75712 if p1_igr else 302848
     condensation_tiles_per_launch = 889616 if p1_igr else 22827168
     volume_tiles_per_assembly = 2952768 if p1_igr else 22145760
+    low_order_igr = order <= 2
     resolved_trace_policy = (
         "native-element-schwarz-matrix-free-warp-"
-        "equilibrated-field-split-fp64"
+        "equilibrated-field-split-sigma-jacobi10-fp64"
+        if low_order_igr else
+        "native-element-schwarz-matrix-free-warp-"
+        "equilibrated-field-split-sigma-jacobi2-fp64"
     )
+    trace_preconditioner = (
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi10_fp64"
+        if low_order_igr else
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi2_fp64"
+    )
+    sigma_sweeps = 10 if low_order_igr else 2
     top_level_resolved_trace_policy = (
         "engine-default" if os.environ.get("FAKE_APP_BAD_TOP_RESOLVED")
         else resolved_trace_policy
@@ -507,10 +529,9 @@ else:
         "trace_policy": "engine-default",
         "requested_trace_policy": "engine-default",
         "resolved_trace_policy": top_level_resolved_trace_policy,
-        "trace_preconditioner":
-            "native_element_schwarz_warp_equilibrated_field_split_fp64",
-        "trace_field_split_sigma_jacobi_sweeps": 0,
-        "trace_field_split_sigma_jacobi_damping": 0.0,
+        "trace_preconditioner": trace_preconditioner,
+        "trace_field_split_sigma_jacobi_sweeps": sigma_sweeps,
+        "trace_field_split_sigma_jacobi_damping": 2.0 / 3.0,
         "mode": "igr",
         "rank_count": 1,
         "polynomial_order": order,
@@ -533,13 +554,11 @@ else:
                 "selected_engine": "tensor",
                 "requested_trace_policy": "engine-default",
                 "resolved_trace_policy": sample_resolved_trace_policy,
-                "trace_preconditioner":
-                    "native_element_schwarz_warp_"
-                    "equilibrated_field_split_fp64",
+                "trace_preconditioner": trace_preconditioner,
                 "element_schwarz_preconditioner_applications": 9,
-                "field_split_sigma_jacobi_sweeps": 0,
-                "field_split_sigma_jacobi_damping": 0.0,
-                "field_split_sigma_jacobi_updates": 0,
+                "field_split_sigma_jacobi_sweeps": sigma_sweeps,
+                "field_split_sigma_jacobi_damping": 2.0 / 3.0,
+                "field_split_sigma_jacobi_updates": 9 * sigma_sweeps,
                 "hardware_supported": True,
                 "volume_assembly_launches": volume_launches,
                 "volume_mma_tiles": volume_tiles_per_assembly * volume_launches,
