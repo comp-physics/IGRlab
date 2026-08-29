@@ -5095,6 +5095,8 @@ __global__ void NativeElementVectorKernel(CudaDeviceView v,CudaMeshShape s,
     value+=sign*element_values[slot];
   }
   truth[row]=valid?value:nan("");
+}
+
 __device__ int ElementSchwarzFieldSplitOriginalRow(
     const int patch_rows,const int packed_row)
 {
