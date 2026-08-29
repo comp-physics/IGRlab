@@ -257,6 +257,28 @@ foreach(_order IN ITEMS 1 2 3)
       TIMEOUT 3600)
 endforeach()
 
+# Directly compare the reduced IGR quadrature schedule to q12/q12 on the
+# same active-IGR one-step and multi-step trajectories.  This remains a
+# test-only numerical qualification and publishes no runtime evidence API.
+foreach(_order IN ITEMS 1 2 3)
+  math(EXPR _igr_volume_quadrature_order "2 * ${_order} + 4")
+  math(EXPR _igr_face_quadrature_order "2 * ${_order} + 2")
+  add_test(
+    NAME hdg_generic_euler_cpu_igr_quadrature_equivalence_p${_order}
+    COMMAND dg_igr_hdg_generic_euler_convergence_cpu_test
+      --order ${_order} --regularization igr
+      --igr-volume-quadrature-order ${_igr_volume_quadrature_order}
+      --igr-face-quadrature-order ${_igr_face_quadrature_order}
+      --quadrature-equivalence)
+  set_tests_properties(
+    hdg_generic_euler_cpu_igr_quadrature_equivalence_p${_order}
+    PROPERTIES
+      PROCESSORS 1
+      RESOURCE_LOCK hdg_generic_euler_cpu
+      LABELS "hdg;generic;cpu;igr;quadrature-equivalence;p${_order}"
+      TIMEOUT 3600)
+endforeach()
+
 add_executable(dg_igr_hdg_traced_scalar_igr_p1_local_test
   test_traced_scalar_igr_p1_local.cpp
   "${PROJECT_SOURCE_DIR}/src/numerics/hdg/runtime/cpu/traced_scalar_igr_p1_local.cpp")
