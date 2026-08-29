@@ -35,6 +35,7 @@ bool CheckExactTwoElementPlan()
       plan.true_multiplicity == std::vector<int>({1, 2, 1}) &&
       plan.true_incidence_slots ==
           std::vector<int>({0, -1, 1, 2, 3, -1}) &&
+      plan.patch_rows == 2 &&
       plan.minimum_multiplicity == 1 && plan.maximum_multiplicity == 2 &&
       plan.maximum_contributors == 2 &&
       plan.first_element_sources[3] == 3 &&

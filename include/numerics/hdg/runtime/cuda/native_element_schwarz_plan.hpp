@@ -76,6 +76,7 @@ struct NativeElementSchwarzPlan final
   // Exactly two fixed slots per true row. -1 denotes an absent boundary
   // incidence. This supports deterministic scatter without device atomics.
   std::vector<int> true_incidence_slots{};
+  int patch_rows = 0;
   int minimum_multiplicity = 0;
   int maximum_multiplicity = 0;
   int maximum_contributors = 0;
@@ -201,6 +202,7 @@ inline NativeElementSchwarzPlan BuildNativeElementSchwarzPlan(
     result.valid = result.maximum_contributors >= 1 &&
         result.maximum_contributors <=
             native_element_schwarz_maximum_contributors;
+    if (result.valid) result.patch_rows = input.patch_rows;
   }
   catch (...)
   {
