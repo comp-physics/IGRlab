@@ -167,6 +167,67 @@ static_assert(NativeTraceCooperativeSpecializationPolicy(),
               "native trace launch support must match fixed-sigma and "
               "coupled-warp kernel specializations exactly");
 
+constexpr bool NativeCoupledTraceDescriptorPolicy() noexcept
+{
+  using dg::hdg::generic::CudaEngineKind;
+  const auto base = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, true,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_coupled_fp64);
+  const auto jacobi2 = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, true,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi2_fp64);
+  const auto jacobi10 = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, true,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi10_fp64);
+  const auto conventional = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, false,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_coupled_fp64);
+  const auto ordinary = ResolveCudaTracePolicy(
+      CudaEngineKind::ordinary, true,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_coupled_fp64);
+  return CudaTracePolicyDescriptorIsExact(base) &&
+      base.trace_preconditioner == CudaTracePreconditionerKind::
+          native_element_schwarz_warp_coupled_fp64 &&
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          base.resolved_selection) &&
+      CudaTracePolicyUsesNativeElementMatrixFreeWarpCoupled(
+          base.resolved_selection) &&
+      !CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
+          base.resolved_selection) &&
+      CudaTracePolicyDescriptorIsExact(jacobi2) &&
+      jacobi2.trace_preconditioner == CudaTracePreconditionerKind::
+          native_element_schwarz_warp_coupled_sigma_jacobi2_fp64 &&
+      CudaTracePolicyUsesNativeElementMatrixFreeWarpCoupled(
+          jacobi2.resolved_selection) &&
+      CudaTracePolicyFixedSigmaJacobiSweeps(jacobi2.resolved_selection) ==
+          2 &&
+      CudaTracePreconditionerFixedSigmaJacobiSweeps(
+          jacobi2.trace_preconditioner) == 2 &&
+      CudaTracePolicyDescriptorIsExact(jacobi10) &&
+      jacobi10.trace_preconditioner == CudaTracePreconditionerKind::
+          native_element_schwarz_warp_coupled_sigma_jacobi10_fp64 &&
+      CudaTracePolicyUsesNativeElementMatrixFreeWarpCoupled(
+          jacobi10.resolved_selection) &&
+      CudaTracePolicyFixedSigmaJacobiSweeps(
+          jacobi10.resolved_selection) ==
+          native_element_schwarz_sigma_jacobi_maximum_sweeps &&
+      CudaTracePreconditionerFixedSigmaJacobiSweeps(
+          jacobi10.trace_preconditioner) ==
+          native_element_schwarz_sigma_jacobi_maximum_sweeps &&
+      !conventional.valid &&
+      !CudaTracePolicyDescriptorIsExact(conventional) &&
+      !ordinary.valid && !CudaTracePolicyDescriptorIsExact(ordinary);
+}
+
+static_assert(NativeCoupledTraceDescriptorPolicy(),
+              "coupled trace policies must remain explicit tensor-IGR-only "
+              "matrix-free descriptors");
+
 constexpr bool TrueResidualAuthorityPolicy() noexcept
 {
   dg::hdg::runtime::cuda_w8a::detail::CudaSolveDiagnostics diagnostics{};
@@ -1777,24 +1838,313 @@ bool NativeElementSchwarzDeviceFixtureForOrder(const int order)
       mismatched, preconditioner, workspace, policy, support, nullptr);
 }
 
+bool NativeCoupledWarpPatchDeviceFixtureForOrder(const int order)
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  if (order < 1 || order > 3) return false;
+  const int rows = 20 * (order + 1);
+  const int patch_entries = rows * rows;
+  constexpr int elements = 1;
+  constexpr int repeated_pivot_steps = 6;
+  const int repeated_pivot = rows - 1;
+
+  // Start from a mildly conditioned upper-triangular factor, then undo a
+  // prescribed pivot chain. Setup must recover that exact chain. Reusing the
+  // same far pivot row at each of the first six columns covers ordered and
+  // repeated swaps, including a swap across the first warp boundary for every
+  // p1--p3 patch size.
+  std::vector<int> expected_pivots(static_cast<std::size_t>(rows));
+  std::vector<double> patch(
+      static_cast<std::size_t>(patch_entries), 0.0);
+  for (int row = 0; row < rows; ++row)
+  {
+    expected_pivots[static_cast<std::size_t>(row)] = row;
+    patch[static_cast<std::size_t>(row) * rows + row] =
+        1.5 + 0.01 * static_cast<double>(row);
+    if (row + 1 < rows)
+      patch[static_cast<std::size_t>(row) * rows + row + 1] =
+          -0.075 + 0.001 * static_cast<double>(row % 7);
+    if (row + 17 < rows)
+      patch[static_cast<std::size_t>(row) * rows + row + 17] =
+          0.025 + 0.0005 * static_cast<double>(row % 5);
+  }
+  for (int column = 0; column < repeated_pivot_steps; ++column)
+    expected_pivots[static_cast<std::size_t>(column)] = repeated_pivot;
+  for (int column = repeated_pivot_steps - 1; column >= 0; --column)
+    for (int entry = 0; entry < rows; ++entry)
+      std::swap(
+          patch[static_cast<std::size_t>(column) * rows + entry],
+          patch[static_cast<std::size_t>(repeated_pivot) * rows + entry]);
+
+  std::vector<double> reference_solution(static_cast<std::size_t>(rows));
+  std::vector<double> right_hand_side(static_cast<std::size_t>(rows), 0.0);
+  for (int row = 0; row < rows; ++row)
+    reference_solution[static_cast<std::size_t>(row)] =
+        0.125 + static_cast<double>((11 * row + 3) % 29) / 31.0;
+  for (int row = 0; row < rows; ++row)
+    for (int column = 0; column < rows; ++column)
+      right_hand_side[static_cast<std::size_t>(row)] = std::fma(
+          patch[static_cast<std::size_t>(row) * rows + column],
+          reference_solution[static_cast<std::size_t>(column)],
+          right_hand_side[static_cast<std::size_t>(row)]);
+  // Matrix-free execution still requires a structurally valid borrowed CSR
+  // descriptor, but its numerical action comes exclusively from `schur`.
+  // Keep that descriptor diagonal so the deliberately row-permuted patch can
+  // contain zero entries on its global diagonal without weakening CSR checks.
+  std::vector<double> structural_matrix(
+      static_cast<std::size_t>(patch_entries), 0.0);
+  for (int row = 0; row < rows; ++row)
+    structural_matrix[static_cast<std::size_t>(row) * rows + row] = 1.0;
+  const NativeCsrFixture matrix =
+      DenseToDiagonalFirstCsr(structural_matrix, rows);
+  if (!NativeCsrFixtureIsValid(matrix)) return false;
+
+  std::vector<int> signed_dofs(static_cast<std::size_t>(rows));
+  std::vector<int> incidence(2 * static_cast<std::size_t>(rows), -1);
+  std::vector<int> first_sources(static_cast<std::size_t>(patch_entries));
+  std::vector<int> second_sources(
+      static_cast<std::size_t>(patch_entries), -1);
+  for (int row = 0; row < rows; ++row)
+  {
+    signed_dofs[static_cast<std::size_t>(row)] = row;
+    incidence[2 * static_cast<std::size_t>(row)] = row;
+  }
+  for (int entry = 0; entry < patch_entries; ++entry)
+    first_sources[static_cast<std::size_t>(entry)] = entry;
+
+  NativeDeviceAllocation<double> schur;
+  NativeDeviceAllocation<double> patch_matrix;
+  NativeDeviceAllocation<double> patch_lu;
+  NativeDeviceAllocation<double> patch_rhs;
+  NativeDeviceAllocation<double> patch_solution;
+  NativeDeviceAllocation<double> status;
+  NativeDeviceAllocation<int> signed_element_trace;
+  NativeDeviceAllocation<int> first_source;
+  NativeDeviceAllocation<int> second_source;
+  NativeDeviceAllocation<int> pivots;
+  NativeDeviceAllocation<int> true_incidence;
+  if (!schur.CopyFrom(patch) ||
+      !patch_matrix.Allocate(static_cast<std::size_t>(patch_entries)) ||
+      !patch_lu.Allocate(static_cast<std::size_t>(patch_entries)) ||
+      !patch_rhs.Allocate(static_cast<std::size_t>(rows)) ||
+      !patch_solution.Allocate(static_cast<std::size_t>(rows)) ||
+      !status.Allocate(elements) ||
+      !signed_element_trace.CopyFrom(signed_dofs) ||
+      !first_source.CopyFrom(first_sources) ||
+      !second_source.CopyFrom(second_sources) ||
+      !pivots.Allocate(static_cast<std::size_t>(rows)) ||
+      !true_incidence.CopyFrom(incidence))
+    return false;
+
+  CudaDeviceView setup_view{};
+  setup_view.schur = schur.data();
+  setup_view.status = status.data();
+  setup_view.signed_element_trace = signed_element_trace.data();
+  setup_view.element_schwarz_patch_matrix = patch_matrix.data();
+  setup_view.element_schwarz_patch_lu = patch_lu.data();
+  setup_view.element_schwarz_rhs = patch_rhs.data();
+  setup_view.element_schwarz_solution = patch_solution.data();
+  setup_view.element_schwarz_first_source = first_source.data();
+  setup_view.element_schwarz_second_source = second_source.data();
+  setup_view.element_schwarz_signed_true_dof =
+      signed_element_trace.data();
+  setup_view.element_schwarz_true_incidence_slots = true_incidence.data();
+  setup_view.element_schwarz_pivots = pivots.data();
+  CudaMeshShape shape{};
+  shape.elements = elements;
+  shape.trace_dofs = rows;
+  shape.trace_components = 5;
+  shape.true_trace_count = rows;
+  shape.order = order;
+  shape.igr_active = true;
+  if (!CudaLaunchSetupNativeElementSchwarz(
+          setup_view, shape,
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_coupled_fp64) ||
+      cudaDeviceSynchronize() != cudaSuccess)
+    return false;
+  double setup_status = 0.0;
+  std::vector<int> observed_pivots(static_cast<std::size_t>(rows));
+  if (!status.CopyOneTo(setup_status) || setup_status != 1.0 ||
+      !pivots.CopyTo(observed_pivots) ||
+      observed_pivots != expected_pivots)
+    return false;
+
+  NativeTraceSolvePolicy policy{};
+  policy.rank_count = 1;
+  policy.krylov_dimension = 1;
+  policy.maximum_iterations = 1;
+  policy.relative_tolerance = 1.0e-10;
+  const NativeTraceCooperativeSupport scalar_support =
+      QueryNativeRankOneTraceCooperativeSupport(
+          rows, policy.krylov_dimension, true, false, false);
+  const NativeTraceCooperativeSupport coupled_support =
+      QueryNativeRankOneTraceCooperativeSupport(
+          rows, policy.krylov_dimension, true, false, true);
+  const NativeTraceWorkspaceRequirements scalar_requirements =
+      QueryNativeTraceWorkspaceRequirements(
+          rows, policy.krylov_dimension,
+          scalar_support.cooperative_blocks, true);
+  const NativeTraceWorkspaceRequirements coupled_requirements =
+      QueryNativeTraceWorkspaceRequirements(
+          rows, policy.krylov_dimension,
+          coupled_support.cooperative_blocks, true);
+  if (!scalar_support.supported || scalar_support.fixed_sigma_jacobi ||
+      scalar_support.coupled_warp_full_patch ||
+      !coupled_support.supported || coupled_support.fixed_sigma_jacobi ||
+      !coupled_support.coupled_warp_full_patch ||
+      !scalar_requirements.valid || !coupled_requirements.valid)
+    return false;
+
+  NativeTraceWorkspaceRequirements requirements{};
+  requirements.valid = true;
+  requirements.basis_doubles = std::max(
+      scalar_requirements.basis_doubles,
+      coupled_requirements.basis_doubles);
+  requirements.vector_doubles = std::max(
+      scalar_requirements.vector_doubles,
+      coupled_requirements.vector_doubles);
+  requirements.reduction_doubles = std::max(
+      scalar_requirements.reduction_doubles,
+      coupled_requirements.reduction_doubles);
+  requirements.small_doubles = std::max(
+      scalar_requirements.small_doubles,
+      coupled_requirements.small_doubles);
+  requirements.permutation_integers = std::max(
+      scalar_requirements.permutation_integers,
+      coupled_requirements.permutation_integers);
+
+  NativeDeviceAllocation<int> matrix_offsets;
+  NativeDeviceAllocation<int> matrix_columns;
+  NativeDeviceAllocation<double> matrix_values;
+  NativeDeviceAllocation<double> device_rhs;
+  NativeDeviceAllocation<double> solution;
+  NativeDeviceAllocation<double> basis;
+  NativeDeviceAllocation<double> vectors;
+  NativeDeviceAllocation<double> reduction;
+  NativeDeviceAllocation<double> small;
+  NativeDeviceAllocation<int> permutation_marks;
+  NativeDeviceAllocation<NativeTraceSolveControl> control;
+  if (!matrix_offsets.CopyFrom(matrix.offsets) ||
+      !matrix_columns.CopyFrom(matrix.columns) ||
+      !matrix_values.CopyFrom(matrix.values) ||
+      !device_rhs.CopyFrom(right_hand_side) ||
+      !solution.Allocate(static_cast<std::size_t>(rows)) ||
+      !basis.Allocate(requirements.basis_doubles) ||
+      !vectors.Allocate(requirements.vector_doubles) ||
+      !reduction.Allocate(requirements.reduction_doubles) ||
+      !small.Allocate(requirements.small_doubles) ||
+      !permutation_marks.Allocate(requirements.permutation_integers) ||
+      !control.Allocate(1))
+    return false;
+
+  NativeTraceSystemView system{};
+  system.matrix = {
+      matrix_offsets.data(), matrix_columns.data(), matrix_values.data(),
+      rows, rows, static_cast<int>(matrix.values.size())};
+  system.rhs = device_rhs.data();
+  system.solution = solution.data();
+  system.operator_kind = NativeTraceOperatorKind::element_matrix_free_fp64;
+  system.element_schur = schur.data();
+  NativeTracePreconditionerView preconditioner{};
+  preconditioner.element_schwarz = {
+      patch_matrix.data(), patch_lu.data(), pivots.data(),
+      signed_element_trace.data(), true_incidence.data(), patch_rhs.data(),
+      patch_solution.data(), elements, rows, rows, 1, 1};
+  NativeTraceWorkspaceView workspace{};
+  workspace.basis = basis.data();
+  workspace.basis_doubles = requirements.basis_doubles;
+  workspace.vectors = vectors.data();
+  workspace.vector_doubles = requirements.vector_doubles;
+  workspace.reduction = reduction.data();
+  workspace.reduction_doubles = requirements.reduction_doubles;
+  workspace.small = small.data();
+  workspace.small_doubles = requirements.small_doubles;
+  workspace.permutation_marks = permutation_marks.data();
+  workspace.permutation_integers = requirements.permutation_integers;
+  workspace.device_control = control.data();
+
+  const auto run = [&](const NativeTracePreconditionerKind kind,
+                       const NativeTraceCooperativeSupport& support,
+                       std::vector<double>& result) {
+    preconditioner.kind = kind;
+    if (!LaunchNativeRankOneTraceSolve(
+            system, preconditioner, workspace, policy, support, nullptr) ||
+        cudaDeviceSynchronize() != cudaSuccess)
+      return false;
+    result.resize(static_cast<std::size_t>(rows));
+    NativeTraceSolveControl observation{};
+    return solution.CopyTo(result) && control.CopyOneTo(observation) &&
+        observation.failure_mask == 0 &&
+        observation.status == NativeTraceSolveStatus::converged &&
+        observation.iterations == 1 &&
+        observation.preconditioner_applications == 2 &&
+        observation.operator_applications >= 2 &&
+        observation.actual_residual_checks >= 2 &&
+        observation.relative_residual_norm <= policy.relative_tolerance;
+  };
+
+  std::vector<double> scalar_result;
+  std::vector<double> coupled_result;
+  if (!run(NativeTracePreconditionerKind::element_overlap_schwarz_fp64,
+           scalar_support, scalar_result) ||
+      !run(NativeTracePreconditionerKind::
+               element_overlap_schwarz_warp_coupled_fp64,
+           coupled_support, coupled_result) ||
+      MaximumScaledDifference(scalar_result, reference_solution) > 2.0e-10 ||
+      MaximumScaledDifference(coupled_result, reference_solution) > 2.0e-10 ||
+      MaximumScaledDifference(scalar_result, coupled_result) > 2.0e-12)
+    return false;
+
+  // One GMRES iteration applies M^{-1} twice: first from the normalized
+  // Arnoldi basis into a distinct work vector, then in-place to the final
+  // basis combination. The exact solution and application count above make
+  // both paths observable without adding a callback or event stream.
+  preconditioner.kind = NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_coupled_fp64;
+  if (LaunchNativeRankOneTraceSolve(
+          system, preconditioner, workspace, policy, scalar_support,
+          nullptr))
+    return false;
+  preconditioner.kind =
+      NativeTracePreconditionerKind::element_overlap_schwarz_fp64;
+  return !LaunchNativeRankOneTraceSolve(
+      system, preconditioner, workspace, policy, coupled_support, nullptr);
+}
+
 bool NativeElementSchwarzDeviceFixture()
 {
   for (int order = 1; order <= 3; ++order)
-    if (!NativeElementSchwarzDeviceFixtureForOrder(order)) return false;
+    if (!NativeElementSchwarzDeviceFixtureForOrder(order) ||
+        !NativeCoupledWarpPatchDeviceFixtureForOrder(order))
+      return false;
   return true;
 }
 
-bool NativeFixedSigmaJacobiOrderFixture(const int order,
-                                        const bool cooperative_warp,
-                                        const int sigma_jacobi_sweeps)
+enum class NativeFixedSigmaPatchKind
+{
+  scalar_field_split,
+  warp_field_split,
+  warp_coupled
+};
+
+bool NativeFixedSigmaJacobiOrderFixture(
+    const int order, const NativeFixedSigmaPatchKind patch_kind,
+    const int sigma_jacobi_sweeps)
 {
   using namespace dg::hdg::runtime::cuda_w8a::detail;
   if (order < 1 || order > 3 || sigma_jacobi_sweeps < 1 ||
       sigma_jacobi_sweeps > native_trace_sigma_jacobi_maximum_sweeps)
     return false;
-  const CudaTracePreconditionerKind setup_preconditioner =
-      CudaTracePreconditionerForFixedSigmaJacobiSweeps(
-          sigma_jacobi_sweeps, cooperative_warp);
+  const bool cooperative_warp =
+      patch_kind != NativeFixedSigmaPatchKind::scalar_field_split;
+  const bool coupled_warp =
+      patch_kind == NativeFixedSigmaPatchKind::warp_coupled;
+  const CudaTracePreconditionerKind setup_preconditioner = coupled_warp
+      ? CudaTraceCoupledWarpPreconditionerForFixedSigmaJacobiSweeps(
+            sigma_jacobi_sweeps)
+      : CudaTracePreconditionerForFixedSigmaJacobiSweeps(
+            sigma_jacobi_sweeps, cooperative_warp);
   const auto native_preconditioner_for = [](
       const int sweeps, const bool warp)
   {
@@ -1864,16 +2214,26 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
       return NativeTracePreconditionerKind::diagonal;
     }
   };
-  const NativeTracePreconditionerKind native_preconditioner =
-      native_preconditioner_for(sigma_jacobi_sweeps, cooperative_warp);
+  const NativeTracePreconditionerKind native_preconditioner = coupled_warp
+      ? sigma_jacobi_sweeps == 2
+          ? NativeTracePreconditionerKind::
+                element_overlap_schwarz_warp_coupled_sigma_jacobi2_fp64
+          : sigma_jacobi_sweeps == native_trace_sigma_jacobi_maximum_sweeps
+              ? NativeTracePreconditionerKind::
+                    element_overlap_schwarz_warp_coupled_sigma_jacobi10_fp64
+              : NativeTracePreconditionerKind::diagonal
+      : native_preconditioner_for(
+            sigma_jacobi_sweeps, cooperative_warp);
   if (setup_preconditioner == CudaTracePreconditionerKind::unconfigured ||
       native_preconditioner == NativeTracePreconditionerKind::diagonal)
     return false;
-  const NativeTraceOperatorKind native_operator = cooperative_warp
-      ? NativeTraceOperatorKind::
-            element_matrix_free_warp_equilibrated_field_split_fp64
-      : NativeTraceOperatorKind::
-            element_matrix_free_equilibrated_field_split_fp64;
+  const NativeTraceOperatorKind native_operator = coupled_warp
+      ? NativeTraceOperatorKind::element_matrix_free_fp64
+      : cooperative_warp
+          ? NativeTraceOperatorKind::
+                element_matrix_free_warp_equilibrated_field_split_fp64
+          : NativeTraceOperatorKind::
+                element_matrix_free_equilibrated_field_split_fp64;
   const int scalar_face_rows = order + 1;
   const int patch_rows = 20 * scalar_face_rows;
   const int face_rows = 5 * scalar_face_rows;
@@ -1902,6 +2262,16 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
     const int scalar = sigma_row % scalar_face_rows;
     return ((face + 1) % 4) * face_rows + 4 * scalar_face_rows + scalar;
   };
+  const auto paired_upper_sigma_row = [scalar_face_rows](const int euler_row)
+  {
+    const int face_rows = 5 * scalar_face_rows;
+    const int face = euler_row / face_rows;
+    const int face_row = euler_row % face_rows;
+    const int component = face_row / scalar_face_rows;
+    const int scalar = face_row % scalar_face_rows;
+    return ((face + component + 1) % 4) * face_rows +
+        4 * scalar_face_rows + scalar;
+  };
   const auto diagonal_value = [face_rows](const int row)
   {
     return 1.25 + 0.005 * static_cast<double>(row % face_rows);
@@ -1916,6 +2286,12 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
     return 0.055 + 0.005 *
         static_cast<double>(sigma_row % scalar_face_rows);
   };
+  const auto upper_coupling_value = [scalar_face_rows](const int euler_row)
+  {
+    const int component =
+        (euler_row % (5 * scalar_face_rows)) / scalar_face_rows;
+    return 0.085 + 0.005 * static_cast<double>(component);
+  };
 
   // Two elements share one complete face. Each scalar sigma row couples to
   // an Euler row and a different sigma row on the next local face. The
@@ -1925,7 +2301,9 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
   // in-place Gauss-Seidel update or a missing inter-warp barrier. A shared sigma
   // row also sees distinct neighbors from the two patches. No individual
   // principal patch is the global inverse and every selected global sigma
-  // correction is nonzero. Element zero uses negative trace orientation, so
+  // correction is nonzero. The coupled policies additionally receive a real
+  // Euler-row/sigma-column block; a lower field-split predictor cannot satisfy
+  // their reference. Element zero uses negative trace orientation, so
   // reconstructing the true RHS from its first incidence also requires the
   // retained sign.
   std::vector<double> element_schur(
@@ -1945,6 +2323,9 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
         schur[static_cast<std::size_t>(row) * patch_rows +
               paired_sigma_row(row)] = sigma_coupling_value(row);
       }
+      else if (coupled_warp)
+        schur[static_cast<std::size_t>(row) * patch_rows +
+              paired_upper_sigma_row(row)] = upper_coupling_value(row);
     }
   }
 
@@ -2023,8 +2404,10 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
       }
   constexpr int warp_rows = 32;
   bool has_sigma_cross_warp_coupling = false;
+  bool has_upper_field_coupling = false;
   for (int row = 0; row < true_rows; ++row)
     for (int column = 0; column < true_rows; ++column)
+    {
       has_sigma_cross_warp_coupling = has_sigma_cross_warp_coupling ||
           (row != column &&
            row / warp_rows != column / warp_rows &&
@@ -2032,7 +2415,15 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
            sigma_class[static_cast<std::size_t>(column)] == 1 &&
            global_matrix[static_cast<std::size_t>(row) * true_rows +
                          column] != 0.0);
-  if (!has_sigma_cross_warp_coupling) return false;
+      has_upper_field_coupling = has_upper_field_coupling ||
+          (sigma_class[static_cast<std::size_t>(row)] == 0 &&
+           sigma_class[static_cast<std::size_t>(column)] == 1 &&
+           global_matrix[static_cast<std::size_t>(row) * true_rows +
+                         column] != 0.0);
+    }
+  if (!has_sigma_cross_warp_coupling ||
+      has_upper_field_coupling != coupled_warp)
+    return false;
   const NativeCsrFixture matrix =
       DenseToDiagonalFirstCsr(global_matrix, true_rows);
   if (!NativeCsrFixtureIsValid(matrix)) return false;
@@ -2138,10 +2529,10 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
   policy.relative_tolerance = 1.0e-14;
   const NativeTraceCooperativeSupport support =
       QueryNativeRankOneTraceCooperativeSupport(
-          true_rows, policy.krylov_dimension, true, true, false);
+          true_rows, policy.krylov_dimension, true, true, coupled_warp);
   const NativeTraceCooperativeSupport base_support =
       QueryNativeRankOneTraceCooperativeSupport(
-          true_rows, policy.krylov_dimension, true, false, false);
+          true_rows, policy.krylov_dimension, true, false, coupled_warp);
   const NativeTraceWorkspaceRequirements fixed_requirements =
       QueryNativeTraceWorkspaceRequirements(
           true_rows, policy.krylov_dimension,
@@ -2168,7 +2559,9 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
       fixed_requirements.control_double_slots,
       base_requirements.control_double_slots);
   if (!support.supported || !support.fixed_sigma_jacobi ||
+      support.coupled_warp_full_patch != coupled_warp ||
       !base_support.supported || base_support.fixed_sigma_jacobi ||
+      base_support.coupled_warp_full_patch != coupled_warp ||
       !requirements.valid)
     return false;
 
@@ -2233,7 +2626,10 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
           nullptr))
     return false;
   auto base_preconditioner = preconditioner;
-  base_preconditioner.kind = cooperative_warp
+  base_preconditioner.kind = coupled_warp
+      ? NativeTracePreconditionerKind::
+            element_overlap_schwarz_warp_coupled_fp64
+      : cooperative_warp
       ? NativeTracePreconditionerKind::
             element_overlap_schwarz_warp_equilibrated_field_split_fp64
       : NativeTracePreconditionerKind::
@@ -2323,6 +2719,8 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
   // unchanged on every sweep. A one-iteration right-GMRES result is analytic:
   // x = h/(h^2+||w_perp||^2) * M^{-1}b.
   std::vector<double> predictor(static_cast<std::size_t>(true_rows), 0.0);
+  std::vector<double> lower_predictor(
+      static_cast<std::size_t>(true_rows), 0.0);
   std::vector<int> multiplicity(static_cast<std::size_t>(true_rows), 0);
   for (int element = 0; element < elements; ++element)
   {
@@ -2348,6 +2746,21 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
     std::vector<double> local_solution;
     if (!SolveDenseReference(principal, local_rhs, local_solution))
       return false;
+    std::vector<double> lower_local_solution;
+    if (coupled_warp)
+    {
+      std::vector<double> lower_principal = principal;
+      for (int row = 0; row < patch_rows; ++row)
+        if (!is_sigma_row(row))
+          for (int column = 0; column < patch_rows; ++column)
+            if (is_sigma_row(column))
+              lower_principal[
+                  static_cast<std::size_t>(row) * patch_rows + column] =
+                  0.0;
+      if (!SolveDenseReference(
+              lower_principal, local_rhs, lower_local_solution))
+        return false;
+    }
     for (int row = 0; row < patch_rows; ++row)
     {
       const int truth = true_dof[
@@ -2355,9 +2768,13 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
       const double sign = element == 0 ? -1.0 : 1.0;
       predictor[static_cast<std::size_t>(truth)] +=
           sign * local_solution[static_cast<std::size_t>(row)];
+      if (coupled_warp)
+        lower_predictor[static_cast<std::size_t>(truth)] +=
+            sign * lower_local_solution[static_cast<std::size_t>(row)];
       ++multiplicity[static_cast<std::size_t>(truth)];
     }
   }
+  bool full_predictor_uses_upper_block = false;
   for (int row = 0; row < true_rows; ++row)
   {
     if (multiplicity[static_cast<std::size_t>(row)] < 1 ||
@@ -2365,7 +2782,18 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
       return false;
     predictor[static_cast<std::size_t>(row)] /=
         static_cast<double>(multiplicity[static_cast<std::size_t>(row)]);
+    if (coupled_warp)
+    {
+      lower_predictor[static_cast<std::size_t>(row)] /=
+          static_cast<double>(multiplicity[static_cast<std::size_t>(row)]);
+      full_predictor_uses_upper_block = full_predictor_uses_upper_block ||
+          (sigma_class[static_cast<std::size_t>(row)] == 0 &&
+           std::abs(predictor[static_cast<std::size_t>(row)] -
+                    lower_predictor[static_cast<std::size_t>(row)]) >
+               1.0e-6);
+    }
   }
+  if (coupled_warp && !full_predictor_uses_upper_block) return false;
   std::vector<double> preconditioned = predictor;
   std::vector<double> next = predictor;
   bool nonzero_sigma_correction = false;
@@ -2401,6 +2829,51 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
   }
   if (!nonzero_sigma_correction) return false;
 
+  // Condition the coupled oracle against the discarded-upper-block
+  // alternative. Apply the same synchronous corrections to that deliberately
+  // lower predictor; J2/J10 update sigma rows only, so they cannot repair the
+  // Euler error introduced by omitting A_{U,sigma}.
+  std::vector<double> lower_preconditioned;
+  if (coupled_warp)
+  {
+    lower_preconditioned = lower_predictor;
+    std::vector<double> lower_next = lower_predictor;
+    for (int sweep = 0; sweep < sigma_jacobi_sweeps; ++sweep)
+    {
+      lower_next = lower_preconditioned;
+      for (int row = 0; row < true_rows; ++row)
+      {
+        if (sigma_class[static_cast<std::size_t>(row)] != 1) continue;
+        double action = 0.0;
+        for (int column = 0; column < true_rows; ++column)
+          action += global_matrix[
+              static_cast<std::size_t>(row) * true_rows + column] *
+              lower_preconditioned[static_cast<std::size_t>(column)];
+        const double diagonal = global_matrix[
+            static_cast<std::size_t>(row) * true_rows + row];
+        lower_next[static_cast<std::size_t>(row)] =
+            lower_preconditioned[static_cast<std::size_t>(row)] +
+            native_trace_sigma_jacobi_damping *
+                (right_hand_side[static_cast<std::size_t>(row)] - action) /
+                    diagonal;
+      }
+      lower_preconditioned.swap(lower_next);
+    }
+    bool corrected_predictors_differ = false;
+    for (int row = 0; row < true_rows; ++row)
+    {
+      if (!std::isfinite(
+              lower_preconditioned[static_cast<std::size_t>(row)]))
+        return false;
+      corrected_predictors_differ = corrected_predictors_differ ||
+          (sigma_class[static_cast<std::size_t>(row)] == 0 &&
+           std::abs(preconditioned[static_cast<std::size_t>(row)] -
+                    lower_preconditioned[static_cast<std::size_t>(row)]) >
+               1.0e-6);
+    }
+    if (!corrected_predictors_differ) return false;
+  }
+
   // A lexicographic in-place sigma sweep is deliberately not equivalent for
   // this cross-coupled fixture. Keep this assertion so removing either the
   // sigma-sigma entries or the device double buffer cannot make the CPU
@@ -2431,45 +2904,73 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
   if (!differs_from_in_place) return false;
 
   double rhs_norm_squared = 0.0;
-  std::vector<double> operator_action(static_cast<std::size_t>(true_rows));
-  for (int row = 0; row < true_rows; ++row)
+  for (const double value : right_hand_side)
+    rhs_norm_squared += value * value;
+  if (!(rhs_norm_squared > 0.0) || !std::isfinite(rhs_norm_squared))
+    return false;
+  const auto one_step_gmres_expected =
+      [&](const std::vector<double>& preconditioner_action,
+          std::vector<double>& expected) {
+    if (preconditioner_action.size() !=
+        static_cast<std::size_t>(true_rows))
+      return false;
+    std::vector<double> operator_action(
+        static_cast<std::size_t>(true_rows), 0.0);
+    for (int row = 0; row < true_rows; ++row)
+      for (int column = 0; column < true_rows; ++column)
+        operator_action[static_cast<std::size_t>(row)] += global_matrix[
+            static_cast<std::size_t>(row) * true_rows + column] *
+            preconditioner_action[static_cast<std::size_t>(column)];
+    double hessenberg = 0.0;
+    for (int row = 0; row < true_rows; ++row)
+      hessenberg += right_hand_side[static_cast<std::size_t>(row)] *
+          operator_action[static_cast<std::size_t>(row)] /
+          rhs_norm_squared;
+    double perpendicular_norm_squared = 0.0;
+    for (int row = 0; row < true_rows; ++row)
+    {
+      const double value = operator_action[static_cast<std::size_t>(row)] -
+          hessenberg * right_hand_side[static_cast<std::size_t>(row)];
+      perpendicular_norm_squared += value * value / rhs_norm_squared;
+    }
+    const double denominator = hessenberg * hessenberg +
+        perpendicular_norm_squared;
+    if (!(denominator > 0.0) || !std::isfinite(denominator)) return false;
+    const double coefficient = hessenberg / denominator;
+    expected.resize(static_cast<std::size_t>(true_rows));
+    for (int row = 0; row < true_rows; ++row)
+    {
+      const double value = coefficient *
+          preconditioner_action[static_cast<std::size_t>(row)];
+      if (!std::isfinite(value)) return false;
+      expected[static_cast<std::size_t>(row)] = value;
+    }
+    return true;
+  };
+  std::vector<double> expected;
+  if (!one_step_gmres_expected(preconditioned, expected)) return false;
+  if (coupled_warp)
   {
-    rhs_norm_squared += right_hand_side[static_cast<std::size_t>(row)] *
-        right_hand_side[static_cast<std::size_t>(row)];
-    double value = 0.0;
-    for (int column = 0; column < true_rows; ++column)
-      value += global_matrix[
-          static_cast<std::size_t>(row) * true_rows + column] *
-          preconditioned[static_cast<std::size_t>(column)];
-    operator_action[static_cast<std::size_t>(row)] = value;
+    std::vector<double> lower_expected;
+    if (!one_step_gmres_expected(lower_preconditioned, lower_expected) ||
+        MaximumScaledDifference(expected, lower_expected) <= 1.0e-6)
+      return false;
   }
-  double hessenberg = 0.0;
-  for (int row = 0; row < true_rows; ++row)
-    hessenberg += right_hand_side[static_cast<std::size_t>(row)] *
-        operator_action[static_cast<std::size_t>(row)] / rhs_norm_squared;
-  double perpendicular_norm_squared = 0.0;
   for (int row = 0; row < true_rows; ++row)
   {
-    const double value = operator_action[static_cast<std::size_t>(row)] -
-        hessenberg * right_hand_side[static_cast<std::size_t>(row)];
-    perpendicular_norm_squared += value * value / rhs_norm_squared;
-  }
-  const double denominator = hessenberg * hessenberg +
-      perpendicular_norm_squared;
-  if (!(denominator > 0.0) || !std::isfinite(denominator)) return false;
-  const double coefficient = hessenberg / denominator;
-  for (int row = 0; row < true_rows; ++row)
-  {
-    const double expected = coefficient *
-        preconditioned[static_cast<std::size_t>(row)];
-    const double tolerance = 5.0e-10 * std::max(1.0, std::abs(expected));
+    const double reference = expected[static_cast<std::size_t>(row)];
+    const double tolerance =
+        5.0e-10 * std::max(1.0, std::abs(reference));
     if (!std::isfinite(host_solution[static_cast<std::size_t>(row)]) ||
-        std::abs(host_solution[static_cast<std::size_t>(row)] - expected) >
+        std::abs(host_solution[static_cast<std::size_t>(row)] - reference) >
             tolerance)
       return false;
   }
   auto mismatched_system = system;
-  mismatched_system.operator_kind = cooperative_warp
+  mismatched_system.operator_kind = coupled_warp
+      ? NativeTraceOperatorKind::
+            element_matrix_free_warp_equilibrated_field_split_fp64
+      : cooperative_warp
       ? NativeTraceOperatorKind::
             element_matrix_free_equilibrated_field_split_fp64
       : NativeTraceOperatorKind::
@@ -2479,8 +2980,10 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
           nullptr))
     return false;
   auto mismatched_preconditioner = preconditioner;
-  mismatched_preconditioner.kind =
-      native_preconditioner_for(sigma_jacobi_sweeps, !cooperative_warp);
+  mismatched_preconditioner.kind = coupled_warp
+      ? native_preconditioner_for(sigma_jacobi_sweeps, true)
+      : native_preconditioner_for(
+            sigma_jacobi_sweeps, !cooperative_warp);
   return !LaunchNativeRankOneTraceSolve(
       system, mismatched_preconditioner, workspace, policy, support, nullptr);
 }
@@ -2492,9 +2995,21 @@ bool NativeFixedSigmaJacobiDeviceFixtures()
          sweeps <= dg::hdg::runtime::cuda_w8a::detail::
              native_trace_sigma_jacobi_maximum_sweeps;
          ++sweeps)
-      if (!NativeFixedSigmaJacobiOrderFixture(order, false, sweeps) ||
-          !NativeFixedSigmaJacobiOrderFixture(order, true, sweeps))
+      if (!NativeFixedSigmaJacobiOrderFixture(
+              order, NativeFixedSigmaPatchKind::scalar_field_split,
+              sweeps) ||
+          !NativeFixedSigmaJacobiOrderFixture(
+              order, NativeFixedSigmaPatchKind::warp_field_split,
+              sweeps))
         return false;
+  for (int order = 1; order <= 3; ++order)
+    if (!NativeFixedSigmaJacobiOrderFixture(
+            order, NativeFixedSigmaPatchKind::warp_coupled, 2) ||
+        !NativeFixedSigmaJacobiOrderFixture(
+            order, NativeFixedSigmaPatchKind::warp_coupled,
+            dg::hdg::runtime::cuda_w8a::detail::
+                native_trace_sigma_jacobi_maximum_sweeps))
+      return false;
   return true;
 }
 std::vector<double> ConventionalFixtureMatrix()
