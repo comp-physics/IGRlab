@@ -1920,11 +1920,36 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
   const NativeTraceCooperativeSupport support =
       QueryNativeRankOneTraceCooperativeSupport(
           true_rows, policy.krylov_dimension, true, true);
-  const NativeTraceWorkspaceRequirements requirements =
+  const NativeTraceCooperativeSupport base_support =
+      QueryNativeRankOneTraceCooperativeSupport(
+          true_rows, policy.krylov_dimension, true, false);
+  const NativeTraceWorkspaceRequirements fixed_requirements =
       QueryNativeTraceWorkspaceRequirements(
           true_rows, policy.krylov_dimension,
           support.cooperative_blocks, true);
+  const NativeTraceWorkspaceRequirements base_requirements =
+      QueryNativeTraceWorkspaceRequirements(
+          true_rows, policy.krylov_dimension,
+          base_support.cooperative_blocks, true);
+  NativeTraceWorkspaceRequirements requirements{};
+  requirements.valid = fixed_requirements.valid && base_requirements.valid;
+  requirements.basis_doubles = std::max(
+      fixed_requirements.basis_doubles, base_requirements.basis_doubles);
+  requirements.vector_doubles = std::max(
+      fixed_requirements.vector_doubles, base_requirements.vector_doubles);
+  requirements.reduction_doubles = std::max(
+      fixed_requirements.reduction_doubles,
+      base_requirements.reduction_doubles);
+  requirements.small_doubles = std::max(
+      fixed_requirements.small_doubles, base_requirements.small_doubles);
+  requirements.permutation_integers = std::max(
+      fixed_requirements.permutation_integers,
+      base_requirements.permutation_integers);
+  requirements.control_double_slots = std::max(
+      fixed_requirements.control_double_slots,
+      base_requirements.control_double_slots);
   if (!support.supported || !support.fixed_sigma_jacobi ||
+      !base_support.supported || base_support.fixed_sigma_jacobi ||
       !requirements.valid)
     return false;
 
@@ -1998,30 +2023,64 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
           system, base_preconditioner, workspace, policy, support, nullptr))
     return false;
 
-  // Preserve a structurally valid signed true-row permutation while swapping
-  // one Euler incidence with one sigma incidence. The native fixed-sweep
-  // kernel must reject this component-major field-contract violation on the
-  // device instead of applying sigma corrections to an Euler true row.
+  // Globally exchange one Euler and one sigma true-row identity across every
+  // signed occurrence and swap their complete incidence lists. This remains
+  // a self-consistent signed-dof/incidence structure, which the non-fixed
+  // element-Schwarz kernel must accept, but violates the extra component-major
+  // true-row contract required by compact sigma-only corrections.
+  constexpr int maximum_incidence = 2;
+  const int euler_truth = 0;
+  const int sigma_truth = 4 * scalar_true_rows;
   std::vector<int> field_permuted_signed_dofs = signed_dofs;
-  std::swap(field_permuted_signed_dofs[0],
-            field_permuted_signed_dofs[
-                static_cast<std::size_t>(4 * scalar_face_rows)]);
+  for (int& signed_dof : field_permuted_signed_dofs)
+  {
+    const bool negative = signed_dof < 0;
+    int truth = negative ? -1 - signed_dof : signed_dof;
+    if (truth == euler_truth)
+      truth = sigma_truth;
+    else if (truth == sigma_truth)
+      truth = euler_truth;
+    signed_dof = negative ? -1 - truth : truth;
+  }
+  std::vector<int> field_permuted_incidence = incidence;
+  for (int index = 0; index < maximum_incidence; ++index)
+    std::swap(field_permuted_incidence[
+                  maximum_incidence * euler_truth + index],
+              field_permuted_incidence[
+                  maximum_incidence * sigma_truth + index]);
   const std::size_t signed_dof_bytes =
       field_permuted_signed_dofs.size() * sizeof(int);
+  const std::size_t incidence_bytes =
+      field_permuted_incidence.size() * sizeof(int);
   if (cudaMemcpy(signed_element_trace.data(),
                  field_permuted_signed_dofs.data(), signed_dof_bytes,
                  cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(true_incidence.data(), field_permuted_incidence.data(),
+                 incidence_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+      !LaunchNativeRankOneTraceSolve(
+          system, base_preconditioner, workspace, policy, base_support,
+          nullptr) ||
+      cudaDeviceSynchronize() != cudaSuccess)
+    return false;
+  NativeTraceSolveControl observation{};
+  if (!control.CopyOneTo(observation) || observation.failure_mask != 0 ||
+      observation.status == NativeTraceSolveStatus::invalid_preconditioner ||
+      cudaMemset(solution.data(), 0,
+                 static_cast<std::size_t>(true_rows) * sizeof(double)) !=
+          cudaSuccess ||
       !LaunchNativeRankOneTraceSolve(
           system, preconditioner, workspace, policy, support, nullptr) ||
       cudaDeviceSynchronize() != cudaSuccess)
     return false;
-  NativeTraceSolveControl observation{};
+  observation = {};
   if (!control.CopyOneTo(observation) ||
       observation.status != NativeTraceSolveStatus::invalid_preconditioner ||
       observation.failure_mask == 0)
     return false;
   if (cudaMemcpy(signed_element_trace.data(), signed_dofs.data(),
                  signed_dof_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(true_incidence.data(), incidence.data(), incidence_bytes,
+                 cudaMemcpyHostToDevice) != cudaSuccess ||
       cudaMemset(solution.data(), 0,
                  static_cast<std::size_t>(true_rows) * sizeof(double)) !=
           cudaSuccess)
