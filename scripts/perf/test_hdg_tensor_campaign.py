@@ -164,7 +164,19 @@ parser.add_argument(
              "native-element-schwarz-matrix-free-equilibrated-field-split-"
              "sigma-jacobi7-fp64",
              "native-element-schwarz-matrix-free-warp-equilibrated-field-"
-             "split-sigma-jacobi7-fp64"),
+             "split-sigma-jacobi7-fp64",
+             "native-element-schwarz-matrix-free-equilibrated-field-split-"
+             "sigma-jacobi8-fp64",
+             "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+             "split-sigma-jacobi8-fp64",
+             "native-element-schwarz-matrix-free-equilibrated-field-split-"
+             "sigma-jacobi9-fp64",
+             "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+             "split-sigma-jacobi9-fp64",
+             "native-element-schwarz-matrix-free-equilibrated-field-split-"
+             "sigma-jacobi10-fp64",
+             "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+             "split-sigma-jacobi10-fp64"),
 )
 parser.add_argument("--order", required=True, type=int)
 parser.add_argument("--mesh-n", required=True, type=int)
@@ -279,6 +291,45 @@ fixed_sigma_jacobi_policies = {
         7,
         "native_element_schwarz_warp_equilibrated_field_split_"
         "sigma_jacobi7_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi8-fp64": (
+        8,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi8_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi8-fp64": (
+        8,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi8_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi9-fp64": (
+        9,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi9_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi9-fp64": (
+        9,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi9_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi10-fp64": (
+        10,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi10_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi10-fp64": (
+        10,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi10_fp64",
         True,
     ),
 }
@@ -1723,7 +1774,20 @@ def main() -> int:
             "sigma-jacobi7-fp64",
             "native-element-schwarz-matrix-free-warp-equilibrated-field-"
             "split-sigma-jacobi7-fp64",
+            "native-element-schwarz-matrix-free-equilibrated-field-split-"
+            "sigma-jacobi8-fp64",
+            "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+            "split-sigma-jacobi8-fp64",
+            "native-element-schwarz-matrix-free-equilibrated-field-split-"
+            "sigma-jacobi9-fp64",
+            "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+            "split-sigma-jacobi9-fp64",
+            "native-element-schwarz-matrix-free-equilibrated-field-split-"
+            "sigma-jacobi10-fp64",
+            "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+            "split-sigma-jacobi10-fp64",
         }
+        assert len(expected_fixed_sigma_policy_names) == 20
         assert set(CAMPAIGN.FIXED_SIGMA_JACOBI_POLICY) == \
             expected_fixed_sigma_policy_names
         fixed_sigma_policy_specs = tuple(
@@ -1830,9 +1894,9 @@ def main() -> int:
 
         for unsupported_fixed_policy in (
                 "native-element-schwarz-matrix-free-warp-"
-                "equilibrated-field-split-sigma-jacobi7-fp64-extra",
+                "equilibrated-field-split-sigma-jacobi10-fp64-extra",
                 "native-element-schwarz-matrix-free-warp-"
-                "equilibrated-field-split-sigma-jacobi8-fp64"):
+                "equilibrated-field-split-sigma-jacobi11-fp64"):
             try:
                 CAMPAIGN.final_command(
                     final,

@@ -155,7 +155,50 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
             "sigma_jacobi7_fp64",
             True,
         ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi8-fp64": (
+            8,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi8_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi8-fp64": (
+            8,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi8_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi9-fp64": (
+            9,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi9_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi9-fp64": (
+            9,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi9_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi10-fp64": (
+            10,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi10_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi10-fp64": (
+            10,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi10_fp64",
+            True,
+        ),
     }
+    assert len(expected) == 20
     assert PROFILE.FIXED_SIGMA_JACOBI_PROFILE_POLICIES == expected
     conventional_default = PROFILE._profile_trace_policy_contract(
         "engine-default", "conventional"
@@ -185,13 +228,13 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
     assert rejected(
         PROFILE._profile_trace_policy_contract,
         "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-        "sigma-jacobi7-fp64-extra",
+        "sigma-jacobi10-fp64-extra",
         "igr",
     )
     assert rejected(
         PROFILE._profile_trace_policy_contract,
         "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-        "sigma-jacobi8-fp64",
+        "sigma-jacobi11-fp64",
         "igr",
     )
     for policy, descriptor in expected.items():
@@ -233,7 +276,7 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
         assert rejected(
             PROFILE._validated_fixed_sigma_jacobi_work, no_work, contract
         ), policy
-        if descriptor[0] == 7:
+        if descriptor[0] == 10:
             overflowing = {
                 **tensor,
                 "element_schwarz_preconditioner_applications":

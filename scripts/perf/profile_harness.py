@@ -158,6 +158,45 @@ FIXED_SIGMA_JACOBI_PROFILE_POLICIES = {
         "sigma_jacobi7_fp64",
         True,
     ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi8-fp64": FixedSigmaJacobiProfilePolicy(
+        8,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi8_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi8-fp64": FixedSigmaJacobiProfilePolicy(
+        8,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi8_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi9-fp64": FixedSigmaJacobiProfilePolicy(
+        9,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi9_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi9-fp64": FixedSigmaJacobiProfilePolicy(
+        9,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi9_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi10-fp64": FixedSigmaJacobiProfilePolicy(
+        10,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi10_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi10-fp64": FixedSigmaJacobiProfilePolicy(
+        10,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi10_fp64",
+        True,
+    ),
 }
 
 

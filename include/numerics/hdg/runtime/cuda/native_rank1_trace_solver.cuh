@@ -27,7 +27,8 @@ inline constexpr int native_trace_cooperative_threads = 256;
 inline constexpr int native_trace_ilu_jacobi_iterations = 5;
 inline constexpr int native_trace_sigma_jacobi3_sweeps = 3;
 inline constexpr int native_trace_sigma_jacobi5_sweeps = 5;
-inline constexpr int native_trace_sigma_jacobi_maximum_sweeps = 7;
+inline constexpr int native_trace_sigma_jacobi7_sweeps = 7;
+inline constexpr int native_trace_sigma_jacobi_maximum_sweeps = 10;
 inline constexpr double native_trace_sigma_jacobi_damping =
     0x1.5555555555555p-1;
 
@@ -51,7 +52,13 @@ enum class NativeTracePreconditionerKind : std::int32_t
   element_overlap_schwarz_equilibrated_field_split_sigma_jacobi6_fp64 = 16,
   element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64 = 17,
   element_overlap_schwarz_equilibrated_field_split_sigma_jacobi7_fp64 = 18,
-  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64 = 19
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64 = 19,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi8_fp64 = 20,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi8_fp64 = 21,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi9_fp64 = 22,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi9_fp64 = 23,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi10_fp64 = 24,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64 = 25
 };
 
 enum class NativeTraceSolveStatus : std::int32_t

@@ -31,6 +31,8 @@ static_assert(detail::native_trace_sigma_jacobi3_sweeps ==
               native_element_schwarz_sigma_jacobi3_sweeps);
 static_assert(detail::native_trace_sigma_jacobi5_sweeps ==
               native_element_schwarz_sigma_jacobi5_sweeps);
+static_assert(detail::native_trace_sigma_jacobi7_sweeps ==
+              native_element_schwarz_sigma_jacobi7_sweeps);
 static_assert(detail::native_trace_sigma_jacobi_maximum_sweeps ==
               native_element_schwarz_sigma_jacobi_maximum_sweeps);
 static_assert(detail::native_trace_sigma_jacobi_damping ==
@@ -1408,12 +1410,30 @@ constexpr NativeTracePreconditionerKind NativeFixedSigmaJacobiPreconditioner(
               element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64
         : NativeTracePreconditionerKind::
               element_overlap_schwarz_equilibrated_field_split_sigma_jacobi6_fp64;
-  case native_element_schwarz_sigma_jacobi_maximum_sweeps:
+  case native_element_schwarz_sigma_jacobi7_sweeps:
     return warp
         ? NativeTracePreconditionerKind::
               element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64
         : NativeTracePreconditionerKind::
               element_overlap_schwarz_equilibrated_field_split_sigma_jacobi7_fp64;
+  case 8:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi8_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi8_fp64;
+  case 9:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi9_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi9_fp64;
+  case native_element_schwarz_sigma_jacobi_maximum_sweeps:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi10_fp64;
   default:
     return NativeTracePreconditionerKind::diagonal;
   }

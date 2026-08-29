@@ -296,6 +296,45 @@ FIXED_SIGMA_JACOBI_POLICY = {
         "sigma_jacobi7_fp64",
         True,
     ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi8-fp64": FixedSigmaJacobiPolicy(
+        8,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi8_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi8-fp64": FixedSigmaJacobiPolicy(
+        8,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi8_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi9-fp64": FixedSigmaJacobiPolicy(
+        9,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi9_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi9-fp64": FixedSigmaJacobiPolicy(
+        9,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi9_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi10-fp64": FixedSigmaJacobiPolicy(
+        10,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi10_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi10-fp64": FixedSigmaJacobiPolicy(
+        10,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi10_fp64",
+        True,
+    ),
 }
 for _fixed_policy, (_fixed_sweeps, _fixed_preconditioner, _fixed_warp) in \
         FIXED_SIGMA_JACOBI_POLICY.items():
