@@ -988,6 +988,28 @@ BindArenaViews() noexcept
       integer_arena_capacity_)
     return false;
 
+  if (CudaTracePreconditionerIsNativeElementSchwarz(
+          trace_policy_descriptor_.trace_preconditioner))
+  {
+    // Rank-one has no remote matrix/vector traffic. Repartition those already
+    // persistent slices as the Schwarz principal matrix, LU, maps, pivots,
+    // and two element-vector work arrays without growing either arena.
+    if (ranks_ != 1 || shape_.matrix_send_count != 0 ||
+        shape_.matrix_receive_count != 0 || shape_.vector_send_count != 0 ||
+        shape_.vector_receive_count != 0)
+      return false;
+    view_.element_schwarz_patch_lu = view_.remote_matrix_send;
+    view_.element_schwarz_patch_matrix = view_.remote_matrix_receive;
+    view_.element_schwarz_rhs = view_.remote_vector_send;
+    view_.element_schwarz_solution = view_.remote_vector_receive;
+    view_.element_schwarz_first_source = view_.matrix_send_source;
+    view_.element_schwarz_second_source = view_.matrix_receive_target;
+    view_.element_schwarz_true_incidence_slots =
+        view_.matrix_receive_section;
+    view_.element_schwarz_signed_true_dof = view_.vector_send_source;
+    view_.element_schwarz_pivots = view_.vector_receive_target;
+  }
+
   double_memory_.Wrap(double_arena_,
                       static_cast<int>(double_arena_capacity_),
                       mfem::MemoryType::DEVICE_UMPIRE, false);
@@ -1105,6 +1127,9 @@ BuildPersistentTrueSystem() noexcept
       trace_policy.trace_preconditioner;
   const bool use_ilu =
       CudaTracePreconditionerIsIlu(selected_preconditioner);
+  const bool use_element_schwarz =
+      CudaTracePreconditionerIsNativeElementSchwarz(
+          selected_preconditioner);
   const bool use_native = trace_solver_kind_ ==
       CudaTraceSolverKind::native_rank1_fp64;
   const bool use_mgr = trace_solver_kind_ ==
@@ -1118,7 +1143,12 @@ BuildPersistentTrueSystem() noexcept
         selected_preconditioner !=
             CudaTracePreconditionerKind::hypre_mgr_field_split)) ||
       (!use_mgr && selected_preconditioner ==
-          CudaTracePreconditionerKind::hypre_mgr_field_split))
+          CudaTracePreconditionerKind::hypre_mgr_field_split) ||
+      (use_element_schwarz &&
+       (!use_native || ranks_ != 1 || !shape_.igr_active ||
+        shape_.trace_components != igr_trace_components ||
+        shape_.trace_dofs !=
+            NativeElementSchwarzIgrPatchRows(shape_.order))))
     return false;
   initialization_tensor_core_evidence_ = {};
   initialization_tensor_core_evidence_.selected_engine = cuda_engine_;
@@ -1135,6 +1165,8 @@ BuildPersistentTrueSystem() noexcept
               CudaTraceSolverKind::hypre_host_staged_rank2;
   initialization_tensor_core_evidence_.trace_solver_accounting_complete =
       true;
+  initialization_tensor_core_evidence_.native_element_schwarz_configured =
+      false;
   // Native IGR keeps one allocator-prime ILU factor alive while the
   // production ILU object materializes its own fixed-shape factor below.
   // This bounded overlap establishes the recurring HYPRE/Umpire replacement
@@ -1429,9 +1461,10 @@ BuildPersistentTrueSystem() noexcept
           warm.ilu_factor_setups == 1 && warm.ilu_factor_reuses == 0;
     }
     warm_solved = use_ilu ? native_allocator_prime_ready :
-        warm_factor_ready &&
+        use_element_schwarz ? true : warm_factor_ready &&
             LaunchAndObserveNativeRankOneTraceSolve(
-                warm_factor, 0, final_coherent_linear_relative_tolerance_,
+                warm_factor, {}, 0,
+                final_coherent_linear_relative_tolerance_,
                 warm);
   }
   else if (use_mgr)
@@ -1493,7 +1526,7 @@ BuildPersistentTrueSystem() noexcept
   if (use_ilu && warm_solved && !use_native)
     (void)CudaAccumulateIluSolveEvidence(
         initialization_tensor_core_evidence_, warm);
-  if (warm_solved && !(use_native && use_ilu))
+  if (warm_solved && !(use_native && (use_ilu || use_element_schwarz)))
   {
     if (use_native)
       initialization_tensor_core_evidence_.
@@ -1501,8 +1534,9 @@ BuildPersistentTrueSystem() noexcept
     else
       initialization_tensor_core_evidence_.hypre_trace_solve_calls = 1;
   }
-  const bool warmed = use_native && use_ilu
-      ? native_allocator_prime_ready
+  const bool warmed = use_native && (use_ilu || use_element_schwarz)
+      ? (use_ilu ? native_allocator_prime_ready :
+          element_schwarz_plan_.valid)
       : warm_solved && warm.device_policy &&
           warm.configured_preconditioner && warm.finite &&
           warm.matrix_generation == 0 &&
@@ -1552,6 +1586,26 @@ BuildPersistentTrueSystem() noexcept
     {
       if (use_ilu)
         ilu_.emplace();
+      const bool native_specific_ready = use_ilu
+          ? native_ilu_inverse_diagonal_ != nullptr &&
+              generic_arena_layout_.native_ilu_inverse_diagonal ==
+                  static_cast<std::size_t>(shape_.true_trace_count) &&
+              native_trace_workspace_.permutation_marks != nullptr
+          : use_element_schwarz
+              ? native_ilu_inverse_diagonal_ == nullptr &&
+                  native_trace_workspace_.permutation_marks != nullptr &&
+                  element_schwarz_plan_.valid &&
+                  view_.element_schwarz_patch_matrix != nullptr &&
+                  view_.element_schwarz_patch_lu != nullptr &&
+                  view_.element_schwarz_rhs != nullptr &&
+                  view_.element_schwarz_solution != nullptr &&
+                  view_.element_schwarz_first_source != nullptr &&
+                  view_.element_schwarz_second_source != nullptr &&
+                  view_.element_schwarz_signed_true_dof != nullptr &&
+                  view_.element_schwarz_true_incidence_slots != nullptr &&
+                  view_.element_schwarz_pivots != nullptr
+              : native_ilu_inverse_diagonal_ == nullptr &&
+                  native_trace_workspace_.permutation_marks == nullptr;
       persistent_configured = !gmres_ && !diagonal_ &&
           (use_ilu == static_cast<bool>(ilu_)) &&
           native_trace_requirements_.valid &&
@@ -1571,14 +1625,7 @@ BuildPersistentTrueSystem() noexcept
               native_trace_requirements_.small_doubles &&
           native_trace_workspace_.permutation_integers ==
               native_trace_requirements_.permutation_integers &&
-          (!use_ilu ||
-           (native_ilu_inverse_diagonal_ != nullptr &&
-            generic_arena_layout_.native_ilu_inverse_diagonal ==
-                static_cast<std::size_t>(shape_.true_trace_count) &&
-            native_trace_workspace_.permutation_marks != nullptr)) &&
-          (use_ilu ||
-           (native_ilu_inverse_diagonal_ == nullptr &&
-            native_trace_workspace_.permutation_marks == nullptr));
+          native_specific_ready;
       if (persistent_configured && use_ilu)
       {
         // Build and validate the production factor while the allocator-prime
@@ -1605,7 +1652,7 @@ BuildPersistentTrueSystem() noexcept
                 persistent_warm_factor_state, persistent_warm_factor,
                 persistent_warm) &&
             LaunchAndObserveNativeRankOneTraceSolve(
-                persistent_warm_factor, 0,
+                persistent_warm_factor, {}, 0,
                 final_coherent_linear_relative_tolerance_,
                 persistent_warm) &&
             persistent_warm.device_policy &&
@@ -1704,6 +1751,16 @@ BuildPersistentTrueSystem() noexcept
     trace_preconditioner_ = selected_preconditioner;
     initialization_tensor_core_evidence_.trace_preconditioner_configured =
         true;
+    initialization_tensor_core_evidence_.native_element_schwarz_configured =
+        use_element_schwarz;
+    initialization_tensor_core_evidence_.element_schwarz_patch_rows =
+        use_element_schwarz ? element_schwarz_plan_.patch_rows : 0;
+    initialization_tensor_core_evidence_.
+        element_schwarz_minimum_multiplicity = use_element_schwarz
+            ? element_schwarz_plan_.minimum_multiplicity : 0;
+    initialization_tensor_core_evidence_.
+        element_schwarz_maximum_multiplicity = use_element_schwarz
+            ? element_schwarz_plan_.maximum_multiplicity : 0;
   }
   ReportCudaWarmLifetimeMarker(
       rank_, "persistent-recreation-configuration", "after",
@@ -1922,13 +1979,53 @@ BuildSparseStagingPlan() noexcept
     if (!CollectiveContinue(local_receive_valid)) { return false; }
   }
 
+  const bool use_element_schwarz =
+      CudaTracePreconditionerIsNativeElementSchwarz(
+          trace_policy_descriptor_.trace_preconditioner);
+  if (use_element_schwarz)
+  {
+    const int expected_patch_rows =
+        NativeElementSchwarzIgrPatchRows(shape_.order);
+    element_schwarz_plan_ = BuildNativeElementSchwarzPlan({
+        shape_.elements, shape_.trace_dofs, shape_.local_trace_count,
+        shape_.true_trace_count, true_structure_.diag_nonzeros,
+        signed_element_trace_.data(),
+        static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs,
+        local_true_index_.data(), local_true_index_.size(),
+        host_matrix_owned_source_.data(),
+        host_matrix_owned_section_.data(),
+        host_matrix_owned_target_.data(),
+        static_cast<std::size_t>(shape_.matrix_owned_count)});
+    const std::size_t patch_entries =
+        static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs *
+        shape_.trace_dofs;
+    const std::size_t element_rows =
+        static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs;
+    const bool plan_exact = ranks_ == 1 && shape_.igr_active &&
+        shape_.trace_components == igr_trace_components &&
+        shape_.trace_dofs == expected_patch_rows &&
+        shape_.matrix_owned_count == static_cast<int>(patch_entries) &&
+        shape_.matrix_send_count == 0 && shape_.matrix_receive_count == 0 &&
+        shape_.vector_send_count == 0 && shape_.vector_receive_count == 0 &&
+        element_schwarz_plan_.valid &&
+        element_schwarz_plan_.signed_element_true_dofs.size() ==
+            element_rows &&
+        element_schwarz_plan_.first_element_sources.size() == patch_entries &&
+        element_schwarz_plan_.second_element_sources.size() == patch_entries &&
+        element_schwarz_plan_.true_incidence_slots.size() ==
+            2 * static_cast<std::size_t>(shape_.true_trace_count);
+    if (!CollectiveContinue(plan_exact)) return false;
+  }
+  else
+    element_schwarz_plan_ = {};
+
   const auto upload = [](int* destination, const int* source, int count)
   {
     return TransportPolicy::HostToDevice(
         destination, source, static_cast<std::size_t>(count) * sizeof(int),
         CudaTransferCategory::topology, CudaTransferSite::map_upload);
   };
-  const bool uploaded = upload(
+  bool uploaded = upload(
                 view_.matrix_owned_source, host_matrix_owned_source_.data(),
                 shape_.matrix_owned_count) &&
       upload(view_.matrix_owned_section, host_matrix_owned_section_.data(),
@@ -1950,6 +2047,25 @@ BuildSparseStagingPlan() noexcept
              shape_.vector_send_count) &&
       upload(view_.vector_receive_target, host_vector_receive_target_.data(),
              shape_.vector_receive_count);
+  if (uploaded && use_element_schwarz)
+  {
+    const int patch_entries = shape_.elements * shape_.trace_dofs *
+        shape_.trace_dofs;
+    const int element_rows = shape_.elements * shape_.trace_dofs;
+    uploaded = upload(
+                   view_.element_schwarz_first_source,
+                   element_schwarz_plan_.first_element_sources.data(),
+                   patch_entries) &&
+        upload(view_.element_schwarz_second_source,
+               element_schwarz_plan_.second_element_sources.data(),
+               patch_entries) &&
+        upload(view_.element_schwarz_signed_true_dof,
+               element_schwarz_plan_.signed_element_true_dofs.data(),
+               element_rows) &&
+        upload(view_.element_schwarz_true_incidence_slots,
+               element_schwarz_plan_.true_incidence_slots.data(),
+               2 * shape_.true_trace_count);
+  }
   return CollectiveContinue(uploaded);
 }
 
@@ -2378,6 +2494,7 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 LaunchAndObserveNativeRankOneTraceSolve(
     const CudaNativeIlu0FactorView& factor,
+    const CudaNativeElementSchwarzView& element_schwarz,
     const std::uint64_t matrix_generation,
     const double requested_relative_tolerance,
     CudaSolveDiagnostics& diagnostics) noexcept
@@ -2390,7 +2507,11 @@ LaunchAndObserveNativeRankOneTraceSolve(
       native_trace_requirements_.control_double_slots >
           native_trace_host_control_.size())
     return false;
-  const bool use_ilu = shape_.igr_active;
+  const bool use_ilu = CudaTracePreconditionerIsIlu(
+      trace_policy_descriptor_.trace_preconditioner);
+  const bool use_element_schwarz =
+      CudaTracePreconditionerIsNativeElementSchwarz(
+          trace_policy_descriptor_.trace_preconditioner);
   const bool factor_exact = use_ilu
       ? factor.offsets != nullptr && factor.columns != nullptr &&
           factor.values != nullptr && factor.permutation != nullptr &&
@@ -2405,8 +2526,37 @@ LaunchAndObserveNativeRankOneTraceSolve(
           factor.values == nullptr && factor.permutation == nullptr &&
           factor.inverse_diagonal == nullptr && factor.rows == 0 &&
           factor.nonzeros == 0;
+  const bool element_schwarz_exact = use_element_schwarz
+      ? element_schwarz.patch_matrix ==
+            view_.element_schwarz_patch_matrix &&
+          element_schwarz.patch_lu == view_.element_schwarz_patch_lu &&
+          element_schwarz.pivots == view_.element_schwarz_pivots &&
+          element_schwarz.signed_element_true_dofs ==
+              view_.element_schwarz_signed_true_dof &&
+          element_schwarz.true_incidence_slots ==
+              view_.element_schwarz_true_incidence_slots &&
+          element_schwarz.element_rhs == view_.element_schwarz_rhs &&
+          element_schwarz.element_solution ==
+              view_.element_schwarz_solution &&
+          element_schwarz.elements == shape_.elements &&
+          element_schwarz.patch_rows == element_schwarz_plan_.patch_rows &&
+          element_schwarz.true_rows == shape_.true_trace_count &&
+          element_schwarz.minimum_multiplicity ==
+              element_schwarz_plan_.minimum_multiplicity &&
+          element_schwarz.maximum_multiplicity ==
+              element_schwarz_plan_.maximum_multiplicity &&
+          element_schwarz_plan_.valid
+      : element_schwarz.patch_matrix == nullptr &&
+          element_schwarz.patch_lu == nullptr &&
+          element_schwarz.pivots == nullptr &&
+          element_schwarz.signed_element_true_dofs == nullptr &&
+          element_schwarz.true_incidence_slots == nullptr &&
+          element_schwarz.element_rhs == nullptr &&
+          element_schwarz.element_solution == nullptr &&
+          element_schwarz.elements == 0 && element_schwarz.patch_rows == 0 &&
+          element_schwarz.true_rows == 0;
   CudaTrueMatrixDeviceView current_matrix{};
-  const bool matrix_exact = factor_exact &&
+  const bool matrix_exact = factor_exact && element_schwarz_exact &&
       CudaGetTrueMatrixDeviceView(*true_matrix_, current_matrix) &&
       current_matrix.rows == shape_.true_trace_count &&
       current_matrix.diag_columns_count == shape_.true_trace_count &&
@@ -2443,7 +2593,8 @@ LaunchAndObserveNativeRankOneTraceSolve(
   native_trace_host_control_.fill(0.0);
   const bool launched = CudaLaunchNativeRankOneTraceSolver(
       current_matrix, view_.true_rhs_scratch, view_.true_solution,
-      use_ilu, factor, native_trace_workspace_, native_trace_support_,
+      trace_policy_descriptor_.trace_preconditioner, factor,
+      element_schwarz, native_trace_workspace_, native_trace_support_,
       requested_relative_tolerance, maximum_linear_iterations_,
       krylov_dimension_, nullptr);
   const std::size_t control_bytes =
@@ -2475,9 +2626,17 @@ LaunchAndObserveNativeRankOneTraceSolve(
   diagnostics.configured_native_solver = decoded &&
       observation.ready_for_true_residual;
   diagnostics.configured_ilu = use_ilu && factor_exact;
-  diagnostics.configured_diagonal = !use_ilu && factor_exact;
+  diagnostics.configured_diagonal =
+      !use_ilu && !use_element_schwarz && factor_exact;
+  diagnostics.configured_element_schwarz =
+      use_element_schwarz && element_schwarz_exact;
+  diagnostics.element_schwarz_preconditioner_applications =
+      use_element_schwarz && observation.preconditioner_applications >= 0
+      ? static_cast<std::uint64_t>(observation.preconditioner_applications)
+      : 0;
   diagnostics.configured_preconditioner =
-      diagnostics.configured_native_solver && factor_exact;
+      diagnostics.configured_native_solver && factor_exact &&
+      element_schwarz_exact;
   diagnostics.finite = decoded && observation.finite;
   diagnostics.reported_tolerance_met = diagnostics.finite &&
       diagnostics.reported_residual <= requested_relative_tolerance;
@@ -2558,19 +2717,69 @@ SolveTrueSystemAttempt(double& true_relative_residual,
   CudaSolveDiagnostics diagnostics{};
   const bool use_ilu = CudaTracePreconditionerIsIlu(
       trace_preconditioner_);
+  const bool use_element_schwarz =
+      CudaTracePreconditionerIsNativeElementSchwarz(
+          trace_preconditioner_);
   bool solved = false;
   if (trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64)
   {
     CudaNativeIlu0FactorView factor{};
-    const bool factor_ready = !use_ilu ||
+    CudaNativeElementSchwarzView element_schwarz{};
+    if (use_element_schwarz)
+    {
+      element_schwarz.patch_matrix = view_.element_schwarz_patch_matrix;
+      element_schwarz.patch_lu = view_.element_schwarz_patch_lu;
+      element_schwarz.pivots = view_.element_schwarz_pivots;
+      element_schwarz.signed_element_true_dofs =
+          view_.element_schwarz_signed_true_dof;
+      element_schwarz.true_incidence_slots =
+          view_.element_schwarz_true_incidence_slots;
+      element_schwarz.element_rhs = view_.element_schwarz_rhs;
+      element_schwarz.element_solution = view_.element_schwarz_solution;
+      element_schwarz.elements = shape_.elements;
+      element_schwarz.patch_rows = element_schwarz_plan_.patch_rows;
+      element_schwarz.true_rows = shape_.true_trace_count;
+      element_schwarz.minimum_multiplicity =
+          element_schwarz_plan_.minimum_multiplicity;
+      element_schwarz.maximum_multiplicity =
+          element_schwarz_plan_.maximum_multiplicity;
+    }
+    const bool ilu_factor_ready = !use_ilu ||
         CudaPrepareNativeRankOneIluFactor(
             *true_matrix_, *hypre_rhs_, *hypre_solution_, *ilu_,
             trace_policy_descriptor_, current_attempt_, matrix_generation,
             native_ilu_inverse_diagonal_,
             generic_arena_layout_.native_ilu_inverse_diagonal,
             ilu_factor_state_, factor, diagnostics, same_matrix_retry);
-    solved = factor_ready && LaunchAndObserveNativeRankOneTraceSolve(
-        factor, matrix_generation, requested_relative_tolerance,
+    bool schwarz_factor_ready = !use_element_schwarz;
+    if (use_element_schwarz)
+    {
+      const bool transition_ready = element_schwarz_plan_.valid &&
+          CudaElementSchwarzFactorTransitionIsExact(
+              element_schwarz_attempt_state_, current_attempt_,
+              matrix_generation, same_matrix_retry);
+      if (same_matrix_retry)
+      {
+        schwarz_factor_ready = transition_ready;
+      }
+      else
+      {
+        schwarz_factor_ready = transition_ready &&
+            CudaLaunchSetupNativeElementSchwarz(view_, shape_) &&
+            StatusPassed();
+        if (schwarz_factor_ready)
+        {
+          element_schwarz_attempt_state_.factor_ready = true;
+          element_schwarz_attempt_state_.factor_generation =
+              matrix_generation;
+          diagnostics.element_schwarz_patch_setups = 1;
+        }
+      }
+    }
+    solved = ilu_factor_ready && schwarz_factor_ready &&
+        LaunchAndObserveNativeRankOneTraceSolve(
+        factor, element_schwarz, matrix_generation,
+        requested_relative_tolerance,
         diagnostics);
     if (solved && use_ilu)
     {
@@ -2581,6 +2790,23 @@ SolveTrueSystemAttempt(double& true_relative_residual,
                : matrix_generation > ilu_factor_state_.last_solve_generation);
       if (state_generation_ready)
         ilu_factor_state_.last_solve_generation = matrix_generation;
+      else
+        solved = false;
+    }
+    if (solved && use_element_schwarz)
+    {
+      const bool state_generation_ready =
+          element_schwarz_attempt_state_.factor_ready &&
+          element_schwarz_attempt_state_.factor_generation ==
+              matrix_generation &&
+          (same_matrix_retry
+               ? matrix_generation ==
+                   element_schwarz_attempt_state_.last_solve_generation
+               : matrix_generation >
+                   element_schwarz_attempt_state_.last_solve_generation);
+      if (state_generation_ready)
+        element_schwarz_attempt_state_.last_solve_generation =
+            matrix_generation;
       else
         solved = false;
     }
@@ -2714,6 +2940,35 @@ SolveTrueSystemAttempt(double& true_relative_residual,
   if (use_ilu && solved)
     (void)CudaAccumulateIluSolveEvidence(
         tensor_core_evidence, diagnostics);
+  if (use_element_schwarz && solved)
+  {
+    const auto checked_add = [](std::uint64_t& target,
+                                const std::uint64_t value) noexcept
+    {
+      if (value > std::numeric_limits<std::uint64_t>::max() - target)
+        return false;
+      target += value;
+      return true;
+    };
+    const bool accounted =
+        tensor_core_evidence.native_element_schwarz_configured &&
+        tensor_core_evidence.element_schwarz_patch_rows ==
+            element_schwarz_plan_.patch_rows &&
+        tensor_core_evidence.element_schwarz_minimum_multiplicity ==
+            element_schwarz_plan_.minimum_multiplicity &&
+        tensor_core_evidence.element_schwarz_maximum_multiplicity ==
+            element_schwarz_plan_.maximum_multiplicity &&
+        checked_add(tensor_core_evidence.element_schwarz_patch_setups,
+                    diagnostics.element_schwarz_patch_setups) &&
+        checked_add(
+            tensor_core_evidence.element_schwarz_preconditioner_applications,
+            diagnostics.element_schwarz_preconditioner_applications);
+    if (!accounted)
+    {
+      tensor_core_evidence.trace_solver_accounting_complete = false;
+      solved = false;
+    }
+  }
   if (solved)
   {
     std::uint64_t* const calls = trace_solver_kind_ ==

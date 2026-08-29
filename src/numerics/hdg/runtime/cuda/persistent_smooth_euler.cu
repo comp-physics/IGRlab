@@ -1355,8 +1355,10 @@ bool CudaQueryNativeRankOneTraceResources(
 
 bool CudaLaunchNativeRankOneTraceSolver(
     const CudaTrueMatrixDeviceView& matrix, const double* const rhs,
-    double* const solution, const bool igr_active,
+    double* const solution,
+    const CudaTracePreconditionerKind preconditioner_kind,
     const CudaNativeIlu0FactorView& ilu_factor,
+    const CudaNativeElementSchwarzView& element_schwarz,
     const CudaNativeTraceWorkspaceView& workspace,
     const CudaNativeTraceCooperativeSupport& support,
     const double relative_tolerance, const int maximum_iterations,
@@ -1370,10 +1372,15 @@ bool CudaLaunchNativeRankOneTraceSolver(
   system.solution = solution;
 
   NativeTracePreconditionerView preconditioner{};
-  preconditioner.kind = igr_active
+  const bool use_ilu = CudaTracePreconditionerIsIlu(preconditioner_kind);
+  const bool use_element_schwarz =
+      CudaTracePreconditionerIsNativeElementSchwarz(preconditioner_kind);
+  preconditioner.kind = use_ilu
       ? NativeTracePreconditionerKind::ilu0_rcm_jacobi
-      : NativeTracePreconditionerKind::diagonal;
-  if (igr_active)
+      : use_element_schwarz
+          ? NativeTracePreconditionerKind::element_overlap_schwarz_fp64
+          : NativeTracePreconditionerKind::diagonal;
+  if (use_ilu)
   {
     preconditioner.ilu0.factor = {
         ilu_factor.offsets, ilu_factor.columns, ilu_factor.values,
@@ -1385,6 +1392,29 @@ bool CudaLaunchNativeRankOneTraceSolver(
         ilu_factor.lower_jacobi_iterations;
     preconditioner.ilu0.upper_jacobi_iterations =
         ilu_factor.upper_jacobi_iterations;
+  }
+  if (use_element_schwarz)
+  {
+    preconditioner.element_schwarz.patch_matrix =
+        element_schwarz.patch_matrix;
+    preconditioner.element_schwarz.patch_lu = element_schwarz.patch_lu;
+    preconditioner.element_schwarz.pivots = element_schwarz.pivots;
+    preconditioner.element_schwarz.signed_element_true_dofs =
+        element_schwarz.signed_element_true_dofs;
+    preconditioner.element_schwarz.true_incidence_slots =
+        element_schwarz.true_incidence_slots;
+    preconditioner.element_schwarz.element_rhs =
+        element_schwarz.element_rhs;
+    preconditioner.element_schwarz.element_solution =
+        element_schwarz.element_solution;
+    preconditioner.element_schwarz.elements = element_schwarz.elements;
+    preconditioner.element_schwarz.patch_rows =
+        element_schwarz.patch_rows;
+    preconditioner.element_schwarz.true_rows = element_schwarz.true_rows;
+    preconditioner.element_schwarz.minimum_multiplicity =
+        element_schwarz.minimum_multiplicity;
+    preconditioner.element_schwarz.maximum_multiplicity =
+        element_schwarz.maximum_multiplicity;
   }
 
   NativeTraceWorkspaceView native_workspace{};
@@ -4638,6 +4668,97 @@ __global__ void GatherRemoteVectorKernel(CudaDeviceView v,CudaMeshShape s,const 
 __global__ void ScatterRemoteVectorKernel(CudaDeviceView v,double* truth,int n)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)atomicAdd(truth+v.vector_receive_target[i],v.remote_vector_receive[i]);}
 
+// Materialize and factor one exact principal trace patch per element. Each
+// patch entry sums all retained signed element-Schur contributors to the
+// corresponding true-matrix entry, then applies the target element's row and
+// column orientation. The unfactored matrix is retained for the native
+// apply's bounded local backward-error gate.
+__global__ void ElementSchwarzSetupKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;
+  if(e>=s.elements)return;
+  const int n=s.trace_dofs;
+  const int element_slots=s.elements*n;
+  const int all_entries=element_slots*n;
+  const std::size_t matrix_offset=static_cast<std::size_t>(e)*n*n;
+  const std::size_t vector_offset=static_cast<std::size_t>(e)*n;
+  double* matrix=v.element_schwarz_patch_matrix+matrix_offset;
+  double* lu=v.element_schwarz_patch_lu+matrix_offset;
+  int* pivots=v.element_schwarz_pivots+vector_offset;
+  __shared__ double scale;
+  __shared__ int pivot_row;
+  __shared__ int failed;
+  if(threadIdx.x==0){scale=0.0;pivot_row=0;failed=0;}
+  __syncthreads();
+  for(int item=threadIdx.x;item<n*n;item+=blockDim.x)
+  {
+    const int row=item/n,column=item-row*n;
+    const int target=static_cast<int>(matrix_offset)+item;
+    const int first=v.element_schwarz_first_source[target];
+    const int second=v.element_schwarz_second_source[target];
+    double row_sign=1.0,column_sign=1.0;
+    (void)Decode(v.element_schwarz_signed_true_dof[
+        static_cast<int>(vector_offset)+row],row_sign);
+    (void)Decode(v.element_schwarz_signed_true_dof[
+        static_cast<int>(vector_offset)+column],column_sign);
+    if(first<0||first>=all_entries||second< -1||second>=all_entries)
+    {
+      atomicExch(&failed,1);
+      matrix[item]=0.0;lu[item]=0.0;
+      continue;
+    }
+    double value=SignedMatrixValue(v,s,first);
+    if(second>=0)value+=SignedMatrixValue(v,s,second);
+    value*=row_sign*column_sign;
+    if(!isfinite(value))atomicExch(&failed,1);
+    matrix[item]=value;
+    lu[item]=value;
+  }
+  __syncthreads();
+  if(threadIdx.x==0)
+  {
+    for(int item=0;item<n*n;++item)scale=fmax(scale,fabs(lu[item]));
+    if(!(scale>0.0)||!isfinite(scale))failed=1;
+  }
+  __syncthreads();
+  for(int column=0;column<n;++column)
+  {
+    if(threadIdx.x==0&&failed==0)
+    {
+      pivot_row=column;
+      for(int row=column+1;row<n;++row)
+        if(fabs(lu[row*n+column])>fabs(lu[pivot_row*n+column]))
+          pivot_row=row;
+      pivots[column]=pivot_row;
+      const double pivot=fabs(lu[pivot_row*n+column]);
+      if(!(pivot>64.0*2.2204460492503131e-16*scale)||
+         !isfinite(pivot))failed=1;
+    }
+    __syncthreads();
+    if(failed)break;
+    if(pivot_row!=column)
+      for(int entry=threadIdx.x;entry<n;entry+=blockDim.x)
+      {
+        const double value=lu[column*n+entry];
+        lu[column*n+entry]=lu[pivot_row*n+entry];
+        lu[pivot_row*n+entry]=value;
+      }
+    __syncthreads();
+    for(int row=column+1+threadIdx.x;row<n;row+=blockDim.x)
+      lu[row*n+column]/=lu[column*n+column];
+    __syncthreads();
+    const int trailing=n-column-1;
+    for(int item=threadIdx.x;item<trailing*trailing;item+=blockDim.x)
+    {
+      const int row=column+1+item/trailing;
+      const int entry=column+1+item%trailing;
+      lu[row*n+entry]-=lu[row*n+column]*lu[column*n+entry];
+    }
+    __syncthreads();
+  }
+  if(threadIdx.x==0)v.status[e]=failed? -7.0:1.0;
+}
+
 __global__ void RecoverKernel(CudaDeviceView v,CudaMeshShape s)
 {
   const int e=blockIdx.x*blockDim.x+threadIdx.x;if(e>=s.elements)return;
@@ -5441,6 +5562,22 @@ bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
   if(!LaunchOk())return false;
   tensor_mma_tiles=per_element*elements;
   return true;
+}
+bool CudaLaunchSetupNativeElementSchwarz(
+    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+{
+  const int expected=NativeElementSchwarzIgrPatchRows(s.order);
+  if(!s.igr_active||s.elements<=0||s.trace_dofs!=expected||
+     v.schur==nullptr||v.status==nullptr||
+     v.element_schwarz_patch_matrix==nullptr||
+     v.element_schwarz_patch_lu==nullptr||
+     v.element_schwarz_first_source==nullptr||
+     v.element_schwarz_second_source==nullptr||
+     v.element_schwarz_signed_true_dof==nullptr||
+     v.element_schwarz_pivots==nullptr)
+    return false;
+  ElementSchwarzSetupKernel<<<s.elements,128>>>(v,s);
+  return LaunchOk();
 }
 bool CudaLaunchBuildRankOneEquilibratedSystem(
     const CudaTrueMatrixDeviceView& original,

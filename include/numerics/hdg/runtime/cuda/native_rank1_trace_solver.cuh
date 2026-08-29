@@ -29,7 +29,8 @@ inline constexpr int native_trace_ilu_jacobi_iterations = 5;
 enum class NativeTracePreconditionerKind : std::int32_t
 {
   diagonal = 1,
-  ilu0_rcm_jacobi = 2
+  ilu0_rcm_jacobi = 2,
+  element_overlap_schwarz_fp64 = 3
 };
 
 enum class NativeTraceSolveStatus : std::int32_t
@@ -85,11 +86,29 @@ struct NativeTraceIlu0View final
   int upper_jacobi_iterations = 0;
 };
 
+/** Persistent exact principal patches and their pivoted FP64 factors. */
+struct NativeTraceElementSchwarzView final
+{
+  const double* patch_matrix = nullptr;
+  const double* patch_lu = nullptr;
+  const int* pivots = nullptr;
+  const int* signed_element_true_dofs = nullptr;
+  const int* true_incidence_slots = nullptr;
+  double* element_rhs = nullptr;
+  double* element_solution = nullptr;
+  int elements = 0;
+  int patch_rows = 0;
+  int true_rows = 0;
+  int minimum_multiplicity = 0;
+  int maximum_multiplicity = 0;
+};
+
 struct NativeTracePreconditionerView final
 {
   NativeTracePreconditionerKind kind =
       NativeTracePreconditionerKind::diagonal;
   NativeTraceIlu0View ilu0{};
+  NativeTraceElementSchwarzView element_schwarz{};
 };
 
 /** Pinned HYPRE GMRES policy; all other convergence switches are fixed off. */

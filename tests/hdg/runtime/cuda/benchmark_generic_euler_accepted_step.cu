@@ -412,6 +412,12 @@ bool SelectTracePolicy(
     options.trace_policy = CudaTracePolicyKind::equilibrated_mgr;
     return true;
   }
+  if (text == "native-element-schwarz-fp64")
+  {
+    options.trace_policy =
+        CudaTracePolicyKind::native_element_schwarz_fp64;
+    return true;
+  }
   return false;
 }
 
@@ -494,8 +500,8 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     {
       if (++index >= argc || !SelectTracePolicy(argv[index], options))
       {
-        error = "--trace-policy requires engine-default, common-fast, or "
-                "equilibrated-mgr";
+        error = "--trace-policy requires engine-default, common-fast, "
+                "equilibrated-mgr, or native-element-schwarz-fp64";
         return false;
       }
       continue;
@@ -703,6 +709,15 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     error = "the IGR quadrature options require --mode igr";
     return false;
   }
+  if (options.trace_policy ==
+          CudaTracePolicyKind::native_element_schwarz_fp64 &&
+      (options.engine != CudaEngineKind::tensor_core ||
+       options.regularization != RegularizationKind::igr))
+  {
+    error = "native-element-schwarz-fp64 requires --engine tensor and "
+            "--mode igr";
+    return false;
+  }
   const std::array<bool, 5> expected_supplied{{
       !options.expected_source_revision.empty(),
       !options.expected_source_tree.empty(),
@@ -735,7 +750,7 @@ void PrintUsage(const char* executable)
 {
   std::cout << "Usage: " << executable
             << " [--mode conventional|igr] [--engine ordinary|tensor]"
-               " [--trace-policy engine-default|common-fast|equilibrated-mgr]"
+               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
@@ -745,7 +760,7 @@ void PrintUsage(const char* executable)
                " [--profile-measured-step 0|1|2|3|4]\n"
                "       " << executable
             << " [--conventional|--igr] [--engine ordinary|tensor]"
-               " [--trace-policy engine-default|common-fast|equilibrated-mgr]"
+               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
@@ -1132,6 +1147,8 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
             tensor.ilu_accounting_complete;
   const bool expected_mgr_solver =
       trace_policy == CudaTracePolicyKind::equilibrated_mgr;
+  const bool expected_element_schwarz = trace_policy ==
+      CudaTracePolicyKind::native_element_schwarz_fp64;
   const bool expected_native_solver =
       engine == CudaEngineKind::tensor_core && !expected_mgr_solver;
   const bool mgr_work_consistent = expected_mgr_solver
@@ -1157,6 +1174,24 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
             tensor.mgr_preconditioner_applications == 0 &&
             tensor.mgr_f_ilu_setups == 0 &&
             tensor.mgr_f_ilu_applications == 0;
+  const bool element_schwarz_work_consistent = expected_element_schwarz
+      ? tensor.native_element_schwarz_configured &&
+            tensor.element_schwarz_patch_setups == trace_solves &&
+            (evidence.linear_iterations == 0 ||
+             tensor.element_schwarz_preconditioner_applications > 0) &&
+            (tensor.element_schwarz_patch_rows == 40 ||
+             tensor.element_schwarz_patch_rows == 60 ||
+             tensor.element_schwarz_patch_rows == 80) &&
+            tensor.element_schwarz_minimum_multiplicity >= 1 &&
+            tensor.element_schwarz_maximum_multiplicity >=
+                tensor.element_schwarz_minimum_multiplicity &&
+            tensor.element_schwarz_maximum_multiplicity <= 2
+      : !tensor.native_element_schwarz_configured &&
+            tensor.element_schwarz_patch_setups == 0 &&
+            tensor.element_schwarz_preconditioner_applications == 0 &&
+            tensor.element_schwarz_patch_rows == 0 &&
+            tensor.element_schwarz_minimum_multiplicity == 0 &&
+            tensor.element_schwarz_maximum_multiplicity == 0;
   const bool trace_solver_consistent =
       tensor.trace_solver_accounting_complete &&
       tensor.native_rank1_trace_solver_configured ==
@@ -1175,6 +1210,7 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
       tensor.trace_preconditioner_configured &&
       tensor.trace_preconditioner == expected_preconditioner &&
       ilu_work_consistent && mgr_work_consistent &&
+      element_schwarz_work_consistent &&
       trace_solver_consistent &&
       tensor.fallback_count == 0 && tensor.fallback_accounting_complete &&
       evidence.no_fallback &&
@@ -1568,6 +1604,19 @@ void PrintStep(const StepSample& sample)
             << evidence.tensor_core.mgr_f_ilu_setups << ','
             << "\"mgr_f_ilu_applications\":"
             << evidence.tensor_core.mgr_f_ilu_applications << ','
+            << "\"element_schwarz_patch_setups\":"
+            << evidence.tensor_core.element_schwarz_patch_setups << ','
+            << "\"element_schwarz_preconditioner_applications\":"
+            << evidence.tensor_core.
+                   element_schwarz_preconditioner_applications << ','
+            << "\"element_schwarz_patch_rows\":"
+            << evidence.tensor_core.element_schwarz_patch_rows << ','
+            << "\"element_schwarz_minimum_multiplicity\":"
+            << evidence.tensor_core.
+                   element_schwarz_minimum_multiplicity << ','
+            << "\"element_schwarz_maximum_multiplicity\":"
+            << evidence.tensor_core.
+                   element_schwarz_maximum_multiplicity << ','
             << "\"minimum_left_scale\":"
             << evidence.tensor_core.minimum_left_scale << ','
             << "\"maximum_left_scale\":"
@@ -1580,6 +1629,8 @@ void PrintStep(const StepSample& sample)
             << std::boolalpha
             << evidence.tensor_core.native_rank1_trace_solver_configured
             << ','
+            << "\"native_element_schwarz_configured\":"
+            << evidence.tensor_core.native_element_schwarz_configured << ','
             << "\"hypre_mgr_rank1_trace_solver_configured\":"
             << evidence.tensor_core.
                    hypre_mgr_rank1_trace_solver_configured << ','
@@ -1842,6 +1893,17 @@ int RunBenchmark(const Options& options)
             << "\"trace_ilu_factor_reuse_policy\":\""
             << CudaIluFactorReusePolicyName(
                    reported_trace_policy.ilu_factor_reuse_policy) << "\","
+            << "\"trace_native_element_schwarz_configured\":"
+            << std::boolalpha
+            << reported_trace_policy.native_element_schwarz_configured << ','
+            << "\"trace_element_schwarz_patch_rows\":"
+            << reported_trace_policy.element_schwarz_patch_rows << ','
+            << "\"trace_element_schwarz_minimum_multiplicity\":"
+            << reported_trace_policy.element_schwarz_minimum_multiplicity
+            << ','
+            << "\"trace_element_schwarz_maximum_multiplicity\":"
+            << reported_trace_policy.element_schwarz_maximum_multiplicity
+            << std::noboolalpha << ','
             << "\"mode\":\""
             << (options.regularization == RegularizationKind::igr
                     ? "igr" : "conventional") << "\","

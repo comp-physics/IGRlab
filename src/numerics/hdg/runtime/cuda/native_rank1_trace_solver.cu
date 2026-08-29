@@ -24,6 +24,7 @@ inline constexpr std::uint32_t failure_nonfinite = 1U << 4;
 inline constexpr std::uint32_t failure_invalid_permutation = 1U << 5;
 inline constexpr std::uint32_t failure_numerical_breakdown = 1U << 6;
 inline constexpr int native_trace_projection_tile = 8;
+inline constexpr int native_trace_schwarz_maximum_incidence = 2;
 
 bool CheckedAdd(const std::size_t left, const std::size_t right,
                 std::size_t& result) noexcept
@@ -191,6 +192,77 @@ __device__ void ValidatePermutation(
   for (int row = thread; row < ilu0.factor.rows; row += stride)
     if (workspace.permutation_marks[row] != 1)
       MarkFailure(control, failure_invalid_permutation);
+}
+
+__device__ int DecodeSignedDof(const int encoded, double& sign) noexcept
+{
+  sign = encoded >= 0 ? 1.0 : -1.0;
+  return encoded >= 0 ? encoded : -1 - encoded;
+}
+
+__device__ void ValidateElementSchwarz(
+    const NativeTraceElementSchwarzView schwarz,
+    NativeTraceSolveControl* control,
+    const cg::grid_group& grid) noexcept
+{
+  const int thread = GlobalThreadIndex();
+  const int stride = GlobalThreadStride();
+  const int patch_rows = schwarz.patch_rows;
+  const int element_slots = schwarz.elements * patch_rows;
+  const int patch_entries = element_slots * patch_rows;
+  for (int entry = thread; entry < patch_entries; entry += stride)
+  {
+    if (!isfinite(schwarz.patch_matrix[entry]) ||
+        !isfinite(schwarz.patch_lu[entry]))
+      MarkFailure(control, failure_nonfinite);
+  }
+  for (int slot = thread; slot < element_slots; slot += stride)
+  {
+    double sign = 1.0;
+    const int truth = DecodeSignedDof(
+        schwarz.signed_element_true_dofs[slot], sign);
+    if (truth < 0 || truth >= schwarz.true_rows ||
+        (sign != 1.0 && sign != -1.0))
+      MarkFailure(control, failure_invalid_preconditioner);
+  }
+  for (int item = thread; item < element_slots; item += stride)
+  {
+    const int column = item % patch_rows;
+    const int pivot = schwarz.pivots[item];
+    const double diagonal = schwarz.patch_lu[
+        static_cast<std::size_t>(item / patch_rows) * patch_rows *
+            patch_rows + column * patch_rows + column];
+    if (pivot < column || pivot >= patch_rows || diagonal == 0.0 ||
+        !isfinite(diagonal))
+      MarkFailure(control, failure_invalid_preconditioner);
+  }
+  for (int row = thread; row < schwarz.true_rows; row += stride)
+  {
+    int multiplicity = 0;
+    for (int incidence = 0;
+         incidence < native_trace_schwarz_maximum_incidence;
+         ++incidence)
+    {
+      const int slot = schwarz.true_incidence_slots[
+          native_trace_schwarz_maximum_incidence * row + incidence];
+      if (slot < 0) continue;
+      if (slot >= element_slots)
+      {
+        MarkFailure(control, failure_invalid_preconditioner);
+        continue;
+      }
+      double sign = 1.0;
+      const int truth = DecodeSignedDof(
+          schwarz.signed_element_true_dofs[slot], sign);
+      if (truth != row)
+        MarkFailure(control, failure_invalid_preconditioner);
+      ++multiplicity;
+    }
+    if (multiplicity < schwarz.minimum_multiplicity ||
+        multiplicity > schwarz.maximum_multiplicity)
+      MarkFailure(control, failure_invalid_preconditioner);
+  }
+  grid.sync();
 }
 
 __device__ double GridDot(const double* left, const double* right,
@@ -480,6 +552,128 @@ __device__ void ApplyPreconditioner(
     return;
   }
 
+  if (preconditioner.kind ==
+      NativeTracePreconditionerKind::element_overlap_schwarz_fp64)
+  {
+    const NativeTraceElementSchwarzView schwarz =
+        preconditioner.element_schwarz;
+    const int patch_rows = schwarz.patch_rows;
+    const int element_slots = schwarz.elements * patch_rows;
+
+    // Gather the complete signed patch RHS before touching output. The final
+    // GMRES update intentionally permits input == output.
+    for (int slot = thread; slot < element_slots; slot += stride)
+    {
+      double sign = 1.0;
+      const int truth = DecodeSignedDof(
+          schwarz.signed_element_true_dofs[slot], sign);
+      schwarz.element_rhs[slot] = sign * input[truth];
+      schwarz.element_solution[slot] = schwarz.element_rhs[slot];
+    }
+    grid.sync();
+
+    for (int element = thread; element < schwarz.elements;
+         element += stride)
+    {
+      const std::size_t vector_offset =
+          static_cast<std::size_t>(element) * patch_rows;
+      const std::size_t matrix_offset = vector_offset * patch_rows;
+      const double* const matrix =
+          schwarz.patch_matrix + matrix_offset;
+      const double* const lu = schwarz.patch_lu + matrix_offset;
+      const int* const pivots = schwarz.pivots + vector_offset;
+      const double* const rhs = schwarz.element_rhs + vector_offset;
+      double* const solution = schwarz.element_solution + vector_offset;
+
+      for (int row = 0; row < patch_rows; ++row)
+      {
+        const int pivot = pivots[row];
+        if (pivot != row)
+        {
+          const double value = solution[row];
+          solution[row] = solution[pivot];
+          solution[pivot] = value;
+        }
+      }
+      for (int row = 0; row < patch_rows; ++row)
+      {
+        double value = solution[row];
+        for (int column = 0; column < row; ++column)
+          value -= lu[row * patch_rows + column] * solution[column];
+        solution[row] = value;
+      }
+      for (int row = patch_rows - 1; row >= 0; --row)
+      {
+        double value = solution[row];
+        for (int column = row + 1; column < patch_rows; ++column)
+          value -= lu[row * patch_rows + column] * solution[column];
+        solution[row] = value / lu[row * patch_rows + row];
+      }
+
+      // Validate the first actual application of each native solve against
+      // the retained unfactored patch. The synchronized aggregate counter
+      // makes this uniform across the cooperative grid; later applications
+      // avoid recurring dense validation traffic.
+      if (control->preconditioner_applications == 1)
+      {
+        double matrix_norm = 0.0;
+        double solution_norm = 0.0;
+        double rhs_norm = 0.0;
+        double residual_norm = 0.0;
+        for (int row = 0; row < patch_rows; ++row)
+        {
+          double row_norm = 0.0;
+          double residual = -rhs[row];
+          solution_norm = fmax(solution_norm, fabs(solution[row]));
+          rhs_norm = fmax(rhs_norm, fabs(rhs[row]));
+          for (int column = 0; column < patch_rows; ++column)
+          {
+            const double coefficient = matrix[row * patch_rows + column];
+            row_norm += fabs(coefficient);
+            residual += coefficient * solution[column];
+          }
+          matrix_norm = fmax(matrix_norm, row_norm);
+          residual_norm = fmax(residual_norm, fabs(residual));
+        }
+        const double denominator =
+            fmax(matrix_norm * solution_norm + rhs_norm, 0x1p-1022);
+        const double backward_error = residual_norm / denominator;
+        const double backward_error_limit =
+            4096.0 * 2.2204460492503131e-16 * patch_rows;
+        if (!isfinite(backward_error) ||
+            backward_error > backward_error_limit)
+          MarkFailure(control, failure_invalid_preconditioner);
+      }
+    }
+    grid.sync();
+    if (control->failure_mask != 0) return;
+
+    // One thread owns one true row and reduces its static one/two element
+    // incidences in fixed order. This is deterministic inverse-multiplicity
+    // weighting and uses no global atomics.
+    for (int row = thread; row < rows; row += stride)
+    {
+      double value = 0.0;
+      int multiplicity = 0;
+      for (int incidence = 0;
+           incidence < native_trace_schwarz_maximum_incidence; ++incidence)
+      {
+        const int slot = schwarz.true_incidence_slots[
+            native_trace_schwarz_maximum_incidence * row + incidence];
+        if (slot < 0) continue;
+        double sign = 1.0;
+        (void)DecodeSignedDof(
+            schwarz.signed_element_true_dofs[slot], sign);
+        value += sign * schwarz.element_solution[slot];
+        ++multiplicity;
+      }
+      output[row] = value / static_cast<double>(multiplicity);
+      if (!isfinite(output[row])) MarkFailure(control, failure_nonfinite);
+    }
+    grid.sync();
+    return;
+  }
+
   const NativeTraceIlu0View ilu0 = preconditioner.ilu0;
   double* const work = workspace.vectors;
   double* const permuted = workspace.vectors + rows;
@@ -629,6 +823,10 @@ __global__ void NativeRankOneTraceSolveKernel(
     }
     ValidatePermutation(preconditioner.ilu0, workspace, control, grid);
   }
+  else if (preconditioner.kind ==
+           NativeTracePreconditionerKind::element_overlap_schwarz_fp64)
+    ValidateElementSchwarz(
+        preconditioner.element_schwarz, control, grid);
   grid.sync();
   if (FinishOnFailure(grid, control)) return;
 
@@ -1158,12 +1356,15 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
     const NativeTraceCooperativeSupport& support,
     const cudaStream_t stream) noexcept
 {
-  const bool igr = preconditioner.kind ==
+  const bool use_ilu = preconditioner.kind ==
       NativeTracePreconditionerKind::ilu0_rcm_jacobi;
+  const bool use_element_schwarz = preconditioner.kind ==
+      NativeTracePreconditionerKind::element_overlap_schwarz_fp64;
+  const bool use_cgs2 = use_ilu || use_element_schwarz;
   const NativeTraceWorkspaceRequirements requirements =
       QueryNativeTraceWorkspaceRequirements(
           system.matrix.rows, policy.krylov_dimension,
-          support.cooperative_blocks, igr);
+          support.cooperative_blocks, use_cgs2);
   const AddressRange basis_range = MakeAddressRange(
       workspace.basis, requirements.basis_doubles, sizeof(double));
   const AddressRange vector_range = MakeAddressRange(
@@ -1197,7 +1398,7 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
       workspace_overlap = workspace_overlap ||
           AddressRangesOverlap(double_ranges[left], borrowed);
   }
-  if (igr)
+  if (use_cgs2)
   {
     const AddressRange permutation_range = MakeAddressRange(
         workspace.permutation_marks, requirements.permutation_integers,
@@ -1209,26 +1410,79 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
       workspace_overlap = workspace_overlap ||
           AddressRangesOverlap(permutation_range, borrowed);
 
-    const NativeTraceIlu0View& ilu0 = preconditioner.ilu0;
-    const std::size_t factor_rows = ilu0.factor.rows > 0
-        ? static_cast<std::size_t>(ilu0.factor.rows) : 0;
-    const std::size_t factor_nonzeros = ilu0.factor.nonzeros > 0
-        ? static_cast<std::size_t>(ilu0.factor.nonzeros) : 0;
-    const AddressRange factor_ranges[] = {
-        MakeAddressRange(ilu0.factor.row_offsets, factor_rows + 1,
-                         sizeof(int)),
-        MakeAddressRange(ilu0.factor.columns, factor_nonzeros, sizeof(int)),
-        MakeAddressRange(ilu0.factor.values, factor_nonzeros, sizeof(double)),
-        MakeAddressRange(ilu0.permutation, factor_rows, sizeof(int)),
-        MakeAddressRange(ilu0.inverse_diagonal, factor_rows,
-                         sizeof(double))};
-    for (const AddressRange& borrowed : factor_ranges)
+    if (use_ilu)
     {
-      workspace_overlap = workspace_overlap ||
-          AddressRangesOverlap(permutation_range, borrowed);
-      for (const AddressRange& range : double_ranges)
+      const NativeTraceIlu0View& ilu0 = preconditioner.ilu0;
+      const std::size_t factor_rows = ilu0.factor.rows > 0
+          ? static_cast<std::size_t>(ilu0.factor.rows) : 0;
+      const std::size_t factor_nonzeros = ilu0.factor.nonzeros > 0
+          ? static_cast<std::size_t>(ilu0.factor.nonzeros) : 0;
+      const AddressRange factor_ranges[] = {
+          MakeAddressRange(ilu0.factor.row_offsets, factor_rows + 1,
+                           sizeof(int)),
+          MakeAddressRange(ilu0.factor.columns, factor_nonzeros, sizeof(int)),
+          MakeAddressRange(ilu0.factor.values, factor_nonzeros,
+                           sizeof(double)),
+          MakeAddressRange(ilu0.permutation, factor_rows, sizeof(int)),
+          MakeAddressRange(ilu0.inverse_diagonal, factor_rows,
+                           sizeof(double))};
+      for (const AddressRange& borrowed : factor_ranges)
+      {
         workspace_overlap = workspace_overlap ||
-            AddressRangesOverlap(range, borrowed);
+            AddressRangesOverlap(permutation_range, borrowed);
+        for (const AddressRange& range : double_ranges)
+          workspace_overlap = workspace_overlap ||
+              AddressRangesOverlap(range, borrowed);
+      }
+    }
+    else
+    {
+      const NativeTraceElementSchwarzView& schwarz =
+          preconditioner.element_schwarz;
+      std::size_t element_slots = 0;
+      std::size_t patch_entries = 0;
+      std::size_t incidence_slots = 0;
+      const bool sizes_valid = schwarz.elements > 0 &&
+          schwarz.patch_rows > 0 && schwarz.true_rows > 0 &&
+          CheckedMultiply(static_cast<std::size_t>(schwarz.elements),
+                          static_cast<std::size_t>(schwarz.patch_rows),
+                          element_slots) &&
+          CheckedMultiply(element_slots,
+                          static_cast<std::size_t>(schwarz.patch_rows),
+                          patch_entries) &&
+          CheckedMultiply(static_cast<std::size_t>(schwarz.true_rows),
+                          static_cast<std::size_t>(
+                              native_trace_schwarz_maximum_incidence),
+                          incidence_slots);
+      const AddressRange schwarz_ranges[] = {
+          MakeAddressRange(schwarz.patch_matrix, patch_entries,
+                           sizeof(double)),
+          MakeAddressRange(schwarz.patch_lu, patch_entries, sizeof(double)),
+          MakeAddressRange(schwarz.element_rhs, element_slots,
+                           sizeof(double)),
+          MakeAddressRange(schwarz.element_solution, element_slots,
+                           sizeof(double)),
+          MakeAddressRange(schwarz.pivots, element_slots, sizeof(int)),
+          MakeAddressRange(schwarz.signed_element_true_dofs, element_slots,
+                           sizeof(int)),
+          MakeAddressRange(schwarz.true_incidence_slots, incidence_slots,
+                           sizeof(int))};
+      workspace_overlap = workspace_overlap || !sizes_valid;
+      for (std::size_t left = 0; left < 7; ++left)
+      {
+        for (std::size_t right = left + 1; right < 7; ++right)
+          workspace_overlap = workspace_overlap ||
+              AddressRangesOverlap(schwarz_ranges[left],
+                                   schwarz_ranges[right]);
+        workspace_overlap = workspace_overlap ||
+            AddressRangesOverlap(permutation_range, schwarz_ranges[left]);
+        for (const AddressRange& range : double_ranges)
+          workspace_overlap = workspace_overlap ||
+              AddressRangesOverlap(range, schwarz_ranges[left]);
+        for (const AddressRange& borrowed : system_ranges)
+          workspace_overlap = workspace_overlap ||
+              AddressRangesOverlap(borrowed, schwarz_ranges[left]);
+      }
     }
   }
   int current_device = -1;
@@ -1275,7 +1529,7 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
 
   if (preconditioner.kind == NativeTracePreconditionerKind::diagonal)
   {
-    if (igr) return false;
+    if (use_cgs2) return false;
   }
   else if (preconditioner.kind ==
            NativeTracePreconditionerKind::ilu0_rcm_jacobi)
@@ -1297,6 +1551,35 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
         !IsAligned(workspace.permutation_marks, alignof(int)))
       return false;
   }
+  else if (preconditioner.kind ==
+           NativeTracePreconditionerKind::element_overlap_schwarz_fp64)
+  {
+    const NativeTraceElementSchwarzView& schwarz =
+        preconditioner.element_schwarz;
+    if (schwarz.elements <= 0 ||
+        (schwarz.patch_rows != 40 && schwarz.patch_rows != 60 &&
+         schwarz.patch_rows != 80) ||
+        schwarz.true_rows != system.matrix.rows ||
+        schwarz.minimum_multiplicity < 1 ||
+        schwarz.maximum_multiplicity < schwarz.minimum_multiplicity ||
+        schwarz.maximum_multiplicity >
+            native_trace_schwarz_maximum_incidence ||
+        schwarz.patch_matrix == nullptr || schwarz.patch_lu == nullptr ||
+        schwarz.pivots == nullptr ||
+        schwarz.signed_element_true_dofs == nullptr ||
+        schwarz.true_incidence_slots == nullptr ||
+        schwarz.element_rhs == nullptr ||
+        schwarz.element_solution == nullptr ||
+        !IsAligned(schwarz.patch_matrix, alignof(double)) ||
+        !IsAligned(schwarz.patch_lu, alignof(double)) ||
+        !IsAligned(schwarz.pivots, alignof(int)) ||
+        !IsAligned(schwarz.signed_element_true_dofs, alignof(int)) ||
+        !IsAligned(schwarz.true_incidence_slots, alignof(int)) ||
+        !IsAligned(schwarz.element_rhs, alignof(double)) ||
+        !IsAligned(schwarz.element_solution, alignof(double)) ||
+        !IsAligned(workspace.permutation_marks, alignof(int)))
+      return false;
+  }
   else
     return false;
 
@@ -1308,7 +1591,7 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
   void* arguments[] = {&system_argument, &preconditioner_argument,
                        &workspace_argument, &policy_argument,
                        &support_argument};
-  const void* const kernel = igr
+  const void* const kernel = use_cgs2
       ? reinterpret_cast<const void*>(NativeRankOneTraceSolveKernel<true>)
       : reinterpret_cast<const void*>(NativeRankOneTraceSolveKernel<false>);
   const cudaError_t launch = cudaLaunchCooperativeKernel(

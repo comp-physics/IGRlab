@@ -53,6 +53,21 @@ set_tests_properties(hdg_runtime_cpu_serial
     RESOURCE_LOCK hdg_runtime_cpu
     TIMEOUT 1800)
 
+add_executable(dg_igr_hdg_native_element_schwarz_plan_test
+  test_native_element_schwarz_plan.cpp)
+target_include_directories(dg_igr_hdg_native_element_schwarz_plan_test
+  PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_compile_options(dg_igr_hdg_native_element_schwarz_plan_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+set_target_properties(dg_igr_hdg_native_element_schwarz_plan_test PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+add_test(NAME hdg_runtime_native_element_schwarz_plan
+  COMMAND dg_igr_hdg_native_element_schwarz_plan_test)
+set_tests_properties(hdg_runtime_native_element_schwarz_plan PROPERTIES
+  PROCESSORS 1
+  LABELS "hdg;runtime;cpu;cuda-contract;schwarz"
+  TIMEOUT 60)
+
 if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
   add_executable(dg_igr_hdg_runtime_w8c_cpu_serial_test
     independent_oracle.cpp

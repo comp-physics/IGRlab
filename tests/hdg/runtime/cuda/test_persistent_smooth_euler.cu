@@ -75,6 +75,22 @@ constexpr bool TrueResidualAuthorityPolicy() noexcept
   const bool native_solver_is_admitted =
       dg::hdg::runtime::cuda_w8a::detail::
           CudaTraceSolveReadyForTrueResidualVerification(native, 8);
+  auto schwarz = native;
+  schwarz.configured_ilu = false;
+  schwarz.configured_element_schwarz = true;
+  schwarz.trace_preconditioner =
+      CudaTracePreconditionerKind::native_element_schwarz_fp64;
+  const bool schwarz_zero_iteration_is_admitted =
+      dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(schwarz, 8);
+  schwarz.iterations = 1;
+  const bool schwarz_zero_application_is_rejected =
+      !dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(schwarz, 8);
+  schwarz.element_schwarz_preconditioner_applications = 1;
+  const bool schwarz_positive_application_is_admitted =
+      dg::hdg::runtime::cuda_w8a::detail::
+          CudaTraceSolveReadyForTrueResidualVerification(schwarz, 8);
   auto mgr = diagnostics;
   mgr.trace_solver =
       dg::hdg::runtime::cuda_w8a::detail::CudaTraceSolverKind::
@@ -156,6 +172,9 @@ constexpr bool TrueResidualAuthorityPolicy() noexcept
   return reported_tolerance_is_not_a_gate &&
       malformed_aggregate_is_not_a_gate &&
       unconfigured_solver_is_rejected && native_solver_is_admitted &&
+      schwarz_zero_iteration_is_admitted &&
+      schwarz_zero_application_is_rejected &&
+      schwarz_positive_application_is_admitted &&
       mgr_solver_is_admitted && mgr_retry_is_admitted &&
       mgr_skipped_setup_is_rejected && mgr_false_reuse_is_rejected &&
       mgr_zero_application_is_rejected &&
@@ -1092,6 +1111,162 @@ bool RunNativeSolveFixture(const NativeSolveFixture& fixture,
       control.CopyOneTo(result.control);
 }
 
+bool NativeElementSchwarzDeviceFixture()
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  constexpr int rows = 40;
+  constexpr int elements = 1;
+  constexpr int patch_entries = rows * rows;
+  constexpr int incidence_slots = 2 * rows;
+  std::vector<double> identity(static_cast<std::size_t>(patch_entries), 0.0);
+  std::vector<int> offsets(static_cast<std::size_t>(rows) + 1);
+  std::vector<int> columns(static_cast<std::size_t>(rows));
+  std::vector<double> diagonal(static_cast<std::size_t>(rows), 1.0);
+  std::vector<double> right_hand_side(static_cast<std::size_t>(rows));
+  std::vector<int> signed_dofs(static_cast<std::size_t>(rows));
+  std::vector<int> first_sources(static_cast<std::size_t>(patch_entries));
+  std::vector<int> second_sources(
+      static_cast<std::size_t>(patch_entries), -1);
+  std::vector<int> incidence(static_cast<std::size_t>(incidence_slots), -1);
+  for (int row = 0; row < rows; ++row)
+  {
+    identity[static_cast<std::size_t>(row) * rows + row] = 1.0;
+    offsets[static_cast<std::size_t>(row)] = row;
+    columns[static_cast<std::size_t>(row)] = row;
+    right_hand_side[static_cast<std::size_t>(row)] =
+        0.25 + static_cast<double>(row) / rows;
+    signed_dofs[static_cast<std::size_t>(row)] = row;
+    incidence[2 * static_cast<std::size_t>(row)] = row;
+  }
+  offsets[static_cast<std::size_t>(rows)] = rows;
+  for (int entry = 0; entry < patch_entries; ++entry)
+    first_sources[static_cast<std::size_t>(entry)] = entry;
+
+  NativeDeviceAllocation<double> schur;
+  NativeDeviceAllocation<double> patch_matrix;
+  NativeDeviceAllocation<double> patch_lu;
+  NativeDeviceAllocation<double> patch_rhs;
+  NativeDeviceAllocation<double> patch_solution;
+  NativeDeviceAllocation<double> status;
+  NativeDeviceAllocation<int> signed_element_trace;
+  NativeDeviceAllocation<int> first_source;
+  NativeDeviceAllocation<int> second_source;
+  NativeDeviceAllocation<int> pivots;
+  NativeDeviceAllocation<int> true_incidence;
+  if (!schur.CopyFrom(identity) ||
+      !patch_matrix.Allocate(patch_entries) ||
+      !patch_lu.Allocate(patch_entries) ||
+      !patch_rhs.Allocate(rows) || !patch_solution.Allocate(rows) ||
+      !status.Allocate(elements) ||
+      !signed_element_trace.CopyFrom(signed_dofs) ||
+      !first_source.CopyFrom(first_sources) ||
+      !second_source.CopyFrom(second_sources) || !pivots.Allocate(rows) ||
+      !true_incidence.CopyFrom(incidence))
+    return false;
+
+  CudaDeviceView setup_view{};
+  setup_view.schur = schur.data();
+  setup_view.status = status.data();
+  setup_view.signed_element_trace = signed_element_trace.data();
+  setup_view.element_schwarz_patch_matrix = patch_matrix.data();
+  setup_view.element_schwarz_patch_lu = patch_lu.data();
+  setup_view.element_schwarz_rhs = patch_rhs.data();
+  setup_view.element_schwarz_solution = patch_solution.data();
+  setup_view.element_schwarz_first_source = first_source.data();
+  setup_view.element_schwarz_second_source = second_source.data();
+  setup_view.element_schwarz_signed_true_dof =
+      signed_element_trace.data();
+  setup_view.element_schwarz_true_incidence_slots = true_incidence.data();
+  setup_view.element_schwarz_pivots = pivots.data();
+  CudaMeshShape shape{};
+  shape.elements = elements;
+  shape.trace_dofs = rows;
+  shape.trace_components = 5;
+  shape.order = 1;
+  shape.igr_active = true;
+  if (!CudaLaunchSetupNativeElementSchwarz(setup_view, shape) ||
+      cudaDeviceSynchronize() != cudaSuccess)
+    return false;
+  double setup_status = 0.0;
+  if (!status.CopyOneTo(setup_status) || setup_status != 1.0) return false;
+
+  NativeTraceSolvePolicy policy{};
+  policy.rank_count = 1;
+  policy.krylov_dimension = 4;
+  policy.maximum_iterations = 8;
+  policy.relative_tolerance = 1.0e-12;
+  const NativeTraceCooperativeSupport support =
+      QueryNativeRankOneTraceCooperativeSupport(
+          rows, policy.krylov_dimension, true);
+  const NativeTraceWorkspaceRequirements requirements =
+      QueryNativeTraceWorkspaceRequirements(
+          rows, policy.krylov_dimension, support.cooperative_blocks, true);
+  if (!support.supported || !requirements.valid) return false;
+
+  NativeDeviceAllocation<int> matrix_offsets;
+  NativeDeviceAllocation<int> matrix_columns;
+  NativeDeviceAllocation<double> matrix_values;
+  NativeDeviceAllocation<double> device_rhs;
+  NativeDeviceAllocation<double> solution;
+  NativeDeviceAllocation<double> basis;
+  NativeDeviceAllocation<double> vectors;
+  NativeDeviceAllocation<double> reduction;
+  NativeDeviceAllocation<double> small;
+  NativeDeviceAllocation<int> permutation_marks;
+  NativeDeviceAllocation<NativeTraceSolveControl> control;
+  if (!matrix_offsets.CopyFrom(offsets) ||
+      !matrix_columns.CopyFrom(columns) ||
+      !matrix_values.CopyFrom(diagonal) ||
+      !device_rhs.CopyFrom(right_hand_side) || !solution.Allocate(rows) ||
+      !basis.Allocate(requirements.basis_doubles) ||
+      !vectors.Allocate(requirements.vector_doubles) ||
+      !reduction.Allocate(requirements.reduction_doubles) ||
+      !small.Allocate(requirements.small_doubles) ||
+      !permutation_marks.Allocate(requirements.permutation_integers) ||
+      !control.Allocate(1))
+    return false;
+
+  NativeTraceSystemView system{};
+  system.matrix = {matrix_offsets.data(), matrix_columns.data(),
+                   matrix_values.data(), rows, rows, rows};
+  system.rhs = device_rhs.data();
+  system.solution = solution.data();
+  NativeTracePreconditionerView preconditioner{};
+  preconditioner.kind =
+      NativeTracePreconditionerKind::element_overlap_schwarz_fp64;
+  preconditioner.element_schwarz = {
+      patch_matrix.data(), patch_lu.data(), pivots.data(),
+      signed_element_trace.data(), true_incidence.data(), patch_rhs.data(),
+      patch_solution.data(), elements, rows, rows, 1, 1};
+  NativeTraceWorkspaceView workspace{};
+  workspace.basis = basis.data();
+  workspace.basis_doubles = requirements.basis_doubles;
+  workspace.vectors = vectors.data();
+  workspace.vector_doubles = requirements.vector_doubles;
+  workspace.reduction = reduction.data();
+  workspace.reduction_doubles = requirements.reduction_doubles;
+  workspace.small = small.data();
+  workspace.small_doubles = requirements.small_doubles;
+  workspace.permutation_marks = permutation_marks.data();
+  workspace.permutation_integers = requirements.permutation_integers;
+  workspace.device_control = control.data();
+  if (!LaunchNativeRankOneTraceSolve(
+          system, preconditioner, workspace, policy, support, nullptr) ||
+      cudaDeviceSynchronize() != cudaSuccess)
+    return false;
+  std::vector<double> host_solution(static_cast<std::size_t>(rows));
+  NativeTraceSolveControl observation{};
+  if (!solution.CopyTo(host_solution) || !control.CopyOneTo(observation) ||
+      observation.status != NativeTraceSolveStatus::converged ||
+      observation.preconditioner_applications <= 0)
+    return false;
+  for (int row = 0; row < rows; ++row)
+    if (std::abs(host_solution[static_cast<std::size_t>(row)] -
+                 right_hand_side[static_cast<std::size_t>(row)]) > 1.0e-11)
+      return false;
+  return true;
+}
+
 std::vector<double> ConventionalFixtureMatrix()
 {
   return {4.0, -1.0, 0.0, 0.0, 0.0,
@@ -1737,6 +1912,15 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
   const auto ordinary_igr_mgr = ResolveCudaTracePolicy(
       CudaEngineKind::ordinary, true,
       CudaTracePolicyKind::equilibrated_mgr);
+  const auto tensor_igr_schwarz = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, true,
+      CudaTracePolicyKind::native_element_schwarz_fp64);
+  const auto tensor_conventional_schwarz = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, false,
+      CudaTracePolicyKind::native_element_schwarz_fp64);
+  const auto ordinary_igr_schwarz = ResolveCudaTracePolicy(
+      CudaEngineKind::ordinary, true,
+      CudaTracePolicyKind::native_element_schwarz_fp64);
   const auto unknown = ResolveCudaTracePolicy(
       CudaEngineKind::ordinary, false,
       static_cast<CudaTracePolicyKind>(255));
@@ -1817,6 +2001,16 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
           CudaIluTriangularSolveKind::not_applicable &&
       tensor_igr_mgr.ilu_factor_reuse_policy ==
           CudaIluFactorReusePolicy::not_applicable &&
+      CudaTracePolicyDescriptorIsExact(tensor_igr_schwarz) &&
+      tensor_igr_schwarz.trace_preconditioner ==
+          CudaTracePreconditionerKind::native_element_schwarz_fp64 &&
+      tensor_igr_schwarz.ilu_type == -1 &&
+      tensor_igr_schwarz.ilu_factor_reuse_policy ==
+          CudaIluFactorReusePolicy::not_applicable &&
+      !tensor_conventional_schwarz.valid &&
+      !CudaTracePolicyDescriptorIsExact(tensor_conventional_schwarz) &&
+      !ordinary_igr_schwarz.valid &&
+      !CudaTracePolicyDescriptorIsExact(ordinary_igr_schwarz) &&
       !tensor_conventional_mgr.valid &&
       !CudaTracePolicyDescriptorIsExact(tensor_conventional_mgr) &&
       !ordinary_igr_mgr.valid &&
@@ -1829,9 +2023,15 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       std::string_view(CudaTracePolicyKindName(
           CudaTracePolicyKind::equilibrated_mgr)) ==
           "equilibrated-mgr" &&
+      std::string_view(CudaTracePolicyKindName(
+          CudaTracePolicyKind::native_element_schwarz_fp64)) ==
+          "native-element-schwarz-fp64" &&
       std::string_view(CudaTracePreconditionerName(
           CudaTracePreconditionerKind::hypre_mgr_field_split)) ==
-          "hypre_mgr_field_split";
+          "hypre_mgr_field_split" &&
+      std::string_view(CudaTracePreconditionerName(
+          CudaTracePreconditionerKind::native_element_schwarz_fp64)) ==
+          "native_element_schwarz_fp64";
 }
 
 static_assert(TracePolicyAblationDescriptorPolicy(),
@@ -2275,6 +2475,62 @@ bool IluFactorStateLifecyclePolicy() noexcept
       state.factor_generation == 0 && state.last_solve_generation == 0;
 }
 
+bool ElementSchwarzFactorStateLifecyclePolicy() noexcept
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  AttemptIdentity attempt{};
+  attempt.sequence = 17;
+  attempt.committed_step = 5;
+  attempt.committed_generation = 9;
+  attempt.dt = 2.0e-4;
+  AttemptIdentity foreign = attempt;
+  foreign.sequence = 18;
+  CudaElementSchwarzAttemptState state{};
+  if (CudaElementSchwarzFactorTransitionIsExact(
+          state, attempt, 10, false))
+    return false;
+  state.attempt = attempt;
+  state.active = true;
+  if (!CudaElementSchwarzFactorTransitionIsExact(
+          state, attempt, 10, false) ||
+      CudaElementSchwarzFactorTransitionIsExact(
+          state, attempt, 10, true))
+    return false;
+  state.factor_ready = true;
+  state.factor_generation = 10;
+  if (CudaElementSchwarzFactorTransitionIsExact(
+          state, attempt, 11, false) ||
+      CudaElementSchwarzFactorTransitionIsExact(
+          state, attempt, 10, true))
+    return false;
+  state.last_solve_generation = 10;
+  if (!CudaElementSchwarzFactorTransitionIsExact(
+          state, attempt, 10, true) ||
+      !CudaElementSchwarzFactorTransitionIsExact(
+          state, attempt, 11, false) ||
+      CudaElementSchwarzFactorTransitionIsExact(
+          state, foreign, 11, false))
+    return false;
+  state.factor_generation = 11;
+  if (CudaElementSchwarzFactorTransitionIsExact(
+          state, attempt, 12, false) ||
+      CudaElementSchwarzFactorTransitionIsExact(
+          state, attempt, 11, true))
+    return false;
+  state.last_solve_generation = 11;
+  if (!CudaElementSchwarzFactorTransitionIsExact(
+          state, attempt, 11, true) ||
+      !CudaElementSchwarzFactorTransitionIsExact(
+          state, attempt, 12, false))
+    return false;
+  {
+    CudaElementSchwarzAttemptEndGuard end_attempt(state);
+    if (!state.active || !state.factor_ready) return false;
+  }
+  return !state.active && !state.factor_ready &&
+      state.factor_generation == 0 && state.last_solve_generation == 0;
+}
+
 struct ModelTag { inline static constexpr std::string_view id = "euler.compressible.2d"; };
 struct FormulationTag { inline static constexpr std::string_view id = "hdg.conventional"; };
 struct TraceTag { inline static constexpr std::string_view id = "mfem.dg_interface.trace"; };
@@ -2685,7 +2941,8 @@ int main(int argc, char** argv)
       mode == "--functional";
   const bool policies = NativeBoundedResultPolicy() &&
       NativeWorkspaceRequirementsPolicy() &&
-      IluFactorStateLifecyclePolicy();
+      IluFactorStateLifecyclePolicy() &&
+      ElementSchwarzFactorStateLifecyclePolicy();
   const bool lifecycle = known_mode && (ranks == 1
       ? (mode == "--functional" ? FunctionalRestart<RankOneTag>(ranks)
          : mode == "--token-negatives" ? TokenFaults<RankOneTag>(ranks)
@@ -2696,7 +2953,8 @@ int main(int argc, char** argv)
          : LifecycleAndRecovery<RankTwoTag>(ranks))
       : false);
   const bool native_device_fixtures = ranks != 1 || !mode.empty() ||
-      (lifecycle && NativeTraceDeviceFixtures());
+      (lifecycle && NativeTraceDeviceFixtures() &&
+       NativeElementSchwarzDeviceFixture());
   const bool mgr_device_fixture = ranks != 1 || !mode.empty() ||
       (native_device_fixtures && RankOneEquilibratedMgrFixture());
   const bool pass = policies && lifecycle && native_device_fixtures &&
