@@ -987,7 +987,8 @@ struct CudaHypreSetupState
       const bool igr_active) const noexcept
   {
     const CudaTracePolicyDescriptor policy = ResolveCudaTracePolicy(
-        expected_engine, igr_active, CudaTracePolicyKind::engine_default);
+        expected_engine, igr_active, 1, generic::minimum_polynomial_order,
+        CudaTracePolicyKind::engine_default);
     return expected_kind == policy.trace_preconditioner &&
         ConfigurationExactForGeneration(expected_generation, policy);
   }
@@ -999,7 +1000,8 @@ struct CudaHypreSetupState
       const bool igr_active) const noexcept
   {
     const CudaTracePolicyDescriptor policy = ResolveCudaTracePolicy(
-        expected_engine, igr_active, CudaTracePolicyKind::engine_default);
+        expected_engine, igr_active, 1, generic::minimum_polynomial_order,
+        CudaTracePolicyKind::engine_default);
     return expected_kind == policy.trace_preconditioner &&
         SolveExactForGeneration(expected_generation, policy);
   }
@@ -1142,7 +1144,8 @@ struct CudaDiagScaleSetupState
       const bool expected_igr_active) const noexcept
   {
     const CudaTracePolicyDescriptor policy = ResolveCudaTracePolicy(
-        expected_engine, expected_igr_active,
+        expected_engine, expected_igr_active, 1,
+        generic::minimum_polynomial_order,
         CudaTracePolicyKind::engine_default);
     return expected_kind == policy.trace_preconditioner &&
         ConfigurationExactForGeneration(expected_generation, policy);
@@ -1155,7 +1158,8 @@ struct CudaDiagScaleSetupState
       const bool expected_igr_active) const noexcept
   {
     const CudaTracePolicyDescriptor policy = ResolveCudaTracePolicy(
-        expected_engine, expected_igr_active,
+        expected_engine, expected_igr_active, 1,
+        generic::minimum_polynomial_order,
         CudaTracePolicyKind::engine_default);
     return expected_kind == policy.trace_preconditioner &&
         SolveExactForGeneration(expected_generation, policy);
@@ -1418,8 +1422,10 @@ constexpr bool CudaInitializeIluEvidence(
     const bool igr_active) noexcept
 {
   const CudaTracePolicyDescriptor policy = ResolveCudaTracePolicy(
-      evidence.selected_engine, igr_active, evidence.trace_policy);
+      evidence.selected_engine, igr_active, evidence.trace_policy_rank_count,
+      evidence.trace_policy_order, evidence.requested_trace_policy);
   const bool selection_exact = CudaTracePolicyDescriptorIsExact(policy) &&
+      evidence.resolved_trace_policy == policy.resolved_selection &&
       kind == policy.trace_preconditioner;
   const CudaIluFactorReusePolicy factor_reuse_policy =
       policy.ilu_factor_reuse_policy;
@@ -1544,7 +1550,8 @@ constexpr bool CudaAccumulateIluSolveEvidence(
       CudaIluApplicationIterations(diagnostics.trace_preconditioner);
   const CudaTracePolicyDescriptor policy = ResolveCudaTracePolicy(
       evidence.selected_engine, diagnostics.igr_active,
-      evidence.trace_policy);
+      evidence.trace_policy_rank_count, evidence.trace_policy_order,
+      evidence.requested_trace_policy);
   const CudaIluTriangularSolveKind expected_triangular_solve_kind =
       policy.ilu_triangular_solve_kind;
   const int expected_lower_jacobi_iterations =
@@ -1554,6 +1561,7 @@ constexpr bool CudaAccumulateIluSolveEvidence(
   const CudaIluFactorReusePolicy expected_factor_reuse_policy =
       policy.ilu_factor_reuse_policy;
   const bool exact_policy = CudaTracePolicyDescriptorIsExact(policy) &&
+      evidence.resolved_trace_policy == policy.resolved_selection &&
       diagnostics.trace_preconditioner == policy.trace_preconditioner &&
       diagnostics.trace_preconditioner ==
           CudaTracePreconditionerKind::hypre_ilu0 &&
@@ -2140,7 +2148,7 @@ public:
   CudaPersistentNumerics& operator=(const CudaPersistentNumerics&) = delete;
 
   bool Initialize(const CudaConfig& config,
-                  const CudaTracePolicyKind trace_policy,
+                  const CudaTracePolicyDescriptor& trace_policy,
                   CudaRunEvidence& evidence,
                   const RuntimeTupleDescriptor& tuple) noexcept
   {
@@ -2149,8 +2157,7 @@ public:
     const bool igr_requested = config.use_generic_numerical_policy &&
         config.numerical_policy.stabilization.kind ==
             generic::RegularizationKind::igr;
-    trace_policy_descriptor_ = ResolveCudaTracePolicy(
-        cuda_engine_, igr_requested, trace_policy);
+    trace_policy_descriptor_ = trace_policy;
     trace_solver_kind_ = CudaTraceSolverKind::unconfigured;
     native_trace_requirements_ = {};
     native_trace_support_ = {};
@@ -2163,7 +2170,14 @@ public:
     element_schwarz_plan_ = {};
     initialization_tensor_core_evidence_ = {};
     evidence.tensor_core.selected_engine = cuda_engine_;
-    evidence.tensor_core.trace_policy = trace_policy;
+    evidence.tensor_core.requested_trace_policy =
+        trace_policy_descriptor_.requested_selection;
+    evidence.tensor_core.resolved_trace_policy =
+        trace_policy_descriptor_.resolved_selection;
+    evidence.tensor_core.trace_policy_rank_count =
+        trace_policy_descriptor_.rank_count;
+    evidence.tensor_core.trace_policy_order =
+        trace_policy_descriptor_.polynomial_order;
     oracle_capture_requested_ = config.capture_oracle;
     TransportPolicy::ResetLedger();
     CudaPolicyContext setup{};
@@ -2174,7 +2188,12 @@ public:
     // communicator disagreement and geometry are thus
     // collective host-side rejections rather than partially initialized GPU
     // state.
-    if (!ValidateTopologyBeforeDevice(config))
+    if (!CudaTracePolicyDescriptorIsExact(trace_policy_descriptor_) ||
+        trace_policy_descriptor_.selected_engine != cuda_engine_ ||
+        trace_policy_descriptor_.igr_active != igr_requested ||
+        trace_policy_descriptor_.rank_count != config.expected_rank_count ||
+        trace_policy_descriptor_.polynomial_order != config.order ||
+        !ValidateTopologyBeforeDevice(config))
     {
       ReportCudaSetupFailure(evidence.rank, "topology-preflight");
       return false;
@@ -2243,7 +2262,7 @@ public:
     trace_solver_kind_ = ResolveCudaTraceSolverKind(
         cuda_engine_, ranks_, host_staged_rank2_, borrowed_topology_,
         shape_.borrowed_host_inputs, config.use_generic_numerical_policy,
-        trace_policy);
+        trace_policy_descriptor_.resolved_selection);
     bool trace_solver_ready = IsKnownCudaTraceSolverKind(trace_solver_kind_);
     if (trace_solver_ready && trace_solver_kind_ ==
             CudaTraceSolverKind::native_rank1_fp64)
@@ -3381,7 +3400,14 @@ public:
         element_schwarz_attempt_state_);
     CudaNumericalResult result{};
     result.tensor_core.selected_engine = cuda_engine_;
-    result.tensor_core.trace_policy = trace_policy_descriptor_.selection;
+    result.tensor_core.requested_trace_policy =
+        trace_policy_descriptor_.requested_selection;
+    result.tensor_core.resolved_trace_policy =
+        trace_policy_descriptor_.resolved_selection;
+    result.tensor_core.trace_policy_rank_count =
+        trace_policy_descriptor_.rank_count;
+    result.tensor_core.trace_policy_order =
+        trace_policy_descriptor_.polynomial_order;
     result.tensor_core.trace_preconditioner = trace_preconditioner_;
     result.tensor_core.trace_preconditioner_configured =
         CudaTracePolicyDescriptorIsExact(trace_policy_descriptor_) &&
@@ -3396,7 +3422,7 @@ public:
         use_element_schwarz && element_schwarz_plan_.valid;
     result.tensor_core.native_matrix_free_trace_operator_configured =
         CudaTracePolicyUsesNativeElementMatrixFreeOperator(
-            trace_policy_descriptor_.selection) &&
+            trace_policy_descriptor_.resolved_selection) &&
         result.tensor_core.native_element_schwarz_configured;
     result.tensor_core.element_schwarz_patch_rows = use_element_schwarz
         ? element_schwarz_plan_.patch_rows : 0;
@@ -3919,7 +3945,7 @@ public:
             result.tensor_core.element_schwarz_maximum_multiplicity == 0;
     const bool matrix_free_selected =
         CudaTracePolicyUsesNativeElementMatrixFreeOperator(
-            trace_policy_descriptor_.selection);
+            trace_policy_descriptor_.resolved_selection);
     const bool matrix_free_accounting_complete = matrix_free_selected
         ? result.tensor_core.native_matrix_free_trace_operator_configured &&
             result.tensor_core.
@@ -4512,7 +4538,14 @@ private:
     const int device_architecture = 10 * properties.major + properties.minor;
     tensor_core_hardware_supported_ = device_architecture == 120;
     evidence.tensor_core.selected_engine = cuda_engine_;
-    evidence.tensor_core.trace_policy = trace_policy_descriptor_.selection;
+    evidence.tensor_core.requested_trace_policy =
+        trace_policy_descriptor_.requested_selection;
+    evidence.tensor_core.resolved_trace_policy =
+        trace_policy_descriptor_.resolved_selection;
+    evidence.tensor_core.trace_policy_rank_count =
+        trace_policy_descriptor_.rank_count;
+    evidence.tensor_core.trace_policy_order =
+        trace_policy_descriptor_.polynomial_order;
     evidence.tensor_core.hardware_supported =
         tensor_core_hardware_supported_;
     if (cuda_engine_ == generic::CudaEngineKind::tensor_core &&

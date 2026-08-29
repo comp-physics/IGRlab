@@ -32,7 +32,8 @@ TRACE_PRECONDITIONER_BY_POLICY_ENGINE_AND_MODE = {
     ("engine-default", "ordinary", "conventional"): "hypre_ilu0",
     ("engine-default", "ordinary", "igr"): "hypre_ilu0",
     ("engine-default", "tensor", "conventional"): "hypre_diag_scale",
-    ("engine-default", "tensor", "igr"): "hypre_ilu0",
+    ("engine-default", "tensor", "igr"):
+        "native_element_schwarz_warp_equilibrated_field_split_fp64",
     ("common-fast", "ordinary", "conventional"): "hypre_diag_scale",
     ("common-fast", "ordinary", "igr"): "hypre_ilu0",
     ("common-fast", "tensor", "conventional"): "hypre_diag_scale",
@@ -55,7 +56,7 @@ TRACE_ILU_POLICY_BY_POLICY_ENGINE_AND_MODE = {
     ("engine-default", "ordinary", "conventional"): (0, 0, 0, 1),
     ("engine-default", "ordinary", "igr"): (0, 0, 1, 1),
     ("engine-default", "tensor", "conventional"): (-1, -1, -1, 0),
-    ("engine-default", "tensor", "igr"): (0, 0, 1, 1),
+    ("engine-default", "tensor", "igr"): (-1, -1, -1, 0),
     ("common-fast", "ordinary", "conventional"): (-1, -1, -1, 0),
     ("common-fast", "ordinary", "igr"): (0, 0, 1, 1),
     ("common-fast", "tensor", "conventional"): (-1, -1, -1, 0),
@@ -79,7 +80,7 @@ TRACE_ILU_FACTOR_REUSE_BY_POLICY_ENGINE_AND_MODE = {
         "refresh_each_trace_solve",
     ("engine-default", "ordinary", "igr"): "refresh_each_trace_solve",
     ("engine-default", "tensor", "conventional"): "not_applicable",
-    ("engine-default", "tensor", "igr"): "first_trace_solve_per_attempt",
+    ("engine-default", "tensor", "igr"): "not_applicable",
     ("common-fast", "ordinary", "conventional"): "not_applicable",
     ("common-fast", "ordinary", "igr"): "first_trace_solve_per_attempt",
     ("common-fast", "tensor", "conventional"): "not_applicable",
@@ -103,11 +104,8 @@ TRACE_ILU_TRIANGULAR_SOLVE_BY_POLICY_ENGINE_AND_MODE = {
     ("engine-default", "ordinary", "igr"): ("direct", 0, 0, 0),
     ("engine-default", "tensor", "conventional"):
         ("not_applicable", 0, 0, 0),
-    # Each side is configured for five Jacobi iterations.  With a zero
-    # initial iterate, the first iteration does not execute a factor SpMV, so
-    # one ILU application performs (5 - 1) + (5 - 1) = 8 such updates.
     ("engine-default", "tensor", "igr"):
-        ("iterative_jacobi", 5, 5, 8),
+        ("not_applicable", 0, 0, 0),
     ("common-fast", "ordinary", "conventional"):
         ("not_applicable", 0, 0, 0),
     ("common-fast", "ordinary", "igr"):
@@ -241,6 +239,20 @@ class CampaignError(RuntimeError):
     """An evidence-invalidating campaign failure."""
 
 
+def expected_resolved_trace_policy(
+        engine: str, mode: str,
+        requested_trace_policy: str = "engine-default") -> str:
+    """Return the deterministic rank-one production policy resolution."""
+    if requested_trace_policy != "engine-default":
+        return requested_trace_policy
+    if engine == "tensor" and mode == "igr":
+        return (
+            "native-element-schwarz-matrix-free-warp-"
+            "equilibrated-field-split-fp64"
+        )
+    return "engine-default"
+
+
 def expected_trace_preconditioner(
         engine: str, mode: str,
         trace_policy: str = "engine-default") -> str:
@@ -370,8 +382,13 @@ def trace_policy_configuration(
     triangular = expected_trace_ilu_triangular_solve_policy(
         engine, mode, trace_policy
     )
+    resolved_trace_policy = expected_resolved_trace_policy(
+        engine, mode, trace_policy
+    )
     return {
         "trace_policy": trace_policy,
+        "requested_trace_policy": trace_policy,
+        "resolved_trace_policy": resolved_trace_policy,
         "trace_preconditioner": expected_trace_preconditioner(
             engine, mode, trace_policy
         ),
@@ -396,6 +413,8 @@ def record_trace_policy_configuration(record: dict[str, Any]) -> dict[str, Any]:
     """Extract bounded top-level policy metadata, never solver event history."""
     return {
         "trace_policy": record.get("trace_policy"),
+        "requested_trace_policy": record.get("requested_trace_policy"),
+        "resolved_trace_policy": record.get("resolved_trace_policy"),
         "trace_preconditioner": record.get("trace_preconditioner"),
         "ilu_type": record.get("trace_ilu_type"),
         "ilu_level_of_fill": record.get("trace_ilu_level_of_fill"),
@@ -1451,9 +1470,16 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
         raise CampaignError("sample lacks tensor-core evidence")
     if tensor.get("selected_engine") != engine:
         raise CampaignError("sample engine evidence differs from selection")
-    if tensor.get("trace_policy") != trace_policy:
+    resolved_trace_policy = expected_resolved_trace_policy(
+        engine, mode, trace_policy
+    )
+    if tensor.get("requested_trace_policy") != trace_policy:
         raise CampaignError(
-            "sample trace-policy evidence differs from the explicit selection"
+            "sample requested trace-policy evidence differs from selection"
+        )
+    if tensor.get("resolved_trace_policy") != resolved_trace_policy:
+        raise CampaignError(
+            "sample resolved trace-policy evidence differs from resolution"
         )
     (
         expected_trace_solver,
@@ -1461,19 +1487,19 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
         expected_mgr,
         expected_rank2,
     ) = expected_trace_solver_configuration(engine, mode, trace_policy)
-    expected_schwarz = trace_policy in {
+    expected_schwarz = resolved_trace_policy in {
         "native-element-schwarz-fp64",
         "native-element-schwarz-matrix-free-fp64",
         "native-element-schwarz-equilibrated-field-split-fp64",
         "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
         "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
     }
-    expected_matrix_free = trace_policy in {
+    expected_matrix_free = resolved_trace_policy in {
         "native-element-schwarz-matrix-free-fp64",
         "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
         "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
     }
-    expected_element_field_split = trace_policy in {
+    expected_element_field_split = resolved_trace_policy in {
         "native-element-schwarz-equilibrated-field-split-fp64",
         "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
         "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
@@ -2036,6 +2062,15 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
             f"expected {trace_policy!r}"
         )
     if source == "final":
+        resolved_trace_policy = expected_resolved_trace_policy(
+            engine, mode, trace_policy
+        )
+        if record.get("requested_trace_policy") != trace_policy or \
+                record.get("resolved_trace_policy") != resolved_trace_policy:
+            raise CampaignError(
+                "benchmark requested/resolved trace-policy provenance is "
+                "inconsistent"
+            )
         production_selectable = trace_policy == "engine-default"
         expected_variant = "production" if production_selectable else "ablation"
         if record.get("variant") != expected_variant or \
@@ -2169,16 +2204,16 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
                 f"configuration: observed={observed_configuration!r}; "
                 f"expected={expected_configuration!r}"
             )
-        warp_field_split = trace_policy == (
+        warp_field_split = resolved_trace_policy == (
             "native-element-schwarz-matrix-free-warp-"
             "equilibrated-field-split-fp64"
         )
-        scalar_field_split = trace_policy in {
+        scalar_field_split = resolved_trace_policy in {
             "native-element-schwarz-equilibrated-field-split-fp64",
             "native-element-schwarz-matrix-free-"
             "equilibrated-field-split-fp64",
         }
-        full_patch = trace_policy in {
+        full_patch = resolved_trace_policy in {
             "native-element-schwarz-fp64",
             "native-element-schwarz-matrix-free-fp64",
         }
@@ -2199,7 +2234,7 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
                 ) != expected_tile_width:
             raise CampaignError(
                 "benchmark element-Schwarz apply metadata does not match "
-                f"the selected trace policy {trace_policy!r}"
+                f"the resolved trace policy {resolved_trace_policy!r}"
             )
     if source == "frozen":
         frozen_exact = {
@@ -2399,7 +2434,8 @@ def summarized_sample_work(sample: dict[str, Any], *, schema: int) -> dict[str, 
         "precision_corrections": sample["precision_corrections"],
         "product_generations": sample["product_generations"],
         "selected_engine": tensor["selected_engine"],
-        "trace_policy": tensor["trace_policy"],
+        "requested_trace_policy": tensor["requested_trace_policy"],
+        "resolved_trace_policy": tensor["resolved_trace_policy"],
         "trace_solver": tensor["trace_solver"],
         "native_rank1_trace_solve_calls": tensor[
             "native_rank1_trace_solve_calls"
@@ -2552,6 +2588,8 @@ def record_summary(record: dict[str, Any]) -> dict[str, Any]:
     else:
         summary.update({
             "trace_policy": record["trace_policy"],
+            "requested_trace_policy": record["requested_trace_policy"],
+            "resolved_trace_policy": record["resolved_trace_policy"],
             "trace_solver": record["trace_solver"],
             "precision_policy": record["precision_policy"],
             "numerical_policy": record["numerical_policy"],
@@ -2648,6 +2686,14 @@ def work_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
             record["trace_policy"] for record in record_list
             if isinstance(record.get("trace_policy"), str)
         })
+        summary["requested_trace_policies"] = sorted({
+            record["requested_trace_policy"] for record in record_list
+            if isinstance(record.get("requested_trace_policy"), str)
+        })
+        summary["resolved_trace_policies"] = sorted({
+            record["resolved_trace_policy"] for record in record_list
+            if isinstance(record.get("resolved_trace_policy"), str)
+        })
         summary["trace_preconditioners"] = sorted({
             record["trace_preconditioner"] for record in record_list
             if isinstance(record.get("trace_preconditioner"), str)
@@ -2698,9 +2744,15 @@ def work_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 tensor.get("selected_engine") for tensor in tensor_samples
                 if isinstance(tensor.get("selected_engine"), str)
             }),
-            "trace_policies": sorted({
-                tensor.get("trace_policy") for tensor in tensor_samples
-                if isinstance(tensor.get("trace_policy"), str)
+            "requested_trace_policies": sorted({
+                tensor.get("requested_trace_policy")
+                for tensor in tensor_samples
+                if isinstance(tensor.get("requested_trace_policy"), str)
+            }),
+            "resolved_trace_policies": sorted({
+                tensor.get("resolved_trace_policy")
+                for tensor in tensor_samples
+                if isinstance(tensor.get("resolved_trace_policy"), str)
             }),
             "trace_solvers": sorted({
                 tensor.get("trace_solver") for tensor in tensor_samples

@@ -929,8 +929,13 @@ struct CudaTracePolicyDescriptor
 {
   generic::CudaEngineKind selected_engine =
       generic::CudaEngineKind::ordinary;
-  CudaTracePolicyKind selection = CudaTracePolicyKind::engine_default;
+  CudaTracePolicyKind requested_selection =
+      CudaTracePolicyKind::engine_default;
+  CudaTracePolicyKind resolved_selection =
+      CudaTracePolicyKind::engine_default;
   bool igr_active = false;
+  int rank_count = 0;
+  int polynomial_order = 0;
   CudaTracePreconditionerKind trace_preconditioner =
       CudaTracePreconditionerKind::unconfigured;
   int ilu_type = -1;
@@ -950,15 +955,41 @@ struct CudaTracePolicyDescriptor
 
 constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
     const generic::CudaEngineKind engine, const bool igr_active,
-    const CudaTracePolicyKind selection) noexcept
+    const int rank_count, const int polynomial_order,
+    const CudaTracePolicyKind requested_selection) noexcept
 {
   CudaTracePolicyDescriptor result{};
   result.selected_engine = engine;
-  result.selection = selection;
+  result.requested_selection = requested_selection;
+  result.resolved_selection = requested_selection;
   result.igr_active = igr_active;
+  result.rank_count = rank_count;
+  result.polynomial_order = polynomial_order;
   if (!generic::IsKnownCudaEngineKind(engine) ||
-      !IsKnownCudaTracePolicyKind(selection))
+      !IsKnownCudaTracePolicyKind(requested_selection) ||
+      (rank_count != 1 && rank_count != 2) ||
+      polynomial_order < generic::minimum_polynomial_order ||
+      polynomial_order > generic::maximum_polynomial_order)
     return result;
+
+  // Production selection is deliberately deterministic and fail closed.  A
+  // rank-one tensor-IGR request resolves engine-default to the qualified
+  // cooperative matrix-free field split before consensus or allocation.
+  // Rank two retains the explicitly reported host-staged HYPRE route.  Every
+  // non-default selector remains a rank-one benchmark ablation.
+  if (requested_selection == CudaTracePolicyKind::engine_default &&
+      engine == generic::CudaEngineKind::tensor_core && igr_active &&
+      rank_count == 1)
+  {
+    result.resolved_selection = CudaTracePolicyKind::
+        native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
+  }
+  else if (requested_selection != CudaTracePolicyKind::engine_default &&
+           rank_count != 1)
+  {
+    return result;
+  }
+  const CudaTracePolicyKind selection = result.resolved_selection;
 
   // The field-split baseline is an explicit rank-one tensor-IGR experiment.
   // Rank/topology admission is performed by the private solver router; every
@@ -1057,8 +1088,11 @@ constexpr bool CudaTracePolicyDescriptorExact(
     const CudaTracePolicyDescriptor& expected) noexcept
 {
   return actual.selected_engine == expected.selected_engine &&
-      actual.selection == expected.selection &&
+      actual.requested_selection == expected.requested_selection &&
+      actual.resolved_selection == expected.resolved_selection &&
       actual.igr_active == expected.igr_active &&
+      actual.rank_count == expected.rank_count &&
+      actual.polynomial_order == expected.polynomial_order &&
       actual.trace_preconditioner == expected.trace_preconditioner &&
       actual.ilu_type == expected.ilu_type &&
       actual.ilu_level_of_fill == expected.ilu_level_of_fill &&
@@ -1083,7 +1117,8 @@ constexpr bool CudaTracePolicyDescriptorIsExact(
   return descriptor.valid && CudaTracePolicyDescriptorExact(
       descriptor, ResolveCudaTracePolicy(
           descriptor.selected_engine, descriptor.igr_active,
-          descriptor.selection));
+          descriptor.rank_count, descriptor.polynomial_order,
+          descriptor.requested_selection));
 }
 
 constexpr bool CudaOrdinaryRankOneRefreshPolicyIsExact(
@@ -1091,6 +1126,11 @@ constexpr bool CudaOrdinaryRankOneRefreshPolicyIsExact(
 {
   return descriptor.selected_engine == generic::CudaEngineKind::ordinary &&
       CudaTracePolicyDescriptorIsExact(descriptor) &&
+      descriptor.requested_selection ==
+          CudaTracePolicyKind::engine_default &&
+      descriptor.resolved_selection ==
+          CudaTracePolicyKind::engine_default &&
+      descriptor.rank_count == 1 &&
       descriptor.trace_preconditioner ==
           CudaTracePreconditionerKind::hypre_ilu0 &&
       descriptor.ilu_factor_reuse_policy ==
@@ -1106,7 +1146,12 @@ struct CudaTensorCoreEvidence
 {
   generic::CudaEngineKind selected_engine =
       generic::CudaEngineKind::ordinary;
-  CudaTracePolicyKind trace_policy = CudaTracePolicyKind::engine_default;
+  CudaTracePolicyKind requested_trace_policy =
+      CudaTracePolicyKind::engine_default;
+  CudaTracePolicyKind resolved_trace_policy =
+      CudaTracePolicyKind::engine_default;
+  int trace_policy_rank_count = 0;
+  int trace_policy_order = 0;
   CudaTracePreconditionerKind trace_preconditioner =
       CudaTracePreconditionerKind::unconfigured;
   int ilu_type = -1;

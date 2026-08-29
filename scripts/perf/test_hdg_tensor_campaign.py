@@ -50,7 +50,9 @@ SCHEMA1_WORKLOAD_SUMMARY_FIELDS = {
     "gpu_sm_count", "dt", "host_export",
 }
 SCHEMA2_ONLY_SUMMARY_FIELDS = {
-    "trace_policy", "trace_policies", "trace_solver", "trace_solvers",
+    "trace_policy", "requested_trace_policy", "resolved_trace_policy",
+    "requested_trace_policies", "resolved_trace_policies",
+    "trace_solver", "trace_solvers",
     "trace_preconditioner",
     "trace_ilu_policy", "trace_preconditioners",
     "tensor_core", "trace_and_tensor_accounting",
@@ -63,7 +65,8 @@ SCHEMA2_ONLY_SUMMARY_FIELDS = {
 }
 SCHEMA2_ONLY_RECORD_FIELDS = {
     "variant", "production_selectable", "backend", "cuda_engine",
-    "trace_policy", "trace_solver", "trace_preconditioner",
+    "trace_policy", "requested_trace_policy", "resolved_trace_policy",
+    "trace_solver", "trace_preconditioner",
     "trace_ilu_type",
     "trace_ilu_level_of_fill", "trace_ilu_local_reordering",
     "trace_ilu_application_iterations", "trace_ilu_accounting_kind",
@@ -89,7 +92,8 @@ SCHEMA2_ONLY_SAMPLE_FIELDS = {
     "iterative_refinement_steps", "residual_replacements",
     "precision_corrections", "all_fp64_policy",
     "correction_accounting_complete", "product_generations", "tensor_core",
-    "trace_solver", "native_rank1_trace_solve_calls",
+    "requested_trace_policy", "resolved_trace_policy", "trace_solver",
+    "native_rank1_trace_solve_calls",
     "hypre_trace_solve_calls", "native_rank1_trace_solver_configured",
     "hypre_mgr_rank1_trace_solver_configured",
     "native_element_schwarz_configured",
@@ -144,20 +148,26 @@ args = parser.parse_args()
 
 is_frozen = "frozen" in str(Path(__file__))
 common_fast = args.trace_policy == "common-fast"
-equilibrated_mgr = args.trace_policy == "equilibrated-mgr"
-matrix_free = args.trace_policy in (
+resolved_trace_policy = (
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64"
+    if args.trace_policy == "engine-default" and
+    args.engine == "tensor" and args.mode == "igr"
+    else args.trace_policy
+)
+equilibrated_mgr = resolved_trace_policy == "equilibrated-mgr"
+matrix_free = resolved_trace_policy in (
     "native-element-schwarz-matrix-free-fp64",
     "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
     "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
 )
-element_field_split = args.trace_policy in (
+element_field_split = resolved_trace_policy in (
     "native-element-schwarz-equilibrated-field-split-fp64",
     "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
     "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
 )
-warp_element_field_split = args.trace_policy == \
+warp_element_field_split = resolved_trace_policy == \
     "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64"
-element_schwarz = args.trace_policy == "native-element-schwarz-fp64" or \
+element_schwarz = resolved_trace_policy == "native-element-schwarz-fp64" or \
     matrix_free or element_field_split
 if equilibrated_mgr and (args.engine != "tensor" or args.mode != "igr"):
     parser.error("equilibrated-mgr requires tensor IGR")
@@ -314,7 +324,8 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
         callback_upper = 14 if ilu_active else 0
         sample["tensor_core"] = {
             "selected_engine": args.engine,
-            "trace_policy": args.trace_policy,
+            "requested_trace_policy": args.trace_policy,
+            "resolved_trace_policy": resolved_trace_policy,
             "trace_solver": trace_solver,
             "native_rank1_trace_solve_calls": (
                 sample["linear_solve_attempts"]
@@ -446,6 +457,8 @@ payload = {
     "backend": "cuda",
     "cuda_engine": args.engine,
     "trace_policy": args.trace_policy,
+    "requested_trace_policy": args.trace_policy,
+    "resolved_trace_policy": resolved_trace_policy,
     "trace_solver": trace_solver,
     "trace_preconditioner": trace_preconditioner,
     "trace_ilu_type": ilu_policy[0],
@@ -600,7 +613,8 @@ payload = {
 }
 if is_frozen:
     for field in (
-        "backend", "cuda_engine", "trace_policy", "trace_solver",
+        "backend", "cuda_engine", "trace_policy",
+        "requested_trace_policy", "resolved_trace_policy", "trace_solver",
         "trace_preconditioner",
         "trace_ilu_type", "trace_ilu_level_of_fill",
         "trace_ilu_local_reordering", "trace_ilu_application_iterations",
@@ -1649,7 +1663,9 @@ def main() -> int:
         ]["attribution_by_mode"]["igr"]["trace_policy_matched"] is False
         assert campaign["export_control"]["attribution"][
             "tensor_trace_preconditioner"
-        ] == "hypre_ilu0"
+        ] == (
+            "native_element_schwarz_warp_equilibrated_field_split_fp64"
+        )
         assert campaign["export_control"]["attribution"][
             "mma_contribution_requires_separate_profiler_attribution"
         ] is True
@@ -1669,7 +1685,7 @@ def main() -> int:
         ) == "hypre_diag_scale"
         assert CAMPAIGN.expected_trace_preconditioner(
             "tensor", "igr"
-        ) == "hypre_ilu0"
+        ) == "native_element_schwarz_warp_equilibrated_field_split_fp64"
         assert CAMPAIGN.expected_trace_ilu_policy(
             "ordinary", "conventional"
         ) == (0, 0, 0, 1)
@@ -1681,7 +1697,7 @@ def main() -> int:
         ) == (-1, -1, -1, 0)
         assert CAMPAIGN.expected_trace_ilu_policy(
             "tensor", "igr"
-        ) == (0, 0, 1, 1)
+        ) == (-1, -1, -1, 0)
         assert CAMPAIGN.expected_trace_ilu_triangular_solve_policy(
             "ordinary", "conventional"
         ) == ("direct", 0, 0, 0)
@@ -1693,7 +1709,7 @@ def main() -> int:
         ) == ("not_applicable", 0, 0, 0)
         assert CAMPAIGN.expected_trace_ilu_triangular_solve_policy(
             "tensor", "igr"
-        ) == ("iterative_jacobi", 5, 5, 8)
+        ) == ("not_applicable", 0, 0, 0)
         assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
             "ordinary", "conventional"
         ) == "refresh_each_trace_solve"
@@ -1705,7 +1721,7 @@ def main() -> int:
         ) == "not_applicable"
         assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
             "tensor", "igr"
-        ) == "first_trace_solve_per_attempt"
+        ) == "not_applicable"
         for engine in ("ordinary", "tensor"):
             assert CAMPAIGN.expected_trace_preconditioner(
                 engine, "conventional", "common-fast"
@@ -1832,7 +1848,8 @@ def main() -> int:
             assert attribution["scope"] == "complete_engine_package"
             assert attribution["ordinary_trace_preconditioner"] == "hypre_ilu0"
             assert attribution["tensor_trace_preconditioner"] == (
-                "hypre_ilu0" if mode == "igr"
+                "native_element_schwarz_warp_equilibrated_field_split_fp64"
+                if mode == "igr"
                 else "hypre_diag_scale"
             )
             assert attribution[
@@ -1843,8 +1860,7 @@ def main() -> int:
                 "ordinary_ilu_factor_reuse_policy"
             ] == "refresh_each_trace_solve"
             assert attribution["tensor_ilu_factor_reuse_policy"] == (
-                "first_trace_solve_per_attempt" if mode == "igr"
-                else "not_applicable"
+                "not_applicable"
             )
             assert attribution[
                 "ordinary_ilu_triangular_solve_policy"
@@ -1856,17 +1872,12 @@ def main() -> int:
             }
             assert attribution[
                 "tensor_ilu_triangular_solve_policy"
-            ] == ({
-                "kind": "iterative_jacobi",
-                "lower_jacobi_iterations": 5,
-                "upper_jacobi_iterations": 5,
-                "jacobi_factor_spmv_updates_per_application": 8,
-            } if mode == "igr" else {
+            ] == {
                 "kind": "not_applicable",
                 "lower_jacobi_iterations": 0,
                 "upper_jacobi_iterations": 0,
                 "jacobi_factor_spmv_updates_per_application": 0,
-            })
+            }
             assert attribution["includes_tensor_condensation"] is True
             assert attribution[
                 "mma_contribution_requires_separate_profiler_attribution"
@@ -1877,12 +1888,20 @@ def main() -> int:
             assert result["engines"]["tensor"]["solver_work"][
                 "trace_preconditioners"
             ] == [
-                "hypre_ilu0" if cell_key.startswith("igr_")
+                "native_element_schwarz_warp_equilibrated_field_split_fp64"
+                if cell_key.startswith("igr_")
                 else "hypre_diag_scale"
             ]
             for engine in ("ordinary", "tensor"):
                 work = result["engines"][engine]["solver_work"]
-                assert work["trace_policies"] == ["engine-default"]
+                assert work["requested_trace_policies"] == ["engine-default"]
+                assert work["resolved_trace_policies"] == [
+                    CAMPAIGN.expected_resolved_trace_policy(
+                        engine,
+                        "igr" if cell_key.startswith("igr_")
+                        else "conventional",
+                    )
+                ]
                 expected_trace_solver = (
                     "native-rank1-fp64"
                     if engine == "tensor" else "hypre-parcsr-gmres"
@@ -1906,7 +1925,7 @@ def main() -> int:
                 assert work["tensor_core"][
                     "trace_solver_accounting_all_complete"
                 ] is True
-                ilu_active = engine == "ordinary" or cell_key.startswith("igr_")
+                ilu_active = engine == "ordinary"
                 assert work["linear_iterations"]["total"] == 70
                 assert work["linear_iterations_by_invocation"] == [
                     [7, 7, 7, 7, 7], [7, 7, 7, 7, 7]
@@ -1918,23 +1937,20 @@ def main() -> int:
                 assert work["tensor_core"][
                     "ilu_accounting_all_complete"
                 ] is True
-                tensor_igr = engine == "tensor" and mode == "igr"
                 expected_triangular_policy = (
-                    ["iterative_jacobi", 5, 5] if tensor_igr
-                    else ["direct", 0, 0] if ilu_active
+                    ["direct", 0, 0] if ilu_active
                     else ["not_applicable", 0, 0]
                 )
                 assert work["tensor_core"][
                     "ilu_triangular_solve_policies"
                 ] == [expected_triangular_policy]
                 expected_factor_setups = (
-                    10 if tensor_igr else 20 if ilu_active else 0
+                    20 if ilu_active else 0
                 )
-                expected_factor_reuses = 10 if tensor_igr else 0
-                expected_factor_age = 1 if tensor_igr else 0
+                expected_factor_reuses = 0
+                expected_factor_age = 0
                 expected_factor_policy = (
-                    "first_trace_solve_per_attempt" if tensor_igr
-                    else "refresh_each_trace_solve" if ilu_active
+                    "refresh_each_trace_solve" if ilu_active
                     else "not_applicable"
                 )
                 assert work["tensor_core"][
@@ -1968,10 +1984,10 @@ def main() -> int:
                 ]["total"] == expected_callback_upper
                 assert work["tensor_core"][
                     "ilu_jacobi_factor_spmv_updates_lower_bound"
-                ]["total"] == (640 if tensor_igr else 0)
+                ]["total"] == 0
                 assert work["tensor_core"][
                     "ilu_jacobi_factor_spmv_updates_upper_bound"
-                ]["total"] == (1120 if tensor_igr else 0)
+                ]["total"] == 0
                 assert all(work["acceptance_gates"].values())
                 assert work["transfers"]["all_complete"] is True
                 memory = result["engines"][engine][
@@ -2038,6 +2054,11 @@ def main() -> int:
                 ).hexdigest()
             summary = item["benchmark_summary"]
             assert summary["trace_policy"] == "engine-default"
+            assert summary["requested_trace_policy"] == "engine-default"
+            assert summary["resolved_trace_policy"] == \
+                CAMPAIGN.expected_resolved_trace_policy(
+                    item["comparison_member"], item["mode"]
+                )
             expected_trace_solver = (
                 "native-rank1-fp64"
                 if item["comparison_member"] == "tensor"
@@ -2075,13 +2096,12 @@ def main() -> int:
                 sample["trace_solver_accounting_complete"] is True
                 for sample in summary["measured_sample_work"]
             )
-            ilu_active = item["comparison_member"] == "ordinary" or \
-                item["mode"] == "igr"
-            expected_accounting_kind = (
-                "derived_bounds_v1" if ilu_active else "unavailable"
-            )
             expected_ilu_policy = CAMPAIGN.expected_trace_ilu_policy(
                 item["comparison_member"], item["mode"]
+            )
+            ilu_active = expected_ilu_policy[3] > 0
+            expected_accounting_kind = (
+                "derived_bounds_v1" if ilu_active else "unavailable"
             )
             expected_factor_reuse_policy = \
                 CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
@@ -2233,6 +2253,13 @@ def main() -> int:
             ] == selection["trace_policy"]
             summary = item["benchmark_summary"]
             assert summary["trace_policy"] == selection["trace_policy"]
+            assert summary["requested_trace_policy"] == \
+                selection["trace_policy"]
+            assert summary["resolved_trace_policy"] == \
+                CAMPAIGN.expected_resolved_trace_policy(
+                    selection["engine"], item["mode"],
+                    selection["trace_policy"]
+                )
             expected_trace_solver = (
                 "native-rank1-fp64"
                 if selection["engine"] == "tensor"
@@ -2240,7 +2267,13 @@ def main() -> int:
             )
             assert summary["trace_solver"] == expected_trace_solver
             assert all(
-                sample["trace_policy"] == selection["trace_policy"] and
+                sample["requested_trace_policy"] ==
+                    selection["trace_policy"] and
+                sample["resolved_trace_policy"] ==
+                    CAMPAIGN.expected_resolved_trace_policy(
+                        selection["engine"], item["mode"],
+                        selection["trace_policy"]
+                    ) and
                 sample["trace_solver"] == expected_trace_solver
                 for sample in summary["measured_sample_work"]
             )
@@ -2370,6 +2403,12 @@ def main() -> int:
         bad_trace_policy = copy.deepcopy(ordinary_record)
         bad_trace_policy["trace_policy"] = "common-fast"
         assert rejected(bad_trace_policy)
+        bad_requested_trace_policy = copy.deepcopy(ordinary_record)
+        bad_requested_trace_policy["requested_trace_policy"] = "common-fast"
+        assert rejected(bad_requested_trace_policy)
+        bad_resolved_trace_policy = copy.deepcopy(ordinary_record)
+        bad_resolved_trace_policy["resolved_trace_policy"] = "common-fast"
+        assert rejected(bad_resolved_trace_policy)
         bad_trace_solver = copy.deepcopy(ordinary_record)
         bad_trace_solver["trace_solver"] = "native-rank1-fp64"
         assert rejected(bad_trace_solver)
@@ -2396,9 +2435,14 @@ def main() -> int:
         assert rejected(bad_production_selection)
         bad_sample_trace_policy = copy.deepcopy(ordinary_record)
         bad_sample_trace_policy["samples"][1]["tensor_core"][
-            "trace_policy"
+            "requested_trace_policy"
         ] = "common-fast"
         assert rejected(bad_sample_trace_policy)
+        bad_sample_resolved_trace_policy = copy.deepcopy(ordinary_record)
+        bad_sample_resolved_trace_policy["samples"][1]["tensor_core"][
+            "resolved_trace_policy"
+        ] = "common-fast"
+        assert rejected(bad_sample_resolved_trace_policy)
         boolean_ilu_policy = copy.deepcopy(ordinary_record)
         boolean_ilu_policy["trace_ilu_application_iterations"] = True
         assert rejected(boolean_ilu_policy)
@@ -2506,55 +2550,65 @@ def main() -> int:
         }
         assert tensor_igr_record[
             "trace_preconditioner"
-        ] == "hypre_ilu0"
-        assert tensor_igr_record["trace_ilu_type"] == 0
-        assert tensor_igr_record["trace_ilu_level_of_fill"] == 0
-        assert tensor_igr_record["trace_ilu_application_iterations"] == 1
-        assert tensor_igr_record["trace_ilu_local_reordering"] == 1
+        ] == "native_element_schwarz_warp_equilibrated_field_split_fp64"
+        assert tensor_igr_record["requested_trace_policy"] == "engine-default"
+        assert tensor_igr_record["resolved_trace_policy"] == (
+            "native-element-schwarz-matrix-free-warp-"
+            "equilibrated-field-split-fp64"
+        )
+        assert tensor_igr_record["trace_ilu_type"] == -1
+        assert tensor_igr_record["trace_ilu_level_of_fill"] == -1
+        assert tensor_igr_record["trace_ilu_application_iterations"] == 0
+        assert tensor_igr_record["trace_ilu_local_reordering"] == -1
         assert tensor_igr_record[
             "trace_ilu_accounting_kind"
-        ] == "derived_bounds_v1"
+        ] == "unavailable"
         assert tensor_igr_record[
             "trace_ilu_factor_reuse_policy"
-        ] == "first_trace_solve_per_attempt"
+        ] == "not_applicable"
         assert tensor_igr_record[
             "trace_ilu_triangular_solve_kind"
-        ] == "iterative_jacobi"
-        assert tensor_igr_record["trace_ilu_lower_jacobi_iterations"] == 5
-        assert tensor_igr_record["trace_ilu_upper_jacobi_iterations"] == 5
+        ] == "not_applicable"
+        assert tensor_igr_record["trace_ilu_lower_jacobi_iterations"] == 0
+        assert tensor_igr_record["trace_ilu_upper_jacobi_iterations"] == 0
         assert all(
             sample["tensor_core"]["trace_preconditioner"] ==
-            "hypre_ilu0" and
-            sample["tensor_core"]["ilu_type"] == 0 and
-            sample["tensor_core"]["ilu_level_of_fill"] == 0 and
-            sample["tensor_core"]["ilu_application_iterations"] == 1 and
-            sample["tensor_core"]["ilu_local_reordering"] == 1 and
+            "native_element_schwarz_warp_equilibrated_field_split_fp64" and
+            sample["tensor_core"]["requested_trace_policy"] ==
+            "engine-default" and
+            sample["tensor_core"]["resolved_trace_policy"] ==
+            "native-element-schwarz-matrix-free-warp-"
+            "equilibrated-field-split-fp64" and
+            sample["tensor_core"]["ilu_type"] == -1 and
+            sample["tensor_core"]["ilu_level_of_fill"] == -1 and
+            sample["tensor_core"]["ilu_application_iterations"] == 0 and
+            sample["tensor_core"]["ilu_local_reordering"] == -1 and
             sample["tensor_core"]["ilu_accounting_kind"] ==
-            "derived_bounds_v1" and
+            "unavailable" and
             sample["tensor_core"]["ilu_factor_reuse_policy"] ==
-            "first_trace_solve_per_attempt" and
-            sample["tensor_core"]["ilu_factor_setups"] == 1 and
-            sample["tensor_core"]["ilu_factor_reuses"] == 1 and
-            sample["tensor_core"]["ilu_factor_age_generations"] == 1 and
+            "not_applicable" and
+            sample["tensor_core"]["ilu_factor_setups"] == 0 and
+            sample["tensor_core"]["ilu_factor_reuses"] == 0 and
+            sample["tensor_core"]["ilu_factor_age_generations"] == 0 and
             sample["tensor_core"]["ilu_triangular_solve_kind"] ==
-            "iterative_jacobi" and
-            sample["tensor_core"]["ilu_lower_jacobi_iterations"] == 5 and
-            sample["tensor_core"]["ilu_upper_jacobi_iterations"] == 5 and
+            "not_applicable" and
+            sample["tensor_core"]["ilu_lower_jacobi_iterations"] == 0 and
+            sample["tensor_core"]["ilu_upper_jacobi_iterations"] == 0 and
             sample["tensor_core"]["ilu_accounting_complete"] is True and
             sample["tensor_core"][
                 "ilu_preconditioner_callbacks_lower_bound"
-            ] == 8 and
+            ] == 0 and
             sample["tensor_core"][
                 "ilu_preconditioner_callbacks_upper_bound"
-            ] == 14 and
-            sample["tensor_core"]["ilu_inner_iterations_lower_bound"] == 8 and
-            sample["tensor_core"]["ilu_inner_iterations_upper_bound"] == 14 and
+            ] == 0 and
+            sample["tensor_core"]["ilu_inner_iterations_lower_bound"] == 0 and
+            sample["tensor_core"]["ilu_inner_iterations_upper_bound"] == 0 and
             sample["tensor_core"][
                 "ilu_jacobi_factor_spmv_updates_lower_bound"
-            ] == 64 and
+            ] == 0 and
             sample["tensor_core"][
                 "ilu_jacobi_factor_spmv_updates_upper_bound"
-            ] == 112
+            ] == 0
             for sample in tensor_igr_record["samples"]
         )
 
@@ -2587,7 +2641,7 @@ def main() -> int:
         wrong_tensor_igr_top_level_kind = copy.deepcopy(tensor_igr_record)
         wrong_tensor_igr_top_level_kind[
             "trace_ilu_accounting_kind"
-        ] = "unavailable"
+        ] = "derived_bounds_v1"
         assert tensor_igr_rejected(wrong_tensor_igr_top_level_kind)
         wrong_tensor_igr_top_level_reuse = copy.deepcopy(tensor_igr_record)
         wrong_tensor_igr_top_level_reuse[
@@ -2634,7 +2688,7 @@ def main() -> int:
         wrong_tensor_igr_kind = copy.deepcopy(tensor_igr_record)
         wrong_tensor_igr_kind["samples"][1]["tensor_core"][
             "ilu_accounting_kind"
-        ] = "unavailable"
+        ] = "derived_bounds_v1"
         assert tensor_igr_rejected(wrong_tensor_igr_kind)
         incomplete_tensor_igr = copy.deepcopy(tensor_igr_record)
         incomplete_tensor_igr["samples"][1]["tensor_core"][
@@ -2654,12 +2708,12 @@ def main() -> int:
         wrong_tensor_igr_reuses = copy.deepcopy(tensor_igr_record)
         wrong_tensor_igr_reuses["samples"][1]["tensor_core"][
             "ilu_factor_reuses"
-        ] = 0
+        ] = 1
         assert tensor_igr_rejected(wrong_tensor_igr_reuses)
         zero_tensor_igr_factor_age = copy.deepcopy(tensor_igr_record)
         zero_tensor_igr_factor_age["samples"][1]["tensor_core"][
             "ilu_factor_age_generations"
-        ] = 0
+        ] = 1
         assert tensor_igr_rejected(zero_tensor_igr_factor_age)
         low_tensor_igr_callback_bound = copy.deepcopy(tensor_igr_record)
         low_tensor_igr_sample = low_tensor_igr_callback_bound[
@@ -3046,7 +3100,7 @@ def main() -> int:
         assert tensor_disposition["all_six_cells_disclosed"] is True
         assert tensor_disposition["attribution_by_mode"]["igr"][
             "tensor_trace_preconditioner"
-        ] == "hypre_ilu0"
+        ] == "native_element_schwarz_warp_equilibrated_field_split_fp64"
         assert tensor_disposition["attribution_by_mode"]["igr"][
             "trace_policy_matched"
         ] is False
@@ -3058,17 +3112,17 @@ def main() -> int:
         ] == "refresh_each_trace_solve"
         assert tensor_disposition["attribution_by_mode"]["igr"][
             "tensor_ilu_factor_reuse_policy"
-        ] == "first_trace_solve_per_attempt"
+        ] == "not_applicable"
         assert tensor_disposition["attribution_by_mode"]["igr"][
             "ordinary_ilu_triangular_solve_policy"
         ]["kind"] == "direct"
         assert tensor_disposition["attribution_by_mode"]["igr"][
             "tensor_ilu_triangular_solve_policy"
         ] == {
-            "kind": "iterative_jacobi",
-            "lower_jacobi_iterations": 5,
-            "upper_jacobi_iterations": 5,
-            "jacobi_factor_spmv_updates_per_application": 8,
+            "kind": "not_applicable",
+            "lower_jacobi_iterations": 0,
+            "upper_jacobi_iterations": 0,
+            "jacobi_factor_spmv_updates_per_application": 0,
         }
         assert tensor_disposition["attribution_by_mode"]["igr"][
             "mma_contribution_requires_separate_profiler_attribution"

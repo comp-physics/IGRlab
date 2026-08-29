@@ -1166,7 +1166,7 @@ bool CudaSolveRankOneMgr(
   diagnostics.igr_active = policy.igr_active;
   diagnostics.krylov_dimension = krylov_dimension;
   const bool exact_policy = CudaTracePolicyDescriptorIsExact(policy) &&
-      policy.selection == CudaTracePolicyKind::equilibrated_mgr &&
+      policy.resolved_selection == CudaTracePolicyKind::equilibrated_mgr &&
       policy.selected_engine == generic::CudaEngineKind::tensor_core &&
       policy.igr_active && policy.trace_preconditioner ==
           CudaTracePreconditionerKind::hypre_mgr_field_split &&

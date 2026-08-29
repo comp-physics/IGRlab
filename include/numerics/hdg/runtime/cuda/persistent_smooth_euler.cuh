@@ -535,13 +535,19 @@ public:
 
   explicit PersistentCudaSmoothEulerEngine(const CudaConfig& config) noexcept
       : PersistentCudaSmoothEulerEngine(
-            config, CudaTracePolicyKind::engine_default)
+            config, ResolveCudaTracePolicy(
+                config.cuda_engine,
+                config.use_generic_numerical_policy &&
+                    config.numerical_policy.stabilization.kind ==
+                        generic::RegularizationKind::igr,
+                config.expected_rank_count, config.order,
+                CudaTracePolicyKind::engine_default))
   {}
 
 private:
   PersistentCudaSmoothEulerEngine(
       const CudaConfig& config,
-      const CudaTracePolicyKind trace_policy) noexcept
+      const CudaTracePolicyDescriptor& trace_policy) noexcept
       : config_(config),
         trace_policy_(trace_policy),
         communicator_(CudaCollectiveCommunicator(config)),
@@ -590,7 +596,12 @@ public:
   {
     evidence = {};
     evidence.tensor_core.selected_engine = config_.cuda_engine;
-    evidence.tensor_core.trace_policy = trace_policy_;
+    evidence.tensor_core.requested_trace_policy =
+        trace_policy_.requested_selection;
+    evidence.tensor_core.resolved_trace_policy =
+        trace_policy_.resolved_selection;
+    evidence.tensor_core.trace_policy_rank_count = trace_policy_.rank_count;
+    evidence.tensor_core.trace_policy_order = trace_policy_.polynomial_order;
     MPI_Comm_rank(communicator_, &evidence.rank);
     MPI_Comm_size(communicator_, &evidence.ranks);
     const bool descriptor_consensus = ConfigurationConsensus();
@@ -1405,8 +1416,16 @@ private:
           config_.use_borrowed_host_inputs &&
           config_.use_generic_numerical_policy));
     const bool trace_policy_configuration =
-        IsKnownCudaTracePolicyKind(trace_policy_) &&
-        (trace_policy_ == CudaTracePolicyKind::engine_default ||
+        CudaTracePolicyDescriptorIsExact(trace_policy_) &&
+        trace_policy_.selected_engine == config_.cuda_engine &&
+        trace_policy_.rank_count == config_.expected_rank_count &&
+        trace_policy_.polynomial_order == config_.order &&
+        trace_policy_.igr_active ==
+            (config_.use_generic_numerical_policy &&
+             config_.numerical_policy.stabilization.kind ==
+                 generic::RegularizationKind::igr) &&
+        (trace_policy_.requested_selection ==
+             CudaTracePolicyKind::engine_default ||
          (config_.expected_rank_count == 1 &&
           config_.use_borrowed_topology &&
           config_.use_borrowed_host_inputs &&
@@ -1584,7 +1603,13 @@ private:
     // tensor_core remains a distinct, rank-consensed configuration identity.
     AppendConfigValue(descriptor, cursor, complete, config_.cuda_engine);
     // Append-only so the engine-default descriptor prefix stays byte-identical.
-    AppendConfigValue(descriptor, cursor, complete, trace_policy_);
+    AppendConfigValue(
+        descriptor, cursor, complete, trace_policy_.requested_selection);
+    AppendConfigValue(
+        descriptor, cursor, complete, trace_policy_.resolved_selection);
+    AppendConfigValue(descriptor, cursor, complete, trace_policy_.rank_count);
+    AppendConfigValue(
+        descriptor, cursor, complete, trace_policy_.polynomial_order);
     return complete;
   }
 
@@ -1720,21 +1745,23 @@ private:
   {
     evidence = {};
     evidence.selected_engine = config_.cuda_engine;
-    evidence.trace_policy = trace_policy_;
+    evidence.requested_trace_policy = trace_policy_.requested_selection;
+    evidence.resolved_trace_policy = trace_policy_.resolved_selection;
+    evidence.trace_policy_rank_count = trace_policy_.rank_count;
+    evidence.trace_policy_order = trace_policy_.polynomial_order;
     evidence.hardware_supported =
         numerics_.TensorCoreHardwareSupported();
     const bool igr_active = config_.use_generic_numerical_policy &&
         config_.numerical_policy.stabilization.kind ==
             generic::RegularizationKind::igr;
-    const CudaTracePolicyDescriptor trace_policy = ResolveCudaTracePolicy(
-        config_.cuda_engine, igr_active, trace_policy_);
     const CudaTracePreconditionerKind selected_preconditioner = initialized_
         ? numerics_.TracePreconditioner()
-        : trace_policy.trace_preconditioner;
+        : trace_policy_.trace_preconditioner;
     evidence.trace_preconditioner = selected_preconditioner;
     const bool selected_policy_ready =
-        CudaTracePolicyDescriptorIsExact(trace_policy) &&
-        selected_preconditioner == trace_policy.trace_preconditioner;
+        CudaTracePolicyDescriptorIsExact(trace_policy_) &&
+        trace_policy_.igr_active == igr_active &&
+        selected_preconditioner == trace_policy_.trace_preconditioner;
     (void)detail::CudaInitializeIluEvidence(
         evidence, selected_preconditioner, igr_active);
     evidence.trace_preconditioner_configured = initialized_ &&
@@ -2126,7 +2153,7 @@ private:
   };
 
   CudaConfig config_{};
-  CudaTracePolicyKind trace_policy_ = CudaTracePolicyKind::engine_default;
+  CudaTracePolicyDescriptor trace_policy_{};
   MPI_Comm communicator_ = MPI_COMM_WORLD;
   detail::CudaPersistentNumerics<AllocatorPolicy, TransportPolicy> numerics_{};
   std::optional<contract_type> contract_{};

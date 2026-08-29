@@ -1132,7 +1132,7 @@ BuildPersistentTrueSystem() noexcept
           selected_preconditioner);
   const bool use_matrix_free =
       CudaTracePolicyUsesNativeElementMatrixFreeOperator(
-          trace_policy.selection);
+          trace_policy.resolved_selection);
   const bool use_native = trace_solver_kind_ ==
       CudaTraceSolverKind::native_rank1_fp64;
   const bool use_mgr = trace_solver_kind_ ==
@@ -1156,7 +1156,14 @@ BuildPersistentTrueSystem() noexcept
     return false;
   initialization_tensor_core_evidence_ = {};
   initialization_tensor_core_evidence_.selected_engine = cuda_engine_;
-  initialization_tensor_core_evidence_.trace_policy = trace_policy.selection;
+  initialization_tensor_core_evidence_.requested_trace_policy =
+      trace_policy.requested_selection;
+  initialization_tensor_core_evidence_.resolved_trace_policy =
+      trace_policy.resolved_selection;
+  initialization_tensor_core_evidence_.trace_policy_rank_count =
+      trace_policy.rank_count;
+  initialization_tensor_core_evidence_.trace_policy_order =
+      trace_policy.polynomial_order;
   initialization_tensor_core_evidence_.trace_preconditioner =
       selected_preconditioner;
   initialization_tensor_core_evidence_.native_rank1_trace_solver_configured =
@@ -2377,7 +2384,7 @@ AssembleTrueSystem() noexcept
   }
   const bool matrix_free_operator =
       CudaTracePolicyUsesNativeElementMatrixFreeOperator(
-          trace_policy_descriptor_.selection);
+          trace_policy_descriptor_.resolved_selection);
   if (matrix_free_operator)
   {
     const bool exact_rank_one_rhs = ranks_ == 1 &&
@@ -2536,13 +2543,13 @@ LaunchAndObserveNativeRankOneTraceSolve(
           trace_policy_descriptor_.trace_preconditioner);
   const bool use_matrix_free =
       CudaTracePolicyUsesNativeElementMatrixFreeOperator(
-          trace_policy_descriptor_.selection);
+          trace_policy_descriptor_.resolved_selection);
   const bool use_matrix_free_equilibrated_field_split =
       CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
-          trace_policy_descriptor_.selection);
+          trace_policy_descriptor_.resolved_selection);
   const bool use_matrix_free_warp_equilibrated_field_split =
       CudaTracePolicyUsesNativeElementMatrixFreeWarpEquilibratedFieldSplit(
-          trace_policy_descriptor_.selection);
+          trace_policy_descriptor_.resolved_selection);
   const bool use_equilibrated_field_split =
       CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
           trace_policy_descriptor_.trace_preconditioner);

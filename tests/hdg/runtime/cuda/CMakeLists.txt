@@ -381,9 +381,11 @@ foreach(_order IN ITEMS 1 2 3)
       TIMEOUT 7200)
 endforeach()
 
-# Exact tensor-IGR optimization candidate: retain all six conventional/IGR,
+# Exact tensor-IGR production candidate: retain all six conventional/IGR,
 # periodic/physical, supplied/source, and localized-contact cases in the same
 # shared CPU/ordinary-CUDA/tensor-CUDA fixture as the legacy controls above.
+# The requested engine-default policy must resolve to the qualified rank-one
+# tensor-IGR trace leaf; explicit policy selectors remain ablation controls.
 foreach(_order IN ITEMS 1 2 3)
   math(EXPR _igr_volume_quadrature_order "2 * ${_order} + 4")
   math(EXPR _igr_face_quadrature_order "2 * ${_order} + 2")
@@ -396,21 +398,20 @@ foreach(_order IN ITEMS 1 2 3)
       --newton-linear-rtol 1e-10
       --final-linear-rtol 3e-11
       --true-residual-tightening-linear-rtol 1e-12
-      --tensor-igr-trace-policy
-        native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64)
+      --tensor-igr-trace-policy engine-default)
   set_tests_properties(
     dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_candidate_p${_order}_rank1
     PROPERTIES
-      LABELS "hdg;runtime;cpu;cuda;generic-euler;alignment;ordinary;tensor;igr;contact;physical;periodic;source;initial-trace;conservation;trajectory;quadrature-candidate;role-tolerance-candidate;warp-field-split;p${_order}"
+      LABELS "hdg;runtime;cpu;cuda;generic-euler;alignment;ordinary;tensor;igr;contact;physical;periodic;source;initial-trace;conservation;trajectory;quadrature-candidate;role-tolerance-candidate;production-trace-policy;p${_order}"
       PROCESSORS 1
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 7200)
 endforeach()
 
 # Parse and validate candidate policies without selecting a CUDA device.  The
-# same executable subsequently applies one policy to every CPU/ordinary/tensor
-# trajectory; these fast checks cover malformed input before that shared
-# numerical suite starts.
+# explicit warp selector below is a private ablation/parser control, separate
+# from the engine-default production candidate above.  These fast checks cover
+# malformed input before the shared numerical suite starts.
 add_test(
   NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_options_default
   COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment

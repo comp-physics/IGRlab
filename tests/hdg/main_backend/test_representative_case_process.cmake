@@ -26,12 +26,39 @@ if(HDG_REPRESENTATIVE_DEVICE STREQUAL "cpu" AND
   message(FATAL_ERROR
     "CPU representative coverage requires the ordinary CUDA selector.")
 endif()
-# Every CUDA representative case below is IGR and shares the qualified ILU(0)
-# trace policy across both CUDA engines.
+if(NOT DEFINED HDG_REPRESENTATIVE_RANKS)
+  set(HDG_REPRESENTATIVE_RANKS 1)
+endif()
+if(HDG_REPRESENTATIVE_RANKS LESS 1)
+  message(FATAL_ERROR "Representative HDG rank count must be positive.")
+endif()
 set(_expected_trace_preconditioner hypre_ilu0)
+set(_expected_requested_trace_policy engine-default)
+set(_expected_resolved_trace_policy engine-default)
+set(_expected_trace_solver hypre-parcsr-gmres)
+set(_expected_ilu_type 0)
 set(_expected_ilu_fill 0)
+set(_expected_ilu_reordering 1)
 set(_expected_ilu_iterations 1)
-if(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor")
+set(_expected_ilu_accounting_kind derived_bounds_v1)
+if(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor" AND
+   HDG_REPRESENTATIVE_RANKS EQUAL 1)
+  set(_expected_trace_preconditioner
+    native_element_schwarz_warp_equilibrated_field_split_fp64)
+  set(_expected_resolved_trace_policy
+    native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64)
+  set(_expected_trace_solver native-rank1-fp64)
+  set(_expected_ilu_type -1)
+  set(_expected_ilu_fill -1)
+  set(_expected_ilu_reordering -1)
+  set(_expected_ilu_iterations 0)
+  set(_expected_ilu_accounting_kind unavailable)
+  set(_expected_ilu_factor_reuse_policy not_applicable)
+  set(_expected_ilu_triangular_solve_kind not_applicable)
+  set(_expected_ilu_lower_jacobi_iterations 0)
+  set(_expected_ilu_upper_jacobi_iterations 0)
+elseif(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor")
+  set(_expected_trace_solver hypre-host-staged-rank2)
   set(_expected_ilu_factor_reuse_policy first_trace_solve_per_attempt)
   set(_expected_ilu_triangular_solve_kind iterative_jacobi)
   set(_expected_ilu_lower_jacobi_iterations 5)
@@ -42,11 +69,8 @@ else()
   set(_expected_ilu_lower_jacobi_iterations 0)
   set(_expected_ilu_upper_jacobi_iterations 0)
 endif()
-if(NOT DEFINED HDG_REPRESENTATIVE_RANKS)
-  set(HDG_REPRESENTATIVE_RANKS 1)
-endif()
-if(HDG_REPRESENTATIVE_RANKS LESS 1)
-  message(FATAL_ERROR "Representative HDG rank count must be positive.")
+if(HDG_REPRESENTATIVE_RANKS EQUAL 2)
+  set(_expected_trace_solver hypre-host-staged-rank2)
 endif()
 
 set(_periodic_command "${HDG_PERIODIC_EXECUTABLE}")
@@ -132,7 +156,7 @@ if(HDG_REPRESENTATIVE_DEVICE STREQUAL "cuda")
     ERROR_VARIABLE _periodic_stderr)
   if(NOT _periodic_status EQUAL 0 OR
      NOT _periodic_stdout MATCHES
-       "\\[hdg-main\\] status=Success.*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*trace_preconditioner=${_expected_trace_preconditioner}.*trace_ilu_type=0.*trace_ilu_level_of_fill=${_expected_ilu_fill}.*trace_ilu_local_reordering=1.*trace_ilu_application_iterations=${_expected_ilu_iterations}.*trace_ilu_accounting_kind=derived_bounds_v1.*trace_ilu_factor_reuse_policy=${_expected_ilu_factor_reuse_policy}.*trace_ilu_triangular_solve_kind=${_expected_ilu_triangular_solve_kind}.*trace_ilu_lower_jacobi_iterations=${_expected_ilu_lower_jacobi_iterations}.*trace_ilu_upper_jacobi_iterations=${_expected_ilu_upper_jacobi_iterations}.*regularization=igr" OR
+       "\\[hdg-main\\] status=Success.*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*requested_trace_policy=${_expected_requested_trace_policy}.*resolved_trace_policy=${_expected_resolved_trace_policy}.*trace_solver=${_expected_trace_solver}.*fallback_count=0.*trace_preconditioner=${_expected_trace_preconditioner}.*trace_ilu_type=${_expected_ilu_type}.*trace_ilu_level_of_fill=${_expected_ilu_fill}.*trace_ilu_local_reordering=${_expected_ilu_reordering}.*trace_ilu_application_iterations=${_expected_ilu_iterations}.*trace_ilu_accounting_kind=${_expected_ilu_accounting_kind}.*trace_ilu_factor_reuse_policy=${_expected_ilu_factor_reuse_policy}.*trace_ilu_triangular_solve_kind=${_expected_ilu_triangular_solve_kind}.*trace_ilu_lower_jacobi_iterations=${_expected_ilu_lower_jacobi_iterations}.*trace_ilu_upper_jacobi_iterations=${_expected_ilu_upper_jacobi_iterations}.*regularization=igr" OR
      NOT _periodic_stderr STREQUAL "")
     message(FATAL_ERROR
       "CUDA periodic p1 HDG IGR execution failed: ${_periodic_status}\\n${_periodic_stdout}\\n${_periodic_stderr}")
@@ -152,7 +176,7 @@ if(HDG_REPRESENTATIVE_DEVICE STREQUAL "cuda")
       ERROR_VARIABLE _physical_stderr)
     if(NOT _physical_status EQUAL 0 OR
        NOT _physical_stdout MATCHES
-         "\\[hdg-main\\] status=Success.*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*trace_preconditioner=${_expected_trace_preconditioner}.*trace_ilu_type=0.*trace_ilu_level_of_fill=${_expected_ilu_fill}.*trace_ilu_local_reordering=1.*trace_ilu_application_iterations=${_expected_ilu_iterations}.*trace_ilu_accounting_kind=derived_bounds_v1.*trace_ilu_factor_reuse_policy=${_expected_ilu_factor_reuse_policy}.*trace_ilu_triangular_solve_kind=${_expected_ilu_triangular_solve_kind}.*trace_ilu_lower_jacobi_iterations=${_expected_ilu_lower_jacobi_iterations}.*trace_ilu_upper_jacobi_iterations=${_expected_ilu_upper_jacobi_iterations}.*regularization=igr" OR
+         "\\[hdg-main\\] status=Success.*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*requested_trace_policy=${_expected_requested_trace_policy}.*resolved_trace_policy=${_expected_resolved_trace_policy}.*trace_solver=${_expected_trace_solver}.*fallback_count=0.*trace_preconditioner=${_expected_trace_preconditioner}.*trace_ilu_type=${_expected_ilu_type}.*trace_ilu_level_of_fill=${_expected_ilu_fill}.*trace_ilu_local_reordering=${_expected_ilu_reordering}.*trace_ilu_application_iterations=${_expected_ilu_iterations}.*trace_ilu_accounting_kind=${_expected_ilu_accounting_kind}.*trace_ilu_factor_reuse_policy=${_expected_ilu_factor_reuse_policy}.*trace_ilu_triangular_solve_kind=${_expected_ilu_triangular_solve_kind}.*trace_ilu_lower_jacobi_iterations=${_expected_ilu_lower_jacobi_iterations}.*trace_ilu_upper_jacobi_iterations=${_expected_ilu_upper_jacobi_iterations}.*regularization=igr" OR
        NOT _physical_stderr STREQUAL "")
       message(FATAL_ERROR
         "CUDA physical-boundary ${_boundary_mode} p1 HDG IGR execution failed: ${_physical_status}\\n${_physical_stdout}\\n${_physical_stderr}")

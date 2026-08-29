@@ -1095,12 +1095,16 @@ static_assert(!IluDerivedBoundsAreConsistent(
 bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
              const CudaEngineKind engine, const bool igr_active,
              const CudaTracePolicyKind trace_policy,
+             const int polynomial_order,
              const std::uint64_t krylov_restart_dimension) noexcept
 {
   const auto& evidence = observation.evidence;
   const auto& tensor = evidence.tensor_core;
   const CudaTracePolicyDescriptor expected_policy =
-      ResolveCudaTracePolicy(engine, igr_active, trace_policy);
+      ResolveCudaTracePolicy(
+          engine, igr_active, 1, polynomial_order, trace_policy);
+  const CudaTracePolicyKind resolved_trace_policy =
+      expected_policy.resolved_selection;
   const auto expected_preconditioner =
       expected_policy.trace_preconditioner;
   const bool ilu_policy = CudaTracePreconditionerIsIlu(
@@ -1203,20 +1207,21 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
             tensor.ilu_factor_age_generations == 0 &&
             tensor.ilu_accounting_complete;
   const bool expected_mgr_solver =
-      trace_policy == CudaTracePolicyKind::equilibrated_mgr;
+      resolved_trace_policy == CudaTracePolicyKind::equilibrated_mgr;
   const bool expected_matrix_free =
-      CudaTracePolicyUsesNativeElementMatrixFreeOperator(trace_policy);
-  const bool expected_element_schwarz = trace_policy ==
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          resolved_trace_policy);
+  const bool expected_element_schwarz = resolved_trace_policy ==
           CudaTracePolicyKind::native_element_schwarz_fp64 ||
       expected_matrix_free ||
-      trace_policy == CudaTracePolicyKind::
+      resolved_trace_policy == CudaTracePolicyKind::
           native_element_schwarz_equilibrated_field_split_fp64;
-  const bool expected_equilibrated_field_split = trace_policy ==
+  const bool expected_equilibrated_field_split = resolved_trace_policy ==
       CudaTracePolicyKind::
           native_element_schwarz_equilibrated_field_split_fp64 ||
-      trace_policy == CudaTracePolicyKind::
+      resolved_trace_policy == CudaTracePolicyKind::
           native_element_schwarz_matrix_free_equilibrated_field_split_fp64 ||
-      trace_policy == CudaTracePolicyKind::
+      resolved_trace_policy == CudaTracePolicyKind::
           native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
   const bool expected_native_solver =
       engine == CudaEngineKind::tensor_core && !expected_mgr_solver;
@@ -1293,7 +1298,10 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
   const bool expected_engine =
       CudaTracePolicyDescriptorIsExact(expected_policy) &&
       tensor.selected_engine == engine &&
-      tensor.trace_policy == trace_policy &&
+      tensor.requested_trace_policy == trace_policy &&
+      tensor.resolved_trace_policy == resolved_trace_policy &&
+      tensor.trace_policy_rank_count == 1 &&
+      tensor.trace_policy_order == polynomial_order &&
       tensor.trace_preconditioner_configured &&
       tensor.trace_preconditioner == expected_preconditioner &&
       ilu_work_consistent && mgr_work_consistent &&
@@ -1344,6 +1352,7 @@ bool RunStep(GenericEulerHdgCudaSession& session,
              const CudaEngineKind engine,
              const bool igr_active,
              const CudaTracePolicyKind trace_policy,
+             const int polynomial_order,
              const std::uint64_t krylov_restart_dimension,
              const bool warmup, const int measured_index,
              StepSample& sample, std::string& error)
@@ -1405,6 +1414,7 @@ bool RunStep(GenericEulerHdgCudaSession& session,
   sample.coordinates = session.coordinates();
   sample.diagnostics = session.diagnostics();
   if (!Healthy(sample.prepared, engine, igr_active, trace_policy,
+               polynomial_order,
                krylov_restart_dimension))
   {
     error = "accepted-step prepared numerical gates failed";
@@ -1629,8 +1639,13 @@ void PrintStep(const StepSample& sample)
             << ",\"tensor_core\":{"
             << "\"selected_engine\":\""
             << EngineName(evidence.tensor_core.selected_engine) << "\","
-            << "\"trace_policy\":\""
-            << CudaTracePolicyKindName(evidence.tensor_core.trace_policy)
+            << "\"requested_trace_policy\":\""
+            << CudaTracePolicyKindName(
+                   evidence.tensor_core.requested_trace_policy)
+            << "\","
+            << "\"resolved_trace_policy\":\""
+            << CudaTracePolicyKindName(
+                   evidence.tensor_core.resolved_trace_policy)
             << "\","
             << "\"trace_preconditioner\":\""
             << CudaTracePreconditionerName(
@@ -1909,6 +1924,7 @@ int RunBenchmark(const Options& options)
                      options.export_interior, options.engine,
                      options.regularization == RegularizationKind::igr,
                      options.trace_policy,
+                     options.order,
                      static_cast<std::uint64_t>(krylov_restart_dimension), warmup,
                      measured_index,
                      samples[static_cast<std::size_t>(index)], error);
@@ -1964,14 +1980,16 @@ int RunBenchmark(const Options& options)
           .prepared.evidence.tensor_core;
   const bool production_selectable =
       options.trace_policy == CudaTracePolicyKind::engine_default;
-  const bool equilibrated_field_split = options.trace_policy ==
+  const CudaTracePolicyKind resolved_trace_policy =
+      reported_trace_policy.resolved_trace_policy;
+  const bool equilibrated_field_split = resolved_trace_policy ==
       CudaTracePolicyKind::
           native_element_schwarz_equilibrated_field_split_fp64 ||
-      options.trace_policy == CudaTracePolicyKind::
+      resolved_trace_policy == CudaTracePolicyKind::
           native_element_schwarz_matrix_free_equilibrated_field_split_fp64 ||
-      options.trace_policy == CudaTracePolicyKind::
+      resolved_trace_policy == CudaTracePolicyKind::
           native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
-  const bool warp_equilibrated_field_split = options.trace_policy ==
+  const bool warp_equilibrated_field_split = resolved_trace_policy ==
       CudaTracePolicyKind::
           native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
   const NativeElementSchwarzFieldSplitLayout field_split_layout =
@@ -1993,6 +2011,11 @@ int RunBenchmark(const Options& options)
             << "\","
             << "\"trace_policy\":\""
             << CudaTracePolicyKindName(options.trace_policy) << "\","
+            << "\"requested_trace_policy\":\""
+            << CudaTracePolicyKindName(
+                   reported_trace_policy.requested_trace_policy) << "\","
+            << "\"resolved_trace_policy\":\""
+            << CudaTracePolicyKindName(resolved_trace_policy) << "\","
             << "\"trace_solver\":\""
             << TraceSolverName(reported_trace_policy) << "\","
             << "\"trace_preconditioner\":\""

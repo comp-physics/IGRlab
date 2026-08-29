@@ -23,19 +23,21 @@ constexpr bool CudaPreparedIluAccountingValid(
     const int linear_iterations, const generic::CudaEngineKind engine,
     const bool igr_active) noexcept
 {
-  const auto preconditioner =
-      CudaTracePreconditionerForEngine(engine, igr_active);
+  const auto policy = ResolveCudaTracePolicy(
+      engine, igr_active, tensor.trace_policy_rank_count,
+      tensor.trace_policy_order, tensor.requested_trace_policy);
+  if (!CudaTracePolicyDescriptorIsExact(policy) ||
+      tensor.resolved_trace_policy != policy.resolved_selection)
+    return false;
+  const auto preconditioner = policy.trace_preconditioner;
   const bool ilu = CudaTracePreconditionerIsIlu(preconditioner);
-  const auto factor_reuse_policy =
-      CudaIluFactorReusePolicyForEngine(engine, igr_active);
-  const auto triangular_solve_kind =
-      CudaIluTriangularSolveKindForEngine(engine, igr_active);
-  const int lower_jacobi_iterations =
-      CudaIluLowerJacobiIterations(engine, igr_active);
-  const int upper_jacobi_iterations =
-      CudaIluUpperJacobiIterations(engine, igr_active);
+  const auto factor_reuse_policy = policy.ilu_factor_reuse_policy;
+  const auto triangular_solve_kind = policy.ilu_triangular_solve_kind;
+  const int lower_jacobi_iterations = policy.ilu_lower_jacobi_iterations;
+  const int upper_jacobi_iterations = policy.ilu_upper_jacobi_iterations;
   if (!ilu)
-    return preconditioner == CudaTracePreconditionerKind::hypre_diag_scale &&
+    return (preconditioner == CudaTracePreconditionerKind::hypre_diag_scale ||
+            CudaTracePreconditionerIsNativeElementSchwarz(preconditioner)) &&
         tensor.ilu_type == -1 && tensor.ilu_level_of_fill == -1 &&
         tensor.ilu_local_reordering == -1 &&
         tensor.ilu_application_iterations == 0 &&
@@ -138,10 +140,18 @@ struct CudaQualificationTestAccess
     const auto& evidence = engine.pending_.evidence;
     const auto& tensor = evidence.tensor_core;
     const bool igr_active = engine.numerics_.shape_.igr_active;
+    const auto trace_policy = ResolveCudaTracePolicy(
+        expected, igr_active, engine.config_.expected_rank_count,
+        engine.config_.order, CudaTracePolicyKind::engine_default);
     return tensor.selected_engine == expected &&
+        CudaTracePolicyDescriptorIsExact(trace_policy) &&
+        tensor.requested_trace_policy ==
+            CudaTracePolicyKind::engine_default &&
+        tensor.resolved_trace_policy == trace_policy.resolved_selection &&
+        tensor.trace_policy_rank_count == engine.config_.expected_rank_count &&
+        tensor.trace_policy_order == engine.config_.order &&
         tensor.trace_preconditioner_configured &&
-        tensor.trace_preconditioner ==
-            CudaTracePreconditionerForEngine(expected, igr_active) &&
+        tensor.trace_preconditioner == trace_policy.trace_preconditioner &&
         CudaPreparedIluAccountingValid(
             tensor, evidence.trace_solves, evidence.linear_iterations,
             expected, igr_active) &&

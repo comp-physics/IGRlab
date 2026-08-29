@@ -24,6 +24,15 @@ using namespace dg::hdg::runtime::cuda_w8a;
 static_assert(std::is_aggregate<CudaConfig>::value,
               "benchmark policy selection must not change CudaConfig ABI");
 
+constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
+    const dg::hdg::generic::CudaEngineKind engine, const bool igr_active,
+    const CudaTracePolicyKind requested) noexcept
+{
+  return dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+      engine, igr_active, 1, dg::hdg::generic::minimum_polynomial_order,
+      requested);
+}
+
 constexpr bool TrueResidualAuthorityPolicy() noexcept
 {
   dg::hdg::runtime::cuda_w8a::detail::CudaSolveDiagnostics diagnostics{};
@@ -1894,14 +1903,15 @@ constexpr bool IluSetupOrderPolicy() noexcept
   const CudaTracePolicyDescriptor common_fast_ordinary_igr =
       ResolveCudaTracePolicy(CudaEngineKind::ordinary, true,
                              CudaTracePolicyKind::common_fast);
+  const CudaTracePolicyDescriptor common_fast_tensor_igr =
+      ResolveCudaTracePolicy(CudaEngineKind::tensor_core, true,
+                             CudaTracePolicyKind::common_fast);
   if (!evidence.ConfigurationExactForGeneration(
-          23, CudaEngineKind::tensor_core,
-          CudaTracePreconditionerKind::hypre_ilu0, true) ||
+          23, common_fast_tensor_igr) ||
       !evidence.ConfigurationExactForGeneration(
           23, common_fast_ordinary_igr) ||
       wrong_fill.ConfigurationExactForGeneration(
-          23, CudaEngineKind::tensor_core,
-          CudaTracePreconditionerKind::hypre_ilu0, true) ||
+          23, common_fast_tensor_igr) ||
       evidence.ConfigurationExactForGeneration(
           23, CudaEngineKind::ordinary,
           CudaTracePreconditionerKind::hypre_ilu0, true) ||
@@ -1912,8 +1922,7 @@ constexpr bool IluSetupOrderPolicy() noexcept
           23, CudaEngineKind::ordinary,
           CudaTracePreconditionerKind::hypre_ilu0, false) ||
       direct.ConfigurationExactForGeneration(
-          23, CudaEngineKind::tensor_core,
-          CudaTracePreconditionerKind::hypre_ilu0, true) ||
+          23, common_fast_tensor_igr) ||
       evidence.ConfigurationExactForGeneration(
           23, CudaEngineKind::tensor_core,
           CudaTracePreconditionerKind::hypre_ilu0, false) ||
@@ -1922,15 +1931,12 @@ constexpr bool IluSetupOrderPolicy() noexcept
   auto extra_terminal = evidence;
   if (extra_terminal.Advance(CudaHypreSetupTransition::mult) ||
       extra_terminal.SolveExactForGeneration(
-          23, CudaEngineKind::tensor_core,
-          CudaTracePreconditionerKind::hypre_ilu0, true))
+          23, common_fast_tensor_igr))
     return false;
   return evidence.SolveExactForGeneration(
-             23, CudaEngineKind::tensor_core,
-             CudaTracePreconditionerKind::hypre_ilu0, true) &&
+             23, common_fast_tensor_igr) &&
       !evidence.SolveExactForGeneration(
-          24, CudaEngineKind::tensor_core,
-          CudaTracePreconditionerKind::hypre_ilu0, true);
+          24, common_fast_tensor_igr);
 }
 
 static_assert(IluSetupOrderPolicy(),
@@ -1946,6 +1952,11 @@ constexpr bool OrdinaryRankOneRefreshRoutingPolicy() noexcept
       CudaOrdinaryRankOneRefreshPolicyIsExact(
           ResolveCudaTracePolicy(
               CudaEngineKind::ordinary, true,
+              CudaTracePolicyKind::engine_default)) &&
+      !CudaOrdinaryRankOneRefreshPolicyIsExact(
+          dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+              CudaEngineKind::ordinary, true, 2,
+              dg::hdg::generic::minimum_polynomial_order,
               CudaTracePolicyKind::engine_default)) &&
       !CudaOrdinaryRankOneRefreshPolicyIsExact(
           ResolveCudaTracePolicy(
@@ -2101,6 +2112,88 @@ constexpr bool TracePreconditionerPolicy() noexcept
 static_assert(TracePreconditionerPolicy(),
               "trace preconditioner selection must be engine-and-mode exact");
 
+constexpr bool ProductionTracePolicyResolutionPolicy() noexcept
+{
+  using dg::hdg::generic::CudaEngineKind;
+  using dg::hdg::runtime::cuda_w8a::detail::CudaTraceSolverKind;
+  using dg::hdg::runtime::cuda_w8a::detail::ResolveCudaTraceSolverKind;
+  constexpr CudaTracePolicyKind warp = CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
+  for (int order = dg::hdg::generic::minimum_polynomial_order;
+       order <= dg::hdg::generic::maximum_polynomial_order; ++order)
+  {
+    const auto tensor_rank1 =
+        dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+            CudaEngineKind::tensor_core, true, 1, order,
+            CudaTracePolicyKind::engine_default);
+    if (!CudaTracePolicyDescriptorIsExact(tensor_rank1) ||
+        tensor_rank1.requested_selection !=
+            CudaTracePolicyKind::engine_default ||
+        tensor_rank1.resolved_selection != warp ||
+        tensor_rank1.rank_count != 1 ||
+        tensor_rank1.polynomial_order != order ||
+        tensor_rank1.trace_preconditioner != CudaTracePreconditionerKind::
+            native_element_schwarz_warp_equilibrated_field_split_fp64 ||
+        ResolveCudaTraceSolverKind(
+            tensor_rank1.selected_engine, tensor_rank1.rank_count, false,
+            true, true, true, tensor_rank1.resolved_selection) !=
+            CudaTraceSolverKind::native_rank1_fp64)
+      return false;
+
+    const auto tensor_rank2 =
+        dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+            CudaEngineKind::tensor_core, true, 2, order,
+            CudaTracePolicyKind::engine_default);
+    if (!CudaTracePolicyDescriptorIsExact(tensor_rank2) ||
+        tensor_rank2.requested_selection !=
+            CudaTracePolicyKind::engine_default ||
+        tensor_rank2.resolved_selection !=
+            CudaTracePolicyKind::engine_default ||
+        tensor_rank2.trace_preconditioner !=
+            CudaTracePreconditionerKind::hypre_ilu0 ||
+        ResolveCudaTraceSolverKind(
+            tensor_rank2.selected_engine, tensor_rank2.rank_count, true,
+            true, true, true, tensor_rank2.resolved_selection) !=
+            CudaTraceSolverKind::hypre_host_staged_rank2)
+      return false;
+
+    const auto rejected_rank2_explicit =
+        dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+            CudaEngineKind::tensor_core, true, 2, order, warp);
+    if (rejected_rank2_explicit.valid ||
+        CudaTracePolicyDescriptorIsExact(rejected_rank2_explicit))
+      return false;
+
+    for (const bool igr_active : {false, true})
+    {
+      for (const int ranks : {1, 2})
+      {
+        const auto ordinary =
+            dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+                CudaEngineKind::ordinary, igr_active, ranks, order,
+                CudaTracePolicyKind::engine_default);
+        if (!CudaTracePolicyDescriptorIsExact(ordinary) ||
+            ordinary.requested_selection !=
+                CudaTracePolicyKind::engine_default ||
+            ordinary.resolved_selection !=
+                CudaTracePolicyKind::engine_default ||
+            ordinary.trace_preconditioner !=
+                CudaTracePreconditionerKind::hypre_ilu0)
+          return false;
+      }
+    }
+  }
+  return !dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+              CudaEngineKind::tensor_core, true, 0, 1,
+              CudaTracePolicyKind::engine_default).valid &&
+      !dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+              CudaEngineKind::tensor_core, true, 1, 4,
+              CudaTracePolicyKind::engine_default).valid;
+}
+
+static_assert(ProductionTracePolicyResolutionPolicy(),
+              "production trace-policy resolution must be exact and closed");
+
 constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
 {
   using dg::hdg::generic::CudaEngineKind;
@@ -2213,13 +2306,19 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       tensor_conventional_default.ilu_factor_reuse_policy ==
           CudaIluFactorReusePolicy::not_applicable &&
       CudaTracePolicyDescriptorIsExact(tensor_igr_default) &&
-      tensor_igr_default.ilu_local_reordering == 1 &&
+      tensor_igr_default.requested_selection ==
+          CudaTracePolicyKind::engine_default &&
+      tensor_igr_default.resolved_selection == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64 &&
+      tensor_igr_default.trace_preconditioner == CudaTracePreconditionerKind::
+          native_element_schwarz_warp_equilibrated_field_split_fp64 &&
+      tensor_igr_default.ilu_local_reordering == -1 &&
       tensor_igr_default.ilu_triangular_solve_kind ==
-          CudaIluTriangularSolveKind::iterative_jacobi &&
-      tensor_igr_default.ilu_lower_jacobi_iterations == 5 &&
-      tensor_igr_default.ilu_upper_jacobi_iterations == 5 &&
+          CudaIluTriangularSolveKind::not_applicable &&
+      tensor_igr_default.ilu_lower_jacobi_iterations == 0 &&
+      tensor_igr_default.ilu_upper_jacobi_iterations == 0 &&
       tensor_igr_default.ilu_factor_reuse_policy ==
-          CudaIluFactorReusePolicy::first_trace_solve_per_attempt &&
+          CudaIluFactorReusePolicy::not_applicable &&
       CudaTracePolicyDescriptorIsExact(ordinary_conventional_common) &&
       CudaTracePolicyDescriptorIsExact(tensor_conventional_common) &&
       ordinary_conventional_common.trace_preconditioner ==
@@ -2285,7 +2384,7 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       tensor_igr_matrix_free.trace_preconditioner ==
           CudaTracePreconditionerKind::native_element_schwarz_fp64 &&
       CudaTracePolicyUsesNativeElementMatrixFreeOperator(
-          tensor_igr_matrix_free.selection) &&
+          tensor_igr_matrix_free.resolved_selection) &&
       !tensor_conventional_matrix_free.valid &&
       !CudaTracePolicyDescriptorIsExact(tensor_conventional_matrix_free) &&
       !ordinary_igr_matrix_free.valid &&
@@ -2298,7 +2397,7 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       tensor_igr_field_split.ilu_factor_reuse_policy ==
           CudaIluFactorReusePolicy::not_applicable &&
       !CudaTracePolicyUsesNativeElementMatrixFreeOperator(
-          tensor_igr_field_split.selection) &&
+          tensor_igr_field_split.resolved_selection) &&
       !tensor_conventional_field_split.valid &&
       !CudaTracePolicyDescriptorIsExact(tensor_conventional_field_split) &&
       !ordinary_igr_field_split.valid &&
@@ -2308,11 +2407,11 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
           CudaTracePreconditionerKind::
               native_element_schwarz_equilibrated_field_split_fp64 &&
       CudaTracePolicyUsesNativeElementMatrixFreeOperator(
-          tensor_igr_combined.selection) &&
+          tensor_igr_combined.resolved_selection) &&
       CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
-          tensor_igr_combined.selection) &&
+          tensor_igr_combined.resolved_selection) &&
       !CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
-          tensor_igr_matrix_free.selection) &&
+          tensor_igr_matrix_free.resolved_selection) &&
       !tensor_conventional_combined.valid &&
       !CudaTracePolicyDescriptorIsExact(tensor_conventional_combined) &&
       !ordinary_igr_combined.valid &&
@@ -2322,13 +2421,13 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
           CudaTracePreconditionerKind::
               native_element_schwarz_warp_equilibrated_field_split_fp64 &&
       CudaTracePolicyUsesNativeElementMatrixFreeOperator(
-          tensor_igr_warp.selection) &&
+          tensor_igr_warp.resolved_selection) &&
       CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
-          tensor_igr_warp.selection) &&
+          tensor_igr_warp.resolved_selection) &&
       CudaTracePolicyUsesNativeElementMatrixFreeWarpEquilibratedFieldSplit(
-          tensor_igr_warp.selection) &&
+          tensor_igr_warp.resolved_selection) &&
       !CudaTracePolicyUsesNativeElementMatrixFreeWarpEquilibratedFieldSplit(
-          tensor_igr_combined.selection) &&
+          tensor_igr_combined.resolved_selection) &&
       !tensor_conventional_warp.valid &&
       !CudaTracePolicyDescriptorIsExact(tensor_conventional_warp) &&
       !ordinary_igr_warp.valid &&
@@ -2520,6 +2619,12 @@ constexpr bool IluWorkAccumulationPolicy() noexcept
 
   CudaTensorCoreEvidence diagonal_evidence{};
   diagonal_evidence.selected_engine = CudaEngineKind::tensor_core;
+  diagonal_evidence.requested_trace_policy =
+      CudaTracePolicyKind::engine_default;
+  diagonal_evidence.resolved_trace_policy =
+      CudaTracePolicyKind::engine_default;
+  diagonal_evidence.trace_policy_rank_count = 1;
+  diagonal_evidence.trace_policy_order = 1;
   if (!CudaInitializeIluEvidence(
           diagonal_evidence,
           CudaTracePreconditionerKind::hypre_diag_scale, false) ||
@@ -2539,7 +2644,12 @@ constexpr bool IluWorkAccumulationPolicy() noexcept
 
   CudaTensorCoreEvidence common_diagonal_evidence{};
   common_diagonal_evidence.selected_engine = CudaEngineKind::ordinary;
-  common_diagonal_evidence.trace_policy = CudaTracePolicyKind::common_fast;
+  common_diagonal_evidence.requested_trace_policy =
+      CudaTracePolicyKind::common_fast;
+  common_diagonal_evidence.resolved_trace_policy =
+      CudaTracePolicyKind::common_fast;
+  common_diagonal_evidence.trace_policy_rank_count = 1;
+  common_diagonal_evidence.trace_policy_order = 1;
   if (!CudaInitializeIluEvidence(
           common_diagonal_evidence,
           CudaTracePreconditionerKind::hypre_diag_scale, false) ||
@@ -2550,6 +2660,12 @@ constexpr bool IluWorkAccumulationPolicy() noexcept
 
   CudaTensorCoreEvidence ordinary_evidence{};
   ordinary_evidence.selected_engine = CudaEngineKind::ordinary;
+  ordinary_evidence.requested_trace_policy =
+      CudaTracePolicyKind::engine_default;
+  ordinary_evidence.resolved_trace_policy =
+      CudaTracePolicyKind::engine_default;
+  ordinary_evidence.trace_policy_rank_count = 1;
+  ordinary_evidence.trace_policy_order = 1;
   if (!CudaInitializeIluEvidence(
           ordinary_evidence,
           CudaTracePreconditionerKind::hypre_ilu0, false))
@@ -2580,6 +2696,12 @@ constexpr bool IluWorkAccumulationPolicy() noexcept
 
   CudaTensorCoreEvidence tensor_igr_evidence{};
   tensor_igr_evidence.selected_engine = CudaEngineKind::tensor_core;
+  tensor_igr_evidence.requested_trace_policy =
+      CudaTracePolicyKind::common_fast;
+  tensor_igr_evidence.resolved_trace_policy =
+      CudaTracePolicyKind::common_fast;
+  tensor_igr_evidence.trace_policy_rank_count = 1;
+  tensor_igr_evidence.trace_policy_order = 1;
   if (!CudaInitializeIluEvidence(
           tensor_igr_evidence,
           CudaTracePreconditionerKind::hypre_ilu0, true))
@@ -2614,8 +2736,12 @@ constexpr bool IluWorkAccumulationPolicy() noexcept
 
   CudaTensorCoreEvidence common_ordinary_igr_evidence{};
   common_ordinary_igr_evidence.selected_engine = CudaEngineKind::ordinary;
-  common_ordinary_igr_evidence.trace_policy =
+  common_ordinary_igr_evidence.requested_trace_policy =
       CudaTracePolicyKind::common_fast;
+  common_ordinary_igr_evidence.resolved_trace_policy =
+      CudaTracePolicyKind::common_fast;
+  common_ordinary_igr_evidence.trace_policy_rank_count = 1;
+  common_ordinary_igr_evidence.trace_policy_order = 1;
   if (!CudaInitializeIluEvidence(
           common_ordinary_igr_evidence,
       CudaTracePreconditionerKind::hypre_ilu0, true) ||
@@ -2636,6 +2762,12 @@ constexpr bool IluWorkAccumulationPolicy() noexcept
 
   CudaTensorCoreEvidence incomplete_evidence{};
   incomplete_evidence.selected_engine = CudaEngineKind::tensor_core;
+  incomplete_evidence.requested_trace_policy =
+      CudaTracePolicyKind::common_fast;
+  incomplete_evidence.resolved_trace_policy =
+      CudaTracePolicyKind::common_fast;
+  incomplete_evidence.trace_policy_rank_count = 1;
+  incomplete_evidence.trace_policy_order = 1;
   if (!CudaInitializeIluEvidence(
           incomplete_evidence,
           CudaTracePreconditionerKind::hypre_ilu0, true))
@@ -2675,6 +2807,12 @@ constexpr bool IluWorkAccumulationPolicy() noexcept
 
   CudaTensorCoreEvidence hard_failure_evidence{};
   hard_failure_evidence.selected_engine = CudaEngineKind::tensor_core;
+  hard_failure_evidence.requested_trace_policy =
+      CudaTracePolicyKind::common_fast;
+  hard_failure_evidence.resolved_trace_policy =
+      CudaTracePolicyKind::common_fast;
+  hard_failure_evidence.trace_policy_rank_count = 1;
+  hard_failure_evidence.trace_policy_order = 1;
   if (!CudaInitializeIluEvidence(
           hard_failure_evidence,
           CudaTracePreconditionerKind::hypre_ilu0, true) ||

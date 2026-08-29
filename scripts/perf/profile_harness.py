@@ -1257,6 +1257,11 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
     expected_mesh_n = int(application_argument(args, "--mesh-n"))
     expected_periods = int(application_argument(args, "--domain-periods"))
     expected_timestep = float(application_argument(args, "--dt"))
+    expected_resolved_trace_policy = (
+        "native-element-schwarz-matrix-free-warp-"
+        "equilibrated-field-split-fp64"
+        if expected_mode == "igr" else PRODUCTION_TRACE_POLICY
+    )
     exact_record = (
         record.get("schema") == 2 and record.get("success") is True and
         record.get("variant") == "production" and
@@ -1264,6 +1269,9 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         record.get("backend") == "cuda" and
         record.get("cuda_engine") == "tensor" and
         record.get("trace_policy") == PRODUCTION_TRACE_POLICY and
+        record.get("requested_trace_policy") == PRODUCTION_TRACE_POLICY and
+        record.get("resolved_trace_policy") ==
+            expected_resolved_trace_policy and
         record.get("mode") == expected_mode and
         record.get("polynomial_order") == expected_order and
         record.get("mesh_n") == expected_mesh_n and
@@ -1319,6 +1327,9 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         )
     if not (
         tensor.get("selected_engine") == "tensor" and
+        tensor.get("requested_trace_policy") == PRODUCTION_TRACE_POLICY and
+        tensor.get("resolved_trace_policy") ==
+            expected_resolved_trace_policy and
         tensor.get("hardware_supported") is True and
         tensor.get("fallback_count") == 0 and
         tensor.get("fallback_accounting_complete") is True and

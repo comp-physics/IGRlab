@@ -181,10 +181,12 @@ bool CudaPreparedTracePolicyValid(
     const CudaTensorCoreEvidence& tensor, const int trace_solves,
     const int linear_iterations, const int linear_solve_attempts,
     const generic::CudaEngineKind engine, const bool igr_active,
-    const CudaTracePolicyKind trace_policy) noexcept
+    const int rank_count, const int polynomial_order,
+    const CudaTracePolicyKind requested_trace_policy) noexcept
 {
   const CudaTracePolicyDescriptor expected = ResolveCudaTracePolicy(
-      engine, igr_active, trace_policy);
+      engine, igr_active, rank_count, polynomial_order,
+      requested_trace_policy);
   if (!CudaTracePolicyDescriptorIsExact(expected) || trace_solves <= 0 ||
       linear_iterations < 0 || linear_solve_attempts < trace_solves ||
       !CudaPreparedIluAccountingValid(
@@ -195,20 +197,23 @@ bool CudaPreparedTracePolicyValid(
   const std::uint64_t solves = static_cast<std::uint64_t>(trace_solves);
   const std::uint64_t attempts =
       static_cast<std::uint64_t>(linear_solve_attempts);
+  const CudaTracePolicyKind resolved_trace_policy =
+      expected.resolved_selection;
   const bool expected_mgr =
-      trace_policy == CudaTracePolicyKind::equilibrated_mgr;
+      resolved_trace_policy == CudaTracePolicyKind::equilibrated_mgr;
   const bool expected_matrix_free =
-      CudaTracePolicyUsesNativeElementMatrixFreeOperator(trace_policy);
-  const bool expected_element_schwarz = trace_policy ==
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          resolved_trace_policy);
+  const bool expected_element_schwarz = resolved_trace_policy ==
           CudaTracePolicyKind::native_element_schwarz_fp64 ||
-      expected_matrix_free || trace_policy == CudaTracePolicyKind::
+      expected_matrix_free || resolved_trace_policy == CudaTracePolicyKind::
           native_element_schwarz_equilibrated_field_split_fp64;
-  const bool expected_equilibrated_field_split = trace_policy ==
+  const bool expected_equilibrated_field_split = resolved_trace_policy ==
           CudaTracePolicyKind::
               native_element_schwarz_equilibrated_field_split_fp64 ||
-      trace_policy == CudaTracePolicyKind::
+      resolved_trace_policy == CudaTracePolicyKind::
           native_element_schwarz_matrix_free_equilibrated_field_split_fp64 ||
-      trace_policy == CudaTracePolicyKind::
+      resolved_trace_policy == CudaTracePolicyKind::
           native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
   const bool expected_native_solver =
       engine == generic::CudaEngineKind::tensor_core && !expected_mgr;
@@ -270,7 +275,10 @@ bool CudaPreparedTracePolicyValid(
       : !tensor.native_matrix_free_trace_operator_configured &&
             tensor.native_matrix_free_trace_operator_applications == 0;
   return tensor.selected_engine == engine &&
-      tensor.trace_policy == trace_policy &&
+      tensor.requested_trace_policy == requested_trace_policy &&
+      tensor.resolved_trace_policy == resolved_trace_policy &&
+      tensor.trace_policy_rank_count == rank_count &&
+      tensor.trace_policy_order == polynomial_order &&
       tensor.trace_preconditioner_configured &&
       tensor.trace_preconditioner == expected.trace_preconditioner &&
       mgr_work && element_schwarz_work && matrix_free_work &&
@@ -1219,6 +1227,7 @@ Trajectory RunCuda(const EulerHdgRequest& request,
                 health.linear_iterations, health.linear_solve_attempts,
                 request.backend.cuda_engine,
                 specification.regularization == RegularizationKind::igr,
+                1, request.polynomial_order,
                 trace_policy) &&
         health.tensor_core.fallback_count == 0 && health.no_fallback &&
         health.tensor_volume_evidence_valid &&
@@ -1532,6 +1541,7 @@ bool ValidAlignmentSelection(
   const auto tensor_igr_trace =
       dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
           CudaEngineKind::tensor_core, true,
+          1, selection.order,
           selection.tensor_igr_trace_policy);
   return dg::hdg::generic::ValidEulerHdgNumericalPolicy(conventional) &&
       dg::hdg::generic::ValidEulerHdgNumericalPolicy(igr) &&
@@ -1663,6 +1673,10 @@ int main(int argc, char* argv[])
   {
     const EulerHdgNumericalPolicy igr = SelectedNumericalPolicy(
         selection, RegularizationKind::igr);
+    const auto tensor_igr_trace =
+        dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+            CudaEngineKind::tensor_core, true, 1, order,
+            selection.tensor_igr_trace_policy);
     std::cout << "HDG numerical-alignment option validation passed order="
               << order << " igr_quadrature="
               << igr.igr_assembly_quadrature_orders.volume_order << '/'
@@ -1671,9 +1685,16 @@ int main(int argc, char* argv[])
               << igr.newton_correction_linear_relative_tolerance << '/'
               << igr.final_coherent_linear_relative_tolerance << '/'
               << igr.true_residual_tightening_linear_relative_tolerance
-              << " tensor_igr_trace_policy="
+              << " tensor_igr_trace_policy_requested="
               << CudaTracePolicyKindName(
-                     selection.tensor_igr_trace_policy) << '\n';
+                     tensor_igr_trace.requested_selection)
+              << " tensor_igr_trace_policy_resolved="
+              << CudaTracePolicyKindName(
+                     tensor_igr_trace.resolved_selection)
+              << " trace_policy_rank_count="
+              << tensor_igr_trace.rank_count
+              << " trace_policy_order="
+              << tensor_igr_trace.polynomial_order << '\n';
     return 0;
   }
   constexpr std::size_t case_count = 6;
@@ -1794,6 +1815,10 @@ int main(int argc, char* argv[])
   {
     const EulerHdgNumericalPolicy igr = SelectedNumericalPolicy(
         selection, RegularizationKind::igr);
+    const auto tensor_igr_trace =
+        dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+            CudaEngineKind::tensor_core, true, 1, order,
+            selection.tensor_igr_trace_policy);
     std::cout << "HDG CPU/ordinary-CUDA/tensor-CUDA numerical alignment and "
                  "IGR discontinuity qualification passed order="
               << order << " igr_quadrature="
@@ -1803,9 +1828,16 @@ int main(int argc, char* argv[])
               << igr.newton_correction_linear_relative_tolerance << '/'
               << igr.final_coherent_linear_relative_tolerance << '/'
               << igr.true_residual_tightening_linear_relative_tolerance
-              << " tensor_igr_trace_policy="
+              << " tensor_igr_trace_policy_requested="
               << CudaTracePolicyKindName(
-                     selection.tensor_igr_trace_policy) << '\n';
+                     tensor_igr_trace.requested_selection)
+              << " tensor_igr_trace_policy_resolved="
+              << CudaTracePolicyKindName(
+                     tensor_igr_trace.resolved_selection)
+              << " trace_policy_rank_count="
+              << tensor_igr_trace.rank_count
+              << " trace_policy_order="
+              << tensor_igr_trace.polynomial_order << '\n';
   }
   return passed ? 0 : 1;
 }

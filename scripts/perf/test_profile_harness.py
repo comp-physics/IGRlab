@@ -240,6 +240,18 @@ else:
     interior_unknowns = 75712 if p1_igr else 302848
     condensation_tiles_per_launch = 889616 if p1_igr else 22827168
     volume_tiles_per_assembly = 2952768 if p1_igr else 22145760
+    resolved_trace_policy = (
+        "native-element-schwarz-matrix-free-warp-"
+        "equilibrated-field-split-fp64"
+    )
+    top_level_resolved_trace_policy = (
+        "engine-default" if os.environ.get("FAKE_APP_BAD_TOP_RESOLVED")
+        else resolved_trace_policy
+    )
+    sample_resolved_trace_policy = (
+        "engine-default" if os.environ.get("FAKE_APP_BAD_SAMPLE_RESOLVED")
+        else resolved_trace_policy
+    )
     print(json.dumps({
         "schema": 2,
         "benchmark": "dg_igr_hdg_cuda_accepted_step",
@@ -249,6 +261,8 @@ else:
         "backend": "cuda",
         "cuda_engine": "tensor",
         "trace_policy": "engine-default",
+        "requested_trace_policy": "engine-default",
+        "resolved_trace_policy": top_level_resolved_trace_policy,
         "mode": "igr",
         "rank_count": 1,
         "polynomial_order": order,
@@ -269,6 +283,8 @@ else:
             "measured_index": 2,
             "tensor_core": {
                 "selected_engine": "tensor",
+                "requested_trace_policy": "engine-default",
+                "resolved_trace_policy": sample_resolved_trace_policy,
                 "hardware_supported": True,
                 "volume_assembly_launches": volume_launches,
                 "volume_mma_tiles": volume_tiles_per_assembly * volume_launches,
@@ -334,6 +350,8 @@ else:
         "backend": "cuda",
         "cuda_engine": "tensor",
         "trace_policy": "engine-default",
+        "requested_trace_policy": "engine-default",
+        "resolved_trace_policy": "engine-default",
         "mode": "conventional",
         "rank_count": 1,
         "polynomial_order": 2,
@@ -354,6 +372,8 @@ else:
             "measured_index": 2,
             "tensor_core": {
                 "selected_engine": "tensor",
+                "requested_trace_policy": "engine-default",
+                "resolved_trace_policy": "engine-default",
                 "hardware_supported": True,
                 "volume_assembly_launches": 3,
                 "volume_mma_tiles": 3893760,
@@ -494,6 +514,24 @@ else:
         assert proof_artifact["generating_command"][-2:] == [
             "--print-units", "base",
         ]
+
+        for suffix, environment, expected_detail in (
+            (
+                "bad-top-resolved", "FAKE_APP_BAD_TOP_RESOLVED",
+                "does not match the qualified production tensor",
+            ),
+            (
+                "bad-sample-resolved", "FAKE_APP_BAD_SAMPLE_RESOLVED",
+                "does not prove an admitted no-fallback tensor engine",
+            ),
+        ):
+            rejected_out = root / f"qualification-{suffix}"
+            run(
+                *qualification_arguments(rejected_out), expected=6,
+                env={**qualification_env, environment: "1"},
+            )
+            assert expected_detail in \
+                read_manifest(rejected_out)["detail"]
 
         volume_qualification_out = root / "qualification-volume"
         run(
