@@ -96,8 +96,11 @@ retained sigmahat field, and converts the solution back to the physical trace
 before the unchanged FP64 original-system true-residual gate. It is invalid
 for ordinary CUDA, conventional mode, and rank two. Its fixed MGR tuple uses
 one explicitly owned ILU0 F-relaxation application with zero tolerance and
-direct triangular solves, CPR-like restriction, Jacobi interpolation, and one
-BoomerAMG coarse application. The F factor is refreshed by every current-
+direct triangular solves, injection restriction, Jacobi interpolation, and
+one BoomerAMG coarse application. Injection is required by the selected
+non-Galerkin HYPRE coarse-grid method and is the supported CUDA path; the
+original CPR-like restriction request fails explicitly on the pinned HYPRE
+GPU backend. The F factor is refreshed by every current-
 generation MGR setup. A one-shot tighter true-residual retry retunes only the
 outer FlexGMRES tolerance and reuses that exact scaled matrix, retained scaled
 right-hand side, MGR hierarchy, and F factor; no HYPRE tolerance-driven inner
@@ -106,6 +109,18 @@ There is no ordinary-CUDA fallback, Schwarz level, mixed precision, or
 adaptive policy in this baseline. Setup/application counts and scale extrema
 are constant-size aggregates; no iteration history or event stream is
 retained.
+
+The first representative mesh-52 p1 accepted-step probe ruled this full-HYPRE
+MGR realization out as a production candidate. Both trace solves satisfied
+their FP64 original-system residual checks (the final relative residual was
+`3.59e-13`), but two new opaque HYPRE pool allocations occurred inside the
+step, so the unchanged persistence telemetry gate rejected the attempt. The
+failed warmup took approximately 60 seconds, compared with approximately
+0.20 seconds for the retained native tensor-IGR path. No gate was relaxed and
+no speedup is claimed. The useful result is architectural: retain the
+Uhat/sigma field split, but implement fine-grid preconditioning natively from
+the element Schur blocks rather than putting the recurring full trace solve
+under HYPRE MGR.
 
 The benchmark emits the selected policy at top level and in every bounded
 sample. The driver validates every preconditioner, ILU, triangular-solve,
@@ -118,8 +133,9 @@ it disagrees with the explicit trace-policy selection, so attribution records
 cannot be mistaken for production-engine evidence.
 The record also names the configured rank-one trace solver, and every sample
 contains fixed scalar native/HYPRE solve-call counts. The validator requires
-ordinary CUDA calls to be entirely HYPRE and tensor CUDA calls to be entirely
-native; neither path can borrow the other's recurring solve work unnoticed.
+ordinary CUDA calls to be entirely HYPRE, production tensor CUDA calls to be
+entirely native, and the explicit tensor MGR ablation to be entirely HYPRE;
+no policy can borrow another policy's recurring solve work unnoticed.
 The same fixed fields and their aggregate totals are retained in the bounded
 campaign manifest, so promotion disposition does not depend on reopening raw
 samples to establish solver routing.
