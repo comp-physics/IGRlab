@@ -3973,8 +3973,7 @@ public:
                        result.tensor_core.equilibration_passes ==
                            completed_trace_solves *
                                static_cast<std::uint64_t>(
-                                   native_element_schwarz_
-                                       equilibration_passes) &&
+                                   native_element_schwarz_equilibration_passes) &&
                        result.tensor_core.mgr_setup_calls == 0 &&
                        result.tensor_core.
                                mgr_preconditioner_applications == 0 &&
