@@ -816,6 +816,44 @@ noise on representative conventional and IGR workloads. All six p/mode cells
 remain reportable even when some are below break-even. Ordinary CUDA remains
 the default regardless of selected tensor wins.
 
+### IGR cost-reduction follow-on
+
+The retained tensor backend made the IGR path much faster than ordinary CUDA,
+but IGR still costs 12.6--14.0 times more per accepted step than conventional
+tensor CUDA on the same mesh-52 p1--p3 controls. Trace width grows by only
+1.25 times (`Uhat4` to `Uhat5`); the material difference is Krylov work. The
+representative IGR steps require 167, 181, and 199 aggregate iterations at
+p1, p2, and p3, while conventional requires 9--14. The p3 profile attributes
+about 80 percent of accepted-step GPU kernel duration to the trace solve.
+
+Two bounded changes are retained before changing the preconditioner. First,
+IGR volume and face quadrature are independently typed. The qualified p1--p3
+candidate schedule is `(6,4)`, `(8,6)`, and `(10,8)` rather than the historical
+`(12,12)`. Direct four-step active-IGR comparisons against q12/q12 remain below
+`7.08e-10` in L2 and `6.06e-9` in Linf, with FP64 true residual below
+`9.36e-13` and conservation below `1.15e-15`. Paired accepted-step speedups are
+approximately 1.03, 1.10, and 1.11 times. The q12 control remains available;
+no conventional quadrature policy changes.
+
+Second, Newton-correction and final-coherent linear tolerances are separate.
+Keeping the final solve and strict true-residual retry at `1e-12` while using
+`1e-10` for Newton corrections yields p1--p3 speedups of 1.085, 1.085, and
+1.049 with zero tightenings. A p3 `1e-9` correction request triggered a strict
+retry on every measured step and was 20.8 percent slower than `1e-10`.
+Because these representative steps take one Newton update and the final
+coherent solve carries 63.5--65.8 percent of all iterations, an adaptive
+forcing rule capped by the unchanged `1e-10` per-solve FP64 gate cannot improve
+this workload. The fixed `1e-10` correction policy is therefore the measured
+safe envelope; the acceptance gates are unchanged.
+
+An explicit HDG route is not part of this campaign. With Euler state fixed,
+the IGR auxiliary problem reduces to a scalar screened-Poisson trace solve, so
+an explicit stage could eliminate Newton/Armijo and the globally coupled four
+Euler trace fields. It would still require that scalar elliptic solve at every
+Runge--Kutta stage, plus an IGR-aware stability bound. This structure instead
+motivates the exact-Backward-Euler native field split and overlapping Schwarz
+work; it is not evidence for a new production integrator.
+
 ### Interpretation limits
 
 - Tensor instructions accelerate the fused local-algebra/condensation kernel
