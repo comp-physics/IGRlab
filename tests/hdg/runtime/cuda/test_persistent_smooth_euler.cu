@@ -33,6 +33,39 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
       requested);
 }
 
+constexpr bool NativeTraceCooperativeSpecializationPolicy() noexcept
+{
+  using dg::hdg::runtime::cuda_w8a::detail::
+      CudaNativeTraceCooperativeSupport;
+  using dg::hdg::runtime::cuda_w8a::detail::
+      CudaNativeTraceCooperativeSupportMatchesPreconditioner;
+  CudaNativeTraceCooperativeSupport legacy{};
+  legacy.fixed_sigma_jacobi = false;
+  CudaNativeTraceCooperativeSupport fixed{};
+  fixed.fixed_sigma_jacobi = true;
+  return
+      CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+          legacy,
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_equilibrated_field_split_fp64) &&
+      !CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+          legacy,
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64) &&
+      CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+          fixed,
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64) &&
+      !CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+          fixed,
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_equilibrated_field_split_fp64);
+}
+
+static_assert(NativeTraceCooperativeSpecializationPolicy(),
+              "native trace launch support must match the exact fixed-sigma "
+              "kernel specialization");
+
 constexpr bool TrueResidualAuthorityPolicy() noexcept
 {
   dg::hdg::runtime::cuda_w8a::detail::CudaSolveDiagnostics diagnostics{};
@@ -265,6 +298,26 @@ constexpr bool TraceSolverSelectionPolicy() noexcept
           CudaEngineKind::tensor_core, 2, true, true, true, true,
           CudaTracePolicyKind::
               native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64) ==
+          CudaTraceSolverKind::unconfigured &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 1, false, true, true, true,
+          CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi3_fp64) ==
+          CudaTraceSolverKind::native_rank1_fp64 &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 2, true, true, true, true,
+          CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi3_fp64) ==
+          CudaTraceSolverKind::unconfigured &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 1, false, true, true, true,
+          CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi3_fp64) ==
+          CudaTraceSolverKind::native_rank1_fp64 &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 2, true, true, true, true,
+          CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi3_fp64) ==
           CudaTraceSolverKind::unconfigured;
 }
 
@@ -1062,7 +1115,7 @@ bool RunNativeSolveFixture(const NativeSolveFixture& fixture,
 
   const NativeTraceCooperativeSupport support =
       QueryNativeRankOneTraceCooperativeSupport(
-          rows, fixture.policy.krylov_dimension, fixture.igr);
+          rows, fixture.policy.krylov_dimension, fixture.igr, false);
   if (!support.supported || support.cooperative_blocks <= 0) return false;
   const NativeTraceWorkspaceRequirements requirements =
       QueryNativeTraceWorkspaceRequirements(
@@ -1237,7 +1290,7 @@ bool NativeElementSchwarzDeviceFixtureForOrder(const int order)
   policy.relative_tolerance = 1.0e-12;
   const NativeTraceCooperativeSupport support =
       QueryNativeRankOneTraceCooperativeSupport(
-          rows, policy.krylov_dimension, true);
+          rows, policy.krylov_dimension, true, false);
   const NativeTraceWorkspaceRequirements requirements =
       QueryNativeTraceWorkspaceRequirements(
           rows, policy.krylov_dimension, support.cooperative_blocks, true);
@@ -1500,6 +1553,469 @@ bool NativeElementSchwarzDeviceFixture()
   return true;
 }
 
+bool NativeFixedSigmaJacobiOrderFixture(const int order,
+                                        const bool cooperative_warp)
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  if (order < 1 || order > 3) return false;
+  const CudaTracePreconditionerKind setup_preconditioner = cooperative_warp
+      ? CudaTracePreconditionerKind::
+            native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64
+      : CudaTracePreconditionerKind::
+            native_element_schwarz_equilibrated_field_split_sigma_jacobi3_fp64;
+  const NativeTracePreconditionerKind native_preconditioner = cooperative_warp
+      ? NativeTracePreconditionerKind::
+            element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64
+      : NativeTracePreconditionerKind::
+            element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64;
+  const NativeTraceOperatorKind native_operator = cooperative_warp
+      ? NativeTraceOperatorKind::
+            element_matrix_free_warp_equilibrated_field_split_fp64
+      : NativeTraceOperatorKind::
+            element_matrix_free_equilibrated_field_split_fp64;
+  const int scalar_face_rows = order + 1;
+  const int patch_rows = 20 * scalar_face_rows;
+  const int face_rows = 5 * scalar_face_rows;
+  const int shared_rows = face_rows;
+  const int true_rows = 2 * patch_rows - shared_rows;
+  constexpr int elements = 2;
+  const int patch_entries = patch_rows * patch_rows;
+  const int element_slots = elements * patch_rows;
+
+  const auto is_sigma_row = [scalar_face_rows](const int row)
+  {
+    return (row % (5 * scalar_face_rows)) / scalar_face_rows == 4;
+  };
+  const auto paired_euler_row = [scalar_face_rows](const int sigma_row)
+  {
+    const int face_rows = 5 * scalar_face_rows;
+    const int face = sigma_row / face_rows;
+    const int scalar = sigma_row % scalar_face_rows;
+    return ((face + 1) % 4) * face_rows + scalar;
+  };
+  const auto diagonal_value = [face_rows](const int row)
+  {
+    return 1.25 + 0.005 * static_cast<double>(row % face_rows);
+  };
+  const auto coupling_value = [scalar_face_rows](const int sigma_row)
+  {
+    return 0.125 + 0.01 *
+        static_cast<double>(sigma_row % scalar_face_rows);
+  };
+
+  // Two elements share one complete face. Each scalar sigma row couples to
+  // an Euler row on the next local face, so a shared sigma row sees distinct
+  // Euler neighbors from the two patches. No individual principal patch is
+  // the global inverse and all three global sigma corrections are nonzero.
+  // Element zero uses negative trace orientation, so reconstructing the true
+  // RHS from its first incidence also requires the retained sign.
+  std::vector<double> element_schur(
+      static_cast<std::size_t>(elements) * patch_entries, 0.0);
+  for (int element = 0; element < elements; ++element)
+  {
+    double* const schur = element_schur.data() +
+        static_cast<std::size_t>(element) * patch_entries;
+    for (int row = 0; row < patch_rows; ++row)
+    {
+      schur[static_cast<std::size_t>(row) * patch_rows + row] =
+          diagonal_value(row);
+      if (is_sigma_row(row))
+        schur[static_cast<std::size_t>(row) * patch_rows +
+              paired_euler_row(row)] = coupling_value(row);
+    }
+  }
+
+  std::vector<int> true_dof(static_cast<std::size_t>(element_slots));
+  std::vector<int> signed_dofs(static_cast<std::size_t>(element_slots));
+  for (int row = 0; row < patch_rows; ++row)
+  {
+    true_dof[static_cast<std::size_t>(row)] = row;
+    signed_dofs[static_cast<std::size_t>(row)] = -1 - row;
+    const int second_truth = row < shared_rows
+        ? 3 * face_rows + row
+        : patch_rows + row - shared_rows;
+    true_dof[static_cast<std::size_t>(patch_rows + row)] = second_truth;
+    signed_dofs[static_cast<std::size_t>(patch_rows + row)] = second_truth;
+  }
+
+  std::vector<double> right_hand_side(
+      static_cast<std::size_t>(true_rows));
+  for (int row = 0; row < true_rows; ++row)
+    right_hand_side[static_cast<std::size_t>(row)] =
+        0.75 + 0.01 * static_cast<double>(row);
+
+  std::vector<int> incidence(
+      2 * static_cast<std::size_t>(true_rows), -1);
+  std::vector<int> sigma_class(static_cast<std::size_t>(true_rows), -1);
+  for (int slot = 0; slot < element_slots; ++slot)
+  {
+    const int truth = true_dof[static_cast<std::size_t>(slot)];
+    int* const row_incidence = incidence.data() + 2 * truth;
+    if (row_incidence[0] < 0)
+      row_incidence[0] = slot;
+    else if (row_incidence[1] < 0)
+      row_incidence[1] = slot;
+    else
+      return false;
+    const int local_sigma = is_sigma_row(slot % patch_rows) ? 1 : 0;
+    if (sigma_class[static_cast<std::size_t>(truth)] >= 0 &&
+        sigma_class[static_cast<std::size_t>(truth)] != local_sigma)
+      return false;
+    sigma_class[static_cast<std::size_t>(truth)] = local_sigma;
+  }
+
+  std::vector<int> local_for_truth(
+      static_cast<std::size_t>(elements) * true_rows, -1);
+  for (int slot = 0; slot < element_slots; ++slot)
+    local_for_truth[static_cast<std::size_t>(slot / patch_rows) * true_rows +
+                    true_dof[static_cast<std::size_t>(slot)]] =
+        slot % patch_rows;
+
+  std::vector<double> global_matrix(
+      static_cast<std::size_t>(true_rows) * true_rows, 0.0);
+  for (int element = 0; element < elements; ++element)
+    for (int row = 0; row < patch_rows; ++row)
+      for (int column = 0; column < patch_rows; ++column)
+      {
+        const int true_row = true_dof[
+            static_cast<std::size_t>(element) * patch_rows + row];
+        const int true_column = true_dof[
+            static_cast<std::size_t>(element) * patch_rows + column];
+        // Both orientations are uniform within their element, so the signed
+        // row/column product is positive for this deliberately simple map.
+        global_matrix[static_cast<std::size_t>(true_row) * true_rows +
+                      true_column] += element_schur[
+            static_cast<std::size_t>(element) * patch_entries +
+            static_cast<std::size_t>(row) * patch_rows + column];
+      }
+  const NativeCsrFixture matrix =
+      DenseToDiagonalFirstCsr(global_matrix, true_rows);
+  if (!NativeCsrFixtureIsValid(matrix)) return false;
+
+  std::vector<int> first_sources(
+      static_cast<std::size_t>(elements) * patch_entries);
+  std::vector<int> second_sources(first_sources.size(), -1);
+  for (int target_element = 0; target_element < elements; ++target_element)
+    for (int row = 0; row < patch_rows; ++row)
+      for (int column = 0; column < patch_rows; ++column)
+      {
+        const int true_row = true_dof[
+            static_cast<std::size_t>(target_element) * patch_rows + row];
+        const int true_column = true_dof[
+            static_cast<std::size_t>(target_element) * patch_rows + column];
+        const std::size_t target =
+            static_cast<std::size_t>(target_element) * patch_entries +
+            static_cast<std::size_t>(row) * patch_rows + column;
+        int source_count = 0;
+        for (int source_element = 0; source_element < elements;
+             ++source_element)
+        {
+          const int source_row = local_for_truth[
+              static_cast<std::size_t>(source_element) * true_rows +
+              true_row];
+          const int source_column = local_for_truth[
+              static_cast<std::size_t>(source_element) * true_rows +
+              true_column];
+          if (source_row < 0 || source_column < 0) continue;
+          const int source = source_element * patch_entries +
+              source_row * patch_rows + source_column;
+          if (source_count == 0)
+            first_sources[target] = source;
+          else if (source_count == 1)
+            second_sources[target] = source;
+          else
+            return false;
+          ++source_count;
+        }
+        if (source_count == 0) return false;
+      }
+
+  NativeDeviceAllocation<double> schur;
+  NativeDeviceAllocation<double> patch_matrix;
+  NativeDeviceAllocation<double> patch_lu;
+  NativeDeviceAllocation<double> patch_rhs;
+  NativeDeviceAllocation<double> patch_solution;
+  NativeDeviceAllocation<double> status;
+  NativeDeviceAllocation<int> signed_element_trace;
+  NativeDeviceAllocation<int> first_source;
+  NativeDeviceAllocation<int> second_source;
+  NativeDeviceAllocation<int> pivots;
+  NativeDeviceAllocation<int> true_incidence;
+  if (!schur.CopyFrom(element_schur) ||
+      !patch_matrix.Allocate(
+          static_cast<std::size_t>(elements) * patch_entries) ||
+      !patch_lu.Allocate(
+          static_cast<std::size_t>(elements) * patch_entries) ||
+      !patch_rhs.Allocate(static_cast<std::size_t>(element_slots)) ||
+      !patch_solution.Allocate(static_cast<std::size_t>(element_slots)) ||
+      !status.Allocate(elements) ||
+      !signed_element_trace.CopyFrom(signed_dofs) ||
+      !first_source.CopyFrom(first_sources) ||
+      !second_source.CopyFrom(second_sources) ||
+      !pivots.Allocate(static_cast<std::size_t>(element_slots)) ||
+      !true_incidence.CopyFrom(incidence))
+    return false;
+
+  CudaDeviceView setup_view{};
+  setup_view.schur = schur.data();
+  setup_view.status = status.data();
+  setup_view.signed_element_trace = signed_element_trace.data();
+  setup_view.element_schwarz_patch_matrix = patch_matrix.data();
+  setup_view.element_schwarz_patch_lu = patch_lu.data();
+  setup_view.element_schwarz_rhs = patch_rhs.data();
+  setup_view.element_schwarz_solution = patch_solution.data();
+  setup_view.element_schwarz_first_source = first_source.data();
+  setup_view.element_schwarz_second_source = second_source.data();
+  setup_view.element_schwarz_signed_true_dof =
+      signed_element_trace.data();
+  setup_view.element_schwarz_true_incidence_slots = true_incidence.data();
+  setup_view.element_schwarz_pivots = pivots.data();
+  CudaMeshShape shape{};
+  shape.elements = elements;
+  shape.trace_dofs = patch_rows;
+  shape.trace_components = 5;
+  shape.true_trace_count = true_rows;
+  shape.order = order;
+  shape.igr_active = true;
+  if (!CudaLaunchSetupNativeElementSchwarz(
+          setup_view, shape, setup_preconditioner) ||
+      cudaDeviceSynchronize() != cudaSuccess)
+    return false;
+  std::vector<double> host_status(static_cast<std::size_t>(elements));
+  if (!status.CopyTo(host_status)) return false;
+  for (const double value : host_status)
+    if (value != 1.0) return false;
+
+  NativeTraceSolvePolicy policy{};
+  policy.rank_count = 1;
+  policy.krylov_dimension = 1;
+  policy.maximum_iterations = 1;
+  policy.relative_tolerance = 1.0e-14;
+  const NativeTraceCooperativeSupport support =
+      QueryNativeRankOneTraceCooperativeSupport(
+          true_rows, policy.krylov_dimension, true, true);
+  const NativeTraceWorkspaceRequirements requirements =
+      QueryNativeTraceWorkspaceRequirements(
+          true_rows, policy.krylov_dimension,
+          support.cooperative_blocks, true);
+  if (!support.supported || !requirements.valid) return false;
+
+  NativeDeviceAllocation<int> device_matrix_offsets;
+  NativeDeviceAllocation<int> device_matrix_columns;
+  NativeDeviceAllocation<double> device_matrix_values;
+  NativeDeviceAllocation<double> device_rhs;
+  NativeDeviceAllocation<double> solution;
+  NativeDeviceAllocation<double> basis;
+  NativeDeviceAllocation<double> vectors;
+  NativeDeviceAllocation<double> reduction;
+  NativeDeviceAllocation<double> small;
+  NativeDeviceAllocation<int> permutation_marks;
+  NativeDeviceAllocation<NativeTraceSolveControl> control;
+  if (!device_matrix_offsets.CopyFrom(matrix.offsets) ||
+      !device_matrix_columns.CopyFrom(matrix.columns) ||
+      !device_matrix_values.CopyFrom(matrix.values) ||
+      !device_rhs.CopyFrom(right_hand_side) ||
+      !solution.Allocate(static_cast<std::size_t>(true_rows)) ||
+      !basis.Allocate(requirements.basis_doubles) ||
+      !vectors.Allocate(requirements.vector_doubles) ||
+      !reduction.Allocate(requirements.reduction_doubles) ||
+      !small.Allocate(requirements.small_doubles) ||
+      !permutation_marks.Allocate(requirements.permutation_integers) ||
+      !control.Allocate(1) ||
+      cudaMemset(solution.data(), 0,
+                 static_cast<std::size_t>(true_rows) * sizeof(double)) !=
+          cudaSuccess)
+    return false;
+
+  NativeTraceSystemView system{};
+  system.matrix = {
+      device_matrix_offsets.data(), device_matrix_columns.data(),
+      device_matrix_values.data(), true_rows, true_rows,
+      static_cast<int>(matrix.values.size())};
+  system.rhs = device_rhs.data();
+  system.solution = solution.data();
+  system.operator_kind = native_operator;
+  system.element_schur = schur.data();
+  NativeTracePreconditionerView preconditioner{};
+  preconditioner.kind = native_preconditioner;
+  preconditioner.element_schwarz = {
+      patch_matrix.data(), patch_lu.data(), pivots.data(),
+      signed_element_trace.data(), true_incidence.data(), patch_rhs.data(),
+      patch_solution.data(), elements, patch_rows, true_rows, 1, 2};
+  NativeTraceWorkspaceView workspace{};
+  workspace.basis = basis.data();
+  workspace.basis_doubles = requirements.basis_doubles;
+  workspace.vectors = vectors.data();
+  workspace.vector_doubles = requirements.vector_doubles;
+  workspace.reduction = reduction.data();
+  workspace.reduction_doubles = requirements.reduction_doubles;
+  workspace.small = small.data();
+  workspace.small_doubles = requirements.small_doubles;
+  workspace.permutation_marks = permutation_marks.data();
+  workspace.permutation_integers = requirements.permutation_integers;
+  workspace.device_control = control.data();
+  if (!LaunchNativeRankOneTraceSolve(
+          system, preconditioner, workspace, policy, support, nullptr) ||
+      cudaDeviceSynchronize() != cudaSuccess)
+    return false;
+
+  std::vector<double> host_solution(static_cast<std::size_t>(true_rows));
+  NativeTraceSolveControl observation{};
+  if (!solution.CopyTo(host_solution) || !control.CopyOneTo(observation) ||
+      observation.status != NativeTraceSolveStatus::maximum_iterations ||
+      observation.preconditioner_applications != 2)
+    return false;
+
+  // Independently construct each exact principal-patch solve on the CPU,
+  // scatter with the signed inverse-multiplicity map, and then apply three
+  // synchronous damped global sigma-row corrections. Euler entries remain
+  // unchanged on every sweep. A one-iteration right-GMRES result is analytic:
+  // x = h/(h^2+||w_perp||^2) * M^{-1}b.
+  std::vector<double> predictor(static_cast<std::size_t>(true_rows), 0.0);
+  std::vector<int> multiplicity(static_cast<std::size_t>(true_rows), 0);
+  for (int element = 0; element < elements; ++element)
+  {
+    std::vector<double> principal(
+        static_cast<std::size_t>(patch_entries), 0.0);
+    std::vector<double> local_rhs(static_cast<std::size_t>(patch_rows));
+    for (int row = 0; row < patch_rows; ++row)
+    {
+      const int true_row = true_dof[
+          static_cast<std::size_t>(element) * patch_rows + row];
+      const double sign = element == 0 ? -1.0 : 1.0;
+      local_rhs[static_cast<std::size_t>(row)] = sign *
+          right_hand_side[static_cast<std::size_t>(true_row)];
+      for (int column = 0; column < patch_rows; ++column)
+      {
+        const int true_column = true_dof[
+            static_cast<std::size_t>(element) * patch_rows + column];
+        principal[static_cast<std::size_t>(row) * patch_rows + column] =
+            sign * sign * global_matrix[
+                static_cast<std::size_t>(true_row) * true_rows + true_column];
+      }
+    }
+    std::vector<double> local_solution;
+    if (!SolveDenseReference(principal, local_rhs, local_solution))
+      return false;
+    for (int row = 0; row < patch_rows; ++row)
+    {
+      const int truth = true_dof[
+          static_cast<std::size_t>(element) * patch_rows + row];
+      const double sign = element == 0 ? -1.0 : 1.0;
+      predictor[static_cast<std::size_t>(truth)] +=
+          sign * local_solution[static_cast<std::size_t>(row)];
+      ++multiplicity[static_cast<std::size_t>(truth)];
+    }
+  }
+  for (int row = 0; row < true_rows; ++row)
+  {
+    if (multiplicity[static_cast<std::size_t>(row)] < 1 ||
+        multiplicity[static_cast<std::size_t>(row)] > 2)
+      return false;
+    predictor[static_cast<std::size_t>(row)] /=
+        static_cast<double>(multiplicity[static_cast<std::size_t>(row)]);
+  }
+  std::vector<double> preconditioned = predictor;
+  std::vector<double> next = predictor;
+  bool nonzero_sigma_correction = false;
+  for (int sweep = 0; sweep < native_trace_sigma_jacobi_sweeps; ++sweep)
+  {
+    next = preconditioned;
+    for (int row = 0; row < true_rows; ++row)
+    {
+      if (sigma_class[static_cast<std::size_t>(row)] != 1) continue;
+      double action = 0.0;
+      for (int column = 0; column < true_rows; ++column)
+        action += global_matrix[
+            static_cast<std::size_t>(row) * true_rows + column] *
+            preconditioned[static_cast<std::size_t>(column)];
+      const double diagonal = global_matrix[
+          static_cast<std::size_t>(row) * true_rows + row];
+      const double value =
+          preconditioned[static_cast<std::size_t>(row)] +
+          native_trace_sigma_jacobi_damping *
+              (right_hand_side[static_cast<std::size_t>(row)] - action) /
+                  diagonal;
+      nonzero_sigma_correction = nonzero_sigma_correction ||
+          std::abs(value -
+                   preconditioned[static_cast<std::size_t>(row)]) > 1.0e-8;
+      next[static_cast<std::size_t>(row)] = value;
+    }
+    preconditioned.swap(next);
+    for (int row = 0; row < true_rows; ++row)
+      if (sigma_class[static_cast<std::size_t>(row)] == 0 &&
+          preconditioned[static_cast<std::size_t>(row)] !=
+              predictor[static_cast<std::size_t>(row)])
+        return false;
+  }
+  if (!nonzero_sigma_correction) return false;
+
+  double rhs_norm_squared = 0.0;
+  std::vector<double> operator_action(static_cast<std::size_t>(true_rows));
+  for (int row = 0; row < true_rows; ++row)
+  {
+    rhs_norm_squared += right_hand_side[static_cast<std::size_t>(row)] *
+        right_hand_side[static_cast<std::size_t>(row)];
+    double value = 0.0;
+    for (int column = 0; column < true_rows; ++column)
+      value += global_matrix[
+          static_cast<std::size_t>(row) * true_rows + column] *
+          preconditioned[static_cast<std::size_t>(column)];
+    operator_action[static_cast<std::size_t>(row)] = value;
+  }
+  double hessenberg = 0.0;
+  for (int row = 0; row < true_rows; ++row)
+    hessenberg += right_hand_side[static_cast<std::size_t>(row)] *
+        operator_action[static_cast<std::size_t>(row)] / rhs_norm_squared;
+  double perpendicular_norm_squared = 0.0;
+  for (int row = 0; row < true_rows; ++row)
+  {
+    const double value = operator_action[static_cast<std::size_t>(row)] -
+        hessenberg * right_hand_side[static_cast<std::size_t>(row)];
+    perpendicular_norm_squared += value * value / rhs_norm_squared;
+  }
+  const double denominator = hessenberg * hessenberg +
+      perpendicular_norm_squared;
+  if (!(denominator > 0.0) || !std::isfinite(denominator)) return false;
+  const double coefficient = hessenberg / denominator;
+  for (int row = 0; row < true_rows; ++row)
+  {
+    const double expected = coefficient *
+        preconditioned[static_cast<std::size_t>(row)];
+    const double tolerance = 5.0e-10 * std::max(1.0, std::abs(expected));
+    if (!std::isfinite(host_solution[static_cast<std::size_t>(row)]) ||
+        std::abs(host_solution[static_cast<std::size_t>(row)] - expected) >
+            tolerance)
+      return false;
+  }
+  auto mismatched_system = system;
+  mismatched_system.operator_kind = cooperative_warp
+      ? NativeTraceOperatorKind::
+            element_matrix_free_equilibrated_field_split_fp64
+      : NativeTraceOperatorKind::
+            element_matrix_free_warp_equilibrated_field_split_fp64;
+  if (LaunchNativeRankOneTraceSolve(
+          mismatched_system, preconditioner, workspace, policy, support,
+          nullptr))
+    return false;
+  auto mismatched_preconditioner = preconditioner;
+  mismatched_preconditioner.kind = cooperative_warp
+      ? NativeTracePreconditionerKind::
+            element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64
+      : NativeTracePreconditionerKind::
+            element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64;
+  return !LaunchNativeRankOneTraceSolve(
+      system, mismatched_preconditioner, workspace, policy, support, nullptr);
+}
+
+bool NativeFixedSigmaJacobiDeviceFixtures()
+{
+  for (int order = 1; order <= 3; ++order)
+    if (!NativeFixedSigmaJacobiOrderFixture(order, false) ||
+        !NativeFixedSigmaJacobiOrderFixture(order, true))
+      return false;
+  return true;
+}
 std::vector<double> ConventionalFixtureMatrix()
 {
   return {4.0, -1.0, 0.0, 0.0, 0.0,
@@ -2284,6 +2800,30 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       CudaEngineKind::ordinary, true,
       CudaTracePolicyKind::
           native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64);
+  const auto tensor_igr_sigma_jacobi = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, true,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi3_fp64);
+  const auto tensor_conventional_sigma_jacobi = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, false,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi3_fp64);
+  const auto ordinary_igr_sigma_jacobi = ResolveCudaTracePolicy(
+      CudaEngineKind::ordinary, true,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi3_fp64);
+  const auto tensor_igr_warp_sigma_jacobi = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, true,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi3_fp64);
+  const auto tensor_conventional_warp_sigma_jacobi = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, false,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi3_fp64);
+  const auto ordinary_igr_warp_sigma_jacobi = ResolveCudaTracePolicy(
+      CudaEngineKind::ordinary, true,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi3_fp64);
   const auto unknown = ResolveCudaTracePolicy(
       CudaEngineKind::ordinary, false,
       static_cast<CudaTracePolicyKind>(255));
@@ -2432,6 +2972,50 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       !CudaTracePolicyDescriptorIsExact(tensor_conventional_warp) &&
       !ordinary_igr_warp.valid &&
       !CudaTracePolicyDescriptorIsExact(ordinary_igr_warp) &&
+      CudaTracePolicyDescriptorIsExact(tensor_igr_sigma_jacobi) &&
+      tensor_igr_sigma_jacobi.trace_preconditioner ==
+          CudaTracePreconditionerKind::
+              native_element_schwarz_equilibrated_field_split_sigma_jacobi3_fp64 &&
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          tensor_igr_sigma_jacobi.resolved_selection) &&
+      CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
+          tensor_igr_sigma_jacobi.resolved_selection) &&
+      CudaTracePreconditionerUsesFixedSigmaJacobi(
+          tensor_igr_sigma_jacobi.trace_preconditioner) &&
+      CudaTracePreconditionerFixedSigmaJacobiSweeps(
+          tensor_igr_sigma_jacobi.trace_preconditioner) == 3 &&
+      CudaTracePreconditionerFixedSigmaJacobiDamping(
+          tensor_igr_sigma_jacobi.trace_preconditioner) ==
+          native_element_schwarz_sigma_jacobi_damping &&
+      !tensor_conventional_sigma_jacobi.valid &&
+      !CudaTracePolicyDescriptorIsExact(
+          tensor_conventional_sigma_jacobi) &&
+      !ordinary_igr_sigma_jacobi.valid &&
+      !CudaTracePolicyDescriptorIsExact(ordinary_igr_sigma_jacobi) &&
+      CudaTracePolicyDescriptorIsExact(tensor_igr_warp_sigma_jacobi) &&
+      tensor_igr_warp_sigma_jacobi.trace_preconditioner ==
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64 &&
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          tensor_igr_warp_sigma_jacobi.resolved_selection) &&
+      CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
+          tensor_igr_warp_sigma_jacobi.resolved_selection) &&
+      CudaTracePolicyUsesNativeElementMatrixFreeWarpEquilibratedFieldSplit(
+          tensor_igr_warp_sigma_jacobi.resolved_selection) &&
+      CudaTracePreconditionerIsNativeElementSchwarzWarpEquilibratedFieldSplit(
+          tensor_igr_warp_sigma_jacobi.trace_preconditioner) &&
+      CudaTracePreconditionerUsesFixedSigmaJacobi(
+          tensor_igr_warp_sigma_jacobi.trace_preconditioner) &&
+      CudaTracePreconditionerFixedSigmaJacobiSweeps(
+          tensor_igr_warp_sigma_jacobi.trace_preconditioner) == 3 &&
+      CudaTracePreconditionerFixedSigmaJacobiDamping(
+          tensor_igr_warp_sigma_jacobi.trace_preconditioner) ==
+          native_element_schwarz_sigma_jacobi_damping &&
+      !tensor_conventional_warp_sigma_jacobi.valid &&
+      !CudaTracePolicyDescriptorIsExact(
+          tensor_conventional_warp_sigma_jacobi) &&
+      !ordinary_igr_warp_sigma_jacobi.valid &&
+      !CudaTracePolicyDescriptorIsExact(ordinary_igr_warp_sigma_jacobi) &&
       !tensor_conventional_mgr.valid &&
       !CudaTracePolicyDescriptorIsExact(tensor_conventional_mgr) &&
       !ordinary_igr_mgr.valid &&
@@ -2462,6 +3046,14 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
           CudaTracePolicyKind::
               native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64)) ==
           "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64" &&
+      std::string_view(CudaTracePolicyKindName(
+          CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi3_fp64)) ==
+          "native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi3-fp64" &&
+      std::string_view(CudaTracePolicyKindName(
+          CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi3_fp64)) ==
+          "native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi3-fp64" &&
       std::string_view(CudaTracePreconditionerName(
           CudaTracePreconditionerKind::hypre_mgr_field_split)) ==
           "hypre_mgr_field_split" &&
@@ -2475,7 +3067,15 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       std::string_view(CudaTracePreconditionerName(
           CudaTracePreconditionerKind::
               native_element_schwarz_warp_equilibrated_field_split_fp64)) ==
-          "native_element_schwarz_warp_equilibrated_field_split_fp64";
+          "native_element_schwarz_warp_equilibrated_field_split_fp64" &&
+      std::string_view(CudaTracePreconditionerName(
+          CudaTracePreconditionerKind::
+              native_element_schwarz_equilibrated_field_split_sigma_jacobi3_fp64)) ==
+          "native_element_schwarz_equilibrated_field_split_sigma_jacobi3_fp64" &&
+      std::string_view(CudaTracePreconditionerName(
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64)) ==
+          "native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64";
 }
 
 static_assert(TracePolicyAblationDescriptorPolicy(),
@@ -3437,7 +4037,8 @@ int main(int argc, char** argv)
       : false);
   const bool native_device_fixtures = ranks != 1 || !mode.empty() ||
       (lifecycle && NativeTraceDeviceFixtures() &&
-       NativeElementSchwarzDeviceFixture());
+       NativeElementSchwarzDeviceFixture() &&
+       NativeFixedSigmaJacobiDeviceFixtures());
   const bool mgr_device_fixture = ranks != 1 || !mode.empty() ||
       (native_device_fixtures && RankOneEquilibratedMgrFixture());
   const bool pass = policies && lifecycle && native_device_fixtures &&

@@ -55,6 +55,7 @@ SCHEMA2_ONLY_SUMMARY_FIELDS = {
     "trace_solver", "trace_solvers",
     "trace_preconditioner",
     "trace_ilu_policy", "trace_preconditioners",
+    "trace_field_split_sigma_jacobi_policy",
     "tensor_core", "trace_and_tensor_accounting",
     "trace_policy_metadata_status", "precision_policy", "numerical_policy",
     "initialization_duration_seconds", "initialization_in_primary_timing",
@@ -75,6 +76,8 @@ SCHEMA2_ONLY_RECORD_FIELDS = {
     "trace_ilu_upper_jacobi_iterations", "time_integrator",
     "trace_element_schwarz_apply",
     "trace_element_schwarz_apply_tile_width",
+    "trace_field_split_sigma_jacobi_sweeps",
+    "trace_field_split_sigma_jacobi_damping",
     "time_step_policy", "gamma", "interior_components",
     "trace_components", "gpu_name", "gpu_device_ordinal", "gpu_uuid",
     "gpu_compute_capability", "cuda_driver_version",
@@ -107,6 +110,9 @@ SCHEMA2_ONLY_SAMPLE_FIELDS = {
     "maximum_left_scale", "minimum_right_scale", "maximum_right_scale",
     "element_schwarz_patch_setups",
     "element_schwarz_preconditioner_applications",
+    "field_split_sigma_jacobi_sweeps",
+    "field_split_sigma_jacobi_damping",
+    "field_split_sigma_jacobi_updates",
     "element_schwarz_patch_rows",
     "element_schwarz_minimum_multiplicity",
     "element_schwarz_maximum_multiplicity",
@@ -130,7 +136,11 @@ parser.add_argument(
              "native-element-schwarz-matrix-free-equilibrated-field-split-"
              "fp64",
              "native-element-schwarz-matrix-free-warp-equilibrated-field-"
-             "split-fp64"),
+             "split-fp64",
+             "native-element-schwarz-matrix-free-equilibrated-field-split-"
+             "sigma-jacobi3-fp64",
+             "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+             "split-sigma-jacobi3-fp64"),
 )
 parser.add_argument("--order", required=True, type=int)
 parser.add_argument("--mesh-n", required=True, type=int)
@@ -159,14 +169,31 @@ matrix_free = resolved_trace_policy in (
     "native-element-schwarz-matrix-free-fp64",
     "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
     "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi3-fp64",
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi3-fp64",
 )
 element_field_split = resolved_trace_policy in (
     "native-element-schwarz-equilibrated-field-split-fp64",
     "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
     "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi3-fp64",
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi3-fp64",
 )
-warp_element_field_split = resolved_trace_policy == \
-    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64"
+warp_element_field_split = resolved_trace_policy in (
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi3-fp64",
+)
+fixed_sigma_jacobi = resolved_trace_policy in (
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi3-fp64",
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi3-fp64",
+)
 element_schwarz = resolved_trace_policy == "native-element-schwarz-fp64" or \
     matrix_free or element_field_split
 if equilibrated_mgr and (args.engine != "tensor" or args.mode != "igr"):
@@ -175,7 +202,13 @@ if element_schwarz and (args.engine != "tensor" or args.mode != "igr"):
     parser.error("native element-Schwarz policies require tensor IGR")
 if element_field_split:
     trace_preconditioner = \
-        ("native_element_schwarz_warp_equilibrated_field_split_fp64"
+        (("native_element_schwarz_warp_equilibrated_field_split_"
+          "sigma_jacobi3_fp64")
+         if warp_element_field_split and fixed_sigma_jacobi else
+         ("native_element_schwarz_equilibrated_field_split_"
+          "sigma_jacobi3_fp64")
+         if fixed_sigma_jacobi else
+         "native_element_schwarz_warp_equilibrated_field_split_fp64"
          if warp_element_field_split else
          "native_element_schwarz_equilibrated_field_split_fp64")
 elif element_schwarz:
@@ -193,7 +226,11 @@ ilu_policy = (
         "hypre_diag_scale", "hypre_mgr_field_split",
         "native_element_schwarz_fp64",
         "native_element_schwarz_equilibrated_field_split_fp64",
-        "native_element_schwarz_warp_equilibrated_field_split_fp64")
+        "native_element_schwarz_warp_equilibrated_field_split_fp64",
+        "native_element_schwarz_equilibrated_field_split_"
+        "sigma_jacobi3_fp64",
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi3_fp64")
     else (0, 0, 1 if args.mode == "igr" else 0, 1)
 )
 ilu_factor_reuse_policy = (
@@ -410,6 +447,15 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
             "element_schwarz_preconditioner_applications": (
                 9 if element_schwarz else 0
             ),
+            "field_split_sigma_jacobi_sweeps": (
+                3 if fixed_sigma_jacobi else 0
+            ),
+            "field_split_sigma_jacobi_damping": (
+                2.0 / 3.0 if fixed_sigma_jacobi else 0.0
+            ),
+            "field_split_sigma_jacobi_updates": (
+                27 if fixed_sigma_jacobi else 0
+            ),
             "element_schwarz_patch_rows": (
                 4 * 5 * (args.order + 1) if element_schwarz else 0
             ),
@@ -481,6 +527,12 @@ payload = {
     "trace_element_schwarz_apply_tile_width": (
         16 if warp_element_field_split and args.order == 1 else
         32 if warp_element_field_split else 0
+    ),
+    "trace_field_split_sigma_jacobi_sweeps": (
+        3 if fixed_sigma_jacobi else 0
+    ),
+    "trace_field_split_sigma_jacobi_damping": (
+        2.0 / 3.0 if fixed_sigma_jacobi else 0.0
     ),
     "mode": args.mode,
     "precision": "fp64",
@@ -624,6 +676,8 @@ if is_frozen:
         "trace_ilu_accounting_kind", "trace_ilu_factor_reuse_policy",
         "trace_element_schwarz_apply",
         "trace_element_schwarz_apply_tile_width",
+        "trace_field_split_sigma_jacobi_sweeps",
+        "trace_field_split_sigma_jacobi_damping",
         "time_integrator", "time_step_policy", "gamma",
         "interior_components", "trace_components", "gpu_name",
         "gpu_device_ordinal", "gpu_uuid", "gpu_compute_capability",
@@ -1535,6 +1589,103 @@ def main() -> int:
                 "schwarz_history", "field_split_history", "event_stream",
                 "flight_recorder", "replay",
             })
+
+        fixed_sigma_policy_specs = (
+            (
+                "native-element-schwarz-matrix-free-equilibrated-field-"
+                "split-sigma-jacobi3-fp64",
+                "native_element_schwarz_equilibrated_field_split_"
+                "sigma_jacobi3_fp64",
+                "scalar-pivoted-lu-fp64",
+                0,
+            ),
+            (
+                "native-element-schwarz-matrix-free-warp-equilibrated-"
+                "field-split-sigma-jacobi3-fp64",
+                "native_element_schwarz_warp_equilibrated_field_split_"
+                "sigma_jacobi3_fp64",
+                "cooperative-pivoted-lu-fp64",
+                32,
+            ),
+        )
+        for (fixed_policy, fixed_preconditioner, fixed_apply,
+             fixed_tile_width) in fixed_sigma_policy_specs:
+            fixed_command = CAMPAIGN.final_command(
+                final,
+                engine="tensor",
+                mode="igr",
+                order=2,
+                mesh_n=12,
+                domain_periods=3,
+                timestep=1.0e-5,
+                export=False,
+                expected_build=explicit_build,
+                trace_policy=fixed_policy,
+            )
+            fixed_record = json.loads(run(fixed_command, root).stdout)
+            fixed_validation_arguments = {
+                **schwarz_validation_arguments,
+                "trace_policy": fixed_policy,
+            }
+            CAMPAIGN.validate_record(
+                fixed_record, **fixed_validation_arguments
+            )
+            assert fixed_record["variant"] == "ablation"
+            assert fixed_record["production_selectable"] is False
+            assert fixed_record["trace_preconditioner"] == \
+                fixed_preconditioner
+            assert fixed_record["trace_element_schwarz_apply"] == fixed_apply
+            assert fixed_record[
+                "trace_element_schwarz_apply_tile_width"
+            ] == fixed_tile_width
+            assert fixed_record[
+                "trace_field_split_sigma_jacobi_sweeps"
+            ] == 3
+            assert fixed_record[
+                "trace_field_split_sigma_jacobi_damping"
+            ] == 2.0 / 3.0
+            for sample in fixed_record["samples"]:
+                tensor = sample["tensor_core"]
+                assert tensor["field_split_sigma_jacobi_sweeps"] == 3
+                assert tensor[
+                    "field_split_sigma_jacobi_damping"
+                ] == 2.0 / 3.0
+                assert tensor["field_split_sigma_jacobi_updates"] == 27
+                assert not set(tensor).intersection({
+                    "schwarz_history", "field_split_history",
+                    "event_stream", "flight_recorder", "replay",
+                })
+            fixed_summary = CAMPAIGN.record_summary(fixed_record)
+            assert fixed_summary[
+                "trace_field_split_sigma_jacobi_policy"
+            ] == {"sweeps": 3, "damping": 2.0 / 3.0}
+            assert all(
+                sample["field_split_sigma_jacobi_updates"] == 27
+                for sample in fixed_summary["measured_sample_work"]
+            )
+
+            def fixed_rejected(record: dict) -> bool:
+                try:
+                    CAMPAIGN.validate_record(
+                        record, **fixed_validation_arguments
+                    )
+                except CAMPAIGN.CampaignError:
+                    return True
+                return False
+
+            for field, value in (
+                    ("trace_field_split_sigma_jacobi_sweeps", 2),
+                    ("trace_field_split_sigma_jacobi_damping", 0.5)):
+                invalid_fixed = copy.deepcopy(fixed_record)
+                invalid_fixed[field] = value
+                assert fixed_rejected(invalid_fixed), field
+            for field, value in (
+                    ("field_split_sigma_jacobi_sweeps", 2),
+                    ("field_split_sigma_jacobi_damping", 0.5),
+                    ("field_split_sigma_jacobi_updates", 26)):
+                invalid_fixed = copy.deepcopy(fixed_record)
+                invalid_fixed["samples"][0]["tensor_core"][field] = value
+                assert fixed_rejected(invalid_fixed), field
 
         def combined_rejected(record: dict) -> bool:
             try:

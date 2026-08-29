@@ -25,6 +25,9 @@ namespace dg::hdg::runtime::cuda_w8a::detail
 inline constexpr std::uint32_t native_trace_control_schema = 1;
 inline constexpr int native_trace_cooperative_threads = 256;
 inline constexpr int native_trace_ilu_jacobi_iterations = 5;
+inline constexpr int native_trace_sigma_jacobi_sweeps = 3;
+inline constexpr double native_trace_sigma_jacobi_damping =
+    0x1.5555555555555p-1;
 
 enum class NativeTracePreconditionerKind : std::int32_t
 {
@@ -32,7 +35,9 @@ enum class NativeTracePreconditionerKind : std::int32_t
   ilu0_rcm_jacobi = 2,
   element_overlap_schwarz_fp64 = 3,
   element_overlap_schwarz_equilibrated_field_split_fp64 = 4,
-  element_overlap_schwarz_warp_equilibrated_field_split_fp64 = 5
+  element_overlap_schwarz_warp_equilibrated_field_split_fp64 = 5,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64 = 6,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64 = 7
 };
 
 enum class NativeTraceSolveStatus : std::int32_t
@@ -304,7 +309,8 @@ QueryNativeTraceWorkspaceRequirements(int rows, int krylov_dimension,
 
 extern "C" NativeTraceCooperativeSupport
 QueryNativeRankOneTraceCooperativeSupport(int rows, int krylov_dimension,
-                                          bool igr_active) noexcept;
+                                          bool igr_active,
+                                          bool fixed_sigma_jacobi) noexcept;
 
 /** Queue exactly one cooperative kernel.  This call never copies or syncs. */
 extern "C" bool LaunchNativeRankOneTraceSolve(

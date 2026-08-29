@@ -27,6 +27,11 @@ namespace dg::hdg::runtime::cuda_w8a
 {
 namespace
 {
+static_assert(detail::native_trace_sigma_jacobi_sweeps ==
+              native_element_schwarz_sigma_jacobi_sweeps);
+static_assert(detail::native_trace_sigma_jacobi_damping ==
+              native_element_schwarz_sigma_jacobi_damping);
+
 std::atomic<std::uint64_t> allocation_events{0};
 std::atomic<std::uint64_t> w8_owned_allocation_calls{0};
 std::atomic<std::uint64_t> deallocation_events{0};
@@ -1316,15 +1321,19 @@ bool CudaSolveRankOneMgr(
 
 bool CudaQueryNativeRankOneTraceResources(
     const int rows, const int krylov_dimension, const bool igr_active,
+    const CudaTracePreconditionerKind preconditioner_kind,
     CudaNativeTraceWorkspaceRequirements& requirements,
     CudaNativeTraceCooperativeSupport& support) noexcept
 {
   requirements = {};
   support = {};
+  const bool fixed_sigma_jacobi =
+      CudaTracePreconditionerUsesFixedSigmaJacobi(preconditioner_kind);
   const NativeTraceCooperativeSupport native_support =
       QueryNativeRankOneTraceCooperativeSupport(
-          rows, krylov_dimension, igr_active);
+          rows, krylov_dimension, igr_active, fixed_sigma_jacobi);
   support.supported = native_support.supported;
+  support.fixed_sigma_jacobi = fixed_sigma_jacobi;
   support.device = native_support.device;
   support.compute_major = native_support.compute_major;
   support.compute_minor = native_support.compute_minor;
@@ -1405,15 +1414,26 @@ bool CudaLaunchNativeRankOneTraceSolver(
   const bool use_warp_equilibrated_field_split =
       CudaTracePreconditionerIsNativeElementSchwarzWarpEquilibratedFieldSplit(
           preconditioner_kind);
+  const bool use_fixed_sigma_jacobi =
+      CudaTracePreconditionerUsesFixedSigmaJacobi(preconditioner_kind);
+  if (!CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+          support, preconditioner_kind))
+    return false;
   preconditioner.kind = use_ilu
       ? NativeTracePreconditionerKind::ilu0_rcm_jacobi
       : use_element_schwarz
           ? (use_equilibrated_field_split
-                 ? (use_warp_equilibrated_field_split
-                        ? NativeTracePreconditionerKind::
-                              element_overlap_schwarz_warp_equilibrated_field_split_fp64
-                        : NativeTracePreconditionerKind::
-                              element_overlap_schwarz_equilibrated_field_split_fp64)
+                 ? (use_fixed_sigma_jacobi
+                        ? (use_warp_equilibrated_field_split
+                               ? NativeTracePreconditionerKind::
+                                     element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64
+                               : NativeTracePreconditionerKind::
+                                     element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64)
+                        : use_warp_equilibrated_field_split
+                            ? NativeTracePreconditionerKind::
+                                  element_overlap_schwarz_warp_equilibrated_field_split_fp64
+                            : NativeTracePreconditionerKind::
+                                  element_overlap_schwarz_equilibrated_field_split_fp64)
                  : NativeTracePreconditionerKind::
                        element_overlap_schwarz_fp64)
           : NativeTracePreconditionerKind::diagonal;

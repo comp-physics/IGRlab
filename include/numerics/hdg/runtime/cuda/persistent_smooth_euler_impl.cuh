@@ -388,6 +388,7 @@ struct CudaNativeTraceWorkspaceRequirements
 struct CudaNativeTraceCooperativeSupport
 {
   bool supported = false;
+  bool fixed_sigma_jacobi = false;
   int device = -1;
   int compute_major = 0;
   int compute_minor = 0;
@@ -396,6 +397,14 @@ struct CudaNativeTraceCooperativeSupport
   int maximum_active_blocks_per_multiprocessor = 0;
   int cooperative_blocks = 0;
 };
+
+constexpr bool CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+    const CudaNativeTraceCooperativeSupport& support,
+    const CudaTracePreconditionerKind preconditioner_kind) noexcept
+{
+  return support.fixed_sigma_jacobi ==
+      CudaTracePreconditionerUsesFixedSigmaJacobi(preconditioner_kind);
+}
 
 struct CudaNativeTraceWorkspaceView
 {
@@ -1850,6 +1859,7 @@ bool CudaGetTrueMatrixDeviceView(mfem::HypreParMatrix& matrix,
                                  CudaTrueMatrixDeviceView& view) noexcept;
 bool CudaQueryNativeRankOneTraceResources(
     int rows, int krylov_dimension, bool igr_active,
+    CudaTracePreconditionerKind preconditioner_kind,
     CudaNativeTraceWorkspaceRequirements& requirements,
     CudaNativeTraceCooperativeSupport& support) noexcept;
 bool CudaLaunchNativeRankOneTraceSolver(
@@ -2269,6 +2279,7 @@ public:
     {
       trace_solver_ready = CudaQueryNativeRankOneTraceResources(
           shape_.true_trace_count, krylov_dimension_, shape_.igr_active,
+          trace_policy_descriptor_.trace_preconditioner,
           native_trace_requirements_, native_trace_support_) &&
           native_trace_requirements_.valid &&
           native_trace_support_.supported &&

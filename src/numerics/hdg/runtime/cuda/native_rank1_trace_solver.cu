@@ -60,6 +60,31 @@ NativeTracePreconditionerIsWarpEquilibratedFieldSplit(
       element_overlap_schwarz_warp_equilibrated_field_split_fp64;
 }
 
+__host__ __device__ constexpr bool
+NativeTracePreconditionerUsesFixedSigmaJacobi(
+    const NativeTracePreconditionerKind kind) noexcept
+{
+  return kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64;
+}
+
+constexpr NativeTracePreconditionerKind
+NativeTraceFixedSigmaJacobiBasePreconditioner(
+    const NativeTracePreconditionerKind kind) noexcept
+{
+  return kind == NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64
+      ? NativeTracePreconditionerKind::
+            element_overlap_schwarz_equilibrated_field_split_fp64
+      : kind == NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64
+          ? NativeTracePreconditionerKind::
+                element_overlap_schwarz_warp_equilibrated_field_split_fp64
+          : kind;
+}
+
 __host__ __device__ constexpr bool NativeTraceOperatorIsElementMatrixFree(
     const NativeTraceOperatorKind kind) noexcept
 {
@@ -636,6 +661,40 @@ __device__ void ValidateElementSchwarz(
     if (multiplicity < schwarz.minimum_multiplicity ||
         multiplicity > schwarz.maximum_multiplicity)
       MarkFailure(control, failure_invalid_preconditioner);
+  }
+  grid.sync();
+}
+
+__device__ void ValidateFixedSigmaJacobiRows(
+    const NativeTraceElementSchwarzView schwarz,
+    const NativeTraceWorkspaceView workspace,
+    NativeTraceSolveControl* control,
+    const cg::grid_group& grid) noexcept
+{
+  const int thread = GlobalThreadIndex();
+  const int stride = GlobalThreadStride();
+  const int patch_rows = schwarz.patch_rows;
+  for (int row = thread; row < schwarz.true_rows; row += stride)
+  {
+    int sigma_field = -1;
+    for (int incidence = 0;
+         incidence < native_trace_schwarz_maximum_incidence;
+         ++incidence)
+    {
+      const int slot = schwarz.true_incidence_slots[
+          native_trace_schwarz_maximum_incidence * row + incidence];
+      if (slot < 0) continue;
+      const int local_row = slot % patch_rows;
+      const int packed_row = FieldSplitPackedRow(patch_rows, local_row);
+      const int incidence_sigma =
+          packed_row >= FieldSplitEulerRows(patch_rows) ? 1 : 0;
+      if (sigma_field >= 0 && sigma_field != incidence_sigma)
+        MarkFailure(control, failure_invalid_preconditioner);
+      sigma_field = incidence_sigma;
+    }
+    if (sigma_field < 0)
+      MarkFailure(control, failure_invalid_preconditioner);
+    workspace.permutation_marks[row] = sigma_field;
   }
   grid.sync();
 }
@@ -1333,6 +1392,86 @@ __device__ void ApplyPreconditioner(
   grid.sync();
 }
 
+__device__ void ApplyFixedSigmaJacobiPreconditioner(
+    const NativeTraceSystemView system,
+    const NativeTracePreconditionerView preconditioner,
+    const NativeTraceWorkspaceView workspace,
+    const double* input, double* output,
+    NativeTraceSolveControl* control,
+    const cg::grid_group& grid) noexcept
+{
+  ApplyPreconditioner(system, preconditioner, workspace, input, output,
+                      control, grid);
+  if (control->failure_mask != 0) return;
+
+  const NativeTraceElementSchwarzView schwarz =
+      preconditioner.element_schwarz;
+  const int rows = system.matrix.rows;
+  const int thread = GlobalThreadIndex();
+  const int stride = GlobalThreadStride();
+
+  // The exact local lower field split above supplies a nonzero stationary
+  // predictor. Refine only the scalar global sigma rows with three fixed
+  // damped Jacobi corrections. Euler rows remain fixed, so this is a lower
+  // block-GS preconditioner refinement rather than a replacement for the
+  // coupled U7/Uhat5 system. The authoritative outer GMRES and
+  // application-level FP64 true-residual rebuild remain unchanged.
+  double* const next_sigma = workspace.vectors + rows;
+  for (int sweep = 0; sweep < native_trace_sigma_jacobi_sweeps; ++sweep)
+  {
+    for (int row = thread; row < rows; row += stride)
+    {
+      if (workspace.permutation_marks[row] != 1) continue;
+      int rhs_slot = -1;
+      for (int incidence = 0;
+           incidence < native_trace_schwarz_maximum_incidence;
+           ++incidence)
+      {
+        const int slot = schwarz.true_incidence_slots[
+            native_trace_schwarz_maximum_incidence * row + incidence];
+        if (slot >= 0)
+        {
+          rhs_slot = slot;
+          break;
+        }
+      }
+      if (rhs_slot < 0)
+      {
+        MarkFailure(control, failure_invalid_preconditioner);
+        continue;
+      }
+      double rhs_sign = 1.0;
+      const int rhs_truth = DecodeSignedDof(
+          schwarz.signed_element_true_dofs[rhs_slot], rhs_sign);
+      if (rhs_truth != row)
+      {
+        MarkFailure(control, failure_invalid_preconditioner);
+        continue;
+      }
+      const double rhs_value =
+          rhs_sign * schwarz.element_rhs[rhs_slot];
+      const int begin = system.matrix.row_offsets[row];
+      const int end = system.matrix.row_offsets[row + 1];
+      double action = 0.0;
+      for (int entry = begin; entry < end; ++entry)
+        action += system.matrix.values[entry] *
+            output[system.matrix.columns[entry]];
+      const double diagonal = system.matrix.values[begin];
+      const double value = output[row] +
+          native_trace_sigma_jacobi_damping *
+              (rhs_value - action) / diagonal;
+      next_sigma[row] = value;
+      if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
+    }
+    grid.sync();
+    if (control->failure_mask != 0) return;
+    for (int row = thread; row < rows; row += stride)
+      if (workspace.permutation_marks[row] == 1)
+        output[row] = next_sigma[row];
+    grid.sync();
+  }
+}
+
 __device__ void SetFinalResidualMetadata(
     NativeTraceSolveControl* control, const double residual) noexcept
 {
@@ -1341,7 +1480,7 @@ __device__ void SetFinalResidualMetadata(
       ? residual / control->rhs_norm : residual;
 }
 
-template <bool UseCgs2>
+template <bool UseCgs2, bool FixedSigmaJacobi>
 __global__ void NativeRankOneTraceSolveKernel(
     const NativeTraceSystemView system,
     const NativeTracePreconditionerView preconditioner,
@@ -1411,6 +1550,7 @@ __global__ void NativeRankOneTraceSolveKernel(
   }
   else if (NativeTracePreconditionerIsElementSchwarz(
                preconditioner.kind))
+  {
     ValidateElementSchwarz(
         preconditioner.element_schwarz,
         NativeTracePreconditionerIsEquilibratedFieldSplit(
@@ -1418,6 +1558,20 @@ __global__ void NativeRankOneTraceSolveKernel(
         NativeTracePreconditionerIsWarpEquilibratedFieldSplit(
             preconditioner.kind),
         control, grid);
+    if constexpr (FixedSigmaJacobi)
+    {
+      if (!NativeTracePreconditionerIsEquilibratedFieldSplit(
+              preconditioner.kind))
+      {
+        if (grid.thread_rank() == 0)
+          MarkFailure(control, failure_invalid_preconditioner);
+        grid.sync();
+      }
+      else
+        ValidateFixedSigmaJacobiRows(
+            preconditioner.element_schwarz, workspace, control, grid);
+    }
+  }
   if (NativeTraceOperatorIsElementMatrixFree(system.operator_kind))
   {
     const NativeTraceElementSchwarzView schwarz =
@@ -1535,8 +1689,13 @@ __global__ void NativeRankOneTraceSolveKernel(
       double* const next_basis = workspace.basis +
           static_cast<std::size_t>(column + 1) * rows;
 
-      ApplyPreconditioner(system, preconditioner, workspace,
-                          current_basis, work, control, grid);
+      if constexpr (FixedSigmaJacobi)
+        ApplyFixedSigmaJacobiPreconditioner(
+            system, preconditioner, workspace, current_basis, work,
+            control, grid);
+      else
+        ApplyPreconditioner(system, preconditioner, workspace,
+                            current_basis, work, control, grid);
       if (FinishOnFailure(grid, control)) return;
       ApplyTraceOperator(system, preconditioner, work, next_basis, control,
                          grid);
@@ -1743,8 +1902,12 @@ __global__ void NativeRankOneTraceSolveKernel(
                    control, grid);
       }
     }
-    ApplyPreconditioner(system, preconditioner, workspace,
-                        work, work, control, grid);
+    if constexpr (FixedSigmaJacobi)
+      ApplyFixedSigmaJacobiPreconditioner(
+          system, preconditioner, workspace, work, work, control, grid);
+    else
+      ApplyPreconditioner(system, preconditioner, workspace,
+                          work, work, control, grid);
     if (FinishOnFailure(grid, control)) return;
     AxpyVector(system.solution, 1.0, work, rows, control, grid);
     if (FinishOnFailure(grid, control)) return;
@@ -1899,11 +2062,13 @@ QueryNativeTraceWorkspaceRequirements(const int rows,
 extern "C" NativeTraceCooperativeSupport
 QueryNativeRankOneTraceCooperativeSupport(const int rows,
                                           const int krylov_dimension,
-                                          const bool igr_active) noexcept
+                                          const bool igr_active,
+                                          const bool fixed_sigma_jacobi) noexcept
 {
   NativeTraceCooperativeSupport result{};
   if (rows <= 0 || krylov_dimension <= 0 ||
-      krylov_dimension == std::numeric_limits<int>::max())
+      krylov_dimension == std::numeric_limits<int>::max() ||
+      (fixed_sigma_jacobi && !igr_active))
     return result;
 
   int device = -1;
@@ -1923,13 +2088,17 @@ QueryNativeRankOneTraceCooperativeSupport(const int rows,
                              device) != cudaSuccess)
     return NativeTraceCooperativeSupport{};
 
-  const cudaError_t occupancy = igr_active
+  const cudaError_t occupancy = fixed_sigma_jacobi
       ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &active_blocks, NativeRankOneTraceSolveKernel<true>,
+            &active_blocks, NativeRankOneTraceSolveKernel<true, true>,
             native_trace_cooperative_threads, 0)
-      : cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &active_blocks, NativeRankOneTraceSolveKernel<false>,
-            native_trace_cooperative_threads, 0);
+      : igr_active
+          ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks, NativeRankOneTraceSolveKernel<true, false>,
+                native_trace_cooperative_threads, 0)
+          : cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks, NativeRankOneTraceSolveKernel<false, false>,
+                native_trace_cooperative_threads, 0);
   if (occupancy != cudaSuccess) return NativeTraceCooperativeSupport{};
 
   // This leaf is an SM120 tensor-backend implementation, not a generic CUDA
@@ -1968,10 +2137,14 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
     const NativeTraceCooperativeSupport& support,
     const cudaStream_t stream) noexcept
 {
-  const bool use_ilu = preconditioner.kind ==
+  const bool use_fixed_sigma_jacobi =
+      NativeTracePreconditionerUsesFixedSigmaJacobi(preconditioner.kind);
+  const NativeTracePreconditionerKind kernel_preconditioner_kind =
+      NativeTraceFixedSigmaJacobiBasePreconditioner(preconditioner.kind);
+  const bool use_ilu = kernel_preconditioner_kind ==
       NativeTracePreconditionerKind::ilu0_rcm_jacobi;
   const bool use_element_schwarz =
-      NativeTracePreconditionerIsElementSchwarz(preconditioner.kind);
+      NativeTracePreconditionerIsElementSchwarz(kernel_preconditioner_kind);
   const bool use_matrix_free =
       NativeTraceOperatorIsElementMatrixFree(system.operator_kind);
   const bool use_cgs2 = use_ilu || use_element_schwarz;
@@ -2119,6 +2292,10 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
   }
   int current_device = -1;
   if (!requirements.valid || workspace_overlap || !support.supported ||
+      (use_fixed_sigma_jacobi &&
+       (!use_element_schwarz ||
+        !NativeTracePreconditionerIsEquilibratedFieldSplit(
+            kernel_preconditioner_kind))) ||
       cudaGetDevice(&current_device) != cudaSuccess ||
       current_device != support.device || support.compute_major != 12 ||
       support.compute_minor != 0 || support.multiprocessors <= 0 ||
@@ -2159,7 +2336,7 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
       workspace.permutation_integers < requirements.permutation_integers ||
       (use_matrix_free &&
        (!NativeTraceOperatorMatchesPreconditioner(
-            system.operator_kind, preconditioner.kind) ||
+            system.operator_kind, kernel_preconditioner_kind) ||
         system.element_schur == nullptr ||
         !IsAligned(system.element_schur, alignof(double)))) ||
       (!use_matrix_free &&
@@ -2168,11 +2345,12 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
         system.element_schur != nullptr)))
     return false;
 
-  if (preconditioner.kind == NativeTracePreconditionerKind::diagonal)
+  if (kernel_preconditioner_kind ==
+      NativeTracePreconditionerKind::diagonal)
   {
     if (use_cgs2) return false;
   }
-  else if (preconditioner.kind ==
+  else if (kernel_preconditioner_kind ==
            NativeTracePreconditionerKind::ilu0_rcm_jacobi)
   {
     const NativeTraceIlu0View& ilu0 = preconditioner.ilu0;
@@ -2193,16 +2371,16 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
       return false;
   }
   else if (NativeTracePreconditionerIsElementSchwarz(
-               preconditioner.kind))
+               kernel_preconditioner_kind))
   {
     const NativeTraceElementSchwarzView& schwarz =
         preconditioner.element_schwarz;
     const bool field_split =
         NativeTracePreconditionerIsEquilibratedFieldSplit(
-            preconditioner.kind);
+            kernel_preconditioner_kind);
     const bool warp_field_split =
         NativeTracePreconditionerIsWarpEquilibratedFieldSplit(
-            preconditioner.kind);
+            kernel_preconditioner_kind);
     const int scalar_face_rows =
         FieldSplitScalarFaceRows(schwarz.patch_rows);
     const int euler_rows = FieldSplitEulerRows(schwarz.patch_rows);
@@ -2249,15 +2427,21 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
 
   NativeTraceSystemView system_argument = system;
   NativeTracePreconditionerView preconditioner_argument = preconditioner;
+  preconditioner_argument.kind = kernel_preconditioner_kind;
   NativeTraceWorkspaceView workspace_argument = workspace;
   NativeTraceSolvePolicy policy_argument = policy;
   NativeTraceCooperativeSupport support_argument = support;
   void* arguments[] = {&system_argument, &preconditioner_argument,
                        &workspace_argument, &policy_argument,
                        &support_argument};
-  const void* const kernel = use_cgs2
-      ? reinterpret_cast<const void*>(NativeRankOneTraceSolveKernel<true>)
-      : reinterpret_cast<const void*>(NativeRankOneTraceSolveKernel<false>);
+  const void* const kernel = use_fixed_sigma_jacobi
+      ? reinterpret_cast<const void*>(
+            NativeRankOneTraceSolveKernel<true, true>)
+      : use_cgs2
+          ? reinterpret_cast<const void*>(
+                NativeRankOneTraceSolveKernel<true, false>)
+          : reinterpret_cast<const void*>(
+                NativeRankOneTraceSolveKernel<false, false>);
   const cudaError_t launch = cudaLaunchCooperativeKernel(
       kernel,
       dim3(static_cast<unsigned int>(support.cooperative_blocks)),
