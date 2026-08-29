@@ -37,6 +37,7 @@ TRACE_PRECONDITIONER_BY_POLICY_ENGINE_AND_MODE = {
     ("common-fast", "ordinary", "igr"): "hypre_ilu0",
     ("common-fast", "tensor", "conventional"): "hypre_diag_scale",
     ("common-fast", "tensor", "igr"): "hypre_ilu0",
+    ("equilibrated-mgr", "tensor", "igr"): "hypre_mgr_field_split",
 }
 TRACE_ILU_POLICY_BY_POLICY_ENGINE_AND_MODE = {
     ("engine-default", "ordinary", "conventional"): (0, 0, 0, 1),
@@ -47,6 +48,7 @@ TRACE_ILU_POLICY_BY_POLICY_ENGINE_AND_MODE = {
     ("common-fast", "ordinary", "igr"): (0, 0, 1, 1),
     ("common-fast", "tensor", "conventional"): (-1, -1, -1, 0),
     ("common-fast", "tensor", "igr"): (0, 0, 1, 1),
+    ("equilibrated-mgr", "tensor", "igr"): (-1, -1, -1, 0),
 }
 TRACE_ILU_FACTOR_REUSE_BY_POLICY_ENGINE_AND_MODE = {
     ("engine-default", "ordinary", "conventional"):
@@ -58,6 +60,7 @@ TRACE_ILU_FACTOR_REUSE_BY_POLICY_ENGINE_AND_MODE = {
     ("common-fast", "ordinary", "igr"): "first_trace_solve_per_attempt",
     ("common-fast", "tensor", "conventional"): "not_applicable",
     ("common-fast", "tensor", "igr"): "first_trace_solve_per_attempt",
+    ("equilibrated-mgr", "tensor", "igr"): "not_applicable",
 }
 TRACE_ILU_TRIANGULAR_SOLVE_BY_POLICY_ENGINE_AND_MODE = {
     ("engine-default", "ordinary", "conventional"): ("direct", 0, 0, 0),
@@ -77,6 +80,32 @@ TRACE_ILU_TRIANGULAR_SOLVE_BY_POLICY_ENGINE_AND_MODE = {
         ("not_applicable", 0, 0, 0),
     ("common-fast", "tensor", "igr"):
         ("iterative_jacobi", 5, 5, 8),
+    ("equilibrated-mgr", "tensor", "igr"):
+        ("not_applicable", 0, 0, 0),
+}
+# Solver name and the three mutually exclusive rank-one/rank-two
+# configuration predicates emitted in each bounded sample.  Keeping this
+# explicit prevents the MGR experiment from being mistaken for the native
+# tensor trace solver merely because both select the tensor CUDA engine.
+TRACE_SOLVER_CONFIGURATION_BY_POLICY_ENGINE_AND_MODE = {
+    ("engine-default", "ordinary", "conventional"):
+        ("hypre-parcsr-gmres", False, False, False),
+    ("engine-default", "ordinary", "igr"):
+        ("hypre-parcsr-gmres", False, False, False),
+    ("engine-default", "tensor", "conventional"):
+        ("native-rank1-fp64", True, False, False),
+    ("engine-default", "tensor", "igr"):
+        ("native-rank1-fp64", True, False, False),
+    ("common-fast", "ordinary", "conventional"):
+        ("hypre-parcsr-gmres", False, False, False),
+    ("common-fast", "ordinary", "igr"):
+        ("hypre-parcsr-gmres", False, False, False),
+    ("common-fast", "tensor", "conventional"):
+        ("native-rank1-fp64", True, False, False),
+    ("common-fast", "tensor", "igr"):
+        ("native-rank1-fp64", True, False, False),
+    ("equilibrated-mgr", "tensor", "igr"):
+        ("hypre-fgmres-mgr-rank1", False, True, False),
 }
 SAME_POLICY_MEMBERS = {
     "O_base": {"engine": "ordinary", "trace_policy": "engine-default"},
@@ -208,6 +237,21 @@ def expected_trace_ilu_triangular_solve_policy(
     except KeyError as error:
         raise CampaignError(
             "unsupported CUDA engine/mode ILU triangular-solve policy: "
+            f"{trace_policy!r}/{engine!r}/{mode!r}"
+        ) from error
+
+
+def expected_trace_solver_configuration(
+        engine: str, mode: str,
+        trace_policy: str = "engine-default") -> tuple[str, bool, bool, bool]:
+    """Return solver name plus native/MGR/rank-two configuration flags."""
+    try:
+        return TRACE_SOLVER_CONFIGURATION_BY_POLICY_ENGINE_AND_MODE[
+            (trace_policy, engine, mode)
+        ]
+    except KeyError as error:
+        raise CampaignError(
+            "unsupported trace-policy/engine/mode solver configuration: "
             f"{trace_policy!r}/{engine!r}/{mode!r}"
         ) from error
 
@@ -1051,6 +1095,45 @@ def _ilu_factor_accounting_is_valid(
     return False
 
 
+def _mgr_accounting_is_valid(
+        *, expected_mgr: bool, trace_solves: int, linear_iterations: int,
+        equilibration_builds: int, equilibration_passes: int,
+        mgr_setup_calls: int, mgr_preconditioner_applications: int,
+        mgr_f_ilu_setups: int, mgr_f_ilu_applications: int,
+        minimum_left_scale: float, maximum_left_scale: float,
+        minimum_right_scale: float, maximum_right_scale: float) -> bool:
+    """Validate constant-size MGR/equilibration aggregates, never history."""
+    counters = (
+        equilibration_builds,
+        equilibration_passes,
+        mgr_setup_calls,
+        mgr_preconditioner_applications,
+        mgr_f_ilu_setups,
+        mgr_f_ilu_applications,
+    )
+    scales = (
+        minimum_left_scale,
+        maximum_left_scale,
+        minimum_right_scale,
+        maximum_right_scale,
+    )
+    if any(value < 0 or value > UINT64_MAX for value in counters) or \
+            any(not math.isfinite(value) for value in scales):
+        return False
+    if not expected_mgr:
+        return not any(counters) and all(value == 0.0 for value in scales)
+    return (
+        equilibration_builds == trace_solves and
+        equilibration_passes == 2 * trace_solves and
+        mgr_setup_calls == trace_solves and
+        mgr_f_ilu_setups == mgr_setup_calls and
+        mgr_f_ilu_applications == mgr_preconditioner_applications and
+        (linear_iterations == 0 or mgr_preconditioner_applications > 0) and
+        0.0 < minimum_left_scale <= maximum_left_scale and
+        0.0 < minimum_right_scale <= maximum_right_scale
+    )
+
+
 def validate_memory_snapshot(value: Any, field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise CampaignError(f"benchmark field {field} is not an object")
@@ -1104,6 +1187,7 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str,
                           trace_policy: str,
                           expected_preconditioner: str,
                           krylov_restart_dimension: int,
+                          true_residual_tightening_enabled: bool,
                           expected_phase: str, expected_index: int,
                           expected_duration: float | None) -> None:
     if not isinstance(sample, dict):
@@ -1147,6 +1231,12 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str,
             work["linear_solve_attempts"] != \
             work["trace_solves"] + work["true_residual_tightenings"]:
         raise CampaignError("role-specific linear work accounting is invalid")
+    if work["true_residual_tightenings"] > 0 and not \
+            true_residual_tightening_enabled:
+        raise CampaignError(
+            "sample reports a true-residual tightening that the recorded "
+            "role-specific tolerance policy cannot request"
+        )
     if work["rejected_line_search_trials"] > work["line_search_trials"]:
         raise CampaignError("rejected line-search work exceeds total trials")
     if any(work[field] != 0 for field in (
@@ -1191,9 +1281,12 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str,
         raise CampaignError(
             "sample trace-policy evidence differs from the explicit selection"
         )
-    expected_trace_solver = (
-        "native-rank1-fp64" if engine == "tensor" else "hypre-parcsr-gmres"
-    )
+    (
+        expected_trace_solver,
+        expected_native,
+        expected_mgr,
+        expected_rank2,
+    ) = expected_trace_solver_configuration(engine, mode, trace_policy)
     if tensor.get("trace_solver") != expected_trace_solver:
         raise CampaignError(
             f"sample trace_solver={tensor.get('trace_solver')!r}; expected "
@@ -1207,16 +1300,17 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str,
         tensor.get("hypre_trace_solve_calls"),
         "samples.tensor_core.hypre_trace_solve_calls",
     )
-    expected_native = engine == "tensor"
     if tensor.get("native_rank1_trace_solver_configured") is not \
             expected_native or \
+            tensor.get("hypre_mgr_rank1_trace_solver_configured") is not \
+            expected_mgr or \
             tensor.get("hypre_host_staged_rank2_trace_solver_configured") \
-            is not False or \
+            is not expected_rank2 or \
             tensor.get("trace_solver_accounting_complete") is not True or \
             native_trace_solves != (work["linear_solve_attempts"]
                                      if expected_native else 0) or \
-            hypre_trace_solves != (0 if expected_native
-                                   else work["linear_solve_attempts"]):
+            hypre_trace_solves != (0 if expected_native else
+                                   work["linear_solve_attempts"]):
         raise CampaignError(
             "sample recurring trace-solver accounting does not match the "
             f"rank-one {engine!r} engine contract"
@@ -1338,6 +1432,39 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str,
             jacobi_update_upper):
         raise CampaignError(
             "sample ILU Jacobi factor-SpMV accounting is inconsistent"
+        )
+    mgr_counters = {
+        field: checked_uint64(
+            tensor.get(field), f"samples.tensor_core.{field}"
+        )
+        for field in (
+            "equilibration_builds",
+            "equilibration_passes",
+            "mgr_setup_calls",
+            "mgr_preconditioner_applications",
+            "mgr_f_ilu_setups",
+            "mgr_f_ilu_applications",
+        )
+    }
+    mgr_scales = {
+        field: checked_float(
+            tensor.get(field), f"samples.tensor_core.{field}"
+        )
+        for field in (
+            "minimum_left_scale",
+            "maximum_left_scale",
+            "minimum_right_scale",
+            "maximum_right_scale",
+        )
+    }
+    if not _mgr_accounting_is_valid(
+            expected_mgr=expected_mgr,
+            trace_solves=work["trace_solves"],
+            linear_iterations=work["linear_iterations"],
+            **mgr_counters,
+            **mgr_scales):
+        raise CampaignError(
+            "sample bounded MGR/equilibration accounting is inconsistent"
         )
     launches = checked_int(
         tensor.get("condensation_launches"),
@@ -1678,10 +1805,9 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
         expected_preconditioner = expected_trace_preconditioner(
             engine, mode, trace_policy
         )
-        expected_trace_solver = (
-            "native-rank1-fp64"
-            if engine == "tensor" else "hypre-parcsr-gmres"
-        )
+        expected_trace_solver = expected_trace_solver_configuration(
+            engine, mode, trace_policy
+        )[0]
         if record.get("trace_solver") != expected_trace_solver:
             raise CampaignError(
                 f"benchmark trace_solver={record.get('trace_solver')!r}; "
@@ -1820,11 +1946,36 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
         )
         if krylov_restart_dimension == 0:
             raise CampaignError("Krylov restart dimension must be positive")
+        newton_linear_tolerance = checked_float(
+            numerical_policy.get(
+                "newton_correction_linear_relative_tolerance"
+            ),
+            "numerical_policy.newton_correction_linear_relative_tolerance",
+        )
+        final_linear_tolerance = checked_float(
+            numerical_policy.get(
+                "final_coherent_linear_relative_tolerance"
+            ),
+            "numerical_policy.final_coherent_linear_relative_tolerance",
+        )
+        tightening_linear_tolerance = checked_float(
+            numerical_policy.get(
+                "true_residual_tightening_linear_relative_tolerance"
+            ),
+            "numerical_policy."
+            "true_residual_tightening_linear_relative_tolerance",
+        )
+        true_residual_tightening_enabled = (
+            tightening_linear_tolerance < newton_linear_tolerance or
+            tightening_linear_tolerance < final_linear_tolerance
+        )
         validate_final_sample(
             samples[0], engine=engine, mode=mode,
             trace_policy=trace_policy,
             expected_preconditioner=expected_preconditioner,
             krylov_restart_dimension=krylov_restart_dimension,
+            true_residual_tightening_enabled=
+                true_residual_tightening_enabled,
             expected_phase="warmup", expected_index=-1,
             expected_duration=None,
         )
@@ -1841,6 +1992,8 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
                 trace_policy=trace_policy,
                 expected_preconditioner=expected_preconditioner,
                 krylov_restart_dimension=krylov_restart_dimension,
+                true_residual_tightening_enabled=
+                    true_residual_tightening_enabled,
                 expected_phase="measured", expected_index=index,
                 expected_duration=duration,
             )
@@ -1936,6 +2089,9 @@ def summarized_sample_work(sample: dict[str, Any], *, schema: int) -> dict[str, 
         "native_rank1_trace_solver_configured": tensor[
             "native_rank1_trace_solver_configured"
         ],
+        "hypre_mgr_rank1_trace_solver_configured": tensor[
+            "hypre_mgr_rank1_trace_solver_configured"
+        ],
         "hypre_host_staged_rank2_trace_solver_configured": tensor[
             "hypre_host_staged_rank2_trace_solver_configured"
         ],
@@ -1983,6 +2139,18 @@ def summarized_sample_work(sample: dict[str, Any], *, schema: int) -> dict[str, 
             "ilu_jacobi_factor_spmv_updates_upper_bound"
         ],
         "ilu_factor_age_generations": tensor["ilu_factor_age_generations"],
+        "equilibration_builds": tensor["equilibration_builds"],
+        "equilibration_passes": tensor["equilibration_passes"],
+        "mgr_setup_calls": tensor["mgr_setup_calls"],
+        "mgr_preconditioner_applications": tensor[
+            "mgr_preconditioner_applications"
+        ],
+        "mgr_f_ilu_setups": tensor["mgr_f_ilu_setups"],
+        "mgr_f_ilu_applications": tensor["mgr_f_ilu_applications"],
+        "minimum_left_scale": tensor["minimum_left_scale"],
+        "maximum_left_scale": tensor["maximum_left_scale"],
+        "minimum_right_scale": tensor["minimum_right_scale"],
+        "maximum_right_scale": tensor["maximum_right_scale"],
         "hardware_supported": tensor["hardware_supported"],
         "condensation_launches": tensor["condensation_launches"],
         "mma_tiles": tensor["mma_tiles"],
@@ -2161,6 +2329,12 @@ def work_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "ilu_jacobi_factor_spmv_updates_upper_bound",
         "native_rank1_trace_solve_calls",
         "hypre_trace_solve_calls",
+        "equilibration_builds",
+        "equilibration_passes",
+        "mgr_setup_calls",
+        "mgr_preconditioner_applications",
+        "mgr_f_ilu_setups",
+        "mgr_f_ilu_applications",
         "condensation_launches",
         "mma_tiles",
         "fallback_count",
@@ -2185,6 +2359,13 @@ def work_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 for tensor in tensor_samples
                 if isinstance(
                     tensor.get("native_rank1_trace_solver_configured"), bool
+                )
+            }),
+            "hypre_mgr_rank1_trace_solver_configured_values": sorted({
+                tensor.get("hypre_mgr_rank1_trace_solver_configured")
+                for tensor in tensor_samples
+                if isinstance(
+                    tensor.get("hypre_mgr_rank1_trace_solver_configured"), bool
                 )
             }),
             "hypre_host_staged_rank2_trace_solver_configured_values": sorted({
@@ -2264,6 +2445,24 @@ def work_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "median": statistics.median(factor_ages),
                 "maximum": max(factor_ages),
             }
+        for field in (
+                "minimum_left_scale",
+                "maximum_left_scale",
+                "minimum_right_scale",
+                "maximum_right_scale"):
+            values = [tensor.get(field) for tensor in tensor_samples]
+            if values and all(
+                    isinstance(value, (int, float)) and
+                    not isinstance(value, bool) and math.isfinite(float(value))
+                    for value in values):
+                # These extrema are already one bounded aggregate per attempt;
+                # summarize their distribution rather than adding them.
+                summary["tensor_core"][field] = {
+                    "count": len(values),
+                    "minimum": min(values),
+                    "median": statistics.median(values),
+                    "maximum": max(values),
+                }
     transfer_fields = (
         "host_to_device_bytes",
         "device_to_host_bytes",
@@ -2455,6 +2654,10 @@ def final_command(executable: Path, *, engine: str, mode: str, order: int,
                   mesh_n: int, domain_periods: int, timestep: float,
                   export: bool, expected_build: dict[str, str],
                   trace_policy: str = "engine-default") -> list[str]:
+    # Fail before launching the benchmark when the explicit policy is not
+    # defined for this exact engine/mode tuple.  In particular, the MGR
+    # experiment is tensor+IGR only.
+    expected_trace_solver_configuration(engine, mode, trace_policy)
     return [
         str(executable),
         "--mode", mode,

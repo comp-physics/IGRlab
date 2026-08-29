@@ -89,8 +89,13 @@ SCHEMA2_ONLY_SAMPLE_FIELDS = {
     "correction_accounting_complete", "product_generations", "tensor_core",
     "trace_solver", "native_rank1_trace_solve_calls",
     "hypre_trace_solve_calls", "native_rank1_trace_solver_configured",
+    "hypre_mgr_rank1_trace_solver_configured",
     "hypre_host_staged_rank2_trace_solver_configured",
-    "trace_solver_accounting_complete",
+    "trace_solver_accounting_complete", "equilibration_builds",
+    "equilibration_passes", "mgr_setup_calls",
+    "mgr_preconditioner_applications", "mgr_f_ilu_setups",
+    "mgr_f_ilu_applications", "minimum_left_scale",
+    "maximum_left_scale", "minimum_right_scale", "maximum_right_scale",
 }
 
 FAKE_BENCHMARK = r'''#!/usr/bin/env python3
@@ -104,7 +109,7 @@ parser.add_argument("--mode", required=True, choices=("conventional", "igr"))
 parser.add_argument("--engine", default="ordinary", choices=("ordinary", "tensor"))
 parser.add_argument(
     "--trace-policy", default="engine-default",
-    choices=("engine-default", "common-fast"),
+    choices=("engine-default", "common-fast", "equilibrated-mgr"),
 )
 parser.add_argument("--order", required=True, type=int)
 parser.add_argument("--mesh-n", required=True, type=int)
@@ -122,14 +127,19 @@ args = parser.parse_args()
 
 is_frozen = "frozen" in str(Path(__file__))
 common_fast = args.trace_policy == "common-fast"
-trace_preconditioner = (
-    "hypre_diag_scale"
-    if args.mode == "conventional" and
-    (common_fast or args.engine == "tensor") else "hypre_ilu0"
-)
+equilibrated_mgr = args.trace_policy == "equilibrated-mgr"
+if equilibrated_mgr and (args.engine != "tensor" or args.mode != "igr"):
+    parser.error("equilibrated-mgr requires tensor IGR")
+if equilibrated_mgr:
+    trace_preconditioner = "hypre_mgr_field_split"
+elif args.mode == "conventional" and \
+        (common_fast or args.engine == "tensor"):
+    trace_preconditioner = "hypre_diag_scale"
+else:
+    trace_preconditioner = "hypre_ilu0"
 ilu_policy = (
     (-1, -1, -1, 0)
-    if trace_preconditioner == "hypre_diag_scale"
+    if trace_preconditioner in ("hypre_diag_scale", "hypre_mgr_field_split")
     else (0, 0, 1 if args.mode == "igr" else 0, 1)
 )
 ilu_factor_reuse_policy = (
@@ -145,6 +155,11 @@ ilu_triangular_policy = (
     else ("iterative_jacobi", 5, 5, 8)
     if args.mode == "igr" and (common_fast or args.engine == "tensor")
     else ("direct", 0, 0, 0)
+)
+trace_solver = (
+    "hypre-fgmres-mgr-rank1"
+    if equilibrated_mgr else "native-rank1-fp64"
+    if args.engine == "tensor" else "hypre-parcsr-gmres"
 )
 if is_frozen:
     scale = 2.5
@@ -234,17 +249,19 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
         sample["tensor_core"] = {
             "selected_engine": args.engine,
             "trace_policy": args.trace_policy,
-            "trace_solver": (
-                "native-rank1-fp64"
-                if args.engine == "tensor" else "hypre-parcsr-gmres"
-            ),
+            "trace_solver": trace_solver,
             "native_rank1_trace_solve_calls": (
-                sample["trace_solves"] if args.engine == "tensor" else 0
+                sample["linear_solve_attempts"]
+                if args.engine == "tensor" and not equilibrated_mgr else 0
             ),
             "hypre_trace_solve_calls": (
-                0 if args.engine == "tensor" else sample["trace_solves"]
+                0 if args.engine == "tensor" and not equilibrated_mgr
+                else sample["linear_solve_attempts"]
             ),
-            "native_rank1_trace_solver_configured": args.engine == "tensor",
+            "native_rank1_trace_solver_configured": (
+                args.engine == "tensor" and not equilibrated_mgr
+            ),
+            "hypre_mgr_rank1_trace_solver_configured": equilibrated_mgr,
             "hypre_host_staged_rank2_trace_solver_configured": False,
             "trace_solver_accounting_complete": True,
             "trace_preconditioner": trace_preconditioner,
@@ -287,6 +304,26 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
                 1 if ilu_factor_reuse_policy ==
                 "first_trace_solve_per_attempt" else 0
             ),
+            "equilibration_builds": (
+                sample["trace_solves"] if equilibrated_mgr else 0
+            ),
+            "equilibration_passes": (
+                2 * sample["trace_solves"] if equilibrated_mgr else 0
+            ),
+            "mgr_setup_calls": (
+                sample["trace_solves"] if equilibrated_mgr else 0
+            ),
+            "mgr_preconditioner_applications": (
+                9 if equilibrated_mgr else 0
+            ),
+            "mgr_f_ilu_setups": (
+                sample["trace_solves"] if equilibrated_mgr else 0
+            ),
+            "mgr_f_ilu_applications": 9 if equilibrated_mgr else 0,
+            "minimum_left_scale": 0.5 if equilibrated_mgr else 0.0,
+            "maximum_left_scale": 2.0 if equilibrated_mgr else 0.0,
+            "minimum_right_scale": 0.25 if equilibrated_mgr else 0.0,
+            "maximum_right_scale": 4.0 if equilibrated_mgr else 0.0,
             "trace_preconditioner_configured": True,
             "hardware_supported": True,
             "condensation_launches": 4 if args.engine == "tensor" else 0,
@@ -314,10 +351,7 @@ payload = {
     "backend": "cuda",
     "cuda_engine": args.engine,
     "trace_policy": args.trace_policy,
-    "trace_solver": (
-        "native-rank1-fp64"
-        if args.engine == "tensor" else "hypre-parcsr-gmres"
-    ),
+    "trace_solver": trace_solver,
     "trace_preconditioner": trace_preconditioner,
     "trace_ilu_type": ilu_policy[0],
     "trace_ilu_level_of_fill": ilu_policy[1],
@@ -480,8 +514,12 @@ if is_frozen:
     ):
         del payload[field]
 else:
-    payload["variant"] = "ablation" if common_fast else "production"
-    payload["production_selectable"] = not common_fast
+    payload["variant"] = (
+        "production" if args.trace_policy == "engine-default" else "ablation"
+    )
+    payload["production_selectable"] = (
+        args.trace_policy == "engine-default"
+    )
     payload["build_identity"] = {
         "source_revision": args.expected_source_revision,
         "source_tree": args.expected_source_tree,
@@ -702,6 +740,47 @@ def main() -> int:
     assert not CAMPAIGN._ilu_factor_accounting_is_valid(
         2, 2, "not_applicable", 0, 1, 0
     )
+    valid_mgr_aggregates = {
+        "expected_mgr": True,
+        "trace_solves": 2,
+        "linear_iterations": 7,
+        "equilibration_builds": 2,
+        "equilibration_passes": 4,
+        "mgr_setup_calls": 2,
+        "mgr_preconditioner_applications": 9,
+        "mgr_f_ilu_setups": 2,
+        "mgr_f_ilu_applications": 9,
+        "minimum_left_scale": 0.5,
+        "maximum_left_scale": 2.0,
+        "minimum_right_scale": 0.25,
+        "maximum_right_scale": 4.0,
+    }
+    assert CAMPAIGN._mgr_accounting_is_valid(**valid_mgr_aggregates)
+    for field, value in (
+            ("equilibration_builds", 1),
+            ("equilibration_passes", 3),
+            ("mgr_setup_calls", 1),
+            ("mgr_f_ilu_setups", 1),
+            ("mgr_f_ilu_applications", 8),
+            ("minimum_left_scale", 0.0),
+            ("maximum_right_scale", 0.1)):
+        invalid = {**valid_mgr_aggregates, field: value}
+        assert not CAMPAIGN._mgr_accounting_is_valid(**invalid)
+    assert CAMPAIGN._mgr_accounting_is_valid(
+        expected_mgr=False,
+        trace_solves=2,
+        linear_iterations=7,
+        equilibration_builds=0,
+        equilibration_passes=0,
+        mgr_setup_calls=0,
+        mgr_preconditioner_applications=0,
+        mgr_f_ilu_setups=0,
+        mgr_f_ilu_applications=0,
+        minimum_left_scale=0.0,
+        maximum_left_scale=0.0,
+        minimum_right_scale=0.0,
+        maximum_right_scale=0.0,
+    )
 
     with tempfile.TemporaryDirectory(prefix="hdg-tensor-campaign-test-") as temp:
         root = Path(temp)
@@ -866,6 +945,167 @@ def main() -> int:
         )
         assert all(provenance_rejected(path) for path in bad_provenance_cases)
 
+        explicit_build = {
+            "source_revision": commit,
+            "source_tree": tree,
+            "source_status": "clean",
+            "build_directory": str(build_cache.resolve().parent),
+            "cmake_cache": str(build_cache.resolve()),
+        }
+        explicit_gpu = {
+            "device_ordinal": 0,
+            "uuid": "GPU-00000000-0000-0000-0000-000000000001",
+            "compute_capability": 120,
+        }
+        mgr_command = CAMPAIGN.final_command(
+            final,
+            engine="tensor",
+            mode="igr",
+            order=2,
+            mesh_n=12,
+            domain_periods=3,
+            timestep=1.0e-5,
+            export=False,
+            expected_build=explicit_build,
+            trace_policy="equilibrated-mgr",
+        )
+        assert mgr_command[mgr_command.index("--trace-policy") + 1] == \
+            "equilibrated-mgr"
+        mgr_record = json.loads(run(mgr_command, root).stdout)
+        mgr_validation_arguments = {
+            "source": "final",
+            "mode": "igr",
+            "order": 2,
+            "mesh_n": 12,
+            "domain_periods": 3,
+            "timestep": 1.0e-5,
+            "export": False,
+            "engine": "tensor",
+            "expected_build": explicit_build,
+            "expected_gpu": explicit_gpu,
+            "trace_policy": "equilibrated-mgr",
+        }
+        CAMPAIGN.validate_record(mgr_record, **mgr_validation_arguments)
+        assert mgr_record["variant"] == "ablation"
+        assert mgr_record["production_selectable"] is False
+        assert mgr_record["trace_solver"] == "hypre-fgmres-mgr-rank1"
+        assert mgr_record["trace_preconditioner"] == \
+            "hypre_mgr_field_split"
+        assert (
+            mgr_record["trace_ilu_type"],
+            mgr_record["trace_ilu_level_of_fill"],
+            mgr_record["trace_ilu_local_reordering"],
+            mgr_record["trace_ilu_application_iterations"],
+        ) == (-1, -1, -1, 0)
+        assert mgr_record["trace_ilu_factor_reuse_policy"] == \
+            "not_applicable"
+        assert mgr_record["trace_ilu_triangular_solve_kind"] == \
+            "not_applicable"
+        for sample in mgr_record["samples"]:
+            tensor = sample["tensor_core"]
+            assert sample["linear_solve_attempts"] == \
+                sample["trace_solves"] + sample["true_residual_tightenings"]
+            assert sample["true_residual_tightenings"] == 0
+            assert tensor["hypre_trace_solve_calls"] == \
+                sample["linear_solve_attempts"]
+            assert tensor["native_rank1_trace_solve_calls"] == 0
+            assert tensor["native_rank1_trace_solver_configured"] is False
+            assert tensor["hypre_mgr_rank1_trace_solver_configured"] is True
+            assert tensor[
+                "hypre_host_staged_rank2_trace_solver_configured"
+            ] is False
+            assert tensor["equilibration_builds"] == sample["trace_solves"]
+            assert tensor["equilibration_passes"] == \
+                2 * sample["trace_solves"]
+            assert tensor["mgr_setup_calls"] == sample["trace_solves"]
+            assert tensor["mgr_preconditioner_applications"] > 0
+            assert tensor["mgr_f_ilu_setups"] == \
+                tensor["mgr_setup_calls"]
+            assert tensor["mgr_f_ilu_applications"] == \
+                tensor["mgr_preconditioner_applications"]
+            assert not set(tensor).intersection({
+                "mgr_history", "equilibration_history", "event_stream",
+                "flight_recorder", "replay",
+            })
+        mgr_record_summary = CAMPAIGN.record_summary(mgr_record)
+        assert all(
+            sample["mgr_f_ilu_applications"] ==
+            sample["mgr_preconditioner_applications"]
+            for sample in mgr_record_summary["measured_sample_work"]
+        )
+        mgr_work_summary = CAMPAIGN.work_summary([mgr_record])["tensor_core"]
+        assert mgr_work_summary["trace_solvers"] == [
+            "hypre-fgmres-mgr-rank1"
+        ]
+        assert mgr_work_summary[
+            "hypre_mgr_rank1_trace_solver_configured_values"
+        ] == [True]
+        assert mgr_work_summary["equilibration_builds"]["total"] == 10
+        assert mgr_work_summary["equilibration_passes"]["total"] == 20
+        assert mgr_work_summary["mgr_setup_calls"]["total"] == 10
+        assert mgr_work_summary["mgr_f_ilu_setups"]["total"] == 10
+        assert mgr_work_summary["mgr_preconditioner_applications"][
+            "total"
+        ] == mgr_work_summary["mgr_f_ilu_applications"]["total"]
+
+        def mgr_rejected(record: dict) -> bool:
+            try:
+                CAMPAIGN.validate_record(record, **mgr_validation_arguments)
+            except CAMPAIGN.CampaignError:
+                return True
+            return False
+
+        for field, value in (
+                ("hypre_trace_solve_calls", 1),
+                ("equilibration_builds", 1),
+                ("equilibration_passes", 3),
+                ("mgr_setup_calls", 1),
+                ("mgr_preconditioner_applications", 0),
+                ("mgr_f_ilu_setups", 1),
+                ("mgr_f_ilu_applications", 8),
+                ("minimum_left_scale", 0.0),
+                ("maximum_right_scale", 0.1)):
+            invalid_mgr = copy.deepcopy(mgr_record)
+            invalid_mgr["samples"][1]["tensor_core"][field] = value
+            assert mgr_rejected(invalid_mgr), field
+        invalid_mgr_flag = copy.deepcopy(mgr_record)
+        invalid_mgr_flag["samples"][1]["tensor_core"][
+            "hypre_mgr_rank1_trace_solver_configured"
+        ] = False
+        assert mgr_rejected(invalid_mgr_flag)
+        invalid_mgr_solver = copy.deepcopy(mgr_record)
+        invalid_mgr_solver["trace_solver"] = "native-rank1-fp64"
+        assert mgr_rejected(invalid_mgr_solver)
+        impossible_tightening = copy.deepcopy(mgr_record)
+        impossible_sample = impossible_tightening["samples"][1]
+        impossible_sample["linear_solve_attempts"] = 3
+        impossible_sample["true_residual_tightenings"] = 1
+        impossible_sample["tensor_core"]["hypre_trace_solve_calls"] = 3
+        assert mgr_rejected(impossible_tightening)
+        for engine, mode in (
+                ("ordinary", "igr"),
+                ("ordinary", "conventional"),
+                ("tensor", "conventional")):
+            try:
+                CAMPAIGN.final_command(
+                    final,
+                    engine=engine,
+                    mode=mode,
+                    order=2,
+                    mesh_n=12,
+                    domain_periods=3,
+                    timestep=1.0e-5,
+                    export=False,
+                    expected_build=explicit_build,
+                    trace_policy="equilibrated-mgr",
+                )
+            except CAMPAIGN.CampaignError:
+                pass
+            else:
+                raise AssertionError(
+                    "MGR command admitted an unsupported engine/mode"
+                )
+
         output = root / "evidence"
         command = [
             sys.executable,
@@ -988,6 +1228,35 @@ def main() -> int:
             assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
                 engine, "igr", "common-fast"
             ) == "first_trace_solve_per_attempt"
+        assert CAMPAIGN.expected_trace_preconditioner(
+            "tensor", "igr", "equilibrated-mgr"
+        ) == "hypre_mgr_field_split"
+        assert CAMPAIGN.expected_trace_ilu_policy(
+            "tensor", "igr", "equilibrated-mgr"
+        ) == (-1, -1, -1, 0)
+        assert CAMPAIGN.expected_trace_ilu_triangular_solve_policy(
+            "tensor", "igr", "equilibrated-mgr"
+        ) == ("not_applicable", 0, 0, 0)
+        assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
+            "tensor", "igr", "equilibrated-mgr"
+        ) == "not_applicable"
+        assert CAMPAIGN.expected_trace_solver_configuration(
+            "tensor", "igr", "equilibrated-mgr"
+        ) == ("hypre-fgmres-mgr-rank1", False, True, False)
+        for engine, mode in (
+                ("ordinary", "igr"),
+                ("ordinary", "conventional"),
+                ("tensor", "conventional")):
+            try:
+                CAMPAIGN.expected_trace_solver_configuration(
+                    engine, mode, "equilibrated-mgr"
+                )
+            except CAMPAIGN.CampaignError:
+                pass
+            else:
+                raise AssertionError(
+                    "equilibrated-mgr admitted an unsupported engine/mode"
+                )
         for cell_key, result in campaign["final_tree_results"].items():
             comparison = result["paired_comparison"]
             assert math.isclose(comparison["speedup"]["median"], 2.0)
