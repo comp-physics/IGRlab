@@ -1371,10 +1371,17 @@ bool CudaLaunchNativeRankOneTraceSolver(
                    matrix.diag_columns_count, matrix.diag_nonzeros};
   system.rhs = rhs;
   system.solution = solution;
-  system.operator_kind = trace_operator.kind ==
-          CudaNativeTraceOperatorKind::element_matrix_free_fp64
-      ? NativeTraceOperatorKind::element_matrix_free_fp64
-      : NativeTraceOperatorKind::assembled_csr_fp64;
+  switch (trace_operator.kind)
+  {
+  case CudaNativeTraceOperatorKind::assembled_csr_fp64:
+    system.operator_kind = NativeTraceOperatorKind::assembled_csr_fp64;
+    break;
+  case CudaNativeTraceOperatorKind::element_matrix_free_fp64:
+    system.operator_kind = NativeTraceOperatorKind::element_matrix_free_fp64;
+    break;
+  default:
+    return false;
+  }
   system.element_schur = trace_operator.element_schur;
 
   NativeTracePreconditionerView preconditioner{};
