@@ -196,6 +196,8 @@ struct NativeTraceWorkspaceView final
 struct NativeTraceCooperativeSupport final
 {
   bool supported = false;
+  /** Exact kernel specialization whose occupancy produced this record. */
+  bool fixed_sigma_jacobi = false;
   int device = -1;
   int compute_major = 0;
   int compute_minor = 0;

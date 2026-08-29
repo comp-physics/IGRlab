@@ -1593,6 +1593,13 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
     const int scalar = sigma_row % scalar_face_rows;
     return ((face + 1) % 4) * face_rows + scalar;
   };
+  const auto paired_sigma_row = [scalar_face_rows](const int sigma_row)
+  {
+    const int face_rows = 5 * scalar_face_rows;
+    const int face = sigma_row / face_rows;
+    const int scalar = sigma_row % scalar_face_rows;
+    return ((face + 1) % 4) * face_rows + 4 * scalar_face_rows + scalar;
+  };
   const auto diagonal_value = [face_rows](const int row)
   {
     return 1.25 + 0.005 * static_cast<double>(row % face_rows);
@@ -1602,13 +1609,23 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
     return 0.125 + 0.01 *
         static_cast<double>(sigma_row % scalar_face_rows);
   };
+  const auto sigma_coupling_value = [scalar_face_rows](const int sigma_row)
+  {
+    return 0.055 + 0.005 *
+        static_cast<double>(sigma_row % scalar_face_rows);
+  };
 
   // Two elements share one complete face. Each scalar sigma row couples to
-  // an Euler row on the next local face, so a shared sigma row sees distinct
-  // Euler neighbors from the two patches. No individual principal patch is
-  // the global inverse and all three global sigma corrections are nonzero.
-  // Element zero uses negative trace orientation, so reconstructing the true
-  // RHS from its first incidence also requires the retained sign.
+  // an Euler row and a different sigma row on the next local face. The
+  // sigma-sigma face cycle crosses warp boundaries for every p1--p3 fixture
+  // and makes every correction depend on the previous sweep's complete sigma
+  // vector, so this distinguishes synchronous Jacobi/double buffering from an
+  // in-place Gauss-Seidel update or a missing inter-warp barrier. A shared sigma
+  // row also sees distinct neighbors from the two patches. No individual
+  // principal patch is the global inverse and all three global sigma
+  // corrections are nonzero. Element zero uses negative trace orientation, so
+  // reconstructing the true RHS from its first incidence also requires the
+  // retained sign.
   std::vector<double> element_schur(
       static_cast<std::size_t>(elements) * patch_entries, 0.0);
   for (int element = 0; element < elements; ++element)
@@ -1620,8 +1637,12 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
       schur[static_cast<std::size_t>(row) * patch_rows + row] =
           diagonal_value(row);
       if (is_sigma_row(row))
+      {
         schur[static_cast<std::size_t>(row) * patch_rows +
               paired_euler_row(row)] = coupling_value(row);
+        schur[static_cast<std::size_t>(row) * patch_rows +
+              paired_sigma_row(row)] = sigma_coupling_value(row);
+      }
     }
   }
 
@@ -1688,6 +1709,18 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
             static_cast<std::size_t>(element) * patch_entries +
             static_cast<std::size_t>(row) * patch_rows + column];
       }
+  constexpr int warp_rows = 32;
+  bool has_sigma_cross_warp_coupling = false;
+  for (int row = 0; row < true_rows; ++row)
+    for (int column = 0; column < true_rows; ++column)
+      has_sigma_cross_warp_coupling = has_sigma_cross_warp_coupling ||
+          (row != column &&
+           row / warp_rows != column / warp_rows &&
+           sigma_class[static_cast<std::size_t>(row)] == 1 &&
+           sigma_class[static_cast<std::size_t>(column)] == 1 &&
+           global_matrix[static_cast<std::size_t>(row) * true_rows +
+                         column] != 0.0);
+  if (!has_sigma_cross_warp_coupling) return false;
   const NativeCsrFixture matrix =
       DenseToDiagonalFirstCsr(global_matrix, true_rows);
   if (!NativeCsrFixtureIsValid(matrix)) return false;
@@ -1798,7 +1831,9 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
       QueryNativeTraceWorkspaceRequirements(
           true_rows, policy.krylov_dimension,
           support.cooperative_blocks, true);
-  if (!support.supported || !requirements.valid) return false;
+  if (!support.supported || !support.fixed_sigma_jacobi ||
+      !requirements.valid)
+    return false;
 
   NativeDeviceAllocation<int> device_matrix_offsets;
   NativeDeviceAllocation<int> device_matrix_columns;
@@ -1854,6 +1889,21 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
   workspace.permutation_marks = permutation_marks.data();
   workspace.permutation_integers = requirements.permutation_integers;
   workspace.device_control = control.data();
+  auto mismatched_support = support;
+  mismatched_support.fixed_sigma_jacobi = false;
+  if (LaunchNativeRankOneTraceSolve(
+          system, preconditioner, workspace, policy, mismatched_support,
+          nullptr))
+    return false;
+  auto base_preconditioner = preconditioner;
+  base_preconditioner.kind = cooperative_warp
+      ? NativeTracePreconditionerKind::
+            element_overlap_schwarz_warp_equilibrated_field_split_fp64
+      : NativeTracePreconditionerKind::
+            element_overlap_schwarz_equilibrated_field_split_fp64;
+  if (LaunchNativeRankOneTraceSolve(
+          system, base_preconditioner, workspace, policy, support, nullptr))
+    return false;
   if (!LaunchNativeRankOneTraceSolve(
           system, preconditioner, workspace, policy, support, nullptr) ||
       cudaDeviceSynchronize() != cudaSuccess)
@@ -1949,6 +1999,35 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
         return false;
   }
   if (!nonzero_sigma_correction) return false;
+
+  // A lexicographic in-place sigma sweep is deliberately not equivalent for
+  // this cross-coupled fixture. Keep this assertion so removing either the
+  // sigma-sigma entries or the device double buffer cannot make the CPU
+  // reference accidentally accept Gauss-Seidel semantics.
+  std::vector<double> in_place = predictor;
+  for (int sweep = 0; sweep < native_trace_sigma_jacobi_sweeps; ++sweep)
+    for (int row = 0; row < true_rows; ++row)
+    {
+      if (sigma_class[static_cast<std::size_t>(row)] != 1) continue;
+      double action = 0.0;
+      for (int column = 0; column < true_rows; ++column)
+        action += global_matrix[
+            static_cast<std::size_t>(row) * true_rows + column] *
+            in_place[static_cast<std::size_t>(column)];
+      const double diagonal = global_matrix[
+          static_cast<std::size_t>(row) * true_rows + row];
+      in_place[static_cast<std::size_t>(row)] +=
+          native_trace_sigma_jacobi_damping *
+          (right_hand_side[static_cast<std::size_t>(row)] - action) /
+              diagonal;
+    }
+  bool differs_from_in_place = false;
+  for (int row = 0; row < true_rows; ++row)
+    if (sigma_class[static_cast<std::size_t>(row)] == 1)
+      differs_from_in_place = differs_from_in_place ||
+          std::abs(in_place[static_cast<std::size_t>(row)] -
+                   preconditioned[static_cast<std::size_t>(row)]) > 1.0e-10;
+  if (!differs_from_in_place) return false;
 
   double rhs_norm_squared = 0.0;
   std::vector<double> operator_action(static_cast<std::size_t>(true_rows));

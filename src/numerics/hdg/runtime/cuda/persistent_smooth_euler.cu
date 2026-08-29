@@ -1333,7 +1333,7 @@ bool CudaQueryNativeRankOneTraceResources(
       QueryNativeRankOneTraceCooperativeSupport(
           rows, krylov_dimension, igr_active, fixed_sigma_jacobi);
   support.supported = native_support.supported;
-  support.fixed_sigma_jacobi = fixed_sigma_jacobi;
+  support.fixed_sigma_jacobi = native_support.fixed_sigma_jacobi;
   support.device = native_support.device;
   support.compute_major = native_support.compute_major;
   support.compute_minor = native_support.compute_minor;
@@ -1497,6 +1497,7 @@ bool CudaLaunchNativeRankOneTraceSolver(
 
   NativeTraceCooperativeSupport native_support{};
   native_support.supported = support.supported;
+  native_support.fixed_sigma_jacobi = support.fixed_sigma_jacobi;
   native_support.device = support.device;
   native_support.compute_major = support.compute_major;
   native_support.compute_minor = support.compute_minor;

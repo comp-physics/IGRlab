@@ -31,6 +31,22 @@ inline constexpr int native_trace_schwarz_euler_components = 4;
 inline constexpr double native_trace_schwarz_minimum_scale = 0x1p-40;
 inline constexpr double native_trace_schwarz_maximum_scale = 0x1p40;
 
+// Keep the device launch POD byte-for-byte compatible with the production
+// kernel while the public host support record carries specialization identity.
+// In particular, adding a host-only tag must not perturb the old kernel's
+// parameter IR, register allocation, or encoded SASS.
+struct NativeTraceKernelCooperativeSupport final
+{
+  bool supported = false;
+  int device = -1;
+  int compute_major = 0;
+  int compute_minor = 0;
+  int multiprocessors = 0;
+  int threads_per_block = 0;
+  int maximum_active_blocks_per_multiprocessor = 0;
+  int cooperative_blocks = 0;
+};
+
 __host__ __device__ constexpr bool NativeTracePreconditionerIsElementSchwarz(
     const NativeTracePreconditionerKind kind) noexcept
 {
@@ -1486,7 +1502,7 @@ __global__ void NativeRankOneTraceSolveKernel(
     const NativeTracePreconditionerView preconditioner,
     const NativeTraceWorkspaceView workspace,
     const NativeTraceSolvePolicy policy,
-    const NativeTraceCooperativeSupport support)
+    const NativeTraceKernelCooperativeSupport support)
 {
   cg::grid_group grid = cg::this_grid();
   __shared__ double block_scratch[native_trace_cooperative_threads];
@@ -2066,6 +2082,7 @@ QueryNativeRankOneTraceCooperativeSupport(const int rows,
                                           const bool fixed_sigma_jacobi) noexcept
 {
   NativeTraceCooperativeSupport result{};
+  result.fixed_sigma_jacobi = fixed_sigma_jacobi;
   if (rows <= 0 || krylov_dimension <= 0 ||
       krylov_dimension == std::numeric_limits<int>::max() ||
       (fixed_sigma_jacobi && !igr_active))
@@ -2086,7 +2103,7 @@ QueryNativeRankOneTraceCooperativeSupport(const int rows,
                              device) != cudaSuccess ||
       cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount,
                              device) != cudaSuccess)
-    return NativeTraceCooperativeSupport{};
+    return result;
 
   const cudaError_t occupancy = fixed_sigma_jacobi
       ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -2099,7 +2116,7 @@ QueryNativeRankOneTraceCooperativeSupport(const int rows,
           : cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                 &active_blocks, NativeRankOneTraceSolveKernel<false, false>,
                 native_trace_cooperative_threads, 0);
-  if (occupancy != cudaSuccess) return NativeTraceCooperativeSupport{};
+  if (occupancy != cudaSuccess) return result;
 
   // This leaf is an SM120 tensor-backend implementation, not a generic CUDA
   // fallback.  A different device is rejected rather than silently rerouted.
@@ -2292,6 +2309,7 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
   }
   int current_device = -1;
   if (!requirements.valid || workspace_overlap || !support.supported ||
+      support.fixed_sigma_jacobi != use_fixed_sigma_jacobi ||
       (use_fixed_sigma_jacobi &&
        (!use_element_schwarz ||
         !NativeTracePreconditionerIsEquilibratedFieldSplit(
@@ -2430,7 +2448,16 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
   preconditioner_argument.kind = kernel_preconditioner_kind;
   NativeTraceWorkspaceView workspace_argument = workspace;
   NativeTraceSolvePolicy policy_argument = policy;
-  NativeTraceCooperativeSupport support_argument = support;
+  NativeTraceKernelCooperativeSupport support_argument{};
+  support_argument.supported = support.supported;
+  support_argument.device = support.device;
+  support_argument.compute_major = support.compute_major;
+  support_argument.compute_minor = support.compute_minor;
+  support_argument.multiprocessors = support.multiprocessors;
+  support_argument.threads_per_block = support.threads_per_block;
+  support_argument.maximum_active_blocks_per_multiprocessor =
+      support.maximum_active_blocks_per_multiprocessor;
+  support_argument.cooperative_blocks = support.cooperative_blocks;
   void* arguments[] = {&system_argument, &preconditioner_argument,
                        &workspace_argument, &policy_argument,
                        &support_argument};
