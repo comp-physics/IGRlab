@@ -209,8 +209,14 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
             "native_element_schwarz_warp_coupled_sigma_jacobi10_fp64",
             True,
         ),
+        "native-element-schwarz-matrix-free-warp-robust-coupled-"
+        "sigma-jacobi10-fp64": (
+            10,
+            "native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64",
+            True,
+        ),
     }
-    assert len(expected) == 22
+    assert len(expected) == 23
     assert PROFILE.FIXED_SIGMA_JACOBI_PROFILE_POLICIES == expected
     for order in (1, 2, 3):
         conventional_default = PROFILE._profile_trace_policy_contract(
@@ -229,8 +235,9 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
         assert igr_default == (
             "engine-default", resolved, descriptor.preconditioner,
             "production", True, descriptor, True,
-            "lower-multiplicative-uhat4-sigmahat",
-            "cooperative-pivoted-lu-fp64",
+            "adaptive-lower-multiplicative-uhat4-sigmahat-or-"
+            "full-coupled-patch-lu",
+            "adaptive-cooperative-lower-or-full-patch-pivoted-lu-fp64",
             16 if order == 1 else 32,
         )
 
@@ -262,13 +269,17 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
         )
     for policy, descriptor in expected.items():
         contract = PROFILE._profile_trace_policy_contract(policy, "igr", 2)
+        robust = policy in PROFILE.ROBUST_WARP_PROFILE_POLICIES
         coupled = "-warp-coupled-" in policy
         assert contract == (
             policy, policy, descriptor[1], "ablation", False,
             PROFILE.FixedSigmaJacobiProfilePolicy(*descriptor), True,
-            "full-coupled-patch-lu" if coupled
+            "adaptive-lower-multiplicative-uhat4-sigmahat-or-"
+            "full-coupled-patch-lu" if robust
+            else "full-coupled-patch-lu" if coupled
             else "lower-multiplicative-uhat4-sigmahat",
-            "cooperative-full-patch-pivoted-lu-fp64" if coupled
+            "adaptive-cooperative-lower-or-full-patch-pivoted-lu-fp64"
+            if robust else "cooperative-full-patch-pivoted-lu-fp64" if coupled
             else "cooperative-pivoted-lu-fp64" if descriptor[2]
             else "scalar-pivoted-lu-fp64",
             32 if coupled or descriptor[2] else 0,
@@ -281,6 +292,9 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
         )
         tensor = {
             "element_schwarz_preconditioner_applications": 9,
+            "sigma_jacobi_sweeps": descriptor[0],
+            "sigma_jacobi_damping": 2.0 / 3.0,
+            "sigma_jacobi_updates": 9 * descriptor[0],
             "field_split_sigma_jacobi_sweeps": descriptor[0],
             "field_split_sigma_jacobi_damping": 2.0 / 3.0,
             "field_split_sigma_jacobi_updates": 9 * descriptor[0],
@@ -291,7 +305,7 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
         assert validated["sigma_jacobi_sweeps"] == descriptor[0]
         assert validated["sigma_jacobi_damping"] == 2.0 / 3.0
         assert validated["sigma_jacobi_updates"] == 9 * descriptor[0]
-        if coupled:
+        if coupled or robust:
             assert not any(
                 key.startswith("field_split_") for key in validated
             )
@@ -356,6 +370,9 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
     )
     base_tensor = {
         "element_schwarz_preconditioner_applications": 9,
+        "sigma_jacobi_sweeps": 0,
+        "sigma_jacobi_damping": 0.0,
+        "sigma_jacobi_updates": 0,
         "field_split_sigma_jacobi_sweeps": 0,
         "field_split_sigma_jacobi_damping": 0.0,
         "field_split_sigma_jacobi_updates": 0,
@@ -571,22 +588,14 @@ else:
     interior_unknowns = 75712 if p1_igr else 302848
     condensation_tiles_per_launch = 889616 if p1_igr else 22827168
     volume_tiles_per_assembly = 908544 if p1_igr else 15331680
-    low_order_igr = order <= 2
     resolved_trace_policy = (
-        "native-element-schwarz-matrix-free-warp-"
-        "equilibrated-field-split-sigma-jacobi10-fp64"
-        if low_order_igr else
-        "native-element-schwarz-matrix-free-warp-"
-        "equilibrated-field-split-sigma-jacobi2-fp64"
+        "native-element-schwarz-matrix-free-warp-robust-coupled-"
+        "sigma-jacobi10-fp64"
     )
     trace_preconditioner = (
-        "native_element_schwarz_warp_equilibrated_field_split_"
-        "sigma_jacobi10_fp64"
-        if low_order_igr else
-        "native_element_schwarz_warp_equilibrated_field_split_"
-        "sigma_jacobi2_fp64"
+        "native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64"
     )
-    sigma_sweeps = 10 if low_order_igr else 2
+    sigma_sweeps = 10
     top_level_resolved_trace_policy = (
         "engine-default" if os.environ.get("FAKE_APP_BAD_TOP_RESOLVED")
         else resolved_trace_policy
@@ -608,17 +617,27 @@ else:
         "resolved_trace_policy": top_level_resolved_trace_policy,
         "trace_preconditioner": trace_preconditioner,
         "trace_element_schwarz_factorization":
-            "lower-multiplicative-uhat4-sigmahat",
+            "adaptive-lower-multiplicative-uhat4-sigmahat-or-"
+            "full-coupled-patch-lu",
         "trace_element_schwarz_equilibration_passes": 2,
         "trace_element_schwarz_euler_rows": 16 * (order + 1),
         "trace_element_schwarz_sigma_rows": 4 * (order + 1),
-        "trace_element_schwarz_apply": "cooperative-pivoted-lu-fp64",
+        "trace_element_schwarz_apply":
+            "adaptive-cooperative-lower-or-full-patch-pivoted-lu-fp64",
         "trace_element_schwarz_apply_tile_width":
             16 if order == 1 else 32,
         "trace_sigma_jacobi_sweeps": sigma_sweeps,
         "trace_sigma_jacobi_damping": 2.0 / 3.0,
         "trace_field_split_sigma_jacobi_sweeps": sigma_sweeps,
         "trace_field_split_sigma_jacobi_damping": 2.0 / 3.0,
+        "trace_robust_lower_specialization_supported": True,
+        "trace_robust_coupled_specialization_supported":
+            not bool(os.environ.get("FAKE_APP_BAD_ROBUST_SUPPORT")),
+        "trace_robust_branch_accounting_complete": True,
+        "trace_robust_lower_patch_setups": 2,
+        "trace_robust_lower_trace_solve_calls": 2,
+        "trace_robust_coupled_patch_setups": 0,
+        "trace_robust_coupled_trace_solve_calls": 0,
         "mode": "igr",
         "rank_count": 1,
         "polynomial_order": order,
@@ -659,12 +678,38 @@ else:
         "samples": [{
             "phase": "measured",
             "measured_index": 2,
+            "trace_solves": 2,
+            "linear_solve_attempts": 2,
             "tensor_core": {
                 "selected_engine": "tensor",
                 "requested_trace_policy": "engine-default",
                 "resolved_trace_policy": sample_resolved_trace_policy,
                 "trace_preconditioner": trace_preconditioner,
+                "native_rank1_trace_solver_configured": True,
+                "native_rank1_trace_solve_calls": (
+                    1 if os.environ.get("FAKE_APP_BAD_NATIVE_TRACE_CALLS")
+                    else 2
+                ),
+                "hypre_trace_solve_calls": (
+                    1 if os.environ.get("FAKE_APP_BAD_HYPRE_TRACE_CALLS")
+                    else 0
+                ),
+                "trace_solver_accounting_complete": not bool(
+                    os.environ.get("FAKE_APP_BAD_TRACE_ACCOUNTING")
+                ),
                 "element_schwarz_preconditioner_applications": 9,
+                "robust_lower_specialization_supported": True,
+                "robust_coupled_specialization_supported": True,
+                "robust_branch_accounting_complete": True,
+                "robust_lower_patch_setups": 2,
+                "robust_lower_trace_solve_calls": 2,
+                "robust_coupled_patch_setups": 0,
+                "robust_coupled_trace_solve_calls": (
+                    1 if os.environ.get("FAKE_APP_BAD_ROBUST_COUNTER") else 0
+                ),
+                "sigma_jacobi_sweeps": sigma_sweeps,
+                "sigma_jacobi_damping": 2.0 / 3.0,
+                "sigma_jacobi_updates": 9 * sigma_sweeps,
                 "field_split_sigma_jacobi_sweeps": sigma_sweeps,
                 "field_split_sigma_jacobi_damping": 2.0 / 3.0,
                 "field_split_sigma_jacobi_updates": 9 * sigma_sweeps,
@@ -746,6 +791,13 @@ else:
         "trace_sigma_jacobi_damping": 0.0,
         "trace_field_split_sigma_jacobi_sweeps": 0,
         "trace_field_split_sigma_jacobi_damping": 0.0,
+        "trace_robust_lower_specialization_supported": False,
+        "trace_robust_coupled_specialization_supported": False,
+        "trace_robust_branch_accounting_complete": True,
+        "trace_robust_lower_patch_setups": 0,
+        "trace_robust_lower_trace_solve_calls": 0,
+        "trace_robust_coupled_patch_setups": 0,
+        "trace_robust_coupled_trace_solve_calls": 0,
         "mode": "conventional",
         "rank_count": 1,
         "polynomial_order": 2,
@@ -771,12 +823,28 @@ else:
         "samples": [{
             "phase": "measured",
             "measured_index": 2,
+            "trace_solves": 2,
+            "linear_solve_attempts": 2,
             "tensor_core": {
                 "selected_engine": "tensor",
                 "requested_trace_policy": "engine-default",
                 "resolved_trace_policy": "engine-default",
                 "trace_preconditioner": "hypre_diag_scale",
+                "native_rank1_trace_solver_configured": True,
+                "native_rank1_trace_solve_calls": 2,
+                "hypre_trace_solve_calls": 0,
+                "trace_solver_accounting_complete": True,
                 "element_schwarz_preconditioner_applications": 0,
+                "robust_lower_specialization_supported": False,
+                "robust_coupled_specialization_supported": False,
+                "robust_branch_accounting_complete": True,
+                "robust_lower_patch_setups": 0,
+                "robust_lower_trace_solve_calls": 0,
+                "robust_coupled_patch_setups": 0,
+                "robust_coupled_trace_solve_calls": 0,
+                "sigma_jacobi_sweeps": 0,
+                "sigma_jacobi_damping": 0.0,
+                "sigma_jacobi_updates": 0,
                 "field_split_sigma_jacobi_sweeps": 0,
                 "field_split_sigma_jacobi_damping": 0.0,
                 "field_split_sigma_jacobi_updates": 0,
@@ -909,6 +977,26 @@ else:
         assert application_work["volume_contraction_launches"] == 3
         assert application_work["planned_volume_mma_tiles"] == 45995040
         assert application_work["all_intended_fused_stages_material"] is True
+        assert application_work["sigma_jacobi_sweeps"] == 10
+        assert application_work["sigma_jacobi_updates"] == 90
+        assert application_work[
+            "robust_lower_specialization_supported"
+        ] is True
+        assert application_work[
+            "robust_coupled_specialization_supported"
+        ] is True
+        assert application_work[
+            "robust_branch_accounting_complete"
+        ] is True
+        assert application_work["robust_lower_patch_setups"] == 2
+        assert application_work["robust_lower_trace_solve_calls"] == 2
+        assert application_work["robust_coupled_patch_setups"] == 0
+        assert application_work[
+            "robust_coupled_trace_solve_calls"
+        ] == 0
+        assert application_work["native_rank1_trace_solve_calls"] == 2
+        assert application_work["hypre_trace_solve_calls"] == 0
+        assert application_work["trace_solver_accounting_complete"] is True
         assert proof["duration_unit"] == "nanoseconds"
         assert proof["raw_duration_unit_field"] == "nsecond"
         assert proof["import_command"][-2:] == ["--print-units", "base"]
@@ -937,6 +1025,26 @@ else:
             (
                 "bad-sample-resolved", "FAKE_APP_BAD_SAMPLE_RESOLVED",
                 "does not prove an admitted no-fallback tensor engine",
+            ),
+            (
+                "bad-robust-support", "FAKE_APP_BAD_ROBUST_SUPPORT",
+                "robust specialization/accounting evidence is invalid",
+            ),
+            (
+                "bad-robust-counter", "FAKE_APP_BAD_ROBUST_COUNTER",
+                "did not remain on the robust lower branch",
+            ),
+            (
+                "bad-native-trace-calls", "FAKE_APP_BAD_NATIVE_TRACE_CALLS",
+                "recurring trace-solver work does not match",
+            ),
+            (
+                "bad-hypre-trace-calls", "FAKE_APP_BAD_HYPRE_TRACE_CALLS",
+                "recurring trace-solver work does not match",
+            ),
+            (
+                "bad-trace-accounting", "FAKE_APP_BAD_TRACE_ACCOUNTING",
+                "recurring trace-solver work does not match",
             ),
             (
                 "bad-igr-volume-q", "FAKE_APP_BAD_IGR_VOLUME_Q",

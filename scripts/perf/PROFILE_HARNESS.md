@@ -104,6 +104,39 @@ NCU/SASS proof required for the production engine package. The ablation keeps
 only bounded benchmark samples and aggregate policy/work metadata; neither the
 campaign nor this profiler harness is a flight recorder or replay facility.
 
+For tensor IGR, `engine-default` resolves at p1, p2, and p3 to
+`native-element-schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-fp64`.
+The summary must report the adaptive lower-or-full-coupled factor/apply
+metadata, both specialization-support booleans, complete branch accounting,
+generic J10 sigma work, and exactly four fixed aggregate branch counters. A
+production profile must exercise the lower specialization; the distinct p1–p3
+zero-gradient correctness fixtures qualify the first-application coupled
+retry, while the W8A rank-one device fixture qualifies setup-time structural
+selection and finite scale-invalid/nonfinite fail-closed classification at
+p1–p3. This
+selection is a tensor-native robust specialization, not fallback execution,
+and `fallback_count` remains exactly zero. No ordered branch history, callback
+stream, recorder, or replay data are retained.
+
+Every selected rank-one tensor sample, conventional as well as IGR, must also
+report the native trace solver configured, complete trace-solver accounting,
+and zero HYPRE trace-solve calls. For robust tensor IGR, native calls must equal
+the sum of the lower and coupled physical-call aggregates; for a non-robust
+tensor profile, native calls must equal the logical linear-attempt count.
+These fixed totals prevent rejected lower applications or conventional native
+trace work from disappearing from profiler attribution without retaining a
+per-attempt event sequence.
+
+Qualification also binds the explicit campaign-candidate numerical policy.
+IGR p1, p2, and p3 use
+volume/face quadrature `(6,4)`, `(8,6)`, and `(10,8)` respectively; every
+profile uses role tolerances `(1e-10,3e-11,1e-12)` for Newton correction,
+final-coherent solve, and strict true-residual tightening. Conventional mode
+does not accept IGR quadrature arguments but uses the same role tolerances.
+This does not alter the general application default, which remains IGR
+q12/q12 and all three linear roles at `1e-12` unless an explicit policy is
+supplied.
+
 `--ncu-qualification-kind tensor-instructions` is the condensation native-
 instruction proof. Its only metrics are
 `sm__inst_executed_pipe_fp64_op_dmma.sum` and
@@ -205,6 +238,11 @@ python3 scripts/perf/profile_harness.py \
   --arg=--trace-policy --arg engine-default \
   --arg=--order --arg 3 --arg=--mesh-n --arg 52 \
   --arg=--domain-periods --arg 1 --arg=--dt --arg 1e-5 \
+  --arg=--newton-linear-rtol --arg 1e-10 \
+  --arg=--final-linear-rtol --arg 3e-11 \
+  --arg=--true-residual-tightening-linear-rtol --arg 1e-12 \
+  --arg=--igr-volume-quadrature-order --arg 10 \
+  --arg=--igr-face-quadrature-order --arg 8 \
   --arg=--profile-measured-step --arg 2 --arg=--no-export \
   --arg=--expected-source-revision --arg "$COMMIT" \
   --arg=--expected-source-tree --arg "$TREE" \

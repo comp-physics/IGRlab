@@ -233,6 +233,8 @@ using dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy;
 using dg::hdg::runtime::cuda_w8a::CudaTransferTotals;
 using dg::hdg::runtime::cuda_w8a::CudaTransportPolicy;
 using dg::hdg::runtime::cuda_w8a::conserved_components;
+using dg::hdg::runtime::cuda_w8a::
+    native_element_schwarz_sigma_jacobi_maximum_sweeps;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaAcceptedStepBenchmarkObservation;
 using dg::hdg::runtime::cuda_w8a::detail::
@@ -647,6 +649,14 @@ bool SelectTracePolicy(
         native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi10_fp64;
     return true;
   }
+  if (text ==
+      "native-element-schwarz-matrix-free-warp-robust-coupled-sigma-"
+      "jacobi10-fp64")
+  {
+    options.trace_policy = CudaTracePolicyKind::
+        native_element_schwarz_matrix_free_warp_robust_coupled_sigma_jacobi10_fp64;
+    return true;
+  }
   return false;
 }
 
@@ -742,7 +752,9 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
                 "sigma-jacobi3-fp64, or the corresponding sigma-jacobi1-"
                 "fp64 through sigma-jacobi10-fp64 policy, or native-element-"
                 "schwarz-matrix-free-warp-coupled-fp64 and its explicit "
-                "sigma-jacobi2-fp64 or sigma-jacobi10-fp64 variants";
+                "sigma-jacobi2-fp64 or sigma-jacobi10-fp64 variants, or "
+                "native-element-schwarz-matrix-free-warp-robust-coupled-"
+                "sigma-jacobi10-fp64";
         return false;
       }
       continue;
@@ -999,7 +1011,9 @@ void PrintUsage(const char* executable)
                " [coupled-policy native-element-schwarz-matrix-free-warp-"
                "coupled-fp64|native-element-schwarz-matrix-free-warp-"
                "coupled-sigma-jacobi2-fp64|native-element-schwarz-matrix-"
-               "free-warp-coupled-sigma-jacobi10-fp64]"
+               "free-warp-coupled-sigma-jacobi10-fp64|native-element-"
+               "schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-"
+               "fp64]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
@@ -1013,7 +1027,9 @@ void PrintUsage(const char* executable)
                " [coupled-policy native-element-schwarz-matrix-free-warp-"
                "coupled-fp64|native-element-schwarz-matrix-free-warp-"
                "coupled-sigma-jacobi2-fp64|native-element-schwarz-matrix-"
-               "free-warp-coupled-sigma-jacobi10-fp64]"
+               "free-warp-coupled-sigma-jacobi10-fp64|native-element-"
+               "schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-"
+               "fp64]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
@@ -1415,6 +1431,11 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
   const bool expected_equilibrated_field_split =
       CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
           expected_preconditioner);
+  const bool expected_robust =
+      CudaTracePolicyUsesNativeElementMatrixFreeWarpRobustCoupled(
+          resolved_trace_policy) &&
+      CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+          expected_preconditioner);
   const bool expected_native_solver =
       engine == CudaEngineKind::tensor_core && !expected_mgr_solver;
   const bool mgr_work_consistent = expected_mgr_solver
@@ -1434,7 +1455,7 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
             tensor.minimum_left_scale <= tensor.maximum_left_scale &&
             tensor.minimum_right_scale > 0.0 &&
             tensor.minimum_right_scale <= tensor.maximum_right_scale
-      : expected_equilibrated_field_split
+      : (expected_equilibrated_field_split || expected_robust)
           ? tensor.equilibration_builds == trace_solves &&
                 tensor.equilibration_passes ==
                     native_element_schwarz_equilibration_passes *
@@ -1483,6 +1504,25 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
              (tensor.native_matrix_free_trace_operator_applications == 0))
       : !tensor.native_matrix_free_trace_operator_configured &&
             tensor.native_matrix_free_trace_operator_applications == 0;
+  // Timed robust workloads must exercise the fast lower branch.  The finite
+  // zero-gradient qualification owns the coupled-branch gate.
+  const bool robust_work_consistent = expected_robust
+      ? tensor.robust_lower_specialization_supported &&
+            tensor.robust_coupled_specialization_supported &&
+            tensor.robust_branch_accounting_complete &&
+            tensor.robust_lower_patch_setups == trace_solves &&
+            tensor.robust_lower_trace_solve_calls == linear_solve_attempts &&
+            tensor.robust_coupled_patch_setups == 0 &&
+            tensor.robust_coupled_trace_solve_calls == 0 &&
+            fixed_sigma_jacobi_sweeps ==
+                native_element_schwarz_sigma_jacobi_maximum_sweeps
+      : !tensor.robust_lower_specialization_supported &&
+            !tensor.robust_coupled_specialization_supported &&
+            tensor.robust_branch_accounting_complete &&
+            tensor.robust_lower_patch_setups == 0 &&
+            tensor.robust_lower_trace_solve_calls == 0 &&
+            tensor.robust_coupled_patch_setups == 0 &&
+            tensor.robust_coupled_trace_solve_calls == 0;
   const bool trace_solver_consistent =
       tensor.trace_solver_accounting_complete &&
       matrix_free_work_consistent &&
@@ -1507,7 +1547,7 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
       ilu_work_consistent && mgr_work_consistent &&
       element_schwarz_work_consistent &&
       fixed_sigma_jacobi_work_consistent &&
-      trace_solver_consistent &&
+      robust_work_consistent && trace_solver_consistent &&
       observation.tensor_volume_work.valid &&
       CudaPreparedTensorVolumeEvidenceValuesValid(
           engine, tensor.volume_assembly_launches,
@@ -1773,9 +1813,32 @@ void PrintStep(const StepSample& sample)
   const int fixed_sigma_jacobi_sweeps =
       CudaTracePreconditionerFixedSigmaJacobiSweeps(
           evidence.tensor_core.trace_preconditioner);
+  const bool robust_policy =
+      CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+          evidence.tensor_core.trace_preconditioner);
+  const bool robust_calls_bounded =
+      evidence.tensor_core.robust_lower_trace_solve_calls <=
+          std::numeric_limits<std::uint64_t>::max() -
+              evidence.tensor_core.robust_coupled_trace_solve_calls;
+  const std::uint64_t robust_physical_calls = robust_calls_bounded
+      ? evidence.tensor_core.robust_lower_trace_solve_calls +
+            evidence.tensor_core.robust_coupled_trace_solve_calls
+      : 0;
+  const std::uint64_t logical_calls =
+      static_cast<std::uint64_t>(evidence.linear_solve_attempts);
+  const std::uint64_t rejected_lower_applications =
+      robust_policy && robust_calls_bounded &&
+          robust_physical_calls >= logical_calls
+      ? robust_physical_calls - logical_calls : 0;
+  const std::uint64_t completed_sigma_jacobi_applications =
+      evidence.tensor_core.element_schwarz_preconditioner_applications >=
+              rejected_lower_applications
+      ? evidence.tensor_core.element_schwarz_preconditioner_applications -
+            rejected_lower_applications
+      : 0;
   const std::uint64_t fixed_sigma_jacobi_updates =
       fixed_sigma_jacobi_sweeps > 0
-      ? evidence.tensor_core.element_schwarz_preconditioner_applications *
+      ? completed_sigma_jacobi_applications *
             static_cast<std::uint64_t>(fixed_sigma_jacobi_sweeps)
       : 0;
   std::cout << "{\"phase\":\""
@@ -1926,6 +1989,14 @@ void PrintStep(const StepSample& sample)
             << "\"element_schwarz_preconditioner_applications\":"
             << evidence.tensor_core.
                    element_schwarz_preconditioner_applications << ','
+            << "\"robust_lower_patch_setups\":"
+            << evidence.tensor_core.robust_lower_patch_setups << ','
+            << "\"robust_lower_trace_solve_calls\":"
+            << evidence.tensor_core.robust_lower_trace_solve_calls << ','
+            << "\"robust_coupled_patch_setups\":"
+            << evidence.tensor_core.robust_coupled_patch_setups << ','
+            << "\"robust_coupled_trace_solve_calls\":"
+            << evidence.tensor_core.robust_coupled_trace_solve_calls << ','
             << "\"field_split_sigma_jacobi_sweeps\":"
             << fixed_sigma_jacobi_sweeps << ','
             << "\"field_split_sigma_jacobi_damping\":";
@@ -1968,6 +2039,15 @@ void PrintStep(const StepSample& sample)
             << "\"native_matrix_free_trace_operator_applications\":"
             << evidence.tensor_core.
                    native_matrix_free_trace_operator_applications << ','
+            << "\"robust_lower_specialization_supported\":"
+            << std::boolalpha
+            << evidence.tensor_core.robust_lower_specialization_supported
+            << ','
+            << "\"robust_coupled_specialization_supported\":"
+            << evidence.tensor_core.robust_coupled_specialization_supported
+            << ','
+            << "\"robust_branch_accounting_complete\":"
+            << evidence.tensor_core.robust_branch_accounting_complete << ','
             << "\"hypre_mgr_rank1_trace_solver_configured\":"
             << evidence.tensor_core.
                    hypre_mgr_rank1_trace_solver_configured << ','
@@ -2214,11 +2294,18 @@ int RunBenchmark(const Options& options)
   const bool warp_coupled_full_patch =
       CudaTracePreconditionerIsNativeElementSchwarzWarpCoupled(
           reported_trace_policy.trace_preconditioner);
+  const bool robust_adaptive =
+      CudaTracePolicyUsesNativeElementMatrixFreeWarpRobustCoupled(
+          resolved_trace_policy) &&
+      CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+          reported_trace_policy.trace_preconditioner);
+  const bool robust_coupled_observed = robust_adaptive &&
+      reported_trace_policy.robust_coupled_trace_solve_calls > 0;
   const int fixed_sigma_jacobi_sweeps =
       CudaTracePreconditionerFixedSigmaJacobiSweeps(
           reported_trace_policy.trace_preconditioner);
   const NativeElementSchwarzFieldSplitLayout field_split_layout =
-      equilibrated_field_split
+      equilibrated_field_split || robust_adaptive
       ? NativeElementSchwarzIgrFieldSplitLayout(options.order)
       : NativeElementSchwarzFieldSplitLayout{};
 
@@ -2273,6 +2360,23 @@ int RunBenchmark(const Options& options)
             << "\"trace_native_matrix_free_operator_configured\":"
             << reported_trace_policy.
                    native_matrix_free_trace_operator_configured << ','
+            << "\"trace_robust_lower_specialization_supported\":"
+            << reported_trace_policy.robust_lower_specialization_supported
+            << ','
+            << "\"trace_robust_coupled_specialization_supported\":"
+            << reported_trace_policy.robust_coupled_specialization_supported
+            << ','
+            << "\"trace_robust_branch_accounting_complete\":"
+            << reported_trace_policy.robust_branch_accounting_complete << ','
+            << std::noboolalpha
+            << "\"trace_robust_lower_patch_setups\":"
+            << reported_trace_policy.robust_lower_patch_setups << ','
+            << "\"trace_robust_lower_trace_solve_calls\":"
+            << reported_trace_policy.robust_lower_trace_solve_calls << ','
+            << "\"trace_robust_coupled_patch_setups\":"
+            << reported_trace_policy.robust_coupled_patch_setups << ','
+            << "\"trace_robust_coupled_trace_solve_calls\":"
+            << reported_trace_policy.robust_coupled_trace_solve_calls << ','
             << "\"trace_element_schwarz_patch_rows\":"
             << reported_trace_policy.element_schwarz_patch_rows << ','
             << "\"trace_element_schwarz_minimum_multiplicity\":"
@@ -2282,7 +2386,10 @@ int RunBenchmark(const Options& options)
             << reported_trace_policy.element_schwarz_maximum_multiplicity
             << std::noboolalpha << ','
             << "\"trace_element_schwarz_factorization\":\""
-            << (warp_coupled_full_patch
+            << (robust_adaptive
+                    ? "adaptive-lower-multiplicative-uhat4-sigmahat-or-"
+                      "full-coupled-patch-lu"
+                    : warp_coupled_full_patch
                     ? "full-coupled-patch-lu"
                     : equilibrated_field_split
                     ? "lower-multiplicative-uhat4-sigmahat"
@@ -2291,7 +2398,7 @@ int RunBenchmark(const Options& options)
                         ? "full-patch-lu" : "not-applicable")
             << "\","
             << "\"trace_element_schwarz_equilibration_passes\":"
-            << (equilibrated_field_split
+            << (equilibrated_field_split || robust_adaptive
                     ? native_element_schwarz_equilibration_passes : 0)
             << ','
             << "\"trace_element_schwarz_euler_rows\":"
@@ -2299,7 +2406,10 @@ int RunBenchmark(const Options& options)
             << "\"trace_element_schwarz_sigma_rows\":"
             << field_split_layout.sigma_rows << ','
             << "\"trace_element_schwarz_apply\":\""
-            << (warp_coupled_full_patch
+            << (robust_adaptive
+                    ? "adaptive-cooperative-lower-or-full-patch-pivoted-"
+                      "lu-fp64"
+                    : warp_coupled_full_patch
                     ? "cooperative-full-patch-pivoted-lu-fp64"
                     : warp_equilibrated_field_split
                         ? "cooperative-pivoted-lu-fp64"
@@ -2311,7 +2421,10 @@ int RunBenchmark(const Options& options)
                             : "not-applicable")
             << "\","
             << "\"trace_element_schwarz_apply_tile_width\":"
-            << (warp_coupled_full_patch
+            << (robust_adaptive
+                    ? (robust_coupled_observed || options.order != 1
+                           ? 32 : 16)
+                    : warp_coupled_full_patch
                     ? 32
                     : warp_equilibrated_field_split
                         ? (options.order == 1 ? 16 : 32) : 0) << ','

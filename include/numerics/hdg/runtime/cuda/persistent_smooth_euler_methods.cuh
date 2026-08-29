@@ -1176,6 +1176,28 @@ BuildPersistentTrueSystem() noexcept
               CudaTraceSolverKind::hypre_host_staged_rank2;
   initialization_tensor_core_evidence_.trace_solver_accounting_complete =
       true;
+  const bool robust =
+      CudaTracePolicyUsesNativeElementMatrixFreeWarpRobustCoupled(
+          trace_policy.resolved_selection) &&
+      CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+          selected_preconditioner);
+  initialization_tensor_core_evidence_.robust_lower_specialization_supported =
+      robust && native_trace_support_.supported &&
+      CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+          native_trace_support_, CudaTracePreconditionerKind::
+              native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64);
+  initialization_tensor_core_evidence_.robust_coupled_specialization_supported =
+      robust && native_trace_robust_coupled_support_.supported &&
+      CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+          native_trace_robust_coupled_support_,
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_coupled_sigma_jacobi10_fp64);
+  initialization_tensor_core_evidence_.robust_branch_accounting_complete =
+      !robust ||
+      (initialization_tensor_core_evidence_.
+           robust_lower_specialization_supported &&
+       initialization_tensor_core_evidence_.
+           robust_coupled_specialization_supported);
   initialization_tensor_core_evidence_.native_element_schwarz_configured =
       false;
   initialization_tensor_core_evidence_.
@@ -1623,6 +1645,17 @@ BuildPersistentTrueSystem() noexcept
           (use_ilu == static_cast<bool>(ilu_)) &&
           native_trace_requirements_.valid &&
           native_trace_support_.supported &&
+          (!robust ||
+           (native_trace_robust_lower_requirements_.valid &&
+            native_trace_robust_coupled_requirements_.valid &&
+            native_trace_robust_coupled_support_.supported &&
+            CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+                native_trace_support_, CudaTracePreconditionerKind::
+                    native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64) &&
+            CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+                native_trace_robust_coupled_support_,
+                CudaTracePreconditionerKind::
+                    native_element_schwarz_warp_coupled_sigma_jacobi10_fp64))) &&
           native_trace_workspace_.basis != nullptr &&
           native_trace_workspace_.vectors != nullptr &&
           native_trace_workspace_.reduction != nullptr &&
@@ -2526,36 +2559,57 @@ LaunchAndObserveNativeRankOneTraceSolve(
     const CudaNativeElementSchwarzView& element_schwarz,
     const std::uint64_t matrix_generation,
     const double requested_relative_tolerance,
-    CudaSolveDiagnostics& diagnostics) noexcept
+    CudaSolveDiagnostics& diagnostics,
+    CudaNativeTraceSolveObservation* const solve_observation) noexcept
 {
+  const bool robust =
+      CudaTracePolicyUsesNativeElementMatrixFreeWarpRobustCoupled(
+          trace_policy_descriptor_.resolved_selection) &&
+      CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+          trace_policy_descriptor_.trace_preconditioner);
+  const CudaTracePreconditionerKind effective_preconditioner = robust
+      ? element_schwarz_attempt_state_.factor_preconditioner
+      : trace_policy_descriptor_.trace_preconditioner;
+  const bool effective_lower = effective_preconditioner ==
+      CudaTracePreconditionerKind::
+          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64;
+  const bool effective_coupled = effective_preconditioner ==
+      CudaTracePreconditionerKind::
+          native_element_schwarz_warp_coupled_sigma_jacobi10_fp64;
+  const CudaNativeTraceCooperativeSupport& effective_support =
+      robust && effective_coupled
+      ? native_trace_robust_coupled_support_ : native_trace_support_;
   if (trace_solver_kind_ != CudaTraceSolverKind::native_rank1_fp64 ||
       ranks_ != 1 || !true_matrix_ || !hypre_rhs_ || !hypre_solution_ ||
       !native_trace_requirements_.valid ||
-      !native_trace_support_.supported ||
+      !effective_support.supported ||
+      (robust && !effective_lower && !effective_coupled) ||
       native_trace_requirements_.control_double_slots == 0 ||
       native_trace_requirements_.control_double_slots >
           native_trace_host_control_.size())
     return false;
   const bool use_ilu = CudaTracePreconditionerIsIlu(
-      trace_policy_descriptor_.trace_preconditioner);
+      effective_preconditioner);
   const bool use_element_schwarz =
       CudaTracePreconditionerIsNativeElementSchwarz(
-          trace_policy_descriptor_.trace_preconditioner);
+          effective_preconditioner);
   const bool use_matrix_free =
       CudaTracePolicyUsesNativeElementMatrixFreeOperator(
           trace_policy_descriptor_.resolved_selection);
   const bool use_matrix_free_equilibrated_field_split =
-      CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
-          trace_policy_descriptor_.resolved_selection);
+      robust ? effective_lower :
+          CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
+              trace_policy_descriptor_.resolved_selection);
   const bool use_matrix_free_warp_equilibrated_field_split =
-      CudaTracePolicyUsesNativeElementMatrixFreeWarpEquilibratedFieldSplit(
-          trace_policy_descriptor_.resolved_selection);
+      robust ? effective_lower :
+          CudaTracePolicyUsesNativeElementMatrixFreeWarpEquilibratedFieldSplit(
+              trace_policy_descriptor_.resolved_selection);
   const bool use_equilibrated_field_split =
       CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
-          trace_policy_descriptor_.trace_preconditioner);
+          effective_preconditioner);
   const bool use_warp_equilibrated_field_split =
       CudaTracePreconditionerIsNativeElementSchwarzWarpEquilibratedFieldSplit(
-          trace_policy_descriptor_.trace_preconditioner);
+          effective_preconditioner);
   const bool factor_exact = use_ilu
       ? factor.offsets != nullptr && factor.columns != nullptr &&
           factor.values != nullptr && factor.permutation != nullptr &&
@@ -2660,9 +2714,9 @@ LaunchAndObserveNativeRankOneTraceSolve(
   native_trace_host_control_.fill(0.0);
   const bool launched = CudaLaunchNativeRankOneTraceSolver(
       current_matrix, view_.true_rhs_scratch, view_.true_solution,
-      trace_policy_descriptor_.trace_preconditioner, factor,
+      effective_preconditioner, factor,
       element_schwarz, trace_operator, native_trace_workspace_,
-      native_trace_support_,
+      effective_support,
       requested_relative_tolerance, maximum_linear_iterations_,
       krylov_dimension_, nullptr);
   const std::size_t control_bytes =
@@ -2680,11 +2734,11 @@ LaunchAndObserveNativeRankOneTraceSolve(
       native_trace_requirements_.control_double_slots,
       requested_relative_tolerance, maximum_linear_iterations_,
       krylov_dimension_, observation);
+  if (solve_observation != nullptr) *solve_observation = observation;
 
   diagnostics.matrix_generation = matrix_generation;
   diagnostics.trace_solver = CudaTraceSolverKind::native_rank1_fp64;
-  diagnostics.trace_preconditioner =
-      trace_policy_descriptor_.trace_preconditioner;
+  diagnostics.trace_preconditioner = effective_preconditioner;
   diagnostics.igr_active = shape_.igr_active;
   diagnostics.krylov_dimension = krylov_dimension_;
   diagnostics.iterations = observation.iterations;
@@ -2797,6 +2851,16 @@ SolveTrueSystemAttempt(double& true_relative_residual,
   const bool use_element_schwarz =
       CudaTracePreconditionerIsNativeElementSchwarz(
           trace_preconditioner_);
+  const bool robust =
+      CudaTracePolicyUsesNativeElementMatrixFreeWarpRobustCoupled(
+          trace_policy_descriptor_.resolved_selection) &&
+      CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+          trace_preconditioner_);
+  std::uint64_t robust_lower_setup_delta = 0;
+  std::uint64_t robust_coupled_setup_delta = 0;
+  std::uint64_t robust_lower_solve_delta = 0;
+  std::uint64_t robust_lower_rejected_solve_delta = 0;
+  std::uint64_t robust_coupled_solve_delta = 0;
   bool solved = false;
   if (trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64)
   {
@@ -2837,21 +2901,108 @@ SolveTrueSystemAttempt(double& true_relative_residual,
               matrix_generation, same_matrix_retry);
       if (same_matrix_retry)
       {
-        schwarz_factor_ready = transition_ready;
+        const CudaTracePreconditionerKind retained =
+            element_schwarz_attempt_state_.factor_preconditioner;
+        const bool retained_exact = !robust ||
+            retained == CudaTracePreconditionerKind::
+                native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64 ||
+            retained == CudaTracePreconditionerKind::
+                native_element_schwarz_warp_coupled_sigma_jacobi10_fp64;
+        schwarz_factor_ready = transition_ready && retained_exact;
       }
       else
       {
-        schwarz_factor_ready = transition_ready &&
-            CudaLaunchSetupNativeElementSchwarz(
-                view_, shape_, trace_preconditioner_) &&
-            StatusPassed();
+        CudaTracePreconditionerKind effective_preconditioner =
+            trace_preconditioner_;
+        if (transition_ready && robust)
+        {
+          constexpr CudaTracePreconditionerKind lower =
+              CudaTracePreconditionerKind::
+                  native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64;
+          constexpr CudaTracePreconditionerKind coupled =
+              CudaTracePreconditionerKind::
+                  native_element_schwarz_warp_coupled_sigma_jacobi10_fp64;
+          const auto observe_setup = [&](
+              const CudaTracePreconditionerKind kind,
+              CudaNativeElementSchwarzSetupStatus& status) noexcept
+          {
+            status = CudaNativeElementSchwarzSetupStatus::unobserved;
+            int host_status = static_cast<int>(
+                CudaNativeElementSchwarzSetupStatus::invalid_or_nonfinite);
+            const bool observed =
+                CudaLaunchSetupNativeElementSchwarz(view_, shape_, kind) &&
+                CudaLaunchClassifyNativeElementSchwarzSetup(
+                    view_, shape_, view_.status_flag) &&
+                TransportPolicy::DeviceToHost(
+                    &host_status, view_.status_flag, sizeof(host_status),
+                    CudaTransferCategory::scalar_diagnostic,
+                    CudaTransferSite::scalar_status) &&
+                TransportPolicy::Synchronize(
+                    CudaTransferSite::scalar_status);
+            if (!observed ||
+                host_status < static_cast<int>(
+                    CudaNativeElementSchwarzSetupStatus::ready) ||
+                host_status > static_cast<int>(
+                    CudaNativeElementSchwarzSetupStatus::
+                        invalid_or_nonfinite))
+            {
+              tensor_core_evidence.robust_branch_accounting_complete = false;
+              tensor_core_evidence.trace_solver_accounting_complete = false;
+              return false;
+            }
+            status = static_cast<CudaNativeElementSchwarzSetupStatus>(
+                host_status);
+            return true;
+          };
+          CudaNativeElementSchwarzSetupStatus lower_status{};
+          const bool lower_observed = observe_setup(lower, lower_status);
+          const CudaRobustElementSchwarzSetupAction lower_action =
+              lower_observed
+              ? CudaRobustElementSchwarzSetupActionFor(lower_status)
+              : CudaRobustElementSchwarzSetupAction::fail_closed;
+          if (lower_observed)
+          {
+            robust_lower_setup_delta = 1;
+            diagnostics.element_schwarz_equilibration_builds = 1;
+            diagnostics.element_schwarz_equilibration_passes =
+                native_element_schwarz_equilibration_passes;
+          }
+          if (lower_action ==
+              CudaRobustElementSchwarzSetupAction::use_lower)
+          {
+            effective_preconditioner = lower;
+            schwarz_factor_ready = true;
+          }
+          else if (lower_action ==
+                   CudaRobustElementSchwarzSetupAction::try_coupled)
+          {
+            CudaNativeElementSchwarzSetupStatus coupled_status{};
+            const bool coupled_observed =
+                observe_setup(coupled, coupled_status);
+            if (coupled_observed) robust_coupled_setup_delta = 1;
+            schwarz_factor_ready = coupled_observed &&
+                coupled_status ==
+                    CudaNativeElementSchwarzSetupStatus::ready;
+            if (schwarz_factor_ready) effective_preconditioner = coupled;
+          }
+        }
+        else if (transition_ready)
+        {
+          schwarz_factor_ready =
+              CudaLaunchSetupNativeElementSchwarz(
+                  view_, shape_, trace_preconditioner_) &&
+              StatusPassed();
+        }
         if (schwarz_factor_ready)
         {
           element_schwarz_attempt_state_.factor_ready = true;
           element_schwarz_attempt_state_.factor_generation =
               matrix_generation;
+          element_schwarz_attempt_state_.factor_preconditioner =
+              effective_preconditioner;
           diagnostics.element_schwarz_patch_setups = 1;
-          if (CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
+          if (!robust &&
+              CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
                   trace_preconditioner_))
           {
             diagnostics.element_schwarz_equilibration_builds = 1;
@@ -2861,11 +3012,128 @@ SolveTrueSystemAttempt(double& true_relative_residual,
         }
       }
     }
+    CudaNativeTraceSolveObservation native_observation{};
     solved = ilu_factor_ready && schwarz_factor_ready &&
         LaunchAndObserveNativeRankOneTraceSolve(
-        factor, element_schwarz, matrix_generation,
-        requested_relative_tolerance,
-        diagnostics);
+            factor, element_schwarz, matrix_generation,
+            requested_relative_tolerance, diagnostics,
+            &native_observation);
+    constexpr std::uint32_t invalid_preconditioner_failure_mask = 1U << 2;
+    const bool lower_application_structurally_rejected =
+        robust && !same_matrix_retry && !solved && diagnostics.device_policy &&
+        schwarz_factor_ready &&
+        element_schwarz_attempt_state_.factor_preconditioner ==
+            CudaTracePreconditionerKind::
+                native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64 &&
+        native_observation.status ==
+            native_trace_solve_status_invalid_preconditioner &&
+        native_observation.failure_mask ==
+            invalid_preconditioner_failure_mask &&
+        native_observation.iterations == 0 &&
+        native_observation.restart_cycles == 1 &&
+        native_observation.preconditioner_applications == 1 &&
+        native_observation.operator_applications == 0 &&
+        native_observation.actual_residual_checks == 1 &&
+        native_observation.finite &&
+        !native_observation.ready_for_true_residual;
+    if (lower_application_structurally_rejected)
+    {
+      // The lower field split passed factor construction but its first actual
+      // application failed the retained-patch backward-error check before any
+      // operator or Krylov work.  This exact terminal tuple completes robust
+      // applicability classification; every other native failure remains
+      // fail-closed.  Count the rejected physical call as recurring work.
+      robust_lower_solve_delta = 1;
+      robust_lower_rejected_solve_delta = 1;
+      const std::uint64_t lower_preconditioner_applications =
+          diagnostics.element_schwarz_preconditioner_applications;
+      const std::uint64_t lower_operator_applications =
+          diagnostics.native_matrix_free_trace_operator_applications;
+      constexpr CudaTracePreconditionerKind coupled =
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_coupled_sigma_jacobi10_fp64;
+      element_schwarz_attempt_state_.factor_ready = false;
+      element_schwarz_attempt_state_.factor_preconditioner =
+          CudaTracePreconditionerKind::unconfigured;
+      CudaNativeElementSchwarzSetupStatus coupled_status =
+          CudaNativeElementSchwarzSetupStatus::unobserved;
+      int host_status = static_cast<int>(
+          CudaNativeElementSchwarzSetupStatus::invalid_or_nonfinite);
+      const bool coupled_observed =
+          CudaLaunchSetupNativeElementSchwarz(view_, shape_, coupled) &&
+          CudaLaunchClassifyNativeElementSchwarzSetup(
+              view_, shape_, view_.status_flag) &&
+          TransportPolicy::DeviceToHost(
+              &host_status, view_.status_flag, sizeof(host_status),
+              CudaTransferCategory::scalar_diagnostic,
+              CudaTransferSite::scalar_status) &&
+          TransportPolicy::Synchronize(CudaTransferSite::scalar_status) &&
+          host_status >= static_cast<int>(
+              CudaNativeElementSchwarzSetupStatus::ready) &&
+          host_status <= static_cast<int>(
+              CudaNativeElementSchwarzSetupStatus::invalid_or_nonfinite);
+      if (coupled_observed)
+      {
+        coupled_status = static_cast<CudaNativeElementSchwarzSetupStatus>(
+            host_status);
+        robust_coupled_setup_delta = 1;
+      }
+      else
+      {
+        tensor_core_evidence.robust_branch_accounting_complete = false;
+        tensor_core_evidence.trace_solver_accounting_complete = false;
+      }
+      const bool coupled_ready = coupled_observed &&
+          coupled_status == CudaNativeElementSchwarzSetupStatus::ready;
+      if (coupled_ready)
+      {
+        element_schwarz_attempt_state_.factor_ready = true;
+        element_schwarz_attempt_state_.factor_generation =
+            matrix_generation;
+        element_schwarz_attempt_state_.factor_preconditioner = coupled;
+        CudaSolveDiagnostics coupled_diagnostics{};
+        solved = LaunchAndObserveNativeRankOneTraceSolve(
+            factor, element_schwarz, matrix_generation,
+            requested_relative_tolerance, coupled_diagnostics);
+        const bool work_bounded =
+            lower_preconditioner_applications <=
+                std::numeric_limits<std::uint64_t>::max() -
+                    coupled_diagnostics.
+                        element_schwarz_preconditioner_applications &&
+            lower_operator_applications <=
+                std::numeric_limits<std::uint64_t>::max() -
+                    coupled_diagnostics.
+                        native_matrix_free_trace_operator_applications;
+        if (work_bounded)
+        {
+          coupled_diagnostics.element_schwarz_preconditioner_applications +=
+              lower_preconditioner_applications;
+          coupled_diagnostics.native_matrix_free_trace_operator_applications +=
+              lower_operator_applications;
+          coupled_diagnostics.element_schwarz_patch_setups =
+              robust_lower_setup_delta + robust_coupled_setup_delta;
+          coupled_diagnostics.element_schwarz_equilibration_builds =
+              diagnostics.element_schwarz_equilibration_builds;
+          coupled_diagnostics.element_schwarz_equilibration_passes =
+              diagnostics.element_schwarz_equilibration_passes;
+          diagnostics = coupled_diagnostics;
+        }
+        else
+        {
+          tensor_core_evidence.robust_branch_accounting_complete = false;
+          tensor_core_evidence.trace_solver_accounting_complete = false;
+          solved = false;
+        }
+      }
+      else
+      {
+        element_schwarz_attempt_state_.factor_ready = false;
+        solved = false;
+      }
+    }
+    if (robust)
+      diagnostics.element_schwarz_patch_setups =
+          robust_lower_setup_delta + robust_coupled_setup_delta;
     if (solved && use_ilu)
     {
       const bool state_generation_ready = ilu_factor_state_.factor_ready &&
@@ -2893,7 +3161,31 @@ SolveTrueSystemAttempt(double& true_relative_residual,
         element_schwarz_attempt_state_.last_solve_generation =
             matrix_generation;
       else
+      {
+        if (robust)
+        {
+          tensor_core_evidence.robust_branch_accounting_complete = false;
+          tensor_core_evidence.trace_solver_accounting_complete = false;
+        }
         solved = false;
+      }
+    }
+    if (solved && robust)
+    {
+      if (element_schwarz_attempt_state_.factor_preconditioner ==
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64)
+        robust_lower_solve_delta = 1;
+      else if (element_schwarz_attempt_state_.factor_preconditioner ==
+               CudaTracePreconditionerKind::
+                   native_element_schwarz_warp_coupled_sigma_jacobi10_fp64)
+        robust_coupled_solve_delta = 1;
+      else
+      {
+        tensor_core_evidence.robust_branch_accounting_complete = false;
+        tensor_core_evidence.trace_solver_accounting_complete = false;
+        solved = false;
+      }
     }
   }
   else if (trace_solver_kind_ ==
@@ -3022,6 +3314,51 @@ SolveTrueSystemAttempt(double& true_relative_residual,
           krylov_dimension_, matrix_generation, diagnostics);
     }
   }
+  if (solved && robust)
+  {
+    const bool setup_deltas_exact = same_matrix_retry
+        ? robust_lower_setup_delta == 0 &&
+            robust_coupled_setup_delta == 0 &&
+            robust_lower_rejected_solve_delta == 0
+        : robust_lower_setup_delta == 1 &&
+            ((robust_coupled_setup_delta == 0 &&
+              robust_lower_solve_delta == 1 &&
+              robust_lower_rejected_solve_delta == 0 &&
+              robust_coupled_solve_delta == 0) ||
+             (robust_coupled_setup_delta == 1 &&
+              robust_coupled_solve_delta == 1 &&
+              robust_lower_solve_delta ==
+                  robust_lower_rejected_solve_delta &&
+              robust_lower_rejected_solve_delta <= 1));
+    const bool solve_deltas_exact =
+        robust_lower_rejected_solve_delta <=
+            robust_lower_solve_delta &&
+        robust_lower_solve_delta - robust_lower_rejected_solve_delta +
+                robust_coupled_solve_delta ==
+            1 &&
+        robust_lower_solve_delta + robust_coupled_solve_delta ==
+            1 + robust_lower_rejected_solve_delta;
+    const bool deltas_bounded =
+        robust_lower_setup_delta <=
+            std::numeric_limits<std::uint64_t>::max() -
+                tensor_core_evidence.robust_lower_patch_setups &&
+        robust_coupled_setup_delta <=
+            std::numeric_limits<std::uint64_t>::max() -
+                tensor_core_evidence.robust_coupled_patch_setups &&
+        robust_lower_solve_delta <=
+            std::numeric_limits<std::uint64_t>::max() -
+                tensor_core_evidence.robust_lower_trace_solve_calls &&
+        robust_coupled_solve_delta <=
+            std::numeric_limits<std::uint64_t>::max() -
+                tensor_core_evidence.robust_coupled_trace_solve_calls;
+    if (!tensor_core_evidence.robust_branch_accounting_complete ||
+        !setup_deltas_exact || !solve_deltas_exact || !deltas_bounded)
+    {
+      tensor_core_evidence.robust_branch_accounting_complete = false;
+      tensor_core_evidence.trace_solver_accounting_complete = false;
+      solved = false;
+    }
+  }
   if (use_ilu && solved)
     (void)CudaAccumulateIluSolveEvidence(
         tensor_core_evidence, diagnostics);
@@ -3068,13 +3405,40 @@ SolveTrueSystemAttempt(double& true_relative_residual,
             CudaTraceSolverKind::native_rank1_fp64
         ? &tensor_core_evidence.native_rank1_trace_solve_calls
         : &tensor_core_evidence.hypre_trace_solve_calls;
-    if (*calls == std::numeric_limits<std::uint64_t>::max())
+    const std::uint64_t call_delta = robust
+        ? robust_lower_solve_delta + robust_coupled_solve_delta : 1;
+    if (call_delta == 0 ||
+        call_delta > std::numeric_limits<std::uint64_t>::max() - *calls)
     {
       tensor_core_evidence.trace_solver_accounting_complete = false;
       solved = false;
     }
     else
-      ++*calls;
+      *calls += call_delta;
+  }
+  if (!solved && robust)
+  {
+    // Any failed robust invocation may have launched setup or solve work that
+    // cannot be represented by the transactional branch counters.  Keep every
+    // branch counter unchanged and fail all aggregate accounting closed instead
+    // of leaving a plausible partial census.
+    tensor_core_evidence.robust_branch_accounting_complete = false;
+    tensor_core_evidence.trace_solver_accounting_complete = false;
+  }
+  if (solved && robust)
+  {
+    // These deltas were fully validated before any generic Schwarz evidence
+    // was mutated.  Commit them only after both that evidence and the global
+    // native-solve call count have succeeded, so branch accounting never
+    // exposes a partially completed invocation.
+    tensor_core_evidence.robust_lower_patch_setups +=
+        robust_lower_setup_delta;
+    tensor_core_evidence.robust_coupled_patch_setups +=
+        robust_coupled_setup_delta;
+    tensor_core_evidence.robust_lower_trace_solve_calls +=
+        robust_lower_solve_delta;
+    tensor_core_evidence.robust_coupled_trace_solve_calls +=
+        robust_coupled_solve_delta;
   }
   // Policy/factor/configuration mismatches already fail `solved`.  Aggregate
   // accounting remains qualification evidence only; the FP64 current-matrix

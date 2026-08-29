@@ -57,6 +57,8 @@ NCU_ACCEPTED_STEP_NVTX_RANGE = "HDG/profiled-accepted-step/"
 NCU_INSTRUCTION_QUALIFICATION_KINDS = frozenset({
     "tensor-instructions", "tensor-volume-instructions",
 })
+# Explicit final-candidate profiler policy.  It does not replace the general
+# application's q12/q12, all-role-1e-12 default numerical policy.
 PRODUCTION_TRACE_POLICY = "engine-default"
 FINAL_IGR_QUADRATURE_BY_ORDER = {1: (6, 4), 2: (8, 6), 3: (10, 8)}
 FINAL_LINEAR_ROLE_RELATIVE_TOLERANCES = (1.0e-10, 3.0e-11, 1.0e-12)
@@ -211,22 +213,25 @@ FIXED_SIGMA_JACOBI_PROFILE_POLICIES = {
         "native_element_schwarz_warp_coupled_sigma_jacobi10_fp64",
         True,
     ),
+    "native-element-schwarz-matrix-free-warp-robust-coupled-"
+    "sigma-jacobi10-fp64": FixedSigmaJacobiProfilePolicy(
+        10,
+        "native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64",
+        True,
+    ),
 }
 COUPLED_WARP_BASE_PROFILE_POLICY = \
     "native-element-schwarz-matrix-free-warp-coupled-fp64"
+PRODUCTION_TENSOR_IGR_ROBUST_TRACE_POLICY = (
+    "native-element-schwarz-matrix-free-warp-robust-coupled-"
+    "sigma-jacobi10-fp64"
+)
+ROBUST_WARP_PROFILE_POLICIES = frozenset({
+    PRODUCTION_TENSOR_IGR_ROBUST_TRACE_POLICY,
+})
 PRODUCTION_TENSOR_IGR_TRACE_POLICY_BY_ORDER = {
-    1: (
-        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-        "sigma-jacobi10-fp64"
-    ),
-    2: (
-        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-        "sigma-jacobi10-fp64"
-    ),
-    3: (
-        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-        "sigma-jacobi2-fp64"
-    ),
+    order: PRODUCTION_TENSOR_IGR_ROBUST_TRACE_POLICY
+    for order in (1, 2, 3)
 }
 
 
@@ -266,9 +271,10 @@ def _profile_trace_policy_contract(
             True,
             fixed,
             mode == "igr",
-            "lower-multiplicative-uhat4-sigmahat"
+            "adaptive-lower-multiplicative-uhat4-sigmahat-or-"
+            "full-coupled-patch-lu"
             if mode == "igr" else "not-applicable",
-            "cooperative-pivoted-lu-fp64"
+            "adaptive-cooperative-lower-or-full-patch-pivoted-lu-fp64"
             if mode == "igr" else "not-applicable",
             (16 if order == 1 else 32) if mode == "igr" else 0,
         )
@@ -291,6 +297,7 @@ def _profile_trace_policy_contract(
             "profiled trace policy is neither engine-default nor an exact "
             "native element-Schwarz IGR ablation policy"
         )
+    robust = requested in ROBUST_WARP_PROFILE_POLICIES
     coupled = "-warp-coupled-" in requested
     return ProfileTracePolicyContract(
         requested,
@@ -300,9 +307,12 @@ def _profile_trace_policy_contract(
         False,
         fixed,
         True,
-        "full-coupled-patch-lu" if coupled
+        "adaptive-lower-multiplicative-uhat4-sigmahat-or-"
+        "full-coupled-patch-lu" if robust
+        else "full-coupled-patch-lu" if coupled
         else "lower-multiplicative-uhat4-sigmahat",
-        "cooperative-full-patch-pivoted-lu-fp64" if coupled
+        "adaptive-cooperative-lower-or-full-patch-pivoted-lu-fp64"
+        if robust else "cooperative-full-patch-pivoted-lu-fp64" if coupled
         else "cooperative-pivoted-lu-fp64" if fixed.warp
         else "scalar-pivoted-lu-fp64",
         32 if coupled or (fixed.warp and order != 1)
@@ -1494,6 +1504,66 @@ def exact_uint64(value: Any, label: str) -> int:
     return result
 
 
+ROBUST_BRANCH_COUNTER_FIELDS = (
+    "robust_lower_patch_setups",
+    "robust_lower_trace_solve_calls",
+    "robust_coupled_patch_setups",
+    "robust_coupled_trace_solve_calls",
+)
+
+
+def _validated_robust_branch_work(
+        evidence: dict[str, Any], *, field_prefix: str,
+        expected_robust: bool, expected_trace_solves: int | None = None,
+        expected_linear_solve_attempts: int | None = None) -> dict[str, int]:
+    """Validate the fixed four aggregate robust-branch counters."""
+    def field(name: str) -> str:
+        return field_prefix + name
+
+    if evidence.get(field("robust_lower_specialization_supported")) is not \
+            expected_robust or evidence.get(
+                field("robust_coupled_specialization_supported")
+            ) is not expected_robust or evidence.get(
+                field("robust_branch_accounting_complete")
+            ) is not True:
+        raise RuntimeError(
+            "profiled robust specialization/accounting evidence is invalid"
+        )
+    counters = {
+        name: exact_uint64(
+            evidence.get(field(name)), f"profiled {field(name)}"
+        )
+        for name in ROBUST_BRANCH_COUNTER_FIELDS
+    }
+    if not expected_robust:
+        if any(counters.values()):
+            raise RuntimeError(
+                "non-robust profile reported robust branch work"
+            )
+        return counters
+    if counters["robust_coupled_patch_setups"] != 0 or \
+            counters["robust_coupled_trace_solve_calls"] != 0:
+        raise RuntimeError(
+            "production profile did not remain on the robust lower branch"
+        )
+    if expected_trace_solves is None:
+        if counters["robust_lower_patch_setups"] <= 0:
+            raise RuntimeError("robust profile reported no lower patch setup")
+    elif counters["robust_lower_patch_setups"] != expected_trace_solves:
+        raise RuntimeError(
+            "robust lower patch setups differ from profiled trace solves"
+        )
+    if expected_linear_solve_attempts is None:
+        if counters["robust_lower_trace_solve_calls"] <= 0:
+            raise RuntimeError("robust profile reported no lower trace solve")
+    elif counters["robust_lower_trace_solve_calls"] != \
+            expected_linear_solve_attempts:
+        raise RuntimeError(
+            "robust lower calls differ from profiled linear solve attempts"
+        )
+    return counters
+
+
 def exact_finite_number(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or \
             not math.isfinite(float(value)):
@@ -1511,22 +1581,37 @@ def _validated_fixed_sigma_jacobi_work(
         tensor.get("element_schwarz_preconditioner_applications"),
         "element-Schwarz preconditioner application count",
     )
-    sweeps = exact_nonnegative_integer(
+    compatibility_sweeps = exact_nonnegative_integer(
         tensor.get("field_split_sigma_jacobi_sweeps"),
         "fixed-sigma Jacobi sweep count",
     )
-    damping = exact_finite_number(
+    compatibility_damping = exact_finite_number(
         tensor.get("field_split_sigma_jacobi_damping"),
         "fixed-sigma Jacobi damping",
     )
-    updates = exact_uint64(
+    compatibility_updates = exact_uint64(
         tensor.get("field_split_sigma_jacobi_updates"),
         "fixed-sigma Jacobi aggregate update count",
+    )
+    sweeps = exact_nonnegative_integer(
+        tensor.get("sigma_jacobi_sweeps"),
+        "generic sigma Jacobi sweep count",
+    )
+    damping = exact_finite_number(
+        tensor.get("sigma_jacobi_damping"),
+        "generic sigma Jacobi damping",
+    )
+    updates = exact_uint64(
+        tensor.get("sigma_jacobi_updates"),
+        "generic sigma Jacobi aggregate update count",
     )
     expected_updates = applications * expected_sweeps
     if expected_updates > UINT64_MAX:
         raise RuntimeError("fixed-sigma Jacobi aggregate work exceeds uint64")
-    if sweeps != expected_sweeps or damping != expected_damping or \
+    if compatibility_sweeps != sweeps or \
+            compatibility_damping != damping or \
+            compatibility_updates != updates or \
+            sweeps != expected_sweeps or damping != expected_damping or \
             updates != expected_updates:
         raise RuntimeError(
             "profiled fixed-sigma Jacobi aggregate work does not exactly "
@@ -1606,8 +1691,11 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         requested_trace_policy, expected_mode, expected_order
     )
     expected_equilibration_passes = (
-        2 if trace_policy_contract.factorization ==
-        "lower-multiplicative-uhat4-sigmahat" else 0
+        2 if trace_policy_contract.factorization in {
+            "lower-multiplicative-uhat4-sigmahat",
+            "adaptive-lower-multiplicative-uhat4-sigmahat-or-"
+            "full-coupled-patch-lu",
+        } else 0
     )
     expected_euler_rows = (
         16 * (expected_order + 1) if expected_equilibration_passes else 0
@@ -1661,6 +1749,13 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
             "profiled benchmark summary does not match the exact typed tensor "
             "accepted-step trace-policy selection"
         )
+    expected_robust = trace_policy_contract.resolved in \
+        ROBUST_WARP_PROFILE_POLICIES
+    _validated_robust_branch_work(
+        record,
+        field_prefix="trace_",
+        expected_robust=expected_robust,
+    )
     numerical_policy = record.get("numerical_policy")
     if not isinstance(numerical_policy, dict):
         raise RuntimeError(
@@ -1747,6 +1842,42 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
     tensor = selected[0].get("tensor_core")
     if not isinstance(tensor, dict):
         raise RuntimeError("selected benchmark sample has no tensor work summary")
+    expected_trace_solves = exact_uint64(
+        selected[0].get("trace_solves"), "profiled trace solve count"
+    )
+    expected_linear_solve_attempts = exact_uint64(
+        selected[0].get("linear_solve_attempts"),
+        "profiled linear solve attempt count",
+    )
+    robust_branch_work = _validated_robust_branch_work(
+        tensor,
+        field_prefix="",
+        expected_robust=expected_robust,
+        expected_trace_solves=expected_trace_solves,
+        expected_linear_solve_attempts=expected_linear_solve_attempts,
+    )
+    native_trace_solve_calls = exact_uint64(
+        tensor.get("native_rank1_trace_solve_calls"),
+        "profiled native rank-one trace solve call count",
+    )
+    hypre_trace_solve_calls = exact_uint64(
+        tensor.get("hypre_trace_solve_calls"),
+        "profiled HYPRE trace solve call count",
+    )
+    expected_native_trace_solve_calls = (
+        robust_branch_work["robust_lower_trace_solve_calls"] +
+        robust_branch_work["robust_coupled_trace_solve_calls"]
+        if expected_robust else expected_linear_solve_attempts
+    )
+    expected_hypre_trace_solve_calls = 0
+    if tensor.get("native_rank1_trace_solver_configured") is not True or \
+            tensor.get("trace_solver_accounting_complete") is not True or \
+            native_trace_solve_calls != expected_native_trace_solve_calls or \
+            hypre_trace_solve_calls != expected_hypre_trace_solve_calls:
+        raise RuntimeError(
+            "profiled recurring trace-solver work does not match the exact "
+            "production engine contract"
+        )
     condensation_launches = exact_uint64(
         tensor.get("condensation_launches"), "condensation launch count"
     )
@@ -1976,6 +2107,13 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         "planned_volume_mma_tiles": volume_mma_tiles,
         "planned_volume_contraction_launch_distribution": chunk_histogram,
         **sigma_jacobi_work,
+        "robust_lower_specialization_supported": expected_robust,
+        "robust_coupled_specialization_supported": expected_robust,
+        "robust_branch_accounting_complete": True,
+        **robust_branch_work,
+        "native_rank1_trace_solve_calls": native_trace_solve_calls,
+        "hypre_trace_solve_calls": hypre_trace_solve_calls,
+        "trace_solver_accounting_complete": True,
         "fallback_count": 0,
         "execution_log": file_identity(log_path),
     }

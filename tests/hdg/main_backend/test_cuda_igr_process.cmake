@@ -26,9 +26,9 @@ set(_expected_ilu_iterations 1)
 set(_expected_ilu_accounting_kind derived_bounds_v1)
 if(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor" AND HDG_MAIN_RANKS EQUAL 1)
   set(_expected_trace_preconditioner
-    native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64)
+    native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64)
   set(_expected_resolved_trace_policy
-    native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi10-fp64)
+    native-element-schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-fp64)
   set(_expected_trace_solver native-rank1-fp64)
   set(_expected_ilu_type -1)
   set(_expected_ilu_fill -1)
@@ -74,13 +74,6 @@ function(run_cuda_igr_success order expected_alpha expected_beta)
     "${_expected_trace_preconditioner}")
   set(_run_expected_resolved_trace_policy
     "${_expected_resolved_trace_policy}")
-  if(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor" AND
-     HDG_MAIN_RANKS EQUAL 1 AND order EQUAL 3)
-    set(_run_expected_trace_preconditioner
-      native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64)
-    set(_run_expected_resolved_trace_policy
-      native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi2-fp64)
-  endif()
   if(HDG_MAIN_RANKS EQUAL 1)
     execute_process(
       COMMAND "${HDG_MAIN_EXECUTABLE}" ${_arguments}

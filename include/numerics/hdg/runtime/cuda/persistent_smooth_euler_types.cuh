@@ -377,7 +377,9 @@ enum class CudaTracePolicyKind : std::uint8_t
       27,
   native_element_schwarz_matrix_free_warp_coupled_fp64 = 28,
   native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi2_fp64 = 29,
-  native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi10_fp64 = 30
+  native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi10_fp64 = 30,
+  native_element_schwarz_matrix_free_warp_robust_coupled_sigma_jacobi10_fp64 =
+      31
 };
 
 constexpr bool IsKnownCudaTracePolicyKind(
@@ -440,7 +442,9 @@ constexpr bool IsKnownCudaTracePolicyKind(
       kind == CudaTracePolicyKind::
           native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi2_fp64 ||
       kind == CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi10_fp64;
+          native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi10_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_robust_coupled_sigma_jacobi10_fp64;
 }
 
 constexpr const char* CudaTracePolicyKindName(
@@ -536,6 +540,9 @@ constexpr const char* CudaTracePolicyKindName(
   case CudaTracePolicyKind::
       native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi10_fp64:
     return "native-element-schwarz-matrix-free-warp-coupled-sigma-jacobi10-fp64";
+  case CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_warp_robust_coupled_sigma_jacobi10_fp64:
+    return "native-element-schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-fp64";
   }
   return "unknown";
 }
@@ -802,7 +809,8 @@ enum class CudaTracePreconditionerKind : std::uint8_t
   native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64 = 26,
   native_element_schwarz_warp_coupled_fp64 = 27,
   native_element_schwarz_warp_coupled_sigma_jacobi2_fp64 = 28,
-  native_element_schwarz_warp_coupled_sigma_jacobi10_fp64 = 29
+  native_element_schwarz_warp_coupled_sigma_jacobi10_fp64 = 29,
+  native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64 = 30
 };
 
 /** Deterministic lifetime policy for a selected HYPRE ILU(0) factor. */
@@ -945,7 +953,17 @@ constexpr bool CudaTracePreconditionerIsNativeElementSchwarz(
       kind == CudaTracePreconditionerKind::
           native_element_schwarz_warp_coupled_sigma_jacobi2_fp64 ||
       kind == CudaTracePreconditionerKind::
-          native_element_schwarz_warp_coupled_sigma_jacobi10_fp64;
+          native_element_schwarz_warp_coupled_sigma_jacobi10_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64;
+}
+
+/** Typed rank-one policy whose effective factor is selected per matrix. */
+constexpr bool CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+    const CudaTracePreconditionerKind kind) noexcept
+{
+  return kind == CudaTracePreconditionerKind::
+      native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64;
 }
 
 constexpr bool
@@ -1092,7 +1110,8 @@ constexpr bool CudaTracePreconditionerUsesFixedSigmaJacobi(
       kind == CudaTracePreconditionerKind::
           native_element_schwarz_warp_coupled_sigma_jacobi2_fp64 ||
       kind == CudaTracePreconditionerKind::
-          native_element_schwarz_warp_coupled_sigma_jacobi10_fp64;
+          native_element_schwarz_warp_coupled_sigma_jacobi10_fp64 ||
+      CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(kind);
 }
 
 constexpr int CudaTracePreconditionerFixedSigmaJacobiSweeps(
@@ -1153,6 +1172,8 @@ constexpr int CudaTracePreconditionerFixedSigmaJacobiSweeps(
       native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64:
   case CudaTracePreconditionerKind::
       native_element_schwarz_warp_coupled_sigma_jacobi10_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64:
     return native_element_schwarz_sigma_jacobi_maximum_sweeps;
   default:
     return 0;
@@ -1255,7 +1276,7 @@ CudaTraceCoupledWarpPreconditionerForFixedSigmaJacobiSweeps(
   }
 }
 
-/** Benchmark-only exact element-Schur operator ablation. */
+/** Exact element-Schur operator selection for native rank-one policies. */
 constexpr bool CudaTracePolicyUsesNativeElementMatrixFreeOperator(
     const CudaTracePolicyKind kind) noexcept
 {
@@ -1310,7 +1331,16 @@ constexpr bool CudaTracePolicyUsesNativeElementMatrixFreeOperator(
       kind == CudaTracePolicyKind::
           native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi2_fp64 ||
       kind == CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi10_fp64;
+          native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi10_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_robust_coupled_sigma_jacobi10_fp64;
+}
+
+constexpr bool CudaTracePolicyUsesNativeElementMatrixFreeWarpRobustCoupled(
+    const CudaTracePolicyKind kind) noexcept
+{
+  return kind == CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_warp_robust_coupled_sigma_jacobi10_fp64;
 }
 
 /** Exact matrix-free/operator and cooperative full-patch pairing. */
@@ -1463,6 +1493,8 @@ constexpr int CudaTracePolicyFixedSigmaJacobiSweeps(
       native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi10_fp64:
   case CudaTracePolicyKind::
       native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi10_fp64:
+  case CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_warp_robust_coupled_sigma_jacobi10_fp64:
     return native_element_schwarz_sigma_jacobi_maximum_sweeps;
   default:
     return 0;
@@ -1546,6 +1578,8 @@ constexpr int CudaIluLevelOfFill(
       native_element_schwarz_warp_coupled_sigma_jacobi2_fp64:
   case CudaTracePreconditionerKind::
       native_element_schwarz_warp_coupled_sigma_jacobi10_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64:
   case CudaTracePreconditionerKind::unconfigured:
     break;
   }
@@ -1613,6 +1647,8 @@ constexpr int CudaIluLocalReordering(
       native_element_schwarz_warp_coupled_sigma_jacobi2_fp64:
   case CudaTracePreconditionerKind::
       native_element_schwarz_warp_coupled_sigma_jacobi10_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64:
   case CudaTracePreconditionerKind::unconfigured:
     break;
   }
@@ -1776,6 +1812,9 @@ constexpr const char* CudaTracePreconditionerName(
   case CudaTracePreconditionerKind::
       native_element_schwarz_warp_coupled_sigma_jacobi10_fp64:
     return "native_element_schwarz_warp_coupled_sigma_jacobi10_fp64";
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64:
+    return "native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64";
   case CudaTracePreconditionerKind::unconfigured:
     break;
   }
@@ -1832,22 +1871,18 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
 
   // Production selection is deliberately deterministic and fail closed.  A
   // rank-one tensor-IGR request resolves engine-default before consensus or
-  // allocation to the bounded, same-hardware sweep winner measured for its
-  // polynomial order: p1/p2 use cooperative sigma-J10 and p3 uses
-  // cooperative sigma-J2.  J10 was the tested sweep cap for p1/p2, so this is
-  // a qualified production selection, not a claim of a global optimum beyond
-  // the measured J1--J10 surface.  Rank two retains the explicitly reported
-  // host-staged HYPRE route.  Every non-default selector remains a rank-one
-  // benchmark ablation.
+  // allocation to the robust cooperative J10 policy for p1--p3.  That policy
+  // attempts the fast equilibrated lower field split on every new matrix and
+  // selects its fully coupled tensor-native leaf only for an exact structural
+  // applicability rejection.  Rank two retains the explicitly reported
+  // host-staged HYPRE route.  Non-default selectors remain explicit rank-one
+  // ablations.
   if (requested_selection == CudaTracePolicyKind::engine_default &&
       engine == generic::CudaEngineKind::tensor_core && igr_active &&
       rank_count == 1)
   {
-    result.resolved_selection = polynomial_order <= 2
-        ? CudaTracePolicyKind::
-              native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi10_fp64
-        : CudaTracePolicyKind::
-              native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi2_fp64;
+    result.resolved_selection = CudaTracePolicyKind::
+        native_element_schwarz_matrix_free_warp_robust_coupled_sigma_jacobi10_fp64;
   }
   else if (requested_selection != CudaTracePolicyKind::engine_default &&
            rank_count != 1)
@@ -1880,6 +1915,25 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
       return result;
     result.trace_preconditioner =
         CudaTracePreconditionerKind::native_element_schwarz_fp64;
+    result.valid = true;
+    return result;
+  }
+
+  // Production-capable robust tensor-native policy.  The descriptor remains
+  // this exact typed selector for consensus and provenance; the rank-one
+  // runtime first attempts the fast cooperative lower J10 factor for every new
+  // matrix and selects the cooperative fully coupled J10 specialization only
+  // after either a classified structural block-factor failure or the exact
+  // first-application retained-patch rejection.  Neither branch is an
+  // ordinary-CUDA or HYPRE fallback; all physical calls remain accounted.
+  if (selection == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_robust_coupled_sigma_jacobi10_fp64)
+  {
+    if (engine != generic::CudaEngineKind::tensor_core || !igr_active ||
+        rank_count != 1)
+      return result;
+    result.trace_preconditioner = CudaTracePreconditionerKind::
+        native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64;
     result.valid = true;
     return result;
   }
@@ -2150,6 +2204,17 @@ struct CudaTensorCoreEvidence
   std::uint64_t element_schwarz_patch_setups = 0;
   std::uint64_t element_schwarz_preconditioner_applications = 0;
   std::uint64_t native_matrix_free_trace_operator_applications = 0;
+  // Fixed aggregate branch census for the robust tensor-native policy.  Setup
+  // and physical solve-call deltas are committed together only after the
+  // effective branch, generic Schwarz evidence, and native call accounting
+  // are complete.  A second physical call occurs only after the exact first
+  // lower-factor application check selects the coupled leaf; it is not a
+  // generic solve fallback.  No matrix, event, or per-solve history is
+  // retained.
+  std::uint64_t robust_lower_patch_setups = 0;
+  std::uint64_t robust_lower_trace_solve_calls = 0;
+  std::uint64_t robust_coupled_patch_setups = 0;
+  std::uint64_t robust_coupled_trace_solve_calls = 0;
   int element_schwarz_patch_rows = 0;
   int element_schwarz_minimum_multiplicity = 0;
   int element_schwarz_maximum_multiplicity = 0;
@@ -2163,6 +2228,9 @@ struct CudaTensorCoreEvidence
   bool hypre_mgr_rank1_trace_solver_configured = false;
   bool native_element_schwarz_configured = false;
   bool native_matrix_free_trace_operator_configured = false;
+  bool robust_lower_specialization_supported = false;
+  bool robust_coupled_specialization_supported = false;
+  bool robust_branch_accounting_complete = false;
   bool hypre_host_staged_rank2_trace_solver_configured = false;
   bool trace_solver_accounting_complete = false;
   bool ilu_accounting_complete = false;

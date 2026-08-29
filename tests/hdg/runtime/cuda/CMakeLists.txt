@@ -389,6 +389,24 @@ endforeach()
 foreach(_order IN ITEMS 1 2 3)
   math(EXPR _igr_volume_quadrature_order "2 * ${_order} + 4")
   math(EXPR _igr_face_quadrature_order "2 * ${_order} + 2")
+  # Conventional cells use the same explicit role tolerances as the campaign
+  # candidate (and no IGR quadrature override).  Bind that complete policy to
+  # the shared spatial and Backward-Euler temporal fixture as well.
+  add_test(
+    NAME dg_igr_hdg_runtime_cuda_generic_euler_convergence_conventional_candidate_p${_order}_rank1
+    COMMAND dg_igr_hdg_runtime_cuda_generic_euler_convergence
+      --order ${_order} --regularization conventional
+      --newton-linear-rtol 1e-10
+      --final-linear-rtol 3e-11
+      --true-residual-tightening-linear-rtol 1e-12)
+  set_tests_properties(
+    dg_igr_hdg_runtime_cuda_generic_euler_convergence_conventional_candidate_p${_order}_rank1
+    PROPERTIES
+      LABELS "hdg;runtime;cpu;cuda;generic-euler;convergence;spatial;backward-euler;ordinary;tensor;conventional;role-tolerance-candidate;production-trace-policy;p${_order};alignment"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 7200)
+
   add_test(
     NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_candidate_p${_order}_rank1
     COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
@@ -441,6 +459,33 @@ foreach(_coupled_policy IN LISTS _dg_igr_coupled_trace_policies)
         RESOURCE_LOCK dg_igr_sm120
         TIMEOUT 7200)
   endforeach()
+endforeach()
+
+# Explicit robust J10 mirrors the promoted engine-default policy.  Reuse the
+# full active six-case alignment fixture and require its fast lower branch at
+# p1-p3 with the bounded quadrature/tolerance candidate.
+set(_dg_igr_robust_trace_policy
+  native-element-schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-fp64)
+foreach(_order IN ITEMS 1 2 3)
+  math(EXPR _igr_volume_quadrature_order "2 * ${_order} + 4")
+  math(EXPR _igr_face_quadrature_order "2 * ${_order} + 2")
+  add_test(
+    NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_robust_jacobi10_p${_order}_rank1
+    COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+      --order ${_order}
+      --igr-volume-quadrature-order ${_igr_volume_quadrature_order}
+      --igr-face-quadrature-order ${_igr_face_quadrature_order}
+      --newton-linear-rtol 1e-10
+      --final-linear-rtol 3e-11
+      --true-residual-tightening-linear-rtol 1e-12
+      --tensor-igr-trace-policy ${_dg_igr_robust_trace_policy})
+  set_tests_properties(
+    dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_robust_jacobi10_p${_order}_rank1
+    PROPERTIES
+      LABELS "hdg;runtime;cpu;cuda;generic-euler;alignment;ordinary;tensor;igr;contact;physical;periodic;source;initial-trace;conservation;trajectory;quadrature-candidate;role-tolerance-candidate;robust-adaptive;lower-branch;production-trace-policy;explicit-policy-control;p${_order}"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 7200)
 endforeach()
 
 # Parse and validate candidate policies without selecting a CUDA device.  The
@@ -565,7 +610,8 @@ endforeach()
 # The original failing entropy-wave corner is isolated as one bounded p1,
 # mesh-3, one-step tensor-IGR gate for each fully coupled specialization.
 # It has identically zero velocity gradient and therefore directly guards the
-# setup singularity without repeating either convergence ladder.
+# coupled full-patch solve on that corner without repeating either convergence
+# ladder.
 foreach(_coupled_policy IN LISTS _dg_igr_coupled_trace_policies)
   string(REPLACE "native-element-schwarz-matrix-free-warp-coupled-" ""
     _coupled_policy_suffix "${_coupled_policy}")
@@ -591,6 +637,54 @@ foreach(_coupled_policy IN LISTS _dg_igr_coupled_trace_policies)
       TIMEOUT 1800)
 endforeach()
 
+# The same bounded zero-gradient corner must select the robust policy's
+# cooperative coupled branch after the exact first-application retained-patch
+# rejection at every supported order.  The W8A rank-one device fixture
+# separately qualifies setup-time structural classification, coupled admission,
+# and invalid/nonfinite fail-closed classification for p1-p3.
+foreach(_order IN ITEMS 1 2 3)
+  math(EXPR _igr_volume_quadrature_order "2 * ${_order} + 4")
+  math(EXPR _igr_face_quadrature_order "2 * ${_order} + 2")
+  add_test(
+    NAME dg_igr_hdg_runtime_cuda_generic_euler_zero_gradient_robust_jacobi10_p${_order}_rank1
+    COMMAND dg_igr_hdg_runtime_cuda_generic_euler_convergence
+      --order ${_order} --regularization igr
+      --igr-volume-quadrature-order ${_igr_volume_quadrature_order}
+      --igr-face-quadrature-order ${_igr_face_quadrature_order}
+      --newton-linear-rtol 1e-10
+      --final-linear-rtol 3e-11
+      --true-residual-tightening-linear-rtol 1e-12
+      --tensor-igr-trace-policy ${_dg_igr_robust_trace_policy}
+      --zero-gradient-only)
+  set_tests_properties(
+    dg_igr_hdg_runtime_cuda_generic_euler_zero_gradient_robust_jacobi10_p${_order}_rank1
+    PROPERTIES
+      LABELS "hdg;runtime;cuda;generic-euler;tensor;igr;zero-gradient;robust-adaptive;coupled-branch;ablation;p${_order}"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1800)
+
+  # Production routing must exercise the same mixed lower/coupled path without
+  # an explicit private-policy override.
+  add_test(
+    NAME dg_igr_hdg_runtime_cuda_generic_euler_zero_gradient_engine_default_p${_order}_rank1
+    COMMAND dg_igr_hdg_runtime_cuda_generic_euler_convergence
+      --order ${_order} --regularization igr
+      --igr-volume-quadrature-order ${_igr_volume_quadrature_order}
+      --igr-face-quadrature-order ${_igr_face_quadrature_order}
+      --newton-linear-rtol 1e-10
+      --final-linear-rtol 3e-11
+      --true-residual-tightening-linear-rtol 1e-12
+      --zero-gradient-only)
+  set_tests_properties(
+    dg_igr_hdg_runtime_cuda_generic_euler_zero_gradient_engine_default_p${_order}_rank1
+    PROPERTIES
+      LABELS "hdg;runtime;cuda;generic-euler;tensor;igr;zero-gradient;coupled-branch;robust-adaptive;production-trace-policy;p${_order}"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1800)
+endforeach()
+
 # CPU/ordinary-CUDA/tensor-CUDA alignment for the same bounded IGR
 # quadrature candidate used by the CPU-only convergence registration.
 foreach(_order IN ITEMS 1 2 3)
@@ -606,6 +700,25 @@ foreach(_order IN ITEMS 1 2 3)
     dg_igr_hdg_runtime_cuda_generic_euler_convergence_igr_reduced_quadrature_p${_order}_rank1
     PROPERTIES
       LABELS "hdg;runtime;cpu;cuda;generic-euler;convergence;spatial;backward-euler;ordinary;tensor;igr;quadrature-candidate;p${_order};alignment"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 7200)
+
+  # Bind the complete explicit candidate policy—not just its quadrature—to
+  # the shared spatial and Backward-Euler temporal convergence fixture.
+  add_test(
+    NAME dg_igr_hdg_runtime_cuda_generic_euler_convergence_igr_candidate_p${_order}_rank1
+    COMMAND dg_igr_hdg_runtime_cuda_generic_euler_convergence
+      --order ${_order} --regularization igr
+      --igr-volume-quadrature-order ${_igr_volume_quadrature_order}
+      --igr-face-quadrature-order ${_igr_face_quadrature_order}
+      --newton-linear-rtol 1e-10
+      --final-linear-rtol 3e-11
+      --true-residual-tightening-linear-rtol 1e-12)
+  set_tests_properties(
+    dg_igr_hdg_runtime_cuda_generic_euler_convergence_igr_candidate_p${_order}_rank1
+    PROPERTIES
+      LABELS "hdg;runtime;cpu;cuda;generic-euler;convergence;spatial;backward-euler;ordinary;tensor;igr;quadrature-candidate;role-tolerance-candidate;production-trace-policy;p${_order};alignment"
       PROCESSORS 1
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 7200)

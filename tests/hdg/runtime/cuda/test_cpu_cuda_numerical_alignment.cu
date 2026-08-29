@@ -213,6 +213,11 @@ bool CudaPreparedTracePolicyValid(
               native_element_schwarz_equilibrated_field_split_fp64 ||
       CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
           resolved_trace_policy);
+  const bool expected_robust =
+      CudaTracePolicyUsesNativeElementMatrixFreeWarpRobustCoupled(
+          resolved_trace_policy) &&
+      CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+          expected.trace_preconditioner);
   const bool expected_native_solver =
       engine == generic::CudaEngineKind::tensor_core && !expected_mgr;
   const bool mgr_work = expected_mgr
@@ -232,7 +237,7 @@ bool CudaPreparedTracePolicyValid(
             tensor.minimum_left_scale <= tensor.maximum_left_scale &&
             tensor.minimum_right_scale > 0.0 &&
             tensor.minimum_right_scale <= tensor.maximum_right_scale
-      : expected_equilibrated_field_split
+      : (expected_equilibrated_field_split || expected_robust)
           ? tensor.equilibration_builds == solves &&
                 tensor.equilibration_passes ==
                     native_element_schwarz_equilibration_passes * solves &&
@@ -272,6 +277,23 @@ bool CudaPreparedTracePolicyValid(
              (tensor.native_matrix_free_trace_operator_applications == 0))
       : !tensor.native_matrix_free_trace_operator_configured &&
             tensor.native_matrix_free_trace_operator_applications == 0;
+  // The active alignment workload must stay on the fast lower branch.  The
+  // separate zero-gradient gate exercises exact adaptive coupled selection.
+  const bool robust_work = expected_robust
+      ? tensor.robust_lower_specialization_supported &&
+            tensor.robust_coupled_specialization_supported &&
+            tensor.robust_branch_accounting_complete &&
+            tensor.robust_lower_patch_setups == solves &&
+            tensor.robust_lower_trace_solve_calls == attempts &&
+            tensor.robust_coupled_patch_setups == 0 &&
+            tensor.robust_coupled_trace_solve_calls == 0
+      : !tensor.robust_lower_specialization_supported &&
+            !tensor.robust_coupled_specialization_supported &&
+            tensor.robust_branch_accounting_complete &&
+            tensor.robust_lower_patch_setups == 0 &&
+            tensor.robust_lower_trace_solve_calls == 0 &&
+            tensor.robust_coupled_patch_setups == 0 &&
+            tensor.robust_coupled_trace_solve_calls == 0;
   return tensor.selected_engine == engine &&
       tensor.requested_trace_policy == requested_trace_policy &&
       tensor.resolved_trace_policy == resolved_trace_policy &&
@@ -279,7 +301,7 @@ bool CudaPreparedTracePolicyValid(
       tensor.trace_policy_order == polynomial_order &&
       tensor.trace_preconditioner_configured &&
       tensor.trace_preconditioner == expected.trace_preconditioner &&
-      mgr_work && element_schwarz_work && matrix_free_work &&
+      mgr_work && element_schwarz_work && matrix_free_work && robust_work &&
       tensor.trace_solver_accounting_complete &&
       tensor.native_rank1_trace_solver_configured == expected_native_solver &&
       tensor.hypre_mgr_rank1_trace_solver_configured == expected_mgr &&
@@ -1509,9 +1531,9 @@ bool ParseCudaTracePolicy(
     const std::string_view text, CudaTracePolicyKind& policy) noexcept
 {
   // Keep this command-line surface private to the finite qualification
-  // executable.  The coupled entries are explicit ablations; they do not add
-  // a selector to the application contract.
-  constexpr std::array<CudaTracePolicyKind, 11> policies{{
+  // executable.  The coupled and robust entries are explicit ablations; they
+  // do not change application engine-default routing.
+  constexpr std::array<CudaTracePolicyKind, 12> policies{{
       CudaTracePolicyKind::engine_default,
       CudaTracePolicyKind::common_fast,
       CudaTracePolicyKind::equilibrated_mgr,
@@ -1528,7 +1550,9 @@ bool ParseCudaTracePolicy(
       CudaTracePolicyKind::
           native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi2_fp64,
       CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi10_fp64}};
+          native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi10_fp64,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_robust_coupled_sigma_jacobi10_fp64}};
   for (const CudaTracePolicyKind candidate : policies)
     if (text == CudaTracePolicyKindName(candidate))
     {
@@ -1656,7 +1680,8 @@ void PrintUsage(const char* const executable)
          "fp64|native-element-schwarz-matrix-free-warp-coupled-fp64|"
          "native-element-schwarz-matrix-free-warp-coupled-sigma-jacobi2-"
          "fp64|native-element-schwarz-matrix-free-warp-coupled-sigma-"
-         "jacobi10-fp64] [--validate-options-only]\n";
+         "jacobi10-fp64|native-element-schwarz-matrix-free-warp-robust-"
+         "coupled-sigma-jacobi10-fp64] [--validate-options-only]\n";
 }
 
 } // namespace

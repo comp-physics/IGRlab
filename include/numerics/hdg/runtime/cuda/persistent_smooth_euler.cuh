@@ -1766,6 +1766,18 @@ private:
         evidence, selected_preconditioner, igr_active);
     evidence.trace_preconditioner_configured = initialized_ &&
         numerics_.TracePreconditionerConfigured() && selected_policy_ready;
+    const bool robust =
+        CudaTracePolicyUsesNativeElementMatrixFreeWarpRobustCoupled(
+            trace_policy_.resolved_selection) &&
+        CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+            selected_preconditioner);
+    evidence.robust_lower_specialization_supported = robust &&
+        evidence.trace_preconditioner_configured;
+    evidence.robust_coupled_specialization_supported = robust &&
+        evidence.trace_preconditioner_configured;
+    evidence.robust_branch_accounting_complete = !robust ||
+        (evidence.robust_lower_specialization_supported &&
+         evidence.robust_coupled_specialization_supported);
     return selected_policy_ready;
   }
 

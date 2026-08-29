@@ -27,6 +27,9 @@ namespace dg::hdg::runtime::cuda_w8a
 {
 namespace
 {
+static_assert(detail::native_trace_solve_status_invalid_preconditioner ==
+              static_cast<int>(
+                  detail::NativeTraceSolveStatus::invalid_preconditioner));
 static_assert(detail::native_trace_sigma_jacobi3_sweeps ==
               native_element_schwarz_sigma_jacobi3_sweeps);
 static_assert(detail::native_trace_sigma_jacobi5_sweeps ==
@@ -1333,6 +1336,11 @@ bool CudaQueryNativeRankOneTraceResources(
 {
   requirements = {};
   support = {};
+  // The robust descriptor is not a kernel specialization.  Its two exact
+  // effective leaves are queried independently by the persistent runtime.
+  if (CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+          preconditioner_kind))
+    return false;
   const bool fixed_sigma_jacobi =
       CudaTracePreconditionerUsesFixedSigmaJacobi(preconditioner_kind);
   const bool coupled_warp_full_patch =
@@ -1476,6 +1484,9 @@ bool CudaLaunchNativeRankOneTraceSolver(
     const double relative_tolerance, const int maximum_iterations,
     const int krylov_dimension, const cudaStream_t stream) noexcept
 {
+  if (CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+          preconditioner_kind))
+    return false;
   NativeTraceSystemView system{};
   system.matrix = {matrix.diag_offsets, matrix.diag_columns,
                    matrix.diag_values, matrix.rows,
@@ -5220,6 +5231,45 @@ __global__ void ZeroVectorKernel(double* values,int n)
 __global__ void StatusReductionKernel(const double* status,int count,
                                       int* failure)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<count&&status[i]!=1.0)atomicExch(failure,1);}
+constexpr int element_schwarz_setup_observed_ready=1;
+constexpr int element_schwarz_setup_observed_structural=2;
+constexpr int element_schwarz_setup_observed_invalid=3;
+constexpr double element_schwarz_status_structural=-7.0;
+constexpr double element_schwarz_status_invalid=-8.0;
+constexpr int element_schwarz_field_split_failure_none=0;
+constexpr int element_schwarz_field_split_failure_structural=1;
+constexpr int element_schwarz_field_split_failure_invalid=2;
+__global__ void ElementSchwarzSetupStatusReductionKernel(
+    const double* status,int count,int* setup_status)
+{
+  const int i=blockIdx.x*blockDim.x+threadIdx.x;
+  if(i>=count)return;
+  const double value=status[i];
+  const int classification=value==1.0?element_schwarz_setup_observed_ready:
+      value==element_schwarz_status_structural?
+          element_schwarz_setup_observed_structural:
+          element_schwarz_setup_observed_invalid;
+  atomicMax(setup_status,classification);
+}
+__global__ void ElementSchwarzSetupInputReductionKernel(
+    CudaDeviceView v,CudaMeshShape s,int* setup_status)
+{
+  const int element=blockIdx.x;
+  if(element>=s.elements||
+     v.status[element]!=element_schwarz_status_structural)return;
+  const int element_entries=s.trace_dofs*s.trace_dofs;
+  const int entries=s.elements*s.trace_dofs*s.trace_dofs;
+  const int begin=element*element_entries;
+  for(int local=threadIdx.x;local<element_entries;local+=blockDim.x)
+  {
+    const int item=begin+local;
+    const int first=v.element_schwarz_first_source[item];
+    const int second=v.element_schwarz_second_source[item];
+    if(first<0||first>=entries||second< -1||second>=entries||
+       !isfinite(v.element_schwarz_patch_matrix[item]))
+      atomicMax(setup_status,element_schwarz_setup_observed_invalid);
+  }
+}
 __global__ void GatherRemoteVectorKernel(CudaDeviceView v,CudaMeshShape s,const double* values,int n)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)v.remote_vector_send[i]=SignedVectorValue(v,s,values,v.vector_send_source[i]);}
 __global__ void ScatterRemoteVectorKernel(CudaDeviceView v,double* truth,int n)
@@ -5274,16 +5324,22 @@ __device__ void FactorElementSchwarzFieldBlock(
   if(threadIdx.x==0)
   {
     *scale=0.0;
-    if(*failed==0)
+    if(*failed==element_schwarz_field_split_failure_none)
       for(int item=0;item<rows*rows;++item)
         *scale=fmax(*scale,fabs(lu[item]));
-    if(*failed==0&&(!(*scale>0.0)||!isfinite(*scale)))
-      *failed=1;
+    if(*failed==element_schwarz_field_split_failure_none)
+    {
+      if(!isfinite(*scale))
+        *failed=element_schwarz_field_split_failure_invalid;
+      else if(!(*scale>0.0))
+        *failed=element_schwarz_field_split_failure_structural;
+    }
   }
   __syncthreads();
   for(int column=0;column<rows;++column)
   {
-    if(threadIdx.x==0&&*failed==0)
+    if(threadIdx.x==0&&
+       *failed==element_schwarz_field_split_failure_none)
     {
       *pivot_row=column;
       for(int row=column+1;row<rows;++row)
@@ -5292,9 +5348,10 @@ __device__ void FactorElementSchwarzFieldBlock(
           *pivot_row=row;
       pivots[column]=*pivot_row;
       const double pivot=fabs(lu[*pivot_row*rows+column]);
-      if(!(pivot>64.0*2.2204460492503131e-16*(*scale))||
-         !isfinite(pivot))
-        *failed=1;
+      if(!isfinite(pivot))
+        *failed=element_schwarz_field_split_failure_invalid;
+      else if(!(pivot>64.0*2.2204460492503131e-16*(*scale)))
+        *failed=element_schwarz_field_split_failure_structural;
     }
     __syncthreads();
     if(*failed)break;
@@ -5307,15 +5364,24 @@ __device__ void FactorElementSchwarzFieldBlock(
       }
     __syncthreads();
     for(int row=column+1+threadIdx.x;row<rows;row+=blockDim.x)
-      lu[row*rows+column]/=lu[column*rows+column];
+    {
+      const double value=lu[row*rows+column]/lu[column*rows+column];
+      lu[row*rows+column]=value;
+      if(!isfinite(value))
+        atomicMax(failed,element_schwarz_field_split_failure_invalid);
+    }
     __syncthreads();
+    if(*failed)break;
     const int trailing=rows-column-1;
     for(int item=threadIdx.x;item<trailing*trailing;item+=blockDim.x)
     {
       const int row=column+1+item/trailing;
       const int entry=column+1+item%trailing;
-      lu[row*rows+entry]-=
+      const double value=lu[row*rows+entry]-
           lu[row*rows+column]*lu[column*rows+entry];
+      lu[row*rows+entry]=value;
+      if(!isfinite(value))
+        atomicMax(failed,element_schwarz_field_split_failure_invalid);
     }
     __syncthreads();
   }
@@ -5446,7 +5512,12 @@ __global__ void ElementSchwarzEquilibratedFieldSplitSetupKernel(
   __shared__ double factor_scale;
   __shared__ int pivot_row;
   __shared__ int failed;
-  if(threadIdx.x==0){factor_scale=0.0;pivot_row=0;failed=0;}
+  if(threadIdx.x==0)
+  {
+    factor_scale=0.0;
+    pivot_row=0;
+    failed=element_schwarz_field_split_failure_none;
+  }
   __syncthreads();
 
   for(int item=threadIdx.x;item<n*n;item+=blockDim.x)
@@ -5462,7 +5533,7 @@ __global__ void ElementSchwarzEquilibratedFieldSplitSetupKernel(
         static_cast<int>(vector_offset)+column],column_sign);
     if(first<0||first>=all_entries||second< -1||second>=all_entries)
     {
-      atomicExch(&failed,1);
+      atomicMax(&failed,element_schwarz_field_split_failure_invalid);
       matrix[item]=0.0;
       storage[item]=0.0;
       continue;
@@ -5470,7 +5541,8 @@ __global__ void ElementSchwarzEquilibratedFieldSplitSetupKernel(
     double value=SignedMatrixValue(v,s,first);
     if(second>=0)value+=SignedMatrixValue(v,s,second);
     value*=row_sign*column_sign;
-    if(!isfinite(value))atomicExch(&failed,1);
+    if(!isfinite(value))
+      atomicMax(&failed,element_schwarz_field_split_failure_invalid);
     matrix[item]=value;
     storage[item]=0.0;
   }
@@ -5527,7 +5599,7 @@ __global__ void ElementSchwarzEquilibratedFieldSplitSetupKernel(
         storage[right_scale_offset+packed]=next_right;
       }
       else
-        atomicExch(&failed,1);
+        atomicMax(&failed,element_schwarz_field_split_failure_invalid);
     }
     __syncthreads();
   }
@@ -5538,9 +5610,12 @@ __global__ void ElementSchwarzEquilibratedFieldSplitSetupKernel(
     const int row=item/euler_rows,column=item-row*euler_rows;
     const int original_row=ElementSchwarzFieldSplitOriginalRow(n,row);
     const int original_column=ElementSchwarzFieldSplitOriginalRow(n,column);
-    storage[item]=storage[left_scale_offset+row]*
+    const double value=storage[left_scale_offset+row]*
         matrix[original_row*n+original_column]*
         storage[right_scale_offset+column];
+    storage[item]=value;
+    if(!isfinite(value))
+      atomicMax(&failed,element_schwarz_field_split_failure_invalid);
   }
   for(int item=threadIdx.x;item<sigma_rows*sigma_rows;
       item+=blockDim.x)
@@ -5552,9 +5627,12 @@ __global__ void ElementSchwarzEquilibratedFieldSplitSetupKernel(
         ElementSchwarzFieldSplitOriginalRow(n,packed_row);
     const int original_column=
         ElementSchwarzFieldSplitOriginalRow(n,packed_column);
-    storage[sigma_lu_offset+item]=storage[left_scale_offset+packed_row]*
+    const double value=storage[left_scale_offset+packed_row]*
         matrix[original_row*n+original_column]*
         storage[right_scale_offset+packed_column];
+    storage[sigma_lu_offset+item]=value;
+    if(!isfinite(value))
+      atomicMax(&failed,element_schwarz_field_split_failure_invalid);
   }
   for(int item=threadIdx.x;item<sigma_rows*euler_rows;
       item+=blockDim.x)
@@ -5570,7 +5648,8 @@ __global__ void ElementSchwarzEquilibratedFieldSplitSetupKernel(
         matrix[original_row*n+original_column]*
         storage[right_scale_offset+euler];
     storage[lower_coupling_offset+item]=value;
-    if(!isfinite(value))atomicExch(&failed,1);
+    if(!isfinite(value))
+      atomicMax(&failed,element_schwarz_field_split_failure_invalid);
   }
   __syncthreads();
   FactorElementSchwarzFieldBlock(
@@ -5585,32 +5664,37 @@ __global__ void ElementSchwarzEquilibratedFieldSplitSetupKernel(
     // n-by-n arena: one FP64 reciprocal diagonal and one exactly represented
     // packed source index per row.  The latter folds the sequential pivot-swap
     // chain into the setup that is already performed once per factor.
-    for(int packed=threadIdx.x;packed<n;packed+=blockDim.x)
-    {
-      const bool euler=packed<euler_rows;
-      const int block_begin=euler?0:euler_rows;
-      const int block_rows=euler?euler_rows:sigma_rows;
-      const int local_row=packed-block_begin;
-      const double* const factor=euler?storage:storage+sigma_lu_offset;
-      const double diagonal=factor[local_row*block_rows+local_row];
-      const double inverse=1.0/diagonal;
-      int source=local_row;
-      for(int step=block_rows-1;step>=0;--step)
+    if(failed==element_schwarz_field_split_failure_none)
+      for(int packed=threadIdx.x;packed<n;packed+=blockDim.x)
       {
-        const int pivot=pivots[block_begin+step];
-        if(source==step)source=pivot;
-        else if(source==pivot)source=step;
+        const bool euler=packed<euler_rows;
+        const int block_begin=euler?0:euler_rows;
+        const int block_rows=euler?euler_rows:sigma_rows;
+        const int local_row=packed-block_begin;
+        const double* const factor=euler?storage:storage+sigma_lu_offset;
+        const double diagonal=factor[local_row*block_rows+local_row];
+        const double inverse=1.0/diagonal;
+        int source=local_row;
+        for(int step=block_rows-1;step>=0;--step)
+        {
+          const int pivot=pivots[block_begin+step];
+          if(source==step)source=pivot;
+          else if(source==pivot)source=step;
+        }
+        storage[inverse_diagonal_offset+packed]=inverse;
+        storage[rhs_permutation_offset+packed]=
+            static_cast<double>(block_begin+source);
+        if(!isfinite(inverse)||inverse==0.0||
+           source<0||source>=block_rows)
+          atomicMax(&failed,element_schwarz_field_split_failure_invalid);
       }
-      storage[inverse_diagonal_offset+packed]=inverse;
-      storage[rhs_permutation_offset+packed]=
-          static_cast<double>(block_begin+source);
-      if(!isfinite(inverse)||inverse==0.0||
-         source<0||source>=block_rows)
-        atomicExch(&failed,1);
-    }
     __syncthreads();
   }
-  if(threadIdx.x==0)v.status[e]=failed? -7.0:1.0;
+  if(threadIdx.x==0)
+    v.status[e]=failed==element_schwarz_field_split_failure_none?1.0:
+        failed==element_schwarz_field_split_failure_structural?
+            element_schwarz_status_structural:
+            element_schwarz_status_invalid;
 }
 
 __global__ void RecoverKernel(CudaDeviceView v,CudaMeshShape s)
@@ -6376,6 +6460,27 @@ bool CudaLaunchTicket(int* words,const CudaFailurePhase phase,std::uint64_t atte
 bool CudaLaunchStatusReduction(const double* status,const int count,
                                int* failure_flag) noexcept
 {if(status==nullptr||failure_flag==nullptr||count<0)return false;if(cudaMemsetAsync(failure_flag,0,sizeof(int),nullptr)!=cudaSuccess)return false;if(count)StatusReductionKernel<<<Blocks(count),128>>>(status,count,failure_flag);return LaunchOk();}
+bool CudaLaunchClassifyNativeElementSchwarzSetup(
+    const CudaDeviceView& v,const CudaMeshShape& s,
+    int* const device_setup_status) noexcept
+{
+  if(v.status==nullptr||v.element_schwarz_patch_matrix==nullptr||
+     v.element_schwarz_first_source==nullptr||
+     v.element_schwarz_second_source==nullptr||
+     device_setup_status==nullptr||s.elements<=0||s.trace_dofs<=0||
+     s.elements>std::numeric_limits<int>::max()/s.trace_dofs||
+     s.elements*s.trace_dofs>
+         std::numeric_limits<int>::max()/s.trace_dofs)
+    return false;
+  if(cudaMemsetAsync(device_setup_status,0,sizeof(int),nullptr)!=cudaSuccess)
+    return false;
+  ElementSchwarzSetupStatusReductionKernel<<<Blocks(s.elements),128>>>(
+      v.status,s.elements,device_setup_status);
+  if(!LaunchOk())return false;
+  ElementSchwarzSetupInputReductionKernel<<<s.elements,128>>>(
+      v,s,device_setup_status);
+  return LaunchOk();
+}
 bool CudaLaunchGatherLocalTrace(const int* map,int count,const double* source,double* destination) noexcept
 {GatherKernel<<<Blocks(count),128>>>(map,count,source,destination);return LaunchOk();}
 bool CudaLaunchAdmissibility(const CudaDeviceView& v,const CudaMeshShape& s) noexcept
@@ -6506,6 +6611,8 @@ bool CudaLaunchSetupNativeElementSchwarz(
       CudaTracePreconditionerIsNativeElementSchwarzWarpEquilibratedFieldSplit(
           preconditioner_kind);
   if(!CudaTracePreconditionerIsNativeElementSchwarz(preconditioner_kind)||
+     CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+         preconditioner_kind)||
      !s.igr_active||s.elements<=0||s.trace_dofs!=expected||
      v.schur==nullptr||v.status==nullptr||
      v.element_schwarz_patch_matrix==nullptr||

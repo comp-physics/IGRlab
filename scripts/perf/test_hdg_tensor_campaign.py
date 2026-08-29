@@ -58,6 +58,8 @@ SCHEMA2_ONLY_SUMMARY_FIELDS = {
     "trace_element_schwarz_factorization",
     "trace_sigma_jacobi_policy",
     "trace_field_split_sigma_jacobi_policy",
+    "trace_robust_branch_counters",
+    "trace_robust_branch_support",
     "tensor_core", "trace_and_tensor_accounting",
     "trace_policy_metadata_status", "precision_policy", "numerical_policy",
     "initialization_duration_seconds", "initialization_in_primary_timing",
@@ -87,6 +89,13 @@ SCHEMA2_ONLY_RECORD_FIELDS = {
     "trace_element_schwarz_sigma_rows",
     "trace_element_schwarz_apply",
     "trace_element_schwarz_apply_tile_width",
+    "trace_robust_lower_specialization_supported",
+    "trace_robust_coupled_specialization_supported",
+    "trace_robust_branch_accounting_complete",
+    "trace_robust_lower_patch_setups",
+    "trace_robust_lower_trace_solve_calls",
+    "trace_robust_coupled_patch_setups",
+    "trace_robust_coupled_trace_solve_calls",
     "trace_sigma_jacobi_sweeps", "trace_sigma_jacobi_damping",
     "trace_field_split_sigma_jacobi_sweeps",
     "trace_field_split_sigma_jacobi_damping",
@@ -122,6 +131,13 @@ SCHEMA2_ONLY_SAMPLE_FIELDS = {
     "maximum_left_scale", "minimum_right_scale", "maximum_right_scale",
     "element_schwarz_patch_setups",
     "element_schwarz_preconditioner_applications",
+    "robust_lower_specialization_supported",
+    "robust_coupled_specialization_supported",
+    "robust_branch_accounting_complete",
+    "robust_lower_patch_setups", "robust_lower_trace_solve_calls",
+    "robust_coupled_patch_setups", "robust_coupled_trace_solve_calls",
+    "sigma_jacobi_sweeps", "sigma_jacobi_damping",
+    "sigma_jacobi_updates",
     "field_split_sigma_jacobi_sweeps",
     "field_split_sigma_jacobi_damping",
     "field_split_sigma_jacobi_updates",
@@ -193,6 +209,8 @@ parser.add_argument(
              "native-element-schwarz-matrix-free-warp-coupled-"
              "sigma-jacobi2-fp64",
              "native-element-schwarz-matrix-free-warp-coupled-"
+             "sigma-jacobi10-fp64",
+             "native-element-schwarz-matrix-free-warp-robust-coupled-"
              "sigma-jacobi10-fp64"),
 )
 parser.add_argument("--order", required=True, type=int)
@@ -219,14 +237,10 @@ args = parser.parse_args()
 is_frozen = "frozen" in str(Path(__file__))
 common_fast = args.trace_policy == "common-fast"
 resolved_trace_policy = (
-    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "native-element-schwarz-matrix-free-warp-robust-coupled-"
     "sigma-jacobi10-fp64"
     if args.trace_policy == "engine-default" and
-    args.engine == "tensor" and args.mode == "igr" and args.order <= 2
-    else "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-    "sigma-jacobi2-fp64"
-    if args.trace_policy == "engine-default" and
-    args.engine == "tensor" and args.mode == "igr" and args.order == 3
+    args.engine == "tensor" and args.mode == "igr"
     else args.trace_policy
 )
 equilibrated_mgr = resolved_trace_policy == "equilibrated-mgr"
@@ -373,6 +387,12 @@ fixed_sigma_jacobi_policies = {
         "native_element_schwarz_warp_coupled_sigma_jacobi10_fp64",
         True,
     ),
+    "native-element-schwarz-matrix-free-warp-robust-coupled-"
+    "sigma-jacobi10-fp64": (
+        10,
+        "native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64",
+        True,
+    ),
 }
 fixed_sigma_jacobi_policy = fixed_sigma_jacobi_policies.get(
     resolved_trace_policy
@@ -381,6 +401,10 @@ fixed_sigma_jacobi_sweeps = (
     fixed_sigma_jacobi_policy[0] if fixed_sigma_jacobi_policy else 0
 )
 fixed_sigma_jacobi = fixed_sigma_jacobi_sweeps > 0
+robust_adaptive = resolved_trace_policy == (
+    "native-element-schwarz-matrix-free-warp-robust-coupled-"
+    "sigma-jacobi10-fp64"
+)
 coupled_warp = resolved_trace_policy in (
     "native-element-schwarz-matrix-free-warp-coupled-fp64",
     "native-element-schwarz-matrix-free-warp-coupled-sigma-jacobi2-fp64",
@@ -391,7 +415,8 @@ matrix_free = resolved_trace_policy in (
     "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
     "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
 )
-matrix_free = matrix_free or fixed_sigma_jacobi or coupled_warp
+matrix_free = matrix_free or fixed_sigma_jacobi or coupled_warp or \
+    robust_adaptive
 element_field_split = resolved_trace_policy in (
     "native-element-schwarz-equilibrated-field-split-fp64",
     "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
@@ -405,15 +430,18 @@ warp_element_field_split = resolved_trace_policy in (
 )
 warp_element_field_split = warp_element_field_split or (
     fixed_sigma_jacobi_policy[2]
-    if fixed_sigma_jacobi_policy and not coupled_warp else False
+    if fixed_sigma_jacobi_policy and not coupled_warp and
+    not robust_adaptive else False
 )
 element_schwarz = resolved_trace_policy == "native-element-schwarz-fp64" or \
-    matrix_free or element_field_split or coupled_warp
+    matrix_free or element_field_split or coupled_warp or robust_adaptive
 if equilibrated_mgr and (args.engine != "tensor" or args.mode != "igr"):
     parser.error("equilibrated-mgr requires tensor IGR")
 if element_schwarz and (args.engine != "tensor" or args.mode != "igr"):
     parser.error("native element-Schwarz policies require tensor IGR")
-if coupled_warp:
+if robust_adaptive:
+    trace_preconditioner = fixed_sigma_jacobi_policy[1]
+elif coupled_warp:
     trace_preconditioner = (
         fixed_sigma_jacobi_policy[1]
         if fixed_sigma_jacobi else
@@ -660,6 +688,24 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
             "element_schwarz_preconditioner_applications": (
                 9 if element_schwarz else 0
             ),
+            "robust_lower_specialization_supported": robust_adaptive,
+            "robust_coupled_specialization_supported": robust_adaptive,
+            "robust_branch_accounting_complete": True,
+            "robust_lower_patch_setups": (
+                sample["trace_solves"] if robust_adaptive else 0
+            ),
+            "robust_lower_trace_solve_calls": (
+                sample["linear_solve_attempts"] if robust_adaptive else 0
+            ),
+            "robust_coupled_patch_setups": 0,
+            "robust_coupled_trace_solve_calls": 0,
+            "sigma_jacobi_sweeps": fixed_sigma_jacobi_sweeps,
+            "sigma_jacobi_damping": (
+                2.0 / 3.0 if fixed_sigma_jacobi else 0.0
+            ),
+            "sigma_jacobi_updates": (
+                9 * fixed_sigma_jacobi_sweeps
+            ),
             "field_split_sigma_jacobi_sweeps": (
                 fixed_sigma_jacobi_sweeps
             ),
@@ -733,6 +779,17 @@ payload = {
     "trace_ilu_factor_reuse_policy": ilu_factor_reuse_policy,
     "trace_native_element_schwarz_configured": element_schwarz,
     "trace_native_matrix_free_operator_configured": matrix_free,
+    "trace_robust_lower_specialization_supported": robust_adaptive,
+    "trace_robust_coupled_specialization_supported": robust_adaptive,
+    "trace_robust_branch_accounting_complete": True,
+    "trace_robust_lower_patch_setups": (
+        2 if robust_adaptive else 0
+    ),
+    "trace_robust_lower_trace_solve_calls": (
+        2 if robust_adaptive else 0
+    ),
+    "trace_robust_coupled_patch_setups": 0,
+    "trace_robust_coupled_trace_solve_calls": 0,
     "trace_element_schwarz_patch_rows": (
         4 * 5 * (args.order + 1) if element_schwarz else 0
     ),
@@ -743,6 +800,8 @@ payload = {
         2 if element_schwarz else 0
     ),
     "trace_element_schwarz_factorization": (
+        "adaptive-lower-multiplicative-uhat4-sigmahat-or-"
+        "full-coupled-patch-lu" if robust_adaptive else
         "full-coupled-patch-lu" if coupled_warp else
         "lower-multiplicative-uhat4-sigmahat" if element_field_split else
         "full-patch-lu" if element_schwarz else "not-applicable"
@@ -757,6 +816,8 @@ payload = {
         4 * (args.order + 1) if element_field_split else 0
     ),
     "trace_element_schwarz_apply": (
+        "adaptive-cooperative-lower-or-full-patch-pivoted-lu-fp64"
+        if robust_adaptive else
         "cooperative-full-patch-pivoted-lu-fp64" if coupled_warp else
         "cooperative-pivoted-lu-fp64" if warp_element_field_split else
         "scalar-pivoted-lu-fp64" if element_field_split else
@@ -764,6 +825,7 @@ payload = {
         "not-applicable"
     ),
     "trace_element_schwarz_apply_tile_width": (
+        (16 if args.order == 1 else 32) if robust_adaptive else
         32 if coupled_warp else
         16 if warp_element_field_split and args.order == 1 else
         32 if warp_element_field_split else 0
@@ -925,6 +987,13 @@ if is_frozen:
         "trace_ilu_accounting_kind", "trace_ilu_factor_reuse_policy",
         "trace_native_element_schwarz_configured",
         "trace_native_matrix_free_operator_configured",
+        "trace_robust_lower_specialization_supported",
+        "trace_robust_coupled_specialization_supported",
+        "trace_robust_branch_accounting_complete",
+        "trace_robust_lower_patch_setups",
+        "trace_robust_lower_trace_solve_calls",
+        "trace_robust_coupled_patch_setups",
+        "trace_robust_coupled_trace_solve_calls",
         "trace_element_schwarz_patch_rows",
         "trace_element_schwarz_minimum_multiplicity",
         "trace_element_schwarz_maximum_multiplicity",
@@ -1042,17 +1111,37 @@ def write_build_provenance(root: Path, source: Path,
             "mode=gpu",
             "profile=cuda-sm120",
             "build_type=Release",
+            "mfem_pin=d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec",
+            "compiler=gcc@13.3.0",
+            "mpi_spec=openmpi+cuda",
+            "mpi_hash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "hypre_spec=hypre@develop+mpi+cuda cuda_arch=120",
             f"hypre_hash={SYNTHETIC_HYPRE_HASH}",
             "hypre_prefix=/fake/spack/hypre-develop-"
             f"{SYNTHETIC_HYPRE_HASH}",
             f"hypre_source_revision={SYNTHETIC_HYPRE_REVISION}",
             "hypre_configuration=mpi+cuda+device-memory+sm120",
+            "metis_spec=metis",
+            "metis_hash=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "raja_state=off",
+            "umpire_spec=umpire",
+            "umpire_hash=cccccccccccccccccccccccccccccccc",
+            "caliper_spec=off",
+            "caliper_hash=off",
+            "cuda_spec=cuda",
+            "cuda_hash=dddddddddddddddddddddddddddddddd",
             "dependency_cuda_arch=120",
             "mfem_cuda_archs=80-virtual",
-            "reuse_abi=build_type=Release;"
+            "reuse_abi=build_type=Release;openmp=off;"
+            "metis=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb;"
+            "compiler=gcc@13.3.0;mpi_spec=openmpi+cuda;"
+            "mpi=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;"
             "hypre_spec=hypre@develop+mpi+cuda cuda_arch=120;"
             f"hypre={SYNTHETIC_HYPRE_HASH};"
+            "raja=off;umpire_spec=umpire;"
+            "umpire=cccccccccccccccccccccccccccccccc;"
+            "caliper_spec=off;caliper=off;cuda_spec=cuda;"
+            "cuda=dddddddddddddddddddddddddddddddd;"
             "dependency_arch=120;mfem_arch=80-virtual",
             "",
         )),
@@ -1557,6 +1646,53 @@ def main() -> int:
                             f"validator admitted wrong {mode}/p{order} "
                             f"numerical field {field}"
                         )
+
+                frozen_policy = CAMPAIGN.frozen_control_numerical_policy(
+                    mode, order
+                )
+                frozen_control_command = CAMPAIGN.final_command(
+                    final,
+                    engine="ordinary",
+                    mode=mode,
+                    order=order,
+                    mesh_n=12,
+                    domain_periods=3,
+                    timestep=1.0e-5,
+                    export=False,
+                    expected_build=explicit_build,
+                    numerical_policy=frozen_policy,
+                )
+                assert all(float(command_value(
+                    frozen_control_command, option
+                )) == 1.0e-12 for option in (
+                    "--newton-linear-rtol",
+                    "--final-linear-rtol",
+                    "--true-residual-tightening-linear-rtol",
+                ))
+                if mode == "igr":
+                    assert int(command_value(
+                        frozen_control_command,
+                        "--igr-volume-quadrature-order",
+                    )) == 12
+                    assert int(command_value(
+                        frozen_control_command,
+                        "--igr-face-quadrature-order",
+                    )) == 12
+                source_locked_command = CAMPAIGN.frozen_command(
+                    Path("frozen-benchmark"),
+                    mode=mode,
+                    order=order,
+                    mesh_n=12,
+                    domain_periods=3,
+                    timestep=1.0e-5,
+                )
+                assert not any(option in source_locked_command for option in (
+                    "--newton-linear-rtol",
+                    "--final-linear-rtol",
+                    "--true-residual-tightening-linear-rtol",
+                    "--igr-volume-quadrature-order",
+                    "--igr-face-quadrature-order",
+                ))
 
         mgr_command = CAMPAIGN.final_command(
             final,
@@ -2075,8 +2211,10 @@ def main() -> int:
             "sigma-jacobi2-fp64",
             "native-element-schwarz-matrix-free-warp-coupled-"
             "sigma-jacobi10-fp64",
+            "native-element-schwarz-matrix-free-warp-robust-coupled-"
+            "sigma-jacobi10-fp64",
         }
-        assert len(expected_fixed_sigma_policy_names) == 22
+        assert len(expected_fixed_sigma_policy_names) == 23
         assert set(CAMPAIGN.FIXED_SIGMA_JACOBI_POLICY) == \
             expected_fixed_sigma_policy_names
         fixed_sigma_policy_specs = tuple(
@@ -2357,10 +2495,7 @@ def main() -> int:
         ]["attribution_by_cell"]["igr_p3"]["trace_policy_matched"] is False
         assert campaign["export_control"]["attribution"][
             "tensor_trace_preconditioner"
-        ] == (
-            "native_element_schwarz_warp_equilibrated_field_split_"
-            "sigma_jacobi2_fp64"
-        )
+        ] == "native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64"
         assert campaign["export_control"]["attribution"][
             "mma_contribution_requires_separate_profiler_attribution"
         ] is True
@@ -2378,11 +2513,12 @@ def main() -> int:
         assert CAMPAIGN.expected_trace_preconditioner(
             "tensor", "conventional"
         ) == "hypre_diag_scale"
-        for order, sweeps in ((1, 10), (2, 10), (3, 2)):
+        for order in (1, 2, 3):
             policy, descriptor = CAMPAIGN.production_tensor_igr_trace_policy(
                 order
             )
-            assert descriptor.sweeps == sweeps
+            assert policy == CAMPAIGN.PRODUCTION_TENSOR_IGR_ROBUST_TRACE_POLICY
+            assert descriptor.sweeps == 10
             assert descriptor.warp is True
             assert CAMPAIGN.expected_resolved_trace_policy(
                 "tensor", "igr", order=order
@@ -3285,6 +3421,32 @@ def main() -> int:
         assert tensor_igr_record["requested_trace_policy"] == "engine-default"
         assert tensor_igr_record["resolved_trace_policy"] == tensor_igr_policy
         assert tensor_igr_record[
+            "trace_element_schwarz_factorization"
+        ] == (
+            "adaptive-lower-multiplicative-uhat4-sigmahat-or-"
+            "full-coupled-patch-lu"
+        )
+        assert tensor_igr_record[
+            "trace_element_schwarz_apply"
+        ] == "adaptive-cooperative-lower-or-full-patch-pivoted-lu-fp64"
+        assert tensor_igr_record[
+            "trace_robust_lower_specialization_supported"
+        ] is True
+        assert tensor_igr_record[
+            "trace_robust_coupled_specialization_supported"
+        ] is True
+        assert tensor_igr_record[
+            "trace_robust_branch_accounting_complete"
+        ] is True
+        assert tensor_igr_record["trace_robust_lower_patch_setups"] == 2
+        assert tensor_igr_record[
+            "trace_robust_lower_trace_solve_calls"
+        ] == 2
+        assert tensor_igr_record["trace_robust_coupled_patch_setups"] == 0
+        assert tensor_igr_record[
+            "trace_robust_coupled_trace_solve_calls"
+        ] == 0
+        assert tensor_igr_record[
             "trace_field_split_sigma_jacobi_sweeps"
         ] == tensor_igr_descriptor.sweeps
         assert tensor_igr_record[
@@ -3320,6 +3482,31 @@ def main() -> int:
             sample["tensor_core"][
                 "element_schwarz_preconditioner_applications"
             ] * tensor_igr_descriptor.sweeps and
+            sample["tensor_core"]["sigma_jacobi_sweeps"] ==
+            tensor_igr_descriptor.sweeps and
+            sample["tensor_core"]["sigma_jacobi_damping"] ==
+            2.0 / 3.0 and
+            sample["tensor_core"]["sigma_jacobi_updates"] ==
+            sample["tensor_core"][
+                "element_schwarz_preconditioner_applications"
+            ] * tensor_igr_descriptor.sweeps and
+            sample["tensor_core"][
+                "robust_lower_specialization_supported"
+            ] is True and
+            sample["tensor_core"][
+                "robust_coupled_specialization_supported"
+            ] is True and
+            sample["tensor_core"][
+                "robust_branch_accounting_complete"
+            ] is True and
+            sample["tensor_core"]["robust_lower_patch_setups"] ==
+            sample["trace_solves"] and
+            sample["tensor_core"]["robust_lower_trace_solve_calls"] ==
+            sample["linear_solve_attempts"] and
+            sample["tensor_core"]["robust_coupled_patch_setups"] == 0 and
+            sample["tensor_core"][
+                "robust_coupled_trace_solve_calls"
+            ] == 0 and
             sample["tensor_core"]["ilu_type"] == -1 and
             sample["tensor_core"]["ilu_level_of_fill"] == -1 and
             sample["tensor_core"]["ilu_application_iterations"] == 0 and
@@ -3372,6 +3559,16 @@ def main() -> int:
             "trace_preconditioner"
         ] = "hypre_diag_scale"
         assert tensor_igr_rejected(wrong_tensor_igr_sample)
+        wrong_tensor_igr_robust_counter = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_robust_counter["samples"][1]["tensor_core"][
+            "robust_coupled_trace_solve_calls"
+        ] = 1
+        assert tensor_igr_rejected(wrong_tensor_igr_robust_counter)
+        wrong_tensor_igr_robust_support = copy.deepcopy(tensor_igr_record)
+        wrong_tensor_igr_robust_support[
+            "trace_robust_coupled_specialization_supported"
+        ] = False
+        assert tensor_igr_rejected(wrong_tensor_igr_robust_support)
         wrong_tensor_igr_top_level_iterations = copy.deepcopy(
             tensor_igr_record
         )
@@ -3719,6 +3916,31 @@ def main() -> int:
             cmake_cache_path=str(build_cache),
             mfem_identity_path=str(mfem_identity),
         )
+        frozen_provenance = CAMPAIGN.validated_build_provenance(
+            source_root=frozen_source,
+            cmake_cache_path=str(frozen_cache),
+            mfem_identity_path=str(frozen_mfem),
+        )
+        comparable = CAMPAIGN.validated_build_control_comparability(
+            final_provenance, frozen_provenance
+        )
+        assert comparable["status"] == \
+            "exact_toolchain_and_dependency_tuple"
+        mismatched_frozen_mfem = rewrite_manifest(
+            frozen_mfem, root / "frozen-mismatched-cuda.txt",
+            replacements={"cuda_hash": "e" * 32},
+        )
+        mismatched_frozen_provenance = \
+            CAMPAIGN.validated_build_provenance(
+                source_root=frozen_source,
+                cmake_cache_path=str(frozen_cache),
+                mfem_identity_path=str(mismatched_frozen_mfem),
+            )
+        expect_campaign_error(
+            lambda: CAMPAIGN.validated_build_control_comparability(
+                final_provenance, mismatched_frozen_provenance
+            )
+        )
         misbound_executable = root / "not-the-build-target" / "benchmark"
         misbound_executable.parent.mkdir()
         write_executable(misbound_executable, FAKE_BENCHMARK)
@@ -3806,6 +4028,45 @@ def main() -> int:
         assert qualification["workload"]["domain_periods"] == 1
         assert qualification["workload"]["dt"] == 1.0e-5
         assert qualification["workload"]["pairs_per_cell"] == 6
+        assert qualification["method"][
+            "same_final_tree_ordinary_tensor_numerical_policy"
+        ] == {
+            f"igr_p{order}": CAMPAIGN.numerical_policy_metadata(
+                CAMPAIGN.final_numerical_policy("igr", order)
+            )
+            for order in (1, 2, 3)
+        }
+        assert qualification["method"][
+            "same_final_tree_policy_binding"
+        ] == (
+            "explicit final-candidate CLI and schema-2 record; not the "
+            "general application default"
+        )
+        assert qualification["method"][
+            "general_application_default_igr_numerical_policy"
+        ] == {
+            "igr_volume_quadrature_order": 12,
+            "igr_face_quadrature_order": 12,
+            "newton_linear_relative_tolerance": 1.0e-12,
+            "final_linear_relative_tolerance": 1.0e-12,
+            "true_residual_tightening_linear_relative_tolerance": 1.0e-12,
+        }
+        assert qualification["method"][
+            "production_tensor_igr_resolved_trace_policy_by_order"
+        ] == {
+            f"p{order}": CAMPAIGN.PRODUCTION_TENSOR_IGR_ROBUST_TRACE_POLICY
+            for order in (1, 2, 3)
+        }
+        assert qualification["method"][
+            "final_ordinary_frozen_control_numerical_policy"
+        ] == {
+            f"igr_p{order}": CAMPAIGN.numerical_policy_metadata(
+                CAMPAIGN.frozen_control_numerical_policy("igr", order)
+            )
+            for order in (1, 2, 3)
+        }
+        assert "source-locked q12 and 1e-12 defaults" in \
+            qualification["method"]["frozen_policy_binding"]
         assert qualification["export_control"]["mode"] == "igr"
         assert qualification["export_control"]["order"] == 3
         assert qualification["export_control"]["attribution"][
@@ -3830,6 +4091,12 @@ def main() -> int:
         ] == str(frozen.resolve())
         assert frozen_build["source_and_overlay"]["diff_sha256"] == \
             hashlib.sha256(synthetic_overlay).hexdigest()
+        assert frozen_build["control_comparability"]["status"] == \
+            "exact_toolchain_and_dependency_tuple"
+        assert qualification["method"]["frozen_build_control_binding"] == (
+            "exact application compiler, CUDA architecture/toolkit, MFEM "
+            "source, MPI, HYPRE, and dependency tuple"
+        )
         assert qualification["hardware"]["start"]["values"]["uuid"] == \
             "GPU-00000000-0000-0000-0000-000000000001"
 
@@ -3928,6 +4195,49 @@ def main() -> int:
             if item["comparison_member"] == "frozen_ordinary"
         ]
         assert len(frozen_invocations) == 36
+        frozen_comparison_invocations = [
+            item for item in qualification["invocations"]
+            if item["phase"] == "ordinary_frozen_comparison"
+        ]
+        assert len(frozen_comparison_invocations) == 72
+        for invocation in frozen_comparison_invocations:
+            assert invocation["numerical_policy_contract"] == {
+                "igr_volume_quadrature_order": 12,
+                "igr_face_quadrature_order": 12,
+                "newton_linear_relative_tolerance": 1.0e-12,
+                "final_linear_relative_tolerance": 1.0e-12,
+                "true_residual_tightening_linear_relative_tolerance":
+                    1.0e-12,
+            }
+            if invocation["comparison_member"] == "final_ordinary":
+                assert invocation["numerical_policy_binding"] == \
+                    "explicit-final-cli-and-schema2-record"
+                assert all(option in invocation["command"] for option in (
+                    "--newton-linear-rtol",
+                    "--final-linear-rtol",
+                    "--true-residual-tightening-linear-rtol",
+                ))
+                if invocation["mode"] == "igr":
+                    assert command_value(
+                        invocation["command"],
+                        "--igr-volume-quadrature-order",
+                    ) == "12"
+                    assert command_value(
+                        invocation["command"],
+                        "--igr-face-quadrature-order",
+                    ) == "12"
+            else:
+                assert invocation["numerical_policy_binding"] == \
+                    "source-locked-frozen-defaults"
+                assert not any(
+                    option in invocation["command"] for option in (
+                        "--newton-linear-rtol",
+                        "--final-linear-rtol",
+                        "--true-residual-tightening-linear-rtol",
+                        "--igr-volume-quadrature-order",
+                        "--igr-face-quadrature-order",
+                    )
+                )
         for result in qualification["frozen_control_results"].values():
             frozen_work = result["controls"]["frozen_ordinary"][
                 "solver_work"
