@@ -1388,10 +1388,17 @@ bool CudaLaunchNativeRankOneTraceSolver(
   const bool use_ilu = CudaTracePreconditionerIsIlu(preconditioner_kind);
   const bool use_element_schwarz =
       CudaTracePreconditionerIsNativeElementSchwarz(preconditioner_kind);
+  const bool use_equilibrated_field_split =
+      CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
+          preconditioner_kind);
   preconditioner.kind = use_ilu
       ? NativeTracePreconditionerKind::ilu0_rcm_jacobi
       : use_element_schwarz
-          ? NativeTracePreconditionerKind::element_overlap_schwarz_fp64
+          ? (use_equilibrated_field_split
+                 ? NativeTracePreconditionerKind::
+                       element_overlap_schwarz_equilibrated_field_split_fp64
+                 : NativeTracePreconditionerKind::
+                       element_overlap_schwarz_fp64)
           : NativeTracePreconditionerKind::diagonal;
   if (use_ilu)
   {
@@ -4705,6 +4712,75 @@ __global__ void NativeElementVectorKernel(CudaDeviceView v,CudaMeshShape s,
     value+=sign*element_values[slot];
   }
   truth[row]=valid?value:nan("");
+__device__ int ElementSchwarzFieldSplitOriginalRow(
+    const int patch_rows,const int packed_row)
+{
+  const int scalar_rows=patch_rows/20;
+  const int euler_rows=16*scalar_rows;
+  const int face_span=5*scalar_rows;
+  if(packed_row<euler_rows)
+  {
+    const int euler_face_span=4*scalar_rows;
+    const int face=packed_row/euler_face_span;
+    return face*face_span+packed_row-face*euler_face_span;
+  }
+  const int sigma=packed_row-euler_rows;
+  const int face=sigma/scalar_rows;
+  return face*face_span+4*scalar_rows+sigma-face*scalar_rows;
+}
+
+__device__ void FactorElementSchwarzFieldBlock(
+    double* const lu,int* const pivots,const int rows,
+    double* const scale,int* const pivot_row,int* const failed)
+{
+  if(threadIdx.x==0)
+  {
+    *scale=0.0;
+    if(*failed==0)
+      for(int item=0;item<rows*rows;++item)
+        *scale=fmax(*scale,fabs(lu[item]));
+    if(*failed==0&&(!(*scale>0.0)||!isfinite(*scale)))
+      *failed=1;
+  }
+  __syncthreads();
+  for(int column=0;column<rows;++column)
+  {
+    if(threadIdx.x==0&&*failed==0)
+    {
+      *pivot_row=column;
+      for(int row=column+1;row<rows;++row)
+        if(fabs(lu[row*rows+column])>
+           fabs(lu[*pivot_row*rows+column]))
+          *pivot_row=row;
+      pivots[column]=*pivot_row;
+      const double pivot=fabs(lu[*pivot_row*rows+column]);
+      if(!(pivot>64.0*2.2204460492503131e-16*(*scale))||
+         !isfinite(pivot))
+        *failed=1;
+    }
+    __syncthreads();
+    if(*failed)break;
+    if(*pivot_row!=column)
+      for(int entry=threadIdx.x;entry<rows;entry+=blockDim.x)
+      {
+        const double value=lu[column*rows+entry];
+        lu[column*rows+entry]=lu[*pivot_row*rows+entry];
+        lu[*pivot_row*rows+entry]=value;
+      }
+    __syncthreads();
+    for(int row=column+1+threadIdx.x;row<rows;row+=blockDim.x)
+      lu[row*rows+column]/=lu[column*rows+column];
+    __syncthreads();
+    const int trailing=rows-column-1;
+    for(int item=threadIdx.x;item<trailing*trailing;item+=blockDim.x)
+    {
+      const int row=column+1+item/trailing;
+      const int entry=column+1+item%trailing;
+      lu[row*rows+entry]-=
+          lu[row*rows+column]*lu[column*rows+entry];
+    }
+    __syncthreads();
+  }
 }
 
 // Materialize and factor one exact principal trace patch per element. Each
@@ -4795,6 +4871,172 @@ __global__ void ElementSchwarzSetupKernel(CudaDeviceView v,CudaMeshShape s)
     }
     __syncthreads();
   }
+  if(threadIdx.x==0)v.status[e]=failed? -7.0:1.0;
+}
+
+// Two deterministic FP64 Ruiz passes are applied independently to the
+// natural Uhat4 Euler and scalar sigmahat diagonal blocks.  The preconditioner
+// is their lower multiplicative block factorization; the exact principal
+// patch remains retained for first-application backward-error checks.
+__global__ void ElementSchwarzEquilibratedFieldSplitSetupKernel(
+    CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;
+  if(e>=s.elements)return;
+  const int n=s.trace_dofs;
+  const int euler_rows=16*(s.order+1);
+  const int sigma_rows=4*(s.order+1);
+  const int element_slots=s.elements*n;
+  const int all_entries=element_slots*n;
+  const std::size_t matrix_offset=static_cast<std::size_t>(e)*n*n;
+  const std::size_t vector_offset=static_cast<std::size_t>(e)*n;
+  const std::size_t sigma_lu_offset=
+      static_cast<std::size_t>(euler_rows)*euler_rows;
+  const std::size_t lower_coupling_offset=sigma_lu_offset+
+      static_cast<std::size_t>(sigma_rows)*sigma_rows;
+  const std::size_t left_scale_offset=lower_coupling_offset+
+      static_cast<std::size_t>(sigma_rows)*euler_rows;
+  const std::size_t right_scale_offset=left_scale_offset+n;
+  double* const matrix=v.element_schwarz_patch_matrix+matrix_offset;
+  double* const storage=v.element_schwarz_patch_lu+matrix_offset;
+  double* const row_norm=v.element_schwarz_rhs+vector_offset;
+  double* const column_norm=v.element_schwarz_solution+vector_offset;
+  int* const pivots=v.element_schwarz_pivots+vector_offset;
+  __shared__ double factor_scale;
+  __shared__ int pivot_row;
+  __shared__ int failed;
+  if(threadIdx.x==0){factor_scale=0.0;pivot_row=0;failed=0;}
+  __syncthreads();
+
+  for(int item=threadIdx.x;item<n*n;item+=blockDim.x)
+  {
+    const int row=item/n,column=item-row*n;
+    const int target=static_cast<int>(matrix_offset)+item;
+    const int first=v.element_schwarz_first_source[target];
+    const int second=v.element_schwarz_second_source[target];
+    double row_sign=1.0,column_sign=1.0;
+    (void)Decode(v.element_schwarz_signed_true_dof[
+        static_cast<int>(vector_offset)+row],row_sign);
+    (void)Decode(v.element_schwarz_signed_true_dof[
+        static_cast<int>(vector_offset)+column],column_sign);
+    if(first<0||first>=all_entries||second< -1||second>=all_entries)
+    {
+      atomicExch(&failed,1);
+      matrix[item]=0.0;
+      storage[item]=0.0;
+      continue;
+    }
+    double value=SignedMatrixValue(v,s,first);
+    if(second>=0)value+=SignedMatrixValue(v,s,second);
+    value*=row_sign*column_sign;
+    if(!isfinite(value))atomicExch(&failed,1);
+    matrix[item]=value;
+    storage[item]=0.0;
+  }
+  __syncthreads();
+  for(int packed=threadIdx.x;packed<n;packed+=blockDim.x)
+  {
+    storage[left_scale_offset+packed]=1.0;
+    storage[right_scale_offset+packed]=1.0;
+  }
+  __syncthreads();
+
+  for(int pass=0;pass<native_element_schwarz_equilibration_passes;++pass)
+  {
+    for(int packed=threadIdx.x;packed<n;packed+=blockDim.x)
+    {
+      const bool euler=packed<euler_rows;
+      const int block_begin=euler?0:euler_rows;
+      const int block_end=euler?euler_rows:n;
+      const int original_row=ElementSchwarzFieldSplitOriginalRow(n,packed);
+      double row_maximum=0.0;
+      double column_maximum=0.0;
+      const double left=storage[left_scale_offset+packed];
+      const double right=storage[right_scale_offset+packed];
+      for(int other=block_begin;other<block_end;++other)
+      {
+        const int original_other=
+            ElementSchwarzFieldSplitOriginalRow(n,other);
+        row_maximum=fmax(row_maximum,fabs(
+            left*matrix[original_row*n+original_other]*
+            storage[right_scale_offset+other]));
+        column_maximum=fmax(column_maximum,fabs(
+            storage[left_scale_offset+other]*
+            matrix[original_other*n+original_row]*right));
+      }
+      row_norm[packed]=row_maximum;
+      column_norm[packed]=column_maximum;
+    }
+    __syncthreads();
+    for(int packed=threadIdx.x;packed<n;packed+=blockDim.x)
+    {
+      const double next_left=storage[left_scale_offset+packed]/
+          sqrt(row_norm[packed]);
+      const double next_right=storage[right_scale_offset+packed]/
+          sqrt(column_norm[packed]);
+      const bool valid=row_norm[packed]>0.0&&column_norm[packed]>0.0&&
+          isfinite(next_left)&&isfinite(next_right)&&
+          next_left>=cuda_rank1_equilibration_minimum_scale&&
+          next_left<=cuda_rank1_equilibration_maximum_scale&&
+          next_right>=cuda_rank1_equilibration_minimum_scale&&
+          next_right<=cuda_rank1_equilibration_maximum_scale;
+      if(valid)
+      {
+        storage[left_scale_offset+packed]=next_left;
+        storage[right_scale_offset+packed]=next_right;
+      }
+      else
+        atomicExch(&failed,1);
+    }
+    __syncthreads();
+  }
+
+  for(int item=threadIdx.x;item<euler_rows*euler_rows;
+      item+=blockDim.x)
+  {
+    const int row=item/euler_rows,column=item-row*euler_rows;
+    const int original_row=ElementSchwarzFieldSplitOriginalRow(n,row);
+    const int original_column=ElementSchwarzFieldSplitOriginalRow(n,column);
+    storage[item]=storage[left_scale_offset+row]*
+        matrix[original_row*n+original_column]*
+        storage[right_scale_offset+column];
+  }
+  for(int item=threadIdx.x;item<sigma_rows*sigma_rows;
+      item+=blockDim.x)
+  {
+    const int row=item/sigma_rows,column=item-row*sigma_rows;
+    const int packed_row=euler_rows+row;
+    const int packed_column=euler_rows+column;
+    const int original_row=
+        ElementSchwarzFieldSplitOriginalRow(n,packed_row);
+    const int original_column=
+        ElementSchwarzFieldSplitOriginalRow(n,packed_column);
+    storage[sigma_lu_offset+item]=storage[left_scale_offset+packed_row]*
+        matrix[original_row*n+original_column]*
+        storage[right_scale_offset+packed_column];
+  }
+  for(int item=threadIdx.x;item<sigma_rows*euler_rows;
+      item+=blockDim.x)
+  {
+    const int sigma=item/euler_rows,euler=item-sigma*euler_rows;
+    const int packed_row=euler_rows+sigma;
+    const int original_row=
+        ElementSchwarzFieldSplitOriginalRow(n,packed_row);
+    const int original_column=
+        ElementSchwarzFieldSplitOriginalRow(n,euler);
+    const double value=
+        storage[left_scale_offset+packed_row]*
+        matrix[original_row*n+original_column]*
+        storage[right_scale_offset+euler];
+    storage[lower_coupling_offset+item]=value;
+    if(!isfinite(value))atomicExch(&failed,1);
+  }
+  __syncthreads();
+  FactorElementSchwarzFieldBlock(
+      storage,pivots,euler_rows,&factor_scale,&pivot_row,&failed);
+  FactorElementSchwarzFieldBlock(
+      storage+sigma_lu_offset,pivots+euler_rows,sigma_rows,
+      &factor_scale,&pivot_row,&failed);
   if(threadIdx.x==0)v.status[e]=failed? -7.0:1.0;
 }
 
@@ -5603,10 +5845,15 @@ bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
   return true;
 }
 bool CudaLaunchSetupNativeElementSchwarz(
-    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+    const CudaDeviceView& v,const CudaMeshShape& s,
+    const CudaTracePreconditionerKind preconditioner_kind) noexcept
 {
   const int expected=NativeElementSchwarzIgrPatchRows(s.order);
-  if(!s.igr_active||s.elements<=0||s.trace_dofs!=expected||
+  const bool field_split=
+      CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
+          preconditioner_kind);
+  if(!CudaTracePreconditionerIsNativeElementSchwarz(preconditioner_kind)||
+     !s.igr_active||s.elements<=0||s.trace_dofs!=expected||
      v.schur==nullptr||v.status==nullptr||
      v.element_schwarz_patch_matrix==nullptr||
      v.element_schwarz_patch_lu==nullptr||
@@ -5615,7 +5862,15 @@ bool CudaLaunchSetupNativeElementSchwarz(
      v.element_schwarz_signed_true_dof==nullptr||
      v.element_schwarz_pivots==nullptr)
     return false;
-  ElementSchwarzSetupKernel<<<s.elements,128>>>(v,s);
+  const NativeElementSchwarzFieldSplitLayout layout=
+      NativeElementSchwarzIgrFieldSplitLayout(s.order);
+  if(field_split&&(!layout.valid||layout.patch_rows!=s.trace_dofs||
+                   layout.required_doubles>layout.available_doubles))
+    return false;
+  if(field_split)
+    ElementSchwarzEquilibratedFieldSplitSetupKernel<<<s.elements,128>>>(v,s);
+  else
+    ElementSchwarzSetupKernel<<<s.elements,128>>>(v,s);
   return LaunchOk();
 }
 bool CudaLaunchAssembleNativeElementVector(

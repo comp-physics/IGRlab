@@ -12,8 +12,76 @@ static_assert(NativeElementSchwarzIgrPatchRows(2) == 60);
 static_assert(NativeElementSchwarzIgrPatchRows(3) == 80);
 static_assert(NativeElementSchwarzIgrPatchRows(0) == 0);
 static_assert(NativeElementSchwarzIgrPatchRows(4) == 0);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(1).valid);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(1).euler_rows == 32);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(1).sigma_rows == 8);
+static_assert(
+    NativeElementSchwarzIgrFieldSplitLayout(1).required_doubles == 1424);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(2).euler_rows == 48);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(2).sigma_rows == 12);
+static_assert(
+    NativeElementSchwarzIgrFieldSplitLayout(2).required_doubles == 3144);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(3).euler_rows == 64);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(3).sigma_rows == 16);
+static_assert(
+    NativeElementSchwarzIgrFieldSplitLayout(3).required_doubles == 5536);
+static_assert(!NativeElementSchwarzIgrFieldSplitLayout(0).valid);
+static_assert(!NativeElementSchwarzIgrFieldSplitLayout(4).valid);
 static_assert(NativeElementSchwarzEncodeDof(7, -1) == -8);
 static_assert(NativeElementSchwarzDecodedDof(-8) == 7);
+
+bool CheckFieldSplitLayout()
+{
+  for (int order = 1; order <= 3; ++order)
+  {
+    const NativeElementSchwarzFieldSplitLayout layout =
+        NativeElementSchwarzIgrFieldSplitLayout(order);
+    if (!layout.valid || layout.patch_rows != 20 * (order + 1) ||
+        layout.euler_rows != 16 * (order + 1) ||
+        layout.sigma_rows != 4 * (order + 1) ||
+        layout.euler_lu_offset != 0 ||
+        layout.sigma_lu_offset !=
+            static_cast<std::size_t>(layout.euler_rows) *
+                layout.euler_rows ||
+        layout.lower_coupling_offset != layout.sigma_lu_offset +
+            static_cast<std::size_t>(layout.sigma_rows) *
+                layout.sigma_rows ||
+        layout.left_scale_offset != layout.lower_coupling_offset +
+            static_cast<std::size_t>(layout.sigma_rows) *
+                layout.euler_rows ||
+        layout.right_scale_offset !=
+            layout.left_scale_offset + layout.patch_rows ||
+        layout.required_doubles > layout.available_doubles)
+      return false;
+
+    int euler_rows = 0;
+    int sigma_rows = 0;
+    std::array<bool, 80> visited{};
+    for (int row = 0; row < layout.patch_rows; ++row)
+    {
+      const int packed = NativeElementSchwarzIgrFieldSplitPackedRow(
+          order, row);
+      if (packed < 0 || packed >= layout.patch_rows ||
+          visited[static_cast<std::size_t>(packed)] ||
+          NativeElementSchwarzIgrFieldSplitPatchRow(order, packed) != row)
+        return false;
+      visited[static_cast<std::size_t>(packed)] = true;
+      if (NativeElementSchwarzIgrPatchRowIsSigma(order, row))
+      {
+        if (packed < layout.euler_rows) return false;
+        ++sigma_rows;
+      }
+      else
+      {
+        if (packed >= layout.euler_rows) return false;
+        ++euler_rows;
+      }
+    }
+    if (euler_rows != layout.euler_rows || sigma_rows != layout.sigma_rows)
+      return false;
+  }
+  return true;
+}
 
 bool CheckExactTwoElementPlan()
 {
@@ -251,7 +319,8 @@ bool CheckMatrixFreeActionAndRhsModel()
 
 int main()
 {
-  if (!CheckExactTwoElementPlan() || !CheckSignedWeightedApplyModel() ||
+  if (!CheckFieldSplitLayout() || !CheckExactTwoElementPlan() ||
+      !CheckSignedWeightedApplyModel() ||
       !CheckFailClosedPlans() || !CheckMatrixFreeActionAndRhsModel())
   {
     std::cerr << "native element Schwarz topology-plan checks failed\n";

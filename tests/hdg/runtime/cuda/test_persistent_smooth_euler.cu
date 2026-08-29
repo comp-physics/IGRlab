@@ -1192,7 +1192,9 @@ bool NativeElementSchwarzDeviceFixture()
   shape.trace_components = 5;
   shape.order = 1;
   shape.igr_active = true;
-  if (!CudaLaunchSetupNativeElementSchwarz(setup_view, shape) ||
+  if (!CudaLaunchSetupNativeElementSchwarz(
+          setup_view, shape,
+          CudaTracePreconditionerKind::native_element_schwarz_fp64) ||
       cudaDeviceSynchronize() != cudaSuccess)
     return false;
   double setup_status = 0.0;
@@ -1265,6 +1267,33 @@ bool NativeElementSchwarzDeviceFixture()
   std::vector<double> host_solution(static_cast<std::size_t>(rows));
   NativeTraceSolveControl observation{};
   if (!solution.CopyTo(host_solution) || !control.CopyOneTo(observation) ||
+      observation.status != NativeTraceSolveStatus::converged ||
+      observation.preconditioner_applications <= 0)
+    return false;
+  for (int row = 0; row < rows; ++row)
+    if (std::abs(host_solution[static_cast<std::size_t>(row)] -
+                 right_hand_side[static_cast<std::size_t>(row)]) > 1.0e-11)
+      return false;
+
+  // The bounded equilibrated field-split ablation reuses the same exact
+  // patch/topology storage.  Identity blocks make its lower multiplicative
+  // action exact and independently exercise the packed Euler/sigma factors,
+  // two-sided scales, solve dispatch, and metadata kind.
+  if (!CudaLaunchSetupNativeElementSchwarz(
+          setup_view, shape,
+          CudaTracePreconditionerKind::
+              native_element_schwarz_equilibrated_field_split_fp64) ||
+      cudaMemset(solution.data(), 0,
+                 static_cast<std::size_t>(rows) * sizeof(double)) !=
+          cudaSuccess ||
+      cudaDeviceSynchronize() != cudaSuccess)
+    return false;
+  preconditioner.kind = NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_fp64;
+  if (!LaunchNativeRankOneTraceSolve(
+          system, preconditioner, workspace, policy, support, nullptr) ||
+      cudaDeviceSynchronize() != cudaSuccess ||
+      !solution.CopyTo(host_solution) || !control.CopyOneTo(observation) ||
       observation.status != NativeTraceSolveStatus::converged ||
       observation.preconditioner_applications <= 0)
     return false;
@@ -1939,6 +1968,18 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
   const auto ordinary_igr_matrix_free = ResolveCudaTracePolicy(
       CudaEngineKind::ordinary, true,
       CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64);
+  const auto tensor_igr_field_split = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, true,
+      CudaTracePolicyKind::
+          native_element_schwarz_equilibrated_field_split_fp64);
+  const auto tensor_conventional_field_split = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, false,
+      CudaTracePolicyKind::
+          native_element_schwarz_equilibrated_field_split_fp64);
+  const auto ordinary_igr_field_split = ResolveCudaTracePolicy(
+      CudaEngineKind::ordinary, true,
+      CudaTracePolicyKind::
+          native_element_schwarz_equilibrated_field_split_fp64);
   const auto unknown = ResolveCudaTracePolicy(
       CudaEngineKind::ordinary, false,
       static_cast<CudaTracePolicyKind>(255));
@@ -2038,6 +2079,17 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       !CudaTracePolicyDescriptorIsExact(tensor_conventional_matrix_free) &&
       !ordinary_igr_matrix_free.valid &&
       !CudaTracePolicyDescriptorIsExact(ordinary_igr_matrix_free) &&
+      CudaTracePolicyDescriptorIsExact(tensor_igr_field_split) &&
+      tensor_igr_field_split.trace_preconditioner ==
+          CudaTracePreconditionerKind::
+              native_element_schwarz_equilibrated_field_split_fp64 &&
+      tensor_igr_field_split.ilu_type == -1 &&
+      tensor_igr_field_split.ilu_factor_reuse_policy ==
+          CudaIluFactorReusePolicy::not_applicable &&
+      !tensor_conventional_field_split.valid &&
+      !CudaTracePolicyDescriptorIsExact(tensor_conventional_field_split) &&
+      !ordinary_igr_field_split.valid &&
+      !CudaTracePolicyDescriptorIsExact(ordinary_igr_field_split) &&
       !tensor_conventional_mgr.valid &&
       !CudaTracePolicyDescriptorIsExact(tensor_conventional_mgr) &&
       !ordinary_igr_mgr.valid &&
@@ -2056,12 +2108,20 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       std::string_view(CudaTracePolicyKindName(
           CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64)) ==
           "native-element-schwarz-matrix-free-fp64" &&
+      std::string_view(CudaTracePolicyKindName(
+          CudaTracePolicyKind::
+              native_element_schwarz_equilibrated_field_split_fp64)) ==
+          "native-element-schwarz-equilibrated-field-split-fp64" &&
       std::string_view(CudaTracePreconditionerName(
           CudaTracePreconditionerKind::hypre_mgr_field_split)) ==
           "hypre_mgr_field_split" &&
       std::string_view(CudaTracePreconditionerName(
           CudaTracePreconditionerKind::native_element_schwarz_fp64)) ==
-          "native_element_schwarz_fp64";
+          "native_element_schwarz_fp64" &&
+      std::string_view(CudaTracePreconditionerName(
+          CudaTracePreconditionerKind::
+              native_element_schwarz_equilibrated_field_split_fp64)) ==
+          "native_element_schwarz_equilibrated_field_split_fp64";
 }
 
 static_assert(TracePolicyAblationDescriptorPolicy(),

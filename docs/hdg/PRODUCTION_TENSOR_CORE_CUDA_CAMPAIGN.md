@@ -122,6 +122,30 @@ Uhat/sigma field split, but implement fine-grid preconditioning natively from
 the element Schur blocks rather than putting the recurring full trace solve
 under HYPRE MGR.
 
+`native-element-schwarz-equilibrated-field-split-fp64` is the corresponding
+bounded native ablation. It is rank-one, tensor-IGR, and benchmark-only. It
+retains the same assembled FP64 global operator, native FP64 GMRES, independent
+current-matrix true-residual check, and deterministic inverse-multiplicity
+overlap weighting as `native-element-schwarz-fp64`. Within each signed p1--p3
+element patch, the face-major trace rows are packed transiently into the
+natural Uhat4 Euler block and scalar sigmahat block. Two deterministic FP64
+two-sided Ruiz passes equilibrate each diagonal block, followed by pivoted
+FP64 LU. Application is the fixed lower multiplicative factorization
+`[A_UU, 0; A_sigma,U, A_sigma,sigma]`; it is an explicit approximation, not a
+claim that the dropped Uhat-from-sigma block vanished mathematically.
+
+The exact unfactored patch is retained for bounded first-application block
+backward-error checks. The two block factors, scaled lower coupling, and
+left/right scales fit inside the existing full-patch LU slice for p1--p3,
+while the existing two element vectors provide setup norms and apply work.
+Consequently the ablation adds no persistent allocation and no copied solver
+lifecycle. Patch setup,
+preconditioner application, equilibration-build, and equilibration-pass work
+are reported only as constant-size aggregates. It has no fallback, event
+history, replay stream, or flight recorder. Promotion depends on paired GPU
+screening against the stronger full-patch FP64 Schwarz control; this design is
+not production-selectable by itself.
+
 The benchmark emits the selected policy at top level and in every bounded
 sample. The driver validates every preconditioner, ILU, triangular-solve,
 accounting, and factor-lifetime dimension exactly, then requires `O_common`

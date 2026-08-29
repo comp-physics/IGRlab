@@ -30,7 +30,8 @@ enum class NativeTracePreconditionerKind : std::int32_t
 {
   diagonal = 1,
   ilu0_rcm_jacobi = 2,
-  element_overlap_schwarz_fp64 = 3
+  element_overlap_schwarz_fp64 = 3,
+  element_overlap_schwarz_equilibrated_field_split_fp64 = 4
 };
 
 enum class NativeTraceSolveStatus : std::int32_t

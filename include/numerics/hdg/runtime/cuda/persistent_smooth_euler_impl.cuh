@@ -352,7 +352,9 @@ constexpr CudaTraceSolverKind ResolveCudaTraceSolverKind(
         ? CudaTraceSolverKind::hypre_fgmres_mgr_rank1
         : CudaTraceSolverKind::unconfigured;
   if (trace_policy == CudaTracePolicyKind::native_element_schwarz_fp64 ||
-      CudaTracePolicyUsesNativeElementMatrixFreeOperator(trace_policy))
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(trace_policy) ||
+      trace_policy == CudaTracePolicyKind::
+          native_element_schwarz_equilibrated_field_split_fp64)
     return engine == generic::CudaEngineKind::tensor_core && ranks == 1 &&
             borrowed_topology && borrowed_host_inputs &&
             generic_numerical_policy
@@ -1345,6 +1347,8 @@ struct CudaSolveDiagnostics
   std::uint64_t element_schwarz_patch_setups = 0;
   std::uint64_t element_schwarz_preconditioner_applications = 0;
   std::uint64_t native_matrix_free_trace_operator_applications = 0;
+  std::uint64_t element_schwarz_equilibration_builds = 0;
+  std::uint64_t element_schwarz_equilibration_passes = 0;
   int iterations = 0;
   double reported_residual = std::numeric_limits<double>::infinity();
 };
@@ -1849,7 +1853,8 @@ bool CudaLaunchNativeRankOneTraceSolver(
     double relative_tolerance, int maximum_iterations,
     int krylov_dimension, cudaStream_t stream) noexcept;
 bool CudaLaunchSetupNativeElementSchwarz(
-    const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    CudaTracePreconditionerKind preconditioner_kind) noexcept;
 bool CudaLaunchAssembleNativeElementVector(
     const CudaDeviceView& view, const CudaMeshShape& shape,
     const double* element_values, double* true_values) noexcept;
@@ -3879,6 +3884,9 @@ public:
     const bool element_schwarz_selected =
         CudaTracePreconditionerIsNativeElementSchwarz(
             trace_preconditioner_);
+    const bool equilibrated_field_split_selected =
+        CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
+            trace_preconditioner_);
     const bool element_schwarz_accounting_complete =
         element_schwarz_selected
         ? result.tensor_core.native_element_schwarz_configured &&
@@ -3959,13 +3967,26 @@ public:
                        result.tensor_core.minimum_right_scale) &&
                    std::isfinite(
                        result.tensor_core.maximum_right_scale)
-             : result.tensor_core.equilibration_builds == 0 &&
-                   result.tensor_core.equilibration_passes == 0 &&
-                   result.tensor_core.mgr_setup_calls == 0 &&
-                   result.tensor_core.
-                           mgr_preconditioner_applications == 0 &&
-                   result.tensor_core.mgr_f_ilu_setups == 0 &&
-                   result.tensor_core.mgr_f_ilu_applications == 0);
+             : equilibrated_field_split_selected
+                 ? result.tensor_core.equilibration_builds ==
+                           completed_trace_solves &&
+                       result.tensor_core.equilibration_passes ==
+                           completed_trace_solves *
+                               static_cast<std::uint64_t>(
+                                   native_element_schwarz_
+                                       equilibration_passes) &&
+                       result.tensor_core.mgr_setup_calls == 0 &&
+                       result.tensor_core.
+                               mgr_preconditioner_applications == 0 &&
+                       result.tensor_core.mgr_f_ilu_setups == 0 &&
+                       result.tensor_core.mgr_f_ilu_applications == 0
+                 : result.tensor_core.equilibration_builds == 0 &&
+                       result.tensor_core.equilibration_passes == 0 &&
+                       result.tensor_core.mgr_setup_calls == 0 &&
+                       result.tensor_core.
+                               mgr_preconditioner_applications == 0 &&
+                       result.tensor_core.mgr_f_ilu_setups == 0 &&
+                       result.tensor_core.mgr_f_ilu_applications == 0);
     result.telemetry = DeviceResident() && NoFallback() &&
         result.tensor_core.trace_solver_accounting_complete &&
         AllocatorPolicy::W8OwnedAllocationCalls() ==

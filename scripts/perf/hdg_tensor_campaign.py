@@ -42,6 +42,8 @@ TRACE_PRECONDITIONER_BY_POLICY_ENGINE_AND_MODE = {
         "native_element_schwarz_fp64",
     ("native-element-schwarz-matrix-free-fp64", "tensor", "igr"):
         "native_element_schwarz_fp64",
+    ("native-element-schwarz-equilibrated-field-split-fp64", "tensor", "igr"):
+        "native_element_schwarz_equilibrated_field_split_fp64",
 }
 TRACE_ILU_POLICY_BY_POLICY_ENGINE_AND_MODE = {
     ("engine-default", "ordinary", "conventional"): (0, 0, 0, 1),
@@ -56,6 +58,8 @@ TRACE_ILU_POLICY_BY_POLICY_ENGINE_AND_MODE = {
     ("native-element-schwarz-fp64", "tensor", "igr"):
         (-1, -1, -1, 0),
     ("native-element-schwarz-matrix-free-fp64", "tensor", "igr"):
+        (-1, -1, -1, 0),
+    ("native-element-schwarz-equilibrated-field-split-fp64", "tensor", "igr"):
         (-1, -1, -1, 0),
 }
 TRACE_ILU_FACTOR_REUSE_BY_POLICY_ENGINE_AND_MODE = {
@@ -72,6 +76,8 @@ TRACE_ILU_FACTOR_REUSE_BY_POLICY_ENGINE_AND_MODE = {
     ("native-element-schwarz-fp64", "tensor", "igr"):
         "not_applicable",
     ("native-element-schwarz-matrix-free-fp64", "tensor", "igr"):
+        "not_applicable",
+    ("native-element-schwarz-equilibrated-field-split-fp64", "tensor", "igr"):
         "not_applicable",
 }
 TRACE_ILU_TRIANGULAR_SOLVE_BY_POLICY_ENGINE_AND_MODE = {
@@ -97,6 +103,8 @@ TRACE_ILU_TRIANGULAR_SOLVE_BY_POLICY_ENGINE_AND_MODE = {
     ("native-element-schwarz-fp64", "tensor", "igr"):
         ("not_applicable", 0, 0, 0),
     ("native-element-schwarz-matrix-free-fp64", "tensor", "igr"):
+        ("not_applicable", 0, 0, 0),
+    ("native-element-schwarz-equilibrated-field-split-fp64", "tensor", "igr"):
         ("not_applicable", 0, 0, 0),
 }
 # Solver name and the three mutually exclusive rank-one/rank-two
@@ -125,6 +133,8 @@ TRACE_SOLVER_CONFIGURATION_BY_POLICY_ENGINE_AND_MODE = {
     ("native-element-schwarz-fp64", "tensor", "igr"):
         ("native-rank1-fp64", True, False, False),
     ("native-element-schwarz-matrix-free-fp64", "tensor", "igr"):
+        ("native-rank1-fp64", True, False, False),
+    ("native-element-schwarz-equilibrated-field-split-fp64", "tensor", "igr"):
         ("native-rank1-fp64", True, False, False),
 }
 SAME_POLICY_MEMBERS = {
@@ -1116,7 +1126,8 @@ def _ilu_factor_accounting_is_valid(
 
 
 def _mgr_accounting_is_valid(
-        *, expected_mgr: bool, trace_solves: int, linear_iterations: int,
+        *, expected_mgr: bool, expected_element_field_split: bool,
+        trace_solves: int, linear_iterations: int,
         equilibration_builds: int, equilibration_passes: int,
         mgr_setup_calls: int, mgr_preconditioner_applications: int,
         mgr_f_ilu_setups: int, mgr_f_ilu_applications: int,
@@ -1140,6 +1151,16 @@ def _mgr_accounting_is_valid(
     if any(value < 0 or value > UINT64_MAX for value in counters) or \
             any(not math.isfinite(value) for value in scales):
         return False
+    if expected_element_field_split:
+        return (
+            not expected_mgr and
+            equilibration_builds == trace_solves and
+            equilibration_passes == 2 * trace_solves and
+            mgr_setup_calls == 0 and
+            mgr_preconditioner_applications == 0 and
+            mgr_f_ilu_setups == 0 and mgr_f_ilu_applications == 0 and
+            all(value == 0.0 for value in scales)
+        )
     if not expected_mgr:
         return not any(counters) and all(value == 0.0 for value in scales)
     return (
@@ -1361,10 +1382,13 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
     expected_schwarz = trace_policy in {
         "native-element-schwarz-fp64",
         "native-element-schwarz-matrix-free-fp64",
+        "native-element-schwarz-equilibrated-field-split-fp64",
     }
     expected_matrix_free = (
         trace_policy == "native-element-schwarz-matrix-free-fp64"
     )
+    expected_element_field_split = trace_policy == \
+        "native-element-schwarz-equilibrated-field-split-fp64"
     if tensor.get("trace_solver") != expected_trace_solver:
         raise CampaignError(
             f"sample trace_solver={tensor.get('trace_solver')!r}; expected "
@@ -1551,6 +1575,7 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
     }
     if not _mgr_accounting_is_valid(
             expected_mgr=expected_mgr,
+            expected_element_field_split=expected_element_field_split,
             trace_solves=work["trace_solves"],
             linear_iterations=work["linear_iterations"],
             **mgr_counters,

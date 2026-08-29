@@ -331,7 +331,8 @@ enum class CudaTracePolicyKind : std::uint8_t
   common_fast = 1,
   equilibrated_mgr = 2,
   native_element_schwarz_fp64 = 3,
-  native_element_schwarz_matrix_free_fp64 = 4
+  native_element_schwarz_matrix_free_fp64 = 4,
+  native_element_schwarz_equilibrated_field_split_fp64 = 5
 };
 
 constexpr bool IsKnownCudaTracePolicyKind(
@@ -342,7 +343,9 @@ constexpr bool IsKnownCudaTracePolicyKind(
       kind == CudaTracePolicyKind::equilibrated_mgr ||
       kind == CudaTracePolicyKind::native_element_schwarz_fp64 ||
       kind ==
-          CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64;
+          CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_equilibrated_field_split_fp64;
 }
 
 constexpr const char* CudaTracePolicyKindName(
@@ -360,6 +363,9 @@ constexpr const char* CudaTracePolicyKindName(
     return "native-element-schwarz-fp64";
   case CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64:
     return "native-element-schwarz-matrix-free-fp64";
+  case CudaTracePolicyKind::
+      native_element_schwarz_equilibrated_field_split_fp64:
+    return "native-element-schwarz-equilibrated-field-split-fp64";
   }
   return "unknown";
 }
@@ -601,7 +607,8 @@ enum class CudaTracePreconditionerKind : std::uint8_t
   hypre_ilu0 = 1,
   hypre_diag_scale = 2,
   hypre_mgr_field_split = 3,
-  native_element_schwarz_fp64 = 4
+  native_element_schwarz_fp64 = 4,
+  native_element_schwarz_equilibrated_field_split_fp64 = 5
 };
 
 /** Deterministic lifetime policy for a selected HYPRE ILU(0) factor. */
@@ -694,7 +701,17 @@ constexpr bool CudaTracePreconditionerIsNativeElementSchwarz(
     const CudaTracePreconditionerKind kind) noexcept
 {
   return kind ==
-      CudaTracePreconditionerKind::native_element_schwarz_fp64;
+          CudaTracePreconditionerKind::native_element_schwarz_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_equilibrated_field_split_fp64;
+}
+
+constexpr bool
+CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
+    const CudaTracePreconditionerKind kind) noexcept
+{
+  return kind == CudaTracePreconditionerKind::
+      native_element_schwarz_equilibrated_field_split_fp64;
 }
 
 /** Benchmark-only exact element-Schur operator ablation. */
@@ -732,6 +749,8 @@ constexpr int CudaIluLevelOfFill(
   case CudaTracePreconditionerKind::hypre_diag_scale:
   case CudaTracePreconditionerKind::hypre_mgr_field_split:
   case CudaTracePreconditionerKind::native_element_schwarz_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_equilibrated_field_split_fp64:
   case CudaTracePreconditionerKind::unconfigured:
     break;
   }
@@ -749,6 +768,8 @@ constexpr int CudaIluLocalReordering(
   case CudaTracePreconditionerKind::hypre_diag_scale:
   case CudaTracePreconditionerKind::hypre_mgr_field_split:
   case CudaTracePreconditionerKind::native_element_schwarz_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_equilibrated_field_split_fp64:
   case CudaTracePreconditionerKind::unconfigured:
     break;
   }
@@ -837,6 +858,9 @@ constexpr const char* CudaTracePreconditionerName(
     return "hypre_mgr_field_split";
   case CudaTracePreconditionerKind::native_element_schwarz_fp64:
     return "native_element_schwarz_fp64";
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_equilibrated_field_split_fp64:
+    return "native_element_schwarz_equilibrated_field_split_fp64";
   case CudaTracePreconditionerKind::unconfigured:
     break;
   }
@@ -903,6 +927,21 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
       return result;
     result.trace_preconditioner =
         CudaTracePreconditionerKind::native_element_schwarz_fp64;
+    result.valid = true;
+    return result;
+  }
+
+  // Benchmark-only native multiplicative field split.  It retains the exact
+  // global FP64 operator and outer GMRES, while each signed element patch
+  // applies a two-pass equilibrated lower block factorization over the
+  // natural Uhat4 Euler and scalar sigmahat fields.  It has no fallback.
+  if (selection == CudaTracePolicyKind::
+          native_element_schwarz_equilibrated_field_split_fp64)
+  {
+    if (engine != generic::CudaEngineKind::tensor_core || !igr_active)
+      return result;
+    result.trace_preconditioner = CudaTracePreconditionerKind::
+        native_element_schwarz_equilibrated_field_split_fp64;
     result.valid = true;
     return result;
   }

@@ -119,7 +119,8 @@ parser.add_argument(
     "--trace-policy", default="engine-default",
     choices=("engine-default", "common-fast", "equilibrated-mgr",
              "native-element-schwarz-fp64",
-             "native-element-schwarz-matrix-free-fp64"),
+             "native-element-schwarz-matrix-free-fp64",
+             "native-element-schwarz-equilibrated-field-split-fp64"),
 )
 parser.add_argument("--order", required=True, type=int)
 parser.add_argument("--mesh-n", required=True, type=int)
@@ -140,13 +141,18 @@ common_fast = args.trace_policy == "common-fast"
 equilibrated_mgr = args.trace_policy == "equilibrated-mgr"
 matrix_free = args.trace_policy == \
     "native-element-schwarz-matrix-free-fp64"
+element_field_split = args.trace_policy == \
+    "native-element-schwarz-equilibrated-field-split-fp64"
 element_schwarz = args.trace_policy == "native-element-schwarz-fp64" or \
-    matrix_free
+    matrix_free or element_field_split
 if equilibrated_mgr and (args.engine != "tensor" or args.mode != "igr"):
     parser.error("equilibrated-mgr requires tensor IGR")
 if element_schwarz and (args.engine != "tensor" or args.mode != "igr"):
-    parser.error("native-element-schwarz-fp64 requires tensor IGR")
-if element_schwarz:
+    parser.error("native element-Schwarz policies require tensor IGR")
+if element_field_split:
+    trace_preconditioner = \
+        "native_element_schwarz_equilibrated_field_split_fp64"
+elif element_schwarz:
     trace_preconditioner = "native_element_schwarz_fp64"
 elif equilibrated_mgr:
     trace_preconditioner = "hypre_mgr_field_split"
@@ -159,7 +165,8 @@ ilu_policy = (
     (-1, -1, -1, 0)
     if trace_preconditioner in (
         "hypre_diag_scale", "hypre_mgr_field_split",
-        "native_element_schwarz_fp64")
+        "native_element_schwarz_fp64",
+        "native_element_schwarz_equilibrated_field_split_fp64")
     else (0, 0, 1 if args.mode == "igr" else 0, 1)
 )
 ilu_factor_reuse_policy = (
@@ -330,10 +337,12 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
                 "first_trace_solve_per_attempt" else 0
             ),
             "equilibration_builds": (
-                sample["trace_solves"] if equilibrated_mgr else 0
+                sample["trace_solves"]
+                if equilibrated_mgr or element_field_split else 0
             ),
             "equilibration_passes": (
-                2 * sample["trace_solves"] if equilibrated_mgr else 0
+                2 * sample["trace_solves"]
+                if equilibrated_mgr or element_field_split else 0
             ),
             "mgr_setup_calls": (
                 sample["trace_solves"] if equilibrated_mgr else 0
@@ -782,6 +791,7 @@ def main() -> int:
     )
     valid_mgr_aggregates = {
         "expected_mgr": True,
+        "expected_element_field_split": False,
         "trace_solves": 2,
         "linear_iterations": 7,
         "equilibration_builds": 2,
@@ -808,10 +818,27 @@ def main() -> int:
         assert not CAMPAIGN._mgr_accounting_is_valid(**invalid)
     assert CAMPAIGN._mgr_accounting_is_valid(
         expected_mgr=False,
+        expected_element_field_split=False,
         trace_solves=2,
         linear_iterations=7,
         equilibration_builds=0,
         equilibration_passes=0,
+        mgr_setup_calls=0,
+        mgr_preconditioner_applications=0,
+        mgr_f_ilu_setups=0,
+        mgr_f_ilu_applications=0,
+        minimum_left_scale=0.0,
+        maximum_left_scale=0.0,
+        minimum_right_scale=0.0,
+        maximum_right_scale=0.0,
+    )
+    assert CAMPAIGN._mgr_accounting_is_valid(
+        expected_mgr=False,
+        expected_element_field_split=True,
+        trace_solves=2,
+        linear_iterations=7,
+        equilibration_builds=2,
+        equilibration_passes=4,
         mgr_setup_calls=0,
         mgr_preconditioner_applications=0,
         mgr_f_ilu_setups=0,
@@ -1300,6 +1327,49 @@ def main() -> int:
             "element_schwarz_patch_rows"
         ]["minimum"] == 60
 
+        field_split_policy = \
+            "native-element-schwarz-equilibrated-field-split-fp64"
+        field_split_command = CAMPAIGN.final_command(
+            final,
+            engine="tensor",
+            mode="igr",
+            order=2,
+            mesh_n=12,
+            domain_periods=3,
+            timestep=1.0e-5,
+            export=False,
+            expected_build=explicit_build,
+            trace_policy=field_split_policy,
+        )
+        field_split_record = json.loads(
+            run(field_split_command, root).stdout
+        )
+        CAMPAIGN.validate_record(
+            field_split_record,
+            **{**schwarz_validation_arguments,
+               "trace_policy": field_split_policy},
+        )
+        assert field_split_record["variant"] == "ablation"
+        assert field_split_record["production_selectable"] is False
+        assert field_split_record["trace_solver"] == "native-rank1-fp64"
+        assert field_split_record["trace_preconditioner"] == \
+            "native_element_schwarz_equilibrated_field_split_fp64"
+        for sample in field_split_record["samples"]:
+            tensor = sample["tensor_core"]
+            assert tensor["native_element_schwarz_configured"] is True
+            assert tensor["equilibration_builds"] == sample["trace_solves"]
+            assert tensor["equilibration_passes"] == \
+                2 * sample["trace_solves"]
+            assert tensor["element_schwarz_patch_setups"] == \
+                sample["trace_solves"]
+            assert tensor[
+                "element_schwarz_preconditioner_applications"
+            ] == 9
+            assert not set(tensor).intersection({
+                "schwarz_history", "field_split_history", "event_stream",
+                "flight_recorder", "replay",
+            })
+
         def schwarz_rejected(record: dict) -> bool:
             try:
                 CAMPAIGN.validate_record(
@@ -1512,6 +1582,23 @@ def main() -> int:
         ) == "not_applicable"
         assert CAMPAIGN.expected_trace_solver_configuration(
             "tensor", "igr", "native-element-schwarz-fp64"
+        ) == ("native-rank1-fp64", True, False, False)
+        field_split_policy = \
+            "native-element-schwarz-equilibrated-field-split-fp64"
+        assert CAMPAIGN.expected_trace_preconditioner(
+            "tensor", "igr", field_split_policy
+        ) == "native_element_schwarz_equilibrated_field_split_fp64"
+        assert CAMPAIGN.expected_trace_ilu_policy(
+            "tensor", "igr", field_split_policy
+        ) == (-1, -1, -1, 0)
+        assert CAMPAIGN.expected_trace_ilu_triangular_solve_policy(
+            "tensor", "igr", field_split_policy
+        ) == ("not_applicable", 0, 0, 0)
+        assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
+            "tensor", "igr", field_split_policy
+        ) == "not_applicable"
+        assert CAMPAIGN.expected_trace_solver_configuration(
+            "tensor", "igr", field_split_policy
         ) == ("native-rank1-fp64", True, False, False)
         for engine, mode in (
                 ("ordinary", "igr"),

@@ -19,9 +19,11 @@ namespace dg::hdg::runtime::cuda_w8a::detail
 
 inline constexpr int native_element_schwarz_faces = 4;
 inline constexpr int native_element_schwarz_igr_trace_components = 5;
+inline constexpr int native_element_schwarz_euler_trace_components = 4;
 inline constexpr int native_element_schwarz_minimum_order = 1;
 inline constexpr int native_element_schwarz_maximum_order = 3;
 inline constexpr int native_element_schwarz_maximum_contributors = 2;
+inline constexpr int native_element_schwarz_equilibration_passes = 2;
 
 constexpr int NativeElementSchwarzIgrPatchRows(const int order) noexcept
 {
@@ -30,6 +32,122 @@ constexpr int NativeElementSchwarzIgrPatchRows(const int order) noexcept
       ? native_element_schwarz_faces *
             native_element_schwarz_igr_trace_components * (order + 1)
       : 0;
+}
+
+/**
+ * Packed storage contract for the benchmark-only equilibrated field split.
+ *
+ * The exact unfactored principal patch remains in its existing n-by-n arena.
+ * The equally large factor arena stores the Euler and sigma diagonal-block
+ * factors, the scaled lower coupling, and two-sided FP64 scales.  This is
+ * strictly smaller than n-by-n for every admitted p1--p3 IGR patch, so no
+ * persistent allocation or alternate application lifecycle is required.
+ */
+struct NativeElementSchwarzFieldSplitLayout final
+{
+  int scalar_face_rows = 0;
+  int patch_rows = 0;
+  int euler_rows = 0;
+  int sigma_rows = 0;
+  std::size_t euler_lu_offset = 0;
+  std::size_t sigma_lu_offset = 0;
+  std::size_t lower_coupling_offset = 0;
+  std::size_t left_scale_offset = 0;
+  std::size_t right_scale_offset = 0;
+  std::size_t required_doubles = 0;
+  std::size_t available_doubles = 0;
+  bool valid = false;
+};
+
+constexpr NativeElementSchwarzFieldSplitLayout
+NativeElementSchwarzIgrFieldSplitLayout(const int order) noexcept
+{
+  NativeElementSchwarzFieldSplitLayout result{};
+  const int patch_rows = NativeElementSchwarzIgrPatchRows(order);
+  if (patch_rows == 0) return result;
+  result.scalar_face_rows = order + 1;
+  result.patch_rows = patch_rows;
+  result.euler_rows = native_element_schwarz_faces *
+      native_element_schwarz_euler_trace_components *
+      result.scalar_face_rows;
+  result.sigma_rows = native_element_schwarz_faces *
+      result.scalar_face_rows;
+  result.euler_lu_offset = 0;
+  result.sigma_lu_offset = static_cast<std::size_t>(result.euler_rows) *
+      result.euler_rows;
+  result.lower_coupling_offset = result.sigma_lu_offset +
+      static_cast<std::size_t>(result.sigma_rows) * result.sigma_rows;
+  result.left_scale_offset = result.lower_coupling_offset +
+      static_cast<std::size_t>(result.sigma_rows) * result.euler_rows;
+  result.right_scale_offset = result.left_scale_offset + patch_rows;
+  result.required_doubles = result.right_scale_offset + patch_rows;
+  result.available_doubles =
+      static_cast<std::size_t>(patch_rows) * patch_rows;
+  result.valid = result.euler_rows + result.sigma_rows == patch_rows &&
+      result.required_doubles <= result.available_doubles;
+  return result;
+}
+
+constexpr bool NativeElementSchwarzIgrPatchRowIsSigma(
+    const int order, const int patch_row) noexcept
+{
+  const NativeElementSchwarzFieldSplitLayout layout =
+      NativeElementSchwarzIgrFieldSplitLayout(order);
+  if (!layout.valid || patch_row < 0 || patch_row >= layout.patch_rows)
+    return false;
+  const int face_span = native_element_schwarz_igr_trace_components *
+      layout.scalar_face_rows;
+  return (patch_row % face_span) /
+      layout.scalar_face_rows ==
+      native_element_schwarz_euler_trace_components;
+}
+
+/** Map a face-major/component-major patch row to [Euler, sigma] packing. */
+constexpr int NativeElementSchwarzIgrFieldSplitPackedRow(
+    const int order, const int patch_row) noexcept
+{
+  const NativeElementSchwarzFieldSplitLayout layout =
+      NativeElementSchwarzIgrFieldSplitLayout(order);
+  if (!layout.valid || patch_row < 0 || patch_row >= layout.patch_rows)
+    return -1;
+  const int face_span = native_element_schwarz_igr_trace_components *
+      layout.scalar_face_rows;
+  const int face = patch_row / face_span;
+  const int within_face = patch_row - face * face_span;
+  const int component = within_face / layout.scalar_face_rows;
+  const int scalar = within_face - component * layout.scalar_face_rows;
+  if (component < native_element_schwarz_euler_trace_components)
+    return face * native_element_schwarz_euler_trace_components *
+        layout.scalar_face_rows + component * layout.scalar_face_rows +
+        scalar;
+  return layout.euler_rows + face * layout.scalar_face_rows + scalar;
+}
+
+/** Inverse of NativeElementSchwarzIgrFieldSplitPackedRow. */
+constexpr int NativeElementSchwarzIgrFieldSplitPatchRow(
+    const int order, const int packed_row) noexcept
+{
+  const NativeElementSchwarzFieldSplitLayout layout =
+      NativeElementSchwarzIgrFieldSplitLayout(order);
+  if (!layout.valid || packed_row < 0 || packed_row >= layout.patch_rows)
+    return -1;
+  const int face_span = native_element_schwarz_igr_trace_components *
+      layout.scalar_face_rows;
+  if (packed_row < layout.euler_rows)
+  {
+    const int euler_face_span =
+        native_element_schwarz_euler_trace_components *
+        layout.scalar_face_rows;
+    const int face = packed_row / euler_face_span;
+    const int within_face = packed_row - face * euler_face_span;
+    return face * face_span + within_face;
+  }
+  const int sigma = packed_row - layout.euler_rows;
+  const int face = sigma / layout.scalar_face_rows;
+  const int scalar = sigma - face * layout.scalar_face_rows;
+  return face * face_span +
+      native_element_schwarz_euler_trace_components *
+          layout.scalar_face_rows + scalar;
 }
 
 constexpr int NativeElementSchwarzDecodedDof(const int encoded) noexcept

@@ -25,6 +25,28 @@ inline constexpr std::uint32_t failure_invalid_permutation = 1U << 5;
 inline constexpr std::uint32_t failure_numerical_breakdown = 1U << 6;
 inline constexpr int native_trace_projection_tile = 8;
 inline constexpr int native_trace_schwarz_maximum_incidence = 2;
+inline constexpr int native_trace_schwarz_faces = 4;
+inline constexpr int native_trace_schwarz_igr_components = 5;
+inline constexpr int native_trace_schwarz_euler_components = 4;
+inline constexpr double native_trace_schwarz_minimum_scale = 0x1p-40;
+inline constexpr double native_trace_schwarz_maximum_scale = 0x1p40;
+
+__host__ __device__ constexpr bool NativeTracePreconditionerIsElementSchwarz(
+    const NativeTracePreconditionerKind kind) noexcept
+{
+  return kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_fp64;
+}
+
+__host__ __device__ constexpr bool
+NativeTracePreconditionerIsEquilibratedFieldSplit(
+    const NativeTracePreconditionerKind kind) noexcept
+{
+  return kind == NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_fp64;
+}
 
 bool CheckedAdd(const std::size_t left, const std::size_t right,
                 std::size_t& result) noexcept
@@ -200,8 +222,119 @@ __device__ int DecodeSignedDof(const int encoded, double& sign) noexcept
   return encoded >= 0 ? encoded : -1 - encoded;
 }
 
+__host__ __device__ int FieldSplitScalarFaceRows(
+    const int patch_rows) noexcept
+{
+  return patch_rows /
+      (native_trace_schwarz_faces * native_trace_schwarz_igr_components);
+}
+
+__host__ __device__ int FieldSplitEulerRows(const int patch_rows) noexcept
+{
+  return native_trace_schwarz_faces *
+      native_trace_schwarz_euler_components *
+      FieldSplitScalarFaceRows(patch_rows);
+}
+
+__host__ __device__ int FieldSplitOriginalRow(
+    const int patch_rows, const int packed_row) noexcept
+{
+  const int scalar_rows = FieldSplitScalarFaceRows(patch_rows);
+  const int euler_rows = FieldSplitEulerRows(patch_rows);
+  const int face_span = native_trace_schwarz_igr_components * scalar_rows;
+  if (packed_row < euler_rows)
+  {
+    const int euler_face_span =
+        native_trace_schwarz_euler_components * scalar_rows;
+    const int face = packed_row / euler_face_span;
+    return face * face_span + packed_row - face * euler_face_span;
+  }
+  const int sigma = packed_row - euler_rows;
+  const int face = sigma / scalar_rows;
+  return face * face_span +
+      native_trace_schwarz_euler_components * scalar_rows +
+      sigma - face * scalar_rows;
+}
+
+__host__ __device__ int FieldSplitPackedRow(
+    const int patch_rows, const int original_row) noexcept
+{
+  const int scalar_rows = FieldSplitScalarFaceRows(patch_rows);
+  const int euler_rows = FieldSplitEulerRows(patch_rows);
+  const int face_span = native_trace_schwarz_igr_components * scalar_rows;
+  const int face = original_row / face_span;
+  const int within_face = original_row - face * face_span;
+  const int component = within_face / scalar_rows;
+  const int scalar = within_face - component * scalar_rows;
+  if (component < native_trace_schwarz_euler_components)
+    return face * native_trace_schwarz_euler_components * scalar_rows +
+        component * scalar_rows + scalar;
+  return euler_rows + face * scalar_rows + scalar;
+}
+
+__host__ __device__ std::size_t FieldSplitSigmaLuOffset(
+    const int patch_rows) noexcept
+{
+  const int euler_rows = FieldSplitEulerRows(patch_rows);
+  return static_cast<std::size_t>(euler_rows) * euler_rows;
+}
+
+__host__ __device__ std::size_t FieldSplitLowerCouplingOffset(
+    const int patch_rows) noexcept
+{
+  const int sigma_rows = patch_rows - FieldSplitEulerRows(patch_rows);
+  return FieldSplitSigmaLuOffset(patch_rows) +
+      static_cast<std::size_t>(sigma_rows) * sigma_rows;
+}
+
+__host__ __device__ std::size_t FieldSplitLeftScaleOffset(
+    const int patch_rows) noexcept
+{
+  const int euler_rows = FieldSplitEulerRows(patch_rows);
+  const int sigma_rows = patch_rows - euler_rows;
+  return FieldSplitLowerCouplingOffset(patch_rows) +
+      static_cast<std::size_t>(sigma_rows) * euler_rows;
+}
+
+__host__ __device__ std::size_t FieldSplitRightScaleOffset(
+    const int patch_rows) noexcept
+{
+  return FieldSplitLeftScaleOffset(patch_rows) + patch_rows;
+}
+
+__device__ void SolvePivotedDenseLu(
+    const double* const lu, const int* const pivots, const int rows,
+    double* const solution) noexcept
+{
+  for (int row = 0; row < rows; ++row)
+  {
+    const int pivot = pivots[row];
+    if (pivot != row)
+    {
+      const double value = solution[row];
+      solution[row] = solution[pivot];
+      solution[pivot] = value;
+    }
+  }
+  for (int row = 0; row < rows; ++row)
+  {
+    double value = solution[row];
+    for (int column = 0; column < row; ++column)
+      value -= lu[row * rows + column] * solution[column];
+    solution[row] = value;
+  }
+  for (int row = rows - 1; row >= 0; --row)
+  {
+    double value = solution[row];
+    for (int column = row + 1; column < rows; ++column)
+      value -= lu[row * rows + column] * solution[column];
+    solution[row] = value / lu[row * rows + row];
+  }
+}
+
 __device__ void ValidateElementSchwarz(
     const NativeTraceElementSchwarzView schwarz,
+    const bool equilibrated_field_split,
     NativeTraceSolveControl* control,
     const cg::grid_group& grid) noexcept
 {
@@ -227,14 +360,48 @@ __device__ void ValidateElementSchwarz(
   }
   for (int item = thread; item < element_slots; item += stride)
   {
-    const int column = item % patch_rows;
+    const int local_item = item % patch_rows;
     const int pivot = schwarz.pivots[item];
-    const double diagonal = schwarz.patch_lu[
+    const std::size_t matrix_offset =
         static_cast<std::size_t>(item / patch_rows) * patch_rows *
-            patch_rows + column * patch_rows + column];
-    if (pivot < column || pivot >= patch_rows || diagonal == 0.0 ||
-        !isfinite(diagonal))
-      MarkFailure(control, failure_invalid_preconditioner);
+        patch_rows;
+    if (equilibrated_field_split)
+    {
+      const int euler_rows = FieldSplitEulerRows(patch_rows);
+      const int block_rows = local_item < euler_rows
+          ? euler_rows : patch_rows - euler_rows;
+      const int block_column = local_item < euler_rows
+          ? local_item : local_item - euler_rows;
+      const std::size_t factor_offset = local_item < euler_rows
+          ? 0 : FieldSplitSigmaLuOffset(patch_rows);
+      const double diagonal = schwarz.patch_lu[
+          matrix_offset + factor_offset +
+          static_cast<std::size_t>(block_column) * block_rows +
+          block_column];
+      const double left_scale = schwarz.patch_lu[
+          matrix_offset + FieldSplitLeftScaleOffset(patch_rows) +
+          local_item];
+      const double right_scale = schwarz.patch_lu[
+          matrix_offset + FieldSplitRightScaleOffset(patch_rows) +
+          local_item];
+      if (pivot < block_column || pivot >= block_rows || diagonal == 0.0 ||
+          !isfinite(diagonal) || !isfinite(left_scale) ||
+          !isfinite(right_scale) ||
+          left_scale < native_trace_schwarz_minimum_scale ||
+          left_scale > native_trace_schwarz_maximum_scale ||
+          right_scale < native_trace_schwarz_minimum_scale ||
+          right_scale > native_trace_schwarz_maximum_scale)
+        MarkFailure(control, failure_invalid_preconditioner);
+    }
+    else
+    {
+      const double diagonal = schwarz.patch_lu[
+          matrix_offset + static_cast<std::size_t>(local_item) * patch_rows +
+          local_item];
+      if (pivot < local_item || pivot >= patch_rows || diagonal == 0.0 ||
+          !isfinite(diagonal))
+        MarkFailure(control, failure_invalid_preconditioner);
+    }
   }
   for (int row = thread; row < schwarz.true_rows; row += stride)
   {
@@ -619,11 +786,13 @@ __device__ void ApplyPreconditioner(
     return;
   }
 
-  if (preconditioner.kind ==
-      NativeTracePreconditionerKind::element_overlap_schwarz_fp64)
+  if (NativeTracePreconditionerIsElementSchwarz(preconditioner.kind))
   {
     const NativeTraceElementSchwarzView schwarz =
         preconditioner.element_schwarz;
+    const bool equilibrated_field_split =
+        NativeTracePreconditionerIsEquilibratedFieldSplit(
+            preconditioner.kind);
     const int patch_rows = schwarz.patch_rows;
     const int element_slots = schwarz.elements * patch_rows;
 
@@ -635,7 +804,8 @@ __device__ void ApplyPreconditioner(
       const int truth = DecodeSignedDof(
           schwarz.signed_element_true_dofs[slot], sign);
       schwarz.element_rhs[slot] = sign * input[truth];
-      schwarz.element_solution[slot] = schwarz.element_rhs[slot];
+      if (!equilibrated_field_split)
+        schwarz.element_solution[slot] = schwarz.element_rhs[slot];
     }
     grid.sync();
 
@@ -652,30 +822,58 @@ __device__ void ApplyPreconditioner(
       const double* const rhs = schwarz.element_rhs + vector_offset;
       double* const solution = schwarz.element_solution + vector_offset;
 
-      for (int row = 0; row < patch_rows; ++row)
+      if (equilibrated_field_split)
       {
-        const int pivot = pivots[row];
-        if (pivot != row)
+        const int euler_rows = FieldSplitEulerRows(patch_rows);
+        const int sigma_rows = patch_rows - euler_rows;
+        const double* const euler_lu = lu;
+        const double* const sigma_lu =
+            lu + FieldSplitSigmaLuOffset(patch_rows);
+        const double* const lower_coupling =
+            lu + FieldSplitLowerCouplingOffset(patch_rows);
+        const double* const left_scale =
+            lu + FieldSplitLeftScaleOffset(patch_rows);
+        const double* const right_scale =
+            lu + FieldSplitRightScaleOffset(patch_rows);
+
+        // Lower multiplicative block factorization
+        // [A_UU 0; A_sigma,U A_sigma,sigma].  The retained global operator
+        // and GMRES remain unchanged.  Packing is only a private local solve
+        // layout; the lower coupling is retained in the same two-sided
+        // scaling, and the externally committed trace stays binary64
+        // Uhat4/Uhat5.
+        for (int packed = 0; packed < euler_rows; ++packed)
         {
-          const double value = solution[row];
-          solution[row] = solution[pivot];
-          solution[pivot] = value;
+          const int original = FieldSplitOriginalRow(patch_rows, packed);
+          solution[packed] = left_scale[packed] * rhs[original];
+        }
+        SolvePivotedDenseLu(
+            euler_lu, pivots, euler_rows, solution);
+
+        for (int sigma = 0; sigma < sigma_rows; ++sigma)
+        {
+          const int packed = euler_rows + sigma;
+          const int original_row =
+              FieldSplitOriginalRow(patch_rows, packed);
+          double value = left_scale[packed] * rhs[original_row];
+          for (int euler = 0; euler < euler_rows; ++euler)
+            value -= lower_coupling[sigma * euler_rows + euler] *
+                solution[euler];
+          solution[packed] = value;
+        }
+        for (int packed = 0; packed < euler_rows; ++packed)
+          solution[packed] *= right_scale[packed];
+        SolvePivotedDenseLu(
+            sigma_lu, pivots + euler_rows, sigma_rows,
+            solution + euler_rows);
+        for (int sigma = 0; sigma < sigma_rows; ++sigma)
+        {
+          const int packed = euler_rows + sigma;
+          solution[packed] *= right_scale[packed];
         }
       }
-      for (int row = 0; row < patch_rows; ++row)
-      {
-        double value = solution[row];
-        for (int column = 0; column < row; ++column)
-          value -= lu[row * patch_rows + column] * solution[column];
-        solution[row] = value;
-      }
-      for (int row = patch_rows - 1; row >= 0; --row)
-      {
-        double value = solution[row];
-        for (int column = row + 1; column < patch_rows; ++column)
-          value -= lu[row * patch_rows + column] * solution[column];
-        solution[row] = value / lu[row * patch_rows + row];
-      }
+      else
+        SolvePivotedDenseLu(lu, pivots, patch_rows, solution);
 
       // Validate the first actual application of each native solve against
       // the retained unfactored patch. The synchronized aggregate counter
@@ -683,33 +881,121 @@ __device__ void ApplyPreconditioner(
       // avoid recurring dense validation traffic.
       if (control->preconditioner_applications == 1)
       {
-        double matrix_norm = 0.0;
-        double solution_norm = 0.0;
-        double rhs_norm = 0.0;
-        double residual_norm = 0.0;
-        for (int row = 0; row < patch_rows; ++row)
+        if (equilibrated_field_split)
         {
-          double row_norm = 0.0;
-          double residual = -rhs[row];
-          solution_norm = fmax(solution_norm, fabs(solution[row]));
-          rhs_norm = fmax(rhs_norm, fabs(rhs[row]));
-          for (int column = 0; column < patch_rows; ++column)
+          const int euler_rows = FieldSplitEulerRows(patch_rows);
+          const int sigma_rows = patch_rows - euler_rows;
+          double euler_matrix_norm = 0.0;
+          double euler_solution_norm = 0.0;
+          double euler_rhs_norm = 0.0;
+          double euler_residual_norm = 0.0;
+          for (int euler_row = 0; euler_row < euler_rows; ++euler_row)
           {
-            const double coefficient = matrix[row * patch_rows + column];
-            row_norm += fabs(coefficient);
-            residual += coefficient * solution[column];
+            const int original_row =
+                FieldSplitOriginalRow(patch_rows, euler_row);
+            double row_norm = 0.0;
+            double residual = -rhs[original_row];
+            euler_solution_norm = fmax(
+                euler_solution_norm, fabs(solution[euler_row]));
+            euler_rhs_norm = fmax(euler_rhs_norm, fabs(rhs[original_row]));
+            for (int euler_column = 0; euler_column < euler_rows;
+                 ++euler_column)
+            {
+              const int original_column =
+                  FieldSplitOriginalRow(patch_rows, euler_column);
+              const double coefficient =
+                  matrix[original_row * patch_rows + original_column];
+              row_norm += fabs(coefficient);
+              residual += coefficient * solution[euler_column];
+            }
+            euler_matrix_norm = fmax(euler_matrix_norm, row_norm);
+            euler_residual_norm = fmax(
+                euler_residual_norm, fabs(residual));
           }
-          matrix_norm = fmax(matrix_norm, row_norm);
-          residual_norm = fmax(residual_norm, fabs(residual));
+
+          double sigma_matrix_norm = 0.0;
+          double sigma_solution_norm = 0.0;
+          double sigma_rhs_norm = 0.0;
+          double sigma_residual_norm = 0.0;
+          for (int sigma_row = 0; sigma_row < sigma_rows; ++sigma_row)
+          {
+            const int packed_row = euler_rows + sigma_row;
+            const int original_row =
+                FieldSplitOriginalRow(patch_rows, packed_row);
+            double adjusted_rhs = rhs[original_row];
+            for (int euler_column = 0; euler_column < euler_rows;
+                 ++euler_column)
+            {
+              const int original_column =
+                  FieldSplitOriginalRow(patch_rows, euler_column);
+              adjusted_rhs -=
+                  matrix[original_row * patch_rows + original_column] *
+                  solution[euler_column];
+            }
+            double row_norm = 0.0;
+            double residual = -adjusted_rhs;
+            sigma_solution_norm = fmax(
+                sigma_solution_norm, fabs(solution[packed_row]));
+            sigma_rhs_norm = fmax(sigma_rhs_norm, fabs(adjusted_rhs));
+            for (int sigma_column = 0; sigma_column < sigma_rows;
+                 ++sigma_column)
+            {
+              const int packed_column = euler_rows + sigma_column;
+              const int original_column =
+                  FieldSplitOriginalRow(patch_rows, packed_column);
+              const double coefficient =
+                  matrix[original_row * patch_rows + original_column];
+              row_norm += fabs(coefficient);
+              residual += coefficient * solution[packed_column];
+            }
+            sigma_matrix_norm = fmax(sigma_matrix_norm, row_norm);
+            sigma_residual_norm = fmax(
+                sigma_residual_norm, fabs(residual));
+          }
+          const double euler_backward_error = euler_residual_norm /
+              fmax(euler_matrix_norm * euler_solution_norm + euler_rhs_norm,
+                   0x1p-1022);
+          const double sigma_backward_error = sigma_residual_norm /
+              fmax(sigma_matrix_norm * sigma_solution_norm + sigma_rhs_norm,
+                   0x1p-1022);
+          const double backward_error_limit =
+              4096.0 * 2.2204460492503131e-16 * patch_rows;
+          if (!isfinite(euler_backward_error) ||
+              !isfinite(sigma_backward_error) ||
+              euler_backward_error > backward_error_limit ||
+              sigma_backward_error > backward_error_limit)
+            MarkFailure(control, failure_invalid_preconditioner);
         }
-        const double denominator =
-            fmax(matrix_norm * solution_norm + rhs_norm, 0x1p-1022);
-        const double backward_error = residual_norm / denominator;
-        const double backward_error_limit =
-            4096.0 * 2.2204460492503131e-16 * patch_rows;
-        if (!isfinite(backward_error) ||
-            backward_error > backward_error_limit)
-          MarkFailure(control, failure_invalid_preconditioner);
+        else
+        {
+          double matrix_norm = 0.0;
+          double solution_norm = 0.0;
+          double rhs_norm = 0.0;
+          double residual_norm = 0.0;
+          for (int row = 0; row < patch_rows; ++row)
+          {
+            double row_norm = 0.0;
+            double residual = -rhs[row];
+            solution_norm = fmax(solution_norm, fabs(solution[row]));
+            rhs_norm = fmax(rhs_norm, fabs(rhs[row]));
+            for (int column = 0; column < patch_rows; ++column)
+            {
+              const double coefficient = matrix[row * patch_rows + column];
+              row_norm += fabs(coefficient);
+              residual += coefficient * solution[column];
+            }
+            matrix_norm = fmax(matrix_norm, row_norm);
+            residual_norm = fmax(residual_norm, fabs(residual));
+          }
+          const double denominator =
+              fmax(matrix_norm * solution_norm + rhs_norm, 0x1p-1022);
+          const double backward_error = residual_norm / denominator;
+          const double backward_error_limit =
+              4096.0 * 2.2204460492503131e-16 * patch_rows;
+          if (!isfinite(backward_error) ||
+              backward_error > backward_error_limit)
+            MarkFailure(control, failure_invalid_preconditioner);
+        }
       }
     }
     grid.sync();
@@ -731,7 +1017,11 @@ __device__ void ApplyPreconditioner(
         double sign = 1.0;
         (void)DecodeSignedDof(
             schwarz.signed_element_true_dofs[slot], sign);
-        value += sign * schwarz.element_solution[slot];
+        const int solution_slot = equilibrated_field_split
+            ? (slot / patch_rows) * patch_rows +
+                FieldSplitPackedRow(patch_rows, slot % patch_rows)
+            : slot;
+        value += sign * schwarz.element_solution[solution_slot];
         ++multiplicity;
       }
       output[row] = value / static_cast<double>(multiplicity);
@@ -891,10 +1181,13 @@ __global__ void NativeRankOneTraceSolveKernel(
     }
     ValidatePermutation(preconditioner.ilu0, workspace, control, grid);
   }
-  else if (preconditioner.kind ==
-           NativeTracePreconditionerKind::element_overlap_schwarz_fp64)
+  else if (NativeTracePreconditionerIsElementSchwarz(
+               preconditioner.kind))
     ValidateElementSchwarz(
-        preconditioner.element_schwarz, control, grid);
+        preconditioner.element_schwarz,
+        NativeTracePreconditionerIsEquilibratedFieldSplit(
+            preconditioner.kind),
+        control, grid);
   if (system.operator_kind ==
       NativeTraceOperatorKind::element_matrix_free_fp64)
   {
@@ -1448,8 +1741,8 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
 {
   const bool use_ilu = preconditioner.kind ==
       NativeTracePreconditionerKind::ilu0_rcm_jacobi;
-  const bool use_element_schwarz = preconditioner.kind ==
-      NativeTracePreconditionerKind::element_overlap_schwarz_fp64;
+  const bool use_element_schwarz =
+      NativeTracePreconditionerIsElementSchwarz(preconditioner.kind);
   const bool use_matrix_free = system.operator_kind ==
       NativeTraceOperatorKind::element_matrix_free_fp64;
   const bool use_cgs2 = use_ilu || use_element_schwarz;
@@ -1636,7 +1929,9 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
       workspace.small_doubles < requirements.small_doubles ||
       workspace.permutation_integers < requirements.permutation_integers ||
       (use_matrix_free &&
-       (!use_element_schwarz || system.element_schur == nullptr ||
+       (preconditioner.kind != NativeTracePreconditionerKind::
+            element_overlap_schwarz_fp64 ||
+        system.element_schur == nullptr ||
         !IsAligned(system.element_schur, alignof(double)))) ||
       (!use_matrix_free &&
        (system.operator_kind !=
@@ -1668,14 +1963,31 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
         !IsAligned(workspace.permutation_marks, alignof(int)))
       return false;
   }
-  else if (preconditioner.kind ==
-           NativeTracePreconditionerKind::element_overlap_schwarz_fp64)
+  else if (NativeTracePreconditionerIsElementSchwarz(
+               preconditioner.kind))
   {
     const NativeTraceElementSchwarzView& schwarz =
         preconditioner.element_schwarz;
+    const bool field_split =
+        NativeTracePreconditionerIsEquilibratedFieldSplit(
+            preconditioner.kind);
+    const int scalar_face_rows =
+        FieldSplitScalarFaceRows(schwarz.patch_rows);
+    const int euler_rows = FieldSplitEulerRows(schwarz.patch_rows);
+    const std::size_t field_split_required =
+        FieldSplitRightScaleOffset(schwarz.patch_rows) +
+        (schwarz.patch_rows > 0
+             ? static_cast<std::size_t>(schwarz.patch_rows) : 0);
+    const std::size_t patch_capacity = schwarz.patch_rows > 0
+        ? static_cast<std::size_t>(schwarz.patch_rows) *
+            schwarz.patch_rows : 0;
     if (schwarz.elements <= 0 ||
         (schwarz.patch_rows != 40 && schwarz.patch_rows != 60 &&
          schwarz.patch_rows != 80) ||
+        (field_split &&
+         (scalar_face_rows < 2 || scalar_face_rows > 4 ||
+          euler_rows != 4 * schwarz.patch_rows / 5 ||
+          field_split_required > patch_capacity)) ||
         schwarz.true_rows != system.matrix.rows ||
         schwarz.minimum_multiplicity < 1 ||
         schwarz.maximum_multiplicity < schwarz.minimum_multiplicity ||

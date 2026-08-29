@@ -2811,7 +2811,8 @@ SolveTrueSystemAttempt(double& true_relative_residual,
       else
       {
         schwarz_factor_ready = transition_ready &&
-            CudaLaunchSetupNativeElementSchwarz(view_, shape_) &&
+            CudaLaunchSetupNativeElementSchwarz(
+                view_, shape_, trace_preconditioner_) &&
             StatusPassed();
         if (schwarz_factor_ready)
         {
@@ -2819,6 +2820,13 @@ SolveTrueSystemAttempt(double& true_relative_residual,
           element_schwarz_attempt_state_.factor_generation =
               matrix_generation;
           diagnostics.element_schwarz_patch_setups = 1;
+          if (CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
+                  trace_preconditioner_))
+          {
+            diagnostics.element_schwarz_equilibration_builds = 1;
+            diagnostics.element_schwarz_equilibration_passes =
+                native_element_schwarz_equilibration_passes;
+          }
         }
       }
     }
@@ -3012,7 +3020,11 @@ SolveTrueSystemAttempt(double& true_relative_residual,
         checked_add(
             tensor_core_evidence.
                 native_matrix_free_trace_operator_applications,
-            diagnostics.native_matrix_free_trace_operator_applications);
+            diagnostics.native_matrix_free_trace_operator_applications) &&
+        checked_add(tensor_core_evidence.equilibration_builds,
+                    diagnostics.element_schwarz_equilibration_builds) &&
+        checked_add(tensor_core_evidence.equilibration_passes,
+                    diagnostics.element_schwarz_equilibration_passes);
     if (!accounted)
     {
       tensor_core_evidence.trace_solver_accounting_complete = false;
