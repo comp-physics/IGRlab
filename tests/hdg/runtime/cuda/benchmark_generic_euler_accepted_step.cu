@@ -626,6 +626,27 @@ bool SelectTracePolicy(
         native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi10_fp64;
     return true;
   }
+  if (text ==
+      "native-element-schwarz-matrix-free-warp-coupled-fp64")
+  {
+    options.trace_policy = CudaTracePolicyKind::
+        native_element_schwarz_matrix_free_warp_coupled_fp64;
+    return true;
+  }
+  if (text ==
+      "native-element-schwarz-matrix-free-warp-coupled-sigma-jacobi2-fp64")
+  {
+    options.trace_policy = CudaTracePolicyKind::
+        native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi2_fp64;
+    return true;
+  }
+  if (text ==
+      "native-element-schwarz-matrix-free-warp-coupled-sigma-jacobi10-fp64")
+  {
+    options.trace_policy = CudaTracePolicyKind::
+        native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi10_fp64;
+    return true;
+  }
   return false;
 }
 
@@ -719,7 +740,9 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
                 "equilibrated-field-split-sigma-jacobi3-fp64, or native-"
                 "element-schwarz-matrix-free-warp-equilibrated-field-split-"
                 "sigma-jacobi3-fp64, or the corresponding sigma-jacobi1-"
-                "fp64 through sigma-jacobi10-fp64 policy";
+                "fp64 through sigma-jacobi10-fp64 policy, or native-element-"
+                "schwarz-matrix-free-warp-coupled-fp64 and its explicit "
+                "sigma-jacobi2-fp64 or sigma-jacobi10-fp64 variants";
         return false;
       }
       continue;
@@ -973,6 +996,10 @@ void PrintUsage(const char* executable)
   std::cout << "Usage: " << executable
             << " [--mode conventional|igr] [--engine ordinary|tensor]"
                " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi10-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi10-fp64]"
+               " [coupled-policy native-element-schwarz-matrix-free-warp-"
+               "coupled-fp64|native-element-schwarz-matrix-free-warp-"
+               "coupled-sigma-jacobi2-fp64|native-element-schwarz-matrix-"
+               "free-warp-coupled-sigma-jacobi10-fp64]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
@@ -983,6 +1010,10 @@ void PrintUsage(const char* executable)
                "       " << executable
             << " [--conventional|--igr] [--engine ordinary|tensor]"
                " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi10-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi10-fp64]"
+               " [coupled-policy native-element-schwarz-matrix-free-warp-"
+               "coupled-fp64|native-element-schwarz-matrix-free-warp-"
+               "coupled-sigma-jacobi2-fp64|native-element-schwarz-matrix-"
+               "free-warp-coupled-sigma-jacobi10-fp64]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
@@ -1901,6 +1932,13 @@ void PrintStep(const StepSample& sample)
   PrintJsonNumber(CudaTracePreconditionerFixedSigmaJacobiDamping(
       evidence.tensor_core.trace_preconditioner));
   std::cout << ",\"field_split_sigma_jacobi_updates\":"
+            << fixed_sigma_jacobi_updates
+            << ",\"sigma_jacobi_sweeps\":"
+            << fixed_sigma_jacobi_sweeps
+            << ",\"sigma_jacobi_damping\":";
+  PrintJsonNumber(CudaTracePreconditionerFixedSigmaJacobiDamping(
+      evidence.tensor_core.trace_preconditioner));
+  std::cout << ",\"sigma_jacobi_updates\":"
             << fixed_sigma_jacobi_updates << ','
             << "\"element_schwarz_patch_rows\":"
             << evidence.tensor_core.element_schwarz_patch_rows << ','
@@ -2173,6 +2211,9 @@ int RunBenchmark(const Options& options)
   const bool warp_equilibrated_field_split =
       CudaTracePreconditionerIsNativeElementSchwarzWarpEquilibratedFieldSplit(
           reported_trace_policy.trace_preconditioner);
+  const bool warp_coupled_full_patch =
+      CudaTracePreconditionerIsNativeElementSchwarzWarpCoupled(
+          reported_trace_policy.trace_preconditioner);
   const int fixed_sigma_jacobi_sweeps =
       CudaTracePreconditionerFixedSigmaJacobiSweeps(
           reported_trace_policy.trace_preconditioner);
@@ -2241,7 +2282,9 @@ int RunBenchmark(const Options& options)
             << reported_trace_policy.element_schwarz_maximum_multiplicity
             << std::noboolalpha << ','
             << "\"trace_element_schwarz_factorization\":\""
-            << (equilibrated_field_split
+            << (warp_coupled_full_patch
+                    ? "full-coupled-patch-lu"
+                    : equilibrated_field_split
                     ? "lower-multiplicative-uhat4-sigmahat"
                     : reported_trace_policy.
                             native_element_schwarz_configured
@@ -2256,8 +2299,10 @@ int RunBenchmark(const Options& options)
             << "\"trace_element_schwarz_sigma_rows\":"
             << field_split_layout.sigma_rows << ','
             << "\"trace_element_schwarz_apply\":\""
-            << (warp_equilibrated_field_split
-                    ? "cooperative-pivoted-lu-fp64"
+            << (warp_coupled_full_patch
+                    ? "cooperative-full-patch-pivoted-lu-fp64"
+                    : warp_equilibrated_field_split
+                        ? "cooperative-pivoted-lu-fp64"
                     : equilibrated_field_split
                         ? "scalar-pivoted-lu-fp64"
                         : reported_trace_policy.
@@ -2266,11 +2311,18 @@ int RunBenchmark(const Options& options)
                             : "not-applicable")
             << "\","
             << "\"trace_element_schwarz_apply_tile_width\":"
-            << (warp_equilibrated_field_split
-                    ? (options.order == 1 ? 16 : 32) : 0) << ','
+            << (warp_coupled_full_patch
+                    ? 32
+                    : warp_equilibrated_field_split
+                        ? (options.order == 1 ? 16 : 32) : 0) << ','
             << "\"trace_field_split_sigma_jacobi_sweeps\":"
             << fixed_sigma_jacobi_sweeps << ','
             << "\"trace_field_split_sigma_jacobi_damping\":";
+  PrintJsonNumber(CudaTracePreconditionerFixedSigmaJacobiDamping(
+      reported_trace_policy.trace_preconditioner));
+  std::cout << ",\"trace_sigma_jacobi_sweeps\":"
+            << fixed_sigma_jacobi_sweeps
+            << ",\"trace_sigma_jacobi_damping\":";
   PrintJsonNumber(CudaTracePreconditionerFixedSigmaJacobiDamping(
       reported_trace_policy.trace_preconditioner));
   std::cout << ','

@@ -408,6 +408,41 @@ foreach(_order IN ITEMS 1 2 3)
       TIMEOUT 7200)
 endforeach()
 
+# Explicit coupled full-patch ablations reuse the complete six-case
+# CPU/ordinary-CUDA/tensor-CUDA alignment fixture.  These are qualification
+# registrations only: application engine-default routing is unchanged.
+set(_dg_igr_coupled_trace_policies
+  native-element-schwarz-matrix-free-warp-coupled-fp64
+  native-element-schwarz-matrix-free-warp-coupled-sigma-jacobi2-fp64
+  native-element-schwarz-matrix-free-warp-coupled-sigma-jacobi10-fp64)
+foreach(_coupled_policy IN LISTS _dg_igr_coupled_trace_policies)
+  string(REPLACE "native-element-schwarz-matrix-free-warp-coupled-" ""
+    _coupled_policy_suffix "${_coupled_policy}")
+  string(REPLACE "-" "_" _coupled_policy_suffix
+    "${_coupled_policy_suffix}")
+  foreach(_order IN ITEMS 1 2 3)
+    math(EXPR _igr_volume_quadrature_order "2 * ${_order} + 4")
+    math(EXPR _igr_face_quadrature_order "2 * ${_order} + 2")
+    add_test(
+      NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_coupled_${_coupled_policy_suffix}_p${_order}_rank1
+      COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+        --order ${_order}
+        --igr-volume-quadrature-order ${_igr_volume_quadrature_order}
+        --igr-face-quadrature-order ${_igr_face_quadrature_order}
+        --newton-linear-rtol 1e-10
+        --final-linear-rtol 3e-11
+        --true-residual-tightening-linear-rtol 1e-12
+        --tensor-igr-trace-policy ${_coupled_policy})
+    set_tests_properties(
+      dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_coupled_${_coupled_policy_suffix}_p${_order}_rank1
+      PROPERTIES
+        LABELS "hdg;runtime;cpu;cuda;generic-euler;alignment;ordinary;tensor;igr;contact;physical;periodic;source;initial-trace;conservation;trajectory;quadrature-candidate;role-tolerance-candidate;coupled-full-patch;ablation;p${_order}"
+        PROCESSORS 1
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 7200)
+  endforeach()
+endforeach()
+
 # Parse and validate candidate policies without selecting a CUDA device.  The
 # explicit warp selector below is a private ablation/parser control, separate
 # from the engine-default production candidate above.  These fast checks cover
@@ -525,6 +560,35 @@ foreach(_regularization IN ITEMS conventional igr)
         RESOURCE_LOCK dg_igr_sm120
         TIMEOUT 7200)
   endforeach()
+endforeach()
+
+# The original failing entropy-wave corner is isolated as one bounded p1,
+# mesh-3, one-step tensor-IGR gate for each fully coupled specialization.
+# It has identically zero velocity gradient and therefore directly guards the
+# setup singularity without repeating either convergence ladder.
+foreach(_coupled_policy IN LISTS _dg_igr_coupled_trace_policies)
+  string(REPLACE "native-element-schwarz-matrix-free-warp-coupled-" ""
+    _coupled_policy_suffix "${_coupled_policy}")
+  string(REPLACE "-" "_" _coupled_policy_suffix
+    "${_coupled_policy_suffix}")
+  add_test(
+    NAME dg_igr_hdg_runtime_cuda_generic_euler_zero_gradient_coupled_${_coupled_policy_suffix}_p1_rank1
+    COMMAND dg_igr_hdg_runtime_cuda_generic_euler_convergence
+      --order 1 --regularization igr
+      --igr-volume-quadrature-order 6
+      --igr-face-quadrature-order 4
+      --newton-linear-rtol 1e-10
+      --final-linear-rtol 3e-11
+      --true-residual-tightening-linear-rtol 1e-12
+      --tensor-igr-trace-policy ${_coupled_policy}
+      --zero-gradient-only)
+  set_tests_properties(
+    dg_igr_hdg_runtime_cuda_generic_euler_zero_gradient_coupled_${_coupled_policy_suffix}_p1_rank1
+    PROPERTIES
+      LABELS "hdg;runtime;cuda;generic-euler;tensor;igr;zero-gradient;coupled-full-patch;ablation;p1"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1800)
 endforeach()
 
 # CPU/ordinary-CUDA/tensor-CUDA alignment for the same bounded IGR

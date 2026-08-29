@@ -1508,7 +1508,10 @@ bool ParsePositiveDouble(
 bool ParseCudaTracePolicy(
     const std::string_view text, CudaTracePolicyKind& policy) noexcept
 {
-  constexpr std::array<CudaTracePolicyKind, 8> policies{{
+  // Keep this command-line surface private to the finite qualification
+  // executable.  The coupled entries are explicit ablations; they do not add
+  // a selector to the application contract.
+  constexpr std::array<CudaTracePolicyKind, 11> policies{{
       CudaTracePolicyKind::engine_default,
       CudaTracePolicyKind::common_fast,
       CudaTracePolicyKind::equilibrated_mgr,
@@ -1519,7 +1522,13 @@ bool ParseCudaTracePolicy(
       CudaTracePolicyKind::
           native_element_schwarz_matrix_free_equilibrated_field_split_fp64,
       CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64}};
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_coupled_fp64,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi2_fp64,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_coupled_sigma_jacobi10_fp64}};
   for (const CudaTracePolicyKind candidate : policies)
     if (text == CudaTracePolicyKindName(candidate))
     {
@@ -1644,7 +1653,10 @@ void PrintUsage(const char* const executable)
          "native-element-schwarz-equilibrated-field-split-fp64|"
          "native-element-schwarz-matrix-free-equilibrated-field-split-fp64|"
          "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-         "fp64] [--validate-options-only]\n";
+         "fp64|native-element-schwarz-matrix-free-warp-coupled-fp64|"
+         "native-element-schwarz-matrix-free-warp-coupled-sigma-jacobi2-"
+         "fp64|native-element-schwarz-matrix-free-warp-coupled-sigma-"
+         "jacobi10-fp64] [--validate-options-only]\n";
 }
 
 } // namespace
