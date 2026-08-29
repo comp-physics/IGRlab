@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 ROOT = Path(__file__).resolve().parents[2]
 PROVENANCE_WRITER = ROOT / "scripts/perf/profile_provenance.py"
@@ -58,6 +58,120 @@ NCU_INSTRUCTION_QUALIFICATION_KINDS = frozenset({
     "tensor-instructions", "tensor-volume-instructions",
 })
 PRODUCTION_TRACE_POLICY = "engine-default"
+
+
+class FixedSigmaJacobiProfilePolicy(NamedTuple):
+    sweeps: int
+    preconditioner: str
+    warp: bool
+
+
+FIXED_SIGMA_JACOBI_PROFILE_POLICIES = {
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi1-fp64": FixedSigmaJacobiProfilePolicy(
+        1,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi1_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi1-fp64": FixedSigmaJacobiProfilePolicy(
+        1,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi1_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi2-fp64": FixedSigmaJacobiProfilePolicy(
+        2,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi2_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi2-fp64": FixedSigmaJacobiProfilePolicy(
+        2,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi2_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi3-fp64": FixedSigmaJacobiProfilePolicy(
+        3,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi3_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi3-fp64": FixedSigmaJacobiProfilePolicy(
+        3,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi3_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi4-fp64": FixedSigmaJacobiProfilePolicy(
+        4,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi4_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi4-fp64": FixedSigmaJacobiProfilePolicy(
+        4,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi4_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi5-fp64": FixedSigmaJacobiProfilePolicy(
+        5,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi5_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi5-fp64": FixedSigmaJacobiProfilePolicy(
+        5,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi5_fp64",
+        True,
+    ),
+}
+
+
+class ProfileTracePolicyContract(NamedTuple):
+    requested: str
+    resolved: str
+    preconditioner: str
+    variant: str
+    production_selectable: bool
+    fixed_sigma_jacobi: FixedSigmaJacobiProfilePolicy | None
+
+
+def _profile_trace_policy_contract(
+        requested: str, mode: str) -> ProfileTracePolicyContract:
+    if mode not in {"conventional", "igr"}:
+        raise RuntimeError("profiled trace policy mode is invalid")
+    if requested == PRODUCTION_TRACE_POLICY:
+        resolved = (
+            "native-element-schwarz-matrix-free-warp-"
+            "equilibrated-field-split-fp64"
+            if mode == "igr" else PRODUCTION_TRACE_POLICY
+        )
+        preconditioner = (
+            "native_element_schwarz_warp_equilibrated_field_split_fp64"
+            if mode == "igr" else "hypre_diag_scale"
+        )
+        return ProfileTracePolicyContract(
+            requested, resolved, preconditioner, "production", True, None
+        )
+    fixed = FIXED_SIGMA_JACOBI_PROFILE_POLICIES.get(requested)
+    if fixed is None or mode != "igr":
+        raise RuntimeError(
+            "profiled trace policy is neither engine-default nor an exact "
+            "benchmark-only fixed-sigma Jacobi IGR policy"
+        )
+    return ProfileTracePolicyContract(
+        requested, requested, fixed.preconditioner, "ablation", False, fixed
+    )
+
+
 NCU_ATTRIBUTION_RANGES = {
     "HDG/local-assembly": "local_assembly",
     "HDG/local-factorization": "local_factorization",
@@ -1208,6 +1322,57 @@ def exact_uint64(value: Any, label: str) -> int:
     return result
 
 
+def exact_finite_number(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or \
+            not math.isfinite(float(value)):
+        raise RuntimeError(f"{label} must be a finite number")
+    return float(value)
+
+
+def _validated_fixed_sigma_jacobi_work(
+        tensor: dict[str, Any],
+        contract: ProfileTracePolicyContract) -> dict[str, int | float]:
+    descriptor = contract.fixed_sigma_jacobi
+    expected_sweeps = descriptor.sweeps if descriptor is not None else 0
+    expected_damping = 2.0 / 3.0 if descriptor is not None else 0.0
+    applications = exact_uint64(
+        tensor.get("element_schwarz_preconditioner_applications"),
+        "element-Schwarz preconditioner application count",
+    )
+    sweeps = exact_nonnegative_integer(
+        tensor.get("field_split_sigma_jacobi_sweeps"),
+        "fixed-sigma Jacobi sweep count",
+    )
+    damping = exact_finite_number(
+        tensor.get("field_split_sigma_jacobi_damping"),
+        "fixed-sigma Jacobi damping",
+    )
+    updates = exact_uint64(
+        tensor.get("field_split_sigma_jacobi_updates"),
+        "fixed-sigma Jacobi aggregate update count",
+    )
+    expected_updates = applications * expected_sweeps
+    if expected_updates > UINT64_MAX:
+        raise RuntimeError("fixed-sigma Jacobi aggregate work exceeds uint64")
+    if sweeps != expected_sweeps or damping != expected_damping or \
+            updates != expected_updates:
+        raise RuntimeError(
+            "profiled fixed-sigma Jacobi aggregate work does not exactly "
+            "match the selected typed trace policy"
+        )
+    if descriptor is not None and applications == 0:
+        raise RuntimeError(
+            "profiled fixed-sigma Jacobi policy has no material "
+            "preconditioner work"
+        )
+    return {
+        "element_schwarz_preconditioner_applications": applications,
+        "field_split_sigma_jacobi_sweeps": sweeps,
+        "field_split_sigma_jacobi_damping": damping,
+        "field_split_sigma_jacobi_updates": updates,
+    }
+
+
 def application_argument(args: argparse.Namespace, option: str) -> str:
     """Return one already-validated accepted-step application argument."""
     positions = [index for index, value in enumerate(args.arg) if value == option]
@@ -1257,21 +1422,24 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
     expected_mesh_n = int(application_argument(args, "--mesh-n"))
     expected_periods = int(application_argument(args, "--domain-periods"))
     expected_timestep = float(application_argument(args, "--dt"))
-    expected_resolved_trace_policy = (
-        "native-element-schwarz-matrix-free-warp-"
-        "equilibrated-field-split-fp64"
-        if expected_mode == "igr" else PRODUCTION_TRACE_POLICY
+    requested_trace_policy = application_argument(args, "--trace-policy")
+    trace_policy_contract = _profile_trace_policy_contract(
+        requested_trace_policy, expected_mode
     )
     exact_record = (
         record.get("schema") == 2 and record.get("success") is True and
-        record.get("variant") == "production" and
-        record.get("production_selectable") is True and
+        record.get("variant") == trace_policy_contract.variant and
+        record.get("production_selectable") is
+            trace_policy_contract.production_selectable and
         record.get("backend") == "cuda" and
         record.get("cuda_engine") == "tensor" and
-        record.get("trace_policy") == PRODUCTION_TRACE_POLICY and
-        record.get("requested_trace_policy") == PRODUCTION_TRACE_POLICY and
+        record.get("trace_policy") == trace_policy_contract.requested and
+        record.get("requested_trace_policy") ==
+            trace_policy_contract.requested and
         record.get("resolved_trace_policy") ==
-            expected_resolved_trace_policy and
+            trace_policy_contract.resolved and
+        record.get("trace_preconditioner") ==
+            trace_policy_contract.preconditioner and
         record.get("mode") == expected_mode and
         record.get("polynomial_order") == expected_order and
         record.get("mesh_n") == expected_mesh_n and
@@ -1283,9 +1451,33 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         record.get("host_export") is False
     )
     if not exact_record:
+        if trace_policy_contract.production_selectable:
+            raise RuntimeError(
+                "profiled benchmark summary does not match the qualified "
+                "production tensor accepted-step selection"
+            )
         raise RuntimeError(
-            "profiled benchmark summary does not match the qualified production "
-            "tensor accepted-step selection"
+            "profiled benchmark summary does not match the exact typed tensor "
+            "accepted-step trace-policy selection"
+        )
+    expected_sigma_sweeps = (
+        trace_policy_contract.fixed_sigma_jacobi.sweeps
+        if trace_policy_contract.fixed_sigma_jacobi is not None else 0
+    )
+    expected_sigma_damping = (
+        2.0 / 3.0
+        if trace_policy_contract.fixed_sigma_jacobi is not None else 0.0
+    )
+    if exact_nonnegative_integer(
+            record.get("trace_field_split_sigma_jacobi_sweeps"),
+            "top-level fixed-sigma Jacobi sweep count",
+        ) != expected_sigma_sweeps or exact_finite_number(
+            record.get("trace_field_split_sigma_jacobi_damping"),
+            "top-level fixed-sigma Jacobi damping",
+        ) != expected_sigma_damping:
+        raise RuntimeError(
+            "profiled benchmark fixed-sigma Jacobi metadata does not exactly "
+            "match the selected typed trace policy"
         )
     samples = record.get("samples")
     if not isinstance(samples, list):
@@ -1327,9 +1519,12 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         )
     if not (
         tensor.get("selected_engine") == "tensor" and
-        tensor.get("requested_trace_policy") == PRODUCTION_TRACE_POLICY and
+        tensor.get("requested_trace_policy") ==
+            trace_policy_contract.requested and
         tensor.get("resolved_trace_policy") ==
-            expected_resolved_trace_policy and
+            trace_policy_contract.resolved and
+        tensor.get("trace_preconditioner") ==
+            trace_policy_contract.preconditioner and
         tensor.get("hardware_supported") is True and
         tensor.get("fallback_count") == 0 and
         tensor.get("fallback_accounting_complete") is True and
@@ -1339,6 +1534,9 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
             "selected benchmark sample does not prove an admitted no-fallback "
             "tensor engine"
         )
+    sigma_jacobi_work = _validated_fixed_sigma_jacobi_work(
+        tensor, trace_policy_contract
+    )
 
     elements = exact_nonnegative_integer(record.get("elements"), "element count")
     interior_components = exact_nonnegative_integer(
@@ -1494,6 +1692,11 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         "status": "complete_profiled_tensor_work",
         "profile_measured_step": measured_step,
         "mode": expected_mode,
+        "trace_policy": trace_policy_contract.requested,
+        "resolved_trace_policy": trace_policy_contract.resolved,
+        "trace_preconditioner": trace_policy_contract.preconditioner,
+        "promotion_eligible_trace_policy":
+            trace_policy_contract.production_selectable,
         "polynomial_order": expected_order,
         "elements": elements,
         "interior_dofs_per_element": interior_dofs,
@@ -1513,6 +1716,7 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
             per_assembly_volume_tiles,
         "planned_volume_mma_tiles": volume_mma_tiles,
         "planned_volume_contraction_launch_distribution": chunk_histogram,
+        **sigma_jacobi_work,
         "fallback_count": 0,
         "execution_log": file_identity(log_path),
     }

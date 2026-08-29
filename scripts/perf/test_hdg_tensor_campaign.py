@@ -148,7 +148,15 @@ parser.add_argument(
              "native-element-schwarz-matrix-free-equilibrated-field-split-"
              "sigma-jacobi3-fp64",
              "native-element-schwarz-matrix-free-warp-equilibrated-field-"
-             "split-sigma-jacobi3-fp64"),
+             "split-sigma-jacobi3-fp64",
+             "native-element-schwarz-matrix-free-equilibrated-field-split-"
+             "sigma-jacobi4-fp64",
+             "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+             "split-sigma-jacobi4-fp64",
+             "native-element-schwarz-matrix-free-equilibrated-field-split-"
+             "sigma-jacobi5-fp64",
+             "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+             "split-sigma-jacobi5-fp64"),
 )
 parser.add_argument("--order", required=True, type=int)
 parser.add_argument("--mesh-n", required=True, type=int)
@@ -173,10 +181,78 @@ resolved_trace_policy = (
     else args.trace_policy
 )
 equilibrated_mgr = resolved_trace_policy == "equilibrated-mgr"
-fixed_sigma_jacobi_sweeps = next(
-    (sweeps for sweeps in (1, 2, 3)
-     if f"sigma-jacobi{sweeps}-fp64" in resolved_trace_policy),
-    0,
+fixed_sigma_jacobi_policies = {
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi1-fp64": (
+        1,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi1_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi1-fp64": (
+        1,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi1_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi2-fp64": (
+        2,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi2_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi2-fp64": (
+        2,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi2_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi3-fp64": (
+        3,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi3_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi3-fp64": (
+        3,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi3_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi4-fp64": (
+        4,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi4_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi4-fp64": (
+        4,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi4_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi5-fp64": (
+        5,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi5_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi5-fp64": (
+        5,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi5_fp64",
+        True,
+    ),
+}
+fixed_sigma_jacobi_policy = fixed_sigma_jacobi_policies.get(
+    resolved_trace_policy
+)
+fixed_sigma_jacobi_sweeps = (
+    fixed_sigma_jacobi_policy[0] if fixed_sigma_jacobi_policy else 0
 )
 fixed_sigma_jacobi = fixed_sigma_jacobi_sweeps > 0
 matrix_free = resolved_trace_policy in (
@@ -195,7 +271,7 @@ warp_element_field_split = resolved_trace_policy in (
     "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
 )
 warp_element_field_split = warp_element_field_split or (
-    fixed_sigma_jacobi and "-warp-" in resolved_trace_policy
+    fixed_sigma_jacobi_policy[2] if fixed_sigma_jacobi_policy else False
 )
 element_schwarz = resolved_trace_policy == "native-element-schwarz-fp64" or \
     matrix_free or element_field_split
@@ -205,10 +281,7 @@ if element_schwarz and (args.engine != "tensor" or args.mode != "igr"):
     parser.error("native element-Schwarz policies require tensor IGR")
 if element_field_split:
     trace_preconditioner = (
-        "native_element_schwarz_" +
-        ("warp_" if warp_element_field_split else "") +
-        "equilibrated_field_split_sigma_jacobi" +
-        str(fixed_sigma_jacobi_sweeps) + "_fp64"
+        fixed_sigma_jacobi_policy[1]
         if fixed_sigma_jacobi else
         "native_element_schwarz_warp_equilibrated_field_split_fp64"
         if warp_element_field_split else
@@ -1589,21 +1662,15 @@ def main() -> int:
 
         fixed_sigma_policy_specs = tuple(
             (
-                "native-element-schwarz-matrix-free-" +
-                ("warp-" if warp else "") +
-                "equilibrated-field-split-sigma-jacobi" +
-                str(sweeps) + "-fp64",
-                "native_element_schwarz_" +
-                ("warp_" if warp else "") +
-                "equilibrated_field_split_sigma_jacobi" +
-                str(sweeps) + "_fp64",
-                "cooperative-pivoted-lu-fp64" if warp else
+                policy,
+                descriptor.preconditioner,
+                "cooperative-pivoted-lu-fp64" if descriptor.warp else
                 "scalar-pivoted-lu-fp64",
-                32 if warp else 0,
-                sweeps,
+                32 if descriptor.warp else 0,
+                descriptor.sweeps,
             )
-            for sweeps in (1, 2, 3)
-            for warp in (False, True)
+            for policy, descriptor in
+            CAMPAIGN.FIXED_SIGMA_JACOBI_POLICY.items()
         )
         for (fixed_policy, fixed_preconditioner, fixed_apply,
              fixed_tile_width, fixed_sweeps) in fixed_sigma_policy_specs:

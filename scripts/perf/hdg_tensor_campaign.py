@@ -22,7 +22,7 @@ import statistics
 import subprocess
 import sys
 import time
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, NamedTuple, Sequence
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -195,44 +195,79 @@ TRACE_SOLVER_CONFIGURATION_BY_POLICY_ENGINE_AND_MODE = {
      "sigma-jacobi3-fp64", "tensor", "igr"):
         ("native-rank1-fp64", True, False, False),
 }
+
+
+class FixedSigmaJacobiPolicy(NamedTuple):
+    sweeps: int
+    preconditioner: str
+    warp: bool
+
+
+NO_FIXED_SIGMA_JACOBI_POLICY = FixedSigmaJacobiPolicy(0, "", False)
 FIXED_SIGMA_JACOBI_POLICY = {
     "native-element-schwarz-matrix-free-equilibrated-field-split-"
-    "sigma-jacobi1-fp64": (
+    "sigma-jacobi1-fp64": FixedSigmaJacobiPolicy(
         1,
         "native_element_schwarz_equilibrated_field_split_sigma_jacobi1_fp64",
         False,
     ),
     "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-    "sigma-jacobi1-fp64": (
+    "sigma-jacobi1-fp64": FixedSigmaJacobiPolicy(
         1,
         "native_element_schwarz_warp_equilibrated_field_split_"
         "sigma_jacobi1_fp64",
         True,
     ),
     "native-element-schwarz-matrix-free-equilibrated-field-split-"
-    "sigma-jacobi2-fp64": (
+    "sigma-jacobi2-fp64": FixedSigmaJacobiPolicy(
         2,
         "native_element_schwarz_equilibrated_field_split_sigma_jacobi2_fp64",
         False,
     ),
     "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-    "sigma-jacobi2-fp64": (
+    "sigma-jacobi2-fp64": FixedSigmaJacobiPolicy(
         2,
         "native_element_schwarz_warp_equilibrated_field_split_"
         "sigma_jacobi2_fp64",
         True,
     ),
     "native-element-schwarz-matrix-free-equilibrated-field-split-"
-    "sigma-jacobi3-fp64": (
+    "sigma-jacobi3-fp64": FixedSigmaJacobiPolicy(
         3,
         "native_element_schwarz_equilibrated_field_split_sigma_jacobi3_fp64",
         False,
     ),
     "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-    "sigma-jacobi3-fp64": (
+    "sigma-jacobi3-fp64": FixedSigmaJacobiPolicy(
         3,
         "native_element_schwarz_warp_equilibrated_field_split_"
         "sigma_jacobi3_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi4-fp64": FixedSigmaJacobiPolicy(
+        4,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi4_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi4-fp64": FixedSigmaJacobiPolicy(
+        4,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi4_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi5-fp64": FixedSigmaJacobiPolicy(
+        5,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi5_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi5-fp64": FixedSigmaJacobiPolicy(
+        5,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi5_fp64",
         True,
     ),
 }
@@ -250,8 +285,10 @@ for _fixed_policy, (_fixed_sweeps, _fixed_preconditioner, _fixed_warp) in \
         ("native-rank1-fp64", True, False, False)
 
 
-def fixed_sigma_jacobi_policy(trace_policy: str) -> tuple[int, str, bool]:
-    return FIXED_SIGMA_JACOBI_POLICY.get(trace_policy, (0, "", False))
+def fixed_sigma_jacobi_policy(trace_policy: str) -> FixedSigmaJacobiPolicy:
+    return FIXED_SIGMA_JACOBI_POLICY.get(
+        trace_policy, NO_FIXED_SIGMA_JACOBI_POLICY
+    )
 
 
 SAME_POLICY_MEMBERS = {

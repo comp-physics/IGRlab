@@ -27,8 +27,10 @@ namespace dg::hdg::runtime::cuda_w8a
 {
 namespace
 {
-static_assert(detail::native_trace_sigma_jacobi_sweeps ==
-              native_element_schwarz_sigma_jacobi_sweeps);
+static_assert(detail::native_trace_sigma_jacobi3_sweeps ==
+              native_element_schwarz_sigma_jacobi3_sweeps);
+static_assert(detail::native_trace_sigma_jacobi_maximum_sweeps ==
+              native_element_schwarz_sigma_jacobi_maximum_sweeps);
 static_assert(detail::native_trace_sigma_jacobi_damping ==
               native_element_schwarz_sigma_jacobi_damping);
 
@@ -1363,6 +1365,46 @@ bool CudaQueryNativeRankOneTraceResources(
           NativeTraceControlDoubleSlots();
 }
 
+constexpr NativeTracePreconditionerKind NativeFixedSigmaJacobiPreconditioner(
+    const int sweeps, const bool warp) noexcept
+{
+  switch (sweeps)
+  {
+  case 1:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi1_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi1_fp64;
+  case 2:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi2_fp64;
+  case native_element_schwarz_sigma_jacobi3_sweeps:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64;
+  case 4:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi4_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi4_fp64;
+  case native_element_schwarz_sigma_jacobi_maximum_sweeps:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi5_fp64;
+  default:
+    return NativeTracePreconditionerKind::diagonal;
+  }
+}
+
 bool CudaLaunchNativeRankOneTraceSolver(
     const CudaTrueMatrixDeviceView& matrix, const double* const rhs,
     double* const solution,
@@ -1418,31 +1460,22 @@ bool CudaLaunchNativeRankOneTraceSolver(
       CudaTracePreconditionerUsesFixedSigmaJacobi(preconditioner_kind);
   const int fixed_sigma_jacobi_sweeps =
       CudaTracePreconditionerFixedSigmaJacobiSweeps(preconditioner_kind);
+  const NativeTracePreconditionerKind fixed_sigma_jacobi_kind =
+      NativeFixedSigmaJacobiPreconditioner(
+          fixed_sigma_jacobi_sweeps,
+          use_warp_equilibrated_field_split);
   if (!CudaNativeTraceCooperativeSupportMatchesPreconditioner(
           support, preconditioner_kind))
+    return false;
+  if (use_fixed_sigma_jacobi &&
+      fixed_sigma_jacobi_kind == NativeTracePreconditionerKind::diagonal)
     return false;
   preconditioner.kind = use_ilu
       ? NativeTracePreconditionerKind::ilu0_rcm_jacobi
       : use_element_schwarz
           ? (use_equilibrated_field_split
                  ? (use_fixed_sigma_jacobi
-                        ? (use_warp_equilibrated_field_split
-                               ? (fixed_sigma_jacobi_sweeps == 1
-                                      ? NativeTracePreconditionerKind::
-                                            element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi1_fp64
-                                      : fixed_sigma_jacobi_sweeps == 2
-                                          ? NativeTracePreconditionerKind::
-                                                element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64
-                                          : NativeTracePreconditionerKind::
-                                                element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64)
-                               : (fixed_sigma_jacobi_sweeps == 1
-                                      ? NativeTracePreconditionerKind::
-                                            element_overlap_schwarz_equilibrated_field_split_sigma_jacobi1_fp64
-                                      : fixed_sigma_jacobi_sweeps == 2
-                                          ? NativeTracePreconditionerKind::
-                                                element_overlap_schwarz_equilibrated_field_split_sigma_jacobi2_fp64
-                                          : NativeTracePreconditionerKind::
-                                                element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64))
+                        ? fixed_sigma_jacobi_kind
                         : use_warp_equilibrated_field_split
                             ? NativeTracePreconditionerKind::
                                   element_overlap_schwarz_warp_equilibrated_field_split_fp64

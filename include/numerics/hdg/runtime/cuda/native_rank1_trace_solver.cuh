@@ -25,7 +25,8 @@ namespace dg::hdg::runtime::cuda_w8a::detail
 inline constexpr std::uint32_t native_trace_control_schema = 1;
 inline constexpr int native_trace_cooperative_threads = 256;
 inline constexpr int native_trace_ilu_jacobi_iterations = 5;
-inline constexpr int native_trace_sigma_jacobi_sweeps = 3;
+inline constexpr int native_trace_sigma_jacobi3_sweeps = 3;
+inline constexpr int native_trace_sigma_jacobi_maximum_sweeps = 5;
 inline constexpr double native_trace_sigma_jacobi_damping =
     0x1.5555555555555p-1;
 
@@ -41,7 +42,11 @@ enum class NativeTracePreconditionerKind : std::int32_t
   element_overlap_schwarz_equilibrated_field_split_sigma_jacobi1_fp64 = 8,
   element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi1_fp64 = 9,
   element_overlap_schwarz_equilibrated_field_split_sigma_jacobi2_fp64 = 10,
-  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64 = 11
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64 = 11,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi4_fp64 = 12,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi4_fp64 = 13,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi5_fp64 = 14,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64 = 15
 };
 
 enum class NativeTraceSolveStatus : std::int32_t

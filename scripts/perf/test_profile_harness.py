@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import os
@@ -13,6 +14,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 HARNESS = ROOT / "scripts/perf/profile_harness.py"
+MODULE_SPEC = importlib.util.spec_from_file_location(
+    "profile_harness_under_test", HARNESS
+)
+if MODULE_SPEC is None or MODULE_SPEC.loader is None:
+    raise RuntimeError("could not load profile_harness.py")
+PROFILE = importlib.util.module_from_spec(MODULE_SPEC)
+MODULE_SPEC.loader.exec_module(PROFILE)
 
 
 def run(*arguments: str, expected: int = 0, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -47,7 +55,166 @@ def common(app: Path, output: Path) -> list[str]:
     return ["--scenario", "generic-case", "--exe", str(app), "--out-dir", str(output), "--arg=--input", "--arg", "case.yaml"]
 
 
+def validate_fixed_sigma_jacobi_profile_surface() -> None:
+    expected = {
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi1-fp64": (
+            1,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi1_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi1-fp64": (
+            1,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi1_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi2-fp64": (
+            2,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi2_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi2-fp64": (
+            2,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi2_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi3-fp64": (
+            3,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi3_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi3-fp64": (
+            3,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi3_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi4-fp64": (
+            4,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi4_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi4-fp64": (
+            4,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi4_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi5-fp64": (
+            5,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi5_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi5-fp64": (
+            5,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi5_fp64",
+            True,
+        ),
+    }
+    assert PROFILE.FIXED_SIGMA_JACOBI_PROFILE_POLICIES == expected
+    conventional_default = PROFILE._profile_trace_policy_contract(
+        "engine-default", "conventional"
+    )
+    assert conventional_default == (
+        "engine-default", "engine-default", "hypre_diag_scale",
+        "production", True, None,
+    )
+    igr_default = PROFILE._profile_trace_policy_contract(
+        "engine-default", "igr"
+    )
+    assert igr_default == (
+        "engine-default",
+        "native-element-schwarz-matrix-free-warp-"
+        "equilibrated-field-split-fp64",
+        "native_element_schwarz_warp_equilibrated_field_split_fp64",
+        "production", True, None,
+    )
+
+    def rejected(function: object, *arguments: object) -> bool:
+        try:
+            function(*arguments)  # type: ignore[operator]
+        except RuntimeError:
+            return True
+        return False
+
+    assert rejected(
+        PROFILE._profile_trace_policy_contract,
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi4-fp64-extra",
+        "igr",
+    )
+    for policy, descriptor in expected.items():
+        contract = PROFILE._profile_trace_policy_contract(policy, "igr")
+        assert contract == (
+            policy, policy, descriptor[1], "ablation", False,
+            PROFILE.FixedSigmaJacobiProfilePolicy(*descriptor),
+        )
+        assert rejected(
+            PROFILE._profile_trace_policy_contract, policy, "conventional"
+        )
+        tensor = {
+            "element_schwarz_preconditioner_applications": 9,
+            "field_split_sigma_jacobi_sweeps": descriptor[0],
+            "field_split_sigma_jacobi_damping": 2.0 / 3.0,
+            "field_split_sigma_jacobi_updates": 9 * descriptor[0],
+        }
+        assert PROFILE._validated_fixed_sigma_jacobi_work(
+            tensor, contract
+        ) == tensor
+        for field, value in (
+                ("field_split_sigma_jacobi_sweeps",
+                 5 if descriptor[0] != 5 else 4),
+                ("field_split_sigma_jacobi_damping", 0.5),
+                ("field_split_sigma_jacobi_damping", float("nan")),
+                ("field_split_sigma_jacobi_updates",
+                 9 * descriptor[0] - 1)):
+            invalid = {**tensor, field: value}
+            assert rejected(
+                PROFILE._validated_fixed_sigma_jacobi_work,
+                invalid,
+                contract,
+            ), (policy, field)
+        no_work = {
+            **tensor,
+            "element_schwarz_preconditioner_applications": 0,
+            "field_split_sigma_jacobi_updates": 0,
+        }
+        assert rejected(
+            PROFILE._validated_fixed_sigma_jacobi_work, no_work, contract
+        ), policy
+        if descriptor[0] == 5:
+            overflowing = {
+                **tensor,
+                "element_schwarz_preconditioner_applications":
+                    PROFILE.UINT64_MAX,
+                "field_split_sigma_jacobi_updates": PROFILE.UINT64_MAX,
+            }
+            assert rejected(
+                PROFILE._validated_fixed_sigma_jacobi_work,
+                overflowing,
+                contract,
+            ), policy
+
+
 def main() -> int:
+    validate_fixed_sigma_jacobi_profile_surface()
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         app = root / "app"
@@ -263,6 +430,10 @@ else:
         "trace_policy": "engine-default",
         "requested_trace_policy": "engine-default",
         "resolved_trace_policy": top_level_resolved_trace_policy,
+        "trace_preconditioner":
+            "native_element_schwarz_warp_equilibrated_field_split_fp64",
+        "trace_field_split_sigma_jacobi_sweeps": 0,
+        "trace_field_split_sigma_jacobi_damping": 0.0,
         "mode": "igr",
         "rank_count": 1,
         "polynomial_order": order,
@@ -285,6 +456,13 @@ else:
                 "selected_engine": "tensor",
                 "requested_trace_policy": "engine-default",
                 "resolved_trace_policy": sample_resolved_trace_policy,
+                "trace_preconditioner":
+                    "native_element_schwarz_warp_"
+                    "equilibrated_field_split_fp64",
+                "element_schwarz_preconditioner_applications": 9,
+                "field_split_sigma_jacobi_sweeps": 0,
+                "field_split_sigma_jacobi_damping": 0.0,
+                "field_split_sigma_jacobi_updates": 0,
                 "hardware_supported": True,
                 "volume_assembly_launches": volume_launches,
                 "volume_mma_tiles": volume_tiles_per_assembly * volume_launches,
@@ -352,6 +530,9 @@ else:
         "trace_policy": "engine-default",
         "requested_trace_policy": "engine-default",
         "resolved_trace_policy": "engine-default",
+        "trace_preconditioner": "hypre_diag_scale",
+        "trace_field_split_sigma_jacobi_sweeps": 0,
+        "trace_field_split_sigma_jacobi_damping": 0.0,
         "mode": "conventional",
         "rank_count": 1,
         "polynomial_order": 2,
@@ -374,6 +555,11 @@ else:
                 "selected_engine": "tensor",
                 "requested_trace_policy": "engine-default",
                 "resolved_trace_policy": "engine-default",
+                "trace_preconditioner": "hypre_diag_scale",
+                "element_schwarz_preconditioner_applications": 0,
+                "field_split_sigma_jacobi_sweeps": 0,
+                "field_split_sigma_jacobi_damping": 0.0,
+                "field_split_sigma_jacobi_updates": 0,
                 "hardware_supported": True,
                 "volume_assembly_launches": 3,
                 "volume_mma_tiles": 3893760,
@@ -696,6 +882,25 @@ else:
         assert "application --trace-policy='common-fast'" in \
             ablation_trace_policy_error
         assert "expected 'engine-default'" in ablation_trace_policy_error
+
+        fixed_trace_policy_arguments = qualification_arguments(
+            root / "qualification-fixed-sigma-jacobi4-trace-policy"
+        )
+        fixed_trace_policy = (
+            "native-element-schwarz-matrix-free-warp-"
+            "equilibrated-field-split-sigma-jacobi4-fp64"
+        )
+        fixed_trace_policy_arguments[
+            fixed_trace_policy_arguments.index("engine-default")
+        ] = fixed_trace_policy
+        fixed_trace_policy_error = run(
+            *fixed_trace_policy_arguments,
+            expected=2,
+            env=qualification_env,
+        ).stderr
+        assert f"application --trace-policy={fixed_trace_policy!r}" in \
+            fixed_trace_policy_error
+        assert "expected 'engine-default'" in fixed_trace_policy_error
 
         missing_category_out = root / "qualification-attribution-missing"
         run(
