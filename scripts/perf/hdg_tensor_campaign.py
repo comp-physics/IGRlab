@@ -38,6 +38,8 @@ TRACE_PRECONDITIONER_BY_POLICY_ENGINE_AND_MODE = {
     ("common-fast", "tensor", "conventional"): "hypre_diag_scale",
     ("common-fast", "tensor", "igr"): "hypre_ilu0",
     ("equilibrated-mgr", "tensor", "igr"): "hypre_mgr_field_split",
+    ("native-element-schwarz-fp64", "tensor", "igr"):
+        "native_element_schwarz_fp64",
 }
 TRACE_ILU_POLICY_BY_POLICY_ENGINE_AND_MODE = {
     ("engine-default", "ordinary", "conventional"): (0, 0, 0, 1),
@@ -49,6 +51,8 @@ TRACE_ILU_POLICY_BY_POLICY_ENGINE_AND_MODE = {
     ("common-fast", "tensor", "conventional"): (-1, -1, -1, 0),
     ("common-fast", "tensor", "igr"): (0, 0, 1, 1),
     ("equilibrated-mgr", "tensor", "igr"): (-1, -1, -1, 0),
+    ("native-element-schwarz-fp64", "tensor", "igr"):
+        (-1, -1, -1, 0),
 }
 TRACE_ILU_FACTOR_REUSE_BY_POLICY_ENGINE_AND_MODE = {
     ("engine-default", "ordinary", "conventional"):
@@ -61,6 +65,8 @@ TRACE_ILU_FACTOR_REUSE_BY_POLICY_ENGINE_AND_MODE = {
     ("common-fast", "tensor", "conventional"): "not_applicable",
     ("common-fast", "tensor", "igr"): "first_trace_solve_per_attempt",
     ("equilibrated-mgr", "tensor", "igr"): "not_applicable",
+    ("native-element-schwarz-fp64", "tensor", "igr"):
+        "not_applicable",
 }
 TRACE_ILU_TRIANGULAR_SOLVE_BY_POLICY_ENGINE_AND_MODE = {
     ("engine-default", "ordinary", "conventional"): ("direct", 0, 0, 0),
@@ -81,6 +87,8 @@ TRACE_ILU_TRIANGULAR_SOLVE_BY_POLICY_ENGINE_AND_MODE = {
     ("common-fast", "tensor", "igr"):
         ("iterative_jacobi", 5, 5, 8),
     ("equilibrated-mgr", "tensor", "igr"):
+        ("not_applicable", 0, 0, 0),
+    ("native-element-schwarz-fp64", "tensor", "igr"):
         ("not_applicable", 0, 0, 0),
 }
 # Solver name and the three mutually exclusive rank-one/rank-two
@@ -106,6 +114,8 @@ TRACE_SOLVER_CONFIGURATION_BY_POLICY_ENGINE_AND_MODE = {
         ("native-rank1-fp64", True, False, False),
     ("equilibrated-mgr", "tensor", "igr"):
         ("hypre-fgmres-mgr-rank1", False, True, False),
+    ("native-element-schwarz-fp64", "tensor", "igr"):
+        ("native-rank1-fp64", True, False, False),
 }
 SAME_POLICY_MEMBERS = {
     "O_base": {"engine": "ordinary", "trace_policy": "engine-default"},
@@ -1134,6 +1144,57 @@ def _mgr_accounting_is_valid(
     )
 
 
+def _element_schwarz_accounting_is_valid(
+        *, expected_schwarz: bool, order: int, trace_solves: int,
+        linear_iterations: int, krylov_restart_dimension: int,
+        patch_setups: int, preconditioner_applications: int,
+        patch_rows: int, minimum_multiplicity: int,
+        maximum_multiplicity: int) -> bool:
+    """Validate bounded native element-Schwarz aggregates, never history."""
+    values = (
+        trace_solves,
+        linear_iterations,
+        krylov_restart_dimension,
+        patch_setups,
+        preconditioner_applications,
+        patch_rows,
+        minimum_multiplicity,
+        maximum_multiplicity,
+    )
+    if any(value < 0 or value > UINT64_MAX for value in values):
+        return False
+    if not expected_schwarz:
+        return not any((
+            patch_setups,
+            preconditioner_applications,
+            patch_rows,
+            minimum_multiplicity,
+            maximum_multiplicity,
+        ))
+    expected_patch_rows = 4 * 5 * (order + 1)
+    if order not in (1, 2, 3) or trace_solves == 0 or \
+            patch_setups != trace_solves or \
+            patch_rows != expected_patch_rows or \
+            minimum_multiplicity < 1 or \
+            minimum_multiplicity > maximum_multiplicity or \
+            maximum_multiplicity > 2 or \
+            krylov_restart_dimension == 0:
+        return False
+    if linear_iterations == 0:
+        return preconditioner_applications == 0
+    if preconditioner_applications <= linear_iterations:
+        return False
+    # Native right-preconditioned GMRES applies the patch solve once per
+    # Krylov iteration and once per restart update.  The aggregate restart
+    # count is therefore exact even though no per-solve partition is retained.
+    restart_cycles = preconditioner_applications - linear_iterations
+    return (
+        restart_cycles <= linear_iterations and
+        restart_cycles <= UINT64_MAX // krylov_restart_dimension and
+        linear_iterations <= restart_cycles * krylov_restart_dimension
+    )
+
+
 def validate_memory_snapshot(value: Any, field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise CampaignError(f"benchmark field {field} is not an object")
@@ -1183,7 +1244,7 @@ def validate_memory_controls(record: dict[str, Any]) -> None:
         raise CampaignError("Umpire allocator high-watermark sum is inconsistent")
 
 
-def validate_final_sample(sample: Any, *, engine: str, mode: str,
+def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
                           trace_policy: str,
                           expected_preconditioner: str,
                           krylov_restart_dimension: int,
@@ -1287,6 +1348,7 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str,
         expected_mgr,
         expected_rank2,
     ) = expected_trace_solver_configuration(engine, mode, trace_policy)
+    expected_schwarz = trace_policy == "native-element-schwarz-fp64"
     if tensor.get("trace_solver") != expected_trace_solver:
         raise CampaignError(
             f"sample trace_solver={tensor.get('trace_solver')!r}; expected "
@@ -1304,6 +1366,8 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str,
             expected_native or \
             tensor.get("hypre_mgr_rank1_trace_solver_configured") is not \
             expected_mgr or \
+            tensor.get("native_element_schwarz_configured") is not \
+            expected_schwarz or \
             tensor.get("hypre_host_staged_rank2_trace_solver_configured") \
             is not expected_rank2 or \
             tensor.get("trace_solver_accounting_complete") is not True or \
@@ -1465,6 +1529,48 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str,
             **mgr_scales):
         raise CampaignError(
             "sample bounded MGR/equilibration accounting is inconsistent"
+        )
+    schwarz_counters = {
+        field: checked_uint64(
+            tensor.get(field), f"samples.tensor_core.{field}"
+        )
+        for field in (
+            "element_schwarz_patch_setups",
+            "element_schwarz_preconditioner_applications",
+        )
+    }
+    schwarz_shape = {
+        field: checked_int(
+            tensor.get(field), f"samples.tensor_core.{field}"
+        )
+        for field in (
+            "element_schwarz_patch_rows",
+            "element_schwarz_minimum_multiplicity",
+            "element_schwarz_maximum_multiplicity",
+        )
+    }
+    if not _element_schwarz_accounting_is_valid(
+            expected_schwarz=expected_schwarz,
+            order=order,
+            trace_solves=work["trace_solves"],
+            linear_iterations=work["linear_iterations"],
+            krylov_restart_dimension=krylov_restart_dimension,
+            patch_setups=schwarz_counters[
+                "element_schwarz_patch_setups"
+            ],
+            preconditioner_applications=schwarz_counters[
+                "element_schwarz_preconditioner_applications"
+            ],
+            patch_rows=schwarz_shape["element_schwarz_patch_rows"],
+            minimum_multiplicity=schwarz_shape[
+                "element_schwarz_minimum_multiplicity"
+            ],
+            maximum_multiplicity=schwarz_shape[
+                "element_schwarz_maximum_multiplicity"
+            ]):
+        raise CampaignError(
+            "sample bounded native element-Schwarz accounting is "
+            "inconsistent"
         )
     launches = checked_int(
         tensor.get("condensation_launches"),
@@ -1970,7 +2076,7 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
             tightening_linear_tolerance < final_linear_tolerance
         )
         validate_final_sample(
-            samples[0], engine=engine, mode=mode,
+            samples[0], engine=engine, mode=mode, order=order,
             trace_policy=trace_policy,
             expected_preconditioner=expected_preconditioner,
             krylov_restart_dimension=krylov_restart_dimension,
@@ -1989,6 +2095,7 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
         for index, duration in enumerate(checked_durations):
             validate_final_sample(
                 samples[index + FINAL_WARMUP_STEPS], engine=engine, mode=mode,
+                order=order,
                 trace_policy=trace_policy,
                 expected_preconditioner=expected_preconditioner,
                 krylov_restart_dimension=krylov_restart_dimension,
@@ -2092,6 +2199,9 @@ def summarized_sample_work(sample: dict[str, Any], *, schema: int) -> dict[str, 
         "hypre_mgr_rank1_trace_solver_configured": tensor[
             "hypre_mgr_rank1_trace_solver_configured"
         ],
+        "native_element_schwarz_configured": tensor[
+            "native_element_schwarz_configured"
+        ],
         "hypre_host_staged_rank2_trace_solver_configured": tensor[
             "hypre_host_staged_rank2_trace_solver_configured"
         ],
@@ -2147,6 +2257,21 @@ def summarized_sample_work(sample: dict[str, Any], *, schema: int) -> dict[str, 
         ],
         "mgr_f_ilu_setups": tensor["mgr_f_ilu_setups"],
         "mgr_f_ilu_applications": tensor["mgr_f_ilu_applications"],
+        "element_schwarz_patch_setups": tensor[
+            "element_schwarz_patch_setups"
+        ],
+        "element_schwarz_preconditioner_applications": tensor[
+            "element_schwarz_preconditioner_applications"
+        ],
+        "element_schwarz_patch_rows": tensor[
+            "element_schwarz_patch_rows"
+        ],
+        "element_schwarz_minimum_multiplicity": tensor[
+            "element_schwarz_minimum_multiplicity"
+        ],
+        "element_schwarz_maximum_multiplicity": tensor[
+            "element_schwarz_maximum_multiplicity"
+        ],
         "minimum_left_scale": tensor["minimum_left_scale"],
         "maximum_left_scale": tensor["maximum_left_scale"],
         "minimum_right_scale": tensor["minimum_right_scale"],
@@ -2335,6 +2460,11 @@ def work_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "mgr_preconditioner_applications",
         "mgr_f_ilu_setups",
         "mgr_f_ilu_applications",
+        "element_schwarz_patch_setups",
+        "element_schwarz_preconditioner_applications",
+        "element_schwarz_patch_rows",
+        "element_schwarz_minimum_multiplicity",
+        "element_schwarz_maximum_multiplicity",
         "condensation_launches",
         "mma_tiles",
         "fallback_count",
@@ -2366,6 +2496,13 @@ def work_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 for tensor in tensor_samples
                 if isinstance(
                     tensor.get("hypre_mgr_rank1_trace_solver_configured"), bool
+                )
+            }),
+            "native_element_schwarz_configured_values": sorted({
+                tensor.get("native_element_schwarz_configured")
+                for tensor in tensor_samples
+                if isinstance(
+                    tensor.get("native_element_schwarz_configured"), bool
                 )
             }),
             "hypre_host_staged_rank2_trace_solver_configured_values": sorted({
@@ -2655,8 +2792,8 @@ def final_command(executable: Path, *, engine: str, mode: str, order: int,
                   export: bool, expected_build: dict[str, str],
                   trace_policy: str = "engine-default") -> list[str]:
     # Fail before launching the benchmark when the explicit policy is not
-    # defined for this exact engine/mode tuple.  In particular, the MGR
-    # experiment is tensor+IGR only.
+    # defined for this exact engine/mode tuple.  The MGR and native element-
+    # Schwarz experiments are tensor+IGR rank-one policies only.
     expected_trace_solver_configuration(engine, mode, trace_policy)
     return [
         str(executable),

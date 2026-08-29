@@ -90,12 +90,18 @@ SCHEMA2_ONLY_SAMPLE_FIELDS = {
     "trace_solver", "native_rank1_trace_solve_calls",
     "hypre_trace_solve_calls", "native_rank1_trace_solver_configured",
     "hypre_mgr_rank1_trace_solver_configured",
+    "native_element_schwarz_configured",
     "hypre_host_staged_rank2_trace_solver_configured",
     "trace_solver_accounting_complete", "equilibration_builds",
     "equilibration_passes", "mgr_setup_calls",
     "mgr_preconditioner_applications", "mgr_f_ilu_setups",
     "mgr_f_ilu_applications", "minimum_left_scale",
     "maximum_left_scale", "minimum_right_scale", "maximum_right_scale",
+    "element_schwarz_patch_setups",
+    "element_schwarz_preconditioner_applications",
+    "element_schwarz_patch_rows",
+    "element_schwarz_minimum_multiplicity",
+    "element_schwarz_maximum_multiplicity",
 }
 
 FAKE_BENCHMARK = r'''#!/usr/bin/env python3
@@ -109,7 +115,8 @@ parser.add_argument("--mode", required=True, choices=("conventional", "igr"))
 parser.add_argument("--engine", default="ordinary", choices=("ordinary", "tensor"))
 parser.add_argument(
     "--trace-policy", default="engine-default",
-    choices=("engine-default", "common-fast", "equilibrated-mgr"),
+    choices=("engine-default", "common-fast", "equilibrated-mgr",
+             "native-element-schwarz-fp64"),
 )
 parser.add_argument("--order", required=True, type=int)
 parser.add_argument("--mesh-n", required=True, type=int)
@@ -128,9 +135,14 @@ args = parser.parse_args()
 is_frozen = "frozen" in str(Path(__file__))
 common_fast = args.trace_policy == "common-fast"
 equilibrated_mgr = args.trace_policy == "equilibrated-mgr"
+element_schwarz = args.trace_policy == "native-element-schwarz-fp64"
 if equilibrated_mgr and (args.engine != "tensor" or args.mode != "igr"):
     parser.error("equilibrated-mgr requires tensor IGR")
-if equilibrated_mgr:
+if element_schwarz and (args.engine != "tensor" or args.mode != "igr"):
+    parser.error("native-element-schwarz-fp64 requires tensor IGR")
+if element_schwarz:
+    trace_preconditioner = "native_element_schwarz_fp64"
+elif equilibrated_mgr:
     trace_preconditioner = "hypre_mgr_field_split"
 elif args.mode == "conventional" and \
         (common_fast or args.engine == "tensor"):
@@ -139,7 +151,9 @@ else:
     trace_preconditioner = "hypre_ilu0"
 ilu_policy = (
     (-1, -1, -1, 0)
-    if trace_preconditioner in ("hypre_diag_scale", "hypre_mgr_field_split")
+    if trace_preconditioner in (
+        "hypre_diag_scale", "hypre_mgr_field_split",
+        "native_element_schwarz_fp64")
     else (0, 0, 1 if args.mode == "igr" else 0, 1)
 )
 ilu_factor_reuse_policy = (
@@ -262,6 +276,7 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
                 args.engine == "tensor" and not equilibrated_mgr
             ),
             "hypre_mgr_rank1_trace_solver_configured": equilibrated_mgr,
+            "native_element_schwarz_configured": element_schwarz,
             "hypre_host_staged_rank2_trace_solver_configured": False,
             "trace_solver_accounting_complete": True,
             "trace_preconditioner": trace_preconditioner,
@@ -320,6 +335,21 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
                 sample["trace_solves"] if equilibrated_mgr else 0
             ),
             "mgr_f_ilu_applications": 9 if equilibrated_mgr else 0,
+            "element_schwarz_patch_setups": (
+                sample["trace_solves"] if element_schwarz else 0
+            ),
+            "element_schwarz_preconditioner_applications": (
+                9 if element_schwarz else 0
+            ),
+            "element_schwarz_patch_rows": (
+                4 * 5 * (args.order + 1) if element_schwarz else 0
+            ),
+            "element_schwarz_minimum_multiplicity": (
+                2 if element_schwarz else 0
+            ),
+            "element_schwarz_maximum_multiplicity": (
+                2 if element_schwarz else 0
+            ),
             "minimum_left_scale": 0.5 if equilibrated_mgr else 0.0,
             "maximum_left_scale": 2.0 if equilibrated_mgr else 0.0,
             "minimum_right_scale": 0.25 if equilibrated_mgr else 0.0,
@@ -781,6 +811,54 @@ def main() -> int:
         minimum_right_scale=0.0,
         maximum_right_scale=0.0,
     )
+    valid_schwarz_aggregates = {
+        "expected_schwarz": True,
+        "order": 2,
+        "trace_solves": 2,
+        "linear_iterations": 7,
+        "krylov_restart_dimension": 100,
+        "patch_setups": 2,
+        "preconditioner_applications": 9,
+        "patch_rows": 60,
+        "minimum_multiplicity": 1,
+        "maximum_multiplicity": 2,
+    }
+    assert CAMPAIGN._element_schwarz_accounting_is_valid(
+        **valid_schwarz_aggregates
+    )
+    assert CAMPAIGN._element_schwarz_accounting_is_valid(
+        **{**valid_schwarz_aggregates, "maximum_multiplicity": 1}
+    )
+    for field, value in (
+            ("patch_setups", 1),
+            ("preconditioner_applications", 7),
+            ("patch_rows", 40),
+            ("minimum_multiplicity", 0),
+            ("maximum_multiplicity", 3)):
+        invalid = {**valid_schwarz_aggregates, field: value}
+        assert not CAMPAIGN._element_schwarz_accounting_is_valid(**invalid)
+    assert not CAMPAIGN._element_schwarz_accounting_is_valid(
+        **{
+            **valid_schwarz_aggregates,
+            "minimum_multiplicity": 2,
+            "maximum_multiplicity": 1,
+        }
+    )
+    no_schwarz_aggregates = {
+        **valid_schwarz_aggregates,
+        "expected_schwarz": False,
+        "patch_setups": 0,
+        "preconditioner_applications": 0,
+        "patch_rows": 0,
+        "minimum_multiplicity": 0,
+        "maximum_multiplicity": 0,
+    }
+    assert CAMPAIGN._element_schwarz_accounting_is_valid(
+        **no_schwarz_aggregates
+    )
+    assert not CAMPAIGN._element_schwarz_accounting_is_valid(
+        **{**no_schwarz_aggregates, "patch_setups": 1}
+    )
 
     with tempfile.TemporaryDirectory(prefix="hdg-tensor-campaign-test-") as temp:
         root = Path(temp)
@@ -1106,6 +1184,173 @@ def main() -> int:
                     "MGR command admitted an unsupported engine/mode"
                 )
 
+        schwarz_command = CAMPAIGN.final_command(
+            final,
+            engine="tensor",
+            mode="igr",
+            order=2,
+            mesh_n=12,
+            domain_periods=3,
+            timestep=1.0e-5,
+            export=False,
+            expected_build=explicit_build,
+            trace_policy="native-element-schwarz-fp64",
+        )
+        assert schwarz_command[
+            schwarz_command.index("--trace-policy") + 1
+        ] == "native-element-schwarz-fp64"
+        schwarz_record = json.loads(run(schwarz_command, root).stdout)
+        schwarz_validation_arguments = {
+            "source": "final",
+            "mode": "igr",
+            "order": 2,
+            "mesh_n": 12,
+            "domain_periods": 3,
+            "timestep": 1.0e-5,
+            "export": False,
+            "engine": "tensor",
+            "expected_build": explicit_build,
+            "expected_gpu": explicit_gpu,
+            "trace_policy": "native-element-schwarz-fp64",
+        }
+        CAMPAIGN.validate_record(
+            schwarz_record, **schwarz_validation_arguments
+        )
+        assert schwarz_record["variant"] == "ablation"
+        assert schwarz_record["production_selectable"] is False
+        assert schwarz_record["trace_solver"] == "native-rank1-fp64"
+        assert schwarz_record["trace_preconditioner"] == \
+            "native_element_schwarz_fp64"
+        assert (
+            schwarz_record["trace_ilu_type"],
+            schwarz_record["trace_ilu_level_of_fill"],
+            schwarz_record["trace_ilu_local_reordering"],
+            schwarz_record["trace_ilu_application_iterations"],
+        ) == (-1, -1, -1, 0)
+        assert schwarz_record["trace_ilu_factor_reuse_policy"] == \
+            "not_applicable"
+        assert schwarz_record["trace_ilu_triangular_solve_kind"] == \
+            "not_applicable"
+        for sample in schwarz_record["samples"]:
+            tensor = sample["tensor_core"]
+            assert tensor["native_rank1_trace_solve_calls"] == \
+                sample["linear_solve_attempts"]
+            assert tensor["hypre_trace_solve_calls"] == 0
+            assert tensor["native_rank1_trace_solver_configured"] is True
+            assert tensor["hypre_mgr_rank1_trace_solver_configured"] is False
+            assert tensor["native_element_schwarz_configured"] is True
+            assert tensor[
+                "hypre_host_staged_rank2_trace_solver_configured"
+            ] is False
+            assert tensor["ilu_factor_setups"] == 0
+            assert tensor["ilu_factor_reuses"] == 0
+            assert tensor["ilu_preconditioner_callbacks_lower_bound"] == 0
+            assert tensor["ilu_preconditioner_callbacks_upper_bound"] == 0
+            assert tensor["equilibration_builds"] == 0
+            assert tensor["equilibration_passes"] == 0
+            assert tensor["mgr_setup_calls"] == 0
+            assert tensor["mgr_preconditioner_applications"] == 0
+            assert tensor["mgr_f_ilu_setups"] == 0
+            assert tensor["mgr_f_ilu_applications"] == 0
+            assert tensor["element_schwarz_patch_setups"] == \
+                sample["trace_solves"]
+            assert tensor[
+                "element_schwarz_preconditioner_applications"
+            ] == 9
+            assert tensor["element_schwarz_patch_rows"] == 60
+            assert tensor["element_schwarz_minimum_multiplicity"] == 2
+            assert tensor["element_schwarz_maximum_multiplicity"] == 2
+            assert not set(tensor).intersection({
+                "schwarz_history", "patch_history", "event_stream",
+                "flight_recorder", "replay",
+            })
+        schwarz_record_summary = CAMPAIGN.record_summary(schwarz_record)
+        assert all(
+            sample["element_schwarz_patch_rows"] == 60 and
+            sample["element_schwarz_patch_setups"] ==
+                sample["trace_solves"]
+            for sample in schwarz_record_summary["measured_sample_work"]
+        )
+        schwarz_work_summary = CAMPAIGN.work_summary(
+            [schwarz_record]
+        )["tensor_core"]
+        assert schwarz_work_summary["trace_solvers"] == [
+            "native-rank1-fp64"
+        ]
+        assert schwarz_work_summary[
+            "native_element_schwarz_configured_values"
+        ] == [True]
+        assert schwarz_work_summary[
+            "element_schwarz_patch_setups"
+        ]["total"] == 10
+        assert schwarz_work_summary[
+            "element_schwarz_preconditioner_applications"
+        ]["total"] == 45
+        assert schwarz_work_summary[
+            "element_schwarz_patch_rows"
+        ]["minimum"] == 60
+
+        def schwarz_rejected(record: dict) -> bool:
+            try:
+                CAMPAIGN.validate_record(
+                    record, **schwarz_validation_arguments
+                )
+            except CAMPAIGN.CampaignError:
+                return True
+            return False
+
+        for field, value in (
+                ("hypre_trace_solve_calls", 1),
+                ("ilu_factor_setups", 1),
+                ("mgr_setup_calls", 1),
+                ("element_schwarz_patch_setups", 1),
+                ("element_schwarz_preconditioner_applications", 7),
+                ("element_schwarz_patch_rows", 40),
+                ("element_schwarz_minimum_multiplicity", 0),
+                ("element_schwarz_maximum_multiplicity", 3)):
+            invalid_schwarz = copy.deepcopy(schwarz_record)
+            invalid_schwarz["samples"][1]["tensor_core"][field] = value
+            assert schwarz_rejected(invalid_schwarz), field
+        invalid_schwarz_flag = copy.deepcopy(schwarz_record)
+        invalid_schwarz_flag["samples"][1]["tensor_core"][
+            "native_element_schwarz_configured"
+        ] = False
+        assert schwarz_rejected(invalid_schwarz_flag)
+        invalid_schwarz_solver = copy.deepcopy(schwarz_record)
+        invalid_schwarz_solver["trace_solver"] = "hypre-parcsr-gmres"
+        assert schwarz_rejected(invalid_schwarz_solver)
+        invalid_schwarz_preconditioner = copy.deepcopy(schwarz_record)
+        invalid_schwarz_preconditioner["trace_preconditioner"] = \
+            "hypre_ilu0"
+        assert schwarz_rejected(invalid_schwarz_preconditioner)
+        invalid_schwarz_rank = copy.deepcopy(schwarz_record)
+        invalid_schwarz_rank["rank_count"] = 2
+        assert schwarz_rejected(invalid_schwarz_rank)
+        for engine, mode in (
+                ("ordinary", "igr"),
+                ("ordinary", "conventional"),
+                ("tensor", "conventional")):
+            try:
+                CAMPAIGN.final_command(
+                    final,
+                    engine=engine,
+                    mode=mode,
+                    order=2,
+                    mesh_n=12,
+                    domain_periods=3,
+                    timestep=1.0e-5,
+                    export=False,
+                    expected_build=explicit_build,
+                    trace_policy="native-element-schwarz-fp64",
+                )
+            except CAMPAIGN.CampaignError:
+                pass
+            else:
+                raise AssertionError(
+                    "element-Schwarz command admitted an unsupported "
+                    "engine/mode"
+                )
+
         output = root / "evidence"
         command = [
             sys.executable,
@@ -1243,6 +1488,21 @@ def main() -> int:
         assert CAMPAIGN.expected_trace_solver_configuration(
             "tensor", "igr", "equilibrated-mgr"
         ) == ("hypre-fgmres-mgr-rank1", False, True, False)
+        assert CAMPAIGN.expected_trace_preconditioner(
+            "tensor", "igr", "native-element-schwarz-fp64"
+        ) == "native_element_schwarz_fp64"
+        assert CAMPAIGN.expected_trace_ilu_policy(
+            "tensor", "igr", "native-element-schwarz-fp64"
+        ) == (-1, -1, -1, 0)
+        assert CAMPAIGN.expected_trace_ilu_triangular_solve_policy(
+            "tensor", "igr", "native-element-schwarz-fp64"
+        ) == ("not_applicable", 0, 0, 0)
+        assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
+            "tensor", "igr", "native-element-schwarz-fp64"
+        ) == "not_applicable"
+        assert CAMPAIGN.expected_trace_solver_configuration(
+            "tensor", "igr", "native-element-schwarz-fp64"
+        ) == ("native-rank1-fp64", True, False, False)
         for engine, mode in (
                 ("ordinary", "igr"),
                 ("ordinary", "conventional"),
