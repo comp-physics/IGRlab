@@ -1576,8 +1576,9 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
   const int scalar_face_rows = order + 1;
   const int patch_rows = 20 * scalar_face_rows;
   const int face_rows = 5 * scalar_face_rows;
-  const int shared_rows = face_rows;
-  const int true_rows = 2 * patch_rows - shared_rows;
+  const int scalar_patch_rows = 4 * scalar_face_rows;
+  const int scalar_true_rows = 2 * scalar_patch_rows - scalar_face_rows;
+  const int true_rows = 5 * scalar_true_rows;
   constexpr int elements = 2;
   const int patch_entries = patch_rows * patch_rows;
   const int element_slots = elements * patch_rows;
@@ -1650,11 +1651,17 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
   std::vector<int> signed_dofs(static_cast<std::size_t>(element_slots));
   for (int row = 0; row < patch_rows; ++row)
   {
-    true_dof[static_cast<std::size_t>(row)] = row;
-    signed_dofs[static_cast<std::size_t>(row)] = -1 - row;
-    const int second_truth = row < shared_rows
-        ? 3 * face_rows + row
-        : patch_rows + row - shared_rows;
+    const int face = row / face_rows;
+    const int face_row = row % face_rows;
+    const int component = face_row / scalar_face_rows;
+    const int scalar = face_row % scalar_face_rows;
+    const int local_scalar = face * scalar_face_rows + scalar;
+    const int first_truth =
+        component * scalar_true_rows + local_scalar;
+    const int second_truth = component * scalar_true_rows +
+        3 * scalar_face_rows + local_scalar;
+    true_dof[static_cast<std::size_t>(row)] = first_truth;
+    signed_dofs[static_cast<std::size_t>(row)] = -1 - first_truth;
     true_dof[static_cast<std::size_t>(patch_rows + row)] = second_truth;
     signed_dofs[static_cast<std::size_t>(patch_rows + row)] = second_truth;
   }
@@ -1684,6 +1691,10 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
       return false;
     sigma_class[static_cast<std::size_t>(truth)] = local_sigma;
   }
+  for (int row = 0; row < true_rows; ++row)
+    if (sigma_class[static_cast<std::size_t>(row)] !=
+        (row >= 4 * scalar_true_rows ? 1 : 0))
+      return false;
 
   std::vector<int> local_for_truth(
       static_cast<std::size_t>(elements) * true_rows, -1);

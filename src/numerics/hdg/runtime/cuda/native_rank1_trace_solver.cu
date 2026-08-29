@@ -690,6 +690,9 @@ __device__ void ValidateFixedSigmaJacobiRows(
   const int thread = GlobalThreadIndex();
   const int stride = GlobalThreadStride();
   const int patch_rows = schwarz.patch_rows;
+  const int sigma_begin = 4 * (schwarz.true_rows / 5);
+  if (thread == 0 && schwarz.true_rows % 5 != 0)
+    MarkFailure(control, failure_invalid_preconditioner);
   for (int row = thread; row < schwarz.true_rows; row += stride)
   {
     int sigma_field = -1;
@@ -709,6 +712,8 @@ __device__ void ValidateFixedSigmaJacobiRows(
       sigma_field = incidence_sigma;
     }
     if (sigma_field < 0)
+      MarkFailure(control, failure_invalid_preconditioner);
+    if (sigma_field != (row >= sigma_begin ? 1 : 0))
       MarkFailure(control, failure_invalid_preconditioner);
     workspace.permutation_marks[row] = sigma_field;
   }
@@ -1416,15 +1421,25 @@ __device__ void ApplyFixedSigmaJacobiPreconditioner(
     NativeTraceSolveControl* control,
     const cg::grid_group& grid) noexcept
 {
-  ApplyPreconditioner(system, preconditioner, workspace, input, output,
-                      control, grid);
-  if (control->failure_mask != 0) return;
-
-  const NativeTraceElementSchwarzView schwarz =
-      preconditioner.element_schwarz;
   const int rows = system.matrix.rows;
   const int thread = GlobalThreadIndex();
   const int stride = GlobalThreadStride();
+  const int sigma_begin = 4 * (rows / 5);
+  double* const next_sigma = workspace.vectors + rows;
+  double* const saved_sigma_rhs = workspace.vectors +
+      2 * static_cast<std::size_t>(rows);
+
+  // The final GMRES update intentionally permits input == output. Preserve
+  // the original component-major sigma RHS before the exact local predictor
+  // writes output; the third existing IGR vector is otherwise unused by the
+  // element-Schwarz path.
+  for (int row = sigma_begin + thread; row < rows; row += stride)
+    saved_sigma_rhs[row] = input[row];
+  grid.sync();
+
+  ApplyPreconditioner(system, preconditioner, workspace, input, output,
+                      control, grid);
+  if (control->failure_mask != 0) return;
 
   // The exact local lower field split above supplies a nonzero stationary
   // predictor. Refine only the scalar global sigma rows with three fixed
@@ -1432,40 +1447,10 @@ __device__ void ApplyFixedSigmaJacobiPreconditioner(
   // block-GS preconditioner refinement rather than a replacement for the
   // coupled U7/Uhat5 system. The authoritative outer GMRES and
   // application-level FP64 true-residual rebuild remain unchanged.
-  double* const next_sigma = workspace.vectors + rows;
   for (int sweep = 0; sweep < native_trace_sigma_jacobi_sweeps; ++sweep)
   {
-    for (int row = thread; row < rows; row += stride)
+    for (int row = sigma_begin + thread; row < rows; row += stride)
     {
-      if (workspace.permutation_marks[row] != 1) continue;
-      int rhs_slot = -1;
-      for (int incidence = 0;
-           incidence < native_trace_schwarz_maximum_incidence;
-           ++incidence)
-      {
-        const int slot = schwarz.true_incidence_slots[
-            native_trace_schwarz_maximum_incidence * row + incidence];
-        if (slot >= 0)
-        {
-          rhs_slot = slot;
-          break;
-        }
-      }
-      if (rhs_slot < 0)
-      {
-        MarkFailure(control, failure_invalid_preconditioner);
-        continue;
-      }
-      double rhs_sign = 1.0;
-      const int rhs_truth = DecodeSignedDof(
-          schwarz.signed_element_true_dofs[rhs_slot], rhs_sign);
-      if (rhs_truth != row)
-      {
-        MarkFailure(control, failure_invalid_preconditioner);
-        continue;
-      }
-      const double rhs_value =
-          rhs_sign * schwarz.element_rhs[rhs_slot];
       const int begin = system.matrix.row_offsets[row];
       const int end = system.matrix.row_offsets[row + 1];
       double action = 0.0;
@@ -1475,15 +1460,14 @@ __device__ void ApplyFixedSigmaJacobiPreconditioner(
       const double diagonal = system.matrix.values[begin];
       const double value = output[row] +
           native_trace_sigma_jacobi_damping *
-              (rhs_value - action) / diagonal;
+              (saved_sigma_rhs[row] - action) / diagonal;
       next_sigma[row] = value;
       if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
     }
     grid.sync();
     if (control->failure_mask != 0) return;
-    for (int row = thread; row < rows; row += stride)
-      if (workspace.permutation_marks[row] == 1)
-        output[row] = next_sigma[row];
+    for (int row = sigma_begin + thread; row < rows; row += stride)
+      output[row] = next_sigma[row];
     grid.sync();
   }
 }
@@ -2311,7 +2295,7 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
   if (!requirements.valid || workspace_overlap || !support.supported ||
       support.fixed_sigma_jacobi != use_fixed_sigma_jacobi ||
       (use_fixed_sigma_jacobi &&
-       (!use_element_schwarz ||
+       (system.matrix.rows % 5 != 0 || !use_element_schwarz ||
         !NativeTracePreconditionerIsEquilibratedFieldSplit(
             kernel_preconditioner_kind))) ||
       cudaGetDevice(&current_device) != cudaSuccess ||
