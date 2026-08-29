@@ -1996,7 +1996,7 @@ bool CudaLaunchFreezeBorrowedCurrentLlfTau(const CudaDeviceView& view,
 enum class CudaBorrowedAssemblyKind : std::uint8_t
 {
   ordinary_split = 0,
-  tensor_fused = 1
+  tensor_volume = 1
 };
 enum class CudaBorrowedRecoveryKind : std::uint8_t
 {

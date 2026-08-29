@@ -68,6 +68,21 @@ set_tests_properties(hdg_runtime_native_element_schwarz_plan PROPERTIES
   LABELS "hdg;runtime;cpu;cuda-contract;schwarz"
   TIMEOUT 60)
 
+add_executable(dg_igr_hdg_tensor_volume_layout_test
+  test_tensor_volume_layout.cpp)
+target_include_directories(dg_igr_hdg_tensor_volume_layout_test
+  PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_compile_options(dg_igr_hdg_tensor_volume_layout_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+set_target_properties(dg_igr_hdg_tensor_volume_layout_test PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+add_test(NAME hdg_runtime_tensor_volume_layout
+  COMMAND dg_igr_hdg_tensor_volume_layout_test)
+set_tests_properties(hdg_runtime_tensor_volume_layout PROPERTIES
+  PROCESSORS 1
+  LABELS "hdg;runtime;cpu;cuda-contract;tensor;assembly"
+  TIMEOUT 60)
+
 if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
   add_executable(dg_igr_hdg_runtime_w8c_cpu_serial_test
     independent_oracle.cpp

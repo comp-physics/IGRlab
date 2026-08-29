@@ -200,6 +200,15 @@ struct CudaBorrowedAssemblyFusionAudit
       std::numeric_limits<double>::infinity(),
       std::numeric_limits<double>::infinity(),
       std::numeric_limits<double>::infinity()}};
+  std::array<double, 8> maximum_scaled_errors{{
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity()}};
   std::array<bool, 8> bitwise_equal{};
   int elements = 0;
   int interior_dofs = 0;
@@ -410,7 +419,7 @@ struct CudaQualificationTestAccess
       return numerics.CollectiveContinue(copied);
     };
     if (!launch_and_copy(CudaBorrowedAssemblyKind::ordinary_split, split) ||
-        !launch_and_copy(CudaBorrowedAssemblyKind::tensor_fused, fused))
+        !launch_and_copy(CudaBorrowedAssemblyKind::tensor_volume, fused))
       return false;
 
     const std::array<const std::vector<double>*, 8> split_products{{
@@ -419,27 +428,52 @@ struct CudaQualificationTestAccess
     const std::array<const std::vector<double>*, 8> fused_products{{
         &fused.residual_r, &fused.residual_g, &fused.a, &fused.b,
         &fused.c, &fused.d, &fused.f, &fused.g}};
-    bool exact = true;
+    bool within_tolerance = true;
+    // Only residual_r, A, and f contain the reordered volume contraction.
+    // Their at-most three products per quadrature point stay under a strict
+    // FP64, dimension-scaled roundoff envelope.  Face-only products retain
+    // their existing bitwise gate, proving that the zero/face leaves did not
+    // change.  This is a test comparison bound, not a solver tolerance.
+    const double tensor_tolerance = 1024.0 *
+        std::numeric_limits<double>::epsilon() *
+        static_cast<double>(std::max(1, shape.volume_points));
     for (std::size_t product = 0; product < split_products.size(); ++product)
     {
       const auto& left = *split_products[product];
       const auto& right = *fused_products[product];
       audit.maximum_absolute_errors[product] = 0.0;
+      audit.maximum_scaled_errors[product] = 0.0;
       audit.bitwise_equal[product] = left == right;
       bool finite = left.size() == right.size();
       for (std::size_t index = 0; finite && index < left.size(); ++index)
       {
         finite = std::isfinite(left[index]) && std::isfinite(right[index]);
         if (finite)
+        {
+          const double difference = std::abs(left[index] - right[index]);
           audit.maximum_absolute_errors[product] = std::max(
               audit.maximum_absolute_errors[product],
-              std::abs(left[index] - right[index]));
+              difference);
+          const double scale = std::max(
+              {1.0, std::abs(left[index]), std::abs(right[index])});
+          audit.maximum_scaled_errors[product] = std::max(
+              audit.maximum_scaled_errors[product], difference / scale);
+        }
       }
       if (!finite)
+      {
         audit.maximum_absolute_errors[product] =
             std::numeric_limits<double>::infinity();
+        audit.maximum_scaled_errors[product] =
+            std::numeric_limits<double>::infinity();
+      }
       audit.bitwise_equal[product] = audit.bitwise_equal[product] && finite;
-      exact = exact && audit.bitwise_equal[product];
+      const bool reordered_volume_product =
+          product == 0 || product == 2 || product == 6;
+      within_tolerance = within_tolerance && finite &&
+          (reordered_volume_product
+               ? audit.maximum_scaled_errors[product] <= tensor_tolerance
+               : audit.bitwise_equal[product]);
     }
     audit.status_bitwise_equal = split.status == fused.status;
     audit.status_all_passed = std::all_of(
@@ -448,7 +482,8 @@ struct CudaQualificationTestAccess
     audit.elements = shape.elements;
     audit.interior_dofs = shape.interior_dofs;
     audit.trace_dofs = shape.trace_dofs;
-    return exact && audit.status_bitwise_equal && audit.status_all_passed;
+    return within_tolerance && audit.status_bitwise_equal &&
+        audit.status_all_passed;
   }
 
   static bool AuditBorrowedAssemblyFusion(
@@ -3285,7 +3320,7 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
     MPI_Comm_rank(request.communicator, &rank);
     if (rank == 0)
     {
-      std::cerr << "CUDA split/fused borrowed assembly mismatch order="
+      std::cerr << "CUDA split/tensor-volume assembly mismatch order="
                 << order << " regularization=" << (igr ? "igr" : "none")
                 << " dimensions=" << assembly_fusion_audit.elements << 'x'
                 << assembly_fusion_audit.interior_dofs << 'x'
@@ -3296,6 +3331,10 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
       std::cerr << " exact=";
       for (const bool exact : assembly_fusion_audit.bitwise_equal)
         std::cerr << ' ' << exact;
+      std::cerr << " scaled=";
+      for (const double error :
+           assembly_fusion_audit.maximum_scaled_errors)
+        std::cerr << ' ' << error;
       std::cerr << " status="
                 << assembly_fusion_audit.status_bitwise_equal << '/'
                 << assembly_fusion_audit.status_all_passed << '\n';

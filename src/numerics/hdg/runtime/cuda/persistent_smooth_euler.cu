@@ -1,5 +1,6 @@
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler.cuh"
 #include "numerics/hdg/runtime/cuda/native_rank1_trace_solver.cuh"
+#include "numerics/hdg/runtime/cuda/tensor_volume_layout.hpp"
 #include "physics/bc/detail/euler_boundary_state.hpp"
 
 #include <HYPRE_krylov.h>
@@ -4092,38 +4093,420 @@ __global__ void BorrowedEulerFaceKernel(CudaDeviceView v,CudaMeshShape s,
       v,s,frozen_llf,e,lane,group_mask,caches[group]);
 }
 
-// Tensor selection fuses only the element-local Zero -> Volume -> Face
-// sequence.  The explicit group barriers replace the grid-wide launch
-// boundaries for the one element owned by each four-lane group; no product is
-// shared between elements.  Condensation deliberately remains a separate
-// launch because its one-block-per-element mapping and synchronization domain
-// do not match this assembly mapping.
-__global__ void BorrowedEulerFusedAssemblyKernel(
-    CudaDeviceView v,CudaMeshShape s,double dt)
+// The tensor volume leaf retains the existing Zero and Face kernels.  Between
+// them it streams exact FP64 point coefficients through solve_workspace,
+// whose subsequent condensation use starts only after assembly completes.
+// The compact q-major slots are:
+//   conventional [0,44): T[4], Fx[4], Fy[4], Jx[4][4], Jy[4][4];
+//   IGR [0,52):    T[4], Fx[4], Fy[4], Jx[4][5], Jy[4][5];
+//   IGR [52,66):   rho,sigma,zx,zy,Q,
+//                  dQ_b=(a_b,bx_b,by_b), b=(rho,rho*u,rho*v).
+// T is (U-Uold)/dt-source.  The weight and basis tables remain authoritative
+// immutable inputs and are deliberately not duplicated in scratch.
+__device__ double BorrowedEulerTensorDqVariation(
+    const BorrowedVolumeCache& cache,const int variable,
+    const double column_phi,const double column_dx,
+    const double column_dy)
 {
+  double dq=0.0;
+  if(variable<3)
+    for(int velocity=0;velocity<dimension;++velocity)
+      for(int direction=0;direction<dimension;++direction)
+      {
+        const double momentum=cache.state[1+velocity];
+        const double momentum_derivative=
+            cache.conservative_gradient[1+velocity][direction];
+        const double density_derivative=
+            cache.conservative_gradient[0][direction];
+        const double column_derivative=direction==0?column_dx:column_dy;
+        const double delta_density=variable==0?column_phi:0.0;
+        const double delta_density_derivative=variable==0?
+            column_derivative:0.0;
+        const double delta_momentum=variable==1+velocity?
+            column_phi:0.0;
+        const double delta_momentum_derivative=variable==1+velocity?
+            column_derivative:0.0;
+        const double delta_gradient=
+            delta_momentum_derivative/cache.state[0]-
+            momentum_derivative*delta_density/
+                (cache.state[0]*cache.state[0])-
+            delta_momentum*density_derivative/
+                (cache.state[0]*cache.state[0])-
+            momentum*delta_density_derivative/
+                (cache.state[0]*cache.state[0])+
+            2.0*momentum*density_derivative*delta_density/
+                (cache.state[0]*cache.state[0]*cache.state[0]);
+        dq+=cache.dq_dgradient[velocity][direction]*delta_gradient;
+      }
+  return dq;
+}
+
+__device__ bool BorrowedEulerTensorVolumeCoefficientPoint(
+    CudaDeviceView v,CudaMeshShape s,double dt,const int e,const int q,
+    const int lane,const unsigned group_mask,BorrowedVolumeCache& cache,
+    double* coefficient)
+{
+  const int si=s.scalar_interior_dofs;
+  const int e_i=e*s.interior_dofs;
+  const int qp=e*s.volume_points+q;
+  if(lane==0)
+  {
+    cache.weight=v.volume_weight[qp];cache.q_value=0.0;cache.valid=1;
+  }
+  cache.state[lane]=0.0;cache.old[lane]=0.0;
+  cache.source[lane]=0.0;cache.flux_x[lane]=0.0;
+  cache.flux_y[lane]=0.0;
+  for(int entry=0;entry<igr_trace_components;++entry)
+  {
+    cache.jacobian_x[lane*igr_trace_components+entry]=0.0;
+    cache.jacobian_y[lane*igr_trace_components+entry]=0.0;
+  }
+  for(int a=0;a<si;++a)
+  {
+    const double phi=v.volume_shape[qp*si+a];
+    cache.state[lane]+=phi*v.work_interior[
+        e_i+ByNodes(a,si,lane)];
+    cache.old[lane]+=phi*v.old_interior[e_i+ByNodes(a,si,lane)];
+    if(s.borrowed_static_source)
+      cache.source[lane]+=phi*v.static_source[
+          e_i+ByNodes(a,si,lane)];
+  }
+  if(s.igr_active)
+  {
+    if(lane<3)
+    {
+      for(int direction=0;direction<dimension;++direction)
+        cache.conservative_gradient[lane][direction]=0.0;
+      for(int a=0;a<si;++a)
+        for(int direction=0;direction<dimension;++direction)
+          cache.conservative_gradient[lane][direction]+=
+              v.volume_derivative[(qp*si+a)*dimension+direction]*
+              v.work_interior[e_i+ByNodes(a,si,lane)];
+    }
+    else
+    {
+      cache.sigma=0.0;cache.z[0]=0.0;cache.z[1]=0.0;
+      for(int a=0;a<si;++a)
+      {
+        const double phi=v.volume_shape[qp*si+a];
+        cache.sigma+=phi*v.work_interior[e_i+ByNodes(a,si,4)];
+        cache.z[0]+=phi*v.work_interior[e_i+ByNodes(a,si,5)];
+        cache.z[1]+=phi*v.work_interior[e_i+ByNodes(a,si,6)];
+      }
+    }
+  }
+  __syncwarp(group_mask);
+  if(lane==0)
+  {
+    const bool flux_ready=s.igr_active
+        ? RegularizedFluxJacobian(cache.state,cache.sigma,1.0,0.0,
+                                  cache.flux_x,cache.jacobian_x)&&
+          RegularizedFluxJacobian(cache.state,cache.sigma,0.0,1.0,
+                                  cache.flux_y,cache.jacobian_y)
+        : FluxJacobian(cache.state,1.0,0.0,cache.flux_x,
+                       cache.jacobian_x)&&
+          FluxJacobian(cache.state,0.0,1.0,cache.flux_y,
+                       cache.jacobian_y);
+    if(!(cache.weight>0.0)||!flux_ready)cache.valid=0;
+    if(cache.valid&&s.igr_active)
+    {
+      for(int velocity=0;velocity<dimension;++velocity)
+        for(int direction=0;direction<dimension;++direction)
+          cache.velocity_gradient[velocity][direction]=
+              cache.conservative_gradient[1+velocity][direction]/
+                  cache.state[0]-cache.state[1+velocity]*
+              cache.conservative_gradient[0][direction]/
+                  (cache.state[0]*cache.state[0]);
+      const double velocity_trace=cache.velocity_gradient[0][0]+
+          cache.velocity_gradient[1][1];
+      cache.q_value=cache.velocity_gradient[0][0]*
+              cache.velocity_gradient[0][0]+
+          2.0*cache.velocity_gradient[0][1]*
+              cache.velocity_gradient[1][0]+
+          cache.velocity_gradient[1][1]*
+              cache.velocity_gradient[1][1]+
+          velocity_trace*velocity_trace;
+      for(int velocity=0;velocity<dimension;++velocity)
+        for(int direction=0;direction<dimension;++direction)
+          cache.dq_dgradient[velocity][direction]=
+              2.0*cache.velocity_gradient[direction][velocity]+
+              (velocity==direction?2.0*velocity_trace:0.0);
+    }
+  }
+  __syncwarp(group_mask);
+  if(!cache.valid)return false;
+
+  coefficient[detail::tensor_volume_temporal_offset+lane]=
+      (cache.state[lane]-cache.old[lane])/dt-cache.source[lane];
+  coefficient[detail::tensor_volume_flux_x_offset+lane]=cache.flux_x[lane];
+  coefficient[detail::tensor_volume_flux_y_offset+lane]=cache.flux_y[lane];
+  const int columns=s.igr_active?igr_trace_components:
+      conserved_components;
+  const int jacobian_y_offset=detail::tensor_volume_jacobian_x_offset+
+      conserved_components*columns;
+  for(int entry=lane;entry<conserved_components*columns;
+      entry+=borrowed_euler_group_threads)
+  {
+    coefficient[detail::tensor_volume_jacobian_x_offset+entry]=
+        cache.jacobian_x[entry];
+    coefficient[jacobian_y_offset+entry]=cache.jacobian_y[entry];
+  }
+  if(s.igr_active&&lane==0)
+  {
+    coefficient[detail::tensor_volume_igr_rho_offset]=cache.state[0];
+    coefficient[detail::tensor_volume_igr_sigma_offset]=cache.sigma;
+    coefficient[detail::tensor_volume_igr_z_x_offset]=cache.z[0];
+    coefficient[detail::tensor_volume_igr_z_y_offset]=cache.z[1];
+    coefficient[detail::tensor_volume_igr_q_offset]=cache.q_value;
+    for(int variable=0;variable<3;++variable)
+    {
+      coefficient[detail::tensor_volume_igr_dq_offset+variable*3]=
+          BorrowedEulerTensorDqVariation(
+              cache,variable,1.0,0.0,0.0);
+      coefficient[detail::tensor_volume_igr_dq_offset+variable*3+1]=
+          BorrowedEulerTensorDqVariation(
+              cache,variable,0.0,1.0,0.0);
+      coefficient[detail::tensor_volume_igr_dq_offset+variable*3+2]=
+          BorrowedEulerTensorDqVariation(
+              cache,variable,0.0,0.0,1.0);
+    }
+  }
+  __syncwarp(group_mask);
+  return true;
+}
+
+__global__ void BorrowedEulerTensorVolumeCoefficientKernel(
+    CudaDeviceView v,CudaMeshShape s,double dt,const int q_begin,
+    const int q_count,const int coefficient_stride)
+{
+  const int e=blockIdx.x;
+  if(e>=s.elements)return;
   const int group=threadIdx.x/borrowed_euler_group_threads;
   const int lane=threadIdx.x%borrowed_euler_group_threads;
   const int warp_lane=threadIdx.x%borrowed_euler_warp_threads;
   const unsigned group_mask=borrowed_euler_group_mask<<
       (warp_lane-lane);
-  const int e=blockIdx.x*borrowed_euler_elements_per_block+group;
-  if(e>=s.elements)return;
-  __shared__ BorrowedVolumeCache volume_caches[
-      borrowed_euler_elements_per_block];
-  __shared__ BorrowedFaceCache face_caches[
-      borrowed_euler_elements_per_block];
-  BorrowedEulerZeroElement(v,s,e,lane);
-  // Zeroing is lane-striped; all products and status must be visible to the
-  // group before any volume accumulation begins.
-  __syncwarp(group_mask);
-  if(!BorrowedEulerVolumeElement(
-         v,s,dt,e,lane,group_mask,volume_caches[group]))return;
-  // The volume helper ends every quadrature point with this same barrier.  An
-  // explicit stage barrier documents and enforces the Volume -> Face edge if
-  // that helper's loop is later specialized for a zero-point shape.
-  __syncwarp(group_mask);
-  (void)BorrowedEulerFaceElement(
-      v,s,false,e,lane,group_mask,face_caches[group]);
+  const std::size_t workspace_doubles=
+      static_cast<std::size_t>(s.interior_dofs)*(s.trace_dofs+1);
+  double* scratch=v.solve_workspace+
+      static_cast<std::size_t>(e)*workspace_doubles;
+  __shared__ BorrowedVolumeCache caches[borrowed_euler_elements_per_block];
+  __shared__ int failed;
+  if(threadIdx.x==0)failed=0;
+  __syncthreads();
+  for(int local_q=group;local_q<q_count;
+      local_q+=borrowed_euler_elements_per_block)
+  {
+    double* coefficient=scratch+
+        static_cast<std::size_t>(local_q)*coefficient_stride;
+    const bool valid=BorrowedEulerTensorVolumeCoefficientPoint(
+        v,s,dt,e,q_begin+local_q,lane,group_mask,caches[group],coefficient);
+    if(!valid&&lane==0)atomicExch(&failed,1);
+  }
+  __syncthreads();
+  if(threadIdx.x==0&&failed)v.status[e]=-1.0;
+}
+
+__device__ __forceinline__ double BorrowedEulerTensorVolumeRight(
+    CudaDeviceView v,CudaMeshShape s,double dt,const double* coefficient,
+    const int qp,const int row_component,const int output_column,
+    const int feature)
+{
+  const double weight=v.volume_weight[qp];
+  const int ni=s.interior_dofs;
+  if(output_column==ni)
+  {
+    if(row_component<conserved_components)
+    {
+      if(feature==0)
+        return weight*coefficient[
+            detail::tensor_volume_temporal_offset+row_component];
+      if(feature==1)
+        return -weight*coefficient[
+            detail::tensor_volume_flux_x_offset+row_component];
+      return -weight*coefficient[
+          detail::tensor_volume_flux_y_offset+row_component];
+    }
+    if(!s.igr_active)return 0.0;
+    const double rho=coefficient[detail::tensor_volume_igr_rho_offset];
+    const double sigma=coefficient[detail::tensor_volume_igr_sigma_offset];
+    if(row_component<6)
+    {
+      const int direction=row_component-4;
+      if(feature==0)
+        return weight*rho*coefficient[
+            detail::tensor_volume_igr_z_x_offset+direction];
+      return feature==direction+1?weight*sigma:0.0;
+    }
+    if(feature==0)
+      return weight*(sigma/rho-s.igr_alpha*
+          coefficient[detail::tensor_volume_igr_q_offset]);
+    return weight*s.igr_alpha*coefficient[
+        detail::tensor_volume_igr_z_x_offset+feature-1];
+  }
+  if(output_column<0||output_column>=ni)return 0.0;
+  const int si=s.scalar_interior_dofs;
+  const int column_component=output_column/si;
+  const int column=output_column-column_component*si;
+  const double column_phi=v.volume_shape[qp*si+column];
+  const double column_dx=v.volume_derivative[
+      (qp*si+column)*dimension];
+  const double column_dy=v.volume_derivative[
+      (qp*si+column)*dimension+1];
+  if(row_component<conserved_components)
+  {
+    const int columns=s.igr_active?igr_trace_components:
+        conserved_components;
+    if(column_component>=columns)return 0.0;
+    if(feature==0)
+      return row_component==column_component?
+          weight*column_phi/dt:0.0;
+    const int base=feature==1?
+        detail::tensor_volume_jacobian_x_offset:
+        detail::tensor_volume_jacobian_x_offset+
+            conserved_components*columns;
+    return -weight*coefficient[
+        base+row_component*columns+column_component]*column_phi;
+  }
+  if(!s.igr_active)return 0.0;
+  const double rho=coefficient[detail::tensor_volume_igr_rho_offset];
+  const double sigma=coefficient[detail::tensor_volume_igr_sigma_offset];
+  if(row_component<6)
+  {
+    const int direction=row_component-4;
+    if(column_component==0&&feature==0)
+      return weight*coefficient[
+          detail::tensor_volume_igr_z_x_offset+direction]*column_phi;
+    if(column_component==4&&feature==direction+1)
+      return weight*column_phi;
+    if(column_component==5+direction&&feature==0)
+      return weight*rho*column_phi;
+    return 0.0;
+  }
+  if(column_component<3&&feature==0)
+  {
+    const int dq_offset=detail::tensor_volume_igr_dq_offset+
+        column_component*3;
+    const double dq=coefficient[dq_offset]*column_phi+
+        coefficient[dq_offset+1]*column_dx+
+        coefficient[dq_offset+2]*column_dy;
+    double derivative=-s.igr_alpha*dq;
+    if(column_component==0)
+      derivative-=sigma*column_phi/(rho*rho);
+    return weight*derivative;
+  }
+  if(column_component==4&&feature==0)
+    return weight*column_phi/rho;
+  if(column_component==5&&feature==1)
+    return weight*s.igr_alpha*column_phi;
+  if(column_component==6&&feature==2)
+    return weight*s.igr_alpha*column_phi;
+  return 0.0;
+}
+
+// One block owns one (element,row-component) slab.  Each warp owns complete
+// 8x8 output tiles, accumulates all q and phi/dx/dy products in FP64 m8n8k4
+// fragments, then writes each A/residual entry exactly once per deterministic
+// quadrature chunk.  The first chunk assigns; later chunks add one completed
+// tile.  No atomics or cross-element ordering are involved.
+__global__ void BorrowedEulerTensorVolumeContractionKernel(
+    CudaDeviceView v,CudaMeshShape s,double dt,const int q_begin,
+    const int q_count,const int coefficient_stride,const bool first_chunk)
+{
+  const int e=blockIdx.x;
+  const int row_component=blockIdx.y;
+  if(e>=s.elements||row_component>=s.interior_components||
+     v.status[e]!=1.0)return;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  constexpr int tensor_warps=4;
+  const int warp=threadIdx.x/warpSize,lane=threadIdx.x%warpSize;
+  const int si=s.scalar_interior_dofs,ni=s.interior_dofs;
+  const int row_tiles=(si+7)/8;
+  const int column_tiles=(ni+1+7)/8;
+  const std::size_t workspace_doubles=
+      static_cast<std::size_t>(ni)*(s.trace_dofs+1);
+  const double* scratch=v.solve_workspace+
+      static_cast<std::size_t>(e)*workspace_doubles;
+  const std::size_t ao=static_cast<std::size_t>(e)*ni*ni;
+  const int e_i=e*ni;
+  __shared__ __align__(32) double tensor_a[tensor_warps][8*4];
+  __shared__ __align__(32) double tensor_b[tensor_warps][4*8];
+  __shared__ __align__(32) double tensor_product[tensor_warps][8*8];
+  double* warp_a=tensor_a[warp];
+  double* warp_b=tensor_b[warp];
+  double* warp_product=tensor_product[warp];
+  for(int tile=warp;tile<row_tiles*column_tiles;tile+=tensor_warps)
+  {
+    const int row_tile=tile/column_tiles;
+    const int column_tile=tile-row_tile*column_tiles;
+    const int row_base=row_tile*8,column_base=column_tile*8;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator,8,8,4,double>
+        accumulator;
+    nvcuda::wmma::fill_fragment(accumulator,0.0);
+    for(int q_base=0;q_base<q_count;q_base+=4)
+      for(int feature=0;feature<dimension+1;++feature)
+      {
+        const int local_row=lane/4,local_inner=lane%4;
+        const int row=row_base+local_row;
+        const int local_q=q_base+local_inner;
+        if(row<si&&local_q<q_count)
+        {
+          const int qp=e*s.volume_points+q_begin+local_q;
+          warp_a[lane]=feature==0?v.volume_shape[qp*si+row]:
+              v.volume_derivative[(qp*si+row)*dimension+feature-1];
+        }
+        else warp_a[lane]=0.0;
+        const int right_inner=lane/8,right_column=lane%8;
+        const int right_q=q_base+right_inner;
+        const int output_column=column_base+right_column;
+        if(right_q<q_count&&output_column<=ni)
+        {
+          const int qp=e*s.volume_points+q_begin+right_q;
+          const double* coefficient=scratch+
+              static_cast<std::size_t>(right_q)*coefficient_stride;
+          warp_b[lane]=BorrowedEulerTensorVolumeRight(
+              v,s,dt,coefficient,qp,row_component,output_column,feature);
+        }
+        else warp_b[lane]=0.0;
+        __syncwarp();
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,8,8,4,double,
+                              nvcuda::wmma::row_major> matrix_a;
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
+                              nvcuda::wmma::row_major> matrix_b;
+        nvcuda::wmma::load_matrix_sync(matrix_a,warp_a,4);
+        nvcuda::wmma::load_matrix_sync(matrix_b,warp_b,8);
+        nvcuda::wmma::mma_sync(
+            accumulator,matrix_a,matrix_b,accumulator);
+      }
+    nvcuda::wmma::store_matrix_sync(
+        warp_product,accumulator,8,nvcuda::wmma::mem_row_major);
+    __syncwarp();
+    for(int item=lane;item<8*8;item+=warpSize)
+    {
+      const int row=row_base+item/8;
+      const int output_column=column_base+item%8;
+      if(row<si&&output_column<=ni)
+      {
+        const int output_row=ByNodes(row,si,row_component);
+        const double value=warp_product[item];
+        if(output_column==ni)
+        {
+          if(first_chunk)v.residual_r[e_i+output_row]=value;
+          else v.residual_r[e_i+output_row]+=value;
+        }
+        else
+        {
+          double& destination=v.a[ao+output_row*ni+output_column];
+          if(first_chunk)destination=value;
+          else destination+=value;
+        }
+      }
+    }
+    __syncwarp();
+  }
+#else
+  if(row_component==0&&threadIdx.x==0)v.status[e]=-1.0;
+#endif
 }
 
 __global__ void CondenseKernel(CudaDeviceView v,CudaMeshShape s)
@@ -5717,13 +6100,70 @@ bool LaunchBorrowedEulerStages(const CudaDeviceView& v,
       v,s,frozen_llf);
   return LaunchOk();
 }
-bool LaunchFusedBorrowedEulerAssembly(const CudaDeviceView& v,
-                                      const CudaMeshShape& s,
-                                      const double dt) noexcept
+bool LaunchTensorBorrowedEulerAssembly(const CudaDeviceView& v,
+                                       const CudaMeshShape& s,
+                                       const double dt) noexcept
 {
+  if(s.elements<=0||s.order<1||s.order>3)return false;
+  const int expected_components=s.igr_active?igr_interior_components:
+      conserved_components;
+  const int expected_trace_components=s.igr_active?igr_trace_components:
+      conserved_components;
+  const int expected_scalar_dofs=(s.order+1)*(s.order+1);
+  const int expected_face_dofs=s.order+1;
+  const auto scratch=detail::PlanTensorVolumeScratch(
+      s.interior_dofs,s.trace_dofs,s.volume_points,s.igr_active);
+  if(!scratch.valid||!isfinite(dt)||!(dt>0.0)||
+     s.scalar_interior_dofs!=expected_scalar_dofs||
+     s.scalar_face_dofs!=expected_face_dofs||
+     s.interior_components!=expected_components||
+     s.trace_components!=expected_trace_components||
+     s.interior_dofs!=expected_components*s.scalar_interior_dofs||
+     s.trace_dofs!=faces_per_element*expected_trace_components*
+         s.scalar_face_dofs||
+     s.volume_points<=0||s.volume_points>maximum_volume_points||
+     s.face_points<=0||s.face_points>maximum_face_points||
+     v.work_interior==nullptr||v.old_interior==nullptr||
+     v.current_local_trace==nullptr||v.residual_r==nullptr||
+     v.residual_g==nullptr||v.a==nullptr||v.b==nullptr||v.c==nullptr||
+     v.d==nullptr||v.f==nullptr||v.g==nullptr||v.status==nullptr||
+     v.solve_workspace==nullptr||v.volume_shape==nullptr||
+     v.volume_derivative==nullptr||v.volume_weight==nullptr||
+     v.face_interior_shape==nullptr||v.face_trace_shape==nullptr||
+     v.face_weight==nullptr||v.face_normal==nullptr||
+     (s.borrowed_static_source&&v.static_source==nullptr)||
+     (s.igr_active&&v.face_h==nullptr)||
+     (s.borrowed_static_boundary_policies&&
+       (v.boundary_policy_kind==nullptr||v.boundary_reference==nullptr||
+        v.boundary_pressure==nullptr)))
+    return false;
   const int blocks=(s.elements-1)/borrowed_euler_elements_per_block+1;
-  BorrowedEulerFusedAssemblyKernel<<<
-      blocks,borrowed_euler_block_threads>>>(v,s,dt);
+  BorrowedEulerZeroKernel<<<blocks,borrowed_euler_block_threads>>>(v,s);
+  if(!LaunchOk())return false;
+  bool first_chunk=true;
+  for(int q_begin=0;q_begin<s.volume_points;)
+  {
+    const int remaining=s.volume_points-q_begin;
+    const int q_count=remaining<scratch.chunk_points?
+        remaining:scratch.chunk_points;
+    if(q_count<=0||q_count>scratch.capacity_points||
+       (remaining>q_count&&q_count%detail::tensor_volume_mma_inner!=0))
+      return false;
+    BorrowedEulerTensorVolumeCoefficientKernel<<<
+        s.elements,borrowed_euler_block_threads>>>(
+            v,s,dt,q_begin,q_count,scratch.coefficient_stride);
+    if(!LaunchOk())return false;
+    const dim3 contraction_grid(
+        static_cast<unsigned>(s.elements),
+        static_cast<unsigned>(s.interior_components),1U);
+    BorrowedEulerTensorVolumeContractionKernel<<<
+        contraction_grid,borrowed_euler_block_threads>>>(
+            v,s,dt,q_begin,q_count,scratch.coefficient_stride,first_chunk);
+    if(!LaunchOk())return false;
+    q_begin+=q_count;
+    first_chunk=false;
+  }
+  BorrowedEulerFaceKernel<<<blocks,borrowed_euler_block_threads>>>(v,s,false);
   return LaunchOk();
 }
 } // namespace
@@ -5747,8 +6187,8 @@ bool CudaLaunchBorrowedAssembly(
   if(!s.borrowed_host_inputs||s.elements<=0)return false;
   if(kind==CudaBorrowedAssemblyKind::ordinary_split)
     return LaunchBorrowedEulerStages(v,s,dt,false);
-  if(kind==CudaBorrowedAssemblyKind::tensor_fused)
-    return LaunchFusedBorrowedEulerAssembly(v,s,dt);
+  if(kind==CudaBorrowedAssemblyKind::tensor_volume)
+    return LaunchTensorBorrowedEulerAssembly(v,s,dt);
   return false;
 }
 bool CudaLaunchAssembly(const CudaDeviceView& v,const CudaMeshShape& s,
@@ -5766,7 +6206,7 @@ bool CudaLaunchAssembly(const CudaDeviceView& v,const CudaMeshShape& s,
         v,s,dt,CudaBorrowedAssemblyKind::ordinary_split);
   if(engine==generic::CudaEngineKind::tensor_core)
     return CudaLaunchBorrowedAssembly(
-        v,s,dt,CudaBorrowedAssemblyKind::tensor_fused);
+        v,s,dt,CudaBorrowedAssemblyKind::tensor_volume);
   return false;
 }
 bool CudaLaunchFrozenBorrowedLlfAssembly(const CudaDeviceView& v,
