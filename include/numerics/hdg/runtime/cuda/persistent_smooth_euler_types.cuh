@@ -330,7 +330,8 @@ enum class CudaTracePolicyKind : std::uint8_t
   engine_default = 0,
   common_fast = 1,
   equilibrated_mgr = 2,
-  native_element_schwarz_fp64 = 3
+  native_element_schwarz_fp64 = 3,
+  native_element_schwarz_matrix_free_fp64 = 4
 };
 
 constexpr bool IsKnownCudaTracePolicyKind(
@@ -339,7 +340,9 @@ constexpr bool IsKnownCudaTracePolicyKind(
   return kind == CudaTracePolicyKind::engine_default ||
       kind == CudaTracePolicyKind::common_fast ||
       kind == CudaTracePolicyKind::equilibrated_mgr ||
-      kind == CudaTracePolicyKind::native_element_schwarz_fp64;
+      kind == CudaTracePolicyKind::native_element_schwarz_fp64 ||
+      kind ==
+          CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64;
 }
 
 constexpr const char* CudaTracePolicyKindName(
@@ -355,6 +358,8 @@ constexpr const char* CudaTracePolicyKindName(
     return "equilibrated-mgr";
   case CudaTracePolicyKind::native_element_schwarz_fp64:
     return "native-element-schwarz-fp64";
+  case CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64:
+    return "native-element-schwarz-matrix-free-fp64";
   }
   return "unknown";
 }
@@ -692,6 +697,14 @@ constexpr bool CudaTracePreconditionerIsNativeElementSchwarz(
       CudaTracePreconditionerKind::native_element_schwarz_fp64;
 }
 
+/** Benchmark-only exact element-Schur operator ablation. */
+constexpr bool CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+    const CudaTracePolicyKind kind) noexcept
+{
+  return kind ==
+      CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64;
+}
+
 constexpr CudaIluFactorReusePolicy CudaIluFactorReusePolicyForEngine(
     const generic::CudaEngineKind engine, const bool igr_active) noexcept
 {
@@ -882,7 +895,9 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
   // Benchmark-only native Schwarz admission. Rank, topology, and exact
   // p1--p3 patch-shape checks are completed by the private solver router and
   // initialization plan before any device setup is allowed.
-  if (selection == CudaTracePolicyKind::native_element_schwarz_fp64)
+  if (selection == CudaTracePolicyKind::native_element_schwarz_fp64 ||
+      selection ==
+          CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64)
   {
     if (engine != generic::CudaEngineKind::tensor_core || !igr_active)
       return result;
@@ -1017,6 +1032,7 @@ struct CudaTensorCoreEvidence
   std::uint64_t mgr_f_ilu_applications = 0;
   std::uint64_t element_schwarz_patch_setups = 0;
   std::uint64_t element_schwarz_preconditioner_applications = 0;
+  std::uint64_t native_matrix_free_trace_operator_applications = 0;
   int element_schwarz_patch_rows = 0;
   int element_schwarz_minimum_multiplicity = 0;
   int element_schwarz_maximum_multiplicity = 0;
@@ -1029,6 +1045,7 @@ struct CudaTensorCoreEvidence
   bool native_rank1_trace_solver_configured = false;
   bool hypre_mgr_rank1_trace_solver_configured = false;
   bool native_element_schwarz_configured = false;
+  bool native_matrix_free_trace_operator_configured = false;
   bool hypre_host_staged_rank2_trace_solver_configured = false;
   bool trace_solver_accounting_complete = false;
   bool ilu_accounting_complete = false;

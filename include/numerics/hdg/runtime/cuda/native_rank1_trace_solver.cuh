@@ -61,12 +61,23 @@ struct NativeTraceCsrView final
   int nonzeros = 0;
 };
 
+enum class NativeTraceOperatorKind : std::int32_t
+{
+  assembled_csr_fp64 = 1,
+  element_matrix_free_fp64 = 2
+};
+
 /** Current true-trace system and HYPRE-owned solution storage. */
 struct NativeTraceSystemView final
 {
   NativeTraceCsrView matrix{};
   const double* rhs = nullptr;
   double* solution = nullptr;
+  NativeTraceOperatorKind operator_kind =
+      NativeTraceOperatorKind::assembled_csr_fp64;
+  // Retained row-major [element][row][column] Schur blocks. Maps and the
+  // persistent element-action scratch are shared with the exact Schwarz view.
+  const double* element_schur = nullptr;
 };
 
 /**
@@ -135,6 +146,7 @@ struct alignas(8) NativeTraceSolveControl final
   int iterations = 0;
   int restart_cycles = 0;
   int preconditioner_applications = 0;
+  int operator_applications = 0;
   int actual_residual_checks = 0;
   double rhs_norm = 0.0;
   double initial_residual_norm = 0.0;
@@ -246,6 +258,7 @@ inline bool NativeTraceResultIsReadyForTrueResidual(
       result.iterations < 0 ||
       result.iterations > policy.maximum_iterations ||
       result.restart_cycles < 0 || result.preconditioner_applications < 0 ||
+      result.operator_applications < 0 ||
       result.actual_residual_checks <= 0 ||
       !std::isfinite(result.rhs_norm) || result.rhs_norm < 0.0 ||
       !std::isfinite(result.initial_residual_norm) ||

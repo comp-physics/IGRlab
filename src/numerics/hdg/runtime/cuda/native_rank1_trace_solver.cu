@@ -505,20 +505,87 @@ __device__ void SparseMatrixVector(
   grid.sync();
 }
 
-__device__ void ComputeActualResidual(
-    const NativeTraceSystemView system, double* residual,
+__device__ void ApplyTraceOperator(
+    const NativeTraceSystemView system,
+    const NativeTracePreconditionerView preconditioner,
+    const double* input, double* output,
     NativeTraceSolveControl* control,
     const cg::grid_group& grid) noexcept
 {
+  if (system.operator_kind == NativeTraceOperatorKind::assembled_csr_fp64)
+  {
+    SparseMatrixVector(system.matrix, input, output, control, grid);
+    return;
+  }
+
+  const NativeTraceElementSchwarzView schwarz =
+      preconditioner.element_schwarz;
+  const int patch_rows = schwarz.patch_rows;
+  const int element_slots = schwarz.elements * patch_rows;
+  const int thread = GlobalThreadIndex();
+  const int stride = GlobalThreadStride();
+  if (grid.thread_rank() == 0) ++control->operator_applications;
+  grid.sync();
+
+  // Exact FP64 T gather and row-major S_e action. Each element row is owned
+  // by one thread and accumulates columns in increasing local order.
+  for (int slot = thread; slot < element_slots; slot += stride)
+  {
+    const int element = slot / patch_rows;
+    const int row = slot - element * patch_rows;
+    const std::size_t row_offset =
+        (static_cast<std::size_t>(element) * patch_rows + row) * patch_rows;
+    const std::size_t map_offset =
+        static_cast<std::size_t>(element) * patch_rows;
+    double value = 0.0;
+    for (int column = 0; column < patch_rows; ++column)
+    {
+      double sign = 1.0;
+      const int truth = DecodeSignedDof(
+          schwarz.signed_element_true_dofs[map_offset + column], sign);
+      value += system.element_schur[row_offset + column] *
+          sign * input[truth];
+    }
+    schwarz.element_solution[slot] = value;
+    if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
+  }
+  grid.sync();
+
+  // Exact FP64 T^T reduction. Static incidence order makes the one/two-term
+  // sum deterministic and avoids global atomics.
+  for (int row = thread; row < system.matrix.rows; row += stride)
+  {
+    double value = 0.0;
+    for (int incidence = 0;
+         incidence < native_trace_schwarz_maximum_incidence; ++incidence)
+    {
+      const int slot = schwarz.true_incidence_slots[
+          native_trace_schwarz_maximum_incidence * row + incidence];
+      if (slot < 0) continue;
+      double sign = 1.0;
+      (void)DecodeSignedDof(
+          schwarz.signed_element_true_dofs[slot], sign);
+      value += sign * schwarz.element_solution[slot];
+    }
+    output[row] = value;
+    if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
+  }
+  grid.sync();
+}
+
+__device__ void ComputeActualResidual(
+    const NativeTraceSystemView system,
+    const NativeTracePreconditionerView preconditioner, double* residual,
+    NativeTraceSolveControl* control,
+    const cg::grid_group& grid) noexcept
+{
+  ApplyTraceOperator(system, preconditioner, system.solution, residual,
+                     control, grid);
   const int thread = GlobalThreadIndex();
   const int stride = GlobalThreadStride();
   for (int row = thread; row < system.matrix.rows; row += stride)
   {
-    double value = system.rhs[row];
-    for (int entry = system.matrix.row_offsets[row];
-         entry < system.matrix.row_offsets[row + 1]; ++entry)
-      value -= system.matrix.values[entry] *
-          system.solution[system.matrix.columns[entry]];
+    const double value = system.rhs[row] - residual[row];
     residual[row] = value;
     if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
   }
@@ -780,6 +847,7 @@ __global__ void NativeRankOneTraceSolveKernel(
     control->iterations = 0;
     control->restart_cycles = 0;
     control->preconditioner_applications = 0;
+    control->operator_applications = 0;
     control->actual_residual_checks = 0;
     control->rhs_norm = 0.0;
     control->initial_residual_norm = 0.0;
@@ -827,6 +895,25 @@ __global__ void NativeRankOneTraceSolveKernel(
            NativeTracePreconditionerKind::element_overlap_schwarz_fp64)
     ValidateElementSchwarz(
         preconditioner.element_schwarz, control, grid);
+  if (system.operator_kind ==
+      NativeTraceOperatorKind::element_matrix_free_fp64)
+  {
+    const NativeTraceElementSchwarzView schwarz =
+        preconditioner.element_schwarz;
+    const int entries = schwarz.elements * schwarz.patch_rows *
+        schwarz.patch_rows;
+    if (preconditioner.kind !=
+            NativeTracePreconditionerKind::element_overlap_schwarz_fp64 ||
+        system.element_schur == nullptr)
+      MarkFailure(control, failure_invalid_system);
+    else
+      for (int entry = thread; entry < entries; entry += stride)
+        if (!isfinite(system.element_schur[entry]))
+          MarkFailure(control, failure_nonfinite);
+  }
+  else if (system.operator_kind !=
+           NativeTraceOperatorKind::assembled_csr_fp64)
+    MarkFailure(control, failure_invalid_system);
   grid.sync();
   if (FinishOnFailure(grid, control)) return;
 
@@ -889,7 +976,8 @@ __global__ void NativeRankOneTraceSolveKernel(
     // already-small restart residual.
     if (residual_norm <= epsilon)
     {
-      ComputeActualResidual(system, first_basis, control, grid);
+      ComputeActualResidual(system, preconditioner, first_basis, control,
+                            grid);
       const double actual = GridNorm(first_basis, rows, workspace, control,
                                      grid, block_scratch);
       if (grid.thread_rank() == 0)
@@ -928,7 +1016,8 @@ __global__ void NativeRankOneTraceSolveKernel(
       ApplyPreconditioner(system, preconditioner, workspace,
                           current_basis, work, control, grid);
       if (FinishOnFailure(grid, control)) return;
-      SparseMatrixVector(system.matrix, work, next_basis, control, grid);
+      ApplyTraceOperator(system, preconditioner, work, next_basis, control,
+                         grid);
       if (FinishOnFailure(grid, control)) return;
 
       if constexpr (UseCgs2)
@@ -1141,7 +1230,8 @@ __global__ void NativeRankOneTraceSolveKernel(
     bool false_convergence_restart = false;
     if (residual_norm <= epsilon)
     {
-      ComputeActualResidual(system, first_basis, control, grid);
+      ComputeActualResidual(system, preconditioner, first_basis, control,
+                            grid);
       const double actual = GridNorm(first_basis, rows, workspace, control,
                                      grid, block_scratch);
       if (grid.thread_rank() == 0)
@@ -1214,7 +1304,7 @@ __global__ void NativeRankOneTraceSolveKernel(
   // Match the established bounded HYPRE lifecycle: publish one final actual
   // residual for a maximum-iteration exit, then let the application rebuild
   // the authoritative FP64 true residual from the current matrix.
-  ComputeActualResidual(system, first_basis, control, grid);
+  ComputeActualResidual(system, preconditioner, first_basis, control, grid);
   const double actual = GridNorm(first_basis, rows, workspace, control,
                                  grid, block_scratch);
   if (grid.thread_rank() == 0)
@@ -1360,6 +1450,8 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
       NativeTracePreconditionerKind::ilu0_rcm_jacobi;
   const bool use_element_schwarz = preconditioner.kind ==
       NativeTracePreconditionerKind::element_overlap_schwarz_fp64;
+  const bool use_matrix_free = system.operator_kind ==
+      NativeTraceOperatorKind::element_matrix_free_fp64;
   const bool use_cgs2 = use_ilu || use_element_schwarz;
   const NativeTraceWorkspaceRequirements requirements =
       QueryNativeTraceWorkspaceRequirements(
@@ -1467,6 +1559,10 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
                            sizeof(int)),
           MakeAddressRange(schwarz.true_incidence_slots, incidence_slots,
                            sizeof(int))};
+      const AddressRange schur_range = use_matrix_free
+          ? MakeAddressRange(system.element_schur, patch_entries,
+                             sizeof(double))
+          : AddressRange{};
       workspace_overlap = workspace_overlap || !sizes_valid;
       for (std::size_t left = 0; left < 7; ++left)
       {
@@ -1482,6 +1578,20 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
         for (const AddressRange& borrowed : system_ranges)
           workspace_overlap = workspace_overlap ||
               AddressRangesOverlap(borrowed, schwarz_ranges[left]);
+      }
+      if (use_matrix_free)
+      {
+        for (const AddressRange& range : double_ranges)
+          workspace_overlap = workspace_overlap ||
+              AddressRangesOverlap(range, schur_range);
+        workspace_overlap = workspace_overlap ||
+            AddressRangesOverlap(permutation_range, schur_range);
+        for (const AddressRange& borrowed : system_ranges)
+          workspace_overlap = workspace_overlap ||
+              AddressRangesOverlap(borrowed, schur_range);
+        for (const AddressRange& borrowed : schwarz_ranges)
+          workspace_overlap = workspace_overlap ||
+              AddressRangesOverlap(borrowed, schur_range);
       }
     }
   }
@@ -1524,7 +1634,14 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
       workspace.vector_doubles < requirements.vector_doubles ||
       workspace.reduction_doubles < requirements.reduction_doubles ||
       workspace.small_doubles < requirements.small_doubles ||
-      workspace.permutation_integers < requirements.permutation_integers)
+      workspace.permutation_integers < requirements.permutation_integers ||
+      (use_matrix_free &&
+       (!use_element_schwarz || system.element_schur == nullptr ||
+        !IsAligned(system.element_schur, alignof(double)))) ||
+      (!use_matrix_free &&
+       (system.operator_kind !=
+            NativeTraceOperatorKind::assembled_csr_fp64 ||
+        system.element_schur != nullptr)))
     return false;
 
   if (preconditioner.kind == NativeTracePreconditionerKind::diagonal)

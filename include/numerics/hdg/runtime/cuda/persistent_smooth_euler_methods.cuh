@@ -1130,6 +1130,9 @@ BuildPersistentTrueSystem() noexcept
   const bool use_element_schwarz =
       CudaTracePreconditionerIsNativeElementSchwarz(
           selected_preconditioner);
+  const bool use_matrix_free =
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          trace_policy.selection);
   const bool use_native = trace_solver_kind_ ==
       CudaTraceSolverKind::native_rank1_fp64;
   const bool use_mgr = trace_solver_kind_ ==
@@ -1148,7 +1151,8 @@ BuildPersistentTrueSystem() noexcept
        (!use_native || ranks_ != 1 || !shape_.igr_active ||
         shape_.trace_components != igr_trace_components ||
         shape_.trace_dofs !=
-            NativeElementSchwarzIgrPatchRows(shape_.order))))
+            NativeElementSchwarzIgrPatchRows(shape_.order))) ||
+      (use_matrix_free && !use_element_schwarz))
     return false;
   initialization_tensor_core_evidence_ = {};
   initialization_tensor_core_evidence_.selected_engine = cuda_engine_;
@@ -1167,6 +1171,8 @@ BuildPersistentTrueSystem() noexcept
       true;
   initialization_tensor_core_evidence_.native_element_schwarz_configured =
       false;
+  initialization_tensor_core_evidence_.
+      native_matrix_free_trace_operator_configured = false;
   // Native IGR keeps one allocator-prime ILU factor alive while the
   // production ILU object materializes its own fixed-shape factor below.
   // This bounded overlap establishes the recurring HYPRE/Umpire replacement
@@ -1753,6 +1759,8 @@ BuildPersistentTrueSystem() noexcept
         true;
     initialization_tensor_core_evidence_.native_element_schwarz_configured =
         use_element_schwarz;
+    initialization_tensor_core_evidence_.
+        native_matrix_free_trace_operator_configured = use_matrix_free;
     initialization_tensor_core_evidence_.element_schwarz_patch_rows =
         use_element_schwarz ? element_schwarz_plan_.patch_rows : 0;
     initialization_tensor_core_evidence_.
@@ -2367,8 +2375,22 @@ AssembleTrueSystem() noexcept
     if (!CollectiveContinue(scattered))
       return false;
   }
-  if (!AssembleTrueVector(
-          view_.condensed_rhs, view_.true_rhs_scratch, true))
+  const bool matrix_free_operator =
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          trace_policy_descriptor_.selection);
+  if (matrix_free_operator)
+  {
+    const bool exact_rank_one_rhs = ranks_ == 1 &&
+        element_schwarz_plan_.valid &&
+        CudaLaunchAssembleNativeElementVector(
+            view_, shape_, view_.condensed_rhs, view_.true_rhs_scratch);
+    if (!CollectiveContinue(exact_rank_one_rhs) ||
+        !CollectiveContinue(TransportPolicy::Synchronize(
+            CudaTransferSite::rhs_remote_scatter)))
+      return false;
+  }
+  else if (!AssembleTrueVector(
+               view_.condensed_rhs, view_.true_rhs_scratch, true))
     return false;
   true_matrix_->HypreRead();
   hypre_rhs_->HypreRead();
@@ -2512,6 +2534,9 @@ LaunchAndObserveNativeRankOneTraceSolve(
   const bool use_element_schwarz =
       CudaTracePreconditionerIsNativeElementSchwarz(
           trace_policy_descriptor_.trace_preconditioner);
+  const bool use_matrix_free =
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          trace_policy_descriptor_.selection);
   const bool factor_exact = use_ilu
       ? factor.offsets != nullptr && factor.columns != nullptr &&
           factor.values != nullptr && factor.permutation != nullptr &&
@@ -2555,8 +2580,19 @@ LaunchAndObserveNativeRankOneTraceSolve(
           element_schwarz.element_solution == nullptr &&
           element_schwarz.elements == 0 && element_schwarz.patch_rows == 0 &&
           element_schwarz.true_rows == 0;
+  CudaNativeTraceOperatorView trace_operator{};
+  trace_operator.kind = use_matrix_free
+      ? CudaNativeTraceOperatorKind::element_matrix_free_fp64
+      : CudaNativeTraceOperatorKind::assembled_csr_fp64;
+  trace_operator.element_schur = use_matrix_free ? view_.schur : nullptr;
+  const bool operator_exact = use_matrix_free
+      ? use_element_schwarz && element_schwarz_exact && ranks_ == 1 &&
+          shape_.igr_active && trace_operator.element_schur == view_.schur &&
+          element_schwarz.patch_rows == shape_.trace_dofs
+      : trace_operator.element_schur == nullptr;
   CudaTrueMatrixDeviceView current_matrix{};
   const bool matrix_exact = factor_exact && element_schwarz_exact &&
+      operator_exact &&
       CudaGetTrueMatrixDeviceView(*true_matrix_, current_matrix) &&
       current_matrix.rows == shape_.true_trace_count &&
       current_matrix.diag_columns_count == shape_.true_trace_count &&
@@ -2594,7 +2630,8 @@ LaunchAndObserveNativeRankOneTraceSolve(
   const bool launched = CudaLaunchNativeRankOneTraceSolver(
       current_matrix, view_.true_rhs_scratch, view_.true_solution,
       trace_policy_descriptor_.trace_preconditioner, factor,
-      element_schwarz, native_trace_workspace_, native_trace_support_,
+      element_schwarz, trace_operator, native_trace_workspace_,
+      native_trace_support_,
       requested_relative_tolerance, maximum_linear_iterations_,
       krylov_dimension_, nullptr);
   const std::size_t control_bytes =
@@ -2634,6 +2671,9 @@ LaunchAndObserveNativeRankOneTraceSolve(
       use_element_schwarz && observation.preconditioner_applications >= 0
       ? static_cast<std::uint64_t>(observation.preconditioner_applications)
       : 0;
+  diagnostics.native_matrix_free_trace_operator_applications =
+      use_matrix_free && observation.operator_applications >= 0
+      ? static_cast<std::uint64_t>(observation.operator_applications) : 0;
   diagnostics.configured_preconditioner =
       diagnostics.configured_native_solver && factor_exact &&
       element_schwarz_exact;
@@ -2641,7 +2681,13 @@ LaunchAndObserveNativeRankOneTraceSolve(
   diagnostics.reported_tolerance_met = diagnostics.finite &&
       diagnostics.reported_residual <= requested_relative_tolerance;
 
-  bool native_accounting_ready = true;
+  const bool operator_accounting_ready = use_matrix_free
+      ? observation.operator_applications >= 0 &&
+          observation.actual_residual_checks >= 1 &&
+          observation.operator_applications == observation.iterations +
+              observation.actual_residual_checks - 1
+      : observation.operator_applications == 0;
+  bool native_accounting_ready = operator_accounting_ready;
   if (use_ilu)
   {
     diagnostics.ilu_type = trace_policy_descriptor_.ilu_type;
@@ -2962,7 +3008,11 @@ SolveTrueSystemAttempt(double& true_relative_residual,
                     diagnostics.element_schwarz_patch_setups) &&
         checked_add(
             tensor_core_evidence.element_schwarz_preconditioner_applications,
-            diagnostics.element_schwarz_preconditioner_applications);
+            diagnostics.element_schwarz_preconditioner_applications) &&
+        checked_add(
+            tensor_core_evidence.
+                native_matrix_free_trace_operator_applications,
+            diagnostics.native_matrix_free_trace_operator_applications);
     if (!accounted)
     {
       tensor_core_evidence.trace_solver_accounting_complete = false;

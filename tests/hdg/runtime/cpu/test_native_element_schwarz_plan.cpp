@@ -161,12 +161,98 @@ bool CheckFailClosedPlans()
       offd_sections.data(), targets.data(), targets.size()});
   return !three_contributors.valid && !offd.valid;
 }
+
+bool CheckMatrixFreeActionAndRhsModel()
+{
+  const std::array<int, 4> signed_element_local{{0, 1, -2, 2}};
+  const std::array<int, 3> local_true{{0, 1, 2}};
+  const std::array<int, 8> sources{{0, 1, 2, 3, 4, 5, 6, 7}};
+  const std::array<int, 8> sections{{0, 0, 0, 0, 0, 0, 0, 0}};
+  const std::array<int, 8> targets{{0, 1, 2, 3, 3, 4, 5, 6}};
+  const NativeElementSchwarzPlan plan = BuildNativeElementSchwarzPlan({
+      2, 2, 3, 3, 7,
+      signed_element_local.data(), signed_element_local.size(),
+      local_true.data(), local_true.size(), sources.data(), sections.data(),
+      targets.data(), targets.size()});
+  if (!plan.valid) return false;
+
+  const std::array<double, 8> schur{{2.0, 1.0, 3.0, 4.0,
+                                     6.0, 5.0, 7.0, 8.0}};
+  const std::array<double, 4> element_rhs{{1.0, 2.0, 3.0, 4.0}};
+  const std::array<double, 3> input{{2.0, 3.0, 5.0}};
+  std::array<double, 9> assembled{};
+  std::array<double, 3> assembled_rhs{};
+  for (int element = 0; element < 2; ++element)
+    for (int row = 0; row < 2; ++row)
+    {
+      const int row_slot = 2 * element + row;
+      const int row_truth = NativeElementSchwarzDecodedDof(
+          plan.signed_element_true_dofs[static_cast<std::size_t>(row_slot)]);
+      const int row_sign = NativeElementSchwarzDofSign(
+          plan.signed_element_true_dofs[static_cast<std::size_t>(row_slot)]);
+      assembled_rhs[static_cast<std::size_t>(row_truth)] += row_sign *
+          element_rhs[static_cast<std::size_t>(row_slot)];
+      for (int column = 0; column < 2; ++column)
+      {
+        const int column_slot = 2 * element + column;
+        const int column_truth = NativeElementSchwarzDecodedDof(
+            plan.signed_element_true_dofs[
+                static_cast<std::size_t>(column_slot)]);
+        const int column_sign = NativeElementSchwarzDofSign(
+            plan.signed_element_true_dofs[
+                static_cast<std::size_t>(column_slot)]);
+        assembled[static_cast<std::size_t>(3 * row_truth + column_truth)] +=
+            row_sign * column_sign * schur[static_cast<std::size_t>(
+                4 * element + 2 * row + column)];
+      }
+    }
+
+  std::array<double, 4> element_action{};
+  for (int element = 0; element < 2; ++element)
+    for (int row = 0; row < 2; ++row)
+      for (int column = 0; column < 2; ++column)
+      {
+        const int column_slot = 2 * element + column;
+        const int truth = NativeElementSchwarzDecodedDof(
+            plan.signed_element_true_dofs[
+                static_cast<std::size_t>(column_slot)]);
+        const int sign = NativeElementSchwarzDofSign(
+            plan.signed_element_true_dofs[
+                static_cast<std::size_t>(column_slot)]);
+        element_action[static_cast<std::size_t>(2 * element + row)] +=
+            schur[static_cast<std::size_t>(
+                4 * element + 2 * row + column)] * sign *
+            input[static_cast<std::size_t>(truth)];
+      }
+  std::array<double, 3> matrix_free_action{};
+  for (int truth = 0; truth < 3; ++truth)
+    for (int incidence = 0; incidence < 2; ++incidence)
+    {
+      const int slot = plan.true_incidence_slots[
+          static_cast<std::size_t>(2 * truth + incidence)];
+      if (slot >= 0)
+        matrix_free_action[static_cast<std::size_t>(truth)] +=
+            NativeElementSchwarzDofSign(
+                plan.signed_element_true_dofs[
+                    static_cast<std::size_t>(slot)]) *
+            element_action[static_cast<std::size_t>(slot)];
+    }
+  std::array<double, 3> assembled_action{};
+  for (int row = 0; row < 3; ++row)
+    for (int column = 0; column < 3; ++column)
+      assembled_action[static_cast<std::size_t>(row)] +=
+          assembled[static_cast<std::size_t>(3 * row + column)] *
+          input[static_cast<std::size_t>(column)];
+  return assembled_rhs == std::array<double, 3>{{1.0, -1.0, 4.0}} &&
+      assembled_action == std::array<double, 3>{{7.0, 11.0, 19.0}} &&
+      matrix_free_action == assembled_action;
+}
 } // namespace
 
 int main()
 {
   if (!CheckExactTwoElementPlan() || !CheckSignedWeightedApplyModel() ||
-      !CheckFailClosedPlans())
+      !CheckFailClosedPlans() || !CheckMatrixFreeActionAndRhsModel())
   {
     std::cerr << "native element Schwarz topology-plan checks failed\n";
     return 1;

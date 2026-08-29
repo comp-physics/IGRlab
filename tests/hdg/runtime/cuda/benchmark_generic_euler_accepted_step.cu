@@ -216,6 +216,8 @@ using dg::hdg::runtime::cuda_w8a::CudaTracePolicyDescriptor;
 using dg::hdg::runtime::cuda_w8a::CudaTracePolicyDescriptorIsExact;
 using dg::hdg::runtime::cuda_w8a::CudaTracePolicyKind;
 using dg::hdg::runtime::cuda_w8a::CudaTracePolicyKindName;
+using dg::hdg::runtime::cuda_w8a::
+    CudaTracePolicyUsesNativeElementMatrixFreeOperator;
 using dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy;
 using dg::hdg::runtime::cuda_w8a::CudaTransferTotals;
 using dg::hdg::runtime::cuda_w8a::CudaTransportPolicy;
@@ -418,6 +420,12 @@ bool SelectTracePolicy(
         CudaTracePolicyKind::native_element_schwarz_fp64;
     return true;
   }
+  if (text == "native-element-schwarz-matrix-free-fp64")
+  {
+    options.trace_policy =
+        CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64;
+    return true;
+  }
   return false;
 }
 
@@ -501,7 +509,8 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
       if (++index >= argc || !SelectTracePolicy(argv[index], options))
       {
         error = "--trace-policy requires engine-default, common-fast, "
-                "equilibrated-mgr, or native-element-schwarz-fp64";
+                "equilibrated-mgr, native-element-schwarz-fp64, or "
+                "native-element-schwarz-matrix-free-fp64";
         return false;
       }
       continue;
@@ -709,12 +718,14 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     error = "the IGR quadrature options require --mode igr";
     return false;
   }
-  if (options.trace_policy ==
-          CudaTracePolicyKind::native_element_schwarz_fp64 &&
+  if ((options.trace_policy ==
+           CudaTracePolicyKind::native_element_schwarz_fp64 ||
+       CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+           options.trace_policy)) &&
       (options.engine != CudaEngineKind::tensor_core ||
        options.regularization != RegularizationKind::igr))
   {
-    error = "native-element-schwarz-fp64 requires --engine tensor and "
+    error = "native element Schwarz policies require --engine tensor and "
             "--mode igr";
     return false;
   }
@@ -750,7 +761,7 @@ void PrintUsage(const char* executable)
 {
   std::cout << "Usage: " << executable
             << " [--mode conventional|igr] [--engine ordinary|tensor]"
-               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64]"
+               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
@@ -760,7 +771,7 @@ void PrintUsage(const char* executable)
                " [--profile-measured-step 0|1|2|3|4]\n"
                "       " << executable
             << " [--conventional|--igr] [--engine ordinary|tensor]"
-               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64]"
+               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
@@ -1147,8 +1158,11 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
             tensor.ilu_accounting_complete;
   const bool expected_mgr_solver =
       trace_policy == CudaTracePolicyKind::equilibrated_mgr;
+  const bool expected_matrix_free =
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(trace_policy);
   const bool expected_element_schwarz = trace_policy ==
-      CudaTracePolicyKind::native_element_schwarz_fp64;
+          CudaTracePolicyKind::native_element_schwarz_fp64 ||
+      expected_matrix_free;
   const bool expected_native_solver =
       engine == CudaEngineKind::tensor_core && !expected_mgr_solver;
   const bool mgr_work_consistent = expected_mgr_solver
@@ -1192,8 +1206,17 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
             tensor.element_schwarz_patch_rows == 0 &&
             tensor.element_schwarz_minimum_multiplicity == 0 &&
             tensor.element_schwarz_maximum_multiplicity == 0;
+  const bool matrix_free_work_consistent = expected_matrix_free
+      ? tensor.native_matrix_free_trace_operator_configured &&
+            tensor.native_matrix_free_trace_operator_applications >=
+                static_cast<std::uint64_t>(evidence.linear_iterations) &&
+            ((evidence.linear_iterations == 0) ==
+             (tensor.native_matrix_free_trace_operator_applications == 0))
+      : !tensor.native_matrix_free_trace_operator_configured &&
+            tensor.native_matrix_free_trace_operator_applications == 0;
   const bool trace_solver_consistent =
       tensor.trace_solver_accounting_complete &&
+      matrix_free_work_consistent &&
       tensor.native_rank1_trace_solver_configured ==
           expected_native_solver &&
       tensor.hypre_mgr_rank1_trace_solver_configured ==
@@ -1631,6 +1654,12 @@ void PrintStep(const StepSample& sample)
             << ','
             << "\"native_element_schwarz_configured\":"
             << evidence.tensor_core.native_element_schwarz_configured << ','
+            << "\"native_matrix_free_trace_operator_configured\":"
+            << evidence.tensor_core.
+                   native_matrix_free_trace_operator_configured << ','
+            << "\"native_matrix_free_trace_operator_applications\":"
+            << evidence.tensor_core.
+                   native_matrix_free_trace_operator_applications << ','
             << "\"hypre_mgr_rank1_trace_solver_configured\":"
             << evidence.tensor_core.
                    hypre_mgr_rank1_trace_solver_configured << ','
@@ -1896,6 +1925,9 @@ int RunBenchmark(const Options& options)
             << "\"trace_native_element_schwarz_configured\":"
             << std::boolalpha
             << reported_trace_policy.native_element_schwarz_configured << ','
+            << "\"trace_native_matrix_free_operator_configured\":"
+            << reported_trace_policy.
+                   native_matrix_free_trace_operator_configured << ','
             << "\"trace_element_schwarz_patch_rows\":"
             << reported_trace_policy.element_schwarz_patch_rows << ','
             << "\"trace_element_schwarz_minimum_multiplicity\":"

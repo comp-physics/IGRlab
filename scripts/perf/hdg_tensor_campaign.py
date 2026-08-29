@@ -40,6 +40,8 @@ TRACE_PRECONDITIONER_BY_POLICY_ENGINE_AND_MODE = {
     ("equilibrated-mgr", "tensor", "igr"): "hypre_mgr_field_split",
     ("native-element-schwarz-fp64", "tensor", "igr"):
         "native_element_schwarz_fp64",
+    ("native-element-schwarz-matrix-free-fp64", "tensor", "igr"):
+        "native_element_schwarz_fp64",
 }
 TRACE_ILU_POLICY_BY_POLICY_ENGINE_AND_MODE = {
     ("engine-default", "ordinary", "conventional"): (0, 0, 0, 1),
@@ -52,6 +54,8 @@ TRACE_ILU_POLICY_BY_POLICY_ENGINE_AND_MODE = {
     ("common-fast", "tensor", "igr"): (0, 0, 1, 1),
     ("equilibrated-mgr", "tensor", "igr"): (-1, -1, -1, 0),
     ("native-element-schwarz-fp64", "tensor", "igr"):
+        (-1, -1, -1, 0),
+    ("native-element-schwarz-matrix-free-fp64", "tensor", "igr"):
         (-1, -1, -1, 0),
 }
 TRACE_ILU_FACTOR_REUSE_BY_POLICY_ENGINE_AND_MODE = {
@@ -66,6 +70,8 @@ TRACE_ILU_FACTOR_REUSE_BY_POLICY_ENGINE_AND_MODE = {
     ("common-fast", "tensor", "igr"): "first_trace_solve_per_attempt",
     ("equilibrated-mgr", "tensor", "igr"): "not_applicable",
     ("native-element-schwarz-fp64", "tensor", "igr"):
+        "not_applicable",
+    ("native-element-schwarz-matrix-free-fp64", "tensor", "igr"):
         "not_applicable",
 }
 TRACE_ILU_TRIANGULAR_SOLVE_BY_POLICY_ENGINE_AND_MODE = {
@@ -89,6 +95,8 @@ TRACE_ILU_TRIANGULAR_SOLVE_BY_POLICY_ENGINE_AND_MODE = {
     ("equilibrated-mgr", "tensor", "igr"):
         ("not_applicable", 0, 0, 0),
     ("native-element-schwarz-fp64", "tensor", "igr"):
+        ("not_applicable", 0, 0, 0),
+    ("native-element-schwarz-matrix-free-fp64", "tensor", "igr"):
         ("not_applicable", 0, 0, 0),
 }
 # Solver name and the three mutually exclusive rank-one/rank-two
@@ -115,6 +123,8 @@ TRACE_SOLVER_CONFIGURATION_BY_POLICY_ENGINE_AND_MODE = {
     ("equilibrated-mgr", "tensor", "igr"):
         ("hypre-fgmres-mgr-rank1", False, True, False),
     ("native-element-schwarz-fp64", "tensor", "igr"):
+        ("native-rank1-fp64", True, False, False),
+    ("native-element-schwarz-matrix-free-fp64", "tensor", "igr"):
         ("native-rank1-fp64", True, False, False),
 }
 SAME_POLICY_MEMBERS = {
@@ -1348,7 +1358,13 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
         expected_mgr,
         expected_rank2,
     ) = expected_trace_solver_configuration(engine, mode, trace_policy)
-    expected_schwarz = trace_policy == "native-element-schwarz-fp64"
+    expected_schwarz = trace_policy in {
+        "native-element-schwarz-fp64",
+        "native-element-schwarz-matrix-free-fp64",
+    }
+    expected_matrix_free = (
+        trace_policy == "native-element-schwarz-matrix-free-fp64"
+    )
     if tensor.get("trace_solver") != expected_trace_solver:
         raise CampaignError(
             f"sample trace_solver={tensor.get('trace_solver')!r}; expected "
@@ -1362,15 +1378,27 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
         tensor.get("hypre_trace_solve_calls"),
         "samples.tensor_core.hypre_trace_solve_calls",
     )
+    matrix_free_operator_applications = checked_uint64(
+        tensor.get("native_matrix_free_trace_operator_applications"),
+        "samples.tensor_core.native_matrix_free_trace_operator_applications",
+    )
+    matrix_free_accounting_exact = (
+        matrix_free_operator_applications >= work["linear_iterations"] and
+        ((work["linear_iterations"] == 0) ==
+         (matrix_free_operator_applications == 0))
+    ) if expected_matrix_free else matrix_free_operator_applications == 0
     if tensor.get("native_rank1_trace_solver_configured") is not \
             expected_native or \
             tensor.get("hypre_mgr_rank1_trace_solver_configured") is not \
             expected_mgr or \
             tensor.get("native_element_schwarz_configured") is not \
             expected_schwarz or \
+            tensor.get("native_matrix_free_trace_operator_configured") is \
+            not expected_matrix_free or \
             tensor.get("hypre_host_staged_rank2_trace_solver_configured") \
             is not expected_rank2 or \
             tensor.get("trace_solver_accounting_complete") is not True or \
+            not matrix_free_accounting_exact or \
             native_trace_solves != (work["linear_solve_attempts"]
                                      if expected_native else 0) or \
             hypre_trace_solves != (0 if expected_native else
@@ -2201,6 +2229,12 @@ def summarized_sample_work(sample: dict[str, Any], *, schema: int) -> dict[str, 
         ],
         "native_element_schwarz_configured": tensor[
             "native_element_schwarz_configured"
+        ],
+        "native_matrix_free_trace_operator_configured": tensor[
+            "native_matrix_free_trace_operator_configured"
+        ],
+        "native_matrix_free_trace_operator_applications": tensor[
+            "native_matrix_free_trace_operator_applications"
         ],
         "hypre_host_staged_rank2_trace_solver_configured": tensor[
             "hypre_host_staged_rank2_trace_solver_configured"

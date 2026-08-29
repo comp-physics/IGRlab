@@ -91,6 +91,8 @@ SCHEMA2_ONLY_SAMPLE_FIELDS = {
     "hypre_trace_solve_calls", "native_rank1_trace_solver_configured",
     "hypre_mgr_rank1_trace_solver_configured",
     "native_element_schwarz_configured",
+    "native_matrix_free_trace_operator_configured",
+    "native_matrix_free_trace_operator_applications",
     "hypre_host_staged_rank2_trace_solver_configured",
     "trace_solver_accounting_complete", "equilibration_builds",
     "equilibration_passes", "mgr_setup_calls",
@@ -116,7 +118,8 @@ parser.add_argument("--engine", default="ordinary", choices=("ordinary", "tensor
 parser.add_argument(
     "--trace-policy", default="engine-default",
     choices=("engine-default", "common-fast", "equilibrated-mgr",
-             "native-element-schwarz-fp64"),
+             "native-element-schwarz-fp64",
+             "native-element-schwarz-matrix-free-fp64"),
 )
 parser.add_argument("--order", required=True, type=int)
 parser.add_argument("--mesh-n", required=True, type=int)
@@ -135,7 +138,10 @@ args = parser.parse_args()
 is_frozen = "frozen" in str(Path(__file__))
 common_fast = args.trace_policy == "common-fast"
 equilibrated_mgr = args.trace_policy == "equilibrated-mgr"
-element_schwarz = args.trace_policy == "native-element-schwarz-fp64"
+matrix_free = args.trace_policy == \
+    "native-element-schwarz-matrix-free-fp64"
+element_schwarz = args.trace_policy == "native-element-schwarz-fp64" or \
+    matrix_free
 if equilibrated_mgr and (args.engine != "tensor" or args.mode != "igr"):
     parser.error("equilibrated-mgr requires tensor IGR")
 if element_schwarz and (args.engine != "tensor" or args.mode != "igr"):
@@ -277,6 +283,10 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
             ),
             "hypre_mgr_rank1_trace_solver_configured": equilibrated_mgr,
             "native_element_schwarz_configured": element_schwarz,
+            "native_matrix_free_trace_operator_configured": matrix_free,
+            "native_matrix_free_trace_operator_applications": (
+                sample["linear_iterations"] if matrix_free else 0
+            ),
             "hypre_host_staged_rank2_trace_solver_configured": False,
             "trace_solver_accounting_complete": True,
             "trace_preconditioner": trace_preconditioner,

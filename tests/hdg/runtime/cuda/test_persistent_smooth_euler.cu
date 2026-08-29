@@ -228,6 +228,14 @@ constexpr bool TraceSolverSelectionPolicy() noexcept
       ResolveCudaTraceSolverKind(
           CudaEngineKind::tensor_core, 2, true, true, true, true,
           CudaTracePolicyKind::equilibrated_mgr) ==
+          CudaTraceSolverKind::unconfigured &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 1, false, true, true, true,
+          CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64) ==
+          CudaTraceSolverKind::native_rank1_fp64 &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 2, true, true, true, true,
+          CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64) ==
           CudaTraceSolverKind::unconfigured;
 }
 
@@ -1414,6 +1422,7 @@ bool SameNativeSolveResult(
       first.restart_cycles == second.restart_cycles &&
       first.preconditioner_applications ==
           second.preconditioner_applications &&
+      first.operator_applications == second.operator_applications &&
       first.actual_residual_checks == second.actual_residual_checks &&
       first.rhs_norm == second.rhs_norm &&
       first.initial_residual_norm == second.initial_residual_norm &&
@@ -1921,6 +1930,15 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
   const auto ordinary_igr_schwarz = ResolveCudaTracePolicy(
       CudaEngineKind::ordinary, true,
       CudaTracePolicyKind::native_element_schwarz_fp64);
+  const auto tensor_igr_matrix_free = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, true,
+      CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64);
+  const auto tensor_conventional_matrix_free = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, false,
+      CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64);
+  const auto ordinary_igr_matrix_free = ResolveCudaTracePolicy(
+      CudaEngineKind::ordinary, true,
+      CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64);
   const auto unknown = ResolveCudaTracePolicy(
       CudaEngineKind::ordinary, false,
       static_cast<CudaTracePolicyKind>(255));
@@ -2011,6 +2029,15 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       !CudaTracePolicyDescriptorIsExact(tensor_conventional_schwarz) &&
       !ordinary_igr_schwarz.valid &&
       !CudaTracePolicyDescriptorIsExact(ordinary_igr_schwarz) &&
+      CudaTracePolicyDescriptorIsExact(tensor_igr_matrix_free) &&
+      tensor_igr_matrix_free.trace_preconditioner ==
+          CudaTracePreconditionerKind::native_element_schwarz_fp64 &&
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          tensor_igr_matrix_free.selection) &&
+      !tensor_conventional_matrix_free.valid &&
+      !CudaTracePolicyDescriptorIsExact(tensor_conventional_matrix_free) &&
+      !ordinary_igr_matrix_free.valid &&
+      !CudaTracePolicyDescriptorIsExact(ordinary_igr_matrix_free) &&
       !tensor_conventional_mgr.valid &&
       !CudaTracePolicyDescriptorIsExact(tensor_conventional_mgr) &&
       !ordinary_igr_mgr.valid &&
@@ -2026,6 +2053,9 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       std::string_view(CudaTracePolicyKindName(
           CudaTracePolicyKind::native_element_schwarz_fp64)) ==
           "native-element-schwarz-fp64" &&
+      std::string_view(CudaTracePolicyKindName(
+          CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64)) ==
+          "native-element-schwarz-matrix-free-fp64" &&
       std::string_view(CudaTracePreconditionerName(
           CudaTracePreconditionerKind::hypre_mgr_field_split)) ==
           "hypre_mgr_field_split" &&

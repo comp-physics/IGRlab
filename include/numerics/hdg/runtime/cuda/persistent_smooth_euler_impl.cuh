@@ -351,7 +351,8 @@ constexpr CudaTraceSolverKind ResolveCudaTraceSolverKind(
             generic_numerical_policy
         ? CudaTraceSolverKind::hypre_fgmres_mgr_rank1
         : CudaTraceSolverKind::unconfigured;
-  if (trace_policy == CudaTracePolicyKind::native_element_schwarz_fp64)
+  if (trace_policy == CudaTracePolicyKind::native_element_schwarz_fp64 ||
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(trace_policy))
     return engine == generic::CudaEngineKind::tensor_core && ranks == 1 &&
             borrowed_topology && borrowed_host_inputs &&
             generic_numerical_policy
@@ -438,6 +439,19 @@ struct CudaNativeElementSchwarzView
   int maximum_multiplicity = 0;
 };
 
+enum class CudaNativeTraceOperatorKind : std::uint8_t
+{
+  assembled_csr_fp64 = 1,
+  element_matrix_free_fp64 = 2
+};
+
+struct CudaNativeTraceOperatorView
+{
+  CudaNativeTraceOperatorKind kind =
+      CudaNativeTraceOperatorKind::assembled_csr_fp64;
+  const double* element_schur = nullptr;
+};
+
 struct CudaNativeTraceSolveObservation
 {
   int status = 0;
@@ -445,6 +459,7 @@ struct CudaNativeTraceSolveObservation
   int iterations = 0;
   int restart_cycles = 0;
   int preconditioner_applications = 0;
+  int operator_applications = 0;
   int actual_residual_checks = 0;
   double rhs_norm = std::numeric_limits<double>::infinity();
   double initial_residual_norm = std::numeric_limits<double>::infinity();
@@ -1329,6 +1344,7 @@ struct CudaSolveDiagnostics
   bool mgr_setup_reused = false;
   std::uint64_t element_schwarz_patch_setups = 0;
   std::uint64_t element_schwarz_preconditioner_applications = 0;
+  std::uint64_t native_matrix_free_trace_operator_applications = 0;
   int iterations = 0;
   double reported_residual = std::numeric_limits<double>::infinity();
 };
@@ -1827,12 +1843,16 @@ bool CudaLaunchNativeRankOneTraceSolver(
     double* solution, CudaTracePreconditionerKind preconditioner_kind,
     const CudaNativeIlu0FactorView& ilu_factor,
     const CudaNativeElementSchwarzView& element_schwarz,
+    const CudaNativeTraceOperatorView& trace_operator,
     const CudaNativeTraceWorkspaceView& workspace,
     const CudaNativeTraceCooperativeSupport& support,
     double relative_tolerance, int maximum_iterations,
     int krylov_dimension, cudaStream_t stream) noexcept;
 bool CudaLaunchSetupNativeElementSchwarz(
     const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
+bool CudaLaunchAssembleNativeElementVector(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    const double* element_values, double* true_values) noexcept;
 bool CudaDecodeNativeRankOneTraceControl(
     const double* host_control, std::size_t host_control_double_slots,
     double relative_tolerance, int maximum_iterations,
@@ -2373,6 +2393,9 @@ public:
     evidence.tensor_core.element_schwarz_preconditioner_applications =
         initialization_tensor_core_evidence_.
             element_schwarz_preconditioner_applications;
+    evidence.tensor_core.native_matrix_free_trace_operator_applications =
+        initialization_tensor_core_evidence_.
+            native_matrix_free_trace_operator_applications;
     evidence.tensor_core.element_schwarz_patch_rows =
         initialization_tensor_core_evidence_.element_schwarz_patch_rows;
     evidence.tensor_core.element_schwarz_minimum_multiplicity =
@@ -2395,6 +2418,9 @@ public:
     evidence.tensor_core.native_element_schwarz_configured =
         initialization_tensor_core_evidence_.
             native_element_schwarz_configured;
+    evidence.tensor_core.native_matrix_free_trace_operator_configured =
+        initialization_tensor_core_evidence_.
+            native_matrix_free_trace_operator_configured;
     evidence.tensor_core.hypre_mgr_rank1_trace_solver_configured =
         initialization_tensor_core_evidence_.
             hypre_mgr_rank1_trace_solver_configured;
@@ -3357,6 +3383,10 @@ public:
             trace_preconditioner_);
     result.tensor_core.native_element_schwarz_configured =
         use_element_schwarz && element_schwarz_plan_.valid;
+    result.tensor_core.native_matrix_free_trace_operator_configured =
+        CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+            trace_policy_descriptor_.selection) &&
+        result.tensor_core.native_element_schwarz_configured;
     result.tensor_core.element_schwarz_patch_rows = use_element_schwarz
         ? element_schwarz_plan_.patch_rows : 0;
     result.tensor_core.element_schwarz_minimum_multiplicity =
@@ -3871,10 +3901,26 @@ public:
             result.tensor_core.element_schwarz_patch_rows == 0 &&
             result.tensor_core.element_schwarz_minimum_multiplicity == 0 &&
             result.tensor_core.element_schwarz_maximum_multiplicity == 0;
+    const bool matrix_free_selected =
+        CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+            trace_policy_descriptor_.selection);
+    const bool matrix_free_accounting_complete = matrix_free_selected
+        ? result.tensor_core.native_matrix_free_trace_operator_configured &&
+            result.tensor_core.
+                native_matrix_free_trace_operator_applications >=
+                static_cast<std::uint64_t>(result.linear_iterations) &&
+            ((result.linear_iterations == 0) ==
+             (result.tensor_core.
+                  native_matrix_free_trace_operator_applications == 0))
+        : !result.tensor_core.
+              native_matrix_free_trace_operator_configured &&
+            result.tensor_core.
+                native_matrix_free_trace_operator_applications == 0;
     result.tensor_core.trace_solver_accounting_complete =
         result.tensor_core.trace_solver_accounting_complete &&
         linear_work_accounting_complete &&
         element_schwarz_accounting_complete &&
+        matrix_free_accounting_complete &&
         ((trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64 &&
           result.tensor_core.native_rank1_trace_solve_calls ==
               completed_linear_solve_attempts &&

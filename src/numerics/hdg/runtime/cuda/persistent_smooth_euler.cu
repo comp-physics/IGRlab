@@ -1359,6 +1359,7 @@ bool CudaLaunchNativeRankOneTraceSolver(
     const CudaTracePreconditionerKind preconditioner_kind,
     const CudaNativeIlu0FactorView& ilu_factor,
     const CudaNativeElementSchwarzView& element_schwarz,
+    const CudaNativeTraceOperatorView& trace_operator,
     const CudaNativeTraceWorkspaceView& workspace,
     const CudaNativeTraceCooperativeSupport& support,
     const double relative_tolerance, const int maximum_iterations,
@@ -1370,6 +1371,11 @@ bool CudaLaunchNativeRankOneTraceSolver(
                    matrix.diag_columns_count, matrix.diag_nonzeros};
   system.rhs = rhs;
   system.solution = solution;
+  system.operator_kind = trace_operator.kind ==
+          CudaNativeTraceOperatorKind::element_matrix_free_fp64
+      ? NativeTraceOperatorKind::element_matrix_free_fp64
+      : NativeTraceOperatorKind::assembled_csr_fp64;
+  system.element_schur = trace_operator.element_schur;
 
   NativeTracePreconditionerView preconditioner{};
   const bool use_ilu = CudaTracePreconditionerIsIlu(preconditioner_kind);
@@ -1480,6 +1486,7 @@ bool CudaDecodeNativeRankOneTraceControl(
   observation.restart_cycles = native_result.restart_cycles;
   observation.preconditioner_applications =
       native_result.preconditioner_applications;
+  observation.operator_applications = native_result.operator_applications;
   observation.actual_residual_checks =
       native_result.actual_residual_checks;
   observation.rhs_norm = native_result.rhs_norm;
@@ -4668,6 +4675,31 @@ __global__ void GatherRemoteVectorKernel(CudaDeviceView v,CudaMeshShape s,const 
 __global__ void ScatterRemoteVectorKernel(CudaDeviceView v,double* truth,int n)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)atomicAdd(truth+v.vector_receive_target[i],v.remote_vector_receive[i]);}
 
+// Rank-one exact T^T r_e assembly. One thread owns one true row and consumes
+// its static one/two incidences in fixed order, so this benchmark ablation has
+// no global atomics and no storage-order-dependent reduction.
+__global__ void NativeElementVectorKernel(CudaDeviceView v,CudaMeshShape s,
+                                          const double* element_values,
+                                          double* truth)
+{
+  const int row=blockIdx.x*blockDim.x+threadIdx.x;
+  if(row>=s.true_trace_count)return;
+  const int element_slots=s.elements*s.trace_dofs;
+  double value=0.0;
+  bool valid=true;
+  for(int incidence=0;incidence<2;++incidence)
+  {
+    const int slot=v.element_schwarz_true_incidence_slots[2*row+incidence];
+    if(slot<0)continue;
+    if(slot>=element_slots){valid=false;continue;}
+    double sign=1.0;
+    const int truth_row=Decode(v.element_schwarz_signed_true_dof[slot],sign);
+    if(truth_row!=row){valid=false;continue;}
+    value+=sign*element_values[slot];
+  }
+  truth[row]=valid?value:nan("");
+}
+
 // Materialize and factor one exact principal trace patch per element. Each
 // patch entry sums all retained signed element-Schur contributors to the
 // corresponding true-matrix entry, then applies the target element's row and
@@ -5577,6 +5609,20 @@ bool CudaLaunchSetupNativeElementSchwarz(
      v.element_schwarz_pivots==nullptr)
     return false;
   ElementSchwarzSetupKernel<<<s.elements,128>>>(v,s);
+  return LaunchOk();
+}
+bool CudaLaunchAssembleNativeElementVector(
+    const CudaDeviceView& v,const CudaMeshShape& s,
+    const double* const element_values,double* const truth) noexcept
+{
+  const int expected=NativeElementSchwarzIgrPatchRows(s.order);
+  if(!s.igr_active||s.elements<=0||s.true_trace_count<=0||
+     s.trace_dofs!=expected||element_values==nullptr||truth==nullptr||
+     element_values==truth||v.element_schwarz_signed_true_dof==nullptr||
+     v.element_schwarz_true_incidence_slots==nullptr)
+    return false;
+  NativeElementVectorKernel<<<Blocks(s.true_trace_count),128>>>(
+      v,s,element_values,truth);
   return LaunchOk();
 }
 bool CudaLaunchBuildRankOneEquilibratedSystem(
