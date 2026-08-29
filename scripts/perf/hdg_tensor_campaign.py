@@ -55,6 +55,9 @@ TRACE_PRECONDITIONER_BY_POLICY_ENGINE_AND_MODE = {
     ("native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
      "sigma-jacobi3-fp64", "tensor", "igr"):
         "native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64",
+    ("native-element-schwarz-matrix-free-warp-coupled-fp64",
+     "tensor", "igr"):
+        "native_element_schwarz_warp_coupled_fp64",
 }
 TRACE_ILU_POLICY_BY_POLICY_ENGINE_AND_MODE = {
     ("engine-default", "ordinary", "conventional"): (0, 0, 0, 1),
@@ -83,6 +86,9 @@ TRACE_ILU_POLICY_BY_POLICY_ENGINE_AND_MODE = {
         (-1, -1, -1, 0),
     ("native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
      "sigma-jacobi3-fp64", "tensor", "igr"):
+        (-1, -1, -1, 0),
+    ("native-element-schwarz-matrix-free-warp-coupled-fp64",
+     "tensor", "igr"):
         (-1, -1, -1, 0),
 }
 TRACE_ILU_FACTOR_REUSE_BY_POLICY_ENGINE_AND_MODE = {
@@ -113,6 +119,9 @@ TRACE_ILU_FACTOR_REUSE_BY_POLICY_ENGINE_AND_MODE = {
         "not_applicable",
     ("native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
      "sigma-jacobi3-fp64", "tensor", "igr"):
+        "not_applicable",
+    ("native-element-schwarz-matrix-free-warp-coupled-fp64",
+     "tensor", "igr"):
         "not_applicable",
 }
 TRACE_ILU_TRIANGULAR_SOLVE_BY_POLICY_ENGINE_AND_MODE = {
@@ -149,6 +158,9 @@ TRACE_ILU_TRIANGULAR_SOLVE_BY_POLICY_ENGINE_AND_MODE = {
         ("not_applicable", 0, 0, 0),
     ("native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
      "sigma-jacobi3-fp64", "tensor", "igr"):
+        ("not_applicable", 0, 0, 0),
+    ("native-element-schwarz-matrix-free-warp-coupled-fp64",
+     "tensor", "igr"):
         ("not_applicable", 0, 0, 0),
 }
 # Solver name and the three mutually exclusive rank-one/rank-two
@@ -191,6 +203,9 @@ TRACE_SOLVER_CONFIGURATION_BY_POLICY_ENGINE_AND_MODE = {
         ("native-rank1-fp64", True, False, False),
     ("native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
      "sigma-jacobi3-fp64", "tensor", "igr"):
+        ("native-rank1-fp64", True, False, False),
+    ("native-element-schwarz-matrix-free-warp-coupled-fp64",
+     "tensor", "igr"):
         ("native-rank1-fp64", True, False, False),
 }
 
@@ -333,7 +348,119 @@ FIXED_SIGMA_JACOBI_POLICY = {
         "sigma_jacobi10_fp64",
         True,
     ),
+    "native-element-schwarz-matrix-free-warp-coupled-"
+    "sigma-jacobi2-fp64": FixedSigmaJacobiPolicy(
+        2,
+        "native_element_schwarz_warp_coupled_sigma_jacobi2_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-warp-coupled-"
+    "sigma-jacobi10-fp64": FixedSigmaJacobiPolicy(
+        10,
+        "native_element_schwarz_warp_coupled_sigma_jacobi10_fp64",
+        True,
+    ),
 }
+
+
+class NativeElementSchwarzPolicy(NamedTuple):
+    matrix_free: bool
+    factorization: str
+    apply: str
+    tile_width: int
+    equilibration_passes: int
+    euler_rows: int
+    sigma_rows: int
+
+
+COUPLED_WARP_TRACE_POLICIES = frozenset({
+    "native-element-schwarz-matrix-free-warp-coupled-fp64",
+    "native-element-schwarz-matrix-free-warp-coupled-sigma-jacobi2-fp64",
+    "native-element-schwarz-matrix-free-warp-coupled-sigma-jacobi10-fp64",
+})
+FULL_PATCH_TRACE_POLICIES = frozenset({
+    "native-element-schwarz-fp64",
+    "native-element-schwarz-matrix-free-fp64",
+})
+LOWER_FIELD_SPLIT_TRACE_POLICIES = frozenset({
+    "native-element-schwarz-equilibrated-field-split-fp64",
+    "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
+    *(
+        policy for policy in FIXED_SIGMA_JACOBI_POLICY
+        if "equilibrated-field-split" in policy
+    ),
+})
+
+
+def native_element_schwarz_policy(
+        trace_policy: str, order: int) -> NativeElementSchwarzPolicy | None:
+    """Return exact factor/apply metadata for one resolved trace policy."""
+    if isinstance(order, bool) or order not in {1, 2, 3}:
+        raise CampaignError("native element-Schwarz policy order is invalid")
+    if trace_policy in COUPLED_WARP_TRACE_POLICIES:
+        return NativeElementSchwarzPolicy(
+            True,
+            "full-coupled-patch-lu",
+            "cooperative-full-patch-pivoted-lu-fp64",
+            32,
+            0,
+            0,
+            0,
+        )
+    if trace_policy in FULL_PATCH_TRACE_POLICIES:
+        return NativeElementSchwarzPolicy(
+            trace_policy == "native-element-schwarz-matrix-free-fp64",
+            "full-patch-lu",
+            "scalar-full-patch-pivoted-lu-fp64",
+            0,
+            0,
+            0,
+            0,
+        )
+    if trace_policy in LOWER_FIELD_SPLIT_TRACE_POLICIES:
+        warp = "-warp-" in trace_policy
+        return NativeElementSchwarzPolicy(
+            "-matrix-free-" in trace_policy,
+            "lower-multiplicative-uhat4-sigmahat",
+            "cooperative-pivoted-lu-fp64" if warp
+            else "scalar-pivoted-lu-fp64",
+            (16 if order == 1 else 32) if warp else 0,
+            2,
+            16 * (order + 1),
+            4 * (order + 1),
+        )
+    return None
+
+
+class FinalNumericalPolicy(NamedTuple):
+    igr_volume_quadrature_order: int
+    igr_face_quadrature_order: int
+    newton_linear_relative_tolerance: float
+    final_linear_relative_tolerance: float
+    true_residual_tightening_linear_relative_tolerance: float
+
+
+FINAL_IGR_QUADRATURE_BY_ORDER = {
+    1: (6, 4),
+    2: (8, 6),
+    3: (10, 8),
+}
+FINAL_LINEAR_ROLE_RELATIVE_TOLERANCES = (1.0e-10, 3.0e-11, 1.0e-12)
+
+
+def final_numerical_policy(mode: str, order: int) -> FinalNumericalPolicy:
+    """Return the explicit final-tree command/validation numerical contract."""
+    if mode not in {"conventional", "igr"} or isinstance(order, bool) or \
+            order not in {1, 2, 3}:
+        raise CampaignError("final numerical policy mode/order is invalid")
+    volume, face = FINAL_IGR_QUADRATURE_BY_ORDER[order] \
+        if mode == "igr" else (12, 12)
+    return FinalNumericalPolicy(
+        volume,
+        face,
+        *FINAL_LINEAR_ROLE_RELATIVE_TOLERANCES,
+    )
 PRODUCTION_TENSOR_IGR_TRACE_POLICY_BY_ORDER = {
     1: (
         "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
@@ -1720,23 +1847,16 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
         resolved_trace_policy
     )
     expected_fixed_sigma_jacobi = expected_sigma_jacobi_sweeps > 0
-    expected_schwarz = resolved_trace_policy in {
-        "native-element-schwarz-fp64",
-        "native-element-schwarz-matrix-free-fp64",
-        "native-element-schwarz-equilibrated-field-split-fp64",
-        "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
-        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
-    } or expected_fixed_sigma_jacobi
-    expected_matrix_free = resolved_trace_policy in {
-        "native-element-schwarz-matrix-free-fp64",
-        "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
-        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
-    } or expected_fixed_sigma_jacobi
-    expected_element_field_split = resolved_trace_policy in {
-        "native-element-schwarz-equilibrated-field-split-fp64",
-        "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
-        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
-    } or expected_fixed_sigma_jacobi
+    patch_policy = native_element_schwarz_policy(
+        resolved_trace_policy, order
+    )
+    expected_schwarz = patch_policy is not None
+    expected_matrix_free = bool(
+        patch_policy is not None and patch_policy.matrix_free
+    )
+    expected_element_field_split = bool(
+        patch_policy is not None and patch_policy.equilibration_passes > 0
+    )
     if tensor.get("trace_solver") != expected_trace_solver:
         raise CampaignError(
             f"sample trace_solver={tensor.get('trace_solver')!r}; expected "
@@ -2226,7 +2346,11 @@ def validate_final_policy(record: dict[str, Any], *, mode: str,
     if not isinstance(policy, dict):
         raise CampaignError("benchmark lacks its numerical policy")
     quadrature = 2 * order + 2
-    expected_volume_assembly_order = 12 if mode == "igr" else quadrature
+    final_policy = final_numerical_policy(mode, order)
+    expected_volume_assembly_order = (
+        final_policy.igr_volume_quadrature_order
+        if mode == "igr" else quadrature
+    )
     expected_volume_points = (expected_volume_assembly_order // 2 + 1) ** 2
     if checked_int(record.get("volume_assembly_order"),
                    "volume_assembly_order", 1) != \
@@ -2244,8 +2368,10 @@ def validate_final_policy(record: dict[str, Any], *, mode: str,
         "volume_projection_quadrature_order": quadrature,
         "true_trace_projection_quadrature_order": quadrature,
         "conventional_assembly_quadrature_order": quadrature,
-        "igr_volume_assembly_quadrature_order": 12,
-        "igr_face_assembly_quadrature_order": 12,
+        "igr_volume_assembly_quadrature_order":
+            final_policy.igr_volume_quadrature_order,
+        "igr_face_assembly_quadrature_order":
+            final_policy.igr_face_quadrature_order,
         "maximum_nonlinear_updates": 80,
         "requested_maximum_linear_iterations": 0,
         "resolved_maximum_linear_iterations": max(
@@ -2264,9 +2390,12 @@ def validate_final_policy(record: dict[str, Any], *, mode: str,
             )
     expected_reals = {
         "nonlinear_relative_tolerance": 1.0e-10,
-        "newton_correction_linear_relative_tolerance": 1.0e-12,
-        "final_coherent_linear_relative_tolerance": 1.0e-12,
-        "true_residual_tightening_linear_relative_tolerance": 1.0e-12,
+        "newton_correction_linear_relative_tolerance":
+            final_policy.newton_linear_relative_tolerance,
+        "final_coherent_linear_relative_tolerance":
+            final_policy.final_linear_relative_tolerance,
+        "true_residual_tightening_linear_relative_tolerance":
+            final_policy.true_residual_tightening_linear_relative_tolerance,
         "true_residual_relative_tolerance": 1.0e-10,
         "conservation_relative_tolerance": 1.0e-10,
         "armijo_constant": 1.0e-4,
@@ -2469,54 +2598,74 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
                 f"configuration: observed={observed_configuration!r}; "
                 f"expected={expected_configuration!r}"
             )
-        expected_sigma_jacobi_sweeps, _, fixed_sigma_warp = \
+        expected_sigma_jacobi_sweeps, _, _ = \
             fixed_sigma_jacobi_policy(resolved_trace_policy)
-        warp_field_split = resolved_trace_policy in {
-            "native-element-schwarz-matrix-free-warp-"
-            "equilibrated-field-split-fp64",
-        } or fixed_sigma_warp
-        scalar_field_split = resolved_trace_policy in {
-            "native-element-schwarz-equilibrated-field-split-fp64",
-            "native-element-schwarz-matrix-free-"
-            "equilibrated-field-split-fp64",
-        } or (expected_sigma_jacobi_sweeps > 0 and not fixed_sigma_warp)
-        full_patch = resolved_trace_policy in {
-            "native-element-schwarz-fp64",
-            "native-element-schwarz-matrix-free-fp64",
-        }
-        expected_schwarz_apply = (
-            "cooperative-pivoted-lu-fp64" if warp_field_split else
-            "scalar-pivoted-lu-fp64" if scalar_field_split else
-            "scalar-full-patch-pivoted-lu-fp64" if full_patch else
-            "not-applicable"
+        patch_policy = native_element_schwarz_policy(
+            resolved_trace_policy, order
         )
-        expected_tile_width = (
-            16 if warp_field_split and order == 1 else
-            32 if warp_field_split else 0
-        )
-        if record.get("trace_element_schwarz_apply") != \
-                expected_schwarz_apply or checked_int(
+        expected_factorization = patch_policy.factorization \
+            if patch_policy is not None else "not-applicable"
+        expected_schwarz_apply = patch_policy.apply \
+            if patch_policy is not None else "not-applicable"
+        expected_tile_width = patch_policy.tile_width \
+            if patch_policy is not None else 0
+        expected_equilibration_passes = patch_policy.equilibration_passes \
+            if patch_policy is not None else 0
+        expected_euler_rows = patch_policy.euler_rows \
+            if patch_policy is not None else 0
+        expected_sigma_rows = patch_policy.sigma_rows \
+            if patch_policy is not None else 0
+        if record.get("trace_element_schwarz_factorization") != \
+                expected_factorization or record.get(
+                    "trace_element_schwarz_apply"
+                ) != expected_schwarz_apply or checked_int(
                     record.get("trace_element_schwarz_apply_tile_width"),
                     "trace_element_schwarz_apply_tile_width",
-                ) != expected_tile_width:
+                ) != expected_tile_width or checked_int(
+                    record.get("trace_element_schwarz_equilibration_passes"),
+                    "trace_element_schwarz_equilibration_passes",
+                ) != expected_equilibration_passes or checked_int(
+                    record.get("trace_element_schwarz_euler_rows"),
+                    "trace_element_schwarz_euler_rows",
+                ) != expected_euler_rows or checked_int(
+                    record.get("trace_element_schwarz_sigma_rows"),
+                    "trace_element_schwarz_sigma_rows",
+                ) != expected_sigma_rows:
             raise CampaignError(
-                "benchmark element-Schwarz apply metadata does not match "
+                "benchmark element-Schwarz factor/apply metadata does not match "
                 f"the resolved trace policy {resolved_trace_policy!r}"
             )
         expected_sigma_jacobi_damping = \
             2.0 / 3.0 if expected_sigma_jacobi_sweeps else 0.0
-        if checked_int(
+        generic_sigma_sweeps = checked_int(
+            record.get("trace_sigma_jacobi_sweeps"),
+            "trace_sigma_jacobi_sweeps",
+        )
+        generic_sigma_damping = checked_float(
+            record.get("trace_sigma_jacobi_damping"),
+            "trace_sigma_jacobi_damping",
+        )
+        compatibility_sigma_sweeps = checked_int(
                 record.get("trace_field_split_sigma_jacobi_sweeps"),
                 "trace_field_split_sigma_jacobi_sweeps",
-            ) != expected_sigma_jacobi_sweeps or not math.isclose(
-                checked_float(
-                    record.get("trace_field_split_sigma_jacobi_damping"),
-                    "trace_field_split_sigma_jacobi_damping",
-                ),
-                expected_sigma_jacobi_damping,
-                rel_tol=0.0,
-                abs_tol=0.0,
-            ):
+        )
+        compatibility_sigma_damping = checked_float(
+            record.get("trace_field_split_sigma_jacobi_damping"),
+            "trace_field_split_sigma_jacobi_damping",
+        )
+        if generic_sigma_sweeps != expected_sigma_jacobi_sweeps or \
+                compatibility_sigma_sweeps != generic_sigma_sweeps or \
+                not math.isclose(
+                    generic_sigma_damping,
+                    expected_sigma_jacobi_damping,
+                    rel_tol=0.0,
+                    abs_tol=0.0,
+                ) or not math.isclose(
+                    compatibility_sigma_damping,
+                    generic_sigma_damping,
+                    rel_tol=0.0,
+                    abs_tol=0.0,
+                ):
             raise CampaignError(
                 "benchmark fixed-sigma Jacobi metadata does not match "
                 f"the resolved trace policy {resolved_trace_policy!r}"
@@ -2903,10 +3052,23 @@ def record_summary(record: dict[str, Any]) -> dict[str, Any]:
             "cuda_runtime_version": record["cuda_runtime_version"],
         })
         summary["trace_preconditioner"] = record["trace_preconditioner"]
-        summary["trace_field_split_sigma_jacobi_policy"] = {
-            "sweeps": record["trace_field_split_sigma_jacobi_sweeps"],
-            "damping": record["trace_field_split_sigma_jacobi_damping"],
+        summary["trace_element_schwarz_factorization"] = record[
+            "trace_element_schwarz_factorization"
+        ]
+        summary["trace_sigma_jacobi_policy"] = {
+            "sweeps": record["trace_sigma_jacobi_sweeps"],
+            "damping": record["trace_sigma_jacobi_damping"],
         }
+        if record["trace_element_schwarz_factorization"] == \
+                "lower-multiplicative-uhat4-sigmahat":
+            summary["trace_field_split_sigma_jacobi_policy"] = {
+                "sweeps": record[
+                    "trace_field_split_sigma_jacobi_sweeps"
+                ],
+                "damping": record[
+                    "trace_field_split_sigma_jacobi_damping"
+                ],
+            }
         summary["trace_ilu_policy"] = {
             "type": record["trace_ilu_type"],
             "level_of_fill": record["trace_ilu_level_of_fill"],
@@ -3026,8 +3188,6 @@ def work_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "mgr_f_ilu_applications",
         "element_schwarz_patch_setups",
         "element_schwarz_preconditioner_applications",
-        "field_split_sigma_jacobi_sweeps",
-        "field_split_sigma_jacobi_updates",
         "element_schwarz_patch_rows",
         "element_schwarz_minimum_multiplicity",
         "element_schwarz_maximum_multiplicity",
@@ -3141,6 +3301,30 @@ def work_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
                     "maximum": max(values),
                     "total": sum(values),
                 }
+        for output_field, compatibility_field in (
+                ("sigma_jacobi_sweeps",
+                 "field_split_sigma_jacobi_sweeps"),
+                ("sigma_jacobi_updates",
+                 "field_split_sigma_jacobi_updates")):
+            values = [
+                tensor.get(compatibility_field) for tensor in tensor_samples
+            ]
+            if values and all(
+                    isinstance(value, int) and not isinstance(value, bool)
+                    for value in values):
+                aggregate = {
+                    "count": len(values),
+                    "minimum": min(values),
+                    "median": statistics.median(values),
+                    "maximum": max(values),
+                    "total": sum(values),
+                }
+                summary["tensor_core"][output_field] = aggregate
+                if all(
+                        record.get("trace_element_schwarz_factorization") ==
+                        "lower-multiplicative-uhat4-sigmahat"
+                        for record in record_list):
+                    summary["tensor_core"][compatibility_field] = aggregate
         factor_ages = [
             tensor.get("ilu_factor_age_generations")
             for tensor in tensor_samples
@@ -3371,7 +3555,8 @@ def final_command(executable: Path, *, engine: str, mode: str, order: int,
     trace_policy_configuration(
         engine, mode, trace_policy, order=order
     )
-    return [
+    numerical_policy = final_numerical_policy(mode, order)
+    command = [
         str(executable),
         "--mode", mode,
         "--engine", engine,
@@ -3380,6 +3565,15 @@ def final_command(executable: Path, *, engine: str, mode: str, order: int,
         "--mesh-n", str(mesh_n),
         "--domain-periods", str(domain_periods),
         "--dt", repr(timestep),
+        "--newton-linear-rtol",
+        repr(numerical_policy.newton_linear_relative_tolerance),
+        "--final-linear-rtol",
+        repr(numerical_policy.final_linear_relative_tolerance),
+        "--true-residual-tightening-linear-rtol",
+        repr(
+            numerical_policy.
+            true_residual_tightening_linear_relative_tolerance
+        ),
         "--export" if export else "--no-export",
         "--expected-source-revision", expected_build["source_revision"],
         "--expected-source-tree", expected_build["source_tree"],
@@ -3387,6 +3581,14 @@ def final_command(executable: Path, *, engine: str, mode: str, order: int,
         "--expected-build-directory", expected_build["build_directory"],
         "--expected-cmake-cache", expected_build["cmake_cache"],
     ]
+    if mode == "igr":
+        command.extend((
+            "--igr-volume-quadrature-order",
+            str(numerical_policy.igr_volume_quadrature_order),
+            "--igr-face-quadrature-order",
+            str(numerical_policy.igr_face_quadrature_order),
+        ))
+    return command
 
 
 def frozen_command(executable: Path, *, mode: str, order: int, mesh_n: int,

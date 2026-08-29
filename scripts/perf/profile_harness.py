@@ -58,6 +58,8 @@ NCU_INSTRUCTION_QUALIFICATION_KINDS = frozenset({
     "tensor-instructions", "tensor-volume-instructions",
 })
 PRODUCTION_TRACE_POLICY = "engine-default"
+FINAL_IGR_QUADRATURE_BY_ORDER = {1: (6, 4), 2: (8, 6), 3: (10, 8)}
+FINAL_LINEAR_ROLE_RELATIVE_TOLERANCES = (1.0e-10, 3.0e-11, 1.0e-12)
 
 
 class FixedSigmaJacobiProfilePolicy(NamedTuple):
@@ -197,7 +199,21 @@ FIXED_SIGMA_JACOBI_PROFILE_POLICIES = {
         "sigma_jacobi10_fp64",
         True,
     ),
+    "native-element-schwarz-matrix-free-warp-coupled-"
+    "sigma-jacobi2-fp64": FixedSigmaJacobiProfilePolicy(
+        2,
+        "native_element_schwarz_warp_coupled_sigma_jacobi2_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-warp-coupled-"
+    "sigma-jacobi10-fp64": FixedSigmaJacobiProfilePolicy(
+        10,
+        "native_element_schwarz_warp_coupled_sigma_jacobi10_fp64",
+        True,
+    ),
 }
+COUPLED_WARP_BASE_PROFILE_POLICY = \
+    "native-element-schwarz-matrix-free-warp-coupled-fp64"
 PRODUCTION_TENSOR_IGR_TRACE_POLICY_BY_ORDER = {
     1: (
         "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
@@ -221,6 +237,10 @@ class ProfileTracePolicyContract(NamedTuple):
     variant: str
     production_selectable: bool
     fixed_sigma_jacobi: FixedSigmaJacobiProfilePolicy | None
+    element_schwarz_required: bool
+    factorization: str
+    apply: str
+    tile_width: int
 
 
 def _profile_trace_policy_contract(
@@ -239,16 +259,54 @@ def _profile_trace_policy_contract(
             preconditioner = "hypre_diag_scale"
             fixed = None
         return ProfileTracePolicyContract(
-            requested, resolved, preconditioner, "production", True, fixed
+            requested,
+            resolved,
+            preconditioner,
+            "production",
+            True,
+            fixed,
+            mode == "igr",
+            "lower-multiplicative-uhat4-sigmahat"
+            if mode == "igr" else "not-applicable",
+            "cooperative-pivoted-lu-fp64"
+            if mode == "igr" else "not-applicable",
+            (16 if order == 1 else 32) if mode == "igr" else 0,
+        )
+    if requested == COUPLED_WARP_BASE_PROFILE_POLICY and mode == "igr":
+        return ProfileTracePolicyContract(
+            requested,
+            requested,
+            "native_element_schwarz_warp_coupled_fp64",
+            "ablation",
+            False,
+            None,
+            True,
+            "full-coupled-patch-lu",
+            "cooperative-full-patch-pivoted-lu-fp64",
+            32,
         )
     fixed = FIXED_SIGMA_JACOBI_PROFILE_POLICIES.get(requested)
     if fixed is None or mode != "igr":
         raise RuntimeError(
             "profiled trace policy is neither engine-default nor an exact "
-            "benchmark-only fixed-sigma Jacobi IGR policy"
+            "native element-Schwarz IGR ablation policy"
         )
+    coupled = "-warp-coupled-" in requested
     return ProfileTracePolicyContract(
-        requested, requested, fixed.preconditioner, "ablation", False, fixed
+        requested,
+        requested,
+        fixed.preconditioner,
+        "ablation",
+        False,
+        fixed,
+        True,
+        "full-coupled-patch-lu" if coupled
+        else "lower-multiplicative-uhat4-sigmahat",
+        "cooperative-full-patch-pivoted-lu-fp64" if coupled
+        else "cooperative-pivoted-lu-fp64" if fixed.warp
+        else "scalar-pivoted-lu-fp64",
+        32 if coupled or (fixed.warp and order != 1)
+        else 16 if fixed.warp else 0,
     )
 
 
@@ -896,12 +954,46 @@ def validate_accepted_step_qualification_application(
                 f"profiler qualification application {option}={value!r}; "
                 f"expected {expected!r}"
             )
-    if required_application_value(parser, args, "--mode") not in {
-            "conventional", "igr"}:
+    mode = required_application_value(parser, args, "--mode")
+    if mode not in {"conventional", "igr"}:
         parser.error("profiler qualification requires conventional or IGR mode")
-    order = required_application_value(parser, args, "--order")
-    if order not in {"1", "2", "3"}:
+    order_text = required_application_value(parser, args, "--order")
+    if order_text not in {"1", "2", "3"}:
         parser.error("profiler qualification requires application order 1, 2, or 3")
+    order = int(order_text)
+    # Promotion-bound NCU/Nsys captures qualify only the production selector.
+    # Explicit coupled and lower-split policies remain available to ordinary
+    # smoke/screening runs, but may not be represented as promotable evidence.
+    expected_role_tolerances = dict(zip(
+        ("--newton-linear-rtol", "--final-linear-rtol",
+         "--true-residual-tightening-linear-rtol"),
+        FINAL_LINEAR_ROLE_RELATIVE_TOLERANCES,
+    ))
+    for option, expected in expected_role_tolerances.items():
+        try:
+            value = float(required_application_value(parser, args, option))
+        except ValueError:
+            parser.error(f"profiler qualification application {option} is invalid")
+        if value != expected:
+            parser.error(
+                f"profiler qualification application {option}={value!r}; "
+                f"expected {expected!r}"
+            )
+    if mode == "igr":
+        volume, face = FINAL_IGR_QUADRATURE_BY_ORDER[order]
+        for option, expected in (
+                ("--igr-volume-quadrature-order", volume),
+                ("--igr-face-quadrature-order", face)):
+            if required_application_value(parser, args, option) != str(expected):
+                parser.error(
+                    f"profiler qualification application {option} must be "
+                    f"{expected} for p{order} IGR"
+                )
+    elif "--igr-volume-quadrature-order" in args.arg or \
+            "--igr-face-quadrature-order" in args.arg:
+        parser.error(
+            "conventional profiler qualification forbids IGR quadrature options"
+        )
     measured_step = required_application_value(
         parser, args, "--profile-measured-step"
     )
@@ -1440,17 +1532,24 @@ def _validated_fixed_sigma_jacobi_work(
             "profiled fixed-sigma Jacobi aggregate work does not exactly "
             "match the selected typed trace policy"
         )
-    if descriptor is not None and applications == 0:
+    if contract.element_schwarz_required and applications == 0:
         raise RuntimeError(
-            "profiled fixed-sigma Jacobi policy has no material "
+            "profiled native element-Schwarz policy has no material "
             "preconditioner work"
         )
-    return {
+    result: dict[str, int | float] = {
         "element_schwarz_preconditioner_applications": applications,
-        "field_split_sigma_jacobi_sweeps": sweeps,
-        "field_split_sigma_jacobi_damping": damping,
-        "field_split_sigma_jacobi_updates": updates,
+        "sigma_jacobi_sweeps": sweeps,
+        "sigma_jacobi_damping": damping,
+        "sigma_jacobi_updates": updates,
     }
+    if contract.factorization == "lower-multiplicative-uhat4-sigmahat":
+        result.update({
+            "field_split_sigma_jacobi_sweeps": sweeps,
+            "field_split_sigma_jacobi_damping": damping,
+            "field_split_sigma_jacobi_updates": updates,
+        })
+    return result
 
 
 def application_argument(args: argparse.Namespace, option: str) -> str:
@@ -1506,6 +1605,16 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
     trace_policy_contract = _profile_trace_policy_contract(
         requested_trace_policy, expected_mode, expected_order
     )
+    expected_equilibration_passes = (
+        2 if trace_policy_contract.factorization ==
+        "lower-multiplicative-uhat4-sigmahat" else 0
+    )
+    expected_euler_rows = (
+        16 * (expected_order + 1) if expected_equilibration_passes else 0
+    )
+    expected_sigma_rows = (
+        4 * (expected_order + 1) if expected_equilibration_passes else 0
+    )
     exact_record = (
         record.get("schema") == 2 and record.get("success") is True and
         record.get("variant") == trace_policy_contract.variant and
@@ -1520,6 +1629,18 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
             trace_policy_contract.resolved and
         record.get("trace_preconditioner") ==
             trace_policy_contract.preconditioner and
+        record.get("trace_element_schwarz_factorization") ==
+            trace_policy_contract.factorization and
+        record.get("trace_element_schwarz_apply") ==
+            trace_policy_contract.apply and
+        record.get("trace_element_schwarz_apply_tile_width") ==
+            trace_policy_contract.tile_width and
+        record.get("trace_element_schwarz_equilibration_passes") ==
+            expected_equilibration_passes and
+        record.get("trace_element_schwarz_euler_rows") ==
+            expected_euler_rows and
+        record.get("trace_element_schwarz_sigma_rows") ==
+            expected_sigma_rows and
         record.get("mode") == expected_mode and
         record.get("polynomial_order") == expected_order and
         record.get("mesh_n") == expected_mesh_n and
@@ -1540,6 +1661,44 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
             "profiled benchmark summary does not match the exact typed tensor "
             "accepted-step trace-policy selection"
         )
+    numerical_policy = record.get("numerical_policy")
+    if not isinstance(numerical_policy, dict):
+        raise RuntimeError(
+            "profiled benchmark summary has no reported numerical policy"
+        )
+    if expected_mode == "igr":
+        expected_volume_order, expected_face_order = \
+            FINAL_IGR_QUADRATURE_BY_ORDER[expected_order]
+        observed_volume_order = exact_nonnegative_integer(
+            numerical_policy.get("igr_volume_assembly_quadrature_order"),
+            "reported IGR volume quadrature order",
+        )
+        observed_face_order = exact_nonnegative_integer(
+            numerical_policy.get("igr_face_assembly_quadrature_order"),
+            "reported IGR face quadrature order",
+        )
+        if (observed_volume_order, observed_face_order) != \
+                (expected_volume_order, expected_face_order):
+            raise RuntimeError(
+                "profiled benchmark reported IGR quadrature policy does not "
+                f"match p{expected_order}: observed "
+                f"({observed_volume_order},{observed_face_order}), expected "
+                f"({expected_volume_order},{expected_face_order})"
+            )
+    reported_role_tolerances = tuple(
+        exact_finite_number(numerical_policy.get(field), f"reported {field}")
+        for field in (
+            "newton_correction_linear_relative_tolerance",
+            "final_coherent_linear_relative_tolerance",
+            "true_residual_tightening_linear_relative_tolerance",
+        )
+    )
+    if reported_role_tolerances != \
+            FINAL_LINEAR_ROLE_RELATIVE_TOLERANCES:
+        raise RuntimeError(
+            "profiled benchmark reported role-specific linear tolerances do "
+            "not match the exact final numerical policy"
+        )
     expected_sigma_sweeps = (
         trace_policy_contract.fixed_sigma_jacobi.sweeps
         if trace_policy_contract.fixed_sigma_jacobi is not None else 0
@@ -1548,13 +1707,26 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         2.0 / 3.0
         if trace_policy_contract.fixed_sigma_jacobi is not None else 0.0
     )
-    if exact_nonnegative_integer(
-            record.get("trace_field_split_sigma_jacobi_sweeps"),
-            "top-level fixed-sigma Jacobi sweep count",
-        ) != expected_sigma_sweeps or exact_finite_number(
-            record.get("trace_field_split_sigma_jacobi_damping"),
-            "top-level fixed-sigma Jacobi damping",
-        ) != expected_sigma_damping:
+    generic_sigma_sweeps = exact_nonnegative_integer(
+        record.get("trace_sigma_jacobi_sweeps"),
+        "top-level sigma Jacobi sweep count",
+    )
+    generic_sigma_damping = exact_finite_number(
+        record.get("trace_sigma_jacobi_damping"),
+        "top-level sigma Jacobi damping",
+    )
+    compatibility_sigma_sweeps = exact_nonnegative_integer(
+        record.get("trace_field_split_sigma_jacobi_sweeps"),
+        "compatibility fixed-sigma Jacobi sweep count",
+    )
+    compatibility_sigma_damping = exact_finite_number(
+        record.get("trace_field_split_sigma_jacobi_damping"),
+        "compatibility fixed-sigma Jacobi damping",
+    )
+    if generic_sigma_sweeps != expected_sigma_sweeps or \
+            compatibility_sigma_sweeps != generic_sigma_sweeps or \
+            generic_sigma_damping != expected_sigma_damping or \
+            compatibility_sigma_damping != generic_sigma_damping:
         raise RuntimeError(
             "profiled benchmark fixed-sigma Jacobi metadata does not exactly "
             "match the selected typed trace policy"
@@ -1651,8 +1823,10 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
     volume_points = exact_nonnegative_integer(
         record.get("volume_points"), "volume point count"
     )
-    expected_volume_assembly_order = 12 if expected_mode == "igr" \
-        else 2 * expected_order + 2
+    expected_volume_assembly_order = (
+        FINAL_IGR_QUADRATURE_BY_ORDER[expected_order][0]
+        if expected_mode == "igr" else 2 * expected_order + 2
+    )
     expected_volume_points = (expected_volume_assembly_order // 2 + 1) ** 2
     if volume_assembly_order != expected_volume_assembly_order or \
             volume_points != expected_volume_points:
@@ -1775,6 +1949,11 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         "trace_policy": trace_policy_contract.requested,
         "resolved_trace_policy": trace_policy_contract.resolved,
         "trace_preconditioner": trace_policy_contract.preconditioner,
+        "trace_element_schwarz_factorization":
+            trace_policy_contract.factorization,
+        "trace_element_schwarz_apply": trace_policy_contract.apply,
+        "trace_element_schwarz_apply_tile_width":
+            trace_policy_contract.tile_width,
         "promotion_eligible_trace_policy":
             trace_policy_contract.production_selectable,
         "polynomial_order": expected_order,
