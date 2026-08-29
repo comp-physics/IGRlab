@@ -146,6 +146,22 @@ history, replay stream, or flight recorder. Promotion depends on paired GPU
 screening against the stronger full-patch FP64 Schwarz control; this design is
 not production-selectable by itself.
 
+`native-element-schwarz-matrix-free-equilibrated-field-split-fp64` is the
+explicit combined ablation. It changes only the global GMRES operator action
+from assembled CSR to the existing exact FP64 `T^T S_e T` element-Schur
+action, while selecting the same two-pass equilibrated lower multiplicative
+Euler/sigma patch preconditioner described above. The combination has its own
+typed policy and private operator kind: neither the matrix-free/full-Schwarz
+policy nor the assembled/equilibrated-field-split policy acquires an implicit
+second interpretation. Cross-paired or unknown operator kinds fail before a
+cooperative solve is queued. The FP64 GMRES policy, assembled current matrix
+used by the independent true-residual authority, all acceptance gates, and
+bounded aggregate setup/application accounting remain unchanged. It reuses
+the existing arenas and adds no persistent allocation, fallback, history,
+replay stream, public evidence API, or flight recorder. Performance maturity
+requires a later paired GPU measurement; this host-qualified slice makes no
+speedup claim.
+
 The benchmark emits the selected policy at top level and in every bounded
 sample. The driver validates every preconditioner, ILU, triangular-solve,
 accounting, and factor-lifetime dimension exactly, then requires `O_common`

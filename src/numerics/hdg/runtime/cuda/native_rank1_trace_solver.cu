@@ -48,6 +48,27 @@ NativeTracePreconditionerIsEquilibratedFieldSplit(
       element_overlap_schwarz_equilibrated_field_split_fp64;
 }
 
+__host__ __device__ constexpr bool NativeTraceOperatorIsElementMatrixFree(
+    const NativeTraceOperatorKind kind) noexcept
+{
+  return kind == NativeTraceOperatorKind::element_matrix_free_fp64 ||
+      kind == NativeTraceOperatorKind::
+          element_matrix_free_equilibrated_field_split_fp64;
+}
+
+__host__ __device__ constexpr bool NativeTraceOperatorMatchesPreconditioner(
+    const NativeTraceOperatorKind operator_kind,
+    const NativeTracePreconditionerKind preconditioner_kind) noexcept
+{
+  return (operator_kind == NativeTraceOperatorKind::element_matrix_free_fp64 &&
+          preconditioner_kind == NativeTracePreconditionerKind::
+              element_overlap_schwarz_fp64) ||
+      (operator_kind == NativeTraceOperatorKind::
+               element_matrix_free_equilibrated_field_split_fp64 &&
+       preconditioner_kind == NativeTracePreconditionerKind::
+           element_overlap_schwarz_equilibrated_field_split_fp64);
+}
+
 bool CheckedAdd(const std::size_t left, const std::size_t right,
                 std::size_t& result) noexcept
 {
@@ -684,6 +705,12 @@ __device__ void ApplyTraceOperator(
     SparseMatrixVector(system.matrix, input, output, control, grid);
     return;
   }
+  if (!NativeTraceOperatorIsElementMatrixFree(system.operator_kind))
+  {
+    MarkFailure(control, failure_invalid_system);
+    grid.sync();
+    return;
+  }
 
   const NativeTraceElementSchwarzView schwarz =
       preconditioner.element_schwarz;
@@ -1188,15 +1215,14 @@ __global__ void NativeRankOneTraceSolveKernel(
         NativeTracePreconditionerIsEquilibratedFieldSplit(
             preconditioner.kind),
         control, grid);
-  if (system.operator_kind ==
-      NativeTraceOperatorKind::element_matrix_free_fp64)
+  if (NativeTraceOperatorIsElementMatrixFree(system.operator_kind))
   {
     const NativeTraceElementSchwarzView schwarz =
         preconditioner.element_schwarz;
     const int entries = schwarz.elements * schwarz.patch_rows *
         schwarz.patch_rows;
-    if (preconditioner.kind !=
-            NativeTracePreconditionerKind::element_overlap_schwarz_fp64 ||
+    if (!NativeTraceOperatorMatchesPreconditioner(
+            system.operator_kind, preconditioner.kind) ||
         system.element_schur == nullptr)
       MarkFailure(control, failure_invalid_system);
     else
@@ -1743,8 +1769,8 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
       NativeTracePreconditionerKind::ilu0_rcm_jacobi;
   const bool use_element_schwarz =
       NativeTracePreconditionerIsElementSchwarz(preconditioner.kind);
-  const bool use_matrix_free = system.operator_kind ==
-      NativeTraceOperatorKind::element_matrix_free_fp64;
+  const bool use_matrix_free =
+      NativeTraceOperatorIsElementMatrixFree(system.operator_kind);
   const bool use_cgs2 = use_ilu || use_element_schwarz;
   const NativeTraceWorkspaceRequirements requirements =
       QueryNativeTraceWorkspaceRequirements(
@@ -1929,8 +1955,8 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
       workspace.small_doubles < requirements.small_doubles ||
       workspace.permutation_integers < requirements.permutation_integers ||
       (use_matrix_free &&
-       (preconditioner.kind != NativeTracePreconditionerKind::
-            element_overlap_schwarz_fp64 ||
+       (!NativeTraceOperatorMatchesPreconditioner(
+            system.operator_kind, preconditioner.kind) ||
         system.element_schur == nullptr ||
         !IsAligned(system.element_schur, alignof(double)))) ||
       (!use_matrix_free &&

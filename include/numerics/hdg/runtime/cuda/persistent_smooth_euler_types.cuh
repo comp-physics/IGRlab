@@ -332,7 +332,8 @@ enum class CudaTracePolicyKind : std::uint8_t
   equilibrated_mgr = 2,
   native_element_schwarz_fp64 = 3,
   native_element_schwarz_matrix_free_fp64 = 4,
-  native_element_schwarz_equilibrated_field_split_fp64 = 5
+  native_element_schwarz_equilibrated_field_split_fp64 = 5,
+  native_element_schwarz_matrix_free_equilibrated_field_split_fp64 = 6
 };
 
 constexpr bool IsKnownCudaTracePolicyKind(
@@ -345,7 +346,9 @@ constexpr bool IsKnownCudaTracePolicyKind(
       kind ==
           CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64 ||
       kind == CudaTracePolicyKind::
-          native_element_schwarz_equilibrated_field_split_fp64;
+          native_element_schwarz_equilibrated_field_split_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_fp64;
 }
 
 constexpr const char* CudaTracePolicyKindName(
@@ -366,6 +369,9 @@ constexpr const char* CudaTracePolicyKindName(
   case CudaTracePolicyKind::
       native_element_schwarz_equilibrated_field_split_fp64:
     return "native-element-schwarz-equilibrated-field-split-fp64";
+  case CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_equilibrated_field_split_fp64:
+    return "native-element-schwarz-matrix-free-equilibrated-field-split-fp64";
   }
   return "unknown";
 }
@@ -719,7 +725,18 @@ constexpr bool CudaTracePolicyUsesNativeElementMatrixFreeOperator(
     const CudaTracePolicyKind kind) noexcept
 {
   return kind ==
-      CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64;
+          CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_fp64;
+}
+
+/** Exact matrix-free/operator and equilibrated-field-split pairing. */
+constexpr bool
+CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
+    const CudaTracePolicyKind kind) noexcept
+{
+  return kind == CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_equilibrated_field_split_fp64;
 }
 
 constexpr CudaIluFactorReusePolicy CudaIluFactorReusePolicyForEngine(
@@ -931,12 +948,16 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
     return result;
   }
 
-  // Benchmark-only native multiplicative field split.  It retains the exact
-  // global FP64 operator and outer GMRES, while each signed element patch
-  // applies a two-pass equilibrated lower block factorization over the
-  // natural Uhat4 Euler and scalar sigmahat fields.  It has no fallback.
+  // Benchmark-only native multiplicative field split.  The assembled policy
+  // retains the exact global FP64 CSR action; the separately typed combined
+  // policy selects the exact element-Schur action.  Both retain the same FP64
+  // outer GMRES and apply a two-pass equilibrated lower block factorization
+  // over the natural Uhat4 Euler and scalar sigmahat fields.  Neither has a
+  // fallback.
   if (selection == CudaTracePolicyKind::
-          native_element_schwarz_equilibrated_field_split_fp64)
+          native_element_schwarz_equilibrated_field_split_fp64 ||
+      selection == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_fp64)
   {
     if (engine != generic::CudaEngineKind::tensor_core || !igr_active)
       return result;

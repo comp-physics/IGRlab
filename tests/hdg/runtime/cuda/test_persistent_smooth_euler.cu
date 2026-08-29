@@ -236,6 +236,16 @@ constexpr bool TraceSolverSelectionPolicy() noexcept
       ResolveCudaTraceSolverKind(
           CudaEngineKind::tensor_core, 2, true, true, true, true,
           CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64) ==
+          CudaTraceSolverKind::unconfigured &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 1, false, true, true, true,
+          CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_equilibrated_field_split_fp64) ==
+          CudaTraceSolverKind::native_rank1_fp64 &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 2, true, true, true, true,
+          CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_equilibrated_field_split_fp64) ==
           CudaTraceSolverKind::unconfigured;
 }
 
@@ -1301,7 +1311,44 @@ bool NativeElementSchwarzDeviceFixture()
     if (std::abs(host_solution[static_cast<std::size_t>(row)] -
                  right_hand_side[static_cast<std::size_t>(row)]) > 1.0e-11)
       return false;
-  return true;
+
+  // The combined policy is a separately typed operator/preconditioner pair.
+  // It reuses the exact element Schur block for the global action and the
+  // already-built equilibrated factors for the preconditioner.  Cross-pairing
+  // either operator kind must fail before a kernel is queued.
+  system.operator_kind = NativeTraceOperatorKind::
+      element_matrix_free_equilibrated_field_split_fp64;
+  system.element_schur = schur.data();
+  if (cudaMemset(solution.data(), 0,
+                 static_cast<std::size_t>(rows) * sizeof(double)) !=
+          cudaSuccess ||
+      !LaunchNativeRankOneTraceSolve(
+          system, preconditioner, workspace, policy, support, nullptr) ||
+      cudaDeviceSynchronize() != cudaSuccess ||
+      !solution.CopyTo(host_solution) || !control.CopyOneTo(observation) ||
+      observation.status != NativeTraceSolveStatus::converged ||
+      observation.preconditioner_applications <= 0 ||
+      observation.operator_applications <= 0)
+    return false;
+  for (int row = 0; row < rows; ++row)
+    if (std::abs(host_solution[static_cast<std::size_t>(row)] -
+                 right_hand_side[static_cast<std::size_t>(row)]) > 1.0e-11)
+      return false;
+
+  auto mismatched = system;
+  mismatched.operator_kind = NativeTraceOperatorKind::element_matrix_free_fp64;
+  if (LaunchNativeRankOneTraceSolve(
+          mismatched, preconditioner, workspace, policy, support, nullptr))
+    return false;
+  auto full_schwarz = preconditioner;
+  full_schwarz.kind =
+      NativeTracePreconditionerKind::element_overlap_schwarz_fp64;
+  if (LaunchNativeRankOneTraceSolve(
+          system, full_schwarz, workspace, policy, support, nullptr))
+    return false;
+  mismatched.operator_kind = static_cast<NativeTraceOperatorKind>(255);
+  return !LaunchNativeRankOneTraceSolve(
+      mismatched, preconditioner, workspace, policy, support, nullptr);
 }
 
 std::vector<double> ConventionalFixtureMatrix()
@@ -1980,6 +2027,18 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       CudaEngineKind::ordinary, true,
       CudaTracePolicyKind::
           native_element_schwarz_equilibrated_field_split_fp64);
+  const auto tensor_igr_combined = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, true,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_fp64);
+  const auto tensor_conventional_combined = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, false,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_fp64);
+  const auto ordinary_igr_combined = ResolveCudaTracePolicy(
+      CudaEngineKind::ordinary, true,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_fp64);
   const auto unknown = ResolveCudaTracePolicy(
       CudaEngineKind::ordinary, false,
       static_cast<CudaTracePolicyKind>(255));
@@ -2086,10 +2145,26 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       tensor_igr_field_split.ilu_type == -1 &&
       tensor_igr_field_split.ilu_factor_reuse_policy ==
           CudaIluFactorReusePolicy::not_applicable &&
+      !CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          tensor_igr_field_split.selection) &&
       !tensor_conventional_field_split.valid &&
       !CudaTracePolicyDescriptorIsExact(tensor_conventional_field_split) &&
       !ordinary_igr_field_split.valid &&
       !CudaTracePolicyDescriptorIsExact(ordinary_igr_field_split) &&
+      CudaTracePolicyDescriptorIsExact(tensor_igr_combined) &&
+      tensor_igr_combined.trace_preconditioner ==
+          CudaTracePreconditionerKind::
+              native_element_schwarz_equilibrated_field_split_fp64 &&
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          tensor_igr_combined.selection) &&
+      CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
+          tensor_igr_combined.selection) &&
+      !CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
+          tensor_igr_matrix_free.selection) &&
+      !tensor_conventional_combined.valid &&
+      !CudaTracePolicyDescriptorIsExact(tensor_conventional_combined) &&
+      !ordinary_igr_combined.valid &&
+      !CudaTracePolicyDescriptorIsExact(ordinary_igr_combined) &&
       !tensor_conventional_mgr.valid &&
       !CudaTracePolicyDescriptorIsExact(tensor_conventional_mgr) &&
       !ordinary_igr_mgr.valid &&
@@ -2112,6 +2187,10 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
           CudaTracePolicyKind::
               native_element_schwarz_equilibrated_field_split_fp64)) ==
           "native-element-schwarz-equilibrated-field-split-fp64" &&
+      std::string_view(CudaTracePolicyKindName(
+          CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_equilibrated_field_split_fp64)) ==
+          "native-element-schwarz-matrix-free-equilibrated-field-split-fp64" &&
       std::string_view(CudaTracePreconditionerName(
           CudaTracePreconditionerKind::hypre_mgr_field_split)) ==
           "hypre_mgr_field_split" &&

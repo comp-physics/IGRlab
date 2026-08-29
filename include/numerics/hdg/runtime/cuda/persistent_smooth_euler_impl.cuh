@@ -444,7 +444,8 @@ struct CudaNativeElementSchwarzView
 enum class CudaNativeTraceOperatorKind : std::uint8_t
 {
   assembled_csr_fp64 = 1,
-  element_matrix_free_fp64 = 2
+  element_matrix_free_fp64 = 2,
+  element_matrix_free_equilibrated_field_split_fp64 = 3
 };
 
 struct CudaNativeTraceOperatorView

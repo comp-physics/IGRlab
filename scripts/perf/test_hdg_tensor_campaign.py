@@ -120,7 +120,9 @@ parser.add_argument(
     choices=("engine-default", "common-fast", "equilibrated-mgr",
              "native-element-schwarz-fp64",
              "native-element-schwarz-matrix-free-fp64",
-             "native-element-schwarz-equilibrated-field-split-fp64"),
+             "native-element-schwarz-equilibrated-field-split-fp64",
+             "native-element-schwarz-matrix-free-equilibrated-field-split-"
+             "fp64"),
 )
 parser.add_argument("--order", required=True, type=int)
 parser.add_argument("--mesh-n", required=True, type=int)
@@ -139,10 +141,14 @@ args = parser.parse_args()
 is_frozen = "frozen" in str(Path(__file__))
 common_fast = args.trace_policy == "common-fast"
 equilibrated_mgr = args.trace_policy == "equilibrated-mgr"
-matrix_free = args.trace_policy == \
-    "native-element-schwarz-matrix-free-fp64"
-element_field_split = args.trace_policy == \
-    "native-element-schwarz-equilibrated-field-split-fp64"
+matrix_free = args.trace_policy in (
+    "native-element-schwarz-matrix-free-fp64",
+    "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
+)
+element_field_split = args.trace_policy in (
+    "native-element-schwarz-equilibrated-field-split-fp64",
+    "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
+)
 element_schwarz = args.trace_policy == "native-element-schwarz-fp64" or \
     matrix_free or element_field_split
 if equilibrated_mgr and (args.engine != "tensor" or args.mode != "igr"):
@@ -1370,6 +1376,70 @@ def main() -> int:
                 "flight_recorder", "replay",
             })
 
+        combined_policy = \
+            "native-element-schwarz-matrix-free-equilibrated-field-split-fp64"
+        combined_command = CAMPAIGN.final_command(
+            final,
+            engine="tensor",
+            mode="igr",
+            order=2,
+            mesh_n=12,
+            domain_periods=3,
+            timestep=1.0e-5,
+            export=False,
+            expected_build=explicit_build,
+            trace_policy=combined_policy,
+        )
+        combined_record = json.loads(run(combined_command, root).stdout)
+        CAMPAIGN.validate_record(
+            combined_record,
+            **{**schwarz_validation_arguments,
+               "trace_policy": combined_policy},
+        )
+        assert combined_record["variant"] == "ablation"
+        assert combined_record["production_selectable"] is False
+        assert combined_record["trace_solver"] == "native-rank1-fp64"
+        assert combined_record["trace_preconditioner"] == \
+            "native_element_schwarz_equilibrated_field_split_fp64"
+        for sample in combined_record["samples"]:
+            tensor = sample["tensor_core"]
+            assert tensor["native_element_schwarz_configured"] is True
+            assert tensor[
+                "native_matrix_free_trace_operator_configured"
+            ] is True
+            assert tensor[
+                "native_matrix_free_trace_operator_applications"
+            ] == sample["linear_iterations"]
+            assert tensor["equilibration_builds"] == sample["trace_solves"]
+            assert tensor["equilibration_passes"] == \
+                2 * sample["trace_solves"]
+            assert tensor["element_schwarz_patch_setups"] == \
+                sample["trace_solves"]
+            assert not set(tensor).intersection({
+                "schwarz_history", "field_split_history", "event_stream",
+                "flight_recorder", "replay",
+            })
+
+        def combined_rejected(record: dict) -> bool:
+            try:
+                CAMPAIGN.validate_record(
+                    record,
+                    **{**schwarz_validation_arguments,
+                       "trace_policy": combined_policy},
+                )
+            except CAMPAIGN.CampaignError:
+                return True
+            return False
+
+        for field, value in (
+                ("native_matrix_free_trace_operator_configured", False),
+                ("native_matrix_free_trace_operator_applications", 0),
+                ("equilibration_builds", 0),
+                ("equilibration_passes", 0)):
+            invalid_combined = copy.deepcopy(combined_record)
+            invalid_combined["samples"][0]["tensor_core"][field] = value
+            assert combined_rejected(invalid_combined)
+
         def schwarz_rejected(record: dict) -> bool:
             try:
                 CAMPAIGN.validate_record(
@@ -1599,6 +1669,23 @@ def main() -> int:
         ) == "not_applicable"
         assert CAMPAIGN.expected_trace_solver_configuration(
             "tensor", "igr", field_split_policy
+        ) == ("native-rank1-fp64", True, False, False)
+        combined_policy = \
+            "native-element-schwarz-matrix-free-equilibrated-field-split-fp64"
+        assert CAMPAIGN.expected_trace_preconditioner(
+            "tensor", "igr", combined_policy
+        ) == "native_element_schwarz_equilibrated_field_split_fp64"
+        assert CAMPAIGN.expected_trace_ilu_policy(
+            "tensor", "igr", combined_policy
+        ) == (-1, -1, -1, 0)
+        assert CAMPAIGN.expected_trace_ilu_triangular_solve_policy(
+            "tensor", "igr", combined_policy
+        ) == ("not_applicable", 0, 0, 0)
+        assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
+            "tensor", "igr", combined_policy
+        ) == "not_applicable"
+        assert CAMPAIGN.expected_trace_solver_configuration(
+            "tensor", "igr", combined_policy
         ) == ("native-rank1-fp64", True, False, False)
         for engine, mode in (
                 ("ordinary", "igr"),

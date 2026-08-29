@@ -1380,6 +1380,11 @@ bool CudaLaunchNativeRankOneTraceSolver(
   case CudaNativeTraceOperatorKind::element_matrix_free_fp64:
     system.operator_kind = NativeTraceOperatorKind::element_matrix_free_fp64;
     break;
+  case CudaNativeTraceOperatorKind::
+      element_matrix_free_equilibrated_field_split_fp64:
+    system.operator_kind = NativeTraceOperatorKind::
+        element_matrix_free_equilibrated_field_split_fp64;
+    break;
   default:
     return false;
   }
