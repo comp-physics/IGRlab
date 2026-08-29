@@ -1304,6 +1304,24 @@ static_assert(!IluDerivedBoundsAreConsistent(
 static_assert(!IluDerivedBoundsAreConsistent(
     1, 2, 0, 1, 1, 2, 0, 0, 0, 1, 1));
 
+static constexpr std::uint64_t ExpectedIluFactorAgeGenerations(
+    const CudaIluFactorReusePolicy policy,
+    const std::uint64_t trace_solves) noexcept
+{
+  return policy ==
+          CudaIluFactorReusePolicy::first_trace_solve_per_attempt &&
+      trace_solves > 0 ? trace_solves - 1 : 0;
+}
+
+static_assert(ExpectedIluFactorAgeGenerations(
+    CudaIluFactorReusePolicy::refresh_each_trace_solve, 2) == 0);
+static_assert(ExpectedIluFactorAgeGenerations(
+    CudaIluFactorReusePolicy::first_trace_solve_per_attempt, 0) == 0);
+static_assert(ExpectedIluFactorAgeGenerations(
+    CudaIluFactorReusePolicy::first_trace_solve_per_attempt, 2) == 1);
+static_assert(ExpectedIluFactorAgeGenerations(
+    CudaIluFactorReusePolicy::not_applicable, 2) == 0);
+
 bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
              const CudaEngineKind engine, const bool igr_active,
              const CudaTracePolicyKind trace_policy,
@@ -1352,6 +1370,9 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
       : first_solve_per_attempt && linear_solve_attempts > 0 ? 1 : 0;
   const std::uint64_t expected_reuses = first_solve_per_attempt &&
       linear_solve_attempts > 0 ? linear_solve_attempts - 1 : 0;
+  const std::uint64_t expected_factor_age =
+      ExpectedIluFactorAgeGenerations(
+          expected_factor_reuse_policy, trace_solves);
   const bool ilu_work_consistent = ilu_policy
       ? evidence.trace_solves >= 0 && evidence.linear_iterations >= 0 &&
             tensor.ilu_type == 0 &&
@@ -1393,8 +1414,7 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
                 tensor.ilu_jacobi_factor_spmv_updates_upper_bound,
                 evidence.linear_iterations,
                 evidence.linear_solve_attempts) &&
-            tensor.ilu_factor_age_generations ==
-                (trace_solves > 0 ? trace_solves - 1 : 0)
+            tensor.ilu_factor_age_generations == expected_factor_age
       : tensor.ilu_type == -1 && tensor.ilu_level_of_fill == -1 &&
             tensor.ilu_local_reordering == -1 &&
             tensor.ilu_application_iterations == 0 &&
