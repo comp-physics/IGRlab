@@ -1997,13 +1997,43 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
   if (LaunchNativeRankOneTraceSolve(
           system, base_preconditioner, workspace, policy, support, nullptr))
     return false;
+
+  // Preserve a structurally valid signed true-row permutation while swapping
+  // one Euler incidence with one sigma incidence. The native fixed-sweep
+  // kernel must reject this component-major field-contract violation on the
+  // device instead of applying sigma corrections to an Euler true row.
+  std::vector<int> field_permuted_signed_dofs = signed_dofs;
+  std::swap(field_permuted_signed_dofs[0],
+            field_permuted_signed_dofs[
+                static_cast<std::size_t>(4 * scalar_face_rows)]);
+  const std::size_t signed_dof_bytes =
+      field_permuted_signed_dofs.size() * sizeof(int);
+  if (cudaMemcpy(signed_element_trace.data(),
+                 field_permuted_signed_dofs.data(), signed_dof_bytes,
+                 cudaMemcpyHostToDevice) != cudaSuccess ||
+      !LaunchNativeRankOneTraceSolve(
+          system, preconditioner, workspace, policy, support, nullptr) ||
+      cudaDeviceSynchronize() != cudaSuccess)
+    return false;
+  NativeTraceSolveControl observation{};
+  if (!control.CopyOneTo(observation) ||
+      observation.status != NativeTraceSolveStatus::invalid_preconditioner ||
+      observation.failure_mask == 0)
+    return false;
+  if (cudaMemcpy(signed_element_trace.data(), signed_dofs.data(),
+                 signed_dof_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemset(solution.data(), 0,
+                 static_cast<std::size_t>(true_rows) * sizeof(double)) !=
+          cudaSuccess)
+    return false;
+
   if (!LaunchNativeRankOneTraceSolve(
           system, preconditioner, workspace, policy, support, nullptr) ||
       cudaDeviceSynchronize() != cudaSuccess)
     return false;
 
   std::vector<double> host_solution(static_cast<std::size_t>(true_rows));
-  NativeTraceSolveControl observation{};
+  observation = {};
   if (!solution.CopyTo(host_solution) || !control.CopyOneTo(observation) ||
       observation.status != NativeTraceSolveStatus::maximum_iterations ||
       observation.preconditioner_applications != 2)

@@ -725,7 +725,6 @@ __device__ void ValidateElementSchwarz(
 
 __device__ void ValidateFixedSigmaJacobiRows(
     const NativeTraceElementSchwarzView schwarz,
-    const NativeTraceWorkspaceView workspace,
     NativeTraceSolveControl* control,
     const cg::grid_group& grid) noexcept
 {
@@ -757,7 +756,6 @@ __device__ void ValidateFixedSigmaJacobiRows(
       MarkFailure(control, failure_invalid_preconditioner);
     if (sigma_field != (row >= sigma_begin ? 1 : 0))
       MarkFailure(control, failure_invalid_preconditioner);
-    workspace.permutation_marks[row] = sigma_field;
   }
   grid.sync();
 }
@@ -1455,6 +1453,7 @@ __device__ void ApplyPreconditioner(
   grid.sync();
 }
 
+template <bool PreserveAliasedInput>
 __device__ void ApplyFixedSigmaJacobiPreconditioner(
     const NativeTraceSystemView system,
     const NativeTracePreconditionerView preconditioner,
@@ -1470,8 +1469,7 @@ __device__ void ApplyFixedSigmaJacobiPreconditioner(
   const int sigma_jacobi_sweeps =
       NativeTraceFixedSigmaJacobiSweeps(preconditioner.kind);
   double* const next_sigma = workspace.vectors + rows;
-  double* const saved_sigma_rhs = workspace.vectors +
-      2 * static_cast<std::size_t>(rows);
+  const double* sigma_rhs = input;
 
   if (sigma_jacobi_sweeps < 1 ||
       sigma_jacobi_sweeps > native_trace_sigma_jacobi_sweeps)
@@ -1482,13 +1480,20 @@ __device__ void ApplyFixedSigmaJacobiPreconditioner(
     return;
   }
 
-  // The final GMRES update intentionally permits input == output. Preserve
-  // the original component-major sigma RHS before the exact local predictor
-  // writes output; the third existing IGR vector is otherwise unused by the
-  // element-Schwarz path.
-  for (int row = sigma_begin + thread; row < rows; row += stride)
-    saved_sigma_rhs[row] = input[row];
-  grid.sync();
+  if constexpr (PreserveAliasedInput)
+  {
+    // The final GMRES update intentionally permits input == output. Preserve
+    // its original component-major sigma RHS before the exact local predictor
+    // writes output; the third existing IGR vector is otherwise unused by the
+    // element-Schwarz path. Arnoldi applications are nonaliasing and bypass
+    // both this copy and its grid barrier.
+    double* const saved_sigma_rhs = workspace.vectors +
+        2 * static_cast<std::size_t>(rows);
+    for (int row = sigma_begin + thread; row < rows; row += stride)
+      saved_sigma_rhs[row] = input[row];
+    grid.sync();
+    sigma_rhs = saved_sigma_rhs;
+  }
 
   NativeTracePreconditionerView base_preconditioner = preconditioner;
   base_preconditioner.kind =
@@ -1517,7 +1522,7 @@ __device__ void ApplyFixedSigmaJacobiPreconditioner(
       const double diagonal = system.matrix.values[begin];
       const double value = output[row] +
           native_trace_sigma_jacobi_damping *
-              (saved_sigma_rhs[row] - action) / diagonal;
+              (sigma_rhs[row] - action) / diagonal;
       next_sigma[row] = value;
       if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
     }
@@ -1630,7 +1635,7 @@ __global__ void NativeRankOneTraceSolveKernel(
       }
       else
         ValidateFixedSigmaJacobiRows(
-            preconditioner.element_schwarz, workspace, control, grid);
+            preconditioner.element_schwarz, control, grid);
     }
   }
   if (NativeTraceOperatorIsElementMatrixFree(system.operator_kind))
@@ -1751,7 +1756,7 @@ __global__ void NativeRankOneTraceSolveKernel(
           static_cast<std::size_t>(column + 1) * rows;
 
       if constexpr (FixedSigmaJacobi)
-        ApplyFixedSigmaJacobiPreconditioner(
+        ApplyFixedSigmaJacobiPreconditioner<false>(
             system, preconditioner, workspace, current_basis, work,
             control, grid);
       else
@@ -1964,7 +1969,7 @@ __global__ void NativeRankOneTraceSolveKernel(
       }
     }
     if constexpr (FixedSigmaJacobi)
-      ApplyFixedSigmaJacobiPreconditioner(
+      ApplyFixedSigmaJacobiPreconditioner<true>(
           system, preconditioner, workspace, work, work, control, grid);
     else
       ApplyPreconditioner(system, preconditioner, workspace,
