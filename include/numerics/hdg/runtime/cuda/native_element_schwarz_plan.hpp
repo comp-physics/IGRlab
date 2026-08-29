@@ -55,8 +55,12 @@ struct NativeElementSchwarzFieldSplitLayout final
   std::size_t left_scale_offset = 0;
   std::size_t right_scale_offset = 0;
   std::size_t required_doubles = 0;
+  std::size_t warp_inverse_diagonal_offset = 0;
+  std::size_t warp_rhs_permutation_offset = 0;
+  std::size_t warp_required_doubles = 0;
   std::size_t available_doubles = 0;
   bool valid = false;
+  bool warp_valid = false;
 };
 
 constexpr NativeElementSchwarzFieldSplitLayout
@@ -81,10 +85,17 @@ NativeElementSchwarzIgrFieldSplitLayout(const int order) noexcept
       static_cast<std::size_t>(result.sigma_rows) * result.euler_rows;
   result.right_scale_offset = result.left_scale_offset + patch_rows;
   result.required_doubles = result.right_scale_offset + patch_rows;
+  result.warp_inverse_diagonal_offset = result.required_doubles;
+  result.warp_rhs_permutation_offset =
+      result.warp_inverse_diagonal_offset + patch_rows;
+  result.warp_required_doubles =
+      result.warp_rhs_permutation_offset + patch_rows;
   result.available_doubles =
       static_cast<std::size_t>(patch_rows) * patch_rows;
   result.valid = result.euler_rows + result.sigma_rows == patch_rows &&
       result.required_doubles <= result.available_doubles;
+  result.warp_valid = result.valid &&
+      result.warp_required_doubles <= result.available_doubles;
   return result;
 }
 

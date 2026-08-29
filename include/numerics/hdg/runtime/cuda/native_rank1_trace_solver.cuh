@@ -31,7 +31,8 @@ enum class NativeTracePreconditionerKind : std::int32_t
   diagonal = 1,
   ilu0_rcm_jacobi = 2,
   element_overlap_schwarz_fp64 = 3,
-  element_overlap_schwarz_equilibrated_field_split_fp64 = 4
+  element_overlap_schwarz_equilibrated_field_split_fp64 = 4,
+  element_overlap_schwarz_warp_equilibrated_field_split_fp64 = 5
 };
 
 enum class NativeTraceSolveStatus : std::int32_t
@@ -66,7 +67,8 @@ enum class NativeTraceOperatorKind : std::int32_t
 {
   assembled_csr_fp64 = 1,
   element_matrix_free_fp64 = 2,
-  element_matrix_free_equilibrated_field_split_fp64 = 3
+  element_matrix_free_equilibrated_field_split_fp64 = 3,
+  element_matrix_free_warp_equilibrated_field_split_fp64 = 4
 };
 
 /** Current true-trace system and HYPRE-owned solution storage. */

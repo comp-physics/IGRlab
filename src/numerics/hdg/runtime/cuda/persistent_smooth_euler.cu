@@ -1385,6 +1385,11 @@ bool CudaLaunchNativeRankOneTraceSolver(
     system.operator_kind = NativeTraceOperatorKind::
         element_matrix_free_equilibrated_field_split_fp64;
     break;
+  case CudaNativeTraceOperatorKind::
+      element_matrix_free_warp_equilibrated_field_split_fp64:
+    system.operator_kind = NativeTraceOperatorKind::
+        element_matrix_free_warp_equilibrated_field_split_fp64;
+    break;
   default:
     return false;
   }
@@ -1397,12 +1402,18 @@ bool CudaLaunchNativeRankOneTraceSolver(
   const bool use_equilibrated_field_split =
       CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
           preconditioner_kind);
+  const bool use_warp_equilibrated_field_split =
+      CudaTracePreconditionerIsNativeElementSchwarzWarpEquilibratedFieldSplit(
+          preconditioner_kind);
   preconditioner.kind = use_ilu
       ? NativeTracePreconditionerKind::ilu0_rcm_jacobi
       : use_element_schwarz
           ? (use_equilibrated_field_split
-                 ? NativeTracePreconditionerKind::
-                       element_overlap_schwarz_equilibrated_field_split_fp64
+                 ? (use_warp_equilibrated_field_split
+                        ? NativeTracePreconditionerKind::
+                              element_overlap_schwarz_warp_equilibrated_field_split_fp64
+                        : NativeTracePreconditionerKind::
+                              element_overlap_schwarz_equilibrated_field_split_fp64)
                  : NativeTracePreconditionerKind::
                        element_overlap_schwarz_fp64)
           : NativeTracePreconditionerKind::diagonal;
@@ -5268,6 +5279,7 @@ __global__ void ElementSchwarzSetupKernel(CudaDeviceView v,CudaMeshShape s)
 // natural Uhat4 Euler and scalar sigmahat diagonal blocks.  The preconditioner
 // is their lower multiplicative block factorization; the exact principal
 // patch remains retained for first-application backward-error checks.
+template <bool PrepareWarpApply>
 __global__ void ElementSchwarzEquilibratedFieldSplitSetupKernel(
     CudaDeviceView v,CudaMeshShape s)
 {
@@ -5287,6 +5299,8 @@ __global__ void ElementSchwarzEquilibratedFieldSplitSetupKernel(
   const std::size_t left_scale_offset=lower_coupling_offset+
       static_cast<std::size_t>(sigma_rows)*euler_rows;
   const std::size_t right_scale_offset=left_scale_offset+n;
+  const std::size_t inverse_diagonal_offset=right_scale_offset+n;
+  const std::size_t rhs_permutation_offset=inverse_diagonal_offset+n;
   double* const matrix=v.element_schwarz_patch_matrix+matrix_offset;
   double* const storage=v.element_schwarz_patch_lu+matrix_offset;
   double* const row_norm=v.element_schwarz_rhs+vector_offset;
@@ -5427,6 +5441,38 @@ __global__ void ElementSchwarzEquilibratedFieldSplitSetupKernel(
   FactorElementSchwarzFieldBlock(
       storage+sigma_lu_offset,pivots+euler_rows,sigma_rows,
       &factor_scale,&pivot_row,&failed);
+  if constexpr(PrepareWarpApply)
+  {
+    // The cooperative apply never changes the retained LU factors or pivot
+    // sequence.  Its two private vectors fit in the unused tail of the same
+    // n-by-n arena: one FP64 reciprocal diagonal and one exactly represented
+    // packed source index per row.  The latter folds the sequential pivot-swap
+    // chain into the setup that is already performed once per factor.
+    for(int packed=threadIdx.x;packed<n;packed+=blockDim.x)
+    {
+      const bool euler=packed<euler_rows;
+      const int block_begin=euler?0:euler_rows;
+      const int block_rows=euler?euler_rows:sigma_rows;
+      const int local_row=packed-block_begin;
+      const double* const factor=euler?storage:storage+sigma_lu_offset;
+      const double diagonal=factor[local_row*block_rows+local_row];
+      const double inverse=1.0/diagonal;
+      int source=local_row;
+      for(int step=block_rows-1;step>=0;--step)
+      {
+        const int pivot=pivots[block_begin+step];
+        if(source==step)source=pivot;
+        else if(source==pivot)source=step;
+      }
+      storage[inverse_diagonal_offset+packed]=inverse;
+      storage[rhs_permutation_offset+packed]=
+          static_cast<double>(block_begin+source);
+      if(!isfinite(inverse)||inverse==0.0||
+         source<0||source>=block_rows)
+        atomicExch(&failed,1);
+    }
+    __syncthreads();
+  }
   if(threadIdx.x==0)v.status[e]=failed? -7.0:1.0;
 }
 
@@ -6299,6 +6345,9 @@ bool CudaLaunchSetupNativeElementSchwarz(
   const bool field_split=
       CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
           preconditioner_kind);
+  const bool warp_field_split=
+      CudaTracePreconditionerIsNativeElementSchwarzWarpEquilibratedFieldSplit(
+          preconditioner_kind);
   if(!CudaTracePreconditionerIsNativeElementSchwarz(preconditioner_kind)||
      !s.igr_active||s.elements<=0||s.trace_dofs!=expected||
      v.schur==nullptr||v.status==nullptr||
@@ -6312,10 +6361,17 @@ bool CudaLaunchSetupNativeElementSchwarz(
   const NativeElementSchwarzFieldSplitLayout layout=
       NativeElementSchwarzIgrFieldSplitLayout(s.order);
   if(field_split&&(!layout.valid||layout.patch_rows!=s.trace_dofs||
-                   layout.required_doubles>layout.available_doubles))
+                   layout.required_doubles>layout.available_doubles||
+                   (warp_field_split&&(!layout.warp_valid||
+                     layout.warp_required_doubles>
+                         layout.available_doubles))))
     return false;
-  if(field_split)
-    ElementSchwarzEquilibratedFieldSplitSetupKernel<<<s.elements,128>>>(v,s);
+  if(warp_field_split)
+    ElementSchwarzEquilibratedFieldSplitSetupKernel<true>
+        <<<s.elements,128>>>(v,s);
+  else if(field_split)
+    ElementSchwarzEquilibratedFieldSplitSetupKernel<false>
+        <<<s.elements,128>>>(v,s);
   else
     ElementSchwarzSetupKernel<<<s.elements,128>>>(v,s);
   return LaunchOk();

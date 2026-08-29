@@ -246,6 +246,16 @@ constexpr bool TraceSolverSelectionPolicy() noexcept
           CudaEngineKind::tensor_core, 2, true, true, true, true,
           CudaTracePolicyKind::
               native_element_schwarz_matrix_free_equilibrated_field_split_fp64) ==
+          CudaTraceSolverKind::unconfigured &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 1, false, true, true, true,
+          CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64) ==
+          CudaTraceSolverKind::native_rank1_fp64 &&
+      ResolveCudaTraceSolverKind(
+          CudaEngineKind::tensor_core, 2, true, true, true, true,
+          CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64) ==
           CudaTraceSolverKind::unconfigured;
 }
 
@@ -1129,13 +1139,14 @@ bool RunNativeSolveFixture(const NativeSolveFixture& fixture,
       control.CopyOneTo(result.control);
 }
 
-bool NativeElementSchwarzDeviceFixture()
+bool NativeElementSchwarzDeviceFixtureForOrder(const int order)
 {
   using namespace dg::hdg::runtime::cuda_w8a::detail;
-  constexpr int rows = 40;
-  constexpr int elements = 1;
-  constexpr int patch_entries = rows * rows;
-  constexpr int incidence_slots = 2 * rows;
+  if (order < 1 || order > 3) return false;
+  const int rows = 20 * (order + 1);
+  const int elements = 1;
+  const int patch_entries = rows * rows;
+  const int incidence_slots = 2 * rows;
   std::vector<double> identity(static_cast<std::size_t>(patch_entries), 0.0);
   std::vector<int> offsets(static_cast<std::size_t>(rows) + 1);
   std::vector<int> columns(static_cast<std::size_t>(rows));
@@ -1200,7 +1211,7 @@ bool NativeElementSchwarzDeviceFixture()
   shape.elements = elements;
   shape.trace_dofs = rows;
   shape.trace_components = 5;
-  shape.order = 1;
+  shape.order = order;
   shape.igr_active = true;
   if (!CudaLaunchSetupNativeElementSchwarz(
           setup_view, shape,
@@ -1335,6 +1346,122 @@ bool NativeElementSchwarzDeviceFixture()
                  right_hand_side[static_cast<std::size_t>(row)]) > 1.0e-11)
       return false;
 
+  // The cooperative variant has a distinct setup/preconditioner/operator
+  // triplet. Exercise a genuinely pivoted, coupled lower field system so its
+  // setup-time permutation folding and cooperative Euler-to-sigma action are
+  // not admitted by an identity-only test.
+  const NativeElementSchwarzFieldSplitLayout warp_layout =
+      NativeElementSchwarzIgrFieldSplitLayout(order);
+  if (!warp_layout.warp_valid) return false;
+  std::vector<double> coupled_patch(
+      static_cast<std::size_t>(patch_entries), 0.0);
+  const auto set_packed = [&](const int packed_row, const int packed_column,
+                              const double value) {
+    const int original_row = NativeElementSchwarzIgrFieldSplitPatchRow(
+        order, packed_row);
+    const int original_column = NativeElementSchwarzIgrFieldSplitPatchRow(
+        order, packed_column);
+    coupled_patch[static_cast<std::size_t>(original_row) * rows +
+                  original_column] = value;
+  };
+  for (int packed = 0; packed < warp_layout.euler_rows; ++packed)
+  {
+    set_packed(packed, packed, 2.0 + 0.01 * packed);
+    if (packed > 1) set_packed(packed, packed - 1, 0.02);
+  }
+  set_packed(0, 0, 0.1);
+  set_packed(0, 1, 1.0);
+  set_packed(1, 0, 10.0);
+  set_packed(1, 1, 1.0);
+  for (int sigma = 0; sigma < warp_layout.sigma_rows; ++sigma)
+  {
+    const int packed = warp_layout.euler_rows + sigma;
+    set_packed(packed, packed, 1.5 + 0.02 * sigma);
+    if (sigma > 1) set_packed(packed, packed - 1, -0.015);
+    for (int euler = 0; euler < warp_layout.euler_rows; ++euler)
+      set_packed(packed, euler,
+                 0.002 * (1 + (sigma + 2 * euler) % 5));
+  }
+  set_packed(warp_layout.euler_rows, warp_layout.euler_rows, 0.2);
+  set_packed(warp_layout.euler_rows, warp_layout.euler_rows + 1, 1.0);
+  set_packed(warp_layout.euler_rows + 1, warp_layout.euler_rows, 8.0);
+  set_packed(warp_layout.euler_rows + 1,
+             warp_layout.euler_rows + 1, 0.5);
+
+  std::vector<double> reference_solution(static_cast<std::size_t>(rows));
+  std::vector<double> coupled_rhs(static_cast<std::size_t>(rows), 0.0);
+  for (int row = 0; row < rows; ++row)
+    reference_solution[static_cast<std::size_t>(row)] =
+        0.2 + static_cast<double>((7 * row) % 17) / 19.0;
+  for (int row = 0; row < rows; ++row)
+    for (int column = 0; column < rows; ++column)
+      coupled_rhs[static_cast<std::size_t>(row)] = std::fma(
+          coupled_patch[static_cast<std::size_t>(row) * rows + column],
+          reference_solution[static_cast<std::size_t>(column)],
+          coupled_rhs[static_cast<std::size_t>(row)]);
+  if (cudaMemcpy(schur.data(), coupled_patch.data(),
+                 static_cast<std::size_t>(patch_entries) * sizeof(double),
+                 cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(device_rhs.data(), coupled_rhs.data(),
+                 static_cast<std::size_t>(rows) * sizeof(double),
+                 cudaMemcpyHostToDevice) != cudaSuccess ||
+      !CudaLaunchSetupNativeElementSchwarz(
+          setup_view, shape,
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_equilibrated_field_split_fp64) ||
+      cudaMemset(solution.data(), 0,
+                 static_cast<std::size_t>(rows) * sizeof(double)) !=
+          cudaSuccess ||
+      cudaDeviceSynchronize() != cudaSuccess)
+    return false;
+  std::vector<int> host_pivots(static_cast<std::size_t>(rows));
+  if (!pivots.CopyTo(host_pivots)) return false;
+  bool euler_pivoted = false;
+  bool sigma_pivoted = false;
+  for (int packed = 0; packed < warp_layout.euler_rows; ++packed)
+    euler_pivoted = euler_pivoted ||
+        host_pivots[static_cast<std::size_t>(packed)] != packed;
+  for (int sigma = 0; sigma < warp_layout.sigma_rows; ++sigma)
+    sigma_pivoted = sigma_pivoted ||
+        host_pivots[static_cast<std::size_t>(
+            warp_layout.euler_rows + sigma)] != sigma;
+  if (!euler_pivoted || !sigma_pivoted) return false;
+  preconditioner.kind = NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_fp64;
+  system.operator_kind = NativeTraceOperatorKind::
+      element_matrix_free_warp_equilibrated_field_split_fp64;
+  if (!LaunchNativeRankOneTraceSolve(
+          system, preconditioner, workspace, policy, support, nullptr) ||
+      cudaDeviceSynchronize() != cudaSuccess ||
+      !solution.CopyTo(host_solution) || !control.CopyOneTo(observation) ||
+      observation.status != NativeTraceSolveStatus::converged ||
+      observation.preconditioner_applications <= 0 ||
+      observation.operator_applications <= 0)
+    return false;
+  for (int row = 0; row < rows; ++row)
+    if (std::abs(host_solution[static_cast<std::size_t>(row)] -
+                 reference_solution[static_cast<std::size_t>(row)]) >
+        1.0e-10)
+      return false;
+
+  // Corrupting the setup-only reciprocal is detected by the bounded upfront
+  // preconditioner validation before GMRES can consume it.
+  const double invalid_inverse = 0.0;
+  if (cudaMemcpy(
+          patch_lu.data() + warp_layout.warp_inverse_diagonal_offset,
+          &invalid_inverse, sizeof(double), cudaMemcpyHostToDevice) !=
+          cudaSuccess ||
+      cudaMemset(solution.data(), 0,
+                 static_cast<std::size_t>(rows) * sizeof(double)) !=
+          cudaSuccess ||
+      !LaunchNativeRankOneTraceSolve(
+          system, preconditioner, workspace, policy, support, nullptr) ||
+      cudaDeviceSynchronize() != cudaSuccess ||
+      !control.CopyOneTo(observation) ||
+      observation.status != NativeTraceSolveStatus::invalid_preconditioner ||
+      observation.failure_mask == 0)
+    return false;
+
   auto mismatched = system;
   mismatched.operator_kind = NativeTraceOperatorKind::element_matrix_free_fp64;
   if (LaunchNativeRankOneTraceSolve(
@@ -1346,9 +1473,22 @@ bool NativeElementSchwarzDeviceFixture()
   if (LaunchNativeRankOneTraceSolve(
           system, full_schwarz, workspace, policy, support, nullptr))
     return false;
+  auto scalar_field_split = preconditioner;
+  scalar_field_split.kind = NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_fp64;
+  if (LaunchNativeRankOneTraceSolve(
+          system, scalar_field_split, workspace, policy, support, nullptr))
+    return false;
   mismatched.operator_kind = static_cast<NativeTraceOperatorKind>(255);
   return !LaunchNativeRankOneTraceSolve(
       mismatched, preconditioner, workspace, policy, support, nullptr);
+}
+
+bool NativeElementSchwarzDeviceFixture()
+{
+  for (int order = 1; order <= 3; ++order)
+    if (!NativeElementSchwarzDeviceFixtureForOrder(order)) return false;
+  return true;
 }
 
 std::vector<double> ConventionalFixtureMatrix()
@@ -2039,6 +2179,18 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       CudaEngineKind::ordinary, true,
       CudaTracePolicyKind::
           native_element_schwarz_matrix_free_equilibrated_field_split_fp64);
+  const auto tensor_igr_warp = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, true,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64);
+  const auto tensor_conventional_warp = ResolveCudaTracePolicy(
+      CudaEngineKind::tensor_core, false,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64);
+  const auto ordinary_igr_warp = ResolveCudaTracePolicy(
+      CudaEngineKind::ordinary, true,
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64);
   const auto unknown = ResolveCudaTracePolicy(
       CudaEngineKind::ordinary, false,
       static_cast<CudaTracePolicyKind>(255));
@@ -2165,6 +2317,22 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       !CudaTracePolicyDescriptorIsExact(tensor_conventional_combined) &&
       !ordinary_igr_combined.valid &&
       !CudaTracePolicyDescriptorIsExact(ordinary_igr_combined) &&
+      CudaTracePolicyDescriptorIsExact(tensor_igr_warp) &&
+      tensor_igr_warp.trace_preconditioner ==
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_equilibrated_field_split_fp64 &&
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          tensor_igr_warp.selection) &&
+      CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
+          tensor_igr_warp.selection) &&
+      CudaTracePolicyUsesNativeElementMatrixFreeWarpEquilibratedFieldSplit(
+          tensor_igr_warp.selection) &&
+      !CudaTracePolicyUsesNativeElementMatrixFreeWarpEquilibratedFieldSplit(
+          tensor_igr_combined.selection) &&
+      !tensor_conventional_warp.valid &&
+      !CudaTracePolicyDescriptorIsExact(tensor_conventional_warp) &&
+      !ordinary_igr_warp.valid &&
+      !CudaTracePolicyDescriptorIsExact(ordinary_igr_warp) &&
       !tensor_conventional_mgr.valid &&
       !CudaTracePolicyDescriptorIsExact(tensor_conventional_mgr) &&
       !ordinary_igr_mgr.valid &&
@@ -2191,6 +2359,10 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
           CudaTracePolicyKind::
               native_element_schwarz_matrix_free_equilibrated_field_split_fp64)) ==
           "native-element-schwarz-matrix-free-equilibrated-field-split-fp64" &&
+      std::string_view(CudaTracePolicyKindName(
+          CudaTracePolicyKind::
+              native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64)) ==
+          "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64" &&
       std::string_view(CudaTracePreconditionerName(
           CudaTracePreconditionerKind::hypre_mgr_field_split)) ==
           "hypre_mgr_field_split" &&
@@ -2200,7 +2372,11 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
       std::string_view(CudaTracePreconditionerName(
           CudaTracePreconditionerKind::
               native_element_schwarz_equilibrated_field_split_fp64)) ==
-          "native_element_schwarz_equilibrated_field_split_fp64";
+          "native_element_schwarz_equilibrated_field_split_fp64" &&
+      std::string_view(CudaTracePreconditionerName(
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_equilibrated_field_split_fp64)) ==
+          "native_element_schwarz_warp_equilibrated_field_split_fp64";
 }
 
 static_assert(TracePolicyAblationDescriptorPolicy(),

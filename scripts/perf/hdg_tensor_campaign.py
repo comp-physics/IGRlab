@@ -47,6 +47,9 @@ TRACE_PRECONDITIONER_BY_POLICY_ENGINE_AND_MODE = {
     ("native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
      "tensor", "igr"):
         "native_element_schwarz_equilibrated_field_split_fp64",
+    ("native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
+     "tensor", "igr"):
+        "native_element_schwarz_warp_equilibrated_field_split_fp64",
 }
 TRACE_ILU_POLICY_BY_POLICY_ENGINE_AND_MODE = {
     ("engine-default", "ordinary", "conventional"): (0, 0, 0, 1),
@@ -65,6 +68,9 @@ TRACE_ILU_POLICY_BY_POLICY_ENGINE_AND_MODE = {
     ("native-element-schwarz-equilibrated-field-split-fp64", "tensor", "igr"):
         (-1, -1, -1, 0),
     ("native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
+     "tensor", "igr"):
+        (-1, -1, -1, 0),
+    ("native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
      "tensor", "igr"):
         (-1, -1, -1, 0),
 }
@@ -86,6 +92,9 @@ TRACE_ILU_FACTOR_REUSE_BY_POLICY_ENGINE_AND_MODE = {
     ("native-element-schwarz-equilibrated-field-split-fp64", "tensor", "igr"):
         "not_applicable",
     ("native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
+     "tensor", "igr"):
+        "not_applicable",
+    ("native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
      "tensor", "igr"):
         "not_applicable",
 }
@@ -116,6 +125,9 @@ TRACE_ILU_TRIANGULAR_SOLVE_BY_POLICY_ENGINE_AND_MODE = {
     ("native-element-schwarz-equilibrated-field-split-fp64", "tensor", "igr"):
         ("not_applicable", 0, 0, 0),
     ("native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
+     "tensor", "igr"):
+        ("not_applicable", 0, 0, 0),
+    ("native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
      "tensor", "igr"):
         ("not_applicable", 0, 0, 0),
 }
@@ -149,6 +161,9 @@ TRACE_SOLVER_CONFIGURATION_BY_POLICY_ENGINE_AND_MODE = {
     ("native-element-schwarz-equilibrated-field-split-fp64", "tensor", "igr"):
         ("native-rank1-fp64", True, False, False),
     ("native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
+     "tensor", "igr"):
+        ("native-rank1-fp64", True, False, False),
+    ("native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
      "tensor", "igr"):
         ("native-rank1-fp64", True, False, False),
 }
@@ -1399,14 +1414,17 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
         "native-element-schwarz-matrix-free-fp64",
         "native-element-schwarz-equilibrated-field-split-fp64",
         "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
     }
     expected_matrix_free = trace_policy in {
         "native-element-schwarz-matrix-free-fp64",
         "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
     }
     expected_element_field_split = trace_policy in {
         "native-element-schwarz-equilibrated-field-split-fp64",
         "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
     }
     if tensor.get("trace_solver") != expected_trace_solver:
         raise CampaignError(
@@ -2064,6 +2082,38 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
                 "benchmark trace-policy metadata is not the exact selected "
                 f"configuration: observed={observed_configuration!r}; "
                 f"expected={expected_configuration!r}"
+            )
+        warp_field_split = trace_policy == (
+            "native-element-schwarz-matrix-free-warp-"
+            "equilibrated-field-split-fp64"
+        )
+        scalar_field_split = trace_policy in {
+            "native-element-schwarz-equilibrated-field-split-fp64",
+            "native-element-schwarz-matrix-free-"
+            "equilibrated-field-split-fp64",
+        }
+        full_patch = trace_policy in {
+            "native-element-schwarz-fp64",
+            "native-element-schwarz-matrix-free-fp64",
+        }
+        expected_schwarz_apply = (
+            "cooperative-pivoted-lu-fp64" if warp_field_split else
+            "scalar-pivoted-lu-fp64" if scalar_field_split else
+            "scalar-full-patch-pivoted-lu-fp64" if full_patch else
+            "not-applicable"
+        )
+        expected_tile_width = (
+            16 if warp_field_split and order == 1 else
+            32 if warp_field_split else 0
+        )
+        if record.get("trace_element_schwarz_apply") != \
+                expected_schwarz_apply or checked_int(
+                    record.get("trace_element_schwarz_apply_tile_width"),
+                    "trace_element_schwarz_apply_tile_width",
+                ) != expected_tile_width:
+            raise CampaignError(
+                "benchmark element-Schwarz apply metadata does not match "
+                f"the selected trace policy {trace_policy!r}"
             )
     if source == "frozen":
         frozen_exact = {

@@ -17,14 +17,23 @@ static_assert(NativeElementSchwarzIgrFieldSplitLayout(1).euler_rows == 32);
 static_assert(NativeElementSchwarzIgrFieldSplitLayout(1).sigma_rows == 8);
 static_assert(
     NativeElementSchwarzIgrFieldSplitLayout(1).required_doubles == 1424);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(1).warp_valid);
+static_assert(
+    NativeElementSchwarzIgrFieldSplitLayout(1).warp_required_doubles == 1504);
 static_assert(NativeElementSchwarzIgrFieldSplitLayout(2).euler_rows == 48);
 static_assert(NativeElementSchwarzIgrFieldSplitLayout(2).sigma_rows == 12);
 static_assert(
     NativeElementSchwarzIgrFieldSplitLayout(2).required_doubles == 3144);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(2).warp_valid);
+static_assert(
+    NativeElementSchwarzIgrFieldSplitLayout(2).warp_required_doubles == 3264);
 static_assert(NativeElementSchwarzIgrFieldSplitLayout(3).euler_rows == 64);
 static_assert(NativeElementSchwarzIgrFieldSplitLayout(3).sigma_rows == 16);
 static_assert(
     NativeElementSchwarzIgrFieldSplitLayout(3).required_doubles == 5536);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(3).warp_valid);
+static_assert(
+    NativeElementSchwarzIgrFieldSplitLayout(3).warp_required_doubles == 5696);
 static_assert(!NativeElementSchwarzIgrFieldSplitLayout(0).valid);
 static_assert(!NativeElementSchwarzIgrFieldSplitLayout(4).valid);
 static_assert(NativeElementSchwarzEncodeDof(7, -1) == -8);
@@ -51,7 +60,14 @@ bool CheckFieldSplitLayout()
                 layout.euler_rows ||
         layout.right_scale_offset !=
             layout.left_scale_offset + layout.patch_rows ||
-        layout.required_doubles > layout.available_doubles)
+        layout.warp_inverse_diagonal_offset != layout.required_doubles ||
+        layout.warp_rhs_permutation_offset !=
+            layout.warp_inverse_diagonal_offset + layout.patch_rows ||
+        layout.warp_required_doubles !=
+            layout.warp_rhs_permutation_offset + layout.patch_rows ||
+        layout.required_doubles > layout.available_doubles ||
+        !layout.warp_valid ||
+        layout.warp_required_doubles > layout.available_doubles)
       return false;
 
     int euler_rows = 0;

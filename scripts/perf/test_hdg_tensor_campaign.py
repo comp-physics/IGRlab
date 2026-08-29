@@ -70,6 +70,8 @@ SCHEMA2_ONLY_RECORD_FIELDS = {
     "trace_ilu_factor_reuse_policy", "trace_ilu_triangular_solve_kind",
     "trace_ilu_lower_jacobi_iterations",
     "trace_ilu_upper_jacobi_iterations", "time_integrator",
+    "trace_element_schwarz_apply",
+    "trace_element_schwarz_apply_tile_width",
     "time_step_policy", "gamma", "interior_components",
     "trace_components", "gpu_name", "gpu_device_ordinal", "gpu_uuid",
     "gpu_compute_capability", "cuda_driver_version",
@@ -122,7 +124,9 @@ parser.add_argument(
              "native-element-schwarz-matrix-free-fp64",
              "native-element-schwarz-equilibrated-field-split-fp64",
              "native-element-schwarz-matrix-free-equilibrated-field-split-"
-             "fp64"),
+             "fp64",
+             "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+             "split-fp64"),
 )
 parser.add_argument("--order", required=True, type=int)
 parser.add_argument("--mesh-n", required=True, type=int)
@@ -144,11 +148,15 @@ equilibrated_mgr = args.trace_policy == "equilibrated-mgr"
 matrix_free = args.trace_policy in (
     "native-element-schwarz-matrix-free-fp64",
     "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
 )
 element_field_split = args.trace_policy in (
     "native-element-schwarz-equilibrated-field-split-fp64",
     "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
 )
+warp_element_field_split = args.trace_policy == \
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64"
 element_schwarz = args.trace_policy == "native-element-schwarz-fp64" or \
     matrix_free or element_field_split
 if equilibrated_mgr and (args.engine != "tensor" or args.mode != "igr"):
@@ -157,7 +165,9 @@ if element_schwarz and (args.engine != "tensor" or args.mode != "igr"):
     parser.error("native element-Schwarz policies require tensor IGR")
 if element_field_split:
     trace_preconditioner = \
-        "native_element_schwarz_equilibrated_field_split_fp64"
+        ("native_element_schwarz_warp_equilibrated_field_split_fp64"
+         if warp_element_field_split else
+         "native_element_schwarz_equilibrated_field_split_fp64")
 elif element_schwarz:
     trace_preconditioner = "native_element_schwarz_fp64"
 elif equilibrated_mgr:
@@ -172,7 +182,8 @@ ilu_policy = (
     if trace_preconditioner in (
         "hypre_diag_scale", "hypre_mgr_field_split",
         "native_element_schwarz_fp64",
-        "native_element_schwarz_equilibrated_field_split_fp64")
+        "native_element_schwarz_equilibrated_field_split_fp64",
+        "native_element_schwarz_warp_equilibrated_field_split_fp64")
     else (0, 0, 1 if args.mode == "igr" else 0, 1)
 )
 ilu_factor_reuse_policy = (
@@ -419,6 +430,16 @@ payload = {
         "derived_bounds_v1" if ilu_policy[3] else "unavailable"
     ),
     "trace_ilu_factor_reuse_policy": ilu_factor_reuse_policy,
+    "trace_element_schwarz_apply": (
+        "cooperative-pivoted-lu-fp64" if warp_element_field_split else
+        "scalar-pivoted-lu-fp64" if element_field_split else
+        "scalar-full-patch-pivoted-lu-fp64" if element_schwarz else
+        "not-applicable"
+    ),
+    "trace_element_schwarz_apply_tile_width": (
+        16 if warp_element_field_split and args.order == 1 else
+        32 if warp_element_field_split else 0
+    ),
     "mode": args.mode,
     "precision": "fp64",
     "time_integrator": "backward_euler",
@@ -556,6 +577,8 @@ if is_frozen:
         "trace_ilu_lower_jacobi_iterations",
         "trace_ilu_upper_jacobi_iterations",
         "trace_ilu_accounting_kind", "trace_ilu_factor_reuse_policy",
+        "trace_element_schwarz_apply",
+        "trace_element_schwarz_apply_tile_width",
         "time_integrator", "time_step_policy", "gamma",
         "interior_components", "trace_components", "gpu_name",
         "gpu_device_ordinal", "gpu_uuid", "gpu_compute_capability",
@@ -1420,6 +1443,54 @@ def main() -> int:
                 "flight_recorder", "replay",
             })
 
+        warp_policy = \
+            "native-element-schwarz-matrix-free-warp-equilibrated-field-" \
+            "split-fp64"
+        warp_command = CAMPAIGN.final_command(
+            final,
+            engine="tensor",
+            mode="igr",
+            order=2,
+            mesh_n=12,
+            domain_periods=3,
+            timestep=1.0e-5,
+            export=False,
+            expected_build=explicit_build,
+            trace_policy=warp_policy,
+        )
+        warp_record = json.loads(run(warp_command, root).stdout)
+        CAMPAIGN.validate_record(
+            warp_record,
+            **{**schwarz_validation_arguments,
+               "trace_policy": warp_policy},
+        )
+        assert warp_record["variant"] == "ablation"
+        assert warp_record["production_selectable"] is False
+        assert warp_record["trace_solver"] == "native-rank1-fp64"
+        assert warp_record["trace_preconditioner"] == \
+            "native_element_schwarz_warp_equilibrated_field_split_fp64"
+        assert warp_record["trace_element_schwarz_apply"] == \
+            "cooperative-pivoted-lu-fp64"
+        assert warp_record["trace_element_schwarz_apply_tile_width"] == 32
+        for sample in warp_record["samples"]:
+            tensor = sample["tensor_core"]
+            assert tensor["native_element_schwarz_configured"] is True
+            assert tensor[
+                "native_matrix_free_trace_operator_configured"
+            ] is True
+            assert tensor[
+                "native_matrix_free_trace_operator_applications"
+            ] == sample["linear_iterations"]
+            assert tensor["equilibration_builds"] == sample["trace_solves"]
+            assert tensor["equilibration_passes"] == \
+                2 * sample["trace_solves"]
+            assert tensor["element_schwarz_patch_setups"] == \
+                sample["trace_solves"]
+            assert not set(tensor).intersection({
+                "schwarz_history", "field_split_history", "event_stream",
+                "flight_recorder", "replay",
+            })
+
         def combined_rejected(record: dict) -> bool:
             try:
                 CAMPAIGN.validate_record(
@@ -1686,6 +1757,24 @@ def main() -> int:
         ) == "not_applicable"
         assert CAMPAIGN.expected_trace_solver_configuration(
             "tensor", "igr", combined_policy
+        ) == ("native-rank1-fp64", True, False, False)
+        warp_policy = \
+            "native-element-schwarz-matrix-free-warp-equilibrated-field-" \
+            "split-fp64"
+        assert CAMPAIGN.expected_trace_preconditioner(
+            "tensor", "igr", warp_policy
+        ) == "native_element_schwarz_warp_equilibrated_field_split_fp64"
+        assert CAMPAIGN.expected_trace_ilu_policy(
+            "tensor", "igr", warp_policy
+        ) == (-1, -1, -1, 0)
+        assert CAMPAIGN.expected_trace_ilu_triangular_solve_policy(
+            "tensor", "igr", warp_policy
+        ) == ("not_applicable", 0, 0, 0)
+        assert CAMPAIGN.expected_trace_ilu_factor_reuse_policy(
+            "tensor", "igr", warp_policy
+        ) == "not_applicable"
+        assert CAMPAIGN.expected_trace_solver_configuration(
+            "tensor", "igr", warp_policy
         ) == ("native-rank1-fp64", True, False, False)
         for engine, mode in (
                 ("ordinary", "igr"),

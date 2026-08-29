@@ -446,6 +446,13 @@ bool SelectTracePolicy(
         native_element_schwarz_matrix_free_equilibrated_field_split_fp64;
     return true;
   }
+  if (text ==
+      "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64")
+  {
+    options.trace_policy = CudaTracePolicyKind::
+        native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
+    return true;
+  }
   return false;
 }
 
@@ -533,7 +540,8 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
                 "native-element-schwarz-matrix-free-fp64, or "
                 "native-element-schwarz-equilibrated-field-split-fp64, or "
                 "native-element-schwarz-matrix-free-equilibrated-field-"
-                "split-fp64";
+                "split-fp64, or native-element-schwarz-matrix-free-warp-"
+                "equilibrated-field-split-fp64";
         return false;
       }
       continue;
@@ -786,7 +794,7 @@ void PrintUsage(const char* executable)
 {
   std::cout << "Usage: " << executable
             << " [--mode conventional|igr] [--engine ordinary|tensor]"
-               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64]"
+               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
@@ -796,7 +804,7 @@ void PrintUsage(const char* executable)
                " [--profile-measured-step 0|1|2|3|4]\n"
                "       " << executable
             << " [--conventional|--igr] [--engine ordinary|tensor]"
-               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64]"
+               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
@@ -1194,7 +1202,9 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
       CudaTracePolicyKind::
           native_element_schwarz_equilibrated_field_split_fp64 ||
       trace_policy == CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_equilibrated_field_split_fp64;
+          native_element_schwarz_matrix_free_equilibrated_field_split_fp64 ||
+      trace_policy == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
   const bool expected_native_solver =
       engine == CudaEngineKind::tensor_core && !expected_mgr_solver;
   const bool mgr_work_consistent = expected_mgr_solver
@@ -1926,7 +1936,12 @@ int RunBenchmark(const Options& options)
       CudaTracePolicyKind::
           native_element_schwarz_equilibrated_field_split_fp64 ||
       options.trace_policy == CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_equilibrated_field_split_fp64;
+          native_element_schwarz_matrix_free_equilibrated_field_split_fp64 ||
+      options.trace_policy == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
+  const bool warp_equilibrated_field_split = options.trace_policy ==
+      CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
   const NativeElementSchwarzFieldSplitLayout field_split_layout =
       equilibrated_field_split
       ? NativeElementSchwarzIgrFieldSplitLayout(options.order)
@@ -2001,6 +2016,19 @@ int RunBenchmark(const Options& options)
             << field_split_layout.euler_rows << ','
             << "\"trace_element_schwarz_sigma_rows\":"
             << field_split_layout.sigma_rows << ','
+            << "\"trace_element_schwarz_apply\":\""
+            << (warp_equilibrated_field_split
+                    ? "cooperative-pivoted-lu-fp64"
+                    : equilibrated_field_split
+                        ? "scalar-pivoted-lu-fp64"
+                        : reported_trace_policy.
+                                native_element_schwarz_configured
+                            ? "scalar-full-patch-pivoted-lu-fp64"
+                            : "not-applicable")
+            << "\","
+            << "\"trace_element_schwarz_apply_tile_width\":"
+            << (warp_equilibrated_field_split
+                    ? (options.order == 1 ? 16 : 32) : 0) << ','
             << "\"mode\":\""
             << (options.regularization == RegularizationKind::igr
                     ? "igr" : "conventional") << "\","

@@ -333,7 +333,8 @@ enum class CudaTracePolicyKind : std::uint8_t
   native_element_schwarz_fp64 = 3,
   native_element_schwarz_matrix_free_fp64 = 4,
   native_element_schwarz_equilibrated_field_split_fp64 = 5,
-  native_element_schwarz_matrix_free_equilibrated_field_split_fp64 = 6
+  native_element_schwarz_matrix_free_equilibrated_field_split_fp64 = 6,
+  native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64 = 7
 };
 
 constexpr bool IsKnownCudaTracePolicyKind(
@@ -348,7 +349,9 @@ constexpr bool IsKnownCudaTracePolicyKind(
       kind == CudaTracePolicyKind::
           native_element_schwarz_equilibrated_field_split_fp64 ||
       kind == CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_equilibrated_field_split_fp64;
+          native_element_schwarz_matrix_free_equilibrated_field_split_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
 }
 
 constexpr const char* CudaTracePolicyKindName(
@@ -372,6 +375,9 @@ constexpr const char* CudaTracePolicyKindName(
   case CudaTracePolicyKind::
       native_element_schwarz_matrix_free_equilibrated_field_split_fp64:
     return "native-element-schwarz-matrix-free-equilibrated-field-split-fp64";
+  case CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64:
+    return "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64";
   }
   return "unknown";
 }
@@ -614,7 +620,8 @@ enum class CudaTracePreconditionerKind : std::uint8_t
   hypre_diag_scale = 2,
   hypre_mgr_field_split = 3,
   native_element_schwarz_fp64 = 4,
-  native_element_schwarz_equilibrated_field_split_fp64 = 5
+  native_element_schwarz_equilibrated_field_split_fp64 = 5,
+  native_element_schwarz_warp_equilibrated_field_split_fp64 = 6
 };
 
 /** Deterministic lifetime policy for a selected HYPRE ILU(0) factor. */
@@ -709,7 +716,9 @@ constexpr bool CudaTracePreconditionerIsNativeElementSchwarz(
   return kind ==
           CudaTracePreconditionerKind::native_element_schwarz_fp64 ||
       kind == CudaTracePreconditionerKind::
-          native_element_schwarz_equilibrated_field_split_fp64;
+          native_element_schwarz_equilibrated_field_split_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_warp_equilibrated_field_split_fp64;
 }
 
 constexpr bool
@@ -717,7 +726,18 @@ CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
     const CudaTracePreconditionerKind kind) noexcept
 {
   return kind == CudaTracePreconditionerKind::
-      native_element_schwarz_equilibrated_field_split_fp64;
+          native_element_schwarz_equilibrated_field_split_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_warp_equilibrated_field_split_fp64;
+}
+
+/** Benchmark-only cooperative FP64 field-patch application. */
+constexpr bool
+CudaTracePreconditionerIsNativeElementSchwarzWarpEquilibratedFieldSplit(
+    const CudaTracePreconditionerKind kind) noexcept
+{
+  return kind == CudaTracePreconditionerKind::
+      native_element_schwarz_warp_equilibrated_field_split_fp64;
 }
 
 /** Benchmark-only exact element-Schur operator ablation. */
@@ -727,7 +747,9 @@ constexpr bool CudaTracePolicyUsesNativeElementMatrixFreeOperator(
   return kind ==
           CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64 ||
       kind == CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_equilibrated_field_split_fp64;
+          native_element_schwarz_matrix_free_equilibrated_field_split_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
 }
 
 /** Exact matrix-free/operator and equilibrated-field-split pairing. */
@@ -736,7 +758,18 @@ CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
     const CudaTracePolicyKind kind) noexcept
 {
   return kind == CudaTracePolicyKind::
-      native_element_schwarz_matrix_free_equilibrated_field_split_fp64;
+          native_element_schwarz_matrix_free_equilibrated_field_split_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
+}
+
+/** Exact matrix-free/operator and cooperative field-split pairing. */
+constexpr bool
+CudaTracePolicyUsesNativeElementMatrixFreeWarpEquilibratedFieldSplit(
+    const CudaTracePolicyKind kind) noexcept
+{
+  return kind == CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64;
 }
 
 constexpr CudaIluFactorReusePolicy CudaIluFactorReusePolicyForEngine(
@@ -768,6 +801,8 @@ constexpr int CudaIluLevelOfFill(
   case CudaTracePreconditionerKind::native_element_schwarz_fp64:
   case CudaTracePreconditionerKind::
       native_element_schwarz_equilibrated_field_split_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_warp_equilibrated_field_split_fp64:
   case CudaTracePreconditionerKind::unconfigured:
     break;
   }
@@ -787,6 +822,8 @@ constexpr int CudaIluLocalReordering(
   case CudaTracePreconditionerKind::native_element_schwarz_fp64:
   case CudaTracePreconditionerKind::
       native_element_schwarz_equilibrated_field_split_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_warp_equilibrated_field_split_fp64:
   case CudaTracePreconditionerKind::unconfigured:
     break;
   }
@@ -878,6 +915,9 @@ constexpr const char* CudaTracePreconditionerName(
   case CudaTracePreconditionerKind::
       native_element_schwarz_equilibrated_field_split_fp64:
     return "native_element_schwarz_equilibrated_field_split_fp64";
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_warp_equilibrated_field_split_fp64:
+    return "native_element_schwarz_warp_equilibrated_field_split_fp64";
   case CudaTracePreconditionerKind::unconfigured:
     break;
   }
@@ -963,6 +1003,20 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
       return result;
     result.trace_preconditioner = CudaTracePreconditionerKind::
         native_element_schwarz_equilibrated_field_split_fp64;
+    result.valid = true;
+    return result;
+  }
+
+  // Separately typed cooperative-patch ablation.  It retains the exact FP64
+  // matrix-free operator and outer GMRES; only the application of the same
+  // equilibrated lower field split is distributed across a fixed CUDA tile.
+  if (selection == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_fp64)
+  {
+    if (engine != generic::CudaEngineKind::tensor_core || !igr_active)
+      return result;
+    result.trace_preconditioner = CudaTracePreconditionerKind::
+        native_element_schwarz_warp_equilibrated_field_split_fp64;
     result.valid = true;
     return result;
   }

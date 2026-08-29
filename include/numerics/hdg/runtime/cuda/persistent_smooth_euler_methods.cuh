@@ -2540,8 +2540,14 @@ LaunchAndObserveNativeRankOneTraceSolve(
   const bool use_matrix_free_equilibrated_field_split =
       CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
           trace_policy_descriptor_.selection);
+  const bool use_matrix_free_warp_equilibrated_field_split =
+      CudaTracePolicyUsesNativeElementMatrixFreeWarpEquilibratedFieldSplit(
+          trace_policy_descriptor_.selection);
   const bool use_equilibrated_field_split =
       CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
+          trace_policy_descriptor_.trace_preconditioner);
+  const bool use_warp_equilibrated_field_split =
+      CudaTracePreconditionerIsNativeElementSchwarzWarpEquilibratedFieldSplit(
           trace_policy_descriptor_.trace_preconditioner);
   const bool factor_exact = use_ilu
       ? factor.offsets != nullptr && factor.columns != nullptr &&
@@ -2587,9 +2593,12 @@ LaunchAndObserveNativeRankOneTraceSolve(
           element_schwarz.elements == 0 && element_schwarz.patch_rows == 0 &&
           element_schwarz.true_rows == 0;
   CudaNativeTraceOperatorView trace_operator{};
-  trace_operator.kind = use_matrix_free_equilibrated_field_split
+  trace_operator.kind = use_matrix_free_warp_equilibrated_field_split
       ? CudaNativeTraceOperatorKind::
-            element_matrix_free_equilibrated_field_split_fp64
+            element_matrix_free_warp_equilibrated_field_split_fp64
+      : use_matrix_free_equilibrated_field_split
+          ? CudaNativeTraceOperatorKind::
+                element_matrix_free_equilibrated_field_split_fp64
       : use_matrix_free
           ? CudaNativeTraceOperatorKind::element_matrix_free_fp64
           : CudaNativeTraceOperatorKind::assembled_csr_fp64;
@@ -2599,9 +2608,12 @@ LaunchAndObserveNativeRankOneTraceSolve(
           shape_.igr_active && trace_operator.element_schur == view_.schur &&
           element_schwarz.patch_rows == shape_.trace_dofs &&
           use_matrix_free_equilibrated_field_split ==
-              use_equilibrated_field_split
+              use_equilibrated_field_split &&
+          use_matrix_free_warp_equilibrated_field_split ==
+              use_warp_equilibrated_field_split
       : trace_operator.element_schur == nullptr &&
-          !use_matrix_free_equilibrated_field_split;
+          !use_matrix_free_equilibrated_field_split &&
+          !use_matrix_free_warp_equilibrated_field_split;
   CudaTrueMatrixDeviceView current_matrix{};
   const bool matrix_exact = factor_exact && element_schwarz_exact &&
       operator_exact &&
