@@ -3141,19 +3141,41 @@ SolveTrueSystem(const generic::EulerHdgLinearSolveRole role,
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
-AssembleAndNorm(state_slot&, const double dt, double& norm) noexcept
+AssembleAndNorm(state_slot&, const double dt, double& norm,
+                CudaTensorCoreEvidence& tensor_core_evidence) noexcept
 {
   TransportPolicy::SetPhase(CudaFailurePhase::assembly, current_generation_);
   bool assembly_launched = false;
+  std::uint64_t invocation_volume_mma_tiles = 0;
   {
     ::dg_igr::NVTXRange profile_region(
         ::dg_igr::observability::RegionId::hdg_local_assembly);
     assembly_launched = CudaLaunchAssembly(
-        view_, shape_, dt, cuda_engine_);
+        view_, shape_, dt, cuda_engine_, invocation_volume_mma_tiles);
   }
   const bool local_assembly = assembly_launched && StatusPassed();
-  if (!CollectiveContinue(local_assembly) ||
-      !AssembleTrueVector(view_.residual_g, view_.true_residual, false))
+  if (!CollectiveContinue(local_assembly)) return false;
+
+  std::uint64_t updated_volume_assembly_launches =
+      tensor_core_evidence.volume_assembly_launches;
+  std::uint64_t updated_volume_mma_tiles =
+      tensor_core_evidence.volume_mma_tiles;
+  const bool known_engine =
+      cuda_engine_ == generic::CudaEngineKind::ordinary ||
+      cuda_engine_ == generic::CudaEngineKind::tensor_core;
+  const bool tensor_selected =
+      cuda_engine_ == generic::CudaEngineKind::tensor_core;
+  const bool volume_work_accounted = known_engine &&
+      AccumulateTensorVolumeWork(
+          tensor_selected, invocation_volume_mma_tiles,
+          updated_volume_assembly_launches, updated_volume_mma_tiles);
+  if (!CollectiveContinue(volume_work_accounted)) return false;
+  tensor_core_evidence.volume_assembly_launches =
+      updated_volume_assembly_launches;
+  tensor_core_evidence.volume_mma_tiles = updated_volume_mma_tiles;
+
+  if (!AssembleTrueVector(
+          view_.residual_g, view_.true_residual, false))
     return false;
   // StatusPassed has consumed and synchronized every per-element assembly
   // status.  Later condensation/admissibility/assembly phases overwrite the

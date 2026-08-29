@@ -216,6 +216,28 @@ scale *= 1.05 if args.mode == "igr" else 1.0
 scale *= 1.2 if args.export else 1.0
 durations = [scale * value for value in (0.99, 1.0, 1.01, 1.0, 1.0)]
 warmup_duration = scale * 1.1
+volume_assembly_order = 12 if args.mode == "igr" else 2 * args.order + 2
+volume_points = (volume_assembly_order // 2 + 1) ** 2
+interior_components = 7 if args.mode == "igr" else 4
+trace_components = 5 if args.mode == "igr" else 4
+scalar_interior_dofs = (args.order + 1) ** 2
+interior_dofs = interior_components * scalar_interior_dofs
+trace_dofs = 4 * trace_components * (args.order + 1)
+coefficient_stride = 66 if args.mode == "igr" else 44
+capacity_points = interior_dofs * (trace_dofs + 1) // coefficient_stride
+chunk_points = volume_points if volume_points <= capacity_points else \
+    capacity_points - capacity_points % 4
+remaining_points = volume_points
+quadrature_groups = 0
+while remaining_points:
+    chunk = min(remaining_points, chunk_points)
+    quadrature_groups += (chunk + 3) // 4
+    remaining_points -= chunk
+volume_mma_tiles_per_assembly = (
+    args.mesh_n * args.mesh_n * interior_components *
+    ((scalar_interior_dofs + 7) // 8) *
+    ((interior_dofs + 8) // 8) * 3 * quadrature_groups
+)
 samples = []
 for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
     sample = {
@@ -392,6 +414,13 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
             "maximum_right_scale": 4.0 if equilibrated_mgr else 0.0,
             "trace_preconditioner_configured": True,
             "hardware_supported": True,
+            "volume_assembly_launches": (
+                3 if args.engine == "tensor" else 0
+            ),
+            "volume_mma_tiles": (
+                3 * volume_mma_tiles_per_assembly
+                if args.engine == "tensor" else 0
+            ),
             "condensation_launches": 4 if args.engine == "tensor" else 0,
             "mma_tiles": 64 if args.engine == "tensor" else 0,
             "fallback_count": 0,
@@ -453,6 +482,8 @@ payload = {
     "cells_per_period": args.mesh_n // args.domain_periods,
     "element_h": args.domain_periods / args.mesh_n,
     "elements": args.mesh_n * args.mesh_n,
+    "volume_assembly_order": volume_assembly_order,
+    "volume_points": volume_points,
     "interior_components": 7 if args.mode == "igr" else 4,
     "trace_components": 5 if args.mode == "igr" else 4,
     "interior_unknowns": (
@@ -1953,9 +1984,31 @@ def main() -> int:
             assert result["engines"]["ordinary"]["solver_work"][
                 "tensor_core"
             ]["mma_tiles"]["total"] == 0
+            assert result["engines"]["ordinary"]["solver_work"][
+                "tensor_core"
+            ]["volume_assembly_launches"]["total"] == 0
+            assert result["engines"]["ordinary"]["solver_work"][
+                "tensor_core"
+            ]["volume_mma_tiles"]["total"] == 0
             assert result["engines"]["tensor"]["solver_work"][
                 "tensor_core"
             ]["mma_tiles"]["total"] == 640
+            order = int(cell_key.rsplit("_p", 1)[1])
+            volume_points = 49 if mode == "igr" else (order + 2) ** 2
+            volume_plan = CAMPAIGN.tensor_volume_work_plan(
+                mode=mode,
+                order=order,
+                elements=12 * 12,
+                volume_points=volume_points,
+            )
+            assert result["engines"]["tensor"]["solver_work"][
+                "tensor_core"
+            ]["volume_assembly_launches"]["total"] == 30
+            assert result["engines"]["tensor"]["solver_work"][
+                "tensor_core"
+            ]["volume_mma_tiles"]["total"] == (
+                30 * volume_plan["mma_tiles_per_assembly"]
+            )
         primary = [item for item in campaign["invocations"]
                    if item["phase"] == "final_tree_primary" and
                    item["mode"] == "conventional" and item["order"] == 1]
@@ -2293,6 +2346,16 @@ def main() -> int:
         bad_mma = copy.deepcopy(ordinary_record)
         bad_mma["samples"][1]["tensor_core"]["mma_tiles"] = 1
         assert rejected(bad_mma)
+        bad_volume_launch = copy.deepcopy(ordinary_record)
+        bad_volume_launch["samples"][1]["tensor_core"][
+            "volume_assembly_launches"
+        ] = 1
+        assert rejected(bad_volume_launch)
+        bad_volume_mma = copy.deepcopy(ordinary_record)
+        bad_volume_mma["samples"][1]["tensor_core"][
+            "volume_mma_tiles"
+        ] = 1
+        assert rejected(bad_volume_mma)
         bad_memory = copy.deepcopy(ordinary_record)
         bad_memory["device_memory_snapshots"]["after_samples"][
             "used_bytes"

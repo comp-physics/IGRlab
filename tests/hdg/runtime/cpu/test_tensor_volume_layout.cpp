@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <iostream>
+#include <limits>
 
 namespace
 {
@@ -23,6 +24,8 @@ static_assert(TensorVolumeIgrDqSlot(3, 0) == -1);
 
 constexpr TensorVolumeScratchPlan conventional_p1 =
     PlanTensorVolumeScratch(16, 32, 9, false);
+constexpr TensorVolumeScratchPlan conventional_p1_q12 =
+    PlanTensorVolumeScratch(16, 32, 49, false);
 constexpr TensorVolumeScratchPlan conventional_p1_q64 =
     PlanTensorVolumeScratch(16, 32, 64, false);
 constexpr TensorVolumeScratchPlan igr_p1 =
@@ -35,6 +38,9 @@ constexpr TensorVolumeScratchPlan igr_p3_q14 =
     PlanTensorVolumeScratch(112, 80, 64, true);
 static_assert(conventional_p1.valid && conventional_p1.capacity_points == 12 &&
               conventional_p1.chunk_points == 9);
+static_assert(conventional_p1_q12.valid &&
+              conventional_p1_q12.capacity_points == 12 &&
+              conventional_p1_q12.chunk_points == 12);
 static_assert(conventional_p1_q64.valid &&
               conventional_p1_q64.chunk_points == 12);
 static_assert(igr_p1.valid && igr_p1.capacity_points == 17 &&
@@ -43,6 +49,61 @@ static_assert(igr_p1_q12.valid && igr_p1_q12.chunk_points == 16);
 static_assert(igr_p2_q12.valid && igr_p2_q12.chunk_points == 49);
 static_assert(igr_p3_q14.valid && igr_p3_q14.chunk_points == 64);
 static_assert(!PlanTensorVolumeScratch(4, 1, 4, true).valid);
+
+constexpr TensorVolumeMmaWorkPlan conventional_p1_q12_work =
+    PlanTensorVolumeMmaWork(1, 4, 4, 16, 32, 49, false);
+constexpr TensorVolumeMmaWorkPlan igr_p1_q12_work =
+    PlanTensorVolumeMmaWork(1, 7, 4, 28, 40, 49, true);
+constexpr TensorVolumeMmaWorkPlan igr_p2_q12_work =
+    PlanTensorVolumeMmaWork(1, 7, 9, 63, 60, 49, true);
+constexpr TensorVolumeMmaWorkPlan igr_p3_q14_work =
+    PlanTensorVolumeMmaWork(1, 7, 16, 112, 80, 64, true);
+static_assert(conventional_p1_q12_work.valid &&
+              conventional_p1_q12_work.contraction_launches == 5 &&
+              conventional_p1_q12_work.mma_tiles == 468);
+static_assert(igr_p1_q12_work.valid &&
+              igr_p1_q12_work.contraction_launches == 4 &&
+              igr_p1_q12_work.mma_tiles == 1092);
+static_assert(igr_p2_q12_work.valid &&
+              igr_p2_q12_work.contraction_launches == 1 &&
+              igr_p2_q12_work.mma_tiles == 4368);
+static_assert(igr_p3_q14_work.valid &&
+              igr_p3_q14_work.contraction_launches == 1 &&
+              igr_p3_q14_work.mma_tiles == 10080);
+static_assert(!PlanTensorVolumeMmaWork(
+    std::numeric_limits<int>::max(), std::numeric_limits<int>::max(),
+    std::numeric_limits<int>::max(), std::numeric_limits<int>::max(),
+    std::numeric_limits<int>::max(), std::numeric_limits<int>::max(),
+    true).valid);
+
+constexpr bool CheckAggregateAccounting()
+{
+  std::uint64_t launches = 0;
+  std::uint64_t tiles = 0;
+  if (!AccumulateTensorVolumeWork(true, 468, launches, tiles) ||
+      launches != 1 || tiles != 468 ||
+      !AccumulateTensorVolumeWork(true, 1092, launches, tiles) ||
+      launches != 2 || tiles != 1560)
+    return false;
+  const std::uint64_t retained_launches = launches;
+  const std::uint64_t retained_tiles = tiles;
+  if (AccumulateTensorVolumeWork(
+          true, std::numeric_limits<std::uint64_t>::max(),
+          launches, tiles) || launches != retained_launches ||
+      tiles != retained_tiles)
+    return false;
+  launches = std::numeric_limits<std::uint64_t>::max();
+  tiles = 0;
+  if (AccumulateTensorVolumeWork(true, 1, launches, tiles) ||
+      launches != std::numeric_limits<std::uint64_t>::max() || tiles != 0)
+    return false;
+  launches = 0;
+  tiles = 0;
+  return AccumulateTensorVolumeWork(false, 0, launches, tiles) &&
+      !AccumulateTensorVolumeWork(false, 1, launches, tiles) &&
+      launches == 0 && tiles == 0;
+}
+static_assert(CheckAggregateAccounting());
 
 bool CheckSlotPartition(const bool igr)
 {
@@ -130,9 +191,12 @@ int main()
 {
   const bool passed = CheckSlotPartition(false) &&
       CheckSlotPartition(true) &&
+      CheckChunkCoverage(conventional_p1_q12, 49) &&
       CheckChunkCoverage(conventional_p1_q64, 64) &&
       CheckChunkCoverage(igr_p1_q12, 49) &&
       CheckChunkCoverage(igr_p3_q14, 64) &&
+      CheckChunkSequence(conventional_p1_q12, 49,
+                         std::array<int, 5>{{12, 12, 12, 12, 1}}) &&
       CheckChunkSequence(igr_p1_q12, 49,
                          std::array<int, 4>{{16, 16, 16, 1}});
   if (!passed)

@@ -2,6 +2,7 @@
 #include "numerics/hdg/runtime/cpu/persistent_smooth_euler.hpp"
 #include "numerics/hdg/runtime/cuda/generic_euler.cuh"
 #include "sim/hdg/state_io.hpp"
+#include "test_cuda_trace_solver_routing.hpp"
 
 #include <mfem.hpp>
 #include <mpi.h>
@@ -162,6 +163,7 @@ struct CrossBackendPreparedHealth
   int line_search_trials = -1;
   int rejected_line_search_trials = -1;
   CudaTensorCoreEvidence tensor_core{};
+  bool tensor_volume_evidence_valid = false;
   bool finite = false;
   bool admissible = false;
   bool recovery = false;
@@ -197,6 +199,10 @@ struct CudaQualificationTestAccess
     health.rejected_line_search_trials =
         numerical.rejected_line_search_trials;
     health.tensor_core = pending.evidence.tensor_core;
+    health.tensor_volume_evidence_valid =
+        CudaPreparedTensorVolumeEvidenceValid(
+            health.tensor_core, engine.numerics_.shape_,
+            engine.config_.cuda_engine);
     health.finite = numerical.finite;
     health.admissible = numerical.admissible;
     health.recovery = numerical.recovery;
@@ -372,6 +378,8 @@ struct StepState
   int rejected_line_search_trials = 0;
   std::uint64_t tensor_condensation_launches = 0;
   std::uint64_t tensor_mma_tiles = 0;
+  std::uint64_t tensor_volume_assembly_launches = 0;
+  std::uint64_t tensor_volume_mma_tiles = 0;
   std::uint64_t fallback_count = 0;
   int trace_components = 0;
   SigmaLocalization sigma{};
@@ -1012,6 +1020,7 @@ Trajectory RunCuda(const EulerHdgRequest& request,
                 health.linear_iterations, request.backend.cuda_engine,
                 specification.regularization == RegularizationKind::igr) &&
         health.tensor_core.fallback_count == 0 && health.no_fallback &&
+        health.tensor_volume_evidence_valid &&
         (request.backend.cuda_engine == CudaEngineKind::ordinary
              ? health.tensor_core.condensation_launches == 0 &&
                    health.tensor_core.mma_tiles == 0
@@ -1060,6 +1069,9 @@ Trajectory RunCuda(const EulerHdgRequest& request,
     state.tensor_condensation_launches =
         health.tensor_core.condensation_launches;
     state.tensor_mma_tiles = health.tensor_core.mma_tiles;
+    state.tensor_volume_assembly_launches =
+        health.tensor_core.volume_assembly_launches;
+    state.tensor_volume_mma_tiles = health.tensor_core.volume_mma_tiles;
     state.fallback_count = health.tensor_core.fallback_count;
     trajectory.states.push_back(std::move(state));
   }
@@ -1188,7 +1200,11 @@ bool CompareTrajectory(const Case& specification,
                 << reference.tensor_condensation_launches << '/'
                 << device.tensor_condensation_launches << ','
                 << reference.tensor_mma_tiles << '/'
-                << device.tensor_mma_tiles << " fallback="
+                << device.tensor_mma_tiles << " volume="
+                << reference.tensor_volume_assembly_launches << '/'
+                << device.tensor_volume_assembly_launches << ','
+                << reference.tensor_volume_mma_tiles << '/'
+                << device.tensor_volume_mma_tiles << " fallback="
                 << reference.fallback_count << '/'
                 << device.fallback_count << " sigma_l2="
                 << reference.sigma.global_l2_squared << '/'

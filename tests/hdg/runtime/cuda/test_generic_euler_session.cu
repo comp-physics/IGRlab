@@ -147,6 +147,8 @@ struct CudaQualificationTestAccess
         CudaPreparedTraceSolverRoutingValid(
             tensor, evidence.trace_solves, expected,
             engine.config_.expected_rank_count) &&
+        CudaPreparedTensorVolumeEvidenceValid(
+            tensor, engine.numerics_.shape_, expected) &&
         tensor.fallback_count == 0 && evidence.no_fallback &&
         (expected == generic::CudaEngineKind::ordinary
              ? tensor.condensation_launches == 0 && tensor.mma_tiles == 0

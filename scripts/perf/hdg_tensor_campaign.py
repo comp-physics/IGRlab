@@ -1060,6 +1060,57 @@ def checked_uint64(value: Any, field: str) -> int:
     return result
 
 
+def tensor_volume_work_plan(*, mode: str, order: int, elements: int,
+                            volume_points: int) -> dict[str, int]:
+    """Independently reproduce the bounded production volume-WMMA plan."""
+    if mode not in {"conventional", "igr"} or order not in {1, 2, 3} or \
+            elements <= 0 or volume_points <= 0:
+        raise CampaignError("tensor-volume work shape is invalid")
+    interior_components = 7 if mode == "igr" else 4
+    trace_components = 5 if mode == "igr" else 4
+    scalar_interior_dofs = (order + 1) ** 2
+    scalar_face_dofs = order + 1
+    interior_dofs = interior_components * scalar_interior_dofs
+    trace_dofs = 4 * trace_components * scalar_face_dofs
+    coefficient_stride = 66 if mode == "igr" else 44
+    workspace_doubles = interior_dofs * (trace_dofs + 1)
+    capacity_points = workspace_doubles // coefficient_stride
+    if capacity_points <= 0:
+        raise CampaignError("tensor-volume workspace holds no coefficient")
+    chunk_points = volume_points if volume_points <= capacity_points else \
+        capacity_points - capacity_points % 4
+    if chunk_points <= 0 or \
+            (volume_points > capacity_points and chunk_points < 4):
+        raise CampaignError("tensor-volume workspace cannot form an MMA chunk")
+
+    chunks: list[int] = []
+    remaining = volume_points
+    quadrature_groups = 0
+    while remaining:
+        count = min(remaining, chunk_points)
+        if count <= 0 or count > capacity_points or \
+                (remaining > count and count % 4):
+            raise CampaignError("tensor-volume chunk plan is inconsistent")
+        chunks.append(count)
+        quadrature_groups += (count + 3) // 4
+        remaining -= count
+    mma_tiles = (
+        elements * interior_components *
+        ((scalar_interior_dofs + 7) // 8) *
+        ((interior_dofs + 8) // 8) * 3 * quadrature_groups
+    )
+    if mma_tiles <= 0 or mma_tiles > UINT64_MAX:
+        raise CampaignError("tensor-volume MMA work exceeds uint64")
+    return {
+        "workspace_doubles": workspace_doubles,
+        "coefficient_stride": coefficient_stride,
+        "capacity_points": capacity_points,
+        "chunk_points": chunk_points,
+        "contraction_launches_per_assembly": len(chunks),
+        "mma_tiles_per_assembly": mma_tiles,
+    }
+
+
 def _ilu_derived_bounds_are_valid(
         outer_iterations: int, linear_solve_attempts: int,
         krylov_restart_dimension: int,
@@ -1308,6 +1359,7 @@ def validate_memory_controls(record: dict[str, Any]) -> None:
 def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
                           trace_policy: str,
                           expected_preconditioner: str,
+                          volume_mma_tiles_per_assembly: int,
                           krylov_restart_dimension: int,
                           true_residual_tightening_enabled: bool,
                           expected_phase: str, expected_index: int,
@@ -1668,6 +1720,14 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
     )
     tiles = checked_int(tensor.get("mma_tiles"),
                         "samples.tensor_core.mma_tiles")
+    volume_launches = checked_uint64(
+        tensor.get("volume_assembly_launches"),
+        "samples.tensor_core.volume_assembly_launches",
+    )
+    volume_tiles = checked_uint64(
+        tensor.get("volume_mma_tiles"),
+        "samples.tensor_core.volume_mma_tiles",
+    )
     if not isinstance(tensor.get("hardware_supported"), bool):
         raise CampaignError("sample tensor hardware-support evidence is missing")
     if tensor.get("fallback_count") != 0 or \
@@ -1677,10 +1737,19 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
     if engine == "tensor":
         if tensor.get("hardware_supported") is not True:
             raise CampaignError("tensor hardware support was not reported")
-        if launches <= 0 or tiles <= 0:
+        if launches <= 0 or tiles <= 0 or volume_launches <= 0:
             raise CampaignError("tensor run did not report production MMA work")
-    elif launches != 0 or tiles != 0:
-        raise CampaignError("ordinary CUDA reported tensor-condensation work")
+        if volume_mma_tiles_per_assembly <= 0 or \
+                volume_launches > UINT64_MAX // \
+                volume_mma_tiles_per_assembly or \
+                volume_tiles != volume_launches * \
+                volume_mma_tiles_per_assembly:
+            raise CampaignError(
+                "tensor-volume aggregate differs from exact shape/chunk work"
+            )
+    elif launches != 0 or tiles != 0 or volume_launches != 0 or \
+            volume_tiles != 0:
+        raise CampaignError("ordinary CUDA reported tensor work")
 
     transfers = sample.get("transfers")
     if not isinstance(transfers, dict) or transfers.get("complete") is not True:
@@ -1809,7 +1878,7 @@ def validate_embedded_final_identity(
 
 
 def validate_final_policy(record: dict[str, Any], *, mode: str,
-                          order: int) -> None:
+                          order: int) -> dict[str, int]:
     exact_top_level = {
         "time_integrator": "backward_euler",
         "time_step_policy": "fixed",
@@ -1866,6 +1935,20 @@ def validate_final_policy(record: dict[str, Any], *, mode: str,
     if not isinstance(policy, dict):
         raise CampaignError("benchmark lacks its numerical policy")
     quadrature = 2 * order + 2
+    expected_volume_assembly_order = 12 if mode == "igr" else quadrature
+    expected_volume_points = (expected_volume_assembly_order // 2 + 1) ** 2
+    if checked_int(record.get("volume_assembly_order"),
+                   "volume_assembly_order", 1) != \
+            expected_volume_assembly_order or \
+            checked_int(record.get("volume_points"),
+                        "volume_points", 1) != expected_volume_points:
+        raise CampaignError(
+            "resolved volume quadrature shape differs from the numerical policy"
+        )
+    volume_work = tensor_volume_work_plan(
+        mode=mode, order=order, elements=elements,
+        volume_points=expected_volume_points,
+    )
     exact_policy = {
         "volume_projection_quadrature_order": quadrature,
         "true_trace_projection_quadrature_order": quadrature,
@@ -1904,6 +1987,7 @@ def validate_final_policy(record: dict[str, Any], *, mode: str,
                 checked_float(policy.get(field), f"numerical_policy.{field}"),
                 expected, rel_tol=0.0, abs_tol=0.0):
             raise CampaignError(f"numerical policy {field} differs from control")
+    return volume_work
 
 
 def validate_record(record: Any, *, source: str, mode: str, order: int,
@@ -1978,7 +2062,9 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
         checked_int(record.get("cuda_runtime_version"),
                     "cuda_runtime_version", 1)
         validate_embedded_final_identity(record, expected_build, expected_gpu)
-        validate_final_policy(record, mode=mode, order=order)
+        volume_work = validate_final_policy(
+            record, mode=mode, order=order
+        )
         if record.get("initialization_in_primary_timing") is not False:
             raise CampaignError("benchmark initialization timing scope is invalid")
         initialization = checked_float(
@@ -2201,6 +2287,8 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
             samples[0], engine=engine, mode=mode, order=order,
             trace_policy=trace_policy,
             expected_preconditioner=expected_preconditioner,
+            volume_mma_tiles_per_assembly=
+                volume_work["mma_tiles_per_assembly"],
             krylov_restart_dimension=krylov_restart_dimension,
             true_residual_tightening_enabled=
                 true_residual_tightening_enabled,
@@ -2220,6 +2308,8 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
                 order=order,
                 trace_policy=trace_policy,
                 expected_preconditioner=expected_preconditioner,
+                volume_mma_tiles_per_assembly=
+                    volume_work["mma_tiles_per_assembly"],
                 krylov_restart_dimension=krylov_restart_dimension,
                 true_residual_tightening_enabled=
                     true_residual_tightening_enabled,
@@ -2405,6 +2495,8 @@ def summarized_sample_work(sample: dict[str, Any], *, schema: int) -> dict[str, 
         "minimum_right_scale": tensor["minimum_right_scale"],
         "maximum_right_scale": tensor["maximum_right_scale"],
         "hardware_supported": tensor["hardware_supported"],
+        "volume_assembly_launches": tensor["volume_assembly_launches"],
+        "volume_mma_tiles": tensor["volume_mma_tiles"],
         "condensation_launches": tensor["condensation_launches"],
         "mma_tiles": tensor["mma_tiles"],
         "fallback_count": tensor["fallback_count"],
@@ -2593,6 +2685,8 @@ def work_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "element_schwarz_patch_rows",
         "element_schwarz_minimum_multiplicity",
         "element_schwarz_maximum_multiplicity",
+        "volume_assembly_launches",
+        "volume_mma_tiles",
         "condensation_launches",
         "mma_tiles",
         "fallback_count",

@@ -9,6 +9,7 @@
  */
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 
 namespace dg::hdg::runtime::cuda_w8a::detail
@@ -110,6 +111,36 @@ struct TensorVolumeScratchPlan final
   bool valid = false;
 };
 
+/** Exact bounded FP64 m8n8k4 work for one tensor-volume assembly call. */
+struct TensorVolumeMmaWorkPlan final
+{
+  TensorVolumeScratchPlan scratch{};
+  std::uint64_t contraction_launches = 0;
+  std::uint64_t mma_tiles = 0;
+  bool valid = false;
+};
+
+constexpr bool TensorVolumeCheckedAdd(
+    const std::uint64_t left, const std::uint64_t right,
+    std::uint64_t& result) noexcept
+{
+  if (right > std::numeric_limits<std::uint64_t>::max() - left)
+    return false;
+  result = left + right;
+  return true;
+}
+
+constexpr bool TensorVolumeCheckedMultiply(
+    const std::uint64_t left, const std::uint64_t right,
+    std::uint64_t& result) noexcept
+{
+  if (left != 0 &&
+      right > std::numeric_limits<std::uint64_t>::max() / left)
+    return false;
+  result = left * right;
+  return true;
+}
+
 /**
  * Plan one element's zero-allocation coefficient stream.
  *
@@ -153,6 +184,98 @@ constexpr TensorVolumeScratchPlan PlanTensorVolumeScratch(
       plan.workspace_doubles /
           static_cast<std::size_t>(plan.coefficient_stride);
   return plan;
+}
+
+/**
+ * Count every dynamic FP64 WMMA instruction executed by one successful
+ * production tensor-volume assembly invocation.
+ *
+ * Each contraction launch covers one deterministic quadrature chunk.  One
+ * block owns an (element,row-component) slab; its warps cover complete 8x8
+ * output tiles and execute one m8n8k4 instruction for every phi/dx/dy feature
+ * and every zero-padded group of four quadrature points.  Consequently a
+ * short final chunk remains material work and is included exactly.
+ */
+constexpr TensorVolumeMmaWorkPlan PlanTensorVolumeMmaWork(
+    const int elements, const int interior_components,
+    const int scalar_interior_dofs, const int interior_dofs,
+    const int trace_dofs, const int volume_points,
+    const bool igr) noexcept
+{
+  TensorVolumeMmaWorkPlan plan{};
+  plan.scratch = PlanTensorVolumeScratch(
+      interior_dofs, trace_dofs, volume_points, igr);
+  if (!plan.scratch.valid || elements <= 0 || interior_components <= 0 ||
+      scalar_interior_dofs <= 0 || interior_dofs <= 0 ||
+      trace_dofs <= 0 || volume_points <= 0)
+    return plan;
+
+  int remaining = volume_points;
+  std::uint64_t quadrature_groups = 0;
+  while (remaining > 0)
+  {
+    const int count = remaining < plan.scratch.chunk_points
+        ? remaining : plan.scratch.chunk_points;
+    if (count <= 0 || count > plan.scratch.capacity_points ||
+        (remaining > count && count % tensor_volume_mma_inner != 0) ||
+        plan.contraction_launches ==
+            std::numeric_limits<std::uint64_t>::max())
+      return TensorVolumeMmaWorkPlan{};
+    const std::uint64_t groups =
+        static_cast<std::uint64_t>((count - 1) /
+                                   tensor_volume_mma_inner + 1);
+    std::uint64_t updated_groups = 0;
+    if (!TensorVolumeCheckedAdd(
+            quadrature_groups, groups, updated_groups))
+      return TensorVolumeMmaWorkPlan{};
+    quadrature_groups = updated_groups;
+    ++plan.contraction_launches;
+    remaining -= count;
+  }
+
+  const std::uint64_t row_tiles =
+      (static_cast<std::uint64_t>(scalar_interior_dofs) + 7U) / 8U;
+  // The final output column is residual_r; all preceding columns are A.
+  const std::uint64_t column_tiles =
+      (static_cast<std::uint64_t>(interior_dofs) + 8U) / 8U;
+  std::uint64_t work = static_cast<std::uint64_t>(elements);
+  const std::uint64_t factors[] = {
+      static_cast<std::uint64_t>(interior_components), row_tiles,
+      column_tiles, static_cast<std::uint64_t>(tensor_volume_features),
+      quadrature_groups};
+  for (const std::uint64_t factor : factors)
+  {
+    std::uint64_t updated = 0;
+    if (!TensorVolumeCheckedMultiply(work, factor, updated))
+      return TensorVolumeMmaWorkPlan{};
+    work = updated;
+  }
+  plan.mma_tiles = work;
+  plan.valid = plan.contraction_launches > 0 && plan.mma_tiles > 0;
+  return plan;
+}
+
+/**
+ * Update the two constant-size tensor-volume aggregate values atomically with
+ * respect to overflow checks.  Ordinary CUDA must retain exact zeros.
+ */
+constexpr bool AccumulateTensorVolumeWork(
+    const bool tensor_selected, const std::uint64_t invocation_mma_tiles,
+    std::uint64_t& volume_assembly_launches,
+    std::uint64_t& volume_mma_tiles) noexcept
+{
+  if (!tensor_selected)
+    return invocation_mma_tiles == 0 && volume_assembly_launches == 0 &&
+        volume_mma_tiles == 0;
+  if (invocation_mma_tiles == 0 ||
+      volume_assembly_launches ==
+          std::numeric_limits<std::uint64_t>::max() ||
+      invocation_mma_tiles >
+          std::numeric_limits<std::uint64_t>::max() - volume_mma_tiles)
+    return false;
+  ++volume_assembly_launches;
+  volume_mma_tiles += invocation_mma_tiles;
+  return true;
 }
 
 constexpr bool TensorVolumeCoefficientOffset(

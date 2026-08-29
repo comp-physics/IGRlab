@@ -1131,6 +1131,11 @@ struct CudaTensorCoreEvidence
   std::uint64_t ilu_jacobi_factor_spmv_updates_upper_bound = 0;
   // Maximum factor age observed in this aggregate scope, never a history.
   std::uint64_t ilu_factor_age_generations = 0;
+  // Volume assembly and condensation retain distinct meanings.  These two
+  // fields count successful production volume invocations and their exact
+  // FP64 m8n8k4 work; mma_tiles below remains condensation-only.
+  std::uint64_t volume_assembly_launches = 0;
+  std::uint64_t volume_mma_tiles = 0;
   std::uint64_t condensation_launches = 0;
   std::uint64_t mma_tiles = 0;
   std::uint64_t fallback_count = 0;

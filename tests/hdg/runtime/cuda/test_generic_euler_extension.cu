@@ -214,6 +214,8 @@ struct CudaBorrowedAssemblyFusionAudit
   int elements = 0;
   int interior_dofs = 0;
   int trace_dofs = 0;
+  std::uint64_t ordinary_volume_mma_tiles = 0;
+  std::uint64_t tensor_volume_mma_tiles = 0;
   bool status_bitwise_equal = false;
   bool status_all_passed = false;
 };
@@ -396,10 +398,11 @@ struct CudaQualificationTestAccess
           CudaTransferSite::generic_host_export);
     };
     const auto launch_and_copy = [&](const CudaBorrowedAssemblyKind kind,
-                                     Products& products) noexcept
+                                     Products& products,
+                                     std::uint64_t& volume_mma_tiles) noexcept
     {
       const bool launched = CudaLaunchBorrowedAssembly(
-              numerics.view_, shape, fixed_dt, kind) &&
+              numerics.view_, shape, fixed_dt, kind, volume_mma_tiles) &&
           numerics.StatusPassed();
       if (!numerics.CollectiveContinue(launched)) return false;
       const bool copied = d2h(products.residual_r.data(),
@@ -419,9 +422,21 @@ struct CudaQualificationTestAccess
               CudaTransferSite::generic_host_export);
       return numerics.CollectiveContinue(copied);
     };
-    if (!launch_and_copy(CudaBorrowedAssemblyKind::ordinary_split, split) ||
-        !launch_and_copy(CudaBorrowedAssemblyKind::tensor_volume, fused))
+    if (!launch_and_copy(
+            CudaBorrowedAssemblyKind::ordinary_split, split,
+            audit.ordinary_volume_mma_tiles) ||
+        !launch_and_copy(
+            CudaBorrowedAssemblyKind::tensor_volume, fused,
+            audit.tensor_volume_mma_tiles))
       return false;
+
+    const auto planned_volume_work = PlanTensorVolumeMmaWork(
+        shape.elements, shape.interior_components,
+        shape.scalar_interior_dofs, shape.interior_dofs,
+        shape.trace_dofs, shape.volume_points, shape.igr_active);
+    const bool exact_volume_work = planned_volume_work.valid &&
+        audit.ordinary_volume_mma_tiles == 0 &&
+        audit.tensor_volume_mma_tiles == planned_volume_work.mma_tiles;
 
     const std::array<const std::vector<double>*, 8> split_products{{
         &split.residual_r, &split.residual_g, &split.a, &split.b,
@@ -483,7 +498,8 @@ struct CudaQualificationTestAccess
     audit.elements = shape.elements;
     audit.interior_dofs = shape.interior_dofs;
     audit.trace_dofs = shape.trace_dofs;
-    return within_tolerance && audit.status_bitwise_equal &&
+    return exact_volume_work && within_tolerance &&
+        audit.status_bitwise_equal &&
         audit.status_all_passed;
   }
 
@@ -508,6 +524,10 @@ struct CudaQualificationTestAccess
     const auto scratch = PlanTensorVolumeScratch(
         shape.interior_dofs, shape.trace_dofs,
         shape.volume_points, false);
+    const auto mma_work = PlanTensorVolumeMmaWork(
+        shape.elements, shape.interior_components,
+        shape.scalar_interior_dofs, shape.interior_dofs,
+        shape.trace_dofs, shape.volume_points, false);
     // For conventional p1, q12 is 49 quadrilateral points and the retained
     // solve workspace holds exactly 12 compact 44-double coefficients.  The
     // production launch loop must therefore execute 12+12+12+12+1.
@@ -518,7 +538,10 @@ struct CudaQualificationTestAccess
         shape.trace_dofs == 32 && scratch.valid &&
         scratch.workspace_doubles == 528 &&
         scratch.coefficient_stride == 44 &&
-        scratch.capacity_points == 12 && scratch.chunk_points == 12;
+        scratch.capacity_points == 12 && scratch.chunk_points == 12 &&
+        mma_work.valid && mma_work.contraction_launches == 5 &&
+        mma_work.mma_tiles ==
+            468U * static_cast<std::uint64_t>(shape.elements);
     return numerics.CollectiveContinue(exact_multi_chunk_shape) &&
         AuditBorrowedAssemblyFusion(engine, audit);
   }
@@ -586,6 +609,8 @@ struct CudaQualificationTestAccess
         CudaPreparedTraceSolverRoutingValid(
             tensor, evidence.trace_solves, expected,
             engine.config_.expected_rank_count) &&
+        CudaPreparedTensorVolumeEvidenceValid(
+            tensor, engine.numerics_.shape_, expected) &&
         tensor.fallback_count == 0 && evidence.no_fallback &&
         (expected == generic::CudaEngineKind::ordinary
              ? tensor.condensation_launches == 0 && tensor.mma_tiles == 0
@@ -1199,12 +1224,13 @@ struct CudaQualificationTestAccess
                               std::vector<double>& residual_g) noexcept
     {
       if (!install(interior, trace)) return false;
+      std::uint64_t ignored_volume_mma_tiles = 0;
       const bool launched = (frozen
               ? CudaLaunchFrozenBorrowedLlfAssembly(
                     numerics.view_, shape, fixed_dt)
               : CudaLaunchAssembly(
                     numerics.view_, shape, fixed_dt,
-                    numerics.cuda_engine_)) &&
+                    numerics.cuda_engine_, ignored_volume_mma_tiles)) &&
           CudaTransportPolicy::Synchronize(
               CudaTransferSite::scalar_status) &&
           numerics.StatusPassed();

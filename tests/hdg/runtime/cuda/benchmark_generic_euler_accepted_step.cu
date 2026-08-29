@@ -1,6 +1,7 @@
 #include "numerics/hdg/generic/session_contract.hpp"
 #include "numerics/hdg/runtime/cuda/generic_euler.cuh"
 #include "utils/profiling/nvtx.hpp"
+#include "test_cuda_trace_solver_routing.hpp"
 
 #include <_hypre_utilities.h>
 #include <cuda_profiler_api.h>
@@ -43,6 +44,7 @@ struct CudaAcceptedStepBenchmarkObservation
       std::numeric_limits<double>::infinity();
   double maximum_conservation_relative_error =
       std::numeric_limits<double>::infinity();
+  TensorVolumeMmaWorkPlan tensor_volume_work{};
   bool candidate_ready = false;
   bool finite = false;
   bool admissible = false;
@@ -70,6 +72,8 @@ struct CudaAcceptedStepProblemMetadata
   int trace_components = 0;
   int scalar_interior_dofs = 0;
   int scalar_face_dofs = 0;
+  int volume_assembly_order = 0;
+  int volume_points = 0;
   int interior_unknowns = 0;
   int true_trace_unknowns = 0;
   int global_true_trace_unknowns = 0;
@@ -111,6 +115,11 @@ struct CudaQualificationTestAccess
         numerical.maximum_conservation_error;
     observation.maximum_conservation_relative_error =
         numerical.maximum_conservation_relative_error;
+    const auto& shape = engine.numerics_.shape_;
+    observation.tensor_volume_work = PlanTensorVolumeMmaWork(
+        shape.elements, shape.interior_components,
+        shape.scalar_interior_dofs, shape.interior_dofs,
+        shape.trace_dofs, shape.volume_points, shape.igr_active);
     observation.candidate_ready = numerical.candidate_ready;
     observation.finite = numerical.finite;
     observation.admissible = numerical.admissible;
@@ -168,6 +177,8 @@ struct CudaQualificationTestAccess
     metadata.trace_components = shape.trace_components;
     metadata.scalar_interior_dofs = shape.scalar_interior_dofs;
     metadata.scalar_face_dofs = shape.scalar_face_dofs;
+    metadata.volume_assembly_order = shape.volume_assembly_order;
+    metadata.volume_points = shape.volume_points;
     metadata.interior_unknowns = shape.interior_count;
     metadata.true_trace_unknowns = shape.true_trace_count;
     metadata.global_true_trace_unknowns = shape.global_true_trace_count;
@@ -229,6 +240,8 @@ using dg::hdg::runtime::cuda_w8a::detail::
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaAcceptedStepProblemMetadata;
 using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
+using dg::hdg::runtime::cuda_w8a::detail::
+    CudaPreparedTensorVolumeEvidenceValuesValid;
 using dg::hdg::runtime::cuda_w8a::detail::
     NativeElementSchwarzFieldSplitLayout;
 using dg::hdg::runtime::cuda_w8a::detail::
@@ -1286,6 +1299,12 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
       ilu_work_consistent && mgr_work_consistent &&
       element_schwarz_work_consistent &&
       trace_solver_consistent &&
+      observation.tensor_volume_work.valid &&
+      CudaPreparedTensorVolumeEvidenceValuesValid(
+          engine, tensor.volume_assembly_launches,
+          tensor.volume_mma_tiles,
+          engine == CudaEngineKind::tensor_core
+              ? observation.tensor_volume_work.mma_tiles : 0) &&
       tensor.fallback_count == 0 && tensor.fallback_accounting_complete &&
       evidence.no_fallback &&
       (engine == CudaEngineKind::ordinary
@@ -1723,6 +1742,10 @@ void PrintStep(const StepSample& sample)
             << evidence.tensor_core.trace_preconditioner_configured << ','
             << "\"hardware_supported\":" << std::boolalpha
             << evidence.tensor_core.hardware_supported
+            << ",\"volume_assembly_launches\":"
+            << evidence.tensor_core.volume_assembly_launches
+            << ",\"volume_mma_tiles\":"
+            << evidence.tensor_core.volume_mma_tiles
             << ",\"condensation_launches\":"
             << evidence.tensor_core.condensation_launches
             << ",\"mma_tiles\":" << evidence.tensor_core.mma_tiles
@@ -1836,9 +1859,18 @@ int RunBenchmark(const Options& options)
   const std::int64_t expected_true_trace_unknowns =
       2LL * options.mesh_n * options.mesh_n *
       problem.scalar_face_dofs * expected_trace_components;
+  const int expected_volume_assembly_order =
+      options.regularization == RegularizationKind::igr
+      ? request.numerical_policy.igr_assembly_quadrature_orders.volume_order
+      : request.numerical_policy.conventional_assembly_quadrature_order;
+  const int expected_volume_points = mfem::IntRules.Get(
+      mfem::Geometry::SQUARE,
+      expected_volume_assembly_order).GetNPoints();
   if (!problem_captured ||
       problem.elements != elements || problem.scalar_interior_dofs <= 0 ||
       problem.scalar_face_dofs <= 0 ||
+      problem.volume_assembly_order != expected_volume_assembly_order ||
+      problem.volume_points != expected_volume_points ||
       problem.interior_components != expected_interior_components ||
       problem.trace_components != expected_trace_components ||
       problem.igr_active !=
@@ -2047,6 +2079,9 @@ int RunBenchmark(const Options& options)
             << static_cast<double>(options.domain_periods) /
                 static_cast<double>(options.mesh_n) << ','
             << "\"elements\":" << elements << ','
+            << "\"volume_assembly_order\":"
+            << problem.volume_assembly_order << ','
+            << "\"volume_points\":" << problem.volume_points << ','
             << "\"interior_components\":"
             << problem.interior_components << ','
             << "\"trace_components\":" << problem.trace_components << ','

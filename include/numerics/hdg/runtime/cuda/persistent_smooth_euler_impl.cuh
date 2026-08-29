@@ -2025,10 +2025,12 @@ constexpr bool CudaRecoveryRouteSupported(
 }
 bool CudaLaunchBorrowedAssembly(
     const CudaDeviceView& view, const CudaMeshShape& shape, double dt,
-    CudaBorrowedAssemblyKind kind) noexcept;
+    CudaBorrowedAssemblyKind kind,
+    std::uint64_t& tensor_volume_mma_tiles) noexcept;
 bool CudaLaunchAssembly(const CudaDeviceView& view,
                         const CudaMeshShape& shape, double dt,
-                        generic::CudaEngineKind engine) noexcept;
+                        generic::CudaEngineKind engine,
+                        std::uint64_t& tensor_volume_mma_tiles) noexcept;
 bool CudaLaunchFrozenBorrowedLlfAssembly(
     const CudaDeviceView& view, const CudaMeshShape& shape,
     double dt) noexcept;
@@ -3080,11 +3082,13 @@ private:
       if (!install_state(interior, trace)) return false;
       TransportPolicy::SetPhase(CudaFailurePhase::assembly,
                                 current_generation_);
+      std::uint64_t ignored_volume_mma_tiles = 0;
       const bool assembled = (frozen_llf
               ? CudaLaunchFrozenBorrowedLlfAssembly(
                     view_, shape_, fixed_dt)
               : CudaLaunchAssembly(
-                    view_, shape_, fixed_dt, cuda_engine_)) &&
+                    view_, shape_, fixed_dt, cuda_engine_,
+                    ignored_volume_mma_tiles)) &&
           StatusPassed();
       if (!CollectiveContinue(assembled)) return false;
       if (residual_interior == nullptr || residual_trace == nullptr)
@@ -3480,7 +3484,8 @@ public:
     const bool assembly_ticket = initialized_ &&
         Ticket(CudaFailurePhase::assembly);
     if (!CollectiveContinue(assembly_ticket) ||
-        !AssembleAndNorm(workspace, attempt.dt, result.initial_residual))
+        !AssembleAndNorm(workspace, attempt.dt, result.initial_residual,
+                         result.tensor_core))
     {
       result.reason = FailureReason::finite_gate;
       return result;
@@ -3696,7 +3701,8 @@ public:
           continue;
         }
         double trial_residual = std::numeric_limits<double>::infinity();
-        if (!AssembleAndNorm(workspace, attempt.dt, trial_residual) ||
+        if (!AssembleAndNorm(workspace, attempt.dt, trial_residual,
+                             result.tensor_core) ||
             !std::isfinite(trial_residual))
         {
           result.reason = FailureReason::finite_gate;
@@ -5039,7 +5045,8 @@ private:
                        int& true_residual_tightenings,
                        CudaTensorCoreEvidence& tensor_core_evidence) noexcept;
   bool AssembleAndNorm(state_slot& workspace, double dt,
-                       double& norm) noexcept;
+                       double& norm,
+                       CudaTensorCoreEvidence& tensor_core_evidence) noexcept;
   bool CopyBase(state_slot& workspace) noexcept;
   bool RestoreBase(state_slot& workspace) noexcept;
   bool UpdateStateHashes(state_slot& workspace) noexcept;

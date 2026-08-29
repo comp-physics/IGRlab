@@ -6155,8 +6155,11 @@ bool LaunchBorrowedEulerStages(const CudaDeviceView& v,
 }
 bool LaunchTensorBorrowedEulerAssembly(const CudaDeviceView& v,
                                        const CudaMeshShape& s,
-                                       const double dt) noexcept
+                                       const double dt,
+                                       std::uint64_t&
+                                           tensor_volume_mma_tiles) noexcept
 {
+  tensor_volume_mma_tiles=0;
   if(s.elements<=0||s.order<1||s.order>3)return false;
   const int expected_components=s.igr_active?igr_interior_components:
       conserved_components;
@@ -6166,7 +6169,15 @@ bool LaunchTensorBorrowedEulerAssembly(const CudaDeviceView& v,
   const int expected_face_dofs=s.order+1;
   const auto scratch=detail::PlanTensorVolumeScratch(
       s.interior_dofs,s.trace_dofs,s.volume_points,s.igr_active);
-  if(!scratch.valid||!isfinite(dt)||!(dt>0.0)||
+  const auto mma_work=detail::PlanTensorVolumeMmaWork(
+      s.elements,s.interior_components,s.scalar_interior_dofs,
+      s.interior_dofs,s.trace_dofs,s.volume_points,s.igr_active);
+  if(!scratch.valid||!mma_work.valid||
+     mma_work.scratch.workspace_doubles!=scratch.workspace_doubles||
+     mma_work.scratch.coefficient_stride!=scratch.coefficient_stride||
+     mma_work.scratch.capacity_points!=scratch.capacity_points||
+     mma_work.scratch.chunk_points!=scratch.chunk_points||
+     !isfinite(dt)||!(dt>0.0)||
      s.scalar_interior_dofs!=expected_scalar_dofs||
      s.scalar_face_dofs!=expected_face_dofs||
      s.interior_components!=expected_components||
@@ -6217,7 +6228,9 @@ bool LaunchTensorBorrowedEulerAssembly(const CudaDeviceView& v,
     first_chunk=false;
   }
   BorrowedEulerFaceKernel<<<blocks,borrowed_euler_block_threads>>>(v,s,false);
-  return LaunchOk();
+  if(!LaunchOk())return false;
+  tensor_volume_mma_tiles=mma_work.mma_tiles;
+  return true;
 }
 } // namespace
 
@@ -6235,19 +6248,24 @@ bool CudaLaunchFreezeBorrowedCurrentLlfTau(const CudaDeviceView& v,
 {FreezeBorrowedCurrentLlfTauKernel<<<s.elements,128>>>(v,s);return LaunchOk();}
 bool CudaLaunchBorrowedAssembly(
     const CudaDeviceView& v,const CudaMeshShape& s,const double dt,
-    const CudaBorrowedAssemblyKind kind) noexcept
+    const CudaBorrowedAssemblyKind kind,
+    std::uint64_t& tensor_volume_mma_tiles) noexcept
 {
+  tensor_volume_mma_tiles=0;
   if(!s.borrowed_host_inputs||s.elements<=0)return false;
   if(kind==CudaBorrowedAssemblyKind::ordinary_split)
     return LaunchBorrowedEulerStages(v,s,dt,false);
   if(kind==CudaBorrowedAssemblyKind::tensor_volume)
-    return LaunchTensorBorrowedEulerAssembly(v,s,dt);
+    return LaunchTensorBorrowedEulerAssembly(
+        v,s,dt,tensor_volume_mma_tiles);
   return false;
 }
 bool CudaLaunchAssembly(const CudaDeviceView& v,const CudaMeshShape& s,
                         const double dt,
-                        const generic::CudaEngineKind engine) noexcept
+                        const generic::CudaEngineKind engine,
+                        std::uint64_t& tensor_volume_mma_tiles) noexcept
 {
+  tensor_volume_mma_tiles=0;
   if(!s.borrowed_host_inputs)
   {
     if(engine!=generic::CudaEngineKind::ordinary)return false;
@@ -6256,10 +6274,12 @@ bool CudaLaunchAssembly(const CudaDeviceView& v,const CudaMeshShape& s,
   }
   if(engine==generic::CudaEngineKind::ordinary)
     return CudaLaunchBorrowedAssembly(
-        v,s,dt,CudaBorrowedAssemblyKind::ordinary_split);
+        v,s,dt,CudaBorrowedAssemblyKind::ordinary_split,
+        tensor_volume_mma_tiles);
   if(engine==generic::CudaEngineKind::tensor_core)
     return CudaLaunchBorrowedAssembly(
-        v,s,dt,CudaBorrowedAssemblyKind::tensor_volume);
+        v,s,dt,CudaBorrowedAssemblyKind::tensor_volume,
+        tensor_volume_mma_tiles);
   return false;
 }
 bool CudaLaunchFrozenBorrowedLlfAssembly(const CudaDeviceView& v,

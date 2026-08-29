@@ -1,8 +1,10 @@
 #pragma once
 
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler_types.cuh"
+#include "numerics/hdg/runtime/cuda/tensor_volume_layout.hpp"
 
 #include <cstdint>
+#include <limits>
 
 namespace dg::hdg::runtime::cuda_w8a::detail
 {
@@ -44,6 +46,41 @@ constexpr bool CudaPreparedTraceSolverRoutingValid(
       tensor.trace_solver_accounting_complete);
 }
 
+constexpr bool CudaPreparedTensorVolumeEvidenceValuesValid(
+    const generic::CudaEngineKind engine,
+    const std::uint64_t assembly_launches,
+    const std::uint64_t mma_tiles,
+    const std::uint64_t mma_tiles_per_assembly) noexcept
+{
+  if (engine == generic::CudaEngineKind::ordinary)
+    return assembly_launches == 0 && mma_tiles == 0 &&
+        mma_tiles_per_assembly == 0;
+  if (engine != generic::CudaEngineKind::tensor_core ||
+      assembly_launches == 0 || mma_tiles_per_assembly == 0)
+    return false;
+  std::uint64_t expected = 0;
+  return TensorVolumeCheckedMultiply(
+             assembly_launches, mma_tiles_per_assembly, expected) &&
+      mma_tiles == expected;
+}
+
+constexpr bool CudaPreparedTensorVolumeEvidenceValid(
+    const CudaTensorCoreEvidence& tensor, const CudaMeshShape& shape,
+    const generic::CudaEngineKind engine) noexcept
+{
+  if (engine == generic::CudaEngineKind::ordinary)
+    return CudaPreparedTensorVolumeEvidenceValuesValid(
+        engine, tensor.volume_assembly_launches,
+        tensor.volume_mma_tiles, 0);
+  const auto plan = PlanTensorVolumeMmaWork(
+      shape.elements, shape.interior_components,
+      shape.scalar_interior_dofs, shape.interior_dofs,
+      shape.trace_dofs, shape.volume_points, shape.igr_active);
+  return plan.valid && CudaPreparedTensorVolumeEvidenceValuesValid(
+      engine, tensor.volume_assembly_launches,
+      tensor.volume_mma_tiles, plan.mma_tiles);
+}
+
 static_assert(CudaPreparedTraceSolverRoutingValuesValid(
     generic::CudaEngineKind::tensor_core, 1, 3, 3, 0, true, false, true));
 static_assert(CudaPreparedTraceSolverRoutingValuesValid(
@@ -64,5 +101,16 @@ static_assert(!CudaPreparedTraceSolverRoutingValuesValid(
     generic::CudaEngineKind::tensor_core, 1, 3, 2, 0, true, false, true));
 static_assert(!CudaPreparedTraceSolverRoutingValuesValid(
     generic::CudaEngineKind::tensor_core, 1, 3, 3, 0, true, false, false));
+static_assert(CudaPreparedTensorVolumeEvidenceValuesValid(
+    generic::CudaEngineKind::ordinary, 0, 0, 0));
+static_assert(CudaPreparedTensorVolumeEvidenceValuesValid(
+    generic::CudaEngineKind::tensor_core, 3, 1404, 468));
+static_assert(!CudaPreparedTensorVolumeEvidenceValuesValid(
+    generic::CudaEngineKind::ordinary, 1, 468, 0));
+static_assert(!CudaPreparedTensorVolumeEvidenceValuesValid(
+    generic::CudaEngineKind::tensor_core, 3, 1403, 468));
+static_assert(!CudaPreparedTensorVolumeEvidenceValuesValid(
+    generic::CudaEngineKind::tensor_core,
+    std::numeric_limits<std::uint64_t>::max(), 1, 2));
 
 } // namespace dg::hdg::runtime::cuda_w8a::detail
