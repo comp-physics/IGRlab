@@ -195,6 +195,65 @@ TRACE_SOLVER_CONFIGURATION_BY_POLICY_ENGINE_AND_MODE = {
      "sigma-jacobi3-fp64", "tensor", "igr"):
         ("native-rank1-fp64", True, False, False),
 }
+FIXED_SIGMA_JACOBI_POLICY = {
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi1-fp64": (
+        1,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi1_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi1-fp64": (
+        1,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi1_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi2-fp64": (
+        2,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi2_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi2-fp64": (
+        2,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi2_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi3-fp64": (
+        3,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi3_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi3-fp64": (
+        3,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi3_fp64",
+        True,
+    ),
+}
+for _fixed_policy, (_fixed_sweeps, _fixed_preconditioner, _fixed_warp) in \
+        FIXED_SIGMA_JACOBI_POLICY.items():
+    _fixed_key = (_fixed_policy, "tensor", "igr")
+    TRACE_PRECONDITIONER_BY_POLICY_ENGINE_AND_MODE[_fixed_key] = \
+        _fixed_preconditioner
+    TRACE_ILU_POLICY_BY_POLICY_ENGINE_AND_MODE[_fixed_key] = (-1, -1, -1, 0)
+    TRACE_ILU_FACTOR_REUSE_BY_POLICY_ENGINE_AND_MODE[_fixed_key] = \
+        "not_applicable"
+    TRACE_ILU_TRIANGULAR_SOLVE_BY_POLICY_ENGINE_AND_MODE[_fixed_key] = \
+        ("not_applicable", 0, 0, 0)
+    TRACE_SOLVER_CONFIGURATION_BY_POLICY_ENGINE_AND_MODE[_fixed_key] = \
+        ("native-rank1-fp64", True, False, False)
+
+
+def fixed_sigma_jacobi_policy(trace_policy: str) -> tuple[int, str, bool]:
+    return FIXED_SIGMA_JACOBI_POLICY.get(trace_policy, (0, "", False))
+
+
 SAME_POLICY_MEMBERS = {
     "O_base": {"engine": "ordinary", "trace_policy": "engine-default"},
     "O_common": {"engine": "ordinary", "trace_policy": "common-fast"},
@@ -1517,41 +1576,27 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
         expected_mgr,
         expected_rank2,
     ) = expected_trace_solver_configuration(engine, mode, trace_policy)
+    expected_sigma_jacobi_sweeps, _, _ = fixed_sigma_jacobi_policy(
+        resolved_trace_policy
+    )
+    expected_fixed_sigma_jacobi = expected_sigma_jacobi_sweeps > 0
     expected_schwarz = resolved_trace_policy in {
         "native-element-schwarz-fp64",
         "native-element-schwarz-matrix-free-fp64",
         "native-element-schwarz-equilibrated-field-split-fp64",
         "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
         "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
-        "native-element-schwarz-matrix-free-equilibrated-field-split-"
-        "sigma-jacobi3-fp64",
-        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-        "sigma-jacobi3-fp64",
-    }
+    } or expected_fixed_sigma_jacobi
     expected_matrix_free = resolved_trace_policy in {
         "native-element-schwarz-matrix-free-fp64",
         "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
         "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
-        "native-element-schwarz-matrix-free-equilibrated-field-split-"
-        "sigma-jacobi3-fp64",
-        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-        "sigma-jacobi3-fp64",
-    }
+    } or expected_fixed_sigma_jacobi
     expected_element_field_split = resolved_trace_policy in {
         "native-element-schwarz-equilibrated-field-split-fp64",
         "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
         "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
-        "native-element-schwarz-matrix-free-equilibrated-field-split-"
-        "sigma-jacobi3-fp64",
-        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-        "sigma-jacobi3-fp64",
-    }
-    expected_fixed_sigma_jacobi = resolved_trace_policy in {
-        "native-element-schwarz-matrix-free-equilibrated-field-split-"
-        "sigma-jacobi3-fp64",
-        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-        "sigma-jacobi3-fp64",
-    }
+    } or expected_fixed_sigma_jacobi
     if tensor.get("trace_solver") != expected_trace_solver:
         raise CampaignError(
             f"sample trace_solver={tensor.get('trace_solver')!r}; expected "
@@ -1800,7 +1845,6 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
         tensor.get("field_split_sigma_jacobi_updates"),
         "samples.tensor_core.field_split_sigma_jacobi_updates",
     )
-    expected_sigma_jacobi_sweeps = 3 if expected_fixed_sigma_jacobi else 0
     expected_sigma_jacobi_damping = 2.0 / 3.0 \
         if expected_fixed_sigma_jacobi else 0.0
     expected_sigma_jacobi_updates = (
@@ -2280,19 +2324,17 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
                 f"configuration: observed={observed_configuration!r}; "
                 f"expected={expected_configuration!r}"
             )
+        expected_sigma_jacobi_sweeps, _, fixed_sigma_warp = \
+            fixed_sigma_jacobi_policy(resolved_trace_policy)
         warp_field_split = resolved_trace_policy in {
             "native-element-schwarz-matrix-free-warp-"
             "equilibrated-field-split-fp64",
-            "native-element-schwarz-matrix-free-warp-equilibrated-field-"
-            "split-sigma-jacobi3-fp64",
-        }
+        } or fixed_sigma_warp
         scalar_field_split = resolved_trace_policy in {
             "native-element-schwarz-equilibrated-field-split-fp64",
             "native-element-schwarz-matrix-free-"
             "equilibrated-field-split-fp64",
-            "native-element-schwarz-matrix-free-equilibrated-field-split-"
-            "sigma-jacobi3-fp64",
-        }
+        } or (expected_sigma_jacobi_sweeps > 0 and not fixed_sigma_warp)
         full_patch = resolved_trace_policy in {
             "native-element-schwarz-fp64",
             "native-element-schwarz-matrix-free-fp64",
@@ -2316,12 +2358,6 @@ def validate_record(record: Any, *, source: str, mode: str, order: int,
                 "benchmark element-Schwarz apply metadata does not match "
                 f"the resolved trace policy {resolved_trace_policy!r}"
             )
-        expected_sigma_jacobi_sweeps = 3 if resolved_trace_policy in {
-            "native-element-schwarz-matrix-free-equilibrated-field-split-"
-            "sigma-jacobi3-fp64",
-            "native-element-schwarz-matrix-free-warp-equilibrated-field-"
-            "split-sigma-jacobi3-fp64",
-        } else 0
         expected_sigma_jacobi_damping = \
             2.0 / 3.0 if expected_sigma_jacobi_sweeps else 0.0
         if checked_int(

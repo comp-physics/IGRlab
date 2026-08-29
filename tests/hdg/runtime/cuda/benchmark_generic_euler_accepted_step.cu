@@ -482,6 +482,38 @@ bool SelectTracePolicy(
         native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi3_fp64;
     return true;
   }
+  if (text ==
+      "native-element-schwarz-matrix-free-equilibrated-field-split-"
+      "sigma-jacobi1-fp64")
+  {
+    options.trace_policy = CudaTracePolicyKind::
+        native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi1_fp64;
+    return true;
+  }
+  if (text ==
+      "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+      "sigma-jacobi1-fp64")
+  {
+    options.trace_policy = CudaTracePolicyKind::
+        native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi1_fp64;
+    return true;
+  }
+  if (text ==
+      "native-element-schwarz-matrix-free-equilibrated-field-split-"
+      "sigma-jacobi2-fp64")
+  {
+    options.trace_policy = CudaTracePolicyKind::
+        native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi2_fp64;
+    return true;
+  }
+  if (text ==
+      "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+      "sigma-jacobi2-fp64")
+  {
+    options.trace_policy = CudaTracePolicyKind::
+        native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi2_fp64;
+    return true;
+  }
   return false;
 }
 
@@ -574,7 +606,8 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
                 "matrix-free-"
                 "equilibrated-field-split-sigma-jacobi3-fp64, or native-"
                 "element-schwarz-matrix-free-warp-equilibrated-field-split-"
-                "sigma-jacobi3-fp64";
+                "sigma-jacobi3-fp64, or the corresponding sigma-jacobi1-"
+                "fp64 or sigma-jacobi2-fp64 policy";
         return false;
       }
       continue;
@@ -827,7 +860,7 @@ void PrintUsage(const char* executable)
 {
   std::cout << "Usage: " << executable
             << " [--mode conventional|igr] [--engine ordinary|tensor]"
-               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi3-fp64]"
+               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi3-fp64]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
@@ -837,7 +870,7 @@ void PrintUsage(const char* executable)
                " [--profile-measured-step 0|1|2|3|4]\n"
                "       " << executable
             << " [--conventional|--igr] [--engine ordinary|tensor]"
-               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi3-fp64]"
+               " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi3-fp64]"
                " [--order 1|2|3] [--mesh-n N]"
                " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"

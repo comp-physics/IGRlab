@@ -138,6 +138,14 @@ parser.add_argument(
              "native-element-schwarz-matrix-free-warp-equilibrated-field-"
              "split-fp64",
              "native-element-schwarz-matrix-free-equilibrated-field-split-"
+             "sigma-jacobi1-fp64",
+             "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+             "split-sigma-jacobi1-fp64",
+             "native-element-schwarz-matrix-free-equilibrated-field-split-"
+             "sigma-jacobi2-fp64",
+             "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+             "split-sigma-jacobi2-fp64",
+             "native-element-schwarz-matrix-free-equilibrated-field-split-"
              "sigma-jacobi3-fp64",
              "native-element-schwarz-matrix-free-warp-equilibrated-field-"
              "split-sigma-jacobi3-fp64"),
@@ -165,34 +173,29 @@ resolved_trace_policy = (
     else args.trace_policy
 )
 equilibrated_mgr = resolved_trace_policy == "equilibrated-mgr"
+fixed_sigma_jacobi_sweeps = next(
+    (sweeps for sweeps in (1, 2, 3)
+     if f"sigma-jacobi{sweeps}-fp64" in resolved_trace_policy),
+    0,
+)
+fixed_sigma_jacobi = fixed_sigma_jacobi_sweeps > 0
 matrix_free = resolved_trace_policy in (
     "native-element-schwarz-matrix-free-fp64",
     "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
     "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
-    "native-element-schwarz-matrix-free-equilibrated-field-split-"
-    "sigma-jacobi3-fp64",
-    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-    "sigma-jacobi3-fp64",
 )
+matrix_free = matrix_free or fixed_sigma_jacobi
 element_field_split = resolved_trace_policy in (
     "native-element-schwarz-equilibrated-field-split-fp64",
     "native-element-schwarz-matrix-free-equilibrated-field-split-fp64",
     "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
-    "native-element-schwarz-matrix-free-equilibrated-field-split-"
-    "sigma-jacobi3-fp64",
-    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-    "sigma-jacobi3-fp64",
 )
+element_field_split = element_field_split or fixed_sigma_jacobi
 warp_element_field_split = resolved_trace_policy in (
     "native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64",
-    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-    "sigma-jacobi3-fp64",
 )
-fixed_sigma_jacobi = resolved_trace_policy in (
-    "native-element-schwarz-matrix-free-equilibrated-field-split-"
-    "sigma-jacobi3-fp64",
-    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-    "sigma-jacobi3-fp64",
+warp_element_field_split = warp_element_field_split or (
+    fixed_sigma_jacobi and "-warp-" in resolved_trace_policy
 )
 element_schwarz = resolved_trace_policy == "native-element-schwarz-fp64" or \
     matrix_free or element_field_split
@@ -201,16 +204,16 @@ if equilibrated_mgr and (args.engine != "tensor" or args.mode != "igr"):
 if element_schwarz and (args.engine != "tensor" or args.mode != "igr"):
     parser.error("native element-Schwarz policies require tensor IGR")
 if element_field_split:
-    trace_preconditioner = \
-        (("native_element_schwarz_warp_equilibrated_field_split_"
-          "sigma_jacobi3_fp64")
-         if warp_element_field_split and fixed_sigma_jacobi else
-         ("native_element_schwarz_equilibrated_field_split_"
-          "sigma_jacobi3_fp64")
-         if fixed_sigma_jacobi else
-         "native_element_schwarz_warp_equilibrated_field_split_fp64"
-         if warp_element_field_split else
-         "native_element_schwarz_equilibrated_field_split_fp64")
+    trace_preconditioner = (
+        "native_element_schwarz_" +
+        ("warp_" if warp_element_field_split else "") +
+        "equilibrated_field_split_sigma_jacobi" +
+        str(fixed_sigma_jacobi_sweeps) + "_fp64"
+        if fixed_sigma_jacobi else
+        "native_element_schwarz_warp_equilibrated_field_split_fp64"
+        if warp_element_field_split else
+        "native_element_schwarz_equilibrated_field_split_fp64"
+    )
 elif element_schwarz:
     trace_preconditioner = "native_element_schwarz_fp64"
 elif equilibrated_mgr:
@@ -223,14 +226,8 @@ else:
 ilu_policy = (
     (-1, -1, -1, 0)
     if trace_preconditioner in (
-        "hypre_diag_scale", "hypre_mgr_field_split",
-        "native_element_schwarz_fp64",
-        "native_element_schwarz_equilibrated_field_split_fp64",
-        "native_element_schwarz_warp_equilibrated_field_split_fp64",
-        "native_element_schwarz_equilibrated_field_split_"
-        "sigma_jacobi3_fp64",
-        "native_element_schwarz_warp_equilibrated_field_split_"
-        "sigma_jacobi3_fp64")
+        "hypre_diag_scale", "hypre_mgr_field_split") or
+    trace_preconditioner.startswith("native_element_schwarz")
     else (0, 0, 1 if args.mode == "igr" else 0, 1)
 )
 ilu_factor_reuse_policy = (
@@ -448,13 +445,13 @@ for index, duration in [(-1, warmup_duration), *enumerate(durations)]:
                 9 if element_schwarz else 0
             ),
             "field_split_sigma_jacobi_sweeps": (
-                3 if fixed_sigma_jacobi else 0
+                fixed_sigma_jacobi_sweeps
             ),
             "field_split_sigma_jacobi_damping": (
                 2.0 / 3.0 if fixed_sigma_jacobi else 0.0
             ),
             "field_split_sigma_jacobi_updates": (
-                27 if fixed_sigma_jacobi else 0
+                9 * fixed_sigma_jacobi_sweeps
             ),
             "element_schwarz_patch_rows": (
                 4 * 5 * (args.order + 1) if element_schwarz else 0
@@ -529,7 +526,7 @@ payload = {
         32 if warp_element_field_split else 0
     ),
     "trace_field_split_sigma_jacobi_sweeps": (
-        3 if fixed_sigma_jacobi else 0
+        fixed_sigma_jacobi_sweeps
     ),
     "trace_field_split_sigma_jacobi_damping": (
         2.0 / 3.0 if fixed_sigma_jacobi else 0.0
@@ -1590,26 +1587,26 @@ def main() -> int:
                 "flight_recorder", "replay",
             })
 
-        fixed_sigma_policy_specs = (
+        fixed_sigma_policy_specs = tuple(
             (
-                "native-element-schwarz-matrix-free-equilibrated-field-"
-                "split-sigma-jacobi3-fp64",
-                "native_element_schwarz_equilibrated_field_split_"
-                "sigma_jacobi3_fp64",
+                "native-element-schwarz-matrix-free-" +
+                ("warp-" if warp else "") +
+                "equilibrated-field-split-sigma-jacobi" +
+                str(sweeps) + "-fp64",
+                "native_element_schwarz_" +
+                ("warp_" if warp else "") +
+                "equilibrated_field_split_sigma_jacobi" +
+                str(sweeps) + "_fp64",
+                "cooperative-pivoted-lu-fp64" if warp else
                 "scalar-pivoted-lu-fp64",
-                0,
-            ),
-            (
-                "native-element-schwarz-matrix-free-warp-equilibrated-"
-                "field-split-sigma-jacobi3-fp64",
-                "native_element_schwarz_warp_equilibrated_field_split_"
-                "sigma_jacobi3_fp64",
-                "cooperative-pivoted-lu-fp64",
-                32,
-            ),
+                32 if warp else 0,
+                sweeps,
+            )
+            for sweeps in (1, 2, 3)
+            for warp in (False, True)
         )
         for (fixed_policy, fixed_preconditioner, fixed_apply,
-             fixed_tile_width) in fixed_sigma_policy_specs:
+             fixed_tile_width, fixed_sweeps) in fixed_sigma_policy_specs:
             fixed_command = CAMPAIGN.final_command(
                 final,
                 engine="tensor",
@@ -1640,17 +1637,19 @@ def main() -> int:
             ] == fixed_tile_width
             assert fixed_record[
                 "trace_field_split_sigma_jacobi_sweeps"
-            ] == 3
+            ] == fixed_sweeps
             assert fixed_record[
                 "trace_field_split_sigma_jacobi_damping"
             ] == 2.0 / 3.0
             for sample in fixed_record["samples"]:
                 tensor = sample["tensor_core"]
-                assert tensor["field_split_sigma_jacobi_sweeps"] == 3
+                assert tensor["field_split_sigma_jacobi_sweeps"] == \
+                    fixed_sweeps
                 assert tensor[
                     "field_split_sigma_jacobi_damping"
                 ] == 2.0 / 3.0
-                assert tensor["field_split_sigma_jacobi_updates"] == 27
+                assert tensor["field_split_sigma_jacobi_updates"] == \
+                    9 * fixed_sweeps
                 assert not set(tensor).intersection({
                     "schwarz_history", "field_split_history",
                     "event_stream", "flight_recorder", "replay",
@@ -1658,9 +1657,10 @@ def main() -> int:
             fixed_summary = CAMPAIGN.record_summary(fixed_record)
             assert fixed_summary[
                 "trace_field_split_sigma_jacobi_policy"
-            ] == {"sweeps": 3, "damping": 2.0 / 3.0}
+            ] == {"sweeps": fixed_sweeps, "damping": 2.0 / 3.0}
             assert all(
-                sample["field_split_sigma_jacobi_updates"] == 27
+                sample["field_split_sigma_jacobi_updates"] ==
+                9 * fixed_sweeps
                 for sample in fixed_summary["measured_sample_work"]
             )
 
@@ -1674,15 +1674,18 @@ def main() -> int:
                 return False
 
             for field, value in (
-                    ("trace_field_split_sigma_jacobi_sweeps", 2),
+                    ("trace_field_split_sigma_jacobi_sweeps",
+                     1 if fixed_sweeps != 1 else 2),
                     ("trace_field_split_sigma_jacobi_damping", 0.5)):
                 invalid_fixed = copy.deepcopy(fixed_record)
                 invalid_fixed[field] = value
                 assert fixed_rejected(invalid_fixed), field
             for field, value in (
-                    ("field_split_sigma_jacobi_sweeps", 2),
+                    ("field_split_sigma_jacobi_sweeps",
+                     1 if fixed_sweeps != 1 else 2),
                     ("field_split_sigma_jacobi_damping", 0.5),
-                    ("field_split_sigma_jacobi_updates", 26)):
+                    ("field_split_sigma_jacobi_updates",
+                     9 * fixed_sweeps - 1)):
                 invalid_fixed = copy.deepcopy(fixed_record)
                 invalid_fixed["samples"][0]["tensor_core"][field] = value
                 assert fixed_rejected(invalid_fixed), field

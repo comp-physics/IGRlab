@@ -83,22 +83,64 @@ NativeTracePreconditionerUsesFixedSigmaJacobi(
   return kind == NativeTracePreconditionerKind::
           element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64 ||
       kind == NativeTracePreconditionerKind::
-          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64;
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_sigma_jacobi1_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi1_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_sigma_jacobi2_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64;
 }
 
-constexpr NativeTracePreconditionerKind
-NativeTraceFixedSigmaJacobiBasePreconditioner(
+__host__ __device__ constexpr int NativeTraceFixedSigmaJacobiSweeps(
+    const NativeTracePreconditionerKind kind) noexcept
+{
+  switch (kind)
+  {
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_sigma_jacobi1_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi1_fp64:
+    return 1;
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_sigma_jacobi2_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64:
+    return 2;
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64:
+    return native_trace_sigma_jacobi_sweeps;
+  default:
+    return 0;
+  }
+}
+
+__host__ __device__ constexpr bool NativeTraceFixedSigmaJacobiUsesWarp(
     const NativeTracePreconditionerKind kind) noexcept
 {
   return kind == NativeTracePreconditionerKind::
-              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64
-      ? NativeTracePreconditionerKind::
-            element_overlap_schwarz_equilibrated_field_split_fp64
-      : kind == NativeTracePreconditionerKind::
-              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi1_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64;
+}
+
+__host__ __device__ constexpr NativeTracePreconditionerKind
+NativeTraceFixedSigmaJacobiBasePreconditioner(
+    const NativeTracePreconditionerKind kind) noexcept
+{
+  return !NativeTracePreconditionerUsesFixedSigmaJacobi(kind)
+      ? kind
+      : NativeTraceFixedSigmaJacobiUsesWarp(kind)
           ? NativeTracePreconditionerKind::
                 element_overlap_schwarz_warp_equilibrated_field_split_fp64
-          : kind;
+          : NativeTracePreconditionerKind::
+                element_overlap_schwarz_equilibrated_field_split_fp64;
 }
 
 __host__ __device__ constexpr bool NativeTraceOperatorIsElementMatrixFree(
@@ -1425,9 +1467,20 @@ __device__ void ApplyFixedSigmaJacobiPreconditioner(
   const int thread = GlobalThreadIndex();
   const int stride = GlobalThreadStride();
   const int sigma_begin = 4 * (rows / 5);
+  const int sigma_jacobi_sweeps =
+      NativeTraceFixedSigmaJacobiSweeps(preconditioner.kind);
   double* const next_sigma = workspace.vectors + rows;
   double* const saved_sigma_rhs = workspace.vectors +
       2 * static_cast<std::size_t>(rows);
+
+  if (sigma_jacobi_sweeps < 1 ||
+      sigma_jacobi_sweeps > native_trace_sigma_jacobi_sweeps)
+  {
+    if (grid.thread_rank() == 0)
+      MarkFailure(control, failure_invalid_preconditioner);
+    grid.sync();
+    return;
+  }
 
   // The final GMRES update intentionally permits input == output. Preserve
   // the original component-major sigma RHS before the exact local predictor
@@ -1437,17 +1490,21 @@ __device__ void ApplyFixedSigmaJacobiPreconditioner(
     saved_sigma_rhs[row] = input[row];
   grid.sync();
 
-  ApplyPreconditioner(system, preconditioner, workspace, input, output,
+  NativeTracePreconditionerView base_preconditioner = preconditioner;
+  base_preconditioner.kind =
+      NativeTraceFixedSigmaJacobiBasePreconditioner(preconditioner.kind);
+  ApplyPreconditioner(system, base_preconditioner, workspace, input, output,
                       control, grid);
   if (control->failure_mask != 0) return;
 
   // The exact local lower field split above supplies a nonzero stationary
-  // predictor. Refine only the scalar global sigma rows with three fixed
-  // damped Jacobi corrections. Euler rows remain fixed, so this is a lower
+  // predictor. Refine only the scalar global sigma rows with the selected
+  // fixed number of damped Jacobi corrections. Euler rows remain fixed, so
+  // this is a lower
   // block-GS preconditioner refinement rather than a replacement for the
   // coupled U7/Uhat5 system. The authoritative outer GMRES and
   // application-level FP64 true-residual rebuild remain unchanged.
-  for (int sweep = 0; sweep < native_trace_sigma_jacobi_sweeps; ++sweep)
+  for (int sweep = 0; sweep < sigma_jacobi_sweeps; ++sweep)
   {
     for (int row = sigma_begin + thread; row < rows; row += stride)
     {
@@ -1495,6 +1552,10 @@ __global__ void NativeRankOneTraceSolveKernel(
   const int krylov_dimension = policy.krylov_dimension;
   const int thread = GlobalThreadIndex();
   const int stride = GlobalThreadStride();
+  const NativeTracePreconditionerKind kernel_preconditioner_kind =
+      FixedSigmaJacobi
+      ? NativeTraceFixedSigmaJacobiBasePreconditioner(preconditioner.kind)
+      : preconditioner.kind;
 
   if (grid.thread_rank() == 0)
   {
@@ -1534,7 +1595,7 @@ __global__ void NativeRankOneTraceSolveKernel(
   for (int row = thread; row < rows; row += stride)
     if (!isfinite(system.rhs[row])) MarkFailure(control, failure_nonfinite);
 
-  if (preconditioner.kind ==
+  if (kernel_preconditioner_kind ==
       NativeTracePreconditionerKind::ilu0_rcm_jacobi)
   {
     ValidateCsr(preconditioner.ilu0.factor, false, true,
@@ -1549,19 +1610,19 @@ __global__ void NativeRankOneTraceSolveKernel(
     ValidatePermutation(preconditioner.ilu0, workspace, control, grid);
   }
   else if (NativeTracePreconditionerIsElementSchwarz(
-               preconditioner.kind))
+               kernel_preconditioner_kind))
   {
     ValidateElementSchwarz(
         preconditioner.element_schwarz,
         NativeTracePreconditionerIsEquilibratedFieldSplit(
-            preconditioner.kind),
+            kernel_preconditioner_kind),
         NativeTracePreconditionerIsWarpEquilibratedFieldSplit(
-            preconditioner.kind),
+            kernel_preconditioner_kind),
         control, grid);
     if constexpr (FixedSigmaJacobi)
     {
       if (!NativeTracePreconditionerIsEquilibratedFieldSplit(
-              preconditioner.kind))
+              kernel_preconditioner_kind))
       {
         if (grid.thread_rank() == 0)
           MarkFailure(control, failure_invalid_preconditioner);
@@ -1579,7 +1640,7 @@ __global__ void NativeRankOneTraceSolveKernel(
     const int entries = schwarz.elements * schwarz.patch_rows *
         schwarz.patch_rows;
     if (!NativeTraceOperatorMatchesPreconditioner(
-            system.operator_kind, preconditioner.kind) ||
+            system.operator_kind, kernel_preconditioner_kind) ||
         system.element_schur == nullptr)
       MarkFailure(control, failure_invalid_system);
     else
@@ -2140,6 +2201,8 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
 {
   const bool use_fixed_sigma_jacobi =
       NativeTracePreconditionerUsesFixedSigmaJacobi(preconditioner.kind);
+  const int fixed_sigma_jacobi_sweeps =
+      NativeTraceFixedSigmaJacobiSweeps(preconditioner.kind);
   const NativeTracePreconditionerKind kernel_preconditioner_kind =
       NativeTraceFixedSigmaJacobiBasePreconditioner(preconditioner.kind);
   const bool use_ilu = kernel_preconditioner_kind ==
@@ -2295,7 +2358,9 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
   if (!requirements.valid || workspace_overlap || !support.supported ||
       support.fixed_sigma_jacobi != use_fixed_sigma_jacobi ||
       (use_fixed_sigma_jacobi &&
-       (system.matrix.rows % 5 != 0 || !use_element_schwarz ||
+       (fixed_sigma_jacobi_sweeps < 1 ||
+        fixed_sigma_jacobi_sweeps > native_trace_sigma_jacobi_sweeps ||
+        system.matrix.rows % 5 != 0 || !use_element_schwarz ||
         !NativeTracePreconditionerIsEquilibratedFieldSplit(
             kernel_preconditioner_kind))) ||
       cudaGetDevice(&current_device) != cudaSuccess ||
@@ -2429,7 +2494,8 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
 
   NativeTraceSystemView system_argument = system;
   NativeTracePreconditionerView preconditioner_argument = preconditioner;
-  preconditioner_argument.kind = kernel_preconditioner_kind;
+  if (!use_fixed_sigma_jacobi)
+    preconditioner_argument.kind = kernel_preconditioner_kind;
   NativeTraceWorkspaceView workspace_argument = workspace;
   NativeTraceSolvePolicy policy_argument = policy;
   NativeTraceKernelCooperativeSupport support_argument{};

@@ -37,7 +37,11 @@ enum class NativeTracePreconditionerKind : std::int32_t
   element_overlap_schwarz_equilibrated_field_split_fp64 = 4,
   element_overlap_schwarz_warp_equilibrated_field_split_fp64 = 5,
   element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64 = 6,
-  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64 = 7
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64 = 7,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi1_fp64 = 8,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi1_fp64 = 9,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi2_fp64 = 10,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64 = 11
 };
 
 enum class NativeTraceSolveStatus : std::int32_t
