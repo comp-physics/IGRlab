@@ -907,6 +907,11 @@ struct CudaQualificationTestAccess
     capture = {};
     auto& numerics = engine.numerics_;
     const CudaMeshShape& shape = numerics.shape_;
+    const auto& tensor = engine.pending_.evidence.tensor_core;
+    const auto trace_policy = ResolveCudaTracePolicy(
+        generic::CudaEngineKind::tensor_core, shape.igr_active,
+        engine.config_.expected_rank_count, engine.config_.order,
+        CudaTracePolicyKind::engine_default);
     bool local_valid = engine.initialized_ && engine.pending_.active &&
         engine.pending_.staging && engine.pending_.numerical.success &&
         engine.config_.cuda_engine == generic::CudaEngineKind::tensor_core &&
@@ -915,13 +920,16 @@ struct CudaQualificationTestAccess
         shape.interior_dofs > 0 && shape.trace_dofs > 0 &&
         numerics.view_.schur != nullptr &&
         numerics.view_.condensed_rhs != nullptr &&
-        engine.pending_.evidence.tensor_core.selected_engine ==
-            generic::CudaEngineKind::tensor_core &&
-        engine.pending_.evidence.tensor_core.trace_preconditioner_configured &&
-        engine.pending_.evidence.tensor_core.trace_preconditioner ==
-            CudaTracePreconditionerForEngine(
-                generic::CudaEngineKind::tensor_core, shape.igr_active) &&
-        engine.pending_.evidence.tensor_core.fallback_count == 0 &&
+        tensor.selected_engine == generic::CudaEngineKind::tensor_core &&
+        CudaTracePolicyDescriptorIsExact(trace_policy) &&
+        tensor.requested_trace_policy ==
+            CudaTracePolicyKind::engine_default &&
+        tensor.resolved_trace_policy == trace_policy.resolved_selection &&
+        tensor.trace_policy_rank_count == engine.config_.expected_rank_count &&
+        tensor.trace_policy_order == engine.config_.order &&
+        tensor.trace_preconditioner_configured &&
+        tensor.trace_preconditioner == trace_policy.trace_preconditioner &&
+        tensor.fallback_count == 0 &&
         engine.pending_.evidence.no_fallback;
     const std::size_t schur_count = local_valid
         ? static_cast<std::size_t>(shape.elements) * shape.trace_dofs *
