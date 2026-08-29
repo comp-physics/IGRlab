@@ -1,5 +1,6 @@
 #include "numerics/hdg/generic/contract.hpp"
 #include "numerics/hdg/runtime/cuda/generic_euler.cuh"
+#include "numerics/hdg/runtime/cuda/tensor_volume_layout.hpp"
 #include "test_cuda_trace_solver_routing.hpp"
 
 #include <mfem.hpp>
@@ -494,6 +495,44 @@ struct CudaQualificationTestAccess
       return AuditBorrowedAssemblyFusion(*session.borrowed_rank1_, audit);
     if (session.borrowed_rank2_)
       return AuditBorrowedAssemblyFusion(*session.borrowed_rank2_, audit);
+    audit = {};
+    return false;
+  }
+
+  template <typename Engine>
+  static bool AuditConventionalP1Q12TensorVolumeMultiChunk(
+      Engine& engine, CudaBorrowedAssemblyFusionAudit& audit) noexcept
+  {
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    const auto scratch = PlanTensorVolumeScratch(
+        shape.interior_dofs, shape.trace_dofs,
+        shape.volume_points, false);
+    // For conventional p1, q12 is 49 quadrilateral points and the retained
+    // solve workspace holds exactly 12 compact 44-double coefficients.  The
+    // production launch loop must therefore execute 12+12+12+12+1.
+    const bool exact_multi_chunk_shape = shape.order == 1 &&
+        !shape.igr_active && shape.volume_assembly_order == 12 &&
+        shape.volume_points == 49 && shape.scalar_interior_dofs == 4 &&
+        shape.scalar_face_dofs == 2 && shape.interior_dofs == 16 &&
+        shape.trace_dofs == 32 && scratch.valid &&
+        scratch.workspace_doubles == 528 &&
+        scratch.coefficient_stride == 44 &&
+        scratch.capacity_points == 12 && scratch.chunk_points == 12;
+    return numerics.CollectiveContinue(exact_multi_chunk_shape) &&
+        AuditBorrowedAssemblyFusion(engine, audit);
+  }
+
+  static bool AuditConventionalP1Q12TensorVolumeMultiChunk(
+      cuda::GenericEulerHdgCudaSession& session,
+      CudaBorrowedAssemblyFusionAudit& audit) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return AuditConventionalP1Q12TensorVolumeMultiChunk(
+          *session.borrowed_rank1_, audit);
+    if (session.borrowed_rank2_)
+      return AuditConventionalP1Q12TensorVolumeMultiChunk(
+          *session.borrowed_rank2_, audit);
     audit = {};
     return false;
   }
@@ -4321,6 +4360,56 @@ bool CheckEulerAlgebra(const int order, const int ranks)
       igr_periodic && igr_physical;
 }
 
+bool CheckConventionalP1Q12TensorVolumeMultiChunkParity(const int order)
+{
+  if (selected_cuda_engine != CudaEngineKind::tensor_core || order != 1)
+    return true;
+
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::nonzero, InitialMode::smooth_periodic);
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::none);
+  request.numerical_policy.conventional_assembly_quadrature_order = 12;
+  const bool admitted =
+      dg::hdg::generic::ValidateEulerHdgRequest(request) ==
+          ContractStatus::accepted;
+  if (!All(admitted, request.communicator)) return false;
+
+  GenericEulerHdgCudaSession session;
+  const auto initialization = session.Initialize(request);
+  const bool initialized = All(
+      initialization.status == HdgEulerSessionStatus::initialized,
+      request.communicator);
+  CudaBorrowedAssemblyFusionAudit audit{};
+  const bool parity = initialized &&
+      CudaQualificationTestAccess::
+          AuditConventionalP1Q12TensorVolumeMultiChunk(session, audit);
+  const bool passed = All(parity, request.communicator);
+  if (!passed)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+    {
+      std::cerr << "CUDA conventional p1 q12 tensor-volume multi-chunk "
+                   "parity failed initialized="
+                << initialized << " dimensions=" << audit.elements << 'x'
+                << audit.interior_dofs << 'x' << audit.trace_dofs
+                << " maxima=";
+      for (const double error : audit.maximum_absolute_errors)
+        std::cerr << ' ' << error;
+      std::cerr << " scaled=";
+      for (const double error : audit.maximum_scaled_errors)
+        std::cerr << ' ' << error;
+      std::cerr << " status=" << audit.status_bitwise_equal << '/'
+                << audit.status_all_passed << '\n';
+    }
+  }
+  return passed;
+}
+
 bool CheckZeroUpdateFinalReconstruction(const int order)
 {
   mfem::ParMesh mesh = MakePeriodicMesh();
@@ -5404,6 +5493,9 @@ int main(int argc, char* argv[])
       CheckConventionalConservationGateRollback(order, ranks);
   const bool tensor_diagonal_convergence_warning_rollback = order > 0 &&
       CheckTensorDiagonalConvergenceWarningRollback(order, ranks);
+  const bool conventional_p1_q12_tensor_volume_multi_chunk_parity =
+      order > 0 &&
+      CheckConventionalP1Q12TensorVolumeMultiChunkParity(order);
   const bool euler_algebra = order > 0 && CheckEulerAlgebra(order, ranks);
   const bool zero_update_final_reconstruction = order > 0 &&
       CheckZeroUpdateFinalReconstruction(order);
@@ -5458,6 +5550,7 @@ int main(int argc, char* argv[])
       mixed_boundary_policies && independent_igr_conservation &&
       conventional_conservation_rollback &&
       tensor_diagonal_convergence_warning_rollback &&
+      conventional_p1_q12_tensor_volume_multi_chunk_parity &&
       euler_algebra && zero_update_final_reconstruction &&
       rejected_armijo_rollback &&
       conventional_periodic && conventional_physical &&
@@ -5482,6 +5575,8 @@ int main(int argc, char* argv[])
               << conventional_conservation_rollback
               << " tensor_diagonal_convergence_warning_rollback="
               << tensor_diagonal_convergence_warning_rollback
+              << " conventional_p1_q12_tensor_volume_multi_chunk_parity="
+              << conventional_p1_q12_tensor_volume_multi_chunk_parity
               << " euler_algebra=" << euler_algebra
               << " zero_update_final_reconstruction="
               << zero_update_final_reconstruction
