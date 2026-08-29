@@ -389,6 +389,7 @@ struct CudaNativeTraceCooperativeSupport
 {
   bool supported = false;
   bool fixed_sigma_jacobi = false;
+  bool coupled_warp_full_patch = false;
   int device = -1;
   int compute_major = 0;
   int compute_minor = 0;
@@ -403,7 +404,10 @@ constexpr bool CudaNativeTraceCooperativeSupportMatchesPreconditioner(
     const CudaTracePreconditionerKind preconditioner_kind) noexcept
 {
   return support.fixed_sigma_jacobi ==
-      CudaTracePreconditionerUsesFixedSigmaJacobi(preconditioner_kind);
+          CudaTracePreconditionerUsesFixedSigmaJacobi(preconditioner_kind) &&
+      support.coupled_warp_full_patch ==
+          CudaTracePreconditionerIsNativeElementSchwarzWarpCoupled(
+              preconditioner_kind);
 }
 
 struct CudaNativeTraceWorkspaceView

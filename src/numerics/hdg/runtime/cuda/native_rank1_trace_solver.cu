@@ -55,7 +55,9 @@ __host__ __device__ constexpr bool NativeTracePreconditionerIsElementSchwarz(
       kind == NativeTracePreconditionerKind::
           element_overlap_schwarz_equilibrated_field_split_fp64 ||
       kind == NativeTracePreconditionerKind::
-          element_overlap_schwarz_warp_equilibrated_field_split_fp64;
+          element_overlap_schwarz_warp_equilibrated_field_split_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_coupled_fp64;
 }
 
 __host__ __device__ constexpr bool
@@ -74,6 +76,18 @@ NativeTracePreconditionerIsWarpEquilibratedFieldSplit(
 {
   return kind == NativeTracePreconditionerKind::
       element_overlap_schwarz_warp_equilibrated_field_split_fp64;
+}
+
+__host__ __device__ constexpr bool
+NativeTracePreconditionerIsWarpCoupled(
+    const NativeTracePreconditionerKind kind) noexcept
+{
+  return kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_coupled_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_coupled_sigma_jacobi2_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_coupled_sigma_jacobi10_fp64;
 }
 
 __host__ __device__ constexpr bool
@@ -119,7 +133,11 @@ NativeTracePreconditionerUsesFixedSigmaJacobi(
       kind == NativeTracePreconditionerKind::
           element_overlap_schwarz_equilibrated_field_split_sigma_jacobi10_fp64 ||
       kind == NativeTracePreconditionerKind::
-          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64;
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_coupled_sigma_jacobi2_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_coupled_sigma_jacobi10_fp64;
 }
 
 __host__ __device__ constexpr int NativeTraceFixedSigmaJacobiSweeps(
@@ -136,6 +154,8 @@ __host__ __device__ constexpr int NativeTraceFixedSigmaJacobiSweeps(
       element_overlap_schwarz_equilibrated_field_split_sigma_jacobi2_fp64:
   case NativeTracePreconditionerKind::
       element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_coupled_sigma_jacobi2_fp64:
     return 2;
   case NativeTracePreconditionerKind::
       element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64:
@@ -176,6 +196,8 @@ __host__ __device__ constexpr int NativeTraceFixedSigmaJacobiSweeps(
       element_overlap_schwarz_equilibrated_field_split_sigma_jacobi10_fp64:
   case NativeTracePreconditionerKind::
       element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_coupled_sigma_jacobi10_fp64:
     return native_trace_sigma_jacobi_maximum_sweeps;
   default:
     return 0;
@@ -213,7 +235,10 @@ NativeTraceFixedSigmaJacobiBasePreconditioner(
 {
   return !NativeTracePreconditionerUsesFixedSigmaJacobi(kind)
       ? kind
-      : NativeTraceFixedSigmaJacobiUsesWarp(kind)
+      : NativeTracePreconditionerIsWarpCoupled(kind)
+          ? NativeTracePreconditionerKind::
+                element_overlap_schwarz_warp_coupled_fp64
+          : NativeTraceFixedSigmaJacobiUsesWarp(kind)
           ? NativeTracePreconditionerKind::
                 element_overlap_schwarz_warp_equilibrated_field_split_fp64
           : NativeTracePreconditionerKind::
@@ -235,8 +260,10 @@ __host__ __device__ constexpr bool NativeTraceOperatorMatchesPreconditioner(
     const NativeTracePreconditionerKind preconditioner_kind) noexcept
 {
   return (operator_kind == NativeTraceOperatorKind::element_matrix_free_fp64 &&
-          preconditioner_kind == NativeTracePreconditionerKind::
-              element_overlap_schwarz_fp64) ||
+          (preconditioner_kind == NativeTracePreconditionerKind::
+               element_overlap_schwarz_fp64 ||
+           preconditioner_kind == NativeTracePreconditionerKind::
+               element_overlap_schwarz_warp_coupled_fp64)) ||
       (operator_kind == NativeTraceOperatorKind::
                element_matrix_free_equilibrated_field_split_fp64 &&
        preconditioner_kind == NativeTracePreconditionerKind::
@@ -1170,6 +1197,78 @@ __device__ void ComputeActualResidual(
   grid.sync();
 }
 
+// One full warp owns one exact principal patch.  Setup retains the ordinary
+// pivoted FP64 LU and pivot sequence; the recurring apply performs the pivot
+// chain once, then parallelizes every triangular row dot product.  No inverse
+// diagonal or permutation metadata is materialized, so this is the same
+// factor as the scalar full-patch policy with a cooperative application leaf.
+__device__ void ApplyWarpCoupledPatch(
+    const NativeTraceElementSchwarzView schwarz,
+    NativeTraceSolveControl* const control) noexcept
+{
+  constexpr int tile_width = 32;
+  const int lane = static_cast<int>(threadIdx.x) & (tile_width - 1);
+  const unsigned int mask = 0xffffffffU;
+  const int tile = GlobalThreadIndex() / tile_width;
+  const int tile_stride = GlobalThreadStride() / tile_width;
+  const int patch_rows = schwarz.patch_rows;
+
+  for (int element = tile; element < schwarz.elements;
+       element += tile_stride)
+  {
+    const std::size_t vector_offset =
+        static_cast<std::size_t>(element) * patch_rows;
+    const std::size_t matrix_offset = vector_offset * patch_rows;
+    const double* const lu = schwarz.patch_lu + matrix_offset;
+    const int* const pivots = schwarz.pivots + vector_offset;
+    double* const solution = schwarz.element_solution + vector_offset;
+
+    // Pivot swaps are order-dependent. One lane applies the exact retained
+    // chain, including repeated pivot rows, before any lane reads the vector.
+    if (lane == 0)
+      for (int row = 0; row < patch_rows; ++row)
+      {
+        const int pivot = pivots[row];
+        if (pivot != row)
+        {
+          const double value = solution[row];
+          solution[row] = solution[pivot];
+          solution[pivot] = value;
+        }
+      }
+    __syncwarp(mask);
+
+    for (int row = 1; row < patch_rows; ++row)
+    {
+      double partial = 0.0;
+      for (int column = lane; column < row; column += tile_width)
+        partial = fma(lu[row * patch_rows + column], solution[column],
+                      partial);
+      const double sum = FieldSplitTileSum<tile_width>(partial, mask);
+      if (lane == 0) solution[row] -= sum;
+      __syncwarp(mask);
+    }
+    for (int row = patch_rows - 1; row >= 0; --row)
+    {
+      double partial = 0.0;
+      for (int column = row + 1 + lane; column < patch_rows;
+           column += tile_width)
+        partial = fma(lu[row * patch_rows + column], solution[column],
+                      partial);
+      const double sum = FieldSplitTileSum<tile_width>(partial, mask);
+      if (lane == 0)
+      {
+        solution[row] =
+            (solution[row] - sum) / lu[row * patch_rows + row];
+        if (!isfinite(solution[row]))
+          MarkFailure(control, failure_nonfinite);
+      }
+      __syncwarp(mask);
+    }
+  }
+}
+
+template <bool CoupledWarp>
 __device__ void ApplyPreconditioner(
     const NativeTraceSystemView system,
     const NativeTracePreconditionerView preconditioner,
@@ -1232,7 +1331,13 @@ __device__ void ApplyPreconditioner(
       grid.sync();
     }
 
-    if (!warp_equilibrated_field_split ||
+    if constexpr (CoupledWarp)
+    {
+      ApplyWarpCoupledPatch(schwarz, control);
+      grid.sync();
+    }
+
+    if ((!warp_equilibrated_field_split && !CoupledWarp) ||
         control->preconditioner_applications == 1)
       for (int element = thread; element < schwarz.elements;
            element += stride)
@@ -1297,7 +1402,7 @@ __device__ void ApplyPreconditioner(
           solution[packed] *= right_scale[packed];
         }
       }
-      else if (!warp_equilibrated_field_split)
+      else if (!warp_equilibrated_field_split && !CoupledWarp)
         SolvePivotedDenseLu(lu, pivots, patch_rows, solution);
 
       // Validate the first actual application of each native solve against
@@ -1530,7 +1635,7 @@ __device__ void ApplyPreconditioner(
   grid.sync();
 }
 
-template <bool PreserveAliasedInput>
+template <bool PreserveAliasedInput, bool CoupledWarp>
 __device__ void ApplyFixedSigmaJacobiPreconditioner(
     const NativeTraceSystemView system,
     const NativeTracePreconditionerView preconditioner,
@@ -1575,12 +1680,12 @@ __device__ void ApplyFixedSigmaJacobiPreconditioner(
   NativeTracePreconditionerView base_preconditioner = preconditioner;
   base_preconditioner.kind =
       NativeTraceFixedSigmaJacobiBasePreconditioner(preconditioner.kind);
-  ApplyPreconditioner(system, base_preconditioner, workspace, input, output,
-                      control, grid);
+  ApplyPreconditioner<CoupledWarp>(
+      system, base_preconditioner, workspace, input, output, control, grid);
   if (control->failure_mask != 0) return;
 
-  // The exact local lower field split above supplies a nonzero stationary
-  // predictor. Refine only the scalar global sigma rows with the selected
+  // The exact local predictor above supplies a nonzero stationary state.
+  // Refine only the scalar global sigma rows with the selected
   // fixed number of damped Jacobi corrections. Euler rows remain fixed, so
   // this is a lower
   // block-GS preconditioner refinement rather than a replacement for the
@@ -1619,7 +1724,7 @@ __device__ void SetFinalResidualMetadata(
       ? residual / control->rhs_norm : residual;
 }
 
-template <bool UseCgs2, bool FixedSigmaJacobi>
+template <bool UseCgs2, bool FixedSigmaJacobi, bool CoupledWarp>
 __global__ void NativeRankOneTraceSolveKernel(
     const NativeTraceSystemView system,
     const NativeTracePreconditionerView preconditioner,
@@ -1671,6 +1776,9 @@ __global__ void NativeRankOneTraceSolveKernel(
         support.cooperative_blocks != static_cast<int>(gridDim.x) ||
         !support.supported)
       MarkFailure(control, failure_invalid_workspace);
+    if (NativeTracePreconditionerIsWarpCoupled(
+            kernel_preconditioner_kind) != CoupledWarp)
+      MarkFailure(control, failure_invalid_preconditioner);
   }
 
   ValidateCsr(system.matrix, true, true, failure_invalid_system, control);
@@ -1704,6 +1812,8 @@ __global__ void NativeRankOneTraceSolveKernel(
     if constexpr (FixedSigmaJacobi)
     {
       if (!NativeTracePreconditionerIsEquilibratedFieldSplit(
+              kernel_preconditioner_kind) &&
+          !NativeTracePreconditionerIsWarpCoupled(
               kernel_preconditioner_kind))
       {
         if (grid.thread_rank() == 0)
@@ -1833,12 +1943,13 @@ __global__ void NativeRankOneTraceSolveKernel(
           static_cast<std::size_t>(column + 1) * rows;
 
       if constexpr (FixedSigmaJacobi)
-        ApplyFixedSigmaJacobiPreconditioner<false>(
+        ApplyFixedSigmaJacobiPreconditioner<false, CoupledWarp>(
             system, preconditioner, workspace, current_basis, work,
             control, grid);
       else
-        ApplyPreconditioner(system, preconditioner, workspace,
-                            current_basis, work, control, grid);
+        ApplyPreconditioner<CoupledWarp>(
+            system, preconditioner, workspace, current_basis, work,
+            control, grid);
       if (FinishOnFailure(grid, control)) return;
       ApplyTraceOperator(system, preconditioner, work, next_basis, control,
                          grid);
@@ -2046,11 +2157,11 @@ __global__ void NativeRankOneTraceSolveKernel(
       }
     }
     if constexpr (FixedSigmaJacobi)
-      ApplyFixedSigmaJacobiPreconditioner<true>(
+      ApplyFixedSigmaJacobiPreconditioner<true, CoupledWarp>(
           system, preconditioner, workspace, work, work, control, grid);
     else
-      ApplyPreconditioner(system, preconditioner, workspace,
-                          work, work, control, grid);
+      ApplyPreconditioner<CoupledWarp>(
+          system, preconditioner, workspace, work, work, control, grid);
     if (FinishOnFailure(grid, control)) return;
     AxpyVector(system.solution, 1.0, work, rows, control, grid);
     if (FinishOnFailure(grid, control)) return;
@@ -2206,13 +2317,15 @@ extern "C" NativeTraceCooperativeSupport
 QueryNativeRankOneTraceCooperativeSupport(const int rows,
                                           const int krylov_dimension,
                                           const bool igr_active,
-                                          const bool fixed_sigma_jacobi) noexcept
+                                          const bool fixed_sigma_jacobi,
+                                          const bool coupled_warp_full_patch) noexcept
 {
   NativeTraceCooperativeSupport result{};
   result.fixed_sigma_jacobi = fixed_sigma_jacobi;
+  result.coupled_warp_full_patch = coupled_warp_full_patch;
   if (rows <= 0 || krylov_dimension <= 0 ||
       krylov_dimension == std::numeric_limits<int>::max() ||
-      (fixed_sigma_jacobi && !igr_active))
+      ((fixed_sigma_jacobi || coupled_warp_full_patch) && !igr_active))
     return result;
 
   int device = -1;
@@ -2232,16 +2345,29 @@ QueryNativeRankOneTraceCooperativeSupport(const int rows,
                              device) != cudaSuccess)
     return result;
 
-  const cudaError_t occupancy = fixed_sigma_jacobi
-      ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &active_blocks, NativeRankOneTraceSolveKernel<true, true>,
-            native_trace_cooperative_threads, 0)
-      : igr_active
+  const cudaError_t occupancy = coupled_warp_full_patch
+      ? fixed_sigma_jacobi
           ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &active_blocks, NativeRankOneTraceSolveKernel<true, false>,
+                &active_blocks,
+                NativeRankOneTraceSolveKernel<true, true, true>,
                 native_trace_cooperative_threads, 0)
           : cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &active_blocks, NativeRankOneTraceSolveKernel<false, false>,
+                &active_blocks,
+                NativeRankOneTraceSolveKernel<true, false, true>,
+                native_trace_cooperative_threads, 0)
+      : fixed_sigma_jacobi
+          ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks,
+                NativeRankOneTraceSolveKernel<true, true, false>,
+                native_trace_cooperative_threads, 0)
+      : igr_active
+          ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks,
+                NativeRankOneTraceSolveKernel<true, false, false>,
+                native_trace_cooperative_threads, 0)
+          : cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks,
+                NativeRankOneTraceSolveKernel<false, false, false>,
                 native_trace_cooperative_threads, 0);
   if (occupancy != cudaSuccess) return result;
 
@@ -2291,6 +2417,8 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
       NativeTracePreconditionerKind::ilu0_rcm_jacobi;
   const bool use_element_schwarz =
       NativeTracePreconditionerIsElementSchwarz(kernel_preconditioner_kind);
+  const bool use_coupled_warp_full_patch =
+      NativeTracePreconditionerIsWarpCoupled(kernel_preconditioner_kind);
   const bool use_matrix_free =
       NativeTraceOperatorIsElementMatrixFree(system.operator_kind);
   const bool use_cgs2 = use_ilu || use_element_schwarz;
@@ -2439,13 +2567,15 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
   int current_device = -1;
   if (!requirements.valid || workspace_overlap || !support.supported ||
       support.fixed_sigma_jacobi != use_fixed_sigma_jacobi ||
+      support.coupled_warp_full_patch != use_coupled_warp_full_patch ||
       (use_fixed_sigma_jacobi &&
        (fixed_sigma_jacobi_sweeps < 1 ||
         fixed_sigma_jacobi_sweeps >
             native_trace_sigma_jacobi_maximum_sweeps ||
         system.matrix.rows % 5 != 0 || !use_element_schwarz ||
-        !NativeTracePreconditionerIsEquilibratedFieldSplit(
-            kernel_preconditioner_kind))) ||
+        (!NativeTracePreconditionerIsEquilibratedFieldSplit(
+             kernel_preconditioner_kind) &&
+         !use_coupled_warp_full_patch))) ||
       cudaGetDevice(&current_device) != cudaSuccess ||
       current_device != support.device || support.compute_major != 12 ||
       support.compute_minor != 0 || support.multiprocessors <= 0 ||
@@ -2594,14 +2724,20 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
   void* arguments[] = {&system_argument, &preconditioner_argument,
                        &workspace_argument, &policy_argument,
                        &support_argument};
-  const void* const kernel = use_fixed_sigma_jacobi
-      ? reinterpret_cast<const void*>(
-            NativeRankOneTraceSolveKernel<true, true>)
+  const void* const kernel = use_coupled_warp_full_patch
+      ? use_fixed_sigma_jacobi
+          ? reinterpret_cast<const void*>(
+                NativeRankOneTraceSolveKernel<true, true, true>)
+          : reinterpret_cast<const void*>(
+                NativeRankOneTraceSolveKernel<true, false, true>)
+      : use_fixed_sigma_jacobi
+          ? reinterpret_cast<const void*>(
+                NativeRankOneTraceSolveKernel<true, true, false>)
       : use_cgs2
           ? reinterpret_cast<const void*>(
-                NativeRankOneTraceSolveKernel<true, false>)
+                NativeRankOneTraceSolveKernel<true, false, false>)
           : reinterpret_cast<const void*>(
-                NativeRankOneTraceSolveKernel<false, false>);
+                NativeRankOneTraceSolveKernel<false, false, false>);
   const cudaError_t launch = cudaLaunchCooperativeKernel(
       kernel,
       dim3(static_cast<unsigned int>(support.cooperative_blocks)),

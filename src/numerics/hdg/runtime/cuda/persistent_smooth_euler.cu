@@ -1335,11 +1335,17 @@ bool CudaQueryNativeRankOneTraceResources(
   support = {};
   const bool fixed_sigma_jacobi =
       CudaTracePreconditionerUsesFixedSigmaJacobi(preconditioner_kind);
+  const bool coupled_warp_full_patch =
+      CudaTracePreconditionerIsNativeElementSchwarzWarpCoupled(
+          preconditioner_kind);
   const NativeTraceCooperativeSupport native_support =
       QueryNativeRankOneTraceCooperativeSupport(
-          rows, krylov_dimension, igr_active, fixed_sigma_jacobi);
+          rows, krylov_dimension, igr_active, fixed_sigma_jacobi,
+          coupled_warp_full_patch);
   support.supported = native_support.supported;
   support.fixed_sigma_jacobi = native_support.fixed_sigma_jacobi;
+  support.coupled_warp_full_patch =
+      native_support.coupled_warp_full_patch;
   support.device = native_support.device;
   support.compute_major = native_support.compute_major;
   support.compute_minor = native_support.compute_minor;
@@ -1439,6 +1445,25 @@ constexpr NativeTracePreconditionerKind NativeFixedSigmaJacobiPreconditioner(
   }
 }
 
+constexpr NativeTracePreconditionerKind NativeCoupledWarpPreconditioner(
+    const int sweeps) noexcept
+{
+  switch (sweeps)
+  {
+  case 0:
+    return NativeTracePreconditionerKind::
+        element_overlap_schwarz_warp_coupled_fp64;
+  case 2:
+    return NativeTracePreconditionerKind::
+        element_overlap_schwarz_warp_coupled_sigma_jacobi2_fp64;
+  case native_element_schwarz_sigma_jacobi_maximum_sweeps:
+    return NativeTracePreconditionerKind::
+        element_overlap_schwarz_warp_coupled_sigma_jacobi10_fp64;
+  default:
+    return NativeTracePreconditionerKind::diagonal;
+  }
+}
+
 bool CudaLaunchNativeRankOneTraceSolver(
     const CudaTrueMatrixDeviceView& matrix, const double* const rhs,
     double* const solution,
@@ -1490,14 +1515,19 @@ bool CudaLaunchNativeRankOneTraceSolver(
   const bool use_warp_equilibrated_field_split =
       CudaTracePreconditionerIsNativeElementSchwarzWarpEquilibratedFieldSplit(
           preconditioner_kind);
+  const bool use_coupled_warp_full_patch =
+      CudaTracePreconditionerIsNativeElementSchwarzWarpCoupled(
+          preconditioner_kind);
   const bool use_fixed_sigma_jacobi =
       CudaTracePreconditionerUsesFixedSigmaJacobi(preconditioner_kind);
   const int fixed_sigma_jacobi_sweeps =
       CudaTracePreconditionerFixedSigmaJacobiSweeps(preconditioner_kind);
   const NativeTracePreconditionerKind fixed_sigma_jacobi_kind =
-      NativeFixedSigmaJacobiPreconditioner(
-          fixed_sigma_jacobi_sweeps,
-          use_warp_equilibrated_field_split);
+      use_coupled_warp_full_patch
+      ? NativeCoupledWarpPreconditioner(fixed_sigma_jacobi_sweeps)
+      : NativeFixedSigmaJacobiPreconditioner(
+            fixed_sigma_jacobi_sweeps,
+            use_warp_equilibrated_field_split);
   if (!CudaNativeTraceCooperativeSupportMatchesPreconditioner(
           support, preconditioner_kind))
     return false;
@@ -1507,7 +1537,10 @@ bool CudaLaunchNativeRankOneTraceSolver(
   preconditioner.kind = use_ilu
       ? NativeTracePreconditionerKind::ilu0_rcm_jacobi
       : use_element_schwarz
-          ? (use_equilibrated_field_split
+          ? (use_coupled_warp_full_patch
+                 ? NativeCoupledWarpPreconditioner(
+                       fixed_sigma_jacobi_sweeps)
+                 : use_equilibrated_field_split
                  ? (use_fixed_sigma_jacobi
                         ? fixed_sigma_jacobi_kind
                         : use_warp_equilibrated_field_split
@@ -1579,6 +1612,8 @@ bool CudaLaunchNativeRankOneTraceSolver(
   NativeTraceCooperativeSupport native_support{};
   native_support.supported = support.supported;
   native_support.fixed_sigma_jacobi = support.fixed_sigma_jacobi;
+  native_support.coupled_warp_full_patch =
+      support.coupled_warp_full_patch;
   native_support.device = support.device;
   native_support.compute_major = support.compute_major;
   native_support.compute_minor = support.compute_minor;

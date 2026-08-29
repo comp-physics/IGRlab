@@ -43,6 +43,11 @@ constexpr bool NativeTraceCooperativeSpecializationPolicy() noexcept
   legacy.fixed_sigma_jacobi = false;
   CudaNativeTraceCooperativeSupport fixed{};
   fixed.fixed_sigma_jacobi = true;
+  CudaNativeTraceCooperativeSupport coupled{};
+  coupled.coupled_warp_full_patch = true;
+  CudaNativeTraceCooperativeSupport coupled_fixed{};
+  coupled_fixed.fixed_sigma_jacobi = true;
+  coupled_fixed.coupled_warp_full_patch = true;
   return
       CudaNativeTraceCooperativeSupportMatchesPreconditioner(
           legacy,
@@ -128,6 +133,30 @@ constexpr bool NativeTraceCooperativeSpecializationPolicy() noexcept
           fixed,
           CudaTracePreconditionerKind::
               native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64) &&
+      CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+          coupled,
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_coupled_fp64) &&
+      !CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+          coupled,
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_coupled_sigma_jacobi2_fp64) &&
+      CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+          coupled_fixed,
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_coupled_sigma_jacobi2_fp64) &&
+      CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+          coupled_fixed,
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_coupled_sigma_jacobi10_fp64) &&
+      !CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+          fixed,
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_coupled_sigma_jacobi2_fp64) &&
+      !CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+          legacy,
+          CudaTracePreconditionerKind::
+              native_element_schwarz_warp_coupled_fp64) &&
       !CudaNativeTraceCooperativeSupportMatchesPreconditioner(
           fixed,
           CudaTracePreconditionerKind::
@@ -135,8 +164,8 @@ constexpr bool NativeTraceCooperativeSpecializationPolicy() noexcept
 }
 
 static_assert(NativeTraceCooperativeSpecializationPolicy(),
-              "native trace launch support must match the exact fixed-sigma "
-              "kernel specialization");
+              "native trace launch support must match fixed-sigma and "
+              "coupled-warp kernel specializations exactly");
 
 constexpr bool TrueResidualAuthorityPolicy() noexcept
 {
@@ -1317,7 +1346,7 @@ bool RunNativeSolveFixture(const NativeSolveFixture& fixture,
 
   const NativeTraceCooperativeSupport support =
       QueryNativeRankOneTraceCooperativeSupport(
-          rows, fixture.policy.krylov_dimension, fixture.igr, false);
+          rows, fixture.policy.krylov_dimension, fixture.igr, false, false);
   if (!support.supported || support.cooperative_blocks <= 0) return false;
   const NativeTraceWorkspaceRequirements requirements =
       QueryNativeTraceWorkspaceRequirements(
@@ -1492,7 +1521,7 @@ bool NativeElementSchwarzDeviceFixtureForOrder(const int order)
   policy.relative_tolerance = 1.0e-12;
   const NativeTraceCooperativeSupport support =
       QueryNativeRankOneTraceCooperativeSupport(
-          rows, policy.krylov_dimension, true, false);
+          rows, policy.krylov_dimension, true, false, false);
   const NativeTraceWorkspaceRequirements requirements =
       QueryNativeTraceWorkspaceRequirements(
           rows, policy.krylov_dimension, support.cooperative_blocks, true);
@@ -2109,10 +2138,10 @@ bool NativeFixedSigmaJacobiOrderFixture(const int order,
   policy.relative_tolerance = 1.0e-14;
   const NativeTraceCooperativeSupport support =
       QueryNativeRankOneTraceCooperativeSupport(
-          true_rows, policy.krylov_dimension, true, true);
+          true_rows, policy.krylov_dimension, true, true, false);
   const NativeTraceCooperativeSupport base_support =
       QueryNativeRankOneTraceCooperativeSupport(
-          true_rows, policy.krylov_dimension, true, false);
+          true_rows, policy.krylov_dimension, true, false, false);
   const NativeTraceWorkspaceRequirements fixed_requirements =
       QueryNativeTraceWorkspaceRequirements(
           true_rows, policy.krylov_dimension,

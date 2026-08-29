@@ -58,7 +58,10 @@ enum class NativeTracePreconditionerKind : std::int32_t
   element_overlap_schwarz_equilibrated_field_split_sigma_jacobi9_fp64 = 22,
   element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi9_fp64 = 23,
   element_overlap_schwarz_equilibrated_field_split_sigma_jacobi10_fp64 = 24,
-  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64 = 25
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64 = 25,
+  element_overlap_schwarz_warp_coupled_fp64 = 26,
+  element_overlap_schwarz_warp_coupled_sigma_jacobi2_fp64 = 27,
+  element_overlap_schwarz_warp_coupled_sigma_jacobi10_fp64 = 28
 };
 
 enum class NativeTraceSolveStatus : std::int32_t
@@ -219,6 +222,8 @@ struct NativeTraceCooperativeSupport final
   bool supported = false;
   /** Exact kernel specialization whose occupancy produced this record. */
   bool fixed_sigma_jacobi = false;
+  /** Exact cooperative fully coupled patch specialization identity. */
+  bool coupled_warp_full_patch = false;
   int device = -1;
   int compute_major = 0;
   int compute_minor = 0;
@@ -333,7 +338,8 @@ QueryNativeTraceWorkspaceRequirements(int rows, int krylov_dimension,
 extern "C" NativeTraceCooperativeSupport
 QueryNativeRankOneTraceCooperativeSupport(int rows, int krylov_dimension,
                                           bool igr_active,
-                                          bool fixed_sigma_jacobi) noexcept;
+                                          bool fixed_sigma_jacobi,
+                                          bool coupled_warp_full_patch) noexcept;
 
 /** Queue exactly one cooperative kernel.  This call never copies or syncs. */
 extern "C" bool LaunchNativeRankOneTraceSolve(
