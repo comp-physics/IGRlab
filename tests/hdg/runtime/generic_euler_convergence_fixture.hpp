@@ -62,6 +62,11 @@ struct CaseSelection
   int order = 0;
   RegularizationKind regularization = RegularizationKind::none;
   EulerHdgAssemblyQuadratureOrders igr_assembly_quadrature_orders{0, 0};
+  // Zero means "retain DefaultEulerHdgNumericalPolicy"; the command-line
+  // parser admits only finite positive overrides.
+  double newton_correction_linear_relative_tolerance = 0.0;
+  double final_coherent_linear_relative_tolerance = 0.0;
+  double true_residual_tightening_linear_relative_tolerance = 0.0;
   bool quadrature_equivalence = false;
 };
 
@@ -87,6 +92,33 @@ inline bool ParseQuadratureOrder(
       order >= 1 && order <= 14;
 }
 
+inline bool ParsePositiveDouble(
+    const std::string_view text, double& value) noexcept
+{
+  value = 0.0;
+  const char* const begin = text.data();
+  const char* const end = begin + text.size();
+  const auto parsed = std::from_chars(
+      begin, end, value, std::chars_format::general);
+  return parsed.ec == std::errc{} && parsed.ptr == end &&
+      std::isfinite(value) && value > 0.0;
+}
+
+inline void ApplySelectedLinearTolerances(
+    const CaseSelection& selection,
+    generic::EulerHdgNumericalPolicy& policy) noexcept
+{
+  if (selection.newton_correction_linear_relative_tolerance > 0.0)
+    policy.newton_correction_linear_relative_tolerance =
+        selection.newton_correction_linear_relative_tolerance;
+  if (selection.final_coherent_linear_relative_tolerance > 0.0)
+    policy.final_coherent_linear_relative_tolerance =
+        selection.final_coherent_linear_relative_tolerance;
+  if (selection.true_residual_tightening_linear_relative_tolerance > 0.0)
+    policy.true_residual_tightening_linear_relative_tolerance =
+        selection.true_residual_tightening_linear_relative_tolerance;
+}
+
 inline bool ParseCaseSelection(const int argc, char* argv[],
                                CaseSelection& selection) noexcept
 {
@@ -95,6 +127,9 @@ inline bool ParseCaseSelection(const int argc, char* argv[],
   bool have_regularization = false;
   bool have_igr_volume_order = false;
   bool have_igr_face_order = false;
+  bool have_newton_linear_tolerance = false;
+  bool have_final_linear_tolerance = false;
+  bool have_true_residual_tightening_linear_tolerance = false;
   bool have_quadrature_equivalence = false;
   for (int argument = 1; argument < argc; ++argument)
   {
@@ -132,6 +167,31 @@ inline bool ParseCaseSelection(const int argc, char* argv[],
           selection.igr_assembly_quadrature_orders.face_order);
       if (!have_igr_face_order) return false;
     }
+    else if (option == "--newton-linear-rtol" &&
+             argument + 1 < argc && !have_newton_linear_tolerance)
+    {
+      have_newton_linear_tolerance = ParsePositiveDouble(
+          argv[++argument],
+          selection.newton_correction_linear_relative_tolerance);
+      if (!have_newton_linear_tolerance) return false;
+    }
+    else if (option == "--final-linear-rtol" &&
+             argument + 1 < argc && !have_final_linear_tolerance)
+    {
+      have_final_linear_tolerance = ParsePositiveDouble(
+          argv[++argument],
+          selection.final_coherent_linear_relative_tolerance);
+      if (!have_final_linear_tolerance) return false;
+    }
+    else if (option == "--true-residual-tightening-linear-rtol" &&
+             argument + 1 < argc &&
+             !have_true_residual_tightening_linear_tolerance)
+    {
+      have_true_residual_tightening_linear_tolerance = ParsePositiveDouble(
+          argv[++argument],
+          selection.true_residual_tightening_linear_relative_tolerance);
+      if (!have_true_residual_tightening_linear_tolerance) return false;
+    }
     else if (option == "--quadrature-equivalence" &&
              !have_quadrature_equivalence)
     {
@@ -143,13 +203,21 @@ inline bool ParseCaseSelection(const int argc, char* argv[],
       return false;
     }
   }
-  return have_order && have_regularization &&
-      have_igr_volume_order == have_igr_face_order &&
-      (!have_igr_volume_order ||
-       selection.regularization == RegularizationKind::igr) &&
-      (!selection.quadrature_equivalence ||
-       (selection.regularization == RegularizationKind::igr &&
-        have_igr_volume_order));
+  if (!have_order || !have_regularization ||
+      have_igr_volume_order != have_igr_face_order ||
+      (have_igr_volume_order &&
+       selection.regularization != RegularizationKind::igr) ||
+      (selection.quadrature_equivalence &&
+       (selection.regularization != RegularizationKind::igr ||
+        !have_igr_volume_order)))
+  {
+    return false;
+  }
+
+  generic::EulerHdgNumericalPolicy policy =
+      generic::DefaultEulerHdgNumericalPolicy(selection.order);
+  ApplySelectedLinearTolerances(selection, policy);
+  return generic::ValidEulerHdgNumericalPolicy(policy);
 }
 
 /**
@@ -305,17 +373,17 @@ inline bool ProjectInitialState(const ActiveIgrWave& wave,
 }
 
 inline EulerHdgRequest MakeRequest(
-    const mfem::ParMesh& mesh, const int order,
+    const mfem::ParMesh& mesh,
     const mfem::ParGridFunction& initial,
     const mfem::ParGridFunction& source, BoundaryAudit& boundary,
     const ExecutionSelection execution,
-    const RegularizationKind regularization,
+    const CaseSelection& test_case,
     const EulerHdgAssemblyQuadratureOrders igr_assembly_quadrature_orders)
 {
   EulerHdgRequest request{};
   request.mesh = &mesh;
   request.communicator = mesh.GetComm();
-  request.polynomial_order = order;
+  request.polynomial_order = test_case.order;
   request.backend = {
       execution.backend,
       execution.backend == BackendKind::cuda ? 0 : -1,
@@ -332,12 +400,14 @@ inline EulerHdgRequest MakeRequest(
   request.boundary = {
       &boundary, PeriodicExterior,
       EulerBoundaryPolicyTableView{nullptr, 0, dimension, gamma}};
-  request.numerical_policy = generic::DefaultEulerHdgNumericalPolicy(order);
+  request.numerical_policy =
+      generic::DefaultEulerHdgNumericalPolicy(test_case.order);
+  ApplySelectedLinearTolerances(test_case, request.numerical_policy);
   if (igr_assembly_quadrature_orders.volume_order > 0)
     request.numerical_policy.igr_assembly_quadrature_orders =
         igr_assembly_quadrature_orders;
   request.numerical_policy.stabilization =
-      regularization == RegularizationKind::igr
+      test_case.regularization == RegularizationKind::igr
       ? generic::RegularizationSelection{RegularizationKind::igr, 0.2, 0.8}
       : generic::RegularizationSelection{RegularizationKind::none, 0.0, 0.0};
   return request;
@@ -1011,11 +1081,11 @@ bool RunQuadratureEquivalenceCase(
     BoundaryAudit candidate_boundary{};
     const EulerHdgAssemblyQuadratureOrders control_orders{12, 12};
     const EulerHdgRequest control_request = MakeRequest(
-        mesh, test_case.order, initial, source, control_boundary, execution,
-        RegularizationKind::igr, control_orders);
+        mesh, initial, source, control_boundary, execution, test_case,
+        control_orders);
     const EulerHdgRequest candidate_request = MakeRequest(
-        mesh, test_case.order, initial, source, candidate_boundary, execution,
-        RegularizationKind::igr, candidate);
+        mesh, initial, source, candidate_boundary, execution, test_case,
+        candidate);
     QuadratureTrajectoryHealth control_health;
     QuadratureTrajectoryHealth candidate_health;
     const bool control_advanced = runner.AdvanceQualified(
@@ -1182,8 +1252,7 @@ bool RunComparisonCase(
       BoundaryAudit boundary{};
       if (!ProjectInitialState(spatial_wave, initial)) return false;
       const EulerHdgRequest request = MakeRequest(
-          mesh, order, initial, source, boundary,
-          executions[execution], regularization,
+          mesh, initial, source, boundary, executions[execution], test_case,
           test_case.igr_assembly_quadrature_orders);
       const bool advanced = runner.Advance(
           request, 1, spatial_final_time, committed);
@@ -1217,8 +1286,8 @@ bool RunComparisonCase(
           static_cast<double>(step_ladder[level]);
       BoundaryAudit boundary{};
       const EulerHdgRequest request = MakeRequest(
-          temporal_mesh, order, temporal_initial, temporal_source, boundary,
-          executions[execution], regularization,
+          temporal_mesh, temporal_initial, temporal_source, boundary,
+          executions[execution], test_case,
           test_case.igr_assembly_quadrature_orders);
       const bool advanced = runner.Advance(
           request, step_ladder[level], dt, *solutions[level]);

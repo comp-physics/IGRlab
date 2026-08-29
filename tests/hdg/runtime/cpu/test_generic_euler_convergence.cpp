@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 
 namespace dg::hdg::runtime::cpu::detail
@@ -225,19 +226,34 @@ int main(int argc, char* argv[])
   const bool parsed =
       dg::hdg::test::generic_euler_convergence::ParseCaseSelection(
           argc, argv, test_case);
+  if (!parsed)
+  {
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (rank == 0)
+      std::cerr << "Usage: " << argv[0]
+                << " --order 1|2|3 --regularization conventional|igr"
+                   " [--igr-volume-quadrature-order Q"
+                   " --igr-face-quadrature-order Q]"
+                   " [--newton-linear-rtol R]"
+                   " [--final-linear-rtol R]"
+                   " [--true-residual-tightening-linear-rtol R]"
+                   " [--quadrature-equivalence]\n";
+    MPI_Finalize();
+    return 2;
+  }
   const std::array<
       dg::hdg::test::generic_euler_convergence::ExecutionSelection, 1>
       executions{{
           {dg::hdg::generic::BackendKind::cpu,
            dg::hdg::generic::CudaEngineKind::ordinary, "CPU"}}};
   CpuRunner runner;
-  const bool passed = parsed &&
-      (test_case.quadrature_equivalence
+  const bool passed = test_case.quadrature_equivalence
            ? dg::hdg::test::generic_euler_convergence::
                  RunQuadratureEquivalenceCase(
                      MPI_COMM_WORLD, test_case, executions[0], runner)
            : dg::hdg::test::generic_euler_convergence::RunComparisonCase(
-                 MPI_COMM_WORLD, test_case, executions, runner));
+                 MPI_COMM_WORLD, test_case, executions, runner);
   MPI_Finalize();
   return passed ? 0 : 1;
 }

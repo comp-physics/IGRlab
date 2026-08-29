@@ -287,6 +287,35 @@ foreach(_order IN ITEMS 1 2 3)
       TIMEOUT 3600)
 endforeach()
 
+# Keep malformed role-specific tolerance choices outside the numerical runner.
+# These fast guards exercise the shared CPU/CUDA argument parser without
+# creating a separate backend qualification suite.
+add_test(
+  NAME hdg_generic_euler_convergence_rejects_nonfinite_linear_tolerance
+  COMMAND dg_igr_hdg_generic_euler_convergence_cpu_test
+    --order 1 --regularization igr --newton-linear-rtol nan)
+add_test(
+  NAME hdg_generic_euler_convergence_rejects_duplicate_linear_tolerance
+  COMMAND dg_igr_hdg_generic_euler_convergence_cpu_test
+    --order 1 --regularization igr
+    --newton-linear-rtol 1e-10 --newton-linear-rtol 1e-10)
+add_test(
+  NAME hdg_generic_euler_convergence_rejects_invalid_tightening_order
+  COMMAND dg_igr_hdg_generic_euler_convergence_cpu_test
+    --order 1 --regularization igr
+    --newton-linear-rtol 1e-10 --final-linear-rtol 3e-11
+    --true-residual-tightening-linear-rtol 1e-9)
+set_tests_properties(
+  hdg_generic_euler_convergence_rejects_nonfinite_linear_tolerance
+  hdg_generic_euler_convergence_rejects_duplicate_linear_tolerance
+  hdg_generic_euler_convergence_rejects_invalid_tightening_order
+  PROPERTIES
+    PROCESSORS 1
+    RESOURCE_LOCK hdg_generic_euler_cpu
+    LABELS "hdg;generic;cpu;convergence;argument-validation"
+    TIMEOUT 30
+    WILL_FAIL TRUE)
+
 # Directly compare the reduced IGR quadrature schedule to q12/q12 on the
 # same active-IGR one-step and multi-step trajectories.  This remains a
 # test-only numerical qualification and publishes no runtime evidence API.
