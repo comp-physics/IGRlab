@@ -1192,7 +1192,7 @@ BuildPersistentTrueSystem() noexcept
       std::vector<unsigned char> true_marker_seen(
           static_cast<std::size_t>(shape_.true_trace_count), 0);
       bool component_ordering_exact = scalar_trace_dofs > 0 &&
-          scalar_local_trace_dofs > 0 && trace_space_ != nullptr &&
+          scalar_local_trace_dofs > 0 && trace_space_.has_value() &&
           trace_space_->GetOrdering() == mfem::Ordering::byNODES &&
           trace_space_->GetNDofs() == scalar_local_trace_dofs &&
           scalar_trace_dofs * igr_trace_components ==

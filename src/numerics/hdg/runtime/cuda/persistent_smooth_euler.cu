@@ -1108,7 +1108,9 @@ bool CudaConfigureRankOneMgrState(
             state.mgr, state.f_relax_types.data()) == 0 &&
         HYPRE_MGRSetCoarseGridMethod(
             state.mgr, state.coarse_grid_methods.data()) == 0 &&
-        HYPRE_MGRSetRestrictType(state.mgr, 13) == 0 &&
+        // Non-Galerkin coarse methods 1--4 require injection restriction.
+        // Type 13 is CPR-like but is not implemented by HYPRE on the GPU.
+        HYPRE_MGRSetRestrictType(state.mgr, 0) == 0 &&
         HYPRE_MGRSetInterpType(state.mgr, 2) == 0 &&
         HYPRE_MGRSetNumRelaxSweeps(state.mgr, 1) == 0 &&
         HYPRE_MGRSetMaxIter(state.mgr, 1) == 0 &&
@@ -2760,6 +2762,8 @@ constexpr double cuda_gamma = 1.4;
 constexpr double cuda_tau = 2.5;
 constexpr double cuda_density_gate = 1.0e-8;
 constexpr double cuda_pi = 3.141592653589793238462643383279502884;
+constexpr double cuda_positive_infinity =
+    std::numeric_limits<double>::infinity();
 
 __device__ void AtomicMaximumPositiveDouble(double* const address,
                                             const double value)
@@ -2790,9 +2794,9 @@ __global__ void InitializeRankOneEquilibrationKernel(
   }
   if (blockIdx.x == 0 && threadIdx.x == 0)
   {
-    control[0] = CUDART_INF;
+    control[0] = cuda_positive_infinity;
     control[1] = 0.0;
-    control[2] = CUDART_INF;
+    control[2] = cuda_positive_infinity;
     control[3] = 0.0;
     *status = 0;
   }
