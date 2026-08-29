@@ -38,7 +38,8 @@ L2 command construction preserves explicit trace/sample or metric/filter
 choices. In smoke mode, `--ncu-kernel-name`,
 `--ncu-kernel-name-base`, launch limits, and NVTX include/exclude options are
 ordinary opt-in filters. In qualification mode, NCU accepts only its exact
-tensor-instruction or accepted-step-attribution selection.
+condensation-instruction, volume-instruction, or accepted-step-attribution
+selection.
 
 ## Common qualification binding
 
@@ -73,7 +74,7 @@ binding is `validation_failure`, not partial qualification.
 
 ## NCU qualification modes
 
-Both NCU qualification kinds are intentionally narrower than general
+The three NCU qualification kinds are intentionally narrower than general
 profiling. Each requires the production
 `dg_igr_hdg_runtime_cuda_accepted_step_benchmark`, with exactly these
 application semantics:
@@ -103,8 +104,8 @@ NCU/SASS proof required for the production engine package. The ablation keeps
 only bounded benchmark samples and aggregate policy/work metadata; neither the
 campaign nor this profiler harness is a flight recorder or replay facility.
 
-`--ncu-qualification-kind tensor-instructions` is the native-instruction
-proof. Its only metrics are
+`--ncu-qualification-kind tensor-instructions` is the condensation native-
+instruction proof. Its only metrics are
 `sm__inst_executed_pipe_fp64_op_dmma.sum` and
 `gpu__time_duration.avg`; its kernel filter is exactly
 `regex:.*TensorBorrowedCondenseKernel.*`; and its only NVTX include is
@@ -128,6 +129,20 @@ launch. The condensed RHS shares a padded Schur edge tile only when it fits;
 otherwise its final contraction is scalar. This closes prefix-truncation and
 partial-work ambiguities while preserving the fused production kernel boundary.
 
+`--ncu-qualification-kind tensor-volume-instructions` is the corresponding
+volume-contraction proof. It uses the same two metrics, the exact
+`regex:.*BorrowedEulerTensorVolumeContractionKernel.*` filter, and only the
+`HDG\/local-assembly/` NVTX range. The benchmark summary supplies the bounded
+aggregate `volume_assembly_launches` and `volume_mma_tiles`; the former counts
+successful production assembly invocations, not contraction-kernel launches.
+The harness independently reconstructs the production coefficient-workspace
+capacity, deterministic quadrature chunks (including a zero-padded final
+tail), contraction-launch count, and FP64 `m8n8k4` work from mode, order, mesh,
+and element shape. It then requires the imported NCU rows to match the exact
+total and complete chunk-shape distribution. The manifest retains only a
+constant-size chunk-shape distribution and DMMA histogram, not ordered or
+per-launch history.
+
 `--ncu-qualification-kind accepted-step-attribution` is the all-kernel
 accepted-step view. Its only metric is `gpu__time_duration.avg`; it forbids a
 kernel filter; and its only NVTX include is
@@ -139,25 +154,27 @@ range. Reaching the limit is treated as possible truncation, not a complete
 capture. It requires positive
 material rows for local assembly, condensation, trace assembly, trace solve,
 interior recovery, reductions, validation, packing/conversion, and nonlinear
-update, plus a positive `TensorBorrowedCondenseKernel` row. The manifest retains
+update, plus positive `TensorBorrowedCondenseKernel` and
+`BorrowedEulerTensorVolumeContractionKernel` rows. The manifest retains
 per-category and per-kernel launch/duration totals, fractions of captured GPU
-kernel duration, the tensor-condensation fraction, and any unclassified outer-
-range work. Its tensor-kernel launch count must also equal the selected
-benchmark sample's condensation-launch count. Local factorization, device
+kernel duration, separate tensor-condensation and tensor-volume fractions, and
+any unclassified outer-range work. Both tensor-kernel launch counts must equal
+their independently derived selected-sample counts. Local factorization, device
 transfer, and synchronization
 categories are retained when present but are not mandatory positive categories
 for every capture.
 
-For either kind, the raw report, imported CSV, import stderr, commands, sizes,
-SHA-256 identities, and the fixed selected-step tensor-work summary are
+For every qualification kind, the raw report, imported CSV, import stderr,
+commands, sizes, SHA-256 identities, and the fixed selected-step tensor-work
+summary are
 retained. This is bounded post-run validation of one finite benchmark log; it
 does not add callbacks, event capture, replay, or production instrumentation.
 The accepted-step attribution contains
 GPU kernel duration only; CUDA API and memcpy time require Nsys, and host/MPI
 time is not included. Its positive tensor-kernel duration is not instruction
-proof, so promotion requires the separate tensor-instructions capture. A
-positive application MMA-tile counter or a tensor-capable library call is not
-substituted for that proof.
+proof, so promotion requires separate condensation and volume instruction
+captures. A positive application MMA-tile counter or a tensor-capable library
+call is not substituted for either proof.
 
 An exact tensor-instruction qualification invocation has this shape (shell
 variables denote already-resolved exact paths or identities):
@@ -200,6 +217,25 @@ python3 scripts/perf/profile_harness.py \
 same accepted-step selection. Qualification then checks it again against the
 profiled sample and fails if nonlinear work changed or the capture was only a
 prefix.
+
+The volume instruction capture uses the same exact candidate and application,
+replacing only the NCU selection with:
+
+```bash
+--ncu-qualification-kind tensor-volume-instructions \
+--ncu-target-processes application-only \
+--ncu-metric sm__inst_executed_pipe_fp64_op_dmma.sum \
+--ncu-metric gpu__time_duration.avg \
+--ncu-kernel-name-base demangled \
+--ncu-kernel-name 'regex:.*BorrowedEulerTensorVolumeContractionKernel.*' \
+--ncu-launch-count "$VOLUME_CONTRACTION_LAUNCHES" \
+--ncu-nvtx-include 'HDG\/local-assembly/' \
+--require-data report=capture.ncu-rep
+```
+
+`VOLUME_CONTRACTION_LAUNCHES` is derived from the unprofiled sample's successful
+assembly-invocation count and the exact quadrature chunk plan, then checked
+again against both the profiled sample and the native report.
 
 The accepted-step attribution uses the same exact candidate, benchmark, GPU,
 application, report, and tool bindings, replacing only the NCU selection with:

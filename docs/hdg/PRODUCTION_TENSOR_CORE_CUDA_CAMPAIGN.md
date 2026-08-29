@@ -314,9 +314,10 @@ uses separate operator applications, reductions, and vector updates; its own
 implementation plan defers whole-timestep fusion beyond per-stage residency.
 
 The transferable principle is operator/dataflow reformulation, not a promise
-that one kernel can cross every solver boundary. The HDG tensor leaf already
-fuses zero/volume/face assembly in one SIMT kernel and, in a separate
-one-block-per-element kernel, performs pivoted local factorization,
+that one kernel can cross every solver boundary. The HDG tensor leaf keeps the
+zero and face assembly leaves while splitting volume assembly into exact FP64
+coefficient evaluation and an output-stationary FP64 WMMA contraction. In a
+separate one-block-per-element kernel, it performs pivoted local factorization,
 multi-right-hand-side solves, condensation, and Schur contraction. It retains
 solved `[B f]` work for recovery and keeps the rank-one Krylov loop and its
 preconditioner/vector algebra inside one cooperative kernel. HYPRE does not
@@ -344,10 +345,15 @@ algebra.
 
 ### Implemented tensor numerical leaf
 
-The production tensor selection retains the existing FP64 residual/Jacobian,
-global true-trace assembly, recovery, validation, and transactional code. Its
-assembly launch fuses the element-local zero, volume, and face stages as one
-SIMT kernel; assembly currently makes no tensor-instruction claim. Its fused
+The production tensor selection retains the existing exact FP64 coefficient,
+flux/LLF/source/IGR arithmetic, face assembly, global true-trace assembly,
+recovery, validation, and transactional code. Its volume leaf packs a checked
+44-double conventional or 66-double IGR coefficient record per quadrature
+point into the existing solve workspace. It processes deterministic checked
+quadrature chunks, zero-pads an incomplete `k=4` tail, and uses native FP64
+WMMA `m8n8k4` to write each residual and volume-Jacobian output tile once per
+chunk; the first chunk assigns and later chunks add completed tiles in fixed
+order. The zero and face leaves remain ordinary FP64 CUDA. Its fused
 local-algebra/condensation kernel uses an eight-column pivoted FP64 LU panel.
 Scalar panel and diagonal-block solve work preserve the ordinary pivot and
 threshold semantics, while native FP64 WMMA `m8n8k4` performs the material
@@ -778,7 +784,7 @@ selected wins cannot suppress regressions or indeterminate cells.
 
 Accepted-step attribution must separate at least:
 
-- residual/Jacobian assembly;
+- residual/Jacobian assembly, including the tensor-volume contraction;
 - the fused local factorization/algebra/condensation kernel category;
 - true-trace assembly and solve;
 - recovery;
@@ -804,20 +810,27 @@ or numeric rows from another kernel. It additionally binds that count to the
 selected benchmark sample, independently reconstructs positive planned tile
 totals for blocked LU, forward/backward RHS updates, and Schur contraction,
 and requires their sum to equal both the benchmark MMA total and the NCU DMMA
-total. `accepted-step-attribution` instead fixes
+total. `tensor-volume-instructions` applies the same native-report checks to
+the demangled `BorrowedEulerTensorVolumeContractionKernel` under the local-
+assembly NVTX range. It independently reconstructs the workspace-limited
+quadrature chunks, including the padded tail, and requires the exact complete
+DMMA total and chunk-shape launch distribution to match the bounded production
+aggregates. `accepted-step-attribution` instead fixes
 the outer profiled-accepted-step NVTX range, duration-only metric, no kernel
 filter, and a positive launch limit. It imports the native raw table, requires
-the material HDG categories and positive tensor-condensation work, and retains
-category/kernel totals plus the tensor kernel's fraction of captured GPU
-kernel duration; its tensor launch count must match the same selected sample.
+the material HDG categories and positive tensor-condensation and tensor-volume
+work, and retains category/kernel totals plus each tensor kernel's fraction of
+captured GPU kernel duration; both tensor launch counts must match the same
+selected sample.
 The local pivoted LU, triangular solves, and Schur product execute in one
 production kernel and therefore remain one fused attribution category; the
 native kernel table and complete aggregate DMMA proof quantify that category
-without pretending an artificial kernel boundary exists. The fused SIMT
-assembly kernel is attributed separately by duration and is not mislabeled as
-tensor execution. The captured fraction excludes
-host/MPI, CUDA-API, and memcpy time and is not DMMA proof, so both NCU kinds are
-required. The Nsys qualification route validates the same exact tensor
+without pretending an artificial kernel boundary exists. The volume
+contraction is attributed separately and has its own complete DMMA proof; its
+scalar coefficient and face leaves remain in local assembly without a tensor
+claim. The captured fraction excludes host/MPI, CUDA-API, and memcpy time and
+is not DMMA proof, so both instruction captures plus accepted-step attribution
+are required. The Nsys qualification route validates the same exact tensor
 accepted-step application arguments, identities, and native report, then
 generates and hash-binds separate `nvtx_sum`, `cuda_api_sum`,
 `cuda_gpu_mem_time_sum`, and `cuda_gpu_mem_size_sum` CSV tables. It requires
@@ -830,9 +843,10 @@ The content-addressed profiler bundle retains these exact derivatives:
 - the clean candidate commit/tree, canonical `--nvtx-profile` build manifest,
   profiled executable size/SHA-256, profiler executable size/SHA-256 and
   version, complete command, environment, GPU identity, and raw report;
-- NCU condensation captures for representative conventional and IGR accepted
-  steps, with the exact native kernel symbol, NVTX selection, launch count,
-  `gpu__time_duration` result, and FP64 DMMA metric/count;
+- separate NCU condensation and volume-contraction captures for representative
+  conventional and IGR accepted steps, with each exact native kernel symbol,
+  NVTX selection, launch count, `gpu__time_duration` result, and FP64 DMMA
+  metric/count;
 - qualified NCU `accepted-step-attribution` captures and derived tables that
   quantify local assembly, local algebra/condensation, trace assembly/solve,
   recovery, reductions/validation, packing/conversion, and nonlinear update,
@@ -840,12 +854,13 @@ The content-addressed profiler bundle retains these exact derivatives:
   unclassified outer-range work and the tensor kernel fraction;
 - Nsys reports and derived NVTX/CUDA-API tables for representative conventional
   and IGR accepted steps, including every extraction command and artifact hash;
-- an exact production-linked SASS dump or canonical SASS-test log containing
-  the selected native sm_120 function, cuobjdump path/hash/version and command,
-  profiled binary hash, `DMMA.8x8x4` static-site count, and retained artifact
-  hash. The canonical SASS test writes the finite exact-function dump and its
-  hash-bound key/value manifest below the canonical build directory; it does
-  not instrument or record the running application.
+- exact production-linked SASS dumps or canonical SASS-test logs for the
+  condensation and volume-contraction native sm_120 functions, each retaining
+  the cuobjdump path/hash/version and command, profiled binary hash,
+  `DMMA.8x8x4` static-site count, and artifact hash. The canonical SASS test
+  writes both finite exact-function dumps and their separate hash-bound
+  key/value manifests below the canonical build directory; it does not
+  instrument or record the running application.
 
 Every derived CSV or text summary is hashed beside the raw report and records
 the tool/import command that produced it. Diagnostic MMA tile counters establish
@@ -896,11 +911,12 @@ work; it is not evidence for a new production integrator.
 
 ### Interpretation limits
 
-- Tensor instructions accelerate the fused local-algebra/condensation kernel
-  only. Residual/Jacobian assembly is fused SIMT; the rank-one tensor trace
-  solver uses one cooperative FP64 SIMT GMRES leaf followed by fixed control
-  transfer and MFEM/HYPRE true-residual verification; and recovery remains
-  FP64 CUDA work. No DMMA claim is made for those non-condensation stages.
+- Tensor instructions accelerate the output-stationary volume contraction and
+  fused local-algebra/condensation kernels. Volume coefficient evaluation,
+  zero/face assembly, the rank-one tensor trace solver, and recovery remain
+  FP64 CUDA/SIMT work. The trace solver uses one cooperative FP64 SIMT GMRES
+  leaf followed by fixed control transfer and MFEM/HYPRE true-residual
+  verification. No DMMA claim is made for those stages.
 - The native rank-one solver is an independent algorithmic effect and its work
   is reported separately from MMA. Tensor conventional applies a diagonal
   preconditioner directly from the borrowed ParCSR matrix. Tensor IGR matches

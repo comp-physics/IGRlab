@@ -185,6 +185,9 @@ elif "--import" in arguments:
         print('"","","","nsecond"')
         categories = [
             ("BorrowedEulerVolumeKernel", "local-assembly", 8000),
+            ("BorrowedEulerTensorVolumeContractionKernel", "local-assembly", 1500),
+            ("BorrowedEulerTensorVolumeContractionKernel", "local-assembly", 1500),
+            ("BorrowedEulerTensorVolumeContractionKernel", "local-assembly", 1500),
             ("TensorBorrowedCondenseKernel", "condensation", 2000),
             ("TensorBorrowedCondenseKernel", "condensation", 2000),
             ("TensorBorrowedCondenseKernel", "condensation", 2000),
@@ -198,6 +201,9 @@ elif "--import" in arguments:
         ]
         if os.environ.get("FAKE_NCU_MISSING_CATEGORY"):
             categories = categories[:-1]
+        if os.environ.get("FAKE_NCU_MISSING_VOLUME"):
+            categories = [item for item in categories
+                          if "VolumeContraction" not in item[0]]
         for launch, (kernel, category, duration) in enumerate(categories):
             ranges = ("HDG/profiled-accepted-step HDG/accepted-step "
                       f"HDG/{category}")
@@ -205,17 +211,35 @@ elif "--import" in arguments:
     else:
         print('"ID","Kernel Name","sm__inst_executed_pipe_fp64_op_dmma.sum","gpu__time_duration.avg"')
         print('"","","inst","nsecond"')
-        value = ("0" if os.environ.get("FAKE_NCU_ZERO") else
-                 "22827167" if os.environ.get("FAKE_NCU_WRONG_TOTAL") else
-                 "22827168")
-        for launch in range(3):
-            print(f'"{launch}","void TensorBorrowedCondenseKernel<double>()","{value}","226912"')
+        volume = bool(os.environ.get("FAKE_NCU_VOLUME"))
+        p1_igr = bool(os.environ.get("FAKE_APP_P1_IGR"))
+        expected_values = (
+            [908544, 908544, 908544, 227136] * 3
+            if volume and p1_igr else
+            [22145760] * 3 if volume else [22827168] * 3
+        )
+        kernel = ("BorrowedEulerTensorVolumeContractionKernel"
+                  if volume else "TensorBorrowedCondenseKernel")
+        for launch, expected in enumerate(expected_values):
+            value = ("0" if os.environ.get("FAKE_NCU_ZERO") else
+                     str(expected - 1)
+                     if os.environ.get("FAKE_NCU_WRONG_TOTAL") else
+                     str(expected))
+            print(f'"{launch}","void {kernel}<double>()","{value}","226912"')
 else:
     stem = pathlib.Path(arguments[arguments.index("--export") + 1])
     payload = (b"not-a-native-report" if os.environ.get("FAKE_NCU_BAD_REPORT")
                else b"NVR\\x00synthetic-native-report")
     stem.with_suffix(".ncu-rep").write_bytes(payload)
     launches = int(os.environ.get("FAKE_APP_CONDENSATION_LAUNCHES", "3"))
+    volume_launches = int(os.environ.get(
+        "FAKE_APP_VOLUME_ASSEMBLY_LAUNCHES", "3"
+    ))
+    p1_igr = bool(os.environ.get("FAKE_APP_P1_IGR"))
+    order = 1 if p1_igr else 3
+    interior_unknowns = 75712 if p1_igr else 302848
+    condensation_tiles_per_launch = 889616 if p1_igr else 22827168
+    volume_tiles_per_assembly = 2952768 if p1_igr else 22145760
     print(json.dumps({
         "schema": 2,
         "benchmark": "dg_igr_hdg_cuda_accepted_step",
@@ -227,14 +251,16 @@ else:
         "trace_policy": "engine-default",
         "mode": "igr",
         "rank_count": 1,
-        "polynomial_order": 3,
+        "polynomial_order": order,
         "mesh_n": 52,
         "domain_periods": 1,
         "dt": 1e-5,
         "elements": 2704,
+        "volume_assembly_order": 12,
+        "volume_points": 49,
         "interior_components": 7,
         "trace_components": 5,
-        "interior_unknowns": 302848,
+        "interior_unknowns": interior_unknowns,
         "profiling_observability": True,
         "profile_measured_step": 2,
         "host_export": False,
@@ -244,8 +270,10 @@ else:
             "tensor_core": {
                 "selected_engine": "tensor",
                 "hardware_supported": True,
+                "volume_assembly_launches": volume_launches,
+                "volume_mma_tiles": volume_tiles_per_assembly * volume_launches,
                 "condensation_launches": launches,
-                "mma_tiles": 22827168 * launches,
+                "mma_tiles": condensation_tiles_per_launch * launches,
                 "fallback_count": 0,
                 "fallback_accounting_complete": True,
                 "no_fallback": True,
@@ -313,6 +341,8 @@ else:
         "domain_periods": 1,
         "dt": 1e-5,
         "elements": 2704,
+        "volume_assembly_order": 6,
+        "volume_points": 16,
         "interior_components": 4,
         "trace_components": 4,
         "interior_unknowns": 97344,
@@ -325,6 +355,8 @@ else:
             "tensor_core": {
                 "selected_engine": "tensor",
                 "hardware_supported": True,
+                "volume_assembly_launches": 3,
+                "volume_mma_tiles": 3893760,
                 "condensation_launches": 3,
                 "mma_tiles": 5159232,
                 "fallback_count": 0,
@@ -338,12 +370,13 @@ else:
 
         def qualification_arguments(
                 output: Path,
-                kind: str = "tensor-instructions") -> list[str]:
+                kind: str = "tensor-instructions",
+                p1_igr: bool = False) -> list[str]:
             application = [
                 "--arg=--mode", "--arg", "igr",
                 "--arg=--engine", "--arg", "tensor",
                 "--arg=--trace-policy", "--arg", "engine-default",
-                "--arg=--order", "--arg", "3",
+                "--arg=--order", "--arg", "1" if p1_igr else "3",
                 "--arg=--mesh-n", "--arg", "52",
                 "--arg=--domain-periods", "--arg", "1",
                 "--arg=--dt", "--arg", "1e-5",
@@ -358,8 +391,8 @@ else:
                 "--arg=--expected-cmake-cache", "--arg",
                 str(qualification_cache.resolve()),
             ]
-            ncu_arguments = (
-                [
+            if kind == "tensor-instructions":
+                ncu_arguments = [
                     "--ncu-metric",
                     "sm__inst_executed_pipe_fp64_op_dmma.sum",
                     "--ncu-metric", "gpu__time_duration.avg",
@@ -369,18 +402,28 @@ else:
                     "--ncu-launch-count", "3",
                     "--ncu-nvtx-include", "HDG\\/condensation/",
                 ]
-                if kind == "tensor-instructions" else
-                [
+            elif kind == "tensor-volume-instructions":
+                ncu_arguments = [
+                    "--ncu-metric",
+                    "sm__inst_executed_pipe_fp64_op_dmma.sum",
+                    "--ncu-metric", "gpu__time_duration.avg",
+                    "--ncu-kernel-name-base", "demangled",
+                    "--ncu-kernel-name",
+                    "regex:.*BorrowedEulerTensorVolumeContractionKernel.*",
+                    "--ncu-launch-count", "12" if p1_igr else "3",
+                    "--ncu-nvtx-include", "HDG\\/local-assembly/",
+                ]
+            else:
+                ncu_arguments = [
                     "--ncu-metric", "gpu__time_duration.avg",
                     "--ncu-kernel-name-base", "demangled",
                     "--ncu-launch-count", "20",
                     "--ncu-nvtx-include",
                     "HDG\\/profiled-accepted-step/",
                 ]
-            )
             return [
                 "--level", "l2-ncu", "--evidence-mode", "qualification",
-                "--scenario", f"igr-p3-{kind}",
+                "--scenario", f"igr-p{1 if p1_igr else 3}-{kind}",
                 "--exe", str(qualification_app), "--out-dir", str(output),
                 "--source-root", str(qualification_source),
                 "--expected-commit", qualification_commit,
@@ -428,6 +471,9 @@ else:
         ]
         assert application_work["condensation_launches"] == 3
         assert application_work["planned_mma_tiles"] == 68481504
+        assert application_work["volume_assembly_launches"] == 3
+        assert application_work["volume_contraction_launches"] == 3
+        assert application_work["planned_volume_mma_tiles"] == 66437280
         assert application_work["all_intended_fused_stages_material"] is True
         assert proof["duration_unit"] == "nanoseconds"
         assert proof["raw_duration_unit_field"] == "nsecond"
@@ -449,6 +495,64 @@ else:
             "--print-units", "base",
         ]
 
+        volume_qualification_out = root / "qualification-volume"
+        run(
+            *qualification_arguments(
+                volume_qualification_out, "tensor-volume-instructions", True
+            ),
+            env={
+                **qualification_env,
+                "FAKE_NCU_VOLUME": "1",
+                "FAKE_APP_P1_IGR": "1",
+            },
+        )
+        volume_manifest = read_manifest(volume_qualification_out)
+        volume_proof = volume_manifest["qualification"][
+            "tensor_instruction_proof"
+        ]
+        assert volume_proof["status"] == \
+            "positive_tensor_instruction_proof"
+        assert volume_proof["qualified_hotspot"] == \
+            "tensor-volume-contraction"
+        assert volume_proof["kernel_substring"] == \
+            "BorrowedEulerTensorVolumeContractionKernel"
+        assert volume_proof["matched_launches"] == 12
+        assert volume_proof["dmma_instruction_total"] == 8858304.0
+        assert volume_proof["dmma_instruction_minimum"] == 227136.0
+        assert volume_proof["dmma_instruction_maximum"] == 908544.0
+        assert volume_proof["dmma_instruction_histogram"] == [
+            {"dmma_instructions": 227136.0, "launches": 3},
+            {"dmma_instructions": 908544.0, "launches": 9},
+        ]
+        assert volume_proof["complete_planned_dmma_match"] is True
+        assert volume_proof["volume_assembly_order"] == 12
+        assert volume_proof["volume_points"] == 49
+        assert volume_proof[
+            "planned_volume_mma_tiles_per_assembly"
+        ] == 2952768
+        assert volume_proof[
+            "planned_volume_contraction_launch_distribution"
+        ] == [
+            {
+                "quadrature_points": 16,
+                "quadrature_groups": 4,
+                "mma_tiles_per_launch": 908544,
+                "launches_per_assembly": 3,
+            },
+            {
+                "quadrature_points": 1,
+                "quadrature_groups": 1,
+                "mma_tiles_per_launch": 227136,
+                "launches_per_assembly": 1,
+            },
+        ]
+        volume_work = volume_manifest["qualification"]["application_work"]
+        assert volume_work["volume_assembly_launches"] == 3
+        assert volume_work["volume_workspace_capacity_points"] == 17
+        assert volume_work["volume_chunk_points"] == 16
+        assert volume_work["volume_contraction_launches"] == 12
+        assert volume_work["planned_volume_mma_tiles"] == 8858304
+
         attribution_out = root / "qualification-attribution"
         run(
             *qualification_arguments(
@@ -462,8 +566,8 @@ else:
         ]
         assert attribution["status"] == \
             "positive_accepted_step_attribution"
-        assert attribution["matched_launches"] == 11
-        assert attribution["total_gpu_kernel_duration_ns"] == 15900.0
+        assert attribution["matched_launches"] == 14
+        assert attribution["total_gpu_kernel_duration_ns"] == 20400.0
         assert attribution["tensor_condensation"]["launches"] == 3
         assert attribution["tensor_condensation"]["duration_ns"] == 6000.0
         assert attribution["import_command"][-2:] == [
@@ -473,7 +577,15 @@ else:
             attribution["tensor_condensation"][
                 "fraction_of_gpu_kernel_duration"
             ],
-            6000.0 / 15900.0,
+            6000.0 / 20400.0,
+        )
+        assert attribution["tensor_volume_assembly"]["launches"] == 3
+        assert attribution["tensor_volume_assembly"]["duration_ns"] == 4500.0
+        assert math.isclose(
+            attribution["tensor_volume_assembly"][
+                "fraction_of_gpu_kernel_duration"
+            ],
+            4500.0 / 20400.0,
         )
         assert set(attribution["required_categories"]) <= {
             item["category"] for item in attribution["categories"]
@@ -563,6 +675,22 @@ else:
         assert missing_category_manifest["outcome"] == "validation_failure"
         assert "missing material accepted-step categories" in \
             missing_category_manifest["detail"]
+
+        missing_volume_out = root / "qualification-attribution-missing-volume"
+        run(
+            *qualification_arguments(
+                missing_volume_out, "accepted-step-attribution"
+            ),
+            expected=6,
+            env={
+                **qualification_env,
+                "FAKE_NCU_ATTRIBUTION": "1",
+                "FAKE_NCU_MISSING_VOLUME": "1",
+            },
+        )
+        assert "no positive tensor-volume contraction" in read_manifest(
+            missing_volume_out
+        )["detail"]
 
         nsys_application = [
             "--arg=--mode", "--arg", "conventional",
@@ -714,6 +842,22 @@ else:
             wrong_total_out
         )["detail"]
 
+        wrong_volume_total_out = root / "qualification-wrong-volume-dmma-total"
+        run(
+            *qualification_arguments(
+                wrong_volume_total_out, "tensor-volume-instructions"
+            ),
+            expected=6,
+            env={
+                **qualification_env,
+                "FAKE_NCU_VOLUME": "1",
+                "FAKE_NCU_WRONG_TOTAL": "1",
+            },
+        )
+        assert "tensor-volume-contraction DMMA work" in read_manifest(
+            wrong_volume_total_out
+        )["detail"]
+
         truncated_out = root / "qualification-truncated-launches"
         run(
             *qualification_arguments(truncated_out), expected=6,
@@ -722,7 +866,8 @@ else:
                 "FAKE_APP_CONDENSATION_LAUNCHES": "4",
             },
         )
-        assert "does not match the profiled accepted step's 4 tensor launches" \
+        assert "does not match the profiled accepted step's 4 " \
+            "fused-local-algebra-condensation launches" \
             in read_manifest(truncated_out)["detail"]
 
         bad_report_out = root / "qualification-bad-report"

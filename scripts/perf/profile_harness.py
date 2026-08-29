@@ -44,12 +44,19 @@ RESERVED_ARTIFACTS = frozenset({
     "nsys-cuda-gpu-mem-size-sum.stderr.txt",
 })
 EXIT_VALIDATION_FAILURE = 6
+UINT64_MAX = (1 << 64) - 1
 NCU_DMMA_METRIC = "sm__inst_executed_pipe_fp64_op_dmma.sum"
 NCU_DURATION_METRIC = "gpu__time_duration.avg"
 NCU_CONDENSATION_KERNEL = "TensorBorrowedCondenseKernel"
 NCU_CONDENSATION_FILTER = f"regex:.*{NCU_CONDENSATION_KERNEL}.*"
 NCU_CONDENSATION_NVTX_RANGE = "HDG/condensation/"
+NCU_VOLUME_KERNEL = "BorrowedEulerTensorVolumeContractionKernel"
+NCU_VOLUME_FILTER = f"regex:.*{NCU_VOLUME_KERNEL}.*"
+NCU_VOLUME_NVTX_RANGE = "HDG/local-assembly/"
 NCU_ACCEPTED_STEP_NVTX_RANGE = "HDG/profiled-accepted-step/"
+NCU_INSTRUCTION_QUALIFICATION_KINDS = frozenset({
+    "tensor-instructions", "tensor-volume-instructions",
+})
 PRODUCTION_TRACE_POLICY = "engine-default"
 NCU_ATTRIBUTION_RANGES = {
     "HDG/local-assembly": "local_assembly",
@@ -640,10 +647,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ncu-target-processes", choices=("application-only", "all"), default="")
     parser.add_argument(
         "--ncu-qualification-kind",
-        choices=("tensor-instructions", "accepted-step-attribution"),
+        choices=("tensor-instructions", "tensor-volume-instructions",
+                 "accepted-step-attribution"),
         default="",
-        help=("Required for NCU qualification: exact tensor instruction proof "
-              "or duration-only accepted-step category attribution."),
+        help=("Required for NCU qualification: exact condensation or volume "
+              "tensor-instruction proof, or duration-only accepted-step "
+              "category attribution."),
     )
     parser.add_argument("--ncu-section", action="append", default=[], help="Explicit NCU section; repeat as needed.")
     parser.add_argument("--ncu-metric", action="append", default=[], help="One exact NCU metric; repeat as needed.")
@@ -740,23 +749,30 @@ def validate_ncu_qualification_inputs(parser: argparse.ArgumentParser,
         parser.error("NCU qualification requires a positive --ncu-launch-count")
     if args.ncu_launch_skip != 0:
         parser.error("NCU qualification forbids --ncu-launch-skip")
-    if args.ncu_qualification_kind == "tensor-instructions":
+    if args.ncu_qualification_kind in NCU_INSTRUCTION_QUALIFICATION_KINDS:
         if set(args.ncu_metric) != {NCU_DMMA_METRIC, NCU_DURATION_METRIC} or \
                 len(args.ncu_metric) != 2:
             parser.error(
                 "tensor-instruction qualification requires exactly the DMMA "
                 "instruction and GPU duration metrics"
             )
-        if args.ncu_kernel_name != NCU_CONDENSATION_FILTER:
+        volume = args.ncu_qualification_kind == \
+            "tensor-volume-instructions"
+        expected_filter = NCU_VOLUME_FILTER if volume \
+            else NCU_CONDENSATION_FILTER
+        expected_range = NCU_VOLUME_NVTX_RANGE if volume \
+            else NCU_CONDENSATION_NVTX_RANGE
+        hotspot = "volume contraction" if volume else "condensation"
+        if args.ncu_kernel_name != expected_filter:
             parser.error(
                 "tensor-instruction qualification requires the exact tensor "
-                "condensation kernel filter"
+                f"{hotspot} kernel filter"
             )
-        if normalized_nvtx != NCU_CONDENSATION_NVTX_RANGE or \
+        if normalized_nvtx != expected_range or \
                 args.ncu_nvtx_exclude:
             parser.error(
                 "tensor-instruction qualification requires only the HDG "
-                "condensation NVTX include range"
+                f"{hotspot} NVTX include range"
             )
     elif args.ncu_qualification_kind == "accepted-step-attribution":
         if args.ncu_metric != [NCU_DURATION_METRIC]:
@@ -1088,7 +1104,9 @@ def ncu_import_command(tool: str, report: Path) -> list[str]:
     ]
 
 
-def parse_ncu_tensor_csv(data: bytes, expected_launches: int) -> dict[str, Any]:
+def parse_ncu_tensor_csv(data: bytes, expected_launches: int,
+                         kernel_substring: str) -> tuple[
+        dict[str, Any], list[float]]:
     try:
         text = data.decode("utf-8", errors="strict")
         rows = list(csv.reader(io.StringIO(text)))
@@ -1125,7 +1143,7 @@ def parse_ncu_tensor_csv(data: bytes, expected_launches: int) -> dict[str, Any]:
         kernel = row[kernel_column].strip()
         if not kernel or kernel == "Kernel Name":
             continue
-        if NCU_CONDENSATION_KERNEL not in kernel:
+        if kernel_substring not in kernel:
             # Units and tool preambles are not kernel rows. A numeric metric makes
             # this a real, unexpected data row and invalidates the exact filter.
             try:
@@ -1143,36 +1161,51 @@ def parse_ncu_tensor_csv(data: bytes, expected_launches: int) -> dict[str, Any]:
         })
     if other_data_kernels:
         raise RuntimeError(
-            "NCU raw CSV contains kernels outside the exact condensation filter: "
+            "NCU raw CSV contains kernels outside the exact hotspot filter: "
             + ", ".join(other_data_kernels[:3])
         )
     if len(matched) != expected_launches:
         raise RuntimeError(
-            f"NCU raw CSV contains {len(matched)} tensor condensation launches; "
+            f"NCU raw CSV contains {len(matched)} {kernel_substring} launches; "
             f"expected {expected_launches}"
         )
     dmma_values = [row["dmma_instructions"] for row in matched]
     duration_values = [row["duration"] for row in matched]
-    return {
+    dmma_histogram = [
+        {
+            "dmma_instructions": value,
+            "launches": dmma_values.count(value),
+        }
+        for value in sorted(set(dmma_values))
+    ]
+    return ({
         "status": "positive_tensor_instruction_proof",
-        "kernel_substring": NCU_CONDENSATION_KERNEL,
+        "kernel_substring": kernel_substring,
         "matched_launches": len(matched),
         "dmma_metric": NCU_DMMA_METRIC,
         "dmma_instruction_total": sum(dmma_values),
         "dmma_instruction_minimum": min(dmma_values),
         "dmma_instruction_maximum": max(dmma_values),
+        "dmma_instruction_histogram": dmma_histogram,
         "duration_metric": NCU_DURATION_METRIC,
         "duration_unit": "nanoseconds",
         "raw_duration_unit_field": duration_unit or "empty (NCU 2024.1)",
         "duration_total": sum(duration_values),
         "duration_minimum": min(duration_values),
-    }
+    }, dmma_values)
 
 
 def exact_nonnegative_integer(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise RuntimeError(f"{label} must be a nonnegative integer")
     return value
+
+
+def exact_uint64(value: Any, label: str) -> int:
+    result = exact_nonnegative_integer(value, label)
+    if result > UINT64_MAX:
+        raise RuntimeError(f"{label} exceeds uint64")
+    return result
 
 
 def application_argument(args: argparse.Namespace, option: str) -> str:
@@ -1262,15 +1295,27 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
     tensor = selected[0].get("tensor_core")
     if not isinstance(tensor, dict):
         raise RuntimeError("selected benchmark sample has no tensor work summary")
-    condensation_launches = exact_nonnegative_integer(
+    condensation_launches = exact_uint64(
         tensor.get("condensation_launches"), "condensation launch count"
     )
-    mma_tiles = exact_nonnegative_integer(
+    mma_tiles = exact_uint64(
         tensor.get("mma_tiles"), "planned MMA tile count"
+    )
+    volume_assembly_launches = exact_uint64(
+        tensor.get("volume_assembly_launches"),
+        "tensor-volume assembly launch count",
+    )
+    volume_mma_tiles = exact_uint64(
+        tensor.get("volume_mma_tiles"),
+        "planned tensor-volume MMA tile count",
     )
     if condensation_launches <= 0 or mma_tiles <= 0:
         raise RuntimeError(
             "selected benchmark sample has no material tensor condensation work"
+        )
+    if volume_assembly_launches <= 0 or volume_mma_tiles <= 0:
+        raise RuntimeError(
+            "selected benchmark sample has no material tensor-volume work"
         )
     if not (
         tensor.get("selected_engine") == "tensor" and
@@ -1309,6 +1354,22 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(
             "profiled benchmark interior shape is inconsistent with its order, "
             "components, and element count"
+        )
+
+    volume_assembly_order = exact_nonnegative_integer(
+        record.get("volume_assembly_order"), "volume assembly order"
+    )
+    volume_points = exact_nonnegative_integer(
+        record.get("volume_points"), "volume point count"
+    )
+    expected_volume_assembly_order = 12 if expected_mode == "igr" \
+        else 2 * expected_order + 2
+    expected_volume_points = (expected_volume_assembly_order // 2 + 1) ** 2
+    if volume_assembly_order != expected_volume_assembly_order or \
+            volume_points != expected_volume_points:
+        raise RuntimeError(
+            "profiled benchmark volume quadrature differs from the exact "
+            "production numerical policy"
         )
 
     def tiles(count: int, width: int) -> int:
@@ -1353,6 +1414,71 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
             f"benchmark planned MMA total {mma_tiles} does not match the "
             f"independent fused-stage total {expected_mma_tiles}"
         )
+
+    # Independently reproduce the zero-allocation tensor-volume chunk plan and
+    # dynamic FP64 m8n8k4 work.  The output is a bounded shape histogram, not a
+    # per-launch trace.
+    coefficient_stride = 66 if expected_mode == "igr" else 44
+    workspace_doubles = interior_dofs * (trace_dofs + 1)
+    capacity_points = workspace_doubles // coefficient_stride
+    if capacity_points <= 0:
+        raise RuntimeError("profiled tensor-volume workspace has zero capacity")
+    chunk_points = volume_points if volume_points <= capacity_points else \
+        capacity_points - capacity_points % 4
+    if chunk_points <= 0 or \
+            (volume_points > capacity_points and chunk_points < 4):
+        raise RuntimeError(
+            "profiled tensor-volume workspace cannot form an MMA chunk"
+        )
+    volume_base_tiles = (
+        elements * interior_components * tiles(scalar_interior_dofs, 8) *
+        tiles(interior_dofs + 1, 8) * 3
+    )
+    remaining_points = volume_points
+    chunk_work: list[tuple[int, int, int]] = []
+    while remaining_points:
+        count = min(remaining_points, chunk_points)
+        if count <= 0 or count > capacity_points or \
+                (remaining_points > count and count % 4):
+            raise RuntimeError(
+                "profiled tensor-volume chunk plan is inconsistent"
+            )
+        groups = tiles(count, 4)
+        chunk_work.append((count, groups, volume_base_tiles * groups))
+        remaining_points -= count
+    per_assembly_volume_tiles = sum(item[2] for item in chunk_work)
+    expected_volume_tiles = (
+        per_assembly_volume_tiles * volume_assembly_launches
+    )
+    volume_contraction_launches = (
+        len(chunk_work) * volume_assembly_launches
+    )
+    if expected_volume_tiles > UINT64_MAX or \
+            volume_contraction_launches > UINT64_MAX or \
+            volume_mma_tiles != expected_volume_tiles:
+        raise RuntimeError(
+            f"benchmark planned tensor-volume MMA total {volume_mma_tiles} "
+            "does not match the independent shape/chunk total "
+            f"{expected_volume_tiles}"
+        )
+    chunk_histogram: list[dict[str, int]] = []
+    for count, groups, per_launch_tiles in chunk_work:
+        existing = next(
+            (item for item in chunk_histogram
+             if item["quadrature_points"] == count and
+             item["quadrature_groups"] == groups and
+             item["mma_tiles_per_launch"] == per_launch_tiles),
+            None,
+        )
+        if existing is None:
+            chunk_histogram.append({
+                "quadrature_points": count,
+                "quadrature_groups": groups,
+                "mma_tiles_per_launch": per_launch_tiles,
+                "launches_per_assembly": 1,
+            })
+        else:
+            existing["launches_per_assembly"] += 1
     return {
         "status": "complete_profiled_tensor_work",
         "profile_measured_step": measured_step,
@@ -1365,6 +1491,17 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         "planned_mma_tiles": mma_tiles,
         "planned_mma_tiles_by_fused_stage": selected_step,
         "all_intended_fused_stages_material": True,
+        "volume_assembly_order": volume_assembly_order,
+        "volume_points": volume_points,
+        "volume_coefficient_stride": coefficient_stride,
+        "volume_workspace_capacity_points": capacity_points,
+        "volume_chunk_points": chunk_points,
+        "volume_assembly_launches": volume_assembly_launches,
+        "volume_contraction_launches": volume_contraction_launches,
+        "planned_volume_mma_tiles_per_assembly":
+            per_assembly_volume_tiles,
+        "planned_volume_mma_tiles": volume_mma_tiles,
+        "planned_volume_contraction_launch_distribution": chunk_histogram,
         "fallback_count": 0,
         "execution_log": file_identity(log_path),
     }
@@ -1389,42 +1526,94 @@ def import_ncu_tensor_proof(args: argparse.Namespace, tool: str,
     if result.returncode:
         raise RuntimeError(f"NCU report import exited {result.returncode}")
     csv_data = regular_bytes(csv_path, args.out_dir)
-    expected_launches = int(application_work["condensation_launches"])
+    volume = args.ncu_qualification_kind == "tensor-volume-instructions"
+    if volume:
+        kernel_substring = NCU_VOLUME_KERNEL
+        hotspot = "tensor-volume-contraction"
+        expected_launches = int(
+            application_work["volume_contraction_launches"]
+        )
+        expected_instructions = int(
+            application_work["planned_volume_mma_tiles"]
+        )
+        assembly_launches = int(
+            application_work["volume_assembly_launches"]
+        )
+        expected_values = [
+            int(item["mma_tiles_per_launch"])
+            for item in application_work[
+                "planned_volume_contraction_launch_distribution"
+            ]
+            for _ in range(
+                int(item["launches_per_assembly"]) * assembly_launches
+            )
+        ]
+    else:
+        kernel_substring = NCU_CONDENSATION_KERNEL
+        hotspot = "fused-local-algebra-condensation"
+        expected_launches = int(application_work["condensation_launches"])
+        expected_instructions = int(application_work["planned_mma_tiles"])
+        expected_per_launch, remainder = divmod(
+            expected_instructions, expected_launches
+        )
+        if remainder:
+            raise RuntimeError(
+                "profiled condensation MMA work is not uniform by launch"
+            )
+        expected_values = [expected_per_launch] * expected_launches
     if args.ncu_launch_count != expected_launches:
         raise RuntimeError(
             f"NCU launch count {args.ncu_launch_count} does not match the "
-            f"profiled accepted step's {expected_launches} tensor launches"
+            f"profiled accepted step's {expected_launches} {hotspot} launches"
         )
-    proof = parse_ncu_tensor_csv(csv_data, expected_launches)
-    expected_instructions = int(application_work["planned_mma_tiles"])
-    expected_per_launch, remainder = divmod(
-        expected_instructions, expected_launches
+    proof, observed_values = parse_ncu_tensor_csv(
+        csv_data, expected_launches, kernel_substring
     )
     exact_dmma_work = (
-        expected_instructions <= 2 ** 53 and remainder == 0 and
+        len(expected_values) == expected_launches and
+        expected_instructions <= 2 ** 53 and
+        all(value <= 2 ** 53 for value in expected_values) and
+        sorted(observed_values) == sorted(
+            float(value) for value in expected_values
+        ) and
         proof["dmma_instruction_total"] == float(expected_instructions) and
-        proof["dmma_instruction_minimum"] == float(expected_per_launch) and
-        proof["dmma_instruction_maximum"] == float(expected_per_launch)
+        proof["dmma_instruction_minimum"] == float(min(expected_values)) and
+        proof["dmma_instruction_maximum"] == float(max(expected_values))
     )
     if not exact_dmma_work:
         raise RuntimeError(
-            "NCU DMMA total does not exactly match the profiled accepted step's "
-            "complete planned MMA work on every launch: observed total/min/max "
+            f"NCU {hotspot} DMMA work does not exactly match the profiled "
+            "accepted step's complete planned MMA work and launch "
+            "distribution: observed total/min/max "
             f"{proof['dmma_instruction_total']}/"
             f"{proof['dmma_instruction_minimum']}/"
             f"{proof['dmma_instruction_maximum']}, expected "
-            f"{expected_instructions}/{expected_per_launch}/"
-            f"{expected_per_launch}"
+            f"{expected_instructions}/{min(expected_values)}/"
+            f"{max(expected_values)}"
         )
     proof.update({
+        "qualified_hotspot": hotspot,
         "complete_planned_dmma_match": True,
-        "planned_dmma_by_fused_stage":
-            application_work["planned_mma_tiles_by_fused_stage"],
         "import_command": command,
         "report": file_identity(report),
         "csv": file_identity(csv_path),
         "import_stderr": file_identity(stderr_path),
     })
+    if volume:
+        proof.update({
+            "volume_assembly_order":
+                application_work["volume_assembly_order"],
+            "volume_points": application_work["volume_points"],
+            "planned_volume_mma_tiles_per_assembly":
+                application_work["planned_volume_mma_tiles_per_assembly"],
+            "planned_volume_contraction_launch_distribution":
+                application_work[
+                    "planned_volume_contraction_launch_distribution"
+                ],
+        })
+    else:
+        proof["planned_dmma_by_fused_stage"] = \
+            application_work["planned_mma_tiles_by_fused_stage"]
     artifacts = [csv_path, stderr_path]
     return proof, artifacts, {path: command for path in artifacts}
 
@@ -1480,8 +1669,10 @@ def parse_ncu_attribution_csv(data: bytes,
         "launches": 0, "duration_ns": 0.0,
     }
     kernel_totals: dict[str, dict[str, Any]] = {}
-    tensor_launches = 0
-    tensor_duration = 0.0
+    tensor_condensation_launches = 0
+    tensor_condensation_duration = 0.0
+    tensor_volume_launches = 0
+    tensor_volume_duration = 0.0
     launches = 0
     total_duration = 0.0
     outside_ranges: list[str] = []
@@ -1523,8 +1714,11 @@ def parse_ncu_attribution_csv(data: bytes,
         launches += 1
         total_duration += duration
         if NCU_CONDENSATION_KERNEL in kernel:
-            tensor_launches += 1
-            tensor_duration += duration
+            tensor_condensation_launches += 1
+            tensor_condensation_duration += duration
+        if NCU_VOLUME_KERNEL in kernel:
+            tensor_volume_launches += 1
+            tensor_volume_duration += duration
     if outside_ranges:
         raise RuntimeError(
             "NCU attribution contains launch data outside the exact accepted-step "
@@ -1549,9 +1743,15 @@ def parse_ncu_attribution_csv(data: bytes,
             "NCU attribution is missing material accepted-step categories: "
             + ", ".join(missing_categories)
         )
-    if tensor_launches <= 0 or tensor_duration <= 0.0:
+    if tensor_condensation_launches <= 0 or \
+            tensor_condensation_duration <= 0.0:
         raise RuntimeError(
             "NCU attribution contains no positive tensor condensation launch"
+        )
+    if tensor_volume_launches <= 0 or tensor_volume_duration <= 0.0:
+        raise RuntimeError(
+            "NCU attribution contains no positive tensor-volume contraction "
+            "launch"
         )
     categories = []
     for category, values in sorted(category_totals.items()):
@@ -1581,9 +1781,17 @@ def parse_ncu_attribution_csv(data: bytes,
         "required_categories": sorted(NCU_REQUIRED_ATTRIBUTION_CATEGORIES),
         "tensor_condensation": {
             "kernel_substring": NCU_CONDENSATION_KERNEL,
-            "launches": tensor_launches,
-            "duration_ns": tensor_duration,
-            "fraction_of_gpu_kernel_duration": tensor_duration / total_duration,
+            "launches": tensor_condensation_launches,
+            "duration_ns": tensor_condensation_duration,
+            "fraction_of_gpu_kernel_duration":
+                tensor_condensation_duration / total_duration,
+        },
+        "tensor_volume_assembly": {
+            "kernel_substring": NCU_VOLUME_KERNEL,
+            "launches": tensor_volume_launches,
+            "duration_ns": tensor_volume_duration,
+            "fraction_of_gpu_kernel_duration":
+                tensor_volume_duration / total_duration,
         },
         "kernel_totals": kernels,
         "scope_limitations": {
@@ -1624,6 +1832,17 @@ def import_ncu_attribution(args: argparse.Namespace, tool: str,
             f"the profiled benchmark: observed "
             f"{attribution['tensor_condensation']['launches']}, expected "
             f"{expected_tensor_launches}"
+        )
+    expected_volume_launches = int(
+        application_work["volume_contraction_launches"]
+    )
+    if attribution["tensor_volume_assembly"]["launches"] != \
+            expected_volume_launches:
+        raise RuntimeError(
+            "NCU accepted-step attribution tensor-volume launch count does "
+            "not match the profiled benchmark: observed "
+            f"{attribution['tensor_volume_assembly']['launches']}, expected "
+            f"{expected_volume_launches}"
         )
     attribution.update({
         "import_command": command,
@@ -1701,9 +1920,11 @@ def qualification_evidence_unchanged(args: argparse.Namespace,
                 execution_log:
             return False, "profiled benchmark execution log changed after validation"
         if args.level == "l2-ncu":
+            instruction_kind = args.ncu_qualification_kind in \
+                NCU_INSTRUCTION_QUALIFICATION_KINDS
             proof_name = (
                 "tensor_instruction_proof"
-                if args.ncu_qualification_kind == "tensor-instructions"
+                if instruction_kind
                 else "accepted_step_attribution"
             )
             proof = qualification.get(proof_name, {})
@@ -1902,8 +2123,8 @@ def main() -> int:
                         }
                         if args.level == "l2-ncu":
                             assert tool is not None
-                            if args.ncu_qualification_kind == \
-                                    "tensor-instructions":
+                            if args.ncu_qualification_kind in \
+                                    NCU_INSTRUCTION_QUALIFICATION_KINDS:
                                 proof_paths = [
                                     args.out_dir / "ncu-tensor-proof.csv",
                                     args.out_dir / "ncu-tensor-proof.stderr.txt",
@@ -1922,8 +2143,8 @@ def main() -> int:
                             artifact_commands.update(
                                 {path: import_command for path in proof_paths}
                             )
-                            if args.ncu_qualification_kind == \
-                                    "tensor-instructions":
+                            if args.ncu_qualification_kind in \
+                                    NCU_INSTRUCTION_QUALIFICATION_KINDS:
                                 tensor_proof, _, _ = import_ncu_tensor_proof(
                                     args, tool, application_work
                                 )
@@ -1933,10 +2154,13 @@ def main() -> int:
                                     "application_work": application_work,
                                     "tensor_instruction_proof": tensor_proof,
                                 }
+                                qualified_hotspot = tensor_proof[
+                                    "qualified_hotspot"
+                                ]
                                 detail = (
-                                    "qualified native NCU report proves complete "
-                                    "planned DMMA execution in the fused tensor "
-                                    "local-algebra/condensation kernel"
+                                    "qualified native NCU report proves "
+                                    "complete planned DMMA execution in the "
+                                    f"{qualified_hotspot} kernel"
                                 )
                             else:
                                 attribution, _, _ = import_ncu_attribution(
@@ -1950,8 +2174,8 @@ def main() -> int:
                                 }
                                 detail = (
                                     "qualified native NCU report attributes the "
-                                    "accepted-step GPU kernel duration and tensor "
-                                    "condensation fraction"
+                                    "accepted-step GPU kernel duration and the "
+                                    "tensor volume/condensation fractions"
                                 )
                         else:
                             assert tool is not None
