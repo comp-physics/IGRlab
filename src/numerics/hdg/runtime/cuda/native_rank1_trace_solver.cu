@@ -99,7 +99,15 @@ NativeTracePreconditionerUsesFixedSigmaJacobi(
       kind == NativeTracePreconditionerKind::
           element_overlap_schwarz_equilibrated_field_split_sigma_jacobi5_fp64 ||
       kind == NativeTracePreconditionerKind::
-          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64;
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_sigma_jacobi7_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64;
 }
 
 __host__ __device__ constexpr int NativeTraceFixedSigmaJacobiSweeps(
@@ -131,6 +139,16 @@ __host__ __device__ constexpr int NativeTraceFixedSigmaJacobiSweeps(
       element_overlap_schwarz_equilibrated_field_split_sigma_jacobi5_fp64:
   case NativeTracePreconditionerKind::
       element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64:
+    return native_trace_sigma_jacobi5_sweeps;
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_sigma_jacobi6_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64:
+    return 6;
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_sigma_jacobi7_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64:
     return native_trace_sigma_jacobi_maximum_sweeps;
   default:
     return 0;
@@ -149,7 +167,11 @@ __host__ __device__ constexpr bool NativeTraceFixedSigmaJacobiUsesWarp(
       kind == NativeTracePreconditionerKind::
           element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi4_fp64 ||
       kind == NativeTracePreconditionerKind::
-          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64;
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64;
 }
 
 __host__ __device__ constexpr NativeTracePreconditionerKind

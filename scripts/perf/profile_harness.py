@@ -132,6 +132,32 @@ FIXED_SIGMA_JACOBI_PROFILE_POLICIES = {
         "sigma_jacobi5_fp64",
         True,
     ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi6-fp64": FixedSigmaJacobiProfilePolicy(
+        6,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi6_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi6-fp64": FixedSigmaJacobiProfilePolicy(
+        6,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi6_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi7-fp64": FixedSigmaJacobiProfilePolicy(
+        7,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi7_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi7-fp64": FixedSigmaJacobiProfilePolicy(
+        7,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi7_fp64",
+        True,
+    ),
 }
 
 

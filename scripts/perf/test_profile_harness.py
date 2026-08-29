@@ -127,6 +127,34 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
             "sigma_jacobi5_fp64",
             True,
         ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi6-fp64": (
+            6,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi6_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi6-fp64": (
+            6,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi6_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi7-fp64": (
+            7,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi7_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi7-fp64": (
+            7,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi7_fp64",
+            True,
+        ),
     }
     assert PROFILE.FIXED_SIGMA_JACOBI_PROFILE_POLICIES == expected
     conventional_default = PROFILE._profile_trace_policy_contract(
@@ -157,7 +185,13 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
     assert rejected(
         PROFILE._profile_trace_policy_contract,
         "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
-        "sigma-jacobi4-fp64-extra",
+        "sigma-jacobi7-fp64-extra",
+        "igr",
+    )
+    assert rejected(
+        PROFILE._profile_trace_policy_contract,
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi8-fp64",
         "igr",
     )
     for policy, descriptor in expected.items():
@@ -199,7 +233,7 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
         assert rejected(
             PROFILE._validated_fixed_sigma_jacobi_work, no_work, contract
         ), policy
-        if descriptor[0] == 5:
+        if descriptor[0] == 7:
             overflowing = {
                 **tensor,
                 "element_schwarz_preconditioner_applications":
@@ -884,11 +918,11 @@ else:
         assert "expected 'engine-default'" in ablation_trace_policy_error
 
         fixed_trace_policy_arguments = qualification_arguments(
-            root / "qualification-fixed-sigma-jacobi4-trace-policy"
+            root / "qualification-fixed-sigma-jacobi7-trace-policy"
         )
         fixed_trace_policy = (
             "native-element-schwarz-matrix-free-warp-"
-            "equilibrated-field-split-sigma-jacobi4-fp64"
+            "equilibrated-field-split-sigma-jacobi7-fp64"
         )
         fixed_trace_policy_arguments[
             fixed_trace_policy_arguments.index("engine-default")

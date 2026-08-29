@@ -354,7 +354,15 @@ enum class CudaTracePolicyKind : std::uint8_t
   native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi5_fp64 =
       16,
   native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi5_fp64 =
-      17
+      17,
+  native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi6_fp64 =
+      18,
+  native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi6_fp64 =
+      19,
+  native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi7_fp64 =
+      20,
+  native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi7_fp64 =
+      21
 };
 
 constexpr bool IsKnownCudaTracePolicyKind(
@@ -391,7 +399,15 @@ constexpr bool IsKnownCudaTracePolicyKind(
       kind == CudaTracePolicyKind::
           native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi5_fp64 ||
       kind == CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi5_fp64;
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi5_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi7_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi7_fp64;
 }
 
 constexpr const char* CudaTracePolicyKindName(
@@ -448,6 +464,18 @@ constexpr const char* CudaTracePolicyKindName(
   case CudaTracePolicyKind::
       native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi5_fp64:
     return "native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi5-fp64";
+  case CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi6_fp64:
+    return "native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi6-fp64";
+  case CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi6_fp64:
+    return "native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi6-fp64";
+  case CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi7_fp64:
+    return "native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi7-fp64";
+  case CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi7_fp64:
+    return "native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi7-fp64";
   }
   return "unknown";
 }
@@ -701,7 +729,11 @@ enum class CudaTracePreconditionerKind : std::uint8_t
   native_element_schwarz_equilibrated_field_split_sigma_jacobi4_fp64 = 13,
   native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi4_fp64 = 14,
   native_element_schwarz_equilibrated_field_split_sigma_jacobi5_fp64 = 15,
-  native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64 = 16
+  native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64 = 16,
+  native_element_schwarz_equilibrated_field_split_sigma_jacobi6_fp64 = 17,
+  native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64 = 18,
+  native_element_schwarz_equilibrated_field_split_sigma_jacobi7_fp64 = 19,
+  native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64 = 20
 };
 
 /** Deterministic lifetime policy for a selected HYPRE ILU(0) factor. */
@@ -818,7 +850,15 @@ constexpr bool CudaTracePreconditionerIsNativeElementSchwarz(
       kind == CudaTracePreconditionerKind::
           native_element_schwarz_equilibrated_field_split_sigma_jacobi5_fp64 ||
       kind == CudaTracePreconditionerKind::
-          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64;
+          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_equilibrated_field_split_sigma_jacobi7_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64;
 }
 
 constexpr bool
@@ -848,7 +888,15 @@ CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
       kind == CudaTracePreconditionerKind::
           native_element_schwarz_equilibrated_field_split_sigma_jacobi5_fp64 ||
       kind == CudaTracePreconditionerKind::
-          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64;
+          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_equilibrated_field_split_sigma_jacobi7_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64;
 }
 
 /** Benchmark-only cooperative FP64 field-patch application. */
@@ -867,11 +915,16 @@ CudaTracePreconditionerIsNativeElementSchwarzWarpEquilibratedFieldSplit(
       kind == CudaTracePreconditionerKind::
           native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi4_fp64 ||
       kind == CudaTracePreconditionerKind::
-          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64;
+          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64;
 }
 
 inline constexpr int native_element_schwarz_sigma_jacobi3_sweeps = 3;
-inline constexpr int native_element_schwarz_sigma_jacobi_maximum_sweeps = 5;
+inline constexpr int native_element_schwarz_sigma_jacobi5_sweeps = 5;
+inline constexpr int native_element_schwarz_sigma_jacobi_maximum_sweeps = 7;
 inline constexpr double native_element_schwarz_sigma_jacobi_damping =
     0x1.5555555555555p-1;
 
@@ -897,7 +950,15 @@ constexpr bool CudaTracePreconditionerUsesFixedSigmaJacobi(
       kind == CudaTracePreconditionerKind::
           native_element_schwarz_equilibrated_field_split_sigma_jacobi5_fp64 ||
       kind == CudaTracePreconditionerKind::
-          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64;
+          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_equilibrated_field_split_sigma_jacobi7_fp64 ||
+      kind == CudaTracePreconditionerKind::
+          native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64;
 }
 
 constexpr int CudaTracePreconditionerFixedSigmaJacobiSweeps(
@@ -929,6 +990,16 @@ constexpr int CudaTracePreconditionerFixedSigmaJacobiSweeps(
       native_element_schwarz_equilibrated_field_split_sigma_jacobi5_fp64:
   case CudaTracePreconditionerKind::
       native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64:
+    return native_element_schwarz_sigma_jacobi5_sweeps;
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_equilibrated_field_split_sigma_jacobi6_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64:
+    return 6;
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_equilibrated_field_split_sigma_jacobi7_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64:
     return native_element_schwarz_sigma_jacobi_maximum_sweeps;
   default:
     return 0;
@@ -972,12 +1043,24 @@ CudaTracePreconditionerForFixedSigmaJacobiSweeps(
               native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi4_fp64
         : CudaTracePreconditionerKind::
               native_element_schwarz_equilibrated_field_split_sigma_jacobi4_fp64;
-  case native_element_schwarz_sigma_jacobi_maximum_sweeps:
+  case native_element_schwarz_sigma_jacobi5_sweeps:
     return warp
         ? CudaTracePreconditionerKind::
               native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64
         : CudaTracePreconditionerKind::
               native_element_schwarz_equilibrated_field_split_sigma_jacobi5_fp64;
+  case 6:
+    return warp
+        ? CudaTracePreconditionerKind::
+              native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64
+        : CudaTracePreconditionerKind::
+              native_element_schwarz_equilibrated_field_split_sigma_jacobi6_fp64;
+  case native_element_schwarz_sigma_jacobi_maximum_sweeps:
+    return warp
+        ? CudaTracePreconditionerKind::
+              native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64
+        : CudaTracePreconditionerKind::
+              native_element_schwarz_equilibrated_field_split_sigma_jacobi7_fp64;
   default:
     return CudaTracePreconditionerKind::unconfigured;
   }
@@ -1012,7 +1095,15 @@ constexpr bool CudaTracePolicyUsesNativeElementMatrixFreeOperator(
       kind == CudaTracePolicyKind::
           native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi5_fp64 ||
       kind == CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi5_fp64;
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi5_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi7_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi7_fp64;
 }
 
 /** Exact matrix-free/operator and equilibrated-field-split pairing. */
@@ -1043,7 +1134,15 @@ CudaTracePolicyUsesNativeElementMatrixFreeEquilibratedFieldSplit(
       kind == CudaTracePolicyKind::
           native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi5_fp64 ||
       kind == CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi5_fp64;
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi5_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi7_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi7_fp64;
 }
 
 /** Exact matrix-free/operator and cooperative field-split pairing. */
@@ -1062,7 +1161,11 @@ CudaTracePolicyUsesNativeElementMatrixFreeWarpEquilibratedFieldSplit(
       kind == CudaTracePolicyKind::
           native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi4_fp64 ||
       kind == CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi5_fp64;
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi5_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi7_fp64;
 }
 
 constexpr int CudaTracePolicyFixedSigmaJacobiSweeps(
@@ -1094,6 +1197,16 @@ constexpr int CudaTracePolicyFixedSigmaJacobiSweeps(
       native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi5_fp64:
   case CudaTracePolicyKind::
       native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi5_fp64:
+    return native_element_schwarz_sigma_jacobi5_sweeps;
+  case CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi6_fp64:
+  case CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi6_fp64:
+    return 6;
+  case CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi7_fp64:
+  case CudaTracePolicyKind::
+      native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi7_fp64:
     return native_element_schwarz_sigma_jacobi_maximum_sweeps;
   default:
     return 0;
@@ -1151,6 +1264,14 @@ constexpr int CudaIluLevelOfFill(
       native_element_schwarz_equilibrated_field_split_sigma_jacobi5_fp64:
   case CudaTracePreconditionerKind::
       native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_equilibrated_field_split_sigma_jacobi6_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_equilibrated_field_split_sigma_jacobi7_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64:
   case CudaTracePreconditionerKind::unconfigured:
     break;
   }
@@ -1192,6 +1313,14 @@ constexpr int CudaIluLocalReordering(
       native_element_schwarz_equilibrated_field_split_sigma_jacobi5_fp64:
   case CudaTracePreconditionerKind::
       native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_equilibrated_field_split_sigma_jacobi6_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_equilibrated_field_split_sigma_jacobi7_fp64:
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64:
   case CudaTracePreconditionerKind::unconfigured:
     break;
   }
@@ -1316,6 +1445,18 @@ constexpr const char* CudaTracePreconditionerName(
   case CudaTracePreconditionerKind::
       native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64:
     return "native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64";
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_equilibrated_field_split_sigma_jacobi6_fp64:
+    return "native_element_schwarz_equilibrated_field_split_sigma_jacobi6_fp64";
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64:
+    return "native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64";
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_equilibrated_field_split_sigma_jacobi7_fp64:
+    return "native_element_schwarz_equilibrated_field_split_sigma_jacobi7_fp64";
+  case CudaTracePreconditionerKind::
+      native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64:
+    return "native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64";
   case CudaTracePreconditionerKind::unconfigured:
     break;
   }
@@ -1421,7 +1562,7 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
   // retains the exact global FP64 CSR action; the separately typed combined
   // policy selects the exact element-Schur action.  The separately typed
   // sigma-Jacobi policies retain that same action and lower factorization,
-  // then apply one through five fixed damped global sigma-row corrections
+  // then apply one through seven fixed damped global sigma-row corrections
   // inside the native preconditioner.  All retain the same FP64 outer GMRES
   // and true-residual
   // authority, and none has a fallback.
@@ -1438,7 +1579,11 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
       selection == CudaTracePolicyKind::
           native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi4_fp64 ||
       selection == CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi5_fp64)
+          native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi5_fp64 ||
+      selection == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      selection == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_equilibrated_field_split_sigma_jacobi7_fp64)
   {
     if (engine != generic::CudaEngineKind::tensor_core || !igr_active)
       return result;
@@ -1471,7 +1616,11 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
       selection == CudaTracePolicyKind::
           native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi4_fp64 ||
       selection == CudaTracePolicyKind::
-          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi5_fp64)
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi5_fp64 ||
+      selection == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      selection == CudaTracePolicyKind::
+          native_element_schwarz_matrix_free_warp_equilibrated_field_split_sigma_jacobi7_fp64)
   {
     if (engine != generic::CudaEngineKind::tensor_core || !igr_active)
       return result;

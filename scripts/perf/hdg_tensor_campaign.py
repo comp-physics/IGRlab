@@ -270,6 +270,32 @@ FIXED_SIGMA_JACOBI_POLICY = {
         "sigma_jacobi5_fp64",
         True,
     ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi6-fp64": FixedSigmaJacobiPolicy(
+        6,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi6_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi6-fp64": FixedSigmaJacobiPolicy(
+        6,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi6_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi7-fp64": FixedSigmaJacobiPolicy(
+        7,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi7_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi7-fp64": FixedSigmaJacobiPolicy(
+        7,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi7_fp64",
+        True,
+    ),
 }
 for _fixed_policy, (_fixed_sweeps, _fixed_preconditioner, _fixed_warp) in \
         FIXED_SIGMA_JACOBI_POLICY.items():
@@ -1884,6 +1910,11 @@ def validate_final_sample(sample: Any, *, engine: str, mode: str, order: int,
     )
     expected_sigma_jacobi_damping = 2.0 / 3.0 \
         if expected_fixed_sigma_jacobi else 0.0
+    if expected_sigma_jacobi_sweeps > 0 and \
+            schwarz_counters[
+                "element_schwarz_preconditioner_applications"
+            ] > UINT64_MAX // expected_sigma_jacobi_sweeps:
+        raise CampaignError("fixed-sigma Jacobi aggregate work exceeds uint64")
     expected_sigma_jacobi_updates = (
         schwarz_counters["element_schwarz_preconditioner_applications"] *
         expected_sigma_jacobi_sweeps

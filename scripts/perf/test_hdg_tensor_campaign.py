@@ -156,7 +156,15 @@ parser.add_argument(
              "native-element-schwarz-matrix-free-equilibrated-field-split-"
              "sigma-jacobi5-fp64",
              "native-element-schwarz-matrix-free-warp-equilibrated-field-"
-             "split-sigma-jacobi5-fp64"),
+             "split-sigma-jacobi5-fp64",
+             "native-element-schwarz-matrix-free-equilibrated-field-split-"
+             "sigma-jacobi6-fp64",
+             "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+             "split-sigma-jacobi6-fp64",
+             "native-element-schwarz-matrix-free-equilibrated-field-split-"
+             "sigma-jacobi7-fp64",
+             "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+             "split-sigma-jacobi7-fp64"),
 )
 parser.add_argument("--order", required=True, type=int)
 parser.add_argument("--mesh-n", required=True, type=int)
@@ -245,6 +253,32 @@ fixed_sigma_jacobi_policies = {
         5,
         "native_element_schwarz_warp_equilibrated_field_split_"
         "sigma_jacobi5_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi6-fp64": (
+        6,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi6_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi6-fp64": (
+        6,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi6_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi7-fp64": (
+        7,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi7_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi7-fp64": (
+        7,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi7_fp64",
         True,
     ),
 }
@@ -1660,6 +1694,38 @@ def main() -> int:
                 "flight_recorder", "replay",
             })
 
+        expected_fixed_sigma_policy_names = {
+            "native-element-schwarz-matrix-free-equilibrated-field-split-"
+            "sigma-jacobi1-fp64",
+            "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+            "split-sigma-jacobi1-fp64",
+            "native-element-schwarz-matrix-free-equilibrated-field-split-"
+            "sigma-jacobi2-fp64",
+            "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+            "split-sigma-jacobi2-fp64",
+            "native-element-schwarz-matrix-free-equilibrated-field-split-"
+            "sigma-jacobi3-fp64",
+            "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+            "split-sigma-jacobi3-fp64",
+            "native-element-schwarz-matrix-free-equilibrated-field-split-"
+            "sigma-jacobi4-fp64",
+            "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+            "split-sigma-jacobi4-fp64",
+            "native-element-schwarz-matrix-free-equilibrated-field-split-"
+            "sigma-jacobi5-fp64",
+            "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+            "split-sigma-jacobi5-fp64",
+            "native-element-schwarz-matrix-free-equilibrated-field-split-"
+            "sigma-jacobi6-fp64",
+            "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+            "split-sigma-jacobi6-fp64",
+            "native-element-schwarz-matrix-free-equilibrated-field-split-"
+            "sigma-jacobi7-fp64",
+            "native-element-schwarz-matrix-free-warp-equilibrated-field-"
+            "split-sigma-jacobi7-fp64",
+        }
+        assert set(CAMPAIGN.FIXED_SIGMA_JACOBI_POLICY) == \
+            expected_fixed_sigma_policy_names
         fixed_sigma_policy_specs = tuple(
             (
                 policy,
@@ -1743,7 +1809,9 @@ def main() -> int:
             for field, value in (
                     ("trace_field_split_sigma_jacobi_sweeps",
                      1 if fixed_sweeps != 1 else 2),
-                    ("trace_field_split_sigma_jacobi_damping", 0.5)):
+                    ("trace_field_split_sigma_jacobi_damping", 0.5),
+                    ("trace_field_split_sigma_jacobi_damping",
+                     float("nan"))):
                 invalid_fixed = copy.deepcopy(fixed_record)
                 invalid_fixed[field] = value
                 assert fixed_rejected(invalid_fixed), field
@@ -1751,11 +1819,39 @@ def main() -> int:
                     ("field_split_sigma_jacobi_sweeps",
                      1 if fixed_sweeps != 1 else 2),
                     ("field_split_sigma_jacobi_damping", 0.5),
+                    ("field_split_sigma_jacobi_damping", float("nan")),
                     ("field_split_sigma_jacobi_updates",
-                     9 * fixed_sweeps - 1)):
+                     9 * fixed_sweeps - 1),
+                    ("field_split_sigma_jacobi_updates",
+                     CAMPAIGN.UINT64_MAX + 1)):
                 invalid_fixed = copy.deepcopy(fixed_record)
                 invalid_fixed["samples"][0]["tensor_core"][field] = value
                 assert fixed_rejected(invalid_fixed), field
+
+        for unsupported_fixed_policy in (
+                "native-element-schwarz-matrix-free-warp-"
+                "equilibrated-field-split-sigma-jacobi7-fp64-extra",
+                "native-element-schwarz-matrix-free-warp-"
+                "equilibrated-field-split-sigma-jacobi8-fp64"):
+            try:
+                CAMPAIGN.final_command(
+                    final,
+                    engine="tensor",
+                    mode="igr",
+                    order=2,
+                    mesh_n=12,
+                    domain_periods=3,
+                    timestep=1.0e-5,
+                    export=False,
+                    expected_build=explicit_build,
+                    trace_policy=unsupported_fixed_policy,
+                )
+            except CAMPAIGN.CampaignError:
+                pass
+            else:
+                raise AssertionError(
+                    "campaign admitted a non-exact fixed-sigma policy"
+                )
 
         def combined_rejected(record: dict) -> bool:
             try:
