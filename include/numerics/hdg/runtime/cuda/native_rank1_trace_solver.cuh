@@ -25,11 +25,43 @@ namespace dg::hdg::runtime::cuda_w8a::detail
 inline constexpr std::uint32_t native_trace_control_schema = 1;
 inline constexpr int native_trace_cooperative_threads = 256;
 inline constexpr int native_trace_ilu_jacobi_iterations = 5;
+inline constexpr int native_trace_sigma_jacobi3_sweeps = 3;
+inline constexpr int native_trace_sigma_jacobi5_sweeps = 5;
+inline constexpr int native_trace_sigma_jacobi7_sweeps = 7;
+inline constexpr int native_trace_sigma_jacobi_maximum_sweeps = 10;
+inline constexpr double native_trace_sigma_jacobi_damping =
+    0x1.5555555555555p-1;
 
 enum class NativeTracePreconditionerKind : std::int32_t
 {
   diagonal = 1,
-  ilu0_rcm_jacobi = 2
+  ilu0_rcm_jacobi = 2,
+  element_overlap_schwarz_fp64 = 3,
+  element_overlap_schwarz_equilibrated_field_split_fp64 = 4,
+  element_overlap_schwarz_warp_equilibrated_field_split_fp64 = 5,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64 = 6,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64 = 7,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi1_fp64 = 8,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi1_fp64 = 9,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi2_fp64 = 10,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64 = 11,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi4_fp64 = 12,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi4_fp64 = 13,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi5_fp64 = 14,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64 = 15,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi6_fp64 = 16,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64 = 17,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi7_fp64 = 18,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64 = 19,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi8_fp64 = 20,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi8_fp64 = 21,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi9_fp64 = 22,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi9_fp64 = 23,
+  element_overlap_schwarz_equilibrated_field_split_sigma_jacobi10_fp64 = 24,
+  element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64 = 25,
+  element_overlap_schwarz_warp_coupled_fp64 = 26,
+  element_overlap_schwarz_warp_coupled_sigma_jacobi2_fp64 = 27,
+  element_overlap_schwarz_warp_coupled_sigma_jacobi10_fp64 = 28
 };
 
 enum class NativeTraceSolveStatus : std::int32_t
@@ -60,12 +92,25 @@ struct NativeTraceCsrView final
   int nonzeros = 0;
 };
 
+enum class NativeTraceOperatorKind : std::int32_t
+{
+  assembled_csr_fp64 = 1,
+  element_matrix_free_fp64 = 2,
+  element_matrix_free_equilibrated_field_split_fp64 = 3,
+  element_matrix_free_warp_equilibrated_field_split_fp64 = 4
+};
+
 /** Current true-trace system and HYPRE-owned solution storage. */
 struct NativeTraceSystemView final
 {
   NativeTraceCsrView matrix{};
   const double* rhs = nullptr;
   double* solution = nullptr;
+  NativeTraceOperatorKind operator_kind =
+      NativeTraceOperatorKind::assembled_csr_fp64;
+  // Retained row-major [element][row][column] Schur blocks. Maps and the
+  // persistent element-action scratch are shared with the exact Schwarz view.
+  const double* element_schur = nullptr;
 };
 
 /**
@@ -85,11 +130,29 @@ struct NativeTraceIlu0View final
   int upper_jacobi_iterations = 0;
 };
 
+/** Persistent exact principal patches and their pivoted FP64 factors. */
+struct NativeTraceElementSchwarzView final
+{
+  const double* patch_matrix = nullptr;
+  const double* patch_lu = nullptr;
+  const int* pivots = nullptr;
+  const int* signed_element_true_dofs = nullptr;
+  const int* true_incidence_slots = nullptr;
+  double* element_rhs = nullptr;
+  double* element_solution = nullptr;
+  int elements = 0;
+  int patch_rows = 0;
+  int true_rows = 0;
+  int minimum_multiplicity = 0;
+  int maximum_multiplicity = 0;
+};
+
 struct NativeTracePreconditionerView final
 {
   NativeTracePreconditionerKind kind =
       NativeTracePreconditionerKind::diagonal;
   NativeTraceIlu0View ilu0{};
+  NativeTraceElementSchwarzView element_schwarz{};
 };
 
 /** Pinned HYPRE GMRES policy; all other convergence switches are fixed off. */
@@ -116,6 +179,7 @@ struct alignas(8) NativeTraceSolveControl final
   int iterations = 0;
   int restart_cycles = 0;
   int preconditioner_applications = 0;
+  int operator_applications = 0;
   int actual_residual_checks = 0;
   double rhs_norm = 0.0;
   double initial_residual_norm = 0.0;
@@ -156,6 +220,10 @@ struct NativeTraceWorkspaceView final
 struct NativeTraceCooperativeSupport final
 {
   bool supported = false;
+  /** Exact kernel specialization whose occupancy produced this record. */
+  bool fixed_sigma_jacobi = false;
+  /** Exact cooperative fully coupled patch specialization identity. */
+  bool coupled_warp_full_patch = false;
   int device = -1;
   int compute_major = 0;
   int compute_minor = 0;
@@ -227,6 +295,7 @@ inline bool NativeTraceResultIsReadyForTrueResidual(
       result.iterations < 0 ||
       result.iterations > policy.maximum_iterations ||
       result.restart_cycles < 0 || result.preconditioner_applications < 0 ||
+      result.operator_applications < 0 ||
       result.actual_residual_checks <= 0 ||
       !std::isfinite(result.rhs_norm) || result.rhs_norm < 0.0 ||
       !std::isfinite(result.initial_residual_norm) ||
@@ -268,7 +337,9 @@ QueryNativeTraceWorkspaceRequirements(int rows, int krylov_dimension,
 
 extern "C" NativeTraceCooperativeSupport
 QueryNativeRankOneTraceCooperativeSupport(int rows, int krylov_dimension,
-                                          bool igr_active) noexcept;
+                                          bool igr_active,
+                                          bool fixed_sigma_jacobi,
+                                          bool coupled_warp_full_patch) noexcept;
 
 /** Queue exactly one cooperative kernel.  This call never copies or syncs. */
 extern "C" bool LaunchNativeRankOneTraceSolve(

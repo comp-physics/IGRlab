@@ -321,13 +321,18 @@ std::string CanonicalNumericalPolicy(
   stream << policy.volume_projection_quadrature_order << ';'
          << policy.true_trace_projection_quadrature_order << ';'
          << policy.conventional_assembly_quadrature_order << ';'
-         << policy.igr_assembly_quadrature_order << ';'
+         << policy.igr_assembly_quadrature_orders.volume_order << ';'
+         << policy.igr_assembly_quadrature_orders.face_order << ';'
          << policy.maximum_nonlinear_updates << ';'
          << policy.maximum_linear_iterations << ';'
          << policy.maximum_line_search_trials << ';'
          << static_cast<int>(policy.stabilization.kind) << ';';
   AppendDouble(stream, policy.nonlinear_relative_tolerance);
-  AppendDouble(stream, policy.linear_relative_tolerance);
+  AppendDouble(stream,
+               policy.newton_correction_linear_relative_tolerance);
+  AppendDouble(stream, policy.final_coherent_linear_relative_tolerance);
+  AppendDouble(
+      stream, policy.true_residual_tightening_linear_relative_tolerance);
   AppendDouble(stream, policy.true_residual_relative_tolerance);
   AppendDouble(stream, policy.conservation_relative_tolerance);
   AppendDouble(stream, policy.armijo_constant);

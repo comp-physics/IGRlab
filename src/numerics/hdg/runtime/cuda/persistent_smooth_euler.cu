@@ -1,8 +1,10 @@
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler.cuh"
 #include "numerics/hdg/runtime/cuda/native_rank1_trace_solver.cuh"
+#include "numerics/hdg/runtime/cuda/tensor_volume_layout.hpp"
 #include "physics/bc/detail/euler_boundary_state.hpp"
 
 #include <HYPRE_krylov.h>
+#include <HYPRE_parcsr_ls.h>
 #include <HYPRE_utilities.h>
 #include <_hypre_parcsr_ls.h>
 #include <_hypre_utilities.h>
@@ -25,6 +27,20 @@ namespace dg::hdg::runtime::cuda_w8a
 {
 namespace
 {
+static_assert(detail::native_trace_solve_status_invalid_preconditioner ==
+              static_cast<int>(
+                  detail::NativeTraceSolveStatus::invalid_preconditioner));
+static_assert(detail::native_trace_sigma_jacobi3_sweeps ==
+              native_element_schwarz_sigma_jacobi3_sweeps);
+static_assert(detail::native_trace_sigma_jacobi5_sweeps ==
+              native_element_schwarz_sigma_jacobi5_sweeps);
+static_assert(detail::native_trace_sigma_jacobi7_sweeps ==
+              native_element_schwarz_sigma_jacobi7_sweeps);
+static_assert(detail::native_trace_sigma_jacobi_maximum_sweeps ==
+              native_element_schwarz_sigma_jacobi_maximum_sweeps);
+static_assert(detail::native_trace_sigma_jacobi_damping ==
+              native_element_schwarz_sigma_jacobi_damping);
+
 std::atomic<std::uint64_t> allocation_events{0};
 std::atomic<std::uint64_t> w8_owned_allocation_calls{0};
 std::atomic<std::uint64_t> deallocation_events{0};
@@ -964,17 +980,380 @@ bool CudaGetTrueMatrixDeviceView(mfem::HypreParMatrix& matrix,
   catch (...) { return false; }
 }
 
+namespace
+{
+HYPRE_Int CudaRankOneMgrSetupCallback(
+    HYPRE_Solver opaque_state, HYPRE_ParCSRMatrix matrix,
+    HYPRE_ParVector rhs, HYPRE_ParVector solution)
+{
+  auto* const state = reinterpret_cast<CudaRankOneMgrState*>(opaque_state);
+  if (state == nullptr || !state->configured || state->mgr == nullptr ||
+      !state->setup_generation_pending ||
+      state->setup_calls == std::numeric_limits<std::uint64_t>::max())
+    return HYPRE_ERROR_GENERIC;
+  const HYPRE_Int result = HYPRE_MGRSetup(
+      state->mgr, matrix, rhs, solution);
+  if (result == 0 && HYPRE_GetError() == 0)
+  {
+    ++state->setup_calls;
+    state->last_setup_matrix_generation =
+        state->pending_matrix_generation;
+    state->has_setup_generation = true;
+  }
+  state->setup_generation_pending = false;
+  return result;
+}
+
+HYPRE_Int CudaRankOneMgrSolveCallback(
+    HYPRE_Solver opaque_state, HYPRE_ParCSRMatrix matrix,
+    HYPRE_ParVector rhs, HYPRE_ParVector solution)
+{
+  auto* const state = reinterpret_cast<CudaRankOneMgrState*>(opaque_state);
+  if (state == nullptr || !state->configured || state->mgr == nullptr ||
+      state->preconditioner_applications ==
+          std::numeric_limits<std::uint64_t>::max())
+    return HYPRE_ERROR_GENERIC;
+  ++state->preconditioner_applications;
+  return HYPRE_MGRSolve(state->mgr, matrix, rhs, solution);
+}
+} // namespace
+
+void CudaDestroyRankOneMgrState(CudaRankOneMgrState& state) noexcept
+{
+  // FlexGMRES and MGR retain, but do not own, their configured subordinate
+  // solver handles. Destroy in dependency order while every matrix/vector
+  // object that may have participated in setup is still alive.
+  if (state.fgmres != nullptr)
+    (void)HYPRE_ParCSRFlexGMRESDestroy(state.fgmres);
+  if (state.mgr != nullptr)
+    (void)HYPRE_MGRDestroy(state.mgr);
+  if (state.f_ilu != nullptr)
+    (void)HYPRE_ILUDestroy(state.f_ilu);
+  if (state.coarse_amg != nullptr)
+    (void)HYPRE_BoomerAMGDestroy(state.coarse_amg);
+  state = {};
+}
+
+bool CudaConfigureRankOneMgrState(
+    CudaRankOneMgrState& state, const MPI_Comm communicator,
+    const int rows, const int scalar_trace_dofs,
+    const double relative_tolerance, const int maximum_iterations,
+    const int krylov_dimension) noexcept
+{
+  CudaDestroyRankOneMgrState(state);
+  const bool inputs_exact = communicator != MPI_COMM_NULL && rows > 0 &&
+      scalar_trace_dofs > 0 &&
+      scalar_trace_dofs * igr_trace_components == rows &&
+      std::isfinite(relative_tolerance) && relative_tolerance > 0.0 &&
+      maximum_iterations > 0 && krylov_dimension > 0 &&
+      HYPRE_GetError() == 0;
+  if (!inputs_exact) return false;
+
+  try
+  {
+    state.point_markers.resize(static_cast<std::size_t>(rows));
+    for (int row = 0; row < rows; ++row)
+      state.point_markers[static_cast<std::size_t>(row)] =
+          static_cast<HYPRE_Int>(row / scalar_trace_dofs);
+    state.coarse_point_index_levels[0] =
+        state.coarse_point_indexes.data();
+
+    bool ok = HYPRE_ParCSRFlexGMRESCreate(
+                  communicator, &state.fgmres) == 0 &&
+        HYPRE_MGRCreate(&state.mgr) == 0 &&
+        HYPRE_ILUCreate(&state.f_ilu) == 0 &&
+        HYPRE_BoomerAMGCreate(&state.coarse_amg) == 0;
+    ok = ok && state.fgmres != nullptr && state.mgr != nullptr &&
+        state.f_ilu != nullptr && state.coarse_amg != nullptr &&
+        HYPRE_ParCSRFlexGMRESSetKDim(
+            state.fgmres, static_cast<HYPRE_Int>(krylov_dimension)) == 0 &&
+        HYPRE_ParCSRFlexGMRESSetTol(
+            state.fgmres, static_cast<HYPRE_Real>(relative_tolerance)) == 0 &&
+        HYPRE_ParCSRFlexGMRESSetAbsoluteTol(state.fgmres, 0.0) == 0 &&
+        HYPRE_ParCSRFlexGMRESSetMaxIter(
+            state.fgmres,
+            static_cast<HYPRE_Int>(maximum_iterations)) == 0 &&
+        HYPRE_ParCSRFlexGMRESSetLogging(state.fgmres, 1) == 0 &&
+        HYPRE_ParCSRFlexGMRESSetPrintLevel(state.fgmres, 0) == 0;
+
+    // The externally owned level-0 F solver removes HYPRE type-32's hidden
+    // tolerance-driven defaults. Every MGR application now has one fixed
+    // ILU(0) application with direct triangular solves; MGR setup refreshes
+    // that factor once for each current matrix generation.
+    ok = ok && HYPRE_ILUSetType(state.f_ilu, 0) == 0 &&
+        HYPRE_ILUSetLevelOfFill(state.f_ilu, 0) == 0 &&
+        HYPRE_ILUSetLocalReordering(state.f_ilu, 0) == 0 &&
+        HYPRE_ILUSetIterativeSetupType(state.f_ilu, 0) == 0 &&
+        HYPRE_ILUSetMaxIter(state.f_ilu, 1) == 0 &&
+        HYPRE_ILUSetTol(state.f_ilu, 0.0) == 0 &&
+        HYPRE_ILUSetTriSolve(state.f_ilu, 1) == 0 &&
+        HYPRE_ILUSetLowerJacobiIters(state.f_ilu, 0) == 0 &&
+        HYPRE_ILUSetUpperJacobiIters(state.f_ilu, 0) == 0 &&
+        HYPRE_ILUSetPrintLevel(state.f_ilu, 0) == 0 &&
+        HYPRE_ILUSetLogging(state.f_ilu, 0) == 0;
+    const auto* const f_ilu_data =
+        reinterpret_cast<const hypre_ParILUData*>(state.f_ilu);
+    ok = ok && f_ilu_data != nullptr &&
+        hypre_ParILUDataIluType(f_ilu_data) == 0 &&
+        hypre_ParILUDataLfil(f_ilu_data) == 0 &&
+        hypre_ParILUDataReorderingType(f_ilu_data) == 0 &&
+        hypre_ParILUDataIterativeSetupType(f_ilu_data) == 0 &&
+        hypre_ParILUDataMaxIter(f_ilu_data) == 1 &&
+        hypre_ParILUDataTol(f_ilu_data) == 0.0 &&
+        hypre_ParILUDataTriSolve(f_ilu_data) == 1 &&
+        hypre_ParILUDataLowerJacobiIters(f_ilu_data) == 0 &&
+        hypre_ParILUDataUpperJacobiIters(f_ilu_data) == 0 &&
+        hypre_ParILUDataPrintLevel(f_ilu_data) == 0;
+
+    // byNODES is component-major: Uhat occupies markers 0..3 and sigmahat
+    // marker 4. One MGR reduction retains sigmahat as the C field and treats
+    // every non-C point as an F point. The fixed tuple is intentionally an
+    // explicit baseline, not an adaptive or hidden fallback policy.
+    ok = ok && HYPRE_MGRSetCpointsByPointMarkerArray(
+        state.mgr, igr_trace_components, 1,
+        state.coarse_point_counts.data(),
+        state.coarse_point_index_levels.data(),
+        state.point_markers.data()) == 0 &&
+        HYPRE_MGRSetNonCpointsToFpoints(state.mgr, 1) == 0 &&
+        HYPRE_MGRSetMaxCoarseLevels(state.mgr, 1) == 0 &&
+        HYPRE_MGRSetFSolverAtLevel(
+            state.mgr, state.f_ilu, 0) == 0 &&
+        HYPRE_MGRSetBlockSize(state.mgr, igr_trace_components) == 0 &&
+        HYPRE_MGRSetLevelFRelaxType(
+            state.mgr, state.f_relax_types.data()) == 0 &&
+        HYPRE_MGRSetCoarseGridMethod(
+            state.mgr, state.coarse_grid_methods.data()) == 0 &&
+        // Non-Galerkin coarse methods 1--4 require injection restriction.
+        // Type 13 is CPR-like but is not implemented by HYPRE on the GPU.
+        HYPRE_MGRSetRestrictType(state.mgr, 0) == 0 &&
+        HYPRE_MGRSetInterpType(state.mgr, 2) == 0 &&
+        HYPRE_MGRSetNumRelaxSweeps(state.mgr, 1) == 0 &&
+        HYPRE_MGRSetMaxIter(state.mgr, 1) == 0 &&
+        HYPRE_MGRSetTol(state.mgr, 0.0) == 0 &&
+        HYPRE_MGRSetLogging(state.mgr, 0) == 0 &&
+        HYPRE_MGRSetPrintLevel(state.mgr, 0) == 0;
+
+    ok = ok && HYPRE_BoomerAMGSetMaxIter(state.coarse_amg, 1) == 0 &&
+        HYPRE_BoomerAMGSetTol(state.coarse_amg, 0.0) == 0 &&
+        HYPRE_BoomerAMGSetPrintLevel(state.coarse_amg, 0) == 0 &&
+        HYPRE_BoomerAMGSetLogging(state.coarse_amg, 0) == 0 &&
+        HYPRE_MGRSetCoarseSolver(
+            state.mgr, HYPRE_BoomerAMGSolve, HYPRE_BoomerAMGSetup,
+            state.coarse_amg) == 0;
+
+    // The callback data is this constant-size owner, allowing aggregate
+    // setup/application counts without retaining a callback event stream.
+    state.configured = ok && HYPRE_GetError() == 0;
+    ok = state.configured && HYPRE_ParCSRFlexGMRESSetPrecond(
+        state.fgmres, CudaRankOneMgrSolveCallback,
+        CudaRankOneMgrSetupCallback,
+        reinterpret_cast<HYPRE_Solver>(&state)) == 0 &&
+        HYPRE_GetError() == 0;
+    state.configured = ok;
+    if (ok)
+      state.configured_relative_tolerance = relative_tolerance;
+    if (!ok) CudaDestroyRankOneMgrState(state);
+    return ok;
+  }
+  catch (...)
+  {
+    CudaDestroyRankOneMgrState(state);
+    return false;
+  }
+}
+
+bool CudaSolveRankOneMgr(
+    CudaRankOneMgrState& state, mfem::HypreParMatrix& matrix,
+    mfem::HypreParVector& rhs, mfem::HypreParVector& solution,
+    const CudaTracePolicyDescriptor& policy,
+    const double relative_tolerance, const int maximum_iterations,
+    const int krylov_dimension, const std::uint64_t matrix_generation,
+    CudaSolveDiagnostics& diagnostics,
+    const bool same_matrix_retry) noexcept
+{
+  CudaTrueSystemDiagnosticScope diagnostic("rank1-equilibrated-mgr-solve",
+                                           matrix_generation);
+  diagnostics = {};
+  diagnostics.matrix_generation = matrix_generation;
+  diagnostics.trace_solver = CudaTraceSolverKind::hypre_fgmres_mgr_rank1;
+  diagnostics.trace_preconditioner = policy.trace_preconditioner;
+  diagnostics.igr_active = policy.igr_active;
+  diagnostics.krylov_dimension = krylov_dimension;
+  const bool exact_policy = CudaTracePolicyDescriptorIsExact(policy) &&
+      policy.resolved_selection == CudaTracePolicyKind::equilibrated_mgr &&
+      policy.selected_engine == generic::CudaEngineKind::tensor_core &&
+      policy.igr_active && policy.trace_preconditioner ==
+          CudaTracePreconditionerKind::hypre_mgr_field_split &&
+      std::isfinite(relative_tolerance) && relative_tolerance > 0.0 &&
+      maximum_iterations > 0 && krylov_dimension > 0;
+  const bool state_ready = exact_policy && state.configured &&
+      state.fgmres != nullptr && state.mgr != nullptr &&
+      state.f_ilu != nullptr && state.coarse_amg != nullptr &&
+      HYPRE_GetError() == 0 &&
+      !state.setup_generation_pending &&
+      (same_matrix_retry
+           ? state.has_setup_generation &&
+               matrix_generation == state.last_setup_matrix_generation
+           : !state.has_setup_generation ||
+               matrix_generation > state.last_setup_matrix_generation) &&
+      CudaHypreDevicePolicyValid(matrix, rhs, solution);
+  if (!state_ready) return false;
+
+  try
+  {
+    matrix.HypreRead();
+    rhs.HypreRead();
+    solution.HypreReadWrite();
+    const std::uint64_t setup_before = state.setup_calls;
+    const std::uint64_t applications_before =
+        state.preconditioner_applications;
+    HYPRE_ParCSRMatrix raw_matrix = reinterpret_cast<HYPRE_ParCSRMatrix>(
+        static_cast<hypre_ParCSRMatrix*>(matrix));
+    HYPRE_ParVector raw_rhs = reinterpret_cast<HYPRE_ParVector>(
+        static_cast<hypre_ParVector*>(rhs));
+    HYPRE_ParVector raw_solution = reinterpret_cast<HYPRE_ParVector>(
+        static_cast<hypre_ParVector*>(solution));
+    const std::uintptr_t matrix_token =
+        reinterpret_cast<std::uintptr_t>(raw_matrix);
+    const std::uintptr_t rhs_token =
+        reinterpret_cast<std::uintptr_t>(raw_rhs);
+    const std::uintptr_t solution_token =
+        reinterpret_cast<std::uintptr_t>(raw_solution);
+    const bool retained_objects_exact = !same_matrix_retry ||
+        (matrix_token != 0 && rhs_token != 0 && solution_token != 0 &&
+         state.setup_matrix_token == matrix_token &&
+         state.setup_rhs_token == rhs_token &&
+         state.setup_solution_token == solution_token);
+    if (!retained_objects_exact) return false;
+    const bool tolerance_configured =
+        HYPRE_ParCSRFlexGMRESSetTol(
+            state.fgmres,
+            static_cast<HYPRE_Real>(relative_tolerance)) == 0 &&
+        HYPRE_GetError() == 0;
+    if (!tolerance_configured) return false;
+    state.configured_relative_tolerance = relative_tolerance;
+    solution = 0.0;
+    solution.HypreReadWrite();
+    HYPRE_Int setup_result = 0;
+    if (!same_matrix_retry)
+    {
+      state.pending_matrix_generation = matrix_generation;
+      state.setup_generation_pending = true;
+      setup_result = HYPRE_ParCSRFlexGMRESSetup(
+          state.fgmres, raw_matrix, raw_rhs, raw_solution);
+    }
+    const bool setup_generation_exact = same_matrix_retry
+        ? !state.setup_generation_pending &&
+            state.has_setup_generation &&
+            state.last_setup_matrix_generation == matrix_generation &&
+            state.setup_calls == setup_before
+        : !state.setup_generation_pending &&
+            state.has_setup_generation &&
+            state.last_setup_matrix_generation == matrix_generation &&
+            setup_before != std::numeric_limits<std::uint64_t>::max() &&
+            state.setup_calls == setup_before + 1;
+    if (setup_result != 0 || HYPRE_GetError() != 0 ||
+        !setup_generation_exact)
+    {
+      state.setup_generation_pending = false;
+      return false;
+    }
+    if (!same_matrix_retry)
+    {
+      state.setup_matrix_token = matrix_token;
+      state.setup_rhs_token = rhs_token;
+      state.setup_solution_token = solution_token;
+    }
+    const HYPRE_Int solve_result = HYPRE_ParCSRFlexGMRESSolve(
+        state.fgmres, raw_matrix, raw_rhs, raw_solution);
+    const HYPRE_Int terminal_hypre_error = HYPRE_GetError();
+    const bool terminal_clean = terminal_hypre_error == 0 &&
+        solve_result == 0;
+    const bool terminal_pure_convergence =
+        terminal_hypre_error == HYPRE_ERROR_CONV &&
+        solve_result == HYPRE_ERROR_CONV;
+    bool terminal_error_cleared = terminal_clean && HYPRE_GetError() == 0;
+    if (terminal_pure_convergence)
+      terminal_error_cleared =
+          HYPRE_ClearError(HYPRE_ERROR_CONV) == 0 &&
+          HYPRE_GetError() == 0;
+    if (!(terminal_clean != terminal_pure_convergence) ||
+        !terminal_error_cleared)
+      return false;
+
+    HYPRE_Int iterations = -1;
+    HYPRE_Real reported_residual =
+        std::numeric_limits<HYPRE_Real>::infinity();
+    const bool observations_ready =
+        HYPRE_ParCSRFlexGMRESGetNumIterations(
+            state.fgmres, &iterations) == 0 &&
+        HYPRE_ParCSRFlexGMRESGetFinalRelativeResidualNorm(
+            state.fgmres, &reported_residual) == 0 &&
+        HYPRE_GetError() == 0;
+    const std::uint64_t application_delta =
+        state.preconditioner_applications - applications_before;
+    const bool callbacks_exact =
+        state.setup_calls == setup_before +
+            static_cast<std::uint64_t>(!same_matrix_retry) &&
+        state.preconditioner_applications >= applications_before &&
+        (iterations == 0 || application_delta > 0);
+    diagnostics.iterations = static_cast<int>(iterations);
+    diagnostics.reported_residual =
+        static_cast<double>(reported_residual);
+    diagnostics.mgr_setup_calls = state.setup_calls - setup_before;
+    diagnostics.mgr_preconditioner_applications =
+        application_delta;
+    // One reduction level plus MGR maxiter=1/type32 and the externally owned
+    // maxiter=1 ILU make these one-for-one fixed-control derivations from the
+    // observed outer MGR setup/application callbacks.
+    diagnostics.mgr_f_ilu_setups = diagnostics.mgr_setup_calls;
+    diagnostics.mgr_f_ilu_applications =
+        diagnostics.mgr_preconditioner_applications;
+    diagnostics.mgr_setup_reused = same_matrix_retry;
+    diagnostics.device_policy = observations_ready &&
+        CudaHypreDevicePolicyValid(matrix, rhs, solution);
+    diagnostics.configured_mgr = callbacks_exact &&
+        state.configured_relative_tolerance == relative_tolerance;
+    diagnostics.configured_preconditioner =
+        diagnostics.configured_mgr;
+    diagnostics.finite = observations_ready &&
+        std::isfinite(diagnostics.reported_residual);
+    diagnostics.reported_tolerance_met = diagnostics.finite &&
+        diagnostics.reported_residual <= relative_tolerance;
+    diagnostic.result = diagnostics.finite &&
+        CudaTraceSolveReadyForTrueResidualVerification(
+            diagnostics, maximum_iterations);
+    return diagnostic.result;
+  }
+  catch (...) { return false; }
+}
+
 bool CudaQueryNativeRankOneTraceResources(
     const int rows, const int krylov_dimension, const bool igr_active,
+    const CudaTracePreconditionerKind preconditioner_kind,
     CudaNativeTraceWorkspaceRequirements& requirements,
     CudaNativeTraceCooperativeSupport& support) noexcept
 {
   requirements = {};
   support = {};
+  // The robust descriptor is not a kernel specialization.  Its two exact
+  // effective leaves are queried independently by the persistent runtime.
+  if (CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+          preconditioner_kind))
+    return false;
+  const bool fixed_sigma_jacobi =
+      CudaTracePreconditionerUsesFixedSigmaJacobi(preconditioner_kind);
+  const bool coupled_warp_full_patch =
+      CudaTracePreconditionerIsNativeElementSchwarzWarpCoupled(
+          preconditioner_kind);
   const NativeTraceCooperativeSupport native_support =
       QueryNativeRankOneTraceCooperativeSupport(
-          rows, krylov_dimension, igr_active);
+          rows, krylov_dimension, igr_active, fixed_sigma_jacobi,
+          coupled_warp_full_patch);
   support.supported = native_support.supported;
+  support.fixed_sigma_jacobi = native_support.fixed_sigma_jacobi;
+  support.coupled_warp_full_patch =
+      native_support.coupled_warp_full_patch;
   support.device = native_support.device;
   support.compute_major = native_support.compute_major;
   support.compute_minor = native_support.compute_minor;
@@ -1004,27 +1383,186 @@ bool CudaQueryNativeRankOneTraceResources(
           NativeTraceControlDoubleSlots();
 }
 
+constexpr NativeTracePreconditionerKind NativeFixedSigmaJacobiPreconditioner(
+    const int sweeps, const bool warp) noexcept
+{
+  switch (sweeps)
+  {
+  case 1:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi1_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi1_fp64;
+  case 2:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi2_fp64;
+  case native_element_schwarz_sigma_jacobi3_sweeps:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64;
+  case 4:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi4_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi4_fp64;
+  case native_element_schwarz_sigma_jacobi5_sweeps:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi5_fp64;
+  case 6:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi6_fp64;
+  case native_element_schwarz_sigma_jacobi7_sweeps:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi7_fp64;
+  case 8:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi8_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi8_fp64;
+  case 9:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi9_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi9_fp64;
+  case native_element_schwarz_sigma_jacobi_maximum_sweeps:
+    return warp
+        ? NativeTracePreconditionerKind::
+              element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64
+        : NativeTracePreconditionerKind::
+              element_overlap_schwarz_equilibrated_field_split_sigma_jacobi10_fp64;
+  default:
+    return NativeTracePreconditionerKind::diagonal;
+  }
+}
+
+constexpr NativeTracePreconditionerKind NativeCoupledWarpPreconditioner(
+    const int sweeps) noexcept
+{
+  switch (sweeps)
+  {
+  case 0:
+    return NativeTracePreconditionerKind::
+        element_overlap_schwarz_warp_coupled_fp64;
+  case 2:
+    return NativeTracePreconditionerKind::
+        element_overlap_schwarz_warp_coupled_sigma_jacobi2_fp64;
+  case native_element_schwarz_sigma_jacobi_maximum_sweeps:
+    return NativeTracePreconditionerKind::
+        element_overlap_schwarz_warp_coupled_sigma_jacobi10_fp64;
+  default:
+    return NativeTracePreconditionerKind::diagonal;
+  }
+}
+
 bool CudaLaunchNativeRankOneTraceSolver(
     const CudaTrueMatrixDeviceView& matrix, const double* const rhs,
-    double* const solution, const bool igr_active,
+    double* const solution,
+    const CudaTracePreconditionerKind preconditioner_kind,
     const CudaNativeIlu0FactorView& ilu_factor,
+    const CudaNativeElementSchwarzView& element_schwarz,
+    const CudaNativeTraceOperatorView& trace_operator,
     const CudaNativeTraceWorkspaceView& workspace,
     const CudaNativeTraceCooperativeSupport& support,
     const double relative_tolerance, const int maximum_iterations,
     const int krylov_dimension, const cudaStream_t stream) noexcept
 {
+  if (CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+          preconditioner_kind))
+    return false;
   NativeTraceSystemView system{};
   system.matrix = {matrix.diag_offsets, matrix.diag_columns,
                    matrix.diag_values, matrix.rows,
                    matrix.diag_columns_count, matrix.diag_nonzeros};
   system.rhs = rhs;
   system.solution = solution;
+  switch (trace_operator.kind)
+  {
+  case CudaNativeTraceOperatorKind::assembled_csr_fp64:
+    system.operator_kind = NativeTraceOperatorKind::assembled_csr_fp64;
+    break;
+  case CudaNativeTraceOperatorKind::element_matrix_free_fp64:
+    system.operator_kind = NativeTraceOperatorKind::element_matrix_free_fp64;
+    break;
+  case CudaNativeTraceOperatorKind::
+      element_matrix_free_equilibrated_field_split_fp64:
+    system.operator_kind = NativeTraceOperatorKind::
+        element_matrix_free_equilibrated_field_split_fp64;
+    break;
+  case CudaNativeTraceOperatorKind::
+      element_matrix_free_warp_equilibrated_field_split_fp64:
+    system.operator_kind = NativeTraceOperatorKind::
+        element_matrix_free_warp_equilibrated_field_split_fp64;
+    break;
+  default:
+    return false;
+  }
+  system.element_schur = trace_operator.element_schur;
 
   NativeTracePreconditionerView preconditioner{};
-  preconditioner.kind = igr_active
+  const bool use_ilu = CudaTracePreconditionerIsIlu(preconditioner_kind);
+  const bool use_element_schwarz =
+      CudaTracePreconditionerIsNativeElementSchwarz(preconditioner_kind);
+  const bool use_equilibrated_field_split =
+      CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
+          preconditioner_kind);
+  const bool use_warp_equilibrated_field_split =
+      CudaTracePreconditionerIsNativeElementSchwarzWarpEquilibratedFieldSplit(
+          preconditioner_kind);
+  const bool use_coupled_warp_full_patch =
+      CudaTracePreconditionerIsNativeElementSchwarzWarpCoupled(
+          preconditioner_kind);
+  const bool use_fixed_sigma_jacobi =
+      CudaTracePreconditionerUsesFixedSigmaJacobi(preconditioner_kind);
+  const int fixed_sigma_jacobi_sweeps =
+      CudaTracePreconditionerFixedSigmaJacobiSweeps(preconditioner_kind);
+  const NativeTracePreconditionerKind fixed_sigma_jacobi_kind =
+      use_coupled_warp_full_patch
+      ? NativeCoupledWarpPreconditioner(fixed_sigma_jacobi_sweeps)
+      : NativeFixedSigmaJacobiPreconditioner(
+            fixed_sigma_jacobi_sweeps,
+            use_warp_equilibrated_field_split);
+  if (!CudaNativeTraceCooperativeSupportMatchesPreconditioner(
+          support, preconditioner_kind))
+    return false;
+  if (use_fixed_sigma_jacobi &&
+      fixed_sigma_jacobi_kind == NativeTracePreconditionerKind::diagonal)
+    return false;
+  preconditioner.kind = use_ilu
       ? NativeTracePreconditionerKind::ilu0_rcm_jacobi
-      : NativeTracePreconditionerKind::diagonal;
-  if (igr_active)
+      : use_element_schwarz
+          ? (use_coupled_warp_full_patch
+                 ? NativeCoupledWarpPreconditioner(
+                       fixed_sigma_jacobi_sweeps)
+                 : use_equilibrated_field_split
+                 ? (use_fixed_sigma_jacobi
+                        ? fixed_sigma_jacobi_kind
+                        : use_warp_equilibrated_field_split
+                            ? NativeTracePreconditionerKind::
+                                  element_overlap_schwarz_warp_equilibrated_field_split_fp64
+                            : NativeTracePreconditionerKind::
+                                  element_overlap_schwarz_equilibrated_field_split_fp64)
+                 : NativeTracePreconditionerKind::
+                       element_overlap_schwarz_fp64)
+          : NativeTracePreconditionerKind::diagonal;
+  if (use_ilu)
   {
     preconditioner.ilu0.factor = {
         ilu_factor.offsets, ilu_factor.columns, ilu_factor.values,
@@ -1036,6 +1574,29 @@ bool CudaLaunchNativeRankOneTraceSolver(
         ilu_factor.lower_jacobi_iterations;
     preconditioner.ilu0.upper_jacobi_iterations =
         ilu_factor.upper_jacobi_iterations;
+  }
+  if (use_element_schwarz)
+  {
+    preconditioner.element_schwarz.patch_matrix =
+        element_schwarz.patch_matrix;
+    preconditioner.element_schwarz.patch_lu = element_schwarz.patch_lu;
+    preconditioner.element_schwarz.pivots = element_schwarz.pivots;
+    preconditioner.element_schwarz.signed_element_true_dofs =
+        element_schwarz.signed_element_true_dofs;
+    preconditioner.element_schwarz.true_incidence_slots =
+        element_schwarz.true_incidence_slots;
+    preconditioner.element_schwarz.element_rhs =
+        element_schwarz.element_rhs;
+    preconditioner.element_schwarz.element_solution =
+        element_schwarz.element_solution;
+    preconditioner.element_schwarz.elements = element_schwarz.elements;
+    preconditioner.element_schwarz.patch_rows =
+        element_schwarz.patch_rows;
+    preconditioner.element_schwarz.true_rows = element_schwarz.true_rows;
+    preconditioner.element_schwarz.minimum_multiplicity =
+        element_schwarz.minimum_multiplicity;
+    preconditioner.element_schwarz.maximum_multiplicity =
+        element_schwarz.maximum_multiplicity;
   }
 
   NativeTraceWorkspaceView native_workspace{};
@@ -1061,6 +1622,9 @@ bool CudaLaunchNativeRankOneTraceSolver(
 
   NativeTraceCooperativeSupport native_support{};
   native_support.supported = support.supported;
+  native_support.fixed_sigma_jacobi = support.fixed_sigma_jacobi;
+  native_support.coupled_warp_full_patch =
+      support.coupled_warp_full_patch;
   native_support.device = support.device;
   native_support.compute_major = support.compute_major;
   native_support.compute_minor = support.compute_minor;
@@ -1101,6 +1665,7 @@ bool CudaDecodeNativeRankOneTraceControl(
   observation.restart_cycles = native_result.restart_cycles;
   observation.preconditioner_applications =
       native_result.preconditioner_applications;
+  observation.operator_applications = native_result.operator_applications;
   observation.actual_residual_checks =
       native_result.actual_residual_checks;
   observation.rhs_norm = native_result.rhs_norm;
@@ -1557,7 +2122,8 @@ bool CudaPrepareNativeRankOneIluFactor(
     const std::size_t inverse_diagonal_count,
     CudaIluAttemptFactorState& factor_state,
     CudaNativeIlu0FactorView& factor_view,
-    CudaSolveDiagnostics& diagnostics) noexcept
+    CudaSolveDiagnostics& diagnostics,
+    const bool same_matrix_retry) noexcept
 {
   CudaTrueSystemDiagnosticScope diagnostic("native-ilu-factor",
                                            matrix_generation);
@@ -1651,7 +2217,9 @@ bool CudaPrepareNativeRankOneIluFactor(
       : factor_state.factor_ready &&
           factor_state.factor_generation <=
               factor_state.last_solve_generation &&
-          matrix_generation > factor_state.last_solve_generation;
+          (same_matrix_retry
+               ? matrix_generation == factor_state.last_solve_generation
+               : matrix_generation > factor_state.last_solve_generation);
   if (!generation_ready) return false;
 
   bool setup_ready = true;
@@ -1828,7 +2396,8 @@ bool CudaSolveWithIluFactorPolicy(
     const int krylov_dimension,
     const std::uint64_t matrix_generation,
     CudaIluAttemptFactorState& factor_state,
-    CudaSolveDiagnostics& diagnostics) noexcept
+    CudaSolveDiagnostics& diagnostics,
+    const bool same_matrix_retry) noexcept
 {
   CudaTrueSystemDiagnosticScope diagnostic("ilu-factor-policy-solve",
                                            matrix_generation);
@@ -1880,7 +2449,9 @@ bool CudaSolveWithIluFactorPolicy(
                    factor_state.jacobi_diagonal_values_token == 0) &&
           factor_state.factor_generation <=
               factor_state.last_solve_generation &&
-          matrix_generation > factor_state.last_solve_generation
+          (same_matrix_retry
+               ? matrix_generation == factor_state.last_solve_generation
+               : matrix_generation > factor_state.last_solve_generation)
       : factor_state.hypre_matrix_token == 0 &&
           factor_state.ilu_handle_token == 0 &&
           factor_state.factor_matrix_token == 0 &&
@@ -1952,10 +2523,12 @@ bool CudaSolveWithIluFactorPolicy(
     }
     else if (policy_ready)
     {
-      // Reuse is a direct Mult on the already-set-up MFEM GMRES.  No setter,
-      // SetOperator call, callback replacement, or adaptive refresh exists on
-      // this branch.
-      policy_ready = CudaRetainedIluFactorExact(
+      // Only the role-specific GMRES stopping tolerance may change while the
+      // already-set-up factor remains live.  The exact retained-factor check
+      // below proves that no SetOperator, callback replacement, or factor
+      // refresh accompanied this bounded retune.
+      gmres.SetTol(relative_tolerance);
+      policy_ready = HYPRE_GetError() == 0 && CudaRetainedIluFactorExact(
           matrix, ilu, gmres, policy,
           relative_tolerance,
           maximum_iterations, krylov_dimension, factor_state,
@@ -2405,6 +2978,169 @@ constexpr double cuda_gamma = 1.4;
 constexpr double cuda_tau = 2.5;
 constexpr double cuda_density_gate = 1.0e-8;
 constexpr double cuda_pi = 3.141592653589793238462643383279502884;
+constexpr double cuda_positive_infinity =
+    std::numeric_limits<double>::infinity();
+
+__device__ void AtomicMaximumPositiveDouble(double* const address,
+                                            const double value)
+{
+  atomicMax(reinterpret_cast<unsigned long long*>(address),
+            __double_as_longlong(value));
+}
+
+__device__ void AtomicMinimumPositiveDouble(double* const address,
+                                            const double value)
+{
+  atomicMin(reinterpret_cast<unsigned long long*>(address),
+            __double_as_longlong(value));
+}
+
+__global__ void InitializeRankOneEquilibrationKernel(
+    double* const left_scale, double* const right_scale,
+    double* const row_norm, double* const column_norm,
+    double* const control, int* const status, const int rows)
+{
+  for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < rows;
+       row += blockDim.x * gridDim.x)
+  {
+    left_scale[row] = 1.0;
+    right_scale[row] = 1.0;
+    row_norm[row] = 0.0;
+    column_norm[row] = 0.0;
+  }
+  if (blockIdx.x == 0 && threadIdx.x == 0)
+  {
+    control[0] = cuda_positive_infinity;
+    control[1] = 0.0;
+    control[2] = cuda_positive_infinity;
+    control[3] = 0.0;
+    *status = 0;
+  }
+}
+
+__global__ void ZeroRankOneEquilibrationNormsKernel(
+    double* const row_norm, double* const column_norm, const int rows)
+{
+  for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < rows;
+       row += blockDim.x * gridDim.x)
+  {
+    row_norm[row] = 0.0;
+    column_norm[row] = 0.0;
+  }
+}
+
+__global__ void AccumulateRankOneEquilibrationNormsKernel(
+    const CudaTrueMatrixDeviceView matrix, const double* const left_scale,
+    const double* const right_scale, double* const row_norm,
+    double* const column_norm, int* const status)
+{
+  for (int row = blockIdx.x * blockDim.x + threadIdx.x;
+       row < matrix.rows; row += blockDim.x * gridDim.x)
+  {
+    const double left = left_scale[row];
+    double maximum = 0.0;
+    for (int entry = matrix.diag_offsets[row];
+         entry < matrix.diag_offsets[row + 1]; ++entry)
+    {
+      const int column = matrix.diag_columns[entry];
+      if (column < 0 || column >= matrix.rows)
+      {
+        atomicOr(status, 1);
+        continue;
+      }
+      const double magnitude = fabs(
+          left * matrix.diag_values[entry] * right_scale[column]);
+      if (!isfinite(magnitude))
+      {
+        atomicOr(status, 1);
+        continue;
+      }
+      maximum = fmax(maximum, magnitude);
+      AtomicMaximumPositiveDouble(column_norm + column, magnitude);
+    }
+    row_norm[row] = maximum;
+  }
+}
+
+__global__ void UpdateRankOneEquilibrationScalesKernel(
+    double* const left_scale, double* const right_scale,
+    const double* const row_norm, const double* const column_norm,
+    int* const status, const int rows)
+{
+  for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < rows;
+       row += blockDim.x * gridDim.x)
+  {
+    const double row_value = row_norm[row];
+    const double column_value = column_norm[row];
+    const double next_left = left_scale[row] / sqrt(row_value);
+    const double next_right = right_scale[row] / sqrt(column_value);
+    const bool valid = row_value > 0.0 && column_value > 0.0 &&
+        isfinite(next_left) && isfinite(next_right) &&
+        next_left >= cuda_rank1_equilibration_minimum_scale &&
+        next_left <= cuda_rank1_equilibration_maximum_scale &&
+        next_right >= cuda_rank1_equilibration_minimum_scale &&
+        next_right <= cuda_rank1_equilibration_maximum_scale;
+    if (!valid)
+    {
+      atomicOr(status, 2);
+      continue;
+    }
+    left_scale[row] = next_left;
+    right_scale[row] = next_right;
+  }
+}
+
+__global__ void BuildRankOneEquilibratedSystemKernel(
+    const CudaTrueMatrixDeviceView original,
+    const CudaTrueMatrixDeviceView equilibrated,
+    const double* const original_rhs, double* const equilibrated_rhs,
+    const double* const left_scale, const double* const right_scale,
+    double* const control, int* const status)
+{
+  for (int row = blockIdx.x * blockDim.x + threadIdx.x;
+       row < original.rows; row += blockDim.x * gridDim.x)
+  {
+    if (*status != 0) continue;
+    const double left = left_scale[row];
+    const double right = right_scale[row];
+    const double scaled_rhs = left * original_rhs[row];
+    if (!isfinite(left) || !isfinite(right) || !isfinite(scaled_rhs))
+    {
+      atomicOr(status, 4);
+      continue;
+    }
+    equilibrated_rhs[row] = scaled_rhs;
+    for (int entry = original.diag_offsets[row];
+         entry < original.diag_offsets[row + 1]; ++entry)
+    {
+      const int column = original.diag_columns[entry];
+      if (column < 0 || column >= original.rows)
+      {
+        atomicOr(status, 4);
+        continue;
+      }
+      const double value =
+          left * original.diag_values[entry] * right_scale[column];
+      if (!isfinite(value))
+        atomicOr(status, 4);
+      else
+        equilibrated.diag_values[entry] = value;
+    }
+    AtomicMinimumPositiveDouble(control + 0, left);
+    AtomicMaximumPositiveDouble(control + 1, left);
+    AtomicMinimumPositiveDouble(control + 2, right);
+    AtomicMaximumPositiveDouble(control + 3, right);
+  }
+}
+
+__global__ void UnscaleRankOneSolutionKernel(
+    double* const solution, const double* const right_scale,
+    const int rows)
+{
+  for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < rows;
+       row += blockDim.x * gridDim.x)
+    solution[row] *= right_scale[row];
+}
 
 __device__ int ByNodes(const int scalar, const int count,
                        const int component)
@@ -3521,38 +4257,420 @@ __global__ void BorrowedEulerFaceKernel(CudaDeviceView v,CudaMeshShape s,
       v,s,frozen_llf,e,lane,group_mask,caches[group]);
 }
 
-// Tensor selection fuses only the element-local Zero -> Volume -> Face
-// sequence.  The explicit group barriers replace the grid-wide launch
-// boundaries for the one element owned by each four-lane group; no product is
-// shared between elements.  Condensation deliberately remains a separate
-// launch because its one-block-per-element mapping and synchronization domain
-// do not match this assembly mapping.
-__global__ void BorrowedEulerFusedAssemblyKernel(
-    CudaDeviceView v,CudaMeshShape s,double dt)
+// The tensor volume leaf retains the existing Zero and Face kernels.  Between
+// them it streams exact FP64 point coefficients through solve_workspace,
+// whose subsequent condensation use starts only after assembly completes.
+// The compact q-major slots are:
+//   conventional [0,44): T[4], Fx[4], Fy[4], Jx[4][4], Jy[4][4];
+//   IGR [0,52):    T[4], Fx[4], Fy[4], Jx[4][5], Jy[4][5];
+//   IGR [52,66):   rho,sigma,zx,zy,Q,
+//                  dQ_b=(a_b,bx_b,by_b), b=(rho,rho*u,rho*v).
+// T is (U-Uold)/dt-source.  The weight and basis tables remain authoritative
+// immutable inputs and are deliberately not duplicated in scratch.
+__device__ double BorrowedEulerTensorDqVariation(
+    const BorrowedVolumeCache& cache,const int variable,
+    const double column_phi,const double column_dx,
+    const double column_dy)
 {
+  double dq=0.0;
+  if(variable<3)
+    for(int velocity=0;velocity<dimension;++velocity)
+      for(int direction=0;direction<dimension;++direction)
+      {
+        const double momentum=cache.state[1+velocity];
+        const double momentum_derivative=
+            cache.conservative_gradient[1+velocity][direction];
+        const double density_derivative=
+            cache.conservative_gradient[0][direction];
+        const double column_derivative=direction==0?column_dx:column_dy;
+        const double delta_density=variable==0?column_phi:0.0;
+        const double delta_density_derivative=variable==0?
+            column_derivative:0.0;
+        const double delta_momentum=variable==1+velocity?
+            column_phi:0.0;
+        const double delta_momentum_derivative=variable==1+velocity?
+            column_derivative:0.0;
+        const double delta_gradient=
+            delta_momentum_derivative/cache.state[0]-
+            momentum_derivative*delta_density/
+                (cache.state[0]*cache.state[0])-
+            delta_momentum*density_derivative/
+                (cache.state[0]*cache.state[0])-
+            momentum*delta_density_derivative/
+                (cache.state[0]*cache.state[0])+
+            2.0*momentum*density_derivative*delta_density/
+                (cache.state[0]*cache.state[0]*cache.state[0]);
+        dq+=cache.dq_dgradient[velocity][direction]*delta_gradient;
+      }
+  return dq;
+}
+
+__device__ bool BorrowedEulerTensorVolumeCoefficientPoint(
+    CudaDeviceView v,CudaMeshShape s,double dt,const int e,const int q,
+    const int lane,const unsigned group_mask,BorrowedVolumeCache& cache,
+    double* coefficient)
+{
+  const int si=s.scalar_interior_dofs;
+  const int e_i=e*s.interior_dofs;
+  const int qp=e*s.volume_points+q;
+  if(lane==0)
+  {
+    cache.weight=v.volume_weight[qp];cache.q_value=0.0;cache.valid=1;
+  }
+  cache.state[lane]=0.0;cache.old[lane]=0.0;
+  cache.source[lane]=0.0;cache.flux_x[lane]=0.0;
+  cache.flux_y[lane]=0.0;
+  for(int entry=0;entry<igr_trace_components;++entry)
+  {
+    cache.jacobian_x[lane*igr_trace_components+entry]=0.0;
+    cache.jacobian_y[lane*igr_trace_components+entry]=0.0;
+  }
+  for(int a=0;a<si;++a)
+  {
+    const double phi=v.volume_shape[qp*si+a];
+    cache.state[lane]+=phi*v.work_interior[
+        e_i+ByNodes(a,si,lane)];
+    cache.old[lane]+=phi*v.old_interior[e_i+ByNodes(a,si,lane)];
+    if(s.borrowed_static_source)
+      cache.source[lane]+=phi*v.static_source[
+          e_i+ByNodes(a,si,lane)];
+  }
+  if(s.igr_active)
+  {
+    if(lane<3)
+    {
+      for(int direction=0;direction<dimension;++direction)
+        cache.conservative_gradient[lane][direction]=0.0;
+      for(int a=0;a<si;++a)
+        for(int direction=0;direction<dimension;++direction)
+          cache.conservative_gradient[lane][direction]+=
+              v.volume_derivative[(qp*si+a)*dimension+direction]*
+              v.work_interior[e_i+ByNodes(a,si,lane)];
+    }
+    else
+    {
+      cache.sigma=0.0;cache.z[0]=0.0;cache.z[1]=0.0;
+      for(int a=0;a<si;++a)
+      {
+        const double phi=v.volume_shape[qp*si+a];
+        cache.sigma+=phi*v.work_interior[e_i+ByNodes(a,si,4)];
+        cache.z[0]+=phi*v.work_interior[e_i+ByNodes(a,si,5)];
+        cache.z[1]+=phi*v.work_interior[e_i+ByNodes(a,si,6)];
+      }
+    }
+  }
+  __syncwarp(group_mask);
+  if(lane==0)
+  {
+    const bool flux_ready=s.igr_active
+        ? RegularizedFluxJacobian(cache.state,cache.sigma,1.0,0.0,
+                                  cache.flux_x,cache.jacobian_x)&&
+          RegularizedFluxJacobian(cache.state,cache.sigma,0.0,1.0,
+                                  cache.flux_y,cache.jacobian_y)
+        : FluxJacobian(cache.state,1.0,0.0,cache.flux_x,
+                       cache.jacobian_x)&&
+          FluxJacobian(cache.state,0.0,1.0,cache.flux_y,
+                       cache.jacobian_y);
+    if(!(cache.weight>0.0)||!flux_ready)cache.valid=0;
+    if(cache.valid&&s.igr_active)
+    {
+      for(int velocity=0;velocity<dimension;++velocity)
+        for(int direction=0;direction<dimension;++direction)
+          cache.velocity_gradient[velocity][direction]=
+              cache.conservative_gradient[1+velocity][direction]/
+                  cache.state[0]-cache.state[1+velocity]*
+              cache.conservative_gradient[0][direction]/
+                  (cache.state[0]*cache.state[0]);
+      const double velocity_trace=cache.velocity_gradient[0][0]+
+          cache.velocity_gradient[1][1];
+      cache.q_value=cache.velocity_gradient[0][0]*
+              cache.velocity_gradient[0][0]+
+          2.0*cache.velocity_gradient[0][1]*
+              cache.velocity_gradient[1][0]+
+          cache.velocity_gradient[1][1]*
+              cache.velocity_gradient[1][1]+
+          velocity_trace*velocity_trace;
+      for(int velocity=0;velocity<dimension;++velocity)
+        for(int direction=0;direction<dimension;++direction)
+          cache.dq_dgradient[velocity][direction]=
+              2.0*cache.velocity_gradient[direction][velocity]+
+              (velocity==direction?2.0*velocity_trace:0.0);
+    }
+  }
+  __syncwarp(group_mask);
+  if(!cache.valid)return false;
+
+  coefficient[detail::tensor_volume_temporal_offset+lane]=
+      (cache.state[lane]-cache.old[lane])/dt-cache.source[lane];
+  coefficient[detail::tensor_volume_flux_x_offset+lane]=cache.flux_x[lane];
+  coefficient[detail::tensor_volume_flux_y_offset+lane]=cache.flux_y[lane];
+  const int columns=s.igr_active?igr_trace_components:
+      conserved_components;
+  const int jacobian_y_offset=detail::tensor_volume_jacobian_x_offset+
+      conserved_components*columns;
+  for(int entry=lane;entry<conserved_components*columns;
+      entry+=borrowed_euler_group_threads)
+  {
+    coefficient[detail::tensor_volume_jacobian_x_offset+entry]=
+        cache.jacobian_x[entry];
+    coefficient[jacobian_y_offset+entry]=cache.jacobian_y[entry];
+  }
+  if(s.igr_active&&lane==0)
+  {
+    coefficient[detail::tensor_volume_igr_rho_offset]=cache.state[0];
+    coefficient[detail::tensor_volume_igr_sigma_offset]=cache.sigma;
+    coefficient[detail::tensor_volume_igr_z_x_offset]=cache.z[0];
+    coefficient[detail::tensor_volume_igr_z_y_offset]=cache.z[1];
+    coefficient[detail::tensor_volume_igr_q_offset]=cache.q_value;
+    for(int variable=0;variable<3;++variable)
+    {
+      coefficient[detail::tensor_volume_igr_dq_offset+variable*3]=
+          BorrowedEulerTensorDqVariation(
+              cache,variable,1.0,0.0,0.0);
+      coefficient[detail::tensor_volume_igr_dq_offset+variable*3+1]=
+          BorrowedEulerTensorDqVariation(
+              cache,variable,0.0,1.0,0.0);
+      coefficient[detail::tensor_volume_igr_dq_offset+variable*3+2]=
+          BorrowedEulerTensorDqVariation(
+              cache,variable,0.0,0.0,1.0);
+    }
+  }
+  __syncwarp(group_mask);
+  return true;
+}
+
+__global__ void BorrowedEulerTensorVolumeCoefficientKernel(
+    CudaDeviceView v,CudaMeshShape s,double dt,const int q_begin,
+    const int q_count,const int coefficient_stride)
+{
+  const int e=blockIdx.x;
+  if(e>=s.elements)return;
   const int group=threadIdx.x/borrowed_euler_group_threads;
   const int lane=threadIdx.x%borrowed_euler_group_threads;
   const int warp_lane=threadIdx.x%borrowed_euler_warp_threads;
   const unsigned group_mask=borrowed_euler_group_mask<<
       (warp_lane-lane);
-  const int e=blockIdx.x*borrowed_euler_elements_per_block+group;
-  if(e>=s.elements)return;
-  __shared__ BorrowedVolumeCache volume_caches[
-      borrowed_euler_elements_per_block];
-  __shared__ BorrowedFaceCache face_caches[
-      borrowed_euler_elements_per_block];
-  BorrowedEulerZeroElement(v,s,e,lane);
-  // Zeroing is lane-striped; all products and status must be visible to the
-  // group before any volume accumulation begins.
-  __syncwarp(group_mask);
-  if(!BorrowedEulerVolumeElement(
-         v,s,dt,e,lane,group_mask,volume_caches[group]))return;
-  // The volume helper ends every quadrature point with this same barrier.  An
-  // explicit stage barrier documents and enforces the Volume -> Face edge if
-  // that helper's loop is later specialized for a zero-point shape.
-  __syncwarp(group_mask);
-  (void)BorrowedEulerFaceElement(
-      v,s,false,e,lane,group_mask,face_caches[group]);
+  const std::size_t workspace_doubles=
+      static_cast<std::size_t>(s.interior_dofs)*(s.trace_dofs+1);
+  double* scratch=v.solve_workspace+
+      static_cast<std::size_t>(e)*workspace_doubles;
+  __shared__ BorrowedVolumeCache caches[borrowed_euler_elements_per_block];
+  __shared__ int failed;
+  if(threadIdx.x==0)failed=0;
+  __syncthreads();
+  for(int local_q=group;local_q<q_count;
+      local_q+=borrowed_euler_elements_per_block)
+  {
+    double* coefficient=scratch+
+        static_cast<std::size_t>(local_q)*coefficient_stride;
+    const bool valid=BorrowedEulerTensorVolumeCoefficientPoint(
+        v,s,dt,e,q_begin+local_q,lane,group_mask,caches[group],coefficient);
+    if(!valid&&lane==0)atomicExch(&failed,1);
+  }
+  __syncthreads();
+  if(threadIdx.x==0&&failed)v.status[e]=-1.0;
+}
+
+__device__ __forceinline__ double BorrowedEulerTensorVolumeRight(
+    CudaDeviceView v,CudaMeshShape s,double dt,const double* coefficient,
+    const int qp,const int row_component,const int output_column,
+    const int feature)
+{
+  const double weight=v.volume_weight[qp];
+  const int ni=s.interior_dofs;
+  if(output_column==ni)
+  {
+    if(row_component<conserved_components)
+    {
+      if(feature==0)
+        return weight*coefficient[
+            detail::tensor_volume_temporal_offset+row_component];
+      if(feature==1)
+        return -weight*coefficient[
+            detail::tensor_volume_flux_x_offset+row_component];
+      return -weight*coefficient[
+          detail::tensor_volume_flux_y_offset+row_component];
+    }
+    if(!s.igr_active)return 0.0;
+    const double rho=coefficient[detail::tensor_volume_igr_rho_offset];
+    const double sigma=coefficient[detail::tensor_volume_igr_sigma_offset];
+    if(row_component<6)
+    {
+      const int direction=row_component-4;
+      if(feature==0)
+        return weight*rho*coefficient[
+            detail::tensor_volume_igr_z_x_offset+direction];
+      return feature==direction+1?weight*sigma:0.0;
+    }
+    if(feature==0)
+      return weight*(sigma/rho-s.igr_alpha*
+          coefficient[detail::tensor_volume_igr_q_offset]);
+    return weight*s.igr_alpha*coefficient[
+        detail::tensor_volume_igr_z_x_offset+feature-1];
+  }
+  if(output_column<0||output_column>=ni)return 0.0;
+  const int si=s.scalar_interior_dofs;
+  const int column_component=output_column/si;
+  const int column=output_column-column_component*si;
+  const double column_phi=v.volume_shape[qp*si+column];
+  const double column_dx=v.volume_derivative[
+      (qp*si+column)*dimension];
+  const double column_dy=v.volume_derivative[
+      (qp*si+column)*dimension+1];
+  if(row_component<conserved_components)
+  {
+    const int columns=s.igr_active?igr_trace_components:
+        conserved_components;
+    if(column_component>=columns)return 0.0;
+    if(feature==0)
+      return row_component==column_component?
+          weight*column_phi/dt:0.0;
+    const int base=feature==1?
+        detail::tensor_volume_jacobian_x_offset:
+        detail::tensor_volume_jacobian_x_offset+
+            conserved_components*columns;
+    return -weight*coefficient[
+        base+row_component*columns+column_component]*column_phi;
+  }
+  if(!s.igr_active)return 0.0;
+  const double rho=coefficient[detail::tensor_volume_igr_rho_offset];
+  const double sigma=coefficient[detail::tensor_volume_igr_sigma_offset];
+  if(row_component<6)
+  {
+    const int direction=row_component-4;
+    if(column_component==0&&feature==0)
+      return weight*coefficient[
+          detail::tensor_volume_igr_z_x_offset+direction]*column_phi;
+    if(column_component==4&&feature==direction+1)
+      return weight*column_phi;
+    if(column_component==5+direction&&feature==0)
+      return weight*rho*column_phi;
+    return 0.0;
+  }
+  if(column_component<3&&feature==0)
+  {
+    const int dq_offset=detail::tensor_volume_igr_dq_offset+
+        column_component*3;
+    const double dq=coefficient[dq_offset]*column_phi+
+        coefficient[dq_offset+1]*column_dx+
+        coefficient[dq_offset+2]*column_dy;
+    double derivative=-s.igr_alpha*dq;
+    if(column_component==0)
+      derivative-=sigma*column_phi/(rho*rho);
+    return weight*derivative;
+  }
+  if(column_component==4&&feature==0)
+    return weight*column_phi/rho;
+  if(column_component==5&&feature==1)
+    return weight*s.igr_alpha*column_phi;
+  if(column_component==6&&feature==2)
+    return weight*s.igr_alpha*column_phi;
+  return 0.0;
+}
+
+// One block owns one (element,row-component) slab.  Each warp owns complete
+// 8x8 output tiles, accumulates all q and phi/dx/dy products in FP64 m8n8k4
+// fragments, then writes each A/residual entry exactly once per deterministic
+// quadrature chunk.  The first chunk assigns; later chunks add one completed
+// tile.  No atomics or cross-element ordering are involved.
+__global__ void BorrowedEulerTensorVolumeContractionKernel(
+    CudaDeviceView v,CudaMeshShape s,double dt,const int q_begin,
+    const int q_count,const int coefficient_stride,const bool first_chunk)
+{
+  const int e=blockIdx.x;
+  const int row_component=blockIdx.y;
+  if(e>=s.elements||row_component>=s.interior_components||
+     v.status[e]!=1.0)return;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  constexpr int tensor_warps=4;
+  const int warp=threadIdx.x/warpSize,lane=threadIdx.x%warpSize;
+  const int si=s.scalar_interior_dofs,ni=s.interior_dofs;
+  const int row_tiles=(si+7)/8;
+  const int column_tiles=(ni+1+7)/8;
+  const std::size_t workspace_doubles=
+      static_cast<std::size_t>(ni)*(s.trace_dofs+1);
+  const double* scratch=v.solve_workspace+
+      static_cast<std::size_t>(e)*workspace_doubles;
+  const std::size_t ao=static_cast<std::size_t>(e)*ni*ni;
+  const int e_i=e*ni;
+  __shared__ __align__(32) double tensor_a[tensor_warps][8*4];
+  __shared__ __align__(32) double tensor_b[tensor_warps][4*8];
+  __shared__ __align__(32) double tensor_product[tensor_warps][8*8];
+  double* warp_a=tensor_a[warp];
+  double* warp_b=tensor_b[warp];
+  double* warp_product=tensor_product[warp];
+  for(int tile=warp;tile<row_tiles*column_tiles;tile+=tensor_warps)
+  {
+    const int row_tile=tile/column_tiles;
+    const int column_tile=tile-row_tile*column_tiles;
+    const int row_base=row_tile*8,column_base=column_tile*8;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator,8,8,4,double>
+        accumulator;
+    nvcuda::wmma::fill_fragment(accumulator,0.0);
+    for(int q_base=0;q_base<q_count;q_base+=4)
+      for(int feature=0;feature<dimension+1;++feature)
+      {
+        const int local_row=lane/4,local_inner=lane%4;
+        const int row=row_base+local_row;
+        const int local_q=q_base+local_inner;
+        if(row<si&&local_q<q_count)
+        {
+          const int qp=e*s.volume_points+q_begin+local_q;
+          warp_a[lane]=feature==0?v.volume_shape[qp*si+row]:
+              v.volume_derivative[(qp*si+row)*dimension+feature-1];
+        }
+        else warp_a[lane]=0.0;
+        const int right_inner=lane/8,right_column=lane%8;
+        const int right_q=q_base+right_inner;
+        const int output_column=column_base+right_column;
+        if(right_q<q_count&&output_column<=ni)
+        {
+          const int qp=e*s.volume_points+q_begin+right_q;
+          const double* coefficient=scratch+
+              static_cast<std::size_t>(right_q)*coefficient_stride;
+          warp_b[lane]=BorrowedEulerTensorVolumeRight(
+              v,s,dt,coefficient,qp,row_component,output_column,feature);
+        }
+        else warp_b[lane]=0.0;
+        __syncwarp();
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,8,8,4,double,
+                              nvcuda::wmma::row_major> matrix_a;
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
+                              nvcuda::wmma::row_major> matrix_b;
+        nvcuda::wmma::load_matrix_sync(matrix_a,warp_a,4);
+        nvcuda::wmma::load_matrix_sync(matrix_b,warp_b,8);
+        nvcuda::wmma::mma_sync(
+            accumulator,matrix_a,matrix_b,accumulator);
+      }
+    nvcuda::wmma::store_matrix_sync(
+        warp_product,accumulator,8,nvcuda::wmma::mem_row_major);
+    __syncwarp();
+    for(int item=lane;item<8*8;item+=warpSize)
+    {
+      const int row=row_base+item/8;
+      const int output_column=column_base+item%8;
+      if(row<si&&output_column<=ni)
+      {
+        const int output_row=ByNodes(row,si,row_component);
+        const double value=warp_product[item];
+        if(output_column==ni)
+        {
+          if(first_chunk)v.residual_r[e_i+output_row]=value;
+          else v.residual_r[e_i+output_row]+=value;
+        }
+        else
+        {
+          double& destination=v.a[ao+output_row*ni+output_column];
+          if(first_chunk)destination=value;
+          else destination+=value;
+        }
+      }
+    }
+    __syncwarp();
+  }
+#else
+  if(row_component==0&&threadIdx.x==0)v.status[e]=-1.0;
+#endif
 }
 
 __global__ void CondenseKernel(CudaDeviceView v,CudaMeshShape s)
@@ -4113,10 +5231,471 @@ __global__ void ZeroVectorKernel(double* values,int n)
 __global__ void StatusReductionKernel(const double* status,int count,
                                       int* failure)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<count&&status[i]!=1.0)atomicExch(failure,1);}
+constexpr int element_schwarz_setup_observed_ready=1;
+constexpr int element_schwarz_setup_observed_structural=2;
+constexpr int element_schwarz_setup_observed_invalid=3;
+constexpr double element_schwarz_status_structural=-7.0;
+constexpr double element_schwarz_status_invalid=-8.0;
+constexpr int element_schwarz_field_split_failure_none=0;
+constexpr int element_schwarz_field_split_failure_structural=1;
+constexpr int element_schwarz_field_split_failure_invalid=2;
+__global__ void ElementSchwarzSetupStatusReductionKernel(
+    const double* status,int count,int* setup_status)
+{
+  const int i=blockIdx.x*blockDim.x+threadIdx.x;
+  if(i>=count)return;
+  const double value=status[i];
+  const int classification=value==1.0?element_schwarz_setup_observed_ready:
+      value==element_schwarz_status_structural?
+          element_schwarz_setup_observed_structural:
+          element_schwarz_setup_observed_invalid;
+  atomicMax(setup_status,classification);
+}
+__global__ void ElementSchwarzSetupInputReductionKernel(
+    CudaDeviceView v,CudaMeshShape s,int* setup_status)
+{
+  const int element=blockIdx.x;
+  if(element>=s.elements||
+     v.status[element]!=element_schwarz_status_structural)return;
+  const int element_entries=s.trace_dofs*s.trace_dofs;
+  const int entries=s.elements*s.trace_dofs*s.trace_dofs;
+  const int begin=element*element_entries;
+  for(int local=threadIdx.x;local<element_entries;local+=blockDim.x)
+  {
+    const int item=begin+local;
+    const int first=v.element_schwarz_first_source[item];
+    const int second=v.element_schwarz_second_source[item];
+    if(first<0||first>=entries||second< -1||second>=entries||
+       !isfinite(v.element_schwarz_patch_matrix[item]))
+      atomicMax(setup_status,element_schwarz_setup_observed_invalid);
+  }
+}
 __global__ void GatherRemoteVectorKernel(CudaDeviceView v,CudaMeshShape s,const double* values,int n)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)v.remote_vector_send[i]=SignedVectorValue(v,s,values,v.vector_send_source[i]);}
 __global__ void ScatterRemoteVectorKernel(CudaDeviceView v,double* truth,int n)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)atomicAdd(truth+v.vector_receive_target[i],v.remote_vector_receive[i]);}
+
+// Rank-one exact T^T r_e assembly. One thread owns one true row and consumes
+// its static one/two incidences in fixed order, so this benchmark ablation has
+// no global atomics and no storage-order-dependent reduction.
+__global__ void NativeElementVectorKernel(CudaDeviceView v,CudaMeshShape s,
+                                          const double* element_values,
+                                          double* truth)
+{
+  const int row=blockIdx.x*blockDim.x+threadIdx.x;
+  if(row>=s.true_trace_count)return;
+  const int element_slots=s.elements*s.trace_dofs;
+  double value=0.0;
+  bool valid=true;
+  for(int incidence=0;incidence<2;++incidence)
+  {
+    const int slot=v.element_schwarz_true_incidence_slots[2*row+incidence];
+    if(slot<0)continue;
+    if(slot>=element_slots){valid=false;continue;}
+    double sign=1.0;
+    const int truth_row=Decode(v.element_schwarz_signed_true_dof[slot],sign);
+    if(truth_row!=row){valid=false;continue;}
+    value+=sign*element_values[slot];
+  }
+  truth[row]=valid?value:nan("");
+}
+
+__device__ int ElementSchwarzFieldSplitOriginalRow(
+    const int patch_rows,const int packed_row)
+{
+  const int scalar_rows=patch_rows/20;
+  const int euler_rows=16*scalar_rows;
+  const int face_span=5*scalar_rows;
+  if(packed_row<euler_rows)
+  {
+    const int euler_face_span=4*scalar_rows;
+    const int face=packed_row/euler_face_span;
+    return face*face_span+packed_row-face*euler_face_span;
+  }
+  const int sigma=packed_row-euler_rows;
+  const int face=sigma/scalar_rows;
+  return face*face_span+4*scalar_rows+sigma-face*scalar_rows;
+}
+
+__device__ void FactorElementSchwarzFieldBlock(
+    double* const lu,int* const pivots,const int rows,
+    double* const scale,int* const pivot_row,int* const failed)
+{
+  if(threadIdx.x==0)
+  {
+    *scale=0.0;
+    if(*failed==element_schwarz_field_split_failure_none)
+      for(int item=0;item<rows*rows;++item)
+        *scale=fmax(*scale,fabs(lu[item]));
+    if(*failed==element_schwarz_field_split_failure_none)
+    {
+      if(!isfinite(*scale))
+        *failed=element_schwarz_field_split_failure_invalid;
+      else if(!(*scale>0.0))
+        *failed=element_schwarz_field_split_failure_structural;
+    }
+  }
+  __syncthreads();
+  for(int column=0;column<rows;++column)
+  {
+    if(threadIdx.x==0&&
+       *failed==element_schwarz_field_split_failure_none)
+    {
+      *pivot_row=column;
+      for(int row=column+1;row<rows;++row)
+        if(fabs(lu[row*rows+column])>
+           fabs(lu[*pivot_row*rows+column]))
+          *pivot_row=row;
+      pivots[column]=*pivot_row;
+      const double pivot=fabs(lu[*pivot_row*rows+column]);
+      if(!isfinite(pivot))
+        *failed=element_schwarz_field_split_failure_invalid;
+      else if(!(pivot>64.0*2.2204460492503131e-16*(*scale)))
+        *failed=element_schwarz_field_split_failure_structural;
+    }
+    __syncthreads();
+    if(*failed)break;
+    if(*pivot_row!=column)
+      for(int entry=threadIdx.x;entry<rows;entry+=blockDim.x)
+      {
+        const double value=lu[column*rows+entry];
+        lu[column*rows+entry]=lu[*pivot_row*rows+entry];
+        lu[*pivot_row*rows+entry]=value;
+      }
+    __syncthreads();
+    for(int row=column+1+threadIdx.x;row<rows;row+=blockDim.x)
+    {
+      const double value=lu[row*rows+column]/lu[column*rows+column];
+      lu[row*rows+column]=value;
+      if(!isfinite(value))
+        atomicMax(failed,element_schwarz_field_split_failure_invalid);
+    }
+    __syncthreads();
+    if(*failed)break;
+    const int trailing=rows-column-1;
+    for(int item=threadIdx.x;item<trailing*trailing;item+=blockDim.x)
+    {
+      const int row=column+1+item/trailing;
+      const int entry=column+1+item%trailing;
+      const double value=lu[row*rows+entry]-
+          lu[row*rows+column]*lu[column*rows+entry];
+      lu[row*rows+entry]=value;
+      if(!isfinite(value))
+        atomicMax(failed,element_schwarz_field_split_failure_invalid);
+    }
+    __syncthreads();
+  }
+}
+
+// Materialize and factor one exact principal trace patch per element. Each
+// patch entry sums all retained signed element-Schur contributors to the
+// corresponding true-matrix entry, then applies the target element's row and
+// column orientation. The unfactored matrix is retained for the native
+// apply's bounded local backward-error gate.
+__global__ void ElementSchwarzSetupKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;
+  if(e>=s.elements)return;
+  const int n=s.trace_dofs;
+  const int element_slots=s.elements*n;
+  const int all_entries=element_slots*n;
+  const std::size_t matrix_offset=static_cast<std::size_t>(e)*n*n;
+  const std::size_t vector_offset=static_cast<std::size_t>(e)*n;
+  double* matrix=v.element_schwarz_patch_matrix+matrix_offset;
+  double* lu=v.element_schwarz_patch_lu+matrix_offset;
+  int* pivots=v.element_schwarz_pivots+vector_offset;
+  __shared__ double scale;
+  __shared__ int pivot_row;
+  __shared__ int failed;
+  if(threadIdx.x==0){scale=0.0;pivot_row=0;failed=0;}
+  __syncthreads();
+  for(int item=threadIdx.x;item<n*n;item+=blockDim.x)
+  {
+    const int row=item/n,column=item-row*n;
+    const int target=static_cast<int>(matrix_offset)+item;
+    const int first=v.element_schwarz_first_source[target];
+    const int second=v.element_schwarz_second_source[target];
+    double row_sign=1.0,column_sign=1.0;
+    (void)Decode(v.element_schwarz_signed_true_dof[
+        static_cast<int>(vector_offset)+row],row_sign);
+    (void)Decode(v.element_schwarz_signed_true_dof[
+        static_cast<int>(vector_offset)+column],column_sign);
+    if(first<0||first>=all_entries||second< -1||second>=all_entries)
+    {
+      atomicExch(&failed,1);
+      matrix[item]=0.0;lu[item]=0.0;
+      continue;
+    }
+    double value=SignedMatrixValue(v,s,first);
+    if(second>=0)value+=SignedMatrixValue(v,s,second);
+    value*=row_sign*column_sign;
+    if(!isfinite(value))atomicExch(&failed,1);
+    matrix[item]=value;
+    lu[item]=value;
+  }
+  __syncthreads();
+  if(threadIdx.x==0)
+  {
+    for(int item=0;item<n*n;++item)scale=fmax(scale,fabs(lu[item]));
+    if(!(scale>0.0)||!isfinite(scale))failed=1;
+  }
+  __syncthreads();
+  for(int column=0;column<n;++column)
+  {
+    if(threadIdx.x==0&&failed==0)
+    {
+      pivot_row=column;
+      for(int row=column+1;row<n;++row)
+        if(fabs(lu[row*n+column])>fabs(lu[pivot_row*n+column]))
+          pivot_row=row;
+      pivots[column]=pivot_row;
+      const double pivot=fabs(lu[pivot_row*n+column]);
+      if(!(pivot>64.0*2.2204460492503131e-16*scale)||
+         !isfinite(pivot))failed=1;
+    }
+    __syncthreads();
+    if(failed)break;
+    if(pivot_row!=column)
+      for(int entry=threadIdx.x;entry<n;entry+=blockDim.x)
+      {
+        const double value=lu[column*n+entry];
+        lu[column*n+entry]=lu[pivot_row*n+entry];
+        lu[pivot_row*n+entry]=value;
+      }
+    __syncthreads();
+    for(int row=column+1+threadIdx.x;row<n;row+=blockDim.x)
+      lu[row*n+column]/=lu[column*n+column];
+    __syncthreads();
+    const int trailing=n-column-1;
+    for(int item=threadIdx.x;item<trailing*trailing;item+=blockDim.x)
+    {
+      const int row=column+1+item/trailing;
+      const int entry=column+1+item%trailing;
+      lu[row*n+entry]-=lu[row*n+column]*lu[column*n+entry];
+    }
+    __syncthreads();
+  }
+  if(threadIdx.x==0)v.status[e]=failed? -7.0:1.0;
+}
+
+// Two deterministic FP64 Ruiz passes are applied independently to the
+// natural Uhat4 Euler and scalar sigmahat diagonal blocks.  The preconditioner
+// is their lower multiplicative block factorization; the exact principal
+// patch remains retained for first-application backward-error checks.
+template <bool PrepareWarpApply>
+__global__ void ElementSchwarzEquilibratedFieldSplitSetupKernel(
+    CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;
+  if(e>=s.elements)return;
+  const int n=s.trace_dofs;
+  const int euler_rows=16*(s.order+1);
+  const int sigma_rows=4*(s.order+1);
+  const int element_slots=s.elements*n;
+  const int all_entries=element_slots*n;
+  const std::size_t matrix_offset=static_cast<std::size_t>(e)*n*n;
+  const std::size_t vector_offset=static_cast<std::size_t>(e)*n;
+  const std::size_t sigma_lu_offset=
+      static_cast<std::size_t>(euler_rows)*euler_rows;
+  const std::size_t lower_coupling_offset=sigma_lu_offset+
+      static_cast<std::size_t>(sigma_rows)*sigma_rows;
+  const std::size_t left_scale_offset=lower_coupling_offset+
+      static_cast<std::size_t>(sigma_rows)*euler_rows;
+  const std::size_t right_scale_offset=left_scale_offset+n;
+  const std::size_t inverse_diagonal_offset=right_scale_offset+n;
+  const std::size_t rhs_permutation_offset=inverse_diagonal_offset+n;
+  double* const matrix=v.element_schwarz_patch_matrix+matrix_offset;
+  double* const storage=v.element_schwarz_patch_lu+matrix_offset;
+  double* const row_norm=v.element_schwarz_rhs+vector_offset;
+  double* const column_norm=v.element_schwarz_solution+vector_offset;
+  int* const pivots=v.element_schwarz_pivots+vector_offset;
+  __shared__ double factor_scale;
+  __shared__ int pivot_row;
+  __shared__ int failed;
+  if(threadIdx.x==0)
+  {
+    factor_scale=0.0;
+    pivot_row=0;
+    failed=element_schwarz_field_split_failure_none;
+  }
+  __syncthreads();
+
+  for(int item=threadIdx.x;item<n*n;item+=blockDim.x)
+  {
+    const int row=item/n,column=item-row*n;
+    const int target=static_cast<int>(matrix_offset)+item;
+    const int first=v.element_schwarz_first_source[target];
+    const int second=v.element_schwarz_second_source[target];
+    double row_sign=1.0,column_sign=1.0;
+    (void)Decode(v.element_schwarz_signed_true_dof[
+        static_cast<int>(vector_offset)+row],row_sign);
+    (void)Decode(v.element_schwarz_signed_true_dof[
+        static_cast<int>(vector_offset)+column],column_sign);
+    if(first<0||first>=all_entries||second< -1||second>=all_entries)
+    {
+      atomicMax(&failed,element_schwarz_field_split_failure_invalid);
+      matrix[item]=0.0;
+      storage[item]=0.0;
+      continue;
+    }
+    double value=SignedMatrixValue(v,s,first);
+    if(second>=0)value+=SignedMatrixValue(v,s,second);
+    value*=row_sign*column_sign;
+    if(!isfinite(value))
+      atomicMax(&failed,element_schwarz_field_split_failure_invalid);
+    matrix[item]=value;
+    storage[item]=0.0;
+  }
+  __syncthreads();
+  for(int packed=threadIdx.x;packed<n;packed+=blockDim.x)
+  {
+    storage[left_scale_offset+packed]=1.0;
+    storage[right_scale_offset+packed]=1.0;
+  }
+  __syncthreads();
+
+  for(int pass=0;pass<native_element_schwarz_equilibration_passes;++pass)
+  {
+    for(int packed=threadIdx.x;packed<n;packed+=blockDim.x)
+    {
+      const bool euler=packed<euler_rows;
+      const int block_begin=euler?0:euler_rows;
+      const int block_end=euler?euler_rows:n;
+      const int original_row=ElementSchwarzFieldSplitOriginalRow(n,packed);
+      double row_maximum=0.0;
+      double column_maximum=0.0;
+      const double left=storage[left_scale_offset+packed];
+      const double right=storage[right_scale_offset+packed];
+      for(int other=block_begin;other<block_end;++other)
+      {
+        const int original_other=
+            ElementSchwarzFieldSplitOriginalRow(n,other);
+        row_maximum=fmax(row_maximum,fabs(
+            left*matrix[original_row*n+original_other]*
+            storage[right_scale_offset+other]));
+        column_maximum=fmax(column_maximum,fabs(
+            storage[left_scale_offset+other]*
+            matrix[original_other*n+original_row]*right));
+      }
+      row_norm[packed]=row_maximum;
+      column_norm[packed]=column_maximum;
+    }
+    __syncthreads();
+    for(int packed=threadIdx.x;packed<n;packed+=blockDim.x)
+    {
+      const double next_left=storage[left_scale_offset+packed]/
+          sqrt(row_norm[packed]);
+      const double next_right=storage[right_scale_offset+packed]/
+          sqrt(column_norm[packed]);
+      const bool valid=row_norm[packed]>0.0&&column_norm[packed]>0.0&&
+          isfinite(next_left)&&isfinite(next_right)&&
+          next_left>=cuda_rank1_equilibration_minimum_scale&&
+          next_left<=cuda_rank1_equilibration_maximum_scale&&
+          next_right>=cuda_rank1_equilibration_minimum_scale&&
+          next_right<=cuda_rank1_equilibration_maximum_scale;
+      if(valid)
+      {
+        storage[left_scale_offset+packed]=next_left;
+        storage[right_scale_offset+packed]=next_right;
+      }
+      else
+        atomicMax(&failed,element_schwarz_field_split_failure_invalid);
+    }
+    __syncthreads();
+  }
+
+  for(int item=threadIdx.x;item<euler_rows*euler_rows;
+      item+=blockDim.x)
+  {
+    const int row=item/euler_rows,column=item-row*euler_rows;
+    const int original_row=ElementSchwarzFieldSplitOriginalRow(n,row);
+    const int original_column=ElementSchwarzFieldSplitOriginalRow(n,column);
+    const double value=storage[left_scale_offset+row]*
+        matrix[original_row*n+original_column]*
+        storage[right_scale_offset+column];
+    storage[item]=value;
+    if(!isfinite(value))
+      atomicMax(&failed,element_schwarz_field_split_failure_invalid);
+  }
+  for(int item=threadIdx.x;item<sigma_rows*sigma_rows;
+      item+=blockDim.x)
+  {
+    const int row=item/sigma_rows,column=item-row*sigma_rows;
+    const int packed_row=euler_rows+row;
+    const int packed_column=euler_rows+column;
+    const int original_row=
+        ElementSchwarzFieldSplitOriginalRow(n,packed_row);
+    const int original_column=
+        ElementSchwarzFieldSplitOriginalRow(n,packed_column);
+    const double value=storage[left_scale_offset+packed_row]*
+        matrix[original_row*n+original_column]*
+        storage[right_scale_offset+packed_column];
+    storage[sigma_lu_offset+item]=value;
+    if(!isfinite(value))
+      atomicMax(&failed,element_schwarz_field_split_failure_invalid);
+  }
+  for(int item=threadIdx.x;item<sigma_rows*euler_rows;
+      item+=blockDim.x)
+  {
+    const int sigma=item/euler_rows,euler=item-sigma*euler_rows;
+    const int packed_row=euler_rows+sigma;
+    const int original_row=
+        ElementSchwarzFieldSplitOriginalRow(n,packed_row);
+    const int original_column=
+        ElementSchwarzFieldSplitOriginalRow(n,euler);
+    const double value=
+        storage[left_scale_offset+packed_row]*
+        matrix[original_row*n+original_column]*
+        storage[right_scale_offset+euler];
+    storage[lower_coupling_offset+item]=value;
+    if(!isfinite(value))
+      atomicMax(&failed,element_schwarz_field_split_failure_invalid);
+  }
+  __syncthreads();
+  FactorElementSchwarzFieldBlock(
+      storage,pivots,euler_rows,&factor_scale,&pivot_row,&failed);
+  FactorElementSchwarzFieldBlock(
+      storage+sigma_lu_offset,pivots+euler_rows,sigma_rows,
+      &factor_scale,&pivot_row,&failed);
+  if constexpr(PrepareWarpApply)
+  {
+    // The cooperative apply never changes the retained LU factors or pivot
+    // sequence.  Its two private vectors fit in the unused tail of the same
+    // n-by-n arena: one FP64 reciprocal diagonal and one exactly represented
+    // packed source index per row.  The latter folds the sequential pivot-swap
+    // chain into the setup that is already performed once per factor.
+    if(failed==element_schwarz_field_split_failure_none)
+      for(int packed=threadIdx.x;packed<n;packed+=blockDim.x)
+      {
+        const bool euler=packed<euler_rows;
+        const int block_begin=euler?0:euler_rows;
+        const int block_rows=euler?euler_rows:sigma_rows;
+        const int local_row=packed-block_begin;
+        const double* const factor=euler?storage:storage+sigma_lu_offset;
+        const double diagonal=factor[local_row*block_rows+local_row];
+        const double inverse=1.0/diagonal;
+        int source=local_row;
+        for(int step=block_rows-1;step>=0;--step)
+        {
+          const int pivot=pivots[block_begin+step];
+          if(source==step)source=pivot;
+          else if(source==pivot)source=step;
+        }
+        storage[inverse_diagonal_offset+packed]=inverse;
+        storage[rhs_permutation_offset+packed]=
+            static_cast<double>(block_begin+source);
+        if(!isfinite(inverse)||inverse==0.0||
+           source<0||source>=block_rows)
+          atomicMax(&failed,element_schwarz_field_split_failure_invalid);
+      }
+    __syncthreads();
+  }
+  if(threadIdx.x==0)
+    v.status[e]=failed==element_schwarz_field_split_failure_none?1.0:
+        failed==element_schwarz_field_split_failure_structural?
+            element_schwarz_status_structural:
+            element_schwarz_status_invalid;
+}
 
 __global__ void RecoverKernel(CudaDeviceView v,CudaMeshShape s)
 {
@@ -4795,14 +6374,84 @@ bool LaunchBorrowedEulerStages(const CudaDeviceView& v,
       v,s,frozen_llf);
   return LaunchOk();
 }
-bool LaunchFusedBorrowedEulerAssembly(const CudaDeviceView& v,
-                                      const CudaMeshShape& s,
-                                      const double dt) noexcept
+bool LaunchTensorBorrowedEulerAssembly(const CudaDeviceView& v,
+                                       const CudaMeshShape& s,
+                                       const double dt,
+                                       std::uint64_t&
+                                           tensor_volume_mma_tiles) noexcept
 {
+  tensor_volume_mma_tiles=0;
+  if(s.elements<=0||s.order<1||s.order>3)return false;
+  const int expected_components=s.igr_active?igr_interior_components:
+      conserved_components;
+  const int expected_trace_components=s.igr_active?igr_trace_components:
+      conserved_components;
+  const int expected_scalar_dofs=(s.order+1)*(s.order+1);
+  const int expected_face_dofs=s.order+1;
+  const auto scratch=detail::PlanTensorVolumeScratch(
+      s.interior_dofs,s.trace_dofs,s.volume_points,s.igr_active);
+  const auto mma_work=detail::PlanTensorVolumeMmaWork(
+      s.elements,s.interior_components,s.scalar_interior_dofs,
+      s.interior_dofs,s.trace_dofs,s.volume_points,s.igr_active);
+  if(!scratch.valid||!mma_work.valid||
+     mma_work.scratch.workspace_doubles!=scratch.workspace_doubles||
+     mma_work.scratch.coefficient_stride!=scratch.coefficient_stride||
+     mma_work.scratch.capacity_points!=scratch.capacity_points||
+     mma_work.scratch.chunk_points!=scratch.chunk_points||
+     !isfinite(dt)||!(dt>0.0)||
+     s.scalar_interior_dofs!=expected_scalar_dofs||
+     s.scalar_face_dofs!=expected_face_dofs||
+     s.interior_components!=expected_components||
+     s.trace_components!=expected_trace_components||
+     s.interior_dofs!=expected_components*s.scalar_interior_dofs||
+     s.trace_dofs!=faces_per_element*expected_trace_components*
+         s.scalar_face_dofs||
+     s.volume_points<=0||s.volume_points>maximum_volume_points||
+     s.face_points<=0||s.face_points>maximum_face_points||
+     v.work_interior==nullptr||v.old_interior==nullptr||
+     v.current_local_trace==nullptr||v.residual_r==nullptr||
+     v.residual_g==nullptr||v.a==nullptr||v.b==nullptr||v.c==nullptr||
+     v.d==nullptr||v.f==nullptr||v.g==nullptr||v.status==nullptr||
+     v.solve_workspace==nullptr||v.volume_shape==nullptr||
+     v.volume_derivative==nullptr||v.volume_weight==nullptr||
+     v.face_interior_shape==nullptr||v.face_trace_shape==nullptr||
+     v.face_weight==nullptr||v.face_normal==nullptr||
+     (s.borrowed_static_source&&v.static_source==nullptr)||
+     (s.igr_active&&v.face_h==nullptr)||
+     (s.borrowed_static_boundary_policies&&
+       (v.boundary_policy_kind==nullptr||v.boundary_reference==nullptr||
+        v.boundary_pressure==nullptr)))
+    return false;
   const int blocks=(s.elements-1)/borrowed_euler_elements_per_block+1;
-  BorrowedEulerFusedAssemblyKernel<<<
-      blocks,borrowed_euler_block_threads>>>(v,s,dt);
-  return LaunchOk();
+  BorrowedEulerZeroKernel<<<blocks,borrowed_euler_block_threads>>>(v,s);
+  if(!LaunchOk())return false;
+  bool first_chunk=true;
+  for(int q_begin=0;q_begin<s.volume_points;)
+  {
+    const int remaining=s.volume_points-q_begin;
+    const int q_count=remaining<scratch.chunk_points?
+        remaining:scratch.chunk_points;
+    if(q_count<=0||q_count>scratch.capacity_points||
+       (remaining>q_count&&q_count%detail::tensor_volume_mma_inner!=0))
+      return false;
+    BorrowedEulerTensorVolumeCoefficientKernel<<<
+        s.elements,borrowed_euler_block_threads>>>(
+            v,s,dt,q_begin,q_count,scratch.coefficient_stride);
+    if(!LaunchOk())return false;
+    const dim3 contraction_grid(
+        static_cast<unsigned>(s.elements),
+        static_cast<unsigned>(s.interior_components),1U);
+    BorrowedEulerTensorVolumeContractionKernel<<<
+        contraction_grid,borrowed_euler_block_threads>>>(
+            v,s,dt,q_begin,q_count,scratch.coefficient_stride,first_chunk);
+    if(!LaunchOk())return false;
+    q_begin+=q_count;
+    first_chunk=false;
+  }
+  BorrowedEulerFaceKernel<<<blocks,borrowed_euler_block_threads>>>(v,s,false);
+  if(!LaunchOk())return false;
+  tensor_volume_mma_tiles=mma_work.mma_tiles;
+  return true;
 }
 } // namespace
 
@@ -4811,6 +6460,27 @@ bool CudaLaunchTicket(int* words,const CudaFailurePhase phase,std::uint64_t atte
 bool CudaLaunchStatusReduction(const double* status,const int count,
                                int* failure_flag) noexcept
 {if(status==nullptr||failure_flag==nullptr||count<0)return false;if(cudaMemsetAsync(failure_flag,0,sizeof(int),nullptr)!=cudaSuccess)return false;if(count)StatusReductionKernel<<<Blocks(count),128>>>(status,count,failure_flag);return LaunchOk();}
+bool CudaLaunchClassifyNativeElementSchwarzSetup(
+    const CudaDeviceView& v,const CudaMeshShape& s,
+    int* const device_setup_status) noexcept
+{
+  if(v.status==nullptr||v.element_schwarz_patch_matrix==nullptr||
+     v.element_schwarz_first_source==nullptr||
+     v.element_schwarz_second_source==nullptr||
+     device_setup_status==nullptr||s.elements<=0||s.trace_dofs<=0||
+     s.elements>std::numeric_limits<int>::max()/s.trace_dofs||
+     s.elements*s.trace_dofs>
+         std::numeric_limits<int>::max()/s.trace_dofs)
+    return false;
+  if(cudaMemsetAsync(device_setup_status,0,sizeof(int),nullptr)!=cudaSuccess)
+    return false;
+  ElementSchwarzSetupStatusReductionKernel<<<Blocks(s.elements),128>>>(
+      v.status,s.elements,device_setup_status);
+  if(!LaunchOk())return false;
+  ElementSchwarzSetupInputReductionKernel<<<s.elements,128>>>(
+      v,s,device_setup_status);
+  return LaunchOk();
+}
 bool CudaLaunchGatherLocalTrace(const int* map,int count,const double* source,double* destination) noexcept
 {GatherKernel<<<Blocks(count),128>>>(map,count,source,destination);return LaunchOk();}
 bool CudaLaunchAdmissibility(const CudaDeviceView& v,const CudaMeshShape& s) noexcept
@@ -4820,19 +6490,24 @@ bool CudaLaunchFreezeBorrowedCurrentLlfTau(const CudaDeviceView& v,
 {FreezeBorrowedCurrentLlfTauKernel<<<s.elements,128>>>(v,s);return LaunchOk();}
 bool CudaLaunchBorrowedAssembly(
     const CudaDeviceView& v,const CudaMeshShape& s,const double dt,
-    const CudaBorrowedAssemblyKind kind) noexcept
+    const CudaBorrowedAssemblyKind kind,
+    std::uint64_t& tensor_volume_mma_tiles) noexcept
 {
+  tensor_volume_mma_tiles=0;
   if(!s.borrowed_host_inputs||s.elements<=0)return false;
   if(kind==CudaBorrowedAssemblyKind::ordinary_split)
     return LaunchBorrowedEulerStages(v,s,dt,false);
-  if(kind==CudaBorrowedAssemblyKind::tensor_fused)
-    return LaunchFusedBorrowedEulerAssembly(v,s,dt);
+  if(kind==CudaBorrowedAssemblyKind::tensor_volume)
+    return LaunchTensorBorrowedEulerAssembly(
+        v,s,dt,tensor_volume_mma_tiles);
   return false;
 }
 bool CudaLaunchAssembly(const CudaDeviceView& v,const CudaMeshShape& s,
                         const double dt,
-                        const generic::CudaEngineKind engine) noexcept
+                        const generic::CudaEngineKind engine,
+                        std::uint64_t& tensor_volume_mma_tiles) noexcept
 {
+  tensor_volume_mma_tiles=0;
   if(!s.borrowed_host_inputs)
   {
     if(engine!=generic::CudaEngineKind::ordinary)return false;
@@ -4841,10 +6516,12 @@ bool CudaLaunchAssembly(const CudaDeviceView& v,const CudaMeshShape& s,
   }
   if(engine==generic::CudaEngineKind::ordinary)
     return CudaLaunchBorrowedAssembly(
-        v,s,dt,CudaBorrowedAssemblyKind::ordinary_split);
+        v,s,dt,CudaBorrowedAssemblyKind::ordinary_split,
+        tensor_volume_mma_tiles);
   if(engine==generic::CudaEngineKind::tensor_core)
     return CudaLaunchBorrowedAssembly(
-        v,s,dt,CudaBorrowedAssemblyKind::tensor_fused);
+        v,s,dt,CudaBorrowedAssemblyKind::tensor_volume,
+        tensor_volume_mma_tiles);
   return false;
 }
 bool CudaLaunchFrozenBorrowedLlfAssembly(const CudaDeviceView& v,
@@ -4921,6 +6598,118 @@ bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
   if(!LaunchOk())return false;
   tensor_mma_tiles=per_element*elements;
   return true;
+}
+bool CudaLaunchSetupNativeElementSchwarz(
+    const CudaDeviceView& v,const CudaMeshShape& s,
+    const CudaTracePreconditionerKind preconditioner_kind) noexcept
+{
+  const int expected=NativeElementSchwarzIgrPatchRows(s.order);
+  const bool field_split=
+      CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
+          preconditioner_kind);
+  const bool warp_field_split=
+      CudaTracePreconditionerIsNativeElementSchwarzWarpEquilibratedFieldSplit(
+          preconditioner_kind);
+  if(!CudaTracePreconditionerIsNativeElementSchwarz(preconditioner_kind)||
+     CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+         preconditioner_kind)||
+     !s.igr_active||s.elements<=0||s.trace_dofs!=expected||
+     v.schur==nullptr||v.status==nullptr||
+     v.element_schwarz_patch_matrix==nullptr||
+     v.element_schwarz_patch_lu==nullptr||
+     v.element_schwarz_first_source==nullptr||
+     v.element_schwarz_second_source==nullptr||
+     v.element_schwarz_signed_true_dof==nullptr||
+     v.element_schwarz_pivots==nullptr)
+    return false;
+  const NativeElementSchwarzFieldSplitLayout layout=
+      NativeElementSchwarzIgrFieldSplitLayout(s.order);
+  if(field_split&&(!layout.valid||layout.patch_rows!=s.trace_dofs||
+                   layout.required_doubles>layout.available_doubles||
+                   (warp_field_split&&(!layout.warp_valid||
+                     layout.warp_required_doubles>
+                         layout.available_doubles))))
+    return false;
+  if(warp_field_split)
+    ElementSchwarzEquilibratedFieldSplitSetupKernel<true>
+        <<<s.elements,128>>>(v,s);
+  else if(field_split)
+    ElementSchwarzEquilibratedFieldSplitSetupKernel<false>
+        <<<s.elements,128>>>(v,s);
+  else
+    ElementSchwarzSetupKernel<<<s.elements,128>>>(v,s);
+  return LaunchOk();
+}
+bool CudaLaunchAssembleNativeElementVector(
+    const CudaDeviceView& v,const CudaMeshShape& s,
+    const double* const element_values,double* const truth) noexcept
+{
+  const int expected=NativeElementSchwarzIgrPatchRows(s.order);
+  if(!s.igr_active||s.elements<=0||s.true_trace_count<=0||
+     s.trace_dofs!=expected||element_values==nullptr||truth==nullptr||
+     element_values==truth||v.element_schwarz_signed_true_dof==nullptr||
+     v.element_schwarz_true_incidence_slots==nullptr)
+    return false;
+  NativeElementVectorKernel<<<Blocks(s.true_trace_count),128>>>(
+      v,s,element_values,truth);
+  return LaunchOk();
+}
+bool CudaLaunchBuildRankOneEquilibratedSystem(
+    const CudaTrueMatrixDeviceView& original,
+    const CudaTrueMatrixDeviceView& equilibrated,
+    const double* const original_rhs, double* const equilibrated_rhs,
+    double* const left_scale, double* const right_scale,
+    double* const row_norm, double* const column_norm,
+    double* const control, int* const status, const int passes,
+    const cudaStream_t stream) noexcept
+{
+  const bool exact = original.rows > 0 &&
+      original.rows == original.diag_columns_count &&
+      original.rows == equilibrated.rows &&
+      original.diag_columns_count == equilibrated.diag_columns_count &&
+      original.diag_nonzeros > 0 &&
+      original.diag_nonzeros == equilibrated.diag_nonzeros &&
+      original.offd_nonzeros == 0 && equilibrated.offd_nonzeros == 0 &&
+      original.diag_offsets != nullptr && original.diag_columns != nullptr &&
+      original.diag_values != nullptr &&
+      equilibrated.diag_offsets != nullptr &&
+      equilibrated.diag_columns != nullptr &&
+      equilibrated.diag_values != nullptr &&
+      original.diag_values != equilibrated.diag_values &&
+      original_rhs != nullptr && equilibrated_rhs != nullptr &&
+      original_rhs != equilibrated_rhs && left_scale != nullptr &&
+      right_scale != nullptr && row_norm != nullptr &&
+      column_norm != nullptr && control != nullptr && status != nullptr &&
+      passes == cuda_rank1_equilibration_passes;
+  if (!exact) return false;
+  const int blocks = Blocks(original.rows);
+  InitializeRankOneEquilibrationKernel<<<blocks,128,0,stream>>>(
+      left_scale, right_scale, row_norm, column_norm, control, status,
+      original.rows);
+  for (int pass = 0; pass < passes; ++pass)
+  {
+    ZeroRankOneEquilibrationNormsKernel<<<blocks,128,0,stream>>>(
+        row_norm, column_norm, original.rows);
+    AccumulateRankOneEquilibrationNormsKernel<<<blocks,128,0,stream>>>(
+        original, left_scale, right_scale, row_norm, column_norm, status);
+    UpdateRankOneEquilibrationScalesKernel<<<blocks,128,0,stream>>>(
+        left_scale, right_scale, row_norm, column_norm, status,
+        original.rows);
+  }
+  BuildRankOneEquilibratedSystemKernel<<<blocks,128,0,stream>>>(
+      original, equilibrated, original_rhs, equilibrated_rhs, left_scale,
+      right_scale, control, status);
+  return LaunchOk();
+}
+bool CudaLaunchUnscaleRankOneSolution(
+    double* const solution, const double* const right_scale,
+    const int rows, const cudaStream_t stream) noexcept
+{
+  if (solution == nullptr || right_scale == nullptr || rows <= 0)
+    return false;
+  UnscaleRankOneSolutionKernel<<<Blocks(rows),128,0,stream>>>(
+      solution, right_scale, rows);
+  return LaunchOk();
 }
 bool CudaLaunchZeroTrueSystem(const CudaTrueMatrixDeviceView& m,double* rhs,int n) noexcept
 {const int count=std::max(std::max(m.diag_nonzeros,m.offd_nonzeros),n);ZeroSystemKernel<<<Blocks(count),128>>>(m,rhs,n);return LaunchOk();}

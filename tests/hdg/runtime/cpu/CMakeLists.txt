@@ -53,6 +53,36 @@ set_tests_properties(hdg_runtime_cpu_serial
     RESOURCE_LOCK hdg_runtime_cpu
     TIMEOUT 1800)
 
+add_executable(dg_igr_hdg_native_element_schwarz_plan_test
+  test_native_element_schwarz_plan.cpp)
+target_include_directories(dg_igr_hdg_native_element_schwarz_plan_test
+  PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_compile_options(dg_igr_hdg_native_element_schwarz_plan_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+set_target_properties(dg_igr_hdg_native_element_schwarz_plan_test PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+add_test(NAME hdg_runtime_native_element_schwarz_plan
+  COMMAND dg_igr_hdg_native_element_schwarz_plan_test)
+set_tests_properties(hdg_runtime_native_element_schwarz_plan PROPERTIES
+  PROCESSORS 1
+  LABELS "hdg;runtime;cpu;cuda-contract;schwarz"
+  TIMEOUT 60)
+
+add_executable(dg_igr_hdg_tensor_volume_layout_test
+  test_tensor_volume_layout.cpp)
+target_include_directories(dg_igr_hdg_tensor_volume_layout_test
+  PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_compile_options(dg_igr_hdg_tensor_volume_layout_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+set_target_properties(dg_igr_hdg_tensor_volume_layout_test PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+add_test(NAME hdg_runtime_tensor_volume_layout
+  COMMAND dg_igr_hdg_tensor_volume_layout_test)
+set_tests_properties(hdg_runtime_tensor_volume_layout PROPERTIES
+  PROCESSORS 1
+  LABELS "hdg;runtime;cpu;cuda-contract;tensor;assembly"
+  TIMEOUT 60)
+
 if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
   add_executable(dg_igr_hdg_runtime_w8c_cpu_serial_test
     independent_oracle.cpp
@@ -233,6 +263,79 @@ foreach(_regularization IN ITEMS conventional igr)
         LABELS "hdg;generic;cpu;convergence;spatial;backward-euler;${_regularization};p${_order}"
         TIMEOUT 3600)
   endforeach()
+endforeach()
+
+# Reuse the production convergence fixture to qualify the bounded IGR
+# quadrature candidate: one extra polynomial degree of volume overintegration
+# beyond the conventional face rule.  Keeping this as a parameterized case
+# makes the q12 default an explicit control until the candidate is promoted.
+foreach(_order IN ITEMS 1 2 3)
+  math(EXPR _igr_volume_quadrature_order "2 * ${_order} + 4")
+  math(EXPR _igr_face_quadrature_order "2 * ${_order} + 2")
+  add_test(
+    NAME hdg_generic_euler_cpu_convergence_igr_reduced_quadrature_p${_order}
+    COMMAND dg_igr_hdg_generic_euler_convergence_cpu_test
+      --order ${_order} --regularization igr
+      --igr-volume-quadrature-order ${_igr_volume_quadrature_order}
+      --igr-face-quadrature-order ${_igr_face_quadrature_order})
+  set_tests_properties(
+    hdg_generic_euler_cpu_convergence_igr_reduced_quadrature_p${_order}
+    PROPERTIES
+      PROCESSORS 1
+      RESOURCE_LOCK hdg_generic_euler_cpu
+      LABELS "hdg;generic;cpu;convergence;spatial;backward-euler;igr;quadrature-candidate;p${_order}"
+      TIMEOUT 3600)
+endforeach()
+
+# Keep malformed role-specific tolerance choices outside the numerical runner.
+# These fast guards exercise the shared CPU/CUDA argument parser without
+# creating a separate backend qualification suite.
+add_test(
+  NAME hdg_generic_euler_convergence_rejects_nonfinite_linear_tolerance
+  COMMAND dg_igr_hdg_generic_euler_convergence_cpu_test
+    --order 1 --regularization igr --newton-linear-rtol nan)
+add_test(
+  NAME hdg_generic_euler_convergence_rejects_duplicate_linear_tolerance
+  COMMAND dg_igr_hdg_generic_euler_convergence_cpu_test
+    --order 1 --regularization igr
+    --newton-linear-rtol 1e-10 --newton-linear-rtol 1e-10)
+add_test(
+  NAME hdg_generic_euler_convergence_rejects_invalid_tightening_order
+  COMMAND dg_igr_hdg_generic_euler_convergence_cpu_test
+    --order 1 --regularization igr
+    --newton-linear-rtol 1e-10 --final-linear-rtol 3e-11
+    --true-residual-tightening-linear-rtol 1e-9)
+set_tests_properties(
+  hdg_generic_euler_convergence_rejects_nonfinite_linear_tolerance
+  hdg_generic_euler_convergence_rejects_duplicate_linear_tolerance
+  hdg_generic_euler_convergence_rejects_invalid_tightening_order
+  PROPERTIES
+    PROCESSORS 1
+    RESOURCE_LOCK hdg_generic_euler_cpu
+    LABELS "hdg;generic;cpu;convergence;argument-validation"
+    TIMEOUT 30
+    WILL_FAIL TRUE)
+
+# Directly compare the reduced IGR quadrature schedule to q12/q12 on the
+# same active-IGR one-step and multi-step trajectories.  This remains a
+# test-only numerical qualification and publishes no runtime evidence API.
+foreach(_order IN ITEMS 1 2 3)
+  math(EXPR _igr_volume_quadrature_order "2 * ${_order} + 4")
+  math(EXPR _igr_face_quadrature_order "2 * ${_order} + 2")
+  add_test(
+    NAME hdg_generic_euler_cpu_igr_quadrature_equivalence_p${_order}
+    COMMAND dg_igr_hdg_generic_euler_convergence_cpu_test
+      --order ${_order} --regularization igr
+      --igr-volume-quadrature-order ${_igr_volume_quadrature_order}
+      --igr-face-quadrature-order ${_igr_face_quadrature_order}
+      --quadrature-equivalence)
+  set_tests_properties(
+    hdg_generic_euler_cpu_igr_quadrature_equivalence_p${_order}
+    PROPERTIES
+      PROCESSORS 1
+      RESOURCE_LOCK hdg_generic_euler_cpu
+      LABELS "hdg;generic;cpu;igr;quadrature-equivalence;p${_order}"
+      TIMEOUT 3600)
 endforeach()
 
 add_executable(dg_igr_hdg_traced_scalar_igr_p1_local_test

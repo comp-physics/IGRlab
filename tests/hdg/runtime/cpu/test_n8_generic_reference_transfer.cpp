@@ -82,13 +82,16 @@ generic::EulerHdgRequest MakeRequest(
   policy.true_trace_projection_quadrature_order = transfer::n8_projection_quadrature_order;
   policy.conventional_assembly_quadrature_order =
       cpu::w8c::SmoothTransitionV2Case::conventional_q_a;
-  policy.igr_assembly_quadrature_order =
-      cpu::w8c::SmoothTransitionV2Case::scalar_q_a;
+  policy.igr_assembly_quadrature_orders = {
+      cpu::w8c::SmoothTransitionV2Case::scalar_q_a,
+      cpu::w8c::SmoothTransitionV2Case::scalar_q_a};
   policy.maximum_nonlinear_updates = sc25::persistent_newton_maximum_iterations;
   policy.maximum_linear_iterations = sc25::persistent_trace_maximum_iterations;
   policy.maximum_line_search_trials = sc25::persistent_line_search_trials;
   policy.nonlinear_relative_tolerance = 1.0e-12;
-  policy.linear_relative_tolerance = 1.0e-12;
+  policy.newton_correction_linear_relative_tolerance = 1.0e-12;
+  policy.final_coherent_linear_relative_tolerance = 1.0e-12;
+  policy.true_residual_tightening_linear_relative_tolerance = 1.0e-12;
   policy.true_residual_relative_tolerance = 1.0e-12;
   policy.conservation_relative_tolerance = 1.0e-10;
   policy.armijo_constant = 1.0e-4;
@@ -98,7 +101,9 @@ generic::EulerHdgRequest MakeRequest(
   return {&mesh,
           mesh.GetComm(),
           transfer::n8_polynomial_order,
-          {generic::BackendKind::cpu, -1},
+          {generic::BackendKind::cpu,
+           -1,
+           generic::CudaEngineKind::ordinary},
           generic_cpu_capabilities,
           {initial.data(), initial.size(), 4},
           {true_trace.data(), true_trace.size(), 4},

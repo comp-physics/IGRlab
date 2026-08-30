@@ -26,6 +26,7 @@ using generic::BackendKind;
 using generic::Capability;
 using generic::CapabilityBit;
 using generic::CudaEngineKind;
+using generic::EulerHdgAssemblyQuadratureOrders;
 using generic::EulerBoundaryPolicyTableView;
 using generic::EulerHdgRequest;
 using generic::RegularizationKind;
@@ -60,6 +61,13 @@ struct CaseSelection
 {
   int order = 0;
   RegularizationKind regularization = RegularizationKind::none;
+  EulerHdgAssemblyQuadratureOrders igr_assembly_quadrature_orders{0, 0};
+  // Zero means "retain DefaultEulerHdgNumericalPolicy"; the command-line
+  // parser admits only finite positive overrides.
+  double newton_correction_linear_relative_tolerance = 0.0;
+  double final_coherent_linear_relative_tolerance = 0.0;
+  double true_residual_tightening_linear_relative_tolerance = 0.0;
+  bool quadrature_equivalence = false;
 };
 
 inline bool ParseOrder(const std::string_view text, int& order) noexcept
@@ -73,12 +81,56 @@ inline bool ParseOrder(const std::string_view text, int& order) noexcept
       order <= generic::maximum_polynomial_order;
 }
 
+inline bool ParseQuadratureOrder(
+    const std::string_view text, int& order) noexcept
+{
+  order = 0;
+  const char* const begin = text.data();
+  const char* const end = begin + text.size();
+  const auto parsed = std::from_chars(begin, end, order);
+  return parsed.ec == std::errc{} && parsed.ptr == end &&
+      order >= 1 && order <= 14;
+}
+
+inline bool ParsePositiveDouble(
+    const std::string_view text, double& value) noexcept
+{
+  value = 0.0;
+  const char* const begin = text.data();
+  const char* const end = begin + text.size();
+  const auto parsed = std::from_chars(
+      begin, end, value, std::chars_format::general);
+  return parsed.ec == std::errc{} && parsed.ptr == end &&
+      std::isfinite(value) && value > 0.0;
+}
+
+inline void ApplySelectedLinearTolerances(
+    const CaseSelection& selection,
+    generic::EulerHdgNumericalPolicy& policy) noexcept
+{
+  if (selection.newton_correction_linear_relative_tolerance > 0.0)
+    policy.newton_correction_linear_relative_tolerance =
+        selection.newton_correction_linear_relative_tolerance;
+  if (selection.final_coherent_linear_relative_tolerance > 0.0)
+    policy.final_coherent_linear_relative_tolerance =
+        selection.final_coherent_linear_relative_tolerance;
+  if (selection.true_residual_tightening_linear_relative_tolerance > 0.0)
+    policy.true_residual_tightening_linear_relative_tolerance =
+        selection.true_residual_tightening_linear_relative_tolerance;
+}
+
 inline bool ParseCaseSelection(const int argc, char* argv[],
                                CaseSelection& selection) noexcept
 {
   selection = {};
   bool have_order = false;
   bool have_regularization = false;
+  bool have_igr_volume_order = false;
+  bool have_igr_face_order = false;
+  bool have_newton_linear_tolerance = false;
+  bool have_final_linear_tolerance = false;
+  bool have_true_residual_tightening_linear_tolerance = false;
+  bool have_quadrature_equivalence = false;
   for (int argument = 1; argument < argc; ++argument)
   {
     const std::string_view option{argv[argument]};
@@ -99,12 +151,73 @@ inline bool ParseCaseSelection(const int argc, char* argv[],
         return false;
       have_regularization = true;
     }
+    else if (option == "--igr-volume-quadrature-order" &&
+             argument + 1 < argc && !have_igr_volume_order)
+    {
+      have_igr_volume_order = ParseQuadratureOrder(
+          argv[++argument],
+          selection.igr_assembly_quadrature_orders.volume_order);
+      if (!have_igr_volume_order) return false;
+    }
+    else if (option == "--igr-face-quadrature-order" &&
+             argument + 1 < argc && !have_igr_face_order)
+    {
+      have_igr_face_order = ParseQuadratureOrder(
+          argv[++argument],
+          selection.igr_assembly_quadrature_orders.face_order);
+      if (!have_igr_face_order) return false;
+    }
+    else if (option == "--newton-linear-rtol" &&
+             argument + 1 < argc && !have_newton_linear_tolerance)
+    {
+      have_newton_linear_tolerance = ParsePositiveDouble(
+          argv[++argument],
+          selection.newton_correction_linear_relative_tolerance);
+      if (!have_newton_linear_tolerance) return false;
+    }
+    else if (option == "--final-linear-rtol" &&
+             argument + 1 < argc && !have_final_linear_tolerance)
+    {
+      have_final_linear_tolerance = ParsePositiveDouble(
+          argv[++argument],
+          selection.final_coherent_linear_relative_tolerance);
+      if (!have_final_linear_tolerance) return false;
+    }
+    else if (option == "--true-residual-tightening-linear-rtol" &&
+             argument + 1 < argc &&
+             !have_true_residual_tightening_linear_tolerance)
+    {
+      have_true_residual_tightening_linear_tolerance = ParsePositiveDouble(
+          argv[++argument],
+          selection.true_residual_tightening_linear_relative_tolerance);
+      if (!have_true_residual_tightening_linear_tolerance) return false;
+    }
+    else if (option == "--quadrature-equivalence" &&
+             !have_quadrature_equivalence)
+    {
+      selection.quadrature_equivalence = true;
+      have_quadrature_equivalence = true;
+    }
     else
     {
       return false;
     }
   }
-  return have_order && have_regularization;
+  if (!have_order || !have_regularization ||
+      have_igr_volume_order != have_igr_face_order ||
+      (have_igr_volume_order &&
+       selection.regularization != RegularizationKind::igr) ||
+      (selection.quadrature_equivalence &&
+       (selection.regularization != RegularizationKind::igr ||
+        !have_igr_volume_order)))
+  {
+    return false;
+  }
+
+  generic::EulerHdgNumericalPolicy policy =
+      generic::DefaultEulerHdgNumericalPolicy(selection.order);
+  ApplySelectedLinearTolerances(selection, policy);
+  return generic::ValidEulerHdgNumericalPolicy(policy);
 }
 
 /**
@@ -135,6 +248,34 @@ struct EntropyWave
     conservative = {{density,
                      density * velocity[0],
                      density * velocity[1],
+                     pressure / (gamma - 1.0) + kinetic_energy}};
+  }
+};
+
+/**
+ * Smooth periodic state with nonconstant velocity and pressure.  Unlike the
+ * entropy-wave convergence control, this state exercises the IGR velocity
+ * gradient and scalar regularization terms.  It is used only for the direct
+ * reduced-versus-q12 quadrature comparison; no analytic evolution is claimed.
+ */
+struct ActiveIgrWave
+{
+  void Evaluate(const double x, const double y,
+                std::array<double, components>& conservative) const noexcept
+  {
+    const double x_phase = 2.0 * pi * x;
+    const double y_phase = 2.0 * pi * y;
+    const double density =
+        1.0 + 0.05 * std::sin(x_phase) * std::cos(y_phase);
+    const double velocity_x = 0.20 + 0.03 * std::cos(y_phase);
+    const double velocity_y = -0.10 + 0.02 * std::sin(x_phase);
+    const double pressure =
+        1.0 + 0.03 * std::cos(x_phase) * std::sin(y_phase);
+    const double kinetic_energy = 0.5 * density *
+        (velocity_x * velocity_x + velocity_y * velocity_y);
+    conservative = {{density,
+                     density * velocity_x,
+                     density * velocity_y,
                      pressure / (gamma - 1.0) + kinetic_energy}};
   }
 };
@@ -208,17 +349,41 @@ inline bool ProjectInitialState(const EntropyWave& wave,
   return true;
 }
 
+inline bool ProjectInitialState(const ActiveIgrWave& wave,
+                                mfem::ParGridFunction& initial)
+{
+  auto exact = [&wave](const mfem::Vector& point, mfem::Vector& value)
+  {
+    std::array<double, components> state{};
+    wave.Evaluate(point[0], point[1], state);
+    value.SetSize(components);
+    for (int component = 0; component < components; ++component)
+      value[component] = state[static_cast<std::size_t>(component)];
+  };
+  try
+  {
+    mfem::VectorFunctionCoefficient coefficient(components, exact);
+    initial.ProjectCoefficient(coefficient);
+  }
+  catch (...)
+  {
+    return false;
+  }
+  return true;
+}
+
 inline EulerHdgRequest MakeRequest(
-    const mfem::ParMesh& mesh, const int order,
+    const mfem::ParMesh& mesh,
     const mfem::ParGridFunction& initial,
     const mfem::ParGridFunction& source, BoundaryAudit& boundary,
     const ExecutionSelection execution,
-    const RegularizationKind regularization)
+    const CaseSelection& test_case,
+    const EulerHdgAssemblyQuadratureOrders igr_assembly_quadrature_orders)
 {
   EulerHdgRequest request{};
   request.mesh = &mesh;
   request.communicator = mesh.GetComm();
-  request.polynomial_order = order;
+  request.polynomial_order = test_case.order;
   request.backend = {
       execution.backend,
       execution.backend == BackendKind::cuda ? 0 : -1,
@@ -235,9 +400,14 @@ inline EulerHdgRequest MakeRequest(
   request.boundary = {
       &boundary, PeriodicExterior,
       EulerBoundaryPolicyTableView{nullptr, 0, dimension, gamma}};
-  request.numerical_policy = generic::DefaultEulerHdgNumericalPolicy(order);
+  request.numerical_policy =
+      generic::DefaultEulerHdgNumericalPolicy(test_case.order);
+  ApplySelectedLinearTolerances(test_case, request.numerical_policy);
+  if (igr_assembly_quadrature_orders.volume_order > 0)
+    request.numerical_policy.igr_assembly_quadrature_orders =
+        igr_assembly_quadrature_orders;
   request.numerical_policy.stabilization =
-      regularization == RegularizationKind::igr
+      test_case.regularization == RegularizationKind::igr
       ? generic::RegularizationSelection{RegularizationKind::igr, 0.2, 0.8}
       : generic::RegularizationSelection{RegularizationKind::none, 0.0, 0.0};
   return request;
@@ -452,6 +622,267 @@ inline double GlobalL2Norm(const mfem::ParGridFunction& field)
   return std::sqrt(static_cast<double>(global_norm_squared));
 }
 
+struct GlobalFieldMetrics
+{
+  double l2_norm = std::numeric_limits<double>::infinity();
+  double linf_norm = std::numeric_limits<double>::infinity();
+  std::array<double, components> component_integrals{{
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity()}};
+  double minimum_density = -std::numeric_limits<double>::infinity();
+  double minimum_pressure = -std::numeric_limits<double>::infinity();
+  bool valid = false;
+};
+
+struct GlobalFieldDifference
+{
+  double l2 = std::numeric_limits<double>::infinity();
+  double linf = std::numeric_limits<double>::infinity();
+  bool valid = false;
+};
+
+/** Global physical-field invariants; no coefficient or rank ordering enters. */
+inline GlobalFieldMetrics MeasureGlobalField(
+    const mfem::ParGridFunction& field)
+{
+  GlobalFieldMetrics result;
+  const auto* const space = field.ParFESpace();
+  auto* const mesh = space == nullptr
+      ? nullptr
+      : const_cast<mfem::ParMesh*>(space->GetParMesh());
+  if (space == nullptr || mesh == nullptr) return result;
+
+  bool valid = true;
+  long double local_norm_squared = 0.0L;
+  std::array<long double, components> local_integrals{};
+  double local_linf = 0.0;
+  double local_minimum_density = std::numeric_limits<double>::infinity();
+  double local_minimum_pressure = std::numeric_limits<double>::infinity();
+  try
+  {
+    for (int element = 0; element < mesh->GetNE() && valid; ++element)
+    {
+      const mfem::FiniteElement* const finite_element = space->GetFE(element);
+      mfem::ElementTransformation* const transformation =
+          mesh->GetElementTransformation(element);
+      if (finite_element == nullptr || transformation == nullptr)
+      {
+        valid = false;
+        break;
+      }
+      const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), 2 * finite_element->GetOrder() + 8);
+      for (int point = 0; point < rule.GetNPoints(); ++point)
+      {
+        const mfem::IntegrationPoint& integration = rule.IntPoint(point);
+        transformation->SetIntPoint(&integration);
+        mfem::Vector value(components);
+        field.GetVectorValue(element, integration, value);
+        const double weight = integration.weight * transformation->Weight();
+        if (value.Size() != components || !(weight > 0.0) ||
+            !std::isfinite(weight))
+        {
+          valid = false;
+          break;
+        }
+        for (int component = 0; component < components; ++component)
+        {
+          const double entry = value[component];
+          if (!std::isfinite(entry))
+          {
+            valid = false;
+            break;
+          }
+          local_norm_squared += static_cast<long double>(weight) *
+              static_cast<long double>(entry) * entry;
+          local_integrals[static_cast<std::size_t>(component)] +=
+              static_cast<long double>(weight) * entry;
+          local_linf = std::max(local_linf, std::abs(entry));
+        }
+        if (!valid) break;
+        const double density = value[0];
+        if (!(density > 0.0))
+        {
+          valid = false;
+          break;
+        }
+        const double pressure = (gamma - 1.0) *
+            (value[3] - 0.5 *
+                 (value[1] * value[1] + value[2] * value[2]) / density);
+        if (!std::isfinite(pressure))
+        {
+          valid = false;
+          break;
+        }
+        local_minimum_density = std::min(local_minimum_density, density);
+        local_minimum_pressure = std::min(local_minimum_pressure, pressure);
+      }
+    }
+  }
+  catch (...)
+  {
+    valid = false;
+  }
+  if (!CollectiveAll(valid, mesh->GetComm())) return result;
+
+  long double global_norm_squared = 0.0L;
+  std::array<long double, components> global_integrals{};
+  double global_linf = 0.0;
+  double global_minimum_density = 0.0;
+  double global_minimum_pressure = 0.0;
+  const int norm_status = MPI_Allreduce(
+      &local_norm_squared, &global_norm_squared, 1, MPI_LONG_DOUBLE, MPI_SUM,
+      mesh->GetComm());
+  const int integral_status = MPI_Allreduce(
+      local_integrals.data(), global_integrals.data(), components,
+      MPI_LONG_DOUBLE, MPI_SUM, mesh->GetComm());
+  const int linf_status = MPI_Allreduce(
+      &local_linf, &global_linf, 1, MPI_DOUBLE, MPI_MAX, mesh->GetComm());
+  const int density_status = MPI_Allreduce(
+      &local_minimum_density, &global_minimum_density, 1, MPI_DOUBLE, MPI_MIN,
+      mesh->GetComm());
+  const int pressure_status = MPI_Allreduce(
+      &local_minimum_pressure, &global_minimum_pressure, 1, MPI_DOUBLE,
+      MPI_MIN, mesh->GetComm());
+  const bool reductions = norm_status == MPI_SUCCESS &&
+      integral_status == MPI_SUCCESS && linf_status == MPI_SUCCESS &&
+      density_status == MPI_SUCCESS && pressure_status == MPI_SUCCESS;
+  if (!CollectiveAll(reductions, mesh->GetComm()) ||
+      !(global_norm_squared > 0.0L) || !std::isfinite(global_norm_squared) ||
+      !std::isfinite(global_linf) ||
+      !std::isfinite(global_minimum_density) ||
+      !std::isfinite(global_minimum_pressure))
+  {
+    return result;
+  }
+
+  result.l2_norm = std::sqrt(static_cast<double>(global_norm_squared));
+  result.linf_norm = global_linf;
+  for (int component = 0; component < components; ++component)
+    result.component_integrals[static_cast<std::size_t>(component)] =
+        static_cast<double>(
+            global_integrals[static_cast<std::size_t>(component)]);
+  result.minimum_density = global_minimum_density;
+  result.minimum_pressure = global_minimum_pressure;
+  result.valid = std::isfinite(result.l2_norm) && result.l2_norm > 0.0 &&
+      std::all_of(result.component_integrals.begin(),
+                  result.component_integrals.end(),
+                  [](const double value) { return std::isfinite(value); });
+  return result;
+}
+
+inline GlobalFieldDifference MeasureGlobalFieldDifference(
+    const mfem::ParGridFunction& left,
+    const mfem::ParGridFunction& right)
+{
+  GlobalFieldDifference result;
+  const auto* const space = left.ParFESpace();
+  auto* const mesh = space == nullptr
+      ? nullptr
+      : const_cast<mfem::ParMesh*>(space->GetParMesh());
+  if (space == nullptr || mesh == nullptr || right.ParFESpace() != space)
+    return result;
+
+  bool valid = true;
+  long double local_difference_squared = 0.0L;
+  double local_linf = 0.0;
+  try
+  {
+    for (int element = 0; element < mesh->GetNE() && valid; ++element)
+    {
+      const mfem::FiniteElement* const finite_element = space->GetFE(element);
+      mfem::ElementTransformation* const transformation =
+          mesh->GetElementTransformation(element);
+      if (finite_element == nullptr || transformation == nullptr)
+      {
+        valid = false;
+        break;
+      }
+      const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), 2 * finite_element->GetOrder() + 8);
+      for (int point = 0; point < rule.GetNPoints(); ++point)
+      {
+        const mfem::IntegrationPoint& integration = rule.IntPoint(point);
+        transformation->SetIntPoint(&integration);
+        mfem::Vector left_value(components);
+        mfem::Vector right_value(components);
+        left.GetVectorValue(element, integration, left_value);
+        right.GetVectorValue(element, integration, right_value);
+        const double weight = integration.weight * transformation->Weight();
+        if (left_value.Size() != components ||
+            right_value.Size() != components || !(weight > 0.0) ||
+            !std::isfinite(weight))
+        {
+          valid = false;
+          break;
+        }
+        for (int component = 0; component < components; ++component)
+        {
+          const double difference =
+              left_value[component] - right_value[component];
+          if (!std::isfinite(difference))
+          {
+            valid = false;
+            break;
+          }
+          local_difference_squared += static_cast<long double>(weight) *
+              static_cast<long double>(difference) * difference;
+          local_linf = std::max(local_linf, std::abs(difference));
+        }
+        if (!valid) break;
+      }
+    }
+  }
+  catch (...)
+  {
+    valid = false;
+  }
+  if (!CollectiveAll(valid, mesh->GetComm())) return result;
+
+  long double global_difference_squared = 0.0L;
+  double global_linf = 0.0;
+  const int l2_status = MPI_Allreduce(
+      &local_difference_squared, &global_difference_squared, 1,
+      MPI_LONG_DOUBLE, MPI_SUM, mesh->GetComm());
+  const int linf_status = MPI_Allreduce(
+      &local_linf, &global_linf, 1, MPI_DOUBLE, MPI_MAX, mesh->GetComm());
+  const bool reductions =
+      l2_status == MPI_SUCCESS && linf_status == MPI_SUCCESS;
+  if (!CollectiveAll(reductions, mesh->GetComm()) ||
+      global_difference_squared < 0.0L ||
+      !std::isfinite(global_difference_squared) ||
+      !std::isfinite(global_linf))
+  {
+    return result;
+  }
+  result.l2 = std::sqrt(static_cast<double>(global_difference_squared));
+  result.linf = global_linf;
+  result.valid = std::isfinite(result.l2) && std::isfinite(result.linf);
+  return result;
+}
+
+/** Aggregate accepted-work summary; deliberately no per-attempt history. */
+struct QuadratureTrajectoryHealth
+{
+  std::int64_t accepted_steps = 0;
+  std::int64_t nonlinear_updates = 0;
+  std::int64_t linear_iterations = 0;
+  std::int64_t linear_solve_attempts = 0;
+  std::int64_t line_search_trials = 0;
+  std::int64_t true_residual_tightenings = 0;
+  std::int64_t trace_solves = 0;
+  double maximum_true_relative_residual = 0.0;
+  double maximum_conservation_error = 0.0;
+  double maximum_conservation_relative_error = 0.0;
+  double maximum_final_nonlinear_residual = 0.0;
+  double minimum_density = std::numeric_limits<double>::infinity();
+  double minimum_pressure = std::numeric_limits<double>::infinity();
+  double maximum_wave_speed = 0.0;
+  bool passed = false;
+};
+
 // Reuse the established three-way trajectory-alignment tolerances for the
 // global L2 field comparisons performed at every h and dt ladder point.
 inline constexpr double field_comparison_relative_tolerance = 5.0e-8;
@@ -554,6 +985,216 @@ inline std::string_view RegularizationName(
       ? std::string_view{"igr"} : std::string_view{"conventional"};
 }
 
+inline bool MixedAgreement(const double difference,
+                           const double left_scale,
+                           const double right_scale) noexcept
+{
+  const double scale = std::max(left_scale, right_scale);
+  return std::isfinite(difference) && std::isfinite(scale) &&
+      difference <= field_comparison_absolute_tolerance +
+          field_comparison_relative_tolerance * scale;
+}
+
+inline bool ConservedIntegralAgreement(
+    const double left, const double right,
+    const double relative_tolerance) noexcept
+{
+  const double scale = std::max({1.0, std::abs(left), std::abs(right)});
+  return std::isfinite(left) && std::isfinite(right) &&
+      std::isfinite(relative_tolerance) && relative_tolerance > 0.0 &&
+      std::abs(left - right) <= 1.0e-12 + relative_tolerance * scale;
+}
+
+inline bool EquivalentSolverWork(
+    const QuadratureTrajectoryHealth& control,
+    const QuadratureTrajectoryHealth& candidate) noexcept
+{
+  // A quadrature perturbation can move a Krylov residual across its unchanged
+  // stopping threshold by one iteration.  Bound that discrete effect by one
+  // iteration per accepted step while requiring every nonlinear, solve-call,
+  // line-search, tightening, and trace-solve count to remain identical.  This
+  // is a test-only work-equivalence envelope, not a relaxed solver tolerance.
+  const std::int64_t iteration_allowance = control.accepted_steps;
+  return control.accepted_steps == candidate.accepted_steps &&
+      control.nonlinear_updates == candidate.nonlinear_updates &&
+      candidate.linear_iterations >=
+          control.linear_iterations - iteration_allowance &&
+      candidate.linear_iterations <=
+          control.linear_iterations + iteration_allowance &&
+      control.linear_solve_attempts == candidate.linear_solve_attempts &&
+      control.line_search_trials == candidate.line_search_trials &&
+      control.true_residual_tightenings ==
+          candidate.true_residual_tightenings &&
+      control.trace_solves == candidate.trace_solves;
+}
+
+/**
+ * Direct test-only comparison of the bounded p-dependent IGR quadrature
+ * candidate against the unchanged q12/q12 policy.  The same active IGR
+ * initial projection, mesh, dt, and solver policy feed both trajectories.
+ * Only two fixed endpoint scenarios are retained; accepted-step work is
+ * reduced immediately into aggregate health quantities by the runner.
+ */
+template <typename Runner>
+bool RunQuadratureEquivalenceCase(
+    const MPI_Comm communicator, const CaseSelection test_case,
+    const ExecutionSelection execution, Runner& runner)
+{
+  const EulerHdgAssemblyQuadratureOrders expected{
+      2 * test_case.order + 4, 2 * test_case.order + 2};
+  const EulerHdgAssemblyQuadratureOrders candidate =
+      test_case.igr_assembly_quadrature_orders;
+  const bool admitted = test_case.quadrature_equivalence &&
+      test_case.regularization == RegularizationKind::igr &&
+      candidate.volume_order == expected.volume_order &&
+      candidate.face_order == expected.face_order &&
+      candidate.volume_order < 12 && candidate.face_order < 12;
+  if (!CollectiveAll(admitted && runner.Begin(execution), communicator))
+    return false;
+
+  constexpr int elements_per_direction = 4;
+  constexpr double dt = 2.5e-4;
+  const std::array<int, 2> step_counts{{1, 4}};
+  bool passed = true;
+  int rank = 0;
+  MPI_Comm_rank(communicator, &rank);
+  for (const int steps : step_counts)
+  {
+    mfem::ParMesh mesh =
+        MakePeriodicMesh(elements_per_direction, communicator);
+    mfem::L2_FECollection collection(
+        test_case.order, dimension, mfem::BasisType::GaussLegendre,
+        mfem::FiniteElement::VALUE);
+    mfem::ParFiniteElementSpace space(
+        &mesh, &collection, components, mfem::Ordering::byNODES);
+    mfem::ParGridFunction initial(&space);
+    mfem::ParGridFunction source(&space);
+    mfem::ParGridFunction control_field(&space);
+    mfem::ParGridFunction candidate_field(&space);
+    source = 0.0;
+    const ActiveIgrWave wave;
+    if (!CollectiveAll(ProjectInitialState(wave, initial), communicator))
+      return false;
+    const GlobalFieldMetrics initial_metrics = MeasureGlobalField(initial);
+
+    BoundaryAudit control_boundary{};
+    BoundaryAudit candidate_boundary{};
+    const EulerHdgAssemblyQuadratureOrders control_orders{12, 12};
+    const EulerHdgRequest control_request = MakeRequest(
+        mesh, initial, source, control_boundary, execution, test_case,
+        control_orders);
+    const EulerHdgRequest candidate_request = MakeRequest(
+        mesh, initial, source, candidate_boundary, execution, test_case,
+        candidate);
+    QuadratureTrajectoryHealth control_health;
+    QuadratureTrajectoryHealth candidate_health;
+    const bool control_advanced = runner.AdvanceQualified(
+        control_request, steps, dt, control_field, control_health);
+    const bool candidate_advanced = runner.AdvanceQualified(
+        candidate_request, steps, dt, candidate_field, candidate_health);
+    if (!CollectiveAll(control_advanced && candidate_advanced &&
+                           control_boundary.calls == 0 &&
+                           candidate_boundary.calls == 0,
+                       communicator))
+    {
+      return false;
+    }
+
+    const GlobalFieldMetrics control_metrics =
+        MeasureGlobalField(control_field);
+    const GlobalFieldMetrics candidate_metrics =
+        MeasureGlobalField(candidate_field);
+    const GlobalFieldDifference field_difference =
+        MeasureGlobalFieldDifference(control_field, candidate_field);
+    bool conservation_agrees = initial_metrics.valid &&
+        control_metrics.valid && candidate_metrics.valid;
+    for (int component = 0; component < components; ++component)
+    {
+      const std::size_t index = static_cast<std::size_t>(component);
+      const double tolerance =
+          control_request.numerical_policy.conservation_relative_tolerance;
+      conservation_agrees = conservation_agrees &&
+          ConservedIntegralAgreement(
+              initial_metrics.component_integrals[index],
+              control_metrics.component_integrals[index], tolerance) &&
+          ConservedIntegralAgreement(
+              initial_metrics.component_integrals[index],
+              candidate_metrics.component_integrals[index], tolerance) &&
+          ConservedIntegralAgreement(
+              control_metrics.component_integrals[index],
+              candidate_metrics.component_integrals[index], tolerance);
+    }
+    const bool field_agrees = field_difference.valid &&
+        MixedAgreement(field_difference.l2, control_metrics.l2_norm,
+                       candidate_metrics.l2_norm) &&
+        MixedAgreement(field_difference.linf, control_metrics.linf_norm,
+                       candidate_metrics.linf_norm);
+    const bool admissible = control_metrics.minimum_density > 0.0 &&
+        control_metrics.minimum_pressure > 0.0 &&
+        candidate_metrics.minimum_density > 0.0 &&
+        candidate_metrics.minimum_pressure > 0.0 &&
+        control_health.minimum_density > 0.0 &&
+        control_health.minimum_pressure > 0.0 &&
+        candidate_health.minimum_density > 0.0 &&
+        candidate_health.minimum_pressure > 0.0;
+    const bool work_agrees =
+        EquivalentSolverWork(control_health, candidate_health);
+    const bool scenario_passed = control_health.passed &&
+        candidate_health.passed && field_agrees && conservation_agrees &&
+        admissible && work_agrees;
+    passed = passed && scenario_passed;
+
+    if (rank == 0)
+    {
+      std::cout << std::setprecision(17)
+                << "generic CPU IGR p" << test_case.order << " q12/q12 vs q"
+                << candidate.volume_order << "/q" << candidate.face_order
+                << " steps=" << steps
+                << " global field difference L2=" << field_difference.l2
+                << " Linf=" << field_difference.linf
+                << "; field norms control/candidate L2="
+                << control_metrics.l2_norm << '/' << candidate_metrics.l2_norm
+                << " Linf=" << control_metrics.linf_norm << '/'
+                << candidate_metrics.linf_norm
+                << "; minimum rho control/candidate="
+                << control_metrics.minimum_density << '/'
+                << candidate_metrics.minimum_density
+                << " pressure=" << control_metrics.minimum_pressure << '/'
+                << candidate_metrics.minimum_pressure
+                << "; true residual control/candidate="
+                << control_health.maximum_true_relative_residual << '/'
+                << candidate_health.maximum_true_relative_residual
+                << "; conservation relative control/candidate="
+                << control_health.maximum_conservation_relative_error << '/'
+                << candidate_health.maximum_conservation_relative_error
+                << "; nonlinear updates control/candidate="
+                << control_health.nonlinear_updates << '/'
+                << candidate_health.nonlinear_updates
+                << "; linear iterations=" << control_health.linear_iterations
+                << '/' << candidate_health.linear_iterations
+                << "; solve attempts="
+                << control_health.linear_solve_attempts << '/'
+                << candidate_health.linear_solve_attempts
+                << "; line-search trials="
+                << control_health.line_search_trials << '/'
+                << candidate_health.line_search_trials
+                << "; tightenings="
+                << control_health.true_residual_tightenings << '/'
+                << candidate_health.true_residual_tightenings
+                << "; field=" << field_agrees
+                << " conservation=" << conservation_agrees
+                << " admissible=" << admissible
+                << " work=" << work_agrees
+                << " passed=" << scenario_passed << '\n';
+    }
+  }
+  passed = CollectiveAll(passed, communicator);
+  if (rank == 0)
+    std::cout << "generic CPU IGR quadrature equivalence gate p"
+              << test_case.order << ": " << passed << '\n';
+  return passed;
+}
+
 template <std::size_t execution_count, typename Runner>
 bool RunComparisonCase(
     const MPI_Comm communicator, const CaseSelection test_case,
@@ -611,8 +1252,8 @@ bool RunComparisonCase(
       BoundaryAudit boundary{};
       if (!ProjectInitialState(spatial_wave, initial)) return false;
       const EulerHdgRequest request = MakeRequest(
-          mesh, order, initial, source, boundary,
-          executions[execution], regularization);
+          mesh, initial, source, boundary, executions[execution], test_case,
+          test_case.igr_assembly_quadrature_orders);
       const bool advanced = runner.Advance(
           request, 1, spatial_final_time, committed);
       if (!CollectiveAll(advanced && boundary.calls == 0, communicator))
@@ -645,9 +1286,9 @@ bool RunComparisonCase(
           static_cast<double>(step_ladder[level]);
       BoundaryAudit boundary{};
       const EulerHdgRequest request = MakeRequest(
-          temporal_mesh, order, temporal_initial, temporal_source, boundary,
-          executions[execution],
-          regularization);
+          temporal_mesh, temporal_initial, temporal_source, boundary,
+          executions[execution], test_case,
+          test_case.igr_assembly_quadrature_orders);
       const bool advanced = runner.Advance(
           request, step_ladder[level], dt, *solutions[level]);
       if (!CollectiveAll(advanced && boundary.calls == 0, communicator))

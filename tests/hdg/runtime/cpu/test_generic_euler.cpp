@@ -294,6 +294,22 @@ bool All(const bool local, const MPI_Comm communicator = MPI_COMM_WORLD)
                        communicator) == MPI_SUCCESS && result == 1;
 }
 
+bool LinearWorkAccountingExact(
+    const dg::hdg::runtime::cpu::CpuAttemptEvidence& attempt) noexcept
+{
+  return attempt.linear_iterations >= 0 &&
+      attempt.linear_solve_attempts >= 0 &&
+      attempt.newton_correction_linear_iterations >= 0 &&
+      attempt.final_coherent_linear_iterations >= 0 &&
+      attempt.true_residual_tightenings >= 0 &&
+      attempt.linear_iterations ==
+          attempt.newton_correction_linear_iterations +
+              attempt.final_coherent_linear_iterations &&
+      attempt.linear_solve_attempts ==
+          static_cast<int>(attempt.work.complete_trace_solves) +
+              attempt.true_residual_tightenings;
+}
+
 struct BorrowedMeshSnapshot
 {
   int elements = 0;
@@ -871,8 +887,12 @@ bool CheckDefaultNumericalPolicyAdaptiveLinearCap()
   const auto default_policy = request.numerical_policy;
   dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
   if (default_policy.maximum_linear_iterations != 0 ||
-      default_policy.linear_relative_tolerance != 1.0e-12 ||
-      default_policy.igr_assembly_quadrature_order != 12 ||
+      default_policy.newton_correction_linear_relative_tolerance != 1.0e-12 ||
+      default_policy.final_coherent_linear_relative_tolerance != 1.0e-12 ||
+      default_policy.true_residual_tightening_linear_relative_tolerance !=
+          1.0e-12 ||
+      default_policy.igr_assembly_quadrature_orders.volume_order != 12 ||
+      default_policy.igr_assembly_quadrature_orders.face_order != 12 ||
       !core.InitializeBorrowedEuler(request))
   {
     return false;
@@ -906,7 +926,12 @@ bool CheckPeriodicAnnotationsRemainTraceCouplings()
   EulerHdgRequest request = Request(mesh, 1, context, fields);
   request.numerical_policy.conventional_assembly_quadrature_order = 10;
   request.numerical_policy.maximum_linear_iterations = 64;
-  request.numerical_policy.linear_relative_tolerance = 1.0e-11;
+  request.numerical_policy.newton_correction_linear_relative_tolerance =
+      1.0e-11;
+  request.numerical_policy.final_coherent_linear_relative_tolerance =
+      1.0e-11;
+  request.numerical_policy.
+      true_residual_tightening_linear_relative_tolerance = 1.0e-11;
   request.numerical_policy.true_residual_relative_tolerance = 1.0e-9;
   GenericEulerHdgCpuSession session;
   return session.Initialize(request).status ==
@@ -961,6 +986,9 @@ bool CheckNaturalFreeStreamPreservation()
 
   const auto& attempt = core.evidence().last_attempt;
   return committed == before && attempt.committed &&
+      LinearWorkAccountingExact(attempt) &&
+      attempt.newton_correction_linear_iterations == 0 &&
+      attempt.true_residual_tightenings == 0 &&
       attempt.status == dg::hdg::runtime::cpu::CpuAttemptStatus::success &&
       attempt.nonlinear_updates == 0 &&
       attempt.initial_nonlinear_residual <=
@@ -1035,6 +1063,7 @@ bool CheckConventionalConservationEvidence()
               maximum_conservation_relative_error, conservation_gate);
   const auto& attempt = core.evidence().last_attempt;
   return conservation_audited && conservation_gate && attempt.committed &&
+      LinearWorkAccountingExact(attempt) &&
       attempt.status == dg::hdg::runtime::cpu::CpuAttemptStatus::success &&
       attempt.finite_gate && attempt.admissibility_gate &&
       attempt.recovery_gate && attempt.nonlinear_gate &&
@@ -1189,6 +1218,7 @@ bool CheckIgrExtensionConvergenceEvidence()
               maximum_conservation_relative_error, conservation_gate);
   const auto& attempt = core.evidence().last_attempt;
   return conservation_audited && conservation_gate && attempt.committed &&
+      LinearWorkAccountingExact(attempt) &&
       attempt.nonlinear_updates > 1 &&
       attempt.finite_gate && attempt.admissibility_gate &&
       attempt.recovery_gate && attempt.nonlinear_gate &&
@@ -1223,16 +1253,22 @@ bool CheckIgrExtensionNumericalPolicy()
   // Deliberately distinct policy controls ensure the IGR assembly,
   // Krylov stopping, true-residual acceptance, and source conservation gates
   // do not silently borrow the nonlinear tolerance or a helper default.
-  request.numerical_policy.igr_assembly_quadrature_order = 10;
+  request.numerical_policy.igr_assembly_quadrature_orders = {10, 8};
   request.numerical_policy.maximum_linear_iterations = 31;
-  request.numerical_policy.linear_relative_tolerance = 1.0e-12;
+  request.numerical_policy.newton_correction_linear_relative_tolerance =
+      1.0e-12;
+  request.numerical_policy.final_coherent_linear_relative_tolerance =
+      1.0e-12;
+  request.numerical_policy.
+      true_residual_tightening_linear_relative_tolerance = 1.0e-12;
   request.numerical_policy.true_residual_relative_tolerance = 1.0e-9;
   request.numerical_policy.conservation_relative_tolerance = 1.0e-8;
   dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
   if (!core.InitializeBorrowedEuler(request)) return false;
+  const auto requested_orders =
+      request.numerical_policy.igr_assembly_quadrature_orders;
   const bool selected_quadrature =
-      core.evidence().assembly_quadrature_order ==
-      request.numerical_policy.igr_assembly_quadrature_order;
+      core.evidence().assembly_quadrature_order == requested_orders.volume_order;
   dg::hdg::runtime::StateCoordinates coordinates{};
   std::uint64_t generation = 0;
   if (!core.PrepareBorrowedEuler(0.001, coordinates, generation)) return false;
@@ -1252,6 +1288,7 @@ bool CheckIgrExtensionNumericalPolicy()
               maximum_conservation_relative_error, conservation_gate);
   const auto& attempt = core.evidence().last_attempt;
   return selected_quadrature && conservation_audited && conservation_gate &&
+      LinearWorkAccountingExact(attempt) &&
       std::isfinite(maximum_conservation_error) && attempt.committed &&
       attempt.linear_iterations > 0 &&
       attempt.linear_iterations <=
@@ -1458,6 +1495,9 @@ bool CheckZeroUpdateFreeStreamFinalReconstruction()
 
   const auto& attempt = core.evidence().last_attempt;
   return committed == before && attempt.committed &&
+      LinearWorkAccountingExact(attempt) &&
+      attempt.newton_correction_linear_iterations == 0 &&
+      attempt.true_residual_tightenings == 0 &&
       attempt.status == dg::hdg::runtime::cpu::CpuAttemptStatus::success &&
       attempt.nonlinear_updates == 0 && attempt.linear_iterations >= 0 &&
       attempt.initial_nonlinear_residual == 0.0 &&

@@ -24,6 +24,255 @@ inline constexpr std::uint32_t failure_nonfinite = 1U << 4;
 inline constexpr std::uint32_t failure_invalid_permutation = 1U << 5;
 inline constexpr std::uint32_t failure_numerical_breakdown = 1U << 6;
 inline constexpr int native_trace_projection_tile = 8;
+inline constexpr int native_trace_schwarz_maximum_incidence = 2;
+inline constexpr int native_trace_schwarz_faces = 4;
+inline constexpr int native_trace_schwarz_igr_components = 5;
+inline constexpr int native_trace_schwarz_euler_components = 4;
+inline constexpr double native_trace_schwarz_minimum_scale = 0x1p-40;
+inline constexpr double native_trace_schwarz_maximum_scale = 0x1p40;
+
+// Keep the device launch POD byte-for-byte compatible with the production
+// kernel while the public host support record carries specialization identity.
+// In particular, adding a host-only tag must not perturb the old kernel's
+// parameter IR, register allocation, or encoded SASS.
+struct NativeTraceKernelCooperativeSupport final
+{
+  bool supported = false;
+  int device = -1;
+  int compute_major = 0;
+  int compute_minor = 0;
+  int multiprocessors = 0;
+  int threads_per_block = 0;
+  int maximum_active_blocks_per_multiprocessor = 0;
+  int cooperative_blocks = 0;
+};
+
+__host__ __device__ constexpr bool NativeTracePreconditionerIsElementSchwarz(
+    const NativeTracePreconditionerKind kind) noexcept
+{
+  return kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_coupled_fp64;
+}
+
+__host__ __device__ constexpr bool
+NativeTracePreconditionerIsEquilibratedFieldSplit(
+    const NativeTracePreconditionerKind kind) noexcept
+{
+  return kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_fp64;
+}
+
+__host__ __device__ constexpr bool
+NativeTracePreconditionerIsWarpEquilibratedFieldSplit(
+    const NativeTracePreconditionerKind kind) noexcept
+{
+  return kind == NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_fp64;
+}
+
+__host__ __device__ constexpr bool
+NativeTracePreconditionerIsWarpCoupled(
+    const NativeTracePreconditionerKind kind) noexcept
+{
+  return kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_coupled_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_coupled_sigma_jacobi2_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_coupled_sigma_jacobi10_fp64;
+}
+
+__host__ __device__ constexpr bool
+NativeTracePreconditionerUsesFixedSigmaJacobi(
+    const NativeTracePreconditionerKind kind) noexcept
+{
+  return kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_sigma_jacobi1_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi1_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_sigma_jacobi2_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_sigma_jacobi4_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi4_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_sigma_jacobi5_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_sigma_jacobi7_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_sigma_jacobi8_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi8_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_sigma_jacobi9_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi9_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_equilibrated_field_split_sigma_jacobi10_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_coupled_sigma_jacobi2_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_coupled_sigma_jacobi10_fp64;
+}
+
+__host__ __device__ constexpr int NativeTraceFixedSigmaJacobiSweeps(
+    const NativeTracePreconditionerKind kind) noexcept
+{
+  switch (kind)
+  {
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_sigma_jacobi1_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi1_fp64:
+    return 1;
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_sigma_jacobi2_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_coupled_sigma_jacobi2_fp64:
+    return 2;
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_sigma_jacobi3_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64:
+    return native_trace_sigma_jacobi3_sweeps;
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_sigma_jacobi4_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi4_fp64:
+    return 4;
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_sigma_jacobi5_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64:
+    return native_trace_sigma_jacobi5_sweeps;
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_sigma_jacobi6_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64:
+    return 6;
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_sigma_jacobi7_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64:
+    return native_trace_sigma_jacobi7_sweeps;
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_sigma_jacobi8_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi8_fp64:
+    return 8;
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_sigma_jacobi9_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi9_fp64:
+    return 9;
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_equilibrated_field_split_sigma_jacobi10_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64:
+  case NativeTracePreconditionerKind::
+      element_overlap_schwarz_warp_coupled_sigma_jacobi10_fp64:
+    return native_trace_sigma_jacobi_maximum_sweeps;
+  default:
+    return 0;
+  }
+}
+
+__host__ __device__ constexpr bool NativeTraceFixedSigmaJacobiUsesWarp(
+    const NativeTracePreconditionerKind kind) noexcept
+{
+  return kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi1_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi2_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi3_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi4_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi5_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi6_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi7_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi8_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi9_fp64 ||
+      kind == NativeTracePreconditionerKind::
+          element_overlap_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64;
+}
+
+__host__ __device__ constexpr NativeTracePreconditionerKind
+NativeTraceFixedSigmaJacobiBasePreconditioner(
+    const NativeTracePreconditionerKind kind) noexcept
+{
+  return !NativeTracePreconditionerUsesFixedSigmaJacobi(kind)
+      ? kind
+      : NativeTracePreconditionerIsWarpCoupled(kind)
+          ? NativeTracePreconditionerKind::
+                element_overlap_schwarz_warp_coupled_fp64
+          : NativeTraceFixedSigmaJacobiUsesWarp(kind)
+          ? NativeTracePreconditionerKind::
+                element_overlap_schwarz_warp_equilibrated_field_split_fp64
+          : NativeTracePreconditionerKind::
+                element_overlap_schwarz_equilibrated_field_split_fp64;
+}
+
+__host__ __device__ constexpr bool NativeTraceOperatorIsElementMatrixFree(
+    const NativeTraceOperatorKind kind) noexcept
+{
+  return kind == NativeTraceOperatorKind::element_matrix_free_fp64 ||
+      kind == NativeTraceOperatorKind::
+          element_matrix_free_equilibrated_field_split_fp64 ||
+      kind == NativeTraceOperatorKind::
+          element_matrix_free_warp_equilibrated_field_split_fp64;
+}
+
+__host__ __device__ constexpr bool NativeTraceOperatorMatchesPreconditioner(
+    const NativeTraceOperatorKind operator_kind,
+    const NativeTracePreconditionerKind preconditioner_kind) noexcept
+{
+  return (operator_kind == NativeTraceOperatorKind::element_matrix_free_fp64 &&
+          (preconditioner_kind == NativeTracePreconditionerKind::
+               element_overlap_schwarz_fp64 ||
+           preconditioner_kind == NativeTracePreconditionerKind::
+               element_overlap_schwarz_warp_coupled_fp64)) ||
+      (operator_kind == NativeTraceOperatorKind::
+               element_matrix_free_equilibrated_field_split_fp64 &&
+       preconditioner_kind == NativeTracePreconditionerKind::
+           element_overlap_schwarz_equilibrated_field_split_fp64) ||
+      (operator_kind == NativeTraceOperatorKind::
+               element_matrix_free_warp_equilibrated_field_split_fp64 &&
+       preconditioner_kind == NativeTracePreconditionerKind::
+           element_overlap_schwarz_warp_equilibrated_field_split_fp64);
+}
 
 bool CheckedAdd(const std::size_t left, const std::size_t right,
                 std::size_t& result) noexcept
@@ -191,6 +440,428 @@ __device__ void ValidatePermutation(
   for (int row = thread; row < ilu0.factor.rows; row += stride)
     if (workspace.permutation_marks[row] != 1)
       MarkFailure(control, failure_invalid_permutation);
+}
+
+__device__ int DecodeSignedDof(const int encoded, double& sign) noexcept
+{
+  sign = encoded >= 0 ? 1.0 : -1.0;
+  return encoded >= 0 ? encoded : -1 - encoded;
+}
+
+__host__ __device__ int FieldSplitScalarFaceRows(
+    const int patch_rows) noexcept
+{
+  return patch_rows /
+      (native_trace_schwarz_faces * native_trace_schwarz_igr_components);
+}
+
+__host__ __device__ int FieldSplitEulerRows(const int patch_rows) noexcept
+{
+  return native_trace_schwarz_faces *
+      native_trace_schwarz_euler_components *
+      FieldSplitScalarFaceRows(patch_rows);
+}
+
+__host__ __device__ int FieldSplitOriginalRow(
+    const int patch_rows, const int packed_row) noexcept
+{
+  const int scalar_rows = FieldSplitScalarFaceRows(patch_rows);
+  const int euler_rows = FieldSplitEulerRows(patch_rows);
+  const int face_span = native_trace_schwarz_igr_components * scalar_rows;
+  if (packed_row < euler_rows)
+  {
+    const int euler_face_span =
+        native_trace_schwarz_euler_components * scalar_rows;
+    const int face = packed_row / euler_face_span;
+    return face * face_span + packed_row - face * euler_face_span;
+  }
+  const int sigma = packed_row - euler_rows;
+  const int face = sigma / scalar_rows;
+  return face * face_span +
+      native_trace_schwarz_euler_components * scalar_rows +
+      sigma - face * scalar_rows;
+}
+
+__host__ __device__ int FieldSplitPackedRow(
+    const int patch_rows, const int original_row) noexcept
+{
+  const int scalar_rows = FieldSplitScalarFaceRows(patch_rows);
+  const int euler_rows = FieldSplitEulerRows(patch_rows);
+  const int face_span = native_trace_schwarz_igr_components * scalar_rows;
+  const int face = original_row / face_span;
+  const int within_face = original_row - face * face_span;
+  const int component = within_face / scalar_rows;
+  const int scalar = within_face - component * scalar_rows;
+  if (component < native_trace_schwarz_euler_components)
+    return face * native_trace_schwarz_euler_components * scalar_rows +
+        component * scalar_rows + scalar;
+  return euler_rows + face * scalar_rows + scalar;
+}
+
+__host__ __device__ std::size_t FieldSplitSigmaLuOffset(
+    const int patch_rows) noexcept
+{
+  const int euler_rows = FieldSplitEulerRows(patch_rows);
+  return static_cast<std::size_t>(euler_rows) * euler_rows;
+}
+
+__host__ __device__ std::size_t FieldSplitLowerCouplingOffset(
+    const int patch_rows) noexcept
+{
+  const int sigma_rows = patch_rows - FieldSplitEulerRows(patch_rows);
+  return FieldSplitSigmaLuOffset(patch_rows) +
+      static_cast<std::size_t>(sigma_rows) * sigma_rows;
+}
+
+__host__ __device__ std::size_t FieldSplitLeftScaleOffset(
+    const int patch_rows) noexcept
+{
+  const int euler_rows = FieldSplitEulerRows(patch_rows);
+  const int sigma_rows = patch_rows - euler_rows;
+  return FieldSplitLowerCouplingOffset(patch_rows) +
+      static_cast<std::size_t>(sigma_rows) * euler_rows;
+}
+
+__host__ __device__ std::size_t FieldSplitRightScaleOffset(
+    const int patch_rows) noexcept
+{
+  return FieldSplitLeftScaleOffset(patch_rows) + patch_rows;
+}
+
+__host__ __device__ std::size_t FieldSplitWarpInverseDiagonalOffset(
+    const int patch_rows) noexcept
+{
+  return FieldSplitRightScaleOffset(patch_rows) + patch_rows;
+}
+
+__host__ __device__ std::size_t FieldSplitWarpRhsPermutationOffset(
+    const int patch_rows) noexcept
+{
+  return FieldSplitWarpInverseDiagonalOffset(patch_rows) + patch_rows;
+}
+
+__host__ __device__ std::size_t FieldSplitWarpRequiredDoubles(
+    const int patch_rows) noexcept
+{
+  return FieldSplitWarpRhsPermutationOffset(patch_rows) + patch_rows;
+}
+
+__device__ void SolvePivotedDenseLu(
+    const double* const lu, const int* const pivots, const int rows,
+    double* const solution) noexcept
+{
+  for (int row = 0; row < rows; ++row)
+  {
+    const int pivot = pivots[row];
+    if (pivot != row)
+    {
+      const double value = solution[row];
+      solution[row] = solution[pivot];
+      solution[pivot] = value;
+    }
+  }
+  for (int row = 0; row < rows; ++row)
+  {
+    double value = solution[row];
+    for (int column = 0; column < row; ++column)
+      value -= lu[row * rows + column] * solution[column];
+    solution[row] = value;
+  }
+  for (int row = rows - 1; row >= 0; --row)
+  {
+    double value = solution[row];
+    for (int column = row + 1; column < rows; ++column)
+      value -= lu[row * rows + column] * solution[column];
+    solution[row] = value / lu[row * rows + row];
+  }
+}
+
+template <int TileWidth>
+__device__ double FieldSplitTileSum(double value,
+                                    const unsigned int mask) noexcept
+{
+#pragma unroll
+  for (int offset = TileWidth / 2; offset > 0; offset /= 2)
+    value += __shfl_down_sync(mask, value, offset, TileWidth);
+  return value;
+}
+
+template <int TileWidth>
+__device__ void SolveFieldSplitLuCooperatively(
+    const double* const lu, const double* const inverse_diagonal,
+    const int rows, double* const solution, const int lane,
+    const unsigned int mask) noexcept
+{
+  for (int row = 1; row < rows; ++row)
+  {
+    double partial = 0.0;
+    for (int column = lane; column < row; column += TileWidth)
+      partial = fma(lu[row * rows + column], solution[column], partial);
+    const double sum = FieldSplitTileSum<TileWidth>(partial, mask);
+    if (lane == 0) solution[row] -= sum;
+    __syncwarp(mask);
+  }
+  for (int row = rows - 1; row >= 0; --row)
+  {
+    double partial = 0.0;
+    for (int column = row + 1 + lane; column < rows;
+         column += TileWidth)
+      partial = fma(lu[row * rows + column], solution[column], partial);
+    const double sum = FieldSplitTileSum<TileWidth>(partial, mask);
+    if (lane == 0)
+      solution[row] = (solution[row] - sum) * inverse_diagonal[row];
+    __syncwarp(mask);
+  }
+}
+
+template <int TileWidth>
+__device__ void ApplyWarpEquilibratedFieldSplit(
+    const NativeTraceElementSchwarzView schwarz,
+    NativeTraceSolveControl* const control) noexcept
+{
+  static_assert(TileWidth == 16 || TileWidth == 32);
+  const int lane = static_cast<int>(threadIdx.x) % TileWidth;
+  const int tile_in_warp =
+      (static_cast<int>(threadIdx.x) & 31) / TileWidth;
+  const unsigned int mask = TileWidth == 32
+      ? 0xffffffffU : 0xffffU << (16 * tile_in_warp);
+  const int tile = GlobalThreadIndex() / TileWidth;
+  const int tile_stride = GlobalThreadStride() / TileWidth;
+  const int patch_rows = schwarz.patch_rows;
+  const int euler_rows = FieldSplitEulerRows(patch_rows);
+  const int sigma_rows = patch_rows - euler_rows;
+
+  for (int element = tile; element < schwarz.elements;
+       element += tile_stride)
+  {
+    const std::size_t vector_offset =
+        static_cast<std::size_t>(element) * patch_rows;
+    const std::size_t matrix_offset = vector_offset * patch_rows;
+    const double* const storage = schwarz.patch_lu + matrix_offset;
+    const double* const euler_lu = storage;
+    const double* const sigma_lu =
+        storage + FieldSplitSigmaLuOffset(patch_rows);
+    const double* const lower_coupling =
+        storage + FieldSplitLowerCouplingOffset(patch_rows);
+    const double* const left_scale =
+        storage + FieldSplitLeftScaleOffset(patch_rows);
+    const double* const right_scale =
+        storage + FieldSplitRightScaleOffset(patch_rows);
+    const double* const inverse_diagonal =
+        storage + FieldSplitWarpInverseDiagonalOffset(patch_rows);
+    const double* const rhs_permutation =
+        storage + FieldSplitWarpRhsPermutationOffset(patch_rows);
+    const double* const rhs = schwarz.element_rhs + vector_offset;
+    double* const solution = schwarz.element_solution + vector_offset;
+
+    // Apply the setup-time pivot permutation while packing the Euler RHS.
+    for (int packed = lane; packed < euler_rows; packed += TileWidth)
+    {
+      const int source = static_cast<int>(rhs_permutation[packed]);
+      const int original = FieldSplitOriginalRow(patch_rows, source);
+      const double value = left_scale[source] * rhs[original];
+      solution[packed] = value;
+      if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
+    }
+    __syncwarp(mask);
+    SolveFieldSplitLuCooperatively<TileWidth>(
+        euler_lu, inverse_diagonal, euler_rows, solution, lane, mask);
+
+    // The sigma pivot acts on the already-adjusted RHS.  Use its final source
+    // row directly so no recurring serial swap chain remains.
+    for (int sigma = 0; sigma < sigma_rows; ++sigma)
+    {
+      const int packed = euler_rows + sigma;
+      const int source = static_cast<int>(rhs_permutation[packed]);
+      const int source_sigma = source - euler_rows;
+      double partial = 0.0;
+      for (int euler = lane; euler < euler_rows; euler += TileWidth)
+        partial = fma(lower_coupling[source_sigma * euler_rows + euler],
+                      solution[euler], partial);
+      const double coupling = FieldSplitTileSum<TileWidth>(partial, mask);
+      if (lane == 0)
+      {
+        const int original = FieldSplitOriginalRow(patch_rows, source);
+        const double value = left_scale[source] * rhs[original] - coupling;
+        solution[packed] = value;
+        if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
+      }
+      __syncwarp(mask);
+    }
+
+    for (int packed = lane; packed < euler_rows; packed += TileWidth)
+      solution[packed] *= right_scale[packed];
+    __syncwarp(mask);
+    SolveFieldSplitLuCooperatively<TileWidth>(
+        sigma_lu, inverse_diagonal + euler_rows, sigma_rows,
+        solution + euler_rows, lane, mask);
+    for (int sigma = lane; sigma < sigma_rows; sigma += TileWidth)
+    {
+      const int packed = euler_rows + sigma;
+      solution[packed] *= right_scale[packed];
+      if (!isfinite(solution[packed]))
+        MarkFailure(control, failure_nonfinite);
+    }
+    __syncwarp(mask);
+  }
+}
+
+__device__ void ValidateElementSchwarz(
+    const NativeTraceElementSchwarzView schwarz,
+    const bool equilibrated_field_split,
+    const bool warp_equilibrated_field_split,
+    NativeTraceSolveControl* control,
+    const cg::grid_group& grid) noexcept
+{
+  const int thread = GlobalThreadIndex();
+  const int stride = GlobalThreadStride();
+  const int patch_rows = schwarz.patch_rows;
+  const int element_slots = schwarz.elements * patch_rows;
+  const int patch_entries = element_slots * patch_rows;
+  for (int entry = thread; entry < patch_entries; entry += stride)
+  {
+    if (!isfinite(schwarz.patch_matrix[entry]) ||
+        !isfinite(schwarz.patch_lu[entry]))
+      MarkFailure(control, failure_nonfinite);
+  }
+  for (int slot = thread; slot < element_slots; slot += stride)
+  {
+    double sign = 1.0;
+    const int truth = DecodeSignedDof(
+        schwarz.signed_element_true_dofs[slot], sign);
+    if (truth < 0 || truth >= schwarz.true_rows ||
+        (sign != 1.0 && sign != -1.0))
+      MarkFailure(control, failure_invalid_preconditioner);
+  }
+  for (int item = thread; item < element_slots; item += stride)
+  {
+    const int local_item = item % patch_rows;
+    const int pivot = schwarz.pivots[item];
+    const std::size_t matrix_offset =
+        static_cast<std::size_t>(item / patch_rows) * patch_rows *
+        patch_rows;
+    if (equilibrated_field_split)
+    {
+      const int euler_rows = FieldSplitEulerRows(patch_rows);
+      const int block_rows = local_item < euler_rows
+          ? euler_rows : patch_rows - euler_rows;
+      const int block_column = local_item < euler_rows
+          ? local_item : local_item - euler_rows;
+      const std::size_t factor_offset = local_item < euler_rows
+          ? 0 : FieldSplitSigmaLuOffset(patch_rows);
+      const double diagonal = schwarz.patch_lu[
+          matrix_offset + factor_offset +
+          static_cast<std::size_t>(block_column) * block_rows +
+          block_column];
+      const double left_scale = schwarz.patch_lu[
+          matrix_offset + FieldSplitLeftScaleOffset(patch_rows) +
+          local_item];
+      const double right_scale = schwarz.patch_lu[
+          matrix_offset + FieldSplitRightScaleOffset(patch_rows) +
+          local_item];
+      if (pivot < block_column || pivot >= block_rows || diagonal == 0.0 ||
+          !isfinite(diagonal) || !isfinite(left_scale) ||
+          !isfinite(right_scale) ||
+          left_scale < native_trace_schwarz_minimum_scale ||
+          left_scale > native_trace_schwarz_maximum_scale ||
+          right_scale < native_trace_schwarz_minimum_scale ||
+          right_scale > native_trace_schwarz_maximum_scale)
+        MarkFailure(control, failure_invalid_preconditioner);
+      if (warp_equilibrated_field_split)
+      {
+        const double inverse_diagonal = schwarz.patch_lu[
+            matrix_offset +
+            FieldSplitWarpInverseDiagonalOffset(patch_rows) + local_item];
+        const double permutation_value = schwarz.patch_lu[
+            matrix_offset +
+            FieldSplitWarpRhsPermutationOffset(patch_rows) + local_item];
+        const int block_begin = local_item < euler_rows ? 0 : euler_rows;
+        const int source = static_cast<int>(permutation_value);
+        const double reciprocal_error =
+            fabs(fma(diagonal, inverse_diagonal, -1.0));
+        if (!isfinite(inverse_diagonal) || inverse_diagonal == 0.0 ||
+            !isfinite(permutation_value) ||
+            permutation_value != static_cast<double>(source) ||
+            source < block_begin || source >= block_begin + block_rows ||
+            !isfinite(reciprocal_error) ||
+            reciprocal_error > 8.0 * 2.2204460492503131e-16)
+          MarkFailure(control, failure_invalid_preconditioner);
+      }
+    }
+    else
+    {
+      const double diagonal = schwarz.patch_lu[
+          matrix_offset + static_cast<std::size_t>(local_item) * patch_rows +
+          local_item];
+      if (pivot < local_item || pivot >= patch_rows || diagonal == 0.0 ||
+          !isfinite(diagonal))
+        MarkFailure(control, failure_invalid_preconditioner);
+    }
+  }
+  for (int row = thread; row < schwarz.true_rows; row += stride)
+  {
+    int multiplicity = 0;
+    for (int incidence = 0;
+         incidence < native_trace_schwarz_maximum_incidence;
+         ++incidence)
+    {
+      const int slot = schwarz.true_incidence_slots[
+          native_trace_schwarz_maximum_incidence * row + incidence];
+      if (slot < 0) continue;
+      if (slot >= element_slots)
+      {
+        MarkFailure(control, failure_invalid_preconditioner);
+        continue;
+      }
+      double sign = 1.0;
+      const int truth = DecodeSignedDof(
+          schwarz.signed_element_true_dofs[slot], sign);
+      if (truth != row)
+        MarkFailure(control, failure_invalid_preconditioner);
+      ++multiplicity;
+    }
+    if (multiplicity < schwarz.minimum_multiplicity ||
+        multiplicity > schwarz.maximum_multiplicity)
+      MarkFailure(control, failure_invalid_preconditioner);
+  }
+  grid.sync();
+}
+
+__device__ void ValidateFixedSigmaJacobiRows(
+    const NativeTraceElementSchwarzView schwarz,
+    NativeTraceSolveControl* control,
+    const cg::grid_group& grid) noexcept
+{
+  const int thread = GlobalThreadIndex();
+  const int stride = GlobalThreadStride();
+  const int patch_rows = schwarz.patch_rows;
+  const int sigma_begin = 4 * (schwarz.true_rows / 5);
+  if (thread == 0 && schwarz.true_rows % 5 != 0)
+    MarkFailure(control, failure_invalid_preconditioner);
+  for (int row = thread; row < schwarz.true_rows; row += stride)
+  {
+    int sigma_field = -1;
+    for (int incidence = 0;
+         incidence < native_trace_schwarz_maximum_incidence;
+         ++incidence)
+    {
+      const int slot = schwarz.true_incidence_slots[
+          native_trace_schwarz_maximum_incidence * row + incidence];
+      if (slot < 0) continue;
+      const int local_row = slot % patch_rows;
+      const int packed_row = FieldSplitPackedRow(patch_rows, local_row);
+      const int incidence_sigma =
+          packed_row >= FieldSplitEulerRows(patch_rows) ? 1 : 0;
+      if (sigma_field >= 0 && sigma_field != incidence_sigma)
+        MarkFailure(control, failure_invalid_preconditioner);
+      sigma_field = incidence_sigma;
+    }
+    if (sigma_field < 0)
+      MarkFailure(control, failure_invalid_preconditioner);
+    if (sigma_field != (row >= sigma_begin ? 1 : 0))
+      MarkFailure(control, failure_invalid_preconditioner);
+  }
+  grid.sync();
 }
 
 __device__ double GridDot(const double* left, const double* right,
@@ -433,26 +1104,171 @@ __device__ void SparseMatrixVector(
   grid.sync();
 }
 
-__device__ void ComputeActualResidual(
-    const NativeTraceSystemView system, double* residual,
+__device__ void ApplyTraceOperator(
+    const NativeTraceSystemView system,
+    const NativeTracePreconditionerView preconditioner,
+    const double* input, double* output,
     NativeTraceSolveControl* control,
     const cg::grid_group& grid) noexcept
 {
+  if (system.operator_kind == NativeTraceOperatorKind::assembled_csr_fp64)
+  {
+    SparseMatrixVector(system.matrix, input, output, control, grid);
+    return;
+  }
+  if (!NativeTraceOperatorIsElementMatrixFree(system.operator_kind))
+  {
+    MarkFailure(control, failure_invalid_system);
+    grid.sync();
+    return;
+  }
+
+  const NativeTraceElementSchwarzView schwarz =
+      preconditioner.element_schwarz;
+  const int patch_rows = schwarz.patch_rows;
+  const int element_slots = schwarz.elements * patch_rows;
+  const int thread = GlobalThreadIndex();
+  const int stride = GlobalThreadStride();
+  if (grid.thread_rank() == 0) ++control->operator_applications;
+  grid.sync();
+
+  // Exact FP64 T gather and row-major S_e action. Each element row is owned
+  // by one thread and accumulates columns in increasing local order.
+  for (int slot = thread; slot < element_slots; slot += stride)
+  {
+    const int element = slot / patch_rows;
+    const int row = slot - element * patch_rows;
+    const std::size_t row_offset =
+        (static_cast<std::size_t>(element) * patch_rows + row) * patch_rows;
+    const std::size_t map_offset =
+        static_cast<std::size_t>(element) * patch_rows;
+    double value = 0.0;
+    for (int column = 0; column < patch_rows; ++column)
+    {
+      double sign = 1.0;
+      const int truth = DecodeSignedDof(
+          schwarz.signed_element_true_dofs[map_offset + column], sign);
+      value += system.element_schur[row_offset + column] *
+          sign * input[truth];
+    }
+    schwarz.element_solution[slot] = value;
+    if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
+  }
+  grid.sync();
+
+  // Exact FP64 T^T reduction. Static incidence order makes the one/two-term
+  // sum deterministic and avoids global atomics.
+  for (int row = thread; row < system.matrix.rows; row += stride)
+  {
+    double value = 0.0;
+    for (int incidence = 0;
+         incidence < native_trace_schwarz_maximum_incidence; ++incidence)
+    {
+      const int slot = schwarz.true_incidence_slots[
+          native_trace_schwarz_maximum_incidence * row + incidence];
+      if (slot < 0) continue;
+      double sign = 1.0;
+      (void)DecodeSignedDof(
+          schwarz.signed_element_true_dofs[slot], sign);
+      value += sign * schwarz.element_solution[slot];
+    }
+    output[row] = value;
+    if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
+  }
+  grid.sync();
+}
+
+__device__ void ComputeActualResidual(
+    const NativeTraceSystemView system,
+    const NativeTracePreconditionerView preconditioner, double* residual,
+    NativeTraceSolveControl* control,
+    const cg::grid_group& grid) noexcept
+{
+  ApplyTraceOperator(system, preconditioner, system.solution, residual,
+                     control, grid);
   const int thread = GlobalThreadIndex();
   const int stride = GlobalThreadStride();
   for (int row = thread; row < system.matrix.rows; row += stride)
   {
-    double value = system.rhs[row];
-    for (int entry = system.matrix.row_offsets[row];
-         entry < system.matrix.row_offsets[row + 1]; ++entry)
-      value -= system.matrix.values[entry] *
-          system.solution[system.matrix.columns[entry]];
+    const double value = system.rhs[row] - residual[row];
     residual[row] = value;
     if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
   }
   grid.sync();
 }
 
+// One full warp owns one exact principal patch.  Setup retains the ordinary
+// pivoted FP64 LU and pivot sequence; the recurring apply performs the pivot
+// chain once, then parallelizes every triangular row dot product.  No inverse
+// diagonal or permutation metadata is materialized, so this is the same
+// factor as the scalar full-patch policy with a cooperative application leaf.
+__device__ void ApplyWarpCoupledPatch(
+    const NativeTraceElementSchwarzView schwarz,
+    NativeTraceSolveControl* const control) noexcept
+{
+  constexpr int tile_width = 32;
+  const int lane = static_cast<int>(threadIdx.x) & (tile_width - 1);
+  const unsigned int mask = 0xffffffffU;
+  const int tile = GlobalThreadIndex() / tile_width;
+  const int tile_stride = GlobalThreadStride() / tile_width;
+  const int patch_rows = schwarz.patch_rows;
+
+  for (int element = tile; element < schwarz.elements;
+       element += tile_stride)
+  {
+    const std::size_t vector_offset =
+        static_cast<std::size_t>(element) * patch_rows;
+    const std::size_t matrix_offset = vector_offset * patch_rows;
+    const double* const lu = schwarz.patch_lu + matrix_offset;
+    const int* const pivots = schwarz.pivots + vector_offset;
+    double* const solution = schwarz.element_solution + vector_offset;
+
+    // Pivot swaps are order-dependent. One lane applies the exact retained
+    // chain, including repeated pivot rows, before any lane reads the vector.
+    if (lane == 0)
+      for (int row = 0; row < patch_rows; ++row)
+      {
+        const int pivot = pivots[row];
+        if (pivot != row)
+        {
+          const double value = solution[row];
+          solution[row] = solution[pivot];
+          solution[pivot] = value;
+        }
+      }
+    __syncwarp(mask);
+
+    for (int row = 1; row < patch_rows; ++row)
+    {
+      double partial = 0.0;
+      for (int column = lane; column < row; column += tile_width)
+        partial = fma(lu[row * patch_rows + column], solution[column],
+                      partial);
+      const double sum = FieldSplitTileSum<tile_width>(partial, mask);
+      if (lane == 0) solution[row] -= sum;
+      __syncwarp(mask);
+    }
+    for (int row = patch_rows - 1; row >= 0; --row)
+    {
+      double partial = 0.0;
+      for (int column = row + 1 + lane; column < patch_rows;
+           column += tile_width)
+        partial = fma(lu[row * patch_rows + column], solution[column],
+                      partial);
+      const double sum = FieldSplitTileSum<tile_width>(partial, mask);
+      if (lane == 0)
+      {
+        solution[row] =
+            (solution[row] - sum) / lu[row * patch_rows + row];
+        if (!isfinite(solution[row]))
+          MarkFailure(control, failure_nonfinite);
+      }
+      __syncwarp(mask);
+    }
+  }
+}
+
+template <bool CoupledWarp>
 __device__ void ApplyPreconditioner(
     const NativeTraceSystemView system,
     const NativeTracePreconditionerView preconditioner,
@@ -475,6 +1291,271 @@ __device__ void ApplyPreconditioner(
           system.matrix.values[system.matrix.row_offsets[row]];
       output[row] = value;
       if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
+    }
+    grid.sync();
+    return;
+  }
+
+  if (NativeTracePreconditionerIsElementSchwarz(preconditioner.kind))
+  {
+    const NativeTraceElementSchwarzView schwarz =
+        preconditioner.element_schwarz;
+    const bool equilibrated_field_split =
+        NativeTracePreconditionerIsEquilibratedFieldSplit(
+            preconditioner.kind);
+    const bool warp_equilibrated_field_split =
+        NativeTracePreconditionerIsWarpEquilibratedFieldSplit(
+            preconditioner.kind);
+    const int patch_rows = schwarz.patch_rows;
+    const int element_slots = schwarz.elements * patch_rows;
+
+    // Gather the complete signed patch RHS before touching output. The final
+    // GMRES update intentionally permits input == output.
+    for (int slot = thread; slot < element_slots; slot += stride)
+    {
+      double sign = 1.0;
+      const int truth = DecodeSignedDof(
+          schwarz.signed_element_true_dofs[slot], sign);
+      schwarz.element_rhs[slot] = sign * input[truth];
+      if (!equilibrated_field_split)
+        schwarz.element_solution[slot] = schwarz.element_rhs[slot];
+    }
+    grid.sync();
+
+    if (warp_equilibrated_field_split)
+    {
+      if (patch_rows == 40)
+        ApplyWarpEquilibratedFieldSplit<16>(schwarz, control);
+      else
+        ApplyWarpEquilibratedFieldSplit<32>(schwarz, control);
+      grid.sync();
+    }
+
+    if constexpr (CoupledWarp)
+    {
+      ApplyWarpCoupledPatch(schwarz, control);
+      grid.sync();
+    }
+
+    if ((!warp_equilibrated_field_split && !CoupledWarp) ||
+        control->preconditioner_applications == 1)
+      for (int element = thread; element < schwarz.elements;
+           element += stride)
+    {
+      const std::size_t vector_offset =
+          static_cast<std::size_t>(element) * patch_rows;
+      const std::size_t matrix_offset = vector_offset * patch_rows;
+      const double* const matrix =
+          schwarz.patch_matrix + matrix_offset;
+      const double* const lu = schwarz.patch_lu + matrix_offset;
+      const int* const pivots = schwarz.pivots + vector_offset;
+      const double* const rhs = schwarz.element_rhs + vector_offset;
+      double* const solution = schwarz.element_solution + vector_offset;
+
+      if (equilibrated_field_split && !warp_equilibrated_field_split)
+      {
+        const int euler_rows = FieldSplitEulerRows(patch_rows);
+        const int sigma_rows = patch_rows - euler_rows;
+        const double* const euler_lu = lu;
+        const double* const sigma_lu =
+            lu + FieldSplitSigmaLuOffset(patch_rows);
+        const double* const lower_coupling =
+            lu + FieldSplitLowerCouplingOffset(patch_rows);
+        const double* const left_scale =
+            lu + FieldSplitLeftScaleOffset(patch_rows);
+        const double* const right_scale =
+            lu + FieldSplitRightScaleOffset(patch_rows);
+
+        // Lower multiplicative block factorization
+        // [A_UU 0; A_sigma,U A_sigma,sigma].  The retained global operator
+        // and GMRES remain unchanged.  Packing is only a private local solve
+        // layout; the lower coupling is retained in the same two-sided
+        // scaling, and the externally committed trace stays binary64
+        // Uhat4/Uhat5.
+        for (int packed = 0; packed < euler_rows; ++packed)
+        {
+          const int original = FieldSplitOriginalRow(patch_rows, packed);
+          solution[packed] = left_scale[packed] * rhs[original];
+        }
+        SolvePivotedDenseLu(
+            euler_lu, pivots, euler_rows, solution);
+
+        for (int sigma = 0; sigma < sigma_rows; ++sigma)
+        {
+          const int packed = euler_rows + sigma;
+          const int original_row =
+              FieldSplitOriginalRow(patch_rows, packed);
+          double value = left_scale[packed] * rhs[original_row];
+          for (int euler = 0; euler < euler_rows; ++euler)
+            value -= lower_coupling[sigma * euler_rows + euler] *
+                solution[euler];
+          solution[packed] = value;
+        }
+        for (int packed = 0; packed < euler_rows; ++packed)
+          solution[packed] *= right_scale[packed];
+        SolvePivotedDenseLu(
+            sigma_lu, pivots + euler_rows, sigma_rows,
+            solution + euler_rows);
+        for (int sigma = 0; sigma < sigma_rows; ++sigma)
+        {
+          const int packed = euler_rows + sigma;
+          solution[packed] *= right_scale[packed];
+        }
+      }
+      else if (!warp_equilibrated_field_split && !CoupledWarp)
+        SolvePivotedDenseLu(lu, pivots, patch_rows, solution);
+
+      // Validate the first actual application of each native solve against
+      // the retained unfactored patch. The synchronized aggregate counter
+      // makes this uniform across the cooperative grid; later applications
+      // avoid recurring dense validation traffic.
+      if (control->preconditioner_applications == 1)
+      {
+        if (equilibrated_field_split)
+        {
+          const int euler_rows = FieldSplitEulerRows(patch_rows);
+          const int sigma_rows = patch_rows - euler_rows;
+          double euler_matrix_norm = 0.0;
+          double euler_solution_norm = 0.0;
+          double euler_rhs_norm = 0.0;
+          double euler_residual_norm = 0.0;
+          for (int euler_row = 0; euler_row < euler_rows; ++euler_row)
+          {
+            const int original_row =
+                FieldSplitOriginalRow(patch_rows, euler_row);
+            double row_norm = 0.0;
+            double residual = -rhs[original_row];
+            euler_solution_norm = fmax(
+                euler_solution_norm, fabs(solution[euler_row]));
+            euler_rhs_norm = fmax(euler_rhs_norm, fabs(rhs[original_row]));
+            for (int euler_column = 0; euler_column < euler_rows;
+                 ++euler_column)
+            {
+              const int original_column =
+                  FieldSplitOriginalRow(patch_rows, euler_column);
+              const double coefficient =
+                  matrix[original_row * patch_rows + original_column];
+              row_norm += fabs(coefficient);
+              residual += coefficient * solution[euler_column];
+            }
+            euler_matrix_norm = fmax(euler_matrix_norm, row_norm);
+            euler_residual_norm = fmax(
+                euler_residual_norm, fabs(residual));
+          }
+
+          double sigma_matrix_norm = 0.0;
+          double sigma_solution_norm = 0.0;
+          double sigma_rhs_norm = 0.0;
+          double sigma_residual_norm = 0.0;
+          for (int sigma_row = 0; sigma_row < sigma_rows; ++sigma_row)
+          {
+            const int packed_row = euler_rows + sigma_row;
+            const int original_row =
+                FieldSplitOriginalRow(patch_rows, packed_row);
+            double adjusted_rhs = rhs[original_row];
+            for (int euler_column = 0; euler_column < euler_rows;
+                 ++euler_column)
+            {
+              const int original_column =
+                  FieldSplitOriginalRow(patch_rows, euler_column);
+              adjusted_rhs -=
+                  matrix[original_row * patch_rows + original_column] *
+                  solution[euler_column];
+            }
+            double row_norm = 0.0;
+            double residual = -adjusted_rhs;
+            sigma_solution_norm = fmax(
+                sigma_solution_norm, fabs(solution[packed_row]));
+            sigma_rhs_norm = fmax(sigma_rhs_norm, fabs(adjusted_rhs));
+            for (int sigma_column = 0; sigma_column < sigma_rows;
+                 ++sigma_column)
+            {
+              const int packed_column = euler_rows + sigma_column;
+              const int original_column =
+                  FieldSplitOriginalRow(patch_rows, packed_column);
+              const double coefficient =
+                  matrix[original_row * patch_rows + original_column];
+              row_norm += fabs(coefficient);
+              residual += coefficient * solution[packed_column];
+            }
+            sigma_matrix_norm = fmax(sigma_matrix_norm, row_norm);
+            sigma_residual_norm = fmax(
+                sigma_residual_norm, fabs(residual));
+          }
+          const double euler_backward_error = euler_residual_norm /
+              fmax(euler_matrix_norm * euler_solution_norm + euler_rhs_norm,
+                   0x1p-1022);
+          const double sigma_backward_error = sigma_residual_norm /
+              fmax(sigma_matrix_norm * sigma_solution_norm + sigma_rhs_norm,
+                   0x1p-1022);
+          const double backward_error_limit =
+              4096.0 * 2.2204460492503131e-16 * patch_rows;
+          if (!isfinite(euler_backward_error) ||
+              !isfinite(sigma_backward_error) ||
+              euler_backward_error > backward_error_limit ||
+              sigma_backward_error > backward_error_limit)
+            MarkFailure(control, failure_invalid_preconditioner);
+        }
+        else
+        {
+          double matrix_norm = 0.0;
+          double solution_norm = 0.0;
+          double rhs_norm = 0.0;
+          double residual_norm = 0.0;
+          for (int row = 0; row < patch_rows; ++row)
+          {
+            double row_norm = 0.0;
+            double residual = -rhs[row];
+            solution_norm = fmax(solution_norm, fabs(solution[row]));
+            rhs_norm = fmax(rhs_norm, fabs(rhs[row]));
+            for (int column = 0; column < patch_rows; ++column)
+            {
+              const double coefficient = matrix[row * patch_rows + column];
+              row_norm += fabs(coefficient);
+              residual += coefficient * solution[column];
+            }
+            matrix_norm = fmax(matrix_norm, row_norm);
+            residual_norm = fmax(residual_norm, fabs(residual));
+          }
+          const double denominator =
+              fmax(matrix_norm * solution_norm + rhs_norm, 0x1p-1022);
+          const double backward_error = residual_norm / denominator;
+          const double backward_error_limit =
+              4096.0 * 2.2204460492503131e-16 * patch_rows;
+          if (!isfinite(backward_error) ||
+              backward_error > backward_error_limit)
+            MarkFailure(control, failure_invalid_preconditioner);
+        }
+      }
+    }
+    grid.sync();
+    if (control->failure_mask != 0) return;
+
+    // One thread owns one true row and reduces its static one/two element
+    // incidences in fixed order. This is deterministic inverse-multiplicity
+    // weighting and uses no global atomics.
+    for (int row = thread; row < rows; row += stride)
+    {
+      double value = 0.0;
+      int multiplicity = 0;
+      for (int incidence = 0;
+           incidence < native_trace_schwarz_maximum_incidence; ++incidence)
+      {
+        const int slot = schwarz.true_incidence_slots[
+            native_trace_schwarz_maximum_incidence * row + incidence];
+        if (slot < 0) continue;
+        double sign = 1.0;
+        (void)DecodeSignedDof(
+            schwarz.signed_element_true_dofs[slot], sign);
+        const int solution_slot = equilibrated_field_split
+            ? (slot / patch_rows) * patch_rows +
+                FieldSplitPackedRow(patch_rows, slot % patch_rows)
+            : slot;
+        value += sign * schwarz.element_solution[solution_slot];
+        ++multiplicity;
+      }
+      output[row] = value / static_cast<double>(multiplicity);
+      if (!isfinite(output[row])) MarkFailure(control, failure_nonfinite);
     }
     grid.sync();
     return;
@@ -554,6 +1635,87 @@ __device__ void ApplyPreconditioner(
   grid.sync();
 }
 
+template <bool PreserveAliasedInput, bool CoupledWarp>
+__device__ void ApplyFixedSigmaJacobiPreconditioner(
+    const NativeTraceSystemView system,
+    const NativeTracePreconditionerView preconditioner,
+    const NativeTraceWorkspaceView workspace,
+    const double* input, double* output,
+    NativeTraceSolveControl* control,
+    const cg::grid_group& grid) noexcept
+{
+  const int rows = system.matrix.rows;
+  const int thread = GlobalThreadIndex();
+  const int stride = GlobalThreadStride();
+  const int sigma_begin = 4 * (rows / 5);
+  const int sigma_jacobi_sweeps =
+      NativeTraceFixedSigmaJacobiSweeps(preconditioner.kind);
+  double* const next_sigma = workspace.vectors + rows;
+  const double* sigma_rhs = input;
+
+  if (sigma_jacobi_sweeps < 1 ||
+      sigma_jacobi_sweeps > native_trace_sigma_jacobi_maximum_sweeps)
+  {
+    if (grid.thread_rank() == 0)
+      MarkFailure(control, failure_invalid_preconditioner);
+    grid.sync();
+    return;
+  }
+
+  if constexpr (PreserveAliasedInput)
+  {
+    // The final GMRES update intentionally permits input == output. Preserve
+    // its original component-major sigma RHS before the exact local predictor
+    // writes output; the third existing IGR vector is otherwise unused by the
+    // element-Schwarz path. Arnoldi applications are nonaliasing and bypass
+    // both this copy and its grid barrier.
+    double* const saved_sigma_rhs = workspace.vectors +
+        2 * static_cast<std::size_t>(rows);
+    for (int row = sigma_begin + thread; row < rows; row += stride)
+      saved_sigma_rhs[row] = input[row];
+    grid.sync();
+    sigma_rhs = saved_sigma_rhs;
+  }
+
+  NativeTracePreconditionerView base_preconditioner = preconditioner;
+  base_preconditioner.kind =
+      NativeTraceFixedSigmaJacobiBasePreconditioner(preconditioner.kind);
+  ApplyPreconditioner<CoupledWarp>(
+      system, base_preconditioner, workspace, input, output, control, grid);
+  if (control->failure_mask != 0) return;
+
+  // The exact local predictor above supplies a nonzero stationary state.
+  // Refine only the scalar global sigma rows with the selected
+  // fixed number of damped Jacobi corrections. Euler rows remain fixed, so
+  // this is a lower
+  // block-GS preconditioner refinement rather than a replacement for the
+  // coupled U7/Uhat5 system. The authoritative outer GMRES and
+  // application-level FP64 true-residual rebuild remain unchanged.
+  for (int sweep = 0; sweep < sigma_jacobi_sweeps; ++sweep)
+  {
+    for (int row = sigma_begin + thread; row < rows; row += stride)
+    {
+      const int begin = system.matrix.row_offsets[row];
+      const int end = system.matrix.row_offsets[row + 1];
+      double action = 0.0;
+      for (int entry = begin; entry < end; ++entry)
+        action += system.matrix.values[entry] *
+            output[system.matrix.columns[entry]];
+      const double diagonal = system.matrix.values[begin];
+      const double value = output[row] +
+          native_trace_sigma_jacobi_damping *
+              (sigma_rhs[row] - action) / diagonal;
+      next_sigma[row] = value;
+      if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
+    }
+    grid.sync();
+    if (control->failure_mask != 0) return;
+    for (int row = sigma_begin + thread; row < rows; row += stride)
+      output[row] = next_sigma[row];
+    grid.sync();
+  }
+}
+
 __device__ void SetFinalResidualMetadata(
     NativeTraceSolveControl* control, const double residual) noexcept
 {
@@ -562,13 +1724,13 @@ __device__ void SetFinalResidualMetadata(
       ? residual / control->rhs_norm : residual;
 }
 
-template <bool UseCgs2>
+template <bool UseCgs2, bool FixedSigmaJacobi, bool CoupledWarp>
 __global__ void NativeRankOneTraceSolveKernel(
     const NativeTraceSystemView system,
     const NativeTracePreconditionerView preconditioner,
     const NativeTraceWorkspaceView workspace,
     const NativeTraceSolvePolicy policy,
-    const NativeTraceCooperativeSupport support)
+    const NativeTraceKernelCooperativeSupport support)
 {
   cg::grid_group grid = cg::this_grid();
   __shared__ double block_scratch[native_trace_cooperative_threads];
@@ -577,6 +1739,10 @@ __global__ void NativeRankOneTraceSolveKernel(
   const int krylov_dimension = policy.krylov_dimension;
   const int thread = GlobalThreadIndex();
   const int stride = GlobalThreadStride();
+  const NativeTracePreconditionerKind kernel_preconditioner_kind =
+      FixedSigmaJacobi
+      ? NativeTraceFixedSigmaJacobiBasePreconditioner(preconditioner.kind)
+      : preconditioner.kind;
 
   if (grid.thread_rank() == 0)
   {
@@ -586,6 +1752,7 @@ __global__ void NativeRankOneTraceSolveKernel(
     control->iterations = 0;
     control->restart_cycles = 0;
     control->preconditioner_applications = 0;
+    control->operator_applications = 0;
     control->actual_residual_checks = 0;
     control->rhs_norm = 0.0;
     control->initial_residual_norm = 0.0;
@@ -609,13 +1776,16 @@ __global__ void NativeRankOneTraceSolveKernel(
         support.cooperative_blocks != static_cast<int>(gridDim.x) ||
         !support.supported)
       MarkFailure(control, failure_invalid_workspace);
+    if (NativeTracePreconditionerIsWarpCoupled(
+            kernel_preconditioner_kind) != CoupledWarp)
+      MarkFailure(control, failure_invalid_preconditioner);
   }
 
   ValidateCsr(system.matrix, true, true, failure_invalid_system, control);
   for (int row = thread; row < rows; row += stride)
     if (!isfinite(system.rhs[row])) MarkFailure(control, failure_nonfinite);
 
-  if (preconditioner.kind ==
+  if (kernel_preconditioner_kind ==
       NativeTracePreconditionerKind::ilu0_rcm_jacobi)
   {
     ValidateCsr(preconditioner.ilu0.factor, false, true,
@@ -629,6 +1799,50 @@ __global__ void NativeRankOneTraceSolveKernel(
     }
     ValidatePermutation(preconditioner.ilu0, workspace, control, grid);
   }
+  else if (NativeTracePreconditionerIsElementSchwarz(
+               kernel_preconditioner_kind))
+  {
+    ValidateElementSchwarz(
+        preconditioner.element_schwarz,
+        NativeTracePreconditionerIsEquilibratedFieldSplit(
+            kernel_preconditioner_kind),
+        NativeTracePreconditionerIsWarpEquilibratedFieldSplit(
+            kernel_preconditioner_kind),
+        control, grid);
+    if constexpr (FixedSigmaJacobi)
+    {
+      if (!NativeTracePreconditionerIsEquilibratedFieldSplit(
+              kernel_preconditioner_kind) &&
+          !NativeTracePreconditionerIsWarpCoupled(
+              kernel_preconditioner_kind))
+      {
+        if (grid.thread_rank() == 0)
+          MarkFailure(control, failure_invalid_preconditioner);
+        grid.sync();
+      }
+      else
+        ValidateFixedSigmaJacobiRows(
+            preconditioner.element_schwarz, control, grid);
+    }
+  }
+  if (NativeTraceOperatorIsElementMatrixFree(system.operator_kind))
+  {
+    const NativeTraceElementSchwarzView schwarz =
+        preconditioner.element_schwarz;
+    const int entries = schwarz.elements * schwarz.patch_rows *
+        schwarz.patch_rows;
+    if (!NativeTraceOperatorMatchesPreconditioner(
+            system.operator_kind, kernel_preconditioner_kind) ||
+        system.element_schur == nullptr)
+      MarkFailure(control, failure_invalid_system);
+    else
+      for (int entry = thread; entry < entries; entry += stride)
+        if (!isfinite(system.element_schur[entry]))
+          MarkFailure(control, failure_nonfinite);
+  }
+  else if (system.operator_kind !=
+           NativeTraceOperatorKind::assembled_csr_fp64)
+    MarkFailure(control, failure_invalid_system);
   grid.sync();
   if (FinishOnFailure(grid, control)) return;
 
@@ -691,7 +1905,8 @@ __global__ void NativeRankOneTraceSolveKernel(
     // already-small restart residual.
     if (residual_norm <= epsilon)
     {
-      ComputeActualResidual(system, first_basis, control, grid);
+      ComputeActualResidual(system, preconditioner, first_basis, control,
+                            grid);
       const double actual = GridNorm(first_basis, rows, workspace, control,
                                      grid, block_scratch);
       if (grid.thread_rank() == 0)
@@ -727,10 +1942,17 @@ __global__ void NativeRankOneTraceSolveKernel(
       double* const next_basis = workspace.basis +
           static_cast<std::size_t>(column + 1) * rows;
 
-      ApplyPreconditioner(system, preconditioner, workspace,
-                          current_basis, work, control, grid);
+      if constexpr (FixedSigmaJacobi)
+        ApplyFixedSigmaJacobiPreconditioner<false, CoupledWarp>(
+            system, preconditioner, workspace, current_basis, work,
+            control, grid);
+      else
+        ApplyPreconditioner<CoupledWarp>(
+            system, preconditioner, workspace, current_basis, work,
+            control, grid);
       if (FinishOnFailure(grid, control)) return;
-      SparseMatrixVector(system.matrix, work, next_basis, control, grid);
+      ApplyTraceOperator(system, preconditioner, work, next_basis, control,
+                         grid);
       if (FinishOnFailure(grid, control)) return;
 
       if constexpr (UseCgs2)
@@ -934,8 +2156,12 @@ __global__ void NativeRankOneTraceSolveKernel(
                    control, grid);
       }
     }
-    ApplyPreconditioner(system, preconditioner, workspace,
-                        work, work, control, grid);
+    if constexpr (FixedSigmaJacobi)
+      ApplyFixedSigmaJacobiPreconditioner<true, CoupledWarp>(
+          system, preconditioner, workspace, work, work, control, grid);
+    else
+      ApplyPreconditioner<CoupledWarp>(
+          system, preconditioner, workspace, work, work, control, grid);
     if (FinishOnFailure(grid, control)) return;
     AxpyVector(system.solution, 1.0, work, rows, control, grid);
     if (FinishOnFailure(grid, control)) return;
@@ -943,7 +2169,8 @@ __global__ void NativeRankOneTraceSolveKernel(
     bool false_convergence_restart = false;
     if (residual_norm <= epsilon)
     {
-      ComputeActualResidual(system, first_basis, control, grid);
+      ComputeActualResidual(system, preconditioner, first_basis, control,
+                            grid);
       const double actual = GridNorm(first_basis, rows, workspace, control,
                                      grid, block_scratch);
       if (grid.thread_rank() == 0)
@@ -1016,7 +2243,7 @@ __global__ void NativeRankOneTraceSolveKernel(
   // Match the established bounded HYPRE lifecycle: publish one final actual
   // residual for a maximum-iteration exit, then let the application rebuild
   // the authoritative FP64 true residual from the current matrix.
-  ComputeActualResidual(system, first_basis, control, grid);
+  ComputeActualResidual(system, preconditioner, first_basis, control, grid);
   const double actual = GridNorm(first_basis, rows, workspace, control,
                                  grid, block_scratch);
   if (grid.thread_rank() == 0)
@@ -1089,11 +2316,16 @@ QueryNativeTraceWorkspaceRequirements(const int rows,
 extern "C" NativeTraceCooperativeSupport
 QueryNativeRankOneTraceCooperativeSupport(const int rows,
                                           const int krylov_dimension,
-                                          const bool igr_active) noexcept
+                                          const bool igr_active,
+                                          const bool fixed_sigma_jacobi,
+                                          const bool coupled_warp_full_patch) noexcept
 {
   NativeTraceCooperativeSupport result{};
+  result.fixed_sigma_jacobi = fixed_sigma_jacobi;
+  result.coupled_warp_full_patch = coupled_warp_full_patch;
   if (rows <= 0 || krylov_dimension <= 0 ||
-      krylov_dimension == std::numeric_limits<int>::max())
+      krylov_dimension == std::numeric_limits<int>::max() ||
+      ((fixed_sigma_jacobi || coupled_warp_full_patch) && !igr_active))
     return result;
 
   int device = -1;
@@ -1111,16 +2343,33 @@ QueryNativeRankOneTraceCooperativeSupport(const int rows,
                              device) != cudaSuccess ||
       cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount,
                              device) != cudaSuccess)
-    return NativeTraceCooperativeSupport{};
+    return result;
 
-  const cudaError_t occupancy = igr_active
-      ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &active_blocks, NativeRankOneTraceSolveKernel<true>,
-            native_trace_cooperative_threads, 0)
-      : cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &active_blocks, NativeRankOneTraceSolveKernel<false>,
-            native_trace_cooperative_threads, 0);
-  if (occupancy != cudaSuccess) return NativeTraceCooperativeSupport{};
+  const cudaError_t occupancy = coupled_warp_full_patch
+      ? fixed_sigma_jacobi
+          ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks,
+                NativeRankOneTraceSolveKernel<true, true, true>,
+                native_trace_cooperative_threads, 0)
+          : cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks,
+                NativeRankOneTraceSolveKernel<true, false, true>,
+                native_trace_cooperative_threads, 0)
+      : fixed_sigma_jacobi
+          ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks,
+                NativeRankOneTraceSolveKernel<true, true, false>,
+                native_trace_cooperative_threads, 0)
+      : igr_active
+          ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks,
+                NativeRankOneTraceSolveKernel<true, false, false>,
+                native_trace_cooperative_threads, 0)
+          : cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks,
+                NativeRankOneTraceSolveKernel<false, false, false>,
+                native_trace_cooperative_threads, 0);
+  if (occupancy != cudaSuccess) return result;
 
   // This leaf is an SM120 tensor-backend implementation, not a generic CUDA
   // fallback.  A different device is rejected rather than silently rerouted.
@@ -1158,12 +2407,25 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
     const NativeTraceCooperativeSupport& support,
     const cudaStream_t stream) noexcept
 {
-  const bool igr = preconditioner.kind ==
+  const bool use_fixed_sigma_jacobi =
+      NativeTracePreconditionerUsesFixedSigmaJacobi(preconditioner.kind);
+  const int fixed_sigma_jacobi_sweeps =
+      NativeTraceFixedSigmaJacobiSweeps(preconditioner.kind);
+  const NativeTracePreconditionerKind kernel_preconditioner_kind =
+      NativeTraceFixedSigmaJacobiBasePreconditioner(preconditioner.kind);
+  const bool use_ilu = kernel_preconditioner_kind ==
       NativeTracePreconditionerKind::ilu0_rcm_jacobi;
+  const bool use_element_schwarz =
+      NativeTracePreconditionerIsElementSchwarz(kernel_preconditioner_kind);
+  const bool use_coupled_warp_full_patch =
+      NativeTracePreconditionerIsWarpCoupled(kernel_preconditioner_kind);
+  const bool use_matrix_free =
+      NativeTraceOperatorIsElementMatrixFree(system.operator_kind);
+  const bool use_cgs2 = use_ilu || use_element_schwarz;
   const NativeTraceWorkspaceRequirements requirements =
       QueryNativeTraceWorkspaceRequirements(
           system.matrix.rows, policy.krylov_dimension,
-          support.cooperative_blocks, igr);
+          support.cooperative_blocks, use_cgs2);
   const AddressRange basis_range = MakeAddressRange(
       workspace.basis, requirements.basis_doubles, sizeof(double));
   const AddressRange vector_range = MakeAddressRange(
@@ -1197,7 +2459,7 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
       workspace_overlap = workspace_overlap ||
           AddressRangesOverlap(double_ranges[left], borrowed);
   }
-  if (igr)
+  if (use_cgs2)
   {
     const AddressRange permutation_range = MakeAddressRange(
         workspace.permutation_marks, requirements.permutation_integers,
@@ -1209,30 +2471,111 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
       workspace_overlap = workspace_overlap ||
           AddressRangesOverlap(permutation_range, borrowed);
 
-    const NativeTraceIlu0View& ilu0 = preconditioner.ilu0;
-    const std::size_t factor_rows = ilu0.factor.rows > 0
-        ? static_cast<std::size_t>(ilu0.factor.rows) : 0;
-    const std::size_t factor_nonzeros = ilu0.factor.nonzeros > 0
-        ? static_cast<std::size_t>(ilu0.factor.nonzeros) : 0;
-    const AddressRange factor_ranges[] = {
-        MakeAddressRange(ilu0.factor.row_offsets, factor_rows + 1,
-                         sizeof(int)),
-        MakeAddressRange(ilu0.factor.columns, factor_nonzeros, sizeof(int)),
-        MakeAddressRange(ilu0.factor.values, factor_nonzeros, sizeof(double)),
-        MakeAddressRange(ilu0.permutation, factor_rows, sizeof(int)),
-        MakeAddressRange(ilu0.inverse_diagonal, factor_rows,
-                         sizeof(double))};
-    for (const AddressRange& borrowed : factor_ranges)
+    if (use_ilu)
     {
-      workspace_overlap = workspace_overlap ||
-          AddressRangesOverlap(permutation_range, borrowed);
-      for (const AddressRange& range : double_ranges)
+      const NativeTraceIlu0View& ilu0 = preconditioner.ilu0;
+      const std::size_t factor_rows = ilu0.factor.rows > 0
+          ? static_cast<std::size_t>(ilu0.factor.rows) : 0;
+      const std::size_t factor_nonzeros = ilu0.factor.nonzeros > 0
+          ? static_cast<std::size_t>(ilu0.factor.nonzeros) : 0;
+      const AddressRange factor_ranges[] = {
+          MakeAddressRange(ilu0.factor.row_offsets, factor_rows + 1,
+                           sizeof(int)),
+          MakeAddressRange(ilu0.factor.columns, factor_nonzeros, sizeof(int)),
+          MakeAddressRange(ilu0.factor.values, factor_nonzeros,
+                           sizeof(double)),
+          MakeAddressRange(ilu0.permutation, factor_rows, sizeof(int)),
+          MakeAddressRange(ilu0.inverse_diagonal, factor_rows,
+                           sizeof(double))};
+      for (const AddressRange& borrowed : factor_ranges)
+      {
         workspace_overlap = workspace_overlap ||
-            AddressRangesOverlap(range, borrowed);
+            AddressRangesOverlap(permutation_range, borrowed);
+        for (const AddressRange& range : double_ranges)
+          workspace_overlap = workspace_overlap ||
+              AddressRangesOverlap(range, borrowed);
+      }
+    }
+    else
+    {
+      const NativeTraceElementSchwarzView& schwarz =
+          preconditioner.element_schwarz;
+      std::size_t element_slots = 0;
+      std::size_t patch_entries = 0;
+      std::size_t incidence_slots = 0;
+      const bool sizes_valid = schwarz.elements > 0 &&
+          schwarz.patch_rows > 0 && schwarz.true_rows > 0 &&
+          CheckedMultiply(static_cast<std::size_t>(schwarz.elements),
+                          static_cast<std::size_t>(schwarz.patch_rows),
+                          element_slots) &&
+          CheckedMultiply(element_slots,
+                          static_cast<std::size_t>(schwarz.patch_rows),
+                          patch_entries) &&
+          CheckedMultiply(static_cast<std::size_t>(schwarz.true_rows),
+                          static_cast<std::size_t>(
+                              native_trace_schwarz_maximum_incidence),
+                          incidence_slots);
+      const AddressRange schwarz_ranges[] = {
+          MakeAddressRange(schwarz.patch_matrix, patch_entries,
+                           sizeof(double)),
+          MakeAddressRange(schwarz.patch_lu, patch_entries, sizeof(double)),
+          MakeAddressRange(schwarz.element_rhs, element_slots,
+                           sizeof(double)),
+          MakeAddressRange(schwarz.element_solution, element_slots,
+                           sizeof(double)),
+          MakeAddressRange(schwarz.pivots, element_slots, sizeof(int)),
+          MakeAddressRange(schwarz.signed_element_true_dofs, element_slots,
+                           sizeof(int)),
+          MakeAddressRange(schwarz.true_incidence_slots, incidence_slots,
+                           sizeof(int))};
+      const AddressRange schur_range = use_matrix_free
+          ? MakeAddressRange(system.element_schur, patch_entries,
+                             sizeof(double))
+          : AddressRange{};
+      workspace_overlap = workspace_overlap || !sizes_valid;
+      for (std::size_t left = 0; left < 7; ++left)
+      {
+        for (std::size_t right = left + 1; right < 7; ++right)
+          workspace_overlap = workspace_overlap ||
+              AddressRangesOverlap(schwarz_ranges[left],
+                                   schwarz_ranges[right]);
+        workspace_overlap = workspace_overlap ||
+            AddressRangesOverlap(permutation_range, schwarz_ranges[left]);
+        for (const AddressRange& range : double_ranges)
+          workspace_overlap = workspace_overlap ||
+              AddressRangesOverlap(range, schwarz_ranges[left]);
+        for (const AddressRange& borrowed : system_ranges)
+          workspace_overlap = workspace_overlap ||
+              AddressRangesOverlap(borrowed, schwarz_ranges[left]);
+      }
+      if (use_matrix_free)
+      {
+        for (const AddressRange& range : double_ranges)
+          workspace_overlap = workspace_overlap ||
+              AddressRangesOverlap(range, schur_range);
+        workspace_overlap = workspace_overlap ||
+            AddressRangesOverlap(permutation_range, schur_range);
+        for (const AddressRange& borrowed : system_ranges)
+          workspace_overlap = workspace_overlap ||
+              AddressRangesOverlap(borrowed, schur_range);
+        for (const AddressRange& borrowed : schwarz_ranges)
+          workspace_overlap = workspace_overlap ||
+              AddressRangesOverlap(borrowed, schur_range);
+      }
     }
   }
   int current_device = -1;
   if (!requirements.valid || workspace_overlap || !support.supported ||
+      support.fixed_sigma_jacobi != use_fixed_sigma_jacobi ||
+      support.coupled_warp_full_patch != use_coupled_warp_full_patch ||
+      (use_fixed_sigma_jacobi &&
+       (fixed_sigma_jacobi_sweeps < 1 ||
+        fixed_sigma_jacobi_sweeps >
+            native_trace_sigma_jacobi_maximum_sweeps ||
+        system.matrix.rows % 5 != 0 || !use_element_schwarz ||
+        (!NativeTracePreconditionerIsEquilibratedFieldSplit(
+             kernel_preconditioner_kind) &&
+         !use_coupled_warp_full_patch))) ||
       cudaGetDevice(&current_device) != cudaSuccess ||
       current_device != support.device || support.compute_major != 12 ||
       support.compute_minor != 0 || support.multiprocessors <= 0 ||
@@ -1270,14 +2613,24 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
       workspace.vector_doubles < requirements.vector_doubles ||
       workspace.reduction_doubles < requirements.reduction_doubles ||
       workspace.small_doubles < requirements.small_doubles ||
-      workspace.permutation_integers < requirements.permutation_integers)
+      workspace.permutation_integers < requirements.permutation_integers ||
+      (use_matrix_free &&
+       (!NativeTraceOperatorMatchesPreconditioner(
+            system.operator_kind, kernel_preconditioner_kind) ||
+        system.element_schur == nullptr ||
+        !IsAligned(system.element_schur, alignof(double)))) ||
+      (!use_matrix_free &&
+       (system.operator_kind !=
+            NativeTraceOperatorKind::assembled_csr_fp64 ||
+        system.element_schur != nullptr)))
     return false;
 
-  if (preconditioner.kind == NativeTracePreconditionerKind::diagonal)
+  if (kernel_preconditioner_kind ==
+      NativeTracePreconditionerKind::diagonal)
   {
-    if (igr) return false;
+    if (use_cgs2) return false;
   }
-  else if (preconditioner.kind ==
+  else if (kernel_preconditioner_kind ==
            NativeTracePreconditionerKind::ilu0_rcm_jacobi)
   {
     const NativeTraceIlu0View& ilu0 = preconditioner.ilu0;
@@ -1297,20 +2650,94 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
         !IsAligned(workspace.permutation_marks, alignof(int)))
       return false;
   }
+  else if (NativeTracePreconditionerIsElementSchwarz(
+               kernel_preconditioner_kind))
+  {
+    const NativeTraceElementSchwarzView& schwarz =
+        preconditioner.element_schwarz;
+    const bool field_split =
+        NativeTracePreconditionerIsEquilibratedFieldSplit(
+            kernel_preconditioner_kind);
+    const bool warp_field_split =
+        NativeTracePreconditionerIsWarpEquilibratedFieldSplit(
+            kernel_preconditioner_kind);
+    const int scalar_face_rows =
+        FieldSplitScalarFaceRows(schwarz.patch_rows);
+    const int euler_rows = FieldSplitEulerRows(schwarz.patch_rows);
+    const std::size_t field_split_required =
+        FieldSplitRightScaleOffset(schwarz.patch_rows) +
+        (schwarz.patch_rows > 0
+             ? static_cast<std::size_t>(schwarz.patch_rows) : 0);
+    const std::size_t patch_capacity = schwarz.patch_rows > 0
+        ? static_cast<std::size_t>(schwarz.patch_rows) *
+            schwarz.patch_rows : 0;
+    const std::size_t selected_field_split_required = warp_field_split
+        ? FieldSplitWarpRequiredDoubles(schwarz.patch_rows)
+        : field_split_required;
+    if (schwarz.elements <= 0 ||
+        (schwarz.patch_rows != 40 && schwarz.patch_rows != 60 &&
+         schwarz.patch_rows != 80) ||
+        (field_split &&
+         (scalar_face_rows < 2 || scalar_face_rows > 4 ||
+          euler_rows != 4 * schwarz.patch_rows / 5 ||
+          selected_field_split_required > patch_capacity)) ||
+        schwarz.true_rows != system.matrix.rows ||
+        schwarz.minimum_multiplicity < 1 ||
+        schwarz.maximum_multiplicity < schwarz.minimum_multiplicity ||
+        schwarz.maximum_multiplicity >
+            native_trace_schwarz_maximum_incidence ||
+        schwarz.patch_matrix == nullptr || schwarz.patch_lu == nullptr ||
+        schwarz.pivots == nullptr ||
+        schwarz.signed_element_true_dofs == nullptr ||
+        schwarz.true_incidence_slots == nullptr ||
+        schwarz.element_rhs == nullptr ||
+        schwarz.element_solution == nullptr ||
+        !IsAligned(schwarz.patch_matrix, alignof(double)) ||
+        !IsAligned(schwarz.patch_lu, alignof(double)) ||
+        !IsAligned(schwarz.pivots, alignof(int)) ||
+        !IsAligned(schwarz.signed_element_true_dofs, alignof(int)) ||
+        !IsAligned(schwarz.true_incidence_slots, alignof(int)) ||
+        !IsAligned(schwarz.element_rhs, alignof(double)) ||
+        !IsAligned(schwarz.element_solution, alignof(double)) ||
+        !IsAligned(workspace.permutation_marks, alignof(int)))
+      return false;
+  }
   else
     return false;
 
   NativeTraceSystemView system_argument = system;
   NativeTracePreconditionerView preconditioner_argument = preconditioner;
+  if (!use_fixed_sigma_jacobi)
+    preconditioner_argument.kind = kernel_preconditioner_kind;
   NativeTraceWorkspaceView workspace_argument = workspace;
   NativeTraceSolvePolicy policy_argument = policy;
-  NativeTraceCooperativeSupport support_argument = support;
+  NativeTraceKernelCooperativeSupport support_argument{};
+  support_argument.supported = support.supported;
+  support_argument.device = support.device;
+  support_argument.compute_major = support.compute_major;
+  support_argument.compute_minor = support.compute_minor;
+  support_argument.multiprocessors = support.multiprocessors;
+  support_argument.threads_per_block = support.threads_per_block;
+  support_argument.maximum_active_blocks_per_multiprocessor =
+      support.maximum_active_blocks_per_multiprocessor;
+  support_argument.cooperative_blocks = support.cooperative_blocks;
   void* arguments[] = {&system_argument, &preconditioner_argument,
                        &workspace_argument, &policy_argument,
                        &support_argument};
-  const void* const kernel = igr
-      ? reinterpret_cast<const void*>(NativeRankOneTraceSolveKernel<true>)
-      : reinterpret_cast<const void*>(NativeRankOneTraceSolveKernel<false>);
+  const void* const kernel = use_coupled_warp_full_patch
+      ? use_fixed_sigma_jacobi
+          ? reinterpret_cast<const void*>(
+                NativeRankOneTraceSolveKernel<true, true, true>)
+          : reinterpret_cast<const void*>(
+                NativeRankOneTraceSolveKernel<true, false, true>)
+      : use_fixed_sigma_jacobi
+          ? reinterpret_cast<const void*>(
+                NativeRankOneTraceSolveKernel<true, true, false>)
+      : use_cgs2
+          ? reinterpret_cast<const void*>(
+                NativeRankOneTraceSolveKernel<true, false, false>)
+          : reinterpret_cast<const void*>(
+                NativeRankOneTraceSolveKernel<false, false, false>);
   const cudaError_t launch = cudaLaunchCooperativeKernel(
       kernel,
       dim3(static_cast<unsigned int>(support.cooperative_blocks)),

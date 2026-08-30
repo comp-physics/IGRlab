@@ -233,6 +233,20 @@ bool CheckAcceptAndReject()
     return false;
   }
   request = ValidRequest(mesh, initial);
+  request.numerical_policy.igr_assembly_quadrature_orders.volume_order = 0;
+  if (ValidateEulerHdgRequest(request) !=
+      ContractStatus::invalid_numerical_policy)
+  {
+    return false;
+  }
+  request = ValidRequest(mesh, initial);
+  request.numerical_policy.igr_assembly_quadrature_orders.face_order = 0;
+  if (ValidateEulerHdgRequest(request) !=
+      ContractStatus::invalid_numerical_policy)
+  {
+    return false;
+  }
+  request = ValidRequest(mesh, initial);
   request.boundary.exterior_state = nullptr;
   if (ValidateEulerHdgRequest(request) !=
       ContractStatus::invalid_boundary_operator)
@@ -480,6 +494,11 @@ bool CheckIgrSelectionAdmission()
   int rank = 0, ranks = 0;
   MPI_Comm_rank(mesh.GetComm(), &rank);
   MPI_Comm_size(mesh.GetComm(), &ranks);
+  request.numerical_policy.igr_assembly_quadrature_orders.face_order =
+      rank == 0 ? 12 : 10;
+  const ContractStatus quadrature_mismatch =
+      ValidateEulerHdgRequest(request);
+  request.numerical_policy.igr_assembly_quadrature_orders.face_order = 12;
   request.numerical_policy.stabilization.alpha = rank == 0 ? 0.25 : 0.5;
   const ContractStatus mismatch = ValidateEulerHdgRequest(request);
   int min_status = static_cast<int>(mismatch), max_status = min_status;
@@ -502,10 +521,54 @@ bool CheckIgrSelectionAdmission()
       physical_p2 == ContractStatus::accepted &&
       physical_p3 == ContractStatus::accepted &&
       cuda == ContractStatus::accepted &&
+      quadrature_mismatch ==
+          (ranks == 1 ? ContractStatus::accepted
+                      : ContractStatus::invalid_numerical_policy) &&
       mismatch == (ranks == 1 ? ContractStatus::accepted
                               : ContractStatus::invalid_numerical_policy) &&
       min_result == MPI_SUCCESS && max_result == MPI_SUCCESS &&
       min_status == max_status;
+}
+
+bool CheckRoleSpecificLinearTolerancePolicy()
+{
+  dg::hdg::generic::EulerHdgNumericalPolicy policy =
+      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(2);
+  const bool defaults_exact =
+      dg::hdg::generic::ValidEulerHdgNumericalPolicy(policy) &&
+      dg::hdg::generic::EulerHdgRequestedLinearRelativeTolerance(
+          policy,
+          dg::hdg::generic::EulerHdgLinearSolveRole::newton_correction) ==
+          1.0e-12 &&
+      dg::hdg::generic::EulerHdgRequestedLinearRelativeTolerance(
+          policy,
+          dg::hdg::generic::EulerHdgLinearSolveRole::final_coherent) ==
+          1.0e-12;
+
+  policy.newton_correction_linear_relative_tolerance = 1.0e-6;
+  policy.final_coherent_linear_relative_tolerance = 1.0e-10;
+  policy.true_residual_tightening_linear_relative_tolerance = 1.0e-12;
+  const bool split_exact =
+      dg::hdg::generic::ValidEulerHdgNumericalPolicy(policy) &&
+      dg::hdg::generic::EulerHdgRequestedLinearRelativeTolerance(
+          policy,
+          dg::hdg::generic::EulerHdgLinearSolveRole::newton_correction) ==
+          1.0e-6 &&
+      dg::hdg::generic::EulerHdgRequestedLinearRelativeTolerance(
+          policy,
+          dg::hdg::generic::EulerHdgLinearSolveRole::final_coherent) ==
+          1.0e-10;
+
+  dg::hdg::generic::EulerHdgNumericalPolicy invalid = policy;
+  invalid.true_residual_tightening_linear_relative_tolerance = 1.0e-5;
+  const bool rejects_looser_fallback =
+      !dg::hdg::generic::ValidEulerHdgNumericalPolicy(invalid);
+  invalid = policy;
+  invalid.true_residual_tightening_linear_relative_tolerance = 0.0;
+  const bool rejects_zero_fallback =
+      !dg::hdg::generic::ValidEulerHdgNumericalPolicy(invalid);
+  return defaults_exact && split_exact && rejects_looser_fallback &&
+      rejects_zero_fallback;
 }
 
 bool CheckZeroOwnedElementAdmission()
@@ -720,6 +783,7 @@ int main(int argc, char* argv[])
   const bool boundary_mismatch = CheckBoundaryPolicyCollectiveMismatch();
   const bool mixed_boundary = CheckMixedBoundaryPolicyAdmission();
   const bool igr = CheckIgrSelectionAdmission();
+  const bool linear_tolerances = CheckRoleSpecificLinearTolerancePolicy();
   const bool empty = CheckZeroOwnedElementAdmission();
   const bool cuda_engine_mismatch = CheckCudaEngineCollectiveMismatch();
   const bool physical_empty = CheckPhysicalPolicyWithZeroOwnedRank();
@@ -728,7 +792,8 @@ int main(int argc, char* argv[])
   const bool geometry = CheckCollectiveGeometryConvergence();
   ok = ok && conservation_normalization && basic && triangle && boundary &&
       boundary_mismatch &&
-      mixed_boundary && igr && empty && cuda_engine_mismatch &&
+      mixed_boundary && igr && linear_tolerances && empty &&
+      cuda_engine_mismatch &&
       physical_empty && asymmetric_null &&
       mismatch && geometry;
   return ok ? 0 : 1;

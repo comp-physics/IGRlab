@@ -317,8 +317,15 @@ public:
 private:
   result_type InitializeAdmitted(
       const cuda_w8a::CudaConfig& config,
-      const cuda_w8a::CudaTracePolicyKind trace_policy) noexcept
+      const cuda_w8a::CudaTracePolicyKind requested_trace_policy) noexcept
   {
+    const bool igr_active = config.use_generic_numerical_policy &&
+        config.numerical_policy.stabilization.kind ==
+            generic::RegularizationKind::igr;
+    const cuda_w8a::CudaTracePolicyDescriptor trace_policy =
+        cuda_w8a::ResolveCudaTracePolicy(
+            config.cuda_engine, igr_active, config.expected_rank_count,
+            config.order, requested_trace_policy);
     // Once every rank has agreed on Initialize, this admission is deliberately
     // evaluated everywhere, then gated again before allocation.
     const bool admitted = PreDeviceAdmission(config, trace_policy);
@@ -879,7 +886,7 @@ private:
 
   bool ConfigConsensus(
       const cuda_w8a::CudaConfig& config,
-      const cuda_w8a::CudaTracePolicyKind trace_policy) const noexcept
+      const cuda_w8a::CudaTracePolicyDescriptor& trace_policy) const noexcept
   {
     bool borrowed_host_mode = false;
     // This min/max pair is unconditional and precedes every descriptor whose
@@ -944,7 +951,9 @@ private:
         AppendConfigValue(local, cursor, complete,
                           policy.conventional_assembly_quadrature_order);
         AppendConfigValue(local, cursor, complete,
-                          policy.igr_assembly_quadrature_order);
+                          policy.igr_assembly_quadrature_orders.volume_order);
+        AppendConfigValue(local, cursor, complete,
+                          policy.igr_assembly_quadrature_orders.face_order);
         AppendConfigValue(local, cursor, complete,
                           policy.maximum_nonlinear_updates);
         AppendConfigValue(local, cursor, complete,
@@ -954,7 +963,12 @@ private:
         AppendConfigValue(local, cursor, complete,
                           policy.nonlinear_relative_tolerance);
         AppendConfigValue(local, cursor, complete,
-                          policy.linear_relative_tolerance);
+                          policy.newton_correction_linear_relative_tolerance);
+        AppendConfigValue(local, cursor, complete,
+                          policy.final_coherent_linear_relative_tolerance);
+        AppendConfigValue(
+            local, cursor, complete,
+            policy.true_residual_tightening_linear_relative_tolerance);
         AppendConfigValue(local, cursor, complete,
                           policy.true_residual_relative_tolerance);
         AppendConfigValue(local, cursor, complete,
@@ -977,7 +991,12 @@ private:
     append_bool(config.injection.enabled);
     AppendConfigValue(local, cursor, complete, config.injection.token_fault);
     // Append-only so the engine-default prefix stays byte-identical.
-    AppendConfigValue(local, cursor, complete, trace_policy);
+    AppendConfigValue(
+        local, cursor, complete, trace_policy.requested_selection);
+    AppendConfigValue(
+        local, cursor, complete, trace_policy.resolved_selection);
+    AppendConfigValue(local, cursor, complete, trace_policy.rank_count);
+    AppendConfigValue(local, cursor, complete, trace_policy.polynomial_order);
 
     config_descriptor minimum = local;
     config_descriptor maximum = local;
@@ -1118,7 +1137,7 @@ private:
 
   bool PreDeviceAdmission(
       const cuda_w8a::CudaConfig& config,
-      const cuda_w8a::CudaTracePolicyKind trace_policy) const noexcept
+      const cuda_w8a::CudaTracePolicyDescriptor& trace_policy) const noexcept
   {
     int mpi_initialized = 0;
     int mpi_finalized = 0;
@@ -1181,8 +1200,15 @@ private:
     bool local = config.use_borrowed_topology && config.borrowed_mesh != nullptr &&
         config.borrowed_communicator != MPI_COMM_NULL &&
         generic::IsKnownCudaEngineKind(config.cuda_engine) &&
-        cuda_w8a::IsKnownCudaTracePolicyKind(trace_policy) &&
-        (trace_policy ==
+        cuda_w8a::CudaTracePolicyDescriptorIsExact(trace_policy) &&
+        trace_policy.selected_engine == config.cuda_engine &&
+        trace_policy.rank_count == config.expected_rank_count &&
+        trace_policy.polynomial_order == config.order &&
+        trace_policy.igr_active ==
+            (config.use_generic_numerical_policy &&
+             config.numerical_policy.stabilization.kind ==
+                 generic::RegularizationKind::igr) &&
+        (trace_policy.requested_selection ==
              cuda_w8a::CudaTracePolicyKind::engine_default ||
          (config.expected_rank_count == 1 &&
           config.use_borrowed_host_inputs &&

@@ -403,6 +403,26 @@ if(MFEM_USE_CUDA)
       $<TARGET_FILE:dg_igr_hdg_main_backend_cuda_physical_extension_test>
       --engine tensor
       ${MPIEXEC_POSTFLAGS})
+  add_test(NAME dg_igr_hdg_main_backend_cuda_physical_extension_candidate_rank1
+    COMMAND dg_igr_hdg_main_backend_cuda_physical_extension_test
+      --candidate-numerical-policy)
+  add_test(NAME dg_igr_hdg_main_backend_cuda_physical_extension_candidate_rank2
+    COMMAND
+      "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 2
+      ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_hdg_main_backend_cuda_physical_extension_test>
+      --candidate-numerical-policy
+      ${MPIEXEC_POSTFLAGS})
+  add_test(NAME dg_igr_hdg_main_backend_cuda_physical_extension_candidate_tensor_rank1
+    COMMAND dg_igr_hdg_main_backend_cuda_physical_extension_test
+      --engine tensor --candidate-numerical-policy)
+  add_test(NAME dg_igr_hdg_main_backend_cuda_physical_extension_candidate_tensor_rank2
+    COMMAND
+      "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 2
+      ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_hdg_main_backend_cuda_physical_extension_test>
+      --engine tensor --candidate-numerical-policy
+      ${MPIEXEC_POSTFLAGS})
   add_test(NAME dg_igr_hdg_main_backend_cuda_engine_mismatch_rank2
     COMMAND
       "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 2
@@ -431,6 +451,30 @@ if(MFEM_USE_CUDA)
   set_tests_properties(
     dg_igr_hdg_main_backend_cuda_physical_extension_tensor_rank2 PROPERTIES
       LABELS "hdg;main-backend;cuda;tensor;physical;all-euler-boundaries;igr;conventional;p1-p3;source;initial-trace;mpi;host-staged"
+      PROCESSORS 2
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 3600)
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_physical_extension_candidate_rank1 PROPERTIES
+      LABELS "hdg;main-backend;cuda;ordinary;physical;all-euler-boundaries;igr;conventional;p1-p3;source;initial-trace;quadrature-candidate;role-tolerance-candidate"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 3600)
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_physical_extension_candidate_rank2 PROPERTIES
+      LABELS "hdg;main-backend;cuda;ordinary;physical;all-euler-boundaries;igr;conventional;p1-p3;source;initial-trace;quadrature-candidate;role-tolerance-candidate;mpi;host-staged"
+      PROCESSORS 2
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 3600)
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_physical_extension_candidate_tensor_rank1 PROPERTIES
+      LABELS "hdg;main-backend;cuda;tensor;physical;all-euler-boundaries;igr;conventional;p1-p3;source;initial-trace;quadrature-candidate;role-tolerance-candidate;production-trace-policy"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 3600)
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_physical_extension_candidate_tensor_rank2 PROPERTIES
+      LABELS "hdg;main-backend;cuda;tensor;physical;all-euler-boundaries;igr;conventional;p1-p3;source;initial-trace;quadrature-candidate;role-tolerance-candidate;mpi;host-staged"
       PROCESSORS 2
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 3600)

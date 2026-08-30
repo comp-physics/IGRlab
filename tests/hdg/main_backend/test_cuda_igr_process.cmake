@@ -16,9 +16,31 @@ if(NOT HDG_MAIN_CUDA_ENGINE STREQUAL "ordinary" AND
     "CUDA HDG engine must be ordinary or tensor, got '${HDG_MAIN_CUDA_ENGINE}'.")
 endif()
 set(_expected_trace_preconditioner hypre_ilu0)
+set(_expected_requested_trace_policy engine-default)
+set(_expected_resolved_trace_policy engine-default)
+set(_expected_trace_solver hypre-parcsr-gmres)
+set(_expected_ilu_type 0)
 set(_expected_ilu_fill 0)
+set(_expected_ilu_reordering 1)
 set(_expected_ilu_iterations 1)
-if(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor")
+set(_expected_ilu_accounting_kind derived_bounds_v1)
+if(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor" AND HDG_MAIN_RANKS EQUAL 1)
+  set(_expected_trace_preconditioner
+    native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64)
+  set(_expected_resolved_trace_policy
+    native-element-schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-fp64)
+  set(_expected_trace_solver native-rank1-fp64)
+  set(_expected_ilu_type -1)
+  set(_expected_ilu_fill -1)
+  set(_expected_ilu_reordering -1)
+  set(_expected_ilu_iterations 0)
+  set(_expected_ilu_accounting_kind unavailable)
+  set(_expected_ilu_factor_reuse_policy not_applicable)
+  set(_expected_ilu_triangular_solve_kind not_applicable)
+  set(_expected_ilu_lower_jacobi_iterations 0)
+  set(_expected_ilu_upper_jacobi_iterations 0)
+elseif(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor")
+  set(_expected_trace_solver hypre-host-staged-rank2)
   set(_expected_ilu_factor_reuse_policy first_trace_solve_per_attempt)
   set(_expected_ilu_triangular_solve_kind iterative_jacobi)
   set(_expected_ilu_lower_jacobi_iterations 5)
@@ -28,6 +50,9 @@ else()
   set(_expected_ilu_triangular_solve_kind direct)
   set(_expected_ilu_lower_jacobi_iterations 0)
   set(_expected_ilu_upper_jacobi_iterations 0)
+endif()
+if(HDG_MAIN_RANKS EQUAL 2)
+  set(_expected_trace_solver hypre-host-staged-rank2)
 endif()
 
 set(_base_arguments
@@ -45,6 +70,10 @@ set(_base_arguments
 
 function(run_cuda_igr_success order expected_alpha expected_beta)
   set(_arguments ${_base_arguments} --order ${order} ${ARGN})
+  set(_run_expected_trace_preconditioner
+    "${_expected_trace_preconditioner}")
+  set(_run_expected_resolved_trace_policy
+    "${_expected_resolved_trace_policy}")
   if(HDG_MAIN_RANKS EQUAL 1)
     execute_process(
       COMMAND "${HDG_MAIN_EXECUTABLE}" ${_arguments}
@@ -64,7 +93,7 @@ function(run_cuda_igr_success order expected_alpha expected_beta)
   endif()
   if(NOT _status EQUAL 0 OR
      NOT _stdout MATCHES
-       "\\[hdg-main\\] status=Success.*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*trace_preconditioner=${_expected_trace_preconditioner}.*trace_ilu_type=0.*trace_ilu_level_of_fill=${_expected_ilu_fill}.*trace_ilu_local_reordering=1.*trace_ilu_application_iterations=${_expected_ilu_iterations}.*trace_ilu_accounting_kind=derived_bounds_v1.*trace_ilu_factor_reuse_policy=${_expected_ilu_factor_reuse_policy}.*trace_ilu_triangular_solve_kind=${_expected_ilu_triangular_solve_kind}.*trace_ilu_lower_jacobi_iterations=${_expected_ilu_lower_jacobi_iterations}.*trace_ilu_upper_jacobi_iterations=${_expected_ilu_upper_jacobi_iterations}.*regularization=igr.*alpha=${expected_alpha}.*beta=${expected_beta}" OR
+       "\\[hdg-main\\] status=Success.*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*requested_trace_policy=${_expected_requested_trace_policy}.*resolved_trace_policy=${_run_expected_resolved_trace_policy}.*trace_solver=${_expected_trace_solver}.*fallback_count=0.*trace_preconditioner=${_run_expected_trace_preconditioner}.*trace_ilu_type=${_expected_ilu_type}.*trace_ilu_level_of_fill=${_expected_ilu_fill}.*trace_ilu_local_reordering=${_expected_ilu_reordering}.*trace_ilu_application_iterations=${_expected_ilu_iterations}.*trace_ilu_accounting_kind=${_expected_ilu_accounting_kind}.*trace_ilu_factor_reuse_policy=${_expected_ilu_factor_reuse_policy}.*trace_ilu_triangular_solve_kind=${_expected_ilu_triangular_solve_kind}.*trace_ilu_lower_jacobi_iterations=${_expected_ilu_lower_jacobi_iterations}.*trace_ilu_upper_jacobi_iterations=${_expected_ilu_upper_jacobi_iterations}.*regularization=igr.*alpha=${expected_alpha}.*beta=${expected_beta}" OR
      NOT _stderr STREQUAL "")
     message(FATAL_ERROR
       "CUDA HDG p${order} IGR execution failed: ${_status}\n${_stdout}\n${_stderr}")

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import os
@@ -13,6 +14,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 HARNESS = ROOT / "scripts/perf/profile_harness.py"
+MODULE_SPEC = importlib.util.spec_from_file_location(
+    "profile_harness_under_test", HARNESS
+)
+if MODULE_SPEC is None or MODULE_SPEC.loader is None:
+    raise RuntimeError("could not load profile_harness.py")
+PROFILE = importlib.util.module_from_spec(MODULE_SPEC)
+MODULE_SPEC.loader.exec_module(PROFILE)
 
 
 def run(*arguments: str, expected: int = 0, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -47,7 +55,347 @@ def common(app: Path, output: Path) -> list[str]:
     return ["--scenario", "generic-case", "--exe", str(app), "--out-dir", str(output), "--arg=--input", "--arg", "case.yaml"]
 
 
+def validate_fixed_sigma_jacobi_profile_surface() -> None:
+    expected = {
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi1-fp64": (
+            1,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi1_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi1-fp64": (
+            1,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi1_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi2-fp64": (
+            2,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi2_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi2-fp64": (
+            2,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi2_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi3-fp64": (
+            3,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi3_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi3-fp64": (
+            3,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi3_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi4-fp64": (
+            4,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi4_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi4-fp64": (
+            4,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi4_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi5-fp64": (
+            5,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi5_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi5-fp64": (
+            5,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi5_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi6-fp64": (
+            6,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi6_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi6-fp64": (
+            6,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi6_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi7-fp64": (
+            7,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi7_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi7-fp64": (
+            7,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi7_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi8-fp64": (
+            8,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi8_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi8-fp64": (
+            8,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi8_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi9-fp64": (
+            9,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi9_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi9-fp64": (
+            9,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi9_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-equilibrated-field-split-"
+        "sigma-jacobi10-fp64": (
+            10,
+            "native_element_schwarz_equilibrated_field_split_"
+            "sigma_jacobi10_fp64",
+            False,
+        ),
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi10-fp64": (
+            10,
+            "native_element_schwarz_warp_equilibrated_field_split_"
+            "sigma_jacobi10_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-warp-coupled-"
+        "sigma-jacobi2-fp64": (
+            2,
+            "native_element_schwarz_warp_coupled_sigma_jacobi2_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-warp-coupled-"
+        "sigma-jacobi10-fp64": (
+            10,
+            "native_element_schwarz_warp_coupled_sigma_jacobi10_fp64",
+            True,
+        ),
+        "native-element-schwarz-matrix-free-warp-robust-coupled-"
+        "sigma-jacobi10-fp64": (
+            10,
+            "native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64",
+            True,
+        ),
+    }
+    assert len(expected) == 23
+    assert PROFILE.FIXED_SIGMA_JACOBI_PROFILE_POLICIES == expected
+    for order in (1, 2, 3):
+        conventional_default = PROFILE._profile_trace_policy_contract(
+            "engine-default", "conventional", order
+        )
+        assert conventional_default == (
+            "engine-default", "engine-default", "hypre_diag_scale",
+            "production", True, None, False, "not-applicable",
+            "not-applicable", 0,
+        )
+        resolved = PROFILE.PRODUCTION_TENSOR_IGR_TRACE_POLICY_BY_ORDER[order]
+        descriptor = PROFILE.FIXED_SIGMA_JACOBI_PROFILE_POLICIES[resolved]
+        igr_default = PROFILE._profile_trace_policy_contract(
+            "engine-default", "igr", order
+        )
+        assert igr_default == (
+            "engine-default", resolved, descriptor.preconditioner,
+            "production", True, descriptor, True,
+            "adaptive-lower-multiplicative-uhat4-sigmahat-or-"
+            "full-coupled-patch-lu",
+            "adaptive-cooperative-lower-or-full-patch-pivoted-lu-fp64",
+            16 if order == 1 else 32,
+        )
+
+    def rejected(function: object, *arguments: object) -> bool:
+        try:
+            function(*arguments)  # type: ignore[operator]
+        except RuntimeError:
+            return True
+        return False
+
+    assert rejected(
+        PROFILE._profile_trace_policy_contract,
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi10-fp64-extra",
+        "igr",
+        2,
+    )
+    assert rejected(
+        PROFILE._profile_trace_policy_contract,
+        "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+        "sigma-jacobi11-fp64",
+        "igr",
+        2,
+    )
+    for invalid_order in (False, 0, 4):
+        assert rejected(
+            PROFILE._profile_trace_policy_contract,
+            "engine-default", "igr", invalid_order,
+        )
+    for policy, descriptor in expected.items():
+        contract = PROFILE._profile_trace_policy_contract(policy, "igr", 2)
+        robust = policy in PROFILE.ROBUST_WARP_PROFILE_POLICIES
+        coupled = "-warp-coupled-" in policy
+        assert contract == (
+            policy, policy, descriptor[1], "ablation", False,
+            PROFILE.FixedSigmaJacobiProfilePolicy(*descriptor), True,
+            "adaptive-lower-multiplicative-uhat4-sigmahat-or-"
+            "full-coupled-patch-lu" if robust
+            else "full-coupled-patch-lu" if coupled
+            else "lower-multiplicative-uhat4-sigmahat",
+            "adaptive-cooperative-lower-or-full-patch-pivoted-lu-fp64"
+            if robust else "cooperative-full-patch-pivoted-lu-fp64" if coupled
+            else "cooperative-pivoted-lu-fp64" if descriptor[2]
+            else "scalar-pivoted-lu-fp64",
+            32 if coupled or descriptor[2] else 0,
+        )
+        assert rejected(
+            PROFILE._profile_trace_policy_contract,
+            policy,
+            "conventional",
+            2,
+        )
+        tensor = {
+            "element_schwarz_preconditioner_applications": 9,
+            "sigma_jacobi_sweeps": descriptor[0],
+            "sigma_jacobi_damping": 2.0 / 3.0,
+            "sigma_jacobi_updates": 9 * descriptor[0],
+            "field_split_sigma_jacobi_sweeps": descriptor[0],
+            "field_split_sigma_jacobi_damping": 2.0 / 3.0,
+            "field_split_sigma_jacobi_updates": 9 * descriptor[0],
+        }
+        validated = PROFILE._validated_fixed_sigma_jacobi_work(
+            tensor, contract
+        )
+        assert validated["sigma_jacobi_sweeps"] == descriptor[0]
+        assert validated["sigma_jacobi_damping"] == 2.0 / 3.0
+        assert validated["sigma_jacobi_updates"] == 9 * descriptor[0]
+        if coupled or robust:
+            assert not any(
+                key.startswith("field_split_") for key in validated
+            )
+        else:
+            assert validated[
+                "field_split_sigma_jacobi_sweeps"
+            ] == descriptor[0]
+        for field, value in (
+                ("field_split_sigma_jacobi_sweeps",
+                 5 if descriptor[0] != 5 else 4),
+                ("field_split_sigma_jacobi_damping", 0.5),
+                ("field_split_sigma_jacobi_damping", float("nan")),
+                ("field_split_sigma_jacobi_updates",
+                 9 * descriptor[0] - 1)):
+            invalid = {**tensor, field: value}
+            assert rejected(
+                PROFILE._validated_fixed_sigma_jacobi_work,
+                invalid,
+                contract,
+            ), (policy, field)
+        no_work = {
+            **tensor,
+            "element_schwarz_preconditioner_applications": 0,
+            "field_split_sigma_jacobi_updates": 0,
+        }
+        assert rejected(
+            PROFILE._validated_fixed_sigma_jacobi_work, no_work, contract
+        ), policy
+        if descriptor[0] == 10:
+            overflowing = {
+                **tensor,
+                "element_schwarz_preconditioner_applications":
+                    PROFILE.UINT64_MAX,
+                "field_split_sigma_jacobi_updates": PROFILE.UINT64_MAX,
+            }
+            assert rejected(
+                PROFILE._validated_fixed_sigma_jacobi_work,
+                overflowing,
+                contract,
+            ), policy
+
+    coupled_base = PROFILE._profile_trace_policy_contract(
+        PROFILE.COUPLED_WARP_BASE_PROFILE_POLICY, "igr", 2
+    )
+    assert coupled_base == (
+        PROFILE.COUPLED_WARP_BASE_PROFILE_POLICY,
+        PROFILE.COUPLED_WARP_BASE_PROFILE_POLICY,
+        "native_element_schwarz_warp_coupled_fp64",
+        "ablation",
+        False,
+        None,
+        True,
+        "full-coupled-patch-lu",
+        "cooperative-full-patch-pivoted-lu-fp64",
+        32,
+    )
+    assert rejected(
+        PROFILE._profile_trace_policy_contract,
+        PROFILE.COUPLED_WARP_BASE_PROFILE_POLICY,
+        "conventional",
+        2,
+    )
+    base_tensor = {
+        "element_schwarz_preconditioner_applications": 9,
+        "sigma_jacobi_sweeps": 0,
+        "sigma_jacobi_damping": 0.0,
+        "sigma_jacobi_updates": 0,
+        "field_split_sigma_jacobi_sweeps": 0,
+        "field_split_sigma_jacobi_damping": 0.0,
+        "field_split_sigma_jacobi_updates": 0,
+    }
+    validated_base = PROFILE._validated_fixed_sigma_jacobi_work(
+        base_tensor, coupled_base
+    )
+    assert validated_base == {
+        "element_schwarz_preconditioner_applications": 9,
+        "sigma_jacobi_sweeps": 0,
+        "sigma_jacobi_damping": 0.0,
+        "sigma_jacobi_updates": 0,
+    }
+    assert rejected(
+        PROFILE._validated_fixed_sigma_jacobi_work,
+        {**base_tensor,
+         "element_schwarz_preconditioner_applications": 0},
+        coupled_base,
+    )
+
+
 def main() -> int:
+    validate_fixed_sigma_jacobi_profile_surface()
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         app = root / "app"
@@ -185,6 +533,9 @@ elif "--import" in arguments:
         print('"","","","nsecond"')
         categories = [
             ("BorrowedEulerVolumeKernel", "local-assembly", 8000),
+            ("BorrowedEulerTensorVolumeContractionKernel", "local-assembly", 1500),
+            ("BorrowedEulerTensorVolumeContractionKernel", "local-assembly", 1500),
+            ("BorrowedEulerTensorVolumeContractionKernel", "local-assembly", 1500),
             ("TensorBorrowedCondenseKernel", "condensation", 2000),
             ("TensorBorrowedCondenseKernel", "condensation", 2000),
             ("TensorBorrowedCondenseKernel", "condensation", 2000),
@@ -198,6 +549,9 @@ elif "--import" in arguments:
         ]
         if os.environ.get("FAKE_NCU_MISSING_CATEGORY"):
             categories = categories[:-1]
+        if os.environ.get("FAKE_NCU_MISSING_VOLUME"):
+            categories = [item for item in categories
+                          if "VolumeContraction" not in item[0]]
         for launch, (kernel, category, duration) in enumerate(categories):
             ranges = ("HDG/profiled-accepted-step HDG/accepted-step "
                       f"HDG/{category}")
@@ -205,17 +559,51 @@ elif "--import" in arguments:
     else:
         print('"ID","Kernel Name","sm__inst_executed_pipe_fp64_op_dmma.sum","gpu__time_duration.avg"')
         print('"","","inst","nsecond"')
-        value = ("0" if os.environ.get("FAKE_NCU_ZERO") else
-                 "22827167" if os.environ.get("FAKE_NCU_WRONG_TOTAL") else
-                 "22827168")
-        for launch in range(3):
-            print(f'"{launch}","void TensorBorrowedCondenseKernel<double>()","{value}","226912"')
+        volume = bool(os.environ.get("FAKE_NCU_VOLUME"))
+        p1_igr = bool(os.environ.get("FAKE_APP_P1_IGR"))
+        expected_values = (
+            [908544] * 3
+            if volume and p1_igr else
+            [15331680] * 3 if volume else [22827168] * 3
+        )
+        kernel = ("BorrowedEulerTensorVolumeContractionKernel"
+                  if volume else "TensorBorrowedCondenseKernel")
+        for launch, expected in enumerate(expected_values):
+            value = ("0" if os.environ.get("FAKE_NCU_ZERO") else
+                     str(expected - 1)
+                     if os.environ.get("FAKE_NCU_WRONG_TOTAL") else
+                     str(expected))
+            print(f'"{launch}","void {kernel}<double>()","{value}","226912"')
 else:
     stem = pathlib.Path(arguments[arguments.index("--export") + 1])
     payload = (b"not-a-native-report" if os.environ.get("FAKE_NCU_BAD_REPORT")
                else b"NVR\\x00synthetic-native-report")
     stem.with_suffix(".ncu-rep").write_bytes(payload)
     launches = int(os.environ.get("FAKE_APP_CONDENSATION_LAUNCHES", "3"))
+    volume_launches = int(os.environ.get(
+        "FAKE_APP_VOLUME_ASSEMBLY_LAUNCHES", "3"
+    ))
+    p1_igr = bool(os.environ.get("FAKE_APP_P1_IGR"))
+    order = 1 if p1_igr else 3
+    interior_unknowns = 75712 if p1_igr else 302848
+    condensation_tiles_per_launch = 889616 if p1_igr else 22827168
+    volume_tiles_per_assembly = 908544 if p1_igr else 15331680
+    resolved_trace_policy = (
+        "native-element-schwarz-matrix-free-warp-robust-coupled-"
+        "sigma-jacobi10-fp64"
+    )
+    trace_preconditioner = (
+        "native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64"
+    )
+    sigma_sweeps = 10
+    top_level_resolved_trace_policy = (
+        "engine-default" if os.environ.get("FAKE_APP_BAD_TOP_RESOLVED")
+        else resolved_trace_policy
+    )
+    sample_resolved_trace_policy = (
+        "engine-default" if os.environ.get("FAKE_APP_BAD_SAMPLE_RESOLVED")
+        else resolved_trace_policy
+    )
     print(json.dumps({
         "schema": 2,
         "benchmark": "dg_igr_hdg_cuda_accepted_step",
@@ -225,27 +613,111 @@ else:
         "backend": "cuda",
         "cuda_engine": "tensor",
         "trace_policy": "engine-default",
+        "requested_trace_policy": "engine-default",
+        "resolved_trace_policy": top_level_resolved_trace_policy,
+        "trace_preconditioner": trace_preconditioner,
+        "trace_element_schwarz_factorization":
+            "adaptive-lower-multiplicative-uhat4-sigmahat-or-"
+            "full-coupled-patch-lu",
+        "trace_element_schwarz_equilibration_passes": 2,
+        "trace_element_schwarz_euler_rows": 16 * (order + 1),
+        "trace_element_schwarz_sigma_rows": 4 * (order + 1),
+        "trace_element_schwarz_apply":
+            "adaptive-cooperative-lower-or-full-patch-pivoted-lu-fp64",
+        "trace_element_schwarz_apply_tile_width":
+            16 if order == 1 else 32,
+        "trace_sigma_jacobi_sweeps": sigma_sweeps,
+        "trace_sigma_jacobi_damping": 2.0 / 3.0,
+        "trace_field_split_sigma_jacobi_sweeps": sigma_sweeps,
+        "trace_field_split_sigma_jacobi_damping": 2.0 / 3.0,
+        "trace_robust_lower_specialization_supported": True,
+        "trace_robust_coupled_specialization_supported":
+            not bool(os.environ.get("FAKE_APP_BAD_ROBUST_SUPPORT")),
+        "trace_robust_branch_accounting_complete": True,
+        "trace_robust_lower_patch_setups": 2,
+        "trace_robust_lower_trace_solve_calls": 2,
+        "trace_robust_coupled_patch_setups": 0,
+        "trace_robust_coupled_trace_solve_calls": 0,
         "mode": "igr",
         "rank_count": 1,
-        "polynomial_order": 3,
+        "polynomial_order": order,
         "mesh_n": 52,
         "domain_periods": 1,
         "dt": 1e-5,
         "elements": 2704,
+        "volume_assembly_order": 6 if p1_igr else 10,
+        "volume_points": 16 if p1_igr else 36,
+        "numerical_policy": {
+            "igr_volume_assembly_quadrature_order": (
+                7 if os.environ.get("FAKE_APP_BAD_IGR_VOLUME_Q") else
+                6 if p1_igr else 10
+            ),
+            "igr_face_assembly_quadrature_order": (
+                5 if os.environ.get("FAKE_APP_BAD_IGR_FACE_Q") else
+                4 if p1_igr else 8
+            ),
+            "newton_correction_linear_relative_tolerance": (
+                1e-12 if os.environ.get("FAKE_APP_BAD_NEWTON_RTOL")
+                else 1e-10
+            ),
+            "final_coherent_linear_relative_tolerance": (
+                1e-12 if os.environ.get("FAKE_APP_BAD_FINAL_RTOL")
+                else 3e-11
+            ),
+            "true_residual_tightening_linear_relative_tolerance": (
+                3e-11 if os.environ.get("FAKE_APP_BAD_TIGHTENING_RTOL")
+                else 1e-12
+            ),
+        },
         "interior_components": 7,
         "trace_components": 5,
-        "interior_unknowns": 302848,
+        "interior_unknowns": interior_unknowns,
         "profiling_observability": True,
         "profile_measured_step": 2,
         "host_export": False,
         "samples": [{
             "phase": "measured",
             "measured_index": 2,
+            "trace_solves": 2,
+            "linear_solve_attempts": 2,
             "tensor_core": {
                 "selected_engine": "tensor",
+                "requested_trace_policy": "engine-default",
+                "resolved_trace_policy": sample_resolved_trace_policy,
+                "trace_preconditioner": trace_preconditioner,
+                "native_rank1_trace_solver_configured": True,
+                "native_rank1_trace_solve_calls": (
+                    1 if os.environ.get("FAKE_APP_BAD_NATIVE_TRACE_CALLS")
+                    else 2
+                ),
+                "hypre_trace_solve_calls": (
+                    1 if os.environ.get("FAKE_APP_BAD_HYPRE_TRACE_CALLS")
+                    else 0
+                ),
+                "trace_solver_accounting_complete": not bool(
+                    os.environ.get("FAKE_APP_BAD_TRACE_ACCOUNTING")
+                ),
+                "element_schwarz_preconditioner_applications": 9,
+                "robust_lower_specialization_supported": True,
+                "robust_coupled_specialization_supported": True,
+                "robust_branch_accounting_complete": True,
+                "robust_lower_patch_setups": 2,
+                "robust_lower_trace_solve_calls": 2,
+                "robust_coupled_patch_setups": 0,
+                "robust_coupled_trace_solve_calls": (
+                    1 if os.environ.get("FAKE_APP_BAD_ROBUST_COUNTER") else 0
+                ),
+                "sigma_jacobi_sweeps": sigma_sweeps,
+                "sigma_jacobi_damping": 2.0 / 3.0,
+                "sigma_jacobi_updates": 9 * sigma_sweeps,
+                "field_split_sigma_jacobi_sweeps": sigma_sweeps,
+                "field_split_sigma_jacobi_damping": 2.0 / 3.0,
+                "field_split_sigma_jacobi_updates": 9 * sigma_sweeps,
                 "hardware_supported": True,
+                "volume_assembly_launches": volume_launches,
+                "volume_mma_tiles": volume_tiles_per_assembly * volume_launches,
                 "condensation_launches": launches,
-                "mma_tiles": 22827168 * launches,
+                "mma_tiles": condensation_tiles_per_launch * launches,
                 "fallback_count": 0,
                 "fallback_accounting_complete": True,
                 "no_fallback": True,
@@ -306,6 +778,26 @@ else:
         "backend": "cuda",
         "cuda_engine": "tensor",
         "trace_policy": "engine-default",
+        "requested_trace_policy": "engine-default",
+        "resolved_trace_policy": "engine-default",
+        "trace_preconditioner": "hypre_diag_scale",
+        "trace_element_schwarz_factorization": "not-applicable",
+        "trace_element_schwarz_equilibration_passes": 0,
+        "trace_element_schwarz_euler_rows": 0,
+        "trace_element_schwarz_sigma_rows": 0,
+        "trace_element_schwarz_apply": "not-applicable",
+        "trace_element_schwarz_apply_tile_width": 0,
+        "trace_sigma_jacobi_sweeps": 0,
+        "trace_sigma_jacobi_damping": 0.0,
+        "trace_field_split_sigma_jacobi_sweeps": 0,
+        "trace_field_split_sigma_jacobi_damping": 0.0,
+        "trace_robust_lower_specialization_supported": False,
+        "trace_robust_coupled_specialization_supported": False,
+        "trace_robust_branch_accounting_complete": True,
+        "trace_robust_lower_patch_setups": 0,
+        "trace_robust_lower_trace_solve_calls": 0,
+        "trace_robust_coupled_patch_setups": 0,
+        "trace_robust_coupled_trace_solve_calls": 0,
         "mode": "conventional",
         "rank_count": 1,
         "polynomial_order": 2,
@@ -313,6 +805,15 @@ else:
         "domain_periods": 1,
         "dt": 1e-5,
         "elements": 2704,
+        "volume_assembly_order": 6,
+        "volume_points": 16,
+        "numerical_policy": {
+            "igr_volume_assembly_quadrature_order": 12,
+            "igr_face_assembly_quadrature_order": 12,
+            "newton_correction_linear_relative_tolerance": 1e-10,
+            "final_coherent_linear_relative_tolerance": 3e-11,
+            "true_residual_tightening_linear_relative_tolerance": 1e-12,
+        },
         "interior_components": 4,
         "trace_components": 4,
         "interior_unknowns": 97344,
@@ -322,9 +823,34 @@ else:
         "samples": [{
             "phase": "measured",
             "measured_index": 2,
+            "trace_solves": 2,
+            "linear_solve_attempts": 2,
             "tensor_core": {
                 "selected_engine": "tensor",
+                "requested_trace_policy": "engine-default",
+                "resolved_trace_policy": "engine-default",
+                "trace_preconditioner": "hypre_diag_scale",
+                "native_rank1_trace_solver_configured": True,
+                "native_rank1_trace_solve_calls": 2,
+                "hypre_trace_solve_calls": 0,
+                "trace_solver_accounting_complete": True,
+                "element_schwarz_preconditioner_applications": 0,
+                "robust_lower_specialization_supported": False,
+                "robust_coupled_specialization_supported": False,
+                "robust_branch_accounting_complete": True,
+                "robust_lower_patch_setups": 0,
+                "robust_lower_trace_solve_calls": 0,
+                "robust_coupled_patch_setups": 0,
+                "robust_coupled_trace_solve_calls": 0,
+                "sigma_jacobi_sweeps": 0,
+                "sigma_jacobi_damping": 0.0,
+                "sigma_jacobi_updates": 0,
+                "field_split_sigma_jacobi_sweeps": 0,
+                "field_split_sigma_jacobi_damping": 0.0,
+                "field_split_sigma_jacobi_updates": 0,
                 "hardware_supported": True,
+                "volume_assembly_launches": 3,
+                "volume_mma_tiles": 3893760,
                 "condensation_launches": 3,
                 "mma_tiles": 5159232,
                 "fallback_count": 0,
@@ -338,15 +864,24 @@ else:
 
         def qualification_arguments(
                 output: Path,
-                kind: str = "tensor-instructions") -> list[str]:
+                kind: str = "tensor-instructions",
+                p1_igr: bool = False) -> list[str]:
             application = [
                 "--arg=--mode", "--arg", "igr",
                 "--arg=--engine", "--arg", "tensor",
                 "--arg=--trace-policy", "--arg", "engine-default",
-                "--arg=--order", "--arg", "3",
+                "--arg=--order", "--arg", "1" if p1_igr else "3",
                 "--arg=--mesh-n", "--arg", "52",
                 "--arg=--domain-periods", "--arg", "1",
                 "--arg=--dt", "--arg", "1e-5",
+                "--arg=--newton-linear-rtol", "--arg", "1e-10",
+                "--arg=--final-linear-rtol", "--arg", "3e-11",
+                "--arg=--true-residual-tightening-linear-rtol", "--arg",
+                "1e-12",
+                "--arg=--igr-volume-quadrature-order", "--arg",
+                "6" if p1_igr else "10",
+                "--arg=--igr-face-quadrature-order", "--arg",
+                "4" if p1_igr else "8",
                 "--arg=--profile-measured-step", "--arg", "2",
                 "--arg=--no-export",
                 "--arg=--expected-source-revision", "--arg",
@@ -358,8 +893,8 @@ else:
                 "--arg=--expected-cmake-cache", "--arg",
                 str(qualification_cache.resolve()),
             ]
-            ncu_arguments = (
-                [
+            if kind == "tensor-instructions":
+                ncu_arguments = [
                     "--ncu-metric",
                     "sm__inst_executed_pipe_fp64_op_dmma.sum",
                     "--ncu-metric", "gpu__time_duration.avg",
@@ -369,18 +904,28 @@ else:
                     "--ncu-launch-count", "3",
                     "--ncu-nvtx-include", "HDG\\/condensation/",
                 ]
-                if kind == "tensor-instructions" else
-                [
+            elif kind == "tensor-volume-instructions":
+                ncu_arguments = [
+                    "--ncu-metric",
+                    "sm__inst_executed_pipe_fp64_op_dmma.sum",
+                    "--ncu-metric", "gpu__time_duration.avg",
+                    "--ncu-kernel-name-base", "demangled",
+                    "--ncu-kernel-name",
+                    "regex:.*BorrowedEulerTensorVolumeContractionKernel.*",
+                    "--ncu-launch-count", "3",
+                    "--ncu-nvtx-include", "HDG\\/local-assembly/",
+                ]
+            else:
+                ncu_arguments = [
                     "--ncu-metric", "gpu__time_duration.avg",
                     "--ncu-kernel-name-base", "demangled",
                     "--ncu-launch-count", "20",
                     "--ncu-nvtx-include",
                     "HDG\\/profiled-accepted-step/",
                 ]
-            )
             return [
                 "--level", "l2-ncu", "--evidence-mode", "qualification",
-                "--scenario", f"igr-p3-{kind}",
+                "--scenario", f"igr-p{1 if p1_igr else 3}-{kind}",
                 "--exe", str(qualification_app), "--out-dir", str(output),
                 "--source-root", str(qualification_source),
                 "--expected-commit", qualification_commit,
@@ -428,7 +973,30 @@ else:
         ]
         assert application_work["condensation_launches"] == 3
         assert application_work["planned_mma_tiles"] == 68481504
+        assert application_work["volume_assembly_launches"] == 3
+        assert application_work["volume_contraction_launches"] == 3
+        assert application_work["planned_volume_mma_tiles"] == 45995040
         assert application_work["all_intended_fused_stages_material"] is True
+        assert application_work["sigma_jacobi_sweeps"] == 10
+        assert application_work["sigma_jacobi_updates"] == 90
+        assert application_work[
+            "robust_lower_specialization_supported"
+        ] is True
+        assert application_work[
+            "robust_coupled_specialization_supported"
+        ] is True
+        assert application_work[
+            "robust_branch_accounting_complete"
+        ] is True
+        assert application_work["robust_lower_patch_setups"] == 2
+        assert application_work["robust_lower_trace_solve_calls"] == 2
+        assert application_work["robust_coupled_patch_setups"] == 0
+        assert application_work[
+            "robust_coupled_trace_solve_calls"
+        ] == 0
+        assert application_work["native_rank1_trace_solve_calls"] == 2
+        assert application_work["hypre_trace_solve_calls"] == 0
+        assert application_work["trace_solver_accounting_complete"] is True
         assert proof["duration_unit"] == "nanoseconds"
         assert proof["raw_duration_unit_field"] == "nsecond"
         assert proof["import_command"][-2:] == ["--print-units", "base"]
@@ -449,6 +1017,115 @@ else:
             "--print-units", "base",
         ]
 
+        for suffix, environment, expected_detail in (
+            (
+                "bad-top-resolved", "FAKE_APP_BAD_TOP_RESOLVED",
+                "does not match the qualified production tensor",
+            ),
+            (
+                "bad-sample-resolved", "FAKE_APP_BAD_SAMPLE_RESOLVED",
+                "does not prove an admitted no-fallback tensor engine",
+            ),
+            (
+                "bad-robust-support", "FAKE_APP_BAD_ROBUST_SUPPORT",
+                "robust specialization/accounting evidence is invalid",
+            ),
+            (
+                "bad-robust-counter", "FAKE_APP_BAD_ROBUST_COUNTER",
+                "did not remain on the robust lower branch",
+            ),
+            (
+                "bad-native-trace-calls", "FAKE_APP_BAD_NATIVE_TRACE_CALLS",
+                "recurring trace-solver work does not match",
+            ),
+            (
+                "bad-hypre-trace-calls", "FAKE_APP_BAD_HYPRE_TRACE_CALLS",
+                "recurring trace-solver work does not match",
+            ),
+            (
+                "bad-trace-accounting", "FAKE_APP_BAD_TRACE_ACCOUNTING",
+                "recurring trace-solver work does not match",
+            ),
+            (
+                "bad-igr-volume-q", "FAKE_APP_BAD_IGR_VOLUME_Q",
+                "reported IGR quadrature policy does not match",
+            ),
+            (
+                "bad-igr-face-q", "FAKE_APP_BAD_IGR_FACE_Q",
+                "reported IGR quadrature policy does not match",
+            ),
+            (
+                "bad-newton-rtol", "FAKE_APP_BAD_NEWTON_RTOL",
+                "reported role-specific linear tolerances do not match",
+            ),
+            (
+                "bad-final-rtol", "FAKE_APP_BAD_FINAL_RTOL",
+                "reported role-specific linear tolerances do not match",
+            ),
+            (
+                "bad-tightening-rtol", "FAKE_APP_BAD_TIGHTENING_RTOL",
+                "reported role-specific linear tolerances do not match",
+            ),
+        ):
+            rejected_out = root / f"qualification-{suffix}"
+            run(
+                *qualification_arguments(rejected_out), expected=6,
+                env={**qualification_env, environment: "1"},
+            )
+            assert expected_detail in \
+                read_manifest(rejected_out)["detail"]
+
+        volume_qualification_out = root / "qualification-volume"
+        run(
+            *qualification_arguments(
+                volume_qualification_out, "tensor-volume-instructions", True
+            ),
+            env={
+                **qualification_env,
+                "FAKE_NCU_VOLUME": "1",
+                "FAKE_APP_P1_IGR": "1",
+            },
+        )
+        volume_manifest = read_manifest(volume_qualification_out)
+        volume_proof = volume_manifest["qualification"][
+            "tensor_instruction_proof"
+        ]
+        assert volume_proof["status"] == \
+            "positive_tensor_instruction_proof"
+        assert volume_proof["qualified_hotspot"] == \
+            "tensor-volume-contraction"
+        assert volume_proof["kernel_substring"] == \
+            "BorrowedEulerTensorVolumeContractionKernel"
+        assert volume_proof["matched_launches"] == 3
+        assert volume_proof["dmma_instruction_total"] == 2725632.0
+        assert volume_proof["dmma_instruction_minimum"] == 908544.0
+        assert volume_proof["dmma_instruction_maximum"] == 908544.0
+        assert volume_proof["dmma_instruction_histogram"] == [
+            {"dmma_instructions": 908544.0, "launches": 3},
+        ]
+        assert volume_proof["complete_planned_dmma_match"] is True
+        assert volume_proof["volume_assembly_order"] == 6
+        assert volume_proof["volume_points"] == 16
+        assert volume_proof[
+            "planned_volume_mma_tiles_per_assembly"
+        ] == 908544
+        assert volume_proof[
+            "planned_volume_contraction_launch_distribution"
+        ] == [
+            {
+                "quadrature_points": 16,
+                "quadrature_groups": 4,
+                "mma_tiles_per_launch": 908544,
+                "launches_per_assembly": 1,
+            },
+        ]
+        volume_work = volume_manifest["qualification"]["application_work"]
+        assert volume_work["volume_assembly_launches"] == 3
+        assert volume_work["volume_workspace_capacity_points"] == 17
+        assert volume_work["volume_chunk_points"] == 16
+        assert volume_work["volume_contraction_launches"] == 3
+        assert volume_work["planned_volume_mma_tiles"] == 2725632
+
         attribution_out = root / "qualification-attribution"
         run(
             *qualification_arguments(
@@ -462,8 +1139,8 @@ else:
         ]
         assert attribution["status"] == \
             "positive_accepted_step_attribution"
-        assert attribution["matched_launches"] == 11
-        assert attribution["total_gpu_kernel_duration_ns"] == 15900.0
+        assert attribution["matched_launches"] == 14
+        assert attribution["total_gpu_kernel_duration_ns"] == 20400.0
         assert attribution["tensor_condensation"]["launches"] == 3
         assert attribution["tensor_condensation"]["duration_ns"] == 6000.0
         assert attribution["import_command"][-2:] == [
@@ -473,7 +1150,15 @@ else:
             attribution["tensor_condensation"][
                 "fraction_of_gpu_kernel_duration"
             ],
-            6000.0 / 15900.0,
+            6000.0 / 20400.0,
+        )
+        assert attribution["tensor_volume_assembly"]["launches"] == 3
+        assert attribution["tensor_volume_assembly"]["duration_ns"] == 4500.0
+        assert math.isclose(
+            attribution["tensor_volume_assembly"][
+                "fraction_of_gpu_kernel_duration"
+            ],
+            4500.0 / 20400.0,
         )
         assert set(attribution["required_categories"]) <= {
             item["category"] for item in attribution["categories"]
@@ -547,6 +1232,30 @@ else:
             ablation_trace_policy_error
         assert "expected 'engine-default'" in ablation_trace_policy_error
 
+        nonpromotion_policies = (
+            "native-element-schwarz-matrix-free-warp-"
+            "equilibrated-field-split-sigma-jacobi7-fp64",
+            PROFILE.COUPLED_WARP_BASE_PROFILE_POLICY,
+            "native-element-schwarz-matrix-free-warp-coupled-"
+            "sigma-jacobi2-fp64",
+            "native-element-schwarz-matrix-free-warp-coupled-"
+            "sigma-jacobi10-fp64",
+        )
+        for index, trace_policy in enumerate(nonpromotion_policies):
+            ablation_arguments = qualification_arguments(
+                root / f"qualification-nonpromotion-policy-{index}"
+            )
+            ablation_arguments[
+                ablation_arguments.index("engine-default")
+            ] = trace_policy
+            error = run(
+                *ablation_arguments,
+                expected=2,
+                env=qualification_env,
+            ).stderr
+            assert f"application --trace-policy={trace_policy!r}" in error
+            assert "expected 'engine-default'" in error
+
         missing_category_out = root / "qualification-attribution-missing"
         run(
             *qualification_arguments(
@@ -564,6 +1273,22 @@ else:
         assert "missing material accepted-step categories" in \
             missing_category_manifest["detail"]
 
+        missing_volume_out = root / "qualification-attribution-missing-volume"
+        run(
+            *qualification_arguments(
+                missing_volume_out, "accepted-step-attribution"
+            ),
+            expected=6,
+            env={
+                **qualification_env,
+                "FAKE_NCU_ATTRIBUTION": "1",
+                "FAKE_NCU_MISSING_VOLUME": "1",
+            },
+        )
+        assert "no positive tensor-volume contraction" in read_manifest(
+            missing_volume_out
+        )["detail"]
+
         nsys_application = [
             "--arg=--mode", "--arg", "conventional",
             "--arg=--engine", "--arg", "tensor",
@@ -572,6 +1297,10 @@ else:
             "--arg=--mesh-n", "--arg", "52",
             "--arg=--domain-periods", "--arg", "1",
             "--arg=--dt", "--arg", "1e-5",
+            "--arg=--newton-linear-rtol", "--arg", "1e-10",
+            "--arg=--final-linear-rtol", "--arg", "3e-11",
+            "--arg=--true-residual-tightening-linear-rtol", "--arg",
+            "1e-12",
             "--arg=--profile-measured-step", "--arg", "2",
             "--arg=--no-export",
             "--arg=--expected-source-revision", "--arg",
@@ -714,6 +1443,22 @@ else:
             wrong_total_out
         )["detail"]
 
+        wrong_volume_total_out = root / "qualification-wrong-volume-dmma-total"
+        run(
+            *qualification_arguments(
+                wrong_volume_total_out, "tensor-volume-instructions"
+            ),
+            expected=6,
+            env={
+                **qualification_env,
+                "FAKE_NCU_VOLUME": "1",
+                "FAKE_NCU_WRONG_TOTAL": "1",
+            },
+        )
+        assert "tensor-volume-contraction DMMA work" in read_manifest(
+            wrong_volume_total_out
+        )["detail"]
+
         truncated_out = root / "qualification-truncated-launches"
         run(
             *qualification_arguments(truncated_out), expected=6,
@@ -722,7 +1467,8 @@ else:
                 "FAKE_APP_CONDENSATION_LAUNCHES": "4",
             },
         )
-        assert "does not match the profiled accepted step's 4 tensor launches" \
+        assert "does not match the profiled accepted step's 4 " \
+            "fused-local-algebra-condensation launches" \
             in read_manifest(truncated_out)["detail"]
 
         bad_report_out = root / "qualification-bad-report"

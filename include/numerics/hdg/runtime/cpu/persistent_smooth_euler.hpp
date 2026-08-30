@@ -68,7 +68,12 @@ inline constexpr double cpu_armijo_constant = 1.0e-4;
 inline constexpr double cpu_nonlinear_tolerance = 1.0e-10;
 // Zero retains the legacy size-derived GMRES cap for standalone routes.
 inline constexpr int cpu_maximum_linear_iterations = 0;
-inline constexpr double cpu_linear_relative_tolerance = 1.0e-12;
+inline constexpr double cpu_newton_correction_linear_relative_tolerance =
+    1.0e-12;
+inline constexpr double cpu_final_coherent_linear_relative_tolerance =
+    1.0e-12;
+inline constexpr double cpu_true_residual_tightening_linear_relative_tolerance =
+    1.0e-12;
 inline constexpr double cpu_conservation_relative_tolerance =
     cpu_nonlinear_tolerance;
 
@@ -134,9 +139,17 @@ struct CpuPersistentConfig
   // These trailing controls leave all standalone aggregate/default routes on
   // their exact pre-policy numerical settings.
   int maximum_linear_iterations = cpu_maximum_linear_iterations;
-  double linear_relative_tolerance = cpu_linear_relative_tolerance;
+  double newton_correction_linear_relative_tolerance =
+      cpu_newton_correction_linear_relative_tolerance;
+  double final_coherent_linear_relative_tolerance =
+      cpu_final_coherent_linear_relative_tolerance;
+  double true_residual_tightening_linear_relative_tolerance =
+      cpu_true_residual_tightening_linear_relative_tolerance;
   double conservation_relative_tolerance =
       cpu_conservation_relative_tolerance;
+  // Zero preserves the frozen standalone policy by inheriting the volume
+  // order. Generic requests always select an explicit positive face order.
+  int face_assembly_quadrature_order = 0;
 };
 
 CpuPersistentConfig MakeCpuSmokeConfig() noexcept;
@@ -247,6 +260,10 @@ struct CpuAttemptEvidence
   int failure_source_rank = -1;
   int nonlinear_updates = 0;
   int linear_iterations = 0;
+  int linear_solve_attempts = 0;
+  int newton_correction_linear_iterations = 0;
+  int final_coherent_linear_iterations = 0;
+  int true_residual_tightenings = 0;
   int final_line_search_trials = 0;
   double initial_nonlinear_residual = 0.0;
   double final_nonlinear_residual = 0.0;

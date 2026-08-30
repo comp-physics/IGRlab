@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 ROOT = Path(__file__).resolve().parents[2]
 PROVENANCE_WRITER = ROOT / "scripts/perf/profile_provenance.py"
@@ -44,13 +44,282 @@ RESERVED_ARTIFACTS = frozenset({
     "nsys-cuda-gpu-mem-size-sum.stderr.txt",
 })
 EXIT_VALIDATION_FAILURE = 6
+UINT64_MAX = (1 << 64) - 1
 NCU_DMMA_METRIC = "sm__inst_executed_pipe_fp64_op_dmma.sum"
 NCU_DURATION_METRIC = "gpu__time_duration.avg"
 NCU_CONDENSATION_KERNEL = "TensorBorrowedCondenseKernel"
 NCU_CONDENSATION_FILTER = f"regex:.*{NCU_CONDENSATION_KERNEL}.*"
 NCU_CONDENSATION_NVTX_RANGE = "HDG/condensation/"
+NCU_VOLUME_KERNEL = "BorrowedEulerTensorVolumeContractionKernel"
+NCU_VOLUME_FILTER = f"regex:.*{NCU_VOLUME_KERNEL}.*"
+NCU_VOLUME_NVTX_RANGE = "HDG/local-assembly/"
 NCU_ACCEPTED_STEP_NVTX_RANGE = "HDG/profiled-accepted-step/"
+NCU_INSTRUCTION_QUALIFICATION_KINDS = frozenset({
+    "tensor-instructions", "tensor-volume-instructions",
+})
+# Explicit final-candidate profiler policy.  It does not replace the general
+# application's q12/q12, all-role-1e-12 default numerical policy.
 PRODUCTION_TRACE_POLICY = "engine-default"
+FINAL_IGR_QUADRATURE_BY_ORDER = {1: (6, 4), 2: (8, 6), 3: (10, 8)}
+FINAL_LINEAR_ROLE_RELATIVE_TOLERANCES = (1.0e-10, 3.0e-11, 1.0e-12)
+
+
+class FixedSigmaJacobiProfilePolicy(NamedTuple):
+    sweeps: int
+    preconditioner: str
+    warp: bool
+
+
+FIXED_SIGMA_JACOBI_PROFILE_POLICIES = {
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi1-fp64": FixedSigmaJacobiProfilePolicy(
+        1,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi1_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi1-fp64": FixedSigmaJacobiProfilePolicy(
+        1,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi1_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi2-fp64": FixedSigmaJacobiProfilePolicy(
+        2,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi2_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi2-fp64": FixedSigmaJacobiProfilePolicy(
+        2,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi2_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi3-fp64": FixedSigmaJacobiProfilePolicy(
+        3,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi3_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi3-fp64": FixedSigmaJacobiProfilePolicy(
+        3,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi3_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi4-fp64": FixedSigmaJacobiProfilePolicy(
+        4,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi4_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi4-fp64": FixedSigmaJacobiProfilePolicy(
+        4,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi4_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi5-fp64": FixedSigmaJacobiProfilePolicy(
+        5,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi5_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi5-fp64": FixedSigmaJacobiProfilePolicy(
+        5,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi5_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi6-fp64": FixedSigmaJacobiProfilePolicy(
+        6,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi6_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi6-fp64": FixedSigmaJacobiProfilePolicy(
+        6,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi6_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi7-fp64": FixedSigmaJacobiProfilePolicy(
+        7,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi7_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi7-fp64": FixedSigmaJacobiProfilePolicy(
+        7,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi7_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi8-fp64": FixedSigmaJacobiProfilePolicy(
+        8,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi8_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi8-fp64": FixedSigmaJacobiProfilePolicy(
+        8,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi8_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi9-fp64": FixedSigmaJacobiProfilePolicy(
+        9,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi9_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi9-fp64": FixedSigmaJacobiProfilePolicy(
+        9,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi9_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-equilibrated-field-split-"
+    "sigma-jacobi10-fp64": FixedSigmaJacobiProfilePolicy(
+        10,
+        "native_element_schwarz_equilibrated_field_split_sigma_jacobi10_fp64",
+        False,
+    ),
+    "native-element-schwarz-matrix-free-warp-equilibrated-field-split-"
+    "sigma-jacobi10-fp64": FixedSigmaJacobiProfilePolicy(
+        10,
+        "native_element_schwarz_warp_equilibrated_field_split_"
+        "sigma_jacobi10_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-warp-coupled-"
+    "sigma-jacobi2-fp64": FixedSigmaJacobiProfilePolicy(
+        2,
+        "native_element_schwarz_warp_coupled_sigma_jacobi2_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-warp-coupled-"
+    "sigma-jacobi10-fp64": FixedSigmaJacobiProfilePolicy(
+        10,
+        "native_element_schwarz_warp_coupled_sigma_jacobi10_fp64",
+        True,
+    ),
+    "native-element-schwarz-matrix-free-warp-robust-coupled-"
+    "sigma-jacobi10-fp64": FixedSigmaJacobiProfilePolicy(
+        10,
+        "native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64",
+        True,
+    ),
+}
+COUPLED_WARP_BASE_PROFILE_POLICY = \
+    "native-element-schwarz-matrix-free-warp-coupled-fp64"
+PRODUCTION_TENSOR_IGR_ROBUST_TRACE_POLICY = (
+    "native-element-schwarz-matrix-free-warp-robust-coupled-"
+    "sigma-jacobi10-fp64"
+)
+ROBUST_WARP_PROFILE_POLICIES = frozenset({
+    PRODUCTION_TENSOR_IGR_ROBUST_TRACE_POLICY,
+})
+PRODUCTION_TENSOR_IGR_TRACE_POLICY_BY_ORDER = {
+    order: PRODUCTION_TENSOR_IGR_ROBUST_TRACE_POLICY
+    for order in (1, 2, 3)
+}
+
+
+class ProfileTracePolicyContract(NamedTuple):
+    requested: str
+    resolved: str
+    preconditioner: str
+    variant: str
+    production_selectable: bool
+    fixed_sigma_jacobi: FixedSigmaJacobiProfilePolicy | None
+    element_schwarz_required: bool
+    factorization: str
+    apply: str
+    tile_width: int
+
+
+def _profile_trace_policy_contract(
+        requested: str, mode: str, order: int) -> ProfileTracePolicyContract:
+    if mode not in {"conventional", "igr"}:
+        raise RuntimeError("profiled trace policy mode is invalid")
+    if isinstance(order, bool) or order not in {1, 2, 3}:
+        raise RuntimeError("profiled trace policy order is invalid")
+    if requested == PRODUCTION_TRACE_POLICY:
+        if mode == "igr":
+            resolved = PRODUCTION_TENSOR_IGR_TRACE_POLICY_BY_ORDER[order]
+            fixed = FIXED_SIGMA_JACOBI_PROFILE_POLICIES[resolved]
+            preconditioner = fixed.preconditioner
+        else:
+            resolved = PRODUCTION_TRACE_POLICY
+            preconditioner = "hypre_diag_scale"
+            fixed = None
+        return ProfileTracePolicyContract(
+            requested,
+            resolved,
+            preconditioner,
+            "production",
+            True,
+            fixed,
+            mode == "igr",
+            "adaptive-lower-multiplicative-uhat4-sigmahat-or-"
+            "full-coupled-patch-lu"
+            if mode == "igr" else "not-applicable",
+            "adaptive-cooperative-lower-or-full-patch-pivoted-lu-fp64"
+            if mode == "igr" else "not-applicable",
+            (16 if order == 1 else 32) if mode == "igr" else 0,
+        )
+    if requested == COUPLED_WARP_BASE_PROFILE_POLICY and mode == "igr":
+        return ProfileTracePolicyContract(
+            requested,
+            requested,
+            "native_element_schwarz_warp_coupled_fp64",
+            "ablation",
+            False,
+            None,
+            True,
+            "full-coupled-patch-lu",
+            "cooperative-full-patch-pivoted-lu-fp64",
+            32,
+        )
+    fixed = FIXED_SIGMA_JACOBI_PROFILE_POLICIES.get(requested)
+    if fixed is None or mode != "igr":
+        raise RuntimeError(
+            "profiled trace policy is neither engine-default nor an exact "
+            "native element-Schwarz IGR ablation policy"
+        )
+    robust = requested in ROBUST_WARP_PROFILE_POLICIES
+    coupled = "-warp-coupled-" in requested
+    return ProfileTracePolicyContract(
+        requested,
+        requested,
+        fixed.preconditioner,
+        "ablation",
+        False,
+        fixed,
+        True,
+        "adaptive-lower-multiplicative-uhat4-sigmahat-or-"
+        "full-coupled-patch-lu" if robust
+        else "full-coupled-patch-lu" if coupled
+        else "lower-multiplicative-uhat4-sigmahat",
+        "adaptive-cooperative-lower-or-full-patch-pivoted-lu-fp64"
+        if robust else "cooperative-full-patch-pivoted-lu-fp64" if coupled
+        else "cooperative-pivoted-lu-fp64" if fixed.warp
+        else "scalar-pivoted-lu-fp64",
+        32 if coupled or (fixed.warp and order != 1)
+        else 16 if fixed.warp else 0,
+    )
+
+
 NCU_ATTRIBUTION_RANGES = {
     "HDG/local-assembly": "local_assembly",
     "HDG/local-factorization": "local_factorization",
@@ -640,10 +909,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ncu-target-processes", choices=("application-only", "all"), default="")
     parser.add_argument(
         "--ncu-qualification-kind",
-        choices=("tensor-instructions", "accepted-step-attribution"),
+        choices=("tensor-instructions", "tensor-volume-instructions",
+                 "accepted-step-attribution"),
         default="",
-        help=("Required for NCU qualification: exact tensor instruction proof "
-              "or duration-only accepted-step category attribution."),
+        help=("Required for NCU qualification: exact condensation or volume "
+              "tensor-instruction proof, or duration-only accepted-step "
+              "category attribution."),
     )
     parser.add_argument("--ncu-section", action="append", default=[], help="Explicit NCU section; repeat as needed.")
     parser.add_argument("--ncu-metric", action="append", default=[], help="One exact NCU metric; repeat as needed.")
@@ -693,12 +964,46 @@ def validate_accepted_step_qualification_application(
                 f"profiler qualification application {option}={value!r}; "
                 f"expected {expected!r}"
             )
-    if required_application_value(parser, args, "--mode") not in {
-            "conventional", "igr"}:
+    mode = required_application_value(parser, args, "--mode")
+    if mode not in {"conventional", "igr"}:
         parser.error("profiler qualification requires conventional or IGR mode")
-    order = required_application_value(parser, args, "--order")
-    if order not in {"1", "2", "3"}:
+    order_text = required_application_value(parser, args, "--order")
+    if order_text not in {"1", "2", "3"}:
         parser.error("profiler qualification requires application order 1, 2, or 3")
+    order = int(order_text)
+    # Promotion-bound NCU/Nsys captures qualify only the production selector.
+    # Explicit coupled and lower-split policies remain available to ordinary
+    # smoke/screening runs, but may not be represented as promotable evidence.
+    expected_role_tolerances = dict(zip(
+        ("--newton-linear-rtol", "--final-linear-rtol",
+         "--true-residual-tightening-linear-rtol"),
+        FINAL_LINEAR_ROLE_RELATIVE_TOLERANCES,
+    ))
+    for option, expected in expected_role_tolerances.items():
+        try:
+            value = float(required_application_value(parser, args, option))
+        except ValueError:
+            parser.error(f"profiler qualification application {option} is invalid")
+        if value != expected:
+            parser.error(
+                f"profiler qualification application {option}={value!r}; "
+                f"expected {expected!r}"
+            )
+    if mode == "igr":
+        volume, face = FINAL_IGR_QUADRATURE_BY_ORDER[order]
+        for option, expected in (
+                ("--igr-volume-quadrature-order", volume),
+                ("--igr-face-quadrature-order", face)):
+            if required_application_value(parser, args, option) != str(expected):
+                parser.error(
+                    f"profiler qualification application {option} must be "
+                    f"{expected} for p{order} IGR"
+                )
+    elif "--igr-volume-quadrature-order" in args.arg or \
+            "--igr-face-quadrature-order" in args.arg:
+        parser.error(
+            "conventional profiler qualification forbids IGR quadrature options"
+        )
     measured_step = required_application_value(
         parser, args, "--profile-measured-step"
     )
@@ -740,23 +1045,30 @@ def validate_ncu_qualification_inputs(parser: argparse.ArgumentParser,
         parser.error("NCU qualification requires a positive --ncu-launch-count")
     if args.ncu_launch_skip != 0:
         parser.error("NCU qualification forbids --ncu-launch-skip")
-    if args.ncu_qualification_kind == "tensor-instructions":
+    if args.ncu_qualification_kind in NCU_INSTRUCTION_QUALIFICATION_KINDS:
         if set(args.ncu_metric) != {NCU_DMMA_METRIC, NCU_DURATION_METRIC} or \
                 len(args.ncu_metric) != 2:
             parser.error(
                 "tensor-instruction qualification requires exactly the DMMA "
                 "instruction and GPU duration metrics"
             )
-        if args.ncu_kernel_name != NCU_CONDENSATION_FILTER:
+        volume = args.ncu_qualification_kind == \
+            "tensor-volume-instructions"
+        expected_filter = NCU_VOLUME_FILTER if volume \
+            else NCU_CONDENSATION_FILTER
+        expected_range = NCU_VOLUME_NVTX_RANGE if volume \
+            else NCU_CONDENSATION_NVTX_RANGE
+        hotspot = "volume contraction" if volume else "condensation"
+        if args.ncu_kernel_name != expected_filter:
             parser.error(
                 "tensor-instruction qualification requires the exact tensor "
-                "condensation kernel filter"
+                f"{hotspot} kernel filter"
             )
-        if normalized_nvtx != NCU_CONDENSATION_NVTX_RANGE or \
+        if normalized_nvtx != expected_range or \
                 args.ncu_nvtx_exclude:
             parser.error(
                 "tensor-instruction qualification requires only the HDG "
-                "condensation NVTX include range"
+                f"{hotspot} NVTX include range"
             )
     elif args.ncu_qualification_kind == "accepted-step-attribution":
         if args.ncu_metric != [NCU_DURATION_METRIC]:
@@ -1088,7 +1400,9 @@ def ncu_import_command(tool: str, report: Path) -> list[str]:
     ]
 
 
-def parse_ncu_tensor_csv(data: bytes, expected_launches: int) -> dict[str, Any]:
+def parse_ncu_tensor_csv(data: bytes, expected_launches: int,
+                         kernel_substring: str) -> tuple[
+        dict[str, Any], list[float]]:
     try:
         text = data.decode("utf-8", errors="strict")
         rows = list(csv.reader(io.StringIO(text)))
@@ -1125,7 +1439,7 @@ def parse_ncu_tensor_csv(data: bytes, expected_launches: int) -> dict[str, Any]:
         kernel = row[kernel_column].strip()
         if not kernel or kernel == "Kernel Name":
             continue
-        if NCU_CONDENSATION_KERNEL not in kernel:
+        if kernel_substring not in kernel:
             # Units and tool preambles are not kernel rows. A numeric metric makes
             # this a real, unexpected data row and invalidates the exact filter.
             try:
@@ -1143,36 +1457,184 @@ def parse_ncu_tensor_csv(data: bytes, expected_launches: int) -> dict[str, Any]:
         })
     if other_data_kernels:
         raise RuntimeError(
-            "NCU raw CSV contains kernels outside the exact condensation filter: "
+            "NCU raw CSV contains kernels outside the exact hotspot filter: "
             + ", ".join(other_data_kernels[:3])
         )
     if len(matched) != expected_launches:
         raise RuntimeError(
-            f"NCU raw CSV contains {len(matched)} tensor condensation launches; "
+            f"NCU raw CSV contains {len(matched)} {kernel_substring} launches; "
             f"expected {expected_launches}"
         )
     dmma_values = [row["dmma_instructions"] for row in matched]
     duration_values = [row["duration"] for row in matched]
-    return {
+    dmma_histogram = [
+        {
+            "dmma_instructions": value,
+            "launches": dmma_values.count(value),
+        }
+        for value in sorted(set(dmma_values))
+    ]
+    return ({
         "status": "positive_tensor_instruction_proof",
-        "kernel_substring": NCU_CONDENSATION_KERNEL,
+        "kernel_substring": kernel_substring,
         "matched_launches": len(matched),
         "dmma_metric": NCU_DMMA_METRIC,
         "dmma_instruction_total": sum(dmma_values),
         "dmma_instruction_minimum": min(dmma_values),
         "dmma_instruction_maximum": max(dmma_values),
+        "dmma_instruction_histogram": dmma_histogram,
         "duration_metric": NCU_DURATION_METRIC,
         "duration_unit": "nanoseconds",
         "raw_duration_unit_field": duration_unit or "empty (NCU 2024.1)",
         "duration_total": sum(duration_values),
         "duration_minimum": min(duration_values),
-    }
+    }, dmma_values)
 
 
 def exact_nonnegative_integer(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise RuntimeError(f"{label} must be a nonnegative integer")
     return value
+
+
+def exact_uint64(value: Any, label: str) -> int:
+    result = exact_nonnegative_integer(value, label)
+    if result > UINT64_MAX:
+        raise RuntimeError(f"{label} exceeds uint64")
+    return result
+
+
+ROBUST_BRANCH_COUNTER_FIELDS = (
+    "robust_lower_patch_setups",
+    "robust_lower_trace_solve_calls",
+    "robust_coupled_patch_setups",
+    "robust_coupled_trace_solve_calls",
+)
+
+
+def _validated_robust_branch_work(
+        evidence: dict[str, Any], *, field_prefix: str,
+        expected_robust: bool, expected_trace_solves: int | None = None,
+        expected_linear_solve_attempts: int | None = None) -> dict[str, int]:
+    """Validate the fixed four aggregate robust-branch counters."""
+    def field(name: str) -> str:
+        return field_prefix + name
+
+    if evidence.get(field("robust_lower_specialization_supported")) is not \
+            expected_robust or evidence.get(
+                field("robust_coupled_specialization_supported")
+            ) is not expected_robust or evidence.get(
+                field("robust_branch_accounting_complete")
+            ) is not True:
+        raise RuntimeError(
+            "profiled robust specialization/accounting evidence is invalid"
+        )
+    counters = {
+        name: exact_uint64(
+            evidence.get(field(name)), f"profiled {field(name)}"
+        )
+        for name in ROBUST_BRANCH_COUNTER_FIELDS
+    }
+    if not expected_robust:
+        if any(counters.values()):
+            raise RuntimeError(
+                "non-robust profile reported robust branch work"
+            )
+        return counters
+    if counters["robust_coupled_patch_setups"] != 0 or \
+            counters["robust_coupled_trace_solve_calls"] != 0:
+        raise RuntimeError(
+            "production profile did not remain on the robust lower branch"
+        )
+    if expected_trace_solves is None:
+        if counters["robust_lower_patch_setups"] <= 0:
+            raise RuntimeError("robust profile reported no lower patch setup")
+    elif counters["robust_lower_patch_setups"] != expected_trace_solves:
+        raise RuntimeError(
+            "robust lower patch setups differ from profiled trace solves"
+        )
+    if expected_linear_solve_attempts is None:
+        if counters["robust_lower_trace_solve_calls"] <= 0:
+            raise RuntimeError("robust profile reported no lower trace solve")
+    elif counters["robust_lower_trace_solve_calls"] != \
+            expected_linear_solve_attempts:
+        raise RuntimeError(
+            "robust lower calls differ from profiled linear solve attempts"
+        )
+    return counters
+
+
+def exact_finite_number(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or \
+            not math.isfinite(float(value)):
+        raise RuntimeError(f"{label} must be a finite number")
+    return float(value)
+
+
+def _validated_fixed_sigma_jacobi_work(
+        tensor: dict[str, Any],
+        contract: ProfileTracePolicyContract) -> dict[str, int | float]:
+    descriptor = contract.fixed_sigma_jacobi
+    expected_sweeps = descriptor.sweeps if descriptor is not None else 0
+    expected_damping = 2.0 / 3.0 if descriptor is not None else 0.0
+    applications = exact_uint64(
+        tensor.get("element_schwarz_preconditioner_applications"),
+        "element-Schwarz preconditioner application count",
+    )
+    compatibility_sweeps = exact_nonnegative_integer(
+        tensor.get("field_split_sigma_jacobi_sweeps"),
+        "fixed-sigma Jacobi sweep count",
+    )
+    compatibility_damping = exact_finite_number(
+        tensor.get("field_split_sigma_jacobi_damping"),
+        "fixed-sigma Jacobi damping",
+    )
+    compatibility_updates = exact_uint64(
+        tensor.get("field_split_sigma_jacobi_updates"),
+        "fixed-sigma Jacobi aggregate update count",
+    )
+    sweeps = exact_nonnegative_integer(
+        tensor.get("sigma_jacobi_sweeps"),
+        "generic sigma Jacobi sweep count",
+    )
+    damping = exact_finite_number(
+        tensor.get("sigma_jacobi_damping"),
+        "generic sigma Jacobi damping",
+    )
+    updates = exact_uint64(
+        tensor.get("sigma_jacobi_updates"),
+        "generic sigma Jacobi aggregate update count",
+    )
+    expected_updates = applications * expected_sweeps
+    if expected_updates > UINT64_MAX:
+        raise RuntimeError("fixed-sigma Jacobi aggregate work exceeds uint64")
+    if compatibility_sweeps != sweeps or \
+            compatibility_damping != damping or \
+            compatibility_updates != updates or \
+            sweeps != expected_sweeps or damping != expected_damping or \
+            updates != expected_updates:
+        raise RuntimeError(
+            "profiled fixed-sigma Jacobi aggregate work does not exactly "
+            "match the selected typed trace policy"
+        )
+    if contract.element_schwarz_required and applications == 0:
+        raise RuntimeError(
+            "profiled native element-Schwarz policy has no material "
+            "preconditioner work"
+        )
+    result: dict[str, int | float] = {
+        "element_schwarz_preconditioner_applications": applications,
+        "sigma_jacobi_sweeps": sweeps,
+        "sigma_jacobi_damping": damping,
+        "sigma_jacobi_updates": updates,
+    }
+    if contract.factorization == "lower-multiplicative-uhat4-sigmahat":
+        result.update({
+            "field_split_sigma_jacobi_sweeps": sweeps,
+            "field_split_sigma_jacobi_damping": damping,
+            "field_split_sigma_jacobi_updates": updates,
+        })
+    return result
 
 
 def application_argument(args: argparse.Namespace, option: str) -> str:
@@ -1224,13 +1686,49 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
     expected_mesh_n = int(application_argument(args, "--mesh-n"))
     expected_periods = int(application_argument(args, "--domain-periods"))
     expected_timestep = float(application_argument(args, "--dt"))
+    requested_trace_policy = application_argument(args, "--trace-policy")
+    trace_policy_contract = _profile_trace_policy_contract(
+        requested_trace_policy, expected_mode, expected_order
+    )
+    expected_equilibration_passes = (
+        2 if trace_policy_contract.factorization in {
+            "lower-multiplicative-uhat4-sigmahat",
+            "adaptive-lower-multiplicative-uhat4-sigmahat-or-"
+            "full-coupled-patch-lu",
+        } else 0
+    )
+    expected_euler_rows = (
+        16 * (expected_order + 1) if expected_equilibration_passes else 0
+    )
+    expected_sigma_rows = (
+        4 * (expected_order + 1) if expected_equilibration_passes else 0
+    )
     exact_record = (
         record.get("schema") == 2 and record.get("success") is True and
-        record.get("variant") == "production" and
-        record.get("production_selectable") is True and
+        record.get("variant") == trace_policy_contract.variant and
+        record.get("production_selectable") is
+            trace_policy_contract.production_selectable and
         record.get("backend") == "cuda" and
         record.get("cuda_engine") == "tensor" and
-        record.get("trace_policy") == PRODUCTION_TRACE_POLICY and
+        record.get("trace_policy") == trace_policy_contract.requested and
+        record.get("requested_trace_policy") ==
+            trace_policy_contract.requested and
+        record.get("resolved_trace_policy") ==
+            trace_policy_contract.resolved and
+        record.get("trace_preconditioner") ==
+            trace_policy_contract.preconditioner and
+        record.get("trace_element_schwarz_factorization") ==
+            trace_policy_contract.factorization and
+        record.get("trace_element_schwarz_apply") ==
+            trace_policy_contract.apply and
+        record.get("trace_element_schwarz_apply_tile_width") ==
+            trace_policy_contract.tile_width and
+        record.get("trace_element_schwarz_equilibration_passes") ==
+            expected_equilibration_passes and
+        record.get("trace_element_schwarz_euler_rows") ==
+            expected_euler_rows and
+        record.get("trace_element_schwarz_sigma_rows") ==
+            expected_sigma_rows and
         record.get("mode") == expected_mode and
         record.get("polynomial_order") == expected_order and
         record.get("mesh_n") == expected_mesh_n and
@@ -1242,9 +1740,91 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         record.get("host_export") is False
     )
     if not exact_record:
+        if trace_policy_contract.production_selectable:
+            raise RuntimeError(
+                "profiled benchmark summary does not match the qualified "
+                "production tensor accepted-step selection"
+            )
         raise RuntimeError(
-            "profiled benchmark summary does not match the qualified production "
-            "tensor accepted-step selection"
+            "profiled benchmark summary does not match the exact typed tensor "
+            "accepted-step trace-policy selection"
+        )
+    expected_robust = trace_policy_contract.resolved in \
+        ROBUST_WARP_PROFILE_POLICIES
+    _validated_robust_branch_work(
+        record,
+        field_prefix="trace_",
+        expected_robust=expected_robust,
+    )
+    numerical_policy = record.get("numerical_policy")
+    if not isinstance(numerical_policy, dict):
+        raise RuntimeError(
+            "profiled benchmark summary has no reported numerical policy"
+        )
+    if expected_mode == "igr":
+        expected_volume_order, expected_face_order = \
+            FINAL_IGR_QUADRATURE_BY_ORDER[expected_order]
+        observed_volume_order = exact_nonnegative_integer(
+            numerical_policy.get("igr_volume_assembly_quadrature_order"),
+            "reported IGR volume quadrature order",
+        )
+        observed_face_order = exact_nonnegative_integer(
+            numerical_policy.get("igr_face_assembly_quadrature_order"),
+            "reported IGR face quadrature order",
+        )
+        if (observed_volume_order, observed_face_order) != \
+                (expected_volume_order, expected_face_order):
+            raise RuntimeError(
+                "profiled benchmark reported IGR quadrature policy does not "
+                f"match p{expected_order}: observed "
+                f"({observed_volume_order},{observed_face_order}), expected "
+                f"({expected_volume_order},{expected_face_order})"
+            )
+    reported_role_tolerances = tuple(
+        exact_finite_number(numerical_policy.get(field), f"reported {field}")
+        for field in (
+            "newton_correction_linear_relative_tolerance",
+            "final_coherent_linear_relative_tolerance",
+            "true_residual_tightening_linear_relative_tolerance",
+        )
+    )
+    if reported_role_tolerances != \
+            FINAL_LINEAR_ROLE_RELATIVE_TOLERANCES:
+        raise RuntimeError(
+            "profiled benchmark reported role-specific linear tolerances do "
+            "not match the exact final numerical policy"
+        )
+    expected_sigma_sweeps = (
+        trace_policy_contract.fixed_sigma_jacobi.sweeps
+        if trace_policy_contract.fixed_sigma_jacobi is not None else 0
+    )
+    expected_sigma_damping = (
+        2.0 / 3.0
+        if trace_policy_contract.fixed_sigma_jacobi is not None else 0.0
+    )
+    generic_sigma_sweeps = exact_nonnegative_integer(
+        record.get("trace_sigma_jacobi_sweeps"),
+        "top-level sigma Jacobi sweep count",
+    )
+    generic_sigma_damping = exact_finite_number(
+        record.get("trace_sigma_jacobi_damping"),
+        "top-level sigma Jacobi damping",
+    )
+    compatibility_sigma_sweeps = exact_nonnegative_integer(
+        record.get("trace_field_split_sigma_jacobi_sweeps"),
+        "compatibility fixed-sigma Jacobi sweep count",
+    )
+    compatibility_sigma_damping = exact_finite_number(
+        record.get("trace_field_split_sigma_jacobi_damping"),
+        "compatibility fixed-sigma Jacobi damping",
+    )
+    if generic_sigma_sweeps != expected_sigma_sweeps or \
+            compatibility_sigma_sweeps != generic_sigma_sweeps or \
+            generic_sigma_damping != expected_sigma_damping or \
+            compatibility_sigma_damping != generic_sigma_damping:
+        raise RuntimeError(
+            "profiled benchmark fixed-sigma Jacobi metadata does not exactly "
+            "match the selected typed trace policy"
         )
     samples = record.get("samples")
     if not isinstance(samples, list):
@@ -1262,18 +1842,72 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
     tensor = selected[0].get("tensor_core")
     if not isinstance(tensor, dict):
         raise RuntimeError("selected benchmark sample has no tensor work summary")
-    condensation_launches = exact_nonnegative_integer(
+    expected_trace_solves = exact_uint64(
+        selected[0].get("trace_solves"), "profiled trace solve count"
+    )
+    expected_linear_solve_attempts = exact_uint64(
+        selected[0].get("linear_solve_attempts"),
+        "profiled linear solve attempt count",
+    )
+    robust_branch_work = _validated_robust_branch_work(
+        tensor,
+        field_prefix="",
+        expected_robust=expected_robust,
+        expected_trace_solves=expected_trace_solves,
+        expected_linear_solve_attempts=expected_linear_solve_attempts,
+    )
+    native_trace_solve_calls = exact_uint64(
+        tensor.get("native_rank1_trace_solve_calls"),
+        "profiled native rank-one trace solve call count",
+    )
+    hypre_trace_solve_calls = exact_uint64(
+        tensor.get("hypre_trace_solve_calls"),
+        "profiled HYPRE trace solve call count",
+    )
+    expected_native_trace_solve_calls = (
+        robust_branch_work["robust_lower_trace_solve_calls"] +
+        robust_branch_work["robust_coupled_trace_solve_calls"]
+        if expected_robust else expected_linear_solve_attempts
+    )
+    expected_hypre_trace_solve_calls = 0
+    if tensor.get("native_rank1_trace_solver_configured") is not True or \
+            tensor.get("trace_solver_accounting_complete") is not True or \
+            native_trace_solve_calls != expected_native_trace_solve_calls or \
+            hypre_trace_solve_calls != expected_hypre_trace_solve_calls:
+        raise RuntimeError(
+            "profiled recurring trace-solver work does not match the exact "
+            "production engine contract"
+        )
+    condensation_launches = exact_uint64(
         tensor.get("condensation_launches"), "condensation launch count"
     )
-    mma_tiles = exact_nonnegative_integer(
+    mma_tiles = exact_uint64(
         tensor.get("mma_tiles"), "planned MMA tile count"
+    )
+    volume_assembly_launches = exact_uint64(
+        tensor.get("volume_assembly_launches"),
+        "tensor-volume assembly launch count",
+    )
+    volume_mma_tiles = exact_uint64(
+        tensor.get("volume_mma_tiles"),
+        "planned tensor-volume MMA tile count",
     )
     if condensation_launches <= 0 or mma_tiles <= 0:
         raise RuntimeError(
             "selected benchmark sample has no material tensor condensation work"
         )
+    if volume_assembly_launches <= 0 or volume_mma_tiles <= 0:
+        raise RuntimeError(
+            "selected benchmark sample has no material tensor-volume work"
+        )
     if not (
         tensor.get("selected_engine") == "tensor" and
+        tensor.get("requested_trace_policy") ==
+            trace_policy_contract.requested and
+        tensor.get("resolved_trace_policy") ==
+            trace_policy_contract.resolved and
+        tensor.get("trace_preconditioner") ==
+            trace_policy_contract.preconditioner and
         tensor.get("hardware_supported") is True and
         tensor.get("fallback_count") == 0 and
         tensor.get("fallback_accounting_complete") is True and
@@ -1283,6 +1917,9 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
             "selected benchmark sample does not prove an admitted no-fallback "
             "tensor engine"
         )
+    sigma_jacobi_work = _validated_fixed_sigma_jacobi_work(
+        tensor, trace_policy_contract
+    )
 
     elements = exact_nonnegative_integer(record.get("elements"), "element count")
     interior_components = exact_nonnegative_integer(
@@ -1309,6 +1946,24 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(
             "profiled benchmark interior shape is inconsistent with its order, "
             "components, and element count"
+        )
+
+    volume_assembly_order = exact_nonnegative_integer(
+        record.get("volume_assembly_order"), "volume assembly order"
+    )
+    volume_points = exact_nonnegative_integer(
+        record.get("volume_points"), "volume point count"
+    )
+    expected_volume_assembly_order = (
+        FINAL_IGR_QUADRATURE_BY_ORDER[expected_order][0]
+        if expected_mode == "igr" else 2 * expected_order + 2
+    )
+    expected_volume_points = (expected_volume_assembly_order // 2 + 1) ** 2
+    if volume_assembly_order != expected_volume_assembly_order or \
+            volume_points != expected_volume_points:
+        raise RuntimeError(
+            "profiled benchmark volume quadrature differs from the exact "
+            "production numerical policy"
         )
 
     def tiles(count: int, width: int) -> int:
@@ -1353,10 +2008,85 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
             f"benchmark planned MMA total {mma_tiles} does not match the "
             f"independent fused-stage total {expected_mma_tiles}"
         )
+
+    # Independently reproduce the zero-allocation tensor-volume chunk plan and
+    # dynamic FP64 m8n8k4 work.  The output is a bounded shape histogram, not a
+    # per-launch trace.
+    coefficient_stride = 66 if expected_mode == "igr" else 44
+    workspace_doubles = interior_dofs * (trace_dofs + 1)
+    capacity_points = workspace_doubles // coefficient_stride
+    if capacity_points <= 0:
+        raise RuntimeError("profiled tensor-volume workspace has zero capacity")
+    chunk_points = volume_points if volume_points <= capacity_points else \
+        capacity_points - capacity_points % 4
+    if chunk_points <= 0 or \
+            (volume_points > capacity_points and chunk_points < 4):
+        raise RuntimeError(
+            "profiled tensor-volume workspace cannot form an MMA chunk"
+        )
+    volume_base_tiles = (
+        elements * interior_components * tiles(scalar_interior_dofs, 8) *
+        tiles(interior_dofs + 1, 8) * 3
+    )
+    remaining_points = volume_points
+    chunk_work: list[tuple[int, int, int]] = []
+    while remaining_points:
+        count = min(remaining_points, chunk_points)
+        if count <= 0 or count > capacity_points or \
+                (remaining_points > count and count % 4):
+            raise RuntimeError(
+                "profiled tensor-volume chunk plan is inconsistent"
+            )
+        groups = tiles(count, 4)
+        chunk_work.append((count, groups, volume_base_tiles * groups))
+        remaining_points -= count
+    per_assembly_volume_tiles = sum(item[2] for item in chunk_work)
+    expected_volume_tiles = (
+        per_assembly_volume_tiles * volume_assembly_launches
+    )
+    volume_contraction_launches = (
+        len(chunk_work) * volume_assembly_launches
+    )
+    if expected_volume_tiles > UINT64_MAX or \
+            volume_contraction_launches > UINT64_MAX or \
+            volume_mma_tiles != expected_volume_tiles:
+        raise RuntimeError(
+            f"benchmark planned tensor-volume MMA total {volume_mma_tiles} "
+            "does not match the independent shape/chunk total "
+            f"{expected_volume_tiles}"
+        )
+    chunk_histogram: list[dict[str, int]] = []
+    for count, groups, per_launch_tiles in chunk_work:
+        existing = next(
+            (item for item in chunk_histogram
+             if item["quadrature_points"] == count and
+             item["quadrature_groups"] == groups and
+             item["mma_tiles_per_launch"] == per_launch_tiles),
+            None,
+        )
+        if existing is None:
+            chunk_histogram.append({
+                "quadrature_points": count,
+                "quadrature_groups": groups,
+                "mma_tiles_per_launch": per_launch_tiles,
+                "launches_per_assembly": 1,
+            })
+        else:
+            existing["launches_per_assembly"] += 1
     return {
         "status": "complete_profiled_tensor_work",
         "profile_measured_step": measured_step,
         "mode": expected_mode,
+        "trace_policy": trace_policy_contract.requested,
+        "resolved_trace_policy": trace_policy_contract.resolved,
+        "trace_preconditioner": trace_policy_contract.preconditioner,
+        "trace_element_schwarz_factorization":
+            trace_policy_contract.factorization,
+        "trace_element_schwarz_apply": trace_policy_contract.apply,
+        "trace_element_schwarz_apply_tile_width":
+            trace_policy_contract.tile_width,
+        "promotion_eligible_trace_policy":
+            trace_policy_contract.production_selectable,
         "polynomial_order": expected_order,
         "elements": elements,
         "interior_dofs_per_element": interior_dofs,
@@ -1365,6 +2095,25 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         "planned_mma_tiles": mma_tiles,
         "planned_mma_tiles_by_fused_stage": selected_step,
         "all_intended_fused_stages_material": True,
+        "volume_assembly_order": volume_assembly_order,
+        "volume_points": volume_points,
+        "volume_coefficient_stride": coefficient_stride,
+        "volume_workspace_capacity_points": capacity_points,
+        "volume_chunk_points": chunk_points,
+        "volume_assembly_launches": volume_assembly_launches,
+        "volume_contraction_launches": volume_contraction_launches,
+        "planned_volume_mma_tiles_per_assembly":
+            per_assembly_volume_tiles,
+        "planned_volume_mma_tiles": volume_mma_tiles,
+        "planned_volume_contraction_launch_distribution": chunk_histogram,
+        **sigma_jacobi_work,
+        "robust_lower_specialization_supported": expected_robust,
+        "robust_coupled_specialization_supported": expected_robust,
+        "robust_branch_accounting_complete": True,
+        **robust_branch_work,
+        "native_rank1_trace_solve_calls": native_trace_solve_calls,
+        "hypre_trace_solve_calls": hypre_trace_solve_calls,
+        "trace_solver_accounting_complete": True,
         "fallback_count": 0,
         "execution_log": file_identity(log_path),
     }
@@ -1389,42 +2138,94 @@ def import_ncu_tensor_proof(args: argparse.Namespace, tool: str,
     if result.returncode:
         raise RuntimeError(f"NCU report import exited {result.returncode}")
     csv_data = regular_bytes(csv_path, args.out_dir)
-    expected_launches = int(application_work["condensation_launches"])
+    volume = args.ncu_qualification_kind == "tensor-volume-instructions"
+    if volume:
+        kernel_substring = NCU_VOLUME_KERNEL
+        hotspot = "tensor-volume-contraction"
+        expected_launches = int(
+            application_work["volume_contraction_launches"]
+        )
+        expected_instructions = int(
+            application_work["planned_volume_mma_tiles"]
+        )
+        assembly_launches = int(
+            application_work["volume_assembly_launches"]
+        )
+        expected_values = [
+            int(item["mma_tiles_per_launch"])
+            for item in application_work[
+                "planned_volume_contraction_launch_distribution"
+            ]
+            for _ in range(
+                int(item["launches_per_assembly"]) * assembly_launches
+            )
+        ]
+    else:
+        kernel_substring = NCU_CONDENSATION_KERNEL
+        hotspot = "fused-local-algebra-condensation"
+        expected_launches = int(application_work["condensation_launches"])
+        expected_instructions = int(application_work["planned_mma_tiles"])
+        expected_per_launch, remainder = divmod(
+            expected_instructions, expected_launches
+        )
+        if remainder:
+            raise RuntimeError(
+                "profiled condensation MMA work is not uniform by launch"
+            )
+        expected_values = [expected_per_launch] * expected_launches
     if args.ncu_launch_count != expected_launches:
         raise RuntimeError(
             f"NCU launch count {args.ncu_launch_count} does not match the "
-            f"profiled accepted step's {expected_launches} tensor launches"
+            f"profiled accepted step's {expected_launches} {hotspot} launches"
         )
-    proof = parse_ncu_tensor_csv(csv_data, expected_launches)
-    expected_instructions = int(application_work["planned_mma_tiles"])
-    expected_per_launch, remainder = divmod(
-        expected_instructions, expected_launches
+    proof, observed_values = parse_ncu_tensor_csv(
+        csv_data, expected_launches, kernel_substring
     )
     exact_dmma_work = (
-        expected_instructions <= 2 ** 53 and remainder == 0 and
+        len(expected_values) == expected_launches and
+        expected_instructions <= 2 ** 53 and
+        all(value <= 2 ** 53 for value in expected_values) and
+        sorted(observed_values) == sorted(
+            float(value) for value in expected_values
+        ) and
         proof["dmma_instruction_total"] == float(expected_instructions) and
-        proof["dmma_instruction_minimum"] == float(expected_per_launch) and
-        proof["dmma_instruction_maximum"] == float(expected_per_launch)
+        proof["dmma_instruction_minimum"] == float(min(expected_values)) and
+        proof["dmma_instruction_maximum"] == float(max(expected_values))
     )
     if not exact_dmma_work:
         raise RuntimeError(
-            "NCU DMMA total does not exactly match the profiled accepted step's "
-            "complete planned MMA work on every launch: observed total/min/max "
+            f"NCU {hotspot} DMMA work does not exactly match the profiled "
+            "accepted step's complete planned MMA work and launch "
+            "distribution: observed total/min/max "
             f"{proof['dmma_instruction_total']}/"
             f"{proof['dmma_instruction_minimum']}/"
             f"{proof['dmma_instruction_maximum']}, expected "
-            f"{expected_instructions}/{expected_per_launch}/"
-            f"{expected_per_launch}"
+            f"{expected_instructions}/{min(expected_values)}/"
+            f"{max(expected_values)}"
         )
     proof.update({
+        "qualified_hotspot": hotspot,
         "complete_planned_dmma_match": True,
-        "planned_dmma_by_fused_stage":
-            application_work["planned_mma_tiles_by_fused_stage"],
         "import_command": command,
         "report": file_identity(report),
         "csv": file_identity(csv_path),
         "import_stderr": file_identity(stderr_path),
     })
+    if volume:
+        proof.update({
+            "volume_assembly_order":
+                application_work["volume_assembly_order"],
+            "volume_points": application_work["volume_points"],
+            "planned_volume_mma_tiles_per_assembly":
+                application_work["planned_volume_mma_tiles_per_assembly"],
+            "planned_volume_contraction_launch_distribution":
+                application_work[
+                    "planned_volume_contraction_launch_distribution"
+                ],
+        })
+    else:
+        proof["planned_dmma_by_fused_stage"] = \
+            application_work["planned_mma_tiles_by_fused_stage"]
     artifacts = [csv_path, stderr_path]
     return proof, artifacts, {path: command for path in artifacts}
 
@@ -1480,8 +2281,10 @@ def parse_ncu_attribution_csv(data: bytes,
         "launches": 0, "duration_ns": 0.0,
     }
     kernel_totals: dict[str, dict[str, Any]] = {}
-    tensor_launches = 0
-    tensor_duration = 0.0
+    tensor_condensation_launches = 0
+    tensor_condensation_duration = 0.0
+    tensor_volume_launches = 0
+    tensor_volume_duration = 0.0
     launches = 0
     total_duration = 0.0
     outside_ranges: list[str] = []
@@ -1523,8 +2326,11 @@ def parse_ncu_attribution_csv(data: bytes,
         launches += 1
         total_duration += duration
         if NCU_CONDENSATION_KERNEL in kernel:
-            tensor_launches += 1
-            tensor_duration += duration
+            tensor_condensation_launches += 1
+            tensor_condensation_duration += duration
+        if NCU_VOLUME_KERNEL in kernel:
+            tensor_volume_launches += 1
+            tensor_volume_duration += duration
     if outside_ranges:
         raise RuntimeError(
             "NCU attribution contains launch data outside the exact accepted-step "
@@ -1549,9 +2355,15 @@ def parse_ncu_attribution_csv(data: bytes,
             "NCU attribution is missing material accepted-step categories: "
             + ", ".join(missing_categories)
         )
-    if tensor_launches <= 0 or tensor_duration <= 0.0:
+    if tensor_condensation_launches <= 0 or \
+            tensor_condensation_duration <= 0.0:
         raise RuntimeError(
             "NCU attribution contains no positive tensor condensation launch"
+        )
+    if tensor_volume_launches <= 0 or tensor_volume_duration <= 0.0:
+        raise RuntimeError(
+            "NCU attribution contains no positive tensor-volume contraction "
+            "launch"
         )
     categories = []
     for category, values in sorted(category_totals.items()):
@@ -1581,9 +2393,17 @@ def parse_ncu_attribution_csv(data: bytes,
         "required_categories": sorted(NCU_REQUIRED_ATTRIBUTION_CATEGORIES),
         "tensor_condensation": {
             "kernel_substring": NCU_CONDENSATION_KERNEL,
-            "launches": tensor_launches,
-            "duration_ns": tensor_duration,
-            "fraction_of_gpu_kernel_duration": tensor_duration / total_duration,
+            "launches": tensor_condensation_launches,
+            "duration_ns": tensor_condensation_duration,
+            "fraction_of_gpu_kernel_duration":
+                tensor_condensation_duration / total_duration,
+        },
+        "tensor_volume_assembly": {
+            "kernel_substring": NCU_VOLUME_KERNEL,
+            "launches": tensor_volume_launches,
+            "duration_ns": tensor_volume_duration,
+            "fraction_of_gpu_kernel_duration":
+                tensor_volume_duration / total_duration,
         },
         "kernel_totals": kernels,
         "scope_limitations": {
@@ -1624,6 +2444,17 @@ def import_ncu_attribution(args: argparse.Namespace, tool: str,
             f"the profiled benchmark: observed "
             f"{attribution['tensor_condensation']['launches']}, expected "
             f"{expected_tensor_launches}"
+        )
+    expected_volume_launches = int(
+        application_work["volume_contraction_launches"]
+    )
+    if attribution["tensor_volume_assembly"]["launches"] != \
+            expected_volume_launches:
+        raise RuntimeError(
+            "NCU accepted-step attribution tensor-volume launch count does "
+            "not match the profiled benchmark: observed "
+            f"{attribution['tensor_volume_assembly']['launches']}, expected "
+            f"{expected_volume_launches}"
         )
     attribution.update({
         "import_command": command,
@@ -1701,9 +2532,11 @@ def qualification_evidence_unchanged(args: argparse.Namespace,
                 execution_log:
             return False, "profiled benchmark execution log changed after validation"
         if args.level == "l2-ncu":
+            instruction_kind = args.ncu_qualification_kind in \
+                NCU_INSTRUCTION_QUALIFICATION_KINDS
             proof_name = (
                 "tensor_instruction_proof"
-                if args.ncu_qualification_kind == "tensor-instructions"
+                if instruction_kind
                 else "accepted_step_attribution"
             )
             proof = qualification.get(proof_name, {})
@@ -1902,8 +2735,8 @@ def main() -> int:
                         }
                         if args.level == "l2-ncu":
                             assert tool is not None
-                            if args.ncu_qualification_kind == \
-                                    "tensor-instructions":
+                            if args.ncu_qualification_kind in \
+                                    NCU_INSTRUCTION_QUALIFICATION_KINDS:
                                 proof_paths = [
                                     args.out_dir / "ncu-tensor-proof.csv",
                                     args.out_dir / "ncu-tensor-proof.stderr.txt",
@@ -1922,8 +2755,8 @@ def main() -> int:
                             artifact_commands.update(
                                 {path: import_command for path in proof_paths}
                             )
-                            if args.ncu_qualification_kind == \
-                                    "tensor-instructions":
+                            if args.ncu_qualification_kind in \
+                                    NCU_INSTRUCTION_QUALIFICATION_KINDS:
                                 tensor_proof, _, _ = import_ncu_tensor_proof(
                                     args, tool, application_work
                                 )
@@ -1933,10 +2766,13 @@ def main() -> int:
                                     "application_work": application_work,
                                     "tensor_instruction_proof": tensor_proof,
                                 }
+                                qualified_hotspot = tensor_proof[
+                                    "qualified_hotspot"
+                                ]
                                 detail = (
-                                    "qualified native NCU report proves complete "
-                                    "planned DMMA execution in the fused tensor "
-                                    "local-algebra/condensation kernel"
+                                    "qualified native NCU report proves "
+                                    "complete planned DMMA execution in the "
+                                    f"{qualified_hotspot} kernel"
                                 )
                             else:
                                 attribution, _, _ = import_ncu_attribution(
@@ -1950,8 +2786,8 @@ def main() -> int:
                                 }
                                 detail = (
                                     "qualified native NCU report attributes the "
-                                    "accepted-step GPU kernel duration and tensor "
-                                    "condensation fraction"
+                                    "accepted-step GPU kernel duration and the "
+                                    "tensor volume/condensation fractions"
                                 )
                         else:
                             assert tool is not None

@@ -53,22 +53,32 @@ Performance has two controls:
 2. final-tree ordinary CUDA versus the frozen commit above.
 
 The first measures the complete final-tree engine package, including the
-tensor condensation leaf. In IGR mode both engines use explicitly recorded
-BJ-ILU0+RCM with one preconditioner application per callback, but ordinary
-CUDA uses direct factor triangular solves and refreshes the factor for every
-trace solve, while tensor CUDA uses fixed five-iteration lower and upper
-Jacobi solves with one factor setup on the first trace solve of an attempt and
-retains that factor for the attempt's subsequent trace solves.
-Conventional
-tensor CUDA retains its separately recorded diagonal trace policy. Neither
-paired engine comparison represents the contribution of MMA instructions
-alone; final profiler attribution must quantify that contribution separately,
-and the triangular-solve difference remains explicit in every IGR comparison.
+tensor condensation leaf and the tensor-native trace algorithm. In IGR mode
+ordinary CUDA retains BJ-ILU0+RCM with direct triangular solves and refreshes
+the factor for every trace solve; tensor CUDA selects the robust J10 native
+matrix-free Schwarz policy described below. Conventional tensor CUDA retains
+its separately recorded diagonal trace policy. The final-tree ordinary/tensor
+pair uses identical order-aware IGR quadrature `(6,4)`, `(8,6)`, or `(10,8)`
+and identical role tolerances `(1e-10,3e-11,1e-12)`. Neither paired engine
+comparison represents the contribution of MMA instructions alone; final
+profiler attribution must quantify that contribution separately, and every
+trace-solver/preconditioner difference remains explicit in the records.
+These values are an explicit performance/qualification-candidate policy passed
+on the benchmark and profiler command lines. They do not change or silently
+stand in for the general application's `DefaultEulerHdgNumericalPolicy`, which
+remains IGR q12/q12 with all three linear roles at `1e-12` when no explicit
+policy is supplied.
 The second control detects shared refactoring that
 slows ordinary CUDA and would otherwise manufacture a tensor speedup.
-Per-sample observed outer iterations, exact factor setup/reuse counts, maximum
-aggregate factor age, and derived ILU/Jacobi work bounds expose recurring
-solver work without removing it from the accepted-step timing.
+It is a distinct apples-to-apples numerical control: both final-tree ordinary
+and the source-locked frozen ordinary executable use IGR volume/face q12/q12
+and `1e-12` for the Newton, final-coherent, and true-residual-tightening linear
+roles. The final-tree command and schema-2 record carry those values
+explicitly; the bound schema-1 source has one historical `1e-12` linear
+tolerance and q12 IGR default and deliberately receives only the reviewed
+order-selector overlay. Per-sample outer iterations, exact factor work, and
+bounded aggregate trace-policy work expose recurring solver cost without
+removing it from accepted-step timing.
 
 ### Provisional same-policy attribution
 
@@ -88,6 +98,109 @@ unchanged. `common-fast` selects diagonal scaling for both conventional
 engines. For IGR it selects the same ILU0+RCM, five-lower/five-upper iterative-
 Jacobi application, and first-trace-solve-per-attempt lifetime for both
 engines.
+
+`equilibrated-mgr` is a separate explicit rank-one tensor-IGR baseline. It
+performs two deterministic FP64 two-sided Ruiz passes, solves the scaled
+system with FlexGMRES preconditioned by one MGR reduction from Uhat4 to the
+retained sigmahat field, and converts the solution back to the physical trace
+before the unchanged FP64 original-system true-residual gate. It is invalid
+for ordinary CUDA, conventional mode, and rank two. Its fixed MGR tuple uses
+one explicitly owned ILU0 F-relaxation application with zero tolerance and
+direct triangular solves, injection restriction, Jacobi interpolation, and
+one BoomerAMG coarse application. Injection is required by the selected
+non-Galerkin HYPRE coarse-grid method and is the supported CUDA path; the
+original CPR-like restriction request fails explicitly on the pinned HYPRE
+GPU backend. The F factor is refreshed by every current-
+generation MGR setup. A one-shot tighter true-residual retry retunes only the
+outer FlexGMRES tolerance and reuses that exact scaled matrix, retained scaled
+right-hand side, MGR hierarchy, and F factor; no HYPRE tolerance-driven inner
+solve is left implicit.
+There is no ordinary-CUDA fallback, Schwarz level, mixed precision, or
+adaptive policy in this baseline. Setup/application counts and scale extrema
+are constant-size aggregates; no iteration history or event stream is
+retained.
+
+The first representative mesh-52 p1 accepted-step probe ruled this full-HYPRE
+MGR realization out as a production candidate. Both trace solves satisfied
+their FP64 original-system residual checks (the final relative residual was
+`3.59e-13`), but two new opaque HYPRE pool allocations occurred inside the
+step, so the unchanged persistence telemetry gate rejected the attempt. The
+failed warmup took approximately 60 seconds, compared with approximately
+0.20 seconds for the retained native tensor-IGR path. No gate was relaxed and
+no speedup is claimed. The useful result is architectural: retain the
+Uhat/sigma field split, but implement fine-grid preconditioning natively from
+the element Schur blocks rather than putting the recurring full trace solve
+under HYPRE MGR.
+
+`native-element-schwarz-equilibrated-field-split-fp64` is the corresponding
+bounded native ablation. It is rank-one, tensor-IGR, and benchmark-only. It
+retains the same assembled FP64 global operator, native FP64 GMRES, independent
+current-matrix true-residual check, and deterministic inverse-multiplicity
+overlap weighting as `native-element-schwarz-fp64`. Within each signed p1--p3
+element patch, the face-major trace rows are packed transiently into the
+natural Uhat4 Euler block and scalar sigmahat block. Two deterministic FP64
+two-sided Ruiz passes equilibrate each diagonal block, followed by pivoted
+FP64 LU. Application is the fixed lower multiplicative factorization
+`[A_UU, 0; A_sigma,U, A_sigma,sigma]`; it is an explicit approximation, not a
+claim that the dropped Uhat-from-sigma block vanished mathematically.
+
+The exact unfactored patch is retained for bounded first-application block
+backward-error checks. The two block factors, scaled lower coupling, and
+left/right scales fit inside the existing full-patch LU slice for p1--p3,
+while the existing two element vectors provide setup norms and apply work.
+Consequently the ablation adds no persistent allocation and no copied solver
+lifecycle. Patch setup,
+preconditioner application, equilibration-build, and equilibration-pass work
+are reported only as constant-size aggregates. It has no fallback, event
+history, replay stream, or flight recorder. Promotion depends on paired GPU
+screening against the stronger full-patch FP64 Schwarz control; this design is
+not production-selectable by itself.
+
+`native-element-schwarz-matrix-free-equilibrated-field-split-fp64` is the
+explicit combined ablation. It changes only the global GMRES operator action
+from assembled CSR to the existing exact FP64 `T^T S_e T` element-Schur
+action, while selecting the same two-pass equilibrated lower multiplicative
+Euler/sigma patch preconditioner described above. The combination has its own
+typed policy and private operator kind: neither the matrix-free/full-Schwarz
+policy nor the assembled/equilibrated-field-split policy acquires an implicit
+second interpretation. Cross-paired or unknown operator kinds fail before a
+cooperative solve is queued. The FP64 GMRES policy, assembled current matrix
+used by the independent true-residual authority, all acceptance gates, and
+bounded aggregate setup/application accounting remain unchanged. It reuses
+the existing arenas and adds no persistent allocation, fallback, history,
+replay stream, public evidence API, or flight recorder. Performance maturity
+requires a later paired GPU measurement; this host-qualified slice makes no
+speedup claim.
+
+Production tensor IGR now resolves `engine-default` at p1, p2, and p3 to the
+typed robust J10 policy
+`native-element-schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-fp64`.
+It first constructs and applies the two-pass equilibrated lower
+`Uhat4/sigmahat` patch specialization with ten damped sigma Jacobi sweeps. An
+exactly classified structural block-factor failure, or the exact first-apply
+backward-error rejection before operator/Krylov work, selects the already
+admitted cooperative full-coupled patch specialization for that matrix. Every
+other setup or solve failure remains fail-closed. This is tensor-native
+specialization selection inside one trace solver, not an ordinary-CUDA
+fallback; the legacy `fallback_count` must remain zero.
+
+Both specializations are admitted before use, preserve the same matrix-free
+FP64 operator and independent original-system true-residual authority, and
+use the generic J10 sigma policy metadata. The four fixed aggregate counters
+`robust_lower_patch_setups`, `robust_lower_trace_solve_calls`,
+`robust_coupled_patch_setups`, and `robust_coupled_trace_solve_calls` disclose
+which specialization did recurring work. The saturated benchmark and final
+profiles require the lower branch. The finite p1–p3 zero-gradient application
+qualification owns the exact first-application coupled-retry gate. The W8A
+rank-one device fixture separately constructs a finite, well-scaled singular
+Euler principal block inside a nonsingular coupled patch, proving setup-time
+structural selection at p1–p3; a nonfinite patch proves that the same
+classifier fails closed. A separate finite, nonsingular patch outside the
+admitted equilibration-scale range proves that non-structural numerical setup
+failure also fails closed instead of selecting coupled execution. The counters
+are bounded scalars only—there is no per-solve history, callback stream,
+recorder, or replay path.
+
 The benchmark emits the selected policy at top level and in every bounded
 sample. The driver validates every preconditioner, ILU, triangular-solve,
 accounting, and factor-lifetime dimension exactly, then requires `O_common`
@@ -99,8 +212,9 @@ it disagrees with the explicit trace-policy selection, so attribution records
 cannot be mistaken for production-engine evidence.
 The record also names the configured rank-one trace solver, and every sample
 contains fixed scalar native/HYPRE solve-call counts. The validator requires
-ordinary CUDA calls to be entirely HYPRE and tensor CUDA calls to be entirely
-native; neither path can borrow the other's recurring solve work unnoticed.
+ordinary CUDA calls to be entirely HYPRE, production tensor CUDA calls to be
+entirely native, and the explicit tensor MGR ablation to be entirely HYPRE;
+no policy can borrow another policy's recurring solve work unnoticed.
 The same fixed fields and their aggregate totals are retained in the bounded
 campaign manifest, so promotion disposition does not depend on reopening raw
 samples to establish solver routing.
@@ -239,9 +353,10 @@ uses separate operator applications, reductions, and vector updates; its own
 implementation plan defers whole-timestep fusion beyond per-stage residency.
 
 The transferable principle is operator/dataflow reformulation, not a promise
-that one kernel can cross every solver boundary. The HDG tensor leaf already
-fuses zero/volume/face assembly in one SIMT kernel and, in a separate
-one-block-per-element kernel, performs pivoted local factorization,
+that one kernel can cross every solver boundary. The HDG tensor leaf keeps the
+zero and face assembly leaves while splitting volume assembly into exact FP64
+coefficient evaluation and an output-stationary FP64 WMMA contraction. In a
+separate one-block-per-element kernel, it performs pivoted local factorization,
 multi-right-hand-side solves, condensation, and Schur contraction. It retains
 solved `[B f]` work for recovery and keeps the rank-one Krylov loop and its
 preconditioner/vector algebra inside one cooperative kernel. HYPRE does not
@@ -269,10 +384,15 @@ algebra.
 
 ### Implemented tensor numerical leaf
 
-The production tensor selection retains the existing FP64 residual/Jacobian,
-global true-trace assembly, recovery, validation, and transactional code. Its
-assembly launch fuses the element-local zero, volume, and face stages as one
-SIMT kernel; assembly currently makes no tensor-instruction claim. Its fused
+The production tensor selection retains the existing exact FP64 coefficient,
+flux/LLF/source/IGR arithmetic, face assembly, global true-trace assembly,
+recovery, validation, and transactional code. Its volume leaf packs a checked
+44-double conventional or 66-double IGR coefficient record per quadrature
+point into the existing solve workspace. It processes deterministic checked
+quadrature chunks, zero-pads an incomplete `k=4` tail, and uses native FP64
+WMMA `m8n8k4` to write each residual and volume-Jacobian output tile once per
+chunk; the first chunk assigns and later chunks add completed tiles in fixed
+order. The zero and face leaves remain ordinary FP64 CUDA. Its fused
 local-algebra/condensation kernel uses an eight-column pivoted FP64 LU panel.
 Scalar panel and diagonal-block solve work preserve the ordinary pivot and
 threshold semantics, while native FP64 WMMA `m8n8k4` performs the material
@@ -304,19 +424,21 @@ from the typed CUDA engine and admitted rank surface:
 | CUDA route | Conventional | IGR |
 | --- | --- | --- |
 | Ordinary rank one | HYPRE ParCSR GMRES with BJ-ILU0, natural ordering, one application, direct factor solves, refresh each solve | HYPRE ParCSR GMRES with BJ-ILU0, RCM, one application, direct factor solves, refresh each solve |
-| Tensor rank one | One native cooperative FP64 GMRES kernel; its diagonal preconditioner reads the diagonal directly from the borrowed device ParCSR matrix | One native cooperative FP64 GMRES kernel; HYPRE builds the ILU0+RCM device factor for the first trace matrix in each attempt, then the native kernel borrows and retains the HYPRE-owned factor CSR and permutation plus an application-owned extracted inverse diagonal while applying five lower and five upper zero-start Jacobi iterations |
+| Tensor rank one | One native cooperative FP64 GMRES kernel; its diagonal preconditioner reads the diagonal directly from the borrowed device ParCSR matrix | One native cooperative FP64 GMRES kernel with exact matrix-free element-Schur action and the robust J10 patch policy: cooperative equilibrated lower `Uhat4/sigmahat` specialization when structurally admissible, otherwise the admitted cooperative full-coupled patch specialization |
 | Either engine, supported rank two | Host-staged rank-two path with HYPRE ParCSR GMRES and the engine/mode preconditioner policy; no native rank-one kernel | Host-staged rank-two path with HYPRE ParCSR GMRES and the engine/mode preconditioner policy; no native rank-one kernel |
 
-The native tensor rank-one GMRES leaf keeps its restarted loop, native CSR
-SpMV over the borrowed rank-one ParCSR diagonal block, preconditioner
-applications, reductions, vector updates, small Hessenberg work, and
-kernel-internal residual checks inside one cooperative kernel launch per trace
-solve. It is a fused FP64 SIMT sparse-solver leaf; no tensor-instruction claim
-is made for it. After that launch, the application copies and synchronizes one
-fixed control result, then uses the current MFEM/HYPRE ParCSR matrix-vector
-product and two communicator inner products to rebuild the authoritative true
-residual. The complete trace-solve phase is therefore not claimed to be one
-kernel launch.
+The native tensor rank-one GMRES leaf keeps its restarted loop,
+preconditioner applications, reductions, vector updates, small Hessenberg
+work, and kernel-internal residual checks inside one cooperative kernel launch
+per trace solve. Conventional mode applies native CSR SpMV over the borrowed
+rank-one ParCSR diagonal block. Production IGR applies the exact FP64
+matrix-free `T^T S_e T` element-Schur operator and one of the two robust patch
+specializations above. It remains a fused FP64 SIMT sparse-solver leaf; no
+tensor-instruction claim is made for it. After that launch, the application
+copies and synchronizes one fixed control result, then uses the current
+MFEM/HYPRE ParCSR matrix-vector product and two communicator inner products to
+rebuild the authoritative true residual. The complete trace-solve phase is
+therefore not claimed to be one kernel launch.
 
 The native leaf has two compile-time-specialized entry points selected by the
 typed preconditioner/mode contract. Conventional diagonal-preconditioned solves
@@ -333,34 +455,27 @@ occupancy admission; this is an explicit numerical specialization, not an
 ordinary-CUDA fallback. CGS2 reduces synchronization and vector traffic but is
 still FP64 SIMT solver fusion, not tensor-core execution.
 
-The MFEM/HYPRE ParCSR object retains matrix-storage ownership. In tensor IGR,
-HYPRE also performs ILU0+RCM factor setup on the first trace solve of an
-attempt and populates the application-owned inverse-diagonal buffer. That
-setup and synchronization remain inside the timed accepted-step region; the
-factor authority is retained for later trace solves in the same attempt.
-HYPRE does not execute the recurring rank-one tensor GMRES loop or its
-preconditioner applications.
-Tensor rank-one admission fails closed if the cooperative launch, borrowed
-topology, or exact SM120 resource contract is unavailable.
+The MFEM/HYPRE ParCSR object retains assembled matrix-storage ownership and the
+independent true-residual product. Production tensor IGR does not ask HYPRE to
+factor or apply its recurring preconditioner: patch setup, J10 sigma work,
+matrix-free operator applications, and GMRES all remain in the native FP64
+rank-one leaf. Tensor rank-one admission fails closed if either robust patch
+shape, cooperative launch, matrix-free topology, or the exact SM120 resource
+contract is unavailable.
 
-The preconditioner is an explicit numerical policy recorded for every accepted
-attempt. Tensor and ordinary IGR both retain external policy name
-`hypre_ilu0`, exact metadata type 0, fill level 0, local RCM reordering 1, and
-one application iteration because the tensor route deliberately uses the
-pinned HYPRE factor contract. Their factor application is nevertheless an
-explicit typed difference: ordinary IGR records `direct` with zero Jacobi
-iterations, while tensor IGR records `iterative_jacobi` with five lower and
-five upper iterations executed by the native kernel. Ordinary IGR uses typed
-factor policy `refresh_each_trace_solve`; tensor IGR uses
-`first_trace_solve_per_attempt`. Tensor conventional diagonal scaling records
-both factor and triangular-solve policies as `not_applicable`.
-Exact factor setups and reuses, maximum aggregate factor age, observed outer
-Krylov iterations, derived callback/inner-work and Jacobi factor-SpMV bounds,
-nonlinear work, line
-searches, transfers, tensor tiles, and fallback work are retained in each
-aggregate benchmark sample. MMA contribution is established separately from
-profiler and SASS evidence; an end-to-end engine speedup is never represented
-as the speedup of MMA alone or as a factor-reuse-only result.
+The preconditioner remains an explicit numerical policy recorded for every
+accepted attempt. Ordinary IGR continues to report HYPRE ILU0+RCM with direct
+factor solves and refresh-per-trace-solve lifetime. Tensor conventional
+reports native diagonal scaling. Production tensor IGR reports
+`native_element_schwarz_warp_robust_coupled_sigma_jacobi10_fp64`, no ILU
+configuration, the adaptive factor/apply metadata above, generic J10
+sweep/damping/update totals, both specialization-support booleans, complete
+branch accounting, and exactly four branch-work counters. Observed outer
+Krylov work, nonlinear work, line searches, transfers, tensor tiles, and
+fallback work remain in every aggregate benchmark sample. MMA contribution is
+established separately from profiler and SASS evidence; an end-to-end engine
+speedup is never represented as the speedup of MMA alone or of the new trace
+preconditioner alone.
 
 The ordinary and rank-two HYPRE routes expose the completed GMRES
 outer-iteration count but neither a cumulative preconditioner-callback count
@@ -384,15 +499,17 @@ count `M`, the pinned implementation derives:
 - inner-work lower and upper bounds equal to the corresponding callback bound
   times `M`.
 
-For tensor IGR, each native ILU application performs five fixed lower-Jacobi
-and five fixed upper-Jacobi iterations. Each side starts from zero, matching
-the selected HYPRE policy, so the first iterate elides the factor SpMV; the
-bounded recurring factor work is therefore `(5-1) + (5-1) = 8` factor-SpMV
-updates per application. The fields
+For the explicit `common-fast` tensor-IGR attribution ablation, each native ILU
+application performs five fixed lower-Jacobi and five fixed upper-Jacobi
+iterations. Each side starts from zero, so the first iterate elides the factor
+SpMV; bounded recurring factor work is therefore `(5-1) + (5-1) = 8`
+factor-SpMV updates per application. The fields
 `ilu_jacobi_factor_spmv_updates_lower_bound` and
 `ilu_jacobi_factor_spmv_updates_upper_bound` are exactly the corresponding
 callback bound times `M` times 8. Direct ordinary ILU and diagonal tensor
-samples report both update bounds as zero.
+samples report both update bounds as zero. Production robust tensor IGR has no
+ILU policy and reports all ILU setup/reuse/bound fields as zero/not-applicable;
+its J10 and robust-branch work use their own bounded aggregate fields.
 
 Every addition and product is checked for `uint64_t` overflow. Bounds are
 derived and accumulated separately for every trace solve; they are never
@@ -425,19 +542,19 @@ API. Final call-structure and instruction evidence comes from external,
 one-off profiler captures.
 
 A provisional rank-one p2 tuning diagnostic also evaluated three Jacobi
-iterations per factor side. The reduced local work increased outer Krylov work
-and regressed accepted-step time relative to the selected five-per-side policy,
-so it was rejected rather than promoted. The unbound provisional samples are
-not final-candidate qualification evidence and no exact diagnostic timing or
-iteration result is promoted by this document.
+iterations per factor side in the earlier ILU attribution route. The reduced
+local work increased outer Krylov work and regressed accepted-step time
+relative to its five-per-side control, so it was rejected. Neither ILU variant
+is the production robust trace policy; the unbound samples are not
+final-candidate qualification evidence.
 
 An attempted tensor-IGR `hypre_bj_iluk1_rcm` policy was also rejected. Source
 inspection of the pinned HYPRE CUDA path and direct setup reproduction showed
 that device-memory ILU setup does not support fill level greater than zero;
-continuing after that rejection left null factor data and crashed. Production
-therefore retains the supported ILU0 configuration rather than hiding an
-ordinary-CUDA or other
-preconditioner fallback. No fill-level-1 result is admissible campaign evidence.
+continuing after that rejection left null factor data and crashed. The
+experiment therefore remained unsupported rather than hiding an ordinary-CUDA
+or other preconditioner fallback. Production tensor IGR uses the robust native
+J10 Schwarz policy; no fill-level-1 result is admissible campaign evidence.
 
 The exact transaction fingerprint remains the historical four-lane FNV-derived
 binary64-byte protocol. A residue/jump-table experiment preserved every hash
@@ -541,18 +658,22 @@ substitute for those results.
 | --- | --- |
 | Generic CPU lifecycle, transactions, algebra, and MPI | `hdg_generic_euler_cpu_rank{1,2}` plus the generic CPU runtime suite |
 | CPU spatial and Backward-Euler behavior | `hdg_generic_euler_cpu_convergence_{conventional,igr}_p{1,2,3}` |
-| Three-way global-field, norm, invariant, trajectory, solver-health, and localized-IGR alignment | `dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p{1,2,3}_rank1` |
-| Shared CPU/ordinary/tensor spatial and Backward-Euler behavior | `dg_igr_hdg_runtime_cuda_generic_euler_convergence_{conventional,igr}_p{1,2,3}_rank1` |
+| Three-way global-field, norm, invariant, trajectory, solver-health, and localized-IGR alignment | `dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p{1,2,3}_rank1`; the exact campaign policy is bound by `*_alignment_candidate_p{1,2,3}_rank1`, and `*_alignment_robust_jacobi10_p{1,2,3}_rank1` is the explicit-policy control for the same production robust leaf |
+| Shared CPU/ordinary/tensor spatial and Backward-Euler behavior | `dg_igr_hdg_runtime_cuda_generic_euler_convergence_{conventional,igr}_p{1,2,3}_rank1`; exact candidate role tolerances and order-aware IGR quadrature are separately bound by `*_convergence_conventional_candidate_p{1,2,3}_rank1` and `*_convergence_igr_candidate_p{1,2,3}_rank1` |
+| Robust tensor-IGR specialization selection | `dg_igr_hdg_runtime_cuda_generic_euler_zero_gradient_engine_default_p{1,2,3}_rank1` proves production routing and exact first-application lower rejection/coupled retry; `dg_igr_hdg_runtime_cuda_w8a_rank1` proves p1-p3 setup-time structural selection, coupled admission, and finite scale-invalid/nonfinite fail-closed classification through the production decision helper |
 | Residual/Jacobian, condensation, deterministic true-trace Schur action, recovery, sources, boundaries, supplied/projected traces, rejection, and rollback | `dg_igr_hdg_runtime_cuda_generic_euler_extension[_tensor]_p{1,2,3}_rank{1,2}` |
 | Prepare/Commit/Abort tokens, retry, failure atomicity, and ordinary/tensor rank-one/rank-two sessions | `dg_igr_hdg_runtime_cuda_generic_euler_session*` |
 | Active subcommunicators and passive world ranks | `dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator[_tensor]_rank{1,2}` |
-| Full application routing, conventional/IGR p1-p3, physical boundaries, external meshes, refinement, fixed/CFL steps, and rank-one/rank-two host staging | `dg_igr_hdg_main_backend_*cpu*`, `dg_igr_hdg_main_backend_*cuda*`, including the `physical_extension`, `igr`, `cfl`, `refine`, and `representative_cases` families |
+| Full application routing, conventional/IGR p1-p3, physical boundaries, external meshes, refinement, fixed/CFL steps, and rank-one/rank-two host staging | `dg_igr_hdg_main_backend_*cpu*`, `dg_igr_hdg_main_backend_*cuda*`, including the `physical_extension`, `igr`, `cfl`, `refine`, and `representative_cases` families; the four `cuda_physical_extension_candidate[_tensor]_rank{1,2}` registrations bind the explicit candidate quadrature/tolerance policy to ordinary/tensor and rank-one/host-staged-rank-two execution |
 | Output/no-output scheduling, VTK fields, sigma publication, and intentionally unsupported routes | `dg_igr_hdg_main_backend_*vtk*`, `*_no_vtk`, `*_rejects_*`, and `*_unsupported_state_routes` |
 | Native production-linked tensor instruction | `dg_igr_hdg_runtime_cuda_tensor_sass_evidence` |
 
 The three-way tests compare global values and invariants, not hashes or
 rank-local layout. Hashes remain useful only for transactional identity inside
-session tests.
+session tests. The three-way numerical comparator is rank one. Rank two is
+qualified through the existing application, runtime, session, topology, and
+subcommunicator functionality gates on the one-GPU host-staged path; it is not
+represented as a direct rank-two field comparator or as scaling evidence.
 
 ## Performance and profiling contract
 
@@ -593,15 +714,15 @@ The 85-block/84-SM geometry is the predeclared saturation basis; it is not
 selected after inspecting results. Mesh, timestep, mathematical mode,
 tolerances, stopping rules, output settings, executable build, GPU lease, and
 hardware conditions are identical within each paired comparison. The recorded
-trace policy follows the mode-aware table above. In IGR, type 0, fill level 0,
-RCM ordering, and the one-application count are identical between the engines;
-the explicitly reported direct-versus-five-per-side-Jacobi triangular policy
-and refresh-each-solve versus first-solve-per-attempt factor lifetime differ.
-All
-recurring trace work remains inside the accepted-step timing; aggregate
-solver-work records disclose exact factor work and derived solve bounds, while
-profiler evidence separately attributes the tensor-condensation MMA
-contribution.
+trace policy follows the mode-aware table above: ordinary IGR uses its HYPRE
+ILU0+RCM policy, while tensor IGR uses robust native J10 Schwarz. Same-final-
+tree ordinary/tensor pairs use the order-aware q6/4, q8/6, or q10/8 IGR
+schedule and `(1e-10,3e-11,1e-12)` role tolerances. Historical-control pairs
+instead use q12/q12 and `(1e-12,1e-12,1e-12)` on both sides. All recurring
+trace work remains inside the accepted-step timing; aggregate solver-work
+records disclose exact factor work, derived solve bounds, generic sigma-Jacobi
+work, and the four robust branch counters, while profiler evidence separately
+attributes the tensor-condensation MMA contribution.
 
 A second, separate break-even campaign uses `mesh_n=4`,
 `domain_periods=1`, and `dt=1e-5`, with the same six-cell, six-pair, no-export
@@ -621,6 +742,13 @@ frozen-control source/overlay/build/executable relationship, live
 `nvidia-smi` metadata, and `CUDA_VISIBLE_DEVICES` equal to the exclusive GPU
 index. Source, executables, build inputs, raw benchmark streams, driver, and
 hardware identity are rechecked before a completed manifest is admitted.
+The final-tree and frozen-control builds must also agree exactly on the
+application C/C++/CUDA compiler paths, CUDA toolkit identity and architecture,
+MFEM pin and configuration, and the MPI, HYPRE, Metis, RAJA, Umpire, and
+Caliper dependency tuple. This control-comparability gate is validated before
+any historical samples run and again before manifest completion; a source-
+correct frozen executable built against a different toolchain or TPL stack is
+not an admissible performance control.
 The MFEM identity must expose a concrete HYPRE MPI/CUDA SM120 spec, its exact
 32-character Spack DAG hash, a hash-bound installation prefix, and the same
 spec/hash pair in the canonical reuse-ABI record. The admitted campaign retains
@@ -703,7 +831,7 @@ selected wins cannot suppress regressions or indeterminate cells.
 
 Accepted-step attribution must separate at least:
 
-- residual/Jacobian assembly;
+- residual/Jacobian assembly, including the tensor-volume contraction;
 - the fused local factorization/algebra/condensation kernel category;
 - true-trace assembly and solve;
 - recovery;
@@ -729,20 +857,27 @@ or numeric rows from another kernel. It additionally binds that count to the
 selected benchmark sample, independently reconstructs positive planned tile
 totals for blocked LU, forward/backward RHS updates, and Schur contraction,
 and requires their sum to equal both the benchmark MMA total and the NCU DMMA
-total. `accepted-step-attribution` instead fixes
+total. `tensor-volume-instructions` applies the same native-report checks to
+the demangled `BorrowedEulerTensorVolumeContractionKernel` under the local-
+assembly NVTX range. It independently reconstructs the workspace-limited
+quadrature chunks, including the padded tail, and requires the exact complete
+DMMA total and chunk-shape launch distribution to match the bounded production
+aggregates. `accepted-step-attribution` instead fixes
 the outer profiled-accepted-step NVTX range, duration-only metric, no kernel
 filter, and a positive launch limit. It imports the native raw table, requires
-the material HDG categories and positive tensor-condensation work, and retains
-category/kernel totals plus the tensor kernel's fraction of captured GPU
-kernel duration; its tensor launch count must match the same selected sample.
+the material HDG categories and positive tensor-condensation and tensor-volume
+work, and retains category/kernel totals plus each tensor kernel's fraction of
+captured GPU kernel duration; both tensor launch counts must match the same
+selected sample.
 The local pivoted LU, triangular solves, and Schur product execute in one
 production kernel and therefore remain one fused attribution category; the
 native kernel table and complete aggregate DMMA proof quantify that category
-without pretending an artificial kernel boundary exists. The fused SIMT
-assembly kernel is attributed separately by duration and is not mislabeled as
-tensor execution. The captured fraction excludes
-host/MPI, CUDA-API, and memcpy time and is not DMMA proof, so both NCU kinds are
-required. The Nsys qualification route validates the same exact tensor
+without pretending an artificial kernel boundary exists. The volume
+contraction is attributed separately and has its own complete DMMA proof; its
+scalar coefficient and face leaves remain in local assembly without a tensor
+claim. The captured fraction excludes host/MPI, CUDA-API, and memcpy time and
+is not DMMA proof, so both instruction captures plus accepted-step attribution
+are required. The Nsys qualification route validates the same exact tensor
 accepted-step application arguments, identities, and native report, then
 generates and hash-binds separate `nvtx_sum`, `cuda_api_sum`,
 `cuda_gpu_mem_time_sum`, and `cuda_gpu_mem_size_sum` CSV tables. It requires
@@ -755,9 +890,10 @@ The content-addressed profiler bundle retains these exact derivatives:
 - the clean candidate commit/tree, canonical `--nvtx-profile` build manifest,
   profiled executable size/SHA-256, profiler executable size/SHA-256 and
   version, complete command, environment, GPU identity, and raw report;
-- NCU condensation captures for representative conventional and IGR accepted
-  steps, with the exact native kernel symbol, NVTX selection, launch count,
-  `gpu__time_duration` result, and FP64 DMMA metric/count;
+- separate NCU condensation and volume-contraction captures for representative
+  conventional and IGR accepted steps, with each exact native kernel symbol,
+  NVTX selection, launch count, `gpu__time_duration` result, and FP64 DMMA
+  metric/count;
 - qualified NCU `accepted-step-attribution` captures and derived tables that
   quantify local assembly, local algebra/condensation, trace assembly/solve,
   recovery, reductions/validation, packing/conversion, and nonlinear update,
@@ -765,12 +901,13 @@ The content-addressed profiler bundle retains these exact derivatives:
   unclassified outer-range work and the tensor kernel fraction;
 - Nsys reports and derived NVTX/CUDA-API tables for representative conventional
   and IGR accepted steps, including every extraction command and artifact hash;
-- an exact production-linked SASS dump or canonical SASS-test log containing
-  the selected native sm_120 function, cuobjdump path/hash/version and command,
-  profiled binary hash, `DMMA.8x8x4` static-site count, and retained artifact
-  hash. The canonical SASS test writes the finite exact-function dump and its
-  hash-bound key/value manifest below the canonical build directory; it does
-  not instrument or record the running application.
+- exact production-linked SASS dumps or canonical SASS-test logs for the
+  condensation and volume-contraction native sm_120 functions, each retaining
+  the cuobjdump path/hash/version and command, profiled binary hash,
+  `DMMA.8x8x4` static-site count, and artifact hash. The canonical SASS test
+  writes both finite exact-function dumps and their separate hash-bound
+  key/value manifests below the canonical build directory; it does not
+  instrument or record the running application.
 
 Every derived CSV or text summary is hashed beside the raw report and records
 the tool/import command that produced it. Diagnostic MMA tile counters establish
@@ -781,31 +918,75 @@ noise on representative conventional and IGR workloads. All six p/mode cells
 remain reportable even when some are below break-even. Ordinary CUDA remains
 the default regardless of selected tensor wins.
 
+### IGR cost-reduction follow-on
+
+The pre-robust tensor baseline made the IGR path much faster than ordinary
+CUDA, but IGR still cost 12.6--14.0 times more per accepted step than
+conventional tensor CUDA on the same mesh-52 p1--p3 controls. Trace width grows by only
+1.25 times (`Uhat4` to `Uhat5`); the material difference is Krylov work. The
+representative IGR steps require 167, 181, and 199 aggregate iterations at
+p1, p2, and p3, while conventional requires 9--14. The p3 profile attributes
+about 80 percent of accepted-step GPU kernel duration to the trace solve.
+Those figures motivate the robust J10 work; they are not performance evidence
+for the new candidate. Its complete paired p1--p3 matrix and profiler package
+must be regenerated at one exact frozen candidate commit before promotion.
+
+Two bounded changes are retained before changing the preconditioner. First,
+IGR volume and face quadrature are independently typed. The explicit p1--p3
+campaign-candidate schedule is `(6,4)`, `(8,6)`, and `(10,8)` rather than the
+application default `(12,12)`. Direct four-step active-IGR comparisons against
+q12/q12 remain below
+`7.08e-10` in L2 and `6.06e-9` in Linf, with FP64 true residual below
+`9.36e-13` and conservation below `1.15e-15`. Paired accepted-step speedups are
+approximately 1.03, 1.10, and 1.11 times. The q12 control remains available;
+no conventional quadrature policy or general application default changes.
+
+Second, Newton-correction and final-coherent linear tolerances are separate.
+Keeping the final solve and strict true-residual retry at `1e-12` while using
+`1e-10` for Newton corrections yields p1--p3 speedups of 1.085, 1.085, and
+1.049 with zero tightenings. A p3 `1e-9` correction request triggered a strict
+retry on every measured step and was 20.8 percent slower than `1e-10`.
+Because these representative steps take one Newton update and the final
+coherent solve carries 63.5--65.8 percent of all iterations, an adaptive
+forcing rule capped by the unchanged `1e-10` per-solve FP64 gate cannot improve
+this workload. The fixed `1e-10` correction policy is therefore the measured
+safe campaign-candidate envelope; the application default remains all-role
+`1e-12` and the acceptance gates are unchanged.
+
+An explicit HDG route is not part of this campaign. With Euler state fixed,
+the IGR auxiliary problem reduces to a scalar screened-Poisson trace solve, so
+an explicit stage could eliminate Newton/Armijo and the globally coupled four
+Euler trace fields. It would still require that scalar elliptic solve at every
+Runge--Kutta stage, plus an IGR-aware stability bound. This structure instead
+motivates the exact-Backward-Euler native field split and overlapping Schwarz
+work; it is not evidence for a new production integrator.
+
 ### Interpretation limits
 
-- Tensor instructions accelerate the fused local-algebra/condensation kernel
-  only. Residual/Jacobian assembly is fused SIMT; the rank-one tensor trace
-  solver uses one cooperative FP64 SIMT GMRES leaf followed by fixed control
-  transfer and MFEM/HYPRE true-residual verification; and recovery remains
-  FP64 CUDA work. No DMMA claim is made for those non-condensation stages.
+- Tensor instructions accelerate the output-stationary volume contraction and
+  fused local-algebra/condensation kernels. Volume coefficient evaluation,
+  zero/face assembly, the rank-one tensor trace solver, and recovery remain
+  FP64 CUDA/SIMT work. The trace solver uses one cooperative FP64 SIMT GMRES
+  leaf followed by fixed control transfer and MFEM/HYPRE true-residual
+  verification. No DMMA claim is made for those stages.
 - The native rank-one solver is an independent algorithmic effect and its work
   is reported separately from MMA. Tensor conventional applies a diagonal
-  preconditioner directly from the borrowed ParCSR matrix. Tensor IGR matches
-  ordinary IGR's type-0, fill-0, RCM, one-application `hypre_ilu0` factor
-  contract. Within that preconditioner, HYPRE performs current-matrix factor
-  setup and diagonal extraction on the first trace solve of each attempt; the
-  factor is retained for subsequent solves in that attempt, and the native
-  cooperative kernel performs five-per-side iterative Jacobi and
-  executes GMRES. Post-launch MFEM/HYPRE true-residual verification remains the
-  acceptance authority in both tensor modes. Those effects are disclosed
-  separately from tensor-condensation MMA attribution. The rejected
-  three-per-side and unsupported fill-level-1 tuning paths are not part of the
-  production engine, and neither may silently fall back.
-- Refreshing the tensor-IGR factor on every trace solve was also rejected. On
+  preconditioner directly from the borrowed ParCSR matrix. Tensor IGR uses the
+  robust J10 native matrix-free Schwarz policy, selecting only between its
+  admitted lower and full-coupled cooperative patch specializations under the
+  exact structural classifier. Post-launch MFEM/HYPRE true-residual
+  verification remains the acceptance authority in both tensor modes. Those
+  effects, generic J10 work, and the four branch counters are disclosed
+  separately from tensor-condensation MMA attribution. The rejected ILU
+  tuning paths are not part of the production engine, and none may silently
+  fall back.
+- Refreshing the earlier tensor-IGR ILU factor on every trace solve was also
+  rejected. On
   the saturated p3 `mesh_n=52` probe it produced a 4.814884 s accepted-step
   median with 1052--1066 outer iterations, versus approximately 4.57 s and
   about 1067 iterations with retained first-factor reuse. The extra setup did
-  not buy a meaningful convergence reduction and regressed end-to-end time.
+  not buy a meaningful convergence reduction and regressed end-to-end time;
+  neither factor-lifetime variant is the production robust policy.
 - Applying tiled CGS2 indiscriminately to both tensor modes was also rejected.
   A pre-freeze saturated p3 tuning probe reduced tensor IGR from the retained-
   factor MGS control's approximately 4.57 s and 1067 outer iterations to a
@@ -815,12 +996,13 @@ the default regardless of selected tensor wins.
   eleven iterations unchanged. The selected mode-specialized entry points
   retain the IGR CGS2 dataflow and restore conventional MGS; the restored
   conventional probe was 0.076536 s. These tuning probes explain the numerical
-  policy but are not final paired campaign evidence.
+  GMRES dataflow but are not final paired campaign evidence; the production
+  robust patch/J10 selection still requires a new exact-candidate matrix.
 - Preliminary external profiling of the earlier HYPRE-solve prototype
   identified sparse direct triangular solve as the dominant tensor-IGR
   accepted-step hotspot. That observation motivated the native fused trace
-  leaf and fixed iterative preconditioner, but it is not final-candidate
-  performance evidence.
+  leaf and subsequent robust native preconditioner work, but it is not
+  final-candidate performance evidence.
 - p1-p3 all use zero-filled 8-by-8/inner-dimension tails. Tile utilization and
   fixed launch costs are therefore degree- and size-dependent; the mesh-4
   campaign defines the disclosed break-even region, including small IGR

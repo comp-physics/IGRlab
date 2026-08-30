@@ -1,5 +1,6 @@
 #include "numerics/hdg/generic/contract.hpp"
 #include "numerics/hdg/runtime/cuda/generic_euler.cuh"
+#include "numerics/hdg/runtime/cuda/tensor_volume_layout.hpp"
 #include "test_cuda_trace_solver_routing.hpp"
 
 #include <mfem.hpp>
@@ -29,19 +30,21 @@ constexpr bool CudaPreparedIluAccountingValid(
     const int linear_iterations, const generic::CudaEngineKind engine,
     const bool igr_active) noexcept
 {
-  const auto preconditioner =
-      CudaTracePreconditionerForEngine(engine, igr_active);
+  const auto policy = ResolveCudaTracePolicy(
+      engine, igr_active, tensor.trace_policy_rank_count,
+      tensor.trace_policy_order, tensor.requested_trace_policy);
+  if (!CudaTracePolicyDescriptorIsExact(policy) ||
+      tensor.resolved_trace_policy != policy.resolved_selection)
+    return false;
+  const auto preconditioner = policy.trace_preconditioner;
   const bool ilu = CudaTracePreconditionerIsIlu(preconditioner);
-  const auto factor_reuse_policy =
-      CudaIluFactorReusePolicyForEngine(engine, igr_active);
-  const auto triangular_solve_kind =
-      CudaIluTriangularSolveKindForEngine(engine, igr_active);
-  const int lower_jacobi_iterations =
-      CudaIluLowerJacobiIterations(engine, igr_active);
-  const int upper_jacobi_iterations =
-      CudaIluUpperJacobiIterations(engine, igr_active);
+  const auto factor_reuse_policy = policy.ilu_factor_reuse_policy;
+  const auto triangular_solve_kind = policy.ilu_triangular_solve_kind;
+  const int lower_jacobi_iterations = policy.ilu_lower_jacobi_iterations;
+  const int upper_jacobi_iterations = policy.ilu_upper_jacobi_iterations;
   if (!ilu)
-    return preconditioner == CudaTracePreconditionerKind::hypre_diag_scale &&
+    return (preconditioner == CudaTracePreconditionerKind::hypre_diag_scale ||
+            CudaTracePreconditionerIsNativeElementSchwarz(preconditioner)) &&
         tensor.ilu_type == -1 && tensor.ilu_level_of_fill == -1 &&
         tensor.ilu_local_reordering == -1 &&
         tensor.ilu_application_iterations == 0 &&
@@ -141,7 +144,8 @@ struct CudaPreparedIgrConservationCapture
   int volume_points = 0;
   int face_points = 0;
   int order = 0;
-  int assembly_order = 0;
+  int volume_assembly_order = 0;
+  int face_assembly_order = 0;
   double alpha = 0.0;
   double beta = 0.0;
   double dt = 0.0;
@@ -199,10 +203,21 @@ struct CudaBorrowedAssemblyFusionAudit
       std::numeric_limits<double>::infinity(),
       std::numeric_limits<double>::infinity(),
       std::numeric_limits<double>::infinity()}};
+  std::array<double, 8> maximum_scaled_errors{{
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity()}};
   std::array<bool, 8> bitwise_equal{};
   int elements = 0;
   int interior_dofs = 0;
   int trace_dofs = 0;
+  std::uint64_t ordinary_volume_mma_tiles = 0;
+  std::uint64_t tensor_volume_mma_tiles = 0;
   bool status_bitwise_equal = false;
   bool status_all_passed = false;
 };
@@ -385,10 +400,11 @@ struct CudaQualificationTestAccess
           CudaTransferSite::generic_host_export);
     };
     const auto launch_and_copy = [&](const CudaBorrowedAssemblyKind kind,
-                                     Products& products) noexcept
+                                     Products& products,
+                                     std::uint64_t& volume_mma_tiles) noexcept
     {
       const bool launched = CudaLaunchBorrowedAssembly(
-              numerics.view_, shape, fixed_dt, kind) &&
+              numerics.view_, shape, fixed_dt, kind, volume_mma_tiles) &&
           numerics.StatusPassed();
       if (!numerics.CollectiveContinue(launched)) return false;
       const bool copied = d2h(products.residual_r.data(),
@@ -408,9 +424,21 @@ struct CudaQualificationTestAccess
               CudaTransferSite::generic_host_export);
       return numerics.CollectiveContinue(copied);
     };
-    if (!launch_and_copy(CudaBorrowedAssemblyKind::ordinary_split, split) ||
-        !launch_and_copy(CudaBorrowedAssemblyKind::tensor_fused, fused))
+    if (!launch_and_copy(
+            CudaBorrowedAssemblyKind::ordinary_split, split,
+            audit.ordinary_volume_mma_tiles) ||
+        !launch_and_copy(
+            CudaBorrowedAssemblyKind::tensor_volume, fused,
+            audit.tensor_volume_mma_tiles))
       return false;
+
+    const auto planned_volume_work = PlanTensorVolumeMmaWork(
+        shape.elements, shape.interior_components,
+        shape.scalar_interior_dofs, shape.interior_dofs,
+        shape.trace_dofs, shape.volume_points, shape.igr_active);
+    const bool exact_volume_work = planned_volume_work.valid &&
+        audit.ordinary_volume_mma_tiles == 0 &&
+        audit.tensor_volume_mma_tiles == planned_volume_work.mma_tiles;
 
     const std::array<const std::vector<double>*, 8> split_products{{
         &split.residual_r, &split.residual_g, &split.a, &split.b,
@@ -418,27 +446,52 @@ struct CudaQualificationTestAccess
     const std::array<const std::vector<double>*, 8> fused_products{{
         &fused.residual_r, &fused.residual_g, &fused.a, &fused.b,
         &fused.c, &fused.d, &fused.f, &fused.g}};
-    bool exact = true;
+    bool within_tolerance = true;
+    // Only residual_r, A, and f contain the reordered volume contraction.
+    // Their at-most three products per quadrature point stay under a strict
+    // FP64, dimension-scaled roundoff envelope.  Face-only products retain
+    // their existing bitwise gate, proving that the zero/face leaves did not
+    // change.  This is a test comparison bound, not a solver tolerance.
+    const double tensor_tolerance = 1024.0 *
+        std::numeric_limits<double>::epsilon() *
+        static_cast<double>(std::max(1, shape.volume_points));
     for (std::size_t product = 0; product < split_products.size(); ++product)
     {
       const auto& left = *split_products[product];
       const auto& right = *fused_products[product];
       audit.maximum_absolute_errors[product] = 0.0;
+      audit.maximum_scaled_errors[product] = 0.0;
       audit.bitwise_equal[product] = left == right;
       bool finite = left.size() == right.size();
       for (std::size_t index = 0; finite && index < left.size(); ++index)
       {
         finite = std::isfinite(left[index]) && std::isfinite(right[index]);
         if (finite)
+        {
+          const double difference = std::abs(left[index] - right[index]);
           audit.maximum_absolute_errors[product] = std::max(
               audit.maximum_absolute_errors[product],
-              std::abs(left[index] - right[index]));
+              difference);
+          const double scale = std::max(
+              {1.0, std::abs(left[index]), std::abs(right[index])});
+          audit.maximum_scaled_errors[product] = std::max(
+              audit.maximum_scaled_errors[product], difference / scale);
+        }
       }
       if (!finite)
+      {
         audit.maximum_absolute_errors[product] =
             std::numeric_limits<double>::infinity();
+        audit.maximum_scaled_errors[product] =
+            std::numeric_limits<double>::infinity();
+      }
       audit.bitwise_equal[product] = audit.bitwise_equal[product] && finite;
-      exact = exact && audit.bitwise_equal[product];
+      const bool reordered_volume_product =
+          product == 0 || product == 2 || product == 6;
+      within_tolerance = within_tolerance && finite &&
+          (reordered_volume_product
+               ? audit.maximum_scaled_errors[product] <= tensor_tolerance
+               : audit.bitwise_equal[product]);
     }
     audit.status_bitwise_equal = split.status == fused.status;
     audit.status_all_passed = std::all_of(
@@ -447,7 +500,9 @@ struct CudaQualificationTestAccess
     audit.elements = shape.elements;
     audit.interior_dofs = shape.interior_dofs;
     audit.trace_dofs = shape.trace_dofs;
-    return exact && audit.status_bitwise_equal && audit.status_all_passed;
+    return exact_volume_work && within_tolerance &&
+        audit.status_bitwise_equal &&
+        audit.status_all_passed;
   }
 
   static bool AuditBorrowedAssemblyFusion(
@@ -458,6 +513,51 @@ struct CudaQualificationTestAccess
       return AuditBorrowedAssemblyFusion(*session.borrowed_rank1_, audit);
     if (session.borrowed_rank2_)
       return AuditBorrowedAssemblyFusion(*session.borrowed_rank2_, audit);
+    audit = {};
+    return false;
+  }
+
+  template <typename Engine>
+  static bool AuditConventionalP1Q12TensorVolumeMultiChunk(
+      Engine& engine, CudaBorrowedAssemblyFusionAudit& audit) noexcept
+  {
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    const auto scratch = PlanTensorVolumeScratch(
+        shape.interior_dofs, shape.trace_dofs,
+        shape.volume_points, false);
+    const auto mma_work = PlanTensorVolumeMmaWork(
+        shape.elements, shape.interior_components,
+        shape.scalar_interior_dofs, shape.interior_dofs,
+        shape.trace_dofs, shape.volume_points, false);
+    // For conventional p1, q12 is 49 quadrilateral points and the retained
+    // solve workspace holds exactly 12 compact 44-double coefficients.  The
+    // production launch loop must therefore execute 12+12+12+12+1.
+    const bool exact_multi_chunk_shape = shape.order == 1 &&
+        !shape.igr_active && shape.volume_assembly_order == 12 &&
+        shape.volume_points == 49 && shape.scalar_interior_dofs == 4 &&
+        shape.scalar_face_dofs == 2 && shape.interior_dofs == 16 &&
+        shape.trace_dofs == 32 && scratch.valid &&
+        scratch.workspace_doubles == 528 &&
+        scratch.coefficient_stride == 44 &&
+        scratch.capacity_points == 12 && scratch.chunk_points == 12 &&
+        mma_work.valid && mma_work.contraction_launches == 5 &&
+        mma_work.mma_tiles ==
+            468U * static_cast<std::uint64_t>(shape.elements);
+    return numerics.CollectiveContinue(exact_multi_chunk_shape) &&
+        AuditBorrowedAssemblyFusion(engine, audit);
+  }
+
+  static bool AuditConventionalP1Q12TensorVolumeMultiChunk(
+      cuda::GenericEulerHdgCudaSession& session,
+      CudaBorrowedAssemblyFusionAudit& audit) noexcept
+  {
+    if (session.borrowed_rank1_)
+      return AuditConventionalP1Q12TensorVolumeMultiChunk(
+          *session.borrowed_rank1_, audit);
+    if (session.borrowed_rank2_)
+      return AuditConventionalP1Q12TensorVolumeMultiChunk(
+          *session.borrowed_rank2_, audit);
     audit = {};
     return false;
   }
@@ -500,17 +600,27 @@ struct CudaQualificationTestAccess
     const auto& evidence = engine.pending_.evidence;
     const auto& tensor = evidence.tensor_core;
     const bool igr_active = engine.numerics_.shape_.igr_active;
+    const auto trace_policy = ResolveCudaTracePolicy(
+        expected, igr_active, engine.config_.expected_rank_count,
+        engine.config_.order, CudaTracePolicyKind::engine_default);
     return IluFactorAuthorityInactive(engine) &&
         tensor.selected_engine == expected &&
+        CudaTracePolicyDescriptorIsExact(trace_policy) &&
+        tensor.requested_trace_policy ==
+            CudaTracePolicyKind::engine_default &&
+        tensor.resolved_trace_policy == trace_policy.resolved_selection &&
+        tensor.trace_policy_rank_count == engine.config_.expected_rank_count &&
+        tensor.trace_policy_order == engine.config_.order &&
         tensor.trace_preconditioner_configured &&
-        tensor.trace_preconditioner ==
-            CudaTracePreconditionerForEngine(expected, igr_active) &&
+        tensor.trace_preconditioner == trace_policy.trace_preconditioner &&
         CudaPreparedIluAccountingValid(
             tensor, evidence.trace_solves, evidence.linear_iterations,
             expected, igr_active) &&
         CudaPreparedTraceSolverRoutingValid(
             tensor, evidence.trace_solves, expected,
             engine.config_.expected_rank_count) &&
+        CudaPreparedTensorVolumeEvidenceValid(
+            tensor, engine.numerics_.shape_, expected) &&
         tensor.fallback_count == 0 && evidence.no_fallback &&
         (expected == generic::CudaEngineKind::ordinary
              ? tensor.condensation_launches == 0 && tensor.mma_tiles == 0
@@ -797,6 +907,11 @@ struct CudaQualificationTestAccess
     capture = {};
     auto& numerics = engine.numerics_;
     const CudaMeshShape& shape = numerics.shape_;
+    const auto& tensor = engine.pending_.evidence.tensor_core;
+    const auto trace_policy = ResolveCudaTracePolicy(
+        generic::CudaEngineKind::tensor_core, shape.igr_active,
+        engine.config_.expected_rank_count, engine.config_.order,
+        CudaTracePolicyKind::engine_default);
     bool local_valid = engine.initialized_ && engine.pending_.active &&
         engine.pending_.staging && engine.pending_.numerical.success &&
         engine.config_.cuda_engine == generic::CudaEngineKind::tensor_core &&
@@ -805,13 +920,16 @@ struct CudaQualificationTestAccess
         shape.interior_dofs > 0 && shape.trace_dofs > 0 &&
         numerics.view_.schur != nullptr &&
         numerics.view_.condensed_rhs != nullptr &&
-        engine.pending_.evidence.tensor_core.selected_engine ==
-            generic::CudaEngineKind::tensor_core &&
-        engine.pending_.evidence.tensor_core.trace_preconditioner_configured &&
-        engine.pending_.evidence.tensor_core.trace_preconditioner ==
-            CudaTracePreconditionerForEngine(
-                generic::CudaEngineKind::tensor_core, shape.igr_active) &&
-        engine.pending_.evidence.tensor_core.fallback_count == 0 &&
+        tensor.selected_engine == generic::CudaEngineKind::tensor_core &&
+        CudaTracePolicyDescriptorIsExact(trace_policy) &&
+        tensor.requested_trace_policy ==
+            CudaTracePolicyKind::engine_default &&
+        tensor.resolved_trace_policy == trace_policy.resolved_selection &&
+        tensor.trace_policy_rank_count == engine.config_.expected_rank_count &&
+        tensor.trace_policy_order == engine.config_.order &&
+        tensor.trace_preconditioner_configured &&
+        tensor.trace_preconditioner == trace_policy.trace_preconditioner &&
+        tensor.fallback_count == 0 &&
         engine.pending_.evidence.no_fallback;
     const std::size_t schur_count = local_valid
         ? static_cast<std::size_t>(shape.elements) * shape.trace_dofs *
@@ -1124,12 +1242,13 @@ struct CudaQualificationTestAccess
                               std::vector<double>& residual_g) noexcept
     {
       if (!install(interior, trace)) return false;
+      std::uint64_t ignored_volume_mma_tiles = 0;
       const bool launched = (frozen
               ? CudaLaunchFrozenBorrowedLlfAssembly(
                     numerics.view_, shape, fixed_dt)
               : CudaLaunchAssembly(
                     numerics.view_, shape, fixed_dt,
-                    numerics.cuda_engine_)) &&
+                    numerics.cuda_engine_, ignored_volume_mma_tiles)) &&
           CudaTransportPolicy::Synchronize(
               CudaTransferSite::scalar_status) &&
           numerics.StatusPassed();
@@ -1497,7 +1616,8 @@ struct CudaQualificationTestAccess
     capture.volume_points = shape.volume_points;
     capture.face_points = shape.face_points;
     capture.order = shape.order;
-    capture.assembly_order = shape.assembly_order;
+    capture.volume_assembly_order = shape.volume_assembly_order;
+    capture.face_assembly_order = shape.face_assembly_order;
     capture.alpha = shape.igr_alpha;
     capture.beta = shape.igr_beta;
     capture.dt = engine.pending_.attempt.dt;
@@ -2613,6 +2733,8 @@ bool VerifyIndependentIgrConservation(
     IndependentIgrConservationResult& result)
 {
   result = {};
+  const auto requested_orders =
+      request.numerical_policy.igr_assembly_quadrature_orders;
   const bool locally_admitted = request.mesh != nullptr &&
       request.source.data != nullptr &&
       request.source.components == components &&
@@ -2622,8 +2744,8 @@ bool VerifyIndependentIgrConservation(
       capture.interior_dofs == capture.scalar_interior_dofs * 7 &&
       capture.trace_dofs == 4 * capture.scalar_face_dofs * 5 &&
       capture.order == request.polynomial_order &&
-      capture.assembly_order ==
-          request.numerical_policy.igr_assembly_quadrature_order &&
+      capture.volume_assembly_order == requested_orders.volume_order &&
+      capture.face_assembly_order == requested_orders.face_order &&
       capture.alpha == request.numerical_policy.stabilization.alpha &&
       capture.beta == request.numerical_policy.stabilization.beta &&
       capture.dt > 0.0 && std::isfinite(capture.dt);
@@ -2691,7 +2813,7 @@ bool VerifyIndependentIgrConservation(
       if (!local_valid) break;
 
       const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
-          finite_element->GetGeomType(), capture.assembly_order);
+          finite_element->GetGeomType(), capture.volume_assembly_order);
       local_valid = volume_rule.GetNPoints() == capture.volume_points;
       mfem::Vector volume_shape(capture.scalar_interior_dofs);
       mfem::DenseMatrix volume_derivative(
@@ -2844,7 +2966,7 @@ bool VerifyIndependentIgrConservation(
         if (!local_valid) break;
 
         const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
-            trace_element->GetGeomType(), capture.assembly_order);
+            trace_element->GetGeomType(), capture.face_assembly_order);
         local_valid = face_rule.GetNPoints() == capture.face_points;
         long double face_measure = 0.0L;
         for (int q = 0; local_valid && q < face_rule.GetNPoints(); ++q)
@@ -3281,7 +3403,7 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
     MPI_Comm_rank(request.communicator, &rank);
     if (rank == 0)
     {
-      std::cerr << "CUDA split/fused borrowed assembly mismatch order="
+      std::cerr << "CUDA split/tensor-volume assembly mismatch order="
                 << order << " regularization=" << (igr ? "igr" : "none")
                 << " dimensions=" << assembly_fusion_audit.elements << 'x'
                 << assembly_fusion_audit.interior_dofs << 'x'
@@ -3292,6 +3414,10 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
       std::cerr << " exact=";
       for (const bool exact : assembly_fusion_audit.bitwise_equal)
         std::cerr << ' ' << exact;
+      std::cerr << " scaled=";
+      for (const double error :
+           assembly_fusion_audit.maximum_scaled_errors)
+        std::cerr << ' ' << error;
       std::cerr << " status="
                 << assembly_fusion_audit.status_bitwise_equal << '/'
                 << assembly_fusion_audit.status_all_passed << '\n';
@@ -3747,6 +3873,9 @@ bool CheckIndependentIgrConservation(const int order)
   EulerHdgRequest request = MakeRequest(
       mesh, order, fields, unused_boundary, false,
       RegularizationKind::igr);
+  // A deliberately split policy proves that the production CUDA route does
+  // not silently reuse the element rule for faces.
+  request.numerical_policy.igr_assembly_quadrature_orders = {10, 8};
   AllSevenBoundaryContext boundary{};
   ConfigureAllSevenPolicies(boundary);
   request.boundary.context = &boundary;
@@ -4164,7 +4293,12 @@ bool CheckTensorDiagonalConvergenceWarningRollback(const int order,
   EulerHdgRequest request = MakeRequest(
       mesh, order, fields, boundary, false, RegularizationKind::none);
   request.numerical_policy.maximum_linear_iterations = 1;
-  request.numerical_policy.linear_relative_tolerance = 1.0e-30;
+  request.numerical_policy.newton_correction_linear_relative_tolerance =
+      1.0e-30;
+  request.numerical_policy.final_coherent_linear_relative_tolerance =
+      1.0e-30;
+  request.numerical_policy.
+      true_residual_tightening_linear_relative_tolerance = 1.0e-30;
   request.numerical_policy.true_residual_relative_tolerance = 1.0e-30;
   const bool admitted =
       dg::hdg::generic::ValidateEulerHdgRequest(request) ==
@@ -4268,6 +4402,56 @@ bool CheckEulerAlgebra(const int order, const int ranks)
   const bool igr_physical = check_physical(RegularizationKind::igr);
   return conventional_periodic && conventional_physical &&
       igr_periodic && igr_physical;
+}
+
+bool CheckConventionalP1Q12TensorVolumeMultiChunkParity(const int order)
+{
+  if (selected_cuda_engine != CudaEngineKind::tensor_core || order != 1)
+    return true;
+
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::nonzero, InitialMode::smooth_periodic);
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::none);
+  request.numerical_policy.conventional_assembly_quadrature_order = 12;
+  const bool admitted =
+      dg::hdg::generic::ValidateEulerHdgRequest(request) ==
+          ContractStatus::accepted;
+  if (!All(admitted, request.communicator)) return false;
+
+  GenericEulerHdgCudaSession session;
+  const auto initialization = session.Initialize(request);
+  const bool initialized = All(
+      initialization.status == HdgEulerSessionStatus::initialized,
+      request.communicator);
+  CudaBorrowedAssemblyFusionAudit audit{};
+  const bool parity = initialized &&
+      CudaQualificationTestAccess::
+          AuditConventionalP1Q12TensorVolumeMultiChunk(session, audit);
+  const bool passed = All(parity, request.communicator);
+  if (!passed)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+    {
+      std::cerr << "CUDA conventional p1 q12 tensor-volume multi-chunk "
+                   "parity failed initialized="
+                << initialized << " dimensions=" << audit.elements << 'x'
+                << audit.interior_dofs << 'x' << audit.trace_dofs
+                << " maxima=";
+      for (const double error : audit.maximum_absolute_errors)
+        std::cerr << ' ' << error;
+      std::cerr << " scaled=";
+      for (const double error : audit.maximum_scaled_errors)
+        std::cerr << ' ' << error;
+      std::cerr << " status=" << audit.status_bitwise_equal << '/'
+                << audit.status_all_passed << '\n';
+    }
+  }
+  return passed;
 }
 
 bool CheckZeroUpdateFinalReconstruction(const int order)
@@ -5353,6 +5537,9 @@ int main(int argc, char* argv[])
       CheckConventionalConservationGateRollback(order, ranks);
   const bool tensor_diagonal_convergence_warning_rollback = order > 0 &&
       CheckTensorDiagonalConvergenceWarningRollback(order, ranks);
+  const bool conventional_p1_q12_tensor_volume_multi_chunk_parity =
+      order > 0 &&
+      CheckConventionalP1Q12TensorVolumeMultiChunkParity(order);
   const bool euler_algebra = order > 0 && CheckEulerAlgebra(order, ranks);
   const bool zero_update_final_reconstruction = order > 0 &&
       CheckZeroUpdateFinalReconstruction(order);
@@ -5407,6 +5594,7 @@ int main(int argc, char* argv[])
       mixed_boundary_policies && independent_igr_conservation &&
       conventional_conservation_rollback &&
       tensor_diagonal_convergence_warning_rollback &&
+      conventional_p1_q12_tensor_volume_multi_chunk_parity &&
       euler_algebra && zero_update_final_reconstruction &&
       rejected_armijo_rollback &&
       conventional_periodic && conventional_physical &&
@@ -5431,6 +5619,8 @@ int main(int argc, char* argv[])
               << conventional_conservation_rollback
               << " tensor_diagonal_convergence_warning_rollback="
               << tensor_diagonal_convergence_warning_rollback
+              << " conventional_p1_q12_tensor_volume_multi_chunk_parity="
+              << conventional_p1_q12_tensor_volume_multi_chunk_parity
               << " euler_algebra=" << euler_algebra
               << " zero_update_final_reconstruction="
               << zero_update_final_reconstruction

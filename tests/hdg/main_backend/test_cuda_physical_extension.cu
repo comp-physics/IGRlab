@@ -83,13 +83,25 @@ mfem::Array<int> Marker(const int maximum_attribute, const int attribute)
 }
 
 dg_sim::hdg::HdgEulerCaseData MakeCaseData(
-    const dg_sim::CaseContext& context, const int order)
+    const dg_sim::CaseContext& context, const int order,
+    const bool candidate_numerical_policy)
 {
   dg_sim::hdg::HdgEulerCaseData data;
   data.initial_condition = std::make_unique<SmoothEulerCoefficient>();
   data.static_source = std::make_unique<SmoothSourceCoefficient>();
   data.numerical_policy =
       dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
+  if (candidate_numerical_policy)
+  {
+    data.numerical_policy.igr_assembly_quadrature_orders = {
+        2 * order + 4, 2 * order + 2};
+    data.numerical_policy.newton_correction_linear_relative_tolerance =
+        1.0e-10;
+    data.numerical_policy.final_coherent_linear_relative_tolerance =
+        3.0e-11;
+    data.numerical_policy.
+        true_residual_tightening_linear_relative_tolerance = 1.0e-12;
+  }
 
   const int attributes = context.Mesh().bdr_attributes.Size() == 0
       ? 0
@@ -120,7 +132,8 @@ bool All(const bool local)
 
 bool RunCase(const int order,
              const dg::hdg::generic::RegularizationKind regularization,
-             const dg::hdg::generic::CudaEngineKind cuda_engine)
+             const dg::hdg::generic::CudaEngineKind cuda_engine,
+             const bool candidate_numerical_policy)
 {
   dg_sim::CaseConfig case_config;
   case_config.case_name = "cuda_physical_extension";
@@ -153,8 +166,9 @@ bool RunCase(const int order,
   options.analysis_steps = 0;
 
   const dg_sim::hdg::HdgEulerCaseDataFactory factory =
-      [order](const dg_sim::CaseContext& context)
-      { return MakeCaseData(context, order); };
+      [order, candidate_numerical_policy](
+          const dg_sim::CaseContext& context)
+      { return MakeCaseData(context, order, candidate_numerical_policy); };
   const dg_sim::hdg::HdgEulerMainRequest request{
       case_config, options, factory, MPI_COMM_WORLD};
   return dg_sim::hdg::RunEulerMainBackend(request) == 0;
@@ -162,25 +176,36 @@ bool RunCase(const int order,
 
 bool ParseEngine(const int argc, char* argv[],
                  dg::hdg::generic::CudaEngineKind& engine,
-                 bool& rank_mismatch)
+                 bool& rank_mismatch,
+                 bool& candidate_numerical_policy)
 {
   engine = dg::hdg::generic::CudaEngineKind::ordinary;
   rank_mismatch = false;
-  if (argc == 1) return true;
-  if (argc == 2 && std::string(argv[1]) == "--rank-engine-mismatch")
+  candidate_numerical_policy = false;
+  bool have_engine = false;
+  for (int index = 1; index < argc; ++index)
   {
-    rank_mismatch = true;
-    return true;
+    const std::string option(argv[index]);
+    if (option == "--engine" && !have_engine && index + 1 < argc)
+    {
+      const std::string value(argv[++index]);
+      if (value == "ordinary")
+        engine = dg::hdg::generic::CudaEngineKind::ordinary;
+      else if (value == "tensor")
+        engine = dg::hdg::generic::CudaEngineKind::tensor_core;
+      else
+        return false;
+      have_engine = true;
+    }
+    else if (option == "--rank-engine-mismatch" && !rank_mismatch)
+      rank_mismatch = true;
+    else if (option == "--candidate-numerical-policy" &&
+             !candidate_numerical_policy)
+      candidate_numerical_policy = true;
+    else
+      return false;
   }
-  if (argc != 3 || std::string(argv[1]) != "--engine") return false;
-  const std::string value(argv[2]);
-  if (value == "ordinary") return true;
-  if (value == "tensor")
-  {
-    engine = dg::hdg::generic::CudaEngineKind::tensor_core;
-    return true;
-  }
-  return false;
+  return !rank_mismatch || (!have_engine && !candidate_numerical_policy);
 }
 
 } // namespace
@@ -197,11 +222,15 @@ int main(int argc, char* argv[])
   dg::hdg::generic::CudaEngineKind cuda_engine =
       dg::hdg::generic::CudaEngineKind::ordinary;
   bool rank_engine_mismatch = false;
-  if (!ParseEngine(argc, argv, cuda_engine, rank_engine_mismatch))
+  bool candidate_numerical_policy = false;
+  if (!ParseEngine(argc, argv, cuda_engine, rank_engine_mismatch,
+                   candidate_numerical_policy))
   {
     if (rank == 0)
       std::cerr << "Usage: " << argv[0]
-                << " [--engine ordinary|tensor] [--rank-engine-mismatch]\n";
+                << " [--engine ordinary|tensor]"
+                   " [--candidate-numerical-policy]"
+                   " [--rank-engine-mismatch]\n";
     return 2;
   }
   if (rank_engine_mismatch)
@@ -211,7 +240,7 @@ int main(int argc, char* argv[])
         ? dg::hdg::generic::CudaEngineKind::ordinary
         : dg::hdg::generic::CudaEngineKind::tensor_core;
     const bool rejected = !RunCase(
-        1, dg::hdg::generic::RegularizationKind::none, cuda_engine);
+        1, dg::hdg::generic::RegularizationKind::none, cuda_engine, false);
     return All(rejected) ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
@@ -223,10 +252,12 @@ int main(int argc, char* argv[])
     // Do not short-circuit collective runs after a prior failure: every rank
     // must enter the complete qualification matrix in the same order.
     const bool conventional_order = RunCase(
-        order, dg::hdg::generic::RegularizationKind::none, cuda_engine);
+        order, dg::hdg::generic::RegularizationKind::none, cuda_engine,
+        candidate_numerical_policy);
     conventional = conventional && conventional_order;
     const bool igr_order = RunCase(
-        order, dg::hdg::generic::RegularizationKind::igr, cuda_engine);
+        order, dg::hdg::generic::RegularizationKind::igr, cuda_engine,
+        candidate_numerical_policy);
     igr = igr && igr_order;
   }
   const bool passed = (ranks == 1 || ranks == 2) &&
@@ -239,6 +270,8 @@ int main(int argc, char* argv[])
               << (cuda_engine == dg::hdg::generic::CudaEngineKind::tensor_core
                       ? "tensor"
                       : "ordinary")
+              << " candidate_numerical_policy="
+              << candidate_numerical_policy
               << " conventional=" << conventional << " igr=" << igr
               << '\n';
     return EXIT_FAILURE;
