@@ -1964,6 +1964,14 @@ struct detail::CpuNumericsCore::Implementation
   std::uint64_t complete_factor_setup_generation = 0;
   std::uint64_t active_candidate_generation = 0;
   StateHash active_candidate_state_hash{};
+  // The scalar IGR closure is an algebraic witness owned by the committed or
+  // prepared candidate state.  Bind the committed certificate to the complete
+  // published slot hashes so a stale boolean can never authorize different
+  // state bytes after publication, rollback, or restart.
+  bool committed_scalar_closure_coherent = false;
+  StateHash committed_scalar_closure_interior_hash{};
+  StateHash committed_scalar_closure_trace_hash{};
+  bool active_candidate_scalar_closure_coherent = false;
   bool publication_chain_authority = false;
   bool borrowed_prepare_active = false;
   // Private qualification control.  It is armed only through friend test
@@ -1978,9 +1986,60 @@ struct detail::CpuNumericsCore::Implementation
                          communicator) == MPI_SUCCESS && reduced == 1;
   }
 
+  bool CollectiveDecision(const bool local, bool& all) const noexcept
+  {
+    int value = local ? 1 : 0;
+    int reduced = 0;
+    const bool completed = MPI_Allreduce(
+        &value, &reduced, 1, MPI_INT, MPI_MIN, communicator) == MPI_SUCCESS;
+    all = completed && reduced == 1;
+    return completed;
+  }
+
   bool IsBorrowed() const noexcept { return borrowed_request != nullptr; }
 
   bool IsIgr() const noexcept { return IsBorrowed() && igr_active; }
+
+  bool IsPartitionedBackwardEuler() const noexcept
+  {
+    return IsBorrowed() && borrowed_request->time_treatment ==
+        generic::EulerHdgTimeTreatment::partitioned_backward_euler;
+  }
+
+  bool RequiresPartitionedScalarClosure() const noexcept
+  {
+    return IsPartitionedBackwardEuler() && IsIgr();
+  }
+
+  bool CommittedScalarClosureCertified() const noexcept
+  {
+    const CpuSlotStorage* const committed = Committed();
+    return !RequiresPartitionedScalarClosure() ||
+        (committed != nullptr && committed_scalar_closure_coherent &&
+         committed_scalar_closure_interior_hash ==
+             HashDoubles(committed->interior) &&
+         committed_scalar_closure_trace_hash ==
+             HashDoubles(committed->trace));
+  }
+
+  void CertifyCommittedScalarClosure() noexcept
+  {
+    committed_scalar_closure_coherent = RequiresPartitionedScalarClosure();
+    if (committed_scalar_closure_coherent)
+    {
+      const CpuSlotStorage* const committed = Committed();
+      committed_scalar_closure_coherent = committed != nullptr;
+      committed_scalar_closure_interior_hash = committed
+          ? HashDoubles(committed->interior) : StateHash{};
+      committed_scalar_closure_trace_hash = committed
+          ? HashDoubles(committed->trace) : StateHash{};
+    }
+    else
+    {
+      committed_scalar_closure_interior_hash = {};
+      committed_scalar_closure_trace_hash = {};
+    }
+  }
 
   bool FillBorrowedField(mfem::ParGridFunction& field,
                          const generic::EulerFieldView view) const noexcept
@@ -3389,7 +3448,6 @@ struct detail::CpuNumericsCore::Implementation
       local_graph_ready = false;
     }
     if (!CollectiveAll(local_graph_ready)) { return false; }
-
     bool parallel_assembly_ready = false;
     try
     {
@@ -3563,7 +3621,8 @@ struct detail::CpuNumericsCore::Implementation
                     quadrature_orders,
                 const bool consume_internal_test_hooks = true,
                 const std::vector<double>* const frozen_borrowed_llf = nullptr,
-                std::vector<double>* const evaluated_borrowed_llf = nullptr)
+                std::vector<double>* const evaluated_borrowed_llf = nullptr,
+                const bool suppress_euler_time_mass = false)
       noexcept
   {
     system.Zero();
@@ -3714,7 +3773,10 @@ struct detail::CpuNumericsCore::Implementation
                   ByNodes(row_scalar, scalar_interior_dofs, equation);
               system.residual_interior[element_ni + row] += weight *
                   (volume_shape_workspace[row_scalar] *
-                       (state[equation] - old_state[equation]) / config.dt -
+                       (suppress_euler_time_mass
+                            ? 0.0
+                            : (state[equation] - old_state[equation]) /
+                                  config.dt) -
                    volume_derivative_workspace(row_scalar, 0) *
                        flux_x[equation] -
                    volume_derivative_workspace(row_scalar, 1) *
@@ -3729,7 +3791,8 @@ struct detail::CpuNumericsCore::Implementation
                 {
                   const int column = ByNodes(
                       column_scalar, scalar_interior_dofs, variable);
-                  const double mass = variable == equation
+                  const double mass = !suppress_euler_time_mass &&
+                          variable == equation
                       ? volume_shape_workspace[row_scalar] *
                             volume_shape_workspace[column_scalar] / config.dt
                       : 0.0;
@@ -4451,6 +4514,409 @@ struct detail::CpuNumericsCore::Implementation
     }
   }
 
+  bool MaskScalarConstraint(LocalSystem& system) const noexcept
+  {
+    if (!RequiresPartitionedScalarClosure() ||
+        system.elements != mesh->GetNE() ||
+        system.interior_dofs != local_interior ||
+        system.trace_dofs != local_trace)
+    {
+      return false;
+    }
+    try
+    {
+      const int trace_face_width = scalar_trace_dofs * trace_components;
+      const auto interior_active = [&](const int local) noexcept
+      {
+        return local / scalar_interior_dofs >= cpu_conserved_components;
+      };
+      const auto trace_active = [&](const int local) noexcept
+      {
+        return (local % trace_face_width) / scalar_trace_dofs ==
+            cpu_conserved_components;
+      };
+      for (int element = 0; element < system.elements; ++element)
+      {
+        const std::size_t interior_offset =
+            static_cast<std::size_t>(element) * local_interior;
+        const std::size_t trace_offset =
+            static_cast<std::size_t>(element) * local_trace;
+        const std::size_t a_offset = interior_offset * local_interior;
+        const std::size_t b_offset = interior_offset * local_trace;
+        const std::size_t c_offset = trace_offset * local_interior;
+        const std::size_t d_offset = trace_offset * local_trace;
+
+        for (int row = 0; row < local_interior; ++row)
+        {
+          const bool row_active = interior_active(row);
+          if (!row_active)
+          {
+            system.residual_interior[interior_offset + row] = 0.0;
+            system.f[interior_offset + row] = 0.0;
+          }
+          for (int column = 0; column < local_interior; ++column)
+          {
+            if (!row_active || !interior_active(column))
+              system.a[a_offset + static_cast<std::size_t>(row) *
+                                      local_interior + column] =
+                  !row_active && row == column ? 1.0 : 0.0;
+          }
+          for (int column = 0; column < local_trace; ++column)
+            if (!row_active || !trace_active(column))
+              system.b[b_offset + static_cast<std::size_t>(row) * local_trace +
+                       column] = 0.0;
+        }
+
+        for (int row = 0; row < local_trace; ++row)
+        {
+          const bool row_active = trace_active(row);
+          if (!row_active)
+          {
+            system.residual_trace[trace_offset + row] = 0.0;
+            system.g[trace_offset + row] = 0.0;
+          }
+          for (int column = 0; column < local_interior; ++column)
+            if (!row_active || !interior_active(column))
+              system.c[c_offset + static_cast<std::size_t>(row) *
+                                      local_interior + column] = 0.0;
+          for (int column = 0; column < local_trace; ++column)
+          {
+            if (!row_active || !trace_active(column))
+              system.d[d_offset + static_cast<std::size_t>(row) * local_trace +
+                       column] = !row_active && row == column ? 1.0 : 0.0;
+          }
+        }
+      }
+      return Finite(system.residual_interior) &&
+          Finite(system.residual_trace) && Finite(system.a) &&
+          Finite(system.b) && Finite(system.c) && Finite(system.d) &&
+          Finite(system.f) && Finite(system.g);
+    }
+    catch (...)
+    {
+      return false;
+    }
+  }
+
+  /**
+   * Retain the full-width reference storage while exposing only the Euler
+   * U4/Uhat4 subsystem to condensation.  The scalar auxiliary state is the
+   * already coherent a^n witness for this Backward-Euler solve; every
+   * auxiliary row and column is replaced by an exact identity constraint.
+   */
+  bool MaskPartitionedEulerSystem(LocalSystem& system) const noexcept
+  {
+    if (!RequiresPartitionedScalarClosure() ||
+        system.elements != mesh->GetNE() ||
+        system.interior_dofs != local_interior ||
+        system.trace_dofs != local_trace)
+    {
+      return false;
+    }
+    try
+    {
+      const int trace_face_width = scalar_trace_dofs * trace_components;
+      const auto interior_active = [&](const int local) noexcept
+      {
+        return local / scalar_interior_dofs < cpu_conserved_components;
+      };
+      const auto trace_active = [&](const int local) noexcept
+      {
+        return (local % trace_face_width) / scalar_trace_dofs <
+            cpu_conserved_components;
+      };
+      for (int element = 0; element < system.elements; ++element)
+      {
+        const std::size_t interior_offset =
+            static_cast<std::size_t>(element) * local_interior;
+        const std::size_t trace_offset =
+            static_cast<std::size_t>(element) * local_trace;
+        const std::size_t a_offset = interior_offset * local_interior;
+        const std::size_t b_offset = interior_offset * local_trace;
+        const std::size_t c_offset = trace_offset * local_interior;
+        const std::size_t d_offset = trace_offset * local_trace;
+
+        for (int row = 0; row < local_interior; ++row)
+        {
+          const bool row_active = interior_active(row);
+          if (!row_active)
+          {
+            system.residual_interior[interior_offset + row] = 0.0;
+            system.f[interior_offset + row] = 0.0;
+          }
+          for (int column = 0; column < local_interior; ++column)
+          {
+            if (!row_active || !interior_active(column))
+              system.a[a_offset + static_cast<std::size_t>(row) *
+                                      local_interior + column] =
+                  !row_active && row == column ? 1.0 : 0.0;
+          }
+          for (int column = 0; column < local_trace; ++column)
+            if (!row_active || !trace_active(column))
+              system.b[b_offset + static_cast<std::size_t>(row) * local_trace +
+                       column] = 0.0;
+        }
+
+        for (int row = 0; row < local_trace; ++row)
+        {
+          const bool row_active = trace_active(row);
+          if (!row_active)
+          {
+            system.residual_trace[trace_offset + row] = 0.0;
+            system.g[trace_offset + row] = 0.0;
+          }
+          for (int column = 0; column < local_interior; ++column)
+            if (!row_active || !interior_active(column))
+              system.c[c_offset + static_cast<std::size_t>(row) *
+                                      local_interior + column] = 0.0;
+          for (int column = 0; column < local_trace; ++column)
+          {
+            if (!row_active || !trace_active(column))
+              system.d[d_offset + static_cast<std::size_t>(row) * local_trace +
+                       column] = !row_active && row == column ? 1.0 : 0.0;
+          }
+        }
+      }
+      return Finite(system.residual_interior) &&
+          Finite(system.residual_trace) && Finite(system.a) &&
+          Finite(system.b) && Finite(system.c) && Finite(system.d) &&
+          Finite(system.f) && Finite(system.g);
+    }
+    catch (...)
+    {
+      return false;
+    }
+  }
+
+  bool PartitionedStateHashes(StateHash& euler,
+                              StateHash& auxiliary) noexcept
+  {
+    euler = {};
+    auxiliary = {};
+    if (!RequiresPartitionedScalarClosure() || !iterate_interior ||
+        interior_components != igr_interior_components ||
+        trace_components != igr_trace_components ||
+        iterate_interior->Size() % interior_components != 0 ||
+        iterate_true_trace.Size() % trace_components != 0)
+    {
+      return false;
+    }
+    try
+    {
+      const double* interior = iterate_interior->HostRead();
+      const double* trace = iterate_true_trace.HostRead();
+      const int interior_scalar =
+          iterate_interior->Size() / interior_components;
+      const int trace_scalar =
+          iterate_true_trace.Size() / trace_components;
+      if ((!interior && iterate_interior->Size() != 0) ||
+          (!trace && iterate_true_trace.Size() != 0))
+      {
+        return false;
+      }
+      const std::size_t euler_interior =
+          static_cast<std::size_t>(cpu_conserved_components) * interior_scalar;
+      const std::size_t euler_trace =
+          static_cast<std::size_t>(cpu_conserved_components) * trace_scalar;
+      const std::size_t auxiliary_interior =
+          static_cast<std::size_t>(interior_components -
+                                   cpu_conserved_components) * interior_scalar;
+      const std::size_t auxiliary_trace =
+          static_cast<std::size_t>(trace_components -
+                                   cpu_conserved_components) * trace_scalar;
+      euler = HashPair(HashBytes(interior, euler_interior * sizeof(double)),
+                       HashBytes(trace, euler_trace * sizeof(double)));
+      auxiliary = HashPair(
+          HashBytes(interior ? interior + euler_interior : nullptr,
+                    auxiliary_interior * sizeof(double)),
+          HashBytes(trace ? trace + euler_trace : nullptr,
+                    auxiliary_trace * sizeof(double)));
+      return true;
+    }
+    catch (...)
+    {
+      euler = {};
+      auxiliary = {};
+      return false;
+    }
+  }
+
+  /** Global L2 norm of the algebraic IGR coefficients in the active state. */
+  bool PartitionedAuxiliaryNorm(double& norm) noexcept
+  {
+    norm = std::numeric_limits<double>::quiet_NaN();
+    bool local_ready = RequiresPartitionedScalarClosure() &&
+        iterate_interior &&
+        interior_components == igr_interior_components &&
+        trace_components == igr_trace_components &&
+        iterate_interior->Size() % interior_components == 0 &&
+        iterate_true_trace.Size() % trace_components == 0;
+    double local_squared = 0.0;
+    try
+    {
+      const double* const interior = local_ready
+          ? iterate_interior->HostRead() : nullptr;
+      const double* const trace = local_ready
+          ? iterate_true_trace.HostRead() : nullptr;
+      const int interior_scalar = local_ready
+          ? iterate_interior->Size() / interior_components : 0;
+      const int trace_scalar = local_ready
+          ? iterate_true_trace.Size() / trace_components : 0;
+      local_ready = local_ready &&
+          (interior || iterate_interior->Size() == 0) &&
+          (trace || iterate_true_trace.Size() == 0);
+      const auto accumulate = [&](const double value) noexcept
+      {
+        const double squared = value * value;
+        local_ready = local_ready && Finite(value) && Finite(squared) &&
+            squared <= std::numeric_limits<double>::max() - local_squared;
+        if (local_ready) local_squared += squared;
+      };
+      for (int component = cpu_conserved_components;
+           local_ready && component < interior_components; ++component)
+        for (int scalar = 0; scalar < interior_scalar; ++scalar)
+          accumulate(interior[ByNodes(
+              scalar, interior_scalar, component)]);
+      for (int component = cpu_conserved_components;
+           local_ready && component < trace_components; ++component)
+        for (int scalar = 0; scalar < trace_scalar; ++scalar)
+          accumulate(trace[ByNodes(scalar, trace_scalar, component)]);
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+
+    const double reduction_value = local_ready ? local_squared : 0.0;
+    double global_squared = 0.0;
+    const bool reduced = MPI_Allreduce(
+        &reduction_value, &global_squared, 1, MPI_DOUBLE, MPI_SUM,
+        communicator) == MPI_SUCCESS;
+    bool ready_everywhere = false;
+    if (!CollectiveDecision(local_ready && reduced, ready_everywhere) ||
+        !ready_everywhere || !Finite(global_squared) ||
+        global_squared < 0.0)
+    {
+      return false;
+    }
+    norm = std::sqrt(global_squared);
+    return Finite(norm);
+  }
+
+  /** Audit the identity-constrained auxiliary solve and freeze any roundoff. */
+  bool FreezePartitionedAuxiliaryIncrements() noexcept
+  {
+    bool local_ready = RequiresPartitionedScalarClosure() &&
+        grid_interior_increment.size() ==
+            static_cast<std::size_t>(iterate_interior->Size()) &&
+        true_increment.Size() == iterate_true_trace.Size() &&
+        local_trace_increment.size() ==
+            static_cast<std::size_t>(mesh->GetNE()) * local_trace;
+    double local_increment_maximum = 0.0;
+    double local_state_maximum = 0.0;
+    try
+    {
+      const double* interior = iterate_interior->HostRead();
+      const double* trace = iterate_true_trace.HostRead();
+      double* true_delta = true_increment.HostReadWrite();
+      const int interior_scalar = local_ready
+          ? iterate_interior->Size() / interior_components : 0;
+      const int trace_scalar = local_ready
+          ? iterate_true_trace.Size() / trace_components : 0;
+      local_ready = local_ready &&
+          iterate_interior->Size() % interior_components == 0 &&
+          iterate_true_trace.Size() % trace_components == 0 &&
+          (interior || iterate_interior->Size() == 0) &&
+          (trace || iterate_true_trace.Size() == 0) &&
+          (true_delta || true_increment.Size() == 0);
+      for (int component = cpu_conserved_components;
+           component < interior_components && local_ready; ++component)
+        for (int scalar = 0; scalar < interior_scalar; ++scalar)
+        {
+          const int index = ByNodes(scalar, interior_scalar, component);
+          local_increment_maximum = std::max(
+              local_increment_maximum,
+              std::abs(grid_interior_increment[static_cast<std::size_t>(index)]));
+          local_state_maximum = std::max(local_state_maximum,
+                                         std::abs(interior[index]));
+        }
+      for (int component = cpu_conserved_components;
+           component < trace_components && local_ready; ++component)
+        for (int scalar = 0; scalar < trace_scalar; ++scalar)
+        {
+          const int index = ByNodes(scalar, trace_scalar, component);
+          local_increment_maximum = std::max(local_increment_maximum,
+                                             std::abs(true_delta[index]));
+          local_state_maximum = std::max(local_state_maximum,
+                                         std::abs(trace[index]));
+        }
+      const int face_stride = scalar_trace_dofs * trace_components;
+      for (int element = 0; element < mesh->GetNE() && local_ready; ++element)
+        for (int local = 0; local < local_trace; ++local)
+          if ((local % face_stride) / scalar_trace_dofs >=
+              cpu_conserved_components)
+          {
+            const std::size_t index =
+                static_cast<std::size_t>(element) * local_trace + local;
+            local_increment_maximum = std::max(
+                local_increment_maximum, std::abs(local_trace_increment[index]));
+          }
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    // Establish rank-common readiness before entering the two reductions.  A
+    // local short circuit here would otherwise let one rank skip a collective
+    // that its peers enter after a rank-local validation failure.
+    if (!CollectiveAll(local_ready)) { return false; }
+    double maximum_increment = 0.0;
+    double maximum_state = 0.0;
+    const int increment_status = MPI_Allreduce(
+        &local_increment_maximum, &maximum_increment, 1, MPI_DOUBLE, MPI_MAX,
+        communicator);
+    const int state_status = MPI_Allreduce(
+        &local_state_maximum, &maximum_state, 1, MPI_DOUBLE, MPI_MAX,
+        communicator);
+    const bool reduced = increment_status == MPI_SUCCESS &&
+        state_status == MPI_SUCCESS;
+    const double tolerance = std::max(
+        64.0 * std::numeric_limits<double>::epsilon() * (1.0 + maximum_state),
+        config.true_residual_tolerance * (1.0 + maximum_state));
+    local_ready = reduced && Finite(maximum_increment) &&
+        Finite(maximum_state) && maximum_increment <= tolerance;
+    if (!CollectiveAll(local_ready)) { return false; }
+
+    try
+    {
+      double* true_delta = true_increment.HostReadWrite();
+      const int interior_scalar = iterate_interior->Size() / interior_components;
+      const int trace_scalar = iterate_true_trace.Size() / trace_components;
+      for (int component = cpu_conserved_components;
+           component < interior_components; ++component)
+        for (int scalar = 0; scalar < interior_scalar; ++scalar)
+          grid_interior_increment[static_cast<std::size_t>(
+              ByNodes(scalar, interior_scalar, component))] = 0.0;
+      for (int component = cpu_conserved_components;
+           component < trace_components; ++component)
+        for (int scalar = 0; scalar < trace_scalar; ++scalar)
+          true_delta[ByNodes(scalar, trace_scalar, component)] = 0.0;
+      const int face_stride = scalar_trace_dofs * trace_components;
+      for (int element = 0; element < mesh->GetNE(); ++element)
+        for (int local = 0; local < local_trace; ++local)
+          if ((local % face_stride) / scalar_trace_dofs >=
+              cpu_conserved_components)
+            local_trace_increment[static_cast<std::size_t>(element) *
+                                      local_trace + local] = 0.0;
+      local_ready = Finite(grid_interior_increment) && Finite(true_increment) &&
+          Finite(local_trace_increment);
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    return CollectiveAll(local_ready);
+  }
 
   double ResidualNorm(const LocalSystem& system,
                       const bool consume_internal_test_hooks = true) noexcept
@@ -4483,12 +4949,10 @@ struct detail::CpuNumericsCore::Implementation
               static_cast<std::size_t>(element) * system.trace_dofs + local];
         }
       for (const double value : system.residual_interior)
-      {
         local_interior_squared += value * value;
-      }
       local_prepared = local_prepared && Finite(local_trace_residual) &&
-          Finite(local_interior_squared) &&
-          trace_space && trace_space->Dof_TrueDof_Matrix() &&
+          Finite(local_interior_squared) && trace_space &&
+          trace_space->Dof_TrueDof_Matrix() &&
           (!consume_internal_test_hooks ||
            !ConsumeOwnedCollectiveTestFault(
                detail::CpuCollectiveTestFault::residual_map_preparation, rank,
@@ -4655,7 +5119,8 @@ struct detail::CpuNumericsCore::Implementation
       const mfem::ParGridFunction& current_trace,
       const double dt,
       double& maximum_error,
-      double& maximum_relative_error) noexcept
+      double& maximum_relative_error,
+      const bool euler_only = false) noexcept
   {
     const auto assembly_orders = EffectiveAssemblyQuadratureOrders(config);
     maximum_error = 0.0;
@@ -4972,7 +5437,8 @@ struct detail::CpuNumericsCore::Implementation
     {
       return false;
     }
-    const int components = IsIgr() ? 5 : cpu_conserved_components;
+    const int components = IsIgr() && !euler_only
+        ? 5 : cpu_conserved_components;
     for (int component = 0; component < components; ++component)
     {
       const double error = std::abs(global_balance[component]);
@@ -5503,6 +5969,372 @@ struct detail::CpuNumericsCore::Implementation
     return CollectiveAll(local_recovery_ready);
   }
 
+  bool ApplyScalarConstraintIncrement() noexcept
+  {
+    bool local_ready = RequiresPartitionedScalarClosure();
+    try
+    {
+      double* interior = iterate_interior->HostReadWrite();
+      double* trace = iterate_true_trace.HostReadWrite();
+      const double* trace_increment = true_increment.HostRead();
+      const int interior_size = iterate_interior->Size();
+      const int trace_size = iterate_true_trace.Size();
+      local_ready = local_ready && interior_size % interior_components == 0 &&
+          trace_size % trace_components == 0 &&
+          grid_interior_increment.size() ==
+              static_cast<std::size_t>(interior_size) &&
+          (interior || interior_size == 0) && (trace || trace_size == 0) &&
+          (trace_increment || trace_size == 0);
+      const int interior_scalar = local_ready
+          ? interior_size / interior_components : 0;
+      const int trace_scalar = local_ready ? trace_size / trace_components : 0;
+      double frozen_increment_maximum = 0.0;
+      double frozen_state_maximum = 0.0;
+      for (int component = 0;
+           component < interior_components && local_ready; ++component)
+        for (int scalar = 0; scalar < interior_scalar; ++scalar)
+        {
+          const int index = ByNodes(scalar, interior_scalar, component);
+          if (component < cpu_conserved_components)
+          {
+            frozen_increment_maximum = std::max(
+                frozen_increment_maximum,
+                std::abs(grid_interior_increment[
+                    static_cast<std::size_t>(index)]));
+            frozen_state_maximum =
+                std::max(frozen_state_maximum, std::abs(interior[index]));
+          }
+          else
+          {
+            interior[index] += grid_interior_increment[
+                static_cast<std::size_t>(index)];
+          }
+        }
+      for (int component = 0;
+           component < trace_components && local_ready; ++component)
+        for (int scalar = 0; scalar < trace_scalar; ++scalar)
+        {
+          const int index = ByNodes(scalar, trace_scalar, component);
+          if (component < cpu_conserved_components)
+          {
+            frozen_increment_maximum = std::max(
+                frozen_increment_maximum, std::abs(trace_increment[index]));
+            frozen_state_maximum =
+                std::max(frozen_state_maximum, std::abs(trace[index]));
+          }
+          else
+          {
+            trace[index] += trace_increment[index];
+          }
+        }
+      const double frozen_tolerance = std::max(
+          64.0 * std::numeric_limits<double>::epsilon() *
+              (1.0 + frozen_state_maximum),
+          config.true_residual_tolerance * (1.0 + frozen_state_maximum));
+      local_ready = local_ready && Finite(frozen_increment_maximum) &&
+          frozen_increment_maximum <= frozen_tolerance &&
+          Finite(*iterate_interior) && Finite(iterate_true_trace);
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    if (!CollectiveAll(local_ready)) { return false; }
+    return LoadTrace(iterate_true_trace, *iterate_trace);
+  }
+
+  bool SolveScalarConstraintImpl(
+      const CpuFailureInjection* injection, CpuAttemptEvidence* attempt,
+      double& maximum_true_residual, double& closure_residual,
+      CpuFailurePhase& failure_phase, bool& injected_failure) noexcept
+  {
+    failure_phase = CpuFailurePhase::none;
+    injected_failure = false;
+    const auto fail_phase = [&](const CpuFailurePhase phase,
+                                const bool injected) noexcept
+    {
+      failure_phase = phase;
+      injected_failure = injected;
+      return false;
+    };
+    const auto enter_phase = [&](const CpuFailurePhase phase) noexcept
+    {
+      return attempt == nullptr ||
+          (injection != nullptr && EnterPhase(*injection, phase));
+    };
+    const auto complete_phase = [&]() noexcept
+    {
+      if (attempt != nullptr) { CompletePhase(); }
+    };
+
+    if (!enter_phase(CpuFailurePhase::assembly))
+      return fail_phase(CpuFailurePhase::assembly, true);
+    if (!Assemble(*iterate_interior, *iterate_trace, current_system,
+                  EffectiveAssemblyQuadratureOrders(config), true, nullptr,
+                  nullptr, true) ||
+        !MaskScalarConstraint(current_system))
+    {
+      return fail_phase(CpuFailurePhase::assembly, false);
+    }
+    if (attempt != nullptr) { ++attempt->work.complete_assemblies; }
+    complete_phase();
+    const double initial_residual = ResidualNorm(current_system);
+    if (!Finite(initial_residual) || initial_residual < 0.0)
+      return fail_phase(CpuFailurePhase::assembly, false);
+
+    if (!enter_phase(CpuFailurePhase::condensation))
+      return fail_phase(CpuFailurePhase::condensation, true);
+    StateHash matrix_hash{};
+    std::uint64_t matrix_generation = 0;
+    if (!CondenseAndAssemble(current_system, matrix_hash, matrix_generation))
+      return fail_phase(CpuFailurePhase::condensation, false);
+    if (attempt != nullptr) { ++attempt->work.complete_condensations; }
+    complete_phase();
+
+    if (!enter_phase(CpuFailurePhase::trace_solve))
+      return fail_phase(CpuFailurePhase::trace_solve, true);
+    double true_residual = 0.0;
+    int iterations = 0;
+    int solve_attempts = 0;
+    int tightenings = 0;
+    StateHash factor_hash{}, solution_hash{};
+    std::uint64_t factor_generation = 0;
+    bool factor_current = false;
+    if (!SolveTrace(matrix_generation,
+                    generic::EulerHdgLinearSolveRole::final_coherent,
+                    true_residual, iterations, solve_attempts, tightenings,
+                    factor_hash, solution_hash, factor_generation,
+                    factor_current) ||
+        !Finite(true_increment))
+    {
+      return fail_phase(CpuFailurePhase::trace_solve, false);
+    }
+    if (iterations < 0 || solve_attempts < 0 || tightenings < 0 ||
+        (attempt != nullptr && (attempt->linear_iterations >
+            std::numeric_limits<int>::max() - iterations ||
+        attempt->linear_solve_attempts >
+            std::numeric_limits<int>::max() - solve_attempts ||
+        attempt->true_residual_tightenings >
+            std::numeric_limits<int>::max() - tightenings ||
+        attempt->final_coherent_linear_iterations >
+            std::numeric_limits<int>::max() - iterations ||
+        attempt->scalar_closure_linear_iterations >
+            std::numeric_limits<int>::max() - iterations ||
+        attempt->scalar_closure_linear_solve_attempts >
+            std::numeric_limits<int>::max() - solve_attempts ||
+        attempt->scalar_closure_true_residual_tightenings >
+            std::numeric_limits<int>::max() - tightenings)))
+    {
+      return fail_phase(CpuFailurePhase::trace_solve, false);
+    }
+    if (attempt != nullptr)
+    {
+      attempt->linear_iterations += iterations;
+      attempt->linear_solve_attempts += solve_attempts;
+      attempt->true_residual_tightenings += tightenings;
+      attempt->final_coherent_linear_iterations += iterations;
+      attempt->scalar_closure_linear_iterations += iterations;
+      attempt->scalar_closure_linear_solve_attempts += solve_attempts;
+      attempt->scalar_closure_true_residual_tightenings += tightenings;
+      if (factor_current) { ++attempt->work.complete_factor_setups; }
+      ++attempt->work.complete_trace_solves;
+      ++attempt->work.complete_scalar_closure_solves;
+    }
+    maximum_true_residual = std::max(maximum_true_residual, true_residual);
+    complete_phase();
+
+    if (!enter_phase(CpuFailurePhase::recovery))
+      return fail_phase(CpuFailurePhase::recovery, true);
+    if (!Recover() || !ApplyScalarConstraintIncrement())
+      return fail_phase(CpuFailurePhase::recovery, false);
+    if (attempt != nullptr) { ++attempt->work.complete_recoveries; }
+    complete_phase();
+
+    // Reassemble the exact projected state.  This unmasked system is retained
+    // for the following Euler spatial evaluation; a copy is masked only for
+    // the scalar post-solve coherence check.
+    if (!enter_phase(CpuFailurePhase::assembly))
+      return fail_phase(CpuFailurePhase::assembly, true);
+    if (!Assemble(*iterate_interior, *iterate_trace, current_system,
+                  EffectiveAssemblyQuadratureOrders(config), true, nullptr,
+                  nullptr, true))
+    {
+      return fail_phase(CpuFailurePhase::assembly, false);
+    }
+    if (attempt != nullptr) { ++attempt->work.complete_assemblies; }
+    complete_phase();
+    try
+    {
+      CopySystem(current_system, trial_system);
+    }
+    catch (...)
+    {
+      return fail_phase(CpuFailurePhase::assembly, false);
+    }
+    if (!MaskScalarConstraint(trial_system))
+      return fail_phase(CpuFailurePhase::assembly, false);
+    closure_residual = ResidualNorm(trial_system);
+    double auxiliary_norm = std::numeric_limits<double>::quiet_NaN();
+    if (!PartitionedAuxiliaryNorm(auxiliary_norm))
+      return fail_phase(CpuFailurePhase::recovery, false);
+    const double tolerance = config.true_residual_tolerance *
+        std::max(auxiliary_norm, 1.0);
+    const double relative_closure_residual = closure_residual /
+        std::max(auxiliary_norm, 1.0);
+    if (!Finite(closure_residual) || !Finite(tolerance) ||
+        !Finite(relative_closure_residual) || closure_residual > tolerance)
+      return fail_phase(CpuFailurePhase::recovery, false);
+    maximum_true_residual = std::max(
+        maximum_true_residual, relative_closure_residual);
+    return true;
+  }
+
+  bool SolveScalarConstraint(
+      const CpuFailureInjection& injection, CpuAttemptEvidence& attempt,
+      double& maximum_true_residual, double& closure_residual,
+      CpuFailurePhase& failure_phase, bool& injected_failure) noexcept
+  {
+    return SolveScalarConstraintImpl(
+        &injection, &attempt, maximum_true_residual, closure_residual,
+        failure_phase, injected_failure);
+  }
+
+  bool ProjectScalarConstraintWithoutAttempt(
+      double& maximum_true_residual, double& closure_residual) noexcept
+  {
+    CpuFailurePhase failure_phase = CpuFailurePhase::none;
+    bool injected_failure = false;
+    return SolveScalarConstraintImpl(
+        nullptr, nullptr, maximum_true_residual, closure_residual,
+        failure_phase, injected_failure) &&
+        failure_phase == CpuFailurePhase::none && !injected_failure;
+  }
+
+  bool ValidateScalarConstraintState(
+      const CpuStateSlot& slot, double& closure_residual,
+      double& closure_tolerance) noexcept
+  {
+    closure_residual = 0.0;
+    closure_tolerance = 0.0;
+    if (!RequiresPartitionedScalarClosure()) { return true; }
+    const CpuSlotStorage* const storage = Storage(slot);
+    bool local_ready = storage != nullptr && iterate_interior && iterate_trace &&
+        storage->interior.size() ==
+            static_cast<std::size_t>(iterate_interior->Size()) &&
+        storage->trace.size() ==
+            static_cast<std::size_t>(iterate_true_trace.Size());
+    if (local_ready)
+    {
+      local_ready = Assign(*iterate_interior, storage->interior) &&
+          Assign(iterate_true_trace, storage->trace);
+    }
+    if (!CollectiveAll(local_ready) ||
+        !LoadTrace(iterate_true_trace, *iterate_trace))
+    {
+      return false;
+    }
+    local_ready = Assemble(*iterate_interior, *iterate_trace, current_system,
+                           EffectiveAssemblyQuadratureOrders(config), true,
+                           nullptr, nullptr, true);
+    if (local_ready) { local_ready = MaskScalarConstraint(current_system); }
+    if (!CollectiveAll(local_ready)) { return false; }
+    closure_residual = ResidualNorm(current_system, false);
+    const std::size_t interior_scalar_count =
+        storage->interior.size() /
+        static_cast<std::size_t>(interior_components);
+    const std::size_t trace_scalar_count =
+        storage->trace.size() / static_cast<std::size_t>(trace_components);
+    bool local_auxiliary_finite =
+        storage->interior.size() %
+                static_cast<std::size_t>(interior_components) == 0 &&
+        storage->trace.size() %
+                static_cast<std::size_t>(trace_components) == 0;
+    double local_auxiliary_squared = 0.0;
+    const auto accumulate_auxiliary =
+        [&local_auxiliary_finite, &local_auxiliary_squared](
+            const double value) noexcept
+        {
+          const double squared = value * value;
+          local_auxiliary_finite = local_auxiliary_finite && Finite(value) &&
+              Finite(squared) && squared <=
+                  std::numeric_limits<double>::max() -
+                      local_auxiliary_squared;
+          if (local_auxiliary_finite) local_auxiliary_squared += squared;
+        };
+    for (int component = cpu_conserved_components;
+         local_auxiliary_finite && component < interior_components;
+         ++component)
+      for (std::size_t scalar = 0; scalar < interior_scalar_count; ++scalar)
+        accumulate_auxiliary(storage->interior[
+            static_cast<std::size_t>(component) * interior_scalar_count +
+            scalar]);
+    for (int component = cpu_conserved_components;
+         local_auxiliary_finite && component < trace_components; ++component)
+      for (std::size_t scalar = 0; scalar < trace_scalar_count; ++scalar)
+        accumulate_auxiliary(storage->trace[
+            static_cast<std::size_t>(component) * trace_scalar_count +
+            scalar]);
+    // Every rank enters the reduction even when its local checkpoint payload
+    // is nonfinite.  The separate collective validity decision then rejects
+    // the state without allowing rank-divergent control flow.
+    const double reduction_value =
+        local_auxiliary_finite ? local_auxiliary_squared : 0.0;
+    double global_auxiliary_squared = 0.0;
+    const bool reduced = MPI_Allreduce(
+        &reduction_value, &global_auxiliary_squared, 1, MPI_DOUBLE, MPI_SUM,
+        communicator) == MPI_SUCCESS;
+    bool auxiliary_finite = false;
+    const bool auxiliary_decided = CollectiveDecision(
+        local_auxiliary_finite && reduced, auxiliary_finite);
+    closure_tolerance = auxiliary_decided && auxiliary_finite &&
+            Finite(global_auxiliary_squared) &&
+            global_auxiliary_squared >= 0.0
+        ? config.true_residual_tolerance * std::max(
+              std::sqrt(global_auxiliary_squared), 1.0)
+        : std::numeric_limits<double>::quiet_NaN();
+    return CollectiveAll(Finite(closure_residual) &&
+                         Finite(closure_tolerance) &&
+                         closure_residual <= closure_tolerance);
+  }
+
+  bool EstablishInitialScalarClosure() noexcept
+  {
+    if (!RequiresPartitionedScalarClosure()) { return true; }
+    const CpuSlotStorage* const committed = Committed();
+    bool local_ready = committed != nullptr && iterate_interior &&
+        old_interior && iterate_trace &&
+        Assign(*old_interior, committed->interior) &&
+        Assign(*iterate_interior, committed->interior) &&
+        Assign(iterate_true_trace, committed->trace);
+    if (!CollectiveAll(local_ready) ||
+        !LoadTrace(iterate_true_trace, *iterate_trace))
+    {
+      return false;
+    }
+    StateHash euler_before{};
+    StateHash auxiliary_before{};
+    StateHash euler_after{};
+    StateHash auxiliary_after{};
+    double maximum_true_residual = 0.0;
+    double closure_residual = 0.0;
+    local_ready = PartitionedStateHashes(euler_before, auxiliary_before);
+    if (!CollectiveAll(local_ready) ||
+        !ProjectScalarConstraintWithoutAttempt(maximum_true_residual,
+                                               closure_residual))
+    {
+      return false;
+    }
+    local_ready = PartitionedStateHashes(euler_after, auxiliary_after) &&
+        euler_after == euler_before && Finite(maximum_true_residual) &&
+        Finite(closure_residual) &&
+        Copy(*iterate_interior, Committed()->interior) &&
+        Copy(iterate_true_trace, Committed()->trace) &&
+        CopySlot(committed_slot, candidate_slot);
+    if (!CollectiveAll(local_ready)) { return false; }
+    CertifyCommittedScalarClosure();
+    return CommittedScalarClosureCertified();
+  }
+
   bool MakeTrial(const double alpha) noexcept
   {
     bool local_trial_ready = true;
@@ -5764,7 +6596,10 @@ bool detail::CpuNumericsCore::InitializeBorrowedEuler(
 {
   if (!generic::ExactNumericalPolicyConsensus(request.communicator,
                                               request.numerical_policy) ||
-      !generic::ValidEulerHdgNumericalPolicy(request.numerical_policy))
+      !generic::ValidEulerHdgNumericalPolicy(request.numerical_policy) ||
+      !generic::ExactEulerHdgTimeTreatmentConsensus(
+          request.communicator, request.time_treatment) ||
+      !generic::IsKnownEulerHdgTimeTreatment(request.time_treatment))
   {
     return false;
   }
@@ -5809,7 +6644,11 @@ bool detail::CpuNumericsCore::InitializeBorrowedEuler(
       request.numerical_policy.stabilization.kind == generic::RegularizationKind::igr
           ? "igr.scalar.traced.alpha-beta.v1"
           : ::dg::hdg::runtime::borrowed_euler_llf_stabilization_id);
-  tuple.time_treatment = StableIdentity::Copy("backward-euler.v1");
+  tuple.time_treatment = StableIdentity::Copy(
+      request.time_treatment ==
+              generic::EulerHdgTimeTreatment::partitioned_backward_euler
+          ? "partitioned-backward-euler.v1"
+          : "backward-euler.v1");
   tuple.backend = StableIdentity::Copy("cpu.host.v1");
   tuple.precision = StableIdentity::Copy("fp64.v1");
 
@@ -6542,6 +7381,21 @@ bool detail::CpuNumericsCore::AuditLastBorrowedEulerConservation(
   return true;
 }
 
+bool detail::CpuNumericsCore::AuditCommittedScalarClosure(
+    double& residual, double& tolerance) noexcept
+{
+  residual = std::numeric_limits<double>::infinity();
+  tolerance = std::numeric_limits<double>::infinity();
+  if (!implementation_) { return false; }
+  Implementation& state = *implementation_;
+  bool certified = false;
+  return state.CollectiveDecision(
+             state.initialized && state.CommittedScalarClosureCertified(),
+             certified) &&
+      certified && state.ValidateScalarConstraintState(
+          state.committed_slot, residual, tolerance);
+}
+
 bool detail::CpuNumericsCore::AdvanceBorrowedEuler(
     const double dt, StateCoordinates& coordinates) noexcept
 {
@@ -6674,6 +7528,8 @@ bool detail::CpuNumericsCore::CommitBorrowedEuler(
       maximum_status == MPI_SUCCESS && minimum_generation == maximum_generation;
   const bool local_valid = state.initialized && state.IsBorrowed() &&
       state.borrowed_prepare_active && CandidateGenerationActive(generation) &&
+      (!state.RequiresPartitionedScalarClosure() ||
+       state.active_candidate_scalar_closure_coherent) &&
       ::dg::hdg::runtime::detail::SameCoordinates(
           coordinates, state.active_evidence.attempt.entry_coordinates) &&
       CpuStateStoragePolicy::CanPublish(state.committed_slot,
@@ -6713,6 +7569,8 @@ bool detail::CpuNumericsCore::CommitBorrowedEuler(
     return false;
   }
   CpuStateStoragePolicy::Publish(state.committed_slot, state.candidate_slot);
+  if (state.RequiresPartitionedScalarClosure())
+    state.CertifyCommittedScalarClosure();
   coordinates.time += attempt.dt;
   ++coordinates.step;
   ++coordinates.generation;
@@ -6786,6 +7644,10 @@ bool detail::CpuNumericsCore::InitializeInternal(
   bool local_ok = mpi_initialized != 0 && mpi_finalized == 0 &&
       MPI_Comm_rank(state.communicator, &state.rank) == MPI_SUCCESS &&
       MPI_Comm_size(state.communicator, &state.ranks) == MPI_SUCCESS &&
+      (!generic || borrowed_request->time_treatment ==
+              generic::EulerHdgTimeTreatment::backward_euler ||
+       borrowed_request->time_treatment ==
+              generic::EulerHdgTimeTreatment::partitioned_backward_euler) &&
       (generic ? state.ranks >= 1 && borrowed_request->mesh != nullptr
                : (state.ranks == 1 || state.ranks == 2) && ExactConfig(config) &&
                      ExactRankShape(config, state.ranks) && config_consensus &&
@@ -7157,6 +8019,11 @@ bool detail::CpuNumericsCore::InitializeInternal(
       CopySlot(state.committed_slot, state.candidate_slot);
   if (!state.CollectiveAll(local_ok)) { return false; }
 
+  // Partitioned IGR owns an algebraic state at t=0.  Establish that closure
+  // before the lifecycle becomes observable; this changes no coordinates and
+  // deliberately contributes no attempt or accepted-step accounting.
+  if (!state.EstablishInitialScalarClosure()) { return false; }
+
   // Prove the exact storage semantics required by the accepted two-phase
   // contract using distinct old/new bytes, then restore the initialization
   // state before the contract observes either slot.
@@ -7394,6 +8261,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   CpuAttemptEvidence& evidence = workspace.attempt;
   state.active_candidate_generation = 0;
   state.active_candidate_state_hash = {};
+  state.active_candidate_scalar_closure_coherent = false;
   state.publication_chain_authority = false;
   evidence.identity = attempt;
   evidence.entry_coordinates = coordinates;
@@ -7457,7 +8325,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       *state.old_interior, state.Committed()->interior);
   bool iterate_assigned = false;
   bool trace_assigned = false;
-  if (coordinates.step == 0)
+  if (coordinates.step == 0 && !state.RequiresPartitionedScalarClosure())
   {
     iterate_assigned = AssignGridFunction(
         *state.iterate_interior, state.first_iterate_interior);
@@ -7479,6 +8347,60 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       state.LoadTrace(state.iterate_true_trace, *state.iterate_trace);
   if (!state.CollectiveAll(trace_loaded)) { return fail(CpuFailurePhase::setup); }
 
+  double maximum_true_residual = 0.0;
+  double final_scalar_closure_residual = 0.0;
+  std::uint64_t scalar_closure_solves = 0;
+  bool scalar_closure_coherent =
+      !state.RequiresPartitionedScalarClosure();
+  StateHash frozen_euler_hash{};
+  StateHash frozen_auxiliary_hash{};
+  if (state.RequiresPartitionedScalarClosure())
+  {
+    // The sequential Euler solve consumes a coherent a^n.  A supplied initial
+    // auxiliary field is intentionally not trusted as such; after the first
+    // successful commit the final projection becomes the next step's witness.
+    bool committed_scalar_closure_certified = false;
+    if (!state.CollectiveDecision(
+            state.CommittedScalarClosureCertified(),
+            committed_scalar_closure_certified))
+    {
+      return fail(CpuFailurePhase::setup);
+    }
+    if (!committed_scalar_closure_certified)
+    {
+      StateHash euler_before_initial_projection{};
+      StateHash auxiliary_before_initial_projection{};
+      if (!state.CollectiveAll(state.PartitionedStateHashes(
+              euler_before_initial_projection,
+              auxiliary_before_initial_projection)))
+      {
+        return fail(CpuFailurePhase::setup);
+      }
+      CpuFailurePhase closure_phase = CpuFailurePhase::none;
+      bool injected_failure = false;
+      if (!state.SolveScalarConstraint(
+              injection, evidence, maximum_true_residual,
+              final_scalar_closure_residual, closure_phase, injected_failure))
+      {
+        return fail(closure_phase,
+                    injected_failure ? CpuAttemptStatus::injected_failure
+                                     : CpuAttemptStatus::runtime_failure);
+      }
+      ++scalar_closure_solves;
+      if (!state.CollectiveAll(state.PartitionedStateHashes(
+              frozen_euler_hash, frozen_auxiliary_hash) &&
+              frozen_euler_hash == euler_before_initial_projection))
+      {
+        return fail(CpuFailurePhase::recovery);
+      }
+    }
+    else if (!state.CollectiveAll(state.PartitionedStateHashes(
+                 frozen_euler_hash, frozen_auxiliary_hash)))
+    {
+      return fail(CpuFailurePhase::setup);
+    }
+  }
+
   double initial_density = 0.0;
   double initial_pressure = 0.0;
   double initial_wave = 0.0;
@@ -7497,6 +8419,8 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   bool assembled = state.Assemble(
       *state.iterate_interior, *state.iterate_trace, state.current_system,
       EffectiveAssemblyQuadratureOrders(state.config));
+  if (assembled && state.RequiresPartitionedScalarClosure())
+    assembled = state.MaskPartitionedEulerSystem(state.current_system);
   const bool assembly_fault = ConsumeOwnedCollectiveTestFault(
       detail::CpuCollectiveTestFault::assembly_completion, state.rank,
       state.incarnation);
@@ -7537,7 +8461,6 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   int updates = 0;
   bool recovered = false;
   bool final_reconstruction_validated = false;
-  double maximum_true_residual = 0.0;
   while (true)
   {
     const bool candidate_converged =
@@ -7667,7 +8590,12 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       return fail(CpuFailurePhase::recovery,
                   CpuAttemptStatus::injected_failure);
     }
-    if (!state.Recover()) { return fail(CpuFailurePhase::recovery); }
+    if (!state.Recover() ||
+        (state.RequiresPartitionedScalarClosure() &&
+         !state.FreezePartitionedAuxiliaryIncrements()))
+    {
+      return fail(CpuFailurePhase::recovery);
+    }
     ++evidence.work.complete_recoveries;
     state.CompletePhase();
     recovered = true;
@@ -7733,7 +8661,10 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       const bool trial_assembled = state.Assemble(
           *state.trial_interior, *state.trial_trace, state.trial_system,
           EffectiveAssemblyQuadratureOrders(state.config));
-      if (!state.CollectiveAll(trial_assembled))
+      const bool trial_system_ready = trial_assembled &&
+          (!state.RequiresPartitionedScalarClosure() ||
+           state.MaskPartitionedEulerSystem(state.trial_system));
+      if (!state.CollectiveAll(trial_system_ready))
       {
         return fail(CpuFailurePhase::assembly);
       }
@@ -7781,12 +8712,78 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
 
   evidence.nonlinear_updates = updates;
   evidence.final_nonlinear_residual = residual;
-  evidence.maximum_true_relative_residual = maximum_true_residual;
   const bool nonlinear_converged =
       residual <= state.config.nonlinear_tolerance *
           (1.0 + evidence.initial_nonlinear_residual);
+  if (!state.CollectiveAll(nonlinear_converged && recovered &&
+                           final_reconstruction_validated))
+  {
+    return fail(CpuFailurePhase::recovery);
+  }
+
+  workspace.maximum_conservation_error = 0.0;
+  workspace.maximum_conservation_relative_error = 0.0;
+  workspace.conservation_gate = !state.IsBorrowed();
+  if (state.RequiresPartitionedScalarClosure())
+  {
+    StateHash euler_before_projection{};
+    StateHash auxiliary_after_euler{};
+    const bool auxiliary_frozen = state.PartitionedStateHashes(
+        euler_before_projection, auxiliary_after_euler) &&
+        auxiliary_after_euler == frozen_auxiliary_hash;
+    if (!state.CollectiveAll(auxiliary_frozen))
+    {
+      return fail(CpuFailurePhase::recovery);
+    }
+
+    // Audit the four conservative equations before replacing a^n with the
+    // coherent a^{n+1}; the algebraic closure is deliberately not part of this
+    // time-step balance.
+    double conservation_error = 0.0;
+    double conservation_relative_error = 0.0;
+    const bool conservation_balanced = state.ConservationBalance(
+        *state.iterate_interior, *state.iterate_trace, attempt.dt,
+        conservation_error, conservation_relative_error, true);
+    workspace.maximum_conservation_error = conservation_error;
+    workspace.maximum_conservation_relative_error =
+        conservation_relative_error;
+    workspace.conservation_gate = conservation_balanced &&
+        conservation_relative_error <=
+            state.config.conservation_relative_tolerance;
+    if (!state.CollectiveAll(workspace.conservation_gate))
+    {
+      return fail(CpuFailurePhase::diagnostics);
+    }
+
+    CpuFailurePhase closure_phase = CpuFailurePhase::none;
+    bool injected_failure = false;
+    if (!state.SolveScalarConstraint(
+            injection, evidence, maximum_true_residual,
+            final_scalar_closure_residual, closure_phase, injected_failure))
+    {
+      return fail(closure_phase,
+                  injected_failure ? CpuAttemptStatus::injected_failure
+                                   : CpuAttemptStatus::runtime_failure);
+    }
+    ++scalar_closure_solves;
+    StateHash euler_after_projection{};
+    StateHash auxiliary_after_projection{};
+    scalar_closure_coherent = state.PartitionedStateHashes(
+        euler_after_projection, auxiliary_after_projection) &&
+        euler_after_projection == euler_before_projection &&
+        Finite(final_scalar_closure_residual);
+    if (!state.CollectiveAll(scalar_closure_coherent))
+    {
+      return fail(CpuFailurePhase::recovery);
+    }
+    workspace.current_newton.candidate_state_hash = HashPair(
+        HashVector(*state.iterate_interior),
+        HashVector(state.iterate_true_trace));
+  }
+
+  evidence.maximum_true_relative_residual = maximum_true_residual;
   const std::uint64_t expected_reconstructions =
-      static_cast<std::uint64_t>(updates) + 1U;
+      static_cast<std::uint64_t>(updates) + 1U + scalar_closure_solves;
   const bool factor_setup_census_exact =
       evidence.work.complete_factor_setups ==
           evidence.work.complete_trace_solves &&
@@ -7803,10 +8800,24 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
               evidence.final_coherent_linear_iterations &&
       evidence.linear_solve_attempts ==
           static_cast<int>(evidence.work.complete_trace_solves) +
-              evidence.true_residual_tightenings;
+              evidence.true_residual_tightenings &&
+      evidence.work.complete_scalar_closure_solves ==
+          scalar_closure_solves &&
+      evidence.scalar_closure_linear_iterations >= 0 &&
+      evidence.scalar_closure_linear_iterations <=
+          evidence.final_coherent_linear_iterations &&
+      evidence.scalar_closure_linear_solve_attempts >=
+          static_cast<int>(scalar_closure_solves) &&
+      evidence.scalar_closure_linear_solve_attempts <=
+          evidence.linear_solve_attempts &&
+      evidence.scalar_closure_true_residual_tightenings >= 0 &&
+      evidence.scalar_closure_true_residual_tightenings <=
+          evidence.true_residual_tightenings &&
+      evidence.scalar_closure_linear_solve_attempts ==
+          static_cast<int>(scalar_closure_solves) +
+              evidence.scalar_closure_true_residual_tightenings;
   if (!state.CollectiveAll(
-          nonlinear_converged && recovered &&
-          final_reconstruction_validated && factor_setup_census_exact &&
+          factor_setup_census_exact &&
           linear_work_census_exact))
   {
     return fail(CpuFailurePhase::recovery);
@@ -7831,6 +8842,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   evidence.candidate_generation = workspace.current_newton.candidate_generation;
   state.active_candidate_generation = workspace.current_newton.candidate_generation;
   state.active_candidate_state_hash = stored_candidate_hash;
+  state.active_candidate_scalar_closure_coherent = scalar_closure_coherent;
   state.publication_chain_authority = true;
 
   if (!state.EnterPhase(injection,
@@ -7855,10 +8867,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
   {
     return fail(CpuFailurePhase::diagnostics);
   }
-  workspace.maximum_conservation_error = 0.0;
-  workspace.maximum_conservation_relative_error = 0.0;
-  workspace.conservation_gate = false;
-  if (state.IsBorrowed())
+  if (state.IsBorrowed() && !state.RequiresPartitionedScalarClosure())
   {
     double conservation_error = 0.0;
     double conservation_relative_error = 0.0;
@@ -7887,8 +8896,8 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       ? final_density > 0.0 && final_pressure > 0.0 && Finite(final_wave)
       : final_density >= density_gate && final_pressure >= pressure_gate &&
             final_wave < cpu_fixed_tau;
-  evidence.recovery_gate = recovered;
-  evidence.nonlinear_gate = nonlinear_converged;
+  evidence.recovery_gate = recovered && scalar_closure_coherent;
+  evidence.nonlinear_gate = nonlinear_converged && scalar_closure_coherent;
   evidence.true_residual_gate = maximum_true_residual <=
       state.config.true_residual_tolerance;
   if (state.config.force_private_scientific_gate_failure)
@@ -7930,6 +8939,11 @@ void detail::CpuNumericsCore::Complete(
   if (outcome.committed)
   {
     attempt.status = CpuAttemptStatus::success;
+    if (state.RequiresPartitionedScalarClosure() &&
+        state.active_candidate_scalar_closure_coherent)
+    {
+      state.CertifyCommittedScalarClosure();
+    }
     state.evidence.accepted.valid = true;
     state.evidence.accepted.coordinates = coordinates;
     state.evidence.accepted.interior_hash =
@@ -7971,7 +8985,8 @@ bool detail::CpuNumericsCore::CaptureCheckpoint(
     CpuCheckpoint& checkpoint) noexcept
 {
   Implementation& state = *implementation_;
-  if (!state.initialized || !descriptor.successful_commit || checkpoint.valid)
+  if (!state.initialized || !descriptor.successful_commit || checkpoint.valid ||
+      !state.CommittedScalarClosureCertified())
   {
     return false;
   }
@@ -7994,6 +9009,19 @@ bool detail::CpuNumericsCore::CaptureCheckpoint(
   return true;
 }
 
+bool detail::CpuNumericsCore::ValidateRestoredScalarClosure(
+    const CpuStateSlot& loaded) noexcept
+{
+  if (!implementation_) { return false; }
+  Implementation& state = *implementation_;
+  if (!state.RequiresPartitionedScalarClosure()) { return true; }
+  if (!state.initialized || state.borrowed_prepare_active) { return false; }
+  double closure_residual = std::numeric_limits<double>::quiet_NaN();
+  double closure_tolerance = std::numeric_limits<double>::quiet_NaN();
+  return state.ValidateScalarConstraintState(
+      loaded, closure_residual, closure_tolerance);
+}
+
 void detail::CpuNumericsCore::CompleteRestore(
     const RestoreOutcome& outcome,
     const StateCoordinates& coordinates,
@@ -8001,6 +9029,7 @@ void detail::CpuNumericsCore::CompleteRestore(
 {
   Implementation& state = *implementation_;
   if (!outcome.restored) { return; }
+  state.CertifyCommittedScalarClosure();
   CpuAttemptEvidence restored;
   restored.status = CpuAttemptStatus::success;
   restored.exit_coordinates = coordinates;
@@ -8130,6 +9159,7 @@ void detail::CpuNumericsCore::InvalidateCandidateGeneration() noexcept
   }
   state.active_candidate_generation = 0;
   state.active_candidate_state_hash = {};
+  state.active_candidate_scalar_closure_coherent = false;
   state.publication_chain_authority = false;
 }
 
@@ -8230,7 +9260,8 @@ bool detail::CpuNumericsCore::ExportCommittedFields(
   if (!state.initialized || !state.IsBorrowed() || !committed ||
       destination.scalar_count != scalar_count ||
       (destination.conservative_coefficients == nullptr && scalar_count != 0) ||
-      (sigma_requested && state.interior_components != igr_interior_components))
+      (sigma_requested && state.interior_components != igr_interior_components) ||
+      (sigma_requested && !state.CommittedScalarClosureCertified()))
   {
     return false;
   }

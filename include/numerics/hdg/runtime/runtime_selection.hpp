@@ -92,6 +92,11 @@ struct BackwardEulerRuntimeTag
   static constexpr std::string_view id = "backward_euler";
 };
 
+struct PartitionedBackwardEulerRuntimeTag
+{
+  static constexpr std::string_view id = "partitioned_backward_euler";
+};
+
 struct CpuSerialBackendTag
 {
   static constexpr std::string_view id = "cpu.serial";
@@ -138,13 +143,14 @@ using CudaRank2OneGpuHostStagedRuntimeSelection =
     ConventionalEulerSmoothPersistentV1Selection<
         CudaRank2OneGpuHostStagedBackendTag>;
 
-template <typename BackendTag>
+template <typename BackendTag,
+          typename TimeTreatmentTag = BackwardEulerRuntimeTag>
 using BorrowedEulerCurrentLlfSelection =
     StaticRunSelection<EulerCompressible2dTag,
                        ConventionalHdgTag,
                        MfemDgInterfaceTraceTag,
                        BorrowedEulerCurrentLlfTauTag,
-                       BackwardEulerRuntimeTag,
+                       TimeTreatmentTag,
                        BackendTag,
                        Fp64RuntimeTag>;
 
@@ -172,5 +178,25 @@ using ScalarIgrCudaRank1RuntimeSelection =
     ScalarIgrSc25PersistentV3Selection<CudaRank1OneGpuBackendTag>;
 using ScalarIgrCudaRank2RuntimeSelection =
     ScalarIgrSc25PersistentV3Selection<CudaRank2OneGpuHostStagedBackendTag>;
+
+template <typename BackendTag>
+using PartitionedBackwardEulerBorrowedEulerCurrentLlfSelection =
+    BorrowedEulerCurrentLlfSelection<
+        BackendTag, PartitionedBackwardEulerRuntimeTag>;
+
+using PartitionedBackwardEulerCpuRank1RuntimeSelection =
+    PartitionedBackwardEulerBorrowedEulerCurrentLlfSelection<
+        CpuSerialBackendTag>;
+using PartitionedBackwardEulerCpuSerialRuntimeSelection =
+    PartitionedBackwardEulerCpuRank1RuntimeSelection;
+using PartitionedBackwardEulerCpuRank2RuntimeSelection =
+    PartitionedBackwardEulerBorrowedEulerCurrentLlfSelection<
+        CpuRank2BackendTag>;
+using PartitionedBackwardEulerCudaRank1RuntimeSelection =
+    PartitionedBackwardEulerBorrowedEulerCurrentLlfSelection<
+        CudaRank1OneGpuBackendTag>;
+using PartitionedBackwardEulerCudaRank2RuntimeSelection =
+    PartitionedBackwardEulerBorrowedEulerCurrentLlfSelection<
+        CudaRank2OneGpuHostStagedBackendTag>;
 
 } // namespace dg::hdg::runtime

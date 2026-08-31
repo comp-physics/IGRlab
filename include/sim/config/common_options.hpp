@@ -134,7 +134,8 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.time_integrator,
                  "-ti",
                  "--time-integrator",
-                 "Time integrator: rk3ssp | backward-euler "
+                 "Time integrator: rk3ssp | backward-euler | "
+                 "partitioned-backward-euler "
                  "(discretization support required).");
   args.AddOption(&opts.zhang_shu_points,
                  "-zsp",

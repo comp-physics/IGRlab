@@ -20,6 +20,7 @@ using dg::hdg::generic::EulerBoundaryPolicy;
 using dg::hdg::generic::EulerBoundaryPolicyKind;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::generic::EulerHdgConservationRelativeError;
+using dg::hdg::generic::EulerHdgTimeTreatment;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::generic::ValidateEulerHdgRequest;
 
@@ -128,10 +129,13 @@ void AttachPolicyTable(EulerHdgRequest& request,
 
 bool CheckPODSurface()
 {
+  const EulerHdgRequest zero_initialized{};
   return std::is_trivial<EulerHdgRequest>::value &&
       std::is_standard_layout<EulerHdgRequest>::value &&
       !std::is_polymorphic<EulerHdgRequest>::value &&
-      std::is_trivial<dg::hdg::generic::BackendSelection>::value;
+      std::is_trivial<dg::hdg::generic::BackendSelection>::value &&
+      zero_initialized.time_treatment ==
+          EulerHdgTimeTreatment::backward_euler;
 }
 
 bool CheckConservationNormalization()
@@ -159,6 +163,24 @@ bool CheckAcceptAndReject()
   {
     return false;
   }
+
+  if (request.time_treatment != EulerHdgTimeTreatment::backward_euler)
+  {
+    return false;
+  }
+  request.time_treatment =
+      EulerHdgTimeTreatment::partitioned_backward_euler;
+  if (ValidateEulerHdgRequest(request) != ContractStatus::accepted)
+  {
+    return false;
+  }
+  request.time_treatment = static_cast<EulerHdgTimeTreatment>(255);
+  if (ValidateEulerHdgRequest(request) !=
+      ContractStatus::invalid_time_treatment)
+  {
+    return false;
+  }
+  request = ValidRequest(mesh, initial);
 
   request.polynomial_order = 0;
   if (ValidateEulerHdgRequest(request) !=
@@ -629,18 +651,27 @@ bool CheckCudaEngineCollectiveMismatch()
       BackendKind::cuda, 0,
       rank == 0 ? CudaEngineKind::ordinary : CudaEngineKind::tensor_core};
   request.capabilities = all_cuda_capabilities;
-  const ContractStatus status = ValidateEulerHdgRequest(request);
-  int minimum = static_cast<int>(status);
+  const ContractStatus backend_status = ValidateEulerHdgRequest(request);
+  int minimum = static_cast<int>(backend_status);
   int maximum = minimum;
   const int minimum_result = MPI_Allreduce(
       MPI_IN_PLACE, &minimum, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
   const int maximum_result = MPI_Allreduce(
       MPI_IN_PLACE, &maximum, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-  const ContractStatus expected = ranks == 1
+  const ContractStatus expected_backend = ranks == 1
       ? ContractStatus::accepted
       : ContractStatus::invalid_backend;
-  return status == expected && minimum_result == MPI_SUCCESS &&
-      maximum_result == MPI_SUCCESS && minimum == maximum;
+  request.backend = {BackendKind::cuda, 0, CudaEngineKind::ordinary};
+  request.time_treatment = rank == 0
+      ? EulerHdgTimeTreatment::backward_euler
+      : EulerHdgTimeTreatment::partitioned_backward_euler;
+  const ContractStatus time_status = ValidateEulerHdgRequest(request);
+  const ContractStatus expected_time = ranks == 1
+      ? ContractStatus::accepted
+      : ContractStatus::invalid_time_treatment;
+  return backend_status == expected_backend && time_status == expected_time &&
+      minimum_result == MPI_SUCCESS && maximum_result == MPI_SUCCESS &&
+      minimum == maximum;
 }
 
 bool CheckAsymmetricNullMeshConvergence()

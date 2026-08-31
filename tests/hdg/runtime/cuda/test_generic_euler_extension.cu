@@ -179,6 +179,20 @@ struct CudaPreparedEulerConservationGateCapture
   bool prestage_allowed = false;
 };
 
+struct CudaPreparedPartitionedClosureAudit
+{
+  double global_scalar_residual =
+      std::numeric_limits<double>::infinity();
+  double global_auxiliary_norm =
+      std::numeric_limits<double>::infinity();
+  double global_scalar_relative_residual =
+      std::numeric_limits<double>::infinity();
+  double relative_residual_tolerance = 0.0;
+  bool auxiliary_interior_finite = false;
+  bool auxiliary_true_trace_finite = false;
+  bool auxiliary_local_trace_finite = false;
+};
+
 struct CudaPreparedLocalCondensationCapture
 {
   int elements = 0;
@@ -636,7 +650,281 @@ struct CudaQualificationTestAccess
       return VerifyPreparedCudaEngine(*session.borrowed_rank1_, expected);
     if (session.borrowed_rank2_)
       return VerifyPreparedCudaEngine(*session.borrowed_rank2_, expected);
+    if (session.partitioned_backward_euler_borrowed_rank1_)
+      return VerifyPreparedCudaEngine(
+          *session.partitioned_backward_euler_borrowed_rank1_, expected);
+    if (session.partitioned_backward_euler_borrowed_rank2_)
+      return VerifyPreparedCudaEngine(
+          *session.partitioned_backward_euler_borrowed_rank2_, expected);
     return false;
+  }
+
+  template <typename Engine>
+  static bool AuditPreparedPartitionedClosure(
+      Engine& engine, CudaPreparedPartitionedClosureAudit& audit) noexcept
+  {
+    audit = {};
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    const auto candidate = numerics.CandidateSlot();
+    auto& workspace = numerics.WorkspaceSlot();
+    const bool element_trace_extent_valid = shape.elements > 0 &&
+        shape.trace_dofs > 0 &&
+        static_cast<std::size_t>(shape.elements) <=
+            std::numeric_limits<std::size_t>::max() /
+                static_cast<std::size_t>(shape.trace_dofs);
+    const std::size_t element_trace_count = element_trace_extent_valid
+        ? static_cast<std::size_t>(shape.elements) * shape.trace_dofs : 0;
+    audit.relative_residual_tolerance =
+        numerics.true_residual_relative_tolerance_;
+    bool local_valid = engine.initialized_ && engine.pending_.active &&
+        engine.pending_.staging && engine.pending_.numerical.success &&
+        numerics.partitioned_backward_euler_ &&
+        shape.borrowed_host_inputs && shape.igr_active &&
+        shape.interior_components == igr_interior_components &&
+        shape.trace_components == igr_trace_components &&
+        shape.scalar_interior_dofs > 0 && shape.scalar_face_dofs > 0 &&
+        shape.interior_count > 0 && shape.local_trace_count > 0 &&
+        shape.true_trace_count > 0 && element_trace_extent_valid &&
+        shape.true_trace_count % shape.trace_components == 0 &&
+        workspace.interior.coefficients == numerics.view_.work_interior &&
+        workspace.trace.coefficients == numerics.view_.work_true_trace &&
+        workspace.interior.count == shape.interior_count &&
+        workspace.trace.count == shape.true_trace_count &&
+        workspace.interior.hash == engine.pending_.candidate_interior_hash &&
+        workspace.trace.hash == engine.pending_.candidate_trace_hash &&
+        workspace.interior.local_hash ==
+            engine.pending_.candidate_local_interior_hash &&
+        workspace.trace.local_hash ==
+            engine.pending_.candidate_local_trace_hash &&
+        candidate.interior.coefficients != nullptr &&
+        candidate.trace.coefficients != nullptr &&
+        candidate.interior.count == workspace.interior.count &&
+        candidate.trace.count == workspace.trace.count &&
+        candidate.interior.hash == engine.pending_.candidate_interior_hash &&
+        candidate.trace.hash == engine.pending_.candidate_trace_hash &&
+        candidate.interior.local_hash ==
+            engine.pending_.candidate_local_interior_hash &&
+        candidate.trace.local_hash ==
+            engine.pending_.candidate_local_trace_hash &&
+        candidate.interior.generation == workspace.interior.generation &&
+        candidate.trace.generation == workspace.trace.generation &&
+        engine.config_.use_generic_numerical_policy &&
+        std::isfinite(audit.relative_residual_tolerance) &&
+        audit.relative_residual_tolerance > 0.0 &&
+        audit.relative_residual_tolerance ==
+            engine.config_.numerical_policy.true_residual_relative_tolerance &&
+        numerics.view_.current_local_trace != nullptr;
+
+    std::vector<double> interior;
+    std::vector<double> true_trace;
+    std::vector<double> local_trace;
+    try
+    {
+      interior.resize(local_valid ? workspace.interior.count : 0);
+      true_trace.resize(local_valid ? workspace.trace.count : 0);
+      local_trace.resize(local_valid ? element_trace_count : 0);
+    }
+    catch (...)
+    {
+      local_valid = false;
+    }
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    const bool copied = CudaTransportPolicy::DeviceToHost(
+            interior.data(), workspace.interior.coefficients,
+            interior.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            true_trace.data(), workspace.trace.coefficients,
+            true_trace.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            local_trace.data(), numerics.view_.current_local_trace,
+            local_trace.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    if (!numerics.CollectiveContinue(copied)) return false;
+
+    double local_auxiliary_squared = 0.0;
+    audit.auxiliary_interior_finite = true;
+    for (int element = 0;
+         element < shape.elements && audit.auxiliary_interior_finite;
+         ++element)
+      for (int local = 0; local < shape.interior_dofs; ++local)
+        if (local / shape.scalar_interior_dofs >= conserved_components)
+        {
+          const std::size_t index = static_cast<std::size_t>(element) *
+              shape.interior_dofs + local;
+          const double value = interior[index];
+          audit.auxiliary_interior_finite = std::isfinite(value);
+          if (!audit.auxiliary_interior_finite) break;
+          local_auxiliary_squared += value * value;
+        }
+
+    const int true_scalar_count =
+        shape.true_trace_count / shape.trace_components;
+    audit.auxiliary_true_trace_finite = true;
+    for (auto iterator =
+             true_trace.begin() + conserved_components * true_scalar_count;
+         iterator != true_trace.end(); ++iterator)
+    {
+      audit.auxiliary_true_trace_finite = std::isfinite(*iterator);
+      if (!audit.auxiliary_true_trace_finite) break;
+      local_auxiliary_squared += *iterator * *iterator;
+    }
+
+    const int face_stride = shape.trace_components * shape.scalar_face_dofs;
+    audit.auxiliary_local_trace_finite = true;
+    for (int element = 0;
+         element < shape.elements && audit.auxiliary_local_trace_finite;
+         ++element)
+      for (int local = 0; local < shape.trace_dofs; ++local)
+        if ((local % face_stride) / shape.scalar_face_dofs >=
+            conserved_components)
+        {
+          const std::size_t index = static_cast<std::size_t>(element) *
+              shape.trace_dofs + local;
+          audit.auxiliary_local_trace_finite =
+              std::isfinite(local_trace[index]);
+          if (!audit.auxiliary_local_trace_finite) break;
+        }
+    const bool auxiliary_finite = audit.auxiliary_interior_finite &&
+        audit.auxiliary_true_trace_finite &&
+        audit.auxiliary_local_trace_finite &&
+        std::isfinite(local_auxiliary_squared);
+    if (!numerics.CollectiveContinue(auxiliary_finite)) return false;
+
+    // Reassemble the already frozen prepared candidate without changing its
+    // state.  This test-only full scalar HDG residual is independent of the
+    // condensed trace-system residual reported by Execute.  Normalize it by
+    // the global auxiliary coefficient norm and state that denominator
+    // explicitly; it is not the trace solver's ||b|| normalization.
+    CudaTensorCoreEvidence scratch_tensor =
+        engine.pending_.numerical.tensor_core;
+    double global_residual = std::numeric_limits<double>::infinity();
+    const bool assembled = numerics.AssemblePartitionedScalarClosure(
+        workspace, engine.pending_.attempt.dt, global_residual,
+        scratch_tensor);
+    if (!numerics.CollectiveContinue(
+            assembled && std::isfinite(global_residual)))
+      return false;
+    double global_auxiliary_squared = 0.0;
+    const bool auxiliary_reduced = MPI_Allreduce(
+        &local_auxiliary_squared, &global_auxiliary_squared, 1, MPI_DOUBLE,
+        MPI_SUM, numerics.communicator_) == MPI_SUCCESS;
+    audit.global_scalar_residual = global_residual;
+    audit.global_auxiliary_norm =
+        auxiliary_reduced && global_auxiliary_squared >= 0.0
+        ? std::sqrt(global_auxiliary_squared)
+        : std::numeric_limits<double>::infinity();
+    audit.global_scalar_relative_residual = audit.global_scalar_residual /
+        std::max(audit.global_auxiliary_norm, 1.0);
+    const bool residual_gate = auxiliary_reduced &&
+        std::isfinite(audit.global_scalar_residual) &&
+        std::isfinite(audit.global_auxiliary_norm) &&
+        std::isfinite(audit.global_scalar_relative_residual) &&
+        std::isfinite(audit.relative_residual_tolerance) &&
+        audit.relative_residual_tolerance > 0.0 &&
+        audit.global_scalar_relative_residual <=
+            audit.relative_residual_tolerance;
+    return numerics.CollectiveContinue(residual_gate);
+  }
+
+  static bool AuditPreparedPartitionedClosure(
+      cuda::GenericEulerHdgCudaSession& session,
+      CudaPreparedPartitionedClosureAudit& audit) noexcept
+  {
+    if (session.partitioned_backward_euler_borrowed_rank1_)
+      return AuditPreparedPartitionedClosure(
+          *session.partitioned_backward_euler_borrowed_rank1_, audit);
+    if (session.partitioned_backward_euler_borrowed_rank2_)
+      return AuditPreparedPartitionedClosure(
+          *session.partitioned_backward_euler_borrowed_rank2_, audit);
+    audit = {};
+    return false;
+  }
+
+  template <typename Engine>
+  static bool CorruptHashConsistentPartitionedAuxiliaryCheckpoint(
+      Engine& engine, CudaSerializedCheckpointV1& checkpoint) noexcept
+  {
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    const int ranks = engine.config_.expected_rank_count;
+    const bool local_shape_valid = engine.initialized_ &&
+        !engine.pending_.active && numerics.partitioned_backward_euler_ &&
+        shape.igr_active && shape.elements > 0 &&
+        shape.interior_components == igr_interior_components &&
+        shape.scalar_interior_dofs > 0 &&
+        ranks >= 1 && ranks <= 2 &&
+        checkpoint.successful_commit &&
+        checkpoint.descriptor.successful_commit &&
+        checkpoint.interior_count <= checkpoint.interior.size() &&
+        checkpoint.interior_count ==
+            static_cast<std::uint64_t>(shape.interior_count);
+    if (!numerics.CollectiveContinue(local_shape_valid)) return false;
+
+    // Corrupt sigma (the first auxiliary component), never U4.  Recompute
+    // both the rank-local and rank-common hashes so the production import and
+    // device rehash gates accept this payload; only the independent scalar
+    // HDG closure validation is then allowed to reject it.
+    const std::size_t auxiliary_index =
+        static_cast<std::size_t>(conserved_components) *
+        static_cast<std::size_t>(shape.scalar_interior_dofs);
+    const StateHash original_local_hash = checkpoint.local_interior_hash;
+    const StateHash original_aggregate_hash =
+        checkpoint.descriptor.interior_hash;
+    const double original = checkpoint.interior[auxiliary_index];
+    const double perturbation = 0.25 * std::max(1.0, std::abs(original));
+    checkpoint.interior[auxiliary_index] = original >= 0.0
+        ? original + perturbation : original - perturbation;
+    const bool local_corruption_valid = std::isfinite(original) &&
+        std::isfinite(checkpoint.interior[auxiliary_index]) &&
+        checkpoint.interior[auxiliary_index] != original;
+    if (!numerics.CollectiveContinue(local_corruption_valid)) return false;
+
+    checkpoint.local_interior_hash = HashHostBytes(
+        checkpoint.interior.data(),
+        static_cast<std::size_t>(checkpoint.interior_count) * sizeof(double));
+    std::array<unsigned char, 2 * 32> hash_pieces{};
+    const bool gathered = MPI_Allgather(
+        checkpoint.local_interior_hash.bytes.data(), 32, MPI_UNSIGNED_CHAR,
+        hash_pieces.data(), 32, MPI_UNSIGNED_CHAR,
+        numerics.communicator_) == MPI_SUCCESS;
+    if (!numerics.CollectiveContinue(gathered)) return false;
+    checkpoint.descriptor.interior_hash = HashHostBytes(
+        hash_pieces.data(), static_cast<std::size_t>(ranks) * 32);
+    return numerics.CollectiveContinue(
+        checkpoint.local_interior_hash != original_local_hash &&
+        checkpoint.descriptor.interior_hash != original_aggregate_hash);
+  }
+
+  template <typename Engine>
+  static bool HashConsistentCheckpointReachedScalarValidation(
+      Engine& engine, const CudaSerializedCheckpointV1& checkpoint) noexcept
+  {
+    auto& numerics = engine.numerics_;
+    const auto& workspace = numerics.WorkspaceSlot();
+    const auto& committed = numerics.CommittedSlot();
+    return numerics.CollectiveContinue(
+        engine.initialized_ && !engine.pending_.active &&
+        numerics.partitioned_backward_euler_ &&
+        workspace.interior.count == checkpoint.interior_count &&
+        workspace.trace.count == checkpoint.owned_true_trace_count &&
+        workspace.interior.local_hash == checkpoint.local_interior_hash &&
+        workspace.trace.local_hash == checkpoint.local_trace_hash &&
+        workspace.interior.hash == checkpoint.descriptor.interior_hash &&
+        workspace.trace.hash == checkpoint.descriptor.trace_hash &&
+        workspace.interior.generation ==
+            checkpoint.descriptor.coordinates.generation &&
+        workspace.trace.generation ==
+            checkpoint.descriptor.coordinates.generation &&
+        committed.interior.hash != workspace.interior.hash);
   }
 
   template <typename Engine>
@@ -1709,6 +1997,12 @@ struct CudaQualificationTestAccess
       cuda::GenericEulerHdgCudaSession& session,
       CudaPreparedIgrConservationCapture& capture) noexcept
   {
+    if (session.partitioned_backward_euler_borrowed_rank1_)
+      return CapturePreparedIgrConservation(
+          *session.partitioned_backward_euler_borrowed_rank1_, capture);
+    if (session.partitioned_backward_euler_borrowed_rank2_)
+      return CapturePreparedIgrConservation(
+          *session.partitioned_backward_euler_borrowed_rank2_, capture);
     if (session.borrowed_rank1_)
       return CapturePreparedIgrConservation(
           *session.borrowed_rank1_, capture);
@@ -2118,6 +2412,12 @@ struct CudaQualificationTestAccess
       cuda::GenericEulerHdgCudaSession& session,
       const CudaBorrowedHostL2Input expected) noexcept
   {
+    if (session.partitioned_backward_euler_borrowed_rank1_)
+      return VerifyBorrowedInitialTrueTrace(
+          *session.partitioned_backward_euler_borrowed_rank1_, expected);
+    if (session.partitioned_backward_euler_borrowed_rank2_)
+      return VerifyBorrowedInitialTrueTrace(
+          *session.partitioned_backward_euler_borrowed_rank2_, expected);
     if (session.borrowed_rank1_)
       return VerifyBorrowedInitialTrueTrace(
           *session.borrowed_rank1_, expected);
@@ -2132,6 +2432,14 @@ struct CudaQualificationTestAccess
       const generic::EulerBoundaryPolicy* const expected,
       const std::size_t expected_count, const double expected_gamma) noexcept
   {
+    if (session.partitioned_backward_euler_borrowed_rank1_)
+      return VerifyBoundaryPolicyTable(
+          *session.partitioned_backward_euler_borrowed_rank1_, expected,
+          expected_count, expected_gamma);
+    if (session.partitioned_backward_euler_borrowed_rank2_)
+      return VerifyBoundaryPolicyTable(
+          *session.partitioned_backward_euler_borrowed_rank2_, expected,
+          expected_count, expected_gamma);
     if (session.borrowed_rank1_)
       return VerifyBoundaryPolicyTable(
           *session.borrowed_rank1_, expected, expected_count, expected_gamma);
@@ -2155,6 +2463,7 @@ using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::EulerBoundaryPolicy;
 using dg::hdg::generic::EulerBoundaryPolicyKind;
 using dg::hdg::generic::EulerHdgRequest;
+using dg::hdg::generic::EulerHdgTimeTreatment;
 using dg::hdg::generic::HdgEulerHostInteriorFields;
 using dg::hdg::generic::HdgEulerSessionStatus;
 using dg::hdg::generic::RegularizationKind;
@@ -2165,11 +2474,13 @@ using dg::hdg::runtime::BorrowedCudaRank2OneGpuHostStagedRuntimeSelection;
 using dg::hdg::runtime::FailureReason;
 using dg::hdg::runtime::RunStatus;
 using dg::hdg::runtime::cuda_w8a::CudaConfig;
+using dg::hdg::runtime::cuda_w8a::CudaFailurePhase;
 using dg::hdg::runtime::cuda_w8a::CudaBorrowedHostL2Input;
 using dg::hdg::runtime::cuda_w8a::CudaMutableHostL2Output;
 using dg::hdg::runtime::cuda_w8a::CudaPrecommitSnapshot;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
 using dg::hdg::runtime::cuda_w8a::CudaRunEvidence;
+using dg::hdg::runtime::cuda_w8a::CudaRunStatus;
 using dg::hdg::runtime::cuda_w8a::CudaStepEvidence;
 using dg::hdg::runtime::cuda_w8a::CudaTransferTotals;
 using dg::hdg::runtime::cuda_w8a::CudaTransportPolicy;
@@ -2181,6 +2492,8 @@ using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedEulerConservationGateCapture;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedIgrConservationCapture;
+using dg::hdg::runtime::cuda_w8a::detail::
+    CudaPreparedPartitionedClosureAudit;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedLocalCondensationCapture;
 using dg::hdg::runtime::cuda_w8a::detail::
@@ -2203,6 +2516,8 @@ constexpr std::uint32_t cpu_capabilities =
     CapabilityBit(Capability::cpu);
 
 CudaEngineKind selected_cuda_engine = CudaEngineKind::ordinary;
+EulerHdgTimeTreatment selected_time_treatment =
+    EulerHdgTimeTreatment::backward_euler;
 
 bool All(const bool local, const MPI_Comm communicator = MPI_COMM_WORLD)
 {
@@ -2626,6 +2941,7 @@ EulerHdgRequest MakeRequest(
             RegularizationKind::igr, 0.2, 0.8}
       : dg::hdg::generic::RegularizationSelection{
             RegularizationKind::none, 0.0, 0.0};
+  request.time_treatment = selected_time_treatment;
   return request;
 }
 
@@ -2659,6 +2975,7 @@ CudaConfig MakeDirectConfig(const EulerHdgRequest& request,
   config.borrowed_boundary = request.boundary;
   config.use_generic_numerical_policy = true;
   config.numerical_policy = request.numerical_policy;
+  config.time_treatment = request.time_treatment;
   return config;
 }
 
@@ -3223,7 +3540,22 @@ bool VerifyIndependentIgrConservation(
   const double lifecycle_relative_tolerance = 64.0 *
       std::numeric_limits<double>::epsilon() *
       (1.0 + production_maximum_relative_error);
-  const bool lifecycle_parity =
+  // A partitioned step admits the conservative Euler solve against the
+  // lagged auxiliary state a^n, then projects the coherent output auxiliary
+  // state a^{n+1}.  The live oracle below intentionally recomputes balance on
+  // that final state, so it must not be bitwise compared with the lifecycle
+  // witness for the earlier (and different) Euler equation.  Preserve exact
+  // witness parity for the monolithic path and independently require the
+  // partitioned lifecycle witness to have passed its configured gate.
+  const bool partitioned_lifecycle = request.time_treatment ==
+      EulerHdgTimeTreatment::partitioned_backward_euler;
+  const bool lifecycle_parity = partitioned_lifecycle ?
+      std::isfinite(capture.lifecycle_maximum_error) &&
+          capture.lifecycle_maximum_error >= 0.0 &&
+          std::isfinite(capture.lifecycle_maximum_relative_error) &&
+          capture.lifecycle_maximum_relative_error >= 0.0 &&
+          capture.lifecycle_maximum_relative_error <=
+              request.numerical_policy.conservation_relative_tolerance :
       std::abs(production_maximum_error -
                capture.lifecycle_maximum_error) <=
           lifecycle_error_tolerance &&
@@ -3275,6 +3607,22 @@ bool VerifyIndependentIgrConservation(
       global_activity[8] > 1.0e-12L && signed_probe_sensitive;
   result.passed = parity && lifecycle_parity && active &&
       omission_detectable;
+  if (!result.passed)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+      std::cerr << "independent IGR conservation gate detail parity="
+                << parity << " lifecycle=" << lifecycle_parity
+                << " active=" << active
+                << " omission=" << omission_detectable
+                << " production_error=" << production_maximum_error
+                << " lifecycle_error=" << capture.lifecycle_maximum_error
+                << " production_relative="
+                << production_maximum_relative_error
+                << " lifecycle_relative="
+                << capture.lifecycle_maximum_relative_error << '\n';
+  }
   return All(result.passed, request.communicator);
 }
 
@@ -4846,11 +5194,11 @@ bool CheckContractAdmission(const int order)
                  null_table_contract && short_table_contract &&
                  wrong_dimension_contract && nonfinite_gamma_contract &&
                  invalid_kind_contract && mismatched_contract &&
-                 crossed_backend_contract &&
-                 invalid_igr_session && null_table_session &&
-                 short_table_session && wrong_dimension_session &&
-                 nonfinite_gamma_session && invalid_kind_session &&
-                 mismatched_session && crossed_backend_session,
+                 crossed_backend_contract && invalid_igr_session &&
+                 null_table_session && short_table_session &&
+                 wrong_dimension_session && nonfinite_gamma_session &&
+                 invalid_kind_session && mismatched_session &&
+                 crossed_backend_session,
              mesh.GetComm());
 }
 
@@ -4992,6 +5340,12 @@ bool CheckLifecycle(const int order, const bool physical,
   const bool first_export = export_prepared(
       first_authority, first_output, first_candidate,
       sigma_first_candidate, first_transfer);
+  const bool partitioned_igr = igr && request.time_treatment ==
+      EulerHdgTimeTreatment::partitioned_backward_euler;
+  CudaPreparedPartitionedClosureAudit partitioned_closure_audit{};
+  const bool partitioned_closure = !partitioned_igr ||
+      CudaQualificationTestAccess::AuditPreparedPartitionedClosure(
+          session, partitioned_closure_audit);
   const bool expected_update = physical
       ? (source_mode != SourceMode::nonzero ||
          DifferentValues(first_candidate, committed_initial))
@@ -4999,9 +5353,26 @@ bool CheckLifecycle(const int order, const bool physical,
             first_candidate, committed_initial, expected_source,
             fields.volume_scalar_count, source_mode, initial_mode, dt);
   if (!All(first_export && first_transfer && expected_update &&
+               partitioned_closure &&
                (!igr || finite(sigma_first_candidate)),
            request.communicator))
   {
+    if (partitioned_igr)
+      std::cerr << "CUDA partitioned closure audit failed order=" << order
+                << " physical=" << physical
+                << " residual="
+                << partitioned_closure_audit.global_scalar_residual
+                << " auxiliary_norm="
+                << partitioned_closure_audit.global_auxiliary_norm
+                << " relative_residual="
+                << partitioned_closure_audit.global_scalar_relative_residual
+                << " tolerance="
+                << partitioned_closure_audit.relative_residual_tolerance
+                << " auxiliary_finite="
+                << partitioned_closure_audit.auxiliary_interior_finite << '/'
+                << partitioned_closure_audit.auxiliary_true_trace_finite << '/'
+                << partitioned_closure_audit.auxiliary_local_trace_finite
+                << '\n';
     return false;
   }
   const auto aborted = session.Abort(
@@ -5046,12 +5417,31 @@ bool CheckLifecycle(const int order, const bool physical,
   const bool retry_export = export_prepared(
       retry_authority, retry_output, retry_candidate,
       sigma_retry_candidate, retry_transfer);
+  CudaPreparedPartitionedClosureAudit retry_closure_audit{};
+  const bool retry_partitioned_closure = !partitioned_igr ||
+      CudaQualificationTestAccess::AuditPreparedPartitionedClosure(
+          session, retry_closure_audit);
   if (!All(retry_export && retry_transfer &&
+               retry_partitioned_closure &&
                NearValues(first_candidate, retry_candidate) &&
                (!igr || NearValues(sigma_first_candidate,
                                    sigma_retry_candidate)),
            request.communicator))
   {
+    if (partitioned_igr)
+      std::cerr << "CUDA partitioned retry closure audit failed order="
+                << order << " physical=" << physical
+                << " residual=" << retry_closure_audit.global_scalar_residual
+                << " auxiliary_norm="
+                << retry_closure_audit.global_auxiliary_norm
+                << " relative_residual="
+                << retry_closure_audit.global_scalar_relative_residual
+                << " tolerance="
+                << retry_closure_audit.relative_residual_tolerance
+                << " auxiliary_finite="
+                << retry_closure_audit.auxiliary_interior_finite << '/'
+                << retry_closure_audit.auxiliary_true_trace_finite << '/'
+                << retry_closure_audit.auxiliary_local_trace_finite << '\n';
     return false;
   }
   const bool acknowledged = session.AcknowledgePreparedOutput(
@@ -5429,10 +5819,353 @@ bool CheckRejectedArmijoRollback(const int order, const int ranks)
              order, ranks, RegularizationKind::igr);
 }
 
+template <typename Engine>
+bool CaptureAndCommitPartitionedCheckpoint(
+    Engine& engine, const double dt,
+    dg::hdg::runtime::cuda_w8a::CudaSerializedCheckpointV1& checkpoint,
+    CudaStepEvidence& evidence)
+{
+  CudaPrecommitSnapshot snapshot{};
+  const bool prepared = engine.PrepareStep(false, dt, snapshot, evidence);
+  const bool staged = prepared &&
+      engine.StagePreparedCheckpoint(checkpoint, evidence);
+  const bool marked = staged && engine.MarkOutputStaged(checkpoint);
+  const bool commit_prepared = marked &&
+      engine.PrepareCommit(checkpoint, evidence);
+  const bool provisional = commit_prepared &&
+      engine.CommitPrepared(checkpoint, evidence);
+  const bool committed = provisional &&
+      engine.FinalizeCommit(checkpoint, evidence);
+  return prepared && snapshot.numerical_candidate_ready && staged && marked &&
+      commit_prepared && provisional && committed &&
+      checkpoint.candidate_frozen && checkpoint.checkpoint_staged &&
+      checkpoint.output_staged && checkpoint.successful_commit &&
+      checkpoint.descriptor.successful_commit &&
+      checkpoint.staging_range.complete &&
+      evidence.status == CudaRunStatus::committed && evidence.committed &&
+      !evidence.retry_available && evidence.scalar_closure_solves == 1 &&
+      evidence.scalar_closure_linear_solve_attempts > 0 &&
+      evidence.no_fallback;
+}
+
+template <typename Engine>
+bool CommitPartitionedContinuation(Engine& engine, const double dt,
+                                   CudaStepEvidence& evidence)
+{
+  CudaPrecommitSnapshot snapshot{};
+  CudaPreparedOutputMetadataV1 output{};
+  const bool prepared = engine.PrepareStep(false, dt, snapshot, evidence);
+  const bool staged = prepared &&
+      engine.StagePreparedOutputMetadata(output, evidence);
+  const bool marked = staged && engine.MarkOutputStaged(output);
+  const bool commit_prepared = marked &&
+      engine.PrepareCommit(output, evidence);
+  const bool provisional = commit_prepared &&
+      engine.CommitPrepared(output, evidence);
+  const bool committed = provisional &&
+      engine.FinalizeCommit(output, evidence);
+  return prepared && snapshot.numerical_candidate_ready && staged && marked &&
+      commit_prepared && provisional && committed &&
+      output.candidate_frozen && output.checkpoint_staged &&
+      output.output_staged && output.successful_commit &&
+      output.staging_range.complete &&
+      evidence.status == CudaRunStatus::committed && evidence.committed &&
+      !evidence.retry_available && evidence.scalar_closure_solves == 1 &&
+      evidence.scalar_closure_linear_solve_attempts > 0 &&
+      evidence.no_fallback;
+}
+
+template <typename Engine>
+bool ExportPartitionedCommittedFields(
+    Engine& engine, const std::size_t scalar_count,
+    std::vector<double>& conservative, std::vector<double>& sigma)
+{
+  conservative.assign(scalar_count * components,
+                      std::numeric_limits<double>::quiet_NaN());
+  sigma.assign(scalar_count, std::numeric_limits<double>::quiet_NaN());
+  return engine.ExportCommittedFields(HdgEulerHostInteriorFields{
+      conservative.data(), sigma.data(), scalar_count});
+}
+
+template <typename Selection>
+bool CheckPartitionedCheckpointRestartForSelection(
+    const int order, const int ranks)
+{
+  // Keep this restart gate bounded to the representative p2 selected smoke.
+  // Each p2 ordinary/tensor executable covers its configured rank count.
+  if (order != 2) return true;
+
+  using Engine = PersistentCudaSmoothEulerEngine<Selection>;
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::nonzero, InitialMode::smooth_periodic);
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::igr);
+  CudaConfig config = MakeDirectConfig(request, ranks, order);
+  constexpr double dt = 1.0e-5;
+  auto checkpoint = std::make_unique<
+      dg::hdg::runtime::cuda_w8a::CudaSerializedCheckpointV1>();
+  std::vector<double> first_conservative, first_sigma;
+  std::vector<double> continued_conservative, continued_sigma;
+  dg::hdg::runtime::StateCoordinates first_coordinates{};
+  dg::hdg::runtime::StateCoordinates continued_coordinates{};
+
+  {
+    auto source = std::make_unique<Engine>(config);
+    CudaRunEvidence initialization{};
+    if (!All(source->Initialize(initialization) &&
+                 source->contract() != nullptr,
+             request.communicator))
+      return false;
+
+    CudaStepEvidence captured{};
+    const bool checkpoint_committed = CaptureAndCommitPartitionedCheckpoint(
+        *source, dt, *checkpoint, captured);
+    first_coordinates = source->contract() != nullptr
+        ? source->contract()->coordinates()
+        : dg::hdg::runtime::StateCoordinates{};
+    const bool checkpoint_identity = checkpoint_committed &&
+        checkpoint->attempt.sequence == checkpoint->descriptor.cursor &&
+        checkpoint->attempt.sequence ==
+            checkpoint->descriptor.coordinates.cursor &&
+        checkpoint->local_interior_hash != dg::hdg::runtime::StateHash{} &&
+        checkpoint->local_trace_hash != dg::hdg::runtime::StateHash{} &&
+        dg::hdg::runtime::detail::SameCoordinates(
+            first_coordinates, checkpoint->descriptor.coordinates);
+    const bool first_export = ExportPartitionedCommittedFields(
+        *source, fields.volume_scalar_count,
+        first_conservative, first_sigma);
+    if (!All(checkpoint_identity && first_export,
+             request.communicator))
+      return false;
+
+    CudaStepEvidence source_continuation{};
+    const bool source_continued = CommitPartitionedContinuation(
+        *source, dt, source_continuation);
+    continued_coordinates = source->contract() != nullptr
+        ? source->contract()->coordinates()
+        : dg::hdg::runtime::StateCoordinates{};
+    const bool continuation_export = ExportPartitionedCommittedFields(
+        *source, fields.volume_scalar_count,
+        continued_conservative, continued_sigma);
+    if (!All(source_continued && continuation_export &&
+                 continued_coordinates.step == first_coordinates.step + 1 &&
+                 continued_coordinates.generation ==
+                     first_coordinates.generation + 1 &&
+                 continued_coordinates.time == first_coordinates.time + dt,
+             request.communicator))
+      return false;
+  }
+
+  {
+    auto restarted = std::make_unique<Engine>(config);
+    CudaRunEvidence initialization{};
+    if (!All(restarted->Initialize(initialization) &&
+                 restarted->contract() != nullptr,
+             request.communicator))
+      return false;
+    CudaStepEvidence restored_evidence{};
+    const bool restored = restarted->Restore(*checkpoint, restored_evidence);
+    std::vector<double> restored_conservative, restored_sigma;
+    const bool restored_export = ExportPartitionedCommittedFields(
+        *restarted, fields.volume_scalar_count,
+        restored_conservative, restored_sigma);
+    const auto restored_coordinates = restarted->contract() != nullptr
+        ? restarted->contract()->coordinates()
+        : dg::hdg::runtime::StateCoordinates{};
+    const bool restored_state = restored && restored_export &&
+        restored_evidence.status == CudaRunStatus::committed &&
+        restored_evidence.committed &&
+        restored_evidence.collective_consensus &&
+        restored_evidence.contract_reason == FailureReason::none &&
+        restored_evidence.after_interior_hash ==
+            checkpoint->descriptor.interior_hash &&
+        restored_evidence.after_trace_hash ==
+            checkpoint->descriptor.trace_hash &&
+        dg::hdg::runtime::detail::SameCoordinates(
+            restored_coordinates, first_coordinates) &&
+        SameValues(restored_conservative, first_conservative) &&
+        SameValues(restored_sigma, first_sigma);
+    if (!All(restored_state, request.communicator)) return false;
+
+    CudaStepEvidence restarted_continuation{};
+    const bool continued = CommitPartitionedContinuation(
+        *restarted, dt, restarted_continuation);
+    std::vector<double> restart_continued_conservative,
+        restart_continued_sigma;
+    const bool continued_export = ExportPartitionedCommittedFields(
+        *restarted, fields.volume_scalar_count,
+        restart_continued_conservative, restart_continued_sigma);
+    const auto restart_continued_coordinates =
+        restarted->contract() != nullptr
+        ? restarted->contract()->coordinates()
+        : dg::hdg::runtime::StateCoordinates{};
+    const bool continuation_agreement = continued && continued_export &&
+        dg::hdg::runtime::detail::SameCoordinates(
+            restart_continued_coordinates, continued_coordinates) &&
+        NearValues(restart_continued_conservative,
+                   continued_conservative) &&
+        NearValues(restart_continued_sigma, continued_sigma);
+    if (!All(continuation_agreement, request.communicator)) return false;
+  }
+
+  // The corrupted checkpoint remains self-consistent at both hash layers.
+  // Restore must import it into scratch, reject the scalar closure, and leave
+  // the pristine committed state and closure certificate publishable.
+  auto corrupted = std::make_unique<
+      dg::hdg::runtime::cuda_w8a::CudaSerializedCheckpointV1>(*checkpoint);
+  {
+    auto rejected = std::make_unique<Engine>(config);
+    CudaRunEvidence initialization{};
+    if (!All(rejected->Initialize(initialization) &&
+                 rejected->contract() != nullptr,
+             request.communicator))
+      return false;
+    std::vector<double> initial_conservative, initial_sigma;
+    const bool initial_export = ExportPartitionedCommittedFields(
+        *rejected, fields.volume_scalar_count,
+        initial_conservative, initial_sigma);
+    const auto before = rejected->contract()->coordinates();
+    const bool corrupted_hashes =
+        CudaQualificationTestAccess::
+            CorruptHashConsistentPartitionedAuxiliaryCheckpoint(
+                *rejected, *corrupted) &&
+        corrupted->local_trace_hash == checkpoint->local_trace_hash &&
+        corrupted->descriptor.trace_hash ==
+            checkpoint->descriptor.trace_hash;
+    if (!All(initial_export && corrupted_hashes, request.communicator))
+      return false;
+
+    CudaStepEvidence rejection{};
+    const bool unexpectedly_restored = rejected->Restore(*corrupted, rejection);
+    const bool reached_scalar_validation =
+        CudaQualificationTestAccess::
+            HashConsistentCheckpointReachedScalarValidation(
+                *rejected, *corrupted);
+    std::vector<double> after_conservative, after_sigma;
+    const bool after_export = ExportPartitionedCommittedFields(
+        *rejected, fields.volume_scalar_count,
+        after_conservative, after_sigma);
+    const auto after = rejected->contract() != nullptr
+        ? rejected->contract()->coordinates()
+        : dg::hdg::runtime::StateCoordinates{};
+    const bool rejected_without_publication = !unexpectedly_restored &&
+        reached_scalar_validation && after_export &&
+        rejection.status == CudaRunStatus::runtime_failure &&
+        rejection.contract_reason == FailureReason::restart_incompatible &&
+        !rejection.committed &&
+        dg::hdg::runtime::detail::SameCoordinates(before, after) &&
+        SameValues(after_conservative, initial_conservative) &&
+        SameValues(after_sigma, initial_sigma) &&
+        rejected->contract() != nullptr &&
+        rejected->contract()->status() == RunStatus::ready;
+    if (!All(rejected_without_publication, request.communicator)) return false;
+  }
+  return true;
+}
+
+bool CheckPartitionedCheckpointRestart(const int order, const int ranks)
+{
+  if (ranks == 1)
+    return CheckPartitionedCheckpointRestartForSelection<
+        dg::hdg::runtime::PartitionedBackwardEulerCudaRank1RuntimeSelection>(
+            order, ranks);
+  return CheckPartitionedCheckpointRestartForSelection<
+      dg::hdg::runtime::PartitionedBackwardEulerCudaRank2RuntimeSelection>(
+          order, ranks);
+}
+
+template <typename Selection>
+bool CheckPartitionedFailureInjectionForSelection(
+    const int order, const int ranks)
+{
+  // This direct-engine fixture isolates abort/retry and closure-certificate
+  // semantics.  Physical-policy lowering is owned by the generic facade and
+  // is already exercised by the physical lifecycle cases above.
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::nonzero, InitialMode::constant);
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::igr);
+  CudaConfig config = MakeDirectConfig(request, ranks, order);
+  config.injection.enabled = true;
+  config.injection.phase = CudaFailurePhase::diagnostics;
+  config.injection.target_step = 1;
+  config.injection.source_rank = ranks - 1;
+
+  auto engine = std::make_unique<
+      PersistentCudaSmoothEulerEngine<Selection>>(config);
+  CudaRunEvidence initialization{};
+  if (!All(engine->Initialize(initialization), request.communicator))
+    return false;
+
+  constexpr double dt = 1.0e-5;
+  CudaPrecommitSnapshot injected_snapshot{};
+  CudaStepEvidence injected{};
+  const bool injected_prepared = engine->PrepareStep(
+      false, dt, injected_snapshot, injected);
+  if (!All(injected_prepared &&
+               injected_snapshot.numerical_candidate_ready &&
+               injected.source_rank == ranks - 1,
+           request.communicator))
+    return false;
+
+  CudaPreparedOutputMetadataV1 denied_output{};
+  const bool rolled_back = engine->PrepareCommit(
+      denied_output, injected);
+  if (!All(rolled_back && injected.retry_available && !injected.committed &&
+               injected.status == CudaRunStatus::retry_available &&
+               injected.contract_reason == FailureReason::backend_failure &&
+               injected.coordinates_preserved &&
+               injected.committed_bytes_preserved &&
+               engine->contract() != nullptr &&
+               engine->contract()->status() == RunStatus::retry_available,
+           request.communicator))
+    return false;
+
+  CudaPrecommitSnapshot retry_snapshot{};
+  CudaStepEvidence retry{};
+  CudaPreparedOutputMetadataV1 retry_output{};
+  const bool retry_prepared = engine->PrepareStep(
+      true, dt, retry_snapshot, retry);
+  const bool staged = retry_prepared &&
+      engine->StagePreparedOutputMetadata(retry_output, retry);
+  const bool marked = staged && engine->MarkOutputStaged(retry_output);
+  const bool prepared_commit = marked &&
+      engine->PrepareCommit(retry_output, retry);
+  const bool provisional = prepared_commit &&
+      engine->CommitPrepared(retry_output, retry);
+  const bool committed = provisional &&
+      engine->FinalizeCommit(retry_output, retry);
+  return All(retry_prepared && retry_snapshot.numerical_candidate_ready &&
+                 staged && marked && prepared_commit && provisional &&
+                 committed && retry_output.successful_commit &&
+                 retry.status == CudaRunStatus::committed &&
+                 retry.committed && !retry.retry_available &&
+                 retry.source_rank == -1,
+             request.communicator);
+}
+
+bool CheckPartitionedFailureInjection(const int order, const int ranks)
+{
+  if (ranks == 1)
+    return CheckPartitionedFailureInjectionForSelection<
+        dg::hdg::runtime::PartitionedBackwardEulerCudaRank1RuntimeSelection>(
+            order, ranks);
+  return CheckPartitionedFailureInjectionForSelection<
+      dg::hdg::runtime::PartitionedBackwardEulerCudaRank2RuntimeSelection>(
+          order, ranks);
+}
+
 struct Options
 {
   int order = -1;
   CudaEngineKind engine = CudaEngineKind::ordinary;
+  EulerHdgTimeTreatment time_treatment =
+      EulerHdgTimeTreatment::backward_euler;
+  bool partitioned_smoke = false;
 };
 
 bool ParseOptions(const int argc, char* argv[], Options& options)
@@ -5459,10 +6192,31 @@ bool ParseOptions(const int argc, char* argv[], Options& options)
         return false;
       continue;
     }
+    if (argument == "--time-treatment")
+    {
+      if (++index >= argc) return false;
+      const std::string treatment(argv[index]);
+      if (treatment == "backward-euler")
+        options.time_treatment = EulerHdgTimeTreatment::backward_euler;
+      else if (treatment == "partitioned-backward-euler")
+        options.time_treatment =
+            EulerHdgTimeTreatment::partitioned_backward_euler;
+      else
+        return false;
+      continue;
+    }
+    if (argument == "--partitioned-smoke")
+    {
+      options.partitioned_smoke = true;
+      continue;
+    }
     return false;
   }
+  const bool partitioned_selected = options.time_treatment ==
+      EulerHdgTimeTreatment::partitioned_backward_euler;
   return options.order >= dg::hdg::generic::minimum_polynomial_order &&
-      options.order <= dg::hdg::generic::maximum_polynomial_order;
+      options.order <= dg::hdg::generic::maximum_polynomial_order &&
+      options.partitioned_smoke == partitioned_selected;
 }
 
 bool CheckRecoveryDispatchAdmission() noexcept
@@ -5500,11 +6254,14 @@ int main(int argc, char* argv[])
   {
     if (rank == 0)
       std::cerr << "Usage: " << argv[0]
-                << " --order 1|2|3 [--engine ordinary|tensor]\n";
+                << " --order 1|2|3 [--engine ordinary|tensor]"
+                   " [--time-treatment backward-euler|"
+                   "partitioned-backward-euler] [--partitioned-smoke]\n";
     return 2;
   }
   const int order = options.order;
   selected_cuda_engine = options.engine;
+  selected_time_treatment = options.time_treatment;
   const bool admission = order > 0 && CheckContractAdmission(order);
   mfem::Device device("cuda");
   (void)device;
@@ -5525,6 +6282,61 @@ int main(int argc, char* argv[])
       std::numeric_limits<long double>::infinity();
   long double igr_physical_response =
       std::numeric_limits<long double>::infinity();
+  if (options.partitioned_smoke)
+  {
+    std::vector<double> conventional_periodic_smoke;
+    std::vector<double> conventional_physical_smoke;
+    std::vector<double> igr_periodic_smoke;
+    std::vector<double> igr_physical_smoke;
+    const bool conventional_periodic = CheckLifecycle(
+        order, false, RegularizationKind::none, SourceMode::nonzero,
+        InitialMode::constant, conventional_periodic_smoke);
+    const bool conventional_physical = CheckLifecycle(
+        order, true, RegularizationKind::none, SourceMode::nonzero,
+        InitialMode::constant, conventional_physical_smoke);
+    const bool igr_periodic = CheckLifecycle(
+        order, false, RegularizationKind::igr, SourceMode::nonzero,
+        InitialMode::constant, igr_periodic_smoke);
+    const bool igr_physical = CheckLifecycle(
+        order, true, RegularizationKind::igr, SourceMode::nonzero,
+        InitialMode::constant, igr_physical_smoke);
+    std::vector<double> igr_empty_source_smoke;
+    std::vector<double> igr_zero_source_smoke;
+    const bool bounded_deep_qualification = order != 2 ||
+        (CheckLifecycle(
+             order, false, RegularizationKind::igr, SourceMode::empty,
+             InitialMode::constant, igr_empty_source_smoke) &&
+         CheckLifecycle(
+             order, false, RegularizationKind::igr, SourceMode::explicit_zero,
+             InitialMode::constant, igr_zero_source_smoke) &&
+         SameValues(igr_empty_source_smoke, igr_zero_source_smoke) &&
+         CheckAllSevenLoweredBoundaryPolicies(order) &&
+         CheckMixedLoweredBoundaryPolicies(order) &&
+         CheckIndependentIgrConservation(order));
+    const bool failure_injection =
+        CheckPartitionedFailureInjection(order, ranks);
+    const bool checkpoint_restart =
+        CheckPartitionedCheckpointRestart(order, ranks);
+    const bool passed = (ranks == 1 || ranks == 2) && All(
+        admission && recovery_dispatch_admission &&
+        conventional_periodic && conventional_physical &&
+        igr_periodic && igr_physical && bounded_deep_qualification &&
+        failure_injection && checkpoint_restart);
+    if (!passed && rank == 0)
+      std::cerr << "partitioned Backward-Euler CUDA smoke failed order="
+                << order << " ranks=" << ranks << " engine="
+                << (selected_cuda_engine == CudaEngineKind::tensor_core
+                        ? "tensor" : "ordinary")
+                << " admission=" << admission
+                << " recovery_dispatch=" << recovery_dispatch_admission
+                << " conventional=" << conventional_periodic << '/'
+                << conventional_physical << " igr=" << igr_periodic << '/'
+                << igr_physical << " deep=" << bounded_deep_qualification
+                << " injection=" << failure_injection
+                << " checkpoint_restart=" << checkpoint_restart
+                << '\n';
+    return passed ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   const bool copied_initial_trace = order > 0 &&
       CheckCopiedInitialTrueTrace(order);
   const bool all_seven_boundary_policies = order > 0 &&

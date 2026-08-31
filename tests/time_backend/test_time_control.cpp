@@ -316,6 +316,22 @@ int main()
   }
 
   {
+    HdgTransactionalTimeAdapter fixed(
+        TimeControl::Fixed(0.0, 1.0, 0.2), OutputSchedule::Disabled(),
+        HdgTimeControlMode::FixedPartitionedBackwardEuler);
+    HdgTransactionalTimeAdapter cfl(
+        TimeControl::CFL(0.0, 1.0, 0.5), OutputSchedule::Disabled(),
+        HdgTimeControlMode::CFLPartitionedBackwardEuler);
+    const StepPlan fixed_plan = fixed.BeginStep();
+    const StepPlan cfl_plan = cfl.BeginStep(0.3, 0.1);
+    checks.Expect(fixed.integrator() == IntegratorTag::BackwardEuler &&
+                    cfl.integrator() == IntegratorTag::BackwardEuler &&
+                    !fixed.UsesCflControl() && cfl.UsesCflControl() &&
+                    Near(fixed_plan.dt, 0.2) && Near(cfl_plan.dt, 0.3),
+                  "partitioned backward-euler retains typed fixed/CFL transactions");
+  }
+
+  {
     HdgTransactionalTimeAdapter adapter(
         TimeControl::CFL(0.0, 1.0, 0.5),
         OutputSchedule::FixedInterval(0.05),
@@ -496,6 +512,15 @@ int main()
                     HdgTimeControlMode::CFLBackwardEuler);
                 },
                 "HDG CFL Backward-Euler rejects fixed control");
+  ExpectInvalid(checks,
+                []
+                {
+                  HdgTransactionalTimeAdapter(
+                    TimeControl::CFL(0.0, 1.0, 0.5),
+                    OutputSchedule::Disabled(),
+                    HdgTimeControlMode::FixedPartitionedBackwardEuler);
+                },
+                "HDG fixed partitioned Backward-Euler rejects CFL control");
   ExpectInvalid(checks,
                 []
                 {

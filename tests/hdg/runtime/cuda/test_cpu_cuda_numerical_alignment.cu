@@ -326,6 +326,8 @@ struct CrossBackendPreparedHealth
   int trace_solves = -1;
   int linear_iterations = -1;
   int linear_solve_attempts = -1;
+  int newton_correction_linear_iterations = -1;
+  int final_coherent_linear_iterations = -1;
   int true_residual_tightenings = -1;
   int line_search_trials = -1;
   int rejected_line_search_trials = -1;
@@ -363,6 +365,10 @@ struct CudaQualificationTestAccess
     health.trace_solves = numerical.trace_solves;
     health.linear_iterations = numerical.linear_iterations;
     health.linear_solve_attempts = numerical.linear_solve_attempts;
+    health.newton_correction_linear_iterations =
+        numerical.newton_correction_linear_iterations;
+    health.final_coherent_linear_iterations =
+        numerical.final_coherent_linear_iterations;
     health.true_residual_tightenings =
         numerical.true_residual_tightenings;
     health.line_search_trials = numerical.line_search_trials;
@@ -388,8 +394,12 @@ struct CudaQualificationTestAccess
       cuda::GenericEulerHdgCudaSession& session,
       CrossBackendPreparedHealth& health) noexcept
   {
-    return session.borrowed_rank1_ &&
-        CapturePreparedHealth(*session.borrowed_rank1_, health);
+    if (session.borrowed_rank1_)
+      return CapturePreparedHealth(*session.borrowed_rank1_, health);
+    if (session.partitioned_backward_euler_borrowed_rank1_)
+      return CapturePreparedHealth(
+          *session.partitioned_backward_euler_borrowed_rank1_, health);
+    return false;
   }
 
   static dg::hdg::generic::HdgEulerSessionResult InitializeTracePolicy(
@@ -434,8 +444,14 @@ struct CudaQualificationTestAccess
       cuda::GenericEulerHdgCudaSession& session,
       std::vector<double>& trace, int& trace_components) noexcept
   {
-    return session.borrowed_rank1_ && ExportCommittedTrace(
-        *session.borrowed_rank1_, trace, trace_components);
+    if (session.borrowed_rank1_)
+      return ExportCommittedTrace(
+          *session.borrowed_rank1_, trace, trace_components);
+    if (session.partitioned_backward_euler_borrowed_rank1_)
+      return ExportCommittedTrace(
+          *session.partitioned_backward_euler_borrowed_rank1_, trace,
+          trace_components);
+    return false;
   }
 };
 
@@ -455,6 +471,7 @@ using dg::hdg::generic::EulerBoundaryPolicyTableView;
 using dg::hdg::generic::EulerHdgAssemblyQuadratureOrders;
 using dg::hdg::generic::EulerHdgNumericalPolicy;
 using dg::hdg::generic::EulerHdgRequest;
+using dg::hdg::generic::EulerHdgTimeTreatment;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::runtime::StateCoordinates;
 using dg::hdg::runtime::cpu::CpuAttemptStatus;
@@ -481,6 +498,8 @@ constexpr double igr_minimum_near_energy_fraction = 0.60;
 struct AlignmentSelection
 {
   int order = 1;
+  EulerHdgTimeTreatment time_treatment =
+      EulerHdgTimeTreatment::backward_euler;
   EulerHdgAssemblyQuadratureOrders igr_assembly_quadrature_orders{0, 0};
   // Zero retains DefaultEulerHdgNumericalPolicy.  Parsing admits only finite
   // positive overrides and the complete policy validator enforces ordering.
@@ -853,6 +872,7 @@ EulerHdgRequest MakeRequest(
       : EulerBoundaryPolicyTableView{nullptr, 0, 2, 1.4};
   request.numerical_policy = SelectedNumericalPolicy(
       selection, specification.regularization);
+  request.time_treatment = selection.time_treatment;
   return request;
 }
 
@@ -1120,6 +1140,36 @@ Trajectory RunCpu(const EulerHdgRequest& request,
     if (!core.AdvanceBorrowedEuler(specification.dt, coordinates))
       return trajectory;
     const auto& attempt = core.evidence().last_attempt;
+    const bool partitioned_igr =
+        request.time_treatment ==
+            EulerHdgTimeTreatment::partitioned_backward_euler &&
+        specification.regularization == RegularizationKind::igr;
+    const std::uint64_t expected_reconstructions =
+        attempt.work.accepted_newton_updates + (partitioned_igr ? 2U : 1U);
+    const bool work_accounting = attempt.nonlinear_updates >= 0 &&
+        attempt.work.accepted_newton_updates ==
+            static_cast<std::uint64_t>(attempt.nonlinear_updates) &&
+        attempt.work.complete_trace_solves == expected_reconstructions &&
+        attempt.work.complete_factor_setups ==
+            attempt.work.complete_trace_solves &&
+        attempt.work.complete_condensations ==
+            attempt.work.complete_trace_solves &&
+        attempt.work.complete_recoveries ==
+            attempt.work.complete_trace_solves &&
+        attempt.work.trial_reassemblies >=
+            attempt.work.accepted_newton_updates &&
+        attempt.linear_iterations >= 0 &&
+        attempt.newton_correction_linear_iterations >= 0 &&
+        attempt.final_coherent_linear_iterations >= 0 &&
+        static_cast<long long>(attempt.linear_iterations) ==
+            static_cast<long long>(
+                attempt.newton_correction_linear_iterations) +
+                attempt.final_coherent_linear_iterations &&
+        attempt.linear_solve_attempts >= 0 &&
+        attempt.true_residual_tightenings >= 0 &&
+        static_cast<long long>(attempt.linear_solve_attempts) ==
+            static_cast<long long>(attempt.work.complete_trace_solves) +
+                attempt.true_residual_tightenings;
     bool conservation_gate = true;
     double conservation_error = 0.0;
     double conservation_relative_error = 0.0;
@@ -1129,6 +1179,7 @@ Trajectory RunCpu(const EulerHdgRequest& request,
                 core, conservation_error, conservation_relative_error,
                 conservation_gate);
     const bool health = conservation_ready && conservation_gate &&
+        work_accounting &&
         attempt.status == CpuAttemptStatus::success && attempt.committed &&
         attempt.finite_gate && attempt.admissibility_gate &&
         attempt.recovery_gate && attempt.nonlinear_gate &&
@@ -1239,6 +1290,30 @@ Trajectory RunCuda(const EulerHdgRequest& request,
     CrossBackendPreparedHealth health;
     const bool captured =
         CudaQualificationTestAccess::CapturePreparedHealth(session, health);
+    const bool partitioned_igr =
+        request.time_treatment ==
+            EulerHdgTimeTreatment::partitioned_backward_euler &&
+        specification.regularization == RegularizationKind::igr;
+    const int final_trace_solves = partitioned_igr ? 2 : 1;
+    const bool work_accounting = health.nonlinear_updates >= 0 &&
+        health.trace_solves ==
+            health.nonlinear_updates + final_trace_solves &&
+        health.linear_iterations >= 0 &&
+        health.newton_correction_linear_iterations >= 0 &&
+        health.final_coherent_linear_iterations >= 0 &&
+        static_cast<long long>(health.linear_iterations) ==
+            static_cast<long long>(
+                health.newton_correction_linear_iterations) +
+                health.final_coherent_linear_iterations &&
+        health.linear_solve_attempts >= health.trace_solves &&
+        health.true_residual_tightenings >= 0 &&
+        static_cast<long long>(health.linear_solve_attempts) ==
+            static_cast<long long>(health.trace_solves) +
+                health.true_residual_tightenings &&
+        health.line_search_trials >= 0 &&
+        health.rejected_line_search_trials >= 0 &&
+        health.line_search_trials == health.nonlinear_updates +
+            health.rejected_line_search_trials;
     const bool expected_engine =
         health.tensor_core.selected_engine == request.backend.cuda_engine &&
         dg::hdg::runtime::cuda_w8a::detail::
@@ -1257,19 +1332,12 @@ Trajectory RunCuda(const EulerHdgRequest& request,
              : health.tensor_core.hardware_supported &&
                    health.tensor_core.condensation_launches > 0 &&
                    health.tensor_core.mma_tiles > 0);
-    const bool healthy = captured && health.success && health.finite &&
+    const bool healthy = captured && work_accounting && health.success &&
+        health.finite &&
         health.admissible && health.recovery && health.true_residual &&
         health.conservation && expected_engine &&
-        health.nonlinear_updates >= 0 &&
         health.nonlinear_updates <=
             request.numerical_policy.maximum_nonlinear_updates &&
-        health.trace_solves >= 1 &&
-        health.linear_iterations >= 0 &&
-        health.linear_solve_attempts ==
-            health.trace_solves + health.true_residual_tightenings &&
-        health.true_residual_tightenings >= 0 &&
-        health.line_search_trials >= 0 &&
-        health.rejected_line_search_trials >= 0 &&
         std::isfinite(health.initial_residual) &&
         std::isfinite(health.final_residual) &&
         health.final_residual <=
@@ -1372,11 +1440,12 @@ bool CompareTrajectory(const Case& specification,
                     device.sigma.far_mean_square) &&
          near_sigma(reference.sigma.near_energy_fraction,
                     device.sigma.near_energy_fraction));
-    // Sigma is neutral at generation zero.  Every accepted state of the two
-    // discontinuous IGR cases must thereafter carry finite nonzero energy
-    // concentrated near the declared off-grid velocity transition.  These
-    // are global quadrature integrals, so no coefficient or rank ordering is
-    // part of the qualification.
+    // Fully coupled Backward Euler retains its neutral generation-zero sigma;
+    // partitioned Backward Euler instead initializes a coherent scalar-closure
+    // witness.  Every accepted state of the two discontinuous IGR cases must
+    // carry finite nonzero energy concentrated near the declared off-grid
+    // velocity transition.  These are global quadrature integrals, so no
+    // coefficient or rank ordering is part of the qualification.
     const bool require_localization =
         specification.require_localized_sigma && index != 0;
     const bool sigma_localization = !require_localization ||
@@ -1576,6 +1645,8 @@ bool ValidAlignmentSelection(
           selection.tensor_igr_trace_policy);
   return dg::hdg::generic::ValidEulerHdgNumericalPolicy(conventional) &&
       dg::hdg::generic::ValidEulerHdgNumericalPolicy(igr) &&
+      dg::hdg::generic::IsKnownEulerHdgTimeTreatment(
+          selection.time_treatment) &&
       dg::hdg::runtime::cuda_w8a::CudaTracePolicyDescriptorIsExact(
           tensor_igr_trace);
 }
@@ -1591,6 +1662,7 @@ bool ParseSelection(const int argc, char* argv[],
   bool have_final_tolerance = false;
   bool have_tightening_tolerance = false;
   bool have_tensor_igr_trace_policy = false;
+  bool have_time_treatment = false;
   bool have_validate_options_only = false;
   for (int argument = 1; argument < argc; ++argument)
   {
@@ -1647,6 +1719,19 @@ bool ParseSelection(const int argc, char* argv[],
           argv[++argument], selection.tensor_igr_trace_policy);
       if (!have_tensor_igr_trace_policy) return false;
     }
+    else if (option == "--time-treatment" &&
+             argument + 1 < argc && !have_time_treatment)
+    {
+      const std::string_view treatment(argv[++argument]);
+      have_time_treatment = true;
+      if (treatment == "backward-euler")
+        selection.time_treatment = EulerHdgTimeTreatment::backward_euler;
+      else if (treatment == "partitioned-backward-euler")
+        selection.time_treatment =
+            EulerHdgTimeTreatment::partitioned_backward_euler;
+      else
+        return false;
+    }
     else if (option == "--validate-options-only" &&
              !have_validate_options_only)
     {
@@ -1667,6 +1752,7 @@ void PrintUsage(const char* const executable)
   std::cerr
       << "Usage: " << executable
       << " [--order 1|2|3]"
+         " [--time-treatment backward-euler|partitioned-backward-euler]"
          " [--igr-volume-quadrature-order Q"
          " --igr-face-quadrature-order Q]"
          " [--newton-linear-rtol R] [--final-linear-rtol R]"
@@ -1713,7 +1799,10 @@ int main(int argc, char* argv[])
             CudaEngineKind::tensor_core, true, 1, order,
             selection.tensor_igr_trace_policy);
     std::cout << "HDG numerical-alignment option validation passed order="
-              << order << " igr_quadrature="
+              << order << " time_treatment="
+              << dg::hdg::generic::EulerHdgTimeTreatmentName(
+                     selection.time_treatment)
+              << " igr_quadrature="
               << igr.igr_assembly_quadrature_orders.volume_order << '/'
               << igr.igr_assembly_quadrature_orders.face_order
               << " linear_tolerances="
@@ -1856,7 +1945,10 @@ int main(int argc, char* argv[])
             selection.tensor_igr_trace_policy);
     std::cout << "HDG CPU/ordinary-CUDA/tensor-CUDA numerical alignment and "
                  "IGR discontinuity qualification passed order="
-              << order << " igr_quadrature="
+              << order << " time_treatment="
+              << dg::hdg::generic::EulerHdgTimeTreatmentName(
+                     selection.time_treatment)
+              << " igr_quadrature="
               << igr.igr_assembly_quadrature_orders.volume_order << '/'
               << igr.igr_assembly_quadrature_orders.face_order
               << " linear_tolerances="

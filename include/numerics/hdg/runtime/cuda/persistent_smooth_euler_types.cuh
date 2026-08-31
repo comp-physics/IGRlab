@@ -103,6 +103,36 @@ inline constexpr int maximum_allocation_events = 64;
 inline constexpr int assembly_quadrature_order = 11;
 inline constexpr int functional_assembly_quadrature_order = 14;
 
+/**
+ * Private rank-one trace work selector.
+ *
+ * This is not a mathematical-layout or backend-selection ABI: every mode
+ * retains the complete Uhat4/sigmahat vectors and true matrix.  The two
+ * projected values are admitted only for the corresponding partitioned-IGR
+ * tensor solve and otherwise fail closed at the native launch seam.
+ */
+enum class CudaNativeTraceActiveSubspace : std::uint8_t
+{
+  full = 0,
+  euler_uhat4 = 1,
+  scalar_sigmahat = 2
+};
+
+constexpr bool IsKnownCudaNativeTraceActiveSubspace(
+    const CudaNativeTraceActiveSubspace subspace) noexcept
+{
+  return subspace == CudaNativeTraceActiveSubspace::full ||
+      subspace == CudaNativeTraceActiveSubspace::euler_uhat4 ||
+      subspace == CudaNativeTraceActiveSubspace::scalar_sigmahat;
+}
+
+constexpr bool CudaNativeTraceActiveSubspaceIsProjected(
+    const CudaNativeTraceActiveSubspace subspace) noexcept
+{
+  return subspace == CudaNativeTraceActiveSubspace::euler_uhat4 ||
+      subspace == CudaNativeTraceActiveSubspace::scalar_sigmahat;
+}
+
 enum class CudaFailurePhase : unsigned char
 {
   setup,
@@ -592,6 +622,8 @@ struct CudaConfig
   bool use_generic_numerical_policy = false;
   generic::EulerHdgNumericalPolicy numerical_policy =
       generic::DefaultEulerHdgNumericalPolicy(polynomial_order);
+  generic::EulerHdgTimeTreatment time_treatment =
+      generic::EulerHdgTimeTreatment::backward_euler;
   bool capture_oracle = false;
   bool force_private_scientific_gate_failure = false;
   CudaInjection injection{};
@@ -2275,6 +2307,10 @@ struct CudaStepEvidence
   int linear_solve_attempts = 0;
   int newton_correction_linear_iterations = 0;
   int final_coherent_linear_iterations = 0;
+  int scalar_closure_solves = 0;
+  int scalar_closure_linear_iterations = 0;
+  int scalar_closure_linear_solve_attempts = 0;
+  int scalar_closure_true_residual_tightenings = 0;
   int true_residual_tightenings = 0;
   int line_search_trials = 0;
   int rejected_line_search_trials = 0;

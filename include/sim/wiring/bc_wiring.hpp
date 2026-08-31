@@ -66,7 +66,7 @@ private:
 
 /// @brief Build a boundary marker map from role/attribute specifications.
 inline BoundaryMarkerMap
-BuildBoundaryMarkers(mfem::ParMesh& pmesh,
+BuildBoundaryMarkers(const mfem::ParMesh& pmesh,
                      std::initializer_list<BoundaryMarkerSpec> specs)
 {
   BoundaryMarkerMap map;

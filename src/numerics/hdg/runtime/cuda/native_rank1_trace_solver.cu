@@ -498,6 +498,72 @@ __host__ __device__ int FieldSplitPackedRow(
   return euler_rows + face * scalar_rows + scalar;
 }
 
+__host__ __device__ constexpr bool NativeTraceActiveSubspaceIsKnown(
+    const NativeTraceActiveSubspace subspace) noexcept
+{
+  return subspace == NativeTraceActiveSubspace::full ||
+      subspace == NativeTraceActiveSubspace::euler_uhat4 ||
+      subspace == NativeTraceActiveSubspace::scalar_sigmahat;
+}
+
+__host__ __device__ constexpr bool NativeTraceActiveSubspaceIsProjected(
+    const NativeTraceActiveSubspace subspace) noexcept
+{
+  return subspace == NativeTraceActiveSubspace::euler_uhat4 ||
+      subspace == NativeTraceActiveSubspace::scalar_sigmahat;
+}
+
+__host__ __device__ int ActivePackedRowBegin(
+    const NativeTraceActiveSubspace subspace,
+    const int patch_rows) noexcept
+{
+  return subspace == NativeTraceActiveSubspace::scalar_sigmahat
+      ? FieldSplitEulerRows(patch_rows) : 0;
+}
+
+__host__ __device__ int ActivePackedRowCount(
+    const NativeTraceActiveSubspace subspace,
+    const int patch_rows) noexcept
+{
+  const int euler_rows = FieldSplitEulerRows(patch_rows);
+  return subspace == NativeTraceActiveSubspace::euler_uhat4
+      ? euler_rows
+      : subspace == NativeTraceActiveSubspace::scalar_sigmahat
+          ? patch_rows - euler_rows : patch_rows;
+}
+
+__host__ __device__ bool PackedRowIsActive(
+    const NativeTraceActiveSubspace subspace, const int patch_rows,
+    const int packed_row) noexcept
+{
+  if (subspace == NativeTraceActiveSubspace::full) return true;
+  const int begin = ActivePackedRowBegin(subspace, patch_rows);
+  const int count = ActivePackedRowCount(subspace, patch_rows);
+  return packed_row >= begin && packed_row < begin + count;
+}
+
+__host__ __device__ bool OriginalPatchRowIsActive(
+    const NativeTraceActiveSubspace subspace, const int patch_rows,
+    const int original_row) noexcept
+{
+  return PackedRowIsActive(
+      subspace, patch_rows,
+      FieldSplitPackedRow(patch_rows, original_row));
+}
+
+__host__ __device__ bool TrueRowIsActive(
+    const NativeTraceActiveSubspace subspace, const int true_rows,
+    const int row) noexcept
+{
+  if (subspace == NativeTraceActiveSubspace::full) return true;
+  const int scalar_rows = true_rows / native_trace_schwarz_igr_components;
+  const int sigma_begin =
+      native_trace_schwarz_euler_components * scalar_rows;
+  return subspace == NativeTraceActiveSubspace::euler_uhat4
+      ? row >= 0 && row < sigma_begin
+      : row >= sigma_begin && row < true_rows;
+}
+
 __host__ __device__ std::size_t FieldSplitSigmaLuOffset(
     const int patch_rows) noexcept
 {
@@ -706,6 +772,79 @@ __device__ void ApplyWarpEquilibratedFieldSplit(
   }
 }
 
+/**
+ * Apply exactly one diagonal field block of the established equilibrated
+ * patch factor.  Partitioned masks make the complementary block and both
+ * cross couplings invariantly zero, so solving the unused identity block or
+ * forming its zero lower-coupling update cannot change the active result.
+ */
+template <int TileWidth>
+__device__ void ApplyWarpEquilibratedFieldSplitActive(
+    const NativeTraceElementSchwarzView schwarz,
+    const NativeTraceActiveSubspace subspace,
+    NativeTraceSolveControl* const control) noexcept
+{
+  static_assert(TileWidth == 16 || TileWidth == 32);
+  const int lane = static_cast<int>(threadIdx.x) % TileWidth;
+  const int tile_in_warp =
+      (static_cast<int>(threadIdx.x) & 31) / TileWidth;
+  const unsigned int mask = TileWidth == 32
+      ? 0xffffffffU : 0xffffU << (16 * tile_in_warp);
+  const int tile = GlobalThreadIndex() / TileWidth;
+  const int tile_stride = GlobalThreadStride() / TileWidth;
+  const int patch_rows = schwarz.patch_rows;
+  const int euler_rows = FieldSplitEulerRows(patch_rows);
+  const int sigma_rows = patch_rows - euler_rows;
+  const bool euler_active =
+      subspace == NativeTraceActiveSubspace::euler_uhat4;
+  const int block_begin = euler_active ? 0 : euler_rows;
+  const int block_rows = euler_active ? euler_rows : sigma_rows;
+
+  for (int element = tile; element < schwarz.elements;
+       element += tile_stride)
+  {
+    const std::size_t vector_offset =
+        static_cast<std::size_t>(element) * patch_rows;
+    const std::size_t matrix_offset = vector_offset * patch_rows;
+    const double* const storage = schwarz.patch_lu + matrix_offset;
+    const double* const factor = euler_active
+        ? storage : storage + FieldSplitSigmaLuOffset(patch_rows);
+    const double* const left_scale =
+        storage + FieldSplitLeftScaleOffset(patch_rows);
+    const double* const right_scale =
+        storage + FieldSplitRightScaleOffset(patch_rows);
+    const double* const inverse_diagonal =
+        storage + FieldSplitWarpInverseDiagonalOffset(patch_rows) +
+        block_begin;
+    const double* const rhs_permutation =
+        storage + FieldSplitWarpRhsPermutationOffset(patch_rows);
+    const double* const rhs = schwarz.element_rhs + vector_offset;
+    double* const solution = schwarz.element_solution + vector_offset;
+
+    for (int local = lane; local < block_rows; local += TileWidth)
+    {
+      const int packed = block_begin + local;
+      const int source = static_cast<int>(rhs_permutation[packed]);
+      const int original = FieldSplitOriginalRow(patch_rows, source);
+      const double value = left_scale[source] * rhs[original];
+      solution[packed] = value;
+      if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
+    }
+    __syncwarp(mask);
+    SolveFieldSplitLuCooperatively<TileWidth>(
+        factor, inverse_diagonal, block_rows,
+        solution + block_begin, lane, mask);
+    for (int local = lane; local < block_rows; local += TileWidth)
+    {
+      const int packed = block_begin + local;
+      solution[packed] *= right_scale[packed];
+      if (!isfinite(solution[packed]))
+        MarkFailure(control, failure_nonfinite);
+    }
+    __syncwarp(mask);
+  }
+}
+
 __device__ void ValidateElementSchwarz(
     const NativeTraceElementSchwarzView schwarz,
     const bool equilibrated_field_split,
@@ -859,6 +998,87 @@ __device__ void ValidateFixedSigmaJacobiRows(
     if (sigma_field < 0)
       MarkFailure(control, failure_invalid_preconditioner);
     if (sigma_field != (row >= sigma_begin ? 1 : 0))
+      MarkFailure(control, failure_invalid_preconditioner);
+  }
+  grid.sync();
+}
+
+/**
+ * Prove the invariant subspace before any projected Krylov work begins.
+ *
+ * The partitioned masks are required to produce an exactly zero complementary
+ * RHS and exactly zero active/complement couplings in both the assembled and
+ * retained element operators.  The full matrix remains available for the
+ * application-level FP64 residual rebuild; this private check only authorizes
+ * omission of work that is mathematically guaranteed to stay zero.
+ */
+__device__ void ValidateProjectedActiveSubspace(
+    const NativeTraceSystemView system,
+    const NativeTraceElementSchwarzView schwarz,
+    NativeTraceSolveControl* control,
+    const cg::grid_group& grid) noexcept
+{
+  const NativeTraceActiveSubspace subspace = system.active_subspace;
+  const int rows = system.matrix.rows;
+  const int patch_rows = schwarz.patch_rows;
+  const int thread = GlobalThreadIndex();
+  const int stride = GlobalThreadStride();
+  if (grid.thread_rank() == 0 &&
+      (!NativeTraceActiveSubspaceIsProjected(subspace) ||
+       rows <= 0 || rows % native_trace_schwarz_igr_components != 0 ||
+       patch_rows <= 0 ||
+       patch_rows % (native_trace_schwarz_faces *
+                     native_trace_schwarz_igr_components) != 0))
+    MarkFailure(control, failure_invalid_system);
+
+  for (int row = thread; row < rows; row += stride)
+  {
+    const bool row_active = TrueRowIsActive(subspace, rows, row);
+    if (!row_active && system.rhs[row] != 0.0)
+      MarkFailure(control, failure_invalid_system);
+    const int begin = system.matrix.row_offsets[row];
+    const int end = system.matrix.row_offsets[row + 1];
+    for (int entry = begin; entry < end; ++entry)
+    {
+      const int column = system.matrix.columns[entry];
+      const bool column_active =
+          TrueRowIsActive(subspace, rows, column);
+      if (row_active != column_active &&
+          system.matrix.values[entry] != 0.0)
+        MarkFailure(control, failure_invalid_system);
+    }
+  }
+
+  const int element_slots = schwarz.elements * patch_rows;
+  const int element_entries = element_slots * patch_rows;
+  for (int entry = thread; entry < element_entries; entry += stride)
+  {
+    const int local_entry = entry % (patch_rows * patch_rows);
+    const int local_row = local_entry / patch_rows;
+    const int local_column = local_entry - local_row * patch_rows;
+    const bool row_active = OriginalPatchRowIsActive(
+        subspace, patch_rows, local_row);
+    const bool column_active = OriginalPatchRowIsActive(
+        subspace, patch_rows, local_column);
+    const double value = system.element_schur[entry];
+    if ((row_active != column_active && value != 0.0) ||
+        (!row_active && !column_active &&
+         value != (local_row == local_column ? 1.0 : 0.0)))
+      MarkFailure(control, failure_invalid_system);
+  }
+
+  // The static signed maps must identify the same field partition in local
+  // face-major and global component-major numbering.  This also makes a stale
+  // or incompatible topology fail closed before projected gather/scatter.
+  for (int slot = thread; slot < element_slots; slot += stride)
+  {
+    double sign = 1.0;
+    const int truth = DecodeSignedDof(
+        schwarz.signed_element_true_dofs[slot], sign);
+    const bool local_active = OriginalPatchRowIsActive(
+        subspace, patch_rows, slot % patch_rows);
+    const bool true_active = TrueRowIsActive(subspace, rows, truth);
+    if (local_active != true_active)
       MarkFailure(control, failure_invalid_preconditioner);
   }
   grid.sync();
@@ -1127,6 +1347,8 @@ __device__ void ApplyTraceOperator(
       preconditioner.element_schwarz;
   const int patch_rows = schwarz.patch_rows;
   const int element_slots = schwarz.elements * patch_rows;
+  const NativeTraceActiveSubspace subspace = system.active_subspace;
+  const bool projected = NativeTraceActiveSubspaceIsProjected(subspace);
   const int thread = GlobalThreadIndex();
   const int stride = GlobalThreadStride();
   if (grid.thread_rank() == 0) ++control->operator_applications;
@@ -1134,46 +1356,109 @@ __device__ void ApplyTraceOperator(
 
   // Exact FP64 T gather and row-major S_e action. Each element row is owned
   // by one thread and accumulates columns in increasing local order.
-  for (int slot = thread; slot < element_slots; slot += stride)
+  if (projected)
   {
-    const int element = slot / patch_rows;
-    const int row = slot - element * patch_rows;
-    const std::size_t row_offset =
-        (static_cast<std::size_t>(element) * patch_rows + row) * patch_rows;
-    const std::size_t map_offset =
-        static_cast<std::size_t>(element) * patch_rows;
-    double value = 0.0;
-    for (int column = 0; column < patch_rows; ++column)
+    const int active_begin = ActivePackedRowBegin(subspace, patch_rows);
+    const int active_rows = ActivePackedRowCount(subspace, patch_rows);
+    const int action_slots = schwarz.elements * active_rows;
+    for (int action_slot = thread; action_slot < action_slots;
+         action_slot += stride)
     {
-      double sign = 1.0;
-      const int truth = DecodeSignedDof(
-          schwarz.signed_element_true_dofs[map_offset + column], sign);
-      value += system.element_schur[row_offset + column] *
-          sign * input[truth];
+      const int element = action_slot / active_rows;
+      const int active_row = action_slot - element * active_rows;
+      const int row = FieldSplitOriginalRow(
+          patch_rows, active_begin + active_row);
+      const std::size_t row_offset =
+          (static_cast<std::size_t>(element) * patch_rows + row) * patch_rows;
+      const std::size_t map_offset =
+          static_cast<std::size_t>(element) * patch_rows;
+      double value = 0.0;
+      for (int active_column = 0; active_column < active_rows;
+           ++active_column)
+      {
+        const int column = FieldSplitOriginalRow(
+            patch_rows, active_begin + active_column);
+        double sign = 1.0;
+        const int truth = DecodeSignedDof(
+            schwarz.signed_element_true_dofs[map_offset + column], sign);
+        value += system.element_schur[row_offset + column] *
+            sign * input[truth];
+      }
+      schwarz.element_solution[map_offset + row] = value;
+      if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
     }
-    schwarz.element_solution[slot] = value;
-    if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
+  }
+  else
+  {
+    for (int slot = thread; slot < element_slots; slot += stride)
+    {
+      const int element = slot / patch_rows;
+      const int row = slot - element * patch_rows;
+      const std::size_t row_offset =
+          (static_cast<std::size_t>(element) * patch_rows + row) * patch_rows;
+      const std::size_t map_offset =
+          static_cast<std::size_t>(element) * patch_rows;
+      double value = 0.0;
+      for (int column = 0; column < patch_rows; ++column)
+      {
+        double sign = 1.0;
+        const int truth = DecodeSignedDof(
+            schwarz.signed_element_true_dofs[map_offset + column], sign);
+        value += system.element_schur[row_offset + column] *
+            sign * input[truth];
+      }
+      schwarz.element_solution[slot] = value;
+      if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
+    }
   }
   grid.sync();
 
   // Exact FP64 T^T reduction. Static incidence order makes the one/two-term
   // sum deterministic and avoids global atomics.
-  for (int row = thread; row < system.matrix.rows; row += stride)
+  if (projected)
   {
-    double value = 0.0;
-    for (int incidence = 0;
-         incidence < native_trace_schwarz_maximum_incidence; ++incidence)
+    for (int row = thread; row < system.matrix.rows; row += stride)
     {
-      const int slot = schwarz.true_incidence_slots[
-          native_trace_schwarz_maximum_incidence * row + incidence];
-      if (slot < 0) continue;
-      double sign = 1.0;
-      (void)DecodeSignedDof(
-          schwarz.signed_element_true_dofs[slot], sign);
-      value += sign * schwarz.element_solution[slot];
+      if (!TrueRowIsActive(subspace, system.matrix.rows, row))
+      {
+        output[row] = 0.0;
+        continue;
+      }
+      double value = 0.0;
+      for (int incidence = 0;
+           incidence < native_trace_schwarz_maximum_incidence; ++incidence)
+      {
+        const int slot = schwarz.true_incidence_slots[
+            native_trace_schwarz_maximum_incidence * row + incidence];
+        if (slot < 0) continue;
+        double sign = 1.0;
+        (void)DecodeSignedDof(
+            schwarz.signed_element_true_dofs[slot], sign);
+        value += sign * schwarz.element_solution[slot];
+      }
+      output[row] = value;
+      if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
     }
-    output[row] = value;
-    if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
+  }
+  else
+  {
+    for (int row = thread; row < system.matrix.rows; row += stride)
+    {
+      double value = 0.0;
+      for (int incidence = 0;
+           incidence < native_trace_schwarz_maximum_incidence; ++incidence)
+      {
+        const int slot = schwarz.true_incidence_slots[
+            native_trace_schwarz_maximum_incidence * row + incidence];
+        if (slot < 0) continue;
+        double sign = 1.0;
+        (void)DecodeSignedDof(
+            schwarz.signed_element_true_dofs[slot], sign);
+        value += sign * schwarz.element_solution[slot];
+      }
+      output[row] = value;
+      if (!isfinite(value)) MarkFailure(control, failure_nonfinite);
+    }
   }
   grid.sync();
 }
@@ -1308,32 +1593,75 @@ __device__ void ApplyPreconditioner(
             preconditioner.kind);
     const int patch_rows = schwarz.patch_rows;
     const int element_slots = schwarz.elements * patch_rows;
+    const NativeTraceActiveSubspace subspace = system.active_subspace;
+    const bool projected = NativeTraceActiveSubspaceIsProjected(subspace);
 
-    // Gather the complete signed patch RHS before touching output. The final
-    // GMRES update intentionally permits input == output.
-    for (int slot = thread; slot < element_slots; slot += stride)
+    // Gather the complete active signed patch RHS before touching output. The
+    // final GMRES update intentionally permits input == output. Full solves
+    // retain their established complete-patch path byte for byte.
+    if (projected)
     {
-      double sign = 1.0;
-      const int truth = DecodeSignedDof(
-          schwarz.signed_element_true_dofs[slot], sign);
-      schwarz.element_rhs[slot] = sign * input[truth];
-      if (!equilibrated_field_split)
-        schwarz.element_solution[slot] = schwarz.element_rhs[slot];
+      const int active_begin = ActivePackedRowBegin(subspace, patch_rows);
+      const int active_rows = ActivePackedRowCount(subspace, patch_rows);
+      const int gather_slots = schwarz.elements * active_rows;
+      for (int gather_slot = thread; gather_slot < gather_slots;
+           gather_slot += stride)
+      {
+        const int element = gather_slot / active_rows;
+        const int active_row = gather_slot - element * active_rows;
+        const int local_row = FieldSplitOriginalRow(
+            patch_rows, active_begin + active_row);
+        const int slot = element * patch_rows + local_row;
+        double sign = 1.0;
+        const int truth = DecodeSignedDof(
+            schwarz.signed_element_true_dofs[slot], sign);
+        schwarz.element_rhs[slot] = sign * input[truth];
+      }
+    }
+    else
+    {
+      for (int slot = thread; slot < element_slots; slot += stride)
+      {
+        double sign = 1.0;
+        const int truth = DecodeSignedDof(
+            schwarz.signed_element_true_dofs[slot], sign);
+        schwarz.element_rhs[slot] = sign * input[truth];
+        if (!equilibrated_field_split)
+          schwarz.element_solution[slot] = schwarz.element_rhs[slot];
+      }
     }
     grid.sync();
 
     if (warp_equilibrated_field_split)
     {
       if (patch_rows == 40)
-        ApplyWarpEquilibratedFieldSplit<16>(schwarz, control);
+      {
+        if (projected)
+          ApplyWarpEquilibratedFieldSplitActive<16>(
+              schwarz, subspace, control);
+        else
+          ApplyWarpEquilibratedFieldSplit<16>(schwarz, control);
+      }
       else
-        ApplyWarpEquilibratedFieldSplit<32>(schwarz, control);
+      {
+        if (projected)
+          ApplyWarpEquilibratedFieldSplitActive<32>(
+              schwarz, subspace, control);
+        else
+          ApplyWarpEquilibratedFieldSplit<32>(schwarz, control);
+      }
       grid.sync();
     }
 
     if constexpr (CoupledWarp)
     {
-      ApplyWarpCoupledPatch(schwarz, control);
+      if (projected)
+      {
+        if (grid.thread_rank() == 0)
+          MarkFailure(control, failure_invalid_preconditioner);
+      }
+      else
+        ApplyWarpCoupledPatch(schwarz, control);
       grid.sync();
     }
 
@@ -1415,72 +1743,86 @@ __device__ void ApplyPreconditioner(
         {
           const int euler_rows = FieldSplitEulerRows(patch_rows);
           const int sigma_rows = patch_rows - euler_rows;
+          const bool validate_euler = !projected ||
+              subspace == NativeTraceActiveSubspace::euler_uhat4;
+          const bool validate_sigma = !projected ||
+              subspace == NativeTraceActiveSubspace::scalar_sigmahat;
           double euler_matrix_norm = 0.0;
           double euler_solution_norm = 0.0;
           double euler_rhs_norm = 0.0;
           double euler_residual_norm = 0.0;
-          for (int euler_row = 0; euler_row < euler_rows; ++euler_row)
+          if (validate_euler)
           {
-            const int original_row =
-                FieldSplitOriginalRow(patch_rows, euler_row);
-            double row_norm = 0.0;
-            double residual = -rhs[original_row];
-            euler_solution_norm = fmax(
-                euler_solution_norm, fabs(solution[euler_row]));
-            euler_rhs_norm = fmax(euler_rhs_norm, fabs(rhs[original_row]));
-            for (int euler_column = 0; euler_column < euler_rows;
-                 ++euler_column)
+            for (int euler_row = 0; euler_row < euler_rows; ++euler_row)
             {
-              const int original_column =
-                  FieldSplitOriginalRow(patch_rows, euler_column);
-              const double coefficient =
-                  matrix[original_row * patch_rows + original_column];
-              row_norm += fabs(coefficient);
-              residual += coefficient * solution[euler_column];
+              const int original_row =
+                  FieldSplitOriginalRow(patch_rows, euler_row);
+              double row_norm = 0.0;
+              double residual = -rhs[original_row];
+              euler_solution_norm = fmax(
+                  euler_solution_norm, fabs(solution[euler_row]));
+              euler_rhs_norm = fmax(
+                  euler_rhs_norm, fabs(rhs[original_row]));
+              for (int euler_column = 0; euler_column < euler_rows;
+                   ++euler_column)
+              {
+                const int original_column =
+                    FieldSplitOriginalRow(patch_rows, euler_column);
+                const double coefficient =
+                    matrix[original_row * patch_rows + original_column];
+                row_norm += fabs(coefficient);
+                residual += coefficient * solution[euler_column];
+              }
+              euler_matrix_norm = fmax(euler_matrix_norm, row_norm);
+              euler_residual_norm = fmax(
+                  euler_residual_norm, fabs(residual));
             }
-            euler_matrix_norm = fmax(euler_matrix_norm, row_norm);
-            euler_residual_norm = fmax(
-                euler_residual_norm, fabs(residual));
           }
 
           double sigma_matrix_norm = 0.0;
           double sigma_solution_norm = 0.0;
           double sigma_rhs_norm = 0.0;
           double sigma_residual_norm = 0.0;
-          for (int sigma_row = 0; sigma_row < sigma_rows; ++sigma_row)
+          if (validate_sigma)
           {
-            const int packed_row = euler_rows + sigma_row;
-            const int original_row =
-                FieldSplitOriginalRow(patch_rows, packed_row);
-            double adjusted_rhs = rhs[original_row];
-            for (int euler_column = 0; euler_column < euler_rows;
-                 ++euler_column)
+            for (int sigma_row = 0; sigma_row < sigma_rows; ++sigma_row)
             {
-              const int original_column =
-                  FieldSplitOriginalRow(patch_rows, euler_column);
-              adjusted_rhs -=
-                  matrix[original_row * patch_rows + original_column] *
-                  solution[euler_column];
+              const int packed_row = euler_rows + sigma_row;
+              const int original_row =
+                  FieldSplitOriginalRow(patch_rows, packed_row);
+              double adjusted_rhs = rhs[original_row];
+              if (!projected)
+              {
+                for (int euler_column = 0; euler_column < euler_rows;
+                     ++euler_column)
+                {
+                  const int original_column =
+                      FieldSplitOriginalRow(patch_rows, euler_column);
+                  adjusted_rhs -=
+                      matrix[original_row * patch_rows + original_column] *
+                      solution[euler_column];
+                }
+              }
+              double row_norm = 0.0;
+              double residual = -adjusted_rhs;
+              sigma_solution_norm = fmax(
+                  sigma_solution_norm, fabs(solution[packed_row]));
+              sigma_rhs_norm = fmax(sigma_rhs_norm, fabs(adjusted_rhs));
+              for (int sigma_column = 0; sigma_column < sigma_rows;
+                   ++sigma_column)
+              {
+                const int packed_column = euler_rows + sigma_column;
+                const int original_column =
+                    FieldSplitOriginalRow(patch_rows, packed_column);
+                const double coefficient =
+                    matrix[original_row * patch_rows + original_column];
+                row_norm += fabs(coefficient);
+                residual += coefficient * solution[packed_column];
+              }
+              sigma_matrix_norm = fmax(sigma_matrix_norm, row_norm);
+              sigma_residual_norm = fmax(
+                  sigma_residual_norm, fabs(residual));
             }
-            double row_norm = 0.0;
-            double residual = -adjusted_rhs;
-            sigma_solution_norm = fmax(
-                sigma_solution_norm, fabs(solution[packed_row]));
-            sigma_rhs_norm = fmax(sigma_rhs_norm, fabs(adjusted_rhs));
-            for (int sigma_column = 0; sigma_column < sigma_rows;
-                 ++sigma_column)
-            {
-              const int packed_column = euler_rows + sigma_column;
-              const int original_column =
-                  FieldSplitOriginalRow(patch_rows, packed_column);
-              const double coefficient =
-                  matrix[original_row * patch_rows + original_column];
-              row_norm += fabs(coefficient);
-              residual += coefficient * solution[packed_column];
-            }
-            sigma_matrix_norm = fmax(sigma_matrix_norm, row_norm);
-            sigma_residual_norm = fmax(
-                sigma_residual_norm, fabs(residual));
           }
           const double euler_backward_error = euler_residual_norm /
               fmax(euler_matrix_norm * euler_solution_norm + euler_rhs_norm,
@@ -1490,10 +1832,12 @@ __device__ void ApplyPreconditioner(
                    0x1p-1022);
           const double backward_error_limit =
               4096.0 * 2.2204460492503131e-16 * patch_rows;
-          if (!isfinite(euler_backward_error) ||
-              !isfinite(sigma_backward_error) ||
-              euler_backward_error > backward_error_limit ||
-              sigma_backward_error > backward_error_limit)
+          if ((validate_euler &&
+               (!isfinite(euler_backward_error) ||
+                euler_backward_error > backward_error_limit)) ||
+              (validate_sigma &&
+               (!isfinite(sigma_backward_error) ||
+                sigma_backward_error > backward_error_limit)))
             MarkFailure(control, failure_invalid_preconditioner);
         }
         else
@@ -1534,28 +1878,61 @@ __device__ void ApplyPreconditioner(
     // One thread owns one true row and reduces its static one/two element
     // incidences in fixed order. This is deterministic inverse-multiplicity
     // weighting and uses no global atomics.
-    for (int row = thread; row < rows; row += stride)
+    if (projected)
     {
-      double value = 0.0;
-      int multiplicity = 0;
-      for (int incidence = 0;
-           incidence < native_trace_schwarz_maximum_incidence; ++incidence)
+      for (int row = thread; row < rows; row += stride)
       {
-        const int slot = schwarz.true_incidence_slots[
-            native_trace_schwarz_maximum_incidence * row + incidence];
-        if (slot < 0) continue;
-        double sign = 1.0;
-        (void)DecodeSignedDof(
-            schwarz.signed_element_true_dofs[slot], sign);
-        const int solution_slot = equilibrated_field_split
-            ? (slot / patch_rows) * patch_rows +
-                FieldSplitPackedRow(patch_rows, slot % patch_rows)
-            : slot;
-        value += sign * schwarz.element_solution[solution_slot];
-        ++multiplicity;
+        if (!TrueRowIsActive(subspace, rows, row))
+        {
+          output[row] = 0.0;
+          continue;
+        }
+        double value = 0.0;
+        int multiplicity = 0;
+        for (int incidence = 0;
+             incidence < native_trace_schwarz_maximum_incidence; ++incidence)
+        {
+          const int slot = schwarz.true_incidence_slots[
+              native_trace_schwarz_maximum_incidence * row + incidence];
+          if (slot < 0) continue;
+          double sign = 1.0;
+          (void)DecodeSignedDof(
+              schwarz.signed_element_true_dofs[slot], sign);
+          const int solution_slot =
+              (slot / patch_rows) * patch_rows +
+              FieldSplitPackedRow(patch_rows, slot % patch_rows);
+          value += sign * schwarz.element_solution[solution_slot];
+          ++multiplicity;
+        }
+        output[row] = value / static_cast<double>(multiplicity);
+        if (!isfinite(output[row])) MarkFailure(control, failure_nonfinite);
       }
-      output[row] = value / static_cast<double>(multiplicity);
-      if (!isfinite(output[row])) MarkFailure(control, failure_nonfinite);
+    }
+    else
+    {
+      for (int row = thread; row < rows; row += stride)
+      {
+        double value = 0.0;
+        int multiplicity = 0;
+        for (int incidence = 0;
+             incidence < native_trace_schwarz_maximum_incidence; ++incidence)
+        {
+          const int slot = schwarz.true_incidence_slots[
+              native_trace_schwarz_maximum_incidence * row + incidence];
+          if (slot < 0) continue;
+          double sign = 1.0;
+          (void)DecodeSignedDof(
+              schwarz.signed_element_true_dofs[slot], sign);
+          const int solution_slot = equilibrated_field_split
+              ? (slot / patch_rows) * patch_rows +
+                  FieldSplitPackedRow(patch_rows, slot % patch_rows)
+              : slot;
+          value += sign * schwarz.element_solution[solution_slot];
+          ++multiplicity;
+        }
+        output[row] = value / static_cast<double>(multiplicity);
+        if (!isfinite(output[row])) MarkFailure(control, failure_nonfinite);
+      }
     }
     grid.sync();
     return;
@@ -1662,6 +2039,20 @@ __device__ void ApplyFixedSigmaJacobiPreconditioner(
     return;
   }
 
+  NativeTracePreconditionerView base_preconditioner = preconditioner;
+  base_preconditioner.kind =
+      NativeTraceFixedSigmaJacobiBasePreconditioner(preconditioner.kind);
+
+  // Partitioned Euler solves live entirely in Uhat4.  The scalar Jacobi
+  // refinement would repeatedly scan an exactly zero identity-constrained
+  // sigmahat RHS and cannot modify the active result.
+  if (system.active_subspace == NativeTraceActiveSubspace::euler_uhat4)
+  {
+    ApplyPreconditioner<CoupledWarp>(
+        system, base_preconditioner, workspace, input, output, control, grid);
+    return;
+  }
+
   if constexpr (PreserveAliasedInput)
   {
     // The final GMRES update intentionally permits input == output. Preserve
@@ -1677,9 +2068,6 @@ __device__ void ApplyFixedSigmaJacobiPreconditioner(
     sigma_rhs = saved_sigma_rhs;
   }
 
-  NativeTracePreconditionerView base_preconditioner = preconditioner;
-  base_preconditioner.kind =
-      NativeTraceFixedSigmaJacobiBasePreconditioner(preconditioner.kind);
   ApplyPreconditioner<CoupledWarp>(
       system, base_preconditioner, workspace, input, output, control, grid);
   if (control->failure_mask != 0) return;
@@ -1779,6 +2167,15 @@ __global__ void NativeRankOneTraceSolveKernel(
     if (NativeTracePreconditionerIsWarpCoupled(
             kernel_preconditioner_kind) != CoupledWarp)
       MarkFailure(control, failure_invalid_preconditioner);
+    if (!NativeTraceActiveSubspaceIsKnown(system.active_subspace))
+      MarkFailure(control, failure_invalid_system);
+    if (NativeTraceActiveSubspaceIsProjected(system.active_subspace) &&
+        (!FixedSigmaJacobi || CoupledWarp ||
+         !NativeTracePreconditionerIsWarpEquilibratedFieldSplit(
+             kernel_preconditioner_kind) ||
+         system.operator_kind != NativeTraceOperatorKind::
+             element_matrix_free_warp_equilibrated_field_split_fp64))
+      MarkFailure(control, failure_invalid_preconditioner);
   }
 
   ValidateCsr(system.matrix, true, true, failure_invalid_system, control);
@@ -1845,6 +2242,13 @@ __global__ void NativeRankOneTraceSolveKernel(
     MarkFailure(control, failure_invalid_system);
   grid.sync();
   if (FinishOnFailure(grid, control)) return;
+
+  if (NativeTraceActiveSubspaceIsProjected(system.active_subspace))
+  {
+    ValidateProjectedActiveSubspace(
+        system, preconditioner.element_schwarz, control, grid);
+    if (FinishOnFailure(grid, control)) return;
+  }
 
   double* const hessenberg = workspace.small;
   double* const cosine = hessenberg +
@@ -2421,6 +2825,8 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
       NativeTracePreconditionerIsWarpCoupled(kernel_preconditioner_kind);
   const bool use_matrix_free =
       NativeTraceOperatorIsElementMatrixFree(system.operator_kind);
+  const bool use_projected_subspace =
+      NativeTraceActiveSubspaceIsProjected(system.active_subspace);
   const bool use_cgs2 = use_ilu || use_element_schwarz;
   const NativeTraceWorkspaceRequirements requirements =
       QueryNativeTraceWorkspaceRequirements(
@@ -2566,8 +2972,16 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
   }
   int current_device = -1;
   if (!requirements.valid || workspace_overlap || !support.supported ||
+      !NativeTraceActiveSubspaceIsKnown(system.active_subspace) ||
       support.fixed_sigma_jacobi != use_fixed_sigma_jacobi ||
       support.coupled_warp_full_patch != use_coupled_warp_full_patch ||
+      (use_projected_subspace &&
+       (!use_fixed_sigma_jacobi || use_coupled_warp_full_patch ||
+        !use_element_schwarz || !use_matrix_free ||
+        !NativeTracePreconditionerIsWarpEquilibratedFieldSplit(
+            kernel_preconditioner_kind) ||
+        system.operator_kind != NativeTraceOperatorKind::
+            element_matrix_free_warp_equilibrated_field_split_fp64)) ||
       (use_fixed_sigma_jacobi &&
        (fixed_sigma_jacobi_sweeps < 1 ||
         fixed_sigma_jacobi_sweeps >

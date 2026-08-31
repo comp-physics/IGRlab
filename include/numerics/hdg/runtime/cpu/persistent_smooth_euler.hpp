@@ -211,6 +211,7 @@ struct CpuWorkCensus
   std::uint64_t complete_condensations = 0;
   std::uint64_t complete_factor_setups = 0;
   std::uint64_t complete_trace_solves = 0;
+  std::uint64_t complete_scalar_closure_solves = 0;
   std::uint64_t complete_recoveries = 0;
   std::uint64_t trial_reassemblies = 0;
   std::uint64_t accepted_newton_updates = 0;
@@ -263,6 +264,9 @@ struct CpuAttemptEvidence
   int linear_solve_attempts = 0;
   int newton_correction_linear_iterations = 0;
   int final_coherent_linear_iterations = 0;
+  int scalar_closure_linear_iterations = 0;
+  int scalar_closure_linear_solve_attempts = 0;
+  int scalar_closure_true_residual_tightenings = 0;
   int true_residual_tightenings = 0;
   int final_line_search_trials = 0;
   double initial_nonlinear_residual = 0.0;
@@ -792,6 +796,8 @@ public:
                 const RunTelemetry&) noexcept;
   bool CaptureCheckpoint(const CheckpointDescriptor&,
                          CpuCheckpoint&) noexcept;
+  /** Independently certify a loaded partitioned-IGR closure before publish. */
+  bool ValidateRestoredScalarClosure(const CpuStateSlot&) noexcept;
   void CompleteRestore(const RestoreOutcome&,
                        const StateCoordinates&,
                        const RunTelemetry&) noexcept;
@@ -837,6 +843,8 @@ private:
   bool AuditLastBorrowedEulerConservation(
       double& maximum_error, double& maximum_relative_error,
       bool& gate) const noexcept;
+  bool AuditCommittedScalarClosure(
+      double& residual, double& tolerance) noexcept;
   bool InitializeInternal(const CpuPersistentConfig&,
                           const RuntimeTupleDescriptor&,
                           const generic::EulerHdgRequest*,
@@ -1167,6 +1175,10 @@ public:
   RestoreOutcome Restore(const CpuCheckpoint& checkpoint) noexcept
   {
     if (!contract_ || !checkpoint.valid)
+    {
+      return {false, RestartCompatibility::policy_mismatch};
+    }
+    if (!core_.ValidateRestoredScalarClosure(checkpoint.state))
     {
       return {false, RestartCompatibility::policy_mismatch};
     }

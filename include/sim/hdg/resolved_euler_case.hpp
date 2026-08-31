@@ -14,12 +14,13 @@
 namespace dg_sim::hdg
 {
 
-/** Reserved resolved-plan spellings; adapter migration is owned elsewhere. */
+/** Typed time/control pairing retained by one resolved general Euler case. */
 enum class HdgEulerTimeMode
 {
   FixedBackwardEuler,
   CFLBackwardEuler,
-  SSPRKStageReserved,
+  FixedPartitionedBackwardEuler,
+  CFLPartitionedBackwardEuler,
   IMEXReserved
 };
 

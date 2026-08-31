@@ -208,6 +208,7 @@ namespace
 
 using dg::hdg::generic::BackendKind;
 using dg::hdg::generic::CudaEngineKind;
+using dg::hdg::generic::EulerHdgTimeTreatment;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::generic::HdgEulerSessionStatus;
 using dg::hdg::runtime::cpu::GenericEulerCpuSessionStatus;
@@ -230,8 +231,27 @@ struct TestSelection
 {
   CudaTracePolicyKind tensor_igr_trace_policy =
       CudaTracePolicyKind::engine_default;
+  EulerHdgTimeTreatment time_treatment =
+      EulerHdgTimeTreatment::backward_euler;
   bool zero_gradient_only = false;
 };
+
+bool ParseTimeTreatment(
+    const std::string_view text,
+    EulerHdgTimeTreatment& treatment) noexcept
+{
+  if (text == "backward-euler")
+  {
+    treatment = EulerHdgTimeTreatment::backward_euler;
+    return true;
+  }
+  if (text == "partitioned-backward-euler")
+  {
+    treatment = EulerHdgTimeTreatment::partitioned_backward_euler;
+    return true;
+  }
+  return false;
+}
 
 bool ParseExplicitTracePolicy(
     const std::string_view text, CudaTracePolicyKind& policy) noexcept
@@ -261,6 +281,7 @@ bool ParseTestSelection(
 {
   selection = {};
   bool have_trace_policy = false;
+  bool have_time_treatment = false;
   bool have_zero_gradient_only = false;
   std::vector<char*> common_arguments;
   common_arguments.reserve(static_cast<std::size_t>(argc));
@@ -274,6 +295,13 @@ bool ParseTestSelection(
       have_trace_policy = ParseExplicitTracePolicy(
           argv[++argument], selection.tensor_igr_trace_policy);
       if (!have_trace_policy) return false;
+    }
+    else if (option == "--time-treatment" &&
+             argument + 1 < argc && !have_time_treatment)
+    {
+      have_time_treatment = ParseTimeTreatment(
+          argv[++argument], selection.time_treatment);
+      if (!have_time_treatment) return false;
     }
     else if (option == "--zero-gradient-only" &&
              !have_zero_gradient_only)
@@ -296,6 +324,8 @@ bool ParseTestSelection(
       dg::hdg::generic::RegularizationKind::igr;
   if (explicit_policy != have_trace_policy ||
       (explicit_policy && !igr) ||
+      (explicit_policy && selection.time_treatment !=
+          EulerHdgTimeTreatment::backward_euler) ||
       (selection.zero_gradient_only && !igr))
     return false;
   if (!explicit_policy && !selection.zero_gradient_only) return true;
@@ -414,8 +444,10 @@ class ThreeEngineRunner
 {
 public:
   explicit ThreeEngineRunner(
-      const CudaTracePolicyKind tensor_igr_trace_policy) noexcept
-      : tensor_igr_trace_policy_(tensor_igr_trace_policy)
+      const CudaTracePolicyKind tensor_igr_trace_policy,
+      const EulerHdgTimeTreatment time_treatment) noexcept
+      : tensor_igr_trace_policy_(tensor_igr_trace_policy),
+        time_treatment_(time_treatment)
   {
   }
 
@@ -451,42 +483,51 @@ public:
   bool Advance(const EulerHdgRequest& request, const int steps,
                const double dt, mfem::ParGridFunction& committed) const
   {
-    if (request.backend.kind == BackendKind::cpu)
-      return phase_ == 1 && AdvanceCpu(request, steps, dt, committed);
-    if (request.backend.kind != BackendKind::cuda || phase_ < 2)
+    // Keep one spatial/temporal fixture for both typed Backward-Euler
+    // architectures; bind the selection identically for all three engines.
+    EulerHdgRequest selected_request = request;
+    selected_request.time_treatment = time_treatment_;
+    if (selected_request.backend.kind == BackendKind::cpu)
+      return phase_ == 1 &&
+          AdvanceCpu(selected_request, steps, dt, committed);
+    if (selected_request.backend.kind != BackendKind::cuda || phase_ < 2)
       return false;
     const CudaTracePolicyKind trace_policy =
-        request.backend.cuda_engine == CudaEngineKind::tensor_core &&
-                request.numerical_policy.stabilization.kind ==
+        selected_request.backend.cuda_engine == CudaEngineKind::tensor_core &&
+                selected_request.numerical_policy.stabilization.kind ==
                     dg::hdg::generic::RegularizationKind::igr
             ? tensor_igr_trace_policy_
             : CudaTracePolicyKind::engine_default;
     const bool tensor_igr =
-        request.backend.cuda_engine == CudaEngineKind::tensor_core &&
-        request.numerical_policy.stabilization.kind ==
+        selected_request.backend.cuda_engine == CudaEngineKind::tensor_core &&
+        selected_request.numerical_policy.stabilization.kind ==
             dg::hdg::generic::RegularizationKind::igr;
     const CudaTracePolicyDescriptor descriptor = ResolveCudaTracePolicy(
-        request.backend.cuda_engine, tensor_igr, 1,
-        request.polynomial_order, trace_policy);
+        selected_request.backend.cuda_engine, tensor_igr, 1,
+        selected_request.polynomial_order, trace_policy);
     const CudaQualificationRobustBranch robust_branch =
-        CudaTracePolicyUsesNativeElementMatrixFreeWarpRobustCoupled(
-            descriptor.resolved_selection)
+        time_treatment_ == EulerHdgTimeTreatment::backward_euler &&
+            CudaTracePolicyUsesNativeElementMatrixFreeWarpRobustCoupled(
+                descriptor.resolved_selection)
         ? CudaQualificationRobustBranch::any_qualified
         : CudaQualificationRobustBranch::not_applicable;
     return AdvanceCuda(
-        request, steps, dt, committed, trace_policy, robust_branch);
+        selected_request, steps, dt, committed, trace_policy, robust_branch);
   }
 
 private:
   std::unique_ptr<mfem::Device> device_;
   CudaTracePolicyKind tensor_igr_trace_policy_ =
       CudaTracePolicyKind::engine_default;
+  EulerHdgTimeTreatment time_treatment_ =
+      EulerHdgTimeTreatment::backward_euler;
   int phase_ = 0;
 };
 
 bool RunZeroGradientTensorIgrCase(
     const dg::hdg::test::generic_euler_convergence::CaseSelection& test_case,
-    const CudaTracePolicyKind trace_policy)
+    const CudaTracePolicyKind trace_policy,
+    const EulerHdgTimeTreatment time_treatment)
 {
   using namespace dg::hdg::test::generic_euler_convergence;
   const CudaTracePolicyDescriptor descriptor = ResolveCudaTracePolicy(
@@ -515,13 +556,15 @@ bool RunZeroGradientTensorIgrCase(
   if (!ProjectInitialState(wave, initial)) return false;
   const ExecutionSelection execution{
       BackendKind::cuda, CudaEngineKind::tensor_core, "tensor CUDA"};
-  const EulerHdgRequest request = MakeRequest(
+  EulerHdgRequest request = MakeRequest(
       mesh, initial, source, boundary, execution, test_case,
       test_case.igr_assembly_quadrature_orders);
+  request.time_treatment = time_treatment;
   constexpr double dt = 0.02;
   const CudaQualificationRobustBranch robust_branch =
-      CudaTracePolicyUsesNativeElementMatrixFreeWarpRobustCoupled(
-          descriptor.resolved_selection)
+      time_treatment == EulerHdgTimeTreatment::backward_euler &&
+          CudaTracePolicyUsesNativeElementMatrixFreeWarpRobustCoupled(
+              descriptor.resolved_selection)
       ? CudaQualificationRobustBranch::coupled
       : CudaQualificationRobustBranch::not_applicable;
   const bool advanced = AdvanceCuda(
@@ -562,6 +605,8 @@ int main(int argc, char* argv[])
                    " [--newton-linear-rtol R]"
                    " [--final-linear-rtol R]"
                    " [--true-residual-tightening-linear-rtol R]"
+                   " [--time-treatment backward-euler|"
+                   "partitioned-backward-euler]"
                    " [--tensor-igr-trace-policy "
                    "native-element-schwarz-matrix-free-warp-coupled-fp64|"
                    "native-element-schwarz-matrix-free-warp-coupled-sigma-"
@@ -578,13 +623,15 @@ int main(int argc, char* argv[])
 
   if (selection.zero_gradient_only)
     return RunZeroGradientTensorIgrCase(
-        test_case, selection.tensor_igr_trace_policy) ? 0 : 1;
+        test_case, selection.tensor_igr_trace_policy,
+        selection.time_treatment) ? 0 : 1;
 
   const std::array<ExecutionSelection, 3> executions{{
       {BackendKind::cpu, CudaEngineKind::ordinary, "CPU"},
       {BackendKind::cuda, CudaEngineKind::ordinary, "ordinary CUDA"},
       {BackendKind::cuda, CudaEngineKind::tensor_core, "tensor CUDA"}}};
-  ThreeEngineRunner runner(selection.tensor_igr_trace_policy);
+  ThreeEngineRunner runner(
+      selection.tensor_igr_trace_policy, selection.time_treatment);
   const bool passed =
       dg::hdg::test::generic_euler_convergence::RunComparisonCase(
           MPI_COMM_WORLD, test_case, executions, runner);

@@ -856,8 +856,10 @@ BindArenaViews() noexcept
   view_.static_source = take_d(max_i);
   view_.initial_current_interior = take_d(max_i);
   view_.base_interior = take_d(max_i);
+  if (partitioned_backward_euler_)
+    view_.partitioned_base_interior = take_d(
+        generic ? generic_arena_layout_.partitioned_base_interior : 0);
   view_.output_interior = take_d(max_i);
-  view_.delta_interior = take_d(max_i);
   view_.recovered_interior = take_d(max_i);
   view_.work_true_trace = take_d(max_tt);
   view_.initial_current_true_trace = take_d(max_tt);
@@ -1499,6 +1501,7 @@ BuildPersistentTrueSystem() noexcept
         use_element_schwarz ? true : warm_factor_ready &&
             LaunchAndObserveNativeRankOneTraceSolve(
                 warm_factor, {}, 0,
+                CudaNativeTraceActiveSubspace::full,
                 final_coherent_linear_relative_tolerance_,
                 warm);
   }
@@ -1699,6 +1702,7 @@ BuildPersistentTrueSystem() noexcept
                 persistent_warm) &&
             LaunchAndObserveNativeRankOneTraceSolve(
                 persistent_warm_factor, {}, 0,
+                CudaNativeTraceActiveSubspace::full,
                 final_coherent_linear_relative_tolerance_,
                 persistent_warm) &&
             persistent_warm.device_policy &&
@@ -2558,6 +2562,7 @@ LaunchAndObserveNativeRankOneTraceSolve(
     const CudaNativeIlu0FactorView& factor,
     const CudaNativeElementSchwarzView& element_schwarz,
     const std::uint64_t matrix_generation,
+    const CudaNativeTraceActiveSubspace active_subspace,
     const double requested_relative_tolerance,
     CudaSolveDiagnostics& diagnostics,
     CudaNativeTraceSolveObservation* const solve_observation) noexcept
@@ -2576,10 +2581,20 @@ LaunchAndObserveNativeRankOneTraceSolve(
   const bool effective_coupled = effective_preconditioner ==
       CudaTracePreconditionerKind::
           native_element_schwarz_warp_coupled_sigma_jacobi10_fp64;
+  const bool projected_subspace =
+      CudaNativeTraceActiveSubspaceIsProjected(active_subspace);
+  const bool projected_context = partitioned_backward_euler_ &&
+      cuda_engine_ == generic::CudaEngineKind::tensor_core &&
+      ranks_ == 1 && shape_.igr_active &&
+      shape_.trace_components == igr_trace_components &&
+      trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64 &&
+      robust && effective_lower;
   const CudaNativeTraceCooperativeSupport& effective_support =
       robust && effective_coupled
       ? native_trace_robust_coupled_support_ : native_trace_support_;
-  if (trace_solver_kind_ != CudaTraceSolverKind::native_rank1_fp64 ||
+  if (!IsKnownCudaNativeTraceActiveSubspace(active_subspace) ||
+      (projected_subspace && !projected_context) ||
+      trace_solver_kind_ != CudaTraceSolverKind::native_rank1_fp64 ||
       ranks_ != 1 || !true_matrix_ || !hypre_rhs_ || !hypre_solution_ ||
       !native_trace_requirements_.valid ||
       !effective_support.supported ||
@@ -2715,7 +2730,8 @@ LaunchAndObserveNativeRankOneTraceSolve(
   const bool launched = CudaLaunchNativeRankOneTraceSolver(
       current_matrix, view_.true_rhs_scratch, view_.true_solution,
       effective_preconditioner, factor,
-      element_schwarz, trace_operator, native_trace_workspace_,
+      element_schwarz, trace_operator, active_subspace,
+      native_trace_workspace_,
       effective_support,
       requested_relative_tolerance, maximum_linear_iterations_,
       krylov_dimension_, nullptr);
@@ -2837,6 +2853,7 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 SolveTrueSystemAttempt(double& true_relative_residual,
                 const std::uint64_t matrix_generation,
+                const CudaNativeTraceActiveSubspace active_subspace,
                 const double requested_relative_tolerance,
                 const bool same_matrix_retry,
                 int& linear_iterations,
@@ -2856,6 +2873,12 @@ SolveTrueSystemAttempt(double& true_relative_residual,
           trace_policy_descriptor_.resolved_selection) &&
       CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
           trace_preconditioner_);
+  const bool projected_subspace =
+      CudaNativeTraceActiveSubspaceIsProjected(active_subspace);
+  if (!IsKnownCudaNativeTraceActiveSubspace(active_subspace) ||
+      (projected_subspace &&
+       trace_solver_kind_ != CudaTraceSolverKind::native_rank1_fp64))
+    return false;
   std::uint64_t robust_lower_setup_delta = 0;
   std::uint64_t robust_coupled_setup_delta = 0;
   std::uint64_t robust_lower_solve_delta = 0;
@@ -2973,7 +2996,7 @@ SolveTrueSystemAttempt(double& true_relative_residual,
             effective_preconditioner = lower;
             schwarz_factor_ready = true;
           }
-          else if (lower_action ==
+          else if (!projected_subspace && lower_action ==
                    CudaRobustElementSchwarzSetupAction::try_coupled)
           {
             CudaNativeElementSchwarzSetupStatus coupled_status{};
@@ -3016,11 +3039,13 @@ SolveTrueSystemAttempt(double& true_relative_residual,
     solved = ilu_factor_ready && schwarz_factor_ready &&
         LaunchAndObserveNativeRankOneTraceSolve(
             factor, element_schwarz, matrix_generation,
+            active_subspace,
             requested_relative_tolerance, diagnostics,
             &native_observation);
     constexpr std::uint32_t invalid_preconditioner_failure_mask = 1U << 2;
     const bool lower_application_structurally_rejected =
-        robust && !same_matrix_retry && !solved && diagnostics.device_policy &&
+        robust && !projected_subspace && !same_matrix_retry && !solved &&
+        diagnostics.device_policy &&
         schwarz_factor_ready &&
         element_schwarz_attempt_state_.factor_preconditioner ==
             CudaTracePreconditionerKind::
@@ -3094,6 +3119,7 @@ SolveTrueSystemAttempt(double& true_relative_residual,
         CudaSolveDiagnostics coupled_diagnostics{};
         solved = LaunchAndObserveNativeRankOneTraceSolve(
             factor, element_schwarz, matrix_generation,
+            active_subspace,
             requested_relative_tolerance, coupled_diagnostics);
         const bool work_bounded =
             lower_preconditioner_applications <=
@@ -3465,6 +3491,7 @@ SolveTrueSystemAttempt(double& true_relative_residual,
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 SolveTrueSystem(const generic::EulerHdgLinearSolveRole role,
+                const CudaNativeTraceActiveSubspace active_subspace,
                 double& true_relative_residual,
                 const std::uint64_t matrix_generation,
                 int& linear_iterations,
@@ -3484,7 +3511,7 @@ SolveTrueSystem(const generic::EulerHdgLinearSolveRole role,
   {
     int invocation_iterations = 0;
     const bool solved = SolveTrueSystemAttempt(
-        true_relative_residual, matrix_generation, tolerance,
+        true_relative_residual, matrix_generation, active_subspace, tolerance,
         same_matrix_retry, invocation_iterations, tensor_core_evidence);
     const bool bounded = invocation_iterations >= 0 &&
         linear_iterations <= std::numeric_limits<int>::max() -
@@ -3512,6 +3539,434 @@ SolveTrueSystem(const generic::EulerHdgLinearSolveRole role,
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+AssemblePartitionedScalarClosure(
+    state_slot&, const double dt, double& norm,
+    CudaTensorCoreEvidence& tensor_core_evidence) noexcept
+{
+  TransportPolicy::SetPhase(CudaFailurePhase::assembly, current_generation_);
+  std::uint64_t invocation_volume_mma_tiles = 0;
+  bool launched = false;
+  {
+    ::dg_igr::NVTXRange profile_region(
+        ::dg_igr::observability::RegionId::hdg_local_assembly);
+    launched = CudaLaunchAssembly(
+        view_, shape_, dt, cuda_engine_, invocation_volume_mma_tiles);
+  }
+  if (!CollectiveContinue(launched && StatusPassed())) return false;
+  std::uint64_t volume_launches = tensor_core_evidence.volume_assembly_launches;
+  std::uint64_t volume_tiles = tensor_core_evidence.volume_mma_tiles;
+  const bool tensor_selected =
+      cuda_engine_ == generic::CudaEngineKind::tensor_core;
+  const bool accounted =
+      (cuda_engine_ == generic::CudaEngineKind::ordinary || tensor_selected) &&
+      AccumulateTensorVolumeWork(
+          tensor_selected, invocation_volume_mma_tiles,
+          volume_launches, volume_tiles);
+  if (!CollectiveContinue(accounted)) return false;
+  tensor_core_evidence.volume_assembly_launches = volume_launches;
+  tensor_core_evidence.volume_mma_tiles = volume_tiles;
+  if (!CollectiveContinue(
+          CudaLaunchPartitionedScalarClosureMask(view_, shape_) &&
+          StatusPassed()) ||
+      !AssembleTrueVector(view_.residual_g, view_.true_residual, false))
+    return false;
+  const bool norm_launched = CudaLaunchLocalSquaredNorm(
+      view_.residual_r, shape_.interior_count, view_.true_residual,
+      shape_.true_trace_count, view_.status, shape_.elements, view_.scalar);
+  if (!CollectiveContinue(norm_launched)) return false;
+  double local_squared = 0.0;
+  const bool scalar_ready = TransportPolicy::DeviceToHost(
+          &local_squared, view_.scalar, sizeof(double),
+          CudaTransferCategory::scalar_diagnostic,
+          CudaTransferSite::scalar_status) &&
+      TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+  if (!CollectiveContinue(scalar_ready)) return false;
+  double global_squared = 0.0;
+  const bool reduced = MPI_Allreduce(
+      &local_squared, &global_squared, 1, MPI_DOUBLE, MPI_SUM,
+      communicator_) == MPI_SUCCESS;
+  if (!CollectiveContinue(reduced && std::isfinite(local_squared) &&
+                          local_squared >= 0.0 &&
+                          std::isfinite(global_squared) &&
+                          global_squared >= 0.0))
+    return false;
+  norm = std::sqrt(global_squared);
+  return CollectiveContinue(std::isfinite(norm));
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+PartitionedAuxiliaryNorm(state_slot& workspace, double& norm) noexcept
+{
+  norm = std::numeric_limits<double>::quiet_NaN();
+  // Assembly status has already been consumed before this helper is called,
+  // so the per-element status array can serve as bounded reduction scratch.
+  const bool launched = CudaLaunchPartitionedAuxiliarySquaredNorm(
+      shape_, workspace.interior.coefficients, workspace.trace.coefficients,
+      view_.status, shape_.elements, view_.scalar);
+  if (!CollectiveContinue(launched)) return false;
+  double local_squared = 0.0;
+  const bool scalar_ready = TransportPolicy::DeviceToHost(
+          &local_squared, view_.scalar, sizeof(double),
+          CudaTransferCategory::scalar_diagnostic,
+          CudaTransferSite::scalar_status) &&
+      TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+  if (!CollectiveContinue(scalar_ready)) return false;
+  double global_squared = 0.0;
+  const bool reduced = MPI_Allreduce(
+      &local_squared, &global_squared, 1, MPI_DOUBLE, MPI_SUM,
+      communicator_) == MPI_SUCCESS;
+  if (!CollectiveContinue(reduced && std::isfinite(local_squared) &&
+                          local_squared >= 0.0 &&
+                          std::isfinite(global_squared) &&
+                          global_squared >= 0.0))
+    return false;
+  norm = std::sqrt(global_squared);
+  return CollectiveContinue(std::isfinite(norm));
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+BootstrapPartitionedScalarClosure(const CudaConfig& config) noexcept
+{
+  if (!partitioned_backward_euler_) return true;
+  state_slot& workspace = workspace_slot_;
+  const AttemptIdentity bootstrap_attempt{0, 0, 0, 0, config.dt};
+  bool projected = false;
+  {
+    CudaIluFactorAttemptEndGuard end_factor_attempt(ilu_factor_state_);
+    CudaElementSchwarzAttemptEndGuard end_schwarz_attempt(
+        element_schwarz_attempt_state_);
+    if (!PrepareAttempt(bootstrap_attempt, workspace, true))
+    {
+      ReportCudaSetupFailure(rank_, "partitioned-bootstrap-prepare");
+      return false;
+    }
+    const bool partitioned_snapshot =
+        TransportPolicy::DeviceToDevice(
+            view_.partitioned_base_interior,
+            workspace.interior.coefficients,
+            workspace.interior.count * sizeof(double),
+            CudaTransferCategory::attempt_history,
+            CudaTransferSite::nonlinear_base_interior) &&
+        TransportPolicy::DeviceToDevice(
+            view_.trial_true_trace, workspace.trace.coefficients,
+            workspace.trace.count * sizeof(double),
+            CudaTransferCategory::attempt_history,
+            CudaTransferSite::nonlinear_base_trace) &&
+        TransportPolicy::Synchronize(
+            CudaTransferSite::nonlinear_base_trace);
+    if (!CollectiveContinue(partitioned_snapshot))
+    {
+      ReportCudaSetupFailure(rank_, "partitioned-bootstrap-snapshot");
+      return false;
+    }
+
+    CudaNumericalResult result{};
+    result.finite = true;
+    result.tensor_core = initialization_tensor_core_evidence_;
+    result.tensor_core.selected_engine = cuda_engine_;
+    result.tensor_core.requested_trace_policy =
+        trace_policy_descriptor_.requested_selection;
+    result.tensor_core.resolved_trace_policy =
+        trace_policy_descriptor_.resolved_selection;
+    result.tensor_core.trace_policy_rank_count =
+        trace_policy_descriptor_.rank_count;
+    result.tensor_core.trace_policy_order =
+        trace_policy_descriptor_.polynomial_order;
+    result.tensor_core.trace_preconditioner = trace_preconditioner_;
+    std::uint64_t product_generation = 0;
+    projected = SolvePartitionedScalarClosure(
+        workspace, generic::EulerHdgLinearSolveRole::final_coherent,
+        result, product_generation);
+    if (!projected)
+    {
+      ReportCudaSetupFailure(
+          rank_, result.phase == CudaFailurePhase::assembly
+              ? "partitioned-bootstrap-closure-assembly"
+              : result.phase == CudaFailurePhase::condensation
+                  ? "partitioned-bootstrap-closure-condensation"
+                  : result.phase == CudaFailurePhase::trace_solve
+                      ? "partitioned-bootstrap-closure-trace"
+                      : "partitioned-bootstrap-closure-recovery");
+    }
+    projected = projected && result.finite && result.recovery;
+    if (projected)
+      projected = CudaLaunchPartitionedBackwardEulerStateAudit(
+                      view_, shape_, false) && StatusPassed();
+    if (!projected && result.recovery)
+      ReportCudaSetupFailure(rank_, "partitioned-bootstrap-state-audit");
+  }
+  if (!CollectiveContinue(projected)) return false;
+
+  const auto copy_interior = [&](double* destination) noexcept
+  {
+    return TransportPolicy::DeviceToDevice(
+        destination, workspace.interior.coefficients,
+        workspace.interior.count * sizeof(double),
+        CudaTransferCategory::attempt_history,
+        CudaTransferSite::attempt_seed_interior);
+  };
+  const auto copy_trace = [&](double* destination) noexcept
+  {
+    return TransportPolicy::DeviceToDevice(
+        destination, workspace.trace.coefficients,
+        workspace.trace.count * sizeof(double),
+        CudaTransferCategory::attempt_history,
+        CudaTransferSite::attempt_seed_trace);
+  };
+  const bool copied = copy_interior(committed_slot_.interior.coefficients) &&
+      copy_interior(candidate_slot_.interior.coefficients) &&
+      copy_interior(view_.initial_current_interior) &&
+      copy_trace(committed_slot_.trace.coefficients) &&
+      copy_trace(candidate_slot_.trace.coefficients) &&
+      copy_trace(view_.initial_current_true_trace) &&
+      TransportPolicy::Synchronize(CudaTransferSite::attempt_seed_trace);
+  if (!CollectiveContinue(copied)) return false;
+  committed_slot_.interior.generation = 0;
+  committed_slot_.trace.generation = 0;
+  candidate_slot_.interior.generation = 0;
+  candidate_slot_.trace.generation = 0;
+  if (!UpdateStateHashes(committed_slot_) ||
+      !UpdateStateHashes(candidate_slot_) ||
+      committed_slot_.interior.hash != candidate_slot_.interior.hash ||
+      committed_slot_.trace.hash != candidate_slot_.trace.hash)
+    return false;
+  MarkCommittedScalarClosureCoherent();
+  current_attempt_ = {};
+  current_generation_ = 0;
+  ticket_count_ = 0;
+  return CommittedScalarClosureCoherent();
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+ValidatePartitionedScalarCheckpoint(
+    const CudaSerializedCheckpointV1& checkpoint, state_slot& workspace,
+    const double dt) noexcept
+{
+  if (!partitioned_backward_euler_) return true;
+  const int true_scalar_count = shape_.true_trace_count /
+      shape_.trace_components;
+  bool finite = shape_.interior_components == igr_interior_components &&
+      shape_.trace_components == igr_trace_components &&
+      true_scalar_count > 0 && std::isfinite(dt) && dt > 0.0;
+  for (int element = 0; finite && element < shape_.elements; ++element)
+    for (int component = conserved_components;
+         finite && component < shape_.interior_components; ++component)
+      for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
+      {
+        const std::size_t index = static_cast<std::size_t>(element) *
+            shape_.interior_dofs + component * shape_.scalar_interior_dofs +
+            scalar;
+        const double value = checkpoint.interior[index];
+        finite = std::isfinite(value);
+      }
+  for (int component = conserved_components;
+       finite && component < shape_.trace_components; ++component)
+    for (int scalar = 0; scalar < true_scalar_count; ++scalar)
+    {
+      const double value = checkpoint.owned_true_trace[
+          component * true_scalar_count + scalar];
+      finite = std::isfinite(value);
+    }
+  if (!CollectiveContinue(finite)) return false;
+
+  const bool staged = TransportPolicy::DeviceToDevice(
+          view_.old_interior, workspace.interior.coefficients,
+          workspace.interior.count * sizeof(double),
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::attempt_seed_interior) &&
+      DistributeCurrentTrace(workspace.trace.coefficients);
+  if (!CollectiveContinue(staged)) return false;
+  CudaTensorCoreEvidence scratch = initialization_tensor_core_evidence_;
+  double global_residual = std::numeric_limits<double>::infinity();
+  if (!AssemblePartitionedScalarClosure(
+          workspace, dt, global_residual, scratch))
+    return false;
+  double global_auxiliary_norm = std::numeric_limits<double>::quiet_NaN();
+  if (!PartitionedAuxiliaryNorm(workspace, global_auxiliary_norm))
+    return false;
+  const double relative_residual = global_residual /
+      std::max(global_auxiliary_norm, 1.0);
+  return CollectiveContinue(std::isfinite(relative_residual) &&
+      relative_residual <= true_residual_relative_tolerance_);
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+SolvePartitionedScalarClosure(
+    state_slot& workspace, const generic::EulerHdgLinearSolveRole role,
+    CudaNumericalResult& result,
+    std::uint64_t& product_generation) noexcept
+{
+  double closure_norm = std::numeric_limits<double>::infinity();
+  if (!AssemblePartitionedScalarClosure(
+          workspace, current_attempt_.dt, closure_norm, result.tensor_core))
+  {
+    result.phase = CudaFailurePhase::assembly;
+    result.reason = FailureReason::finite_gate;
+    return false;
+  }
+  if (result.trace_solves == 0) result.initial_residual = closure_norm;
+  result.finite = result.finite && std::isfinite(closure_norm);
+  if (!result.finite)
+  {
+    result.reason = FailureReason::finite_gate;
+    return false;
+  }
+  result.phase = CudaFailurePhase::condensation;
+  std::uint64_t condensation_tiles = 0;
+  bool condensed = false;
+  {
+    ::dg_igr::NVTXRange profile_region(
+        ::dg_igr::observability::RegionId::hdg_condensation);
+    condensed = CopyBase(workspace) && Ticket(CudaFailurePhase::condensation) &&
+        CudaLaunchCondensation(
+            view_, shape_, cuda_engine_, condensation_tiles) &&
+        StatusPassed();
+  }
+  if (cuda_engine_ == generic::CudaEngineKind::tensor_core && condensed)
+  {
+    if (result.tensor_core.condensation_launches ==
+            std::numeric_limits<std::uint64_t>::max() ||
+        condensation_tiles > std::numeric_limits<std::uint64_t>::max() -
+            result.tensor_core.mma_tiles)
+      condensed = false;
+    else
+    {
+      ++result.tensor_core.condensation_launches;
+      result.tensor_core.mma_tiles += condensation_tiles;
+    }
+  }
+  if (!CollectiveContinue(condensed))
+  {
+    result.reason = FailureReason::backend_failure;
+    return false;
+  }
+  result.phase = CudaFailurePhase::trace_solve;
+  if (!AssembleTrueSystem() ||
+      !CollectiveContinue(Ticket(CudaFailurePhase::trace_solve)))
+  {
+    result.reason = FailureReason::true_residual_gate;
+    return false;
+  }
+  product_generation = ++linear_generation_;
+  int iterations = 0;
+  int solve_attempts = 0;
+  int tightenings = 0;
+  double true_relative_residual = std::numeric_limits<double>::infinity();
+  const bool solved = SolveTrueSystem(
+      role,
+      ResolveCudaNativeTraceActiveSubspace(
+          partitioned_backward_euler_, cuda_engine_, ranks_,
+          trace_solver_kind_, true),
+      true_relative_residual, product_generation, iterations,
+      solve_attempts, tightenings, result.tensor_core);
+  int& role_iterations =
+      role == generic::EulerHdgLinearSolveRole::newton_correction
+      ? result.newton_correction_linear_iterations
+      : result.final_coherent_linear_iterations;
+  const bool bounded = iterations >= 0 && solve_attempts >= 0 &&
+      tightenings >= 0 &&
+      iterations <= std::numeric_limits<int>::max() -
+          result.linear_iterations &&
+      iterations <= std::numeric_limits<int>::max() - role_iterations &&
+      solve_attempts <= std::numeric_limits<int>::max() -
+          result.linear_solve_attempts &&
+      tightenings <= std::numeric_limits<int>::max() -
+          result.true_residual_tightenings &&
+      result.scalar_closure_solves != std::numeric_limits<int>::max() &&
+      iterations <= std::numeric_limits<int>::max() -
+          result.scalar_closure_linear_iterations &&
+      solve_attempts <= std::numeric_limits<int>::max() -
+          result.scalar_closure_linear_solve_attempts &&
+      tightenings <= std::numeric_limits<int>::max() -
+          result.scalar_closure_true_residual_tightenings &&
+      result.trace_solves != std::numeric_limits<int>::max();
+  if (!CollectiveContinue(solved && bounded))
+  {
+    result.reason = FailureReason::true_residual_gate;
+    return false;
+  }
+  result.linear_iterations += iterations;
+  role_iterations += iterations;
+  result.linear_solve_attempts += solve_attempts;
+  result.true_residual_tightenings += tightenings;
+  ++result.trace_solves;
+  ++result.scalar_closure_solves;
+  result.scalar_closure_linear_iterations += iterations;
+  result.scalar_closure_linear_solve_attempts += solve_attempts;
+  result.scalar_closure_true_residual_tightenings += tightenings;
+  result.true_relative_residual = true_relative_residual;
+  result.final_residual = true_relative_residual;
+  const bool distributed = DistributeTraceIncrement();
+  result.phase = CudaFailurePhase::recovery;
+  bool recovered = false;
+  if (distributed && Ticket(CudaFailurePhase::recovery))
+  {
+    ::dg_igr::NVTXRange profile_region(
+        ::dg_igr::observability::RegionId::hdg_interior_recovery);
+    recovered = CudaLaunchRecover(view_, shape_, cuda_engine_) &&
+        StatusPassed();
+  }
+  const bool frozen_euler_increments = recovered &&
+      CudaLaunchPartitionedScalarClosureFreezeEulerIncrements(view_, shape_);
+  if (!CollectiveContinue(frozen_euler_increments &&
+                          CudaLaunchTrial(view_, shape_, 1.0) &&
+                          CudaLaunchPartitionedScalarClosureRestoreEuler(
+                              view_, shape_) &&
+                          DistributeCurrentTrace(
+                              workspace.trace.coefficients)))
+  {
+    result.reason = FailureReason::recovery_gate;
+    return false;
+  }
+  // Recovery updates local sigma/z as well as the owned sigmahat trace.  A
+  // converged condensed trace residual alone does not certify those recovered
+  // local equations, so reassemble the exact candidate and gate the complete
+  // scalar constraint before it can become a committed witness.
+  double final_closure_norm = std::numeric_limits<double>::infinity();
+  if (!AssemblePartitionedScalarClosure(
+          workspace, current_attempt_.dt, final_closure_norm,
+          result.tensor_core))
+  {
+    result.phase = CudaFailurePhase::assembly;
+    result.reason = FailureReason::finite_gate;
+    result.finite = false;
+    return false;
+  }
+  double auxiliary_norm = std::numeric_limits<double>::quiet_NaN();
+  if (!PartitionedAuxiliaryNorm(workspace, auxiliary_norm))
+  {
+    result.phase = CudaFailurePhase::recovery;
+    result.reason = FailureReason::finite_gate;
+    result.finite = false;
+    return false;
+  }
+  const double closure_tolerance = true_residual_relative_tolerance_ *
+      std::max(auxiliary_norm, 1.0);
+  const double final_closure_relative_residual = final_closure_norm /
+      std::max(auxiliary_norm, 1.0);
+  result.finite = result.finite && std::isfinite(final_closure_norm) &&
+      std::isfinite(closure_tolerance) &&
+      std::isfinite(final_closure_relative_residual);
+  if (!CollectiveContinue(result.finite &&
+                          final_closure_norm <= closure_tolerance))
+  {
+    result.phase = CudaFailurePhase::recovery;
+    result.reason = result.finite ? FailureReason::recovery_gate
+                                  : FailureReason::finite_gate;
+    return false;
+  }
+  result.true_relative_residual = std::max(
+      result.true_relative_residual, final_closure_relative_residual);
+  result.recovery = true;
+  return true;
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 AssembleAndNorm(state_slot&, const double dt, double& norm,
                 CudaTensorCoreEvidence& tensor_core_evidence) noexcept
 {
@@ -3526,6 +3981,11 @@ AssembleAndNorm(state_slot&, const double dt, double& norm,
   }
   const bool local_assembly = assembly_launched && StatusPassed();
   if (!CollectiveContinue(local_assembly)) return false;
+  if (partitioned_backward_euler_ &&
+      !CollectiveContinue(
+          CudaLaunchPartitionedBackwardEulerMask(view_, shape_) &&
+          StatusPassed()))
+    return false;
 
   std::uint64_t updated_volume_assembly_launches =
       tensor_core_evidence.volume_assembly_launches;

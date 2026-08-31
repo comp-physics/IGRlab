@@ -35,6 +35,7 @@ using dg::hdg::generic::BackendKind;
 using dg::hdg::generic::BackendSelection;
 using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::EulerHdgRequest;
+using dg::hdg::generic::EulerHdgTimeTreatment;
 using dg::hdg::generic::HdgEulerSessionStatus;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::generic::RegularizationSelection;
@@ -284,6 +285,23 @@ RegularizationSelection CanonicalRegularization(
       "HDG regularization must resolve to 'none' or 'igr'");
 }
 
+EulerHdgTimeTreatment CanonicalTimeTreatment(
+    const HdgEulerMainRequest& request)
+{
+  const std::string selector = ToLowerCopy(request.options.time_integrator);
+  if (selector.empty() || selector == "backward-euler")
+  {
+    return EulerHdgTimeTreatment::backward_euler;
+  }
+  if (selector == "partitioned-backward-euler")
+  {
+    return EulerHdgTimeTreatment::partitioned_backward_euler;
+  }
+  throw std::invalid_argument(
+      "HDG time integrator must resolve to 'backward-euler' or "
+      "'partitioned-backward-euler'");
+}
+
 CudaEngineKind CanonicalCudaEngine(const HdgEulerMainRequest& request)
 {
   const std::optional<HdgCudaEngine> engine =
@@ -351,7 +369,8 @@ std::string CanonicalNumericalPolicy(
 std::string ConsensusText(const HdgEulerMainRequest& request,
                           const std::string& mesh_path,
                           const RegularizationSelection regularization,
-                          const CudaTracePolicyDescriptor& trace_policy)
+                          const CudaTracePolicyDescriptor& trace_policy,
+                          const EulerHdgTimeTreatment time_treatment)
 {
   std::ostringstream stream;
   const CudaEngineKind cuda_engine = trace_policy.selected_engine;
@@ -408,7 +427,8 @@ std::string ConsensusText(const HdgEulerMainRequest& request,
   AppendDouble(stream, request.options.t_final);
   AppendDouble(stream, request.options.dt_save);
   AppendDouble(stream, request.case_config.gamma);
-  stream << static_cast<int>(regularization.kind) << ';';
+  stream << static_cast<int>(regularization.kind) << ';'
+         << static_cast<int>(time_treatment) << ';';
   AppendDouble(stream, regularization.alpha);
   AppendDouble(stream, regularization.beta);
   return stream.str();
@@ -462,7 +482,8 @@ bool ExactTextConsensus(const MPI_Comm communicator,
 
 std::string Validate(const HdgEulerMainRequest& request,
                      const RegularizationSelection regularization,
-                     const CudaEngineKind cuda_engine)
+                     const CudaEngineKind cuda_engine,
+                     const EulerHdgTimeTreatment time_treatment)
 {
   if (!LiveSupportedCommunicator(request.communicator))
     return "CUDA HDG requires a live one- or two-rank MPI communicator";
@@ -474,6 +495,8 @@ std::string Validate(const HdgEulerMainRequest& request,
     return "generic CUDA HDG rejects an invalid CUDA engine";
   if (!dg::hdg::generic::ValidRegularizationSelection(regularization))
     return "HDG IGR alpha and beta must be finite and positive";
+  if (!dg::hdg::generic::IsKnownEulerHdgTimeTreatment(time_treatment))
+    return "CUDA HDG time treatment is invalid";
   if (!request.options.restart_vtk.empty() || request.options.restart_cycle >= 0 ||
       request.options.restart_step >= 0 || request.options.save_state_files)
     return "generic CUDA HDG restart/state-file routes are unsupported";
@@ -483,7 +506,7 @@ std::string Validate(const HdgEulerMainRequest& request,
     return "CUDA HDG --time-step must be finite";
   if (request.options.dt <= 0.0 &&
       (!std::isfinite(request.options.cfl) || request.options.cfl <= 0.0))
-    return "CUDA CFL Backward Euler requires a finite positive --cfl-number";
+    return "CUDA CFL HDG time integration requires a finite positive --cfl-number";
   if (!std::isfinite(request.options.dt_min) || request.options.dt_min < 0.0)
     return "CUDA HDG --dt-min must be finite and non-negative";
   if (!std::isfinite(request.options.t_final) || request.options.t_final <= 0.0)
@@ -558,14 +581,17 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
 
   std::string reason;
   RegularizationSelection regularization{};
+  EulerHdgTimeTreatment time_treatment =
+      EulerHdgTimeTreatment::backward_euler;
   CudaEngineKind cuda_engine = CudaEngineKind::ordinary;
   CudaTracePolicyDescriptor trace_policy{};
   int ranks = 0;
   try
   {
     regularization = CanonicalRegularization(request);
+    time_treatment = CanonicalTimeTreatment(request);
     cuda_engine = CanonicalCudaEngine(request);
-    reason = Validate(request, regularization, cuda_engine);
+    reason = Validate(request, regularization, cuda_engine, time_treatment);
     if (reason.empty())
     {
       if (MPI_Comm_size(request.communicator, &ranks) != MPI_SUCCESS)
@@ -594,7 +620,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   try
   {
     mesh_path = ResolveCaseMesh(request.case_config, request.options.mesh_file);
-    consensus = ConsensusText(request, mesh_path, regularization, trace_policy);
+    consensus = ConsensusText(request, mesh_path, regularization, trace_policy,
+                              time_treatment);
   }
   catch (...) { reason = "CUDA HDG configuration resolution failed"; }
   if (!CollectiveAll(request.communicator, !consensus.empty()))
@@ -813,7 +840,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
                 dg::hdg::generic::euler_2d_conserved_components}
           : dg::hdg::generic::EulerFieldView{
                 nullptr, 0, dg::hdg::generic::euler_2d_conserved_components},
-      boundary->View(), numerical_policy};
+      boundary->View(), numerical_policy, time_treatment};
 
   GenericEulerHdgCudaSession session;
   if (session.Initialize(resolved_plan.request).status !=
@@ -825,6 +852,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   try
   {
     const bool cfl_control = request.options.dt <= 0.0;
+    const bool partitioned_backward_euler = time_treatment ==
+        EulerHdgTimeTreatment::partitioned_backward_euler;
     resolved_plan.time_control = cfl_control
         ? HdgTransactionalTimeAdapter::TimeControl::CFL(
               0.0, request.options.t_final, request.options.cfl)
@@ -838,16 +867,23 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         : HdgTransactionalTimeAdapter::OutputSchedule::Disabled(
               time::backend::InitialOutputPolicy::Suppress,
               time::backend::FinalOutputPolicy::Suppress);
-    resolved_plan.time_mode = cfl_control
-        ? HdgEulerTimeMode::CFLBackwardEuler
-        : HdgEulerTimeMode::FixedBackwardEuler;
+    resolved_plan.time_mode = partitioned_backward_euler
+        ? (cfl_control
+              ? HdgEulerTimeMode::CFLPartitionedBackwardEuler
+              : HdgEulerTimeMode::FixedPartitionedBackwardEuler)
+        : (cfl_control ? HdgEulerTimeMode::CFLBackwardEuler
+                       : HdgEulerTimeMode::FixedBackwardEuler);
     const mfem::io::VTKOutputConfig vtk = MakeCaseVTKConfig(request.case_config);
     resolved_plan.output = {request.options.vtk_save, vtk.prefix_path,
                             CollectionName(request, cuda_engine)};
     time_driver = std::make_unique<HdgTransactionalTimeAdapter>(
         resolved_plan.time_control, resolved_plan.output_schedule,
-        cfl_control ? HdgTimeControlMode::CFLBackwardEuler
-                    : HdgTimeControlMode::FixedBackwardEuler);
+        partitioned_backward_euler
+            ? (cfl_control
+                  ? HdgTimeControlMode::CFLPartitionedBackwardEuler
+                  : HdgTimeControlMode::FixedPartitionedBackwardEuler)
+            : (cfl_control ? HdgTimeControlMode::CFLBackwardEuler
+                           : HdgTimeControlMode::FixedBackwardEuler));
     if (request.options.vtk_save)
     {
       const int levels = vtk.levels_of_detail >= 0 ? vtk.levels_of_detail
@@ -912,7 +948,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   while (!time_driver->Finished())
   {
     double proposed_dt = 0.0;
-    if (time_driver->mode() == HdgTimeControlMode::CFLBackwardEuler)
+    if (time_driver->UsesCflControl())
     {
       const auto diagnostics = session.diagnostics();
       const bool diagnostics_ready =
@@ -1063,6 +1099,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
               << " time=" << time_driver->time() << " output_cycle="
               << time_driver->output_cycle() << " cuda_engine="
               << CudaEngineName(cuda_engine)
+              << " time_treatment="
+              << dg::hdg::generic::EulerHdgTimeTreatmentName(time_treatment)
               << " requested_trace_policy="
               << CudaTracePolicyKindName(trace_policy.requested_selection)
               << " resolved_trace_policy="

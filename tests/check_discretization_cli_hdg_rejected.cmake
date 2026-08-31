@@ -42,8 +42,14 @@ expect_early_rejection(
   "Time integrator 'backward-euler' is unavailable for DG/DGSEM"
   --time-integrator backward-euler)
 expect_early_rejection(
+  "Time integrator 'partitioned-backward-euler' is unavailable for DG/DGSEM"
+  --time-integrator partitioned-backward-euler)
+expect_early_rejection(
   "Time integrator 'rk3ssp' is unavailable for HDG"
   --discretization hdg --time-integrator rk3ssp)
+expect_early_rejection(
+  "Case 'discretization-cli-boundary' does not provide an HDG backend adapter\\."
+  --discretization hdg --time-integrator partitioned-backward-euler)
 expect_early_rejection(
   "Case 'discretization-cli-boundary' does not provide an HDG backend adapter\\."
   --discretization hdg --regularization igr --device cuda)

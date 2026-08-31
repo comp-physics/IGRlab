@@ -55,6 +55,35 @@ enum class RegularizationKind : std::uint8_t
   igr = 1
 };
 
+/** Typed temporal architecture selected within the shared Euler lifecycle. */
+enum class EulerHdgTimeTreatment : std::uint8_t
+{
+  // Zero preserves Backward Euler for value-initialized and legacy aggregate
+  // requests while the new member remains a trailing POD extension.
+  backward_euler = 0,
+  partitioned_backward_euler = 1
+};
+
+constexpr bool IsKnownEulerHdgTimeTreatment(
+    const EulerHdgTimeTreatment treatment) noexcept
+{
+  return treatment == EulerHdgTimeTreatment::backward_euler ||
+      treatment == EulerHdgTimeTreatment::partitioned_backward_euler;
+}
+
+constexpr const char* EulerHdgTimeTreatmentName(
+    const EulerHdgTimeTreatment treatment) noexcept
+{
+  switch (treatment)
+  {
+  case EulerHdgTimeTreatment::backward_euler:
+    return "backward-euler";
+  case EulerHdgTimeTreatment::partitioned_backward_euler:
+    return "partitioned-backward-euler";
+  }
+  return "unknown";
+}
+
 /** Numerical role of one condensed true-trace linear solve. */
 enum class EulerHdgLinearSolveRole : std::uint8_t
 {
@@ -198,7 +227,8 @@ enum class ContractStatus : std::uint8_t
   collective_failure,
   invalid_regularization,
   invalid_initial_trace,
-  invalid_numerical_policy
+  invalid_numerical_policy,
+  invalid_time_treatment
 };
 
 enum class Capability : std::uint32_t
@@ -316,6 +346,8 @@ struct EulerHdgRequest
   EulerFieldView source;
   BoundaryOperatorView boundary;
   EulerHdgNumericalPolicy numerical_policy;
+  /** Trailing zero-compatible typed time architecture; Backward Euler is zero. */
+  EulerHdgTimeTreatment time_treatment;
 };
 
 static_assert(std::is_standard_layout<BackendSelection>::value &&
@@ -866,6 +898,20 @@ inline bool ExactBackendSelectionConsensus(
                  std::begin(maximum));
 }
 
+inline bool ExactEulerHdgTimeTreatmentConsensus(
+    const MPI_Comm communicator,
+    const EulerHdgTimeTreatment treatment) noexcept
+{
+  const int local = static_cast<int>(treatment);
+  int minimum = local;
+  int maximum = local;
+  const bool minimum_ready = MPI_Allreduce(
+      &local, &minimum, 1, MPI_INT, MPI_MIN, communicator) == MPI_SUCCESS;
+  const bool maximum_ready = MPI_Allreduce(
+      &local, &maximum, 1, MPI_INT, MPI_MAX, communicator) == MPI_SUCCESS;
+  return minimum_ready && maximum_ready && minimum == maximum;
+}
+
 inline ContractStatus ValidateEulerHdgRequest(
     const EulerHdgRequest& request) noexcept
 {
@@ -909,6 +955,12 @@ inline ContractStatus ValidateEulerHdgRequest(
       !ValidEulerHdgNumericalPolicy(request.numerical_policy))
   {
     RecordFailure(local_status, ContractStatus::invalid_numerical_policy);
+  }
+  if (!ExactEulerHdgTimeTreatmentConsensus(request.communicator,
+                                           request.time_treatment) ||
+      !IsKnownEulerHdgTimeTreatment(request.time_treatment))
+  {
+    RecordFailure(local_status, ContractStatus::invalid_time_treatment);
   }
   if (!ExactBackendSelectionConsensus(request.communicator, request.backend) ||
       (request.backend.kind != BackendKind::cpu &&
