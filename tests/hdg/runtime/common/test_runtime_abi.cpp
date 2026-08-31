@@ -145,6 +145,14 @@ bool CheckRuntimeSelection()
       CudaRank1OneGpuRuntimeSelection::Descriptor();
   const RuntimeTupleDescriptor cuda_rank2 =
       CudaRank2OneGpuHostStagedRuntimeSelection::Descriptor();
+  const RuntimeTupleDescriptor partitioned_cpu_rank1 =
+      PartitionedBackwardEulerCpuRank1RuntimeSelection::Descriptor();
+  const RuntimeTupleDescriptor partitioned_cpu_rank2 =
+      PartitionedBackwardEulerCpuRank2RuntimeSelection::Descriptor();
+  const RuntimeTupleDescriptor partitioned_cuda_rank1 =
+      PartitionedBackwardEulerCudaRank1RuntimeSelection::Descriptor();
+  const RuntimeTupleDescriptor partitioned_cuda_rank2 =
+      PartitionedBackwardEulerCudaRank2RuntimeSelection::Descriptor();
   return Check(
       conventional_persistent_card_id ==
               "exp.hdg.euler.conventional.smooth_persistent.w8a.v1" &&
@@ -160,8 +168,21 @@ bool CheckRuntimeSelection()
           cpu_serial.trace.view() == "mfem.dg_interface.trace" &&
           cpu_serial.stabilization.view() == "tau.fixed" &&
           cpu_serial.time_treatment.view() == "backward_euler" &&
-          cpu_serial.precision.view() == "fp64",
-      "runtime_selection_exact_card_and_four_backend_ids");
+          cpu_serial.precision.view() == "fp64" &&
+          partitioned_cpu_rank1.backend.view() == "cpu.serial" &&
+          partitioned_cpu_rank2.backend.view() == "cpu.rank2" &&
+          partitioned_cuda_rank1.backend.view() == "cuda.rank1.one_gpu" &&
+          partitioned_cuda_rank2.backend.view() ==
+              "cuda.rank2.one_gpu.host_staged" &&
+          partitioned_cpu_rank1.time_treatment.view() ==
+              "partitioned_backward_euler" &&
+          partitioned_cpu_rank2.time_treatment.view() ==
+              "partitioned_backward_euler" &&
+          partitioned_cuda_rank1.time_treatment.view() ==
+              "partitioned_backward_euler" &&
+          partitioned_cuda_rank2.time_treatment.view() ==
+              "partitioned_backward_euler",
+      "runtime_selection_exact_card_and_partitioned_backend_ids");
 }
 
 bool CheckTransferCodec()

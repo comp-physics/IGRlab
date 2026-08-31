@@ -157,8 +157,14 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "request: invalid regularization is not parsed");
     ctx.Check(dg_sim::TryParseTimeIntegrator("BACKWARD-EULER") ==
                 dg_sim::TimeIntegrator::BackwardEuler &&
+                dg_sim::TryParseTimeIntegrator(
+                  "PARTITIONED-BACKWARD-EULER") ==
+                  dg_sim::TimeIntegrator::PartitionedBackwardEuler &&
                 std::string(dg_sim::TimeIntegratorToString(
-                  dg_sim::TimeIntegrator::RK3SSP)) == "rk3ssp",
+                  dg_sim::TimeIntegrator::RK3SSP)) == "rk3ssp" &&
+                std::string(dg_sim::TimeIntegratorToString(
+                  dg_sim::TimeIntegrator::PartitionedBackwardEuler)) ==
+                  "partitioned-backward-euler",
               "request: time-integrator parser and metadata name are stable");
     ctx.Check(!dg_sim::TryParseTimeIntegrator("invalid"),
               "request: invalid time integrator is not parsed");
@@ -302,6 +308,14 @@ int RunTimeDefaultsTests(TestContext& ctx)
                 dg_sim::SolverRequestResolutionStatus::UnsupportedTimeIntegrator,
               "request: DG/DGSEM backward-euler is rejected");
 
+    const dg_sim::SolverRequestResolution dg_partitioned_be =
+      dg_sim::ResolveSolverRequest("dg", false, "", "dg", "",
+                                   "partitioned-backward-euler",
+                                   false, false, false, true);
+    ctx.Check(dg_partitioned_be.status ==
+                dg_sim::SolverRequestResolutionStatus::UnsupportedTimeIntegrator,
+              "request: DG/DGSEM partitioned backward-euler is rejected");
+
     const dg_sim::SolverRequestResolution invalid_regularization =
       dg_sim::ResolveSolverRequest("dg", false, "", "dg", "invalid", "",
                                    false, false, true, false);
@@ -322,6 +336,32 @@ int RunTimeDefaultsTests(TestContext& ctx)
     ctx.Check(hdg_rk.status ==
                 dg_sim::SolverRequestResolutionStatus::UnsupportedTimeIntegrator,
               "request: HDG RK3SSP is rejected");
+
+    const dg_sim::SolverRequestResolution hdg_partitioned_cpu =
+      dg_sim::ResolveSolverRequest(
+        "dg", false, "hdg", "dg", "none", "partitioned-backward-euler",
+        true, false, true, true, "cpu");
+    ctx.Check(hdg_partitioned_cpu.IsResolved() &&
+                hdg_partitioned_cpu.regularization ==
+                  dg_sim::Regularization::None &&
+                hdg_partitioned_cpu.time_integrator ==
+                  dg_sim::TimeIntegrator::PartitionedBackwardEuler &&
+                hdg_partitioned_cpu.device_backend ==
+                  dg_sim::DeviceBackend::CPU,
+              "request: conventional HDG CPU admits partitioned backward-euler");
+
+    const dg_sim::SolverRequestResolution hdg_partitioned_cuda =
+      dg_sim::ResolveSolverRequest(
+        "dg", false, "hdg", "dg", "igr", "partitioned-backward-euler",
+        true, false, true, true, "cuda");
+    ctx.Check(hdg_partitioned_cuda.IsResolved() &&
+                hdg_partitioned_cuda.regularization ==
+                  dg_sim::Regularization::IGR &&
+                hdg_partitioned_cuda.time_integrator ==
+                  dg_sim::TimeIntegrator::PartitionedBackwardEuler &&
+                hdg_partitioned_cuda.device_backend ==
+                  dg_sim::DeviceBackend::CUDA,
+              "request: IGR HDG CUDA admits partitioned backward-euler");
 
     const dg_sim::SolverRequestResolution hdg_igr_cpu =
       dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "igr", "",

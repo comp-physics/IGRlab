@@ -135,8 +135,17 @@ struct CudaQualificationTestAccess
       cuda::GenericEulerHdgCudaSession& session,
       CudaAcceptedStepBenchmarkObservation& observation) noexcept
   {
-    return session.borrowed_rank1_ && !session.borrowed_rank2_ &&
-        CapturePrepared(*session.borrowed_rank1_, observation);
+    if (session.borrowed_rank1_)
+      return CapturePrepared(*session.borrowed_rank1_, observation);
+    if (session.borrowed_rank2_)
+      return CapturePrepared(*session.borrowed_rank2_, observation);
+    if (session.partitioned_backward_euler_borrowed_rank1_)
+      return CapturePrepared(
+          *session.partitioned_backward_euler_borrowed_rank1_, observation);
+    if (session.partitioned_backward_euler_borrowed_rank2_)
+      return CapturePrepared(
+          *session.partitioned_backward_euler_borrowed_rank2_, observation);
+    return false;
   }
 
   template <typename Engine>
@@ -161,8 +170,17 @@ struct CudaQualificationTestAccess
       cuda::GenericEulerHdgCudaSession& session,
       CudaAcceptedStepCommittedHashes& hashes) noexcept
   {
-    return session.borrowed_rank1_ && !session.borrowed_rank2_ &&
-        CaptureCommitted(*session.borrowed_rank1_, hashes);
+    if (session.borrowed_rank1_)
+      return CaptureCommitted(*session.borrowed_rank1_, hashes);
+    if (session.borrowed_rank2_)
+      return CaptureCommitted(*session.borrowed_rank2_, hashes);
+    if (session.partitioned_backward_euler_borrowed_rank1_)
+      return CaptureCommitted(
+          *session.partitioned_backward_euler_borrowed_rank1_, hashes);
+    if (session.partitioned_backward_euler_borrowed_rank2_)
+      return CaptureCommitted(
+          *session.partitioned_backward_euler_borrowed_rank2_, hashes);
+    return false;
   }
 
   template <typename Engine>
@@ -190,8 +208,17 @@ struct CudaQualificationTestAccess
       cuda::GenericEulerHdgCudaSession& session,
       CudaAcceptedStepProblemMetadata& metadata) noexcept
   {
-    return session.borrowed_rank1_ && !session.borrowed_rank2_ &&
-        CaptureProblemMetadata(*session.borrowed_rank1_, metadata);
+    if (session.borrowed_rank1_)
+      return CaptureProblemMetadata(*session.borrowed_rank1_, metadata);
+    if (session.borrowed_rank2_)
+      return CaptureProblemMetadata(*session.borrowed_rank2_, metadata);
+    if (session.partitioned_backward_euler_borrowed_rank1_)
+      return CaptureProblemMetadata(
+          *session.partitioned_backward_euler_borrowed_rank1_, metadata);
+    if (session.partitioned_backward_euler_borrowed_rank2_)
+      return CaptureProblemMetadata(
+          *session.partitioned_backward_euler_borrowed_rank2_, metadata);
+    return false;
   }
 };
 
@@ -207,6 +234,7 @@ using dg::hdg::generic::CapabilityBit;
 using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::EulerBoundaryPolicyTableView;
 using dg::hdg::generic::EulerHdgRequest;
+using dg::hdg::generic::EulerHdgTimeTreatment;
 using dg::hdg::generic::HdgEulerSessionStatus;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::runtime::StateHash;
@@ -257,8 +285,9 @@ constexpr int principal_elements_per_block =
     principal_threads / principal_element_threads;
 constexpr int default_mesh_n = 104;
 constexpr int warmup_steps = 1;
-constexpr int measured_steps = 5;
-constexpr int total_steps = warmup_steps + measured_steps;
+constexpr int default_measured_steps = 5;
+constexpr int minimum_measured_steps = 5;
+constexpr int maximum_measured_steps = 20;
 constexpr double default_timestep = 1.0e-5;
 constexpr double benchmark_gamma = 1.4;
 
@@ -303,9 +332,12 @@ struct Options
   RegularizationKind regularization = RegularizationKind::none;
   CudaEngineKind engine = CudaEngineKind::ordinary;
   CudaTracePolicyKind trace_policy = CudaTracePolicyKind::engine_default;
+  EulerHdgTimeTreatment time_treatment =
+      EulerHdgTimeTreatment::backward_euler;
   int order = 1;
   int mesh_n = default_mesh_n;
   int domain_periods = 1;
+  int measured_steps = default_measured_steps;
   int profile_measured_step = -1;
   double timestep = default_timestep;
   // Backward-compatible common override plus role-specific policy controls.
@@ -412,6 +444,36 @@ bool SelectEngine(const std::string_view text, Options& options) noexcept
   if (text == "tensor")
   {
     options.engine = CudaEngineKind::tensor_core;
+    return true;
+  }
+  return false;
+}
+
+constexpr const char* TimeIntegratorJsonName(
+    const EulerHdgTimeTreatment treatment) noexcept
+{
+  switch (treatment)
+  {
+  case EulerHdgTimeTreatment::backward_euler:
+    return "backward_euler";
+  case EulerHdgTimeTreatment::partitioned_backward_euler:
+    return "partitioned_backward_euler";
+  }
+  return "invalid";
+}
+
+bool SelectTimeIntegrator(
+    const std::string_view text, Options& options) noexcept
+{
+  if (text == "backward-euler")
+  {
+    options.time_treatment = EulerHdgTimeTreatment::backward_euler;
+    return true;
+  }
+  if (text == "partitioned-backward-euler")
+  {
+    options.time_treatment =
+        EulerHdgTimeTreatment::partitioned_backward_euler;
     return true;
   }
   return false;
@@ -735,6 +797,16 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
       }
       continue;
     }
+    if (argument == "--time-integrator")
+    {
+      if (++index >= argc || !SelectTimeIntegrator(argv[index], options))
+      {
+        error = "--time-integrator requires backward-euler or "
+                "partitioned-backward-euler";
+        return false;
+      }
+      continue;
+    }
     if (argument == "--trace-policy")
     {
       if (++index >= argc || !SelectTracePolicy(argv[index], options))
@@ -794,10 +866,21 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     {
       if (++index >= argc ||
           !ParsePositiveInt(argv[index], 0,
-                            options.profile_measured_step) ||
-          options.profile_measured_step >= measured_steps)
+                            options.profile_measured_step))
       {
-        error = "--profile-measured-step requires an integer in [0,4]";
+        error = "--profile-measured-step requires a nonnegative integer";
+        return false;
+      }
+      continue;
+    }
+    if (argument == "--measured-steps")
+    {
+      if (++index >= argc ||
+          !ParsePositiveInt(argv[index], minimum_measured_steps,
+                            options.measured_steps) ||
+          options.measured_steps > maximum_measured_steps)
+      {
+        error = "--measured-steps requires an integer in [5,20]";
         return false;
       }
       continue;
@@ -946,6 +1029,11 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
             "and divide --mesh-n exactly";
     return false;
   }
+  if (options.profile_measured_step >= options.measured_steps)
+  {
+    error = "--profile-measured-step must be less than --measured-steps";
+    return false;
+  }
   const bool have_igr_volume_order =
       options.igr_volume_assembly_quadrature_order != 0;
   const bool have_igr_face_order =
@@ -1007,6 +1095,7 @@ void PrintUsage(const char* executable)
 {
   std::cout << "Usage: " << executable
             << " [--mode conventional|igr] [--engine ordinary|tensor]"
+               " [--time-integrator backward-euler|partitioned-backward-euler]"
                " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi10-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi10-fp64]"
                " [coupled-policy native-element-schwarz-matrix-free-warp-"
                "coupled-fp64|native-element-schwarz-matrix-free-warp-"
@@ -1020,9 +1109,11 @@ void PrintUsage(const char* executable)
                " [--true-residual-tightening-linear-rtol RTOL]"
                " [--igr-volume-quadrature-order Q]"
                " [--igr-face-quadrature-order Q] [--export|--no-export]"
-               " [--profile-measured-step 0|1|2|3|4]\n"
+               " [--measured-steps N(5-20)]"
+               " [--profile-measured-step INDEX]\n"
                "       " << executable
             << " [--conventional|--igr] [--engine ordinary|tensor]"
+               " [--time-integrator backward-euler|partitioned-backward-euler]"
                " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi10-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi10-fp64]"
                " [coupled-policy native-element-schwarz-matrix-free-warp-"
                "coupled-fp64|native-element-schwarz-matrix-free-warp-"
@@ -1036,7 +1127,8 @@ void PrintUsage(const char* executable)
                " [--true-residual-tightening-linear-rtol RTOL]"
                " [--igr-volume-quadrature-order Q]"
                " [--igr-face-quadrature-order Q] [--export|--no-export]"
-               " [--profile-measured-step 0|1|2|3|4]\n";
+               " [--measured-steps N(5-20)]"
+               " [--profile-measured-step INDEX]\n";
 }
 
 mfem::ParMesh MakePeriodicMesh(const int n, const int domain_periods)
@@ -1131,6 +1223,7 @@ EulerHdgRequest MakeRequest(const mfem::ParMesh& mesh,
       nullptr, 0, 2, benchmark_gamma};
   request.numerical_policy =
       dg::hdg::generic::DefaultEulerHdgNumericalPolicy(options.order);
+  request.time_treatment = options.time_treatment;
   if (options.linear_relative_tolerance > 0.0)
   {
     request.numerical_policy.newton_correction_linear_relative_tolerance =
@@ -1324,7 +1417,9 @@ static_assert(ExpectedIluFactorAgeGenerations(
 
 bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
              const CudaEngineKind engine, const bool igr_active,
+             const EulerHdgTimeTreatment time_treatment,
              const CudaTracePolicyKind trace_policy,
+             const int rank_count,
              const int polynomial_order,
              const std::uint64_t krylov_restart_dimension) noexcept
 {
@@ -1332,7 +1427,7 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
   const auto& tensor = evidence.tensor_core;
   const CudaTracePolicyDescriptor expected_policy =
       ResolveCudaTracePolicy(
-          engine, igr_active, 1, polynomial_order, trace_policy);
+          engine, igr_active, rank_count, polynomial_order, trace_policy);
   const CudaTracePolicyKind resolved_trace_policy =
       expected_policy.resolved_selection;
   const auto expected_preconditioner =
@@ -1456,8 +1551,9 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
           resolved_trace_policy) &&
       CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
           expected_preconditioner);
-  const bool expected_native_solver =
+  const bool expected_native_solver = rank_count == 1 &&
       engine == CudaEngineKind::tensor_core && !expected_mgr_solver;
+  const bool expected_host_staged_solver = rank_count == 2;
   const bool mgr_work_consistent = expected_mgr_solver
       ? tensor.equilibration_builds == trace_solves &&
             tensor.equilibration_passes == 2 * trace_solves &&
@@ -1550,17 +1646,39 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
           expected_native_solver &&
       tensor.hypre_mgr_rank1_trace_solver_configured ==
           expected_mgr_solver &&
-      !tensor.hypre_host_staged_rank2_trace_solver_configured &&
+      tensor.hypre_host_staged_rank2_trace_solver_configured ==
+          expected_host_staged_solver &&
       tensor.native_rank1_trace_solve_calls ==
           (expected_native_solver ? linear_solve_attempts : 0) &&
       tensor.hypre_trace_solve_calls ==
           (expected_native_solver ? 0 : linear_solve_attempts);
+  const bool expected_scalar_closure = igr_active &&
+      time_treatment == EulerHdgTimeTreatment::partitioned_backward_euler;
+  const bool scalar_closure_work_consistent = expected_scalar_closure
+      ? evidence.scalar_closure_solves == 1 &&
+            evidence.scalar_closure_linear_iterations >= 0 &&
+            evidence.scalar_closure_linear_solve_attempts >=
+                evidence.scalar_closure_solves &&
+            evidence.scalar_closure_true_residual_tightenings >= 0 &&
+            evidence.scalar_closure_linear_iterations <=
+                evidence.final_coherent_linear_iterations &&
+            evidence.scalar_closure_linear_solve_attempts <=
+                evidence.linear_solve_attempts &&
+            evidence.scalar_closure_true_residual_tightenings <=
+                evidence.true_residual_tightenings &&
+            evidence.scalar_closure_linear_solve_attempts ==
+                evidence.scalar_closure_solves +
+                    evidence.scalar_closure_true_residual_tightenings
+      : evidence.scalar_closure_solves == 0 &&
+            evidence.scalar_closure_linear_iterations == 0 &&
+            evidence.scalar_closure_linear_solve_attempts == 0 &&
+            evidence.scalar_closure_true_residual_tightenings == 0;
   const bool expected_engine =
       CudaTracePolicyDescriptorIsExact(expected_policy) &&
       tensor.selected_engine == engine &&
       tensor.requested_trace_policy == trace_policy &&
       tensor.resolved_trace_policy == resolved_trace_policy &&
-      tensor.trace_policy_rank_count == 1 &&
+      tensor.trace_policy_rank_count == rank_count &&
       tensor.trace_policy_order == polynomial_order &&
       tensor.trace_preconditioner_configured &&
       tensor.trace_preconditioner == expected_preconditioner &&
@@ -1601,6 +1719,7 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
               evidence.final_coherent_linear_iterations &&
       evidence.linear_solve_attempts ==
           evidence.trace_solves + evidence.true_residual_tightenings &&
+      scalar_closure_work_consistent &&
       evidence.line_search_trials >= 0 &&
       evidence.rejected_line_search_trials >= 0 && expected_engine;
 }
@@ -1612,7 +1731,9 @@ bool RunStep(GenericEulerHdgCudaSession& session,
              const bool export_interior,
              const CudaEngineKind engine,
              const bool igr_active,
+             const EulerHdgTimeTreatment time_treatment,
              const CudaTracePolicyKind trace_policy,
+             const int rank_count,
              const int polynomial_order,
              const std::uint64_t krylov_restart_dimension,
              const bool warmup, const int measured_index,
@@ -1625,6 +1746,7 @@ bool RunStep(GenericEulerHdgCudaSession& session,
   GenericEulerCudaPreparedStep authority{};
   CudaPreparedOutputMetadataV1 output{};
 
+  MPI_Barrier(MPI_COMM_WORLD);
   const auto started = clock::now();
   const auto prepared = session.Prepare(timestep, authority, output);
   const bool observed = prepared.status == HdgEulerSessionStatus::prepared &&
@@ -1650,8 +1772,10 @@ bool RunStep(GenericEulerHdgCudaSession& session,
   // may deliberately return with same-stream metadata staging still in
   // flight, so subtracting host observation time could also subtract real
   // device work that overlaps it.
-  sample.seconds =
+  const double local_seconds =
       std::chrono::duration<double>(finished - started).count();
+  MPI_Allreduce(&local_seconds, &sample.seconds, 1, MPI_DOUBLE, MPI_MAX,
+                MPI_COMM_WORLD);
   if (!observed || !exported || !acknowledged ||
       committed.status != HdgEulerSessionStatus::committed ||
       !output.successful_commit)
@@ -1674,7 +1798,9 @@ bool RunStep(GenericEulerHdgCudaSession& session,
   }
   sample.coordinates = session.coordinates();
   sample.diagnostics = session.diagnostics();
-  if (!Healthy(sample.prepared, engine, igr_active, trace_policy,
+  if (!Healthy(sample.prepared, engine, igr_active, time_treatment,
+               trace_policy,
+               rank_count,
                polynomial_order,
                krylov_restart_dimension))
   {
@@ -1705,14 +1831,17 @@ bool RunStep(GenericEulerHdgCudaSession& session,
   return true;
 }
 
-double Median(std::array<double, measured_steps> values) noexcept
+double Median(std::vector<double> values)
 {
   std::sort(values.begin(), values.end());
-  return values[values.size() / 2];
+  const std::size_t middle = values.size() / 2;
+  return values.size() % 2 == 0
+      ? 0.5 * (values[middle - 1] + values[middle])
+      : values[middle];
 }
 
 double PopulationStandardDeviation(
-    const std::array<double, measured_steps>& values) noexcept
+    const std::vector<double>& values) noexcept
 {
   double mean = 0.0;
   for (const double value : values) mean += value;
@@ -1906,6 +2035,14 @@ void PrintStep(const StepSample& sample)
             << evidence.newton_correction_linear_iterations
             << ",\"final_coherent_linear_iterations\":"
             << evidence.final_coherent_linear_iterations
+            << ",\"scalar_closure_solves\":"
+            << evidence.scalar_closure_solves
+            << ",\"scalar_closure_linear_iterations\":"
+            << evidence.scalar_closure_linear_iterations
+            << ",\"scalar_closure_linear_solve_attempts\":"
+            << evidence.scalar_closure_linear_solve_attempts
+            << ",\"scalar_closure_true_residual_tightenings\":"
+            << evidence.scalar_closure_true_residual_tightenings
             << ",\"true_residual_tightenings\":"
             << evidence.true_residual_tightenings
             << ",\"line_search_trials\":" << evidence.line_search_trials
@@ -2125,6 +2262,10 @@ void PrintStep(const StepSample& sample)
 int RunBenchmark(const Options& options)
 {
   using clock = std::chrono::steady_clock;
+  int rank = 0;
+  int rank_count = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &rank_count);
   const auto initialization_started = clock::now();
   mfem::Device device("cuda");
   int active_device = -1;
@@ -2146,12 +2287,15 @@ int RunBenchmark(const Options& options)
   mfem::ParMesh mesh = MakePeriodicMesh(
       options.mesh_n, options.domain_periods);
   const int elements = mesh.GetNE();
+  int global_elements = 0;
+  MPI_Allreduce(&elements, &global_elements, 1, MPI_INT, MPI_SUM,
+                MPI_COMM_WORLD);
   const int principal_blocks =
       (elements + principal_elements_per_block - 1) /
       principal_elements_per_block;
   BorrowedFields fields = MakeFields(
       mesh, options.domain_periods, options.order);
-  if (elements != options.mesh_n * options.mesh_n ||
+  if (global_elements != options.mesh_n * options.mesh_n || elements <= 0 ||
       fields.volume_scalar_count == 0 ||
       fields.initial.size() !=
           fields.volume_scalar_count * conserved_components)
@@ -2174,9 +2318,12 @@ int RunBenchmark(const Options& options)
     return 1;
   }
   const auto initialization_finished = clock::now();
-  const double initialization_seconds =
+  const double local_initialization_seconds =
       std::chrono::duration<double>(
           initialization_finished - initialization_started).count();
+  double initialization_seconds = 0.0;
+  MPI_Allreduce(&local_initialization_seconds, &initialization_seconds, 1,
+                MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
   const DeviceMemorySnapshot memory_after_initialization =
       CaptureDeviceMemory();
 
@@ -2194,9 +2341,17 @@ int RunBenchmark(const Options& options)
   const std::int64_t expected_interior_unknowns =
       static_cast<std::int64_t>(elements) *
       problem.scalar_interior_dofs * expected_interior_components;
-  const std::int64_t expected_true_trace_unknowns =
+  const std::int64_t expected_global_true_trace_unknowns =
       2LL * options.mesh_n * options.mesh_n *
       problem.scalar_face_dofs * expected_trace_components;
+  const long long local_interior_unknowns = problem.interior_unknowns;
+  const long long local_true_trace_unknowns = problem.true_trace_unknowns;
+  long long global_interior_unknowns = 0;
+  long long summed_true_trace_unknowns = 0;
+  MPI_Allreduce(&local_interior_unknowns, &global_interior_unknowns, 1,
+                MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
+  MPI_Allreduce(&local_true_trace_unknowns, &summed_true_trace_unknowns, 1,
+                MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
   const int expected_volume_assembly_order =
       options.regularization == RegularizationKind::igr
       ? request.numerical_policy.igr_assembly_quadrature_orders.volume_order
@@ -2214,8 +2369,10 @@ int RunBenchmark(const Options& options)
       problem.igr_active !=
           (options.regularization == RegularizationKind::igr) ||
       problem.interior_unknowns != expected_interior_unknowns ||
-      problem.true_trace_unknowns != expected_true_trace_unknowns ||
-      problem.true_trace_unknowns != problem.global_true_trace_unknowns)
+      problem.true_trace_unknowns <= 0 ||
+      problem.global_true_trace_unknowns !=
+          expected_global_true_trace_unknowns ||
+      summed_true_trace_unknowns != problem.global_true_trace_unknowns)
   {
     std::cerr << "{\"schema\":2,\"success\":false,"
                  "\"error\":\"CUDA problem metadata validation failed\"}\n";
@@ -2233,7 +2390,8 @@ int RunBenchmark(const Options& options)
 
   std::vector<double> exported_interior(
       options.export_interior ? fields.initial.size() : 0, 0.0);
-  std::array<StepSample, total_steps> samples{};
+  const int total_steps = warmup_steps + options.measured_steps;
+  std::vector<StepSample> samples(static_cast<std::size_t>(total_steps));
   std::string error;
   for (int index = 0; index < total_steps; ++index)
   {
@@ -2246,7 +2404,9 @@ int RunBenchmark(const Options& options)
       return RunStep(session, fields, exported_interior, options.timestep,
                      options.export_interior, options.engine,
                      options.regularization == RegularizationKind::igr,
+                     options.time_treatment,
                      options.trace_policy,
+                     rank_count,
                      options.order,
                      static_cast<std::uint64_t>(krylov_restart_dimension), warmup,
                      measured_index,
@@ -2283,16 +2443,24 @@ int RunBenchmark(const Options& options)
     {
       step_succeeded = run_step();
     }
-    if (!step_succeeded)
+    const int local_step_succeeded = step_succeeded ? 1 : 0;
+    int all_steps_succeeded = 0;
+    MPI_Allreduce(&local_step_succeeded, &all_steps_succeeded, 1, MPI_INT,
+                  MPI_MIN, MPI_COMM_WORLD);
+    if (all_steps_succeeded == 0)
     {
-      std::cerr << "{\"schema\":2,\"success\":false,\"step_index\":"
-                << index << ",\"error\":\"" << error << "\"}\n";
+      if (rank == 0)
+        std::cerr << "{\"schema\":2,\"success\":false,\"step_index\":"
+                  << index << ",\"error\":\""
+                  << (step_succeeded ? "another rank failed" : error)
+                  << "\"}\n";
       return 1;
     }
   }
 
-  std::array<double, measured_steps> durations{};
-  for (int index = 0; index < measured_steps; ++index)
+  std::vector<double> durations(
+      static_cast<std::size_t>(options.measured_steps));
+  for (int index = 0; index < options.measured_steps; ++index)
     durations[static_cast<std::size_t>(index)] =
         samples[static_cast<std::size_t>(index + warmup_steps)].seconds;
   const DeviceMemorySnapshot memory_after_samples = CaptureDeviceMemory();
@@ -2328,6 +2496,8 @@ int RunBenchmark(const Options& options)
       equilibrated_field_split || robust_adaptive
       ? NativeElementSchwarzIgrFieldSplitLayout(options.order)
       : NativeElementSchwarzFieldSplitLayout{};
+
+  if (rank != 0) return 0;
 
   std::cout << std::setprecision(17)
             << "{\"schema\":2,"
@@ -2463,10 +2633,11 @@ int RunBenchmark(const Options& options)
             << (options.regularization == RegularizationKind::igr
                     ? "igr" : "conventional") << "\","
             << "\"precision\":\"fp64\","
-            << "\"time_integrator\":\"backward_euler\","
+            << "\"time_integrator\":\""
+            << TimeIntegratorJsonName(options.time_treatment) << "\","
             << "\"time_step_policy\":\"fixed\","
             << "\"gamma\":" << benchmark_gamma << ','
-            << "\"rank_count\":1,"
+            << "\"rank_count\":" << rank_count << ','
             << "\"polynomial_order\":" << options.order << ','
             << "\"mesh_n\":" << options.mesh_n << ','
             << "\"domain_periods\":" << options.domain_periods << ','
@@ -2476,15 +2647,20 @@ int RunBenchmark(const Options& options)
             << "\"element_h\":"
             << static_cast<double>(options.domain_periods) /
                 static_cast<double>(options.mesh_n) << ','
-            << "\"elements\":" << elements << ','
+            << "\"elements\":" << global_elements << ','
+            << "\"local_elements\":" << elements << ','
             << "\"volume_assembly_order\":"
             << problem.volume_assembly_order << ','
             << "\"volume_points\":" << problem.volume_points << ','
             << "\"interior_components\":"
             << problem.interior_components << ','
             << "\"trace_components\":" << problem.trace_components << ','
-            << "\"interior_unknowns\":" << problem.interior_unknowns << ','
+            << "\"interior_unknowns\":" << global_interior_unknowns << ','
+            << "\"local_interior_unknowns\":"
+            << problem.interior_unknowns << ','
             << "\"true_trace_unknowns\":"
+            << problem.global_true_trace_unknowns << ','
+            << "\"local_true_trace_unknowns\":"
             << problem.true_trace_unknowns << ','
             << "\"gpu_sm_count\":"
             << device_properties.multiProcessorCount << ','
@@ -2605,7 +2781,7 @@ int RunBenchmark(const Options& options)
             << (options.export_interior ? "ExportPreparedInteriorD2H+" : "")
             << "AcknowledgePreparedOutput+Commit\","
             << "\"warmup_steps\":" << warmup_steps << ','
-            << "\"measured_steps\":" << measured_steps << ','
+            << "\"measured_steps\":" << options.measured_steps << ','
             << "\"warmup_duration_seconds\":";
   PrintJsonNumber(samples[0].seconds);
   std::cout << ",\"raw_durations_seconds\":[";
@@ -2633,7 +2809,9 @@ int RunBenchmark(const Options& options)
 int main(int argc, char* argv[])
 {
   mfem::MPI_Session mpi(argc, argv);
+  int rank = 0;
   int ranks = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
 
   Options options;
@@ -2649,10 +2827,11 @@ int main(int argc, char* argv[])
     PrintUsage(argv[0]);
     return 0;
   }
-  if (ranks != 1)
+  if (ranks != 1 && ranks != 2)
   {
-    std::cerr << "{\"schema\":1,\"success\":false,"
-                 "\"error\":\"benchmark requires exactly one MPI rank\"}\n";
+    if (rank == 0)
+      std::cerr << "{\"schema\":1,\"success\":false,"
+                   "\"error\":\"benchmark requires one or two MPI ranks\"}\n";
     return 2;
   }
   if (!ExactExpectedBuildIdentity(options))

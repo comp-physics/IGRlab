@@ -2,7 +2,7 @@
 
 /**
  * @file sim/hdg/transactional_time_adapter.hpp
- * @brief Pure fixed/CFL Backward-Euler transaction adapter for HDG staging.
+ * @brief Pure fixed/CFL transaction adapter for typed HDG time treatments.
  *
  * No solver, MFEM, runtime backend, or output writer is included here.  The
  * caller owns those effects and uses the preview before FinalizeSuccess().
@@ -19,11 +19,13 @@
 namespace dg_sim::hdg
 {
 
-/// Reserved selection tags for future HDG time-control implementations.
+/// Exact time-treatment/control pairing for one HDG transaction cursor.
 enum class HdgTimeControlMode
 {
   FixedBackwardEuler,
   CFLBackwardEuler,
+  FixedPartitionedBackwardEuler,
+  CFLPartitionedBackwardEuler,
   IMEX,
   EmbeddedError
 };
@@ -59,12 +61,17 @@ public:
     HdgTimeControlMode mode = HdgTimeControlMode::FixedBackwardEuler)
     : cursor_(ValidateAndMoveControl(std::move(control), mode),
               std::move(schedule),
-              time::backend::IntegratorTag::BackwardEuler),
+              IntegratorForMode(mode)),
       mode_(mode)
   {
   }
 
   HdgTimeControlMode mode() const { return mode_; }
+  time::backend::IntegratorTag integrator() const
+  {
+    return cursor_.integrator();
+  }
+  bool UsesCflControl() const { return IsCflMode(mode_); }
   double time() const { return cursor_.time(); }
   bool Finished() const { return cursor_.Finished(); }
   bool HasPendingStep() const { return cursor_.HasPendingPlan(); }
@@ -76,7 +83,7 @@ public:
   std::uint64_t output_cycle() const { return output_cycle_; }
 
   /**
-   * Start a Backward-Euler transaction, or return its pending retry.
+   * Start one typed HDG transaction, or return its pending retry.
    *
    * In fixed mode @p proposed_dt is intentionally ignored by the underlying
    * planner.  In CFL mode it must be the backend's finite, positive,
@@ -100,7 +107,7 @@ public:
       throw std::invalid_argument(
           "HDG minimum nominal dt must be finite and non-negative");
     }
-    if (mode_ == HdgTimeControlMode::CFLBackwardEuler &&
+    if (IsCflMode(mode_) &&
         proposed_dt < minimum_nominal_dt)
     {
       throw std::invalid_argument(
@@ -109,7 +116,7 @@ public:
     return BeginStep(proposed_dt);
   }
 
-  /// Compatibility spelling for a fixed Backward-Euler transaction.
+  /// Compatibility spelling for a fixed-control transaction.
   const StepPlan& BeginStep() { return BeginStep(0.0); }
 
   /// Returns the same uncommitted plan after an external failure.
@@ -146,17 +153,44 @@ public:
   }
 
 private:
+  static constexpr bool IsCflMode(const HdgTimeControlMode mode) noexcept
+  {
+    return mode == HdgTimeControlMode::CFLBackwardEuler ||
+        mode == HdgTimeControlMode::CFLPartitionedBackwardEuler;
+  }
+
+  static time::backend::IntegratorTag IntegratorForMode(
+      const HdgTimeControlMode mode)
+  {
+    switch (mode)
+    {
+    case HdgTimeControlMode::FixedBackwardEuler:
+    case HdgTimeControlMode::CFLBackwardEuler:
+    case HdgTimeControlMode::FixedPartitionedBackwardEuler:
+    case HdgTimeControlMode::CFLPartitionedBackwardEuler:
+      return time::backend::IntegratorTag::BackwardEuler;
+    case HdgTimeControlMode::IMEX:
+      return time::backend::IntegratorTag::IMEX;
+    case HdgTimeControlMode::EmbeddedError:
+      return time::backend::IntegratorTag::EmbeddedError;
+    }
+    throw std::invalid_argument("unknown HDG time-control mode");
+  }
+
   static TimeControl ValidateAndMoveControl(TimeControl control,
                                             HdgTimeControlMode mode)
   {
-    const bool fixed_pair = mode == HdgTimeControlMode::FixedBackwardEuler &&
+    const bool fixed_mode = mode == HdgTimeControlMode::FixedBackwardEuler ||
+        mode == HdgTimeControlMode::FixedPartitionedBackwardEuler;
+    const bool cfl_mode = IsCflMode(mode);
+    const bool fixed_pair = fixed_mode &&
         control.kind == time::backend::StepControlKind::Fixed;
-    const bool cfl_pair = mode == HdgTimeControlMode::CFLBackwardEuler &&
+    const bool cfl_pair = cfl_mode &&
         control.kind == time::backend::StepControlKind::CFL;
     if (!fixed_pair && !cfl_pair)
     {
       throw std::invalid_argument(
-          "HDG time-control requires an exact Backward-Euler/control pairing");
+          "HDG time-control requires an exact integrator/control pairing");
     }
     control.Validate();
     return control;

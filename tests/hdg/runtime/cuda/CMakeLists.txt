@@ -334,6 +334,48 @@ foreach(_order IN ITEMS 1 2 3)
       TIMEOUT 3600)
 endforeach()
 
+# Focused productionization gate for the typed partitioned Backward-Euler
+# lifecycle.  Reuse the same conventional-degeneration, periodic/physical IGR,
+# and transactional fixtures at every supported order, engine, and rank
+# topology without duplicating backend-specific test code.
+foreach(_order IN ITEMS 1 2 3)
+  foreach(_engine IN ITEMS ordinary tensor)
+    set(_engine_args)
+    if(_engine STREQUAL "tensor")
+      list(APPEND _engine_args --engine tensor)
+    endif()
+    add_test(
+      NAME dg_igr_hdg_runtime_cuda_partitioned_backward_euler_p${_order}_${_engine}_rank1
+      COMMAND dg_igr_hdg_runtime_cuda_generic_euler_extension
+        --order ${_order} ${_engine_args}
+        --time-treatment partitioned-backward-euler --partitioned-smoke)
+    add_test(
+      NAME dg_igr_hdg_runtime_cuda_partitioned_backward_euler_p${_order}_${_engine}_rank2
+      COMMAND
+        "${MPIEXEC_EXECUTABLE}"
+        "${MPIEXEC_NUMPROC_FLAG}" 2
+        ${MPIEXEC_PREFLAGS}
+        $<TARGET_FILE:dg_igr_hdg_runtime_cuda_generic_euler_extension>
+        --order ${_order} ${_engine_args}
+        --time-treatment partitioned-backward-euler --partitioned-smoke
+        ${MPIEXEC_POSTFLAGS})
+    set_tests_properties(
+      dg_igr_hdg_runtime_cuda_partitioned_backward_euler_p${_order}_${_engine}_rank1
+      PROPERTIES
+        LABELS "hdg;runtime;cuda;generic-euler;partitioned-backward-euler;${_engine};igr;conventional;p${_order};physical;periodic;lifecycle"
+        PROCESSORS 1
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 3600)
+    set_tests_properties(
+      dg_igr_hdg_runtime_cuda_partitioned_backward_euler_p${_order}_${_engine}_rank2
+      PROPERTIES
+        LABELS "hdg;runtime;cuda;generic-euler;partitioned-backward-euler;${_engine};igr;conventional;p${_order};physical;periodic;lifecycle;mpi;host-staged"
+        PROCESSORS 2
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 3600)
+  endforeach()
+endforeach()
+
 # Direct rank-one CPU/ordinary-CUDA/tensor-CUDA field agreement reuses one
 # trajectory fixture for all pairwise comparisons at p1-p3.  Rank-two engine
 # correctness remains in the generic extension matrix above.
@@ -376,6 +418,25 @@ foreach(_order IN ITEMS 1 2 3)
     dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p${_order}_rank1
     PROPERTIES
       LABELS "hdg;runtime;cpu;cuda;generic-euler;alignment;ordinary;tensor;igr;contact;physical;periodic;source;initial-trace;conservation;trajectory;p${_order}"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 7200)
+endforeach()
+
+# Winner-specific cross-backend qualification reuses the complete bounded
+# six-case trajectory fixture.  This covers CPU, ordinary CUDA, and tensor
+# CUDA pairwise agreement at every supported polynomial order while retaining
+# the registrations above as the fully coupled Backward-Euler controls.
+foreach(_order IN ITEMS 1 2 3)
+  add_test(
+    NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_partitioned_backward_euler_p${_order}_rank1
+    COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+      --order ${_order}
+      --time-treatment partitioned-backward-euler)
+  set_tests_properties(
+    dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_partitioned_backward_euler_p${_order}_rank1
+    PROPERTIES
+      LABELS "hdg;runtime;cpu;cuda;generic-euler;alignment;partitioned-backward-euler;ordinary;tensor;igr;contact;physical;periodic;source;initial-trace;conservation;trajectory;p${_order}"
       PROCESSORS 1
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 7200)
@@ -606,6 +667,23 @@ foreach(_regularization IN ITEMS conventional igr)
         TIMEOUT 7200)
   endforeach()
 endforeach()
+
+# One bounded winner-specific ladder reuses the shared CPU/ordinary-CUDA/
+# tensor-CUDA spatial and temporal convergence oracle.  The p1-p3 backend
+# surface is covered by the focused alignment matrix above, so p2 is enough to
+# bind the selected time treatment without duplicating the legacy matrix.
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_generic_euler_convergence_partitioned_backward_euler_igr_p2_rank1
+  COMMAND dg_igr_hdg_runtime_cuda_generic_euler_convergence
+    --order 2 --regularization igr
+    --time-treatment partitioned-backward-euler)
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_generic_euler_convergence_partitioned_backward_euler_igr_p2_rank1
+  PROPERTIES
+    LABELS "hdg;runtime;cpu;cuda;generic-euler;convergence;spatial;temporal-order;partitioned-backward-euler;ordinary;tensor;igr;p2;alignment"
+    PROCESSORS 1
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 3600)
 
 # The original failing entropy-wave corner is isolated as one bounded p1,
 # mesh-3, one-step tensor-IGR gate for each fully coupled specialization.
@@ -911,6 +989,48 @@ add_test(
     --active-ranks 2
     --engine tensor
     ${MPIEXEC_POSTFLAGS})
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_partitioned_backward_euler_ordinary_rank1
+  COMMAND
+    "${MPIEXEC_EXECUTABLE}"
+    "${MPIEXEC_NUMPROC_FLAG}" 2
+    ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator>
+    --active-ranks 1
+    --time-treatment partitioned-backward-euler
+    ${MPIEXEC_POSTFLAGS})
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_partitioned_backward_euler_ordinary_rank2
+  COMMAND
+    "${MPIEXEC_EXECUTABLE}"
+    "${MPIEXEC_NUMPROC_FLAG}" 3
+    ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator>
+    --active-ranks 2
+    --time-treatment partitioned-backward-euler
+    ${MPIEXEC_POSTFLAGS})
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_partitioned_backward_euler_tensor_rank1
+  COMMAND
+    "${MPIEXEC_EXECUTABLE}"
+    "${MPIEXEC_NUMPROC_FLAG}" 2
+    ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator>
+    --active-ranks 1
+    --engine tensor
+    --time-treatment partitioned-backward-euler
+    ${MPIEXEC_POSTFLAGS})
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_partitioned_backward_euler_tensor_rank2
+  COMMAND
+    "${MPIEXEC_EXECUTABLE}"
+    "${MPIEXEC_NUMPROC_FLAG}" 3
+    ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator>
+    --active-ranks 2
+    --engine tensor
+    --time-treatment partitioned-backward-euler
+    ${MPIEXEC_POSTFLAGS})
 set_tests_properties(
   dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_rank1
   PROPERTIES
@@ -936,6 +1056,34 @@ set_tests_properties(
   dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_tensor_rank2
   PROPERTIES
     LABELS "hdg;runtime;cuda;generic-euler;tensor;igr;subcommunicator;rank2;mpi;negative;host-staged;no-fallback"
+    PROCESSORS 3
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 3600)
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_partitioned_backward_euler_ordinary_rank1
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;generic-euler;partitioned-backward-euler;ordinary;igr;subcommunicator;rank1;mpi"
+    PROCESSORS 2
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 3600)
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_partitioned_backward_euler_ordinary_rank2
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;generic-euler;partitioned-backward-euler;ordinary;igr;subcommunicator;rank2;mpi;negative;host-staged"
+    PROCESSORS 3
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 3600)
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_partitioned_backward_euler_tensor_rank1
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;generic-euler;partitioned-backward-euler;tensor;igr;subcommunicator;rank1;mpi;no-fallback"
+    PROCESSORS 2
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 3600)
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_partitioned_backward_euler_tensor_rank2
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;generic-euler;partitioned-backward-euler;tensor;igr;subcommunicator;rank2;mpi;negative;host-staged;no-fallback"
     PROCESSORS 3
     RESOURCE_LOCK dg_igr_sm120
     TIMEOUT 3600)

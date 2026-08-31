@@ -100,6 +100,22 @@ enum class NativeTraceOperatorKind : std::int32_t
   element_matrix_free_warp_equilibrated_field_split_fp64 = 4
 };
 
+/**
+ * Exact invariant subspace used by partitioned-IGR rank-one trace solves.
+ *
+ * Storage, CSR metadata, true-DOF maps, and the externally visible solution
+ * remain the complete Uhat4/sigmahat system.  A projected solve only omits
+ * matrix-free and preconditioner work in the identity-constrained complement;
+ * it never changes the mathematical trace layout or the later full-matrix
+ * FP64 residual authority.
+ */
+enum class NativeTraceActiveSubspace : std::int32_t
+{
+  full = 0,
+  euler_uhat4 = 1,
+  scalar_sigmahat = 2
+};
+
 /** Current true-trace system and HYPRE-owned solution storage. */
 struct NativeTraceSystemView final
 {
@@ -111,6 +127,8 @@ struct NativeTraceSystemView final
   // Retained row-major [element][row][column] Schur blocks. Maps and the
   // persistent element-action scratch are shared with the exact Schwarz view.
   const double* element_schur = nullptr;
+  NativeTraceActiveSubspace active_subspace =
+      NativeTraceActiveSubspace::full;
 };
 
 /**

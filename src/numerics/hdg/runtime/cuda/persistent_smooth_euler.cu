@@ -1479,13 +1479,15 @@ bool CudaLaunchNativeRankOneTraceSolver(
     const CudaNativeIlu0FactorView& ilu_factor,
     const CudaNativeElementSchwarzView& element_schwarz,
     const CudaNativeTraceOperatorView& trace_operator,
+    const CudaNativeTraceActiveSubspace active_subspace,
     const CudaNativeTraceWorkspaceView& workspace,
     const CudaNativeTraceCooperativeSupport& support,
     const double relative_tolerance, const int maximum_iterations,
     const int krylov_dimension, const cudaStream_t stream) noexcept
 {
   if (CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
-          preconditioner_kind))
+          preconditioner_kind) ||
+      !IsKnownCudaNativeTraceActiveSubspace(active_subspace))
     return false;
   NativeTraceSystemView system{};
   system.matrix = {matrix.diag_offsets, matrix.diag_columns,
@@ -1515,6 +1517,20 @@ bool CudaLaunchNativeRankOneTraceSolver(
     return false;
   }
   system.element_schur = trace_operator.element_schur;
+  switch (active_subspace)
+  {
+  case CudaNativeTraceActiveSubspace::full:
+    system.active_subspace = NativeTraceActiveSubspace::full;
+    break;
+  case CudaNativeTraceActiveSubspace::euler_uhat4:
+    system.active_subspace = NativeTraceActiveSubspace::euler_uhat4;
+    break;
+  case CudaNativeTraceActiveSubspace::scalar_sigmahat:
+    system.active_subspace = NativeTraceActiveSubspace::scalar_sigmahat;
+    break;
+  default:
+    return false;
+  }
 
   NativeTracePreconditionerView preconditioner{};
   const bool use_ilu = CudaTracePreconditionerIsIlu(preconditioner_kind);
@@ -1533,6 +1549,14 @@ bool CudaLaunchNativeRankOneTraceSolver(
       CudaTracePreconditionerUsesFixedSigmaJacobi(preconditioner_kind);
   const int fixed_sigma_jacobi_sweeps =
       CudaTracePreconditionerFixedSigmaJacobiSweeps(preconditioner_kind);
+  const bool use_projected_subspace =
+      CudaNativeTraceActiveSubspaceIsProjected(active_subspace);
+  if (use_projected_subspace &&
+      (!use_fixed_sigma_jacobi || use_coupled_warp_full_patch ||
+       !use_warp_equilibrated_field_split ||
+       trace_operator.kind != CudaNativeTraceOperatorKind::
+           element_matrix_free_warp_equilibrated_field_split_fp64))
+    return false;
   const NativeTracePreconditionerKind fixed_sigma_jacobi_kind =
       use_coupled_warp_full_patch
       ? NativeCoupledWarpPreconditioner(fixed_sigma_jacobi_sweeps)
@@ -3460,6 +3484,18 @@ __global__ void AdmissibilityKernel(CudaDeviceView view, CudaMeshShape shape)
   __syncthreads();
   const int ni0 = element * shape.interior_dofs;
   const int nt0 = element * shape.trace_dofs;
+  // Admission is a byte-level contract for every mathematical block, not
+  // only for U4 evaluated at quadrature points.  In particular, a non-finite
+  // recovered sigma, z, or sigmahat must fail before publication even when it
+  // does not perturb the conservative-state admissibility samples.
+  for (int local = threadIdx.x; local < shape.interior_dofs;
+       local += blockDim.x)
+    if (!isfinite(view.work_interior[ni0 + local]))
+      atomicExch(&volume_failed, 1);
+  for (int local = threadIdx.x; local < shape.trace_dofs;
+       local += blockDim.x)
+    if (!isfinite(view.current_local_trace[nt0 + local]))
+      atomicExch(&face_failed, 1);
   for (int q = threadIdx.x; q < shape.volume_points; q += blockDim.x)
   {
     const int qp = element * shape.volume_points + q;
@@ -4255,6 +4291,217 @@ __global__ void BorrowedEulerFaceKernel(CudaDeviceView v,CudaMeshShape s,
   __shared__ BorrowedFaceCache caches[borrowed_euler_elements_per_block];
   (void)BorrowedEulerFaceElement(
       v,s,frozen_llf,e,lane,group_mask,caches[group]);
+}
+
+// Retain the established full-width condensation storage while replacing the
+// frozen Euler rows and columns by exact identity constraints.  The remaining
+// auxiliary block therefore advances only sigma, z, and sigmahat and cannot
+// borrow an approximate Euler increment to satisfy its true-residual gate.
+__global__ void PartitionedScalarClosureMaskKernel(
+    CudaDeviceView v,CudaMeshShape s)
+{
+  const int element=blockIdx.x;
+  if(element>=s.elements)return;
+  const int ni=s.interior_dofs,nt=s.trace_dofs;
+  const int si=s.scalar_interior_dofs,sf=s.scalar_face_dofs;
+  const int e_i=element*ni,e_t=element*nt;
+  const std::size_t ao=static_cast<std::size_t>(element)*ni*ni;
+  const std::size_t bo=static_cast<std::size_t>(element)*ni*nt;
+  const std::size_t co=static_cast<std::size_t>(element)*nt*ni;
+  const std::size_t doff=static_cast<std::size_t>(element)*nt*nt;
+  const int face_stride=s.trace_components*sf;
+  for(int row=threadIdx.x;row<ni;row+=blockDim.x)
+    if(row/si<conserved_components)
+    {
+      v.residual_r[e_i+row]=0.0;v.f[e_i+row]=0.0;
+    }
+  for(int row=threadIdx.x;row<nt;row+=blockDim.x)
+    if((row%face_stride)/sf<conserved_components)
+    {
+      v.residual_g[e_t+row]=0.0;v.g[e_t+row]=0.0;
+    }
+  for(int entry=threadIdx.x;entry<ni*ni;entry+=blockDim.x)
+  {
+    const int row=entry/ni,column=entry-row*ni;
+    if(row/si<conserved_components||column/si<conserved_components)
+      v.a[ao+entry]=row==column?1.0:0.0;
+  }
+  for(int entry=threadIdx.x;entry<ni*nt;entry+=blockDim.x)
+  {
+    const int row=entry/nt,column=entry-row*nt;
+    if(row/si<conserved_components||
+       (column%face_stride)/sf<conserved_components)
+      v.b[bo+entry]=0.0;
+  }
+  for(int entry=threadIdx.x;entry<nt*ni;entry+=blockDim.x)
+  {
+    const int row=entry/ni,column=entry-row*ni;
+    if((row%face_stride)/sf<conserved_components||
+       column/si<conserved_components)
+      v.c[co+entry]=0.0;
+  }
+  for(int entry=threadIdx.x;entry<nt*nt;entry+=blockDim.x)
+  {
+    const int row=entry/nt,column=entry-row*nt;
+    if((row%face_stride)/sf<conserved_components||
+       (column%face_stride)/sf<conserved_components)
+      v.d[doff+entry]=row==column?1.0:0.0;
+  }
+  __syncthreads();
+  if(threadIdx.x==0)v.status[element]=1.0;
+}
+
+// Retain the established full-width storage while replacing every
+// sigma/z/sigmahat row and column by an identity constraint.  Euler residual
+// values were already assembled with the frozen sigma witness, so the
+// remaining U4/Uhat4 block is precisely the frozen-closure BE subsystem.
+__global__ void PartitionedBackwardEulerMaskKernel(
+    CudaDeviceView v,CudaMeshShape s)
+{
+  const int element=blockIdx.x;
+  if(element>=s.elements)return;
+  const int ni=s.interior_dofs,nt=s.trace_dofs;
+  const int si=s.scalar_interior_dofs,sf=s.scalar_face_dofs;
+  const int e_i=element*ni,e_t=element*nt;
+  const std::size_t ao=static_cast<std::size_t>(element)*ni*ni;
+  const std::size_t bo=static_cast<std::size_t>(element)*ni*nt;
+  const std::size_t co=static_cast<std::size_t>(element)*nt*ni;
+  const std::size_t doff=static_cast<std::size_t>(element)*nt*nt;
+  const int face_stride=s.trace_components*sf;
+  for(int row=threadIdx.x;row<ni;row+=blockDim.x)
+    if(row/si>=conserved_components)
+    {
+      v.residual_r[e_i+row]=0.0;
+      v.f[e_i+row]=0.0;
+    }
+  for(int row=threadIdx.x;row<nt;row+=blockDim.x)
+    if((row%face_stride)/sf>=conserved_components)
+    {
+      v.residual_g[e_t+row]=0.0;
+      v.g[e_t+row]=0.0;
+    }
+  for(int entry=threadIdx.x;entry<ni*ni;entry+=blockDim.x)
+  {
+    const int row=entry/ni,column=entry-row*ni;
+    if(row/si>=conserved_components||column/si>=conserved_components)
+      v.a[ao+entry]=row==column?1.0:0.0;
+  }
+  for(int entry=threadIdx.x;entry<ni*nt;entry+=blockDim.x)
+  {
+    const int row=entry/nt,column=entry-row*nt;
+    if(row/si>=conserved_components||
+       (column%face_stride)/sf>=conserved_components)
+      v.b[bo+entry]=0.0;
+  }
+  for(int entry=threadIdx.x;entry<nt*ni;entry+=blockDim.x)
+  {
+    const int row=entry/ni,column=entry-row*ni;
+    if((row%face_stride)/sf>=conserved_components||
+       column/si>=conserved_components)
+      v.c[co+entry]=0.0;
+  }
+  for(int entry=threadIdx.x;entry<nt*nt;entry+=blockDim.x)
+  {
+    const int row=entry/nt,column=entry-row*nt;
+    if((row%face_stride)/sf>=conserved_components||
+       (column%face_stride)/sf>=conserved_components)
+      v.d[doff+entry]=row==column?1.0:0.0;
+  }
+  __syncthreads();
+  if(threadIdx.x==0)v.status[element]=1.0;
+}
+
+// Iterative solves may leave roundoff-sized values in identity-constrained
+// entries.  Remove them before any trial update so frozen auxiliary state is
+// preserved bit-for-bit and cannot influence an accepted Euler correction.
+__global__ void FrozenBlockIncrementsKernel(
+    CudaDeviceView v,CudaMeshShape s,int local_trace_entries,
+    bool freeze_auxiliary)
+{
+  const int index=blockIdx.x*blockDim.x+threadIdx.x;
+  if(index<s.interior_count)
+  {
+    const int local=index%s.interior_dofs;
+    const bool auxiliary=
+        local/s.scalar_interior_dofs>=conserved_components;
+    if(auxiliary==freeze_auxiliary)
+      v.recovered_interior[index]=0.0;
+  }
+  if(index<s.true_trace_count)
+  {
+    const int scalar_count=s.true_trace_count/s.trace_components;
+    const bool auxiliary=index/scalar_count>=conserved_components;
+    if(auxiliary==freeze_auxiliary)
+      v.true_solution[index]=0.0;
+  }
+  if(index<local_trace_entries)
+  {
+    const int local=index%s.trace_dofs;
+    const int face_stride=s.trace_components*s.scalar_face_dofs;
+    const bool auxiliary=
+        (local%face_stride)/s.scalar_face_dofs>=conserved_components;
+    if(auxiliary==freeze_auxiliary)
+      v.trace_increment_local[index]=0.0;
+  }
+}
+
+// Compare exact IEEE-754 payload bits against the attempt-local snapshot.
+// Blocks own disjoint element interiors; block zero additionally audits this
+// rank's owned true-trace slab.  This is a bounded numerical gate, not
+// retained event history or a public diagnostic surface.
+__global__ void PartitionedBackwardEulerStateAuditKernel(
+    CudaDeviceView v,CudaMeshShape s,bool audit_auxiliary)
+{
+  const int element=blockIdx.x;
+  if(element>=s.elements)return;
+  __shared__ int invalid;
+  if(threadIdx.x==0)invalid=0;
+  __syncthreads();
+  const int begin=element*s.interior_dofs;
+  for(int local=threadIdx.x;local<s.interior_dofs;local+=blockDim.x)
+  {
+    const int component=local/s.scalar_interior_dofs;
+    const bool selected=audit_auxiliary?
+        component>=conserved_components:component<conserved_components;
+    if(selected&&__double_as_longlong(v.work_interior[begin+local])!=
+                    __double_as_longlong(
+                        v.partitioned_base_interior[begin+local]))
+      atomicExch(&invalid,1);
+  }
+  if(element==0)
+  {
+    const int scalar_count=s.true_trace_count/s.trace_components;
+    for(int index=threadIdx.x;index<s.true_trace_count;
+        index+=blockDim.x)
+    {
+      const int component=index/scalar_count;
+      const bool selected=audit_auxiliary?
+          component>=conserved_components:component<conserved_components;
+      if(selected&&__double_as_longlong(v.work_true_trace[index])!=
+                      __double_as_longlong(v.trial_true_trace[index]))
+        atomicExch(&invalid,1);
+    }
+  }
+  __syncthreads();
+  if(threadIdx.x==0)v.status[element]=invalid?-1.0:1.0;
+}
+
+__global__ void PartitionedScalarClosureRestoreEulerKernel(
+    CudaDeviceView v,CudaMeshShape s)
+{
+  const int index=blockIdx.x*blockDim.x+threadIdx.x;
+  if(index<s.interior_count)
+  {
+    const int local=index%s.interior_dofs;
+    if(local/s.scalar_interior_dofs<conserved_components)
+      v.work_interior[index]=v.base_interior[index];
+  }
+  if(index<s.true_trace_count)
+  {
+    const int scalar_count=s.true_trace_count/s.trace_components;
+    if(index/scalar_count<conserved_components)
+      v.work_true_trace[index]=v.base_true_trace[index];
+  }
 }
 
 // The tensor volume leaf retains the existing Zero and Face kernels.  Between
@@ -5825,6 +6072,49 @@ __global__ void NormPartialsKernel(const double* a,int an,const double* b,
   if(thread==0)partials[blockIdx.x]=partial[0];
 }
 
+__global__ void PartitionedAuxiliaryNormPartialsKernel(
+    CudaMeshShape shape, const double* interior, const double* true_trace,
+    int interior_auxiliary_count, int trace_auxiliary_count,
+    double* partials)
+{
+  __shared__ double partial[cooperative_reduction_threads];
+  const int thread=threadIdx.x;
+  const int count=interior_auxiliary_count+trace_auxiliary_count;
+  const int interior_auxiliary_per_element=
+      (shape.interior_components-conserved_components)*
+          shape.scalar_interior_dofs;
+  const int true_scalar_count=
+      shape.true_trace_count/shape.trace_components;
+  double sum=0.0;
+  const int global_thread=blockIdx.x*blockDim.x+thread;
+  const int stride=gridDim.x*blockDim.x;
+  for(int index=global_thread;index<count;index+=stride)
+  {
+    double value=0.0;
+    if(index<interior_auxiliary_count)
+    {
+      const int element=index/interior_auxiliary_per_element;
+      const int local=index-element*interior_auxiliary_per_element;
+      value=interior[static_cast<std::size_t>(element)*shape.interior_dofs+
+                     conserved_components*shape.scalar_interior_dofs+local];
+    }
+    else
+    {
+      const int local=index-interior_auxiliary_count;
+      value=true_trace[conserved_components*true_scalar_count+local];
+    }
+    sum+=value*value;
+  }
+  partial[thread]=sum;
+  __syncthreads();
+  for(int offset=blockDim.x/2;offset>0;offset/=2)
+  {
+    if(thread<offset)partial[thread]+=partial[thread+offset];
+    __syncthreads();
+  }
+  if(thread==0)partials[blockIdx.x]=partial[0];
+}
+
 __global__ void NormReduceKernel(const double* partials,int partial_count,
                                  double* out)
 {
@@ -6531,6 +6821,96 @@ bool CudaLaunchFrozenBorrowedLlfAssembly(const CudaDeviceView& v,
   if(!s.borrowed_host_inputs||s.igr_active||s.elements<=0)return false;
   return LaunchBorrowedEulerStages(v,s,dt,true);
 }
+bool CudaLaunchPartitionedScalarClosureMask(
+    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+{
+  if(!s.borrowed_host_inputs||!s.igr_active||
+     s.elements<=0||s.interior_components!=igr_interior_components||
+     s.trace_components!=igr_trace_components||v.residual_r==nullptr||
+     v.residual_g==nullptr||v.a==nullptr||v.b==nullptr||v.c==nullptr||
+     v.d==nullptr||v.f==nullptr||v.g==nullptr||v.status==nullptr)
+    return false;
+  PartitionedScalarClosureMaskKernel<<<s.elements,128>>>(v,s);
+  return LaunchOk();
+}
+bool CudaLaunchPartitionedBackwardEulerMask(
+    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+{
+  if(!s.borrowed_host_inputs||!s.igr_active||
+     s.interior_components!=igr_interior_components||
+     s.trace_components!=igr_trace_components||s.elements<=0||
+     s.scalar_interior_dofs<=0||s.scalar_face_dofs<=0||
+     v.residual_r==nullptr||v.residual_g==nullptr||v.a==nullptr||
+     v.b==nullptr||v.c==nullptr||v.d==nullptr||v.f==nullptr||
+     v.g==nullptr||v.status==nullptr)return false;
+  PartitionedBackwardEulerMaskKernel<<<s.elements,128>>>(v,s);
+  return LaunchOk();
+}
+bool CudaLaunchPartitionedBackwardEulerFreezeIncrements(
+    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+{
+  if(!s.borrowed_host_inputs||!s.igr_active||
+     s.interior_components!=igr_interior_components||
+     s.trace_components!=igr_trace_components||s.interior_count<=0||
+     s.elements<=0||s.trace_dofs<=0||
+     s.elements>std::numeric_limits<int>::max()/s.trace_dofs||
+     s.local_trace_count<=0||s.true_trace_count<=0||
+     s.true_trace_count%s.trace_components!=0||
+     v.recovered_interior==nullptr||v.true_solution==nullptr||
+     v.trace_increment_local==nullptr)return false;
+  const int local_trace_entries=s.elements*s.trace_dofs;
+  const int count=std::max(s.interior_count,
+      std::max(local_trace_entries,s.true_trace_count));
+  FrozenBlockIncrementsKernel<<<Blocks(count),128>>>(
+      v,s,local_trace_entries,true);
+  return LaunchOk();
+}
+bool CudaLaunchPartitionedScalarClosureFreezeEulerIncrements(
+    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+{
+  if(!s.borrowed_host_inputs||!s.igr_active||
+     s.interior_components!=igr_interior_components||
+     s.trace_components!=igr_trace_components||s.interior_count<=0||
+     s.elements<=0||s.trace_dofs<=0||
+     s.elements>std::numeric_limits<int>::max()/s.trace_dofs||
+     s.local_trace_count<=0||s.true_trace_count<=0||
+     s.true_trace_count%s.trace_components!=0||
+     v.recovered_interior==nullptr||v.true_solution==nullptr||
+     v.trace_increment_local==nullptr)return false;
+  const int local_trace_entries=s.elements*s.trace_dofs;
+  const int count=std::max(s.interior_count,
+      std::max(local_trace_entries,s.true_trace_count));
+  FrozenBlockIncrementsKernel<<<Blocks(count),128>>>(
+      v,s,local_trace_entries,false);
+  return LaunchOk();
+}
+bool CudaLaunchPartitionedBackwardEulerStateAudit(
+    const CudaDeviceView& v,const CudaMeshShape& s,
+    const bool audit_auxiliary) noexcept
+{
+  if(!s.borrowed_host_inputs||!s.igr_active||
+     s.elements<=0||s.interior_components!=igr_interior_components||
+     s.trace_components!=igr_trace_components||s.interior_count<=0||
+     s.true_trace_count<=0||s.true_trace_count%s.trace_components!=0||
+     v.work_interior==nullptr||v.partitioned_base_interior==nullptr||
+     v.work_true_trace==nullptr||v.trial_true_trace==nullptr||
+     v.status==nullptr)return false;
+  PartitionedBackwardEulerStateAuditKernel<<<s.elements,128>>>(
+      v,s,audit_auxiliary);
+  return LaunchOk();
+}
+bool CudaLaunchPartitionedScalarClosureRestoreEuler(
+    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+{
+  if(!s.borrowed_host_inputs||!s.igr_active||s.interior_count<=0||
+     s.true_trace_count<=0||s.true_trace_count%s.trace_components!=0||
+     v.work_interior==nullptr||v.base_interior==nullptr||
+     v.work_true_trace==nullptr||v.base_true_trace==nullptr)
+    return false;
+  PartitionedScalarClosureRestoreEulerKernel<<<
+      Blocks(std::max(s.interior_count,s.true_trace_count)),128>>>(v,s);
+  return LaunchOk();
+}
 bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
                             const generic::CudaEngineKind engine,
                             std::uint64_t& tensor_mma_tiles) noexcept
@@ -6767,6 +7147,38 @@ bool CudaLaunchLocalSquaredNorm(const double* a,int an,const double* b,int bn,
   const int blocks=std::min(needed_blocks,scratch_count);
   NormPartialsKernel<<<blocks,cooperative_reduction_threads>>>(
       a,an,b,bn,scratch);
+  if(!LaunchOk())return false;
+  NormReduceKernel<<<1,cooperative_reduction_threads>>>(scratch,blocks,out);
+  return LaunchOk();
+}
+bool CudaLaunchPartitionedAuxiliarySquaredNorm(
+    const CudaMeshShape& s,const double* interior,const double* true_trace,
+    double* scratch,int scratch_count,double* out) noexcept
+{
+  if(!s.igr_active||s.elements<=0||s.interior_components!=
+         igr_interior_components||s.trace_components!=igr_trace_components||
+     s.scalar_interior_dofs<=0||s.interior_dofs!=
+         s.interior_components*s.scalar_interior_dofs||
+     s.true_trace_count<=0||
+     s.true_trace_count%s.trace_components!=0||interior==nullptr||
+     true_trace==nullptr||scratch==nullptr||scratch==out||
+     scratch_count<=0||out==nullptr)return false;
+  const long long interior_count=static_cast<long long>(s.elements)*
+      (s.interior_components-conserved_components)*s.scalar_interior_dofs;
+  const long long trace_count=
+      static_cast<long long>(s.trace_components-conserved_components)*
+      (s.true_trace_count/s.trace_components);
+  if(interior_count<=0||trace_count<=0||
+     interior_count>std::numeric_limits<int>::max()||
+     trace_count>std::numeric_limits<int>::max()||
+     interior_count+trace_count>std::numeric_limits<int>::max())return false;
+  const int total=static_cast<int>(interior_count+trace_count);
+  const int needed_blocks=(total-1)/cooperative_reduction_threads+1;
+  const int blocks=std::min(needed_blocks,scratch_count);
+  PartitionedAuxiliaryNormPartialsKernel<<<
+      blocks,cooperative_reduction_threads>>>(
+          s,interior,true_trace,static_cast<int>(interior_count),
+          static_cast<int>(trace_count),scratch);
   if(!LaunchOk())return false;
   NormReduceKernel<<<1,cooperative_reduction_threads>>>(scratch,blocks,out);
   return LaunchOk();

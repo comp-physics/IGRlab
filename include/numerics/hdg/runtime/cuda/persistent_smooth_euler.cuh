@@ -472,6 +472,10 @@ struct CudaNumericalResult
   int linear_solve_attempts = 0;
   int newton_correction_linear_iterations = 0;
   int final_coherent_linear_iterations = 0;
+  int scalar_closure_solves = 0;
+  int scalar_closure_linear_iterations = 0;
+  int scalar_closure_linear_solve_attempts = 0;
+  int scalar_closure_true_residual_tightenings = 0;
   int true_residual_tightenings = 0;
   int line_search_trials = 0;
   int rejected_line_search_trials = 0;
@@ -505,12 +509,18 @@ inline bool ExactSelection(const CudaConfig& config) noexcept
   const bool borrowed_current_llf = config.use_borrowed_host_inputs &&
       ExactId(tuple.stabilization,
               borrowed_euler_llf_stabilization_id);
+  const bool backward_euler =
+      config.time_treatment == generic::EulerHdgTimeTreatment::backward_euler &&
+      ExactId(tuple.time_treatment, "backward_euler");
+  const bool partitioned_backward_euler = config.time_treatment ==
+          generic::EulerHdgTimeTreatment::partitioned_backward_euler &&
+      ExactId(tuple.time_treatment, "partitioned_backward_euler");
   return Selection::interior_space == InteriorSpace::l2 && tuple.Valid() &&
       ExactId(tuple.model, "euler.compressible.2d") &&
       ExactId(tuple.formulation, "hdg.conventional") &&
       ExactId(tuple.trace, "mfem.dg_interface.trace") &&
       (legacy_fixed || borrowed_current_llf) &&
-      ExactId(tuple.time_treatment, "backward_euler") &&
+      (backward_euler || partitioned_backward_euler) &&
       ExactId(tuple.precision, "fp64") && (rank_one || rank_two);
 }
 
@@ -955,6 +965,7 @@ public:
     if (outcome.committed)
     {
       numerics_.SwapPublishedSlotHandles();
+      numerics_.MarkCommittedScalarClosureCoherent();
       if (config_.use_borrowed_host_inputs)
       {
         committed_maximum_wave_speed_ = candidate_maximum_wave_speed;
@@ -1020,6 +1031,9 @@ public:
     const AttemptOutcome outcome =
         contract_->RevertCommit(std::move(*pending_.provisional), reason);
     pending_.provisional.reset();
+    // Numerical slot handles move only after FinalizeCommit succeeds.  A
+    // provisional contract revert therefore leaves both the prior committed
+    // bytes and their hash-bound scalar-closure certificate untouched.
     AbortStagedArtifacts(checkpoint);
     FinishOutcome(outcome, pending_.evidence);
     evidence = pending_.evidence;
@@ -1076,6 +1090,15 @@ public:
       UpdateAttemptEvidence(evidence);
       return false;
     }
+    const double restored_dt = checkpoint.descriptor.coordinates.dt;
+    if (!numerics_.ValidatePartitionedScalarCheckpoint(
+            checkpoint, loaded, restored_dt))
+    {
+      evidence.status = CudaRunStatus::runtime_failure;
+      evidence.contract_reason = FailureReason::restart_incompatible;
+      UpdateAttemptEvidence(evidence);
+      return false;
+    }
     // The accepted public constructor carries the attempt frontier while the
     // c879 Restore seam restores coordinates only. Recreate the still-pristine
     // contract before publication so the next sequence/candidate cursor is
@@ -1097,9 +1120,25 @@ public:
                         CollectivePolicy(communicator_));
       next_attempt_sequence_ = 0;
     }
+    else if (!numerics_.AdoptPreparedCandidateMetadata(loaded))
+    {
+      // The contract has restored collectively, but no numerical handle or
+      // scalar certificate may publish without the exact imported metadata.
+      // This invariant failure is terminal for the facade and remains
+      // externally unpublished.
+      initialized_ = false;
+      evidence.after = contract_->coordinates();
+      evidence.committed = false;
+      evidence.collective_consensus = false;
+      evidence.contract_reason = FailureReason::backend_failure;
+      evidence.status = CudaRunStatus::runtime_failure;
+      UpdateAttemptEvidence(evidence);
+      return false;
+    }
     else
     {
       numerics_.SwapPublishedSlotHandles();
+      numerics_.MarkCommittedScalarClosureCoherent();
       next_attempt_sequence_ = restored_frontier;
     }
     evidence.after = contract_->coordinates();
@@ -1134,7 +1173,9 @@ public:
   bool ExportCommittedFields(
       generic::HdgEulerHostInteriorFields destination) noexcept
   {
-    if (!initialized_ || pending_.active) { return false; }
+    if (!initialized_ || pending_.active ||
+        !numerics_.CommittedScalarClosureCoherent())
+      return false;
     return numerics_.ExportFields(numerics_.CommittedSlot().interior,
                                   destination);
   }
@@ -1409,6 +1450,23 @@ private:
     const bool fixed_oracle_requested_for_generic_storage =
         config_.use_borrowed_topology && config_.use_borrowed_host_inputs &&
         config_.capture_oracle;
+    const bool partitioned_backward_euler = config_.time_treatment ==
+        generic::EulerHdgTimeTreatment::partitioned_backward_euler;
+    const bool partitioned_backward_euler_configuration =
+        partitioned_backward_euler &&
+        (config_.expected_rank_count == 1 ||
+         config_.expected_rank_count == 2) &&
+        config_.use_borrowed_topology &&
+        config_.use_borrowed_host_inputs &&
+        config_.use_generic_numerical_policy &&
+        (config_.numerical_policy.stabilization.kind ==
+             generic::RegularizationKind::none ||
+         config_.numerical_policy.stabilization.kind ==
+             generic::RegularizationKind::igr);
+    const bool time_treatment_configuration =
+        generic::IsKnownEulerHdgTimeTreatment(config_.time_treatment) &&
+        (!partitioned_backward_euler ||
+         partitioned_backward_euler_configuration);
     const bool cuda_engine_configuration =
         generic::IsKnownCudaEngineKind(config_.cuda_engine) &&
         (config_.cuda_engine != generic::CudaEngineKind::tensor_core ||
@@ -1439,6 +1497,7 @@ private:
         (!config_.use_generic_numerical_policy || borrowed_generic_shape) &&
         boundary_policy_configuration &&
         borrowed_topology_identity &&
+        time_treatment_configuration &&
         !fixed_oracle_requested_for_generic_storage &&
         std::isfinite(config_.dt) && config_.dt > 0.0 &&
         (config_.use_borrowed_host_inputs ||
@@ -1589,6 +1648,8 @@ private:
     append_bool(config_.injection.enabled);
     AppendConfigValue(descriptor, cursor, complete,
                       config_.injection.token_fault);
+    AppendConfigValue(descriptor, cursor, complete,
+                      config_.time_treatment);
     const RuntimeTupleDescriptor tuple = Selection::Descriptor();
     AppendConfigId(descriptor, cursor, complete, tuple.model);
     AppendConfigId(descriptor, cursor, complete, tuple.formulation);
@@ -1863,6 +1924,15 @@ private:
       return FinishBackendFailure(begin.attempt, evidence,
                                   CudaFailurePhase::after_recovery_before_commit);
     }
+    // PersistentRunContract owns descriptor copies.  StoreCandidate has now
+    // synchronously copied the workspace payload and metadata into its private
+    // candidate; mirror that authoritative metadata into the numerical handle
+    // before either freeze or publication can observe it.
+    if (!numerics_.AdoptPreparedCandidateMetadata(workspace))
+    {
+      return FinishBackendFailure(begin.attempt, evidence,
+                                  CudaFailurePhase::after_recovery_before_commit);
+    }
 
     const CudaTransferTotals totals = TransportPolicy::Accounting();
     AttemptReport report{};
@@ -1908,6 +1978,13 @@ private:
         adjusted.newton_correction_linear_iterations;
     evidence.final_coherent_linear_iterations =
         adjusted.final_coherent_linear_iterations;
+    evidence.scalar_closure_solves = adjusted.scalar_closure_solves;
+    evidence.scalar_closure_linear_iterations =
+        adjusted.scalar_closure_linear_iterations;
+    evidence.scalar_closure_linear_solve_attempts =
+        adjusted.scalar_closure_linear_solve_attempts;
+    evidence.scalar_closure_true_residual_tightenings =
+        adjusted.scalar_closure_true_residual_tightenings;
     evidence.true_residual_tightenings =
         adjusted.true_residual_tightenings;
     evidence.line_search_trials = adjusted.line_search_trials;
@@ -2103,6 +2180,13 @@ private:
         numerical.newton_correction_linear_iterations;
     evidence.final_coherent_linear_iterations =
         numerical.final_coherent_linear_iterations;
+    evidence.scalar_closure_solves = numerical.scalar_closure_solves;
+    evidence.scalar_closure_linear_iterations =
+        numerical.scalar_closure_linear_iterations;
+    evidence.scalar_closure_linear_solve_attempts =
+        numerical.scalar_closure_linear_solve_attempts;
+    evidence.scalar_closure_true_residual_tightenings =
+        numerical.scalar_closure_true_residual_tightenings;
     evidence.true_residual_tightenings =
         numerical.true_residual_tightenings;
     evidence.line_search_trials = numerical.line_search_trials;

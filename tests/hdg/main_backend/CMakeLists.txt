@@ -8,6 +8,15 @@ endif()
 # regularization mode, polynomial order, and rank count are visible in CTest.
 function(add_hdg_main_cfl_process_test test_name output_tag device
          cuda_engine regularization order ranks expected_steps)
+  set(_time_integrator backward-euler)
+  if(ARGC GREATER 8)
+    set(_time_integrator "${ARGV8}")
+  endif()
+  if(NOT _time_integrator STREQUAL "backward-euler" AND
+     NOT _time_integrator STREQUAL "partitioned-backward-euler")
+    message(FATAL_ERROR
+      "Unknown HDG production-main time integrator '${_time_integrator}'.")
+  endif()
   add_test(NAME ${test_name}
     COMMAND "${CMAKE_COMMAND}"
       "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
@@ -19,6 +28,7 @@ function(add_hdg_main_cfl_process_test test_name output_tag device
       "-DHDG_MAIN_ORDER=${order}"
       "-DHDG_MAIN_N=3"
       "-DHDG_MAIN_RANKS=${ranks}"
+      "-DHDG_MAIN_TIME_INTEGRATOR=${_time_integrator}"
       "-DHDG_MAIN_DT=0"
       "-DHDG_MAIN_CFL=0.25"
       "-DHDG_MAIN_T_FINAL=0.02"
@@ -43,9 +53,14 @@ function(add_hdg_main_cfl_process_test test_name output_tag device
     set(_device_labels cpu)
     set(_resource_lock hdg_generic_euler_cpu)
   endif()
+  set(_labels
+    hdg main-backend ${_device_labels} ${_mode_label} p${order}
+    rank${ranks} mpi process generic-borrowed cfl no-vtk)
+  if(_time_integrator STREQUAL "partitioned-backward-euler")
+    list(APPEND _labels partitioned-backward-euler)
+  endif()
   set_tests_properties(${test_name} PROPERTIES
-    LABELS
-      "hdg;main-backend;${_device_labels};${_mode_label};p${order};rank${ranks};mpi;process;generic-borrowed;cfl;no-vtk"
+    LABELS "${_labels}"
     PROCESSORS ${ranks}
     RESOURCE_LOCK ${_resource_lock}
     TIMEOUT 1200)
@@ -56,6 +71,15 @@ endfunction()
 # as the committed trajectory and mode-specific Euler/IGR field surface.
 function(add_hdg_main_cuda_refinement_process_test test_name output_tag
          cuda_engine regularization order refinement_mode)
+  set(_time_integrator backward-euler)
+  if(ARGC GREATER 6)
+    set(_time_integrator "${ARGV6}")
+  endif()
+  if(NOT _time_integrator STREQUAL "backward-euler" AND
+     NOT _time_integrator STREQUAL "partitioned-backward-euler")
+    message(FATAL_ERROR
+      "Unknown HDG production-main time integrator '${_time_integrator}'.")
+  endif()
   if(refinement_mode STREQUAL "serial")
     set(_serial_refine 1)
     set(_parallel_refine 0)
@@ -87,6 +111,7 @@ function(add_hdg_main_cuda_refinement_process_test test_name output_tag
       "-DHDG_MAIN_RANKS=${_ranks}"
       "-DHDG_MAIN_SERIAL_REFINE=${_serial_refine}"
       "-DHDG_MAIN_PARALLEL_REFINE=${_parallel_refine}"
+      "-DHDG_MAIN_TIME_INTEGRATOR=${_time_integrator}"
       "-DHDG_MAIN_DT=0.005"
       "-DHDG_MAIN_T_FINAL=0.01"
       "-DHDG_MAIN_DT_SAVE=0.005"
@@ -98,9 +123,15 @@ function(add_hdg_main_cuda_refinement_process_test test_name output_tag
       "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
       "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+  set(_labels
+    hdg main-backend cuda ${cuda_engine} ${_mode_label} p${order}
+    rank${_ranks} ${refinement_mode}-refinement mpi process generic-borrowed
+    fixed-step vtk refinement)
+  if(_time_integrator STREQUAL "partitioned-backward-euler")
+    list(APPEND _labels partitioned-backward-euler)
+  endif()
   set_tests_properties(${test_name} PROPERTIES
-    LABELS
-      "hdg;main-backend;cuda;${cuda_engine};${_mode_label};p${order};rank${_ranks};${refinement_mode}-refinement;mpi;process;generic-borrowed;fixed-step;vtk;refinement"
+    LABELS "${_labels}"
     PROCESSORS ${_ranks}
     RESOURCE_LOCK dg_igr_sm120
     TIMEOUT 1200)
@@ -169,6 +200,14 @@ add_hdg_main_cfl_process_test(
   dg_igr_hdg_main_backend_cpu_igr_rank2_cfl
   cpu-igr-rank2-cfl
   cpu ordinary igr 1 2 3)
+
+# The selected partitioned Backward-Euler architecture uses this CPU p2
+# application gate as the numerical-reference counterpart to the bounded CUDA
+# winner gates below.  Existing Backward-Euler registrations remain unchanged.
+add_hdg_main_cfl_process_test(
+  dg_igr_hdg_main_backend_cpu_partitioned_backward_euler_igr_p2_rank1_cfl
+  cpu-partitioned-backward-euler-igr-p2-rank1-cfl
+  cpu ordinary igr 2 1 4 partitioned-backward-euler)
 
 if(NOT TARGET dgsem_smooth_advection OR
    NOT TARGET hdg_smooth_transition_research)
@@ -781,6 +820,58 @@ if(MFEM_USE_CUDA)
       cuda-tensor-igr-p${_order}-rank1-cfl
       cuda tensor igr ${_order} 1 ${_expected_cfl_steps})
   endforeach()
+
+  # Winner-specific application qualification is deliberately bounded: p2
+  # rank-one CFL gates cover both CUDA engines, while the two fixed-step VTK
+  # gates split serial and parallel refinement across ordinary and tensor CUDA.
+  add_hdg_main_cfl_process_test(
+    dg_igr_hdg_main_backend_cuda_ordinary_partitioned_backward_euler_igr_p2_rank1_cfl
+    cuda-ordinary-partitioned-backward-euler-igr-p2-rank1-cfl
+    cuda ordinary igr 2 1 4 partitioned-backward-euler)
+  add_hdg_main_cfl_process_test(
+    dg_igr_hdg_main_backend_cuda_tensor_partitioned_backward_euler_igr_p2_rank1_cfl
+    cuda-tensor-partitioned-backward-euler-igr-p2-rank1-cfl
+    cuda tensor igr 2 1 4 partitioned-backward-euler)
+
+  add_hdg_main_cuda_refinement_process_test(
+    dg_igr_hdg_main_backend_cuda_ordinary_partitioned_backward_euler_igr_p2_rank1_serial_refine
+    cuda-ordinary-partitioned-backward-euler-igr-p2-rank1-serial-refine
+    ordinary igr 2 serial partitioned-backward-euler)
+  add_hdg_main_cuda_refinement_process_test(
+    dg_igr_hdg_main_backend_cuda_tensor_partitioned_backward_euler_igr_p2_rank2_parallel_refine
+    cuda-tensor-partitioned-backward-euler-igr-p2-rank2-parallel-refine
+    tensor igr 2 parallel partitioned-backward-euler)
+
+  # Five fixed steps are the common admissible short cylinder interval used by
+  # the architecture bake-off.  This is the production application and mesh,
+  # with output disabled so the gate remains a bounded evolution check.
+  if(TARGET supersonic_cylinder_w_igr)
+    add_test(
+      NAME dg_igr_hdg_main_backend_cuda_tensor_partitioned_backward_euler_cylinder_p2_rank1
+      COMMAND $<TARGET_FILE:supersonic_cylinder_w_igr>
+        --discretization hdg
+        --device cuda
+        --hdg-cuda-engine tensor
+        --regularization igr
+        --time-integrator partitioned-backward-euler
+        --mesh ${PROJECT_SOURCE_DIR}/examples/supersonic_example_w_igr/supersonic_cylinder.msh
+        --order 2
+        --serial-refine 0
+        --parallel-refine 0
+        --time-step 0.00001
+        --t-final 0.00005
+        --no-vtk_save
+        --no-glvis)
+    set_tests_properties(
+      dg_igr_hdg_main_backend_cuda_tensor_partitioned_backward_euler_cylinder_p2_rank1
+      PROPERTIES
+        LABELS "hdg;main-backend;cuda;tensor;igr;partitioned-backward-euler;p2;rank1;physical;cylinder;fixed-step;no-vtk;application"
+        PASS_REGULAR_EXPRESSION
+          "\\[hdg-main\\] status=Success step=5.*time=5e-05.*cuda_engine=tensor.*time_treatment=partitioned-backward-euler.*fallback_count=0.*regularization=igr"
+        PROCESSORS 1
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 1200)
+  endif()
 
   # Keep p2 serial and parallel refinement as independent process gates.
   # They validate each refined trajectory's own output, never field equality.

@@ -34,6 +34,7 @@ using dg::hdg::generic::BackendKind;
 using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::BackendSelection;
 using dg::hdg::generic::EulerHdgRequest;
+using dg::hdg::generic::EulerHdgTimeTreatment;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::generic::RegularizationSelection;
 using dg::hdg::runtime::cpu::GenericEulerCpuSessionStatus;
@@ -283,7 +284,8 @@ std::string CanonicalMainRequest(
     const HdgEulerMainRequest& request,
     const std::string& mesh_path,
     const mfem::io::VTKOutputConfig& vtk,
-    const RegularizationSelection regularization)
+    const RegularizationSelection regularization,
+    const EulerHdgTimeTreatment time_treatment)
 {
   std::ostringstream stream;
   AppendText(stream, request.case_config.case_name);
@@ -308,7 +310,8 @@ std::string CanonicalMainRequest(
   AppendDouble(stream, request.options.t_final);
   AppendDouble(stream, request.options.dt_save);
   AppendDouble(stream, request.case_config.gamma);
-  stream << static_cast<int>(regularization.kind) << ';';
+  stream << static_cast<int>(regularization.kind) << ';'
+         << static_cast<int>(time_treatment) << ';';
   AppendDouble(stream, regularization.alpha);
   AppendDouble(stream, regularization.beta);
   return stream.str();
@@ -358,6 +361,23 @@ RegularizationSelection CanonicalRegularization(
   throw std::invalid_argument("HDG regularization must resolve to 'none' or 'igr'");
 }
 
+EulerHdgTimeTreatment CanonicalTimeTreatment(
+    const HdgEulerMainRequest& request)
+{
+  const std::string selector = ToLowerCopy(request.options.time_integrator);
+  if (selector.empty() || selector == "backward-euler")
+  {
+    return EulerHdgTimeTreatment::backward_euler;
+  }
+  if (selector == "partitioned-backward-euler")
+  {
+    return EulerHdgTimeTreatment::partitioned_backward_euler;
+  }
+  throw std::invalid_argument(
+      "HDG time integrator must resolve to 'backward-euler' or "
+      "'partitioned-backward-euler'");
+}
+
 int Reject(const HdgEulerMainRequest& request,
            const std::string& reason) noexcept
 {
@@ -369,7 +389,8 @@ int Reject(const HdgEulerMainRequest& request,
 }
 
 std::string Validate(const HdgEulerMainRequest& request,
-                     const RegularizationSelection regularization)
+                     const RegularizationSelection regularization,
+                     const EulerHdgTimeTreatment time_treatment)
 {
   int initialized = 0;
   int finalized = 0;
@@ -391,6 +412,10 @@ std::string Validate(const HdgEulerMainRequest& request,
   {
     return "HDG IGR alpha and beta must be finite and positive";
   }
+  if (!dg::hdg::generic::IsKnownEulerHdgTimeTreatment(time_treatment))
+  {
+    return "HDG time treatment is invalid";
+  }
   if (!request.options.restart_vtk.empty() ||
       request.options.restart_cycle >= 0 ||
       request.options.restart_step >= 0 || request.options.save_state_files)
@@ -408,7 +433,7 @@ std::string Validate(const HdgEulerMainRequest& request,
   if (request.options.dt <= 0.0 &&
       (!std::isfinite(request.options.cfl) || request.options.cfl <= 0.0))
   {
-    return "CFL Backward Euler requires a finite positive --cfl-number";
+    return "CFL HDG time integration requires a finite positive --cfl-number";
   }
   if (!std::isfinite(request.options.dt_min) || request.options.dt_min < 0.0)
   {
@@ -478,11 +503,14 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     }
     std::string rejection;
     RegularizationSelection regularization{};
+    EulerHdgTimeTreatment time_treatment =
+        EulerHdgTimeTreatment::backward_euler;
     bool local_ok = true;
     try
     {
       regularization = CanonicalRegularization(request);
-      rejection = Validate(request, regularization);
+      time_treatment = CanonicalTimeTreatment(request);
+      rejection = Validate(request, regularization, time_treatment);
       local_ok = rejection.empty();
     }
     catch (const std::exception& error)
@@ -516,7 +544,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         : MeshPathPrecedence::CommandLineOverride;
       vtk = MakeCaseVTKConfig(request.case_config);
       canonical_request = CanonicalMainRequest(
-          request, mesh_request.mesh_path, vtk, regularization);
+          request, mesh_request.mesh_path, vtk, regularization,
+          time_treatment);
       local_ok = true;
     }
     catch (...)
@@ -768,7 +797,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         : dg::hdg::generic::EulerFieldView{
             nullptr, 0, dg::hdg::generic::euler_2d_conserved_components},
       boundary->View(),
-      numerical_policy};
+      numerical_policy,
+      time_treatment};
 
     std::unique_ptr<GenericEulerHdgCpuSession> session;
     try
@@ -803,21 +833,30 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
             time::backend::InitialOutputPolicy::Suppress,
             time::backend::FinalOutputPolicy::Suppress);
       const bool cfl_control = request.options.dt <= 0.0;
+      const bool partitioned_backward_euler = time_treatment ==
+          EulerHdgTimeTreatment::partitioned_backward_euler;
       resolved_plan.time_control = cfl_control
           ? HdgTransactionalTimeAdapter::TimeControl::CFL(
                 0.0, request.options.t_final, request.options.cfl)
           : HdgTransactionalTimeAdapter::TimeControl::Fixed(
                 0.0, request.options.t_final, request.options.dt);
-      resolved_plan.time_mode = cfl_control
-          ? HdgEulerTimeMode::CFLBackwardEuler
-          : HdgEulerTimeMode::FixedBackwardEuler;
+      resolved_plan.time_mode = partitioned_backward_euler
+          ? (cfl_control
+                ? HdgEulerTimeMode::CFLPartitionedBackwardEuler
+                : HdgEulerTimeMode::FixedPartitionedBackwardEuler)
+          : (cfl_control ? HdgEulerTimeMode::CFLBackwardEuler
+                         : HdgEulerTimeMode::FixedBackwardEuler);
       resolved_plan.output = {request.options.vtk_save,
                               vtk.prefix_path,
                               CollectionName(request)};
       time_driver = std::make_unique<HdgTransactionalTimeAdapter>(
           resolved_plan.time_control, resolved_plan.output_schedule,
-          cfl_control ? HdgTimeControlMode::CFLBackwardEuler
-                      : HdgTimeControlMode::FixedBackwardEuler);
+          partitioned_backward_euler
+              ? (cfl_control
+                    ? HdgTimeControlMode::CFLPartitionedBackwardEuler
+                    : HdgTimeControlMode::FixedPartitionedBackwardEuler)
+              : (cfl_control ? HdgTimeControlMode::CFLBackwardEuler
+                             : HdgTimeControlMode::FixedBackwardEuler));
       local_ok = true;
     }
     catch (...)
@@ -914,7 +953,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     while (!time_driver->Finished())
     {
       double proposed_dt = 0.0;
-      if (time_driver->mode() == HdgTimeControlMode::CFLBackwardEuler)
+      if (time_driver->UsesCflControl())
       {
         const auto diagnostics = session->diagnostics();
         const bool diagnostics_ready =
@@ -1097,7 +1136,10 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       std::cout << "[hdg-main] status=Success step="
                 << time_driver->solver_step() << " time="
                 << time_driver->time() << " output_cycle="
-                << time_driver->output_cycle() << " regularization="
+                << time_driver->output_cycle() << " time_treatment="
+                << dg::hdg::generic::EulerHdgTimeTreatmentName(
+                     time_treatment)
+                << " regularization="
                 << (regularization.kind == RegularizationKind::igr ? "igr" : "none")
                 << " alpha=" << regularization.alpha
                 << " beta=" << regularization.beta << '\n';

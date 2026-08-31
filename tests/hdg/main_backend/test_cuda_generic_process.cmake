@@ -40,6 +40,14 @@ if(NOT HDG_MAIN_REGULARIZATION STREQUAL "none" AND
   message(FATAL_ERROR
     "HDG regularization must be none or igr, got '${HDG_MAIN_REGULARIZATION}'.")
 endif()
+if(NOT DEFINED HDG_MAIN_TIME_INTEGRATOR)
+  set(HDG_MAIN_TIME_INTEGRATOR backward-euler)
+endif()
+if(NOT HDG_MAIN_TIME_INTEGRATOR STREQUAL "backward-euler" AND
+   NOT HDG_MAIN_TIME_INTEGRATOR STREQUAL "partitioned-backward-euler")
+  message(FATAL_ERROR
+    "HDG time integrator must be backward-euler or partitioned-backward-euler, got '${HDG_MAIN_TIME_INTEGRATOR}'.")
+endif()
 
 function(require_euler_field text_variable tag field components context)
   set(_text "${${text_variable}}")
@@ -108,6 +116,7 @@ set(_arguments
   --order "${HDG_MAIN_ORDER}"
   --serial-refine "${HDG_MAIN_SERIAL_REFINE}"
   --parallel-refine "${HDG_MAIN_PARALLEL_REFINE}"
+  --time-integrator "${HDG_MAIN_TIME_INTEGRATOR}"
   --time-step "${HDG_MAIN_DT}"
   --t-final "${HDG_MAIN_T_FINAL}"
   --no-glvis)
@@ -183,7 +192,10 @@ if(HDG_MAIN_DEVICE STREQUAL "cuda")
     endif()
   endif()
   string(APPEND _success_pattern
-    ".*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*requested_trace_policy=${_expected_requested_trace_policy}.*resolved_trace_policy=${_expected_resolved_trace_policy}.*trace_solver=${_expected_trace_solver}.*fallback_count=0.*trace_preconditioner=${_expected_trace_preconditioner}.*trace_ilu_type=${_expected_ilu_type}.*trace_ilu_level_of_fill=${_expected_ilu_fill}.*trace_ilu_local_reordering=${_expected_ilu_reordering}.*trace_ilu_application_iterations=${_expected_ilu_iterations}.*trace_ilu_accounting_kind=${_expected_ilu_accounting}.*trace_ilu_factor_reuse_policy=${_expected_ilu_factor_reuse_policy}.*trace_ilu_triangular_solve_kind=${_expected_ilu_triangular_solve_kind}.*trace_ilu_lower_jacobi_iterations=${_expected_ilu_lower_jacobi_iterations}.*trace_ilu_upper_jacobi_iterations=${_expected_ilu_upper_jacobi_iterations}")
+    ".*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*time_treatment=${HDG_MAIN_TIME_INTEGRATOR}.*requested_trace_policy=${_expected_requested_trace_policy}.*resolved_trace_policy=${_expected_resolved_trace_policy}.*trace_solver=${_expected_trace_solver}.*fallback_count=0.*trace_preconditioner=${_expected_trace_preconditioner}.*trace_ilu_type=${_expected_ilu_type}.*trace_ilu_level_of_fill=${_expected_ilu_fill}.*trace_ilu_local_reordering=${_expected_ilu_reordering}.*trace_ilu_application_iterations=${_expected_ilu_iterations}.*trace_ilu_accounting_kind=${_expected_ilu_accounting}.*trace_ilu_factor_reuse_policy=${_expected_ilu_factor_reuse_policy}.*trace_ilu_triangular_solve_kind=${_expected_ilu_triangular_solve_kind}.*trace_ilu_lower_jacobi_iterations=${_expected_ilu_lower_jacobi_iterations}.*trace_ilu_upper_jacobi_iterations=${_expected_ilu_upper_jacobi_iterations}")
+else()
+  string(APPEND _success_pattern
+    ".*time_treatment=${HDG_MAIN_TIME_INTEGRATOR}")
 endif()
 if(DEFINED HDG_MAIN_CFL)
   list(APPEND _arguments --cfl-number "${HDG_MAIN_CFL}")

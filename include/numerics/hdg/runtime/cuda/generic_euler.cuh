@@ -286,6 +286,7 @@ private:
     config.borrowed_boundary = request.boundary;
     config.use_generic_numerical_policy = true;
     config.numerical_policy = request.numerical_policy;
+    config.time_treatment = request.time_treatment;
     return InitializeAdmitted(config, trace_policy);
   }
 
@@ -348,9 +349,21 @@ private:
       {
         if (config.use_borrowed_host_inputs)
         {
-          borrowed_rank1_.reset(
-              new borrowed_rank1_engine(config, trace_policy));
-          allocated = borrowed_rank1_ != nullptr;
+          if (config.time_treatment == generic::EulerHdgTimeTreatment::
+                       partitioned_backward_euler)
+          {
+            partitioned_backward_euler_borrowed_rank1_.reset(
+                new partitioned_backward_euler_borrowed_rank1_engine(
+                    config, trace_policy));
+            allocated =
+                partitioned_backward_euler_borrowed_rank1_ != nullptr;
+          }
+          else
+          {
+            borrowed_rank1_.reset(
+                new borrowed_rank1_engine(config, trace_policy));
+            allocated = borrowed_rank1_ != nullptr;
+          }
         }
         else
         {
@@ -362,9 +375,21 @@ private:
       {
         if (config.use_borrowed_host_inputs)
         {
-          borrowed_rank2_.reset(
-              new borrowed_rank2_engine(config, trace_policy));
-          allocated = borrowed_rank2_ != nullptr;
+          if (config.time_treatment == generic::EulerHdgTimeTreatment::
+                  partitioned_backward_euler)
+          {
+            partitioned_backward_euler_borrowed_rank2_.reset(
+                new partitioned_backward_euler_borrowed_rank2_engine(
+                    config, trace_policy));
+            allocated =
+                partitioned_backward_euler_borrowed_rank2_ != nullptr;
+          }
+          else
+          {
+            borrowed_rank2_.reset(
+                new borrowed_rank2_engine(config, trace_policy));
+            allocated = borrowed_rank2_ != nullptr;
+          }
         }
         else
         {
@@ -383,6 +408,8 @@ private:
       rank2_.reset();
       borrowed_rank1_.reset();
       borrowed_rank2_.reset();
+      partitioned_backward_euler_borrowed_rank1_.reset();
+      partitioned_backward_euler_borrowed_rank2_.reset();
       failed_ = true;
       return Result(generic::HdgEulerSessionStatus::rejected);
     }
@@ -686,6 +713,12 @@ private:
       BorrowedCudaRank1OneGpuRuntimeSelection>;
   using borrowed_rank2_engine = cuda_w8a::PersistentCudaSmoothEulerEngine<
       BorrowedCudaRank2OneGpuHostStagedRuntimeSelection>;
+  using partitioned_backward_euler_borrowed_rank1_engine =
+      cuda_w8a::PersistentCudaSmoothEulerEngine<
+          PartitionedBackwardEulerCudaRank1RuntimeSelection>;
+  using partitioned_backward_euler_borrowed_rank2_engine =
+      cuda_w8a::PersistentCudaSmoothEulerEngine<
+          PartitionedBackwardEulerCudaRank2RuntimeSelection>;
 
   static coordinates_type ToCoordinates(
       const StateCoordinates& value) noexcept
@@ -852,7 +885,15 @@ private:
         (borrowed_rank1_ && borrowed_rank1_->contract() &&
          borrowed_rank1_->contract()->status() == expected) ||
         (borrowed_rank2_ && borrowed_rank2_->contract() &&
-         borrowed_rank2_->contract()->status() == expected);
+         borrowed_rank2_->contract()->status() == expected) ||
+        (partitioned_backward_euler_borrowed_rank1_ &&
+         partitioned_backward_euler_borrowed_rank1_->contract() &&
+         partitioned_backward_euler_borrowed_rank1_->contract()->status() ==
+             expected) ||
+        (partitioned_backward_euler_borrowed_rank2_ &&
+         partitioned_backward_euler_borrowed_rank2_->contract() &&
+         partitioned_backward_euler_borrowed_rank2_->contract()->status() ==
+             expected);
   }
 
   void ConsumeAuthority(GenericEulerCudaPreparedStep& authority) noexcept
@@ -990,6 +1031,7 @@ private:
     AppendConfigValue(local, cursor, complete, config.injection.source_rank);
     append_bool(config.injection.enabled);
     AppendConfigValue(local, cursor, complete, config.injection.token_fault);
+    AppendConfigValue(local, cursor, complete, config.time_treatment);
     // Append-only so the engine-default prefix stays byte-identical.
     AppendConfigValue(
         local, cursor, complete, trace_policy.requested_selection);
@@ -1194,6 +1236,22 @@ private:
                 config.borrowed_global_topology))
         : cuda_w8a::IsCudaAbsentBorrowedGlobalTopologyIdentity(
             config.borrowed_global_topology);
+    const bool partitioned_backward_euler = config.time_treatment ==
+        generic::EulerHdgTimeTreatment::partitioned_backward_euler;
+    const bool partitioned_backward_euler_configuration =
+        partitioned_backward_euler &&
+        (config.expected_rank_count == 1 ||
+         config.expected_rank_count == 2) &&
+        config.use_borrowed_host_inputs &&
+        config.use_generic_numerical_policy &&
+        (config.numerical_policy.stabilization.kind ==
+             generic::RegularizationKind::none ||
+         config.numerical_policy.stabilization.kind ==
+             generic::RegularizationKind::igr);
+    const bool time_treatment_abi =
+        generic::IsKnownEulerHdgTimeTreatment(config.time_treatment) &&
+        (!partitioned_backward_euler ||
+         partitioned_backward_euler_configuration);
     int ranks = 0;
     int borrowed_collective = MPI_UNEQUAL;
     int borrowed_mesh = MPI_UNEQUAL;
@@ -1217,6 +1275,7 @@ private:
         initial_trace_abi && numerical_policy_abi &&
         boundary_policy_abi &&
         borrowed_topology_identity &&
+        time_treatment_abi &&
         MPI_Comm_size(communicator_, &ranks) == MPI_SUCCESS &&
         (ranks == 1 || ranks == 2) && ranks == config.expected_rank_count &&
         config.requested_device == 0 &&
@@ -1399,6 +1458,10 @@ private:
     if (rank2_) return callback(*rank2_);
     if (borrowed_rank1_) return callback(*borrowed_rank1_);
     if (borrowed_rank2_) return callback(*borrowed_rank2_);
+    if (partitioned_backward_euler_borrowed_rank1_)
+      return callback(*partitioned_backward_euler_borrowed_rank1_);
+    if (partitioned_backward_euler_borrowed_rank2_)
+      return callback(*partitioned_backward_euler_borrowed_rank2_);
     return false;
   }
 
@@ -1410,6 +1473,16 @@ private:
       return ToCoordinates(borrowed_rank1_->contract()->coordinates());
     if (borrowed_rank2_ && borrowed_rank2_->contract())
       return ToCoordinates(borrowed_rank2_->contract()->coordinates());
+    if (partitioned_backward_euler_borrowed_rank1_ &&
+        partitioned_backward_euler_borrowed_rank1_->contract())
+      return ToCoordinates(
+          partitioned_backward_euler_borrowed_rank1_->contract()->
+              coordinates());
+    if (partitioned_backward_euler_borrowed_rank2_ &&
+        partitioned_backward_euler_borrowed_rank2_->contract())
+      return ToCoordinates(
+          partitioned_backward_euler_borrowed_rank2_->contract()->
+              coordinates());
     return coordinates_;
   }
 
@@ -1417,6 +1490,10 @@ private:
   std::unique_ptr<rank2_engine> rank2_;
   std::unique_ptr<borrowed_rank1_engine> borrowed_rank1_;
   std::unique_ptr<borrowed_rank2_engine> borrowed_rank2_;
+  std::unique_ptr<partitioned_backward_euler_borrowed_rank1_engine>
+      partitioned_backward_euler_borrowed_rank1_;
+  std::unique_ptr<partitioned_backward_euler_borrowed_rank2_engine>
+      partitioned_backward_euler_borrowed_rank2_;
   cuda_w8a::CudaRunEvidence setup_{};
   coordinates_type coordinates_{};
   MPI_Comm communicator_ = MPI_COMM_NULL;

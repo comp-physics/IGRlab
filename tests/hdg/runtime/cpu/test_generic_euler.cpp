@@ -52,6 +52,12 @@ struct CpuQualificationTestAccess
   {
     return core.ArmExactZeroInitialResidualForTests();
   }
+
+  static bool AuditCommittedClosure(
+      CpuNumericsCore& core, double& residual, double& tolerance) noexcept
+  {
+    return core.AuditCommittedScalarClosure(residual, tolerance);
+  }
 };
 
 } // namespace dg::hdg::runtime::cpu::detail
@@ -64,6 +70,7 @@ using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::Capability;
 using dg::hdg::generic::CapabilityBit;
 using dg::hdg::generic::EulerHdgRequest;
+using dg::hdg::generic::EulerHdgTimeTreatment;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::runtime::cpu::ExecuteGenericEulerHdgCpu;
 using dg::hdg::runtime::cpu::GenericEulerCpuPreparedStep;
@@ -237,7 +244,9 @@ struct ExactBorrowedEulerFields
 
 EulerHdgRequest Request(const mfem::ParMesh& mesh, const int order,
                         BoundaryContext& boundary,
-                        const ExactBorrowedEulerFields& fields)
+                        const ExactBorrowedEulerFields& fields,
+                        const EulerHdgTimeTreatment time_treatment =
+                            EulerHdgTimeTreatment::backward_euler)
 {
   EulerHdgRequest request{};
   request.mesh = &mesh;
@@ -254,6 +263,7 @@ EulerHdgRequest Request(const mfem::ParMesh& mesh, const int order,
       &boundary, NonperiodicExterior, {nullptr, 0, 0, 0.0}};
   request.numerical_policy =
       dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
+  request.time_treatment = time_treatment;
   return request;
 }
 
@@ -301,13 +311,178 @@ bool LinearWorkAccountingExact(
       attempt.linear_solve_attempts >= 0 &&
       attempt.newton_correction_linear_iterations >= 0 &&
       attempt.final_coherent_linear_iterations >= 0 &&
+      attempt.scalar_closure_linear_iterations >= 0 &&
+      attempt.scalar_closure_linear_solve_attempts >= 0 &&
+      attempt.scalar_closure_true_residual_tightenings >= 0 &&
       attempt.true_residual_tightenings >= 0 &&
       attempt.linear_iterations ==
           attempt.newton_correction_linear_iterations +
               attempt.final_coherent_linear_iterations &&
       attempt.linear_solve_attempts ==
           static_cast<int>(attempt.work.complete_trace_solves) +
-              attempt.true_residual_tightenings;
+              attempt.true_residual_tightenings &&
+      attempt.scalar_closure_linear_iterations <=
+          attempt.final_coherent_linear_iterations &&
+      attempt.scalar_closure_linear_solve_attempts <=
+          attempt.linear_solve_attempts &&
+      attempt.scalar_closure_true_residual_tightenings <=
+          attempt.true_residual_tightenings &&
+      attempt.scalar_closure_linear_solve_attempts ==
+          static_cast<int>(attempt.work.complete_scalar_closure_solves) +
+              attempt.scalar_closure_true_residual_tightenings;
+}
+
+bool AdmissibleEulerCoefficients(const std::vector<double>& state) noexcept
+{
+  if (state.size() % 4 != 0) return false;
+  const std::size_t scalar_count = state.size() / 4;
+  for (std::size_t scalar = 0; scalar < scalar_count; ++scalar)
+  {
+    const double density = state[scalar];
+    const double momentum_x = state[scalar_count + scalar];
+    const double momentum_y = state[2 * scalar_count + scalar];
+    const double energy = state[3 * scalar_count + scalar];
+    if (!std::isfinite(density) || !(density > 0.0) ||
+        !std::isfinite(momentum_x) || !std::isfinite(momentum_y) ||
+        !std::isfinite(energy))
+    {
+      return false;
+    }
+    const double pressure = 0.4 *
+        (energy - 0.5 *
+             (momentum_x * momentum_x + momentum_y * momentum_y) / density);
+    if (!std::isfinite(pressure) || !(pressure > 0.0)) return false;
+  }
+  return true;
+}
+
+bool SameEulerCoefficientsWithinRoundoff(
+    const std::vector<double>& left,
+    const std::vector<double>& right) noexcept
+{
+  if (left.size() != right.size()) return false;
+  constexpr double multiplier = 128.0;
+  for (std::size_t index = 0; index < left.size(); ++index)
+  {
+    const double scale = std::max({1.0, std::abs(left[index]),
+                                   std::abs(right[index])});
+    if (!std::isfinite(left[index]) || !std::isfinite(right[index]) ||
+        std::abs(left[index] - right[index]) >
+            multiplier * std::numeric_limits<double>::epsilon() * scale)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+double MaximumScaledDifference(const std::vector<double>& left,
+                               const std::vector<double>& right) noexcept
+{
+  if (left.size() != right.size())
+    return std::numeric_limits<double>::infinity();
+  double maximum = 0.0;
+  for (std::size_t index = 0; index < left.size(); ++index)
+  {
+    if (!std::isfinite(left[index]) || !std::isfinite(right[index]))
+      return std::numeric_limits<double>::infinity();
+    const double scale = std::max({1.0, std::abs(left[index]),
+                                   std::abs(right[index])});
+    maximum = std::max(maximum,
+                       std::abs(left[index] - right[index]) / scale);
+  }
+  return maximum;
+}
+
+struct OneStepEulerState
+{
+  std::vector<double> interior_u4;
+  std::vector<double> trace_uhat4;
+};
+
+bool RunEulerSteps(
+    const mfem::ParMesh& mesh, const ExactBorrowedEulerFields& fields,
+    BoundaryContext& boundary, const EulerHdgTimeTreatment time_treatment,
+    const int order, const bool igr, const double dt,
+    OneStepEulerState& result, const int accepted_steps = 1)
+{
+  if (accepted_steps <= 0) return false;
+  EulerHdgRequest request = Request(
+      mesh, order, boundary, fields, time_treatment);
+  if (igr)
+    request.numerical_policy.stabilization =
+        {RegularizationKind::igr, 0.2, 0.4};
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  if (!core.InitializeBorrowedEuler(request)) return false;
+
+  dg::hdg::runtime::StateCoordinates coordinates{};
+  double maximum_wave_speed = 0.0;
+  double stable_dt = 0.0;
+  for (int step = 0; step < accepted_steps; ++step)
+  {
+    std::uint64_t generation = 0;
+    if (!core.PrepareBorrowedEuler(dt, coordinates, generation) ||
+        generation == 0 ||
+        !core.CommitBorrowedEuler(generation, coordinates,
+                                  maximum_wave_speed, stable_dt))
+    {
+      return false;
+    }
+  }
+
+  result.interior_u4.assign(fields.initial.size(), 0.0);
+  if (!core.ExportCommittedInterior(result.interior_u4.data(),
+                                    result.interior_u4.size()))
+  {
+    return false;
+  }
+  const dg::hdg::runtime::cpu::CpuStateSnapshot snapshot =
+      core.Snapshot(coordinates);
+  const std::size_t trace_components = igr ? 5U : 4U;
+  if (snapshot.trace.size == 0 || snapshot.trace.data == nullptr ||
+      snapshot.trace.size % trace_components != 0)
+  {
+    return false;
+  }
+  const std::size_t scalar_trace =
+      snapshot.trace.size / trace_components;
+  result.trace_uhat4.assign(
+      snapshot.trace.data, snapshot.trace.data + 4 * scalar_trace);
+
+  double maximum_conservation_error =
+      std::numeric_limits<double>::quiet_NaN();
+  double maximum_conservation_relative_error =
+      std::numeric_limits<double>::quiet_NaN();
+  bool conservation_gate = false;
+  const bool conservation_audited =
+      dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+          AuditLastConservation(
+              core, maximum_conservation_error,
+              maximum_conservation_relative_error, conservation_gate);
+  const auto& attempt = core.evidence().last_attempt;
+  return conservation_audited && conservation_gate && attempt.committed &&
+      attempt.status == dg::hdg::runtime::cpu::CpuAttemptStatus::success &&
+      attempt.finite_gate && attempt.admissibility_gate &&
+      attempt.recovery_gate && attempt.nonlinear_gate &&
+      attempt.true_residual_gate &&
+      attempt.minimum_density > 0.0 && attempt.minimum_pressure > 0.0 &&
+      std::isfinite(attempt.maximum_true_relative_residual) &&
+      attempt.maximum_true_relative_residual <=
+          request.numerical_policy.true_residual_relative_tolerance &&
+      std::isfinite(maximum_conservation_error) &&
+      maximum_conservation_error >= 0.0 &&
+      std::isfinite(maximum_conservation_relative_error) &&
+      maximum_conservation_relative_error <=
+          request.numerical_policy.conservation_relative_tolerance &&
+      AdmissibleEulerCoefficients(result.interior_u4) &&
+      coordinates.step == static_cast<std::uint64_t>(accepted_steps) &&
+      coordinates.generation == static_cast<std::uint64_t>(accepted_steps) &&
+      std::abs(coordinates.time - accepted_steps * dt) <=
+          64.0 * std::numeric_limits<double>::epsilon() *
+              std::max(1.0, std::abs(accepted_steps * dt)) &&
+      coordinates.dt == dt &&
+      std::isfinite(maximum_wave_speed) && maximum_wave_speed > 0.0 &&
+      std::isfinite(stable_dt) && stable_dt > 0.0;
 }
 
 struct BorrowedMeshSnapshot
@@ -1176,6 +1351,449 @@ bool CheckIgrExtensionLifecycle()
       boundary.calls == 0;
 }
 
+bool CheckPartitionedBackwardEulerIgrLifecycle()
+{
+  int ranks = 1;
+  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS) return false;
+  if (ranks < 1 || ranks > 3) return true;
+
+  // The three-rank gate used to skip every substantive partitioned test.
+  // Put the complete prepare/abort/retry/commit lifecycle on a deliberately
+  // imbalanced periodic mesh there so the scalar closure must collectively
+  // include both zero-local-element ranks.
+  mfem::ParMesh mesh = ranks == 3
+      ? MakePeriodicRankZeroOwnedBorrowedMesh()
+      : MakePeriodicBorrowedMesh();
+  const int local_empty = mesh.GetNE() == 0 ? 1 : 0;
+  int empty_ranks = 0;
+  if (MPI_Allreduce(&local_empty, &empty_ranks, 1, MPI_INT, MPI_SUM,
+                    mesh.GetComm()) != MPI_SUCCESS ||
+      (ranks == 3 && empty_ranks != 2))
+  {
+    return false;
+  }
+  const std::array<double, 8> free_stream{{1.0, 1.0, 0.20, 0.20,
+                                           -0.10, -0.10, 2.60, 2.60}};
+  const std::array<double, 8> source{};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, free_stream, source);
+  EulerHdgRequest request = Request(
+      mesh, 1, boundary, fields,
+      EulerHdgTimeTreatment::partitioned_backward_euler);
+  request.numerical_policy.stabilization =
+      {RegularizationKind::igr, 0.2, 0.4};
+  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+      dg::hdg::generic::ContractStatus::accepted)
+  {
+    return false;
+  }
+
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  if (!core.InitializeBorrowedEuler(request) ||
+      core.evidence().tuple.time_treatment.view() !=
+          "partitioned-backward-euler.v1")
+  {
+    return false;
+  }
+
+  const std::size_t scalar_count = fields.initial.size() / 4;
+  std::vector<double> committed_before(fields.initial.size(), 0.0);
+  std::vector<double> sigma_before(scalar_count, 0.0);
+  double initial_closure_residual = std::numeric_limits<double>::infinity();
+  double initial_closure_tolerance = std::numeric_limits<double>::infinity();
+  if (!core.ExportCommittedFields(
+          {committed_before.data(), sigma_before.data(), scalar_count}) ||
+      committed_before != fields.initial || core.evidence().attempts != 0 ||
+      core.evidence().accepted_step_count != 0 ||
+      !dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+          AuditCommittedClosure(core, initial_closure_residual,
+                                initial_closure_tolerance) ||
+      !std::isfinite(initial_closure_residual) ||
+      !std::isfinite(initial_closure_tolerance) ||
+      initial_closure_residual > initial_closure_tolerance ||
+      !AdmissibleEulerCoefficients(committed_before) ||
+      !std::all_of(sigma_before.begin(), sigma_before.end(),
+                   [](const double value) { return std::isfinite(value); }))
+  {
+    return false;
+  }
+
+  // Keep this local one-step comparison inside the asymptotic lagging regime;
+  // the separate fixed-final-time check below exercises practical first-order
+  // trajectory convergence at the coarser 2e-4 horizon.
+  constexpr double dt = 2.5e-5;
+  dg::hdg::runtime::StateCoordinates coordinates{};
+  std::uint64_t first_generation = 0;
+  if (!core.PrepareBorrowedEuler(dt, coordinates, first_generation) ||
+      first_generation == 0 || coordinates.time != 0.0 ||
+      coordinates.step != 0 || coordinates.generation != 0)
+  {
+    return false;
+  }
+  std::vector<double> first_candidate(fields.initial.size(), 0.0);
+  std::vector<double> first_sigma(scalar_count, 0.0);
+  const bool first_observation = core.ExportPreparedFields(
+      first_generation,
+      {first_candidate.data(), first_sigma.data(), scalar_count});
+  const bool first_coherent = first_observation &&
+      SameEulerCoefficientsWithinRoundoff(
+          first_candidate, committed_before) &&
+      AdmissibleEulerCoefficients(first_candidate) &&
+      std::all_of(first_sigma.begin(), first_sigma.end(),
+                  [](const double value) { return std::isfinite(value); });
+  if (!first_coherent ||
+      !core.AbortBorrowedEuler(first_generation, coordinates))
+  {
+    return false;
+  }
+
+  std::vector<double> committed_after_abort(fields.initial.size(), 0.0);
+  std::vector<double> sigma_after_abort(scalar_count, 0.0);
+  if (!core.ExportCommittedFields(
+          {committed_after_abort.data(), sigma_after_abort.data(),
+           scalar_count}) ||
+      committed_after_abort != committed_before ||
+      sigma_after_abort != sigma_before ||
+      !core.evidence().last_attempt.rollback_byte_equal ||
+      core.evidence().last_attempt.committed || coordinates.time != 0.0 ||
+      coordinates.step != 0 || coordinates.generation != 0)
+  {
+    return false;
+  }
+
+  std::uint64_t retry_generation = 0;
+  if (!core.PrepareBorrowedEuler(dt, coordinates, retry_generation) ||
+      retry_generation == 0)
+  {
+    return false;
+  }
+  std::vector<double> retry_candidate(fields.initial.size(), 0.0);
+  std::vector<double> retry_sigma(scalar_count, 0.0);
+  if (!core.ExportPreparedFields(
+          retry_generation,
+          {retry_candidate.data(), retry_sigma.data(), scalar_count}) ||
+      retry_candidate != first_candidate || retry_sigma != first_sigma)
+  {
+    return false;
+  }
+
+  double maximum_wave_speed = 0.0;
+  double stable_dt = 0.0;
+  if (!core.CommitBorrowedEuler(retry_generation, coordinates,
+                                maximum_wave_speed, stable_dt))
+  {
+    return false;
+  }
+  std::vector<double> committed_after(fields.initial.size(), 0.0);
+  std::vector<double> sigma_after(scalar_count, 0.0);
+  if (!core.ExportCommittedFields(
+          {committed_after.data(), sigma_after.data(), scalar_count}) ||
+      committed_after != retry_candidate || sigma_after != retry_sigma ||
+      !AdmissibleEulerCoefficients(committed_after))
+  {
+    return false;
+  }
+
+  double maximum_conservation_error =
+      std::numeric_limits<double>::quiet_NaN();
+  double maximum_conservation_relative_error =
+      std::numeric_limits<double>::quiet_NaN();
+  bool conservation_gate = false;
+  const bool conservation_audited =
+      dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+          AuditLastConservation(
+              core, maximum_conservation_error,
+              maximum_conservation_relative_error, conservation_gate);
+  const auto& evidence = core.evidence();
+  const auto& attempt = evidence.last_attempt;
+  return conservation_audited && conservation_gate && attempt.committed &&
+      attempt.status == dg::hdg::runtime::cpu::CpuAttemptStatus::success &&
+      attempt.finite_gate && attempt.admissibility_gate &&
+      attempt.recovery_gate && attempt.nonlinear_gate &&
+      attempt.true_residual_gate && attempt.nonlinear_updates == 0 &&
+      attempt.final_line_search_trials == 0 &&
+      attempt.work.accepted_newton_updates == 0 &&
+      attempt.newton_correction_linear_iterations == 0 &&
+      attempt.work.complete_trace_solves == 2 &&
+      attempt.work.complete_scalar_closure_solves == 1 &&
+      attempt.scalar_closure_linear_solve_attempts >= 1 &&
+      attempt.work.complete_condensations ==
+          attempt.work.complete_trace_solves &&
+      attempt.work.complete_recoveries == attempt.work.complete_trace_solves &&
+      attempt.work.complete_assemblies >= attempt.work.complete_trace_solves &&
+      attempt.minimum_density > 0.0 && attempt.minimum_pressure > 0.0 &&
+      std::isfinite(attempt.maximum_true_relative_residual) &&
+      attempt.maximum_true_relative_residual <=
+          request.numerical_policy.true_residual_relative_tolerance &&
+      std::isfinite(maximum_conservation_error) &&
+      maximum_conservation_error >= 0.0 &&
+      std::isfinite(maximum_conservation_relative_error) &&
+      maximum_conservation_relative_error <=
+          request.numerical_policy.conservation_relative_tolerance &&
+      evidence.attempts == 2 && evidence.failed_attempts == 1 &&
+      evidence.commits == 1 && evidence.accepted_step_count == 1 &&
+      coordinates.time == dt && coordinates.dt == dt &&
+      coordinates.step == 1 && coordinates.generation == 1 &&
+      std::isfinite(maximum_wave_speed) && maximum_wave_speed > 0.0 &&
+      std::isfinite(stable_dt) && stable_dt > 0.0 && boundary.calls == 0;
+}
+
+bool CheckPartitionedConventionalDegeneracy()
+{
+  int ranks = 1;
+  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS) return false;
+  if (ranks != 1 && ranks != 2) return true;
+
+  mfem::ParMesh mesh = MakeBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                       0.00, 0.01, 2.55, 2.62}};
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                      0.00, 0.00, 0.03, 0.04}};
+  ExactBorrowedEulerFields fields(mesh, 2, initial, source);
+  std::array<BoundaryContext, 2> boundaries{};
+  OneStepEulerState backward_euler;
+  OneStepEulerState partitioned;
+  constexpr double dt = 1.0e-4;
+  const bool backward_euler_ok = RunEulerSteps(
+      mesh, fields, boundaries[0], EulerHdgTimeTreatment::backward_euler,
+      2, false, dt, backward_euler);
+  const bool partitioned_ok = RunEulerSteps(
+      mesh, fields, boundaries[1],
+      EulerHdgTimeTreatment::partitioned_backward_euler,
+      2, false, dt, partitioned);
+  return backward_euler_ok && partitioned_ok &&
+      backward_euler.interior_u4 == partitioned.interior_u4 &&
+      backward_euler.trace_uhat4 == partitioned.trace_uhat4 &&
+      boundaries[0].calls > 0 &&
+      boundaries[0].calls == boundaries[1].calls;
+}
+
+bool CheckPartitionedIgrOrdersAndPhysicalBoundary()
+{
+  int ranks = 1;
+  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS) return false;
+  if (ranks != 1 && ranks != 2) return true;
+
+  mfem::ParMesh mesh = MakeBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.02, 0.08, 0.09,
+                                       0.00, 0.01, 2.55, 2.58}};
+  const std::array<double, 8> source{{0.002, 0.003, 0.0, 0.001,
+                                      0.0, 0.0, 0.004, 0.005}};
+  for (int order = 1; order <= 3; ++order)
+  {
+    ExactBorrowedEulerFields fields(mesh, order, initial, source);
+    BoundaryContext boundary{};
+    OneStepEulerState state;
+    if (!RunEulerSteps(
+            mesh, fields, boundary,
+            EulerHdgTimeTreatment::partitioned_backward_euler,
+            order, true, 1.0e-4, state) ||
+        boundary.calls == 0)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool CheckPartitionedSmallDtTrajectory()
+{
+  int ranks = 1;
+  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS) return false;
+  if (ranks != 1) return true;
+
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  // Reuse the established nonuniform Euler/IGR coefficients and static source
+  // at p2.  The alternating local coefficients exercise a genuine spatial
+  // residual while retaining the same admissible state used by the existing
+  // IGR lifecycle and convergence checks.
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                       0.00, 0.01, 2.55, 2.62}};
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                      0.00, 0.00, 0.03, 0.04}};
+  ExactBorrowedEulerFields fields(mesh, 2, initial, source);
+  std::array<BoundaryContext, 4> boundaries{};
+  OneStepEulerState backward_euler;
+  OneStepEulerState partitioned;
+  OneStepEulerState backward_euler_half;
+  OneStepEulerState partitioned_half;
+  constexpr double dt = 1.0e-4;
+  constexpr double half_dt = 0.5 * dt;
+  const bool backward_euler_ok = RunEulerSteps(
+      mesh, fields, boundaries[0], EulerHdgTimeTreatment::backward_euler,
+      2, true, dt, backward_euler);
+  const bool partitioned_ok = RunEulerSteps(
+      mesh, fields, boundaries[1],
+      EulerHdgTimeTreatment::partitioned_backward_euler,
+      2, true, dt, partitioned);
+  const bool backward_euler_half_ok = RunEulerSteps(
+      mesh, fields, boundaries[2], EulerHdgTimeTreatment::backward_euler,
+      2, true, half_dt, backward_euler_half);
+  const bool partitioned_half_ok = RunEulerSteps(
+      mesh, fields, boundaries[3],
+      EulerHdgTimeTreatment::partitioned_backward_euler,
+      2, true, half_dt, partitioned_half);
+  if (!backward_euler_ok || !partitioned_ok ||
+      !backward_euler_half_ok || !partitioned_half_ok)
+  {
+    std::cerr << "small-dt IGR run gate failed: be=" << backward_euler_ok
+              << " partitioned_be=" << partitioned_ok
+              << " be_half=" << backward_euler_half_ok
+              << " partitioned_be_half=" << partitioned_half_ok << '\n';
+    return false;
+  }
+
+  const double interior_difference = MaximumScaledDifference(
+      backward_euler.interior_u4, partitioned.interior_u4);
+  const double trace_difference = MaximumScaledDifference(
+      backward_euler.trace_uhat4, partitioned.trace_uhat4);
+  const double half_interior_difference = MaximumScaledDifference(
+      backward_euler_half.interior_u4,
+      partitioned_half.interior_u4);
+  const double half_trace_difference = MaximumScaledDifference(
+      backward_euler_half.trace_uhat4,
+      partitioned_half.trace_uhat4);
+
+  // The supplied state has a face-projected trace rather than an Euler trace
+  // constraint witness.  The partitioned route projects the scalar closure
+  // first while monolithic BE solves directly onto the coupled constraint
+  // manifold, so this DAE startup comparison is required to contract at first
+  // order in both U4 and Uhat4.  The separate fixed-final-time check below
+  // establishes the temporal-order claim after startup.
+  constexpr double startup_first_order_bound = 1.0e-3;
+  constexpr double roundoff_floor =
+      2048.0 * std::numeric_limits<double>::epsilon();
+  const auto contracts = [roundoff_floor](
+      const double coarse, const double fine,
+      const double minimum_ratio) noexcept
+  {
+    if (!std::isfinite(coarse) || !std::isfinite(fine)) return false;
+    if (coarse <= 8.0 * roundoff_floor)
+      return fine <= 8.0 * roundoff_floor;
+    return minimum_ratio * fine <= coarse + roundoff_floor;
+  };
+  const double interior_bound = startup_first_order_bound * dt;
+  const double half_interior_bound = startup_first_order_bound * half_dt;
+  const double trace_bound = startup_first_order_bound * dt;
+  const double half_trace_bound = startup_first_order_bound * half_dt;
+  const bool interior_bounded = interior_difference <= interior_bound;
+  const bool trace_bounded = trace_difference <= trace_bound;
+  const bool half_interior_bounded =
+      half_interior_difference <= half_interior_bound;
+  const bool half_trace_bounded = half_trace_difference <= half_trace_bound;
+  const bool interior_contracts =
+      contracts(interior_difference, half_interior_difference, 1.8);
+  const bool trace_contracts =
+      contracts(trace_difference, half_trace_difference, 1.8);
+  const bool accepted = interior_bounded && trace_bounded &&
+      half_interior_bounded && half_trace_bounded && interior_contracts &&
+      trace_contracts &&
+      std::all_of(boundaries.begin(), boundaries.end(),
+                  [](const BoundaryContext& boundary)
+                  { return boundary.calls == 0; });
+  if (!accepted)
+  {
+    std::cerr << "small-dt partitioned-BE comparison failed: U4="
+              << interior_difference << " U4_half="
+              << half_interior_difference << " Uhat4=" << trace_difference
+              << " Uhat4_half=" << half_trace_difference
+              << " U4_bound=" << interior_bound
+              << " U4_half_bound=" << half_interior_bound
+              << " Uhat4_bound=" << trace_bound
+              << " Uhat4_half_bound=" << half_trace_bound
+              << " U4_ratio="
+              << interior_difference /
+                     std::max(half_interior_difference, roundoff_floor)
+              << " Uhat4_ratio="
+              << trace_difference /
+                     std::max(half_trace_difference, roundoff_floor)
+              << " roundoff_floor=" << roundoff_floor
+              << " U4_bound_ok=" << interior_bounded
+              << " U4_half_bound_ok=" << half_interior_bounded
+              << " Uhat4_bound_ok=" << trace_bounded
+              << " Uhat4_half_bound_ok=" << half_trace_bounded
+              << " U4_contracts=" << interior_contracts
+              << " Uhat4_contracts=" << trace_contracts << '\n';
+  }
+  return accepted;
+}
+
+bool CheckPartitionedFixedTimeFirstOrder()
+{
+  int ranks = 1;
+  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS) return false;
+  if (ranks != 1) return true;
+
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                       0.00, 0.01, 2.55, 2.62}};
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                      0.00, 0.00, 0.03, 0.04}};
+  ExactBorrowedEulerFields fields(mesh, 2, initial, source);
+  std::array<BoundaryContext, 3> boundaries{};
+  OneStepEulerState coarse;
+  OneStepEulerState medium;
+  OneStepEulerState fine;
+  constexpr double final_time = 2.0e-4;
+  const bool coarse_ok = RunEulerSteps(
+      mesh, fields, boundaries[0],
+      EulerHdgTimeTreatment::partitioned_backward_euler,
+      2, true, final_time, coarse, 1);
+  const bool medium_ok = RunEulerSteps(
+      mesh, fields, boundaries[1],
+      EulerHdgTimeTreatment::partitioned_backward_euler,
+      2, true, 0.5 * final_time, medium, 2);
+  const bool fine_ok = RunEulerSteps(
+      mesh, fields, boundaries[2],
+      EulerHdgTimeTreatment::partitioned_backward_euler,
+      2, true, 0.25 * final_time, fine, 4);
+  if (!coarse_ok || !medium_ok || !fine_ok)
+  {
+    std::cerr << "fixed-time partitioned-BE run gate failed: coarse="
+              << coarse_ok << " medium=" << medium_ok
+              << " fine=" << fine_ok << '\n';
+    return false;
+  }
+
+  const double u4_coarse = MaximumScaledDifference(
+      coarse.interior_u4, medium.interior_u4);
+  const double u4_fine = MaximumScaledDifference(
+      medium.interior_u4, fine.interior_u4);
+  const double uhat_coarse = MaximumScaledDifference(
+      coarse.trace_uhat4, medium.trace_uhat4);
+  const double uhat_fine = MaximumScaledDifference(
+      medium.trace_uhat4, fine.trace_uhat4);
+  constexpr double roundoff_floor =
+      4096.0 * std::numeric_limits<double>::epsilon();
+  const auto first_order = [roundoff_floor](
+      const double coarse_difference, const double fine_difference) noexcept
+  {
+    return std::isfinite(coarse_difference) &&
+        std::isfinite(fine_difference) &&
+        coarse_difference > 32.0 * roundoff_floor &&
+        fine_difference > roundoff_floor &&
+        1.7 * fine_difference <= coarse_difference + roundoff_floor;
+  };
+  const bool accepted = first_order(u4_coarse, u4_fine) &&
+      first_order(uhat_coarse, uhat_fine) &&
+      std::all_of(boundaries.begin(), boundaries.end(),
+                  [](const BoundaryContext& boundary)
+                  { return boundary.calls == 0; });
+  if (!accepted)
+  {
+    std::cerr << "fixed-time partitioned-BE order failed: U4_coarse="
+              << u4_coarse << " U4_fine=" << u4_fine
+              << " U4_ratio="
+              << u4_coarse / std::max(u4_fine, roundoff_floor)
+              << " Uhat4_coarse=" << uhat_coarse
+              << " Uhat4_fine=" << uhat_fine
+              << " Uhat4_ratio="
+              << uhat_coarse / std::max(uhat_fine, roundoff_floor)
+              << " roundoff_floor=" << roundoff_floor << '\n';
+  }
+  return accepted;
+}
+
 bool CheckIgrExtensionConvergenceEvidence()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
@@ -1648,7 +2266,10 @@ bool CheckSubcommunicatorIsolation()
   return All(local && freed);
 }
 
-bool CheckBorrowedSessionDoesNotUseWorldCollectives()
+bool CheckBorrowedSessionDoesNotUseWorldCollectives(
+    const EulerHdgTimeTreatment time_treatment =
+        EulerHdgTimeTreatment::backward_euler,
+    const bool igr = false)
 {
   int world_rank = 0;
   int world_size = 1;
@@ -1673,7 +2294,11 @@ bool CheckBorrowedSessionDoesNotUseWorldCollectives()
     mfem::ParMesh mesh = MakeBorrowedMesh(active_communicator);
     BoundaryContext boundary{};
     ExactBorrowedEulerFields fields(mesh, 1, initial, source);
-    EulerHdgRequest request = Request(mesh, 1, boundary, fields);
+    EulerHdgRequest request = Request(
+        mesh, 1, boundary, fields, time_treatment);
+    if (igr)
+      request.numerical_policy.stabilization =
+          {RegularizationKind::igr, 0.2, 0.4};
     const BorrowedMeshSnapshot before = SnapshotBorrowedMesh(mesh);
     GenericEulerHdgCpuSession session;
     GenericEulerCpuPreparedStep prepared;
@@ -1686,6 +2311,18 @@ bool CheckBorrowedSessionDoesNotUseWorldCollectives()
         session.Advance(0.047).status ==
             GenericEulerCpuSessionStatus::advanced &&
         boundary.calls > 0 && SameBorrowedMesh(mesh, before, active_communicator);
+    if (local && igr)
+    {
+      const std::size_t scalar_count = fields.initial.size() / 4;
+      std::vector<double> committed(fields.initial.size(), 0.0);
+      std::vector<double> sigma(scalar_count,
+                                std::numeric_limits<double>::quiet_NaN());
+      local = session.ExportCommittedFields(
+                  {committed.data(), sigma.data(), scalar_count}) &&
+          AdmissibleEulerCoefficients(committed) &&
+          std::all_of(sigma.begin(), sigma.end(),
+                      [](const double value) { return std::isfinite(value); });
+    }
     local = All(local, active_communicator);
   }
 
@@ -1909,6 +2546,14 @@ int main(int argc, char* argv[])
   const bool conventional_conservation =
       CheckConventionalConservationEvidence();
   const bool igr_extension = CheckIgrExtensionLifecycle();
+  const bool partitioned_igr =
+      CheckPartitionedBackwardEulerIgrLifecycle();
+  const bool partitioned_conventional =
+      CheckPartitionedConventionalDegeneracy();
+  const bool partitioned_orders_boundary =
+      CheckPartitionedIgrOrdersAndPhysicalBoundary();
+  const bool partitioned_small_dt = CheckPartitionedSmallDtTrajectory();
+  const bool partitioned_fixed_time = CheckPartitionedFixedTimeFirstOrder();
   const bool igr_extension_convergence =
       CheckIgrExtensionConvergenceEvidence();
   const bool igr_extension_numerical_policy =
@@ -1925,6 +2570,9 @@ int main(int argc, char* argv[])
   const bool zero_owned = CheckZeroOwnedElementEngine();
   const bool subcommunicator = CheckSubcommunicatorIsolation();
   const bool passive_world = CheckBorrowedSessionDoesNotUseWorldCollectives();
+  const bool partitioned_passive_world =
+      CheckBorrowedSessionDoesNotUseWorldCollectives(
+          EulerHdgTimeTreatment::partitioned_backward_euler, true);
   const bool mismatch = CheckCollectiveMismatchAndAtomicFailure();
   const bool initial_trace_admission = CheckCollectiveInitialTraceAdmission();
   const bool initial_trace_zero_local =
@@ -1936,12 +2584,16 @@ int main(int argc, char* argv[])
       default_numerical_policy &&
       periodic && natural_free_stream && conventional_conservation &&
       igr_extension && igr_extension_zero_local &&
+      partitioned_igr && partitioned_conventional &&
+      partitioned_orders_boundary && partitioned_small_dt &&
+      partitioned_fixed_time &&
       igr_extension_convergence &&
       igr_extension_numerical_policy &&
       igr_extension_initialization && igr_assembler_jacobian && llf_policy &&
       zero_update && dynamic_tau &&
       boundary_picard &&
-      zero_owned && subcommunicator && passive_world && mismatch &&
+      zero_owned && subcommunicator && passive_world &&
+      partitioned_passive_world && mismatch &&
       initial_trace_admission && initial_trace_zero_local && callback_failure;
   if (!All(local))
   {
@@ -1954,6 +2606,12 @@ int main(int argc, char* argv[])
               << " natural_free_stream=" << natural_free_stream
               << " conventional_conservation=" << conventional_conservation
               << " igr_extension=" << igr_extension
+              << " partitioned_igr=" << partitioned_igr
+              << " partitioned_conventional=" << partitioned_conventional
+              << " partitioned_orders_boundary="
+              << partitioned_orders_boundary
+              << " partitioned_small_dt=" << partitioned_small_dt
+              << " partitioned_fixed_time=" << partitioned_fixed_time
               << " igr_extension_convergence=" << igr_extension_convergence
               << " igr_extension_numerical_policy="
               << igr_extension_numerical_policy
@@ -1972,6 +2630,7 @@ int main(int argc, char* argv[])
               << " boundary_picard=" << boundary_picard
               << " zero_owned=" << zero_owned
               << " passive_world=" << passive_world
+              << " partitioned_passive_world=" << partitioned_passive_world
               << " subcommunicator=" << subcommunicator
               << " mismatch=" << mismatch
               << " initial_trace_admission=" << initial_trace_admission

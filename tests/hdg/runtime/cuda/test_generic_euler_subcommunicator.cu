@@ -132,7 +132,8 @@ struct CudaQualificationTestAccess
 {
   template <typename Engine>
   static bool VerifyPreparedCudaEngine(
-      Engine& engine, const generic::CudaEngineKind expected) noexcept
+      Engine& engine, const generic::CudaEngineKind expected,
+      const generic::EulerHdgTimeTreatment expected_time_treatment) noexcept
   {
     if (!engine.initialized_ || !engine.pending_.active ||
         !engine.pending_.staging)
@@ -140,10 +141,35 @@ struct CudaQualificationTestAccess
     const auto& evidence = engine.pending_.evidence;
     const auto& tensor = evidence.tensor_core;
     const bool igr_active = engine.numerics_.shape_.igr_active;
+    const bool partitioned_igr = igr_active &&
+        expected_time_treatment ==
+            generic::EulerHdgTimeTreatment::partitioned_backward_euler;
+    const int final_trace_solves = partitioned_igr ? 2 : 1;
+    const bool work_accounting = evidence.nonlinear_updates >= 0 &&
+        evidence.trace_solves ==
+            evidence.nonlinear_updates + final_trace_solves &&
+        evidence.linear_iterations >= 0 &&
+        evidence.newton_correction_linear_iterations >= 0 &&
+        evidence.final_coherent_linear_iterations >= 0 &&
+        static_cast<long long>(evidence.linear_iterations) ==
+            static_cast<long long>(
+                evidence.newton_correction_linear_iterations) +
+                evidence.final_coherent_linear_iterations &&
+        evidence.linear_solve_attempts >= evidence.trace_solves &&
+        evidence.true_residual_tightenings >= 0 &&
+        static_cast<long long>(evidence.linear_solve_attempts) ==
+            static_cast<long long>(evidence.trace_solves) +
+                evidence.true_residual_tightenings &&
+        evidence.line_search_trials >= 0 &&
+        evidence.rejected_line_search_trials >= 0 &&
+        evidence.line_search_trials == evidence.nonlinear_updates +
+            evidence.rejected_line_search_trials;
     const auto trace_policy = ResolveCudaTracePolicy(
         expected, igr_active, engine.config_.expected_rank_count,
         engine.config_.order, CudaTracePolicyKind::engine_default);
-    return tensor.selected_engine == expected &&
+    return engine.config_.time_treatment == expected_time_treatment &&
+        engine.numerics_.partitioned_backward_euler_ == partitioned_igr &&
+        work_accounting && tensor.selected_engine == expected &&
         CudaTracePolicyDescriptorIsExact(trace_policy) &&
         tensor.requested_trace_policy ==
             CudaTracePolicyKind::engine_default &&
@@ -169,12 +195,23 @@ struct CudaQualificationTestAccess
 
   static bool VerifyPreparedCudaEngine(
       cuda::GenericEulerHdgCudaSession& session,
-      const generic::CudaEngineKind expected) noexcept
+      const generic::CudaEngineKind expected,
+      const generic::EulerHdgTimeTreatment expected_time_treatment) noexcept
   {
     if (session.borrowed_rank1_)
-      return VerifyPreparedCudaEngine(*session.borrowed_rank1_, expected);
+      return VerifyPreparedCudaEngine(
+          *session.borrowed_rank1_, expected, expected_time_treatment);
     if (session.borrowed_rank2_)
-      return VerifyPreparedCudaEngine(*session.borrowed_rank2_, expected);
+      return VerifyPreparedCudaEngine(
+          *session.borrowed_rank2_, expected, expected_time_treatment);
+    if (session.partitioned_backward_euler_borrowed_rank1_)
+      return VerifyPreparedCudaEngine(
+          *session.partitioned_backward_euler_borrowed_rank1_, expected,
+          expected_time_treatment);
+    if (session.partitioned_backward_euler_borrowed_rank2_)
+      return VerifyPreparedCudaEngine(
+          *session.partitioned_backward_euler_borrowed_rank2_, expected,
+          expected_time_treatment);
     return false;
   }
 };
@@ -189,6 +226,7 @@ using dg::hdg::generic::Capability;
 using dg::hdg::generic::CapabilityBit;
 using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::EulerHdgRequest;
+using dg::hdg::generic::EulerHdgTimeTreatment;
 using dg::hdg::generic::HdgEulerSessionStatus;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
@@ -297,7 +335,8 @@ BorrowedFields MakeFields(mfem::ParMesh& mesh)
 
 EulerHdgRequest MakeRequest(const mfem::ParMesh& mesh,
                             BorrowedFields& fields,
-                            const CudaEngineKind engine)
+                            const CudaEngineKind engine,
+                            const EulerHdgTimeTreatment time_treatment)
 {
   EulerHdgRequest request{};
   request.mesh = &mesh;
@@ -319,12 +358,14 @@ EulerHdgRequest MakeRequest(const mfem::ParMesh& mesh,
       dg::hdg::generic::DefaultEulerHdgNumericalPolicy(1);
   request.numerical_policy.stabilization = {
       RegularizationKind::igr, 0.2, 0.8};
+  request.time_treatment = time_treatment;
   return request;
 }
 
 bool CheckActiveSubcommunicator(const MPI_Comm communicator,
                                 const int active_ranks,
-                                const CudaEngineKind engine)
+                                const CudaEngineKind engine,
+                                const EulerHdgTimeTreatment time_treatment)
 {
   int rank = -1;
   int ranks = 0;
@@ -337,7 +378,8 @@ bool CheckActiveSubcommunicator(const MPI_Comm communicator,
   mfem::ParMesh mesh(communicator, serial);
   BorrowedFields fields = MakeFields(mesh);
   if (!All(communicator, HYPRE_GetError() == 0)) return false;
-  EulerHdgRequest request = MakeRequest(mesh, fields, engine);
+  EulerHdgRequest request = MakeRequest(
+      mesh, fields, engine, time_treatment);
 
   if (ranks == 2)
   {
@@ -360,7 +402,8 @@ bool CheckActiveSubcommunicator(const MPI_Comm communicator,
       HdgEulerSessionStatus::prepared;
   if (!All(communicator, prepared)) return false;
   const bool engine_evidence =
-      CudaQualificationTestAccess::VerifyPreparedCudaEngine(session, engine);
+      CudaQualificationTestAccess::VerifyPreparedCudaEngine(
+          session, engine, time_treatment);
   if (!All(communicator, engine_evidence)) return false;
   const bool acknowledged = session.AcknowledgePreparedOutput(authority, output);
   if (!All(communicator, acknowledged)) return false;
@@ -373,6 +416,8 @@ struct Options
 {
   int active_ranks = 0;
   CudaEngineKind engine = CudaEngineKind::ordinary;
+  EulerHdgTimeTreatment time_treatment =
+      EulerHdgTimeTreatment::backward_euler;
 };
 
 bool ParseOptions(const int argc, char* argv[], Options& options) noexcept
@@ -394,6 +439,19 @@ bool ParseOptions(const int argc, char* argv[], Options& options) noexcept
         options.engine = CudaEngineKind::ordinary;
       else if (engine == "tensor")
         options.engine = CudaEngineKind::tensor_core;
+      else
+        return false;
+      continue;
+    }
+    if (argument == "--time-treatment")
+    {
+      if (++index >= argc) return false;
+      const std::string_view treatment(argv[index]);
+      if (treatment == "backward-euler")
+        options.time_treatment = EulerHdgTimeTreatment::backward_euler;
+      else if (treatment == "partitioned-backward-euler")
+        options.time_treatment =
+            EulerHdgTimeTreatment::partitioned_backward_euler;
       else
         return false;
       continue;
@@ -434,7 +492,7 @@ int main(int argc, char* argv[])
     try
     {
       local = CheckActiveSubcommunicator(
-          active, active_ranks, options.engine);
+          active, active_ranks, options.engine, options.time_treatment);
     }
     catch (...) { local = false; }
   }

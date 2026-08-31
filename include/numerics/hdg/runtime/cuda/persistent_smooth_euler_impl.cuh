@@ -371,6 +371,40 @@ constexpr CudaTraceSolverKind ResolveCudaTraceSolverKind(
   return CudaTraceSolverKind::hypre_parcsr_gmres;
 }
 
+constexpr CudaNativeTraceActiveSubspace ResolveCudaNativeTraceActiveSubspace(
+    const bool partitioned_igr, const generic::CudaEngineKind engine,
+    const int ranks, const CudaTraceSolverKind trace_solver,
+    const bool scalar_closure) noexcept
+{
+  const bool projected = partitioned_igr &&
+      engine == generic::CudaEngineKind::tensor_core && ranks == 1 &&
+      trace_solver == CudaTraceSolverKind::native_rank1_fp64;
+  return !projected ? CudaNativeTraceActiveSubspace::full
+      : scalar_closure
+          ? CudaNativeTraceActiveSubspace::scalar_sigmahat
+          : CudaNativeTraceActiveSubspace::euler_uhat4;
+}
+static_assert(ResolveCudaNativeTraceActiveSubspace(
+                  true, generic::CudaEngineKind::tensor_core, 1,
+                  CudaTraceSolverKind::native_rank1_fp64, false) ==
+              CudaNativeTraceActiveSubspace::euler_uhat4);
+static_assert(ResolveCudaNativeTraceActiveSubspace(
+                  true, generic::CudaEngineKind::tensor_core, 1,
+                  CudaTraceSolverKind::native_rank1_fp64, true) ==
+              CudaNativeTraceActiveSubspace::scalar_sigmahat);
+static_assert(ResolveCudaNativeTraceActiveSubspace(
+                  false, generic::CudaEngineKind::tensor_core, 1,
+                  CudaTraceSolverKind::native_rank1_fp64, false) ==
+              CudaNativeTraceActiveSubspace::full);
+static_assert(ResolveCudaNativeTraceActiveSubspace(
+                  true, generic::CudaEngineKind::ordinary, 1,
+                  CudaTraceSolverKind::hypre_parcsr_gmres, false) ==
+              CudaNativeTraceActiveSubspace::full);
+static_assert(ResolveCudaNativeTraceActiveSubspace(
+                  true, generic::CudaEngineKind::tensor_core, 2,
+                  CudaTraceSolverKind::hypre_host_staged_rank2, true) ==
+              CudaNativeTraceActiveSubspace::full);
+
 // Private translation seam to the source-only native solver ABI.  Keeping
 // these primitive PODs here prevents the native CUDA leaf header from becoming
 // part of the public persistent-engine include surface.
@@ -833,6 +867,7 @@ struct CudaGenericArenaLayout
   std::size_t boundary_reference = 0;
   std::size_t boundary_pressure = 0;
   std::size_t native_ilu_inverse_diagonal = 0;
+  std::size_t partitioned_base_interior = 0;
   std::size_t solve_workspace = 0;
   std::size_t two_exchange_keys = 0;
 };
@@ -877,10 +912,12 @@ struct CudaDeviceView
   double* borrowed_lagged_llf_tau = nullptr;
   double* initial_current_interior = nullptr;
   double* base_interior = nullptr;
+  // Partitioned Backward Euler snapshots one block family while the
+  // complementary subsystem is solved and audited bit-for-bit.
+  double* partitioned_base_interior = nullptr;
   // Compact four-component element-local staging used only for host output.
   // The nonlinear trial is written directly into work_interior.
   double* output_interior = nullptr;
-  double* delta_interior = nullptr;
   double* recovered_interior = nullptr;
   double* work_true_trace = nullptr;
   double* initial_current_true_trace = nullptr;
@@ -1933,6 +1970,7 @@ bool CudaLaunchNativeRankOneTraceSolver(
     const CudaNativeIlu0FactorView& ilu_factor,
     const CudaNativeElementSchwarzView& element_schwarz,
     const CudaNativeTraceOperatorView& trace_operator,
+    CudaNativeTraceActiveSubspace active_subspace,
     const CudaNativeTraceWorkspaceView& workspace,
     const CudaNativeTraceCooperativeSupport& support,
     double relative_tolerance, int maximum_iterations,
@@ -2120,6 +2158,19 @@ bool CudaLaunchAssembly(const CudaDeviceView& view,
 bool CudaLaunchFrozenBorrowedLlfAssembly(
     const CudaDeviceView& view, const CudaMeshShape& shape,
     double dt) noexcept;
+bool CudaLaunchPartitionedScalarClosureMask(
+    const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
+bool CudaLaunchPartitionedBackwardEulerMask(
+    const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
+bool CudaLaunchPartitionedBackwardEulerFreezeIncrements(
+    const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
+bool CudaLaunchPartitionedScalarClosureFreezeEulerIncrements(
+    const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
+bool CudaLaunchPartitionedBackwardEulerStateAudit(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    bool audit_auxiliary) noexcept;
+bool CudaLaunchPartitionedScalarClosureRestoreEuler(
+    const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
 bool CudaLaunchCondensation(const CudaDeviceView& view,
                             const CudaMeshShape& shape,
                             generic::CudaEngineKind engine,
@@ -2157,6 +2208,10 @@ bool CudaLaunchLocalSquaredNorm(const double* first, int first_count,
                                 const double* second, int second_count,
                                 double* scratch, int scratch_count,
                                 double* result) noexcept;
+bool CudaLaunchPartitionedAuxiliarySquaredNorm(
+    const CudaMeshShape& shape, const double* interior,
+    const double* true_trace, double* scratch, int scratch_count,
+    double* result) noexcept;
 bool CudaLaunchMaximumWave(const CudaDeviceView& view,
                            const CudaMeshShape& shape,
                            const double* interior,
@@ -2232,9 +2287,18 @@ public:
   {
     communicator_ = CudaCollectiveCommunicator(config);
     cuda_engine_ = config.cuda_engine;
+    time_treatment_ = config.time_treatment;
     const bool igr_requested = config.use_generic_numerical_policy &&
         config.numerical_policy.stabilization.kind ==
             generic::RegularizationKind::igr;
+    // The typed partitioned treatment is also the conventional U4/Uhat4
+    // lifecycle selector.  With no IGR algebraic block it is exactly the
+    // established four-field Backward-Euler algorithm; activate the lagged
+    // closure split only when the auxiliary equations actually exist.
+    partitioned_backward_euler_ = time_treatment_ ==
+            generic::EulerHdgTimeTreatment::partitioned_backward_euler &&
+        igr_requested;
+    committed_scalar_closure_coherent_ = false;
     trace_policy_descriptor_ = trace_policy;
     trace_solver_kind_ = CudaTraceSolverKind::unconfigured;
     native_trace_requirements_ = {};
@@ -2307,6 +2371,8 @@ public:
         : 1.0e-13;
     true_residual_relative_tolerance_ = config.use_generic_numerical_policy
         ? config.numerical_policy.true_residual_relative_tolerance : 1.0e-10;
+    nonlinear_relative_tolerance_ = config.use_generic_numerical_policy
+        ? config.numerical_policy.nonlinear_relative_tolerance : 1.0e-10;
     maximum_linear_iterations_ = config.use_generic_numerical_policy
         ? generic::ResolveEulerHdgMaximumLinearIterations(
               config.numerical_policy.maximum_linear_iterations,
@@ -2334,6 +2400,8 @@ public:
                                 final_coherent_linear_relative_tolerance_ &&
                             true_residual_relative_tolerance_ > 0.0 &&
                             std::isfinite(true_residual_relative_tolerance_) &&
+                            nonlinear_relative_tolerance_ > 0.0 &&
+                            std::isfinite(nonlinear_relative_tolerance_) &&
                             maximum_linear_iterations_ > 0 &&
                             krylov_dimension_ > 0))
     {
@@ -2612,6 +2680,13 @@ public:
       ReportCudaSetupFailure(evidence.rank, "residency-ticket");
       return false;
     }
+    if (!CollectiveContinue(
+            BootstrapPartitionedScalarClosure(config)))
+    {
+      ReportCudaSetupFailure(evidence.rank,
+                             "partitioned-scalar-bootstrap");
+      return false;
+    }
     resources_.mfem_pin = StableIdentity::Copy(
         "d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec");
     local_mesh_hash_ = HashHostBytes(element_coordinate_keys_.data(),
@@ -2670,6 +2745,51 @@ public:
 
   state_slot CommittedSlot() const noexcept { return committed_slot_; }
   state_slot CandidateSlot() const noexcept { return candidate_slot_; }
+  /**
+   * Mirror metadata only after the run contract has synchronously copied this
+   * exact workspace into its independently owned candidate descriptor.  The
+   * payload pointers and ownership tokens remain those of the numerical slot;
+   * only metadata copied by CudaContractStoragePolicy::StoreCandidate is
+   * adopted here.
+   */
+  bool AdoptPreparedCandidateMetadata(
+      const state_slot& prepared) noexcept
+  {
+    const bool local_valid =
+        prepared.interior.coefficients != nullptr &&
+        prepared.trace.coefficients != nullptr &&
+        prepared.interior.coefficients ==
+            workspace_slot_.interior.coefficients &&
+        prepared.trace.coefficients == workspace_slot_.trace.coefficients &&
+        prepared.interior.count == workspace_slot_.interior.count &&
+        prepared.trace.count == workspace_slot_.trace.count &&
+        candidate_slot_.interior.coefficients != nullptr &&
+        candidate_slot_.trace.coefficients != nullptr &&
+        candidate_slot_.interior.coefficients !=
+            prepared.interior.coefficients &&
+        candidate_slot_.trace.coefficients != prepared.trace.coefficients &&
+        candidate_slot_.interior.count == prepared.interior.count &&
+        candidate_slot_.trace.count == prepared.trace.count &&
+        prepared.interior.generation == prepared.trace.generation &&
+        prepared.interior.mfem_device_valid &&
+        prepared.trace.mfem_device_valid &&
+        candidate_slot_.interior.mfem_device_valid &&
+        candidate_slot_.trace.mfem_owned &&
+        candidate_slot_.trace.mfem_device_valid;
+    if (!CollectiveContinue(local_valid)) return false;
+
+    candidate_slot_.interior.hash = prepared.interior.hash;
+    candidate_slot_.interior.local_hash = prepared.interior.local_hash;
+    candidate_slot_.interior.generation = prepared.interior.generation;
+    candidate_slot_.interior.mfem_device_valid =
+        prepared.interior.mfem_device_valid;
+    candidate_slot_.trace.hash = prepared.trace.hash;
+    candidate_slot_.trace.local_hash = prepared.trace.local_hash;
+    candidate_slot_.trace.generation = prepared.trace.generation;
+    candidate_slot_.trace.mfem_device_valid =
+        prepared.trace.mfem_device_valid;
+    return true;
+  }
   /** Mirror a final contract slot publication without moving any payload. */
   void SwapPublishedSlotHandles() noexcept
   {
@@ -2677,6 +2797,60 @@ public:
     committed_slot_ = candidate_slot_;
     candidate_slot_ = prior_committed;
   }
+  /** Certify only a final scalar-projected candidate after logical commit. */
+  void MarkCommittedScalarClosureCoherent() noexcept
+  {
+    committed_scalar_closure_coherent_ = partitioned_backward_euler_;
+    committed_scalar_closure_interior_hash_ =
+        committed_scalar_closure_coherent_
+        ? committed_slot_.interior.hash : StateHash{};
+    committed_scalar_closure_trace_hash_ =
+        committed_scalar_closure_coherent_
+        ? committed_slot_.trace.hash : StateHash{};
+  }
+  /** Restored bytes carry no independent scalar-closure certificate. */
+  void InvalidateCommittedScalarClosureCoherence() noexcept
+  {
+    committed_scalar_closure_coherent_ = false;
+    committed_scalar_closure_interior_hash_ = {};
+    committed_scalar_closure_trace_hash_ = {};
+  }
+  bool AssessCommittedScalarClosureCoherence(bool& coherent) noexcept
+  {
+    coherent = !partitioned_backward_euler_;
+    if (!partitioned_backward_euler_) return true;
+    const bool cached_certificate = committed_scalar_closure_coherent_ &&
+        committed_slot_.interior.hash ==
+            committed_scalar_closure_interior_hash_ &&
+        committed_slot_.trace.hash == committed_scalar_closure_trace_hash_;
+    // The committed device buffers are authoritative.  Recompute their
+    // hashes before reusing a scalar witness so stale descriptor metadata or
+    // an unintended payload mutation cannot select a rank-divergent path.
+    if (!UpdateStateHashes(committed_slot_)) return false;
+    const bool local_coherent = cached_certificate &&
+        committed_slot_.interior.hash ==
+            committed_scalar_closure_interior_hash_ &&
+        committed_slot_.trace.hash == committed_scalar_closure_trace_hash_;
+    int coherent_ranks = 0;
+    if (!CollectiveCount(local_coherent, coherent_ranks)) return false;
+    coherent = coherent_ranks == ranks_;
+    return true;
+  }
+  bool CommittedScalarClosureCoherent() const noexcept
+  {
+    // Published slot storage is private and immutable between lifecycle
+    // transitions.  Execute performs the authoritative device rehash before
+    // reuse; export may therefore check the resulting cached certificate
+    // without introducing a new collective into a rank-local copy operation.
+    return !partitioned_backward_euler_ ||
+        (committed_scalar_closure_coherent_ &&
+         committed_slot_.interior.hash ==
+             committed_scalar_closure_interior_hash_ &&
+         committed_slot_.trace.hash == committed_scalar_closure_trace_hash_);
+  }
+  bool ValidatePartitionedScalarCheckpoint(
+      const CudaSerializedCheckpointV1& checkpoint, state_slot& workspace,
+      double dt) noexcept;
   state_slot& WorkspaceSlot() noexcept { return workspace_slot_; }
   const PersistentResourceDescriptor& Resources() const noexcept
   {
@@ -3493,7 +3667,9 @@ private:
 
 public:
   bool EulerConservationBalance(const double dt, double& maximum_error,
-                                double& maximum_relative_error) noexcept
+                                double& maximum_relative_error,
+                                const bool include_scalar_constraint = true)
+      noexcept
   {
     maximum_error = 0.0;
     maximum_relative_error = 0.0;
@@ -3532,7 +3708,8 @@ public:
                             std::isfinite(global_domain_measure) &&
                             global_domain_measure > 0.0))
       return false;
-    const int active_components = shape_.igr_active
+    const int active_components =
+        shape_.igr_active && include_scalar_constraint
         ? components : conserved_components;
     for (int component = 0; component < active_components; ++component)
     {
@@ -3685,6 +3862,75 @@ public:
       result.injection_source_rank = config.injection.source_rank;
       return true;
     };
+    std::uint64_t last_product_generation = 0;
+    const auto snapshot_partitioned_state = [&]() noexcept
+    {
+      return view_.partitioned_base_interior != nullptr &&
+          view_.trial_true_trace != nullptr &&
+          TransportPolicy::DeviceToDevice(
+              view_.partitioned_base_interior,
+              workspace.interior.coefficients,
+              workspace.interior.count * sizeof(double),
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_interior) &&
+          TransportPolicy::DeviceToDevice(
+              view_.trial_true_trace,
+              workspace.trace.coefficients,
+              workspace.trace.count * sizeof(double),
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_trace) &&
+          TransportPolicy::Synchronize(
+              CudaTransferSite::nonlinear_base_trace);
+    };
+    if (partitioned_backward_euler_)
+    {
+      const bool admitted = (ranks_ == 1 || ranks_ == 2) &&
+          shape_.borrowed_host_inputs && shape_.igr_active &&
+          view_.partitioned_base_interior != nullptr &&
+          !config.capture_oracle;
+      if (!CollectiveContinue(admitted))
+      {
+        result.phase = CudaFailurePhase::setup;
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+      result.finite = true;
+      // Generic initialization and restart bytes do not prove the scalar
+      // algebraic equations.  Establish that witness once before freezing it;
+      // later committed partitioned candidates reuse their final closure.
+      bool committed_scalar_closure_coherent = false;
+      if (!AssessCommittedScalarClosureCoherence(
+              committed_scalar_closure_coherent))
+      {
+        result.phase = CudaFailurePhase::setup;
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+      if (!committed_scalar_closure_coherent)
+      {
+        std::uint64_t initial_closure_generation = 0;
+        const bool initial_euler_snapshot = snapshot_partitioned_state();
+        if (!CollectiveContinue(initial_euler_snapshot) ||
+            !SolvePartitionedScalarClosure(
+                workspace, generic::EulerHdgLinearSolveRole::final_coherent,
+                result, initial_closure_generation) ||
+            !CollectiveContinue(
+                CudaLaunchPartitionedBackwardEulerStateAudit(
+                    view_, shape_, false) && StatusPassed()))
+        {
+          if (result.reason == FailureReason::none)
+            result.reason = FailureReason::recovery_gate;
+          return result;
+        }
+        last_product_generation = initial_closure_generation;
+      }
+      // Retain the exact frozen a^n witness across every nonlinear trial.
+      if (!CollectiveContinue(snapshot_partitioned_state()))
+      {
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+    }
     result.phase = CudaFailurePhase::assembly;
     if (inject_at(CudaFailurePhase::assembly)) { return result; }
     const bool assembly_ticket = initialized_ &&
@@ -3777,7 +4023,6 @@ public:
       }
       return true;
     };
-    std::uint64_t last_product_generation = 0;
     for (int iteration = 0; iteration < maximum_nonlinear_updates; ++iteration)
     {
       const bool minimum_update_witness = config.use_generic_numerical_policy ||
@@ -3813,6 +4058,9 @@ public:
       int true_residual_tightenings = 0;
       const bool solve_ok = SolveTrueSystem(
           generic::EulerHdgLinearSolveRole::newton_correction,
+          ResolveCudaNativeTraceActiveSubspace(
+              partitioned_backward_euler_, cuda_engine_, ranks_,
+              trace_solver_kind_, false),
           result.true_relative_residual, generation, solve_iterations,
           solve_attempts, true_residual_tightenings, result.tensor_core);
       const bool solve_accounted = record_linear_work(
@@ -3841,7 +4089,11 @@ public:
         recovery_launched = CudaLaunchRecover(view_, shape_, cuda_engine_);
       }
       const bool recovered = recovery_launched && StatusPassed();
-      if (!CollectiveContinue(recovered))
+      const bool frozen_partitioned_increments = recovered &&
+          (!partitioned_backward_euler_ ||
+           CudaLaunchPartitionedBackwardEulerFreezeIncrements(
+               view_, shape_));
+      if (!CollectiveContinue(frozen_partitioned_increments))
       {
         result.phase = CudaFailurePhase::recovery;
         result.reason = FailureReason::recovery_gate;
@@ -3978,6 +4230,9 @@ public:
     int coherent_true_residual_tightenings = 0;
     const bool coherent_solve_ok = SolveTrueSystem(
         generic::EulerHdgLinearSolveRole::final_coherent,
+        ResolveCudaNativeTraceActiveSubspace(
+            partitioned_backward_euler_, cuda_engine_, ranks_,
+            trace_solver_kind_, false),
         result.true_relative_residual, last_product_generation,
         coherent_solve_iterations, coherent_solve_attempts,
         coherent_true_residual_tightenings, result.tensor_core);
@@ -4003,7 +4258,11 @@ public:
     }
     const bool coherent_solve =
         coherent_recovery_launched && StatusPassed();
-    if (!CollectiveContinue(coherent_solve))
+    const bool coherent_partitioned_increments = coherent_solve &&
+        (!partitioned_backward_euler_ ||
+         CudaLaunchPartitionedBackwardEulerFreezeIncrements(
+             view_, shape_));
+    if (!CollectiveContinue(coherent_partitioned_increments))
     {
       result.reason = FailureReason::recovery_gate;
       return result;
@@ -4031,6 +4290,85 @@ public:
                        last_product_generation,
                        last_product_generation,
                        0};
+    if (partitioned_backward_euler_)
+    {
+      // The accepted implicit Euler state still carries the frozen committed
+      // auxiliary witness.  Project the scalar DAE constraint exactly once
+      // onto that new U4/Uhat4 state before any publication gate observes it.
+      const bool auxiliary_frozen =
+          CudaLaunchPartitionedBackwardEulerStateAudit(
+              view_, shape_, true) && StatusPassed();
+      if (!CollectiveContinue(auxiliary_frozen))
+      {
+        result.reason = FailureReason::recovery_gate;
+        return result;
+      }
+      const double frozen_euler_true_relative_residual =
+          result.true_relative_residual;
+      const bool frozen_euler_true_residual =
+          std::isfinite(frozen_euler_true_relative_residual) &&
+          frozen_euler_true_relative_residual <=
+              true_residual_relative_tolerance_;
+      if (!CollectiveContinue(frozen_euler_true_residual))
+      {
+        result.reason = FailureReason::true_residual_gate;
+        return result;
+      }
+      // Conservation belongs to the lagged Euler equation F(U^{n+1},a^n),
+      // not the subsequently projected auxiliary state a^{n+1}.
+      bool frozen_conservation_ready = false;
+      {
+        ::dg_igr::NVTXRange profile_region(
+            ::dg_igr::observability::RegionId::hdg_validation);
+        frozen_conservation_ready = EulerConservationBalance(
+            attempt.dt, result.maximum_conservation_error,
+            result.maximum_conservation_relative_error, false);
+      }
+      if (!CollectiveContinue(frozen_conservation_ready))
+      {
+        result.candidate_ready = false;
+        result.conservation = false;
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+      result.conservation = CollectiveContinue(
+          result.maximum_conservation_relative_error <=
+              config.numerical_policy.conservation_relative_tolerance);
+      if (!CollectiveContinue(snapshot_partitioned_state()))
+      {
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+      const double final_nonlinear_residual = result.final_residual;
+      std::uint64_t final_closure_generation = 0;
+      if (!SolvePartitionedScalarClosure(
+              workspace, generic::EulerHdgLinearSolveRole::final_coherent,
+              result, final_closure_generation))
+        return result;
+      // The scalar projection contributes to the complete true-residual
+      // witness, but it must not replace the Euler nonlinear convergence
+      // residual reported for this accepted attempt.
+      const bool euler_frozen =
+          CudaLaunchPartitionedBackwardEulerStateAudit(
+              view_, shape_, false) && StatusPassed() &&
+          result.final_residual == final_nonlinear_residual;
+      if (!CollectiveContinue(euler_frozen))
+      {
+        result.reason = FailureReason::recovery_gate;
+        return result;
+      }
+      result.true_relative_residual = std::max(
+          frozen_euler_true_relative_residual,
+          result.true_relative_residual);
+      last_product_generation = final_closure_generation;
+      result.recovery = true;
+      result.candidate_ready = true;
+      result.products = {last_product_generation,
+                         last_product_generation,
+                         last_product_generation,
+                         last_product_generation,
+                         0};
+    }
     bool admissibility_launched = false;
     {
       ::dg_igr::NVTXRange profile_region(
@@ -4044,7 +4382,7 @@ public:
     if (config.force_private_scientific_gate_failure)
       result.true_residual = false;
     if (inject_at(CudaFailurePhase::diagnostics)) { return result; }
-    if (shape_.borrowed_host_inputs)
+    if (shape_.borrowed_host_inputs && !partitioned_backward_euler_)
     {
       bool conservation_ready = false;
       {
@@ -4116,7 +4454,24 @@ public:
             result.newton_correction_linear_iterations +
                 result.final_coherent_linear_iterations &&
         result.linear_solve_attempts ==
-            result.trace_solves + result.true_residual_tightenings;
+            result.trace_solves + result.true_residual_tightenings &&
+        result.scalar_closure_solves >= 0 &&
+        result.scalar_closure_linear_iterations >= 0 &&
+        result.scalar_closure_linear_solve_attempts >=
+            result.scalar_closure_solves &&
+        result.scalar_closure_true_residual_tightenings >= 0 &&
+        result.scalar_closure_linear_iterations <=
+            result.final_coherent_linear_iterations &&
+        result.scalar_closure_linear_solve_attempts <=
+            result.linear_solve_attempts &&
+        result.scalar_closure_true_residual_tightenings <=
+            result.true_residual_tightenings &&
+        result.scalar_closure_linear_solve_attempts ==
+            result.scalar_closure_solves +
+                result.scalar_closure_true_residual_tightenings &&
+        (partitioned_backward_euler_
+             ? result.scalar_closure_solves >= 1
+             : result.scalar_closure_solves == 0);
     const bool element_schwarz_selected =
         CudaTracePreconditionerIsNativeElementSchwarz(
             trace_preconditioner_);
@@ -5034,6 +5389,8 @@ private:
       layout.interior = interior;
       layout.local_trace = local_trace;
       layout.true_trace = true_trace;
+      layout.partitioned_base_interior =
+          partitioned_backward_euler_ ? interior : 0;
       layout.element_faces = element_faces;
       layout.face_h = shape_.igr_active ? element_faces : 0;
       valid = valid && checked_product(element_faces, conserved_components,
@@ -5122,11 +5479,11 @@ private:
 
       if (!generic) return true;
       std::size_t doubles = 0;
-      std::size_t ten_interior = 0, four_true = 0, three_element_trace = 0;
+      std::size_t nine_interior = 0, four_true = 0, three_element_trace = 0;
       std::size_t two_coupling = 0, two_local_matrix = 0;
       std::size_t two_element_trace = 0, three_local_matrix = 0;
       std::size_t four_element_trace = 0;
-      valid = checked_product(interior, 10, ten_interior) &&
+      valid = checked_product(interior, 9, nine_interior) &&
           checked_product(true_trace, 4, four_true) &&
           checked_product(layout.element_trace, 3, three_element_trace) &&
           checked_product(layout.element_coupling, 2, two_coupling) &&
@@ -5134,7 +5491,7 @@ private:
           checked_product(layout.element_trace, 2, two_element_trace) &&
           checked_product(layout.local_matrix, 3, three_local_matrix) &&
           checked_product(layout.element_trace, 4, four_element_trace) &&
-          checked_add(doubles, ten_interior) &&
+          checked_add(doubles, nine_interior) &&
           checked_add(doubles, four_true) && checked_add(doubles, local_trace) &&
           checked_add(doubles, three_element_trace) && checked_add(doubles, interior) &&
           checked_add(doubles, layout.element_trace) &&
@@ -5156,6 +5513,8 @@ private:
           (!shape_.borrowed_static_boundary_policies ||
            (checked_add(doubles, layout.boundary_reference) &&
             checked_add(doubles, layout.boundary_pressure))) &&
+          (!partitioned_backward_euler_ ||
+           checked_add(doubles, layout.partitioned_base_interior)) &&
           (!native_trace ||
            (checked_add(doubles, layout.native_ilu_inverse_diagonal) &&
             checked_add(doubles,
@@ -5333,16 +5692,19 @@ private:
       const CudaNativeIlu0FactorView& factor,
       const CudaNativeElementSchwarzView& element_schwarz,
       std::uint64_t matrix_generation,
+      CudaNativeTraceActiveSubspace active_subspace,
       double requested_relative_tolerance,
       CudaSolveDiagnostics& diagnostics,
       CudaNativeTraceSolveObservation* observation = nullptr) noexcept;
   bool SolveTrueSystemAttempt(double& true_relative_residual,
                        std::uint64_t matrix_generation,
+                       CudaNativeTraceActiveSubspace active_subspace,
                        double requested_relative_tolerance,
                        bool same_matrix_retry,
                        int& linear_iterations,
                        CudaTensorCoreEvidence& tensor_core_evidence) noexcept;
   bool SolveTrueSystem(generic::EulerHdgLinearSolveRole role,
+                       CudaNativeTraceActiveSubspace active_subspace,
                        double& true_relative_residual,
                        std::uint64_t matrix_generation,
                        int& linear_iterations,
@@ -5352,6 +5714,16 @@ private:
   bool AssembleAndNorm(state_slot& workspace, double dt,
                        double& norm,
                        CudaTensorCoreEvidence& tensor_core_evidence) noexcept;
+  bool AssemblePartitionedScalarClosure(
+      state_slot& workspace, double dt, double& norm,
+      CudaTensorCoreEvidence& tensor_core_evidence) noexcept;
+  bool PartitionedAuxiliaryNorm(
+      state_slot& workspace, double& norm) noexcept;
+  bool BootstrapPartitionedScalarClosure(const CudaConfig& config) noexcept;
+  bool SolvePartitionedScalarClosure(
+      state_slot& workspace, generic::EulerHdgLinearSolveRole role,
+      CudaNumericalResult& result,
+      std::uint64_t& product_generation) noexcept;
   bool CopyBase(state_slot& workspace) noexcept;
   bool RestoreBase(state_slot& workspace) noexcept;
   bool UpdateStateHashes(state_slot& workspace) noexcept;
@@ -5383,8 +5755,14 @@ private:
   bool tensor_core_hardware_supported_ = false;
   bool oracle_captured_ = false;
   bool oracle_capture_requested_ = false;
+  bool partitioned_backward_euler_ = false;
+  bool committed_scalar_closure_coherent_ = false;
+  StateHash committed_scalar_closure_interior_hash_{};
+  StateHash committed_scalar_closure_trace_hash_{};
   generic::CudaEngineKind cuda_engine_ =
       generic::CudaEngineKind::ordinary;
+  generic::EulerHdgTimeTreatment time_treatment_ =
+      generic::EulerHdgTimeTreatment::backward_euler;
   CudaTraceSolverKind trace_solver_kind_ =
       CudaTraceSolverKind::unconfigured;
   CudaTracePolicyDescriptor trace_policy_descriptor_{};
@@ -5488,6 +5866,7 @@ private:
   double final_coherent_linear_relative_tolerance_ = 1.0e-13;
   double true_residual_tightening_linear_relative_tolerance_ = 1.0e-13;
   double true_residual_relative_tolerance_ = 1.0e-10;
+  double nonlinear_relative_tolerance_ = 1.0e-10;
   int maximum_linear_iterations_ = 400;
   int krylov_dimension_ = 20;
   std::size_t host_exchange_bytes_ = 0;

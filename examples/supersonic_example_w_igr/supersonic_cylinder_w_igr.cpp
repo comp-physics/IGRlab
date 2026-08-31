@@ -50,6 +50,7 @@
 
 #include "mfem.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <memory>
 
@@ -176,6 +177,57 @@ int main(int argc, char* argv[])
     bc.AddSlipWall(markers);
     bc.AddSlipWall(markers, dg_sim::BoundaryRole::Cylinder);
   };
+
+#if defined(DG_IGR_HAS_HDG_MAIN_BACKEND) && DG_IGR_HAS_HDG_MAIN_BACKEND
+  spec.make_hdg_case_data = [](const SupersonicIGROptions& opts,
+                                const dg_sim::CaseConfig& case_config,
+                                const dg_sim::CommonOptions& options,
+                                const dg_sim::CaseContext& context)
+  {
+    dg_sim::hdg::HdgEulerCaseData data;
+    data.numerical_policy =
+      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(options.order);
+
+    mfem::Vector Uin(4);
+    Uin(0) = 1.4;
+    Uin(1) = 1.4 * opts.inflow.vx;
+    Uin(2) = 1.4 * opts.inflow.vy;
+    Uin(3) = 8.8;
+
+    // The legacy case's smoothed startup depends only on the globally reduced
+    // hmin; c_alpha and its length-scale policy do not change that quantity.
+    const double hmin =
+      dg_sim::ComputeAlphaInfo(
+        context.Mesh(),
+        /*c_alpha_user=*/1.0,
+        case_config.igr_config.alpha_length_scale_policy)
+        .hmin;
+    const double delta = std::max(8.0 * hmin, 0.08);
+    auto initial_condition =
+      mfem::SupersonicCylinderSmoothedNormalVelocityIC(Uin,
+                                                       case_config.gamma,
+                                                       /*xc=*/0.6,
+                                                       /*yc=*/0.0,
+                                                       /*r_cyl=*/0.25,
+                                                       delta);
+    data.initial_condition =
+      std::make_unique<mfem::VectorFunctionCoefficient>(initial_condition);
+
+    const auto markers = dg_sim::BuildBoundaryMarkers(
+      context.Mesh(),
+      {{dg_sim::BoundaryRole::Inlet, {4}},
+       {dg_sim::BoundaryRole::Outlet, {2}},
+       {dg_sim::BoundaryRole::Slip, {1, 3}},
+       {dg_sim::BoundaryRole::Cylinder, {5}}});
+    data.boundary_plan.AddSupersonicInlet(
+      markers.At(dg_sim::BoundaryRole::Inlet), [Uin] { return Uin; });
+    data.boundary_plan.AddSupersonicOutlet(
+      markers.At(dg_sim::BoundaryRole::Outlet));
+    data.boundary_plan.AddSlipWall(markers.At(dg_sim::BoundaryRole::Slip));
+    data.boundary_plan.AddSlipWall(markers.At(dg_sim::BoundaryRole::Cylinder));
+    return data;
+  };
+#endif
 
   spec.postprocess = [](const SupersonicIGROptions&,
                         const dg_sim::ExampleContext&,
