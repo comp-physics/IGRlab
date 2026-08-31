@@ -4339,14 +4339,19 @@ public:
         result.reason = FailureReason::backend_failure;
         return result;
       }
+      const double final_nonlinear_residual = result.final_residual;
       std::uint64_t final_closure_generation = 0;
       if (!SolvePartitionedScalarClosure(
               workspace, generic::EulerHdgLinearSolveRole::final_coherent,
               result, final_closure_generation))
         return result;
+      // The scalar projection contributes to the complete true-residual
+      // witness, but it must not replace the Euler nonlinear convergence
+      // residual reported for this accepted attempt.
       const bool euler_frozen =
           CudaLaunchPartitionedBackwardEulerStateAudit(
-              view_, shape_, false) && StatusPassed();
+              view_, shape_, false) && StatusPassed() &&
+          result.final_residual == final_nonlinear_residual;
       if (!CollectiveContinue(euler_frozen))
       {
         result.reason = FailureReason::recovery_gate;

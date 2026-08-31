@@ -3899,7 +3899,6 @@ SolvePartitionedScalarClosure(
   result.scalar_closure_linear_solve_attempts += solve_attempts;
   result.scalar_closure_true_residual_tightenings += tightenings;
   result.true_relative_residual = true_relative_residual;
-  result.final_residual = true_relative_residual;
   const bool distributed = DistributeTraceIncrement();
   result.phase = CudaFailurePhase::recovery;
   bool recovered = false;
