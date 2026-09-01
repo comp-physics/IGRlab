@@ -13,6 +13,7 @@
  */
 
 #include "numerics/hdg/runtime/app/application_contract.hpp"
+#include "sim/hdg/transactional_time_adapter.hpp"
 
 #include <array>
 #include <cstddef>
@@ -376,6 +377,83 @@ struct DecodedCheckpointMetadataV1
   std::uint64_t aggregate_true_trace_coefficients = 0;
   StateHash artifact_hash{};
 };
+
+/**
+ * Fieldwise view of one committed rank-local generic CUDA HDG checkpoint.
+ *
+ * The two coefficient pointers are encode-time views only.  Pointer values,
+ * CUDA storage tokens, object padding, and affine facade authorities are not
+ * part of the artifact schema.
+ */
+struct GenericHdgCudaCheckpointRankViewV1
+{
+  std::uint32_t source_rank = 0;
+  std::uint32_t rank_count = 0;
+  AttemptIdentity attempt{};
+  CheckpointDescriptor descriptor{};
+  StateHash local_mesh_hash{};
+  StateHash local_partition_hash{};
+  StateHash local_topology_hash{};
+  StateHash local_interior_hash{};
+  StateHash local_trace_hash{};
+  const double* interior = nullptr;
+  std::uint64_t interior_count = 0;
+  const double* owned_true_trace = nullptr;
+  std::uint64_t owned_true_trace_count = 0;
+  bool successful_commit = false;
+};
+
+/** Owned, pointer-free decode result for one rank-local CUDA checkpoint. */
+struct GenericHdgCudaOwnedRankCheckpointV1
+{
+  std::uint32_t source_rank = 0;
+  std::uint32_t rank_count = 0;
+  AttemptIdentity attempt{};
+  CheckpointDescriptor descriptor{};
+  StateHash local_mesh_hash{};
+  StateHash local_partition_hash{};
+  StateHash local_topology_hash{};
+  StateHash local_interior_hash{};
+  StateHash local_trace_hash{};
+  std::vector<double> interior;
+  std::vector<double> owned_true_trace;
+};
+
+/** Complete committed-boundary generic CUDA HDG restart artifact. */
+struct GenericHdgCudaCheckpointArtifactV1
+{
+  std::uint32_t schema_version = 0;
+  StateHash numerical_identity{};
+  dg_sim::hdg::HdgTransactionalTimeAdapterState time_state{};
+  std::vector<GenericHdgCudaOwnedRankCheckpointV1> ranks;
+  StateHash artifact_hash{};
+};
+
+inline constexpr std::uint32_t generic_hdg_cuda_checkpoint_codec_version_v1 =
+    1;
+inline constexpr std::size_t generic_hdg_cuda_checkpoint_maximum_bytes_v1 =
+    256U * 1024U * 1024U;
+
+/** Canonical SHA-256 used for the caller's fieldwise numerical identity. */
+StateHash CheckpointSha256V1(ConstByteView bytes) noexcept;
+
+/** Encode one complete committed PDE/time boundary without object bytes. */
+CheckpointCodecStatus EncodeGenericHdgCudaCheckpointV1(
+    const StateHash& numerical_identity,
+    const dg_sim::hdg::HdgTransactionalTimeAdapterState& time_state,
+    const GenericHdgCudaCheckpointRankViewV1* ranks,
+    std::size_t rank_count,
+    std::vector<std::uint8_t>& encoded);
+
+/**
+ * Decode into temporary owned values, validate all hashes/identities, then
+ * replace @p artifact only after the complete artifact has passed.
+ */
+CheckpointCodecStatus DecodeGenericHdgCudaCheckpointV1(
+    ConstByteView encoded,
+    const StateHash& expected_numerical_identity,
+    std::uint32_t expected_rank_count,
+    GenericHdgCudaCheckpointArtifactV1& artifact);
 
 CheckpointCodecStatus EncodeCheckpointV1(
     const CapturedCheckpointV1& checkpoint,

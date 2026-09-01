@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -136,15 +137,42 @@ bool Run(const std::filesystem::path& output)
       mesh,
       output_fields.Fields(),
       {output.string(), "hdg_physical", mfem::VTKFormat::ASCII, 1, false}};
-  dg_sim::hdg::HDGParaViewSeries publisher(request);
-  publisher.Write({3, 20, 1.25});
-  publisher.Write({4, 25, 1.5});
+  {
+    dg_sim::hdg::HDGParaViewSeries publisher(request);
+    publisher.Write({3, 20, 1.25});
+    publisher.Write({4, 25, 1.5});
+  }
+  request.options.restart =
+      dg_sim::hdg::HDGParaViewOptions::RestartSeed{4, 1.5};
+  bool stale_cycle_rejected = false;
+  bool nonmonotone_time_rejected = false;
+  {
+    dg_sim::hdg::HDGParaViewSeries resumed(request);
+    resumed.Write({5, 30, 1.75});
+    resumed.Write({6, 35, 2.0});
+    try { resumed.Write({6, 40, 2.25}); }
+    catch (const std::invalid_argument&) { stale_cycle_rejected = true; }
+    try { resumed.Write({7, 40, 2.0}); }
+    catch (const std::invalid_argument&) { nonmonotone_time_rejected = true; }
+  }
+  bool stale_seed_rejected = false;
+  request.options.restart =
+      dg_sim::hdg::HDGParaViewOptions::RestartSeed{5, 1.75};
+  try
+  {
+    static_cast<void>(dg_sim::hdg::HDGParaViewSeries(request));
+  }
+  catch (const std::invalid_argument&) { stale_seed_rejected = true; }
   MPI_Barrier(MPI_COMM_WORLD);
 
   const std::filesystem::path first_cycle =
       output / "hdg_physical" / "Cycle000003";
   const std::filesystem::path second_cycle =
       output / "hdg_physical" / "Cycle000004";
+  const std::filesystem::path resumed_first_cycle =
+      output / "hdg_physical" / "Cycle000005";
+  const std::filesystem::path resumed_second_cycle =
+      output / "hdg_physical" / "Cycle000006";
   const std::filesystem::path first_local_vtu = first_cycle /
       (std::string("proc") +
        (rank == 0 ? "000000" : "000001") + ".vtu");
@@ -156,6 +184,10 @@ bool Run(const std::filesystem::path& output)
       "NumberOfCells=\"" + std::to_string(mesh.GetNE()) + "\"";
   bool passed = std::filesystem::exists(first_local_vtu) &&
       std::filesystem::exists(second_local_vtu) &&
+      std::filesystem::exists(resumed_first_cycle / rank_name.str()) &&
+      std::filesystem::exists(resumed_second_cycle / rank_name.str()) &&
+      stale_cycle_rejected && nonmonotone_time_rejected &&
+      stale_seed_rejected &&
       Contains(local_text, "Name=\"density\"") &&
       Contains(local_text, "Name=\"momentum\"") &&
       Contains(local_text, "Name=\"energy\"") &&
@@ -175,8 +207,12 @@ bool Run(const std::filesystem::path& output)
         Contains(pvd, "timestep=\"1.5\"") &&
         Contains(pvd, "Cycle000003/data.pvtu") &&
         Contains(pvd, "Cycle000004/data.pvtu") &&
+        Contains(pvd, "Cycle000005/data.pvtu") &&
+        Contains(pvd, "Cycle000006/data.pvtu") &&
         CountOccurrences(pvd, "Cycle000003/data.pvtu") == 1 &&
         CountOccurrences(pvd, "Cycle000004/data.pvtu") == 1 &&
+        CountOccurrences(pvd, "Cycle000005/data.pvtu") == 1 &&
+        CountOccurrences(pvd, "Cycle000006/data.pvtu") == 1 &&
         !Contains(pvd, "stale-history-cycle-000002") &&
         Contains(first_pvtu, "proc000000.vtu") &&
         Contains(second_pvtu, "proc000000.vtu");

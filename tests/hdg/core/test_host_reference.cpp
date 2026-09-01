@@ -214,6 +214,72 @@ int TestDelayedPivotRecovery()
   return 0;
 }
 
+int TestRetainedOperatorRightHandSideRefresh()
+{
+  constexpr LocalIndex batches = 2, ni = 2, nt = 2;
+  std::array<double,8> a{{4.,1.,2.,3., 3.,-1.,1.,2.}};
+  std::array<double,8> b{{1.,0.,0.,1., 2.,1.,1.,-1.}};
+  std::array<double,8> c{{2.,-1.,1.,2., 1.,3.,-2.,1.}};
+  std::array<double,8> d{{5.,.5,.5,4., 6.,1.,1.,3.}};
+  std::array<double,4> first_f{{1.,2., 4.,-1.}};
+  std::array<double,4> first_g{{3.,4., 2.,5.}};
+  std::array<double,4> next_f{{-2.,.5, 1.25,3.}};
+  std::array<double,4> next_g{{1.,-4., .75,2.5}};
+  std::array<double,8> retained_schur{}, rebuilt_schur{};
+  std::array<double,4> first_rhs{}, refreshed_rhs{}, rebuilt_rhs{};
+  const LocalSystemBatchView first{{ni,nt,1,1},
+      ConstView(a.data(),batches,ni,ni), ConstView(b.data(),batches,ni,nt),
+      ConstView(c.data(),batches,nt,ni), ConstView(d.data(),batches,nt,nt),
+      ConstView(first_f.data(),batches,ni,1),
+      ConstView(first_g.data(),batches,nt,1)};
+  const LocalSystemBatchView rebuilt{{ni,nt,1,1},
+      ConstView(a.data(),batches,ni,ni), ConstView(b.data(),batches,ni,nt),
+      ConstView(c.data(),batches,nt,ni), ConstView(d.data(),batches,nt,nt),
+      ConstView(next_f.data(),batches,ni,1),
+      ConstView(next_g.data(),batches,nt,1)};
+  HostReferenceEngine retained, reference;
+  if (retained.Prepare({ni,nt,1,1}, batches) != Status::success ||
+      retained.Condense(first,
+          {View(retained_schur.data(),batches,nt,nt),
+           View(first_rhs.data(),batches,nt,1)}) != Status::success ||
+      retained.RefreshRightHandSide(
+          ConstView(next_f.data(),batches,ni,1),
+          ConstView(next_g.data(),batches,nt,1),
+          View(refreshed_rhs.data(),batches,nt,1)) != Status::success ||
+      reference.Condense(rebuilt,
+          {View(rebuilt_schur.data(),batches,nt,nt),
+           View(rebuilt_rhs.data(),batches,nt,1)}) != Status::success ||
+      !LogicalNear(ConstView(retained_schur.data(),batches,nt,nt),
+                   ConstView(rebuilt_schur.data(),batches,nt,nt)) ||
+      !LogicalNear(ConstView(refreshed_rhs.data(),batches,nt,1),
+                   ConstView(rebuilt_rhs.data(),batches,nt,1)))
+  {
+    return 1;
+  }
+
+  std::array<double,4> trace{{.25,-.75,1.5,.5}};
+  std::array<double,4> retained_interior{}, rebuilt_interior{};
+  if (retained.Recover(ConstView(trace.data(),batches,nt,1),
+                       View(retained_interior.data(),batches,ni,1)) !=
+          Status::success ||
+      reference.Recover(ConstView(trace.data(),batches,nt,1),
+                        View(rebuilt_interior.data(),batches,ni,1)) !=
+          Status::success ||
+      !LogicalNear(ConstView(retained_interior.data(),batches,ni,1),
+                   ConstView(rebuilt_interior.data(),batches,ni,1)))
+  {
+    return 2;
+  }
+  std::array<double,4> sentinel{};
+  sentinel.fill(-91.);
+  auto bad = ConstView(next_f.data(), batches, ni, 1);
+  bad.column_stride = 0;
+  return retained.RefreshRightHandSide(
+             bad, ConstView(next_g.data(),batches,nt,1),
+             View(sentinel.data(),batches,nt,1)) == Status::invalid_view &&
+         AllEqual(sentinel,-91.) ? 0 : 3;
+}
+
 int TestWritableLayoutsAndOverlap()
 {
   constexpr LocalIndex batches=2, ni=2, nt=2;
@@ -402,6 +468,8 @@ int main()
   if(parity!=0) return parity;
   const int delayed_pivot=TestDelayedPivotRecovery();
   if(delayed_pivot!=0) return 10+delayed_pivot;
+  const int refreshed=TestRetainedOperatorRightHandSideRefresh();
+  if(refreshed!=0) return 20+refreshed;
   const int writable=TestWritableLayoutsAndOverlap();
-  return writable==0 ? TestFailuresAndCensus() : 20+writable;
+  return writable==0 ? TestFailuresAndCensus() : 30+writable;
 }

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1346,9 +1347,13 @@ bool CudaQueryNativeRankOneTraceResources(
   const bool coupled_warp_full_patch =
       CudaTracePreconditionerIsNativeElementSchwarzWarpCoupled(
           preconditioner_kind);
+  const bool use_cgs2 = CudaTracePreconditionerIsIlu(preconditioner_kind) ||
+      CudaTracePreconditionerIsNativeElementSchwarz(preconditioner_kind);
+  if ((fixed_sigma_jacobi || coupled_warp_full_patch) && !igr_active)
+    return false;
   const NativeTraceCooperativeSupport native_support =
       QueryNativeRankOneTraceCooperativeSupport(
-          rows, krylov_dimension, igr_active, fixed_sigma_jacobi,
+          rows, krylov_dimension, use_cgs2, fixed_sigma_jacobi,
           coupled_warp_full_patch);
   support.supported = native_support.supported;
   support.fixed_sigma_jacobi = native_support.fixed_sigma_jacobi;
@@ -1366,7 +1371,7 @@ bool CudaQueryNativeRankOneTraceResources(
     return false;
   const NativeTraceWorkspaceRequirements native_requirements =
       QueryNativeTraceWorkspaceRequirements(
-          rows, krylov_dimension, support.cooperative_blocks, igr_active);
+          rows, krylov_dimension, support.cooperative_blocks, use_cgs2);
   requirements.valid = native_requirements.valid;
   requirements.basis_doubles = native_requirements.basis_doubles;
   requirements.vector_doubles = native_requirements.vector_doubles;
@@ -3369,6 +3374,81 @@ __device__ bool LocalLlfSpeed(const double* state, const double nx,
   return isfinite(sound) && isfinite(speed) && speed > 0.0;
 }
 
+__device__ bool LocalLlfRadiusGradient(
+    const double* state, const double nx, const double ny,
+    double& radius, double* gradient)
+{
+  if (!PhysicallyAdmissible(state) || !isfinite(nx) || !isfinite(ny) ||
+      (nx == 0.0 && ny == 0.0))
+    return false;
+  const double density = state[0];
+  const double momentum_squared = state[1] * state[1] +
+      state[2] * state[2];
+  const double normal_momentum = state[1] * nx + state[2] * ny;
+  const double normal_velocity = normal_momentum / density;
+  const double pressure = (cuda_gamma - 1.0) *
+      (state[3] - 0.5 * momentum_squared / density);
+  const double sound = sqrt(cuda_gamma * pressure / density);
+  if (!(sound > 0.0) || !isfinite(sound)) return false;
+  const double velocity_sign = normal_velocity > 0.0 ? 1.0 :
+      normal_velocity < 0.0 ? -1.0 : 0.0;
+  const double thermodynamic_scale =
+      cuda_gamma * (cuda_gamma - 1.0) / (2.0 * sound);
+  const double inverse_density = 1.0 / density;
+  const double inverse_density_squared = inverse_density * inverse_density;
+  const double inverse_density_cubed =
+      inverse_density_squared * inverse_density;
+  gradient[0] = velocity_sign * (-normal_velocity * inverse_density) +
+      thermodynamic_scale *
+          (-state[3] * inverse_density_squared +
+           momentum_squared * inverse_density_cubed);
+  gradient[1] = velocity_sign * nx * inverse_density -
+      thermodynamic_scale * state[1] * inverse_density_squared;
+  gradient[2] = velocity_sign * ny * inverse_density -
+      thermodynamic_scale * state[2] * inverse_density_squared;
+  gradient[3] = thermodynamic_scale * inverse_density;
+  radius = fabs(normal_velocity) + sound;
+  bool valid = isfinite(radius) && radius > 0.0;
+  for (int component = 0; component < conserved_components; ++component)
+    valid = valid && isfinite(gradient[component]);
+  return valid;
+}
+
+// Exact active-branch derivative of the conventional borrowed LLF speed.
+// Equality selects the interior branch, matching the CPU RODAS3 Jacobian.
+__device__ bool LocalLlfSpeedGradient(
+    const double* interior, const double* trace,
+    const double nx, const double ny, double& stabilization,
+    double* interior_gradient, double* trace_gradient)
+{
+  double interior_radius = 0.0, trace_radius = 0.0;
+  double evaluated_interior[conserved_components] = {};
+  double evaluated_trace[conserved_components] = {};
+  if (!LocalLlfRadiusGradient(
+          interior, nx, ny, interior_radius, evaluated_interior) ||
+      !LocalLlfRadiusGradient(
+          trace, nx, ny, trace_radius, evaluated_trace))
+    return false;
+  for (int component = 0; component < conserved_components; ++component)
+  {
+    interior_gradient[component] = 0.0;
+    trace_gradient[component] = 0.0;
+  }
+  if (interior_radius >= trace_radius)
+  {
+    stabilization = interior_radius;
+    for (int component = 0; component < conserved_components; ++component)
+      interior_gradient[component] = evaluated_interior[component];
+  }
+  else
+  {
+    stabilization = trace_radius;
+    for (int component = 0; component < conserved_components; ++component)
+      trace_gradient[component] = evaluated_trace[component];
+  }
+  return isfinite(stabilization) && stabilization > 0.0;
+}
+
 __device__ bool MapStaticBoundaryKind(
     const int kind, mfem::detail::EulerBoundaryStateKind& mapped)
 {
@@ -3433,6 +3513,101 @@ __device__ bool StaticBoundaryExterior(
           reference, normal, interior, exterior))
     return false;
   return PhysicallyAdmissible(exterior);
+}
+
+// Deterministic FP64 derivative of the lowered static boundary map.  Two
+// centered widths plus Richardson extrapolation reject unresolved branch
+// changes.  Backward Euler never requests this path.
+__device__ bool StaticBoundaryExteriorJacobian(
+    const int kind, const double* reference, const double pressure_out,
+    const double gamma, const double* interior, const double normal_x,
+    const double normal_y, const double* exterior, double* jacobian)
+{
+  double repeated[conserved_components] = {};
+  if (!StaticBoundaryExterior(
+          kind, reference, pressure_out, gamma, interior,
+          normal_x, normal_y, repeated))
+    return false;
+  for (int row = 0; row < conserved_components; ++row)
+    if (repeated[row] != exterior[row]) return false;
+
+  constexpr int maximum_step_reductions = 8;
+  const double initial_relative_step = cbrt(DBL_EPSILON);
+  const double agreement_factor = 256.0 * sqrt(DBL_EPSILON);
+  for (int column = 0; column < conserved_components; ++column)
+  {
+    const double scale = fmax(1.0, fabs(interior[column]));
+    double width = initial_relative_step * scale;
+    bool column_ready = false;
+    for (int reduction = 0;
+         reduction < maximum_step_reductions && !column_ready;
+         ++reduction)
+    {
+      double coarse_plus[conserved_components];
+      double coarse_minus[conserved_components];
+      double fine_plus[conserved_components];
+      double fine_minus[conserved_components];
+      for (int component = 0; component < conserved_components; ++component)
+      {
+        coarse_plus[component] = interior[component];
+        coarse_minus[component] = interior[component];
+        fine_plus[component] = interior[component];
+        fine_minus[component] = interior[component];
+      }
+      coarse_plus[column] += width;
+      coarse_minus[column] -= width;
+      fine_plus[column] += 0.5 * width;
+      fine_minus[column] -= 0.5 * width;
+      if (!PhysicallyAdmissible(coarse_plus) ||
+          !PhysicallyAdmissible(coarse_minus) ||
+          !PhysicallyAdmissible(fine_plus) ||
+          !PhysicallyAdmissible(fine_minus))
+      {
+        width *= 0.5;
+        continue;
+      }
+      double coarse_plus_exterior[conserved_components] = {};
+      double coarse_minus_exterior[conserved_components] = {};
+      double fine_plus_exterior[conserved_components] = {};
+      double fine_minus_exterior[conserved_components] = {};
+      if (!StaticBoundaryExterior(
+              kind, reference, pressure_out, gamma, coarse_plus,
+              normal_x, normal_y, coarse_plus_exterior) ||
+          !StaticBoundaryExterior(
+              kind, reference, pressure_out, gamma, coarse_minus,
+              normal_x, normal_y, coarse_minus_exterior) ||
+          !StaticBoundaryExterior(
+              kind, reference, pressure_out, gamma, fine_plus,
+              normal_x, normal_y, fine_plus_exterior) ||
+          !StaticBoundaryExterior(
+              kind, reference, pressure_out, gamma, fine_minus,
+              normal_x, normal_y, fine_minus_exterior))
+      {
+        width *= 0.5;
+        continue;
+      }
+      column_ready = true;
+      for (int row = 0; row < conserved_components; ++row)
+      {
+        const double coarse =
+            (coarse_plus_exterior[row] - coarse_minus_exterior[row]) /
+            (2.0 * width);
+        const double fine =
+            (fine_plus_exterior[row] - fine_minus_exterior[row]) / width;
+        const double derivative = (4.0 * fine - coarse) / 3.0;
+        const double derivative_scale = fmax(
+            1.0, fmax(fabs(coarse), fmax(
+                fabs(fine), fmax(fabs(derivative),
+                                  fabs(exterior[row]) / scale))));
+        column_ready = column_ready && isfinite(derivative) &&
+            fabs(fine - coarse) <= agreement_factor * derivative_scale;
+        jacobian[row * conserved_components + column] = derivative;
+      }
+      if (!column_ready) width *= 0.5;
+    }
+    if (!column_ready) return false;
+  }
+  return true;
 }
 
 __device__ int Decode(const int encoded, double& sign)
@@ -3748,6 +3923,9 @@ struct BorrowedFaceCache
   double flux[conserved_components];
   double jacobian[conserved_components * igr_trace_components];
   double exterior[conserved_components];
+  double stabilization_interior_gradient[conserved_components];
+  double stabilization_trace_gradient[conserved_components];
+  double exterior_jacobian[conserved_components * conserved_components];
   double sigma;
   double sigma_hat;
   double z[dimension];
@@ -4039,8 +4217,9 @@ __global__ void BorrowedEulerVolumeKernel(CudaDeviceView v,CudaMeshShape s,
 }
 
 __device__ bool BorrowedEulerFaceElement(
-    CudaDeviceView v,CudaMeshShape s,const bool frozen_llf,const int e,
-    const int lane,const unsigned group_mask,BorrowedFaceCache& cache)
+    CudaDeviceView v,CudaMeshShape s,const bool frozen_llf,
+    const bool differentiate_nonlinearities,const int e,const int lane,
+    const unsigned group_mask,BorrowedFaceCache& cache)
 {
   if(v.status[e]!=1.0)return false;
   const int ni=s.interior_dofs,nt=s.trace_dofs;
@@ -4065,8 +4244,12 @@ __device__ bool BorrowedEulerFaceElement(
       // and Jacobian staging row.
       cache.interior[lane]=0.0;cache.trace[lane]=0.0;
       cache.flux[lane]=0.0;cache.exterior[lane]=0.0;
+      cache.stabilization_interior_gradient[lane]=0.0;
+      cache.stabilization_trace_gradient[lane]=0.0;
       for(int entry=0;entry<igr_trace_components;++entry)
         cache.jacobian[lane*igr_trace_components+entry]=0.0;
+      for(int entry=0;entry<conserved_components;++entry)
+        cache.exterior_jacobian[lane*conserved_components+entry]=0.0;
       for(int a=0;a<si;++a)
         cache.interior[lane]+=v.face_interior_shape[qp*si+a]*
             v.work_interior[e_i+ByNodes(a,si,lane)];
@@ -4109,6 +4292,15 @@ __device__ bool BorrowedEulerFaceElement(
         if(!s.igr_active)
         {
           if(frozen_llf)cache.stabilization=v.borrowed_lagged_llf_tau[qp];
+          else if(differentiate_nonlinearities)
+          {
+            if(!LocalLlfSpeedGradient(
+                    cache.interior,cache.trace,cache.normal[0],cache.normal[1],
+                    cache.stabilization,
+                    cache.stabilization_interior_gradient,
+                    cache.stabilization_trace_gradient))
+              cache.valid=-2;
+          }
           else
           {
             double interior_speed=0.0,trace_speed=0.0;
@@ -4130,13 +4322,23 @@ __device__ bool BorrowedEulerFaceElement(
         const int boundary_kind=s.borrowed_static_boundary_policies?
             v.boundary_policy_kind[e*faces_per_element+face]:0;
         cache.physical_boundary=boundary_kind!=0;
-        if(cache.valid==1&&cache.physical_boundary&&
-           !StaticBoundaryExterior(boundary_kind,
-              v.boundary_reference+(e*faces_per_element+face)*
-                  conserved_components,
-              v.boundary_pressure[e*faces_per_element+face],s.boundary_gamma,
-              cache.interior,cache.normal[0],cache.normal[1],cache.exterior))
-          cache.valid=-3;
+        if(cache.valid==1&&cache.physical_boundary)
+        {
+          const double* reference=v.boundary_reference+
+              (e*faces_per_element+face)*conserved_components;
+          const double pressure=v.boundary_pressure[
+              e*faces_per_element+face];
+          if(!StaticBoundaryExterior(
+                 boundary_kind,reference,pressure,s.boundary_gamma,
+                 cache.interior,cache.normal[0],cache.normal[1],
+                 cache.exterior)||
+             (differentiate_nonlinearities&&
+              !StaticBoundaryExteriorJacobian(
+                  boundary_kind,reference,pressure,s.boundary_gamma,
+                  cache.interior,cache.normal[0],cache.normal[1],
+                  cache.exterior,cache.exterior_jacobian)))
+            cache.valid=-3;
+        }
         if(cache.valid==1&&s.igr_active)
         {
           const double h=v.face_h[e*faces_per_element+face];
@@ -4169,16 +4371,26 @@ __device__ bool BorrowedEulerFaceElement(
               (cache.flux[component]+cache.stabilization*
                   (cache.interior[component]-cache.trace[component]));
           for(int col=0;col<si;++col)
-            v.a[ao+interior_row*ni+ByNodes(col,si,component)]+=
-                cache.weight*rp*cache.stabilization*
-                    v.face_interior_shape[qp*si+col];
+            for(int cc=0;cc<conserved_components;++cc)
+            {
+              const double derivative=(component==cc?
+                      cache.stabilization:0.0)+
+                  (cache.interior[component]-cache.trace[component])*
+                      cache.stabilization_interior_gradient[cc];
+              v.a[ao+interior_row*ni+ByNodes(col,si,cc)]+=
+                  cache.weight*rp*v.face_interior_shape[qp*si+col]*
+                      derivative;
+            }
           const int columns=s.igr_active?igr_trace_components:
               conserved_components;
           for(int col=0;col<sf;++col)for(int cc=0;cc<columns;++cc)
             v.b[bo+interior_row*nt+to+ByNodes(col,sf,cc)]+=
                 cache.weight*rp*v.face_trace_shape[qp*sf+col]*
                 (cache.jacobian[component*columns+cc]-
-                 (component==cc?cache.stabilization:0.0));
+                 (component==cc?cache.stabilization:0.0)+
+                 (cache.interior[component]-cache.trace[component])*
+                     (cc<conserved_components?
+                          cache.stabilization_trace_gradient[cc]:0.0));
         }
         else if(s.igr_active&&component<6)
         {
@@ -4230,11 +4442,19 @@ __device__ bool BorrowedEulerFaceElement(
                   cache.trace[component]-cache.exterior[component]:
                   cache.flux[component]+cache.stabilization*
                       (cache.interior[component]-cache.trace[component]));
-          if(!cache.physical_boundary)
-            for(int col=0;col<si;++col)
-              v.c[co+trace_row*ni+ByNodes(col,si,component)]+=
-                  cache.weight*rp*cache.stabilization*
-                      v.face_interior_shape[qp*si+col];
+          for(int col=0;col<si;++col)
+            for(int cc=0;cc<conserved_components;++cc)
+            {
+              const double derivative=cache.physical_boundary?
+                  -cache.exterior_jacobian[
+                      component*conserved_components+cc]:
+                  (component==cc?cache.stabilization:0.0)+
+                  (cache.interior[component]-cache.trace[component])*
+                      cache.stabilization_interior_gradient[cc];
+              v.c[co+trace_row*ni+ByNodes(col,si,cc)]+=
+                  cache.weight*rp*v.face_interior_shape[qp*si+col]*
+                      derivative;
+            }
           const int columns=s.igr_active?igr_trace_components:
               conserved_components;
           for(int col=0;col<sf;++col)for(int cc=0;cc<columns;++cc)
@@ -4242,7 +4462,10 @@ __device__ bool BorrowedEulerFaceElement(
                 cache.weight*rp*v.face_trace_shape[qp*sf+col]*
                 (cache.physical_boundary?(component==cc?1.0:0.0):
                  cache.jacobian[component*columns+cc]-
-                    (component==cc?cache.stabilization:0.0));
+                    (component==cc?cache.stabilization:0.0)+
+                    (cache.interior[component]-cache.trace[component])*
+                        (cc<conserved_components?
+                             cache.stabilization_trace_gradient[cc]:0.0));
         }
         else if(s.igr_active&&component==4)
         {
@@ -4279,7 +4502,8 @@ __device__ bool BorrowedEulerFaceElement(
 }
 
 __global__ void BorrowedEulerFaceKernel(CudaDeviceView v,CudaMeshShape s,
-                                        bool frozen_llf)
+                                        bool frozen_llf,
+                                        bool differentiate_nonlinearities)
 {
   const int group=threadIdx.x/borrowed_euler_group_threads;
   const int lane=threadIdx.x%borrowed_euler_group_threads;
@@ -4290,7 +4514,8 @@ __global__ void BorrowedEulerFaceKernel(CudaDeviceView v,CudaMeshShape s,
   if(e>=s.elements)return;
   __shared__ BorrowedFaceCache caches[borrowed_euler_elements_per_block];
   (void)BorrowedEulerFaceElement(
-      v,s,frozen_llf,e,lane,group_mask,caches[group]);
+      v,s,frozen_llf,differentiate_nonlinearities,e,lane,group_mask,
+      caches[group]);
 }
 
 // Retain the established full-width condensation storage while replacing the
@@ -4502,6 +4727,416 @@ __global__ void PartitionedScalarClosureRestoreEulerKernel(
     if(index/scalar_count<conserved_components)
       v.work_true_trace[index]=v.base_true_trace[index];
   }
+}
+
+// The singular mass owns only the four volume Euler components.  Algebraic
+// reconstruction therefore freezes those rows/columns and leaves every trace
+// component plus the IGR auxiliary volume block active.
+__global__ void RodasAlgebraicMaskKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int element=blockIdx.x;
+  if(element>=s.elements)return;
+  const int ni=s.interior_dofs,nt=s.trace_dofs;
+  const int si=s.scalar_interior_dofs;
+  const int e_i=element*ni;
+  const std::size_t ao=static_cast<std::size_t>(element)*ni*ni;
+  const std::size_t bo=static_cast<std::size_t>(element)*ni*nt;
+  const std::size_t co=static_cast<std::size_t>(element)*nt*ni;
+  for(int row=threadIdx.x;row<ni;row+=blockDim.x)
+    if(row/si<conserved_components)
+    {
+      v.residual_r[e_i+row]=0.0;
+      v.f[e_i+row]=0.0;
+    }
+  for(int entry=threadIdx.x;entry<ni*ni;entry+=blockDim.x)
+  {
+    const int row=entry/ni,column=entry-row*ni;
+    if(row/si<conserved_components||column/si<conserved_components)
+      v.a[ao+entry]=row==column?1.0:0.0;
+  }
+  for(int entry=threadIdx.x;entry<ni*nt;entry+=blockDim.x)
+  {
+    const int row=entry/nt;
+    if(row/si<conserved_components)v.b[bo+entry]=0.0;
+  }
+  for(int entry=threadIdx.x;entry<nt*ni;entry+=blockDim.x)
+  {
+    const int column=entry%ni;
+    if(column/si<conserved_components)v.c[co+entry]=0.0;
+  }
+  __syncthreads();
+  if(threadIdx.x==0)v.status[element]=1.0;
+}
+
+__global__ void RodasFreezeDifferentialIncrementKernel(
+    CudaDeviceView v,CudaMeshShape s)
+{
+  const int index=blockIdx.x*blockDim.x+threadIdx.x;
+  if(index<s.interior_count)
+  {
+    const int local=index%s.interior_dofs;
+    if(local/s.scalar_interior_dofs<conserved_components)
+      v.recovered_interior[index]=0.0;
+  }
+}
+
+__global__ void RodasRestoreDifferentialStateKernel(
+    CudaDeviceView v,CudaMeshShape s)
+{
+  const int index=blockIdx.x*blockDim.x+threadIdx.x;
+  if(index<s.interior_count)
+  {
+    const int local=index%s.interior_dofs;
+    if(local/s.scalar_interior_dofs<conserved_components)
+      v.work_interior[index]=v.base_interior[index];
+  }
+}
+
+static __device__ __forceinline__ double RodasAlpha(
+    const int stage,const int prior)
+{
+  if(stage==2&&prior==0)return 1.0;
+  if(stage==3&&prior==0)return 0.75;
+  if(stage==3&&prior==1)return -0.25;
+  if(stage==3&&prior==2)return 0.5;
+  return 0.0;
+}
+
+static __device__ __forceinline__ double RodasGamma(
+    const int stage,const int prior)
+{
+  if(stage==1&&prior==0)return 1.0;
+  if(stage==2&&(prior==0||prior==1))return -0.25;
+  if(stage==3&&(prior==0||prior==1))return 1.0/12.0;
+  if(stage==3&&prior==2)return -2.0/3.0;
+  return 0.0;
+}
+
+static __device__ __forceinline__ double RodasPrincipalWeight(
+    const int stage)
+{
+  return stage==0?5.0/6.0:stage==1?-1.0/6.0:
+      stage==2?-1.0/6.0:0.5;
+}
+
+static __device__ __forceinline__ double RodasErrorWeight(
+    const int stage)
+{
+  return stage==0?1.0/12.0:stage==1?1.0/12.0:
+      stage==2?-2.0/3.0:0.5;
+}
+
+__global__ void RodasLoadStageKernel(CudaDeviceView v,CudaMeshShape s,
+                                     int stage)
+{
+  const int index=blockIdx.x*blockDim.x+threadIdx.x;
+  if(index<s.interior_count)
+  {
+    double value=v.base_interior[index];
+    for(int prior=0;prior<stage;++prior)
+      value+=RodasAlpha(stage,prior)*v.rodas_stage_interior[prior][index];
+    v.work_interior[index]=value;
+  }
+  if(index<s.true_trace_count)
+  {
+    double value=v.base_true_trace[index];
+    for(int prior=0;prior<stage;++prior)
+      value+=RodasAlpha(stage,prior)*v.rodas_stage_true_trace[prior][index];
+    v.work_true_trace[index]=value;
+  }
+}
+
+__global__ void RodasCombinationKernel(CudaDeviceView v,CudaMeshShape s,
+                                       int stage)
+{
+  const int index=blockIdx.x*blockDim.x+threadIdx.x;
+  if(index<s.interior_count)
+  {
+    double value=0.0;
+    for(int prior=0;prior<stage;++prior)
+      value+=RodasGamma(stage,prior)*v.rodas_stage_interior[prior][index];
+    v.rodas_combination_interior[index]=value;
+  }
+  if(index<s.true_trace_count)
+  {
+    double value=0.0;
+    for(int prior=0;prior<stage;++prior)
+      value+=RodasGamma(stage,prior)*
+          v.rodas_stage_true_trace[prior][index];
+    v.rodas_combination_true_trace[index]=value;
+  }
+}
+
+__global__ void RodasStageRightHandSideKernel(
+    CudaDeviceView v,CudaMeshShape s,double step_size)
+{
+  const int element=blockIdx.x;
+  if(element>=s.elements)return;
+  constexpr double gamma=0.5;
+  const int ni=s.interior_dofs,nt=s.trace_dofs;
+  const int si=s.scalar_interior_dofs;
+  const int e_i=element*ni,e_t=element*nt;
+  __shared__ int invalid;
+  if(threadIdx.x==0)invalid=0;
+  __syncthreads();
+  for(int row=threadIdx.x;row<ni;row+=blockDim.x)
+  {
+    const int component=row/si;
+    const int scalar=row-component*si;
+    double mass_action=0.0;
+    if(component<conserved_components)
+      for(int q=0;q<s.volume_points;++q)
+      {
+        const int qp=element*s.volume_points+q;
+        double combination=0.0;
+        for(int column=0;column<si;++column)
+          combination+=v.volume_shape[qp*si+column]*
+              v.rodas_combination_interior[
+                  e_i+ByNodes(column,si,component)];
+        mass_action+=v.volume_weight[qp]*v.volume_shape[qp*si+scalar]*
+            combination/(gamma*step_size);
+      }
+    const double value=(v.rodas_residual_f[e_i+row]+mass_action)/gamma;
+    v.f[e_i+row]=value;
+    v.residual_r[e_i+row]=-value;
+    if(!isfinite(value))atomicExch(&invalid,1);
+  }
+  for(int row=threadIdx.x;row<nt;row+=blockDim.x)
+  {
+    const double value=v.rodas_residual_g[e_t+row]/gamma;
+    v.g[e_t+row]=value;
+    v.residual_g[e_t+row]=-value;
+    if(!isfinite(value))atomicExch(&invalid,1);
+  }
+  __syncthreads();
+  if(threadIdx.x==0)v.status[element]=invalid?-1.0:1.0;
+}
+
+__global__ void RodasCaptureStageKernel(CudaDeviceView v,CudaMeshShape s,
+                                        int stage)
+{
+  const int element=blockIdx.x;
+  if(element>=s.elements)return;
+  constexpr double inverse_gamma=2.0;
+  __shared__ int invalid;
+  if(threadIdx.x==0)invalid=0;
+  __syncthreads();
+  const int begin=element*s.interior_dofs;
+  for(int local=threadIdx.x;local<s.interior_dofs;local+=blockDim.x)
+  {
+    const int index=begin+local;
+    const double value=v.recovered_interior[index]-inverse_gamma*
+        v.rodas_combination_interior[index];
+    v.rodas_stage_interior[stage][index]=value;
+    if(!isfinite(value))atomicExch(&invalid,1);
+  }
+  if(element==0)
+    for(int index=threadIdx.x;index<s.true_trace_count;index+=blockDim.x)
+    {
+      const double value=v.true_solution[index]-inverse_gamma*
+          v.rodas_combination_true_trace[index];
+      v.rodas_stage_true_trace[stage][index]=value;
+      if(!isfinite(value))atomicExch(&invalid,1);
+    }
+  __syncthreads();
+  if(threadIdx.x==0)v.status[element]=invalid?-1.0:1.0;
+}
+
+__global__ void RodasFormCandidateKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int index=blockIdx.x*blockDim.x+threadIdx.x;
+  if(index<s.interior_count)
+  {
+    double value=v.base_interior[index];
+    for(int stage=0;stage<4;++stage)
+      value+=RodasPrincipalWeight(stage)*v.rodas_stage_interior[stage][index];
+    v.work_interior[index]=value;
+  }
+  if(index<s.true_trace_count)
+  {
+    double value=v.base_true_trace[index];
+    for(int stage=0;stage<4;++stage)
+      value+=RodasPrincipalWeight(stage)*
+          v.rodas_stage_true_trace[stage][index];
+    v.work_true_trace[index]=value;
+  }
+}
+
+__global__ void RodasTemporalErrorPartialsKernel(
+    CudaDeviceView v,CudaMeshShape s)
+{
+  __shared__ double partial[256];
+  const int element=blockIdx.x,thread=threadIdx.x;
+  double sum=0.0;
+  const int differential=conserved_components*s.scalar_interior_dofs;
+  for(int local=thread;local<differential;local+=blockDim.x)
+  {
+    const int index=element*s.interior_dofs+local;
+    double estimate=0.0;
+    for(int stage=0;stage<4;++stage)
+      estimate+=RodasErrorWeight(stage)*
+          v.rodas_stage_interior[stage][index];
+    sum+=estimate*estimate;
+  }
+  partial[thread]=sum;
+  __syncthreads();
+  for(int offset=blockDim.x/2;offset>0;offset/=2)
+  {
+    if(thread<offset)partial[thread]+=partial[thread+offset];
+    __syncthreads();
+  }
+  if(thread==0)v.status[element]=partial[0];
+}
+
+__global__ void RodasAlgebraicCorrectionPartialsKernel(
+    CudaDeviceView v,CudaMeshShape s)
+{
+  __shared__ double partial[256];
+  const int element=blockIdx.x,thread=threadIdx.x;
+  double sum=0.0;
+  const int auxiliary=(s.interior_components-conserved_components)*
+      s.scalar_interior_dofs;
+  const int offset=conserved_components*s.scalar_interior_dofs;
+  for(int local=thread;local<auxiliary;local+=blockDim.x)
+  {
+    const int index=element*s.interior_dofs+offset+local;
+    const double before=v.rodas_combination_interior[index];
+    const double after=v.work_interior[index];
+    const double difference=after-before;
+    sum+=difference*difference;
+  }
+  if(element==0)
+    for(int index=thread;index<s.true_trace_count;index+=blockDim.x)
+    {
+      const double before=v.rodas_combination_true_trace[index];
+      const double after=v.work_true_trace[index];
+      const double difference=after-before;
+      sum+=difference*difference;
+    }
+  partial[thread]=sum;
+  __syncthreads();
+  for(int reduce=blockDim.x/2;reduce>0;reduce/=2)
+  {
+    if(thread<reduce)partial[thread]+=partial[thread+reduce];
+    __syncthreads();
+  }
+  if(thread==0)v.status[element]=partial[0];
+}
+
+static __device__ __forceinline__ double RodasPreparedScaledSquare(
+    const double difference,const double before,const double after,
+    const double absolute_tolerance,const double relative_tolerance)
+{
+  const double scale=absolute_tolerance+relative_tolerance*
+      fmax(fabs(before),fabs(after));
+  if(!isfinite(difference)||!isfinite(scale)||scale<0.0)
+    return __longlong_as_double(0x7ff0000000000000ULL);
+  if(scale==0.0)
+    return difference==0.0?0.0:
+        __longlong_as_double(0x7ff0000000000000ULL);
+  const double normalized=difference/scale;
+  return normalized*normalized;
+}
+
+__global__ void RodasPreparedTemporalErrorPartialsKernel(
+    CudaDeviceView v,CudaMeshShape s,double absolute_tolerance,
+    double relative_tolerance)
+{
+  __shared__ double partial[256];
+  const int element=blockIdx.x,thread=threadIdx.x;
+  double sum=0.0;
+  const int sites=conserved_components*s.volume_points;
+  const int element_offset=element*s.interior_dofs;
+  for(int site=thread;site<sites;site+=blockDim.x)
+  {
+    const int component=site%conserved_components;
+    const int q=site/conserved_components;
+    const int qp=element*s.volume_points+q;
+    double before=0.0,after=0.0,estimate=0.0;
+    for(int scalar=0;scalar<s.scalar_interior_dofs;++scalar)
+    {
+      const double phi=
+          v.volume_shape[qp*s.scalar_interior_dofs+scalar];
+      const int index=element_offset+
+          ByNodes(scalar,s.scalar_interior_dofs,component);
+      before+=phi*v.rodas_residual_f[index];
+      after+=phi*v.work_interior[index];
+      for(int stage=0;stage<4;++stage)
+        estimate+=phi*RodasErrorWeight(stage)*
+            v.rodas_stage_interior[stage][index];
+    }
+    const double weight=v.volume_weight[qp];
+    const double scaled=RodasPreparedScaledSquare(
+        estimate,before,after,absolute_tolerance,relative_tolerance);
+    sum+=(isfinite(weight)&&weight>0.0)?weight*scaled:
+        __longlong_as_double(0x7ff0000000000000ULL);
+  }
+  partial[thread]=sum;
+  __syncthreads();
+  for(int offset=blockDim.x/2;offset>0;offset/=2)
+  {
+    if(thread<offset)partial[thread]+=partial[thread+offset];
+    __syncthreads();
+  }
+  if(thread==0)v.status[element]=partial[0];
+}
+
+__global__ void RodasVolumeMeasurePartialsKernel(
+    CudaDeviceView v,CudaMeshShape s)
+{
+  __shared__ double partial[256];
+  const int element=blockIdx.x,thread=threadIdx.x;
+  double sum=0.0;
+  for(int q=thread;q<s.volume_points;q+=blockDim.x)
+  {
+    const double weight=v.volume_weight[element*s.volume_points+q];
+    sum+=(isfinite(weight)&&weight>0.0)?weight:
+        __longlong_as_double(0x7ff0000000000000ULL);
+  }
+  partial[thread]=sum;
+  __syncthreads();
+  for(int offset=blockDim.x/2;offset>0;offset/=2)
+  {
+    if(thread<offset)partial[thread]+=partial[thread+offset];
+    __syncthreads();
+  }
+  if(thread==0)v.status[element]=partial[0];
+}
+
+__global__ void RodasPreparedAlgebraicCorrectionPartialsKernel(
+    CudaDeviceView v,CudaMeshShape s,double absolute_tolerance,
+    double relative_tolerance)
+{
+  __shared__ double partial[256];
+  const int element=blockIdx.x,thread=threadIdx.x;
+  double sum=0.0;
+  const int auxiliary=(s.interior_components-conserved_components)*
+      s.scalar_interior_dofs;
+  const int offset=conserved_components*s.scalar_interior_dofs;
+  for(int local=thread;local<auxiliary;local+=blockDim.x)
+  {
+    const int index=element*s.interior_dofs+offset+local;
+    const double before=v.rodas_combination_interior[index];
+    const double after=v.work_interior[index];
+    sum+=RodasPreparedScaledSquare(
+        after-before,before,after,absolute_tolerance,relative_tolerance);
+  }
+  if(element==0)
+    for(int index=thread;index<s.true_trace_count;index+=blockDim.x)
+    {
+      const double before=v.rodas_combination_true_trace[index];
+      const double after=v.work_true_trace[index];
+      sum+=RodasPreparedScaledSquare(
+          after-before,before,after,absolute_tolerance,relative_tolerance);
+    }
+  partial[thread]=sum;
+  __syncthreads();
+  for(int reduce=blockDim.x/2;reduce>0;reduce/=2)
+  {
+    if(thread<reduce)partial[thread]+=partial[thread+reduce];
+    __syncthreads();
+  }
+  if(thread==0)v.status[element]=partial[0];
 }
 
 // The tensor volume leaf retains the existing Zero and Face kernels.  Between
@@ -5953,13 +6588,100 @@ __global__ void RecoverKernel(CudaDeviceView v,CudaMeshShape s)
                       v.f+e*ni,v.recovered_interior+e*ni);
   v.status[e]=1;
 }
-__global__ void OrdinaryBorrowedRecoverKernel(CudaDeviceView v,CudaMeshShape s)
+// One cooperative retained-LU solve.  All callers enter collectively with one
+// block per element and a vector in element-private storage.  The ordering is
+// the frozen ordinary borrowed recovery ordering: retained pivot sequence,
+// column-ordered forward substitution, then row-ordered back substitution.
+static __device__ __forceinline__ void BorrowedSolveRetainedLuVector(
+    const double* lu,const double* pivots,const int rows,double* vector)
+{
+  for(int row=0;row<rows;++row)
+  {
+    if(threadIdx.x==0)
+    {
+      const int pivot=static_cast<int>(pivots[row]);
+      if(pivot!=row)
+      {
+        const double value=vector[row];
+        vector[row]=vector[pivot];vector[pivot]=value;
+      }
+    }
+    __syncthreads();
+  }
+  for(int column=0;column<rows;++column)
+  {
+    for(int row=column+1+threadIdx.x;row<rows;row+=blockDim.x)
+      vector[row]-=lu[row*rows+column]*vector[column];
+    __syncthreads();
+  }
+  for(int row=rows-1;row>=0;--row)
+  {
+    if(threadIdx.x==0)
+    {
+      double value=vector[row];
+      for(int column=row+1;column<rows;++column)
+        value-=lu[row*rows+column]*vector[column];
+      vector[row]=value/lu[row*rows+row];
+    }
+    __syncthreads();
+  }
+}
+
+// Common-shift causal stages replace only f/g.  recovered_interior is exactly
+// one vector per element and is free between stage assembly and recovery, so it
+// provides a zero-allocation A^{-1}f scratch without relying on the tensor
+// volume/condensation alias in solve_workspace.
+__global__ void RetainedLuRhsCondenseKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;if(e>=s.elements)return;
+  const int ni=s.interior_dofs,nt=s.trace_dofs;
+  const std::size_t ao=static_cast<std::size_t>(e)*ni*ni;
+  const std::size_t co=static_cast<std::size_t>(e)*nt*ni;
+  const double* lu=v.lu+ao;
+  const double* pivots=v.pivots+e*ni;
+  double* solved=v.recovered_interior+e*ni;
+  __shared__ int failed;
+  if(threadIdx.x==0)failed=0;
+  __syncthreads();
+  for(int row=threadIdx.x;row<ni;row+=blockDim.x)
+  {
+    const double value=v.f[e*ni+row];
+    solved[row]=value;
+    if(!isfinite(value))atomicExch(&failed,1);
+  }
+  __syncthreads();
+  if(!failed)BorrowedSolveRetainedLuVector(lu,pivots,ni,solved);
+  __syncthreads();
+  for(int row=threadIdx.x;row<ni;row+=blockDim.x)
+    if(!isfinite(solved[row]))atomicExch(&failed,1);
+  __syncthreads();
+  if(failed)
+  {
+    if(threadIdx.x==0)v.status[e]=-1.0;
+    return;
+  }
+  for(int row=threadIdx.x;row<nt;row+=blockDim.x)
+  {
+    double value=v.g[e*nt+row];
+    for(int column=0;column<ni;++column)
+      value-=v.c[co+row*ni+column]*solved[column];
+    v.condensed_rhs[e*nt+row]=value;
+    if(!isfinite(value))atomicExch(&failed,1);
+  }
+  __syncthreads();
+  if(threadIdx.x==0)v.status[e]=failed?-1.0:1.0;
+}
+
+__global__ void BorrowedRetainedLuRecoverKernel(CudaDeviceView v,CudaMeshShape s)
 {
   const int e=blockIdx.x;if(e>=s.elements)return;
   const int ni=s.interior_dofs,nt=s.trace_dofs;
   const double* lu=v.lu+static_cast<std::size_t>(e)*ni*ni;
   const double* pivots=v.pivots+e*ni;
   double* recovered=v.recovered_interior+e*ni;
+  __shared__ int failed;
+  if(threadIdx.x==0)failed=0;
+  __syncthreads();
   for(int row=threadIdx.x;row<ni;row+=blockDim.x)
   {
     // Preserve the frozen ordinary-CUDA arithmetic: form f-B*dhat first,
@@ -5969,39 +6691,15 @@ __global__ void OrdinaryBorrowedRecoverKernel(CudaDeviceView v,CudaMeshShape s)
       value-=v.b[(static_cast<std::size_t>(e)*ni+row)*nt+column]*
           v.trace_increment_local[e*nt+column];
     recovered[row]=value;
+    if(!isfinite(value))atomicExch(&failed,1);
   }
   __syncthreads();
-  for(int row=0;row<ni;++row)
-  {
-    if(threadIdx.x==0)
-    {
-      const int pivot=static_cast<int>(pivots[row]);
-      if(pivot!=row)
-      {
-        const double value=recovered[row];
-        recovered[row]=recovered[pivot];recovered[pivot]=value;
-      }
-    }
-    __syncthreads();
-  }
-  for(int column=0;column<ni;++column)
-  {
-    for(int row=column+1+threadIdx.x;row<ni;row+=blockDim.x)
-      recovered[row]-=lu[row*ni+column]*recovered[column];
-    __syncthreads();
-  }
-  for(int row=ni-1;row>=0;--row)
-  {
-    if(threadIdx.x==0)
-    {
-      double value=recovered[row];
-      for(int column=row+1;column<ni;++column)
-        value-=lu[row*ni+column]*recovered[column];
-      recovered[row]=value/lu[row*ni+row];
-    }
-    __syncthreads();
-  }
-  if(threadIdx.x==0)v.status[e]=1;
+  if(!failed)BorrowedSolveRetainedLuVector(lu,pivots,ni,recovered);
+  __syncthreads();
+  for(int row=threadIdx.x;row<ni;row+=blockDim.x)
+    if(!isfinite(recovered[row]))atomicExch(&failed,1);
+  __syncthreads();
+  if(threadIdx.x==0)v.status[e]=failed?-1.0:1.0;
 }
 __global__ void TensorBorrowedRecoverKernel(CudaDeviceView v,CudaMeshShape s)
 {
@@ -6430,6 +7128,376 @@ __device__ __forceinline__ bool EulerConservationFaceSite(
   return true;
 }
 
+// Evaluate the exact RODAS3 conservation identity retained by the CPU
+// reference.  At this point the lifecycle has repurposed its persistent
+// RODAS work vectors as follows:
+//
+//   rodas_residual_f             U^n, element-interior layout
+//   rodas_residual_g             Uhat^n, signed element-trace layout
+//   rodas_combination_interior   principal U^{n+1} before projection
+//
+// The causal stage trace increments retain their owned true-dof vectors for
+// stage construction. Rank two additionally distributes every increment into
+// persistent ghost-complete local storage before this witness; the element map
+// must never interpret an owned true vector as though it contained ghosts.
+__device__ __forceinline__ bool RodasMappedTraceIncrement(
+    CudaDeviceView v, CudaMeshShape s, const int element_trace_index,
+    const int stage, double& value)
+{
+  if (stage < 0 || stage >= 4 || element_trace_index < 0 ||
+      element_trace_index >= s.elements * s.trace_dofs)
+    return false;
+  double sign = 1.0;
+  const int local_index = Decode(
+      v.signed_element_trace[element_trace_index], sign);
+  const bool distributed =
+      s.global_true_trace_count != s.true_trace_count;
+  const int count = distributed ? s.local_trace_count : s.true_trace_count;
+  const double* increments = distributed
+      ? v.rodas_stage_local_trace[stage]
+      : v.rodas_stage_true_trace[stage];
+  if (local_index < 0 || local_index >= count || increments == nullptr)
+    return false;
+  value = sign * increments[local_index];
+  return isfinite(value);
+}
+
+__device__ __forceinline__ bool RodasConservationVolumeSite(
+    CudaDeviceView v, CudaMeshShape s, const int element, const int q,
+    const double dt, EulerConservationSite& site)
+{
+  const int interior_offset = element * s.interior_dofs;
+  const int qp = element * s.volume_points + q;
+  const double weight = v.volume_weight[qp];
+  if (!(weight > 0.0) || !isfinite(weight)) return false;
+
+  double candidate[conserved_components] = {};
+  double base[conserved_components] = {};
+  double source[conserved_components] = {};
+  for (int scalar = 0; scalar < s.scalar_interior_dofs; ++scalar)
+  {
+    const double phi =
+        v.volume_shape[qp * s.scalar_interior_dofs + scalar];
+    if (!isfinite(phi)) return false;
+    for (int component = 0; component < conserved_components; ++component)
+    {
+      const int index = interior_offset +
+          ByNodes(scalar, s.scalar_interior_dofs, component);
+      candidate[component] +=
+          phi * v.rodas_combination_interior[index];
+      base[component] += phi * v.rodas_residual_f[index];
+      source[component] += phi * v.static_source[index];
+    }
+  }
+
+  site.measure = weight;
+  for (int component = 0; component < conserved_components; ++component)
+  {
+    const double change = weight * (candidate[component] - base[component]);
+    const double forcing = dt * weight * source[component];
+    site.balance[component] = change - forcing;
+    site.scale[component] = fabs(change) + fabs(forcing);
+    if (!isfinite(candidate[component]) || !isfinite(base[component]) ||
+        !isfinite(source[component]) || !isfinite(change) ||
+        !isfinite(forcing) || !isfinite(site.balance[component]) ||
+        !isfinite(site.scale[component]))
+      return false;
+  }
+  // RODAS3 advances only the differential U4 mass rows.  The scalar IGR
+  // closure remains algebraic and has no entry in this balance.
+  site.balance[4] = 0.0;
+  site.scale[4] = 0.0;
+  return true;
+}
+
+__device__ __forceinline__ bool RodasConservationFaceSite(
+    CudaDeviceView v, CudaMeshShape s, const int element, const int face,
+    const int q, const double dt, EulerConservationSite& site)
+{
+  constexpr double common_gamma = 0.5;
+  constexpr int stages = 4;
+  const int element_face = element * faces_per_element + face;
+  if (v.boundary_policy_kind == nullptr ||
+      v.boundary_policy_kind[element_face] == 0)
+    return true;
+
+  const int qp = element_face * s.face_points + q;
+  const double weight = v.face_weight[qp];
+  const double normal[dimension] = {
+      v.face_normal[qp * dimension],
+      v.face_normal[qp * dimension + 1]};
+  if (!(weight > 0.0) || !isfinite(weight) || !isfinite(normal[0]) ||
+      !isfinite(normal[1]) || (normal[0] == 0.0 && normal[1] == 0.0))
+    return false;
+
+  const int interior_offset = element * s.interior_dofs;
+  const int trace_offset = element * s.trace_dofs;
+  const int face_offset =
+      face * s.trace_components * s.scalar_face_dofs;
+  double base_interior[conserved_components] = {};
+  double base_trace[conserved_components] = {};
+  double base_sigma_hat = 0.0;
+  double increment_interior[stages][conserved_components] = {};
+  double increment_trace[stages][igr_trace_components] = {};
+
+  for (int scalar = 0; scalar < s.scalar_interior_dofs; ++scalar)
+  {
+    const double phi =
+        v.face_interior_shape[qp * s.scalar_interior_dofs + scalar];
+    if (!isfinite(phi)) return false;
+    for (int component = 0; component < conserved_components; ++component)
+    {
+      const int index = interior_offset +
+          ByNodes(scalar, s.scalar_interior_dofs, component);
+      base_interior[component] += phi * v.rodas_residual_f[index];
+      for (int stage = 0; stage < stages; ++stage)
+        increment_interior[stage][component] +=
+            phi * v.rodas_stage_interior[stage][index];
+    }
+  }
+
+  const int trace_variables = s.igr_active
+      ? igr_trace_components : conserved_components;
+  for (int scalar = 0; scalar < s.scalar_face_dofs; ++scalar)
+  {
+    const double phi =
+        v.face_trace_shape[qp * s.scalar_face_dofs + scalar];
+    if (!isfinite(phi)) return false;
+    for (int component = 0; component < trace_variables; ++component)
+    {
+      const int local = trace_offset + face_offset +
+          ByNodes(scalar, s.scalar_face_dofs, component);
+      if (component < conserved_components)
+        base_trace[component] += phi * v.rodas_residual_g[local];
+      else
+        base_sigma_hat += phi * v.rodas_residual_g[local];
+      for (int stage = 0; stage < stages; ++stage)
+      {
+        double mapped = 0.0;
+        if (!RodasMappedTraceIncrement(v, s, local, stage, mapped))
+          return false;
+        increment_trace[stage][component] += phi * mapped;
+      }
+    }
+  }
+
+  double base_flux[conserved_components] = {};
+  double base_regularized_jacobian[
+      conserved_components * igr_trace_components] = {};
+  double base_conventional_jacobian[
+      conserved_components * conserved_components] = {};
+  double base_stabilization = 0.0;
+  double stabilization_interior_gradient[conserved_components] = {};
+  double stabilization_trace_gradient[conserved_components] = {};
+  const bool base_ready = s.igr_active
+      ? RegularizedFluxJacobian(
+            base_trace, base_sigma_hat, normal[0], normal[1], base_flux,
+            base_regularized_jacobian)
+      : FluxJacobian(
+            base_trace, normal[0], normal[1], base_flux,
+            base_conventional_jacobian) &&
+            LocalLlfSpeedGradient(
+                base_interior, base_trace, normal[0], normal[1],
+                base_stabilization, stabilization_interior_gradient,
+                stabilization_trace_gradient);
+  if (!base_ready) return false;
+
+  for (int stage = 0; stage < stages; ++stage)
+  {
+    double stage_interior[conserved_components] = {};
+    double stage_trace[conserved_components] = {};
+    double direction_interior[conserved_components] = {};
+    double direction_trace[conserved_components] = {};
+    for (int component = 0; component < conserved_components; ++component)
+    {
+      stage_interior[component] = base_interior[component];
+      stage_trace[component] = base_trace[component];
+      for (int term = 0; term <= stage; ++term)
+      {
+        if (term < stage)
+        {
+          const double alpha = RodasAlpha(stage, term);
+          stage_interior[component] +=
+              alpha * increment_interior[term][component];
+          stage_trace[component] +=
+              alpha * increment_trace[term][component];
+        }
+        const double coefficient = term == stage
+            ? common_gamma : RodasGamma(stage, term);
+        direction_interior[component] +=
+            coefficient * increment_interior[term][component];
+        direction_trace[component] +=
+            coefficient * increment_trace[term][component];
+      }
+    }
+
+    double stage_sigma_hat = base_sigma_hat;
+    double direction_sigma_hat = 0.0;
+    if (s.igr_active)
+      for (int term = 0; term <= stage; ++term)
+      {
+        if (term < stage)
+          stage_sigma_hat += RodasAlpha(stage, term) *
+              increment_trace[term][4];
+        const double coefficient = term == stage
+            ? common_gamma : RodasGamma(stage, term);
+        direction_sigma_hat += coefficient * increment_trace[term][4];
+      }
+
+    double boundary_flux[conserved_components] = {};
+    double boundary_derivative[conserved_components] = {};
+    if (s.igr_active)
+    {
+      double ignored_stage_jacobian[
+          conserved_components * igr_trace_components] = {};
+      if (!RegularizedFluxJacobian(
+              stage_trace, stage_sigma_hat, normal[0], normal[1],
+              boundary_flux, ignored_stage_jacobian))
+        return false;
+      for (int component = 0; component < conserved_components; ++component)
+      {
+        boundary_flux[component] += s.igr_beta *
+            (stage_interior[component] - stage_trace[component]);
+        for (int variable = 0; variable < conserved_components; ++variable)
+          boundary_derivative[component] += base_regularized_jacobian[
+              component * igr_trace_components + variable] *
+              direction_trace[variable];
+        boundary_derivative[component] += base_regularized_jacobian[
+            component * igr_trace_components + 4] * direction_sigma_hat +
+            s.igr_beta *
+                (direction_interior[component] -
+                 direction_trace[component]);
+      }
+    }
+    else
+    {
+      double interior_speed = 0.0;
+      double trace_speed = 0.0;
+      if (!EulerNormalFlux(
+              stage_trace, normal[0], normal[1], boundary_flux) ||
+          !LocalLlfSpeed(
+              stage_interior, normal[0], normal[1], interior_speed) ||
+          !LocalLlfSpeed(
+              stage_trace, normal[0], normal[1], trace_speed))
+        return false;
+      const double stage_stabilization = fmax(interior_speed, trace_speed);
+      if (!(stage_stabilization > 0.0) ||
+          !isfinite(stage_stabilization))
+        return false;
+      double stabilization_direction = 0.0;
+      for (int variable = 0; variable < conserved_components; ++variable)
+        stabilization_direction +=
+            stabilization_interior_gradient[variable] *
+                direction_interior[variable] +
+            stabilization_trace_gradient[variable] *
+                direction_trace[variable];
+      for (int component = 0; component < conserved_components; ++component)
+      {
+        boundary_flux[component] += stage_stabilization *
+            (stage_interior[component] - stage_trace[component]);
+        for (int variable = 0; variable < conserved_components; ++variable)
+          boundary_derivative[component] += base_conventional_jacobian[
+              component * conserved_components + variable] *
+              direction_trace[variable];
+        boundary_derivative[component] += base_stabilization *
+                (direction_interior[component] -
+                 direction_trace[component]) +
+            stabilization_direction *
+                (base_interior[component] - base_trace[component]);
+      }
+    }
+
+    const double principal_weight = RodasPrincipalWeight(stage);
+    for (int component = 0; component < conserved_components; ++component)
+    {
+      const double contribution = dt * principal_weight * weight *
+          (boundary_flux[component] + boundary_derivative[component]);
+      const double contribution_scale =
+          dt * fabs(principal_weight) * weight *
+          (fabs(boundary_flux[component]) +
+           fabs(boundary_derivative[component]));
+      site.balance[component] += contribution;
+      site.scale[component] += contribution_scale;
+      if (!isfinite(boundary_flux[component]) ||
+          !isfinite(boundary_derivative[component]) ||
+          !isfinite(contribution) || !isfinite(contribution_scale) ||
+          !isfinite(site.balance[component]) ||
+          !isfinite(site.scale[component]))
+        return false;
+    }
+  }
+  site.balance[4] = 0.0;
+  site.scale[4] = 0.0;
+  return true;
+}
+
+__global__ void RodasConservationElementsKernel(
+    CudaDeviceView v, CudaMeshShape s, const double dt)
+{
+  constexpr int components = igr_trace_components;
+  static_assert(euler_conservation_result_scalars == 2 * components + 2);
+  __shared__ double balance[components][cooperative_conservation_threads];
+  __shared__ double scale[components][cooperative_conservation_threads];
+  __shared__ double measure[cooperative_conservation_threads];
+  __shared__ int validity[cooperative_conservation_threads];
+  const int element = blockIdx.x;
+  const int thread = threadIdx.x;
+  const int face_sites = faces_per_element * s.face_points;
+  const int sites = s.volume_points + face_sites;
+  EulerConservationSite site{};
+  bool valid = s.borrowed_host_inputs && isfinite(dt) && dt > 0.0;
+  if (valid && thread < s.volume_points)
+    valid = RodasConservationVolumeSite(v, s, element, thread, dt, site);
+  else if (valid && thread < sites)
+  {
+    const int face_site = thread - s.volume_points;
+    const int face = face_site / s.face_points;
+    const int q = face_site - face * s.face_points;
+    valid = RodasConservationFaceSite(v, s, element, face, q, dt, site);
+  }
+  for (int component = 0; component < components; ++component)
+  {
+    balance[component][thread] = valid ? site.balance[component] : 0.0;
+    scale[component][thread] = valid ? site.scale[component] : 0.0;
+  }
+  measure[thread] = valid ? site.measure : 0.0;
+  validity[thread] = valid ? 1 : 0;
+  __syncthreads();
+  for (int offset = cooperative_conservation_threads / 2;
+       offset > 0; offset /= 2)
+  {
+    if (thread < offset)
+    {
+      for (int component = 0; component < components; ++component)
+      {
+        balance[component][thread] +=
+            balance[component][thread + offset];
+        scale[component][thread] += scale[component][thread + offset];
+      }
+      measure[thread] += measure[thread + offset];
+      validity[thread] = validity[thread] && validity[thread + offset];
+    }
+    __syncthreads();
+  }
+  if (thread == 0)
+  {
+    bool element_valid = validity[0] != 0 && isfinite(measure[0]);
+    for (int component = 0; component < components; ++component)
+      element_valid = element_valid && isfinite(balance[component][0]) &&
+          isfinite(scale[component][0]);
+    const int scratch = element * s.interior_dofs;
+    for (int component = 0; component < components; ++component)
+    {
+      v.f[scratch + component] =
+          element_valid ? balance[component][0] : 0.0;
+      v.f[scratch + components + component] =
+          element_valid ? scale[component][0] : 0.0;
+    }
+    v.f[scratch + 2 * components] = element_valid ? measure[0] : 0.0;
+    v.f[scratch + 2 * components + 1] = element_valid ? 1.0 : 0.0;
+  }
+}
+
 // Compact post-candidate balance used by the production borrowed-Euler
 // lifecycle.  One block owns one element, and its lanes map the ordered site
 // sequence [volume q][face 0 q]...[face 3 q].  Nonphysical face sites are
@@ -6653,7 +7721,8 @@ int Blocks(const int n) noexcept { return (n + 127) / 128; }
 bool LaunchBorrowedEulerStages(const CudaDeviceView& v,
                                const CudaMeshShape& s,
                                const double dt,
-                               const bool frozen_llf) noexcept
+                               const bool frozen_llf,
+                               const bool differentiate_nonlinearities) noexcept
 {
   const int blocks=(s.elements-1)/borrowed_euler_elements_per_block+1;
   BorrowedEulerZeroKernel<<<blocks,borrowed_euler_block_threads>>>(v,s);
@@ -6661,14 +7730,16 @@ bool LaunchBorrowedEulerStages(const CudaDeviceView& v,
   BorrowedEulerVolumeKernel<<<blocks,borrowed_euler_block_threads>>>(v,s,dt);
   if(!LaunchOk())return false;
   BorrowedEulerFaceKernel<<<blocks,borrowed_euler_block_threads>>>(
-      v,s,frozen_llf);
+      v,s,frozen_llf,differentiate_nonlinearities);
   return LaunchOk();
 }
 bool LaunchTensorBorrowedEulerAssembly(const CudaDeviceView& v,
                                        const CudaMeshShape& s,
                                        const double dt,
                                        std::uint64_t&
-                                           tensor_volume_mma_tiles) noexcept
+                                           tensor_volume_mma_tiles,
+                                       const bool
+                                           differentiate_nonlinearities) noexcept
 {
   tensor_volume_mma_tiles=0;
   if(s.elements<=0||s.order<1||s.order>3)return false;
@@ -6738,7 +7809,8 @@ bool LaunchTensorBorrowedEulerAssembly(const CudaDeviceView& v,
     q_begin+=q_count;
     first_chunk=false;
   }
-  BorrowedEulerFaceKernel<<<blocks,borrowed_euler_block_threads>>>(v,s,false);
+  BorrowedEulerFaceKernel<<<blocks,borrowed_euler_block_threads>>>(
+      v,s,false,differentiate_nonlinearities);
   if(!LaunchOk())return false;
   tensor_volume_mma_tiles=mma_work.mma_tiles;
   return true;
@@ -6781,21 +7853,24 @@ bool CudaLaunchFreezeBorrowedCurrentLlfTau(const CudaDeviceView& v,
 bool CudaLaunchBorrowedAssembly(
     const CudaDeviceView& v,const CudaMeshShape& s,const double dt,
     const CudaBorrowedAssemblyKind kind,
-    std::uint64_t& tensor_volume_mma_tiles) noexcept
+    std::uint64_t& tensor_volume_mma_tiles,
+    const bool differentiate_nonlinearities) noexcept
 {
   tensor_volume_mma_tiles=0;
   if(!s.borrowed_host_inputs||s.elements<=0)return false;
   if(kind==CudaBorrowedAssemblyKind::ordinary_split)
-    return LaunchBorrowedEulerStages(v,s,dt,false);
+    return LaunchBorrowedEulerStages(
+        v,s,dt,false,differentiate_nonlinearities);
   if(kind==CudaBorrowedAssemblyKind::tensor_volume)
     return LaunchTensorBorrowedEulerAssembly(
-        v,s,dt,tensor_volume_mma_tiles);
+        v,s,dt,tensor_volume_mma_tiles,differentiate_nonlinearities);
   return false;
 }
 bool CudaLaunchAssembly(const CudaDeviceView& v,const CudaMeshShape& s,
                         const double dt,
                         const generic::CudaEngineKind engine,
-                        std::uint64_t& tensor_volume_mma_tiles) noexcept
+                        std::uint64_t& tensor_volume_mma_tiles,
+                        const bool differentiate_nonlinearities) noexcept
 {
   tensor_volume_mma_tiles=0;
   if(!s.borrowed_host_inputs)
@@ -6807,11 +7882,11 @@ bool CudaLaunchAssembly(const CudaDeviceView& v,const CudaMeshShape& s,
   if(engine==generic::CudaEngineKind::ordinary)
     return CudaLaunchBorrowedAssembly(
         v,s,dt,CudaBorrowedAssemblyKind::ordinary_split,
-        tensor_volume_mma_tiles);
+        tensor_volume_mma_tiles,differentiate_nonlinearities);
   if(engine==generic::CudaEngineKind::tensor_core)
     return CudaLaunchBorrowedAssembly(
         v,s,dt,CudaBorrowedAssemblyKind::tensor_volume,
-        tensor_volume_mma_tiles);
+        tensor_volume_mma_tiles,differentiate_nonlinearities);
   return false;
 }
 bool CudaLaunchFrozenBorrowedLlfAssembly(const CudaDeviceView& v,
@@ -6819,7 +7894,7 @@ bool CudaLaunchFrozenBorrowedLlfAssembly(const CudaDeviceView& v,
                                          double dt) noexcept
 {
   if(!s.borrowed_host_inputs||s.igr_active||s.elements<=0)return false;
-  return LaunchBorrowedEulerStages(v,s,dt,true);
+  return LaunchBorrowedEulerStages(v,s,dt,true,false);
 }
 bool CudaLaunchPartitionedScalarClosureMask(
     const CudaDeviceView& v,const CudaMeshShape& s) noexcept
@@ -6911,6 +7986,166 @@ bool CudaLaunchPartitionedScalarClosureRestoreEuler(
       Blocks(std::max(s.interior_count,s.true_trace_count)),128>>>(v,s);
   return LaunchOk();
 }
+bool CudaLaunchRodasAlgebraicMask(
+    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+{
+  if(!s.borrowed_host_inputs||s.elements<=0||
+     s.interior_components<conserved_components||
+     s.scalar_interior_dofs<=0||s.interior_dofs<=0||s.trace_dofs<=0||
+     v.residual_r==nullptr||v.a==nullptr||v.b==nullptr||v.c==nullptr||
+     v.f==nullptr||v.status==nullptr)return false;
+  RodasAlgebraicMaskKernel<<<s.elements,128>>>(v,s);
+  return LaunchOk();
+}
+bool CudaLaunchRodasFreezeDifferentialIncrement(
+    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+{
+  if(!s.borrowed_host_inputs||s.interior_count<=0||
+     s.interior_components<conserved_components||
+     s.scalar_interior_dofs<=0||v.recovered_interior==nullptr)return false;
+  RodasFreezeDifferentialIncrementKernel<<<Blocks(s.interior_count),128>>>(v,s);
+  return LaunchOk();
+}
+bool CudaLaunchRodasRestoreDifferentialState(
+    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+{
+  if(!s.borrowed_host_inputs||s.interior_count<=0||
+     s.interior_components<conserved_components||
+     s.scalar_interior_dofs<=0||v.work_interior==nullptr||
+     v.base_interior==nullptr)return false;
+  RodasRestoreDifferentialStateKernel<<<Blocks(s.interior_count),128>>>(v,s);
+  return LaunchOk();
+}
+bool CudaLaunchRodasLoadStage(const CudaDeviceView& v,const CudaMeshShape& s,
+                              const std::size_t stage) noexcept
+{
+  using Coefficients=::dg::hdg::time::Rodas3Coefficients;
+  static_assert(Coefficients::stage_count==4);
+  static_assert(Coefficients::common_gamma==
+                ::dg::hdg::time::RationalCoefficient{1,2});
+  if(!s.borrowed_host_inputs||stage>=Coefficients::stage_count||
+     s.interior_count<=0||s.true_trace_count<=0||
+     v.base_interior==nullptr||v.base_true_trace==nullptr||
+     v.work_interior==nullptr||v.work_true_trace==nullptr)return false;
+  for(std::size_t prior=0;prior<Coefficients::stage_count;++prior)
+    if(v.rodas_stage_interior[prior]==nullptr||
+       v.rodas_stage_true_trace[prior]==nullptr)return false;
+  RodasLoadStageKernel<<<
+      Blocks(std::max(s.interior_count,s.true_trace_count)),128>>>(
+          v,s,static_cast<int>(stage));
+  return LaunchOk();
+}
+bool CudaLaunchRodasBuildStageRightHandSide(
+    const CudaDeviceView& v,const CudaMeshShape& s,
+    const std::size_t stage,const double step_size) noexcept
+{
+  using Coefficients=::dg::hdg::time::Rodas3Coefficients;
+  if(!s.borrowed_host_inputs||stage>=Coefficients::stage_count||
+     !std::isfinite(step_size)||!(step_size>0.0)||s.elements<=0||
+     s.interior_count<=0||s.true_trace_count<=0||s.interior_dofs<=0||
+     s.trace_dofs<=0||s.scalar_interior_dofs<=0||s.volume_points<=0||
+     v.rodas_combination_interior==nullptr||
+     v.rodas_combination_true_trace==nullptr||
+     v.rodas_residual_f==nullptr||v.rodas_residual_g==nullptr||
+     v.volume_shape==nullptr||v.volume_weight==nullptr||v.f==nullptr||
+     v.g==nullptr||v.residual_r==nullptr||v.residual_g==nullptr||
+     v.status==nullptr)return false;
+  for(std::size_t prior=0;prior<Coefficients::stage_count;++prior)
+    if(v.rodas_stage_interior[prior]==nullptr||
+       v.rodas_stage_true_trace[prior]==nullptr)return false;
+  RodasCombinationKernel<<<
+      Blocks(std::max(s.interior_count,s.true_trace_count)),128>>>(
+          v,s,static_cast<int>(stage));
+  RodasStageRightHandSideKernel<<<s.elements,128>>>(v,s,step_size);
+  return LaunchOk();
+}
+bool CudaLaunchRodasCaptureStageIncrement(
+    const CudaDeviceView& v,const CudaMeshShape& s,
+    const std::size_t stage) noexcept
+{
+  using Coefficients=::dg::hdg::time::Rodas3Coefficients;
+  if(!s.borrowed_host_inputs||stage>=Coefficients::stage_count||
+     s.elements<=0||s.interior_count<=0||s.true_trace_count<=0||
+     v.recovered_interior==nullptr||v.true_solution==nullptr||
+     v.rodas_combination_interior==nullptr||
+     v.rodas_combination_true_trace==nullptr||v.status==nullptr||
+     v.rodas_stage_interior[stage]==nullptr||
+     v.rodas_stage_true_trace[stage]==nullptr)return false;
+  RodasCaptureStageKernel<<<s.elements,128>>>(
+      v,s,static_cast<int>(stage));
+  return LaunchOk();
+}
+bool CudaLaunchRodasFormCandidate(
+    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+{
+  if(!s.borrowed_host_inputs||s.interior_count<=0||s.true_trace_count<=0||
+     v.base_interior==nullptr||v.base_true_trace==nullptr||
+     v.work_interior==nullptr||v.work_true_trace==nullptr)return false;
+  for(std::size_t stage=0;
+      stage<::dg::hdg::time::Rodas3Coefficients::stage_count;++stage)
+    if(v.rodas_stage_interior[stage]==nullptr||
+       v.rodas_stage_true_trace[stage]==nullptr)return false;
+  RodasFormCandidateKernel<<<
+      Blocks(std::max(s.interior_count,s.true_trace_count)),128>>>(v,s);
+  return LaunchOk();
+}
+bool CudaLaunchRodasTemporalErrorSquared(
+    const CudaDeviceView& v,const CudaMeshShape& s,double* result) noexcept
+{
+  if(!s.borrowed_host_inputs||s.elements<=0||s.scalar_interior_dofs<=0||
+     s.interior_components<conserved_components||v.base_interior==nullptr||
+     v.work_interior==nullptr||v.status==nullptr||result==nullptr)return false;
+  for(std::size_t stage=0;
+      stage<::dg::hdg::time::Rodas3Coefficients::stage_count;++stage)
+    if(v.rodas_stage_interior[stage]==nullptr)return false;
+  RodasTemporalErrorPartialsKernel<<<s.elements,256>>>(v,s);
+  NormReduceKernel<<<1,256>>>(v.status,s.elements,result);
+  return LaunchOk();
+}
+bool CudaLaunchRodasAlgebraicCorrectionSquared(
+    const CudaDeviceView& v,const CudaMeshShape& s,double* result) noexcept
+{
+  if(!s.borrowed_host_inputs||s.elements<=0||s.scalar_interior_dofs<=0||
+     s.interior_components<conserved_components||s.true_trace_count<=0||
+     v.rodas_combination_interior==nullptr||
+     v.rodas_combination_true_trace==nullptr||v.work_interior==nullptr||
+     v.work_true_trace==nullptr||v.status==nullptr||result==nullptr)
+    return false;
+  RodasAlgebraicCorrectionPartialsKernel<<<s.elements,256>>>(v,s);
+  NormReduceKernel<<<1,256>>>(v.status,s.elements,result);
+  return LaunchOk();
+}
+bool CudaLaunchRodasPreparedAssessmentSquared(
+    const CudaDeviceView& v,const CudaMeshShape& s,
+    const double absolute_tolerance,const double relative_tolerance,
+    double* differential_result,double* algebraic_result,
+    double* differential_measure) noexcept
+{
+  if(!s.borrowed_host_inputs||s.elements<=0||s.volume_points<=0||
+     s.scalar_interior_dofs<=0||
+     s.interior_components<conserved_components||s.true_trace_count<=0||
+     !std::isfinite(absolute_tolerance)||absolute_tolerance<0.0||
+     !std::isfinite(relative_tolerance)||relative_tolerance<0.0||
+     !(absolute_tolerance>0.0||relative_tolerance>0.0)||
+     v.rodas_residual_f==nullptr||v.work_interior==nullptr||
+     v.rodas_combination_interior==nullptr||
+     v.rodas_combination_true_trace==nullptr||v.work_true_trace==nullptr||
+     v.volume_shape==nullptr||v.volume_weight==nullptr||v.status==nullptr||
+     differential_result==nullptr||differential_measure==nullptr||
+     algebraic_result==nullptr)return false;
+  for(std::size_t stage=0;
+      stage<::dg::hdg::time::Rodas3Coefficients::stage_count;++stage)
+    if(v.rodas_stage_interior[stage]==nullptr)return false;
+  RodasPreparedTemporalErrorPartialsKernel<<<s.elements,256>>>(
+      v,s,absolute_tolerance,relative_tolerance);
+  NormReduceKernel<<<1,256>>>(v.status,s.elements,differential_result);
+  RodasVolumeMeasurePartialsKernel<<<s.elements,256>>>(v,s);
+  NormReduceKernel<<<1,256>>>(v.status,s.elements,differential_measure);
+  RodasPreparedAlgebraicCorrectionPartialsKernel<<<s.elements,256>>>(
+      v,s,absolute_tolerance,relative_tolerance);
+  NormReduceKernel<<<1,256>>>(v.status,s.elements,algebraic_result);
+  return LaunchOk();
+}
 bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
                             const generic::CudaEngineKind engine,
                             std::uint64_t& tensor_mma_tiles) noexcept
@@ -6979,11 +8214,25 @@ bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
   tensor_mma_tiles=per_element*elements;
   return true;
 }
+bool CudaLaunchCondenseRetainedLuRhs(
+    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+{
+  if(!s.borrowed_host_inputs||s.elements<=0||s.interior_dofs<=0||
+     s.trace_dofs<=0||
+     s.interior_dofs>generic_maximum_interior_dofs_per_element||
+     s.trace_dofs>generic_maximum_trace_dofs_per_element||
+     v.c==nullptr||v.f==nullptr||v.g==nullptr||v.lu==nullptr||
+     v.pivots==nullptr||v.recovered_interior==nullptr||
+     v.condensed_rhs==nullptr||v.status==nullptr)
+    return false;
+  RetainedLuRhsCondenseKernel<<<s.elements,128>>>(v,s);
+  return LaunchOk();
+}
 bool CudaLaunchSetupNativeElementSchwarz(
     const CudaDeviceView& v,const CudaMeshShape& s,
     const CudaTracePreconditionerKind preconditioner_kind) noexcept
 {
-  const int expected=NativeElementSchwarzIgrPatchRows(s.order);
+  const int expected=NativeElementSchwarzPatchRows(s.order,s.igr_active);
   const bool field_split=
       CudaTracePreconditionerIsNativeElementSchwarzEquilibratedFieldSplit(
           preconditioner_kind);
@@ -6993,7 +8242,7 @@ bool CudaLaunchSetupNativeElementSchwarz(
   if(!CudaTracePreconditionerIsNativeElementSchwarz(preconditioner_kind)||
      CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
          preconditioner_kind)||
-     !s.igr_active||s.elements<=0||s.trace_dofs!=expected||
+     (field_split&&!s.igr_active)||s.elements<=0||s.trace_dofs!=expected||
      v.schur==nullptr||v.status==nullptr||
      v.element_schwarz_patch_matrix==nullptr||
      v.element_schwarz_patch_lu==nullptr||
@@ -7024,8 +8273,8 @@ bool CudaLaunchAssembleNativeElementVector(
     const CudaDeviceView& v,const CudaMeshShape& s,
     const double* const element_values,double* const truth) noexcept
 {
-  const int expected=NativeElementSchwarzIgrPatchRows(s.order);
-  if(!s.igr_active||s.elements<=0||s.true_trace_count<=0||
+  const int expected=NativeElementSchwarzPatchRows(s.order,s.igr_active);
+  if(s.elements<=0||s.true_trace_count<=0||
      s.trace_dofs!=expected||element_values==nullptr||truth==nullptr||
      element_values==truth||v.element_schwarz_signed_true_dof==nullptr||
      v.element_schwarz_true_incidence_slots==nullptr)
@@ -7115,7 +8364,7 @@ bool CudaLaunchRecover(const CudaDeviceView& v,const CudaMeshShape& s,
   {
     const auto recovery=CudaBorrowedRecoveryForEngine(engine);
     if(recovery==CudaBorrowedRecoveryKind::ordinary_direct_lu)
-      OrdinaryBorrowedRecoverKernel<<<s.elements,128>>>(v,s);
+      BorrowedRetainedLuRecoverKernel<<<s.elements,128>>>(v,s);
     else if(recovery==CudaBorrowedRecoveryKind::tensor_retained_solve)
       TensorBorrowedRecoverKernel<<<s.elements,128>>>(v,s);
     else return false;
@@ -7124,6 +8373,20 @@ bool CudaLaunchRecover(const CudaDeviceView& v,const CudaMeshShape& s,
   {
     RecoverKernel<<<Blocks(s.elements),128>>>(v,s);
   }
+  return LaunchOk();
+}
+bool CudaLaunchRecoverFromRetainedLu(
+    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+{
+  if(!s.borrowed_host_inputs||s.elements<=0||s.interior_dofs<=0||
+     s.trace_dofs<=0||
+     s.interior_dofs>generic_maximum_interior_dofs_per_element||
+     s.trace_dofs>generic_maximum_trace_dofs_per_element||
+     v.b==nullptr||v.f==nullptr||v.lu==nullptr||v.pivots==nullptr||
+     v.trace_increment_local==nullptr||v.recovered_interior==nullptr||
+     v.status==nullptr)
+    return false;
+  BorrowedRetainedLuRecoverKernel<<<s.elements,128>>>(v,s);
   return LaunchOk();
 }
 bool CudaLaunchTrial(const CudaDeviceView& v,const CudaMeshShape& s,double alpha) noexcept
@@ -7201,6 +8464,59 @@ bool CudaLaunchEulerConservation(const CudaDeviceView& v,
          faces_per_element||
      (s.igr_active&&v.face_h==nullptr))return false;
   EulerConservationElementsKernel<<<
+      s.elements,cooperative_conservation_threads>>>(v,s,dt);
+  if(!LaunchOk())return false;
+  EulerConservationReduceKernel<<<
+      1,cooperative_conservation_threads>>>(v,s,out);
+  return LaunchOk();
+}
+bool CudaLaunchRodasConservation(const CudaDeviceView& v,
+                                 const CudaMeshShape& s,
+                                 const double dt, double* out) noexcept
+{
+  using Coefficients=::dg::hdg::time::Rodas3Coefficients;
+  static_assert(Coefficients::stage_count==4);
+  static_assert(Coefficients::common_gamma==
+                ::dg::hdg::time::RationalCoefficient{1,2});
+  const int expected_interior_components=s.igr_active
+      ? igr_interior_components:conserved_components;
+  const int expected_trace_components=s.igr_active
+      ? igr_trace_components:conserved_components;
+  if(!s.borrowed_host_inputs||!isfinite(dt)||!(dt>0.0)||out==nullptr||
+     s.elements<=0||s.scalar_interior_dofs<=0||s.scalar_face_dofs<=0||
+     s.interior_components!=expected_interior_components||
+     s.trace_components!=expected_trace_components||
+     s.interior_dofs!=s.interior_components*s.scalar_interior_dofs||
+     s.trace_dofs!=faces_per_element*s.trace_components*
+         s.scalar_face_dofs||
+     s.interior_dofs<euler_conservation_result_scalars||
+     s.interior_count<=0||
+     s.elements>s.interior_count/s.interior_dofs||
+     s.elements>std::numeric_limits<int>::max()/s.trace_dofs||
+     s.local_trace_count<=0||s.true_trace_count<=0||
+     s.global_true_trace_count<s.true_trace_count||
+     s.true_trace_count%s.trace_components!=0||
+     s.volume_points<=0||
+     s.volume_points>cooperative_conservation_threads||
+     s.face_points<=0||
+     s.face_points>(cooperative_conservation_threads-s.volume_points)/
+         faces_per_element||
+     !isfinite(s.igr_beta)||v.f==nullptr||v.residual_r==nullptr||
+     v.static_source==nullptr||v.volume_shape==nullptr||
+     v.volume_weight==nullptr||v.face_interior_shape==nullptr||
+     v.face_trace_shape==nullptr||v.face_weight==nullptr||
+     v.face_normal==nullptr||
+     (s.borrowed_static_boundary_policies&&
+      v.boundary_policy_kind==nullptr)||
+     v.signed_element_trace==nullptr||
+     v.rodas_residual_f==nullptr||v.rodas_residual_g==nullptr||
+     v.rodas_combination_interior==nullptr)return false;
+  for(std::size_t stage=0;stage<Coefficients::stage_count;++stage)
+    if(v.rodas_stage_interior[stage]==nullptr||
+       v.rodas_stage_true_trace[stage]==nullptr||
+       (s.global_true_trace_count!=s.true_trace_count&&
+        v.rodas_stage_local_trace[stage]==nullptr))return false;
+  RodasConservationElementsKernel<<<
       s.elements,cooperative_conservation_threads>>>(v,s,dt);
   if(!LaunchOk())return false;
   EulerConservationReduceKernel<<<

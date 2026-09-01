@@ -1,10 +1,12 @@
 #include "sim/hdg/main_backend.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -12,10 +14,14 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "numerics/hdg/generic/contract.hpp"
 #include "numerics/hdg/generic/session_contract.hpp"
+#include "numerics/hdg/runtime/app/checkpoint_codec.hpp"
+#include "numerics/hdg/runtime/app/durable_io.hpp"
 #include "numerics/hdg/runtime/cuda/generic_euler.cuh"
 #include "sim/context/case_context.hpp"
 #include "sim/hdg/euler_output_fields.hpp"
@@ -25,6 +31,15 @@
 #include "sim/hdg/transactional_time_adapter.hpp"
 #include "sim/io/vtk_helpers.hpp"
 #include "sim/wiring/hdg_boundary_wiring.hpp"
+
+#if defined(__GNUC__) || defined(__clang__)
+// Headerless test seam: ordinary executables provide no definition, while the
+// split-process fixture may inject one deterministic prepare-boundary abort.
+// This is neither a production option nor persisted numerical identity.
+extern "C" bool dg_igr_hdg_cuda_prepare_boundary_failure_for_test(
+    std::uint64_t committed_steps, double committed_time) noexcept
+    __attribute__((weak));
+#endif
 
 namespace dg_sim::hdg
 {
@@ -39,6 +54,8 @@ using dg::hdg::generic::EulerHdgTimeTreatment;
 using dg::hdg::generic::HdgEulerSessionStatus;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::generic::RegularizationSelection;
+using dg::hdg::runtime::cuda::GenericEulerCudaCheckpointPayloadViewV1;
+using dg::hdg::runtime::cuda::GenericEulerCudaMutableCheckpointPayloadV1;
 using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using dg::hdg::runtime::cuda_w8a::CudaIluAccountingKind;
@@ -56,7 +73,51 @@ using dg::hdg::runtime::cuda_w8a::CudaTracePolicyKind;
 using dg::hdg::runtime::cuda_w8a::CudaTracePolicyKindName;
 using dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerIsIlu;
 using dg::hdg::runtime::cuda_w8a::CudaTracePreconditionerName;
+using dg::hdg::runtime::cuda_w8a::DefaultCudaTracePolicyRequest;
 using dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy;
+
+using PreparedCudaOutput = CudaPreparedOutputMetadataV1;
+
+struct PreparedCudaCheckpointPayload
+{
+  std::vector<double> interior;
+  std::vector<double> owned_true_trace;
+  bool staged = false;
+};
+
+constexpr double kRodas3AlgebraicCorrectionFraction = 0.25;
+constexpr std::uint32_t kMaximumConsecutiveAdaptiveRejections = 16;
+
+bool HasTestOnlyPrepareBoundaryFailureHook() noexcept
+{
+#if defined(__GNUC__) || defined(__clang__)
+  return dg_igr_hdg_cuda_prepare_boundary_failure_for_test != nullptr;
+#else
+  return false;
+#endif
+}
+
+bool TestOnlyPrepareBoundaryFailure(
+    const std::uint64_t committed_steps,
+    const double committed_time) noexcept
+{
+#if defined(__GNUC__) || defined(__clang__)
+  return dg_igr_hdg_cuda_prepare_boundary_failure_for_test(
+      committed_steps, committed_time);
+#else
+  static_cast<void>(committed_steps);
+  static_cast<void>(committed_time);
+  return false;
+#endif
+}
+
+bool SameCoordinates(
+    const dg::hdg::generic::HdgEulerSessionCoordinates& lhs,
+    const dg::hdg::generic::HdgEulerSessionCoordinates& rhs) noexcept
+{
+  return lhs.time == rhs.time && lhs.step == rhs.step &&
+      lhs.generation == rhs.generation && lhs.dt == rhs.dt;
+}
 
 bool IsRoot(const MPI_Comm communicator) noexcept
 {
@@ -120,6 +181,69 @@ bool ExactDoubleConsensus(const MPI_Comm communicator,
       minimum == maximum;
 }
 
+std::string FinalizeAdaptiveRejectionOrReason(
+    const MPI_Comm communicator,
+    HdgTransactionalTimeAdapter& time_driver,
+    const HdgTransactionalTimeAdapter::StepPlan& plan,
+    const HdgTransactionalTimeAdapter::AdaptiveAttempt& attempt)
+{
+  std::optional<HdgTransactionalTimeAdapter::AdaptiveDecision> decision;
+  bool local_ok = false;
+  try
+  {
+    decision.emplace(time_driver.PreviewAdaptiveDecision(attempt));
+    local_ok = !decision->Accepted();
+  }
+  catch (...)
+  {
+    local_ok = false;
+  }
+  if (!CollectiveAll(communicator, local_ok) ||
+      !ExactDoubleConsensus(communicator, decision->next_dt()))
+  {
+    return "adaptive CUDA RODAS3 rejection decision is not collective";
+  }
+
+  try
+  {
+    time_driver.FinalizeAdaptiveRejection(*decision);
+    local_ok = true;
+  }
+  catch (...)
+  {
+    local_ok = false;
+  }
+  if (!CollectiveAll(communicator, local_ok))
+    return "adaptive CUDA RODAS3 rejection transaction failed";
+
+  HdgTransactionalTimeAdapter::AdaptiveControllerState state{};
+  try
+  {
+    state = time_driver.AdaptiveCheckpointState();
+    local_ok = true;
+  }
+  catch (...)
+  {
+    local_ok = false;
+  }
+  if (!CollectiveAll(communicator, local_ok) ||
+      !ExactDoubleConsensus(communicator, state.next_dt))
+  {
+    return "adaptive CUDA RODAS3 controller state diverged after rejection";
+  }
+  if (state.consecutive_rejections >=
+      kMaximumConsecutiveAdaptiveRejections)
+  {
+    return "adaptive CUDA RODAS3 exceeded the consecutive-rejection limit";
+  }
+  if (decision->minimum_dt_reached() &&
+      plan.dt <= time_driver.adaptive_controller_config().minimum_dt)
+  {
+    return "adaptive CUDA RODAS3 rejected an attempt at the minimum timestep";
+  }
+  return {};
+}
+
 int Reject(const HdgEulerMainRequest& request,
            const std::string& reason) noexcept
 {
@@ -142,6 +266,146 @@ void AppendDouble(std::ostringstream& stream, const double value)
                 "HDG main consensus requires IEEE binary64 doubles");
   std::memcpy(&bits, &value, sizeof(bits));
   stream << bits << ';';
+}
+
+void AppendStateHash(std::ostringstream& stream,
+                     const dg::hdg::runtime::StateHash& hash)
+{
+  for (const std::uint8_t byte : hash.bytes)
+    stream << static_cast<unsigned int>(byte) << ',';
+  stream << ';';
+}
+
+bool NonzeroStateHash(const dg::hdg::runtime::StateHash& hash) noexcept
+{
+  return std::any_of(hash.bytes.begin(), hash.bytes.end(),
+                     [](const std::uint8_t byte) { return byte != 0; });
+}
+
+bool ProjectedFieldHash(const double* values,
+                        const std::size_t count,
+                        dg::hdg::runtime::StateHash& hash) noexcept
+{
+  static_assert(sizeof(double) == sizeof(std::uint64_t),
+                "projected input identity requires IEEE binary64 storage");
+  if ((count != 0 && values == nullptr) ||
+      count > std::numeric_limits<std::size_t>::max() / sizeof(double))
+    return false;
+  for (std::size_t index = 0; index < count; ++index)
+    if (!std::isfinite(values[index])) return false;
+  const std::uint8_t empty = 0;
+  const auto* bytes = count == 0
+      ? &empty : reinterpret_cast<const std::uint8_t*>(values);
+  const std::size_t byte_count = count == 0 ? 1 : count * sizeof(double);
+  hash = dg::hdg::runtime::app::CheckpointSha256V1(
+      {bytes, byte_count});
+  return NonzeroStateHash(hash);
+}
+
+struct ProjectedProblemRankIdentityV1
+{
+  std::uint32_t schema = 1;
+  int source_rank = -1;
+  int rank_count = 0;
+  std::uint64_t initial_volume_count = 0;
+  std::uint64_t initial_true_trace_count = 0;
+  std::uint64_t source_volume_count = 0;
+  dg::hdg::runtime::StateHash initial_volume_hash{};
+  dg::hdg::runtime::StateHash initial_true_trace_hash{};
+  dg::hdg::runtime::StateHash source_volume_hash{};
+  bool source_present = false;
+};
+
+static_assert(std::is_trivially_copyable<ProjectedProblemRankIdentityV1>::value,
+              "projected-input consensus transfer must be a value DTO");
+
+bool CollectiveProjectedProblemIdentity(
+    const MPI_Comm communicator,
+    const double* initial_volume,
+    const std::size_t initial_volume_count,
+    const double* initial_true_trace,
+    const std::size_t initial_true_trace_count,
+    const double* source_volume,
+    const std::size_t source_volume_count,
+    const bool source_present,
+    dg::hdg::runtime::StateHash& identity) noexcept
+{
+  int rank = -1;
+  int ranks = 0;
+  bool local_ok = communicator != MPI_COMM_NULL &&
+      MPI_Comm_rank(communicator, &rank) == MPI_SUCCESS &&
+      MPI_Comm_size(communicator, &ranks) == MPI_SUCCESS && rank >= 0 &&
+      ranks > 0 &&
+      sizeof(ProjectedProblemRankIdentityV1) <=
+          static_cast<std::size_t>(std::numeric_limits<int>::max()) &&
+      initial_volume_count <= std::numeric_limits<std::uint64_t>::max() &&
+      initial_true_trace_count <= std::numeric_limits<std::uint64_t>::max() &&
+      source_volume_count <= std::numeric_limits<std::uint64_t>::max() &&
+      (source_present ||
+       (source_volume == nullptr && source_volume_count == 0));
+  ProjectedProblemRankIdentityV1 local{};
+  if (local_ok)
+  {
+    local.source_rank = rank;
+    local.rank_count = ranks;
+    local.initial_volume_count = initial_volume_count;
+    local.initial_true_trace_count = initial_true_trace_count;
+    local.source_volume_count = source_volume_count;
+    local.source_present = source_present;
+    local_ok = ProjectedFieldHash(
+            initial_volume, initial_volume_count,
+            local.initial_volume_hash) &&
+        ProjectedFieldHash(
+            initial_true_trace, initial_true_trace_count,
+            local.initial_true_trace_hash) &&
+        ProjectedFieldHash(
+            source_volume, source_volume_count,
+            local.source_volume_hash);
+  }
+  if (!CollectiveAll(communicator, local_ok)) return false;
+
+  std::vector<ProjectedProblemRankIdentityV1> gathered;
+  try { gathered.resize(static_cast<std::size_t>(ranks)); }
+  catch (...) { local_ok = false; }
+  if (!CollectiveAll(communicator, local_ok)) return false;
+  const bool gathered_ok = MPI_Allgather(
+      &local, static_cast<int>(sizeof(local)), MPI_BYTE,
+      gathered.data(), static_cast<int>(sizeof(local)), MPI_BYTE,
+      communicator) == MPI_SUCCESS;
+  if (!CollectiveAll(communicator, gathered_ok)) return false;
+
+  try
+  {
+    std::ostringstream stream;
+    AppendText(stream, "generic-cuda-hdg-projected-problem.v1");
+    stream << ranks << ';';
+    for (int index = 0; index < ranks; ++index)
+    {
+      const auto& source = gathered[static_cast<std::size_t>(index)];
+      if (source.schema != 1 || source.source_rank != index ||
+          source.rank_count != ranks ||
+          source.source_present != gathered.front().source_present ||
+          !NonzeroStateHash(source.initial_volume_hash) ||
+          !NonzeroStateHash(source.initial_true_trace_hash) ||
+          !NonzeroStateHash(source.source_volume_hash))
+        return false;
+      stream << source.schema << ';' << source.source_rank << ';'
+             << source.rank_count << ';'
+             << source.initial_volume_count << ';'
+             << source.initial_true_trace_count << ';'
+             << source.source_volume_count << ';'
+             << source.source_present << ';';
+      AppendStateHash(stream, source.initial_volume_hash);
+      AppendStateHash(stream, source.initial_true_trace_hash);
+      AppendStateHash(stream, source.source_volume_hash);
+    }
+    const std::string text = stream.str();
+    identity = dg::hdg::runtime::app::CheckpointSha256V1(
+        {reinterpret_cast<const std::uint8_t*>(text.data()), text.size()});
+    local_ok = NonzeroStateHash(identity);
+  }
+  catch (...) { local_ok = false; }
+  return CollectiveAll(communicator, local_ok);
 }
 
 struct FrozenBoundaryPlan
@@ -297,9 +561,13 @@ EulerHdgTimeTreatment CanonicalTimeTreatment(
   {
     return EulerHdgTimeTreatment::partitioned_backward_euler;
   }
+  if (selector == "rodas3")
+  {
+    return EulerHdgTimeTreatment::rodas3;
+  }
   throw std::invalid_argument(
-      "HDG time integrator must resolve to 'backward-euler' or "
-      "'partitioned-backward-euler'");
+      "HDG time integrator must resolve to 'backward-euler', "
+      "'partitioned-backward-euler', or 'rodas3'");
 }
 
 CudaEngineKind CanonicalCudaEngine(const HdgEulerMainRequest& request)
@@ -409,6 +677,8 @@ std::string ConsensusText(const HdgEulerMainRequest& request,
   stream << ilu_lower_jacobi_iterations << ';'
          << ilu_upper_jacobi_iterations << ';';
   AppendText(stream, request.options.restart_vtk);
+  AppendText(stream, request.options.hdg_checkpoint);
+  AppendText(stream, request.options.hdg_restart_checkpoint);
   AppendText(stream, vtk.prefix_path);
   stream << request.options.order << ';'
          << request.options.ser_ref_levels << ';'
@@ -423,6 +693,8 @@ std::string ConsensusText(const HdgEulerMainRequest& request,
          << vtk.levels_of_detail << ';';
   AppendDouble(stream, request.options.dt);
   AppendDouble(stream, request.options.dt_min);
+  AppendDouble(stream, request.options.time_atol);
+  AppendDouble(stream, request.options.time_rtol);
   AppendDouble(stream, request.options.cfl);
   AppendDouble(stream, request.options.t_final);
   AppendDouble(stream, request.options.dt_save);
@@ -432,6 +704,51 @@ std::string ConsensusText(const HdgEulerMainRequest& request,
   AppendDouble(stream, regularization.alpha);
   AppendDouble(stream, regularization.beta);
   return stream.str();
+}
+
+dg::hdg::runtime::StateHash CheckpointNumericalIdentity(
+    const HdgEulerMainRequest& request,
+    const std::string& serialized_mesh,
+    const std::string& case_data_consensus,
+    const dg::hdg::runtime::StateHash& projected_problem_identity,
+    const RegularizationSelection regularization,
+    const CudaTracePolicyDescriptor& trace_policy,
+    const EulerHdgTimeTreatment time_treatment)
+{
+  // Artifact locations and VTK/GLVis publication toggles are deliberately
+  // absent.  The time cursor persisted in the artifact independently binds
+  // its complete control and output schedule.
+  std::ostringstream stream;
+  AppendText(stream, "generic-cuda-hdg-checkpoint-identity.v1");
+  AppendText(stream, request.case_config.case_name);
+  AppendText(stream, serialized_mesh);
+  AppendText(stream, case_data_consensus);
+  AppendStateHash(stream, projected_problem_identity);
+  AppendText(stream, CudaEngineName(trace_policy.selected_engine));
+  AppendText(stream,
+             CudaTracePolicyKindName(trace_policy.requested_selection));
+  AppendText(stream,
+             CudaTracePolicyKindName(trace_policy.resolved_selection));
+  AppendText(stream, TraceSolverName(trace_policy));
+  stream << request.options.order << ';'
+         << request.options.ser_ref_levels << ';'
+         << request.options.par_ref_levels << ';'
+         << static_cast<int>(regularization.kind) << ';'
+         << static_cast<int>(time_treatment) << ';';
+  AppendDouble(stream, request.options.dt);
+  AppendDouble(stream, request.options.dt_min);
+  AppendDouble(stream, request.options.time_atol);
+  AppendDouble(stream, request.options.time_rtol);
+  AppendDouble(stream, request.options.cfl);
+  AppendDouble(stream, request.options.t_final);
+  AppendDouble(stream, request.options.dt_save);
+  AppendDouble(stream, request.case_config.gamma);
+  AppendDouble(stream, regularization.alpha);
+  AppendDouble(stream, regularization.beta);
+  const std::string identity = stream.str();
+  return dg::hdg::runtime::app::CheckpointSha256V1(
+      {reinterpret_cast<const std::uint8_t*>(identity.data()),
+       identity.size()});
 }
 
 std::string CaseDataConsensusText(
@@ -480,6 +797,335 @@ bool ExactTextConsensus(const MPI_Comm communicator,
           std::equal(local.begin(), local.end(), root.begin()));
 }
 
+struct LoadedCudaCheckpoint
+{
+  HdgTransactionalTimeAdapter::RestartState time_state{};
+  CudaPreparedOutputMetadataV1 local_metadata{};
+  std::vector<double> local_interior;
+  std::vector<double> local_owned_true_trace;
+};
+
+bool BroadcastCheckpointBytes(const MPI_Comm communicator,
+                              std::vector<std::uint8_t>& bytes) noexcept
+{
+  int rank = -1;
+  if (MPI_Comm_rank(communicator, &rank) != MPI_SUCCESS) return false;
+  std::uint64_t byte_count = rank == 0 ? bytes.size() : 0;
+  if (MPI_Bcast(&byte_count, 1, MPI_UINT64_T, 0, communicator) != MPI_SUCCESS ||
+      byte_count == 0 ||
+      byte_count >
+          dg::hdg::runtime::app::
+              generic_hdg_cuda_checkpoint_maximum_bytes_v1 ||
+      byte_count > static_cast<std::uint64_t>(
+          std::numeric_limits<int>::max()))
+    return false;
+  try
+  {
+    if (rank != 0) bytes.resize(static_cast<std::size_t>(byte_count));
+  }
+  catch (...) { return false; }
+  return MPI_Bcast(bytes.data(), static_cast<int>(byte_count), MPI_BYTE, 0,
+                   communicator) == MPI_SUCCESS;
+}
+
+bool MaterializeCudaCheckpointMetadata(
+    const dg::hdg::runtime::app::GenericHdgCudaOwnedRankCheckpointV1& source,
+    CudaPreparedOutputMetadataV1& destination) noexcept
+{
+  destination = {};
+  if (source.source_rank >
+          static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+      source.rank_count >
+          static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+      source.interior.empty() || source.owned_true_trace.empty())
+    return false;
+  destination.schema = 1;
+  destination.source_rank = static_cast<int>(source.source_rank);
+  destination.rank_count = static_cast<int>(source.rank_count);
+  destination.attempt = source.attempt;
+  destination.descriptor = source.descriptor;
+  destination.local_mesh_hash = source.local_mesh_hash;
+  destination.local_partition_hash = source.local_partition_hash;
+  destination.local_topology_hash = source.local_topology_hash;
+  destination.local_interior_hash = source.local_interior_hash;
+  destination.local_trace_hash = source.local_trace_hash;
+  destination.interior_count = source.interior.size();
+  destination.owned_true_trace_count = source.owned_true_trace.size();
+  destination.staging_generation = source.descriptor.coordinates.generation;
+  destination.successful_commit = true;
+  return true;
+}
+
+bool LoadCudaCheckpoint(
+    const MPI_Comm communicator,
+    const std::string& path,
+    const dg::hdg::runtime::StateHash& numerical_identity,
+    const std::uint32_t rank_count,
+    LoadedCudaCheckpoint& loaded) noexcept
+{
+  int rank = -1;
+  if (MPI_Comm_rank(communicator, &rank) != MPI_SUCCESS) return false;
+  std::vector<std::uint8_t> bytes;
+  std::string detail;
+  bool local_ok = rank != 0 ||
+      dg::hdg::runtime::app::detail::ReadCurrentGenerationArtifact(
+          std::filesystem::path{path},
+          dg::hdg::runtime::app::
+              generic_hdg_cuda_checkpoint_maximum_bytes_v1,
+          bytes, detail) == dg::hdg::runtime::app::DurableIoStatus::ok;
+  if (!CollectiveAll(communicator, local_ok) ||
+      !BroadcastCheckpointBytes(communicator, bytes))
+    return false;
+  dg::hdg::runtime::app::GenericHdgCudaCheckpointArtifactV1 artifact{};
+  local_ok =
+      dg::hdg::runtime::app::DecodeGenericHdgCudaCheckpointV1(
+          {bytes.data(), bytes.size()}, numerical_identity, rank_count,
+          artifact) == dg::hdg::runtime::app::CheckpointCodecStatus::ok &&
+      rank >= 0 && static_cast<std::size_t>(rank) < artifact.ranks.size();
+  LoadedCudaCheckpoint candidate{};
+  if (local_ok)
+  {
+    auto& source = artifact.ranks[rank];
+    local_ok = MaterializeCudaCheckpointMetadata(
+        source, candidate.local_metadata);
+    if (local_ok)
+    {
+      candidate.time_state = std::move(artifact.time_state);
+      candidate.local_interior = std::move(source.interior);
+      candidate.local_owned_true_trace =
+          std::move(source.owned_true_trace);
+    }
+  }
+  if (!CollectiveAll(communicator, local_ok)) return false;
+  loaded = std::move(candidate);
+  return true;
+}
+
+struct CudaCheckpointRankIdentityV1
+{
+  std::uint32_t schema = 0;
+  int source_rank = -1;
+  int rank_count = 0;
+  dg::hdg::runtime::AttemptIdentity attempt{};
+  dg::hdg::runtime::CheckpointDescriptor descriptor{};
+  dg::hdg::runtime::StateHash local_mesh_hash{};
+  dg::hdg::runtime::StateHash local_partition_hash{};
+  dg::hdg::runtime::StateHash local_topology_hash{};
+  dg::hdg::runtime::StateHash local_interior_hash{};
+  dg::hdg::runtime::StateHash local_trace_hash{};
+  std::uint64_t interior_count = 0;
+  std::uint64_t owned_true_trace_count = 0;
+  bool successful_commit = false;
+};
+
+static_assert(std::is_trivially_copyable<CudaCheckpointRankIdentityV1>::value,
+              "rank-local checkpoint identity gather must be a value DTO");
+
+CudaCheckpointRankIdentityV1 CheckpointRankIdentity(
+    const CudaPreparedOutputMetadataV1& source) noexcept
+{
+  return {source.schema,
+          source.source_rank,
+          source.rank_count,
+          source.attempt,
+          source.descriptor,
+          source.local_mesh_hash,
+          source.local_partition_hash,
+          source.local_topology_hash,
+          source.local_interior_hash,
+          source.local_trace_hash,
+          source.interior_count,
+          source.owned_true_trace_count,
+          source.successful_commit};
+}
+
+bool PublishCudaCheckpoint(
+    const MPI_Comm communicator,
+    const std::string& path,
+    const dg::hdg::runtime::StateHash& numerical_identity,
+    const HdgTransactionalTimeAdapter::RestartState& time_state,
+    const CudaPreparedOutputMetadataV1& local_metadata,
+    const PreparedCudaCheckpointPayload& local_payload) noexcept
+{
+  int rank = -1;
+  int ranks = 0;
+  if (MPI_Comm_rank(communicator, &rank) != MPI_SUCCESS ||
+      MPI_Comm_size(communicator, &ranks) != MPI_SUCCESS || ranks < 1 ||
+      ranks > static_cast<int>(dg::hdg::runtime::app::
+          application_checkpoint_max_rank_count_v1) ||
+      sizeof(CudaCheckpointRankIdentityV1) >
+          static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    return false;
+  const bool local_payload_valid = local_payload.staged &&
+      local_metadata.schema == 1 && local_metadata.successful_commit &&
+      !local_payload.interior.empty() &&
+      !local_payload.owned_true_trace.empty() &&
+      local_metadata.interior_count == local_payload.interior.size() &&
+      local_metadata.owned_true_trace_count ==
+          local_payload.owned_true_trace.size() &&
+      local_payload.interior.size() <=
+          static_cast<std::size_t>(std::numeric_limits<int>::max()) &&
+      local_payload.owned_true_trace.size() <=
+          static_cast<std::size_t>(std::numeric_limits<int>::max());
+  if (!CollectiveAll(communicator, local_payload_valid)) return false;
+
+  const CudaCheckpointRankIdentityV1 transfer =
+      CheckpointRankIdentity(local_metadata);
+  std::array<CudaCheckpointRankIdentityV1,
+             dg::hdg::runtime::app::application_checkpoint_max_rank_count_v1>
+      gathered{};
+  const bool identity_gathered = MPI_Gather(
+      &transfer, static_cast<int>(sizeof(transfer)), MPI_BYTE,
+      gathered.data(), static_cast<int>(sizeof(transfer)), MPI_BYTE,
+      0, communicator) == MPI_SUCCESS;
+  if (!CollectiveAll(communicator, identity_gathered))
+    return false;
+
+  std::array<int,
+             dg::hdg::runtime::app::application_checkpoint_max_rank_count_v1>
+      interior_counts{}, interior_offsets{}, trace_counts{}, trace_offsets{};
+  int aggregate_interior_count = 0;
+  int aggregate_trace_count = 0;
+  bool local_ok = true;
+  if (rank == 0)
+  {
+    for (int index = 0; local_ok && index < ranks; ++index)
+    {
+      const auto& source = gathered[index];
+      local_ok = source.interior_count > 0 &&
+          source.owned_true_trace_count > 0 &&
+          source.interior_count <= static_cast<std::uint64_t>(
+              std::numeric_limits<int>::max() - aggregate_interior_count) &&
+          source.owned_true_trace_count <= static_cast<std::uint64_t>(
+              std::numeric_limits<int>::max() - aggregate_trace_count);
+      if (!local_ok) break;
+      interior_counts[index] = static_cast<int>(source.interior_count);
+      trace_counts[index] =
+          static_cast<int>(source.owned_true_trace_count);
+      interior_offsets[index] = aggregate_interior_count;
+      trace_offsets[index] = aggregate_trace_count;
+      aggregate_interior_count += interior_counts[index];
+      aggregate_trace_count += trace_counts[index];
+    }
+    constexpr std::uint64_t maximum_coefficients =
+        dg::hdg::runtime::app::
+            generic_hdg_cuda_checkpoint_maximum_bytes_v1 /
+        sizeof(double);
+    local_ok = local_ok &&
+        static_cast<std::uint64_t>(aggregate_interior_count) <=
+            maximum_coefficients &&
+        static_cast<std::uint64_t>(aggregate_trace_count) <=
+            maximum_coefficients - static_cast<std::uint64_t>(
+                aggregate_interior_count);
+  }
+  if (!CollectiveAll(communicator, local_ok)) return false;
+
+  std::vector<double> gathered_interior;
+  std::vector<double> gathered_trace;
+  if (rank == 0)
+  {
+    try
+    {
+      gathered_interior.resize(
+          static_cast<std::size_t>(aggregate_interior_count));
+      gathered_trace.resize(
+          static_cast<std::size_t>(aggregate_trace_count));
+    }
+    catch (...) { local_ok = false; }
+  }
+  if (!CollectiveAll(communicator, local_ok)) return false;
+  const bool interior_gathered = MPI_Gatherv(
+      local_payload.interior.data(),
+      static_cast<int>(local_payload.interior.size()), MPI_DOUBLE,
+      gathered_interior.data(), interior_counts.data(),
+      interior_offsets.data(), MPI_DOUBLE, 0, communicator) == MPI_SUCCESS;
+  const bool trace_gathered = MPI_Gatherv(
+      local_payload.owned_true_trace.data(),
+      static_cast<int>(local_payload.owned_true_trace.size()), MPI_DOUBLE,
+      gathered_trace.data(), trace_counts.data(), trace_offsets.data(),
+      MPI_DOUBLE, 0, communicator) == MPI_SUCCESS;
+  if (!CollectiveAll(
+          communicator, interior_gathered && trace_gathered))
+    return false;
+
+  if (rank == 0)
+  {
+    std::string detail;
+    std::array<dg::hdg::runtime::app::GenericHdgCudaCheckpointRankViewV1,
+               dg::hdg::runtime::app::
+                   application_checkpoint_max_rank_count_v1> views{};
+    for (int index = 0; index < ranks; ++index)
+    {
+      const CudaCheckpointRankIdentityV1& source = gathered[index];
+      views[index] = {
+          static_cast<std::uint32_t>(source.source_rank),
+          static_cast<std::uint32_t>(source.rank_count),
+          source.attempt,
+          source.descriptor,
+          source.local_mesh_hash,
+          source.local_partition_hash,
+          source.local_topology_hash,
+          source.local_interior_hash,
+          source.local_trace_hash,
+          gathered_interior.data() + interior_offsets[index],
+          source.interior_count,
+          gathered_trace.data() + trace_offsets[index],
+          source.owned_true_trace_count,
+          source.successful_commit};
+    }
+    std::vector<std::uint8_t> encoded;
+    local_ok = dg::hdg::runtime::app::EncodeGenericHdgCudaCheckpointV1(
+        numerical_identity, time_state, views.data(),
+        static_cast<std::size_t>(ranks), encoded) ==
+        dg::hdg::runtime::app::CheckpointCodecStatus::ok;
+    if (local_ok)
+    {
+      try
+      {
+        const std::filesystem::path alias =
+            std::filesystem::absolute(path).lexically_normal();
+        const std::filesystem::path parent = alias.has_parent_path()
+            ? alias.parent_path() : std::filesystem::path{"."};
+        const std::filesystem::path store = parent /
+            ("." + alias.filename().string() +
+             ".dg-igr-hdg-checkpoint-store");
+        std::error_code error;
+        if (!std::filesystem::exists(store, error))
+        {
+          local_ok = !error &&
+              dg::hdg::runtime::app::CreateDurableDirectory(
+                  store, detail) ==
+                  dg::hdg::runtime::app::DurableIoStatus::ok;
+        }
+        else
+        {
+          local_ok = !error && std::filesystem::is_directory(store, error) &&
+              !error;
+        }
+        dg::hdg::runtime::app::DurableGenerationTransactionV1 transaction;
+        constexpr std::string_view logical_name =
+            "generic-hdg-cuda-checkpoint.v1";
+        if (local_ok)
+          local_ok = transaction.Begin(
+              store, local_metadata.descriptor.coordinates.cursor,
+              detail) == dg::hdg::runtime::app::DurableIoStatus::ok;
+        if (local_ok)
+          local_ok = transaction.Stage(logical_name, encoded.data(),
+                                       encoded.size(), detail) ==
+              dg::hdg::runtime::app::DurableIoStatus::ok;
+        if (local_ok)
+          local_ok = transaction.AddAlias(alias, logical_name, detail) ==
+              dg::hdg::runtime::app::DurableIoStatus::ok;
+        if (local_ok)
+          local_ok = transaction.Publish(detail) ==
+              dg::hdg::runtime::app::DurableIoStatus::ok;
+      }
+      catch (...) { local_ok = false; }
+    }
+  }
+  return CollectiveAll(communicator, local_ok);
+}
+
 std::string Validate(const HdgEulerMainRequest& request,
                      const RegularizationSelection regularization,
                      const CudaEngineKind cuda_engine,
@@ -497,20 +1143,59 @@ std::string Validate(const HdgEulerMainRequest& request,
     return "HDG IGR alpha and beta must be finite and positive";
   if (!dg::hdg::generic::IsKnownEulerHdgTimeTreatment(time_treatment))
     return "CUDA HDG time treatment is invalid";
+  const bool rodas3 = time_treatment == EulerHdgTimeTreatment::rodas3;
   if (!request.options.restart_vtk.empty() || request.options.restart_cycle >= 0 ||
       request.options.restart_step >= 0 || request.options.save_state_files)
     return "generic CUDA HDG restart/state-file routes are unsupported";
+  const auto valid_checkpoint_path = [](const std::string& text) noexcept
+  {
+    if (text.empty()) return true;
+    try
+    {
+      const std::filesystem::path path{text};
+      return !path.empty() && !path.filename().empty() &&
+          text.find('\0') == std::string::npos;
+    }
+    catch (...) { return false; }
+  };
+  if (!valid_checkpoint_path(request.options.hdg_checkpoint) ||
+      !valid_checkpoint_path(request.options.hdg_restart_checkpoint))
+    return "generic CUDA HDG checkpoint paths are invalid";
   if (request.options.glvis)
     return "generic CUDA HDG GLVis is unsupported";
   if (!std::isfinite(request.options.dt))
     return "CUDA HDG --time-step must be finite";
-  if (request.options.dt <= 0.0 &&
+  if (rodas3 && request.options.dt == 0.0)
+    return "CUDA HDG RODAS3 requires a nonzero --time-step";
+  if (rodas3 &&
+      (!std::isfinite(request.options.time_atol) ||
+       request.options.time_atol < 0.0 ||
+       !std::isfinite(request.options.time_rtol) ||
+       request.options.time_rtol < 0.0 ||
+       (request.options.time_atol == 0.0 &&
+        request.options.time_rtol == 0.0)))
+    return "CUDA RODAS3 requires finite nonnegative --time-atol and "
+           "--time-rtol with at least one positive tolerance";
+  const bool adaptive_rodas3 = rodas3 && request.options.dt < 0.0;
+  const bool checkpoint_requested =
+      !request.options.hdg_checkpoint.empty() ||
+      !request.options.hdg_restart_checkpoint.empty();
+  if (checkpoint_requested && !rodas3)
+    return "generic CUDA HDG checkpoint continuity is a RODAS3-only typed "
+           "opt-in";
+  if (adaptive_rodas3 &&
+      (!std::isfinite(request.options.dt_min) ||
+       request.options.dt_min <= 0.0))
+    return "adaptive CUDA RODAS3 requires a finite positive --dt-min";
+  if (!rodas3 && request.options.dt <= 0.0 &&
       (!std::isfinite(request.options.cfl) || request.options.cfl <= 0.0))
     return "CUDA CFL HDG time integration requires a finite positive --cfl-number";
   if (!std::isfinite(request.options.dt_min) || request.options.dt_min < 0.0)
     return "CUDA HDG --dt-min must be finite and non-negative";
   if (!std::isfinite(request.options.t_final) || request.options.t_final <= 0.0)
     return "CUDA HDG final time must be finite and positive";
+  if (adaptive_rodas3 && request.options.dt_min > request.options.t_final)
+    return "adaptive CUDA RODAS3 --dt-min must not exceed the final-time horizon";
   if (request.options.vtk_save &&
       (!std::isfinite(request.options.dt_save) || request.options.dt_save <= 0.0))
     return "CUDA HDG ParaView output requires a positive --time-step-save";
@@ -564,9 +1249,63 @@ HDGParaViewMetadata Metadata(
 
 bool AbortPrepared(GenericEulerHdgCudaSession& session,
                    GenericEulerCudaPreparedStep& authority,
-                   CudaPreparedOutputMetadataV1& native_export) noexcept
+                   PreparedCudaOutput& native_export) noexcept
 {
   return session.Abort(std::move(authority), native_export).status ==
+      HdgEulerSessionStatus::aborted;
+}
+
+bool PrepareOutput(GenericEulerHdgCudaSession& session,
+                   const double dt,
+                   GenericEulerCudaPreparedStep& authority,
+                   PreparedCudaOutput& native_export) noexcept
+{
+  return session.Prepare(dt, authority, native_export).status ==
+      HdgEulerSessionStatus::prepared;
+}
+
+bool AssessPreparedOutput(
+    GenericEulerHdgCudaSession& session,
+    const GenericEulerCudaPreparedStep& authority,
+    const PreparedCudaOutput& native_export,
+    const dg::hdg::generic::HdgEulerPreparedAssessmentPolicy policy,
+    dg::hdg::generic::HdgEulerPreparedAssessment& assessment) noexcept
+{
+  return session.AssessPrepared(
+      authority, native_export, policy, assessment);
+}
+
+bool ExportPreparedOutputFields(
+    GenericEulerHdgCudaSession& session,
+    const GenericEulerCudaPreparedStep& authority,
+    const PreparedCudaOutput& native_export,
+    dg::hdg::generic::HdgEulerHostInteriorFields destination) noexcept
+{
+  return session.ExportPreparedFields(
+      authority, native_export, destination);
+}
+
+bool AcknowledgePreparedOutput(
+    GenericEulerHdgCudaSession& session,
+    const GenericEulerCudaPreparedStep& authority,
+    PreparedCudaOutput& native_export) noexcept
+{
+  return session.AcknowledgePreparedOutput(authority, native_export);
+}
+
+bool CommitPreparedOutput(GenericEulerHdgCudaSession& session,
+                          GenericEulerCudaPreparedStep& authority,
+                          PreparedCudaOutput& native_export) noexcept
+{
+  return session.Commit(std::move(authority), native_export).status ==
+      HdgEulerSessionStatus::committed;
+}
+
+bool RejectPreparedOutput(GenericEulerHdgCudaSession& session,
+                          GenericEulerCudaPreparedStep& authority,
+                          PreparedCudaOutput& native_export) noexcept
+{
+  return session.RejectPrepared(std::move(authority), native_export).status ==
       HdgEulerSessionStatus::aborted;
 }
 
@@ -604,7 +1343,10 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
             cuda_engine,
             regularization.kind == RegularizationKind::igr,
             ranks, request.options.order,
-            CudaTracePolicyKind::engine_default);
+            DefaultCudaTracePolicyRequest(
+                cuda_engine,
+                regularization.kind == RegularizationKind::igr,
+                ranks, time_treatment));
         if (!CudaTracePolicyDescriptorIsExact(trace_policy))
           reason = "CUDA HDG trace policy resolution failed";
       }
@@ -842,19 +1584,94 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
                 nullptr, 0, dg::hdg::generic::euler_2d_conserved_components},
       boundary->View(), numerical_policy, time_treatment};
 
+  const bool publish_checkpoints = !request.options.hdg_checkpoint.empty();
+  const bool checkpoint_state_requested = publish_checkpoints ||
+      !request.options.hdg_restart_checkpoint.empty();
+  dg::hdg::runtime::StateHash projected_problem_identity{};
+  if (checkpoint_state_requested &&
+      !CollectiveProjectedProblemIdentity(
+          request.communicator,
+          resolved_plan.request.initial_state.data,
+          resolved_plan.request.initial_state.scalar_count,
+          resolved_plan.request.initial_true_trace.data,
+          resolved_plan.request.initial_true_trace.scalar_count,
+          resolved_plan.request.source.data,
+          resolved_plan.request.source.scalar_count,
+          source_state != nullptr, projected_problem_identity))
+    return Reject(
+        request,
+        "CUDA HDG projected problem identity construction failed");
+  const dg::hdg::runtime::StateHash checkpoint_numerical_identity =
+      checkpoint_state_requested
+      ? CheckpointNumericalIdentity(
+            request, serialized_mesh, case_data_consensus,
+            projected_problem_identity, regularization, trace_policy,
+            time_treatment)
+      : dg::hdg::runtime::StateHash{};
+
   GenericEulerHdgCudaSession session;
   if (session.Initialize(resolved_plan.request).status !=
       HdgEulerSessionStatus::initialized)
     return Reject(request, "generic CUDA session initialization failed");
+  const bool rodas3 = time_treatment == EulerHdgTimeTreatment::rodas3;
+  const bool adaptive_rodas3 = rodas3 && request.options.dt < 0.0;
+  local_ok = !rodas3 ||
+      dg::hdg::generic::HasHdgEulerSessionCapabilities(
+          session.capabilities(),
+          dg::hdg::generic::HdgEulerSessionCapabilityBit(
+              dg::hdg::generic::HdgEulerSessionCapability::
+                  prepared_embedded_assessment));
+  if (!CollectiveAll(request.communicator, local_ok))
+    return Reject(
+        request,
+        "generic CUDA RODAS3 session lacks prepared embedded assessment");
+  std::optional<LoadedCudaCheckpoint> restored_checkpoint;
+  if (!request.options.hdg_restart_checkpoint.empty())
+  {
+    try
+    {
+      restored_checkpoint.emplace();
+      local_ok = LoadCudaCheckpoint(
+          request.communicator, request.options.hdg_restart_checkpoint,
+          checkpoint_numerical_identity, static_cast<std::uint32_t>(ranks),
+          *restored_checkpoint);
+    }
+    catch (...) { local_ok = false; }
+    if (!CollectiveAll(request.communicator, local_ok))
+      return Reject(request,
+                    "generic CUDA HDG checkpoint decode/identity validation failed");
+    local_ok = session.Restore(
+        restored_checkpoint->local_metadata,
+        GenericEulerCudaCheckpointPayloadViewV1{
+            restored_checkpoint->local_interior.data(),
+            restored_checkpoint->local_interior.size(),
+            restored_checkpoint->local_owned_true_trace.data(),
+            restored_checkpoint->local_owned_true_trace.size()}).status ==
+        HdgEulerSessionStatus::committed;
+    const auto restored_coordinates = session.coordinates();
+    local_ok = local_ok &&
+        restored_coordinates.time ==
+            restored_checkpoint->time_state.cursor.current_time &&
+        restored_coordinates.step ==
+            restored_checkpoint->time_state.cursor.committed_steps &&
+        restored_coordinates.generation ==
+            restored_checkpoint->local_metadata.descriptor.coordinates.generation;
+    if (!CollectiveAll(request.communicator, local_ok))
+      return Reject(request,
+                    "generic CUDA HDG checkpoint restore failed closed");
+  }
   std::unique_ptr<HdgTransactionalTimeAdapter> time_driver;
   std::unique_ptr<HdgEulerParaViewFields> output_fields;
   std::unique_ptr<HDGParaViewSeries> output;
   try
   {
-    const bool cfl_control = request.options.dt <= 0.0;
+    const bool cfl_control = !rodas3 && request.options.dt <= 0.0;
     const bool partitioned_backward_euler = time_treatment ==
         EulerHdgTimeTreatment::partitioned_backward_euler;
-    resolved_plan.time_control = cfl_control
+    resolved_plan.time_control = adaptive_rodas3
+        ? HdgTransactionalTimeAdapter::TimeControl::Adaptive(
+              0.0, request.options.t_final, std::abs(request.options.dt))
+        : cfl_control
         ? HdgTransactionalTimeAdapter::TimeControl::CFL(
               0.0, request.options.t_final, request.options.cfl)
         : HdgTransactionalTimeAdapter::TimeControl::Fixed(
@@ -867,7 +1684,10 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         : HdgTransactionalTimeAdapter::OutputSchedule::Disabled(
               time::backend::InitialOutputPolicy::Suppress,
               time::backend::FinalOutputPolicy::Suppress);
-    resolved_plan.time_mode = partitioned_backward_euler
+    resolved_plan.time_mode = adaptive_rodas3
+        ? HdgEulerTimeMode::AdaptiveRodas3
+        : rodas3 ? HdgEulerTimeMode::FixedRodas3
+        : partitioned_backward_euler
         ? (cfl_control
               ? HdgEulerTimeMode::CFLPartitionedBackwardEuler
               : HdgEulerTimeMode::FixedPartitionedBackwardEuler)
@@ -876,14 +1696,38 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     const mfem::io::VTKOutputConfig vtk = MakeCaseVTKConfig(request.case_config);
     resolved_plan.output = {request.options.vtk_save, vtk.prefix_path,
                             CollectionName(request, cuda_engine)};
-    time_driver = std::make_unique<HdgTransactionalTimeAdapter>(
-        resolved_plan.time_control, resolved_plan.output_schedule,
-        partitioned_backward_euler
-            ? (cfl_control
-                  ? HdgTimeControlMode::CFLPartitionedBackwardEuler
-                  : HdgTimeControlMode::FixedPartitionedBackwardEuler)
-            : (cfl_control ? HdgTimeControlMode::CFLBackwardEuler
-                           : HdgTimeControlMode::FixedBackwardEuler));
+    if (adaptive_rodas3)
+    {
+      HdgTransactionalTimeAdapter::AdaptiveControllerConfig adaptive_config;
+      adaptive_config.minimum_dt = request.options.dt_min;
+      adaptive_config.maximum_dt = request.options.t_final;
+      time_driver = restored_checkpoint
+          ? std::make_unique<HdgTransactionalTimeAdapter>(
+                resolved_plan.time_control, resolved_plan.output_schedule,
+                adaptive_config, restored_checkpoint->time_state,
+                HdgTimeControlMode::AdaptiveRodas3)
+          : std::make_unique<HdgTransactionalTimeAdapter>(
+                resolved_plan.time_control, resolved_plan.output_schedule,
+                adaptive_config, HdgTimeControlMode::AdaptiveRodas3);
+    }
+    else
+    {
+      const HdgTimeControlMode mode = rodas3
+          ? HdgTimeControlMode::FixedRodas3
+          : partitioned_backward_euler
+          ? (cfl_control
+                ? HdgTimeControlMode::CFLPartitionedBackwardEuler
+                : HdgTimeControlMode::FixedPartitionedBackwardEuler)
+          : (cfl_control ? HdgTimeControlMode::CFLBackwardEuler
+                         : HdgTimeControlMode::FixedBackwardEuler);
+      time_driver = restored_checkpoint
+          ? std::make_unique<HdgTransactionalTimeAdapter>(
+                resolved_plan.time_control, resolved_plan.output_schedule,
+                restored_checkpoint->time_state, mode)
+          : std::make_unique<HdgTransactionalTimeAdapter>(
+                resolved_plan.time_control, resolved_plan.output_schedule,
+                mode);
+    }
     if (request.options.vtk_save)
     {
       const int levels = vtk.levels_of_detail >= 0 ? vtk.levels_of_detail
@@ -904,11 +1748,23 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
           regularization.kind == RegularizationKind::igr,
           request.case_config.gamma,
           request.case_config.rk3_config.rho_min);
+      HDGParaViewOptions output_options{
+          resolved_plan.output.prefix_path,
+          resolved_plan.output.collection_name, vtk.format, levels,
+          vtk.high_order_output};
+      if (restored_checkpoint)
+      {
+        if (restored_checkpoint->time_state.output_cycle >
+            static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+          throw std::runtime_error(
+              "CUDA HDG restart output cycle exceeds ParaView range");
+        output_options.restart = HDGParaViewOptions::RestartSeed{
+            static_cast<int>(restored_checkpoint->time_state.output_cycle),
+            restored_checkpoint->time_state.cursor.current_time};
+      }
       output = std::make_unique<HDGParaViewSeries>(HDGParaViewRequest{
           context->Mesh(), output_fields->Fields(),
-          {resolved_plan.output.prefix_path,
-           resolved_plan.output.collection_name, vtk.format, levels,
-           vtk.high_order_output}});
+          std::move(output_options)});
     }
   }
   catch (...) { local_ok = false; }
@@ -919,7 +1775,12 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   std::optional<HdgTransactionalTimeAdapter::OutputEvent> initial;
   try
   {
-    initial = time_driver->InitialOutput();
+    // A restored cursor has already accounted for its initial publication.
+    // Re-emitting cycle zero would both overwrite committed output and make a
+    // split process diverge from the persisted output-cycle authority.
+    initial = restored_checkpoint
+        ? std::nullopt
+        : time_driver->InitialOutput();
     local_ok = !initial || output != nullptr;
   }
   catch (...) { local_ok = false; }
@@ -973,14 +1834,220 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         return Reject(request,
             "committed CUDA CFL proposal is invalid or below --dt-min");
     }
-    const auto& plan = time_driver->BeginStep(proposed_dt, request.options.dt_min);
+    const HdgTransactionalTimeAdapter::StepPlan plan = adaptive_rodas3
+        ? time_driver->BeginAdaptiveStep()
+        : time_driver->BeginStep(proposed_dt, request.options.dt_min);
+    const auto coordinates_before_prepare = session.coordinates();
     GenericEulerCudaPreparedStep authority;
-    CudaPreparedOutputMetadataV1 native_export{};
-    if (session.Prepare(plan.dt, authority, native_export).status !=
-        HdgEulerSessionStatus::prepared)
+    PreparedCudaOutput native_export{};
+    PreparedCudaCheckpointPayload checkpoint_payload;
+    const bool prepared_locally =
+        PrepareOutput(session, plan.dt, authority, native_export);
+    if (!CollectiveAll(request.communicator, prepared_locally))
     {
-      time_driver->RecordFailure(HdgStepFailurePhase::NonlinearSolve);
-      return Reject(request, "generic CUDA prepared step failed");
+      const bool uniformly_unprepared =
+          CollectiveAll(request.communicator, !prepared_locally);
+      const bool coordinates_unchanged = SameCoordinates(
+          coordinates_before_prepare, session.coordinates());
+      if (!uniformly_unprepared ||
+          !CollectiveAll(request.communicator, coordinates_unchanged))
+      {
+        time_driver->RecordFailure(HdgStepFailurePhase::NonlinearSolve);
+        return Reject(
+            request,
+            "generic CUDA prepare failure did not preserve collective coordinates");
+      }
+      if (!adaptive_rodas3)
+      {
+        time_driver->RecordFailure(HdgStepFailurePhase::NonlinearSolve);
+        return Reject(request, "generic CUDA prepared step failed");
+      }
+      local_ok = session.RejectFailedPrepare().status ==
+          HdgEulerSessionStatus::aborted;
+      const bool abandoned_coordinates_unchanged = SameCoordinates(
+          coordinates_before_prepare, session.coordinates());
+      if (!CollectiveAll(
+              request.communicator,
+              local_ok && abandoned_coordinates_unchanged))
+      {
+        return Reject(
+            request,
+            "CUDA adaptive failed-prepare rejection did not preserve state");
+      }
+      const HdgTransactionalTimeAdapter::AdaptiveAttempt failed_attempt{};
+      const std::string rejection = FinalizeAdaptiveRejectionOrReason(
+          request.communicator, *time_driver, plan, failed_attempt);
+      if (!rejection.empty()) return Reject(request, rejection);
+      continue;
+    }
+
+    // A test executable linked to this exact production backend may supply a
+    // private weak definition to exercise process-boundary rollback after a
+    // prescribed committed generation. Production executables have no
+    // definition and no CLI/environment stop control. The prepared candidate
+    // is aborted before assessment/output and committed coordinates must stay
+    // unchanged.
+    if (HasTestOnlyPrepareBoundaryFailureHook())
+    {
+      const bool inject_prepare_failure = TestOnlyPrepareBoundaryFailure(
+          time_driver->solver_step(), time_driver->time());
+      const bool inject_on_all_ranks =
+          CollectiveAll(request.communicator, inject_prepare_failure);
+      const bool inject_on_no_ranks =
+          CollectiveAll(request.communicator, !inject_prepare_failure);
+      if (!inject_on_all_ranks && !inject_on_no_ranks)
+      {
+        local_ok = AbortPrepared(session, authority, native_export);
+        return Reject(
+            request,
+            local_ok
+                ? "test-only CUDA prepare-boundary failure differs between ranks"
+                : "CUDA prepared abort failed after test-only gate disagreement");
+      }
+      if (inject_on_all_ranks)
+      {
+        local_ok = AbortPrepared(session, authority, native_export);
+        const bool coordinates_unchanged = SameCoordinates(
+            coordinates_before_prepare, session.coordinates());
+        time_driver->RecordFailure(HdgStepFailurePhase::NonlinearSolve);
+        if (!CollectiveAll(
+                request.communicator,
+                local_ok && coordinates_unchanged))
+        {
+          return Reject(
+              request,
+              "CUDA prepared abort failed after test-only prepare-boundary failure");
+        }
+        return Reject(
+            request,
+            "test-only CUDA prepare-boundary failure injected");
+      }
+    }
+
+    std::optional<HdgTransactionalTimeAdapter::AdaptiveDecision>
+        adaptive_decision;
+    if (rodas3)
+    {
+      const dg::hdg::generic::HdgEulerPreparedAssessmentPolicy
+          assessment_policy{request.options.time_atol,
+                            request.options.time_rtol,
+                            kRodas3AlgebraicCorrectionFraction};
+      dg::hdg::generic::HdgEulerPreparedAssessment assessment{};
+      const bool assessment_succeeded = AssessPreparedOutput(session,
+          authority, native_export, assessment_policy, assessment);
+      const bool assessment_values_valid = CollectiveAll(
+          request.communicator,
+          dg::hdg::generic::IsValidHdgEulerPreparedAssessment(assessment));
+      const bool assessment_values_collective = ExactDoubleConsensus(
+              request.communicator,
+              assessment.normalized_differential_error) &&
+          ExactDoubleConsensus(
+              request.communicator,
+              assessment.normalized_algebraic_correction);
+      const bool finite_solver_gate = CollectiveAll(
+          request.communicator,
+          assessment_succeeded && assessment.finite_gate &&
+              assessment.solver_gate);
+      const bool residual_gate = CollectiveAll(
+          request.communicator, assessment.residual_gate);
+      const bool admissibility_gate = CollectiveAll(
+          request.communicator, assessment.admissibility_gate);
+      const bool closure_gate = CollectiveAll(
+          request.communicator,
+          assessment.algebraic_closure_gate &&
+              assessment.algebraic_correction_gate);
+
+      if (adaptive_rodas3)
+      {
+        HdgTransactionalTimeAdapter::AdaptiveAttempt attempt{};
+        if (assessment_values_valid && assessment_values_collective)
+          attempt.collective_normalized_error =
+              assessment.normalized_differential_error;
+        attempt.collective_solver_success = finite_solver_gate;
+        attempt.collective_residuals_satisfied = residual_gate;
+        attempt.collective_admissible = admissibility_gate;
+        attempt.collective_algebraic_closure_satisfied = closure_gate;
+        try
+        {
+          adaptive_decision.emplace(
+              time_driver->PreviewAdaptiveDecision(attempt));
+          local_ok = true;
+        }
+        catch (...)
+        {
+          local_ok = false;
+        }
+        if (!CollectiveAll(request.communicator, local_ok) ||
+            !ExactDoubleConsensus(
+                request.communicator, adaptive_decision->next_dt()))
+        {
+          local_ok = AbortPrepared(session, authority, native_export);
+          if (!CollectiveAll(request.communicator, local_ok))
+            return Reject(
+                request,
+                "CUDA abort failed after adaptive decision failure");
+          return Reject(
+              request, "adaptive CUDA RODAS3 decision construction failed");
+        }
+        const bool collectively_accepted = CollectiveAll(
+            request.communicator, adaptive_decision->Accepted());
+        const bool collectively_rejected = CollectiveAll(
+            request.communicator, !adaptive_decision->Accepted());
+        if (!collectively_accepted && !collectively_rejected)
+        {
+          local_ok = AbortPrepared(session, authority, native_export);
+          if (!CollectiveAll(request.communicator, local_ok))
+            return Reject(
+                request,
+                "CUDA abort failed after adaptive decision divergence");
+          return Reject(
+              request, "adaptive CUDA RODAS3 acceptance differs between ranks");
+        }
+        if (collectively_rejected)
+        {
+          local_ok = RejectPreparedOutput(session, authority, native_export);
+          const bool coordinates_unchanged = SameCoordinates(
+              coordinates_before_prepare, session.coordinates());
+          if (!CollectiveAll(
+                  request.communicator,
+                  local_ok && coordinates_unchanged))
+          {
+            return Reject(
+                request, "CUDA adaptive prepared-step rejection failed");
+          }
+          const HdgTransactionalTimeAdapter::AdaptiveAttempt rejected_attempt{
+              assessment_values_valid && assessment_values_collective
+                  ? assessment.normalized_differential_error
+                  : std::numeric_limits<double>::infinity(),
+              finite_solver_gate,
+              residual_gate,
+              admissibility_gate,
+              closure_gate};
+          const std::string rejection = FinalizeAdaptiveRejectionOrReason(
+              request.communicator, *time_driver, plan, rejected_attempt);
+          if (!rejection.empty()) return Reject(request, rejection);
+          continue;
+        }
+      }
+      else
+      {
+        const bool fixed_assessment_accepted = CollectiveAll(
+            request.communicator,
+            assessment_values_valid && assessment_values_collective &&
+                finite_solver_gate && residual_gate && admissibility_gate &&
+                closure_gate);
+        if (!fixed_assessment_accepted)
+        {
+          local_ok = AbortPrepared(session, authority, native_export);
+          if (!CollectiveAll(request.communicator, local_ok))
+            return Reject(
+                request,
+                "CUDA abort failed after fixed RODAS3 assessment rejection");
+          return Reject(
+              request,
+              "fixed CUDA RODAS3 assessment rejected its algebraic correction or solver gates");
+        }
+      }
     }
 
     std::optional<HdgTransactionalTimeAdapter::OutputEvent> preview;
@@ -1018,8 +2085,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
             local_ok ? "CUDA prepared-state output view failed"
                      : "CUDA prepared abort failed after output-view failure");
       }
-      local_ok = session.ExportPreparedFields(authority, native_export,
-                                              destination);
+      local_ok = ExportPreparedOutputFields(
+          session, authority, native_export, destination);
       if (!CollectiveAll(request.communicator, local_ok))
       {
         local_ok = AbortPrepared(session, authority, native_export);
@@ -1038,7 +2105,61 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
                      : "CUDA prepared abort failed after derived-field failure");
       }
     }
-    if (!session.AcknowledgePreparedOutput(authority, native_export))
+    if (publish_checkpoints)
+    {
+      constexpr std::uint64_t maximum_coefficients =
+          dg::hdg::runtime::app::
+              generic_hdg_cuda_checkpoint_maximum_bytes_v1 /
+          sizeof(double);
+      local_ok = native_export.interior_count > 0 &&
+          native_export.owned_true_trace_count > 0 &&
+          native_export.interior_count <= maximum_coefficients &&
+          native_export.owned_true_trace_count <=
+              maximum_coefficients - native_export.interior_count &&
+          native_export.interior_count <=
+              std::numeric_limits<std::size_t>::max() &&
+          native_export.owned_true_trace_count <=
+              std::numeric_limits<std::size_t>::max();
+      if (local_ok)
+      {
+        try
+        {
+          checkpoint_payload.interior.resize(
+              static_cast<std::size_t>(native_export.interior_count));
+          checkpoint_payload.owned_true_trace.resize(
+              static_cast<std::size_t>(
+                  native_export.owned_true_trace_count));
+        }
+        catch (...) { local_ok = false; }
+      }
+      if (!CollectiveAll(request.communicator, local_ok))
+      {
+        local_ok = AbortPrepared(session, authority, native_export);
+        time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+        return Reject(
+            request,
+            local_ok ? "CUDA checkpoint payload allocation failed"
+                     : "CUDA prepared abort failed after checkpoint allocation failure");
+      }
+      local_ok = session.ExportPreparedCheckpointPayload(
+          authority, native_export,
+          GenericEulerCudaMutableCheckpointPayloadV1{
+              checkpoint_payload.interior.data(),
+              checkpoint_payload.interior.size(),
+              checkpoint_payload.owned_true_trace.data(),
+              checkpoint_payload.owned_true_trace.size()});
+      if (!CollectiveAll(request.communicator, local_ok))
+      {
+        local_ok = AbortPrepared(session, authority, native_export);
+        time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+        return Reject(
+            request,
+            local_ok ? "CUDA prepared checkpoint payload export failed"
+                     : "CUDA prepared abort failed after checkpoint export failure");
+      }
+      checkpoint_payload.staged = true;
+    }
+    if (!AcknowledgePreparedOutput(session, authority, native_export))
     {
       local_ok = AbortPrepared(session, authority, native_export);
       time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
@@ -1046,18 +2167,46 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
           local_ok ? "CUDA prepared output acknowledgement failed"
                    : "CUDA prepared abort failed after acknowledgement failure");
     }
-    if (session.Commit(std::move(authority), native_export).status !=
-        HdgEulerSessionStatus::committed)
+    std::optional<HdgTransactionalTimeAdapter::OutputEvent> preflight;
+    try
+    {
+      preflight = adaptive_rodas3
+          ? time_driver->PreflightAdaptiveSuccess(*adaptive_decision)
+          : time_driver->PreflightSuccess();
+      local_ok = preflight.has_value() == preview.has_value();
+      if (local_ok && preview)
+        local_ok = preflight->cycle == preview->cycle &&
+            preflight->time == preview->time &&
+            preflight->is_initial == preview->is_initial &&
+            preflight->is_final == preview->is_final;
+    }
+    catch (...) { local_ok = false; }
+    if (!CollectiveAll(request.communicator, local_ok))
+    {
+      local_ok = AbortPrepared(session, authority, native_export);
+      return Reject(
+          request,
+          local_ok ? "CUDA time transaction preflight failed"
+                   : "CUDA prepared abort failed after time preflight failure");
+    }
+    if (!CommitPreparedOutput(session, authority, native_export))
       return Reject(request, "generic CUDA prepared commit failed");
     // Publication remains post-commit.  On an output step the explicit export
     // copied the frozen candidate into this private host view, acknowledgement
     // bound that export to the affine authority, and Commit published that
     // exact candidate without mutating the host bytes.  A no-output step needs
-    // only the already-staged native metadata acknowledgement and never
-    // materializes the full interior on the host.
+    // only the already-staged native metadata acknowledgement.  The explicit
+    // checkpoint opt-in separately stages exact dynamic interior and trace
+    // payloads while the same affine candidate remains abortable.
 
     std::optional<HdgTransactionalTimeAdapter::OutputEvent> finalized;
-    try { finalized = time_driver->FinalizeSuccess(); local_ok = true; }
+    try
+    {
+      finalized = adaptive_rodas3
+          ? time_driver->FinalizeAdaptiveSuccess(*adaptive_decision)
+          : time_driver->FinalizeSuccess();
+      local_ok = true;
+    }
     catch (...) { local_ok = false; }
     if (!CollectiveAll(request.communicator, local_ok))
       return Reject(request,
@@ -1078,6 +2227,46 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       if (!CollectiveAll(request.communicator, local_ok))
         return Reject(request, "CUDA ParaView output failed after commit");
     }
+    if (publish_checkpoints)
+    {
+      HdgTransactionalTimeAdapter::RestartState time_state{};
+      try
+      {
+        time_state = time_driver->CheckpointState();
+        local_ok = checkpoint_payload.staged &&
+            native_export.successful_commit &&
+            native_export.descriptor.coordinates.time ==
+                time_state.cursor.current_time &&
+            native_export.descriptor.coordinates.step ==
+                time_state.cursor.committed_steps;
+      }
+      catch (...) { local_ok = false; }
+      if (!CollectiveAll(request.communicator, local_ok) ||
+          !PublishCudaCheckpoint(
+              request.communicator, request.options.hdg_checkpoint,
+              checkpoint_numerical_identity, time_state, native_export,
+              checkpoint_payload))
+        return Reject(request,
+                      "generic CUDA HDG checkpoint publication failed");
+    }
+  }
+
+  HdgTransactionalTimeAdapter::AdaptiveControllerState adaptive_state{};
+  if (adaptive_rodas3)
+  {
+    try
+    {
+      adaptive_state = time_driver->AdaptiveCheckpointState();
+      local_ok = adaptive_state.accepted_steps ==
+          time_driver->solver_step();
+    }
+    catch (...)
+    {
+      local_ok = false;
+    }
+    if (!CollectiveAll(request.communicator, local_ok))
+      return Reject(
+          request, "adaptive CUDA RODAS3 final controller state is invalid");
   }
 
   if (IsRoot(request.communicator))
@@ -1129,7 +2318,10 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
               << " regularization="
               << (regularization.kind == RegularizationKind::igr ? "igr" : "none")
               << " alpha=" << regularization.alpha
-              << " beta=" << regularization.beta << '\n';
+              << " beta=" << regularization.beta;
+    if (adaptive_rodas3)
+      std::cout << " rejected_attempts=" << adaptive_state.rejected_attempts;
+    std::cout << '\n';
   }
   return 0;
 }

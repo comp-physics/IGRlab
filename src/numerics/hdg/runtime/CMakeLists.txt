@@ -314,7 +314,8 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
       SOURCES "${PROJECT_SOURCE_DIR}/src/sim/hdg/main_backend_cuda.cu"
       PRIVATE_LINK_LIBRARIES
         dg_igr_hdg_runtime_cuda
-        dg_igr_hdg_generic_cpu)
+        dg_igr_hdg_generic_cpu
+        dg_igr_hdg_runtime_app_contract)
   elseif(_dg_igr_hdg_runtime_cuda_sources)
     message(STATUS
             "HDG CUDA sources are reserved but not built by the requested CPU profile.")

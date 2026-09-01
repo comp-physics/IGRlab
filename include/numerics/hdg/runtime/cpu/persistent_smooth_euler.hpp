@@ -217,6 +217,9 @@ struct CpuWorkCensus
   std::uint64_t accepted_newton_updates = 0;
   std::uint64_t phase_entries = 0;
   std::uint64_t phase_completions = 0;
+  std::uint64_t common_shift_operator_builds = 0;
+  std::uint64_t common_shift_operator_reuses = 0;
+  std::uint64_t condensed_rhs_refreshes = 0;
 };
 
 struct CpuStorageEvidence
@@ -275,6 +278,10 @@ struct CpuAttemptEvidence
   double minimum_density = 0.0;
   double minimum_pressure = 0.0;
   double maximum_wave_speed = 0.0;
+  double temporal_error_norm = 0.0;
+  double initial_algebraic_correction_norm = 0.0;
+  double final_algebraic_residual = 0.0;
+  double final_algebraic_correction_norm = 0.0;
   StateHash committed_interior_before{};
   StateHash committed_trace_before{};
   StateHash committed_interior_after{};
@@ -762,6 +769,11 @@ public:
   /** Prepare one borrowed candidate without changing the committed slot. */
   bool PrepareBorrowedEuler(double, StateCoordinates&,
                             std::uint64_t&) noexcept;
+  /** Assess one live RODAS3 candidate without exposing internal evidence. */
+  bool AssessPreparedBorrowedEuler(
+      std::uint64_t,
+      generic::HdgEulerPreparedAssessmentPolicy,
+      generic::HdgEulerPreparedAssessment&) noexcept;
   /** Publish exactly one active prepared candidate. */
   bool CommitBorrowedEuler(std::uint64_t, StateCoordinates&, double&,
                            double&) noexcept;
@@ -828,17 +840,27 @@ public:
 private:
   friend struct CpuQualificationTestAccess;
   /**
-   * Central-difference audit of the live borrowed IGR assembler.  The
-   * qualification translation unit reaches it only through the private
-   * friend above; this method stages and publishes no solver state.
+   * Central-difference audit of the live borrowed assembler.  RODAS requests
+   * the refreshed exact-J nonlinearities; BE/PBE retain their established
+   * frozen/Picard audit.  The qualification translation unit reaches it only
+   * through the private friend above; this stages and publishes no state.
    */
   bool AuditBorrowedEulerAssemblerJacobian(
       double relative_tolerance,
       std::array<double, 6>& relative_errors) noexcept;
+  bool AuditRodasAlgebraicBlockSolvability(
+      double& algebraic_residual, double& correction_norm) noexcept;
+  bool AuditPreparedRodasStageEquations(
+      std::array<double, 4>& absolute_residuals,
+      std::array<double, 4>& relative_residuals,
+      std::array<double, 4>& counterfactual_relative_residuals,
+      double& maximum_zero_mass_entry) noexcept;
   bool AuditBorrowedEulerLlfPolicy(
       double& base_stabilization, double& refreshed_stabilization,
       double& frozen_jacobian_relative_error,
       double& refreshed_candidate_relative_difference) noexcept;
+  bool AuditPreparedRodasEndpointConservation(
+      double& maximum_error, double& maximum_relative_error) noexcept;
   bool ArmExactZeroInitialResidualForTests() noexcept;
   bool AuditLastBorrowedEulerConservation(
       double& maximum_error, double& maximum_relative_error,

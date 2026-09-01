@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iterator>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -48,6 +49,14 @@ void ValidateRequest(const HDGParaViewRequest& request)
   {
     throw std::invalid_argument(
         "HDG ParaView requires at least one physical interior field");
+  }
+  if (request.options.restart &&
+      (request.options.restart->last_cycle < 0 ||
+       !std::isfinite(request.options.restart->committed_time)))
+  {
+    throw std::invalid_argument(
+        "HDG ParaView restart seed must have a non-negative cycle and "
+        "finite committed time");
   }
 
   std::unordered_set<std::string> names;
@@ -162,6 +171,76 @@ bool TextContains(const std::filesystem::path& path,
   return !input.bad() && text.find(token) != std::string::npos;
 }
 
+struct HistoricalPublication
+{
+  int cycle = -1;
+  double time = 0.0;
+};
+
+bool ValidateRestartHistory(
+    const std::filesystem::path& root,
+    const std::string& collection_name,
+    const HDGParaViewOptions::RestartSeed& seed,
+    const int rank,
+    const int ranks)
+{
+  const std::filesystem::path pvd = root / (collection_name + ".pvd");
+  if (!StructurallyCompleteXml(pvd)) return false;
+  std::ifstream input(pvd);
+  if (!input) return false;
+  const std::regex entry(
+      "timestep=\"([^\"]+)\".*file=\"Cycle([0-9]+)/data\\.pvtu\"");
+  std::vector<HistoricalPublication> publications;
+  std::string line;
+  try
+  {
+    std::smatch match;
+    while (std::getline(input, line))
+    {
+      if (!std::regex_search(line, match, entry)) continue;
+      if (match.size() != 3) return false;
+      const double time = std::stod(match[1].str());
+      const int cycle = std::stoi(match[2].str());
+      if (!std::isfinite(time) || cycle < 0) return false;
+      if (!publications.empty() &&
+          (cycle != publications.back().cycle + 1 ||
+           !(time > publications.back().time)))
+        return false;
+      publications.push_back({cycle, time});
+    }
+  }
+  catch (...)
+  {
+    return false;
+  }
+  if (input.bad() || publications.empty() ||
+      publications.front().cycle > 1 ||
+      publications.back().cycle != seed.last_cycle ||
+      publications.back().time > seed.committed_time)
+    return false;
+
+  for (const HistoricalPublication& publication : publications)
+  {
+    const std::filesystem::path cycle =
+        root / ("Cycle" + Padded(publication.cycle));
+    const std::filesystem::path local_vtu =
+        cycle / ("proc" + Padded(rank) + ".vtu");
+    if (!StructurallyCompleteXml(local_vtu)) return false;
+    if (rank == 0)
+    {
+      const std::filesystem::path pvtu = cycle / "data.pvtu";
+      if (!StructurallyCompleteXml(pvtu)) return false;
+      for (int source_rank = 0; source_rank < ranks; ++source_rank)
+      {
+        if (!TextContains(pvtu,
+                          "proc" + Padded(source_rank) + ".vtu"))
+          return false;
+      }
+    }
+  }
+  return true;
+}
+
 } // namespace
 
 HDGParaViewSeries::HDGParaViewSeries(const HDGParaViewRequest& request)
@@ -182,6 +261,21 @@ HDGParaViewSeries::HDGParaViewSeries(const HDGParaViewRequest& request)
       (std::filesystem::path(request.options.prefix_path) /
        collection_name_).string();
 
+  if (request.options.restart)
+  {
+    const bool history_valid = ValidateRestartHistory(
+        std::filesystem::path(collection_path_), collection_name_,
+        *request.options.restart, rank_, ranks_);
+    if (!CollectiveAll(communicator_, history_valid))
+    {
+      throw std::invalid_argument(
+          "HDG ParaView restart history is missing, stale, or malformed");
+    }
+    last_cycle_ = request.options.restart->last_cycle;
+    committed_time_floor_ = request.options.restart->committed_time;
+    has_committed_time_floor_ = true;
+  }
+
   // Passing the caller's ParMesh directly preserves its rank-local geometry
   // and partition.  ParaViewDataCollection writes one VTU per rank and its
   // rank-zero PVTU/PVD coordination; this adapter performs no gather.
@@ -192,6 +286,7 @@ HDGParaViewSeries::HDGParaViewSeries(const HDGParaViewRequest& request)
   collection_->SetLevelsOfDetail(request.options.levels_of_detail);
   collection_->SetHighOrderOutput(request.options.high_order_output);
   collection_->SetDataFormat(request.options.data_format);
+  collection_->UseRestartMode(request.options.restart.has_value());
 
   for (const HDGInteriorFieldView& view : request.interior_fields)
   {
@@ -211,7 +306,9 @@ void HDGParaViewSeries::Write(const HDGParaViewMetadata& metadata)
   try
   {
     ValidateMetadata(metadata);
-    metadata_ready = metadata.cycle > last_cycle_;
+    metadata_ready = metadata.cycle > last_cycle_ &&
+        (!has_committed_time_floor_ ||
+         metadata.time > committed_time_floor_);
     cycle = "Cycle" + Padded(metadata.cycle);
     root = std::filesystem::path(collection_path_);
     cycle_path = root / cycle;
@@ -310,6 +407,8 @@ void HDGParaViewSeries::Write(const HDGParaViewMetadata& metadata)
         "HDG ParaView publication is incomplete on at least one rank");
   }
   last_cycle_ = metadata.cycle;
+  committed_time_floor_ = metadata.time;
+  has_committed_time_floor_ = true;
 }
 
 } // namespace dg_sim::hdg

@@ -20,6 +20,13 @@ namespace dg::hdg::runtime::cpu::detail
 
 struct CpuQualificationTestAccess
 {
+  static bool SameCheckpointState(
+      const GenericEulerCpuCheckpoint& left,
+      const GenericEulerCpuCheckpoint& right) noexcept
+  {
+    return left.SameStateForTests(right);
+  }
+
   static bool AuditLastConservation(
       const CpuNumericsCore& core, double& maximum_error,
       double& maximum_relative_error, bool& gate) noexcept
@@ -28,12 +35,40 @@ struct CpuQualificationTestAccess
         maximum_error, maximum_relative_error, gate);
   }
 
+  static bool AuditPreparedRodasEndpointConservation(
+      CpuNumericsCore& core, double& maximum_error,
+      double& maximum_relative_error) noexcept
+  {
+    return core.AuditPreparedRodasEndpointConservation(
+        maximum_error, maximum_relative_error);
+  }
+
   static bool VerifyAssemblerJacobian(
       CpuNumericsCore& core, const double relative_tolerance,
       std::array<double, 6>& relative_errors) noexcept
   {
     return core.AuditBorrowedEulerAssemblerJacobian(
         relative_tolerance, relative_errors);
+  }
+
+  static bool VerifyRodasAlgebraicBlock(
+      CpuNumericsCore& core, double& algebraic_residual,
+      double& correction_norm) noexcept
+  {
+    return core.AuditRodasAlgebraicBlockSolvability(
+        algebraic_residual, correction_norm);
+  }
+
+  static bool AuditPreparedRodasStageEquations(
+      CpuNumericsCore& core,
+      std::array<double, 4>& absolute_residuals,
+      std::array<double, 4>& relative_residuals,
+      std::array<double, 4>& counterfactual_relative_residuals,
+      double& maximum_zero_mass_entry) noexcept
+  {
+    return core.AuditPreparedRodasStageEquations(
+        absolute_residuals, relative_residuals,
+        counterfactual_relative_residuals, maximum_zero_mass_entry);
   }
 
   static bool VerifyLlfPolicy(
@@ -73,8 +108,10 @@ using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::generic::EulerHdgTimeTreatment;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::runtime::cpu::ExecuteGenericEulerHdgCpu;
+using dg::hdg::runtime::cpu::GenericEulerCpuCheckpoint;
 using dg::hdg::runtime::cpu::GenericEulerCpuPreparedStep;
 using dg::hdg::runtime::cpu::GenericEulerCpuSessionResult;
+using dg::hdg::runtime::cpu::GenericEulerCpuSessionCoordinates;
 using dg::hdg::runtime::cpu::GenericEulerCpuSessionStatus;
 using dg::hdg::runtime::cpu::GenericEulerHdgCpuSession;
 using dg::hdg::runtime::cpu::RestartGenericEulerHdgCpu;
@@ -130,15 +167,44 @@ bool FixedExteriorForAssemblerJacobianForTests(
     return false;
   }
   ++context->calls;
-  // The production physical-boundary Jacobian deliberately freezes the
-  // Euler exterior-state callback (Picard linearization).  Keep this test
-  // callback independent of the perturbed state so finite differences check
-  // that exact contract while still exercising every physical face row.
+  // BE/PBE deliberately freeze the exterior-state callback (Picard
+  // linearization).  Keep this legacy audit callback independent of the
+  // perturbed state while still exercising every physical face row; the
+  // separate RODAS3 audit below uses state-dependent boundary maps.
   exterior[0] = 1.1;
   exterior[1] = 0.03 * point.outward_normal[0];
   exterior[2] = 0.03 * point.outward_normal[1];
   exterior[3] = 2.9;
   return true;
+}
+
+bool SmoothAutonomousExteriorForRodasJacobianForTests(
+    const void* opaque,
+    const dg::hdg::generic::BoundaryPointView& point,
+    const double* interior, double* exterior) noexcept
+{
+  auto* const context = static_cast<BoundaryContext*>(const_cast<void*>(opaque));
+  if (context == nullptr || context->fail || point.space_dimension != 2 ||
+      point.position == nullptr || point.outward_normal == nullptr ||
+      point.boundary_attribute <= 0 || interior == nullptr ||
+      exterior == nullptr)
+  {
+    return false;
+  }
+  ++context->calls;
+  const double rho = interior[0];
+  const double mx = interior[1];
+  const double my = interior[2];
+  const double energy = interior[3];
+  exterior[0] = 0.95 + 0.05 * rho + 0.01 * rho * rho;
+  exterior[1] = 0.10 * mx - 0.05 * my +
+      0.02 * rho * point.outward_normal[0];
+  exterior[2] = 0.10 * my - 0.05 * mx +
+      0.02 * rho * point.outward_normal[1];
+  exterior[3] = 2.50 + 0.10 * energy +
+      0.01 * (mx * mx + my * my);
+  return std::all_of(exterior, exterior + 4,
+                     [](const double value) { return std::isfinite(value); });
 }
 
 bool CheckBoundaryExteriorSemantics()
@@ -304,6 +370,18 @@ bool All(const bool local, const MPI_Comm communicator = MPI_COMM_WORLD)
                        communicator) == MPI_SUCCESS && result == 1;
 }
 
+bool SameSessionCoordinates(
+    const dg::hdg::runtime::cpu::GenericEulerCpuSessionCoordinates& left,
+    const dg::hdg::runtime::cpu::GenericEulerCpuSessionCoordinates& right)
+    noexcept
+{
+  return dg::hdg::generic::DoubleBits(left.time) ==
+          dg::hdg::generic::DoubleBits(right.time) &&
+      left.step == right.step && left.generation == right.generation &&
+      dg::hdg::generic::DoubleBits(left.dt) ==
+          dg::hdg::generic::DoubleBits(right.dt);
+}
+
 bool LinearWorkAccountingExact(
     const dg::hdg::runtime::cpu::CpuAttemptEvidence& attempt) noexcept
 {
@@ -394,11 +472,138 @@ double MaximumScaledDifference(const std::vector<double>& left,
   return maximum;
 }
 
+double QuadratureScaledU4Difference(
+    const mfem::ParMesh& mesh, const int order,
+    const std::vector<double>& left, const std::vector<double>& right,
+    const double absolute_tolerance, const double relative_tolerance) noexcept
+{
+  if (order < 1 || left.size() != right.size() ||
+      !std::isfinite(absolute_tolerance) || absolute_tolerance < 0.0 ||
+      !std::isfinite(relative_tolerance) || relative_tolerance < 0.0 ||
+      (absolute_tolerance == 0.0 && relative_tolerance == 0.0))
+  {
+    return std::numeric_limits<double>::infinity();
+  }
+  double local_squared = 0.0;
+  double local_measure = 0.0;
+  bool local_valid = true;
+  const auto collective_all = [&mesh](const bool value) noexcept
+  {
+    const int local = value ? 1 : 0;
+    int global = 0;
+    return MPI_Allreduce(&local, &global, 1, MPI_INT, MPI_MIN,
+                         mesh.GetComm()) == MPI_SUCCESS && global == 1;
+  };
+  try
+  {
+    mfem::L2_FECollection collection(
+        order, 2, mfem::BasisType::GaussLegendre,
+        mfem::FiniteElement::VALUE);
+    mfem::ParFiniteElementSpace space(
+        const_cast<mfem::ParMesh*>(&mesh), &collection, 4,
+        mfem::Ordering::byNODES);
+    local_valid = left.size() == static_cast<std::size_t>(space.GetVSize());
+    mfem::Array<int> vdofs;
+    mfem::Vector shape;
+    for (int element = 0; element < mesh.GetNE() && local_valid; ++element)
+    {
+      const mfem::FiniteElement* const finite_element = space.GetFE(element);
+      mfem::ElementTransformation* const transformation =
+          const_cast<mfem::ParMesh&>(mesh).GetElementTransformation(element);
+      local_valid = finite_element != nullptr && transformation != nullptr;
+      if (!local_valid) break;
+      const int scalar_dofs = finite_element->GetDof();
+      shape.SetSize(scalar_dofs);
+      space.GetElementVDofs(element, vdofs);
+      local_valid = vdofs.Size() == 4 * scalar_dofs;
+      const mfem::IntegrationRule& rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), 2 * order + 6);
+      for (int q = 0; q < rule.GetNPoints() && local_valid; ++q)
+      {
+        const mfem::IntegrationPoint& point = rule.IntPoint(q);
+        transformation->SetIntPoint(&point);
+        finite_element->CalcShape(point, shape);
+        const double weight = point.weight * transformation->Weight();
+        local_valid = std::isfinite(weight) && weight > 0.0;
+        if (!local_valid) break;
+        local_measure += weight;
+        for (int component = 0; component < 4 && local_valid; ++component)
+        {
+          double before = 0.0;
+          double after = 0.0;
+          for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+          {
+            const int signed_dof = vdofs[component * scalar_dofs + scalar];
+            const int dof = signed_dof < 0 ? -1 - signed_dof : signed_dof;
+            const double sign = signed_dof < 0 ? -1.0 : 1.0;
+            local_valid = dof >= 0 &&
+                static_cast<std::size_t>(dof) < left.size() &&
+                std::isfinite(shape[scalar]);
+            if (!local_valid) break;
+            before += shape[scalar] * sign *
+                left[static_cast<std::size_t>(dof)];
+            after += shape[scalar] * sign *
+                right[static_cast<std::size_t>(dof)];
+          }
+          const double scale = absolute_tolerance + relative_tolerance *
+              std::max(std::abs(before), std::abs(after));
+          local_valid = local_valid && std::isfinite(before) &&
+              std::isfinite(after) && std::isfinite(scale) && scale > 0.0;
+          if (local_valid)
+          {
+            const double normalized = (before - after) / scale;
+            local_squared += weight * normalized * normalized;
+            local_valid = std::isfinite(local_squared) &&
+                std::isfinite(local_measure);
+          }
+        }
+      }
+    }
+  }
+  catch (...) { local_valid = false; }
+  if (!collective_all(local_valid))
+    return std::numeric_limits<double>::infinity();
+  double global_squared = 0.0;
+  double global_measure = 0.0;
+  const bool reduced = MPI_Allreduce(
+          &local_squared, &global_squared, 1, MPI_DOUBLE, MPI_SUM,
+          mesh.GetComm()) == MPI_SUCCESS &&
+      MPI_Allreduce(&local_measure, &global_measure, 1, MPI_DOUBLE, MPI_SUM,
+                    mesh.GetComm()) == MPI_SUCCESS;
+  if (!collective_all(reduced && std::isfinite(global_squared) &&
+                      global_squared >= 0.0 &&
+                      std::isfinite(global_measure) &&
+                      global_measure > 0.0))
+  {
+    return std::numeric_limits<double>::infinity();
+  }
+  return std::sqrt(global_squared / (4.0 * global_measure));
+}
+
 struct OneStepEulerState
 {
   std::vector<double> interior_u4;
   std::vector<double> trace_uhat4;
+  double temporal_error_norm = std::numeric_limits<double>::infinity();
+  double normalized_temporal_error =
+      std::numeric_limits<double>::infinity();
+  double normalized_algebraic_correction =
+      std::numeric_limits<double>::infinity();
 };
+
+bool AssessPreparedRodas3(
+    dg::hdg::runtime::cpu::detail::CpuNumericsCore& core,
+    const std::uint64_t generation,
+    dg::hdg::generic::HdgEulerPreparedAssessment* const captured = nullptr)
+{
+  constexpr dg::hdg::generic::HdgEulerPreparedAssessmentPolicy policy{
+      1.0e-8, 1.0e-5, 0.25};
+  dg::hdg::generic::HdgEulerPreparedAssessment assessment{};
+  const bool assessed = core.AssessPreparedBorrowedEuler(
+      generation, policy, assessment);
+  if (assessed && captured != nullptr) *captured = assessment;
+  return assessed && assessment.algebraic_correction_gate;
+}
 
 bool RunEulerSteps(
     const mfem::ParMesh& mesh, const ExactBorrowedEulerFields& fields,
@@ -418,16 +623,28 @@ bool RunEulerSteps(
   dg::hdg::runtime::StateCoordinates coordinates{};
   double maximum_wave_speed = 0.0;
   double stable_dt = 0.0;
+  dg::hdg::generic::HdgEulerPreparedAssessment last_assessment{};
   for (int step = 0; step < accepted_steps; ++step)
   {
     std::uint64_t generation = 0;
     if (!core.PrepareBorrowedEuler(dt, coordinates, generation) ||
         generation == 0 ||
+        (time_treatment == EulerHdgTimeTreatment::rodas3 &&
+         !AssessPreparedRodas3(core, generation, &last_assessment)) ||
         !core.CommitBorrowedEuler(generation, coordinates,
                                   maximum_wave_speed, stable_dt))
     {
       return false;
     }
+  }
+  result.temporal_error_norm =
+      core.evidence().last_attempt.temporal_error_norm;
+  if (time_treatment == EulerHdgTimeTreatment::rodas3)
+  {
+    result.normalized_temporal_error =
+        last_assessment.normalized_differential_error;
+    result.normalized_algebraic_correction =
+        last_assessment.normalized_algebraic_correction;
   }
 
   result.interior_u4.assign(fields.initial.size(), 0.0);
@@ -800,8 +1017,14 @@ bool CheckPreparedSessionLifecycle()
           dg::hdg::generic::HdgEulerSessionCapability::committed_cfl_diagnostics) |
       dg::hdg::generic::HdgEulerSessionCapabilityBit(
           dg::hdg::generic::HdgEulerSessionCapability::generic_borrowed_inputs);
+  const std::uint32_t assessment_capability =
+      dg::hdg::generic::HdgEulerSessionCapabilityBit(
+          dg::hdg::generic::HdgEulerSessionCapability::
+              prepared_embedded_assessment);
   if (!dg::hdg::generic::HasHdgEulerSessionCapabilities(
           session.capabilities(), required_capabilities) ||
+      dg::hdg::generic::HasHdgEulerSessionCapabilities(
+          session.capabilities(), assessment_capability) ||
       !dg::hdg::generic::IsValidHdgEulerCommittedDiagnostics(
           session.diagnostics(), session.capabilities()) ||
       !MatchesCommittedCflDiagnostic(session.diagnostics(), mesh, 1))
@@ -1191,6 +1414,848 @@ bool CheckNaturalFreeStreamPreservation()
       stable_dt > 0.0 && boundary.calls == 0;
 }
 
+bool CheckRodas3CommonShiftFreeStream()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> free_stream{{1.0, 1.0, 0.20, 0.20,
+                                           -0.10, -0.10, 2.60, 2.60}};
+  const std::array<double, 8> source{};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, free_stream, source);
+  EulerHdgRequest request = Request(
+      mesh, 1, boundary, fields, EulerHdgTimeTreatment::rodas3);
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  if (!core.InitializeBorrowedEuler(request) ||
+      core.evidence().tuple.time_treatment.view() !=
+          "rodas3-common-gamma.v1")
+  {
+    std::cerr << "RODAS3 free-stream initialization failed\n";
+    return false;
+  }
+  std::vector<double> before(fields.initial.size(), 0.0);
+  std::vector<double> after(fields.initial.size(), 0.0);
+  if (!core.ExportCommittedInterior(before.data(), before.size())) return false;
+  dg::hdg::runtime::StateCoordinates coordinates{};
+  std::uint64_t generation = 0;
+  constexpr double dt = 1.0e-3;
+  if (!core.PrepareBorrowedEuler(dt, coordinates, generation) ||
+      generation == 0)
+  {
+    const auto& failed = core.evidence().last_attempt;
+    std::cerr << "RODAS3 free-stream prepare failed status="
+              << static_cast<int>(failed.status) << " phase="
+              << static_cast<int>(failed.failure_phase) << " assemblies="
+              << failed.work.complete_assemblies << " condensations="
+              << failed.work.complete_condensations << " solves="
+              << failed.work.complete_trace_solves << " recoveries="
+              << failed.work.complete_recoveries << " builds="
+              << failed.work.common_shift_operator_builds << " reuses="
+              << failed.work.common_shift_operator_reuses << " rhs_refreshes="
+              << failed.work.condensed_rhs_refreshes << '\n';
+    return false;
+  }
+  double maximum_wave_speed = 0.0;
+  double stable_dt = 0.0;
+  if (!AssessPreparedRodas3(core, generation) ||
+      !core.CommitBorrowedEuler(generation, coordinates,
+                                maximum_wave_speed, stable_dt) ||
+      !core.ExportCommittedInterior(after.data(), after.size()))
+  {
+    std::cerr << "RODAS3 free-stream commit/export failed\n";
+    return false;
+  }
+  const auto& attempt = core.evidence().last_attempt;
+  const bool passed = after == before && attempt.committed &&
+      attempt.status == dg::hdg::runtime::cpu::CpuAttemptStatus::success &&
+      attempt.work.common_shift_operator_builds == 1 &&
+      attempt.work.common_shift_operator_reuses == 3 &&
+      attempt.work.condensed_rhs_refreshes == 3 &&
+      attempt.work.complete_factor_setups <
+          attempt.work.complete_trace_solves &&
+      attempt.work.complete_trace_solves >= 4 &&
+      attempt.work.complete_recoveries ==
+          attempt.work.complete_trace_solves &&
+      attempt.temporal_error_norm <=
+          64.0 * std::numeric_limits<double>::epsilon() &&
+      attempt.final_algebraic_correction_norm == 0.0 &&
+      attempt.finite_gate && attempt.admissibility_gate &&
+      attempt.recovery_gate && attempt.nonlinear_gate &&
+      attempt.true_residual_gate && boundary.calls == 0 &&
+      coordinates.step == 1 && coordinates.generation == 1 &&
+      coordinates.time == dt && coordinates.dt == dt &&
+      std::isfinite(maximum_wave_speed) && maximum_wave_speed > 0.0 &&
+      std::isfinite(stable_dt) && stable_dt > 0.0;
+  if (!passed)
+  {
+    std::cerr << "RODAS3 free-stream evidence mismatch state_equal="
+              << (after == before) << " status="
+              << static_cast<int>(attempt.status) << " committed="
+              << attempt.committed << " builds="
+              << attempt.work.common_shift_operator_builds << " reuses="
+              << attempt.work.common_shift_operator_reuses << " rhs_refreshes="
+              << attempt.work.condensed_rhs_refreshes << " setups="
+              << attempt.work.complete_factor_setups << " solves="
+              << attempt.work.complete_trace_solves << " recoveries="
+              << attempt.work.complete_recoveries << " temporal_error="
+              << attempt.temporal_error_norm << " algebraic_correction="
+              << attempt.final_algebraic_correction_norm << " gates="
+              << attempt.finite_gate << attempt.admissibility_gate
+              << attempt.recovery_gate << attempt.nonlinear_gate
+              << attempt.true_residual_gate << " coordinates="
+              << coordinates.time << ',' << coordinates.step << ','
+              << coordinates.generation << ',' << coordinates.dt << '\n';
+  }
+  return passed;
+}
+
+bool CheckRodas3NontrivialDaeLifecycle()
+{
+  int ranks = 1;
+  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS) return false;
+  if (ranks != 1 && ranks != 2) return true;
+
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                       0.00, 0.01, 2.55, 2.62}};
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                      0.00, 0.00, 0.03, 0.04}};
+  std::array<std::array<BoundaryContext, 2>, 3> boundaries{};
+  constexpr double dt = 1.0e-4;
+
+  for (int order = 1; order <= 3; ++order)
+  {
+    ExactBorrowedEulerFields fields(mesh, order, initial, source);
+    for (int regularized = 0; regularized < 2; ++regularized)
+    {
+      BoundaryContext& boundary =
+          boundaries[static_cast<std::size_t>(order - 1)]
+                    [static_cast<std::size_t>(regularized)];
+      EulerHdgRequest request = Request(
+          mesh, order, boundary, fields,
+          EulerHdgTimeTreatment::rodas3);
+      if (regularized != 0)
+        request.numerical_policy.stabilization =
+            {RegularizationKind::igr, 0.2, 0.4};
+
+      dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+      if (!core.InitializeBorrowedEuler(request)) return false;
+      std::vector<double> committed_before(fields.initial.size(), 0.0);
+      if (!core.ExportCommittedInterior(committed_before.data(),
+                                        committed_before.size()))
+      {
+        return false;
+      }
+
+      dg::hdg::runtime::StateCoordinates coordinates{};
+      std::uint64_t first_generation = 0;
+      if (!core.PrepareBorrowedEuler(dt, coordinates, first_generation) ||
+          first_generation == 0)
+      {
+        return false;
+      }
+      std::vector<double> first_candidate(fields.initial.size(), 0.0);
+      if (!core.ExportPreparedInterior(first_generation,
+                                       first_candidate.data(),
+                                       first_candidate.size()) ||
+          first_candidate == committed_before ||
+          !AdmissibleEulerCoefficients(first_candidate) ||
+          !core.AbortBorrowedEuler(first_generation, coordinates))
+      {
+        return false;
+      }
+      std::vector<double> after_abort(fields.initial.size(), 0.0);
+      if (!core.ExportCommittedInterior(
+              after_abort.data(), after_abort.size()) ||
+          after_abort != committed_before ||
+          !core.evidence().last_attempt.rollback_byte_equal)
+      {
+        return false;
+      }
+
+      std::uint64_t retry_generation = 0;
+      if (!core.PrepareBorrowedEuler(dt, coordinates, retry_generation) ||
+          retry_generation == 0)
+      {
+        return false;
+      }
+      std::vector<double> retry_candidate(fields.initial.size(), 0.0);
+      if (!core.ExportPreparedInterior(retry_generation,
+                                       retry_candidate.data(),
+                                       retry_candidate.size()) ||
+          retry_candidate != first_candidate)
+      {
+        return false;
+      }
+      double maximum_wave_speed = 0.0;
+      double stable_dt = 0.0;
+      if (!AssessPreparedRodas3(core, retry_generation) ||
+          !core.CommitBorrowedEuler(retry_generation, coordinates,
+                                    maximum_wave_speed, stable_dt))
+      {
+        return false;
+      }
+
+      double closure_residual = 0.0;
+      double closure_tolerance = 0.0;
+      const bool closure_ready = regularized == 0 ||
+          dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+              AuditCommittedClosure(core, closure_residual,
+                                    closure_tolerance);
+      const auto& attempt = core.evidence().last_attempt;
+      const bool accepted = attempt.committed &&
+        attempt.status ==
+            dg::hdg::runtime::cpu::CpuAttemptStatus::success &&
+        attempt.work.common_shift_operator_builds == 1 &&
+        attempt.work.common_shift_operator_reuses == 3 &&
+        attempt.work.condensed_rhs_refreshes == 3 &&
+        attempt.work.complete_factor_setups <
+            attempt.work.complete_trace_solves &&
+        attempt.work.complete_recoveries ==
+            attempt.work.complete_trace_solves &&
+        std::isfinite(attempt.temporal_error_norm) &&
+        attempt.temporal_error_norm > 0.0 &&
+        std::isfinite(attempt.final_algebraic_residual) &&
+        std::isfinite(attempt.final_algebraic_correction_norm) &&
+        attempt.finite_gate && attempt.admissibility_gate &&
+        attempt.recovery_gate && attempt.nonlinear_gate &&
+        attempt.true_residual_gate && closure_ready &&
+        (regularized == 0 ||
+         (std::isfinite(closure_residual) &&
+          std::isfinite(closure_tolerance) &&
+          closure_residual <= closure_tolerance)) &&
+        coordinates.time == dt && coordinates.step == 1 &&
+        coordinates.generation == 1 && coordinates.dt == dt &&
+        std::isfinite(maximum_wave_speed) && maximum_wave_speed > 0.0 &&
+        std::isfinite(stable_dt) && stable_dt > 0.0 &&
+        boundary.calls == 0;
+      if (!accepted)
+      {
+        std::cerr << "RODAS3 nontrivial DAE lifecycle failed order="
+                << order << " igr=" << regularized << " status="
+                << static_cast<int>(attempt.status) << " builds="
+                << attempt.work.common_shift_operator_builds << " reuses="
+                << attempt.work.common_shift_operator_reuses
+                << " rhs_refreshes="
+                << attempt.work.condensed_rhs_refreshes << " setups="
+                << attempt.work.complete_factor_setups << " solves="
+                << attempt.work.complete_trace_solves << " recoveries="
+                << attempt.work.complete_recoveries << " error="
+                << attempt.temporal_error_norm << " algebraic_residual="
+                << attempt.final_algebraic_residual
+                << " algebraic_correction="
+                << attempt.final_algebraic_correction_norm << " closure="
+                << closure_residual << '/' << closure_tolerance << '\n';
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool CheckRodas3PreparedAssessmentAuthority()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                       0.00, 0.01, 2.55, 2.62}};
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                      0.00, 0.00, 0.03, 0.04}};
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 2, initial, source);
+  EulerHdgRequest request = Request(
+      mesh, 2, boundary, fields, EulerHdgTimeTreatment::rodas3);
+  GenericEulerHdgCpuSession session;
+  if (session.Initialize(request).status !=
+      GenericEulerCpuSessionStatus::initialized)
+  {
+    return false;
+  }
+  const auto assessment_capability =
+      dg::hdg::generic::HdgEulerSessionCapabilityBit(
+          dg::hdg::generic::HdgEulerSessionCapability::
+              prepared_embedded_assessment);
+  if (!dg::hdg::generic::HasHdgEulerSessionCapabilities(
+          session.capabilities(), assessment_capability))
+  {
+    return false;
+  }
+
+  GenericEulerCpuPreparedStep prepared;
+  constexpr double dt = 1.0e-4;
+  if (session.Prepare(dt, prepared).status !=
+          GenericEulerCpuSessionStatus::prepared ||
+      session.Commit(std::move(prepared)).status !=
+          GenericEulerCpuSessionStatus::rejected ||
+      session.coordinates().step != 0)
+  {
+    return false;
+  }
+
+  constexpr dg::hdg::generic::HdgEulerPreparedAssessmentPolicy policy{
+      1.0e-8, 1.0e-5, 0.25};
+  dg::hdg::generic::HdgEulerPreparedAssessment assessment{};
+  int rank = -1;
+  if (MPI_Comm_rank(MPI_COMM_WORLD, &rank) != MPI_SUCCESS) return false;
+  const dg::hdg::generic::HdgEulerPreparedAssessmentPolicy
+      rank_local_policy = rank == 0
+      ? dg::hdg::generic::HdgEulerPreparedAssessmentPolicy{0.0, 0.0, 0.25}
+      : policy;
+  // A rank-local malformed policy must reject collectively before any peer
+  // enters the core policy-consensus collectives.  The live prepared token
+  // remains valid for a subsequent coherent assessment.
+  if (session.AssessPrepared(prepared, rank_local_policy, assessment))
+  {
+    return false;
+  }
+  const bool assessed = session.AssessPrepared(
+      prepared, policy, assessment);
+  const bool gates = assessment.finite_gate && assessment.solver_gate &&
+      assessment.residual_gate && assessment.admissibility_gate &&
+      assessment.algebraic_closure_gate &&
+      assessment.algebraic_correction_gate;
+  if (!assessed || !gates ||
+      !dg::hdg::generic::IsValidHdgEulerPreparedAssessment(assessment) ||
+      session.Commit(std::move(prepared)).status !=
+          GenericEulerCpuSessionStatus::committed)
+  {
+    return false;
+  }
+  if (session.coordinates().step != 1 ||
+      session.coordinates().generation != 1 ||
+      session.coordinates().time != dt || session.coordinates().dt != dt)
+  {
+    return false;
+  }
+
+  // Exercise the core boundary directly so no facade-only token state can
+  // mask a publication bypass.  A failed replacement assessment must revoke
+  // a prior passing policy for the same still-live generation.
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  dg::hdg::runtime::StateCoordinates coordinates{};
+  std::uint64_t generation = 0;
+  if (!core.InitializeBorrowedEuler(request) ||
+      !core.PrepareBorrowedEuler(dt, coordinates, generation) ||
+      generation == 0)
+  {
+    return false;
+  }
+  double maximum_wave_speed = 0.0;
+  double stable_dt = 0.0;
+  if (core.CommitBorrowedEuler(generation, coordinates,
+                               maximum_wave_speed, stable_dt))
+  {
+    return false;
+  }
+  dg::hdg::generic::HdgEulerPreparedAssessment core_assessment{};
+  if (!core.AssessPreparedBorrowedEuler(
+          generation, policy, core_assessment) ||
+      !core_assessment.algebraic_correction_gate)
+  {
+    return false;
+  }
+  constexpr dg::hdg::generic::HdgEulerPreparedAssessmentPolicy
+      invalid_replacement{0.0, 0.0, 0.25};
+  if (core.AssessPreparedBorrowedEuler(
+          generation, invalid_replacement, core_assessment) ||
+      core.CommitBorrowedEuler(generation, coordinates,
+                               maximum_wave_speed, stable_dt))
+  {
+    return false;
+  }
+  if (!core.AssessPreparedBorrowedEuler(
+          generation, policy, core_assessment) ||
+      !core_assessment.algebraic_correction_gate ||
+      !core.CommitBorrowedEuler(generation, coordinates,
+                                maximum_wave_speed, stable_dt))
+  {
+    return false;
+  }
+  return coordinates.step == 1 &&
+      coordinates.generation == 1 && coordinates.time == dt &&
+      coordinates.dt == dt &&
+      session.coordinates().generation == 1 &&
+      std::isfinite(maximum_wave_speed) && std::isfinite(stable_dt) &&
+      stable_dt > 0.0;
+}
+
+bool CheckRodas3FixedTimeThirdOrder()
+{
+  int ranks = 1;
+  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS) return false;
+  if (ranks != 1) return true;
+
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> initial{{1.0, 1.05, 0.10, 0.12,
+                                       0.00, 0.01, 2.55, 2.62}};
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                      0.00, 0.00, 0.03, 0.04}};
+  ExactBorrowedEulerFields fields(mesh, 2, initial, source);
+  std::array<BoundaryContext, 3> boundaries{};
+  OneStepEulerState coarse;
+  OneStepEulerState medium;
+  OneStepEulerState fine;
+  constexpr double final_time = 8.0e-4;
+  constexpr int coarse_steps = 4;
+  const bool coarse_ok = RunEulerSteps(
+      mesh, fields, boundaries[0], EulerHdgTimeTreatment::rodas3,
+      2, false, final_time / coarse_steps, coarse, coarse_steps);
+  const bool medium_ok = RunEulerSteps(
+      mesh, fields, boundaries[1], EulerHdgTimeTreatment::rodas3,
+      2, false, final_time / (2 * coarse_steps), medium, 2 * coarse_steps);
+  const bool fine_ok = RunEulerSteps(
+      mesh, fields, boundaries[2], EulerHdgTimeTreatment::rodas3,
+      2, false, final_time / (4 * coarse_steps), fine, 4 * coarse_steps);
+  if (!coarse_ok || !medium_ok || !fine_ok)
+  {
+    std::cerr << "RODAS3 fixed-time order run failed coarse=" << coarse_ok
+              << " medium=" << medium_ok << " fine=" << fine_ok << '\n';
+    return false;
+  }
+
+  const double u4_coarse = MaximumScaledDifference(
+      coarse.interior_u4, medium.interior_u4);
+  const double u4_fine = MaximumScaledDifference(
+      medium.interior_u4, fine.interior_u4);
+  const double uhat_coarse = MaximumScaledDifference(
+      coarse.trace_uhat4, medium.trace_uhat4);
+  const double uhat_fine = MaximumScaledDifference(
+      medium.trace_uhat4, fine.trace_uhat4);
+  constexpr double assessment_absolute_tolerance = 1.0e-8;
+  constexpr double assessment_relative_tolerance = 1.0e-5;
+  const double weighted_u4_coarse = QuadratureScaledU4Difference(
+      mesh, 2, coarse.interior_u4, medium.interior_u4,
+      assessment_absolute_tolerance, assessment_relative_tolerance);
+  const double weighted_u4_fine = QuadratureScaledU4Difference(
+      mesh, 2, medium.interior_u4, fine.interior_u4,
+      assessment_absolute_tolerance, assessment_relative_tolerance);
+  constexpr double roundoff_floor =
+      8192.0 * std::numeric_limits<double>::epsilon();
+  const auto third_order = [roundoff_floor](
+      const double coarse_difference, const double fine_difference) noexcept
+  {
+    const double ratio = coarse_difference /
+        std::max(fine_difference, roundoff_floor);
+    return std::isfinite(coarse_difference) &&
+        std::isfinite(fine_difference) &&
+        coarse_difference > 32.0 * roundoff_floor &&
+        fine_difference > roundoff_floor &&
+        ratio >= 6.0 && ratio <= 10.0;
+  };
+  const auto estimator_third_order = [roundoff_floor](
+      const double coarse_estimate, const double fine_estimate) noexcept
+  {
+    const double ratio = coarse_estimate /
+        std::max(fine_estimate, roundoff_floor);
+    return std::isfinite(coarse_estimate) &&
+        std::isfinite(fine_estimate) &&
+        coarse_estimate > 32.0 * roundoff_floor &&
+        fine_estimate > 4.0 * roundoff_floor &&
+        ratio >= 6.0 && ratio <= 10.0;
+  };
+  const auto finite_positive = [](const double value) noexcept
+  {
+    return std::isfinite(value) && value > 0.0;
+  };
+  const double coarse_effectivity =
+      coarse.normalized_temporal_error / weighted_u4_coarse;
+  const double fine_effectivity =
+      medium.normalized_temporal_error / weighted_u4_fine;
+  const double effectivity_ratio = coarse_effectivity / fine_effectivity;
+  const bool normalized_estimator_calibrated =
+      estimator_third_order(coarse.normalized_temporal_error,
+                            medium.normalized_temporal_error) &&
+      estimator_third_order(medium.normalized_temporal_error,
+                            fine.normalized_temporal_error) &&
+      estimator_third_order(weighted_u4_coarse, weighted_u4_fine) &&
+      finite_positive(coarse_effectivity) && finite_positive(fine_effectivity) &&
+      std::isfinite(effectivity_ratio) && effectivity_ratio >= 0.2 &&
+      effectivity_ratio <= 5.0 &&
+      coarse.normalized_algebraic_correction <= 0.25 &&
+      medium.normalized_algebraic_correction <= 0.25 &&
+      fine.normalized_algebraic_correction <= 0.25;
+  // On one fixed spatial discretization, both Richardson differences and the
+  // principal/embedded one-step defect remain resolved above the numerical
+  // floor.  A halved step therefore gives the expected factor-eight decrease
+  // before spatial or nonlinear-solve error can mask the temporal behavior.
+  const bool accepted = third_order(u4_coarse, u4_fine) &&
+      third_order(uhat_coarse, uhat_fine) &&
+      estimator_third_order(coarse.temporal_error_norm,
+                            medium.temporal_error_norm) &&
+      estimator_third_order(medium.temporal_error_norm,
+                            fine.temporal_error_norm) &&
+      normalized_estimator_calibrated &&
+      std::all_of(boundaries.begin(), boundaries.end(),
+                  [](const BoundaryContext& boundary)
+                  { return boundary.calls == 0; });
+  int rank = -1;
+  if (MPI_Comm_rank(mesh.GetComm(), &rank) == MPI_SUCCESS && rank == 0)
+  {
+    std::cout << "[cpu-rodas3-estimator] normalized="
+              << coarse.normalized_temporal_error << ','
+              << medium.normalized_temporal_error << ','
+              << fine.normalized_temporal_error
+              << " weighted_richardson=" << weighted_u4_coarse << ','
+              << weighted_u4_fine << " effectivity="
+              << coarse_effectivity << ',' << fine_effectivity
+              << " effectivity_ratio=" << effectivity_ratio
+              << " passed=" << accepted << '\n';
+  }
+  if (!accepted)
+  {
+    std::cerr << "RODAS3 fixed-time order failed U4_coarse=" << u4_coarse
+              << " U4_fine=" << u4_fine << " U4_ratio="
+              << u4_coarse / std::max(u4_fine, roundoff_floor)
+              << " Uhat4_coarse=" << uhat_coarse
+              << " Uhat4_fine=" << uhat_fine << " Uhat4_ratio="
+              << uhat_coarse / std::max(uhat_fine, roundoff_floor)
+              << " estimator=" << coarse.temporal_error_norm << ' '
+              << medium.temporal_error_norm << ' '
+              << fine.temporal_error_norm << " estimator_ratios="
+              << coarse.temporal_error_norm /
+                    std::max(medium.temporal_error_norm, roundoff_floor)
+              << ' ' << medium.temporal_error_norm /
+                    std::max(fine.temporal_error_norm, roundoff_floor)
+              << " normalized_estimator="
+              << coarse.normalized_temporal_error << ' '
+              << medium.normalized_temporal_error << ' '
+              << fine.normalized_temporal_error
+              << " weighted_Richardson=" << weighted_u4_coarse << ' '
+              << weighted_u4_fine << " effectivity="
+              << coarse_effectivity << ' ' << fine_effectivity
+              << " effectivity_ratio=" << effectivity_ratio
+              << " normalized_algebraic="
+              << coarse.normalized_algebraic_correction << ' '
+              << medium.normalized_algebraic_correction << ' '
+              << fine.normalized_algebraic_correction
+              << " roundoff_floor=" << roundoff_floor << '\n';
+  }
+  return accepted;
+}
+
+bool CheckRodas3PhysicalBoundaryConservation()
+{
+  constexpr std::array<double, 8> initial{{
+      1.10, 1.12, 0.08, 0.09, -0.04, -0.03, 2.90, 2.95}};
+  constexpr std::array<double, 8> source{{
+      0.01, 0.02, -0.01, 0.00, 0.00, 0.01, 0.03, 0.04}};
+  constexpr double dt = 1.0e-4;
+  bool local = true;
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  for (int regularized = 0; regularized < 2; ++regularized)
+  {
+    mfem::ParMesh mesh = MakeBorrowedMesh();
+    BoundaryContext boundary{};
+    ExactBorrowedEulerFields fields(mesh, 2, initial, source);
+    EulerHdgRequest request = Request(
+        mesh, 2, boundary, fields, EulerHdgTimeTreatment::rodas3);
+    request.boundary = {
+        &boundary, SmoothAutonomousExteriorForRodasJacobianForTests,
+        {nullptr, 0, 0, 0.0}};
+    if (regularized != 0)
+      request.numerical_policy.stabilization =
+          {RegularizationKind::igr, 0.2, 0.4};
+
+    dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+    dg::hdg::runtime::StateCoordinates coordinates{};
+    std::uint64_t generation = 0;
+    double endpoint_error = std::numeric_limits<double>::infinity();
+    double endpoint_relative_error =
+        std::numeric_limits<double>::infinity();
+    bool prepared = core.InitializeBorrowedEuler(request) &&
+        core.PrepareBorrowedEuler(dt, coordinates, generation) &&
+        generation != 0;
+    const bool endpoint_audited = prepared &&
+        dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+            AuditPreparedRodasEndpointConservation(
+                core, endpoint_error, endpoint_relative_error);
+    double maximum_wave_speed = 0.0;
+    double stable_dt = 0.0;
+    const bool committed = endpoint_audited &&
+        AssessPreparedRodas3(core, generation) &&
+        core.CommitBorrowedEuler(generation, coordinates,
+                                 maximum_wave_speed, stable_dt);
+    double rodas_error = std::numeric_limits<double>::infinity();
+    double rodas_relative_error = std::numeric_limits<double>::infinity();
+    bool conservation_gate = false;
+    const bool audited = committed &&
+        dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+            AuditLastConservation(
+                core, rodas_error, rodas_relative_error,
+                conservation_gate);
+    int global_boundary_calls = 0;
+    const bool calls_reduced = MPI_Allreduce(
+        &boundary.calls, &global_boundary_calls, 1, MPI_INT, MPI_SUM,
+        mesh.GetComm()) == MPI_SUCCESS;
+    const auto& attempt = core.evidence().last_attempt;
+    // The endpoint expression is not merely numerically different: it would
+    // reject this step under the requested production tolerance, while the
+    // stage-weighted ROW identity accepts it.  This avoids a fixture-specific
+    // magic lower bound.
+    const bool verified = audited && conservation_gate && calls_reduced &&
+        global_boundary_calls > 0 && attempt.committed &&
+        attempt.status ==
+            dg::hdg::runtime::cpu::CpuAttemptStatus::success &&
+        std::isfinite(rodas_error) && rodas_error >= 0.0 &&
+        std::isfinite(rodas_relative_error) &&
+        rodas_relative_error <=
+            request.numerical_policy.conservation_relative_tolerance &&
+        std::isfinite(endpoint_error) && endpoint_error > 0.0 &&
+        std::isfinite(endpoint_relative_error) &&
+        endpoint_relative_error >
+            request.numerical_policy.conservation_relative_tolerance &&
+        endpoint_relative_error > rodas_relative_error &&
+        coordinates.step == 1 && coordinates.generation == 1 &&
+        coordinates.time == dt && coordinates.dt == dt &&
+        std::isfinite(maximum_wave_speed) && maximum_wave_speed > 0.0 &&
+        std::isfinite(stable_dt) && stable_dt > 0.0;
+    if (!verified && rank == 0)
+    {
+      std::cerr << "RODAS3 physical-boundary conservation failed igr="
+                << regularized << " prepared=" << prepared
+                << " endpoint_audited=" << endpoint_audited
+                << " committed=" << committed << " audited=" << audited
+                << " gate=" << conservation_gate << " ROW="
+                << rodas_error << '/' << rodas_relative_error
+                << " endpoint=" << endpoint_error << '/'
+                << endpoint_relative_error << " tolerance="
+                << request.numerical_policy.conservation_relative_tolerance
+                << " boundary_calls=" << global_boundary_calls << '\n';
+    }
+    local = local && verified;
+  }
+  return All(local);
+}
+
+bool CheckRodas3SingularMassStageEquationsForTests()
+{
+  constexpr std::array<double, 8> initial{{
+      1.10, 1.12, 0.08, 0.09, -0.04, -0.03, 2.90, 2.95}};
+  constexpr std::array<double, 8> source{{
+      0.01, 0.02, -0.01, 0.00, 0.00, 0.01, 0.03, 0.04}};
+  constexpr double dt = 1.0e-4;
+  constexpr double stage_equation_relative_tolerance = 1.0e-11;
+  constexpr double counterfactual_relative_floor = 1.0e-3;
+  bool local = true;
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  for (int fixture = 0; fixture < 4; ++fixture)
+  {
+    const bool physical_boundary = fixture >= 2;
+    const bool regularized = (fixture & 1) != 0;
+    mfem::ParMesh mesh = physical_boundary
+        ? MakeBorrowedMesh() : MakePeriodicBorrowedMesh();
+    BoundaryContext boundary{};
+    ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+    EulerHdgRequest request = Request(
+        mesh, 1, boundary, fields, EulerHdgTimeTreatment::rodas3);
+    if (physical_boundary)
+      request.boundary = {
+          &boundary, SmoothAutonomousExteriorForRodasJacobianForTests,
+          {nullptr, 0, 0, 0.0}};
+    if (regularized)
+      request.numerical_policy.stabilization =
+          {RegularizationKind::igr, 0.2, 0.4};
+
+    dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+    dg::hdg::runtime::StateCoordinates coordinates{};
+    const auto committed_before = core.InitializeBorrowedEuler(request)
+        ? core.Snapshot(coordinates)
+        : dg::hdg::runtime::cpu::CpuStateSnapshot{};
+    std::uint64_t generation = 0;
+    const bool prepared = committed_before.interior.data &&
+        core.PrepareBorrowedEuler(dt, coordinates, generation) &&
+        generation != 0;
+    const auto candidate_before = prepared
+        ? core.CandidateSnapshot(coordinates)
+        : dg::hdg::runtime::cpu::CpuStateSnapshot{};
+    std::array<double, 4> absolute_residuals{};
+    std::array<double, 4> relative_residuals{};
+    std::array<double, 4> counterfactual_relative_residuals{};
+    double maximum_zero_mass_entry =
+        std::numeric_limits<double>::infinity();
+    const bool audited = prepared &&
+        dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+            AuditPreparedRodasStageEquations(
+                core, absolute_residuals, relative_residuals,
+                counterfactual_relative_residuals,
+                maximum_zero_mass_entry);
+    const auto candidate_after = audited
+        ? core.CandidateSnapshot(coordinates)
+        : dg::hdg::runtime::cpu::CpuStateSnapshot{};
+    const bool exact_passes = audited && std::all_of(
+        relative_residuals.begin(), relative_residuals.end(),
+        [](const double residual)
+        {
+          return std::isfinite(residual) && residual >= 0.0 &&
+              residual <= stage_equation_relative_tolerance;
+        });
+    const bool counterfactual_fails = audited && std::all_of(
+        counterfactual_relative_residuals.begin(),
+        counterfactual_relative_residuals.end(),
+        [](const double residual)
+        {
+          return std::isfinite(residual) &&
+              residual > counterfactual_relative_floor;
+        });
+    const bool candidate_unchanged = audited &&
+        candidate_before.state_hash == candidate_after.state_hash &&
+        candidate_before.interior_hash == candidate_after.interior_hash &&
+        candidate_before.trace_hash == candidate_after.trace_hash;
+    const bool aborted = prepared &&
+        core.AbortBorrowedEuler(generation, coordinates);
+    const auto committed_after = aborted
+        ? core.Snapshot(coordinates)
+        : dg::hdg::runtime::cpu::CpuStateSnapshot{};
+    int global_boundary_calls = 0;
+    const bool calls_reduced = MPI_Allreduce(
+        &boundary.calls, &global_boundary_calls, 1, MPI_INT, MPI_SUM,
+        mesh.GetComm()) == MPI_SUCCESS;
+    const bool boundary_exercised = physical_boundary
+        ? global_boundary_calls > 0 : global_boundary_calls == 0;
+    const bool verified = exact_passes && counterfactual_fails &&
+        maximum_zero_mass_entry == 0.0 && candidate_unchanged && aborted &&
+        committed_before.state_hash == committed_after.state_hash &&
+        calls_reduced && boundary_exercised && coordinates.time == 0.0 &&
+        coordinates.step == 0 && coordinates.generation == 0 &&
+        coordinates.cursor == 0 && coordinates.dt == 0.0;
+    if (!verified && rank == 0)
+    {
+      std::cerr << "RODAS3 singular-mass stage audit failed fixture="
+                << fixture << " prepared=" << prepared
+                << " audited=" << audited << " zero_mass="
+                << maximum_zero_mass_entry << " boundary_calls="
+                << global_boundary_calls << " absolute=";
+      for (const double value : absolute_residuals)
+        std::cerr << ' ' << value;
+      std::cerr << " relative=";
+      for (const double value : relative_residuals)
+        std::cerr << ' ' << value;
+      std::cerr << " counterfactual=";
+      for (const double value : counterfactual_relative_residuals)
+        std::cerr << ' ' << value;
+      std::cerr << '\n';
+    }
+    local = local && verified;
+  }
+  return All(local);
+}
+
+bool CheckRodas3ScaledInconsistentEntryRollback()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  constexpr std::array<double, 8> initial{{
+      1.00, 1.05, 0.10, 0.12, 0.00, 0.01, 2.55, 2.62}};
+  constexpr std::array<double, 8> source{{
+      0.01, 0.02, 0.00, 0.01, 0.00, 0.00, 0.03, 0.04}};
+  constexpr double dt = 1.0e-4;
+  BoundaryContext reference_boundary{};
+  ExactBorrowedEulerFields fields(mesh, 2, initial, source);
+  EulerHdgRequest reference_request = Request(
+      mesh, 2, reference_boundary, fields,
+      EulerHdgTimeTreatment::rodas3);
+
+  std::vector<double> coherent_trace;
+  double coherent_entry_residual = std::numeric_limits<double>::infinity();
+  double coherent_entry_correction = std::numeric_limits<double>::infinity();
+  {
+    dg::hdg::runtime::cpu::detail::CpuNumericsCore reference;
+    dg::hdg::runtime::StateCoordinates coordinates{};
+    if (!reference.InitializeBorrowedEuler(reference_request)) return false;
+    const auto initial_snapshot = reference.Snapshot(coordinates);
+    if (initial_snapshot.trace.size == 0 || !initial_snapshot.trace.data)
+      return false;
+    coherent_trace.assign(
+        initial_snapshot.trace.data,
+        initial_snapshot.trace.data + initial_snapshot.trace.size);
+    std::uint64_t generation = 0;
+    if (!reference.PrepareBorrowedEuler(dt, coordinates, generation) ||
+        generation == 0)
+    {
+      return false;
+    }
+    const auto& evidence = reference.evidence().last_attempt;
+    coherent_entry_residual = evidence.initial_nonlinear_residual;
+    coherent_entry_correction =
+        evidence.initial_algebraic_correction_norm;
+    if (!reference.AbortBorrowedEuler(generation, coordinates)) return false;
+  }
+
+  constexpr double inconsistent_scale = 16.0;
+  std::vector<double> inconsistent_trace = coherent_trace;
+  for (double& value : inconsistent_trace) value *= inconsistent_scale;
+  BoundaryContext boundary{};
+  EulerHdgRequest request = Request(
+      mesh, 2, boundary, fields, EulerHdgTimeTreatment::rodas3);
+  request.initial_true_trace = {
+      inconsistent_trace.data(), inconsistent_trace.size(), 4};
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  dg::hdg::runtime::StateCoordinates coordinates{};
+  if (!core.InitializeBorrowedEuler(request)) return false;
+  double inconsistent_entry_residual =
+      std::numeric_limits<double>::infinity();
+  double inconsistent_entry_correction =
+      std::numeric_limits<double>::infinity();
+  const bool inconsistent_projection_audited =
+      dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+          VerifyRodasAlgebraicBlock(
+              core, inconsistent_entry_residual,
+              inconsistent_entry_correction);
+  const auto before = core.Snapshot(coordinates);
+  std::vector<double> interior_before(
+      before.interior.data, before.interior.data + before.interior.size);
+  std::vector<double> trace_before(
+      before.trace.data, before.trace.data + before.trace.size);
+
+  std::uint64_t generation = 123;
+  const bool first_rejected =
+      !core.PrepareBorrowedEuler(dt, coordinates, generation) &&
+      generation == 0;
+  const auto after = core.Snapshot(coordinates);
+  const bool byte_equal = after.interior.size == interior_before.size() &&
+      after.trace.size == trace_before.size() &&
+      std::equal(interior_before.begin(), interior_before.end(),
+                 after.interior.data) &&
+      std::equal(trace_before.begin(), trace_before.end(), after.trace.data);
+  generation = 456;
+  const bool retry_rejected =
+      !core.PrepareBorrowedEuler(dt, coordinates, generation) &&
+      generation == 0;
+  const double residual_allowance = std::max(
+      request.numerical_policy.nonlinear_relative_tolerance,
+      1024.0 * std::numeric_limits<double>::epsilon());
+  constexpr double entry_correction_allowance = 0.25;
+  const bool accepted = inconsistent_projection_audited && first_rejected &&
+      retry_rejected && byte_equal &&
+      std::isfinite(coherent_entry_residual) &&
+      coherent_entry_residual <= residual_allowance &&
+      std::isfinite(coherent_entry_correction) &&
+      coherent_entry_correction <= entry_correction_allowance &&
+      std::isfinite(inconsistent_entry_residual) &&
+      inconsistent_entry_residual <= residual_allowance &&
+      std::isfinite(inconsistent_entry_correction) &&
+      inconsistent_entry_correction > entry_correction_allowance &&
+      coordinates.time == 0.0 && coordinates.step == 0 &&
+      coordinates.generation == 0 && coordinates.cursor == 0 &&
+      coordinates.dt == 0.0;
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  if (!accepted && rank == 0)
+  {
+    std::cerr << "RODAS3 inconsistent-entry rollback failed first="
+              << first_rejected << " retry=" << retry_rejected
+              << " audited=" << inconsistent_projection_audited
+              << " byte_equal=" << byte_equal << " coherent_residual="
+              << coherent_entry_residual << " coherent_correction="
+              << coherent_entry_correction << " inconsistent_residual="
+              << inconsistent_entry_residual
+              << " inconsistent_correction="
+              << inconsistent_entry_correction << " residual_allowance="
+              << residual_allowance << " correction_allowance="
+              << entry_correction_allowance << '\n';
+  }
+  return All(accepted);
+}
+
 bool CheckConventionalConservationEvidence()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
@@ -1384,6 +2449,19 @@ bool CheckPartitionedBackwardEulerIgrLifecycle()
       {RegularizationKind::igr, 0.2, 0.4};
   if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
       dg::hdg::generic::ContractStatus::accepted)
+  {
+    return false;
+  }
+
+  GenericEulerHdgCpuSession capability_session;
+  const std::uint32_t assessment_capability =
+      dg::hdg::generic::HdgEulerSessionCapabilityBit(
+          dg::hdg::generic::HdgEulerSessionCapability::
+              prepared_embedded_assessment);
+  if (capability_session.Initialize(request).status !=
+          GenericEulerCpuSessionStatus::initialized ||
+      dg::hdg::generic::HasHdgEulerSessionCapabilities(
+          capability_session.capabilities(), assessment_capability))
   {
     return false;
   }
@@ -2033,6 +3111,110 @@ bool CheckUnifiedIgrAssemblerJacobianForTests()
   return All(local);
 }
 
+bool CheckRodas3PhysicalBoundaryJacobianForTests()
+{
+  constexpr std::array<double, 8> initial{{
+      1.10, 1.12, 0.08, 0.09, -0.04, -0.03, 2.90, 2.95}};
+  constexpr std::array<double, 8> source{};
+  constexpr double relative_tolerance = 1.0e-4;
+  bool local = true;
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  for (int regularized_case = 0; regularized_case < 2; ++regularized_case)
+    for (int boundary_case = 0; boundary_case < 2; ++boundary_case)
+    {
+      mfem::ParMesh mesh = MakeBorrowedMesh();
+      BoundaryContext boundary{};
+      ExactBorrowedEulerFields fields(mesh, 2, initial, source);
+      EulerHdgRequest request = Request(
+          mesh, 2, boundary, fields, EulerHdgTimeTreatment::rodas3);
+      request.boundary = {
+          &boundary,
+          boundary_case == 0
+              ? NonperiodicExterior
+              : SmoothAutonomousExteriorForRodasJacobianForTests,
+          {nullptr, 0, 0, 0.0}};
+      if (regularized_case != 0)
+        request.numerical_policy.stabilization =
+            {RegularizationKind::igr, 0.2, 0.8};
+
+      dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+      std::array<double, 6> relative_errors{};
+      const bool initialized = core.InitializeBorrowedEuler(request);
+      const bool verified = initialized &&
+          dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+              VerifyAssemblerJacobian(
+                  core, relative_tolerance, relative_errors);
+      int global_boundary_calls = 0;
+      const bool calls_reduced = MPI_Allreduce(
+          &boundary.calls, &global_boundary_calls, 1, MPI_INT, MPI_SUM,
+          mesh.GetComm()) == MPI_SUCCESS;
+      if ((!verified || !calls_reduced || global_boundary_calls <= 0) &&
+          rank == 0)
+      {
+        std::cerr << "RODAS3 physical-boundary Jacobian check failed igr="
+                  << regularized_case << " boundary_case=" << boundary_case
+                  << " initialized=" << initialized << " boundary_calls="
+                  << global_boundary_calls << " errors=";
+        for (const double error : relative_errors) std::cerr << ' ' << error;
+        std::cerr << '\n';
+      }
+      local = local && verified && calls_reduced && global_boundary_calls > 0;
+    }
+  return All(local);
+}
+
+bool CheckRodas3AlgebraicBlockSolvabilityForTests()
+{
+  constexpr std::array<double, 8> initial{{
+      1.10, 1.12, 0.08, 0.09, -0.04, -0.03, 2.90, 2.95}};
+  constexpr std::array<double, 8> source{};
+  bool local = true;
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  for (int fixture = 0; fixture < 3; ++fixture)
+  {
+    const bool physical_boundary = fixture != 0;
+    const bool igr_auxiliary_neumann = fixture == 2;
+    mfem::ParMesh mesh = physical_boundary
+        ? MakeBorrowedMesh() : MakePeriodicBorrowedMesh();
+    BoundaryContext boundary{};
+    ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+    EulerHdgRequest request = Request(
+        mesh, 1, boundary, fields, EulerHdgTimeTreatment::rodas3);
+    if (igr_auxiliary_neumann)
+      request.numerical_policy.stabilization =
+          {RegularizationKind::igr, 0.2, 0.8};
+
+    dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+    double algebraic_residual = std::numeric_limits<double>::infinity();
+    double correction_norm = std::numeric_limits<double>::infinity();
+    const bool initialized = core.InitializeBorrowedEuler(request);
+    const bool verified = initialized &&
+        dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+            VerifyRodasAlgebraicBlock(
+                core, algebraic_residual, correction_norm);
+    int global_boundary_calls = 0;
+    const bool calls_reduced = MPI_Allreduce(
+        &boundary.calls, &global_boundary_calls, 1, MPI_INT, MPI_SUM,
+        mesh.GetComm()) == MPI_SUCCESS;
+    const bool boundary_exercised = physical_boundary
+        ? global_boundary_calls > 0 : global_boundary_calls == 0;
+    if ((!verified || !calls_reduced || !boundary_exercised) && rank == 0)
+    {
+      std::cerr << "RODAS3 algebraic-block solvability check failed fixture="
+                << fixture << " initialized=" << initialized
+                << " boundary_calls=" << global_boundary_calls
+                << " residual=" << algebraic_residual
+                << " correction=" << correction_norm << '\n';
+    }
+    local = local && verified && calls_reduced && boundary_exercised &&
+        std::isfinite(algebraic_residual) && std::isfinite(correction_norm) &&
+        correction_norm > 0.0;
+  }
+  return All(local);
+}
+
 bool CheckBorrowedLlfNoFloorAndFrozenRefresh()
 {
   mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
@@ -2214,6 +3396,170 @@ bool CheckZeroOwnedElementEngine()
   }
   return accepted && any_empty != 0 &&
       SameBorrowedMesh(mesh, before, mesh.GetComm());
+}
+
+bool CheckRodas3CommittedCheckpointRestart()
+{
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  constexpr std::array<double, 8> initial{{
+      1.00, 1.05, 0.10, 0.12, 0.00, 0.01, 2.55, 2.62}};
+  constexpr std::array<double, 8> source{{
+      0.01, 0.02, 0.00, 0.01, 0.00, 0.00, 0.03, 0.04}};
+  constexpr double dt = 1.0e-4;
+  BoundaryContext boundary{};
+  ExactBorrowedEulerFields fields(mesh, 1, initial, source);
+  EulerHdgRequest request = Request(
+      mesh, 1, boundary, fields, EulerHdgTimeTreatment::rodas3);
+  request.numerical_policy.stabilization =
+      {RegularizationKind::igr, 0.2, 0.4};
+
+  GenericEulerCpuCheckpoint uninterrupted_final;
+  GenericEulerCpuSessionResult uninterrupted_result{};
+  {
+    GenericEulerHdgCpuSession uninterrupted;
+    bool ready = uninterrupted.Initialize(request).status ==
+        GenericEulerCpuSessionStatus::initialized;
+    for (int step = 0; step < 3 && ready; ++step)
+    {
+      uninterrupted_result = uninterrupted.Advance(dt);
+      ready = uninterrupted_result.status ==
+          GenericEulerCpuSessionStatus::advanced;
+    }
+    if (!ready || !uninterrupted.CaptureCheckpoint(uninterrupted_final))
+    {
+      return false;
+    }
+  }
+
+  GenericEulerCpuCheckpoint split_checkpoint;
+  dg::hdg::generic::HdgEulerCommittedDiagnostics split_diagnostics{};
+  GenericEulerCpuSessionCoordinates split_coordinates{};
+  {
+    GenericEulerHdgCpuSession split;
+    if (split.Initialize(request).status !=
+            GenericEulerCpuSessionStatus::initialized ||
+        split.Advance(dt).status != GenericEulerCpuSessionStatus::advanced)
+    {
+      return false;
+    }
+
+    // A live candidate is not a restart boundary.  Explicitly aborting the
+    // candidate restores the same committed bytes, after which capture is
+    // admitted and the resumed trajectory must remain exact.
+    GenericEulerCpuPreparedStep rejected_candidate;
+    GenericEulerCpuCheckpoint inadmissible_checkpoint;
+    const bool prepared = split.Prepare(dt, rejected_candidate).status ==
+        GenericEulerCpuSessionStatus::prepared;
+    const bool pending_capture_rejected = prepared &&
+        !split.CaptureCheckpoint(inadmissible_checkpoint) &&
+        !inadmissible_checkpoint.valid();
+    const bool aborted = prepared &&
+        split.Abort(std::move(rejected_candidate)).status ==
+            GenericEulerCpuSessionStatus::aborted;
+    if (!pending_capture_rejected || !aborted ||
+        !split.CaptureCheckpoint(split_checkpoint))
+    {
+      return false;
+    }
+    split_coordinates = split.coordinates();
+    split_diagnostics = split.diagnostics();
+  }
+
+  GenericEulerCpuCheckpoint resume_checkpoint(std::move(split_checkpoint));
+  if (split_checkpoint.valid() || !resume_checkpoint.valid() ||
+      !SameSessionCoordinates(
+          resume_checkpoint.coordinates(), split_coordinates))
+  {
+    return false;
+  }
+
+  // A numerically different solver policy is a fresh compatible mesh but not
+  // a compatible restart configuration.  Rejection must leave generation
+  // zero untouched.
+  {
+    EulerHdgRequest mismatched_request = request;
+    mismatched_request.numerical_policy.maximum_linear_iterations = 37;
+    GenericEulerHdgCpuSession mismatched;
+    const bool initialized = mismatched.Initialize(mismatched_request).status ==
+        GenericEulerCpuSessionStatus::initialized;
+    const auto rejected = initialized
+        ? mismatched.Restore(resume_checkpoint)
+        : GenericEulerCpuSessionResult{};
+    const auto coordinates = mismatched.coordinates();
+    if (!initialized ||
+        rejected.status != GenericEulerCpuSessionStatus::rejected ||
+        coordinates.time != 0.0 || coordinates.step != 0 ||
+        coordinates.generation != 0 || coordinates.dt != 0.0)
+    {
+      return false;
+    }
+  }
+
+  GenericEulerCpuCheckpoint restarted_final;
+  GenericEulerCpuSessionResult restarted_result{};
+  {
+    GenericEulerHdgCpuSession restarted;
+    if (restarted.Initialize(request).status !=
+        GenericEulerCpuSessionStatus::initialized)
+    {
+      return false;
+    }
+    const auto restored = restarted.Restore(resume_checkpoint);
+    const auto restored_diagnostics = restarted.diagnostics();
+    const bool diagnostics_exact = restored_diagnostics.available &&
+        restored_diagnostics.wave_generation ==
+            split_diagnostics.wave_generation &&
+        dg::hdg::generic::DoubleBits(
+            restored_diagnostics.coordinates.time) ==
+            dg::hdg::generic::DoubleBits(
+                split_diagnostics.coordinates.time) &&
+        dg::hdg::generic::DoubleBits(
+            restored_diagnostics.coordinates.dt) ==
+            dg::hdg::generic::DoubleBits(
+                split_diagnostics.coordinates.dt) &&
+        restored_diagnostics.coordinates.step ==
+            split_diagnostics.coordinates.step &&
+        restored_diagnostics.coordinates.generation ==
+            split_diagnostics.coordinates.generation &&
+        dg::hdg::generic::DoubleBits(
+            restored_diagnostics.maximum_wave_speed) ==
+            dg::hdg::generic::DoubleBits(
+                split_diagnostics.maximum_wave_speed) &&
+        dg::hdg::generic::DoubleBits(
+            restored_diagnostics.backend_stable_dt) ==
+            dg::hdg::generic::DoubleBits(
+                split_diagnostics.backend_stable_dt);
+    if (restored.status != GenericEulerCpuSessionStatus::restored ||
+        !SameSessionCoordinates(restored.coordinates, split_coordinates) ||
+        !diagnostics_exact)
+    {
+      return false;
+    }
+    for (int step = 1; step < 3; ++step)
+    {
+      restarted_result = restarted.Advance(dt);
+      if (restarted_result.status != GenericEulerCpuSessionStatus::advanced)
+      {
+        return false;
+      }
+    }
+    if (!restarted.CaptureCheckpoint(restarted_final)) return false;
+  }
+
+  const bool exact_state =
+      dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+          SameCheckpointState(uninterrupted_final, restarted_final);
+  return All(exact_state && uninterrupted_final.valid() &&
+      restarted_final.valid() &&
+      SameSessionCoordinates(uninterrupted_result.coordinates,
+                             restarted_result.coordinates) &&
+      SameSessionCoordinates(uninterrupted_final.coordinates(),
+                             restarted_final.coordinates()) &&
+      uninterrupted_result.coordinates.step == 3 &&
+      uninterrupted_result.coordinates.generation == 3 &&
+      dg::hdg::generic::DoubleBits(
+          uninterrupted_result.coordinates.time) ==
+          dg::hdg::generic::DoubleBits(3.0 * dt));
 }
 
 bool CheckSubcommunicatorIsolation()
@@ -2543,6 +3889,17 @@ int main(int argc, char* argv[])
       CheckDefaultNumericalPolicyAdaptiveLinearCap();
   const bool periodic = CheckPeriodicAnnotationsRemainTraceCouplings();
   const bool natural_free_stream = CheckNaturalFreeStreamPreservation();
+  const bool rodas3_free_stream = CheckRodas3CommonShiftFreeStream();
+  const bool rodas3_nontrivial_dae = CheckRodas3NontrivialDaeLifecycle();
+  const bool rodas3_prepared_assessment =
+      CheckRodas3PreparedAssessmentAuthority();
+  const bool rodas3_fixed_time_order = CheckRodas3FixedTimeThirdOrder();
+  const bool rodas3_physical_conservation =
+      CheckRodas3PhysicalBoundaryConservation();
+  const bool rodas3_stage_equations =
+      CheckRodas3SingularMassStageEquationsForTests();
+  const bool rodas3_inconsistent_entry =
+      CheckRodas3ScaledInconsistentEntryRollback();
   const bool conventional_conservation =
       CheckConventionalConservationEvidence();
   const bool igr_extension = CheckIgrExtensionLifecycle();
@@ -2563,9 +3920,14 @@ int main(int argc, char* argv[])
       CheckIgrExtensionInitializationDeterminism();
   const bool igr_assembler_jacobian =
       CheckUnifiedIgrAssemblerJacobianForTests();
+  const bool rodas3_boundary_jacobian =
+      CheckRodas3PhysicalBoundaryJacobianForTests();
+  const bool rodas3_algebraic_block =
+      CheckRodas3AlgebraicBlockSolvabilityForTests();
   const bool llf_policy = CheckBorrowedLlfNoFloorAndFrozenRefresh();
   const bool zero_update = CheckZeroUpdateFreeStreamFinalReconstruction();
   const bool dynamic_tau = CheckDynamicTauHighWaveTwoSteps();
+  const bool rodas3_checkpoint = CheckRodas3CommittedCheckpointRestart();
   const bool boundary_picard = CheckClosedBoundaryPicardAssembly();
   const bool zero_owned = CheckZeroOwnedElementEngine();
   const bool subcommunicator = CheckSubcommunicatorIsolation();
@@ -2583,14 +3945,20 @@ int main(int argc, char* argv[])
       committed_export && committed_export_zero_owned &&
       default_numerical_policy &&
       periodic && natural_free_stream && conventional_conservation &&
+      rodas3_free_stream && rodas3_nontrivial_dae &&
+      rodas3_prepared_assessment &&
+      rodas3_fixed_time_order && rodas3_physical_conservation &&
+      rodas3_stage_equations &&
+      rodas3_inconsistent_entry &&
       igr_extension && igr_extension_zero_local &&
       partitioned_igr && partitioned_conventional &&
       partitioned_orders_boundary && partitioned_small_dt &&
       partitioned_fixed_time &&
       igr_extension_convergence &&
       igr_extension_numerical_policy &&
-      igr_extension_initialization && igr_assembler_jacobian && llf_policy &&
-      zero_update && dynamic_tau &&
+      igr_extension_initialization && igr_assembler_jacobian &&
+      rodas3_boundary_jacobian && rodas3_algebraic_block && llf_policy &&
+      zero_update && dynamic_tau && rodas3_checkpoint &&
       boundary_picard &&
       zero_owned && subcommunicator && passive_world &&
       partitioned_passive_world && mismatch &&
@@ -2603,6 +3971,16 @@ int main(int argc, char* argv[])
               << " boundary_semantics=" << boundary_semantics
               << " trace_restriction=" << trace_restriction
               << " orders=" << orders << " periodic=" << periodic
+              << " rodas3_free_stream=" << rodas3_free_stream
+              << " rodas3_nontrivial_dae=" << rodas3_nontrivial_dae
+              << " rodas3_prepared_assessment="
+              << rodas3_prepared_assessment
+              << " rodas3_fixed_time_order=" << rodas3_fixed_time_order
+              << " rodas3_physical_conservation="
+              << rodas3_physical_conservation
+              << " rodas3_stage_equations=" << rodas3_stage_equations
+              << " rodas3_inconsistent_entry="
+              << rodas3_inconsistent_entry
               << " natural_free_stream=" << natural_free_stream
               << " conventional_conservation=" << conventional_conservation
               << " igr_extension=" << igr_extension
@@ -2619,6 +3997,8 @@ int main(int argc, char* argv[])
               << " igr_extension_initialization="
               << igr_extension_initialization
               << " igr_assembler_jacobian=" << igr_assembler_jacobian
+              << " rodas3_boundary_jacobian=" << rodas3_boundary_jacobian
+              << " rodas3_algebraic_block=" << rodas3_algebraic_block
               << " llf_policy=" << llf_policy
               << " zero_update=" << zero_update
               << " prepared_lifecycle=" << prepared_lifecycle
@@ -2627,6 +4007,7 @@ int main(int argc, char* argv[])
               << committed_export_zero_owned
               << " default_numerical_policy=" << default_numerical_policy
               << " dynamic_tau=" << dynamic_tau
+              << " rodas3_checkpoint=" << rodas3_checkpoint
               << " boundary_picard=" << boundary_picard
               << " zero_owned=" << zero_owned
               << " passive_world=" << passive_world

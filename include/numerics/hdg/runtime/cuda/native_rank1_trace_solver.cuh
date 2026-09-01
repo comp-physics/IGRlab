@@ -32,6 +32,39 @@ inline constexpr int native_trace_sigma_jacobi_maximum_sweeps = 10;
 inline constexpr double native_trace_sigma_jacobi_damping =
     0x1.5555555555555p-1;
 
+/** Exact conventional-Uhat4 p1--p3 quadrilateral patches. */
+constexpr bool NativeTraceConventionalElementSchwarzPatchRowsSupported(
+    const int rows) noexcept
+{
+  return rows == 32 || rows == 48 || rows == 64;
+}
+
+/** Exact IGR-Uhat4/sigmahat p1--p3 quadrilateral patches. */
+constexpr bool NativeTraceIgrElementSchwarzPatchRowsSupported(
+    const int rows) noexcept
+{
+  return rows == 40 || rows == 60 || rows == 80;
+}
+
+/** Exact conventional and IGR p1--p3 quadrilateral patch union. */
+constexpr bool NativeTraceElementSchwarzPatchRowsSupported(
+    const int rows) noexcept
+{
+  return NativeTraceConventionalElementSchwarzPatchRowsSupported(rows) ||
+      NativeTraceIgrElementSchwarzPatchRowsSupported(rows);
+}
+
+static_assert(NativeTraceElementSchwarzPatchRowsSupported(32));
+static_assert(NativeTraceElementSchwarzPatchRowsSupported(40));
+static_assert(NativeTraceElementSchwarzPatchRowsSupported(48));
+static_assert(NativeTraceElementSchwarzPatchRowsSupported(60));
+static_assert(NativeTraceElementSchwarzPatchRowsSupported(64));
+static_assert(NativeTraceElementSchwarzPatchRowsSupported(80));
+static_assert(!NativeTraceElementSchwarzPatchRowsSupported(24));
+static_assert(!NativeTraceElementSchwarzPatchRowsSupported(72));
+static_assert(!NativeTraceIgrElementSchwarzPatchRowsSupported(32));
+static_assert(!NativeTraceConventionalElementSchwarzPatchRowsSupported(40));
+
 enum class NativeTracePreconditionerKind : std::int32_t
 {
   diagonal = 1,
@@ -351,11 +384,11 @@ inline bool NativeTraceResultIsReadyForTrueResidual(
 extern "C" NativeTraceWorkspaceRequirements
 QueryNativeTraceWorkspaceRequirements(int rows, int krylov_dimension,
                                       int cooperative_blocks,
-                                      bool igr_active) noexcept;
+                                      bool use_cgs2) noexcept;
 
 extern "C" NativeTraceCooperativeSupport
 QueryNativeRankOneTraceCooperativeSupport(int rows, int krylov_dimension,
-                                          bool igr_active,
+                                          bool use_cgs2,
                                           bool fixed_sigma_jacobi,
                                           bool coupled_warp_full_patch) noexcept;
 

@@ -80,6 +80,24 @@ private:
   bool valid_ = false;
 };
 
+/** Exact caller-owned destinations for one metadata-bound candidate payload. */
+struct GenericEulerCudaMutableCheckpointPayloadV1
+{
+  double* interior = nullptr;
+  std::size_t interior_count = 0;
+  double* owned_true_trace = nullptr;
+  std::size_t owned_true_trace_count = 0;
+};
+
+/** Immutable decoded payload view used only during a pristine restore. */
+struct GenericEulerCudaCheckpointPayloadViewV1
+{
+  const double* interior = nullptr;
+  std::size_t interior_count = 0;
+  const double* owned_true_trace = nullptr;
+  std::size_t owned_true_trace_count = 0;
+};
+
 /**
  * Header-only adapter over the existing persistent CUDA engine.  Its complete
  * lifecycle is PrepareStep -> staged output -> MarkOutputStaged ->
@@ -119,10 +137,16 @@ public:
             generic::HdgEulerSessionCapability::prepared_output) |
         generic::HdgEulerSessionCapabilityBit(
             generic::HdgEulerSessionCapability::generic_borrowed_inputs);
-    return metadata_output_mode_ ? base |
+    const std::uint32_t embedded_assessment =
+        RodasAssessmentRequired()
+        ? generic::HdgEulerSessionCapabilityBit(
+              generic::HdgEulerSessionCapability::
+                  prepared_embedded_assessment)
+        : 0U;
+    return embedded_assessment | (metadata_output_mode_ ? base |
         generic::HdgEulerSessionCapabilityBit(
             generic::HdgEulerSessionCapability::committed_cfl_diagnostics)
-        : base;
+        : base);
   }
 
   /**
@@ -287,7 +311,15 @@ private:
     config.use_generic_numerical_policy = true;
     config.numerical_policy = request.numerical_policy;
     config.time_treatment = request.time_treatment;
-    return InitializeAdmitted(config, trace_policy);
+    const cuda_w8a::CudaTracePolicyKind admitted_trace_policy =
+        trace_policy == cuda_w8a::CudaTracePolicyKind::engine_default
+        ? cuda_w8a::DefaultCudaTracePolicyRequest(
+              request.backend.cuda_engine,
+              request.numerical_policy.stabilization.kind ==
+                  generic::RegularizationKind::igr,
+              ranks, request.time_treatment)
+        : trace_policy;
+    return InitializeAdmitted(config, admitted_trace_policy);
   }
 
 public:
@@ -358,6 +390,13 @@ private:
             allocated =
                 partitioned_backward_euler_borrowed_rank1_ != nullptr;
           }
+          else if (config.time_treatment ==
+                   generic::EulerHdgTimeTreatment::rodas3)
+          {
+            rodas3_borrowed_rank1_.reset(
+                new rodas3_borrowed_rank1_engine(config, trace_policy));
+            allocated = rodas3_borrowed_rank1_ != nullptr;
+          }
           else
           {
             borrowed_rank1_.reset(
@@ -383,6 +422,13 @@ private:
                     config, trace_policy));
             allocated =
                 partitioned_backward_euler_borrowed_rank2_ != nullptr;
+          }
+          else if (config.time_treatment ==
+                   generic::EulerHdgTimeTreatment::rodas3)
+          {
+            rodas3_borrowed_rank2_.reset(
+                new rodas3_borrowed_rank2_engine(config, trace_policy));
+            allocated = rodas3_borrowed_rank2_ != nullptr;
           }
           else
           {
@@ -410,6 +456,8 @@ private:
       borrowed_rank2_.reset();
       partitioned_backward_euler_borrowed_rank1_.reset();
       partitioned_backward_euler_borrowed_rank2_.reset();
+      rodas3_borrowed_rank1_.reset();
+      rodas3_borrowed_rank2_.reset();
       failed_ = true;
       return Result(generic::HdgEulerSessionStatus::rejected);
     }
@@ -450,6 +498,7 @@ public:
         (!retry_ready_ || SameDouble(dt, retained_dt_));
     if (!AdmitOperation(operation_tag::prepare, local_valid))
       return Result(generic::HdgEulerSessionStatus::rejected);
+    ClearAssessmentAuthority();
     // Admission above deliberately carries only a validity bit; retain the
     // exact IEEE payload agreement as its own collective before any engine
     // affine phase so unequal finite proposals cannot silently proceed.
@@ -464,6 +513,18 @@ public:
     const bool prepared = CollectiveAll(prepared_locally);
     if (!prepared)
     {
+      const bool retryable_failure = CollectiveAll(
+          !prepared_locally && evidence.retry_available &&
+          evidence.coordinates_preserved &&
+          evidence.committed_bytes_preserved &&
+          EngineHasStatus(RunStatus::retry_available));
+      if (retryable_failure)
+      {
+        retained_dt_ = dt;
+        retry_ready_ = true;
+        coordinates_ = EngineCoordinates();
+        return Result(generic::HdgEulerSessionStatus::rejected);
+      }
       failed_ = true;
       return Result(generic::HdgEulerSessionStatus::rejected);
     }
@@ -581,6 +642,74 @@ public:
     { return engine.ExportPreparedFields(destination); });
   }
 
+  /**
+   * Materialize both parts of the exact metadata-staged candidate into
+   * caller-owned storage.  The pointers are transient copy destinations and
+   * are never checkpoint identity or serialized artifact fields.
+   */
+  bool ExportPreparedCheckpointPayload(
+      const GenericEulerCudaPreparedStep& authority,
+      const prepared_output_type& metadata,
+      const GenericEulerCudaMutableCheckpointPayloadV1 destination) noexcept
+  {
+    const bool local_valid = metadata_output_mode_ &&
+        Matches(authority, metadata) && destination.interior != nullptr &&
+        destination.owned_true_trace != nullptr &&
+        destination.interior_count == metadata.interior_count &&
+        destination.owned_true_trace_count ==
+            metadata.owned_true_trace_count;
+    if (!AdmitOperation(
+            operation_tag::export_prepared_checkpoint_payload, local_valid))
+      return false;
+    return Dispatch([&](auto& engine)
+    {
+      return engine.ExportPreparedCheckpointPayload(
+          metadata, destination.interior, destination.interior_count,
+          destination.owned_true_trace,
+          destination.owned_true_trace_count);
+    });
+  }
+
+  /** Collectively assess one live prepared RODAS3 candidate. */
+  template <typename StagedOutput>
+  bool AssessPrepared(
+      const GenericEulerCudaPreparedStep& authority,
+      const StagedOutput& native_export,
+      const generic::HdgEulerPreparedAssessmentPolicy policy,
+      generic::HdgEulerPreparedAssessment& assessment) noexcept
+  {
+    static_assert(IsSupportedOutput<StagedOutput>(),
+                  "CUDA prepared output must be checkpoint or metadata");
+    assessment = {};
+    ClearAssessmentAuthority();
+    const bool local_valid = OutputMatchesMode<StagedOutput>() &&
+        Matches(authority, native_export) && RodasAssessmentRequired() &&
+        generic::IsValidHdgEulerPreparedAssessmentPolicy(policy);
+    if (!AdmitOperation(operation_tag::assess_prepared, local_valid))
+      return false;
+    const bool assessed = Dispatch([&](auto& engine)
+    { return engine.AssessPrepared(native_export, policy, assessment); });
+    const bool authorized = assessed &&
+        generic::IsValidHdgEulerPreparedAssessment(assessment) &&
+        assessment.finite_gate && assessment.solver_gate &&
+        assessment.residual_gate && assessment.admissibility_gate &&
+        assessment.algebraic_closure_gate &&
+        assessment.algebraic_correction_gate;
+    if (authorized)
+    {
+      assessment_authority_ = true;
+      assessed_epoch_ = authority.epoch_;
+      assessed_facade_incarnation_ = authority.facade_incarnation_;
+      assessed_native_export_ = &native_export;
+      assessed_policy_ = policy;
+      assessed_policy_bits_ = {{
+          generic::DoubleBits(policy.absolute_tolerance),
+          generic::DoubleBits(policy.relative_tolerance),
+          generic::DoubleBits(policy.algebraic_correction_fraction)}};
+    }
+    return assessed;
+  }
+
   /** The caller attests that the staged native export is ready for publication. */
   template <typename StagedOutput>
   bool AcknowledgePreparedOutput(
@@ -609,7 +738,9 @@ public:
                   "CUDA prepared output must be checkpoint or metadata");
     const bool local_valid = OutputMatchesMode<StagedOutput>() &&
         Matches(authority, native_export) &&
-        output_acknowledged_;
+        output_acknowledged_ &&
+        (!RodasAssessmentRequired() ||
+         AssessmentMatches(authority, native_export));
     if (!AdmitOperation(operation_tag::commit, local_valid))
       return Result(generic::HdgEulerSessionStatus::rejected);
     cuda_w8a::CudaStepEvidence evidence{};
@@ -684,6 +815,156 @@ public:
     return Result(generic::HdgEulerSessionStatus::aborted);
   }
 
+  /**
+   * Decline a prepared adaptive candidate and the contract's exact same-dt
+   * retry, leaving the committed state ready for a fresh timestep.
+   */
+  template <typename StagedOutput>
+  result_type RejectPrepared(GenericEulerCudaPreparedStep&& authority,
+                             StagedOutput& native_export) noexcept
+  {
+    static_assert(IsSupportedOutput<StagedOutput>(),
+                  "CUDA prepared output must be checkpoint or metadata");
+    if (!AdmitOperation(operation_tag::reject_prepared,
+                        OutputMatchesMode<StagedOutput>() &&
+                        Matches(authority, native_export)))
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    cuda_w8a::CudaStepEvidence evidence{};
+    const bool rejected = Dispatch([&](auto& engine)
+    { return engine.RejectPrepared(
+        native_export, FailureReason::backend_failure, evidence); });
+    const bool expected_contract_state = coordinates_.step == 0 &&
+            coordinates_.generation == 0 && coordinates_.time == 0.0
+        ? EngineHasStatus(RunStatus::ready)
+        : EngineHasStatus(RunStatus::committed);
+    const bool rollback_fresh = rejected && !evidence.retry_available &&
+        evidence.coordinates_preserved &&
+        evidence.committed_bytes_preserved && expected_contract_state &&
+        !native_export.candidate_frozen &&
+        !native_export.checkpoint_staged &&
+        !native_export.output_staged &&
+        !native_export.successful_commit;
+    ConsumeAuthority(authority);
+    if (!CollectiveAll(rollback_fresh))
+    {
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    retry_ready_ = false;
+    coordinates_ = EngineCoordinates();
+    return Result(generic::HdgEulerSessionStatus::aborted);
+  }
+
+  /** Abandon a retryable adaptive failure that produced no prepared token. */
+  result_type RejectFailedPrepare() noexcept
+  {
+    const bool local_valid = initialized_ && !failed_ && !prepared_active_ &&
+        active_native_export_ == nullptr && active_facade_incarnation_ == 0 &&
+        retry_ready_ && EngineHasStatus(RunStatus::retry_available);
+    if (!AdmitOperation(operation_tag::reject_failed_prepare, local_valid))
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    cuda_w8a::CudaStepEvidence evidence{};
+    const bool rejected = Dispatch([&](auto& engine)
+    { return engine.RejectFailedAttempt(evidence); });
+    const bool expected_contract_state = coordinates_.step == 0 &&
+            coordinates_.generation == 0 && coordinates_.time == 0.0
+        ? EngineHasStatus(RunStatus::ready)
+        : EngineHasStatus(RunStatus::committed);
+    const bool rollback_fresh = rejected && !evidence.retry_available &&
+        evidence.coordinates_preserved &&
+        evidence.committed_bytes_preserved && expected_contract_state;
+    if (!CollectiveAll(rollback_fresh))
+    {
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    retry_ready_ = false;
+    coordinates_ = EngineCoordinates();
+    return Result(generic::HdgEulerSessionStatus::aborted);
+  }
+
+  /**
+   * Restore one fieldwise-decoded native checkpoint into a pristine session.
+   * The decoder owns artifact schema/hash validation; the existing CUDA
+   * engine independently revalidates the exact tuple, mesh, partition,
+   * topology, rank, order, layout, payload hashes, and committed frontier.
+   */
+  result_type Restore(const native_export_type& checkpoint) noexcept
+  {
+    const bool local_valid = initialized_ && !failed_ && !prepared_active_ &&
+        active_native_export_ == nullptr && active_facade_incarnation_ == 0 &&
+        coordinates_.step == 0 && coordinates_.generation == 0 &&
+        coordinates_.time == 0.0 && !metadata_output_mode_ &&
+        checkpoint.successful_commit;
+    if (!AdmitOperation(operation_tag::restore, local_valid))
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    cuda_w8a::CudaStepEvidence evidence{};
+    const bool restored_locally = Dispatch([&](auto& engine)
+    { return engine.Restore(checkpoint, evidence); });
+    const bool restored = restored_locally &&
+        EngineHasStatus(RunStatus::committed);
+    if (!CollectiveAll(restored))
+    {
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    coordinates_ = EngineCoordinates();
+    ++epoch_;
+    retained_dt_ = 0.0;
+    retry_ready_ = false;
+    ClearAssessmentAuthority();
+    if (metadata_output_mode_ && !RefreshCommittedDiagnostics())
+    {
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    return Result(generic::HdgEulerSessionStatus::committed);
+  }
+
+  /** Restore one fieldwise-decoded generic checkpoint into a pristine run. */
+  result_type Restore(
+      const prepared_output_type& metadata,
+      const GenericEulerCudaCheckpointPayloadViewV1 payload) noexcept
+  {
+    const bool local_valid = initialized_ && !failed_ && !prepared_active_ &&
+        active_native_export_ == nullptr && active_facade_incarnation_ == 0 &&
+        coordinates_.step == 0 && coordinates_.generation == 0 &&
+        coordinates_.time == 0.0 && metadata_output_mode_ &&
+        metadata.successful_commit && payload.interior != nullptr &&
+        payload.owned_true_trace != nullptr &&
+        payload.interior_count == metadata.interior_count &&
+        payload.owned_true_trace_count ==
+            metadata.owned_true_trace_count;
+    if (!AdmitOperation(operation_tag::restore, local_valid))
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    cuda_w8a::CudaStepEvidence evidence{};
+    const bool restored_locally = Dispatch([&](auto& engine)
+    {
+      return engine.Restore(
+          metadata, payload.interior, payload.interior_count,
+          payload.owned_true_trace, payload.owned_true_trace_count,
+          evidence);
+    });
+    const bool restored = restored_locally &&
+        EngineHasStatus(RunStatus::committed);
+    if (!CollectiveAll(restored))
+    {
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    coordinates_ = EngineCoordinates();
+    ++epoch_;
+    retained_dt_ = 0.0;
+    retry_ready_ = false;
+    ClearAssessmentAuthority();
+    if (!RefreshCommittedDiagnostics())
+    {
+      failed_ = true;
+      return Result(generic::HdgEulerSessionStatus::rejected);
+    }
+    return Result(generic::HdgEulerSessionStatus::committed);
+  }
+
   coordinates_type coordinates() const noexcept { return coordinates_; }
 
   generic::HdgEulerCommittedDiagnostics diagnostics() const noexcept
@@ -702,7 +983,12 @@ private:
     export_committed = 6,
     export_prepared = 7,
     export_committed_fields = 8,
-    export_prepared_fields = 9
+    export_prepared_fields = 9,
+    assess_prepared = 10,
+    reject_prepared = 11,
+    reject_failed_prepare = 12,
+    restore = 13,
+    export_prepared_checkpoint_payload = 14
   };
 
   using rank1_engine = cuda_w8a::PersistentCudaSmoothEulerEngine<
@@ -719,6 +1005,12 @@ private:
   using partitioned_backward_euler_borrowed_rank2_engine =
       cuda_w8a::PersistentCudaSmoothEulerEngine<
           PartitionedBackwardEulerCudaRank2RuntimeSelection>;
+  using rodas3_borrowed_rank1_engine =
+      cuda_w8a::PersistentCudaSmoothEulerEngine<
+          Rodas3CudaRank1RuntimeSelection>;
+  using rodas3_borrowed_rank2_engine =
+      cuda_w8a::PersistentCudaSmoothEulerEngine<
+          Rodas3CudaRank2RuntimeSelection>;
 
   static coordinates_type ToCoordinates(
       const StateCoordinates& value) noexcept
@@ -789,13 +1081,47 @@ private:
   template <typename StagedOutput>
   bool OutputMatchesMode() const noexcept
   {
-    return metadata_output_mode_ == IsMetadataOutput<StagedOutput>();
+    return IsMetadataOutput<StagedOutput>() == metadata_output_mode_;
   }
 
   bool ReadyForPrepare() const noexcept
   {
     return initialized_ && !failed_ && !prepared_active_ &&
         active_native_export_ == nullptr && active_facade_incarnation_ == 0;
+  }
+
+  bool RodasAssessmentRequired() const noexcept
+  {
+    return rodas3_borrowed_rank1_ != nullptr ||
+        rodas3_borrowed_rank2_ != nullptr;
+  }
+
+  void ClearAssessmentAuthority() noexcept
+  {
+    assessment_authority_ = false;
+    assessed_epoch_ = 0;
+    assessed_facade_incarnation_ = 0;
+    assessed_native_export_ = nullptr;
+    assessed_policy_ = {};
+    assessed_policy_bits_ = {};
+  }
+
+  template <typename StagedOutput>
+  bool AssessmentMatches(
+      const GenericEulerCudaPreparedStep& authority,
+      const StagedOutput& native_export) const noexcept
+  {
+    const std::array<std::uint64_t, 3> policy_bits{{
+        generic::DoubleBits(assessed_policy_.absolute_tolerance),
+        generic::DoubleBits(assessed_policy_.relative_tolerance),
+        generic::DoubleBits(
+            assessed_policy_.algebraic_correction_fraction)}};
+    return assessment_authority_ && authority.valid_ &&
+        assessed_epoch_ == authority.epoch_ &&
+        assessed_facade_incarnation_ == authority.facade_incarnation_ &&
+        assessed_native_export_ == static_cast<const void*>(&native_export) &&
+        generic::IsValidHdgEulerPreparedAssessmentPolicy(assessed_policy_) &&
+        assessed_policy_bits_ == policy_bits;
   }
 
   template <typename StagedOutput>
@@ -893,7 +1219,11 @@ private:
         (partitioned_backward_euler_borrowed_rank2_ &&
          partitioned_backward_euler_borrowed_rank2_->contract() &&
          partitioned_backward_euler_borrowed_rank2_->contract()->status() ==
-             expected);
+             expected) ||
+        (rodas3_borrowed_rank1_ && rodas3_borrowed_rank1_->contract() &&
+         rodas3_borrowed_rank1_->contract()->status() == expected) ||
+        (rodas3_borrowed_rank2_ && rodas3_borrowed_rank2_->contract() &&
+         rodas3_borrowed_rank2_->contract()->status() == expected);
   }
 
   void ConsumeAuthority(GenericEulerCudaPreparedStep& authority) noexcept
@@ -903,6 +1233,7 @@ private:
     output_acknowledged_ = false;
     active_native_export_ = nullptr;
     active_facade_incarnation_ = 0;
+    ClearAssessmentAuthority();
   }
 
   using config_descriptor = std::array<unsigned char, 1024>;
@@ -1462,6 +1793,10 @@ private:
       return callback(*partitioned_backward_euler_borrowed_rank1_);
     if (partitioned_backward_euler_borrowed_rank2_)
       return callback(*partitioned_backward_euler_borrowed_rank2_);
+    if (rodas3_borrowed_rank1_)
+      return callback(*rodas3_borrowed_rank1_);
+    if (rodas3_borrowed_rank2_)
+      return callback(*rodas3_borrowed_rank2_);
     return false;
   }
 
@@ -1483,6 +1818,12 @@ private:
       return ToCoordinates(
           partitioned_backward_euler_borrowed_rank2_->contract()->
               coordinates());
+    if (rodas3_borrowed_rank1_ && rodas3_borrowed_rank1_->contract())
+      return ToCoordinates(
+          rodas3_borrowed_rank1_->contract()->coordinates());
+    if (rodas3_borrowed_rank2_ && rodas3_borrowed_rank2_->contract())
+      return ToCoordinates(
+          rodas3_borrowed_rank2_->contract()->coordinates());
     return coordinates_;
   }
 
@@ -1494,6 +1835,8 @@ private:
       partitioned_backward_euler_borrowed_rank1_;
   std::unique_ptr<partitioned_backward_euler_borrowed_rank2_engine>
       partitioned_backward_euler_borrowed_rank2_;
+  std::unique_ptr<rodas3_borrowed_rank1_engine> rodas3_borrowed_rank1_;
+  std::unique_ptr<rodas3_borrowed_rank2_engine> rodas3_borrowed_rank2_;
   cuda_w8a::CudaRunEvidence setup_{};
   coordinates_type coordinates_{};
   MPI_Comm communicator_ = MPI_COMM_NULL;
@@ -1510,6 +1853,12 @@ private:
   const void* active_native_export_ = nullptr;
   std::uint64_t active_facade_incarnation_ = 0;
   bool metadata_output_mode_ = false;
+  bool assessment_authority_ = false;
+  std::uint64_t assessed_epoch_ = 0;
+  std::uint64_t assessed_facade_incarnation_ = 0;
+  const void* assessed_native_export_ = nullptr;
+  generic::HdgEulerPreparedAssessmentPolicy assessed_policy_{};
+  std::array<std::uint64_t, 3> assessed_policy_bits_{};
   inline static std::uint64_t next_session_collective_id_ =
       unassigned_session_collective_id;
 };

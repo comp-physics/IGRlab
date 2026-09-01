@@ -93,9 +93,10 @@ enum class Regularization
 /// @brief Time-integrator selection for the Euler solver request.
 enum class TimeIntegrator
 {
-  RK3SSP,
-  BackwardEuler,
-  PartitionedBackwardEuler
+  RK3SSP = 0,
+  BackwardEuler = 1,
+  PartitionedBackwardEuler = 2,
+  Rodas3 = 3
 };
 
 /// @brief Source of the effective general discretization selection.
@@ -721,6 +722,10 @@ TryParseTimeIntegrator(const std::string& value)
   {
     return TimeIntegrator::PartitionedBackwardEuler;
   }
+  if (lower == "rodas3")
+  {
+    return TimeIntegrator::Rodas3;
+  }
   return std::nullopt;
 }
 
@@ -734,6 +739,8 @@ inline const char* TimeIntegratorToString(TimeIntegrator time_integrator)
     return "backward-euler";
   case TimeIntegrator::PartitionedBackwardEuler:
     return "partitioned-backward-euler";
+  case TimeIntegrator::Rodas3:
+    return "rodas3";
   }
   return "rk3ssp";
 }
@@ -991,7 +998,7 @@ ResolveSolverRequest(const std::string& case_default_dg_backend,
       result.status = SolverRequestResolutionStatus::InvalidTimeIntegrator;
       result.message = "Invalid time integrator '" + time_integrator_value +
                        "'. Use 'rk3ssp', 'backward-euler', or "
-                       "'partitioned-backward-euler'.";
+                       "'partitioned-backward-euler', or 'rodas3'.";
       return result;
     }
     result.time_integrator = *time_integrator;
@@ -1012,7 +1019,8 @@ ResolveSolverRequest(const std::string& case_default_dg_backend,
   {
     result.status = SolverRequestResolutionStatus::UnsupportedTimeIntegrator;
     result.message = "Time integrator 'rk3ssp' is unavailable for HDG; use "
-                     "'backward-euler' or 'partitioned-backward-euler'.";
+                     "'backward-euler', 'partitioned-backward-euler', or "
+                     "'rodas3'.";
     return result;
   }
   return result;

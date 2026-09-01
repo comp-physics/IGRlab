@@ -62,6 +62,12 @@ NCU_INSTRUCTION_QUALIFICATION_KINDS = frozenset({
 PRODUCTION_TRACE_POLICY = "engine-default"
 FINAL_IGR_QUADRATURE_BY_ORDER = {1: (6, 4), 2: (8, 6), 3: (10, 8)}
 FINAL_LINEAR_ROLE_RELATIVE_TOLERANCES = (1.0e-10, 3.0e-11, 1.0e-12)
+TIME_INTEGRATOR_SUMMARY_BY_CLI = {
+    "backward-euler": "backward_euler",
+    "partitioned-backward-euler": "partitioned_backward_euler",
+    "rodas3": "rodas3",
+}
+RODAS3_ALGEBRAIC_CORRECTION_FRACTION = 0.25
 
 
 class FixedSigmaJacobiProfilePolicy(NamedTuple):
@@ -277,6 +283,20 @@ def _profile_trace_policy_contract(
             "adaptive-cooperative-lower-or-full-patch-pivoted-lu-fp64"
             if mode == "igr" else "not-applicable",
             (16 if order == 1 else 32) if mode == "igr" else 0,
+        )
+    if requested == "native-element-schwarz-matrix-free-fp64" and \
+            mode == "conventional":
+        return ProfileTracePolicyContract(
+            requested,
+            requested,
+            "native_element_schwarz_fp64",
+            "ablation",
+            False,
+            None,
+            True,
+            "full-patch-lu",
+            "scalar-full-patch-pivoted-lu-fp64",
+            0,
         )
     if requested == COUPLED_WARP_BASE_PROFILE_POLICY and mode == "igr":
         return ProfileTracePolicyContract(
@@ -971,6 +991,33 @@ def validate_accepted_step_qualification_application(
     if order_text not in {"1", "2", "3"}:
         parser.error("profiler qualification requires application order 1, 2, or 3")
     order = int(order_text)
+    time_integrator = required_application_value(
+        parser, args, "--time-integrator"
+    )
+    if time_integrator not in TIME_INTEGRATOR_SUMMARY_BY_CLI:
+        parser.error(
+            "profiler qualification requires backward-euler, "
+            "partitioned-backward-euler, or rodas3"
+        )
+    time_tolerance_options = ("--time-atol", "--time-rtol")
+    if time_integrator == "rodas3":
+        for option in time_tolerance_options:
+            try:
+                value = float(required_application_value(parser, args, option))
+            except ValueError:
+                parser.error(
+                    f"profiler qualification application {option} is invalid"
+                )
+            if not math.isfinite(value) or value <= 0.0:
+                parser.error(
+                    f"profiler qualification application {option} must be "
+                    "finite and positive"
+                )
+    elif any(option in args.arg for option in time_tolerance_options):
+        parser.error(
+            "backward-Euler profiler qualification forbids application "
+            "--time-atol and --time-rtol"
+        )
     # Promotion-bound NCU/Nsys captures qualify only the production selector.
     # Explicit coupled and lower-split policies remain available to ordinary
     # smoke/screening runs, but may not be represented as promotable evidence.
@@ -1645,6 +1692,157 @@ def application_argument(args: argparse.Namespace, option: str) -> str:
     return args.arg[positions[0] + 1]
 
 
+def _effective_profile_trace_policy(
+        requested: str, mode: str, time_integrator: str) -> str:
+    """Mirror the generic CUDA facade's typed engine-default admission."""
+    if requested == PRODUCTION_TRACE_POLICY and mode == "conventional" and \
+            time_integrator == "rodas3":
+        return "native-element-schwarz-matrix-free-fp64"
+    return requested
+
+
+def _validated_time_integrator_work(
+        sample: dict[str, Any], expected_time_integrator_cli: str,
+        expected_time_atol: float,
+        expected_time_rtol: float) -> dict[str, Any]:
+    """Validate the bounded assessment and common-shift work census."""
+    rodas3 = expected_time_integrator_cli == "rodas3"
+    assessment = sample.get("prepared_assessment")
+    if not isinstance(assessment, dict):
+        raise RuntimeError(
+            "selected benchmark sample has no prepared time assessment"
+        )
+    expected_assessment_flag = rodas3
+    if assessment.get("required") is not expected_assessment_flag or \
+            assessment.get("performed") is not expected_assessment_flag or \
+            assessment.get("accepted") is not expected_assessment_flag:
+        raise RuntimeError(
+            "profiled prepared-assessment state does not match the selected "
+            "time integrator"
+        )
+    absolute_tolerance = exact_finite_number(
+        assessment.get("absolute_tolerance"),
+        "prepared assessment absolute tolerance",
+    )
+    relative_tolerance = exact_finite_number(
+        assessment.get("relative_tolerance"),
+        "prepared assessment relative tolerance",
+    )
+    algebraic_fraction = exact_finite_number(
+        assessment.get("algebraic_correction_fraction"),
+        "prepared assessment algebraic correction fraction",
+    )
+    expected_fraction = (
+        RODAS3_ALGEBRAIC_CORRECTION_FRACTION if rodas3 else 0.0
+    )
+    if (absolute_tolerance, relative_tolerance, algebraic_fraction) != (
+            expected_time_atol, expected_time_rtol, expected_fraction):
+        raise RuntimeError(
+            "profiled prepared-assessment policy does not exactly match the "
+            "application time tolerances"
+        )
+
+    gate_names = (
+        "finite_gate", "solver_gate", "residual_gate",
+        "admissibility_gate", "algebraic_closure_gate",
+        "algebraic_correction_gate",
+    )
+    if any(assessment.get(name) is not expected_assessment_flag
+           for name in gate_names):
+        raise RuntimeError(
+            "profiled prepared-assessment gates do not match the selected "
+            "time integrator"
+        )
+    normalized_differential_error: float | None = None
+    normalized_algebraic_correction: float | None = None
+    if rodas3:
+        normalized_differential_error = exact_finite_number(
+            assessment.get("normalized_differential_error"),
+            "prepared normalized differential error",
+        )
+        normalized_algebraic_correction = exact_finite_number(
+            assessment.get("normalized_algebraic_correction"),
+            "prepared normalized algebraic correction",
+        )
+        if not 0.0 <= normalized_differential_error <= 1.0 or not \
+                0.0 <= normalized_algebraic_correction <= \
+                RODAS3_ALGEBRAIC_CORRECTION_FRACTION:
+            raise RuntimeError(
+                "profiled RODAS3 assessment exceeds its accepted temporal or "
+                "algebraic budget"
+            )
+    elif assessment.get("normalized_differential_error") is not None or \
+            assessment.get("normalized_algebraic_correction") is not None:
+        raise RuntimeError(
+            "backward-Euler sample unexpectedly reports an embedded assessment"
+        )
+
+    census_names = (
+        "complete_assemblies", "complete_condensations",
+        "complete_recoveries", "common_shift_operator_builds",
+        "common_shift_operator_reuses", "condensed_rhs_refreshes",
+        "common_shift_trace_solves", "common_shift_preconditioner_setups",
+        "common_shift_preconditioner_reuses",
+    )
+    census = {
+        name: exact_uint64(sample.get(name), f"profiled {name}")
+        for name in census_names
+    }
+    nonlinear_updates = exact_nonnegative_integer(
+        sample.get("nonlinear_updates"), "profiled nonlinear update count"
+    )
+    trace_solves = exact_uint64(
+        sample.get("trace_solves"), "profiled trace solve count"
+    )
+    if rodas3:
+        raw_errors = {
+            name: exact_finite_number(sample.get(name), f"profiled {name}")
+            for name in (
+                "temporal_error_norm", "final_algebraic_residual",
+                "final_algebraic_correction_norm",
+            )
+        }
+        if any(value < 0.0 for value in raw_errors.values()) or \
+                trace_solves != nonlinear_updates + 4 or \
+                census["complete_assemblies"] <= 0 or \
+                census["complete_condensations"] <= 0 or \
+                census["complete_recoveries"] <= 0 or \
+                census["common_shift_operator_builds"] != 1 or \
+                census["common_shift_operator_reuses"] != 3 or \
+                census["condensed_rhs_refreshes"] != 3 or \
+                census["common_shift_trace_solves"] != 4 or \
+                census["common_shift_preconditioner_setups"] < 1 or \
+                census["common_shift_preconditioner_reuses"] != 3:
+            raise RuntimeError(
+                "profiled RODAS3 common-shift or complete-work census is invalid"
+            )
+    else:
+        raw_errors = {}
+        if any(census[name] != 0 for name in (
+                "common_shift_operator_builds",
+                "common_shift_operator_reuses", "condensed_rhs_refreshes",
+                "common_shift_trace_solves",
+                "common_shift_preconditioner_setups",
+                "common_shift_preconditioner_reuses")):
+            raise RuntimeError(
+                "backward-Euler sample unexpectedly reports common-shift work"
+            )
+    return {
+        "time_integrator": TIME_INTEGRATOR_SUMMARY_BY_CLI[
+            expected_time_integrator_cli
+        ],
+        "time_absolute_tolerance": expected_time_atol,
+        "time_relative_tolerance": expected_time_rtol,
+        "algebraic_correction_fraction": expected_fraction,
+        "normalized_differential_error": normalized_differential_error,
+        "normalized_algebraic_correction": normalized_algebraic_correction,
+        "nonlinear_updates": nonlinear_updates,
+        "trace_solves": trace_solves,
+        **raw_errors,
+        **census,
+    }
+
+
 def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
     """Validate one bounded benchmark summary from the profiled process.
 
@@ -1686,10 +1884,31 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
     expected_mesh_n = int(application_argument(args, "--mesh-n"))
     expected_periods = int(application_argument(args, "--domain-periods"))
     expected_timestep = float(application_argument(args, "--dt"))
-    requested_trace_policy = application_argument(args, "--trace-policy")
-    trace_policy_contract = _profile_trace_policy_contract(
-        requested_trace_policy, expected_mode, expected_order
+    expected_time_integrator_cli = application_argument(
+        args, "--time-integrator"
     )
+    expected_time_integrator = TIME_INTEGRATOR_SUMMARY_BY_CLI[
+        expected_time_integrator_cli
+    ]
+    expected_time_atol = (
+        float(application_argument(args, "--time-atol"))
+        if expected_time_integrator_cli == "rodas3" else 0.0
+    )
+    expected_time_rtol = (
+        float(application_argument(args, "--time-rtol"))
+        if expected_time_integrator_cli == "rodas3" else 0.0
+    )
+    requested_trace_policy = application_argument(args, "--trace-policy")
+    effective_trace_policy = _effective_profile_trace_policy(
+        requested_trace_policy, expected_mode, expected_time_integrator_cli
+    )
+    trace_policy_contract = _profile_trace_policy_contract(
+        effective_trace_policy, expected_mode, expected_order
+    )
+    if requested_trace_policy == PRODUCTION_TRACE_POLICY:
+        trace_policy_contract = trace_policy_contract._replace(
+            variant="production", production_selectable=True
+        )
     expected_equilibration_passes = (
         2 if trace_policy_contract.factorization in {
             "lower-multiplicative-uhat4-sigmahat",
@@ -1710,6 +1929,7 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
             trace_policy_contract.production_selectable and
         record.get("backend") == "cuda" and
         record.get("cuda_engine") == "tensor" and
+        record.get("cli_trace_policy") == requested_trace_policy and
         record.get("trace_policy") == trace_policy_contract.requested and
         record.get("requested_trace_policy") ==
             trace_policy_contract.requested and
@@ -1730,6 +1950,8 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         record.get("trace_element_schwarz_sigma_rows") ==
             expected_sigma_rows and
         record.get("mode") == expected_mode and
+        record.get("time_integrator") == expected_time_integrator and
+        record.get("time_step_policy") == "fixed" and
         record.get("polynomial_order") == expected_order and
         record.get("mesh_n") == expected_mesh_n and
         record.get("domain_periods") == expected_periods and
@@ -1839,6 +2061,10 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
             "profiled benchmark summary does not identify exactly one selected "
             "measured step"
         )
+    time_integrator_work = _validated_time_integrator_work(
+        selected[0], expected_time_integrator_cli,
+        expected_time_atol, expected_time_rtol,
+    )
     tensor = selected[0].get("tensor_core")
     if not isinstance(tensor, dict):
         raise RuntimeError("selected benchmark sample has no tensor work summary")
@@ -1899,6 +2125,15 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
     if volume_assembly_launches <= 0 or volume_mma_tiles <= 0:
         raise RuntimeError(
             "selected benchmark sample has no material tensor-volume work"
+        )
+    if expected_time_integrator_cli == "rodas3" and (
+            volume_assembly_launches !=
+                time_integrator_work["complete_assemblies"] or
+            condensation_launches !=
+                time_integrator_work["complete_condensations"]):
+        raise RuntimeError(
+            "profiled RODAS3 backend launches do not match its complete-work "
+            "census"
         )
     if not (
         tensor.get("selected_engine") == "tensor" and
@@ -2077,6 +2312,7 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         "status": "complete_profiled_tensor_work",
         "profile_measured_step": measured_step,
         "mode": expected_mode,
+        "cli_trace_policy": requested_trace_policy,
         "trace_policy": trace_policy_contract.requested,
         "resolved_trace_policy": trace_policy_contract.resolved,
         "trace_preconditioner": trace_policy_contract.preconditioner,
@@ -2115,6 +2351,7 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         "hypre_trace_solve_calls": hypre_trace_solve_calls,
         "trace_solver_accounting_complete": True,
         "fallback_count": 0,
+        **time_integrator_work,
         "execution_log": file_identity(log_path),
     }
 
@@ -2230,8 +2467,10 @@ def import_ncu_tensor_proof(args: argparse.Namespace, tool: str,
     return proof, artifacts, {path: command for path in artifacts}
 
 
-def parse_ncu_attribution_csv(data: bytes,
-                              launch_limit: int) -> dict[str, Any]:
+def parse_ncu_attribution_csv(
+        data: bytes, launch_limit: int,
+        required_categories: frozenset[str] =
+            NCU_REQUIRED_ATTRIBUTION_CATEGORIES) -> dict[str, Any]:
     try:
         text = data.decode("utf-8", errors="strict")
         rows = list(csv.reader(io.StringIO(text)))
@@ -2346,7 +2585,7 @@ def parse_ncu_attribution_csv(data: bytes,
             f"{launch_limit}"
         )
     missing_categories = sorted(
-        category for category in NCU_REQUIRED_ATTRIBUTION_CATEGORIES
+        category for category in required_categories
         if category_totals[category]["launches"] <= 0 or
         category_totals[category]["duration_ns"] <= 0.0
     )
@@ -2390,7 +2629,7 @@ def parse_ncu_attribution_csv(data: bytes,
         "matched_launches": launches,
         "total_gpu_kernel_duration_ns": total_duration,
         "categories": categories,
-        "required_categories": sorted(NCU_REQUIRED_ATTRIBUTION_CATEGORIES),
+        "required_categories": sorted(required_categories),
         "tensor_condensation": {
             "kernel_substring": NCU_CONDENSATION_KERNEL,
             "launches": tensor_condensation_launches,
@@ -2433,8 +2672,14 @@ def import_ncu_attribution(args: argparse.Namespace, tool: str,
     if result.returncode:
         raise RuntimeError(f"NCU report import exited {result.returncode}")
     csv_data = regular_bytes(csv_path, args.out_dir)
+    required_categories = NCU_REQUIRED_ATTRIBUTION_CATEGORIES
+    if application_work.get("time_integrator") == "rodas3":
+        # RODAS stages do not execute a nonlinear line-search update. Their
+        # bounded stage/common-shift census is validated from the benchmark
+        # summary instead of manufacturing a stage-specific NVTX range.
+        required_categories = required_categories - {"nonlinear_update"}
     attribution = parse_ncu_attribution_csv(
-        csv_data, args.ncu_launch_count
+        csv_data, args.ncu_launch_count, frozenset(required_categories)
     )
     expected_tensor_launches = int(application_work["condensation_launches"])
     if attribution["tensor_condensation"]["launches"] != \

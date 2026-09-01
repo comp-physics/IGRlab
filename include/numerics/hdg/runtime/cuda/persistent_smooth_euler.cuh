@@ -21,6 +21,7 @@
 #include "numerics/hdg/runtime/cuda/native_element_schwarz_plan.hpp"
 #include "numerics/hdg/runtime/cuda/tensor_volume_layout.hpp"
 #include "numerics/hdg/runtime/runtime_selection.hpp"
+#include "numerics/hdg/time/rodas3.hpp"
 #include "numerics/hdg/trace/trace_dg_mpi.hpp"
 #include "physics/bc/boundary_state.hpp"
 #include "utils/profiling/nvtx.hpp"
@@ -462,6 +463,18 @@ struct CudaNumericalResult
   double true_relative_residual = std::numeric_limits<double>::infinity();
   double maximum_conservation_error = 0.0;
   double maximum_conservation_relative_error = 0.0;
+  double temporal_error_norm = 0.0;
+  double final_algebraic_residual = 0.0;
+  double final_algebraic_correction_norm = 0.0;
+  std::uint64_t complete_assemblies = 0;
+  std::uint64_t complete_condensations = 0;
+  std::uint64_t complete_recoveries = 0;
+  std::uint64_t common_shift_operator_builds = 0;
+  std::uint64_t common_shift_operator_reuses = 0;
+  std::uint64_t condensed_rhs_refreshes = 0;
+  std::uint64_t common_shift_trace_solves = 0;
+  std::uint64_t common_shift_preconditioner_setups = 0;
+  std::uint64_t common_shift_preconditioner_reuses = 0;
   int nonlinear_updates = 0;
   int trace_solves = 0;
   // Sum outer GMRES iterations from the configured native or HYPRE trace
@@ -515,12 +528,15 @@ inline bool ExactSelection(const CudaConfig& config) noexcept
   const bool partitioned_backward_euler = config.time_treatment ==
           generic::EulerHdgTimeTreatment::partitioned_backward_euler &&
       ExactId(tuple.time_treatment, "partitioned_backward_euler");
+  const bool rodas3 =
+      config.time_treatment == generic::EulerHdgTimeTreatment::rodas3 &&
+      ExactId(tuple.time_treatment, "rodas3");
   return Selection::interior_space == InteriorSpace::l2 && tuple.Valid() &&
       ExactId(tuple.model, "euler.compressible.2d") &&
       ExactId(tuple.formulation, "hdg.conventional") &&
       ExactId(tuple.trace, "mfem.dg_interface.trace") &&
       (legacy_fixed || borrowed_current_llf) &&
-      (backward_euler || partitioned_backward_euler) &&
+      (backward_euler || partitioned_backward_euler || rodas3) &&
       ExactId(tuple.precision, "fp64") && (rank_one || rank_two);
 }
 
@@ -805,6 +821,124 @@ public:
     return all_staged;
   }
 
+  /**
+   * Copy the exact metadata-staged candidate into caller-owned spans.  This
+   * keeps generic meshes independent of the legacy fixed checkpoint DTO while
+   * retaining the same affine candidate and hash authority.
+   */
+  bool ExportPreparedCheckpointPayload(
+      const CudaPreparedOutputMetadataV1& metadata,
+      double* interior, const std::size_t interior_count,
+      double* owned_true_trace,
+      const std::size_t owned_true_trace_count) noexcept
+  {
+    const state_slot& staging_slot = numerics_.WorkspaceSlot();
+    const bool local_valid = initialized_ &&
+        config_.time_treatment == generic::EulerHdgTimeTreatment::rodas3 &&
+        pending_.active && pending_.staging && pending_.prestage_allowed &&
+        pending_.checkpoint_staged && metadata.schema == 1 &&
+        metadata.candidate_frozen && metadata.checkpoint_staged &&
+        !metadata.output_staged && !metadata.successful_commit &&
+        metadata.facade_incarnation == facade_incarnation_ &&
+        ::dg::hdg::runtime::detail::SameAttempt(
+            metadata.attempt, pending_.attempt) &&
+        ::dg::hdg::runtime::detail::SameCheckpoint(
+            metadata.descriptor, pending_.staging->future_checkpoint()) &&
+        metadata.local_interior_hash ==
+            pending_.candidate_local_interior_hash &&
+        metadata.local_trace_hash == pending_.candidate_local_trace_hash &&
+        metadata.interior_count == staging_slot.interior.count &&
+        metadata.owned_true_trace_count == staging_slot.trace.count;
+    if (!numerics_.CollectiveContinue(local_valid)) return false;
+    return numerics_.ExportPreparedCheckpointPayload(
+        staging_slot, metadata, interior, interior_count, owned_true_trace,
+        owned_true_trace_count);
+  }
+
+  /**
+   * Assess one exact frozen RODAS3 candidate without publishing it.  A
+   * successful call returns the bounded controller inputs; commit authority
+   * is retained only when the independent algebraic reconstruction also fits
+   * its policy budget.
+   */
+  template <typename StagedOutput>
+  bool AssessPrepared(
+      const StagedOutput& output,
+      const generic::HdgEulerPreparedAssessmentPolicy policy,
+      generic::HdgEulerPreparedAssessment& assessment) noexcept
+  {
+    assessment = {};
+    ClearPendingAssessment();
+    const bool local_output_valid = initialized_ && pending_.active &&
+        pending_.staging && pending_.prestage_allowed &&
+        pending_.checkpoint_staged &&
+        config_.time_treatment == generic::EulerHdgTimeTreatment::rodas3 &&
+        output.candidate_frozen && output.checkpoint_staged &&
+        !output.successful_commit &&
+        output.facade_incarnation == facade_incarnation_ &&
+        ::dg::hdg::runtime::detail::SameAttempt(
+            output.attempt, pending_.attempt) &&
+        dg::hdg::runtime::detail::SameCheckpoint(
+            output.descriptor, pending_.staging->future_checkpoint()) &&
+        generic::IsValidHdgEulerPreparedAssessmentPolicy(policy);
+    const std::array<std::uint64_t, 3> local_policy{{
+        generic::DoubleBits(policy.absolute_tolerance),
+        generic::DoubleBits(policy.relative_tolerance),
+        generic::DoubleBits(policy.algebraic_correction_fraction)}};
+    std::array<std::uint64_t, 3> minimum_policy{};
+    std::array<std::uint64_t, 3> maximum_policy{};
+    const bool policy_consensus = MPI_Allreduce(
+            local_policy.data(), minimum_policy.data(),
+            static_cast<int>(local_policy.size()), MPI_UINT64_T, MPI_MIN,
+            communicator_) == MPI_SUCCESS &&
+        MPI_Allreduce(local_policy.data(), maximum_policy.data(),
+                      static_cast<int>(local_policy.size()), MPI_UINT64_T,
+                      MPI_MAX, communicator_) == MPI_SUCCESS &&
+        minimum_policy == maximum_policy;
+    if (!numerics_.CollectiveContinue(
+            local_output_valid && policy_consensus))
+      return false;
+
+    if (!numerics_.AssessPreparedRodas3(
+            pending_.attempt, pending_.candidate_interior_hash,
+            pending_.candidate_trace_hash, policy, assessment))
+      return false;
+    const detail::CudaNumericalResult& numerical = pending_.numerical;
+    assessment.finite_gate = numerical.finite &&
+        generic::IsValidHdgEulerPreparedAssessment(assessment);
+    assessment.solver_gate = numerical.success && numerical.telemetry;
+    assessment.residual_gate = numerical.true_residual &&
+        numerical.conservation;
+    assessment.admissibility_gate = numerical.admissible;
+    const double algebraic_residual_allowance = std::max(
+        config_.numerical_policy.nonlinear_relative_tolerance,
+        1024.0 * std::numeric_limits<double>::epsilon());
+    assessment.algebraic_closure_gate = numerical.recovery &&
+        std::isfinite(numerical.final_algebraic_residual) &&
+        numerical.final_algebraic_residual <= algebraic_residual_allowance;
+    assessment.algebraic_correction_gate =
+        assessment.normalized_algebraic_correction <=
+            policy.algebraic_correction_fraction;
+    const bool primary_gates = numerics_.CollectiveContinue(
+        assessment.finite_gate && assessment.solver_gate &&
+        assessment.residual_gate && assessment.admissibility_gate &&
+        assessment.algebraic_closure_gate);
+    const bool publishable = numerics_.CollectiveContinue(
+        primary_gates && assessment.algebraic_correction_gate);
+    if (publishable)
+    {
+      pending_.assessment_authority = true;
+      pending_.assessment_attempt = pending_.attempt;
+      pending_.assessment_interior_hash =
+          pending_.candidate_interior_hash;
+      pending_.assessment_trace_hash = pending_.candidate_trace_hash;
+      pending_.assessment_policy = policy;
+      pending_.assessment_policy_bits = local_policy;
+    }
+    UpdateAttemptEvidence(pending_.evidence);
+    return primary_gates;
+  }
+
   /** Freeze the independent oracle bytes during the same candidate epoch. */
   bool StagePreparedOracle(CudaOraclePod& pod,
                            CudaStepEvidence& evidence) noexcept
@@ -862,6 +996,13 @@ public:
   bool PrepareCommit(StagedOutput& checkpoint,
                      CudaStepEvidence& evidence) noexcept
   {
+    const bool success_publication_requested = pending_.active &&
+        pending_.prestage_allowed && pending_.report.gates.success;
+    const bool assessment_ready =
+        config_.time_treatment != generic::EulerHdgTimeTreatment::rodas3 ||
+        !success_publication_requested ||
+        PendingAssessmentExact();
+    if (!numerics_.CollectiveContinue(assessment_ready)) return false;
     const bool local_staging = pending_.active && pending_.staging.has_value();
     if (!numerics_.CollectiveContinue(local_staging))
       return RetainAffineProtocolFailure(evidence);
@@ -1015,6 +1156,89 @@ public:
     return outcome.retry_available;
   }
 
+  /**
+   * Adaptive decline: roll back the prepared candidate, then explicitly
+   * decline the contract's same-dt retry so a fresh primary attempt may use a
+   * controller-selected timestep.
+   */
+  template <typename StagedOutput>
+  bool RejectPrepared(StagedOutput& checkpoint,
+                      FailureReason reason,
+                      CudaStepEvidence& evidence) noexcept
+  {
+    const bool rolled_back = AbortPrepared(checkpoint, reason, evidence);
+    const bool rollback_exact = rolled_back && evidence.retry_available &&
+        evidence.coordinates_preserved &&
+        evidence.committed_bytes_preserved && contract_ &&
+        contract_->status() == RunStatus::retry_available;
+    if (!numerics_.CollectiveContinue(rollback_exact))
+    {
+      initialized_ = false;
+      return false;
+    }
+    const StateCoordinates coordinates_before = contract_->coordinates();
+    const bool abandoned = contract_->AbandonRetry();
+    const StateCoordinates coordinates_after = contract_->coordinates();
+    const RunStatus expected = coordinates_after.step == 0 &&
+            coordinates_after.generation == 0 && coordinates_after.time == 0.0
+        ? RunStatus::ready : RunStatus::committed;
+    const bool abandoned_exact = abandoned &&
+        contract_->status() == expected &&
+        ::dg::hdg::runtime::detail::SameCoordinates(
+            coordinates_before, coordinates_after);
+    if (!numerics_.CollectiveContinue(abandoned_exact))
+    {
+      initialized_ = false;
+      return false;
+    }
+    retained_retry_dt_ = fixed_dt;
+    evidence.after = coordinates_after;
+    evidence.retry_available = false;
+    evidence.contract_reason = FailureReason::none;
+    evidence.status = CudaRunStatus::ready;
+    UpdateAttemptEvidence(evidence);
+    return true;
+  }
+
+  /**
+   * Decline a retryable attempt that failed before a candidate/staging token
+   * existed.  This is the no-token counterpart of RejectPrepared: the run
+   * contract has already rolled back to the exact committed bytes and only
+   * its same-dt retry authority remains live.
+   */
+  bool RejectFailedAttempt(CudaStepEvidence& evidence) noexcept
+  {
+    evidence = {};
+    const bool locally_ready = initialized_ && contract_ && !pending_.active &&
+        contract_->status() == RunStatus::retry_available;
+    if (!numerics_.CollectiveContinue(locally_ready)) return false;
+    const StateCoordinates coordinates_before = contract_->coordinates();
+    const bool abandoned = contract_->AbandonRetry();
+    const StateCoordinates coordinates_after = contract_->coordinates();
+    const RunStatus expected = coordinates_after.step == 0 &&
+            coordinates_after.generation == 0 && coordinates_after.time == 0.0
+        ? RunStatus::ready : RunStatus::committed;
+    const bool abandoned_exact = abandoned &&
+        contract_->status() == expected &&
+        ::dg::hdg::runtime::detail::SameCoordinates(
+            coordinates_before, coordinates_after);
+    if (!numerics_.CollectiveContinue(abandoned_exact))
+    {
+      initialized_ = false;
+      return false;
+    }
+    retained_retry_dt_ = fixed_dt;
+    evidence.before = coordinates_before;
+    evidence.after = coordinates_after;
+    evidence.coordinates_preserved = true;
+    evidence.committed_bytes_preserved = true;
+    evidence.retry_available = false;
+    evidence.collective_consensus = true;
+    evidence.status = CudaRunStatus::ready;
+    UpdateAttemptEvidence(evidence);
+    return true;
+  }
+
   template <typename StagedOutput>
   bool RevertCommit(StagedOutput& checkpoint,
                     FailureReason reason,
@@ -1126,6 +1350,113 @@ public:
       // scalar certificate may publish without the exact imported metadata.
       // This invariant failure is terminal for the facade and remains
       // externally unpublished.
+      initialized_ = false;
+      evidence.after = contract_->coordinates();
+      evidence.committed = false;
+      evidence.collective_consensus = false;
+      evidence.contract_reason = FailureReason::backend_failure;
+      evidence.status = CudaRunStatus::runtime_failure;
+      UpdateAttemptEvidence(evidence);
+      return false;
+    }
+    else
+    {
+      numerics_.SwapPublishedSlotHandles();
+      numerics_.MarkCommittedScalarClosureCoherent();
+      next_attempt_sequence_ = restored_frontier;
+    }
+    evidence.after = contract_->coordinates();
+    evidence.after_interior_hash = loaded.interior.hash;
+    evidence.after_trace_hash = loaded.trace.hash;
+    evidence.committed = restored.restored;
+    evidence.collective_consensus = restored.compatibility !=
+        RestartCompatibility::collective_protocol;
+    evidence.contract_reason = restored.restored ? FailureReason::none :
+        FailureReason::restart_incompatible;
+    evidence.status = restored.restored ? CudaRunStatus::committed :
+        CudaRunStatus::runtime_failure;
+    UpdateAttemptEvidence(evidence);
+    return restored.restored;
+  }
+
+  /**
+   * Restore a committed RODAS3 checkpoint from exact caller-owned spans.  The
+   * metadata carries identity and hashes only; pointer tokens and staging
+   * counters are deliberately not restart authority.
+   */
+  bool Restore(
+      const CudaPreparedOutputMetadataV1& metadata,
+      const double* interior, const std::size_t interior_count,
+      const double* owned_true_trace,
+      const std::size_t owned_true_trace_count,
+      CudaStepEvidence& evidence) noexcept
+  {
+    evidence = {};
+    const bool zero_work_evidence_ready =
+        InitializeZeroWorkTensorCoreEvidence(evidence.tensor_core);
+    if (!zero_work_evidence_ready || !initialized_ || pending_.active ||
+        config_.time_treatment != generic::EulerHdgTimeTreatment::rodas3)
+      return false;
+    evidence.before = contract_->coordinates();
+    const StateCoordinates restored_coordinates =
+        metadata.descriptor.coordinates;
+    const std::uint64_t restored_frontier = restored_coordinates.cursor;
+    const bool local_frontier_valid =
+        contract_->status() == RunStatus::ready &&
+        evidence.before.step == 0 && evidence.before.generation == 0 &&
+        evidence.before.cursor == 0 && evidence.before.time == 0.0 &&
+        metadata.attempt.sequence == restored_frontier &&
+        restored_frontier != 0 &&
+        restored_frontier != std::numeric_limits<std::uint64_t>::max() &&
+        restored_coordinates.step != 0 &&
+        restored_coordinates.generation != 0 &&
+        metadata.attempt.committed_step == restored_coordinates.step - 1 &&
+        metadata.attempt.committed_generation ==
+            restored_coordinates.generation - 1;
+    if (!numerics_.CollectiveContinue(local_frontier_valid))
+    {
+      evidence.status = CudaRunStatus::runtime_failure;
+      evidence.contract_reason = FailureReason::restart_incompatible;
+      return false;
+    }
+    CudaPolicyContext context{};
+    context.attempt_sequence = restored_frontier;
+    context.target_step = metadata.descriptor.coordinates.step;
+    context.generation = metadata.descriptor.coordinates.generation;
+    context.rank = numerics_.rank();
+    context.phase = CudaFailurePhase::setup;
+    evidence.transfer_range.begin_ordinal =
+        TransportPolicy::Ledger().observed_count + 1;
+    TransportPolicy::BeginAttempt(context);
+    state_slot& loaded = numerics_.WorkspaceSlot();
+    const bool imported = numerics_.ImportCheckpoint(
+        metadata, interior, interior_count, owned_true_trace,
+        owned_true_trace_count, loaded);
+    if (!imported)
+    {
+      evidence.status = CudaRunStatus::runtime_failure;
+      evidence.contract_reason = FailureReason::restart_incompatible;
+      UpdateAttemptEvidence(evidence);
+      return false;
+    }
+
+    contract_.reset();
+    StateCoordinates initial{};
+    contract_.emplace(numerics_.CommittedSlot(), numerics_.CandidateSlot(),
+                      initial, numerics_.Resources(), restored_frontier,
+                      CollectivePolicy(communicator_));
+    const RestoreOutcome restored =
+        contract_->Restore(metadata.descriptor, loaded);
+    if (!restored.restored)
+    {
+      contract_.reset();
+      contract_.emplace(numerics_.CommittedSlot(), numerics_.CandidateSlot(),
+                        initial, numerics_.Resources(), 0,
+                        CollectivePolicy(communicator_));
+      next_attempt_sequence_ = 0;
+    }
+    else if (!numerics_.AdoptPreparedCandidateMetadata(loaded))
+    {
       initialized_ = false;
       evidence.after = contract_->coordinates();
       evidence.committed = false;
@@ -1375,6 +1706,36 @@ private:
     pending_.oracle_staged = false;
     pending_.output_staged = false;
     pending_.has_oracle = false;
+    ClearPendingAssessment();
+  }
+
+  void ClearPendingAssessment() noexcept
+  {
+    pending_.assessment_authority = false;
+    pending_.assessment_attempt = {};
+    pending_.assessment_interior_hash = {};
+    pending_.assessment_trace_hash = {};
+    pending_.assessment_policy = {};
+    pending_.assessment_policy_bits = {};
+  }
+
+  bool PendingAssessmentExact() const noexcept
+  {
+    const std::array<std::uint64_t, 3> policy_bits{{
+        generic::DoubleBits(pending_.assessment_policy.absolute_tolerance),
+        generic::DoubleBits(pending_.assessment_policy.relative_tolerance),
+        generic::DoubleBits(
+            pending_.assessment_policy.algebraic_correction_fraction)}};
+    return pending_.active && pending_.staging &&
+        pending_.assessment_authority &&
+        ::dg::hdg::runtime::detail::SameAttempt(
+            pending_.assessment_attempt, pending_.attempt) &&
+        pending_.assessment_interior_hash ==
+            pending_.candidate_interior_hash &&
+        pending_.assessment_trace_hash == pending_.candidate_trace_hash &&
+        generic::IsValidHdgEulerPreparedAssessmentPolicy(
+            pending_.assessment_policy) &&
+        policy_bits == pending_.assessment_policy_bits;
   }
 
   bool ValidateConfig() const noexcept
@@ -1463,10 +1824,46 @@ private:
              generic::RegularizationKind::none ||
          config_.numerical_policy.stabilization.kind ==
              generic::RegularizationKind::igr);
+    // Rank-one tensor CUDA retains its matrix-free operator and
+    // element-Schwarz factor across the four causal stages. Rank-one ordinary
+    // CUDA retains the assembled ParCSR operator and local condensation LU.
+    // Both rank-two engines use the established host-staged ParCSR leaf with
+    // their exact engine-default HYPRE preconditioner; only the distributed
+    // RHS is refreshed after the first causal stage.
+    const bool rodas3 = config_.time_treatment ==
+        generic::EulerHdgTimeTreatment::rodas3;
+    const bool rodas3_tensor_configuration =
+        config_.cuda_engine == generic::CudaEngineKind::tensor_core &&
+        CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+            trace_policy_.resolved_selection) &&
+        CudaTracePreconditionerIsNativeElementSchwarz(
+            trace_policy_.trace_preconditioner);
+    const bool rodas3_ordinary_configuration =
+        config_.cuda_engine == generic::CudaEngineKind::ordinary &&
+        CudaOrdinaryRankOneRefreshPolicyIsExact(trace_policy_);
+    const bool rodas3_host_staged_rank_two_configuration =
+        config_.expected_rank_count == 2 &&
+        config_.require_host_staged_rank2 &&
+        CudaHostStagedRankTwoPolicyIsExact(trace_policy_);
+    const bool rodas3_configuration = rodas3 &&
+        (config_.expected_rank_count == 1 ||
+         config_.expected_rank_count == 2) &&
+        config_.use_borrowed_topology &&
+        config_.use_borrowed_host_inputs &&
+        config_.use_generic_numerical_policy &&
+        (config_.numerical_policy.stabilization.kind ==
+             generic::RegularizationKind::none ||
+         config_.numerical_policy.stabilization.kind ==
+             generic::RegularizationKind::igr) &&
+        ((config_.expected_rank_count == 1 &&
+          (rodas3_tensor_configuration ||
+           rodas3_ordinary_configuration)) ||
+         rodas3_host_staged_rank_two_configuration);
     const bool time_treatment_configuration =
         generic::IsKnownEulerHdgTimeTreatment(config_.time_treatment) &&
         (!partitioned_backward_euler ||
-         partitioned_backward_euler_configuration);
+         partitioned_backward_euler_configuration) &&
+        (!rodas3 || rodas3_configuration);
     const bool cuda_engine_configuration =
         generic::IsKnownCudaEngineKind(config_.cuda_engine) &&
         (config_.cuda_engine != generic::CudaEngineKind::tensor_core ||
@@ -1846,6 +2243,7 @@ private:
                       CudaStepEvidence& evidence) noexcept
   {
     evidence = {};
+    ClearPendingAssessment();
     const bool zero_work_evidence_ready =
         InitializeZeroWorkTensorCoreEvidence(evidence.tensor_core);
     evidence.before = contract_->coordinates();
@@ -1970,6 +2368,25 @@ private:
     evidence.initial_residual = adjusted.initial_residual;
     evidence.final_residual = adjusted.final_residual;
     evidence.true_relative_residual = adjusted.true_relative_residual;
+    evidence.temporal_error_norm = adjusted.temporal_error_norm;
+    evidence.final_algebraic_residual = adjusted.final_algebraic_residual;
+    evidence.final_algebraic_correction_norm =
+        adjusted.final_algebraic_correction_norm;
+    evidence.complete_assemblies = adjusted.complete_assemblies;
+    evidence.complete_condensations = adjusted.complete_condensations;
+    evidence.complete_recoveries = adjusted.complete_recoveries;
+    evidence.common_shift_operator_builds =
+        adjusted.common_shift_operator_builds;
+    evidence.common_shift_operator_reuses =
+        adjusted.common_shift_operator_reuses;
+    evidence.condensed_rhs_refreshes =
+        adjusted.condensed_rhs_refreshes;
+    evidence.common_shift_trace_solves =
+        adjusted.common_shift_trace_solves;
+    evidence.common_shift_preconditioner_setups =
+        adjusted.common_shift_preconditioner_setups;
+    evidence.common_shift_preconditioner_reuses =
+        adjusted.common_shift_preconditioner_reuses;
     evidence.nonlinear_updates = adjusted.nonlinear_updates;
     evidence.trace_solves = adjusted.trace_solves;
     evidence.linear_iterations = adjusted.linear_iterations;
@@ -2172,6 +2589,25 @@ private:
     evidence.initial_residual = numerical.initial_residual;
     evidence.final_residual = numerical.final_residual;
     evidence.true_relative_residual = numerical.true_relative_residual;
+    evidence.temporal_error_norm = numerical.temporal_error_norm;
+    evidence.final_algebraic_residual = numerical.final_algebraic_residual;
+    evidence.final_algebraic_correction_norm =
+        numerical.final_algebraic_correction_norm;
+    evidence.complete_assemblies = numerical.complete_assemblies;
+    evidence.complete_condensations = numerical.complete_condensations;
+    evidence.complete_recoveries = numerical.complete_recoveries;
+    evidence.common_shift_operator_builds =
+        numerical.common_shift_operator_builds;
+    evidence.common_shift_operator_reuses =
+        numerical.common_shift_operator_reuses;
+    evidence.condensed_rhs_refreshes =
+        numerical.condensed_rhs_refreshes;
+    evidence.common_shift_trace_solves =
+        numerical.common_shift_trace_solves;
+    evidence.common_shift_preconditioner_setups =
+        numerical.common_shift_preconditioner_setups;
+    evidence.common_shift_preconditioner_reuses =
+        numerical.common_shift_preconditioner_reuses;
     evidence.nonlinear_updates = numerical.nonlinear_updates;
     evidence.trace_solves = numerical.trace_solves;
     evidence.linear_iterations = numerical.linear_iterations;
@@ -2246,6 +2682,12 @@ private:
     std::uint64_t ledger_begin = 0;
     std::uint64_t w8_owned_allocation_begin = 0;
     CudaOraclePod oracle{};
+    bool assessment_authority = false;
+    AttemptIdentity assessment_attempt{};
+    StateHash assessment_interior_hash{};
+    StateHash assessment_trace_hash{};
+    generic::HdgEulerPreparedAssessmentPolicy assessment_policy{};
+    std::array<std::uint64_t, 3> assessment_policy_bits{};
   };
 
   CudaConfig config_{};

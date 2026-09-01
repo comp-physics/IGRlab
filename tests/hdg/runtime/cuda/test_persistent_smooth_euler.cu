@@ -715,20 +715,40 @@ bool NativeBoundedResultPolicy() noexcept
 bool NativeWorkspaceRequirementsPolicy() noexcept
 {
   using namespace dg::hdg::runtime::cuda_w8a::detail;
-  const NativeTraceWorkspaceRequirements conventional =
+  const NativeTraceWorkspaceRequirements classical_gram_schmidt =
       QueryNativeTraceWorkspaceRequirements(10, 4, 2, false);
-  const NativeTraceWorkspaceRequirements igr =
+  const NativeTraceWorkspaceRequirements cgs2 =
       QueryNativeTraceWorkspaceRequirements(10, 4, 2, true);
-  return conventional.valid && igr.valid &&
-      conventional.basis_doubles == 50 && igr.basis_doubles == 50 &&
-      conventional.vector_doubles == 10 && igr.vector_doubles == 30 &&
-      conventional.reduction_doubles == 2 &&
-      igr.reduction_doubles == 12 &&
-      conventional.small_doubles == 33 && igr.small_doubles == 33 &&
-      conventional.permutation_integers == 0 &&
-      igr.permutation_integers == 10 &&
-      conventional.control_double_slots == NativeTraceControlDoubleSlots() &&
-      igr.control_double_slots == NativeTraceControlDoubleSlots();
+  return classical_gram_schmidt.valid && cgs2.valid &&
+      classical_gram_schmidt.basis_doubles == 50 &&
+      cgs2.basis_doubles == 50 &&
+      classical_gram_schmidt.vector_doubles == 10 &&
+      cgs2.vector_doubles == 30 &&
+      classical_gram_schmidt.reduction_doubles == 2 &&
+      cgs2.reduction_doubles == 12 &&
+      classical_gram_schmidt.small_doubles == 33 &&
+      cgs2.small_doubles == 33 &&
+      classical_gram_schmidt.permutation_integers == 0 &&
+      cgs2.permutation_integers == 10 &&
+      classical_gram_schmidt.control_double_slots ==
+          NativeTraceControlDoubleSlots() &&
+      cgs2.control_double_slots == NativeTraceControlDoubleSlots();
+}
+
+bool NativeElementSchwarzPatchRowsPolicy() noexcept
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  constexpr std::array<int, 3> conventional{{32, 48, 64}};
+  constexpr std::array<int, 3> igr{{40, 60, 80}};
+  for (const int rows : conventional)
+    if (!NativeTraceElementSchwarzPatchRowsSupported(rows)) return false;
+  for (const int rows : igr)
+    if (!NativeTraceElementSchwarzPatchRowsSupported(rows)) return false;
+  return !NativeTraceElementSchwarzPatchRowsSupported(0) &&
+      !NativeTraceElementSchwarzPatchRowsSupported(24) &&
+      !NativeTraceElementSchwarzPatchRowsSupported(36) &&
+      !NativeTraceElementSchwarzPatchRowsSupported(72) &&
+      !NativeTraceElementSchwarzPatchRowsSupported(96);
 }
 
 template <typename T>
@@ -1078,6 +1098,93 @@ bool CopyDeviceValues(const double* const source, const std::size_t count,
   return count == 0 || (source != nullptr &&
       cudaMemcpy(values.data(), source, count * sizeof(double),
                  cudaMemcpyDeviceToHost) == cudaSuccess);
+}
+
+bool RetainedLuStageLeafFixture() noexcept
+{
+  using namespace dg::hdg::runtime::cuda_w8a::detail;
+  const std::vector<double> coupling{{1.0, 2.0, -1.0, 1.0}};
+  const std::vector<double> trace_coupling{{1.0, -1.0, 0.5, 2.0}};
+  const std::vector<double> interior_rhs{{5.0, 11.0}};
+  const std::vector<double> trace_rhs{{3.0, 4.0}};
+  // Pivoted factorization of [[1,2],[3,4]], including a genuine row swap.
+  const std::vector<double> retained_lu{{3.0, 4.0, 1.0 / 3.0, 2.0 / 3.0}};
+  const std::vector<double> retained_pivots{{1.0, 1.0}};
+  const std::vector<double> trace_increment{{0.25, -0.5}};
+  const std::vector<double> workspace_sentinel{{101.0, 102.0, 103.0,
+                                                 104.0, 105.0, 106.0}};
+  const std::vector<double> schur_sentinel{{201.0, 202.0, 203.0, 204.0}};
+  const std::vector<double> zeros2(2, 0.0);
+  const std::vector<double> status_seed(1, 0.0);
+
+  NativeDeviceAllocation<double> b, c, f, g, lu, pivots, trace, recovered;
+  NativeDeviceAllocation<double> condensed, workspace, schur, status;
+  if (!b.CopyFrom(coupling) || !c.CopyFrom(trace_coupling) ||
+      !f.CopyFrom(interior_rhs) || !g.CopyFrom(trace_rhs) ||
+      !lu.CopyFrom(retained_lu) || !pivots.CopyFrom(retained_pivots) ||
+      !trace.CopyFrom(trace_increment) || !recovered.CopyFrom(zeros2) ||
+      !condensed.CopyFrom(zeros2) ||
+      !workspace.CopyFrom(workspace_sentinel) ||
+      !schur.CopyFrom(schur_sentinel) || !status.CopyFrom(status_seed))
+    return false;
+
+  CudaDeviceView view{};
+  view.b = b.data();
+  view.c = c.data();
+  view.f = f.data();
+  view.g = g.data();
+  view.lu = lu.data();
+  view.pivots = pivots.data();
+  view.solve_workspace = workspace.data();
+  view.schur = schur.data();
+  view.condensed_rhs = condensed.data();
+  view.trace_increment_local = trace.data();
+  view.recovered_interior = recovered.data();
+  view.status = status.data();
+  CudaMeshShape shape{};
+  shape.elements = 1;
+  shape.interior_dofs = 2;
+  shape.trace_dofs = 2;
+  shape.borrowed_host_inputs = true;
+
+  if (!CudaLaunchCondenseRetainedLuRhs(view, shape) ||
+      cudaDeviceSynchronize() != cudaSuccess)
+    return false;
+  std::vector<double> observed_condensed(2), observed_solved(2);
+  std::vector<double> observed_lu(4), observed_pivots(2);
+  std::vector<double> observed_workspace(6), observed_schur(4);
+  std::vector<double> observed_status(1);
+  if (!condensed.CopyTo(observed_condensed) ||
+      !recovered.CopyTo(observed_solved) || !lu.CopyTo(observed_lu) ||
+      !pivots.CopyTo(observed_pivots) ||
+      !workspace.CopyTo(observed_workspace) || !schur.CopyTo(observed_schur) ||
+      !status.CopyTo(observed_status))
+    return false;
+  const bool rhs_exact = ValuesClose(observed_solved[0], 1.0) &&
+      ValuesClose(observed_solved[1], 2.0) &&
+      ValuesClose(observed_condensed[0], 4.0) &&
+      ValuesClose(observed_condensed[1], -0.5);
+  const bool retained_storage_exact = observed_lu == retained_lu &&
+      observed_pivots == retained_pivots &&
+      observed_workspace == workspace_sentinel &&
+      observed_schur == schur_sentinel && observed_status[0] == 1.0;
+  if (!rhs_exact || !retained_storage_exact) return false;
+
+  if (!CudaLaunchRecoverFromRetainedLu(view, shape) ||
+      cudaDeviceSynchronize() != cudaSuccess ||
+      !recovered.CopyTo(observed_solved) || !status.CopyTo(observed_status))
+    return false;
+  const bool recovery_exact = ValuesClose(observed_solved[0], 0.25) &&
+      ValuesClose(observed_solved[1], 2.75) && observed_status[0] == 1.0;
+
+  CudaMeshShape nonborrowed = shape;
+  nonborrowed.borrowed_host_inputs = false;
+  CudaDeviceView missing_c = view;
+  missing_c.c = nullptr;
+  return recovery_exact &&
+      !CudaLaunchCondenseRetainedLuRhs(view, nonborrowed) &&
+      !CudaLaunchCondenseRetainedLuRhs(missing_c, shape) &&
+      !CudaLaunchRecoverFromRetainedLu(view, nonborrowed);
 }
 
 bool RankOneEquilibratedMgrFixture()
@@ -1541,7 +1648,8 @@ bool RunNativeSolveFixture(const NativeSolveFixture& fixture,
       control.CopyOneTo(result.control);
 }
 
-bool NativeElementSchwarzDeviceFixtureForOrder(const int order)
+bool NativeElementSchwarzDeviceFixtureForOrder(
+    const int order, const bool igr_active)
 {
   using namespace dg::hdg::runtime::cuda_w8a::detail;
   static_assert(CudaRobustElementSchwarzSetupActionFor(
@@ -1559,7 +1667,8 @@ bool NativeElementSchwarzDeviceFixtureForOrder(const int order)
                         invalid_or_nonfinite) ==
                 CudaRobustElementSchwarzSetupAction::fail_closed);
   if (order < 1 || order > 3) return false;
-  const int rows = 20 * (order + 1);
+  const int trace_components = igr_active ? 5 : 4;
+  const int rows = 4 * trace_components * (order + 1);
   const int elements = 1;
   const int patch_entries = rows * rows;
   const int incidence_slots = 2 * rows;
@@ -1628,9 +1737,9 @@ bool NativeElementSchwarzDeviceFixtureForOrder(const int order)
   CudaMeshShape shape{};
   shape.elements = elements;
   shape.trace_dofs = rows;
-  shape.trace_components = 5;
+  shape.trace_components = trace_components;
   shape.order = order;
-  shape.igr_active = true;
+  shape.igr_active = igr_active;
 
   // Qualify the setup-time half of the robust policy independently of the
   // zero-gradient first-application fixture.  This finite patch has one
@@ -1639,101 +1748,104 @@ bool NativeElementSchwarzDeviceFixtureForOrder(const int order)
   // LU and classify structurally, while the coupled leaf must be ready.  A
   // finite patch outside the admitted equilibration-scale range and a
   // nonfinite patch must instead classify invalid and fail closed.
-  const NativeElementSchwarzFieldSplitLayout robust_layout =
-      NativeElementSchwarzIgrFieldSplitLayout(order);
-  if (!robust_layout.warp_valid) return false;
-  std::vector<double> structural_patch = identity;
-  const int euler_original = NativeElementSchwarzIgrFieldSplitPatchRow(
-      order, 0);
-  const int euler_second_original =
-      NativeElementSchwarzIgrFieldSplitPatchRow(order, 1);
-  const int sigma_original = NativeElementSchwarzIgrFieldSplitPatchRow(
-      order, robust_layout.euler_rows);
-  structural_patch[static_cast<std::size_t>(euler_original) * rows +
-                   euler_second_original] = 1.0;
-  structural_patch[static_cast<std::size_t>(euler_second_original) * rows +
-                   euler_original] = 1.0;
-  structural_patch[static_cast<std::size_t>(euler_original) * rows +
-                   sigma_original] = 1.0;
-  structural_patch[static_cast<std::size_t>(sigma_original) * rows +
-                   euler_original] = 1.0;
-  const auto classify_setup = [&](const CudaTracePreconditionerKind kind,
-                                  double& setup_status,
-                                  int& classification) noexcept
+  if (igr_active)
   {
-    return CudaLaunchSetupNativeElementSchwarz(setup_view, shape, kind) &&
-        CudaLaunchClassifyNativeElementSchwarzSetup(
-            setup_view, shape, setup_classification.data()) &&
-        cudaDeviceSynchronize() == cudaSuccess &&
-        status.CopyOneTo(setup_status) &&
-        setup_classification.CopyOneTo(classification);
-  };
-  if (cudaMemcpy(schur.data(), structural_patch.data(),
-                 static_cast<std::size_t>(patch_entries) * sizeof(double),
-                 cudaMemcpyHostToDevice) != cudaSuccess)
-    return false;
-  double robust_setup_status = 0.0;
-  int robust_setup_classification = 0;
-  if (!classify_setup(
-          CudaTracePreconditionerKind::
-              native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64,
-          robust_setup_status, robust_setup_classification) ||
-      robust_setup_status != -7.0 ||
-      robust_setup_classification != static_cast<int>(
-          CudaNativeElementSchwarzSetupStatus::
-              structural_block_factor_failure) ||
-      CudaRobustElementSchwarzSetupActionFor(
-          static_cast<CudaNativeElementSchwarzSetupStatus>(
-              robust_setup_classification)) !=
-          CudaRobustElementSchwarzSetupAction::try_coupled)
-    return false;
-  if (!classify_setup(
-          CudaTracePreconditionerKind::
-              native_element_schwarz_warp_coupled_sigma_jacobi10_fp64,
-          robust_setup_status, robust_setup_classification) ||
-      robust_setup_status != 1.0 ||
-      robust_setup_classification != static_cast<int>(
-          CudaNativeElementSchwarzSetupStatus::ready))
-    return false;
-  std::vector<double> finite_invalid_patch = identity;
-  finite_invalid_patch[
-      static_cast<std::size_t>(euler_original) * rows + euler_original] =
-          0x1p-100;
-  if (cudaMemcpy(schur.data(), finite_invalid_patch.data(),
-                 static_cast<std::size_t>(patch_entries) * sizeof(double),
-                 cudaMemcpyHostToDevice) != cudaSuccess ||
-      !classify_setup(
-          CudaTracePreconditionerKind::
-              native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64,
-          robust_setup_status, robust_setup_classification) ||
-      robust_setup_status != -8.0 ||
-      robust_setup_classification != static_cast<int>(
-          CudaNativeElementSchwarzSetupStatus::invalid_or_nonfinite) ||
-      CudaRobustElementSchwarzSetupActionFor(
-          static_cast<CudaNativeElementSchwarzSetupStatus>(
-              robust_setup_classification)) !=
-          CudaRobustElementSchwarzSetupAction::fail_closed)
-    return false;
-  std::vector<double> invalid_patch = identity;
-  invalid_patch[0] = std::numeric_limits<double>::quiet_NaN();
-  if (cudaMemcpy(schur.data(), invalid_patch.data(),
-                 static_cast<std::size_t>(patch_entries) * sizeof(double),
-                 cudaMemcpyHostToDevice) != cudaSuccess ||
-      !classify_setup(
-          CudaTracePreconditionerKind::
-              native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64,
-          robust_setup_status, robust_setup_classification) ||
-      robust_setup_status != -8.0 ||
-      robust_setup_classification != static_cast<int>(
-          CudaNativeElementSchwarzSetupStatus::invalid_or_nonfinite) ||
-      CudaRobustElementSchwarzSetupActionFor(
-          static_cast<CudaNativeElementSchwarzSetupStatus>(
-              robust_setup_classification)) !=
-          CudaRobustElementSchwarzSetupAction::fail_closed ||
-      cudaMemcpy(schur.data(), identity.data(),
-                 static_cast<std::size_t>(patch_entries) * sizeof(double),
-                 cudaMemcpyHostToDevice) != cudaSuccess)
-    return false;
+    const NativeElementSchwarzFieldSplitLayout robust_layout =
+        NativeElementSchwarzIgrFieldSplitLayout(order);
+    if (!robust_layout.warp_valid) return false;
+    std::vector<double> structural_patch = identity;
+    const int euler_original = NativeElementSchwarzIgrFieldSplitPatchRow(
+        order, 0);
+    const int euler_second_original =
+        NativeElementSchwarzIgrFieldSplitPatchRow(order, 1);
+    const int sigma_original = NativeElementSchwarzIgrFieldSplitPatchRow(
+        order, robust_layout.euler_rows);
+    structural_patch[static_cast<std::size_t>(euler_original) * rows +
+                     euler_second_original] = 1.0;
+    structural_patch[static_cast<std::size_t>(euler_second_original) * rows +
+                     euler_original] = 1.0;
+    structural_patch[static_cast<std::size_t>(euler_original) * rows +
+                     sigma_original] = 1.0;
+    structural_patch[static_cast<std::size_t>(sigma_original) * rows +
+                     euler_original] = 1.0;
+    const auto classify_setup = [&](const CudaTracePreconditionerKind kind,
+                                    double& setup_status,
+                                    int& classification) noexcept
+    {
+      return CudaLaunchSetupNativeElementSchwarz(setup_view, shape, kind) &&
+          CudaLaunchClassifyNativeElementSchwarzSetup(
+              setup_view, shape, setup_classification.data()) &&
+          cudaDeviceSynchronize() == cudaSuccess &&
+          status.CopyOneTo(setup_status) &&
+          setup_classification.CopyOneTo(classification);
+    };
+    if (cudaMemcpy(schur.data(), structural_patch.data(),
+                   static_cast<std::size_t>(patch_entries) * sizeof(double),
+                   cudaMemcpyHostToDevice) != cudaSuccess)
+      return false;
+    double robust_setup_status = 0.0;
+    int robust_setup_classification = 0;
+    if (!classify_setup(
+            CudaTracePreconditionerKind::
+                native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64,
+            robust_setup_status, robust_setup_classification) ||
+        robust_setup_status != -7.0 ||
+        robust_setup_classification != static_cast<int>(
+            CudaNativeElementSchwarzSetupStatus::
+                structural_block_factor_failure) ||
+        CudaRobustElementSchwarzSetupActionFor(
+            static_cast<CudaNativeElementSchwarzSetupStatus>(
+                robust_setup_classification)) !=
+            CudaRobustElementSchwarzSetupAction::try_coupled)
+      return false;
+    if (!classify_setup(
+            CudaTracePreconditionerKind::
+                native_element_schwarz_warp_coupled_sigma_jacobi10_fp64,
+            robust_setup_status, robust_setup_classification) ||
+        robust_setup_status != 1.0 ||
+        robust_setup_classification != static_cast<int>(
+            CudaNativeElementSchwarzSetupStatus::ready))
+      return false;
+    std::vector<double> finite_invalid_patch = identity;
+    finite_invalid_patch[
+        static_cast<std::size_t>(euler_original) * rows + euler_original] =
+            0x1p-100;
+    if (cudaMemcpy(schur.data(), finite_invalid_patch.data(),
+                   static_cast<std::size_t>(patch_entries) * sizeof(double),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        !classify_setup(
+            CudaTracePreconditionerKind::
+                native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64,
+            robust_setup_status, robust_setup_classification) ||
+        robust_setup_status != -8.0 ||
+        robust_setup_classification != static_cast<int>(
+            CudaNativeElementSchwarzSetupStatus::invalid_or_nonfinite) ||
+        CudaRobustElementSchwarzSetupActionFor(
+            static_cast<CudaNativeElementSchwarzSetupStatus>(
+                robust_setup_classification)) !=
+            CudaRobustElementSchwarzSetupAction::fail_closed)
+      return false;
+    std::vector<double> invalid_patch = identity;
+    invalid_patch[0] = std::numeric_limits<double>::quiet_NaN();
+    if (cudaMemcpy(schur.data(), invalid_patch.data(),
+                   static_cast<std::size_t>(patch_entries) * sizeof(double),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        !classify_setup(
+            CudaTracePreconditionerKind::
+                native_element_schwarz_warp_equilibrated_field_split_sigma_jacobi10_fp64,
+            robust_setup_status, robust_setup_classification) ||
+        robust_setup_status != -8.0 ||
+        robust_setup_classification != static_cast<int>(
+            CudaNativeElementSchwarzSetupStatus::invalid_or_nonfinite) ||
+        CudaRobustElementSchwarzSetupActionFor(
+            static_cast<CudaNativeElementSchwarzSetupStatus>(
+                robust_setup_classification)) !=
+            CudaRobustElementSchwarzSetupAction::fail_closed ||
+        cudaMemcpy(schur.data(), identity.data(),
+                   static_cast<std::size_t>(patch_entries) * sizeof(double),
+                   cudaMemcpyHostToDevice) != cudaSuccess)
+      return false;
+  }
   if (!CudaLaunchSetupNativeElementSchwarz(
           setup_view, shape,
           CudaTracePreconditionerKind::native_element_schwarz_fp64) ||
@@ -1816,6 +1928,7 @@ bool NativeElementSchwarzDeviceFixtureForOrder(const int order)
     if (std::abs(host_solution[static_cast<std::size_t>(row)] -
                  right_hand_side[static_cast<std::size_t>(row)]) > 1.0e-11)
       return false;
+  if (!igr_active) return true;
 
   // The bounded equilibrated field-split ablation reuses the same exact
   // patch/topology storage.  Identity blocks make its lower multiplicative
@@ -2282,7 +2395,8 @@ bool NativeCoupledWarpPatchDeviceFixtureForOrder(const int order)
 bool NativeElementSchwarzDeviceFixture()
 {
   for (int order = 1; order <= 3; ++order)
-    if (!NativeElementSchwarzDeviceFixtureForOrder(order) ||
+    if (!NativeElementSchwarzDeviceFixtureForOrder(order, false) ||
+        !NativeElementSchwarzDeviceFixtureForOrder(order, true) ||
         !NativeCoupledWarpPatchDeviceFixtureForOrder(order))
       return false;
   return true;
@@ -4164,8 +4278,11 @@ constexpr bool TracePolicyAblationDescriptorPolicy() noexcept
           CudaTracePreconditionerKind::native_element_schwarz_fp64 &&
       CudaTracePolicyUsesNativeElementMatrixFreeOperator(
           tensor_igr_matrix_free.resolved_selection) &&
-      !tensor_conventional_matrix_free.valid &&
-      !CudaTracePolicyDescriptorIsExact(tensor_conventional_matrix_free) &&
+      CudaTracePolicyDescriptorIsExact(tensor_conventional_matrix_free) &&
+      tensor_conventional_matrix_free.trace_preconditioner ==
+          CudaTracePreconditionerKind::native_element_schwarz_fp64 &&
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          tensor_conventional_matrix_free.resolved_selection) &&
       !ordinary_igr_matrix_free.valid &&
       !CudaTracePolicyDescriptorIsExact(ordinary_igr_matrix_free) &&
       CudaTracePolicyDescriptorIsExact(tensor_igr_field_split) &&
@@ -4957,6 +5074,14 @@ bool ElementSchwarzFactorStateLifecyclePolicy() noexcept
     return false;
   state.attempt = attempt;
   state.active = true;
+  if (!CudaElementSchwarzRhsTransitionIsExact(
+          state, 1, CudaTraceRhsTransition::new_operator) ||
+      CudaElementSchwarzRhsTransitionIsExact(
+          state, 1, CudaTraceRhsTransition::same_operator_new_rhs) ||
+      CudaElementSchwarzRhsTransitionIsExact(
+          state, 1,
+          CudaTraceRhsTransition::same_operator_same_rhs_retry))
+    return false;
   if (!CudaElementSchwarzFactorTransitionIsExact(
           state, attempt, 10, false) ||
       CudaElementSchwarzFactorTransitionIsExact(
@@ -4964,6 +5089,18 @@ bool ElementSchwarzFactorStateLifecyclePolicy() noexcept
     return false;
   state.factor_ready = true;
   state.factor_generation = 10;
+  if (!CudaElementSchwarzRhsTransitionIsExact(
+          state, 1, CudaTraceRhsTransition::same_operator_new_rhs))
+    return false;
+  state.last_rhs_generation = 1;
+  if (!CudaElementSchwarzRhsTransitionIsExact(
+          state, 1,
+          CudaTraceRhsTransition::same_operator_same_rhs_retry) ||
+      !CudaElementSchwarzRhsTransitionIsExact(
+          state, 2, CudaTraceRhsTransition::same_operator_new_rhs) ||
+      CudaElementSchwarzRhsTransitionIsExact(
+          state, 1, CudaTraceRhsTransition::same_operator_new_rhs))
+    return false;
   if (CudaElementSchwarzFactorTransitionIsExact(
           state, attempt, 11, false) ||
       CudaElementSchwarzFactorTransitionIsExact(
@@ -4994,7 +5131,8 @@ bool ElementSchwarzFactorStateLifecyclePolicy() noexcept
     if (!state.active || !state.factor_ready) return false;
   }
   return !state.active && !state.factor_ready &&
-      state.factor_generation == 0 && state.last_solve_generation == 0;
+      state.factor_generation == 0 && state.last_solve_generation == 0 &&
+      state.last_rhs_generation == 0;
 }
 
 struct ModelTag { inline static constexpr std::string_view id = "euler.compressible.2d"; };
@@ -5407,6 +5545,7 @@ int main(int argc, char** argv)
       mode == "--functional";
   const bool policies = NativeBoundedResultPolicy() &&
       NativeWorkspaceRequirementsPolicy() &&
+      NativeElementSchwarzPatchRowsPolicy() &&
       IluFactorStateLifecyclePolicy() &&
       ElementSchwarzFactorStateLifecyclePolicy();
   const bool lifecycle = known_mode && (ranks == 1
@@ -5419,7 +5558,8 @@ int main(int argc, char** argv)
          : LifecycleAndRecovery<RankTwoTag>(ranks))
       : false);
   const bool native_device_fixtures = ranks != 1 || !mode.empty() ||
-      (lifecycle && NativeTraceDeviceFixtures() &&
+      (lifecycle && RetainedLuStageLeafFixture() &&
+       NativeTraceDeviceFixtures() &&
        NativeElementSchwarzDeviceFixture() &&
        NativeFixedSigmaJacobiDeviceFixtures());
   const bool mgr_device_fixture = ranks != 1 || !mode.empty() ||

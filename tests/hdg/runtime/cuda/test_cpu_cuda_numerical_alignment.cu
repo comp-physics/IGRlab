@@ -322,6 +322,18 @@ struct CrossBackendPreparedHealth
       std::numeric_limits<double>::infinity();
   double maximum_conservation_relative_error =
       std::numeric_limits<double>::infinity();
+  double temporal_error_norm = std::numeric_limits<double>::infinity();
+  double final_algebraic_residual = std::numeric_limits<double>::infinity();
+  double final_algebraic_correction_norm =
+      std::numeric_limits<double>::infinity();
+  std::uint64_t common_shift_operator_builds = 0;
+  std::uint64_t common_shift_operator_reuses = 0;
+  std::uint64_t condensed_rhs_refreshes = 0;
+  std::uint64_t common_shift_trace_solves = 0;
+  std::uint64_t common_shift_preconditioner_setups = 0;
+  std::uint64_t common_shift_preconditioner_reuses = 0;
+  std::uint64_t complete_assemblies = 0;
+  std::uint64_t complete_condensations = 0;
   int nonlinear_updates = -1;
   int trace_solves = -1;
   int linear_iterations = -1;
@@ -338,13 +350,79 @@ struct CrossBackendPreparedHealth
   bool recovery = false;
   bool true_residual = false;
   bool conservation = false;
+  bool telemetry = false;
   bool no_fallback = false;
   bool success = false;
 };
 
+bool CudaPreparedRodas3TracePolicyValid(
+    const CrossBackendPreparedHealth& health,
+    const generic::CudaEngineKind engine, const bool igr_active,
+    const int rank_count, const int polynomial_order,
+    const CudaTracePolicyKind requested_trace_policy) noexcept
+{
+  const CudaTracePolicyDescriptor expected = ResolveCudaTracePolicy(
+      engine, igr_active, rank_count, polynomial_order,
+      requested_trace_policy);
+  const auto& tensor = health.tensor_core;
+  const bool tensor_rank_one =
+      engine == generic::CudaEngineKind::tensor_core && rank_count == 1;
+  const bool retained_ilu = expected.ilu_factor_reuse_policy ==
+      CudaIluFactorReusePolicy::first_trace_solve_per_attempt;
+  const bool preconditioner_census = tensor_rank_one
+      ? health.common_shift_preconditioner_setups >= 1 &&
+            health.common_shift_preconditioner_reuses == 3
+      : retained_ilu
+          ? health.common_shift_preconditioner_setups == 1 &&
+                health.common_shift_preconditioner_reuses == 3
+          : health.common_shift_preconditioner_setups == 4 &&
+                health.common_shift_preconditioner_reuses == 0;
+  return CudaTracePolicyDescriptorIsExact(expected) &&
+      health.nonlinear_updates >= 0 &&
+      health.trace_solves == health.nonlinear_updates + 4 &&
+      health.linear_iterations >= 0 &&
+      health.linear_solve_attempts >= health.trace_solves &&
+      health.common_shift_operator_builds == 1 &&
+      health.common_shift_operator_reuses == 3 &&
+      health.condensed_rhs_refreshes == 3 &&
+      health.common_shift_trace_solves == 4 && preconditioner_census &&
+      tensor.selected_engine == engine &&
+      tensor.requested_trace_policy == requested_trace_policy &&
+      tensor.resolved_trace_policy == expected.resolved_selection &&
+      tensor.trace_policy_rank_count == rank_count &&
+      tensor.trace_policy_order == polynomial_order &&
+      tensor.trace_preconditioner_configured &&
+      tensor.trace_preconditioner == expected.trace_preconditioner &&
+      CudaPreparedIluAccountingValid(
+          tensor, health.trace_solves, health.linear_iterations,
+          health.linear_solve_attempts, expected) &&
+      CudaPreparedTraceSolverRoutingValid(
+          tensor, health.linear_solve_attempts, engine, rank_count) &&
+      tensor.trace_solver_accounting_complete &&
+      tensor.fallback_accounting_complete && tensor.fallback_count == 0 &&
+      health.no_fallback && health.telemetry;
+}
+
+bool CudaPreparedRodas3BackendWorkValid(
+    const CrossBackendPreparedHealth& health,
+    const generic::CudaEngineKind engine) noexcept
+{
+  const auto& tensor = health.tensor_core;
+  const bool exact_launch_census = health.complete_assemblies > 0 &&
+      health.complete_condensations > 0 &&
+      tensor.volume_assembly_launches == health.complete_assemblies &&
+      tensor.condensation_launches == health.complete_condensations;
+  if (!exact_launch_census) return false;
+  if (engine == generic::CudaEngineKind::ordinary)
+    return tensor.volume_mma_tiles == 0 && tensor.mma_tiles == 0;
+  return engine == generic::CudaEngineKind::tensor_core &&
+      tensor.hardware_supported && health.tensor_volume_evidence_valid &&
+      tensor.volume_mma_tiles > 0 && tensor.mma_tiles > 0;
+}
+
 // This accessor exists only in this qualification executable.  It observes
-// the already-computed prepared gates and copies the logical committed true
-// trace to host storage; it launches no numerical work and publishes no API.
+// the already-computed prepared gates and copies logical committed state to
+// host storage; it launches no numerical work and publishes no API.
 struct CudaQualificationTestAccess
 {
   template <typename Engine>
@@ -361,6 +439,22 @@ struct CudaQualificationTestAccess
         numerical.maximum_conservation_error;
     health.maximum_conservation_relative_error =
         numerical.maximum_conservation_relative_error;
+    health.temporal_error_norm = numerical.temporal_error_norm;
+    health.final_algebraic_residual = numerical.final_algebraic_residual;
+    health.final_algebraic_correction_norm =
+        numerical.final_algebraic_correction_norm;
+    health.common_shift_operator_builds =
+        numerical.common_shift_operator_builds;
+    health.common_shift_operator_reuses =
+        numerical.common_shift_operator_reuses;
+    health.condensed_rhs_refreshes = numerical.condensed_rhs_refreshes;
+    health.common_shift_trace_solves = numerical.common_shift_trace_solves;
+    health.common_shift_preconditioner_setups =
+        numerical.common_shift_preconditioner_setups;
+    health.common_shift_preconditioner_reuses =
+        numerical.common_shift_preconditioner_reuses;
+    health.complete_assemblies = numerical.complete_assemblies;
+    health.complete_condensations = numerical.complete_condensations;
     health.nonlinear_updates = numerical.nonlinear_updates;
     health.trace_solves = numerical.trace_solves;
     health.linear_iterations = numerical.linear_iterations;
@@ -384,6 +478,7 @@ struct CudaQualificationTestAccess
     health.recovery = numerical.recovery;
     health.true_residual = numerical.true_residual;
     health.conservation = numerical.conservation;
+    health.telemetry = numerical.telemetry;
     health.no_fallback = pending.evidence.no_fallback;
     health.success = numerical.success;
     return engine.initialized_ && pending.active && pending.staging &&
@@ -394,12 +489,8 @@ struct CudaQualificationTestAccess
       cuda::GenericEulerHdgCudaSession& session,
       CrossBackendPreparedHealth& health) noexcept
   {
-    if (session.borrowed_rank1_)
-      return CapturePreparedHealth(*session.borrowed_rank1_, health);
-    if (session.partitioned_backward_euler_borrowed_rank1_)
-      return CapturePreparedHealth(
-          *session.partitioned_backward_euler_borrowed_rank1_, health);
-    return false;
+    return session.Dispatch(
+        [&](auto& engine) { return CapturePreparedHealth(engine, health); });
   }
 
   static dg::hdg::generic::HdgEulerSessionResult InitializeTracePolicy(
@@ -444,14 +535,106 @@ struct CudaQualificationTestAccess
       cuda::GenericEulerHdgCudaSession& session,
       std::vector<double>& trace, int& trace_components) noexcept
   {
-    if (session.borrowed_rank1_)
-      return ExportCommittedTrace(
-          *session.borrowed_rank1_, trace, trace_components);
-    if (session.partitioned_backward_euler_borrowed_rank1_)
-      return ExportCommittedTrace(
-          *session.partitioned_backward_euler_borrowed_rank1_, trace,
-          trace_components);
-    return false;
+    return session.Dispatch([&](auto& engine)
+    { return ExportCommittedTrace(engine, trace, trace_components); });
+  }
+
+  template <typename Engine>
+  static bool ExportCommittedFullInterior(
+      Engine& engine, std::vector<double>& interior,
+      int& interior_components) noexcept
+  {
+    interior.clear();
+    interior_components = 0;
+    auto& numerics = engine.numerics_;
+    const auto committed = numerics.CommittedSlot();
+    const auto& shape = numerics.shape_;
+    std::vector<double> element_local;
+    std::vector<unsigned char> assigned;
+    bool ready = engine.initialized_ && !engine.pending_.active &&
+        committed.interior.coefficients != nullptr &&
+        committed.interior.count != 0 &&
+        shape.elements > 0 && shape.scalar_interior_dofs > 0 &&
+        shape.interior_components > 0 &&
+        shape.interior_dofs ==
+            shape.scalar_interior_dofs * shape.interior_components &&
+        committed.interior.count ==
+            static_cast<std::size_t>(shape.elements) * shape.interior_dofs &&
+        committed.interior.count %
+                static_cast<std::size_t>(shape.interior_components) ==
+            0 &&
+        numerics.signed_element_interior_.size() == committed.interior.count;
+    try
+    {
+      if (ready)
+      {
+        element_local.resize(committed.interior.count);
+        interior.resize(committed.interior.count);
+        assigned.assign(committed.interior.count, 0);
+      }
+    }
+    catch (...) { ready = false; }
+    if (!numerics.CollectiveContinue(ready)) return false;
+    const bool copied = CudaTransportPolicy::DeviceToHost(
+            element_local.data(), committed.interior.coefficients,
+            element_local.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    if (!numerics.CollectiveContinue(copied)) return false;
+
+    // Device slots are element-local, whereas the CPU snapshot and public
+    // Euler fields use MFEM's canonical byNODES vector.  Reverse-scatter every
+    // component before comparing; a raw slot-byte comparison is a layout test,
+    // not a numerical-state comparison.
+    const std::size_t scalar_count = committed.interior.count /
+        static_cast<std::size_t>(shape.interior_components);
+    bool canonical = true;
+    for (int element = 0; canonical && element < shape.elements; ++element)
+      for (int component = 0;
+           canonical && component < shape.interior_components; ++component)
+        for (int scalar = 0;
+             canonical && scalar < shape.scalar_interior_dofs; ++scalar)
+      {
+        const int local = scalar + shape.scalar_interior_dofs * component;
+        const std::size_t source = static_cast<std::size_t>(element) *
+            shape.interior_dofs + static_cast<std::size_t>(local);
+        double sign = 1.0;
+        const int dof = CudaDecodeSigned(
+            numerics.signed_element_interior_[source], sign);
+        const std::size_t lower =
+            static_cast<std::size_t>(component) * scalar_count;
+        const std::size_t upper = lower + scalar_count;
+        canonical = dof >= 0 && static_cast<std::size_t>(dof) >= lower &&
+            static_cast<std::size_t>(dof) < upper &&
+            assigned[static_cast<std::size_t>(dof)] == 0 &&
+            std::isfinite(element_local[source]);
+        if (canonical)
+        {
+          interior[static_cast<std::size_t>(dof)] =
+              sign * element_local[source];
+          assigned[static_cast<std::size_t>(dof)] = 1;
+        }
+      }
+    canonical = canonical &&
+        std::find(assigned.begin(), assigned.end(), 0) == assigned.end();
+    if (!numerics.CollectiveContinue(canonical))
+    {
+      interior.clear();
+      return false;
+    }
+    interior_components = shape.interior_components;
+    return true;
+  }
+
+  static bool ExportCommittedFullInterior(
+      cuda::GenericEulerHdgCudaSession& session,
+      std::vector<double>& interior, int& interior_components) noexcept
+  {
+    return session.Dispatch([&](auto& engine)
+    { return ExportCommittedFullInterior(
+          engine, interior, interior_components); });
   }
 };
 
@@ -577,6 +760,7 @@ struct SigmaLocalization
 struct StepState
 {
   std::vector<double> physical_interior;
+  std::vector<double> full_interior;
   std::vector<double> true_trace;
   double time = 0.0;
   std::uint64_t step = 0;
@@ -588,6 +772,8 @@ struct StepState
   double true_relative_residual = 0.0;
   double maximum_conservation_error = 0.0;
   double maximum_conservation_relative_error = 0.0;
+  double normalized_differential_error = 0.0;
+  double normalized_algebraic_correction = 0.0;
   int nonlinear_updates = 0;
   int trace_solves = 0;
   int linear_iterations = 0;
@@ -598,13 +784,20 @@ struct StepState
   std::uint64_t tensor_volume_assembly_launches = 0;
   std::uint64_t tensor_volume_mma_tiles = 0;
   std::uint64_t fallback_count = 0;
+  std::uint64_t common_shift_operator_builds = 0;
+  std::uint64_t common_shift_operator_reuses = 0;
+  std::uint64_t condensed_rhs_refreshes = 0;
+  std::uint64_t common_shift_trace_solves = 0;
+  int interior_components = 0;
   int trace_components = 0;
+  bool assessment_available = false;
   SigmaLocalization sigma{};
 };
 
 struct Trajectory
 {
   std::vector<StepState> states;
+  std::string_view failure = "fixture";
   bool passed = false;
 };
 
@@ -833,6 +1026,10 @@ CudaTracePolicyKind SelectedCudaTracePolicy(
     const CudaEngineKind engine,
     const RegularizationKind regularization) noexcept
 {
+  if (engine == CudaEngineKind::tensor_core &&
+      selection.time_treatment == EulerHdgTimeTreatment::rodas3)
+    return CudaTracePolicyKind::
+        native_element_schwarz_matrix_free_fp64;
   return engine == CudaEngineKind::tensor_core &&
           regularization == RegularizationKind::igr
       ? selection.tensor_igr_trace_policy
@@ -1098,7 +1295,18 @@ bool CaptureCpuState(CpuNumericsCore& core,
   if (!core.ExportCommittedFields({
           state.physical_interior.data(),
           sigma.empty() ? nullptr : sigma.data(), scalar_count}) ||
-      snapshot.trace.data == nullptr || snapshot.trace.size == 0)
+      snapshot.interior.data == nullptr || snapshot.interior.size == 0 ||
+      snapshot.trace.data == nullptr || snapshot.trace.size == 0 ||
+      scalar_count == 0 || snapshot.interior.size % scalar_count != 0)
+    return false;
+  state.full_interior.assign(
+      snapshot.interior.data,
+      snapshot.interior.data + snapshot.interior.size);
+  state.interior_components = static_cast<int>(
+      snapshot.interior.size / scalar_count);
+  const int expected_interior_components =
+      regularization == RegularizationKind::igr ? 7 : components;
+  if (state.interior_components != expected_interior_components)
     return false;
   state.true_trace.assign(
       snapshot.trace.data, snapshot.trace.data + snapshot.trace.size);
@@ -1117,6 +1325,7 @@ Trajectory RunCpu(const EulerHdgRequest& request,
                   const Case& specification)
 {
   Trajectory trajectory;
+  trajectory.failure = "initialize";
   CpuNumericsCore core;
   if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
           ContractStatus::accepted ||
@@ -1124,6 +1333,7 @@ Trajectory RunCpu(const EulerHdgRequest& request,
     return trajectory;
   StateCoordinates coordinates{};
   StepState initial;
+  trajectory.failure = "initial-state-capture";
   if (!CaptureCpuState(core, coordinates, mesh, request.polynomial_order,
                        fields.scalar_count, specification.regularization,
                        initial))
@@ -1137,8 +1347,45 @@ Trajectory RunCpu(const EulerHdgRequest& request,
 
   for (int step = 0; step < specification.steps; ++step)
   {
-    if (!core.AdvanceBorrowedEuler(specification.dt, coordinates))
-      return trajectory;
+    const bool rodas3 = request.time_treatment ==
+        EulerHdgTimeTreatment::rodas3;
+    dg::hdg::generic::HdgEulerPreparedAssessment assessment{};
+    bool advanced = false;
+    if (rodas3)
+    {
+      std::uint64_t generation = 0;
+      constexpr dg::hdg::generic::HdgEulerPreparedAssessmentPolicy
+          assessment_policy{1.0e-8, 1.0e-5, 0.25};
+      const bool prepared = core.PrepareBorrowedEuler(
+          specification.dt, coordinates, generation) && generation != 0;
+      trajectory.failure = "prepare";
+      if (!prepared) return trajectory;
+      const bool assessed = prepared && core.AssessPreparedBorrowedEuler(
+          generation, assessment_policy, assessment) &&
+          dg::hdg::generic::IsValidHdgEulerPreparedAssessment(assessment) &&
+          assessment.finite_gate && assessment.solver_gate &&
+          assessment.residual_gate && assessment.admissibility_gate &&
+          assessment.algebraic_closure_gate &&
+          assessment.algebraic_correction_gate;
+      trajectory.failure = "assessment";
+      if (!assessed)
+      {
+        static_cast<void>(core.AbortBorrowedEuler(
+            generation, coordinates));
+        return trajectory;
+      }
+      double maximum_wave_speed = 0.0;
+      double backend_stable_dt = 0.0;
+      trajectory.failure = "commit";
+      advanced = core.CommitBorrowedEuler(
+          generation, coordinates, maximum_wave_speed, backend_stable_dt);
+    }
+    else
+    {
+      trajectory.failure = "advance";
+      advanced = core.AdvanceBorrowedEuler(specification.dt, coordinates);
+    }
+    if (!advanced) return trajectory;
     const auto& attempt = core.evidence().last_attempt;
     const bool partitioned_igr =
         request.time_treatment ==
@@ -1146,19 +1393,7 @@ Trajectory RunCpu(const EulerHdgRequest& request,
         specification.regularization == RegularizationKind::igr;
     const std::uint64_t expected_reconstructions =
         attempt.work.accepted_newton_updates + (partitioned_igr ? 2U : 1U);
-    const bool work_accounting = attempt.nonlinear_updates >= 0 &&
-        attempt.work.accepted_newton_updates ==
-            static_cast<std::uint64_t>(attempt.nonlinear_updates) &&
-        attempt.work.complete_trace_solves == expected_reconstructions &&
-        attempt.work.complete_factor_setups ==
-            attempt.work.complete_trace_solves &&
-        attempt.work.complete_condensations ==
-            attempt.work.complete_trace_solves &&
-        attempt.work.complete_recoveries ==
-            attempt.work.complete_trace_solves &&
-        attempt.work.trial_reassemblies >=
-            attempt.work.accepted_newton_updates &&
-        attempt.linear_iterations >= 0 &&
+    const bool common_linear_accounting = attempt.linear_iterations >= 0 &&
         attempt.newton_correction_linear_iterations >= 0 &&
         attempt.final_coherent_linear_iterations >= 0 &&
         static_cast<long long>(attempt.linear_iterations) ==
@@ -1170,6 +1405,39 @@ Trajectory RunCpu(const EulerHdgRequest& request,
         static_cast<long long>(attempt.linear_solve_attempts) ==
             static_cast<long long>(attempt.work.complete_trace_solves) +
                 attempt.true_residual_tightenings;
+    const bool rodas3_work_accounting = rodas3 &&
+        attempt.nonlinear_updates == 0 &&
+        attempt.work.accepted_newton_updates == 0 &&
+        attempt.work.trial_reassemblies == 0 &&
+        attempt.work.common_shift_operator_builds == 1 &&
+        attempt.work.common_shift_operator_reuses == 3 &&
+        attempt.work.condensed_rhs_refreshes == 3 &&
+        attempt.work.complete_trace_solves >= 4 &&
+        attempt.work.complete_factor_setups <=
+            attempt.work.complete_trace_solves &&
+        attempt.work.complete_condensations +
+                attempt.work.common_shift_operator_reuses ==
+            attempt.work.complete_trace_solves &&
+        attempt.work.complete_recoveries ==
+            attempt.work.complete_trace_solves &&
+        std::isfinite(attempt.temporal_error_norm) &&
+        std::isfinite(attempt.final_algebraic_residual) &&
+        std::isfinite(attempt.final_algebraic_correction_norm);
+    const bool backward_euler_work_accounting = !rodas3 &&
+        attempt.nonlinear_updates >= 0 &&
+        attempt.work.accepted_newton_updates ==
+            static_cast<std::uint64_t>(attempt.nonlinear_updates) &&
+        attempt.work.complete_trace_solves == expected_reconstructions &&
+        attempt.work.complete_factor_setups ==
+            attempt.work.complete_trace_solves &&
+        attempt.work.complete_condensations ==
+            attempt.work.complete_trace_solves &&
+        attempt.work.complete_recoveries ==
+            attempt.work.complete_trace_solves &&
+        attempt.work.trial_reassemblies >=
+            attempt.work.accepted_newton_updates;
+    const bool work_accounting = common_linear_accounting &&
+        (rodas3_work_accounting || backward_euler_work_accounting);
     bool conservation_gate = true;
     double conservation_error = 0.0;
     double conservation_relative_error = 0.0;
@@ -1195,18 +1463,55 @@ Trajectory RunCpu(const EulerHdgRequest& request,
             request.numerical_policy.true_residual_relative_tolerance &&
         conservation_relative_error <=
             request.numerical_policy.conservation_relative_tolerance;
+    if (!work_accounting)
+    {
+      trajectory.failure = "work-accounting";
+      std::cerr << "CPU RODAS work mismatch case=" << specification.name
+                << " linear=" << attempt.linear_iterations << '/'
+                << attempt.newton_correction_linear_iterations << '/'
+                << attempt.final_coherent_linear_iterations
+                << " attempts/tightenings=" << attempt.linear_solve_attempts
+                << '/' << attempt.true_residual_tightenings
+                << " condense/solve/factor/recover="
+                << attempt.work.complete_condensations << '/'
+                << attempt.work.complete_trace_solves << '/'
+                << attempt.work.complete_factor_setups << '/'
+                << attempt.work.complete_recoveries
+                << " common_shift="
+                << attempt.work.common_shift_operator_builds << '/'
+                << attempt.work.common_shift_operator_reuses << '/'
+                << attempt.work.condensed_rhs_refreshes << '\n';
+    }
+    else if (!conservation_ready || !conservation_gate)
+      trajectory.failure = "conservation";
+    else if (attempt.status != CpuAttemptStatus::success ||
+             !attempt.committed)
+      trajectory.failure = "attempt-status";
+    else if (!attempt.finite_gate || !attempt.admissibility_gate ||
+             !attempt.recovery_gate || !attempt.nonlinear_gate ||
+             !attempt.true_residual_gate)
+      trajectory.failure = "numerical-gates";
+    else
+      trajectory.failure = "residual-bounds";
     StepState state;
-    if (!health ||
-        !CaptureCpuState(core, coordinates, mesh, request.polynomial_order,
-                         fields.scalar_count, specification.regularization,
-                         state))
+    if (!health) return trajectory;
+    trajectory.failure = "committed-state-capture";
+    if (!CaptureCpuState(
+            core, coordinates, mesh, request.polynomial_order,
+            fields.scalar_count, specification.regularization, state))
       return trajectory;
+    trajectory.failure = "trace-layout";
     state.initial_residual = attempt.initial_nonlinear_residual;
     state.final_residual = attempt.final_nonlinear_residual;
     state.true_relative_residual = attempt.maximum_true_relative_residual;
     state.maximum_conservation_error = conservation_error;
     state.maximum_conservation_relative_error =
         conservation_relative_error;
+    state.assessment_available = rodas3;
+    state.normalized_differential_error =
+        rodas3 ? assessment.normalized_differential_error : 0.0;
+    state.normalized_algebraic_correction =
+        rodas3 ? assessment.normalized_algebraic_correction : 0.0;
     state.nonlinear_updates = attempt.nonlinear_updates;
     state.trace_solves = static_cast<int>(
         attempt.work.complete_trace_solves);
@@ -1219,6 +1524,12 @@ Trajectory RunCpu(const EulerHdgRequest& request,
             ? attempt.work.trial_reassemblies -
                   attempt.work.accepted_newton_updates
             : 0);
+    state.common_shift_operator_builds =
+        attempt.work.common_shift_operator_builds;
+    state.common_shift_operator_reuses =
+        attempt.work.common_shift_operator_reuses;
+    state.condensed_rhs_refreshes = attempt.work.condensed_rhs_refreshes;
+    state.common_shift_trace_solves = rodas3 ? 4U : 0U;
     state.trace_components = specification.regularization ==
             RegularizationKind::igr ? 5 : components;
     if (state.true_trace.size() %
@@ -1228,6 +1539,7 @@ Trajectory RunCpu(const EulerHdgRequest& request,
   }
   trajectory.passed = trajectory.states.size() ==
       static_cast<std::size_t>(specification.steps + 1);
+  if (trajectory.passed) trajectory.failure = {};
   return trajectory;
 }
 
@@ -1243,8 +1555,12 @@ bool CaptureCudaState(GenericEulerHdgCudaSession& session,
   if (!session.ExportCommittedFields({
           state.physical_interior.data(),
           sigma.empty() ? nullptr : sigma.data(), scalar_count}) ||
+      !CudaQualificationTestAccess::ExportCommittedFullInterior(
+          session, state.full_interior, state.interior_components) ||
       !CudaQualificationTestAccess::ExportCommittedTrace(
           session, state.true_trace, state.trace_components) ||
+      state.interior_components !=
+          (regularization == RegularizationKind::igr ? 7 : components) ||
       !PhysicalCoefficients(state.physical_interior, scalar_count) ||
       (regularization == RegularizationKind::igr &&
        !ComputeSigmaLocalization(mesh, order, sigma, state.sigma)))
@@ -1266,6 +1582,7 @@ Trajectory RunCuda(const EulerHdgRequest& request,
                    const CudaTracePolicyKind trace_policy)
 {
   Trajectory trajectory;
+  trajectory.failure = "initialize";
   GenericEulerHdgCudaSession session;
   if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
           ContractStatus::accepted ||
@@ -1274,6 +1591,7 @@ Trajectory RunCuda(const EulerHdgRequest& request,
           dg::hdg::generic::HdgEulerSessionStatus::initialized)
     return trajectory;
   StepState initial;
+  trajectory.failure = "initial-state-capture";
   if (!CaptureCudaState(session, mesh, request.polynomial_order,
                         fields.scalar_count, specification.regularization,
                         initial))
@@ -1284,21 +1602,32 @@ Trajectory RunCuda(const EulerHdgRequest& request,
   {
     GenericEulerCudaPreparedStep authority;
     GenericEulerHdgCudaSession::prepared_output_type output{};
+    trajectory.failure = "prepare";
     if (session.Prepare(specification.dt, authority, output).status !=
         dg::hdg::generic::HdgEulerSessionStatus::prepared)
       return trajectory;
     CrossBackendPreparedHealth health;
     const bool captured =
         CudaQualificationTestAccess::CapturePreparedHealth(session, health);
+    const bool rodas3 = request.time_treatment ==
+        EulerHdgTimeTreatment::rodas3;
+    dg::hdg::generic::HdgEulerPreparedAssessment assessment{};
+    constexpr dg::hdg::generic::HdgEulerPreparedAssessmentPolicy
+        assessment_policy{1.0e-8, 1.0e-5, 0.25};
+    const bool assessed = !rodas3 ||
+        (captured && session.AssessPrepared(
+             authority, output, assessment_policy, assessment) &&
+         dg::hdg::generic::IsValidHdgEulerPreparedAssessment(assessment) &&
+         assessment.finite_gate && assessment.solver_gate &&
+         assessment.residual_gate && assessment.admissibility_gate &&
+         assessment.algebraic_closure_gate &&
+         assessment.algebraic_correction_gate);
     const bool partitioned_igr =
         request.time_treatment ==
             EulerHdgTimeTreatment::partitioned_backward_euler &&
         specification.regularization == RegularizationKind::igr;
     const int final_trace_solves = partitioned_igr ? 2 : 1;
-    const bool work_accounting = health.nonlinear_updates >= 0 &&
-        health.trace_solves ==
-            health.nonlinear_updates + final_trace_solves &&
-        health.linear_iterations >= 0 &&
+    const bool common_linear_accounting = health.linear_iterations >= 0 &&
         health.newton_correction_linear_iterations >= 0 &&
         health.final_coherent_linear_iterations >= 0 &&
         static_cast<long long>(health.linear_iterations) ==
@@ -1311,29 +1640,58 @@ Trajectory RunCuda(const EulerHdgRequest& request,
             static_cast<long long>(health.trace_solves) +
                 health.true_residual_tightenings &&
         health.line_search_trials >= 0 &&
-        health.rejected_line_search_trials >= 0 &&
+        health.rejected_line_search_trials >= 0;
+    const bool rodas3_work_accounting = rodas3 &&
+        health.nonlinear_updates >= 0 &&
+        health.trace_solves == health.nonlinear_updates + 4 &&
+        health.line_search_trials == 0 &&
+        health.rejected_line_search_trials == 0 &&
+        health.common_shift_operator_builds == 1 &&
+        health.common_shift_operator_reuses == 3 &&
+        health.condensed_rhs_refreshes == 3 &&
+        health.common_shift_trace_solves == 4 &&
+        std::isfinite(health.temporal_error_norm) &&
+        std::isfinite(health.final_algebraic_residual) &&
+        std::isfinite(health.final_algebraic_correction_norm);
+    const bool backward_euler_work_accounting = !rodas3 &&
+        health.nonlinear_updates >= 0 &&
+        health.trace_solves ==
+            health.nonlinear_updates + final_trace_solves &&
         health.line_search_trials == health.nonlinear_updates +
             health.rejected_line_search_trials;
+    const bool work_accounting = common_linear_accounting &&
+        (rodas3_work_accounting || backward_euler_work_accounting);
+    const bool trace_policy_valid = rodas3
+        ? dg::hdg::runtime::cuda_w8a::detail::
+              CudaPreparedRodas3TracePolicyValid(
+                  health, request.backend.cuda_engine,
+                  specification.regularization == RegularizationKind::igr,
+                  1, request.polynomial_order, trace_policy)
+        : dg::hdg::runtime::cuda_w8a::detail::
+              CudaPreparedTracePolicyValid(
+                  health.tensor_core, health.trace_solves,
+                  health.linear_iterations, health.linear_solve_attempts,
+                  request.backend.cuda_engine,
+                  specification.regularization == RegularizationKind::igr,
+                  1, request.polynomial_order, trace_policy);
+    const bool backend_work = rodas3
+        ? dg::hdg::runtime::cuda_w8a::detail::
+              CudaPreparedRodas3BackendWorkValid(
+                  health, request.backend.cuda_engine)
+        : health.tensor_volume_evidence_valid &&
+              (request.backend.cuda_engine == CudaEngineKind::ordinary
+                   ? health.tensor_core.condensation_launches == 0 &&
+                         health.tensor_core.mma_tiles == 0
+                   : health.tensor_core.hardware_supported &&
+                         health.tensor_core.condensation_launches > 0 &&
+                         health.tensor_core.mma_tiles > 0);
     const bool expected_engine =
         health.tensor_core.selected_engine == request.backend.cuda_engine &&
-        dg::hdg::runtime::cuda_w8a::detail::
-            CudaPreparedTracePolicyValid(
-                health.tensor_core, health.trace_solves,
-                health.linear_iterations, health.linear_solve_attempts,
-                request.backend.cuda_engine,
-                specification.regularization == RegularizationKind::igr,
-                1, request.polynomial_order,
-                trace_policy) &&
+        trace_policy_valid &&
         health.tensor_core.fallback_count == 0 && health.no_fallback &&
-        health.tensor_volume_evidence_valid &&
-        (request.backend.cuda_engine == CudaEngineKind::ordinary
-             ? health.tensor_core.condensation_launches == 0 &&
-                   health.tensor_core.mma_tiles == 0
-             : health.tensor_core.hardware_supported &&
-                   health.tensor_core.condensation_launches > 0 &&
-                   health.tensor_core.mma_tiles > 0);
-    const bool healthy = captured && work_accounting && health.success &&
-        health.finite &&
+        backend_work;
+    const bool healthy = captured && assessed && work_accounting &&
+        health.success && health.finite && health.telemetry &&
         health.admissible && health.recovery && health.true_residual &&
         health.conservation && expected_engine &&
         health.nonlinear_updates <=
@@ -1347,11 +1705,38 @@ Trajectory RunCuda(const EulerHdgRequest& request,
             request.numerical_policy.true_residual_relative_tolerance &&
         health.maximum_conservation_relative_error <=
             request.numerical_policy.conservation_relative_tolerance;
+    if (!captured)
+      trajectory.failure = "prepared-health-capture";
+    else if (!assessed)
+      trajectory.failure = "assessment";
+    else if (!work_accounting)
+      trajectory.failure = "work-accounting";
+    else if (!expected_engine)
+    {
+      trajectory.failure = "engine-routing";
+      std::cerr << "CUDA RODAS engine-routing mismatch case="
+                << specification.name << " requested/selected="
+                << static_cast<int>(request.backend.cuda_engine) << '/'
+                << static_cast<int>(health.tensor_core.selected_engine)
+                << " trace-policy/backend=" << trace_policy_valid << '/'
+                << backend_work << " assembly="
+                << health.tensor_core.volume_assembly_launches << '/'
+                << health.complete_assemblies << '/'
+                << health.tensor_core.volume_mma_tiles
+                << " condensation="
+                << health.tensor_core.condensation_launches << '/'
+                << health.complete_condensations << '/'
+                << health.tensor_core.mma_tiles << " hardware="
+                << health.tensor_core.hardware_supported << '\n';
+    }
+    else
+      trajectory.failure = "numerical-gates";
     if (!healthy || !session.AcknowledgePreparedOutput(authority, output) ||
         session.Commit(std::move(authority), output).status !=
             dg::hdg::generic::HdgEulerSessionStatus::committed)
       return trajectory;
     StepState state;
+    trajectory.failure = "committed-state-capture";
     if (!CaptureCudaState(session, mesh, request.polynomial_order,
                           fields.scalar_count, specification.regularization,
                           state))
@@ -1362,6 +1747,11 @@ Trajectory RunCuda(const EulerHdgRequest& request,
     state.maximum_conservation_error = health.maximum_conservation_error;
     state.maximum_conservation_relative_error =
         health.maximum_conservation_relative_error;
+    state.assessment_available = rodas3;
+    state.normalized_differential_error =
+        rodas3 ? assessment.normalized_differential_error : 0.0;
+    state.normalized_algebraic_correction =
+        rodas3 ? assessment.normalized_algebraic_correction : 0.0;
     state.nonlinear_updates = health.nonlinear_updates;
     state.trace_solves = health.trace_solves;
     state.linear_iterations = health.linear_iterations;
@@ -1375,16 +1765,24 @@ Trajectory RunCuda(const EulerHdgRequest& request,
         health.tensor_core.volume_assembly_launches;
     state.tensor_volume_mma_tiles = health.tensor_core.volume_mma_tiles;
     state.fallback_count = health.tensor_core.fallback_count;
+    state.common_shift_operator_builds =
+        health.common_shift_operator_builds;
+    state.common_shift_operator_reuses =
+        health.common_shift_operator_reuses;
+    state.condensed_rhs_refreshes = health.condensed_rhs_refreshes;
+    state.common_shift_trace_solves = health.common_shift_trace_solves;
     trajectory.states.push_back(std::move(state));
   }
   trajectory.passed = trajectory.states.size() ==
       static_cast<std::size_t>(specification.steps + 1);
+  if (trajectory.passed) trajectory.failure = {};
   return trajectory;
 }
 
 bool CompareTrajectory(const Case& specification,
                        const std::string_view comparison,
-                       const Trajectory& left, const Trajectory& right)
+                       const Trajectory& left, const Trajectory& right,
+                       const bool require_rodas3_assessment)
 {
   if (!left.passed || !right.passed ||
       left.states.size() != right.states.size())
@@ -1396,6 +1794,8 @@ bool CompareTrajectory(const Case& specification,
     const StepState& device = right.states[index];
     const ComparisonMetrics interior = Compare(
         reference.physical_interior, device.physical_interior);
+    const ComparisonMetrics full_interior = Compare(
+        reference.full_interior, device.full_interior);
     const ComparisonMetrics trace = Compare(
         reference.true_trace, device.true_trace);
     const auto near_scalar = [](const double left, const double right)
@@ -1451,8 +1851,28 @@ bool CompareTrajectory(const Case& specification,
     const bool sigma_localization = !require_localization ||
         (reference.sigma.nonzero && reference.sigma.localized &&
          device.sigma.nonzero && device.sigma.localized);
-    const bool state_passed = interior.passed && trace.passed &&
-        sigma_metrics && sigma_localization &&
+    const bool assessment = !require_rodas3_assessment ||
+        (index == 0
+             ? !reference.assessment_available &&
+                   !device.assessment_available
+             : reference.assessment_available &&
+                   device.assessment_available &&
+                   near_scalar(reference.normalized_differential_error,
+                               device.normalized_differential_error) &&
+                   near_scalar(reference.normalized_algebraic_correction,
+                               device.normalized_algebraic_correction) &&
+                   reference.common_shift_operator_builds == 1 &&
+                   device.common_shift_operator_builds == 1 &&
+                   reference.common_shift_operator_reuses == 3 &&
+                   device.common_shift_operator_reuses == 3 &&
+                   reference.condensed_rhs_refreshes == 3 &&
+                   device.condensed_rhs_refreshes == 3 &&
+                   reference.common_shift_trace_solves == 4 &&
+                   device.common_shift_trace_solves == 4);
+    const bool state_passed = interior.passed &&
+        (!require_rodas3_assessment || full_interior.passed) &&
+        trace.passed && assessment && sigma_metrics && sigma_localization &&
+        reference.interior_components == device.interior_components &&
         reference.trace_components == device.trace_components &&
         reference.step == device.step &&
         reference.generation == device.generation &&
@@ -1474,6 +1894,10 @@ bool CompareTrajectory(const Case& specification,
                 << " state=" << index
                 << " interior_rel=" << interior.relative_l2
                 << " interior_inf=" << interior.maximum_absolute
+                << " full_interior_rel=" << full_interior.relative_l2
+                << " full_interior_inf=" << full_interior.maximum_absolute
+                << " interior_components=" << reference.interior_components
+                << '/' << device.interior_components
                 << " trace_rel=" << trace.relative_l2
                 << " trace_inf=" << trace.maximum_absolute
                 << " trace_components=" << reference.trace_components
@@ -1509,7 +1933,20 @@ bool CompareTrajectory(const Case& specification,
                 << reference.tensor_volume_mma_tiles << '/'
                 << device.tensor_volume_mma_tiles << " fallback="
                 << reference.fallback_count << '/'
-                << device.fallback_count << " sigma_l2="
+                << device.fallback_count << " assessment="
+                << reference.normalized_differential_error << '/'
+                << device.normalized_differential_error << ','
+                << reference.normalized_algebraic_correction << '/'
+                << device.normalized_algebraic_correction
+                << " common_shift="
+                << reference.common_shift_operator_builds << '/'
+                << device.common_shift_operator_builds << ','
+                << reference.common_shift_operator_reuses << '/'
+                << device.common_shift_operator_reuses << ','
+                << reference.condensed_rhs_refreshes << '/'
+                << device.condensed_rhs_refreshes << ','
+                << reference.common_shift_trace_solves << '/'
+                << device.common_shift_trace_solves << " sigma_l2="
                 << reference.sigma.global_l2_squared << '/'
                 << device.sigma.global_l2_squared << " sigma_max="
                 << reference.sigma.global_maximum_absolute << '/'
@@ -1729,6 +2166,8 @@ bool ParseSelection(const int argc, char* argv[],
       else if (treatment == "partitioned-backward-euler")
         selection.time_treatment =
             EulerHdgTimeTreatment::partitioned_backward_euler;
+      else if (treatment == "rodas3")
+        selection.time_treatment = EulerHdgTimeTreatment::rodas3;
       else
         return false;
     }
@@ -1752,7 +2191,7 @@ void PrintUsage(const char* const executable)
   std::cerr
       << "Usage: " << executable
       << " [--order 1|2|3]"
-         " [--time-treatment backward-euler|partitioned-backward-euler]"
+         " [--time-treatment backward-euler|partitioned-backward-euler|rodas3]"
          " [--igr-volume-quadrature-order Q"
          " --igr-face-quadrature-order Q]"
          " [--newton-linear-rtol R] [--final-linear-rtol R]"
@@ -1821,23 +2260,34 @@ int main(int argc, char* argv[])
               << tensor_igr_trace.polynomial_order << '\n';
     return 0;
   }
+  const bool rodas3 = selection.time_treatment ==
+      EulerHdgTimeTreatment::rodas3;
+  const int smooth_steps = rodas3 ? 1 : 3;
+  const int short_steps = rodas3 ? 1 : 2;
+  const double fixed_dt = rodas3 ? 1.0e-6 : 1.0e-5;
   constexpr std::size_t case_count = 6;
   const std::array<Case, case_count> cases{{
       {"conventional-smooth-short-trajectory", InitialMode::smooth_periodic,
-       RegularizationKind::none, false, 3, 1.0e-5, false, 0.0, false},
+       RegularizationKind::none, false, smooth_steps, fixed_dt, false, 0.0,
+       false},
       {"conventional-smooth-slip-source-trajectory",
-       InitialMode::smooth_periodic, RegularizationKind::none, true, 2,
-       1.0e-5, false, 1.0, false},
+       InitialMode::smooth_periodic, RegularizationKind::none, true,
+       short_steps,
+       fixed_dt, false, 1.0, false},
       {"igr-smooth-short-trajectory", InitialMode::smooth_periodic,
-       RegularizationKind::igr, false, 3, 1.0e-5, false, 0.0, false},
+       RegularizationKind::igr, false, smooth_steps, fixed_dt, false, 0.0,
+       false},
       {"igr-smooth-source-supplied-trace-trajectory",
-       InitialMode::smooth_periodic, RegularizationKind::igr, false, 2,
-       1.0e-5, false, 1.0, true},
+       InitialMode::smooth_periodic, RegularizationKind::igr, false,
+       short_steps,
+       fixed_dt, false, 1.0, true},
       {"igr-periodic-localized-contact", InitialMode::localized_igr_contact,
-       RegularizationKind::igr, false, 2, 1.0e-5, true, 0.0, false},
+       RegularizationKind::igr, false, short_steps, fixed_dt, true, 0.0,
+       false},
       {"igr-slip-boundary-localized-contact",
        InitialMode::localized_igr_contact,
-       RegularizationKind::igr, true, 2, 1.0e-5, true, 0.0, false}}};
+       RegularizationKind::igr, true, short_steps, fixed_dt, true, 0.0,
+       false}}};
 
   // MFEM and HYPRE device selection is process-global.  Form every CPU
   // reference trajectory under the default host policy first, then select
@@ -1852,7 +2302,13 @@ int main(int argc, char* argv[])
     cpu_phase_ready = trajectory.passed && cpu_phase_ready;
   if (!All(cpu_phase_ready))
   {
-    std::cerr << "CPU reference trajectory construction failed\n";
+    for (std::size_t index = 0; index < cases.size(); ++index)
+      if (!cpu_trajectories[index].passed)
+        std::cerr << "CPU reference trajectory construction failed case="
+                  << cases[index].name << " subgate="
+                  << cpu_trajectories[index].failure << " states="
+                  << cpu_trajectories[index].states.size() << '/'
+                  << cases[index].steps + 1 << '\n';
     return 1;
   }
 
@@ -1880,8 +2336,13 @@ int main(int argc, char* argv[])
       [](const Trajectory& trajectory) { return trajectory.passed; });
   if (!All(ordinary_phase_ready))
   {
-    std::cerr << "ordinary CUDA trajectory construction failed order="
-              << order << '\n';
+    for (std::size_t index = 0; index < cases.size(); ++index)
+      if (!ordinary_trajectories[index].passed)
+        std::cerr << "ordinary CUDA trajectory construction failed case="
+                  << cases[index].name << " subgate="
+                  << ordinary_trajectories[index].failure << " states="
+                  << ordinary_trajectories[index].states.size() << '/'
+                  << cases[index].steps + 1 << " order=" << order << '\n';
     return 1;
   }
   const bool cuda_engine_transition_clean = HYPRE_ClearAllErrors() == 0 &&
@@ -1900,8 +2361,13 @@ int main(int argc, char* argv[])
       [](const Trajectory& trajectory) { return trajectory.passed; });
   if (!All(tensor_phase_ready))
   {
-    std::cerr << "tensor CUDA trajectory construction failed order="
-              << order << '\n';
+    for (std::size_t index = 0; index < cases.size(); ++index)
+      if (!tensor_trajectories[index].passed)
+        std::cerr << "tensor CUDA trajectory construction failed case="
+                  << cases[index].name << " subgate="
+                  << tensor_trajectories[index].failure << " states="
+                  << tensor_trajectories[index].states.size() << '/'
+                  << cases[index].steps + 1 << " order=" << order << '\n';
     return 1;
   }
 
@@ -1910,13 +2376,13 @@ int main(int argc, char* argv[])
   {
     const bool cpu_ordinary = CompareTrajectory(
         cases[index], "cpu-vs-ordinary", cpu_trajectories[index],
-        ordinary_trajectories[index]);
+        ordinary_trajectories[index], rodas3);
     const bool cpu_tensor = CompareTrajectory(
         cases[index], "cpu-vs-tensor", cpu_trajectories[index],
-        tensor_trajectories[index]);
+        tensor_trajectories[index], rodas3);
     const bool ordinary_tensor = CompareTrajectory(
         cases[index], "ordinary-vs-tensor", ordinary_trajectories[index],
-        tensor_trajectories[index]);
+        tensor_trajectories[index], rodas3);
     const bool case_passed =
         cpu_ordinary && cpu_tensor && ordinary_tensor;
     if (!case_passed)

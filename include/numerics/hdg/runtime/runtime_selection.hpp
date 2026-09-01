@@ -97,6 +97,11 @@ struct PartitionedBackwardEulerRuntimeTag
   static constexpr std::string_view id = "partitioned_backward_euler";
 };
 
+struct Rodas3RuntimeTag
+{
+  static constexpr std::string_view id = "rodas3";
+};
+
 struct CpuSerialBackendTag
 {
   static constexpr std::string_view id = "cpu.serial";
@@ -197,6 +202,21 @@ using PartitionedBackwardEulerCudaRank1RuntimeSelection =
         CudaRank1OneGpuBackendTag>;
 using PartitionedBackwardEulerCudaRank2RuntimeSelection =
     PartitionedBackwardEulerBorrowedEulerCurrentLlfSelection<
+        CudaRank2OneGpuHostStagedBackendTag>;
+
+template <typename BackendTag>
+using Rodas3BorrowedEulerCurrentLlfSelection =
+    BorrowedEulerCurrentLlfSelection<BackendTag, Rodas3RuntimeTag>;
+
+using Rodas3CpuRank1RuntimeSelection =
+    Rodas3BorrowedEulerCurrentLlfSelection<CpuSerialBackendTag>;
+using Rodas3CpuSerialRuntimeSelection = Rodas3CpuRank1RuntimeSelection;
+using Rodas3CpuRank2RuntimeSelection =
+    Rodas3BorrowedEulerCurrentLlfSelection<CpuRank2BackendTag>;
+using Rodas3CudaRank1RuntimeSelection =
+    Rodas3BorrowedEulerCurrentLlfSelection<CudaRank1OneGpuBackendTag>;
+using Rodas3CudaRank2RuntimeSelection =
+    Rodas3BorrowedEulerCurrentLlfSelection<
         CudaRank2OneGpuHostStagedBackendTag>;
 
 } // namespace dg::hdg::runtime

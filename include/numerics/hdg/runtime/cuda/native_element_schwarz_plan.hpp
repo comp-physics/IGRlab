@@ -25,13 +25,21 @@ inline constexpr int native_element_schwarz_maximum_order = 3;
 inline constexpr int native_element_schwarz_maximum_contributors = 2;
 inline constexpr int native_element_schwarz_equilibration_passes = 2;
 
-constexpr int NativeElementSchwarzIgrPatchRows(const int order) noexcept
+constexpr int NativeElementSchwarzPatchRows(
+    const int order, const bool igr_active) noexcept
 {
   return order >= native_element_schwarz_minimum_order &&
           order <= native_element_schwarz_maximum_order
       ? native_element_schwarz_faces *
-            native_element_schwarz_igr_trace_components * (order + 1)
+            (igr_active ? native_element_schwarz_igr_trace_components
+                        : native_element_schwarz_euler_trace_components) *
+            (order + 1)
       : 0;
+}
+
+constexpr int NativeElementSchwarzIgrPatchRows(const int order) noexcept
+{
+  return NativeElementSchwarzPatchRows(order, true);
 }
 
 /**

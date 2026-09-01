@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -171,6 +172,13 @@ bool CheckAcceptAndReject()
   request.time_treatment =
       EulerHdgTimeTreatment::partitioned_backward_euler;
   if (ValidateEulerHdgRequest(request) != ContractStatus::accepted)
+  {
+    return false;
+  }
+  request.time_treatment = EulerHdgTimeTreatment::rodas3;
+  if (ValidateEulerHdgRequest(request) != ContractStatus::accepted ||
+      std::string_view(dg::hdg::generic::EulerHdgTimeTreatmentName(
+        request.time_treatment)) != "rodas3")
   {
     return false;
   }

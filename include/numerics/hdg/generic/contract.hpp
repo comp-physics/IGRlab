@@ -61,14 +61,16 @@ enum class EulerHdgTimeTreatment : std::uint8_t
   // Zero preserves Backward Euler for value-initialized and legacy aggregate
   // requests while the new member remains a trailing POD extension.
   backward_euler = 0,
-  partitioned_backward_euler = 1
+  partitioned_backward_euler = 1,
+  rodas3 = 2
 };
 
 constexpr bool IsKnownEulerHdgTimeTreatment(
     const EulerHdgTimeTreatment treatment) noexcept
 {
   return treatment == EulerHdgTimeTreatment::backward_euler ||
-      treatment == EulerHdgTimeTreatment::partitioned_backward_euler;
+      treatment == EulerHdgTimeTreatment::partitioned_backward_euler ||
+      treatment == EulerHdgTimeTreatment::rodas3;
 }
 
 constexpr const char* EulerHdgTimeTreatmentName(
@@ -80,6 +82,8 @@ constexpr const char* EulerHdgTimeTreatmentName(
     return "backward-euler";
   case EulerHdgTimeTreatment::partitioned_backward_euler:
     return "partitioned-backward-euler";
+  case EulerHdgTimeTreatment::rodas3:
+    return "rodas3";
   }
   return "unknown";
 }
@@ -277,7 +281,12 @@ struct BoundaryPointView
 /**
  * A borrowed host numerical boundary operator.  The callback may inspect only
  * the supplied point and interior state and writes one four-component exterior
- * state.  It receives no mesh, solver, lifecycle, or state-owner handle.  The
+ * state.  It receives no time coordinate: its numerical value is therefore an
+ * autonomous, deterministic map of `(context, point, interior_state)` for one
+ * admitted lifecycle.  Observational counters may change, but mutable context
+ * must not change the returned state.  RODAS3 may reevaluate this map at
+ * bounded FP64 perturbations to form its frozen boundary Jacobian.  The
+ * callback receives no mesh, solver, lifecycle, or state-owner handle.  The
  * companion attribute-indexed POD table carries the same resolved policy data
  * for device backends; it is copied during Initialize and never retained.
  */

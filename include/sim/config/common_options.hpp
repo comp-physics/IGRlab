@@ -36,6 +36,10 @@ struct CommonOptions
   ///< HDG IGR-extension beta; used only with --discretization hdg --regularization igr.
   std::string time_integrator;
   ///< Time-integrator selector; empty selects the discretization default.
+  mfem::real_t time_atol = 1.0e-8;
+  ///< Differential-state absolute tolerance for embedded adaptive stepping.
+  mfem::real_t time_rtol = 1.0e-5;
+  ///< Differential-state relative tolerance for embedded adaptive stepping.
   std::string zhang_shu_points =
     "consumer"; ///< Zhang-Shu point set: "consumer" or "quadrature".
   std::string dgsem_stab =
@@ -76,6 +80,10 @@ struct CommonOptions
   std::string restart_vtk; ///< PVD file or dataset directory to restart from.
   int restart_cycle = -1;  ///< Selected PVD cycle; -1 selects the latest cycle.
   int restart_step = -1;   ///< Completed global step for legacy VTK cycles.
+  std::string hdg_checkpoint;
+  ///< Optional rolling committed-boundary HDG checkpoint artifact.
+  std::string hdg_restart_checkpoint;
+  ///< Optional HDG checkpoint artifact to restore before time integration.
 };
 
 /**
@@ -135,8 +143,16 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-ti",
                  "--time-integrator",
                  "Time integrator: rk3ssp | backward-euler | "
-                 "partitioned-backward-euler "
+                 "partitioned-backward-euler | rodas3 "
                  "(discretization support required).");
+  args.AddOption(&opts.time_atol,
+                 "-tatol",
+                 "--time-atol",
+                 "Absolute differential-state tolerance for adaptive RODAS3.");
+  args.AddOption(&opts.time_rtol,
+                 "-trtol",
+                 "--time-rtol",
+                 "Relative differential-state tolerance for adaptive RODAS3.");
   args.AddOption(&opts.zhang_shu_points,
                  "-zsp",
                  "--zhang-shu-points",
@@ -171,7 +187,9 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.dt,
                  "-dt",
                  "--time-step",
-                 "Time step. Positive number skips CFL timestep calculation.");
+                 "Time step. Positive selects fixed stepping; nonpositive "
+                 "selects CFL for Backward Euler, while negative supplies the "
+                 "initial adaptive RODAS3 step magnitude.");
   args.AddOption(&opts.dt_min,
                  "-dtmin",
                  "--dt-min",
@@ -272,6 +290,16 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-restart-step",
                  "--restart-step",
                  "Completed global RK step for legacy cycles without a manifest.");
+  args.AddOption(&opts.hdg_checkpoint,
+                 "-hdg-checkpoint",
+                 "--hdg-checkpoint",
+                 "Rolling committed-boundary HDG checkpoint artifact path; "
+                 "empty disables checkpoint publication.");
+  args.AddOption(&opts.hdg_restart_checkpoint,
+                 "-hdg-restart-checkpoint",
+                 "--hdg-restart-checkpoint",
+                 "Restore a committed HDG checkpoint artifact before time "
+                 "integration; empty disables checkpoint restore.");
 }
 
 /**

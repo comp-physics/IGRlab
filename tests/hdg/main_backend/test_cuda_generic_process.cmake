@@ -43,10 +43,19 @@ endif()
 if(NOT DEFINED HDG_MAIN_TIME_INTEGRATOR)
   set(HDG_MAIN_TIME_INTEGRATOR backward-euler)
 endif()
+if(NOT DEFINED HDG_MAIN_OMIT_TIME_INTEGRATOR)
+  set(HDG_MAIN_OMIT_TIME_INTEGRATOR OFF)
+endif()
 if(NOT HDG_MAIN_TIME_INTEGRATOR STREQUAL "backward-euler" AND
-   NOT HDG_MAIN_TIME_INTEGRATOR STREQUAL "partitioned-backward-euler")
+   NOT HDG_MAIN_TIME_INTEGRATOR STREQUAL "partitioned-backward-euler" AND
+   NOT HDG_MAIN_TIME_INTEGRATOR STREQUAL "rodas3")
   message(FATAL_ERROR
-    "HDG time integrator must be backward-euler or partitioned-backward-euler, got '${HDG_MAIN_TIME_INTEGRATOR}'.")
+    "HDG time integrator must be backward-euler, partitioned-backward-euler, or rodas3, got '${HDG_MAIN_TIME_INTEGRATOR}'.")
+endif()
+if(HDG_MAIN_OMIT_TIME_INTEGRATOR AND
+   NOT HDG_MAIN_TIME_INTEGRATOR STREQUAL "backward-euler")
+  message(FATAL_ERROR
+    "Only the backward-Euler-default process gate may omit --time-integrator.")
 endif()
 
 function(require_euler_field text_variable tag field components context)
@@ -116,12 +125,14 @@ set(_arguments
   --order "${HDG_MAIN_ORDER}"
   --serial-refine "${HDG_MAIN_SERIAL_REFINE}"
   --parallel-refine "${HDG_MAIN_PARALLEL_REFINE}"
-  --time-integrator "${HDG_MAIN_TIME_INTEGRATOR}"
   --time-step "${HDG_MAIN_DT}"
   --t-final "${HDG_MAIN_T_FINAL}"
   --no-glvis)
 if(NOT HDG_MAIN_OMIT_CUDA_ENGINE)
   list(APPEND _arguments --hdg-cuda-engine "${HDG_MAIN_CUDA_ENGINE}")
+endif()
+if(NOT HDG_MAIN_OMIT_TIME_INTEGRATOR)
+  list(APPEND _arguments --time-integrator "${HDG_MAIN_TIME_INTEGRATOR}")
 endif()
 set(_success_pattern
   "\\[hdg-main\\] status=Success.*step=${HDG_MAIN_EXPECTED_STEPS}.*time=${HDG_MAIN_EXPECTED_FINAL_TIME}")
@@ -136,6 +147,28 @@ if(HDG_MAIN_DEVICE STREQUAL "cuda")
     set(_expected_trace_solver hypre-parcsr-gmres)
   endif()
   if(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor" AND
+     HDG_MAIN_REGULARIZATION STREQUAL "none" AND
+     HDG_MAIN_TIME_INTEGRATOR STREQUAL "rodas3" AND
+     HDG_MAIN_RANKS EQUAL 1)
+    # The generic facade lowers this integrator-specific default to the exact
+    # admitted engine policy before device initialization.  Engine telemetry
+    # therefore reports the typed native request as well as its identical
+    # resolved selection; Backward Euler continues to report engine-default.
+    set(_expected_requested_trace_policy
+      native-element-schwarz-matrix-free-fp64)
+    set(_expected_trace_preconditioner native_element_schwarz_fp64)
+    set(_expected_resolved_trace_policy
+      native-element-schwarz-matrix-free-fp64)
+    set(_expected_ilu_type -1)
+    set(_expected_ilu_fill -1)
+    set(_expected_ilu_iterations 0)
+    set(_expected_ilu_reordering -1)
+    set(_expected_ilu_accounting unavailable)
+    set(_expected_ilu_factor_reuse_policy not_applicable)
+    set(_expected_ilu_triangular_solve_kind not_applicable)
+    set(_expected_ilu_lower_jacobi_iterations 0)
+    set(_expected_ilu_upper_jacobi_iterations 0)
+  elseif(HDG_MAIN_CUDA_ENGINE STREQUAL "tensor" AND
      HDG_MAIN_REGULARIZATION STREQUAL "none")
     set(_expected_trace_preconditioner hypre_diag_scale)
     set(_expected_ilu_type -1)
@@ -199,6 +232,19 @@ else()
 endif()
 if(DEFINED HDG_MAIN_CFL)
   list(APPEND _arguments --cfl-number "${HDG_MAIN_CFL}")
+endif()
+if(DEFINED HDG_MAIN_TIME_ATOL)
+  list(APPEND _arguments --time-atol "${HDG_MAIN_TIME_ATOL}")
+endif()
+if(DEFINED HDG_MAIN_TIME_RTOL)
+  list(APPEND _arguments --time-rtol "${HDG_MAIN_TIME_RTOL}")
+endif()
+if(DEFINED HDG_MAIN_DT_MIN)
+  list(APPEND _arguments --dt-min "${HDG_MAIN_DT_MIN}")
+endif()
+if(DEFINED HDG_MAIN_EXPECTED_REJECTIONS)
+  string(APPEND _success_pattern
+    ".*rejected_attempts=${HDG_MAIN_EXPECTED_REJECTIONS}")
 endif()
 if(HDG_MAIN_NO_VTK)
   list(APPEND _arguments --no-vtk_save)

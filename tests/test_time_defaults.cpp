@@ -35,6 +35,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "HDG IGR defaults: alpha and beta are one");
     ctx.Check(opts.hdg_cuda_engine == "ordinary",
               "HDG CUDA engine defaults to ordinary");
+    ctx.Check(opts.time_atol == 1.0e-8 && opts.time_rtol == 1.0e-5,
+              "adaptive time tolerances retain their typed opt-in defaults");
     ctx.Check(dg_sim::ParseZhangShuPointSet("consumer") ==
                 mfem::ZhangShuPointSet::kConsumer,
               "Zhang-Shu options: parse consumer point set");
@@ -160,11 +162,15 @@ int RunTimeDefaultsTests(TestContext& ctx)
                 dg_sim::TryParseTimeIntegrator(
                   "PARTITIONED-BACKWARD-EULER") ==
                   dg_sim::TimeIntegrator::PartitionedBackwardEuler &&
+                dg_sim::TryParseTimeIntegrator("RODAS3") ==
+                  dg_sim::TimeIntegrator::Rodas3 &&
                 std::string(dg_sim::TimeIntegratorToString(
                   dg_sim::TimeIntegrator::RK3SSP)) == "rk3ssp" &&
                 std::string(dg_sim::TimeIntegratorToString(
                   dg_sim::TimeIntegrator::PartitionedBackwardEuler)) ==
-                  "partitioned-backward-euler",
+                  "partitioned-backward-euler" &&
+                std::string(dg_sim::TimeIntegratorToString(
+                  dg_sim::TimeIntegrator::Rodas3)) == "rodas3",
               "request: time-integrator parser and metadata name are stable");
     ctx.Check(!dg_sim::TryParseTimeIntegrator("invalid"),
               "request: invalid time integrator is not parsed");
@@ -316,6 +322,13 @@ int RunTimeDefaultsTests(TestContext& ctx)
                 dg_sim::SolverRequestResolutionStatus::UnsupportedTimeIntegrator,
               "request: DG/DGSEM partitioned backward-euler is rejected");
 
+    const dg_sim::SolverRequestResolution dg_rodas3 =
+      dg_sim::ResolveSolverRequest("dg", false, "", "dg", "", "rodas3",
+                                   false, false, false, true);
+    ctx.Check(dg_rodas3.status ==
+                dg_sim::SolverRequestResolutionStatus::UnsupportedTimeIntegrator,
+              "request: DG/DGSEM RODAS3 is rejected");
+
     const dg_sim::SolverRequestResolution invalid_regularization =
       dg_sim::ResolveSolverRequest("dg", false, "", "dg", "invalid", "",
                                    false, false, true, false);
@@ -362,6 +375,32 @@ int RunTimeDefaultsTests(TestContext& ctx)
                 hdg_partitioned_cuda.device_backend ==
                   dg_sim::DeviceBackend::CUDA,
               "request: IGR HDG CUDA admits partitioned backward-euler");
+
+    const dg_sim::SolverRequestResolution hdg_rodas3_cpu =
+      dg_sim::ResolveSolverRequest(
+        "dg", false, "hdg", "dg", "none", "rodas3",
+        true, false, true, true, "cpu");
+    ctx.Check(hdg_rodas3_cpu.IsResolved() &&
+                hdg_rodas3_cpu.regularization ==
+                  dg_sim::Regularization::None &&
+                hdg_rodas3_cpu.time_integrator ==
+                  dg_sim::TimeIntegrator::Rodas3 &&
+                hdg_rodas3_cpu.device_backend ==
+                  dg_sim::DeviceBackend::CPU,
+              "request: conventional HDG CPU admits typed RODAS3 opt-in");
+
+    const dg_sim::SolverRequestResolution hdg_rodas3_cuda =
+      dg_sim::ResolveSolverRequest(
+        "dg", false, "hdg", "dg", "igr", "rodas3",
+        true, false, true, true, "cuda");
+    ctx.Check(hdg_rodas3_cuda.IsResolved() &&
+                hdg_rodas3_cuda.regularization ==
+                  dg_sim::Regularization::IGR &&
+                hdg_rodas3_cuda.time_integrator ==
+                  dg_sim::TimeIntegrator::Rodas3 &&
+                hdg_rodas3_cuda.device_backend ==
+                  dg_sim::DeviceBackend::CUDA,
+              "request: IGR HDG CUDA admits typed RODAS3 opt-in");
 
     const dg_sim::SolverRequestResolution hdg_igr_cpu =
       dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "igr", "",

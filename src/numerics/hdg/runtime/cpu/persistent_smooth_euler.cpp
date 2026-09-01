@@ -4,6 +4,7 @@
 
 #include "numerics/hdg/core/host_reference.hpp"
 #include "numerics/hdg/runtime/runtime_selection.hpp"
+#include "numerics/hdg/time/rodas3.hpp"
 #include "numerics/hdg/trace/trace_dg_mpi.hpp"
 
 #include <mfem.hpp>
@@ -45,6 +46,12 @@ constexpr std::string_view expected_mfem_pin =
 
 constexpr int igr_interior_components = 7;
 constexpr int igr_trace_components = 5;
+// A supplied/derived entry trace may require a bounded consistency
+// projection, but it may not be replaced wholesale.  The norm is an RMS of
+// componentwise changes scaled by max(1, |before|, |after|); one quarter is a
+// deliberately broad initialization allowance, independent of time-error
+// tolerances used for the final candidate reconstruction.
+constexpr double rodas_maximum_entry_algebraic_correction_norm = 0.25;
 
 using State = std::array<double, cpu_conserved_components>;
 using Matrix4 =
@@ -448,6 +455,49 @@ bool NormalSpectralRadius(const State& conservative,
   return Finite(radius) && radius > 0.0;
 }
 
+bool NormalSpectralRadiusGradient(
+    const State& conservative, const std::array<double, 2>& normal,
+    double& radius, State& gradient) noexcept
+{
+  State primitive{};
+  if (!Primitive(conservative, primitive) || !Finite(normal) ||
+      (normal[0] == 0.0 && normal[1] == 0.0))
+  {
+    return false;
+  }
+  const double density = conservative[0];
+  const double momentum_squared =
+      conservative[1] * conservative[1] +
+      conservative[2] * conservative[2];
+  const double normal_momentum =
+      conservative[1] * normal[0] + conservative[2] * normal[1];
+  const double normal_velocity = normal_momentum / density;
+  const double sound_speed =
+      std::sqrt(cpu_gamma * primitive[3] / density);
+  if (!Finite(sound_speed) || !(sound_speed > 0.0)) return false;
+
+  const double velocity_sign = normal_velocity > 0.0
+      ? 1.0 : normal_velocity < 0.0 ? -1.0 : 0.0;
+  const double thermodynamic_scale =
+      cpu_gamma * (cpu_gamma - 1.0) / (2.0 * sound_speed);
+  const double inverse_density = 1.0 / density;
+  const double inverse_density_squared =
+      inverse_density * inverse_density;
+  const double inverse_density_cubed =
+      inverse_density_squared * inverse_density;
+  gradient[0] = velocity_sign * (-normal_velocity * inverse_density) +
+      thermodynamic_scale *
+          (-conservative[3] * inverse_density_squared +
+           momentum_squared * inverse_density_cubed);
+  gradient[1] = velocity_sign * normal[0] * inverse_density -
+      thermodynamic_scale * conservative[1] * inverse_density_squared;
+  gradient[2] = velocity_sign * normal[1] * inverse_density -
+      thermodynamic_scale * conservative[2] * inverse_density_squared;
+  gradient[3] = thermodynamic_scale * inverse_density;
+  radius = std::abs(normal_velocity) + sound_speed;
+  return Finite(radius) && radius > 0.0 && Finite(gradient);
+}
+
 bool BorrowedEulerLlfStabilization(
     const State& interior, const State& trace,
     const std::array<double, 2>& normal, double& stabilization) noexcept
@@ -461,6 +511,139 @@ bool BorrowedEulerLlfStabilization(
   }
   stabilization = std::max(interior_radius, trace_radius);
   return Finite(stabilization) && stabilization > 0.0;
+}
+
+bool BorrowedEulerLlfStabilizationGradient(
+    const State& interior, const State& trace,
+    const std::array<double, 2>& normal, double& stabilization,
+    State& interior_gradient, State& trace_gradient) noexcept
+{
+  double interior_radius = 0.0;
+  double trace_radius = 0.0;
+  State evaluated_interior_gradient{};
+  State evaluated_trace_gradient{};
+  if (!NormalSpectralRadiusGradient(
+          interior, normal, interior_radius,
+          evaluated_interior_gradient) ||
+      !NormalSpectralRadiusGradient(
+          trace, normal, trace_radius, evaluated_trace_gradient))
+  {
+    return false;
+  }
+  interior_gradient = {};
+  trace_gradient = {};
+  if (interior_radius >= trace_radius)
+  {
+    stabilization = interior_radius;
+    interior_gradient = evaluated_interior_gradient;
+  }
+  else
+  {
+    stabilization = trace_radius;
+    trace_gradient = evaluated_trace_gradient;
+  }
+  return Finite(stabilization) && stabilization > 0.0 &&
+      Finite(interior_gradient) && Finite(trace_gradient);
+}
+
+/**
+ * Deterministic FP64 derivative of the borrowed autonomous boundary map.
+ *
+ * The generic callback contract does not expose a Jacobian.  RODAS3 therefore
+ * uses a bounded Richardson central difference at its one frozen
+ * linearization point.  The repeated base evaluation rejects stateful boundary
+ * values, while the two difference widths reject unresolved branch changes.
+ * Backward-Euler paths never call this helper and retain their established
+ * Picard boundary linearization.
+ */
+bool BorrowedEulerBoundaryStateJacobian(
+    const generic::NumericalBoundaryState callback, const void* const context,
+    const generic::BoundaryPointView& point, const State& interior,
+    const State& exterior, Matrix4& jacobian) noexcept
+{
+  if (!callback || !Finite(interior) || !Finite(exterior)) return false;
+
+  State repeated{};
+  if (!callback(context, point, interior.data(), repeated.data()) ||
+      !Finite(repeated) || repeated != exterior)
+  {
+    return false;
+  }
+
+  jacobian = {};
+  constexpr int maximum_step_reductions = 8;
+  const double initial_relative_step =
+      std::cbrt(std::numeric_limits<double>::epsilon());
+  const double agreement_factor =
+      256.0 * std::sqrt(std::numeric_limits<double>::epsilon());
+  for (int column = 0; column < cpu_conserved_components; ++column)
+  {
+    const double scale = std::max(1.0, std::abs(interior[column]));
+    double width = initial_relative_step * scale;
+    bool column_ready = false;
+    for (int reduction = 0;
+         reduction < maximum_step_reductions && !column_ready; ++reduction)
+    {
+      State coarse_plus = interior;
+      State coarse_minus = interior;
+      State fine_plus = interior;
+      State fine_minus = interior;
+      coarse_plus[column] += width;
+      coarse_minus[column] -= width;
+      fine_plus[column] += 0.5 * width;
+      fine_minus[column] -= 0.5 * width;
+      State primitive{};
+      if (!Primitive(coarse_plus, primitive) ||
+          !Primitive(coarse_minus, primitive) ||
+          !Primitive(fine_plus, primitive) ||
+          !Primitive(fine_minus, primitive))
+      {
+        width *= 0.5;
+        continue;
+      }
+
+      State coarse_plus_exterior{};
+      State coarse_minus_exterior{};
+      State fine_plus_exterior{};
+      State fine_minus_exterior{};
+      if (!callback(context, point, coarse_plus.data(),
+                    coarse_plus_exterior.data()) ||
+          !callback(context, point, coarse_minus.data(),
+                    coarse_minus_exterior.data()) ||
+          !callback(context, point, fine_plus.data(),
+                    fine_plus_exterior.data()) ||
+          !callback(context, point, fine_minus.data(),
+                    fine_minus_exterior.data()) ||
+          !Finite(coarse_plus_exterior) || !Finite(coarse_minus_exterior) ||
+          !Finite(fine_plus_exterior) || !Finite(fine_minus_exterior))
+      {
+        width *= 0.5;
+        continue;
+      }
+
+      column_ready = true;
+      for (int row = 0; row < cpu_conserved_components; ++row)
+      {
+        const double coarse =
+            (coarse_plus_exterior[row] - coarse_minus_exterior[row]) /
+            (2.0 * width);
+        const double fine =
+            (fine_plus_exterior[row] - fine_minus_exterior[row]) / width;
+        const double derivative = (4.0 * fine - coarse) / 3.0;
+        const double derivative_scale = std::max(
+            {1.0, std::abs(coarse), std::abs(fine), std::abs(derivative),
+             std::abs(exterior[row]) / scale});
+        column_ready = column_ready && Finite(derivative) &&
+            std::abs(fine - coarse) <=
+                agreement_factor * derivative_scale;
+        jacobian[row][column] = derivative;
+      }
+      if (!column_ready) width *= 0.5;
+    }
+    if (!column_ready) return false;
+  }
+  return std::all_of(jacobian.begin(), jacobian.end(),
+                     [](const auto& row) { return Finite(row); });
 }
 
 bool ManufacturedSource(const double x, const double y,
@@ -1495,6 +1678,12 @@ struct LocalSystem
   }
 };
 
+struct EulerTimeMassRates
+{
+  double residual_inverse_dt = 0.0;
+  double jacobian_inverse_dt = 0.0;
+};
+
 void CopySystem(const LocalSystem& source, LocalSystem& destination) noexcept
 {
   std::copy(source.residual_interior.begin(), source.residual_interior.end(),
@@ -1887,6 +2076,7 @@ struct detail::CpuNumericsCore::Implementation
   std::unique_ptr<mfem::ParGridFunction> trial_interior;
   std::unique_ptr<mfem::ParGridFunction> iterate_trace;
   std::unique_ptr<mfem::ParGridFunction> trial_trace;
+  std::unique_ptr<mfem::ParGridFunction> rodas_base_trace_grid;
   mfem::Vector iterate_true_trace;
   mfem::Vector trial_true_trace;
   mfem::Vector true_increment;
@@ -1923,6 +2113,7 @@ struct detail::CpuNumericsCore::Implementation
 
   LocalSystem current_system;
   LocalSystem trial_system;
+  LocalSystem rodas_operator_system;
   core::HostReferenceEngine condensation;
   std::vector<double> schur;
   std::vector<double> reduced_rhs;
@@ -1930,6 +2121,15 @@ struct detail::CpuNumericsCore::Implementation
   std::vector<double> recovered_interior;
   std::vector<double> grid_interior_increment;
   std::vector<int> interior_census;
+  std::vector<double> rodas_mass_over_shift;
+  std::array<std::vector<double>, 4> rodas_stage_interior;
+  std::array<std::vector<double>, 4> rodas_stage_trace;
+  std::vector<double> rodas_base_interior;
+  std::vector<double> rodas_base_trace;
+  std::vector<double> rodas_combination_interior;
+  std::vector<double> rodas_combination_trace;
+  std::vector<double> rodas_conservation_direction_interior;
+  std::vector<double> rodas_conservation_direction_trace;
 
   std::unique_ptr<mfem::SparseMatrix> local_matrix;
   std::unique_ptr<mfem::ParBilinearForm> parallel_form;
@@ -1962,8 +2162,17 @@ struct detail::CpuNumericsCore::Implementation
   std::uint64_t next_matrix_refresh_generation = 1;
   std::uint64_t pending_factor_setup_generation = 0;
   std::uint64_t complete_factor_setup_generation = 0;
+  std::uint64_t reusable_operator_generation = 0;
   std::uint64_t active_candidate_generation = 0;
   StateHash active_candidate_state_hash{};
+  // A RODAS3 candidate may be published only after its embedded-error and
+  // final algebraic-reconstruction assessment has passed.  Keep this bounded
+  // certificate tied to the exact candidate generation, bytes, and policy;
+  // every new assessment replaces it, including a failed stricter one.
+  std::uint64_t assessed_candidate_generation = 0;
+  StateHash assessed_candidate_state_hash{};
+  std::array<std::uint64_t, 3> assessed_candidate_policy{};
+  bool assessed_candidate_authority = false;
   // The scalar IGR closure is an algebraic witness owned by the committed or
   // prepared candidate state.  Bind the committed certificate to the complete
   // published slot hashes so a stale boolean can never authorize different
@@ -2004,6 +2213,12 @@ struct detail::CpuNumericsCore::Implementation
   {
     return IsBorrowed() && borrowed_request->time_treatment ==
         generic::EulerHdgTimeTreatment::partitioned_backward_euler;
+  }
+
+  bool IsRodas3() const noexcept
+  {
+    return IsBorrowed() && borrowed_request->time_treatment ==
+        generic::EulerHdgTimeTreatment::rodas3;
   }
 
   bool RequiresPartitionedScalarClosure() const noexcept
@@ -3342,6 +3557,12 @@ struct detail::CpuNumericsCore::Implementation
       const std::size_t batches = static_cast<std::size_t>(mesh->GetNE());
       const std::size_t ni = static_cast<std::size_t>(local_interior);
       const std::size_t nt = static_cast<std::size_t>(local_trace);
+      if (IsRodas3() &&
+          !rodas_operator_system.Allocate(
+              mesh->GetNE(), local_interior, local_trace, allocations))
+      {
+        return false;
+      }
       if (!ResizeOwned(schur, batches * nt * nt,
                        CpuOwnedAllocationSite::condensation_vector,
                        allocations) ||
@@ -3364,6 +3585,51 @@ struct detail::CpuNumericsCore::Implementation
       {
         return false;
       }
+      if (IsRodas3())
+      {
+        const std::size_t interior_size =
+            static_cast<std::size_t>(interior_space->GetVSize());
+        const std::size_t trace_size =
+            static_cast<std::size_t>(trace_space->GetTrueVSize());
+        if (!ResizeOwned(rodas_mass_over_shift, batches * ni * ni,
+                         CpuOwnedAllocationSite::condensation_vector,
+                         allocations) ||
+            !ResizeOwned(rodas_combination_interior, interior_size,
+                         CpuOwnedAllocationSite::recovery_vector,
+                         allocations) ||
+            !ResizeOwned(rodas_combination_trace, trace_size,
+                         CpuOwnedAllocationSite::recovery_vector,
+                         allocations) ||
+            !ResizeOwned(rodas_conservation_direction_interior,
+                         interior_size,
+                         CpuOwnedAllocationSite::recovery_vector,
+                         allocations) ||
+            !ResizeOwned(rodas_conservation_direction_trace, trace_size,
+                         CpuOwnedAllocationSite::recovery_vector,
+                         allocations) ||
+            !ResizeOwned(rodas_base_interior, interior_size,
+                         CpuOwnedAllocationSite::recovery_vector,
+                         allocations) ||
+            !ResizeOwned(rodas_base_trace, trace_size,
+                         CpuOwnedAllocationSite::recovery_vector,
+                         allocations))
+        {
+          return false;
+        }
+        for (std::size_t stage = 0; stage < rodas_stage_interior.size();
+             ++stage)
+        {
+          if (!ResizeOwned(rodas_stage_interior[stage], interior_size,
+                           CpuOwnedAllocationSite::recovery_vector,
+                           allocations) ||
+              !ResizeOwned(rodas_stage_trace[stage], trace_size,
+                           CpuOwnedAllocationSite::recovery_vector,
+                           allocations))
+          {
+            return false;
+          }
+        }
+      }
 
       old_interior = std::make_unique<mfem::ParGridFunction>(
           interior_space.get());
@@ -3375,10 +3641,16 @@ struct detail::CpuNumericsCore::Implementation
           interior_space.get());
       iterate_trace = std::make_unique<mfem::ParGridFunction>(trace_space.get());
       trial_trace = std::make_unique<mfem::ParGridFunction>(trace_space.get());
+      if (IsRodas3())
+      {
+        rodas_base_trace_grid =
+            std::make_unique<mfem::ParGridFunction>(trace_space.get());
+      }
       if (!ObserveWrapper(old_interior) || !ObserveWrapper(external_source) ||
           !ObserveWrapper(iterate_interior) ||
           !ObserveWrapper(trial_interior) || !ObserveWrapper(iterate_trace) ||
-          !ObserveWrapper(trial_trace))
+          !ObserveWrapper(trial_trace) ||
+          (IsRodas3() && !ObserveWrapper(rodas_base_trace_grid)))
       {
         return false;
       }
@@ -3606,7 +3878,26 @@ struct detail::CpuNumericsCore::Implementation
         bytes(trial_system.residual_trace) + bytes(trial_system.a) +
         bytes(trial_system.b) + bytes(trial_system.c) +
         bytes(trial_system.d) + bytes(trial_system.f) +
-        bytes(trial_system.g) + bytes(schur) + bytes(reduced_rhs) +
+        bytes(trial_system.g) +
+        bytes(rodas_operator_system.residual_interior) +
+        bytes(rodas_operator_system.residual_trace) +
+        bytes(rodas_operator_system.a) +
+        bytes(rodas_operator_system.b) +
+        bytes(rodas_operator_system.c) +
+        bytes(rodas_operator_system.d) +
+        bytes(rodas_operator_system.f) +
+        bytes(rodas_operator_system.g) +
+        bytes(rodas_mass_over_shift) +
+        bytes(rodas_stage_interior[0]) + bytes(rodas_stage_interior[1]) +
+        bytes(rodas_stage_interior[2]) + bytes(rodas_stage_interior[3]) +
+        bytes(rodas_stage_trace[0]) + bytes(rodas_stage_trace[1]) +
+        bytes(rodas_stage_trace[2]) + bytes(rodas_stage_trace[3]) +
+        bytes(rodas_base_interior) + bytes(rodas_base_trace) +
+        bytes(rodas_combination_interior) +
+        bytes(rodas_combination_trace) +
+        bytes(rodas_conservation_direction_interior) +
+        bytes(rodas_conservation_direction_trace) +
+        bytes(schur) + bytes(reduced_rhs) +
         bytes(local_trace_increment) + bytes(recovered_interior) +
         bytes(grid_interior_increment) + bytes(interior_census) +
         bytes(owned_schur_terms) + bytes(outgoing_schur_terms) +
@@ -3622,7 +3913,9 @@ struct detail::CpuNumericsCore::Implementation
                 const bool consume_internal_test_hooks = true,
                 const std::vector<double>* const frozen_borrowed_llf = nullptr,
                 std::vector<double>* const evaluated_borrowed_llf = nullptr,
-                const bool suppress_euler_time_mass = false)
+                const bool suppress_euler_time_mass = false,
+                const EulerTimeMassRates* const time_mass_rates = nullptr,
+                const bool differentiate_borrowed_nonlinearities = false)
       noexcept
   {
     system.Zero();
@@ -3635,6 +3928,17 @@ struct detail::CpuNumericsCore::Implementation
         return false;
       }
       if (evaluated_borrowed_llf) { evaluated_borrowed_llf->clear(); }
+      const double residual_inverse_dt = time_mass_rates
+          ? time_mass_rates->residual_inverse_dt
+          : suppress_euler_time_mass ? 0.0 : 1.0 / config.dt;
+      const double jacobian_inverse_dt = time_mass_rates
+          ? time_mass_rates->jacobian_inverse_dt
+          : suppress_euler_time_mass ? 0.0 : 1.0 / config.dt;
+      if (!Finite(residual_inverse_dt) || residual_inverse_dt < 0.0 ||
+          !Finite(jacobian_inverse_dt) || jacobian_inverse_dt < 0.0)
+      {
+        return false;
+      }
       std::size_t borrowed_llf_index = 0;
       const double alpha = regularized
           ? borrowed_request->numerical_policy.stabilization.alpha : 0.0;
@@ -3773,10 +4077,8 @@ struct detail::CpuNumericsCore::Implementation
                   ByNodes(row_scalar, scalar_interior_dofs, equation);
               system.residual_interior[element_ni + row] += weight *
                   (volume_shape_workspace[row_scalar] *
-                       (suppress_euler_time_mass
-                            ? 0.0
-                            : (state[equation] - old_state[equation]) /
-                                  config.dt) -
+                       ((state[equation] - old_state[equation]) *
+                        residual_inverse_dt) -
                    volume_derivative_workspace(row_scalar, 0) *
                        flux_x[equation] -
                    volume_derivative_workspace(row_scalar, 1) *
@@ -3791,10 +4093,10 @@ struct detail::CpuNumericsCore::Implementation
                 {
                   const int column = ByNodes(
                       column_scalar, scalar_interior_dofs, variable);
-                  const double mass = !suppress_euler_time_mass &&
-                          variable == equation
+                  const double mass = variable == equation
                       ? volume_shape_workspace[row_scalar] *
-                            volume_shape_workspace[column_scalar] / config.dt
+                            volume_shape_workspace[column_scalar] *
+                            jacobian_inverse_dt
                       : 0.0;
                   const double volume =
                       -(volume_derivative_workspace(row_scalar, 0) *
@@ -4050,6 +4352,7 @@ struct detail::CpuNumericsCore::Implementation
             State interior_state{}, trace_state{}, trace_flux{},
                 exterior_state{};
             Matrix45 trace_jacobian{};
+            Matrix4 exterior_jacobian{};
             if (!Interpolate(current_interior, interior_vdofs,
                              scalar_interior_dofs,
                              face_interior_shape_workspace,
@@ -4106,14 +4409,25 @@ struct detail::CpuNumericsCore::Implementation
             }
 
             double stabilization = beta;
+            State stabilization_interior_gradient{};
+            State stabilization_trace_gradient{};
             if (!regularized)
             {
               if (IsBorrowed())
               {
                 double evaluated_stabilization = 0.0;
-                if (!BorrowedEulerLlfStabilization(
-                        interior_state, trace_state, normal,
-                        evaluated_stabilization))
+                const bool stabilization_ready =
+                    differentiate_borrowed_nonlinearities &&
+                        !frozen_borrowed_llf
+                    ? BorrowedEulerLlfStabilizationGradient(
+                          interior_state, trace_state, normal,
+                          evaluated_stabilization,
+                          stabilization_interior_gradient,
+                          stabilization_trace_gradient)
+                    : BorrowedEulerLlfStabilization(
+                          interior_state, trace_state, normal,
+                          evaluated_stabilization);
+                if (!stabilization_ready)
                 {
                   return false;
                 }
@@ -4136,10 +4450,10 @@ struct detail::CpuNumericsCore::Implementation
                   stabilization = evaluated_stabilization;
                 }
                 ++borrowed_llf_index;
-                // Evaluate LLF at this residual candidate.  Its value is
-                // deliberately frozen in A/B/C/D below: Newton and line
-                // search candidates refresh it only through a new Assemble
-                // call, never through a spectral-radius derivative.
+                // Backward Euler retains the established Picard-linearized
+                // LLF treatment.  RODAS3 requests the exact active-branch
+                // spectral-radius derivative so its frozen stage Jacobian is
+                // the Jacobian of the residual evaluated at the base state.
               }
               else
               {
@@ -4161,7 +4475,12 @@ struct detail::CpuNumericsCore::Implementation
                   !borrowed_request->boundary.exterior_state(
                       borrowed_request->boundary.context, boundary_point,
                       interior_state.data(), exterior_state.data()) ||
-                  !Finite(exterior_state))
+                  !Finite(exterior_state) ||
+                  (differentiate_borrowed_nonlinearities &&
+                   !BorrowedEulerBoundaryStateJacobian(
+                       borrowed_request->boundary.exterior_state,
+                       borrowed_request->boundary.context, boundary_point,
+                       interior_state, exterior_state, exterior_jacobian)))
               {
                 return false;
               }
@@ -4241,8 +4560,11 @@ struct detail::CpuNumericsCore::Implementation
                         column_scalar, scalar_interior_dofs,
                         column_component);
                     const double derivative =
-                        row_component == column_component
-                            ? stabilization : 0.0;
+                        (row_component == column_component
+                             ? stabilization : 0.0) +
+                        (interior_state[row_component] -
+                         trace_state[row_component]) *
+                            stabilization_interior_gradient[column_component];
                     system.a[element_a +
                         static_cast<std::size_t>(row) * local_interior +
                         column] += weight *
@@ -4268,7 +4590,11 @@ struct detail::CpuNumericsCore::Implementation
                         ByNodes(column_scalar, scalar_trace_dofs, variable);
                     const double derivative =
                         trace_jacobian[equation][variable] -
-                        (variable == equation ? stabilization : 0.0);
+                        (variable == equation ? stabilization : 0.0) +
+                        (interior_state[equation] - trace_state[equation]) *
+                            (variable < cpu_conserved_components
+                                 ? stabilization_trace_gradient[variable]
+                                 : 0.0);
                     system.b[element_b +
                         static_cast<std::size_t>(row) * local_trace +
                         column] += weight *
@@ -4294,9 +4620,13 @@ struct detail::CpuNumericsCore::Implementation
                         column_scalar, scalar_interior_dofs,
                         column_component);
                     const double derivative = physical_boundary
-                        ? 0.0
+                        ? -exterior_jacobian[row_component][column_component]
                         : (row_component == column_component
-                               ? stabilization : 0.0);
+                               ? stabilization : 0.0) +
+                            (interior_state[row_component] -
+                             trace_state[row_component]) *
+                                stabilization_interior_gradient[
+                                    column_component];
                     system.c[element_c +
                         static_cast<std::size_t>(row) * local_interior +
                         column] += weight *
@@ -4320,7 +4650,12 @@ struct detail::CpuNumericsCore::Implementation
                     const double derivative = physical_boundary
                         ? (variable == equation ? 1.0 : 0.0)
                         : trace_jacobian[equation][variable] -
-                            (variable == equation ? stabilization : 0.0);
+                            (variable == equation ? stabilization : 0.0) +
+                            (interior_state[equation] -
+                             trace_state[equation]) *
+                                (variable < cpu_conserved_components
+                                     ? stabilization_trace_gradient[variable]
+                                     : 0.0);
                     system.d[element_d +
                         static_cast<std::size_t>(row) * local_trace +
                         column] += weight *
@@ -4676,6 +5011,77 @@ struct detail::CpuNumericsCore::Implementation
                        column] = !row_active && row == column ? 1.0 : 0.0;
           }
         }
+      }
+      return Finite(system.residual_interior) &&
+          Finite(system.residual_trace) && Finite(system.a) &&
+          Finite(system.b) && Finite(system.c) && Finite(system.d) &&
+          Finite(system.f) && Finite(system.g);
+    }
+    catch (...)
+    {
+      return false;
+    }
+  }
+
+  /** Freeze differential volume U4 while solving every algebraic unknown. */
+  bool MaskRodasAlgebraicSystem(LocalSystem& system) const noexcept
+  {
+    if (!IsRodas3() || system.elements != mesh->GetNE() ||
+        system.interior_dofs != local_interior ||
+        system.trace_dofs != local_trace)
+    {
+      return false;
+    }
+    try
+    {
+      const auto interior_active = [&](const int local) noexcept
+      {
+        return local / scalar_interior_dofs >= cpu_conserved_components;
+      };
+      for (int element = 0; element < system.elements; ++element)
+      {
+        const std::size_t interior_offset =
+            static_cast<std::size_t>(element) * local_interior;
+        const std::size_t trace_offset =
+            static_cast<std::size_t>(element) * local_trace;
+        const std::size_t a_offset = interior_offset * local_interior;
+        const std::size_t b_offset = interior_offset * local_trace;
+        const std::size_t c_offset = trace_offset * local_interior;
+
+        for (int row = 0; row < local_interior; ++row)
+        {
+          const bool row_active = interior_active(row);
+          if (!row_active)
+          {
+            system.residual_interior[interior_offset + row] = 0.0;
+            system.f[interior_offset + row] = 0.0;
+          }
+          for (int column = 0; column < local_interior; ++column)
+          {
+            if (!row_active || !interior_active(column))
+            {
+              system.a[a_offset + static_cast<std::size_t>(row) *
+                                      local_interior + column] =
+                  !row_active && row == column ? 1.0 : 0.0;
+            }
+          }
+          if (!row_active)
+          {
+            for (int column = 0; column < local_trace; ++column)
+            {
+              system.b[b_offset + static_cast<std::size_t>(row) *
+                                      local_trace + column] = 0.0;
+            }
+          }
+        }
+
+        for (int row = 0; row < local_trace; ++row)
+          for (int column = 0; column < local_interior; ++column)
+            if (!interior_active(column))
+            {
+              system.c[c_offset + static_cast<std::size_t>(row) *
+                                      local_interior + column] = 0.0;
+            }
       }
       return Finite(system.residual_interior) &&
           Finite(system.residual_trace) && Finite(system.a) &&
@@ -5120,7 +5526,8 @@ struct detail::CpuNumericsCore::Implementation
       const double dt,
       double& maximum_error,
       double& maximum_relative_error,
-      const bool euler_only = false) noexcept
+      const bool euler_only = false,
+      const bool igr_scalar_only = false) noexcept
   {
     const auto assembly_orders = EffectiveAssemblyQuadratureOrders(config);
     maximum_error = 0.0;
@@ -5437,9 +5844,450 @@ struct detail::CpuNumericsCore::Implementation
     {
       return false;
     }
-    const int components = IsIgr() && !euler_only
-        ? 5 : cpu_conserved_components;
-    for (int component = 0; component < components; ++component)
+    const int first_component = igr_scalar_only ? 4 : 0;
+    const int components = igr_scalar_only
+        ? 5 : IsIgr() && !euler_only ? 5 : cpu_conserved_components;
+    if (igr_scalar_only && !IsIgr()) return false;
+    for (int component = first_component; component < components; ++component)
+    {
+      const double error = std::abs(global_balance[component]);
+      const double relative =
+          dg::hdg::generic::EulerHdgConservationRelativeError(
+              error, global_scale[component], global_domain_measure);
+      maximum_error = std::max(maximum_error, error);
+      maximum_relative_error = std::max(maximum_relative_error, relative);
+    }
+    return Finite(maximum_error) && Finite(maximum_relative_error);
+  }
+
+  /**
+   * Verify the principal RODAS3 conservative update for the differential U4
+   * variables.  For the autonomous singular-mass residual convention used by
+   * Assemble, each stage satisfies
+   *
+   *   M k_i = -h [R(Y_i) + R'_n d_i],
+   *   d_i = gamma k_i + sum_{j<i} Gamma_ij k_j.
+   *
+   * Summing constant Euler test rows, cancelling the algebraic interior-face
+   * rows, and applying the principal weights gives
+   *
+   *   C M (U_{n+1}-U_n) - h S
+   *     + h sum_i b_i [B(Y_i) + DB_n d_i] = 0.
+   *
+   * The boundary flux and its frozen directional derivative below call the
+   * same flux, LLF active-branch derivative, and IGR Jacobian helpers as the
+   * exact stage assembler.  In particular, this is a physical-boundary
+   * balance rather than a reconstruction identity.  The final algebraic
+   * projection leaves U4 unchanged; its trace must not replace any Y_i here.
+   */
+  bool RodasConservationBalance(
+      const double dt, double& maximum_error,
+      double& maximum_relative_error) noexcept
+  {
+    using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
+    maximum_error = 0.0;
+    maximum_relative_error = 0.0;
+    CpuSlotStorage* const candidate = Candidate();
+    bool local_ok = IsRodas3() && candidate && rodas_base_trace_grid &&
+        Finite(dt) && dt > 0.0 && external_source && old_interior &&
+        iterate_interior && trial_interior && iterate_trace && trial_trace &&
+        candidate->interior.size() ==
+            static_cast<std::size_t>(iterate_interior->Size()) &&
+        candidate->trace.size() ==
+            static_cast<std::size_t>(iterate_true_trace.Size()) &&
+        rodas_base_interior.size() == candidate->interior.size() &&
+        rodas_base_trace.size() == candidate->trace.size() &&
+        rodas_conservation_direction_interior.size() ==
+            candidate->interior.size() &&
+        rodas_conservation_direction_trace.size() == candidate->trace.size();
+    for (const auto& stage : rodas_stage_interior)
+      local_ok = local_ok && stage.size() == candidate->interior.size();
+    for (const auto& stage : rodas_stage_trace)
+      local_ok = local_ok && stage.size() == candidate->trace.size();
+
+    const auto restore_candidate = [&]() noexcept
+    {
+      const bool assigned = candidate &&
+          Assign(*iterate_interior, candidate->interior) &&
+          Assign(iterate_true_trace, candidate->trace);
+      return CollectiveAll(assigned) &&
+          LoadTrace(iterate_true_trace, *iterate_trace);
+    };
+
+    const bool base_trace_assigned = local_ok &&
+        Assign(trial_true_trace, rodas_base_trace);
+    if (!CollectiveAll(base_trace_assigned) ||
+        !LoadTrace(trial_true_trace, *rodas_base_trace_grid))
+    {
+      static_cast<void>(restore_candidate());
+      return false;
+    }
+
+    const auto assembly_orders = EffectiveAssemblyQuadratureOrders(config);
+    std::array<double, cpu_conserved_components> local_balance{};
+    std::array<double, cpu_conserved_components> local_scale{};
+    double local_domain_measure = 0.0;
+    try
+    {
+      // The candidate is still loaded here.  Integrate the actual principal
+      // U4 change and the autonomous, state-independent source once.
+      for (int element = 0; element < mesh->GetNE() && local_ok; ++element)
+      {
+        const mfem::FiniteElement* finite_element =
+            interior_space->GetFE(element);
+        mfem::ElementTransformation* transformation =
+            mesh->GetElementTransformation(element);
+        if (!finite_element || !transformation)
+        {
+          local_ok = false;
+          break;
+        }
+        const int* interior_vdofs = element_interior_vdofs.data() +
+            static_cast<std::size_t>(element) * local_interior;
+        const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
+            finite_element->GetGeomType(), assembly_orders.volume_order);
+        for (int q = 0; q < volume_rule.GetNPoints() && local_ok; ++q)
+        {
+          const mfem::IntegrationPoint& point = volume_rule.IntPoint(q);
+          transformation->SetIntPoint(&point);
+          finite_element->CalcShape(point, volume_shape_workspace);
+          State current{}, previous{}, source{};
+          local_ok = Interpolate(*iterate_interior, interior_vdofs,
+                                 scalar_interior_dofs,
+                                 volume_shape_workspace, current) &&
+              Interpolate(*old_interior, interior_vdofs,
+                          scalar_interior_dofs,
+                          volume_shape_workspace, previous) &&
+              Interpolate(*external_source, interior_vdofs,
+                          scalar_interior_dofs,
+                          volume_shape_workspace, source);
+          const double weight = point.weight * transformation->Weight();
+          local_ok = local_ok && Finite(weight) && weight > 0.0;
+          if (!local_ok) break;
+          local_domain_measure += weight;
+          for (int component = 0;
+               component < cpu_conserved_components; ++component)
+          {
+            const double change =
+                weight * (current[component] - previous[component]);
+            const double forcing = dt * weight * source[component];
+            local_balance[component] += change - forcing;
+            local_scale[component] +=
+                std::abs(change) + std::abs(forcing);
+          }
+        }
+      }
+    }
+    catch (...)
+    {
+      local_ok = false;
+    }
+
+    if (!CollectiveAll(local_ok))
+    {
+      static_cast<void>(restore_candidate());
+      return false;
+    }
+
+    const bool regularized = IsIgr();
+    const double beta = regularized
+        ? borrowed_request->numerical_policy.stabilization.beta : 0.0;
+    for (std::size_t stage = 0;
+         stage < Coefficients::stage_count && local_ok; ++stage)
+    {
+      // Load the nonlinear residual state Y_i and form the complete frozen-J
+      // direction d_i, including the diagonal gamma*k_i term.
+      if (!LoadRodasStageState(stage))
+      {
+        local_ok = false;
+        break;
+      }
+      std::fill(rodas_conservation_direction_interior.begin(),
+                rodas_conservation_direction_interior.end(), 0.0);
+      std::fill(rodas_conservation_direction_trace.begin(),
+                rodas_conservation_direction_trace.end(), 0.0);
+      for (std::size_t term = 0; term <= stage; ++term)
+      {
+        const double coefficient = term == stage
+            ? Coefficients::common_gamma.value()
+            : Coefficients::Gamma(stage, term);
+        for (std::size_t index = 0;
+             index < rodas_conservation_direction_interior.size(); ++index)
+        {
+          rodas_conservation_direction_interior[index] += coefficient *
+              rodas_stage_interior[term][index];
+        }
+        for (std::size_t index = 0;
+             index < rodas_conservation_direction_trace.size(); ++index)
+        {
+          rodas_conservation_direction_trace[index] += coefficient *
+              rodas_stage_trace[term][index];
+        }
+      }
+      local_ok = Finite(rodas_conservation_direction_interior) &&
+          Finite(rodas_conservation_direction_trace) &&
+          Assign(*trial_interior, rodas_conservation_direction_interior) &&
+          Assign(trial_true_trace, rodas_conservation_direction_trace);
+      if (!CollectiveAll(local_ok) ||
+          !LoadTrace(trial_true_trace, *trial_trace))
+      {
+        local_ok = false;
+        break;
+      }
+
+      const double principal_weight = Coefficients::PrincipalWeight(stage);
+      try
+      {
+        for (int element = 0; element < mesh->GetNE() && local_ok; ++element)
+        {
+          const mfem::FiniteElement* finite_element =
+              interior_space->GetFE(element);
+          if (!finite_element)
+          {
+            local_ok = false;
+            break;
+          }
+          const int* interior_vdofs = element_interior_vdofs.data() +
+              static_cast<std::size_t>(element) * local_interior;
+          for (int local_face = 0;
+               local_face < 4 && local_ok; ++local_face)
+          {
+            const int face = element_faces[
+                static_cast<std::size_t>(element) * 4 + local_face];
+            mfem::FaceElementTransformations* face_transformation =
+                mesh->GetFaceElementTransformations(face);
+            const mfem::FiniteElement* trace_element =
+                trace_space->GetFaceElement(face);
+            const bool physical_boundary = face >= 0 &&
+                face < static_cast<int>(shared_faces.size()) &&
+                shared_faces[static_cast<std::size_t>(face)] == 0 &&
+                face_transformation && face_transformation->Elem2No < 0 &&
+                mesh->GetFaceToBdrElMap()[face] >= 0;
+            if (!physical_boundary) continue;
+            if (!face_transformation || !face_transformation->Face ||
+                !trace_element)
+            {
+              local_ok = false;
+              break;
+            }
+            const bool element_one =
+                face_transformation->Elem1No == element;
+            if (!element_one && face_transformation->Elem2No != element)
+            {
+              local_ok = false;
+              break;
+            }
+            const int trace_offset = local_face * scalar_trace_dofs *
+                trace_components;
+            const int* face_trace_vdofs = signed_trace_dofs.data() +
+                static_cast<std::size_t>(element) * local_trace +
+                trace_offset;
+            const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
+                trace_element->GetGeomType(), assembly_orders.face_order);
+            for (int q = 0; q < face_rule.GetNPoints() && local_ok; ++q)
+            {
+              const mfem::IntegrationPoint& point = face_rule.IntPoint(q);
+              face_transformation->SetAllIntPoints(&point);
+              const mfem::IntegrationPoint& element_point = element_one
+                  ? face_transformation->GetElement1IntPoint()
+                  : face_transformation->GetElement2IntPoint();
+              mfem::CalcOrtho(face_transformation->Face->Jacobian(),
+                              scaled_normal_workspace);
+              const double normal_norm = scaled_normal_workspace.Norml2();
+              const double face_measure =
+                  face_transformation->Face->Weight();
+              if (!Finite(normal_norm) || !(normal_norm > 0.0) ||
+                  !Finite(face_measure) || !(face_measure > 0.0))
+              {
+                local_ok = false;
+                break;
+              }
+              const double side = element_one ? 1.0 : -1.0;
+              const std::array<double, 2> normal{{
+                  side * scaled_normal_workspace[0] / normal_norm,
+                  side * scaled_normal_workspace[1] / normal_norm}};
+              finite_element->CalcShape(element_point,
+                                        face_interior_shape_workspace);
+              trace_element->CalcShape(point, face_trace_shape_workspace);
+
+              State stage_interior{}, stage_trace{}, base_interior{},
+                  base_trace{}, direction_interior{}, direction_trace{};
+              local_ok = Interpolate(
+                      *iterate_interior, interior_vdofs,
+                      scalar_interior_dofs, face_interior_shape_workspace,
+                      stage_interior) &&
+                  Interpolate(*iterate_trace, face_trace_vdofs,
+                              scalar_trace_dofs,
+                              face_trace_shape_workspace, stage_trace) &&
+                  Interpolate(*old_interior, interior_vdofs,
+                              scalar_interior_dofs,
+                              face_interior_shape_workspace, base_interior) &&
+                  Interpolate(*rodas_base_trace_grid, face_trace_vdofs,
+                              scalar_trace_dofs,
+                              face_trace_shape_workspace, base_trace) &&
+                  Interpolate(*trial_interior, interior_vdofs,
+                              scalar_interior_dofs,
+                              face_interior_shape_workspace,
+                              direction_interior) &&
+                  Interpolate(*trial_trace, face_trace_vdofs,
+                              scalar_trace_dofs,
+                              face_trace_shape_workspace, direction_trace);
+              if (!local_ok) break;
+
+              State boundary_flux{};
+              State boundary_derivative{};
+              if (regularized)
+              {
+                double stage_sigma_hat = 0.0;
+                double base_sigma_hat = 0.0;
+                double direction_sigma_hat = 0.0;
+                Matrix45 ignored{};
+                Matrix45 base_jacobian{};
+                local_ok = InterpolateComponent(
+                        *iterate_trace, face_trace_vdofs,
+                        scalar_trace_dofs, face_trace_shape_workspace, 4,
+                        stage_sigma_hat) &&
+                    InterpolateComponent(
+                        *rodas_base_trace_grid, face_trace_vdofs,
+                        scalar_trace_dofs, face_trace_shape_workspace, 4,
+                        base_sigma_hat) &&
+                    InterpolateComponent(
+                        *trial_trace, face_trace_vdofs,
+                        scalar_trace_dofs, face_trace_shape_workspace, 4,
+                        direction_sigma_hat) &&
+                    RegularizedNormalFlux(stage_trace, stage_sigma_hat,
+                                          normal, boundary_flux, ignored);
+                State ignored_base_flux{};
+                local_ok = local_ok && RegularizedNormalFlux(
+                    base_trace, base_sigma_hat, normal,
+                    ignored_base_flux, base_jacobian);
+                for (int component = 0;
+                     component < cpu_conserved_components && local_ok;
+                     ++component)
+                {
+                  boundary_flux[component] += beta *
+                      (stage_interior[component] -
+                       stage_trace[component]);
+                  for (int variable = 0;
+                       variable < cpu_conserved_components; ++variable)
+                  {
+                    boundary_derivative[component] +=
+                        base_jacobian[component][variable] *
+                        direction_trace[variable];
+                  }
+                  boundary_derivative[component] +=
+                      base_jacobian[component][4] * direction_sigma_hat +
+                      beta * (direction_interior[component] -
+                              direction_trace[component]);
+                }
+              }
+              else
+              {
+                Matrix4 base_jacobian{};
+                double stage_stabilization = 0.0;
+                double base_stabilization = 0.0;
+                State stabilization_interior_gradient{};
+                State stabilization_trace_gradient{};
+                local_ok = NormalFlux(stage_trace, normal, boundary_flux) &&
+                    BorrowedEulerLlfStabilization(
+                        stage_interior, stage_trace, normal,
+                        stage_stabilization) &&
+                    NormalFluxJacobian(base_trace, normal, base_jacobian) &&
+                    BorrowedEulerLlfStabilizationGradient(
+                        base_interior, base_trace, normal,
+                        base_stabilization,
+                        stabilization_interior_gradient,
+                        stabilization_trace_gradient);
+                double stabilization_direction = 0.0;
+                for (int variable = 0;
+                     variable < cpu_conserved_components && local_ok;
+                     ++variable)
+                {
+                  stabilization_direction +=
+                      stabilization_interior_gradient[variable] *
+                          direction_interior[variable] +
+                      stabilization_trace_gradient[variable] *
+                          direction_trace[variable];
+                }
+                for (int component = 0;
+                     component < cpu_conserved_components && local_ok;
+                     ++component)
+                {
+                  boundary_flux[component] += stage_stabilization *
+                      (stage_interior[component] -
+                       stage_trace[component]);
+                  for (int variable = 0;
+                       variable < cpu_conserved_components; ++variable)
+                  {
+                    boundary_derivative[component] +=
+                        base_jacobian[component][variable] *
+                        direction_trace[variable];
+                  }
+                  boundary_derivative[component] +=
+                      base_stabilization *
+                          (direction_interior[component] -
+                           direction_trace[component]) +
+                      stabilization_direction *
+                          (base_interior[component] -
+                           base_trace[component]);
+                }
+              }
+              const double weight = point.weight * face_measure;
+              local_ok = local_ok && Finite(weight) && weight > 0.0 &&
+                  Finite(boundary_flux) && Finite(boundary_derivative);
+              for (int component = 0;
+                   component < cpu_conserved_components && local_ok;
+                   ++component)
+              {
+                const double contribution = dt * principal_weight *
+                    weight * (boundary_flux[component] +
+                              boundary_derivative[component]);
+                local_balance[component] += contribution;
+                local_scale[component] += dt * std::abs(principal_weight) *
+                    weight * (std::abs(boundary_flux[component]) +
+                              std::abs(boundary_derivative[component]));
+                local_ok = Finite(local_balance[component]) &&
+                    Finite(local_scale[component]);
+              }
+            }
+          }
+        }
+      }
+      catch (...)
+      {
+        local_ok = false;
+      }
+      local_ok = CollectiveAll(local_ok);
+    }
+
+    const bool restored = restore_candidate();
+    if (!CollectiveAll(local_ok && restored && Finite(local_balance) &&
+                       Finite(local_scale) && Finite(local_domain_measure) &&
+                       local_domain_measure >= 0.0))
+    {
+      return false;
+    }
+    std::array<double, cpu_conserved_components> global_balance{};
+    std::array<double, cpu_conserved_components> global_scale{};
+    double global_domain_measure = 0.0;
+    const bool reduced = MPI_Allreduce(
+            local_balance.data(), global_balance.data(),
+            static_cast<int>(global_balance.size()), MPI_DOUBLE, MPI_SUM,
+            communicator) == MPI_SUCCESS &&
+        MPI_Allreduce(local_scale.data(), global_scale.data(),
+                      static_cast<int>(global_scale.size()), MPI_DOUBLE,
+                      MPI_SUM, communicator) == MPI_SUCCESS &&
+        MPI_Allreduce(&local_domain_measure, &global_domain_measure, 1,
+                      MPI_DOUBLE, MPI_SUM, communicator) == MPI_SUCCESS;
+    if (!CollectiveAll(reduced && Finite(global_balance) &&
+                       Finite(global_scale) &&
+                       Finite(global_domain_measure) &&
+                       global_domain_measure > 0.0))
+    {
+      return false;
+    }
+    for (int component = 0;
+         component < cpu_conserved_components; ++component)
     {
       const double error = std::abs(global_balance[component]);
       const double relative =
@@ -5524,6 +6372,7 @@ struct detail::CpuNumericsCore::Implementation
                            std::uint64_t& matrix_refresh_generation) noexcept
   {
     matrix_refresh_generation = 0;
+    reusable_operator_generation = 0;
     double* diagonal_data = nullptr;
     double* offdiagonal_data = nullptr;
     bool outgoing_ready = false;
@@ -5710,6 +6559,65 @@ struct detail::CpuNumericsCore::Implementation
     return true;
   }
 
+  bool RefreshCondensedRightHandSide(
+      const LocalSystem& system,
+      const std::uint64_t expected_operator_generation) noexcept
+  {
+    bool local_ready = expected_operator_generation != 0 &&
+        reusable_operator_generation == expected_operator_generation &&
+        complete_factor_setup_generation == expected_operator_generation &&
+        pending_factor_setup_generation == 0 &&
+        system.elements == mesh->GetNE() &&
+        system.interior_dofs == local_interior &&
+        system.trace_dofs == local_trace;
+    try
+    {
+      if (local_ready && system.elements > 0)
+      {
+        local_ready = condensation.RefreshRightHandSide(
+            AsConst(View(system.f.data(), system.elements,
+                         local_interior, 1)),
+            AsConst(View(system.g.data(), system.elements,
+                         local_trace, 1)),
+            View(reduced_rhs.data(), system.elements, local_trace, 1)) ==
+            core::Status::success;
+      }
+      local_trace_rhs = 0.0;
+      for (int element = 0; element < system.elements && local_ready; ++element)
+        for (int row = 0; row < local_trace; ++row)
+        {
+          double sign = 1.0;
+          const int dof = Decode(signed_trace_dofs[
+              static_cast<std::size_t>(element) * local_trace + row], sign);
+          if (dof < 0 || dof >= local_trace_rhs.Size())
+          {
+            local_ready = false;
+            break;
+          }
+          local_trace_rhs[dof] += sign * reduced_rhs[
+              static_cast<std::size_t>(element) * local_trace + row];
+        }
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    if (!CollectiveAll(local_ready)) return false;
+
+    bool true_rhs_ready = true;
+    try
+    {
+      trace_space->Dof_TrueDof_Matrix()->MultTranspose(
+          local_trace_rhs, true_trace_rhs);
+      true_rhs_ready = Finite(true_trace_rhs);
+    }
+    catch (...)
+    {
+      true_rhs_ready = false;
+    }
+    return CollectiveAll(true_rhs_ready);
+  }
+
   bool SolveTrace(const std::uint64_t expected_matrix_refresh_generation,
                   const generic::EulerHdgLinearSolveRole role,
                   double& true_relative_residual, int& iterations,
@@ -5717,7 +6625,9 @@ struct detail::CpuNumericsCore::Implementation
                   StateHash& factor_hash,
                   StateHash& solution_hash,
                   std::uint64_t& factor_setup_generation,
-                  bool& factor_setup_current) noexcept
+                  bool& factor_setup_current,
+                  const bool retain_operator = false,
+                  const bool reuse_operator = false) noexcept
   {
     factor_setup_generation = 0;
     factor_setup_current = false;
@@ -5733,11 +6643,19 @@ struct detail::CpuNumericsCore::Implementation
     bool rhs_ready = true;
     try
     {
-      if (expected_matrix_refresh_generation == 0 ||
-          pending_factor_setup_generation !=
-              expected_matrix_refresh_generation ||
-          complete_factor_setup_generation >=
-              expected_matrix_refresh_generation)
+      const bool generation_ready = reuse_operator
+          ? expected_matrix_refresh_generation != 0 &&
+              reusable_operator_generation ==
+                  expected_matrix_refresh_generation &&
+              pending_factor_setup_generation == 0 &&
+              complete_factor_setup_generation ==
+                  expected_matrix_refresh_generation
+          : expected_matrix_refresh_generation != 0 &&
+              pending_factor_setup_generation ==
+                  expected_matrix_refresh_generation &&
+              complete_factor_setup_generation <
+                  expected_matrix_refresh_generation;
+      if (!generation_ready)
       {
         rhs_ready = false;
       }
@@ -5760,10 +6678,10 @@ struct detail::CpuNumericsCore::Implementation
     }
     if (!CollectiveAll(rhs_ready)) { return false; }
 
-    factor_setup_generation = pending_factor_setup_generation;
-    factor_setup_current = factor_setup_generation ==
-        expected_matrix_refresh_generation;
-    if (!CollectiveAll(factor_setup_current)) { return false; }
+    factor_setup_generation = expected_matrix_refresh_generation;
+    factor_setup_current = !reuse_operator &&
+        pending_factor_setup_generation == expected_matrix_refresh_generation;
+    if (!CollectiveAll(reuse_operator || factor_setup_current)) return false;
 
     // This attests the exact Schur input and frozen ILU configuration only;
     // HYPRE does not expose stable factor bytes for hashing.
@@ -5804,6 +6722,7 @@ struct detail::CpuNumericsCore::Implementation
       {
         complete_factor_setup_generation = factor_setup_generation;
         pending_factor_setup_generation = 0;
+        reusable_operator_generation = 0;
         return false;
       }
 
@@ -5836,6 +6755,7 @@ struct detail::CpuNumericsCore::Implementation
       {
         complete_factor_setup_generation = factor_setup_generation;
         pending_factor_setup_generation = 0;
+        reusable_operator_generation = 0;
         return false;
       }
 
@@ -5861,6 +6781,8 @@ struct detail::CpuNumericsCore::Implementation
         catch (...) { solution_ready = false; }
         complete_factor_setup_generation = factor_setup_generation;
         pending_factor_setup_generation = 0;
+        reusable_operator_generation = retain_operator
+            ? factor_setup_generation : 0;
         return CollectiveAll(solution_ready);
       }
 
@@ -5872,6 +6794,7 @@ struct detail::CpuNumericsCore::Implementation
     }
     complete_factor_setup_generation = factor_setup_generation;
     pending_factor_setup_generation = 0;
+    reusable_operator_generation = 0;
     return false;
   }
 
@@ -6041,6 +6964,305 @@ struct detail::CpuNumericsCore::Implementation
     }
     if (!CollectiveAll(local_ready)) { return false; }
     return LoadTrace(iterate_true_trace, *iterate_trace);
+  }
+
+  bool ApplyRodasAlgebraicIncrement() noexcept
+  {
+    bool local_ready = IsRodas3() && iterate_interior &&
+        iterate_interior->Size() % interior_components == 0 &&
+        iterate_true_trace.Size() == true_increment.Size() &&
+        grid_interior_increment.size() ==
+            static_cast<std::size_t>(iterate_interior->Size());
+    double frozen_increment_maximum = 0.0;
+    double frozen_state_maximum = 0.0;
+    try
+    {
+      double* const interior = local_ready
+          ? iterate_interior->HostReadWrite() : nullptr;
+      double* const trace = local_ready
+          ? iterate_true_trace.HostReadWrite() : nullptr;
+      const double* const trace_increment = local_ready
+          ? true_increment.HostRead() : nullptr;
+      local_ready = local_ready &&
+          (interior || iterate_interior->Size() == 0) &&
+          (trace || iterate_true_trace.Size() == 0) &&
+          (trace_increment || true_increment.Size() == 0);
+      const int scalar_interior = local_ready
+          ? iterate_interior->Size() / interior_components : 0;
+      for (int component = 0;
+           component < interior_components && local_ready; ++component)
+        for (int scalar = 0; scalar < scalar_interior; ++scalar)
+        {
+          const int index = ByNodes(scalar, scalar_interior, component);
+          const double increment = grid_interior_increment[
+              static_cast<std::size_t>(index)];
+          if (component < cpu_conserved_components)
+          {
+            frozen_increment_maximum =
+                std::max(frozen_increment_maximum, std::abs(increment));
+            frozen_state_maximum =
+                std::max(frozen_state_maximum, std::abs(interior[index]));
+          }
+          else
+          {
+            interior[index] += increment;
+          }
+        }
+      for (int index = 0;
+           index < iterate_true_trace.Size() && local_ready; ++index)
+      {
+        trace[index] += trace_increment[index];
+      }
+      const double frozen_tolerance = std::max(
+          64.0 * std::numeric_limits<double>::epsilon() *
+              (1.0 + frozen_state_maximum),
+          config.true_residual_tolerance * (1.0 + frozen_state_maximum));
+      local_ready = local_ready && Finite(frozen_increment_maximum) &&
+          frozen_increment_maximum <= frozen_tolerance &&
+          Finite(*iterate_interior) && Finite(iterate_true_trace);
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    if (!CollectiveAll(local_ready)) return false;
+    return LoadTrace(iterate_true_trace, *iterate_trace);
+  }
+
+  bool SaveRodasBaseState() noexcept
+  {
+    bool local_ready = IsRodas3() &&
+        rodas_base_interior.size() ==
+            static_cast<std::size_t>(iterate_interior->Size()) &&
+        rodas_base_trace.size() ==
+            static_cast<std::size_t>(iterate_true_trace.Size());
+    try
+    {
+      const double* const interior = local_ready
+          ? iterate_interior->HostRead() : nullptr;
+      const double* const trace = local_ready
+          ? iterate_true_trace.HostRead() : nullptr;
+      local_ready = local_ready &&
+          (interior || iterate_interior->Size() == 0) &&
+          (trace || iterate_true_trace.Size() == 0);
+      if (local_ready)
+      {
+        std::copy(interior, interior + iterate_interior->Size(),
+                  rodas_base_interior.begin());
+        std::copy(trace, trace + iterate_true_trace.Size(),
+                  rodas_base_trace.begin());
+      }
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    return CollectiveAll(local_ready && Finite(rodas_base_interior) &&
+                         Finite(rodas_base_trace));
+  }
+
+  bool ProjectRodasAlgebraicState(
+      const CpuFailureInjection& injection,
+      CpuAttemptEvidence& attempt,
+      double& maximum_true_residual,
+      double& algebraic_residual,
+      double& correction_norm,
+      CpuFailurePhase& failure_phase,
+      bool& injected_failure) noexcept
+  {
+    failure_phase = CpuFailurePhase::none;
+    injected_failure = false;
+    algebraic_residual = std::numeric_limits<double>::infinity();
+    correction_norm = std::numeric_limits<double>::infinity();
+    const auto fail_phase = [&](const CpuFailurePhase phase,
+                                const bool injected) noexcept
+    {
+      failure_phase = phase;
+      injected_failure = injected;
+      reusable_operator_generation = 0;
+      return false;
+    };
+    const auto enter_phase = [&](const CpuFailurePhase phase) noexcept
+    {
+      return EnterPhase(injection, phase);
+    };
+    bool snapshot_ready = IsRodas3() &&
+        rodas_combination_interior.size() ==
+            static_cast<std::size_t>(iterate_interior->Size()) &&
+        rodas_combination_trace.size() ==
+            static_cast<std::size_t>(iterate_true_trace.Size());
+    try
+    {
+      const double* const interior = snapshot_ready
+          ? iterate_interior->HostRead() : nullptr;
+      const double* const trace = snapshot_ready
+          ? iterate_true_trace.HostRead() : nullptr;
+      snapshot_ready = snapshot_ready &&
+          (interior || iterate_interior->Size() == 0) &&
+          (trace || iterate_true_trace.Size() == 0);
+      if (snapshot_ready)
+      {
+        std::copy(interior, interior + iterate_interior->Size(),
+                  rodas_combination_interior.begin());
+        std::copy(trace, trace + iterate_true_trace.Size(),
+                  rodas_combination_trace.begin());
+      }
+    }
+    catch (...)
+    {
+      snapshot_ready = false;
+    }
+    if (!CollectiveAll(snapshot_ready))
+      return fail_phase(CpuFailurePhase::setup, false);
+
+    const EulerTimeMassRates spatial_only{0.0, 0.0};
+    const double residual_allowance = std::max(
+        config.nonlinear_tolerance,
+        1024.0 * std::numeric_limits<double>::epsilon());
+    bool converged = false;
+    constexpr int maximum_projection_updates = 6;
+    for (int update = 0; update <= maximum_projection_updates; ++update)
+    {
+      if (!enter_phase(CpuFailurePhase::assembly))
+        return fail_phase(CpuFailurePhase::assembly, true);
+      if (!Assemble(*iterate_interior, *iterate_trace, current_system,
+                    EffectiveAssemblyQuadratureOrders(config), true,
+                    nullptr, nullptr, false, &spatial_only, true) ||
+          !MaskRodasAlgebraicSystem(current_system))
+      {
+        return fail_phase(CpuFailurePhase::assembly, false);
+      }
+      ++attempt.work.complete_assemblies;
+      CompletePhase();
+      algebraic_residual = ResidualNorm(current_system);
+      if (!Finite(algebraic_residual) || algebraic_residual < 0.0)
+        return fail_phase(CpuFailurePhase::assembly, false);
+      // A large inconsistent entry state must never relax its own acceptance
+      // threshold.  This absolute algebraic residual uses the same assembled
+      // norm on every update and admits only the requested tolerance or the
+      // bounded FP64 floor.
+      if (algebraic_residual <= residual_allowance)
+      {
+        converged = true;
+        break;
+      }
+      if (update == maximum_projection_updates) break;
+
+      if (!enter_phase(CpuFailurePhase::condensation))
+        return fail_phase(CpuFailurePhase::condensation, true);
+      StateHash matrix_hash{};
+      std::uint64_t matrix_generation = 0;
+      if (!CondenseAndAssemble(current_system, matrix_hash,
+                               matrix_generation))
+      {
+        return fail_phase(CpuFailurePhase::condensation, false);
+      }
+      ++attempt.work.complete_condensations;
+      CompletePhase();
+
+      if (!enter_phase(CpuFailurePhase::trace_solve))
+        return fail_phase(CpuFailurePhase::trace_solve, true);
+      double true_residual = 0.0;
+      int iterations = 0;
+      int solve_attempts = 0;
+      int tightenings = 0;
+      StateHash factor_hash{}, solution_hash{};
+      std::uint64_t factor_generation = 0;
+      bool factor_current = false;
+      const bool solved = SolveTrace(
+          matrix_generation,
+          generic::EulerHdgLinearSolveRole::final_coherent,
+          true_residual, iterations, solve_attempts, tightenings,
+          factor_hash, solution_hash, factor_generation, factor_current);
+      const bool counts_ready = iterations >= 0 && solve_attempts >= 0 &&
+          tightenings >= 0 && attempt.linear_iterations <=
+              std::numeric_limits<int>::max() - iterations &&
+          attempt.linear_solve_attempts <=
+              std::numeric_limits<int>::max() - solve_attempts &&
+          attempt.true_residual_tightenings <=
+              std::numeric_limits<int>::max() - tightenings &&
+          attempt.final_coherent_linear_iterations <=
+              std::numeric_limits<int>::max() - iterations;
+      if (!CollectiveAll(solved && counts_ready && Finite(true_increment)))
+        return fail_phase(CpuFailurePhase::trace_solve, false);
+      attempt.linear_iterations += iterations;
+      attempt.linear_solve_attempts += solve_attempts;
+      attempt.true_residual_tightenings += tightenings;
+      attempt.final_coherent_linear_iterations += iterations;
+      if (factor_current) ++attempt.work.complete_factor_setups;
+      ++attempt.work.complete_trace_solves;
+      maximum_true_residual = std::max(maximum_true_residual, true_residual);
+      CompletePhase();
+
+      if (!enter_phase(CpuFailurePhase::recovery))
+        return fail_phase(CpuFailurePhase::recovery, true);
+      if (!Recover() || !ApplyRodasAlgebraicIncrement())
+        return fail_phase(CpuFailurePhase::recovery, false);
+      ++attempt.work.complete_recoveries;
+      CompletePhase();
+    }
+    if (!CollectiveAll(converged))
+      return fail_phase(CpuFailurePhase::recovery, false);
+
+    bool norm_ready = iterate_interior->Size() % interior_components == 0;
+    double local_squared = 0.0;
+    std::uint64_t local_count = 0;
+    try
+    {
+      const double* const interior = norm_ready
+          ? iterate_interior->HostRead() : nullptr;
+      const double* const trace = norm_ready
+          ? iterate_true_trace.HostRead() : nullptr;
+      norm_ready = norm_ready &&
+          (interior || iterate_interior->Size() == 0) &&
+          (trace || iterate_true_trace.Size() == 0);
+      const int scalar_interior = norm_ready
+          ? iterate_interior->Size() / interior_components : 0;
+      const auto add = [&](const double before, const double after) noexcept
+      {
+        const double scale = std::max({1.0, std::abs(before),
+                                       std::abs(after)});
+        const double value = (after - before) / scale;
+        local_squared += value * value;
+        ++local_count;
+        norm_ready = norm_ready && Finite(local_squared);
+      };
+      for (int component = cpu_conserved_components;
+           component < interior_components && norm_ready; ++component)
+        for (int scalar = 0; scalar < scalar_interior; ++scalar)
+        {
+          const int index = ByNodes(scalar, scalar_interior, component);
+          add(rodas_combination_interior[static_cast<std::size_t>(index)],
+              interior[index]);
+        }
+      for (int index = 0;
+           index < iterate_true_trace.Size() && norm_ready; ++index)
+      {
+        add(rodas_combination_trace[static_cast<std::size_t>(index)],
+            trace[index]);
+      }
+    }
+    catch (...)
+    {
+      norm_ready = false;
+    }
+    if (!CollectiveAll(norm_ready))
+      return fail_phase(CpuFailurePhase::recovery, false);
+    double global_squared = 0.0;
+    std::uint64_t global_count = 0;
+    const bool reduced = MPI_Allreduce(
+            &local_squared, &global_squared, 1, MPI_DOUBLE, MPI_SUM,
+            communicator) == MPI_SUCCESS &&
+        MPI_Allreduce(&local_count, &global_count, 1, MPI_UINT64_T,
+                      MPI_SUM, communicator) == MPI_SUCCESS;
+    if (!CollectiveAll(reduced && global_count > 0 &&
+                       Finite(global_squared)))
+    {
+      return fail_phase(CpuFailurePhase::recovery, false);
+    }
+    correction_norm = std::sqrt(
+        global_squared / static_cast<double>(global_count));
+    return CollectiveAll(Finite(correction_norm));
   }
 
   bool SolveScalarConstraintImpl(
@@ -6423,6 +7645,328 @@ struct detail::CpuNumericsCore::Implementation
     return CollectiveAll(copied);
   }
 
+  bool LoadRodasStageState(const std::size_t stage) noexcept
+  {
+    using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
+    bool local_ready = IsRodas3() && stage < Coefficients::stage_count;
+    try
+    {
+      local_ready = local_ready &&
+          rodas_base_interior.size() ==
+              static_cast<std::size_t>(iterate_interior->Size()) &&
+          rodas_base_trace.size() ==
+              static_cast<std::size_t>(iterate_true_trace.Size());
+      double* const interior = local_ready
+          ? iterate_interior->HostWrite() : nullptr;
+      double* const trace = local_ready
+          ? iterate_true_trace.HostWrite() : nullptr;
+      local_ready = local_ready &&
+          (interior || iterate_interior->Size() == 0) &&
+          (trace || iterate_true_trace.Size() == 0);
+      for (std::size_t index = 0;
+           index < rodas_base_interior.size() && local_ready; ++index)
+      {
+        double value = rodas_base_interior[index];
+        for (std::size_t prior = 0; prior < stage; ++prior)
+        {
+          value += Coefficients::Alpha(stage, prior) *
+              rodas_stage_interior[prior][index];
+        }
+        interior[index] = value;
+        local_ready = Finite(value);
+      }
+      for (std::size_t index = 0;
+           index < rodas_base_trace.size() && local_ready; ++index)
+      {
+        double value = rodas_base_trace[index];
+        for (std::size_t prior = 0; prior < stage; ++prior)
+        {
+          value += Coefficients::Alpha(stage, prior) *
+              rodas_stage_trace[prior][index];
+        }
+        trace[index] = value;
+        local_ready = Finite(value);
+      }
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    if (!CollectiveAll(local_ready)) return false;
+    return LoadTrace(iterate_true_trace, *iterate_trace);
+  }
+
+  bool PrepareRodasCommonShift(const double step_size) noexcept
+  {
+    using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
+    const double gamma = Coefficients::common_gamma.value();
+    if (!IsRodas3() || !Finite(step_size) || !(step_size > 0.0) ||
+        !Finite(gamma) || !(gamma > 0.0))
+    {
+      return false;
+    }
+    const EulerTimeMassRates shifted_mass{0.0,
+                                          1.0 / (gamma * step_size)};
+    const EulerTimeMassRates spatial_only{0.0, 0.0};
+    const auto quadrature_orders = EffectiveAssemblyQuadratureOrders(config);
+    if (!Assemble(*iterate_interior, *iterate_trace, rodas_operator_system,
+                  quadrature_orders, true, nullptr, nullptr, false,
+                  &shifted_mass, true) ||
+        !Assemble(*iterate_interior, *iterate_trace, trial_system,
+                  quadrature_orders, false, nullptr, nullptr, false,
+                  &spatial_only, true))
+    {
+      return false;
+    }
+    bool local_ready = rodas_operator_system.a.size() == trial_system.a.size() &&
+        rodas_mass_over_shift.size() == rodas_operator_system.a.size() &&
+        rodas_operator_system.b == trial_system.b &&
+        rodas_operator_system.c == trial_system.c &&
+        rodas_operator_system.d == trial_system.d &&
+        rodas_operator_system.f == trial_system.f &&
+        rodas_operator_system.g == trial_system.g;
+    for (std::size_t index = 0;
+         index < rodas_mass_over_shift.size() && local_ready; ++index)
+    {
+      rodas_mass_over_shift[index] =
+          rodas_operator_system.a[index] - trial_system.a[index];
+      local_ready = Finite(rodas_mass_over_shift[index]);
+    }
+    return CollectiveAll(local_ready);
+  }
+
+  bool BuildRodasStageSystem(const std::size_t stage) noexcept
+  {
+    using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
+    if (!IsRodas3() || stage >= Coefficients::stage_count) return false;
+    const LocalSystem& residual_system = stage < 2
+        ? rodas_operator_system : trial_system;
+    bool local_ready = true;
+    try
+    {
+      CopySystem(rodas_operator_system, current_system);
+      std::copy(residual_system.residual_interior.begin(),
+                residual_system.residual_interior.end(),
+                current_system.residual_interior.begin());
+      std::copy(residual_system.residual_trace.begin(),
+                residual_system.residual_trace.end(),
+                current_system.residual_trace.begin());
+      std::copy(residual_system.f.begin(), residual_system.f.end(),
+                current_system.f.begin());
+      std::copy(residual_system.g.begin(), residual_system.g.end(),
+                current_system.g.begin());
+
+      std::fill(rodas_combination_interior.begin(),
+                rodas_combination_interior.end(), 0.0);
+      std::fill(rodas_combination_trace.begin(),
+                rodas_combination_trace.end(), 0.0);
+      for (std::size_t prior = 0; prior < stage; ++prior)
+      {
+        const double coefficient = Coefficients::Gamma(stage, prior);
+        for (std::size_t index = 0;
+             index < rodas_combination_interior.size(); ++index)
+        {
+          rodas_combination_interior[index] += coefficient *
+              rodas_stage_interior[prior][index];
+        }
+        for (std::size_t index = 0;
+             index < rodas_combination_trace.size(); ++index)
+        {
+          rodas_combination_trace[index] += coefficient *
+              rodas_stage_trace[prior][index];
+        }
+      }
+
+      const double gamma = Coefficients::common_gamma.value();
+      for (int element = 0; element < current_system.elements; ++element)
+      {
+        const std::size_t element_interior =
+            static_cast<std::size_t>(element) * local_interior;
+        const std::size_t element_matrix = element_interior * local_interior;
+        for (int row = 0; row < local_interior; ++row)
+        {
+          double mass_action = 0.0;
+          for (int column = 0; column < local_interior; ++column)
+          {
+            double sign = 1.0;
+            const int dof = Decode(element_interior_vdofs[
+                element_interior + static_cast<std::size_t>(column)], sign);
+            if (dof < 0 ||
+                dof >= static_cast<int>(rodas_combination_interior.size()))
+            {
+              local_ready = false;
+              break;
+            }
+            mass_action += rodas_mass_over_shift[
+                element_matrix + static_cast<std::size_t>(row) *
+                    local_interior + column] * sign *
+                rodas_combination_interior[static_cast<std::size_t>(dof)];
+          }
+          if (!local_ready) break;
+          const std::size_t row_index =
+              element_interior + static_cast<std::size_t>(row);
+          current_system.f[row_index] =
+              (current_system.f[row_index] + mass_action) / gamma;
+          current_system.residual_interior[row_index] =
+              -current_system.f[row_index];
+          local_ready = Finite(current_system.f[row_index]);
+        }
+        if (!local_ready) break;
+      }
+      for (std::size_t index = 0;
+           index < current_system.g.size() && local_ready; ++index)
+      {
+        current_system.g[index] /= gamma;
+        current_system.residual_trace[index] = -current_system.g[index];
+        local_ready = Finite(current_system.g[index]);
+      }
+      local_ready = local_ready && Finite(rodas_combination_interior) &&
+          Finite(rodas_combination_trace) &&
+          Finite(current_system.f) && Finite(current_system.g);
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    return CollectiveAll(local_ready);
+  }
+
+  bool CaptureRodasStageIncrement(const std::size_t stage) noexcept
+  {
+    using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
+    const double gamma = Coefficients::common_gamma.value();
+    bool local_ready = IsRodas3() && stage < Coefficients::stage_count &&
+        grid_interior_increment.size() ==
+            rodas_stage_interior[stage].size() &&
+        true_increment.Size() ==
+            static_cast<int>(rodas_stage_trace[stage].size());
+    try
+    {
+      const double* const trace_increment = local_ready
+          ? true_increment.HostRead() : nullptr;
+      local_ready = local_ready &&
+          (trace_increment || true_increment.Size() == 0);
+      for (std::size_t index = 0;
+           index < grid_interior_increment.size() && local_ready; ++index)
+      {
+        rodas_stage_interior[stage][index] =
+            grid_interior_increment[index] -
+            rodas_combination_interior[index] / gamma;
+        local_ready = Finite(rodas_stage_interior[stage][index]);
+      }
+      for (std::size_t index = 0;
+           index < rodas_stage_trace[stage].size() && local_ready; ++index)
+      {
+        rodas_stage_trace[stage][index] = trace_increment[index] -
+            rodas_combination_trace[index] / gamma;
+        local_ready = Finite(rodas_stage_trace[stage][index]);
+      }
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    return CollectiveAll(local_ready);
+  }
+
+  bool FormRodasCandidate(double& temporal_error_norm) noexcept
+  {
+    using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
+    temporal_error_norm = std::numeric_limits<double>::infinity();
+    bool local_ready = IsRodas3() &&
+        rodas_base_interior.size() ==
+            static_cast<std::size_t>(iterate_interior->Size()) &&
+        rodas_base_trace.size() ==
+            static_cast<std::size_t>(iterate_true_trace.Size()) &&
+        iterate_interior->Size() % interior_components == 0;
+    double local_error_squared = 0.0;
+    double local_scale_squared = 0.0;
+    std::uint64_t local_differential_count = 0;
+    try
+    {
+      double* const interior = local_ready
+          ? iterate_interior->HostWrite() : nullptr;
+      double* const trace = local_ready
+          ? iterate_true_trace.HostWrite() : nullptr;
+      local_ready = local_ready &&
+          (interior || iterate_interior->Size() == 0) &&
+          (trace || iterate_true_trace.Size() == 0);
+      const int scalar_interior = local_ready
+          ? iterate_interior->Size() / interior_components : 0;
+      for (std::size_t index = 0;
+           index < rodas_base_interior.size() && local_ready; ++index)
+      {
+        double principal = rodas_base_interior[index];
+        for (std::size_t stage = 0; stage < Coefficients::stage_count; ++stage)
+        {
+          principal += Coefficients::PrincipalWeight(stage) *
+              rodas_stage_interior[stage][index];
+        }
+        interior[index] = principal;
+        local_ready = Finite(principal);
+      }
+      for (std::size_t index = 0;
+           index < rodas_base_trace.size() && local_ready; ++index)
+      {
+        double principal = rodas_base_trace[index];
+        for (std::size_t stage = 0; stage < Coefficients::stage_count; ++stage)
+        {
+          principal += Coefficients::PrincipalWeight(stage) *
+              rodas_stage_trace[stage][index];
+        }
+        trace[index] = principal;
+        local_ready = Finite(principal);
+      }
+      for (int component = 0;
+           component < cpu_conserved_components && local_ready; ++component)
+        for (int scalar = 0; scalar < scalar_interior; ++scalar)
+        {
+          const int index = ByNodes(scalar, scalar_interior, component);
+          double estimate = 0.0;
+          for (std::size_t stage = 0;
+               stage < Coefficients::stage_count; ++stage)
+          {
+            estimate += Coefficients::ErrorWeight(stage) *
+                rodas_stage_interior[stage][static_cast<std::size_t>(index)];
+          }
+          const double scale = std::max(
+              {1.0, std::abs(rodas_base_interior[
+                        static_cast<std::size_t>(index)]),
+               std::abs(interior[index])});
+          local_error_squared += (estimate / scale) * (estimate / scale);
+          ++local_differential_count;
+          local_scale_squared += 1.0;
+          local_ready = Finite(local_error_squared);
+        }
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    if (!CollectiveAll(local_ready)) return false;
+    double global_error_squared = 0.0;
+    double global_scale_squared = 0.0;
+    std::uint64_t global_differential_count = 0;
+    const bool reduced = MPI_Allreduce(
+            &local_error_squared, &global_error_squared, 1, MPI_DOUBLE,
+            MPI_SUM, communicator) == MPI_SUCCESS &&
+        MPI_Allreduce(&local_scale_squared, &global_scale_squared, 1,
+                      MPI_DOUBLE, MPI_SUM, communicator) == MPI_SUCCESS &&
+        MPI_Allreduce(&local_differential_count,
+                      &global_differential_count, 1, MPI_UINT64_T,
+                      MPI_SUM, communicator) == MPI_SUCCESS;
+    if (!CollectiveAll(reduced && global_differential_count > 0 &&
+                       global_scale_squared > 0.0 &&
+                       Finite(global_error_squared)))
+    {
+      return false;
+    }
+    temporal_error_norm = std::sqrt(
+        global_error_squared / static_cast<double>(global_differential_count));
+    if (!CollectiveAll(Finite(temporal_error_norm))) return false;
+    return LoadTrace(iterate_true_trace, *iterate_trace);
+  }
+
   bool StoreCandidate() noexcept
   {
     CpuSlotStorage* candidate = Candidate();
@@ -6437,6 +7981,10 @@ struct detail::CpuNumericsCore::Implementation
     return Copy(*iterate_interior, candidate->interior) &&
         Copy(iterate_true_trace, candidate->trace);
   }
+
+  CpuNumericalResult ExecuteRodas3(const AttemptIdentity&,
+                                   const StateCoordinates&,
+                                   const CpuFailureInjection&) noexcept;
 
 };
 
@@ -6644,11 +8192,14 @@ bool detail::CpuNumericsCore::InitializeBorrowedEuler(
       request.numerical_policy.stabilization.kind == generic::RegularizationKind::igr
           ? "igr.scalar.traced.alpha-beta.v1"
           : ::dg::hdg::runtime::borrowed_euler_llf_stabilization_id);
-  tuple.time_treatment = StableIdentity::Copy(
+  const std::string_view time_identity =
       request.time_treatment ==
               generic::EulerHdgTimeTreatment::partitioned_backward_euler
-          ? "partitioned-backward-euler.v1"
-          : "backward-euler.v1");
+          ? std::string_view{"partitioned-backward-euler.v1"}
+          : request.time_treatment == generic::EulerHdgTimeTreatment::rodas3
+          ? std::string_view{"rodas3-common-gamma.v1"}
+          : std::string_view{"backward-euler.v1"};
+  tuple.time_treatment = StableIdentity::Copy(time_identity);
   tuple.backend = StableIdentity::Copy("cpu.host.v1");
   tuple.precision = StableIdentity::Copy("fp64.v1");
 
@@ -6829,6 +8380,7 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
   if (!implementation_) { return false; }
   Implementation& state = *implementation_;
   const bool regularized = state.IsIgr();
+  const bool exact_rodas_jacobian = state.IsRodas3();
   const CpuSlotStorage* const committed = state.Committed();
   bool local_valid = state.initialized && state.IsBorrowed() && committed &&
       state.mesh && state.interior_space && state.trace_space &&
@@ -6979,16 +8531,22 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
   const auto quadrature_orders =
       generic::ResolveEulerHdgAssemblyQuadratureOrders(numerical_policy);
   std::vector<double> frozen_borrowed_llf;
-  local_valid = state.Assemble(*base_interior, *base_trace,
-                               state.current_system, quadrature_orders, false,
-                               nullptr,
-                               regularized ? nullptr : &frozen_borrowed_llf);
+  std::vector<double> evaluated_borrowed_llf;
+  local_valid = state.Assemble(
+      *base_interior, *base_trace, state.current_system, quadrature_orders,
+      false, nullptr,
+      regularized ? nullptr
+                  : exact_rodas_jacobian ? &evaluated_borrowed_llf
+                                         : &frozen_borrowed_llf,
+      false, nullptr, exact_rodas_jacobian);
+  const std::vector<double>& base_borrowed_llf = exact_rodas_jacobian
+      ? evaluated_borrowed_llf : frozen_borrowed_llf;
   local_valid = local_valid &&
-      (regularized || (!frozen_borrowed_llf.empty() &&
-                       Finite(frozen_borrowed_llf) &&
+      (regularized || (!base_borrowed_llf.empty() &&
+                       Finite(base_borrowed_llf) &&
                        std::all_of(
-                           frozen_borrowed_llf.begin(),
-                           frozen_borrowed_llf.end(),
+                           base_borrowed_llf.begin(),
+                           base_borrowed_llf.end(),
                            [](const double stabilization)
                            { return stabilization < cpu_fixed_tau; })));
   if (!state.CollectiveAll(local_valid)) { return false; }
@@ -7249,12 +8807,13 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
   std::vector<double> difference_d;
   std::vector<double> difference_combined_interior;
   std::vector<double> difference_combined_trace;
-  const bool interior_difference_ready =
-      central_difference(true, false, true, difference_a, difference_c);
-  const bool trace_difference_ready =
-      central_difference(false, true, true, difference_b, difference_d);
+  const bool freeze_nonlinearities = !exact_rodas_jacobian;
+  const bool interior_difference_ready = central_difference(
+      true, false, freeze_nonlinearities, difference_a, difference_c);
+  const bool trace_difference_ready = central_difference(
+      false, true, freeze_nonlinearities, difference_b, difference_d);
   const bool combined_difference_ready = central_difference(
-      true, true, true, difference_combined_interior,
+      true, true, freeze_nonlinearities, difference_combined_interior,
       difference_combined_trace);
   if (!interior_difference_ready || !trace_difference_ready ||
       !combined_difference_ready)
@@ -7263,7 +8822,8 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
   }
   std::vector<double> refreshed_combined_interior;
   std::vector<double> refreshed_combined_trace;
-  const bool refreshed_difference_ready = regularized || central_difference(
+  const bool refreshed_difference_ready = regularized ||
+      exact_rodas_jacobian || central_difference(
       true, true, false, refreshed_combined_interior,
       refreshed_combined_trace);
   if (!refreshed_difference_ready) { return false; }
@@ -7333,6 +8893,7 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
   double refreshed_interior_difference = 0.0;
   double refreshed_trace_difference = 0.0;
   const bool refreshed_policy_distinguished = regularized ||
+      exact_rodas_jacobian ||
       (refreshed_tau_changed &&
        relative_error(refreshed_combined_interior, combined_interior,
                       refreshed_interior_difference) &&
@@ -7348,13 +8909,591 @@ bool detail::CpuNumericsCore::AuditBorrowedEulerAssemblerJacobian(
   // Leave the reusable primary system at the unperturbed linearization.  No
   // state slot, trace vector, candidate authority, or solver lifecycle state
   // is published by this test-only check.
-  local_valid = state.Assemble(*base_interior, *base_trace,
-                               state.current_system, quadrature_orders, false);
+  local_valid = state.Assemble(
+      *base_interior, *base_trace, state.current_system, quadrature_orders,
+      false, nullptr, nullptr, false, nullptr, exact_rodas_jacobian);
   if (!state.CollectiveAll(local_valid)) { return false; }
   return state.CollectiveAll(std::all_of(
       relative_errors.begin(), relative_errors.end(),
       [relative_tolerance](const double error)
       { return Finite(error) && error <= relative_tolerance; }));
+}
+
+bool detail::CpuNumericsCore::AuditRodasAlgebraicBlockSolvability(
+    double& algebraic_residual, double& correction_norm) noexcept
+{
+  algebraic_residual = std::numeric_limits<double>::infinity();
+  correction_norm = std::numeric_limits<double>::infinity();
+  if (!implementation_) return false;
+  Implementation& state = *implementation_;
+  const CpuSlotStorage* const committed = state.Committed();
+  bool local_ready = state.initialized && state.IsBorrowed() &&
+      state.IsRodas3() && committed && state.iterate_interior &&
+      state.iterate_trace && !state.borrowed_prepare_active &&
+      state.active_candidate_generation == 0 &&
+      committed->interior.size() ==
+          static_cast<std::size_t>(state.iterate_interior->Size()) &&
+      committed->trace.size() ==
+          static_cast<std::size_t>(state.iterate_true_trace.Size());
+  if (!state.CollectiveAll(local_ready)) return false;
+
+  local_ready = Assign(*state.iterate_interior, committed->interior) &&
+      Assign(state.iterate_true_trace, committed->trace) &&
+      state.LoadTrace(state.iterate_true_trace, *state.iterate_trace);
+  if (!state.CollectiveAll(local_ready)) return false;
+
+  std::vector<double> differential_before;
+  try
+  {
+    double* const interior = state.iterate_interior->HostReadWrite();
+    double* const trace = state.iterate_true_trace.HostReadWrite();
+    const int interior_size = state.iterate_interior->Size();
+    const int trace_size = state.iterate_true_trace.Size();
+    local_ready = (interior || interior_size == 0) &&
+        (trace || trace_size == 0) &&
+        interior_size % state.interior_components == 0 &&
+        trace_size % state.trace_components == 0;
+    const int interior_scalar = local_ready
+        ? interior_size / state.interior_components : 0;
+    const int trace_scalar = local_ready
+        ? trace_size / state.trace_components : 0;
+    differential_before.reserve(static_cast<std::size_t>(
+        cpu_conserved_components * interior_scalar));
+    for (int component = 0;
+         component < cpu_conserved_components && local_ready; ++component)
+      for (int scalar = 0; scalar < interior_scalar; ++scalar)
+        differential_before.push_back(
+            interior[ByNodes(scalar, interior_scalar, component)]);
+
+    const auto perturbation = [](const std::size_t index,
+                                 const double value) noexcept
+    {
+      const double sign = (index & 1U) == 0U ? 1.0 : -1.0;
+      return 2.0e-3 * sign * std::max(1.0, std::abs(value));
+    };
+    for (int component = cpu_conserved_components;
+         component < state.interior_components && local_ready; ++component)
+      for (int scalar = 0; scalar < interior_scalar; ++scalar)
+      {
+        const int index = ByNodes(scalar, interior_scalar, component);
+        interior[index] += perturbation(
+            static_cast<std::size_t>(index), interior[index]);
+      }
+    for (int index = 0; index < trace_size && local_ready; ++index)
+      trace[index] += perturbation(
+          static_cast<std::size_t>(interior_size + index), trace[index]);
+    local_ready = local_ready && Finite(*state.iterate_interior) &&
+        Finite(state.iterate_true_trace);
+  }
+  catch (...)
+  {
+    local_ready = false;
+  }
+  if (!state.CollectiveAll(local_ready)) return false;
+  local_ready = state.LoadTrace(
+      state.iterate_true_trace, *state.iterate_trace);
+  double minimum_density = 0.0;
+  double minimum_pressure = 0.0;
+  double maximum_wave = 0.0;
+  local_ready = local_ready && state.Prescreen(
+      *state.iterate_interior, *state.iterate_trace, minimum_density,
+      minimum_pressure, maximum_wave);
+  if (!state.CollectiveAll(local_ready)) return false;
+
+  CpuAttemptEvidence attempt{};
+  CpuFailurePhase failure_phase = CpuFailurePhase::none;
+  bool injected_failure = false;
+  double maximum_true_residual = 0.0;
+  const CpuFailureInjection injection{};
+  const bool projected = state.ProjectRodasAlgebraicState(
+      injection, attempt, maximum_true_residual, algebraic_residual,
+      correction_norm, failure_phase, injected_failure);
+
+  bool differential_frozen = projected;
+  try
+  {
+    const double* const interior = projected
+        ? state.iterate_interior->HostRead() : nullptr;
+    const int interior_size = state.iterate_interior->Size();
+    differential_frozen = differential_frozen &&
+        (interior || interior_size == 0) &&
+        interior_size % state.interior_components == 0;
+    const int scalar = differential_frozen
+        ? interior_size / state.interior_components : 0;
+    std::size_t before_index = 0;
+    for (int component = 0;
+         component < cpu_conserved_components && differential_frozen;
+         ++component)
+      for (int degree = 0; degree < scalar; ++degree)
+      {
+        differential_frozen = before_index < differential_before.size() &&
+            interior[ByNodes(degree, scalar, component)] ==
+                differential_before[before_index];
+        ++before_index;
+      }
+    differential_frozen = differential_frozen &&
+        before_index == differential_before.size();
+  }
+  catch (...)
+  {
+    differential_frozen = false;
+  }
+
+  const double residual_allowance = std::max(
+      64.0 * state.config.nonlinear_tolerance,
+      1024.0 * std::numeric_limits<double>::epsilon());
+  local_ready = projected && !injected_failure &&
+      failure_phase == CpuFailurePhase::none && differential_frozen &&
+      Finite(maximum_true_residual) && Finite(algebraic_residual) &&
+      algebraic_residual <= residual_allowance && Finite(correction_norm) &&
+      correction_norm > 32.0 * std::numeric_limits<double>::epsilon();
+
+  const bool restored =
+      Assign(*state.iterate_interior, committed->interior) &&
+      Assign(state.iterate_true_trace, committed->trace) &&
+      state.LoadTrace(state.iterate_true_trace, *state.iterate_trace);
+  state.reusable_operator_generation = 0;
+  return state.CollectiveAll(local_ready && restored);
+}
+
+bool detail::CpuNumericsCore::AuditPreparedRodasStageEquations(
+    std::array<double, 4>& absolute_residuals,
+    std::array<double, 4>& relative_residuals,
+    std::array<double, 4>& counterfactual_relative_residuals,
+    double& maximum_zero_mass_entry) noexcept
+{
+  using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
+  absolute_residuals.fill(std::numeric_limits<double>::infinity());
+  relative_residuals.fill(std::numeric_limits<double>::infinity());
+  counterfactual_relative_residuals.fill(
+      std::numeric_limits<double>::infinity());
+  maximum_zero_mass_entry = std::numeric_limits<double>::infinity();
+  if (!implementation_) return false;
+  Implementation& state = *implementation_;
+  const CpuSlotStorage* const candidate = state.Candidate();
+  const double step_size = state.active_evidence.attempt.identity.dt;
+  const double gamma = Coefficients::common_gamma.value();
+  bool local_ready = state.initialized && state.IsBorrowed() &&
+      state.IsRodas3() && state.borrowed_prepare_active && candidate &&
+      state.active_candidate_generation != 0 && Finite(step_size) &&
+      step_size > 0.0 && Finite(gamma) && gamma > 0.0 &&
+      state.iterate_interior && state.iterate_trace && state.trial_interior &&
+      state.trial_trace &&
+      state.rodas_base_interior.size() == candidate->interior.size() &&
+      state.rodas_base_trace.size() == candidate->trace.size() &&
+      candidate->interior.size() ==
+          static_cast<std::size_t>(state.iterate_interior->Size()) &&
+      candidate->trace.size() ==
+          static_cast<std::size_t>(state.iterate_true_trace.Size()) &&
+      state.rodas_conservation_direction_interior.size() ==
+          candidate->interior.size() &&
+      state.rodas_conservation_direction_trace.size() ==
+          candidate->trace.size();
+  for (const auto& stage : state.rodas_stage_interior)
+    local_ready = local_ready && stage.size() == candidate->interior.size();
+  for (const auto& stage : state.rodas_stage_trace)
+    local_ready = local_ready && stage.size() == candidate->trace.size();
+  if (!state.CollectiveAll(local_ready)) return false;
+
+  const auto restore_candidate = [&]() noexcept
+  {
+    const bool assigned = AssignGridFunction(
+            *state.iterate_interior, candidate->interior) &&
+        Assign(state.iterate_true_trace, candidate->trace);
+    return state.CollectiveAll(assigned) &&
+        state.LoadTrace(state.iterate_true_trace, *state.iterate_trace);
+  };
+
+  const bool base_loaded = AssignGridFunction(
+          *state.iterate_interior, state.rodas_base_interior) &&
+      Assign(state.iterate_true_trace, state.rodas_base_trace);
+  if (!state.CollectiveAll(base_loaded) ||
+      !state.LoadTrace(state.iterate_true_trace, *state.iterate_trace))
+  {
+    static_cast<void>(restore_candidate());
+    return false;
+  }
+
+  const EulerTimeMassRates spatial_only{0.0, 0.0};
+  const EulerTimeMassRates shifted_mass{0.0,
+                                        1.0 / (gamma * step_size)};
+  const auto quadrature_orders =
+      EffectiveAssemblyQuadratureOrders(state.config);
+  local_ready = state.Assemble(
+          *state.iterate_interior, *state.iterate_trace,
+          state.rodas_operator_system, quadrature_orders, false,
+          nullptr, nullptr, false, &spatial_only, true) &&
+      state.Assemble(
+          *state.iterate_interior, *state.iterate_trace,
+          state.current_system, quadrature_orders, false,
+          nullptr, nullptr, false, &shifted_mass, true);
+  if (!state.CollectiveAll(local_ready))
+  {
+    static_cast<void>(restore_candidate());
+    return false;
+  }
+
+  local_ready = state.current_system.elements == state.mesh->GetNE() &&
+      state.current_system.interior_dofs == state.local_interior &&
+      state.current_system.trace_dofs == state.local_trace &&
+      state.current_system.a.size() == state.rodas_operator_system.a.size() &&
+      state.current_system.b.size() == state.rodas_operator_system.b.size() &&
+      state.current_system.c.size() == state.rodas_operator_system.c.size() &&
+      state.current_system.d.size() == state.rodas_operator_system.d.size() &&
+      state.rodas_mass_over_shift.size() == state.current_system.a.size() &&
+      state.current_system.residual_interior ==
+          state.rodas_operator_system.residual_interior &&
+      state.current_system.residual_trace ==
+          state.rodas_operator_system.residual_trace;
+  double local_zero_mass_maximum = 0.0;
+  double local_differential_mass_maximum = 0.0;
+  try
+  {
+    for (int element = 0;
+         element < state.current_system.elements && local_ready; ++element)
+    {
+      const std::size_t matrix_offset =
+          static_cast<std::size_t>(element) * state.local_interior *
+          state.local_interior;
+      for (int row = 0; row < state.local_interior; ++row)
+      {
+        const int row_component = row / state.scalar_interior_dofs;
+        for (int column = 0; column < state.local_interior; ++column)
+        {
+          const int column_component =
+              column / state.scalar_interior_dofs;
+          const std::size_t index = matrix_offset +
+              static_cast<std::size_t>(row) * state.local_interior + column;
+          const double mass_entry = state.current_system.a[index] -
+              state.rodas_operator_system.a[index];
+          state.rodas_mass_over_shift[index] = mass_entry;
+          const bool differential_mass =
+              row_component < cpu_conserved_components &&
+              column_component == row_component;
+          if (differential_mass)
+            local_differential_mass_maximum = std::max(
+                local_differential_mass_maximum, std::abs(mass_entry));
+          else
+            local_zero_mass_maximum = std::max(
+                local_zero_mass_maximum, std::abs(mass_entry));
+          local_ready = Finite(mass_entry);
+        }
+      }
+    }
+    const auto accumulate_zero_mass = [&](const std::vector<double>& shifted,
+                                          const std::vector<double>& spatial)
+    {
+      if (shifted.size() != spatial.size()) return false;
+      for (std::size_t index = 0; index < shifted.size(); ++index)
+      {
+        const double difference = shifted[index] - spatial[index];
+        if (!Finite(difference)) return false;
+        local_zero_mass_maximum = std::max(
+            local_zero_mass_maximum, std::abs(difference));
+      }
+      return true;
+    };
+    local_ready = local_ready && accumulate_zero_mass(
+        state.current_system.b, state.rodas_operator_system.b) &&
+        accumulate_zero_mass(
+            state.current_system.c, state.rodas_operator_system.c) &&
+        accumulate_zero_mass(
+            state.current_system.d, state.rodas_operator_system.d);
+  }
+  catch (...)
+  {
+    local_ready = false;
+  }
+  if (!state.CollectiveAll(local_ready))
+  {
+    static_cast<void>(restore_candidate());
+    return false;
+  }
+  double global_zero_mass_maximum = 0.0;
+  double global_differential_mass_maximum = 0.0;
+  const bool mass_reduced = MPI_Allreduce(
+          &local_zero_mass_maximum, &global_zero_mass_maximum, 1,
+          MPI_DOUBLE, MPI_MAX, state.communicator) == MPI_SUCCESS &&
+      MPI_Allreduce(
+          &local_differential_mass_maximum,
+          &global_differential_mass_maximum, 1, MPI_DOUBLE, MPI_MAX,
+          state.communicator) == MPI_SUCCESS;
+  if (!state.CollectiveAll(
+          mass_reduced && Finite(global_zero_mass_maximum) &&
+          Finite(global_differential_mass_maximum) &&
+          global_differential_mass_maximum > 0.0))
+  {
+    static_cast<void>(restore_candidate());
+    return false;
+  }
+  maximum_zero_mass_entry = global_zero_mass_maximum;
+
+  constexpr double counterfactual_mass_fraction = 1.0 / 16.0;
+  for (std::size_t stage = 0;
+       stage < Coefficients::stage_count && local_ready; ++stage)
+  {
+    if (!state.LoadRodasStageState(stage))
+    {
+      local_ready = false;
+      break;
+    }
+    local_ready = state.Assemble(
+        *state.iterate_interior, *state.iterate_trace,
+        state.trial_system, quadrature_orders, false,
+        nullptr, nullptr, false, &spatial_only, true);
+    if (!state.CollectiveAll(local_ready)) break;
+
+    std::fill(state.rodas_conservation_direction_interior.begin(),
+              state.rodas_conservation_direction_interior.end(), 0.0);
+    std::fill(state.rodas_conservation_direction_trace.begin(),
+              state.rodas_conservation_direction_trace.end(), 0.0);
+    for (std::size_t term = 0; term <= stage; ++term)
+    {
+      const double coefficient = term == stage
+          ? gamma : Coefficients::Gamma(stage, term);
+      for (std::size_t index = 0;
+           index < state.rodas_conservation_direction_interior.size();
+           ++index)
+      {
+        state.rodas_conservation_direction_interior[index] += coefficient *
+            state.rodas_stage_interior[term][index];
+      }
+      for (std::size_t index = 0;
+           index < state.rodas_conservation_direction_trace.size(); ++index)
+      {
+        state.rodas_conservation_direction_trace[index] += coefficient *
+            state.rodas_stage_trace[term][index];
+      }
+    }
+    local_ready = Finite(state.rodas_conservation_direction_interior) &&
+        Finite(state.rodas_conservation_direction_trace) &&
+        AssignGridFunction(
+            *state.trial_interior,
+            state.rodas_conservation_direction_interior) &&
+        Assign(state.trial_true_trace,
+               state.rodas_conservation_direction_trace);
+    if (!state.CollectiveAll(local_ready) ||
+        !state.LoadTrace(state.trial_true_trace, *state.trial_trace))
+    {
+      local_ready = false;
+      break;
+    }
+
+    try
+    {
+      const double* const direction_interior =
+          state.trial_interior->HostRead();
+      const double* const direction_trace = state.trial_trace->HostRead();
+      local_ready =
+          (direction_interior || state.trial_interior->Size() == 0) &&
+          (direction_trace || state.trial_trace->Size() == 0);
+      std::fill(state.current_system.residual_interior.begin(),
+                state.current_system.residual_interior.end(), 0.0);
+      std::fill(state.current_system.residual_trace.begin(),
+                state.current_system.residual_trace.end(), 0.0);
+      std::fill(state.current_system.f.begin(),
+                state.current_system.f.end(), 0.0);
+      std::fill(state.current_system.g.begin(),
+                state.current_system.g.end(), 0.0);
+      std::fill(state.rodas_operator_system.f.begin(),
+                state.rodas_operator_system.f.end(), 0.0);
+      std::fill(state.rodas_operator_system.g.begin(),
+                state.rodas_operator_system.g.end(), 0.0);
+
+      for (int element = 0;
+           element < state.current_system.elements && local_ready; ++element)
+      {
+        const std::size_t interior_offset =
+            static_cast<std::size_t>(element) * state.local_interior;
+        const std::size_t trace_offset =
+            static_cast<std::size_t>(element) * state.local_trace;
+        const std::size_t a_offset = interior_offset * state.local_interior;
+        const std::size_t b_offset = interior_offset * state.local_trace;
+        const std::size_t c_offset = trace_offset * state.local_interior;
+        const std::size_t d_offset = trace_offset * state.local_trace;
+        for (int row = 0; row < state.local_interior; ++row)
+        {
+          double mass_action = 0.0;
+          double jacobian_action = 0.0;
+          for (int column = 0; column < state.local_interior; ++column)
+          {
+            double sign = 1.0;
+            const int dof = Decode(state.element_interior_vdofs[
+                interior_offset + static_cast<std::size_t>(column)], sign);
+            if (dof < 0 || dof >= state.trial_interior->Size() ||
+                dof >= static_cast<int>(
+                    state.rodas_stage_interior[stage].size()))
+            {
+              local_ready = false;
+              break;
+            }
+            const std::size_t matrix_index = a_offset +
+                static_cast<std::size_t>(row) * state.local_interior + column;
+            mass_action += state.rodas_mass_over_shift[matrix_index] * sign *
+                state.rodas_stage_interior[stage][
+                    static_cast<std::size_t>(dof)];
+            jacobian_action += state.rodas_operator_system.a[matrix_index] *
+                sign * direction_interior[dof];
+          }
+          for (int column = 0;
+               column < state.local_trace && local_ready; ++column)
+          {
+            double sign = 1.0;
+            const int dof = Decode(state.signed_trace_dofs[
+                trace_offset + static_cast<std::size_t>(column)], sign);
+            if (dof < 0 || dof >= state.trial_trace->Size())
+            {
+              local_ready = false;
+              break;
+            }
+            jacobian_action += state.rodas_operator_system.b[
+                b_offset + static_cast<std::size_t>(row) *
+                    state.local_trace + column] * sign *
+                direction_trace[dof];
+          }
+          if (!local_ready) break;
+          const std::size_t row_index =
+              interior_offset + static_cast<std::size_t>(row);
+          const double mass_term =
+              gamma * step_size * mass_action;
+          const double residual_term = step_size *
+              state.trial_system.residual_interior[row_index];
+          const double jacobian_term = step_size * jacobian_action;
+          state.current_system.f[row_index] = mass_term;
+          state.rodas_operator_system.f[row_index] = jacobian_term;
+          state.current_system.residual_interior[row_index] =
+              mass_term + residual_term + jacobian_term;
+          local_ready = Finite(mass_term) && Finite(residual_term) &&
+              Finite(jacobian_term) && Finite(
+                  state.current_system.residual_interior[row_index]);
+        }
+
+        for (int row = 0;
+             row < state.local_trace && local_ready; ++row)
+        {
+          double jacobian_action = 0.0;
+          for (int column = 0; column < state.local_interior; ++column)
+          {
+            double sign = 1.0;
+            const int dof = Decode(state.element_interior_vdofs[
+                interior_offset + static_cast<std::size_t>(column)], sign);
+            if (dof < 0 || dof >= state.trial_interior->Size())
+            {
+              local_ready = false;
+              break;
+            }
+            jacobian_action += state.rodas_operator_system.c[
+                c_offset + static_cast<std::size_t>(row) *
+                    state.local_interior + column] * sign *
+                direction_interior[dof];
+          }
+          for (int column = 0;
+               column < state.local_trace && local_ready; ++column)
+          {
+            double sign = 1.0;
+            const int dof = Decode(state.signed_trace_dofs[
+                trace_offset + static_cast<std::size_t>(column)], sign);
+            if (dof < 0 || dof >= state.trial_trace->Size())
+            {
+              local_ready = false;
+              break;
+            }
+            jacobian_action += state.rodas_operator_system.d[
+                d_offset + static_cast<std::size_t>(row) *
+                    state.local_trace + column] * sign *
+                direction_trace[dof];
+          }
+          if (!local_ready) break;
+          const std::size_t row_index =
+              trace_offset + static_cast<std::size_t>(row);
+          const double residual_term = step_size *
+              state.trial_system.residual_trace[row_index];
+          const double jacobian_term = step_size * jacobian_action;
+          state.rodas_operator_system.g[row_index] = jacobian_term;
+          state.current_system.residual_trace[row_index] =
+              residual_term + jacobian_term;
+          local_ready = Finite(residual_term) && Finite(jacobian_term) &&
+              Finite(state.current_system.residual_trace[row_index]);
+        }
+      }
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    if (!state.CollectiveAll(local_ready)) break;
+
+    // ResidualNorm signed-assembles the element-face rows, maps the rank-local
+    // trace residual through Dof_TrueDof_Matrix()->MultTranspose, and then
+    // takes the communicator-wide true-vector norm.  Thus shared trace rows
+    // are checked after their required global assembly; individual element
+    // face contributions are not incorrectly required to vanish.
+    const double exact_residual =
+        state.ResidualNorm(state.current_system, false);
+    for (std::size_t index = 0;
+         index < state.current_system.residual_interior.size(); ++index)
+    {
+      state.current_system.residual_interior[index] +=
+          counterfactual_mass_fraction * state.current_system.f[index];
+    }
+    const double counterfactual_residual =
+        state.ResidualNorm(state.current_system, false);
+
+    std::copy(state.current_system.f.begin(), state.current_system.f.end(),
+              state.current_system.residual_interior.begin());
+    std::fill(state.current_system.residual_trace.begin(),
+              state.current_system.residual_trace.end(), 0.0);
+    const double mass_norm = state.ResidualNorm(state.current_system, false);
+
+    for (std::size_t index = 0;
+         index < state.current_system.residual_interior.size(); ++index)
+    {
+      state.current_system.residual_interior[index] = step_size *
+          state.trial_system.residual_interior[index];
+    }
+    for (std::size_t index = 0;
+         index < state.current_system.residual_trace.size(); ++index)
+    {
+      state.current_system.residual_trace[index] = step_size *
+          state.trial_system.residual_trace[index];
+    }
+    const double spatial_residual_norm =
+        state.ResidualNorm(state.current_system, false);
+
+    std::copy(state.rodas_operator_system.f.begin(),
+              state.rodas_operator_system.f.end(),
+              state.current_system.residual_interior.begin());
+    std::copy(state.rodas_operator_system.g.begin(),
+              state.rodas_operator_system.g.end(),
+              state.current_system.residual_trace.begin());
+    const double jacobian_action_norm =
+        state.ResidualNorm(state.current_system, false);
+    const double scale = mass_norm + spatial_residual_norm +
+        jacobian_action_norm;
+    const double counterfactual_scale =
+        (1.0 + counterfactual_mass_fraction) * mass_norm +
+        spatial_residual_norm + jacobian_action_norm;
+    local_ready = Finite(exact_residual) && exact_residual >= 0.0 &&
+        Finite(counterfactual_residual) && counterfactual_residual >= 0.0 &&
+        Finite(scale) && scale > 0.0 && Finite(counterfactual_scale) &&
+        counterfactual_scale > 0.0;
+    if (!state.CollectiveAll(local_ready)) break;
+    absolute_residuals[stage] = exact_residual;
+    relative_residuals[stage] = exact_residual / scale;
+    counterfactual_relative_residuals[stage] =
+        counterfactual_residual / counterfactual_scale;
+    local_ready = Finite(relative_residuals[stage]) &&
+        Finite(counterfactual_relative_residuals[stage]);
+    if (!state.CollectiveAll(local_ready)) break;
+  }
+
+  state.reusable_operator_generation = 0;
+  const bool restored = restore_candidate();
+  return state.CollectiveAll(
+      local_ready && restored && Finite(absolute_residuals) &&
+      Finite(relative_residuals) &&
+      Finite(counterfactual_relative_residuals) &&
+      Finite(maximum_zero_mass_entry));
 }
 
 bool detail::CpuNumericsCore::AuditLastBorrowedEulerConservation(
@@ -7381,6 +9520,27 @@ bool detail::CpuNumericsCore::AuditLastBorrowedEulerConservation(
   return true;
 }
 
+bool detail::CpuNumericsCore::AuditPreparedRodasEndpointConservation(
+    double& maximum_error, double& maximum_relative_error) noexcept
+{
+  maximum_error = std::numeric_limits<double>::infinity();
+  maximum_relative_error = std::numeric_limits<double>::infinity();
+  if (!implementation_) return false;
+  Implementation& state = *implementation_;
+  const bool local_ready = state.initialized && state.IsRodas3() &&
+      state.borrowed_prepare_active && state.active_candidate_generation != 0 &&
+      state.Candidate() && state.iterate_interior && state.iterate_trace &&
+      Finite(state.active_evidence.attempt.identity.dt) &&
+      state.active_evidence.attempt.identity.dt > 0.0;
+  if (!state.CollectiveAll(local_ready)) return false;
+  // Qualification-only counterfactual: this is the endpoint Backward-Euler
+  // oracle that RODAS must not use for its differential conservation gate.
+  return state.ConservationBalance(
+      *state.iterate_interior, *state.iterate_trace,
+      state.active_evidence.attempt.identity.dt,
+      maximum_error, maximum_relative_error, true);
+}
+
 bool detail::CpuNumericsCore::AuditCommittedScalarClosure(
     double& residual, double& tolerance) noexcept
 {
@@ -7403,6 +9563,18 @@ bool detail::CpuNumericsCore::AdvanceBorrowedEuler(
   if (!PrepareBorrowedEuler(dt, coordinates, generation))
   {
     return false;
+  }
+  if (implementation_->IsRodas3())
+  {
+    constexpr generic::HdgEulerPreparedAssessmentPolicy fixed_policy{
+        1.0e-8, 1.0e-5, 0.25};
+    generic::HdgEulerPreparedAssessment assessment{};
+    if (!AssessPreparedBorrowedEuler(generation, fixed_policy, assessment) ||
+        !assessment.algebraic_correction_gate)
+    {
+      static_cast<void>(AbortBorrowedEuler(generation, coordinates));
+      return false;
+    }
   }
   double maximum_wave_speed = 0.0;
   double backend_stable_dt = 0.0;
@@ -7509,6 +9681,249 @@ bool detail::CpuNumericsCore::PrepareBorrowedEuler(
   return true;
 }
 
+bool detail::CpuNumericsCore::AssessPreparedBorrowedEuler(
+    const std::uint64_t generation,
+    const generic::HdgEulerPreparedAssessmentPolicy policy,
+    generic::HdgEulerPreparedAssessment& assessment) noexcept
+{
+  assessment = {};
+  if (!implementation_) return false;
+  Implementation& state = *implementation_;
+  state.assessed_candidate_generation = 0;
+  state.assessed_candidate_state_hash = {};
+  state.assessed_candidate_policy = {};
+  state.assessed_candidate_authority = false;
+  const CpuSlotStorage* const candidate = state.Candidate();
+  bool local_ready = state.initialized && state.IsBorrowed() &&
+      state.IsRodas3() && state.borrowed_prepare_active && candidate &&
+      state.active_candidate_generation == generation && generation != 0 &&
+      generic::IsValidHdgEulerPreparedAssessmentPolicy(policy) &&
+      state.interior_components >= cpu_conserved_components &&
+      candidate->interior.size() == state.rodas_base_interior.size() &&
+      candidate->interior.size() == state.rodas_combination_interior.size() &&
+      candidate->trace.size() == state.rodas_base_trace.size() &&
+      candidate->trace.size() == state.rodas_combination_trace.size() &&
+      candidate->interior.size() %
+              static_cast<std::size_t>(state.interior_components) ==
+          0;
+  for (const auto& stage : state.rodas_stage_interior)
+    local_ready = local_ready && stage.size() == candidate->interior.size();
+
+  const std::array<std::uint64_t, 3> local_policy = {
+      generic::DoubleBits(policy.absolute_tolerance),
+      generic::DoubleBits(policy.relative_tolerance),
+      generic::DoubleBits(policy.algebraic_correction_fraction)};
+  std::array<std::uint64_t, 3> minimum_policy{};
+  std::array<std::uint64_t, 3> maximum_policy{};
+  const bool policy_consensus = MPI_Allreduce(
+          local_policy.data(), minimum_policy.data(),
+          static_cast<int>(local_policy.size()), MPI_UINT64_T, MPI_MIN,
+          state.communicator) == MPI_SUCCESS &&
+      MPI_Allreduce(local_policy.data(), maximum_policy.data(),
+                    static_cast<int>(local_policy.size()), MPI_UINT64_T,
+                    MPI_MAX, state.communicator) == MPI_SUCCESS &&
+      minimum_policy == maximum_policy;
+  if (!state.CollectiveAll(local_ready && policy_consensus)) return false;
+
+  using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
+  double local_error_squared = 0.0;
+  double local_differential_measure = 0.0;
+  double local_correction_squared = 0.0;
+  std::uint64_t local_algebraic_count = 0;
+  const std::size_t scalar_interior = candidate->interior.size() /
+      static_cast<std::size_t>(state.interior_components);
+  const auto scaled_square = [&](const double difference,
+                                 const double before,
+                                 const double after,
+                                 double& sum) noexcept
+  {
+    const double scale = policy.absolute_tolerance +
+        policy.relative_tolerance *
+            std::max(std::abs(before), std::abs(after));
+    if (!Finite(difference) || !Finite(scale) || scale < 0.0)
+      return false;
+    if (scale == 0.0) return difference == 0.0;
+    const double scaled = difference / scale;
+    sum += scaled * scaled;
+    return Finite(sum);
+  };
+
+  // The embedded estimate controls the differential U4 fields in a physical
+  // L2 RMS norm.  Evaluating the coefficient vectors at the same volume
+  // quadrature used by the residual makes the tolerance independent of the
+  // L2 basis, polynomial order, element size, and partitioning.
+  const auto interpolate_coefficients = [&state](
+      const std::vector<double>& coefficients,
+      const int* const signed_vdofs,
+      const int component,
+      double& value) noexcept
+  {
+    value = 0.0;
+    for (int scalar = 0; scalar < state.scalar_interior_dofs; ++scalar)
+    {
+      double sign = 1.0;
+      const int dof = Decode(
+          signed_vdofs[ByNodes(scalar, state.scalar_interior_dofs,
+                               component)],
+          sign);
+      if (dof < 0 ||
+          static_cast<std::size_t>(dof) >= coefficients.size())
+      {
+        return false;
+      }
+      value += state.volume_shape_workspace[scalar] * sign *
+          coefficients[static_cast<std::size_t>(dof)];
+    }
+    return Finite(value);
+  };
+  try
+  {
+    const auto quadrature_orders =
+        EffectiveAssemblyQuadratureOrders(state.config);
+    for (int element = 0;
+         element < state.mesh->GetNE() && local_ready; ++element)
+    {
+      const mfem::FiniteElement* finite_element =
+          state.interior_space->GetFE(element);
+      mfem::ElementTransformation* transformation =
+          state.mesh->GetElementTransformation(element);
+      local_ready = finite_element && transformation &&
+          finite_element->GetDof() == state.scalar_interior_dofs;
+      if (!local_ready) break;
+      const int* const interior_vdofs =
+          state.element_interior_vdofs.data() +
+          static_cast<std::size_t>(element) * state.local_interior;
+      const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
+          finite_element->GetGeomType(), quadrature_orders.volume_order);
+      for (int q = 0; q < volume_rule.GetNPoints() && local_ready; ++q)
+      {
+        const mfem::IntegrationPoint& point = volume_rule.IntPoint(q);
+        transformation->SetIntPoint(&point);
+        finite_element->CalcShape(point, state.volume_shape_workspace);
+        const double weight = point.weight * transformation->Weight();
+        local_ready = Finite(weight) && weight > 0.0;
+        if (!local_ready) break;
+        local_differential_measure += weight;
+        local_ready = Finite(local_differential_measure);
+        for (int component = 0;
+             component < cpu_conserved_components && local_ready;
+             ++component)
+        {
+          double before = 0.0;
+          double after = 0.0;
+          double estimate = 0.0;
+          local_ready = interpolate_coefficients(
+              state.rodas_base_interior, interior_vdofs, component, before) &&
+              interpolate_coefficients(
+                  candidate->interior, interior_vdofs, component, after);
+          for (std::size_t stage = 0;
+               stage < Coefficients::stage_count && local_ready; ++stage)
+          {
+            double increment = 0.0;
+            local_ready = interpolate_coefficients(
+                state.rodas_stage_interior[stage], interior_vdofs,
+                component, increment);
+            estimate += Coefficients::ErrorWeight(stage) * increment;
+          }
+          double normalized_squared = 0.0;
+          local_ready = local_ready && scaled_square(
+              estimate, before, after, normalized_squared);
+          if (local_ready)
+          {
+            local_error_squared += weight * normalized_squared;
+            local_ready = Finite(local_error_squared);
+          }
+        }
+      }
+    }
+  }
+  catch (...)
+  {
+    local_ready = false;
+  }
+  for (int component = cpu_conserved_components;
+       component < state.interior_components && local_ready; ++component)
+    for (std::size_t scalar = 0;
+         scalar < scalar_interior && local_ready; ++scalar)
+    {
+      const std::size_t index = static_cast<std::size_t>(
+          ByNodes(static_cast<int>(scalar),
+                  static_cast<int>(scalar_interior), component));
+      const double before = state.rodas_combination_interior[index];
+      const double after = candidate->interior[index];
+      local_ready = scaled_square(after - before, before, after,
+                                  local_correction_squared);
+      ++local_algebraic_count;
+    }
+  for (std::size_t index = 0;
+       index < candidate->trace.size() && local_ready; ++index)
+  {
+    const double before = state.rodas_combination_trace[index];
+    const double after = candidate->trace[index];
+    local_ready = scaled_square(after - before, before, after,
+                                local_correction_squared);
+    ++local_algebraic_count;
+  }
+  if (!state.CollectiveAll(local_ready)) return false;
+
+  double global_error_squared = 0.0;
+  double global_differential_measure = 0.0;
+  double global_correction_squared = 0.0;
+  std::uint64_t global_algebraic_count = 0;
+  const bool reduced = MPI_Allreduce(
+          &local_error_squared, &global_error_squared, 1, MPI_DOUBLE,
+          MPI_SUM, state.communicator) == MPI_SUCCESS &&
+      MPI_Allreduce(&local_differential_measure,
+                    &global_differential_measure, 1, MPI_DOUBLE, MPI_SUM,
+                    state.communicator) == MPI_SUCCESS &&
+      MPI_Allreduce(&local_correction_squared, &global_correction_squared, 1,
+                    MPI_DOUBLE, MPI_SUM, state.communicator) == MPI_SUCCESS &&
+      MPI_Allreduce(&local_algebraic_count, &global_algebraic_count, 1,
+                    MPI_UINT64_T, MPI_SUM, state.communicator) == MPI_SUCCESS;
+  if (!state.CollectiveAll(
+          reduced && global_differential_measure > 0.0 &&
+          global_algebraic_count > 0 && Finite(global_error_squared) &&
+          Finite(global_differential_measure) &&
+          Finite(global_correction_squared)))
+  {
+    return false;
+  }
+
+  assessment.normalized_differential_error = std::sqrt(
+      global_error_squared /
+      (static_cast<double>(cpu_conserved_components) *
+       global_differential_measure));
+  assessment.normalized_algebraic_correction = std::sqrt(
+      global_correction_squared /
+      static_cast<double>(global_algebraic_count));
+  const CpuAttemptEvidence& evidence = state.active_evidence.attempt;
+  assessment.finite_gate = evidence.finite_gate &&
+      generic::IsValidHdgEulerPreparedAssessment(assessment);
+  assessment.solver_gate = evidence.status == CpuAttemptStatus::success &&
+      evidence.nonlinear_gate;
+  assessment.residual_gate = evidence.true_residual_gate &&
+      state.active_evidence.conservation_gate;
+  assessment.admissibility_gate = evidence.admissibility_gate;
+  assessment.algebraic_closure_gate = evidence.recovery_gate;
+  assessment.algebraic_correction_gate =
+      assessment.normalized_algebraic_correction <=
+          policy.algebraic_correction_fraction;
+  const bool primary_gates = state.CollectiveAll(
+      assessment.finite_gate && assessment.solver_gate &&
+      assessment.residual_gate && assessment.admissibility_gate &&
+      assessment.algebraic_closure_gate);
+  const bool publishable = state.CollectiveAll(
+      primary_gates && assessment.algebraic_correction_gate);
+  if (publishable)
+  {
+    state.assessed_candidate_generation = generation;
+    state.assessed_candidate_state_hash = state.active_candidate_state_hash;
+    state.assessed_candidate_policy = local_policy;
+    state.assessed_candidate_authority = true;
+  }
+  return primary_gates;
+}
+
 bool detail::CpuNumericsCore::CommitBorrowedEuler(
     const std::uint64_t generation, StateCoordinates& coordinates,
     double& maximum_wave_speed, double& backend_stable_dt) noexcept
@@ -7528,6 +9943,12 @@ bool detail::CpuNumericsCore::CommitBorrowedEuler(
       maximum_status == MPI_SUCCESS && minimum_generation == maximum_generation;
   const bool local_valid = state.initialized && state.IsBorrowed() &&
       state.borrowed_prepare_active && CandidateGenerationActive(generation) &&
+      (!state.IsRodas3() ||
+       (state.assessed_candidate_authority &&
+        state.assessed_candidate_generation == generation &&
+        state.assessed_candidate_state_hash ==
+            state.active_candidate_state_hash &&
+        state.assessed_candidate_policy != std::array<std::uint64_t, 3>{})) &&
       (!state.RequiresPartitionedScalarClosure() ||
        state.active_candidate_scalar_closure_coherent) &&
       ::dg::hdg::runtime::detail::SameCoordinates(
@@ -7647,7 +10068,9 @@ bool detail::CpuNumericsCore::InitializeInternal(
       (!generic || borrowed_request->time_treatment ==
               generic::EulerHdgTimeTreatment::backward_euler ||
        borrowed_request->time_treatment ==
-              generic::EulerHdgTimeTreatment::partitioned_backward_euler) &&
+              generic::EulerHdgTimeTreatment::partitioned_backward_euler ||
+       borrowed_request->time_treatment ==
+              generic::EulerHdgTimeTreatment::rodas3) &&
       (generic ? state.ranks >= 1 && borrowed_request->mesh != nullptr
                : (state.ranks == 1 || state.ranks == 2) && ExactConfig(config) &&
                      ExactRankShape(config, state.ranks) && config_consensus &&
@@ -8249,12 +10672,411 @@ bool detail::CpuNumericsCore::InitializeInternal(
   return true;
 }
 
+detail::CpuNumericalResult
+detail::CpuNumericsCore::Implementation::ExecuteRodas3(
+    const AttemptIdentity& attempt,
+    const StateCoordinates& coordinates,
+    const CpuFailureInjection& injection) noexcept
+{
+  CpuNumericalResult result;
+  CpuAttemptWorkspace& workspace = active_evidence;
+  workspace = {};
+  CpuAttemptEvidence& evidence = workspace.attempt;
+  active_candidate_generation = 0;
+  active_candidate_state_hash = {};
+  active_candidate_scalar_closure_coherent = false;
+  publication_chain_authority = false;
+  reusable_operator_generation = 0;
+  evidence.identity = attempt;
+  evidence.entry_coordinates = coordinates;
+  evidence.candidate_cursor = attempt.sequence;
+  evidence.rank = rank;
+  evidence.ranks = ranks;
+  evidence.failure_source_rank = -1;
+  evidence.transfers = {0, 0, 0, 0, 0, true};
+  entry_coordinates = coordinates;
+  entry_interior_hash = HashDoubles(Committed()->interior);
+  entry_trace_hash = HashDoubles(Committed()->trace);
+  evidence.committed_interior_before = entry_interior_hash;
+  evidence.committed_trace_before = entry_trace_hash;
+
+  const auto fail = [&](const CpuFailurePhase phase,
+                        const CpuAttemptStatus status =
+                            CpuAttemptStatus::runtime_failure,
+                        const FailureReason reason =
+                            FailureReason::backend_failure)
+  {
+    reusable_operator_generation = 0;
+    evidence.failure_phase = phase;
+    evidence.status = status;
+    evidence.finite_gate = false;
+    evidence.admissibility_gate = false;
+    evidence.recovery_gate = false;
+    evidence.nonlinear_gate = false;
+    evidence.true_residual_gate = false;
+    evidence.transfers.allocation_events =
+        allocations.EventsAfterBaseline();
+    result.evidence = evidence;
+    result.gates = {false, false, false, false, true, false};
+    result.originating_failure = reason;
+    return result;
+  };
+
+  const bool entry_ready = initialized && IsRodas3() && Committed() &&
+      Candidate() && Candidate()->interior == Committed()->interior &&
+      Candidate()->trace == Committed()->trace &&
+      Finite(attempt.dt) && attempt.dt > 0.0;
+  if (!CollectiveAll(entry_ready))
+    return fail(CpuFailurePhase::setup, CpuAttemptStatus::invalid_request);
+  if (!CollectiveAll(InjectionArguments(injection, coordinates.step + 1)))
+    return fail(CpuFailurePhase::setup, CpuAttemptStatus::invalid_request);
+
+  const bool state_loaded = AssignGridFunction(
+          *old_interior, Committed()->interior) &&
+      AssignGridFunction(*iterate_interior, Committed()->interior) &&
+      Assign(iterate_true_trace, Committed()->trace) &&
+      LoadTrace(iterate_true_trace, *iterate_trace);
+  if (!CollectiveAll(state_loaded)) return fail(CpuFailurePhase::setup);
+
+  double maximum_true_residual = 0.0;
+  double initial_algebraic_residual = 0.0;
+  double initial_algebraic_correction = 0.0;
+  CpuFailurePhase projection_phase = CpuFailurePhase::none;
+  bool projection_injected = false;
+  const bool initial_projection_ready = ProjectRodasAlgebraicState(
+          injection, evidence, maximum_true_residual,
+          initial_algebraic_residual, initial_algebraic_correction,
+          projection_phase, projection_injected);
+  evidence.initial_nonlinear_residual = initial_algebraic_residual;
+  evidence.initial_algebraic_correction_norm =
+      initial_algebraic_correction;
+  if (!initial_projection_ready)
+  {
+    return fail(projection_phase,
+                projection_injected ? CpuAttemptStatus::injected_failure
+                                    : CpuAttemptStatus::runtime_failure);
+  }
+  if (!CollectiveAll(Finite(initial_algebraic_correction)))
+  {
+    return fail(CpuFailurePhase::recovery,
+                CpuAttemptStatus::runtime_failure,
+                FailureReason::success_gate);
+  }
+  if (!CollectiveAll(initial_algebraic_correction <=
+                     rodas_maximum_entry_algebraic_correction_norm))
+  {
+    return fail(CpuFailurePhase::recovery,
+                CpuAttemptStatus::runtime_failure,
+                FailureReason::success_gate);
+  }
+  if (!SaveRodasBaseState()) return fail(CpuFailurePhase::setup);
+
+  double minimum_density = std::numeric_limits<double>::infinity();
+  double minimum_pressure = std::numeric_limits<double>::infinity();
+  double maximum_wave = 0.0;
+  if (!CollectiveAll(Prescreen(*iterate_interior, *iterate_trace,
+                               minimum_density, minimum_pressure,
+                               maximum_wave)))
+  {
+    return fail(CpuFailurePhase::assembly,
+                CpuAttemptStatus::runtime_failure,
+                FailureReason::admissibility_gate);
+  }
+
+  if (!EnterPhase(injection, CpuFailurePhase::assembly))
+    return fail(CpuFailurePhase::assembly,
+                CpuAttemptStatus::injected_failure);
+  if (!PrepareRodasCommonShift(attempt.dt))
+    return fail(CpuFailurePhase::assembly);
+  evidence.work.complete_assemblies += 2;
+  CompletePhase();
+
+  std::uint64_t common_operator_generation = 0;
+  using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
+  for (std::size_t stage = 0; stage < Coefficients::stage_count; ++stage)
+  {
+    if (!LoadRodasStageState(stage)) return fail(CpuFailurePhase::setup);
+    double stage_density = 0.0;
+    double stage_pressure = 0.0;
+    double stage_wave = 0.0;
+    if (!CollectiveAll(Prescreen(*iterate_interior, *iterate_trace,
+                                 stage_density, stage_pressure, stage_wave)))
+    {
+      return fail(CpuFailurePhase::assembly,
+                  CpuAttemptStatus::runtime_failure,
+                  FailureReason::admissibility_gate);
+    }
+    minimum_density = std::min(minimum_density, stage_density);
+    minimum_pressure = std::min(minimum_pressure, stage_pressure);
+    maximum_wave = std::max(maximum_wave, stage_wave);
+
+    if (stage >= 2)
+    {
+      if (!EnterPhase(injection, CpuFailurePhase::assembly))
+        return fail(CpuFailurePhase::assembly,
+                    CpuAttemptStatus::injected_failure);
+      const EulerTimeMassRates spatial_only{0.0, 0.0};
+      if (!Assemble(*iterate_interior, *iterate_trace, trial_system,
+                    EffectiveAssemblyQuadratureOrders(config), true,
+                    nullptr, nullptr, false, &spatial_only))
+      {
+        return fail(CpuFailurePhase::assembly);
+      }
+      ++evidence.work.complete_assemblies;
+      CompletePhase();
+    }
+    if (!BuildRodasStageSystem(stage))
+      return fail(CpuFailurePhase::assembly);
+
+    if (!EnterPhase(injection, CpuFailurePhase::condensation))
+      return fail(CpuFailurePhase::condensation,
+                  CpuAttemptStatus::injected_failure);
+    if (stage == 0)
+    {
+      StateHash matrix_hash{};
+      if (!CondenseAndAssemble(current_system, matrix_hash,
+                               common_operator_generation))
+      {
+        return fail(CpuFailurePhase::condensation);
+      }
+      ++evidence.work.complete_condensations;
+      ++evidence.work.common_shift_operator_builds;
+    }
+    else
+    {
+      if (!RefreshCondensedRightHandSide(
+              current_system, common_operator_generation))
+      {
+        return fail(CpuFailurePhase::condensation);
+      }
+      ++evidence.work.common_shift_operator_reuses;
+      ++evidence.work.condensed_rhs_refreshes;
+    }
+    CompletePhase();
+
+    if (!EnterPhase(injection, CpuFailurePhase::trace_solve))
+      return fail(CpuFailurePhase::trace_solve,
+                  CpuAttemptStatus::injected_failure);
+    double true_residual = 0.0;
+    int iterations = 0;
+    int solve_attempts = 0;
+    int tightenings = 0;
+    StateHash factor_hash{}, solution_hash{};
+    std::uint64_t factor_generation = 0;
+    bool factor_current = false;
+    const bool retain_operator = stage + 1 < Coefficients::stage_count;
+    const bool trace_solved = SolveTrace(
+        common_operator_generation,
+        generic::EulerHdgLinearSolveRole::final_coherent,
+        true_residual, iterations, solve_attempts, tightenings,
+        factor_hash, solution_hash, factor_generation, factor_current,
+        retain_operator, stage != 0);
+    const bool counts_ready = iterations >= 0 && solve_attempts >= 0 &&
+        tightenings >= 0 && evidence.linear_iterations <=
+            std::numeric_limits<int>::max() - iterations &&
+        evidence.linear_solve_attempts <=
+            std::numeric_limits<int>::max() - solve_attempts &&
+        evidence.true_residual_tightenings <=
+            std::numeric_limits<int>::max() - tightenings &&
+        evidence.final_coherent_linear_iterations <=
+            std::numeric_limits<int>::max() - iterations;
+    if (!CollectiveAll(trace_solved && counts_ready &&
+                       Finite(true_increment)))
+    {
+      return fail(CpuFailurePhase::trace_solve);
+    }
+    evidence.linear_iterations += iterations;
+    evidence.linear_solve_attempts += solve_attempts;
+    evidence.true_residual_tightenings += tightenings;
+    evidence.final_coherent_linear_iterations += iterations;
+    if (factor_current) ++evidence.work.complete_factor_setups;
+    ++evidence.work.complete_trace_solves;
+    maximum_true_residual = std::max(maximum_true_residual, true_residual);
+    CompletePhase();
+
+    if (!EnterPhase(injection, CpuFailurePhase::recovery))
+      return fail(CpuFailurePhase::recovery,
+                  CpuAttemptStatus::injected_failure);
+    if (!Recover() || !CaptureRodasStageIncrement(stage))
+      return fail(CpuFailurePhase::recovery);
+    ++evidence.work.complete_recoveries;
+    CompletePhase();
+  }
+  reusable_operator_generation = 0;
+
+  double temporal_error_norm = 0.0;
+  if (!FormRodasCandidate(temporal_error_norm))
+    return fail(CpuFailurePhase::recovery);
+  evidence.temporal_error_norm = temporal_error_norm;
+
+  double candidate_density = 0.0;
+  double candidate_pressure = 0.0;
+  double candidate_wave = 0.0;
+  if (!CollectiveAll(Prescreen(*iterate_interior, *iterate_trace,
+                               candidate_density, candidate_pressure,
+                               candidate_wave)))
+  {
+    return fail(CpuFailurePhase::recovery,
+                CpuAttemptStatus::runtime_failure,
+                FailureReason::admissibility_gate);
+  }
+  minimum_density = std::min(minimum_density, candidate_density);
+  minimum_pressure = std::min(minimum_pressure, candidate_pressure);
+  maximum_wave = std::max(maximum_wave, candidate_wave);
+
+  double final_algebraic_residual = 0.0;
+  double final_algebraic_correction = 0.0;
+  projection_phase = CpuFailurePhase::none;
+  projection_injected = false;
+  const bool final_projection_ready = ProjectRodasAlgebraicState(
+          injection, evidence, maximum_true_residual,
+          final_algebraic_residual, final_algebraic_correction,
+          projection_phase, projection_injected);
+  evidence.final_nonlinear_residual = final_algebraic_residual;
+  evidence.final_algebraic_residual = final_algebraic_residual;
+  evidence.final_algebraic_correction_norm = final_algebraic_correction;
+  if (!final_projection_ready)
+  {
+    return fail(projection_phase,
+                projection_injected ? CpuAttemptStatus::injected_failure
+                                    : CpuAttemptStatus::runtime_failure);
+  }
+  if (!CollectiveAll(Finite(final_algebraic_correction)))
+  {
+    return fail(CpuFailurePhase::recovery,
+                CpuAttemptStatus::runtime_failure,
+                FailureReason::success_gate);
+  }
+
+  if (!EnterPhase(injection,
+                  CpuFailurePhase::after_recovery_before_commit))
+  {
+    return fail(CpuFailurePhase::after_recovery_before_commit,
+                CpuAttemptStatus::injected_failure);
+  }
+  CompletePhase();
+  if (!EnterPhase(injection, CpuFailurePhase::diagnostics))
+    return fail(CpuFailurePhase::diagnostics,
+                CpuAttemptStatus::injected_failure);
+
+  double final_density = 0.0;
+  double final_pressure = 0.0;
+  double final_wave = 0.0;
+  if (!CollectiveAll(Prescreen(*iterate_interior, *iterate_trace,
+                               final_density, final_pressure, final_wave)))
+  {
+    return fail(CpuFailurePhase::diagnostics,
+                CpuAttemptStatus::runtime_failure,
+                FailureReason::admissibility_gate);
+  }
+  // Preserve the projected principal candidate while the RODAS conservation
+  // witness reloads its preprojection stage and frozen-direction states.
+  if (!StoreCandidate()) return fail(CpuFailurePhase::diagnostics);
+  double conservation_error = 0.0;
+  double conservation_relative_error = 0.0;
+  bool conservation_balanced = RodasConservationBalance(
+      attempt.dt, conservation_error, conservation_relative_error);
+  if (conservation_balanced && IsIgr())
+  {
+    // The scalar IGR continuum equation remains an instantaneous algebraic
+    // closure.  Its established endpoint integral is separate from the ROW
+    // differential U4 balance above.
+    double scalar_error = 0.0;
+    double scalar_relative_error = 0.0;
+    conservation_balanced = ConservationBalance(
+        *iterate_interior, *iterate_trace, attempt.dt,
+        scalar_error, scalar_relative_error, false, true);
+    conservation_error = std::max(conservation_error, scalar_error);
+    conservation_relative_error = std::max(
+        conservation_relative_error, scalar_relative_error);
+  }
+  workspace.maximum_conservation_error = conservation_error;
+  workspace.maximum_conservation_relative_error =
+      conservation_relative_error;
+  workspace.conservation_gate = conservation_balanced &&
+      conservation_relative_error <= config.conservation_relative_tolerance;
+  if (!CollectiveAll(workspace.conservation_gate))
+    return fail(CpuFailurePhase::diagnostics,
+                CpuAttemptStatus::runtime_failure,
+                FailureReason::success_gate);
+  CompletePhase();
+
+  const bool architecture_census =
+      evidence.work.common_shift_operator_builds == 1 &&
+      evidence.work.common_shift_operator_reuses == 3 &&
+      evidence.work.condensed_rhs_refreshes == 3 &&
+      evidence.work.complete_factor_setups <=
+          evidence.work.complete_trace_solves &&
+      evidence.linear_solve_attempts ==
+          static_cast<int>(evidence.work.complete_trace_solves) +
+              evidence.true_residual_tightenings;
+  if (!CollectiveAll(architecture_census))
+    return fail(CpuFailurePhase::terminal_evidence);
+
+  const StateHash stored_candidate_hash = HashPair(
+      HashDoubles(Candidate()->interior), HashDoubles(Candidate()->trace));
+  workspace.current_newton = {};
+  workspace.current_newton.accepted = true;
+  workspace.current_newton.ordered = true;
+  workspace.current_newton.affine_consumption_verified = true;
+  workspace.current_newton.retained_for_publication = true;
+  workspace.current_newton.candidate_generation =
+      next_candidate_generation++;
+  workspace.current_newton.candidate_state_hash = stored_candidate_hash;
+  evidence.candidate_generation =
+      workspace.current_newton.candidate_generation;
+  active_candidate_generation = evidence.candidate_generation;
+  active_candidate_state_hash = stored_candidate_hash;
+  publication_chain_authority = true;
+
+  evidence.nonlinear_updates = 0;
+  evidence.initial_nonlinear_residual = initial_algebraic_residual;
+  evidence.final_nonlinear_residual = final_algebraic_residual;
+  evidence.maximum_true_relative_residual = maximum_true_residual;
+  evidence.minimum_density =
+      std::min({minimum_density, final_density, candidate_density});
+  evidence.minimum_pressure =
+      std::min({minimum_pressure, final_pressure, candidate_pressure});
+  evidence.maximum_wave_speed =
+      std::max({maximum_wave, final_wave, candidate_wave});
+  evidence.finite_gate = Finite(temporal_error_norm) &&
+      Finite(final_algebraic_residual) &&
+      Finite(final_algebraic_correction) &&
+      Finite(Candidate()->interior) && Finite(Candidate()->trace);
+  evidence.admissibility_gate = final_density > 0.0 &&
+      final_pressure > 0.0 && Finite(final_wave);
+  const double algebraic_residual_allowance = std::max(
+      config.nonlinear_tolerance,
+      1024.0 * std::numeric_limits<double>::epsilon());
+  evidence.recovery_gate = final_algebraic_residual <=
+      algebraic_residual_allowance;
+  evidence.nonlinear_gate = evidence.recovery_gate;
+  evidence.true_residual_gate = maximum_true_residual <=
+      config.true_residual_tolerance;
+  if (config.force_private_scientific_gate_failure)
+    evidence.true_residual_gate = false;
+  evidence.status = CpuAttemptStatus::success;
+  evidence.failure_phase = CpuFailurePhase::none;
+  evidence.transfers.allocation_events = allocations.EventsAfterBaseline();
+  if (evidence.transfers.allocation_events != 0)
+    return fail(CpuFailurePhase::terminal_evidence);
+  result.evidence = evidence;
+  result.gates = {evidence.finite_gate, evidence.admissibility_gate,
+                  evidence.recovery_gate, evidence.true_residual_gate,
+                  true, evidence.nonlinear_gate &&
+                      workspace.conservation_gate};
+  result.originating_failure = FailureReason::none;
+  return result;
+}
+
 detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
     const AttemptIdentity& attempt,
     const StateCoordinates& coordinates,
     const CpuFailureInjection& injection) noexcept
 {
   Implementation& state = *implementation_;
+  if (state.IsRodas3())
+    return state.ExecuteRodas3(attempt, coordinates, injection);
   CpuNumericalResult result;
   CpuAttemptWorkspace& workspace = state.active_evidence;
   workspace = {};
@@ -9159,6 +11981,10 @@ void detail::CpuNumericsCore::InvalidateCandidateGeneration() noexcept
   }
   state.active_candidate_generation = 0;
   state.active_candidate_state_hash = {};
+  state.assessed_candidate_generation = 0;
+  state.assessed_candidate_state_hash = {};
+  state.assessed_candidate_policy = {};
+  state.assessed_candidate_authority = false;
   state.active_candidate_scalar_closure_coherent = false;
   state.publication_chain_authority = false;
 }

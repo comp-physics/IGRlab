@@ -3,6 +3,70 @@
 namespace detail
 {
 
+// Qualification of a supplied RODAS3 entry state uses the same normalized
+// algebraic correction as the CPU leaf. Keep the reduction private to this
+// implementation: it is one scalar gate, not retained diagnostic history.
+static __global__ void CudaRodasNormalizedEntryCorrectionSquaredKernel(
+    const CudaDeviceView view, const CudaMeshShape shape,
+    double* const result)
+{
+  __shared__ double partial[256];
+  const int thread = threadIdx.x;
+  double sum = 0.0;
+  const int auxiliary_components =
+      shape.interior_components - conserved_components;
+  const int auxiliary_offset =
+      conserved_components * shape.scalar_interior_dofs;
+  for (int element = 0; element < shape.elements; ++element)
+    for (int local = thread;
+         local < auxiliary_components * shape.scalar_interior_dofs;
+         local += blockDim.x)
+    {
+      const int index = element * shape.interior_dofs +
+          auxiliary_offset + local;
+      const double before = view.rodas_combination_interior[index];
+      const double after = view.work_interior[index];
+      const double scale = fmax(1.0, fmax(fabs(before), fabs(after)));
+      const double correction = (after - before) / scale;
+      sum += correction * correction;
+    }
+  for (int index = thread; index < shape.true_trace_count;
+       index += blockDim.x)
+  {
+    const double before = view.rodas_combination_true_trace[index];
+    const double after = view.work_true_trace[index];
+    const double scale = fmax(1.0, fmax(fabs(before), fabs(after)));
+    const double correction = (after - before) / scale;
+    sum += correction * correction;
+  }
+  partial[thread] = sum;
+  __syncthreads();
+  for (int offset = blockDim.x / 2; offset > 0; offset /= 2)
+  {
+    if (thread < offset) partial[thread] += partial[thread + offset];
+    __syncthreads();
+  }
+  if (thread == 0) result[0] = partial[0];
+}
+
+inline bool CudaLaunchRodasNormalizedEntryCorrectionSquared(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    double* const result) noexcept
+{
+  if (!shape.borrowed_host_inputs || shape.elements <= 0 ||
+      shape.scalar_interior_dofs <= 0 ||
+      shape.interior_components < conserved_components ||
+      shape.true_trace_count <= 0 ||
+      view.rodas_combination_interior == nullptr ||
+      view.rodas_combination_true_trace == nullptr ||
+      view.work_interior == nullptr || view.work_true_trace == nullptr ||
+      result == nullptr)
+    return false;
+  CudaRodasNormalizedEntryCorrectionSquaredKernel<<<1, 256>>>(
+      view, shape, result);
+  return cudaPeekAtLastError() == cudaSuccess;
+}
+
 inline int CudaDecodeSigned(const int encoded, double& sign) noexcept
 {
   sign = encoded >= 0 ? 1.0 : -1.0;
@@ -859,6 +923,22 @@ BindArenaViews() noexcept
   if (partitioned_backward_euler_)
     view_.partitioned_base_interior = take_d(
         generic ? generic_arena_layout_.partitioned_base_interior : 0);
+  if (rodas3_)
+  {
+    for (double*& stage : view_.rodas_stage_interior)
+      stage = take_d(max_i);
+    view_.rodas_combination_interior = take_d(max_i);
+    view_.rodas_residual_f = take_d(max_i);
+    for (double*& stage : view_.rodas_stage_true_trace)
+      stage = take_d(max_tt);
+    if (ranks_ == 2)
+      for (double*& stage : view_.rodas_stage_local_trace)
+        stage = take_d(max_lt);
+    view_.rodas_combination_true_trace = take_d(max_tt);
+    view_.rodas_residual_g = take_d(max_er);
+    view_.rodas_operator_b = take_d(max_b);
+    view_.rodas_operator_c = take_d(max_b);
+  }
   view_.output_interior = take_d(max_i);
   view_.recovered_interior = take_d(max_i);
   view_.work_true_trace = take_d(max_tt);
@@ -1139,6 +1219,10 @@ BuildPersistentTrueSystem() noexcept
       CudaTraceSolverKind::native_rank1_fp64;
   const bool use_mgr = trace_solver_kind_ ==
       CudaTraceSolverKind::hypre_fgmres_mgr_rank1;
+  const int expected_element_schwarz_rows =
+      NativeElementSchwarzPatchRows(shape_.order, shape_.igr_active);
+  const int expected_trace_components = shape_.igr_active
+      ? igr_trace_components : conserved_components;
   if (!IsKnownCudaTraceSolverKind(trace_solver_kind_) ||
       (use_native && (ranks_ != 1 || !borrowed_topology_ ||
                       !shape_.borrowed_host_inputs)) ||
@@ -1150,10 +1234,9 @@ BuildPersistentTrueSystem() noexcept
       (!use_mgr && selected_preconditioner ==
           CudaTracePreconditionerKind::hypre_mgr_field_split) ||
       (use_element_schwarz &&
-       (!use_native || ranks_ != 1 || !shape_.igr_active ||
-        shape_.trace_components != igr_trace_components ||
-        shape_.trace_dofs !=
-            NativeElementSchwarzIgrPatchRows(shape_.order))) ||
+       (!use_native || ranks_ != 1 ||
+        shape_.trace_components != expected_trace_components ||
+        shape_.trace_dofs != expected_element_schwarz_rows)) ||
       (use_matrix_free && !use_element_schwarz))
     return false;
   initialization_tensor_core_evidence_ = {};
@@ -1631,7 +1714,10 @@ BuildPersistentTrueSystem() noexcept
               native_trace_workspace_.permutation_marks != nullptr
           : use_element_schwarz
               ? native_ilu_inverse_diagonal_ == nullptr &&
-                  native_trace_workspace_.permutation_marks != nullptr &&
+                  (native_trace_requirements_.permutation_integers == 0
+                       ? native_trace_workspace_.permutation_marks == nullptr
+                       : native_trace_workspace_.permutation_marks !=
+                             nullptr) &&
                   element_schwarz_plan_.valid &&
                   view_.element_schwarz_patch_matrix != nullptr &&
                   view_.element_schwarz_patch_lu != nullptr &&
@@ -2037,7 +2123,7 @@ BuildSparseStagingPlan() noexcept
   if (use_element_schwarz)
   {
     const int expected_patch_rows =
-        NativeElementSchwarzIgrPatchRows(shape_.order);
+        NativeElementSchwarzPatchRows(shape_.order, shape_.igr_active);
     element_schwarz_plan_ = BuildNativeElementSchwarzPlan({
         shape_.elements, shape_.trace_dofs, shape_.local_trace_count,
         shape_.true_trace_count, true_structure_.diag_nonzeros,
@@ -2053,8 +2139,10 @@ BuildSparseStagingPlan() noexcept
         shape_.trace_dofs;
     const std::size_t element_rows =
         static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs;
-    const bool plan_exact = ranks_ == 1 && shape_.igr_active &&
-        shape_.trace_components == igr_trace_components &&
+    const int expected_trace_components = shape_.igr_active
+        ? igr_trace_components : conserved_components;
+    const bool plan_exact = ranks_ == 1 &&
+        shape_.trace_components == expected_trace_components &&
         shape_.trace_dofs == expected_patch_rows &&
         shape_.matrix_owned_count == static_cast<int>(patch_entries) &&
         shape_.matrix_send_count == 0 && shape_.matrix_receive_count == 0 &&
@@ -2319,6 +2407,50 @@ DistributeTraceIncrement() noexcept
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+DistributeRodasStageIncrement(const std::size_t stage) noexcept
+{
+  using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
+  if (stage >= Coefficients::stage_count ||
+      view_.rodas_stage_true_trace[stage] == nullptr)
+    return false;
+  // Rank one has no ghosts and the conservation kernel deliberately keeps the
+  // established owned=true-vector path without any added staging work.
+  if (ranks_ == 1) return true;
+  if (ranks_ != 2 || view_.rodas_stage_local_trace[stage] == nullptr)
+    return false;
+
+  ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_packing);
+  double* owned_host = owned_stage_.HostWrite();
+  const std::size_t owned_bytes =
+      static_cast<std::size_t>(shape_.true_trace_count) * sizeof(double);
+  const std::size_t local_bytes =
+      static_cast<std::size_t>(shape_.local_trace_count) * sizeof(double);
+  const bool staged_out = TransportPolicy::DeviceToHost(
+          owned_host, view_.rodas_stage_true_trace[stage], owned_bytes,
+          CudaTransferCategory::host_staged_trace_exchange,
+          CudaTransferSite::trace_solution_stage_out) &&
+      TransportPolicy::Synchronize(
+          CudaTransferSite::trace_solution_stage_out);
+  if (!CollectiveContinue(staged_out)) return false;
+  const bool distributed =
+      exchange_plan_.Distribute(*trace_space_, owned_stage_, local_stage_);
+  const bool staging_recorded = TransportPolicy::RecordMpiStaging(
+      host_exchange_bytes_,
+      CudaTransferCategory::host_staged_trace_exchange,
+      CudaTransferSite::trace_ghost_stage_in, owned_host,
+      local_stage_.HostRead(), owned_bytes, local_bytes, distributed);
+  if (!CollectiveContinue(distributed && staging_recorded)) return false;
+  const bool local_ready = TransportPolicy::HostToDevice(
+          view_.rodas_stage_local_trace[stage], local_stage_.HostRead(),
+          local_bytes, CudaTransferCategory::host_staged_trace_exchange,
+          CudaTransferSite::trace_ghost_stage_in) &&
+      TransportPolicy::Synchronize(CudaTransferSite::trace_ghost_stage_in);
+  return CollectiveContinue(local_ready);
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 AssembleTrueVector(const double* element_values, double* true_values,
                    const bool completion_required) noexcept
 {
@@ -2438,8 +2570,70 @@ AssembleTrueSystem() noexcept
     return false;
   true_matrix_->HypreRead();
   hypre_rhs_->HypreRead();
-  return CollectiveContinue(CudaHypreDevicePolicyValid(
-      *true_matrix_, *hypre_rhs_, *hypre_solution_));
+  const bool ready = CudaHypreDevicePolicyValid(
+      *true_matrix_, *hypre_rhs_, *hypre_solution_) &&
+      true_rhs_generation_ != std::numeric_limits<std::uint64_t>::max();
+  if (!CollectiveContinue(ready)) return false;
+  ++true_rhs_generation_;
+  return true;
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+RefreshRetainedTrueRhs() noexcept
+{
+  ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_trace_assembly);
+  const bool common_admission = (ranks_ == 1 || ranks_ == 2) &&
+      true_matrix_ && hypre_rhs_ && hypre_solution_;
+  const bool native_admitted = common_admission &&
+      trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64 &&
+      element_schwarz_plan_.valid &&
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          trace_policy_descriptor_.resolved_selection);
+  const bool ordinary_admitted = common_admission &&
+      ranks_ == 1 &&
+      trace_solver_kind_ == CudaTraceSolverKind::hypre_parcsr_gmres &&
+      CudaTracePreconditionerIsIlu(trace_preconditioner_) &&
+      CudaOrdinaryRankOneRefreshPolicyIsExact(trace_policy_descriptor_);
+  const bool host_staged_rank_two_admitted = common_admission &&
+      ranks_ == 2 && host_staged_rank2_ &&
+      trace_solver_kind_ == CudaTraceSolverKind::hypre_host_staged_rank2 &&
+      CudaHostStagedRankTwoPolicyIsExact(trace_policy_descriptor_);
+  bool refreshed = false;
+  if (native_admitted)
+  {
+    refreshed = CudaLaunchAssembleNativeElementVector(
+            view_, shape_, view_.condensed_rhs,
+            view_.true_rhs_scratch) &&
+        TransportPolicy::Synchronize(
+            CudaTransferSite::rhs_remote_scatter);
+  }
+  else if (ordinary_admitted || host_staged_rank_two_admitted)
+  {
+    // AssembleTrueVector writes only the retained HYPRE RHS storage. It does
+    // not touch true_matrix_ or any element Schur/LU data. Rank two performs
+    // its established host-staged remote-vector gather inside this call.
+    refreshed = AssembleTrueVector(
+        view_.condensed_rhs, view_.true_rhs_scratch, true);
+  }
+  if (!CollectiveContinue(refreshed))
+    return false;
+  try
+  {
+    // HypreRead publishes the retained ParCSR operator and refreshed vector.
+    // No matrix value, transpose cache, or local condensation factor is
+    // rebuilt on any admitted RHS-only path.
+    true_matrix_->HypreRead();
+    hypre_rhs_->HypreRead();
+  }
+  catch (...) { return false; }
+  const bool ready = CudaHypreDevicePolicyValid(
+      *true_matrix_, *hypre_rhs_, *hypre_solution_) &&
+      true_rhs_generation_ != std::numeric_limits<std::uint64_t>::max();
+  if (!CollectiveContinue(ready)) return false;
+  ++true_rhs_generation_;
+  return true;
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
@@ -2681,7 +2875,7 @@ LaunchAndObserveNativeRankOneTraceSolve(
   trace_operator.element_schur = use_matrix_free ? view_.schur : nullptr;
   const bool operator_exact = use_matrix_free
       ? use_element_schwarz && element_schwarz_exact && ranks_ == 1 &&
-          shape_.igr_active && trace_operator.element_schur == view_.schur &&
+          trace_operator.element_schur == view_.schur &&
           element_schwarz.patch_rows == shape_.trace_dofs &&
           use_matrix_free_equilibrated_field_split ==
               use_equilibrated_field_split &&
@@ -2856,6 +3050,7 @@ SolveTrueSystemAttempt(double& true_relative_residual,
                 const CudaNativeTraceActiveSubspace active_subspace,
                 const double requested_relative_tolerance,
                 const bool same_matrix_retry,
+                const bool same_operator_new_rhs,
                 int& linear_iterations,
                 CudaTensorCoreEvidence& tensor_core_evidence) noexcept
 {
@@ -2875,9 +3070,53 @@ SolveTrueSystemAttempt(double& true_relative_residual,
           trace_preconditioner_);
   const bool projected_subspace =
       CudaNativeTraceActiveSubspaceIsProjected(active_subspace);
+  const bool retained_operator = same_matrix_retry ||
+      same_operator_new_rhs;
+  const CudaTraceRhsTransition rhs_transition = same_matrix_retry
+      ? CudaTraceRhsTransition::same_operator_same_rhs_retry
+      : same_operator_new_rhs
+          ? CudaTraceRhsTransition::same_operator_new_rhs
+          : CudaTraceRhsTransition::new_operator;
+  const bool rhs_transition_exact = !use_element_schwarz ||
+      CudaElementSchwarzRhsTransitionIsExact(
+          element_schwarz_attempt_state_, true_rhs_generation_,
+          rhs_transition);
+  const bool native_retained_rhs = !same_matrix_retry &&
+      trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64 &&
+      ranks_ == 1 && use_element_schwarz &&
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          trace_policy_descriptor_.resolved_selection) &&
+      element_schwarz_attempt_state_.factor_ready &&
+      element_schwarz_attempt_state_.factor_generation ==
+          matrix_generation &&
+      element_schwarz_attempt_state_.last_solve_generation ==
+          matrix_generation &&
+      true_rhs_generation_ >
+          element_schwarz_attempt_state_.last_rhs_generation;
+  const bool ordinary_retained_rhs = !same_matrix_retry &&
+      trace_solver_kind_ == CudaTraceSolverKind::hypre_parcsr_gmres &&
+      ranks_ == 1 && use_ilu &&
+      CudaOrdinaryRankOneRefreshPolicyIsExact(
+          trace_policy_descriptor_) &&
+      CudaOrdinaryRankOneRefreshAttemptIsExact(
+          ilu_factor_state_, current_attempt_,
+          reinterpret_cast<std::uintptr_t>(true_matrix_.get()),
+          reinterpret_cast<std::uintptr_t>(true_device_.diag_values),
+          reinterpret_cast<std::uintptr_t>(true_device_.offd_values),
+          true_device_.diag_nonzeros, true_device_.offd_nonzeros) &&
+      true_rhs_generation_ > 0;
+  const bool host_staged_rank_two_retained_rhs = !same_matrix_retry &&
+      trace_solver_kind_ == CudaTraceSolverKind::hypre_host_staged_rank2 &&
+      ranks_ == 2 && host_staged_rank2_ &&
+      CudaHostStagedRankTwoPolicyIsExact(trace_policy_descriptor_) &&
+      true_rhs_generation_ > 0;
+  const bool same_operator_rhs_admitted = !same_operator_new_rhs ||
+      native_retained_rhs || ordinary_retained_rhs ||
+      host_staged_rank_two_retained_rhs;
   if (!IsKnownCudaNativeTraceActiveSubspace(active_subspace) ||
       (projected_subspace &&
-       trace_solver_kind_ != CudaTraceSolverKind::native_rank1_fp64))
+       trace_solver_kind_ != CudaTraceSolverKind::native_rank1_fp64) ||
+      !rhs_transition_exact || !same_operator_rhs_admitted)
     return false;
   std::uint64_t robust_lower_setup_delta = 0;
   std::uint64_t robust_coupled_setup_delta = 0;
@@ -2921,8 +3160,8 @@ SolveTrueSystemAttempt(double& true_relative_residual,
       const bool transition_ready = element_schwarz_plan_.valid &&
           CudaElementSchwarzFactorTransitionIsExact(
               element_schwarz_attempt_state_, current_attempt_,
-              matrix_generation, same_matrix_retry);
-      if (same_matrix_retry)
+              matrix_generation, retained_operator);
+      if (retained_operator)
       {
         const CudaTracePreconditionerKind retained =
             element_schwarz_attempt_state_.factor_preconditioner;
@@ -3044,7 +3283,7 @@ SolveTrueSystemAttempt(double& true_relative_residual,
             &native_observation);
     constexpr std::uint32_t invalid_preconditioner_failure_mask = 1U << 2;
     const bool lower_application_structurally_rejected =
-        robust && !projected_subspace && !same_matrix_retry && !solved &&
+        robust && !projected_subspace && !retained_operator && !solved &&
         diagnostics.device_policy &&
         schwarz_factor_ready &&
         element_schwarz_attempt_state_.factor_preconditioner ==
@@ -3164,7 +3403,7 @@ SolveTrueSystemAttempt(double& true_relative_residual,
     {
       const bool state_generation_ready = ilu_factor_state_.factor_ready &&
           ilu_factor_state_.factor_generation <= matrix_generation &&
-          (same_matrix_retry
+          (retained_operator
                ? matrix_generation == ilu_factor_state_.last_solve_generation
                : matrix_generation > ilu_factor_state_.last_solve_generation);
       if (state_generation_ready)
@@ -3178,14 +3417,23 @@ SolveTrueSystemAttempt(double& true_relative_residual,
           element_schwarz_attempt_state_.factor_ready &&
           element_schwarz_attempt_state_.factor_generation ==
               matrix_generation &&
-          (same_matrix_retry
+          (retained_operator
                ? matrix_generation ==
                    element_schwarz_attempt_state_.last_solve_generation
                : matrix_generation >
-                   element_schwarz_attempt_state_.last_solve_generation);
+                   element_schwarz_attempt_state_.last_solve_generation) &&
+          (same_matrix_retry
+               ? true_rhs_generation_ ==
+                   element_schwarz_attempt_state_.last_rhs_generation
+               : true_rhs_generation_ >
+                   element_schwarz_attempt_state_.last_rhs_generation);
       if (state_generation_ready)
+      {
         element_schwarz_attempt_state_.last_solve_generation =
             matrix_generation;
+        element_schwarz_attempt_state_.last_rhs_generation =
+            true_rhs_generation_;
+      }
       else
       {
         if (robust)
@@ -3328,7 +3576,7 @@ SolveTrueSystemAttempt(double& true_relative_residual,
             current_attempt_, requested_relative_tolerance,
             maximum_linear_iterations_, krylov_dimension_,
             matrix_generation, ilu_factor_state_, diagnostics,
-            same_matrix_retry);
+            retained_operator);
       }
     }
     else
@@ -3342,7 +3590,7 @@ SolveTrueSystemAttempt(double& true_relative_residual,
   }
   if (solved && robust)
   {
-    const bool setup_deltas_exact = same_matrix_retry
+    const bool setup_deltas_exact = retained_operator
         ? robust_lower_setup_delta == 0 &&
             robust_coupled_setup_delta == 0 &&
             robust_lower_rejected_solve_delta == 0
@@ -3497,7 +3745,8 @@ SolveTrueSystem(const generic::EulerHdgLinearSolveRole role,
                 int& linear_iterations,
                 int& linear_solve_attempts,
                 int& true_residual_tightenings,
-                CudaTensorCoreEvidence& tensor_core_evidence) noexcept
+                CudaTensorCoreEvidence& tensor_core_evidence,
+                const bool same_operator_new_rhs) noexcept
 {
   linear_iterations = 0;
   linear_solve_attempts = 0;
@@ -3507,12 +3756,14 @@ SolveTrueSystem(const generic::EulerHdgLinearSolveRole role,
       ? newton_correction_linear_relative_tolerance_
       : final_coherent_linear_relative_tolerance_;
   const auto invoke = [&](const double tolerance,
-                          const bool same_matrix_retry) noexcept
+                          const bool same_matrix_retry,
+                          const bool retained_new_rhs) noexcept
   {
     int invocation_iterations = 0;
     const bool solved = SolveTrueSystemAttempt(
         true_relative_residual, matrix_generation, active_subspace, tolerance,
-        same_matrix_retry, invocation_iterations, tensor_core_evidence);
+        same_matrix_retry, retained_new_rhs, invocation_iterations,
+        tensor_core_evidence);
     const bool bounded = invocation_iterations >= 0 &&
         linear_iterations <= std::numeric_limits<int>::max() -
             invocation_iterations &&
@@ -3525,7 +3776,7 @@ SolveTrueSystem(const generic::EulerHdgLinearSolveRole role,
     return solved && bounded;
   };
 
-  if (!invoke(requested_tolerance, false)) return false;
+  if (!invoke(requested_tolerance, false, same_operator_new_rhs)) return false;
   if (true_relative_residual <= true_residual_relative_tolerance_)
     return true;
   const bool tighten =
@@ -3533,8 +3784,844 @@ SolveTrueSystem(const generic::EulerHdgLinearSolveRole role,
           requested_tolerance;
   if (!CollectiveContinue(tighten)) return false;
   ++true_residual_tightenings;
-  return invoke(true_residual_tightening_linear_relative_tolerance_, true) &&
+  return invoke(true_residual_tightening_linear_relative_tolerance_, true,
+                false) &&
       true_relative_residual <= true_residual_relative_tolerance_;
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+auto CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
+              state_slot& workspace) noexcept -> CudaNumericalResult
+{
+  using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
+  ::dg_igr::NVTXRange accepted_step_profile_region(
+      ::dg_igr::observability::RegionId::hdg_accepted_step);
+  CudaIluFactorAttemptEndGuard end_factor_attempt(ilu_factor_state_);
+  CudaElementSchwarzAttemptEndGuard end_schwarz_attempt(
+      element_schwarz_attempt_state_);
+  CudaNumericalResult result{};
+  result.tensor_core.selected_engine = cuda_engine_;
+  result.tensor_core.requested_trace_policy =
+      trace_policy_descriptor_.requested_selection;
+  result.tensor_core.resolved_trace_policy =
+      trace_policy_descriptor_.resolved_selection;
+  result.tensor_core.trace_policy_rank_count =
+      trace_policy_descriptor_.rank_count;
+  result.tensor_core.trace_policy_order =
+      trace_policy_descriptor_.polynomial_order;
+  result.tensor_core.trace_preconditioner = trace_preconditioner_;
+  result.tensor_core.trace_preconditioner_configured =
+      CudaTracePolicyDescriptorIsExact(trace_policy_descriptor_) &&
+      trace_preconditioner_ == trace_policy_descriptor_.trace_preconditioner;
+  result.tensor_core.native_rank1_trace_solver_configured =
+      trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64;
+  result.tensor_core.hypre_host_staged_rank2_trace_solver_configured =
+      trace_solver_kind_ == CudaTraceSolverKind::hypre_host_staged_rank2;
+  result.tensor_core.native_element_schwarz_configured =
+      CudaTracePreconditionerIsNativeElementSchwarz(trace_preconditioner_) &&
+      element_schwarz_plan_.valid;
+  result.tensor_core.native_matrix_free_trace_operator_configured =
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          trace_policy_descriptor_.resolved_selection) &&
+      result.tensor_core.native_element_schwarz_configured;
+  const bool robust_trace_policy =
+      CudaTracePolicyUsesNativeElementMatrixFreeWarpRobustCoupled(
+          trace_policy_descriptor_.resolved_selection) &&
+      CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+          trace_preconditioner_);
+  result.tensor_core.robust_lower_specialization_supported =
+      robust_trace_policy && native_trace_support_.supported;
+  result.tensor_core.robust_coupled_specialization_supported =
+      robust_trace_policy && native_trace_robust_coupled_support_.supported;
+  result.tensor_core.robust_branch_accounting_complete =
+      !robust_trace_policy ||
+      (result.tensor_core.robust_lower_specialization_supported &&
+       result.tensor_core.robust_coupled_specialization_supported);
+  result.tensor_core.element_schwarz_patch_rows =
+      element_schwarz_plan_.patch_rows;
+  result.tensor_core.element_schwarz_minimum_multiplicity =
+      element_schwarz_plan_.minimum_multiplicity;
+  result.tensor_core.element_schwarz_maximum_multiplicity =
+      element_schwarz_plan_.maximum_multiplicity;
+  result.tensor_core.trace_solver_accounting_complete = true;
+  result.tensor_core.hardware_supported =
+      tensor_core_hardware_supported_;
+  // Every admitted RODAS3 route is fixed before device work and has no
+  // fallback: rank-one tensor-native, rank-one ordinary ParCSR, or the exact
+  // engine-default rank-two host-staged ParCSR leaf.
+  result.tensor_core.fallback_accounting_complete = true;
+  result.precision_work.all_fp64_policy = true;
+  result.precision_work.accounting_complete = true;
+  (void)CudaInitializeIluEvidence(
+      result.tensor_core, trace_preconditioner_, shape_.igr_active);
+
+  accepted_allocation_events_ = AllocatorPolicy::AllocationEvents();
+  const bool tensor_rank_one =
+      cuda_engine_ == generic::CudaEngineKind::tensor_core &&
+      trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64 &&
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          trace_policy_descriptor_.resolved_selection) &&
+      CudaTracePreconditionerIsNativeElementSchwarz(trace_preconditioner_) &&
+      element_schwarz_plan_.valid;
+  const bool ordinary_rank_one =
+      cuda_engine_ == generic::CudaEngineKind::ordinary &&
+      trace_solver_kind_ == CudaTraceSolverKind::hypre_parcsr_gmres &&
+      CudaTracePreconditionerIsIlu(trace_preconditioner_) &&
+      CudaOrdinaryRankOneRefreshPolicyIsExact(trace_policy_descriptor_);
+  const bool host_staged_rank_two =
+      ranks_ == 2 && host_staged_rank2_ &&
+      trace_solver_kind_ == CudaTraceSolverKind::hypre_host_staged_rank2 &&
+      CudaHostStagedRankTwoPolicyIsExact(trace_policy_descriptor_);
+  const bool ilu_common_shift =
+      CudaTracePreconditionerIsIlu(trace_preconditioner_);
+  const bool diagonal_common_shift = trace_preconditioner_ ==
+      CudaTracePreconditionerKind::hypre_diag_scale;
+  const double algebraic_residual_allowance = std::max(
+      nonlinear_relative_tolerance_,
+      1024.0 * std::numeric_limits<double>::epsilon());
+  const bool admitted = initialized_ && rodas3_ &&
+      time_treatment_ == generic::EulerHdgTimeTreatment::rodas3 &&
+      (ranks_ == 1 || ranks_ == 2) && shape_.borrowed_host_inputs &&
+      (tensor_rank_one || ordinary_rank_one || host_staged_rank_two) &&
+      !config.capture_oracle &&
+      std::isfinite(attempt.dt) && attempt.dt > 0.0 &&
+      workspace.interior.coefficients == view_.work_interior &&
+      workspace.trace.coefficients == view_.work_true_trace &&
+      view_.rodas_residual_f != nullptr &&
+      view_.rodas_residual_g != nullptr &&
+      view_.rodas_operator_b != nullptr &&
+      view_.rodas_operator_c != nullptr &&
+      view_.rodas_combination_interior != nullptr &&
+      view_.rodas_combination_true_trace != nullptr &&
+      (ranks_ == 1 ||
+       std::all_of(std::begin(view_.rodas_stage_local_trace),
+                   std::end(view_.rodas_stage_local_trace),
+                   [](const double* value) { return value != nullptr; }));
+  if (!CollectiveContinue(admitted))
+  {
+    result.phase = CudaFailurePhase::setup;
+    result.reason = FailureReason::backend_failure;
+    return result;
+  }
+
+  const bool numerical_injection_phase =
+      config.injection.phase == CudaFailurePhase::assembly ||
+      config.injection.phase == CudaFailurePhase::condensation ||
+      config.injection.phase == CudaFailurePhase::trace_solve ||
+      config.injection.phase == CudaFailurePhase::recovery ||
+      config.injection.phase ==
+          CudaFailurePhase::after_recovery_before_commit ||
+      config.injection.phase == CudaFailurePhase::diagnostics;
+  const bool injection_config_valid = !config.injection.enabled ||
+      (numerical_injection_phase && config.injection.target_step != 0 &&
+       config.injection.source_rank >= 0 &&
+       config.injection.source_rank < ranks_);
+  if (!CollectiveContinue(injection_config_valid))
+  {
+    result.reason = FailureReason::collective_protocol;
+    return result;
+  }
+  const bool injection_active = config.injection.enabled &&
+      config.injection.target_step == attempt.committed_step + 1 &&
+      attempt.retry_index == 0;
+  const auto inject_at = [&](const CudaFailurePhase phase) noexcept
+  {
+    result.phase = phase;
+    if (!injection_active || config.injection.phase != phase) return false;
+    const int local_claim = rank_ == config.injection.source_rank ? 1 : 0;
+    int claims = 0;
+    if (MPI_Allreduce(&local_claim, &claims, 1, MPI_INT, MPI_SUM,
+                      communicator_) != MPI_SUCCESS || claims != 1)
+    {
+      result.reason = FailureReason::collective_protocol;
+      return true;
+    }
+    result.injected = true;
+    result.injection_source_rank = config.injection.source_rank;
+    result.reason = FailureReason::backend_failure;
+    return true;
+  };
+  const auto enter = [&](const CudaFailurePhase phase) noexcept
+  {
+    return !inject_at(phase) &&
+        CollectiveContinue(Ticket(phase));
+  };
+  const auto add_volume_work = [&](const std::uint64_t mma_tiles) noexcept
+  {
+    if (result.tensor_core.volume_assembly_launches ==
+            std::numeric_limits<std::uint64_t>::max() ||
+        mma_tiles > std::numeric_limits<std::uint64_t>::max() -
+            result.tensor_core.volume_mma_tiles)
+      return false;
+    ++result.tensor_core.volume_assembly_launches;
+    result.tensor_core.volume_mma_tiles += mma_tiles;
+    ++result.complete_assemblies;
+    return true;
+  };
+  const auto assemble_spatial = [&](const bool algebraic_mask,
+                                    double* residual_norm) noexcept
+  {
+    const std::size_t interior_bytes = workspace.interior.count *
+        sizeof(double);
+    const bool staged = TransportPolicy::DeviceToDevice(
+        view_.old_interior, workspace.interior.coefficients, interior_bytes,
+        CudaTransferCategory::attempt_history,
+        CudaTransferSite::attempt_seed_interior);
+    if (!CollectiveContinue(staged)) return false;
+    std::uint64_t mma_tiles = 0;
+    bool launched = false;
+    {
+      ::dg_igr::NVTXRange profile_region(
+          ::dg_igr::observability::RegionId::hdg_local_assembly);
+      launched = CudaLaunchAssembly(
+          view_, shape_, Coefficients::ShiftScale(attempt.dt), cuda_engine_,
+          mma_tiles, true);
+    }
+    if (!CollectiveContinue(launched && StatusPassed()) ||
+        !CollectiveContinue(add_volume_work(mma_tiles)))
+      return false;
+    if (algebraic_mask &&
+        !CollectiveContinue(CudaLaunchRodasAlgebraicMask(view_, shape_) &&
+                            StatusPassed()))
+      return false;
+    if (residual_norm == nullptr) return true;
+    if (!AssembleTrueVector(
+            view_.residual_g, view_.true_residual, false) ||
+        !CollectiveContinue(CudaLaunchLocalSquaredNorm(
+            view_.residual_r, shape_.interior_count, view_.true_residual,
+            shape_.true_trace_count, view_.status, shape_.elements,
+            view_.scalar)))
+      return false;
+    double local_squared = 0.0;
+    const bool copied = TransportPolicy::DeviceToHost(
+            &local_squared, view_.scalar, sizeof(double),
+            CudaTransferCategory::scalar_diagnostic,
+            CudaTransferSite::scalar_status) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    if (!CollectiveContinue(copied)) return false;
+    double global_squared = 0.0;
+    const bool reduced = MPI_Allreduce(
+        &local_squared, &global_squared, 1, MPI_DOUBLE, MPI_SUM,
+        communicator_) == MPI_SUCCESS;
+    *residual_norm = std::sqrt(global_squared);
+    return CollectiveContinue(reduced && std::isfinite(local_squared) &&
+                              local_squared >= 0.0 &&
+                              std::isfinite(*residual_norm));
+  };
+  const auto condense_current = [&]() noexcept
+  {
+    std::uint64_t mma_tiles = 0;
+    bool condensed = false;
+    {
+      ::dg_igr::NVTXRange profile_region(
+          ::dg_igr::observability::RegionId::hdg_condensation);
+      condensed = CopyBase(workspace) &&
+          CudaLaunchCondensation(view_, shape_, cuda_engine_, mma_tiles) &&
+          StatusPassed();
+    }
+    if (!CollectiveContinue(condensed)) return false;
+    if (result.tensor_core.condensation_launches ==
+            std::numeric_limits<std::uint64_t>::max() ||
+        mma_tiles > std::numeric_limits<std::uint64_t>::max() -
+            result.tensor_core.mma_tiles)
+      return false;
+    ++result.tensor_core.condensation_launches;
+    result.tensor_core.mma_tiles += mma_tiles;
+    ++result.complete_condensations;
+    return AssembleTrueSystem();
+  };
+  const auto record_linear_work = [&](const int iterations,
+                                      const int attempts,
+                                      const int tightenings) noexcept
+  {
+    if (iterations < 0 || attempts < 0 || tightenings < 0 ||
+        iterations > std::numeric_limits<int>::max() -
+            result.linear_iterations ||
+        iterations > std::numeric_limits<int>::max() -
+            result.final_coherent_linear_iterations ||
+        attempts > std::numeric_limits<int>::max() -
+            result.linear_solve_attempts ||
+        tightenings > std::numeric_limits<int>::max() -
+            result.true_residual_tightenings ||
+        result.trace_solves == std::numeric_limits<int>::max())
+      return false;
+    result.linear_iterations += iterations;
+    result.final_coherent_linear_iterations += iterations;
+    result.linear_solve_attempts += attempts;
+    result.true_residual_tightenings += tightenings;
+    ++result.trace_solves;
+    return true;
+  };
+  double maximum_true_residual = 0.0;
+  const auto solve_and_recover = [&](const std::uint64_t generation,
+                                     const bool retained_rhs,
+                                     const bool algebraic_projection) noexcept
+  {
+    int iterations = 0, attempts = 0, tightenings = 0;
+    double true_residual = std::numeric_limits<double>::infinity();
+    const bool solved = SolveTrueSystem(
+        generic::EulerHdgLinearSolveRole::final_coherent,
+        CudaNativeTraceActiveSubspace::full, true_residual, generation,
+        iterations, attempts, tightenings, result.tensor_core, retained_rhs);
+    if (!CollectiveContinue(solved &&
+                            record_linear_work(iterations, attempts,
+                                               tightenings)))
+      return false;
+    maximum_true_residual = std::max(maximum_true_residual, true_residual);
+    if (!DistributeTraceIncrement()) return false;
+    bool recovered = false;
+    {
+      ::dg_igr::NVTXRange profile_region(
+          ::dg_igr::observability::RegionId::hdg_interior_recovery);
+      recovered = algebraic_projection
+          ? CudaLaunchRecover(view_, shape_, cuda_engine_)
+          : CudaLaunchRecoverFromRetainedLu(view_, shape_);
+    }
+    if (!CollectiveContinue(recovered && StatusPassed())) return false;
+    ++result.complete_recoveries;
+    return true;
+  };
+  const auto admissible = [&]() noexcept
+  {
+    const bool local = CudaLaunchAdmissibility(view_, shape_) &&
+        StatusPassed();
+    return CollectiveContinue(local);
+  };
+  const auto project_algebraic = [&](double& initial_norm,
+                                     double& final_norm) noexcept
+  {
+    initial_norm = std::numeric_limits<double>::infinity();
+    final_norm = std::numeric_limits<double>::infinity();
+    constexpr int maximum_updates = 6;
+    for (int update = 0; update <= maximum_updates; ++update)
+    {
+      if (!enter(CudaFailurePhase::assembly) ||
+          !assemble_spatial(true, &final_norm))
+        return false;
+      if (update == 0) initial_norm = final_norm;
+      // Algebraic consistency is an absolute acceptance contract.  Scaling
+      // the stopping threshold by the entry inconsistency could otherwise
+      // admit a trace/IGR state that merely made a large relative reduction
+      // while remaining outside the qualified index-one constraint surface.
+      if (final_norm <= algebraic_residual_allowance)
+        return true;
+      if (update == maximum_updates) return false;
+      if (!enter(CudaFailurePhase::condensation) || !condense_current())
+        return false;
+      const std::uint64_t generation = ++linear_generation_;
+      if (!enter(CudaFailurePhase::trace_solve)) return false;
+      if (!enter(CudaFailurePhase::recovery) ||
+          !solve_and_recover(generation, false, true) ||
+          !CollectiveContinue(
+              CudaLaunchRodasFreezeDifferentialIncrement(view_, shape_) &&
+              CudaLaunchTrial(view_, shape_, 1.0) &&
+              CudaLaunchRodasRestoreDifferentialState(view_, shape_) &&
+              DistributeCurrentTrace(workspace.trace.coefficients)))
+        return false;
+      ++result.nonlinear_updates;
+    }
+    return false;
+  };
+
+  const std::size_t interior_bytes = workspace.interior.count *
+      sizeof(double);
+  const std::size_t true_trace_bytes = workspace.trace.count *
+      sizeof(double);
+  const bool entry_snapshot = TransportPolicy::DeviceToDevice(
+          view_.rodas_combination_interior,
+          workspace.interior.coefficients, interior_bytes,
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_interior) &&
+      TransportPolicy::DeviceToDevice(
+          view_.rodas_combination_true_trace,
+          workspace.trace.coefficients, true_trace_bytes,
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_trace) &&
+      TransportPolicy::Synchronize(
+          CudaTransferSite::nonlinear_base_trace);
+  if (!CollectiveContinue(entry_snapshot))
+  {
+    result.reason = FailureReason::backend_failure;
+    return result;
+  }
+
+  double initial_algebraic_norm = 0.0;
+  double projected_algebraic_norm = 0.0;
+  if (!project_algebraic(initial_algebraic_norm,
+                         projected_algebraic_norm))
+  {
+    if (result.reason == FailureReason::none)
+      result.reason = FailureReason::recovery_gate;
+    return result;
+  }
+  result.initial_residual = initial_algebraic_norm;
+  const bool entry_correction_launched =
+      CudaLaunchRodasNormalizedEntryCorrectionSquared(
+          view_, shape_, view_.scalar);
+  double local_entry_correction_squared = 0.0;
+  const bool entry_correction_copied = entry_correction_launched &&
+      TransportPolicy::DeviceToHost(
+          &local_entry_correction_squared, view_.scalar, sizeof(double),
+          CudaTransferCategory::scalar_diagnostic,
+          CudaTransferSite::scalar_status) &&
+      TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+  double global_entry_correction_squared = 0.0;
+  const std::uint64_t local_entry_algebraic_count =
+      static_cast<std::uint64_t>(shape_.elements) *
+          (shape_.interior_components - conserved_components) *
+          shape_.scalar_interior_dofs +
+      static_cast<std::uint64_t>(shape_.true_trace_count);
+  std::uint64_t global_entry_algebraic_count = 0;
+  const bool entry_correction_reduced = entry_correction_copied &&
+      MPI_Allreduce(&local_entry_correction_squared,
+                    &global_entry_correction_squared, 1, MPI_DOUBLE,
+                    MPI_SUM, communicator_) == MPI_SUCCESS &&
+      MPI_Allreduce(&local_entry_algebraic_count,
+                    &global_entry_algebraic_count, 1, MPI_UINT64_T,
+                    MPI_SUM, communicator_) == MPI_SUCCESS;
+  const double normalized_entry_correction =
+      global_entry_algebraic_count > 0
+      ? std::sqrt(global_entry_correction_squared /
+                  static_cast<double>(global_entry_algebraic_count))
+      : std::numeric_limits<double>::infinity();
+  constexpr double maximum_entry_algebraic_correction_norm = 0.25;
+  if (!CollectiveContinue(
+          entry_correction_reduced && global_entry_algebraic_count > 0 &&
+          std::isfinite(local_entry_correction_squared) &&
+          local_entry_correction_squared >= 0.0 &&
+          std::isfinite(normalized_entry_correction) &&
+          normalized_entry_correction <=
+              maximum_entry_algebraic_correction_norm))
+  {
+    result.phase = CudaFailurePhase::recovery;
+    result.reason = FailureReason::recovery_gate;
+    return result;
+  }
+  if (!CollectiveContinue(CopyBase(workspace)) || !admissible())
+  {
+    result.reason = FailureReason::admissibility_gate;
+    return result;
+  }
+
+  if (!enter(CudaFailurePhase::assembly) ||
+      !assemble_spatial(false, nullptr))
+  {
+    result.reason = FailureReason::finite_gate;
+    return result;
+  }
+  const std::size_t element_trace_bytes =
+      static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs *
+      sizeof(double);
+  const std::size_t coupling_bytes =
+      static_cast<std::size_t>(shape_.elements) * shape_.interior_dofs *
+      shape_.trace_dofs * sizeof(double);
+  const bool common_saved = TransportPolicy::DeviceToDevice(
+          view_.rodas_residual_f, view_.f, interior_bytes,
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_interior) &&
+      TransportPolicy::DeviceToDevice(
+          view_.rodas_residual_g, view_.g, element_trace_bytes,
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_trace) &&
+      TransportPolicy::DeviceToDevice(
+          view_.rodas_operator_b, view_.b, coupling_bytes,
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_interior) &&
+      TransportPolicy::DeviceToDevice(
+          view_.rodas_operator_c, view_.c, coupling_bytes,
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_interior) &&
+      TransportPolicy::Synchronize(
+          CudaTransferSite::nonlinear_base_interior);
+  if (!CollectiveContinue(common_saved))
+  {
+    result.reason = FailureReason::backend_failure;
+    return result;
+  }
+
+  std::uint64_t common_generation = 0;
+  for (std::size_t stage = 0; stage < Coefficients::stage_count; ++stage)
+  {
+    if (!CollectiveContinue(CudaLaunchRodasLoadStage(view_, shape_, stage) &&
+                            DistributeCurrentTrace(
+                                workspace.trace.coefficients)) ||
+        !admissible())
+    {
+      result.phase = CudaFailurePhase::assembly;
+      result.reason = FailureReason::admissibility_gate;
+      return result;
+    }
+    if (stage >= 2)
+    {
+      if (!enter(CudaFailurePhase::assembly) ||
+          !assemble_spatial(false, nullptr))
+      {
+        result.reason = FailureReason::finite_gate;
+        return result;
+      }
+      const bool residual_and_operator_ready =
+          TransportPolicy::DeviceToDevice(
+              view_.rodas_residual_f, view_.f, interior_bytes,
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_interior) &&
+          TransportPolicy::DeviceToDevice(
+              view_.rodas_residual_g, view_.g, element_trace_bytes,
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_trace) &&
+          TransportPolicy::DeviceToDevice(
+              view_.b, view_.rodas_operator_b, coupling_bytes,
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_interior) &&
+          TransportPolicy::DeviceToDevice(
+              view_.c, view_.rodas_operator_c, coupling_bytes,
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_interior);
+      if (!CollectiveContinue(residual_and_operator_ready))
+      {
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+    }
+    if (!CollectiveContinue(CudaLaunchRodasBuildStageRightHandSide(
+            view_, shape_, stage, attempt.dt) && StatusPassed()))
+    {
+      result.reason = FailureReason::finite_gate;
+      return result;
+    }
+    if (!enter(CudaFailurePhase::condensation)) return result;
+    if (stage == 0)
+    {
+      std::uint64_t mma_tiles = 0;
+      const bool condensed = CudaLaunchCondensation(
+          view_, shape_, cuda_engine_, mma_tiles) && StatusPassed();
+      if (!CollectiveContinue(condensed) ||
+          result.tensor_core.condensation_launches ==
+              std::numeric_limits<std::uint64_t>::max() ||
+          mma_tiles > std::numeric_limits<std::uint64_t>::max() -
+              result.tensor_core.mma_tiles ||
+          !AssembleTrueSystem())
+      {
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+      ++result.tensor_core.condensation_launches;
+      result.tensor_core.mma_tiles += mma_tiles;
+      ++result.complete_condensations;
+      ++result.common_shift_operator_builds;
+      common_generation = ++linear_generation_;
+    }
+    else
+    {
+      const bool refreshed = CudaLaunchCondenseRetainedLuRhs(
+              view_, shape_) && StatusPassed() &&
+          RefreshRetainedTrueRhs();
+      if (!CollectiveContinue(refreshed))
+      {
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+      ++result.common_shift_operator_reuses;
+      ++result.condensed_rhs_refreshes;
+    }
+    const std::uint64_t setups_before = tensor_rank_one
+        ? result.tensor_core.element_schwarz_patch_setups
+        : ilu_common_shift ? result.tensor_core.ilu_factor_setups : 0;
+    const std::uint64_t reuses_before =
+        ilu_common_shift ? result.tensor_core.ilu_factor_reuses : 0;
+    if (!enter(CudaFailurePhase::trace_solve) ||
+        !enter(CudaFailurePhase::recovery) ||
+        !solve_and_recover(common_generation, stage != 0, false) ||
+        !CollectiveContinue(CudaLaunchRodasCaptureStageIncrement(
+                                view_, shape_, stage) &&
+                            StatusPassed() &&
+                            DistributeRodasStageIncrement(stage)))
+    {
+      if (result.reason == FailureReason::none)
+        result.reason = FailureReason::recovery_gate;
+      return result;
+    }
+    const std::uint64_t setups_after = tensor_rank_one
+        ? result.tensor_core.element_schwarz_patch_setups
+        : ilu_common_shift ? result.tensor_core.ilu_factor_setups : 0;
+    const std::uint64_t reuses_after =
+        ilu_common_shift ? result.tensor_core.ilu_factor_reuses : 0;
+    if (!CollectiveContinue(setups_after >= setups_before &&
+                            reuses_after >= reuses_before))
+    {
+      result.reason = FailureReason::telemetry_gate;
+      return result;
+    }
+    const std::uint64_t setup_delta = setups_after - setups_before;
+    const std::uint64_t reuse_delta = reuses_after - reuses_before;
+    if (tensor_rank_one)
+    {
+      if (stage == 0)
+        result.common_shift_preconditioner_setups += setup_delta;
+      else
+      {
+        if (!CollectiveContinue(setup_delta == 0 && reuse_delta == 0))
+        {
+          result.reason = FailureReason::telemetry_gate;
+          return result;
+        }
+        ++result.common_shift_preconditioner_reuses;
+      }
+    }
+    else if (ilu_common_shift)
+    {
+      // The selected ILU lifetime remains authoritative: ordinary CUDA
+      // refreshes every causal solve, whereas tensor IGR retains the first
+      // factor for the complete attempt (including the algebraic projection
+      // that precedes these stages).  Keep the common-shift census logical:
+      // stage zero owns its one setup and stages one through three reuse it,
+      // while tensor_core retains the exact physical setup/reuse totals.
+      if (!CollectiveContinue(setup_delta + reuse_delta == 1))
+      {
+        result.reason = FailureReason::telemetry_gate;
+        return result;
+      }
+      if (trace_policy_descriptor_.ilu_factor_reuse_policy ==
+          CudaIluFactorReusePolicy::first_trace_solve_per_attempt)
+      {
+        if (stage == 0)
+          ++result.common_shift_preconditioner_setups;
+        else
+          ++result.common_shift_preconditioner_reuses;
+      }
+      else
+      {
+        result.common_shift_preconditioner_setups += setup_delta;
+        result.common_shift_preconditioner_reuses += reuse_delta;
+      }
+    }
+    else
+    {
+      // Conventional tensor rank two uses its established HYPRE diagonal
+      // scale. CudaRefreshDiagonalAndSolve rebuilds that scale once per solve;
+      // it intentionally has no ILU counter, so record the physical setup here.
+      if (!CollectiveContinue(host_staged_rank_two &&
+                              diagonal_common_shift &&
+                              setup_delta == 0 && reuse_delta == 0))
+      {
+        result.reason = FailureReason::telemetry_gate;
+        return result;
+      }
+      ++result.common_shift_preconditioner_setups;
+    }
+    ++result.common_shift_trace_solves;
+  }
+
+  if (!CollectiveContinue(CudaLaunchRodasFormCandidate(view_, shape_) &&
+                          DistributeCurrentTrace(
+                              workspace.trace.coefficients)) ||
+      !admissible() ||
+      !CollectiveContinue(CudaLaunchRodasTemporalErrorSquared(
+          view_, shape_, view_.scalar)))
+  {
+    result.reason = FailureReason::admissibility_gate;
+    return result;
+  }
+  double local_error_squared = 0.0;
+  const bool error_copied = TransportPolicy::DeviceToHost(
+          &local_error_squared, view_.scalar, sizeof(double),
+          CudaTransferCategory::scalar_diagnostic,
+          CudaTransferSite::scalar_status) &&
+      TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+  double global_error_squared = 0.0;
+  std::uint64_t local_differential_count =
+      static_cast<std::uint64_t>(shape_.elements) * conserved_components *
+      shape_.scalar_interior_dofs;
+  std::uint64_t global_differential_count = 0;
+  const bool error_reduced = error_copied &&
+      MPI_Allreduce(&local_error_squared, &global_error_squared, 1,
+                    MPI_DOUBLE, MPI_SUM, communicator_) == MPI_SUCCESS &&
+      MPI_Allreduce(&local_differential_count, &global_differential_count, 1,
+                    MPI_UINT64_T, MPI_SUM, communicator_) == MPI_SUCCESS;
+  result.temporal_error_norm = std::sqrt(
+      global_error_squared / static_cast<double>(global_differential_count));
+  if (!CollectiveContinue(error_reduced && global_differential_count > 0 &&
+                          std::isfinite(result.temporal_error_norm)))
+  {
+    result.reason = FailureReason::finite_gate;
+    return result;
+  }
+
+  // Final algebraic Newton updates reuse base_* as their transactional
+  // linearization snapshot.  Preserve the step-entry differential state in
+  // storage that is dead after estimator formation so conservation never
+  // observes a projection iterate as U^n.
+  const bool candidate_snapshot = TransportPolicy::DeviceToDevice(
+          view_.rodas_residual_f, view_.base_interior, interior_bytes,
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_interior) &&
+      TransportPolicy::DeviceToDevice(
+          view_.rodas_residual_g, view_.base_local_trace,
+          element_trace_bytes,
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_local_trace) &&
+      TransportPolicy::DeviceToDevice(
+          view_.rodas_combination_interior, workspace.interior.coefficients,
+          interior_bytes, CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_interior) &&
+      TransportPolicy::DeviceToDevice(
+          view_.rodas_combination_true_trace, workspace.trace.coefficients,
+          workspace.trace.count * sizeof(double),
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_trace) &&
+      TransportPolicy::Synchronize(CudaTransferSite::nonlinear_base_trace);
+  if (!CollectiveContinue(candidate_snapshot))
+  {
+    result.reason = FailureReason::backend_failure;
+    return result;
+  }
+  double final_projection_initial = 0.0;
+  if (!project_algebraic(final_projection_initial,
+                         result.final_algebraic_residual) ||
+      !CollectiveContinue(CudaLaunchRodasAlgebraicCorrectionSquared(
+          view_, shape_, view_.scalar)))
+  {
+    result.reason = FailureReason::recovery_gate;
+    return result;
+  }
+  double local_correction_squared = 0.0;
+  const bool correction_copied = TransportPolicy::DeviceToHost(
+          &local_correction_squared, view_.scalar, sizeof(double),
+          CudaTransferCategory::scalar_diagnostic,
+          CudaTransferSite::scalar_status) &&
+      TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+  double global_correction_squared = 0.0;
+  std::uint64_t local_algebraic_count =
+      static_cast<std::uint64_t>(shape_.elements) *
+          (shape_.interior_components - conserved_components) *
+          shape_.scalar_interior_dofs +
+      static_cast<std::uint64_t>(shape_.true_trace_count);
+  std::uint64_t global_algebraic_count = 0;
+  const bool correction_reduced = correction_copied &&
+      MPI_Allreduce(&local_correction_squared, &global_correction_squared, 1,
+                    MPI_DOUBLE, MPI_SUM, communicator_) == MPI_SUCCESS &&
+      MPI_Allreduce(&local_algebraic_count, &global_algebraic_count, 1,
+                    MPI_UINT64_T, MPI_SUM, communicator_) == MPI_SUCCESS;
+  result.final_algebraic_correction_norm = std::sqrt(
+      global_correction_squared / static_cast<double>(global_algebraic_count));
+  if (!CollectiveContinue(correction_reduced && global_algebraic_count > 0 &&
+                          std::isfinite(
+                              result.final_algebraic_correction_norm)) ||
+      !admissible())
+  {
+    result.reason = FailureReason::recovery_gate;
+    return result;
+  }
+
+  if (!enter(CudaFailurePhase::after_recovery_before_commit)) return result;
+  result.phase = CudaFailurePhase::diagnostics;
+  if (inject_at(CudaFailurePhase::diagnostics)) return result;
+  const bool conservation_ready = RodasConservationBalance(
+      attempt.dt, result.maximum_conservation_error,
+      result.maximum_conservation_relative_error);
+  result.conservation = CollectiveContinue(
+      conservation_ready &&
+      result.maximum_conservation_relative_error <=
+          config.numerical_policy.conservation_relative_tolerance);
+  result.finite = std::isfinite(result.temporal_error_norm) &&
+      std::isfinite(result.final_algebraic_residual) &&
+      std::isfinite(result.final_algebraic_correction_norm);
+  result.admissible = true;
+  result.recovery = result.finite &&
+      result.final_algebraic_residual <= algebraic_residual_allowance;
+  result.true_relative_residual = maximum_true_residual;
+  result.true_residual = std::isfinite(maximum_true_residual) &&
+      maximum_true_residual <= true_residual_relative_tolerance_;
+  if (config.force_private_scientific_gate_failure)
+    result.true_residual = false;
+  result.final_residual = result.final_algebraic_residual;
+  result.candidate_ready = result.finite && result.admissible &&
+      result.recovery;
+  const bool retained_ilu_census = ilu_common_shift &&
+      trace_policy_descriptor_.ilu_factor_reuse_policy ==
+          CudaIluFactorReusePolicy::first_trace_solve_per_attempt &&
+      result.common_shift_preconditioner_setups == 1 &&
+      result.common_shift_preconditioner_reuses == 3;
+  const bool refresh_preconditioner_census =
+      ((ilu_common_shift &&
+        trace_policy_descriptor_.ilu_factor_reuse_policy ==
+            CudaIluFactorReusePolicy::refresh_each_trace_solve) ||
+       diagonal_common_shift) &&
+      result.common_shift_preconditioner_setups == 4 &&
+      result.common_shift_preconditioner_reuses == 0;
+  const bool preconditioner_census = tensor_rank_one
+      ? result.common_shift_preconditioner_setups >= 1 &&
+          result.common_shift_preconditioner_reuses == 3
+      : (ordinary_rank_one || host_staged_rank_two) &&
+          (retained_ilu_census || refresh_preconditioner_census);
+  const bool architecture_census =
+      result.common_shift_operator_builds == 1 &&
+      result.common_shift_operator_reuses == 3 &&
+      result.condensed_rhs_refreshes == 3 &&
+      result.common_shift_trace_solves == 4 &&
+      preconditioner_census;
+  const std::uint64_t current_allocation_events =
+      AllocatorPolicy::AllocationEvents();
+  bool allocation_plateau_exact =
+      current_allocation_events == accepted_allocation_events_;
+  if (!allocation_plateau_sampled_)
+  {
+    // Rank-two HYPRE may materialize two opaque pool high-water transitions
+    // during the first complete RODAS3 attempt (algebraic projection plus
+    // common-shift work). Freeze that bounded first-use footprint; every
+    // later attempt remains exact at the accepted count.
+    const std::uint64_t first_attempt_high_water_allowance =
+        host_staged_rank_two ? 2U : 1U;
+    allocation_plateau_exact =
+        current_allocation_events == accepted_allocation_events_ ||
+        (accepted_allocation_events_ <=
+             std::numeric_limits<std::uint64_t>::max() -
+                 first_attempt_high_water_allowance &&
+         current_allocation_events > accepted_allocation_events_ &&
+         current_allocation_events <= accepted_allocation_events_ +
+             first_attempt_high_water_allowance);
+    if (allocation_plateau_exact)
+      accepted_allocation_events_ = current_allocation_events;
+    allocation_plateau_sampled_ = true;
+  }
+  const bool solver_calls_exact = tensor_rank_one
+      ? result.tensor_core.native_rank1_trace_solve_calls >=
+            static_cast<std::uint64_t>(result.linear_solve_attempts) &&
+          result.tensor_core.hypre_trace_solve_calls == 0
+      : (ordinary_rank_one || host_staged_rank_two) &&
+          result.tensor_core.hypre_trace_solve_calls >=
+              static_cast<std::uint64_t>(result.linear_solve_attempts) &&
+          result.tensor_core.native_rank1_trace_solve_calls == 0;
+  result.tensor_core.trace_solver_accounting_complete =
+      result.tensor_core.trace_solver_accounting_complete &&
+      result.linear_solve_attempts ==
+          result.trace_solves + result.true_residual_tightenings &&
+      solver_calls_exact;
+  result.telemetry = architecture_census && DeviceResident() && NoFallback() &&
+      result.tensor_core.trace_solver_accounting_complete &&
+      AllocatorPolicy::W8OwnedAllocationCalls() ==
+          baseline_w8_owned_allocation_calls_ &&
+      AllocatorPolicy::DeallocationEvents() ==
+          baseline_deallocation_events_ && allocation_plateau_exact;
+  result.success = result.candidate_ready && result.true_residual &&
+      result.conservation && result.telemetry;
+  result.reason = result.success ? FailureReason::none :
+      (!result.true_residual ? FailureReason::true_residual_gate :
+       !result.conservation ? FailureReason::success_gate :
+       !result.telemetry ? FailureReason::telemetry_gate :
+                           FailureReason::success_gate);
+  workspace.interior.generation = current_generation_;
+  workspace.trace.generation = current_generation_;
+  const std::uint64_t product_generation = ++linear_generation_;
+  result.products = {product_generation, product_generation,
+                     product_generation, product_generation, 0};
+  if (!UpdateStateHashes(workspace))
+  {
+    result.candidate_ready = false;
+    result.success = false;
+    result.reason = FailureReason::backend_failure;
+  }
+  return result;
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
