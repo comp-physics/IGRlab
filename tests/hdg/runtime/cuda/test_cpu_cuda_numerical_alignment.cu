@@ -1027,13 +1027,13 @@ CudaTracePolicyKind SelectedCudaTracePolicy(
     const RegularizationKind regularization) noexcept
 {
   if (engine == CudaEngineKind::tensor_core &&
-      selection.time_treatment == EulerHdgTimeTreatment::rodas3)
-    return CudaTracePolicyKind::
-        native_element_schwarz_matrix_free_fp64;
-  return engine == CudaEngineKind::tensor_core &&
-          regularization == RegularizationKind::igr
-      ? selection.tensor_igr_trace_policy
-      : CudaTracePolicyKind::engine_default;
+      regularization == RegularizationKind::igr &&
+      selection.tensor_igr_trace_policy !=
+          CudaTracePolicyKind::engine_default)
+    return selection.tensor_igr_trace_policy;
+  return dg::hdg::runtime::cuda_w8a::DefaultCudaTracePolicyRequest(
+      engine, regularization == RegularizationKind::igr, 1,
+      selection.time_treatment);
 }
 
 EulerHdgRequest MakeRequest(
