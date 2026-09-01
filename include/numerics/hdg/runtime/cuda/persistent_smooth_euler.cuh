@@ -20,6 +20,7 @@
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler_types.cuh"
 #include "numerics/hdg/runtime/cuda/native_element_schwarz_plan.hpp"
 #include "numerics/hdg/runtime/cuda/tensor_volume_layout.hpp"
+#include "numerics/hdg/runtime/cuda/trace_csr_graph_plan.hpp"
 #include "numerics/hdg/runtime/runtime_selection.hpp"
 #include "numerics/hdg/time/rodas3.hpp"
 #include "numerics/hdg/trace/trace_dg_mpi.hpp"

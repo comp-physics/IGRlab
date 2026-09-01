@@ -1,4 +1,5 @@
 #include "numerics/hdg/runtime/cuda/native_element_schwarz_plan.hpp"
+#include "numerics/hdg/runtime/cuda/trace_csr_graph_plan.hpp"
 
 #include <array>
 #include <iostream>
@@ -126,6 +127,154 @@ bool CheckExactTwoElementPlan()
       plan.second_element_sources[3] == 4 &&
       plan.first_element_sources[4] == 3 &&
       plan.second_element_sources[4] == 4;
+}
+
+bool SamePlan(const NativeElementSchwarzPlan& left,
+              const NativeElementSchwarzPlan& right)
+{
+  return left.signed_element_true_dofs ==
+          right.signed_element_true_dofs &&
+      left.first_element_sources == right.first_element_sources &&
+      left.second_element_sources == right.second_element_sources &&
+      left.true_multiplicity == right.true_multiplicity &&
+      left.true_incidence_slots == right.true_incidence_slots &&
+      left.patch_rows == right.patch_rows &&
+      left.minimum_multiplicity == right.minimum_multiplicity &&
+      left.maximum_multiplicity == right.maximum_multiplicity &&
+      left.maximum_contributors == right.maximum_contributors &&
+      left.valid == right.valid;
+}
+
+bool CheckDirectPlanMatchesCsrDerivedPlan()
+{
+  // Both trace dofs are shared, exercising two contributors for diagonal and
+  // off-diagonal entries. The second element uses opposite orientations.
+  const std::array<int, 4> signed_element_local{{0, 1, -1, -2}};
+  const std::array<int, 2> local_true{{0, 1}};
+  const std::array<int, 8> sources{{0, 1, 2, 3, 4, 5, 6, 7}};
+  const std::array<int, 8> sections{{0, 0, 0, 0, 0, 0, 0, 0}};
+  const std::array<int, 8> targets{{0, 1, 2, 3, 0, 1, 2, 3}};
+  const NativeElementSchwarzPlan csr = BuildNativeElementSchwarzPlan({
+      2, 2, 2, 2, 4,
+      signed_element_local.data(), signed_element_local.size(),
+      local_true.data(), local_true.size(), sources.data(), sections.data(),
+      targets.data(), targets.size()});
+  const NativeElementSchwarzPlan direct =
+      BuildDirectNativeElementSchwarzPlan({
+          2, 2, 2, 2,
+          signed_element_local.data(), signed_element_local.size(),
+          local_true.data(), local_true.size()});
+  if (!csr.valid || !direct.valid || !SamePlan(csr, direct) ||
+      direct.first_element_sources !=
+          std::vector<int>({0, 1, 2, 3, 0, 1, 2, 3}) ||
+      direct.second_element_sources !=
+          std::vector<int>({4, 5, 6, 7, 4, 5, 6, 7}) ||
+      direct.true_incidence_slots != std::vector<int>({0, 2, 1, 3}))
+    return false;
+
+  // A boundary/interior mix also checks one-contributor entries and both
+  // multiplicity values.
+  const std::array<int, 4> mixed_signed{{0, 1, -2, 2}};
+  const std::array<int, 3> mixed_true{{0, 1, 2}};
+  const std::array<int, 8> mixed_targets{{0, 1, 2, 3, 3, 4, 5, 6}};
+  const NativeElementSchwarzPlan mixed_csr = BuildNativeElementSchwarzPlan({
+      2, 2, 3, 3, 7, mixed_signed.data(), mixed_signed.size(),
+      mixed_true.data(), mixed_true.size(), sources.data(), sections.data(),
+      mixed_targets.data(), mixed_targets.size()});
+  const NativeElementSchwarzPlan mixed_direct =
+      BuildDirectNativeElementSchwarzPlan({
+          2, 2, 3, 3, mixed_signed.data(), mixed_signed.size(),
+          mixed_true.data(), mixed_true.size()});
+  if (!mixed_csr.valid || !mixed_direct.valid ||
+      !SamePlan(mixed_csr, mixed_direct) ||
+      mixed_direct.minimum_multiplicity != 1 ||
+      mixed_direct.maximum_multiplicity != 2)
+    return false;
+
+  // Local and true numbering need not coincide on a borrowed topology.
+  const std::array<int, 3> permuted_true{{2, 0, 1}};
+  const NativeElementSchwarzPlan permuted_csr =
+      BuildNativeElementSchwarzPlan({
+          2, 2, 3, 3, 7, mixed_signed.data(), mixed_signed.size(),
+          permuted_true.data(), permuted_true.size(), sources.data(),
+          sections.data(), mixed_targets.data(), mixed_targets.size()});
+  const NativeElementSchwarzPlan permuted_direct =
+      BuildDirectNativeElementSchwarzPlan({
+          2, 2, 3, 3, mixed_signed.data(), mixed_signed.size(),
+          permuted_true.data(), permuted_true.size()});
+  return permuted_csr.valid && permuted_direct.valid &&
+      SamePlan(permuted_csr, permuted_direct) &&
+      permuted_direct.minimum_multiplicity == 1 &&
+      permuted_direct.maximum_multiplicity == 2;
+}
+
+bool CheckDirectPlanFailsClosed()
+{
+  const std::array<int, 3> three_incidence{{0, 0, 0}};
+  const std::array<int, 1> one_truth{{0}};
+  const NativeElementSchwarzPlan too_many =
+      BuildDirectNativeElementSchwarzPlan({
+          3, 1, 1, 1, three_incidence.data(), three_incidence.size(),
+          one_truth.data(), one_truth.size()});
+
+  const std::array<int, 2> duplicate_in_element{{0, 0}};
+  const NativeElementSchwarzPlan duplicate =
+      BuildDirectNativeElementSchwarzPlan({
+          1, 2, 1, 1, duplicate_in_element.data(),
+          duplicate_in_element.size(), one_truth.data(), one_truth.size()});
+
+  const std::array<int, 1> invalid_local{{1}};
+  const NativeElementSchwarzPlan bad_local =
+      BuildDirectNativeElementSchwarzPlan({
+          1, 1, 1, 1, invalid_local.data(), invalid_local.size(),
+          one_truth.data(), one_truth.size()});
+
+  const std::array<int, 1> out_of_range_truth{{1}};
+  const std::array<int, 1> valid_local{{0}};
+  const NativeElementSchwarzPlan bad_truth =
+      BuildDirectNativeElementSchwarzPlan({
+          1, 1, 1, 1, valid_local.data(), valid_local.size(),
+          out_of_range_truth.data(), out_of_range_truth.size()});
+
+  const NativeElementSchwarzPlan bad_count =
+      BuildDirectNativeElementSchwarzPlan({
+          1, 1, 1, 1, valid_local.data(), 0,
+          one_truth.data(), one_truth.size()});
+  return !too_many.valid && !duplicate.valid && !bad_local.valid &&
+      !bad_truth.valid && !bad_count.valid;
+}
+
+bool CheckDirectTraceCsrGraph()
+{
+  const std::array<int, 4> signed_element_local{{0, 1, -2, 2}};
+  const TraceCsrGraphPlan graph = BuildTraceCsrGraphPlan({
+      2, 2, 3, signed_element_local.data(), signed_element_local.size()});
+  if (!graph.valid || graph.legacy_columns_sorted ||
+      graph.offsets != std::vector<int>({0, 2, 5, 7}) ||
+      graph.columns != std::vector<int>({0, 1, 1, 2, 0, 2, 1}))
+    return false;
+
+  // Repeated incidence within one element is harmless for the union graph.
+  const std::array<int, 3> duplicate{{0, 0, 1}};
+  const TraceCsrGraphPlan duplicate_graph = BuildTraceCsrGraphPlan({
+      1, 3, 2, duplicate.data(), duplicate.size()});
+  if (!duplicate_graph.valid ||
+      duplicate_graph.offsets != std::vector<int>({0, 2, 4}) ||
+      duplicate_graph.columns != std::vector<int>({0, 1, 1, 0}))
+    return false;
+
+  const std::array<int, 1> invalid_local{{2}};
+  const TraceCsrGraphPlan bad_local = BuildTraceCsrGraphPlan({
+      1, 1, 2, invalid_local.data(), invalid_local.size()});
+  const TraceCsrGraphPlan bad_count = BuildTraceCsrGraphPlan({
+      1, 1, 1, invalid_local.data(), 0});
+  const TraceCsrGraphPlan unreferenced_row = BuildTraceCsrGraphPlan({
+      1, 1, 2, duplicate.data(), 1});
+  const std::array<int, 2> cancelling_diagonal{{0, -1}};
+  const TraceCsrGraphPlan cancelled = BuildTraceCsrGraphPlan({
+      1, 2, 1, cancelling_diagonal.data(), cancelling_diagonal.size()});
+  return !bad_local.valid && !bad_count.valid && !unreferenced_row.valid &&
+      !cancelled.valid;
 }
 
 bool CheckSignedWeightedApplyModel()
@@ -336,6 +485,9 @@ bool CheckMatrixFreeActionAndRhsModel()
 int main()
 {
   if (!CheckFieldSplitLayout() || !CheckExactTwoElementPlan() ||
+      !CheckDirectPlanMatchesCsrDerivedPlan() ||
+      !CheckDirectPlanFailsClosed() ||
+      !CheckDirectTraceCsrGraph() ||
       !CheckSignedWeightedApplyModel() ||
       !CheckFailClosedPlans() || !CheckMatrixFreeActionAndRhsModel())
   {

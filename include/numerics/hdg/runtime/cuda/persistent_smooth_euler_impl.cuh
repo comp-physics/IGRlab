@@ -5818,7 +5818,14 @@ private:
       const std::size_t host_local_trace = generic ? local_trace : maximum_local_trace_dofs;
       const std::size_t host_true_trace = generic ? true_trace : maximum_true_trace_dofs;
       const std::size_t host_matrix = generic ? layout.local_matrix : maximum_local_matrix_entries;
-      const std::size_t host_exchange = generic ? layout.local_matrix : maximum_exchange_entries;
+      // Rank one has no host-staged matrix exchange.  Its device exchange
+      // slices remain deliberately reserved and are reused by the native
+      // element-Schwarz implementation, but allocating the corresponding
+      // host keys/maps/value buffers consumed multiple GiB at p3/refinement 1
+      // even though no rank-one code can read them.
+      const std::size_t host_exchange = generic
+          ? (ranks_ == 2 ? layout.local_matrix : 0)
+          : maximum_exchange_entries;
 
       signed_element_trace_.assign(host_element_trace, 0);
       local_global_true_.assign(host_local_trace, 0);
@@ -5875,10 +5882,8 @@ private:
       host_vector_owned_target_.assign(host_element_trace, 0);
       host_vector_send_source_.assign(host_element_trace, 0);
       host_vector_receive_target_.assign(host_element_trace, 0);
-      matrix_send_keys_.assign(generic ? layout.two_exchange_keys :
-          2 * host_exchange, 0);
-      matrix_receive_keys_.assign(generic ? layout.two_exchange_keys :
-          2 * host_exchange, 0);
+      matrix_send_keys_.assign(2 * host_exchange, 0);
+      matrix_receive_keys_.assign(2 * host_exchange, 0);
       vector_send_keys_.assign(host_element_trace, 0);
       vector_receive_keys_.assign(host_element_trace, 0);
       matrix_send_host_.assign(host_exchange, 0.0);

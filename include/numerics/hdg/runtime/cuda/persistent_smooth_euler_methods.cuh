@@ -847,34 +847,32 @@ BuildLocalTraceGraph() noexcept
 {
   try
   {
-    local_trace_matrix_.emplace(shape_.local_trace_count);
-    for (int element = 0; element < shape_.elements; ++element)
-      for (int row = 0; row < shape_.trace_dofs; ++row)
-      {
-        double row_sign = 1.0;
-        const int local_row = CudaDecodeSigned(
-            signed_element_trace_[static_cast<std::size_t>(element) *
-                                      shape_.trace_dofs + row],
-            row_sign);
-        for (int column = 0; column < shape_.trace_dofs; ++column)
-        {
-          double column_sign = 1.0;
-          const int local_column = CudaDecodeSigned(
-              signed_element_trace_[static_cast<std::size_t>(element) *
-                                        shape_.trace_dofs + column],
-              column_sign);
-          local_trace_matrix_->Add(local_row, local_column,
-                                   row_sign * column_sign);
-        }
-      }
-    local_trace_matrix_->Finalize();
-    double* values = local_trace_matrix_->HostWriteData();
-    const int* offsets = local_trace_matrix_->HostReadI();
-    const int* columns = local_trace_matrix_->HostReadJ();
+    TraceCsrGraphPlan graph = BuildTraceCsrGraphPlan({
+        shape_.elements, shape_.trace_dofs, shape_.local_trace_count,
+        signed_element_trace_.data(),
+        static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs});
+    if (!graph.valid ||
+        graph.offsets.size() !=
+            static_cast<std::size_t>(shape_.local_trace_count) + 1 ||
+        graph.columns.empty())
+      return false;
+
+    // Wrap the topology without ownership, let MFEM allocate the value array,
+    // then deep-copy the complete CSR object into MFEM-managed storage. Raw
+    // new[] graph arrays cannot be transferred into a DEVICE_UMPIRE build:
+    // its MemoryManager must remain the allocation and teardown authority.
+    mfem::SparseMatrix planned_graph(
+        graph.offsets.data(), graph.columns.data(), nullptr,
+        shape_.local_trace_count, shape_.local_trace_count,
+        false, false, graph.legacy_columns_sorted);
+    double* values = planned_graph.HostWriteData();
     for (int row = 0; row < shape_.local_trace_count; ++row)
-      for (int entry = offsets[row]; entry < offsets[row + 1]; ++entry)
-        values[entry] = columns[entry] == row ? 64.0 : 1.0e-3;
-    local_trace_matrix_->MoveDiagonalFirst();
+      for (int entry = graph.offsets[static_cast<std::size_t>(row)];
+           entry < graph.offsets[static_cast<std::size_t>(row) + 1]; ++entry)
+        values[entry] =
+            graph.columns[static_cast<std::size_t>(entry)] == row
+            ? 64.0 : 1.0e-3;
+    local_trace_matrix_.emplace(planned_graph, true);
   }
   catch (...)
   {
@@ -1916,42 +1914,163 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 BuildSparseStagingPlan() noexcept
 {
+  // The generic true graph is persistent, so resolve its topology once.  The
+  // old staging builder linearly scanned every owned true row for every dense
+  // element-Schur entry.  That made setup O(E * n_t^2 * N_true), even for the
+  // native rank-one matrix-free operator.  Keep the exact CSR staging needed
+  // by the independent residual and robust native checks, but resolve local
+  // rows directly and use logarithmic searches wherever immutable row
+  // topology is sorted (with a bounded row-local fallback otherwise).
+  std::vector<std::pair<std::int64_t, int>> owned_row_lookup;
+  std::vector<unsigned char> diag_tail_sorted;
+  std::vector<unsigned char> offd_sorted;
+  bool lookup_ready = shape_.true_trace_count > 0 &&
+      owned_global_true_.size() >=
+          static_cast<std::size_t>(shape_.true_trace_count);
+  try
+  {
+    if (lookup_ready)
+    {
+      owned_row_lookup.reserve(
+          static_cast<std::size_t>(shape_.true_trace_count));
+      for (int row = 0; row < shape_.true_trace_count; ++row)
+        owned_row_lookup.emplace_back(
+            owned_global_true_[static_cast<std::size_t>(row)], row);
+      std::sort(owned_row_lookup.begin(), owned_row_lookup.end());
+      diag_tail_sorted.assign(
+          static_cast<std::size_t>(shape_.true_trace_count), 0);
+      offd_sorted.assign(
+          static_cast<std::size_t>(shape_.true_trace_count), 0);
+    }
+  }
+  catch (...)
+  {
+    lookup_ready = false;
+  }
+  for (std::size_t index = 1;
+       lookup_ready && index < owned_row_lookup.size(); ++index)
+    if (owned_row_lookup[index - 1].first == owned_row_lookup[index].first)
+      lookup_ready = false;
+  if (!CollectiveContinue(lookup_ready)) return false;
+
+  bool structure_searchable =
+      true_structure_.diag_nonzeros >= 0 &&
+      true_structure_.offd_nonzeros >= 0 &&
+      true_structure_.diag_offsets.size() ==
+          static_cast<std::size_t>(shape_.true_trace_count) + 1 &&
+      true_structure_.offd_offsets.size() ==
+          static_cast<std::size_t>(shape_.true_trace_count) + 1 &&
+      true_structure_.diag_columns.size() ==
+          static_cast<std::size_t>(true_structure_.diag_nonzeros) &&
+      true_structure_.offd_columns.size() ==
+          static_cast<std::size_t>(true_structure_.offd_nonzeros);
+  for (int row = 0; structure_searchable &&
+       row < shape_.true_trace_count; ++row)
+  {
+    const int diag_begin = true_structure_.diag_offsets[
+        static_cast<std::size_t>(row)];
+    const int diag_end = true_structure_.diag_offsets[
+        static_cast<std::size_t>(row + 1)];
+    const int offd_begin = true_structure_.offd_offsets[
+        static_cast<std::size_t>(row)];
+    const int offd_end = true_structure_.offd_offsets[
+        static_cast<std::size_t>(row + 1)];
+    structure_searchable = diag_begin >= 0 && diag_begin <= diag_end &&
+        diag_end <= true_structure_.diag_nonzeros && offd_begin >= 0 &&
+        offd_begin <= offd_end && offd_end <= true_structure_.offd_nonzeros;
+    if (!structure_searchable) break;
+    const int diag_tail_begin = std::min(diag_begin + 1, diag_end);
+    diag_tail_sorted[static_cast<std::size_t>(row)] =
+        static_cast<unsigned char>(std::is_sorted(
+            true_structure_.diag_columns.begin() + diag_tail_begin,
+            true_structure_.diag_columns.begin() + diag_end));
+    offd_sorted[static_cast<std::size_t>(row)] =
+        static_cast<unsigned char>(std::is_sorted(
+            true_structure_.offd_columns.begin() + offd_begin,
+            true_structure_.offd_columns.begin() + offd_end));
+  }
+  if (!CollectiveContinue(structure_searchable)) return false;
+
   const auto find_row = [&](const std::int64_t global)
   {
-    for (int row = 0; row < shape_.true_trace_count; ++row)
-      if (owned_global_true_[static_cast<std::size_t>(row)] == global)
-        return row;
-    return -1;
+    const auto found = std::lower_bound(
+        owned_row_lookup.begin(), owned_row_lookup.end(), global,
+        [](const std::pair<std::int64_t, int>& entry,
+           const std::int64_t value) { return entry.first < value; });
+    return found != owned_row_lookup.end() && found->first == global
+        ? found->second : -1;
   };
-  const auto find_target = [&](const std::int64_t row_global,
+  const auto find_target = [&](const int row,
+                               const int owned_column,
                                const std::int64_t column_global,
                                int& section, int& target)
   {
-    const int row = find_row(row_global);
-    if (row < 0) { return false; }
-    for (int entry = true_structure_.diag_offsets[static_cast<std::size_t>(row)];
-         entry < true_structure_.diag_offsets[static_cast<std::size_t>(row + 1)];
-         ++entry)
+    if (row < 0 || row >= shape_.true_trace_count) return false;
+    if (owned_column >= 0)
     {
-      const int column = true_structure_.diag_columns[static_cast<std::size_t>(entry)];
-      if (column >= 0 && column < shape_.true_trace_count &&
-          owned_global_true_[static_cast<std::size_t>(column)] == column_global)
+      const int begin = true_structure_.diag_offsets[
+          static_cast<std::size_t>(row)];
+      const int end = true_structure_.diag_offsets[
+          static_cast<std::size_t>(row + 1)];
+      if (begin < end && true_structure_.diag_columns[
+              static_cast<std::size_t>(begin)] == owned_column)
       {
         section = 0;
-        target = entry;
+        target = begin;
+        return true;
+      }
+      const int tail_begin = std::min(begin + 1, end);
+      if (diag_tail_sorted[static_cast<std::size_t>(row)] != 0)
+      {
+        const auto first = true_structure_.diag_columns.begin() + tail_begin;
+        const auto last = true_structure_.diag_columns.begin() + end;
+        const auto found = std::lower_bound(first, last, owned_column);
+        if (found != last && *found == owned_column)
+        {
+          section = 0;
+          target = static_cast<int>(
+              found - true_structure_.diag_columns.begin());
+          return true;
+        }
+      }
+      else
+        for (int entry = tail_begin; entry < end; ++entry)
+          if (true_structure_.diag_columns[
+                  static_cast<std::size_t>(entry)] == owned_column)
+          {
+            section = 0;
+            target = entry;
+            return true;
+          }
+      return false;
+    }
+
+    const int begin = true_structure_.offd_offsets[
+        static_cast<std::size_t>(row)];
+    const int end = true_structure_.offd_offsets[
+        static_cast<std::size_t>(row + 1)];
+    if (offd_sorted[static_cast<std::size_t>(row)] != 0)
+    {
+      const auto first = true_structure_.offd_columns.begin() + begin;
+      const auto last = true_structure_.offd_columns.begin() + end;
+      const auto found = std::lower_bound(first, last, column_global);
+      if (found != last && *found == column_global)
+      {
+        section = 1;
+        target = static_cast<int>(
+            found - true_structure_.offd_columns.begin());
         return true;
       }
     }
-    for (int entry = true_structure_.offd_offsets[static_cast<std::size_t>(row)];
-         entry < true_structure_.offd_offsets[static_cast<std::size_t>(row + 1)];
-         ++entry)
-      if (true_structure_.offd_columns[static_cast<std::size_t>(entry)] ==
-          column_global)
-      {
-        section = 1;
-        target = entry;
-        return true;
-      }
+    else
+      for (int entry = begin; entry < end; ++entry)
+        if (true_structure_.offd_columns[static_cast<std::size_t>(entry)] ==
+            column_global)
+        {
+          section = 1;
+          target = entry;
+          return true;
+        }
     return false;
   };
 
@@ -1966,10 +2085,11 @@ BuildSparseStagingPlan() noexcept
       const std::int64_t row_global =
           local_global_true_[static_cast<std::size_t>(row_local)];
       const int row_owner = local_owner_[static_cast<std::size_t>(row_local)];
+      const int true_row = row_owner == rank_
+          ? local_true_index_[static_cast<std::size_t>(row_local)] : -1;
       const int vector_source = element * shape_.trace_dofs + row;
       if (row_owner == rank_)
       {
-        const int true_row = find_row(row_global);
         if (true_row < 0)
         {
           local_plan_valid = false;
@@ -2000,12 +2120,17 @@ BuildSparseStagingPlan() noexcept
             column_sign);
         const std::int64_t column_global =
             local_global_true_[static_cast<std::size_t>(column_local)];
+        const int column_owner =
+            local_owner_[static_cast<std::size_t>(column_local)];
+        const int owned_column = column_owner == rank_
+            ? local_true_index_[static_cast<std::size_t>(column_local)] : -1;
         const int source = (element * shape_.trace_dofs + row) *
                                shape_.trace_dofs + column;
         if (row_owner == rank_)
         {
           int section = -1, target = -1;
-          if (!find_target(row_global, column_global, section, target))
+          if (!find_target(
+                  true_row, owned_column, column_global, section, target))
           {
             local_plan_valid = false;
           }
@@ -2106,12 +2231,17 @@ BuildSparseStagingPlan() noexcept
       return false;
     bool local_receive_valid = true;
     for (int entry = 0; entry < shape_.matrix_receive_count; ++entry)
+    {
+      const std::int64_t row_global =
+          matrix_receive_keys_[2 * static_cast<std::size_t>(entry)];
+      const std::int64_t column_global =
+          matrix_receive_keys_[2 * static_cast<std::size_t>(entry) + 1];
       local_receive_valid = find_target(
-          matrix_receive_keys_[2 * static_cast<std::size_t>(entry)],
-          matrix_receive_keys_[2 * static_cast<std::size_t>(entry) + 1],
+          find_row(row_global), find_row(column_global), column_global,
           host_matrix_receive_section_[static_cast<std::size_t>(entry)],
           host_matrix_receive_target_[static_cast<std::size_t>(entry)]) &&
           local_receive_valid;
+    }
     for (int entry = 0; entry < shape_.vector_receive_count; ++entry)
     {
       const int target = find_row(
@@ -2130,16 +2260,27 @@ BuildSparseStagingPlan() noexcept
   {
     const int expected_patch_rows =
         NativeElementSchwarzPatchRows(shape_.order, shape_.igr_active);
-    element_schwarz_plan_ = BuildNativeElementSchwarzPlan({
-        shape_.elements, shape_.trace_dofs, shape_.local_trace_count,
-        shape_.true_trace_count, true_structure_.diag_nonzeros,
-        signed_element_trace_.data(),
-        static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs,
-        local_true_index_.data(), local_true_index_.size(),
-        host_matrix_owned_source_.data(),
-        host_matrix_owned_section_.data(),
-        host_matrix_owned_target_.data(),
-        static_cast<std::size_t>(shape_.matrix_owned_count)});
+    const bool direct_rank_one = ranks_ == 1 &&
+        CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+            trace_policy_descriptor_.resolved_selection);
+    element_schwarz_plan_ = direct_rank_one
+        ? BuildDirectNativeElementSchwarzPlan({
+              shape_.elements, shape_.trace_dofs,
+              shape_.local_trace_count, shape_.true_trace_count,
+              signed_element_trace_.data(),
+              static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs,
+              local_true_index_.data(), local_true_index_.size()})
+        : BuildNativeElementSchwarzPlan({
+              shape_.elements, shape_.trace_dofs,
+              shape_.local_trace_count, shape_.true_trace_count,
+              true_structure_.diag_nonzeros,
+              signed_element_trace_.data(),
+              static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs,
+              local_true_index_.data(), local_true_index_.size(),
+              host_matrix_owned_source_.data(),
+              host_matrix_owned_section_.data(),
+              host_matrix_owned_target_.data(),
+              static_cast<std::size_t>(shape_.matrix_owned_count)});
     const std::size_t patch_entries =
         static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs *
         shape_.trace_dofs;
@@ -2167,7 +2308,7 @@ BuildSparseStagingPlan() noexcept
 
   const auto upload = [](int* destination, const int* source, int count)
   {
-    return TransportPolicy::HostToDevice(
+    return count == 0 || TransportPolicy::HostToDevice(
         destination, source, static_cast<std::size_t>(count) * sizeof(int),
         CudaTransferCategory::topology, CudaTransferSite::map_upload);
   };

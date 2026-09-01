@@ -204,6 +204,27 @@ struct NativeElementSchwarzPlanInput final
   std::size_t matrix_entry_count = 0;
 };
 
+/**
+ * Rank-one matrix-free topology input.
+ *
+ * Unlike NativeElementSchwarzPlanInput, this contract does not depend on an
+ * assembled true-CSR graph or on source/section/target staging arrays.  The
+ * signed element-local map and the local-to-true map contain all topology
+ * needed to recover the one or two element contributions to a principal
+ * Schwarz-patch entry.
+ */
+struct NativeElementSchwarzDirectPlanInput final
+{
+  int elements = 0;
+  int patch_rows = 0;
+  int local_rows = 0;
+  int true_rows = 0;
+  const int* signed_element_local_dofs = nullptr;
+  std::size_t signed_element_local_dof_count = 0;
+  const int* local_true_dofs = nullptr;
+  std::size_t local_true_dof_count = 0;
+};
+
 struct NativeElementSchwarzPlan final
 {
   std::vector<int> signed_element_true_dofs{};
@@ -219,6 +240,158 @@ struct NativeElementSchwarzPlan final
   int maximum_contributors = 0;
   bool valid = false;
 };
+
+/**
+ * Build the rank-one element-overlap plan directly from trace incidence.
+ *
+ * Every admitted true trace row has one boundary incidence or two interior
+ * incidences.  The contributors to an ordered true entry (i,j) are exactly
+ * the elements common to the two incidence lists.  Incidences are recorded
+ * in element-major/local-row-major order, so the recovered source order is
+ * identical to the legacy CSR-derived plan's nested element/row/column order.
+ */
+inline NativeElementSchwarzPlan BuildDirectNativeElementSchwarzPlan(
+    const NativeElementSchwarzDirectPlanInput& input)
+{
+  NativeElementSchwarzPlan result{};
+  if (input.elements <= 0 || input.patch_rows <= 0 ||
+      input.local_rows <= 0 || input.true_rows <= 0 ||
+      input.signed_element_local_dofs == nullptr ||
+      input.local_true_dofs == nullptr)
+    return result;
+
+  const std::size_t elements = static_cast<std::size_t>(input.elements);
+  const std::size_t rows = static_cast<std::size_t>(input.patch_rows);
+  if (rows > std::numeric_limits<std::size_t>::max() / elements)
+    return result;
+  const std::size_t element_rows = elements * rows;
+  if (rows > std::numeric_limits<std::size_t>::max() / element_rows)
+    return result;
+  const std::size_t element_entries = element_rows * rows;
+  if (element_rows > static_cast<std::size_t>(
+                         std::numeric_limits<int>::max()) ||
+      element_entries > static_cast<std::size_t>(
+                            std::numeric_limits<int>::max()) ||
+      input.signed_element_local_dof_count != element_rows ||
+      input.local_true_dof_count < static_cast<std::size_t>(input.local_rows))
+    return result;
+
+  try
+  {
+    result.signed_element_true_dofs.assign(element_rows, 0);
+    result.first_element_sources.assign(element_entries, -1);
+    result.second_element_sources.assign(element_entries, -1);
+    result.true_multiplicity.assign(
+        static_cast<std::size_t>(input.true_rows), 0);
+    result.true_incidence_slots.assign(
+        2 * static_cast<std::size_t>(input.true_rows), -1);
+
+    for (std::size_t slot = 0; slot < element_rows; ++slot)
+    {
+      const int encoded_local = input.signed_element_local_dofs[slot];
+      const int local = NativeElementSchwarzDecodedDof(encoded_local);
+      if (local < 0 || local >= input.local_rows) return result;
+      const int truth = input.local_true_dofs[static_cast<std::size_t>(local)];
+      if (truth < 0 || truth >= input.true_rows) return result;
+      const int encoded_true = NativeElementSchwarzEncodeDof(
+          truth, NativeElementSchwarzDofSign(encoded_local));
+      if (encoded_true == std::numeric_limits<int>::min()) return result;
+      result.signed_element_true_dofs[slot] = encoded_true;
+
+      int& multiplicity =
+          result.true_multiplicity[static_cast<std::size_t>(truth)];
+      if (multiplicity < 0 ||
+          multiplicity >= native_element_schwarz_maximum_contributors)
+        return result;
+      if (multiplicity > 0)
+      {
+        const int previous = result.true_incidence_slots[
+            2 * static_cast<std::size_t>(truth)];
+        if (previous < 0 ||
+            previous / input.patch_rows ==
+                static_cast<int>(slot) / input.patch_rows)
+          return result;
+      }
+      result.true_incidence_slots[
+          2 * static_cast<std::size_t>(truth) +
+          static_cast<std::size_t>(multiplicity)] = static_cast<int>(slot);
+      ++multiplicity;
+    }
+
+    const auto multiplicity_bounds = std::minmax_element(
+        result.true_multiplicity.begin(), result.true_multiplicity.end());
+    if (multiplicity_bounds.first == result.true_multiplicity.end() ||
+        *multiplicity_bounds.first <= 0 ||
+        *multiplicity_bounds.second >
+            native_element_schwarz_maximum_contributors)
+      return result;
+    result.minimum_multiplicity = *multiplicity_bounds.first;
+    result.maximum_multiplicity = *multiplicity_bounds.second;
+
+    for (std::size_t target = 0; target < element_entries; ++target)
+    {
+      const std::size_t target_element = target / (rows * rows);
+      const std::size_t target_entry = target - target_element * rows * rows;
+      const std::size_t target_row = target_element * rows +
+          target_entry / rows;
+      const std::size_t target_column = target_element * rows +
+          target_entry % rows;
+      const int row_truth = NativeElementSchwarzDecodedDof(
+          result.signed_element_true_dofs[target_row]);
+      const int column_truth = NativeElementSchwarzDecodedDof(
+          result.signed_element_true_dofs[target_column]);
+
+      int first = -1;
+      int second = -1;
+      const int row_multiplicity = result.true_multiplicity[
+          static_cast<std::size_t>(row_truth)];
+      const int column_multiplicity = result.true_multiplicity[
+          static_cast<std::size_t>(column_truth)];
+      for (int row_incidence = 0; row_incidence < row_multiplicity;
+           ++row_incidence)
+      {
+        const int source_row = result.true_incidence_slots[
+            2 * static_cast<std::size_t>(row_truth) +
+            static_cast<std::size_t>(row_incidence)];
+        if (source_row < 0) return result;
+        const int source_element = source_row / input.patch_rows;
+        for (int column_incidence = 0;
+             column_incidence < column_multiplicity; ++column_incidence)
+        {
+          const int source_column = result.true_incidence_slots[
+              2 * static_cast<std::size_t>(column_truth) +
+              static_cast<std::size_t>(column_incidence)];
+          if (source_column < 0) return result;
+          if (source_column / input.patch_rows != source_element) continue;
+          const int source = source_row * input.patch_rows +
+              source_column % input.patch_rows;
+          if (first < 0)
+            first = source;
+          else if (second < 0 && first != source)
+            second = source;
+          else
+            return result;
+        }
+      }
+      if (first < 0) return result;
+      if (second >= 0 && second < first) std::swap(first, second);
+      result.first_element_sources[target] = first;
+      result.second_element_sources[target] = second;
+      result.maximum_contributors = std::max(
+          result.maximum_contributors, second >= 0 ? 2 : 1);
+    }
+
+    result.valid = result.maximum_contributors >= 1 &&
+        result.maximum_contributors <=
+            native_element_schwarz_maximum_contributors;
+    if (result.valid) result.patch_rows = input.patch_rows;
+  }
+  catch (...)
+  {
+    return NativeElementSchwarzPlan{};
+  }
+  return result;
+}
 
 /**
  * Build the exact source plan for every entry of every principal patch.
