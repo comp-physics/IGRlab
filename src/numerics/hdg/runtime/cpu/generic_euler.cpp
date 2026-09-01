@@ -95,7 +95,16 @@ bool SameNumericalPolicy(const generic::EulerHdgNumericalPolicy& left,
       generic::DoubleBits(left.stabilization.alpha) ==
           generic::DoubleBits(right.stabilization.alpha) &&
       generic::DoubleBits(left.stabilization.beta) ==
-          generic::DoubleBits(right.stabilization.beta);
+          generic::DoubleBits(right.stabilization.beta) &&
+      left.positivity_limiter.kind == right.positivity_limiter.kind &&
+      left.positivity_limiter.point_set ==
+          right.positivity_limiter.point_set &&
+      generic::DoubleBits(left.positivity_limiter.density_floor) ==
+          generic::DoubleBits(right.positivity_limiter.density_floor) &&
+      generic::DoubleBits(left.positivity_limiter.pressure_floor) ==
+          generic::DoubleBits(right.positivity_limiter.pressure_floor) &&
+      left.positivity_limiter.pressure_bisection_iterations ==
+          right.positivity_limiter.pressure_bisection_iterations;
 }
 
 bool SameBackend(const generic::BackendSelection& left,

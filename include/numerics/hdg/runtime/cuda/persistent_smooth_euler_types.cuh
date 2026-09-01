@@ -2355,6 +2355,17 @@ struct CudaStepEvidence
   std::uint64_t common_shift_trace_solves = 0;
   std::uint64_t common_shift_preconditioner_setups = 0;
   std::uint64_t common_shift_preconditioner_reuses = 0;
+  std::uint64_t positivity_limiter_calls = 0;
+  std::uint64_t positivity_limiter_active_calls = 0;
+  // An admitted Zhang--Shu map cannot repair a cell whose conservative
+  // physical mean is already below either configured floor.  Retain only the
+  // bounded attempt aggregate so a terminal adaptive rejection can be
+  // distinguished from a pointwise/stage admissibility failure; no element
+  // identity or event history is recorded.
+  std::uint64_t positivity_limiter_inadmissible_mean_rejections = 0;
+  std::uint64_t positivity_algebraic_projections = 0;
+  std::uint64_t common_shift_operator_rebuilds = 0;
+  double maximum_positivity_limiter_correction_norm = 0.0;
   int nonlinear_updates = 0;
   int trace_solves = 0;
   // Work census copied from the internal numerical result without changing

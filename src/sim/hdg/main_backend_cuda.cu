@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -49,13 +50,17 @@ namespace
 using dg::hdg::generic::BackendKind;
 using dg::hdg::generic::BackendSelection;
 using dg::hdg::generic::CudaEngineKind;
+using dg::hdg::generic::EulerHdgPositivityLimiterKind;
+using dg::hdg::generic::EulerHdgPositivityLimiterPolicy;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::generic::EulerHdgTimeTreatment;
+using dg::hdg::generic::EulerHdgZhangShuPointSet;
 using dg::hdg::generic::HdgEulerSessionStatus;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::generic::RegularizationSelection;
 using dg::hdg::runtime::cuda::GenericEulerCudaCheckpointPayloadViewV1;
 using dg::hdg::runtime::cuda::GenericEulerCudaMutableCheckpointPayloadV1;
+using dg::hdg::runtime::cuda::GenericEulerCudaPrepareFailureClass;
 using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using dg::hdg::runtime::cuda_w8a::CudaIluAccountingKind;
@@ -185,7 +190,8 @@ std::string FinalizeAdaptiveRejectionOrReason(
     const MPI_Comm communicator,
     HdgTransactionalTimeAdapter& time_driver,
     const HdgTransactionalTimeAdapter::StepPlan& plan,
-    const HdgTransactionalTimeAdapter::AdaptiveAttempt& attempt)
+    const HdgTransactionalTimeAdapter::AdaptiveAttempt& attempt,
+    const char* const failure_classification)
 {
   std::optional<HdgTransactionalTimeAdapter::AdaptiveDecision> decision;
   bool local_ok = false;
@@ -231,17 +237,93 @@ std::string FinalizeAdaptiveRejectionOrReason(
   {
     return "adaptive CUDA RODAS3 controller state diverged after rejection";
   }
+  const auto terminal_reason = [&](const char* const reason)
+  {
+    std::ostringstream stream;
+    stream << reason << " committed_t=" << std::scientific
+           << std::setprecision(17) << time_driver.time()
+           << " attempted_dt=" << plan.dt
+           << " next_dt=" << state.next_dt
+           << " consecutive_rejections=" << state.consecutive_rejections;
+    if (failure_classification != nullptr &&
+        failure_classification[0] != '\0')
+      stream << " failure_class=" << failure_classification;
+    return stream.str();
+  };
   if (state.consecutive_rejections >=
       kMaximumConsecutiveAdaptiveRejections)
   {
-    return "adaptive CUDA RODAS3 exceeded the consecutive-rejection limit";
+    return terminal_reason(
+        "adaptive CUDA RODAS3 exceeded the consecutive-rejection limit");
   }
   if (decision->minimum_dt_reached() &&
       plan.dt <= time_driver.adaptive_controller_config().minimum_dt)
   {
-    return "adaptive CUDA RODAS3 rejected an attempt at the minimum timestep";
+    return terminal_reason(
+        "adaptive CUDA RODAS3 rejected an attempt at the minimum timestep");
   }
   return {};
+}
+
+const char* PrepareFailureClassName(
+    const GenericEulerCudaPrepareFailureClass failure) noexcept
+{
+  switch (failure)
+  {
+  case GenericEulerCudaPrepareFailureClass::not_failed:
+    return "prepare_not_failed";
+  case GenericEulerCudaPrepareFailureClass::unavailable:
+    return "prepare_failure_unavailable";
+  case GenericEulerCudaPrepareFailureClass::
+      zhang_shu_inadmissible_conservative_mean:
+    return "zhang_shu_inadmissible_conservative_mean";
+  case GenericEulerCudaPrepareFailureClass::finite_gate:
+    return "prepare_finite_gate";
+  case GenericEulerCudaPrepareFailureClass::admissibility_gate:
+    return "prepare_admissibility_gate";
+  case GenericEulerCudaPrepareFailureClass::trace_solve:
+    return "prepare_trace_solve";
+  case GenericEulerCudaPrepareFailureClass::recovery_gate:
+    return "prepare_recovery_gate";
+  case GenericEulerCudaPrepareFailureClass::true_residual_gate:
+    return "prepare_true_residual_gate";
+  case GenericEulerCudaPrepareFailureClass::telemetry_gate:
+    return "prepare_telemetry_gate";
+  case GenericEulerCudaPrepareFailureClass::success_gate:
+    return "prepare_success_gate";
+  case GenericEulerCudaPrepareFailureClass::collective_protocol:
+    return "prepare_collective_protocol";
+  case GenericEulerCudaPrepareFailureClass::backend_or_contract:
+    return "prepare_backend_or_contract";
+  case GenericEulerCudaPrepareFailureClass::mixed_numerical_failure:
+    return "prepare_mixed_numerical_failure";
+  }
+  return "prepare_failure_unavailable";
+}
+
+const char* PreparedAssessmentFailureClass(
+    const bool assessment_values_valid,
+    const bool assessment_values_collective,
+    const bool finite_solver_gate,
+    const bool residual_gate,
+    const bool admissibility_gate,
+    const bool algebraic_closure_gate,
+    const bool algebraic_correction_gate) noexcept
+{
+  if (!assessment_values_valid || !assessment_values_collective)
+    return "prepared_assessment_invalid";
+  const unsigned failed_gates = (!finite_solver_gate ? 1U : 0U) +
+      (!residual_gate ? 1U : 0U) + (!admissibility_gate ? 1U : 0U) +
+      (!algebraic_closure_gate ? 1U : 0U) +
+      (!algebraic_correction_gate ? 1U : 0U);
+  if (failed_gates > 1U) return "prepared_multiple_gates";
+  if (!finite_solver_gate) return "prepared_solver_finite_gate";
+  if (!residual_gate) return "prepared_residual_gate";
+  if (!admissibility_gate) return "prepared_admissibility_gate";
+  if (!algebraic_closure_gate) return "prepared_algebraic_closure_gate";
+  if (!algebraic_correction_gate)
+    return "prepared_algebraic_correction_gate";
+  return "embedded_temporal_error";
 }
 
 int Reject(const HdgEulerMainRequest& request,
@@ -619,7 +701,10 @@ std::string CanonicalNumericalPolicy(
          << policy.maximum_nonlinear_updates << ';'
          << policy.maximum_linear_iterations << ';'
          << policy.maximum_line_search_trials << ';'
-         << static_cast<int>(policy.stabilization.kind) << ';';
+         << static_cast<int>(policy.stabilization.kind) << ';'
+         << static_cast<int>(policy.positivity_limiter.kind) << ';'
+         << static_cast<int>(policy.positivity_limiter.point_set) << ';'
+         << policy.positivity_limiter.pressure_bisection_iterations << ';';
   AppendDouble(stream, policy.nonlinear_relative_tolerance);
   AppendDouble(stream,
                policy.newton_correction_linear_relative_tolerance);
@@ -631,7 +716,37 @@ std::string CanonicalNumericalPolicy(
   AppendDouble(stream, policy.armijo_constant);
   AppendDouble(stream, policy.stabilization.alpha);
   AppendDouble(stream, policy.stabilization.beta);
+  AppendDouble(stream, policy.positivity_limiter.density_floor);
+  AppendDouble(stream, policy.positivity_limiter.pressure_floor);
   return stream.str();
+}
+
+EulerHdgZhangShuPointSet CanonicalZhangShuPointSet(
+    const mfem::ZhangShuPointSet point_set)
+{
+  switch (point_set)
+  {
+  case mfem::ZhangShuPointSet::kConsumer:
+    return EulerHdgZhangShuPointSet::consumer;
+  case mfem::ZhangShuPointSet::kQuadrature:
+    return EulerHdgZhangShuPointSet::quadrature;
+  }
+  throw std::invalid_argument("CUDA HDG Zhang-Shu point set is invalid");
+}
+
+EulerHdgPositivityLimiterPolicy CanonicalPositivityLimiterPolicy(
+    const HdgEulerMainRequest& request,
+    const EulerHdgTimeTreatment time_treatment)
+{
+  if (time_treatment != EulerHdgTimeTreatment::rodas3 ||
+      !request.case_config.limiter_pipeline.zhang_shu)
+    return {};
+  return {EulerHdgPositivityLimiterKind::zhang_shu,
+          CanonicalZhangShuPointSet(
+              request.case_config.limiter_pipeline.zhang_shu_points),
+          request.case_config.rk3_config.rho_min,
+          request.case_config.rk3_config.p_min,
+          request.case_config.rk3_config.p_bisect_iters};
 }
 
 std::string ConsensusText(const HdgEulerMainRequest& request,
@@ -1258,9 +1373,12 @@ bool AbortPrepared(GenericEulerHdgCudaSession& session,
 bool PrepareOutput(GenericEulerHdgCudaSession& session,
                    const double dt,
                    GenericEulerCudaPreparedStep& authority,
-                   PreparedCudaOutput& native_export) noexcept
+                   PreparedCudaOutput& native_export,
+                   GenericEulerCudaPrepareFailureClass&
+                       prepare_failure_class) noexcept
 {
-  return session.Prepare(dt, authority, native_export).status ==
+  return session.Prepare(
+             dt, authority, native_export, &prepare_failure_class).status ==
       HdgEulerSessionStatus::prepared;
 }
 
@@ -1462,9 +1580,11 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   {
     case_data.emplace(request.make_case_data(*context));
     numerical_policy = case_data->numerical_policy;
-    // Case factories own every numerical role except the command-line
-    // regularization toggle and its two IGR coefficients.
+    // Case factories own every numerical role except command-line
+    // regularization and the shared case limiter pipeline.
     numerical_policy.stabilization = regularization;
+    numerical_policy.positivity_limiter =
+        CanonicalPositivityLimiterPolicy(request, time_treatment);
     reason = ValidateCaseData(*case_data, numerical_policy);
     if (!reason.empty()) throw std::invalid_argument(reason);
     frozen_boundary.emplace(FreezeBoundaryPlan(case_data->boundary_plan));
@@ -1841,8 +1961,11 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     GenericEulerCudaPreparedStep authority;
     PreparedCudaOutput native_export{};
     PreparedCudaCheckpointPayload checkpoint_payload;
+    GenericEulerCudaPrepareFailureClass prepare_failure_class =
+        GenericEulerCudaPrepareFailureClass::not_failed;
     const bool prepared_locally =
-        PrepareOutput(session, plan.dt, authority, native_export);
+        PrepareOutput(session, plan.dt, authority, native_export,
+                      prepare_failure_class);
     if (!CollectiveAll(request.communicator, prepared_locally))
     {
       const bool uniformly_unprepared =
@@ -1876,7 +1999,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       }
       const HdgTransactionalTimeAdapter::AdaptiveAttempt failed_attempt{};
       const std::string rejection = FinalizeAdaptiveRejectionOrReason(
-          request.communicator, *time_driver, plan, failed_attempt);
+          request.communicator, *time_driver, plan, failed_attempt,
+          PrepareFailureClassName(prepare_failure_class));
       if (!rejection.empty()) return Reject(request, rejection);
       continue;
     }
@@ -1952,10 +2076,14 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
           request.communicator, assessment.residual_gate);
       const bool admissibility_gate = CollectiveAll(
           request.communicator, assessment.admissibility_gate);
-      const bool closure_gate = CollectiveAll(
+      const bool algebraic_closure_gate = CollectiveAll(
           request.communicator,
-          assessment.algebraic_closure_gate &&
-              assessment.algebraic_correction_gate);
+          assessment.algebraic_closure_gate);
+      const bool algebraic_correction_gate = CollectiveAll(
+          request.communicator,
+          assessment.algebraic_correction_gate);
+      const bool closure_gate = algebraic_closure_gate &&
+          algebraic_correction_gate;
 
       if (adaptive_rodas3)
       {
@@ -2024,7 +2152,11 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
               admissibility_gate,
               closure_gate};
           const std::string rejection = FinalizeAdaptiveRejectionOrReason(
-              request.communicator, *time_driver, plan, rejected_attempt);
+              request.communicator, *time_driver, plan, rejected_attempt,
+              PreparedAssessmentFailureClass(
+                  assessment_values_valid, assessment_values_collective,
+                  finite_solver_gate, residual_gate, admissibility_gate,
+                  algebraic_closure_gate, algebraic_correction_gate));
           if (!rejection.empty()) return Reject(request, rejection);
           continue;
         }

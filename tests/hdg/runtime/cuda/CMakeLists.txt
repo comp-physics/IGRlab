@@ -288,7 +288,7 @@ add_test(
 set_tests_properties(
   dg_igr_hdg_runtime_cuda_rodas3_tensor_rank1_architecture_screen
   PROPERTIES
-    LABELS "hdg;runtime;cuda;generic-euler;rodas3;tensor;rank1;conventional;igr;common-shift;architecture-screen"
+    LABELS "hdg;runtime;cuda;generic-euler;rodas3;tensor;rank1;conventional;igr;common-shift;architecture-screen;zhang-shu;limiter;admissibility;closure"
     PROCESSORS 1
     RESOURCE_LOCK dg_igr_sm120
     TIMEOUT 1800)

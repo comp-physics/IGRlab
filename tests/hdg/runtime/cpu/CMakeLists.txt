@@ -217,6 +217,26 @@ set_target_properties(dg_igr_hdg_generic_euler_cpu_test PROPERTIES
   CXX_STANDARD_REQUIRED ON
   CXX_EXTENSIONS OFF)
 
+add_executable(dg_igr_hdg_zhang_shu_lifecycle_cpu_test
+  test_zhang_shu_lifecycle.cpp)
+target_include_directories(dg_igr_hdg_zhang_shu_lifecycle_cpu_test PRIVATE
+  "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_hdg_zhang_shu_lifecycle_cpu_test PRIVATE
+  dg_igr_hdg_generic_cpu mfem MPI::MPI_CXX)
+target_compile_options(dg_igr_hdg_zhang_shu_lifecycle_cpu_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+set_target_properties(dg_igr_hdg_zhang_shu_lifecycle_cpu_test PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
+add_test(NAME hdg_zhang_shu_lifecycle_cpu_rank1
+  COMMAND dg_igr_hdg_zhang_shu_lifecycle_cpu_test)
+set_tests_properties(hdg_zhang_shu_lifecycle_cpu_rank1 PROPERTIES
+  PROCESSORS 1
+  RESOURCE_LOCK hdg_generic_euler_cpu
+  LABELS "hdg;generic;cpu;rodas3;limiter;igr;closure;transactional"
+  TIMEOUT 180)
+
 foreach(_ranks IN ITEMS 1 2 3)
   if(_ranks EQUAL 1)
     add_test(NAME hdg_generic_euler_cpu_rank1

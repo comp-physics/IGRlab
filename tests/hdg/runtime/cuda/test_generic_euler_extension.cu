@@ -6817,6 +6817,12 @@ bool RunRodas3RankOneStep(
       evidence.common_shift_operator_reuses == 3 &&
       evidence.condensed_rhs_refreshes == 3 &&
       evidence.common_shift_trace_solves == 4 &&
+      evidence.positivity_limiter_calls == 0 &&
+      evidence.positivity_limiter_active_calls == 0 &&
+      evidence.positivity_limiter_inadmissible_mean_rejections == 0 &&
+      evidence.positivity_algebraic_projections == 0 &&
+      evidence.common_shift_operator_rebuilds == 0 &&
+      evidence.maximum_positivity_limiter_correction_norm == 0.0 &&
       preconditioner_architecture;
   record.numerical_passed = observation.candidate_ready &&
       observation.finite && observation.admissible &&
@@ -7296,6 +7302,332 @@ bool CheckRodas3EntryProjectionGate()
   return All(run(1.05, true) && run(64.0, false), mesh.GetComm());
 }
 
+bool CheckRodas3ZhangShuActiveStageLifecycle()
+{
+  constexpr int order = 1;
+  constexpr int scalar_dofs = 4;
+  constexpr double dt = 1.0e-6;
+  constexpr double density_floor = 0.999;
+  constexpr double pressure_floor = 1.0e-8;
+  constexpr double source_amplitude = 2500.0;
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::explicit_zero, InitialMode::constant);
+  if (fields.initial.empty() || fields.source.size() != fields.initial.size())
+    return false;
+
+  // For Q1 Gauss--Legendre L2, the four nodal weights are equal.  This
+  // checkerboard source therefore has exactly zero cell mean while stage 2,
+  // Y_3 = y_n + k_1, has density coefficients on both sides of the floor.
+  // Stages 0 and 1 remain the admissible coherent entry state, so activation
+  // specifically reaches the causal-stage projection/rebuild path.
+  bool source_ready = true;
+  try
+  {
+    mfem::L2_FECollection collection(
+        order, 2, mfem::BasisType::GaussLegendre,
+        mfem::FiniteElement::VALUE);
+    mfem::ParFiniteElementSpace space(
+        &mesh, &collection, components, mfem::Ordering::byNODES);
+    for (int element = 0; element < mesh.GetNE() && source_ready; ++element)
+    {
+      const mfem::FiniteElement* const finite_element = space.GetFE(element);
+      mfem::Array<int> vdofs;
+      space.GetElementVDofs(element, vdofs);
+      source_ready = finite_element != nullptr &&
+          finite_element->GetDof() == scalar_dofs &&
+          vdofs.Size() == components * scalar_dofs;
+      for (int scalar = 0; scalar < scalar_dofs && source_ready; ++scalar)
+      {
+        double sign = 1.0;
+        const int dof = DecodeSignedDof(vdofs[scalar], sign);
+        const double local_value = scalar % 2 == 0
+            ? -source_amplitude : source_amplitude;
+        source_ready = dof >= 0 &&
+            static_cast<std::size_t>(dof) < fields.source.size();
+        if (source_ready)
+          fields.source[static_cast<std::size_t>(dof)] = sign * local_value;
+      }
+    }
+  }
+  catch (...) { source_ready = false; }
+  if (!All(source_ready, mesh.GetComm())) return false;
+
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::none);
+  request.backend.cuda_engine = CudaEngineKind::tensor_core;
+  request.time_treatment = EulerHdgTimeTreatment::rodas3;
+  request.numerical_policy.positivity_limiter = {
+      dg::hdg::generic::EulerHdgPositivityLimiterKind::zhang_shu,
+      dg::hdg::generic::EulerHdgZhangShuPointSet::consumer,
+      density_floor,
+      pressure_floor,
+      12};
+  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+      ContractStatus::accepted)
+    return false;
+
+  CudaConfig config = MakeDirectConfig(request, 1, order);
+  config.dt = dt;
+  config.cuda_engine = CudaEngineKind::tensor_core;
+  const CudaTracePolicyKind requested_policy =
+      dg::hdg::runtime::cuda_w8a::DefaultCudaTracePolicyRequest(
+          CudaEngineKind::tensor_core, false, 1,
+          EulerHdgTimeTreatment::rodas3);
+  auto engine = CudaQualificationTestAccess::CreateWithTracePolicy<
+      dg::hdg::runtime::Rodas3CudaRank1RuntimeSelection>(
+          config, requested_policy);
+  CudaRunEvidence initialization{};
+  if (!engine || !All(engine->Initialize(initialization), mesh.GetComm()))
+    return false;
+
+  CudaPrecommitSnapshot snapshot{};
+  CudaStepEvidence evidence{};
+  CudaRodas3ScreenObservation observation{};
+  CudaPreparedOutputMetadataV1 output{};
+  dg::hdg::generic::HdgEulerPreparedAssessment strict_assessment{};
+  dg::hdg::generic::HdgEulerPreparedAssessment assessment{};
+  constexpr dg::hdg::generic::HdgEulerPreparedAssessmentPolicy
+      strict_assessment_policy{1.0e-8, 1.0e-5, 0.25};
+  constexpr dg::hdg::generic::HdgEulerPreparedAssessmentPolicy
+      relaxed_assessment_policy{1.0e-8, 1.0e-2, 0.25};
+  const bool prepared = engine->PrepareStep(false, dt, snapshot, evidence);
+  const CudaStepEvidence prepared_evidence = evidence;
+  const bool captured = prepared &&
+      CudaQualificationTestAccess::CapturePreparedRodas3(
+          *engine, observation);
+  const bool staged = captured &&
+      engine->StagePreparedOutputMetadata(output, evidence);
+  const bool strict_assessed = staged &&
+      engine->AssessPrepared(
+          output, strict_assessment_policy, strict_assessment);
+  const bool strict_primary_gates = strict_assessed &&
+      strict_assessment.finite_gate && strict_assessment.solver_gate &&
+      strict_assessment.residual_gate &&
+      strict_assessment.admissibility_gate &&
+      strict_assessment.algebraic_closure_gate &&
+      !strict_assessment.algebraic_correction_gate &&
+      !output.output_staged && !output.successful_commit;
+  const bool assessed = strict_primary_gates &&
+      engine->AssessPrepared(
+          output, relaxed_assessment_policy, assessment);
+  const bool marked = assessed && assessment.algebraic_correction_gate &&
+      engine->MarkOutputStaged(output);
+  const bool commit_prepared = marked &&
+      engine->PrepareCommit(output, evidence);
+  const bool provisional = commit_prepared &&
+      engine->CommitPrepared(output, evidence);
+  const bool committed = provisional &&
+      engine->FinalizeCommit(output, evidence);
+
+  std::vector<double> committed_u4(fields.initial.size(), 0.0);
+  const bool exported = committed && engine->ExportCommittedInterior(
+      {committed_u4.data(), fields.volume_scalar_count, components});
+  bool consumer_coefficients_admissible = exported;
+  for (std::size_t scalar = 0;
+       scalar < fields.volume_scalar_count &&
+           consumer_coefficients_admissible;
+       ++scalar)
+  {
+    const double density = committed_u4[scalar];
+    const double momentum_x =
+        committed_u4[fields.volume_scalar_count + scalar];
+    const double momentum_y =
+        committed_u4[2 * fields.volume_scalar_count + scalar];
+    const double energy =
+        committed_u4[3 * fields.volume_scalar_count + scalar];
+    const double pressure = 0.4 *
+        (energy - 0.5 *
+            (momentum_x * momentum_x + momentum_y * momentum_y) / density);
+    consumer_coefficients_admissible = std::isfinite(density) &&
+        density >= density_floor && std::isfinite(pressure) &&
+        pressure >= pressure_floor;
+  }
+  const bool passed = prepared && captured && staged && strict_assessed &&
+      strict_primary_gates && assessed && marked && commit_prepared &&
+      provisional && committed &&
+      snapshot.numerical_candidate_ready && observation.candidate_ready &&
+      observation.finite && observation.admissible && observation.recovery &&
+      observation.true_residual && observation.conservation &&
+      observation.telemetry && observation.success &&
+      assessment.finite_gate && assessment.solver_gate &&
+      assessment.residual_gate && assessment.admissibility_gate &&
+      assessment.algebraic_closure_gate &&
+      assessment.algebraic_correction_gate &&
+      evidence.status == CudaRunStatus::committed && evidence.committed &&
+      evidence.positivity_limiter_calls ==
+          prepared_evidence.positivity_limiter_calls &&
+      evidence.positivity_limiter_active_calls ==
+          prepared_evidence.positivity_limiter_active_calls &&
+      evidence.positivity_limiter_inadmissible_mean_rejections ==
+          prepared_evidence.positivity_limiter_inadmissible_mean_rejections &&
+      evidence.positivity_algebraic_projections ==
+          prepared_evidence.positivity_algebraic_projections &&
+      evidence.common_shift_operator_rebuilds ==
+          prepared_evidence.common_shift_operator_rebuilds &&
+      evidence.maximum_positivity_limiter_correction_norm ==
+          prepared_evidence.maximum_positivity_limiter_correction_norm &&
+      prepared_evidence.no_fallback && prepared_evidence.device_resident &&
+      prepared_evidence.positivity_limiter_calls == 6 &&
+      prepared_evidence.positivity_limiter_active_calls >= 1 &&
+      prepared_evidence.positivity_limiter_active_calls <=
+          prepared_evidence.positivity_limiter_calls &&
+      prepared_evidence.positivity_limiter_inadmissible_mean_rejections == 0 &&
+      prepared_evidence.positivity_algebraic_projections ==
+          prepared_evidence.positivity_limiter_active_calls &&
+      prepared_evidence.common_shift_operator_rebuilds >= 1 &&
+      prepared_evidence.common_shift_operator_rebuilds <=
+          prepared_evidence.positivity_limiter_active_calls &&
+      prepared_evidence.common_shift_operator_builds ==
+          1 + prepared_evidence.common_shift_operator_rebuilds &&
+      prepared_evidence.common_shift_operator_reuses == 3 &&
+      prepared_evidence.condensed_rhs_refreshes == 3 &&
+      prepared_evidence.maximum_positivity_limiter_correction_norm > 0.0 &&
+      std::isfinite(prepared_evidence.temporal_error_norm) &&
+      std::isfinite(prepared_evidence.final_algebraic_residual) &&
+      std::isfinite(prepared_evidence.final_algebraic_correction_norm) &&
+      consumer_coefficients_admissible && output.successful_commit &&
+      evidence.after.step == 1 && evidence.after.generation == 1 &&
+      evidence.after.time == dt;
+  if (!passed)
+  {
+    int rank = -1;
+    MPI_Comm_rank(mesh.GetComm(), &rank);
+    if (rank == 0)
+    {
+      std::cerr << "CUDA Zhang--Shu active-stage lifecycle failed: prepared="
+                << prepared << " captured=" << captured
+                << " staged=" << staged
+                << " strict_assessed=" << strict_assessed
+                << " strict_primary=" << strict_primary_gates
+                << " reassessed=" << assessed
+                << " marked=" << marked
+                << " commit_prepared=" << commit_prepared
+                << " provisional=" << provisional
+                << " committed=" << committed << " status="
+                << static_cast<int>(evidence.status) << " phase="
+                << static_cast<int>(prepared_evidence.phase) << " reason="
+                << static_cast<int>(prepared_evidence.contract_reason)
+                << " calls="
+                << prepared_evidence.positivity_limiter_calls << " active="
+                << prepared_evidence.positivity_limiter_active_calls
+                << " mean_rejections="
+                << prepared_evidence.
+                    positivity_limiter_inadmissible_mean_rejections
+                << " projections="
+                << prepared_evidence.positivity_algebraic_projections
+                << " rebuilds="
+                << prepared_evidence.common_shift_operator_rebuilds
+                << " builds="
+                << prepared_evidence.common_shift_operator_builds
+                << " reuses="
+                << prepared_evidence.common_shift_operator_reuses
+                << " correction="
+                << prepared_evidence.maximum_positivity_limiter_correction_norm
+                << " conservation=" << observation.conservation
+                << " strict_differential="
+                << strict_assessment.normalized_differential_error
+                << " strict_algebraic="
+                << strict_assessment.normalized_algebraic_correction
+                << " strict_algebraic_gate="
+                << strict_assessment.algebraic_correction_gate
+                << " normalized_differential="
+                << assessment.normalized_differential_error
+                << " normalized_algebraic="
+                << assessment.normalized_algebraic_correction
+                << " algebraic_gate="
+                << assessment.algebraic_correction_gate
+                << '\n';
+    }
+  }
+  return All(passed, mesh.GetComm());
+}
+
+bool CheckRodas3ZhangShuMeanRejectionAttribution()
+{
+  constexpr int order = 1;
+  constexpr double dt = 1.0e-6;
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::empty, InitialMode::constant);
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::none);
+  request.backend.cuda_engine = CudaEngineKind::tensor_core;
+  request.time_treatment = EulerHdgTimeTreatment::rodas3;
+  // The constant state has rho_bar=1.  A floor strictly above that mean is a
+  // deterministic no-repair limiter rejection, while the Euler state itself
+  // remains finite with positive physical density and pressure.
+  request.numerical_policy.positivity_limiter = {
+      dg::hdg::generic::EulerHdgPositivityLimiterKind::zhang_shu,
+      dg::hdg::generic::EulerHdgZhangShuPointSet::consumer,
+      1.001,
+      1.0e-8,
+      12};
+  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+      ContractStatus::accepted)
+    return false;
+
+  CudaConfig config = MakeDirectConfig(request, 1, order);
+  config.dt = dt;
+  config.cuda_engine = CudaEngineKind::tensor_core;
+  const CudaTracePolicyKind requested_policy =
+      dg::hdg::runtime::cuda_w8a::DefaultCudaTracePolicyRequest(
+          CudaEngineKind::tensor_core, false, 1,
+          EulerHdgTimeTreatment::rodas3);
+  auto engine = CudaQualificationTestAccess::CreateWithTracePolicy<
+      dg::hdg::runtime::Rodas3CudaRank1RuntimeSelection>(
+          config, requested_policy);
+  CudaRunEvidence initialization{};
+  if (!engine || !All(engine->Initialize(initialization), mesh.GetComm()))
+    return false;
+
+  CudaPrecommitSnapshot snapshot{};
+  CudaStepEvidence evidence{};
+  const bool prepared = engine->PrepareStep(false, dt, snapshot, evidence);
+  const CudaStepEvidence failed_evidence = evidence;
+  CudaStepEvidence rollback{};
+  const bool abandoned = !prepared && engine->RejectFailedAttempt(rollback);
+  const bool passed = abandoned &&
+      failed_evidence.status == CudaRunStatus::retry_available &&
+      failed_evidence.phase == CudaFailurePhase::assembly &&
+      failed_evidence.contract_reason == FailureReason::admissibility_gate &&
+      failed_evidence.positivity_limiter_calls == 1 &&
+      failed_evidence.positivity_limiter_active_calls == 0 &&
+      failed_evidence.positivity_limiter_inadmissible_mean_rejections == 1 &&
+      failed_evidence.positivity_algebraic_projections == 0 &&
+      failed_evidence.common_shift_operator_builds == 0 &&
+      failed_evidence.common_shift_trace_solves == 0 &&
+      failed_evidence.retry_available &&
+      failed_evidence.coordinates_preserved &&
+      failed_evidence.committed_bytes_preserved &&
+      rollback.coordinates_preserved && rollback.committed_bytes_preserved &&
+      !rollback.retry_available;
+  if (!passed)
+  {
+    int rank = -1;
+    MPI_Comm_rank(mesh.GetComm(), &rank);
+    if (rank == 0)
+      std::cerr << "CUDA Zhang--Shu mean-rejection attribution failed: "
+                << "prepared=" << prepared << " abandoned=" << abandoned
+                << " status=" << static_cast<int>(failed_evidence.status)
+                << " phase=" << static_cast<int>(failed_evidence.phase)
+                << " reason="
+                << static_cast<int>(failed_evidence.contract_reason)
+                << " calls="
+                << failed_evidence.positivity_limiter_calls
+                << " active="
+                << failed_evidence.positivity_limiter_active_calls
+                << " mean_rejections="
+                << failed_evidence.
+                    positivity_limiter_inadmissible_mean_rejections
+                << " retry=" << failed_evidence.retry_available
+                << '\n';
+  }
+  return All(passed, mesh.GetComm());
+}
+
 bool CheckRodas3RankOneScreen(const int rank)
 {
   Rodas3ScreenRecord conventional{};
@@ -7324,6 +7656,10 @@ bool CheckRodas3RankOneScreen(const int rank)
   const bool default_trace_architecture =
       CheckRodas3DefaultTraceArchitecture();
   const bool entry_projection_gate = CheckRodas3EntryProjectionGate();
+  const bool positivity_lifecycle =
+      CheckRodas3ZhangShuActiveStageLifecycle();
+  const bool positivity_mean_rejection =
+      CheckRodas3ZhangShuMeanRejectionAttribution();
   const bool all_seven_boundary_policies =
       CheckAllSevenLoweredBoundaryPolicies(1);
   if (rank == 0)
@@ -7418,6 +7754,9 @@ bool CheckRodas3RankOneScreen(const int rank)
               << " default_trace_architecture="
               << default_trace_architecture
               << " entry_projection_gate=" << entry_projection_gate
+              << " positivity_lifecycle=" << positivity_lifecycle
+              << " positivity_mean_rejection="
+              << positivity_mean_rejection
               << " all_seven_boundary_policies="
               << all_seven_boundary_policies << '\n';
   }
@@ -7425,7 +7764,8 @@ bool CheckRodas3RankOneScreen(const int rank)
       conventional_physical_passed && igr_physical_passed &&
       ordinary_conventional_passed && ordinary_igr_passed &&
       assessment_authority && default_trace_architecture &&
-      entry_projection_gate &&
+      entry_projection_gate && positivity_lifecycle &&
+      positivity_mean_rejection &&
       all_seven_boundary_policies;
 }
 

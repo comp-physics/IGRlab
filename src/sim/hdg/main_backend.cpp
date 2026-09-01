@@ -33,8 +33,11 @@ namespace
 using dg::hdg::generic::BackendKind;
 using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::BackendSelection;
+using dg::hdg::generic::EulerHdgPositivityLimiterKind;
+using dg::hdg::generic::EulerHdgPositivityLimiterPolicy;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::generic::EulerHdgTimeTreatment;
+using dg::hdg::generic::EulerHdgZhangShuPointSet;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::generic::RegularizationSelection;
 using dg::hdg::runtime::cpu::GenericEulerCpuSessionStatus;
@@ -422,7 +425,10 @@ std::string CanonicalNumericalPolicy(
          << policy.maximum_nonlinear_updates << ';'
          << policy.maximum_linear_iterations << ';'
          << policy.maximum_line_search_trials << ';'
-         << static_cast<int>(policy.stabilization.kind) << ';';
+         << static_cast<int>(policy.stabilization.kind) << ';'
+         << static_cast<int>(policy.positivity_limiter.kind) << ';'
+         << static_cast<int>(policy.positivity_limiter.point_set) << ';'
+         << policy.positivity_limiter.pressure_bisection_iterations << ';';
   AppendDouble(stream, policy.nonlinear_relative_tolerance);
   AppendDouble(stream,
                policy.newton_correction_linear_relative_tolerance);
@@ -434,7 +440,37 @@ std::string CanonicalNumericalPolicy(
   AppendDouble(stream, policy.armijo_constant);
   AppendDouble(stream, policy.stabilization.alpha);
   AppendDouble(stream, policy.stabilization.beta);
+  AppendDouble(stream, policy.positivity_limiter.density_floor);
+  AppendDouble(stream, policy.positivity_limiter.pressure_floor);
   return stream.str();
+}
+
+EulerHdgZhangShuPointSet CanonicalZhangShuPointSet(
+    const mfem::ZhangShuPointSet point_set)
+{
+  switch (point_set)
+  {
+  case mfem::ZhangShuPointSet::kConsumer:
+    return EulerHdgZhangShuPointSet::consumer;
+  case mfem::ZhangShuPointSet::kQuadrature:
+    return EulerHdgZhangShuPointSet::quadrature;
+  }
+  throw std::invalid_argument("HDG Zhang-Shu point set is invalid");
+}
+
+EulerHdgPositivityLimiterPolicy CanonicalPositivityLimiterPolicy(
+    const HdgEulerMainRequest& request,
+    const EulerHdgTimeTreatment time_treatment)
+{
+  if (time_treatment != EulerHdgTimeTreatment::rodas3 ||
+      !request.case_config.limiter_pipeline.zhang_shu)
+    return {};
+  return {EulerHdgPositivityLimiterKind::zhang_shu,
+          CanonicalZhangShuPointSet(
+              request.case_config.limiter_pipeline.zhang_shu_points),
+          request.case_config.rk3_config.rho_min,
+          request.case_config.rk3_config.p_min,
+          request.case_config.rk3_config.p_bisect_iters};
 }
 
 RegularizationSelection CanonicalRegularization(
@@ -784,8 +820,11 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
             "HDG Euler static source must have four components");
       }
       numerical_policy = case_data->numerical_policy;
-      // Cases own all numerical roles except command-line regularization.
+      // Cases own all numerical roles except command-line regularization and
+      // the shared case limiter pipeline lowered by this application adapter.
       numerical_policy.stabilization = regularization;
+      numerical_policy.positivity_limiter =
+          CanonicalPositivityLimiterPolicy(request, time_treatment);
       if (!dg::hdg::generic::ValidEulerHdgNumericalPolicy(numerical_policy))
       {
         throw std::invalid_argument("HDG case data has an invalid numerical policy");

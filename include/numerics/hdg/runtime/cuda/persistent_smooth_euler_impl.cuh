@@ -2165,6 +2165,10 @@ bool CudaLaunchStatusReduction(const double* status, int count,
 bool CudaLaunchGatherLocalTrace(const int* signed_map, int count,
                                 const double* true_trace,
                                 double* local_trace) noexcept;
+bool CudaLaunchZhangShuU4(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    const generic::EulerHdgPositivityLimiterPolicy& policy,
+    int* device_result, double* correction_squared) noexcept;
 bool CudaLaunchAdmissibility(const CudaDeviceView& view,
                              const CudaMeshShape& shape) noexcept;
 bool CudaLaunchFreezeBorrowedCurrentLlfTau(const CudaDeviceView& view,
@@ -2235,21 +2239,34 @@ bool CudaLaunchRodasRestoreDifferentialState(
 bool CudaLaunchRodasLoadStage(const CudaDeviceView& view,
                              const CudaMeshShape& shape,
                              std::size_t stage) noexcept;
+bool CudaLaunchRodasSeedAlgebraicProjection(
+    const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
 bool CudaLaunchRodasBuildStageRightHandSide(
     const CudaDeviceView& view, const CudaMeshShape& shape,
     std::size_t stage, double step_size) noexcept;
 bool CudaLaunchRodasCaptureStageIncrement(
     const CudaDeviceView& view, const CudaMeshShape& shape,
     std::size_t stage) noexcept;
+bool CudaLaunchRodasCopyDifferentialState(
+    const CudaMeshShape& shape, const double* source,
+    double* destination) noexcept;
 bool CudaLaunchRodasFormCandidate(const CudaDeviceView& view,
                                  const CudaMeshShape& shape) noexcept;
 bool CudaLaunchRodasTemporalErrorSquared(
     const CudaDeviceView& view, const CudaMeshShape& shape,
     double* result) noexcept;
+bool CudaLaunchRodasFilteredPairErrorSquared(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    double* result, double* differential_measure) noexcept;
 bool CudaLaunchRodasAlgebraicCorrectionSquared(
     const CudaDeviceView& view, const CudaMeshShape& shape,
     double* result) noexcept;
 bool CudaLaunchRodasPreparedAssessmentSquared(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    double absolute_tolerance, double relative_tolerance,
+    double* differential_result, double* algebraic_result,
+    double* differential_measure) noexcept;
+bool CudaLaunchRodasPreparedFilteredPairAssessmentSquared(
     const CudaDeviceView& view, const CudaMeshShape& shape,
     double absolute_tolerance, double relative_tolerance,
     double* differential_result, double* algebraic_result,
@@ -2316,6 +2333,12 @@ bool CudaLaunchEulerConservation(const CudaDeviceView& view,
 bool CudaLaunchRodasConservation(const CudaDeviceView& view,
                                  const CudaMeshShape& shape,
                                  double dt, double* result) noexcept;
+bool CudaLaunchRodasAdmittedStageConservation(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    double dt, std::size_t stage, double* result) noexcept;
+bool CudaLaunchRodasConservationVolume(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    double dt, double* result) noexcept;
 
 bool CudaLaunchHash(const double* values, int count,
                     std::uint64_t* words) noexcept;
@@ -2962,6 +2985,7 @@ public:
       const AttemptIdentity& attempt,
       const StateHash& expected_interior_hash,
       const StateHash& expected_trace_hash,
+      const bool filtered_pair,
       const generic::HdgEulerPreparedAssessmentPolicy policy,
       generic::HdgEulerPreparedAssessment& assessment) noexcept
   {
@@ -2988,17 +3012,27 @@ public:
         workspace_slot_.trace.hash == expected_trace_hash;
     if (!CollectiveContinue(local_valid)) return false;
 
-    const bool launched = CudaLaunchRodasPreparedAssessmentSquared(
-        view_, shape_, policy.absolute_tolerance, policy.relative_tolerance,
-        view_.scalar, view_.scalar + 1, view_.scalar + 2);
+    // The limiter-enabled attempt retained its already-admitted final-stage
+    // predictor in the leading U4 lanes of rodas_combination_interior.  The
+    // default path launches the original error-weight kernels byte-for-byte;
+    // it performs no capture, copy, or alternative assessment work.
+    const bool launched = filtered_pair
+        ? CudaLaunchRodasPreparedFilteredPairAssessmentSquared(
+              view_, shape_, policy.absolute_tolerance,
+              policy.relative_tolerance, view_.scalar, view_.scalar + 1,
+              view_.scalar + 2)
+        : CudaLaunchRodasPreparedAssessmentSquared(
+              view_, shape_, policy.absolute_tolerance,
+              policy.relative_tolerance, view_.scalar, view_.scalar + 1,
+              view_.scalar + 2);
     std::array<double, 3> local_sums{{
         std::numeric_limits<double>::infinity(),
         std::numeric_limits<double>::infinity(),
         std::numeric_limits<double>::infinity()}};
     const bool copied = launched && TransportPolicy::DeviceToHost(
-            local_sums.data(), view_.scalar, sizeof(local_sums),
-            CudaTransferCategory::scalar_diagnostic,
-            CudaTransferSite::scalar_status) &&
+             local_sums.data(), view_.scalar, sizeof(local_sums),
+             CudaTransferCategory::scalar_diagnostic,
+             CudaTransferSite::scalar_status) &&
         TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
     if (!CollectiveContinue(copied)) return false;
 
@@ -4055,22 +4089,38 @@ public:
   }
 
   /**
-   * Verify the full singular-mass RODAS3 balance.  The device witness uses
-   * the four causal stage states and directions retained by ExecuteRodas3;
-   * it therefore cannot be replaced by a Backward-Euler endpoint balance.
-   * Only the four differential Euler equations contribute to this witness.
+   * Verify the full singular-mass RODAS3 balance.  The default device witness
+   * reconstructs the four causal stage states from retained increments.  A
+   * positivity-enabled attempt instead supplies boundary terms reduced while
+   * each actual admitted stage was resident; this method adds them to the
+   * endpoint volume/source term.  Neither path is a Backward-Euler endpoint
+   * balance. Only the four differential Euler equations contribute.
    */
-  bool RodasConservationBalance(const double dt, double& maximum_error,
-                                double& maximum_relative_error) noexcept
+  bool RodasConservationBalance(
+      const double dt, double& maximum_error,
+      double& maximum_relative_error,
+      const double* const admitted_stage_boundary_balance = nullptr,
+      const double* const admitted_stage_boundary_scale = nullptr) noexcept
   {
     maximum_error = 0.0;
     maximum_relative_error = 0.0;
     constexpr int components = igr_trace_components;
     static_assert(euler_conservation_result_scalars == 2 * components + 2);
     std::array<double, euler_conservation_result_scalars> local{};
+    const bool admitted_stage_witness =
+        admitted_stage_boundary_balance != nullptr &&
+        admitted_stage_boundary_scale != nullptr;
+    const bool witness_pointer_pair = admitted_stage_witness ||
+        (admitted_stage_boundary_balance == nullptr &&
+         admitted_stage_boundary_scale == nullptr);
     const bool launched = initialized_ && rodas3_ &&
         shape_.borrowed_host_inputs && std::isfinite(dt) && dt > 0.0 &&
-        CudaLaunchRodasConservation(view_, shape_, dt, view_.scalar);
+        witness_pointer_pair &&
+        (admitted_stage_witness
+             ? CudaLaunchRodasConservationVolume(
+                   view_, shape_, dt, view_.scalar)
+             : CudaLaunchRodasConservation(
+                   view_, shape_, dt, view_.scalar));
     if (!CollectiveContinue(launched)) return false;
     const bool copied = TransportPolicy::DeviceToHost(
             local.data(), view_.scalar, local.size() * sizeof(double),
@@ -4080,6 +4130,24 @@ public:
     bool local_valid = copied && local[2 * components + 1] == 1.0 &&
         std::isfinite(local[2 * components]) &&
         local[2 * components] >= 0.0;
+    if (local_valid && admitted_stage_witness)
+      for (int component = 0; component < components; ++component)
+      {
+        const double boundary_balance =
+            admitted_stage_boundary_balance[component];
+        const double boundary_scale = admitted_stage_boundary_scale[component];
+        local_valid = std::isfinite(boundary_balance) &&
+            std::isfinite(boundary_scale) && boundary_scale >= 0.0;
+        if (!local_valid) break;
+        local[static_cast<std::size_t>(component)] += boundary_balance;
+        local[static_cast<std::size_t>(components + component)] +=
+            boundary_scale;
+        local_valid =
+            std::isfinite(local[static_cast<std::size_t>(component)]) &&
+            std::isfinite(local[static_cast<std::size_t>(
+                components + component)]) &&
+            local[static_cast<std::size_t>(components + component)] >= 0.0;
+      }
     for (int index = 0; local_valid && index <= 2 * components; ++index)
       local_valid = std::isfinite(local[static_cast<std::size_t>(index)]);
     if (!CollectiveContinue(local_valid)) return false;

@@ -220,6 +220,13 @@ struct CpuWorkCensus
   std::uint64_t common_shift_operator_builds = 0;
   std::uint64_t common_shift_operator_reuses = 0;
   std::uint64_t condensed_rhs_refreshes = 0;
+  // Bounded RODAS-only Zhang--Shu observability.  These remain exactly zero
+  // for the default inactive policy and for every BE/PBE attempt.
+  std::uint64_t positivity_limiter_calls = 0;
+  std::uint64_t positivity_limiter_active_calls = 0;
+  std::uint64_t positivity_limited_elements = 0;
+  std::uint64_t positivity_algebraic_projections = 0;
+  std::uint64_t common_shift_operator_rebuilds = 0;
 };
 
 struct CpuStorageEvidence
@@ -282,6 +289,8 @@ struct CpuAttemptEvidence
   double initial_algebraic_correction_norm = 0.0;
   double final_algebraic_residual = 0.0;
   double final_algebraic_correction_norm = 0.0;
+  double maximum_positivity_limiter_correction_norm = 0.0;
+  double maximum_positivity_algebraic_correction_norm = 0.0;
   StateHash committed_interior_before{};
   StateHash committed_trace_before{};
   StateHash committed_interior_after{};

@@ -476,6 +476,12 @@ struct CudaNumericalResult
   std::uint64_t common_shift_trace_solves = 0;
   std::uint64_t common_shift_preconditioner_setups = 0;
   std::uint64_t common_shift_preconditioner_reuses = 0;
+  std::uint64_t positivity_limiter_calls = 0;
+  std::uint64_t positivity_limiter_active_calls = 0;
+  std::uint64_t positivity_limiter_inadmissible_mean_rejections = 0;
+  std::uint64_t positivity_algebraic_projections = 0;
+  std::uint64_t common_shift_operator_rebuilds = 0;
+  double maximum_positivity_limiter_correction_norm = 0.0;
   int nonlinear_updates = 0;
   int trace_solves = 0;
   // Sum outer GMRES iterations from the configured native or HYPRE trace
@@ -902,7 +908,10 @@ public:
 
     if (!numerics_.AssessPreparedRodas3(
             pending_.attempt, pending_.candidate_interior_hash,
-            pending_.candidate_trace_hash, policy, assessment))
+            pending_.candidate_trace_hash,
+            config_.numerical_policy.positivity_limiter.kind ==
+                generic::EulerHdgPositivityLimiterKind::zhang_shu,
+            policy, assessment))
       return false;
     const detail::CudaNumericalResult& numerical = pending_.numerical;
     assessment.finite_gate = numerical.finite &&
@@ -2388,6 +2397,18 @@ private:
         adjusted.common_shift_preconditioner_setups;
     evidence.common_shift_preconditioner_reuses =
         adjusted.common_shift_preconditioner_reuses;
+    evidence.positivity_limiter_calls =
+        adjusted.positivity_limiter_calls;
+    evidence.positivity_limiter_active_calls =
+        adjusted.positivity_limiter_active_calls;
+    evidence.positivity_limiter_inadmissible_mean_rejections =
+        adjusted.positivity_limiter_inadmissible_mean_rejections;
+    evidence.positivity_algebraic_projections =
+        adjusted.positivity_algebraic_projections;
+    evidence.common_shift_operator_rebuilds =
+        adjusted.common_shift_operator_rebuilds;
+    evidence.maximum_positivity_limiter_correction_norm =
+        adjusted.maximum_positivity_limiter_correction_norm;
     evidence.nonlinear_updates = adjusted.nonlinear_updates;
     evidence.trace_solves = adjusted.trace_solves;
     evidence.linear_iterations = adjusted.linear_iterations;
@@ -2609,6 +2630,18 @@ private:
         numerical.common_shift_preconditioner_setups;
     evidence.common_shift_preconditioner_reuses =
         numerical.common_shift_preconditioner_reuses;
+    evidence.positivity_limiter_calls =
+        numerical.positivity_limiter_calls;
+    evidence.positivity_limiter_active_calls =
+        numerical.positivity_limiter_active_calls;
+    evidence.positivity_limiter_inadmissible_mean_rejections =
+        numerical.positivity_limiter_inadmissible_mean_rejections;
+    evidence.positivity_algebraic_projections =
+        numerical.positivity_algebraic_projections;
+    evidence.common_shift_operator_rebuilds =
+        numerical.common_shift_operator_rebuilds;
+    evidence.maximum_positivity_limiter_correction_norm =
+        numerical.maximum_positivity_limiter_correction_norm;
     evidence.nonlinear_updates = numerical.nonlinear_updates;
     evidence.trace_solves = numerical.trace_solves;
     evidence.linear_iterations = numerical.linear_iterations;

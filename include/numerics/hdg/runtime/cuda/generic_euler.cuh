@@ -99,6 +99,29 @@ struct GenericEulerCudaCheckpointPayloadViewV1
 };
 
 /**
+ * One bounded, collective classification for an immediately failed prepare.
+ * This is neither retained attempt history nor a numerical-evidence export:
+ * it exists only so the application can identify the last rejection if the
+ * adaptive controller subsequently declares that rejection terminal.
+ */
+enum class GenericEulerCudaPrepareFailureClass : unsigned char
+{
+  not_failed,
+  unavailable,
+  zhang_shu_inadmissible_conservative_mean,
+  finite_gate,
+  admissibility_gate,
+  trace_solve,
+  recovery_gate,
+  true_residual_gate,
+  telemetry_gate,
+  success_gate,
+  collective_protocol,
+  backend_or_contract,
+  mixed_numerical_failure
+};
+
+/**
  * Header-only adapter over the existing persistent CUDA engine.  Its complete
  * lifecycle is PrepareStep -> staged output -> MarkOutputStaged ->
  * PrepareCommit -> CommitPrepared -> FinalizeCommit.  No second numerical
@@ -485,10 +508,15 @@ public:
   /** Stage the native candidate export; an explicit acknowledgement is next. */
   template <typename StagedOutput>
   result_type Prepare(const double dt, GenericEulerCudaPreparedStep& authority,
-                      StagedOutput& native_export) noexcept
+                      StagedOutput& native_export,
+                      GenericEulerCudaPrepareFailureClass*
+                          prepare_failure_class = nullptr) noexcept
   {
     static_assert(IsSupportedOutput<StagedOutput>(),
                   "CUDA prepared output must be checkpoint or metadata");
+    if (prepare_failure_class != nullptr)
+      *prepare_failure_class =
+          GenericEulerCudaPrepareFailureClass::not_failed;
     // A destination authority is never an overwrite slot.  In particular, a
     // live authority from another session remains usable by its owner when
     // this session rejects the prepare collectively.
@@ -520,6 +548,10 @@ public:
           EngineHasStatus(RunStatus::retry_available));
       if (retryable_failure)
       {
+        const auto collective_failure_class =
+            CollectivePrepareFailureClass(evidence);
+        if (prepare_failure_class != nullptr)
+          *prepare_failure_class = collective_failure_class;
         retained_dt_ = dt;
         retry_ready_ = true;
         coordinates_ = EngineCoordinates();
@@ -1202,6 +1234,71 @@ private:
                          communicator_) == MPI_SUCCESS && output == 1;
   }
 
+  static GenericEulerCudaPrepareFailureClass LocalPrepareFailureClass(
+      const cuda_w8a::CudaStepEvidence& evidence) noexcept
+  {
+    if (evidence.positivity_limiter_inadmissible_mean_rejections != 0)
+    {
+      return GenericEulerCudaPrepareFailureClass::
+          zhang_shu_inadmissible_conservative_mean;
+    }
+    switch (evidence.contract_reason)
+    {
+    case FailureReason::finite_gate:
+      return GenericEulerCudaPrepareFailureClass::finite_gate;
+    case FailureReason::admissibility_gate:
+      return GenericEulerCudaPrepareFailureClass::admissibility_gate;
+    case FailureReason::recovery_gate:
+      return GenericEulerCudaPrepareFailureClass::recovery_gate;
+    case FailureReason::true_residual_gate:
+      return GenericEulerCudaPrepareFailureClass::true_residual_gate;
+    case FailureReason::telemetry_gate:
+      return GenericEulerCudaPrepareFailureClass::telemetry_gate;
+    case FailureReason::success_gate:
+      return GenericEulerCudaPrepareFailureClass::success_gate;
+    case FailureReason::collective_protocol:
+      return GenericEulerCudaPrepareFailureClass::collective_protocol;
+    default:
+      break;
+    }
+    if (evidence.phase == cuda_w8a::CudaFailurePhase::trace_solve)
+      return GenericEulerCudaPrepareFailureClass::trace_solve;
+    if (evidence.phase == cuda_w8a::CudaFailurePhase::recovery)
+      return GenericEulerCudaPrepareFailureClass::recovery_gate;
+    return GenericEulerCudaPrepareFailureClass::backend_or_contract;
+  }
+
+  GenericEulerCudaPrepareFailureClass CollectivePrepareFailureClass(
+      const cuda_w8a::CudaStepEvidence& evidence) const noexcept
+  {
+    const auto local_class = LocalPrepareFailureClass(evidence);
+    const unsigned local[2] = {
+        evidence.positivity_limiter_inadmissible_mean_rejections != 0 ? 1U
+                                                                       : 0U,
+        static_cast<unsigned>(local_class)};
+    unsigned minimum[2] = {local[0], local[1]};
+    unsigned maximum[2] = {local[0], local[1]};
+    const bool minimum_ready = MPI_Allreduce(
+        local, minimum, 2, MPI_UNSIGNED, MPI_MIN, communicator_) ==
+        MPI_SUCCESS;
+    const bool maximum_ready = MPI_Allreduce(
+        local, maximum, 2, MPI_UNSIGNED, MPI_MAX, communicator_) ==
+        MPI_SUCCESS;
+    if (!minimum_ready || !maximum_ready)
+      return GenericEulerCudaPrepareFailureClass::unavailable;
+    // One inadmissible conservative cell mean is sufficient to invalidate the
+    // collective candidate; unlike the remaining categories it need not be
+    // observed independently on every rank.
+    if (maximum[0] != 0)
+    {
+      return GenericEulerCudaPrepareFailureClass::
+          zhang_shu_inadmissible_conservative_mean;
+    }
+    if (minimum[1] != maximum[1])
+      return GenericEulerCudaPrepareFailureClass::mixed_numerical_failure;
+    return local_class;
+  }
+
   bool EngineHasStatus(const RunStatus expected) const noexcept
   {
     return (rank1_ && rank1_->contract() &&
@@ -1370,6 +1467,18 @@ private:
         local, cursor, complete, trace_policy.resolved_selection);
     AppendConfigValue(local, cursor, complete, trace_policy.rank_count);
     AppendConfigValue(local, cursor, complete, trace_policy.polynomial_order);
+    // Keep the pre-limiter descriptor prefix byte-identical.  A legacy or
+    // value-initialized policy appends only zero bytes here.
+    if (borrowed_host_mode && config.use_generic_numerical_policy)
+    {
+      const auto& limiter = config.numerical_policy.positivity_limiter;
+      AppendConfigValue(local, cursor, complete, limiter.kind);
+      AppendConfigValue(local, cursor, complete, limiter.point_set);
+      AppendConfigValue(local, cursor, complete, limiter.density_floor);
+      AppendConfigValue(local, cursor, complete, limiter.pressure_floor);
+      AppendConfigValue(
+          local, cursor, complete, limiter.pressure_bisection_iterations);
+    }
 
     config_descriptor minimum = local;
     config_descriptor maximum = local;

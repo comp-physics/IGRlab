@@ -1,6 +1,7 @@
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler.cuh"
 #include "numerics/hdg/runtime/cuda/native_rank1_trace_solver.cuh"
 #include "numerics/hdg/runtime/cuda/tensor_volume_layout.hpp"
+#include "numerics/hdg/euler/zhang_shu_u4.hpp"
 #include "physics/bc/detail/euler_boundary_state.hpp"
 
 #include <HYPRE_krylov.h>
@@ -3645,6 +3646,348 @@ __global__ void GatherKernel(const int* map, const int count,
   destination[entry] = sign * source[index];
 }
 
+__device__ __forceinline__ bool ZhangShuStoredPointAdmissible(
+    const double* const point, const double gamma,
+    const double density_floor, const double pressure_floor)
+{
+  double pressure = 0.0;
+  return point[0] >= density_floor &&
+      ::dg::hdg::euler::zhang_shu::Pressure(point, gamma, pressure) &&
+      pressure >= pressure_floor;
+}
+
+/**
+ * Conservative leading-U4 Zhang--Shu filter for one HDG element.
+ *
+ * One block owns one element. Thread zero computes the physical quadrature
+ * mean and the two causal limiter factors; all threads then scale disjoint
+ * coefficient entries. The consumer point set is the union of the volume
+ * and face residual points and the nodal coefficients. The quadrature point
+ * set omits the last group. Algebraic reconstruction of Uhat4 and the IGR
+ * fields deliberately remains a lifecycle operation after this kernel.
+ *
+ * device_result is an aggregate classification: 0 means exact no-op, 1 means
+ * at least one element changed, 2 means another strict no-repair failure, and
+ * 3 means at least one conservative cell mean is below a configured floor.
+ * Three is deliberately the strongest MPI_MAX value: a bad mean is the one
+ * limiter failure that timestep reduction cannot repair pointwise. The
+ * per-element status slice holds the squared scale-normalized coefficient
+ * correction for a subsequent aggregate norm reduction; it is never retained
+ * as event data.
+ */
+__global__ void ZhangShuU4Kernel(
+    CudaDeviceView view, CudaMeshShape shape,
+    const generic::EulerHdgZhangShuPointSet point_set,
+    const double density_floor, const double pressure_floor,
+    const int pressure_bisections, int* device_result)
+{
+  namespace zs = ::dg::hdg::euler::zhang_shu;
+  const int element = blockIdx.x;
+  if (element >= shape.elements) return;
+  __shared__ double mean[conserved_components];
+  __shared__ double density_theta;
+  __shared__ double pressure_theta;
+  __shared__ int failed;
+  __shared__ int mean_rejected;
+  __shared__ int active;
+  __shared__ double correction_squared[128];
+  const int interior_offset = element * shape.interior_dofs;
+  const int si = shape.scalar_interior_dofs;
+  if (threadIdx.x == 0)
+  {
+    failed = 0;
+    mean_rejected = 0;
+    active = 0;
+    density_theta = 1.0;
+    pressure_theta = 1.0;
+    for (int component = 0; component < conserved_components; ++component)
+      mean[component] = 0.0;
+    double measure = 0.0;
+    for (int q = 0; q < shape.volume_points && !failed; ++q)
+    {
+      const int qp = element * shape.volume_points + q;
+      const double weight = view.volume_weight[qp];
+      if (!isfinite(weight) || !(weight > 0.0))
+      {
+        failed = 1;
+        break;
+      }
+      measure += weight;
+      for (int component = 0; component < conserved_components; ++component)
+      {
+        double value = 0.0;
+        for (int scalar = 0; scalar < si; ++scalar)
+          value += view.volume_shape[qp * si + scalar] *
+              view.work_interior[interior_offset +
+                  ByNodes(scalar, si, component)];
+        mean[component] += weight * value;
+      }
+    }
+    if (!isfinite(measure) || !(measure > 0.0)) failed = 1;
+    if (!failed)
+      for (int component = 0; component < conserved_components; ++component)
+      {
+        mean[component] /= measure;
+        if (!isfinite(mean[component])) failed = 1;
+      }
+    const zs::Parameters parameters{
+        shape.boundary_gamma, density_floor, pressure_floor,
+        pressure_bisections};
+    if (!failed && zs::ValidateAdmissibleMean(mean, parameters) !=
+                       zs::Status::success)
+    {
+      failed = 1;
+      mean_rejected = 1;
+    }
+
+    // Density pass. This pass changes rho only; momentum and total energy
+    // remain the original point values for the pressure pass below.
+    for (int q = 0; q < shape.volume_points && !failed; ++q)
+    {
+      const int qp = element * shape.volume_points + q;
+      double point[conserved_components] = {};
+      for (int scalar = 0; scalar < si; ++scalar)
+        for (int component = 0; component < conserved_components; ++component)
+          point[component] += view.volume_shape[qp * si + scalar] *
+              view.work_interior[interior_offset +
+                  ByNodes(scalar, si, component)];
+      const zs::ThetaResult result = zs::DensityTheta(
+          mean, point, parameters);
+      if (!result.ok()) failed = 1;
+      else density_theta = fmin(density_theta, result.theta);
+    }
+    const int face_sites = faces_per_element * shape.face_points;
+    for (int site = 0; site < face_sites && !failed; ++site)
+    {
+      const int face = site / shape.face_points;
+      const int q = site - face * shape.face_points;
+      const int qp = (element * faces_per_element + face) *
+          shape.face_points + q;
+      double point[conserved_components] = {};
+      for (int scalar = 0; scalar < si; ++scalar)
+        for (int component = 0; component < conserved_components; ++component)
+          point[component] += view.face_interior_shape[qp * si + scalar] *
+              view.work_interior[interior_offset +
+                  ByNodes(scalar, si, component)];
+      const zs::ThetaResult result = zs::DensityTheta(
+          mean, point, parameters);
+      if (!result.ok()) failed = 1;
+      else density_theta = fmin(density_theta, result.theta);
+    }
+    if (point_set == generic::EulerHdgZhangShuPointSet::consumer)
+      for (int scalar = 0; scalar < si && !failed; ++scalar)
+      {
+        double point[conserved_components];
+        for (int component = 0; component < conserved_components; ++component)
+          point[component] = view.work_interior[interior_offset +
+              ByNodes(scalar, si, component)];
+        const zs::ThetaResult result = zs::DensityTheta(
+            mean, point, parameters);
+        if (!result.ok()) failed = 1;
+        else density_theta = fmin(density_theta, result.theta);
+      }
+
+    // Pressure pass over the same points after applying only the density
+    // factor. PressureTheta returns the admissible lower bisection bracket.
+    for (int q = 0; q < shape.volume_points && !failed; ++q)
+    {
+      const int qp = element * shape.volume_points + q;
+      double point[conserved_components] = {};
+      for (int scalar = 0; scalar < si; ++scalar)
+        for (int component = 0; component < conserved_components; ++component)
+          point[component] += view.volume_shape[qp * si + scalar] *
+              view.work_interior[interior_offset +
+                  ByNodes(scalar, si, component)];
+      double density_limited[conserved_components];
+      const zs::Status blend = zs::BlendDensityOnlyU4(
+          mean, point, density_theta, density_limited);
+      const zs::ThetaResult result = blend == zs::Status::success
+          ? zs::PressureTheta(mean, density_limited, parameters)
+          : zs::ThetaResult{blend, 1.0};
+      if (!result.ok()) failed = 1;
+      else pressure_theta = fmin(pressure_theta, result.theta);
+    }
+    for (int site = 0; site < face_sites && !failed; ++site)
+    {
+      const int face = site / shape.face_points;
+      const int q = site - face * shape.face_points;
+      const int qp = (element * faces_per_element + face) *
+          shape.face_points + q;
+      double point[conserved_components] = {};
+      for (int scalar = 0; scalar < si; ++scalar)
+        for (int component = 0; component < conserved_components; ++component)
+          point[component] += view.face_interior_shape[qp * si + scalar] *
+              view.work_interior[interior_offset +
+                  ByNodes(scalar, si, component)];
+      double density_limited[conserved_components];
+      const zs::Status blend = zs::BlendDensityOnlyU4(
+          mean, point, density_theta, density_limited);
+      const zs::ThetaResult result = blend == zs::Status::success
+          ? zs::PressureTheta(mean, density_limited, parameters)
+          : zs::ThetaResult{blend, 1.0};
+      if (!result.ok()) failed = 1;
+      else pressure_theta = fmin(pressure_theta, result.theta);
+    }
+    if (point_set == generic::EulerHdgZhangShuPointSet::consumer)
+      for (int scalar = 0; scalar < si && !failed; ++scalar)
+      {
+        double point[conserved_components];
+        for (int component = 0; component < conserved_components; ++component)
+          point[component] = view.work_interior[interior_offset +
+              ByNodes(scalar, si, component)];
+        double density_limited[conserved_components];
+        const zs::Status blend = zs::BlendDensityOnlyU4(
+            mean, point, density_theta, density_limited);
+        const zs::ThetaResult result = blend == zs::Status::success
+            ? zs::PressureTheta(mean, density_limited, parameters)
+            : zs::ThetaResult{blend, 1.0};
+        if (!result.ok()) failed = 1;
+        else pressure_theta = fmin(pressure_theta, result.theta);
+      }
+    active = !failed && (density_theta < 1.0 || pressure_theta < 1.0);
+    if (failed) atomicMax(device_result, mean_rejected ? 3 : 2);
+    else if (active) atomicMax(device_result, 1);
+  }
+  __syncthreads();
+
+  double local_correction_squared = 0.0;
+  if (active)
+    for (int local = threadIdx.x;
+         local < conserved_components * si; local += blockDim.x)
+    {
+      const int component = local / si;
+      const int scalar = local - component * si;
+      const int index = interior_offset + ByNodes(scalar, si, component);
+      const double theta = component == 0
+          ? density_theta * pressure_theta : pressure_theta;
+      const double before = view.work_interior[index];
+      const double after = (1.0 - theta) * mean[component] + theta * before;
+      if (!isfinite(before) || !isfinite(after))
+      {
+        atomicExch(&failed, 1);
+        atomicMax(device_result, 2);
+      }
+      else
+      {
+        view.work_interior[index] = after;
+        const double correction_scale =
+            fmax(1.0, fmax(fabs(before), fabs(after)));
+        const double correction = (after - before) / correction_scale;
+        local_correction_squared += correction * correction;
+      }
+    }
+  __syncthreads();
+
+  // Independently admit the polynomial that is actually stored.  The
+  // bisection factors are conservative lower brackets, but their final
+  // coefficient application and interpolation still round.  Revisit the
+  // exact selected point set after both causal scales and fail the attempt if
+  // any point lands below either floor; no state is clamped or repaired.
+  if (threadIdx.x == 0 && !failed)
+  {
+    for (int q = 0; q < shape.volume_points && !failed; ++q)
+    {
+      const int qp = element * shape.volume_points + q;
+      double point[conserved_components] = {};
+      for (int scalar = 0; scalar < si; ++scalar)
+        for (int component = 0; component < conserved_components;
+             ++component)
+          point[component] += view.volume_shape[qp * si + scalar] *
+              view.work_interior[interior_offset +
+                  ByNodes(scalar, si, component)];
+      if (!ZhangShuStoredPointAdmissible(
+              point, shape.boundary_gamma, density_floor, pressure_floor))
+        failed = 1;
+    }
+    const int face_sites = faces_per_element * shape.face_points;
+    for (int site = 0; site < face_sites && !failed; ++site)
+    {
+      const int face = site / shape.face_points;
+      const int q = site - face * shape.face_points;
+      const int qp = (element * faces_per_element + face) *
+          shape.face_points + q;
+      double point[conserved_components] = {};
+      for (int scalar = 0; scalar < si; ++scalar)
+        for (int component = 0; component < conserved_components;
+             ++component)
+          point[component] += view.face_interior_shape[qp * si + scalar] *
+              view.work_interior[interior_offset +
+                  ByNodes(scalar, si, component)];
+      if (!ZhangShuStoredPointAdmissible(
+              point, shape.boundary_gamma, density_floor, pressure_floor))
+        failed = 1;
+    }
+    if (point_set == generic::EulerHdgZhangShuPointSet::consumer)
+      for (int scalar = 0; scalar < si && !failed; ++scalar)
+      {
+        double point[conserved_components];
+        for (int component = 0; component < conserved_components;
+             ++component)
+          point[component] = view.work_interior[interior_offset +
+              ByNodes(scalar, si, component)];
+        if (!ZhangShuStoredPointAdmissible(
+                point, shape.boundary_gamma, density_floor,
+                pressure_floor))
+          failed = 1;
+      }
+
+    // Match the CPU reference's independent conservation check: scaling
+    // coefficient deviations about the physical mean must preserve that mean
+    // within a small FP64 accumulation allowance.
+    double limited_mean[conserved_components] = {};
+    double limited_measure = 0.0;
+    for (int q = 0; q < shape.volume_points && !failed; ++q)
+    {
+      const int qp = element * shape.volume_points + q;
+      const double weight = view.volume_weight[qp];
+      if (!isfinite(weight) || !(weight > 0.0))
+      {
+        failed = 1;
+        break;
+      }
+      limited_measure += weight;
+      for (int component = 0; component < conserved_components;
+           ++component)
+      {
+        double point = 0.0;
+        for (int scalar = 0; scalar < si; ++scalar)
+          point += view.volume_shape[qp * si + scalar] *
+              view.work_interior[interior_offset +
+                  ByNodes(scalar, si, component)];
+        limited_mean[component] += weight * point;
+      }
+    }
+    if (!isfinite(limited_measure) || !(limited_measure > 0.0)) failed = 1;
+    for (int component = 0;
+         component < conserved_components && !failed; ++component)
+    {
+      limited_mean[component] /= limited_measure;
+      const double tolerance = 512.0 * zs::machine_epsilon *
+          fmax(1.0, fmax(fabs(mean[component]),
+                         fabs(limited_mean[component])));
+      if (!isfinite(limited_mean[component]) ||
+          fabs(limited_mean[component] - mean[component]) > tolerance)
+        failed = 1;
+    }
+    if (failed) atomicMax(device_result, mean_rejected ? 3 : 2);
+  }
+  __syncthreads();
+
+  correction_squared[threadIdx.x] = local_correction_squared;
+  __syncthreads();
+  for (int offset = blockDim.x / 2; offset > 0; offset /= 2)
+  {
+    if (threadIdx.x < offset)
+      correction_squared[threadIdx.x] +=
+          correction_squared[threadIdx.x + offset];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    view.status[element] = failed
+        ? __longlong_as_double(0x7ff0000000000000ULL)
+        : correction_squared[0];
+}
+
 __global__ void AdmissibilityKernel(CudaDeviceView view, CudaMeshShape shape)
 {
   const int element = blockIdx.x;
@@ -4846,6 +5189,25 @@ __global__ void RodasLoadStageKernel(CudaDeviceView v,CudaMeshShape s,
   }
 }
 
+// Start a frozen-U4 algebraic projection from the last coherent base
+// algebraic state.  U4 is intentionally left at the just-filtered stage;
+// every auxiliary interior coefficient and every true-trace coefficient is
+// merely an initial guess and is subsequently solved by the exact projector.
+__global__ void RodasSeedAlgebraicProjectionKernel(
+    CudaDeviceView v,CudaMeshShape s)
+{
+  const int index=blockIdx.x*blockDim.x+threadIdx.x;
+  if(index<s.interior_count)
+  {
+    const int local=index%s.interior_dofs;
+    const int component=local/s.scalar_interior_dofs;
+    if(component>=conserved_components)
+      v.work_interior[index]=v.base_interior[index];
+  }
+  if(index<s.true_trace_count)
+    v.work_true_trace[index]=v.base_true_trace[index];
+}
+
 __global__ void RodasCombinationKernel(CudaDeviceView v,CudaMeshShape s,
                                        int stage)
 {
@@ -4942,6 +5304,20 @@ __global__ void RodasCaptureStageKernel(CudaDeviceView v,CudaMeshShape s,
   if(threadIdx.x==0)v.status[element]=invalid?-1.0:1.0;
 }
 
+// Copy only the four differential component slabs while preserving the
+// element-strided full-state layout.  The positivity path uses this to keep
+// the already-admitted final-stage predictor without retaining another
+// algebraic/trace state.
+__global__ void RodasCopyDifferentialStateKernel(
+    CudaMeshShape s,const double* source,double* destination)
+{
+  const int index=blockIdx.x*blockDim.x+threadIdx.x;
+  if(index>=s.interior_count)return;
+  const int local=index%s.interior_dofs;
+  if(local<conserved_components*s.scalar_interior_dofs)
+    destination[index]=source[index];
+}
+
 __global__ void RodasFormCandidateKernel(CudaDeviceView v,CudaMeshShape s)
 {
   const int index=blockIdx.x*blockDim.x+threadIdx.x;
@@ -4977,6 +5353,53 @@ __global__ void RodasTemporalErrorPartialsKernel(
       estimate+=RodasErrorWeight(stage)*
           v.rodas_stage_interior[stage][index];
     sum+=estimate*estimate;
+  }
+  partial[thread]=sum;
+  __syncthreads();
+  for(int offset=blockDim.x/2;offset>0;offset/=2)
+  {
+    if(thread<offset)partial[thread]+=partial[thread+offset];
+    __syncthreads();
+  }
+  if(thread==0)v.status[element]=partial[0];
+}
+
+// The embedded RODAS3 formula is exactly the stage-three predictor.  With
+// positivity enabled, output_interior holds that predictor after its own
+// Zhang--Shu admission, while work_interior holds the independently admitted
+// principal endpoint.  Measure the filtered method P(U_H)-P(U_L) in the same
+// physical-quadrature RMS used by the CPU reference.
+__global__ void RodasFilteredPairErrorPartialsKernel(
+    CudaDeviceView v,CudaMeshShape s)
+{
+  __shared__ double partial[256];
+  const int element=blockIdx.x,thread=threadIdx.x;
+  double sum=0.0;
+  const int sites=conserved_components*s.volume_points;
+  const int element_offset=element*s.interior_dofs;
+  for(int site=thread;site<sites;site+=blockDim.x)
+  {
+    const int component=site%conserved_components;
+    const int q=site/conserved_components;
+    const int qp=element*s.volume_points+q;
+    double before=0.0,high=0.0,low=0.0;
+    for(int scalar=0;scalar<s.scalar_interior_dofs;++scalar)
+    {
+      const double phi=v.volume_shape[qp*s.scalar_interior_dofs+scalar];
+      const int index=element_offset+
+          ByNodes(scalar,s.scalar_interior_dofs,component);
+      before+=phi*v.base_interior[index];
+      high+=phi*v.work_interior[index];
+      low+=phi*v.output_interior[index];
+    }
+    const double weight=v.volume_weight[qp];
+    const double scale=fmax(1.0,fmax(fabs(before),fabs(high)));
+    const double error=(high-low)/scale;
+    sum+=(isfinite(weight)&&weight>0.0&&isfinite(before)&&
+          isfinite(high)&&isfinite(low)&&isfinite(scale)&&scale>0.0&&
+          isfinite(error))
+        ?weight*error*error:
+         __longlong_as_double(0x7ff0000000000000ULL);
   }
   partial[thread]=sum;
   __syncthreads();
@@ -5068,6 +5491,51 @@ __global__ void RodasPreparedTemporalErrorPartialsKernel(
     const double weight=v.volume_weight[qp];
     const double scaled=RodasPreparedScaledSquare(
         estimate,before,after,absolute_tolerance,relative_tolerance);
+    sum+=(isfinite(weight)&&weight>0.0)?weight*scaled:
+        __longlong_as_double(0x7ff0000000000000ULL);
+  }
+  partial[thread]=sum;
+  __syncthreads();
+  for(int offset=blockDim.x/2;offset>0;offset/=2)
+  {
+    if(thread<offset)partial[thread]+=partial[thread+offset];
+    __syncthreads();
+  }
+  if(thread==0)v.status[element]=partial[0];
+}
+
+// Prepared assessment reads the captured admitted predictor from the leading
+// U4 lanes of rodas_combination_interior.  Its auxiliary lanes still retain
+// the unprojected principal endpoint for the independent algebraic-correction
+// assessment below.
+__global__ void RodasPreparedFilteredPairErrorPartialsKernel(
+    CudaDeviceView v,CudaMeshShape s,double absolute_tolerance,
+    double relative_tolerance)
+{
+  __shared__ double partial[256];
+  const int element=blockIdx.x,thread=threadIdx.x;
+  double sum=0.0;
+  const int sites=conserved_components*s.volume_points;
+  const int element_offset=element*s.interior_dofs;
+  for(int site=thread;site<sites;site+=blockDim.x)
+  {
+    const int component=site%conserved_components;
+    const int q=site/conserved_components;
+    const int qp=element*s.volume_points+q;
+    double before=0.0,after=0.0,embedded=0.0;
+    for(int scalar=0;scalar<s.scalar_interior_dofs;++scalar)
+    {
+      const double phi=
+          v.volume_shape[qp*s.scalar_interior_dofs+scalar];
+      const int index=element_offset+
+          ByNodes(scalar,s.scalar_interior_dofs,component);
+      before+=phi*v.rodas_residual_f[index];
+      after+=phi*v.work_interior[index];
+      embedded+=phi*v.rodas_combination_interior[index];
+    }
+    const double weight=v.volume_weight[qp];
+    const double scaled=RodasPreparedScaledSquare(
+        after-embedded,before,after,absolute_tolerance,relative_tolerance);
     sum+=(isfinite(weight)&&weight>0.0)?weight*scaled:
         __longlong_as_double(0x7ff0000000000000ULL);
   }
@@ -7431,6 +7899,288 @@ __device__ __forceinline__ bool RodasConservationFaceSite(
   return true;
 }
 
+/**
+ * Boundary contribution for one RODAS stage whose nonlinear residual state
+ * is still loaded in work_interior/current_local_trace.
+ *
+ * The stage direction remains the exact causal combination of retained
+ * increments.  Only Y_i comes from the admitted state.  This distinction is
+ * essential after a mean-preserving Zhang--Shu correction: reconstructing
+ * Y_i = U_n + sum(alpha_ij k_j) would silently audit the unfiltered
+ * polynomial rather than the state used by the residual evaluation.
+ */
+__device__ __forceinline__ bool RodasAdmittedConservationFaceSite(
+    CudaDeviceView v, CudaMeshShape s, const int element, const int face,
+    const int q, const double dt, const int admitted_stage,
+    EulerConservationSite& site)
+{
+  constexpr double common_gamma = 0.5;
+  constexpr int stages = 4;
+  if (admitted_stage < 0 || admitted_stage >= stages) return false;
+  const int element_face = element * faces_per_element + face;
+  if (v.boundary_policy_kind == nullptr ||
+      v.boundary_policy_kind[element_face] == 0)
+    return true;
+
+  const int qp = element_face * s.face_points + q;
+  const double weight = v.face_weight[qp];
+  const double normal[dimension] = {
+      v.face_normal[qp * dimension],
+      v.face_normal[qp * dimension + 1]};
+  if (!(weight > 0.0) || !isfinite(weight) || !isfinite(normal[0]) ||
+      !isfinite(normal[1]) || (normal[0] == 0.0 && normal[1] == 0.0))
+    return false;
+
+  const int interior_offset = element * s.interior_dofs;
+  const int trace_offset = element * s.trace_dofs;
+  const int face_offset =
+      face * s.trace_components * s.scalar_face_dofs;
+  double base_interior[conserved_components] = {};
+  double base_trace[conserved_components] = {};
+  double stage_interior[conserved_components] = {};
+  double stage_trace[conserved_components] = {};
+  double direction_interior[conserved_components] = {};
+  double direction_trace[conserved_components] = {};
+  double base_sigma_hat = 0.0;
+  double stage_sigma_hat = 0.0;
+  double direction_sigma_hat = 0.0;
+
+  for (int scalar = 0; scalar < s.scalar_interior_dofs; ++scalar)
+  {
+    const double phi =
+        v.face_interior_shape[qp * s.scalar_interior_dofs + scalar];
+    if (!isfinite(phi)) return false;
+    for (int component = 0; component < conserved_components; ++component)
+    {
+      const int index = interior_offset +
+          ByNodes(scalar, s.scalar_interior_dofs, component);
+      base_interior[component] += phi * v.base_interior[index];
+      stage_interior[component] += phi * v.work_interior[index];
+      for (int term = 0; term <= admitted_stage; ++term)
+      {
+        const double coefficient = term == admitted_stage
+            ? common_gamma : RodasGamma(admitted_stage, term);
+        direction_interior[component] += coefficient * phi *
+            v.rodas_stage_interior[term][index];
+      }
+    }
+  }
+
+  const int trace_variables = s.igr_active
+      ? igr_trace_components : conserved_components;
+  for (int scalar = 0; scalar < s.scalar_face_dofs; ++scalar)
+  {
+    const double phi =
+        v.face_trace_shape[qp * s.scalar_face_dofs + scalar];
+    if (!isfinite(phi)) return false;
+    for (int component = 0; component < trace_variables; ++component)
+    {
+      const int local = trace_offset + face_offset +
+          ByNodes(scalar, s.scalar_face_dofs, component);
+      if (component < conserved_components)
+      {
+        base_trace[component] += phi * v.base_local_trace[local];
+        stage_trace[component] += phi * v.current_local_trace[local];
+      }
+      else
+      {
+        base_sigma_hat += phi * v.base_local_trace[local];
+        stage_sigma_hat += phi * v.current_local_trace[local];
+      }
+      for (int term = 0; term <= admitted_stage; ++term)
+      {
+        double mapped = 0.0;
+        if (!RodasMappedTraceIncrement(v, s, local, term, mapped))
+          return false;
+        const double coefficient = term == admitted_stage
+            ? common_gamma : RodasGamma(admitted_stage, term);
+        if (component < conserved_components)
+          direction_trace[component] += coefficient * phi * mapped;
+        else
+          direction_sigma_hat += coefficient * phi * mapped;
+      }
+    }
+  }
+
+  double base_flux[conserved_components] = {};
+  double base_regularized_jacobian[
+      conserved_components * igr_trace_components] = {};
+  double base_conventional_jacobian[
+      conserved_components * conserved_components] = {};
+  double base_stabilization = 0.0;
+  double stabilization_interior_gradient[conserved_components] = {};
+  double stabilization_trace_gradient[conserved_components] = {};
+  const bool base_ready = s.igr_active
+      ? RegularizedFluxJacobian(
+            base_trace, base_sigma_hat, normal[0], normal[1], base_flux,
+            base_regularized_jacobian)
+      : FluxJacobian(
+            base_trace, normal[0], normal[1], base_flux,
+            base_conventional_jacobian) &&
+            LocalLlfSpeedGradient(
+                base_interior, base_trace, normal[0], normal[1],
+                base_stabilization, stabilization_interior_gradient,
+                stabilization_trace_gradient);
+  if (!base_ready) return false;
+
+  double boundary_flux[conserved_components] = {};
+  double boundary_derivative[conserved_components] = {};
+  if (s.igr_active)
+  {
+    double ignored_stage_jacobian[
+        conserved_components * igr_trace_components] = {};
+    if (!RegularizedFluxJacobian(
+            stage_trace, stage_sigma_hat, normal[0], normal[1],
+            boundary_flux, ignored_stage_jacobian))
+      return false;
+    for (int component = 0; component < conserved_components; ++component)
+    {
+      boundary_flux[component] += s.igr_beta *
+          (stage_interior[component] - stage_trace[component]);
+      for (int variable = 0; variable < conserved_components; ++variable)
+        boundary_derivative[component] += base_regularized_jacobian[
+            component * igr_trace_components + variable] *
+            direction_trace[variable];
+      boundary_derivative[component] += base_regularized_jacobian[
+          component * igr_trace_components + 4] * direction_sigma_hat +
+          s.igr_beta * (direction_interior[component] -
+                        direction_trace[component]);
+    }
+  }
+  else
+  {
+    double interior_speed = 0.0;
+    double trace_speed = 0.0;
+    if (!EulerNormalFlux(
+            stage_trace, normal[0], normal[1], boundary_flux) ||
+        !LocalLlfSpeed(
+            stage_interior, normal[0], normal[1], interior_speed) ||
+        !LocalLlfSpeed(
+            stage_trace, normal[0], normal[1], trace_speed))
+      return false;
+    const double stage_stabilization = fmax(interior_speed, trace_speed);
+    if (!(stage_stabilization > 0.0) || !isfinite(stage_stabilization))
+      return false;
+    double stabilization_direction = 0.0;
+    for (int variable = 0; variable < conserved_components; ++variable)
+      stabilization_direction +=
+          stabilization_interior_gradient[variable] *
+              direction_interior[variable] +
+          stabilization_trace_gradient[variable] *
+              direction_trace[variable];
+    for (int component = 0; component < conserved_components; ++component)
+    {
+      boundary_flux[component] += stage_stabilization *
+          (stage_interior[component] - stage_trace[component]);
+      for (int variable = 0; variable < conserved_components; ++variable)
+        boundary_derivative[component] += base_conventional_jacobian[
+            component * conserved_components + variable] *
+            direction_trace[variable];
+      boundary_derivative[component] += base_stabilization *
+              (direction_interior[component] -
+               direction_trace[component]) +
+          stabilization_direction *
+              (base_interior[component] - base_trace[component]);
+    }
+  }
+
+  const double principal_weight = RodasPrincipalWeight(admitted_stage);
+  for (int component = 0; component < conserved_components; ++component)
+  {
+    const double contribution = dt * principal_weight * weight *
+        (boundary_flux[component] + boundary_derivative[component]);
+    const double contribution_scale = dt * fabs(principal_weight) * weight *
+        (fabs(boundary_flux[component]) +
+         fabs(boundary_derivative[component]));
+    site.balance[component] = contribution;
+    site.scale[component] = contribution_scale;
+    if (!isfinite(boundary_flux[component]) ||
+        !isfinite(boundary_derivative[component]) ||
+        !isfinite(contribution) || !isfinite(contribution_scale))
+      return false;
+  }
+  site.balance[4] = 0.0;
+  site.scale[4] = 0.0;
+  return true;
+}
+
+// Positivity-enabled RODAS uses this allocation-free split witness.  A
+// nonnegative stage selects one admitted stage's boundary term; -1 selects
+// only the endpoint volume/source term.  Each launch reduces to the same
+// bounded twelve-scalar result as the established complete witness.
+__global__ void RodasAdmittedConservationElementsKernel(
+    CudaDeviceView v, CudaMeshShape s, const double dt,
+    const int admitted_stage)
+{
+  constexpr int components = igr_trace_components;
+  static_assert(euler_conservation_result_scalars == 2 * components + 2);
+  __shared__ double balance[components][cooperative_conservation_threads];
+  __shared__ double scale[components][cooperative_conservation_threads];
+  __shared__ double measure[cooperative_conservation_threads];
+  __shared__ int validity[cooperative_conservation_threads];
+  const int element = blockIdx.x;
+  const int thread = threadIdx.x;
+  const bool volume_only = admitted_stage < 0;
+  const int sites = volume_only
+      ? s.volume_points : faces_per_element * s.face_points;
+  EulerConservationSite site{};
+  bool valid = s.borrowed_host_inputs && isfinite(dt) && dt > 0.0;
+  if (valid && thread < sites)
+  {
+    if (volume_only)
+      valid = RodasConservationVolumeSite(
+          v, s, element, thread, dt, site);
+    else
+    {
+      const int face = thread / s.face_points;
+      const int q = thread - face * s.face_points;
+      valid = RodasAdmittedConservationFaceSite(
+          v, s, element, face, q, dt, admitted_stage, site);
+    }
+  }
+  for (int component = 0; component < components; ++component)
+  {
+    balance[component][thread] = valid ? site.balance[component] : 0.0;
+    scale[component][thread] = valid ? site.scale[component] : 0.0;
+  }
+  measure[thread] = valid ? site.measure : 0.0;
+  validity[thread] = valid ? 1 : 0;
+  __syncthreads();
+  for (int offset = cooperative_conservation_threads / 2;
+       offset > 0; offset /= 2)
+  {
+    if (thread < offset)
+    {
+      for (int component = 0; component < components; ++component)
+      {
+        balance[component][thread] +=
+            balance[component][thread + offset];
+        scale[component][thread] += scale[component][thread + offset];
+      }
+      measure[thread] += measure[thread + offset];
+      validity[thread] = validity[thread] && validity[thread + offset];
+    }
+    __syncthreads();
+  }
+  if (thread == 0)
+  {
+    bool element_valid = validity[0] != 0 && isfinite(measure[0]);
+    for (int component = 0; component < components; ++component)
+      element_valid = element_valid && isfinite(balance[component][0]) &&
+          isfinite(scale[component][0]);
+    const int scratch = element * s.interior_dofs;
+    for (int component = 0; component < components; ++component)
+    {
+      v.f[scratch + component] =
+          element_valid ? balance[component][0] : 0.0;
+      v.f[scratch + components + component] =
+          element_valid ? scale[component][0] : 0.0;
+    }
+    v.f[scratch + 2 * components] = element_valid ? measure[0] : 0.0;
+    v.f[scratch + 2 * components + 1] = element_valid ? 1.0 : 0.0;
+  }
+}
+
 __global__ void RodasConservationElementsKernel(
     CudaDeviceView v, CudaMeshShape s, const double dt)
 {
@@ -7845,6 +8595,28 @@ bool CudaLaunchClassifyNativeElementSchwarzSetup(
 }
 bool CudaLaunchGatherLocalTrace(const int* map,int count,const double* source,double* destination) noexcept
 {GatherKernel<<<Blocks(count),128>>>(map,count,source,destination);return LaunchOk();}
+bool CudaLaunchZhangShuU4(
+    const CudaDeviceView& v,const CudaMeshShape& s,
+    const generic::EulerHdgPositivityLimiterPolicy& policy,
+    int* const device_result,double* const correction_squared) noexcept
+{
+  if(policy.kind!=generic::EulerHdgPositivityLimiterKind::zhang_shu||
+     !generic::ValidEulerHdgPositivityLimiterPolicy(policy)||
+     device_result==nullptr||correction_squared==nullptr||s.elements<=0||
+     s.interior_components<conserved_components||
+     s.scalar_interior_dofs<=0||s.volume_points<=0||s.face_points<=0||
+     v.work_interior==nullptr||v.volume_shape==nullptr||
+     v.volume_weight==nullptr||v.face_interior_shape==nullptr||
+     v.status==nullptr)return false;
+  if(cudaMemsetAsync(device_result,0,sizeof(int),nullptr)!=cudaSuccess)
+    return false;
+  ZhangShuU4Kernel<<<s.elements,128>>>(
+      v,s,policy.point_set,policy.density_floor,policy.pressure_floor,
+      policy.pressure_bisection_iterations,device_result);
+  if(!LaunchOk())return false;
+  NormReduceKernel<<<1,256>>>(v.status,s.elements,correction_squared);
+  return LaunchOk();
+}
 bool CudaLaunchAdmissibility(const CudaDeviceView& v,const CudaMeshShape& s) noexcept
 {AdmissibilityKernel<<<s.elements,128>>>(v,s);return LaunchOk();}
 bool CudaLaunchFreezeBorrowedCurrentLlfTau(const CudaDeviceView& v,
@@ -8035,6 +8807,18 @@ bool CudaLaunchRodasLoadStage(const CudaDeviceView& v,const CudaMeshShape& s,
           v,s,static_cast<int>(stage));
   return LaunchOk();
 }
+bool CudaLaunchRodasSeedAlgebraicProjection(
+    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+{
+  if(!s.borrowed_host_inputs||s.interior_count<=0||s.true_trace_count<=0||
+     s.interior_dofs<=0||s.scalar_interior_dofs<=0||
+     s.interior_components<conserved_components||
+     v.work_interior==nullptr||v.base_interior==nullptr||
+     v.work_true_trace==nullptr||v.base_true_trace==nullptr)return false;
+  RodasSeedAlgebraicProjectionKernel<<<
+      Blocks(std::max(s.interior_count,s.true_trace_count)),128>>>(v,s);
+  return LaunchOk();
+}
 bool CudaLaunchRodasBuildStageRightHandSide(
     const CudaDeviceView& v,const CudaMeshShape& s,
     const std::size_t stage,const double step_size) noexcept
@@ -8075,6 +8859,18 @@ bool CudaLaunchRodasCaptureStageIncrement(
       v,s,static_cast<int>(stage));
   return LaunchOk();
 }
+bool CudaLaunchRodasCopyDifferentialState(
+    const CudaMeshShape& s,const double* source,double* destination) noexcept
+{
+  if(!s.borrowed_host_inputs||s.elements<=0||s.interior_count<=0||
+     s.interior_dofs<=0||s.scalar_interior_dofs<=0||
+     s.interior_components<conserved_components||
+     s.interior_dofs!=s.interior_components*s.scalar_interior_dofs||
+     source==nullptr||destination==nullptr)return false;
+  RodasCopyDifferentialStateKernel<<<Blocks(s.interior_count),128>>>(
+      s,source,destination);
+  return LaunchOk();
+}
 bool CudaLaunchRodasFormCandidate(
     const CudaDeviceView& v,const CudaMeshShape& s) noexcept
 {
@@ -8100,6 +8896,23 @@ bool CudaLaunchRodasTemporalErrorSquared(
     if(v.rodas_stage_interior[stage]==nullptr)return false;
   RodasTemporalErrorPartialsKernel<<<s.elements,256>>>(v,s);
   NormReduceKernel<<<1,256>>>(v.status,s.elements,result);
+  return LaunchOk();
+}
+bool CudaLaunchRodasFilteredPairErrorSquared(
+    const CudaDeviceView& v,const CudaMeshShape& s,double* result,
+    double* differential_measure) noexcept
+{
+  if(!s.borrowed_host_inputs||s.elements<=0||s.volume_points<=0||
+     s.scalar_interior_dofs<=0||
+     s.interior_components<conserved_components||
+     v.base_interior==nullptr||v.work_interior==nullptr||
+     v.output_interior==nullptr||v.volume_shape==nullptr||
+     v.volume_weight==nullptr||v.status==nullptr||result==nullptr||
+     differential_measure==nullptr)return false;
+  RodasFilteredPairErrorPartialsKernel<<<s.elements,256>>>(v,s);
+  NormReduceKernel<<<1,256>>>(v.status,s.elements,result);
+  RodasVolumeMeasurePartialsKernel<<<s.elements,256>>>(v,s);
+  NormReduceKernel<<<1,256>>>(v.status,s.elements,differential_measure);
   return LaunchOk();
 }
 bool CudaLaunchRodasAlgebraicCorrectionSquared(
@@ -8137,6 +8950,34 @@ bool CudaLaunchRodasPreparedAssessmentSquared(
       stage<::dg::hdg::time::Rodas3Coefficients::stage_count;++stage)
     if(v.rodas_stage_interior[stage]==nullptr)return false;
   RodasPreparedTemporalErrorPartialsKernel<<<s.elements,256>>>(
+      v,s,absolute_tolerance,relative_tolerance);
+  NormReduceKernel<<<1,256>>>(v.status,s.elements,differential_result);
+  RodasVolumeMeasurePartialsKernel<<<s.elements,256>>>(v,s);
+  NormReduceKernel<<<1,256>>>(v.status,s.elements,differential_measure);
+  RodasPreparedAlgebraicCorrectionPartialsKernel<<<s.elements,256>>>(
+      v,s,absolute_tolerance,relative_tolerance);
+  NormReduceKernel<<<1,256>>>(v.status,s.elements,algebraic_result);
+  return LaunchOk();
+}
+bool CudaLaunchRodasPreparedFilteredPairAssessmentSquared(
+    const CudaDeviceView& v,const CudaMeshShape& s,
+    const double absolute_tolerance,const double relative_tolerance,
+    double* differential_result,double* algebraic_result,
+    double* differential_measure) noexcept
+{
+  if(!s.borrowed_host_inputs||s.elements<=0||s.volume_points<=0||
+     s.scalar_interior_dofs<=0||
+     s.interior_components<conserved_components||s.true_trace_count<=0||
+     !std::isfinite(absolute_tolerance)||absolute_tolerance<0.0||
+     !std::isfinite(relative_tolerance)||relative_tolerance<0.0||
+     !(absolute_tolerance>0.0||relative_tolerance>0.0)||
+     v.rodas_residual_f==nullptr||v.work_interior==nullptr||
+     v.rodas_combination_interior==nullptr||
+     v.rodas_combination_true_trace==nullptr||v.work_true_trace==nullptr||
+     v.volume_shape==nullptr||v.volume_weight==nullptr||v.status==nullptr||
+     differential_result==nullptr||differential_measure==nullptr||
+     algebraic_result==nullptr)return false;
+  RodasPreparedFilteredPairErrorPartialsKernel<<<s.elements,256>>>(
       v,s,absolute_tolerance,relative_tolerance);
   NormReduceKernel<<<1,256>>>(v.status,s.elements,differential_result);
   RodasVolumeMeasurePartialsKernel<<<s.elements,256>>>(v,s);
@@ -8518,6 +9359,80 @@ bool CudaLaunchRodasConservation(const CudaDeviceView& v,
         v.rodas_stage_local_trace[stage]==nullptr))return false;
   RodasConservationElementsKernel<<<
       s.elements,cooperative_conservation_threads>>>(v,s,dt);
+  if(!LaunchOk())return false;
+  EulerConservationReduceKernel<<<
+      1,cooperative_conservation_threads>>>(v,s,out);
+  return LaunchOk();
+}
+bool CudaLaunchRodasAdmittedStageConservation(
+    const CudaDeviceView& v,const CudaMeshShape& s,
+    const double dt,const std::size_t stage,double* out) noexcept
+{
+  using Coefficients=::dg::hdg::time::Rodas3Coefficients;
+  static_assert(Coefficients::stage_count==4);
+  static_assert(Coefficients::common_gamma==
+                ::dg::hdg::time::RationalCoefficient{1,2});
+  const int expected_interior_components=s.igr_active
+      ? igr_interior_components:conserved_components;
+  const int expected_trace_components=s.igr_active
+      ? igr_trace_components:conserved_components;
+  if(stage>=Coefficients::stage_count||!s.borrowed_host_inputs||
+     !isfinite(dt)||!(dt>0.0)||out==nullptr||s.elements<=0||
+     s.scalar_interior_dofs<=0||s.scalar_face_dofs<=0||
+     s.interior_components!=expected_interior_components||
+     s.trace_components!=expected_trace_components||
+     s.interior_dofs!=s.interior_components*s.scalar_interior_dofs||
+     s.trace_dofs!=faces_per_element*s.trace_components*
+         s.scalar_face_dofs||
+     s.interior_dofs<euler_conservation_result_scalars||
+     s.interior_count<=0||
+     s.elements>s.interior_count/s.interior_dofs||
+     s.elements>std::numeric_limits<int>::max()/s.trace_dofs||
+     s.local_trace_count<=0||s.true_trace_count<=0||
+     s.global_true_trace_count<s.true_trace_count||
+     s.true_trace_count%s.trace_components!=0||s.face_points<=0||
+     s.face_points>cooperative_conservation_threads/faces_per_element||
+     !isfinite(s.igr_beta)||v.f==nullptr||v.residual_r==nullptr||
+     v.work_interior==nullptr||v.base_interior==nullptr||
+     v.current_local_trace==nullptr||v.base_local_trace==nullptr||
+     v.face_interior_shape==nullptr||v.face_trace_shape==nullptr||
+     v.face_weight==nullptr||v.face_normal==nullptr||
+     (s.borrowed_static_boundary_policies&&
+      v.boundary_policy_kind==nullptr)||
+     v.signed_element_trace==nullptr)return false;
+  for(std::size_t term=0;term<=stage;++term)
+    if(v.rodas_stage_interior[term]==nullptr||
+       v.rodas_stage_true_trace[term]==nullptr||
+       (s.global_true_trace_count!=s.true_trace_count&&
+        v.rodas_stage_local_trace[term]==nullptr))return false;
+  RodasAdmittedConservationElementsKernel<<<
+      s.elements,cooperative_conservation_threads>>>(
+          v,s,dt,static_cast<int>(stage));
+  if(!LaunchOk())return false;
+  EulerConservationReduceKernel<<<
+      1,cooperative_conservation_threads>>>(v,s,out);
+  return LaunchOk();
+}
+bool CudaLaunchRodasConservationVolume(
+    const CudaDeviceView& v,const CudaMeshShape& s,
+    const double dt,double* out) noexcept
+{
+  const int expected_interior_components=s.igr_active
+      ? igr_interior_components:conserved_components;
+  if(!s.borrowed_host_inputs||!isfinite(dt)||!(dt>0.0)||out==nullptr||
+     s.elements<=0||s.scalar_interior_dofs<=0||
+     s.interior_components!=expected_interior_components||
+     s.interior_dofs!=s.interior_components*s.scalar_interior_dofs||
+     s.interior_dofs<euler_conservation_result_scalars||
+     s.interior_count<=0||
+     s.elements>s.interior_count/s.interior_dofs||s.volume_points<=0||
+     s.volume_points>cooperative_conservation_threads||
+     v.f==nullptr||v.residual_r==nullptr||v.static_source==nullptr||
+     v.volume_shape==nullptr||v.volume_weight==nullptr||
+     v.rodas_residual_f==nullptr||
+     v.rodas_combination_interior==nullptr)return false;
+  RodasAdmittedConservationElementsKernel<<<
+      s.elements,cooperative_conservation_threads>>>(v,s,dt,-1);
   if(!LaunchOk())return false;
   EulerConservationReduceKernel<<<
       1,cooperative_conservation_threads>>>(v,s,out);

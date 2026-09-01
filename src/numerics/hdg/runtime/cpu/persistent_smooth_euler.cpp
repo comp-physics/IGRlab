@@ -3,6 +3,7 @@
 #include "hdg_cpu_serial_lifecycle.hpp"
 
 #include "numerics/hdg/core/host_reference.hpp"
+#include "numerics/hdg/euler/zhang_shu_u4.hpp"
 #include "numerics/hdg/runtime/runtime_selection.hpp"
 #include "numerics/hdg/time/rodas3.hpp"
 #include "numerics/hdg/trace/trace_dg_mpi.hpp"
@@ -704,6 +705,28 @@ bool Interpolate(const mfem::Vector& field,
           signed_vdofs[ByNodes(scalar, scalar_dofs, component)], sign);
       if (dof < 0 || dof >= field.Size()) { return false; }
       state[component] += shape[scalar] * sign * values[dof];
+    }
+  return Finite(state);
+}
+
+bool Interpolate(const std::vector<double>& field,
+                 const int* signed_vdofs,
+                 const int scalar_dofs,
+                 const mfem::Vector& shape,
+                 State& state) noexcept
+{
+  if (signed_vdofs == nullptr || shape.Size() != scalar_dofs) { return false; }
+  state = {};
+  for (int scalar = 0; scalar < scalar_dofs; ++scalar)
+    for (int component = 0; component < cpu_conserved_components; ++component)
+    {
+      double sign = 1.0;
+      const int dof = Decode(
+          signed_vdofs[ByNodes(scalar, scalar_dofs, component)], sign);
+      if (dof < 0 || static_cast<std::size_t>(dof) >= field.size())
+        return false;
+      state[component] += shape[scalar] * sign * field[
+          static_cast<std::size_t>(dof)];
     }
   return Finite(state);
 }
@@ -2130,6 +2153,15 @@ struct detail::CpuNumericsCore::Implementation
   std::vector<double> rodas_combination_trace;
   std::vector<double> rodas_conservation_direction_interior;
   std::vector<double> rodas_conservation_direction_trace;
+  // The positivity path owns only bounded RODAS workspaces.  U4 occupies the
+  // first four byNODES slabs; the full-state snapshots preserve an admitted
+  // limited stage while the base common-shift operator is rebuilt after an
+  // algebraic projection has replaced the condensation/factor state.
+  std::vector<double> rodas_limiter_u4_before;
+  std::vector<double> rodas_limited_stage_interior;
+  std::vector<double> rodas_limited_stage_trace;
+  std::array<std::vector<double>, 4> rodas_admitted_stage_interior;
+  std::array<std::vector<double>, 4> rodas_admitted_stage_trace;
 
   std::unique_ptr<mfem::SparseMatrix> local_matrix;
   std::unique_ptr<mfem::ParBilinearForm> parallel_form;
@@ -2219,6 +2251,13 @@ struct detail::CpuNumericsCore::Implementation
   {
     return IsBorrowed() && borrowed_request->time_treatment ==
         generic::EulerHdgTimeTreatment::rodas3;
+  }
+
+  bool RodasPositivityLimiterEnabled() const noexcept
+  {
+    return IsRodas3() && borrowed_request &&
+        borrowed_request->numerical_policy.positivity_limiter.kind ==
+            generic::EulerHdgPositivityLimiterKind::zhang_shu;
   }
 
   bool RequiresPartitionedScalarClosure() const noexcept
@@ -3596,6 +3635,9 @@ struct detail::CpuNumericsCore::Implementation
             static_cast<std::size_t>(interior_space->GetVSize());
         const std::size_t trace_size =
             static_cast<std::size_t>(trace_space->GetTrueVSize());
+        const std::size_t scalar_size = interior_components > 0
+            ? interior_size / static_cast<std::size_t>(interior_components)
+            : 0;
         if (!ResizeOwned(rodas_mass_over_shift, batches * ni * ni,
                          CpuOwnedAllocationSite::condensation_vector,
                          allocations) ||
@@ -3621,6 +3663,22 @@ struct detail::CpuNumericsCore::Implementation
         {
           return false;
         }
+        if (RodasPositivityLimiterEnabled() &&
+            (scalar_size * static_cast<std::size_t>(interior_components) !=
+                 interior_size ||
+             !ResizeOwned(
+                 rodas_limiter_u4_before,
+                 scalar_size * cpu_conserved_components,
+                 CpuOwnedAllocationSite::recovery_vector, allocations) ||
+             !ResizeOwned(rodas_limited_stage_interior, interior_size,
+                          CpuOwnedAllocationSite::recovery_vector,
+                          allocations) ||
+             !ResizeOwned(rodas_limited_stage_trace, trace_size,
+                          CpuOwnedAllocationSite::recovery_vector,
+                          allocations)))
+        {
+          return false;
+        }
         for (std::size_t stage = 0; stage < rodas_stage_interior.size();
              ++stage)
         {
@@ -3629,7 +3687,15 @@ struct detail::CpuNumericsCore::Implementation
                            allocations) ||
               !ResizeOwned(rodas_stage_trace[stage], trace_size,
                            CpuOwnedAllocationSite::recovery_vector,
-                           allocations))
+                           allocations) ||
+              (RodasPositivityLimiterEnabled() &&
+               (!ResizeOwned(rodas_admitted_stage_interior[stage],
+                             interior_size,
+                             CpuOwnedAllocationSite::recovery_vector,
+                             allocations) ||
+                !ResizeOwned(rodas_admitted_stage_trace[stage], trace_size,
+                             CpuOwnedAllocationSite::recovery_vector,
+                             allocations))))
           {
             return false;
           }
@@ -3681,7 +3747,10 @@ struct detail::CpuNumericsCore::Implementation
       if (mfem::IntRules.Get(mfem::Geometry::SQUARE,
                              assembly_orders.volume_order).GetNPoints() <= 0 ||
           mfem::IntRules.Get(mfem::Geometry::SEGMENT,
-                             assembly_orders.face_order).GetNPoints() <= 0)
+                             assembly_orders.face_order).GetNPoints() <= 0 ||
+          (RodasPositivityLimiterEnabled() &&
+           mfem::IntRules.Get(mfem::Geometry::SEGMENT,
+                              assembly_orders.volume_order).GetNPoints() <= 0))
       {
         return false;
       }
@@ -3902,6 +3971,17 @@ struct detail::CpuNumericsCore::Implementation
         bytes(rodas_combination_trace) +
         bytes(rodas_conservation_direction_interior) +
         bytes(rodas_conservation_direction_trace) +
+        bytes(rodas_limiter_u4_before) +
+        bytes(rodas_limited_stage_interior) +
+        bytes(rodas_limited_stage_trace) +
+        bytes(rodas_admitted_stage_interior[0]) +
+        bytes(rodas_admitted_stage_interior[1]) +
+        bytes(rodas_admitted_stage_interior[2]) +
+        bytes(rodas_admitted_stage_interior[3]) +
+        bytes(rodas_admitted_stage_trace[0]) +
+        bytes(rodas_admitted_stage_trace[1]) +
+        bytes(rodas_admitted_stage_trace[2]) +
+        bytes(rodas_admitted_stage_trace[3]) +
         bytes(schur) + bytes(reduced_rhs) +
         bytes(local_trace_increment) + bytes(recovered_interior) +
         bytes(grid_interior_increment) + bytes(interior_census) +
@@ -5884,6 +5964,9 @@ struct detail::CpuNumericsCore::Implementation
    * exact stage assembler.  In particular, this is a physical-boundary
    * balance rather than a reconstruction identity.  The final algebraic
    * projection leaves U4 unchanged; its trace must not replace any Y_i here.
+   * With positivity enabled, the retained Y_i snapshots are the actual
+   * filtered-and-reconstructed states used by the residual evaluation, not a
+   * later reconstruction from the unfiltered alpha combination.
    */
   bool RodasConservationBalance(
       const double dt, double& maximum_error,
@@ -5909,6 +5992,13 @@ struct detail::CpuNumericsCore::Implementation
       local_ok = local_ok && stage.size() == candidate->interior.size();
     for (const auto& stage : rodas_stage_trace)
       local_ok = local_ok && stage.size() == candidate->trace.size();
+    if (RodasPositivityLimiterEnabled())
+    {
+      for (const auto& stage : rodas_admitted_stage_interior)
+        local_ok = local_ok && stage.size() == candidate->interior.size();
+      for (const auto& stage : rodas_admitted_stage_trace)
+        local_ok = local_ok && stage.size() == candidate->trace.size();
+    }
 
     const auto restore_candidate = [&]() noexcept
     {
@@ -6000,9 +6090,22 @@ struct detail::CpuNumericsCore::Implementation
     for (std::size_t stage = 0;
          stage < Coefficients::stage_count && local_ok; ++stage)
     {
-      // Load the nonlinear residual state Y_i and form the complete frozen-J
-      // direction d_i, including the diagonal gamma*k_i term.
-      if (!LoadRodasStageState(stage))
+      // Load the actual admitted nonlinear residual state Y_i and form the
+      // complete frozen-J direction d_i, including diagonal gamma*k_i.
+      bool stage_loaded = true;
+      if (RodasPositivityLimiterEnabled())
+      {
+        const bool assigned = Assign(
+                *iterate_interior, rodas_admitted_stage_interior[stage]) &&
+            Assign(iterate_true_trace, rodas_admitted_stage_trace[stage]);
+        stage_loaded = CollectiveAll(assigned) &&
+            LoadTrace(iterate_true_trace, *iterate_trace);
+      }
+      else
+      {
+        stage_loaded = LoadRodasStageState(stage);
+      }
+      if (!stage_loaded)
       {
         local_ok = false;
         break;
@@ -6124,7 +6227,11 @@ struct detail::CpuNumericsCore::Implementation
                   Interpolate(*iterate_trace, face_trace_vdofs,
                               scalar_trace_dofs,
                               face_trace_shape_workspace, stage_trace) &&
-                  Interpolate(*old_interior, interior_vdofs,
+                  // Entry filtering changes boundary values while preserving
+                  // the cell mean.  The frozen Jacobian was rebuilt at this
+                  // admitted base, so its LLF direction must use that exact
+                  // U4 polynomial rather than the unfiltered committed state.
+                  Interpolate(rodas_base_interior, interior_vdofs,
                               scalar_interior_dofs,
                               face_interior_shape_workspace, base_interior) &&
                   Interpolate(*rodas_base_trace_grid, face_trace_vdofs,
@@ -7066,6 +7173,102 @@ struct detail::CpuNumericsCore::Implementation
                          Finite(rodas_base_trace));
   }
 
+  bool SnapshotRodasAlgebraicCorrectionReference() noexcept
+  {
+    bool local_ready = IsRodas3() &&
+        rodas_combination_interior.size() ==
+            static_cast<std::size_t>(iterate_interior->Size()) &&
+        rodas_combination_trace.size() ==
+            static_cast<std::size_t>(iterate_true_trace.Size());
+    try
+    {
+      const double* const interior = local_ready
+          ? iterate_interior->HostRead() : nullptr;
+      const double* const trace = local_ready
+          ? iterate_true_trace.HostRead() : nullptr;
+      local_ready = local_ready &&
+          (interior || iterate_interior->Size() == 0) &&
+          (trace || iterate_true_trace.Size() == 0);
+      if (local_ready)
+      {
+        std::copy(interior, interior + iterate_interior->Size(),
+                  rodas_combination_interior.begin());
+        std::copy(trace, trace + iterate_true_trace.Size(),
+                  rodas_combination_trace.begin());
+      }
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    return CollectiveAll(local_ready &&
+                         Finite(rodas_combination_interior) &&
+                         Finite(rodas_combination_trace));
+  }
+
+  /**
+   * Seed a frozen-U4 algebraic projection from the last coherent RODAS base.
+   *
+   * The positivity filter owns only the leading differential U4 fields.  A
+   * causal stage predictor may nevertheless have produced an inadmissible
+   * algebraic initial guess in the auxiliary or trace fields.  Restore those
+   * guesses from the coherent base before the exact algebraic projector is
+   * entered, while preserving every just-limited U4 coefficient.
+   */
+  bool SeedRodasAlgebraicProjectionFromBase() noexcept
+  {
+    bool local_ready = IsRodas3() && interior_space && mesh &&
+        rodas_base_interior.size() ==
+            static_cast<std::size_t>(iterate_interior->Size()) &&
+        rodas_base_trace.size() ==
+            static_cast<std::size_t>(iterate_true_trace.Size()) &&
+        element_interior_vdofs.size() ==
+            static_cast<std::size_t>(mesh->GetNE()) * local_interior;
+    try
+    {
+      double* const interior = local_ready
+          ? iterate_interior->HostWrite() : nullptr;
+      local_ready = local_ready &&
+          (interior || iterate_interior->Size() == 0);
+      for (int element = 0;
+           element < mesh->GetNE() && local_ready; ++element)
+      {
+        const int* const signed_vdofs = element_interior_vdofs.data() +
+            static_cast<std::size_t>(element) * local_interior;
+        for (int component = cpu_conserved_components;
+             component < interior_components && local_ready; ++component)
+          for (int scalar = 0;
+               scalar < scalar_interior_dofs && local_ready; ++scalar)
+          {
+            double sign = 1.0;
+            const int dof = Decode(
+                signed_vdofs[ByNodes(scalar, scalar_interior_dofs,
+                                     component)], sign);
+            local_ready = dof >= 0 &&
+                dof < iterate_interior->Size() && Finite(sign);
+            if (local_ready)
+              interior[dof] = rodas_base_interior[
+                  static_cast<std::size_t>(dof)];
+          }
+      }
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    const bool trace_assigned =
+        Assign(iterate_true_trace, rodas_base_trace);
+    if (!CollectiveAll(local_ready && trace_assigned &&
+                       Finite(*iterate_interior) &&
+                       Finite(iterate_true_trace)))
+    {
+      return false;
+    }
+    // LoadTrace may exchange shared trace data.  Every rank reaches it only
+    // after all rank-local writes have been collectively converged.
+    return LoadTrace(iterate_true_trace, *iterate_trace);
+  }
+
   bool ProjectRodasAlgebraicState(
       const CpuFailureInjection& injection,
       CpuAttemptEvidence& attempt,
@@ -7073,7 +7276,8 @@ struct detail::CpuNumericsCore::Implementation
       double& algebraic_residual,
       double& correction_norm,
       CpuFailurePhase& failure_phase,
-      bool& injected_failure) noexcept
+      bool& injected_failure,
+      const bool correction_reference_ready = false) noexcept
   {
     failure_phase = CpuFailurePhase::none;
     injected_failure = false;
@@ -7091,33 +7295,16 @@ struct detail::CpuNumericsCore::Implementation
     {
       return EnterPhase(injection, phase);
     };
-    bool snapshot_ready = IsRodas3() &&
-        rodas_combination_interior.size() ==
-            static_cast<std::size_t>(iterate_interior->Size()) &&
-        rodas_combination_trace.size() ==
-            static_cast<std::size_t>(iterate_true_trace.Size());
-    try
-    {
-      const double* const interior = snapshot_ready
-          ? iterate_interior->HostRead() : nullptr;
-      const double* const trace = snapshot_ready
-          ? iterate_true_trace.HostRead() : nullptr;
-      snapshot_ready = snapshot_ready &&
-          (interior || iterate_interior->Size() == 0) &&
-          (trace || iterate_true_trace.Size() == 0);
-      if (snapshot_ready)
-      {
-        std::copy(interior, interior + iterate_interior->Size(),
-                  rodas_combination_interior.begin());
-        std::copy(trace, trace + iterate_true_trace.Size(),
-                  rodas_combination_trace.begin());
-      }
-    }
-    catch (...)
-    {
-      snapshot_ready = false;
-    }
-    if (!CollectiveAll(snapshot_ready))
+    const bool reference_ready = correction_reference_ready
+        ? CollectiveAll(IsRodas3() &&
+              rodas_combination_interior.size() ==
+                  static_cast<std::size_t>(iterate_interior->Size()) &&
+              rodas_combination_trace.size() ==
+                  static_cast<std::size_t>(iterate_true_trace.Size()) &&
+              Finite(rodas_combination_interior) &&
+              Finite(rodas_combination_trace))
+        : SnapshotRodasAlgebraicCorrectionReference();
+    if (!reference_ready)
       return fail_phase(CpuFailurePhase::setup, false);
 
     const EulerTimeMassRates spatial_only{0.0, 0.0};
@@ -7701,6 +7888,434 @@ struct detail::CpuNumericsCore::Implementation
     return LoadTrace(iterate_true_trace, *iterate_trace);
   }
 
+  struct RodasPositivityResult
+  {
+    bool active = false;
+    std::uint64_t limited_elements = 0;
+    double correction_norm = 0.0;
+  };
+
+  /**
+   * Strict conservative Zhang--Shu filter for the leading U4 slabs.
+   *
+   * The L2 state is byNODES and element-local, so scaling every local U4
+   * coefficient about the physical quadrature mean realizes
+   *   U_h <- Ubar + theta (U_h - Ubar)
+   * without touching sigma/z.  An inadmissible mean is a hard failure: this
+   * routine never repairs density or energy.  The positivity points contain
+   * the exact volume/face rules consumed by Assemble/Prescreen, and the
+   * consumer policy additionally admits the nodal coefficients.
+   */
+  bool ApplyRodasPositivityLimiterToCoefficients(
+      double* const values,
+      const int value_size,
+      RodasPositivityResult& result) noexcept
+  {
+    result = {};
+    if (!RodasPositivityLimiterEnabled()) return true;
+    const auto& policy =
+        borrowed_request->numerical_policy.positivity_limiter;
+    const auto quadrature_orders = EffectiveAssemblyQuadratureOrders(config);
+    bool local_ready = values && value_size > 0 && interior_space && mesh &&
+        interior_components >= cpu_conserved_components &&
+        scalar_interior_dofs > 0 && quadrature_orders.volume_order > 0 &&
+        quadrature_orders.face_order > 0 &&
+        policy.density_floor > 0.0 && policy.pressure_floor > 0.0 &&
+        policy.pressure_bisection_iterations > 0 &&
+        value_size % interior_components == 0;
+    std::uint64_t local_limited_elements = 0;
+    double local_correction_squared = 0.0;
+    std::uint64_t local_correction_count = 0;
+    try
+    {
+      const int scalar_size = local_ready
+          ? value_size / interior_components : 0;
+      local_ready = local_ready &&
+          rodas_limiter_u4_before.size() == static_cast<std::size_t>(
+              scalar_size * cpu_conserved_components);
+      for (int component = 0;
+           component < cpu_conserved_components && local_ready; ++component)
+        for (int scalar = 0; scalar < scalar_size; ++scalar)
+        {
+          const int index = ByNodes(scalar, scalar_size, component);
+          const double value = values[index];
+          local_ready = Finite(value);
+          rodas_limiter_u4_before[static_cast<std::size_t>(index)] = value;
+        }
+
+      const ::dg::hdg::euler::zhang_shu::Parameters limiter_parameters{
+          cpu_gamma, policy.density_floor, policy.pressure_floor,
+          policy.pressure_bisection_iterations};
+
+      for (int element = 0;
+           element < mesh->GetNE() && local_ready; ++element)
+      {
+        const mfem::FiniteElement* const finite_element =
+            interior_space->GetFE(element);
+        mfem::ElementTransformation* const transformation =
+            mesh->GetElementTransformation(element);
+        const int* const signed_vdofs = element_interior_vdofs.data() +
+            static_cast<std::size_t>(element) * local_interior;
+        local_ready = finite_element && transformation &&
+            finite_element->GetDof() == scalar_interior_dofs;
+        if (!local_ready) break;
+
+        const auto interpolate = [&](const mfem::Vector& shape,
+                                     State& state) noexcept
+        {
+          if (shape.Size() != scalar_interior_dofs) return false;
+          state = {};
+          for (int scalar = 0; scalar < scalar_interior_dofs; ++scalar)
+            for (int component = 0;
+                 component < cpu_conserved_components; ++component)
+            {
+              double sign = 1.0;
+              const int dof = Decode(
+                  signed_vdofs[ByNodes(scalar, scalar_interior_dofs,
+                                       component)], sign);
+              if (dof < 0 || dof >= value_size) return false;
+              state[component] += shape[scalar] * sign * values[dof];
+            }
+          return Finite(state);
+        };
+
+        const auto coefficient_state = [&](const int scalar,
+                                            State& state) noexcept
+        {
+          if (scalar < 0 || scalar >= scalar_interior_dofs) return false;
+          state = {};
+          for (int component = 0;
+               component < cpu_conserved_components; ++component)
+          {
+            double sign = 1.0;
+            const int dof = Decode(
+                signed_vdofs[ByNodes(scalar, scalar_interior_dofs,
+                                     component)], sign);
+            if (dof < 0 || dof >= value_size) return false;
+            state[component] = sign * values[dof];
+          }
+          return Finite(state);
+        };
+
+        State mean{};
+        double measure = 0.0;
+        const mfem::IntegrationRule& mean_rule = mfem::IntRules.Get(
+            finite_element->GetGeomType(), quadrature_orders.volume_order);
+        for (int q = 0; q < mean_rule.GetNPoints() && local_ready; ++q)
+        {
+          const mfem::IntegrationPoint& point = mean_rule.IntPoint(q);
+          transformation->SetIntPoint(&point);
+          finite_element->CalcShape(point, volume_shape_workspace);
+          State state{};
+          const double weight = point.weight * transformation->Weight();
+          local_ready = Finite(weight) && weight > 0.0 &&
+              interpolate(volume_shape_workspace, state);
+          if (!local_ready) break;
+          measure += weight;
+          for (int component = 0;
+               component < cpu_conserved_components; ++component)
+          {
+            mean[component] += weight * state[component];
+          }
+        }
+        local_ready = local_ready && Finite(measure) && measure > 0.0;
+        for (double& value : mean)
+        {
+          if (local_ready)
+          {
+            value /= measure;
+            local_ready = Finite(value);
+          }
+        }
+        local_ready = local_ready &&
+            ::dg::hdg::euler::zhang_shu::ValidateAdmissibleMean(
+                mean.data(), limiter_parameters) ==
+                ::dg::hdg::euler::zhang_shu::Status::success;
+        if (!local_ready) break;
+
+        const auto visit_points = [&](auto&& visitor) noexcept
+        {
+          bool ready = true;
+          const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
+              finite_element->GetGeomType(), quadrature_orders.volume_order);
+          for (int q = 0; q < volume_rule.GetNPoints() && ready; ++q)
+          {
+            const mfem::IntegrationPoint& point = volume_rule.IntPoint(q);
+            finite_element->CalcShape(point, volume_shape_workspace);
+            State state{};
+            ready = interpolate(volume_shape_workspace, state) &&
+                visitor(state);
+          }
+
+          for (int local_face = 0; local_face < 4 && ready; ++local_face)
+          {
+            const int face = element_faces[
+                static_cast<std::size_t>(element) * 4 + local_face];
+            mfem::FaceElementTransformations* const face_transformation =
+                mesh->GetFaceElementTransformations(face);
+            if (!face_transformation) { ready = false; break; }
+            const bool element_one =
+                face_transformation->Elem1No == element;
+            if (!element_one && face_transformation->Elem2No != element)
+            {
+              ready = false;
+              break;
+            }
+            const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
+                face_transformation->GetGeometryType(),
+                quadrature_orders.face_order);
+            for (int q = 0; q < face_rule.GetNPoints() && ready; ++q)
+            {
+              const mfem::IntegrationPoint& face_point =
+                  face_rule.IntPoint(q);
+              face_transformation->SetAllIntPoints(&face_point);
+              const mfem::IntegrationPoint& element_point = element_one
+                  ? face_transformation->GetElement1IntPoint()
+                  : face_transformation->GetElement2IntPoint();
+              finite_element->CalcShape(
+                  element_point, face_interior_shape_workspace);
+              State state{};
+              ready = interpolate(face_interior_shape_workspace, state) &&
+                  visitor(state);
+            }
+          }
+          if (policy.point_set ==
+              generic::EulerHdgZhangShuPointSet::consumer)
+          {
+            for (int scalar = 0;
+                 scalar < scalar_interior_dofs && ready; ++scalar)
+            {
+              State state{};
+              ready = coefficient_state(scalar, state) && visitor(state);
+            }
+          }
+          return ready;
+        };
+
+        double theta_density = 1.0;
+        local_ready = visit_points([&](const State& state) noexcept
+        {
+          const auto point_result =
+              ::dg::hdg::euler::zhang_shu::DensityTheta(
+                  mean.data(), state.data(), limiter_parameters);
+          if (!point_result.ok()) return false;
+          theta_density = std::min(theta_density, point_result.theta);
+          return Finite(theta_density);
+        });
+
+        double theta_pressure = 1.0;
+        if (local_ready)
+        {
+          local_ready = visit_points([&](const State& state) noexcept
+          {
+            State density_limited{};
+            if (::dg::hdg::euler::zhang_shu::BlendDensityOnlyU4(
+                    mean.data(), state.data(), theta_density,
+                    density_limited.data()) !=
+                ::dg::hdg::euler::zhang_shu::Status::success)
+            {
+              return false;
+            }
+            const auto point_result =
+                ::dg::hdg::euler::zhang_shu::PressureTheta(
+                    mean.data(), density_limited.data(),
+                    limiter_parameters);
+            if (!point_result.ok()) return false;
+            theta_pressure = std::min(theta_pressure, point_result.theta);
+            return Finite(theta_pressure);
+          });
+        }
+
+        const ::dg::hdg::euler::zhang_shu::ElementFactors factors{
+            ::dg::hdg::euler::zhang_shu::Status::success,
+            theta_density, theta_pressure, -1};
+        if (local_ready && factors.active())
+        {
+          // The density pass changes rho only.  The subsequent pressure pass
+          // scales all U4 fields, hence rho receives the product of factors
+          // while momentum and energy receive only the pressure factor.
+          for (int scalar = 0;
+               scalar < scalar_interior_dofs && local_ready; ++scalar)
+            for (int component = 0;
+                 component < cpu_conserved_components; ++component)
+            {
+              double sign = 1.0;
+              const int dof = Decode(
+                  signed_vdofs[ByNodes(scalar, scalar_interior_dofs,
+                                       component)], sign);
+              if (dof < 0 || dof >= value_size)
+              {
+                local_ready = false;
+                break;
+              }
+              const double local_value = sign * values[dof];
+              const double theta = factors.component_theta(component);
+              const double limited = (1.0 - theta) * mean[component] +
+                  theta * local_value;
+              if (!Finite(limited))
+              {
+                local_ready = false;
+                break;
+              }
+              values[dof] = sign * limited;
+            }
+        }
+
+        // Independently gate the actual stored polynomial after both scales.
+        if (local_ready)
+        {
+          local_ready = visit_points([&](const State& state) noexcept
+          {
+            double point_pressure = 0.0;
+            return ::dg::hdg::euler::zhang_shu::Pressure(
+                       state.data(), limiter_parameters.gamma,
+                       point_pressure) &&
+                state[0] >= policy.density_floor &&
+                point_pressure >= policy.pressure_floor;
+          });
+        }
+
+        // Scaling about this quadrature mean must preserve every U4 mean.
+        State limited_mean{};
+        double limited_measure = 0.0;
+        for (int q = 0;
+             q < mean_rule.GetNPoints() && local_ready; ++q)
+        {
+          const mfem::IntegrationPoint& point = mean_rule.IntPoint(q);
+          transformation->SetIntPoint(&point);
+          finite_element->CalcShape(point, volume_shape_workspace);
+          State state{};
+          const double weight = point.weight * transformation->Weight();
+          local_ready = Finite(weight) && weight > 0.0 &&
+              interpolate(volume_shape_workspace, state);
+          if (!local_ready) break;
+          limited_measure += weight;
+          for (int component = 0;
+               component < cpu_conserved_components; ++component)
+          {
+            limited_mean[component] += weight * state[component];
+          }
+        }
+        local_ready = local_ready && Finite(limited_measure) &&
+            limited_measure > 0.0;
+        for (int component = 0;
+             component < cpu_conserved_components && local_ready; ++component)
+        {
+          limited_mean[component] /= limited_measure;
+          const double tolerance = 512.0 *
+              std::numeric_limits<double>::epsilon() *
+              std::max({1.0, std::abs(mean[component]),
+                        std::abs(limited_mean[component])});
+          local_ready = Finite(limited_mean[component]) &&
+              std::abs(limited_mean[component] - mean[component]) <=
+                  tolerance;
+        }
+        if (theta_density < 1.0 || theta_pressure < 1.0)
+          ++local_limited_elements;
+      }
+
+      for (int component = 0;
+           component < cpu_conserved_components && local_ready; ++component)
+        for (int scalar = 0; scalar < scalar_size; ++scalar)
+        {
+          const int index = ByNodes(scalar, scalar_size, component);
+          const double before =
+              rodas_limiter_u4_before[static_cast<std::size_t>(index)];
+          const double after = values[index];
+          const double scale = std::max({1.0, std::abs(before),
+                                         std::abs(after)});
+          const double correction = (after - before) / scale;
+          local_correction_squared += correction * correction;
+          ++local_correction_count;
+          local_ready = Finite(local_correction_squared);
+        }
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    if (!CollectiveAll(local_ready)) return false;
+
+    std::uint64_t global_limited_elements = 0;
+    std::uint64_t global_correction_count = 0;
+    double global_correction_squared = 0.0;
+    const bool reduced = MPI_Allreduce(
+            &local_limited_elements, &global_limited_elements, 1,
+            MPI_UINT64_T, MPI_SUM, communicator) == MPI_SUCCESS &&
+        MPI_Allreduce(&local_correction_count, &global_correction_count, 1,
+                      MPI_UINT64_T, MPI_SUM, communicator) == MPI_SUCCESS &&
+        MPI_Allreduce(&local_correction_squared, &global_correction_squared,
+                      1, MPI_DOUBLE, MPI_SUM, communicator) == MPI_SUCCESS;
+    if (!CollectiveAll(reduced && global_correction_count > 0 &&
+                       Finite(global_correction_squared)))
+    {
+      return false;
+    }
+    result.active = global_limited_elements > 0;
+    result.limited_elements = global_limited_elements;
+    result.correction_norm = std::sqrt(
+        global_correction_squared /
+        static_cast<double>(global_correction_count));
+    return CollectiveAll(Finite(result.correction_norm) &&
+                         (result.active || result.correction_norm == 0.0));
+  }
+
+  bool ApplyRodasPositivityLimiter(
+      RodasPositivityResult& result) noexcept
+  {
+    result = {};
+    if (!RodasPositivityLimiterEnabled()) return true;
+    bool local_ready = iterate_interior != nullptr;
+    double* values = nullptr;
+    try
+    {
+      values = local_ready ? iterate_interior->HostReadWrite() : nullptr;
+      local_ready = local_ready &&
+          (values != nullptr || iterate_interior->Size() == 0);
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    if (!CollectiveAll(local_ready)) return false;
+    return ApplyRodasPositivityLimiterToCoefficients(
+        values, iterate_interior->Size(), result);
+  }
+
+  bool CaptureRodasAdmittedStageState(const std::size_t stage) noexcept
+  {
+    if (!RodasPositivityLimiterEnabled()) return true;
+    bool local_ready = stage < rodas_admitted_stage_interior.size() &&
+        rodas_admitted_stage_interior[stage].size() ==
+            static_cast<std::size_t>(iterate_interior->Size()) &&
+        rodas_admitted_stage_trace[stage].size() ==
+            static_cast<std::size_t>(iterate_true_trace.Size());
+    try
+    {
+      const double* const interior = local_ready
+          ? iterate_interior->HostRead() : nullptr;
+      const double* const trace = local_ready
+          ? iterate_true_trace.HostRead() : nullptr;
+      local_ready = local_ready &&
+          (interior || iterate_interior->Size() == 0) &&
+          (trace || iterate_true_trace.Size() == 0);
+      if (local_ready)
+      {
+        if (iterate_interior->Size() != 0)
+          std::copy(interior, interior + iterate_interior->Size(),
+                    rodas_admitted_stage_interior[stage].begin());
+        if (iterate_true_trace.Size() != 0)
+          std::copy(trace, trace + iterate_true_trace.Size(),
+                    rodas_admitted_stage_trace[stage].begin());
+      }
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    return CollectiveAll(local_ready);
+  }
+
   bool PrepareRodasCommonShift(const double step_size) noexcept
   {
     using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
@@ -7738,6 +8353,176 @@ struct detail::CpuNumericsCore::Implementation
       local_ready = Finite(rodas_mass_over_shift[index]);
     }
     return CollectiveAll(local_ready);
+  }
+
+  /**
+   * Restore the base common-shift factor after a limiter-triggered algebraic
+   * projection has used the shared condensation, matrix, ILU, and GMRES
+   * objects.  This is deliberately an active-only slow path: it snapshots the
+   * admitted limited stage, rebuilds and factors the exact base operator with
+   * one bounded throw-away solve, then restores the stage bytes.  The normal
+   * limiter-inactive path executes none of this work and retains its original
+   * one-build/three-reuse census.
+   */
+  bool RebuildRodasCommonShiftAfterProjection(
+      const double step_size,
+      const CpuFailureInjection& injection,
+      CpuAttemptEvidence& attempt,
+      double& maximum_true_residual,
+      std::uint64_t& common_operator_generation,
+      CpuFailurePhase& failure_phase,
+      bool& injected_failure) noexcept
+  {
+    failure_phase = CpuFailurePhase::none;
+    injected_failure = false;
+    reusable_operator_generation = 0;
+    bool snapshot_ready = RodasPositivityLimiterEnabled() &&
+        rodas_limited_stage_interior.size() ==
+            static_cast<std::size_t>(iterate_interior->Size()) &&
+        rodas_limited_stage_trace.size() ==
+            static_cast<std::size_t>(iterate_true_trace.Size()) &&
+        rodas_base_interior.size() ==
+            static_cast<std::size_t>(iterate_interior->Size()) &&
+        rodas_base_trace.size() ==
+            static_cast<std::size_t>(iterate_true_trace.Size());
+    try
+    {
+      const double* const interior = snapshot_ready
+          ? iterate_interior->HostRead() : nullptr;
+      const double* const trace = snapshot_ready
+          ? iterate_true_trace.HostRead() : nullptr;
+      snapshot_ready = snapshot_ready &&
+          (interior || iterate_interior->Size() == 0) &&
+          (trace || iterate_true_trace.Size() == 0);
+      if (snapshot_ready)
+      {
+        if (iterate_interior->Size() != 0)
+          std::copy(interior, interior + iterate_interior->Size(),
+                    rodas_limited_stage_interior.begin());
+        if (iterate_true_trace.Size() != 0)
+          std::copy(trace, trace + iterate_true_trace.Size(),
+                    rodas_limited_stage_trace.begin());
+      }
+    }
+    catch (...)
+    {
+      snapshot_ready = false;
+    }
+    if (!CollectiveAll(snapshot_ready))
+    {
+      failure_phase = CpuFailurePhase::setup;
+      return false;
+    }
+    const bool base_interior_assigned =
+        Assign(*iterate_interior, rodas_base_interior);
+    const bool base_trace_assigned =
+        Assign(iterate_true_trace, rodas_base_trace);
+    if (!CollectiveAll(base_interior_assigned && base_trace_assigned))
+    {
+      failure_phase = CpuFailurePhase::setup;
+      return false;
+    }
+    if (!LoadTrace(iterate_true_trace, *iterate_trace))
+    {
+      failure_phase = CpuFailurePhase::setup;
+      return false;
+    }
+
+    if (!EnterPhase(injection, CpuFailurePhase::assembly))
+    {
+      failure_phase = CpuFailurePhase::assembly;
+      injected_failure = true;
+      return false;
+    }
+    if (!PrepareRodasCommonShift(step_size))
+    {
+      failure_phase = CpuFailurePhase::assembly;
+      return false;
+    }
+    attempt.work.complete_assemblies += 2;
+    CompletePhase();
+
+    if (!EnterPhase(injection, CpuFailurePhase::condensation))
+    {
+      failure_phase = CpuFailurePhase::condensation;
+      injected_failure = true;
+      return false;
+    }
+    StateHash matrix_hash{};
+    if (!CondenseAndAssemble(rodas_operator_system, matrix_hash,
+                             common_operator_generation))
+    {
+      failure_phase = CpuFailurePhase::condensation;
+      return false;
+    }
+    ++attempt.work.complete_condensations;
+    ++attempt.work.common_shift_operator_builds;
+    ++attempt.work.common_shift_operator_rebuilds;
+    CompletePhase();
+
+    if (!EnterPhase(injection, CpuFailurePhase::trace_solve))
+    {
+      failure_phase = CpuFailurePhase::trace_solve;
+      injected_failure = true;
+      return false;
+    }
+    double true_residual = 0.0;
+    int iterations = 0;
+    int solve_attempts = 0;
+    int tightenings = 0;
+    StateHash factor_hash{}, solution_hash{};
+    std::uint64_t factor_generation = 0;
+    bool factor_current = false;
+    const bool solved = SolveTrace(
+        common_operator_generation,
+        generic::EulerHdgLinearSolveRole::final_coherent,
+        true_residual, iterations, solve_attempts, tightenings,
+        factor_hash, solution_hash, factor_generation, factor_current,
+        true, false);
+    const bool counts_ready = iterations >= 0 && solve_attempts >= 0 &&
+        tightenings >= 0 && attempt.linear_iterations <=
+            std::numeric_limits<int>::max() - iterations &&
+        attempt.linear_solve_attempts <=
+            std::numeric_limits<int>::max() - solve_attempts &&
+        attempt.true_residual_tightenings <=
+            std::numeric_limits<int>::max() - tightenings &&
+        attempt.final_coherent_linear_iterations <=
+            std::numeric_limits<int>::max() - iterations;
+    if (!CollectiveAll(solved && counts_ready && factor_current &&
+                       reusable_operator_generation ==
+                           common_operator_generation &&
+                       Finite(true_increment)))
+    {
+      failure_phase = CpuFailurePhase::trace_solve;
+      return false;
+    }
+    attempt.linear_iterations += iterations;
+    attempt.linear_solve_attempts += solve_attempts;
+    attempt.true_residual_tightenings += tightenings;
+    attempt.final_coherent_linear_iterations += iterations;
+    ++attempt.work.complete_factor_setups;
+    ++attempt.work.complete_trace_solves;
+    maximum_true_residual = std::max(maximum_true_residual, true_residual);
+    CompletePhase();
+
+    const bool limited_interior_restored = Assign(
+        *iterate_interior, rodas_limited_stage_interior);
+    const bool limited_trace_restored = Assign(
+        iterate_true_trace, rodas_limited_stage_trace);
+    if (!CollectiveAll(limited_interior_restored &&
+                       limited_trace_restored))
+    {
+      failure_phase = CpuFailurePhase::setup;
+      reusable_operator_generation = 0;
+      return false;
+    }
+    if (!LoadTrace(iterate_true_trace, *iterate_trace))
+    {
+      failure_phase = CpuFailurePhase::setup;
+      reusable_operator_generation = 0;
+      return false;
+    }
+    return true;
   }
 
   bool BuildRodasStageSystem(const std::size_t stage) noexcept
@@ -7877,6 +8662,7 @@ struct detail::CpuNumericsCore::Implementation
   bool FormRodasCandidate(double& temporal_error_norm) noexcept
   {
     using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
+    const bool filtered_pair = RodasPositivityLimiterEnabled();
     temporal_error_norm = std::numeric_limits<double>::infinity();
     bool local_ready = IsRodas3() &&
         rodas_base_interior.size() ==
@@ -7922,33 +8708,42 @@ struct detail::CpuNumericsCore::Implementation
         trace[index] = principal;
         local_ready = Finite(principal);
       }
-      for (int component = 0;
-           component < cpu_conserved_components && local_ready; ++component)
-        for (int scalar = 0; scalar < scalar_interior; ++scalar)
-        {
-          const int index = ByNodes(scalar, scalar_interior, component);
-          double estimate = 0.0;
-          for (std::size_t stage = 0;
-               stage < Coefficients::stage_count; ++stage)
+      if (!filtered_pair)
+      {
+        for (int component = 0;
+             component < cpu_conserved_components && local_ready; ++component)
+          for (int scalar = 0; scalar < scalar_interior; ++scalar)
           {
-            estimate += Coefficients::ErrorWeight(stage) *
-                rodas_stage_interior[stage][static_cast<std::size_t>(index)];
+            const int index = ByNodes(scalar, scalar_interior, component);
+            double estimate = 0.0;
+            for (std::size_t stage = 0;
+                 stage < Coefficients::stage_count; ++stage)
+            {
+              estimate += Coefficients::ErrorWeight(stage) *
+                  rodas_stage_interior[stage][
+                      static_cast<std::size_t>(index)];
+            }
+            const double scale = std::max(
+                {1.0, std::abs(rodas_base_interior[
+                          static_cast<std::size_t>(index)]),
+                 std::abs(interior[index])});
+            local_error_squared += (estimate / scale) * (estimate / scale);
+            ++local_differential_count;
+            local_scale_squared += 1.0;
+            local_ready = Finite(local_error_squared);
           }
-          const double scale = std::max(
-              {1.0, std::abs(rodas_base_interior[
-                        static_cast<std::size_t>(index)]),
-               std::abs(interior[index])});
-          local_error_squared += (estimate / scale) * (estimate / scale);
-          ++local_differential_count;
-          local_scale_squared += 1.0;
-          local_ready = Finite(local_error_squared);
-        }
+      }
     }
     catch (...)
     {
       local_ready = false;
     }
     if (!CollectiveAll(local_ready)) return false;
+    if (filtered_pair)
+    {
+      temporal_error_norm = 0.0;
+      return LoadTrace(iterate_true_trace, *iterate_trace);
+    }
     double global_error_squared = 0.0;
     double global_scale_squared = 0.0;
     std::uint64_t global_differential_count = 0;
@@ -7970,6 +8765,113 @@ struct detail::CpuNumericsCore::Implementation
         global_error_squared / static_cast<double>(global_differential_count));
     if (!CollectiveAll(Finite(temporal_error_norm))) return false;
     return LoadTrace(iterate_true_trace, *iterate_trace);
+  }
+
+  /**
+   * Evaluate the embedded differential estimate after the nonlinear
+   * positivity map has independently admitted both endpoint polynomials.
+   * This controls the filtered method P(U_H)-P(U_L), rather than treating the
+   * full shock-local displacement P(U_H)-U_H as temporal truncation error.
+   */
+  bool FormRodasFilteredPairError(double& temporal_error_norm) noexcept
+  {
+    temporal_error_norm = std::numeric_limits<double>::infinity();
+    bool local_ready = RodasPositivityLimiterEnabled() && iterate_interior &&
+        interior_space && mesh &&
+        rodas_base_interior.size() ==
+            static_cast<std::size_t>(iterate_interior->Size()) &&
+        rodas_admitted_stage_interior[3].size() ==
+            rodas_base_interior.size();
+    double local_error_squared = 0.0;
+    double local_measure = 0.0;
+    try
+    {
+      const double* const high = local_ready
+          ? iterate_interior->HostRead() : nullptr;
+      local_ready = local_ready &&
+          (high != nullptr || iterate_interior->Size() == 0);
+      const auto quadrature_orders =
+          EffectiveAssemblyQuadratureOrders(config);
+      for (int element = 0;
+           element < mesh->GetNE() && local_ready; ++element)
+      {
+        const mfem::FiniteElement* const finite_element =
+            interior_space->GetFE(element);
+        mfem::ElementTransformation* const transformation =
+            mesh->GetElementTransformation(element);
+        local_ready = finite_element && transformation &&
+            finite_element->GetDof() == scalar_interior_dofs;
+        if (!local_ready) break;
+        const int* const signed_vdofs = element_interior_vdofs.data() +
+            static_cast<std::size_t>(element) * local_interior;
+        const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
+            finite_element->GetGeomType(), quadrature_orders.volume_order);
+        for (int q = 0; q < volume_rule.GetNPoints() && local_ready; ++q)
+        {
+          const mfem::IntegrationPoint& point = volume_rule.IntPoint(q);
+          transformation->SetIntPoint(&point);
+          finite_element->CalcShape(point, volume_shape_workspace);
+          const double weight = point.weight * transformation->Weight();
+          local_ready = Finite(weight) && weight > 0.0;
+          for (int component = 0;
+               component < cpu_conserved_components && local_ready;
+               ++component)
+          {
+            double base_value = 0.0;
+            double high_value = 0.0;
+            double low_value = 0.0;
+            for (int scalar = 0; scalar < scalar_interior_dofs; ++scalar)
+            {
+              double sign = 1.0;
+              const int dof = Decode(
+                  signed_vdofs[ByNodes(scalar, scalar_interior_dofs,
+                                       component)], sign);
+              local_ready = dof >= 0 &&
+                  static_cast<std::size_t>(dof) <
+                      rodas_base_interior.size();
+              if (!local_ready) break;
+              const double shape = volume_shape_workspace[scalar] * sign;
+              base_value += shape *
+                  rodas_base_interior[static_cast<std::size_t>(dof)];
+              high_value += shape * high[dof];
+              low_value += shape *
+                  rodas_admitted_stage_interior[3][
+                      static_cast<std::size_t>(dof)];
+            }
+            const double scale = std::max(
+                {1.0, std::abs(base_value), std::abs(high_value)});
+            const double error = (high_value - low_value) / scale;
+            local_error_squared += weight * error * error;
+            local_ready = local_ready && Finite(base_value) &&
+                Finite(high_value) && Finite(low_value) && Finite(error) &&
+                Finite(local_error_squared);
+          }
+          local_measure += weight;
+          local_ready = local_ready && Finite(local_measure);
+        }
+      }
+    }
+    catch (...)
+    {
+      local_ready = false;
+    }
+    if (!CollectiveAll(local_ready)) return false;
+    double global_error_squared = 0.0;
+    double global_measure = 0.0;
+    const bool reduced = MPI_Allreduce(
+            &local_error_squared, &global_error_squared, 1, MPI_DOUBLE,
+            MPI_SUM, communicator) == MPI_SUCCESS &&
+        MPI_Allreduce(&local_measure, &global_measure, 1, MPI_DOUBLE,
+                      MPI_SUM, communicator) == MPI_SUCCESS;
+    if (!CollectiveAll(reduced && Finite(global_error_squared) &&
+                       Finite(global_measure) && global_measure > 0.0))
+    {
+      return false;
+    }
+    temporal_error_norm = std::sqrt(
+        global_error_squared /
+        (static_cast<double>(cpu_conserved_components) * global_measure));
+    return CollectiveAll(Finite(temporal_error_norm));
   }
 
   bool StoreCandidate() noexcept
@@ -8960,8 +9862,6 @@ bool detail::CpuNumericsCore::AuditRodasAlgebraicBlockSolvability(
         trace_size % state.trace_components == 0;
     const int interior_scalar = local_ready
         ? interior_size / state.interior_components : 0;
-    const int trace_scalar = local_ready
-        ? trace_size / state.trace_components : 0;
     differential_before.reserve(static_cast<std::size_t>(
         cpu_conserved_components * interior_scalar));
     for (int component = 0;
@@ -9098,6 +9998,13 @@ bool detail::CpuNumericsCore::AuditPreparedRodasStageEquations(
     local_ready = local_ready && stage.size() == candidate->interior.size();
   for (const auto& stage : state.rodas_stage_trace)
     local_ready = local_ready && stage.size() == candidate->trace.size();
+  if (state.RodasPositivityLimiterEnabled())
+  {
+    for (const auto& stage : state.rodas_admitted_stage_interior)
+      local_ready = local_ready && stage.size() == candidate->interior.size();
+    for (const auto& stage : state.rodas_admitted_stage_trace)
+      local_ready = local_ready && stage.size() == candidate->trace.size();
+  }
   if (!state.CollectiveAll(local_ready)) return false;
 
   const auto restore_candidate = [&]() noexcept
@@ -9237,7 +10144,23 @@ bool detail::CpuNumericsCore::AuditPreparedRodasStageEquations(
   for (std::size_t stage = 0;
        stage < Coefficients::stage_count && local_ready; ++stage)
   {
-    if (!state.LoadRodasStageState(stage))
+    bool stage_loaded = true;
+    if (state.RodasPositivityLimiterEnabled())
+    {
+      const bool assigned = AssignGridFunction(
+              *state.iterate_interior,
+              state.rodas_admitted_stage_interior[stage]) &&
+          Assign(state.iterate_true_trace,
+                 state.rodas_admitted_stage_trace[stage]);
+      stage_loaded = state.CollectiveAll(assigned) &&
+          state.LoadTrace(state.iterate_true_trace,
+                          *state.iterate_trace);
+    }
+    else
+    {
+      stage_loaded = state.LoadRodasStageState(stage);
+    }
+    if (!stage_loaded)
     {
       local_ready = false;
       break;
@@ -9706,6 +10629,9 @@ bool detail::CpuNumericsCore::AssessPreparedBorrowedEuler(
       state.interior_components >= cpu_conserved_components &&
       candidate->interior.size() == state.rodas_base_interior.size() &&
       candidate->interior.size() == state.rodas_combination_interior.size() &&
+      (!state.RodasPositivityLimiterEnabled() ||
+       candidate->interior.size() ==
+           state.rodas_admitted_stage_interior[3].size()) &&
       candidate->trace.size() == state.rodas_base_trace.size() &&
       candidate->trace.size() == state.rodas_combination_trace.size() &&
       candidate->interior.size() %
@@ -9821,14 +10747,25 @@ bool detail::CpuNumericsCore::AssessPreparedBorrowedEuler(
               state.rodas_base_interior, interior_vdofs, component, before) &&
               interpolate_coefficients(
                   candidate->interior, interior_vdofs, component, after);
-          for (std::size_t stage = 0;
-               stage < Coefficients::stage_count && local_ready; ++stage)
+          if (state.RodasPositivityLimiterEnabled())
           {
-            double increment = 0.0;
-            local_ready = interpolate_coefficients(
-                state.rodas_stage_interior[stage], interior_vdofs,
-                component, increment);
-            estimate += Coefficients::ErrorWeight(stage) * increment;
+            double embedded = 0.0;
+            local_ready = local_ready && interpolate_coefficients(
+                state.rodas_admitted_stage_interior[3], interior_vdofs,
+                component, embedded);
+            estimate = after - embedded;
+          }
+          else
+          {
+            for (std::size_t stage = 0;
+                 stage < Coefficients::stage_count && local_ready; ++stage)
+            {
+              double increment = 0.0;
+              local_ready = interpolate_coefficients(
+                  state.rodas_stage_interior[stage], interior_vdofs,
+                  component, increment);
+              estimate += Coefficients::ErrorWeight(stage) * increment;
+            }
           }
           double normalized_squared = 0.0;
           local_ready = local_ready && scaled_square(
@@ -10749,6 +11686,30 @@ detail::CpuNumericsCore::Implementation::ExecuteRodas3(
   double initial_algebraic_correction = 0.0;
   CpuFailurePhase projection_phase = CpuFailurePhase::none;
   bool projection_injected = false;
+  bool base_limiter_active = false;
+  // Filter U4 before the first assembly.  This is what lets an admissible
+  // cell mean rescue a polynomial whose consumer values would otherwise make
+  // the initial algebraic projection itself unevaluable.
+  if (RodasPositivityLimiterEnabled())
+  {
+    ++evidence.work.positivity_limiter_calls;
+    RodasPositivityResult limiter{};
+    if (!ApplyRodasPositivityLimiter(limiter))
+    {
+      return fail(CpuFailurePhase::recovery,
+                  CpuAttemptStatus::runtime_failure,
+                  FailureReason::admissibility_gate);
+    }
+    evidence.maximum_positivity_limiter_correction_norm =
+        limiter.correction_norm;
+    base_limiter_active = limiter.active;
+    if (limiter.active)
+    {
+      ++evidence.work.positivity_limiter_active_calls;
+      evidence.work.positivity_limited_elements +=
+          limiter.limited_elements;
+    }
+  }
   const bool initial_projection_ready = ProjectRodasAlgebraicState(
           injection, evidence, maximum_true_residual,
           initial_algebraic_residual, initial_algebraic_correction,
@@ -10761,6 +11722,12 @@ detail::CpuNumericsCore::Implementation::ExecuteRodas3(
     return fail(projection_phase,
                 projection_injected ? CpuAttemptStatus::injected_failure
                                     : CpuAttemptStatus::runtime_failure);
+  }
+  if (base_limiter_active)
+  {
+    ++evidence.work.positivity_algebraic_projections;
+    evidence.maximum_positivity_algebraic_correction_norm =
+        initial_algebraic_correction;
   }
   if (!CollectiveAll(Finite(initial_algebraic_correction)))
   {
@@ -10775,6 +11742,7 @@ detail::CpuNumericsCore::Implementation::ExecuteRodas3(
                 CpuAttemptStatus::runtime_failure,
                 FailureReason::success_gate);
   }
+
   if (!SaveRodasBaseState()) return fail(CpuFailurePhase::setup);
 
   double minimum_density = std::numeric_limits<double>::infinity();
@@ -10802,6 +11770,80 @@ detail::CpuNumericsCore::Implementation::ExecuteRodas3(
   for (std::size_t stage = 0; stage < Coefficients::stage_count; ++stage)
   {
     if (!LoadRodasStageState(stage)) return fail(CpuFailurePhase::setup);
+    if (RodasPositivityLimiterEnabled())
+    {
+      ++evidence.work.positivity_limiter_calls;
+      RodasPositivityResult limiter{};
+      if (!ApplyRodasPositivityLimiter(limiter))
+      {
+        return fail(CpuFailurePhase::recovery,
+                    CpuAttemptStatus::runtime_failure,
+                    FailureReason::admissibility_gate);
+      }
+      evidence.maximum_positivity_limiter_correction_norm = std::max(
+          evidence.maximum_positivity_limiter_correction_norm,
+          limiter.correction_norm);
+      if (limiter.active)
+      {
+        ++evidence.work.positivity_limiter_active_calls;
+        evidence.work.positivity_limited_elements +=
+            limiter.limited_elements;
+        if (!SnapshotRodasAlgebraicCorrectionReference() ||
+            !SeedRodasAlgebraicProjectionFromBase())
+          return fail(CpuFailurePhase::setup);
+        double stage_algebraic_residual = 0.0;
+        double stage_algebraic_correction = 0.0;
+        projection_phase = CpuFailurePhase::none;
+        projection_injected = false;
+        if (!ProjectRodasAlgebraicState(
+                injection, evidence, maximum_true_residual,
+                stage_algebraic_residual, stage_algebraic_correction,
+                projection_phase, projection_injected, true))
+        {
+          return fail(projection_phase,
+                      projection_injected
+                          ? CpuAttemptStatus::injected_failure
+                          : CpuAttemptStatus::runtime_failure);
+        }
+        ++evidence.work.positivity_algebraic_projections;
+        evidence.maximum_positivity_algebraic_correction_norm = std::max(
+            evidence.maximum_positivity_algebraic_correction_norm,
+            stage_algebraic_correction);
+
+        if (stage == 0)
+        {
+          // Stage zero is the method base.  In the unlikely event the base
+          // pass was not bitwise idempotent, make that admitted state the
+          // frozen base and recreate its local common-shift data; the normal
+          // stage-zero condensation below performs the sole factor setup.
+          if (!SaveRodasBaseState()) return fail(CpuFailurePhase::setup);
+          if (!EnterPhase(injection, CpuFailurePhase::assembly))
+            return fail(CpuFailurePhase::assembly,
+                        CpuAttemptStatus::injected_failure);
+          if (!PrepareRodasCommonShift(attempt.dt))
+            return fail(CpuFailurePhase::assembly);
+          evidence.work.complete_assemblies += 2;
+          CompletePhase();
+        }
+        else
+        {
+          CpuFailurePhase rebuild_phase = CpuFailurePhase::none;
+          bool rebuild_injected = false;
+          if (!RebuildRodasCommonShiftAfterProjection(
+                  attempt.dt, injection, evidence, maximum_true_residual,
+                  common_operator_generation, rebuild_phase,
+                  rebuild_injected))
+          {
+            return fail(rebuild_phase,
+                        rebuild_injected
+                            ? CpuAttemptStatus::injected_failure
+                            : CpuAttemptStatus::runtime_failure);
+          }
+        }
+      }
+    }
+    if (!CaptureRodasAdmittedStageState(stage))
+      return fail(CpuFailurePhase::setup);
     double stage_density = 0.0;
     double stage_pressure = 0.0;
     double stage_wave = 0.0;
@@ -10913,6 +11955,57 @@ detail::CpuNumericsCore::Implementation::ExecuteRodas3(
   double temporal_error_norm = 0.0;
   if (!FormRodasCandidate(temporal_error_norm))
     return fail(CpuFailurePhase::recovery);
+
+  double final_algebraic_residual = 0.0;
+  double final_algebraic_correction = 0.0;
+  bool candidate_projected_after_limiter = false;
+  if (RodasPositivityLimiterEnabled())
+  {
+    ++evidence.work.positivity_limiter_calls;
+    RodasPositivityResult limiter{};
+    if (!ApplyRodasPositivityLimiter(limiter))
+    {
+      return fail(CpuFailurePhase::recovery,
+                  CpuAttemptStatus::runtime_failure,
+                  FailureReason::admissibility_gate);
+    }
+    evidence.maximum_positivity_limiter_correction_norm = std::max(
+        evidence.maximum_positivity_limiter_correction_norm,
+        limiter.correction_norm);
+    if (limiter.active)
+    {
+      ++evidence.work.positivity_limiter_active_calls;
+      evidence.work.positivity_limited_elements +=
+          limiter.limited_elements;
+      if (!SnapshotRodasAlgebraicCorrectionReference() ||
+          !SeedRodasAlgebraicProjectionFromBase())
+        return fail(CpuFailurePhase::setup);
+      projection_phase = CpuFailurePhase::none;
+      projection_injected = false;
+      if (!ProjectRodasAlgebraicState(
+              injection, evidence, maximum_true_residual,
+              final_algebraic_residual, final_algebraic_correction,
+              projection_phase, projection_injected, true))
+      {
+        return fail(projection_phase,
+                    projection_injected
+                        ? CpuAttemptStatus::injected_failure
+                        : CpuAttemptStatus::runtime_failure);
+      }
+      ++evidence.work.positivity_algebraic_projections;
+      evidence.maximum_positivity_algebraic_correction_norm = std::max(
+          evidence.maximum_positivity_algebraic_correction_norm,
+          final_algebraic_correction);
+      candidate_projected_after_limiter = true;
+    }
+
+    if (!FormRodasFilteredPairError(temporal_error_norm))
+    {
+      return fail(CpuFailurePhase::recovery,
+                  CpuAttemptStatus::runtime_failure,
+                  FailureReason::finite_gate);
+    }
+  }
   evidence.temporal_error_norm = temporal_error_norm;
 
   double candidate_density = 0.0;
@@ -10930,23 +12023,24 @@ detail::CpuNumericsCore::Implementation::ExecuteRodas3(
   minimum_pressure = std::min(minimum_pressure, candidate_pressure);
   maximum_wave = std::max(maximum_wave, candidate_wave);
 
-  double final_algebraic_residual = 0.0;
-  double final_algebraic_correction = 0.0;
-  projection_phase = CpuFailurePhase::none;
-  projection_injected = false;
-  const bool final_projection_ready = ProjectRodasAlgebraicState(
-          injection, evidence, maximum_true_residual,
-          final_algebraic_residual, final_algebraic_correction,
-          projection_phase, projection_injected);
+  if (!candidate_projected_after_limiter)
+  {
+    projection_phase = CpuFailurePhase::none;
+    projection_injected = false;
+    const bool final_projection_ready = ProjectRodasAlgebraicState(
+            injection, evidence, maximum_true_residual,
+            final_algebraic_residual, final_algebraic_correction,
+            projection_phase, projection_injected);
+    if (!final_projection_ready)
+    {
+      return fail(projection_phase,
+                  projection_injected ? CpuAttemptStatus::injected_failure
+                                      : CpuAttemptStatus::runtime_failure);
+    }
+  }
   evidence.final_nonlinear_residual = final_algebraic_residual;
   evidence.final_algebraic_residual = final_algebraic_residual;
   evidence.final_algebraic_correction_norm = final_algebraic_correction;
-  if (!final_projection_ready)
-  {
-    return fail(projection_phase,
-                projection_injected ? CpuAttemptStatus::injected_failure
-                                    : CpuAttemptStatus::runtime_failure);
-  }
   if (!CollectiveAll(Finite(final_algebraic_correction)))
   {
     return fail(CpuFailurePhase::recovery,
@@ -11008,7 +12102,8 @@ detail::CpuNumericsCore::Implementation::ExecuteRodas3(
   CompletePhase();
 
   const bool architecture_census =
-      evidence.work.common_shift_operator_builds == 1 &&
+      evidence.work.common_shift_operator_builds ==
+          1 + evidence.work.common_shift_operator_rebuilds &&
       evidence.work.common_shift_operator_reuses == 3 &&
       evidence.work.condensed_rhs_refreshes == 3 &&
       evidence.work.complete_factor_setups <=
@@ -11048,6 +12143,8 @@ detail::CpuNumericsCore::Implementation::ExecuteRodas3(
   evidence.finite_gate = Finite(temporal_error_norm) &&
       Finite(final_algebraic_residual) &&
       Finite(final_algebraic_correction) &&
+      Finite(evidence.maximum_positivity_limiter_correction_norm) &&
+      Finite(evidence.maximum_positivity_algebraic_correction_norm) &&
       Finite(Candidate()->interior) && Finite(Candidate()->trace);
   evidence.admissibility_gate = final_density > 0.0 &&
       final_pressure > 0.0 && Finite(final_wave);
