@@ -2778,10 +2778,10 @@ public:
       return false;
     }
     if (!CollectiveContinue(
-            BootstrapPartitionedScalarClosure(config)))
+            BootstrapInitialScalarClosure(config)))
     {
       ReportCudaSetupFailure(evidence.rank,
-                             "partitioned-scalar-bootstrap");
+                             "initial-scalar-bootstrap");
       return false;
     }
     resources_.mfem_pin = StableIdentity::Copy(
@@ -6144,7 +6144,7 @@ private:
       CudaTensorCoreEvidence& tensor_core_evidence) noexcept;
   bool PartitionedAuxiliaryNorm(
       state_slot& workspace, double& norm) noexcept;
-  bool BootstrapPartitionedScalarClosure(const CudaConfig& config) noexcept;
+  bool BootstrapInitialScalarClosure(const CudaConfig& config) noexcept;
   bool SolvePartitionedScalarClosure(
       state_slot& workspace, generic::EulerHdgLinearSolveRole role,
       CudaNumericalResult& result,
@@ -6155,6 +6155,10 @@ private:
   bool HashState(const double* values, int count, StateHash& hash) noexcept;
   bool AggregateHash(const StateHash& local, StateHash& aggregate) const
       noexcept;
+  bool RequiresInitialScalarClosure() const noexcept
+  {
+    return shape_.igr_active && (partitioned_backward_euler_ || rodas3_);
+  }
   std::size_t WorkspaceBytes() const noexcept;
   bool OraclePayloadFitsCapacity() const noexcept;
   void CaptureOracleMetadata(const AttemptIdentity& attempt,

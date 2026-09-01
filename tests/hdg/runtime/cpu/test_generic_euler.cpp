@@ -9,6 +9,7 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -1650,6 +1651,278 @@ bool CheckRodas3NontrivialDaeLifecycle()
     }
   }
   return true;
+}
+
+bool CheckRodas3IgrInitialScalarClosure()
+{
+  constexpr int order = 1;
+  constexpr int igr_interior_components = 7;
+  constexpr int igr_trace_components = 5;
+  const auto zero_coordinates =
+      [](const dg::hdg::runtime::StateCoordinates& coordinates) noexcept
+  {
+    return coordinates.time == 0.0 && coordinates.step == 0 &&
+        coordinates.generation == 0 && coordinates.cursor == 0 &&
+        coordinates.dt == 0.0;
+  };
+  const auto zero_work = [](const auto& work) noexcept
+  {
+    return work.complete_assemblies == 0 &&
+        work.complete_condensations == 0 &&
+        work.complete_factor_setups == 0 &&
+        work.complete_trace_solves == 0 &&
+        work.complete_scalar_closure_solves == 0 &&
+        work.complete_recoveries == 0 && work.trial_reassemblies == 0 &&
+        work.accepted_newton_updates == 0 && work.phase_entries == 0 &&
+        work.phase_completions == 0 &&
+        work.common_shift_operator_builds == 0 &&
+        work.common_shift_operator_reuses == 0 &&
+        work.condensed_rhs_refreshes == 0;
+  };
+  const auto same_bytes = [](const double* const left,
+                             const double* const right,
+                             const std::size_t count) noexcept
+  {
+    return count == 0 ||
+        (left != nullptr && right != nullptr &&
+         std::memcmp(left, right, count * sizeof(double)) == 0);
+  };
+
+  mfem::ParMesh mesh = MakePeriodicBorrowedMesh();
+  const std::array<double, 8> initial{{1.00, 1.08, 0.16, 0.09,
+                                      -0.03, 0.04, 2.70, 2.88}};
+  const std::array<double, 8> source{{0.01, 0.02, 0.00, 0.01,
+                                      0.00, 0.00, 0.03, 0.04}};
+  ExactBorrowedEulerFields fields(mesh, order, initial, source);
+
+  // Construct a coherent Uhat4 and then supply it explicitly, so the IGR
+  // initialization below proves preservation of caller-owned trace bytes.
+  BoundaryContext reference_boundary{};
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore reference;
+  const EulerHdgRequest reference_request = Request(
+      mesh, order, reference_boundary, fields);
+  if (!reference.InitializeBorrowedEuler(reference_request)) return false;
+  const auto reference_snapshot = reference.Snapshot({});
+  if (reference_snapshot.trace.size == 0 ||
+      reference_snapshot.trace.size % 4 != 0 ||
+      reference_snapshot.trace.data == nullptr)
+  {
+    return false;
+  }
+  std::vector<double> caller_trace(
+      reference_snapshot.trace.data,
+      reference_snapshot.trace.data + reference_snapshot.trace.size);
+
+  BoundaryContext boundary{};
+  EulerHdgRequest request = Request(
+      mesh, order, boundary, fields, EulerHdgTimeTreatment::rodas3);
+  request.numerical_policy.stabilization =
+      {RegularizationKind::igr, 0.2, 0.4};
+  request.initial_true_trace = {
+      caller_trace.data(), caller_trace.size(), 4};
+  dg::hdg::runtime::cpu::detail::CpuNumericsCore core;
+  if (!core.InitializeBorrowedEuler(request)) return false;
+
+  dg::hdg::runtime::StateCoordinates coordinates{};
+  const auto initialized = core.Snapshot(coordinates);
+  const bool layout_ready = initialized.interior.data != nullptr &&
+      initialized.trace.data != nullptr &&
+      initialized.interior.size % igr_interior_components == 0 &&
+      initialized.trace.size % igr_trace_components == 0;
+  const std::size_t interior_scalar = layout_ready
+      ? initialized.interior.size / igr_interior_components : 0;
+  const std::size_t trace_scalar = layout_ready
+      ? initialized.trace.size / igr_trace_components : 0;
+  const bool caller_u4_preserved = layout_ready &&
+      fields.initial.size() == 4 * interior_scalar &&
+      same_bytes(initialized.interior.data, fields.initial.data(),
+                 fields.initial.size());
+  const bool caller_uhat4_preserved = layout_ready &&
+      caller_trace.size() == 4 * trace_scalar &&
+      same_bytes(initialized.trace.data, caller_trace.data(),
+                 caller_trace.size());
+
+  // The three trailing volume components are sigma and the two entries of z;
+  // the trailing trace component is sigma-hat.  Each algebraic field must be
+  // finite and globally nontrivial after the t=0 closure solve.
+  bool local_auxiliary_finite = layout_ready;
+  std::array<double, 3> local_auxiliary_maximum{};
+  if (layout_ready)
+  {
+    for (std::size_t scalar = 0; scalar < interior_scalar; ++scalar)
+    {
+      const double sigma = initialized.interior.data[
+          4 * interior_scalar + scalar];
+      local_auxiliary_finite =
+          local_auxiliary_finite && std::isfinite(sigma);
+      if (std::isfinite(sigma))
+        local_auxiliary_maximum[0] =
+            std::max(local_auxiliary_maximum[0], std::abs(sigma));
+      for (int component = 5; component < igr_interior_components;
+           ++component)
+      {
+        const double z = initialized.interior.data[
+            static_cast<std::size_t>(component) * interior_scalar + scalar];
+        local_auxiliary_finite =
+            local_auxiliary_finite && std::isfinite(z);
+        if (std::isfinite(z))
+          local_auxiliary_maximum[1] =
+              std::max(local_auxiliary_maximum[1], std::abs(z));
+      }
+    }
+    for (std::size_t scalar = 0; scalar < trace_scalar; ++scalar)
+    {
+      const double sigma_hat =
+          initialized.trace.data[4 * trace_scalar + scalar];
+      local_auxiliary_finite =
+          local_auxiliary_finite && std::isfinite(sigma_hat);
+      if (std::isfinite(sigma_hat))
+        local_auxiliary_maximum[2] =
+            std::max(local_auxiliary_maximum[2], std::abs(sigma_hat));
+    }
+  }
+  std::array<double, 3> global_auxiliary_maximum{};
+  const bool auxiliary_reduced = MPI_Allreduce(
+      local_auxiliary_maximum.data(), global_auxiliary_maximum.data(),
+      static_cast<int>(global_auxiliary_maximum.size()), MPI_DOUBLE, MPI_MAX,
+      mesh.GetComm()) == MPI_SUCCESS;
+  const bool auxiliary_finite = All(local_auxiliary_finite, mesh.GetComm());
+  const bool auxiliary_nontrivial = auxiliary_reduced &&
+      std::all_of(global_auxiliary_maximum.begin(),
+                  global_auxiliary_maximum.end(),
+                  [](const double value)
+                  { return std::isfinite(value) && value > 0.0; });
+
+  std::vector<double> initialized_interior(
+      initialized.interior.data,
+      initialized.interior.data + initialized.interior.size);
+  std::vector<double> initialized_trace(
+      initialized.trace.data,
+      initialized.trace.data + initialized.trace.size);
+  double closure_residual = std::numeric_limits<double>::quiet_NaN();
+  double closure_tolerance = std::numeric_limits<double>::quiet_NaN();
+  const bool closure_audited =
+      dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+          AuditCommittedClosure(
+              core, closure_residual, closure_tolerance) &&
+      std::isfinite(closure_residual) && closure_residual >= 0.0 &&
+      std::isfinite(closure_tolerance) && closure_tolerance > 0.0 &&
+      closure_residual <= closure_tolerance;
+  const auto after_audit = core.Snapshot(coordinates);
+  const bool audit_preserved_state =
+      after_audit.interior.size == initialized_interior.size() &&
+      after_audit.trace.size == initialized_trace.size() &&
+      same_bytes(after_audit.interior.data, initialized_interior.data(),
+                 initialized_interior.size()) &&
+      same_bytes(after_audit.trace.data, initialized_trace.data(),
+                 initialized_trace.size());
+
+  const auto& initial_evidence = core.evidence();
+  const bool zero_initial_accounting = zero_coordinates(coordinates) &&
+      zero_coordinates(initialized.coordinates) &&
+      zero_coordinates(after_audit.coordinates) &&
+      initial_evidence.accepted_step_count == 0 &&
+      initial_evidence.attempts == 0 &&
+      initial_evidence.failed_attempts == 0 &&
+      initial_evidence.retries == 0 && initial_evidence.commits == 0 &&
+      !initial_evidence.accepted.valid &&
+      initial_evidence.last_attempt.status ==
+          dg::hdg::runtime::cpu::CpuAttemptStatus::ready &&
+      initial_evidence.last_attempt.candidate_cursor == 0 &&
+      initial_evidence.last_attempt.nonlinear_updates == 0 &&
+      initial_evidence.last_attempt.linear_iterations == 0 &&
+      initial_evidence.last_attempt.linear_solve_attempts == 0 &&
+      initial_evidence.last_attempt.scalar_closure_linear_iterations == 0 &&
+      initial_evidence.last_attempt.scalar_closure_linear_solve_attempts == 0 &&
+      zero_coordinates(initial_evidence.last_attempt.entry_coordinates) &&
+      zero_coordinates(initial_evidence.last_attempt.exit_coordinates) &&
+      zero_work(initial_evidence.last_attempt.work);
+
+  std::uint64_t generation = 0;
+  const bool prepared =
+      core.PrepareBorrowedEuler(1.0e-4, coordinates, generation) &&
+      generation != 0;
+  const auto committed_while_prepared = core.Snapshot(coordinates);
+  const auto candidate = core.CandidateSnapshot(coordinates);
+  const bool prepare_is_transactional = prepared &&
+      zero_coordinates(coordinates) &&
+      same_bytes(committed_while_prepared.interior.data,
+                 initialized_interior.data(), initialized_interior.size()) &&
+      same_bytes(committed_while_prepared.trace.data,
+                 initialized_trace.data(), initialized_trace.size()) &&
+      candidate.interior.size == initialized_interior.size() &&
+      candidate.trace.size == initialized_trace.size();
+  const bool aborted = prepared &&
+      core.AbortBorrowedEuler(generation, coordinates);
+  const auto after_abort = core.Snapshot(coordinates);
+  const auto candidate_after_abort = core.CandidateSnapshot(coordinates);
+  double rollback_closure_residual =
+      std::numeric_limits<double>::quiet_NaN();
+  double rollback_closure_tolerance =
+      std::numeric_limits<double>::quiet_NaN();
+  const bool rollback_closure_audited = aborted &&
+      dg::hdg::runtime::cpu::detail::CpuQualificationTestAccess::
+          AuditCommittedClosure(
+              core, rollback_closure_residual,
+              rollback_closure_tolerance) &&
+      std::isfinite(rollback_closure_residual) &&
+      std::isfinite(rollback_closure_tolerance) &&
+      rollback_closure_residual <= rollback_closure_tolerance;
+  const auto& abort_evidence = core.evidence();
+  const bool abort_is_transactional = aborted &&
+      zero_coordinates(coordinates) &&
+      zero_coordinates(after_abort.coordinates) &&
+      after_abort.interior.size == initialized_interior.size() &&
+      after_abort.trace.size == initialized_trace.size() &&
+      same_bytes(after_abort.interior.data, initialized_interior.data(),
+                 initialized_interior.size()) &&
+      same_bytes(after_abort.trace.data, initialized_trace.data(),
+                 initialized_trace.size()) &&
+      candidate_after_abort.interior.size == initialized_interior.size() &&
+      candidate_after_abort.trace.size == initialized_trace.size() &&
+      same_bytes(candidate_after_abort.interior.data,
+                 initialized_interior.data(), initialized_interior.size()) &&
+      same_bytes(candidate_after_abort.trace.data,
+                 initialized_trace.data(), initialized_trace.size()) &&
+      abort_evidence.attempts == 1 &&
+      abort_evidence.failed_attempts == 1 &&
+      abort_evidence.accepted_step_count == 0 &&
+      abort_evidence.commits == 0 && !abort_evidence.accepted.valid &&
+      !abort_evidence.last_attempt.committed &&
+      abort_evidence.last_attempt.rollback_byte_equal &&
+      abort_evidence.last_attempt.status ==
+          dg::hdg::runtime::cpu::CpuAttemptStatus::runtime_failure;
+
+  const bool passed = caller_u4_preserved && caller_uhat4_preserved &&
+      auxiliary_finite && auxiliary_nontrivial && closure_audited &&
+      audit_preserved_state && zero_initial_accounting &&
+      prepare_is_transactional && rollback_closure_audited &&
+      abort_is_transactional && reference_boundary.calls == 0 &&
+      boundary.calls == 0;
+  if (!passed)
+  {
+    int rank = 0;
+    MPI_Comm_rank(mesh.GetComm(), &rank);
+    std::cerr << "RODAS3 IGR initial scalar closure failed rank=" << rank
+              << " U4=" << caller_u4_preserved
+              << " Uhat4=" << caller_uhat4_preserved
+              << " auxiliary_finite=" << auxiliary_finite
+              << " auxiliary_nontrivial=" << auxiliary_nontrivial
+              << " auxiliary_maxima=" << global_auxiliary_maximum[0] << ','
+              << global_auxiliary_maximum[1] << ','
+              << global_auxiliary_maximum[2]
+              << " closure=" << closure_residual << '/'
+              << closure_tolerance
+              << " audit_state=" << audit_preserved_state
+              << " zero_accounting=" << zero_initial_accounting
+              << " prepared=" << prepared
+              << " prepare_transaction=" << prepare_is_transactional
+              << " aborted=" << aborted
+              << " rollback_closure=" << rollback_closure_residual << '/'
+              << rollback_closure_tolerance
+              << " abort_transaction=" << abort_is_transactional << '\n';
+  }
+  return passed;
 }
 
 bool CheckRodas3PreparedAssessmentAuthority()
@@ -3891,6 +4164,8 @@ int main(int argc, char* argv[])
   const bool natural_free_stream = CheckNaturalFreeStreamPreservation();
   const bool rodas3_free_stream = CheckRodas3CommonShiftFreeStream();
   const bool rodas3_nontrivial_dae = CheckRodas3NontrivialDaeLifecycle();
+  const bool rodas3_igr_initial_closure =
+      CheckRodas3IgrInitialScalarClosure();
   const bool rodas3_prepared_assessment =
       CheckRodas3PreparedAssessmentAuthority();
   const bool rodas3_fixed_time_order = CheckRodas3FixedTimeThirdOrder();
@@ -3946,6 +4221,7 @@ int main(int argc, char* argv[])
       default_numerical_policy &&
       periodic && natural_free_stream && conventional_conservation &&
       rodas3_free_stream && rodas3_nontrivial_dae &&
+      rodas3_igr_initial_closure &&
       rodas3_prepared_assessment &&
       rodas3_fixed_time_order && rodas3_physical_conservation &&
       rodas3_stage_equations &&
@@ -3973,6 +4249,8 @@ int main(int argc, char* argv[])
               << " orders=" << orders << " periodic=" << periodic
               << " rodas3_free_stream=" << rodas3_free_stream
               << " rodas3_nontrivial_dae=" << rodas3_nontrivial_dae
+              << " rodas3_igr_initial_closure="
+              << rodas3_igr_initial_closure
               << " rodas3_prepared_assessment="
               << rodas3_prepared_assessment
               << " rodas3_fixed_time_order=" << rodas3_fixed_time_order

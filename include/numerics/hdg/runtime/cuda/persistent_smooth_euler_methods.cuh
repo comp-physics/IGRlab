@@ -928,6 +928,12 @@ BindArenaViews() noexcept
     for (double*& stage : view_.rodas_stage_interior)
       stage = take_d(max_i);
     view_.rodas_combination_interior = take_d(max_i);
+    // The initial scalar bootstrap completes before any RODAS stage exists.
+    // Reuse its principal-combination vector for the frozen U4 snapshot so
+    // making the private t=0 IGR state coherent adds no persistent arena.
+    if (shape_.igr_active)
+      view_.partitioned_base_interior =
+          view_.rodas_combination_interior;
     view_.rodas_residual_f = take_d(max_i);
     for (double*& stage : view_.rodas_stage_true_trace)
       stage = take_d(max_tt);
@@ -2777,7 +2783,7 @@ LaunchAndObserveNativeRankOneTraceSolve(
           native_element_schwarz_warp_coupled_sigma_jacobi10_fp64;
   const bool projected_subspace =
       CudaNativeTraceActiveSubspaceIsProjected(active_subspace);
-  const bool projected_context = partitioned_backward_euler_ &&
+  const bool projected_context = RequiresInitialScalarClosure() &&
       cuda_engine_ == generic::CudaEngineKind::tensor_core &&
       ranks_ == 1 && shape_.igr_active &&
       shape_.trace_components == igr_trace_components &&
@@ -4719,9 +4725,9 @@ PartitionedAuxiliaryNorm(state_slot& workspace, double& norm) noexcept
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
-BootstrapPartitionedScalarClosure(const CudaConfig& config) noexcept
+BootstrapInitialScalarClosure(const CudaConfig& config) noexcept
 {
-  if (!partitioned_backward_euler_) return true;
+  if (!RequiresInitialScalarClosure()) return true;
   state_slot& workspace = workspace_slot_;
   const AttemptIdentity bootstrap_attempt{0, 0, 0, 0, config.dt};
   bool projected = false;
@@ -4731,7 +4737,7 @@ BootstrapPartitionedScalarClosure(const CudaConfig& config) noexcept
         element_schwarz_attempt_state_);
     if (!PrepareAttempt(bootstrap_attempt, workspace, true))
     {
-      ReportCudaSetupFailure(rank_, "partitioned-bootstrap-prepare");
+      ReportCudaSetupFailure(rank_, "initial-scalar-bootstrap-prepare");
       return false;
     }
     const bool partitioned_snapshot =
@@ -4750,7 +4756,7 @@ BootstrapPartitionedScalarClosure(const CudaConfig& config) noexcept
             CudaTransferSite::nonlinear_base_trace);
     if (!CollectiveContinue(partitioned_snapshot))
     {
-      ReportCudaSetupFailure(rank_, "partitioned-bootstrap-snapshot");
+      ReportCudaSetupFailure(rank_, "initial-scalar-bootstrap-snapshot");
       return false;
     }
 
@@ -4775,19 +4781,19 @@ BootstrapPartitionedScalarClosure(const CudaConfig& config) noexcept
     {
       ReportCudaSetupFailure(
           rank_, result.phase == CudaFailurePhase::assembly
-              ? "partitioned-bootstrap-closure-assembly"
+              ? "initial-scalar-bootstrap-closure-assembly"
               : result.phase == CudaFailurePhase::condensation
-                  ? "partitioned-bootstrap-closure-condensation"
+                  ? "initial-scalar-bootstrap-closure-condensation"
                   : result.phase == CudaFailurePhase::trace_solve
-                      ? "partitioned-bootstrap-closure-trace"
-                      : "partitioned-bootstrap-closure-recovery");
+                      ? "initial-scalar-bootstrap-closure-trace"
+                      : "initial-scalar-bootstrap-closure-recovery");
     }
     projected = projected && result.finite && result.recovery;
     if (projected)
       projected = CudaLaunchPartitionedBackwardEulerStateAudit(
                       view_, shape_, false) && StatusPassed();
     if (!projected && result.recovery)
-      ReportCudaSetupFailure(rank_, "partitioned-bootstrap-state-audit");
+      ReportCudaSetupFailure(rank_, "initial-scalar-bootstrap-state-audit");
   }
   if (!CollectiveContinue(projected)) return false;
 
@@ -4951,7 +4957,7 @@ SolvePartitionedScalarClosure(
   const bool solved = SolveTrueSystem(
       role,
       ResolveCudaNativeTraceActiveSubspace(
-          partitioned_backward_euler_, cuda_engine_, ranks_,
+          RequiresInitialScalarClosure(), cuda_engine_, ranks_,
           trace_solver_kind_, true),
       true_relative_residual, product_generation, iterations,
       solve_attempts, tightenings, result.tensor_core);

@@ -194,6 +194,26 @@ struct CudaPreparedPartitionedClosureAudit
   bool auxiliary_local_trace_finite = false;
 };
 
+struct CudaInitializedRodas3IgrClosureAudit
+{
+  double global_scalar_residual =
+      std::numeric_limits<double>::infinity();
+  double global_scalar_relative_residual =
+      std::numeric_limits<double>::infinity();
+  double relative_residual_tolerance = 0.0;
+  std::array<double, 3> global_auxiliary_norms{{
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity()}};
+  bool euler_interior_exact = false;
+  bool euler_true_trace_exact = false;
+  bool auxiliary_interior_finite_nontrivial = false;
+  bool auxiliary_true_trace_finite_nontrivial = false;
+  bool auxiliary_local_trace_finite_nontrivial = false;
+  bool lifecycle_zero = false;
+  bool combination_alias_exact = false;
+};
+
 struct CudaPreparedLocalCondensationCapture
 {
   int elements = 0;
@@ -400,6 +420,298 @@ struct CudaQualificationTestAccess
     observation.telemetry = numerical.telemetry;
     observation.success = numerical.success;
     return true;
+  }
+
+  template <typename Engine>
+  static bool AuditInitializedRodas3IgrClosure(
+      Engine& engine, const double* supplied_interior,
+      const std::size_t supplied_interior_count,
+      const double* supplied_true_trace,
+      const std::size_t supplied_true_trace_count,
+      CudaInitializedRodas3IgrClosureAudit& audit) noexcept
+  {
+    audit = {};
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    auto& committed = numerics.committed_slot_;
+    auto& candidate = numerics.candidate_slot_;
+    auto& workspace = numerics.workspace_slot_;
+    const std::size_t element_trace_count = shape.elements > 0 &&
+            shape.trace_dofs > 0 &&
+            static_cast<std::size_t>(shape.elements) <=
+                std::numeric_limits<std::size_t>::max() /
+                    static_cast<std::size_t>(shape.trace_dofs)
+        ? static_cast<std::size_t>(shape.elements) * shape.trace_dofs : 0;
+    const int true_scalar_count = shape.trace_components > 0
+        ? shape.true_trace_count / shape.trace_components : 0;
+    const std::size_t public_true_trace_count = true_scalar_count > 0
+        ? static_cast<std::size_t>(conserved_components) *
+              static_cast<std::size_t>(true_scalar_count)
+        : 0;
+    audit.relative_residual_tolerance =
+        numerics.true_residual_relative_tolerance_;
+
+    const auto& attempt = numerics.current_attempt_;
+    const StateCoordinates coordinates = engine.contract_
+        ? engine.contract_->coordinates() : StateCoordinates{};
+    audit.lifecycle_zero = engine.initialized_ && engine.contract_ &&
+        !engine.pending_.active && !engine.pending_.staging &&
+        !engine.pending_.prepared && !engine.pending_.provisional &&
+        engine.next_attempt_sequence_ == 0 && attempt.sequence == 0 &&
+        attempt.committed_step == 0 && attempt.committed_generation == 0 &&
+        attempt.retry_index == 0 && attempt.dt == 0.0 &&
+        numerics.current_generation_ == 0 && numerics.ticket_count_ == 0 &&
+        committed.interior.generation == 0 &&
+        committed.trace.generation == 0 &&
+        candidate.interior.generation == 0 && candidate.trace.generation == 0 &&
+        coordinates.time == 0.0 && coordinates.step == 0 &&
+        coordinates.generation == 0 && coordinates.cursor == 0 &&
+        coordinates.dt == 0.0;
+    audit.combination_alias_exact =
+        numerics.view_.partitioned_base_interior != nullptr &&
+        numerics.view_.partitioned_base_interior ==
+            numerics.view_.rodas_combination_interior;
+
+    bool local_valid = engine.initialized_ && engine.contract_ &&
+        numerics.initialized_ && numerics.rodas3_ && shape.igr_active &&
+        shape.borrowed_host_inputs &&
+        engine.config_.cuda_engine == generic::CudaEngineKind::tensor_core &&
+        shape.interior_components == igr_interior_components &&
+        shape.trace_components == igr_trace_components &&
+        shape.elements > 0 && shape.scalar_interior_dofs > 0 &&
+        shape.scalar_face_dofs > 0 && shape.interior_count > 0 &&
+        shape.true_trace_count > 0 && element_trace_count > 0 &&
+        true_scalar_count > 0 &&
+        shape.true_trace_count % shape.trace_components == 0 &&
+        supplied_interior != nullptr && supplied_true_trace != nullptr &&
+        supplied_interior_count ==
+            static_cast<std::size_t>(conserved_components) *
+                static_cast<std::size_t>(
+                    numerics.interior_space_->GetVSize() /
+                    shape.interior_components) &&
+        supplied_true_trace_count == public_true_trace_count &&
+        committed.interior.coefficients != nullptr &&
+        committed.trace.coefficients != nullptr &&
+        candidate.interior.coefficients != nullptr &&
+        candidate.trace.coefficients != nullptr &&
+        workspace.interior.coefficients == numerics.view_.work_interior &&
+        workspace.trace.coefficients == numerics.view_.work_true_trace &&
+        committed.interior.count == static_cast<std::size_t>(shape.interior_count) &&
+        committed.trace.count == static_cast<std::size_t>(shape.true_trace_count) &&
+        candidate.interior.count == committed.interior.count &&
+        candidate.trace.count == committed.trace.count &&
+        committed.interior.hash == candidate.interior.hash &&
+        committed.trace.hash == candidate.trace.hash &&
+        numerics.view_.old_interior != nullptr &&
+        numerics.view_.current_local_trace != nullptr &&
+        std::isfinite(engine.config_.dt) && engine.config_.dt > 0.0 &&
+        std::isfinite(audit.relative_residual_tolerance) &&
+        audit.relative_residual_tolerance > 0.0 && audit.lifecycle_zero &&
+        audit.combination_alias_exact;
+
+    std::array<std::vector<double>, 3> interiors;
+    std::array<std::vector<double>, 3> true_traces;
+    std::vector<double> local_trace;
+    try
+    {
+      for (auto& values : interiors)
+        values.resize(local_valid ? committed.interior.count : 0);
+      for (auto& values : true_traces)
+        values.resize(local_valid ? committed.trace.count : 0);
+      local_trace.resize(local_valid ? element_trace_count : 0);
+    }
+    catch (...) { local_valid = false; }
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    const bool staged = CudaTransportPolicy::DeviceToDevice(
+            workspace.interior.coefficients,
+            committed.interior.coefficients,
+            committed.interior.count * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToDevice(
+            numerics.view_.old_interior,
+            committed.interior.coefficients,
+            committed.interior.count * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToDevice(
+            workspace.trace.coefficients,
+            committed.trace.coefficients,
+            committed.trace.count * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        numerics.DistributeCurrentTrace(committed.trace.coefficients);
+    if (!numerics.CollectiveContinue(staged)) return false;
+
+    CudaTensorCoreEvidence scratch_tensor =
+        numerics.initialization_tensor_core_evidence_;
+    const bool assembled = numerics.AssemblePartitionedScalarClosure(
+        workspace, engine.config_.dt, audit.global_scalar_residual,
+        scratch_tensor);
+    if (!numerics.CollectiveContinue(
+            assembled && std::isfinite(audit.global_scalar_residual)))
+      return false;
+
+    const std::array<const double*, 3> interior_sources{{
+        committed.interior.coefficients, candidate.interior.coefficients,
+        numerics.view_.initial_current_interior}};
+    const std::array<const double*, 3> true_trace_sources{{
+        committed.trace.coefficients, candidate.trace.coefficients,
+        numerics.view_.initial_current_true_trace}};
+    bool copied = true;
+    for (std::size_t state = 0; copied && state < interiors.size(); ++state)
+      copied = CudaTransportPolicy::DeviceToHost(
+          interiors[state].data(), interior_sources[state],
+          interiors[state].size() * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export);
+    for (std::size_t state = 0; copied && state < true_traces.size(); ++state)
+      copied = CudaTransportPolicy::DeviceToHost(
+          true_traces[state].data(), true_trace_sources[state],
+          true_traces[state].size() * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export);
+    copied = copied && CudaTransportPolicy::DeviceToHost(
+        local_trace.data(), numerics.view_.current_local_trace,
+        local_trace.size() * sizeof(double),
+        CudaTransferCategory::generic_host_bridge,
+        CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    if (!numerics.CollectiveContinue(copied)) return false;
+
+    audit.euler_interior_exact = true;
+    for (int element = 0;
+         element < shape.elements && audit.euler_interior_exact; ++element)
+      for (int component = 0;
+           component < conserved_components && audit.euler_interior_exact;
+           ++component)
+        for (int scalar = 0; scalar < shape.scalar_interior_dofs; ++scalar)
+        {
+          const int local = component * shape.scalar_interior_dofs + scalar;
+          double sign = 1.0;
+          const int dof = CudaDecodeSigned(
+              numerics.signed_element_interior_[
+                  static_cast<std::size_t>(element) * shape.interior_dofs +
+                  local],
+              sign);
+          if (dof < 0 || static_cast<std::size_t>(dof) >=
+                  supplied_interior_count)
+          {
+            audit.euler_interior_exact = false;
+            break;
+          }
+          const double expected = sign * supplied_interior[dof];
+          const std::size_t index = static_cast<std::size_t>(element) *
+              shape.interior_dofs + local;
+          for (const auto& values : interiors)
+            if (std::memcmp(&values[index], &expected, sizeof(double)) != 0)
+            {
+              audit.euler_interior_exact = false;
+              break;
+            }
+          if (!audit.euler_interior_exact) break;
+        }
+
+    audit.euler_true_trace_exact = true;
+    for (std::size_t index = 0;
+         index < supplied_true_trace_count && audit.euler_true_trace_exact;
+         ++index)
+      for (const auto& values : true_traces)
+        if (std::memcmp(
+                &values[index], &supplied_true_trace[index],
+                sizeof(double)) != 0)
+        {
+          audit.euler_true_trace_exact = false;
+          break;
+        }
+
+    std::array<double, 3> local_auxiliary_squared{};
+    bool auxiliary_interior_finite = true;
+    for (int element = 0;
+         element < shape.elements && auxiliary_interior_finite; ++element)
+      for (int component = conserved_components;
+           component < shape.interior_components; ++component)
+        for (int scalar = 0; scalar < shape.scalar_interior_dofs; ++scalar)
+        {
+          const std::size_t index = static_cast<std::size_t>(element) *
+              shape.interior_dofs +
+              component * shape.scalar_interior_dofs + scalar;
+          const double value = interiors[0][index];
+          auxiliary_interior_finite = std::isfinite(value);
+          if (!auxiliary_interior_finite) break;
+          local_auxiliary_squared[0] += value * value;
+        }
+
+    bool auxiliary_true_trace_finite = true;
+    for (int component = conserved_components;
+         component < shape.trace_components &&
+             auxiliary_true_trace_finite;
+         ++component)
+      for (int scalar = 0; scalar < true_scalar_count; ++scalar)
+      {
+        const double value = true_traces[0][
+            static_cast<std::size_t>(component) * true_scalar_count + scalar];
+        auxiliary_true_trace_finite = std::isfinite(value);
+        if (!auxiliary_true_trace_finite) break;
+        local_auxiliary_squared[1] += value * value;
+      }
+
+    const int face_stride =
+        shape.trace_components * shape.scalar_face_dofs;
+    bool auxiliary_local_trace_finite = true;
+    for (int element = 0;
+         element < shape.elements && auxiliary_local_trace_finite; ++element)
+      for (int local = 0; local < shape.trace_dofs; ++local)
+        if ((local % face_stride) / shape.scalar_face_dofs >=
+            conserved_components)
+        {
+          const double value = local_trace[
+              static_cast<std::size_t>(element) * shape.trace_dofs + local];
+          auxiliary_local_trace_finite = std::isfinite(value);
+          if (!auxiliary_local_trace_finite) break;
+          local_auxiliary_squared[2] += value * value;
+        }
+
+    std::array<double, 3> global_auxiliary_squared{};
+    const bool reduced = MPI_Allreduce(
+        local_auxiliary_squared.data(), global_auxiliary_squared.data(),
+        static_cast<int>(global_auxiliary_squared.size()), MPI_DOUBLE,
+        MPI_SUM, numerics.communicator_) == MPI_SUCCESS;
+    for (std::size_t category = 0;
+         reduced && category < global_auxiliary_squared.size(); ++category)
+      audit.global_auxiliary_norms[category] =
+          global_auxiliary_squared[category] >= 0.0
+          ? std::sqrt(global_auxiliary_squared[category])
+          : std::numeric_limits<double>::infinity();
+    audit.auxiliary_interior_finite_nontrivial = reduced &&
+        auxiliary_interior_finite &&
+        std::isfinite(audit.global_auxiliary_norms[0]) &&
+        audit.global_auxiliary_norms[0] > 0.0;
+    audit.auxiliary_true_trace_finite_nontrivial = reduced &&
+        auxiliary_true_trace_finite &&
+        std::isfinite(audit.global_auxiliary_norms[1]) &&
+        audit.global_auxiliary_norms[1] > 0.0;
+    audit.auxiliary_local_trace_finite_nontrivial = reduced &&
+        auxiliary_local_trace_finite &&
+        std::isfinite(audit.global_auxiliary_norms[2]) &&
+        audit.global_auxiliary_norms[2] > 0.0;
+    const double auxiliary_state_norm = std::hypot(
+        audit.global_auxiliary_norms[0],
+        audit.global_auxiliary_norms[1]);
+    audit.global_scalar_relative_residual =
+        audit.global_scalar_residual / std::max(auxiliary_state_norm, 1.0);
+    const bool residual_exact =
+        std::isfinite(audit.global_scalar_relative_residual) &&
+        audit.global_scalar_relative_residual <=
+            audit.relative_residual_tolerance;
+    return numerics.CollectiveContinue(audit.euler_interior_exact &&
+        audit.euler_true_trace_exact &&
+        audit.auxiliary_interior_finite_nontrivial &&
+        audit.auxiliary_true_trace_finite_nontrivial &&
+        audit.auxiliary_local_trace_finite_nontrivial && residual_exact &&
+        audit.lifecycle_zero && audit.combination_alias_exact);
   }
 
 
@@ -2668,6 +2980,8 @@ using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedIgrConservationCapture;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedPartitionedClosureAudit;
+using dg::hdg::runtime::cuda_w8a::detail::
+    CudaInitializedRodas3IgrClosureAudit;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedLocalCondensationCapture;
 using dg::hdg::runtime::cuda_w8a::detail::
@@ -6357,6 +6671,7 @@ struct Rodas3ScreenRecord
   CudaStepEvidence rollback{};
   CudaRodas3ScreenObservation observation{};
   CudaRodas3ScreenObservation retry_observation{};
+  CudaInitializedRodas3IgrClosureAudit initial_closure_audit{};
   dg::hdg::generic::HdgEulerPreparedAssessment assessment{};
   dg::hdg::generic::HdgEulerPreparedAssessment retry_assessment{};
   bool state_changed = false;
@@ -6367,6 +6682,8 @@ struct Rodas3ScreenRecord
   bool rollback_passed = false;
   bool retry_passed = false;
   bool exact_jacobian_passed = false;
+  bool initial_closure_audited = false;
+  bool initial_closure_passed = true;
   std::array<double, 6> exact_jacobian_relative_errors{};
   bool passed = false;
 };
@@ -6417,10 +6734,13 @@ bool RunRodas3RankOneStep(
   std::unique_ptr<Engine> engine;
   if (engine_kind == CudaEngineKind::tensor_core)
   {
+    const CudaTracePolicyKind requested_policy =
+        dg::hdg::runtime::cuda_w8a::DefaultCudaTracePolicyRequest(
+            engine_kind, regularization == RegularizationKind::igr, 1,
+            EulerHdgTimeTreatment::rodas3);
     engine = CudaQualificationTestAccess::CreateWithTracePolicy<
         dg::hdg::runtime::Rodas3CudaRank1RuntimeSelection>(
-            config,
-            CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64);
+            config, requested_policy);
   }
   else if (engine_kind == CudaEngineKind::ordinary)
   {
@@ -6434,6 +6754,17 @@ bool RunRodas3RankOneStep(
       setup_end - setup_begin).count();
   if (!All(initialized, request.communicator))
     return false;
+
+  const bool initial_closure_audit_required =
+      engine_kind == CudaEngineKind::tensor_core &&
+      regularization == RegularizationKind::igr && !physical;
+  record.initial_closure_audited = initial_closure_audit_required;
+  record.initial_closure_passed = !initial_closure_audit_required ||
+      CudaQualificationTestAccess::AuditInitializedRodas3IgrClosure(
+          *engine, fields.initial.data(), fields.initial.size(),
+          fields.initial_true_trace.data(), fields.initial_true_trace.size(),
+          record.initial_closure_audit);
+  if (!All(record.initial_closure_passed, request.communicator)) return false;
 
   constexpr double exact_jacobian_tolerance = 2.5e-4;
   record.exact_jacobian_passed = !physical ||
@@ -6521,6 +6852,7 @@ bool RunRodas3RankOneStep(
       evidence.after.time == evidence.before.time + dt;
   record.passed = record.architecture_passed && record.numerical_passed &&
       record.lifecycle_passed && record.exact_jacobian_passed &&
+      record.initial_closure_passed &&
       record.state_changed && std::isfinite(record.setup_seconds) &&
       record.setup_seconds >= 0.0 && std::isfinite(record.step_seconds) &&
       record.step_seconds > 0.0;
@@ -6916,10 +7248,13 @@ bool CheckRodas3EntryProjectionGate()
     config.cuda_engine = CudaEngineKind::tensor_core;
     using Engine = PersistentCudaSmoothEulerEngine<
         dg::hdg::runtime::Rodas3CudaRank1RuntimeSelection>;
+    const CudaTracePolicyKind requested_policy =
+        dg::hdg::runtime::cuda_w8a::DefaultCudaTracePolicyRequest(
+            CudaEngineKind::tensor_core, true, 1,
+            EulerHdgTimeTreatment::rodas3);
     auto engine = CudaQualificationTestAccess::CreateWithTracePolicy<
         dg::hdg::runtime::Rodas3CudaRank1RuntimeSelection>(
-            config,
-            CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64);
+            config, requested_policy);
     CudaRunEvidence initialization{};
     if (!engine || !engine->Initialize(initialization)) return false;
 
@@ -7031,7 +7366,31 @@ bool CheckRodas3RankOneScreen(const int rank)
                 << " lifecycle_passed=" << value.lifecycle_passed
                 << " exact_jacobian_passed="
                 << value.exact_jacobian_passed
-                << " exact_jacobian_errors=";
+                << " initial_closure_audited="
+                << value.initial_closure_audited
+                << " initial_closure_passed="
+                << value.initial_closure_passed;
+      if (value.initial_closure_audited)
+      {
+        std::cout << " initial_u4_exact="
+                  << value.initial_closure_audit.euler_interior_exact
+                  << " initial_uhat4_exact="
+                  << value.initial_closure_audit.euler_true_trace_exact
+                  << " initial_auxiliary_norms=";
+        for (const double norm :
+             value.initial_closure_audit.global_auxiliary_norms)
+          std::cout << norm << ',';
+        std::cout << " initial_scalar_residual="
+                  << value.initial_closure_audit.global_scalar_residual
+                  << " initial_scalar_relative_residual="
+                  << value.initial_closure_audit.
+                      global_scalar_relative_residual
+                  << " initial_lifecycle_zero="
+                  << value.initial_closure_audit.lifecycle_zero
+                  << " initial_combination_alias="
+                  << value.initial_closure_audit.combination_alias_exact;
+      }
+      std::cout << " exact_jacobian_errors=";
       for (const double error : value.exact_jacobian_relative_errors)
         std::cout << error << ',';
       std::cout

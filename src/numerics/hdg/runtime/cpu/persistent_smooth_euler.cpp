@@ -2226,6 +2226,11 @@ struct detail::CpuNumericsCore::Implementation
     return IsPartitionedBackwardEuler() && IsIgr();
   }
 
+  bool RequiresInitialScalarClosure() const noexcept
+  {
+    return IsIgr() && (IsPartitionedBackwardEuler() || IsRodas3());
+  }
+
   bool CommittedScalarClosureCertified() const noexcept
   {
     const CpuSlotStorage* const committed = Committed();
@@ -4851,7 +4856,7 @@ struct detail::CpuNumericsCore::Implementation
 
   bool MaskScalarConstraint(LocalSystem& system) const noexcept
   {
-    if (!RequiresPartitionedScalarClosure() ||
+    if (!RequiresInitialScalarClosure() ||
         system.elements != mesh->GetNE() ||
         system.interior_dofs != local_interior ||
         system.trace_dofs != local_trace)
@@ -5099,7 +5104,7 @@ struct detail::CpuNumericsCore::Implementation
   {
     euler = {};
     auxiliary = {};
-    if (!RequiresPartitionedScalarClosure() || !iterate_interior ||
+    if (!RequiresInitialScalarClosure() || !iterate_interior ||
         interior_components != igr_interior_components ||
         trace_components != igr_trace_components ||
         iterate_interior->Size() % interior_components != 0 ||
@@ -5151,7 +5156,7 @@ struct detail::CpuNumericsCore::Implementation
   bool PartitionedAuxiliaryNorm(double& norm) noexcept
   {
     norm = std::numeric_limits<double>::quiet_NaN();
-    bool local_ready = RequiresPartitionedScalarClosure() &&
+    bool local_ready = RequiresInitialScalarClosure() &&
         iterate_interior &&
         interior_components == igr_interior_components &&
         trace_components == igr_trace_components &&
@@ -6894,7 +6899,7 @@ struct detail::CpuNumericsCore::Implementation
 
   bool ApplyScalarConstraintIncrement() noexcept
   {
-    bool local_ready = RequiresPartitionedScalarClosure();
+    bool local_ready = RequiresInitialScalarClosure();
     try
     {
       double* interior = iterate_interior->HostReadWrite();
@@ -7438,7 +7443,7 @@ struct detail::CpuNumericsCore::Implementation
   {
     closure_residual = 0.0;
     closure_tolerance = 0.0;
-    if (!RequiresPartitionedScalarClosure()) { return true; }
+    if (!RequiresInitialScalarClosure()) { return true; }
     const CpuSlotStorage* const storage = Storage(slot);
     bool local_ready = storage != nullptr && iterate_interior && iterate_trace &&
         storage->interior.size() ==
@@ -7521,7 +7526,7 @@ struct detail::CpuNumericsCore::Implementation
 
   bool EstablishInitialScalarClosure() noexcept
   {
-    if (!RequiresPartitionedScalarClosure()) { return true; }
+    if (!RequiresInitialScalarClosure()) { return true; }
     const CpuSlotStorage* const committed = Committed();
     bool local_ready = committed != nullptr && iterate_interior &&
         old_interior && iterate_trace &&
@@ -10442,9 +10447,10 @@ bool detail::CpuNumericsCore::InitializeInternal(
       CopySlot(state.committed_slot, state.candidate_slot);
   if (!state.CollectiveAll(local_ok)) { return false; }
 
-  // Partitioned IGR owns an algebraic state at t=0.  Establish that closure
-  // before the lifecycle becomes observable; this changes no coordinates and
-  // deliberately contributes no attempt or accepted-step accounting.
+  // Partitioned and RODAS3 IGR own an algebraic state at t=0. Establish that
+  // closure before the lifecycle becomes observable; this changes no
+  // coordinates and deliberately contributes no attempt or accepted-step
+  // accounting.
   if (!state.EstablishInitialScalarClosure()) { return false; }
 
   // Prove the exact storage semantics required by the accepted two-phase
@@ -11147,7 +11153,7 @@ detail::CpuNumericalResult detail::CpuNumericsCore::Execute(
       *state.old_interior, state.Committed()->interior);
   bool iterate_assigned = false;
   bool trace_assigned = false;
-  if (coordinates.step == 0 && !state.RequiresPartitionedScalarClosure())
+  if (coordinates.step == 0 && !state.RequiresInitialScalarClosure())
   {
     iterate_assigned = AssignGridFunction(
         *state.iterate_interior, state.first_iterate_interior);
