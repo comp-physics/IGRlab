@@ -4293,8 +4293,13 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
     if (stage == 0)
     {
       std::uint64_t mma_tiles = 0;
-      const bool condensed = CudaLaunchCondensation(
-          view_, shape_, cuda_engine_, mma_tiles) && StatusPassed();
+      bool condensed = false;
+      {
+        ::dg_igr::NVTXRange profile_region(
+            ::dg_igr::observability::RegionId::hdg_condensation);
+        condensed = CudaLaunchCondensation(
+            view_, shape_, cuda_engine_, mma_tiles) && StatusPassed();
+      }
       if (!CollectiveContinue(condensed) ||
           result.tensor_core.condensation_launches ==
               std::numeric_limits<std::uint64_t>::max() ||

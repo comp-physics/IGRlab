@@ -620,6 +620,12 @@ else:
     time_rtol = float(arguments[arguments.index("--time-rtol") + 1]) \
         if rodas3 else 0.0
     trace_solve_count = 6 if rodas3 else 2
+    nonlinear_updates = 2 if rodas3 else 1
+    patch_setup_count = (
+        nonlinear_updates + 1 if rodas3 else trace_solve_count
+    )
+    if os.environ.get("FAKE_APP_BAD_RODAS_PATCH_SETUPS"):
+        patch_setup_count += 1
     p1_igr = bool(os.environ.get("FAKE_APP_P1_IGR"))
     order = 1 if p1_igr else 3
     interior_unknowns = 75712 if p1_igr else 302848
@@ -672,7 +678,7 @@ else:
         "trace_robust_coupled_specialization_supported":
             not bool(os.environ.get("FAKE_APP_BAD_ROBUST_SUPPORT")),
         "trace_robust_branch_accounting_complete": True,
-        "trace_robust_lower_patch_setups": trace_solve_count,
+        "trace_robust_lower_patch_setups": patch_setup_count,
         "trace_robust_lower_trace_solve_calls": trace_solve_count,
         "trace_robust_coupled_patch_setups": 0,
         "trace_robust_coupled_trace_solve_calls": 0,
@@ -718,7 +724,7 @@ else:
         "samples": [{
             "phase": "measured",
             "measured_index": 2,
-            "nonlinear_updates": 2 if rodas3 else 1,
+            "nonlinear_updates": nonlinear_updates,
             "trace_solves": trace_solve_count,
             "linear_solve_attempts": trace_solve_count,
             "temporal_error_norm": 1e-7 if rodas3 else 0.0,
@@ -770,7 +776,7 @@ else:
                 "robust_lower_specialization_supported": True,
                 "robust_coupled_specialization_supported": True,
                 "robust_branch_accounting_complete": True,
-                "robust_lower_patch_setups": trace_solve_count,
+                "robust_lower_patch_setups": patch_setup_count,
                 "robust_lower_trace_solve_calls": trace_solve_count,
                 "robust_coupled_patch_setups": 0,
                 "robust_coupled_trace_solve_calls": (
@@ -1165,6 +1171,8 @@ else:
         assert rodas3_work["common_shift_trace_solves"] == 4
         assert rodas3_work["common_shift_preconditioner_setups"] == 1
         assert rodas3_work["common_shift_preconditioner_reuses"] == 3
+        assert rodas3_work["robust_lower_patch_setups"] == 3
+        assert rodas3_work["robust_lower_trace_solve_calls"] == 6
         assert rodas3_work["complete_assemblies"] == 3
         assert rodas3_work["complete_condensations"] == 3
         assert rodas3_work["complete_recoveries"] == 4
@@ -1173,6 +1181,23 @@ else:
         ]
         assert "nonlinear_update" not in \
             rodas3_attribution["required_categories"]
+
+        bad_rodas_patch_out = root / \
+            "qualification-bad-rodas-patch-setups"
+        run(
+            *qualification_arguments(
+                bad_rodas_patch_out, "accepted-step-attribution",
+                time_integrator="rodas3",
+            ),
+            expected=6,
+            env={
+                **qualification_env,
+                "FAKE_NCU_ATTRIBUTION": "1",
+                "FAKE_APP_BAD_RODAS_PATCH_SETUPS": "1",
+            },
+        )
+        assert "robust lower patch setups differ from profiled setup census" \
+            in read_manifest(bad_rodas_patch_out)["detail"]
 
         missing_integrator = qualification_arguments(
             root / "qualification-missing-time-integrator"

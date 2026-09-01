@@ -1561,8 +1561,8 @@ ROBUST_BRANCH_COUNTER_FIELDS = (
 
 def _validated_robust_branch_work(
         evidence: dict[str, Any], *, field_prefix: str,
-        expected_robust: bool, expected_trace_solves: int | None = None,
-        expected_linear_solve_attempts: int | None = None) -> dict[str, int]:
+        expected_robust: bool, expected_patch_setups: int | None = None,
+        expected_trace_solve_calls: int | None = None) -> dict[str, int]:
     """Validate the fixed four aggregate robust-branch counters."""
     def field(name: str) -> str:
         return field_prefix + name
@@ -1593,18 +1593,18 @@ def _validated_robust_branch_work(
         raise RuntimeError(
             "production profile did not remain on the robust lower branch"
         )
-    if expected_trace_solves is None:
+    if expected_patch_setups is None:
         if counters["robust_lower_patch_setups"] <= 0:
             raise RuntimeError("robust profile reported no lower patch setup")
-    elif counters["robust_lower_patch_setups"] != expected_trace_solves:
+    elif counters["robust_lower_patch_setups"] != expected_patch_setups:
         raise RuntimeError(
-            "robust lower patch setups differ from profiled trace solves"
+            "robust lower patch setups differ from profiled setup census"
         )
-    if expected_linear_solve_attempts is None:
+    if expected_trace_solve_calls is None:
         if counters["robust_lower_trace_solve_calls"] <= 0:
             raise RuntimeError("robust profile reported no lower trace solve")
     elif counters["robust_lower_trace_solve_calls"] != \
-            expected_linear_solve_attempts:
+            expected_trace_solve_calls:
         raise RuntimeError(
             "robust lower calls differ from profiled linear solve attempts"
         )
@@ -2079,8 +2079,13 @@ def profiled_tensor_work(args: argparse.Namespace) -> dict[str, Any]:
         tensor,
         field_prefix="",
         expected_robust=expected_robust,
-        expected_trace_solves=expected_trace_solves,
-        expected_linear_solve_attempts=expected_linear_solve_attempts,
+        expected_patch_setups=(
+            time_integrator_work["nonlinear_updates"] +
+            time_integrator_work["common_shift_preconditioner_setups"]
+            if expected_time_integrator_cli == "rodas3"
+            else expected_trace_solves
+        ),
+        expected_trace_solve_calls=expected_linear_solve_attempts,
     )
     native_trace_solve_calls = exact_uint64(
         tensor.get("native_rank1_trace_solve_calls"),
