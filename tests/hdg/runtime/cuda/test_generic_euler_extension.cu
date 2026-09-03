@@ -1,4 +1,5 @@
 #include "numerics/hdg/generic/contract.hpp"
+#include "numerics/hdg/euler/zhang_shu_u4.hpp"
 #include "numerics/hdg/runtime/cuda/generic_euler.cuh"
 #include "numerics/hdg/runtime/cuda/tensor_volume_layout.hpp"
 #include "test_cuda_trace_solver_routing.hpp"
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -193,6 +195,26 @@ struct CudaPreparedPartitionedClosureAudit
   bool auxiliary_local_trace_finite = false;
 };
 
+struct CudaInitializedRodas3IgrClosureAudit
+{
+  double global_scalar_residual =
+      std::numeric_limits<double>::infinity();
+  double global_scalar_relative_residual =
+      std::numeric_limits<double>::infinity();
+  double relative_residual_tolerance = 0.0;
+  std::array<double, 3> global_auxiliary_norms{{
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity()}};
+  bool euler_interior_exact = false;
+  bool euler_true_trace_exact = false;
+  bool auxiliary_interior_finite_nontrivial = false;
+  bool auxiliary_true_trace_finite_nontrivial = false;
+  bool auxiliary_local_trace_finite_nontrivial = false;
+  bool lifecycle_zero = false;
+  bool combination_alias_exact = false;
+};
+
 struct CudaPreparedLocalCondensationCapture
 {
   int elements = 0;
@@ -316,11 +338,612 @@ bool SolveRecoveryReference(std::vector<double>& matrix,
   return true;
 }
 
+struct CudaRodas3ScreenObservation
+{
+  double maximum_conservation_error =
+      std::numeric_limits<double>::infinity();
+  double maximum_conservation_relative_error =
+      std::numeric_limits<double>::infinity();
+  bool candidate_ready = false;
+  bool finite = false;
+  bool admissible = false;
+  bool recovery = false;
+  bool true_residual = false;
+  bool conservation = false;
+  bool telemetry = false;
+  bool success = false;
+};
+
+struct CudaRodas3LimiterEndpointAudit
+{
+  double maximum_candidate_formula_scaled_error =
+      std::numeric_limits<double>::infinity();
+  bool candidate_formula_nontrivial = false;
+  bool candidate_formula_passed = false;
+};
+
+struct CudaDirectZhangShuAudit
+{
+  std::vector<double> limited_u4{};
+  std::vector<double> theta_rho{};
+  std::vector<double> theta_p{};
+  int classification = 2;
+  double correction_squared = std::numeric_limits<double>::infinity();
+};
+
+
 // This accessor is defined only in the qualification translation unit.  The
 // production engine and generic facade grant it private friendship; its
 // detail-only launch helpers publish no runtime diagnostic API or state.
 struct CudaQualificationTestAccess
 {
+  template <typename Engine>
+  static bool ApplyDirectZhangShu(
+      Engine& engine, const std::vector<double>& input,
+      CudaDirectZhangShuAudit& audit) noexcept
+  {
+    audit = {};
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    const int slot = numerics.candidate_limiter_diagnostics_;
+    bool local_valid = engine.initialized_ && !engine.pending_.active &&
+        numerics.initialized_ && numerics.positivity_limiter_enabled_ &&
+        shape.borrowed_host_inputs && !shape.igr_active &&
+        shape.interior_components == conserved_components &&
+        shape.elements > 0 && shape.interior_count > 0 &&
+        input.size() == static_cast<std::size_t>(shape.interior_count) &&
+        slot >= 0 && slot < 2 && numerics.view_.work_interior != nullptr &&
+        numerics.view_.status_flag != nullptr &&
+        numerics.view_.scalar != nullptr;
+    try
+    {
+      audit.limited_u4.resize(input.size(), 0.0);
+      audit.theta_rho.resize(static_cast<std::size_t>(shape.elements), 0.0);
+      audit.theta_p.resize(static_cast<std::size_t>(shape.elements), 0.0);
+    }
+    catch (...)
+    {
+      local_valid = false;
+    }
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    const auto& policy = engine.config_.numerical_policy.positivity_limiter;
+    const bool launched = CudaLaunchInitializeZhangShuDiagnostics(
+            numerics.view_, shape) &&
+        CudaTransportPolicy::HostToDevice(
+            numerics.view_.work_interior, input.data(),
+            input.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaLaunchZhangShuU4(
+            numerics.view_, shape, policy, slot,
+            numerics.view_.status_flag, numerics.view_.scalar);
+    if (!numerics.CollectiveContinue(launched)) return false;
+
+    const bool copied = CudaTransportPolicy::DeviceToHost(
+            &audit.classification, numerics.view_.status_flag,
+            sizeof(audit.classification),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            &audit.correction_squared, numerics.view_.scalar,
+            sizeof(audit.correction_squared),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            audit.limited_u4.data(), numerics.view_.work_interior,
+            audit.limited_u4.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            audit.theta_rho.data(), numerics.view_.positivity_theta_rho[slot],
+            audit.theta_rho.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            audit.theta_p.data(), numerics.view_.positivity_theta_p[slot],
+            audit.theta_p.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    local_valid = copied && audit.classification >= 0 &&
+        audit.classification <= 3 &&
+        std::isfinite(audit.correction_squared) &&
+        audit.correction_squared >= 0.0;
+    return numerics.CollectiveContinue(local_valid);
+  }
+
+  static bool CorruptFacadePreparedAssessmentPolicy(
+      cuda::GenericEulerHdgCudaSession& session) noexcept
+  {
+    if (!session.assessment_authority_) return false;
+    session.assessed_policy_bits_[0] ^= 1U;
+    return true;
+  }
+
+  static bool FacadePreparedAssessmentInactive(
+      const cuda::GenericEulerHdgCudaSession& session) noexcept
+  {
+    return !session.assessment_authority_ && session.assessed_epoch_ == 0 &&
+        session.assessed_facade_incarnation_ == 0 &&
+        session.assessed_native_export_ == nullptr &&
+        session.assessed_policy_bits_ == std::array<std::uint64_t, 3>{};
+  }
+
+  template <typename Selection>
+  static std::unique_ptr<PersistentCudaSmoothEulerEngine<Selection>>
+  CreateWithTracePolicy(
+      const CudaConfig& config,
+      const CudaTracePolicyKind requested_policy) noexcept
+  {
+    using Engine = PersistentCudaSmoothEulerEngine<Selection>;
+    const bool igr = config.use_generic_numerical_policy &&
+        config.numerical_policy.stabilization.kind ==
+            generic::RegularizationKind::igr;
+    const CudaTracePolicyDescriptor policy = ResolveCudaTracePolicy(
+        config.cuda_engine, igr, config.expected_rank_count, config.order,
+        requested_policy);
+    if (!CudaTracePolicyDescriptorIsExact(policy)) return {};
+    try
+    {
+      return std::unique_ptr<Engine>(new Engine(config, policy));
+    }
+    catch (...) { return {}; }
+  }
+
+  template <typename Engine>
+  static bool CapturePreparedRodas3(
+      Engine& engine, CudaRodas3ScreenObservation& observation) noexcept
+  {
+    observation = {};
+    if (!engine.initialized_ || !engine.pending_.active ||
+        !engine.pending_.staging ||
+        engine.config_.time_treatment != generic::EulerHdgTimeTreatment::rodas3)
+      return false;
+    const auto& numerical = engine.pending_.numerical;
+    observation.maximum_conservation_error =
+        numerical.maximum_conservation_error;
+    observation.maximum_conservation_relative_error =
+        numerical.maximum_conservation_relative_error;
+    observation.candidate_ready = numerical.candidate_ready;
+    observation.finite = numerical.finite;
+    observation.admissible = numerical.admissible;
+    observation.recovery = numerical.recovery;
+    observation.true_residual = numerical.true_residual;
+    observation.conservation = numerical.conservation;
+    observation.telemetry = numerical.telemetry;
+    observation.success = numerical.success;
+    return true;
+  }
+
+  template <typename Engine>
+  static bool VerifyLimiterDiagnosticAcceptedHistorySeed(
+      Engine& engine, const std::vector<double>& expected_theta_rho,
+      const std::vector<double>& expected_theta_p) noexcept
+  {
+    auto& numerics = engine.numerics_;
+    const std::size_t elements =
+        static_cast<std::size_t>(numerics.shape_.elements);
+    bool local_valid = engine.initialized_ && !engine.pending_.active &&
+        numerics.initialized_ && numerics.positivity_limiter_enabled_ &&
+        elements > 0 && expected_theta_rho.size() == elements &&
+        expected_theta_p.size() == elements &&
+        numerics.committed_limiter_diagnostics_ >= 0 &&
+        numerics.committed_limiter_diagnostics_ < 2 &&
+        numerics.candidate_limiter_diagnostics_ >= 0 &&
+        numerics.candidate_limiter_diagnostics_ < 2;
+    std::vector<double> reset, observed;
+    try
+    {
+      reset.assign(2 * elements, 1.0);
+      observed.resize(2 * elements, 0.0);
+    }
+    catch (...) { local_valid = false; }
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    double* const candidate = numerics.view_.positivity_theta_rho[
+        numerics.candidate_limiter_diagnostics_];
+    const bool reset_copied = CudaTransportPolicy::HostToDevice(
+        candidate, reset.data(), reset.size() * sizeof(double),
+        CudaTransferCategory::generic_host_bridge,
+        CudaTransferSite::generic_host_export);
+    if (!numerics.CollectiveContinue(reset_copied)) return false;
+    if (!numerics.SeedCandidateLimiterDiagnostics()) return false;
+    const bool observed_copied = CudaTransportPolicy::DeviceToHost(
+            observed.data(), candidate, observed.size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    local_valid = observed_copied;
+    for (std::size_t element = 0;
+         element < elements && local_valid; ++element)
+      local_valid = observed[element] == expected_theta_rho[element] &&
+          observed[elements + element] == expected_theta_p[element];
+    return numerics.CollectiveContinue(local_valid);
+  }
+
+  template <typename Engine>
+  static bool AuditPreparedRodas3LimiterEndpoint(
+      Engine& engine, CudaRodas3LimiterEndpointAudit& audit) noexcept
+  {
+    audit = {};
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    bool local_valid = engine.initialized_ && engine.pending_.active &&
+        engine.pending_.staging && numerics.initialized_ && numerics.rodas3_ &&
+        engine.config_.numerical_policy.positivity_limiter.kind ==
+            generic::EulerHdgPositivityLimiterKind::zhang_shu &&
+        shape.borrowed_host_inputs && shape.elements > 0 &&
+        shape.scalar_interior_dofs > 0 &&
+        shape.interior_components >= conserved_components &&
+        shape.interior_count > 0 && shape.true_trace_count > 0 &&
+        numerics.view_.work_interior != nullptr &&
+        numerics.view_.output_interior != nullptr &&
+        numerics.view_.recovered_interior != nullptr;
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    std::array<std::vector<double>, 3> states;
+    try
+    {
+      for (auto& state : states)
+        state.resize(static_cast<std::size_t>(shape.interior_count));
+    }
+    catch (...) { local_valid = false; }
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    const bool copied = CudaTransportPolicy::DeviceToHost(
+            states[0].data(), numerics.view_.work_interior,
+            states[0].size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            states[1].data(), numerics.view_.output_interior,
+            states[1].size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToHost(
+            states[2].data(), numerics.view_.recovered_interior,
+            states[2].size() * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    if (!numerics.CollectiveContinue(copied)) return false;
+
+    audit.maximum_candidate_formula_scaled_error = 0.0;
+    double maximum_formula_increment = 0.0;
+    for (int element = 0; element < shape.elements; ++element)
+      for (int local = 0;
+           local < conserved_components * shape.scalar_interior_dofs;
+           ++local)
+      {
+        const std::size_t index = static_cast<std::size_t>(element) *
+                static_cast<std::size_t>(shape.interior_dofs) +
+            static_cast<std::size_t>(local);
+        const double high = states[0][index];
+        const double admitted_final_stage = states[1][index];
+        const double final_stage_increment = states[2][index];
+        const double expected = admitted_final_stage +
+            0.5 * final_stage_increment;
+        const double scale = std::max({1.0, std::abs(high),
+                                       std::abs(expected)});
+        const double scaled_error = std::abs(high - expected) / scale;
+        maximum_formula_increment = std::max(
+            maximum_formula_increment,
+            std::abs(0.5 * final_stage_increment));
+        local_valid = local_valid && std::isfinite(high) &&
+            std::isfinite(admitted_final_stage) &&
+            std::isfinite(final_stage_increment) &&
+            std::isfinite(expected) && std::isfinite(scale) && scale > 0.0 &&
+            std::isfinite(scaled_error);
+        audit.maximum_candidate_formula_scaled_error = std::max(
+            audit.maximum_candidate_formula_scaled_error, scaled_error);
+      }
+    audit.candidate_formula_nontrivial =
+        std::isfinite(maximum_formula_increment) &&
+        maximum_formula_increment > 0.0;
+    audit.candidate_formula_passed = local_valid &&
+        audit.candidate_formula_nontrivial &&
+        audit.maximum_candidate_formula_scaled_error <=
+            64.0 * std::numeric_limits<double>::epsilon();
+    return numerics.CollectiveContinue(audit.candidate_formula_passed);
+  }
+
+  template <typename Engine>
+  static bool AuditInitializedRodas3IgrClosure(
+      Engine& engine, const double* supplied_interior,
+      const std::size_t supplied_interior_count,
+      const double* supplied_true_trace,
+      const std::size_t supplied_true_trace_count,
+      CudaInitializedRodas3IgrClosureAudit& audit) noexcept
+  {
+    audit = {};
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    auto& committed = numerics.committed_slot_;
+    auto& candidate = numerics.candidate_slot_;
+    auto& workspace = numerics.workspace_slot_;
+    const std::size_t element_trace_count = shape.elements > 0 &&
+            shape.trace_dofs > 0 &&
+            static_cast<std::size_t>(shape.elements) <=
+                std::numeric_limits<std::size_t>::max() /
+                    static_cast<std::size_t>(shape.trace_dofs)
+        ? static_cast<std::size_t>(shape.elements) * shape.trace_dofs : 0;
+    const int true_scalar_count = shape.trace_components > 0
+        ? shape.true_trace_count / shape.trace_components : 0;
+    const std::size_t public_true_trace_count = true_scalar_count > 0
+        ? static_cast<std::size_t>(conserved_components) *
+              static_cast<std::size_t>(true_scalar_count)
+        : 0;
+    audit.relative_residual_tolerance =
+        numerics.true_residual_relative_tolerance_;
+
+    const auto& attempt = numerics.current_attempt_;
+    const StateCoordinates coordinates = engine.contract_
+        ? engine.contract_->coordinates() : StateCoordinates{};
+    audit.lifecycle_zero = engine.initialized_ && engine.contract_ &&
+        !engine.pending_.active && !engine.pending_.staging &&
+        !engine.pending_.prepared && !engine.pending_.provisional &&
+        engine.next_attempt_sequence_ == 0 && attempt.sequence == 0 &&
+        attempt.committed_step == 0 && attempt.committed_generation == 0 &&
+        attempt.retry_index == 0 && attempt.dt == 0.0 &&
+        numerics.current_generation_ == 0 && numerics.ticket_count_ == 0 &&
+        committed.interior.generation == 0 &&
+        committed.trace.generation == 0 &&
+        candidate.interior.generation == 0 && candidate.trace.generation == 0 &&
+        coordinates.time == 0.0 && coordinates.step == 0 &&
+        coordinates.generation == 0 && coordinates.cursor == 0 &&
+        coordinates.dt == 0.0;
+    audit.combination_alias_exact =
+        numerics.view_.partitioned_base_interior != nullptr &&
+        numerics.view_.partitioned_base_interior ==
+            numerics.view_.rodas_combination_interior;
+
+    bool local_valid = engine.initialized_ && engine.contract_ &&
+        numerics.initialized_ && numerics.rodas3_ && shape.igr_active &&
+        shape.borrowed_host_inputs &&
+        engine.config_.cuda_engine == generic::CudaEngineKind::tensor_core &&
+        shape.interior_components == igr_interior_components &&
+        shape.trace_components == igr_trace_components &&
+        shape.elements > 0 && shape.scalar_interior_dofs > 0 &&
+        shape.scalar_face_dofs > 0 && shape.interior_count > 0 &&
+        shape.true_trace_count > 0 && element_trace_count > 0 &&
+        true_scalar_count > 0 &&
+        shape.true_trace_count % shape.trace_components == 0 &&
+        supplied_interior != nullptr && supplied_true_trace != nullptr &&
+        supplied_interior_count ==
+            static_cast<std::size_t>(conserved_components) *
+                static_cast<std::size_t>(
+                    numerics.interior_space_->GetVSize() /
+                    shape.interior_components) &&
+        supplied_true_trace_count == public_true_trace_count &&
+        committed.interior.coefficients != nullptr &&
+        committed.trace.coefficients != nullptr &&
+        candidate.interior.coefficients != nullptr &&
+        candidate.trace.coefficients != nullptr &&
+        workspace.interior.coefficients == numerics.view_.work_interior &&
+        workspace.trace.coefficients == numerics.view_.work_true_trace &&
+        committed.interior.count == static_cast<std::size_t>(shape.interior_count) &&
+        committed.trace.count == static_cast<std::size_t>(shape.true_trace_count) &&
+        candidate.interior.count == committed.interior.count &&
+        candidate.trace.count == committed.trace.count &&
+        committed.interior.hash == candidate.interior.hash &&
+        committed.trace.hash == candidate.trace.hash &&
+        numerics.view_.old_interior != nullptr &&
+        numerics.view_.current_local_trace != nullptr &&
+        std::isfinite(engine.config_.dt) && engine.config_.dt > 0.0 &&
+        std::isfinite(audit.relative_residual_tolerance) &&
+        audit.relative_residual_tolerance > 0.0 && audit.lifecycle_zero &&
+        audit.combination_alias_exact;
+
+    std::array<std::vector<double>, 3> interiors;
+    std::array<std::vector<double>, 3> true_traces;
+    std::vector<double> local_trace;
+    try
+    {
+      for (auto& values : interiors)
+        values.resize(local_valid ? committed.interior.count : 0);
+      for (auto& values : true_traces)
+        values.resize(local_valid ? committed.trace.count : 0);
+      local_trace.resize(local_valid ? element_trace_count : 0);
+    }
+    catch (...) { local_valid = false; }
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+
+    const bool staged = CudaTransportPolicy::DeviceToDevice(
+            workspace.interior.coefficients,
+            committed.interior.coefficients,
+            committed.interior.count * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToDevice(
+            numerics.view_.old_interior,
+            committed.interior.coefficients,
+            committed.interior.count * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::DeviceToDevice(
+            workspace.trace.coefficients,
+            committed.trace.coefficients,
+            committed.trace.count * sizeof(double),
+            CudaTransferCategory::generic_host_bridge,
+            CudaTransferSite::generic_host_export) &&
+        numerics.DistributeCurrentTrace(committed.trace.coefficients);
+    if (!numerics.CollectiveContinue(staged)) return false;
+
+    CudaTensorCoreEvidence scratch_tensor =
+        numerics.initialization_tensor_core_evidence_;
+    const bool assembled = numerics.AssemblePartitionedScalarClosure(
+        workspace, engine.config_.dt, audit.global_scalar_residual,
+        scratch_tensor);
+    if (!numerics.CollectiveContinue(
+            assembled && std::isfinite(audit.global_scalar_residual)))
+      return false;
+
+    const std::array<const double*, 3> interior_sources{{
+        committed.interior.coefficients, candidate.interior.coefficients,
+        numerics.view_.initial_current_interior}};
+    const std::array<const double*, 3> true_trace_sources{{
+        committed.trace.coefficients, candidate.trace.coefficients,
+        numerics.view_.initial_current_true_trace}};
+    bool copied = true;
+    for (std::size_t state = 0; copied && state < interiors.size(); ++state)
+      copied = CudaTransportPolicy::DeviceToHost(
+          interiors[state].data(), interior_sources[state],
+          interiors[state].size() * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export);
+    for (std::size_t state = 0; copied && state < true_traces.size(); ++state)
+      copied = CudaTransportPolicy::DeviceToHost(
+          true_traces[state].data(), true_trace_sources[state],
+          true_traces[state].size() * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export);
+    copied = copied && CudaTransportPolicy::DeviceToHost(
+        local_trace.data(), numerics.view_.current_local_trace,
+        local_trace.size() * sizeof(double),
+        CudaTransferCategory::generic_host_bridge,
+        CudaTransferSite::generic_host_export) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    if (!numerics.CollectiveContinue(copied)) return false;
+
+    audit.euler_interior_exact = true;
+    for (int element = 0;
+         element < shape.elements && audit.euler_interior_exact; ++element)
+      for (int component = 0;
+           component < conserved_components && audit.euler_interior_exact;
+           ++component)
+        for (int scalar = 0; scalar < shape.scalar_interior_dofs; ++scalar)
+        {
+          const int local = component * shape.scalar_interior_dofs + scalar;
+          double sign = 1.0;
+          const int dof = CudaDecodeSigned(
+              numerics.signed_element_interior_[
+                  static_cast<std::size_t>(element) * shape.interior_dofs +
+                  local],
+              sign);
+          if (dof < 0 || static_cast<std::size_t>(dof) >=
+                  supplied_interior_count)
+          {
+            audit.euler_interior_exact = false;
+            break;
+          }
+          const double expected = sign * supplied_interior[dof];
+          const std::size_t index = static_cast<std::size_t>(element) *
+              shape.interior_dofs + local;
+          for (const auto& values : interiors)
+            if (std::memcmp(&values[index], &expected, sizeof(double)) != 0)
+            {
+              audit.euler_interior_exact = false;
+              break;
+            }
+          if (!audit.euler_interior_exact) break;
+        }
+
+    audit.euler_true_trace_exact = true;
+    for (std::size_t index = 0;
+         index < supplied_true_trace_count && audit.euler_true_trace_exact;
+         ++index)
+      for (const auto& values : true_traces)
+        if (std::memcmp(
+                &values[index], &supplied_true_trace[index],
+                sizeof(double)) != 0)
+        {
+          audit.euler_true_trace_exact = false;
+          break;
+        }
+
+    std::array<double, 3> local_auxiliary_squared{};
+    bool auxiliary_interior_finite = true;
+    for (int element = 0;
+         element < shape.elements && auxiliary_interior_finite; ++element)
+      for (int component = conserved_components;
+           component < shape.interior_components; ++component)
+        for (int scalar = 0; scalar < shape.scalar_interior_dofs; ++scalar)
+        {
+          const std::size_t index = static_cast<std::size_t>(element) *
+              shape.interior_dofs +
+              component * shape.scalar_interior_dofs + scalar;
+          const double value = interiors[0][index];
+          auxiliary_interior_finite = std::isfinite(value);
+          if (!auxiliary_interior_finite) break;
+          local_auxiliary_squared[0] += value * value;
+        }
+
+    bool auxiliary_true_trace_finite = true;
+    for (int component = conserved_components;
+         component < shape.trace_components &&
+             auxiliary_true_trace_finite;
+         ++component)
+      for (int scalar = 0; scalar < true_scalar_count; ++scalar)
+      {
+        const double value = true_traces[0][
+            static_cast<std::size_t>(component) * true_scalar_count + scalar];
+        auxiliary_true_trace_finite = std::isfinite(value);
+        if (!auxiliary_true_trace_finite) break;
+        local_auxiliary_squared[1] += value * value;
+      }
+
+    const int face_stride =
+        shape.trace_components * shape.scalar_face_dofs;
+    bool auxiliary_local_trace_finite = true;
+    for (int element = 0;
+         element < shape.elements && auxiliary_local_trace_finite; ++element)
+      for (int local = 0; local < shape.trace_dofs; ++local)
+        if ((local % face_stride) / shape.scalar_face_dofs >=
+            conserved_components)
+        {
+          const double value = local_trace[
+              static_cast<std::size_t>(element) * shape.trace_dofs + local];
+          auxiliary_local_trace_finite = std::isfinite(value);
+          if (!auxiliary_local_trace_finite) break;
+          local_auxiliary_squared[2] += value * value;
+        }
+
+    std::array<double, 3> global_auxiliary_squared{};
+    const bool reduced = MPI_Allreduce(
+        local_auxiliary_squared.data(), global_auxiliary_squared.data(),
+        static_cast<int>(global_auxiliary_squared.size()), MPI_DOUBLE,
+        MPI_SUM, numerics.communicator_) == MPI_SUCCESS;
+    for (std::size_t category = 0;
+         reduced && category < global_auxiliary_squared.size(); ++category)
+      audit.global_auxiliary_norms[category] =
+          global_auxiliary_squared[category] >= 0.0
+          ? std::sqrt(global_auxiliary_squared[category])
+          : std::numeric_limits<double>::infinity();
+    audit.auxiliary_interior_finite_nontrivial = reduced &&
+        auxiliary_interior_finite &&
+        std::isfinite(audit.global_auxiliary_norms[0]) &&
+        audit.global_auxiliary_norms[0] > 0.0;
+    audit.auxiliary_true_trace_finite_nontrivial = reduced &&
+        auxiliary_true_trace_finite &&
+        std::isfinite(audit.global_auxiliary_norms[1]) &&
+        audit.global_auxiliary_norms[1] > 0.0;
+    audit.auxiliary_local_trace_finite_nontrivial = reduced &&
+        auxiliary_local_trace_finite &&
+        std::isfinite(audit.global_auxiliary_norms[2]) &&
+        audit.global_auxiliary_norms[2] > 0.0;
+    const double auxiliary_state_norm = std::hypot(
+        audit.global_auxiliary_norms[0],
+        audit.global_auxiliary_norms[1]);
+    audit.global_scalar_relative_residual =
+        audit.global_scalar_residual / std::max(auxiliary_state_norm, 1.0);
+    const bool residual_exact =
+        std::isfinite(audit.global_scalar_relative_residual) &&
+        audit.global_scalar_relative_residual <=
+            audit.relative_residual_tolerance;
+    return numerics.CollectiveContinue(audit.euler_interior_exact &&
+        audit.euler_true_trace_exact &&
+        audit.auxiliary_interior_finite_nontrivial &&
+        audit.auxiliary_true_trace_finite_nontrivial &&
+        audit.auxiliary_local_trace_finite_nontrivial && residual_exact &&
+        audit.lifecycle_zero && audit.combination_alias_exact);
+  }
+
+
   template <typename Engine>
   static bool AuditBorrowedAssemblyFusion(
       Engine& engine, CudaBorrowedAssemblyFusionAudit& audit) noexcept
@@ -614,14 +1237,15 @@ struct CudaQualificationTestAccess
     const auto& evidence = engine.pending_.evidence;
     const auto& tensor = evidence.tensor_core;
     const bool igr_active = engine.numerics_.shape_.igr_active;
+    const CudaTracePolicyKind requested_policy =
+        engine.numerics_.trace_policy_descriptor_.requested_selection;
     const auto trace_policy = ResolveCudaTracePolicy(
         expected, igr_active, engine.config_.expected_rank_count,
-        engine.config_.order, CudaTracePolicyKind::engine_default);
+        engine.config_.order, requested_policy);
     return IluFactorAuthorityInactive(engine) &&
         tensor.selected_engine == expected &&
         CudaTracePolicyDescriptorIsExact(trace_policy) &&
-        tensor.requested_trace_policy ==
-            CudaTracePolicyKind::engine_default &&
+        tensor.requested_trace_policy == requested_policy &&
         tensor.resolved_trace_policy == trace_policy.resolved_selection &&
         tensor.trace_policy_rank_count == engine.config_.expected_rank_count &&
         tensor.trace_policy_order == engine.config_.order &&
@@ -656,6 +1280,12 @@ struct CudaQualificationTestAccess
     if (session.partitioned_backward_euler_borrowed_rank2_)
       return VerifyPreparedCudaEngine(
           *session.partitioned_backward_euler_borrowed_rank2_, expected);
+    if (session.rodas3_borrowed_rank1_)
+      return VerifyPreparedCudaEngine(
+          *session.rodas3_borrowed_rank1_, expected);
+    if (session.rodas3_borrowed_rank2_)
+      return VerifyPreparedCudaEngine(
+          *session.rodas3_borrowed_rank2_, expected);
     return false;
   }
 
@@ -1283,28 +1913,100 @@ struct CudaQualificationTestAccess
   }
 
   template <typename Engine>
+  static bool AuditNativeRankOneTrueRhsRefresh(Engine& engine) noexcept
+  {
+    // Build one coherent current operator/RHS pair, refresh only that same RHS,
+    // and prove the independently retained ParCSR values remain byte-exact.
+    // This is a private qualification seam, not a production diagnostic API.
+    auto& numerics = engine.numerics_;
+    const CudaMeshShape& shape = numerics.shape_;
+    bool local_valid = engine.initialized_ && engine.pending_.active &&
+        engine.pending_.staging && engine.pending_.numerical.success &&
+        engine.config_.expected_rank_count == 1 && shape.igr_active &&
+        engine.config_.cuda_engine == generic::CudaEngineKind::tensor_core &&
+        numerics.cuda_engine_ == generic::CudaEngineKind::tensor_core &&
+        numerics.trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64 &&
+        CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+            numerics.trace_policy_descriptor_.resolved_selection) &&
+        numerics.true_device_.diag_nonzeros > 0 &&
+        numerics.true_device_.offd_nonzeros == 0 &&
+        numerics.true_device_.diag_values != nullptr &&
+        numerics.view_.true_rhs_scratch != nullptr;
+    std::vector<double> matrix_before, matrix_after, rhs_before, rhs_after;
+    try
+    {
+      const std::size_t matrix_values = local_valid
+          ? static_cast<std::size_t>(numerics.true_device_.diag_nonzeros) : 0;
+      const std::size_t rhs_values = local_valid
+          ? static_cast<std::size_t>(shape.true_trace_count) : 0;
+      matrix_before.resize(matrix_values);
+      matrix_after.resize(matrix_values);
+      rhs_before.resize(rhs_values);
+      rhs_after.resize(rhs_values);
+    }
+    catch (...) { local_valid = false; }
+    if (!numerics.CollectiveContinue(local_valid)) return false;
+    const auto copy = [](double* destination, const double* source,
+                         const std::size_t count) noexcept
+    {
+      return CudaTransportPolicy::DeviceToHost(
+          destination, source, count * sizeof(double),
+          CudaTransferCategory::generic_host_bridge,
+          CudaTransferSite::generic_host_export);
+    };
+    const bool assembled = numerics.AssembleTrueSystem() &&
+        copy(matrix_before.data(), numerics.true_device_.diag_values,
+             matrix_before.size()) &&
+        copy(rhs_before.data(), numerics.view_.true_rhs_scratch,
+             rhs_before.size()) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    if (!numerics.CollectiveContinue(assembled) ||
+        !numerics.RefreshRetainedTrueRhs())
+      return false;
+    const bool copied =
+        copy(matrix_after.data(), numerics.true_device_.diag_values,
+             matrix_after.size()) &&
+        copy(rhs_after.data(), numerics.view_.true_rhs_scratch,
+             rhs_after.size()) &&
+        CudaTransportPolicy::Synchronize(
+            CudaTransferSite::generic_host_export);
+    return numerics.CollectiveContinue(copied &&
+        matrix_before == matrix_after && rhs_before == rhs_after);
+  }
+
+  template <typename Engine>
   static bool VerifyAssemblerJacobian(
       Engine& engine, const double relative_tolerance,
-      std::array<double, 6>& relative_errors) noexcept
+      std::array<double, 6>& relative_errors,
+      const bool differentiate_nonlinearities = false) noexcept
   {
     relative_errors.fill(std::numeric_limits<double>::infinity());
     return engine.initialized_ && !engine.pending_.active &&
         engine.config_.use_generic_numerical_policy &&
         engine.numerics_.AuditBorrowedEulerAssemblerJacobian(
-            relative_tolerance, relative_errors);
+            relative_tolerance, relative_errors,
+            differentiate_nonlinearities);
   }
 
   static bool VerifyAssemblerJacobian(
       cuda::GenericEulerHdgCudaSession& session,
       const double relative_tolerance,
-      std::array<double, 6>& relative_errors) noexcept
+      std::array<double, 6>& relative_errors,
+      const bool differentiate_nonlinearities = false) noexcept
   {
     if (session.borrowed_rank1_)
       return VerifyAssemblerJacobian(
-          *session.borrowed_rank1_, relative_tolerance, relative_errors);
+          *session.borrowed_rank1_, relative_tolerance, relative_errors,
+          differentiate_nonlinearities);
     if (session.borrowed_rank2_)
       return VerifyAssemblerJacobian(
-          *session.borrowed_rank2_, relative_tolerance, relative_errors);
+          *session.borrowed_rank2_, relative_tolerance, relative_errors,
+          differentiate_nonlinearities);
+    if (session.rodas3_borrowed_rank1_)
+      return VerifyAssemblerJacobian(
+          *session.rodas3_borrowed_rank1_, relative_tolerance,
+          relative_errors, differentiate_nonlinearities);
     relative_errors.fill(std::numeric_limits<double>::infinity());
     return false;
   }
@@ -2446,6 +3148,14 @@ struct CudaQualificationTestAccess
     if (session.borrowed_rank2_)
       return VerifyBoundaryPolicyTable(
           *session.borrowed_rank2_, expected, expected_count, expected_gamma);
+    if (session.rodas3_borrowed_rank1_)
+      return VerifyBoundaryPolicyTable(
+          *session.rodas3_borrowed_rank1_, expected,
+          expected_count, expected_gamma);
+    if (session.rodas3_borrowed_rank2_)
+      return VerifyBoundaryPolicyTable(
+          *session.rodas3_borrowed_rank2_, expected,
+          expected_count, expected_gamma);
     return false;
   }
 };
@@ -2473,6 +3183,9 @@ using dg::hdg::runtime::BorrowedCudaRank1OneGpuRuntimeSelection;
 using dg::hdg::runtime::BorrowedCudaRank2OneGpuHostStagedRuntimeSelection;
 using dg::hdg::runtime::FailureReason;
 using dg::hdg::runtime::RunStatus;
+using dg::hdg::runtime::StableIdentity;
+using dg::hdg::runtime::cuda_w8a::CudaStaticBoundaryPolicy;
+using dg::hdg::runtime::cuda_w8a::CudaStaticBoundaryPolicyKind;
 using dg::hdg::runtime::cuda_w8a::CudaConfig;
 using dg::hdg::runtime::cuda_w8a::CudaFailurePhase;
 using dg::hdg::runtime::cuda_w8a::CudaBorrowedHostL2Input;
@@ -2482,12 +3195,16 @@ using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
 using dg::hdg::runtime::cuda_w8a::CudaRunEvidence;
 using dg::hdg::runtime::cuda_w8a::CudaRunStatus;
 using dg::hdg::runtime::cuda_w8a::CudaStepEvidence;
+using dg::hdg::runtime::cuda_w8a::CudaTracePolicyKind;
 using dg::hdg::runtime::cuda_w8a::CudaTransferTotals;
 using dg::hdg::runtime::cuda_w8a::CudaTransportPolicy;
 using dg::hdg::runtime::cuda_w8a::PersistentCudaSmoothEulerEngine;
 using dg::hdg::runtime::cuda_w8a::detail::CudaBorrowedRecoveryForEngine;
 using dg::hdg::runtime::cuda_w8a::detail::CudaBorrowedRecoveryKind;
+using dg::hdg::runtime::cuda_w8a::detail::CudaDirectZhangShuAudit;
 using dg::hdg::runtime::cuda_w8a::detail::CudaRecoveryRouteSupported;
+using dg::hdg::runtime::cuda_w8a::detail::CudaRodas3LimiterEndpointAudit;
+using dg::hdg::runtime::cuda_w8a::detail::CudaRodas3ScreenObservation;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedEulerConservationGateCapture;
 using dg::hdg::runtime::cuda_w8a::detail::
@@ -2495,15 +3212,24 @@ using dg::hdg::runtime::cuda_w8a::detail::
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedPartitionedClosureAudit;
 using dg::hdg::runtime::cuda_w8a::detail::
+    CudaInitializedRodas3IgrClosureAudit;
+using dg::hdg::runtime::cuda_w8a::detail::
     CudaPreparedLocalCondensationCapture;
 using dg::hdg::runtime::cuda_w8a::detail::
     CudaBorrowedAssemblyFusionAudit;
 using dg::hdg::runtime::cuda_w8a::detail::CudaPreparedRecoveryAudit;
 using dg::hdg::runtime::cuda_w8a::detail::CudaQualificationTestAccess;
+using dg::hdg::runtime::cuda_w8a::igr_interior_components;
 using dg::hdg::runtime::cuda_w8a::igr_trace_components;
 using dg::hdg::runtime::cuda_w8a::detail::qualification_density_gate;
 
 constexpr int components = dg::hdg::generic::euler_2d_conserved_components;
+constexpr int hidden_corner_order = 3;
+constexpr int hidden_corner_scalar_dofs = 16;
+constexpr int hidden_corner_quadrature_order = 12;
+constexpr int hidden_corner_pressure_bisections = 24;
+constexpr double hidden_corner_density_floor = 1.0e-8;
+constexpr double hidden_corner_pressure_floor = 1.0e-6;
 constexpr std::uint32_t cuda_capabilities =
     CapabilityBit(Capability::conforming_quadrilateral_mesh) |
     CapabilityBit(Capability::polynomial_order_one_to_three) |
@@ -2554,10 +3280,11 @@ mfem::ParMesh MakeMixedPeriodicMesh()
   return mfem::ParMesh(MPI_COMM_WORLD, periodic);
 }
 
-mfem::ParMesh MakePhysicalMesh()
+mfem::ParMesh MakePhysicalMesh(const int elements_per_direction = 3)
 {
   mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
-      3, 3, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+      elements_per_direction, elements_per_direction,
+      mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
   return mfem::ParMesh(MPI_COMM_WORLD, serial);
 }
 
@@ -2706,7 +3433,8 @@ enum class InitialMode
 {
   constant,
   smooth_periodic,
-  affine_physical
+  affine_physical,
+  hidden_corner_pressure
 };
 
 void EvaluateInitialState(const InitialMode mode, const mfem::Vector& point,
@@ -2731,6 +3459,16 @@ void EvaluateInitialState(const InitialMode mode, const mfem::Vector& point,
     state[1] = rho * u;
     state[2] = rho * v;
     state[3] = pressure / 0.4 + 0.5 * rho * (u * u + v * v);
+    return;
+  }
+  if (mode == InitialMode::hidden_corner_pressure)
+  {
+    constexpr double pressure_delta = 1.0e-2;
+    const double pressure = point[0] + point[1] - pressure_delta;
+    state[0] = 1.0;
+    state[1] = 0.0;
+    state[2] = 0.0;
+    state[3] = pressure / 0.4;
     return;
   }
   constexpr double pi = 3.141592653589793238462643383279502884;
@@ -2904,6 +3642,147 @@ BorrowedFields MakeBorrowedFields(
           mesh, trace_space, initial_evaluator, fields.initial_true_trace))
     return {};
   return fields;
+}
+
+struct HiddenCornerFieldAudit
+{
+  std::array<double, components> mean{};
+  double minimum_selected_pressure =
+      std::numeric_limits<double>::infinity();
+  double minimum_vertex_pressure =
+      std::numeric_limits<double>::infinity();
+  bool selected_points_admissible = false;
+  bool vertices_admissible = false;
+};
+
+bool AuditHiddenCornerField(
+    mfem::ParMesh& mesh, const std::vector<double>& coefficients,
+    HiddenCornerFieldAudit& audit)
+{
+  audit = {};
+  bool ready = mesh.GetNE() == 1;
+  try
+  {
+    mfem::L2_FECollection collection(
+        hidden_corner_order, 2, mfem::BasisType::GaussLegendre,
+        mfem::FiniteElement::VALUE);
+    mfem::ParFiniteElementSpace space(
+        &mesh, &collection, components, mfem::Ordering::byNODES);
+    const mfem::FiniteElement* const finite_element =
+        ready ? space.GetFE(0) : nullptr;
+    mfem::ElementTransformation* const transformation =
+        ready ? mesh.GetElementTransformation(0) : nullptr;
+    mfem::Array<int> vdofs;
+    if (ready) space.GetElementVDofs(0, vdofs);
+    ready = ready && finite_element && transformation &&
+        finite_element->GetDof() == hidden_corner_scalar_dofs &&
+        vdofs.Size() == components * hidden_corner_scalar_dofs &&
+        coefficients.size() == static_cast<std::size_t>(space.GetVSize());
+
+    const auto evaluate = [&](const mfem::IntegrationPoint& point,
+                              std::array<double, components>& state)
+    {
+      if (!ready) return false;
+      mfem::Vector shape(hidden_corner_scalar_dofs);
+      finite_element->CalcShape(point, shape);
+      state = {};
+      for (int scalar = 0; scalar < hidden_corner_scalar_dofs; ++scalar)
+        for (int component = 0; component < components; ++component)
+        {
+          double sign = 1.0;
+          const int dof = DecodeSignedDof(
+              vdofs[component * hidden_corner_scalar_dofs + scalar], sign);
+          if (dof < 0 ||
+              static_cast<std::size_t>(dof) >= coefficients.size())
+          {
+            return false;
+          }
+          state[component] += sign * shape[scalar] *
+              coefficients[static_cast<std::size_t>(dof)];
+        }
+      return std::all_of(
+          state.begin(), state.end(),
+          [](const double value) { return std::isfinite(value); });
+    };
+    const auto admit = [&](const mfem::IntegrationPoint& point,
+                           double& minimum_pressure)
+    {
+      std::array<double, components> state{};
+      double pressure = std::numeric_limits<double>::quiet_NaN();
+      const bool pressure_ready = evaluate(point, state) &&
+          dg::hdg::euler::zhang_shu::Pressure(
+              state.data(), 1.4, pressure);
+      if (pressure_ready)
+        minimum_pressure = std::min(minimum_pressure, pressure);
+      return pressure_ready && state[0] >= hidden_corner_density_floor &&
+          pressure >= hidden_corner_pressure_floor;
+    };
+
+    bool selected = ready;
+    double measure = 0.0;
+    const mfem::IntegrationRule& volume_rule = mfem::IntRules.Get(
+        mfem::Geometry::SQUARE, hidden_corner_quadrature_order);
+    for (int q = 0; q < volume_rule.GetNPoints() && ready; ++q)
+    {
+      const mfem::IntegrationPoint& point = volume_rule.IntPoint(q);
+      std::array<double, components> state{};
+      transformation->SetIntPoint(&point);
+      const double weight = point.weight * transformation->Weight();
+      ready = std::isfinite(weight) && weight > 0.0 &&
+          evaluate(point, state);
+      if (!ready) break;
+      measure += weight;
+      for (int component = 0; component < components; ++component)
+        audit.mean[component] += weight * state[component];
+      selected = admit(point, audit.minimum_selected_pressure) && selected;
+    }
+    ready = ready && std::isfinite(measure) && measure > 0.0;
+    for (double& value : audit.mean)
+    {
+      if (ready) value /= measure;
+      ready = ready && std::isfinite(value);
+    }
+
+    const mfem::IntegrationRule& face_rule = mfem::IntRules.Get(
+        mfem::Geometry::SEGMENT, hidden_corner_quadrature_order);
+    for (int q = 0; q < face_rule.GetNPoints() && ready; ++q)
+    {
+      const double s = face_rule.IntPoint(q).x;
+      std::array<mfem::IntegrationPoint, 4> points{};
+      points[0].Set2(s, 0.0);
+      points[1].Set2(1.0, s);
+      points[2].Set2(s, 1.0);
+      points[3].Set2(0.0, s);
+      for (const mfem::IntegrationPoint& point : points)
+        selected = admit(point, audit.minimum_selected_pressure) && selected;
+    }
+    const mfem::IntegrationRule& nodes = finite_element->GetNodes();
+    ready = ready && nodes.GetNPoints() == hidden_corner_scalar_dofs;
+    for (int scalar = 0; scalar < nodes.GetNPoints() && ready; ++scalar)
+      selected = admit(
+          nodes.IntPoint(scalar), audit.minimum_selected_pressure) && selected;
+
+    const mfem::IntegrationRule* const vertices =
+        mfem::Geometries.GetVertices(mfem::Geometry::SQUARE);
+    bool vertices_admissible = ready && vertices &&
+        vertices->GetNPoints() == 4;
+    for (int vertex = 0;
+         vertices && vertex < vertices->GetNPoints() && ready; ++vertex)
+    {
+      vertices_admissible = admit(
+          vertices->IntPoint(vertex), audit.minimum_vertex_pressure) &&
+          vertices_admissible;
+    }
+    audit.selected_points_admissible = selected;
+    audit.vertices_admissible = vertices_admissible;
+  }
+  catch (...)
+  {
+    ready = false;
+  }
+  return ready &&
+      std::isfinite(audit.minimum_selected_pressure) &&
+      std::isfinite(audit.minimum_vertex_pressure);
 }
 
 EulerHdgRequest MakeRequest(
@@ -3885,6 +4764,20 @@ bool CheckEulerAlgebraForSelection(const EulerHdgRequest& request,
                 << trace_action_scaled_error
                 << " tensor_mma_tiles="
                 << condensation_capture.tensor_mma_tiles << '\n';
+    return false;
+  }
+  const bool native_rhs_refresh =
+      config.cuda_engine != CudaEngineKind::tensor_core || !igr || ranks != 1 ||
+      CudaQualificationTestAccess::AuditNativeRankOneTrueRhsRefresh(*engine);
+  const bool native_rhs_refresh_everywhere = All(
+      native_rhs_refresh, request.communicator);
+  if (!native_rhs_refresh_everywhere)
+  {
+    int rank = 0;
+    MPI_Comm_rank(request.communicator, &rank);
+    if (rank == 0)
+      std::cerr << "CUDA native rank-one RHS-only refresh failed order="
+                << order << '\n';
     return false;
   }
   const bool work_accounting =
@@ -6156,7 +7049,1460 @@ bool CheckPartitionedFailureInjection(const int order, const int ranks)
             order, ranks);
   return CheckPartitionedFailureInjectionForSelection<
       dg::hdg::runtime::PartitionedBackwardEulerCudaRank2RuntimeSelection>(
-          order, ranks);
+      order, ranks);
+}
+
+struct Rodas3ScreenRecord
+{
+  double setup_seconds = std::numeric_limits<double>::infinity();
+  double step_seconds = std::numeric_limits<double>::infinity();
+  CudaRunEvidence initialization{};
+  CudaStepEvidence evidence{};
+  CudaStepEvidence retry_evidence{};
+  CudaStepEvidence rollback{};
+  CudaRodas3ScreenObservation observation{};
+  CudaRodas3ScreenObservation retry_observation{};
+  CudaInitializedRodas3IgrClosureAudit initial_closure_audit{};
+  dg::hdg::generic::HdgEulerPreparedAssessment assessment{};
+  dg::hdg::generic::HdgEulerPreparedAssessment retry_assessment{};
+  bool state_changed = false;
+  bool architecture_passed = false;
+  bool numerical_passed = false;
+  bool lifecycle_passed = false;
+  bool host_staged_passed = false;
+  bool rollback_passed = false;
+  bool retry_passed = false;
+  bool exact_jacobian_passed = false;
+  bool initial_closure_audited = false;
+  bool initial_closure_passed = true;
+  std::array<double, 6> exact_jacobian_relative_errors{};
+  bool passed = false;
+};
+
+bool RunRodas3RankOneStep(
+    const CudaEngineKind engine_kind,
+    const RegularizationKind regularization,
+    Rodas3ScreenRecord& record,
+    const bool physical = false)
+{
+  record = {};
+  constexpr int order = 1;
+  constexpr double dt = 1.0e-6;
+  mfem::ParMesh mesh = physical ? MakePhysicalMesh() : MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, physical ? SourceMode::nonzero : SourceMode::empty,
+      InitialMode::smooth_periodic);
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, physical, regularization);
+  request.time_treatment = EulerHdgTimeTreatment::rodas3;
+  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+      ContractStatus::accepted)
+    return false;
+  CudaConfig config = MakeDirectConfig(request, 1, order);
+  config.dt = dt;
+  config.cuda_engine = engine_kind;
+  std::array<CudaStaticBoundaryPolicy, 4> device_policies{};
+  if (physical)
+  {
+    const std::array<double, components> reference{{
+        1.0, 0.05, -0.02, 2.60}};
+    const std::array<double, components> unused{};
+    device_policies = {{
+        {1, CudaStaticBoundaryPolicyKind::slip_wall, unused, 0.0},
+        {2, CudaStaticBoundaryPolicyKind::supersonic_outlet, unused, 0.0},
+        {3, CudaStaticBoundaryPolicyKind::far_field, reference, 0.0},
+        {4, CudaStaticBoundaryPolicyKind::supersonic_inlet, reference, 0.0}}};
+    config.borrowed_global_topology = StableIdentity::Copy(
+        "generic.euler.request.topology.v1");
+    config.borrowed_boundary_policies = {
+        device_policies.data(), device_policies.size(), 1.4};
+  }
+
+  using Engine = PersistentCudaSmoothEulerEngine<
+      dg::hdg::runtime::Rodas3CudaRank1RuntimeSelection>;
+  const auto setup_begin = std::chrono::steady_clock::now();
+  std::unique_ptr<Engine> engine;
+  if (engine_kind == CudaEngineKind::tensor_core)
+  {
+    const CudaTracePolicyKind requested_policy =
+        dg::hdg::runtime::cuda_w8a::DefaultCudaTracePolicyRequest(
+            engine_kind, regularization == RegularizationKind::igr, 1,
+            EulerHdgTimeTreatment::rodas3);
+    engine = CudaQualificationTestAccess::CreateWithTracePolicy<
+        dg::hdg::runtime::Rodas3CudaRank1RuntimeSelection>(
+            config, requested_policy);
+  }
+  else if (engine_kind == CudaEngineKind::ordinary)
+  {
+    engine = std::make_unique<Engine>(config);
+  }
+  CudaRunEvidence initialization{};
+  const bool initialized = engine && engine->Initialize(initialization) &&
+      engine->contract() != nullptr;
+  const auto setup_end = std::chrono::steady_clock::now();
+  record.setup_seconds = std::chrono::duration<double>(
+      setup_end - setup_begin).count();
+  if (!All(initialized, request.communicator))
+    return false;
+
+  const bool initial_closure_audit_required =
+      engine_kind == CudaEngineKind::tensor_core &&
+      regularization == RegularizationKind::igr && !physical;
+  record.initial_closure_audited = initial_closure_audit_required;
+  record.initial_closure_passed = !initial_closure_audit_required ||
+      CudaQualificationTestAccess::AuditInitializedRodas3IgrClosure(
+          *engine, fields.initial.data(), fields.initial.size(),
+          fields.initial_true_trace.data(), fields.initial_true_trace.size(),
+          record.initial_closure_audit);
+  if (!All(record.initial_closure_passed, request.communicator)) return false;
+
+  constexpr double exact_jacobian_tolerance = 2.5e-4;
+  record.exact_jacobian_passed = !physical ||
+      CudaQualificationTestAccess::VerifyAssemblerJacobian(
+          *engine, exact_jacobian_tolerance,
+          record.exact_jacobian_relative_errors, true);
+  if (!All(record.exact_jacobian_passed, request.communicator)) return false;
+
+  CudaPrecommitSnapshot snapshot{};
+  CudaPreparedOutputMetadataV1 output{};
+  const auto step_begin = std::chrono::steady_clock::now();
+  const bool prepared = engine->PrepareStep(
+      false, dt, snapshot, record.evidence);
+  const bool captured = prepared &&
+      CudaQualificationTestAccess::CapturePreparedRodas3(
+          *engine, record.observation);
+  const bool staged = captured &&
+      engine->StagePreparedOutputMetadata(output, record.evidence);
+  constexpr dg::hdg::generic::HdgEulerPreparedAssessmentPolicy
+      fixed_policy{1.0e-8, 1.0e-5, 0.25};
+  const bool assessed = staged && engine->AssessPrepared(
+      output, fixed_policy, record.assessment);
+  const bool marked = assessed &&
+      record.assessment.algebraic_correction_gate &&
+      engine->MarkOutputStaged(output);
+  const bool commit_prepared = marked &&
+      engine->PrepareCommit(output, record.evidence);
+  const bool provisional = commit_prepared &&
+      engine->CommitPrepared(output, record.evidence);
+  const bool committed = provisional &&
+      engine->FinalizeCommit(output, record.evidence);
+  const auto step_end = std::chrono::steady_clock::now();
+  record.step_seconds = std::chrono::duration<double>(
+      step_end - step_begin).count();
+
+  const auto& evidence = record.evidence;
+  const auto& observation = record.observation;
+  record.state_changed = evidence.before_interior_hash !=
+      evidence.after_interior_hash;
+  const bool preconditioner_architecture =
+      engine_kind == CudaEngineKind::tensor_core
+      ? evidence.common_shift_preconditioner_setups == 1 &&
+          evidence.common_shift_preconditioner_reuses == 3
+      : evidence.common_shift_preconditioner_setups == 4 &&
+          evidence.common_shift_preconditioner_reuses == 0 &&
+          evidence.tensor_core.ilu_factor_setups >= 4 &&
+          evidence.tensor_core.ilu_factor_reuses == 0;
+  record.architecture_passed =
+      evidence.common_shift_operator_builds == 1 &&
+      evidence.common_shift_operator_reuses == 3 &&
+      evidence.condensed_rhs_refreshes == 3 &&
+      evidence.common_shift_trace_solves == 4 &&
+      evidence.positivity_limiter_calls == 0 &&
+      evidence.positivity_limiter_active_calls == 0 &&
+      evidence.positivity_limiter_inadmissible_mean_rejections == 0 &&
+      evidence.positivity_algebraic_projections == 0 &&
+      evidence.common_shift_operator_rebuilds == 0 &&
+      evidence.maximum_positivity_limiter_correction_norm == 0.0 &&
+      preconditioner_architecture;
+  record.numerical_passed = observation.candidate_ready &&
+      observation.finite && observation.admissible &&
+      observation.recovery && observation.true_residual &&
+      observation.conservation && observation.telemetry &&
+      observation.success && std::isfinite(evidence.temporal_error_norm) &&
+      evidence.temporal_error_norm >= 0.0 &&
+      std::isfinite(evidence.final_algebraic_residual) &&
+      evidence.final_algebraic_residual >= 0.0 &&
+      std::isfinite(evidence.final_algebraic_correction_norm) &&
+      evidence.final_algebraic_correction_norm >= 0.0 &&
+      std::isfinite(evidence.true_relative_residual) &&
+      evidence.true_relative_residual <=
+          request.numerical_policy.true_residual_relative_tolerance &&
+      std::isfinite(observation.maximum_conservation_error) &&
+      std::isfinite(observation.maximum_conservation_relative_error) &&
+      observation.maximum_conservation_relative_error <=
+          request.numerical_policy.conservation_relative_tolerance;
+  record.lifecycle_passed = prepared && captured && staged && assessed &&
+      record.assessment.finite_gate && record.assessment.solver_gate &&
+      record.assessment.residual_gate &&
+      record.assessment.admissibility_gate &&
+      record.assessment.algebraic_closure_gate &&
+      record.assessment.algebraic_correction_gate && marked &&
+      commit_prepared && provisional && committed &&
+      snapshot.numerical_candidate_ready && output.candidate_frozen &&
+      output.checkpoint_staged && output.output_staged &&
+      output.successful_commit && evidence.status == CudaRunStatus::committed &&
+      evidence.committed && !evidence.retry_available &&
+      evidence.no_fallback && evidence.device_resident &&
+      evidence.after.step == evidence.before.step + 1 &&
+      evidence.after.generation == evidence.before.generation + 1 &&
+      evidence.after.time == evidence.before.time + dt;
+  record.passed = record.architecture_passed && record.numerical_passed &&
+      record.lifecycle_passed && record.exact_jacobian_passed &&
+      record.initial_closure_passed &&
+      record.state_changed && std::isfinite(record.setup_seconds) &&
+      record.setup_seconds >= 0.0 && std::isfinite(record.step_seconds) &&
+      record.step_seconds > 0.0;
+  return All(record.passed, request.communicator);
+}
+
+bool RunRodas3RankTwoStep(
+    const CudaEngineKind engine_kind,
+    const RegularizationKind regularization,
+    Rodas3ScreenRecord& record)
+{
+  record = {};
+  constexpr int order = 1;
+  constexpr int ranks = 2;
+  constexpr double dt = 1.0e-6;
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::empty, InitialMode::smooth_periodic);
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, regularization);
+  request.time_treatment = EulerHdgTimeTreatment::rodas3;
+  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+      ContractStatus::accepted)
+    return false;
+  CudaConfig config = MakeDirectConfig(request, ranks, order);
+  config.dt = dt;
+  config.cuda_engine = engine_kind;
+  using Engine = PersistentCudaSmoothEulerEngine<
+      dg::hdg::runtime::Rodas3CudaRank2RuntimeSelection>;
+  const auto setup_begin = std::chrono::steady_clock::now();
+  auto engine = std::make_unique<Engine>(config);
+  const bool initialized = engine && engine->Initialize(record.initialization) &&
+      engine->contract() != nullptr;
+  const auto setup_end = std::chrono::steady_clock::now();
+  record.setup_seconds = std::chrono::duration<double>(
+      setup_end - setup_begin).count();
+  if (!All(initialized, request.communicator)) return false;
+
+  CudaPrecommitSnapshot snapshot{};
+  CudaPreparedOutputMetadataV1 output{};
+  const auto step_begin = std::chrono::steady_clock::now();
+  const bool prepared = engine->PrepareStep(
+      false, dt, snapshot, record.evidence);
+  const bool captured = prepared &&
+      CudaQualificationTestAccess::CapturePreparedRodas3(
+          *engine, record.observation);
+  const bool staged = captured &&
+      engine->StagePreparedOutputMetadata(output, record.evidence);
+  constexpr dg::hdg::generic::HdgEulerPreparedAssessmentPolicy
+      fixed_policy{1.0e-8, 1.0e-5, 0.25};
+  const bool assessed = staged && engine->AssessPrepared(
+      output, fixed_policy, record.assessment);
+  const bool staged_artifact = output.candidate_frozen &&
+      output.checkpoint_staged && !output.output_staged &&
+      !output.successful_commit;
+  const bool rolled_back = assessed &&
+      engine->AbortPrepared(output, FailureReason::backend_failure,
+                            record.rollback);
+  const bool aborted_artifacts_cleared = !output.candidate_frozen &&
+      !output.checkpoint_staged && !output.output_staged &&
+      !output.successful_commit;
+  record.rollback_passed = rolled_back && !record.rollback.committed &&
+      record.rollback.retry_available && record.rollback.collective_consensus &&
+      record.rollback.coordinates_preserved &&
+      record.rollback.committed_bytes_preserved &&
+      record.rollback.status == CudaRunStatus::retry_available &&
+      record.rollback.contract_reason == FailureReason::backend_failure &&
+      record.rollback.before_interior_hash ==
+          record.rollback.after_interior_hash &&
+      record.rollback.before_trace_hash == record.rollback.after_trace_hash &&
+      engine->contract() != nullptr &&
+      engine->contract()->status() == RunStatus::retry_available &&
+      aborted_artifacts_cleared;
+
+  CudaPrecommitSnapshot retry_snapshot{};
+  CudaPreparedOutputMetadataV1 retry_output{};
+  const bool retry_prepared = record.rollback_passed && engine->PrepareStep(
+      true, dt, retry_snapshot, record.retry_evidence);
+  const bool retry_captured = retry_prepared &&
+      CudaQualificationTestAccess::CapturePreparedRodas3(
+          *engine, record.retry_observation);
+  const bool retry_staged = retry_captured &&
+      engine->StagePreparedOutputMetadata(
+          retry_output, record.retry_evidence);
+  const bool retry_assessed = retry_staged && engine->AssessPrepared(
+      retry_output, fixed_policy, record.retry_assessment);
+  const bool retry_marked = retry_assessed &&
+      record.retry_assessment.algebraic_correction_gate &&
+      engine->MarkOutputStaged(retry_output);
+  const bool retry_commit_prepared = retry_marked &&
+      engine->PrepareCommit(retry_output, record.retry_evidence);
+  const bool retry_provisional = retry_commit_prepared &&
+      engine->CommitPrepared(retry_output, record.retry_evidence);
+  const bool retry_committed = retry_provisional &&
+      engine->FinalizeCommit(retry_output, record.retry_evidence);
+  const auto step_end = std::chrono::steady_clock::now();
+  record.step_seconds = std::chrono::duration<double>(
+      step_end - step_begin).count();
+
+  const auto& evidence = record.evidence;
+  const auto& observation = record.observation;
+  const bool retained_ilu = engine_kind == CudaEngineKind::tensor_core &&
+      regularization == RegularizationKind::igr;
+  const bool diagonal_scale = engine_kind == CudaEngineKind::tensor_core &&
+      regularization == RegularizationKind::none;
+  const std::uint64_t expected_physical_trace_solves =
+      regularization == RegularizationKind::igr ? 6U : 7U;
+  const auto architecture_exact = [&](const CudaStepEvidence& value)
+  {
+    const bool preconditioner_exact = retained_ilu
+        ? value.common_shift_preconditioner_setups == 1 &&
+            value.common_shift_preconditioner_reuses == 3 &&
+            value.tensor_core.ilu_factor_setups == 1 &&
+            value.tensor_core.ilu_factor_reuses == 5
+        : value.common_shift_preconditioner_setups == 4 &&
+            value.common_shift_preconditioner_reuses == 0 &&
+            (diagonal_scale
+                 ? value.tensor_core.ilu_factor_setups == 0 &&
+                     value.tensor_core.ilu_factor_reuses == 0
+                 : value.tensor_core.ilu_factor_setups ==
+                       expected_physical_trace_solves &&
+                     value.tensor_core.ilu_factor_reuses == 0);
+    return value.common_shift_operator_builds == 1 &&
+        value.common_shift_operator_reuses == 3 &&
+        value.condensed_rhs_refreshes == 3 &&
+        value.common_shift_trace_solves == 4 && preconditioner_exact;
+  };
+  const auto numerical_exact = [&](
+      const CudaStepEvidence& value,
+      const CudaRodas3ScreenObservation& observed,
+      const dg::hdg::generic::HdgEulerPreparedAssessment& assessed_value)
+  {
+    return observed.candidate_ready && observed.finite &&
+        observed.admissible && observed.recovery && observed.true_residual &&
+        observed.conservation && observed.telemetry && observed.success &&
+        assessed_value.finite_gate && assessed_value.solver_gate &&
+        assessed_value.residual_gate && assessed_value.admissibility_gate &&
+        assessed_value.algebraic_closure_gate &&
+        assessed_value.algebraic_correction_gate &&
+        std::isfinite(value.temporal_error_norm) &&
+        value.temporal_error_norm >= 0.0 &&
+        std::isfinite(value.final_algebraic_residual) &&
+        value.final_algebraic_residual >= 0.0 &&
+        std::isfinite(value.final_algebraic_correction_norm) &&
+        value.final_algebraic_correction_norm >= 0.0 &&
+        std::isfinite(value.true_relative_residual) &&
+        value.true_relative_residual <=
+            request.numerical_policy.true_residual_relative_tolerance &&
+        std::isfinite(observed.maximum_conservation_error) &&
+        std::isfinite(observed.maximum_conservation_relative_error) &&
+        observed.maximum_conservation_relative_error <=
+            request.numerical_policy.conservation_relative_tolerance;
+  };
+  const auto host_staged_exact = [&](const CudaStepEvidence& value)
+  {
+    return value.tensor_core.
+            hypre_host_staged_rank2_trace_solver_configured &&
+        value.tensor_core.hypre_trace_solve_calls ==
+            expected_physical_trace_solves &&
+        value.transfers.complete && value.transfers.host_to_device_bytes > 0 &&
+        value.transfers.device_to_host_bytes > 0 &&
+        value.transfers.mpi_staging_bytes > 0;
+  };
+  record.architecture_passed = architecture_exact(evidence) &&
+      architecture_exact(record.retry_evidence);
+  record.numerical_passed = numerical_exact(
+      evidence, observation, record.assessment) && numerical_exact(
+      record.retry_evidence, record.retry_observation,
+      record.retry_assessment);
+  record.state_changed = snapshot.candidate_interior_hash !=
+          evidence.before_interior_hash &&
+      retry_snapshot.candidate_interior_hash !=
+          record.retry_evidence.before_interior_hash;
+  record.host_staged_passed = record.initialization.ranks == ranks &&
+      record.initialization.same_physical_gpu &&
+      record.initialization.host_staged_rank2 &&
+      record.initialization.no_host_solver_fallback &&
+      record.initialization.mfem_device_valid &&
+      record.initialization.hypre_cuda_umpire_device &&
+      record.initialization.signed_owner_ghost_semantics &&
+      record.initialization.tensor_core.
+          hypre_host_staged_rank2_trace_solver_configured &&
+      host_staged_exact(evidence) && host_staged_exact(record.retry_evidence);
+  record.retry_passed = retry_prepared && retry_captured && retry_staged &&
+      retry_assessed && retry_marked && retry_commit_prepared &&
+      retry_provisional && retry_committed &&
+      retry_snapshot.numerical_candidate_ready &&
+      retry_output.candidate_frozen && retry_output.checkpoint_staged &&
+      retry_output.output_staged && retry_output.successful_commit &&
+      record.retry_evidence.status == CudaRunStatus::committed &&
+      record.retry_evidence.committed &&
+      !record.retry_evidence.retry_available &&
+      record.retry_evidence.no_fallback &&
+      record.retry_evidence.device_resident &&
+      record.retry_evidence.before.step == evidence.before.step &&
+      record.retry_evidence.before.generation == evidence.before.generation &&
+      record.retry_evidence.before.time == evidence.before.time &&
+      record.retry_evidence.after.step == evidence.before.step + 1 &&
+      record.retry_evidence.after.generation ==
+          evidence.before.generation + 1 &&
+      record.retry_evidence.after.time == evidence.before.time + dt;
+  record.lifecycle_passed = prepared && captured && staged && assessed &&
+      staged_artifact && snapshot.numerical_candidate_ready &&
+      evidence.no_fallback && evidence.device_resident &&
+      record.host_staged_passed && record.rollback_passed &&
+      record.retry_passed;
+  record.passed = record.architecture_passed && record.numerical_passed &&
+      record.lifecycle_passed && record.state_changed &&
+      std::isfinite(record.setup_seconds) && record.setup_seconds >= 0.0 &&
+      std::isfinite(record.step_seconds) && record.step_seconds > 0.0;
+  return All(record.passed, request.communicator);
+}
+
+bool CheckRodas3PreparedAssessmentAuthority()
+{
+  constexpr int order = 1;
+  constexpr double first_dt = 1.0e-6;
+  constexpr double fresh_dt = 7.5e-7;
+  constexpr dg::hdg::generic::HdgEulerPreparedAssessmentPolicy
+      fixed_policy{1.0e-8, 1.0e-5, 0.25};
+  constexpr dg::hdg::generic::HdgEulerPreparedAssessmentPolicy
+      invalid_policy{0.0, 0.0, 0.25};
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::empty, InitialMode::smooth_periodic);
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::igr);
+  request.time_treatment = EulerHdgTimeTreatment::rodas3;
+
+  GenericEulerHdgCudaSession session;
+  const bool initialized = session.Initialize(request).status ==
+      HdgEulerSessionStatus::initialized;
+  const bool capability = dg::hdg::generic::HasHdgEulerSessionCapabilities(
+      session.capabilities(),
+      dg::hdg::generic::HdgEulerSessionCapabilityBit(
+          dg::hdg::generic::HdgEulerSessionCapability::
+              prepared_embedded_assessment));
+  if (!All(initialized && capability, request.communicator)) return false;
+
+  const auto initial_coordinates = session.coordinates();
+  GenericEulerCudaPreparedStep first_authority;
+  GenericEulerHdgCudaSession::prepared_output_type first_output{};
+  const bool first_prepared = session.Prepare(
+      first_dt, first_authority, first_output).status ==
+          HdgEulerSessionStatus::prepared;
+  const bool first_inactive =
+      CudaQualificationTestAccess::FacadePreparedAssessmentInactive(session);
+  const bool first_acknowledged = first_prepared &&
+      session.AcknowledgePreparedOutput(first_authority, first_output);
+  const auto missing_assessment = first_acknowledged
+      ? session.Commit(std::move(first_authority), first_output)
+      : dg::hdg::generic::HdgEulerSessionResult{};
+  const bool missing_rejected = missing_assessment.status ==
+          HdgEulerSessionStatus::rejected &&
+      session.coordinates().time == initial_coordinates.time &&
+      session.coordinates().step == initial_coordinates.step &&
+      session.coordinates().generation == initial_coordinates.generation;
+
+  GenericEulerCudaPreparedStep empty_authority;
+  dg::hdg::generic::HdgEulerPreparedAssessment mismatch_assessment{};
+  const bool mismatched_token_rejected = !session.AssessPrepared(
+      empty_authority, first_output, fixed_policy, mismatch_assessment);
+  dg::hdg::generic::HdgEulerPreparedAssessment invalid_assessment{};
+  const bool invalid_policy_rejected = !session.AssessPrepared(
+      first_authority, first_output, invalid_policy, invalid_assessment);
+  dg::hdg::generic::HdgEulerPreparedAssessment first_assessment{};
+  const bool first_assessed = session.AssessPrepared(
+      first_authority, first_output, fixed_policy, first_assessment);
+  const bool first_gates = first_assessed &&
+      dg::hdg::generic::IsValidHdgEulerPreparedAssessment(
+          first_assessment) &&
+      first_assessment.finite_gate && first_assessment.solver_gate &&
+      first_assessment.residual_gate &&
+      first_assessment.admissibility_gate &&
+      first_assessment.algebraic_closure_gate &&
+      first_assessment.algebraic_correction_gate;
+  const auto declined = first_gates
+      ? session.RejectPrepared(
+            std::move(first_authority), first_output)
+      : dg::hdg::generic::HdgEulerSessionResult{};
+  const bool decline_exact = declined.status ==
+          HdgEulerSessionStatus::aborted &&
+      session.coordinates().time == initial_coordinates.time &&
+      session.coordinates().step == initial_coordinates.step &&
+      session.coordinates().generation == initial_coordinates.generation &&
+      !first_output.candidate_frozen &&
+      !first_output.checkpoint_staged && !first_output.output_staged &&
+      CudaQualificationTestAccess::FacadePreparedAssessmentInactive(session);
+  if (!All(first_prepared && first_inactive && first_acknowledged &&
+               missing_rejected && mismatched_token_rejected &&
+               invalid_policy_rejected && first_gates && decline_exact,
+           request.communicator))
+    return false;
+
+  GenericEulerCudaPreparedStep fresh_authority;
+  GenericEulerHdgCudaSession::prepared_output_type fresh_output{};
+  const bool fresh_prepared = session.Prepare(
+      fresh_dt, fresh_authority, fresh_output).status ==
+          HdgEulerSessionStatus::prepared;
+  dg::hdg::generic::HdgEulerPreparedAssessment fresh_assessment{};
+  const bool fresh_assessed = fresh_prepared && session.AssessPrepared(
+      fresh_authority, fresh_output, fixed_policy, fresh_assessment) &&
+      fresh_assessment.algebraic_correction_gate;
+  const bool fresh_acknowledged = fresh_assessed &&
+      session.AcknowledgePreparedOutput(fresh_authority, fresh_output);
+  const bool policy_corrupted = fresh_acknowledged &&
+      CudaQualificationTestAccess::CorruptFacadePreparedAssessmentPolicy(
+          session);
+  const auto mismatched_policy = policy_corrupted
+      ? session.Commit(std::move(fresh_authority), fresh_output)
+      : dg::hdg::generic::HdgEulerSessionResult{};
+  const bool mismatched_policy_rejected = mismatched_policy.status ==
+      HdgEulerSessionStatus::rejected;
+  dg::hdg::generic::HdgEulerPreparedAssessment reassessment{};
+  const bool reassessed = mismatched_policy_rejected &&
+      session.AssessPrepared(
+          fresh_authority, fresh_output, fixed_policy, reassessment) &&
+      reassessment.algebraic_correction_gate;
+  const auto committed = reassessed
+      ? session.Commit(std::move(fresh_authority), fresh_output)
+      : dg::hdg::generic::HdgEulerSessionResult{};
+  const bool committed_exact = committed.status ==
+          HdgEulerSessionStatus::committed &&
+      committed.coordinates.time == initial_coordinates.time + fresh_dt &&
+      committed.coordinates.step == initial_coordinates.step + 1 &&
+      committed.coordinates.generation ==
+          initial_coordinates.generation + 1 &&
+      fresh_output.successful_commit &&
+      CudaQualificationTestAccess::FacadePreparedAssessmentInactive(session);
+  return All(fresh_prepared && fresh_assessed && fresh_acknowledged &&
+                 policy_corrupted && mismatched_policy_rejected &&
+                 reassessed && committed_exact,
+             request.communicator);
+}
+
+bool CheckRodas3DefaultTraceArchitecture()
+{
+  constexpr int order = 1;
+  constexpr double dt = 1.0e-6;
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::empty, InitialMode::smooth_periodic);
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::none);
+  request.backend.cuda_engine = CudaEngineKind::tensor_core;
+  request.time_treatment = EulerHdgTimeTreatment::rodas3;
+
+  GenericEulerHdgCudaSession session;
+  if (!All(session.Initialize(request).status ==
+               HdgEulerSessionStatus::initialized,
+           request.communicator))
+    return false;
+
+  const auto initial = session.coordinates();
+  GenericEulerCudaPreparedStep authority;
+  GenericEulerHdgCudaSession::prepared_output_type output{};
+  const bool prepared = session.Prepare(dt, authority, output).status ==
+      HdgEulerSessionStatus::prepared;
+  const bool exact_native_route = prepared &&
+      CudaQualificationTestAccess::VerifyPreparedCudaEngine(
+          session, CudaEngineKind::tensor_core);
+  const auto rejected = exact_native_route
+      ? session.RejectPrepared(std::move(authority), output)
+      : dg::hdg::generic::HdgEulerSessionResult{};
+  const auto final = session.coordinates();
+  return All(prepared && exact_native_route &&
+                 rejected.status == HdgEulerSessionStatus::aborted &&
+                 final.time == initial.time && final.step == initial.step &&
+                 final.generation == initial.generation,
+             request.communicator);
+}
+
+bool CheckRodas3EntryProjectionGate()
+{
+  constexpr int order = 1;
+  constexpr double dt = 1.0e-6;
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  const BorrowedFields coherent = MakeBorrowedFields(
+      mesh, order, SourceMode::empty, InitialMode::smooth_periodic);
+  const auto run = [&](const double trace_scale,
+                       const bool expect_prepared)
+  {
+    BorrowedFields fields = coherent;
+    for (double& value : fields.initial_true_trace) value *= trace_scale;
+    BoundaryContext boundary{};
+    EulerHdgRequest request = MakeRequest(
+        mesh, order, fields, boundary, false, RegularizationKind::igr);
+    request.time_treatment = EulerHdgTimeTreatment::rodas3;
+    CudaConfig config = MakeDirectConfig(request, 1, order);
+    config.dt = dt;
+    config.cuda_engine = CudaEngineKind::tensor_core;
+    using Engine = PersistentCudaSmoothEulerEngine<
+        dg::hdg::runtime::Rodas3CudaRank1RuntimeSelection>;
+    const CudaTracePolicyKind requested_policy =
+        dg::hdg::runtime::cuda_w8a::DefaultCudaTracePolicyRequest(
+            CudaEngineKind::tensor_core, true, 1,
+            EulerHdgTimeTreatment::rodas3);
+    auto engine = CudaQualificationTestAccess::CreateWithTracePolicy<
+        dg::hdg::runtime::Rodas3CudaRank1RuntimeSelection>(
+            config, requested_policy);
+    CudaRunEvidence initialization{};
+    if (!engine || !engine->Initialize(initialization)) return false;
+
+    CudaPrecommitSnapshot snapshot{};
+    CudaStepEvidence evidence{};
+    const bool prepared = engine->PrepareStep(false, dt, snapshot, evidence);
+    const bool projected = evidence.nonlinear_updates > 0 &&
+        std::isfinite(evidence.initial_residual) &&
+        evidence.initial_residual >
+            request.numerical_policy.nonlinear_relative_tolerance;
+    if (!expect_prepared)
+    {
+      return !prepared && projected &&
+          evidence.phase == CudaFailurePhase::recovery &&
+          evidence.contract_reason == FailureReason::recovery_gate &&
+          evidence.common_shift_operator_builds == 0 &&
+          evidence.before.time == evidence.after.time &&
+          evidence.before.step == evidence.after.step &&
+          evidence.before.generation == evidence.after.generation &&
+          evidence.coordinates_preserved &&
+          evidence.committed_bytes_preserved;
+    }
+
+    CudaPreparedOutputMetadataV1 output{};
+    CudaStepEvidence staged_evidence{};
+    const bool staged = prepared &&
+        engine->StagePreparedOutputMetadata(output, staged_evidence);
+    CudaStepEvidence rollback{};
+    const bool rolled_back = staged && engine->AbortPrepared(
+        output, FailureReason::backend_failure, rollback);
+    return projected && rolled_back && rollback.coordinates_preserved &&
+        rollback.committed_bytes_preserved;
+  };
+
+  // The first state is intentionally inconsistent but remains within the
+  // CPU/CUDA shared 0.25 normalized entry-correction allowance. The second
+  // reaches the same constraint surface only by replacing the supplied trace
+  // wholesale and must be rejected transactionally before causal stages.
+  return All(run(1.05, true) && run(64.0, false), mesh.GetComm());
+}
+
+bool CheckRodas3ZhangShuActiveStageLifecycle()
+{
+  constexpr int order = 1;
+  constexpr int scalar_dofs = 4;
+  constexpr double dt = 1.0e-6;
+  constexpr double density_floor = 0.999;
+  constexpr double pressure_floor = 1.039;
+  constexpr double source_amplitude = 2500.0;
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::explicit_zero, InitialMode::constant);
+  if (fields.initial.empty() || fields.source.size() != fields.initial.size())
+    return false;
+
+  // For Q1 Gauss--Legendre L2, the four nodal weights are equal.  These
+  // density-and-energy checkerboards therefore have exactly zero cell mean
+  // while stage 2, Y_3 = y_n + k_1, crosses both consumer floors.  The
+  // pressure pass contracts the density-limited polynomial strictly away
+  // from its corner density root, so coefficient-space vertex interpolation
+  // remains independently admissible rather than relying on root rounding.
+  // Stages 0 and 1 remain the admissible coherent entry state, so activation
+  // specifically reaches the causal-stage projection/rebuild path.
+  bool source_ready = true;
+  try
+  {
+    mfem::L2_FECollection collection(
+        order, 2, mfem::BasisType::GaussLegendre,
+        mfem::FiniteElement::VALUE);
+    mfem::ParFiniteElementSpace space(
+        &mesh, &collection, components, mfem::Ordering::byNODES);
+    for (int element = 0; element < mesh.GetNE() && source_ready; ++element)
+    {
+      const mfem::FiniteElement* const finite_element = space.GetFE(element);
+      mfem::Array<int> vdofs;
+      space.GetElementVDofs(element, vdofs);
+      source_ready = finite_element != nullptr &&
+          finite_element->GetDof() == scalar_dofs &&
+          vdofs.Size() == components * scalar_dofs;
+      for (int scalar = 0; scalar < scalar_dofs && source_ready; ++scalar)
+      {
+        double density_sign = 1.0;
+        double energy_sign = 1.0;
+        const int density_dof = DecodeSignedDof(
+            vdofs[scalar], density_sign);
+        const int energy_dof = DecodeSignedDof(
+            vdofs[3 * scalar_dofs + scalar], energy_sign);
+        const double local_value = scalar % 2 == 0
+            ? -source_amplitude : source_amplitude;
+        source_ready = density_dof >= 0 && energy_dof >= 0 &&
+            static_cast<std::size_t>(density_dof) < fields.source.size() &&
+            static_cast<std::size_t>(energy_dof) < fields.source.size();
+        if (source_ready)
+        {
+          fields.source[static_cast<std::size_t>(density_dof)] =
+              density_sign * local_value;
+          fields.source[static_cast<std::size_t>(energy_dof)] =
+              energy_sign * local_value;
+        }
+      }
+    }
+  }
+  catch (...) { source_ready = false; }
+  if (!All(source_ready, mesh.GetComm())) return false;
+
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::none);
+  request.backend.cuda_engine = CudaEngineKind::tensor_core;
+  request.time_treatment = EulerHdgTimeTreatment::rodas3;
+  request.numerical_policy.positivity_limiter = {
+      dg::hdg::generic::EulerHdgPositivityLimiterKind::zhang_shu,
+      dg::hdg::generic::EulerHdgZhangShuPointSet::consumer,
+      density_floor,
+      pressure_floor,
+      12};
+  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+      ContractStatus::accepted)
+    return false;
+
+  CudaConfig config = MakeDirectConfig(request, 1, order);
+  config.dt = dt;
+  config.cuda_engine = CudaEngineKind::tensor_core;
+  const CudaTracePolicyKind requested_policy =
+      dg::hdg::runtime::cuda_w8a::DefaultCudaTracePolicyRequest(
+          CudaEngineKind::tensor_core, false, 1,
+          EulerHdgTimeTreatment::rodas3);
+  auto engine = CudaQualificationTestAccess::CreateWithTracePolicy<
+      dg::hdg::runtime::Rodas3CudaRank1RuntimeSelection>(
+          config, requested_policy);
+  CudaRunEvidence initialization{};
+  if (!engine || !All(engine->Initialize(initialization), mesh.GetComm()))
+    return false;
+
+  CudaPrecommitSnapshot snapshot{};
+  CudaStepEvidence evidence{};
+  CudaRodas3ScreenObservation observation{};
+  CudaPreparedOutputMetadataV1 output{};
+  dg::hdg::generic::HdgEulerPreparedAssessment measured_assessment{};
+  dg::hdg::generic::HdgEulerPreparedAssessment strict_assessment{};
+  dg::hdg::generic::HdgEulerPreparedAssessment assessment{};
+  constexpr dg::hdg::generic::HdgEulerPreparedAssessmentPolicy
+      measurement_policy{1.0e-8, 1.0e-5, 1.0};
+  constexpr dg::hdg::generic::HdgEulerPreparedAssessmentPolicy
+      acceptance_policy{1.0e-8, 1.0e-5, 0.25};
+  CudaRodas3LimiterEndpointAudit endpoint_audit{};
+  const bool prepared = engine->PrepareStep(false, dt, snapshot, evidence);
+  const CudaStepEvidence prepared_evidence = evidence;
+  const bool captured = prepared &&
+      CudaQualificationTestAccess::CapturePreparedRodas3(
+          *engine, observation);
+  // Before metadata staging repacks output_interior, verify that the selected
+  // stage-consistent candidate is exactly admitted Y4 + gamma*q4 in U4.
+  const bool endpoint_audited = captured &&
+      CudaQualificationTestAccess::AuditPreparedRodas3LimiterEndpoint(
+          *engine, endpoint_audit);
+  const bool staged = endpoint_audited &&
+      engine->StagePreparedOutputMetadata(output, evidence);
+  // Measure the real post-limiter algebraic reconstruction.  When it is
+  // nonzero, set a valid bound strictly below it and prove rejection without
+  // fabricating a correction in private device storage.  Exact zero is also
+  // a legitimate fully coherent endpoint and must remain admissible.
+  const bool measured = staged && engine->AssessPrepared(
+      output, measurement_policy, measured_assessment);
+  const double measured_correction =
+      measured_assessment.normalized_algebraic_correction;
+  const bool nonzero_correction = measured_correction > 0.0;
+  const double strict_fraction = nonzero_correction
+      ? 0.5 * std::min(measured_correction, 1.0) : 0.0;
+  const dg::hdg::generic::HdgEulerPreparedAssessmentPolicy
+      strict_assessment_policy{1.0e-8, 1.0e-5, strict_fraction};
+  const bool strict_policy_ready = measured &&
+      std::isfinite(measured_correction) && measured_correction >= 0.0 &&
+      (!nonzero_correction ||
+       (strict_fraction > 0.0 && strict_fraction < measured_correction &&
+        dg::hdg::generic::IsValidHdgEulerPreparedAssessmentPolicy(
+            strict_assessment_policy)));
+  const bool strict_assessed = strict_policy_ready &&
+      (!nonzero_correction || engine->AssessPrepared(
+          output, strict_assessment_policy, strict_assessment));
+  const bool strict_primary_gates = strict_assessed &&
+      (nonzero_correction
+          ? strict_assessment.finite_gate &&
+                strict_assessment.solver_gate &&
+                strict_assessment.residual_gate &&
+                strict_assessment.admissibility_gate &&
+                strict_assessment.algebraic_closure_gate &&
+                !strict_assessment.algebraic_correction_gate &&
+                strict_assessment.normalized_algebraic_correction >
+                    strict_assessment_policy.algebraic_correction_fraction
+          : measured_assessment.finite_gate &&
+                measured_assessment.solver_gate &&
+                measured_assessment.residual_gate &&
+                measured_assessment.admissibility_gate &&
+                measured_assessment.algebraic_closure_gate &&
+                measured_assessment.algebraic_correction_gate &&
+                measured_correction == 0.0) &&
+      !output.output_staged && !output.successful_commit;
+  const bool assessed = strict_primary_gates &&
+      engine->AssessPrepared(
+          output, acceptance_policy, assessment);
+  const bool marked = assessed && assessment.algebraic_correction_gate &&
+      engine->MarkOutputStaged(output);
+  const bool commit_prepared = marked &&
+      engine->PrepareCommit(output, evidence);
+  const bool provisional = commit_prepared &&
+      engine->CommitPrepared(output, evidence);
+  const bool committed = provisional &&
+      engine->FinalizeCommit(output, evidence);
+
+  std::vector<double> committed_u4(fields.initial.size(), 0.0);
+  std::vector<double> theta_rho(
+      static_cast<std::size_t>(mesh.GetNE()), 0.0);
+  std::vector<double> theta_p(
+      static_cast<std::size_t>(mesh.GetNE()), 0.0);
+  const bool exported = committed && engine->ExportCommittedFields(
+      dg::hdg::generic::HdgEulerHostInteriorFields{
+          committed_u4.data(), nullptr, fields.volume_scalar_count,
+          theta_rho.data(), theta_p.data(),
+          static_cast<std::size_t>(mesh.GetNE())});
+  const bool limiter_diagnostics_active = exported &&
+      std::all_of(theta_rho.begin(), theta_rho.end(),
+                  [](const double value)
+                  { return std::isfinite(value) && value >= 0.0 && value <= 1.0; }) &&
+      std::all_of(theta_p.begin(), theta_p.end(),
+                  [](const double value)
+                  { return std::isfinite(value) && value >= 0.0 && value <= 1.0; }) &&
+      (std::any_of(theta_rho.begin(), theta_rho.end(),
+                   [](const double value) { return value < 1.0; }) ||
+       std::any_of(theta_p.begin(), theta_p.end(),
+                   [](const double value) { return value < 1.0; }));
+  const bool diagnostic_history_seeded = limiter_diagnostics_active &&
+      CudaQualificationTestAccess::
+          VerifyLimiterDiagnosticAcceptedHistorySeed(
+              *engine, theta_rho, theta_p);
+  bool consumer_coefficients_admissible = exported;
+  for (std::size_t scalar = 0;
+       scalar < fields.volume_scalar_count &&
+           consumer_coefficients_admissible;
+       ++scalar)
+  {
+    const double density = committed_u4[scalar];
+    const double momentum_x =
+        committed_u4[fields.volume_scalar_count + scalar];
+    const double momentum_y =
+        committed_u4[2 * fields.volume_scalar_count + scalar];
+    const double energy =
+        committed_u4[3 * fields.volume_scalar_count + scalar];
+    const double pressure = 0.4 *
+        (energy - 0.5 *
+            (momentum_x * momentum_x + momentum_y * momentum_y) / density);
+    consumer_coefficients_admissible = std::isfinite(density) &&
+        density >= density_floor && std::isfinite(pressure) &&
+        pressure >= pressure_floor;
+  }
+  const bool passed = prepared && captured && endpoint_audited && staged &&
+      measured && strict_policy_ready && strict_assessed &&
+      strict_primary_gates && assessed && marked && commit_prepared &&
+      provisional && committed && endpoint_audit.candidate_formula_passed &&
+      endpoint_audit.candidate_formula_nontrivial &&
+      snapshot.numerical_candidate_ready && observation.candidate_ready &&
+      observation.finite && observation.admissible && observation.recovery &&
+      observation.true_residual && observation.conservation &&
+      observation.telemetry && observation.success &&
+      assessment.finite_gate && assessment.solver_gate &&
+      assessment.residual_gate && assessment.admissibility_gate &&
+      assessment.algebraic_closure_gate &&
+      assessment.algebraic_correction_gate &&
+      evidence.status == CudaRunStatus::committed && evidence.committed &&
+      evidence.positivity_limiter_calls ==
+          prepared_evidence.positivity_limiter_calls &&
+      evidence.positivity_limiter_active_calls ==
+          prepared_evidence.positivity_limiter_active_calls &&
+      evidence.positivity_limiter_inadmissible_mean_rejections ==
+          prepared_evidence.positivity_limiter_inadmissible_mean_rejections &&
+      evidence.positivity_algebraic_projections ==
+          prepared_evidence.positivity_algebraic_projections &&
+      evidence.common_shift_operator_rebuilds ==
+          prepared_evidence.common_shift_operator_rebuilds &&
+      evidence.maximum_positivity_limiter_correction_norm ==
+          prepared_evidence.maximum_positivity_limiter_correction_norm &&
+      prepared_evidence.no_fallback && prepared_evidence.device_resident &&
+      prepared_evidence.positivity_limiter_calls == 6 &&
+      // Only causal stages 2 and 3 are eligible for reconstruction.  Two
+      // rebuilds therefore prove that the final-stage branch was exercised.
+      prepared_evidence.positivity_limiter_active_calls == 2 &&
+      prepared_evidence.positivity_limiter_inadmissible_mean_rejections == 0 &&
+      prepared_evidence.positivity_algebraic_projections ==
+          prepared_evidence.positivity_limiter_active_calls &&
+      prepared_evidence.common_shift_operator_rebuilds == 2 &&
+      prepared_evidence.common_shift_operator_builds ==
+          1 + prepared_evidence.common_shift_operator_rebuilds &&
+      prepared_evidence.common_shift_operator_reuses == 3 &&
+      prepared_evidence.condensed_rhs_refreshes == 3 &&
+      prepared_evidence.maximum_positivity_limiter_correction_norm > 0.0 &&
+      std::isfinite(prepared_evidence.temporal_error_norm) &&
+      std::isfinite(prepared_evidence.final_algebraic_residual) &&
+      std::isfinite(prepared_evidence.final_algebraic_correction_norm) &&
+      consumer_coefficients_admissible && limiter_diagnostics_active &&
+      diagnostic_history_seeded &&
+      output.successful_commit &&
+      evidence.after.step == 1 && evidence.after.generation == 1 &&
+      evidence.after.time == dt;
+  if (!passed)
+  {
+    int rank = -1;
+    MPI_Comm_rank(mesh.GetComm(), &rank);
+    if (rank == 0)
+    {
+      std::cerr << "CUDA Zhang--Shu active-stage lifecycle failed: prepared="
+                << prepared << " captured=" << captured
+                << " staged=" << staged
+                << " strict_assessed=" << strict_assessed
+                << " strict_primary=" << strict_primary_gates
+                << " reassessed=" << assessed
+                << " marked=" << marked
+                << " commit_prepared=" << commit_prepared
+                << " provisional=" << provisional
+                << " committed=" << committed << " status="
+                << static_cast<int>(evidence.status) << " phase="
+                << static_cast<int>(prepared_evidence.phase) << " reason="
+                << static_cast<int>(prepared_evidence.contract_reason)
+                << " calls="
+                << prepared_evidence.positivity_limiter_calls << " active="
+                << prepared_evidence.positivity_limiter_active_calls
+                << " mean_rejections="
+                << prepared_evidence.
+                    positivity_limiter_inadmissible_mean_rejections
+                << " projections="
+                << prepared_evidence.positivity_algebraic_projections
+                << " rebuilds="
+                << prepared_evidence.common_shift_operator_rebuilds
+                << " builds="
+                << prepared_evidence.common_shift_operator_builds
+                << " reuses="
+                << prepared_evidence.common_shift_operator_reuses
+                << " correction="
+                << prepared_evidence.maximum_positivity_limiter_correction_norm
+                << " conservation=" << observation.conservation
+                << " endpoint_formula="
+                << endpoint_audit.candidate_formula_passed
+                << " endpoint_formula_error="
+                << endpoint_audit.maximum_candidate_formula_scaled_error
+                << " diagnostic_history_seeded="
+                << diagnostic_history_seeded
+                << " measured_correction=" << measured_correction
+                << " strict_fraction=" << strict_fraction
+                << " strict_policy_ready=" << strict_policy_ready
+                << " strict_differential="
+                << strict_assessment.normalized_differential_error
+                << " strict_algebraic="
+                << strict_assessment.normalized_algebraic_correction
+                << " strict_algebraic_gate="
+                << strict_assessment.algebraic_correction_gate
+                << " normalized_differential="
+                << assessment.normalized_differential_error
+                << " normalized_algebraic="
+                << assessment.normalized_algebraic_correction
+                << " algebraic_gate="
+                << assessment.algebraic_correction_gate
+                << '\n';
+    }
+  }
+  return All(passed, mesh.GetComm());
+}
+
+bool CheckRodas3ZhangShuMeanRejectionAttribution()
+{
+  constexpr int order = 1;
+  constexpr double dt = 1.0e-6;
+  mfem::ParMesh mesh = MakePeriodicMesh();
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, order, SourceMode::empty, InitialMode::constant);
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, order, fields, boundary, false, RegularizationKind::none);
+  request.backend.cuda_engine = CudaEngineKind::tensor_core;
+  request.time_treatment = EulerHdgTimeTreatment::rodas3;
+  // The constant state has rho_bar=1.  A floor strictly above that mean is a
+  // deterministic no-repair limiter rejection, while the Euler state itself
+  // remains finite with positive physical density and pressure.
+  request.numerical_policy.positivity_limiter = {
+      dg::hdg::generic::EulerHdgPositivityLimiterKind::zhang_shu,
+      dg::hdg::generic::EulerHdgZhangShuPointSet::consumer,
+      1.001,
+      1.0e-8,
+      12};
+  if (dg::hdg::generic::ValidateEulerHdgRequest(request) !=
+      ContractStatus::accepted)
+    return false;
+
+  CudaConfig config = MakeDirectConfig(request, 1, order);
+  config.dt = dt;
+  config.cuda_engine = CudaEngineKind::tensor_core;
+  const CudaTracePolicyKind requested_policy =
+      dg::hdg::runtime::cuda_w8a::DefaultCudaTracePolicyRequest(
+          CudaEngineKind::tensor_core, false, 1,
+          EulerHdgTimeTreatment::rodas3);
+  auto engine = CudaQualificationTestAccess::CreateWithTracePolicy<
+      dg::hdg::runtime::Rodas3CudaRank1RuntimeSelection>(
+          config, requested_policy);
+  CudaRunEvidence initialization{};
+  if (!engine || !All(engine->Initialize(initialization), mesh.GetComm()))
+    return false;
+
+  CudaPrecommitSnapshot snapshot{};
+  CudaStepEvidence evidence{};
+  const bool prepared = engine->PrepareStep(false, dt, snapshot, evidence);
+  const CudaStepEvidence failed_evidence = evidence;
+  CudaStepEvidence rollback{};
+  const bool abandoned = !prepared && engine->RejectFailedAttempt(rollback);
+  std::vector<double> committed_u4(fields.initial.size(), 0.0);
+  std::vector<double> theta_rho(
+      static_cast<std::size_t>(mesh.GetNE()), 0.0);
+  std::vector<double> theta_p(
+      static_cast<std::size_t>(mesh.GetNE()), 0.0);
+  const bool diagnostics_rolled_back = abandoned &&
+      engine->ExportCommittedFields(
+          dg::hdg::generic::HdgEulerHostInteriorFields{
+              committed_u4.data(), nullptr, fields.volume_scalar_count,
+              theta_rho.data(), theta_p.data(),
+              static_cast<std::size_t>(mesh.GetNE())}) &&
+      std::all_of(theta_rho.begin(), theta_rho.end(),
+                  [](const double value) { return value == 1.0; }) &&
+      std::all_of(theta_p.begin(), theta_p.end(),
+                  [](const double value) { return value == 1.0; });
+  const bool passed = abandoned &&
+      failed_evidence.status == CudaRunStatus::retry_available &&
+      failed_evidence.phase == CudaFailurePhase::assembly &&
+      failed_evidence.contract_reason == FailureReason::admissibility_gate &&
+      failed_evidence.positivity_limiter_calls == 1 &&
+      failed_evidence.positivity_limiter_active_calls == 0 &&
+      failed_evidence.positivity_limiter_inadmissible_mean_rejections == 1 &&
+      failed_evidence.positivity_algebraic_projections == 0 &&
+      failed_evidence.common_shift_operator_builds == 0 &&
+      failed_evidence.common_shift_trace_solves == 0 &&
+      failed_evidence.retry_available &&
+      failed_evidence.coordinates_preserved &&
+      failed_evidence.committed_bytes_preserved &&
+      rollback.coordinates_preserved && rollback.committed_bytes_preserved &&
+      !rollback.retry_available && diagnostics_rolled_back;
+  if (!passed)
+  {
+    int rank = -1;
+    MPI_Comm_rank(mesh.GetComm(), &rank);
+    if (rank == 0)
+      std::cerr << "CUDA Zhang--Shu mean-rejection attribution failed: "
+                << "prepared=" << prepared << " abandoned=" << abandoned
+                << " status=" << static_cast<int>(failed_evidence.status)
+                << " phase=" << static_cast<int>(failed_evidence.phase)
+                << " reason="
+                << static_cast<int>(failed_evidence.contract_reason)
+                << " calls="
+                << failed_evidence.positivity_limiter_calls
+                << " active="
+                << failed_evidence.positivity_limiter_active_calls
+                << " mean_rejections="
+                << failed_evidence.
+                    positivity_limiter_inadmissible_mean_rejections
+                << " retry=" << failed_evidence.retry_available
+                << '\n';
+  }
+  return All(passed, mesh.GetComm());
+}
+
+bool CheckP3ZhangShuConsumerVertices(const CudaEngineKind engine_kind)
+{
+  mfem::ParMesh mesh = MakePhysicalMesh(1);
+  BorrowedFields fields = MakeBorrowedFields(
+      mesh, hidden_corner_order, SourceMode::explicit_zero,
+      InitialMode::hidden_corner_pressure);
+  HiddenCornerFieldAudit input{};
+  const bool input_audited = !fields.initial.empty() &&
+      fields.volume_scalar_count == hidden_corner_scalar_dofs &&
+      AuditHiddenCornerField(mesh, fields.initial, input);
+  double mean_pressure = 0.0;
+  const bool hidden_corner_witness = input_audited &&
+      input.selected_points_admissible && !input.vertices_admissible &&
+      input.minimum_selected_pressure > hidden_corner_pressure_floor &&
+      input.minimum_vertex_pressure < hidden_corner_pressure_floor &&
+      dg::hdg::euler::zhang_shu::Pressure(
+          input.mean.data(), 1.4, mean_pressure) &&
+      mean_pressure > hidden_corner_pressure_floor;
+
+  BoundaryContext boundary{};
+  EulerHdgRequest request = MakeRequest(
+      mesh, hidden_corner_order, fields, boundary, true,
+      RegularizationKind::none);
+  request.backend.cuda_engine = engine_kind;
+  request.time_treatment = EulerHdgTimeTreatment::rodas3;
+  request.numerical_policy.conventional_assembly_quadrature_order =
+      hidden_corner_quadrature_order;
+  request.numerical_policy.positivity_limiter = {
+      dg::hdg::generic::EulerHdgPositivityLimiterKind::zhang_shu,
+      dg::hdg::generic::EulerHdgZhangShuPointSet::consumer,
+      hidden_corner_density_floor,
+      hidden_corner_pressure_floor,
+      hidden_corner_pressure_bisections};
+  const bool request_valid = hidden_corner_witness &&
+      dg::hdg::generic::ValidateEulerHdgRequest(request) ==
+          ContractStatus::accepted;
+
+  CudaConfig config = MakeDirectConfig(request, 1, hidden_corner_order);
+  config.dt = 1.0e-8;
+  config.cuda_engine = engine_kind;
+  const std::array<double, components> reference{{
+      1.0, 0.05, -0.02, 2.60}};
+  const std::array<double, components> unused{};
+  const std::array<CudaStaticBoundaryPolicy, 4> device_policies{{
+      {1, CudaStaticBoundaryPolicyKind::slip_wall, unused, 0.0},
+      {2, CudaStaticBoundaryPolicyKind::supersonic_outlet, unused, 0.0},
+      {3, CudaStaticBoundaryPolicyKind::far_field, reference, 0.0},
+      {4, CudaStaticBoundaryPolicyKind::supersonic_inlet, reference, 0.0}}};
+  config.borrowed_global_topology = StableIdentity::Copy(
+      "generic.euler.request.topology.v1");
+  config.borrowed_boundary_policies = {
+      device_policies.data(), device_policies.size(), 1.4};
+  const CudaTracePolicyKind requested_policy =
+      dg::hdg::runtime::cuda_w8a::DefaultCudaTracePolicyRequest(
+          engine_kind, false, 1, EulerHdgTimeTreatment::rodas3);
+  using Engine = PersistentCudaSmoothEulerEngine<
+      dg::hdg::runtime::Rodas3CudaRank1RuntimeSelection>;
+  std::unique_ptr<Engine> engine{};
+  if (request_valid)
+  {
+    engine = CudaQualificationTestAccess::CreateWithTracePolicy<
+        dg::hdg::runtime::Rodas3CudaRank1RuntimeSelection>(
+        config, requested_policy);
+  }
+  CudaRunEvidence initialization{};
+  const bool initialized = engine && engine->Initialize(initialization);
+  CudaDirectZhangShuAudit device_audit{};
+  const bool limited = initialized &&
+      CudaQualificationTestAccess::ApplyDirectZhangShu(
+          *engine, fields.initial, device_audit);
+  HiddenCornerFieldAudit admitted{};
+  const bool output_audited = limited && AuditHiddenCornerField(
+      mesh, device_audit.limited_u4, admitted);
+
+  bool mean_preserved = output_audited;
+  for (int component = 0; component < components && mean_preserved;
+       ++component)
+  {
+    const double scale = std::max(
+        {1.0, std::abs(input.mean[component]),
+         std::abs(admitted.mean[component])});
+    mean_preserved = std::abs(
+        input.mean[component] - admitted.mean[component]) <=
+        2.0e-13 * scale;
+  }
+
+  const bool theta_ready = device_audit.theta_rho.size() == 1 &&
+      device_audit.theta_p.size() == 1 &&
+      device_audit.theta_rho[0] == 1.0 &&
+      std::isfinite(device_audit.theta_p[0]) &&
+      device_audit.theta_p[0] >= 0.0 &&
+      device_audit.theta_p[0] < 1.0;
+  const double exact_pressure_theta = theta_ready
+      ? (mean_pressure - hidden_corner_pressure_floor) /
+          (mean_pressure - input.minimum_vertex_pressure)
+      : 0.0;
+  const double bisection_width = std::ldexp(
+      1.0, -hidden_corner_pressure_bisections);
+  const bool conservative_pressure_bracket = theta_ready &&
+      device_audit.theta_p[0] <= exact_pressure_theta + 64.0 *
+          std::numeric_limits<double>::epsilon() &&
+      device_audit.theta_p[0] >=
+          exact_pressure_theta - bisection_width - 1.0e-12;
+
+  bool coefficient_formula = theta_ready &&
+      device_audit.limited_u4.size() == fields.initial.size();
+  for (int component = 0; component < components && coefficient_formula;
+       ++component)
+  {
+    const double theta = component == 0
+        ? device_audit.theta_rho[0] * device_audit.theta_p[0]
+        : device_audit.theta_p[0];
+    for (std::size_t scalar = 0;
+         scalar < fields.volume_scalar_count && coefficient_formula; ++scalar)
+    {
+      const std::size_t index =
+          static_cast<std::size_t>(component) *
+              fields.volume_scalar_count + scalar;
+      const double expected = (1.0 - theta) * input.mean[component] +
+          theta * fields.initial[index];
+      const double observed = device_audit.limited_u4[index];
+      const double scale = std::max(
+          {1.0, std::abs(expected), std::abs(observed)});
+      coefficient_formula = std::isfinite(observed) &&
+          std::abs(observed - expected) <= 512.0 *
+              std::numeric_limits<double>::epsilon() * scale;
+    }
+  }
+
+  const bool passed = request_valid && initialized && limited &&
+      device_audit.classification == 1 &&
+      device_audit.correction_squared > 0.0 && output_audited &&
+      admitted.selected_points_admissible && admitted.vertices_admissible &&
+      admitted.minimum_vertex_pressure >= hidden_corner_pressure_floor &&
+      mean_preserved && conservative_pressure_bracket &&
+      coefficient_formula;
+  int rank = -1;
+  MPI_Comm_rank(mesh.GetComm(), &rank);
+  if (!passed && rank == 0)
+  {
+    std::cerr << "CUDA Zhang--Shu p3 consumer-vertex failure: engine="
+              << (engine_kind == CudaEngineKind::tensor_core
+                      ? "tensor" : "ordinary")
+              << " witness=" << hidden_corner_witness
+              << " request=" << request_valid
+              << " initialized=" << initialized
+              << " limited=" << limited
+              << " classification=" << device_audit.classification
+              << " correction2=" << device_audit.correction_squared
+              << " input_selected=" << input.selected_points_admissible
+              << " input_vertex=" << input.vertices_admissible
+              << " input_vertex_p=" << input.minimum_vertex_pressure
+              << " output_vertex=" << admitted.vertices_admissible
+              << " output_vertex_p=" << admitted.minimum_vertex_pressure
+              << " mean_preserved=" << mean_preserved
+              << " theta_rho="
+              << (device_audit.theta_rho.empty()
+                      ? -1.0 : device_audit.theta_rho[0])
+              << " theta_p="
+              << (device_audit.theta_p.empty()
+                      ? -1.0 : device_audit.theta_p[0])
+              << " exact_theta=" << exact_pressure_theta
+              << " coefficient_formula=" << coefficient_formula << '\n';
+  }
+  return All(passed, mesh.GetComm());
+}
+
+bool CheckRodas3RankOneScreen(const int rank)
+{
+  Rodas3ScreenRecord conventional{};
+  Rodas3ScreenRecord igr{};
+  Rodas3ScreenRecord conventional_physical{};
+  Rodas3ScreenRecord igr_physical{};
+  Rodas3ScreenRecord ordinary_conventional{};
+  Rodas3ScreenRecord ordinary_igr{};
+  const bool conventional_passed = RunRodas3RankOneStep(
+      CudaEngineKind::tensor_core, RegularizationKind::none, conventional);
+  const bool igr_passed = RunRodas3RankOneStep(
+      CudaEngineKind::tensor_core, RegularizationKind::igr, igr);
+  const bool conventional_physical_passed = RunRodas3RankOneStep(
+      CudaEngineKind::tensor_core, RegularizationKind::none,
+      conventional_physical, true);
+  const bool igr_physical_passed = RunRodas3RankOneStep(
+      CudaEngineKind::tensor_core, RegularizationKind::igr,
+      igr_physical, true);
+  const bool ordinary_conventional_passed = RunRodas3RankOneStep(
+      CudaEngineKind::ordinary, RegularizationKind::none,
+      ordinary_conventional);
+  const bool ordinary_igr_passed = RunRodas3RankOneStep(
+      CudaEngineKind::ordinary, RegularizationKind::igr, ordinary_igr);
+  const bool assessment_authority =
+      CheckRodas3PreparedAssessmentAuthority();
+  const bool default_trace_architecture =
+      CheckRodas3DefaultTraceArchitecture();
+  const bool entry_projection_gate = CheckRodas3EntryProjectionGate();
+  const bool positivity_lifecycle =
+      CheckRodas3ZhangShuActiveStageLifecycle();
+  const bool positivity_mean_rejection =
+      CheckRodas3ZhangShuMeanRejectionAttribution();
+  const bool all_seven_boundary_policies =
+      CheckAllSevenLoweredBoundaryPolicies(1);
+  if (rank == 0)
+  {
+    const auto print = [](const char* mode, const Rodas3ScreenRecord& value)
+    {
+      const auto& evidence = value.evidence;
+      std::cout << "[cuda-rodas3-screen] mode=" << mode
+                << " setup_seconds=" << value.setup_seconds
+                << " step_seconds=" << value.step_seconds
+                << " common_shift_builds="
+                << evidence.common_shift_operator_builds
+                << " common_shift_reuses="
+                << evidence.common_shift_operator_reuses
+                << " rhs_refreshes=" << evidence.condensed_rhs_refreshes
+                << " trace_solves=" << evidence.common_shift_trace_solves
+                << " preconditioner_setups="
+                << evidence.common_shift_preconditioner_setups
+                << " preconditioner_reuses="
+                << evidence.common_shift_preconditioner_reuses
+                << " assemblies=" << evidence.complete_assemblies
+                << " condensations=" << evidence.complete_condensations
+                << " recoveries=" << evidence.complete_recoveries
+                << " linear_iterations=" << evidence.linear_iterations
+                << " temporal_error=" << evidence.temporal_error_norm
+                << " normalized_temporal_error="
+                << value.assessment.normalized_differential_error
+                << " algebraic_residual="
+                << evidence.final_algebraic_residual
+                << " algebraic_correction="
+                << evidence.final_algebraic_correction_norm
+                << " normalized_algebraic_correction="
+                << value.assessment.normalized_algebraic_correction
+                << " true_residual=" << evidence.true_relative_residual
+                << " conservation_relative="
+                << value.observation.maximum_conservation_relative_error
+                << " state_changed=" << value.state_changed
+                << " architecture_passed=" << value.architecture_passed
+                << " numerical_passed=" << value.numerical_passed
+                << " lifecycle_passed=" << value.lifecycle_passed
+                << " exact_jacobian_passed="
+                << value.exact_jacobian_passed
+                << " initial_closure_audited="
+                << value.initial_closure_audited
+                << " initial_closure_passed="
+                << value.initial_closure_passed;
+      if (value.initial_closure_audited)
+      {
+        std::cout << " initial_u4_exact="
+                  << value.initial_closure_audit.euler_interior_exact
+                  << " initial_uhat4_exact="
+                  << value.initial_closure_audit.euler_true_trace_exact
+                  << " initial_auxiliary_norms=";
+        for (const double norm :
+             value.initial_closure_audit.global_auxiliary_norms)
+          std::cout << norm << ',';
+        std::cout << " initial_scalar_residual="
+                  << value.initial_closure_audit.global_scalar_residual
+                  << " initial_scalar_relative_residual="
+                  << value.initial_closure_audit.
+                      global_scalar_relative_residual
+                  << " initial_lifecycle_zero="
+                  << value.initial_closure_audit.lifecycle_zero
+                  << " initial_combination_alias="
+                  << value.initial_closure_audit.combination_alias_exact;
+      }
+      std::cout << " exact_jacobian_errors=";
+      for (const double error : value.exact_jacobian_relative_errors)
+        std::cout << error << ',';
+      std::cout
+                << " candidate_ready="
+                << value.observation.candidate_ready
+                << " finite=" << value.observation.finite
+                << " admissible=" << value.observation.admissible
+                << " recovery=" << value.observation.recovery
+                << " true_residual_gate="
+                << value.observation.true_residual
+                << " conservation_gate="
+                << value.observation.conservation
+                << " telemetry=" << value.observation.telemetry
+                << " numerical_success=" << value.observation.success
+                << " passed=" << value.passed << '\n';
+    };
+    print("conventional", conventional);
+    print("igr", igr);
+    print("conventional-physical-source", conventional_physical);
+    print("igr-physical-source", igr_physical);
+    print("ordinary-conventional", ordinary_conventional);
+    print("ordinary-igr", ordinary_igr);
+    std::cout << "[cuda-rodas3-screen] prepared_assessment_authority="
+              << assessment_authority
+              << " default_trace_architecture="
+              << default_trace_architecture
+              << " entry_projection_gate=" << entry_projection_gate
+              << " positivity_lifecycle=" << positivity_lifecycle
+              << " positivity_mean_rejection="
+              << positivity_mean_rejection
+              << " all_seven_boundary_policies="
+              << all_seven_boundary_policies << '\n';
+  }
+  return conventional_passed && igr_passed &&
+      conventional_physical_passed && igr_physical_passed &&
+      ordinary_conventional_passed && ordinary_igr_passed &&
+      assessment_authority && default_trace_architecture &&
+      entry_projection_gate && positivity_lifecycle &&
+      positivity_mean_rejection &&
+      all_seven_boundary_policies;
+}
+
+bool CheckRodas3RankTwoScreen(
+    const int rank, const CudaEngineKind engine_kind)
+{
+  Rodas3ScreenRecord conventional{};
+  Rodas3ScreenRecord igr{};
+  const bool conventional_passed = RunRodas3RankTwoStep(
+      engine_kind, RegularizationKind::none, conventional);
+  const bool igr_passed = RunRodas3RankTwoStep(
+      engine_kind, RegularizationKind::igr, igr);
+  if (rank == 0)
+  {
+    const char* engine_name = engine_kind == CudaEngineKind::ordinary
+        ? "ordinary" : "tensor";
+    const auto print = [engine_name](
+        const char* mode, const Rodas3ScreenRecord& value)
+    {
+      const auto& evidence = value.evidence;
+      std::cout << "[cuda-rodas3-rank2-screen] engine=" << engine_name
+                << " mode=" << mode
+                << " setup_seconds=" << value.setup_seconds
+                << " step_seconds=" << value.step_seconds
+                << " common_shift_builds="
+                << evidence.common_shift_operator_builds
+                << " common_shift_reuses="
+                << evidence.common_shift_operator_reuses
+                << " rhs_refreshes=" << evidence.condensed_rhs_refreshes
+                << " trace_solves=" << evidence.common_shift_trace_solves
+                << " preconditioner_setups="
+                << evidence.common_shift_preconditioner_setups
+                << " preconditioner_reuses="
+                << evidence.common_shift_preconditioner_reuses
+                << " ilu_factor_setups="
+                << evidence.tensor_core.ilu_factor_setups
+                << " ilu_factor_reuses="
+                << evidence.tensor_core.ilu_factor_reuses
+                << " hypre_trace_calls="
+                << evidence.tensor_core.hypre_trace_solve_calls
+                << " temporal_error=" << evidence.temporal_error_norm
+                << " normalized_temporal_error="
+                << value.assessment.normalized_differential_error
+                << " algebraic_residual="
+                << evidence.final_algebraic_residual
+                << " algebraic_correction="
+                << evidence.final_algebraic_correction_norm
+                << " normalized_algebraic_correction="
+                << value.assessment.normalized_algebraic_correction
+                << " true_residual=" << evidence.true_relative_residual
+                << " conservation_relative="
+                << value.observation.maximum_conservation_relative_error
+                << " mpi_staging_bytes="
+                << evidence.transfers.mpi_staging_bytes
+                << " h2d_bytes=" << evidence.transfers.host_to_device_bytes
+                << " d2h_bytes=" << evidence.transfers.device_to_host_bytes
+                << " host_staged=" << value.host_staged_passed
+                << " finite=" << value.observation.finite
+                << " admissible=" << value.observation.admissible
+                << " final_dae="
+                << value.assessment.algebraic_closure_gate
+                << " conservation=" << value.observation.conservation
+                << " rollback=" << value.rollback_passed
+                << " retry=" << value.retry_passed
+                << " retry_common_shift="
+                << value.retry_evidence.common_shift_operator_builds << '/'
+                << value.retry_evidence.common_shift_operator_reuses << '/'
+                << value.retry_evidence.condensed_rhs_refreshes << '/'
+                << value.retry_evidence.common_shift_trace_solves
+                << " retry_hypre_trace_calls="
+                << value.retry_evidence.tensor_core.hypre_trace_solve_calls
+                << " architecture=" << value.architecture_passed
+                << " numerical=" << value.numerical_passed
+                << " lifecycle=" << value.lifecycle_passed
+                << " passed=" << value.passed << '\n';
+    };
+    print("conventional-rank2", conventional);
+    print("igr-rank2", igr);
+  }
+  return conventional_passed && igr_passed;
 }
 
 struct Options
@@ -6166,6 +8512,8 @@ struct Options
   EulerHdgTimeTreatment time_treatment =
       EulerHdgTimeTreatment::backward_euler;
   bool partitioned_smoke = false;
+  bool rodas3_screen = false;
+  bool rodas3_rank2_screen = false;
 };
 
 bool ParseOptions(const int argc, char* argv[], Options& options)
@@ -6201,6 +8549,8 @@ bool ParseOptions(const int argc, char* argv[], Options& options)
       else if (treatment == "partitioned-backward-euler")
         options.time_treatment =
             EulerHdgTimeTreatment::partitioned_backward_euler;
+      else if (treatment == "rodas3")
+        options.time_treatment = EulerHdgTimeTreatment::rodas3;
       else
         return false;
       continue;
@@ -6210,13 +8560,29 @@ bool ParseOptions(const int argc, char* argv[], Options& options)
       options.partitioned_smoke = true;
       continue;
     }
+    if (argument == "--rodas3-screen")
+    {
+      options.rodas3_screen = true;
+      continue;
+    }
+    if (argument == "--rodas3-rank2-screen")
+    {
+      options.rodas3_rank2_screen = true;
+      continue;
+    }
     return false;
   }
   const bool partitioned_selected = options.time_treatment ==
       EulerHdgTimeTreatment::partitioned_backward_euler;
+  const bool rodas3_selected = options.time_treatment ==
+      EulerHdgTimeTreatment::rodas3;
+  const bool any_rodas3_screen = options.rodas3_screen ||
+      options.rodas3_rank2_screen;
   return options.order >= dg::hdg::generic::minimum_polynomial_order &&
       options.order <= dg::hdg::generic::maximum_polynomial_order &&
-      options.partitioned_smoke == partitioned_selected;
+      options.partitioned_smoke == partitioned_selected &&
+      any_rodas3_screen == rodas3_selected &&
+      !(options.rodas3_screen && options.rodas3_rank2_screen);
 }
 
 bool CheckRecoveryDispatchAdmission() noexcept
@@ -6256,15 +8622,25 @@ int main(int argc, char* argv[])
       std::cerr << "Usage: " << argv[0]
                 << " --order 1|2|3 [--engine ordinary|tensor]"
                    " [--time-treatment backward-euler|"
-                   "partitioned-backward-euler] [--partitioned-smoke]\n";
+                   "partitioned-backward-euler|rodas3]"
+                   " [--partitioned-smoke|--rodas3-screen|"
+                   "--rodas3-rank2-screen]\n";
     return 2;
   }
   const int order = options.order;
   selected_cuda_engine = options.engine;
   selected_time_treatment = options.time_treatment;
-  const bool admission = order > 0 && CheckContractAdmission(order);
+  const bool admission = options.rodas3_screen ||
+      options.rodas3_rank2_screen ||
+      (order > 0 && CheckContractAdmission(order));
   mfem::Device device("cuda");
   (void)device;
+  if (options.rodas3_screen)
+    return ranks == 1 && CheckRodas3RankOneScreen(rank)
+        ? EXIT_SUCCESS : EXIT_FAILURE;
+  if (options.rodas3_rank2_screen)
+    return ranks == 2 && CheckRodas3RankTwoScreen(rank, options.engine)
+        ? EXIT_SUCCESS : EXIT_FAILURE;
   const bool recovery_dispatch_admission = CheckRecoveryDispatchAdmission();
   std::vector<double> conventional_periodic_state;
   std::vector<double> conventional_physical_state;
@@ -6357,6 +8733,8 @@ int main(int argc, char* argv[])
       CheckZeroUpdateFinalReconstruction(order);
   const bool rejected_armijo_rollback = order > 0 &&
       CheckRejectedArmijoRollback(order, ranks);
+  const bool p3_consumer_vertices = order != hidden_corner_order ||
+      ranks != 1 || CheckP3ZhangShuConsumerVertices(options.engine);
   const bool conventional_periodic = order > 0 && CheckLifecycle(
       order, false, RegularizationKind::none, SourceMode::nonzero,
       InitialMode::constant,
@@ -6408,7 +8786,7 @@ int main(int argc, char* argv[])
       tensor_diagonal_convergence_warning_rollback &&
       conventional_p1_q12_tensor_volume_multi_chunk_parity &&
       euler_algebra && zero_update_final_reconstruction &&
-      rejected_armijo_rollback &&
+      rejected_armijo_rollback && p3_consumer_vertices &&
       conventional_periodic && conventional_physical &&
       igr_periodic && igr_physical && boundary_effect && source_equivalence);
   if (!passed)
@@ -6438,6 +8816,7 @@ int main(int argc, char* argv[])
               << zero_update_final_reconstruction
               << " rejected_armijo_rollback="
               << rejected_armijo_rollback
+              << " p3_consumer_vertices=" << p3_consumer_vertices
               << " conventional_periodic=" << conventional_periodic
               << " conventional_physical=" << conventional_physical
               << " igr_periodic=" << igr_periodic

@@ -680,6 +680,7 @@ struct CudaIluAttemptFactorState
   int factor_nonzeros = 0;
   std::uint64_t factor_generation = 0;
   std::uint64_t last_solve_generation = 0;
+  std::uint64_t last_rhs_generation = 0;
   bool active = false;
   bool factor_ready = false;
 };
@@ -717,11 +718,39 @@ struct CudaElementSchwarzAttemptState
   AttemptIdentity attempt{};
   std::uint64_t factor_generation = 0;
   std::uint64_t last_solve_generation = 0;
+  std::uint64_t last_rhs_generation = 0;
   CudaTracePreconditionerKind factor_preconditioner =
       CudaTracePreconditionerKind::unconfigured;
   bool active = false;
   bool factor_ready = false;
 };
+
+enum class CudaTraceRhsTransition : std::uint8_t
+{
+  new_operator = 0,
+  same_operator_new_rhs = 1,
+  same_operator_same_rhs_retry = 2
+};
+
+constexpr bool CudaElementSchwarzRhsTransitionIsExact(
+    const CudaElementSchwarzAttemptState& state,
+    const std::uint64_t rhs_generation,
+    const CudaTraceRhsTransition transition) noexcept
+{
+  if (!state.active || rhs_generation == 0) return false;
+  switch (transition)
+  {
+  case CudaTraceRhsTransition::new_operator:
+    return rhs_generation > state.last_rhs_generation;
+  case CudaTraceRhsTransition::same_operator_new_rhs:
+    return state.factor_ready &&
+        rhs_generation > state.last_rhs_generation;
+  case CudaTraceRhsTransition::same_operator_same_rhs_retry:
+    return state.factor_ready &&
+        rhs_generation == state.last_rhs_generation;
+  }
+  return false;
+}
 
 inline bool CudaElementSchwarzFactorTransitionIsExact(
     const CudaElementSchwarzAttemptState& state,
@@ -862,12 +891,23 @@ struct CudaGenericArenaLayout
   std::size_t face_trace = 0;
   std::size_t face_weight = 0;
   std::size_t face_normal = 0;
+  // Four reference-square vertex evaluations of the interior scalar basis.
+  // These are shared by every element and exist only for Zhang--Shu.
+  std::size_t limiter_vertex_shape = 0;
   std::size_t face_h = 0;
   std::size_t element_faces = 0;
   std::size_t boundary_reference = 0;
   std::size_t boundary_pressure = 0;
+  // Two transactional slots, each with density and pressure theta per local
+  // element.  This slice exists only for a selected RODAS Zhang--Shu policy.
+  std::size_t positivity_diagnostics = 0;
   std::size_t native_ilu_inverse_diagonal = 0;
   std::size_t partitioned_base_interior = 0;
+  std::size_t rodas_interior_vectors = 0;
+  std::size_t rodas_true_trace_vectors = 0;
+  std::size_t rodas_local_trace_vectors = 0;
+  std::size_t rodas_element_trace_vectors = 0;
+  std::size_t rodas_coupling_matrices = 0;
   std::size_t solve_workspace = 0;
   std::size_t two_exchange_keys = 0;
 };
@@ -915,6 +955,25 @@ struct CudaDeviceView
   // Partitioned Backward Euler snapshots one block family while the
   // complementary subsystem is solved and audited bit-for-bit.
   double* partitioned_base_interior = nullptr;
+  // RODAS3 keeps four causal increments plus one combination vector and one
+  // residual vector for the volume unknowns.  Trace storage has four causal
+  // increments plus one combination; element-local residual g and retained
+  // common-shift B/C use their native element layouts.
+  double* rodas_stage_interior[
+      ::dg::hdg::time::Rodas3Coefficients::stage_count]{};
+  double* rodas_stage_true_trace[
+      ::dg::hdg::time::Rodas3Coefficients::stage_count]{};
+  // Rank two distributes every owned stage increment into one persistent
+  // ghost-complete local trace vector before the exact face-balance witness.
+  // Rank one leaves these null and continues to read its owned=true vectors.
+  double* rodas_stage_local_trace[
+      ::dg::hdg::time::Rodas3Coefficients::stage_count]{};
+  double* rodas_combination_interior = nullptr;
+  double* rodas_combination_true_trace = nullptr;
+  double* rodas_residual_f = nullptr;
+  double* rodas_residual_g = nullptr;
+  double* rodas_operator_b = nullptr;
+  double* rodas_operator_c = nullptr;
   // Compact four-component element-local staging used only for host output.
   // The nonlinear trial is written directly into work_interior.
   double* output_interior = nullptr;
@@ -955,6 +1014,7 @@ struct CudaDeviceView
   double* face_trace_shape = nullptr;
   double* face_weight = nullptr;
   double* face_normal = nullptr;
+  double* limiter_vertex_shape = nullptr;
   // Element-volume / face-measure length used by the IGR auxiliary closure.
   double* face_h = nullptr;
   // Borrowed-host physical-boundary data.  A zero kind is an ordinary
@@ -962,6 +1022,8 @@ struct CudaDeviceView
   // value-only exterior policy for this element-local face.
   double* boundary_reference = nullptr;
   double* boundary_pressure = nullptr;
+  double* positivity_theta_rho[2]{};
+  double* positivity_theta_p[2]{};
   double* status = nullptr;
   double* scalar = nullptr;
   std::uint64_t* hash_words = nullptr;
@@ -2112,6 +2174,13 @@ bool CudaLaunchStatusReduction(const double* status, int count,
 bool CudaLaunchGatherLocalTrace(const int* signed_map, int count,
                                 const double* true_trace,
                                 double* local_trace) noexcept;
+bool CudaLaunchZhangShuU4(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    const generic::EulerHdgPositivityLimiterPolicy& policy,
+    int diagnostic_slot, int* device_result,
+    double* correction_squared) noexcept;
+bool CudaLaunchInitializeZhangShuDiagnostics(
+    const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
 bool CudaLaunchAdmissibility(const CudaDeviceView& view,
                              const CudaMeshShape& shape) noexcept;
 bool CudaLaunchFreezeBorrowedCurrentLlfTau(const CudaDeviceView& view,
@@ -2150,11 +2219,13 @@ constexpr bool CudaRecoveryRouteSupported(
 bool CudaLaunchBorrowedAssembly(
     const CudaDeviceView& view, const CudaMeshShape& shape, double dt,
     CudaBorrowedAssemblyKind kind,
-    std::uint64_t& tensor_volume_mma_tiles) noexcept;
+    std::uint64_t& tensor_volume_mma_tiles,
+    bool differentiate_nonlinearities = false) noexcept;
 bool CudaLaunchAssembly(const CudaDeviceView& view,
                         const CudaMeshShape& shape, double dt,
                         generic::CudaEngineKind engine,
-                        std::uint64_t& tensor_volume_mma_tiles) noexcept;
+                        std::uint64_t& tensor_volume_mma_tiles,
+                        bool differentiate_nonlinearities = false) noexcept;
 bool CudaLaunchFrozenBorrowedLlfAssembly(
     const CudaDeviceView& view, const CudaMeshShape& shape,
     double dt) noexcept;
@@ -2171,10 +2242,58 @@ bool CudaLaunchPartitionedBackwardEulerStateAudit(
     bool audit_auxiliary) noexcept;
 bool CudaLaunchPartitionedScalarClosureRestoreEuler(
     const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
+bool CudaLaunchRodasAlgebraicMask(const CudaDeviceView& view,
+                                 const CudaMeshShape& shape) noexcept;
+bool CudaLaunchRodasFreezeDifferentialIncrement(
+    const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
+bool CudaLaunchRodasRestoreDifferentialState(
+    const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
+bool CudaLaunchRodasLoadStage(const CudaDeviceView& view,
+                             const CudaMeshShape& shape,
+                             std::size_t stage) noexcept;
+bool CudaLaunchRodasSeedAlgebraicProjection(
+    const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
+bool CudaLaunchRodasBuildStageRightHandSide(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    std::size_t stage, double step_size) noexcept;
+bool CudaLaunchRodasCaptureStageIncrement(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    std::size_t stage) noexcept;
+bool CudaLaunchRodasCopyDifferentialState(
+    const CudaMeshShape& shape, const double* source,
+    double* destination) noexcept;
+bool CudaLaunchRodasFormCandidate(const CudaDeviceView& view,
+                                 const CudaMeshShape& shape,
+                                 bool admitted_final_stage) noexcept;
+bool CudaLaunchRodasTemporalErrorSquared(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    double* result) noexcept;
+bool CudaLaunchRodasFilteredPairErrorSquared(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    double* result, double* differential_measure) noexcept;
+bool CudaLaunchRodasAlgebraicCorrectionSquared(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    double* result) noexcept;
+bool CudaLaunchRodasPreparedAssessmentSquared(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    double absolute_tolerance, double relative_tolerance,
+    double* differential_result, double* algebraic_result,
+    double* differential_measure) noexcept;
+bool CudaLaunchRodasPreparedFilteredPairAssessmentSquared(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    double absolute_tolerance, double relative_tolerance,
+    double* differential_result, double* algebraic_result,
+    double* differential_measure) noexcept;
 bool CudaLaunchCondensation(const CudaDeviceView& view,
                             const CudaMeshShape& shape,
                             generic::CudaEngineKind engine,
                             std::uint64_t& tensor_mma_tiles) noexcept;
+// Rebuild only the condensed element right-hand side from retained pivoted
+// interior factors.  This leaf deliberately neither reads nor writes
+// solve_workspace: tensor volume assembly is allowed to reuse that slice
+// between causal stage solves.
+bool CudaLaunchCondenseRetainedLuRhs(const CudaDeviceView& view,
+                                    const CudaMeshShape& shape) noexcept;
 bool CudaLaunchZeroTrueSystem(const CudaTrueMatrixDeviceView& matrix,
                               double* rhs, int rhs_count) noexcept;
 bool CudaLaunchAssembleOwnedMatrix(const CudaDeviceView& view,
@@ -2198,6 +2317,10 @@ bool CudaLaunchScatterRemoteVector(const CudaDeviceView& view,
 bool CudaLaunchRecover(const CudaDeviceView& view,
                        const CudaMeshShape& shape,
                        generic::CudaEngineKind engine) noexcept;
+// Explicit retained-factor recovery for a causal stage whose tensor assembly
+// has overwritten solve_workspace after the common operator was condensed.
+bool CudaLaunchRecoverFromRetainedLu(const CudaDeviceView& view,
+                                     const CudaMeshShape& shape) noexcept;
 bool CudaLaunchTrial(const CudaDeviceView& view,
                      const CudaMeshShape& shape, double alpha) noexcept;
 bool CudaLaunchPackInteriorOutput(const CudaMeshShape& shape,
@@ -2220,6 +2343,15 @@ bool CudaLaunchMaximumWave(const CudaDeviceView& view,
 bool CudaLaunchEulerConservation(const CudaDeviceView& view,
                                  const CudaMeshShape& shape,
                                  double dt, double* result) noexcept;
+bool CudaLaunchRodasConservation(const CudaDeviceView& view,
+                                 const CudaMeshShape& shape,
+                                 double dt, double* result) noexcept;
+bool CudaLaunchRodasAdmittedStageConservation(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    double dt, std::size_t stage, double* result) noexcept;
+bool CudaLaunchRodasConservationVolume(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    double dt, double* result) noexcept;
 
 bool CudaLaunchHash(const double* values, int count,
                     std::uint64_t* words) noexcept;
@@ -2288,6 +2420,13 @@ public:
     communicator_ = CudaCollectiveCommunicator(config);
     cuda_engine_ = config.cuda_engine;
     time_treatment_ = config.time_treatment;
+    rodas3_ = time_treatment_ == generic::EulerHdgTimeTreatment::rodas3;
+    positivity_limiter_enabled_ = rodas3_ &&
+        config.use_generic_numerical_policy &&
+        config.numerical_policy.positivity_limiter.kind ==
+            generic::EulerHdgPositivityLimiterKind::zhang_shu;
+    committed_limiter_diagnostics_ = 0;
+    candidate_limiter_diagnostics_ = 1;
     const bool igr_requested = config.use_generic_numerical_policy &&
         config.numerical_policy.stabilization.kind ==
             generic::RegularizationKind::igr;
@@ -2526,6 +2665,14 @@ public:
       ReportCudaSetupFailure(evidence.rank, "upload-topology-state");
       return false;
     }
+    if (!CollectiveContinue(
+            !positivity_limiter_enabled_ ||
+            CudaLaunchInitializeZhangShuDiagnostics(view_, shape_)))
+    {
+      ReportCudaSetupFailure(evidence.rank,
+                             "initialize-positivity-diagnostics");
+      return false;
+    }
     CudaBeginTrueSystemDiagnostic(rank_);
     const bool true_system_ready = BuildPersistentTrueSystem();
     CudaEndTrueSystemDiagnostic(true_system_ready);
@@ -2681,10 +2828,10 @@ public:
       return false;
     }
     if (!CollectiveContinue(
-            BootstrapPartitionedScalarClosure(config)))
+            BootstrapInitialScalarClosure(config)))
     {
       ReportCudaSetupFailure(evidence.rank,
-                             "partitioned-scalar-bootstrap");
+                             "initial-scalar-bootstrap");
       return false;
     }
     resources_.mfem_pin = StableIdentity::Copy(
@@ -2796,6 +2943,9 @@ public:
     const state_slot prior_committed = committed_slot_;
     committed_slot_ = candidate_slot_;
     candidate_slot_ = prior_committed;
+    if (positivity_limiter_enabled_)
+      std::swap(committed_limiter_diagnostics_,
+                candidate_limiter_diagnostics_);
   }
   /** Certify only a final scalar-projected candidate after logical commit. */
   void MarkCommittedScalarClosureCoherent() noexcept
@@ -2852,6 +3002,100 @@ public:
       const CudaSerializedCheckpointV1& checkpoint, state_slot& workspace,
       double dt) noexcept;
   state_slot& WorkspaceSlot() noexcept { return workspace_slot_; }
+
+  /**
+   * Compute the controller-facing RODAS3 norms for one exact frozen
+   * candidate.  The step-entry U4 state and the pre-reconstruction algebraic
+   * state are retained privately by ExecuteRodas3. The differential U4 norm
+   * is a quadrature-weighted physical L2 RMS; the algebraic correction keeps
+   * its coefficient-count RMS because trace and auxiliary spaces have no
+   * shared physical mass measure.
+   */
+  bool AssessPreparedRodas3(
+      const AttemptIdentity& attempt,
+      const StateHash& expected_interior_hash,
+      const StateHash& expected_trace_hash,
+      const bool filtered_pair,
+      const generic::HdgEulerPreparedAssessmentPolicy policy,
+      generic::HdgEulerPreparedAssessment& assessment) noexcept
+  {
+    assessment = {};
+    bool local_valid = initialized_ && rodas3_ &&
+        ::dg::hdg::runtime::detail::SameAttempt(current_attempt_, attempt) &&
+        generic::IsValidHdgEulerPreparedAssessmentPolicy(policy) &&
+        workspace_slot_.interior.coefficients == view_.work_interior &&
+        workspace_slot_.trace.coefficients == view_.work_true_trace &&
+        workspace_slot_.interior.count == shape_.interior_count &&
+        workspace_slot_.trace.count == shape_.true_trace_count &&
+        shape_.interior_components >= conserved_components &&
+        shape_.scalar_interior_dofs > 0 && shape_.elements > 0 &&
+        shape_.true_trace_count > 0 && view_.rodas_residual_f != nullptr &&
+        view_.rodas_combination_interior != nullptr &&
+        view_.rodas_combination_true_trace != nullptr &&
+        view_.scalar != nullptr;
+    if (!CollectiveContinue(local_valid)) return false;
+
+    // Descriptor hashes alone are insufficient authority: recompute them
+    // from the private device buffers before granting an assessment.
+    if (!UpdateStateHashes(workspace_slot_)) return false;
+    local_valid = workspace_slot_.interior.hash == expected_interior_hash &&
+        workspace_slot_.trace.hash == expected_trace_hash;
+    if (!CollectiveContinue(local_valid)) return false;
+
+    // The limiter-enabled attempt retained its already-admitted final-stage
+    // predictor in the leading U4 lanes of rodas_combination_interior.  The
+    // default path launches the original error-weight kernels byte-for-byte;
+    // it performs no capture, copy, or alternative assessment work.
+    const bool launched = filtered_pair
+        ? CudaLaunchRodasPreparedFilteredPairAssessmentSquared(
+              view_, shape_, policy.absolute_tolerance,
+              policy.relative_tolerance, view_.scalar, view_.scalar + 1,
+              view_.scalar + 2)
+        : CudaLaunchRodasPreparedAssessmentSquared(
+              view_, shape_, policy.absolute_tolerance,
+              policy.relative_tolerance, view_.scalar, view_.scalar + 1,
+              view_.scalar + 2);
+    std::array<double, 3> local_sums{{
+        std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::infinity()}};
+    const bool copied = launched && TransportPolicy::DeviceToHost(
+             local_sums.data(), view_.scalar, sizeof(local_sums),
+             CudaTransferCategory::scalar_diagnostic,
+             CudaTransferSite::scalar_status) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    if (!CollectiveContinue(copied)) return false;
+
+    std::array<double, 3> global_sums{};
+    const std::uint64_t local_algebraic_count =
+        static_cast<std::uint64_t>(shape_.elements) *
+                static_cast<std::uint64_t>(
+                    shape_.interior_components - conserved_components) *
+                static_cast<std::uint64_t>(shape_.scalar_interior_dofs) +
+            static_cast<std::uint64_t>(shape_.true_trace_count);
+    std::uint64_t global_algebraic_count = 0;
+    const bool reduced = MPI_Allreduce(
+            local_sums.data(), global_sums.data(),
+            static_cast<int>(global_sums.size()), MPI_DOUBLE, MPI_SUM,
+            communicator_) == MPI_SUCCESS &&
+        MPI_Allreduce(&local_algebraic_count, &global_algebraic_count, 1,
+                      MPI_UINT64_T, MPI_SUM, communicator_) == MPI_SUCCESS;
+    local_valid = reduced && global_algebraic_count > 0 &&
+        std::isfinite(global_sums[0]) && global_sums[0] >= 0.0 &&
+        std::isfinite(global_sums[1]) && global_sums[1] >= 0.0 &&
+        std::isfinite(global_sums[2]) && global_sums[2] > 0.0;
+    if (!CollectiveContinue(local_valid)) return false;
+
+    assessment.normalized_differential_error = std::sqrt(
+        global_sums[0] /
+        (static_cast<double>(conserved_components) * global_sums[2]));
+    assessment.normalized_algebraic_correction = std::sqrt(
+        global_sums[1] /
+        static_cast<double>(global_algebraic_count));
+    return CollectiveContinue(
+        generic::IsValidHdgEulerPreparedAssessment(assessment));
+  }
+
   const PersistentResourceDescriptor& Resources() const noexcept
   {
     return resources_;
@@ -2994,6 +3238,75 @@ public:
     return checkpoint.checkpoint_staged;
   }
 
+  /**
+   * Materialize one metadata-staged candidate into exact caller-owned spans.
+   * The fixed V1 checkpoint DTO remains unchanged; this seam merely removes
+   * its compile-time payload capacity from the generic borrowed-mesh route.
+   */
+  bool ExportPreparedCheckpointPayload(
+      const state_slot& frozen,
+      const CudaPreparedOutputMetadataV1& metadata,
+      double* interior, const std::size_t interior_count,
+      double* owned_true_trace,
+      const std::size_t owned_true_trace_count) noexcept
+  {
+    const bool local_descriptor_valid = initialized_ &&
+        metadata.schema == 1 && metadata.candidate_frozen &&
+        metadata.checkpoint_staged && !metadata.output_staged &&
+        !metadata.successful_commit && metadata.source_rank == rank_ &&
+        metadata.rank_count == ranks_ &&
+        metadata.local_mesh_hash == local_mesh_hash_ &&
+        metadata.local_partition_hash == local_partition_hash_ &&
+        metadata.local_topology_hash == local_topology_hash_ &&
+        frozen.interior.coefficients != nullptr &&
+        frozen.trace.coefficients != nullptr && interior != nullptr &&
+        owned_true_trace != nullptr &&
+        interior_count == frozen.interior.count &&
+        owned_true_trace_count == frozen.trace.count &&
+        metadata.interior_count == interior_count &&
+        metadata.owned_true_trace_count == owned_true_trace_count &&
+        metadata.local_interior_hash == frozen.interior.local_hash &&
+        metadata.local_trace_hash == frozen.trace.local_hash &&
+        metadata.interior_source_token == frozen.interior.storage_token &&
+        metadata.trace_source_token == frozen.trace.storage_token &&
+        metadata.staging_generation == frozen.interior.generation &&
+        frozen.interior.generation == frozen.trace.generation;
+    if (!CollectiveContinue(local_descriptor_valid)) return false;
+
+    const bool interior_copied = TransportPolicy::DeviceToHost(
+            interior, frozen.interior.coefficients,
+            interior_count * sizeof(double),
+            CudaTransferCategory::checkpoint_candidate_staging,
+            CudaTransferSite::checkpoint_stage_interior,
+            frozen.interior.count * sizeof(double),
+            interior_count * sizeof(double));
+    const bool trace_copied = TransportPolicy::DeviceToHost(
+            owned_true_trace, frozen.trace.coefficients,
+            owned_true_trace_count * sizeof(double),
+            CudaTransferCategory::checkpoint_candidate_staging,
+            CudaTransferSite::checkpoint_stage_trace,
+            frozen.trace.count * sizeof(double),
+            owned_true_trace_count * sizeof(double));
+    const bool synchronized = TransportPolicy::Synchronize(
+        CudaTransferSite::checkpoint_stage_trace);
+    if (!CollectiveContinue(
+            interior_copied && trace_copied && synchronized))
+      return false;
+
+    bool finite = true;
+    for (std::size_t i = 0; finite && i < interior_count; ++i)
+      finite = std::isfinite(interior[i]);
+    for (std::size_t i = 0; finite && i < owned_true_trace_count; ++i)
+      finite = std::isfinite(owned_true_trace[i]);
+    const StateHash host_interior = HashHostBytes(
+        interior, interior_count * sizeof(double));
+    const StateHash host_trace = HashHostBytes(
+        owned_true_trace, owned_true_trace_count * sizeof(double));
+    return CollectiveContinue(finite &&
+        host_interior == metadata.local_interior_hash &&
+        host_trace == metadata.local_trace_hash);
+  }
+
   bool ImportCheckpoint(const CudaSerializedCheckpointV1& checkpoint,
                         state_slot& loaded) noexcept
   {
@@ -3057,6 +3370,83 @@ public:
     return CollectiveContinue(
         loaded.interior.hash == checkpoint.descriptor.interior_hash &&
         loaded.trace.hash == checkpoint.descriptor.trace_hash);
+  }
+
+  /** Restore exact caller-owned spans described by committed V1 metadata. */
+  bool ImportCheckpoint(
+      const CudaPreparedOutputMetadataV1& metadata,
+      const double* interior, const std::size_t interior_count,
+      const double* owned_true_trace,
+      const std::size_t owned_true_trace_count,
+      state_slot& loaded) noexcept
+  {
+    const bool local_descriptor_valid = metadata.schema == 1 &&
+        metadata.successful_commit && metadata.rank_count == ranks_ &&
+        metadata.source_rank == rank_ &&
+        metadata.local_mesh_hash == local_mesh_hash_ &&
+        metadata.local_partition_hash == local_partition_hash_ &&
+        metadata.local_topology_hash == local_topology_hash_ &&
+        interior != nullptr && owned_true_trace != nullptr &&
+        interior_count == loaded.interior.count &&
+        owned_true_trace_count == loaded.trace.count &&
+        metadata.interior_count == interior_count &&
+        metadata.owned_true_trace_count == owned_true_trace_count;
+    if (!CollectiveContinue(local_descriptor_valid)) return false;
+
+    bool finite = true;
+    for (std::size_t i = 0; finite && i < interior_count; ++i)
+      finite = std::isfinite(interior[i]);
+    for (std::size_t i = 0; finite && i < owned_true_trace_count; ++i)
+      finite = std::isfinite(owned_true_trace[i]);
+    const StateHash host_interior = HashHostBytes(
+        interior, interior_count * sizeof(double));
+    const StateHash host_trace = HashHostBytes(
+        owned_true_trace, owned_true_trace_count * sizeof(double));
+    const bool host_payload_valid = finite &&
+        host_interior == metadata.local_interior_hash &&
+        host_trace == metadata.local_trace_hash;
+    if (!CollectiveContinue(host_payload_valid)) return false;
+
+    const bool interior_copied = TransportPolicy::HostToDevice(
+            loaded.interior.coefficients, interior,
+            interior_count * sizeof(double),
+            CudaTransferCategory::checkpoint_restore_import,
+            CudaTransferSite::checkpoint_import_interior,
+            interior_count * sizeof(double),
+            loaded.interior.count * sizeof(double));
+    const bool trace_copied = TransportPolicy::HostToDevice(
+            loaded.trace.coefficients, owned_true_trace,
+            owned_true_trace_count * sizeof(double),
+            CudaTransferCategory::checkpoint_restore_import,
+            CudaTransferSite::checkpoint_import_trace,
+            owned_true_trace_count * sizeof(double),
+            loaded.trace.count * sizeof(double));
+    const bool synchronized = TransportPolicy::Synchronize(
+        CudaTransferSite::checkpoint_import_trace);
+    if (!CollectiveContinue(
+            interior_copied && trace_copied && synchronized))
+      return false;
+
+    StateHash copied_interior{};
+    StateHash copied_trace{};
+    const bool local_hash_ready = HashState(
+            loaded.interior.coefficients, shape_.interior_count,
+            copied_interior) &&
+        HashState(loaded.trace.coefficients, shape_.true_trace_count,
+                  copied_trace);
+    const bool copied_hashes_valid = local_hash_ready &&
+        copied_interior == host_interior && copied_trace == host_trace;
+    if (!CollectiveContinue(copied_hashes_valid)) return false;
+    loaded.interior.local_hash = copied_interior;
+    loaded.trace.local_hash = copied_trace;
+    if (!AggregateHash(copied_interior, loaded.interior.hash) ||
+        !AggregateHash(copied_trace, loaded.trace.hash))
+      return false;
+    loaded.interior.generation = metadata.descriptor.coordinates.generation;
+    loaded.trace.generation = metadata.descriptor.coordinates.generation;
+    return CollectiveContinue(
+        loaded.interior.hash == metadata.descriptor.interior_hash &&
+        loaded.trace.hash == metadata.descriptor.trace_hash);
   }
 
   CudaReuseEvidence ReuseEvidence() const noexcept
@@ -3299,7 +3689,8 @@ private:
    */
   bool AuditBorrowedEulerAssemblerJacobian(
       const double relative_tolerance,
-      std::array<double, 6>& relative_errors) noexcept
+      std::array<double, 6>& relative_errors,
+      const bool differentiate_nonlinearities = false) noexcept
   {
     relative_errors.fill(std::numeric_limits<double>::infinity());
     const bool component_layout = shape_.igr_active
@@ -3441,7 +3832,8 @@ private:
                     view_, shape_, fixed_dt)
               : CudaLaunchAssembly(
                     view_, shape_, fixed_dt, cuda_engine_,
-                    ignored_volume_mma_tiles)) &&
+                    ignored_volume_mma_tiles,
+                    differentiate_nonlinearities)) &&
           StatusPassed();
       if (!CollectiveContinue(assembled)) return false;
       if (residual_interior == nullptr || residual_trace == nullptr)
@@ -3475,7 +3867,7 @@ private:
     // that same candidate value only for the finite-difference perturbations
     // below: A/B/C/D intentionally omit d-tau while every ordinary residual
     // or line-search assembly refreshes tau from its own current candidate.
-    if (!shape_.igr_active)
+    if (!differentiate_nonlinearities && !shape_.igr_active)
     {
       const bool tau_frozen = CudaLaunchFreezeBorrowedCurrentLlfTau(
               view_, shape_) && StatusPassed();
@@ -3580,9 +3972,9 @@ private:
       catch (...) { ready = false; }
       if (!CollectiveContinue(ready) ||
           !assemble(plus_interior, plus_trace, &plus_r, &plus_g,
-                    !shape_.igr_active) ||
+                    !differentiate_nonlinearities && !shape_.igr_active) ||
           !assemble(minus_interior, minus_trace, &minus_r, &minus_g,
-                    !shape_.igr_active))
+                    !differentiate_nonlinearities && !shape_.igr_active))
         return false;
       try
       {
@@ -3726,10 +4118,107 @@ public:
                               std::isfinite(maximum_relative_error));
   }
 
+  /**
+   * Verify the full singular-mass RODAS3 balance.  The default device witness
+   * reconstructs the four causal stage states from retained increments.  A
+   * positivity-enabled attempt instead supplies boundary terms reduced while
+   * each actual admitted stage was resident; this method adds them to the
+   * endpoint volume/source term.  Neither path is a Backward-Euler endpoint
+   * balance. Only the four differential Euler equations contribute.
+   */
+  bool RodasConservationBalance(
+      const double dt, double& maximum_error,
+      double& maximum_relative_error,
+      const double* const admitted_stage_boundary_balance = nullptr,
+      const double* const admitted_stage_boundary_scale = nullptr) noexcept
+  {
+    maximum_error = 0.0;
+    maximum_relative_error = 0.0;
+    constexpr int components = igr_trace_components;
+    static_assert(euler_conservation_result_scalars == 2 * components + 2);
+    std::array<double, euler_conservation_result_scalars> local{};
+    const bool admitted_stage_witness =
+        admitted_stage_boundary_balance != nullptr &&
+        admitted_stage_boundary_scale != nullptr;
+    const bool witness_pointer_pair = admitted_stage_witness ||
+        (admitted_stage_boundary_balance == nullptr &&
+         admitted_stage_boundary_scale == nullptr);
+    const bool launched = initialized_ && rodas3_ &&
+        shape_.borrowed_host_inputs && std::isfinite(dt) && dt > 0.0 &&
+        witness_pointer_pair &&
+        (admitted_stage_witness
+             ? CudaLaunchRodasConservationVolume(
+                   view_, shape_, dt, view_.scalar)
+             : CudaLaunchRodasConservation(
+                   view_, shape_, dt, view_.scalar));
+    if (!CollectiveContinue(launched)) return false;
+    const bool copied = TransportPolicy::DeviceToHost(
+            local.data(), view_.scalar, local.size() * sizeof(double),
+            CudaTransferCategory::scalar_diagnostic,
+            CudaTransferSite::scalar_status) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    bool local_valid = copied && local[2 * components + 1] == 1.0 &&
+        std::isfinite(local[2 * components]) &&
+        local[2 * components] >= 0.0;
+    if (local_valid && admitted_stage_witness)
+      for (int component = 0; component < components; ++component)
+      {
+        const double boundary_balance =
+            admitted_stage_boundary_balance[component];
+        const double boundary_scale = admitted_stage_boundary_scale[component];
+        local_valid = std::isfinite(boundary_balance) &&
+            std::isfinite(boundary_scale) && boundary_scale >= 0.0;
+        if (!local_valid) break;
+        local[static_cast<std::size_t>(component)] += boundary_balance;
+        local[static_cast<std::size_t>(components + component)] +=
+            boundary_scale;
+        local_valid =
+            std::isfinite(local[static_cast<std::size_t>(component)]) &&
+            std::isfinite(local[static_cast<std::size_t>(
+                components + component)]) &&
+            local[static_cast<std::size_t>(components + component)] >= 0.0;
+      }
+    for (int index = 0; local_valid && index <= 2 * components; ++index)
+      local_valid = std::isfinite(local[static_cast<std::size_t>(index)]);
+    if (!CollectiveContinue(local_valid)) return false;
+
+    std::array<double, components> global_balance{};
+    std::array<double, components> global_scale{};
+    double global_domain_measure = 0.0;
+    const bool balance_reduced = MPI_Allreduce(
+        local.data(), global_balance.data(), components, MPI_DOUBLE,
+        MPI_SUM, communicator_) == MPI_SUCCESS;
+    const bool scale_reduced = MPI_Allreduce(
+        local.data() + components, global_scale.data(), components,
+        MPI_DOUBLE, MPI_SUM, communicator_) == MPI_SUCCESS;
+    const bool measure_reduced = MPI_Allreduce(
+        local.data() + 2 * components, &global_domain_measure, 1,
+        MPI_DOUBLE, MPI_SUM, communicator_) == MPI_SUCCESS;
+    if (!CollectiveContinue(balance_reduced && scale_reduced &&
+                            measure_reduced &&
+                            std::isfinite(global_domain_measure) &&
+                            global_domain_measure > 0.0))
+      return false;
+    for (int component = 0; component < conserved_components; ++component)
+    {
+      const double error = std::abs(
+          global_balance[static_cast<std::size_t>(component)]);
+      const double relative =
+          dg::hdg::generic::EulerHdgConservationRelativeError(
+              error, global_scale[static_cast<std::size_t>(component)],
+              global_domain_measure);
+      maximum_error = std::max(maximum_error, error);
+      maximum_relative_error = std::max(maximum_relative_error, relative);
+    }
+    return CollectiveContinue(std::isfinite(maximum_error) &&
+                              std::isfinite(maximum_relative_error));
+  }
+
   CudaNumericalResult Execute(const CudaConfig& config,
                               const AttemptIdentity& attempt,
                               state_slot& workspace) noexcept
   {
+    if (rodas3_) return ExecuteRodas3(config, attempt, workspace);
     ::dg_igr::NVTXRange accepted_step_profile_region(
         ::dg_igr::observability::RegionId::hdg_accepted_step);
     CudaIluFactorAttemptEndGuard end_factor_attempt(ilu_factor_state_);
@@ -4482,7 +4971,8 @@ public:
         element_schwarz_selected
         ? result.tensor_core.native_element_schwarz_configured &&
             result.tensor_core.element_schwarz_patch_rows ==
-                NativeElementSchwarzIgrPatchRows(shape_.order) &&
+                NativeElementSchwarzPatchRows(
+                    shape_.order, shape_.igr_active) &&
             result.tensor_core.element_schwarz_minimum_multiplicity >= 1 &&
             result.tensor_core.element_schwarz_maximum_multiplicity >=
                 result.tensor_core.element_schwarz_minimum_multiplicity &&
@@ -4716,10 +5206,14 @@ public:
                       CudaMutableHostL2Output destination) noexcept;
   bool ExportFields(
       const CudaInteriorState& source,
-      generic::HdgEulerHostInteriorFields destination) noexcept;
+      generic::HdgEulerHostInteriorFields destination,
+      bool prepared_diagnostics) noexcept;
 
 private:
   friend struct CudaQualificationTestAccess;
+
+  /** Seed one attempt's transactional diagnostic slot from accepted history. */
+  bool SeedCandidateLimiterDiagnostics() noexcept;
 
   static bool IgrActive(const CudaConfig& config) noexcept
   {
@@ -5391,11 +5885,34 @@ private:
       layout.true_trace = true_trace;
       layout.partitioned_base_interior =
           partitioned_backward_euler_ ? interior : 0;
+      if (rodas3_)
+      {
+        valid = valid &&
+            checked_product(interior, 6, layout.rodas_interior_vectors) &&
+            checked_product(true_trace, 5,
+                            layout.rodas_true_trace_vectors) &&
+            checked_product(local_trace,
+                            ranks_ == 2
+                                ? ::dg::hdg::time::Rodas3Coefficients::
+                                      stage_count
+                                : 0,
+                            layout.rodas_local_trace_vectors) &&
+            checked_product(layout.element_trace, 1,
+                            layout.rodas_element_trace_vectors) &&
+            checked_product(layout.element_coupling, 2,
+                            layout.rodas_coupling_matrices);
+      }
       layout.element_faces = element_faces;
       layout.face_h = shape_.igr_active ? element_faces : 0;
       valid = valid && checked_product(element_faces, conserved_components,
                                        layout.boundary_reference);
       layout.boundary_pressure = element_faces;
+      if (positivity_limiter_enabled_)
+        valid = valid && checked_product(
+                elements, 4, layout.positivity_diagnostics) &&
+            checked_product(static_cast<std::size_t>(4),
+                            scalar_interior_dofs,
+                            layout.limiter_vertex_shape);
       layout.native_ilu_inverse_diagonal =
           native_trace && CudaTracePreconditionerIsIlu(
               trace_policy_descriptor_.trace_preconditioner)
@@ -5409,7 +5926,14 @@ private:
       const std::size_t host_local_trace = generic ? local_trace : maximum_local_trace_dofs;
       const std::size_t host_true_trace = generic ? true_trace : maximum_true_trace_dofs;
       const std::size_t host_matrix = generic ? layout.local_matrix : maximum_local_matrix_entries;
-      const std::size_t host_exchange = generic ? layout.local_matrix : maximum_exchange_entries;
+      // Rank one has no host-staged matrix exchange.  Its device exchange
+      // slices remain deliberately reserved and are reused by the native
+      // element-Schwarz implementation, but allocating the corresponding
+      // host keys/maps/value buffers consumed multiple GiB at p3/refinement 1
+      // even though no rank-one code can read them.
+      const std::size_t host_exchange = generic
+          ? (ranks_ == 2 ? layout.local_matrix : 0)
+          : maximum_exchange_entries;
 
       signed_element_trace_.assign(host_element_trace, 0);
       local_global_true_.assign(host_local_trace, 0);
@@ -5434,6 +5958,9 @@ private:
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points, 0.0);
       host_face_normal_.assign(generic ? layout.face_normal :
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * dimension, 0.0);
+      host_limiter_vertex_shape_.assign(
+          positivity_limiter_enabled_ ? layout.limiter_vertex_shape : 0,
+          0.0);
       host_face_h_.assign(generic && shape_.igr_active ? layout.face_h : 0,
                           1.0);
       host_boundary_reference_.assign(generic &&
@@ -5455,6 +5982,8 @@ private:
                                  : conserved_components) *
               shape_.scalar_interior_dofs,
           0.0);
+      host_export_positivity_.assign(
+          positivity_limiter_enabled_ ? 2 * host_elements : 0, 1.0);
       signed_element_interior_.assign(host_interior, 0);
       host_matrix_owned_source_.assign(host_matrix, 0);
       host_matrix_owned_section_.assign(host_matrix, 0);
@@ -5466,10 +5995,8 @@ private:
       host_vector_owned_target_.assign(host_element_trace, 0);
       host_vector_send_source_.assign(host_element_trace, 0);
       host_vector_receive_target_.assign(host_element_trace, 0);
-      matrix_send_keys_.assign(generic ? layout.two_exchange_keys :
-          2 * host_exchange, 0);
-      matrix_receive_keys_.assign(generic ? layout.two_exchange_keys :
-          2 * host_exchange, 0);
+      matrix_send_keys_.assign(2 * host_exchange, 0);
+      matrix_receive_keys_.assign(2 * host_exchange, 0);
       vector_send_keys_.assign(host_element_trace, 0);
       vector_receive_keys_.assign(host_element_trace, 0);
       matrix_send_host_.assign(host_exchange, 0.0);
@@ -5513,8 +6040,17 @@ private:
           (!shape_.borrowed_static_boundary_policies ||
            (checked_add(doubles, layout.boundary_reference) &&
             checked_add(doubles, layout.boundary_pressure))) &&
+          (!positivity_limiter_enabled_ ||
+           (checked_add(doubles, layout.positivity_diagnostics) &&
+            checked_add(doubles, layout.limiter_vertex_shape))) &&
           (!partitioned_backward_euler_ ||
            checked_add(doubles, layout.partitioned_base_interior)) &&
+          (!rodas3_ ||
+           (checked_add(doubles, layout.rodas_interior_vectors) &&
+            checked_add(doubles, layout.rodas_true_trace_vectors) &&
+            checked_add(doubles, layout.rodas_local_trace_vectors) &&
+            checked_add(doubles, layout.rodas_element_trace_vectors) &&
+            checked_add(doubles, layout.rodas_coupling_matrices))) &&
           (!native_trace ||
            (checked_add(doubles, layout.native_ilu_inverse_diagonal) &&
             checked_add(doubles,
@@ -5688,6 +6224,11 @@ private:
                           double* true_values,
                           bool completion_required) noexcept;
   bool AssembleTrueSystem() noexcept;
+  // RHS refresh that preserves the retained element Schur blocks and already
+  // assembled global operator. Rank one may assemble natively; rank two uses
+  // the established host-staged distributed vector assembly only.
+  bool RefreshRetainedTrueRhs() noexcept;
+  bool DistributeRodasStageIncrement(std::size_t stage) noexcept;
   bool LaunchAndObserveNativeRankOneTraceSolve(
       const CudaNativeIlu0FactorView& factor,
       const CudaNativeElementSchwarzView& element_schwarz,
@@ -5701,6 +6242,7 @@ private:
                        CudaNativeTraceActiveSubspace active_subspace,
                        double requested_relative_tolerance,
                        bool same_matrix_retry,
+                       bool same_operator_new_rhs,
                        int& linear_iterations,
                        CudaTensorCoreEvidence& tensor_core_evidence) noexcept;
   bool SolveTrueSystem(generic::EulerHdgLinearSolveRole role,
@@ -5710,16 +6252,20 @@ private:
                        int& linear_iterations,
                        int& linear_solve_attempts,
                        int& true_residual_tightenings,
-                       CudaTensorCoreEvidence& tensor_core_evidence) noexcept;
+                       CudaTensorCoreEvidence& tensor_core_evidence,
+                       bool same_operator_new_rhs = false) noexcept;
   bool AssembleAndNorm(state_slot& workspace, double dt,
                        double& norm,
                        CudaTensorCoreEvidence& tensor_core_evidence) noexcept;
+  CudaNumericalResult ExecuteRodas3(const CudaConfig& config,
+                                    const AttemptIdentity& attempt,
+                                    state_slot& workspace) noexcept;
   bool AssemblePartitionedScalarClosure(
       state_slot& workspace, double dt, double& norm,
       CudaTensorCoreEvidence& tensor_core_evidence) noexcept;
   bool PartitionedAuxiliaryNorm(
       state_slot& workspace, double& norm) noexcept;
-  bool BootstrapPartitionedScalarClosure(const CudaConfig& config) noexcept;
+  bool BootstrapInitialScalarClosure(const CudaConfig& config) noexcept;
   bool SolvePartitionedScalarClosure(
       state_slot& workspace, generic::EulerHdgLinearSolveRole role,
       CudaNumericalResult& result,
@@ -5730,6 +6276,10 @@ private:
   bool HashState(const double* values, int count, StateHash& hash) noexcept;
   bool AggregateHash(const StateHash& local, StateHash& aggregate) const
       noexcept;
+  bool RequiresInitialScalarClosure() const noexcept
+  {
+    return shape_.igr_active && (partitioned_backward_euler_ || rodas3_);
+  }
   std::size_t WorkspaceBytes() const noexcept;
   bool OraclePayloadFitsCapacity() const noexcept;
   void CaptureOracleMetadata(const AttemptIdentity& attempt,
@@ -5756,6 +6306,10 @@ private:
   bool oracle_captured_ = false;
   bool oracle_capture_requested_ = false;
   bool partitioned_backward_euler_ = false;
+  bool rodas3_ = false;
+  bool positivity_limiter_enabled_ = false;
+  int committed_limiter_diagnostics_ = 0;
+  int candidate_limiter_diagnostics_ = 1;
   bool committed_scalar_closure_coherent_ = false;
   StateHash committed_scalar_closure_interior_hash_{};
   StateHash committed_scalar_closure_trace_hash_{};
@@ -5797,6 +6351,7 @@ private:
       rank_one_equilibration_host_control_{};
   std::vector<double> host_true_diag_values_{};
   std::vector<double> host_true_offd_values_{};
+  std::vector<double> host_export_positivity_{};
   double* double_arena_ = nullptr;
   int* integer_arena_ = nullptr;
   // False-mode retains the literal W8A capacities and BindArenaViews branch.
@@ -5855,6 +6410,9 @@ private:
   AttemptIdentity current_attempt_{};
   std::uint64_t current_generation_ = 0;
   std::uint64_t linear_generation_ = 0;
+  // Monotone authority for the live true-vector contents.  Matrix generation
+  // alone cannot distinguish a causal new stage RHS from a tolerance retry.
+  std::uint64_t true_rhs_generation_ = 0;
   std::uint64_t baseline_allocations_ = 0;
   std::uint64_t accepted_allocation_events_ = 0;
   std::uint64_t baseline_w8_owned_allocation_calls_ = 0;
@@ -5888,6 +6446,7 @@ private:
   std::vector<double> host_face_trace_shape_{};
   std::vector<double> host_face_weight_{};
   std::vector<double> host_face_normal_{};
+  std::vector<double> host_limiter_vertex_shape_{};
   std::vector<double> host_face_h_{};
   std::vector<double> host_boundary_reference_{};
   std::vector<double> host_boundary_pressure_{};

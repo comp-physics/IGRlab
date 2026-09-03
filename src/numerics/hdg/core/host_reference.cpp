@@ -516,6 +516,93 @@ Status HostReferenceEngine::Condense(const LocalSystemBatchView& input,
   catch (const std::length_error&) { return Status::allocation_failure; }
 }
 
+Status HostReferenceEngine::RefreshRightHandSide(
+    const StridedBlockView<const double> f,
+    const StridedBlockView<const double> g,
+    const StridedBlockView<double> right_hand_side) noexcept
+{
+  if (!ready_) return Status::not_ready;
+  const std::size_t ni =
+      static_cast<std::size_t>(shape_.InteriorUnknowns());
+  const std::size_t nt =
+      static_cast<std::size_t>(shape_.TraceUnknowns());
+  if (!Valid(f, batch_count_, ni, 1) ||
+      !Valid(g, batch_count_, nt, 1))
+  {
+    return Status::invalid_view;
+  }
+  const Status rhs_status =
+      ValidateWritable(right_hand_side, batch_count_, nt, 1);
+  if (rhs_status != Status::success) return rhs_status;
+  Status alias_status = ValidateDisjoint(right_hand_side, f);
+  if (alias_status != Status::success) return alias_status;
+  alias_status = ValidateDisjoint(right_hand_side, g);
+  if (alias_status != Status::success) return alias_status;
+
+  if (batch_count_ > std::numeric_limits<std::size_t>::max() / ni ||
+      batch_count_ > std::numeric_limits<std::size_t>::max() / nt)
+  {
+    return Status::overflow;
+  }
+  const std::size_t f_count = batch_count_ * ni;
+  const std::size_t rhs_count = batch_count_ * nt;
+  try
+  {
+    const bool prepared = staged_f_.size() == f_count &&
+        staged_rhs_.size() == rhs_count && work_.size() >= ni;
+    std::vector<double> local_f, local_rhs, local_work;
+    std::vector<double>& next_f = prepared ? staged_f_ : local_f;
+    std::vector<double>& next_rhs = prepared ? staged_rhs_ : local_rhs;
+    std::vector<double>& solve = prepared ? work_ : local_work;
+    if (!prepared)
+    {
+      next_f.resize(f_count);
+      next_rhs.resize(rhs_count);
+      solve.resize(ni);
+    }
+    for (std::size_t batch = 0; batch < batch_count_; ++batch)
+    {
+      CopyIn(f, batch, next_f.data() + batch * ni);
+      if (!AllFinite(next_f.data() + batch * ni, ni))
+        return Status::non_finite;
+      std::copy(next_f.begin() + static_cast<std::ptrdiff_t>(batch * ni),
+                next_f.begin() +
+                    static_cast<std::ptrdiff_t>((batch + 1) * ni),
+                solve.begin());
+      if (!Solve(lu_.data() + batch * ni * ni,
+                 pivots_.data() + batch * ni, ni, solve.data(), 1))
+      {
+        return Status::non_finite;
+      }
+      for (std::size_t row = 0; row < nt; ++row)
+      {
+        const double value = g(batch, static_cast<LocalIndex>(row), 0);
+        if (!std::isfinite(value)) return Status::non_finite;
+        double reduced = value;
+        for (std::size_t column = 0; column < ni; ++column)
+        {
+          reduced -= c_[batch * nt * ni + row * ni + column] *
+              solve[column];
+        }
+        if (!std::isfinite(reduced)) return Status::non_finite;
+        next_rhs[batch * nt + row] = reduced;
+      }
+    }
+    for (std::size_t batch = 0; batch < batch_count_; ++batch)
+    {
+      CopyOut(next_rhs.data() + batch * nt, nt, 1,
+              right_hand_side, batch);
+    }
+    if (prepared)
+      std::copy(next_f.begin(), next_f.end(), f_.begin());
+    else
+      f_.swap(next_f);
+    return Status::success;
+  }
+  catch (const std::bad_alloc&) { return Status::allocation_failure; }
+  catch (const std::length_error&) { return Status::allocation_failure; }
+}
+
 Status HostReferenceEngine::ApplySchur(const StridedBlockView<const double> trace,
                                        const StridedBlockView<double> result) const noexcept
 {

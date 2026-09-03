@@ -145,6 +145,10 @@ struct CudaQualificationTestAccess
     if (session.partitioned_backward_euler_borrowed_rank2_)
       return CapturePrepared(
           *session.partitioned_backward_euler_borrowed_rank2_, observation);
+    if (session.rodas3_borrowed_rank1_)
+      return CapturePrepared(*session.rodas3_borrowed_rank1_, observation);
+    if (session.rodas3_borrowed_rank2_)
+      return CapturePrepared(*session.rodas3_borrowed_rank2_, observation);
     return false;
   }
 
@@ -180,6 +184,10 @@ struct CudaQualificationTestAccess
     if (session.partitioned_backward_euler_borrowed_rank2_)
       return CaptureCommitted(
           *session.partitioned_backward_euler_borrowed_rank2_, hashes);
+    if (session.rodas3_borrowed_rank1_)
+      return CaptureCommitted(*session.rodas3_borrowed_rank1_, hashes);
+    if (session.rodas3_borrowed_rank2_)
+      return CaptureCommitted(*session.rodas3_borrowed_rank2_, hashes);
     return false;
   }
 
@@ -218,6 +226,10 @@ struct CudaQualificationTestAccess
     if (session.partitioned_backward_euler_borrowed_rank2_)
       return CaptureProblemMetadata(
           *session.partitioned_backward_euler_borrowed_rank2_, metadata);
+    if (session.rodas3_borrowed_rank1_)
+      return CaptureProblemMetadata(*session.rodas3_borrowed_rank1_, metadata);
+    if (session.rodas3_borrowed_rank2_)
+      return CaptureProblemMetadata(*session.rodas3_borrowed_rank2_, metadata);
     return false;
   }
 };
@@ -235,6 +247,8 @@ using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::EulerBoundaryPolicyTableView;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::generic::EulerHdgTimeTreatment;
+using dg::hdg::generic::HdgEulerPreparedAssessment;
+using dg::hdg::generic::HdgEulerPreparedAssessmentPolicy;
 using dg::hdg::generic::HdgEulerSessionStatus;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::runtime::StateHash;
@@ -255,6 +269,7 @@ using dg::hdg::runtime::cuda_w8a::CudaTracePolicyDescriptor;
 using dg::hdg::runtime::cuda_w8a::CudaTracePolicyDescriptorIsExact;
 using dg::hdg::runtime::cuda_w8a::CudaTracePolicyKind;
 using dg::hdg::runtime::cuda_w8a::CudaTracePolicyKindName;
+using dg::hdg::runtime::cuda_w8a::DefaultCudaTracePolicyRequest;
 using dg::hdg::runtime::cuda_w8a::
     CudaTracePolicyUsesNativeElementMatrixFreeOperator;
 using dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy;
@@ -283,6 +298,7 @@ constexpr int principal_threads = 128;
 constexpr int principal_element_threads = 4;
 constexpr int principal_elements_per_block =
     principal_threads / principal_element_threads;
+constexpr double rodas3_algebraic_correction_fraction = 0.25;
 constexpr int default_mesh_n = 104;
 constexpr int warmup_steps = 1;
 constexpr int default_measured_steps = 5;
@@ -340,6 +356,8 @@ struct Options
   int measured_steps = default_measured_steps;
   int profile_measured_step = -1;
   double timestep = default_timestep;
+  double time_absolute_tolerance = 0.0;
+  double time_relative_tolerance = 0.0;
   // Backward-compatible common override plus role-specific policy controls.
   double linear_relative_tolerance = 0.0;
   double newton_correction_linear_relative_tolerance = 0.0;
@@ -353,6 +371,8 @@ struct Options
   std::string expected_build_directory{};
   std::string expected_cmake_cache{};
   bool export_interior = false;
+  bool time_absolute_tolerance_supplied = false;
+  bool time_relative_tolerance_supplied = false;
   bool help = false;
 };
 
@@ -370,9 +390,14 @@ struct StepSample
   std::uint64_t exported_interior_checksum = 0;
   CudaTransferTotals transfers{};
   CudaAcceptedStepBenchmarkObservation prepared{};
+  HdgEulerPreparedAssessmentPolicy assessment_policy{};
+  HdgEulerPreparedAssessment assessment{};
   CudaAcceptedStepCommittedHashes committed{};
   dg::hdg::generic::HdgEulerSessionCoordinates coordinates{};
   dg::hdg::generic::HdgEulerCommittedDiagnostics diagnostics{};
+  bool assessment_required = false;
+  bool assessment_performed = false;
+  bool assessment_accepted = false;
 };
 
 struct DeviceMemorySnapshot
@@ -458,6 +483,8 @@ constexpr const char* TimeIntegratorJsonName(
     return "backward_euler";
   case EulerHdgTimeTreatment::partitioned_backward_euler:
     return "partitioned_backward_euler";
+  case EulerHdgTimeTreatment::rodas3:
+    return "rodas3";
   }
   return "invalid";
 }
@@ -474,6 +501,11 @@ bool SelectTimeIntegrator(
   {
     options.time_treatment =
         EulerHdgTimeTreatment::partitioned_backward_euler;
+    return true;
+  }
+  if (text == "rodas3")
+  {
+    options.time_treatment = EulerHdgTimeTreatment::rodas3;
     return true;
   }
   return false;
@@ -801,8 +833,8 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     {
       if (++index >= argc || !SelectTimeIntegrator(argv[index], options))
       {
-        error = "--time-integrator requires backward-euler or "
-                "partitioned-backward-euler";
+        error = "--time-integrator requires backward-euler, "
+                "partitioned-backward-euler, or rodas3";
         return false;
       }
       continue;
@@ -893,6 +925,28 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
         error = "--dt requires a finite positive FP64 value";
         return false;
       }
+      continue;
+    }
+    if (argument == "--time-atol")
+    {
+      if (++index >= argc ||
+          !ParsePositiveDouble(argv[index], options.time_absolute_tolerance))
+      {
+        error = "--time-atol requires a finite positive FP64 value";
+        return false;
+      }
+      options.time_absolute_tolerance_supplied = true;
+      continue;
+    }
+    if (argument == "--time-rtol")
+    {
+      if (++index >= argc ||
+          !ParsePositiveDouble(argv[index], options.time_relative_tolerance))
+      {
+        error = "--time-rtol requires a finite positive FP64 value";
+        return false;
+      }
+      options.time_relative_tolerance_supplied = true;
       continue;
     }
     if (argument == "--linear-rtol")
@@ -1034,6 +1088,21 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     error = "--profile-measured-step must be less than --measured-steps";
     return false;
   }
+  const bool rodas3 =
+      options.time_treatment == EulerHdgTimeTreatment::rodas3;
+  if (rodas3 && (!options.time_absolute_tolerance_supplied ||
+                 !options.time_relative_tolerance_supplied))
+  {
+    error = "--time-integrator rodas3 requires explicit --time-atol and "
+            "--time-rtol";
+    return false;
+  }
+  if (!rodas3 && (options.time_absolute_tolerance_supplied ||
+                  options.time_relative_tolerance_supplied))
+  {
+    error = "--time-atol and --time-rtol require --time-integrator rodas3";
+    return false;
+  }
   const bool have_igr_volume_order =
       options.igr_volume_assembly_quadrature_order != 0;
   const bool have_igr_face_order =
@@ -1095,7 +1164,7 @@ void PrintUsage(const char* executable)
 {
   std::cout << "Usage: " << executable
             << " [--mode conventional|igr] [--engine ordinary|tensor]"
-               " [--time-integrator backward-euler|partitioned-backward-euler]"
+               " [--time-integrator backward-euler|partitioned-backward-euler|rodas3]"
                " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi10-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi10-fp64]"
                " [coupled-policy native-element-schwarz-matrix-free-warp-"
                "coupled-fp64|native-element-schwarz-matrix-free-warp-"
@@ -1104,7 +1173,9 @@ void PrintUsage(const char* executable)
                "schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-"
                "fp64]"
                " [--order 1|2|3] [--mesh-n N]"
-               " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
+               " [--domain-periods K] [--dt DT]"
+               " [--time-atol ATOL --time-rtol RTOL]"
+               " [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
                " [--true-residual-tightening-linear-rtol RTOL]"
                " [--igr-volume-quadrature-order Q]"
@@ -1113,7 +1184,7 @@ void PrintUsage(const char* executable)
                " [--profile-measured-step INDEX]\n"
                "       " << executable
             << " [--conventional|--igr] [--engine ordinary|tensor]"
-               " [--time-integrator backward-euler|partitioned-backward-euler]"
+               " [--time-integrator backward-euler|partitioned-backward-euler|rodas3]"
                " [--trace-policy engine-default|common-fast|equilibrated-mgr|native-element-schwarz-fp64|native-element-schwarz-matrix-free-fp64|native-element-schwarz-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi1-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi2-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi3-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi4-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi5-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi6-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi7-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi8-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi9-fp64|native-element-schwarz-matrix-free-equilibrated-field-split-sigma-jacobi10-fp64|native-element-schwarz-matrix-free-warp-equilibrated-field-split-sigma-jacobi10-fp64]"
                " [coupled-policy native-element-schwarz-matrix-free-warp-"
                "coupled-fp64|native-element-schwarz-matrix-free-warp-"
@@ -1122,7 +1193,9 @@ void PrintUsage(const char* executable)
                "schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-"
                "fp64]"
                " [--order 1|2|3] [--mesh-n N]"
-               " [--domain-periods K] [--dt DT] [--linear-rtol RTOL]"
+               " [--domain-periods K] [--dt DT]"
+               " [--time-atol ATOL --time-rtol RTOL]"
+               " [--linear-rtol RTOL]"
                " [--newton-linear-rtol RTOL] [--final-linear-rtol RTOL]"
                " [--true-residual-tightening-linear-rtol RTOL]"
                " [--igr-volume-quadrature-order Q]"
@@ -1425,6 +1498,8 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
 {
   const auto& evidence = observation.evidence;
   const auto& tensor = evidence.tensor_core;
+  const bool rodas3 =
+      time_treatment == EulerHdgTimeTreatment::rodas3;
   const CudaTracePolicyDescriptor expected_policy =
       ResolveCudaTracePolicy(
           engine, igr_active, rank_count, polynomial_order, trace_policy);
@@ -1652,6 +1727,50 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
           (expected_native_solver ? linear_solve_attempts : 0) &&
       tensor.hypre_trace_solve_calls ==
           (expected_native_solver ? 0 : linear_solve_attempts);
+  const bool tensor_rank_one =
+      engine == CudaEngineKind::tensor_core && rank_count == 1;
+  const bool retained_common_shift_preconditioner =
+      expected_factor_reuse_policy ==
+          CudaIluFactorReusePolicy::first_trace_solve_per_attempt;
+  const bool rodas3_preconditioner_census = tensor_rank_one
+      ? evidence.common_shift_preconditioner_setups >= 1 &&
+            evidence.common_shift_preconditioner_reuses == 3
+      : retained_common_shift_preconditioner
+          ? evidence.common_shift_preconditioner_setups == 1 &&
+                evidence.common_shift_preconditioner_reuses == 3
+          : evidence.common_shift_preconditioner_setups == 4 &&
+                evidence.common_shift_preconditioner_reuses == 0;
+  const bool rodas3_method_work_consistent =
+      evidence.nonlinear_updates >= 0 &&
+      evidence.trace_solves == evidence.nonlinear_updates + 4 &&
+      evidence.line_search_trials == 0 &&
+      evidence.rejected_line_search_trials == 0 &&
+      std::isfinite(evidence.temporal_error_norm) &&
+      evidence.temporal_error_norm >= 0.0 &&
+      std::isfinite(evidence.final_algebraic_residual) &&
+      evidence.final_algebraic_residual >= 0.0 &&
+      std::isfinite(evidence.final_algebraic_correction_norm) &&
+      evidence.final_algebraic_correction_norm >= 0.0 &&
+      evidence.common_shift_operator_builds == 1 &&
+      evidence.common_shift_operator_reuses == 3 &&
+      evidence.condensed_rhs_refreshes == 3 &&
+      evidence.common_shift_trace_solves == 4 &&
+      rodas3_preconditioner_census;
+  const bool rodas3_backend_work_consistent =
+      evidence.complete_assemblies > 0 &&
+      evidence.complete_condensations > 0 &&
+      evidence.complete_recoveries > 0 &&
+      tensor.volume_assembly_launches == evidence.complete_assemblies &&
+      tensor.condensation_launches == evidence.complete_condensations &&
+      (engine == CudaEngineKind::ordinary
+           ? tensor.volume_mma_tiles == 0 && tensor.mma_tiles == 0
+           : engine == CudaEngineKind::tensor_core &&
+                 observation.tensor_volume_work.valid &&
+                 CudaPreparedTensorVolumeEvidenceValuesValid(
+                     engine, tensor.volume_assembly_launches,
+                     tensor.volume_mma_tiles,
+                     observation.tensor_volume_work.mma_tiles) &&
+                 tensor.hardware_supported && tensor.mma_tiles > 0);
   const bool expected_scalar_closure = igr_active &&
       time_treatment == EulerHdgTimeTreatment::partitioned_backward_euler;
   const bool scalar_closure_work_consistent = expected_scalar_closure
@@ -1673,7 +1792,7 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
             evidence.scalar_closure_linear_iterations == 0 &&
             evidence.scalar_closure_linear_solve_attempts == 0 &&
             evidence.scalar_closure_true_residual_tightenings == 0;
-  const bool expected_engine =
+  const bool common_engine_identity =
       CudaTracePolicyDescriptorIsExact(expected_policy) &&
       tensor.selected_engine == engine &&
       tensor.requested_trace_policy == trace_policy &&
@@ -1682,22 +1801,27 @@ bool Healthy(const CudaAcceptedStepBenchmarkObservation& observation,
       tensor.trace_policy_order == polynomial_order &&
       tensor.trace_preconditioner_configured &&
       tensor.trace_preconditioner == expected_preconditioner &&
-      ilu_work_consistent && mgr_work_consistent &&
-      element_schwarz_work_consistent &&
-      fixed_sigma_jacobi_work_consistent &&
-      robust_work_consistent && trace_solver_consistent &&
+      ilu_work_consistent && trace_solver_consistent &&
+      tensor.fallback_count == 0 && tensor.fallback_accounting_complete &&
+      evidence.no_fallback;
+  const bool backward_euler_engine_work = mgr_work_consistent &&
+      element_schwarz_work_consistent && fixed_sigma_jacobi_work_consistent &&
+      robust_work_consistent &&
       observation.tensor_volume_work.valid &&
       CudaPreparedTensorVolumeEvidenceValuesValid(
           engine, tensor.volume_assembly_launches,
           tensor.volume_mma_tiles,
           engine == CudaEngineKind::tensor_core
               ? observation.tensor_volume_work.mma_tiles : 0) &&
-      tensor.fallback_count == 0 && tensor.fallback_accounting_complete &&
-      evidence.no_fallback &&
       (engine == CudaEngineKind::ordinary
            ? tensor.condensation_launches == 0 && tensor.mma_tiles == 0
            : tensor.hardware_supported && tensor.condensation_launches > 0 &&
                  tensor.mma_tiles > 0);
+  const bool expected_engine = common_engine_identity &&
+      (rodas3
+           ? rodas3_method_work_consistent &&
+                 rodas3_backend_work_consistent
+           : backward_euler_engine_work);
   return observation.candidate_ready && observation.finite &&
       observation.admissible && observation.recovery &&
       observation.true_residual && observation.conservation &&
@@ -1736,6 +1860,8 @@ bool RunStep(GenericEulerHdgCudaSession& session,
              const int rank_count,
              const int polynomial_order,
              const std::uint64_t krylov_restart_dimension,
+             const double time_absolute_tolerance,
+             const double time_relative_tolerance,
              const bool warmup, const int measured_index,
              StepSample& sample, std::string& error)
 {
@@ -1745,13 +1871,36 @@ bool RunStep(GenericEulerHdgCudaSession& session,
   sample.measured_index = measured_index;
   GenericEulerCudaPreparedStep authority{};
   CudaPreparedOutputMetadataV1 output{};
+  const bool rodas3 =
+      time_treatment == EulerHdgTimeTreatment::rodas3;
+  sample.assessment_required = rodas3;
+  sample.assessment_policy = rodas3
+      ? HdgEulerPreparedAssessmentPolicy{
+            time_absolute_tolerance, time_relative_tolerance,
+            rodas3_algebraic_correction_fraction}
+      : HdgEulerPreparedAssessmentPolicy{};
 
   MPI_Barrier(MPI_COMM_WORLD);
   const auto started = clock::now();
   const auto prepared = session.Prepare(timestep, authority, output);
   const bool observed = prepared.status == HdgEulerSessionStatus::prepared &&
       CudaQualificationTestAccess::CapturePrepared(session, sample.prepared);
-  const bool exported = observed && (!export_interior ||
+  const bool assessed = !rodas3 ||
+      (observed && session.AssessPrepared(
+          authority, output, sample.assessment_policy, sample.assessment));
+  sample.assessment_performed = rodas3 && assessed;
+  const bool assessment_gates = !rodas3 ||
+      (assessed &&
+       dg::hdg::generic::IsValidHdgEulerPreparedAssessment(
+           sample.assessment) &&
+       sample.assessment.finite_gate && sample.assessment.solver_gate &&
+       sample.assessment.residual_gate &&
+       sample.assessment.admissibility_gate &&
+       sample.assessment.algebraic_closure_gate &&
+       sample.assessment.algebraic_correction_gate &&
+       sample.assessment.normalized_differential_error <= 1.0);
+  sample.assessment_accepted = rodas3 && assessment_gates;
+  const bool exported = observed && assessment_gates && (!export_interior ||
       session.ExportPreparedInterior(
           authority, output, CudaMutableHostL2Output{
               exported_interior.data(), fields.volume_scalar_count,
@@ -1776,12 +1925,17 @@ bool RunStep(GenericEulerHdgCudaSession& session,
       std::chrono::duration<double>(finished - started).count();
   MPI_Allreduce(&local_seconds, &sample.seconds, 1, MPI_DOUBLE, MPI_MAX,
                 MPI_COMM_WORLD);
-  if (!observed || !exported || !acknowledged ||
+  if (!observed || !assessed || !assessment_gates || !exported ||
+      !acknowledged ||
       committed.status != HdgEulerSessionStatus::committed ||
       !output.successful_commit)
   {
     error = "accepted-step transaction failed: prepare_status=" +
         std::to_string(static_cast<unsigned int>(prepared.status)) +
+        ", assessment_performed=" +
+        std::to_string(sample.assessment_performed ? 1 : 0) +
+        ", assessment_accepted=" +
+        std::to_string(sample.assessment_accepted ? 1 : 0) +
         ", commit_status=" +
         std::to_string(static_cast<unsigned int>(committed.status));
     return false;
@@ -2013,6 +2167,12 @@ void PrintStep(const StepSample& sample)
   PrintJsonNumber(evidence.final_residual);
   std::cout << ",\"true_relative_residual\":";
   PrintJsonNumber(evidence.true_relative_residual);
+  std::cout << ",\"temporal_error_norm\":";
+  PrintJsonNumber(evidence.temporal_error_norm);
+  std::cout << ",\"final_algebraic_residual\":";
+  PrintJsonNumber(evidence.final_algebraic_residual);
+  std::cout << ",\"final_algebraic_correction_norm\":";
+  PrintJsonNumber(evidence.final_algebraic_correction_norm);
   std::cout << ",\"maximum_conservation_error\":";
   PrintJsonNumber(sample.prepared.maximum_conservation_error);
   std::cout << ",\"maximum_conservation_relative_error\":";
@@ -2031,6 +2191,24 @@ void PrintStep(const StepSample& sample)
             << ",\"linear_iterations\":" << evidence.linear_iterations
             << ",\"linear_solve_attempts\":"
             << evidence.linear_solve_attempts
+            << ",\"complete_assemblies\":"
+            << evidence.complete_assemblies
+            << ",\"complete_condensations\":"
+            << evidence.complete_condensations
+            << ",\"complete_recoveries\":"
+            << evidence.complete_recoveries
+            << ",\"common_shift_operator_builds\":"
+            << evidence.common_shift_operator_builds
+            << ",\"common_shift_operator_reuses\":"
+            << evidence.common_shift_operator_reuses
+            << ",\"condensed_rhs_refreshes\":"
+            << evidence.condensed_rhs_refreshes
+            << ",\"common_shift_trace_solves\":"
+            << evidence.common_shift_trace_solves
+            << ",\"common_shift_preconditioner_setups\":"
+            << evidence.common_shift_preconditioner_setups
+            << ",\"common_shift_preconditioner_reuses\":"
+            << evidence.common_shift_preconditioner_reuses
             << ",\"newton_correction_linear_iterations\":"
             << evidence.newton_correction_linear_iterations
             << ",\"final_coherent_linear_iterations\":"
@@ -2058,6 +2236,31 @@ void PrintStep(const StepSample& sample)
             << precision_work.all_fp64_policy
             << ",\"correction_accounting_complete\":"
             << precision_work.accounting_complete << std::noboolalpha
+            << ",\"prepared_assessment\":{\"required\":"
+            << std::boolalpha << sample.assessment_required
+            << ",\"performed\":" << sample.assessment_performed
+            << ",\"accepted\":" << sample.assessment_accepted
+            << std::noboolalpha << ",\"absolute_tolerance\":";
+  PrintJsonNumber(sample.assessment_policy.absolute_tolerance);
+  std::cout << ",\"relative_tolerance\":";
+  PrintJsonNumber(sample.assessment_policy.relative_tolerance);
+  std::cout << ",\"algebraic_correction_fraction\":";
+  PrintJsonNumber(sample.assessment_policy.algebraic_correction_fraction);
+  std::cout << ",\"normalized_differential_error\":";
+  PrintJsonNumber(sample.assessment.normalized_differential_error);
+  std::cout << ",\"normalized_algebraic_correction\":";
+  PrintJsonNumber(sample.assessment.normalized_algebraic_correction);
+  std::cout << ",\"finite_gate\":" << std::boolalpha
+            << sample.assessment.finite_gate
+            << ",\"solver_gate\":" << sample.assessment.solver_gate
+            << ",\"residual_gate\":" << sample.assessment.residual_gate
+            << ",\"admissibility_gate\":"
+            << sample.assessment.admissibility_gate
+            << ",\"algebraic_closure_gate\":"
+            << sample.assessment.algebraic_closure_gate
+            << ",\"algebraic_correction_gate\":"
+            << sample.assessment.algebraic_correction_gate
+            << std::noboolalpha << '}'
             << ",\"product_generations\":{"
             << "\"residual\":" << evidence.products.residual_generation
             << ",\"matrix\":" << evidence.products.matrix_generation
@@ -2308,8 +2511,15 @@ int RunBenchmark(const Options& options)
   GenericEulerHdgCudaSession session;
   const EulerHdgRequest request = MakeRequest(
       mesh, fields, options);
+  const bool igr_active =
+      options.regularization == RegularizationKind::igr;
+  const CudaTracePolicyKind effective_trace_policy =
+      options.trace_policy == CudaTracePolicyKind::engine_default
+      ? DefaultCudaTracePolicyRequest(
+            options.engine, igr_active, rank_count, options.time_treatment)
+      : options.trace_policy;
   if (CudaQualificationTestAccess::InitializeBenchmarkTracePolicy(
-          session, request, options.trace_policy).status !=
+          session, request, effective_trace_policy).status !=
           HdgEulerSessionStatus::initialized ||
       cudaDeviceSynchronize() != cudaSuccess)
   {
@@ -2403,12 +2613,14 @@ int RunBenchmark(const Options& options)
     {
       return RunStep(session, fields, exported_interior, options.timestep,
                      options.export_interior, options.engine,
-                     options.regularization == RegularizationKind::igr,
+                     igr_active,
                      options.time_treatment,
-                     options.trace_policy,
+                     effective_trace_policy,
                      rank_count,
                      options.order,
-                     static_cast<std::uint64_t>(krylov_restart_dimension), warmup,
+                     static_cast<std::uint64_t>(krylov_restart_dimension),
+                     options.time_absolute_tolerance,
+                     options.time_relative_tolerance, warmup,
                      measured_index,
                      samples[static_cast<std::size_t>(index)], error);
     };
@@ -2511,8 +2723,10 @@ int RunBenchmark(const Options& options)
             << "\"backend\":\"cuda\","
             << "\"cuda_engine\":\"" << EngineName(options.engine)
             << "\","
-            << "\"trace_policy\":\""
+            << "\"cli_trace_policy\":\""
             << CudaTracePolicyKindName(options.trace_policy) << "\","
+            << "\"trace_policy\":\""
+            << CudaTracePolicyKindName(effective_trace_policy) << "\","
             << "\"requested_trace_policy\":\""
             << CudaTracePolicyKindName(
                    reported_trace_policy.requested_trace_policy) << "\","
@@ -2778,6 +2992,8 @@ int RunBenchmark(const Options& options)
   PrintUmpireHighWatermarks(umpire_high_watermarks);
   std::cout << ','
             << "\"timing_scope\":\"Prepare+CapturePreparedObservation+"
+            << (options.time_treatment == EulerHdgTimeTreatment::rodas3
+                    ? "AssessPrepared+" : "")
             << (options.export_interior ? "ExportPreparedInteriorD2H+" : "")
             << "AcknowledgePreparedOutput+Commit\","
             << "\"warmup_steps\":" << warmup_steps << ','

@@ -29,19 +29,47 @@ int RunTimeDefaultsTests(TestContext& ctx)
     dg_sim::CommonOptions opts;
     dg_sim::CaseConfig case_cfg;
     dg_sim::IGROptions igr_opts;
+    ctx.Check(opts.positivity_limiter == "case",
+              "positivity limiter defaults preserve the case policy");
     ctx.Check(opts.zhang_shu_points == "consumer",
               "Zhang-Shu defaults: consumer point set selected");
     ctx.Check(opts.hdg_igr_alpha == 1.0 && opts.hdg_igr_beta == 1.0,
               "HDG IGR defaults: alpha and beta are one");
     ctx.Check(opts.hdg_cuda_engine == "ordinary",
               "HDG CUDA engine defaults to ordinary");
+    ctx.Check(opts.time_atol == 1.0e-8 && opts.time_rtol == 1.0e-5,
+              "adaptive time tolerances retain their typed opt-in defaults");
     ctx.Check(dg_sim::ParseZhangShuPointSet("consumer") ==
                 mfem::ZhangShuPointSet::kConsumer,
               "Zhang-Shu options: parse consumer point set");
     ctx.Check(dg_sim::ParseZhangShuPointSet("quadrature") ==
                 mfem::ZhangShuPointSet::kQuadrature,
               "Zhang-Shu options: parse quadrature point set");
+    ctx.Check(dg_sim::ParsePositivityLimiterSelection("case") ==
+                  dg_sim::PositivityLimiterSelection::Case &&
+                dg_sim::ParsePositivityLimiterSelection("none") ==
+                  dg_sim::PositivityLimiterSelection::None &&
+                dg_sim::ParsePositivityLimiterSelection("zhang-shu") ==
+                  dg_sim::PositivityLimiterSelection::ZhangShu,
+              "positivity limiter options have typed case/none/Zhang-Shu selectors");
 
+    case_cfg.limiter_pipeline.zhang_shu = true;
+    opts.positivity_limiter = "none";
+    const dg_sim::RunConfig limiter_off =
+      dg_sim::MakeRunConfig(case_cfg, opts, igr_opts);
+    ctx.Check(!limiter_off.case_config.limiter_pipeline.zhang_shu &&
+                limiter_off.opts.positivity_limiter == "none",
+              "positivity limiter none overrides an enabled case default");
+
+    case_cfg.limiter_pipeline.zhang_shu = false;
+    opts.positivity_limiter = "zhang_shu";
+    const dg_sim::RunConfig limiter_on =
+      dg_sim::MakeRunConfig(case_cfg, opts, igr_opts);
+    ctx.Check(limiter_on.case_config.limiter_pipeline.zhang_shu &&
+                limiter_on.opts.positivity_limiter == "zhang-shu",
+              "positivity limiter Zhang-Shu override is enabled and canonicalized");
+
+    opts.positivity_limiter = "case";
     opts.zhang_shu_points = "quadrature";
     const dg_sim::RunConfig run_cfg =
       dg_sim::MakeRunConfig(case_cfg, opts, igr_opts);
@@ -160,11 +188,15 @@ int RunTimeDefaultsTests(TestContext& ctx)
                 dg_sim::TryParseTimeIntegrator(
                   "PARTITIONED-BACKWARD-EULER") ==
                   dg_sim::TimeIntegrator::PartitionedBackwardEuler &&
+                dg_sim::TryParseTimeIntegrator("RODAS3") ==
+                  dg_sim::TimeIntegrator::Rodas3 &&
                 std::string(dg_sim::TimeIntegratorToString(
                   dg_sim::TimeIntegrator::RK3SSP)) == "rk3ssp" &&
                 std::string(dg_sim::TimeIntegratorToString(
                   dg_sim::TimeIntegrator::PartitionedBackwardEuler)) ==
-                  "partitioned-backward-euler",
+                  "partitioned-backward-euler" &&
+                std::string(dg_sim::TimeIntegratorToString(
+                  dg_sim::TimeIntegrator::Rodas3)) == "rodas3",
               "request: time-integrator parser and metadata name are stable");
     ctx.Check(!dg_sim::TryParseTimeIntegrator("invalid"),
               "request: invalid time integrator is not parsed");
@@ -316,6 +348,13 @@ int RunTimeDefaultsTests(TestContext& ctx)
                 dg_sim::SolverRequestResolutionStatus::UnsupportedTimeIntegrator,
               "request: DG/DGSEM partitioned backward-euler is rejected");
 
+    const dg_sim::SolverRequestResolution dg_rodas3 =
+      dg_sim::ResolveSolverRequest("dg", false, "", "dg", "", "rodas3",
+                                   false, false, false, true);
+    ctx.Check(dg_rodas3.status ==
+                dg_sim::SolverRequestResolutionStatus::UnsupportedTimeIntegrator,
+              "request: DG/DGSEM RODAS3 is rejected");
+
     const dg_sim::SolverRequestResolution invalid_regularization =
       dg_sim::ResolveSolverRequest("dg", false, "", "dg", "invalid", "",
                                    false, false, true, false);
@@ -362,6 +401,32 @@ int RunTimeDefaultsTests(TestContext& ctx)
                 hdg_partitioned_cuda.device_backend ==
                   dg_sim::DeviceBackend::CUDA,
               "request: IGR HDG CUDA admits partitioned backward-euler");
+
+    const dg_sim::SolverRequestResolution hdg_rodas3_cpu =
+      dg_sim::ResolveSolverRequest(
+        "dg", false, "hdg", "dg", "none", "rodas3",
+        true, false, true, true, "cpu");
+    ctx.Check(hdg_rodas3_cpu.IsResolved() &&
+                hdg_rodas3_cpu.regularization ==
+                  dg_sim::Regularization::None &&
+                hdg_rodas3_cpu.time_integrator ==
+                  dg_sim::TimeIntegrator::Rodas3 &&
+                hdg_rodas3_cpu.device_backend ==
+                  dg_sim::DeviceBackend::CPU,
+              "request: conventional HDG CPU admits typed RODAS3 opt-in");
+
+    const dg_sim::SolverRequestResolution hdg_rodas3_cuda =
+      dg_sim::ResolveSolverRequest(
+        "dg", false, "hdg", "dg", "igr", "rodas3",
+        true, false, true, true, "cuda");
+    ctx.Check(hdg_rodas3_cuda.IsResolved() &&
+                hdg_rodas3_cuda.regularization ==
+                  dg_sim::Regularization::IGR &&
+                hdg_rodas3_cuda.time_integrator ==
+                  dg_sim::TimeIntegrator::Rodas3 &&
+                hdg_rodas3_cuda.device_backend ==
+                  dg_sim::DeviceBackend::CUDA,
+              "request: IGR HDG CUDA admits typed RODAS3 opt-in");
 
     const dg_sim::SolverRequestResolution hdg_igr_cpu =
       dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "igr", "",

@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -20,7 +21,9 @@ using dg::hdg::generic::EulerBoundaryPolicy;
 using dg::hdg::generic::EulerBoundaryPolicyKind;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::generic::EulerHdgConservationRelativeError;
+using dg::hdg::generic::EulerHdgPositivityLimiterKind;
 using dg::hdg::generic::EulerHdgTimeTreatment;
+using dg::hdg::generic::EulerHdgZhangShuPointSet;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::generic::ValidateEulerHdgRequest;
 
@@ -134,6 +137,8 @@ bool CheckPODSurface()
       std::is_standard_layout<EulerHdgRequest>::value &&
       !std::is_polymorphic<EulerHdgRequest>::value &&
       std::is_trivial<dg::hdg::generic::BackendSelection>::value &&
+      zero_initialized.numerical_policy.positivity_limiter.kind ==
+          EulerHdgPositivityLimiterKind::none &&
       zero_initialized.time_treatment ==
           EulerHdgTimeTreatment::backward_euler;
 }
@@ -171,6 +176,13 @@ bool CheckAcceptAndReject()
   request.time_treatment =
       EulerHdgTimeTreatment::partitioned_backward_euler;
   if (ValidateEulerHdgRequest(request) != ContractStatus::accepted)
+  {
+    return false;
+  }
+  request.time_treatment = EulerHdgTimeTreatment::rodas3;
+  if (ValidateEulerHdgRequest(request) != ContractStatus::accepted ||
+      std::string_view(dg::hdg::generic::EulerHdgTimeTreatmentName(
+        request.time_treatment)) != "rodas3")
   {
     return false;
   }
@@ -593,6 +605,63 @@ bool CheckRoleSpecificLinearTolerancePolicy()
       rejects_zero_fallback;
 }
 
+bool CheckPositivityLimiterPolicy()
+{
+  auto policy = dg::hdg::generic::DefaultEulerHdgNumericalPolicy(2);
+  const bool default_off =
+      policy.positivity_limiter.kind ==
+          EulerHdgPositivityLimiterKind::none &&
+      dg::hdg::generic::ValidEulerHdgNumericalPolicy(policy);
+
+  policy.positivity_limiter = {
+      EulerHdgPositivityLimiterKind::zhang_shu,
+      EulerHdgZhangShuPointSet::consumer,
+      5.0e-7,
+      1.0e-6,
+      12};
+  const bool active_valid =
+      dg::hdg::generic::ValidEulerHdgNumericalPolicy(policy);
+
+  auto invalid = dg::hdg::generic::DefaultEulerHdgNumericalPolicy(2);
+  invalid.positivity_limiter.density_floor = 5.0e-7;
+  const bool rejects_noncanonical_off =
+      !dg::hdg::generic::ValidEulerHdgNumericalPolicy(invalid);
+  invalid = policy;
+  invalid.positivity_limiter.point_set =
+      static_cast<EulerHdgZhangShuPointSet>(255);
+  const bool rejects_unknown_points =
+      !dg::hdg::generic::ValidEulerHdgNumericalPolicy(invalid);
+  invalid = policy;
+  invalid.positivity_limiter.pressure_bisection_iterations = 0;
+  const bool rejects_zero_iterations =
+      !dg::hdg::generic::ValidEulerHdgNumericalPolicy(invalid);
+  invalid = policy;
+  invalid.positivity_limiter.pressure_bisection_iterations = 65;
+  const bool rejects_excessive_iterations =
+      !dg::hdg::generic::ValidEulerHdgNumericalPolicy(invalid);
+
+  mfem::ParMesh mesh = MakeSquareMesh();
+  const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
+  EulerHdgRequest request = ValidRequest(mesh, initial);
+  request.numerical_policy.positivity_limiter = policy.positivity_limiter;
+  const bool rejects_backward_euler =
+      ValidateEulerHdgRequest(request) ==
+          ContractStatus::invalid_numerical_policy;
+  request.time_treatment =
+      EulerHdgTimeTreatment::partitioned_backward_euler;
+  const bool rejects_partitioned_backward_euler =
+      ValidateEulerHdgRequest(request) ==
+          ContractStatus::invalid_numerical_policy;
+  request.time_treatment = EulerHdgTimeTreatment::rodas3;
+  const bool admits_rodas3 =
+      ValidateEulerHdgRequest(request) == ContractStatus::accepted;
+
+  return default_off && active_valid && rejects_noncanonical_off &&
+      rejects_unknown_points && rejects_zero_iterations &&
+      rejects_excessive_iterations && rejects_backward_euler &&
+      rejects_partitioned_backward_euler && admits_rodas3;
+}
+
 bool CheckZeroOwnedElementAdmission()
 {
   int ranks = 0;
@@ -815,6 +884,7 @@ int main(int argc, char* argv[])
   const bool mixed_boundary = CheckMixedBoundaryPolicyAdmission();
   const bool igr = CheckIgrSelectionAdmission();
   const bool linear_tolerances = CheckRoleSpecificLinearTolerancePolicy();
+  const bool positivity_limiter = CheckPositivityLimiterPolicy();
   const bool empty = CheckZeroOwnedElementAdmission();
   const bool cuda_engine_mismatch = CheckCudaEngineCollectiveMismatch();
   const bool physical_empty = CheckPhysicalPolicyWithZeroOwnedRank();
@@ -823,7 +893,8 @@ int main(int argc, char* argv[])
   const bool geometry = CheckCollectiveGeometryConvergence();
   ok = ok && conservation_normalization && basic && triangle && boundary &&
       boundary_mismatch &&
-      mixed_boundary && igr && linear_tolerances && empty &&
+      mixed_boundary && igr && linear_tolerances && positivity_limiter &&
+      empty &&
       cuda_engine_mismatch &&
       physical_empty && asymmetric_null &&
       mismatch && geometry;

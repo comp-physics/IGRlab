@@ -153,6 +153,14 @@ bool CheckRuntimeSelection()
       PartitionedBackwardEulerCudaRank1RuntimeSelection::Descriptor();
   const RuntimeTupleDescriptor partitioned_cuda_rank2 =
       PartitionedBackwardEulerCudaRank2RuntimeSelection::Descriptor();
+  const RuntimeTupleDescriptor rodas3_cpu_rank1 =
+      Rodas3CpuRank1RuntimeSelection::Descriptor();
+  const RuntimeTupleDescriptor rodas3_cpu_rank2 =
+      Rodas3CpuRank2RuntimeSelection::Descriptor();
+  const RuntimeTupleDescriptor rodas3_cuda_rank1 =
+      Rodas3CudaRank1RuntimeSelection::Descriptor();
+  const RuntimeTupleDescriptor rodas3_cuda_rank2 =
+      Rodas3CudaRank2RuntimeSelection::Descriptor();
   return Check(
       conventional_persistent_card_id ==
               "exp.hdg.euler.conventional.smooth_persistent.w8a.v1" &&
@@ -181,8 +189,17 @@ bool CheckRuntimeSelection()
           partitioned_cuda_rank1.time_treatment.view() ==
               "partitioned_backward_euler" &&
           partitioned_cuda_rank2.time_treatment.view() ==
-              "partitioned_backward_euler",
-      "runtime_selection_exact_card_and_partitioned_backend_ids");
+              "partitioned_backward_euler" &&
+          rodas3_cpu_rank1.backend.view() == "cpu.serial" &&
+          rodas3_cpu_rank2.backend.view() == "cpu.rank2" &&
+          rodas3_cuda_rank1.backend.view() == "cuda.rank1.one_gpu" &&
+          rodas3_cuda_rank2.backend.view() ==
+              "cuda.rank2.one_gpu.host_staged" &&
+          rodas3_cpu_rank1.time_treatment.view() == "rodas3" &&
+          rodas3_cpu_rank2.time_treatment.view() == "rodas3" &&
+          rodas3_cuda_rank1.time_treatment.view() == "rodas3" &&
+          rodas3_cuda_rank2.time_treatment.view() == "rodas3",
+      "runtime_selection_exact_card_and_typed_time_backend_ids");
 }
 
 bool CheckTransferCodec()

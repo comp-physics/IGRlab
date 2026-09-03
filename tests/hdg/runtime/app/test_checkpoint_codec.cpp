@@ -227,6 +227,34 @@ StateHash OracleCoefficientHash(
   return hash.Finalize();
 }
 
+StateHash CudaRuntimePayloadHash(
+    const std::vector<double>& values) noexcept
+{
+  std::array<std::uint64_t, 4> hash{{
+      1469598103934665603ULL,
+      1099511628211ULL ^ 0x9e3779b97f4a7c15ULL,
+      1469598103934665603ULL ^ 0xd6e8feb86659fd93ULL,
+      1099511628211ULL ^ 0xa0761d6478bd642fULL}};
+  for (const double value : values)
+  {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
+    for (std::size_t byte = 0; byte < sizeof(value); ++byte)
+    {
+      for (std::size_t lane = 0; lane < hash.size(); ++lane)
+      {
+        hash[lane] ^=
+            static_cast<std::uint64_t>(bytes[byte] + 17U * lane);
+        hash[lane] *= 1099511628211ULL + 2ULL * lane;
+      }
+    }
+  }
+  StateHash result{};
+  static_assert(sizeof(hash) == result.bytes.size(),
+                "CUDA payload hash must fill StateHash");
+  std::memcpy(result.bytes.data(), hash.data(), sizeof(hash));
+  return result;
+}
+
 struct OracleRankTuple
 {
   std::uint32_t rank = 0;
@@ -3281,6 +3309,296 @@ bool CheckDecodeMutationCensusAndAtomicity()
   return passed;
 }
 
+bool CheckGenericCudaAdaptiveCommittedBoundaryRoundTrip()
+{
+  using Adapter = dg_sim::hdg::HdgTransactionalTimeAdapter;
+  using dg_sim::hdg::HdgTimeControlMode;
+  using dg_sim::time::backend::FinalOutputPolicy;
+  using dg_sim::time::backend::InitialOutputPolicy;
+
+  Adapter::AdaptiveControllerConfig controller;
+  controller.minimum_dt = 1.0e-6;
+  controller.maximum_dt = 0.1;
+  Adapter time_driver(
+      Adapter::TimeControl::Adaptive(0.0, 0.1, 0.05),
+      Adapter::OutputSchedule::FixedInterval(
+          0.025, InitialOutputPolicy::Emit, FinalOutputPolicy::Emit),
+      controller, HdgTimeControlMode::AdaptiveRodas3);
+  static_cast<void>(time_driver.InitialOutput());
+
+  const auto first_plan = time_driver.BeginAdaptiveStep();
+  const Adapter::AdaptiveAttempt rejected_attempt{
+      4.0, true, true, true, true};
+  const auto rejected =
+      time_driver.PreviewAdaptiveDecision(rejected_attempt);
+  if (rejected.Accepted() || rejected.attempted_dt() != first_plan.dt)
+    return Check(false, "generic_cuda_adaptive_rejection_constructed");
+  time_driver.FinalizeAdaptiveRejection(rejected);
+
+  const auto accepted_plan = time_driver.BeginAdaptiveStep();
+  const Adapter::AdaptiveAttempt accepted_attempt{
+      0.25, true, true, true, true};
+  const auto accepted =
+      time_driver.PreviewAdaptiveDecision(accepted_attempt);
+  if (!accepted.Accepted())
+    return Check(false, "generic_cuda_adaptive_acceptance_preflighted");
+  try
+  {
+    static_cast<void>(time_driver.PreflightAdaptiveSuccess(accepted));
+  }
+  catch (...)
+  {
+    return Check(false, "generic_cuda_adaptive_acceptance_preflighted");
+  }
+  static_cast<void>(time_driver.FinalizeAdaptiveSuccess(accepted));
+  const Adapter::RestartState time_state = time_driver.CheckpointState();
+
+  std::vector<double> interior{1.0, 0.1, -0.2, 2.6,
+                               0.9, 0.0, 0.3, 2.4};
+  std::vector<double> trace{1.0, 0.1, -0.2, 2.6, 0.9, 0.0};
+  const StateHash interior_hash = CudaRuntimePayloadHash(interior);
+  const StateHash trace_hash = CudaRuntimePayloadHash(trace);
+  CheckpointDescriptor descriptor{};
+  descriptor.schema_version = checkpoint_schema_version;
+  descriptor.successful_commit = true;
+  descriptor.restart_mode = RestartMode::same_backend_rank_partition;
+  descriptor.tuple.model = StableIdentity::Copy("euler-full-energy");
+  descriptor.tuple.formulation = StableIdentity::Copy("hdg");
+  descriptor.tuple.trace = StableIdentity::Copy("uhat4");
+  descriptor.tuple.stabilization = StableIdentity::Copy("none");
+  descriptor.tuple.time_treatment = StableIdentity::Copy("rodas3");
+  descriptor.tuple.backend = StableIdentity::Copy("cuda-tensor");
+  descriptor.tuple.precision = StableIdentity::Copy("fp64");
+  descriptor.mfem_pin = StableIdentity::Copy("d9d6526cc1749980");
+  descriptor.mesh_hash = FilledHash(0x10);
+  descriptor.partition_hash = FilledHash(0x30);
+  descriptor.topology_hash = FilledHash(0x50);
+  descriptor.rank_count = 1;
+  descriptor.polynomial_order = 2;
+  descriptor.layout = StableIdentity::Copy(
+      "l2-interior.true-trace-owned.component-major.v1");
+  descriptor.precision = descriptor.tuple.precision;
+  descriptor.cursor = accepted_plan.sequence;
+  descriptor.dt = accepted_plan.dt;
+  descriptor.coordinates = {time_state.cursor.current_time, 1, 1,
+                            accepted_plan.sequence, accepted_plan.dt};
+  descriptor.coordinate_fingerprint =
+      dg::hdg::runtime::detail::CoordinateFingerprint(
+          descriptor.coordinates);
+  descriptor.interior_hash = interior_hash;
+  descriptor.trace_hash = trace_hash;
+  const AttemptIdentity attempt{accepted_plan.sequence, 0, 0, 0,
+                                accepted_plan.dt};
+  const StateHash numerical_identity = FilledHash(0xa0);
+  const GenericHdgCudaCheckpointRankViewV1 rank{
+      0, 1, attempt, descriptor,
+      FilledHash(0x10), FilledHash(0x30), FilledHash(0x50),
+      interior_hash, trace_hash,
+      interior.data(), interior.size(), trace.data(), trace.size(), true};
+
+  std::vector<std::uint8_t> encoded;
+  bool passed = Check(
+      EncodeGenericHdgCudaCheckpointV1(
+          numerical_identity, time_state, &rank, 1, encoded) ==
+          CheckpointCodecStatus::ok,
+      "generic_cuda_adaptive_checkpoint_encodes");
+  if (!passed) return false;
+  GenericHdgCudaCheckpointRankViewV1 sha_rank = rank;
+  sha_rank.local_interior_hash = OracleCoefficientHash(interior);
+  sha_rank.local_trace_hash = OracleCoefficientHash(trace);
+  std::vector<std::uint8_t> sha_mismatch_output{0xa5U, 0x5aU};
+  const std::vector<std::uint8_t> sha_mismatch_sentinel =
+      sha_mismatch_output;
+  passed = Check(
+      EncodeGenericHdgCudaCheckpointV1(
+          numerical_identity, time_state, &sha_rank, 1,
+          sha_mismatch_output) ==
+              CheckpointCodecStatus::local_payload_hash_mismatch &&
+          sha_mismatch_output == sha_mismatch_sentinel,
+      "generic_cuda_sha_hash_is_not_runtime_payload_hash") && passed;
+  std::vector<double> second_interior = interior;
+  std::vector<double> second_trace = trace;
+  GenericHdgCudaCheckpointRankViewV1 second_rank = rank;
+  second_rank.interior = second_interior.data();
+  second_rank.owned_true_trace = second_trace.data();
+  std::vector<std::uint8_t> pointer_independent;
+  passed = Check(
+      EncodeGenericHdgCudaCheckpointV1(
+          numerical_identity, time_state, &second_rank, 1,
+          pointer_independent) == CheckpointCodecStatus::ok &&
+          pointer_independent == encoded,
+      "generic_cuda_checkpoint_excludes_pointer_identity") && passed;
+
+  GenericHdgCudaCheckpointArtifactV1 decoded{};
+  passed = Check(
+      DecodeGenericHdgCudaCheckpointV1(
+          {encoded.data(), encoded.size()}, numerical_identity, 1,
+          decoded) == CheckpointCodecStatus::ok &&
+          decoded.schema_version ==
+              generic_hdg_cuda_checkpoint_codec_version_v1 &&
+          decoded.numerical_identity == numerical_identity &&
+          decoded.time_state.cursor.current_time ==
+              time_state.cursor.current_time &&
+          decoded.time_state.cursor.committed_steps == 1 &&
+          decoded.time_state.output_cycle == time_state.output_cycle &&
+          decoded.time_state.adaptive_controller.has_value() &&
+          decoded.time_state.adaptive_controller->rejected_attempts == 1 &&
+          decoded.time_state.adaptive_controller->accepted_steps == 1 &&
+          decoded.time_state.adaptive_controller->revision == 2 &&
+          decoded.ranks.size() == 1 &&
+          decoded.ranks[0].interior == interior &&
+          decoded.ranks[0].owned_true_trace == trace,
+      "generic_cuda_adaptive_checkpoint_round_trip") && passed;
+
+  // Resume the controller/cursor at the decoded committed boundary and drive
+  // both the uninterrupted and restored timelines through the next accepted
+  // transaction.  The first segment already includes a rejected attempt, so
+  // equality here covers rejection history, next-dt authority, output cursor,
+  // and the subsequent committed coordinates rather than decode alone.
+  try
+  {
+    Adapter resumed(
+        Adapter::TimeControl::Adaptive(0.0, 0.1, 0.05),
+        Adapter::OutputSchedule::FixedInterval(
+            0.025, InitialOutputPolicy::Emit, FinalOutputPolicy::Emit),
+        controller, decoded.time_state, HdgTimeControlMode::AdaptiveRodas3);
+    const auto control_plan = time_driver.BeginAdaptiveStep();
+    const auto resumed_plan = resumed.BeginAdaptiveStep();
+    const bool same_plan =
+        control_plan.sequence == resumed_plan.sequence &&
+        control_plan.start_time == resumed_plan.start_time &&
+        control_plan.proposed_dt == resumed_plan.proposed_dt &&
+        control_plan.dt == resumed_plan.dt &&
+        control_plan.end_time == resumed_plan.end_time &&
+        control_plan.hits_scheduled_output ==
+            resumed_plan.hits_scheduled_output &&
+        control_plan.hits_final == resumed_plan.hits_final &&
+        control_plan.scheduled_cycle == resumed_plan.scheduled_cycle;
+    const Adapter::AdaptiveAttempt continuation_attempt{
+        0.4, true, true, true, true};
+    const auto control_decision =
+        time_driver.PreviewAdaptiveDecision(continuation_attempt);
+    const auto resumed_decision =
+        resumed.PreviewAdaptiveDecision(continuation_attempt);
+    const auto control_preflight =
+        time_driver.PreflightAdaptiveSuccess(control_decision);
+    const auto resumed_preflight =
+        resumed.PreflightAdaptiveSuccess(resumed_decision);
+    const bool same_preflight =
+        control_preflight.has_value() == resumed_preflight.has_value() &&
+        (!control_preflight ||
+         (control_preflight->cycle == resumed_preflight->cycle &&
+          control_preflight->time == resumed_preflight->time &&
+          control_preflight->is_initial == resumed_preflight->is_initial &&
+          control_preflight->is_final == resumed_preflight->is_final));
+    static_cast<void>(
+        time_driver.FinalizeAdaptiveSuccess(control_decision));
+    static_cast<void>(resumed.FinalizeAdaptiveSuccess(resumed_decision));
+    const Adapter::RestartState control_state =
+        time_driver.CheckpointState();
+    const Adapter::RestartState resumed_state = resumed.CheckpointState();
+    const auto& control_cursor = control_state.cursor;
+    const auto& resumed_cursor = resumed_state.cursor;
+    const auto& control_controller = *control_state.adaptive_controller;
+    const auto& resumed_controller = *resumed_state.adaptive_controller;
+    const bool same_state =
+        control_state.schema_version == resumed_state.schema_version &&
+        control_state.mode == resumed_state.mode &&
+        control_state.output_cycle == resumed_state.output_cycle &&
+        control_cursor.schema_version == resumed_cursor.schema_version &&
+        control_cursor.current_time == resumed_cursor.current_time &&
+        control_cursor.committed_steps == resumed_cursor.committed_steps &&
+        control_cursor.next_sequence == resumed_cursor.next_sequence &&
+        control_cursor.next_fixed_cycle == resumed_cursor.next_fixed_cycle &&
+        control_cursor.next_publication_cycle ==
+            resumed_cursor.next_publication_cycle &&
+        control_cursor.next_explicit_index ==
+            resumed_cursor.next_explicit_index &&
+        control_controller.schema_version ==
+            resumed_controller.schema_version &&
+        control_controller.configured_estimator_order ==
+            resumed_controller.configured_estimator_order &&
+        control_controller.configured_minimum_dt ==
+            resumed_controller.configured_minimum_dt &&
+        control_controller.configured_maximum_dt ==
+            resumed_controller.configured_maximum_dt &&
+        control_controller.configured_safety_factor ==
+            resumed_controller.configured_safety_factor &&
+        control_controller.configured_minimum_scale ==
+            resumed_controller.configured_minimum_scale &&
+        control_controller.configured_maximum_rejection_scale ==
+            resumed_controller.configured_maximum_rejection_scale &&
+        control_controller.configured_maximum_growth_scale ==
+            resumed_controller.configured_maximum_growth_scale &&
+        control_controller.consecutive_rejections ==
+            resumed_controller.consecutive_rejections &&
+        control_controller.revision == resumed_controller.revision &&
+        control_controller.accepted_steps ==
+            resumed_controller.accepted_steps &&
+        control_controller.rejected_attempts ==
+            resumed_controller.rejected_attempts &&
+        control_controller.next_dt == resumed_controller.next_dt &&
+        control_controller.last_attempted_dt ==
+            resumed_controller.last_attempted_dt &&
+        control_controller.last_normalized_error ==
+            resumed_controller.last_normalized_error &&
+        control_controller.last_step_accepted ==
+            resumed_controller.last_step_accepted;
+    passed = Check(
+        same_plan && control_decision.Accepted() &&
+            resumed_decision.Accepted() &&
+            control_decision.next_dt() == resumed_decision.next_dt() &&
+            same_preflight && same_state,
+        "generic_cuda_adaptive_split_continuation_matches_control") &&
+        passed;
+  }
+  catch (...)
+  {
+    passed = Check(
+        false,
+        "generic_cuda_adaptive_split_continuation_matches_control") &&
+        passed;
+  }
+
+  const GenericHdgCudaCheckpointArtifactV1 decoded_snapshot = decoded;
+  const auto unchanged = [&](const GenericHdgCudaCheckpointArtifactV1& value)
+  {
+    return value.schema_version == decoded_snapshot.schema_version &&
+        value.numerical_identity == decoded_snapshot.numerical_identity &&
+        value.artifact_hash == decoded_snapshot.artifact_hash &&
+        value.time_state.cursor.current_time ==
+            decoded_snapshot.time_state.cursor.current_time &&
+        value.time_state.output_cycle ==
+            decoded_snapshot.time_state.output_cycle &&
+        value.ranks.size() == 1 && decoded_snapshot.ranks.size() == 1 &&
+        value.ranks[0].interior == decoded_snapshot.ranks[0].interior &&
+        value.ranks[0].owned_true_trace ==
+            decoded_snapshot.ranks[0].owned_true_trace;
+  };
+  std::vector<std::uint8_t> corrupted = encoded;
+  corrupted[corrupted.size() / 2] ^= 1U;
+  passed = Check(
+      DecodeGenericHdgCudaCheckpointV1(
+          {corrupted.data(), corrupted.size()}, numerical_identity, 1,
+          decoded) == CheckpointCodecStatus::checksum_mismatch &&
+          unchanged(decoded),
+      "generic_cuda_corruption_rejected_atomically") && passed;
+  StateHash wrong_identity = numerical_identity;
+  wrong_identity.bytes[0] ^= 1U;
+  passed = Check(
+      DecodeGenericHdgCudaCheckpointV1(
+          {encoded.data(), encoded.size()}, wrong_identity, 1,
+          decoded) == CheckpointCodecStatus::invalid_config_identity &&
+          unchanged(decoded),
+      "generic_cuda_identity_mismatch_rejected_atomically") && passed;
+  passed = Check(
+      DecodeGenericHdgCudaCheckpointV1(
+          {encoded.data(), encoded.size() - 1}, numerical_identity, 1,
+          decoded) == CheckpointCodecStatus::truncated && unchanged(decoded),
+      "generic_cuda_truncation_rejected_atomically") && passed;
+  return passed;
+}
+
 } // namespace
 
 int main()
@@ -3299,6 +3617,7 @@ int main()
   passed = CheckGoldenRoundTrip() && passed;
   passed = CheckEncoderControls() && passed;
   passed = CheckDecodeMutationCensusAndAtomicity() && passed;
+  passed = CheckGenericCudaAdaptiveCommittedBoundaryRoundTrip() && passed;
   if (passed)
   {
     std::cout << "HDG W8A in-memory checkpoint codec checks passed\n";

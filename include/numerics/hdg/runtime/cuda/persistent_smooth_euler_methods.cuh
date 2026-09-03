@@ -3,6 +3,70 @@
 namespace detail
 {
 
+// Qualification of a supplied RODAS3 entry state uses the same normalized
+// algebraic correction as the CPU leaf. Keep the reduction private to this
+// implementation: it is one scalar gate, not retained diagnostic history.
+static __global__ void CudaRodasNormalizedEntryCorrectionSquaredKernel(
+    const CudaDeviceView view, const CudaMeshShape shape,
+    double* const result)
+{
+  __shared__ double partial[256];
+  const int thread = threadIdx.x;
+  double sum = 0.0;
+  const int auxiliary_components =
+      shape.interior_components - conserved_components;
+  const int auxiliary_offset =
+      conserved_components * shape.scalar_interior_dofs;
+  for (int element = 0; element < shape.elements; ++element)
+    for (int local = thread;
+         local < auxiliary_components * shape.scalar_interior_dofs;
+         local += blockDim.x)
+    {
+      const int index = element * shape.interior_dofs +
+          auxiliary_offset + local;
+      const double before = view.rodas_combination_interior[index];
+      const double after = view.work_interior[index];
+      const double scale = fmax(1.0, fmax(fabs(before), fabs(after)));
+      const double correction = (after - before) / scale;
+      sum += correction * correction;
+    }
+  for (int index = thread; index < shape.true_trace_count;
+       index += blockDim.x)
+  {
+    const double before = view.rodas_combination_true_trace[index];
+    const double after = view.work_true_trace[index];
+    const double scale = fmax(1.0, fmax(fabs(before), fabs(after)));
+    const double correction = (after - before) / scale;
+    sum += correction * correction;
+  }
+  partial[thread] = sum;
+  __syncthreads();
+  for (int offset = blockDim.x / 2; offset > 0; offset /= 2)
+  {
+    if (thread < offset) partial[thread] += partial[thread + offset];
+    __syncthreads();
+  }
+  if (thread == 0) result[0] = partial[0];
+}
+
+inline bool CudaLaunchRodasNormalizedEntryCorrectionSquared(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    double* const result) noexcept
+{
+  if (!shape.borrowed_host_inputs || shape.elements <= 0 ||
+      shape.scalar_interior_dofs <= 0 ||
+      shape.interior_components < conserved_components ||
+      shape.true_trace_count <= 0 ||
+      view.rodas_combination_interior == nullptr ||
+      view.rodas_combination_true_trace == nullptr ||
+      view.work_interior == nullptr || view.work_true_trace == nullptr ||
+      result == nullptr)
+    return false;
+  CudaRodasNormalizedEntryCorrectionSquaredKernel<<<1, 256>>>(
+      view, shape, result);
+  return cudaPeekAtLastError() == cudaSuccess;
+}
+
 inline int CudaDecodeSigned(const int encoded, double& sign) noexcept
 {
   sign = encoded >= 0 ? 1.0 : -1.0;
@@ -142,6 +206,32 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
                 0.0);
       std::fill(host_boundary_pressure_.begin(), host_boundary_pressure_.end(),
                 0.0);
+    }
+  }
+  if (positivity_limiter_enabled_)
+  {
+    const mfem::FiniteElement* const reference_element =
+        interior_space_->GetFE(0);
+    const mfem::IntegrationRule* const vertices = reference_element
+        ? mfem::Geometries.GetVertices(reference_element->GetGeomType())
+        : nullptr;
+    if (reference_element == nullptr || vertices == nullptr ||
+        vertices->GetNPoints() != 4 ||
+        host_limiter_vertex_shape_.size() !=
+            static_cast<std::size_t>(4 * shape_.scalar_interior_dofs))
+      return false;
+    mfem::Vector vertex_shape(shape_.scalar_interior_dofs);
+    for (int vertex = 0; vertex < 4; ++vertex)
+    {
+      reference_element->CalcShape(vertices->IntPoint(vertex), vertex_shape);
+      for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
+      {
+        const double value = vertex_shape[scalar];
+        if (!std::isfinite(value)) return false;
+        host_limiter_vertex_shape_[
+            static_cast<std::size_t>(vertex) *
+                shape_.scalar_interior_dofs + scalar] = value;
+      }
     }
   }
   for (int element = 0; element < shape_.elements; ++element)
@@ -698,8 +788,38 @@ ExportInterior(const CudaInteriorState& source,
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+SeedCandidateLimiterDiagnostics() noexcept
+{
+  const std::size_t elements = static_cast<std::size_t>(shape_.elements);
+  const std::size_t value_count = 2 * elements;
+  const bool local_valid = initialized_ && positivity_limiter_enabled_ &&
+      elements > 0 && committed_limiter_diagnostics_ >= 0 &&
+      committed_limiter_diagnostics_ < 2 &&
+      candidate_limiter_diagnostics_ >= 0 &&
+      candidate_limiter_diagnostics_ < 2 &&
+      committed_limiter_diagnostics_ != candidate_limiter_diagnostics_ &&
+      view_.positivity_theta_rho[committed_limiter_diagnostics_] != nullptr &&
+      view_.positivity_theta_p[committed_limiter_diagnostics_] ==
+          view_.positivity_theta_rho[committed_limiter_diagnostics_] +
+              shape_.elements &&
+      view_.positivity_theta_rho[candidate_limiter_diagnostics_] != nullptr &&
+      view_.positivity_theta_p[candidate_limiter_diagnostics_] ==
+          view_.positivity_theta_rho[candidate_limiter_diagnostics_] +
+              shape_.elements;
+  if (!CollectiveContinue(local_valid)) return false;
+  const bool copied = TransportPolicy::DeviceToDevice(
+      view_.positivity_theta_rho[candidate_limiter_diagnostics_],
+      view_.positivity_theta_rho[committed_limiter_diagnostics_],
+      value_count * sizeof(double), CudaTransferCategory::attempt_history,
+      CudaTransferSite::attempt_seed_interior);
+  return CollectiveContinue(copied);
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 ExportFields(const CudaInteriorState& source,
-             const generic::HdgEulerHostInteriorFields destination) noexcept
+             const generic::HdgEulerHostInteriorFields destination,
+             const bool prepared_diagnostics) noexcept
 {
   const std::size_t scalar_count =
       static_cast<std::size_t>(interior_space_->GetVSize() /
@@ -709,12 +829,34 @@ ExportFields(const CudaInteriorState& source,
       ? igr_published_components : conserved_components;
   const std::size_t coefficient_count = scalar_count *
       static_cast<std::size_t>(output_components);
+  const bool any_limiter_diagnostics =
+      destination.zhang_shu_theta_rho != nullptr ||
+      destination.zhang_shu_theta_p != nullptr ||
+      destination.zhang_shu_element_count != 0;
+  const bool limiter_diagnostics_requested =
+      destination.zhang_shu_theta_rho != nullptr &&
+      destination.zhang_shu_theta_p != nullptr &&
+      destination.zhang_shu_element_count ==
+          static_cast<std::size_t>(shape_.elements);
+  const int diagnostic_slot = prepared_diagnostics
+      ? candidate_limiter_diagnostics_
+      : committed_limiter_diagnostics_;
+  const bool limiter_diagnostics_ready =
+      !any_limiter_diagnostics ||
+      (limiter_diagnostics_requested && positivity_limiter_enabled_ &&
+       diagnostic_slot >= 0 && diagnostic_slot < 2 &&
+       view_.positivity_theta_rho[diagnostic_slot] != nullptr &&
+       view_.positivity_theta_p[diagnostic_slot] ==
+           view_.positivity_theta_rho[diagnostic_slot] + shape_.elements &&
+       host_export_positivity_.size() ==
+           2 * destination.zhang_shu_element_count);
   bool local_valid = initialized_ && borrowed_host_inputs_ &&
       source.coefficients != nullptr && source.count ==
           static_cast<std::size_t>(shape_.interior_count) &&
       destination.scalar_count == scalar_count &&
       (destination.conservative_coefficients != nullptr || scalar_count == 0) &&
-      (!sigma_requested || shape_.igr_active);
+      (!sigma_requested || shape_.igr_active) &&
+      limiter_diagnostics_ready;
   // Validate the complete reverse scatter before launching or transferring,
   // so a rejected request cannot partially overwrite either caller field.
   for (int element = 0; local_valid && element < shape_.elements; ++element)
@@ -749,8 +891,30 @@ ExportFields(const CudaInteriorState& source,
           coefficient_count * sizeof(double),
           CudaTransferCategory::generic_host_bridge,
           CudaTransferSite::generic_host_export) &&
+      (!limiter_diagnostics_requested ||
+       TransportPolicy::DeviceToHost(
+           host_export_positivity_.data(),
+           view_.positivity_theta_rho[diagnostic_slot],
+           2 * destination.zhang_shu_element_count * sizeof(double),
+           CudaTransferCategory::generic_host_bridge,
+           CudaTransferSite::generic_host_export)) &&
       TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
   if (!CollectiveContinue(copied)) { return false; }
+  bool limiter_values_valid = true;
+  if (limiter_diagnostics_requested)
+  {
+    const std::size_t elements = destination.zhang_shu_element_count;
+    for (std::size_t element = 0;
+         element < elements && limiter_values_valid; ++element)
+    {
+      const double theta_rho = host_export_positivity_[element];
+      const double theta_p = host_export_positivity_[elements + element];
+      limiter_values_valid = std::isfinite(theta_rho) &&
+          theta_rho >= 0.0 && theta_rho <= 1.0 &&
+          std::isfinite(theta_p) && theta_p >= 0.0 && theta_p <= 1.0;
+    }
+  }
+  if (!CollectiveContinue(limiter_values_valid)) { return false; }
   for (int element = 0; element < shape_.elements; ++element)
     for (int component = 0; component < output_components; ++component)
       for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
@@ -774,6 +938,17 @@ ExportFields(const CudaInteriorState& source,
                 value;
       }
     }
+  if (limiter_diagnostics_requested)
+  {
+    const std::size_t elements = destination.zhang_shu_element_count;
+    for (std::size_t element = 0; element < elements; ++element)
+    {
+      const double theta_rho = host_export_positivity_[element];
+      const double theta_p = host_export_positivity_[elements + element];
+      destination.zhang_shu_theta_rho[element] = theta_rho;
+      destination.zhang_shu_theta_p[element] = theta_p;
+    }
+  }
   return true;
 }
 
@@ -783,34 +958,32 @@ BuildLocalTraceGraph() noexcept
 {
   try
   {
-    local_trace_matrix_.emplace(shape_.local_trace_count);
-    for (int element = 0; element < shape_.elements; ++element)
-      for (int row = 0; row < shape_.trace_dofs; ++row)
-      {
-        double row_sign = 1.0;
-        const int local_row = CudaDecodeSigned(
-            signed_element_trace_[static_cast<std::size_t>(element) *
-                                      shape_.trace_dofs + row],
-            row_sign);
-        for (int column = 0; column < shape_.trace_dofs; ++column)
-        {
-          double column_sign = 1.0;
-          const int local_column = CudaDecodeSigned(
-              signed_element_trace_[static_cast<std::size_t>(element) *
-                                        shape_.trace_dofs + column],
-              column_sign);
-          local_trace_matrix_->Add(local_row, local_column,
-                                   row_sign * column_sign);
-        }
-      }
-    local_trace_matrix_->Finalize();
-    double* values = local_trace_matrix_->HostWriteData();
-    const int* offsets = local_trace_matrix_->HostReadI();
-    const int* columns = local_trace_matrix_->HostReadJ();
+    TraceCsrGraphPlan graph = BuildTraceCsrGraphPlan({
+        shape_.elements, shape_.trace_dofs, shape_.local_trace_count,
+        signed_element_trace_.data(),
+        static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs});
+    if (!graph.valid ||
+        graph.offsets.size() !=
+            static_cast<std::size_t>(shape_.local_trace_count) + 1 ||
+        graph.columns.empty())
+      return false;
+
+    // Wrap the topology without ownership, let MFEM allocate the value array,
+    // then deep-copy the complete CSR object into MFEM-managed storage. Raw
+    // new[] graph arrays cannot be transferred into a DEVICE_UMPIRE build:
+    // its MemoryManager must remain the allocation and teardown authority.
+    mfem::SparseMatrix planned_graph(
+        graph.offsets.data(), graph.columns.data(), nullptr,
+        shape_.local_trace_count, shape_.local_trace_count,
+        false, false, graph.legacy_columns_sorted);
+    double* values = planned_graph.HostWriteData();
     for (int row = 0; row < shape_.local_trace_count; ++row)
-      for (int entry = offsets[row]; entry < offsets[row + 1]; ++entry)
-        values[entry] = columns[entry] == row ? 64.0 : 1.0e-3;
-    local_trace_matrix_->MoveDiagonalFirst();
+      for (int entry = graph.offsets[static_cast<std::size_t>(row)];
+           entry < graph.offsets[static_cast<std::size_t>(row) + 1]; ++entry)
+        values[entry] =
+            graph.columns[static_cast<std::size_t>(entry)] == row
+            ? 64.0 : 1.0e-3;
+    local_trace_matrix_.emplace(planned_graph, true);
   }
   catch (...)
   {
@@ -859,6 +1032,28 @@ BindArenaViews() noexcept
   if (partitioned_backward_euler_)
     view_.partitioned_base_interior = take_d(
         generic ? generic_arena_layout_.partitioned_base_interior : 0);
+  if (rodas3_)
+  {
+    for (double*& stage : view_.rodas_stage_interior)
+      stage = take_d(max_i);
+    view_.rodas_combination_interior = take_d(max_i);
+    // The initial scalar bootstrap completes before any RODAS stage exists.
+    // Reuse its principal-combination vector for the frozen U4 snapshot so
+    // making the private t=0 IGR state coherent adds no persistent arena.
+    if (shape_.igr_active)
+      view_.partitioned_base_interior =
+          view_.rodas_combination_interior;
+    view_.rodas_residual_f = take_d(max_i);
+    for (double*& stage : view_.rodas_stage_true_trace)
+      stage = take_d(max_tt);
+    if (ranks_ == 2)
+      for (double*& stage : view_.rodas_stage_local_trace)
+        stage = take_d(max_lt);
+    view_.rodas_combination_true_trace = take_d(max_tt);
+    view_.rodas_residual_g = take_d(max_er);
+    view_.rodas_operator_b = take_d(max_b);
+    view_.rodas_operator_c = take_d(max_b);
+  }
   view_.output_interior = take_d(max_i);
   view_.recovered_interior = take_d(max_i);
   view_.work_true_trace = take_d(max_tt);
@@ -905,6 +1100,9 @@ BindArenaViews() noexcept
       static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points);
   view_.face_normal = take_d(generic ? generic_arena_layout_.face_normal :
       static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * dimension);
+  if (positivity_limiter_enabled_)
+    view_.limiter_vertex_shape = take_d(
+        generic_arena_layout_.limiter_vertex_shape);
   if (shape_.igr_active)
     view_.face_h = generic && shape_.igr_active
         ? take_d(generic_arena_layout_.face_h) : nullptr;
@@ -924,6 +1122,16 @@ BindArenaViews() noexcept
         generic_arena_layout_.boundary_reference : 0);
     view_.boundary_pressure = take_d(generic ?
         generic_arena_layout_.boundary_pressure : 0);
+  }
+  if (positivity_limiter_enabled_)
+  {
+    for (int slot = 0; slot < 2; ++slot)
+    {
+      view_.positivity_theta_rho[slot] =
+          take_d(generic_arena_layout_.elements);
+      view_.positivity_theta_p[slot] =
+          take_d(generic_arena_layout_.elements);
+    }
   }
   if (trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64)
   {
@@ -1097,6 +1305,12 @@ UploadTopologyAndState() noexcept
                shape_.face_points * dimension * sizeof(double),
            CudaTransferSite::quadrature_upload))
     return false;
+  if (positivity_limiter_enabled_ &&
+      !h2d(view_.limiter_vertex_shape,
+           host_limiter_vertex_shape_.data(),
+           static_cast<std::size_t>(4 * shape_.scalar_interior_dofs) *
+               sizeof(double), CudaTransferSite::quadrature_upload))
+    return false;
   if (shape_.igr_active &&
       !h2d(view_.face_h, host_face_h_.data(),
            static_cast<std::size_t>(shape_.elements) * faces_per_element *
@@ -1139,6 +1353,10 @@ BuildPersistentTrueSystem() noexcept
       CudaTraceSolverKind::native_rank1_fp64;
   const bool use_mgr = trace_solver_kind_ ==
       CudaTraceSolverKind::hypre_fgmres_mgr_rank1;
+  const int expected_element_schwarz_rows =
+      NativeElementSchwarzPatchRows(shape_.order, shape_.igr_active);
+  const int expected_trace_components = shape_.igr_active
+      ? igr_trace_components : conserved_components;
   if (!IsKnownCudaTraceSolverKind(trace_solver_kind_) ||
       (use_native && (ranks_ != 1 || !borrowed_topology_ ||
                       !shape_.borrowed_host_inputs)) ||
@@ -1150,10 +1368,9 @@ BuildPersistentTrueSystem() noexcept
       (!use_mgr && selected_preconditioner ==
           CudaTracePreconditionerKind::hypre_mgr_field_split) ||
       (use_element_schwarz &&
-       (!use_native || ranks_ != 1 || !shape_.igr_active ||
-        shape_.trace_components != igr_trace_components ||
-        shape_.trace_dofs !=
-            NativeElementSchwarzIgrPatchRows(shape_.order))) ||
+       (!use_native || ranks_ != 1 ||
+        shape_.trace_components != expected_trace_components ||
+        shape_.trace_dofs != expected_element_schwarz_rows)) ||
       (use_matrix_free && !use_element_schwarz))
     return false;
   initialization_tensor_core_evidence_ = {};
@@ -1631,7 +1848,10 @@ BuildPersistentTrueSystem() noexcept
               native_trace_workspace_.permutation_marks != nullptr
           : use_element_schwarz
               ? native_ilu_inverse_diagonal_ == nullptr &&
-                  native_trace_workspace_.permutation_marks != nullptr &&
+                  (native_trace_requirements_.permutation_integers == 0
+                       ? native_trace_workspace_.permutation_marks == nullptr
+                       : native_trace_workspace_.permutation_marks !=
+                             nullptr) &&
                   element_schwarz_plan_.valid &&
                   view_.element_schwarz_patch_matrix != nullptr &&
                   view_.element_schwarz_patch_lu != nullptr &&
@@ -1824,42 +2044,163 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 BuildSparseStagingPlan() noexcept
 {
+  // The generic true graph is persistent, so resolve its topology once.  The
+  // old staging builder linearly scanned every owned true row for every dense
+  // element-Schur entry.  That made setup O(E * n_t^2 * N_true), even for the
+  // native rank-one matrix-free operator.  Keep the exact CSR staging needed
+  // by the independent residual and robust native checks, but resolve local
+  // rows directly and use logarithmic searches wherever immutable row
+  // topology is sorted (with a bounded row-local fallback otherwise).
+  std::vector<std::pair<std::int64_t, int>> owned_row_lookup;
+  std::vector<unsigned char> diag_tail_sorted;
+  std::vector<unsigned char> offd_sorted;
+  bool lookup_ready = shape_.true_trace_count > 0 &&
+      owned_global_true_.size() >=
+          static_cast<std::size_t>(shape_.true_trace_count);
+  try
+  {
+    if (lookup_ready)
+    {
+      owned_row_lookup.reserve(
+          static_cast<std::size_t>(shape_.true_trace_count));
+      for (int row = 0; row < shape_.true_trace_count; ++row)
+        owned_row_lookup.emplace_back(
+            owned_global_true_[static_cast<std::size_t>(row)], row);
+      std::sort(owned_row_lookup.begin(), owned_row_lookup.end());
+      diag_tail_sorted.assign(
+          static_cast<std::size_t>(shape_.true_trace_count), 0);
+      offd_sorted.assign(
+          static_cast<std::size_t>(shape_.true_trace_count), 0);
+    }
+  }
+  catch (...)
+  {
+    lookup_ready = false;
+  }
+  for (std::size_t index = 1;
+       lookup_ready && index < owned_row_lookup.size(); ++index)
+    if (owned_row_lookup[index - 1].first == owned_row_lookup[index].first)
+      lookup_ready = false;
+  if (!CollectiveContinue(lookup_ready)) return false;
+
+  bool structure_searchable =
+      true_structure_.diag_nonzeros >= 0 &&
+      true_structure_.offd_nonzeros >= 0 &&
+      true_structure_.diag_offsets.size() ==
+          static_cast<std::size_t>(shape_.true_trace_count) + 1 &&
+      true_structure_.offd_offsets.size() ==
+          static_cast<std::size_t>(shape_.true_trace_count) + 1 &&
+      true_structure_.diag_columns.size() ==
+          static_cast<std::size_t>(true_structure_.diag_nonzeros) &&
+      true_structure_.offd_columns.size() ==
+          static_cast<std::size_t>(true_structure_.offd_nonzeros);
+  for (int row = 0; structure_searchable &&
+       row < shape_.true_trace_count; ++row)
+  {
+    const int diag_begin = true_structure_.diag_offsets[
+        static_cast<std::size_t>(row)];
+    const int diag_end = true_structure_.diag_offsets[
+        static_cast<std::size_t>(row + 1)];
+    const int offd_begin = true_structure_.offd_offsets[
+        static_cast<std::size_t>(row)];
+    const int offd_end = true_structure_.offd_offsets[
+        static_cast<std::size_t>(row + 1)];
+    structure_searchable = diag_begin >= 0 && diag_begin <= diag_end &&
+        diag_end <= true_structure_.diag_nonzeros && offd_begin >= 0 &&
+        offd_begin <= offd_end && offd_end <= true_structure_.offd_nonzeros;
+    if (!structure_searchable) break;
+    const int diag_tail_begin = std::min(diag_begin + 1, diag_end);
+    diag_tail_sorted[static_cast<std::size_t>(row)] =
+        static_cast<unsigned char>(std::is_sorted(
+            true_structure_.diag_columns.begin() + diag_tail_begin,
+            true_structure_.diag_columns.begin() + diag_end));
+    offd_sorted[static_cast<std::size_t>(row)] =
+        static_cast<unsigned char>(std::is_sorted(
+            true_structure_.offd_columns.begin() + offd_begin,
+            true_structure_.offd_columns.begin() + offd_end));
+  }
+  if (!CollectiveContinue(structure_searchable)) return false;
+
   const auto find_row = [&](const std::int64_t global)
   {
-    for (int row = 0; row < shape_.true_trace_count; ++row)
-      if (owned_global_true_[static_cast<std::size_t>(row)] == global)
-        return row;
-    return -1;
+    const auto found = std::lower_bound(
+        owned_row_lookup.begin(), owned_row_lookup.end(), global,
+        [](const std::pair<std::int64_t, int>& entry,
+           const std::int64_t value) { return entry.first < value; });
+    return found != owned_row_lookup.end() && found->first == global
+        ? found->second : -1;
   };
-  const auto find_target = [&](const std::int64_t row_global,
+  const auto find_target = [&](const int row,
+                               const int owned_column,
                                const std::int64_t column_global,
                                int& section, int& target)
   {
-    const int row = find_row(row_global);
-    if (row < 0) { return false; }
-    for (int entry = true_structure_.diag_offsets[static_cast<std::size_t>(row)];
-         entry < true_structure_.diag_offsets[static_cast<std::size_t>(row + 1)];
-         ++entry)
+    if (row < 0 || row >= shape_.true_trace_count) return false;
+    if (owned_column >= 0)
     {
-      const int column = true_structure_.diag_columns[static_cast<std::size_t>(entry)];
-      if (column >= 0 && column < shape_.true_trace_count &&
-          owned_global_true_[static_cast<std::size_t>(column)] == column_global)
+      const int begin = true_structure_.diag_offsets[
+          static_cast<std::size_t>(row)];
+      const int end = true_structure_.diag_offsets[
+          static_cast<std::size_t>(row + 1)];
+      if (begin < end && true_structure_.diag_columns[
+              static_cast<std::size_t>(begin)] == owned_column)
       {
         section = 0;
-        target = entry;
+        target = begin;
+        return true;
+      }
+      const int tail_begin = std::min(begin + 1, end);
+      if (diag_tail_sorted[static_cast<std::size_t>(row)] != 0)
+      {
+        const auto first = true_structure_.diag_columns.begin() + tail_begin;
+        const auto last = true_structure_.diag_columns.begin() + end;
+        const auto found = std::lower_bound(first, last, owned_column);
+        if (found != last && *found == owned_column)
+        {
+          section = 0;
+          target = static_cast<int>(
+              found - true_structure_.diag_columns.begin());
+          return true;
+        }
+      }
+      else
+        for (int entry = tail_begin; entry < end; ++entry)
+          if (true_structure_.diag_columns[
+                  static_cast<std::size_t>(entry)] == owned_column)
+          {
+            section = 0;
+            target = entry;
+            return true;
+          }
+      return false;
+    }
+
+    const int begin = true_structure_.offd_offsets[
+        static_cast<std::size_t>(row)];
+    const int end = true_structure_.offd_offsets[
+        static_cast<std::size_t>(row + 1)];
+    if (offd_sorted[static_cast<std::size_t>(row)] != 0)
+    {
+      const auto first = true_structure_.offd_columns.begin() + begin;
+      const auto last = true_structure_.offd_columns.begin() + end;
+      const auto found = std::lower_bound(first, last, column_global);
+      if (found != last && *found == column_global)
+      {
+        section = 1;
+        target = static_cast<int>(
+            found - true_structure_.offd_columns.begin());
         return true;
       }
     }
-    for (int entry = true_structure_.offd_offsets[static_cast<std::size_t>(row)];
-         entry < true_structure_.offd_offsets[static_cast<std::size_t>(row + 1)];
-         ++entry)
-      if (true_structure_.offd_columns[static_cast<std::size_t>(entry)] ==
-          column_global)
-      {
-        section = 1;
-        target = entry;
-        return true;
-      }
+    else
+      for (int entry = begin; entry < end; ++entry)
+        if (true_structure_.offd_columns[static_cast<std::size_t>(entry)] ==
+            column_global)
+        {
+          section = 1;
+          target = entry;
+          return true;
+        }
     return false;
   };
 
@@ -1874,10 +2215,11 @@ BuildSparseStagingPlan() noexcept
       const std::int64_t row_global =
           local_global_true_[static_cast<std::size_t>(row_local)];
       const int row_owner = local_owner_[static_cast<std::size_t>(row_local)];
+      const int true_row = row_owner == rank_
+          ? local_true_index_[static_cast<std::size_t>(row_local)] : -1;
       const int vector_source = element * shape_.trace_dofs + row;
       if (row_owner == rank_)
       {
-        const int true_row = find_row(row_global);
         if (true_row < 0)
         {
           local_plan_valid = false;
@@ -1908,12 +2250,17 @@ BuildSparseStagingPlan() noexcept
             column_sign);
         const std::int64_t column_global =
             local_global_true_[static_cast<std::size_t>(column_local)];
+        const int column_owner =
+            local_owner_[static_cast<std::size_t>(column_local)];
+        const int owned_column = column_owner == rank_
+            ? local_true_index_[static_cast<std::size_t>(column_local)] : -1;
         const int source = (element * shape_.trace_dofs + row) *
                                shape_.trace_dofs + column;
         if (row_owner == rank_)
         {
           int section = -1, target = -1;
-          if (!find_target(row_global, column_global, section, target))
+          if (!find_target(
+                  true_row, owned_column, column_global, section, target))
           {
             local_plan_valid = false;
           }
@@ -2014,12 +2361,17 @@ BuildSparseStagingPlan() noexcept
       return false;
     bool local_receive_valid = true;
     for (int entry = 0; entry < shape_.matrix_receive_count; ++entry)
+    {
+      const std::int64_t row_global =
+          matrix_receive_keys_[2 * static_cast<std::size_t>(entry)];
+      const std::int64_t column_global =
+          matrix_receive_keys_[2 * static_cast<std::size_t>(entry) + 1];
       local_receive_valid = find_target(
-          matrix_receive_keys_[2 * static_cast<std::size_t>(entry)],
-          matrix_receive_keys_[2 * static_cast<std::size_t>(entry) + 1],
+          find_row(row_global), find_row(column_global), column_global,
           host_matrix_receive_section_[static_cast<std::size_t>(entry)],
           host_matrix_receive_target_[static_cast<std::size_t>(entry)]) &&
           local_receive_valid;
+    }
     for (int entry = 0; entry < shape_.vector_receive_count; ++entry)
     {
       const int target = find_row(
@@ -2037,24 +2389,37 @@ BuildSparseStagingPlan() noexcept
   if (use_element_schwarz)
   {
     const int expected_patch_rows =
-        NativeElementSchwarzIgrPatchRows(shape_.order);
-    element_schwarz_plan_ = BuildNativeElementSchwarzPlan({
-        shape_.elements, shape_.trace_dofs, shape_.local_trace_count,
-        shape_.true_trace_count, true_structure_.diag_nonzeros,
-        signed_element_trace_.data(),
-        static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs,
-        local_true_index_.data(), local_true_index_.size(),
-        host_matrix_owned_source_.data(),
-        host_matrix_owned_section_.data(),
-        host_matrix_owned_target_.data(),
-        static_cast<std::size_t>(shape_.matrix_owned_count)});
+        NativeElementSchwarzPatchRows(shape_.order, shape_.igr_active);
+    const bool direct_rank_one = ranks_ == 1 &&
+        CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+            trace_policy_descriptor_.resolved_selection);
+    element_schwarz_plan_ = direct_rank_one
+        ? BuildDirectNativeElementSchwarzPlan({
+              shape_.elements, shape_.trace_dofs,
+              shape_.local_trace_count, shape_.true_trace_count,
+              signed_element_trace_.data(),
+              static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs,
+              local_true_index_.data(), local_true_index_.size()})
+        : BuildNativeElementSchwarzPlan({
+              shape_.elements, shape_.trace_dofs,
+              shape_.local_trace_count, shape_.true_trace_count,
+              true_structure_.diag_nonzeros,
+              signed_element_trace_.data(),
+              static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs,
+              local_true_index_.data(), local_true_index_.size(),
+              host_matrix_owned_source_.data(),
+              host_matrix_owned_section_.data(),
+              host_matrix_owned_target_.data(),
+              static_cast<std::size_t>(shape_.matrix_owned_count)});
     const std::size_t patch_entries =
         static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs *
         shape_.trace_dofs;
     const std::size_t element_rows =
         static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs;
-    const bool plan_exact = ranks_ == 1 && shape_.igr_active &&
-        shape_.trace_components == igr_trace_components &&
+    const int expected_trace_components = shape_.igr_active
+        ? igr_trace_components : conserved_components;
+    const bool plan_exact = ranks_ == 1 &&
+        shape_.trace_components == expected_trace_components &&
         shape_.trace_dofs == expected_patch_rows &&
         shape_.matrix_owned_count == static_cast<int>(patch_entries) &&
         shape_.matrix_send_count == 0 && shape_.matrix_receive_count == 0 &&
@@ -2073,7 +2438,7 @@ BuildSparseStagingPlan() noexcept
 
   const auto upload = [](int* destination, const int* source, int count)
   {
-    return TransportPolicy::HostToDevice(
+    return count == 0 || TransportPolicy::HostToDevice(
         destination, source, static_cast<std::size_t>(count) * sizeof(int),
         CudaTransferCategory::topology, CudaTransferSite::map_upload);
   };
@@ -2319,6 +2684,50 @@ DistributeTraceIncrement() noexcept
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+DistributeRodasStageIncrement(const std::size_t stage) noexcept
+{
+  using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
+  if (stage >= Coefficients::stage_count ||
+      view_.rodas_stage_true_trace[stage] == nullptr)
+    return false;
+  // Rank one has no ghosts and the conservation kernel deliberately keeps the
+  // established owned=true-vector path without any added staging work.
+  if (ranks_ == 1) return true;
+  if (ranks_ != 2 || view_.rodas_stage_local_trace[stage] == nullptr)
+    return false;
+
+  ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_packing);
+  double* owned_host = owned_stage_.HostWrite();
+  const std::size_t owned_bytes =
+      static_cast<std::size_t>(shape_.true_trace_count) * sizeof(double);
+  const std::size_t local_bytes =
+      static_cast<std::size_t>(shape_.local_trace_count) * sizeof(double);
+  const bool staged_out = TransportPolicy::DeviceToHost(
+          owned_host, view_.rodas_stage_true_trace[stage], owned_bytes,
+          CudaTransferCategory::host_staged_trace_exchange,
+          CudaTransferSite::trace_solution_stage_out) &&
+      TransportPolicy::Synchronize(
+          CudaTransferSite::trace_solution_stage_out);
+  if (!CollectiveContinue(staged_out)) return false;
+  const bool distributed =
+      exchange_plan_.Distribute(*trace_space_, owned_stage_, local_stage_);
+  const bool staging_recorded = TransportPolicy::RecordMpiStaging(
+      host_exchange_bytes_,
+      CudaTransferCategory::host_staged_trace_exchange,
+      CudaTransferSite::trace_ghost_stage_in, owned_host,
+      local_stage_.HostRead(), owned_bytes, local_bytes, distributed);
+  if (!CollectiveContinue(distributed && staging_recorded)) return false;
+  const bool local_ready = TransportPolicy::HostToDevice(
+          view_.rodas_stage_local_trace[stage], local_stage_.HostRead(),
+          local_bytes, CudaTransferCategory::host_staged_trace_exchange,
+          CudaTransferSite::trace_ghost_stage_in) &&
+      TransportPolicy::Synchronize(CudaTransferSite::trace_ghost_stage_in);
+  return CollectiveContinue(local_ready);
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 AssembleTrueVector(const double* element_values, double* true_values,
                    const bool completion_required) noexcept
 {
@@ -2438,8 +2847,70 @@ AssembleTrueSystem() noexcept
     return false;
   true_matrix_->HypreRead();
   hypre_rhs_->HypreRead();
-  return CollectiveContinue(CudaHypreDevicePolicyValid(
-      *true_matrix_, *hypre_rhs_, *hypre_solution_));
+  const bool ready = CudaHypreDevicePolicyValid(
+      *true_matrix_, *hypre_rhs_, *hypre_solution_) &&
+      true_rhs_generation_ != std::numeric_limits<std::uint64_t>::max();
+  if (!CollectiveContinue(ready)) return false;
+  ++true_rhs_generation_;
+  return true;
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+RefreshRetainedTrueRhs() noexcept
+{
+  ::dg_igr::NVTXRange profile_region(
+      ::dg_igr::observability::RegionId::hdg_trace_assembly);
+  const bool common_admission = (ranks_ == 1 || ranks_ == 2) &&
+      true_matrix_ && hypre_rhs_ && hypre_solution_;
+  const bool native_admitted = common_admission &&
+      trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64 &&
+      element_schwarz_plan_.valid &&
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          trace_policy_descriptor_.resolved_selection);
+  const bool ordinary_admitted = common_admission &&
+      ranks_ == 1 &&
+      trace_solver_kind_ == CudaTraceSolverKind::hypre_parcsr_gmres &&
+      CudaTracePreconditionerIsIlu(trace_preconditioner_) &&
+      CudaOrdinaryRankOneRefreshPolicyIsExact(trace_policy_descriptor_);
+  const bool host_staged_rank_two_admitted = common_admission &&
+      ranks_ == 2 && host_staged_rank2_ &&
+      trace_solver_kind_ == CudaTraceSolverKind::hypre_host_staged_rank2 &&
+      CudaHostStagedRankTwoPolicyIsExact(trace_policy_descriptor_);
+  bool refreshed = false;
+  if (native_admitted)
+  {
+    refreshed = CudaLaunchAssembleNativeElementVector(
+            view_, shape_, view_.condensed_rhs,
+            view_.true_rhs_scratch) &&
+        TransportPolicy::Synchronize(
+            CudaTransferSite::rhs_remote_scatter);
+  }
+  else if (ordinary_admitted || host_staged_rank_two_admitted)
+  {
+    // AssembleTrueVector writes only the retained HYPRE RHS storage. It does
+    // not touch true_matrix_ or any element Schur/LU data. Rank two performs
+    // its established host-staged remote-vector gather inside this call.
+    refreshed = AssembleTrueVector(
+        view_.condensed_rhs, view_.true_rhs_scratch, true);
+  }
+  if (!CollectiveContinue(refreshed))
+    return false;
+  try
+  {
+    // HypreRead publishes the retained ParCSR operator and refreshed vector.
+    // No matrix value, transpose cache, or local condensation factor is
+    // rebuilt on any admitted RHS-only path.
+    true_matrix_->HypreRead();
+    hypre_rhs_->HypreRead();
+  }
+  catch (...) { return false; }
+  const bool ready = CudaHypreDevicePolicyValid(
+      *true_matrix_, *hypre_rhs_, *hypre_solution_) &&
+      true_rhs_generation_ != std::numeric_limits<std::uint64_t>::max();
+  if (!CollectiveContinue(ready)) return false;
+  ++true_rhs_generation_;
+  return true;
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
@@ -2583,7 +3054,7 @@ LaunchAndObserveNativeRankOneTraceSolve(
           native_element_schwarz_warp_coupled_sigma_jacobi10_fp64;
   const bool projected_subspace =
       CudaNativeTraceActiveSubspaceIsProjected(active_subspace);
-  const bool projected_context = partitioned_backward_euler_ &&
+  const bool projected_context = RequiresInitialScalarClosure() &&
       cuda_engine_ == generic::CudaEngineKind::tensor_core &&
       ranks_ == 1 && shape_.igr_active &&
       shape_.trace_components == igr_trace_components &&
@@ -2681,7 +3152,7 @@ LaunchAndObserveNativeRankOneTraceSolve(
   trace_operator.element_schur = use_matrix_free ? view_.schur : nullptr;
   const bool operator_exact = use_matrix_free
       ? use_element_schwarz && element_schwarz_exact && ranks_ == 1 &&
-          shape_.igr_active && trace_operator.element_schur == view_.schur &&
+          trace_operator.element_schur == view_.schur &&
           element_schwarz.patch_rows == shape_.trace_dofs &&
           use_matrix_free_equilibrated_field_split ==
               use_equilibrated_field_split &&
@@ -2856,6 +3327,7 @@ SolveTrueSystemAttempt(double& true_relative_residual,
                 const CudaNativeTraceActiveSubspace active_subspace,
                 const double requested_relative_tolerance,
                 const bool same_matrix_retry,
+                const bool same_operator_new_rhs,
                 int& linear_iterations,
                 CudaTensorCoreEvidence& tensor_core_evidence) noexcept
 {
@@ -2875,9 +3347,53 @@ SolveTrueSystemAttempt(double& true_relative_residual,
           trace_preconditioner_);
   const bool projected_subspace =
       CudaNativeTraceActiveSubspaceIsProjected(active_subspace);
+  const bool retained_operator = same_matrix_retry ||
+      same_operator_new_rhs;
+  const CudaTraceRhsTransition rhs_transition = same_matrix_retry
+      ? CudaTraceRhsTransition::same_operator_same_rhs_retry
+      : same_operator_new_rhs
+          ? CudaTraceRhsTransition::same_operator_new_rhs
+          : CudaTraceRhsTransition::new_operator;
+  const bool rhs_transition_exact = !use_element_schwarz ||
+      CudaElementSchwarzRhsTransitionIsExact(
+          element_schwarz_attempt_state_, true_rhs_generation_,
+          rhs_transition);
+  const bool native_retained_rhs = !same_matrix_retry &&
+      trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64 &&
+      ranks_ == 1 && use_element_schwarz &&
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          trace_policy_descriptor_.resolved_selection) &&
+      element_schwarz_attempt_state_.factor_ready &&
+      element_schwarz_attempt_state_.factor_generation ==
+          matrix_generation &&
+      element_schwarz_attempt_state_.last_solve_generation ==
+          matrix_generation &&
+      true_rhs_generation_ >
+          element_schwarz_attempt_state_.last_rhs_generation;
+  const bool ordinary_retained_rhs = !same_matrix_retry &&
+      trace_solver_kind_ == CudaTraceSolverKind::hypre_parcsr_gmres &&
+      ranks_ == 1 && use_ilu &&
+      CudaOrdinaryRankOneRefreshPolicyIsExact(
+          trace_policy_descriptor_) &&
+      CudaOrdinaryRankOneRefreshAttemptIsExact(
+          ilu_factor_state_, current_attempt_,
+          reinterpret_cast<std::uintptr_t>(true_matrix_.get()),
+          reinterpret_cast<std::uintptr_t>(true_device_.diag_values),
+          reinterpret_cast<std::uintptr_t>(true_device_.offd_values),
+          true_device_.diag_nonzeros, true_device_.offd_nonzeros) &&
+      true_rhs_generation_ > 0;
+  const bool host_staged_rank_two_retained_rhs = !same_matrix_retry &&
+      trace_solver_kind_ == CudaTraceSolverKind::hypre_host_staged_rank2 &&
+      ranks_ == 2 && host_staged_rank2_ &&
+      CudaHostStagedRankTwoPolicyIsExact(trace_policy_descriptor_) &&
+      true_rhs_generation_ > 0;
+  const bool same_operator_rhs_admitted = !same_operator_new_rhs ||
+      native_retained_rhs || ordinary_retained_rhs ||
+      host_staged_rank_two_retained_rhs;
   if (!IsKnownCudaNativeTraceActiveSubspace(active_subspace) ||
       (projected_subspace &&
-       trace_solver_kind_ != CudaTraceSolverKind::native_rank1_fp64))
+       trace_solver_kind_ != CudaTraceSolverKind::native_rank1_fp64) ||
+      !rhs_transition_exact || !same_operator_rhs_admitted)
     return false;
   std::uint64_t robust_lower_setup_delta = 0;
   std::uint64_t robust_coupled_setup_delta = 0;
@@ -2921,8 +3437,8 @@ SolveTrueSystemAttempt(double& true_relative_residual,
       const bool transition_ready = element_schwarz_plan_.valid &&
           CudaElementSchwarzFactorTransitionIsExact(
               element_schwarz_attempt_state_, current_attempt_,
-              matrix_generation, same_matrix_retry);
-      if (same_matrix_retry)
+              matrix_generation, retained_operator);
+      if (retained_operator)
       {
         const CudaTracePreconditionerKind retained =
             element_schwarz_attempt_state_.factor_preconditioner;
@@ -3044,7 +3560,7 @@ SolveTrueSystemAttempt(double& true_relative_residual,
             &native_observation);
     constexpr std::uint32_t invalid_preconditioner_failure_mask = 1U << 2;
     const bool lower_application_structurally_rejected =
-        robust && !projected_subspace && !same_matrix_retry && !solved &&
+        robust && !projected_subspace && !retained_operator && !solved &&
         diagnostics.device_policy &&
         schwarz_factor_ready &&
         element_schwarz_attempt_state_.factor_preconditioner ==
@@ -3164,7 +3680,7 @@ SolveTrueSystemAttempt(double& true_relative_residual,
     {
       const bool state_generation_ready = ilu_factor_state_.factor_ready &&
           ilu_factor_state_.factor_generation <= matrix_generation &&
-          (same_matrix_retry
+          (retained_operator
                ? matrix_generation == ilu_factor_state_.last_solve_generation
                : matrix_generation > ilu_factor_state_.last_solve_generation);
       if (state_generation_ready)
@@ -3178,14 +3694,23 @@ SolveTrueSystemAttempt(double& true_relative_residual,
           element_schwarz_attempt_state_.factor_ready &&
           element_schwarz_attempt_state_.factor_generation ==
               matrix_generation &&
-          (same_matrix_retry
+          (retained_operator
                ? matrix_generation ==
                    element_schwarz_attempt_state_.last_solve_generation
                : matrix_generation >
-                   element_schwarz_attempt_state_.last_solve_generation);
+                   element_schwarz_attempt_state_.last_solve_generation) &&
+          (same_matrix_retry
+               ? true_rhs_generation_ ==
+                   element_schwarz_attempt_state_.last_rhs_generation
+               : true_rhs_generation_ >
+                   element_schwarz_attempt_state_.last_rhs_generation);
       if (state_generation_ready)
+      {
         element_schwarz_attempt_state_.last_solve_generation =
             matrix_generation;
+        element_schwarz_attempt_state_.last_rhs_generation =
+            true_rhs_generation_;
+      }
       else
       {
         if (robust)
@@ -3328,7 +3853,7 @@ SolveTrueSystemAttempt(double& true_relative_residual,
             current_attempt_, requested_relative_tolerance,
             maximum_linear_iterations_, krylov_dimension_,
             matrix_generation, ilu_factor_state_, diagnostics,
-            same_matrix_retry);
+            retained_operator);
       }
     }
     else
@@ -3342,7 +3867,7 @@ SolveTrueSystemAttempt(double& true_relative_residual,
   }
   if (solved && robust)
   {
-    const bool setup_deltas_exact = same_matrix_retry
+    const bool setup_deltas_exact = retained_operator
         ? robust_lower_setup_delta == 0 &&
             robust_coupled_setup_delta == 0 &&
             robust_lower_rejected_solve_delta == 0
@@ -3497,7 +4022,8 @@ SolveTrueSystem(const generic::EulerHdgLinearSolveRole role,
                 int& linear_iterations,
                 int& linear_solve_attempts,
                 int& true_residual_tightenings,
-                CudaTensorCoreEvidence& tensor_core_evidence) noexcept
+                CudaTensorCoreEvidence& tensor_core_evidence,
+                const bool same_operator_new_rhs) noexcept
 {
   linear_iterations = 0;
   linear_solve_attempts = 0;
@@ -3507,12 +4033,14 @@ SolveTrueSystem(const generic::EulerHdgLinearSolveRole role,
       ? newton_correction_linear_relative_tolerance_
       : final_coherent_linear_relative_tolerance_;
   const auto invoke = [&](const double tolerance,
-                          const bool same_matrix_retry) noexcept
+                          const bool same_matrix_retry,
+                          const bool retained_new_rhs) noexcept
   {
     int invocation_iterations = 0;
     const bool solved = SolveTrueSystemAttempt(
         true_relative_residual, matrix_generation, active_subspace, tolerance,
-        same_matrix_retry, invocation_iterations, tensor_core_evidence);
+        same_matrix_retry, retained_new_rhs, invocation_iterations,
+        tensor_core_evidence);
     const bool bounded = invocation_iterations >= 0 &&
         linear_iterations <= std::numeric_limits<int>::max() -
             invocation_iterations &&
@@ -3525,7 +4053,7 @@ SolveTrueSystem(const generic::EulerHdgLinearSolveRole role,
     return solved && bounded;
   };
 
-  if (!invoke(requested_tolerance, false)) return false;
+  if (!invoke(requested_tolerance, false, same_operator_new_rhs)) return false;
   if (true_relative_residual <= true_residual_relative_tolerance_)
     return true;
   const bool tighten =
@@ -3533,8 +4061,1422 @@ SolveTrueSystem(const generic::EulerHdgLinearSolveRole role,
           requested_tolerance;
   if (!CollectiveContinue(tighten)) return false;
   ++true_residual_tightenings;
-  return invoke(true_residual_tightening_linear_relative_tolerance_, true) &&
+  return invoke(true_residual_tightening_linear_relative_tolerance_, true,
+                false) &&
       true_relative_residual <= true_residual_relative_tolerance_;
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+auto CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
+              state_slot& workspace) noexcept -> CudaNumericalResult
+{
+  using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
+  ::dg_igr::NVTXRange accepted_step_profile_region(
+      ::dg_igr::observability::RegionId::hdg_accepted_step);
+  CudaIluFactorAttemptEndGuard end_factor_attempt(ilu_factor_state_);
+  CudaElementSchwarzAttemptEndGuard end_schwarz_attempt(
+      element_schwarz_attempt_state_);
+  CudaNumericalResult result{};
+  result.tensor_core.selected_engine = cuda_engine_;
+  result.tensor_core.requested_trace_policy =
+      trace_policy_descriptor_.requested_selection;
+  result.tensor_core.resolved_trace_policy =
+      trace_policy_descriptor_.resolved_selection;
+  result.tensor_core.trace_policy_rank_count =
+      trace_policy_descriptor_.rank_count;
+  result.tensor_core.trace_policy_order =
+      trace_policy_descriptor_.polynomial_order;
+  result.tensor_core.trace_preconditioner = trace_preconditioner_;
+  result.tensor_core.trace_preconditioner_configured =
+      CudaTracePolicyDescriptorIsExact(trace_policy_descriptor_) &&
+      trace_preconditioner_ == trace_policy_descriptor_.trace_preconditioner;
+  result.tensor_core.native_rank1_trace_solver_configured =
+      trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64;
+  result.tensor_core.hypre_host_staged_rank2_trace_solver_configured =
+      trace_solver_kind_ == CudaTraceSolverKind::hypre_host_staged_rank2;
+  result.tensor_core.native_element_schwarz_configured =
+      CudaTracePreconditionerIsNativeElementSchwarz(trace_preconditioner_) &&
+      element_schwarz_plan_.valid;
+  result.tensor_core.native_matrix_free_trace_operator_configured =
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          trace_policy_descriptor_.resolved_selection) &&
+      result.tensor_core.native_element_schwarz_configured;
+  const bool robust_trace_policy =
+      CudaTracePolicyUsesNativeElementMatrixFreeWarpRobustCoupled(
+          trace_policy_descriptor_.resolved_selection) &&
+      CudaTracePreconditionerIsNativeElementSchwarzRobustCoupled(
+          trace_preconditioner_);
+  result.tensor_core.robust_lower_specialization_supported =
+      robust_trace_policy && native_trace_support_.supported;
+  result.tensor_core.robust_coupled_specialization_supported =
+      robust_trace_policy && native_trace_robust_coupled_support_.supported;
+  result.tensor_core.robust_branch_accounting_complete =
+      !robust_trace_policy ||
+      (result.tensor_core.robust_lower_specialization_supported &&
+       result.tensor_core.robust_coupled_specialization_supported);
+  result.tensor_core.element_schwarz_patch_rows =
+      element_schwarz_plan_.patch_rows;
+  result.tensor_core.element_schwarz_minimum_multiplicity =
+      element_schwarz_plan_.minimum_multiplicity;
+  result.tensor_core.element_schwarz_maximum_multiplicity =
+      element_schwarz_plan_.maximum_multiplicity;
+  result.tensor_core.trace_solver_accounting_complete = true;
+  result.tensor_core.hardware_supported =
+      tensor_core_hardware_supported_;
+  // Every admitted RODAS3 route is fixed before device work and has no
+  // fallback: rank-one tensor-native, rank-one ordinary ParCSR, or the exact
+  // engine-default rank-two host-staged ParCSR leaf.
+  result.tensor_core.fallback_accounting_complete = true;
+  result.precision_work.all_fp64_policy = true;
+  result.precision_work.accounting_complete = true;
+  (void)CudaInitializeIluEvidence(
+      result.tensor_core, trace_preconditioner_, shape_.igr_active);
+
+  accepted_allocation_events_ = AllocatorPolicy::AllocationEvents();
+  const bool tensor_rank_one =
+      cuda_engine_ == generic::CudaEngineKind::tensor_core &&
+      trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64 &&
+      CudaTracePolicyUsesNativeElementMatrixFreeOperator(
+          trace_policy_descriptor_.resolved_selection) &&
+      CudaTracePreconditionerIsNativeElementSchwarz(trace_preconditioner_) &&
+      element_schwarz_plan_.valid;
+  const bool ordinary_rank_one =
+      cuda_engine_ == generic::CudaEngineKind::ordinary &&
+      trace_solver_kind_ == CudaTraceSolverKind::hypre_parcsr_gmres &&
+      CudaTracePreconditionerIsIlu(trace_preconditioner_) &&
+      CudaOrdinaryRankOneRefreshPolicyIsExact(trace_policy_descriptor_);
+  const bool host_staged_rank_two =
+      ranks_ == 2 && host_staged_rank2_ &&
+      trace_solver_kind_ == CudaTraceSolverKind::hypre_host_staged_rank2 &&
+      CudaHostStagedRankTwoPolicyIsExact(trace_policy_descriptor_);
+  const bool ilu_common_shift =
+      CudaTracePreconditionerIsIlu(trace_preconditioner_);
+  const bool diagonal_common_shift = trace_preconditioner_ ==
+      CudaTracePreconditionerKind::hypre_diag_scale;
+  const double algebraic_residual_allowance = std::max(
+      nonlinear_relative_tolerance_,
+      1024.0 * std::numeric_limits<double>::epsilon());
+  const bool positivity_enabled =
+      config.numerical_policy.positivity_limiter.kind ==
+          generic::EulerHdgPositivityLimiterKind::zhang_shu;
+  const bool admitted = initialized_ && rodas3_ &&
+      time_treatment_ == generic::EulerHdgTimeTreatment::rodas3 &&
+      (ranks_ == 1 || ranks_ == 2) && shape_.borrowed_host_inputs &&
+      (tensor_rank_one || ordinary_rank_one || host_staged_rank_two) &&
+      !config.capture_oracle &&
+      std::isfinite(attempt.dt) && attempt.dt > 0.0 &&
+      workspace.interior.coefficients == view_.work_interior &&
+      workspace.trace.coefficients == view_.work_true_trace &&
+      view_.rodas_residual_f != nullptr &&
+      view_.rodas_residual_g != nullptr &&
+      view_.rodas_operator_b != nullptr &&
+      view_.rodas_operator_c != nullptr &&
+      view_.rodas_combination_interior != nullptr &&
+      view_.rodas_combination_true_trace != nullptr &&
+      (ranks_ == 1 ||
+       std::all_of(std::begin(view_.rodas_stage_local_trace),
+                   std::end(view_.rodas_stage_local_trace),
+                   [](const double* value) { return value != nullptr; }));
+  if (!CollectiveContinue(admitted))
+  {
+    result.phase = CudaFailurePhase::setup;
+    result.reason = FailureReason::backend_failure;
+    return result;
+  }
+
+  const bool numerical_injection_phase =
+      config.injection.phase == CudaFailurePhase::assembly ||
+      config.injection.phase == CudaFailurePhase::condensation ||
+      config.injection.phase == CudaFailurePhase::trace_solve ||
+      config.injection.phase == CudaFailurePhase::recovery ||
+      config.injection.phase ==
+          CudaFailurePhase::after_recovery_before_commit ||
+      config.injection.phase == CudaFailurePhase::diagnostics;
+  const bool injection_config_valid = !config.injection.enabled ||
+      (numerical_injection_phase && config.injection.target_step != 0 &&
+       config.injection.source_rank >= 0 &&
+       config.injection.source_rank < ranks_);
+  if (!CollectiveContinue(injection_config_valid))
+  {
+    result.reason = FailureReason::collective_protocol;
+    return result;
+  }
+  const bool injection_active = config.injection.enabled &&
+      config.injection.target_step == attempt.committed_step + 1 &&
+      attempt.retry_index == 0;
+  const auto inject_at = [&](const CudaFailurePhase phase) noexcept
+  {
+    result.phase = phase;
+    if (!injection_active || config.injection.phase != phase) return false;
+    const int local_claim = rank_ == config.injection.source_rank ? 1 : 0;
+    int claims = 0;
+    if (MPI_Allreduce(&local_claim, &claims, 1, MPI_INT, MPI_SUM,
+                      communicator_) != MPI_SUCCESS || claims != 1)
+    {
+      result.reason = FailureReason::collective_protocol;
+      return true;
+    }
+    result.injected = true;
+    result.injection_source_rank = config.injection.source_rank;
+    result.reason = FailureReason::backend_failure;
+    return true;
+  };
+  const auto enter = [&](const CudaFailurePhase phase) noexcept
+  {
+    return !inject_at(phase) &&
+        CollectiveContinue(Ticket(phase));
+  };
+  const auto add_volume_work = [&](const std::uint64_t mma_tiles) noexcept
+  {
+    if (result.tensor_core.volume_assembly_launches ==
+            std::numeric_limits<std::uint64_t>::max() ||
+        mma_tiles > std::numeric_limits<std::uint64_t>::max() -
+            result.tensor_core.volume_mma_tiles)
+      return false;
+    ++result.tensor_core.volume_assembly_launches;
+    result.tensor_core.volume_mma_tiles += mma_tiles;
+    ++result.complete_assemblies;
+    return true;
+  };
+  const auto assemble_spatial = [&](const bool algebraic_mask,
+                                    double* residual_norm) noexcept
+  {
+    const std::size_t interior_bytes = workspace.interior.count *
+        sizeof(double);
+    const bool staged = TransportPolicy::DeviceToDevice(
+        view_.old_interior, workspace.interior.coefficients, interior_bytes,
+        CudaTransferCategory::attempt_history,
+        CudaTransferSite::attempt_seed_interior);
+    if (!CollectiveContinue(staged)) return false;
+    std::uint64_t mma_tiles = 0;
+    bool launched = false;
+    {
+      ::dg_igr::NVTXRange profile_region(
+          ::dg_igr::observability::RegionId::hdg_local_assembly);
+      launched = CudaLaunchAssembly(
+          view_, shape_, Coefficients::ShiftScale(attempt.dt), cuda_engine_,
+          mma_tiles, true);
+    }
+    if (!CollectiveContinue(launched && StatusPassed()) ||
+        !CollectiveContinue(add_volume_work(mma_tiles)))
+      return false;
+    if (algebraic_mask &&
+        !CollectiveContinue(CudaLaunchRodasAlgebraicMask(view_, shape_) &&
+                            StatusPassed()))
+      return false;
+    if (residual_norm == nullptr) return true;
+    if (!AssembleTrueVector(
+            view_.residual_g, view_.true_residual, false) ||
+        !CollectiveContinue(CudaLaunchLocalSquaredNorm(
+            view_.residual_r, shape_.interior_count, view_.true_residual,
+            shape_.true_trace_count, view_.status, shape_.elements,
+            view_.scalar)))
+      return false;
+    double local_squared = 0.0;
+    const bool copied = TransportPolicy::DeviceToHost(
+            &local_squared, view_.scalar, sizeof(double),
+            CudaTransferCategory::scalar_diagnostic,
+            CudaTransferSite::scalar_status) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    if (!CollectiveContinue(copied)) return false;
+    double global_squared = 0.0;
+    const bool reduced = MPI_Allreduce(
+        &local_squared, &global_squared, 1, MPI_DOUBLE, MPI_SUM,
+        communicator_) == MPI_SUCCESS;
+    *residual_norm = std::sqrt(global_squared);
+    return CollectiveContinue(reduced && std::isfinite(local_squared) &&
+                              local_squared >= 0.0 &&
+                              std::isfinite(*residual_norm));
+  };
+  const auto condense_current = [&]() noexcept
+  {
+    std::uint64_t mma_tiles = 0;
+    bool condensed = false;
+    {
+      ::dg_igr::NVTXRange profile_region(
+          ::dg_igr::observability::RegionId::hdg_condensation);
+      condensed = CopyBase(workspace) &&
+          CudaLaunchCondensation(view_, shape_, cuda_engine_, mma_tiles) &&
+          StatusPassed();
+    }
+    if (!CollectiveContinue(condensed)) return false;
+    if (result.tensor_core.condensation_launches ==
+            std::numeric_limits<std::uint64_t>::max() ||
+        mma_tiles > std::numeric_limits<std::uint64_t>::max() -
+            result.tensor_core.mma_tiles)
+      return false;
+    ++result.tensor_core.condensation_launches;
+    result.tensor_core.mma_tiles += mma_tiles;
+    ++result.complete_condensations;
+    return AssembleTrueSystem();
+  };
+  const auto record_linear_work = [&](const int iterations,
+                                      const int attempts,
+                                      const int tightenings) noexcept
+  {
+    if (iterations < 0 || attempts < 0 || tightenings < 0 ||
+        iterations > std::numeric_limits<int>::max() -
+            result.linear_iterations ||
+        iterations > std::numeric_limits<int>::max() -
+            result.final_coherent_linear_iterations ||
+        attempts > std::numeric_limits<int>::max() -
+            result.linear_solve_attempts ||
+        tightenings > std::numeric_limits<int>::max() -
+            result.true_residual_tightenings ||
+        result.trace_solves == std::numeric_limits<int>::max())
+      return false;
+    result.linear_iterations += iterations;
+    result.final_coherent_linear_iterations += iterations;
+    result.linear_solve_attempts += attempts;
+    result.true_residual_tightenings += tightenings;
+    ++result.trace_solves;
+    return true;
+  };
+  double maximum_true_residual = 0.0;
+  const auto solve_and_recover = [&](const std::uint64_t generation,
+                                     const bool retained_rhs,
+                                     const bool algebraic_projection) noexcept
+  {
+    int iterations = 0, attempts = 0, tightenings = 0;
+    double true_residual = std::numeric_limits<double>::infinity();
+    const bool solved = SolveTrueSystem(
+        generic::EulerHdgLinearSolveRole::final_coherent,
+        CudaNativeTraceActiveSubspace::full, true_residual, generation,
+        iterations, attempts, tightenings, result.tensor_core, retained_rhs);
+    if (!CollectiveContinue(solved &&
+                            record_linear_work(iterations, attempts,
+                                               tightenings)))
+      return false;
+    maximum_true_residual = std::max(maximum_true_residual, true_residual);
+    if (!DistributeTraceIncrement()) return false;
+    bool recovered = false;
+    {
+      ::dg_igr::NVTXRange profile_region(
+          ::dg_igr::observability::RegionId::hdg_interior_recovery);
+      recovered = algebraic_projection
+          ? CudaLaunchRecover(view_, shape_, cuda_engine_)
+          : CudaLaunchRecoverFromRetainedLu(view_, shape_);
+    }
+    if (!CollectiveContinue(recovered && StatusPassed())) return false;
+    ++result.complete_recoveries;
+    return true;
+  };
+  constexpr unsigned rodas_admissibility_unknown_failure = 1U << 31U;
+  const auto classify_admissibility = [&](const char* const site,
+                                           const int stage,
+                                           unsigned& global_mask) noexcept
+  {
+    global_mask = rodas_admissibility_unknown_failure;
+    const bool launched = CudaLaunchAdmissibility(view_, shape_);
+    const bool local_admissible = launched && StatusPassed();
+    if (CollectiveContinue(local_admissible))
+    {
+      global_mask = 0U;
+      return true;
+    }
+
+    // A failed attempt has no publishable state.  Copy only its bounded
+    // per-element classification so the lifecycle can distinguish a finite
+    // Uhat-only DAE inconsistency from a differential or nonfinite failure.
+    // The existing export buffer is deliberately reused: this slow path
+    // performs no allocation and retains no stage/event history.
+    unsigned local_mask = 0U;
+    bool local_probe_ready = launched;
+    if (!local_admissible && launched)
+    {
+      local_probe_ready =
+          host_export_interior_.size() >=
+              static_cast<std::size_t>(shape_.elements) &&
+          TransportPolicy::DeviceToHost(
+              host_export_interior_.data(), view_.status,
+              static_cast<std::size_t>(shape_.elements) * sizeof(double),
+              CudaTransferCategory::scalar_diagnostic,
+              CudaTransferSite::scalar_status) &&
+          TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+      bool classified = false;
+      if (local_probe_ready)
+      {
+        for (int element = 0; element < shape_.elements; ++element)
+        {
+          const double value = host_export_interior_[
+              static_cast<std::size_t>(element)];
+          if (value == 1.0) continue;
+          classified = true;
+          if (std::isfinite(value) && value < 0.0 &&
+              -value <= static_cast<double>(
+                  std::numeric_limits<unsigned>::max()))
+            local_mask |= static_cast<unsigned>(-value);
+          else
+            local_mask |= rodas_admissibility_unknown_failure;
+        }
+        if (!classified)
+          local_mask |= rodas_admissibility_unknown_failure;
+      }
+    }
+    if (!CollectiveContinue(local_probe_ready)) return false;
+    unsigned reduced_mask = 0U;
+    const bool reduced = MPI_Allreduce(
+        &local_mask, &reduced_mask, 1, MPI_UNSIGNED, MPI_BOR,
+        communicator_) == MPI_SUCCESS;
+    if (!CollectiveContinue(reduced)) return false;
+    global_mask = reduced_mask;
+    (void)site;
+    (void)stage;
+    return (global_mask & rodas_admissibility_unknown_failure) == 0U;
+  };
+  const auto admissible = [&](const char* const site,
+                              const int stage) noexcept
+  {
+    unsigned mask = 0U;
+    return classify_admissibility(site, stage, mask) && mask == 0U;
+  };
+  const auto limit_rodas_state = [&](const char* const site,
+                                     const int stage, bool& active,
+                                     double& correction_norm) noexcept
+  {
+    active = false;
+    correction_norm = 0.0;
+    const auto& policy = config.numerical_policy.positivity_limiter;
+    if (policy.kind == generic::EulerHdgPositivityLimiterKind::none)
+      return true;
+    const bool seed_diagnostics = result.positivity_limiter_calls == 0;
+    if (result.positivity_limiter_calls ==
+        std::numeric_limits<std::uint64_t>::max())
+      return false;
+    if (seed_diagnostics && !SeedCandidateLimiterDiagnostics()) return false;
+    ++result.positivity_limiter_calls;
+    const bool launched = CudaLaunchZhangShuU4(
+        view_, shape_, policy, candidate_limiter_diagnostics_,
+        view_.status_flag, view_.scalar);
+    int local_classification = 2;
+    double local_correction_squared =
+        std::numeric_limits<double>::infinity();
+    const bool copied = launched && TransportPolicy::DeviceToHost(
+            &local_classification, view_.status_flag,
+            sizeof(local_classification),
+            CudaTransferCategory::scalar_diagnostic,
+            CudaTransferSite::scalar_status) &&
+        TransportPolicy::DeviceToHost(
+            &local_correction_squared, view_.scalar,
+            sizeof(local_correction_squared),
+            CudaTransferCategory::scalar_diagnostic,
+            CudaTransferSite::scalar_status) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    if (!CollectiveContinue(copied)) return false;
+    int global_classification = 2;
+    double global_correction_squared = 0.0;
+    const std::uint64_t local_count =
+        static_cast<std::uint64_t>(shape_.elements) *
+        conserved_components * shape_.scalar_interior_dofs;
+    std::uint64_t global_count = 0;
+    const bool reduced = MPI_Allreduce(
+            &local_classification, &global_classification, 1, MPI_INT,
+            MPI_MAX, communicator_) == MPI_SUCCESS &&
+        MPI_Allreduce(&local_correction_squared,
+                      &global_correction_squared, 1, MPI_DOUBLE, MPI_SUM,
+                      communicator_) == MPI_SUCCESS &&
+        MPI_Allreduce(&local_count, &global_count, 1, MPI_UINT64_T,
+                      MPI_SUM, communicator_) == MPI_SUCCESS;
+    const bool classification_valid = reduced &&
+        global_classification >= 0 && global_classification <= 3;
+    if (classification_valid && global_classification == 3)
+      result.positivity_limiter_inadmissible_mean_rejections = 1;
+    const bool ready = classification_valid && global_classification <= 1 &&
+        global_count > 0 && std::isfinite(local_correction_squared) &&
+        local_correction_squared >= 0.0 &&
+        std::isfinite(global_correction_squared) &&
+        global_correction_squared >= 0.0;
+    if (!CollectiveContinue(ready)) return false;
+    active = global_classification == 1;
+    correction_norm = std::sqrt(
+        global_correction_squared / static_cast<double>(global_count));
+    if (!CollectiveContinue(std::isfinite(correction_norm))) return false;
+    result.maximum_positivity_limiter_correction_norm = std::max(
+        result.maximum_positivity_limiter_correction_norm,
+        correction_norm);
+    if (active)
+    {
+      if (result.positivity_limiter_active_calls ==
+          std::numeric_limits<std::uint64_t>::max())
+        return false;
+      ++result.positivity_limiter_active_calls;
+    }
+    return true;
+  };
+  std::array<double, igr_trace_components>
+      admitted_stage_boundary_balance{};
+  std::array<double, igr_trace_components>
+      admitted_stage_boundary_scale{};
+  const auto capture_admitted_stage_conservation =
+      [&](const std::size_t stage) noexcept
+  {
+    if (!positivity_enabled) return true;
+    std::array<double, euler_conservation_result_scalars> local{};
+    const bool launched = CudaLaunchRodasAdmittedStageConservation(
+        view_, shape_, attempt.dt, stage, view_.scalar);
+    if (!CollectiveContinue(launched)) return false;
+    const bool copied = TransportPolicy::DeviceToHost(
+            local.data(), view_.scalar, sizeof(local),
+            CudaTransferCategory::scalar_diagnostic,
+            CudaTransferSite::scalar_status) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    if (!CollectiveContinue(copied)) return false;
+    bool local_valid = copied &&
+        local[2 * igr_trace_components + 1] == 1.0 &&
+        local[2 * igr_trace_components] == 0.0;
+    for (int component = 0;
+         component < igr_trace_components && local_valid; ++component)
+    {
+      const double balance = local[static_cast<std::size_t>(component)];
+      const double scale = local[static_cast<std::size_t>(
+          igr_trace_components + component)];
+      local_valid = std::isfinite(balance) && std::isfinite(scale) &&
+          scale >= 0.0;
+      if (!local_valid) break;
+      admitted_stage_boundary_balance[component] += balance;
+      admitted_stage_boundary_scale[component] += scale;
+      local_valid = std::isfinite(
+              admitted_stage_boundary_balance[component]) &&
+          std::isfinite(admitted_stage_boundary_scale[component]) &&
+          admitted_stage_boundary_scale[component] >= 0.0;
+    }
+    return CollectiveContinue(local_valid);
+  };
+  const std::size_t interior_bytes = workspace.interior.count *
+      sizeof(double);
+  const std::size_t true_trace_bytes = workspace.trace.count *
+      sizeof(double);
+  const auto snapshot_algebraic_reference = [&]() noexcept
+  {
+    return TransportPolicy::DeviceToDevice(
+            view_.rodas_combination_interior,
+            workspace.interior.coefficients, interior_bytes,
+            CudaTransferCategory::attempt_history,
+            CudaTransferSite::nonlinear_base_interior) &&
+        TransportPolicy::DeviceToDevice(
+            view_.rodas_combination_true_trace,
+            workspace.trace.coefficients, true_trace_bytes,
+            CudaTransferCategory::attempt_history,
+            CudaTransferSite::nonlinear_base_trace) &&
+        TransportPolicy::Synchronize(
+            CudaTransferSite::nonlinear_base_trace);
+  };
+  const auto project_algebraic = [&](double& initial_norm,
+                                     double& final_norm) noexcept
+  {
+    initial_norm = std::numeric_limits<double>::infinity();
+    final_norm = std::numeric_limits<double>::infinity();
+    constexpr int maximum_updates = 6;
+    for (int update = 0; update <= maximum_updates; ++update)
+    {
+      if (!enter(CudaFailurePhase::assembly) ||
+          !assemble_spatial(true, &final_norm))
+        return false;
+      if (update == 0) initial_norm = final_norm;
+      // Algebraic consistency is an absolute acceptance contract.  Scaling
+      // the stopping threshold by the entry inconsistency could otherwise
+      // admit a trace/IGR state that merely made a large relative reduction
+      // while remaining outside the qualified index-one constraint surface.
+      if (final_norm <= algebraic_residual_allowance)
+        return true;
+      if (update == maximum_updates) return false;
+      if (!enter(CudaFailurePhase::condensation) || !condense_current())
+        return false;
+      const std::uint64_t generation = ++linear_generation_;
+      if (!enter(CudaFailurePhase::trace_solve)) return false;
+      if (!enter(CudaFailurePhase::recovery) ||
+          !solve_and_recover(generation, false, true) ||
+          !CollectiveContinue(
+              CudaLaunchRodasFreezeDifferentialIncrement(view_, shape_) &&
+              CudaLaunchTrial(view_, shape_, 1.0) &&
+              CudaLaunchRodasRestoreDifferentialState(view_, shape_) &&
+              DistributeCurrentTrace(workspace.trace.coefficients)))
+        return false;
+      ++result.nonlinear_updates;
+    }
+    return false;
+  };
+
+  bool entry_limited = false;
+  double entry_limiter_correction = 0.0;
+  if (!limit_rodas_state(
+          "entry", -1, entry_limited, entry_limiter_correction))
+  {
+    result.phase = CudaFailurePhase::assembly;
+    result.reason = FailureReason::admissibility_gate;
+    return result;
+  }
+  (void)entry_limiter_correction;
+  const bool entry_snapshot = TransportPolicy::DeviceToDevice(
+          view_.rodas_combination_interior,
+          workspace.interior.coefficients, interior_bytes,
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_interior) &&
+      TransportPolicy::DeviceToDevice(
+          view_.rodas_combination_true_trace,
+          workspace.trace.coefficients, true_trace_bytes,
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_trace) &&
+      TransportPolicy::Synchronize(
+          CudaTransferSite::nonlinear_base_trace);
+  if (!CollectiveContinue(entry_snapshot))
+  {
+    result.reason = FailureReason::backend_failure;
+    return result;
+  }
+
+  double initial_algebraic_norm = 0.0;
+  double projected_algebraic_norm = 0.0;
+  if (!project_algebraic(initial_algebraic_norm,
+                         projected_algebraic_norm))
+  {
+    if (result.reason == FailureReason::none)
+      result.reason = FailureReason::recovery_gate;
+    return result;
+  }
+  if (entry_limited)
+    ++result.positivity_algebraic_projections;
+  result.initial_residual = initial_algebraic_norm;
+  const bool entry_correction_launched =
+      CudaLaunchRodasNormalizedEntryCorrectionSquared(
+          view_, shape_, view_.scalar);
+  double local_entry_correction_squared = 0.0;
+  const bool entry_correction_copied = entry_correction_launched &&
+      TransportPolicy::DeviceToHost(
+          &local_entry_correction_squared, view_.scalar, sizeof(double),
+          CudaTransferCategory::scalar_diagnostic,
+          CudaTransferSite::scalar_status) &&
+      TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+  if (!CollectiveContinue(entry_correction_copied))
+  {
+    result.phase = CudaFailurePhase::recovery;
+    result.reason = FailureReason::recovery_gate;
+    return result;
+  }
+  double global_entry_correction_squared = 0.0;
+  const std::uint64_t local_entry_algebraic_count =
+      static_cast<std::uint64_t>(shape_.elements) *
+          (shape_.interior_components - conserved_components) *
+          shape_.scalar_interior_dofs +
+      static_cast<std::uint64_t>(shape_.true_trace_count);
+  std::uint64_t global_entry_algebraic_count = 0;
+  const bool entry_correction_reduced = MPI_Allreduce(
+          &local_entry_correction_squared,
+          &global_entry_correction_squared, 1, MPI_DOUBLE,
+          MPI_SUM, communicator_) == MPI_SUCCESS &&
+      MPI_Allreduce(&local_entry_algebraic_count,
+                    &global_entry_algebraic_count, 1, MPI_UINT64_T,
+                    MPI_SUM, communicator_) == MPI_SUCCESS;
+  const double normalized_entry_correction =
+      global_entry_algebraic_count > 0
+      ? std::sqrt(global_entry_correction_squared /
+                  static_cast<double>(global_entry_algebraic_count))
+      : std::numeric_limits<double>::infinity();
+  constexpr double maximum_entry_algebraic_correction_norm = 0.25;
+  if (!CollectiveContinue(
+          entry_correction_reduced && global_entry_algebraic_count > 0 &&
+          std::isfinite(local_entry_correction_squared) &&
+          local_entry_correction_squared >= 0.0 &&
+          std::isfinite(normalized_entry_correction) &&
+          normalized_entry_correction <=
+              maximum_entry_algebraic_correction_norm))
+  {
+    result.phase = CudaFailurePhase::recovery;
+    result.reason = FailureReason::recovery_gate;
+    return result;
+  }
+  if (!CollectiveContinue(CopyBase(workspace)) ||
+      !admissible("entry_projection", -1))
+  {
+    result.reason = FailureReason::admissibility_gate;
+    return result;
+  }
+
+  if (!enter(CudaFailurePhase::assembly) ||
+      !assemble_spatial(false, nullptr))
+  {
+    result.reason = FailureReason::finite_gate;
+    return result;
+  }
+  const std::size_t element_trace_bytes =
+      static_cast<std::size_t>(shape_.elements) * shape_.trace_dofs *
+      sizeof(double);
+  const std::size_t coupling_bytes =
+      static_cast<std::size_t>(shape_.elements) * shape_.interior_dofs *
+      shape_.trace_dofs * sizeof(double);
+  const bool common_saved = TransportPolicy::DeviceToDevice(
+          view_.rodas_residual_f, view_.f, interior_bytes,
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_interior) &&
+      TransportPolicy::DeviceToDevice(
+          view_.rodas_residual_g, view_.g, element_trace_bytes,
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_trace) &&
+      TransportPolicy::DeviceToDevice(
+          view_.rodas_operator_b, view_.b, coupling_bytes,
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_interior) &&
+      TransportPolicy::DeviceToDevice(
+          view_.rodas_operator_c, view_.c, coupling_bytes,
+          CudaTransferCategory::attempt_history,
+          CudaTransferSite::nonlinear_base_interior) &&
+      TransportPolicy::Synchronize(
+          CudaTransferSite::nonlinear_base_interior);
+  if (!CollectiveContinue(common_saved))
+  {
+    result.reason = FailureReason::backend_failure;
+    return result;
+  }
+
+  std::uint64_t common_generation = 0;
+  bool final_stage_reconstructed = false;
+  for (std::size_t stage = 0; stage < Coefficients::stage_count; ++stage)
+  {
+    bool stage_limited = false;
+    double stage_limiter_correction = 0.0;
+    if (!CollectiveContinue(CudaLaunchRodasLoadStage(view_, shape_, stage) &&
+                            DistributeCurrentTrace(
+                                workspace.trace.coefficients)) ||
+        !limit_rodas_state("stage", static_cast<int>(stage),
+                           stage_limited, stage_limiter_correction))
+    {
+      result.phase = CudaFailurePhase::assembly;
+      result.reason = FailureReason::admissibility_gate;
+      return result;
+    }
+    (void)stage_limiter_correction;
+    unsigned stage_admissibility_mask = 0U;
+    if (!classify_admissibility(
+            "stage", static_cast<int>(stage),
+            stage_admissibility_mask))
+    {
+      result.phase = CudaFailurePhase::assembly;
+      result.reason = FailureReason::backend_failure;
+      return result;
+    }
+
+    const bool stage_reconstructed = stage_limited;
+    if (stage_admissibility_mask != 0U && !stage_reconstructed)
+    {
+      result.phase = CudaFailurePhase::assembly;
+      result.reason = FailureReason::admissibility_gate;
+      return result;
+    }
+    if (stage + 1 == Coefficients::stage_count)
+      final_stage_reconstructed = stage_reconstructed;
+    if (stage_reconstructed)
+    {
+      // Stages zero and one are the common-shift base surfaces.  Only an
+      // explicitly selected, active U4 positivity map may replace a later
+      // causal stage and trigger exact fixed-U4 algebraic reconstruction.
+      if (!CollectiveContinue(stage >= 2 && common_generation != 0))
+      {
+        result.phase = CudaFailurePhase::assembly;
+        result.reason = FailureReason::admissibility_gate;
+        return result;
+      }
+
+      // The algebraic projector owns base_*, local factors, the assembled
+      // skeleton operator, and solver setup state. Preserve the physical step
+      // base in disposable RODAS scratch before seeding the projection from
+      // that last coherent algebraic state.
+      const bool base_saved = TransportPolicy::DeviceToDevice(
+              view_.rodas_residual_f, view_.base_interior, interior_bytes,
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_interior) &&
+          TransportPolicy::DeviceToDevice(
+              view_.rodas_combination_true_trace, view_.base_true_trace,
+              true_trace_bytes, CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_trace) &&
+          CudaLaunchRodasSeedAlgebraicProjection(view_, shape_) &&
+          TransportPolicy::Synchronize(
+              CudaTransferSite::nonlinear_base_trace);
+      if (!CollectiveContinue(base_saved) ||
+          !DistributeCurrentTrace(workspace.trace.coefficients))
+      {
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+
+      double stage_projection_initial = 0.0;
+      double stage_projection_final = 0.0;
+      if (!project_algebraic(stage_projection_initial,
+                             stage_projection_final) ||
+          !CollectiveContinue(
+              stage_projection_final <= algebraic_residual_allowance))
+      {
+        result.reason = FailureReason::recovery_gate;
+        return result;
+      }
+      ++result.positivity_algebraic_projections;
+
+      // Keep the coherent filtered stage while restoring the exact step base
+      // and rebuilding the one common-shift operator that the projector has
+      // overwritten. output_interior/trial_true_trace are otherwise dormant
+      // during Prepare and require no new persistent allocation.
+      const bool stage_saved_and_base_restored =
+          TransportPolicy::DeviceToDevice(
+              view_.output_interior, workspace.interior.coefficients,
+              interior_bytes, CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_interior) &&
+          TransportPolicy::DeviceToDevice(
+              view_.trial_true_trace, workspace.trace.coefficients,
+              true_trace_bytes, CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_trace) &&
+          TransportPolicy::DeviceToDevice(
+              view_.base_interior, view_.rodas_residual_f, interior_bytes,
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_interior) &&
+          TransportPolicy::DeviceToDevice(
+              workspace.interior.coefficients, view_.rodas_residual_f,
+              interior_bytes, CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_interior) &&
+          TransportPolicy::DeviceToDevice(
+              view_.base_true_trace, view_.rodas_combination_true_trace,
+              true_trace_bytes, CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_trace) &&
+          TransportPolicy::DeviceToDevice(
+              workspace.trace.coefficients,
+              view_.rodas_combination_true_trace, true_trace_bytes,
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_trace) &&
+          TransportPolicy::Synchronize(
+              CudaTransferSite::nonlinear_base_trace);
+      if (!CollectiveContinue(stage_saved_and_base_restored) ||
+          !DistributeCurrentTrace(workspace.trace.coefficients))
+      {
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+      const bool local_base_trace_restored =
+          TransportPolicy::DeviceToDevice(
+              view_.base_local_trace, view_.current_local_trace,
+              element_trace_bytes, CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_local_trace);
+      if (!CollectiveContinue(local_base_trace_restored) ||
+          !enter(CudaFailurePhase::assembly) ||
+          !assemble_spatial(false, nullptr))
+      {
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+      const bool common_resaved = TransportPolicy::DeviceToDevice(
+              view_.rodas_residual_f, view_.f, interior_bytes,
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_interior) &&
+          TransportPolicy::DeviceToDevice(
+              view_.rodas_residual_g, view_.g, element_trace_bytes,
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_trace) &&
+          TransportPolicy::DeviceToDevice(
+              view_.rodas_operator_b, view_.b, coupling_bytes,
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_interior) &&
+          TransportPolicy::DeviceToDevice(
+              view_.rodas_operator_c, view_.c, coupling_bytes,
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_interior) &&
+          CudaLaunchRodasBuildStageRightHandSide(
+              view_, shape_, 0, attempt.dt) && StatusPassed();
+      if (!CollectiveContinue(common_resaved) ||
+          !enter(CudaFailurePhase::condensation))
+      {
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+      std::uint64_t rebuild_tiles = 0;
+      bool rebuilt = false;
+      {
+        ::dg_igr::NVTXRange profile_region(
+            ::dg_igr::observability::RegionId::hdg_condensation);
+        rebuilt = CudaLaunchCondensation(
+            view_, shape_, cuda_engine_, rebuild_tiles) && StatusPassed();
+      }
+      if (!CollectiveContinue(rebuilt) ||
+          result.tensor_core.condensation_launches ==
+              std::numeric_limits<std::uint64_t>::max() ||
+          rebuild_tiles > std::numeric_limits<std::uint64_t>::max() -
+              result.tensor_core.mma_tiles ||
+          !AssembleTrueSystem())
+      {
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+      ++result.tensor_core.condensation_launches;
+      result.tensor_core.mma_tiles += rebuild_tiles;
+      ++result.complete_condensations;
+      ++result.common_shift_operator_builds;
+      ++result.common_shift_operator_rebuilds;
+      common_generation = ++linear_generation_;
+
+      const bool stage_restored = TransportPolicy::DeviceToDevice(
+              workspace.interior.coefficients, view_.output_interior,
+              interior_bytes, CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_interior) &&
+          TransportPolicy::DeviceToDevice(
+              workspace.trace.coefficients, view_.trial_true_trace,
+              true_trace_bytes, CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_trace) &&
+          TransportPolicy::Synchronize(
+              CudaTransferSite::nonlinear_base_trace);
+      if (!CollectiveContinue(stage_restored) ||
+          !DistributeCurrentTrace(workspace.trace.coefficients))
+      {
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+    }
+    if (stage_reconstructed &&
+        !admissible("stage_projection", static_cast<int>(stage)))
+    {
+      result.phase = CudaFailurePhase::assembly;
+      result.reason = FailureReason::admissibility_gate;
+      return result;
+    }
+    if (positivity_enabled && stage + 1 == Coefficients::stage_count)
+    {
+      // RODAS3's embedded endpoint is exactly Y_4.  Capture only its admitted
+      // U4 lanes after the stage limiter/reconstruction and before the
+      // principal candidate overwrites work_interior.  output_interior is
+      // lifecycle-dead from the end of stage reconstruction until Execute
+      // returns; the captured lanes are moved to protected RODAS storage
+      // before a prepared candidate can be exported.
+      if (!CollectiveContinue(CudaLaunchRodasCopyDifferentialState(
+              shape_, workspace.interior.coefficients,
+              view_.output_interior)))
+      {
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+    }
+    if (stage >= 2)
+    {
+      if (!enter(CudaFailurePhase::assembly) ||
+          !assemble_spatial(false, nullptr))
+      {
+        result.reason = FailureReason::finite_gate;
+        return result;
+      }
+      const bool residual_and_operator_ready =
+          TransportPolicy::DeviceToDevice(
+              view_.rodas_residual_f, view_.f, interior_bytes,
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_interior) &&
+          TransportPolicy::DeviceToDevice(
+              view_.rodas_residual_g, view_.g, element_trace_bytes,
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_trace) &&
+          TransportPolicy::DeviceToDevice(
+              view_.b, view_.rodas_operator_b, coupling_bytes,
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_interior) &&
+          TransportPolicy::DeviceToDevice(
+              view_.c, view_.rodas_operator_c, coupling_bytes,
+              CudaTransferCategory::attempt_history,
+              CudaTransferSite::nonlinear_base_interior);
+      if (!CollectiveContinue(residual_and_operator_ready))
+      {
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+    }
+    if (!CollectiveContinue(CudaLaunchRodasBuildStageRightHandSide(
+            view_, shape_, stage, attempt.dt) && StatusPassed()))
+    {
+      result.reason = FailureReason::finite_gate;
+      return result;
+    }
+    if (!enter(CudaFailurePhase::condensation)) return result;
+    if (stage == 0)
+    {
+      std::uint64_t mma_tiles = 0;
+      bool condensed = false;
+      {
+        ::dg_igr::NVTXRange profile_region(
+            ::dg_igr::observability::RegionId::hdg_condensation);
+        condensed = CudaLaunchCondensation(
+            view_, shape_, cuda_engine_, mma_tiles) && StatusPassed();
+      }
+      if (!CollectiveContinue(condensed) ||
+          result.tensor_core.condensation_launches ==
+              std::numeric_limits<std::uint64_t>::max() ||
+          mma_tiles > std::numeric_limits<std::uint64_t>::max() -
+              result.tensor_core.mma_tiles ||
+          !AssembleTrueSystem())
+      {
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+      ++result.tensor_core.condensation_launches;
+      result.tensor_core.mma_tiles += mma_tiles;
+      ++result.complete_condensations;
+      ++result.common_shift_operator_builds;
+      common_generation = ++linear_generation_;
+    }
+    else
+    {
+      const bool refreshed = CudaLaunchCondenseRetainedLuRhs(
+              view_, shape_) && StatusPassed() &&
+          RefreshRetainedTrueRhs();
+      if (!CollectiveContinue(refreshed))
+      {
+        result.reason = FailureReason::backend_failure;
+        return result;
+      }
+      ++result.common_shift_operator_reuses;
+      ++result.condensed_rhs_refreshes;
+    }
+    const std::uint64_t setups_before = tensor_rank_one
+        ? result.tensor_core.element_schwarz_patch_setups
+        : ilu_common_shift ? result.tensor_core.ilu_factor_setups : 0;
+    const std::uint64_t reuses_before =
+        ilu_common_shift ? result.tensor_core.ilu_factor_reuses : 0;
+    // A stage algebraic reconstruction invalidates and rebuilds the
+    // common-shift operator.  Its first subsequent solve is therefore a new
+    // operator transition even when this is not tableau stage zero.  Calling
+    // it a retained-RHS transition would (correctly) fail the generation
+    // contract before the new Schwarz/ILU setup can be constructed.
+    const bool same_operator_new_rhs = stage != 0 && !stage_reconstructed;
+    if (!enter(CudaFailurePhase::trace_solve) ||
+        !enter(CudaFailurePhase::recovery) ||
+        !solve_and_recover(common_generation, same_operator_new_rhs, false) ||
+        !CollectiveContinue(CudaLaunchRodasCaptureStageIncrement(
+                                view_, shape_, stage) &&
+                            StatusPassed() &&
+                            DistributeRodasStageIncrement(stage)))
+    {
+      if (result.reason == FailureReason::none)
+        result.reason = FailureReason::recovery_gate;
+      return result;
+    }
+    if (!capture_admitted_stage_conservation(stage))
+    {
+      result.reason = FailureReason::backend_failure;
+      return result;
+    }
+    const std::uint64_t setups_after = tensor_rank_one
+        ? result.tensor_core.element_schwarz_patch_setups
+        : ilu_common_shift ? result.tensor_core.ilu_factor_setups : 0;
+    const std::uint64_t reuses_after =
+        ilu_common_shift ? result.tensor_core.ilu_factor_reuses : 0;
+    if (!CollectiveContinue(setups_after >= setups_before &&
+                            reuses_after >= reuses_before))
+    {
+      result.reason = FailureReason::telemetry_gate;
+      return result;
+    }
+    const std::uint64_t setup_delta = setups_after - setups_before;
+    const std::uint64_t reuse_delta = reuses_after - reuses_before;
+    if (tensor_rank_one)
+    {
+      if (stage == 0 || stage_reconstructed)
+      {
+        if (!CollectiveContinue(setup_delta > 0 && reuse_delta == 0))
+        {
+          result.reason = FailureReason::telemetry_gate;
+          return result;
+        }
+        result.common_shift_preconditioner_setups += setup_delta;
+      }
+      else
+      {
+        if (!CollectiveContinue(setup_delta == 0 && reuse_delta == 0))
+        {
+          result.reason = FailureReason::telemetry_gate;
+          return result;
+        }
+        ++result.common_shift_preconditioner_reuses;
+      }
+    }
+    else if (ilu_common_shift)
+    {
+      // The selected ILU lifetime remains authoritative: ordinary CUDA
+      // refreshes every causal solve, whereas tensor IGR retains the first
+      // factor for the complete attempt (including the algebraic projection
+      // that precedes these stages).  Keep the common-shift census logical:
+      // stage zero owns its one setup and stages one through three reuse it,
+      // while tensor_core retains the exact physical setup/reuse totals.
+      if (!CollectiveContinue(setup_delta + reuse_delta == 1))
+      {
+        result.reason = FailureReason::telemetry_gate;
+        return result;
+      }
+      if (trace_policy_descriptor_.ilu_factor_reuse_policy ==
+          CudaIluFactorReusePolicy::first_trace_solve_per_attempt)
+      {
+        if (stage == 0)
+          ++result.common_shift_preconditioner_setups;
+        else
+          ++result.common_shift_preconditioner_reuses;
+      }
+      else
+      {
+        result.common_shift_preconditioner_setups += setup_delta;
+        result.common_shift_preconditioner_reuses += reuse_delta;
+      }
+    }
+    else
+    {
+      // Conventional tensor rank two uses its established HYPRE diagonal
+      // scale. CudaRefreshDiagonalAndSolve rebuilds that scale once per solve;
+      // it intentionally has no ILU counter, so record the physical setup here.
+      if (!CollectiveContinue(host_staged_rank_two &&
+                              diagonal_common_shift &&
+                              setup_delta == 0 && reuse_delta == 0))
+      {
+        result.reason = FailureReason::telemetry_gate;
+        return result;
+      }
+      ++result.common_shift_preconditioner_setups;
+    }
+    ++result.common_shift_trace_solves;
+  }
+
+  const auto preserve_endpoint_base = [&]() noexcept
+  {
+    // The projector reuses base_* for its Newton snapshots.  Preserve both
+    // forms of the coherent step-entry state that remain live after the
+    // causal stages: U4 for estimation/conservation and the element-local
+    // trace for any subsequent reconstruction work.
+    return TransportPolicy::DeviceToDevice(
+            view_.rodas_residual_f, view_.base_interior, interior_bytes,
+            CudaTransferCategory::attempt_history,
+            CudaTransferSite::nonlinear_base_interior) &&
+        TransportPolicy::DeviceToDevice(
+            view_.rodas_residual_g, view_.base_local_trace,
+            element_trace_bytes,
+            CudaTransferCategory::attempt_history,
+            CudaTransferSite::nonlinear_base_local_trace) &&
+        TransportPolicy::Synchronize(
+            CudaTransferSite::nonlinear_base_local_trace);
+  };
+
+  if (!CollectiveContinue(CudaLaunchRodasFormCandidate(
+                              view_, shape_, final_stage_reconstructed) &&
+                          DistributeCurrentTrace(
+                              workspace.trace.coefficients)))
+  {
+    result.reason = FailureReason::admissibility_gate;
+    return result;
+  }
+  bool endpoint_limited = false;
+  bool endpoint_projected = false;
+  double endpoint_limiter_correction = 0.0;
+  double final_projection_initial = 0.0;
+  if (!limit_rodas_state("endpoint", -1, endpoint_limited,
+                         endpoint_limiter_correction))
+  {
+    result.reason = FailureReason::admissibility_gate;
+    return result;
+  }
+  (void)endpoint_limiter_correction;
+  if (!CollectiveContinue(preserve_endpoint_base()))
+  {
+    result.reason = FailureReason::backend_failure;
+    return result;
+  }
+  // The endpoint predictor is the independent algebraic-correction
+  // reference, including after a U4-only positivity map.  Snapshot it before
+  // any fixed-U4 Newton update so the tangent lift cannot evade the temporal
+  // error allowance.
+  if (!CollectiveContinue(snapshot_algebraic_reference()))
+  {
+    result.reason = FailureReason::backend_failure;
+    return result;
+  }
+  if (endpoint_limited)
+  {
+    // A Zhang--Shu map owns U4 only.  The affine endpoint's auxiliary fields
+    // and trace are merely a predictor after U4 is filtered.  Keep those
+    // algebraic values as the Newton initial guess and independently bound
+    // the complete reconstruction needed to reach exact nonlinear closure.
+    if (!project_algebraic(final_projection_initial,
+                           result.final_algebraic_residual))
+    {
+      result.reason = FailureReason::recovery_gate;
+      return result;
+    }
+    ++result.positivity_algebraic_projections;
+    endpoint_projected = true;
+
+    // project_algebraic uses base_* as private iteration storage. Restore
+    // only the differential entry lanes needed by the filtered-pair scale;
+    // the protected preprojection reference remains in rodas_combination_*.
+    if (!CollectiveContinue(CudaLaunchRodasCopyDifferentialState(
+            shape_, view_.rodas_residual_f, view_.base_interior)))
+    {
+      result.reason = FailureReason::backend_failure;
+      return result;
+    }
+  }
+  if (!admissible("endpoint", -1))
+  {
+    result.reason = FailureReason::admissibility_gate;
+    return result;
+  }
+  if (positivity_enabled)
+  {
+    const bool launched = CudaLaunchRodasFilteredPairErrorSquared(
+        view_, shape_, view_.scalar, view_.scalar + 1);
+    std::array<double, 2> local{{
+        std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::infinity()}};
+    const bool error_copied = launched && TransportPolicy::DeviceToHost(
+            local.data(), view_.scalar, sizeof(local),
+            CudaTransferCategory::scalar_diagnostic,
+            CudaTransferSite::scalar_status) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    // Converge rank-local device/transport success before any rank enters the
+    // estimator reductions; otherwise a one-rank copy failure can deadlock.
+    if (!CollectiveContinue(error_copied))
+    {
+      result.reason = FailureReason::finite_gate;
+      return result;
+    }
+    std::array<double, 2> global{};
+    const bool error_reduced = MPI_Allreduce(
+        local.data(), global.data(), static_cast<int>(global.size()),
+        MPI_DOUBLE, MPI_SUM, communicator_) == MPI_SUCCESS;
+    const bool error_ready = error_reduced && std::isfinite(local[0]) &&
+        local[0] >= 0.0 && std::isfinite(local[1]) && local[1] > 0.0 &&
+        std::isfinite(global[0]) && global[0] >= 0.0 &&
+        std::isfinite(global[1]) && global[1] > 0.0;
+    result.temporal_error_norm = error_ready
+        ? std::sqrt(global[0] /
+              (static_cast<double>(conserved_components) * global[1]))
+        : std::numeric_limits<double>::infinity();
+    if (!CollectiveContinue(error_ready &&
+                            std::isfinite(result.temporal_error_norm)))
+    {
+      result.reason = FailureReason::finite_gate;
+      return result;
+    }
+  }
+  else
+  {
+    // Preserve the existing limiter-off launch, transfer, and two-reduction
+    // estimator path exactly.  Only collective convergence is inserted
+    // before MPI so a local transport failure cannot strand another rank.
+    const bool launched = CudaLaunchRodasTemporalErrorSquared(
+        view_, shape_, view_.scalar);
+    double local_error_squared = 0.0;
+    const bool error_copied = launched && TransportPolicy::DeviceToHost(
+            &local_error_squared, view_.scalar, sizeof(double),
+            CudaTransferCategory::scalar_diagnostic,
+            CudaTransferSite::scalar_status) &&
+        TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+    if (!CollectiveContinue(error_copied))
+    {
+      result.reason = FailureReason::finite_gate;
+      return result;
+    }
+    double global_error_squared = 0.0;
+    const std::uint64_t local_differential_count =
+        static_cast<std::uint64_t>(shape_.elements) *
+        conserved_components * shape_.scalar_interior_dofs;
+    std::uint64_t global_differential_count = 0;
+    const bool error_reduced = MPI_Allreduce(
+            &local_error_squared, &global_error_squared, 1,
+            MPI_DOUBLE, MPI_SUM, communicator_) == MPI_SUCCESS &&
+        MPI_Allreduce(&local_differential_count,
+                      &global_differential_count, 1, MPI_UINT64_T,
+                      MPI_SUM, communicator_) == MPI_SUCCESS;
+    result.temporal_error_norm = global_differential_count > 0
+        ? std::sqrt(global_error_squared /
+                    static_cast<double>(global_differential_count))
+        : std::numeric_limits<double>::infinity();
+    if (!CollectiveContinue(error_reduced &&
+                            global_differential_count > 0 &&
+                            std::isfinite(result.temporal_error_norm)))
+    {
+      result.reason = FailureReason::finite_gate;
+      return result;
+    }
+  }
+
+  // Preserve the original limiter-inactive ordering and operation census.
+  // The active endpoint has already taken this exact snapshot and completed
+  // its projection before the filtered embedded estimate was formed.
+  if (!endpoint_projected)
+  {
+    if (!project_algebraic(final_projection_initial,
+                           result.final_algebraic_residual))
+    {
+      result.reason = FailureReason::recovery_gate;
+      return result;
+    }
+  }
+  if (!CollectiveContinue(CudaLaunchRodasAlgebraicCorrectionSquared(
+          view_, shape_, view_.scalar)))
+  {
+    result.reason = FailureReason::recovery_gate;
+    return result;
+  }
+  double local_correction_squared = 0.0;
+  const bool correction_copied = TransportPolicy::DeviceToHost(
+          &local_correction_squared, view_.scalar, sizeof(double),
+          CudaTransferCategory::scalar_diagnostic,
+          CudaTransferSite::scalar_status) &&
+      TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+  if (!CollectiveContinue(correction_copied))
+  {
+    result.reason = FailureReason::recovery_gate;
+    return result;
+  }
+  double global_correction_squared = 0.0;
+  std::uint64_t local_algebraic_count =
+      static_cast<std::uint64_t>(shape_.elements) *
+          (shape_.interior_components - conserved_components) *
+          shape_.scalar_interior_dofs +
+      static_cast<std::uint64_t>(shape_.true_trace_count);
+  std::uint64_t global_algebraic_count = 0;
+  const bool correction_reduced = MPI_Allreduce(
+          &local_correction_squared, &global_correction_squared, 1,
+          MPI_DOUBLE, MPI_SUM, communicator_) == MPI_SUCCESS &&
+      MPI_Allreduce(&local_algebraic_count, &global_algebraic_count, 1,
+                    MPI_UINT64_T, MPI_SUM, communicator_) == MPI_SUCCESS;
+  result.final_algebraic_correction_norm = global_algebraic_count > 0
+      ? std::sqrt(global_correction_squared /
+                  static_cast<double>(global_algebraic_count))
+      : std::numeric_limits<double>::infinity();
+  if (!CollectiveContinue(correction_reduced && global_algebraic_count > 0 &&
+                          std::isfinite(
+                              result.final_algebraic_correction_norm)) ||
+      !admissible("final_projection", -1))
+  {
+    result.reason = FailureReason::recovery_gate;
+    return result;
+  }
+
+  if (!enter(CudaFailurePhase::after_recovery_before_commit)) return result;
+  result.phase = CudaFailurePhase::diagnostics;
+  if (inject_at(CudaFailurePhase::diagnostics)) return result;
+  const bool conservation_ready = RodasConservationBalance(
+      attempt.dt, result.maximum_conservation_error,
+      result.maximum_conservation_relative_error,
+      positivity_enabled ? admitted_stage_boundary_balance.data() : nullptr,
+      positivity_enabled ? admitted_stage_boundary_scale.data() : nullptr);
+  if (positivity_enabled &&
+      !CollectiveContinue(CudaLaunchRodasCopyDifferentialState(
+          shape_, view_.output_interior,
+          view_.rodas_combination_interior)))
+  {
+    result.reason = FailureReason::backend_failure;
+    return result;
+  }
+  // The conservation witness has now consumed the principal preprojection
+  // U4 snapshot.  Its leading lanes are dead, so they protect the admitted
+  // embedded U4 through Prepare -> Assess even if an intervening output
+  // export repacks output_interior.  Auxiliary lanes remain untouched for the
+  // prepared algebraic-correction gate.
+  result.conservation = CollectiveContinue(
+      conservation_ready &&
+      result.maximum_conservation_relative_error <=
+          config.numerical_policy.conservation_relative_tolerance);
+  result.finite = std::isfinite(result.temporal_error_norm) &&
+      std::isfinite(result.final_algebraic_residual) &&
+      std::isfinite(result.final_algebraic_correction_norm);
+  result.admissible = true;
+  result.recovery = result.finite &&
+      result.final_algebraic_residual <= algebraic_residual_allowance;
+  result.true_relative_residual = maximum_true_residual;
+  result.true_residual = std::isfinite(maximum_true_residual) &&
+      maximum_true_residual <= true_residual_relative_tolerance_;
+  if (config.force_private_scientific_gate_failure)
+    result.true_residual = false;
+  result.final_residual = result.final_algebraic_residual;
+  result.candidate_ready = result.finite && result.admissible &&
+      result.recovery;
+  const bool retained_ilu_census = ilu_common_shift &&
+      trace_policy_descriptor_.ilu_factor_reuse_policy ==
+          CudaIluFactorReusePolicy::first_trace_solve_per_attempt &&
+      result.common_shift_preconditioner_setups == 1 &&
+      result.common_shift_preconditioner_reuses == 3;
+  const bool refresh_preconditioner_census =
+      ((ilu_common_shift &&
+        trace_policy_descriptor_.ilu_factor_reuse_policy ==
+            CudaIluFactorReusePolicy::refresh_each_trace_solve) ||
+       diagonal_common_shift) &&
+      result.common_shift_preconditioner_setups == 4 &&
+      result.common_shift_preconditioner_reuses == 0;
+  const bool preconditioner_census = tensor_rank_one
+      ? result.common_shift_preconditioner_setups >=
+              1 + result.common_shift_operator_rebuilds &&
+          result.common_shift_preconditioner_reuses +
+                  result.common_shift_operator_rebuilds ==
+              Coefficients::stage_count - 1
+      : (ordinary_rank_one || host_staged_rank_two) &&
+          (retained_ilu_census || refresh_preconditioner_census);
+  const bool architecture_census =
+      result.common_shift_operator_builds ==
+          1 + result.common_shift_operator_rebuilds &&
+      result.common_shift_operator_reuses == 3 &&
+      result.condensed_rhs_refreshes == 3 &&
+      result.common_shift_trace_solves == 4 &&
+      preconditioner_census;
+  const std::uint64_t current_allocation_events =
+      AllocatorPolicy::AllocationEvents();
+  bool allocation_plateau_exact =
+      current_allocation_events == accepted_allocation_events_;
+  if (!allocation_plateau_sampled_)
+  {
+    // Rank-two HYPRE may materialize two opaque pool high-water transitions
+    // during the first complete RODAS3 attempt (algebraic projection plus
+    // common-shift work). Freeze that bounded first-use footprint; every
+    // later attempt remains exact at the accepted count.
+    const std::uint64_t first_attempt_high_water_allowance =
+        host_staged_rank_two ? 2U : 1U;
+    allocation_plateau_exact =
+        current_allocation_events == accepted_allocation_events_ ||
+        (accepted_allocation_events_ <=
+             std::numeric_limits<std::uint64_t>::max() -
+                 first_attempt_high_water_allowance &&
+         current_allocation_events > accepted_allocation_events_ &&
+         current_allocation_events <= accepted_allocation_events_ +
+             first_attempt_high_water_allowance);
+    if (allocation_plateau_exact)
+      accepted_allocation_events_ = current_allocation_events;
+    allocation_plateau_sampled_ = true;
+  }
+  const bool solver_calls_exact = tensor_rank_one
+      ? result.tensor_core.native_rank1_trace_solve_calls >=
+            static_cast<std::uint64_t>(result.linear_solve_attempts) &&
+          result.tensor_core.hypre_trace_solve_calls == 0
+      : (ordinary_rank_one || host_staged_rank_two) &&
+          result.tensor_core.hypre_trace_solve_calls >=
+              static_cast<std::uint64_t>(result.linear_solve_attempts) &&
+          result.tensor_core.native_rank1_trace_solve_calls == 0;
+  result.tensor_core.trace_solver_accounting_complete =
+      result.tensor_core.trace_solver_accounting_complete &&
+      result.linear_solve_attempts ==
+          result.trace_solves + result.true_residual_tightenings &&
+      solver_calls_exact;
+  result.telemetry = architecture_census && DeviceResident() && NoFallback() &&
+      result.tensor_core.trace_solver_accounting_complete &&
+      AllocatorPolicy::W8OwnedAllocationCalls() ==
+          baseline_w8_owned_allocation_calls_ &&
+      AllocatorPolicy::DeallocationEvents() ==
+          baseline_deallocation_events_ && allocation_plateau_exact;
+  result.success = result.candidate_ready && result.true_residual &&
+      result.conservation && result.telemetry;
+  result.reason = result.success ? FailureReason::none :
+      (!result.true_residual ? FailureReason::true_residual_gate :
+       !result.conservation ? FailureReason::success_gate :
+       !result.telemetry ? FailureReason::telemetry_gate :
+                           FailureReason::success_gate);
+  workspace.interior.generation = current_generation_;
+  workspace.trace.generation = current_generation_;
+  const std::uint64_t product_generation = ++linear_generation_;
+  result.products = {product_generation, product_generation,
+                     product_generation, product_generation, 0};
+  if (!UpdateStateHashes(workspace))
+  {
+    result.candidate_ready = false;
+    result.success = false;
+    result.reason = FailureReason::backend_failure;
+  }
+  return result;
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
@@ -3627,9 +5569,9 @@ PartitionedAuxiliaryNorm(state_slot& workspace, double& norm) noexcept
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
-BootstrapPartitionedScalarClosure(const CudaConfig& config) noexcept
+BootstrapInitialScalarClosure(const CudaConfig& config) noexcept
 {
-  if (!partitioned_backward_euler_) return true;
+  if (!RequiresInitialScalarClosure()) return true;
   state_slot& workspace = workspace_slot_;
   const AttemptIdentity bootstrap_attempt{0, 0, 0, 0, config.dt};
   bool projected = false;
@@ -3639,7 +5581,7 @@ BootstrapPartitionedScalarClosure(const CudaConfig& config) noexcept
         element_schwarz_attempt_state_);
     if (!PrepareAttempt(bootstrap_attempt, workspace, true))
     {
-      ReportCudaSetupFailure(rank_, "partitioned-bootstrap-prepare");
+      ReportCudaSetupFailure(rank_, "initial-scalar-bootstrap-prepare");
       return false;
     }
     const bool partitioned_snapshot =
@@ -3658,7 +5600,7 @@ BootstrapPartitionedScalarClosure(const CudaConfig& config) noexcept
             CudaTransferSite::nonlinear_base_trace);
     if (!CollectiveContinue(partitioned_snapshot))
     {
-      ReportCudaSetupFailure(rank_, "partitioned-bootstrap-snapshot");
+      ReportCudaSetupFailure(rank_, "initial-scalar-bootstrap-snapshot");
       return false;
     }
 
@@ -3683,19 +5625,19 @@ BootstrapPartitionedScalarClosure(const CudaConfig& config) noexcept
     {
       ReportCudaSetupFailure(
           rank_, result.phase == CudaFailurePhase::assembly
-              ? "partitioned-bootstrap-closure-assembly"
+              ? "initial-scalar-bootstrap-closure-assembly"
               : result.phase == CudaFailurePhase::condensation
-                  ? "partitioned-bootstrap-closure-condensation"
+                  ? "initial-scalar-bootstrap-closure-condensation"
                   : result.phase == CudaFailurePhase::trace_solve
-                      ? "partitioned-bootstrap-closure-trace"
-                      : "partitioned-bootstrap-closure-recovery");
+                      ? "initial-scalar-bootstrap-closure-trace"
+                      : "initial-scalar-bootstrap-closure-recovery");
     }
     projected = projected && result.finite && result.recovery;
     if (projected)
       projected = CudaLaunchPartitionedBackwardEulerStateAudit(
                       view_, shape_, false) && StatusPassed();
     if (!projected && result.recovery)
-      ReportCudaSetupFailure(rank_, "partitioned-bootstrap-state-audit");
+      ReportCudaSetupFailure(rank_, "initial-scalar-bootstrap-state-audit");
   }
   if (!CollectiveContinue(projected)) return false;
 
@@ -3859,7 +5801,7 @@ SolvePartitionedScalarClosure(
   const bool solved = SolveTrueSystem(
       role,
       ResolveCudaNativeTraceActiveSubspace(
-          partitioned_backward_euler_, cuda_engine_, ranks_,
+          RequiresInitialScalarClosure(), cuda_engine_, ranks_,
           trace_solver_kind_, true),
       true_relative_residual, product_generation, iterations,
       solve_attempts, tightenings, result.tensor_core);

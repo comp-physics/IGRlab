@@ -2029,4 +2029,570 @@ CheckpointCodecStatus DecodeCheckpointV1(
   return CheckpointCodecStatus::ok;
 }
 
+namespace generic_cuda_codec_detail
+{
+
+using codec_detail::BitsDouble;
+using codec_detail::checksum_size;
+using codec_detail::DoubleBits;
+using codec_detail::LittleEndianBytes;
+using codec_detail::NonzeroHash;
+using codec_detail::ReadDescriptor;
+using codec_detail::Reader;
+using codec_detail::WriteDescriptor;
+using codec_detail::Writer;
+
+constexpr std::array<std::uint8_t, 16> magic{{
+    'D', 'G', 'I', 'G', 'R', '-', 'H', 'D', 'G', '-', 'C', 'U', 'D', 'A',
+    '1', 0}};
+constexpr std::size_t total_size_offset = magic.size() + sizeof(std::uint32_t);
+constexpr std::size_t prefix_size =
+    magic.size() + sizeof(std::uint32_t) + sizeof(std::uint64_t);
+constexpr std::uint64_t maximum_explicit_output_times = 1024U * 1024U;
+
+bool ValidTimeMode(const dg_sim::hdg::HdgTimeControlMode mode) noexcept
+{
+  using dg_sim::hdg::HdgTimeControlMode;
+  switch (mode)
+  {
+    case HdgTimeControlMode::FixedBackwardEuler:
+    case HdgTimeControlMode::CFLBackwardEuler:
+    case HdgTimeControlMode::FixedPartitionedBackwardEuler:
+    case HdgTimeControlMode::CFLPartitionedBackwardEuler:
+    case HdgTimeControlMode::IMEX:
+    case HdgTimeControlMode::EmbeddedError:
+    case HdgTimeControlMode::FixedRodas3:
+    case HdgTimeControlMode::AdaptiveRodas3:
+      return true;
+  }
+  return false;
+}
+
+bool ValidTimeState(
+    const dg_sim::hdg::HdgTransactionalTimeAdapterState& state) noexcept
+{
+  using Adapter = dg_sim::hdg::HdgTransactionalTimeAdapter;
+  try
+  {
+    if (!ValidTimeMode(state.mode)) return false;
+    if (state.mode == dg_sim::hdg::HdgTimeControlMode::AdaptiveRodas3)
+    {
+      if (!state.adaptive_controller) return false;
+      const auto& saved = *state.adaptive_controller;
+      Adapter::AdaptiveControllerConfig config;
+      config.minimum_dt = saved.configured_minimum_dt;
+      config.maximum_dt = saved.configured_maximum_dt;
+      config.safety_factor = saved.configured_safety_factor;
+      config.minimum_scale = saved.configured_minimum_scale;
+      config.maximum_rejection_scale =
+          saved.configured_maximum_rejection_scale;
+      config.maximum_growth_scale = saved.configured_maximum_growth_scale;
+      config.estimator_order = saved.configured_estimator_order;
+      Adapter probe(state.cursor.control, state.cursor.output_schedule,
+                    config, state, state.mode);
+      return !probe.HasPendingStep() &&
+          probe.solver_step() == state.cursor.committed_steps &&
+          probe.time() == state.cursor.current_time &&
+          probe.output_cycle() == state.output_cycle;
+    }
+    Adapter probe(state.cursor.control, state.cursor.output_schedule,
+                  state, state.mode);
+    return !state.adaptive_controller && !probe.HasPendingStep() &&
+        probe.solver_step() == state.cursor.committed_steps &&
+        probe.time() == state.cursor.current_time &&
+        probe.output_cycle() == state.output_cycle;
+  }
+  catch (...)
+  {
+    return false;
+  }
+}
+
+void WriteDouble(Writer& writer, const double value)
+{
+  writer.UnsignedLittleEndian(DoubleBits(value));
+}
+
+bool ReadDouble(Reader& reader, double& value) noexcept
+{
+  std::uint64_t bits = 0;
+  if (!reader.UnsignedLittleEndian(bits)) return false;
+  value = BitsDouble(bits);
+  return true;
+}
+
+bool WriteTimeState(
+    Writer& writer,
+    const dg_sim::hdg::HdgTransactionalTimeAdapterState& state)
+{
+  const auto& cursor = state.cursor;
+  const auto& control = cursor.control;
+  const auto& schedule = cursor.output_schedule;
+  writer.UnsignedLittleEndian(state.schema_version);
+  writer.UnsignedLittleEndian(static_cast<std::uint32_t>(state.mode));
+  writer.UnsignedLittleEndian(state.output_cycle);
+  writer.UnsignedLittleEndian(cursor.schema_version);
+  WriteDouble(writer, control.initial_time);
+  WriteDouble(writer, control.final_time);
+  writer.UnsignedLittleEndian(static_cast<std::uint32_t>(control.kind));
+  WriteDouble(writer, control.fixed_dt);
+  WriteDouble(writer, control.cfl);
+  WriteDouble(writer, control.adaptive_initial_dt);
+  writer.UnsignedLittleEndian(static_cast<std::uint32_t>(schedule.kind));
+  WriteDouble(writer, schedule.interval);
+  writer.UnsignedLittleEndian(
+      static_cast<std::uint64_t>(schedule.explicit_times.size()));
+  for (const double value : schedule.explicit_times) WriteDouble(writer, value);
+  writer.UnsignedLittleEndian(static_cast<std::uint32_t>(schedule.initial));
+  writer.UnsignedLittleEndian(static_cast<std::uint32_t>(schedule.final));
+  writer.UnsignedLittleEndian(static_cast<std::uint32_t>(cursor.integrator));
+  WriteDouble(writer, cursor.current_time);
+  writer.UnsignedLittleEndian(cursor.committed_steps);
+  writer.UnsignedLittleEndian(cursor.next_sequence);
+  writer.UnsignedLittleEndian(cursor.next_fixed_cycle);
+  writer.UnsignedLittleEndian(cursor.next_publication_cycle);
+  writer.UnsignedLittleEndian(cursor.next_explicit_index);
+  writer.U8(state.adaptive_controller ? 1U : 0U);
+  if (state.adaptive_controller)
+  {
+    const auto& value = *state.adaptive_controller;
+    writer.UnsignedLittleEndian(value.schema_version);
+    writer.UnsignedLittleEndian(value.configured_estimator_order);
+    WriteDouble(writer, value.configured_minimum_dt);
+    WriteDouble(writer, value.configured_maximum_dt);
+    WriteDouble(writer, value.configured_safety_factor);
+    WriteDouble(writer, value.configured_minimum_scale);
+    WriteDouble(writer, value.configured_maximum_rejection_scale);
+    WriteDouble(writer, value.configured_maximum_growth_scale);
+    writer.UnsignedLittleEndian(value.consecutive_rejections);
+    writer.UnsignedLittleEndian(value.revision);
+    writer.UnsignedLittleEndian(value.accepted_steps);
+    writer.UnsignedLittleEndian(value.rejected_attempts);
+    WriteDouble(writer, value.next_dt);
+    WriteDouble(writer, value.last_attempted_dt);
+    WriteDouble(writer, value.last_normalized_error);
+    writer.U8(value.last_step_accepted);
+  }
+  return true;
+}
+
+bool ReadTimeState(
+    Reader& reader,
+    dg_sim::hdg::HdgTransactionalTimeAdapterState& state)
+{
+  using namespace dg_sim::time::backend;
+  dg_sim::hdg::HdgTransactionalTimeAdapterState candidate{};
+  std::uint32_t mode = 0;
+  std::uint32_t control_kind = 0;
+  std::uint32_t schedule_kind = 0;
+  std::uint32_t initial_policy = 0;
+  std::uint32_t final_policy = 0;
+  std::uint32_t integrator = 0;
+  std::uint64_t explicit_count = 0;
+  std::uint8_t adaptive_present = 0;
+  if (!reader.UnsignedLittleEndian(candidate.schema_version) ||
+      !reader.UnsignedLittleEndian(mode) ||
+      !reader.UnsignedLittleEndian(candidate.output_cycle) ||
+      !reader.UnsignedLittleEndian(candidate.cursor.schema_version) ||
+      !ReadDouble(reader, candidate.cursor.control.initial_time) ||
+      !ReadDouble(reader, candidate.cursor.control.final_time) ||
+      !reader.UnsignedLittleEndian(control_kind) ||
+      !ReadDouble(reader, candidate.cursor.control.fixed_dt) ||
+      !ReadDouble(reader, candidate.cursor.control.cfl) ||
+      !ReadDouble(reader, candidate.cursor.control.adaptive_initial_dt) ||
+      !reader.UnsignedLittleEndian(schedule_kind) ||
+      !ReadDouble(reader, candidate.cursor.output_schedule.interval) ||
+      !reader.UnsignedLittleEndian(explicit_count) ||
+      explicit_count > maximum_explicit_output_times ||
+      explicit_count > reader.Remaining() / sizeof(std::uint64_t))
+    return false;
+  try
+  {
+    candidate.cursor.output_schedule.explicit_times.resize(
+        static_cast<std::size_t>(explicit_count));
+  }
+  catch (...)
+  {
+    return false;
+  }
+  for (double& value : candidate.cursor.output_schedule.explicit_times)
+    if (!ReadDouble(reader, value)) return false;
+  if (!reader.UnsignedLittleEndian(initial_policy) ||
+      !reader.UnsignedLittleEndian(final_policy) ||
+      !reader.UnsignedLittleEndian(integrator) ||
+      !ReadDouble(reader, candidate.cursor.current_time) ||
+      !reader.UnsignedLittleEndian(candidate.cursor.committed_steps) ||
+      !reader.UnsignedLittleEndian(candidate.cursor.next_sequence) ||
+      !reader.UnsignedLittleEndian(candidate.cursor.next_fixed_cycle) ||
+      !reader.UnsignedLittleEndian(candidate.cursor.next_publication_cycle) ||
+      !reader.UnsignedLittleEndian(candidate.cursor.next_explicit_index) ||
+      !reader.U8(adaptive_present) || adaptive_present > 1U)
+    return false;
+  candidate.mode = static_cast<dg_sim::hdg::HdgTimeControlMode>(mode);
+  candidate.cursor.control.kind = static_cast<StepControlKind>(control_kind);
+  candidate.cursor.output_schedule.kind =
+      static_cast<OutputScheduleKind>(schedule_kind);
+  candidate.cursor.output_schedule.initial =
+      static_cast<InitialOutputPolicy>(initial_policy);
+  candidate.cursor.output_schedule.final =
+      static_cast<FinalOutputPolicy>(final_policy);
+  candidate.cursor.integrator = static_cast<IntegratorTag>(integrator);
+  if (adaptive_present)
+  {
+    EmbeddedErrorControllerState adaptive{};
+    if (!reader.UnsignedLittleEndian(adaptive.schema_version) ||
+        !reader.UnsignedLittleEndian(adaptive.configured_estimator_order) ||
+        !ReadDouble(reader, adaptive.configured_minimum_dt) ||
+        !ReadDouble(reader, adaptive.configured_maximum_dt) ||
+        !ReadDouble(reader, adaptive.configured_safety_factor) ||
+        !ReadDouble(reader, adaptive.configured_minimum_scale) ||
+        !ReadDouble(reader, adaptive.configured_maximum_rejection_scale) ||
+        !ReadDouble(reader, adaptive.configured_maximum_growth_scale) ||
+        !reader.UnsignedLittleEndian(adaptive.consecutive_rejections) ||
+        !reader.UnsignedLittleEndian(adaptive.revision) ||
+        !reader.UnsignedLittleEndian(adaptive.accepted_steps) ||
+        !reader.UnsignedLittleEndian(adaptive.rejected_attempts) ||
+        !ReadDouble(reader, adaptive.next_dt) ||
+        !ReadDouble(reader, adaptive.last_attempted_dt) ||
+        !ReadDouble(reader, adaptive.last_normalized_error) ||
+        !reader.U8(adaptive.last_step_accepted))
+      return false;
+    candidate.adaptive_controller = adaptive;
+  }
+  if (!ValidTimeState(candidate)) return false;
+  state = std::move(candidate);
+  return true;
+}
+
+bool GenericDescriptorValid(const CheckpointDescriptor& value,
+                            const std::uint32_t rank_count) noexcept
+{
+  return value.schema_version == checkpoint_schema_version &&
+      value.successful_commit &&
+      value.restart_mode == RestartMode::same_backend_rank_partition &&
+      value.tuple.Valid() && value.mfem_pin.valid() &&
+      !value.mfem_pin.empty() && value.rank_count == rank_count &&
+      value.polynomial_order >= 0 && value.layout.valid() &&
+      !value.layout.empty() && value.precision.valid() &&
+      !value.precision.empty() && value.precision == value.tuple.precision &&
+      value.cursor == value.coordinates.cursor &&
+      value.coordinates.generation == value.coordinates.step &&
+      value.coordinates.step != 0 && std::isfinite(value.coordinates.time) &&
+      value.coordinates.time > 0.0 && std::isfinite(value.dt) &&
+      value.dt > 0.0 && std::isfinite(value.coordinates.dt) &&
+      value.coordinates.dt > 0.0 &&
+      DoubleBits(value.dt) == DoubleBits(value.coordinates.dt) &&
+      value.coordinate_fingerprint ==
+          ::dg::hdg::runtime::detail::CoordinateFingerprint(
+              value.coordinates) &&
+      NonzeroHash(value.interior_hash) && NonzeroHash(value.trace_hash);
+}
+
+bool TimeMatchesDescriptor(
+    const dg_sim::hdg::HdgTransactionalTimeAdapterState& time,
+    const CheckpointDescriptor& descriptor) noexcept
+{
+  return DoubleBits(time.cursor.current_time) ==
+          DoubleBits(descriptor.coordinates.time) &&
+      time.cursor.committed_steps == descriptor.coordinates.step &&
+      time.cursor.next_sequence == descriptor.coordinates.cursor + 1 &&
+      descriptor.coordinates.cursor !=
+          std::numeric_limits<std::uint64_t>::max();
+}
+
+CheckpointCodecStatus HashValues(const double* values,
+                                 const std::uint64_t count,
+                                 StateHash& result) noexcept
+{
+  if (values == nullptr || count == 0)
+    return CheckpointCodecStatus::invalid_coefficient_schema;
+  // CudaPreparedOutputMetadataV1 carries the persistent CUDA runtime's
+  // four-lane byte hash, not the artifact checksum's SHA-256.  Recompute that
+  // exact authority here so the fieldwise codec validates the staged bytes
+  // without silently changing the engine's committed-state identity.
+  std::array<std::uint64_t, 4> hash{{
+      1469598103934665603ULL,
+      1099511628211ULL ^ 0x9e3779b97f4a7c15ULL,
+      1469598103934665603ULL ^ 0xd6e8feb86659fd93ULL,
+      1099511628211ULL ^ 0xa0761d6478bd642fULL}};
+  for (std::uint64_t index = 0; index < count; ++index)
+  {
+    if (!std::isfinite(values[index]))
+      return CheckpointCodecStatus::noncanonical_fp64;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(
+        values + index);
+    for (std::size_t byte = 0; byte < sizeof(double); ++byte)
+    {
+      for (std::size_t lane = 0; lane < hash.size(); ++lane)
+      {
+        hash[lane] ^=
+            static_cast<std::uint64_t>(bytes[byte] + 17U * lane);
+        hash[lane] *= 1099511628211ULL + 2ULL * lane;
+      }
+    }
+  }
+  static_assert(sizeof(hash) == StateHash{}.bytes.size(),
+                "CUDA payload hash must fill StateHash");
+  std::memcpy(result.bytes.data(), hash.data(), sizeof(hash));
+  return CheckpointCodecStatus::ok;
+}
+
+void WriteValues(Writer& writer, const double* values,
+                 const std::uint64_t count)
+{
+  for (std::uint64_t index = 0; index < count; ++index)
+    WriteDouble(writer, values[index]);
+}
+
+bool ReadValues(Reader& reader, std::vector<double>& values,
+                const std::uint64_t count)
+{
+  if (count == 0 || count > reader.Remaining() / sizeof(std::uint64_t) ||
+      count > std::numeric_limits<std::size_t>::max())
+    return false;
+  try { values.resize(static_cast<std::size_t>(count)); }
+  catch (...) { return false; }
+  for (double& value : values)
+    if (!ReadDouble(reader, value) || !std::isfinite(value)) return false;
+  return true;
+}
+
+} // namespace generic_cuda_codec_detail
+
+StateHash CheckpointSha256V1(const ConstByteView bytes) noexcept
+{
+  StateHash result{};
+  if (!bytes.Valid()) return result;
+  const Sha256Digest digest = ComputeSha256(bytes.data, bytes.size);
+  result.bytes = digest;
+  return result;
+}
+
+CheckpointCodecStatus EncodeGenericHdgCudaCheckpointV1(
+    const StateHash& numerical_identity,
+    const dg_sim::hdg::HdgTransactionalTimeAdapterState& time_state,
+    const GenericHdgCudaCheckpointRankViewV1* ranks,
+    const std::size_t rank_count,
+    std::vector<std::uint8_t>& encoded)
+{
+  using namespace generic_cuda_codec_detail;
+  try
+  {
+    if (!NonzeroHash(numerical_identity) || !ValidTimeState(time_state) ||
+        ranks == nullptr || rank_count == 0 ||
+        rank_count > application_checkpoint_max_rank_count_v1)
+      return CheckpointCodecStatus::invalid_descriptor;
+    const std::uint32_t exact_rank_count =
+        static_cast<std::uint32_t>(rank_count);
+    for (std::size_t index = 0; index < rank_count; ++index)
+    {
+      const auto& rank = ranks[index];
+      if (rank.source_rank != index || rank.rank_count != exact_rank_count ||
+          !rank.successful_commit ||
+          !GenericDescriptorValid(rank.descriptor, exact_rank_count) ||
+          !NonzeroHash(rank.local_mesh_hash) ||
+          !NonzeroHash(rank.local_partition_hash) ||
+          !NonzeroHash(rank.local_topology_hash) ||
+          !TimeMatchesDescriptor(time_state, rank.descriptor) ||
+          rank.attempt.sequence != rank.descriptor.coordinates.cursor ||
+          rank.attempt.committed_step + 1 !=
+              rank.descriptor.coordinates.step ||
+          rank.attempt.committed_generation + 1 !=
+              rank.descriptor.coordinates.generation)
+        return CheckpointCodecStatus::invalid_descriptor;
+      if (index != 0 &&
+          !::dg::hdg::runtime::detail::SameCheckpoint(
+              ranks[0].descriptor, rank.descriptor))
+        return CheckpointCodecStatus::rank_tuple_mismatch;
+      StateHash interior{};
+      StateHash trace{};
+      CheckpointCodecStatus status =
+          HashValues(rank.interior, rank.interior_count, interior);
+      if (status != CheckpointCodecStatus::ok) return status;
+      status = HashValues(rank.owned_true_trace,
+                          rank.owned_true_trace_count, trace);
+      if (status != CheckpointCodecStatus::ok) return status;
+      if (interior != rank.local_interior_hash ||
+          trace != rank.local_trace_hash)
+        return CheckpointCodecStatus::local_payload_hash_mismatch;
+    }
+
+    Writer writer;
+    writer.Bytes(magic.data(), magic.size());
+    writer.UnsignedLittleEndian(generic_hdg_cuda_checkpoint_codec_version_v1);
+    writer.UnsignedLittleEndian(std::uint64_t{0});
+    writer.Hash(numerical_identity);
+    writer.UnsignedLittleEndian(exact_rank_count);
+    WriteTimeState(writer, time_state);
+    for (std::size_t index = 0; index < rank_count; ++index)
+    {
+      const auto& rank = ranks[index];
+      writer.UnsignedLittleEndian(rank.source_rank);
+      writer.UnsignedLittleEndian(rank.rank_count);
+      writer.UnsignedLittleEndian(rank.attempt.sequence);
+      writer.UnsignedLittleEndian(rank.attempt.committed_step);
+      writer.UnsignedLittleEndian(rank.attempt.committed_generation);
+      writer.U8(rank.attempt.retry_index);
+      WriteDouble(writer, rank.attempt.dt);
+      if (!WriteDescriptor(writer, rank.descriptor))
+        return CheckpointCodecStatus::invalid_descriptor;
+      writer.Hash(rank.local_mesh_hash);
+      writer.Hash(rank.local_partition_hash);
+      writer.Hash(rank.local_topology_hash);
+      writer.Hash(rank.local_interior_hash);
+      writer.Hash(rank.local_trace_hash);
+      writer.UnsignedLittleEndian(rank.interior_count);
+      writer.UnsignedLittleEndian(rank.owned_true_trace_count);
+    }
+    for (std::size_t index = 0; index < rank_count; ++index)
+    {
+      WriteValues(writer, ranks[index].interior, ranks[index].interior_count);
+      WriteValues(writer, ranks[index].owned_true_trace,
+                  ranks[index].owned_true_trace_count);
+    }
+    if (writer.bytes().size() >
+        generic_hdg_cuda_checkpoint_maximum_bytes_v1 - checksum_size)
+      return CheckpointCodecStatus::size_overflow;
+    const std::uint64_t final_size = writer.bytes().size() + checksum_size;
+    if (!writer.PatchU64(total_size_offset, final_size))
+      return CheckpointCodecStatus::size_overflow;
+    const Sha256Digest checksum =
+        ComputeSha256(writer.bytes().data(), writer.bytes().size());
+    writer.Bytes(checksum.data(), checksum.size());
+    encoded = std::move(writer.bytes());
+    return CheckpointCodecStatus::ok;
+  }
+  catch (const std::bad_alloc&)
+  {
+    return CheckpointCodecStatus::allocation_failure;
+  }
+  catch (const std::length_error&)
+  {
+    return CheckpointCodecStatus::allocation_failure;
+  }
+}
+
+CheckpointCodecStatus DecodeGenericHdgCudaCheckpointV1(
+    const ConstByteView encoded,
+    const StateHash& expected_numerical_identity,
+    const std::uint32_t expected_rank_count,
+    GenericHdgCudaCheckpointArtifactV1& artifact)
+{
+  using namespace generic_cuda_codec_detail;
+  if (!encoded.Valid() || !NonzeroHash(expected_numerical_identity) ||
+      expected_rank_count == 0 ||
+      expected_rank_count > application_checkpoint_max_rank_count_v1)
+    return CheckpointCodecStatus::invalid_argument;
+  if (encoded.size < prefix_size + checksum_size)
+    return CheckpointCodecStatus::truncated;
+  if (encoded.size > generic_hdg_cuda_checkpoint_maximum_bytes_v1)
+    return CheckpointCodecStatus::size_overflow;
+  if (!std::equal(magic.begin(), magic.end(), encoded.data))
+    return CheckpointCodecStatus::invalid_magic;
+  Reader prefix(encoded.data + magic.size(), encoded.size - magic.size());
+  std::uint32_t version = 0;
+  std::uint64_t declared_size = 0;
+  if (!prefix.UnsignedLittleEndian(version) ||
+      !prefix.UnsignedLittleEndian(declared_size))
+    return CheckpointCodecStatus::truncated;
+  if (version != generic_hdg_cuda_checkpoint_codec_version_v1)
+    return CheckpointCodecStatus::unsupported_version;
+  if (declared_size > encoded.size) return CheckpointCodecStatus::truncated;
+  if (declared_size < encoded.size)
+    return CheckpointCodecStatus::length_mismatch;
+  const std::size_t content_size = encoded.size - checksum_size;
+  const Sha256Digest checksum = ComputeSha256(encoded.data, content_size);
+  if (!std::equal(checksum.begin(), checksum.end(),
+                  encoded.data + content_size))
+    return CheckpointCodecStatus::checksum_mismatch;
+
+  try
+  {
+    Reader reader(encoded.data, content_size);
+    if (!reader.Skip(prefix_size)) return CheckpointCodecStatus::truncated;
+    GenericHdgCudaCheckpointArtifactV1 candidate{};
+    candidate.schema_version = version;
+    std::uint32_t rank_count = 0;
+    if (!reader.Hash(candidate.numerical_identity) ||
+        !reader.UnsignedLittleEndian(rank_count) ||
+        candidate.numerical_identity != expected_numerical_identity)
+      return CheckpointCodecStatus::invalid_config_identity;
+    if (rank_count != expected_rank_count)
+      return CheckpointCodecStatus::rank_tuple_mismatch;
+    if (!ReadTimeState(reader, candidate.time_state))
+      return CheckpointCodecStatus::invalid_descriptor;
+    candidate.ranks.resize(rank_count);
+    std::vector<std::uint64_t> interior_counts(rank_count);
+    std::vector<std::uint64_t> trace_counts(rank_count);
+    for (std::uint32_t index = 0; index < rank_count; ++index)
+    {
+      auto& rank = candidate.ranks[index];
+      std::uint64_t attempt_dt = 0;
+      if (!reader.UnsignedLittleEndian(rank.source_rank) ||
+          !reader.UnsignedLittleEndian(rank.rank_count) ||
+          !reader.UnsignedLittleEndian(rank.attempt.sequence) ||
+          !reader.UnsignedLittleEndian(rank.attempt.committed_step) ||
+          !reader.UnsignedLittleEndian(rank.attempt.committed_generation) ||
+          !reader.U8(rank.attempt.retry_index) ||
+          !reader.UnsignedLittleEndian(attempt_dt) ||
+          !ReadDescriptor(reader, rank.descriptor) ||
+          !reader.Hash(rank.local_mesh_hash) ||
+          !reader.Hash(rank.local_partition_hash) ||
+          !reader.Hash(rank.local_topology_hash) ||
+          !reader.Hash(rank.local_interior_hash) ||
+          !reader.Hash(rank.local_trace_hash) ||
+          !reader.UnsignedLittleEndian(interior_counts[index]) ||
+          !reader.UnsignedLittleEndian(trace_counts[index]))
+        return CheckpointCodecStatus::truncated;
+      rank.attempt.dt = BitsDouble(attempt_dt);
+      if (rank.source_rank != index || rank.rank_count != rank_count ||
+          !GenericDescriptorValid(rank.descriptor, rank_count) ||
+          !NonzeroHash(rank.local_mesh_hash) ||
+          !NonzeroHash(rank.local_partition_hash) ||
+          !NonzeroHash(rank.local_topology_hash) ||
+          !TimeMatchesDescriptor(candidate.time_state, rank.descriptor) ||
+          rank.attempt.sequence != rank.descriptor.coordinates.cursor ||
+          rank.attempt.committed_step + 1 !=
+              rank.descriptor.coordinates.step ||
+          rank.attempt.committed_generation + 1 !=
+              rank.descriptor.coordinates.generation)
+        return CheckpointCodecStatus::invalid_descriptor;
+      if (index != 0 &&
+          !::dg::hdg::runtime::detail::SameCheckpoint(
+              candidate.ranks[0].descriptor, rank.descriptor))
+        return CheckpointCodecStatus::rank_tuple_mismatch;
+    }
+    for (std::uint32_t index = 0; index < rank_count; ++index)
+    {
+      auto& rank = candidate.ranks[index];
+      if (!ReadValues(reader, rank.interior, interior_counts[index]) ||
+          !ReadValues(reader, rank.owned_true_trace, trace_counts[index]))
+        return CheckpointCodecStatus::truncated;
+      StateHash interior{};
+      StateHash trace{};
+      CheckpointCodecStatus status = HashValues(
+          rank.interior.data(), rank.interior.size(), interior);
+      if (status != CheckpointCodecStatus::ok) return status;
+      status = HashValues(rank.owned_true_trace.data(),
+                          rank.owned_true_trace.size(), trace);
+      if (status != CheckpointCodecStatus::ok) return status;
+      if (interior != rank.local_interior_hash ||
+          trace != rank.local_trace_hash)
+        return CheckpointCodecStatus::local_payload_hash_mismatch;
+    }
+    if (!reader.AtEnd()) return CheckpointCodecStatus::trailing_bytes;
+    candidate.artifact_hash.bytes = checksum;
+    artifact = std::move(candidate);
+    return CheckpointCodecStatus::ok;
+  }
+  catch (const std::bad_alloc&)
+  {
+    return CheckpointCodecStatus::allocation_failure;
+  }
+  catch (const std::length_error&)
+  {
+    return CheckpointCodecStatus::allocation_failure;
+  }
+}
+
 } // namespace dg::hdg::runtime::app

@@ -2671,7 +2671,7 @@ extern "C" NativeTraceWorkspaceRequirements
 QueryNativeTraceWorkspaceRequirements(const int rows,
                                       const int krylov_dimension,
                                       const int cooperative_blocks,
-                                      const bool igr_active) noexcept
+                                      const bool use_cgs2) noexcept
 {
   NativeTraceWorkspaceRequirements result{};
   if (rows <= 0 || krylov_dimension <= 0 ||
@@ -2688,7 +2688,7 @@ QueryNativeTraceWorkspaceRequirements(const int rows,
   if (!CheckedAdd(dimension, 1, dimension_plus_one) ||
       !CheckedMultiply(row_count, dimension_plus_one,
                        result.basis_doubles) ||
-      !CheckedMultiply(row_count, igr_active ? 3U : 1U,
+      !CheckedMultiply(row_count, use_cgs2 ? 3U : 1U,
                        result.vector_doubles) ||
       !CheckedMultiply(dimension_plus_one, dimension, hessenberg) ||
       !CheckedMultiply(dimension, 2, scalar_vectors) ||
@@ -2696,7 +2696,7 @@ QueryNativeTraceWorkspaceRequirements(const int rows,
       !CheckedAdd(hessenberg, scalar_vectors, small))
     return NativeTraceWorkspaceRequirements{};
 
-  if (igr_active)
+  if (use_cgs2)
   {
     std::size_t projection_partials = 0;
     const std::size_t projection_tile = std::min(
@@ -2711,7 +2711,7 @@ QueryNativeTraceWorkspaceRequirements(const int rows,
   else
     result.reduction_doubles = static_cast<std::size_t>(cooperative_blocks);
   result.small_doubles = small;
-  result.permutation_integers = igr_active ? row_count : 0;
+  result.permutation_integers = use_cgs2 ? row_count : 0;
   result.control_double_slots = NativeTraceControlDoubleSlots();
   result.valid = true;
   return result;
@@ -2720,7 +2720,7 @@ QueryNativeTraceWorkspaceRequirements(const int rows,
 extern "C" NativeTraceCooperativeSupport
 QueryNativeRankOneTraceCooperativeSupport(const int rows,
                                           const int krylov_dimension,
-                                          const bool igr_active,
+                                          const bool use_cgs2,
                                           const bool fixed_sigma_jacobi,
                                           const bool coupled_warp_full_patch) noexcept
 {
@@ -2729,7 +2729,7 @@ QueryNativeRankOneTraceCooperativeSupport(const int rows,
   result.coupled_warp_full_patch = coupled_warp_full_patch;
   if (rows <= 0 || krylov_dimension <= 0 ||
       krylov_dimension == std::numeric_limits<int>::max() ||
-      ((fixed_sigma_jacobi || coupled_warp_full_patch) && !igr_active))
+      ((fixed_sigma_jacobi || coupled_warp_full_patch) && !use_cgs2))
     return result;
 
   int device = -1;
@@ -2764,7 +2764,7 @@ QueryNativeRankOneTraceCooperativeSupport(const int rows,
                 &active_blocks,
                 NativeRankOneTraceSolveKernel<true, true, false>,
                 native_trace_cooperative_threads, 0)
-      : igr_active
+      : use_cgs2
           ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                 &active_blocks,
                 NativeRankOneTraceSolveKernel<true, false, false>,
@@ -3089,8 +3089,10 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
         ? FieldSplitWarpRequiredDoubles(schwarz.patch_rows)
         : field_split_required;
     if (schwarz.elements <= 0 ||
-        (schwarz.patch_rows != 40 && schwarz.patch_rows != 60 &&
-         schwarz.patch_rows != 80) ||
+        !NativeTraceElementSchwarzPatchRowsSupported(schwarz.patch_rows) ||
+        ((field_split || use_coupled_warp_full_patch) &&
+         !NativeTraceIgrElementSchwarzPatchRowsSupported(
+             schwarz.patch_rows)) ||
         (field_split &&
          (scalar_face_rows < 2 || scalar_face_rows > 4 ||
           euler_rows != 4 * schwarz.patch_rows / 5 ||

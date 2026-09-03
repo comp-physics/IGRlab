@@ -37,6 +37,15 @@ set_tests_properties(dg_igr_gpu_memory_control_python PROPERTIES
   TIMEOUT 180
 )
 
+add_test(NAME dg_igr_adaptive_trace_memory_matrix_python
+  COMMAND /usr/bin/env python3
+          ${CMAKE_SOURCE_DIR}/scripts/perf/test_adaptive_trace_memory_matrix.py
+)
+set_tests_properties(dg_igr_adaptive_trace_memory_matrix_python PROPERTIES
+  LABELS "hdg;tensor;memory;architecture-selection;python;no-gpu"
+  TIMEOUT 180
+)
+
 add_test(NAME dg_igr_hdg_tensor_memory_campaign_python
   COMMAND /usr/bin/env python3
           ${CMAKE_SOURCE_DIR}/scripts/perf/test_hdg_tensor_memory_campaign.py

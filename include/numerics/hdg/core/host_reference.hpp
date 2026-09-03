@@ -52,6 +52,14 @@ public:
   Status Prepare(const LocalBlockShape& shape, std::size_t batches) noexcept;
   Status Condense(const LocalSystemBatchView& input,
                   const CondensedBatchView& output) noexcept;
+  /**
+   * Re-condense only a right-hand side against the most recently retained
+   * local operator.  This preserves LU(A), B, C, D, and the Schur operator;
+   * it replaces the retained f used by Recover and forms g-C A^{-1}f.
+   */
+  Status RefreshRightHandSide(StridedBlockView<const double> f,
+                              StridedBlockView<const double> g,
+                              StridedBlockView<double> right_hand_side) noexcept;
   Status ApplySchur(StridedBlockView<const double> trace,
                     StridedBlockView<double> result) const noexcept;
   Status Recover(StridedBlockView<const double> trace,

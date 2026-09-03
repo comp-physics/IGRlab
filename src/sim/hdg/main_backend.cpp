@@ -19,6 +19,7 @@
 #include "sim/context/case_context.hpp"
 #include "sim/hdg/euler_output_fields.hpp"
 #include "sim/hdg/parallel_vtk.hpp"
+#include "sim/hdg/regularization_scaling.hpp"
 #include "sim/hdg/resolved_euler_case.hpp"
 #include "sim/hdg/state_io.hpp"
 #include "sim/hdg/transactional_time_adapter.hpp"
@@ -33,13 +34,28 @@ namespace
 using dg::hdg::generic::BackendKind;
 using dg::hdg::generic::CudaEngineKind;
 using dg::hdg::generic::BackendSelection;
+using dg::hdg::generic::EulerHdgPositivityLimiterKind;
+using dg::hdg::generic::EulerHdgPositivityLimiterPolicy;
 using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::generic::EulerHdgTimeTreatment;
+using dg::hdg::generic::EulerHdgZhangShuPointSet;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::generic::RegularizationSelection;
 using dg::hdg::runtime::cpu::GenericEulerCpuSessionStatus;
 using dg::hdg::runtime::cpu::GenericEulerHdgCpuSession;
 using dg::hdg::runtime::cpu::GenericEulerCpuPreparedStep;
+
+constexpr double kRodas3AlgebraicCorrectionFraction = 0.25;
+constexpr std::uint32_t kMaximumConsecutiveAdaptiveRejections = 16;
+
+bool SameCoordinates(
+    const dg::hdg::runtime::cpu::GenericEulerCpuSessionCoordinates& lhs,
+    const dg::hdg::runtime::cpu::GenericEulerCpuSessionCoordinates& rhs)
+    noexcept
+{
+  return lhs.time == rhs.time && lhs.step == rhs.step &&
+      lhs.generation == rhs.generation && lhs.dt == rhs.dt;
+}
 
 bool IsRoot(const MPI_Comm communicator) noexcept
 {
@@ -76,6 +92,19 @@ bool CollectiveAll(const MPI_Comm communicator, const bool local) noexcept
       output == 1;
 }
 
+bool ExactBoolConsensus(const MPI_Comm communicator,
+                        const bool value) noexcept
+{
+  int ranks = 0;
+  const int input = value ? 1 : 0;
+  int count = 0;
+  return communicator != MPI_COMM_NULL &&
+      MPI_Comm_size(communicator, &ranks) == MPI_SUCCESS && ranks > 0 &&
+      MPI_Allreduce(&input, &count, 1, MPI_INT, MPI_SUM,
+                    communicator) == MPI_SUCCESS &&
+      (count == 0 || count == ranks);
+}
+
 bool ExactDoubleConsensus(const MPI_Comm communicator, const double value) noexcept
 {
   if (communicator == MPI_COMM_NULL) return false;
@@ -91,6 +120,72 @@ bool ExactDoubleConsensus(const MPI_Comm communicator, const double value) noexc
       &bits, &maximum, 1, MPI_UINT64_T, MPI_MAX, communicator);
   return minimum_status == MPI_SUCCESS && maximum_status == MPI_SUCCESS &&
       minimum == maximum;
+}
+
+std::string FinalizeAdaptiveRejectionOrReason(
+    const MPI_Comm communicator,
+    HdgTransactionalTimeAdapter& time_driver,
+    const HdgTransactionalTimeAdapter::StepPlan& plan,
+    const HdgTransactionalTimeAdapter::AdaptiveAttempt& attempt)
+{
+  std::optional<HdgTransactionalTimeAdapter::AdaptiveDecision> decision;
+  bool local_ok = false;
+  try
+  {
+    decision.emplace(time_driver.PreviewAdaptiveDecision(attempt));
+    local_ok = !decision->Accepted();
+  }
+  catch (...)
+  {
+    local_ok = false;
+  }
+  const bool rejection_consensus = CollectiveAll(communicator, local_ok) &&
+      ExactDoubleConsensus(communicator, decision->next_dt());
+  if (!rejection_consensus)
+  {
+    return "adaptive RODAS3 rejection decision is not collective";
+  }
+
+  try
+  {
+    time_driver.FinalizeAdaptiveRejection(*decision);
+    local_ok = true;
+  }
+  catch (...)
+  {
+    local_ok = false;
+  }
+  if (!CollectiveAll(communicator, local_ok))
+  {
+    return "adaptive RODAS3 rejection transaction failed";
+  }
+
+  HdgTransactionalTimeAdapter::AdaptiveControllerState state{};
+  try
+  {
+    state = time_driver.AdaptiveCheckpointState();
+    local_ok = true;
+  }
+  catch (...)
+  {
+    local_ok = false;
+  }
+  if (!CollectiveAll(communicator, local_ok) ||
+      !ExactDoubleConsensus(communicator, state.next_dt))
+  {
+    return "adaptive RODAS3 controller state diverged after rejection";
+  }
+  if (state.consecutive_rejections >=
+      kMaximumConsecutiveAdaptiveRejections)
+  {
+    return "adaptive RODAS3 exceeded the consecutive-rejection limit";
+  }
+  if (decision->minimum_dt_reached() &&
+      plan.dt <= time_driver.adaptive_controller_config().minimum_dt)
+  {
+    return "adaptive RODAS3 rejected an attempt at the minimum timestep";
+  }
+  return {};
 }
 
 bool ExactTextConsensus(const MPI_Comm communicator,
@@ -280,11 +375,18 @@ FrozenBoundaryPlan FreezeBoundaryPlan(const EulerBoundaryPlan& source)
   return frozen;
 }
 
+dg_igr::IGRAlphaLengthScalePolicy CanonicalAlphaLengthScalePolicy(
+    const HdgEulerMainRequest& request) noexcept
+{
+  return request.alpha_length_scale_policy_override.value_or(
+      request.case_config.igr_config.alpha_length_scale_policy);
+}
+
 std::string CanonicalMainRequest(
     const HdgEulerMainRequest& request,
     const std::string& mesh_path,
     const mfem::io::VTKOutputConfig& vtk,
-    const RegularizationSelection regularization,
+    const HdgRegularizationRequest& regularization,
     const EulerHdgTimeTreatment time_treatment)
 {
   std::ostringstream stream;
@@ -293,12 +395,18 @@ std::string CanonicalMainRequest(
   AppendText(stream, ToLowerCopy(request.options.device));
   AppendText(stream, request.options.restart_vtk);
   AppendText(stream, vtk.prefix_path);
+  AppendText(
+      stream,
+      PositivityLimiterSelectionToString(ParsePositivityLimiterSelection(
+          request.options.positivity_limiter)));
+  AppendText(stream, ToLowerCopy(request.options.zhang_shu_points));
   stream << request.options.order << ';'
          << request.options.ser_ref_levels << ';'
          << request.options.par_ref_levels << ';'
          << request.options.restart_cycle << ';'
          << request.options.restart_step << ';'
          << request.options.vtk_save << ';'
+         << request.options.vtk_zhang_shu_diagnostics << ';'
          << request.options.glvis << ';'
          << request.options.save_state_files << ';'
          << static_cast<int>(vtk.format) << ';'
@@ -306,14 +414,17 @@ std::string CanonicalMainRequest(
          << vtk.levels_of_detail << ';';
   AppendDouble(stream, request.options.dt);
   AppendDouble(stream, request.options.dt_min);
+  AppendDouble(stream, request.options.time_atol);
+  AppendDouble(stream, request.options.time_rtol);
   AppendDouble(stream, request.options.cfl);
   AppendDouble(stream, request.options.t_final);
   AppendDouble(stream, request.options.dt_save);
   AppendDouble(stream, request.case_config.gamma);
   stream << static_cast<int>(regularization.kind) << ';'
+         << static_cast<int>(CanonicalAlphaLengthScalePolicy(request)) << ';'
          << static_cast<int>(time_treatment) << ';';
-  AppendDouble(stream, regularization.alpha);
-  AppendDouble(stream, regularization.beta);
+  AppendDouble(stream, regularization.c_alpha);
+  AppendDouble(stream, regularization.euler_trace_penalty);
   return stream.str();
 }
 
@@ -329,7 +440,10 @@ std::string CanonicalNumericalPolicy(
          << policy.maximum_nonlinear_updates << ';'
          << policy.maximum_linear_iterations << ';'
          << policy.maximum_line_search_trials << ';'
-         << static_cast<int>(policy.stabilization.kind) << ';';
+         << static_cast<int>(policy.stabilization.kind) << ';'
+         << static_cast<int>(policy.positivity_limiter.kind) << ';'
+         << static_cast<int>(policy.positivity_limiter.point_set) << ';'
+         << policy.positivity_limiter.pressure_bisection_iterations << ';';
   AppendDouble(stream, policy.nonlinear_relative_tolerance);
   AppendDouble(stream,
                policy.newton_correction_linear_relative_tolerance);
@@ -341,10 +455,44 @@ std::string CanonicalNumericalPolicy(
   AppendDouble(stream, policy.armijo_constant);
   AppendDouble(stream, policy.stabilization.alpha);
   AppendDouble(stream, policy.stabilization.beta);
+  AppendDouble(stream, policy.positivity_limiter.density_floor);
+  AppendDouble(stream, policy.positivity_limiter.pressure_floor);
   return stream.str();
 }
 
-RegularizationSelection CanonicalRegularization(
+EulerHdgZhangShuPointSet CanonicalZhangShuPointSet(
+    const std::string& point_set)
+{
+  const std::string selector = ToLowerCopy(point_set);
+  if (selector == "consumer")
+  {
+    return EulerHdgZhangShuPointSet::consumer;
+  }
+  if (selector == "quadrature")
+  {
+    return EulerHdgZhangShuPointSet::quadrature;
+  }
+  throw std::invalid_argument(
+      "HDG Zhang-Shu point set must resolve to 'consumer' or 'quadrature'");
+}
+
+EulerHdgPositivityLimiterPolicy CanonicalPositivityLimiterPolicy(
+    const HdgEulerMainRequest& request,
+    const EulerHdgTimeTreatment time_treatment)
+{
+  if (time_treatment != EulerHdgTimeTreatment::rodas3 ||
+      !ResolveZhangShuPositivityLimiter(
+          request.options.positivity_limiter,
+          request.case_config.limiter_pipeline.zhang_shu))
+    return {};
+  return {EulerHdgPositivityLimiterKind::zhang_shu,
+          CanonicalZhangShuPointSet(request.options.zhang_shu_points),
+          request.case_config.rk3_config.rho_min,
+          request.case_config.rk3_config.p_min,
+          request.case_config.rk3_config.p_bisect_iters};
+}
+
+HdgRegularizationRequest CanonicalRegularization(
     const HdgEulerMainRequest& request)
 {
   const std::string selector = ToLowerCopy(request.options.regularization);
@@ -373,9 +521,13 @@ EulerHdgTimeTreatment CanonicalTimeTreatment(
   {
     return EulerHdgTimeTreatment::partitioned_backward_euler;
   }
+  if (selector == "rodas3")
+  {
+    return EulerHdgTimeTreatment::rodas3;
+  }
   throw std::invalid_argument(
-      "HDG time integrator must resolve to 'backward-euler' or "
-      "'partitioned-backward-euler'");
+      "HDG time integrator must resolve to 'backward-euler', "
+      "'partitioned-backward-euler', or 'rodas3'");
 }
 
 int Reject(const HdgEulerMainRequest& request,
@@ -389,7 +541,7 @@ int Reject(const HdgEulerMainRequest& request,
 }
 
 std::string Validate(const HdgEulerMainRequest& request,
-                     const RegularizationSelection regularization,
+                     const HdgRegularizationRequest& regularization,
                      const EulerHdgTimeTreatment time_treatment)
 {
   int initialized = 0;
@@ -408,13 +560,57 @@ std::string Validate(const HdgEulerMainRequest& request,
   {
     return "generic main-backend V1 supports only --device cpu";
   }
-  if (!dg::hdg::generic::ValidRegularizationSelection(regularization))
+  if (!ValidHdgRegularizationRequest(regularization))
   {
-    return "HDG IGR alpha and beta must be finite and positive";
+    return "HDG IGR c_alpha and Euler trace penalty must be finite and positive";
+  }
+  if (regularization.kind == RegularizationKind::igr &&
+      CanonicalAlphaLengthScalePolicy(request) ==
+        dg_igr::IGRAlphaLengthScalePolicy::Local)
+  {
+    return "HDG IGR does not support the element-local alpha length policy";
   }
   if (!dg::hdg::generic::IsKnownEulerHdgTimeTreatment(time_treatment))
   {
     return "HDG time treatment is invalid";
+  }
+  if (!std::isfinite(request.options.dt))
+  {
+    return "HDG --time-step must be finite";
+  }
+  const bool rodas3 = time_treatment == EulerHdgTimeTreatment::rodas3;
+  const PositivityLimiterSelection positivity_limiter =
+      ParsePositivityLimiterSelection(request.options.positivity_limiter);
+  static_cast<void>(CanonicalZhangShuPointSet(
+      request.options.zhang_shu_points));
+  if (!rodas3 &&
+      positivity_limiter == PositivityLimiterSelection::ZhangShu)
+  {
+    return "HDG Zhang-Shu positivity limiting is a RODAS3-only typed opt-in";
+  }
+  if (rodas3 && request.options.dt == 0.0)
+  {
+    return "HDG RODAS3 requires a nonzero --time-step";
+  }
+  if (rodas3 &&
+      (!std::isfinite(request.options.time_atol) ||
+       request.options.time_atol < 0.0 ||
+       !std::isfinite(request.options.time_rtol) ||
+       request.options.time_rtol < 0.0 ||
+       (request.options.time_atol == 0.0 &&
+        request.options.time_rtol == 0.0)))
+  {
+    return "RODAS3 requires finite nonnegative --time-atol and --time-rtol "
+           "with at least one positive tolerance";
+  }
+  const bool adaptive_rodas3 = rodas3 && request.options.dt < 0.0;
+  if (adaptive_rodas3)
+  {
+    if (!std::isfinite(request.options.dt_min) ||
+        request.options.dt_min <= 0.0)
+    {
+      return "adaptive RODAS3 requires a finite positive --dt-min";
+    }
   }
   if (!request.options.restart_vtk.empty() ||
       request.options.restart_cycle >= 0 ||
@@ -422,15 +618,16 @@ std::string Validate(const HdgEulerMainRequest& request,
   {
     return "generic HDG restart/state-file routes are unsupported";
   }
+  if (!request.options.hdg_checkpoint.empty() ||
+      !request.options.hdg_restart_checkpoint.empty())
+  {
+    return "generic CPU HDG checkpoint routes are unsupported";
+  }
   if (request.options.glvis)
   {
     return "generic HDG GLVis output is unsupported";
   }
-  if (!std::isfinite(request.options.dt))
-  {
-    return "HDG --time-step must be finite";
-  }
-  if (request.options.dt <= 0.0 &&
+  if (!rodas3 && request.options.dt <= 0.0 &&
       (!std::isfinite(request.options.cfl) || request.options.cfl <= 0.0))
   {
     return "CFL HDG time integration requires a finite positive --cfl-number";
@@ -443,6 +640,10 @@ std::string Validate(const HdgEulerMainRequest& request,
       request.options.t_final <= 0.0)
   {
     return "HDG final time must be finite and positive";
+  }
+  if (adaptive_rodas3 && request.options.dt_min > request.options.t_final)
+  {
+    return "adaptive RODAS3 --dt-min must not exceed the final-time horizon";
   }
   if (request.options.order < dg::hdg::generic::minimum_polynomial_order ||
       request.options.order > dg::hdg::generic::maximum_polynomial_order)
@@ -502,15 +703,18 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       return Reject(request, "invalid MPI communicator or lifecycle");
     }
     std::string rejection;
-    RegularizationSelection regularization{};
+    HdgRegularizationRequest regularization_request{};
+    ResolvedHdgRegularization resolved_regularization{};
+    RegularizationSelection regularization{
+        RegularizationKind::none, 0.0, 0.0};
     EulerHdgTimeTreatment time_treatment =
         EulerHdgTimeTreatment::backward_euler;
     bool local_ok = true;
     try
     {
-      regularization = CanonicalRegularization(request);
+      regularization_request = CanonicalRegularization(request);
       time_treatment = CanonicalTimeTreatment(request);
-      rejection = Validate(request, regularization, time_treatment);
+      rejection = Validate(request, regularization_request, time_treatment);
       local_ok = rejection.empty();
     }
     catch (const std::exception& error)
@@ -544,7 +748,7 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         : MeshPathPrecedence::CommandLineOverride;
       vtk = MakeCaseVTKConfig(request.case_config);
       canonical_request = CanonicalMainRequest(
-          request, mesh_request.mesh_path, vtk, regularization,
+          request, mesh_request.mesh_path, vtk, regularization_request,
           time_treatment);
       local_ok = true;
     }
@@ -624,6 +828,33 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
                     "HDG parallel mesh construction failed on at least one rank");
     }
 
+    try
+    {
+      resolved_regularization = ResolveHdgRegularization(
+          context->Mesh(),
+          CanonicalAlphaLengthScalePolicy(request),
+          regularization_request);
+      regularization = resolved_regularization.selection;
+      local_ok =
+          dg::hdg::generic::ValidRegularizationSelection(regularization);
+    }
+    catch (const std::exception& error)
+    {
+      rejection = error.what();
+      local_ok = false;
+    }
+    catch (...)
+    {
+      rejection = "unknown HDG IGR mesh-scaling failure";
+      local_ok = false;
+    }
+    if (!CollectiveAll(request.communicator, local_ok))
+    {
+      return Reject(request, rejection.empty()
+          ? "HDG IGR mesh scaling failed on another rank"
+          : rejection);
+    }
+
     // Case physics is deliberately resolved only after the generic adapter
     // has constructed the backend-neutral mesh.  The factory owns analytic
     // coefficients; this adapter borrows them solely for the projections
@@ -653,8 +884,11 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
             "HDG Euler static source must have four components");
       }
       numerical_policy = case_data->numerical_policy;
-      // Cases own all numerical roles except command-line regularization.
+      // Cases own all numerical roles except command-line regularization and
+      // the shared case limiter pipeline lowered by this application adapter.
       numerical_policy.stabilization = regularization;
+      numerical_policy.positivity_limiter =
+          CanonicalPositivityLimiterPolicy(request, time_treatment);
       if (!dg::hdg::generic::ValidEulerHdgNumericalPolicy(numerical_policy))
       {
         throw std::invalid_argument("HDG case data has an invalid numerical policy");
@@ -821,6 +1055,20 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     {
       return Reject(request, "generic CPU session initialization failed");
     }
+    const bool rodas3 = time_treatment == EulerHdgTimeTreatment::rodas3;
+    const bool adaptive_rodas3 = rodas3 && request.options.dt < 0.0;
+    local_ok = !rodas3 ||
+        dg::hdg::generic::HasHdgEulerSessionCapabilities(
+            session->capabilities(),
+            dg::hdg::generic::HdgEulerSessionCapabilityBit(
+                dg::hdg::generic::HdgEulerSessionCapability::
+                    prepared_embedded_assessment));
+    if (!CollectiveAll(request.communicator, local_ok))
+    {
+      return Reject(
+          request,
+          "generic CPU RODAS3 session lacks prepared embedded assessment");
+    }
     std::unique_ptr<HdgTransactionalTimeAdapter> time_driver;
     try
     {
@@ -832,15 +1080,21 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         : HdgTransactionalTimeAdapter::OutputSchedule::Disabled(
             time::backend::InitialOutputPolicy::Suppress,
             time::backend::FinalOutputPolicy::Suppress);
-      const bool cfl_control = request.options.dt <= 0.0;
+      const bool cfl_control = !rodas3 && request.options.dt <= 0.0;
       const bool partitioned_backward_euler = time_treatment ==
           EulerHdgTimeTreatment::partitioned_backward_euler;
-      resolved_plan.time_control = cfl_control
+      resolved_plan.time_control = adaptive_rodas3
+          ? HdgTransactionalTimeAdapter::TimeControl::Adaptive(
+                0.0, request.options.t_final, std::abs(request.options.dt))
+          : cfl_control
           ? HdgTransactionalTimeAdapter::TimeControl::CFL(
                 0.0, request.options.t_final, request.options.cfl)
           : HdgTransactionalTimeAdapter::TimeControl::Fixed(
                 0.0, request.options.t_final, request.options.dt);
-      resolved_plan.time_mode = partitioned_backward_euler
+      resolved_plan.time_mode = adaptive_rodas3
+          ? HdgEulerTimeMode::AdaptiveRodas3
+          : rodas3 ? HdgEulerTimeMode::FixedRodas3
+          : partitioned_backward_euler
           ? (cfl_control
                 ? HdgEulerTimeMode::CFLPartitionedBackwardEuler
                 : HdgEulerTimeMode::FixedPartitionedBackwardEuler)
@@ -849,14 +1103,29 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       resolved_plan.output = {request.options.vtk_save,
                               vtk.prefix_path,
                               CollectionName(request)};
-      time_driver = std::make_unique<HdgTransactionalTimeAdapter>(
-          resolved_plan.time_control, resolved_plan.output_schedule,
-          partitioned_backward_euler
-              ? (cfl_control
-                    ? HdgTimeControlMode::CFLPartitionedBackwardEuler
-                    : HdgTimeControlMode::FixedPartitionedBackwardEuler)
-              : (cfl_control ? HdgTimeControlMode::CFLBackwardEuler
-                             : HdgTimeControlMode::FixedBackwardEuler));
+      if (adaptive_rodas3)
+      {
+        HdgTransactionalTimeAdapter::AdaptiveControllerConfig
+            adaptive_config;
+        adaptive_config.minimum_dt = request.options.dt_min;
+        adaptive_config.maximum_dt = request.options.t_final;
+        time_driver = std::make_unique<HdgTransactionalTimeAdapter>(
+            resolved_plan.time_control, resolved_plan.output_schedule,
+            adaptive_config, HdgTimeControlMode::AdaptiveRodas3);
+      }
+      else
+      {
+        time_driver = std::make_unique<HdgTransactionalTimeAdapter>(
+            resolved_plan.time_control, resolved_plan.output_schedule,
+            rodas3
+                ? HdgTimeControlMode::FixedRodas3
+                : partitioned_backward_euler
+                ? (cfl_control
+                      ? HdgTimeControlMode::CFLPartitionedBackwardEuler
+                      : HdgTimeControlMode::FixedPartitionedBackwardEuler)
+                : (cfl_control ? HdgTimeControlMode::CFLBackwardEuler
+                               : HdgTimeControlMode::FixedBackwardEuler));
+      }
       local_ok = true;
     }
     catch (...)
@@ -896,6 +1165,9 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         output_fields = std::make_unique<HdgEulerParaViewFields>(
             context->Mesh(), *collection, *published_state,
             regularization.kind == RegularizationKind::igr,
+            request.options.vtk_zhang_shu_diagnostics &&
+                numerical_policy.positivity_limiter.kind ==
+                    EulerHdgPositivityLimiterKind::zhang_shu,
             request.case_config.gamma,
             request.case_config.rk3_config.rho_min);
         const HDGParaViewRequest output_request{
@@ -916,37 +1188,56 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         return Reject(request,
                       "HDG ParaView setup failed on at least one rank");
       }
-      if (const auto initial = time_driver->InitialOutput())
+    }
+
+    std::optional<HdgTransactionalTimeAdapter::OutputEvent> initial;
+    try
+    {
+      initial = time_driver->InitialOutput();
+      local_ok = !initial || output != nullptr;
+    }
+    catch (...)
+    {
+      local_ok = false;
+    }
+    if (!CollectiveAll(request.communicator, local_ok))
+    {
+      return Reject(request, "HDG initial output preview failed");
+    }
+    if (!ExactBoolConsensus(request.communicator, initial.has_value()))
+    {
+      return Reject(request, "HDG initial output differs between ranks");
+    }
+    if (initial)
+    {
+      dg::hdg::generic::HdgEulerHostInteriorFields destination{};
+      local_ok = output_fields && output_fields->FreshHostOutput(destination);
+      if (!CollectiveAll(request.communicator, local_ok))
       {
-        dg::hdg::generic::HdgEulerHostInteriorFields destination{};
-        local_ok = output_fields->FreshHostOutput(destination);
-        if (!CollectiveAll(request.communicator, local_ok))
-        {
-          return Reject(request,
-                        "initial Euler/IGR output view construction failed");
-        }
-        local_ok = session->ExportCommittedFields(destination);
-        if (!CollectiveAll(request.communicator, local_ok))
-        {
-          return Reject(request,
-                        "initial committed Euler/IGR field export failed");
-        }
-        local_ok = output_fields->UpdateDerived();
-        if (!CollectiveAll(request.communicator, local_ok))
-        {
-          return Reject(request,
-                        "initial derived Euler field construction failed");
-        }
-        try
-        {
-          output->Write(Metadata(*initial, /*solver_step=*/0));
-          local_ok = true;
-        }
-        catch (...) { local_ok = false; }
-        if (!CollectiveAll(request.communicator, local_ok))
-        {
-          return Reject(request, "initial HDG ParaView output failed");
-        }
+        return Reject(request,
+                      "initial Euler/IGR output view construction failed");
+      }
+      local_ok = session->ExportCommittedFields(destination);
+      if (!CollectiveAll(request.communicator, local_ok))
+      {
+        return Reject(request,
+                      "initial committed Euler/IGR field export failed");
+      }
+      local_ok = output_fields->UpdateDerived();
+      if (!CollectiveAll(request.communicator, local_ok))
+      {
+        return Reject(request,
+                      "initial derived Euler field construction failed");
+      }
+      try
+      {
+        output->Write(Metadata(*initial, /*solver_step=*/0));
+        local_ok = true;
+      }
+      catch (...) { local_ok = false; }
+      if (!CollectiveAll(request.communicator, local_ok))
+      {
+        return Reject(request, "initial HDG ParaView output failed");
       }
     }
 
@@ -981,23 +1272,189 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
                         "committed CFL proposal is invalid or below --dt-min");
         }
       }
-      const auto& plan = time_driver->BeginStep(proposed_dt,
-                                                 request.options.dt_min);
+      const HdgTransactionalTimeAdapter::StepPlan plan = adaptive_rodas3
+          ? time_driver->BeginAdaptiveStep()
+          : time_driver->BeginStep(proposed_dt, request.options.dt_min);
+      const auto coordinates_before_prepare = session->coordinates();
       GenericEulerCpuPreparedStep prepared;
-      local_ok = session->Prepare(plan.dt, prepared).status ==
+      const bool prepared_locally = session->Prepare(plan.dt, prepared).status ==
           GenericEulerCpuSessionStatus::prepared;
-      if (!CollectiveAll(request.communicator, local_ok))
+      if (!CollectiveAll(request.communicator, prepared_locally))
       {
-        // Prepare only mints a token after its collective admission succeeds.
-        time_driver->RecordFailure(HdgStepFailurePhase::NonlinearSolve);
-        return Reject(request, "generic CPU prepared step failed");
+        const bool uniformly_unprepared =
+            CollectiveAll(request.communicator, !prepared_locally);
+        const bool coordinates_unchanged = SameCoordinates(
+            coordinates_before_prepare, session->coordinates());
+        if (!uniformly_unprepared ||
+            !CollectiveAll(request.communicator, coordinates_unchanged))
+        {
+          time_driver->RecordFailure(HdgStepFailurePhase::NonlinearSolve);
+          return Reject(
+              request,
+              "generic CPU prepare failure did not preserve collective coordinates");
+        }
+        if (!adaptive_rodas3)
+        {
+          time_driver->RecordFailure(HdgStepFailurePhase::NonlinearSolve);
+          return Reject(request, "generic CPU prepared step failed");
+        }
+
+        // A failed adaptive prepare mints no token and leaves both committed
+        // coordinates and output cursors untouched.  Feed an infinite-error
+        // attempt to the pure controller, then retry with its smaller plan.
+        const HdgTransactionalTimeAdapter::AdaptiveAttempt failed_attempt{};
+        const std::string rejection = FinalizeAdaptiveRejectionOrReason(
+            request.communicator, *time_driver, plan, failed_attempt);
+        if (!rejection.empty()) return Reject(request, rejection);
+        continue;
+      }
+
+      std::optional<HdgTransactionalTimeAdapter::AdaptiveDecision>
+          adaptive_decision;
+      if (rodas3)
+      {
+        const dg::hdg::generic::HdgEulerPreparedAssessmentPolicy
+            assessment_policy{request.options.time_atol,
+                              request.options.time_rtol,
+                              kRodas3AlgebraicCorrectionFraction};
+        dg::hdg::generic::HdgEulerPreparedAssessment assessment{};
+        const bool assessment_succeeded = session->AssessPrepared(
+            prepared, assessment_policy, assessment);
+        const bool assessment_values_valid = CollectiveAll(
+            request.communicator,
+            dg::hdg::generic::IsValidHdgEulerPreparedAssessment(
+                assessment));
+        const bool assessment_values_collective =
+            ExactDoubleConsensus(
+                request.communicator,
+                assessment.normalized_differential_error) &&
+            ExactDoubleConsensus(
+                request.communicator,
+                assessment.normalized_algebraic_correction);
+        const bool finite_solver_gate = CollectiveAll(
+            request.communicator,
+            assessment_succeeded && assessment.finite_gate &&
+                assessment.solver_gate);
+        const bool residual_gate = CollectiveAll(
+            request.communicator, assessment.residual_gate);
+        const bool admissibility_gate = CollectiveAll(
+            request.communicator, assessment.admissibility_gate);
+        const bool closure_gate = CollectiveAll(
+            request.communicator,
+            assessment.algebraic_closure_gate &&
+                assessment.algebraic_correction_gate);
+
+        if (adaptive_rodas3)
+        {
+          HdgTransactionalTimeAdapter::AdaptiveAttempt attempt{};
+          if (assessment_values_valid && assessment_values_collective)
+          {
+            attempt.collective_normalized_error =
+                assessment.normalized_differential_error;
+          }
+          attempt.collective_solver_success = finite_solver_gate;
+          attempt.collective_residuals_satisfied = residual_gate;
+          attempt.collective_admissible = admissibility_gate;
+          attempt.collective_algebraic_closure_satisfied = closure_gate;
+          try
+          {
+            adaptive_decision.emplace(
+                time_driver->PreviewAdaptiveDecision(attempt));
+            local_ok = true;
+          }
+          catch (...)
+          {
+            local_ok = false;
+          }
+          if (!CollectiveAll(request.communicator, local_ok) ||
+              !ExactDoubleConsensus(
+                  request.communicator, adaptive_decision->next_dt()))
+          {
+            local_ok = session->Abort(std::move(prepared)).status ==
+                GenericEulerCpuSessionStatus::aborted;
+            if (!CollectiveAll(request.communicator, local_ok))
+            {
+              return Reject(
+                  request,
+                  "generic CPU abort failed after adaptive decision failure");
+            }
+            return Reject(request,
+                          "adaptive RODAS3 decision construction failed");
+          }
+          const bool collectively_accepted = CollectiveAll(
+              request.communicator, adaptive_decision->Accepted());
+          const bool collectively_rejected = CollectiveAll(
+              request.communicator, !adaptive_decision->Accepted());
+          if (!collectively_accepted && !collectively_rejected)
+          {
+            local_ok = session->Abort(std::move(prepared)).status ==
+                GenericEulerCpuSessionStatus::aborted;
+            if (!CollectiveAll(request.communicator, local_ok))
+            {
+              return Reject(
+                  request,
+                  "generic CPU abort failed after adaptive decision divergence");
+            }
+            return Reject(request,
+                          "adaptive RODAS3 acceptance differs between ranks");
+          }
+          if (collectively_rejected)
+          {
+            local_ok = session->Abort(std::move(prepared)).status ==
+                GenericEulerCpuSessionStatus::aborted;
+            const bool coordinates_unchanged_after_abort = SameCoordinates(
+                coordinates_before_prepare, session->coordinates());
+            if (!CollectiveAll(
+                    request.communicator,
+                    local_ok && coordinates_unchanged_after_abort))
+            {
+              return Reject(
+                  request,
+                  "generic CPU adaptive prepared-step abort failed");
+            }
+            const HdgTransactionalTimeAdapter::AdaptiveAttempt rejected_attempt{
+                assessment_values_valid && assessment_values_collective
+                    ? assessment.normalized_differential_error
+                    : std::numeric_limits<double>::infinity(),
+                finite_solver_gate,
+                residual_gate,
+                admissibility_gate,
+                closure_gate};
+            const std::string rejection = FinalizeAdaptiveRejectionOrReason(
+                request.communicator, *time_driver, plan, rejected_attempt);
+            if (!rejection.empty()) return Reject(request, rejection);
+            continue;
+          }
+        }
+        else
+        {
+          const bool fixed_assessment_accepted = CollectiveAll(
+              request.communicator,
+              assessment_values_valid && assessment_values_collective &&
+                  finite_solver_gate && residual_gate && admissibility_gate &&
+                  closure_gate);
+          if (!fixed_assessment_accepted)
+          {
+            local_ok = session->Abort(std::move(prepared)).status ==
+                GenericEulerCpuSessionStatus::aborted;
+            if (!CollectiveAll(request.communicator, local_ok))
+            {
+              return Reject(
+                  request,
+                  "generic CPU abort failed after fixed RODAS3 assessment rejection");
+            }
+            return Reject(
+                request,
+                "fixed RODAS3 prepared assessment rejected its algebraic correction or solver gates");
+          }
+        }
       }
 
       std::optional<HdgTransactionalTimeAdapter::OutputEvent> preview;
       try
       {
         preview = time_driver->PreviewFinalizedOutput();
-        local_ok = true;
+        local_ok = !preview || output != nullptr;
       }
       catch (...)
       {
@@ -1016,6 +1473,20 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         }
         time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
         return Reject(request, "HDG output preview failed");
+      }
+      if (!ExactBoolConsensus(request.communicator, preview.has_value()))
+      {
+        local_ok = session->Abort(std::move(prepared)).status ==
+            GenericEulerCpuSessionStatus::aborted;
+        if (!CollectiveAll(request.communicator, local_ok))
+        {
+          time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+          return Reject(
+              request,
+              "generic CPU prepared-step abort failed after output preview disagreement");
+        }
+        time_driver->RecordFailure(HdgStepFailurePhase::OutputStaging);
+        return Reject(request, "HDG output preview differs between ranks");
       }
       if (preview)
       {
@@ -1067,6 +1538,42 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
           return Reject(request, "prepared derived Euler field update failed");
         }
       }
+
+      // Exhaust every fallible time/controller validation while the solver
+      // candidate is still abortable.  No time-side mutation occurs between
+      // this preflight and the post-PDE finalization below.
+      std::optional<HdgTransactionalTimeAdapter::OutputEvent> preflight;
+      try
+      {
+        preflight = adaptive_rodas3
+            ? time_driver->PreflightAdaptiveSuccess(*adaptive_decision)
+            : time_driver->PreflightSuccess();
+        local_ok = preview.has_value() == preflight.has_value();
+        if (local_ok && preview)
+        {
+          local_ok = preview->cycle == preflight->cycle &&
+              preview->time == preflight->time &&
+              preview->is_initial == preflight->is_initial &&
+              preview->is_final == preflight->is_final;
+        }
+      }
+      catch (...)
+      {
+        local_ok = false;
+      }
+      if (!CollectiveAll(request.communicator, local_ok))
+      {
+        local_ok = session->Abort(std::move(prepared)).status ==
+            GenericEulerCpuSessionStatus::aborted;
+        if (!CollectiveAll(request.communicator, local_ok))
+        {
+          return Reject(
+              request,
+              "generic CPU prepared-step abort failed after time preflight failure");
+        }
+        return Reject(request, "HDG time transaction preflight failed");
+      }
+
       local_ok = session->Commit(std::move(prepared)).status ==
           GenericEulerCpuSessionStatus::committed;
       if (!CollectiveAll(request.communicator, local_ok))
@@ -1085,7 +1592,9 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       std::optional<HdgTransactionalTimeAdapter::OutputEvent> finalized;
       try
       {
-        finalized = time_driver->FinalizeSuccess();
+        finalized = adaptive_rodas3
+            ? time_driver->FinalizeAdaptiveSuccess(*adaptive_decision)
+            : time_driver->FinalizeSuccess();
         local_ok = true;
       }
       catch (...)
@@ -1131,6 +1640,26 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       }
     }
 
+    HdgTransactionalTimeAdapter::AdaptiveControllerState adaptive_state{};
+    if (adaptive_rodas3)
+    {
+      try
+      {
+        adaptive_state = time_driver->AdaptiveCheckpointState();
+        local_ok = adaptive_state.accepted_steps ==
+            time_driver->solver_step();
+      }
+      catch (...)
+      {
+        local_ok = false;
+      }
+      if (!CollectiveAll(request.communicator, local_ok))
+      {
+        return Reject(request,
+                      "adaptive RODAS3 final controller state is invalid");
+      }
+    }
+
     if (IsRoot(request.communicator))
     {
       std::cout << "[hdg-main] status=Success step="
@@ -1140,9 +1669,31 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
                 << dg::hdg::generic::EulerHdgTimeTreatmentName(
                      time_treatment)
                 << " regularization="
-                << (regularization.kind == RegularizationKind::igr ? "igr" : "none")
-                << " alpha=" << regularization.alpha
-                << " beta=" << regularization.beta << '\n';
+                << (regularization.kind == RegularizationKind::igr ? "igr" : "none");
+      std::cout << " positivity_limiter="
+                << (numerical_policy.positivity_limiter.kind ==
+                        EulerHdgPositivityLimiterKind::zhang_shu
+                    ? "zhang-shu" : "none")
+                << " zhang_shu_points="
+                << (numerical_policy.positivity_limiter.point_set ==
+                        EulerHdgZhangShuPointSet::quadrature
+                    ? "quadrature" : "consumer");
+      if (regularization.kind == RegularizationKind::igr)
+      {
+        std::cout << " c_alpha=" << regularization_request.c_alpha
+                  << " alpha_effective=" << regularization.alpha
+                  << " alpha_length_policy="
+                  << IGRAlphaLengthScalePolicyToString(
+                       resolved_regularization.alpha_info.policy)
+                  << " h_eff=" << resolved_regularization.alpha_info.dx_eff
+                  << " euler_trace_penalty=" << regularization.beta;
+      }
+      if (adaptive_rodas3)
+      {
+        std::cout << " rejected_attempts="
+                  << adaptive_state.rejected_attempts;
+      }
+      std::cout << '\n';
     }
     return 0;
   }

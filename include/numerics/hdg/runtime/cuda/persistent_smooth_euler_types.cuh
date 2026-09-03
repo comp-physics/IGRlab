@@ -1882,6 +1882,27 @@ struct CudaTracePolicyDescriptor
   bool valid = false;
 };
 
+/**
+ * Deterministic production request selected before policy resolution.
+ *
+ * RODAS3 reuses one common shifted operator across its causal stages.  On the
+ * qualified rank-one conventional tensor surface, request the persistent
+ * matrix-free trace action and retained element-Schwarz factors explicitly so
+ * consensus, provenance, and the engine all describe the same architecture.
+ * Every pre-existing mode keeps the engine-default request.
+ */
+constexpr CudaTracePolicyKind DefaultCudaTracePolicyRequest(
+    const generic::CudaEngineKind engine, const bool igr_active,
+    const int rank_count,
+    const generic::EulerHdgTimeTreatment time_treatment) noexcept
+{
+  return engine == generic::CudaEngineKind::tensor_core && !igr_active &&
+          rank_count == 1 &&
+          time_treatment == generic::EulerHdgTimeTreatment::rodas3
+      ? CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64
+      : CudaTracePolicyKind::engine_default;
+}
+
 constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
     const generic::CudaEngineKind engine, const bool igr_active,
     const int rank_count, const int polynomial_order,
@@ -1943,7 +1964,13 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
       selection ==
           CudaTracePolicyKind::native_element_schwarz_matrix_free_fp64)
   {
-    if (engine != generic::CudaEngineKind::tensor_core || !igr_active)
+    // The plain retained patch LU and matrix-free element action are
+    // component-count generic. Conventional Uhat4 uses the existing non-IGR
+    // cooperative specialization; only the assembled ablation stays on its
+    // previously qualified IGR surface.
+    if (engine != generic::CudaEngineKind::tensor_core ||
+        (!igr_active && selection != CudaTracePolicyKind::
+            native_element_schwarz_matrix_free_fp64))
       return result;
     result.trace_preconditioner =
         CudaTracePreconditionerKind::native_element_schwarz_fp64;
@@ -2180,6 +2207,23 @@ constexpr bool CudaOrdinaryRankOneRefreshPolicyIsExact(
       descriptor.ilu_upper_jacobi_iterations == 0;
 }
 
+/** Exact engine-default policy admitted by the two-rank host-staged leaf. */
+constexpr bool CudaHostStagedRankTwoPolicyIsExact(
+    const CudaTracePolicyDescriptor& descriptor) noexcept
+{
+  return CudaTracePolicyDescriptorIsExact(descriptor) &&
+      descriptor.rank_count == 2 &&
+      descriptor.requested_selection ==
+          CudaTracePolicyKind::engine_default &&
+      descriptor.resolved_selection ==
+          CudaTracePolicyKind::engine_default &&
+      descriptor.trace_preconditioner == CudaTracePreconditionerForEngine(
+          descriptor.selected_engine, descriptor.igr_active) &&
+      (CudaTracePreconditionerIsIlu(descriptor.trace_preconditioner) ||
+       descriptor.trace_preconditioner ==
+           CudaTracePreconditionerKind::hypre_diag_scale);
+}
+
 /** Production tensor-leaf selection and work census for one scope. */
 struct CudaTensorCoreEvidence
 {
@@ -2299,6 +2343,29 @@ struct CudaStepEvidence
   double initial_residual = std::numeric_limits<double>::infinity();
   double final_residual = std::numeric_limits<double>::infinity();
   double true_relative_residual = std::numeric_limits<double>::infinity();
+  double temporal_error_norm = 0.0;
+  double final_algebraic_residual = 0.0;
+  double final_algebraic_correction_norm = 0.0;
+  std::uint64_t complete_assemblies = 0;
+  std::uint64_t complete_condensations = 0;
+  std::uint64_t complete_recoveries = 0;
+  std::uint64_t common_shift_operator_builds = 0;
+  std::uint64_t common_shift_operator_reuses = 0;
+  std::uint64_t condensed_rhs_refreshes = 0;
+  std::uint64_t common_shift_trace_solves = 0;
+  std::uint64_t common_shift_preconditioner_setups = 0;
+  std::uint64_t common_shift_preconditioner_reuses = 0;
+  std::uint64_t positivity_limiter_calls = 0;
+  std::uint64_t positivity_limiter_active_calls = 0;
+  // An admitted Zhang--Shu map cannot repair a cell whose conservative
+  // physical mean is already below either configured floor.  Retain only the
+  // bounded attempt aggregate so a terminal adaptive rejection can be
+  // distinguished from a pointwise/stage admissibility failure; no element
+  // identity or event history is recorded.
+  std::uint64_t positivity_limiter_inadmissible_mean_rejections = 0;
+  std::uint64_t positivity_algebraic_projections = 0;
+  std::uint64_t common_shift_operator_rebuilds = 0;
+  double maximum_positivity_limiter_correction_norm = 0.0;
   int nonlinear_updates = 0;
   int trace_solves = 0;
   // Work census copied from the internal numerical result without changing

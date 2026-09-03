@@ -17,6 +17,51 @@ set_target_properties(dg_igr_hdg_contract_test PROPERTIES
   CXX_STANDARD_REQUIRED ON
   CXX_EXTENSIONS OFF)
 
+add_executable(dg_igr_hdg_zhang_shu_u4_core_test
+  euler/test_zhang_shu_u4_core.cpp)
+target_include_directories(dg_igr_hdg_zhang_shu_u4_core_test PRIVATE ../../include)
+target_compile_options(dg_igr_hdg_zhang_shu_u4_core_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+set_target_properties(dg_igr_hdg_zhang_shu_u4_core_test PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
+
+if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  add_test(NAME dg_igr_hdg_zhang_shu_u4_core_cpu
+           COMMAND dg_igr_hdg_zhang_shu_u4_core_test)
+  set_tests_properties(dg_igr_hdg_zhang_shu_u4_core_cpu PROPERTIES
+    LABELS "hdg;euler;limiter;admissibility;conservation;cpu"
+    TIMEOUT 30)
+endif()
+
+if(MFEM_USE_CUDA AND DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA")
+  add_executable(dg_igr_hdg_zhang_shu_u4_core_cuda_test
+    euler/test_zhang_shu_u4_core_cuda.cu)
+  target_include_directories(dg_igr_hdg_zhang_shu_u4_core_cuda_test
+    PRIVATE ../../include)
+  target_link_libraries(dg_igr_hdg_zhang_shu_u4_core_cuda_test
+    PRIVATE CUDA::cudart)
+  set_target_properties(dg_igr_hdg_zhang_shu_u4_core_cuda_test PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_EXTENSIONS OFF
+    CUDA_SEPARABLE_COMPILATION ON)
+
+  if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    add_test(NAME dg_igr_hdg_zhang_shu_u4_core_cuda
+             COMMAND dg_igr_hdg_zhang_shu_u4_core_cuda_test)
+    set_tests_properties(dg_igr_hdg_zhang_shu_u4_core_cuda PROPERTIES
+      LABELS "hdg;euler;limiter;admissibility;conservation;cuda"
+      RESOURCE_LOCK dg_igr_sm120
+      SKIP_RETURN_CODE 75
+      TIMEOUT 30)
+  endif()
+endif()
+
 # Compile controls and rejection cases through one isolated C++17 harness.
 # A negative is accepted only when compilation fails with its unique marker;
 # missing files/includes and unrelated configure or syntax failures fail closed.

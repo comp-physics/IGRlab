@@ -61,14 +61,16 @@ enum class EulerHdgTimeTreatment : std::uint8_t
   // Zero preserves Backward Euler for value-initialized and legacy aggregate
   // requests while the new member remains a trailing POD extension.
   backward_euler = 0,
-  partitioned_backward_euler = 1
+  partitioned_backward_euler = 1,
+  rodas3 = 2
 };
 
 constexpr bool IsKnownEulerHdgTimeTreatment(
     const EulerHdgTimeTreatment treatment) noexcept
 {
   return treatment == EulerHdgTimeTreatment::backward_euler ||
-      treatment == EulerHdgTimeTreatment::partitioned_backward_euler;
+      treatment == EulerHdgTimeTreatment::partitioned_backward_euler ||
+      treatment == EulerHdgTimeTreatment::rodas3;
 }
 
 constexpr const char* EulerHdgTimeTreatmentName(
@@ -80,6 +82,8 @@ constexpr const char* EulerHdgTimeTreatmentName(
     return "backward-euler";
   case EulerHdgTimeTreatment::partitioned_backward_euler:
     return "partitioned-backward-euler";
+  case EulerHdgTimeTreatment::rodas3:
+    return "rodas3";
   }
   return "unknown";
 }
@@ -100,6 +104,56 @@ struct RegularizationSelection
   RegularizationKind kind;
   double alpha;
   double beta;
+};
+
+/** Optional positivity limiter selected within the shared Euler lifecycle. */
+enum class EulerHdgPositivityLimiterKind : std::uint8_t
+{
+  // Zero preserves the unmodified HDG state for legacy aggregate policies.
+  none = 0,
+  zhang_shu = 1
+};
+
+constexpr bool IsKnownEulerHdgPositivityLimiterKind(
+    const EulerHdgPositivityLimiterKind kind) noexcept
+{
+  return kind == EulerHdgPositivityLimiterKind::none ||
+      kind == EulerHdgPositivityLimiterKind::zhang_shu;
+}
+
+/** Backend-neutral positivity points consumed by the Zhang--Shu limiter. */
+enum class EulerHdgZhangShuPointSet : std::uint8_t
+{
+  // Consumer adds the reference-element vertices and nodal coefficients to
+  // the volume/face residual rules. It is zero so the complete inactive
+  // payload is value-initialized.
+  consumer = 0,
+  // Quadrature contains only the volume and face residual rules.
+  quadrature = 1
+};
+
+constexpr bool IsKnownEulerHdgZhangShuPointSet(
+    const EulerHdgZhangShuPointSet point_set) noexcept
+{
+  return point_set == EulerHdgZhangShuPointSet::consumer ||
+      point_set == EulerHdgZhangShuPointSet::quadrature;
+}
+
+/**
+ * Typed Zhang--Shu admission policy.
+ *
+ * The inactive spelling is exactly the value-initialized object: `none`,
+ * `consumer`, zero floors, and zero bisection iterations.
+ * This makes the enclosing trailing policy extension safe for old aggregate
+ * initializers while keeping inactive numerical identity unambiguous.
+ */
+struct EulerHdgPositivityLimiterPolicy
+{
+  EulerHdgPositivityLimiterKind kind;
+  EulerHdgZhangShuPointSet point_set;
+  double density_floor;
+  double pressure_floor;
+  int pressure_bisection_iterations;
 };
 
 /** Independent MFEM integration-rule orders for element and face assembly. */
@@ -132,6 +186,8 @@ struct EulerHdgNumericalPolicy
   double conservation_relative_tolerance;
   double armijo_constant;
   RegularizationSelection stabilization;
+  /** Trailing zero-compatible policy; `none` is the production default. */
+  EulerHdgPositivityLimiterPolicy positivity_limiter;
 };
 
 /** Preserve the pre-policy generic CPU numerical choices for order @p p. */
@@ -143,7 +199,7 @@ constexpr EulerHdgNumericalPolicy DefaultEulerHdgNumericalPolicy(
   // requests; the order-general extension deliberately overintegrates at 12.
   return {quadrature, quadrature, quadrature, {12, 12}, 80, 0, 13,
           1.0e-10, 1.0e-12, 1.0e-12, 1.0e-12, 1.0e-10,
-          1.0e-10, 1.0e-4, {RegularizationKind::none, 0.0, 0.0}};
+          1.0e-10, 1.0e-4, {RegularizationKind::none, 0.0, 0.0}, {}};
 }
 
 /** Resolve the active assembly rules without duplicating engine policy. */
@@ -277,7 +333,12 @@ struct BoundaryPointView
 /**
  * A borrowed host numerical boundary operator.  The callback may inspect only
  * the supplied point and interior state and writes one four-component exterior
- * state.  It receives no mesh, solver, lifecycle, or state-owner handle.  The
+ * state.  It receives no time coordinate: its numerical value is therefore an
+ * autonomous, deterministic map of `(context, point, interior_state)` for one
+ * admitted lifecycle.  Observational counters may change, but mutable context
+ * must not change the returned state.  RODAS3 may reevaluate this map at
+ * bounded FP64 perturbations to form its frozen boundary Jacobian.  The
+ * callback receives no mesh, solver, lifecycle, or state-owner handle.  The
  * companion attribute-indexed POD table carries the same resolved policy data
  * for device backends; it is copied during Initialize and never retained.
  */
@@ -371,6 +432,10 @@ static_assert(std::is_standard_layout<EulerBoundaryPolicyTableView>::value &&
 static_assert(std::is_standard_layout<RegularizationSelection>::value &&
                   std::is_trivial<RegularizationSelection>::value,
               "generic HDG regularization must stay POD");
+static_assert(
+    std::is_standard_layout<EulerHdgPositivityLimiterPolicy>::value &&
+        std::is_trivial<EulerHdgPositivityLimiterPolicy>::value,
+    "generic HDG positivity-limiter policy must stay POD");
 static_assert(
     std::is_standard_layout<EulerHdgAssemblyQuadratureOrders>::value &&
         std::is_trivial<EulerHdgAssemblyQuadratureOrders>::value,
@@ -572,6 +637,24 @@ inline bool ValidRegularizationSelection(
       std::isfinite(selection.beta) && selection.beta > 0.0;
 }
 
+inline bool ValidEulerHdgPositivityLimiterPolicy(
+    const EulerHdgPositivityLimiterPolicy& policy) noexcept
+{
+  if (policy.kind == EulerHdgPositivityLimiterKind::none)
+  {
+    return policy.point_set == EulerHdgZhangShuPointSet::consumer &&
+        DoubleBits(policy.density_floor) == 0 &&
+        DoubleBits(policy.pressure_floor) == 0 &&
+        policy.pressure_bisection_iterations == 0;
+  }
+  return policy.kind == EulerHdgPositivityLimiterKind::zhang_shu &&
+      IsKnownEulerHdgZhangShuPointSet(policy.point_set) &&
+      std::isfinite(policy.density_floor) && policy.density_floor > 0.0 &&
+      std::isfinite(policy.pressure_floor) && policy.pressure_floor > 0.0 &&
+      policy.pressure_bisection_iterations > 0 &&
+      policy.pressure_bisection_iterations <= 64;
+}
+
 inline bool ValidEulerHdgNumericalPolicy(
     const EulerHdgNumericalPolicy& policy) noexcept
 {
@@ -604,7 +687,8 @@ inline bool ValidEulerHdgNumericalPolicy(
           policy.final_coherent_linear_relative_tolerance &&
       std::isfinite(policy.armijo_constant) &&
       policy.armijo_constant > 0.0 && policy.armijo_constant < 1.0 &&
-      ValidRegularizationSelection(policy.stabilization);
+      ValidRegularizationSelection(policy.stabilization) &&
+      ValidEulerHdgPositivityLimiterPolicy(policy.positivity_limiter);
 }
 
 /**
@@ -842,7 +926,10 @@ inline bool ExactNumericalPolicyConsensus(
       policy.maximum_nonlinear_updates,
       policy.maximum_linear_iterations,
       policy.maximum_line_search_trials,
-      static_cast<int>(policy.stabilization.kind)};
+      static_cast<int>(policy.stabilization.kind),
+      static_cast<int>(policy.positivity_limiter.kind),
+      static_cast<int>(policy.positivity_limiter.point_set),
+      policy.positivity_limiter.pressure_bisection_iterations};
   std::uint64_t reals[] = {
       DoubleBits(policy.nonlinear_relative_tolerance),
       DoubleBits(policy.newton_correction_linear_relative_tolerance),
@@ -852,7 +939,9 @@ inline bool ExactNumericalPolicyConsensus(
       DoubleBits(policy.conservation_relative_tolerance),
       DoubleBits(policy.armijo_constant),
       DoubleBits(policy.stabilization.alpha),
-      DoubleBits(policy.stabilization.beta)};
+      DoubleBits(policy.stabilization.beta),
+      DoubleBits(policy.positivity_limiter.density_floor),
+      DoubleBits(policy.positivity_limiter.pressure_floor)};
   int minimum_integers[sizeof(integers) / sizeof(*integers)]{};
   int maximum_integers[sizeof(integers) / sizeof(*integers)]{};
   std::uint64_t minimum_reals[sizeof(reals) / sizeof(*reals)]{};
@@ -961,6 +1050,15 @@ inline ContractStatus ValidateEulerHdgRequest(
       !IsKnownEulerHdgTimeTreatment(request.time_treatment))
   {
     RecordFailure(local_status, ContractStatus::invalid_time_treatment);
+  }
+  else if (request.numerical_policy.positivity_limiter.kind !=
+               EulerHdgPositivityLimiterKind::none &&
+           request.time_treatment != EulerHdgTimeTreatment::rodas3)
+  {
+    // The first HDG Zhang--Shu lifecycle is a filtered RODAS3 method.  Never
+    // accept an active policy on a Backward-Euler path that does not execute
+    // the filter.
+    RecordFailure(local_status, ContractStatus::invalid_numerical_policy);
   }
   if (!ExactBackendSelectionConsensus(request.communicator, request.backend) ||
       (request.backend.kind != BackendKind::cpu &&

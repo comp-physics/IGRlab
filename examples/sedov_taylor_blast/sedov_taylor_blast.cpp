@@ -51,6 +51,7 @@
 
 #include "mfem.hpp"
 #include <iostream>
+#include <utility>
 
 #include "sim/igr_sim.hpp"
 
@@ -117,6 +118,31 @@ int main(int argc, char* argv[])
   {
     bc.AddSlipWall(markers);
   };
+
+#if defined(DG_IGR_HAS_HDG_MAIN_BACKEND) && DG_IGR_HAS_HDG_MAIN_BACKEND
+  spec.make_hdg_case_data = [](const SedovOptions&,
+                                const dg_sim::CaseConfig& case_config,
+                                const dg_sim::CommonOptions& options,
+                                const dg_sim::CaseContext& context)
+  {
+    dg_sim::hdg::HdgEulerCaseData data;
+    data.numerical_policy =
+      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(options.order);
+
+    constexpr int base_cells = 32;
+    auto initial_condition = mfem::GetSedovTaylorBlastInit(
+      case_config.gamma, /*E_blast=*/1.0, base_cells, base_cells);
+    data.initial_condition =
+      std::make_unique<mfem::VectorFunctionCoefficient>(
+        4, std::move(initial_condition));
+
+    const auto markers = dg_sim::BuildBoundaryMarkers(
+      context.Mesh(), {{dg_sim::BoundaryRole::Slip, {1, 2, 3, 4}}});
+    data.boundary_plan.AddSlipWall(
+      markers.At(dg_sim::BoundaryRole::Slip));
+    return data;
+  };
+#endif
 
   spec.postprocess = [](const SedovOptions&,
                         const dg_sim::ExampleContext&,

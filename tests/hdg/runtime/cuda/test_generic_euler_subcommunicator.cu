@@ -7,9 +7,11 @@
 #include <mpi.h>
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <string_view>
 #include <utility>
@@ -20,8 +22,9 @@ namespace dg::hdg::runtime::cuda_w8a::detail
 
 constexpr bool CudaPreparedIluAccountingValid(
     const CudaTensorCoreEvidence& tensor, const int trace_solves,
-    const int linear_iterations, const generic::CudaEngineKind engine,
-    const bool igr_active) noexcept
+    const int linear_iterations, const int linear_solve_attempts,
+    const std::uint64_t matrix_generations,
+    const generic::CudaEngineKind engine, const bool igr_active) noexcept
 {
   const auto policy = ResolveCudaTracePolicy(
       engine, igr_active, tensor.trace_policy_rank_count,
@@ -61,7 +64,8 @@ constexpr bool CudaPreparedIluAccountingValid(
         tensor.ilu_accounting_complete;
   const int expected_fill = 0;
   const int expected_reordering = igr_active ? 1 : 0;
-  if (trace_solves <= 0 || linear_iterations < 0 || tensor.ilu_type != 0 ||
+  if (trace_solves <= 0 || linear_iterations < 0 ||
+      linear_solve_attempts < trace_solves || tensor.ilu_type != 0 ||
       tensor.ilu_level_of_fill != expected_fill ||
       tensor.ilu_local_reordering != expected_reordering ||
       tensor.ilu_application_iterations != 1 ||
@@ -79,19 +83,26 @@ constexpr bool CudaPreparedIluAccountingValid(
       tensor.ilu_preconditioner_callbacks_lower_bound >
           tensor.ilu_preconditioner_callbacks_upper_bound)
     return false;
-  const std::uint64_t solves = static_cast<std::uint64_t>(trace_solves);
+  const std::uint64_t attempts =
+      static_cast<std::uint64_t>(linear_solve_attempts);
   const bool factor_work = factor_reuse_policy ==
           CudaIluFactorReusePolicy::refresh_each_trace_solve
       ? tensor.ilu_factor_reuse_policy == factor_reuse_policy &&
-            tensor.ilu_factor_setups == solves &&
+            tensor.ilu_factor_setups == attempts &&
             tensor.ilu_factor_reuses == 0 &&
             tensor.ilu_factor_age_generations == 0
       : factor_reuse_policy ==
               CudaIluFactorReusePolicy::first_trace_solve_per_attempt &&
+            matrix_generations > 0 &&
+            matrix_generations <=
+                static_cast<std::uint64_t>(trace_solves) &&
             tensor.ilu_factor_reuse_policy == factor_reuse_policy &&
             tensor.ilu_factor_setups == 1 &&
-            tensor.ilu_factor_reuses == solves - 1 &&
-            tensor.ilu_factor_age_generations == solves - 1;
+            tensor.ilu_factor_reuses == attempts - 1 &&
+            // Factor age counts distinct matrix generations, not causal
+            // solves.  RODAS3's last three stages reuse the common shifted
+            // matrix and therefore do not age its retained ILU factor.
+            tensor.ilu_factor_age_generations == matrix_generations - 1;
   if (!factor_work) return false;
   const std::uint64_t iterations =
       static_cast<std::uint64_t>(linear_iterations);
@@ -133,22 +144,39 @@ struct CudaQualificationTestAccess
   template <typename Engine>
   static bool VerifyPreparedCudaEngine(
       Engine& engine, const generic::CudaEngineKind expected,
-      const generic::EulerHdgTimeTreatment expected_time_treatment) noexcept
+      const generic::EulerHdgTimeTreatment expected_time_treatment,
+      const MPI_Comm expected_communicator) noexcept
   {
     if (!engine.initialized_ || !engine.pending_.active ||
         !engine.pending_.staging)
       return false;
     const auto& evidence = engine.pending_.evidence;
+    const auto& numerical = engine.pending_.numerical;
     const auto& tensor = evidence.tensor_core;
     const bool igr_active = engine.numerics_.shape_.igr_active;
     const bool partitioned_igr = igr_active &&
         expected_time_treatment ==
             generic::EulerHdgTimeTreatment::partitioned_backward_euler;
+    const bool rodas3 = expected_time_treatment ==
+        generic::EulerHdgTimeTreatment::rodas3;
     const int final_trace_solves = partitioned_igr ? 2 : 1;
-    const bool work_accounting = evidence.nonlinear_updates >= 0 &&
-        evidence.trace_solves ==
-            evidence.nonlinear_updates + final_trace_solves &&
-        evidence.linear_iterations >= 0 &&
+    const auto trace_policy = ResolveCudaTracePolicy(
+        expected, igr_active, engine.config_.expected_rank_count,
+        engine.config_.order, CudaTracePolicyKind::engine_default);
+    const bool tensor_rank_one =
+        expected == generic::CudaEngineKind::tensor_core &&
+        engine.config_.expected_rank_count == 1;
+    const bool retained_ilu = trace_policy.ilu_factor_reuse_policy ==
+        CudaIluFactorReusePolicy::first_trace_solve_per_attempt;
+    const bool rodas3_preconditioner_census = tensor_rank_one
+        ? evidence.common_shift_preconditioner_setups >= 1 &&
+              evidence.common_shift_preconditioner_reuses == 3
+        : retained_ilu
+            ? evidence.common_shift_preconditioner_setups == 1 &&
+                  evidence.common_shift_preconditioner_reuses == 3
+            : evidence.common_shift_preconditioner_setups == 4 &&
+                  evidence.common_shift_preconditioner_reuses == 0;
+    const bool common_linear_accounting = evidence.linear_iterations >= 0 &&
         evidence.newton_correction_linear_iterations >= 0 &&
         evidence.final_coherent_linear_iterations >= 0 &&
         static_cast<long long>(evidence.linear_iterations) ==
@@ -161,15 +189,54 @@ struct CudaQualificationTestAccess
             static_cast<long long>(evidence.trace_solves) +
                 evidence.true_residual_tightenings &&
         evidence.line_search_trials >= 0 &&
-        evidence.rejected_line_search_trials >= 0 &&
+        evidence.rejected_line_search_trials >= 0;
+    const bool backward_euler_work = !rodas3 &&
+        evidence.nonlinear_updates >= 0 &&
+        evidence.trace_solves ==
+            evidence.nonlinear_updates + final_trace_solves &&
         evidence.line_search_trials == evidence.nonlinear_updates +
             evidence.rejected_line_search_trials;
-    const auto trace_policy = ResolveCudaTracePolicy(
-        expected, igr_active, engine.config_.expected_rank_count,
-        engine.config_.order, CudaTracePolicyKind::engine_default);
-    return engine.config_.time_treatment == expected_time_treatment &&
-        engine.numerics_.partitioned_backward_euler_ == partitioned_igr &&
-        work_accounting && tensor.selected_engine == expected &&
+    const bool rodas3_work = rodas3 && evidence.nonlinear_updates >= 0 &&
+        evidence.trace_solves == evidence.nonlinear_updates + 4 &&
+        evidence.line_search_trials == 0 &&
+        evidence.rejected_line_search_trials == 0 &&
+        evidence.common_shift_operator_builds == 1 &&
+        evidence.common_shift_operator_reuses == 3 &&
+        evidence.condensed_rhs_refreshes == 3 &&
+        evidence.common_shift_trace_solves == 4 &&
+        rodas3_preconditioner_census &&
+        std::isfinite(evidence.temporal_error_norm) &&
+        std::isfinite(evidence.final_algebraic_residual) &&
+        std::isfinite(evidence.final_algebraic_correction_norm);
+    int communicator_comparison = MPI_UNEQUAL;
+    int world_comparison = MPI_IDENT;
+    const bool communicator_bound = expected_communicator != MPI_COMM_NULL &&
+        MPI_Comm_compare(engine.communicator_, expected_communicator,
+                         &communicator_comparison) == MPI_SUCCESS &&
+        MPI_Comm_compare(engine.communicator_, MPI_COMM_WORLD,
+                         &world_comparison) == MPI_SUCCESS &&
+        (communicator_comparison == MPI_IDENT ||
+         communicator_comparison == MPI_CONGRUENT) &&
+        world_comparison == MPI_UNEQUAL;
+    const bool work_accounting = common_linear_accounting &&
+        (backward_euler_work || rodas3_work);
+    const bool numerical_gates = numerical.candidate_ready &&
+        numerical.finite && numerical.admissible && numerical.recovery &&
+        numerical.true_residual && numerical.conservation &&
+        numerical.telemetry && numerical.success &&
+        std::isfinite(numerical.maximum_conservation_error) &&
+        std::isfinite(numerical.maximum_conservation_relative_error) &&
+        numerical.maximum_conservation_relative_error <=
+            engine.config_.numerical_policy.conservation_relative_tolerance;
+    const bool host_staged_rank_two =
+        engine.config_.expected_rank_count != 2 ||
+        (tensor.hypre_host_staged_rank2_trace_solver_configured &&
+         evidence.transfers.mpi_staging_bytes > 0);
+    const bool time_contract =
+        engine.config_.time_treatment == expected_time_treatment &&
+        engine.numerics_.partitioned_backward_euler_ == partitioned_igr;
+    const bool policy_contract =
+        tensor.selected_engine == expected &&
         CudaTracePolicyDescriptorIsExact(trace_policy) &&
         tensor.requested_trace_policy ==
             CudaTracePolicyKind::engine_default &&
@@ -177,42 +244,117 @@ struct CudaQualificationTestAccess
         tensor.trace_policy_rank_count == engine.config_.expected_rank_count &&
         tensor.trace_policy_order == engine.config_.order &&
         tensor.trace_preconditioner_configured &&
-        tensor.trace_preconditioner == trace_policy.trace_preconditioner &&
-        CudaPreparedIluAccountingValid(
-            tensor, evidence.trace_solves, evidence.linear_iterations,
-            expected, igr_active) &&
-        CudaPreparedTraceSolverRoutingValid(
-            tensor, evidence.trace_solves, expected,
-            engine.config_.expected_rank_count) &&
-        CudaPreparedTensorVolumeEvidenceValid(
-            tensor, engine.numerics_.shape_, expected) &&
-        tensor.fallback_count == 0 && evidence.no_fallback &&
-        (expected == generic::CudaEngineKind::ordinary
-             ? tensor.condensation_launches == 0 && tensor.mma_tiles == 0
-             : tensor.hardware_supported &&
-                   tensor.condensation_launches > 0 && tensor.mma_tiles > 0);
+        tensor.trace_preconditioner == trace_policy.trace_preconditioner;
+    const std::uint64_t matrix_generations = rodas3
+        ? evidence.complete_condensations
+        : evidence.trace_solves > 0
+            ? static_cast<std::uint64_t>(evidence.trace_solves) : 0;
+    const bool ilu_accounting = CudaPreparedIluAccountingValid(
+        tensor, evidence.trace_solves, evidence.linear_iterations,
+        evidence.linear_solve_attempts, matrix_generations, expected,
+        igr_active);
+    const bool routing = CudaPreparedTraceSolverRoutingValid(
+        tensor, rodas3 ? evidence.linear_solve_attempts
+                       : evidence.trace_solves,
+        expected,
+        engine.config_.expected_rank_count);
+    const bool exact_rodas3_launch_census = rodas3 &&
+        evidence.complete_assemblies > 0 &&
+        evidence.complete_condensations > 0 &&
+        tensor.volume_assembly_launches == evidence.complete_assemblies &&
+        tensor.condensation_launches == evidence.complete_condensations;
+    const bool volume = rodas3
+        ? exact_rodas3_launch_census &&
+              (expected == generic::CudaEngineKind::ordinary
+                   ? tensor.volume_mma_tiles == 0
+                   : CudaPreparedTensorVolumeEvidenceValid(
+                         tensor, engine.numerics_.shape_, expected) &&
+                         tensor.volume_mma_tiles > 0)
+        : CudaPreparedTensorVolumeEvidenceValid(
+              tensor, engine.numerics_.shape_, expected);
+    const bool no_fallback = tensor.fallback_accounting_complete &&
+        tensor.fallback_count == 0 && evidence.no_fallback;
+    const bool backend_work = rodas3
+        ? exact_rodas3_launch_census &&
+              (expected == generic::CudaEngineKind::ordinary
+                   ? tensor.mma_tiles == 0
+                   : tensor.hardware_supported && tensor.mma_tiles > 0)
+        : expected == generic::CudaEngineKind::ordinary
+            ? tensor.condensation_launches == 0 && tensor.mma_tiles == 0
+            : tensor.hardware_supported &&
+                  tensor.condensation_launches > 0 && tensor.mma_tiles > 0;
+    const bool valid = communicator_bound && time_contract &&
+        work_accounting && numerical_gates && host_staged_rank_two &&
+        policy_contract && ilu_accounting && routing && volume &&
+        no_fallback && backend_work;
+    int rank = -1;
+    if (!valid && expected_communicator != MPI_COMM_NULL &&
+        MPI_Comm_rank(expected_communicator, &rank) == MPI_SUCCESS &&
+        rank == 0)
+    {
+      std::cerr << "subcommunicator prepared-evidence mismatch"
+                << " communicator/time/work/numerical/host/policy/ilu/"
+                   "routing/volume/fallback/backend="
+                << communicator_bound << '/' << time_contract << '/'
+                << work_accounting << '/' << numerical_gates << '/'
+                << host_staged_rank_two << '/' << policy_contract << '/'
+                << ilu_accounting << '/' << routing << '/' << volume << '/'
+                << no_fallback << '/' << backend_work
+                << " trace/linear/attempts/tightenings="
+                << evidence.trace_solves << '/'
+                << evidence.linear_iterations << '/'
+                << evidence.linear_solve_attempts << '/'
+                << evidence.true_residual_tightenings
+                << " common_shift="
+                << evidence.common_shift_operator_builds << '/'
+                << evidence.common_shift_operator_reuses << '/'
+                << evidence.condensed_rhs_refreshes << '/'
+                << evidence.common_shift_trace_solves
+                << " preconditioner="
+                << evidence.common_shift_preconditioner_setups << '/'
+                << evidence.common_shift_preconditioner_reuses
+                << " assembly=" << tensor.volume_assembly_launches << '/'
+                << evidence.complete_assemblies << '/'
+                << tensor.volume_mma_tiles
+                << " condensation=" << tensor.condensation_launches << '/'
+                << evidence.complete_condensations << '/'
+                << tensor.mma_tiles << " hardware="
+                << tensor.hardware_supported << '\n';
+    }
+    return valid;
   }
 
   static bool VerifyPreparedCudaEngine(
       cuda::GenericEulerHdgCudaSession& session,
       const generic::CudaEngineKind expected,
-      const generic::EulerHdgTimeTreatment expected_time_treatment) noexcept
+      const generic::EulerHdgTimeTreatment expected_time_treatment,
+      const MPI_Comm expected_communicator) noexcept
   {
-    if (session.borrowed_rank1_)
-      return VerifyPreparedCudaEngine(
-          *session.borrowed_rank1_, expected, expected_time_treatment);
-    if (session.borrowed_rank2_)
-      return VerifyPreparedCudaEngine(
-          *session.borrowed_rank2_, expected, expected_time_treatment);
-    if (session.partitioned_backward_euler_borrowed_rank1_)
-      return VerifyPreparedCudaEngine(
-          *session.partitioned_backward_euler_borrowed_rank1_, expected,
-          expected_time_treatment);
-    if (session.partitioned_backward_euler_borrowed_rank2_)
-      return VerifyPreparedCudaEngine(
-          *session.partitioned_backward_euler_borrowed_rank2_, expected,
-          expected_time_treatment);
-    return false;
+    return session.Dispatch([&](auto& engine)
+    { return VerifyPreparedCudaEngine(
+          engine, expected, expected_time_treatment,
+          expected_communicator); });
+  }
+
+  template <typename Engine>
+  static bool CaptureCommittedHashes(
+      Engine& engine, StateHash& interior, StateHash& trace) noexcept
+  {
+    if (!engine.initialized_ || engine.pending_.active) return false;
+    const auto committed = engine.numerics_.CommittedSlot();
+    if (committed.interior.count == 0 || committed.trace.count == 0)
+      return false;
+    interior = committed.interior.hash;
+    trace = committed.trace.hash;
+    return true;
+  }
+
+  static bool CaptureCommittedHashes(
+      cuda::GenericEulerHdgCudaSession& session,
+      StateHash& interior, StateHash& trace) noexcept
+  {
+    return session.Dispatch([&](auto& engine)
+    { return CaptureCommittedHashes(engine, interior, trace); });
   }
 };
 
@@ -229,6 +371,7 @@ using dg::hdg::generic::EulerHdgRequest;
 using dg::hdg::generic::EulerHdgTimeTreatment;
 using dg::hdg::generic::HdgEulerSessionStatus;
 using dg::hdg::generic::RegularizationKind;
+using dg::hdg::runtime::StateHash;
 using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
 using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
@@ -251,6 +394,32 @@ bool All(const MPI_Comm communicator, const bool local) noexcept
       MPI_Allreduce(&input, &output, 1, MPI_INT, MPI_MIN, communicator) ==
           MPI_SUCCESS &&
       output == 1;
+}
+
+bool SameCoordinates(
+    const dg::hdg::generic::HdgEulerSessionCoordinates& left,
+    const dg::hdg::generic::HdgEulerSessionCoordinates& right) noexcept
+{
+  return left.time == right.time && left.dt == right.dt &&
+      left.step == right.step && left.generation == right.generation;
+}
+
+bool AssessPreparedRodas3(
+    GenericEulerHdgCudaSession& session,
+    const GenericEulerCudaPreparedStep& authority,
+    const CudaPreparedOutputMetadataV1& output,
+    const EulerHdgTimeTreatment time_treatment) noexcept
+{
+  if (time_treatment != EulerHdgTimeTreatment::rodas3) return true;
+  constexpr dg::hdg::generic::HdgEulerPreparedAssessmentPolicy policy{
+      1.0e-8, 1.0e-5, 0.25};
+  dg::hdg::generic::HdgEulerPreparedAssessment assessment{};
+  return session.AssessPrepared(authority, output, policy, assessment) &&
+      dg::hdg::generic::IsValidHdgEulerPreparedAssessment(assessment) &&
+      assessment.finite_gate && assessment.solver_gate &&
+      assessment.residual_gate && assessment.admissibility_gate &&
+      assessment.algebraic_closure_gate &&
+      assessment.algebraic_correction_gate;
 }
 
 bool ExteriorState(const void*,
@@ -373,11 +542,21 @@ bool CheckActiveSubcommunicator(const MPI_Comm communicator,
       MPI_Comm_size(communicator, &ranks) != MPI_SUCCESS ||
       ranks != active_ranks)
     return false;
+  const auto fail = [&](const std::string_view phase) noexcept
+  {
+    if (rank == 0)
+      std::cerr << "subcommunicator RODAS lifecycle failed phase="
+                << phase << " active_ranks=" << active_ranks
+                << " engine=" << static_cast<int>(engine) << '\n';
+    return false;
+  };
+  const double dt = time_treatment == EulerHdgTimeTreatment::rodas3
+      ? 1.0e-6 : 0.025;
 
   mfem::Mesh serial = PeriodicMesh();
   mfem::ParMesh mesh(communicator, serial);
   BorrowedFields fields = MakeFields(mesh);
-  if (!All(communicator, HYPRE_GetError() == 0)) return false;
+  if (!All(communicator, HYPRE_GetError() == 0)) return fail("fields");
   EulerHdgRequest request = MakeRequest(
       mesh, fields, engine, time_treatment);
 
@@ -388,28 +567,70 @@ bool CheckActiveSubcommunicator(const MPI_Comm communicator,
     if (rank == 0) asymmetric.mesh = nullptr;
     const bool rejected = rejected_session.Initialize(asymmetric).status ==
         HdgEulerSessionStatus::rejected;
-    if (!All(communicator, rejected)) return false;
+    if (!All(communicator, rejected)) return fail("asymmetric-rejection");
   }
 
   GenericEulerHdgCudaSession session;
   const bool initialized = session.Initialize(request).status ==
       HdgEulerSessionStatus::initialized;
-  if (!All(communicator, initialized)) return false;
+  if (!All(communicator, initialized)) return fail("initialize");
+
+  StateHash initial_interior{};
+  StateHash initial_trace{};
+  const auto initial_coordinates = session.coordinates();
+  const bool initial_captured =
+      CudaQualificationTestAccess::CaptureCommittedHashes(
+          session, initial_interior, initial_trace);
+  if (!All(communicator, initial_captured))
+    return fail("initial-hash-capture");
+
+  GenericEulerCudaPreparedStep rejected_authority;
+  CudaPreparedOutputMetadataV1 rejected_output{};
+  const bool first_prepared = session.Prepare(
+      dt, rejected_authority, rejected_output).status ==
+      HdgEulerSessionStatus::prepared;
+  if (!All(communicator, first_prepared)) return fail("first-prepare");
+  const bool first_assessed = AssessPreparedRodas3(
+      session, rejected_authority, rejected_output, time_treatment);
+  const bool first_engine_evidence =
+      CudaQualificationTestAccess::VerifyPreparedCudaEngine(
+          session, engine, time_treatment, communicator);
+  if (!All(communicator, first_assessed && first_engine_evidence))
+    return fail(first_assessed ? "first-evidence" : "first-assessment");
+  const bool rejected = session.RejectPrepared(
+      std::move(rejected_authority), rejected_output).status ==
+      HdgEulerSessionStatus::aborted;
+  if (!All(communicator, rejected)) return fail("reject");
+  StateHash after_reject_interior{};
+  StateHash after_reject_trace{};
+  const bool rollback =
+      CudaQualificationTestAccess::CaptureCommittedHashes(
+          session, after_reject_interior, after_reject_trace) &&
+      after_reject_interior == initial_interior &&
+      after_reject_trace == initial_trace &&
+      SameCoordinates(session.coordinates(), initial_coordinates);
+  if (!All(communicator, rollback)) return fail("rollback");
 
   GenericEulerCudaPreparedStep authority;
   CudaPreparedOutputMetadataV1 output{};
-  const bool prepared = session.Prepare(0.025, authority, output).status ==
+  const bool prepared = session.Prepare(dt, authority, output).status ==
       HdgEulerSessionStatus::prepared;
-  if (!All(communicator, prepared)) return false;
+  if (!All(communicator, prepared)) return fail("second-prepare");
+  const bool assessed = AssessPreparedRodas3(
+      session, authority, output, time_treatment);
   const bool engine_evidence =
       CudaQualificationTestAccess::VerifyPreparedCudaEngine(
-          session, engine, time_treatment);
-  if (!All(communicator, engine_evidence)) return false;
-  const bool acknowledged = session.AcknowledgePreparedOutput(authority, output);
-  if (!All(communicator, acknowledged)) return false;
+          session, engine, time_treatment, communicator);
+  if (!All(communicator, assessed && engine_evidence))
+    return fail(assessed ? "second-evidence" : "second-assessment");
+  const bool acknowledged = session.AcknowledgePreparedOutput(
+      authority, output);
+  if (!All(communicator, acknowledged)) return fail("acknowledge");
   const bool committed = session.Commit(std::move(authority), output).status ==
       HdgEulerSessionStatus::committed;
-  return All(communicator, committed && session.coordinates().step == 1);
+  if (!All(communicator, committed && session.coordinates().step == 1))
+    return fail("commit");
+  return true;
 }
 
 struct Options
@@ -452,6 +673,8 @@ bool ParseOptions(const int argc, char* argv[], Options& options) noexcept
       else if (treatment == "partitioned-backward-euler")
         options.time_treatment =
             EulerHdgTimeTreatment::partitioned_backward_euler;
+      else if (treatment == "rodas3")
+        options.time_treatment = EulerHdgTimeTreatment::rodas3;
       else
         return false;
       continue;

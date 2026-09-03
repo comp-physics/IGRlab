@@ -1892,6 +1892,34 @@ public:
     return PrepareAndAdmit({InteriorSpace::l2, pending_dt_}, true);
   }
 
+  /**
+   * Decline the single exact retry offered after a completed rollback.
+   *
+   * This transition changes no coordinates or state bytes.  It only returns
+   * the contract to the admission state associated with its still-published
+   * state, allowing a controller to begin a fresh primary attempt with a new
+   * timestep.  Collective adapters must agree on this transition before
+   * calling it; a duplicate or busy call is rejected without mutation.
+   */
+  bool AbandonRetry() noexcept
+  {
+    if (TwoPhaseCommitBusy() || active_ ||
+        status_ != RunStatus::retry_available)
+    {
+      RejectStaleConsumer();
+      return false;
+    }
+    pending_dt_ = 0.0;
+    pending_target_time_ = coordinates_.time;
+    retry_used_ = false;
+    status_ = coordinates_.step == 0 && coordinates_.generation == 0 &&
+            coordinates_.time == 0.0
+        ? RunStatus::ready
+        : RunStatus::committed;
+    last_failure_ = FailureReason::none;
+    return true;
+  }
+
   AttemptOutcome FinishAttempt(const AttemptIdentity& attempt,
                                const AttemptReport& report,
                                ProductBundle&& products) noexcept

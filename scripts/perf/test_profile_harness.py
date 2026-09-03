@@ -218,6 +218,15 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
     }
     assert len(expected) == 23
     assert PROFILE.FIXED_SIGMA_JACOBI_PROFILE_POLICIES == expected
+    assert PROFILE._effective_profile_trace_policy(
+        "engine-default", "conventional", "rodas3"
+    ) == "native-element-schwarz-matrix-free-fp64"
+    assert PROFILE._effective_profile_trace_policy(
+        "engine-default", "igr", "rodas3"
+    ) == "engine-default"
+    assert PROFILE._effective_profile_trace_policy(
+        "engine-default", "conventional", "backward-euler"
+    ) == "engine-default"
     for order in (1, 2, 3):
         conventional_default = PROFILE._profile_trace_policy_contract(
             "engine-default", "conventional", order
@@ -226,6 +235,16 @@ def validate_fixed_sigma_jacobi_profile_surface() -> None:
             "engine-default", "engine-default", "hypre_diag_scale",
             "production", True, None, False, "not-applicable",
             "not-applicable", 0,
+        )
+        conventional_rodas_default = PROFILE._profile_trace_policy_contract(
+            "native-element-schwarz-matrix-free-fp64",
+            "conventional", order,
+        )
+        assert conventional_rodas_default == (
+            "native-element-schwarz-matrix-free-fp64",
+            "native-element-schwarz-matrix-free-fp64",
+            "native_element_schwarz_fp64", "ablation", False, None, True,
+            "full-patch-lu", "scalar-full-patch-pivoted-lu-fp64", 0,
         )
         resolved = PROFILE.PRODUCTION_TENSOR_IGR_TRACE_POLICY_BY_ORDER[order]
         descriptor = PROFILE.FIXED_SIGMA_JACOBI_PROFILE_POLICIES[resolved]
@@ -583,6 +602,30 @@ else:
     volume_launches = int(os.environ.get(
         "FAKE_APP_VOLUME_ASSEMBLY_LAUNCHES", "3"
     ))
+    time_integrator_cli = arguments[
+        arguments.index("--time-integrator") + 1
+    ]
+    time_integrator = {
+        "backward-euler": "backward_euler",
+        "partitioned-backward-euler": "partitioned_backward_euler",
+        "rodas3": "rodas3",
+    }[time_integrator_cli]
+    if os.environ.get("FAKE_APP_BAD_TIME_INTEGRATOR"):
+        time_integrator = (
+            "backward_euler" if time_integrator == "rodas3" else "rodas3"
+        )
+    rodas3 = time_integrator_cli == "rodas3"
+    time_atol = float(arguments[arguments.index("--time-atol") + 1]) \
+        if rodas3 else 0.0
+    time_rtol = float(arguments[arguments.index("--time-rtol") + 1]) \
+        if rodas3 else 0.0
+    trace_solve_count = 6 if rodas3 else 2
+    nonlinear_updates = 2 if rodas3 else 1
+    patch_setup_count = (
+        nonlinear_updates + 1 if rodas3 else trace_solve_count
+    )
+    if os.environ.get("FAKE_APP_BAD_RODAS_PATCH_SETUPS"):
+        patch_setup_count += 1
     p1_igr = bool(os.environ.get("FAKE_APP_P1_IGR"))
     order = 1 if p1_igr else 3
     interior_unknowns = 75712 if p1_igr else 302848
@@ -612,6 +655,7 @@ else:
         "production_selectable": True,
         "backend": "cuda",
         "cuda_engine": "tensor",
+        "cli_trace_policy": "engine-default",
         "trace_policy": "engine-default",
         "requested_trace_policy": "engine-default",
         "resolved_trace_policy": top_level_resolved_trace_policy,
@@ -634,11 +678,13 @@ else:
         "trace_robust_coupled_specialization_supported":
             not bool(os.environ.get("FAKE_APP_BAD_ROBUST_SUPPORT")),
         "trace_robust_branch_accounting_complete": True,
-        "trace_robust_lower_patch_setups": 2,
-        "trace_robust_lower_trace_solve_calls": 2,
+        "trace_robust_lower_patch_setups": patch_setup_count,
+        "trace_robust_lower_trace_solve_calls": trace_solve_count,
         "trace_robust_coupled_patch_setups": 0,
         "trace_robust_coupled_trace_solve_calls": 0,
         "mode": "igr",
+        "time_integrator": time_integrator,
+        "time_step_policy": "fixed",
         "rank_count": 1,
         "polynomial_order": order,
         "mesh_n": 52,
@@ -678,8 +724,37 @@ else:
         "samples": [{
             "phase": "measured",
             "measured_index": 2,
-            "trace_solves": 2,
-            "linear_solve_attempts": 2,
+            "nonlinear_updates": nonlinear_updates,
+            "trace_solves": trace_solve_count,
+            "linear_solve_attempts": trace_solve_count,
+            "temporal_error_norm": 1e-7 if rodas3 else 0.0,
+            "final_algebraic_residual": 1e-12 if rodas3 else 0.0,
+            "final_algebraic_correction_norm": 1e-9 if rodas3 else 0.0,
+            "complete_assemblies": volume_launches if rodas3 else 0,
+            "complete_condensations": launches if rodas3 else 0,
+            "complete_recoveries": 4 if rodas3 else 0,
+            "common_shift_operator_builds": 1 if rodas3 else 0,
+            "common_shift_operator_reuses": 3 if rodas3 else 0,
+            "condensed_rhs_refreshes": 3 if rodas3 else 0,
+            "common_shift_trace_solves": 4 if rodas3 else 0,
+            "common_shift_preconditioner_setups": 1 if rodas3 else 0,
+            "common_shift_preconditioner_reuses": 3 if rodas3 else 0,
+            "prepared_assessment": {
+                "required": rodas3,
+                "performed": rodas3,
+                "accepted": rodas3,
+                "absolute_tolerance": time_atol,
+                "relative_tolerance": time_rtol,
+                "algebraic_correction_fraction": 0.25 if rodas3 else 0.0,
+                "normalized_differential_error": 0.5 if rodas3 else None,
+                "normalized_algebraic_correction": 0.1 if rodas3 else None,
+                "finite_gate": rodas3,
+                "solver_gate": rodas3,
+                "residual_gate": rodas3,
+                "admissibility_gate": rodas3,
+                "algebraic_closure_gate": rodas3,
+                "algebraic_correction_gate": rodas3,
+            },
             "tensor_core": {
                 "selected_engine": "tensor",
                 "requested_trace_policy": "engine-default",
@@ -688,7 +763,7 @@ else:
                 "native_rank1_trace_solver_configured": True,
                 "native_rank1_trace_solve_calls": (
                     1 if os.environ.get("FAKE_APP_BAD_NATIVE_TRACE_CALLS")
-                    else 2
+                    else trace_solve_count
                 ),
                 "hypre_trace_solve_calls": (
                     1 if os.environ.get("FAKE_APP_BAD_HYPRE_TRACE_CALLS")
@@ -701,8 +776,8 @@ else:
                 "robust_lower_specialization_supported": True,
                 "robust_coupled_specialization_supported": True,
                 "robust_branch_accounting_complete": True,
-                "robust_lower_patch_setups": 2,
-                "robust_lower_trace_solve_calls": 2,
+                "robust_lower_patch_setups": patch_setup_count,
+                "robust_lower_trace_solve_calls": trace_solve_count,
                 "robust_coupled_patch_setups": 0,
                 "robust_coupled_trace_solve_calls": (
                     1 if os.environ.get("FAKE_APP_BAD_ROBUST_COUNTER") else 0
@@ -777,6 +852,7 @@ else:
         "production_selectable": True,
         "backend": "cuda",
         "cuda_engine": "tensor",
+        "cli_trace_policy": "engine-default",
         "trace_policy": "engine-default",
         "requested_trace_policy": "engine-default",
         "resolved_trace_policy": "engine-default",
@@ -799,6 +875,8 @@ else:
         "trace_robust_coupled_patch_setups": 0,
         "trace_robust_coupled_trace_solve_calls": 0,
         "mode": "conventional",
+        "time_integrator": "backward_euler",
+        "time_step_policy": "fixed",
         "rank_count": 1,
         "polynomial_order": 2,
         "mesh_n": 52,
@@ -823,8 +901,37 @@ else:
         "samples": [{
             "phase": "measured",
             "measured_index": 2,
+            "nonlinear_updates": 1,
             "trace_solves": 2,
             "linear_solve_attempts": 2,
+            "temporal_error_norm": 0.0,
+            "final_algebraic_residual": 0.0,
+            "final_algebraic_correction_norm": 0.0,
+            "complete_assemblies": 0,
+            "complete_condensations": 0,
+            "complete_recoveries": 0,
+            "common_shift_operator_builds": 0,
+            "common_shift_operator_reuses": 0,
+            "condensed_rhs_refreshes": 0,
+            "common_shift_trace_solves": 0,
+            "common_shift_preconditioner_setups": 0,
+            "common_shift_preconditioner_reuses": 0,
+            "prepared_assessment": {
+                "required": False,
+                "performed": False,
+                "accepted": False,
+                "absolute_tolerance": 0.0,
+                "relative_tolerance": 0.0,
+                "algebraic_correction_fraction": 0.0,
+                "normalized_differential_error": None,
+                "normalized_algebraic_correction": None,
+                "finite_gate": False,
+                "solver_gate": False,
+                "residual_gate": False,
+                "admissibility_gate": False,
+                "algebraic_closure_gate": False,
+                "algebraic_correction_gate": False,
+            },
             "tensor_core": {
                 "selected_engine": "tensor",
                 "requested_trace_policy": "engine-default",
@@ -865,10 +972,12 @@ else:
         def qualification_arguments(
                 output: Path,
                 kind: str = "tensor-instructions",
-                p1_igr: bool = False) -> list[str]:
+                p1_igr: bool = False,
+                time_integrator: str = "backward-euler") -> list[str]:
             application = [
                 "--arg=--mode", "--arg", "igr",
                 "--arg=--engine", "--arg", "tensor",
+                "--arg=--time-integrator", "--arg", time_integrator,
                 "--arg=--trace-policy", "--arg", "engine-default",
                 "--arg=--order", "--arg", "1" if p1_igr else "3",
                 "--arg=--mesh-n", "--arg", "52",
@@ -893,6 +1002,11 @@ else:
                 "--arg=--expected-cmake-cache", "--arg",
                 str(qualification_cache.resolve()),
             ]
+            if time_integrator == "rodas3":
+                application.extend((
+                    "--arg=--time-atol", "--arg", "1e-8",
+                    "--arg=--time-rtol", "--arg", "1e-5",
+                ))
             if kind == "tensor-instructions":
                 ncu_arguments = [
                     "--ncu-metric",
@@ -971,6 +1085,9 @@ else:
         application_work = qualification_manifest["qualification"][
             "application_work"
         ]
+        assert application_work["time_integrator"] == "backward_euler"
+        assert application_work["time_absolute_tolerance"] == 0.0
+        assert application_work["time_relative_tolerance"] == 0.0
         assert application_work["condensation_launches"] == 3
         assert application_work["planned_mma_tiles"] == 68481504
         assert application_work["volume_assembly_launches"] == 3
@@ -1016,6 +1133,126 @@ else:
         assert proof_artifact["generating_command"][-2:] == [
             "--print-units", "base",
         ]
+
+        partitioned_out = root / "qualification-partitioned"
+        run(
+            *qualification_arguments(
+                partitioned_out, time_integrator="partitioned-backward-euler"
+            ),
+            env=qualification_env,
+        )
+        partitioned_work = read_manifest(partitioned_out)["qualification"][
+            "application_work"
+        ]
+        assert partitioned_work["time_integrator"] == \
+            "partitioned_backward_euler"
+        assert partitioned_work["common_shift_operator_builds"] == 0
+
+        rodas3_out = root / "qualification-rodas3"
+        run(
+            *qualification_arguments(
+                rodas3_out, "accepted-step-attribution",
+                time_integrator="rodas3"
+            ),
+            env={**qualification_env, "FAKE_NCU_ATTRIBUTION": "1"},
+        )
+        rodas3_work = read_manifest(rodas3_out)["qualification"][
+            "application_work"
+        ]
+        assert rodas3_work["time_integrator"] == "rodas3"
+        assert rodas3_work["time_absolute_tolerance"] == 1e-8
+        assert rodas3_work["time_relative_tolerance"] == 1e-5
+        assert rodas3_work["algebraic_correction_fraction"] == 0.25
+        assert rodas3_work["normalized_differential_error"] == 0.5
+        assert rodas3_work["normalized_algebraic_correction"] == 0.1
+        assert rodas3_work["common_shift_operator_builds"] == 1
+        assert rodas3_work["common_shift_operator_reuses"] == 3
+        assert rodas3_work["condensed_rhs_refreshes"] == 3
+        assert rodas3_work["common_shift_trace_solves"] == 4
+        assert rodas3_work["common_shift_preconditioner_setups"] == 1
+        assert rodas3_work["common_shift_preconditioner_reuses"] == 3
+        assert rodas3_work["robust_lower_patch_setups"] == 3
+        assert rodas3_work["robust_lower_trace_solve_calls"] == 6
+        assert rodas3_work["complete_assemblies"] == 3
+        assert rodas3_work["complete_condensations"] == 3
+        assert rodas3_work["complete_recoveries"] == 4
+        rodas3_attribution = read_manifest(rodas3_out)["qualification"][
+            "accepted_step_attribution"
+        ]
+        assert "nonlinear_update" not in \
+            rodas3_attribution["required_categories"]
+
+        bad_rodas_patch_out = root / \
+            "qualification-bad-rodas-patch-setups"
+        run(
+            *qualification_arguments(
+                bad_rodas_patch_out, "accepted-step-attribution",
+                time_integrator="rodas3",
+            ),
+            expected=6,
+            env={
+                **qualification_env,
+                "FAKE_NCU_ATTRIBUTION": "1",
+                "FAKE_APP_BAD_RODAS_PATCH_SETUPS": "1",
+            },
+        )
+        assert "robust lower patch setups differ from profiled setup census" \
+            in read_manifest(bad_rodas_patch_out)["detail"]
+
+        missing_integrator = qualification_arguments(
+            root / "qualification-missing-time-integrator"
+        )
+        integrator_index = missing_integrator.index(
+            "--arg=--time-integrator"
+        )
+        del missing_integrator[integrator_index:integrator_index + 3]
+        assert "requires exactly one application --time-integrator" in run(
+            *missing_integrator, expected=2, env=qualification_env,
+        ).stderr
+
+        invalid_integrator = qualification_arguments(
+            root / "qualification-invalid-time-integrator"
+        )
+        invalid_integrator[
+            invalid_integrator.index("backward-euler")
+        ] = "other-integrator"
+        assert "requires backward-euler" in run(
+            *invalid_integrator, expected=2, env=qualification_env,
+        ).stderr
+
+        missing_rodas3_tolerance = qualification_arguments(
+            root / "qualification-rodas3-missing-tolerance",
+            time_integrator="rodas3",
+        )
+        tolerance_index = missing_rodas3_tolerance.index("--arg=--time-atol")
+        del missing_rodas3_tolerance[tolerance_index:tolerance_index + 3]
+        assert "requires exactly one application --time-atol" in run(
+            *missing_rodas3_tolerance, expected=2, env=qualification_env,
+        ).stderr
+
+        backward_euler_tolerance = qualification_arguments(
+            root / "qualification-backward-euler-time-tolerance"
+        )
+        backward_euler_tolerance.extend((
+            "--arg=--time-atol", "--arg", "1e-8",
+            "--arg=--time-rtol", "--arg", "1e-5",
+        ))
+        assert "forbids application --time-atol" in run(
+            *backward_euler_tolerance, expected=2, env=qualification_env,
+        ).stderr
+
+        bad_time_integrator_out = root / "qualification-bad-time-integrator"
+        run(
+            *qualification_arguments(
+                bad_time_integrator_out, time_integrator="rodas3"
+            ),
+            expected=6,
+            env={
+                **qualification_env, "FAKE_APP_BAD_TIME_INTEGRATOR": "1",
+            },
+        )
+        assert "does not match the qualified production tensor" in \
+            read_manifest(bad_time_integrator_out)["detail"]
 
         for suffix, environment, expected_detail in (
             (
@@ -1292,6 +1529,7 @@ else:
         nsys_application = [
             "--arg=--mode", "--arg", "conventional",
             "--arg=--engine", "--arg", "tensor",
+            "--arg=--time-integrator", "--arg", "backward-euler",
             "--arg=--trace-policy", "--arg", "engine-default",
             "--arg=--order", "--arg", "2",
             "--arg=--mesh-n", "--arg", "52",

@@ -14,7 +14,9 @@
  */
 
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <mfem.hpp>
@@ -55,6 +57,35 @@ struct HDGParaViewOptions
   mfem::VTKFormat data_format = mfem::VTKFormat::BINARY;
   int levels_of_detail = 1;
   bool high_order_output = false;
+  /**
+   * Trusted committed-boundary seed for appending an existing native series.
+   * The cycle is the last durable output cycle; committed_time is the
+   * checkpoint time and may be later than that cycle's publication time.
+   */
+  struct RestartSeed
+  {
+    int last_cycle = -1;
+    double committed_time = 0.0;
+  };
+  std::optional<RestartSeed> restart;
+
+  HDGParaViewOptions() = default;
+
+  HDGParaViewOptions(
+      std::string prefix,
+      std::string collection,
+      const mfem::VTKFormat format = mfem::VTKFormat::BINARY,
+      const int detail = 1,
+      const bool high_order = false,
+      std::optional<RestartSeed> restart_seed = std::nullopt)
+      : prefix_path(std::move(prefix)),
+        collection_name(std::move(collection)),
+        data_format(format),
+        levels_of_detail(detail),
+        high_order_output(high_order),
+        restart(std::move(restart_seed))
+  {
+  }
 };
 
 /**
@@ -77,8 +108,9 @@ struct HDGParaViewRequest
  * the supplied mesh and fields remain externally owned and must outlive it.
  *
  * Keeping this object alive across Write() calls preserves native MFEM PVD
- * entries for each published cycle.  It neither uses restart mode nor reads
- * historical output from disk.
+ * entries for each published cycle.  An explicit restart seed validates the
+ * existing series and enables MFEM's native append mode; fresh-series behavior
+ * remains the default.
  */
 class HDGParaViewSeries
 {
@@ -108,6 +140,8 @@ private:
   std::string collection_path_;
   std::string collection_name_;
   int last_cycle_ = -1;
+  double committed_time_floor_ = 0.0;
+  bool has_committed_time_floor_ = false;
 };
 
 } // namespace dg_sim::hdg

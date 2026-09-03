@@ -7,6 +7,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 
 #include <mpi.h>
 
@@ -52,6 +53,8 @@ struct HdgEulerMainRequest
   const CommonOptions& options;
   const HdgEulerCaseDataFactory& make_case_data;
   MPI_Comm communicator = MPI_COMM_WORLD;
+  std::optional<dg_igr::IGRAlphaLengthScalePolicy>
+      alpha_length_scale_policy_override;
 };
 
 /**

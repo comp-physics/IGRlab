@@ -37,11 +37,26 @@ foreach(_engine IN LISTS _engines)
     set(_engine_arguments)
     set(_route_expected_reason "${_expected_reason}")
   endif()
-  foreach(_route IN ITEMS restart state-file)
+  if(_device STREQUAL "cpu")
+    set(_routes restart state-file hdg-checkpoint hdg-restart-checkpoint)
+  else()
+    set(_routes restart state-file)
+  endif()
+  foreach(_route IN LISTS _routes)
     if(_route STREQUAL "restart")
       set(_route_arguments --restart-vtk unsupported-state.pvd)
-    else()
+      set(_selected_expected_reason "${_route_expected_reason}")
+    elseif(_route STREQUAL "state-file")
       set(_route_arguments --save-state)
+      set(_selected_expected_reason "${_route_expected_reason}")
+    elseif(_route STREQUAL "hdg-checkpoint")
+      set(_route_arguments --hdg-checkpoint unsupported-state.chk)
+      set(_selected_expected_reason
+        "\\[hdg-main\\] status=Rejected reason=generic CPU HDG checkpoint routes are unsupported")
+    else()
+      set(_route_arguments --hdg-restart-checkpoint unsupported-state.chk)
+      set(_selected_expected_reason
+        "\\[hdg-main\\] status=Rejected reason=generic CPU HDG checkpoint routes are unsupported")
     endif()
     execute_process(
       COMMAND "${HDG_MAIN_EXECUTABLE}" ${_base_arguments}
@@ -50,7 +65,7 @@ foreach(_engine IN LISTS _engines)
       OUTPUT_VARIABLE _stdout
       ERROR_VARIABLE _stderr)
     if(_status EQUAL 0 OR
-       NOT _stderr MATCHES "${_route_expected_reason}")
+       NOT _stderr MATCHES "${_selected_expected_reason}")
       message(FATAL_ERROR
         "HDG ${_device}/${_engine} ${_route} route was not rejected atomically: "
         "${_status}\n${_stdout}\n${_stderr}")

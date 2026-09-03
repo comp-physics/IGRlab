@@ -93,9 +93,10 @@ enum class Regularization
 /// @brief Time-integrator selection for the Euler solver request.
 enum class TimeIntegrator
 {
-  RK3SSP,
-  BackwardEuler,
-  PartitionedBackwardEuler
+  RK3SSP = 0,
+  BackwardEuler = 1,
+  PartitionedBackwardEuler = 2,
+  Rodas3 = 3
 };
 
 /// @brief Source of the effective general discretization selection.
@@ -257,6 +258,74 @@ inline std::string ToLowerCopy(std::string value)
                  [](unsigned char c)
                  { return static_cast<char>(std::tolower(c)); });
   return value;
+}
+
+/// @brief Typed command-line override for the case Zhang--Shu policy.
+enum class PositivityLimiterSelection
+{
+  Case,
+  None,
+  ZhangShu
+};
+
+inline PositivityLimiterSelection
+ParsePositivityLimiterSelection(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower.empty() || lower == "case")
+  {
+    return PositivityLimiterSelection::Case;
+  }
+  if (lower == "none")
+  {
+    return PositivityLimiterSelection::None;
+  }
+  if (lower == "zhang-shu" || lower == "zhang_shu" || lower == "zhangshu")
+  {
+    return PositivityLimiterSelection::ZhangShu;
+  }
+  MFEM_VERIFY(false,
+              "Invalid positivity limiter '"
+                << value << "'. Use 'case', 'none', or 'zhang-shu'.");
+  return PositivityLimiterSelection::Case;
+}
+
+inline const char* PositivityLimiterSelectionToString(
+  const PositivityLimiterSelection selection)
+{
+  switch (selection)
+  {
+  case PositivityLimiterSelection::Case:
+    return "case";
+  case PositivityLimiterSelection::None:
+    return "none";
+  case PositivityLimiterSelection::ZhangShu:
+    return "zhang-shu";
+  }
+  return "case";
+}
+
+inline bool ResolveZhangShuPositivityLimiter(
+  const PositivityLimiterSelection selection,
+  const bool case_default) noexcept
+{
+  switch (selection)
+  {
+  case PositivityLimiterSelection::Case:
+    return case_default;
+  case PositivityLimiterSelection::None:
+    return false;
+  case PositivityLimiterSelection::ZhangShu:
+    return true;
+  }
+  return case_default;
+}
+
+inline bool ResolveZhangShuPositivityLimiter(
+  const std::string& selection, const bool case_default)
+{
+  return ResolveZhangShuPositivityLimiter(
+    ParsePositivityLimiterSelection(selection), case_default);
 }
 
 inline mfem::ZhangShuPointSet
@@ -721,6 +790,10 @@ TryParseTimeIntegrator(const std::string& value)
   {
     return TimeIntegrator::PartitionedBackwardEuler;
   }
+  if (lower == "rodas3")
+  {
+    return TimeIntegrator::Rodas3;
+  }
   return std::nullopt;
 }
 
@@ -734,6 +807,8 @@ inline const char* TimeIntegratorToString(TimeIntegrator time_integrator)
     return "backward-euler";
   case TimeIntegrator::PartitionedBackwardEuler:
     return "partitioned-backward-euler";
+  case TimeIntegrator::Rodas3:
+    return "rodas3";
   }
   return "rk3ssp";
 }
@@ -991,7 +1066,7 @@ ResolveSolverRequest(const std::string& case_default_dg_backend,
       result.status = SolverRequestResolutionStatus::InvalidTimeIntegrator;
       result.message = "Invalid time integrator '" + time_integrator_value +
                        "'. Use 'rk3ssp', 'backward-euler', or "
-                       "'partitioned-backward-euler'.";
+                       "'partitioned-backward-euler', or 'rodas3'.";
       return result;
     }
     result.time_integrator = *time_integrator;
@@ -1012,7 +1087,8 @@ ResolveSolverRequest(const std::string& case_default_dg_backend,
   {
     result.status = SolverRequestResolutionStatus::UnsupportedTimeIntegrator;
     result.message = "Time integrator 'rk3ssp' is unavailable for HDG; use "
-                     "'backward-euler' or 'partitioned-backward-euler'.";
+                     "'backward-euler', 'partitioned-backward-euler', or "
+                     "'rodas3'.";
     return result;
   }
   return result;
@@ -1063,11 +1139,45 @@ inline bool IsExactDGFaceOptionName(const std::string& value)
          value == "-ino-exface" || value == "--no-igr-exact-dg-face";
 }
 
+inline bool IsCAlphaOptionName(const std::string& value)
+{
+  return value == "-ca" || value == "--c-alpha";
+}
+
+inline bool IsHdgIgrAlphaOptionName(const std::string& value)
+{
+  return value == "-hia" || value == "--hdg-igr-alpha";
+}
+
 inline bool HasExactDGFaceOptionOverride(int argc, char** argv)
 {
   for (int i = 1; i < argc; ++i)
   {
     if (IsExactDGFaceOptionName(argv[i]))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool HasCAlphaOptionOverride(int argc, char** argv)
+{
+  for (int i = 1; i < argc; ++i)
+  {
+    if (IsCAlphaOptionName(argv[i]))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool HasHdgIgrAlphaOptionOverride(int argc, char** argv)
+{
+  for (int i = 1; i < argc; ++i)
+  {
+    if (IsHdgIgrAlphaOptionName(argv[i]))
     {
       return true;
     }
@@ -1541,7 +1651,8 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
   args.AddOption(&igr_opts.c_alpha_user,
                  "-ca",
                  "--c-alpha",
-                 "Forward scaling constant C_alpha (default 1.0).");
+                 "Forward scaling constant C_alpha (default 1.0); for HDG "
+                 "this aliases --hdg-igr-alpha when that option is absent.");
   args.AddOption(&igr_opts.alpha_length_policy,
                  "-ial",
                  "--igr-alpha-length",
@@ -1662,10 +1773,17 @@ inline RunConfig MakeRunConfig(
 {
   RunConfig run_cfg;
   run_cfg.case_config = case_cfg;
+  const PositivityLimiterSelection positivity_limiter =
+    ParsePositivityLimiterSelection(opts.positivity_limiter);
   const mfem::ZhangShuPointSet zhang_shu_points =
     ParseZhangShuPointSet(opts.zhang_shu_points);
+  run_cfg.case_config.limiter_pipeline.zhang_shu =
+    ResolveZhangShuPositivityLimiter(
+      positivity_limiter, case_cfg.limiter_pipeline.zhang_shu);
   run_cfg.case_config.limiter_pipeline.zhang_shu_points = zhang_shu_points;
   run_cfg.opts = opts;
+  run_cfg.opts.positivity_limiter =
+    PositivityLimiterSelectionToString(positivity_limiter);
   run_cfg.opts.zhang_shu_points = ZhangShuPointSetToString(zhang_shu_points);
   run_cfg.igr_opts = igr_opts;
   run_cfg.device_backend = ParseDeviceBackend(opts.device);

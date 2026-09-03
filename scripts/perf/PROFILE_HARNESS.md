@@ -235,9 +235,12 @@ python3 scripts/perf/profile_harness.py \
   --ncu-nvtx-include 'HDG\/condensation/' \
   --require-data report=capture.ncu-rep \
   --arg=--mode --arg igr --arg=--engine --arg tensor \
+  --arg=--time-integrator --arg rodas3 \
   --arg=--trace-policy --arg engine-default \
   --arg=--order --arg 3 --arg=--mesh-n --arg 52 \
   --arg=--domain-periods --arg 1 --arg=--dt --arg 1e-5 \
+  --arg=--time-atol --arg 1e-10 \
+  --arg=--time-rtol --arg 1e-6 \
   --arg=--newton-linear-rtol --arg 1e-10 \
   --arg=--final-linear-rtol --arg 3e-11 \
   --arg=--true-residual-tightening-linear-rtol --arg 1e-12 \

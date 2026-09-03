@@ -1748,6 +1748,54 @@ bool CheckProductProtocolAndIncarnationABA()
   return passed;
 }
 
+bool CheckAbandonedRetryAdmitsFreshTimestep()
+{
+  Contract contract = MakeContract();
+  const BeginOutcome initial =
+      contract.BeginStep({InteriorSpace::l2, 0.125});
+  auto initial_products = IssueAll(contract, initial.attempt);
+  AttemptReport rejected = PassingReport(12);
+  rejected.gates.success = false;
+  const AttemptOutcome rolled_back = contract.FinishAttempt(
+      initial.attempt, rejected, std::move(initial_products));
+
+  const StateCoordinates coordinates_before = contract.coordinates();
+  Slot published_before{};
+  const bool published_captured = CopyPublished(contract, published_before);
+  const bool abandoned = contract.AbandonRetry();
+  const bool duplicate_rejected = !contract.AbandonRetry();
+  Slot published_after{};
+  const bool published_preserved = CopyPublished(contract, published_after);
+
+  constexpr double replacement_dt = 0.03125;
+  const BeginOutcome replacement =
+      contract.BeginStep({InteriorSpace::l2, replacement_dt});
+  const bool stored = replacement.started &&
+      StoreCandidate(contract, replacement.attempt, AcceptedSlot());
+  auto replacement_products = replacement.started
+      ? IssueAll(contract, replacement.attempt)
+      : Contract::ProductBundle{};
+  const AttemptOutcome committed = replacement.started
+      ? contract.FinishAttempt(
+            replacement.attempt, PassingReport(14),
+            std::move(replacement_products))
+      : AttemptOutcome{};
+  const StateCoordinates expected{1.0 + replacement_dt, 5, 8, 14,
+                                  replacement_dt};
+
+  return Check(
+      initial.started && rolled_back.retry_available &&
+          published_captured && abandoned && duplicate_rejected &&
+          published_preserved &&
+          published_after.interior == published_before.interior &&
+          published_after.trace == published_before.trace &&
+          SameCoordinates(coordinates_before, InitialCoordinates()) &&
+          replacement.started && replacement.attempt.retry_index == 0 &&
+          replacement.attempt.dt == replacement_dt && stored &&
+          committed.committed && SameCoordinates(contract.coordinates(), expected),
+      "abandoned_exact_retry_admits_fresh_primary_timestep");
+}
+
 bool CheckStaleFinishIsolation()
 {
   bool passed = true;
@@ -4482,6 +4530,7 @@ int main()
   passed = CheckStaticSelectionAndCollectiveAdmission() && passed;
   passed = CheckCapabilitiesAndFailureAtomicPublication() && passed;
   passed = CheckProductProtocolAndIncarnationABA() && passed;
+  passed = CheckAbandonedRetryAdmitsFreshTimestep() && passed;
   passed = CheckStaleFinishIsolation() && passed;
   passed = CheckFirstFailureAcrossSuccessfulRetry() && passed;
   passed = CheckResidualTelemetryAndCollectiveTruth() && passed;

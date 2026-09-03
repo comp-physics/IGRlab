@@ -17,11 +17,13 @@ namespace dg_sim::hdg
 /** Typed time/control pairing retained by one resolved general Euler case. */
 enum class HdgEulerTimeMode
 {
-  FixedBackwardEuler,
-  CFLBackwardEuler,
-  FixedPartitionedBackwardEuler,
-  CFLPartitionedBackwardEuler,
-  IMEXReserved
+  FixedBackwardEuler = 0,
+  CFLBackwardEuler = 1,
+  FixedPartitionedBackwardEuler = 2,
+  CFLPartitionedBackwardEuler = 3,
+  IMEXReserved = 4,
+  FixedRodas3 = 5,
+  AdaptiveRodas3 = 6
 };
 
 /** Intent only: publication implementation and fields remain caller-owned. */

@@ -19,6 +19,7 @@
 namespace dg::hdg::runtime::cpu::detail
 {
 class CpuNumericsCore;
+struct CpuQualificationTestAccess;
 }
 
 namespace dg::hdg::runtime::cpu
@@ -32,7 +33,8 @@ enum class GenericEulerCpuSessionStatus : std::uint8_t
   committed,
   aborted,
   advanced,
-  rejected
+  rejected,
+  restored
 };
 
 /** Compact committed-time coordinates; no history or runtime evidence leaks. */
@@ -60,6 +62,38 @@ struct GenericEulerCpuInteriorBuffer
 };
 
 class GenericEulerHdgCpuSession;
+
+/**
+ * Move-only committed checkpoint for one distributed generic CPU session.
+ *
+ * The compact public handle owns an opaque rank-local payload containing the
+ * complete dynamic interior and true-trace coefficient arrays together with
+ * their rank-common descriptor and committed coordinates.  It deliberately
+ * exposes neither solver evidence nor attempt history.  Application-level
+ * serialization is owned by the caller and is not part of this seam.
+ */
+class GenericEulerCpuCheckpoint
+{
+public:
+  GenericEulerCpuCheckpoint() noexcept;
+  ~GenericEulerCpuCheckpoint();
+  GenericEulerCpuCheckpoint(const GenericEulerCpuCheckpoint&) = delete;
+  GenericEulerCpuCheckpoint& operator=(const GenericEulerCpuCheckpoint&) =
+      delete;
+  GenericEulerCpuCheckpoint(GenericEulerCpuCheckpoint&&) noexcept;
+  GenericEulerCpuCheckpoint& operator=(GenericEulerCpuCheckpoint&&) noexcept;
+
+  bool valid() const noexcept;
+  GenericEulerCpuSessionCoordinates coordinates() const noexcept;
+
+private:
+  struct Storage;
+  std::unique_ptr<Storage> storage_{};
+
+  bool SameStateForTests(const GenericEulerCpuCheckpoint&) const noexcept;
+  friend class GenericEulerHdgCpuSession;
+  friend struct detail::CpuQualificationTestAccess;
+};
 
 /**
  * Backend-specific, move-only authority for one prepared CPU candidate.
@@ -126,6 +160,27 @@ public:
   GenericEulerCpuSessionResult Commit(GenericEulerCpuPreparedStep&&) noexcept;
   GenericEulerCpuSessionResult Abort(GenericEulerCpuPreparedStep&&) noexcept;
   GenericEulerCpuSessionResult Advance(double dt) noexcept;
+  /**
+   * Capture one full committed state collectively.  Capture is admitted only
+   * after a successful commit and while no prepared candidate is live.
+   */
+  bool CaptureCheckpoint(GenericEulerCpuCheckpoint&) noexcept;
+  /**
+   * Restore a checkpoint collectively into a freshly initialized compatible
+   * session.  Configuration, topology, partition, layout, and state hashes
+   * must match exactly before the complete state is published.
+   */
+  GenericEulerCpuSessionResult Restore(
+      const GenericEulerCpuCheckpoint&) noexcept;
+  /**
+   * Collectively assess the live prepared embedded candidate.  This exposes
+   * only time-controller inputs and never publishes the candidate or solver
+   * evidence.
+   */
+  bool AssessPrepared(
+      const GenericEulerCpuPreparedStep&,
+      generic::HdgEulerPreparedAssessmentPolicy,
+      generic::HdgEulerPreparedAssessment&) noexcept;
   GenericEulerCpuSessionCoordinates coordinates() const noexcept;
   std::uint32_t capabilities() const noexcept;
   /** Trace-inclusive diagnostics for the generation-bound committed state. */
@@ -155,6 +210,10 @@ private:
   GenericEulerCpuSessionCoordinates coordinates_{};
   generic::HdgEulerCommittedDiagnostics diagnostics_{};
   std::uint64_t session_epoch_ = 0;
+  std::uint64_t prepared_generation_ = 0;
+  // RODAS3 publication requires an explicit generation-bound temporal and
+  // algebraic assessment.  Other time treatments retain their legacy path.
+  std::uint64_t assessed_generation_ = 0;
   bool initialization_attempted_ = false;
   bool initialized_ = false;
 };

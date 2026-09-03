@@ -31,11 +31,17 @@ struct CommonOptions
   std::string hdg_cuda_engine = "ordinary";
   ///< CUDA HDG engine: ordinary | tensor; ordinary remains the default.
   double hdg_igr_alpha = 1.0;
-  ///< HDG IGR-extension alpha; used only with --discretization hdg --regularization igr.
+  ///< Dimensionless HDG IGR C_alpha, mesh-scaled by the case length policy.
   double hdg_igr_beta = 1.0;
-  ///< HDG IGR-extension beta; used only with --discretization hdg --regularization igr.
+  ///< Numerical Euler U4 trace penalty used by HDG IGR; not a physical scalar.
   std::string time_integrator;
   ///< Time-integrator selector; empty selects the discretization default.
+  mfem::real_t time_atol = 1.0e-8;
+  ///< Differential-state absolute tolerance for embedded adaptive stepping.
+  mfem::real_t time_rtol = 1.0e-5;
+  ///< Differential-state relative tolerance for embedded adaptive stepping.
+  std::string positivity_limiter = "case";
+  ///< Positivity limiter selector: case | none | zhang-shu.
   std::string zhang_shu_points =
     "consumer"; ///< Zhang-Shu point set: "consumer" or "quadrature".
   std::string dgsem_stab =
@@ -76,6 +82,10 @@ struct CommonOptions
   std::string restart_vtk; ///< PVD file or dataset directory to restart from.
   int restart_cycle = -1;  ///< Selected PVD cycle; -1 selects the latest cycle.
   int restart_step = -1;   ///< Completed global step for legacy VTK cycles.
+  std::string hdg_checkpoint;
+  ///< Optional rolling committed-boundary HDG checkpoint artifact.
+  std::string hdg_restart_checkpoint;
+  ///< Optional HDG checkpoint artifact to restore before time integration.
 };
 
 /**
@@ -126,17 +136,33 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.hdg_igr_alpha,
                  "-hia",
                  "--hdg-igr-alpha",
-                 "HDG IGR-extension alpha (finite and positive; default 1.0).");
+                 "Dimensionless HDG IGR C_alpha; the case mesh-length policy "
+                 "sets the physical alpha=C_alpha*h_eff^2 (default 1.0).");
   args.AddOption(&opts.hdg_igr_beta,
                  "-hib",
                  "--hdg-igr-beta",
-                 "HDG IGR-extension beta (finite and positive; default 1.0).");
+                 "HDG numerical Euler U4 trace penalty (finite and positive; "
+                 "not a second physical IGR scalar; default 1.0).");
   args.AddOption(&opts.time_integrator,
                  "-ti",
                  "--time-integrator",
                  "Time integrator: rk3ssp | backward-euler | "
-                 "partitioned-backward-euler "
+                 "partitioned-backward-euler | rodas3 "
                  "(discretization support required).");
+  args.AddOption(&opts.time_atol,
+                 "-tatol",
+                 "--time-atol",
+                 "Absolute differential-state tolerance for adaptive RODAS3.");
+  args.AddOption(&opts.time_rtol,
+                 "-trtol",
+                 "--time-rtol",
+                 "Relative differential-state tolerance for adaptive RODAS3.");
+  args.AddOption(&opts.positivity_limiter,
+                 "-pl",
+                 "--positivity-limiter",
+                 "Positivity limiter: case | none | zhang-shu. 'case' "
+                 "preserves the case default when the selected integrator "
+                 "supports limiting; HDG limiting is RODAS3-only.");
   args.AddOption(&opts.zhang_shu_points,
                  "-zsp",
                  "--zhang-shu-points",
@@ -171,7 +197,9 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.dt,
                  "-dt",
                  "--time-step",
-                 "Time step. Positive number skips CFL timestep calculation.");
+                 "Time step. Positive selects fixed stepping; nonpositive "
+                 "selects CFL for Backward Euler, while negative supplies the "
+                 "initial adaptive RODAS3 step magnitude.");
   args.AddOption(&opts.dt_min,
                  "-dtmin",
                  "--dt-min",
@@ -272,6 +300,16 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-restart-step",
                  "--restart-step",
                  "Completed global RK step for legacy cycles without a manifest.");
+  args.AddOption(&opts.hdg_checkpoint,
+                 "-hdg-checkpoint",
+                 "--hdg-checkpoint",
+                 "Rolling committed-boundary HDG checkpoint artifact path; "
+                 "empty disables checkpoint publication.");
+  args.AddOption(&opts.hdg_restart_checkpoint,
+                 "-hdg-restart-checkpoint",
+                 "--hdg-restart-checkpoint",
+                 "Restore a committed HDG checkpoint artifact before time "
+                 "integration; empty disables checkpoint restore.");
 }
 
 /**

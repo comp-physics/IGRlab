@@ -209,6 +209,163 @@ add_hdg_main_cfl_process_test(
   cpu-partitioned-backward-euler-igr-p2-rank1-cfl
   cpu ordinary igr 2 1 4 partitioned-backward-euler)
 
+add_test(NAME dg_igr_hdg_main_backend_cpu_rodas3_fixed_rank1
+  COMMAND "${CMAKE_COMMAND}"
+    "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+    "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cpu-rodas3-fixed-rank1-output"
+    "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+    "-DHDG_MAIN_DEVICE=cpu"
+    "-DHDG_MAIN_REGULARIZATION=none"
+    "-DHDG_MAIN_ORDER=1"
+    "-DHDG_MAIN_N=3"
+    "-DHDG_MAIN_RANKS=1"
+    "-DHDG_MAIN_TIME_INTEGRATOR=rodas3"
+    "-DHDG_MAIN_DT=0.00001"
+    "-DHDG_MAIN_T_FINAL=0.00001"
+    "-DHDG_MAIN_EXPECTED_STEPS=1"
+    "-DHDG_MAIN_EXPECTED_FINAL_TIME=1e-05"
+    "-DHDG_MAIN_NO_VTK=ON"
+    "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+    "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+set_tests_properties(dg_igr_hdg_main_backend_cpu_rodas3_fixed_rank1 PROPERTIES
+  LABELS "hdg;main-backend;cpu;rodas3;fixed-step;process"
+  PROCESSORS 1
+  RESOURCE_LOCK hdg_generic_euler_cpu
+  TIMEOUT 1200)
+
+add_test(NAME dg_igr_hdg_main_backend_cpu_backward_euler_rejects_zhang_shu_rank1
+  COMMAND "${CMAKE_COMMAND}"
+    "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+    "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cpu-backward-euler-rejects-zhang-shu-rank1-output"
+    "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+    "-DHDG_MAIN_DEVICE=cpu"
+    "-DHDG_MAIN_REGULARIZATION=none"
+    "-DHDG_MAIN_ORDER=1"
+    "-DHDG_MAIN_N=3"
+    "-DHDG_MAIN_RANKS=1"
+    "-DHDG_MAIN_TIME_INTEGRATOR=backward-euler"
+    "-DHDG_MAIN_POSITIVITY_LIMITER=zhang-shu"
+    "-DHDG_MAIN_DT=0.00001"
+    "-DHDG_MAIN_T_FINAL=0.00001"
+    "-DHDG_MAIN_NO_VTK=ON"
+    "-DHDG_MAIN_EXPECT_REJECTION_PATTERN=RODAS3-only typed opt-in"
+    "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+    "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+set_tests_properties(
+  dg_igr_hdg_main_backend_cpu_backward_euler_rejects_zhang_shu_rank1
+  PROPERTIES
+    LABELS "hdg;main-backend;cpu;backward-euler;zhang-shu;negative;process"
+    PROCESSORS 1
+    RESOURCE_LOCK hdg_generic_euler_cpu
+    TIMEOUT 1200)
+
+add_test(NAME dg_igr_hdg_main_backend_cpu_rejects_conflicting_c_alpha_rank1
+  COMMAND "${CMAKE_COMMAND}"
+    "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+    "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cpu-rejects-conflicting-c-alpha-rank1-output"
+    "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+    "-DHDG_MAIN_DEVICE=cpu"
+    "-DHDG_MAIN_REGULARIZATION=igr"
+    "-DHDG_MAIN_ORDER=1"
+    "-DHDG_MAIN_N=3"
+    "-DHDG_MAIN_RANKS=1"
+    "-DHDG_MAIN_TIME_INTEGRATOR=rodas3"
+    "-DHDG_MAIN_C_ALPHA=0.5"
+    "-DHDG_MAIN_HDG_IGR_ALPHA=1.0"
+    "-DHDG_MAIN_DT=0.00001"
+    "-DHDG_MAIN_T_FINAL=0.00001"
+    "-DHDG_MAIN_NO_VTK=ON"
+    "-DHDG_MAIN_EXPECT_REJECTION_PATTERN=Conflicting HDG IGR C_alpha values"
+    "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+    "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+set_tests_properties(
+  dg_igr_hdg_main_backend_cpu_rejects_conflicting_c_alpha_rank1
+  PROPERTIES
+    LABELS "hdg;main-backend;cpu;igr;c-alpha;negative;process"
+    PROCESSORS 1
+    RESOURCE_LOCK hdg_generic_euler_cpu
+    TIMEOUT 1200)
+
+add_test(NAME dg_igr_hdg_main_backend_cpu_rodas3_adaptive_rejection_rank1
+  COMMAND "${CMAKE_COMMAND}"
+    "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+    "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cpu-rodas3-adaptive-rejection-rank1-output"
+    "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+    "-DHDG_MAIN_DEVICE=cpu"
+    "-DHDG_MAIN_REGULARIZATION=none"
+    "-DHDG_MAIN_ORDER=1"
+    "-DHDG_MAIN_N=3"
+    "-DHDG_MAIN_RANKS=1"
+    "-DHDG_MAIN_TIME_INTEGRATOR=rodas3"
+    "-DHDG_MAIN_POSITIVITY_LIMITER=zhang-shu"
+    "-DHDG_MAIN_ZHANG_SHU_POINTS=quadrature"
+    "-DHDG_MAIN_EXPECT_POSITIVITY_LIMITER=zhang-shu"
+    "-DHDG_MAIN_EXPECT_ZHANG_SHU_POINTS=quadrature"
+    "-DHDG_MAIN_VTK_ZHANG_SHU_DIAGNOSTICS=ON"
+    "-DHDG_MAIN_EXPECT_ZHANG_SHU_FIELDS=ON"
+    "-DHDG_MAIN_DT=-0.001"
+    "-DHDG_MAIN_DT_MIN=1e-8"
+    "-DHDG_MAIN_TIME_ATOL=1e-10"
+    "-DHDG_MAIN_TIME_RTOL=1e-10"
+    "-DHDG_MAIN_T_FINAL=0.001"
+    "-DHDG_MAIN_DT_SAVE=0.001"
+    "-DHDG_MAIN_EXPECTED_STEPS=[1-9][0-9]*"
+    "-DHDG_MAIN_EXPECTED_REJECTIONS=[1-9][0-9]*"
+    "-DHDG_MAIN_EXPECTED_FINAL_TIME=0\\.001"
+    "-DHDG_MAIN_EXPECTED_CYCLES=000000,000001"
+    "-DHDG_MAIN_EXPECTED_TIMES=0,0.001"
+    "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+    "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+set_tests_properties(
+  dg_igr_hdg_main_backend_cpu_rodas3_adaptive_rejection_rank1 PROPERTIES
+    LABELS "hdg;main-backend;cpu;rodas3;adaptive;rejection;rollback;output-landing;zhang-shu;limiter-diagnostics;process"
+    PROCESSORS 1
+    RESOURCE_LOCK hdg_generic_euler_cpu
+    TIMEOUT 1200)
+
+# Exercise the production CPU output-presence consensus inside a genuine
+# adaptive two-rank transaction.  The first proposal is clipped to the
+# intermediate publication boundary and rejected before a smaller accepted
+# retry; exact output cycles prove that rollback did not publish or advance.
+add_test(NAME dg_igr_hdg_main_backend_cpu_rodas3_adaptive_intermediate_output_rank2
+  COMMAND "${CMAKE_COMMAND}"
+    "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+    "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cpu-rodas3-adaptive-intermediate-output-rank2-output"
+    "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+    "-DHDG_MAIN_DEVICE=cpu"
+    "-DHDG_MAIN_REGULARIZATION=none"
+    "-DHDG_MAIN_ORDER=1"
+    "-DHDG_MAIN_N=3"
+    "-DHDG_MAIN_RANKS=2"
+    "-DHDG_MAIN_TIME_INTEGRATOR=rodas3"
+    "-DHDG_MAIN_DT=-0.001"
+    "-DHDG_MAIN_DT_MIN=1e-8"
+    "-DHDG_MAIN_TIME_ATOL=1e-10"
+    "-DHDG_MAIN_TIME_RTOL=1e-10"
+    "-DHDG_MAIN_T_FINAL=0.001"
+    "-DHDG_MAIN_DT_SAVE=0.00099"
+    "-DHDG_MAIN_EXPECTED_STEPS=[1-9][0-9]*"
+    "-DHDG_MAIN_EXPECTED_REJECTIONS=[1-9][0-9]*"
+    "-DHDG_MAIN_EXPECTED_FINAL_TIME=0\\.001"
+    "-DHDG_MAIN_EXPECTED_CYCLES=000000,000001,000002"
+    "-DHDG_MAIN_EXPECTED_TIMES=0,0.00099,0.001"
+    "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+    "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+    "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+    "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+set_tests_properties(
+  dg_igr_hdg_main_backend_cpu_rodas3_adaptive_intermediate_output_rank2
+  PROPERTIES
+    LABELS "hdg;main-backend;cpu;rodas3;rank2;mpi;adaptive;rejection;rollback;output-clipping;intermediate-output;process"
+    PROCESSORS 2
+    RESOURCE_LOCK hdg_generic_euler_cpu
+    TIMEOUT 1200)
+
 if(NOT TARGET dgsem_smooth_advection OR
    NOT TARGET hdg_smooth_transition_research)
   message(FATAL_ERROR
@@ -332,6 +489,33 @@ set_tests_properties(
     PROCESSORS 1
     RESOURCE_LOCK hdg_generic_euler_cpu
     TIMEOUT 300)
+
+if(TARGET sedov_taylor_blast)
+  add_test(NAME dg_igr_hdg_main_backend_cpu_rodas3_igr_sedov_p1_rank1_fixed
+    COMMAND $<TARGET_FILE:sedov_taylor_blast>
+      --discretization hdg
+      --device cpu
+      --regularization igr
+      --time-integrator rodas3
+      --positivity-limiter none
+      --hdg-igr-alpha 1
+      --mesh ${PROJECT_SOURCE_DIR}/examples/sedov_taylor_blast/sedov_taylor.msh
+      --order 1
+      --serial-refine 0
+      --parallel-refine 0
+      --time-step 0.000001
+      --t-final 0.000001
+      --no-vtk_save
+      --no-glvis)
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cpu_rodas3_igr_sedov_p1_rank1_fixed PROPERTIES
+      LABELS "hdg;main-backend;cpu;igr;rodas3;sedov;p1;rank1;slip;fixed-step;limiter-off;no-vtk;application"
+      PASS_REGULAR_EXPRESSION
+        "\\[hdg-main\\] status=Success step=1.*time=1e-06.*time_treatment=rodas3.*regularization=igr.*c_alpha=1"
+      PROCESSORS 1
+      RESOURCE_LOCK hdg_generic_euler_cpu
+      TIMEOUT 1200)
+endif()
 endif()
 
 if(MFEM_USE_CUDA)
@@ -607,6 +791,37 @@ if(MFEM_USE_CUDA)
         TIMEOUT 1200)
   endforeach()
 
+  # Exercise the application-level default rather than only parser/config
+  # defaults: the process fixture expects Backward Euler in status telemetry
+  # while deliberately omitting --time-integrator from the launched command.
+  add_test(NAME dg_igr_hdg_main_backend_cuda_default_backward_euler_rank1
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-default-backward-euler-rank1-output"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+      "-DHDG_MAIN_DEVICE=cuda"
+      "-DHDG_MAIN_CUDA_ENGINE=ordinary"
+      "-DHDG_MAIN_REGULARIZATION=none"
+      "-DHDG_MAIN_ORDER=1"
+      "-DHDG_MAIN_N=3"
+      "-DHDG_MAIN_RANKS=1"
+      "-DHDG_MAIN_TIME_INTEGRATOR=backward-euler"
+      "-DHDG_MAIN_OMIT_TIME_INTEGRATOR=ON"
+      "-DHDG_MAIN_DT=0.00001"
+      "-DHDG_MAIN_T_FINAL=0.00001"
+      "-DHDG_MAIN_EXPECTED_STEPS=1"
+      "-DHDG_MAIN_EXPECTED_FINAL_TIME=1e-05"
+      "-DHDG_MAIN_NO_VTK=ON"
+      "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_default_backward_euler_rank1 PROPERTIES
+      LABELS "hdg;main-backend;cuda;ordinary;conventional;backward-euler;default;rank1;fixed-step;process;no-vtk"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1200)
+
   add_test(NAME dg_igr_hdg_main_backend_cuda_igr_vtk_rank1
     COMMAND "${CMAKE_COMMAND}"
       "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
@@ -842,10 +1057,245 @@ if(MFEM_USE_CUDA)
     cuda-tensor-partitioned-backward-euler-igr-p2-rank2-parallel-refine
     tensor igr 2 parallel partitioned-backward-euler)
 
+  # RODAS3 remains an explicit opt-in.  Keep its production-entry matrix
+  # compact because the direct runtime qualification below this application
+  # seam owns the p1--p3, boundary/source, and engine-alignment coverage.
+  add_test(NAME dg_igr_hdg_main_backend_cuda_ordinary_rodas3_conventional_p1_rank1_fixed
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-ordinary-rodas3-conventional-p1-rank1-fixed-output"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+      "-DHDG_MAIN_DEVICE=cuda"
+      "-DHDG_MAIN_CUDA_ENGINE=ordinary"
+      "-DHDG_MAIN_REGULARIZATION=none"
+      "-DHDG_MAIN_ORDER=1"
+      "-DHDG_MAIN_N=3"
+      "-DHDG_MAIN_RANKS=1"
+      "-DHDG_MAIN_TIME_INTEGRATOR=rodas3"
+      "-DHDG_MAIN_DT=0.000001"
+      "-DHDG_MAIN_T_FINAL=0.000001"
+      "-DHDG_MAIN_EXPECTED_STEPS=1"
+      "-DHDG_MAIN_EXPECTED_FINAL_TIME=1e-06"
+      "-DHDG_MAIN_NO_VTK=ON"
+      "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_ordinary_rodas3_conventional_p1_rank1_fixed
+    PROPERTIES
+      LABELS "hdg;main-backend;cuda;ordinary;conventional;rodas3;p1;rank1;fixed-step;process;no-vtk"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1200)
+
+  add_test(NAME dg_igr_hdg_main_backend_cuda_tensor_rodas3_igr_p2_rank1_fixed
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-tensor-rodas3-igr-p2-rank1-fixed-output"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+      "-DHDG_MAIN_DEVICE=cuda"
+      "-DHDG_MAIN_CUDA_ENGINE=tensor"
+      "-DHDG_MAIN_REGULARIZATION=igr"
+      "-DHDG_MAIN_ORDER=2"
+      "-DHDG_MAIN_N=3"
+      "-DHDG_MAIN_RANKS=1"
+      "-DHDG_MAIN_TIME_INTEGRATOR=rodas3"
+      "-DHDG_MAIN_C_ALPHA=0.5"
+      "-DHDG_MAIN_EXPECT_C_ALPHA=0.5"
+      "-DHDG_MAIN_POSITIVITY_LIMITER=zhang-shu"
+      "-DHDG_MAIN_ZHANG_SHU_POINTS=quadrature"
+      "-DHDG_MAIN_EXPECT_POSITIVITY_LIMITER=zhang-shu"
+      "-DHDG_MAIN_EXPECT_ZHANG_SHU_POINTS=quadrature"
+      "-DHDG_MAIN_VTK_ZHANG_SHU_DIAGNOSTICS=ON"
+      "-DHDG_MAIN_EXPECT_ZHANG_SHU_FIELDS=ON"
+      "-DHDG_MAIN_DT=0.000001"
+      "-DHDG_MAIN_T_FINAL=0.000001"
+      "-DHDG_MAIN_DT_SAVE=0.000001"
+      "-DHDG_MAIN_EXPECTED_STEPS=1"
+      "-DHDG_MAIN_EXPECTED_FINAL_TIME=1e-06"
+      "-DHDG_MAIN_EXPECTED_CYCLES=000000,000001"
+      "-DHDG_MAIN_EXPECTED_TIMES=0,1e-06"
+      "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_tensor_rodas3_igr_p2_rank1_fixed
+    PROPERTIES
+      LABELS "hdg;main-backend;cuda;tensor;igr;rodas3;p2;rank1;fixed-step;vtk;zhang-shu;limiter-diagnostics;process"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1200)
+
+  add_test(NAME dg_igr_hdg_main_backend_cuda_tensor_rodas3_igr_p1_rank2_fixed
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-tensor-rodas3-igr-p1-rank2-fixed-output"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+      "-DHDG_MAIN_DEVICE=cuda"
+      "-DHDG_MAIN_CUDA_ENGINE=tensor"
+      "-DHDG_MAIN_REGULARIZATION=igr"
+      "-DHDG_MAIN_ORDER=1"
+      "-DHDG_MAIN_N=3"
+      "-DHDG_MAIN_RANKS=2"
+      "-DHDG_MAIN_TIME_INTEGRATOR=rodas3"
+      "-DHDG_MAIN_DT=0.000001"
+      "-DHDG_MAIN_T_FINAL=0.000001"
+      "-DHDG_MAIN_EXPECTED_STEPS=1"
+      "-DHDG_MAIN_EXPECTED_FINAL_TIME=1e-06"
+      "-DHDG_MAIN_NO_VTK=ON"
+      "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+      "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_tensor_rodas3_igr_p1_rank2_fixed
+    PROPERTIES
+      LABELS "hdg;main-backend;cuda;tensor;igr;rodas3;p1;rank2;mpi;host-staged;fixed-step;process;no-vtk"
+      PROCESSORS 2
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1200)
+
+  # Keep the adaptive rank-two production entry independent of the fixed-step
+  # host-staged gate above.  The strict embedded tolerance makes the initial
+  # horizon-sized proposal reject before a smaller proposal is accepted, while
+  # --no-vtk_save keeps this MPI lifecycle check bounded.
+  add_test(NAME dg_igr_hdg_main_backend_cuda_tensor_rodas3_igr_p1_rank2_adaptive_rejection
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-tensor-rodas3-igr-p1-rank2-adaptive-rejection-output"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+      "-DHDG_MAIN_DEVICE=cuda"
+      "-DHDG_MAIN_CUDA_ENGINE=tensor"
+      "-DHDG_MAIN_REGULARIZATION=igr"
+      "-DHDG_MAIN_ORDER=1"
+      "-DHDG_MAIN_N=3"
+      "-DHDG_MAIN_RANKS=2"
+      "-DHDG_MAIN_TIME_INTEGRATOR=rodas3"
+      "-DHDG_MAIN_DT=-0.001"
+      "-DHDG_MAIN_DT_MIN=1e-8"
+      "-DHDG_MAIN_TIME_ATOL=1e-10"
+      "-DHDG_MAIN_TIME_RTOL=1e-10"
+      "-DHDG_MAIN_T_FINAL=0.001"
+      "-DHDG_MAIN_EXPECTED_STEPS=[1-9][0-9]*"
+      "-DHDG_MAIN_EXPECTED_REJECTIONS=[1-9][0-9]*"
+      "-DHDG_MAIN_EXPECTED_FINAL_TIME=0\\.001"
+      "-DHDG_MAIN_NO_VTK=ON"
+      "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      "-DHDG_MAIN_MPIEXEC_PREFLAGS=${MPIEXEC_PREFLAGS}"
+      "-DHDG_MAIN_MPIEXEC_POSTFLAGS=${MPIEXEC_POSTFLAGS}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_tensor_rodas3_igr_p1_rank2_adaptive_rejection
+    PROPERTIES
+      LABELS "hdg;main-backend;cuda;tensor;igr;rodas3;p1;rank2;mpi;host-staged;adaptive;rejection;rollback;process;no-vtk"
+      PROCESSORS 2
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1200)
+
+  add_test(NAME dg_igr_hdg_main_backend_cuda_tensor_rodas3_conventional_p1_rank1_adaptive_rejection
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-tensor-rodas3-conventional-p1-rank1-adaptive-rejection-output"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+      "-DHDG_MAIN_DEVICE=cuda"
+      "-DHDG_MAIN_CUDA_ENGINE=tensor"
+      "-DHDG_MAIN_REGULARIZATION=none"
+      "-DHDG_MAIN_ORDER=1"
+      "-DHDG_MAIN_N=3"
+      "-DHDG_MAIN_RANKS=1"
+      "-DHDG_MAIN_TIME_INTEGRATOR=rodas3"
+      "-DHDG_MAIN_DT=-0.001"
+      "-DHDG_MAIN_DT_MIN=1e-8"
+      "-DHDG_MAIN_TIME_ATOL=1e-10"
+      "-DHDG_MAIN_TIME_RTOL=1e-10"
+      "-DHDG_MAIN_T_FINAL=0.001"
+      "-DHDG_MAIN_DT_SAVE=0.001"
+      "-DHDG_MAIN_EXPECTED_STEPS=[1-9][0-9]*"
+      "-DHDG_MAIN_EXPECTED_REJECTIONS=[1-9][0-9]*"
+      "-DHDG_MAIN_EXPECTED_FINAL_TIME=0\\.001"
+      "-DHDG_MAIN_EXPECTED_CYCLES=000000,000001"
+      "-DHDG_MAIN_EXPECTED_TIMES=0,0.001"
+      "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_tensor_rodas3_conventional_p1_rank1_adaptive_rejection
+    PROPERTIES
+      LABELS "hdg;main-backend;cuda;tensor;conventional;rodas3;p1;rank1;adaptive;rejection;rollback;output-landing;process"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1200)
+
+  # The nominal 1e-3 controller proposal is first clipped to the 9.9e-4
+  # intermediate publication boundary.  A strict embedded-error gate forces
+  # rejection/retry around that clipped plan; exact three-cycle publication
+  # checks then prove that rollback did not advance or duplicate output.
+  add_test(NAME dg_igr_hdg_main_backend_cuda_tensor_rodas3_conventional_p1_rank1_adaptive_intermediate_output_rejection
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+      "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cuda-tensor-rodas3-conventional-p1-rank1-adaptive-intermediate-output-rejection-output"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+      "-DHDG_MAIN_DEVICE=cuda"
+      "-DHDG_MAIN_CUDA_ENGINE=tensor"
+      "-DHDG_MAIN_REGULARIZATION=none"
+      "-DHDG_MAIN_ORDER=1"
+      "-DHDG_MAIN_N=3"
+      "-DHDG_MAIN_RANKS=1"
+      "-DHDG_MAIN_TIME_INTEGRATOR=rodas3"
+      "-DHDG_MAIN_DT=-0.001"
+      "-DHDG_MAIN_DT_MIN=1e-8"
+      "-DHDG_MAIN_TIME_ATOL=1e-10"
+      "-DHDG_MAIN_TIME_RTOL=1e-10"
+      "-DHDG_MAIN_T_FINAL=0.001"
+      "-DHDG_MAIN_DT_SAVE=0.00099"
+      "-DHDG_MAIN_EXPECTED_STEPS=[1-9][0-9]*"
+      "-DHDG_MAIN_EXPECTED_REJECTIONS=[1-9][0-9]*"
+      "-DHDG_MAIN_EXPECTED_FINAL_TIME=0\\.001"
+      "-DHDG_MAIN_EXPECTED_CYCLES=000000,000001,000002"
+      "-DHDG_MAIN_EXPECTED_TIMES=0,0.00099,0.001"
+      "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+      "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_tensor_rodas3_conventional_p1_rank1_adaptive_intermediate_output_rejection
+    PROPERTIES
+      LABELS "hdg;main-backend;cuda;tensor;conventional;rodas3;p1;rank1;adaptive;rejection;rollback;output-clipping;intermediate-output;process"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1200)
+
   # Five fixed steps are the common admissible short cylinder interval used by
   # the architecture bake-off.  This is the production application and mesh,
   # with output disabled so the gate remains a bounded evolution check.
   if(TARGET supersonic_cylinder_w_igr)
+    add_test(
+      NAME dg_igr_hdg_main_backend_cuda_tensor_backward_euler_cylinder_p2_rank1
+      COMMAND $<TARGET_FILE:supersonic_cylinder_w_igr>
+        --discretization hdg
+        --device cuda
+        --hdg-cuda-engine tensor
+        --regularization igr
+        --time-integrator backward-euler
+        --mesh ${PROJECT_SOURCE_DIR}/examples/supersonic_example_w_igr/supersonic_cylinder.msh
+        --order 2
+        --serial-refine 0
+        --parallel-refine 0
+        --time-step 0.00001
+        --t-final 0.00005
+        --no-vtk_save
+        --no-glvis)
+    set_tests_properties(
+      dg_igr_hdg_main_backend_cuda_tensor_backward_euler_cylinder_p2_rank1
+      PROPERTIES
+        LABELS "hdg;main-backend;cuda;tensor;igr;backward-euler;monolithic;p2;rank1;physical;cylinder;fixed-step;no-vtk;application"
+        PASS_REGULAR_EXPRESSION
+          "\\[hdg-main\\] status=Success step=5.*time=5e-05.*cuda_engine=tensor.*time_treatment=backward-euler.*fallback_count=0.*regularization=igr.*c_alpha=1.*alpha_effective=0.0104992.*alpha_length_policy=max.*h_eff=0.102466"
+        PROCESSORS 1
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 1200)
+
     add_test(
       NAME dg_igr_hdg_main_backend_cuda_tensor_partitioned_backward_euler_cylinder_p2_rank1
       COMMAND $<TARGET_FILE:supersonic_cylinder_w_igr>
@@ -867,7 +1317,63 @@ if(MFEM_USE_CUDA)
       PROPERTIES
         LABELS "hdg;main-backend;cuda;tensor;igr;partitioned-backward-euler;p2;rank1;physical;cylinder;fixed-step;no-vtk;application"
         PASS_REGULAR_EXPRESSION
-          "\\[hdg-main\\] status=Success step=5.*time=5e-05.*cuda_engine=tensor.*time_treatment=partitioned-backward-euler.*fallback_count=0.*regularization=igr"
+          "\\[hdg-main\\] status=Success step=5.*time=5e-05.*cuda_engine=tensor.*time_treatment=partitioned-backward-euler.*fallback_count=0.*regularization=igr.*c_alpha=1.*alpha_effective=0.0104992.*alpha_length_policy=max.*h_eff=0.102466"
+        PROCESSORS 1
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 1200)
+
+    add_test(
+      NAME dg_igr_hdg_main_backend_cuda_tensor_rodas3_cylinder_p2_rank1
+      COMMAND $<TARGET_FILE:supersonic_cylinder_w_igr>
+        --discretization hdg
+        --device cuda
+        --hdg-cuda-engine tensor
+        --regularization igr
+        --time-integrator rodas3
+        --mesh ${PROJECT_SOURCE_DIR}/examples/supersonic_example_w_igr/supersonic_cylinder.msh
+        --order 2
+        --serial-refine 0
+        --parallel-refine 0
+        --time-step 0.00001
+        --t-final 0.00005
+        --no-vtk_save
+        --no-glvis)
+    set_tests_properties(
+      dg_igr_hdg_main_backend_cuda_tensor_rodas3_cylinder_p2_rank1
+      PROPERTIES
+        LABELS "hdg;main-backend;cuda;tensor;igr;rodas3;p2;rank1;physical;cylinder;fixed-step;no-vtk;application"
+        PASS_REGULAR_EXPRESSION
+          "\\[hdg-main\\] status=Success step=5.*time=5e-05.*cuda_engine=tensor.*time_treatment=rodas3.*fallback_count=0.*regularization=igr.*c_alpha=1.*alpha_effective=0.0104992.*alpha_length_policy=max.*h_eff=0.102466"
+        PROCESSORS 1
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 1200)
+  endif()
+
+  if(TARGET sedov_taylor_blast)
+    add_test(
+      NAME dg_igr_hdg_main_backend_cuda_tensor_rodas3_igr_sedov_p1_rank1_fixed
+      COMMAND $<TARGET_FILE:sedov_taylor_blast>
+        --discretization hdg
+        --device cuda
+        --hdg-cuda-engine tensor
+        --regularization igr
+        --time-integrator rodas3
+        --positivity-limiter none
+        --hdg-igr-alpha 1
+        --mesh ${PROJECT_SOURCE_DIR}/examples/sedov_taylor_blast/sedov_taylor.msh
+        --order 1
+        --serial-refine 0
+        --parallel-refine 0
+        --time-step 0.000001
+        --t-final 0.000001
+        --no-vtk_save
+        --no-glvis)
+    set_tests_properties(
+      dg_igr_hdg_main_backend_cuda_tensor_rodas3_igr_sedov_p1_rank1_fixed
+      PROPERTIES
+        LABELS "hdg;main-backend;cuda;tensor;igr;rodas3;sedov;p1;rank1;slip;fixed-step;limiter-off;no-vtk;application"
+        PASS_REGULAR_EXPRESSION
+          "\\[hdg-main\\] status=Success step=1.*time=1e-06.*cuda_engine=tensor.*time_treatment=rodas3.*fallback_count=0.*regularization=igr.*c_alpha=1"
         PROCESSORS 1
         RESOURCE_LOCK dg_igr_sm120
         TIMEOUT 1200)
@@ -1061,6 +1567,50 @@ if(MFEM_USE_CUDA)
       PROCESSORS 1
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 300)
+
+  add_executable(dg_igr_hdg_main_backend_cuda_checkpoint_split_test
+    test_cuda_checkpoint_split_driver.cu)
+  target_include_directories(
+    dg_igr_hdg_main_backend_cuda_checkpoint_split_test PRIVATE
+      "${PROJECT_SOURCE_DIR}/include")
+  target_compile_definitions(
+    dg_igr_hdg_main_backend_cuda_checkpoint_split_test PRIVATE
+      DG_IGR_HDG_REPOSITORY_ROOT="${PROJECT_SOURCE_DIR}")
+  target_link_libraries(
+    dg_igr_hdg_main_backend_cuda_checkpoint_split_test PRIVATE
+      dg_igr_hdg_main_backend_cuda
+      dg_igr_hdg_runtime_app_contract
+      igr_mfem
+      mfem
+      MPI::MPI_CXX)
+  target_compile_options(
+    dg_igr_hdg_main_backend_cuda_checkpoint_split_test PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  set_target_properties(
+    dg_igr_hdg_main_backend_cuda_checkpoint_split_test PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON
+      CUDA_EXTENSIONS OFF
+      CUDA_ARCHITECTURES 120
+      CUDA_SEPARABLE_COMPILATION ON
+      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+  add_test(NAME dg_igr_hdg_main_backend_cuda_checkpoint_process
+    COMMAND "${CMAKE_COMMAND}"
+      "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_main_backend_cuda_checkpoint_split_test>"
+      "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n6.mesh"
+      "-DHDG_MAIN_WORK=${CMAKE_CURRENT_BINARY_DIR}/cuda-checkpoint-process"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_checkpoint_process.cmake")
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cuda_checkpoint_process PROPERTIES
+      LABELS "hdg;main-backend;cuda;tensor;rodas3;igr;p2;dynamic-checkpoint;restart;corruption;process"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1200)
 
   add_test(NAME dg_igr_hdg_main_backend_preserves_dgsem_cuda_profile
     COMMAND "${CMAKE_COMMAND}"

@@ -27,7 +27,7 @@ function(run_w8c_smoke expected_regularization)
     "\\[hdg-main\\] status=Success.*step=2.*regularization=${expected_regularization}")
   if(expected_regularization STREQUAL "igr")
     set(_expected_status
-      "${_expected_status}.*alpha=0.1.*beta=2.5")
+      "${_expected_status}.*c_alpha=0.1.*alpha_effective=0.0015625.*alpha_length_policy=average.*h_eff=0.125.*euler_trace_penalty=2.5")
   endif()
   if(HDG_W8C_RANKS EQUAL 1)
     execute_process(

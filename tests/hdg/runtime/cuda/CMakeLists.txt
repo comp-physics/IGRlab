@@ -277,6 +277,42 @@ set_target_properties(dg_igr_hdg_runtime_cuda_generic_euler_extension
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
+# Bounded direct numerical/architecture screens for the typed common-shift ROW
+# path. Rank one covers native tensor and ordinary CUDA. The two rank-two tests
+# independently require the established host-staged HYPRE transport for both
+# engines while exercising conventional and IGR candidates transactionally.
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_rodas3_tensor_rank1_architecture_screen
+  COMMAND dg_igr_hdg_runtime_cuda_generic_euler_extension
+    --order 1 --engine tensor --time-treatment rodas3 --rodas3-screen)
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_rodas3_tensor_rank1_architecture_screen
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;generic-euler;rodas3;tensor;rank1;conventional;igr;common-shift;architecture-screen;zhang-shu;limiter;admissibility;closure"
+    PROCESSORS 1
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 1800)
+
+foreach(_engine IN ITEMS ordinary tensor)
+  add_test(
+    NAME dg_igr_hdg_runtime_cuda_rodas3_${_engine}_rank2_architecture_screen
+    COMMAND
+      "${MPIEXEC_EXECUTABLE}"
+      "${MPIEXEC_NUMPROC_FLAG}" 2
+      ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_hdg_runtime_cuda_generic_euler_extension>
+      --order 1 --engine ${_engine} --time-treatment rodas3
+      --rodas3-rank2-screen
+      ${MPIEXEC_POSTFLAGS})
+  set_tests_properties(
+    dg_igr_hdg_runtime_cuda_rodas3_${_engine}_rank2_architecture_screen
+    PROPERTIES
+      LABELS "hdg;runtime;cuda;generic-euler;rodas3;${_engine};rank2;mpi;host-staged;conventional;igr;common-shift;architecture-screen;rollback"
+      PROCESSORS 2
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 1800)
+endforeach()
+
 foreach(_order IN ITEMS 1 2 3)
   add_test(
     NAME dg_igr_hdg_runtime_cuda_generic_euler_extension_p${_order}_rank1
@@ -421,6 +457,23 @@ foreach(_order IN ITEMS 1 2 3)
       PROCESSORS 1
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 7200)
+endforeach()
+
+# RODAS3 reuses the complete CPU/ordinary-CUDA/tensor-CUDA alignment fixture,
+# including conventional and IGR trajectories, prepared assessment, and exact
+# committed-state agreement at every supported polynomial order.
+foreach(_order IN ITEMS 1 2 3)
+  add_test(
+    NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rodas3_p${_order}_rank1
+    COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+      --order ${_order} --time-treatment rodas3)
+  set_tests_properties(
+    dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_rodas3_p${_order}_rank1
+    PROPERTIES
+      LABELS "hdg;runtime;cpu;cuda;generic-euler;alignment;rodas3;ordinary;tensor;igr;conventional;physical;periodic;source;initial-trace;conservation;assessment;p${_order}"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 3600)
 endforeach()
 
 # Winner-specific cross-backend qualification reuses the complete bounded
@@ -622,7 +675,8 @@ set_tests_properties(
 # first, selects MFEM CUDA once, then forms both CUDA engine ladders and
 # compares backend-neutral global error/norm sequences at every h and dt.
 add_executable(dg_igr_hdg_runtime_cuda_generic_euler_convergence
-  test_generic_euler_convergence.cu)
+  test_generic_euler_convergence.cu
+  "${PROJECT_SOURCE_DIR}/src/sim/hdg/parallel_vtk.cpp")
 target_include_directories(
   dg_igr_hdg_runtime_cuda_generic_euler_convergence
   PRIVATE
@@ -652,6 +706,110 @@ set_target_properties(
     CUDA_ARCHITECTURES 120
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+# Test-only, rank-one tensor decision harness.  It keeps the established
+# convergence registrations below unchanged, executes no output path, and
+# compares fixed-horizon RODAS3, monolithic BE, and partitioned BE on an
+# evolving smooth state with active IGR closure.  U4 error is measured against
+# a bounded same-mesh RODAS3 reference and kept above its Richardson
+# uncertainty.  The production C_alpha=1 average-length lowering is mandatory;
+# the engine-default trace policy remains the default and explicit selectors
+# remain available only for bounded ablations.
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_rodas3_equal_error_probe_igr_p3_rank1
+  COMMAND dg_igr_hdg_runtime_cuda_generic_euler_convergence
+    --order 3 --regularization igr
+    --architecture-selection-screen
+    --screen-probe-only
+    --screen-elements 12
+    --screen-final-time 0.08)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_rodas3_equal_error_igr_p3_rank1
+  COMMAND dg_igr_hdg_runtime_cuda_generic_euler_convergence
+    --order 3 --regularization igr
+    --architecture-selection-screen
+    --screen-elements 12
+    --screen-final-time 0.08)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_rodas3_equal_error_with_output_igr_p3_rank1
+  COMMAND dg_igr_hdg_runtime_cuda_generic_euler_convergence
+    --order 3 --regularization igr
+    --architecture-selection-screen
+    --screen-elements 12
+    --screen-final-time 0.08
+    --screen-output-root
+      "${CMAKE_CURRENT_BINARY_DIR}/rodas3-equal-error-output")
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_rodas3_adaptive_equal_error_with_output_igr_p3_rank1
+  COMMAND dg_igr_hdg_runtime_cuda_generic_euler_convergence
+    --order 3 --regularization igr
+    --architecture-selection-screen
+    --adaptive-rodas3-screen
+    --screen-elements 12
+    --screen-final-time 0.08
+    --screen-time-atol 1.0e-10
+    --screen-time-rtol 1.0e-6
+    --screen-initial-dt 0.08
+    --screen-dt-min 1.0e-6
+    --screen-output-root
+      "${CMAKE_CURRENT_BINARY_DIR}/rodas3-adaptive-equal-error-output")
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_rodas3_equal_error_probe_igr_p3_rank1
+  dg_igr_hdg_runtime_cuda_rodas3_equal_error_igr_p3_rank1
+  dg_igr_hdg_runtime_cuda_rodas3_equal_error_with_output_igr_p3_rank1
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;generic-euler;tensor;igr;active-igr;corrected-alpha;same-mesh-reference;rodas3;backward-euler;partitioned-backward-euler;equal-error;architecture-selection;performance;manual;p3"
+    PROCESSORS 1
+    RESOURCE_LOCK dg_igr_sm120
+    SKIP_RETURN_CODE 77
+    TIMEOUT 3600)
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_rodas3_adaptive_equal_error_with_output_igr_p3_rank1
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;generic-euler;tensor;igr;active-igr;corrected-alpha;same-mesh-reference;rodas3;adaptive;backward-euler;partitioned-backward-euler;equal-error;architecture-selection;performance;p3"
+    PROCESSORS 1
+    RESOURCE_LOCK dg_igr_sm120
+    ENVIRONMENT "DG_IGR_RUN_ARCHITECTURE_SELECTION_SCREEN=1"
+    TIMEOUT 3600)
+
+# Final-selection whole-device memory controls.  The driver returns CTest skip
+# status 77 unless the exact selected steps/controller tuple, selected GPU UUID,
+# and CUDA_VISIBLE_DEVICES are supplied by the tracked build.sh invocation.
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_adaptive_trace_memory_matrix_igr_p3_rank1
+  COMMAND /usr/bin/env python3
+    "${CMAKE_SOURCE_DIR}/scripts/perf/adaptive_trace_memory_matrix.py"
+    --executable
+      "$<TARGET_FILE:dg_igr_hdg_runtime_cuda_generic_euler_convergence>"
+    --nvidia-smi nvidia-smi)
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_adaptive_trace_memory_matrix_igr_p3_rank1
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;generic-euler;tensor;igr;rodas3;adaptive;backward-euler;partitioned-backward-euler;architecture-selection;memory;performance;manual;p3"
+    PROCESSORS 1
+    RESOURCE_LOCK dg_igr_sm120
+    SKIP_RETURN_CODE 77
+    TIMEOUT 3600)
+
+# Startup-inclusive timing is a separate no-poller matrix.  Each method runs
+# in three fresh processes with initial/midpoint/final output and the same
+# externally supplied equal-error controls used by the memory qualification.
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_adaptive_trace_fresh_process_timing_igr_p3_rank1
+  COMMAND /usr/bin/env python3
+    "${CMAKE_SOURCE_DIR}/scripts/perf/adaptive_trace_memory_matrix.py"
+    --mode fresh-process-timing
+    --executable
+      "$<TARGET_FILE:dg_igr_hdg_runtime_cuda_generic_euler_convergence>")
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_adaptive_trace_fresh_process_timing_igr_p3_rank1
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;generic-euler;tensor;igr;active-igr;corrected-alpha;same-mesh-reference;rodas3;adaptive;backward-euler;partitioned-backward-euler;architecture-selection;fresh-process;startup;output;performance;manual;p3"
+    PROCESSORS 1
+    RESOURCE_LOCK dg_igr_sm120
+    SKIP_RETURN_CODE 77
+    TIMEOUT 3600)
+
 foreach(_regularization IN ITEMS conventional igr)
   foreach(_order IN ITEMS 1 2 3)
     add_test(
@@ -1031,6 +1189,37 @@ add_test(
     --engine tensor
     --time-treatment partitioned-backward-euler
     ${MPIEXEC_POSTFLAGS})
+
+# RODAS3 communicator qualification keeps one MPI_COMM_WORLD rank passive and
+# runs the complete active-subcommunicator transaction. Rank two additionally
+# proves the same-GPU host-staged HYPRE route for each CUDA engine.
+foreach(_engine IN ITEMS ordinary tensor)
+  foreach(_active_ranks IN ITEMS 1 2)
+    math(EXPR _world_ranks "${_active_ranks} + 1")
+    set(_rank_labels "rank${_active_ranks}")
+    if(_active_ranks EQUAL 2)
+      string(APPEND _rank_labels ";host-staged")
+    endif()
+    add_test(
+      NAME dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_rodas3_${_engine}_rank${_active_ranks}
+      COMMAND
+        "${MPIEXEC_EXECUTABLE}"
+        "${MPIEXEC_NUMPROC_FLAG}" ${_world_ranks}
+        ${MPIEXEC_PREFLAGS}
+        $<TARGET_FILE:dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator>
+        --active-ranks ${_active_ranks}
+        --engine ${_engine}
+        --time-treatment rodas3
+        ${MPIEXEC_POSTFLAGS})
+    set_tests_properties(
+      dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_rodas3_${_engine}_rank${_active_ranks}
+      PROPERTIES
+        LABELS "hdg;runtime;cuda;generic-euler;rodas3;${_engine};igr;subcommunicator;mpi;assessment;no-fallback;${_rank_labels}"
+        PROCESSORS ${_world_ranks}
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 1800)
+  endforeach()
+endforeach()
 set_tests_properties(
   dg_igr_hdg_runtime_cuda_generic_euler_subcommunicator_rank1
   PROPERTIES

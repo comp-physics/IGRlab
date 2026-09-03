@@ -25,14 +25,15 @@ namespace dg_sim::time::backend
 /// The selection tag is data only; no integrator implementation lives here.
 enum class IntegratorTag
 {
-  BackendDefault,
-  SSPRK33,
-  BackwardEuler,
+  BackendDefault = 0,
+  SSPRK33 = 1,
+  BackwardEuler = 2,
   // Reserved tags: a later backend may implement them without changing this
   // scheduling contract.
-  DIRK,
-  IMEX,
-  EmbeddedError
+  DIRK = 3,
+  IMEX = 4,
+  EmbeddedError = 5,
+  Rodas3 = 6
 };
 
 inline void ValidateIntegratorTag(IntegratorTag tag)
@@ -45,6 +46,7 @@ inline void ValidateIntegratorTag(IntegratorTag tag)
     case IntegratorTag::DIRK:
     case IntegratorTag::IMEX:
     case IntegratorTag::EmbeddedError:
+    case IntegratorTag::Rodas3:
       return;
     default:
       throw std::invalid_argument("unknown integrator tag");
@@ -67,22 +69,26 @@ inline const char* IntegratorTagName(IntegratorTag tag)
       return "IMEX";
     case IntegratorTag::EmbeddedError:
       return "embedded_error";
+    case IntegratorTag::Rodas3:
+      return "rodas3";
   }
   throw std::invalid_argument("unknown integrator tag");
 }
 
 enum class StepControlKind
 {
-  Fixed,
-  CFL
+  Fixed = 0,
+  CFL = 1,
+  Adaptive = 2
 };
 
 /**
- * @brief Fixed/CFL step control, intentionally independent of IntegratorTag.
+ * @brief Fixed/CFL/adaptive proposal source, independent of IntegratorTag.
  *
  * In fixed mode the backend proposal passed to StepPlanCursor::Plan is
  * ignored.  In CFL mode that proposal is the backend's already-reduced CFL
- * candidate and is validated here before clipping.
+ * candidate.  In adaptive mode it is the pure controller's current proposal.
+ * Both proposal modes are validated here before boundary clipping.
  */
 struct TimeControl
 {
@@ -91,17 +97,40 @@ struct TimeControl
   StepControlKind kind = StepControlKind::Fixed;
   double fixed_dt = 0.0;
   double cfl = 0.0;
+  double adaptive_initial_dt = 0.0;
 
   static TimeControl Fixed(double initial_time,
                            double final_time,
                            double fixed_dt)
   {
-    return {initial_time, final_time, StepControlKind::Fixed, fixed_dt, 0.0};
+    return {initial_time,
+            final_time,
+            StepControlKind::Fixed,
+            fixed_dt,
+            0.0,
+            0.0};
   }
 
   static TimeControl CFL(double initial_time, double final_time, double cfl)
   {
-    return {initial_time, final_time, StepControlKind::CFL, 0.0, cfl};
+    return {initial_time,
+            final_time,
+            StepControlKind::CFL,
+            0.0,
+            cfl,
+            0.0};
+  }
+
+  static TimeControl Adaptive(double initial_time,
+                              double final_time,
+                              double initial_dt)
+  {
+    return {initial_time,
+            final_time,
+            StepControlKind::Adaptive,
+            0.0,
+            0.0,
+            initial_dt};
   }
 
   void Validate() const
@@ -129,6 +158,14 @@ struct TimeControl
             "CFL number must be finite and positive");
         }
         break;
+      case StepControlKind::Adaptive:
+        if (!std::isfinite(adaptive_initial_dt) ||
+            adaptive_initial_dt <= 0.0)
+        {
+          throw std::invalid_argument(
+            "adaptive initial dt must be finite and positive");
+        }
+        break;
       default:
         throw std::invalid_argument("unknown step control kind");
     }
@@ -143,8 +180,9 @@ struct TimeControl
     }
     if (!std::isfinite(backend_proposed_dt) || backend_proposed_dt <= 0.0)
     {
-      throw std::invalid_argument(
-        "backend CFL proposal must be finite and positive");
+      throw std::invalid_argument(kind == StepControlKind::CFL
+          ? "backend CFL proposal must be finite and positive"
+          : "adaptive controller proposal must be finite and positive");
     }
     return backend_proposed_dt;
   }
@@ -152,21 +190,21 @@ struct TimeControl
 
 enum class OutputScheduleKind
 {
-  Disabled,
-  FixedInterval,
-  ExplicitTimes
+  Disabled = 0,
+  FixedInterval = 1,
+  ExplicitTimes = 2
 };
 
 enum class InitialOutputPolicy
 {
-  Suppress,
-  Emit
+  Suppress = 0,
+  Emit = 1
 };
 
 enum class FinalOutputPolicy
 {
-  Suppress,
-  Emit
+  Suppress = 0,
+  Emit = 1
 };
 
 /**
@@ -280,6 +318,28 @@ struct StepPlan
 };
 
 /**
+ * @brief Fieldwise restart record for a committed StepPlanCursor boundary.
+ *
+ * Checkpoint codecs must serialize the named configuration and cursor fields,
+ * including each explicit output time, rather than object bytes or padding.
+ * A pending plan is deliberately absent: it belongs to an uncommitted solver
+ * attempt and must be accepted or aborted before this record can be produced.
+ */
+struct StepPlanCursorState
+{
+  std::uint32_t schema_version = 0;
+  TimeControl control;
+  OutputSchedule output_schedule;
+  IntegratorTag integrator = IntegratorTag::BackendDefault;
+  double current_time = 0.0;
+  std::uint64_t committed_steps = 0;
+  std::uint64_t next_sequence = 0;
+  std::uint64_t next_fixed_cycle = 0;
+  std::uint64_t next_publication_cycle = 0;
+  std::uint64_t next_explicit_index = 0;
+};
+
+/**
  * @brief Nonvirtual commit cursor for deterministic output-aligned stepping.
  *
  * Plan() caches its result.  Retrying an attempted backend step therefore
@@ -289,6 +349,8 @@ struct StepPlan
 class StepPlanCursor
 {
 public:
+  static constexpr std::uint32_t state_schema_version = 1;
+
   StepPlanCursor(TimeControl control,
                  OutputSchedule schedule,
                  IntegratorTag integrator = IntegratorTag::BackendDefault)
@@ -312,6 +374,69 @@ public:
   std::uint64_t committed_steps() const { return committed_steps_; }
   bool Finished() const { return time_ == control_.final_time; }
   bool HasPendingPlan() const { return pending_.has_value(); }
+
+  /** Capture the complete committed scheduling state. */
+  StepPlanCursorState CheckpointState() const
+  {
+    if (pending_)
+    {
+      throw std::logic_error(
+          "time cursor cannot checkpoint a pending plan");
+    }
+    return StepPlanCursorState{state_schema_version,
+                               control_,
+                               schedule_,
+                               integrator_,
+                               time_,
+                               committed_steps_,
+                               next_sequence_,
+                               next_fixed_cycle_,
+                               next_publication_cycle_,
+                               static_cast<std::uint64_t>(
+                                   next_explicit_index_)};
+  }
+
+  /**
+   * Restore a matching committed scheduling state with a strong guarantee.
+   *
+   * All identity and cursor invariants are checked before any live member is
+   * changed.  Restore never discards a pending plan.
+   */
+  void Restore(const StepPlanCursorState& state)
+  {
+    if (pending_)
+    {
+      throw std::logic_error(
+          "time cursor cannot restore over a pending plan");
+    }
+    ValidateRestoredState(state);
+    time_ = state.current_time;
+    committed_steps_ = state.committed_steps;
+    next_sequence_ = state.next_sequence;
+    next_fixed_cycle_ = state.next_fixed_cycle;
+    next_publication_cycle_ = state.next_publication_cycle;
+    next_explicit_index_ =
+        static_cast<std::size_t>(state.next_explicit_index);
+  }
+
+  /** The deterministic last output cycle implied by committed cursor state. */
+  std::uint64_t LastCommittedOutputCycle() const
+  {
+    if (next_publication_cycle_ == 0)
+    {
+      throw std::logic_error("time cursor publication cycle is invalid");
+    }
+    if (committed_steps_ == 0)
+    {
+      return 0;
+    }
+    if (Finished() && schedule_.final == FinalOutputPolicy::Emit &&
+        !FinalBoundaryWasScheduled())
+    {
+      return next_publication_cycle_;
+    }
+    return next_publication_cycle_ - 1;
+  }
 
   /// Returns the transaction that Commit() may consume without advancing it.
   const StepPlan& PendingPlan() const
@@ -351,6 +476,10 @@ public:
     {
       throw std::logic_error("cannot plan after final time");
     }
+    if (next_sequence_ == std::numeric_limits<std::uint64_t>::max())
+    {
+      throw std::overflow_error("time plan sequence overflow");
+    }
 
     const double proposed_dt = control_.ResolveDt(backend_proposed_dt);
     const double final_boundary = control_.final_time;
@@ -364,9 +493,19 @@ public:
     if (output)
     {
       const double output_dt = output->time - time_;
-      if (output_dt >= 0.0 && output_dt <= planned_dt)
+      // A proposal can be one representable value below output_dt while its
+      // rounded endpoint is exactly the output boundary.  Classify that as a
+      // boundary hit without increasing the solver's proposed dt; otherwise
+      // Commit() reaches the boundary without advancing the output cursor and
+      // the following plan is forced to a zero-length step.
+      const bool rounded_to_output = end_time == output->time;
+      if (output_dt >= 0.0 &&
+          (output_dt <= planned_dt || rounded_to_output))
       {
-        planned_dt = output_dt;
+        if (output_dt <= planned_dt)
+        {
+          planned_dt = output_dt;
+        }
         end_time = output->time;
         hit_output = true;
         output_cycle = output->cycle;
@@ -405,15 +544,45 @@ public:
     return OutputForCommit(*pending_);
   }
 
+  /**
+   * Validate every fallible condition for a later Commit().
+   *
+   * A caller may use this immediately before committing an external solver
+   * transaction.  If the cursor is not mutated in between, Commit() performs
+   * only the already-validated, allocation-free state transition.
+   */
+  std::optional<OutputEvent> PreflightCommit(const StepPlan& plan) const
+  {
+    const std::optional<OutputEvent> output = PreviewCommit(plan);
+    if (committed_steps_ == std::numeric_limits<std::uint64_t>::max())
+    {
+      throw std::overflow_error("time committed-step counter overflow");
+    }
+    if (pending_->hits_scheduled_output)
+    {
+      if (next_publication_cycle_ ==
+          std::numeric_limits<std::uint64_t>::max())
+      {
+        throw std::overflow_error("time publication-cycle counter overflow");
+      }
+      if (schedule_.kind == OutputScheduleKind::FixedInterval &&
+          next_fixed_cycle_ == std::numeric_limits<std::uint64_t>::max())
+      {
+        throw std::overflow_error("time fixed-output counter overflow");
+      }
+      if (schedule_.kind == OutputScheduleKind::ExplicitTimes &&
+          next_explicit_index_ == std::numeric_limits<std::size_t>::max())
+      {
+        throw std::overflow_error("time explicit-output cursor overflow");
+      }
+    }
+    return output;
+  }
+
   std::optional<OutputEvent> Commit(const StepPlan& plan)
   {
-    if (!pending_ || !SamePlan(plan, *pending_))
-    {
-      throw std::logic_error("only the pending plan may be committed once");
-    }
-
+    const std::optional<OutputEvent> output = PreflightCommit(plan);
     const StepPlan committed = *pending_;
-    const std::optional<OutputEvent> output = PreviewCommit(plan);
     pending_.reset();
     time_ = committed.end_time;
     ++committed_steps_;
@@ -423,6 +592,22 @@ public:
     }
 
     return output;
+  }
+
+  /**
+   * Reject the pending attempt without advancing time or output state.
+   *
+   * The next Plan() receives a new sequence and may use a smaller adaptive
+   * proposal.  Fixed/CFL retry behavior remains unchanged unless a caller
+   * explicitly invokes this operation.
+   */
+  void Abort(const StepPlan& plan)
+  {
+    if (!pending_ || !SamePlan(plan, *pending_))
+    {
+      throw std::logic_error("only the pending plan may be aborted once");
+    }
+    pending_.reset();
   }
 
 private:
@@ -447,6 +632,174 @@ private:
            lhs.hits_scheduled_output == rhs.hits_scheduled_output &&
            lhs.hits_final == rhs.hits_final &&
            lhs.scheduled_cycle == rhs.scheduled_cycle;
+  }
+
+  static bool SameControl(const TimeControl& lhs, const TimeControl& rhs)
+  {
+    return lhs.initial_time == rhs.initial_time &&
+           lhs.final_time == rhs.final_time && lhs.kind == rhs.kind &&
+           lhs.fixed_dt == rhs.fixed_dt && lhs.cfl == rhs.cfl &&
+           lhs.adaptive_initial_dt == rhs.adaptive_initial_dt;
+  }
+
+  static bool SameSchedule(const OutputSchedule& lhs,
+                           const OutputSchedule& rhs)
+  {
+    return lhs.kind == rhs.kind && lhs.interval == rhs.interval &&
+           lhs.explicit_times == rhs.explicit_times &&
+           lhs.initial == rhs.initial && lhs.final == rhs.final;
+  }
+
+  double CanonicalFixedBoundary(const std::uint64_t cycle) const
+  {
+    const double target = control_.initial_time +
+        static_cast<double>(cycle) * schedule_.interval;
+    return std::isfinite(target) && NearlyEqual(target, control_.final_time)
+        ? control_.final_time
+        : target;
+  }
+
+  void ValidateScheduledState(const StepPlanCursorState& state) const
+  {
+    if (state.next_publication_cycle == 0 ||
+        state.next_publication_cycle - 1 > state.committed_steps)
+    {
+      throw std::invalid_argument(
+          "time cursor publication counters are inconsistent");
+    }
+
+    switch (schedule_.kind)
+    {
+      case OutputScheduleKind::Disabled:
+        if (state.next_fixed_cycle != 1 ||
+            state.next_publication_cycle != 1 ||
+            state.next_explicit_index != 0)
+        {
+          throw std::invalid_argument(
+              "disabled output cursor state is inconsistent");
+        }
+        return;
+
+      case OutputScheduleKind::FixedInterval:
+      {
+        if (state.next_fixed_cycle == 0 ||
+            state.next_fixed_cycle != state.next_publication_cycle ||
+            state.next_explicit_index != 0)
+        {
+          throw std::invalid_argument(
+              "fixed-interval output cursors are inconsistent");
+        }
+        if (state.next_fixed_cycle > 1)
+        {
+          const double previous =
+              CanonicalFixedBoundary(state.next_fixed_cycle - 1);
+          if (!std::isfinite(previous) ||
+              (previous > control_.final_time &&
+               !NearlyEqual(previous, control_.final_time)) ||
+              previous > state.current_time)
+          {
+            throw std::invalid_argument(
+                "fixed-interval output cursor skipped its prior boundary");
+          }
+        }
+        const double next = CanonicalFixedBoundary(state.next_fixed_cycle);
+        if (std::isfinite(next) &&
+            !(next > control_.final_time &&
+              !NearlyEqual(next, control_.final_time)) &&
+            !(next > state.current_time))
+        {
+          throw std::invalid_argument(
+              "fixed-interval output cursor did not advance past time");
+        }
+        return;
+      }
+
+      case OutputScheduleKind::ExplicitTimes:
+      {
+        if (state.next_fixed_cycle != 1 ||
+            state.next_explicit_index >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max()) ||
+            state.next_explicit_index >
+                static_cast<std::uint64_t>(schedule_.explicit_times.size()))
+        {
+          throw std::invalid_argument(
+              "explicit output cursor index is invalid");
+        }
+        const std::uint64_t initial_skip =
+            HasExplicitInitialOutput() ? 1U : 0U;
+        if (state.next_explicit_index < initial_skip)
+        {
+          throw std::invalid_argument(
+              "explicit output cursor precedes its initial boundary");
+        }
+        const std::uint64_t emitted =
+            state.next_explicit_index - initial_skip;
+        if (emitted != state.next_publication_cycle - 1)
+        {
+          throw std::invalid_argument(
+              "explicit output cursors are inconsistent");
+        }
+        const std::size_t next_index =
+            static_cast<std::size_t>(state.next_explicit_index);
+        if (emitted != 0 &&
+            schedule_.explicit_times[next_index - 1] > state.current_time)
+        {
+          throw std::invalid_argument(
+              "explicit output cursor skipped its prior boundary");
+        }
+        if (next_index < schedule_.explicit_times.size() &&
+            !(schedule_.explicit_times[next_index] > state.current_time))
+        {
+          throw std::invalid_argument(
+              "explicit output cursor did not advance past time");
+        }
+        return;
+      }
+    }
+    throw std::invalid_argument("unknown output schedule kind");
+  }
+
+  void ValidateRestoredState(const StepPlanCursorState& state) const
+  {
+    if (state.schema_version != state_schema_version)
+    {
+      throw std::invalid_argument(
+          "time cursor state schema is unsupported");
+    }
+    state.control.Validate();
+    state.output_schedule.Validate();
+    ValidateIntegratorTag(state.integrator);
+    if (!SameControl(state.control, control_) ||
+        !SameSchedule(state.output_schedule, schedule_) ||
+        state.integrator != integrator_)
+    {
+      throw std::invalid_argument(
+          "time cursor state belongs to a different configuration");
+    }
+    if (!std::isfinite(state.current_time) ||
+        state.current_time < control_.initial_time ||
+        state.current_time > control_.final_time)
+    {
+      throw std::invalid_argument(
+          "time cursor current time is outside its configured bounds");
+    }
+    const bool at_initial = state.current_time == control_.initial_time;
+    if ((state.committed_steps == 0) != at_initial)
+    {
+      throw std::invalid_argument(
+          "time cursor step count contradicts its current time");
+    }
+    if (state.next_sequence == 0 ||
+        state.next_sequence - 1 < state.committed_steps ||
+        (state.current_time != control_.final_time &&
+         state.next_sequence ==
+             std::numeric_limits<std::uint64_t>::max()))
+    {
+      throw std::invalid_argument(
+          "time cursor sequence counter is inconsistent");
+    }
+    ValidateScheduledState(state);
   }
 
   void CanonicalizeExplicitTimes()
@@ -510,6 +863,23 @@ private:
     }
   }
 
+  bool FinalBoundaryWasScheduled() const
+  {
+    if (schedule_.kind == OutputScheduleKind::FixedInterval &&
+        next_fixed_cycle_ > 1)
+    {
+      return CanonicalFixedBoundary(next_fixed_cycle_ - 1) ==
+          control_.final_time;
+    }
+    if (schedule_.kind == OutputScheduleKind::ExplicitTimes &&
+        next_explicit_index_ != 0)
+    {
+      return schedule_.explicit_times[next_explicit_index_ - 1] ==
+          control_.final_time;
+    }
+    return false;
+  }
+
   bool HasExplicitInitialOutput() const
   {
     return schedule_.kind == OutputScheduleKind::ExplicitTimes &&
@@ -528,7 +898,9 @@ private:
       const double target = control_.initial_time +
                             static_cast<double>(next_fixed_cycle_) *
                               schedule_.interval;
-      if (target > control_.final_time && !NearlyEqual(target, control_.final_time))
+      if (!std::isfinite(target) ||
+          (target > control_.final_time &&
+           !NearlyEqual(target, control_.final_time)))
       {
         return std::nullopt;
       }
