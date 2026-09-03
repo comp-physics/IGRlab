@@ -808,8 +808,10 @@ int RunTimeDefaultsTests(TestContext& ctx)
   }
 
   // --- Hook dispatch and payload fields ---
+  // Keep one identical global fixture for the one- and two-rank parity runs,
+  // while giving every rank in the supported two-rank test local work.
   mfem::Mesh serial_mesh =
-    mfem::Mesh::MakeCartesian2D(1,
+    mfem::Mesh::MakeCartesian2D(2,
                                 1,
                                 mfem::Element::QUADRILATERAL,
                                 /*gen_edges=*/true,
@@ -861,7 +863,9 @@ int RunTimeDefaultsTests(TestContext& ctx)
 
     FillConstantState(state, bundle.sol);
     const int scalar_dofs = example_ctx.spaces.vfes.GetNDofs();
-    if (scalar_dofs > 0)
+    int fixture_rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &fixture_rank);
+    if (fixture_rank == 0 && scalar_dofs > 0)
     {
       // The element mean remains admissible, but one Euler consumer node has
       // negative pressure and therefore requires a mean-preserving blend.
@@ -878,11 +882,10 @@ int RunTimeDefaultsTests(TestContext& ctx)
 
     limiter_run.regularization = dg_sim::Regularization::IGR;
     limiter_run.case_config.limiter_pipeline.zhang_shu = true;
-    const int volume_qord =
-      2 * example_ctx.spaces.vfes.GetFE(0)->GetOrder() + 2;
+    const int local_order = example_ctx.spaces.vfes.GetFE(0)->GetOrder();
+    const int volume_qord = 2 * local_order + 2;
     const std::vector<int> face_qords{
-      2 * example_ctx.spaces.vfes.GetFE(0)->GetOrder() +
-      limiter_run.case_config.int_order_offset};
+      2 * local_order + limiter_run.case_config.int_order_offset};
     const auto pre_dof_scan = mfem::dg_igr::ScanEulerAdmissibility(
       example_ctx.spaces.vfes,
       bundle.sol,
@@ -2008,7 +2011,9 @@ int RunTimeDefaultsTests(TestContext& ctx)
     cfg.t_final = 1.0;
     cfg.dt = 0.0;
     cfg.dt_min = 0.05;
-    cfg.cfl = 0.3;
+    // The two-element fixture has half the original characteristic length;
+    // retain the intended first accepted step of 0.1 before the speed jump.
+    cfg.cfl = 0.6;
     cfg.order = 1;
     cfg.vtk_save = true;
     cfg.dt_save = 100.0; // avoid save-boundary snapping in this test

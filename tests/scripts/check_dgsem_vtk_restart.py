@@ -424,13 +424,14 @@ def restart_diagnostics(log: str) -> dict[str, object]:
         raise RuntimeError(f"restart mesh/admissibility certificate is invalid: {values}")
     sigma = vtk.require(
         r"\[vtk-restart\] event=sigma-initialization solved=(\d+) cold_start=(\d+) "
-        r"reusable_stage0=(\d+) independent_residual_certified=(\d+) "
+        r"reusable_stage0=(\d+) certification_supported=(\d+) "
+        r"independent_residual_certified=(\d+) "
         r"independent_residual_rel_rhs=([0-9.eE+-]+)",
         log,
         "cold sigma recomputation certificate",
     )
-    sigma_values = [int(value) for value in sigma.groups()[:4]]
-    if sigma_values != [1, 1, 1, 1]:
+    sigma_values = [int(value) for value in sigma.groups()[:5]]
+    if sigma_values != [1, 1, 1, 1, 1]:
         raise RuntimeError(f"sigma was not cold-recomputed and certified: {sigma.groups()}")
     lifecycle = vtk.require(
         r"\[igr-sigma-lifecycle\] event=run-summary prefetch_solves=(\d+) "
@@ -452,8 +453,9 @@ def restart_diagnostics(log: str) -> dict[str, object]:
             "solved": sigma_values[0],
             "cold_start": sigma_values[1],
             "reusable_stage0": sigma_values[2],
-            "independent_residual_certified": sigma_values[3],
-            "independent_residual_rel_rhs": float(sigma.group(5)),
+            "certification_supported": sigma_values[3],
+            "independent_residual_certified": sigma_values[4],
+            "independent_residual_rel_rhs": float(sigma.group(6)),
         },
         "sigma_lifecycle": {
             "prefetch_solves": lifecycle_values[0],
