@@ -628,6 +628,7 @@ struct DGSEMProductionCache
     DGSEMVolumeDissipation::None;
   real_t gamma = 1.4;
   real_t velocity_density_floor = dg_igr::FluxDefaults::kRhoVelFloor;
+  bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
   std::uint64_t policy_fingerprint = 0;
@@ -878,6 +879,8 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   const real_t velocity_density_floor =
     flux_igr ? flux_igr->GetVelocityRhoFloor()
              : dg_igr::FluxDefaults::kRhoVelFloor;
+  const bool invariant_domain_flux =
+    flux_igr && flux_igr->GetInvariantDomainFlux();
   const bool sigma_aware_cfl = flux_igr && flux_igr->GetSigmaAwareCFL();
   const bool sigma_aware_rusanov =
     flux_igr && flux_igr->GetSigmaAwareRusanov();
@@ -924,6 +927,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
     static_cast<std::uint64_t>(op_->GetDGSEMVolumeDissipation()));
   fingerprint = HashReal(fingerprint, gamma);
   fingerprint = HashReal(fingerprint, velocity_density_floor);
+  fingerprint = HashCombine(fingerprint, invariant_domain_flux ? 1 : 0);
   fingerprint = HashCombine(fingerprint, sigma_aware_cfl ? 1 : 0);
   fingerprint = HashCombine(fingerprint, sigma_aware_rusanov ? 1 : 0);
   fingerprint = HashCombine(fingerprint, cuda ? 1 : 0);
@@ -950,6 +954,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   semantic = HashCombine(
     semantic,
     flux_igr && igr_base_flux ? 1 : 0);
+  semantic = HashCombine(semantic, invariant_domain_flux ? 1 : 0);
   semantic = HashCombine(semantic, sigma_aware_cfl ? 1 : 0);
   semantic = HashCombine(semantic, sigma_aware_rusanov ? 1 : 0);
   semantic = HashCombine(semantic, cuda ? 1 : 0);
@@ -1158,7 +1163,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   }
 
   if (policy_reason == DGSEMProductionReason::None &&
-      (sigma_aware_cfl || sigma_aware_rusanov))
+      (invariant_domain_flux || sigma_aware_cfl || sigma_aware_rusanov))
   {
     policy_reason = DGSEMProductionReason::UnsupportedSigmaSpeedPolicy;
   }
@@ -1515,6 +1520,8 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
   const FiniteElementSpace* sigma_fes =
     sigma_field ? sigma_field->FESpace() : nullptr;
   const long sigma_sequence = sigma_fes ? sigma_fes->GetSequence() : -1;
+  const bool invariant_domain_flux =
+    flux_igr && flux_igr->GetInvariantDomainFlux();
   const bool sigma_aware_cfl = flux_igr && flux_igr->GetSigmaAwareCFL();
   const bool sigma_aware_rusanov =
     flux_igr && flux_igr->GetSigmaAwareRusanov();
@@ -1532,6 +1539,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     c.volume_dissipation != op_->GetDGSEMVolumeDissipation() ||
     c.gamma != op_->GetDGSEMGamma() ||
     c.velocity_density_floor != velocity_density_floor ||
+    c.invariant_domain_flux != invariant_domain_flux ||
     c.sigma_aware_cfl != sigma_aware_cfl ||
     c.sigma_aware_rusanov != sigma_aware_rusanov;
 
@@ -1570,6 +1578,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
   c.volume_dissipation = op_->GetDGSEMVolumeDissipation();
   c.gamma = op_->GetDGSEMGamma();
   c.velocity_density_floor = velocity_density_floor;
+  c.invariant_domain_flux = invariant_domain_flux;
   c.sigma_aware_cfl = sigma_aware_cfl;
   c.sigma_aware_rusanov = sigma_aware_rusanov;
 
@@ -1628,7 +1637,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
   {
     return fail(DGSEMProductionReason::UnsupportedModel);
   }
-  if (sigma_aware_cfl || sigma_aware_rusanov)
+  if (invariant_domain_flux || sigma_aware_cfl || sigma_aware_rusanov)
   {
     return fail(DGSEMProductionReason::UnsupportedSigmaSpeedPolicy);
   }

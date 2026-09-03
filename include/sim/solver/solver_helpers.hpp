@@ -105,11 +105,33 @@ inline void ApplyIGRRuntimeOptionOverrides(const IGROptions& igr_opts,
   cfg.exact_dg_face_operator = igr_opts.exact_dg_face_operator;
 }
 
-inline mfem::RK3SSPWithLimiter MakeRK3Stepper(mfem::ParFiniteElementSpace& vfes,
-                                              int dim,
-                                              const mfem::RK3Config& cfg)
+inline mfem::SSPRKMethod SSPRKMethodForTimeIntegrator(
+  TimeIntegrator time_integrator)
 {
-  mfem::RK3SSPWithLimiter rk3(vfes);
+  switch (time_integrator)
+  {
+  case TimeIntegrator::RK3SSP:
+    return mfem::SSPRKMethod::SSPRK33;
+  case TimeIntegrator::SSPRK104:
+    return mfem::SSPRKMethod::SSPRK104;
+  case TimeIntegrator::BackwardEuler:
+  case TimeIntegrator::PartitionedBackwardEuler:
+  case TimeIntegrator::Rodas3:
+    break;
+  }
+  MFEM_VERIFY(false,
+              "Selected time integrator is not an explicit SSPRK method.");
+  return mfem::SSPRKMethod::SSPRK33;
+}
+
+inline mfem::RK3SSPWithLimiter MakeRK3Stepper(
+  mfem::ParFiniteElementSpace& vfes,
+  int dim,
+  const mfem::RK3Config& cfg,
+  TimeIntegrator time_integrator = TimeIntegrator::RK3SSP)
+{
+  mfem::RK3SSPWithLimiter rk3(
+    vfes, SSPRKMethodForTimeIntegrator(time_integrator));
   rk3.SetEulerParams(dim, cfg.gamma);
   rk3.SetLimiterParams(cfg.rho_min,
                        cfg.p_min,

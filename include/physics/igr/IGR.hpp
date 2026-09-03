@@ -14,12 +14,13 @@
  * Given the current conservative state U = [ρ, ρu, E], this class computes Σ by
  * solving the scalar elliptic PDE
  *
- *   (1/ρ) Σ - α ∇·( (1/ρ) ∇Σ ) = α ( ||∇u||_F^2 + (∇·u)^2 )
+ *   (1/ρ) Σ - α ∇·( (1/ρ) ∇Σ )
+ *     = α ( tr((∇u)^2) + (∇·u)^2 )
  *
  * Discretization:
  *  - Mass term: ( (1/ρ) Σ, v )
  *  - Diffusion term: ( (α/ρ) ∇Σ, ∇v ) [+ IPDG face terms if Σ-space is DG]
- *  - RHS: ( α( ||∇u||_F^2 + (∇·u)^2 ), v )
+ *  - RHS: ( α( tr((∇u)^2) + (∇·u)^2 ), v )
  *
  * Solve options:
  *  - Legacy: a few preconditioned Richardson smoother sweeps (fast/approx)
@@ -86,6 +87,7 @@ public:
 
   // ---- Recommended Krylov-solve knobs ----
   void SetSolveMode(SolveMode m) { solve_mode_ = m; }
+  SolveMode GetSolveMode() const { return solve_mode_; }
   void SetLinearSolver(LinearSolverType s) { lin_solver_type_ = s; }
   void SetPreconditioner(PrecondType p);
   void SetNonconvergencePolicy(NonconvergencePolicy policy)
@@ -111,7 +113,19 @@ public:
   {
     stage_rtol_scale_ = std::max(1.0, scale);
   }
-  void SetRKStageIndex(int stage) { rk_stage_index_ = stage; }
+  /// Legacy three-stage context retained for direct callers and SSPRK(3,3).
+  void SetRKStageIndex(int stage)
+  {
+    rk_stage_index_ = stage;
+    rk_stage_count_ = stage >= 0 ? 3 : -1;
+  }
+  void SetRKStageContext(int stage, int stage_count)
+  {
+    MFEM_VERIFY(stage >= 0 && stage_count > 0 && stage < stage_count,
+                "Invalid explicit RK stage context.");
+    rk_stage_index_ = stage;
+    rk_stage_count_ = stage_count;
+  }
   void SetRKStepIndex(int step) { rk_step_index_ = step; }
   void SetCurrentTime(double time) { current_time_ = time; }
   void SetCurrentTimeStep(double dt) { current_dt_ = dt; }
@@ -192,6 +206,14 @@ public:
   double GetLastLinearTrueResidualRelRHS() const
   {
     return last_linear_true_residual_rel_rhs_;
+  }
+  double GetLastIndependentCertificateRelativeLimit() const
+  {
+    return last_independent_certificate_relative_limit_;
+  }
+  double GetLastIndependentCertificateAbsoluteLimit() const
+  {
+    return last_independent_certificate_absolute_limit_;
   }
   bool GetLastWarmStartEffective() const
   {
@@ -666,6 +688,7 @@ private:
   int sigma_update_interval_ = 1;
   double stage_rtol_scale_ = 1.0;
   int rk_stage_index_ = -1;
+  int rk_stage_count_ = -1;
   int rk_step_index_ = -1;
   double current_time_ = std::numeric_limits<double>::quiet_NaN();
   double current_dt_ = std::numeric_limits<double>::quiet_NaN();
@@ -713,6 +736,10 @@ private:
   double last_linear_true_residual_abs_ =
     std::numeric_limits<double>::quiet_NaN();
   double last_linear_true_residual_rel_rhs_ =
+    std::numeric_limits<double>::quiet_NaN();
+  double last_independent_certificate_relative_limit_ =
+    std::numeric_limits<double>::quiet_NaN();
+  double last_independent_certificate_absolute_limit_ =
     std::numeric_limits<double>::quiet_NaN();
   double last_linear_true_initial_residual_abs_ =
     std::numeric_limits<double>::quiet_NaN();

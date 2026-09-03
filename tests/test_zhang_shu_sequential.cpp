@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <string>
 
 #include "numerics/limiters/zhang_shu.hpp"
@@ -45,7 +46,8 @@ void CurveMesh(mfem::Mesh& mesh)
 
 mfem::Vector ElementAverage(mfem::ParFiniteElementSpace& fes,
                             const mfem::ParGridFunction& state,
-                            int element)
+                            int element,
+                            int quadrature_order = kQuadratureOrder)
 {
   mfem::Array<int> vdofs;
   mfem::Vector element_state;
@@ -59,7 +61,7 @@ mfem::Vector ElementAverage(mfem::ParFiniteElementSpace& fes,
     *fes.GetElementTransformation(element),
     values,
     kNumEq,
-    kQuadratureOrder,
+    quadrature_order,
     average);
   return average;
 }
@@ -316,42 +318,52 @@ int InvalidAverageCase()
     data[dof + 3 * ndofs] = 0.1;
   }
   const mfem::Vector average_before = ElementAverage(fes, state, 0);
+  const mfem::Vector state_before(state);
 
   mfem::ZhangShuLimiterElementDiagnostics diagnostics;
-  mfem::ApplyZhangShuPositivityLimiter(
-    fes,
-    state,
-    kDim,
-    kGamma,
-    kRhoMin,
-    kPressureMin,
-    kQuadratureOrder,
-    {},
-    kBisectionIterations,
-    mfem::ZhangShuPointSet::kConsumer,
-    &diagnostics);
+  int rejected_elements = 0;
+  try
+  {
+    mfem::ApplyZhangShuPositivityLimiter(
+      fes,
+      state,
+      kDim,
+      kGamma,
+      kRhoMin,
+      kPressureMin,
+      kQuadratureOrder,
+      {},
+      kBisectionIterations,
+      mfem::ZhangShuPointSet::kConsumer,
+      &diagnostics);
+  }
+  catch (const mfem::RecoverableLimiterFailure& failure)
+  {
+    rejected_elements = failure.GlobalRejectedElementCount();
+  }
   const mfem::Vector average_after = ElementAverage(fes, state, 0);
+  mfem::Vector state_error(state);
+  state_error -= state_before;
 
-  bool ok = diagnostics.collapsed_average.HostRead()[0] == 1.0;
+  bool ok = rejected_elements == 1;
+  ok = diagnostics.inadmissible_average.HostRead()[0] == 1.0 && ok;
+  ok = diagnostics.collapsed_average.HostRead()[0] == 0.0 && ok;
   for (int component = 0; component < kNumEq; ++component)
   {
-    ok = Near(diagnostics.average_repair.HostRead()[component],
-              average_after(component) - average_before(component),
-              2.0e-12) && ok;
+    ok = diagnostics.average_repair.HostRead()[component] == 0.0 && ok;
+    ok = Near(average_after(component), average_before(component), 2.0e-12) &&
+         ok;
   }
-  ok = average_after(0) >= kRhoMin && ok;
-  ok = Pressure(average_after) >= 0.99 * kPressureMin && ok;
+  ok = state_error.Normlinf() == 0.0 && ok;
+  ok = average_after(0) < kRhoMin && ok;
   if (!ok)
   {
-    std::cerr << "[FAIL] invalid-average collapse accounting\n";
+    std::cerr << "[FAIL] invalid-density average was not rejected transactionally\n";
     return 3;
   }
   if (mfem::Mpi::Root())
   {
-    std::cout << "[PASS] invalid-average collapse accounting"
-              << " delta_rho=" << diagnostics.average_repair.HostRead()[0]
-              << " delta_energy="
-              << diagnostics.average_repair.HostRead()[3] << "\n";
+    std::cout << "[PASS] invalid-density average rejected without repair\n";
   }
   return 0;
 }
@@ -377,42 +389,181 @@ int InvalidPressureAverageCase()
   const mfem::Vector average_before = ElementAverage(fes, state, 0);
   MFEM_VERIFY(Pressure(average_before) < kPressureMin,
               "Invalid-pressure test average must be inadmissible.");
+  const mfem::Vector state_before(state);
 
   mfem::ZhangShuLimiterElementDiagnostics diagnostics;
-  mfem::ApplyZhangShuPositivityLimiter(
-    fes,
-    state,
-    kDim,
-    kGamma,
-    kRhoMin,
-    kPressureMin,
-    kQuadratureOrder,
-    {},
-    kBisectionIterations,
-    mfem::ZhangShuPointSet::kConsumer,
-    &diagnostics);
+  int rejected_elements = 0;
+  try
+  {
+    mfem::ApplyZhangShuPositivityLimiter(
+      fes,
+      state,
+      kDim,
+      kGamma,
+      kRhoMin,
+      kPressureMin,
+      kQuadratureOrder,
+      {},
+      kBisectionIterations,
+      mfem::ZhangShuPointSet::kConsumer,
+      &diagnostics);
+  }
+  catch (const mfem::RecoverableLimiterFailure& failure)
+  {
+    rejected_elements = failure.GlobalRejectedElementCount();
+  }
   const mfem::Vector average_after = ElementAverage(fes, state, 0);
+  mfem::Vector state_error(state);
+  state_error -= state_before;
 
-  bool ok = diagnostics.collapsed_average.HostRead()[0] == 1.0;
+  bool ok = rejected_elements == 1;
+  ok = diagnostics.inadmissible_average.HostRead()[0] == 1.0 && ok;
+  ok = diagnostics.collapsed_average.HostRead()[0] == 0.0 && ok;
   for (int component = 0; component < kNumEq; ++component)
   {
-    ok = Near(diagnostics.average_repair.HostRead()[component],
-              average_after(component) - average_before(component),
-              2.0e-12) && ok;
+    ok = diagnostics.average_repair.HostRead()[component] == 0.0 && ok;
+    ok = Near(average_after(component), average_before(component), 2.0e-12) &&
+         ok;
   }
-  ok = Near(average_after(0), average_before(0), 2.0e-12) && ok;
-  ok = Near(average_after(1), average_before(1), 2.0e-12) && ok;
-  ok = Pressure(average_after) >= 0.99 * kPressureMin && ok;
+  ok = state_error.Normlinf() == 0.0 && ok;
+  ok = Pressure(average_after) < kPressureMin && ok;
   if (!ok)
   {
-    std::cerr << "[FAIL] invalid-pressure-average collapse accounting\n";
+    std::cerr << "[FAIL] invalid-pressure average was not rejected transactionally\n";
     return 4;
   }
   if (mfem::Mpi::Root())
   {
-    std::cout << "[PASS] invalid-pressure-average collapse accounting"
-              << " delta_energy="
-              << diagnostics.average_repair.HostRead()[3] << "\n";
+    std::cout << "[PASS] invalid-pressure average rejected without repair\n";
+  }
+  return 0;
+}
+
+int NonFiniteConsumerPointCases()
+{
+  mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
+    1, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  mfem::ParMesh mesh(MPI_COMM_WORLD, serial_mesh);
+  mfem::DG_FECollection fec(1, kDim, mfem::BasisType::GaussLegendre);
+  mfem::ParFiniteElementSpace fes(
+    &mesh, &fec, kNumEq, mfem::Ordering::byNODES);
+  const mfem::IntegrationRule& nodes = fes.GetFE(0)->GetNodes();
+  const double finite_max = std::numeric_limits<double>::max();
+
+  auto set_state = [&](mfem::ParGridFunction& state,
+                       bool overflow_component)
+  {
+    state = 0.0;
+    mfem::Array<int> vdofs;
+    fes.GetElementVDofs(0, vdofs);
+    mfem::Vector element_state(vdofs.Size());
+    mfem::DenseMatrix values(element_state.GetData(),
+                             fes.GetFE(0)->GetDof(),
+                             kNumEq);
+    for (int node = 0; node < nodes.GetNPoints(); ++node)
+    {
+      mfem::Vector value(kNumEq);
+      value = 0.0;
+      if (overflow_component)
+      {
+        value(0) = nodes.IntPoint(node).x < 0.5
+                     ? 0.9 * finite_max
+                     : 0.4 * finite_max;
+      }
+      else
+      {
+        value(0) = 1.0;
+        const double momentum_amplitude = 2.0 * std::sqrt(finite_max);
+        value(1) = nodes.IntPoint(node).x < 0.5
+                     ? momentum_amplitude
+                     : -momentum_amplitude;
+      }
+      value(3) = 0.2 * finite_max;
+      values.SetRow(node, value);
+    }
+    state.SetSubVector(vdofs, element_state);
+  };
+
+  auto reject_transactionally = [&](mfem::ParGridFunction& state,
+                                    int quadrature_order,
+                                    const std::string& label)
+  {
+    const mfem::Vector before(state);
+    int rejected_elements = 0;
+    bool generic_failure_report = false;
+    try
+    {
+      mfem::ApplyZhangShuPositivityLimiter(
+        fes,
+        state,
+        kDim,
+        kGamma,
+        kRhoMin,
+        kPressureMin,
+        quadrature_order,
+        {quadrature_order},
+        kBisectionIterations,
+        mfem::ZhangShuPointSet::kConsumer,
+        nullptr);
+    }
+    catch (const mfem::RecoverableLimiterFailure& failure)
+    {
+      rejected_elements = failure.GlobalRejectedElementCount();
+      generic_failure_report =
+        std::string(failure.what()).find("failed limiter admission") !=
+        std::string::npos;
+    }
+    mfem::Vector error(state);
+    error -= before;
+    if (rejected_elements != 1 || !generic_failure_report ||
+        error.Normlinf() != 0.0)
+    {
+      std::cerr << "[FAIL] " << label
+                << " was not rejected collectively and transactionally\n";
+      return false;
+    }
+    return true;
+  };
+
+  mfem::ParGridFunction component_overflow(&fes);
+  set_state(component_overflow, /*overflow_component=*/true);
+  const mfem::Vector component_average =
+    ElementAverage(fes, component_overflow, 0, /*quadrature_order=*/2);
+  mfem::IntegrationPoint left_face_midpoint;
+  left_face_midpoint.Set2(0.0, 0.5);
+  const mfem::Vector component_face_value =
+    ElementValue(fes, component_overflow, 0, left_face_midpoint);
+  bool ok = std::isfinite(component_average(0)) &&
+            std::isfinite(Pressure(component_average)) &&
+            !std::isfinite(component_face_value(0));
+  ok = reject_transactionally(component_overflow,
+                              /*quadrature_order=*/2,
+                              "non-finite consumer density") &&
+       ok;
+
+  mfem::ParGridFunction pressure_overflow(&fes);
+  set_state(pressure_overflow, /*overflow_component=*/false);
+  const mfem::Vector pressure_average =
+    ElementAverage(fes, pressure_overflow, 0);
+  const mfem::Vector pressure_node =
+    ElementValue(fes, pressure_overflow, 0, nodes.IntPoint(0));
+  ok = std::isfinite(pressure_average(0)) &&
+       std::isfinite(Pressure(pressure_average)) &&
+       !std::isfinite(Pressure(pressure_node)) && ok;
+  ok = reject_transactionally(pressure_overflow,
+                              kQuadratureOrder,
+                              "non-finite consumer pressure") &&
+       ok;
+
+  if (!ok)
+  {
+    std::cerr << "[FAIL] non-finite consumer-point test setup or rejection\n";
+    return 5;
+  }
+  if (mfem::Mpi::Root())
+  {
+    std::cout << "[PASS] non-finite consumer density and pressure rejected "
+                 "without relying on the optional NaN scan\n";
   }
   return 0;
 }
@@ -438,5 +589,7 @@ int main(int argc, char** argv)
   if (invalid_density != 0) { return invalid_density; }
   const int invalid_pressure = InvalidPressureAverageCase();
   if (invalid_pressure != 0) { return invalid_pressure; }
+  const int nonfinite_consumer = NonFiniteConsumerPointCases();
+  if (nonfinite_consumer != 0) { return nonfinite_consumer; }
   return 0;
 }

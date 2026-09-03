@@ -66,6 +66,7 @@ struct LimiterPipelineConfig
 
   bool zhang_shu = false;
   ZhangShuPointSet zhang_shu_points = ZhangShuPointSet::kConsumer;
+  bool zhang_shu_vtk_points = false;
 };
 
 /**

@@ -242,7 +242,8 @@ std::string FinalizeAdaptiveRejectionOrReason(
   const auto terminal_reason = [&](const char* const reason)
   {
     std::ostringstream stream;
-    stream << reason << " committed_t=" << std::scientific
+    stream << reason << " committed_step=" << time_driver.solver_step()
+           << " committed_t=" << std::scientific
            << std::setprecision(17) << time_driver.time()
            << " attempted_dt=" << plan.dt
            << " next_dt=" << state.next_dt
@@ -1990,6 +1991,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       return Reject(request, "CUDA HDG initial ParaView output failed");
   }
 
+  double minimum_accepted_dt = std::numeric_limits<double>::infinity();
+  double maximum_accepted_dt = 0.0;
   while (!time_driver->Finished())
   {
     double proposed_dt = 0.0;
@@ -2445,6 +2448,32 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
         return Reject(request,
                       "generic CUDA HDG checkpoint publication failed");
     }
+    minimum_accepted_dt = std::min(minimum_accepted_dt, plan.dt);
+    maximum_accepted_dt = std::max(maximum_accepted_dt, plan.dt);
+    const std::uint64_t committed_step = time_driver->solver_step();
+    const bool report_progress = request.options.vis_steps > 0 &&
+        (committed_step %
+             static_cast<std::uint64_t>(request.options.vis_steps) == 0 ||
+         time_driver->Finished());
+    if (report_progress && IsRoot(request.communicator))
+    {
+      std::cout << "[hdg-progress] event=accepted"
+                << " step=" << committed_step
+                << " time=" << time_driver->time()
+                << " accepted_dt=" << plan.dt;
+      if (adaptive_rodas3)
+      {
+        try
+        {
+          const auto progress_state = time_driver->AdaptiveCheckpointState();
+          std::cout << " next_dt=" << progress_state.next_dt
+                    << " rejected_attempts="
+                    << progress_state.rejected_attempts;
+        }
+        catch (...) { std::cout << " controller_state=unavailable"; }
+      }
+      std::cout << '\n';
+    }
   }
 
   HdgTransactionalTimeAdapter::AdaptiveControllerState adaptive_state{};
@@ -2533,6 +2562,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     }
     if (adaptive_rodas3)
       std::cout << " rejected_attempts=" << adaptive_state.rejected_attempts;
+    std::cout << " minimum_accepted_dt=" << minimum_accepted_dt
+              << " maximum_accepted_dt=" << maximum_accepted_dt;
     std::cout << '\n';
   }
   return 0;

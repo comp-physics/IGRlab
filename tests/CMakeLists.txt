@@ -46,6 +46,24 @@ set_tests_properties(dg_igr_adaptive_trace_memory_matrix_python PROPERTIES
   TIMEOUT 180
 )
 
+add_test(NAME dg_igr_shock_architecture_matrix_python
+  COMMAND /usr/bin/env python3
+          ${CMAKE_SOURCE_DIR}/scripts/perf/test_shock_architecture_matrix.py
+)
+set_tests_properties(dg_igr_shock_architecture_matrix_python PROPERTIES
+  LABELS "shock;architecture-selection;python;no-gpu"
+  TIMEOUT 60
+)
+
+add_test(NAME dg_igr_shock_qoi_python
+  COMMAND /usr/bin/env python3
+          ${CMAKE_SOURCE_DIR}/scripts/perf/test_shock_qoi.py
+)
+set_tests_properties(dg_igr_shock_qoi_python PROPERTIES
+  LABELS "shock;qoi;architecture-selection;python;no-gpu"
+  TIMEOUT 60
+)
+
 add_test(NAME dg_igr_hdg_tensor_memory_campaign_python
   COMMAND /usr/bin/env python3
           ${CMAKE_SOURCE_DIR}/scripts/perf/test_hdg_tensor_memory_campaign.py
@@ -124,11 +142,74 @@ add_executable(dg_igr_unit_tests
   test_diagnostics.cpp
 )
 
+add_executable(dg_igr_explicit_ssprk_test
+  test_explicit_ssprk.cpp
+)
+target_link_libraries(dg_igr_explicit_ssprk_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_explicit_ssprk_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+)
+add_test(NAME dg_igr_explicit_ssprk_cpu
+  COMMAND dg_igr_explicit_ssprk_test cpu
+)
+set_tests_properties(dg_igr_explicit_ssprk_cpu PROPERTIES
+  LABELS "timestepping;ssprk;lifecycle;cpu"
+  TIMEOUT 60
+)
+if(MFEM_USE_CUDA)
+  add_test(NAME dg_igr_explicit_ssprk_cuda
+    COMMAND dg_igr_explicit_ssprk_test cuda
+  )
+  set_tests_properties(dg_igr_explicit_ssprk_cuda PROPERTIES
+    LABELS "timestepping;ssprk;lifecycle;cuda"
+    TIMEOUT 60
+    RUN_SERIAL TRUE
+  )
+endif()
+
 target_link_libraries(dg_igr_unit_tests PRIVATE igr_mfem mfem)
 
 target_include_directories(dg_igr_unit_tests PRIVATE
   ${CMAKE_SOURCE_DIR}/include
 )
+
+if(MFEM_USE_MPI AND MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
+  add_executable(dg_igr_vtk_restart_subcommunicator_test
+    test_vtk_restart_subcommunicator.cpp
+  )
+  target_link_libraries(dg_igr_vtk_restart_subcommunicator_test PRIVATE
+    igr_mfem
+    mfem
+  )
+  target_include_directories(dg_igr_vtk_restart_subcommunicator_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+  )
+  add_test(NAME dg_igr_vtk_restart_subcommunicator_cpu
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4
+            $<TARGET_FILE:dg_igr_vtk_restart_subcommunicator_test>
+            ${CMAKE_BINARY_DIR}/tests/vtk-restart-subcommunicator-cpu
+  )
+  set_tests_properties(dg_igr_vtk_restart_subcommunicator_cpu PROPERTIES
+    LABELS "mpi;subcommunicator;dg;vtk;restart"
+    TIMEOUT 180
+    RUN_SERIAL TRUE
+    PROCESSORS 4
+  )
+  add_test(NAME dg_igr_vtk_restart_static_source_mismatch_cpu
+    COMMAND ${CMAKE_COMMAND}
+            -DTEST_EXE=$<TARGET_FILE:dg_igr_vtk_restart_subcommunicator_test>
+            -DOUTPUT_ROOT=${CMAKE_BINARY_DIR}/tests/vtk-restart-static-source-mismatch-cpu
+            -DMPIEXEC=${MPIEXEC_EXECUTABLE}
+            -DMPI_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/check_vtk_restart_source_mismatch.cmake
+  )
+  set_tests_properties(dg_igr_vtk_restart_static_source_mismatch_cpu PROPERTIES
+    LABELS "mpi;subcommunicator;dg;vtk;restart;static-source"
+    TIMEOUT 180
+    RUN_SERIAL TRUE
+    PROCESSORS 4
+  )
+endif()
 
 add_executable(dg_igr_discretization_cli_boundary_test
   test_discretization_cli_boundary.cpp
@@ -219,6 +300,39 @@ if (MFEM_USE_CUDA)
     TIMEOUT 120
     RUN_SERIAL TRUE
   )
+
+  add_executable(dg_igr_exact_iid_device_parity_test
+    test_exact_iid_device_parity.cpp
+  )
+  target_link_libraries(dg_igr_exact_iid_device_parity_test PRIVATE
+    igr_mfem
+    mfem
+  )
+  target_include_directories(dg_igr_exact_iid_device_parity_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+  )
+  set(DG_IGR_EXACT_IID_DEVICE_PARITY_REF
+      "${CMAKE_CURRENT_BINARY_DIR}/exact-iid-device-parity-reference.txt")
+  add_test(NAME dg_igr_exact_iid_device_parity_cpu_reference
+    COMMAND $<TARGET_FILE:dg_igr_exact_iid_device_parity_test>
+            cpu --write-reference ${DG_IGR_EXACT_IID_DEVICE_PARITY_REF}
+  )
+  set_tests_properties(dg_igr_exact_iid_device_parity_cpu_reference PROPERTIES
+    FIXTURES_SETUP dg_igr_exact_iid_device_parity_reference
+    LABELS "cpu-reference;dg;igr;invariant-domain-flux;parity"
+    TIMEOUT 120
+    RUN_SERIAL TRUE
+  )
+  add_test(NAME dg_igr_exact_iid_device_parity_cuda
+    COMMAND $<TARGET_FILE:dg_igr_exact_iid_device_parity_test>
+            cuda --compare ${DG_IGR_EXACT_IID_DEVICE_PARITY_REF}
+  )
+  set_tests_properties(dg_igr_exact_iid_device_parity_cuda PROPERTIES
+    FIXTURES_REQUIRED dg_igr_exact_iid_device_parity_reference
+    LABELS "cuda;dg;igr;invariant-domain-flux;parity"
+    TIMEOUT 120
+    RUN_SERIAL TRUE
+  )
 endif()
 
 add_test(NAME dg_igr_euler_tests COMMAND dg_igr_unit_tests --euler)
@@ -236,6 +350,32 @@ add_test(NAME dg_igr_bc_tests COMMAND dg_igr_unit_tests --bc)
 add_test(NAME dg_igr_igr_tests COMMAND dg_igr_unit_tests --igr)
 add_test(NAME dg_igr_time_defaults_tests COMMAND dg_igr_unit_tests --time-defaults)
 add_test(NAME dg_igr_diagnostics_tests COMMAND dg_igr_unit_tests --diagnostics)
+
+if(TARGET dgsem_smooth_advection_periodic)
+  add_test(NAME dg_igr_hdg_static_source_legacy_ignored_by_dgsem
+    COMMAND $<TARGET_FILE:dgsem_smooth_advection_periodic>
+            -dev cpu -rs 0 -rp 0 -o 1 -tf 1.0e-4 -dt 1.0e-4 -c 0.0
+            -no-glvis -no-vtk -no-save-state -iprint 0
+            --hdg-static-source 0.01
+  )
+  set_tests_properties(dg_igr_hdg_static_source_legacy_ignored_by_dgsem
+    PROPERTIES
+      LABELS "config;compatibility;dgsem;static-source"
+      TIMEOUT 120
+  )
+
+  add_test(NAME dg_igr_static_source_ordinary_dg_smoke
+    COMMAND $<TARGET_FILE:dgsem_smooth_advection_periodic>
+            -dev cpu -rs 0 -rp 0 -o 1 -tf 1.0e-4 -dt 1.0e-4 -c 0.0
+            -no-glvis -no-vtk -no-save-state -iprint 0
+            --dg-backend dg --static-source 0.01
+  )
+  set_tests_properties(dg_igr_static_source_ordinary_dg_smoke
+    PROPERTIES
+      LABELS "dg;static-source;smoke"
+      TIMEOUT 120
+  )
+endif()
 
 if (TARGET supersonic_cylinder_w_igr)
   add_test(NAME dg_igr_sigma_vtk_lifecycle_cpu
@@ -265,6 +405,23 @@ if (TARGET supersonic_cylinder_w_igr)
   set_tests_properties(dg_igr_vtk_restart_cpu PROPERTIES
     LABELS "igr;vtk;restart"
     TIMEOUT 300
+    RUN_SERIAL TRUE
+  )
+
+  add_test(NAME dg_igr_vtk_restart_ssprk104_iidflux_cpu
+    COMMAND /usr/bin/env python3
+            ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+            --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+            --device cpu
+            --time-integrator ssprk104
+            --invariant-domain-flux
+            --zhang-shu-vtk-points
+            --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-ssprk104-iidflux-cpu
+            --negative-controls
+  )
+  set_tests_properties(dg_igr_vtk_restart_ssprk104_iidflux_cpu PROPERTIES
+    LABELS "igr;vtk;restart;ssprk104;invariant-domain-flux"
+    TIMEOUT 360
     RUN_SERIAL TRUE
   )
 
@@ -312,6 +469,21 @@ if (TARGET supersonic_cylinder_w_igr)
       TIMEOUT 180
       RUN_SERIAL TRUE
     )
+
+    add_test(NAME dg_vtk_restart_ssprk104_no_igr_cpu
+      COMMAND /usr/bin/env python3
+              ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              --exe $<TARGET_FILE:supersonic_cylinder>
+              --device cpu
+              --no-igr
+              --time-integrator ssprk104
+              --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-ssprk104-no-igr-cpu
+    )
+    set_tests_properties(dg_vtk_restart_ssprk104_no_igr_cpu PROPERTIES
+      LABELS "dg;vtk;restart;ssprk104;conventional"
+      TIMEOUT 240
+      RUN_SERIAL TRUE
+    )
   endif()
 
   if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
@@ -328,6 +500,26 @@ if (TARGET supersonic_cylinder_w_igr)
     set_tests_properties(dg_igr_vtk_restart_mpi_cpu PROPERTIES
       LABELS "mpi;igr;vtk;restart;exact-face"
       TIMEOUT 300
+      RUN_SERIAL TRUE
+      PROCESSORS 2
+    )
+
+    add_test(NAME dg_igr_vtk_restart_ssprk104_iidflux_mpi_cpu
+      COMMAND /usr/bin/env python3
+              ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+              --device cpu
+              --time-integrator ssprk104
+              --invariant-domain-flux
+              --zhang-shu-vtk-points
+              --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-ssprk104-iidflux-mpi-cpu
+              --mpi-ranks 2
+              --mpiexec ${MPIEXEC_EXECUTABLE}
+              --mpi-numproc-flag=${MPIEXEC_NUMPROC_FLAG}
+    )
+    set_tests_properties(dg_igr_vtk_restart_ssprk104_iidflux_mpi_cpu PROPERTIES
+      LABELS "mpi;igr;vtk;restart;ssprk104;invariant-domain-flux"
+      TIMEOUT 360
       RUN_SERIAL TRUE
       PROCESSORS 2
     )
@@ -360,6 +552,39 @@ if (TARGET supersonic_cylinder_w_igr)
       RUN_SERIAL TRUE
     )
 
+    add_test(NAME dg_igr_vtk_restart_ssprk104_iidflux_cuda
+      COMMAND /usr/bin/env python3
+              ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+              --device cuda
+              --time-integrator ssprk104
+              --invariant-domain-flux
+              --zhang-shu-vtk-points
+              --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-ssprk104-iidflux-cuda
+    )
+    set_tests_properties(dg_igr_vtk_restart_ssprk104_iidflux_cuda PROPERTIES
+      LABELS "cuda;igr;vtk;restart;ssprk104;invariant-domain-flux"
+      TIMEOUT 360
+      RUN_SERIAL TRUE
+    )
+
+    if (TARGET supersonic_cylinder)
+      add_test(NAME dg_vtk_restart_ssprk104_no_igr_cuda
+        COMMAND /usr/bin/env python3
+                ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+                --exe $<TARGET_FILE:supersonic_cylinder>
+                --device cuda
+                --no-igr
+                --time-integrator ssprk104
+                --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-ssprk104-no-igr-cuda
+      )
+      set_tests_properties(dg_vtk_restart_ssprk104_no_igr_cuda PROPERTIES
+        LABELS "cuda;dg;vtk;restart;ssprk104;conventional"
+        TIMEOUT 300
+        RUN_SERIAL TRUE
+      )
+    endif()
+
     if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
       add_test(NAME dg_igr_sigma_vtk_lifecycle_mpi_cuda
         COMMAND /usr/bin/env python3
@@ -391,6 +616,26 @@ if (TARGET supersonic_cylinder_w_igr)
       set_tests_properties(dg_igr_vtk_restart_mpi_cuda PROPERTIES
         LABELS "cuda;mpi;igr;vtk;restart;exact-face"
         TIMEOUT 360
+        RUN_SERIAL TRUE
+        PROCESSORS 2
+      )
+
+      add_test(NAME dg_igr_vtk_restart_ssprk104_iidflux_mpi_cuda
+        COMMAND /usr/bin/env python3
+                ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+                --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
+                --device cuda
+                --time-integrator ssprk104
+                --invariant-domain-flux
+                --zhang-shu-vtk-points
+                --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-ssprk104-iidflux-mpi-cuda
+                --mpi-ranks 2
+                --mpiexec ${MPIEXEC_EXECUTABLE}
+                --mpi-numproc-flag=${MPIEXEC_NUMPROC_FLAG}
+      )
+      set_tests_properties(dg_igr_vtk_restart_ssprk104_iidflux_mpi_cuda PROPERTIES
+        LABELS "cuda;mpi;igr;vtk;restart;ssprk104;invariant-domain-flux"
+        TIMEOUT 420
         RUN_SERIAL TRUE
         PROCESSORS 2
       )

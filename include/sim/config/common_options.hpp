@@ -8,6 +8,7 @@
 #include <string>
 
 #include "mfem.hpp"
+#include "utils/config/env_flags.hpp"
 
 namespace dg_sim
 {
@@ -44,6 +45,8 @@ struct CommonOptions
   ///< Positivity limiter selector: case | none | zhang-shu.
   std::string zhang_shu_points =
     "consumer"; ///< Zhang-Shu point set: "consumer" or "quadrature".
+  bool zhang_shu_vtk_points = false;
+  ///< Also enforce positivity at the refined points used for VTK output.
   std::string dgsem_stab =
     "none"; ///< DGSEM stabilization: "none", "split", or "filter".
   std::string dgsem_volume_flux =
@@ -79,6 +82,8 @@ struct CommonOptions
   bool nan_scan = false; ///< Enable NaN/inf scanning during the time loop.
   bool admissibility_scan =
     false; ///< Enable Euler density/pressure admissibility scans during the time loop.
+  bool conservation_balance =
+    false; ///< Enable bounded accepted-step Euler conservation diagnostics.
   std::string restart_vtk; ///< PVD file or dataset directory to restart from.
   int restart_cycle = -1;  ///< Selected PVD cycle; -1 selects the latest cycle.
   int restart_step = -1;   ///< Completed global step for legacy VTK cycles.
@@ -99,6 +104,11 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                              CommonOptions& opts,
                              const std::string& mesh_help)
 {
+  // Preserve the historical environment-only control as a default seed.
+  // Either typed CLI spelling registered below remains authoritative.
+  opts.zhang_shu_vtk_points = dg_igr::EnvFlagEnabledDefault(
+    "DG_IGR_LIMITER_ENFORCE_VTK_POINTS", opts.zhang_shu_vtk_points);
+
   args.AddOption(&opts.mesh_file, "-m", "--mesh", mesh_help.c_str());
   args.AddOption(&opts.ser_ref_levels,
                  "-rs",
@@ -146,8 +156,8 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.time_integrator,
                  "-ti",
                  "--time-integrator",
-                 "Time integrator: rk3ssp | backward-euler | "
-                 "partitioned-backward-euler | rodas3 "
+                 "Time integrator: rk3ssp | ssprk104 | "
+                 "backward-euler | partitioned-backward-euler | rodas3 "
                  "(discretization support required).");
   args.AddOption(&opts.time_atol,
                  "-tatol",
@@ -167,6 +177,13 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-zsp",
                  "--zhang-shu-points",
                  "Zhang-Shu positivity points: consumer | quadrature.");
+  args.AddOption(&opts.zhang_shu_vtk_points,
+                 "-zsvtk",
+                 "--zhang-shu-vtk-points",
+                 "-no-zsvtk",
+                 "--no-zhang-shu-vtk-points",
+                 "Enable or disable Zhang-Shu enforcement at the refined "
+                 "points used for VTK output (default off).");
   args.AddOption(
     &opts.dgsem_stab,
     "-ds",
@@ -288,6 +305,15 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "--no-admissibility-scan",
                  "Enable or disable Euler density/pressure admissibility "
                  "scans during time integration.");
+  args.AddOption(&opts.conservation_balance,
+                 "-conservation-balance",
+                 "--conservation-balance",
+                 "-no-conservation-balance",
+                 "--no-conservation-balance",
+                 "Enable or disable bounded accepted-step Euler physical-"
+                 "boundary conservation diagnostics. This qualification "
+                 "mode adds reductions and is excluded from performance "
+                 "timings.");
   args.AddOption(&opts.restart_vtk,
                  "-restart-vtk",
                  "--restart-vtk",

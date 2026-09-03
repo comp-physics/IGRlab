@@ -30,7 +30,10 @@ template <typename NumericalFlux> struct EulerIGRPhysics
            gamma,
            igr,
            ctx.run_cfg.igr_opts.sigma_aware_cfl,
-           ctx.run_cfg.igr_opts.sigma_aware_rusanov),
+           ctx.run_cfg.igr_opts.sigma_aware_rusanov,
+           ctx.run_cfg.igr_opts.igr_invariant_domain_flux,
+           ctx.run_cfg.case_config.rk3_config.rho_min,
+           ctx.run_cfg.case_config.rk3_config.p_min),
       op(MakeDGOperator(ctx, flux.numerical_flux))
   {
     ConfigureDGSEMSurfaceFlux(flux.numerical_flux, ctx.run_cfg, gamma);
@@ -39,7 +42,13 @@ template <typename NumericalFlux> struct EulerIGRPhysics
       flux.numerical_flux,
       ctx.run_cfg.case_config.int_order_offset,
       ctx.dim,
-      gamma);
+      gamma,
+      ctx.run_cfg.igr_opts.igr_invariant_domain_flux
+        ? ctx.run_cfg.case_config.rk3_config.rho_min
+        : mfem::kEulerBoundaryDensityFloor,
+      ctx.run_cfg.igr_opts.igr_invariant_domain_flux
+        ? ctx.run_cfg.case_config.rk3_config.p_min
+        : mfem::kEulerBoundaryPressureFloor);
     bc_setup(bc, markers);
   }
 };

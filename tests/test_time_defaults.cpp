@@ -1,13 +1,17 @@
 #include "sim/config/case_config.hpp"
 #include "sim/context/example_context.hpp"
+#include "sim/io/run_metadata.hpp"
 #include "sim/io/vtk_helpers.hpp"
+#include "sim/solver/solver.hpp"
 #include "sim/solver/solver_helpers.hpp"
 #include "sim/state/euler_state_bundle.hpp"
 #include "sim/time/time_defaults.hpp"
+#include "utils/diagnostics/euler_admissibility.hpp"
 
 #include "test_utils.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -33,6 +37,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "positivity limiter defaults preserve the case policy");
     ctx.Check(opts.zhang_shu_points == "consumer",
               "Zhang-Shu defaults: consumer point set selected");
+    ctx.Check(!opts.zhang_shu_vtk_points,
+              "Zhang-Shu defaults: refined VTK points are disabled");
     ctx.Check(opts.hdg_igr_alpha == 1.0 && opts.hdg_igr_beta == 1.0,
               "HDG IGR defaults: alpha and beta are one");
     ctx.Check(opts.hdg_cuda_engine == "ordinary",
@@ -71,10 +77,13 @@ int RunTimeDefaultsTests(TestContext& ctx)
 
     opts.positivity_limiter = "case";
     opts.zhang_shu_points = "quadrature";
+    opts.zhang_shu_vtk_points = true;
     const dg_sim::RunConfig run_cfg =
       dg_sim::MakeRunConfig(case_cfg, opts, igr_opts);
     ctx.Check(run_cfg.case_config.limiter_pipeline.zhang_shu_points ==
-                mfem::ZhangShuPointSet::kQuadrature,
+                mfem::ZhangShuPointSet::kQuadrature &&
+                run_cfg.case_config.limiter_pipeline.zhang_shu_vtk_points &&
+                run_cfg.opts.zhang_shu_vtk_points,
               "Zhang-Shu options: CLI policy reaches limiter pipeline");
     ctx.Check(std::string(dg_sim::ZhangShuPointSetToString(
                 mfem::ZhangShuPointSet::kConsumer)) == "consumer",
@@ -190,14 +199,25 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   dg_sim::TimeIntegrator::PartitionedBackwardEuler &&
                 dg_sim::TryParseTimeIntegrator("RODAS3") ==
                   dg_sim::TimeIntegrator::Rodas3 &&
+                dg_sim::TryParseTimeIntegrator("SSPRK104") ==
+                  dg_sim::TimeIntegrator::SSPRK104 &&
                 std::string(dg_sim::TimeIntegratorToString(
                   dg_sim::TimeIntegrator::RK3SSP)) == "rk3ssp" &&
+                std::string(dg_sim::TimeIntegratorToString(
+                  dg_sim::TimeIntegrator::SSPRK104)) == "ssprk104" &&
                 std::string(dg_sim::TimeIntegratorToString(
                   dg_sim::TimeIntegrator::PartitionedBackwardEuler)) ==
                   "partitioned-backward-euler" &&
                 std::string(dg_sim::TimeIntegratorToString(
                   dg_sim::TimeIntegrator::Rodas3)) == "rodas3",
               "request: time-integrator parser and metadata name are stable");
+    ctx.Check(dg_sim::SSPRKMethodForTimeIntegrator(
+                dg_sim::TimeIntegrator::RK3SSP) ==
+                  mfem::SSPRKMethod::SSPRK33 &&
+                dg_sim::SSPRKMethodForTimeIntegrator(
+                  dg_sim::TimeIntegrator::SSPRK104) ==
+                  mfem::SSPRKMethod::SSPRK104,
+              "request: typed explicit selectors map to SSPRK methods");
     ctx.Check(!dg_sim::TryParseTimeIntegrator("invalid"),
               "request: invalid time integrator is not parsed");
     ctx.Check(dg_sim::TryParseDeviceBackend("CUDA") ==
@@ -254,6 +274,22 @@ int RunTimeDefaultsTests(TestContext& ctx)
                 dgsem_default.time_integrator == dg_sim::TimeIntegrator::RK3SSP,
               "request: omitted DGSEM selectors retain CaseSpec "
               "regularization and RK3SSP");
+
+    const dg_sim::SolverRequestResolution dg_ssprk104 =
+      dg_sim::ResolveSolverRequest("dg", true, "", "dg", "", "ssprk104",
+                                   false, false, false, true);
+    ctx.Check(dg_ssprk104.IsResolved() &&
+                dg_ssprk104.time_integrator ==
+                  dg_sim::TimeIntegrator::SSPRK104,
+              "request: DG admits typed SSPRK(10,4) opt-in");
+
+    const dg_sim::SolverRequestResolution dgsem_ssprk104 =
+      dg_sim::ResolveSolverRequest("dgsem", true, "", "dgsem", "",
+                                   "ssprk104", false, false, false, true);
+    ctx.Check(dgsem_ssprk104.IsResolved() &&
+                dgsem_ssprk104.time_integrator ==
+                  dg_sim::TimeIntegrator::SSPRK104,
+              "request: DGSEM admits typed SSPRK(10,4) opt-in");
 
     const dg_sim::SolverRequestResolution legacy_override =
       dg_sim::ResolveSolverRequest("dg", true, "", "dg", "none", "rk3ssp",
@@ -375,6 +411,13 @@ int RunTimeDefaultsTests(TestContext& ctx)
     ctx.Check(hdg_rk.status ==
                 dg_sim::SolverRequestResolutionStatus::UnsupportedTimeIntegrator,
               "request: HDG RK3SSP is rejected");
+
+    const dg_sim::SolverRequestResolution hdg_ssprk104 =
+      dg_sim::ResolveSolverRequest("dg", false, "hdg", "dg", "",
+                                   "ssprk104", true, false, false, true);
+    ctx.Check(hdg_ssprk104.status ==
+                dg_sim::SolverRequestResolutionStatus::UnsupportedTimeIntegrator,
+              "request: HDG SSPRK(10,4) is rejected");
 
     const dg_sim::SolverRequestResolution hdg_partitioned_cpu =
       dg_sim::ResolveSolverRequest(
@@ -503,6 +546,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "IGR defaults: sigma-aware CFL is disabled");
     ctx.Check(!igr_opts.sigma_aware_rusanov,
               "IGR defaults: sigma-aware Rusanov is disabled");
+    ctx.Check(!igr_opts.igr_invariant_domain_flux,
+              "IGR defaults: invariant-domain flux is disabled");
     ctx.CheckNear(igr_opts.stage_rtol_scale,
                   1.0,
                   0.0,
@@ -595,6 +640,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     dg_sim::IGROptions igr_opts;
     opts.device = "cpu";
     opts.dg_backend = "dg";
+    opts.positivity_limiter = "zhang-shu";
     igr_opts.space = "L2";
     igr_opts.grad = "BrokenL2";
     igr_opts.linear_solver = "cg";
@@ -602,6 +648,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
     igr_opts.lin_rtol = 3.0e-3;
     igr_opts.lin_maxit = 777;
     igr_opts.sigma_aware_cfl = true;
+    igr_opts.igr_invariant_domain_flux = true;
+    opts.zhang_shu_vtk_points = true;
     dg_sim::ApplyIGRDerivedRuntimeDefaults(opts,
                                            igr_opts,
                                            /*exact_face_operator_overridden=*/false);
@@ -617,6 +665,16 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "IGR defaults: explicit CPU L2 iteration cap is preserved");
     ctx.Check(igr_opts.sigma_aware_cfl,
               "IGR defaults: explicit sigma-aware CFL opt-in is preserved");
+    ctx.Check(igr_opts.igr_invariant_domain_flux,
+              "IGR defaults: explicit invariant-domain flux is preserved");
+    const dg_sim::RunConfig exact_flux_run =
+      dg_sim::MakeRunConfig(dg_sim::CaseConfig{}, opts, igr_opts);
+    ctx.Check(exact_flux_run.igr_opts.igr_invariant_domain_flux &&
+                exact_flux_run.case_config.limiter_pipeline.zhang_shu &&
+                exact_flux_run.case_config.limiter_pipeline
+                  .zhang_shu_vtk_points,
+              "IGR options: invariant-domain DG accepts the VTK-point "
+              "limiter policy");
   }
 
   {
@@ -633,6 +691,77 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "IGR defaults: CPU H1 keeps its CG-resolving auto policy");
     ctx.Check(igr_opts.preconditioner == "auto",
               "IGR defaults: CPU H1 keeps its BoomerAMG-resolving auto policy");
+  }
+
+  // --- Exact invariant-domain flux has paired typed CLI controls ---
+  {
+    char program_name[] = "test";
+    char enable_name[] = "--igr-invariant-domain-flux";
+    char* enable_argv[] = {program_name, enable_name};
+    dg_sim::IGROptions enabled;
+    mfem::OptionsParser enable_parser(2, enable_argv);
+    dg_sim::AddIGROptions(enable_parser, enabled);
+    enable_parser.Parse();
+    ctx.Check(enable_parser.Good() && enabled.igr_invariant_domain_flux,
+              "IGR options: invariant-domain flux enable flag parses");
+
+    char disable_name[] = "--no-igr-invariant-domain-flux";
+    char* disable_argv[] = {program_name, disable_name};
+    dg_sim::IGROptions disabled;
+    disabled.igr_invariant_domain_flux = true;
+    mfem::OptionsParser disable_parser(2, disable_argv);
+    dg_sim::AddIGROptions(disable_parser, disabled);
+    disable_parser.Parse();
+    ctx.Check(disable_parser.Good() && !disabled.igr_invariant_domain_flux,
+              "IGR options: invariant-domain flux disable flag parses");
+  }
+
+  // --- Refined VTK limiter points have typed CLI and legacy-env controls ---
+  {
+    constexpr const char* vtk_points_env =
+      "DG_IGR_LIMITER_ENFORCE_VTK_POINTS";
+    const char* original_env_text = std::getenv(vtk_points_env);
+    const std::optional<std::string> original_env = original_env_text
+      ? std::optional<std::string>(original_env_text)
+      : std::nullopt;
+    unsetenv(vtk_points_env);
+
+    char program_name[] = "test";
+    char enable_name[] = "--zhang-shu-vtk-points";
+    char* enable_argv[] = {program_name, enable_name};
+    dg_sim::CommonOptions enabled;
+    mfem::OptionsParser enable_parser(2, enable_argv);
+    dg_sim::AddCommonOptions(enable_parser, enabled, "test mesh");
+    enable_parser.Parse();
+    ctx.Check(enable_parser.Good() && enabled.zhang_shu_vtk_points,
+              "Zhang-Shu VTK points: typed enable flag parses");
+
+    setenv(vtk_points_env, "1", 1);
+    char disable_name[] = "--no-zhang-shu-vtk-points";
+    char* disable_argv[] = {program_name, disable_name};
+    dg_sim::CommonOptions disabled;
+    mfem::OptionsParser disable_parser(2, disable_argv);
+    dg_sim::AddCommonOptions(disable_parser, disabled, "test mesh");
+    disable_parser.Parse();
+    ctx.Check(disable_parser.Good() && !disabled.zhang_shu_vtk_points,
+              "Zhang-Shu VTK points: typed disable overrides legacy env");
+
+    char* env_argv[] = {program_name};
+    dg_sim::CommonOptions env_enabled;
+    mfem::OptionsParser env_parser(1, env_argv);
+    dg_sim::AddCommonOptions(env_parser, env_enabled, "test mesh");
+    env_parser.Parse();
+    ctx.Check(env_parser.Good() && env_enabled.zhang_shu_vtk_points,
+              "Zhang-Shu VTK points: legacy env remains a default fallback");
+
+    if (original_env)
+    {
+      setenv(vtk_points_env, original_env->c_str(), 1);
+    }
+    else
+    {
+      unsetenv(vtk_points_env);
+    }
   }
 
   // --- Callback config wiring ---
@@ -714,6 +843,391 @@ int RunTimeDefaultsTests(TestContext& ctx)
   const mfem::Vector state =
     EulerConsFromPrim2D(/*rho=*/1.2, /*u=*/0.3, /*v=*/-0.1, /*p=*/0.9, gamma);
   FillConstantState(state, bundle.sol);
+
+  // --- initial Zhang-Shu admission precedes all consumers and is strict ---
+  {
+    dg_sim::RunConfig limiter_run = run_cfg;
+    limiter_run.case_config.gamma = gamma;
+    limiter_run.case_config.int_order_offset = 1;
+    limiter_run.case_config.rk3_config.gamma = gamma;
+    limiter_run.case_config.rk3_config.rho_min = 1.0e-12;
+    limiter_run.case_config.rk3_config.p_min = 1.0e-12;
+    limiter_run.case_config.rk3_config.quad_order = 0;
+    limiter_run.case_config.rk3_config.p_bisect_iters = 20;
+    limiter_run.regularization = dg_sim::Regularization::None;
+    limiter_run.case_config.limiter_pipeline.zhang_shu = false;
+    limiter_run.case_config.limiter_pipeline.zhang_shu_points =
+      mfem::ZhangShuPointSet::kConsumer;
+
+    FillConstantState(state, bundle.sol);
+    const int scalar_dofs = example_ctx.spaces.vfes.GetNDofs();
+    if (scalar_dofs > 0)
+    {
+      // The element mean remains admissible, but one Euler consumer node has
+      // negative pressure and therefore requires a mean-preserving blend.
+      bundle.sol.HostReadWrite()[3 * scalar_dofs] = -0.5;
+    }
+    const mfem::Vector candidate(bundle.sol);
+    const bool disabled_applied =
+      dg_sim::detail::ApplyInitialEulerZhangShuTransaction(limiter_run,
+                                                           bundle);
+    mfem::Vector disabled_error(bundle.sol);
+    disabled_error -= candidate;
+    ctx.Check(!disabled_applied && disabled_error.Normlinf() == 0.0,
+              "initial admission: disabled Zhang-Shu policy is an exact no-op");
+
+    limiter_run.regularization = dg_sim::Regularization::IGR;
+    limiter_run.case_config.limiter_pipeline.zhang_shu = true;
+    const int volume_qord =
+      2 * example_ctx.spaces.vfes.GetFE(0)->GetOrder() + 2;
+    const std::vector<int> face_qords{
+      2 * example_ctx.spaces.vfes.GetFE(0)->GetOrder() +
+      limiter_run.case_config.int_order_offset};
+    const auto pre_dof_scan = mfem::dg_igr::ScanEulerAdmissibility(
+      example_ctx.spaces.vfes,
+      bundle.sol,
+      /*dim=*/2,
+      gamma,
+      limiter_run.case_config.rk3_config.rho_min,
+      limiter_run.case_config.rk3_config.p_min,
+      volume_qord,
+      face_qords,
+      mfem::dg_igr::EulerAdmissibilityPointSet::Dof);
+    const auto integral_before =
+      dg_sim::detail::IntegrateEulerConservedState(bundle.sol);
+    mfem::ZhangShuLimiterElementDiagnostics diagnostics;
+    const bool enabled_applied =
+      dg_sim::detail::ApplyInitialEulerZhangShuTransaction(limiter_run,
+                                                           bundle,
+                                                           &diagnostics);
+    const auto post_dof_scan = mfem::dg_igr::ScanEulerAdmissibility(
+      example_ctx.spaces.vfes,
+      bundle.sol,
+      /*dim=*/2,
+      gamma,
+      limiter_run.case_config.rk3_config.rho_min,
+      limiter_run.case_config.rk3_config.p_min,
+      volume_qord,
+      face_qords,
+      mfem::dg_igr::EulerAdmissibilityPointSet::Dof);
+    const auto post_limiter_scan = mfem::dg_igr::ScanEulerAdmissibility(
+      example_ctx.spaces.vfes,
+      bundle.sol,
+      /*dim=*/2,
+      gamma,
+      limiter_run.case_config.rk3_config.rho_min,
+      limiter_run.case_config.rk3_config.p_min,
+      volume_qord,
+      face_qords,
+      mfem::dg_igr::EulerAdmissibilityPointSet::Limiter);
+    const auto integral_after =
+      dg_sim::detail::IntegrateEulerConservedState(bundle.sol);
+    double local_active = 0.0;
+    const double* active = diagnostics.active.HostRead();
+    for (int i = 0; i < diagnostics.active.Size(); ++i)
+    {
+      local_active += active[i];
+    }
+    double global_active = local_active;
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &global_active,
+                  1,
+                  mfem::MPITypeMap<double>::mpi_type,
+                  MPI_SUM,
+                  example_ctx.spaces.vfes.GetComm());
+    ctx.Check(pre_dof_scan.global_bad_pressure > 0 && enabled_applied &&
+                post_dof_scan.global_bad_rho == 0 &&
+                post_dof_scan.global_bad_pressure == 0 &&
+                post_limiter_scan.global_bad_rho == 0 &&
+                post_limiter_scan.global_bad_pressure == 0 &&
+                global_active > 0.0,
+              "initial admission: consumer-point violation is limited before "
+              "use");
+    for (int component = 0; component < state.Size(); ++component)
+    {
+      ctx.CheckNear(integral_after.components(component),
+                    integral_before.components(component),
+                    2.0e-12,
+                    "initial admission: limiter preserves component " +
+                      std::to_string(component) + " integral");
+    }
+
+    mfem::Vector inadmissible_mean(4);
+    inadmissible_mean(0) = -1.0;
+    inadmissible_mean(1) = 0.0;
+    inadmissible_mean(2) = 0.0;
+    inadmissible_mean(3) = 2.5;
+    FillConstantState(inadmissible_mean, bundle.sol);
+    const mfem::Vector invalid_before(bundle.sol);
+    bool caught_invalid_mean = false;
+    int reported_rejected_elements = 0;
+    try
+    {
+      dg_sim::detail::ApplyInitialEulerZhangShuTransaction(limiter_run,
+                                                           bundle);
+    }
+    catch (const mfem::RecoverableLimiterFailure& failure)
+    {
+      caught_invalid_mean = true;
+      reported_rejected_elements = failure.GlobalRejectedElementCount();
+    }
+    int caught_min = caught_invalid_mean ? 1 : 0;
+    int caught_max = caught_min;
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &caught_min,
+                  1,
+                  MPI_INT,
+                  MPI_MIN,
+                  example_ctx.spaces.vfes.GetComm());
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &caught_max,
+                  1,
+                  MPI_INT,
+                  MPI_MAX,
+                  example_ctx.spaces.vfes.GetComm());
+    mfem::Vector invalid_error(bundle.sol);
+    invalid_error -= invalid_before;
+    double global_invalid_error = invalid_error.Normlinf();
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &global_invalid_error,
+                  1,
+                  mfem::MPITypeMap<double>::mpi_type,
+                  MPI_MAX,
+                  example_ctx.spaces.vfes.GetComm());
+    ctx.Check(caught_min == 1 && caught_max == 1 &&
+                reported_rejected_elements > 0 && global_invalid_error == 0.0,
+              "initial admission: invalid mean rejects collectively without "
+              "mutation");
+    FillConstantState(state, bundle.sol);
+  }
+
+  // A proper subcommunicator must make its own admission decision: an
+  // inadmissible group cannot reject an independent admissible group.
+  {
+    int world_rank = 0;
+    int world_size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    const int color = world_size > 1 ? world_rank % 2 : 0;
+    MPI_Comm subcommunicator = MPI_COMM_NULL;
+    MPI_Comm_split(MPI_COMM_WORLD, color, world_rank, &subcommunicator);
+    {
+      int subcommunicator_size = 1;
+      MPI_Comm_size(subcommunicator, &subcommunicator_size);
+      mfem::Mesh submesh = mfem::Mesh::MakeCartesian2D(
+        std::max(1, subcommunicator_size),
+        1,
+        mfem::Element::QUADRILATERAL,
+        /*gen_edges=*/true,
+        /*sx=*/1.0,
+        /*sy=*/1.0);
+      auto submesh_parallel =
+        std::make_unique<mfem::ParMesh>(subcommunicator, submesh);
+      submesh.Clear();
+
+      dg_sim::RunConfig sub_run;
+      sub_run.opts.order = 1;
+      sub_run.dg_backend = dg_sim::DGBackend::DG;
+      sub_run.case_config.gamma = gamma;
+      sub_run.case_config.int_order_offset = 1;
+      sub_run.case_config.rk3_config.gamma = gamma;
+      sub_run.case_config.rk3_config.rho_min = 1.0e-12;
+      sub_run.case_config.rk3_config.p_min = 1.0e-12;
+      sub_run.case_config.limiter_pipeline.zhang_shu = true;
+      sub_run.case_config.limiter_pipeline.zhang_shu_points =
+        mfem::ZhangShuPointSet::kConsumer;
+      dg_sim::ExampleContext sub_context(sub_run,
+                                         std::move(submesh_parallel),
+                                         /*sigma_space=*/"H1",
+                                         /*need_sigma=*/false,
+                                         /*need_h1=*/false);
+      dg_sim::EulerStateBundle sub_bundle(
+        sub_context, gamma, /*rho_floor=*/1.0e-12);
+      mfem::Vector sub_state = state;
+      if (color == 0)
+      {
+        sub_state(0) = -1.0;
+        sub_state(1) = 0.0;
+        sub_state(2) = 0.0;
+        sub_state(3) = 2.5;
+      }
+      FillConstantState(sub_state, sub_bundle.sol);
+
+      bool subcommunicator_rejected = false;
+      try
+      {
+        dg_sim::detail::ApplyInitialEulerZhangShuTransaction(sub_run,
+                                                             sub_bundle);
+      }
+      catch (const mfem::RecoverableLimiterFailure&)
+      {
+        subcommunicator_rejected = true;
+      }
+      ctx.Check(subcommunicator_rejected == (color == 0),
+                "initial admission: decisions are isolated by state "
+                "subcommunicator");
+    }
+    MPI_Comm_free(&subcommunicator);
+  }
+
+  // --- Explicit SSPRK selections have collision-free output identities ---
+  {
+    dg_sim::CaseConfig dataset_case;
+    dataset_case.case_name = "ssprk-dataset";
+    dg_sim::RunConfig dataset_run;
+    dataset_run.opts.order = 3;
+    dataset_run.opts.ser_ref_levels = 1;
+    dataset_run.opts.par_ref_levels = 2;
+    dataset_run.igr_opts.space = "L2";
+    dataset_run.igr_opts.grad = "BrokenL2";
+    dataset_run.igr_opts.c_alpha_user = 0.25;
+
+    dataset_run.time_integrator = dg_sim::TimeIntegrator::RK3SSP;
+    const std::string rk3_name =
+      dg_sim::MakeCaseVTKDatasetName(dataset_case, dataset_run);
+    dataset_run.time_integrator = dg_sim::TimeIntegrator::SSPRK104;
+    const std::string ssprk104_name =
+      dg_sim::MakeCaseVTKDatasetName(dataset_case, dataset_run);
+
+    ctx.Check(ssprk104_name == rk3_name + "_ti_ssprk104",
+              "VTK dataset: SSPRK(10,4) has a typed suffix");
+    ctx.Check(rk3_name.find("_ti_") == std::string::npos,
+              "VTK dataset: established RK3SSP name remains unchanged");
+    dataset_run.igr_opts.igr_invariant_domain_flux = true;
+    const std::string invariant_flux_name =
+      dg_sim::MakeCaseVTKDatasetName(dataset_case, dataset_run);
+    ctx.Check(invariant_flux_name == ssprk104_name + "_iidflux",
+              "VTK dataset: exact IGR-aware face flux has a typed suffix");
+    dataset_run.opts.zhang_shu_vtk_points = true;
+    const std::string vtk_point_name =
+      dg_sim::MakeCaseVTKDatasetName(dataset_case, dataset_run);
+    ctx.Check(vtk_point_name == invariant_flux_name + "_zsvtk",
+              "VTK dataset: refined limiter points have a typed suffix");
+  }
+
+  // --- Run metadata records the new explicit time-integrator identity ---
+  {
+    constexpr const char* prefix_env_name = "DG_IGR_VTK_PREFIX_PATH";
+    const char* original_prefix_text = std::getenv(prefix_env_name);
+    const std::optional<std::string> original_prefix = original_prefix_text
+      ? std::optional<std::string>(original_prefix_text)
+      : std::nullopt;
+
+    long long output_token = 0;
+    if (mfem::Mpi::Root())
+    {
+      output_token = std::chrono::high_resolution_clock::now()
+                       .time_since_epoch()
+                       .count();
+    }
+    MPI_Bcast(&output_token,
+              1,
+              mfem::MPITypeMap<long long>::mpi_type,
+              0,
+              MPI_COMM_WORLD);
+    const std::filesystem::path output_root =
+      std::filesystem::path("/tmp") /
+      ("dg_igr_ssprk_metadata_" + std::to_string(output_token));
+    setenv(prefix_env_name, output_root.c_str(), 1);
+
+    dg_sim::CaseConfig metadata_case;
+    metadata_case.case_name = "ssprk-metadata";
+    dg_sim::RunConfig metadata_run;
+    metadata_run.case_config = metadata_case;
+    metadata_run.opts.vtk_save = true;
+    metadata_run.opts.order = 2;
+    metadata_run.igr_opts.space = "L2";
+    metadata_run.igr_opts.grad = "BrokenL2";
+    metadata_run.igr_opts.igr_invariant_domain_flux = true;
+    metadata_run.opts.zhang_shu_vtk_points = true;
+    const std::vector<dg_sim::TimeIntegrator> methods = {
+      dg_sim::TimeIntegrator::SSPRK104};
+    dg_sim::RunSummary metadata_summary;
+    metadata_summary.accepted_attempts = 4;
+    metadata_summary.rejected_attempts = 1;
+    metadata_summary.rejected_limiter_elements = 3;
+    metadata_summary.rhs_evaluations = 17;
+    metadata_summary.minimum_attempted_dt = 0.025;
+    metadata_summary.minimum_accepted_dt = 0.05;
+    metadata_summary.maximum_attempted_dt = 0.2;
+    metadata_summary.maximum_accepted_dt = 0.1;
+    metadata_summary.success = true;
+    metadata_summary.termination_reason = "target-reached";
+    std::vector<std::string> dataset_names;
+    char program_name[] = "test";
+    char* metadata_argv[] = {program_name};
+    for (const dg_sim::TimeIntegrator method : methods)
+    {
+      metadata_run.time_integrator = method;
+      dataset_names.push_back(
+        dg_sim::MakeCaseVTKDatasetName(metadata_case, metadata_run, 0.25));
+      dg_sim::WriteRunMetadataSidecar(metadata_case,
+                                      metadata_run,
+                                      &metadata_summary,
+                                      /*igr=*/nullptr,
+                                      /*c_alpha_value=*/0.25,
+                                      /*argc=*/1,
+                                      metadata_argv,
+                                      /*success=*/true);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    int metadata_fields_ok[1] = {1};
+    if (mfem::Mpi::Root())
+    {
+      for (std::size_t i = 0; i < methods.size(); ++i)
+      {
+        const std::filesystem::path metadata_path =
+          output_root / dataset_names[i] / "run_metadata.json";
+        std::ifstream input(metadata_path);
+        const bool opened = input.is_open();
+        const std::string contents((std::istreambuf_iterator<char>(input)),
+                                   std::istreambuf_iterator<char>());
+        const std::string expected =
+          "\"time_integrator\": \"" +
+          std::string(dg_sim::TimeIntegratorToString(methods[i])) + "\"";
+        metadata_fields_ok[i] = static_cast<int>(
+          opened && contents.find(expected) != std::string::npos &&
+          contents.find("\"accepted_attempts\": 4") != std::string::npos &&
+          contents.find("\"rejected_attempts\": 1") != std::string::npos &&
+          contents.find("\"rejected_limiter_elements\": 3") !=
+            std::string::npos &&
+          contents.find("\"rhs_evaluations\": 17") != std::string::npos &&
+          contents.find("\"maximum_attempted_dt\": 0.2") !=
+            std::string::npos &&
+          contents.find("\"maximum_accepted_dt\": 0.1") !=
+            std::string::npos &&
+          contents.find("\"igr_invariant_domain_flux\": true") !=
+            std::string::npos &&
+          contents.find("\"zhang_shu_vtk_points\": true") !=
+            std::string::npos &&
+          contents.find("\"success\": true") != std::string::npos &&
+          contents.find("\"termination_reason\": \"target-reached\"") !=
+            std::string::npos);
+      }
+    }
+    MPI_Bcast(metadata_fields_ok,
+              1,
+              mfem::MPITypeMap<int>::mpi_type,
+              0,
+              MPI_COMM_WORLD);
+    ctx.Check(metadata_fields_ok[0] == 1,
+              "run metadata: SSPRK(10,4) identity and retry aggregates persist");
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (mfem::Mpi::Root())
+    {
+      std::filesystem::remove_all(output_root);
+    }
+    if (original_prefix)
+    {
+      setenv(prefix_env_name, original_prefix->c_str(), 1);
+    }
+    else
+    {
+      unsetenv(prefix_env_name);
+    }
+  }
 
   // --- VTK pressure can bypass the projected pressure polynomial ---
   {
@@ -855,8 +1369,23 @@ int RunTimeDefaultsTests(TestContext& ctx)
 
   struct TimeLoopDummyOperator
   {
+    int abort_calls = 0;
+    mfem::real_t last_abort_time = -1.0;
+    std::uint64_t last_abort_generation = 0;
+    mfem::real_t last_abort_retry_dt = -1.0;
+
     void Mult(const mfem::Vector&, mfem::Vector& y) const { y = 0.0; }
     mfem::real_t GetMaxCharSpeed() const { return 1.0; }
+    void AbortRKStep(const mfem::Vector&,
+                     mfem::real_t restored_time,
+                     std::uint64_t restored_generation,
+                     mfem::real_t retry_dt)
+    {
+      ++abort_calls;
+      last_abort_time = restored_time;
+      last_abort_generation = restored_generation;
+      last_abort_retry_dt = retry_dt;
+    }
   };
   struct TimeLoopCountingStepper
   {
@@ -877,6 +1406,456 @@ int RunTimeDefaultsTests(TestContext& ctx)
       return (speed_calls == 1) ? 1.0 : 200.0;
     }
   };
+  struct TimeLoopOverflowDtOperator
+  {
+    mutable int speed_calls = 0;
+    void Mult(const mfem::Vector&, mfem::Vector& y) const { y = 0.0; }
+    mfem::real_t GetMaxCharSpeed() const
+    {
+      ++speed_calls;
+      return (speed_calls == 1)
+               ? 1.0
+               : std::numeric_limits<mfem::real_t>::denorm_min();
+    }
+  };
+  struct TimeLoopRetryStepper
+  {
+    explicit TimeLoopRetryStepper(int failures)
+      : failures_remaining(failures)
+    {
+    }
+
+    int calls = 0;
+    int failures_remaining = 0; // negative means reject every attempt
+    std::uint64_t generation = 7;
+    std::vector<mfem::real_t> attempted_dts;
+
+    std::uint64_t GetStateGeneration() const { return generation; }
+    void RestoreStateGeneration(std::uint64_t value) { generation = value; }
+
+    void Step(mfem::Vector& state, mfem::real_t& t, mfem::real_t& dt)
+    {
+      ++calls;
+      attempted_dts.push_back(dt);
+      if (state.Size() > 0)
+      {
+        state.HostReadWrite()[0] += dt;
+      }
+      t += dt;
+      ++generation;
+      if (failures_remaining != 0)
+      {
+        if (failures_remaining > 0)
+        {
+          --failures_remaining;
+        }
+        throw mfem::RecoverableLimiterFailure(2);
+      }
+    }
+  };
+
+  struct TimeLoopRejectAfterAcceptedStepper
+  {
+    explicit TimeLoopRejectAfterAcceptedStepper(int accepted_before_reject)
+      : accepted_before_reject(accepted_before_reject)
+    {
+    }
+
+    int calls = 0;
+    int accepted_before_reject = 0;
+    std::uint64_t generation = 11;
+
+    std::uint64_t GetStateGeneration() const { return generation; }
+    void RestoreStateGeneration(std::uint64_t value) { generation = value; }
+
+    void Step(mfem::Vector&, mfem::real_t& t, mfem::real_t& dt)
+    {
+      ++calls;
+      t += dt;
+      ++generation;
+      if (calls > accepted_before_reject)
+      {
+        throw mfem::RecoverableLimiterFailure(1);
+      }
+    }
+  };
+
+  // --- limiter-stage rejection restores the transaction and retries at 1/2 dt ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopRetryStepper stepper(/*failures=*/1);
+    const mfem::Vector state_before(bundle.sol);
+    const mfem::real_t first_value_before =
+      bundle.sol.Size() > 0 ? bundle.sol.HostRead()[0] : 0.0;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.1;
+    cfg.dt = 0.1;
+    cfg.dt_min = 0.01;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = false;
+
+    int rejection_hooks = 0;
+    bool hook_observed_restored_transaction = true;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_rejected_attempt =
+      [&](int step,
+          mfem::real_t t,
+          mfem::real_t attempted_dt,
+          mfem::real_t retry_dt)
+    {
+      ++rejection_hooks;
+      hook_observed_restored_transaction =
+        hook_observed_restored_transaction && step == 0 && t == 0.0 &&
+        (bundle.sol.Size() == 0 ||
+         bundle.sol.HostRead()[0] == first_value_before) &&
+        stepper.GetStateGeneration() == 7 && attempted_dt == 0.1 &&
+        retry_dt == 0.05;
+    };
+
+    const dg_sim::TimeLoopResult result =
+      dg_sim::RunTimeLoop(
+        op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(result.steps == 2 && result.accepted_attempts == 2,
+              "time loop retry: only accepted attempts advance step counters");
+    ctx.Check(result.rejected_attempts == 1 &&
+                result.rejected_limiter_elements == 2,
+              "time loop retry: rejected limiter work is aggregated");
+    const dg_sim::RunSummary retry_summary = dg_sim::BuildRunSummary(
+      example_ctx,
+      result,
+      /*elapsed_seconds=*/1.0,
+      mfem::Mpi::WorldSize());
+    ctx.Check(retry_summary.accepted_attempts == 2 &&
+                retry_summary.rejected_attempts == 1 &&
+                retry_summary.rejected_limiter_elements == 2 &&
+                retry_summary.minimum_attempted_dt == 0.05 &&
+                retry_summary.minimum_accepted_dt == 0.05 &&
+                retry_summary.maximum_attempted_dt == 0.1 &&
+                retry_summary.maximum_accepted_dt == 0.05 &&
+                !retry_summary.dt_min_reached && retry_summary.success &&
+                retry_summary.termination_reason == "target-reached",
+              "time loop retry: run summary preserves bounded aggregates");
+    ctx.CheckNear(result.minimum_attempted_dt,
+                  0.05,
+                  0.0,
+                  "time loop retry: minimum attempted dt is aggregated");
+    ctx.CheckNear(result.minimum_accepted_dt,
+                  0.05,
+                  0.0,
+                  "time loop retry: minimum accepted dt is aggregated");
+    ctx.CheckNear(result.maximum_attempted_dt,
+                  0.1,
+                  0.0,
+                  "time loop retry: maximum attempted dt is aggregated");
+    ctx.CheckNear(result.maximum_accepted_dt,
+                  0.05,
+                  0.0,
+                  "time loop retry: maximum accepted dt is aggregated");
+    ctx.Check(stepper.calls == 3 && stepper.attempted_dts.size() == 3 &&
+                stepper.attempted_dts[0] == 0.1 &&
+                stepper.attempted_dts[1] == 0.05 &&
+                stepper.attempted_dts[2] == 0.05,
+              "time loop retry: fixed nominal dt remains at the reduced value");
+    ctx.Check(rejection_hooks == 1 && hook_observed_restored_transaction,
+              "time loop retry: observation hook sees restored transaction");
+    ctx.Check(op.abort_calls == 1 && op.last_abort_time == 0.0 &&
+                op.last_abort_generation == 7 &&
+                op.last_abort_retry_dt == 0.05,
+              "time loop retry: operator abort sees restored transaction");
+    ctx.CheckNear(result.final_time,
+                  0.1,
+                  1.0e-14,
+                  "time loop retry: accepted attempts reach the horizon");
+    if (bundle.sol.Size() > 0)
+    {
+      ctx.CheckNear(bundle.sol.HostRead()[0],
+                    first_value_before + 0.1,
+                    1.0e-14,
+                    "time loop retry: rejected state mutation is not committed");
+    }
+    ctx.Check(stepper.GetStateGeneration() == 9,
+              "time loop retry: rejected generation is rolled back");
+    bundle.sol = state_before;
+  }
+
+  // --- retry-cap exhaustion is distinct from a configured dt floor ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopRetryStepper stepper(/*failures=*/-1);
+    const mfem::Vector state_before(bundle.sol);
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.2;
+    cfg.dt = 0.04;
+    cfg.dt_min = 0.0;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = false;
+
+    const dg_sim::TimeLoopResult result =
+      dg_sim::RunTimeLoop(
+        op, example_ctx.Mesh(), bundle.sol, stepper, cfg);
+    ctx.Check(!result.success && !result.dt_min_reached &&
+                result.termination_reason == "limiter-retry-limit",
+              "time loop retry: retry-cap exhaustion has its own failure reason");
+    ctx.Check(result.rejected_attempts == 64 && stepper.calls == 64 &&
+                result.accepted_attempts == 0 && result.steps == 0,
+              "time loop retry: retry cap commits no stage or time step");
+    mfem::Vector rollback_error(bundle.sol);
+    rollback_error -= state_before;
+    ctx.Check(rollback_error.Normlinf() == 0.0,
+              "time loop retry: retry-cap exhaustion preserves state");
+    bundle.sol = state_before;
+  }
+
+  // --- the application wrapper propagates retry exhaustion as a failed run ---
+  {
+    struct RejectingRunOperator : public mfem::TimeDependentOperator
+    {
+      explicit RejectingRunOperator(int size)
+        : mfem::TimeDependentOperator(size)
+      {
+      }
+      void Mult(const mfem::Vector&, mfem::Vector& derivative) const override
+      {
+        derivative = 0.0;
+      }
+      mfem::real_t GetMaxCharSpeed() const { return 1.0; }
+    } op(bundle.sol.Size());
+
+    const mfem::Vector state_before(bundle.sol);
+    mfem::RK3SSPWithLimiter stepper(example_ctx.spaces.vfes);
+    stepper.AddAlwaysCallback(
+      [](mfem::ParFiniteElementSpace&,
+         mfem::ParGridFunction&,
+         double)
+      { throw mfem::RecoverableLimiterFailure(1); });
+
+    dg_sim::CaseConfig failure_case;
+    failure_case.case_name = "retry-limit-integration";
+    dg_sim::RunConfig failure_run = run_cfg;
+    failure_run.case_config = failure_case;
+    failure_run.opts.t_final = 0.1;
+    failure_run.opts.dt = 0.1;
+    failure_run.opts.dt_min = 0.0;
+    failure_run.opts.cfl = 0.0;
+    failure_run.opts.vtk_save = false;
+    failure_run.opts.glvis = false;
+    failure_run.opts.vis_steps = 0;
+    failure_run.opts.analysis_steps = 0;
+    dg_sim::TimeLoopCallbacks callbacks;
+    dg_sim::RunSummary summary;
+    bool glvis_enabled = false;
+    const bool ok = dg_sim::RunEulerCase(example_ctx,
+                                         failure_case,
+                                         failure_run,
+                                         bundle,
+                                         stepper,
+                                         op,
+                                         glvis_enabled,
+                                         callbacks,
+                                         /*precision=*/8,
+                                         &summary);
+    int application_failure_ok = 1;
+    if (mfem::Mpi::Root())
+    {
+      application_failure_ok = static_cast<int>(
+        !ok && !summary.success && !summary.dt_min_reached &&
+        summary.termination_reason == "limiter-retry-limit" &&
+        summary.rhs_evaluations == 64 && summary.accepted_attempts == 0 &&
+        summary.rejected_attempts == 64);
+    }
+    MPI_Bcast(&application_failure_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    ctx.Check(application_failure_ok == 1,
+              "RunEulerCase: retry exhaustion propagates as a typed failure");
+    mfem::Vector rollback_error(bundle.sol);
+    rollback_error -= state_before;
+    ctx.Check(rollback_error.Normlinf() == 0.0,
+              "RunEulerCase: retry exhaustion commits no conservative state");
+
+    const char* prefix_env_name = "DG_IGR_VTK_PREFIX_PATH";
+    const char* old_prefix = std::getenv(prefix_env_name);
+    const std::optional<std::string> original_prefix =
+      old_prefix ? std::optional<std::string>(old_prefix) : std::nullopt;
+    long long output_token = 0;
+    if (mfem::Mpi::Root())
+    {
+      output_token = std::chrono::high_resolution_clock::now()
+                       .time_since_epoch()
+                       .count();
+    }
+    MPI_Bcast(&output_token,
+              1,
+              mfem::MPITypeMap<long long>::mpi_type,
+              0,
+              MPI_COMM_WORLD);
+    const std::filesystem::path output_root =
+      std::filesystem::path("/tmp") /
+      ("dg_igr_retry_limit_metadata_" + std::to_string(output_token));
+    setenv(prefix_env_name, output_root.c_str(), 1);
+    char program_name[] = "test";
+    char* metadata_argv[] = {program_name};
+    dg_sim::RunConfig metadata_run = failure_run;
+    metadata_run.opts.vtk_save = true;
+    dg_sim::WriteRunMetadataSidecar(failure_case,
+                                    metadata_run,
+                                    &summary,
+                                    /*igr=*/nullptr,
+                                    /*c_alpha_value=*/0.0,
+                                    /*argc=*/1,
+                                    metadata_argv,
+                                    /*success=*/ok,
+                                    "retry-limit-integration");
+    MPI_Barrier(MPI_COMM_WORLD);
+    int metadata_ok = 1;
+    if (mfem::Mpi::Root())
+    {
+      std::ifstream input(output_root / "retry-limit-integration" /
+                          "run_metadata.json");
+      const std::string contents((std::istreambuf_iterator<char>(input)),
+                                 std::istreambuf_iterator<char>());
+      metadata_ok = static_cast<int>(
+        input.is_open() &&
+        contents.find("\"success\": false") != std::string::npos &&
+        contents.find("\"termination_reason\": \"limiter-retry-limit\"") !=
+          std::string::npos);
+      std::filesystem::remove_all(output_root);
+    }
+    MPI_Bcast(&metadata_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    ctx.Check(metadata_ok == 1,
+              "RunEulerCase: retry-limit failure persists in run metadata");
+    if (original_prefix)
+    {
+      setenv(prefix_env_name, original_prefix->c_str(), 1);
+    }
+    else
+    {
+      unsetenv(prefix_env_name);
+    }
+    bundle.sol = state_before;
+  }
+
+  // --- a limiter rejection at dt_min restores state and terminates cleanly ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopRetryStepper stepper(/*failures=*/-1);
+    const mfem::Vector state_before(bundle.sol);
+    const mfem::real_t first_value_before =
+      bundle.sol.Size() > 0 ? bundle.sol.HostRead()[0] : 0.0;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.2;
+    cfg.dt = 0.04;
+    cfg.dt_min = 0.02;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = false;
+
+    int rejection_hooks = 0;
+    mfem::real_t last_retry_dt = -1.0;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_rejected_attempt =
+      [&](int,
+          mfem::real_t,
+          mfem::real_t,
+          mfem::real_t retry_dt)
+    {
+      ++rejection_hooks;
+      last_retry_dt = retry_dt;
+    };
+
+    const dg_sim::TimeLoopResult result =
+      dg_sim::RunTimeLoop(
+        op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(result.dt_min_reached && result.steps == 0 &&
+                result.accepted_attempts == 0 && !result.success &&
+                result.termination_reason == "limiter-dt-min",
+              "time loop retry: rejection at dt_min commits no step");
+    ctx.Check(result.rejected_attempts == 2 && stepper.calls == 2 &&
+                stepper.attempted_dts[0] == 0.04 &&
+                stepper.attempted_dts[1] == 0.02,
+              "time loop retry: dt_min is attempted once, then terminates");
+    ctx.Check(rejection_hooks == 2 && last_retry_dt == 0.0,
+              "time loop retry: terminal rejection hook is notified");
+    ctx.Check(op.abort_calls == 2 && op.last_abort_time == 0.0 &&
+                op.last_abort_generation == 7 &&
+                op.last_abort_retry_dt == 0.0,
+              "time loop retry: terminal operator abort sees no retry dt");
+    ctx.CheckNear(result.final_time,
+                  0.0,
+                  0.0,
+                  "time loop retry: terminal rejection restores time");
+    ctx.Check((bundle.sol.Size() == 0 ||
+               bundle.sol.HostRead()[0] == first_value_before) &&
+                stepper.GetStateGeneration() == 7,
+              "time loop retry: terminal rejection restores state/provenance");
+    bundle.sol = state_before;
+  }
+
+  // --- a first-attempt terminal rejection does not duplicate an initial save ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopRetryStepper stepper(/*failures=*/-1);
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.2;
+    cfg.dt = 0.04;
+    cfg.dt_min = 0.04;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = true;
+    cfg.dt_save = 0.1;
+    cfg.initial_state_saved = true;
+    cfg.save_index_offset = 1;
+
+    int save_calls = 0;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_save = [&](int, mfem::real_t, int, bool) { ++save_calls; };
+
+    const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+      op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(!result.success && result.steps == 0 &&
+                result.termination_reason == "limiter-dt-min",
+              "time loop failure output: first attempt rejects at initial time");
+    ctx.Check(save_calls == 0,
+              "time loop failure output: initial save time is not duplicated");
+  }
+
+  // --- terminal rejection after a save boundary does not duplicate its time ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopRejectAfterAcceptedStepper stepper(/*accepted_before_reject=*/1);
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.3;
+    cfg.dt = 0.1;
+    cfg.dt_min = 0.1;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = true;
+    cfg.dt_save = 0.1;
+    cfg.initial_state_saved = true;
+    cfg.save_index_offset = 1;
+
+    std::vector<mfem::real_t> save_times;
+    std::vector<int> save_cycles;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_save = [&](int,
+                        mfem::real_t time,
+                        int cycle,
+                        bool)
+    {
+      save_times.push_back(time);
+      save_cycles.push_back(cycle);
+    };
+
+    const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+      op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(!result.success && result.steps == 1 &&
+                result.termination_reason == "limiter-dt-min",
+              "time loop failure output: rejection preserves saved boundary");
+    ctx.Check(save_times.size() == 1 && save_cycles == std::vector<int>({1}),
+              "time loop failure output: saved cycle is not duplicated");
+    if (save_times.size() == 1)
+    {
+      ctx.CheckNear(save_times[0],
+                    0.1,
+                    1.0e-14,
+                    "time loop failure output: retained save time is exact");
+    }
+  }
 
   // --- dt_min guard uses nominal dt (before stepping) ---
   {
@@ -893,10 +1872,105 @@ int RunTimeDefaultsTests(TestContext& ctx)
       dg_sim::RunTimeLoop(op, example_ctx.Mesh(), bundle.sol, stepper, cfg);
     ctx.Check(result.dt_min_reached,
               "time loop: dt_min guard uses nominal dt before stepping");
+    ctx.Check(!result.success &&
+                result.termination_reason == "initial-dt-min",
+              "time loop: initial dt_min guard records a typed reason");
     ctx.Check(stepper.calls == 0,
               "time loop: dt_min guard aborts before first step");
     ctx.Check(result.steps == 0,
               "time loop: dt_min abort leaves completed step count at zero");
+  }
+
+  // --- a restarted initial-dt failure emits its finite committed state ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopCountingStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.initial_time = 0.25;
+    cfg.initial_step = 7;
+    cfg.t_final = 0.5;
+    cfg.dt = 0.01;
+    cfg.dt_min = 0.02;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = true;
+    cfg.dt_save = 0.1;
+    cfg.save_index_offset = 4;
+    cfg.initial_state_saved = false;
+
+    int save_calls = 0;
+    int saved_step = -1;
+    int saved_cycle = -1;
+    mfem::real_t saved_time = -1.0;
+    bool saved_final = false;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_save = [&](int step,
+                        mfem::real_t time,
+                        int cycle,
+                        bool is_final)
+    {
+      ++save_calls;
+      saved_step = step;
+      saved_cycle = cycle;
+      saved_time = time;
+      saved_final = is_final;
+    };
+
+    const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+      op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(!result.success && result.termination_reason == "initial-dt-min" &&
+                result.steps == 7 && stepper.calls == 0,
+              "time loop failure output: restarted dt floor is typed");
+    ctx.Check(save_calls == 1 && saved_step == 7 && saved_cycle == 4 &&
+                saved_final,
+              "time loop failure output: restarted committed state is saved");
+    ctx.CheckNear(saved_time,
+                  0.25,
+                  0.0,
+                  "time loop failure output: restart save retains checkpoint time");
+  }
+
+  // --- non-finite post-accept CFL dt emits the finite committed state ---
+  {
+    TimeLoopOverflowDtOperator op;
+    TimeLoopCountingStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 1.0;
+    cfg.dt = 0.0;
+    cfg.dt_min = 0.0;
+    cfg.cfl = 0.3;
+    cfg.order = 1;
+    cfg.vtk_save = true;
+    cfg.dt_save = 100.0;
+
+    int final_save_calls = 0;
+    int final_save_step = -1;
+    mfem::real_t final_save_time = -1.0;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_save = [&](int step,
+                        mfem::real_t time,
+                        int,
+                        bool is_final)
+    {
+      if (is_final)
+      {
+        ++final_save_calls;
+        final_save_step = step;
+        final_save_time = time;
+      }
+    };
+
+    const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+      op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(!result.success &&
+                result.termination_reason == "nonfinite-cfl-dt" &&
+                result.steps == 1 && stepper.calls == 1,
+              "time loop failure output: overflowed CFL update is typed");
+    ctx.Check(final_save_calls == 1 && final_save_step == result.steps,
+              "time loop failure output: post-accept state is saved once");
+    ctx.CheckNear(final_save_time,
+                  result.final_time,
+                  0.0,
+                  "time loop failure output: saved time is committed time");
   }
 
   // --- clipped/snap dt_real below dt_min is allowed (bookkeeping policy) ---
@@ -922,6 +1996,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   0.41,
                   1.0e-12,
                   "time loop: clipped final dt_real reaches target final time");
+    ctx.Check(result.success && result.termination_reason == "target-reached",
+              "time loop: clipped final step records successful termination");
   }
 
   // --- dt_min after CFL update records current step and emits final save ---
@@ -955,6 +2031,9 @@ int RunTimeDefaultsTests(TestContext& ctx)
       dg_sim::RunTimeLoop(op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
     ctx.Check(result.dt_min_reached,
               "time loop: dt_min set when CFL update drops nominal dt below threshold");
+    ctx.Check(!result.success && result.termination_reason == "cfl-dt-min" &&
+                result.rhs_evaluations == 1,
+              "time loop: CFL floor reason and initial probe work are recorded");
     ctx.Check(stepper.calls == 1,
               "time loop: dt_min after CFL update occurs after one completed step");
     ctx.Check(result.steps == 1,
@@ -992,6 +2071,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "time loop: zero dt_real exits before any step is counted");
     ctx.Check(!result.dt_min_reached,
               "time loop: zero-step exit is distinct from dt_min guard");
+    ctx.Check(result.success && result.termination_reason == "target-reached",
+              "time loop: zero-step horizon is a successful termination");
     ctx.CheckNear(result.final_time,
                   0.0,
                   1.0e-14,
@@ -1159,6 +2240,19 @@ int RunTimeDefaultsTests(TestContext& ctx)
   dg_sim::TimeLoopIO io;
   bool glvis_enabled = false;
   io.glvis_enabled = &glvis_enabled;
+  int sigma_prepare_count = 0;
+  int sigma_prepare_step = -1;
+  mfem::real_t sigma_prepare_time = -1.0;
+  bool sigma_prepare_final = true;
+  bool sigma_output_allowed = true;
+  io.prepare_sigma = [&](int step, mfem::real_t t, bool is_final)
+  {
+    ++sigma_prepare_count;
+    sigma_prepare_step = step;
+    sigma_prepare_time = t;
+    sigma_prepare_final = is_final;
+    return dg_sim::SigmaOutputPreparation{0.0, sigma_output_allowed};
+  };
 
   dg_sim::TimeLoopHooks hooks =
     dg_sim::MakeEulerTimeLoopHooks(example_ctx,
@@ -1173,6 +2267,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
   ctx.Check(static_cast<bool>(hooks.on_save), "time hooks: on_save is wired");
   ctx.Check(static_cast<bool>(hooks.on_analysis),
             "time hooks: on_analysis is wired");
+  ctx.Check(!hooks.on_rejected_attempt,
+            "time hooks: rejected-step algebraic recovery is operator-owned");
 
   hooks.on_visualize(/*step=*/5, /*t=*/0.2, /*dt=*/0.01, /*done=*/false);
   hooks.on_save(/*step=*/5, /*t=*/0.2, /*save_idx=*/3, /*is_final=*/false);
@@ -1181,6 +2277,14 @@ int RunTimeDefaultsTests(TestContext& ctx)
   ctx.Check(alive_count == 1, "time hooks: on_alive dispatched once");
   ctx.Check(save_count == 1, "time hooks: on_vtk_save dispatched once");
   ctx.Check(analysis_count == 1, "time hooks: on_analysis dispatched once");
+  ctx.Check(sigma_prepare_count == 1 && sigma_prepare_step == 5 &&
+              sigma_prepare_time == 0.2 && !sigma_prepare_final,
+            "time hooks: save preparation remains independently wired");
+
+  sigma_output_allowed = false;
+  hooks.on_save(/*step=*/6, /*t=*/0.3, /*save_idx=*/4, /*is_final=*/true);
+  ctx.Check(save_count == 1 && sigma_prepare_count == 2,
+            "time hooks: denied algebraic preparation suppresses final output");
 
   ctx.Check(last_alive.step == 5 && !last_alive.is_final,
             "time hooks: alive payload carries step/final flag");

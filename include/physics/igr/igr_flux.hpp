@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include "mfem.hpp"
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
 #include "utils/config/dg_igr_defaults.hpp"
@@ -14,6 +16,47 @@
 
 namespace mfem
 {
+
+/** Bounded aggregate over frozen-sigma characteristic-state samples.
+ *
+ * A sample is counted whenever exact invariant-domain mode evaluates a state
+ * for its dissipation speed or independent q_sigma qualification telemetry.
+ * `nonfinite_count` counts a sample when either q_sigma or its
+ * normalized ratio q_sigma/(gamma*p) is non-finite.  Minima ignore their
+ * respective non-finite values.  The DG operator combines this host aggregate
+ * with its packed-device aggregates at end of run.
+ */
+struct IGRFrozenSigmaTelemetry
+{
+  bool enabled = false;
+  std::uint64_t sample_count = 0;
+  std::uint64_t nonpositive_count = 0;
+  std::uint64_t nonfinite_count = 0;
+  double minimum_raw_q_sigma = std::numeric_limits<double>::infinity();
+  double minimum_q_sigma_over_gamma_p =
+    std::numeric_limits<double>::infinity();
+
+  void Merge(const IGRFrozenSigmaTelemetry& other)
+  {
+    enabled = enabled || other.enabled;
+    sample_count += other.sample_count;
+    nonpositive_count += other.nonpositive_count;
+    nonfinite_count += other.nonfinite_count;
+    minimum_raw_q_sigma =
+      std::min(minimum_raw_q_sigma, other.minimum_raw_q_sigma);
+    minimum_q_sigma_over_gamma_p =
+      std::min(minimum_q_sigma_over_gamma_p,
+               other.minimum_q_sigma_over_gamma_p);
+  }
+};
+
+/// Read-only, communicator-wide aggregate supplied by an Euler operator.
+class IGRFrozenSigmaTelemetryProvider
+{
+public:
+  virtual ~IGRFrozenSigmaTelemetryProvider() = default;
+  virtual IGRFrozenSigmaTelemetry GetGlobalFrozenSigmaTelemetry() const = 0;
+};
 
 /** Conservative explicit speed bound for the pressure-like IGR flux.
  *
@@ -33,16 +76,20 @@ MFEM_HOST_DEVICE inline real_t IGRFluxCharacteristicSpeed(real_t base_speed,
     rho_floor);
 }
 
-/** Frozen-stage invariant-domain threshold for the IGR flux.
+/** Frozen-stage invariant-domain and characteristic bound for the IGR flux.
  *
- * For normal velocity u_n and total pressure P = p + sigma, positivity of
- * both Lax-Friedrichs split states U +/- F_IGR(U)/a requires
+ * For normal velocity u_n and total pressure P = p + sigma, non-negativity of
+ * the density and internal energy in both Lax-Friedrichs split states
+ * U +/- F_IGR(U)/a requires
  *
  *   a >= |u_n| + |P| sqrt((gamma - 1)/(2 rho p)).
  *
- * The ordinary Euler characteristic speed already bounds this expression
- * when sigma is zero. During one explicit stage sigma is fixed by the stage
- * state, so the bound applies to that stage's face flux and CFL estimate.
+ * The returned speed is the maximum of that split threshold, the ordinary
+ * Euler speed, and a modulus bound for the frozen-sigma local roots.  The
+ * latter are strictly hyperbolic only when
+ * gamma*p + (gamma - 1)*sigma > 0; a finite modulus bound when this quantity
+ * is nonpositive is not a hyperbolicity or stability claim.  This local
+ * statement also does not characterize the nonlocal reduced DAE Jacobian.
  */
 MFEM_HOST_DEVICE inline real_t IGRFluxInvariantDomainSpeed(
   real_t base_speed,
@@ -75,6 +122,9 @@ MFEM_HOST_DEVICE inline real_t IGRFluxInvariantDomainSpeed(
  * Notes
  *  - The returned max characteristic speed includes the pressure-like IGR
  *    scale sqrt(|Sigma|/rho) when Sigma is active and sigma-aware CFL is on.
+ *    The invariant-domain mode instead reports the combined frozen-stage
+ *    split/characteristic bound and uses that same bound for Rusanov
+ *    dissipation.
  *  - On faces, Sigma is taken from the explicit side argument in
  *    ComputeFluxDotNAtSide/ComputeAvgFluxDotNAtSide.
  *    On boundary faces (Elem2 == nullptr) the interior (Left) value is used.
@@ -83,9 +133,12 @@ class FluxWithIGR : public FluxFunction, public FaceSideExplicitFlux
 {
 public:
   /// Construct an IGR-decorated flux around an existing base FluxFunction.
-  explicit FluxWithIGR(const FluxFunction& base)
+  explicit FluxWithIGR(
+    const FluxFunction& base,
+    real_t gamma = dg_igr::EulerDefaults::kGamma)
     : FluxFunction(base.num_equations, base.dim),
-      base_(base)
+      base_(base),
+      gamma_(gamma)
   {
   }
 
@@ -95,6 +148,25 @@ public:
   /// Density floor used only for u = m / rho in the IGR terms (default FluxDefaults::kRhoVelFloor).
   void SetVelocityRhoFloor(double f) { rho_vel_floor_ = f; }
 
+  /** Floors defining the admitted state set for invariant-domain mode.
+   *
+   * The density floor is also used by the frozen-sigma energy flux.  Keeping
+   * both values on the flux object lets host and packed-device paths share the
+   * limiter's configured admissibility contract.
+   */
+  void SetInvariantDomainFloors(double density_floor,
+                                double pressure_floor)
+  {
+    MFEM_VERIFY(std::isfinite(density_floor) && density_floor > 0.0,
+                "The IGR invariant-domain density floor must be finite and "
+                "positive.");
+    MFEM_VERIFY(std::isfinite(pressure_floor) && pressure_floor > 0.0,
+                "The IGR invariant-domain pressure floor must be finite and "
+                "positive.");
+    rho_vel_floor_ = density_floor;
+    invariant_domain_pressure_floor_ = pressure_floor;
+  }
+
   /// Include the sigma characteristic scale in the speed returned for CFL accounting.
   /// Disabled by default; enable it explicitly for sigma-aware CFL diagnostics.
   void SetSigmaAwareCFL(bool enabled) { sigma_aware_cfl_ = enabled; }
@@ -103,14 +175,43 @@ public:
   /// Disabled by default; enable it explicitly when requested by the case.
   void SetSigmaAwareRusanov(bool enabled) { sigma_aware_rusanov_ = enabled; }
 
+  /** Use the frozen-stage IGR split/characteristic speed for both CFL
+   * accounting and Rusanov dissipation. This typed mode takes precedence over
+   * the two independent legacy sigma-speed heuristics. "Invariant-domain"
+   * names the exact LF split condition; it is not by itself a complete DG
+   * positivity theorem or a reduced-DAE hyperbolicity claim.
+   */
+  void SetInvariantDomainFlux(bool enabled)
+  {
+    MFEM_VERIFY(!enabled || HasEulerBase(),
+                "The IGR invariant-domain flux requires an Euler base flux.");
+    invariant_domain_flux_ = enabled;
+  }
+
   bool GetSigmaAwareCFL() const { return sigma_aware_cfl_; }
   bool GetSigmaAwareRusanov() const { return sigma_aware_rusanov_; }
+  bool GetInvariantDomainFlux() const { return invariant_domain_flux_; }
+  real_t GetGamma() const { return gamma_; }
 
-  /// Select the Rusanov speed independently from the speed reported for CFL.
+  /** Host-path aggregate since construction.
+   *
+   * This includes every attempted exact-mode state sample, including samples
+   * from subsequently rejected time-step attempts.  It stores no event history.
+   */
+  IGRFrozenSigmaTelemetry GetFrozenSigmaTelemetry() const
+  {
+    return frozen_sigma_telemetry_;
+  }
+
+  /// Select the legacy independent Rusanov speed, or the exact coupled speed.
   real_t SelectRusanovDissipationSpeed(real_t reported_speed,
                                        real_t rho,
                                        real_t sigma) const
   {
+    if (invariant_domain_flux_)
+    {
+      return reported_speed;
+    }
     return ::dg_igr::frozen_scalar_igr_algebra::SelectRusanovDissipationSpeed(
       reported_speed,
       rho,
@@ -193,15 +294,32 @@ public:
   /// Access the density floor used only in the IGR energy sigma term.
   double GetVelocityRhoFloor() const { return rho_vel_floor_; }
 
+  /// Access the pressure floor defining the invariant-domain admitted set.
+  double GetInvariantDomainPressureFloor() const
+  {
+    return invariant_domain_pressure_floor_;
+  }
+
 private:
   const FluxFunction& base_;
+  real_t gamma_ = dg_igr::EulerDefaults::kGamma;
   const mfem::ParGridFunction* sigma_ =
     nullptr; // non-owning; owned by IGR solver/state wiring
   double rho_vel_floor_ = dg_igr::FluxDefaults::kRhoVelFloor;
+  double invariant_domain_pressure_floor_ = dg_igr::LimiterDefaults::kPMin;
   bool sigma_aware_cfl_ = false;
   bool sigma_aware_rusanov_ = false;
+  bool invariant_domain_flux_ = false;
+  mutable IGRFrozenSigmaTelemetry frozen_sigma_telemetry_;
 
   // helpers
+
+  real_t InvariantDomainSpeed(const Vector& U,
+                              const Vector* normal,
+                              real_t sigma,
+                              real_t base_speed) const;
+
+  void RecordFrozenSigmaSample(real_t pressure, real_t sigma) const;
 
   inline void
   AddTensorSigmaTerms(const Vector& U, double sigma, DenseMatrix& F) const

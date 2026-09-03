@@ -159,7 +159,9 @@ struct MPIRankField
       fes0(std::make_unique<mfem::ParFiniteElementSpace>(&mesh, fec0.get())),
       rank(fes0.get())
   {
-    rank = static_cast<double>(mfem::Mpi::WorldRank());
+    int communicator_rank = 0;
+    MPI_Comm_rank(mesh.GetComm(), &communicator_rank);
+    rank = static_cast<double>(communicator_rank);
   }
 };
 

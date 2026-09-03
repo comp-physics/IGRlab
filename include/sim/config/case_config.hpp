@@ -50,6 +50,7 @@ struct IGROptions
   int amg_max_levels = -1;
   double amg_strong_threshold = -1.0;
   bool exact_dg_face_operator = false;
+  bool igr_invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
 };
@@ -96,7 +97,8 @@ enum class TimeIntegrator
   RK3SSP = 0,
   BackwardEuler = 1,
   PartitionedBackwardEuler = 2,
-  Rodas3 = 3
+  Rodas3 = 3,
+  SSPRK104 = 4
 };
 
 /// @brief Source of the effective general discretization selection.
@@ -782,6 +784,10 @@ TryParseTimeIntegrator(const std::string& value)
   {
     return TimeIntegrator::RK3SSP;
   }
+  if (lower == "ssprk104")
+  {
+    return TimeIntegrator::SSPRK104;
+  }
   if (lower == "backward-euler")
   {
     return TimeIntegrator::BackwardEuler;
@@ -803,6 +809,8 @@ inline const char* TimeIntegratorToString(TimeIntegrator time_integrator)
   {
   case TimeIntegrator::RK3SSP:
     return "rk3ssp";
+  case TimeIntegrator::SSPRK104:
+    return "ssprk104";
   case TimeIntegrator::BackwardEuler:
     return "backward-euler";
   case TimeIntegrator::PartitionedBackwardEuler:
@@ -811,6 +819,12 @@ inline const char* TimeIntegratorToString(TimeIntegrator time_integrator)
     return "rodas3";
   }
   return "rk3ssp";
+}
+
+inline bool IsExplicitSSPRKTimeIntegrator(TimeIntegrator time_integrator)
+{
+  return time_integrator == TimeIntegrator::RK3SSP ||
+         time_integrator == TimeIntegrator::SSPRK104;
 }
 
 inline const char*
@@ -1065,30 +1079,34 @@ ResolveSolverRequest(const std::string& case_default_dg_backend,
     {
       result.status = SolverRequestResolutionStatus::InvalidTimeIntegrator;
       result.message = "Invalid time integrator '" + time_integrator_value +
-                       "'. Use 'rk3ssp', 'backward-euler', or "
-                       "'partitioned-backward-euler', or 'rodas3'.";
+                       "'. Use 'rk3ssp', 'ssprk104', "
+                       "'backward-euler', 'partitioned-backward-euler', or "
+                       "'rodas3'.";
       return result;
     }
     result.time_integrator = *time_integrator;
   }
 
   if (result.discretization != Discretization::HDG &&
-      result.time_integrator != TimeIntegrator::RK3SSP)
+      !IsExplicitSSPRKTimeIntegrator(result.time_integrator))
   {
     result.status = SolverRequestResolutionStatus::UnsupportedTimeIntegrator;
     result.message = "Time integrator '" +
                      std::string(TimeIntegratorToString(
                        result.time_integrator)) +
-                     "' is unavailable for DG/DGSEM; use 'rk3ssp'.";
+                     "' is unavailable for DG/DGSEM; use 'rk3ssp' or "
+                     "'ssprk104'.";
     return result;
   }
   if (result.discretization == Discretization::HDG &&
-      result.time_integrator == TimeIntegrator::RK3SSP)
+      IsExplicitSSPRKTimeIntegrator(result.time_integrator))
   {
     result.status = SolverRequestResolutionStatus::UnsupportedTimeIntegrator;
-    result.message = "Time integrator 'rk3ssp' is unavailable for HDG; use "
-                     "'backward-euler', 'partitioned-backward-euler', or "
-                     "'rodas3'.";
+    result.message = "Time integrator '" +
+                     std::string(TimeIntegratorToString(
+                       result.time_integrator)) +
+                     "' is unavailable for HDG; use 'backward-euler', "
+                     "'partitioned-backward-euler', or 'rodas3'.";
     return result;
   }
   return result;
@@ -1760,6 +1778,15 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
     "--no-igr-sigma-rusanov",
     "Include or exclude the IGR sigma speed in Rusanov dissipation "
     "(default off).");
+  args.AddOption(
+    &igr_opts.igr_invariant_domain_flux,
+    "-iidflux",
+    "--igr-invariant-domain-flux",
+    "-ino-iidflux",
+    "--no-igr-invariant-domain-flux",
+    "Use or disable the exact frozen-stage LF split threshold together with "
+    "the frozen-sigma characteristic-modulus bound for both CFL accounting "
+    "and Rusanov dissipation (default off).");
 }
 
 inline RunConfig MakeRunConfig(
@@ -1781,6 +1808,8 @@ inline RunConfig MakeRunConfig(
     ResolveZhangShuPositivityLimiter(
       positivity_limiter, case_cfg.limiter_pipeline.zhang_shu);
   run_cfg.case_config.limiter_pipeline.zhang_shu_points = zhang_shu_points;
+  run_cfg.case_config.limiter_pipeline.zhang_shu_vtk_points =
+    opts.zhang_shu_vtk_points;
   run_cfg.opts = opts;
   run_cfg.opts.positivity_limiter =
     PositivityLimiterSelectionToString(positivity_limiter);

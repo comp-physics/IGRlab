@@ -3,6 +3,7 @@
 #include "mfem/general/annotation.hpp"
 
 #include <cmath>
+#include <limits>
 
 /**
  * @file physics/bc/detail/euler_boundary_state.hpp
@@ -33,6 +34,46 @@ struct EulerPrimitiveNormalState
   Scalar tangential_velocity = Scalar(0.0);
   Scalar sound_speed = Scalar(1.0);
 };
+
+template <typename Scalar>
+MFEM_HOST_DEVICE inline bool EulerFinitePositive(const Scalar value)
+{
+  // Ordered comparisons reject NaN; the upper bound rejects infinity on both
+  // host and device without relying on a backend-specific isfinite overload.
+  return value > Scalar(0.0) &&
+         value <= std::numeric_limits<Scalar>::max();
+}
+
+template <typename Scalar>
+MFEM_HOST_DEVICE inline bool EulerConservativeStateMeetsContract(
+    const Scalar* state, const int dimension, const int equations,
+    const Scalar gamma, const Scalar density_floor,
+    const Scalar pressure_floor)
+{
+  if (!state || equations != dimension + 2 || dimension < 1 || dimension > 3 ||
+      !EulerFinitePositive(gamma - Scalar(1.0)) ||
+      !EulerFinitePositive(density_floor) ||
+      !EulerFinitePositive(pressure_floor))
+    return false;
+  for (int equation = 0; equation < equations; ++equation)
+  {
+    const Scalar value = state[equation];
+    if (!(value >= -std::numeric_limits<Scalar>::max()) ||
+        value > std::numeric_limits<Scalar>::max())
+      return false;
+  }
+  const Scalar density = state[0];
+  if (!(density >= density_floor))
+    return false;
+  Scalar momentum_squared = Scalar(0.0);
+  for (int d = 0; d < dimension; ++d)
+    momentum_squared += state[1 + d] * state[1 + d];
+  const Scalar pressure = (gamma - Scalar(1.0)) *
+      (state[1 + dimension] -
+       Scalar(0.5) * momentum_squared / density);
+  return pressure >= pressure_floor &&
+         pressure <= std::numeric_limits<Scalar>::max();
+}
 
 template <typename Scalar>
 MFEM_HOST_DEVICE inline void EulerBuildNormalTangential(
@@ -73,10 +114,10 @@ EulerConservativeToPrimitiveNormal(const Scalar* conservative,
                                    const int dimension,
                                    const Scalar gamma,
                                    const Scalar* normal_unit,
-                                   const Scalar* tangent_unit)
+                                   const Scalar* tangent_unit,
+                                   const Scalar density_floor,
+                                   const Scalar pressure_floor)
 {
-  constexpr Scalar density_floor = Scalar(1.0e-12);
-  constexpr Scalar pressure_floor = Scalar(1.0e-12);
   EulerPrimitiveNormalState<Scalar> result;
   const Scalar density = fmax(conservative[0], density_floor);
   Scalar velocity[3] = {Scalar(0.0), Scalar(0.0), Scalar(0.0)};
@@ -142,9 +183,9 @@ MFEM_HOST_DEVICE inline void EulerPrimitiveNormalToConservative(
 
 template <typename Scalar>
 MFEM_HOST_DEVICE inline Scalar EulerEntropyLike(
-    const Scalar pressure, const Scalar density, const Scalar gamma)
+    const Scalar pressure, const Scalar density, const Scalar gamma,
+    const Scalar density_floor)
 {
-  constexpr Scalar density_floor = Scalar(1.0e-12);
   return pressure / pow(fmax(density, density_floor), gamma);
 }
 
@@ -152,10 +193,9 @@ template <typename Scalar>
 MFEM_HOST_DEVICE inline EulerPrimitiveNormalState<Scalar>
 EulerSubsonicOutletPressureClosure(
     const EulerPrimitiveNormalState<Scalar>& inner, const Scalar gamma,
-    const Scalar pressure_out)
+    const Scalar pressure_out, const Scalar density_floor,
+    const Scalar pressure_floor)
 {
-  constexpr Scalar density_floor = Scalar(1.0e-12);
-  constexpr Scalar pressure_floor = Scalar(1.0e-12);
   EulerPrimitiveNormalState<Scalar> result = inner;
   if (inner.normal_velocity >= inner.sound_speed ||
       inner.normal_velocity <= -inner.sound_speed)
@@ -163,7 +203,7 @@ EulerSubsonicOutletPressureClosure(
 
   const Scalar gamma_minus_one = gamma - Scalar(1.0);
   const Scalar entropy =
-      EulerEntropyLike(inner.pressure, inner.rho, gamma);
+      EulerEntropyLike(inner.pressure, inner.rho, gamma, density_floor);
   const Scalar pressure = fmax(pressure_out, pressure_floor);
   const Scalar density = pow(pressure / entropy, Scalar(1.0) / gamma);
   const Scalar sound_speed =
@@ -185,10 +225,9 @@ MFEM_HOST_DEVICE inline EulerPrimitiveNormalState<Scalar>
 EulerNonreflectingOutletClosure(
     const EulerPrimitiveNormalState<Scalar>& inner,
     const EulerPrimitiveNormalState<Scalar>& reference,
-    const Scalar gamma)
+    const Scalar gamma, const Scalar density_floor,
+    const Scalar pressure_floor)
 {
-  constexpr Scalar density_floor = Scalar(1.0e-12);
-  constexpr Scalar pressure_floor = Scalar(1.0e-12);
   EulerPrimitiveNormalState<Scalar> result = inner;
   if (inner.normal_velocity >= inner.sound_speed ||
       inner.normal_velocity <= -inner.sound_speed)
@@ -207,15 +246,27 @@ EulerNonreflectingOutletClosure(
     return result;
 
   const Scalar entropy =
-      EulerEntropyLike(reference.pressure, reference.rho, gamma);
+      EulerEntropyLike(reference.pressure,
+                       reference.rho,
+                       gamma,
+                       density_floor);
+  const Scalar entropy_scale = gamma * entropy;
+  if (!EulerFinitePositive(entropy) ||
+      !EulerFinitePositive(entropy_scale))
+    return result;
   const Scalar density = pow(
-      (sound_speed * sound_speed) /
-          fmax(gamma * entropy, pressure_floor),
+      (sound_speed * sound_speed) / entropy_scale,
       Scalar(1.0) / gamma_minus_one);
+  if (!EulerFinitePositive(density))
+    return result;
+  const Scalar admitted_density = fmax(density, density_floor);
   const Scalar pressure =
-      entropy * pow(fmax(density, density_floor), gamma);
+      entropy * pow(admitted_density, gamma);
+  if (!(pressure >= Scalar(0.0)) ||
+      pressure > std::numeric_limits<Scalar>::max())
+    return result;
 
-  result.rho = fmax(density, density_floor);
+  result.rho = admitted_density;
   result.pressure = fmax(pressure, pressure_floor);
   result.sound_speed = sound_speed;
   result.normal_velocity = normal_velocity;
@@ -227,10 +278,9 @@ template <typename Scalar>
 MFEM_HOST_DEVICE inline EulerPrimitiveNormalState<Scalar>
 EulerSubsonicInletClosure(
     const EulerPrimitiveNormalState<Scalar>& inner,
-    const EulerPrimitiveNormalState<Scalar>& target, const Scalar gamma)
+    const EulerPrimitiveNormalState<Scalar>& target, const Scalar gamma,
+    const Scalar density_floor, const Scalar pressure_floor)
 {
-  constexpr Scalar density_floor = Scalar(1.0e-12);
-  constexpr Scalar pressure_floor = Scalar(1.0e-12);
   EulerPrimitiveNormalState<Scalar> result = target;
   if (inner.normal_velocity <= -inner.sound_speed)
     return result;
@@ -250,15 +300,24 @@ EulerSubsonicInletClosure(
     return target;
 
   const Scalar entropy =
-      EulerEntropyLike(target.pressure, target.rho, gamma);
+      EulerEntropyLike(target.pressure, target.rho, gamma, density_floor);
+  const Scalar entropy_scale = gamma * entropy;
+  if (!EulerFinitePositive(entropy) ||
+      !EulerFinitePositive(entropy_scale))
+    return target;
   const Scalar density = pow(
-      (sound_speed * sound_speed) /
-          fmax(gamma * entropy, pressure_floor),
+      (sound_speed * sound_speed) / entropy_scale,
       Scalar(1.0) / gamma_minus_one);
+  if (!EulerFinitePositive(density))
+    return target;
+  const Scalar admitted_density = fmax(density, density_floor);
   const Scalar pressure =
-      entropy * pow(fmax(density, density_floor), gamma);
+      entropy * pow(admitted_density, gamma);
+  if (!(pressure >= Scalar(0.0)) ||
+      pressure > std::numeric_limits<Scalar>::max())
+    return target;
 
-  result.rho = fmax(density, density_floor);
+  result.rho = admitted_density;
   result.pressure = fmax(pressure, pressure_floor);
   result.sound_speed = sound_speed;
   result.normal_velocity = normal_velocity;
@@ -267,15 +326,18 @@ EulerSubsonicInletClosure(
 }
 
 /**
- * Pure Euler closure.  Callers remain responsible for their own state,
- * normal, and thermodynamic admission policy.
+ * Pure Euler closure. Callers may supply the admitted density/pressure floors
+ * used by characteristic reconstruction; legacy callers retain 1e-12.
+ * Supersonic copy branches still require the supplied state to be preflighted.
  */
 template <typename Scalar>
 MFEM_HOST_DEVICE inline bool EvaluateEulerBoundaryState(
     const EulerBoundaryStateKind kind, const int dimension,
     const int equations, const Scalar gamma, const Scalar pressure_out,
     const Scalar* reference_state, const Scalar* normal,
-    const Scalar* interior, Scalar* exterior)
+    const Scalar* interior, Scalar* exterior,
+    const Scalar density_floor = Scalar(1.0e-12),
+    const Scalar pressure_floor = Scalar(1.0e-12))
 {
   if (equations != dimension + 2)
     return false;
@@ -296,8 +358,8 @@ MFEM_HOST_DEVICE inline bool EvaluateEulerBoundaryState(
   {
     for (int equation = 0; equation < equations; ++equation)
       exterior[equation] = interior[equation];
-    constexpr Scalar density_floor = Scalar(1.0e-12);
     const Scalar density = fmax(interior[0], density_floor);
+    exterior[0] = density;
     Scalar normal_unit[3] = {Scalar(0.0), Scalar(0.0), Scalar(0.0)};
     Scalar tangent_unit[3] = {Scalar(0.0), Scalar(0.0), Scalar(0.0)};
     EulerBuildNormalTangential(
@@ -319,31 +381,61 @@ MFEM_HOST_DEVICE inline bool EvaluateEulerBoundaryState(
   EulerBuildNormalTangential(normal, dimension, normal_unit, tangent_unit);
   const EulerPrimitiveNormalState<Scalar> inner =
       EulerConservativeToPrimitiveNormal(
-          interior, dimension, gamma, normal_unit, tangent_unit);
+          interior,
+          dimension,
+          gamma,
+          normal_unit,
+          tangent_unit,
+          density_floor,
+          pressure_floor);
 
   EulerPrimitiveNormalState<Scalar> boundary = inner;
   if (kind == EulerBoundaryStateKind::subsonic_outlet_pressure)
     boundary =
-        EulerSubsonicOutletPressureClosure(inner, gamma, pressure_out);
+        EulerSubsonicOutletPressureClosure(inner,
+                                           gamma,
+                                           pressure_out,
+                                           density_floor,
+                                           pressure_floor);
   else if (kind == EulerBoundaryStateKind::nonreflecting_outlet)
   {
     const EulerPrimitiveNormalState<Scalar> reference =
         EulerConservativeToPrimitiveNormal(
-            reference_state, dimension, gamma, normal_unit, tangent_unit);
-    boundary = EulerNonreflectingOutletClosure(inner, reference, gamma);
+            reference_state,
+            dimension,
+            gamma,
+            normal_unit,
+            tangent_unit,
+            density_floor,
+            pressure_floor);
+    boundary = EulerNonreflectingOutletClosure(
+      inner, reference, gamma, density_floor, pressure_floor);
   }
   else if (kind == EulerBoundaryStateKind::subsonic_inlet)
   {
     const EulerPrimitiveNormalState<Scalar> target =
         EulerConservativeToPrimitiveNormal(
-            reference_state, dimension, gamma, normal_unit, tangent_unit);
-    boundary = EulerSubsonicInletClosure(inner, target, gamma);
+            reference_state,
+            dimension,
+            gamma,
+            normal_unit,
+            tangent_unit,
+            density_floor,
+            pressure_floor);
+    boundary = EulerSubsonicInletClosure(
+      inner, target, gamma, density_floor, pressure_floor);
   }
   else if (kind == EulerBoundaryStateKind::far_field)
   {
     const EulerPrimitiveNormalState<Scalar> far_field =
         EulerConservativeToPrimitiveNormal(
-            reference_state, dimension, gamma, normal_unit, tangent_unit);
+            reference_state,
+            dimension,
+            gamma,
+            normal_unit,
+            tangent_unit,
+            density_floor,
+            pressure_floor);
     if (inner.normal_velocity <= -inner.sound_speed)
     {
       for (int equation = 0; equation < equations; ++equation)
@@ -357,8 +449,10 @@ MFEM_HOST_DEVICE inline bool EvaluateEulerBoundaryState(
       return true;
     }
     boundary = inner.normal_velocity < Scalar(0.0)
-        ? EulerSubsonicInletClosure(inner, far_field, gamma)
-        : EulerNonreflectingOutletClosure(inner, far_field, gamma);
+        ? EulerSubsonicInletClosure(
+            inner, far_field, gamma, density_floor, pressure_floor)
+        : EulerNonreflectingOutletClosure(
+            inner, far_field, gamma, density_floor, pressure_floor);
   }
   else
     return false;

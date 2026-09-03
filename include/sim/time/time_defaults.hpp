@@ -27,13 +27,22 @@
 namespace dg_sim
 {
 
+/// @brief Result of reconstructing an algebraic state before an IO consumer.
+struct SigmaOutputPreparation
+{
+  double seconds = 0.0;
+  bool output_allowed = true;
+};
+
 /// @brief Optional IO wiring for the shared time loop.
 struct TimeLoopIO
 {
   EulerVisWindows* glvis_windows = nullptr;
   bool* glvis_enabled = nullptr;
   mfem::ParaViewDataCollection* paraview = nullptr;
-  std::function<double(int step, mfem::real_t t, bool is_final)>
+  std::function<SigmaOutputPreparation(int step,
+                                       mfem::real_t t,
+                                       bool is_final)>
     prepare_sigma;
   std::function<void(int step, mfem::real_t t, int cycle)> after_vtk_save;
 };
@@ -247,8 +256,24 @@ inline RunSummary BuildRunSummary(const ExampleContext& ctx,
   RunSummary summary;
   summary.steps = result.steps;
   summary.segment_steps = result.segment_steps;
+  summary.accepted_attempts = result.accepted_attempts;
+  summary.rejected_attempts = result.rejected_attempts;
+  summary.rejected_limiter_elements = result.rejected_limiter_elements;
+  summary.rhs_evaluations = result.rhs_evaluations;
   summary.initial_time = result.initial_time;
   summary.final_time = result.final_time;
+  summary.minimum_attempted_dt =
+    std::isfinite(result.minimum_attempted_dt)
+      ? result.minimum_attempted_dt
+      : 0.0;
+  summary.minimum_accepted_dt =
+    std::isfinite(result.minimum_accepted_dt) ? result.minimum_accepted_dt
+                                             : 0.0;
+  summary.maximum_attempted_dt = result.maximum_attempted_dt;
+  summary.maximum_accepted_dt = result.maximum_accepted_dt;
+  summary.dt_min_reached = result.dt_min_reached;
+  summary.success = result.success;
+  summary.termination_reason = result.termination_reason;
   summary.elapsed = elapsed_seconds;
   summary.local_dofs = static_cast<int>(ctx.spaces.vfes.TrueVSize());
   summary.global_dofs =
@@ -333,6 +358,23 @@ inline void FillIGRTimeInfo(TimeLoopInfo& info,
 
 inline void PrintSummaryBox(const RunSummary& summary)
 {
+  const auto attempt_line = [&summary]() -> std::string
+  {
+    std::ostringstream os;
+    os << "attempts (accepted/rejected): " << summary.accepted_attempts
+       << " / " << summary.rejected_attempts
+       << " | rejected limiter elements: "
+       << summary.rejected_limiter_elements
+       << " | RHS evaluations: " << summary.rhs_evaluations
+       << " | dt range (attempted): "
+       << FormatSci(summary.minimum_attempted_dt) << " / "
+       << FormatSci(summary.maximum_attempted_dt)
+       << " | dt range (accepted): "
+       << FormatSci(summary.minimum_accepted_dt) << " / "
+       << FormatSci(summary.maximum_accepted_dt)
+       << " | termination: " << summary.termination_reason;
+    return os.str();
+  };
   const auto igr_line = [&summary]() -> std::string
   {
     if (!summary.has_igr)
@@ -375,6 +417,7 @@ inline void PrintSummaryBox(const RunSummary& summary)
               "time (initial/final): " + FormatFixed(summary.initial_time) +
                 " / " + FormatFixed(summary.final_time),
               "elapsed: " + FormatFixed(summary.elapsed) + " s",
+              attempt_line(),
               igr_line(),
               igr_breakdown(),
               "dofs (local/global): " +
@@ -392,6 +435,7 @@ inline void PrintSummaryBox(const RunSummary& summary)
        " | elapsed: " + FormatFixed(summary.elapsed) + " s",
      "time (initial/final): " + FormatFixed(summary.initial_time) + " / " +
        FormatFixed(summary.final_time),
+     attempt_line(),
      igr_line(),
      igr_breakdown(),
      "avg/step: " + FormatSci(summary.avg_step) + " s",
@@ -604,7 +648,12 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
     {
       if (prepare_sigma)
       {
-        prepare_sigma(step, t, done);
+        const SigmaOutputPreparation preparation =
+          prepare_sigma(step, t, done);
+        if (!preparation.output_allowed)
+        {
+          return;
+        }
       }
       UpdateEulerGLVis(*glvis_windows,
                        bundle_ptr->field_list,
@@ -626,7 +675,13 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
     double sigma_prepare_s = 0.0;
     if (prepare_sigma)
     {
-      sigma_prepare_s = prepare_sigma(step, t, is_final);
+      const SigmaOutputPreparation preparation =
+        prepare_sigma(step, t, is_final);
+      sigma_prepare_s = preparation.seconds;
+      if (!preparation.output_allowed)
+      {
+        return;
+      }
     }
     if (callbacks.on_vtk_save)
     {

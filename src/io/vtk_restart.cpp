@@ -39,6 +39,17 @@ namespace fs = std::filesystem;
 using tinyxml2::XMLDocument;
 using tinyxml2::XMLElement;
 
+constexpr int legacy_manifest_schema = 1;
+constexpr int typed_integrator_manifest_schema = 2;
+constexpr int current_manifest_schema = 3;
+
+bool IsSupportedManifestSchema(int schema)
+{
+  return schema == legacy_manifest_schema ||
+         schema == typed_integrator_manifest_schema ||
+         schema == current_manifest_schema;
+}
+
 struct PVDEntry
 {
   int cycle = -1;
@@ -61,11 +72,17 @@ struct Manifest
   int parallel_refinement = -1;
   bool igr_enabled = false;
   bool exact_dg_face = false;
+  bool igr_invariant_domain_flux = false;
+  bool zhang_shu_limiter = false;
+  bool zhang_shu_vtk_points = false;
   double gamma = 0.0;
+  double rho_floor = 0.0;
+  double pressure_floor = 0.0;
   double c_alpha = 0.0;
   int sigma_update_interval = 1;
   std::string case_name;
   std::string dg_backend;
+  std::string time_integrator;
   std::string basis;
   std::string ordering;
   std::string data_type;
@@ -76,6 +93,8 @@ struct Manifest
   std::string alpha_length_policy;
   std::string ip_kind;
   std::string sigma_cadence;
+  bool static_source_present = false;
+  std::string static_source_fingerprint;
 };
 
 struct PieceData
@@ -371,7 +390,9 @@ void ValidateManifest(const Manifest& manifest,
                       const RunConfig& run_cfg,
                       const ExampleContext& ctx,
                       std::uint64_t fingerprint,
-                      bool igr_enabled);
+                      bool igr_enabled,
+                      const mfem::ParGridFunction* static_source,
+                      std::uint64_t static_source_fingerprint);
 PVTUInfo ReadPVTU(const PVDEntry& entry, int dim, int ranks, int rank);
 PieceData ReadPiece(const PVTUInfo& info, int dim);
 void CollectiveFailure(const std::string& local_error, MPI_Comm comm);
@@ -673,11 +694,39 @@ void HashString(std::uint64_t& hash, const std::string& value)
   HashBytes(hash, &terminator, 1);
 }
 
+void HashCanonicalUInt64(std::uint64_t& hash, std::uint64_t value)
+{
+  std::array<unsigned char, sizeof(value)> bytes{};
+  for (std::size_t i = 0; i < bytes.size(); ++i)
+  {
+    bytes[i] = static_cast<unsigned char>(value & 0xffU);
+    value >>= 8U;
+  }
+  HashBytes(hash, bytes.data(), bytes.size());
+}
+
+void HashCanonicalDouble(std::uint64_t& hash, double value)
+{
+  // Positive and negative zero are the same projected source.  Normalize
+  // them so the identity represents numerical values rather than incidental
+  // sign bits introduced by a coefficient implementation.
+  if (value == 0.0) { value = 0.0; }
+  std::uint64_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(value),
+                "Restart field fingerprints require IEEE-sized doubles.");
+  std::memcpy(&bits, &value, sizeof(bits));
+  HashCanonicalUInt64(hash, bits);
+}
+
 } // namespace
 
 std::uint64_t ComputeVTKRestartMeshFingerprint(const RunConfig& run_cfg,
                                                const ExampleContext& ctx)
 {
+  const MPI_Comm comm = ctx.Mesh().GetComm();
+  int comm_size = 0;
+  MFEM_VERIFY(MPI_Comm_size(comm, &comm_size) == MPI_SUCCESS && comm_size > 0,
+              "VTK restart requires a live mesh communicator.");
   std::uint64_t local = 1469598103934665603ULL;
   HashString(local, run_cfg.case_config.case_name);
   HashString(local, BackendName(run_cfg));
@@ -708,16 +757,85 @@ std::uint64_t ComputeVTKRestartMeshFingerprint(const RunConfig& run_cfg,
       }
     }
   }
-  std::vector<std::uint64_t> rank_hashes(mfem::Mpi::WorldSize());
+  std::vector<std::uint64_t> rank_hashes(static_cast<std::size_t>(comm_size));
   MPI_Allgather(&local,
                 1,
                 mfem::MPITypeMap<std::uint64_t>::mpi_type,
                 rank_hashes.data(),
                 1,
                 mfem::MPITypeMap<std::uint64_t>::mpi_type,
-                ctx.Mesh().GetComm());
+                comm);
   std::uint64_t global = 1469598103934665603ULL;
   for (const auto value : rank_hashes) { HashValue(global, value); }
+  return global;
+}
+
+std::uint64_t ComputeVTKRestartFieldFingerprint(
+  const mfem::ParGridFunction& field,
+  const ExampleContext& ctx)
+{
+  const auto* const space = field.ParFESpace();
+  MFEM_VERIFY(space != nullptr && space->GetParMesh() != nullptr,
+              "VTK restart field fingerprints require a parallel FE space.");
+  MFEM_VERIFY(space == &ctx.spaces.vfes,
+              "The VTK restart static source must use the active Euler space.");
+  MFEM_VERIFY(field.Size() == space->GetVSize(),
+              "The VTK restart static source has an invalid local size.");
+
+  const MPI_Comm comm = ctx.Mesh().GetComm();
+  int comm_rank = -1;
+  int comm_size = 0;
+  int communicator_relation = MPI_UNEQUAL;
+  MFEM_VERIFY(MPI_Comm_rank(comm, &comm_rank) == MPI_SUCCESS &&
+                MPI_Comm_size(comm, &comm_size) == MPI_SUCCESS &&
+                comm_rank >= 0 && comm_size > 0 &&
+                MPI_Comm_compare(space->GetParMesh()->GetComm(),
+                                 comm,
+                                 &communicator_relation) == MPI_SUCCESS &&
+                (communicator_relation == MPI_IDENT ||
+                 communicator_relation == MPI_CONGRUENT),
+              "The VTK restart static source must use the mesh communicator.");
+
+  std::uint64_t local = 1469598103934665603ULL;
+  HashString(local, "dg-igr-vtk-restart-field-v1");
+  HashCanonicalUInt64(local, static_cast<std::uint64_t>(comm_size));
+  HashCanonicalUInt64(local, static_cast<std::uint64_t>(comm_rank));
+  HashCanonicalUInt64(local, static_cast<std::uint64_t>(field.Size()));
+  HashCanonicalUInt64(local, static_cast<std::uint64_t>(space->GetVSize()));
+  HashCanonicalUInt64(local, static_cast<std::uint64_t>(space->GetTrueVSize()));
+  HashCanonicalUInt64(local, static_cast<std::uint64_t>(space->GetVDim()));
+  HashCanonicalUInt64(
+    local, static_cast<std::uint64_t>(space->GetOrdering()));
+  HashCanonicalUInt64(local, static_cast<std::uint64_t>(space->GetNE()));
+  const char* const collection_name =
+    space->FEColl() == nullptr ? nullptr : space->FEColl()->Name();
+  HashString(local, collection_name == nullptr ? "" : collection_name);
+  const mfem::real_t* const values = field.HostRead();
+  for (int i = 0; i < field.Size(); ++i)
+  {
+    MFEM_VERIFY(std::isfinite(values[i]),
+                "The projected VTK restart static source must be finite.");
+    HashCanonicalDouble(local, static_cast<double>(values[i]));
+  }
+
+  std::vector<std::uint64_t> rank_hashes(static_cast<std::size_t>(comm_size));
+  MFEM_VERIFY(
+    MPI_Allgather(&local,
+                  1,
+                  mfem::MPITypeMap<std::uint64_t>::mpi_type,
+                  rank_hashes.data(),
+                  1,
+                  mfem::MPITypeMap<std::uint64_t>::mpi_type,
+                  comm) == MPI_SUCCESS,
+    "Unable to collect VTK restart static-source fingerprints.");
+  std::uint64_t global = 1469598103934665603ULL;
+  HashString(global, "dg-igr-vtk-restart-distributed-field-v1");
+  HashCanonicalUInt64(global, static_cast<std::uint64_t>(comm_size));
+  for (std::size_t rank = 0; rank < rank_hashes.size(); ++rank)
+  {
+    HashCanonicalUInt64(global, static_cast<std::uint64_t>(rank));
+    HashCanonicalUInt64(global, rank_hashes[rank]);
+  }
   return global;
 }
 
@@ -725,7 +843,8 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
                                    const RunConfig& run_cfg,
                                    const ExampleContext& ctx,
                                    mfem::ParGridFunction& state,
-                                   bool igr_enabled)
+                                   bool igr_enabled,
+                                   const mfem::ParGridFunction* static_source)
 {
   const auto start = std::chrono::steady_clock::now();
   VTKRestartInfo info;
@@ -736,6 +855,13 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
   bool has_manifest = false;
   std::string error;
   std::unique_ptr<mfem::ParGridFunction> candidate;
+  const MPI_Comm comm = ctx.Mesh().GetComm();
+  int comm_rank = 0;
+  int comm_size = 0;
+  MFEM_VERIFY(MPI_Comm_rank(comm, &comm_rank) == MPI_SUCCESS &&
+                MPI_Comm_size(comm, &comm_size) == MPI_SUCCESS &&
+                comm_size > 0,
+              "VTK restart requires a live mesh communicator.");
   try
   {
     if (igr_enabled)
@@ -763,20 +889,37 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
     const fs::path manifest_path = entry.pvtu.parent_path() / "restart.json";
     has_manifest = fs::is_regular_file(manifest_path);
     if (has_manifest) { manifest = ReadManifest(manifest_path); }
-    pvtu = ReadPVTU(entry,
-                    ctx.dim,
-                    mfem::Mpi::WorldSize(),
-                    mfem::Mpi::WorldRank());
+    pvtu = ReadPVTU(entry, ctx.dim, comm_size, comm_rank);
     piece = ReadPiece(pvtu, ctx.dim);
   }
   catch (const std::exception& ex)
   {
     error = ex.what();
   }
-  CollectiveFailure(error, ctx.Mesh().GetComm());
+  CollectiveFailure(error, comm);
 
   const std::uint64_t fingerprint =
     ComputeVTKRestartMeshFingerprint(run_cfg, ctx);
+  int static_source_presence[2] = {static_source == nullptr ? 0 : 1,
+                                   static_source == nullptr ? 0 : 1};
+  MFEM_VERIFY(MPI_Allreduce(MPI_IN_PLACE,
+                            &static_source_presence[0],
+                            1,
+                            MPI_INT,
+                            MPI_MIN,
+                            comm) == MPI_SUCCESS &&
+                MPI_Allreduce(MPI_IN_PLACE,
+                              &static_source_presence[1],
+                              1,
+                              MPI_INT,
+                              MPI_MAX,
+                              comm) == MPI_SUCCESS &&
+                static_source_presence[0] == static_source_presence[1],
+              "VTK restart static-source presence must agree on every rank.");
+  const std::uint64_t static_source_fingerprint =
+    static_source == nullptr
+      ? 0
+      : ComputeVTKRestartFieldFingerprint(*static_source, ctx);
   ReconstructionMetrics local_metrics;
   error.clear();
   try
@@ -784,7 +927,14 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
     if (has_manifest)
     {
       ValidateManifest(
-        manifest, entry, run_cfg, ctx, fingerprint, igr_enabled);
+        manifest,
+        entry,
+        run_cfg,
+        ctx,
+        fingerprint,
+        igr_enabled,
+        static_source,
+        static_source_fingerprint);
       if (request.legacy_step >= 0 && request.legacy_step != manifest.step)
       {
         Fail("--restart-step conflicts with the selected cycle manifest");
@@ -794,6 +944,11 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
     }
     else
     {
+      if (static_source != nullptr)
+      {
+        Fail("legacy VTK restart data without a manifest cannot certify the "
+             "active static source");
+      }
       if (run_cfg.dg_backend == DGBackend::DGSEM)
       {
         Fail("DGSEM VTK restart requires a complete restart manifest");
@@ -814,7 +969,7 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
   {
     error = ex.what();
   }
-  CollectiveFailure(error, ctx.Mesh().GetComm());
+  CollectiveFailure(error, comm);
 
   info.cycle = entry.cycle;
   info.time = entry.time;
@@ -823,9 +978,9 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
                 1,
                 MPI_DOUBLE,
                 MPI_MAX,
-                ctx.Mesh().GetComm());
+                comm);
   double sums[2] = {local_metrics.residual_sq, local_metrics.source_sq};
-  MPI_Allreduce(MPI_IN_PLACE, sums, 2, MPI_DOUBLE, MPI_SUM, ctx.Mesh().GetComm());
+  MPI_Allreduce(MPI_IN_PLACE, sums, 2, MPI_DOUBLE, MPI_SUM, comm);
   info.reconstruction_rel_l2 =
     std::sqrt(sums[0] / std::max(sums[1], std::numeric_limits<double>::min()));
   MPI_Allreduce(&local_metrics.point_max,
@@ -833,13 +988,13 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
                 1,
                 MPI_DOUBLE,
                 MPI_MAX,
-                ctx.Mesh().GetComm());
+                comm);
   MPI_Allreduce(&local_metrics.condition_inf,
                 &info.interpolation_condition_inf,
                 1,
                 MPI_DOUBLE,
                 MPI_MAX,
-                ctx.Mesh().GetComm());
+                comm);
 
   MFEM_VERIFY(candidate, "collective VTK restart candidate is unavailable");
   const mfem::dg_igr::NonFiniteSummary finite =
@@ -924,33 +1079,70 @@ void WriteVTKRestartManifest(const std::string& dataset_dir,
                              const RunConfig& run_cfg,
                              const ExampleContext& ctx,
                              bool sigma_saved,
-                             int vtk_compression_level)
+                             int vtk_compression_level,
+                             const mfem::ParGridFunction* static_source)
 {
   MFEM_VERIFY(cycle >= 0 && step >= 0 && std::isfinite(time),
               "Invalid VTK restart manifest state.");
+  const MPI_Comm comm = ctx.Mesh().GetComm();
+  int comm_rank = 0;
+  int comm_size = 0;
+  MFEM_VERIFY(MPI_Comm_rank(comm, &comm_rank) == MPI_SUCCESS &&
+                MPI_Comm_size(comm, &comm_size) == MPI_SUCCESS &&
+                comm_size > 0,
+              "VTK restart manifest requires a live mesh communicator.");
   const std::uint64_t fingerprint =
     ComputeVTKRestartMeshFingerprint(run_cfg, ctx);
+  int static_source_presence[2] = {static_source == nullptr ? 0 : 1,
+                                   static_source == nullptr ? 0 : 1};
+  MFEM_VERIFY(MPI_Allreduce(MPI_IN_PLACE,
+                            &static_source_presence[0],
+                            1,
+                            MPI_INT,
+                            MPI_MIN,
+                            comm) == MPI_SUCCESS &&
+                MPI_Allreduce(MPI_IN_PLACE,
+                              &static_source_presence[1],
+                              1,
+                              MPI_INT,
+                              MPI_MAX,
+                              comm) == MPI_SUCCESS &&
+                static_source_presence[0] == static_source_presence[1],
+              "VTK restart static-source presence must agree on every rank.");
+  const std::uint64_t static_source_fingerprint =
+    static_source == nullptr
+      ? 0
+      : ComputeVTKRestartFieldFingerprint(*static_source, ctx);
   long long local_elements = ctx.Mesh().GetNE();
   long long global_elements = 0;
-  std::vector<long long> local_element_counts(mfem::Mpi::WorldSize());
+  std::vector<long long> local_element_counts(
+    static_cast<std::size_t>(comm_size));
   MPI_Allgather(&local_elements,
                 1,
                 MPI_LONG_LONG,
                 local_element_counts.data(),
                 1,
                 MPI_LONG_LONG,
-                ctx.Mesh().GetComm());
+                comm);
   MPI_Allreduce(&local_elements,
                 &global_elements,
                 1,
                 MPI_LONG_LONG,
                 MPI_SUM,
-                ctx.Mesh().GetComm());
-  MPI_Barrier(ctx.Mesh().GetComm());
-  if (!mfem::Mpi::Root()) { return; }
+                comm);
+  MPI_Barrier(comm);
+  if (comm_rank != 0)
+  {
+    // The root publishes the completion marker only after every rank has
+    // closed its piece.  Do not let peers leave this collective operation
+    // until that marker is visible.
+    MPI_Barrier(comm);
+    return;
+  }
 
   picojson::object object;
-  object["schema_version"] = picojson::value(1.0);
+  object["schema_version"] =
+    picojson::value(static_cast<double>(current_manifest_schema));
   object["complete"] = picojson::value(true);
   object["dataset"] = picojson::value(dataset_name);
   object["case"] = picojson::value(run_cfg.case_config.case_name);
@@ -961,7 +1153,7 @@ void WriteVTKRestartManifest(const std::string& dataset_dir,
   object["next_cycle"] = picojson::value(static_cast<double>(cycle + 1));
   object["next_save_time"] =
     picojson::value(static_cast<double>(time + run_cfg.opts.dt_save));
-  object["ranks"] = picojson::value(static_cast<double>(mfem::Mpi::WorldSize()));
+  object["ranks"] = picojson::value(static_cast<double>(comm_size));
   object["piece_pattern"] = picojson::value(std::string("proc%06d.vtu"));
   object["local_elements_rank0"] = picojson::value(static_cast<double>(local_elements));
   picojson::array local_elements_json;
@@ -979,6 +1171,8 @@ void WriteVTKRestartManifest(const std::string& dataset_dir,
   object["parallel_refinement"] =
     picojson::value(static_cast<double>(run_cfg.opts.par_ref_levels));
   object["dg_backend"] = picojson::value(BackendName(run_cfg));
+  object["time_integrator"] = picojson::value(
+    std::string(TimeIntegratorToString(run_cfg.time_integrator)));
   object["basis"] = picojson::value(BasisName(run_cfg));
   object["ordering"] = picojson::value(std::string("byNODES"));
   const auto vtk_config = MakeCaseVTKConfig(run_cfg.case_config);
@@ -997,11 +1191,23 @@ void WriteVTKRestartManifest(const std::string& dataset_dir,
   object["level_of_detail"] =
     picojson::value(static_cast<double>(run_cfg.opts.order));
   object["mesh_fingerprint"] = picojson::value(FingerprintString(fingerprint));
+  object["static_source_present"] = picojson::value(static_source != nullptr);
+  object["static_source_fingerprint"] = picojson::value(
+    static_source == nullptr ? std::string("none")
+                             : FingerprintString(static_source_fingerprint));
   object["required_fields"] =
     picojson::value(std::string("density:1,momentum:") +
                     std::to_string(ctx.dim) + ",energy:1");
   object["gamma"] = picojson::value(run_cfg.case_config.gamma);
+  object["rho_floor"] =
+    picojson::value(run_cfg.case_config.rk3_config.rho_min);
+  object["pressure_floor"] =
+    picojson::value(run_cfg.case_config.rk3_config.p_min);
+  object["zhang_shu_limiter"] =
+    picojson::value(run_cfg.case_config.limiter_pipeline.zhang_shu);
   object["zhang_shu_points"] = picojson::value(run_cfg.opts.zhang_shu_points);
+  object["zhang_shu_vtk_points"] =
+    picojson::value(run_cfg.opts.zhang_shu_vtk_points);
   object["igr_enabled"] = picojson::value(sigma_saved);
   object["igr_space"] = picojson::value(IGRSpaceName(run_cfg));
   object["igr_grad"] = picojson::value(IGRGradName(run_cfg));
@@ -1013,6 +1219,8 @@ void WriteVTKRestartManifest(const std::string& dataset_dir,
     IGRIPKindToString(ParseIGRIPKind(run_cfg.igr_opts.ip_kind))));
   object["exact_dg_face"] =
     picojson::value(run_cfg.igr_opts.exact_dg_face_operator);
+  object["igr_invariant_domain_flux"] =
+    picojson::value(run_cfg.igr_opts.igr_invariant_domain_flux);
   const auto sigma_cadence = run_cfg.igr_opts.sigma_cadence.empty()
                                ? run_cfg.case_config.igr_config.sigma_cadence
                                : ParseIGRSigmaUpdateCadence(
@@ -1044,6 +1252,7 @@ void WriteVTKRestartManifest(const std::string& dataset_dir,
     MFEM_ABORT("Unable to atomically publish restart manifest "
                << final_path << ": " << ec.message());
   }
+  MPI_Barrier(comm);
 }
 
 } // namespace dg_sim
@@ -1162,7 +1371,10 @@ PVDEntry SelectEntry(const std::vector<PVDEntry>& entries,
       try
       {
         const Manifest manifest = ReadManifest(manifest_path);
-        if (manifest.schema == 1 && manifest.complete) { return *entry; }
+        if (IsSupportedManifestSchema(manifest.schema) && manifest.complete)
+        {
+          return *entry;
+        }
       }
       catch (const std::exception&)
       {
@@ -1287,6 +1499,39 @@ Manifest ReadManifest(const fs::path& path)
   result.alpha_length_policy = JSONString(object, "alpha_length_policy");
   result.ip_kind = JSONString(object, "ip_kind");
   result.sigma_cadence = JSONString(object, "sigma_cadence");
+  if (result.schema == typed_integrator_manifest_schema ||
+      result.schema == current_manifest_schema)
+  {
+    result.time_integrator = JSONString(object, "time_integrator");
+    result.igr_invariant_domain_flux =
+      JSONBool(object, "igr_invariant_domain_flux");
+    result.zhang_shu_limiter = JSONBool(object, "zhang_shu_limiter");
+    result.zhang_shu_vtk_points =
+      JSONBool(object, "zhang_shu_vtk_points");
+    result.rho_floor = JSONDouble(object, "rho_floor");
+    result.pressure_floor = JSONDouble(object, "pressure_floor");
+  }
+  else if (result.schema == legacy_manifest_schema)
+  {
+    // Schema 1 predates typed SSPRK(10,4) and the invariant-domain flux.
+    // Retain its established compatibility only under that legacy method.
+    result.time_integrator = "rk3ssp";
+    result.igr_invariant_domain_flux = false;
+  }
+  if (result.schema == current_manifest_schema)
+  {
+    result.static_source_present =
+      JSONBool(object, "static_source_present");
+    result.static_source_fingerprint =
+      JSONString(object, "static_source_fingerprint");
+  }
+  else
+  {
+    // Schemas 1 and 2 predate projected static-source identity.  They remain
+    // usable only when the active run is source-free.
+    result.static_source_present = false;
+    result.static_source_fingerprint = "none";
+  }
   return result;
 }
 
@@ -1322,11 +1567,48 @@ void ValidateManifest(const Manifest& manifest,
                       const RunConfig& run_cfg,
                       const ExampleContext& ctx,
                       std::uint64_t fingerprint,
-                      bool igr_enabled)
+                      bool igr_enabled,
+                      const mfem::ParGridFunction* static_source,
+                      std::uint64_t static_source_fingerprint)
 {
-  if (manifest.schema != 1 || !manifest.complete)
+  int comm_size = 0;
+  MFEM_VERIFY(MPI_Comm_size(ctx.Mesh().GetComm(), &comm_size) == MPI_SUCCESS &&
+                comm_size > 0,
+              "VTK restart validation requires a live mesh communicator.");
+  if (!manifest.complete)
   {
-    Fail("restart manifest is incomplete or uses an unsupported schema");
+    Fail("restart manifest is incomplete");
+  }
+  if (!IsSupportedManifestSchema(manifest.schema))
+  {
+    Fail("restart manifest uses an unsupported schema");
+  }
+  if (manifest.schema == legacy_manifest_schema &&
+      (run_cfg.time_integrator != TimeIntegrator::RK3SSP ||
+       run_cfg.igr_opts.igr_invariant_domain_flux ||
+       run_cfg.opts.zhang_shu_vtk_points))
+  {
+    Fail("restart manifest schema 1 is compatible only with rk3ssp and "
+         "invariant-domain flux and VTK-point limiter enforcement disabled");
+  }
+  if (manifest.schema < current_manifest_schema && static_source != nullptr)
+  {
+    Fail("restart manifest schema " + std::to_string(manifest.schema) +
+         " cannot certify the active static source");
+  }
+  if (manifest.schema == current_manifest_schema)
+  {
+    const bool active_static_source = static_source != nullptr;
+    const std::string active_static_source_fingerprint =
+      active_static_source ? FingerprintString(static_source_fingerprint)
+                           : std::string("none");
+    if (manifest.static_source_present != active_static_source ||
+        manifest.static_source_fingerprint !=
+          active_static_source_fingerprint)
+    {
+      Fail("restart manifest static source is incompatible with the active "
+           "projected source");
+    }
   }
   const auto same_time = std::abs(manifest.time - entry.time) <=
                          32.0 * std::numeric_limits<double>::epsilon() *
@@ -1353,7 +1635,18 @@ void ValidateManifest(const Manifest& manifest,
     return std::abs(a - b) <= 64.0 * std::numeric_limits<double>::epsilon() *
                                std::max({1.0, std::abs(a), std::abs(b)});
   };
-  if (manifest.ranks != mfem::Mpi::WorldSize() || manifest.dim != ctx.dim ||
+  const bool current_method_mismatch =
+    manifest.schema >= typed_integrator_manifest_schema &&
+    (manifest.time_integrator !=
+       TimeIntegratorToString(run_cfg.time_integrator) ||
+     manifest.igr_invariant_domain_flux !=
+       run_cfg.igr_opts.igr_invariant_domain_flux ||
+     manifest.zhang_shu_limiter !=
+       run_cfg.case_config.limiter_pipeline.zhang_shu ||
+     manifest.zhang_shu_vtk_points != run_cfg.opts.zhang_shu_vtk_points ||
+     manifest.rho_floor != run_cfg.case_config.rk3_config.rho_min ||
+     manifest.pressure_floor != run_cfg.case_config.rk3_config.p_min);
+  if (manifest.ranks != comm_size || manifest.dim != ctx.dim ||
       manifest.equations != ctx.num_equations ||
       manifest.order != run_cfg.opts.order ||
       manifest.serial_refinement != run_cfg.opts.ser_ref_levels ||
@@ -1366,6 +1659,7 @@ void ValidateManifest(const Manifest& manifest,
       !close(manifest.gamma, run_cfg.case_config.gamma) ||
       manifest.zhang_shu_points != run_cfg.opts.zhang_shu_points ||
       manifest.igr_enabled != igr_enabled ||
+      current_method_mismatch ||
       (igr_enabled &&
        (manifest.igr_space != IGRSpaceName(run_cfg) ||
         manifest.igr_grad != IGRGradName(run_cfg) ||

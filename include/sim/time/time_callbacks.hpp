@@ -6,6 +6,7 @@
  */
 
 #include <functional>
+#include <string>
 
 namespace dg_sim
 {
@@ -67,8 +68,20 @@ struct RunSummary
 {
   int steps = 0;
   int segment_steps = 0;
+  int accepted_attempts = 0;
+  int rejected_attempts = 0;
+  /// Sum of failed element admissions over rejected limiter attempts.
+  long long rejected_limiter_elements = 0;
+  long long rhs_evaluations = 0;
   double initial_time = 0.0;
   double final_time = 0.0;
+  double minimum_attempted_dt = 0.0;
+  double minimum_accepted_dt = 0.0;
+  double maximum_attempted_dt = 0.0;
+  double maximum_accepted_dt = 0.0;
+  bool dt_min_reached = false;
+  bool success = false;
+  std::string termination_reason = "not-started";
   double elapsed = 0.0;
   double avg_step = 0.0;
   double avg_step_per_dof_local = 0.0;

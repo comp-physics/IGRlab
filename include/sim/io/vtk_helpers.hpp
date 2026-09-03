@@ -40,6 +40,25 @@ inline std::string MakeCaseVTKDatasetName(
   name << case_cfg.case_name << "_p_" << run_cfg.opts.order << "_ref_"
        << total_ref << "_is_" << run_cfg.igr_opts.space << "_ig_"
        << run_cfg.igr_opts.grad << "_ca_" << c_alpha;
+  // Preserve the established RK3SSP dataset name while keeping the typed
+  // SSPRK(10,4) output from colliding with it.
+  if (run_cfg.time_integrator == TimeIntegrator::SSPRK104)
+  {
+    name << "_ti_" << TimeIntegratorToString(run_cfg.time_integrator);
+  }
+  // The exact IGR-aware invariant-domain face speed changes the numerical
+  // flux and therefore must never share an output directory with the legacy
+  // Rusanov selection.
+  if (run_cfg.igr_opts.igr_invariant_domain_flux)
+  {
+    name << "_iidflux";
+  }
+  // Refined VTK points enlarge the limiter's enforced point set and therefore
+  // define a distinct numerical policy even when all other selectors match.
+  if (run_cfg.opts.zhang_shu_vtk_points)
+  {
+    name << "_zsvtk";
+  }
   return name.str();
 }
 

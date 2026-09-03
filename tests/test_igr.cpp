@@ -5,10 +5,12 @@
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/riemann/rusanov.hpp"
 #include "numerics/riemann/side_scope_utils.hpp"
+#include "numerics/timestepping/RK3SSPWithLimiter.hpp"
 #include "sim/io/vis_helpers.hpp"
 #include "../src/numerics/dg/DGFaceQuadratureKernels.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cmath>
 #include <limits>
@@ -690,7 +692,7 @@ int RunIGRTests(TestContext& ctx)
   }
 
   mfem::EulerFlux base_flux(dim, gamma);
-  mfem::FluxWithIGR igr_flux(base_flux);
+  mfem::FluxWithIGR igr_flux(base_flux, gamma);
 
   const mfem::Vector state = EulerConsFromPrim2D(
     /*rho=*/1.2,
@@ -751,6 +753,12 @@ int RunIGRTests(TestContext& ctx)
             "FluxWithIGR defaults to Euler-only CFL accounting");
   ctx.Check(!igr_flux.GetSigmaAwareRusanov(),
             "FluxWithIGR defaults to Euler-only Rusanov dissipation");
+  ctx.Check(!igr_flux.GetInvariantDomainFlux(),
+            "FluxWithIGR defaults to the legacy Euler-only speed policy");
+  ctx.CheckNear(igr_flux.GetGamma(),
+                gamma,
+                0.0,
+                "FluxWithIGR retains the supplied Euler gamma");
 
   mfem::FaceElementTransformations& Tr_face = GetFaceTr(pmesh, /*face=*/0);
 
@@ -860,6 +868,180 @@ int RunIGRTests(TestContext& ctx)
               "IGR invariant-domain speed keeps both split states admissible");
     ctx.Check(unsafe_split_detected,
               "A speed below the IGR invariant-domain threshold loses pressure");
+
+    igr_flux.SetSigmaAwareCFL(false);
+    igr_flux.SetSigmaAwareRusanov(false);
+    igr_flux.SetInvariantDomainFlux(true);
+    mfem::Vector exact_flux(dim + 2);
+    const double exact_reported_speed = igr_flux.ComputeFluxDotN(
+      low_pressure_state, unit_normal, Tr_face, exact_flux);
+    const double exact_dissipation_speed =
+      igr_flux.SelectRusanovDissipationSpeed(exact_reported_speed,
+                                             low_pressure_state(0),
+                                             sigma_value);
+    ctx.CheckNear(exact_reported_speed,
+                  analytic_threshold,
+                  2.0e-10 * analytic_threshold,
+                  "Exact IGR mode reports the invariant-domain CFL speed");
+    ctx.CheckNear(exact_dissipation_speed,
+                  exact_reported_speed,
+                  0.0,
+                  "Exact IGR mode couples Rusanov dissipation to CFL speed");
+    for (int i = 0; i < exact_flux.Size(); ++i)
+    {
+      ctx.CheckNear(exact_flux(i),
+                    full_flux(i),
+                    tol,
+                    "Exact IGR speed mode preserves physical flux, component " +
+                      std::to_string(i));
+    }
+
+    igr_flux.SetSigmaAwareCFL(true);
+    igr_flux.SetSigmaAwareRusanov(true);
+    mfem::Vector exact_with_heuristics_flux(dim + 2);
+    const double exact_with_heuristics = igr_flux.ComputeFluxDotN(
+      low_pressure_state, unit_normal, Tr_face, exact_with_heuristics_flux);
+    ctx.CheckNear(exact_with_heuristics,
+                  exact_reported_speed,
+                  0.0,
+                  "Exact IGR mode overrides independent sigma heuristics");
+    const mfem::IGRFrozenSigmaTelemetry q_sigma_telemetry =
+      igr_flux.GetFrozenSigmaTelemetry();
+    const double expected_q_sigma =
+      gamma * 1.0e-6 + (gamma - 1.0) * sigma_value;
+    ctx.Check(q_sigma_telemetry.enabled &&
+                q_sigma_telemetry.sample_count == 2 &&
+                q_sigma_telemetry.nonpositive_count == 0 &&
+                q_sigma_telemetry.nonfinite_count == 0,
+              "Exact IGR host speed telemetry counts attempted samples");
+    ctx.CheckNear(q_sigma_telemetry.minimum_raw_q_sigma,
+                  expected_q_sigma,
+                  2.0e-14,
+                  "Exact IGR host telemetry records minimum raw q_sigma");
+    ctx.CheckNear(q_sigma_telemetry.minimum_q_sigma_over_gamma_p,
+                  expected_q_sigma / (gamma * 1.0e-6),
+                  2.0e-14,
+                  "Exact IGR host telemetry records normalized q_sigma");
+    igr_flux.SetInvariantDomainFlux(false);
+  }
+
+  // Exercise the raw invariant-domain algebra away from the default gas and
+  // with a negative Sigma.  The state is only one representable value above
+  // its configured density and pressure floors; scaled oblique normals must
+  // change F.n linearly without changing the reported unit-normal speed.
+  {
+    constexpr double gamma_floor = 1.67;
+    constexpr double rho_floor = 5.0e-7;
+    constexpr double pressure_floor = 1.0e-6;
+    constexpr double negative_sigma = -9.0e-6;
+    const double rho_floor_state =
+      std::nextafter(rho_floor, std::numeric_limits<double>::infinity());
+    const double pressure_floor_state =
+      std::nextafter(pressure_floor,
+                     std::numeric_limits<double>::infinity());
+    const mfem::Vector floor_state = EulerConsFromPrim2D(
+      rho_floor_state,
+      /*u=*/0.4,
+      /*v=*/-0.3,
+      pressure_floor_state,
+      gamma_floor);
+    mfem::Vector unit_oblique({0.6, -0.8});
+    constexpr double normal_scale = 7.25;
+    mfem::Vector scaled_oblique(unit_oblique);
+    scaled_oblique *= normal_scale;
+
+    mfem::EulerFlux floor_base_flux(dim, gamma_floor);
+    mfem::FaceElementTransformations dummy_face;
+    mfem::Vector unit_flux(dim + 2);
+    mfem::Vector scaled_flux(dim + 2);
+    const double unit_base_speed = floor_base_flux.ComputeFluxDotN(
+      floor_state, unit_oblique, dummy_face, unit_flux);
+    const double scaled_base_speed = floor_base_flux.ComputeFluxDotN(
+      floor_state, scaled_oblique, dummy_face, scaled_flux);
+    ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFlux(
+      dim,
+      floor_state.GetData(),
+      1,
+      unit_oblique.GetData(),
+      1,
+      negative_sigma,
+      rho_floor,
+      unit_flux.GetData(),
+      1);
+    ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFlux(
+      dim,
+      floor_state.GetData(),
+      1,
+      scaled_oblique.GetData(),
+      1,
+      negative_sigma,
+      rho_floor,
+      scaled_flux.GetData(),
+      1);
+
+    const double transport_speed = std::abs(0.4 * unit_oblique(0) -
+                                            0.3 * unit_oblique(1));
+    const double expected_split_speed =
+      transport_speed +
+      std::abs(pressure_floor_state + negative_sigma) *
+        std::sqrt((gamma_floor - 1.0) /
+                  (2.0 * rho_floor_state * pressure_floor_state));
+    const double invariant_speed = mfem::IGRFluxInvariantDomainSpeed(
+      unit_base_speed,
+      rho_floor_state,
+      pressure_floor_state,
+      transport_speed,
+      negative_sigma,
+      gamma_floor,
+      rho_floor,
+      pressure_floor);
+    ctx.Check(expected_split_speed > unit_base_speed,
+              "Near-floor negative-Sigma case exercises the split threshold");
+    ctx.CheckNear(invariant_speed,
+                  expected_split_speed,
+                  2.0e-13 * expected_split_speed,
+                  "Invariant-domain algebra handles negative Sigma, nondefault "
+                  "gamma, and configured floors");
+    ctx.CheckNear(scaled_base_speed,
+                  unit_base_speed,
+                  2.0e-13 * unit_base_speed,
+                  "Euler unit-normal speed is invariant to normal scaling");
+    for (int eq = 0; eq < unit_flux.Size(); ++eq)
+    {
+      ctx.CheckNear(scaled_flux(eq),
+                    normal_scale * unit_flux(eq),
+                    2.0e-12 * std::max(1.0, std::abs(scaled_flux(eq))),
+                    "Euler+IGR normal flux scales linearly for an oblique "
+                    "normal, component " +
+                      std::to_string(eq));
+    }
+
+    const auto pressure_of = [&](const mfem::Vector& value)
+    {
+      const double momentum_squared =
+        value(1) * value(1) + value(2) * value(2);
+      return (gamma_floor - 1.0) *
+             (value(3) - 0.5 * momentum_squared / value(0));
+    };
+    bool safe_splits = true;
+    bool unsafe_split = false;
+    for (const double sign : {-1.0, 1.0})
+    {
+      mfem::Vector safe(floor_state);
+      safe.Add(sign / (1.01 * invariant_speed), unit_flux);
+      safe_splits = safe_splits && safe(0) > 0.0 && pressure_of(safe) > 0.0;
+
+      mfem::Vector unsafe(floor_state);
+      unsafe.Add(sign / (0.99 * invariant_speed), unit_flux);
+      unsafe_split = unsafe_split ||
+                     unsafe(0) <= 0.0 || pressure_of(unsafe) <= 0.0;
+    }
+    ctx.Check(safe_splits,
+              "Negative-Sigma invariant speed keeps both near-floor splits "
+              "admissible");
+    ctx.Check(unsafe_split,
+              "Negative-Sigma split threshold is sharp in the near-floor "
+              "case");
   }
 
   // --- Tensor flux path: sigma terms must enter ComputeFlux (volume flux) ---
@@ -3282,11 +3464,23 @@ int RunIGRTests(TestContext& ctx)
     op_s.SetNumericalFlux(&num_flux_s);
 
     mfem::EulerWithIGR wrapped(op_s, igr_solver_s, U_base);
+    ctx.Check(wrapped.SupportsPhysicalBoundaryFluxIntegral() &&
+                op_s.SupportsPhysicalBoundaryFluxIntegral(),
+              "EulerWithIGR forwards boundary-flux provider support");
     wrapped.BeginRKStep(/*step=*/0, /*t=*/0.0, /*dt=*/0.01);
     wrapped.SetRKStage(/*stage=*/0);
 
     mfem::Vector rhs(U_stage.Size());
+    wrapped.ArmPhysicalBoundaryFluxIntegral();
     wrapped.Mult(U_stage, rhs);
+    ctx.Check(wrapped.HasLastPhysicalBoundaryFluxIntegral() &&
+                op_s.HasLastPhysicalBoundaryFluxIntegral() &&
+                wrapped.GetLastPhysicalBoundaryFluxIntegral().Size() ==
+                  num_eq_s &&
+                wrapped.GetLastPhysicalBoundaryFluxIntegral().Normlinf() ==
+                  0.0,
+              "EulerWithIGR forwards one-shot boundary-flux capture through "
+              "the periodic zero-boundary control");
 
     mfem::Vector sigma_wrapped(igr_solver_s.GetSigma().Size());
     sigma_wrapped = igr_solver_s.GetSigma();
@@ -3324,6 +3518,127 @@ int RunIGRTests(TestContext& ctx)
               "EulerWithIGR updates sigma from stage state used in RHS");
     ctx.Check(stale_err >= 0.5 * stage_vs_base,
               "EulerWithIGR sigma is not sourced from persistent base state");
+
+    // --- SSPRK(10,4) must drive all ten every-stage IGR closures ---
+    {
+      mfem::Vector state_before_ssprk104(U_base);
+      const mfem::Vector uniform_before_ssprk104 = EulerConsFromPrim1D(
+        /*rho=*/1.1,
+        /*u=*/0.25,
+        /*p=*/1.0,
+        gamma);
+      FillConstantState(uniform_before_ssprk104, U_base);
+      U_base.ExchangeFaceNbrData();
+      mfem::Vector source_components(num_eq_s);
+      source_components(0) = 0.2;
+      source_components(1) = -0.1;
+      source_components(2) = 0.3;
+      mfem::ParGridFunction projected_source(&state_fes_s);
+      FillConstantState(source_components, projected_source);
+      op_s.SetStaticSource(projected_source);
+      ctx.Check(op_s.HasStaticSource(),
+                "Euler+IGR SSPRK source control installs on the base DG "
+                "operator without wrapping it");
+      const int production_before_ssprk104 =
+        igr_solver_s.GetProductionLinearSolveCalls();
+
+      // Close the manual stage context above before handing lifecycle control
+      // to a real stage-aware time integrator.
+      wrapped.EndRKStep(U_base, /*t=*/0.0, /*state_generation=*/0);
+
+      // Exercise the intermediate-stage tolerance path without retaining a
+      // production solve-history API solely for this regression.
+      igr_solver_s.SetStageRtolScale(4.0);
+      mfem::RK3SSPWithLimiter ssprk104(
+        state_fes_s, mfem::SSPRKMethod::SSPRK104);
+      ssprk104.EnablePhysicalBoundaryFluxTracking();
+      ssprk104.Init(wrapped);
+      mfem::real_t ssprk104_time = 0.0;
+      mfem::real_t ssprk104_dt = 1.0e-6;
+      ssprk104.Step(U_base, ssprk104_time, ssprk104_dt);
+
+      ctx.Check(ssprk104.GetStageCount() == 10,
+                "SSPRK(10,4) reports ten RHS stages");
+      ctx.Check(igr_solver_s.GetProductionLinearSolveCalls() ==
+                  production_before_ssprk104 + 10,
+                "SSPRK(10,4) performs one production IGR closure per stage");
+      ctx.Check(ssprk104.GetStateGeneration() == 10u,
+                "SSPRK(10,4) commits the accepted endpoint generation");
+      ctx.Check(wrapped.GetSigmaStateGeneration() == 9u,
+                "SSPRK(10,4) final RHS closure records stage generation nine");
+      ctx.CheckNear(ssprk104_time,
+                    ssprk104_dt,
+                    10.0 * std::numeric_limits<mfem::real_t>::epsilon(),
+                    "SSPRK(10,4) advances the physical time once");
+      ctx.Check(ssprk104.SupportsPhysicalBoundaryFluxTracking() &&
+                  ssprk104.HasCumulativePhysicalBoundaryFluxIntegral() &&
+                  ssprk104.GetCumulativePhysicalBoundaryFluxIntegral().Size() ==
+                    num_eq_s &&
+                  ssprk104.GetCumulativePhysicalBoundaryFluxIntegral()
+                      .Normlinf() == 0.0 &&
+                  ssprk104
+                      .GetCumulativePhysicalBoundaryFluxAbsoluteIntegral()
+                      .Normlinf() == 0.0,
+                "SSPRK(10,4) consumes forwarded Euler+IGR boundary captures");
+      mfem::Vector expected_components(uniform_before_ssprk104);
+      expected_components.Add(ssprk104_dt, source_components);
+      mfem::ParGridFunction expected_grid_function(&state_fes_s);
+      FillConstantState(expected_components, expected_grid_function);
+      mfem::Vector source_increment_error(U_base);
+      source_increment_error -= expected_grid_function;
+      const double maximum_source_increment_error =
+        source_increment_error.Normlinf();
+      ctx.LogMetric("igr_ssprk104_static_source_max_error=" +
+                    FormatSci(maximum_source_increment_error));
+      ctx.Check(maximum_source_increment_error <= 2.0e-10,
+                "EulerWithIGR and SSPRK(10,4) preserve the exact uniform "
+                "static-source increment");
+
+      igr_solver_s.SetStageRtolScale(1.0);
+      mfem::Vector zero_source(U_base.Size());
+      zero_source = 0.0;
+      op_s.SetStaticSource(zero_source);
+      ctx.Check(!op_s.HasStaticSource(),
+                "clearing the IGR base source restores the source-free path");
+      U_base = state_before_ssprk104;
+      U_base.ExchangeFaceNbrData();
+
+      // An actual Euler+IGR stage that is rejected by the callback pipeline
+      // must not publish its already-captured RHS flux.
+      mfem::RK3SSPWithLimiter rejected_ssprk(
+        state_fes_s, mfem::SSPRKMethod::SSPRK33);
+      rejected_ssprk.EnablePhysicalBoundaryFluxTracking();
+      rejected_ssprk.AddAlwaysCallback(
+        [](mfem::ParFiniteElementSpace&,
+           mfem::ParGridFunction&,
+           double)
+        { throw mfem::RecoverableLimiterFailure(1); });
+      rejected_ssprk.Init(wrapped);
+      const mfem::Vector state_before_rejection(U_base);
+      mfem::real_t rejected_time = 0.0;
+      mfem::real_t rejected_dt = 1.0e-6;
+      bool caught_rejection = false;
+      try
+      {
+        rejected_ssprk.Step(U_base, rejected_time, rejected_dt);
+      }
+      catch (const mfem::RecoverableLimiterFailure&)
+      {
+        caught_rejection = true;
+        U_base = state_before_rejection;
+        U_base.ExchangeFaceNbrData();
+        rejected_ssprk.RestoreStateGeneration(0);
+        wrapped.AbortRKStep(U_base,
+                           /*restored_time=*/0.0,
+                           /*restored_state_generation=*/0,
+                           /*retry_dt=*/0.0);
+      }
+      ctx.Check(caught_rejection && rejected_time == 0.0 &&
+                  !rejected_ssprk
+                     .HasCumulativePhysicalBoundaryFluxIntegral(),
+                "rejected Euler+IGR SSPRK attempt rolls back before boundary "
+                "flux commit");
+    }
 
     // --- Sigma output lifecycle: freshness, direct reuse, and invalidation ---
     const int lifecycle_calls_start = igr_solver_s.GetLinearSolveCalls();
@@ -3467,6 +3782,30 @@ int RunIGRTests(TestContext& ctx)
                 lifecycle_production_start + 3,
               "Sigma lifecycle: production preparations remain production work");
 
+    const int calls_before_cached_certificate =
+      igr_solver_s.GetLinearSolveCalls();
+    const int output_before_cached_certificate =
+      igr_solver_s.GetOutputOnlyLinearSolveCalls();
+    const mfem::IGRSigmaPreparationResult cached_certificate =
+      wrapped.PrepareSigmaForOutput(U_stage,
+                                    /*state_generation=*/104,
+                                    /*next_rk_step=*/3,
+                                    /*time=*/0.3,
+                                    /*reusable_stage0=*/false,
+                                    /*cold_start=*/false,
+                                    /*certify_residual=*/true);
+    ctx.Check(cached_certificate.solved &&
+                cached_certificate.independent_residual_certified &&
+                std::isfinite(
+                  cached_certificate.independent_residual_rel_rhs),
+              "Sigma lifecycle: certification bypasses generation-cache reuse");
+    ctx.Check(igr_solver_s.GetLinearSolveCalls() ==
+                  calls_before_cached_certificate + 1 &&
+                igr_solver_s.GetOutputOnlyLinearSolveCalls() ==
+                  output_before_cached_certificate + 1,
+              "Sigma lifecycle: cached accepted state receives one independent "
+              "output-only certificate solve");
+
     mfem::ParGridFunction U_checkpoint_next(&state_fes_s);
     project_state(U_checkpoint_next, /*phase=*/0.05);
     auto configure_checkpoint_solver = [](dg_igr::IGRSolver& solver)
@@ -3607,6 +3946,261 @@ int RunIGRTests(TestContext& ctx)
     check_non_stage_fallback(dg_igr::IGRSigmaUpdateCadence::EveryNSteps,
                              /*interval=*/3,
                              "every-n-steps");
+
+    // --- Rejected RK attempts restore IGR cadence and stage-0 provenance ---
+    auto check_refresh_rejection =
+      [&](dg_igr::IGRSigmaUpdateCadence cadence,
+          bool expect_abort_solve,
+          const std::string& label)
+    {
+      dg_igr::IGRSolver retry_solver(sigma_fes_s,
+                                     state_fes_s,
+                                     dim_s,
+                                     num_eq_s,
+                                     /*alpha=*/0.25);
+      configure_checkpoint_solver(retry_solver);
+      retry_solver.SetSigmaUpdatePolicy(cadence, /*interval=*/1);
+      retry_solver.SetStageRtolScale(1.0);
+
+      mfem::EulerFlux retry_base_flux(dim_s, gamma);
+      mfem::FluxWithIGR retry_igr_flux(retry_base_flux);
+      retry_igr_flux.SetSigmaField(&retry_solver.GetSigma());
+      mfem::RusanovFluxWithSides retry_num_flux(retry_igr_flux);
+      auto retry_form =
+        std::make_unique<mfem::HyperbolicFormIntegrator>(retry_num_flux,
+                                                         /*IntOrderOffset=*/2);
+      mfem::DGHyperbolicConservationLaws retry_op(
+        state_fes_s, std::move(retry_form), /*preassembleWeakDivergence=*/true);
+      retry_op.SetNumericalFlux(&retry_num_flux);
+      mfem::EulerWithIGR retry_wrapped(retry_op, retry_solver, U_base);
+
+      constexpr std::uint64_t restored_generation = 200;
+      retry_wrapped.PrepareSigmaForOutput(
+        U_base,
+        restored_generation,
+        /*next_rk_step=*/0,
+        /*time=*/0.0,
+        /*reusable_stage0=*/true);
+      mfem::Vector prepared_sigma(retry_solver.GetSigma());
+      const double prepared_norm =
+        std::max(GlobalL2Norm(prepared_sigma), 1.0e-30);
+      const long long reuse_before = retry_wrapped.GetSigmaStage0ReuseCount();
+
+      mfem::Vector retry_rhs(U_base.Size());
+      retry_wrapped.BeginRKStep(/*step=*/0, /*t=*/0.0, /*dt=*/0.02);
+      retry_wrapped.SetRKStageState(/*stage=*/0, restored_generation);
+      retry_wrapped.Mult(U_base, retry_rhs);
+      retry_wrapped.SetRKStageState(/*stage=*/1,
+                                    restored_generation + 1);
+      retry_wrapped.Mult(U_stage, retry_rhs);
+      const int calls_before_abort = retry_solver.GetLinearSolveCalls();
+
+      retry_wrapped.AbortRKStep(U_base,
+                               /*restored_time=*/0.0,
+                               restored_generation,
+                               /*retry_dt=*/0.01);
+      const int expected_abort_calls = expect_abort_solve ? 1 : 0;
+      ctx.Check(retry_solver.GetLinearSolveCalls() ==
+                  calls_before_abort + expected_abort_calls,
+                "IGR retry lifecycle: abort solve disposition is correct (" +
+                  label + ")");
+      ctx.Check(retry_wrapped.GetSigmaStateGeneration() ==
+                  restored_generation,
+                "IGR retry lifecycle: abort restores sigma provenance (" +
+                  label + ")");
+      ctx.Check(retry_solver.HasPendingStage0PrefetchAccounting() ==
+                  expect_abort_solve,
+                "IGR retry lifecycle: abort prefetch accounting matches "
+                "actual retry preparation (" +
+                  label + ")");
+      mfem::Vector abort_delta(retry_solver.GetSigma());
+      abort_delta -= prepared_sigma;
+      ctx.Check(GlobalL2Norm(abort_delta) <= 1.0e-5 * prepared_norm,
+                "IGR retry lifecycle: abort sigma matches restored state (" +
+                  label + ")");
+
+      const int calls_before_retry = retry_solver.GetLinearSolveCalls();
+      retry_wrapped.BeginRKStep(/*step=*/0, /*t=*/0.0, /*dt=*/0.01);
+      retry_wrapped.SetRKStageState(/*stage=*/0, restored_generation);
+      retry_wrapped.Mult(U_base, retry_rhs);
+      ctx.Check(retry_solver.GetLinearSolveCalls() == calls_before_retry,
+                "IGR retry lifecycle: retry consumes prepared stage 0 (" +
+                  label + ")");
+      ctx.Check(!retry_solver.HasPendingStage0PrefetchAccounting(),
+                "IGR retry lifecycle: retry leaves no pending prefetch "
+                "accounting (" +
+                  label + ")");
+      ctx.Check(retry_wrapped.GetSigmaStage0ReuseCount() == reuse_before + 2,
+                "IGR retry lifecycle: rejected and retried stage 0 are both "
+                "accounted (" +
+                  label + ")");
+      retry_wrapped.EndRKStep(
+        U_base, /*t=*/0.01, restored_generation + 2);
+    };
+
+    check_refresh_rejection(dg_igr::IGRSigmaUpdateCadence::EveryStage,
+                            /*expect_abort_solve=*/true,
+                            "every-stage");
+    check_refresh_rejection(dg_igr::IGRSigmaUpdateCadence::EveryStep,
+                            /*expect_abort_solve=*/false,
+                            "every-step");
+
+    // A skipped EveryNSteps step must remain skipped across rejection. The
+    // output immediately before it is temporary and must not change either an
+    // accepted or rejected transport attempt. The next scheduled refresh must
+    // still be recognized and reusable on retry.
+    {
+      dg_igr::IGRSolver retry_solver(sigma_fes_s,
+                                     state_fes_s,
+                                     dim_s,
+                                     num_eq_s,
+                                     /*alpha=*/0.25);
+      configure_checkpoint_solver(retry_solver);
+      retry_solver.SetSigmaUpdatePolicy(
+        dg_igr::IGRSigmaUpdateCadence::EveryNSteps, /*interval=*/3);
+      retry_solver.SetStageRtolScale(1.0);
+
+      mfem::EulerFlux retry_base_flux(dim_s, gamma);
+      mfem::FluxWithIGR retry_igr_flux(retry_base_flux);
+      retry_igr_flux.SetSigmaField(&retry_solver.GetSigma());
+      mfem::RusanovFluxWithSides retry_num_flux(retry_igr_flux);
+      auto retry_form =
+        std::make_unique<mfem::HyperbolicFormIntegrator>(retry_num_flux,
+                                                         /*IntOrderOffset=*/2);
+      mfem::DGHyperbolicConservationLaws retry_op(
+        state_fes_s, std::move(retry_form), /*preassembleWeakDivergence=*/true);
+      retry_op.SetNumericalFlux(&retry_num_flux);
+      mfem::ParGridFunction retry_state(&state_fes_s);
+      retry_state = U_base;
+      retry_state.ExchangeFaceNbrData();
+      mfem::EulerWithIGR retry_wrapped(
+        retry_op, retry_solver, retry_state);
+      mfem::Vector retry_rhs(retry_state.Size());
+
+      constexpr std::uint64_t generation0 = 300;
+      retry_wrapped.PrepareSigmaForOutput(retry_state,
+                                          generation0,
+                                          /*next_rk_step=*/0,
+                                          /*time=*/0.0,
+                                          /*reusable_stage0=*/true);
+      retry_wrapped.BeginRKStep(/*step=*/0, /*t=*/0.0, /*dt=*/0.01);
+      retry_wrapped.SetRKStageState(/*stage=*/0, generation0);
+      retry_wrapped.Mult(retry_state, retry_rhs);
+      mfem::Vector production_sigma(retry_solver.GetSigma());
+      retry_state = U_stage;
+      retry_state.ExchangeFaceNbrData();
+      retry_wrapped.EndRKStep(retry_state, /*t=*/0.01, generation0 + 1);
+      const long long reuse_after_step0 =
+        retry_wrapped.GetSigmaStage0ReuseCount();
+      const int production_calls_after_step0 =
+        retry_solver.GetProductionLinearSolveCalls();
+
+      const mfem::IGRSigmaPreparationResult accepted_skip_output =
+        retry_wrapped.PrepareSigmaForOutput(
+          retry_state,
+          generation0 + 1,
+          /*next_rk_step=*/1,
+          /*time=*/0.01,
+          /*reusable_stage0=*/true);
+      ctx.Check(accepted_skip_output.solved &&
+                  !accepted_skip_output.reusable_stage0 &&
+                  accepted_skip_output.output_only &&
+                  retry_solver.GetProductionLinearSolveCalls() ==
+                    production_calls_after_step0,
+                "IGR output isolation: pre-skip output is not a production "
+                "prefetch");
+      mfem::Vector accepted_output_delta(retry_solver.GetSigma());
+      accepted_output_delta -= production_sigma;
+      ctx.Check(GlobalL2Norm(accepted_output_delta) > 1.0e-8,
+                "IGR output isolation: accepted-step output setup changes the "
+                "visible diagnostic sigma");
+      const int calls_after_accepted_output =
+        retry_solver.GetLinearSolveCalls();
+      const int output_calls_after_accepted_output =
+        retry_solver.GetOutputOnlyLinearSolveCalls();
+
+      // Accepted skipped step: BeginRKStep restores production sigma before
+      // the RHS and the cadence adds no solve or stage-0 reuse.
+      retry_wrapped.BeginRKStep(/*step=*/1, /*t=*/0.01, /*dt=*/0.02);
+      retry_wrapped.SetRKStageState(/*stage=*/0, generation0 + 1);
+      mfem::Vector restored_before_accepted_rhs(retry_solver.GetSigma());
+      restored_before_accepted_rhs -= production_sigma;
+      retry_wrapped.Mult(retry_state, retry_rhs);
+      ctx.Check(restored_before_accepted_rhs.Normlinf() == 0.0 &&
+                  retry_solver.GetLinearSolveCalls() ==
+                    calls_after_accepted_output &&
+                  retry_wrapped.GetSigmaStage0ReuseCount() ==
+                    reuse_after_step0,
+                "IGR output isolation: accepted skipped step restores and "
+                "retains production sigma");
+      retry_wrapped.EndRKStep(
+        retry_state, /*t=*/0.03, generation0 + 2);
+
+      // Rejected skipped step: a second immediate output solve is temporary;
+      // both the failed attempt and retry retain the same production sigma.
+      const mfem::IGRSigmaPreparationResult rejected_skip_output =
+        retry_wrapped.PrepareSigmaForOutput(
+          retry_state,
+          generation0 + 2,
+          /*next_rk_step=*/2,
+          /*time=*/0.03,
+          /*reusable_stage0=*/true);
+      ctx.Check(rejected_skip_output.solved &&
+                  !rejected_skip_output.reusable_stage0 &&
+                  rejected_skip_output.output_only &&
+                  retry_solver.GetOutputOnlyLinearSolveCalls() ==
+                    output_calls_after_accepted_output + 1 &&
+                  retry_solver.GetProductionLinearSolveCalls() ==
+                    production_calls_after_step0,
+                "IGR output isolation: rejected pre-skip output is separately "
+                "classified as output-only");
+      const int calls_after_rejected_output =
+        retry_solver.GetLinearSolveCalls();
+      retry_wrapped.BeginRKStep(/*step=*/2, /*t=*/0.03, /*dt=*/0.02);
+      retry_wrapped.SetRKStageState(/*stage=*/0, generation0 + 2);
+      retry_wrapped.Mult(retry_state, retry_rhs);
+      retry_wrapped.SetRKStageState(/*stage=*/1, generation0 + 3);
+      retry_wrapped.Mult(retry_state, retry_rhs);
+      retry_wrapped.AbortRKStep(retry_state,
+                               /*restored_time=*/0.03,
+                               generation0 + 2,
+                               /*retry_dt=*/0.01);
+      retry_wrapped.BeginRKStep(/*step=*/2, /*t=*/0.03, /*dt=*/0.01);
+      retry_wrapped.SetRKStageState(/*stage=*/0, generation0 + 2);
+      retry_wrapped.Mult(retry_state, retry_rhs);
+      mfem::Vector rejected_retry_sigma_delta(retry_solver.GetSigma());
+      rejected_retry_sigma_delta -= production_sigma;
+      ctx.Check(rejected_retry_sigma_delta.Normlinf() == 0.0 &&
+                  retry_solver.GetLinearSolveCalls() ==
+                    calls_after_rejected_output &&
+                  retry_wrapped.GetSigmaStage0ReuseCount() ==
+                    reuse_after_step0,
+                "IGR output isolation: rejected skipped step and retry add no "
+                "closure solve or reuse");
+      retry_wrapped.EndRKStep(
+        retry_state, /*t=*/0.04, generation0 + 4);
+
+      retry_wrapped.BeginRKStep(/*step=*/3, /*t=*/0.04, /*dt=*/0.02);
+      retry_wrapped.SetRKStageState(/*stage=*/0, generation0 + 4);
+      retry_wrapped.Mult(retry_state, retry_rhs);
+      const int calls_after_scheduled_refresh =
+        retry_solver.GetLinearSolveCalls();
+      retry_wrapped.AbortRKStep(retry_state,
+                               /*restored_time=*/0.04,
+                               generation0 + 4,
+                               /*retry_dt=*/0.01);
+      retry_wrapped.BeginRKStep(/*step=*/3, /*t=*/0.04, /*dt=*/0.01);
+      retry_wrapped.SetRKStageState(/*stage=*/0, generation0 + 4);
+      retry_wrapped.Mult(retry_state, retry_rhs);
+      ctx.Check(retry_solver.GetLinearSolveCalls() ==
+                  calls_after_scheduled_refresh &&
+                  retry_wrapped.GetSigmaStage0ReuseCount() ==
+                    reuse_after_step0 + 1,
+                "IGR retry lifecycle: scheduled every-N refresh remains due "
+                "and is reused on retry");
+      retry_wrapped.EndRKStep(
+        retry_state, /*t=*/0.05, generation0 + 5);
+    }
   }
 
   // Exercise both the MFEM-matching arithmetic shared-face path and the

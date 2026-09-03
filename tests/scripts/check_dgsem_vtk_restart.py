@@ -206,6 +206,7 @@ def base_command(args: argparse.Namespace, mesh: Path) -> list[str]:
         "-dvf", "central",
         "-dvd", "none",
         "-dsf", "rusanov",
+        "--time-integrator", "rk3ssp",
         "-as", "0",
         "-no-glvis",
         "-vtk",
@@ -249,7 +250,7 @@ def entries_contract(pvd: Path, ranks: int, order: int) -> dict[str, object]:
         manifest_path = pvtu.parent / "restart.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         required = {
-            "schema_version": 1,
+            "schema_version": 3,
             "complete": True,
             "case": "dgsem_sedov_taylor_blast",
             "cycle": cycle,
@@ -261,14 +262,21 @@ def entries_contract(pvd: Path, ranks: int, order: int) -> dict[str, object]:
             "serial_refinement": 0,
             "parallel_refinement": 0,
             "dg_backend": "dgsem",
+            "time_integrator": "rk3ssp",
             "basis": "GaussLobatto",
             "ordering": "byNODES",
             "data_type": "Float64",
             "vtk_format": "binary",
             "piece_pattern": "proc%06d.vtu",
             "igr_enabled": True,
+            "igr_invariant_domain_flux": False,
+            "zhang_shu_limiter": True,
+            "rho_floor": 5.0e-7,
+            "pressure_floor": 1.0e-6,
             "sigma_saved": True,
             "sigma_restart_policy": "cold-recompute-from-conservative-state",
+            "static_source_present": False,
+            "static_source_fingerprint": "none",
         }
         for key, want in required.items():
             if manifest.get(key) != want:

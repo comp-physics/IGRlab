@@ -1,4 +1,6 @@
 #include "physics/igr/IGR.hpp"
+
+#include "numerics/timestepping/ssprk_coefficients.hpp"
 #include "utils/config/env_flags.hpp"
 #include "utils/profiling/nvtx.hpp"
 #include "IGR_internal_utils.hpp"
@@ -2031,6 +2033,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     std::numeric_limits<double>::quiet_NaN();
   last_linear_true_residual_rel_rhs_ =
     std::numeric_limits<double>::quiet_NaN();
+  last_independent_certificate_relative_limit_ =
+    std::numeric_limits<double>::quiet_NaN();
+  last_independent_certificate_absolute_limit_ =
+    std::numeric_limits<double>::quiet_NaN();
   last_linear_true_initial_residual_abs_ =
     std::numeric_limits<double>::quiet_NaN();
   last_linear_true_residual_rel_initial_ =
@@ -2456,7 +2462,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   }
   last_warm_start_effective_ = enable_warm_start;
 
-  const bool is_intermediate_stage = (rk_stage_index_ >= 0 && rk_stage_index_ < 2);
+  const bool is_intermediate_stage =
+    mfem::IsIntermediateRKStage(rk_stage_index_, rk_stage_count_);
   const double effective_rtol =
     is_intermediate_stage ? (lin_rtol_ * stage_rtol_scale_) : lin_rtol_;
   mfem::Vector event_initial_guess;
@@ -2648,12 +2655,32 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   if (certify_independent_residual)
   {
     const double certificate_factor = extended_certificate_factor;
-    const double certificate_limit =
+    const double certificate_relative_limit =
       certificate_factor * effective_rtol;
-    independent_certificate_passed =
-      std::isfinite(last_linear_true_residual_rel_rhs_) &&
-      last_linear_true_residual_rel_rhs_ <= certificate_limit;
-    if (!independent_certificate_passed && VectorIsFinite(X_))
+    const double certificate_absolute_limit =
+      certificate_factor * lin_atol_;
+    last_independent_certificate_relative_limit_ = certificate_relative_limit;
+    last_independent_certificate_absolute_limit_ = certificate_absolute_limit;
+    auto certificate_passes = [&]()
+    {
+      const bool relative_pass =
+        std::isfinite(last_linear_true_residual_rel_rhs_) &&
+        last_linear_true_residual_rel_rhs_ <= certificate_relative_limit;
+      const bool absolute_pass =
+        std::isfinite(last_linear_true_residual_abs_) &&
+        last_linear_true_residual_abs_ <= certificate_absolute_limit;
+      return relative_pass || absolute_pass;
+    };
+    independent_certificate_passed = certificate_passes();
+    int local_solution_finite = VectorIsFinite(X_) ? 1 : 0;
+    int collective_solution_finite = 0;
+    MPI_Allreduce(&local_solution_finite,
+                  &collective_solution_finite,
+                  1,
+                  MPI_INT,
+                  MPI_MIN,
+                  comm);
+    if (!independent_certificate_passed && collective_solution_finite != 0)
     {
       const int first_attempt_iters = last_linear_iters_;
       const double first_attempt_initial_norm = last_linear_initial_norm_;
@@ -2668,7 +2695,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                   << " first_attempt_iters=" << first_attempt_iters
                   << " first_true_residual_rel_rhs="
                   << first_attempt_true_rel
-                  << " limit=" << certificate_limit
+                  << " relative_limit=" << certificate_relative_limit
+                  << " absolute_limit=" << certificate_absolute_limit
                   << " action=restart-recurrence-from-current-iterate"
                   << std::endl;
       }
@@ -2678,9 +2706,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       last_linear_initial_norm_ = first_attempt_initial_norm;
       ++residual_replacement_retries;
       recompute_true_residual();
-      independent_certificate_passed =
-        std::isfinite(last_linear_true_residual_rel_rhs_) &&
-        last_linear_true_residual_rel_rhs_ <= certificate_limit;
+      independent_certificate_passed = certificate_passes();
     }
     // The independent residual is authoritative for certified solves. This
     // also recognizes a valid capped iterate when the Krylov recurrence's
@@ -2697,7 +2723,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                 << (certify_current_solve_ ? "restart" : "extended-solve")
                 << " start=" << extended_certificate_start
                 << " factor=" << certificate_factor
-                << " limit=" << certificate_limit
+                << " relative_limit=" << certificate_relative_limit
+                << " absolute_limit=" << certificate_absolute_limit
                 << " true_residual_rel_rhs="
                 << last_linear_true_residual_rel_rhs_
                 << " true_residual_rel_initial="
