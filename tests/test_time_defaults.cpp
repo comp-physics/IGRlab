@@ -29,6 +29,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
     dg_sim::CommonOptions opts;
     dg_sim::CaseConfig case_cfg;
     dg_sim::IGROptions igr_opts;
+    ctx.Check(opts.positivity_limiter == "case",
+              "positivity limiter defaults preserve the case policy");
     ctx.Check(opts.zhang_shu_points == "consumer",
               "Zhang-Shu defaults: consumer point set selected");
     ctx.Check(opts.hdg_igr_alpha == 1.0 && opts.hdg_igr_beta == 1.0,
@@ -43,7 +45,31 @@ int RunTimeDefaultsTests(TestContext& ctx)
     ctx.Check(dg_sim::ParseZhangShuPointSet("quadrature") ==
                 mfem::ZhangShuPointSet::kQuadrature,
               "Zhang-Shu options: parse quadrature point set");
+    ctx.Check(dg_sim::ParsePositivityLimiterSelection("case") ==
+                  dg_sim::PositivityLimiterSelection::Case &&
+                dg_sim::ParsePositivityLimiterSelection("none") ==
+                  dg_sim::PositivityLimiterSelection::None &&
+                dg_sim::ParsePositivityLimiterSelection("zhang-shu") ==
+                  dg_sim::PositivityLimiterSelection::ZhangShu,
+              "positivity limiter options have typed case/none/Zhang-Shu selectors");
 
+    case_cfg.limiter_pipeline.zhang_shu = true;
+    opts.positivity_limiter = "none";
+    const dg_sim::RunConfig limiter_off =
+      dg_sim::MakeRunConfig(case_cfg, opts, igr_opts);
+    ctx.Check(!limiter_off.case_config.limiter_pipeline.zhang_shu &&
+                limiter_off.opts.positivity_limiter == "none",
+              "positivity limiter none overrides an enabled case default");
+
+    case_cfg.limiter_pipeline.zhang_shu = false;
+    opts.positivity_limiter = "zhang_shu";
+    const dg_sim::RunConfig limiter_on =
+      dg_sim::MakeRunConfig(case_cfg, opts, igr_opts);
+    ctx.Check(limiter_on.case_config.limiter_pipeline.zhang_shu &&
+                limiter_on.opts.positivity_limiter == "zhang-shu",
+              "positivity limiter Zhang-Shu override is enabled and canonicalized");
+
+    opts.positivity_limiter = "case";
     opts.zhang_shu_points = "quadrature";
     const dg_sim::RunConfig run_cfg =
       dg_sim::MakeRunConfig(case_cfg, opts, igr_opts);

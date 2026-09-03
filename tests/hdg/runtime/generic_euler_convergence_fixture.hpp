@@ -255,8 +255,9 @@ struct EntropyWave
 /**
  * Smooth periodic state with nonconstant velocity and pressure.  Unlike the
  * entropy-wave convergence control, this state exercises the IGR velocity
- * gradient and scalar regularization terms.  It is used only for the direct
- * reduced-versus-q12 quadrature comparison; no analytic evolution is claimed.
+ * gradient and scalar regularization terms.  It is used for the direct
+ * reduced-versus-q12 quadrature comparison and the numerical-reference
+ * architecture screen; no analytic evolution is claimed.
  */
 struct ActiveIgrWave
 {

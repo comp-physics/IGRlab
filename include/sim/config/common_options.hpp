@@ -31,15 +31,17 @@ struct CommonOptions
   std::string hdg_cuda_engine = "ordinary";
   ///< CUDA HDG engine: ordinary | tensor; ordinary remains the default.
   double hdg_igr_alpha = 1.0;
-  ///< HDG IGR-extension alpha; used only with --discretization hdg --regularization igr.
+  ///< Dimensionless HDG IGR C_alpha, mesh-scaled by the case length policy.
   double hdg_igr_beta = 1.0;
-  ///< HDG IGR-extension beta; used only with --discretization hdg --regularization igr.
+  ///< Numerical Euler U4 trace penalty used by HDG IGR; not a physical scalar.
   std::string time_integrator;
   ///< Time-integrator selector; empty selects the discretization default.
   mfem::real_t time_atol = 1.0e-8;
   ///< Differential-state absolute tolerance for embedded adaptive stepping.
   mfem::real_t time_rtol = 1.0e-5;
   ///< Differential-state relative tolerance for embedded adaptive stepping.
+  std::string positivity_limiter = "case";
+  ///< Positivity limiter selector: case | none | zhang-shu.
   std::string zhang_shu_points =
     "consumer"; ///< Zhang-Shu point set: "consumer" or "quadrature".
   std::string dgsem_stab =
@@ -134,11 +136,13 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.hdg_igr_alpha,
                  "-hia",
                  "--hdg-igr-alpha",
-                 "HDG IGR-extension alpha (finite and positive; default 1.0).");
+                 "Dimensionless HDG IGR C_alpha; the case mesh-length policy "
+                 "sets the physical alpha=C_alpha*h_eff^2 (default 1.0).");
   args.AddOption(&opts.hdg_igr_beta,
                  "-hib",
                  "--hdg-igr-beta",
-                 "HDG IGR-extension beta (finite and positive; default 1.0).");
+                 "HDG numerical Euler U4 trace penalty (finite and positive; "
+                 "not a second physical IGR scalar; default 1.0).");
   args.AddOption(&opts.time_integrator,
                  "-ti",
                  "--time-integrator",
@@ -153,6 +157,12 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-trtol",
                  "--time-rtol",
                  "Relative differential-state tolerance for adaptive RODAS3.");
+  args.AddOption(&opts.positivity_limiter,
+                 "-pl",
+                 "--positivity-limiter",
+                 "Positivity limiter: case | none | zhang-shu. 'case' "
+                 "preserves the case default when the selected integrator "
+                 "supports limiting; HDG limiting is RODAS3-only.");
   args.AddOption(&opts.zhang_shu_points,
                  "-zsp",
                  "--zhang-shu-points",

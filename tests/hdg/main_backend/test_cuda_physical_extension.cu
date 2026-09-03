@@ -170,7 +170,7 @@ bool RunCase(const int order,
           const dg_sim::CaseContext& context)
       { return MakeCaseData(context, order, candidate_numerical_policy); };
   const dg_sim::hdg::HdgEulerMainRequest request{
-      case_config, options, factory, MPI_COMM_WORLD};
+      case_config, options, factory, MPI_COMM_WORLD, {}};
   return dg_sim::hdg::RunEulerMainBackend(request) == 0;
 }
 

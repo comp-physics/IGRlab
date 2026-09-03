@@ -57,6 +57,39 @@ if(HDG_MAIN_OMIT_TIME_INTEGRATOR AND
   message(FATAL_ERROR
     "Only the backward-Euler-default process gate may omit --time-integrator.")
 endif()
+if(DEFINED HDG_MAIN_POSITIVITY_LIMITER AND
+   NOT HDG_MAIN_POSITIVITY_LIMITER STREQUAL "case" AND
+   NOT HDG_MAIN_POSITIVITY_LIMITER STREQUAL "none" AND
+   NOT HDG_MAIN_POSITIVITY_LIMITER STREQUAL "zhang-shu")
+  message(FATAL_ERROR
+    "HDG positivity limiter must be case, none, or zhang-shu, got '${HDG_MAIN_POSITIVITY_LIMITER}'.")
+endif()
+if(DEFINED HDG_MAIN_ZHANG_SHU_POINTS AND
+   NOT HDG_MAIN_ZHANG_SHU_POINTS STREQUAL "consumer" AND
+   NOT HDG_MAIN_ZHANG_SHU_POINTS STREQUAL "quadrature")
+  message(FATAL_ERROR
+    "HDG Zhang-Shu point set must be consumer or quadrature, got '${HDG_MAIN_ZHANG_SHU_POINTS}'.")
+endif()
+if(NOT DEFINED HDG_MAIN_EXPECT_ZHANG_SHU_FIELDS)
+  set(HDG_MAIN_EXPECT_ZHANG_SHU_FIELDS OFF)
+endif()
+if(NOT HDG_MAIN_EXPECT_ZHANG_SHU_FIELDS STREQUAL "ON" AND
+   NOT HDG_MAIN_EXPECT_ZHANG_SHU_FIELDS STREQUAL "OFF")
+  message(FATAL_ERROR
+    "HDG Zhang-Shu field expectation must be ON or OFF.")
+endif()
+if(DEFINED HDG_MAIN_VTK_ZHANG_SHU_DIAGNOSTICS AND
+   NOT HDG_MAIN_VTK_ZHANG_SHU_DIAGNOSTICS STREQUAL "ON" AND
+   NOT HDG_MAIN_VTK_ZHANG_SHU_DIAGNOSTICS STREQUAL "OFF")
+  message(FATAL_ERROR
+    "HDG Zhang-Shu VTK diagnostics selector must be ON or OFF.")
+endif()
+if(DEFINED HDG_MAIN_C_ALPHA AND HDG_MAIN_C_ALPHA STREQUAL "")
+  message(FATAL_ERROR "HDG --c-alpha process value must not be empty.")
+endif()
+if(DEFINED HDG_MAIN_HDG_IGR_ALPHA AND HDG_MAIN_HDG_IGR_ALPHA STREQUAL "")
+  message(FATAL_ERROR "HDG --hdg-igr-alpha process value must not be empty.")
+endif()
 
 function(require_euler_field text_variable tag field components context)
   set(_text "${${text_variable}}")
@@ -133,6 +166,27 @@ if(NOT HDG_MAIN_OMIT_CUDA_ENGINE)
 endif()
 if(NOT HDG_MAIN_OMIT_TIME_INTEGRATOR)
   list(APPEND _arguments --time-integrator "${HDG_MAIN_TIME_INTEGRATOR}")
+endif()
+if(DEFINED HDG_MAIN_POSITIVITY_LIMITER)
+  list(APPEND _arguments
+    --positivity-limiter "${HDG_MAIN_POSITIVITY_LIMITER}")
+endif()
+if(DEFINED HDG_MAIN_ZHANG_SHU_POINTS)
+  list(APPEND _arguments
+    --zhang-shu-points "${HDG_MAIN_ZHANG_SHU_POINTS}")
+endif()
+if(DEFINED HDG_MAIN_VTK_ZHANG_SHU_DIAGNOSTICS)
+  if(HDG_MAIN_VTK_ZHANG_SHU_DIAGNOSTICS)
+    list(APPEND _arguments --vtk-zhang-shu-diagnostics)
+  else()
+    list(APPEND _arguments --no-vtk-zhang-shu-diagnostics)
+  endif()
+endif()
+if(DEFINED HDG_MAIN_C_ALPHA)
+  list(APPEND _arguments --c-alpha "${HDG_MAIN_C_ALPHA}")
+endif()
+if(DEFINED HDG_MAIN_HDG_IGR_ALPHA)
+  list(APPEND _arguments --hdg-igr-alpha "${HDG_MAIN_HDG_IGR_ALPHA}")
 endif()
 set(_success_pattern
   "\\[hdg-main\\] status=Success.*step=${HDG_MAIN_EXPECTED_STEPS}.*time=${HDG_MAIN_EXPECTED_FINAL_TIME}")
@@ -230,6 +284,18 @@ else()
   string(APPEND _success_pattern
     ".*time_treatment=${HDG_MAIN_TIME_INTEGRATOR}")
 endif()
+if(DEFINED HDG_MAIN_EXPECT_POSITIVITY_LIMITER)
+  string(APPEND _success_pattern
+    ".*positivity_limiter=${HDG_MAIN_EXPECT_POSITIVITY_LIMITER}")
+endif()
+if(DEFINED HDG_MAIN_EXPECT_ZHANG_SHU_POINTS)
+  string(APPEND _success_pattern
+    ".*zhang_shu_points=${HDG_MAIN_EXPECT_ZHANG_SHU_POINTS}")
+endif()
+if(DEFINED HDG_MAIN_EXPECT_C_ALPHA)
+  string(APPEND _success_pattern
+    ".*c_alpha=${HDG_MAIN_EXPECT_C_ALPHA}")
+endif()
 if(DEFINED HDG_MAIN_CFL)
   list(APPEND _arguments --cfl-number "${HDG_MAIN_CFL}")
 endif()
@@ -267,6 +333,17 @@ else()
       "${HDG_MAIN_EXECUTABLE}" ${_arguments}
       ${HDG_MAIN_MPIEXEC_POSTFLAGS}
     RESULT_VARIABLE _status OUTPUT_VARIABLE _stdout ERROR_VARIABLE _stderr)
+endif()
+
+if(DEFINED HDG_MAIN_EXPECT_REJECTION_PATTERN)
+  set(_combined_output "${_stdout}\n${_stderr}")
+  if(_status EQUAL 0 OR
+     NOT _combined_output MATCHES "${HDG_MAIN_EXPECT_REJECTION_PATTERN}")
+    message(FATAL_ERROR
+      "generic HDG main did not produce the selected rejection: ${_status}\n${_stdout}\n${_stderr}")
+  endif()
+  file(REMOVE_RECURSE "${HDG_MAIN_OUTPUT}")
+  return()
 endif()
 
 if(NOT _status EQUAL 0 OR
@@ -351,6 +428,17 @@ foreach(_index RANGE 0 ${_last_output_index})
     message(FATAL_ERROR
       "conventional HDG PVTU cycle ${_cycle} unexpectedly contains sigma")
   endif()
+  foreach(_field IN ITEMS
+      zhang_shu_ever_active zhang_shu_theta_rho_min_cumulative
+      zhang_shu_theta_p_min_cumulative)
+    if(HDG_MAIN_EXPECT_ZHANG_SHU_FIELDS)
+      require_euler_field(_pvtu_text PDataArray "${_field}" 1
+        "HDG PVTU cycle ${_cycle}")
+    elseif(_pvtu_text MATCHES "Name=\\\"${_field}\\\"")
+      message(FATAL_ERROR
+        "HDG PVTU cycle ${_cycle} unexpectedly contains ${_field}")
+    endif()
+  endforeach()
   if(_pvtu_text MATCHES "Name=\\\"conservative\\\"")
     message(FATAL_ERROR
       "HDG PVTU cycle ${_cycle} exposes obsolete packed conservative data")
@@ -408,6 +496,17 @@ foreach(_index RANGE 0 ${_last_output_index})
       message(FATAL_ERROR
         "conventional HDG VTU rank ${_rank} cycle ${_cycle} unexpectedly contains sigma")
     endif()
+    foreach(_field IN ITEMS
+        zhang_shu_ever_active zhang_shu_theta_rho_min_cumulative
+        zhang_shu_theta_p_min_cumulative)
+      if(HDG_MAIN_EXPECT_ZHANG_SHU_FIELDS)
+        require_euler_field(_vtu_text DataArray "${_field}" 1
+          "HDG VTU rank ${_rank} cycle ${_cycle}")
+      elseif(_vtu_text MATCHES "Name=\\\"${_field}\\\"")
+        message(FATAL_ERROR
+          "HDG VTU rank ${_rank} cycle ${_cycle} unexpectedly contains ${_field}")
+      endif()
+    endforeach()
     if(_vtu_text MATCHES "Name=\\\"conservative\\\"")
       message(FATAL_ERROR
         "HDG VTU rank ${_rank} cycle ${_cycle} exposes obsolete conservative data")

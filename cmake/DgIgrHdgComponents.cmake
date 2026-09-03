@@ -358,6 +358,7 @@ function(dg_igr_configure_hdg_cuda_final_consumer target)
       dg_igr_hdg_runtime
       hdg_smooth_periodic
       dgsem_smooth_advection
+      sedov_taylor_blast
       supersonic_cylinder_w_igr)
   list(FIND _dg_igr_hdg_final_consumers "${target}"
        _dg_igr_hdg_final_consumer_index)

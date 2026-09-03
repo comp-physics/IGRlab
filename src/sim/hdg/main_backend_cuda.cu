@@ -27,6 +27,7 @@
 #include "sim/context/case_context.hpp"
 #include "sim/hdg/euler_output_fields.hpp"
 #include "sim/hdg/parallel_vtk.hpp"
+#include "sim/hdg/regularization_scaling.hpp"
 #include "sim/hdg/resolved_euler_case.hpp"
 #include "sim/hdg/state_io.hpp"
 #include "sim/hdg/transactional_time_adapter.hpp"
@@ -72,6 +73,7 @@ using dg::hdg::runtime::cuda_w8a::CudaIluLocalReordering;
 using dg::hdg::runtime::cuda_w8a::CudaIluTriangularSolveKindName;
 using dg::hdg::runtime::cuda_w8a::CudaIluType;
 using dg::hdg::runtime::cuda_w8a::CudaPreparedOutputMetadataV1;
+using dg::hdg::runtime::cuda_w8a::CudaStepEvidence;
 using dg::hdg::runtime::cuda_w8a::CudaTracePolicyDescriptor;
 using dg::hdg::runtime::cuda_w8a::CudaTracePolicyDescriptorIsExact;
 using dg::hdg::runtime::cuda_w8a::CudaTracePolicyKind;
@@ -613,7 +615,14 @@ FrozenBoundaryPlan FreezeBoundaryPlan(const EulerBoundaryPlan& source)
   return frozen;
 }
 
-RegularizationSelection CanonicalRegularization(
+dg_igr::IGRAlphaLengthScalePolicy CanonicalAlphaLengthScalePolicy(
+    const HdgEulerMainRequest& request) noexcept
+{
+  return request.alpha_length_scale_policy_override.value_or(
+      request.case_config.igr_config.alpha_length_scale_policy);
+}
+
+HdgRegularizationRequest CanonicalRegularization(
     const HdgEulerMainRequest& request)
 {
   const std::string selector = ToLowerCopy(request.options.regularization);
@@ -722,16 +731,20 @@ std::string CanonicalNumericalPolicy(
 }
 
 EulerHdgZhangShuPointSet CanonicalZhangShuPointSet(
-    const mfem::ZhangShuPointSet point_set)
+    const std::string& point_set)
 {
-  switch (point_set)
+  const std::string selector = ToLowerCopy(point_set);
+  if (selector == "consumer")
   {
-  case mfem::ZhangShuPointSet::kConsumer:
     return EulerHdgZhangShuPointSet::consumer;
-  case mfem::ZhangShuPointSet::kQuadrature:
+  }
+  if (selector == "quadrature")
+  {
     return EulerHdgZhangShuPointSet::quadrature;
   }
-  throw std::invalid_argument("CUDA HDG Zhang-Shu point set is invalid");
+  throw std::invalid_argument(
+      "CUDA HDG Zhang-Shu point set must resolve to 'consumer' or "
+      "'quadrature'");
 }
 
 EulerHdgPositivityLimiterPolicy CanonicalPositivityLimiterPolicy(
@@ -739,11 +752,12 @@ EulerHdgPositivityLimiterPolicy CanonicalPositivityLimiterPolicy(
     const EulerHdgTimeTreatment time_treatment)
 {
   if (time_treatment != EulerHdgTimeTreatment::rodas3 ||
-      !request.case_config.limiter_pipeline.zhang_shu)
+      !ResolveZhangShuPositivityLimiter(
+          request.options.positivity_limiter,
+          request.case_config.limiter_pipeline.zhang_shu))
     return {};
   return {EulerHdgPositivityLimiterKind::zhang_shu,
-          CanonicalZhangShuPointSet(
-              request.case_config.limiter_pipeline.zhang_shu_points),
+          CanonicalZhangShuPointSet(request.options.zhang_shu_points),
           request.case_config.rk3_config.rho_min,
           request.case_config.rk3_config.p_min,
           request.case_config.rk3_config.p_bisect_iters};
@@ -751,7 +765,7 @@ EulerHdgPositivityLimiterPolicy CanonicalPositivityLimiterPolicy(
 
 std::string ConsensusText(const HdgEulerMainRequest& request,
                           const std::string& mesh_path,
-                          const RegularizationSelection regularization,
+                          const HdgRegularizationRequest& regularization,
                           const CudaTracePolicyDescriptor& trace_policy,
                           const EulerHdgTimeTreatment time_treatment)
 {
@@ -795,12 +809,18 @@ std::string ConsensusText(const HdgEulerMainRequest& request,
   AppendText(stream, request.options.hdg_checkpoint);
   AppendText(stream, request.options.hdg_restart_checkpoint);
   AppendText(stream, vtk.prefix_path);
+  AppendText(
+      stream,
+      PositivityLimiterSelectionToString(ParsePositivityLimiterSelection(
+          request.options.positivity_limiter)));
+  AppendText(stream, ToLowerCopy(request.options.zhang_shu_points));
   stream << request.options.order << ';'
          << request.options.ser_ref_levels << ';'
          << request.options.par_ref_levels << ';'
          << request.options.restart_cycle << ';'
          << request.options.restart_step << ';'
          << request.options.vtk_save << ';'
+         << request.options.vtk_zhang_shu_diagnostics << ';'
          << request.options.glvis << ';'
          << request.options.save_state_files << ';'
          << static_cast<int>(vtk.format) << ';'
@@ -815,9 +835,10 @@ std::string ConsensusText(const HdgEulerMainRequest& request,
   AppendDouble(stream, request.options.dt_save);
   AppendDouble(stream, request.case_config.gamma);
   stream << static_cast<int>(regularization.kind) << ';'
+         << static_cast<int>(CanonicalAlphaLengthScalePolicy(request)) << ';'
          << static_cast<int>(time_treatment) << ';';
-  AppendDouble(stream, regularization.alpha);
-  AppendDouble(stream, regularization.beta);
+  AppendDouble(stream, regularization.c_alpha);
+  AppendDouble(stream, regularization.euler_trace_penalty);
   return stream.str();
 }
 
@@ -1242,7 +1263,7 @@ bool PublishCudaCheckpoint(
 }
 
 std::string Validate(const HdgEulerMainRequest& request,
-                     const RegularizationSelection regularization,
+                     const HdgRegularizationRequest& regularization,
                      const CudaEngineKind cuda_engine,
                      const EulerHdgTimeTreatment time_treatment)
 {
@@ -1254,11 +1275,23 @@ std::string Validate(const HdgEulerMainRequest& request,
     return "generic CUDA HDG requires --device cuda";
   if (!dg::hdg::generic::IsKnownCudaEngineKind(cuda_engine))
     return "generic CUDA HDG rejects an invalid CUDA engine";
-  if (!dg::hdg::generic::ValidRegularizationSelection(regularization))
-    return "HDG IGR alpha and beta must be finite and positive";
+  if (!ValidHdgRegularizationRequest(regularization))
+    return "HDG IGR c_alpha and Euler trace penalty must be finite and positive";
+  if (regularization.kind == RegularizationKind::igr &&
+      CanonicalAlphaLengthScalePolicy(request) ==
+        dg_igr::IGRAlphaLengthScalePolicy::Local)
+    return "HDG IGR does not support the element-local alpha length policy";
   if (!dg::hdg::generic::IsKnownEulerHdgTimeTreatment(time_treatment))
     return "CUDA HDG time treatment is invalid";
   const bool rodas3 = time_treatment == EulerHdgTimeTreatment::rodas3;
+  const PositivityLimiterSelection positivity_limiter =
+      ParsePositivityLimiterSelection(request.options.positivity_limiter);
+  static_cast<void>(CanonicalZhangShuPointSet(
+      request.options.zhang_shu_points));
+  if (!rodas3 &&
+      positivity_limiter == PositivityLimiterSelection::ZhangShu)
+    return "CUDA HDG Zhang-Shu positivity limiting is a RODAS3-only typed "
+           "opt-in";
   if (!request.options.restart_vtk.empty() || request.options.restart_cycle >= 0 ||
       request.options.restart_step >= 0 || request.options.save_state_files)
     return "generic CUDA HDG restart/state-file routes are unsupported";
@@ -1423,7 +1456,8 @@ bool RejectPreparedOutput(GenericEulerHdgCudaSession& session,
                           GenericEulerCudaPreparedStep& authority,
                           PreparedCudaOutput& native_export) noexcept
 {
-  return session.RejectPrepared(std::move(authority), native_export).status ==
+  return session.RejectPrepared(
+             std::move(authority), native_export).status ==
       HdgEulerSessionStatus::aborted;
 }
 
@@ -1437,7 +1471,10 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
     return Reject(request, "invalid MPI communicator or lifecycle");
 
   std::string reason;
-  RegularizationSelection regularization{};
+  HdgRegularizationRequest regularization_request{};
+  ResolvedHdgRegularization resolved_regularization{};
+  RegularizationSelection regularization{
+      RegularizationKind::none, 0.0, 0.0};
   EulerHdgTimeTreatment time_treatment =
       EulerHdgTimeTreatment::backward_euler;
   CudaEngineKind cuda_engine = CudaEngineKind::ordinary;
@@ -1445,10 +1482,11 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   int ranks = 0;
   try
   {
-    regularization = CanonicalRegularization(request);
+    regularization_request = CanonicalRegularization(request);
     time_treatment = CanonicalTimeTreatment(request);
     cuda_engine = CanonicalCudaEngine(request);
-    reason = Validate(request, regularization, cuda_engine, time_treatment);
+    reason = Validate(
+        request, regularization_request, cuda_engine, time_treatment);
     if (reason.empty())
     {
       if (MPI_Comm_size(request.communicator, &ranks) != MPI_SUCCESS)
@@ -1459,11 +1497,11 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       {
         trace_policy = ResolveCudaTracePolicy(
             cuda_engine,
-            regularization.kind == RegularizationKind::igr,
+            regularization_request.kind == RegularizationKind::igr,
             ranks, request.options.order,
             DefaultCudaTracePolicyRequest(
                 cuda_engine,
-                regularization.kind == RegularizationKind::igr,
+                regularization_request.kind == RegularizationKind::igr,
                 ranks, time_treatment));
         if (!CudaTracePolicyDescriptorIsExact(trace_policy))
           reason = "CUDA HDG trace policy resolution failed";
@@ -1480,8 +1518,8 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   try
   {
     mesh_path = ResolveCaseMesh(request.case_config, request.options.mesh_file);
-    consensus = ConsensusText(request, mesh_path, regularization, trace_policy,
-                              time_treatment);
+    consensus = ConsensusText(request, mesh_path, regularization_request,
+                              trace_policy, time_treatment);
   }
   catch (...) { reason = "CUDA HDG configuration resolution failed"; }
   if (!CollectiveAll(request.communicator, !consensus.empty()))
@@ -1571,6 +1609,29 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
   if (!CollectiveAll(request.communicator, context.has_value() && local_ok))
     return Reject(request,
                   "CUDA HDG mesh context publication failed on another rank");
+
+  try
+  {
+    resolved_regularization = ResolveHdgRegularization(
+        context->Mesh(),
+        CanonicalAlphaLengthScalePolicy(request),
+        regularization_request);
+    regularization = resolved_regularization.selection;
+    local_ok = dg::hdg::generic::ValidRegularizationSelection(regularization);
+  }
+  catch (const std::exception& error)
+  {
+    reason = error.what();
+    local_ok = false;
+  }
+  catch (...)
+  {
+    reason = "unknown CUDA HDG IGR mesh-scaling failure";
+    local_ok = false;
+  }
+  if (!CollectiveAll(request.communicator, local_ok))
+    return Reject(request, reason.empty()
+        ? "CUDA HDG IGR mesh scaling failed on another rank" : reason);
 
   std::optional<HdgEulerCaseData> case_data;
   std::optional<FrozenBoundaryPlan> frozen_boundary;
@@ -1866,6 +1927,9 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       output_fields = std::make_unique<HdgEulerParaViewFields>(
           context->Mesh(), *collection, *published_state,
           regularization.kind == RegularizationKind::igr,
+          request.options.vtk_zhang_shu_diagnostics &&
+              numerical_policy.positivity_limiter.kind ==
+                  EulerHdgPositivityLimiterKind::zhang_shu,
           request.case_config.gamma,
           request.case_config.rk3_config.rho_min);
       HDGParaViewOptions output_options{
@@ -2448,9 +2512,25 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
               << " trace_ilu_upper_jacobi_iterations="
               << ilu_upper_jacobi_iterations
               << " regularization="
-              << (regularization.kind == RegularizationKind::igr ? "igr" : "none")
-              << " alpha=" << regularization.alpha
-              << " beta=" << regularization.beta;
+              << (regularization.kind == RegularizationKind::igr ? "igr" : "none");
+    std::cout << " positivity_limiter="
+              << (numerical_policy.positivity_limiter.kind ==
+                      EulerHdgPositivityLimiterKind::zhang_shu
+                  ? "zhang-shu" : "none")
+              << " zhang_shu_points="
+              << (numerical_policy.positivity_limiter.point_set ==
+                      EulerHdgZhangShuPointSet::quadrature
+                  ? "quadrature" : "consumer");
+    if (regularization.kind == RegularizationKind::igr)
+    {
+      std::cout << " c_alpha=" << regularization_request.c_alpha
+                << " alpha_effective=" << regularization.alpha
+                << " alpha_length_policy="
+                << IGRAlphaLengthScalePolicyToString(
+                     resolved_regularization.alpha_info.policy)
+                << " h_eff=" << resolved_regularization.alpha_info.dx_eff
+                << " euler_trace_penalty=" << regularization.beta;
+    }
     if (adaptive_rodas3)
       std::cout << " rejected_attempts=" << adaptive_state.rejected_attempts;
     std::cout << '\n';

@@ -23,14 +23,23 @@ namespace dg::hdg::generic
  * The conservative coefficients contain four component-major, byNODES L2
  * slabs.  A non-null @ref sigma_coefficients requests the scalar IGR field;
  * the private auxiliary gradient and every trace field remain unexposed.
- * Backends may use any internal layout, but must fill both requested views
- * from the same committed or prepared state transaction.
+ * Backends may use any internal layout, but must fill every requested view
+ * from the same committed or prepared state transaction.  The optional
+ * Zhang--Shu arrays are element ordered, not finite-element coefficient
+ * arrays.  They retain the minimum density and pressure factors observed by
+ * the bounded limiter calls across accepted RODAS attempts since session
+ * initialization.  Rejected attempts never publish and no stage history is
+ * exposed.  This running accepted-history aggregate prevents activations on
+ * substeps between VTK output times from disappearing before publication.
  */
 struct HdgEulerHostInteriorFields
 {
   double* conservative_coefficients = nullptr;
   double* sigma_coefficients = nullptr;
   std::size_t scalar_count = 0;
+  double* zhang_shu_theta_rho = nullptr;
+  double* zhang_shu_theta_p = nullptr;
+  std::size_t zhang_shu_element_count = 0;
 };
 
 enum class HdgEulerSessionCapability : std::uint32_t

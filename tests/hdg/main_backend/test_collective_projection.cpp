@@ -92,7 +92,7 @@ int main(int argc, char* argv[])
         return case_data;
       };
       const dg_sim::hdg::HdgEulerMainRequest request{
-          case_config, options, make_case_data, MPI_COMM_WORLD};
+          case_config, options, make_case_data, MPI_COMM_WORLD, {}};
       return dg_sim::hdg::RunEulerMainBackend(request) != 0;
     };
     const bool volume_rejected = run_rejection(mfem::Geometry::SQUARE);

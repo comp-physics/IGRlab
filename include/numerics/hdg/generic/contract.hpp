@@ -124,8 +124,11 @@ constexpr bool IsKnownEulerHdgPositivityLimiterKind(
 /** Backend-neutral positivity points consumed by the Zhang--Shu limiter. */
 enum class EulerHdgZhangShuPointSet : std::uint8_t
 {
-  // Consumer is zero so the complete inactive payload is value-initialized.
+  // Consumer adds the reference-element vertices and nodal coefficients to
+  // the volume/face residual rules. It is zero so the complete inactive
+  // payload is value-initialized.
   consumer = 0,
+  // Quadrature contains only the volume and face residual rules.
   quadrature = 1
 };
 

@@ -493,9 +493,19 @@ public:
     if (output)
     {
       const double output_dt = output->time - time_;
-      if (output_dt >= 0.0 && output_dt <= planned_dt)
+      // A proposal can be one representable value below output_dt while its
+      // rounded endpoint is exactly the output boundary.  Classify that as a
+      // boundary hit without increasing the solver's proposed dt; otherwise
+      // Commit() reaches the boundary without advancing the output cursor and
+      // the following plan is forced to a zero-length step.
+      const bool rounded_to_output = end_time == output->time;
+      if (output_dt >= 0.0 &&
+          (output_dt <= planned_dt || rounded_to_output))
       {
-        planned_dt = output_dt;
+        if (output_dt <= planned_dt)
+        {
+          planned_dt = output_dt;
+        }
         end_time = output->time;
         hit_output = true;
         output_cycle = output->cycle;

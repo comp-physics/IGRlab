@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Whole-device memory control for the selected adaptive trace methods.
+"""Final memory and fresh-process controls for adaptive trace methods.
 
-This test-only driver performs no build, GPU selection, file publication, or
-raw-log retention.  A tracked CTest invocation supplies the already-built
-convergence executable while the caller owns the exclusive visible GPU.
+This test-only driver performs no build, GPU selection, persistent file
+publication, or raw-log retention.  A tracked CTest invocation supplies the
+already-built convergence executable while the caller owns the exclusive
+visible GPU.  Memory sampling and unperturbed process timing are deliberately
+separate modes.
 """
 
 from __future__ import annotations
@@ -13,7 +15,10 @@ import math
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
+import tempfile
+import time
 from typing import Any, Mapping, Sequence
 
 
@@ -39,11 +44,56 @@ ORDER = 3
 ELEMENTS_PER_DIRECTION = 12
 FINAL_TIME = 0.08
 REGULARIZATION = "igr"
+MEMORY_MODE = "memory"
+FRESH_PROCESS_TIMING_MODE = "fresh-process-timing"
+MODES = (MEMORY_MODE, FRESH_PROCESS_TIMING_MODE)
 
 RODAS3 = "rodas3"
 MONOLITHIC_BE = "monolithic_backward_euler"
 PARTITIONED_BE = "partitioned_backward_euler"
 METHODS = (RODAS3, MONOLITHIC_BE, PARTITIONED_BE)
+
+EXACT_WORK_FIELDS = (
+    "steps",
+    "accepted_steps",
+    "rejected_attempts",
+    "controller_revision",
+    "nonlinear_updates",
+    "linear_iterations",
+    "linear_solve_attempts",
+    "trace_solves",
+    "scalar_closure_solves",
+    "scalar_closure_linear_iterations",
+    "true_residual_tightenings",
+    "complete_assemblies",
+    "complete_condensations",
+    "complete_recoveries",
+    "common_shift_operator_builds",
+    "common_shift_operator_reuses",
+    "condensed_rhs_refreshes",
+    "common_shift_trace_solves",
+    "common_shift_preconditioner_setups",
+    "common_shift_preconditioner_reuses",
+    "native_trace_solve_calls",
+    "hypre_trace_solve_calls",
+    "patch_setups",
+    "preconditioner_applications",
+    "matrix_free_operator_applications",
+    "output_publications",
+)
+MAXIMUM_QUALITY_FIELDS = (
+    "maximum_final_residual",
+    "maximum_true_relative_residual",
+    "maximum_conservation_error",
+    "maximum_conservation_relative_error",
+    "maximum_embedded_temporal_error_norm",
+    "maximum_final_algebraic_residual",
+    "maximum_final_algebraic_correction_norm",
+)
+MINIMUM_QUALITY_FIELDS = (
+    "minimum_density",
+    "minimum_pressure",
+)
 
 ENV_BE_STEPS = "DG_IGR_ADAPTIVE_TRACE_MEMORY_BE_STEPS"
 ENV_PBE_STEPS = "DG_IGR_ADAPTIVE_TRACE_MEMORY_PBE_STEPS"
@@ -213,11 +263,182 @@ def parse_architecture_selection_point(
     return parsed, internal_floor
 
 
-def benchmark_command(
-        executable: str, method: str, controls: Mapping[str, Any]) -> list[str]:
-    """Build one exact, output-free convergence memory command."""
+def _point_int(fields: Mapping[str, str], name: str) -> int:
+    if name not in fields:
+        raise AdaptiveTraceMemoryError(
+            f"architecture point omitted required field: {name}"
+        )
+    try:
+        return int(fields[name])
+    except ValueError as error:
+        raise AdaptiveTraceMemoryError(
+            f"architecture point {name} must be an integer"
+        ) from error
+
+
+def _point_float(fields: Mapping[str, str], name: str) -> float:
+    if name not in fields:
+        raise AdaptiveTraceMemoryError(
+            f"architecture point omitted required field: {name}"
+        )
+    try:
+        value = float(fields[name])
+    except ValueError as error:
+        raise AdaptiveTraceMemoryError(
+            f"architecture point {name} must be numeric"
+        ) from error
+    if not math.isfinite(value):
+        raise AdaptiveTraceMemoryError(
+            f"architecture point {name} must be finite"
+        )
+    return value
+
+
+def _require_point_flag(fields: Mapping[str, str], name: str,
+                        expected: bool) -> None:
+    value = _point_int(fields, name)
+    if value != int(expected):
+        raise AdaptiveTraceMemoryError(
+            f"architecture point {name}={value}; expected {int(expected)}"
+        )
+
+
+def validate_selected_point(
+        fields: Mapping[str, str], method: str, controls: Mapping[str, Any],
+        *, expect_output: bool) -> float:
+    """Bind one successful point to the selected controls and full gates."""
     if method not in METHODS:
         raise AdaptiveTraceMemoryError(f"unknown method: {method}")
+    expected_text = {
+        "method": method,
+        "regularization": REGULARIZATION,
+        "order": str(ORDER),
+        "elements_per_direction": str(ELEMENTS_PER_DIRECTION),
+    }
+    for name, expected in expected_text.items():
+        if fields.get(name) != expected:
+            raise AdaptiveTraceMemoryError(
+                f"architecture point {name}={fields.get(name)!r}; "
+                f"expected {expected!r}"
+            )
+    if _point_float(fields, "final_time") != FINAL_TIME:
+        raise AdaptiveTraceMemoryError(
+            "architecture point final_time differs from selected horizon"
+        )
+    _require_point_flag(fields, "passed", True)
+    _require_point_flag(fields, "temporal_reference_error", False)
+    if _point_int(fields, "timing_repetitions") != 1:
+        raise AdaptiveTraceMemoryError(
+            "single-method point must contain exactly one timing repetition"
+        )
+
+    gate_names = (
+        "finite_gate",
+        "admissibility_gate",
+        "recovery_gate",
+        "true_residual_gate",
+        "conservation_gate",
+        "no_fallback_gate",
+        "trace_policy_gate",
+        "common_shift_gate",
+    )
+    for name in gate_names:
+        _require_point_flag(fields, name, True)
+    positive_names = (
+        "measured_u4_global_l2_error",
+        "sigma_coefficient_rms",
+        "minimum_density",
+        "minimum_pressure",
+        "maximum_wave_speed",
+        "measured_session_wall_seconds",
+        "common_setup_inclusive_wall_seconds",
+    )
+    for name in positive_names:
+        if _point_float(fields, name) <= 0.0:
+            raise AdaptiveTraceMemoryError(
+                f"architecture point {name} must be positive"
+            )
+    measured_wall = _point_float(fields, "measured_session_wall_seconds")
+    internal_wall = _point_float(
+        fields, "common_setup_inclusive_wall_seconds"
+    )
+    if internal_wall < measured_wall:
+        raise AdaptiveTraceMemoryError(
+            "common-setup-inclusive wall is below the session wall"
+        )
+    nonnegative_names = (
+        *MAXIMUM_QUALITY_FIELDS,
+    )
+    for name in nonnegative_names:
+        if _point_float(fields, name) < 0.0:
+            raise AdaptiveTraceMemoryError(
+                f"architecture point {name} must be nonnegative"
+            )
+    for name in EXACT_WORK_FIELDS:
+        if _point_int(fields, name) < 0:
+            raise AdaptiveTraceMemoryError(
+                f"architecture point {name} must be nonnegative"
+            )
+    if _point_int(fields, "trace_solves") <= 0:
+        raise AdaptiveTraceMemoryError(
+            "architecture point trace_solves must be positive"
+        )
+
+    steps = _point_int(fields, "steps")
+    accepted = _point_int(fields, "accepted_steps")
+    rejected = _point_int(fields, "rejected_attempts")
+    if method == RODAS3:
+        expected_controls = {
+            "time_atol": float(controls["rodas_atol"]),
+            "time_rtol": float(controls["rodas_rtol"]),
+            "adaptive_initial_dt": float(controls["rodas_initial_dt"]),
+            "adaptive_minimum_dt": float(controls["rodas_dt_min"]),
+            "dt": float(controls["rodas_initial_dt"]),
+        }
+        for name, expected in expected_controls.items():
+            if _point_float(fields, name) != expected:
+                raise AdaptiveTraceMemoryError(
+                    f"architecture point {name} differs from selected control"
+                )
+        revision = _point_int(fields, "controller_revision")
+        _require_point_flag(fields, "adaptive", True)
+        _require_point_flag(fields, "prepared_assessment_authority", True)
+        if steps <= 0 or accepted != steps or rejected <= 0 or \
+                revision != accepted + rejected:
+            raise AdaptiveTraceMemoryError(
+                "adaptive point violates accepted/rejected revision accounting"
+            )
+    else:
+        key = "be_steps" if method == MONOLITHIC_BE else "pbe_steps"
+        expected_steps = int(controls[key])
+        _require_point_flag(fields, "adaptive", False)
+        if steps != expected_steps or accepted != expected_steps or rejected != 0:
+            raise AdaptiveTraceMemoryError(
+                "fixed-step point differs from selected step control"
+            )
+        if _point_float(fields, "dt") != FINAL_TIME / expected_steps:
+            raise AdaptiveTraceMemoryError(
+                "fixed-step point dt differs from the selected horizon/steps"
+            )
+
+    expected_publications = 3 if expect_output else 0
+    if _point_int(fields, "output_publications") != expected_publications:
+        raise AdaptiveTraceMemoryError(
+            "architecture point output publication count is not selected"
+        )
+    _require_point_flag(fields, "midpoint_output_landed", expect_output)
+    _require_point_flag(fields, "final_output_landed", expect_output)
+    return internal_wall
+
+
+def benchmark_command(
+        executable: str, method: str, controls: Mapping[str, Any],
+        output_root: str | None = None) -> list[str]:
+    """Build one exact selected-method convergence command."""
+    if method not in METHODS:
+        raise AdaptiveTraceMemoryError(f"unknown method: {method}")
+    if output_root is not None and not output_root:
+        raise AdaptiveTraceMemoryError("output root must be non-empty")
     command = [
         executable,
         "--order", str(ORDER),
@@ -239,6 +460,8 @@ def benchmark_command(
     else:
         steps_key = "be_steps" if method == MONOLITHIC_BE else "pbe_steps"
         command.extend(["--screen-memory-steps", str(int(controls[steps_key]))])
+    if output_root is not None:
+        command.extend(["--screen-output-root", output_root])
     return command
 
 
@@ -309,8 +532,11 @@ def run_matrix(
                 raise AdaptiveTraceMemoryError(
                     f"{method} control omitted benchmark stdout"
                 )
-            _, internal_floor = parse_architecture_selection_point(
+            fields, internal_floor = parse_architecture_selection_point(
                 benchmark["stdout"], method
+            )
+            validate_selected_point(
+                fields, method, controls, expect_output=False
             )
             repeats[method].append(_minimal_control(evidence))
             floors[method].append(internal_floor)
@@ -330,6 +556,229 @@ def run_matrix(
             "maximum_internal_cuda_used_floor_bytes": max(floors[method]),
         }
     return aggregates
+
+
+def _run_fresh_process(
+        command: Sequence[str], *, timeout_seconds: float,
+        environment: Mapping[str, str]) -> dict[str, Any]:
+    """Run one unprofiled child and retain only its bounded process result."""
+    started_ns = time.monotonic_ns()
+    try:
+        completed = subprocess.run(
+            list(command),
+            env=dict(environment),
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+            check=False,
+            start_new_session=True,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise AdaptiveTraceMemoryError(
+            "fresh-process timing child exceeded its timeout"
+        ) from error
+    except OSError as error:
+        raise AdaptiveTraceMemoryError(
+            f"unable to launch fresh-process timing child: {error}"
+        ) from error
+    finished_ns = time.monotonic_ns()
+    return {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "wall_seconds": (finished_ns - started_ns) / 1.0e9,
+    }
+
+
+def _bounded_failure_excerpt(value: Any, limit: int = 512) -> str:
+    """Flatten one diagnostic stream without retaining an unbounded log."""
+    if not isinstance(value, str):
+        return "<missing>"
+    flattened = " ".join(value.split())
+    return flattened[:limit] if flattened else "<empty>"
+
+
+def _three_repeat_statistics(values: Sequence[float], name: str,
+                             *, allow_zero: bool = False) -> dict[str, float]:
+    if len(values) != 3:
+        raise AdaptiveTraceMemoryError(
+            f"{name} requires exactly three repetitions"
+        )
+    checked = [float(value) for value in values]
+    if any(not math.isfinite(value) or
+           (value < 0.0 if allow_zero else value <= 0.0)
+           for value in checked):
+        qualifier = "nonnegative" if allow_zero else "positive"
+        raise AdaptiveTraceMemoryError(
+            f"{name} repetitions must be finite and {qualifier}"
+        )
+    ordered = sorted(checked)
+    return {
+        "minimum": ordered[0],
+        "median": ordered[1],
+        "maximum": ordered[2],
+        "range": ordered[2] - ordered[0],
+    }
+
+
+def run_fresh_process_timing_matrix(
+        executable: str, controls: Mapping[str, Any],
+        environment: Mapping[str, str]) -> dict[str, dict[str, Any]]:
+    """Run three output-inclusive fresh processes per selected method."""
+    child_environment = dict(environment)
+    child_environment["DG_IGR_RUN_ARCHITECTURE_SELECTION_SCREEN"] = "1"
+    process_walls: dict[str, list[float]] = {
+        method: [] for method in METHODS
+    }
+    internal_walls: dict[str, list[float]] = {
+        method: [] for method in METHODS
+    }
+    process_envelopes: dict[str, list[float]] = {
+        method: [] for method in METHODS
+    }
+    work_signatures: dict[str, list[tuple[int, ...]]] = {
+        method: [] for method in METHODS
+    }
+    u4_metrics: dict[str, list[float]] = {
+        method: [] for method in METHODS
+    }
+    maximum_quality_metrics: dict[str, dict[str, list[float]]] = {
+        method: {name: [] for name in MAXIMUM_QUALITY_FIELDS}
+        for method in METHODS
+    }
+    minimum_quality_metrics: dict[str, dict[str, list[float]]] = {
+        method: {name: [] for name in MINIMUM_QUALITY_FIELDS}
+        for method in METHODS
+    }
+
+    with tempfile.TemporaryDirectory(
+            prefix="dg-igr-adaptive-trace-timing-") as temporary_root:
+        for repetition, rotation in enumerate(latin_square_schedule()):
+            for method in rotation:
+                output_root = str(
+                    Path(temporary_root) /
+                    f"repeat-{repetition + 1}-{method}"
+                )
+                command = benchmark_command(
+                    executable, method, controls, output_root
+                )
+                try:
+                    evidence = _run_fresh_process(
+                        command,
+                        timeout_seconds=CONTROL_TIMEOUT_SECONDS,
+                        environment=child_environment,
+                    )
+                except AdaptiveTraceMemoryError as error:
+                    raise AdaptiveTraceMemoryError(
+                        f"{method} fresh-process timing failed: {error}"
+                    ) from error
+                if evidence.get("returncode") != 0:
+                    raise AdaptiveTraceMemoryError(
+                        f"{method} fresh-process timing exited nonzero: "
+                        "stderr=" + _bounded_failure_excerpt(
+                            evidence.get("stderr")
+                        )
+                    )
+                stdout = evidence.get("stdout")
+                if not isinstance(stdout, str):
+                    raise AdaptiveTraceMemoryError(
+                        f"{method} fresh-process timing omitted stdout"
+                    )
+                stderr = evidence.get("stderr")
+                if not isinstance(stderr, str) or stderr:
+                    raise AdaptiveTraceMemoryError(
+                        f"{method} fresh-process timing produced non-empty "
+                        "stderr: " + _bounded_failure_excerpt(stderr)
+                    )
+                fields, _ = parse_architecture_selection_point(stdout, method)
+                internal_wall = validate_selected_point(
+                    fields, method, controls, expect_output=True
+                )
+                try:
+                    process_wall = float(evidence.get("wall_seconds", math.nan))
+                except (TypeError, ValueError) as error:
+                    raise AdaptiveTraceMemoryError(
+                        f"{method} fresh-process wall must be numeric"
+                    ) from error
+                if not math.isfinite(process_wall) or process_wall <= 0.0:
+                    raise AdaptiveTraceMemoryError(
+                        f"{method} fresh-process wall must be finite and positive"
+                    )
+                envelope = process_wall - internal_wall
+                if envelope < 0.0:
+                    raise AdaptiveTraceMemoryError(
+                        f"{method} process wall is below its internal wall"
+                    )
+                process_walls[method].append(process_wall)
+                internal_walls[method].append(internal_wall)
+                process_envelopes[method].append(envelope)
+                work_signatures[method].append(tuple(
+                    _point_int(fields, name) for name in EXACT_WORK_FIELDS
+                ))
+                u4_metrics[method].append(
+                    _point_float(fields, "measured_u4_global_l2_error")
+                )
+                for name in MAXIMUM_QUALITY_FIELDS:
+                    maximum_quality_metrics[method][name].append(
+                        _point_float(fields, name)
+                    )
+                for name in MINIMUM_QUALITY_FIELDS:
+                    minimum_quality_metrics[method][name].append(
+                        _point_float(fields, name)
+                    )
+
+    for method in METHODS:
+        if len(set(work_signatures[method])) != 1:
+            raise AdaptiveTraceMemoryError(
+                f"{method} work signature changed across timing repetitions"
+            )
+        reference_u4 = u4_metrics[method][0]
+        for value in u4_metrics[method][1:]:
+            scale = max(reference_u4, value)
+            if abs(reference_u4 - value) > 1.0e-13 + 1.0e-9 * scale:
+                raise AdaptiveTraceMemoryError(
+                    f"{method} U4 metric changed across timing repetitions"
+                )
+
+    return {
+        method: {
+            "repeat_count": 3,
+            "work_signature": dict(zip(
+                EXACT_WORK_FIELDS, work_signatures[method][0]
+            )),
+            "u4_metric": _three_repeat_statistics(
+                u4_metrics[method], f"{method} U4 metric"
+            ),
+            "maximum_quality_metrics": {
+                name: _three_repeat_statistics(
+                    maximum_quality_metrics[method][name],
+                    f"{method} {name}", allow_zero=True,
+                )
+                for name in MAXIMUM_QUALITY_FIELDS
+            },
+            "minimum_quality_metrics": {
+                name: _three_repeat_statistics(
+                    minimum_quality_metrics[method][name],
+                    f"{method} {name}",
+                )
+                for name in MINIMUM_QUALITY_FIELDS
+            },
+            "process_wall_seconds": _three_repeat_statistics(
+                process_walls[method], f"{method} process wall"
+            ),
+            "internal_wall_seconds": _three_repeat_statistics(
+                internal_walls[method], f"{method} internal wall"
+            ),
+            "process_envelope_seconds": _three_repeat_statistics(
+                process_envelopes[method], f"{method} process envelope",
+                allow_zero=True,
+            ),
+        }
+        for method in METHODS
+    }
 
 
 def _bytes_from_mib(value: Any) -> int:
@@ -363,15 +812,112 @@ def print_aggregates(aggregates: Mapping[str, Mapping[str, Any]]) -> None:
         )
 
 
+def print_fresh_process_timing_aggregates(
+        aggregates: Mapping[str, Mapping[str, Any]],
+        controls: Mapping[str, Any]) -> None:
+    """Print compact process-wall summaries and an uncertainty-aware result."""
+    print(
+        "ADAPTIVE_TRACE_FRESH_PROCESS_CONTROLS"
+        f" regularization={REGULARIZATION}"
+        f" order={ORDER}"
+        f" elements_per_direction={ELEMENTS_PER_DIRECTION}"
+        f" final_time={FINAL_TIME:.17g}"
+        f" monolithic_steps={int(controls['be_steps'])}"
+        f" partitioned_steps={int(controls['pbe_steps'])}"
+        f" rodas3_time_atol={float(controls['rodas_atol']):.17g}"
+        f" rodas3_time_rtol={float(controls['rodas_rtol']):.17g}"
+        f" rodas3_initial_dt={float(controls['rodas_initial_dt']):.17g}"
+        f" rodas3_minimum_dt={float(controls['rodas_dt_min']):.17g}"
+        f" requested_gpu_uuid={controls['gpu_uuid']}"
+        f" cuda_visible_devices={controls['visible_devices']}"
+        " timing_repetitions=3"
+        " output_publications_per_process=3"
+    )
+    for method in METHODS:
+        item = aggregates[method]
+        work = item["work_signature"]
+        u4 = item["u4_metric"]
+        maximum_quality = item["maximum_quality_metrics"]
+        minimum_quality = item["minimum_quality_metrics"]
+        process = item["process_wall_seconds"]
+        internal = item["internal_wall_seconds"]
+        envelope = item["process_envelope_seconds"]
+        work_text = "".join(
+            f" {name}={work[name]}" for name in EXACT_WORK_FIELDS
+        )
+        maximum_quality_text = "".join(
+            f" {name}_max={maximum_quality[name]['maximum']:.17g}"
+            f" {name}_range={maximum_quality[name]['range']:.17g}"
+            for name in MAXIMUM_QUALITY_FIELDS
+        )
+        minimum_quality_text = "".join(
+            f" {name}_min={minimum_quality[name]['minimum']:.17g}"
+            f" {name}_range={minimum_quality[name]['range']:.17g}"
+            for name in MINIMUM_QUALITY_FIELDS
+        )
+        print(
+            "ADAPTIVE_TRACE_FRESH_PROCESS_WALL"
+            f" method={method}"
+            f" repeat_count={item['repeat_count']}"
+            f"{work_text}"
+            f" u4_metric_median={u4['median']:.17g}"
+            f" u4_metric_range={u4['range']:.17g}"
+            f"{maximum_quality_text}"
+            f"{minimum_quality_text}"
+            f" minimum_seconds={process['minimum']:.17g}"
+            f" median_seconds={process['median']:.17g}"
+            f" maximum_seconds={process['maximum']:.17g}"
+            f" range_seconds={process['range']:.17g}"
+            f" internal_median_seconds={internal['median']:.17g}"
+            f" process_envelope_median_seconds={envelope['median']:.17g}"
+            " process_startup_included=1"
+            " process_teardown_included=1"
+            " output_included=1"
+            " nvidia_smi_polling=0"
+            " selected_controls_validated=1"
+            " numerical_gates_validated=1"
+            " qualified=1"
+        )
+
+    rodas = aggregates[RODAS3]["process_wall_seconds"]
+    monolithic = aggregates[MONOLITHIC_BE]["process_wall_seconds"]
+    partitioned = aggregates[PARTITIONED_BE]["process_wall_seconds"]
+    median_vs_monolithic = monolithic["median"] / rodas["median"]
+    median_vs_partitioned = partitioned["median"] / rodas["median"]
+    conservative_vs_monolithic = monolithic["minimum"] / rodas["maximum"]
+    conservative_vs_partitioned = partitioned["minimum"] / rodas["maximum"]
+    separated = conservative_vs_monolithic > 1.0 and \
+        conservative_vs_partitioned > 1.0
+    if not separated:
+        raise AdaptiveTraceMemoryError(
+            "RODAS3 fresh-process timing is not separated beyond the "
+            "observed monolithic and partitioned ranges"
+        )
+    print(
+        "ADAPTIVE_TRACE_FRESH_PROCESS_SELECTION"
+        f" rodas3_speedup_vs_monolithic_median="
+        f"{median_vs_monolithic:.17g}"
+        f" rodas3_speedup_vs_partitioned_median="
+        f"{median_vs_partitioned:.17g}"
+        f" rodas3_speedup_vs_monolithic_conservative="
+        f"{conservative_vs_monolithic:.17g}"
+        f" rodas3_speedup_vs_partitioned_conservative="
+        f"{conservative_vs_partitioned:.17g}"
+        f" separated_beyond_observed_ranges={int(separated)}"
+        " measurement_qualified=1"
+    )
+
+
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the selected adaptive/BE/PBE tensor CUDA memory matrix; "
+            "Run a selected adaptive/BE/PBE tensor CUDA final matrix; "
             "the caller must own the one visible GPU"
         )
     )
     parser.add_argument("--executable", required=True)
-    parser.add_argument("--nvidia-smi", required=True)
+    parser.add_argument("--mode", choices=MODES, default=MEMORY_MODE)
+    parser.add_argument("--nvidia-smi")
     return parser
 
 
@@ -382,18 +928,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     except MissingQualificationEnvironment as error:
         print(
             "ADAPTIVE_TRACE_MEMORY_MATRIX skipped=1"
+            f" mode={arguments.mode}"
             f" missing_environment={','.join(error.names)}"
         )
         return SKIP_RETURN_CODE
     try:
-        executable = _resolve_program(arguments.executable, "convergence executable")
-        nvidia_smi = _resolve_program(arguments.nvidia_smi, "nvidia-smi")
-        aggregates = run_matrix(
-            executable, nvidia_smi, controls, os.environ
+        executable = _resolve_program(
+            arguments.executable, "convergence executable"
         )
-        print_aggregates(aggregates)
+        if arguments.mode == MEMORY_MODE:
+            if arguments.nvidia_smi is None:
+                raise AdaptiveTraceMemoryError(
+                    "memory mode requires --nvidia-smi"
+                )
+            nvidia_smi = _resolve_program(arguments.nvidia_smi, "nvidia-smi")
+            aggregates = run_matrix(
+                executable, nvidia_smi, controls, os.environ
+            )
+            print_aggregates(aggregates)
+        else:
+            aggregates = run_fresh_process_timing_matrix(
+                executable, controls, os.environ
+            )
+            print_fresh_process_timing_aggregates(aggregates, controls)
     except AdaptiveTraceMemoryError as error:
-        print(f"adaptive trace memory matrix failed: {error}", file=sys.stderr)
+        print(
+            f"adaptive trace {arguments.mode} matrix failed: {error}",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

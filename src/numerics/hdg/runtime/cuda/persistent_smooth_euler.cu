@@ -3656,15 +3656,45 @@ __device__ __forceinline__ bool ZhangShuStoredPointAdmissible(
       pressure >= pressure_floor;
 }
 
+__device__ __forceinline__ void ZhangShuInterpolateVertex(
+    const CudaDeviceView& view, const CudaMeshShape& shape,
+    const int element, const int vertex, double* const point)
+{
+  const int interior_offset = element * shape.interior_dofs;
+  const int si = shape.scalar_interior_dofs;
+  for (int component = 0; component < conserved_components; ++component)
+  {
+    point[component] = 0.0;
+    for (int scalar = 0; scalar < si; ++scalar)
+      point[component] +=
+          view.limiter_vertex_shape[vertex * si + scalar] *
+          view.work_interior[interior_offset +
+              ByNodes(scalar, si, component)];
+  }
+}
+
+__global__ void InitializeZhangShuDiagnosticsKernel(
+    CudaDeviceView view, CudaMeshShape shape)
+{
+  const int element = blockIdx.x * blockDim.x + threadIdx.x;
+  if (element >= shape.elements) return;
+  for (int slot = 0; slot < 2; ++slot)
+  {
+    view.positivity_theta_rho[slot][element] = 1.0;
+    view.positivity_theta_p[slot][element] = 1.0;
+  }
+}
+
 /**
  * Conservative leading-U4 Zhang--Shu filter for one HDG element.
  *
  * One block owns one element. Thread zero computes the physical quadrature
  * mean and the two causal limiter factors; all threads then scale disjoint
  * coefficient entries. The consumer point set is the union of the volume
- * and face residual points and the nodal coefficients. The quadrature point
- * set omits the last group. Algebraic reconstruction of Uhat4 and the IGR
- * fields deliberately remains a lifecycle operation after this kernel.
+ * and face residual points, the four reference-element vertices, and the
+ * nodal coefficients. The quadrature point set omits the last two groups.
+ * Algebraic reconstruction of Uhat4 and the IGR fields deliberately remains
+ * a lifecycle operation after this kernel.
  *
  * device_result is an aggregate classification: 0 means exact no-op, 1 means
  * at least one element changed, 2 means another strict no-repair failure, and
@@ -3673,13 +3703,17 @@ __device__ __forceinline__ bool ZhangShuStoredPointAdmissible(
  * limiter failure that timestep reduction cannot repair pointwise. The
  * per-element status slice holds the squared scale-normalized coefficient
  * correction for a subsequent aggregate norm reduction; it is never retained
- * as event data.
+ * as event data.  Two dedicated element arrays min-accumulate theta from the
+ * accepted-history seed across this attempt's bounded limiter calls.  Their
+ * slot is published only with the state transaction, so rejected attempts do
+ * not contaminate the bounded running aggregate and no stage stream exists.
  */
 __global__ void ZhangShuU4Kernel(
     CudaDeviceView view, CudaMeshShape shape,
     const generic::EulerHdgZhangShuPointSet point_set,
     const double density_floor, const double pressure_floor,
-    const int pressure_bisections, int* device_result)
+    const int pressure_bisections, const int diagnostic_slot,
+    int* device_result)
 {
   namespace zs = ::dg::hdg::euler::zhang_shu;
   const int element = blockIdx.x;
@@ -3775,6 +3809,16 @@ __global__ void ZhangShuU4Kernel(
       else density_theta = fmin(density_theta, result.theta);
     }
     if (point_set == generic::EulerHdgZhangShuPointSet::consumer)
+    {
+      for (int vertex = 0; vertex < 4 && !failed; ++vertex)
+      {
+        double point[conserved_components] = {};
+        ZhangShuInterpolateVertex(view, shape, element, vertex, point);
+        const zs::ThetaResult result = zs::DensityTheta(
+            mean, point, parameters);
+        if (!result.ok()) failed = 1;
+        else density_theta = fmin(density_theta, result.theta);
+      }
       for (int scalar = 0; scalar < si && !failed; ++scalar)
       {
         double point[conserved_components];
@@ -3786,6 +3830,7 @@ __global__ void ZhangShuU4Kernel(
         if (!result.ok()) failed = 1;
         else density_theta = fmin(density_theta, result.theta);
       }
+    }
 
     // Pressure pass over the same points after applying only the density
     // factor. PressureTheta returns the admissible lower bisection bracket.
@@ -3829,6 +3874,20 @@ __global__ void ZhangShuU4Kernel(
       else pressure_theta = fmin(pressure_theta, result.theta);
     }
     if (point_set == generic::EulerHdgZhangShuPointSet::consumer)
+    {
+      for (int vertex = 0; vertex < 4 && !failed; ++vertex)
+      {
+        double point[conserved_components] = {};
+        ZhangShuInterpolateVertex(view, shape, element, vertex, point);
+        double density_limited[conserved_components];
+        const zs::Status blend = zs::BlendDensityOnlyU4(
+            mean, point, density_theta, density_limited);
+        const zs::ThetaResult result = blend == zs::Status::success
+            ? zs::PressureTheta(mean, density_limited, parameters)
+            : zs::ThetaResult{blend, 1.0};
+        if (!result.ok()) failed = 1;
+        else pressure_theta = fmin(pressure_theta, result.theta);
+      }
       for (int scalar = 0; scalar < si && !failed; ++scalar)
       {
         double point[conserved_components];
@@ -3844,7 +3903,17 @@ __global__ void ZhangShuU4Kernel(
         if (!result.ok()) failed = 1;
         else pressure_theta = fmin(pressure_theta, result.theta);
       }
+    }
     active = !failed && (density_theta < 1.0 || pressure_theta < 1.0);
+    if (!failed)
+    {
+      view.positivity_theta_rho[diagnostic_slot][element] = fmin(
+          view.positivity_theta_rho[diagnostic_slot][element],
+          density_theta);
+      view.positivity_theta_p[diagnostic_slot][element] = fmin(
+          view.positivity_theta_p[diagnostic_slot][element],
+          pressure_theta);
+    }
     if (failed) atomicMax(device_result, mean_rejected ? 3 : 2);
     else if (active) atomicMax(device_result, 1);
   }
@@ -3918,6 +3987,16 @@ __global__ void ZhangShuU4Kernel(
         failed = 1;
     }
     if (point_set == generic::EulerHdgZhangShuPointSet::consumer)
+    {
+      for (int vertex = 0; vertex < 4 && !failed; ++vertex)
+      {
+        double point[conserved_components] = {};
+        ZhangShuInterpolateVertex(view, shape, element, vertex, point);
+        if (!ZhangShuStoredPointAdmissible(
+                point, shape.boundary_gamma, density_floor,
+                pressure_floor))
+          failed = 1;
+      }
       for (int scalar = 0; scalar < si && !failed; ++scalar)
       {
         double point[conserved_components];
@@ -3930,6 +4009,7 @@ __global__ void ZhangShuU4Kernel(
                 pressure_floor))
           failed = 1;
       }
+    }
 
     // Match the CPU reference's independent conservation check: scaling
     // coefficient deviations about the physical mean must preserve that mean
@@ -3992,13 +4072,18 @@ __global__ void AdmissibilityKernel(CudaDeviceView view, CudaMeshShape shape)
 {
   const int element = blockIdx.x;
   if (element >= shape.elements) return;
-  __shared__ int volume_failed;
-  __shared__ int face_failed;
+  // Failure-only classification consumed by the bounded host probe in the
+  // RODAS3 path.  The ordinary admission contract remains status == 1.0.
+  constexpr unsigned nonfinite_u4_coefficient = 1U << 0U;
+  constexpr unsigned nonfinite_igr_interior_coefficient = 1U << 1U;
+  constexpr unsigned nonfinite_uhat4_coefficient = 1U << 2U;
+  constexpr unsigned nonfinite_igr_trace_coefficient = 1U << 3U;
+  constexpr unsigned volume_u4_failure = 1U << 4U;
+  constexpr unsigned face_interior_u4_failure = 1U << 5U;
+  constexpr unsigned uhat4_failure = 1U << 6U;
+  __shared__ unsigned failure_mask;
   if (threadIdx.x == 0)
-  {
-    volume_failed = 0;
-    face_failed = 0;
-  }
+    failure_mask = 0U;
   __syncthreads();
   const int ni0 = element * shape.interior_dofs;
   const int nt0 = element * shape.trace_dofs;
@@ -4009,11 +4094,23 @@ __global__ void AdmissibilityKernel(CudaDeviceView view, CudaMeshShape shape)
   for (int local = threadIdx.x; local < shape.interior_dofs;
        local += blockDim.x)
     if (!isfinite(view.work_interior[ni0 + local]))
-      atomicExch(&volume_failed, 1);
+      atomicOr(&failure_mask,
+               local / shape.scalar_interior_dofs < conserved_components
+                   ? nonfinite_u4_coefficient
+                   : nonfinite_igr_interior_coefficient);
   for (int local = threadIdx.x; local < shape.trace_dofs;
        local += blockDim.x)
     if (!isfinite(view.current_local_trace[nt0 + local]))
-      atomicExch(&face_failed, 1);
+    {
+      const int face_span =
+          shape.trace_components * shape.scalar_face_dofs;
+      const int component =
+          (local % face_span) / shape.scalar_face_dofs;
+      atomicOr(&failure_mask,
+               component < conserved_components
+                   ? nonfinite_uhat4_coefficient
+                   : nonfinite_igr_trace_coefficient);
+    }
   for (int q = threadIdx.x; q < shape.volume_points; q += blockDim.x)
   {
     const int qp = element * shape.volume_points + q;
@@ -4025,7 +4122,8 @@ __global__ void AdmissibilityKernel(CudaDeviceView view, CudaMeshShape shape)
             view.work_interior[ni0 + ByNodes(
                 scalar, shape.scalar_interior_dofs, component)];
     if (!(shape.borrowed_host_inputs ? PhysicallyAdmissible(state) :
-          Admissible(state))) atomicExch(&volume_failed, 1);
+          Admissible(state)))
+      atomicOr(&failure_mask, volume_u4_failure);
   }
   const int face_points = faces_per_element * shape.face_points;
   for (int fq = threadIdx.x; fq < face_points; fq += blockDim.x)
@@ -4051,16 +4149,17 @@ __global__ void AdmissibilityKernel(CudaDeviceView view, CudaMeshShape shape)
               view.current_local_trace[nt0 + offset + ByNodes(
                   scalar, shape.scalar_face_dofs, component)];
       if (!(shape.borrowed_host_inputs ? PhysicallyAdmissible(interior) :
-            Admissible(interior)) ||
-          !(shape.borrowed_host_inputs ? PhysicallyAdmissible(trace) :
+            Admissible(interior)))
+        atomicOr(&failure_mask, face_interior_u4_failure);
+      if (!(shape.borrowed_host_inputs ? PhysicallyAdmissible(trace) :
             Admissible(trace)))
-        atomicExch(&face_failed, 1);
+        atomicOr(&failure_mask, uhat4_failure);
     }
   }
   __syncthreads();
   if (threadIdx.x == 0)
-    view.status[element] = volume_failed ? -1.0 :
-        (face_failed ? -2.0 : 1.0);
+    view.status[element] = failure_mask == 0U
+        ? 1.0 : -static_cast<double>(failure_mask);
 }
 
 __global__ void FreezeBorrowedCurrentLlfTauKernel(CudaDeviceView view,
@@ -5318,22 +5417,35 @@ __global__ void RodasCopyDifferentialStateKernel(
     destination[index]=source[index];
 }
 
-__global__ void RodasFormCandidateKernel(CudaDeviceView v,CudaMeshShape s)
+__global__ void RodasFormCandidateKernel(
+    CudaDeviceView v,CudaMeshShape s,bool admitted_final_stage)
 {
+  constexpr double gamma=0.5;
   const int index=blockIdx.x*blockDim.x+threadIdx.x;
   if(index<s.interior_count)
   {
-    double value=v.base_interior[index];
-    for(int stage=0;stage<4;++stage)
-      value+=RodasPrincipalWeight(stage)*v.rodas_stage_interior[stage][index];
+    // A limiter-active fourth stage is no longer the affine tableau state.
+    // Stiff accuracy therefore owns the admitted state plus its causal stage
+    // correction, not a reconstruction from the raw base and k vectors.  The
+    // two formulas are identical whenever no stage map changed Y4.
+    double value=admitted_final_stage
+        ?v.work_interior[index]+gamma*v.recovered_interior[index]
+        :v.base_interior[index];
+    if(!admitted_final_stage)
+      for(int stage=0;stage<4;++stage)
+        value+=RodasPrincipalWeight(stage)*
+            v.rodas_stage_interior[stage][index];
     v.work_interior[index]=value;
   }
   if(index<s.true_trace_count)
   {
-    double value=v.base_true_trace[index];
-    for(int stage=0;stage<4;++stage)
-      value+=RodasPrincipalWeight(stage)*
-          v.rodas_stage_true_trace[stage][index];
+    double value=admitted_final_stage
+        ?v.work_true_trace[index]+gamma*v.true_solution[index]
+        :v.base_true_trace[index];
+    if(!admitted_final_stage)
+      for(int stage=0;stage<4;++stage)
+        value+=RodasPrincipalWeight(stage)*
+            v.rodas_stage_true_trace[stage][index];
     v.work_true_trace[index]=value;
   }
 }
@@ -8598,23 +8710,38 @@ bool CudaLaunchGatherLocalTrace(const int* map,int count,const double* source,do
 bool CudaLaunchZhangShuU4(
     const CudaDeviceView& v,const CudaMeshShape& s,
     const generic::EulerHdgPositivityLimiterPolicy& policy,
-    int* const device_result,double* const correction_squared) noexcept
+    const int diagnostic_slot,int* const device_result,
+    double* const correction_squared) noexcept
 {
   if(policy.kind!=generic::EulerHdgPositivityLimiterKind::zhang_shu||
      !generic::ValidEulerHdgPositivityLimiterPolicy(policy)||
      device_result==nullptr||correction_squared==nullptr||s.elements<=0||
+     diagnostic_slot<0||diagnostic_slot>=2||
      s.interior_components<conserved_components||
      s.scalar_interior_dofs<=0||s.volume_points<=0||s.face_points<=0||
      v.work_interior==nullptr||v.volume_shape==nullptr||
      v.volume_weight==nullptr||v.face_interior_shape==nullptr||
+     v.limiter_vertex_shape==nullptr||
+     v.positivity_theta_rho[diagnostic_slot]==nullptr||
+     v.positivity_theta_p[diagnostic_slot]==nullptr||
      v.status==nullptr)return false;
   if(cudaMemsetAsync(device_result,0,sizeof(int),nullptr)!=cudaSuccess)
     return false;
   ZhangShuU4Kernel<<<s.elements,128>>>(
       v,s,policy.point_set,policy.density_floor,policy.pressure_floor,
-      policy.pressure_bisection_iterations,device_result);
+      policy.pressure_bisection_iterations,diagnostic_slot,device_result);
   if(!LaunchOk())return false;
   NormReduceKernel<<<1,256>>>(v.status,s.elements,correction_squared);
+  return LaunchOk();
+}
+bool CudaLaunchInitializeZhangShuDiagnostics(
+    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+{
+  if(s.elements<=0||v.positivity_theta_rho[0]==nullptr||
+     v.positivity_theta_p[0]==nullptr||
+     v.positivity_theta_rho[1]==nullptr||
+     v.positivity_theta_p[1]==nullptr)return false;
+  InitializeZhangShuDiagnosticsKernel<<<Blocks(s.elements),128>>>(v,s);
   return LaunchOk();
 }
 bool CudaLaunchAdmissibility(const CudaDeviceView& v,const CudaMeshShape& s) noexcept
@@ -8872,17 +8999,21 @@ bool CudaLaunchRodasCopyDifferentialState(
   return LaunchOk();
 }
 bool CudaLaunchRodasFormCandidate(
-    const CudaDeviceView& v,const CudaMeshShape& s) noexcept
+    const CudaDeviceView& v,const CudaMeshShape& s,
+    const bool admitted_final_stage) noexcept
 {
   if(!s.borrowed_host_inputs||s.interior_count<=0||s.true_trace_count<=0||
      v.base_interior==nullptr||v.base_true_trace==nullptr||
-     v.work_interior==nullptr||v.work_true_trace==nullptr)return false;
+     v.work_interior==nullptr||v.work_true_trace==nullptr||
+     (admitted_final_stage&&
+      (v.recovered_interior==nullptr||v.true_solution==nullptr)))return false;
   for(std::size_t stage=0;
       stage<::dg::hdg::time::Rodas3Coefficients::stage_count;++stage)
     if(v.rodas_stage_interior[stage]==nullptr||
        v.rodas_stage_true_trace[stage]==nullptr)return false;
   RodasFormCandidateKernel<<<
-      Blocks(std::max(s.interior_count,s.true_trace_count)),128>>>(v,s);
+      Blocks(std::max(s.interior_count,s.true_trace_count)),128>>>(
+          v,s,admitted_final_stage);
   return LaunchOk();
 }
 bool CudaLaunchRodasTemporalErrorSquared(
@@ -8934,9 +9065,16 @@ bool CudaLaunchRodasPreparedAssessmentSquared(
     double* differential_result,double* algebraic_result,
     double* differential_measure) noexcept
 {
+  const int expected_interior_components=s.igr_active?
+      igr_interior_components:conserved_components;
+  const int expected_trace_components=s.igr_active?
+      igr_trace_components:conserved_components;
   if(!s.borrowed_host_inputs||s.elements<=0||s.volume_points<=0||
      s.scalar_interior_dofs<=0||
-     s.interior_components<conserved_components||s.true_trace_count<=0||
+     s.interior_components!=expected_interior_components||
+     s.trace_components!=expected_trace_components||
+     s.true_trace_count<=0||
+     s.true_trace_count%s.trace_components!=0||
      !std::isfinite(absolute_tolerance)||absolute_tolerance<0.0||
      !std::isfinite(relative_tolerance)||relative_tolerance<0.0||
      !(absolute_tolerance>0.0||relative_tolerance>0.0)||
@@ -8965,9 +9103,16 @@ bool CudaLaunchRodasPreparedFilteredPairAssessmentSquared(
     double* differential_result,double* algebraic_result,
     double* differential_measure) noexcept
 {
+  const int expected_interior_components=s.igr_active?
+      igr_interior_components:conserved_components;
+  const int expected_trace_components=s.igr_active?
+      igr_trace_components:conserved_components;
   if(!s.borrowed_host_inputs||s.elements<=0||s.volume_points<=0||
      s.scalar_interior_dofs<=0||
-     s.interior_components<conserved_components||s.true_trace_count<=0||
+     s.interior_components!=expected_interior_components||
+     s.trace_components!=expected_trace_components||
+     s.true_trace_count<=0||
+     s.true_trace_count%s.trace_components!=0||
      !std::isfinite(absolute_tolerance)||absolute_tolerance<0.0||
      !std::isfinite(relative_tolerance)||relative_tolerance<0.0||
      !(absolute_tolerance>0.0||relative_tolerance>0.0)||

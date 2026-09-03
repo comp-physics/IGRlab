@@ -68,7 +68,7 @@ set(_base_arguments
   --no-vtk_save
   --no-glvis)
 
-function(run_cuda_igr_success order expected_alpha expected_beta)
+function(run_cuda_igr_success order expected_c_alpha expected_alpha expected_penalty)
   set(_arguments ${_base_arguments} --order ${order} ${ARGN})
   set(_run_expected_trace_preconditioner
     "${_expected_trace_preconditioner}")
@@ -93,7 +93,7 @@ function(run_cuda_igr_success order expected_alpha expected_beta)
   endif()
   if(NOT _status EQUAL 0 OR
      NOT _stdout MATCHES
-       "\\[hdg-main\\] status=Success.*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*requested_trace_policy=${_expected_requested_trace_policy}.*resolved_trace_policy=${_run_expected_resolved_trace_policy}.*trace_solver=${_expected_trace_solver}.*fallback_count=0.*trace_preconditioner=${_run_expected_trace_preconditioner}.*trace_ilu_type=${_expected_ilu_type}.*trace_ilu_level_of_fill=${_expected_ilu_fill}.*trace_ilu_local_reordering=${_expected_ilu_reordering}.*trace_ilu_application_iterations=${_expected_ilu_iterations}.*trace_ilu_accounting_kind=${_expected_ilu_accounting_kind}.*trace_ilu_factor_reuse_policy=${_expected_ilu_factor_reuse_policy}.*trace_ilu_triangular_solve_kind=${_expected_ilu_triangular_solve_kind}.*trace_ilu_lower_jacobi_iterations=${_expected_ilu_lower_jacobi_iterations}.*trace_ilu_upper_jacobi_iterations=${_expected_ilu_upper_jacobi_iterations}.*regularization=igr.*alpha=${expected_alpha}.*beta=${expected_beta}" OR
+       "\\[hdg-main\\] status=Success.*cuda_engine=${HDG_MAIN_CUDA_ENGINE}.*requested_trace_policy=${_expected_requested_trace_policy}.*resolved_trace_policy=${_run_expected_resolved_trace_policy}.*trace_solver=${_expected_trace_solver}.*fallback_count=0.*trace_preconditioner=${_run_expected_trace_preconditioner}.*trace_ilu_type=${_expected_ilu_type}.*trace_ilu_level_of_fill=${_expected_ilu_fill}.*trace_ilu_local_reordering=${_expected_ilu_reordering}.*trace_ilu_application_iterations=${_expected_ilu_iterations}.*trace_ilu_accounting_kind=${_expected_ilu_accounting_kind}.*trace_ilu_factor_reuse_policy=${_expected_ilu_factor_reuse_policy}.*trace_ilu_triangular_solve_kind=${_expected_ilu_triangular_solve_kind}.*trace_ilu_lower_jacobi_iterations=${_expected_ilu_lower_jacobi_iterations}.*trace_ilu_upper_jacobi_iterations=${_expected_ilu_upper_jacobi_iterations}.*regularization=igr.*c_alpha=${expected_c_alpha}.*alpha_effective=${expected_alpha}.*alpha_length_policy=average.*h_eff=0.333333.*euler_trace_penalty=${expected_penalty}" OR
      NOT _stderr STREQUAL "")
     message(FATAL_ERROR
       "CUDA HDG p${order} IGR execution failed: ${_status}\n${_stdout}\n${_stderr}")
@@ -129,15 +129,18 @@ endfunction()
 # This is the production main-backend route, not the frozen SC25/P1 oracle.
 # All supported orders share the same generic IC/trace projection, source,
 # time adapter, nonlinear lifecycle, condensation, and optional IGR fields.
-run_cuda_igr_success(1 1 1)
-run_cuda_igr_success(1 0.2 0.8
+run_cuda_igr_success(1 1 0.111111 1)
+run_cuda_igr_success(1 0.2 0.0222222 0.8
   --hdg-igr-alpha 0.2 --hdg-igr-beta 0.8)
-run_cuda_igr_success(1 1 1 --hdg-static-source 0.001)
-run_cuda_igr_success(2 1 1)
-run_cuda_igr_success(3 1 1)
+run_cuda_igr_success(1 1 0.111111 1 --hdg-static-source 0.001)
+run_cuda_igr_success(2 1 0.111111 1)
+run_cuda_igr_success(3 1 0.111111 1)
 expect_cuda_igr_rejection(
-  "HDG IGR alpha and beta must be finite and positive"
+  "HDG IGR c_alpha and Euler trace penalty must be finite and positive"
   --order 1 --hdg-igr-alpha 0)
 expect_cuda_igr_rejection(
-  "HDG IGR alpha and beta must be finite and positive"
+  "HDG IGR c_alpha and Euler trace penalty must be finite and positive"
   --order 1 --hdg-igr-beta 0)
+expect_cuda_igr_rejection(
+  "HDG IGR does not support the element-local alpha length policy"
+  --order 1 --igr-alpha-length local)

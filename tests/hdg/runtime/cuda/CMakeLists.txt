@@ -709,10 +709,12 @@ set_target_properties(
 
 # Test-only, rank-one tensor decision harness.  It keeps the established
 # convergence registrations below unchanged, executes no output path, and
-# compares fixed-horizon RODAS3, monolithic BE, and partitioned BE at one
-# measured U4 error tolerance above a separately reported spatial-floor
-# sentinel.  The default screen uses the production engine-default trace
-# policy; explicit selectors remain available only for bounded ablations.
+# compares fixed-horizon RODAS3, monolithic BE, and partitioned BE on an
+# evolving smooth state with active IGR closure.  U4 error is measured against
+# a bounded same-mesh RODAS3 reference and kept above its Richardson
+# uncertainty.  The production C_alpha=1 average-length lowering is mandatory;
+# the engine-default trace policy remains the default and explicit selectors
+# remain available only for bounded ablations.
 add_test(
   NAME dg_igr_hdg_runtime_cuda_rodas3_equal_error_probe_igr_p3_rank1
   COMMAND dg_igr_hdg_runtime_cuda_generic_euler_convergence
@@ -756,7 +758,7 @@ set_tests_properties(
   dg_igr_hdg_runtime_cuda_rodas3_equal_error_igr_p3_rank1
   dg_igr_hdg_runtime_cuda_rodas3_equal_error_with_output_igr_p3_rank1
   PROPERTIES
-    LABELS "hdg;runtime;cuda;generic-euler;tensor;igr;rodas3;backward-euler;partitioned-backward-euler;equal-error;architecture-selection;performance;manual;p3"
+    LABELS "hdg;runtime;cuda;generic-euler;tensor;igr;active-igr;corrected-alpha;same-mesh-reference;rodas3;backward-euler;partitioned-backward-euler;equal-error;architecture-selection;performance;manual;p3"
     PROCESSORS 1
     RESOURCE_LOCK dg_igr_sm120
     SKIP_RETURN_CODE 77
@@ -764,7 +766,7 @@ set_tests_properties(
 set_tests_properties(
   dg_igr_hdg_runtime_cuda_rodas3_adaptive_equal_error_with_output_igr_p3_rank1
   PROPERTIES
-    LABELS "hdg;runtime;cuda;generic-euler;tensor;igr;rodas3;adaptive;backward-euler;partitioned-backward-euler;equal-error;architecture-selection;performance;p3"
+    LABELS "hdg;runtime;cuda;generic-euler;tensor;igr;active-igr;corrected-alpha;same-mesh-reference;rodas3;adaptive;backward-euler;partitioned-backward-euler;equal-error;architecture-selection;performance;p3"
     PROCESSORS 1
     RESOURCE_LOCK dg_igr_sm120
     ENVIRONMENT "DG_IGR_RUN_ARCHITECTURE_SELECTION_SCREEN=1"
@@ -784,6 +786,25 @@ set_tests_properties(
   dg_igr_hdg_runtime_cuda_adaptive_trace_memory_matrix_igr_p3_rank1
   PROPERTIES
     LABELS "hdg;runtime;cuda;generic-euler;tensor;igr;rodas3;adaptive;backward-euler;partitioned-backward-euler;architecture-selection;memory;performance;manual;p3"
+    PROCESSORS 1
+    RESOURCE_LOCK dg_igr_sm120
+    SKIP_RETURN_CODE 77
+    TIMEOUT 3600)
+
+# Startup-inclusive timing is a separate no-poller matrix.  Each method runs
+# in three fresh processes with initial/midpoint/final output and the same
+# externally supplied equal-error controls used by the memory qualification.
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_adaptive_trace_fresh_process_timing_igr_p3_rank1
+  COMMAND /usr/bin/env python3
+    "${CMAKE_SOURCE_DIR}/scripts/perf/adaptive_trace_memory_matrix.py"
+    --mode fresh-process-timing
+    --executable
+      "$<TARGET_FILE:dg_igr_hdg_runtime_cuda_generic_euler_convergence>")
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_adaptive_trace_fresh_process_timing_igr_p3_rank1
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;generic-euler;tensor;igr;active-igr;corrected-alpha;same-mesh-reference;rodas3;adaptive;backward-euler;partitioned-backward-euler;architecture-selection;fresh-process;startup;output;performance;manual;p3"
     PROCESSORS 1
     RESOURCE_LOCK dg_igr_sm120
     SKIP_RETURN_CODE 77

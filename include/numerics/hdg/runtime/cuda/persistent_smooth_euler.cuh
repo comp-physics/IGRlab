@@ -1518,7 +1518,7 @@ public:
         !numerics_.CommittedScalarClosureCoherent())
       return false;
     return numerics_.ExportFields(numerics_.CommittedSlot().interior,
-                                  destination);
+                                  destination, false);
   }
 
   bool CachedBorrowedEulerDiagnostics(double& maximum_wave_speed,
@@ -1546,7 +1546,7 @@ public:
         !pending_.prestage_allowed || !pending_.checkpoint_staged)
       return false;
     return numerics_.ExportFields(numerics_.WorkspaceSlot().interior,
-                                  destination);
+                                  destination, true);
   }
 
   CudaReuseEvidence ReuseEvidence() const noexcept

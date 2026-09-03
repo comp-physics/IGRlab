@@ -891,10 +891,16 @@ struct CudaGenericArenaLayout
   std::size_t face_trace = 0;
   std::size_t face_weight = 0;
   std::size_t face_normal = 0;
+  // Four reference-square vertex evaluations of the interior scalar basis.
+  // These are shared by every element and exist only for Zhang--Shu.
+  std::size_t limiter_vertex_shape = 0;
   std::size_t face_h = 0;
   std::size_t element_faces = 0;
   std::size_t boundary_reference = 0;
   std::size_t boundary_pressure = 0;
+  // Two transactional slots, each with density and pressure theta per local
+  // element.  This slice exists only for a selected RODAS Zhang--Shu policy.
+  std::size_t positivity_diagnostics = 0;
   std::size_t native_ilu_inverse_diagonal = 0;
   std::size_t partitioned_base_interior = 0;
   std::size_t rodas_interior_vectors = 0;
@@ -1008,6 +1014,7 @@ struct CudaDeviceView
   double* face_trace_shape = nullptr;
   double* face_weight = nullptr;
   double* face_normal = nullptr;
+  double* limiter_vertex_shape = nullptr;
   // Element-volume / face-measure length used by the IGR auxiliary closure.
   double* face_h = nullptr;
   // Borrowed-host physical-boundary data.  A zero kind is an ordinary
@@ -1015,6 +1022,8 @@ struct CudaDeviceView
   // value-only exterior policy for this element-local face.
   double* boundary_reference = nullptr;
   double* boundary_pressure = nullptr;
+  double* positivity_theta_rho[2]{};
+  double* positivity_theta_p[2]{};
   double* status = nullptr;
   double* scalar = nullptr;
   std::uint64_t* hash_words = nullptr;
@@ -2168,7 +2177,10 @@ bool CudaLaunchGatherLocalTrace(const int* signed_map, int count,
 bool CudaLaunchZhangShuU4(
     const CudaDeviceView& view, const CudaMeshShape& shape,
     const generic::EulerHdgPositivityLimiterPolicy& policy,
-    int* device_result, double* correction_squared) noexcept;
+    int diagnostic_slot, int* device_result,
+    double* correction_squared) noexcept;
+bool CudaLaunchInitializeZhangShuDiagnostics(
+    const CudaDeviceView& view, const CudaMeshShape& shape) noexcept;
 bool CudaLaunchAdmissibility(const CudaDeviceView& view,
                              const CudaMeshShape& shape) noexcept;
 bool CudaLaunchFreezeBorrowedCurrentLlfTau(const CudaDeviceView& view,
@@ -2251,7 +2263,8 @@ bool CudaLaunchRodasCopyDifferentialState(
     const CudaMeshShape& shape, const double* source,
     double* destination) noexcept;
 bool CudaLaunchRodasFormCandidate(const CudaDeviceView& view,
-                                 const CudaMeshShape& shape) noexcept;
+                                 const CudaMeshShape& shape,
+                                 bool admitted_final_stage) noexcept;
 bool CudaLaunchRodasTemporalErrorSquared(
     const CudaDeviceView& view, const CudaMeshShape& shape,
     double* result) noexcept;
@@ -2408,6 +2421,12 @@ public:
     cuda_engine_ = config.cuda_engine;
     time_treatment_ = config.time_treatment;
     rodas3_ = time_treatment_ == generic::EulerHdgTimeTreatment::rodas3;
+    positivity_limiter_enabled_ = rodas3_ &&
+        config.use_generic_numerical_policy &&
+        config.numerical_policy.positivity_limiter.kind ==
+            generic::EulerHdgPositivityLimiterKind::zhang_shu;
+    committed_limiter_diagnostics_ = 0;
+    candidate_limiter_diagnostics_ = 1;
     const bool igr_requested = config.use_generic_numerical_policy &&
         config.numerical_policy.stabilization.kind ==
             generic::RegularizationKind::igr;
@@ -2644,6 +2663,14 @@ public:
     if (!CollectiveContinue(UploadTopologyAndState()))
     {
       ReportCudaSetupFailure(evidence.rank, "upload-topology-state");
+      return false;
+    }
+    if (!CollectiveContinue(
+            !positivity_limiter_enabled_ ||
+            CudaLaunchInitializeZhangShuDiagnostics(view_, shape_)))
+    {
+      ReportCudaSetupFailure(evidence.rank,
+                             "initialize-positivity-diagnostics");
       return false;
     }
     CudaBeginTrueSystemDiagnostic(rank_);
@@ -2916,6 +2943,9 @@ public:
     const state_slot prior_committed = committed_slot_;
     committed_slot_ = candidate_slot_;
     candidate_slot_ = prior_committed;
+    if (positivity_limiter_enabled_)
+      std::swap(committed_limiter_diagnostics_,
+                candidate_limiter_diagnostics_);
   }
   /** Certify only a final scalar-projected candidate after logical commit. */
   void MarkCommittedScalarClosureCoherent() noexcept
@@ -5176,10 +5206,14 @@ public:
                       CudaMutableHostL2Output destination) noexcept;
   bool ExportFields(
       const CudaInteriorState& source,
-      generic::HdgEulerHostInteriorFields destination) noexcept;
+      generic::HdgEulerHostInteriorFields destination,
+      bool prepared_diagnostics) noexcept;
 
 private:
   friend struct CudaQualificationTestAccess;
+
+  /** Seed one attempt's transactional diagnostic slot from accepted history. */
+  bool SeedCandidateLimiterDiagnostics() noexcept;
 
   static bool IgrActive(const CudaConfig& config) noexcept
   {
@@ -5873,6 +5907,12 @@ private:
       valid = valid && checked_product(element_faces, conserved_components,
                                        layout.boundary_reference);
       layout.boundary_pressure = element_faces;
+      if (positivity_limiter_enabled_)
+        valid = valid && checked_product(
+                elements, 4, layout.positivity_diagnostics) &&
+            checked_product(static_cast<std::size_t>(4),
+                            scalar_interior_dofs,
+                            layout.limiter_vertex_shape);
       layout.native_ilu_inverse_diagonal =
           native_trace && CudaTracePreconditionerIsIlu(
               trace_policy_descriptor_.trace_preconditioner)
@@ -5918,6 +5958,9 @@ private:
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points, 0.0);
       host_face_normal_.assign(generic ? layout.face_normal :
           static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * dimension, 0.0);
+      host_limiter_vertex_shape_.assign(
+          positivity_limiter_enabled_ ? layout.limiter_vertex_shape : 0,
+          0.0);
       host_face_h_.assign(generic && shape_.igr_active ? layout.face_h : 0,
                           1.0);
       host_boundary_reference_.assign(generic &&
@@ -5939,6 +5982,8 @@ private:
                                  : conserved_components) *
               shape_.scalar_interior_dofs,
           0.0);
+      host_export_positivity_.assign(
+          positivity_limiter_enabled_ ? 2 * host_elements : 0, 1.0);
       signed_element_interior_.assign(host_interior, 0);
       host_matrix_owned_source_.assign(host_matrix, 0);
       host_matrix_owned_section_.assign(host_matrix, 0);
@@ -5995,6 +6040,9 @@ private:
           (!shape_.borrowed_static_boundary_policies ||
            (checked_add(doubles, layout.boundary_reference) &&
             checked_add(doubles, layout.boundary_pressure))) &&
+          (!positivity_limiter_enabled_ ||
+           (checked_add(doubles, layout.positivity_diagnostics) &&
+            checked_add(doubles, layout.limiter_vertex_shape))) &&
           (!partitioned_backward_euler_ ||
            checked_add(doubles, layout.partitioned_base_interior)) &&
           (!rodas3_ ||
@@ -6259,6 +6307,9 @@ private:
   bool oracle_capture_requested_ = false;
   bool partitioned_backward_euler_ = false;
   bool rodas3_ = false;
+  bool positivity_limiter_enabled_ = false;
+  int committed_limiter_diagnostics_ = 0;
+  int candidate_limiter_diagnostics_ = 1;
   bool committed_scalar_closure_coherent_ = false;
   StateHash committed_scalar_closure_interior_hash_{};
   StateHash committed_scalar_closure_trace_hash_{};
@@ -6300,6 +6351,7 @@ private:
       rank_one_equilibration_host_control_{};
   std::vector<double> host_true_diag_values_{};
   std::vector<double> host_true_offd_values_{};
+  std::vector<double> host_export_positivity_{};
   double* double_arena_ = nullptr;
   int* integer_arena_ = nullptr;
   // False-mode retains the literal W8A capacities and BindArenaViews branch.
@@ -6394,6 +6446,7 @@ private:
   std::vector<double> host_face_trace_shape_{};
   std::vector<double> host_face_weight_{};
   std::vector<double> host_face_normal_{};
+  std::vector<double> host_limiter_vertex_shape_{};
   std::vector<double> host_face_h_{};
   std::vector<double> host_boundary_reference_{};
   std::vector<double> host_boundary_pressure_{};

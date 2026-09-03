@@ -234,6 +234,61 @@ set_tests_properties(dg_igr_hdg_main_backend_cpu_rodas3_fixed_rank1 PROPERTIES
   RESOURCE_LOCK hdg_generic_euler_cpu
   TIMEOUT 1200)
 
+add_test(NAME dg_igr_hdg_main_backend_cpu_backward_euler_rejects_zhang_shu_rank1
+  COMMAND "${CMAKE_COMMAND}"
+    "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+    "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cpu-backward-euler-rejects-zhang-shu-rank1-output"
+    "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+    "-DHDG_MAIN_DEVICE=cpu"
+    "-DHDG_MAIN_REGULARIZATION=none"
+    "-DHDG_MAIN_ORDER=1"
+    "-DHDG_MAIN_N=3"
+    "-DHDG_MAIN_RANKS=1"
+    "-DHDG_MAIN_TIME_INTEGRATOR=backward-euler"
+    "-DHDG_MAIN_POSITIVITY_LIMITER=zhang-shu"
+    "-DHDG_MAIN_DT=0.00001"
+    "-DHDG_MAIN_T_FINAL=0.00001"
+    "-DHDG_MAIN_NO_VTK=ON"
+    "-DHDG_MAIN_EXPECT_REJECTION_PATTERN=RODAS3-only typed opt-in"
+    "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+    "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+set_tests_properties(
+  dg_igr_hdg_main_backend_cpu_backward_euler_rejects_zhang_shu_rank1
+  PROPERTIES
+    LABELS "hdg;main-backend;cpu;backward-euler;zhang-shu;negative;process"
+    PROCESSORS 1
+    RESOURCE_LOCK hdg_generic_euler_cpu
+    TIMEOUT 1200)
+
+add_test(NAME dg_igr_hdg_main_backend_cpu_rejects_conflicting_c_alpha_rank1
+  COMMAND "${CMAKE_COMMAND}"
+    "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
+    "-DHDG_MAIN_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/cpu-rejects-conflicting-c-alpha-rank1-output"
+    "-DHDG_MAIN_MESH=${PROJECT_SOURCE_DIR}/examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n3.mesh"
+    "-DHDG_MAIN_DEVICE=cpu"
+    "-DHDG_MAIN_REGULARIZATION=igr"
+    "-DHDG_MAIN_ORDER=1"
+    "-DHDG_MAIN_N=3"
+    "-DHDG_MAIN_RANKS=1"
+    "-DHDG_MAIN_TIME_INTEGRATOR=rodas3"
+    "-DHDG_MAIN_C_ALPHA=0.5"
+    "-DHDG_MAIN_HDG_IGR_ALPHA=1.0"
+    "-DHDG_MAIN_DT=0.00001"
+    "-DHDG_MAIN_T_FINAL=0.00001"
+    "-DHDG_MAIN_NO_VTK=ON"
+    "-DHDG_MAIN_EXPECT_REJECTION_PATTERN=Conflicting HDG IGR C_alpha values"
+    "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
+    "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
+set_tests_properties(
+  dg_igr_hdg_main_backend_cpu_rejects_conflicting_c_alpha_rank1
+  PROPERTIES
+    LABELS "hdg;main-backend;cpu;igr;c-alpha;negative;process"
+    PROCESSORS 1
+    RESOURCE_LOCK hdg_generic_euler_cpu
+    TIMEOUT 1200)
+
 add_test(NAME dg_igr_hdg_main_backend_cpu_rodas3_adaptive_rejection_rank1
   COMMAND "${CMAKE_COMMAND}"
     "-DHDG_MAIN_EXECUTABLE=$<TARGET_FILE:dgsem_smooth_advection_periodic>"
@@ -245,6 +300,12 @@ add_test(NAME dg_igr_hdg_main_backend_cpu_rodas3_adaptive_rejection_rank1
     "-DHDG_MAIN_N=3"
     "-DHDG_MAIN_RANKS=1"
     "-DHDG_MAIN_TIME_INTEGRATOR=rodas3"
+    "-DHDG_MAIN_POSITIVITY_LIMITER=zhang-shu"
+    "-DHDG_MAIN_ZHANG_SHU_POINTS=quadrature"
+    "-DHDG_MAIN_EXPECT_POSITIVITY_LIMITER=zhang-shu"
+    "-DHDG_MAIN_EXPECT_ZHANG_SHU_POINTS=quadrature"
+    "-DHDG_MAIN_VTK_ZHANG_SHU_DIAGNOSTICS=ON"
+    "-DHDG_MAIN_EXPECT_ZHANG_SHU_FIELDS=ON"
     "-DHDG_MAIN_DT=-0.001"
     "-DHDG_MAIN_DT_MIN=1e-8"
     "-DHDG_MAIN_TIME_ATOL=1e-10"
@@ -261,7 +322,7 @@ add_test(NAME dg_igr_hdg_main_backend_cpu_rodas3_adaptive_rejection_rank1
     -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
 set_tests_properties(
   dg_igr_hdg_main_backend_cpu_rodas3_adaptive_rejection_rank1 PROPERTIES
-    LABELS "hdg;main-backend;cpu;rodas3;adaptive;rejection;rollback;output-landing;process"
+    LABELS "hdg;main-backend;cpu;rodas3;adaptive;rejection;rollback;output-landing;zhang-shu;limiter-diagnostics;process"
     PROCESSORS 1
     RESOURCE_LOCK hdg_generic_euler_cpu
     TIMEOUT 1200)
@@ -428,6 +489,33 @@ set_tests_properties(
     PROCESSORS 1
     RESOURCE_LOCK hdg_generic_euler_cpu
     TIMEOUT 300)
+
+if(TARGET sedov_taylor_blast)
+  add_test(NAME dg_igr_hdg_main_backend_cpu_rodas3_igr_sedov_p1_rank1_fixed
+    COMMAND $<TARGET_FILE:sedov_taylor_blast>
+      --discretization hdg
+      --device cpu
+      --regularization igr
+      --time-integrator rodas3
+      --positivity-limiter none
+      --hdg-igr-alpha 1
+      --mesh ${PROJECT_SOURCE_DIR}/examples/sedov_taylor_blast/sedov_taylor.msh
+      --order 1
+      --serial-refine 0
+      --parallel-refine 0
+      --time-step 0.000001
+      --t-final 0.000001
+      --no-vtk_save
+      --no-glvis)
+  set_tests_properties(
+    dg_igr_hdg_main_backend_cpu_rodas3_igr_sedov_p1_rank1_fixed PROPERTIES
+      LABELS "hdg;main-backend;cpu;igr;rodas3;sedov;p1;rank1;slip;fixed-step;limiter-off;no-vtk;application"
+      PASS_REGULAR_EXPRESSION
+        "\\[hdg-main\\] status=Success step=1.*time=1e-06.*time_treatment=rodas3.*regularization=igr.*c_alpha=1"
+      PROCESSORS 1
+      RESOURCE_LOCK hdg_generic_euler_cpu
+      TIMEOUT 1200)
+endif()
 endif()
 
 if(MFEM_USE_CUDA)
@@ -1012,18 +1100,28 @@ if(MFEM_USE_CUDA)
       "-DHDG_MAIN_N=3"
       "-DHDG_MAIN_RANKS=1"
       "-DHDG_MAIN_TIME_INTEGRATOR=rodas3"
+      "-DHDG_MAIN_C_ALPHA=0.5"
+      "-DHDG_MAIN_EXPECT_C_ALPHA=0.5"
+      "-DHDG_MAIN_POSITIVITY_LIMITER=zhang-shu"
+      "-DHDG_MAIN_ZHANG_SHU_POINTS=quadrature"
+      "-DHDG_MAIN_EXPECT_POSITIVITY_LIMITER=zhang-shu"
+      "-DHDG_MAIN_EXPECT_ZHANG_SHU_POINTS=quadrature"
+      "-DHDG_MAIN_VTK_ZHANG_SHU_DIAGNOSTICS=ON"
+      "-DHDG_MAIN_EXPECT_ZHANG_SHU_FIELDS=ON"
       "-DHDG_MAIN_DT=0.000001"
       "-DHDG_MAIN_T_FINAL=0.000001"
+      "-DHDG_MAIN_DT_SAVE=0.000001"
       "-DHDG_MAIN_EXPECTED_STEPS=1"
       "-DHDG_MAIN_EXPECTED_FINAL_TIME=1e-06"
-      "-DHDG_MAIN_NO_VTK=ON"
+      "-DHDG_MAIN_EXPECTED_CYCLES=000000,000001"
+      "-DHDG_MAIN_EXPECTED_TIMES=0,1e-06"
       "-DHDG_MAIN_MPIEXEC=${MPIEXEC_EXECUTABLE}"
       "-DHDG_MAIN_NUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_generic_process.cmake")
   set_tests_properties(
     dg_igr_hdg_main_backend_cuda_tensor_rodas3_igr_p2_rank1_fixed
     PROPERTIES
-      LABELS "hdg;main-backend;cuda;tensor;igr;rodas3;p2;rank1;fixed-step;process;no-vtk"
+      LABELS "hdg;main-backend;cuda;tensor;igr;rodas3;p2;rank1;fixed-step;vtk;zhang-shu;limiter-diagnostics;process"
       PROCESSORS 1
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 1200)
@@ -1193,7 +1291,7 @@ if(MFEM_USE_CUDA)
       PROPERTIES
         LABELS "hdg;main-backend;cuda;tensor;igr;backward-euler;monolithic;p2;rank1;physical;cylinder;fixed-step;no-vtk;application"
         PASS_REGULAR_EXPRESSION
-          "\\[hdg-main\\] status=Success step=5.*time=5e-05.*cuda_engine=tensor.*time_treatment=backward-euler.*fallback_count=0.*regularization=igr"
+          "\\[hdg-main\\] status=Success step=5.*time=5e-05.*cuda_engine=tensor.*time_treatment=backward-euler.*fallback_count=0.*regularization=igr.*c_alpha=1.*alpha_effective=0.0104992.*alpha_length_policy=max.*h_eff=0.102466"
         PROCESSORS 1
         RESOURCE_LOCK dg_igr_sm120
         TIMEOUT 1200)
@@ -1219,7 +1317,7 @@ if(MFEM_USE_CUDA)
       PROPERTIES
         LABELS "hdg;main-backend;cuda;tensor;igr;partitioned-backward-euler;p2;rank1;physical;cylinder;fixed-step;no-vtk;application"
         PASS_REGULAR_EXPRESSION
-          "\\[hdg-main\\] status=Success step=5.*time=5e-05.*cuda_engine=tensor.*time_treatment=partitioned-backward-euler.*fallback_count=0.*regularization=igr"
+          "\\[hdg-main\\] status=Success step=5.*time=5e-05.*cuda_engine=tensor.*time_treatment=partitioned-backward-euler.*fallback_count=0.*regularization=igr.*c_alpha=1.*alpha_effective=0.0104992.*alpha_length_policy=max.*h_eff=0.102466"
         PROCESSORS 1
         RESOURCE_LOCK dg_igr_sm120
         TIMEOUT 1200)
@@ -1245,7 +1343,37 @@ if(MFEM_USE_CUDA)
       PROPERTIES
         LABELS "hdg;main-backend;cuda;tensor;igr;rodas3;p2;rank1;physical;cylinder;fixed-step;no-vtk;application"
         PASS_REGULAR_EXPRESSION
-          "\\[hdg-main\\] status=Success step=5.*time=5e-05.*cuda_engine=tensor.*time_treatment=rodas3.*fallback_count=0.*regularization=igr"
+          "\\[hdg-main\\] status=Success step=5.*time=5e-05.*cuda_engine=tensor.*time_treatment=rodas3.*fallback_count=0.*regularization=igr.*c_alpha=1.*alpha_effective=0.0104992.*alpha_length_policy=max.*h_eff=0.102466"
+        PROCESSORS 1
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 1200)
+  endif()
+
+  if(TARGET sedov_taylor_blast)
+    add_test(
+      NAME dg_igr_hdg_main_backend_cuda_tensor_rodas3_igr_sedov_p1_rank1_fixed
+      COMMAND $<TARGET_FILE:sedov_taylor_blast>
+        --discretization hdg
+        --device cuda
+        --hdg-cuda-engine tensor
+        --regularization igr
+        --time-integrator rodas3
+        --positivity-limiter none
+        --hdg-igr-alpha 1
+        --mesh ${PROJECT_SOURCE_DIR}/examples/sedov_taylor_blast/sedov_taylor.msh
+        --order 1
+        --serial-refine 0
+        --parallel-refine 0
+        --time-step 0.000001
+        --t-final 0.000001
+        --no-vtk_save
+        --no-glvis)
+    set_tests_properties(
+      dg_igr_hdg_main_backend_cuda_tensor_rodas3_igr_sedov_p1_rank1_fixed
+      PROPERTIES
+        LABELS "hdg;main-backend;cuda;tensor;igr;rodas3;sedov;p1;rank1;slip;fixed-step;limiter-off;no-vtk;application"
+        PASS_REGULAR_EXPRESSION
+          "\\[hdg-main\\] status=Success step=1.*time=1e-06.*cuda_engine=tensor.*time_treatment=rodas3.*fallback_count=0.*regularization=igr.*c_alpha=1"
         PROCESSORS 1
         RESOURCE_LOCK dg_igr_sm120
         TIMEOUT 1200)

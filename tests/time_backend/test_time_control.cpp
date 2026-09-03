@@ -285,6 +285,41 @@ int main()
   }
 
   {
+    constexpr double output_interval = 0.025;
+    constexpr double final_time = 0.2;
+    StepPlanCursor cursor(TimeControl::CFL(0.0, final_time, 0.5),
+                          OutputSchedule::FixedInterval(output_interval));
+    for (std::uint64_t cycle = 1; cycle <= 5; ++cycle)
+    {
+      const auto output = cursor.Commit(cursor.Plan(0.03));
+      checks.Expect(output && output->cycle == cycle,
+                    "boundary-rounding setup advances the preceding output cycles");
+    }
+    cursor.Commit(cursor.Plan(0.02));
+
+    const double output_time = 6.0 * output_interval;
+    const double output_dt = output_time - cursor.time();
+    const double just_below_output_dt =
+        std::nextafter(output_dt, 0.0);
+    checks.Expect(just_below_output_dt < output_dt &&
+                      cursor.time() + just_below_output_dt == output_time,
+                  "boundary-rounding regression setup straddles one ULP");
+
+    const StepPlan first = cursor.Plan(just_below_output_dt);
+    checks.Expect(first.dt == just_below_output_dt &&
+                      first.end_time == output_time &&
+                      first.hits_scheduled_output &&
+                      first.scheduled_cycle == 6,
+                  "a rounded endpoint advances its exact output boundary without increasing dt");
+    const auto output = cursor.Commit(first);
+    const StepPlan second = cursor.Plan(0.001);
+    checks.Expect(output && output->cycle == 6 &&
+                      output->time == output_time && second.dt > 0.0 &&
+                      second.start_time == output_time,
+                  "the output cursor advances after a one-ULP boundary landing");
+  }
+
+  {
     StepPlanCursor cursor(TimeControl::Fixed(0.0, 1.0, 1.0),
                           OutputSchedule::Explicit({0.0, 0.4, 0.8},
                                                    InitialOutputPolicy::Suppress,

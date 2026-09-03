@@ -555,6 +555,25 @@ struct Solver
     if (request_resolution.discretization == Discretization::HDG)
     {
 #if defined(DG_IGR_HAS_HDG_MAIN_BACKEND) && DG_IGR_HAS_HDG_MAIN_BACKEND
+      const bool c_alpha_overridden = HasCAlphaOptionOverride(argc, argv);
+      const bool hdg_igr_alpha_overridden =
+        HasHdgIgrAlphaOptionOverride(argc, argv);
+      if (c_alpha_overridden && hdg_igr_alpha_overridden &&
+          cli_igr_opts.c_alpha_user != cli_opts.hdg_igr_alpha)
+      {
+        if (mfem::Mpi::Root())
+        {
+          std::cerr << "Conflicting HDG IGR C_alpha values: --c-alpha="
+                    << cli_igr_opts.c_alpha_user
+                    << " and --hdg-igr-alpha=" << cli_opts.hdg_igr_alpha
+                    << ". Use one spelling or supply the same value to both.\n";
+        }
+        return 1;
+      }
+      if (c_alpha_overridden)
+      {
+        cli_opts.hdg_igr_alpha = cli_igr_opts.c_alpha_user;
+      }
       MFEM_VERIFY(static_cast<bool>(spec.make_hdg_case_data),
                   "Case '" << case_cfg.case_name
                             << "' does not provide an HDG backend adapter.");
@@ -567,8 +586,19 @@ struct Solver
       {
         return spec.make_hdg_case_data(case_opts, case_cfg, cli_opts, context);
       };
+      const std::optional<dg_igr::IGRAlphaLengthScalePolicy>
+        hdg_alpha_length_policy_override =
+          cli_igr_opts.alpha_length_policy.empty()
+            ? std::nullopt
+            : std::optional<dg_igr::IGRAlphaLengthScalePolicy>{
+                ParseIGRAlphaLengthScalePolicy(
+                  cli_igr_opts.alpha_length_policy)};
       const hdg::HdgEulerMainRequest hdg_request{
-        case_cfg, cli_opts, make_hdg_case_data, MPI_COMM_WORLD};
+        case_cfg,
+        cli_opts,
+        make_hdg_case_data,
+        MPI_COMM_WORLD,
+        hdg_alpha_length_policy_override};
 #if defined(MFEM_USE_CUDA)
       // The CUDA HDG adapter returns before the legacy device construction
       // below.  Keep this device alive for its entire generic backend call so
@@ -677,7 +707,7 @@ struct Solver
       spec.diagnostics.zhang_shu_limiter &&
       run_cfg.opts.vtk_save &&
       run_cfg.opts.vtk_zhang_shu_diagnostics &&
-      case_cfg.limiter_pipeline.zhang_shu;
+      run_cfg.case_config.limiter_pipeline.zhang_shu;
     const bool need_h1 = spec.need_h1 || enable_h1_vis_diag;
     ExampleContext ctx = BuildExampleContext(run_cfg,
                                              run_cfg.igr_opts.space,
@@ -699,22 +729,24 @@ struct Solver
     }
 
     mfem::RK3SSPWithLimiter rk3 =
-      MakeRK3Stepper(ctx.spaces.vfes, ctx.dim, case_cfg.rk3_config);
+      MakeRK3Stepper(ctx.spaces.vfes, ctx.dim,
+                     run_cfg.case_config.rk3_config);
     if (run_cfg.dg_backend == DGBackend::DG)
     {
       const int dg_face_qord =
-        2 * ctx.spaces.vfes.GetFE(0)->GetOrder() + case_cfg.int_order_offset;
+        2 * ctx.spaces.vfes.GetFE(0)->GetOrder() +
+        run_cfg.case_config.int_order_offset;
       rk3.SetLimiterFaceQuadratureOrders({dg_face_qord});
     }
     ConfigureLimiterPipeline(rk3,
-                             case_cfg.limiter_pipeline,
+                             run_cfg.case_config.limiter_pipeline,
                              ctx.spaces.vfes,
                              ctx.dim,
-                             case_cfg.gamma);
+                             run_cfg.case_config.gamma);
     rk3.EnableStageNanScan(run_cfg.opts.nan_scan);
     rk3.EnableStageAdmissibilityScan(run_cfg.opts.admissibility_scan);
 
-    const double rho_floor = case_cfg.rk3_config.rho_min;
+    const double rho_floor = run_cfg.case_config.rk3_config.rho_min;
     std::unique_ptr<dg_igr::IGRSolver> igr;
     double vtk_c_alpha = spec.vtk.c_alpha_value;
     if (use_igr)

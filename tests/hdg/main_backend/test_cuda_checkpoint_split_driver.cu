@@ -343,7 +343,7 @@ int Run(const Arguments& arguments)
       { return MakeCaseData(context, order, arguments.perturb_initial,
                             arguments.perturb_source); };
   const dg_sim::hdg::HdgEulerMainRequest request{
-      case_config, options, factory, MPI_COMM_WORLD};
+      case_config, options, factory, MPI_COMM_WORLD, {}};
   return dg_sim::hdg::RunEulerMainBackend(request);
 }
 

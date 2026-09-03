@@ -208,6 +208,32 @@ BuildHostGeometryAndMaps(const CudaConfig& config) noexcept
                 0.0);
     }
   }
+  if (positivity_limiter_enabled_)
+  {
+    const mfem::FiniteElement* const reference_element =
+        interior_space_->GetFE(0);
+    const mfem::IntegrationRule* const vertices = reference_element
+        ? mfem::Geometries.GetVertices(reference_element->GetGeomType())
+        : nullptr;
+    if (reference_element == nullptr || vertices == nullptr ||
+        vertices->GetNPoints() != 4 ||
+        host_limiter_vertex_shape_.size() !=
+            static_cast<std::size_t>(4 * shape_.scalar_interior_dofs))
+      return false;
+    mfem::Vector vertex_shape(shape_.scalar_interior_dofs);
+    for (int vertex = 0; vertex < 4; ++vertex)
+    {
+      reference_element->CalcShape(vertices->IntPoint(vertex), vertex_shape);
+      for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
+      {
+        const double value = vertex_shape[scalar];
+        if (!std::isfinite(value)) return false;
+        host_limiter_vertex_shape_[
+            static_cast<std::size_t>(vertex) *
+                shape_.scalar_interior_dofs + scalar] = value;
+      }
+    }
+  }
   for (int element = 0; element < shape_.elements; ++element)
   {
     const mfem::FiniteElement* fe = interior_space_->GetFE(element);
@@ -762,8 +788,38 @@ ExportInterior(const CudaInteriorState& source,
 
 template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+SeedCandidateLimiterDiagnostics() noexcept
+{
+  const std::size_t elements = static_cast<std::size_t>(shape_.elements);
+  const std::size_t value_count = 2 * elements;
+  const bool local_valid = initialized_ && positivity_limiter_enabled_ &&
+      elements > 0 && committed_limiter_diagnostics_ >= 0 &&
+      committed_limiter_diagnostics_ < 2 &&
+      candidate_limiter_diagnostics_ >= 0 &&
+      candidate_limiter_diagnostics_ < 2 &&
+      committed_limiter_diagnostics_ != candidate_limiter_diagnostics_ &&
+      view_.positivity_theta_rho[committed_limiter_diagnostics_] != nullptr &&
+      view_.positivity_theta_p[committed_limiter_diagnostics_] ==
+          view_.positivity_theta_rho[committed_limiter_diagnostics_] +
+              shape_.elements &&
+      view_.positivity_theta_rho[candidate_limiter_diagnostics_] != nullptr &&
+      view_.positivity_theta_p[candidate_limiter_diagnostics_] ==
+          view_.positivity_theta_rho[candidate_limiter_diagnostics_] +
+              shape_.elements;
+  if (!CollectiveContinue(local_valid)) return false;
+  const bool copied = TransportPolicy::DeviceToDevice(
+      view_.positivity_theta_rho[candidate_limiter_diagnostics_],
+      view_.positivity_theta_rho[committed_limiter_diagnostics_],
+      value_count * sizeof(double), CudaTransferCategory::attempt_history,
+      CudaTransferSite::attempt_seed_interior);
+  return CollectiveContinue(copied);
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 ExportFields(const CudaInteriorState& source,
-             const generic::HdgEulerHostInteriorFields destination) noexcept
+             const generic::HdgEulerHostInteriorFields destination,
+             const bool prepared_diagnostics) noexcept
 {
   const std::size_t scalar_count =
       static_cast<std::size_t>(interior_space_->GetVSize() /
@@ -773,12 +829,34 @@ ExportFields(const CudaInteriorState& source,
       ? igr_published_components : conserved_components;
   const std::size_t coefficient_count = scalar_count *
       static_cast<std::size_t>(output_components);
+  const bool any_limiter_diagnostics =
+      destination.zhang_shu_theta_rho != nullptr ||
+      destination.zhang_shu_theta_p != nullptr ||
+      destination.zhang_shu_element_count != 0;
+  const bool limiter_diagnostics_requested =
+      destination.zhang_shu_theta_rho != nullptr &&
+      destination.zhang_shu_theta_p != nullptr &&
+      destination.zhang_shu_element_count ==
+          static_cast<std::size_t>(shape_.elements);
+  const int diagnostic_slot = prepared_diagnostics
+      ? candidate_limiter_diagnostics_
+      : committed_limiter_diagnostics_;
+  const bool limiter_diagnostics_ready =
+      !any_limiter_diagnostics ||
+      (limiter_diagnostics_requested && positivity_limiter_enabled_ &&
+       diagnostic_slot >= 0 && diagnostic_slot < 2 &&
+       view_.positivity_theta_rho[diagnostic_slot] != nullptr &&
+       view_.positivity_theta_p[diagnostic_slot] ==
+           view_.positivity_theta_rho[diagnostic_slot] + shape_.elements &&
+       host_export_positivity_.size() ==
+           2 * destination.zhang_shu_element_count);
   bool local_valid = initialized_ && borrowed_host_inputs_ &&
       source.coefficients != nullptr && source.count ==
           static_cast<std::size_t>(shape_.interior_count) &&
       destination.scalar_count == scalar_count &&
       (destination.conservative_coefficients != nullptr || scalar_count == 0) &&
-      (!sigma_requested || shape_.igr_active);
+      (!sigma_requested || shape_.igr_active) &&
+      limiter_diagnostics_ready;
   // Validate the complete reverse scatter before launching or transferring,
   // so a rejected request cannot partially overwrite either caller field.
   for (int element = 0; local_valid && element < shape_.elements; ++element)
@@ -813,8 +891,30 @@ ExportFields(const CudaInteriorState& source,
           coefficient_count * sizeof(double),
           CudaTransferCategory::generic_host_bridge,
           CudaTransferSite::generic_host_export) &&
+      (!limiter_diagnostics_requested ||
+       TransportPolicy::DeviceToHost(
+           host_export_positivity_.data(),
+           view_.positivity_theta_rho[diagnostic_slot],
+           2 * destination.zhang_shu_element_count * sizeof(double),
+           CudaTransferCategory::generic_host_bridge,
+           CudaTransferSite::generic_host_export)) &&
       TransportPolicy::Synchronize(CudaTransferSite::generic_host_export);
   if (!CollectiveContinue(copied)) { return false; }
+  bool limiter_values_valid = true;
+  if (limiter_diagnostics_requested)
+  {
+    const std::size_t elements = destination.zhang_shu_element_count;
+    for (std::size_t element = 0;
+         element < elements && limiter_values_valid; ++element)
+    {
+      const double theta_rho = host_export_positivity_[element];
+      const double theta_p = host_export_positivity_[elements + element];
+      limiter_values_valid = std::isfinite(theta_rho) &&
+          theta_rho >= 0.0 && theta_rho <= 1.0 &&
+          std::isfinite(theta_p) && theta_p >= 0.0 && theta_p <= 1.0;
+    }
+  }
+  if (!CollectiveContinue(limiter_values_valid)) { return false; }
   for (int element = 0; element < shape_.elements; ++element)
     for (int component = 0; component < output_components; ++component)
       for (int scalar = 0; scalar < shape_.scalar_interior_dofs; ++scalar)
@@ -838,6 +938,17 @@ ExportFields(const CudaInteriorState& source,
                 value;
       }
     }
+  if (limiter_diagnostics_requested)
+  {
+    const std::size_t elements = destination.zhang_shu_element_count;
+    for (std::size_t element = 0; element < elements; ++element)
+    {
+      const double theta_rho = host_export_positivity_[element];
+      const double theta_p = host_export_positivity_[elements + element];
+      destination.zhang_shu_theta_rho[element] = theta_rho;
+      destination.zhang_shu_theta_p[element] = theta_p;
+    }
+  }
   return true;
 }
 
@@ -989,6 +1100,9 @@ BindArenaViews() noexcept
       static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points);
   view_.face_normal = take_d(generic ? generic_arena_layout_.face_normal :
       static_cast<std::size_t>(maximum_rank_elements) * faces_per_element * maximum_face_points * dimension);
+  if (positivity_limiter_enabled_)
+    view_.limiter_vertex_shape = take_d(
+        generic_arena_layout_.limiter_vertex_shape);
   if (shape_.igr_active)
     view_.face_h = generic && shape_.igr_active
         ? take_d(generic_arena_layout_.face_h) : nullptr;
@@ -1008,6 +1122,16 @@ BindArenaViews() noexcept
         generic_arena_layout_.boundary_reference : 0);
     view_.boundary_pressure = take_d(generic ?
         generic_arena_layout_.boundary_pressure : 0);
+  }
+  if (positivity_limiter_enabled_)
+  {
+    for (int slot = 0; slot < 2; ++slot)
+    {
+      view_.positivity_theta_rho[slot] =
+          take_d(generic_arena_layout_.elements);
+      view_.positivity_theta_p[slot] =
+          take_d(generic_arena_layout_.elements);
+    }
   }
   if (trace_solver_kind_ == CudaTraceSolverKind::native_rank1_fp64)
   {
@@ -1180,6 +1304,12 @@ UploadTopologyAndState() noexcept
            static_cast<std::size_t>(shape_.elements) * faces_per_element *
                shape_.face_points * dimension * sizeof(double),
            CudaTransferSite::quadrature_upload))
+    return false;
+  if (positivity_limiter_enabled_ &&
+      !h2d(view_.limiter_vertex_shape,
+           host_limiter_vertex_shape_.data(),
+           static_cast<std::size_t>(4 * shape_.scalar_interior_dofs) *
+               sizeof(double), CudaTransferSite::quadrature_upload))
     return false;
   if (shape_.igr_active &&
       !h2d(view_.face_h, host_face_h_.data(),
@@ -4232,13 +4362,77 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
     ++result.complete_recoveries;
     return true;
   };
-  const auto admissible = [&]() noexcept
+  constexpr unsigned rodas_admissibility_unknown_failure = 1U << 31U;
+  const auto classify_admissibility = [&](const char* const site,
+                                           const int stage,
+                                           unsigned& global_mask) noexcept
   {
-    const bool local = CudaLaunchAdmissibility(view_, shape_) &&
-        StatusPassed();
-    return CollectiveContinue(local);
+    global_mask = rodas_admissibility_unknown_failure;
+    const bool launched = CudaLaunchAdmissibility(view_, shape_);
+    const bool local_admissible = launched && StatusPassed();
+    if (CollectiveContinue(local_admissible))
+    {
+      global_mask = 0U;
+      return true;
+    }
+
+    // A failed attempt has no publishable state.  Copy only its bounded
+    // per-element classification so the lifecycle can distinguish a finite
+    // Uhat-only DAE inconsistency from a differential or nonfinite failure.
+    // The existing export buffer is deliberately reused: this slow path
+    // performs no allocation and retains no stage/event history.
+    unsigned local_mask = 0U;
+    bool local_probe_ready = launched;
+    if (!local_admissible && launched)
+    {
+      local_probe_ready =
+          host_export_interior_.size() >=
+              static_cast<std::size_t>(shape_.elements) &&
+          TransportPolicy::DeviceToHost(
+              host_export_interior_.data(), view_.status,
+              static_cast<std::size_t>(shape_.elements) * sizeof(double),
+              CudaTransferCategory::scalar_diagnostic,
+              CudaTransferSite::scalar_status) &&
+          TransportPolicy::Synchronize(CudaTransferSite::scalar_status);
+      bool classified = false;
+      if (local_probe_ready)
+      {
+        for (int element = 0; element < shape_.elements; ++element)
+        {
+          const double value = host_export_interior_[
+              static_cast<std::size_t>(element)];
+          if (value == 1.0) continue;
+          classified = true;
+          if (std::isfinite(value) && value < 0.0 &&
+              -value <= static_cast<double>(
+                  std::numeric_limits<unsigned>::max()))
+            local_mask |= static_cast<unsigned>(-value);
+          else
+            local_mask |= rodas_admissibility_unknown_failure;
+        }
+        if (!classified)
+          local_mask |= rodas_admissibility_unknown_failure;
+      }
+    }
+    if (!CollectiveContinue(local_probe_ready)) return false;
+    unsigned reduced_mask = 0U;
+    const bool reduced = MPI_Allreduce(
+        &local_mask, &reduced_mask, 1, MPI_UNSIGNED, MPI_BOR,
+        communicator_) == MPI_SUCCESS;
+    if (!CollectiveContinue(reduced)) return false;
+    global_mask = reduced_mask;
+    (void)site;
+    (void)stage;
+    return (global_mask & rodas_admissibility_unknown_failure) == 0U;
   };
-  const auto limit_rodas_state = [&](bool& active,
+  const auto admissible = [&](const char* const site,
+                              const int stage) noexcept
+  {
+    unsigned mask = 0U;
+    return classify_admissibility(site, stage, mask) && mask == 0U;
+  };
+  const auto limit_rodas_state = [&](const char* const site,
+                                     const int stage, bool& active,
                                      double& correction_norm) noexcept
   {
     active = false;
@@ -4246,12 +4440,15 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
     const auto& policy = config.numerical_policy.positivity_limiter;
     if (policy.kind == generic::EulerHdgPositivityLimiterKind::none)
       return true;
+    const bool seed_diagnostics = result.positivity_limiter_calls == 0;
     if (result.positivity_limiter_calls ==
         std::numeric_limits<std::uint64_t>::max())
       return false;
+    if (seed_diagnostics && !SeedCandidateLimiterDiagnostics()) return false;
     ++result.positivity_limiter_calls;
     const bool launched = CudaLaunchZhangShuU4(
-        view_, shape_, policy, view_.status_flag, view_.scalar);
+        view_, shape_, policy, candidate_limiter_diagnostics_,
+        view_.status_flag, view_.scalar);
     int local_classification = 2;
     double local_correction_squared =
         std::numeric_limits<double>::infinity();
@@ -4346,6 +4543,25 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
     }
     return CollectiveContinue(local_valid);
   };
+  const std::size_t interior_bytes = workspace.interior.count *
+      sizeof(double);
+  const std::size_t true_trace_bytes = workspace.trace.count *
+      sizeof(double);
+  const auto snapshot_algebraic_reference = [&]() noexcept
+  {
+    return TransportPolicy::DeviceToDevice(
+            view_.rodas_combination_interior,
+            workspace.interior.coefficients, interior_bytes,
+            CudaTransferCategory::attempt_history,
+            CudaTransferSite::nonlinear_base_interior) &&
+        TransportPolicy::DeviceToDevice(
+            view_.rodas_combination_true_trace,
+            workspace.trace.coefficients, true_trace_bytes,
+            CudaTransferCategory::attempt_history,
+            CudaTransferSite::nonlinear_base_trace) &&
+        TransportPolicy::Synchronize(
+            CudaTransferSite::nonlinear_base_trace);
+  };
   const auto project_algebraic = [&](double& initial_norm,
                                      double& final_norm) noexcept
   {
@@ -4382,13 +4598,10 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
     return false;
   };
 
-  const std::size_t interior_bytes = workspace.interior.count *
-      sizeof(double);
-  const std::size_t true_trace_bytes = workspace.trace.count *
-      sizeof(double);
   bool entry_limited = false;
   double entry_limiter_correction = 0.0;
-  if (!limit_rodas_state(entry_limited, entry_limiter_correction))
+  if (!limit_rodas_state(
+          "entry", -1, entry_limited, entry_limiter_correction))
   {
     result.phase = CudaFailurePhase::assembly;
     result.reason = FailureReason::admissibility_gate;
@@ -4473,7 +4686,8 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
     result.reason = FailureReason::recovery_gate;
     return result;
   }
-  if (!CollectiveContinue(CopyBase(workspace)) || !admissible())
+  if (!CollectiveContinue(CopyBase(workspace)) ||
+      !admissible("entry_projection", -1))
   {
     result.reason = FailureReason::admissibility_gate;
     return result;
@@ -4516,6 +4730,7 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
   }
 
   std::uint64_t common_generation = 0;
+  bool final_stage_reconstructed = false;
   for (std::size_t stage = 0; stage < Coefficients::stage_count; ++stage)
   {
     bool stage_limited = false;
@@ -4523,18 +4738,38 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
     if (!CollectiveContinue(CudaLaunchRodasLoadStage(view_, shape_, stage) &&
                             DistributeCurrentTrace(
                                 workspace.trace.coefficients)) ||
-        !limit_rodas_state(stage_limited, stage_limiter_correction))
+        !limit_rodas_state("stage", static_cast<int>(stage),
+                           stage_limited, stage_limiter_correction))
     {
       result.phase = CudaFailurePhase::assembly;
       result.reason = FailureReason::admissibility_gate;
       return result;
     }
     (void)stage_limiter_correction;
-    if (stage_limited)
+    unsigned stage_admissibility_mask = 0U;
+    if (!classify_admissibility(
+            "stage", static_cast<int>(stage),
+            stage_admissibility_mask))
     {
-      // Stages zero and one are the already coherent base state for this ROW
-      // tableau.  A correction there indicates that entry filtering was not
-      // requested/admitted and cannot safely be hidden as a stage mutation.
+      result.phase = CudaFailurePhase::assembly;
+      result.reason = FailureReason::backend_failure;
+      return result;
+    }
+
+    const bool stage_reconstructed = stage_limited;
+    if (stage_admissibility_mask != 0U && !stage_reconstructed)
+    {
+      result.phase = CudaFailurePhase::assembly;
+      result.reason = FailureReason::admissibility_gate;
+      return result;
+    }
+    if (stage + 1 == Coefficients::stage_count)
+      final_stage_reconstructed = stage_reconstructed;
+    if (stage_reconstructed)
+    {
+      // Stages zero and one are the common-shift base surfaces.  Only an
+      // explicitly selected, active U4 positivity map may replace a later
+      // causal stage and trigger exact fixed-U4 algebraic reconstruction.
       if (!CollectiveContinue(stage >= 2 && common_generation != 0))
       {
         result.phase = CudaFailurePhase::assembly;
@@ -4692,7 +4927,8 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
         return result;
       }
     }
-    if (!admissible())
+    if (stage_reconstructed &&
+        !admissible("stage_projection", static_cast<int>(stage)))
     {
       result.phase = CudaFailurePhase::assembly;
       result.reason = FailureReason::admissibility_gate;
@@ -4796,12 +5032,12 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
         : ilu_common_shift ? result.tensor_core.ilu_factor_setups : 0;
     const std::uint64_t reuses_before =
         ilu_common_shift ? result.tensor_core.ilu_factor_reuses : 0;
-    // A limiter-triggered algebraic projection invalidates and rebuilds the
+    // A stage algebraic reconstruction invalidates and rebuilds the
     // common-shift operator.  Its first subsequent solve is therefore a new
     // operator transition even when this is not tableau stage zero.  Calling
     // it a retained-RHS transition would (correctly) fail the generation
     // contract before the new Schwarz/ILU setup can be constructed.
-    const bool same_operator_new_rhs = stage != 0 && !stage_limited;
+    const bool same_operator_new_rhs = stage != 0 && !stage_reconstructed;
     if (!enter(CudaFailurePhase::trace_solve) ||
         !enter(CudaFailurePhase::recovery) ||
         !solve_and_recover(common_generation, same_operator_new_rhs, false) ||
@@ -4834,7 +5070,7 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
     const std::uint64_t reuse_delta = reuses_after - reuses_before;
     if (tensor_rank_one)
     {
-      if (stage == 0 || stage_limited)
+      if (stage == 0 || stage_reconstructed)
       {
         if (!CollectiveContinue(setup_delta > 0 && reuse_delta == 0))
         {
@@ -4897,12 +5133,12 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
     ++result.common_shift_trace_solves;
   }
 
-  const auto snapshot_endpoint_candidate = [&]() noexcept
+  const auto preserve_endpoint_base = [&]() noexcept
   {
     // The projector reuses base_* for its Newton snapshots.  Preserve both
-    // the coherent step-entry state needed by conservation and the original
-    // filtered high predictor needed by the algebraic-correction gate before
-    // a limiter-active endpoint is seeded from the coherent base.
+    // forms of the coherent step-entry state that remain live after the
+    // causal stages: U4 for estimation/conservation and the element-local
+    // trace for any subsequent reconstruction work.
     return TransportPolicy::DeviceToDevice(
             view_.rodas_residual_f, view_.base_interior, interior_bytes,
             CudaTransferCategory::attempt_history,
@@ -4912,22 +5148,12 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
             element_trace_bytes,
             CudaTransferCategory::attempt_history,
             CudaTransferSite::nonlinear_base_local_trace) &&
-        TransportPolicy::DeviceToDevice(
-            view_.rodas_combination_interior,
-            workspace.interior.coefficients, interior_bytes,
-            CudaTransferCategory::attempt_history,
-            CudaTransferSite::nonlinear_base_interior) &&
-        TransportPolicy::DeviceToDevice(
-            view_.rodas_combination_true_trace,
-            workspace.trace.coefficients,
-            workspace.trace.count * sizeof(double),
-            CudaTransferCategory::attempt_history,
-            CudaTransferSite::nonlinear_base_trace) &&
         TransportPolicy::Synchronize(
-            CudaTransferSite::nonlinear_base_trace);
+            CudaTransferSite::nonlinear_base_local_trace);
   };
 
-  if (!CollectiveContinue(CudaLaunchRodasFormCandidate(view_, shape_) &&
+  if (!CollectiveContinue(CudaLaunchRodasFormCandidate(
+                              view_, shape_, final_stage_reconstructed) &&
                           DistributeCurrentTrace(
                               workspace.trace.coefficients)))
   {
@@ -4938,25 +5164,34 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
   bool endpoint_projected = false;
   double endpoint_limiter_correction = 0.0;
   double final_projection_initial = 0.0;
-  if (!limit_rodas_state(endpoint_limited,
+  if (!limit_rodas_state("endpoint", -1, endpoint_limited,
                          endpoint_limiter_correction))
   {
     result.reason = FailureReason::admissibility_gate;
     return result;
   }
   (void)endpoint_limiter_correction;
+  if (!CollectiveContinue(preserve_endpoint_base()))
+  {
+    result.reason = FailureReason::backend_failure;
+    return result;
+  }
+  // The endpoint predictor is the independent algebraic-correction
+  // reference, including after a U4-only positivity map.  Snapshot it before
+  // any fixed-U4 Newton update so the tangent lift cannot evade the temporal
+  // error allowance.
+  if (!CollectiveContinue(snapshot_algebraic_reference()))
+  {
+    result.reason = FailureReason::backend_failure;
+    return result;
+  }
   if (endpoint_limited)
   {
     // A Zhang--Shu map owns U4 only.  The affine endpoint's auxiliary fields
-    // and trace are merely a predictor and may be inadmissible even when the
-    // filtered polynomial is valid.  Save that predictor for the correction
-    // gate, seed algebraic unknowns from the coherent base, then admit only
-    // the exactly reconstructed singular-mass state.
-    const bool seeded = snapshot_endpoint_candidate() &&
-        CudaLaunchRodasSeedAlgebraicProjection(view_, shape_);
-    if (!CollectiveContinue(seeded) ||
-        !DistributeCurrentTrace(workspace.trace.coefficients) ||
-        !project_algebraic(final_projection_initial,
+    // and trace are merely a predictor after U4 is filtered.  Keep those
+    // algebraic values as the Newton initial guess and independently bound
+    // the complete reconstruction needed to reach exact nonlinear closure.
+    if (!project_algebraic(final_projection_initial,
                            result.final_algebraic_residual))
     {
       result.reason = FailureReason::recovery_gate;
@@ -4965,9 +5200,9 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
     ++result.positivity_algebraic_projections;
     endpoint_projected = true;
 
-    // project_algebraic uses base_* as private iteration storage.  Restore
+    // project_algebraic uses base_* as private iteration storage. Restore
     // only the differential entry lanes needed by the filtered-pair scale;
-    // the protected high-predictor snapshot remains in rodas_combination_*.
+    // the protected preprojection reference remains in rodas_combination_*.
     if (!CollectiveContinue(CudaLaunchRodasCopyDifferentialState(
             shape_, view_.rodas_residual_f, view_.base_interior)))
     {
@@ -4975,7 +5210,7 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
       return result;
     }
   }
-  if (!admissible())
+  if (!admissible("endpoint", -1))
   {
     result.reason = FailureReason::admissibility_gate;
     return result;
@@ -5065,11 +5300,6 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
   // its projection before the filtered embedded estimate was formed.
   if (!endpoint_projected)
   {
-    if (!CollectiveContinue(snapshot_endpoint_candidate()))
-    {
-      result.reason = FailureReason::backend_failure;
-      return result;
-    }
     if (!project_algebraic(final_projection_initial,
                            result.final_algebraic_residual))
     {
@@ -5113,7 +5343,7 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
   if (!CollectiveContinue(correction_reduced && global_algebraic_count > 0 &&
                           std::isfinite(
                               result.final_algebraic_correction_norm)) ||
-      !admissible())
+      !admissible("final_projection", -1))
   {
     result.reason = FailureReason::recovery_gate;
     return result;
