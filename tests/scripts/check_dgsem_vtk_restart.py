@@ -1016,7 +1016,7 @@ def execute(args: argparse.Namespace, attempt: Path, runner: Runner) -> dict[str
     runtime = metadata.get("runtime", {})
     igr_linear = metadata.get("igr_linear", {})
     if (
-        metadata.get("schema_version") != 2
+        metadata.get("schema_version") != 3
         or metadata.get("restart", {}).get("cycle") != 1
         or metadata.get("performance", {}).get("segment_steps") != 1
         or runtime.get("dgsem_stabilization") != "none"
