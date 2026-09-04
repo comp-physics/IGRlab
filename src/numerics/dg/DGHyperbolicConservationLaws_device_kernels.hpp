@@ -15,6 +15,13 @@ constexpr int kFrozenSigmaNonfiniteCount_ = 2;
 constexpr int kFrozenSigmaMinimumRaw_ = 3;
 constexpr int kFrozenSigmaMinimumRatio_ = 4;
 
+enum FusedFaceKind_ : int
+{
+  kFusedInteriorFace_ = 0,
+  kFusedBoundaryFace_ = 1,
+  kFusedSharedFace_ = 2
+};
+
 #ifdef DG_IGR_HAS_ACCEL_FORALL
 MFEM_HOST_DEVICE inline bool FiniteTelemetryValue_(const double value)
 {
@@ -257,6 +264,110 @@ MFEM_HOST_DEVICE inline void SelectIGRFaceSpeeds_(
   dissipation_speed = sigma_aware_rusanov ? heuristic_speed : base_speed;
 }
 
+/** Assemble either the established Rusanov flux or the equal-penalty
+ * HDG-eliminated trace-centered flux from already evaluated side states.
+ *
+ * The trace state is an arithmetic conservative-state average. For active
+ * broken-L2 IGR its scalar trace is the arithmetic sigma average. The trace
+ * sample participates in both CFL and dissipation maxima, but is deliberately
+ * not recorded as an additional q_sigma telemetry sample: host and packed
+ * paths retain the established per-side coverage contract.
+ */
+MFEM_HOST_DEVICE inline void AssembleEulerFaceFlux_(
+  const real_t* state1,
+  const real_t* state2,
+  const real_t* normal,
+  int dim,
+  int neq,
+  real_t gamma,
+  real_t sigma1,
+  real_t sigma2,
+  real_t sigma_rho_floor,
+  real_t invariant_domain_pressure_floor,
+  bool use_sigma,
+  bool invariant_domain_flux,
+  bool sigma_aware_cfl,
+  bool sigma_aware_rusanov,
+  bool trace_centered,
+  const real_t* flux1,
+  const real_t* flux2,
+  real_t cfl_speed1,
+  real_t cfl_speed2,
+  real_t dissipation_speed1,
+  real_t dissipation_speed2,
+  real_t* flux_hat,
+  real_t& cfl_speed_max)
+{
+  real_t normal_norm2 = 0.0;
+  for (int d = 0; d < dim; ++d)
+  {
+    normal_norm2 += normal[d] * normal[d];
+  }
+  const real_t normal_norm = sqrt(normal_norm2);
+
+  if (!trace_centered)
+  {
+    const real_t scaled_max_speed =
+      fmax(dissipation_speed1, dissipation_speed2) * normal_norm;
+    cfl_speed_max = fmax(cfl_speed1, cfl_speed2);
+    for (int eq = 0; eq < neq; ++eq)
+    {
+      flux_hat[eq] =
+        0.5 * (scaled_max_speed * (state1[eq] - state2[eq]) +
+               flux1[eq] + flux2[eq]);
+    }
+    return;
+  }
+
+  real_t state_hat[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+  real_t flux_trace[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+  for (int eq = 0; eq < neq; ++eq)
+  {
+    state_hat[eq] = 0.5 * (state1[eq] + state2[eq]);
+  }
+  real_t trace_base_speed = 0.0;
+  ComputeEulerFluxDotN_(
+    state_hat, normal, dim, gamma, flux_trace, trace_base_speed);
+  real_t trace_cfl_speed = trace_base_speed;
+  real_t trace_dissipation_speed = trace_base_speed;
+  if (use_sigma)
+  {
+    const real_t sigma_hat = 0.5 * (sigma1 + sigma2);
+    AddSigmaDotNTerms_(state_hat,
+                       normal,
+                       dim,
+                       sigma_hat,
+                       sigma_rho_floor,
+                       flux_trace);
+    SelectIGRFaceSpeeds_(state_hat,
+                         normal,
+                         dim,
+                         gamma,
+                         trace_base_speed,
+                         sigma_hat,
+                         sigma_rho_floor,
+                         invariant_domain_pressure_floor,
+                         invariant_domain_flux,
+                         sigma_aware_cfl,
+                         sigma_aware_rusanov,
+                         /*q_sigma_telemetry_slot=*/nullptr,
+                         trace_cfl_speed,
+                         trace_dissipation_speed);
+  }
+
+  const real_t tau =
+    fmax(trace_dissipation_speed,
+         fmax(dissipation_speed1, dissipation_speed2));
+  const real_t scaled_tau = tau * normal_norm;
+  cfl_speed_max =
+    fmax(trace_cfl_speed, fmax(cfl_speed1, cfl_speed2));
+  for (int eq = 0; eq < neq; ++eq)
+  {
+    flux_hat[eq] = flux_trace[eq] +
+                   0.5 * scaled_tau * (state1[eq] - state2[eq]);
+  }
+}
+
 struct PackedInverseMassKernel
 {
   int dof = 0;
@@ -450,6 +561,7 @@ struct PackedInteriorFaceEulerRusanovKernel
   bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
+  bool trace_centered = false;
   const int* state_map = nullptr;
   const int* face_e1 = nullptr;
   const int* face_e2 = nullptr;
@@ -572,20 +684,31 @@ struct PackedInteriorFaceEulerRusanovKernel
                              dissipation_speed2);
       }
 
-      real_t normal_norm2 = 0.0;
-      for (int d = 0; d < dim; ++d)
-      {
-        normal_norm2 += normal[d] * normal[d];
-      }
-      const real_t scaled_max_speed =
-        fmax(dissipation_speed1, dissipation_speed2) * sqrt(normal_norm2);
-      speed_max = fmax(speed_max, fmax(cfl_speed1, cfl_speed2));
-
-      for (int eq = 0; eq < neq; ++eq)
-      {
-        flux_hat[eq] = 0.5 * (scaled_max_speed * (u1[eq] - u2[eq]) + flux1[eq] +
-                              flux2[eq]);
-      }
+      real_t sample_cfl_speed = 0.0;
+      AssembleEulerFaceFlux_(u1,
+                             u2,
+                             normal,
+                             dim,
+                             neq,
+                             gamma,
+                             sigma_1,
+                             sigma_2,
+                             sigma_rho_floor,
+                             invariant_domain_pressure_floor,
+                             use_sigma,
+                             invariant_domain_flux,
+                             sigma_aware_cfl,
+                             sigma_aware_rusanov,
+                             trace_centered,
+                             flux1,
+                             flux2,
+                             cfl_speed1,
+                             cfl_speed2,
+                             dissipation_speed1,
+                             dissipation_speed2,
+                             flux_hat,
+                             sample_cfl_speed);
+      speed_max = fmax(speed_max, sample_cfl_speed);
 
       const real_t wq = weights[face_q];
       for (int i = 0; i < dof; ++i)
@@ -620,6 +743,7 @@ struct PackedSharedFaceEulerRusanovKernel
   bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
+  bool trace_centered = false;
   const int* state_map = nullptr;
   const int* face_e1 = nullptr;
   const int* face_nbr_vdof_map = nullptr;
@@ -751,20 +875,31 @@ struct PackedSharedFaceEulerRusanovKernel
                              dissipation_speed2);
       }
 
-      real_t normal_norm2 = 0.0;
-      for (int d = 0; d < dim; ++d)
-      {
-        normal_norm2 += normal[d] * normal[d];
-      }
-      const real_t scaled_max_speed =
-        fmax(dissipation_speed1, dissipation_speed2) * sqrt(normal_norm2);
-      speed_max = fmax(speed_max, fmax(cfl_speed1, cfl_speed2));
-
-      for (int eq = 0; eq < neq; ++eq)
-      {
-        flux_hat[eq] = 0.5 * (scaled_max_speed * (u1[eq] - u2[eq]) + flux1[eq] +
-                              flux2[eq]);
-      }
+      real_t sample_cfl_speed = 0.0;
+      AssembleEulerFaceFlux_(u1,
+                             u2,
+                             normal,
+                             dim,
+                             neq,
+                             gamma,
+                             sigma_1,
+                             sigma_2,
+                             sigma_rho_floor,
+                             invariant_domain_pressure_floor,
+                             use_sigma,
+                             invariant_domain_flux,
+                             sigma_aware_cfl,
+                             sigma_aware_rusanov,
+                             trace_centered,
+                             flux1,
+                             flux2,
+                             cfl_speed1,
+                             cfl_speed2,
+                             dissipation_speed1,
+                             dissipation_speed2,
+                             flux_hat,
+                             sample_cfl_speed);
+      speed_max = fmax(speed_max, sample_cfl_speed);
 
       const real_t wq = weights[face_q];
       for (int i = 0; i < dof; ++i)
@@ -797,6 +932,7 @@ struct PackedBoundaryFaceEulerRusanovKernel
   bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
+  bool trace_centered = false;
   int bdr_max_attr = 0;
   const int* state_map = nullptr;
   const int* face_e1 = nullptr;
@@ -971,20 +1107,35 @@ struct PackedBoundaryFaceEulerRusanovKernel
                              dissipation_speed2);
       }
 
-      real_t normal_norm2 = 0.0;
-      for (int d = 0; d < dim; ++d)
-      {
-        normal_norm2 += normal[d] * normal[d];
-      }
-      const real_t scaled_max_speed =
-        fmax(dissipation_speed1, dissipation_speed2) * sqrt(normal_norm2);
-      speed_max = fmax(speed_max, fmax(cfl_speed1, cfl_speed2));
+      real_t sample_cfl_speed = 0.0;
+      AssembleEulerFaceFlux_(u1,
+                             u2,
+                             normal,
+                             dim,
+                             neq,
+                             gamma,
+                             sigma_1,
+                             sigma_1,
+                             sigma_rho_floor,
+                             invariant_domain_pressure_floor,
+                             use_sigma,
+                             invariant_domain_flux,
+                             sigma_aware_cfl,
+                             sigma_aware_rusanov,
+                             trace_centered,
+                             flux1,
+                             flux2,
+                             cfl_speed1,
+                             cfl_speed2,
+                             dissipation_speed1,
+                             dissipation_speed2,
+                             flux_hat,
+                             sample_cfl_speed);
+      speed_max = fmax(speed_max, sample_cfl_speed);
       const real_t wq = weights[face_q];
 
       for (int eq = 0; eq < neq; ++eq)
       {
-        flux_hat[eq] = 0.5 * (scaled_max_speed * (u1[eq] - u2[eq]) + flux1[eq] +
-                              flux2[eq]);
         // Record the outward flux before the residual's leading minus sign.
         if (boundary_flux_integral)
         {
@@ -1006,9 +1157,10 @@ struct PackedBoundaryFaceEulerRusanovKernel
   }
 };
 
-// Q-parallel variants: each thread handles one (face, q) sample and scatters
-// contributions atomically. A separate reduction kernel computes per-face max
-// characteristic speed.
+// Q-parallel variants: each thread handles one (face, q) sample. The default
+// path scatters contributions atomically. The opt-in fused screen instead
+// writes one weighted numerical-flux record per sample; an element-owned
+// kernel lifts those records without atomics.
 struct PackedInteriorFaceEulerRusanovQKernel
 {
   int dof = 0;
@@ -1024,6 +1176,7 @@ struct PackedInteriorFaceEulerRusanovQKernel
   bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
+  bool trace_centered = false;
   const int* state_map = nullptr;
   const int* face_e1 = nullptr;
   const int* face_e2 = nullptr;
@@ -1033,6 +1186,7 @@ struct PackedInteriorFaceEulerRusanovQKernel
   const real_t* weights = nullptr;
   const real_t* x = nullptr;
   real_t* z = nullptr;
+  real_t* flux_record = nullptr;
   real_t* face_speed_q = nullptr;
   double* q_sigma_telemetry = nullptr;
   const int* sigma_map = nullptr;
@@ -1144,22 +1298,40 @@ struct PackedInteriorFaceEulerRusanovQKernel
                            dissipation_speed2);
     }
 
-    real_t normal_norm2 = 0.0;
-    for (int d = 0; d < dim; ++d)
-    {
-      normal_norm2 += normal[d] * normal[d];
-    }
-    const real_t scaled_max_speed =
-      fmax(dissipation_speed1, dissipation_speed2) * sqrt(normal_norm2);
-    face_speed_q[fq] = fmax(cfl_speed1, cfl_speed2);
-
-    for (int eq = 0; eq < neq; ++eq)
-    {
-      flux_hat[eq] = 0.5 * (scaled_max_speed * (u1[eq] - u2[eq]) + flux1[eq] +
-                            flux2[eq]);
-    }
+    AssembleEulerFaceFlux_(u1,
+                           u2,
+                           normal,
+                           dim,
+                           neq,
+                           gamma,
+                           sigma_1,
+                           sigma_2,
+                           sigma_rho_floor,
+                           invariant_domain_pressure_floor,
+                           use_sigma,
+                           invariant_domain_flux,
+                           sigma_aware_cfl,
+                           sigma_aware_rusanov,
+                           trace_centered,
+                           flux1,
+                           flux2,
+                           cfl_speed1,
+                           cfl_speed2,
+                           dissipation_speed1,
+                           dissipation_speed2,
+                           flux_hat,
+                           face_speed_q[fq]);
 
     const real_t wq = weights[face_q];
+    if (flux_record)
+    {
+      const int record_off = face_q * neq;
+      for (int eq = 0; eq < neq; ++eq)
+      {
+        flux_record[record_off + eq] = wq * flux_hat[eq];
+      }
+      return;
+    }
     for (int i = 0; i < dof; ++i)
     {
       const real_t c1 = -wq * shape1[shape_off + i];
@@ -1190,6 +1362,7 @@ struct PackedSharedFaceEulerRusanovQKernel
   bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
+  bool trace_centered = false;
   const int* state_map = nullptr;
   const int* face_e1 = nullptr;
   const int* face_nbr_vdof_map = nullptr;
@@ -1200,6 +1373,7 @@ struct PackedSharedFaceEulerRusanovQKernel
   const real_t* x = nullptr;
   const real_t* x_nbr = nullptr;
   real_t* z = nullptr;
+  real_t* flux_record = nullptr;
   real_t* face_speed_q = nullptr;
   double* q_sigma_telemetry = nullptr;
   const int* sigma_map = nullptr;
@@ -1317,22 +1491,40 @@ struct PackedSharedFaceEulerRusanovQKernel
                            dissipation_speed2);
     }
 
-    real_t normal_norm2 = 0.0;
-    for (int d = 0; d < dim; ++d)
-    {
-      normal_norm2 += normal[d] * normal[d];
-    }
-    const real_t scaled_max_speed =
-      fmax(dissipation_speed1, dissipation_speed2) * sqrt(normal_norm2);
-    face_speed_q[fq] = fmax(cfl_speed1, cfl_speed2);
-
-    for (int eq = 0; eq < neq; ++eq)
-    {
-      flux_hat[eq] = 0.5 * (scaled_max_speed * (u1[eq] - u2[eq]) + flux1[eq] +
-                            flux2[eq]);
-    }
+    AssembleEulerFaceFlux_(u1,
+                           u2,
+                           normal,
+                           dim,
+                           neq,
+                           gamma,
+                           sigma_1,
+                           sigma_2,
+                           sigma_rho_floor,
+                           invariant_domain_pressure_floor,
+                           use_sigma,
+                           invariant_domain_flux,
+                           sigma_aware_cfl,
+                           sigma_aware_rusanov,
+                           trace_centered,
+                           flux1,
+                           flux2,
+                           cfl_speed1,
+                           cfl_speed2,
+                           dissipation_speed1,
+                           dissipation_speed2,
+                           flux_hat,
+                           face_speed_q[fq]);
 
     const real_t wq = weights[face_q];
+    if (flux_record)
+    {
+      const int record_off = face_q * neq;
+      for (int eq = 0; eq < neq; ++eq)
+      {
+        flux_record[record_off + eq] = wq * flux_hat[eq];
+      }
+      return;
+    }
     for (int i = 0; i < dof; ++i)
     {
       const real_t c1 = -wq * shape1[shape_off + i];
@@ -1360,6 +1552,7 @@ struct PackedBoundaryFaceEulerRusanovQKernel
   bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
+  bool trace_centered = false;
   int bdr_max_attr = 0;
   const int* state_map = nullptr;
   const int* face_e1 = nullptr;
@@ -1369,6 +1562,7 @@ struct PackedBoundaryFaceEulerRusanovQKernel
   const real_t* weights = nullptr;
   const real_t* x = nullptr;
   real_t* z = nullptr;
+  real_t* flux_record = nullptr;
   real_t* face_speed_q = nullptr;
   double* q_sigma_telemetry = nullptr;
   real_t* boundary_flux_integral = nullptr;
@@ -1390,6 +1584,13 @@ struct PackedBoundaryFaceEulerRusanovQKernel
     if (attr <= 0 || attr > bdr_max_attr)
     {
       face_speed_q[fq] = 0.0;
+      if (flux_record)
+      {
+        for (int eq = 0; eq < neq; ++eq)
+        {
+          flux_record[fq * neq + eq] = 0.0;
+        }
+      }
       return;
     }
 
@@ -1397,6 +1598,13 @@ struct PackedBoundaryFaceEulerRusanovQKernel
     if (bdr_type == static_cast<int>(DeviceBoundaryType::unsupported))
     {
       face_speed_q[fq] = 0.0;
+      if (flux_record)
+      {
+        for (int eq = 0; eq < neq; ++eq)
+        {
+          flux_record[fq * neq + eq] = 0.0;
+        }
+      }
       return;
     }
 
@@ -1456,6 +1664,15 @@ struct PackedBoundaryFaceEulerRusanovQKernel
       {
         for (int eq = 0; eq < neq; ++eq)
           AtomicAdd(boundary_flux_integral[eq], invalid);
+      }
+      if (flux_record)
+      {
+        const int record_off = face_q * neq;
+        for (int eq = 0; eq < neq; ++eq)
+        {
+          flux_record[record_off + eq] = invalid;
+        }
+        return;
       }
       for (int i = 0; i < dof; ++i)
       {
@@ -1528,25 +1745,48 @@ struct PackedBoundaryFaceEulerRusanovQKernel
                            dissipation_speed2);
     }
 
-    real_t normal_norm2 = 0.0;
-    for (int d = 0; d < dim; ++d)
-    {
-      normal_norm2 += normal[d] * normal[d];
-    }
-    const real_t scaled_max_speed =
-      fmax(dissipation_speed1, dissipation_speed2) * sqrt(normal_norm2);
-    face_speed_q[fq] = fmax(cfl_speed1, cfl_speed2);
+    AssembleEulerFaceFlux_(u1,
+                           u2,
+                           normal,
+                           dim,
+                           neq,
+                           gamma,
+                           sigma_1,
+                           sigma_1,
+                           sigma_rho_floor,
+                           invariant_domain_pressure_floor,
+                           use_sigma,
+                           invariant_domain_flux,
+                           sigma_aware_cfl,
+                           sigma_aware_rusanov,
+                           trace_centered,
+                           flux1,
+                           flux2,
+                           cfl_speed1,
+                           cfl_speed2,
+                           dissipation_speed1,
+                           dissipation_speed2,
+                           flux_hat,
+                           face_speed_q[fq]);
     const real_t wq = weights[face_q];
 
     for (int eq = 0; eq < neq; ++eq)
     {
-      flux_hat[eq] = 0.5 * (scaled_max_speed * (u1[eq] - u2[eq]) + flux1[eq] +
-                            flux2[eq]);
       // Record the outward flux before the residual's leading minus sign.
       if (boundary_flux_integral)
       {
         AtomicAdd(boundary_flux_integral[eq], wq * flux_hat[eq]);
       }
+    }
+
+    if (flux_record)
+    {
+      const int record_off = face_q * neq;
+      for (int eq = 0; eq < neq; ++eq)
+      {
+        flux_record[record_off + eq] = wq * flux_hat[eq];
+      }
+      return;
     }
 
     for (int i = 0; i < dof; ++i)
@@ -1557,6 +1797,238 @@ struct PackedBoundaryFaceEulerRusanovQKernel
         const int zi = state_map[state_off + i * neq + eq];
         AtomicAdd(z[zi], c1 * flux_hat[eq]);
       }
+    }
+  }
+};
+
+/** Element-owned exact DG residual screen.
+ *
+ * Face quadrature kernels have already written w_q F_hat records. Each local
+ * element has exclusive ownership of its residual, so the face lifts need no
+ * atomics. The weak volume term and dense inverse mass are kept in the same
+ * thread and never materialized in the global z vector. This deliberately
+ * targets p1--p2 quadrilateral Euler tuples (at most 9 dofs x 4 equations).
+ * A p3 FP64-WMMA path is deliberately deferred until this ownership screen
+ * demonstrates enough end-to-end headroom to justify a specialized kernel.
+ */
+struct FusedElementOwnedEulerResidualKernel
+{
+  static constexpr int kMaxDof = 9;
+  static constexpr int kMaxEquations = 4;
+  static constexpr int kMaxLocalValues = kMaxDof * kMaxEquations;
+
+  int dof = 0;
+  int neq = 0;
+  int dim = 0;
+  int ldof = 0;
+  int sigma_ldof = 0;
+  int int_nq = 0;
+  int bdr_nq = 0;
+  int shared_nq = 0;
+  real_t gamma = 1.4;
+  real_t sigma_rho_floor = 1.0e-12;
+  real_t invariant_domain_pressure_floor = 1.0e-12;
+  bool use_sigma = false;
+  bool invariant_domain_flux = false;
+  bool track_volume_speed = false;
+
+  const int* state_map = nullptr;
+  const real_t* weakdiv = nullptr;
+  const real_t* invmass = nullptr;
+  const real_t* x = nullptr;
+  real_t* y = nullptr;
+
+  const int* elem_face_offsets = nullptr;
+  const int* elem_face_kind = nullptr;
+  const int* elem_face_id = nullptr;
+  const int* elem_face_side = nullptr;
+  const real_t* int_shape1 = nullptr;
+  const real_t* int_shape2 = nullptr;
+  const real_t* bdr_shape1 = nullptr;
+  const real_t* shared_shape1 = nullptr;
+  const real_t* int_flux_record = nullptr;
+  const real_t* bdr_flux_record = nullptr;
+  const real_t* shared_flux_record = nullptr;
+
+  real_t* volume_speed = nullptr;
+  double* q_sigma_telemetry = nullptr;
+  const int* sigma_map = nullptr;
+  const real_t* sigma_interp = nullptr;
+  const real_t* sigma_vals = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int e) const
+  {
+    real_t residual[kMaxLocalValues];
+    for (int k = 0; k < ldof; ++k)
+    {
+      residual[k] = 0.0;
+    }
+
+    const int state_off = e * ldof;
+    const int weak_off = e * dof * dof * dim;
+    const int sigma_map_off = e * sigma_ldof;
+    const int sigma_interp_off = e * dof * sigma_ldof;
+    const int energy_eq = 1 + dim;
+    const real_t gm1 = gamma - 1.0;
+    real_t element_max_speed = 0.0;
+
+    // Exact preassembled weak-divergence volume contribution.
+    for (int j = 0; j < dof; ++j)
+    {
+      const real_t rho = x[state_map[state_off + j * neq]];
+      const real_t inv_rho = 1.0 / rho;
+      real_t mom[3] = {0.0, 0.0, 0.0};
+      real_t mom2 = 0.0;
+      for (int d = 0; d < dim; ++d)
+      {
+        mom[d] = x[state_map[state_off + j * neq + 1 + d]];
+        mom2 += mom[d] * mom[d];
+      }
+      const real_t energy =
+        x[state_map[state_off + j * neq + energy_eq]];
+      const real_t pressure = gm1 * (energy - 0.5 * mom2 * inv_rho);
+      const real_t enthalpy = (energy + pressure) * inv_rho;
+
+      real_t sigma_j = 0.0;
+      if (use_sigma)
+      {
+        const int interp_row_off = sigma_interp_off + j * sigma_ldof;
+        for (int k = 0; k < sigma_ldof; ++k)
+        {
+          sigma_j += sigma_interp[interp_row_off + k] *
+                     sigma_vals[sigma_map[sigma_map_off + k]];
+        }
+      }
+      if (use_sigma && invariant_domain_flux)
+      {
+        AccumulateFrozenSigmaTelemetry_(
+          pressure,
+          sigma_j,
+          gamma,
+          q_sigma_telemetry +
+            (e * dof + j) * kFrozenSigmaTelemetryWidth_);
+      }
+      const real_t inv_rho_sigma =
+        use_sigma ? 1.0 / fmax(rho, sigma_rho_floor) : 0.0;
+      if (track_volume_speed)
+      {
+        const real_t transport_speed = sqrt(mom2) * inv_rho;
+        const real_t base_speed =
+          transport_speed + sqrt(gamma * pressure * inv_rho);
+        element_max_speed = fmax(
+          element_max_speed,
+          IGRFluxInvariantDomainSpeed(base_speed,
+                                      rho,
+                                      pressure,
+                                      transport_speed,
+                                      sigma_j,
+                                      gamma,
+                                      sigma_rho_floor,
+                                      invariant_domain_pressure_floor));
+      }
+
+      for (int i = 0; i < dof; ++i)
+      {
+        const int wbase = weak_off + i * dof * dim + j * dim;
+        real_t continuity = 0.0;
+        for (int d = 0; d < dim; ++d)
+        {
+          continuity += weakdiv[wbase + d] * mom[d];
+        }
+        residual[i * neq] += continuity;
+
+        for (int m = 0; m < dim; ++m)
+        {
+          real_t momentum = 0.0;
+          for (int d = 0; d < dim; ++d)
+          {
+            real_t flux_md = mom[m] * mom[d] * inv_rho;
+            if (m == d)
+            {
+              flux_md += pressure;
+              if (use_sigma)
+              {
+                flux_md += ::dg_igr::frozen_scalar_igr_algebra::
+                  TensorSigmaMomentumDiagonalTerm(sigma_j);
+              }
+            }
+            momentum += weakdiv[wbase + d] * flux_md;
+          }
+          residual[i * neq + 1 + m] += momentum;
+        }
+
+        real_t energy_flux = 0.0;
+        for (int d = 0; d < dim; ++d)
+        {
+          real_t flux_ed = mom[d] * enthalpy;
+          if (use_sigma)
+          {
+            flux_ed += ::dg_igr::frozen_scalar_igr_algebra::
+              TensorSigmaEnergyTermFromInverseDensity(
+                sigma_j, mom[d], inv_rho_sigma);
+          }
+          energy_flux += weakdiv[wbase + d] * flux_ed;
+        }
+        residual[i * neq + energy_eq] += energy_flux;
+      }
+    }
+
+    // Deterministic element-owned face lifts from weighted flux records.
+    for (int incident = elem_face_offsets[e];
+         incident < elem_face_offsets[e + 1];
+         ++incident)
+    {
+      const int kind = elem_face_kind[incident];
+      const int face = elem_face_id[incident];
+      const int side = elem_face_side[incident];
+      const int nq = kind == kFusedInteriorFace_
+                       ? int_nq
+                       : (kind == kFusedBoundaryFace_ ? bdr_nq : shared_nq);
+      const real_t* shape = kind == kFusedInteriorFace_
+                              ? (side == 0 ? int_shape1 : int_shape2)
+                              : (kind == kFusedBoundaryFace_ ? bdr_shape1
+                                                             : shared_shape1);
+      const real_t* record = kind == kFusedInteriorFace_
+                               ? int_flux_record
+                               : (kind == kFusedBoundaryFace_
+                                    ? bdr_flux_record
+                                    : shared_flux_record);
+      const real_t sign =
+        kind == kFusedInteriorFace_ && side == 1 ? 1.0 : -1.0;
+      for (int q = 0; q < nq; ++q)
+      {
+        const int face_q = face * nq + q;
+        const int shape_off = face_q * dof;
+        const int record_off = face_q * neq;
+        for (int i = 0; i < dof; ++i)
+        {
+          const real_t scale = sign * shape[shape_off + i];
+          for (int eq = 0; eq < neq; ++eq)
+          {
+            residual[i * neq + eq] += scale * record[record_off + eq];
+          }
+        }
+      }
+    }
+
+    // Exact local inverse mass; output ownership is unique in the DG L-vector.
+    const int mass_off = e * dof * dof;
+    for (int eq = 0; eq < neq; ++eq)
+    {
+      for (int i = 0; i < dof; ++i)
+      {
+        real_t sum = 0.0;
+        for (int j = 0; j < dof; ++j)
+        {
+          sum += invmass[mass_off + j * dof + i] *
+                 residual[j * neq + eq];
+        }
+        y[state_map[state_off + i * neq + eq]] = sum;
+      }
+    }
+    if (track_volume_speed)
+    {
+      volume_speed[e] = element_max_speed;
     }
   }
 };

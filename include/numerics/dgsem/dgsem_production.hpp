@@ -6,10 +6,12 @@
  * @ingroup numerics_dgsem
  *
  * The production path is intentionally limited to the accepted correctness
- * tuple: 1D/2D p1--p4 Gauss--Lobatto Euler, central volume flux without
- * volume dissipation, Rusanov surfaces, and zero or prescribed stage-frozen
- * scalar sigma.  Unsupported tuples are named here so strict evidence can
- * reject them without mutating the caller's output.
+ * tuple: 1D/2D p1--p4 Gauss--Lobatto Euler, central volume flux, Rusanov
+ * surfaces, and zero or prescribed stage-frozen scalar sigma.  LLF volume
+ * dissipation, the shared FP64 operator panel, and its audited p3 fixed-point
+ * emulation are explicit CUDA research selections; their defaults remain
+ * disabled. Unsupported tuples are named here so strict evidence can reject
+ * them without mutating caller output.
  */
 
 #include "mfem.hpp"
@@ -77,6 +79,12 @@ struct DGSEMProductionSelection
   bool has_local_faces = false;
   bool has_shared_faces = false;
   bool has_boundary_faces = false;
+  bool volume_panel_requested = false;
+  bool volume_panel_active = false;
+  bool volume_fixedpoint_requested = false;
+  bool volume_fixedpoint_active = false;
+  bool volume_fixedpoint_permanent_fallback = false;
+  bool device_llf_volume_active = false;
   int dimension = 0;
   int order = 0;
   int elements = 0;
@@ -118,6 +126,9 @@ struct DGSEMProductionCacheCounters
   std::int64_t workspace_identity_failures = 0;
   std::int64_t unchanged_cache_fast_paths = 0;
   std::int64_t rebuild_preflight_entries = 0;
+  std::int64_t fixedpoint_panel_calls = 0;
+  std::int64_t fixedpoint_panel_audits = 0;
+  std::int64_t fixedpoint_panel_failures = 0;
 };
 
 /** Exact warm-stage workspace snapshot.

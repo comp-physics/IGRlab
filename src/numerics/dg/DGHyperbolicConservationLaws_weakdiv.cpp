@@ -409,6 +409,116 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
            : 0.0;
 }
 
+real_t DGHyperbolicConservationLaws::ApplyFusedElementResidualEuler_(
+  const Vector& x_in,
+  Vector& y_out) const
+{
+#ifndef DG_IGR_HAS_ACCEL_FORALL
+  (void)x_in;
+  (void)y_out;
+  MFEM_ABORT("Fused element residual screen requires accelerator forall.");
+  return 0.0;
+#else
+  MFEM_VERIFY(UseFusedElementResidualScreen_(),
+              "Fused element residual selected for an unsupported tuple.");
+
+  const FluxFunction& flux_function = formIntegrator->GetFluxFunction();
+  const auto* flux_igr = dynamic_cast<const FluxWithIGR*>(&flux_function);
+  const bool euler_base =
+    dynamic_cast<const EulerFlux*>(&flux_function) != nullptr ||
+    (flux_igr && flux_igr->HasEulerBase());
+  MFEM_VERIFY(euler_base,
+              "Fused element residual requires Euler or Euler+IGR flux.");
+
+  bool use_sigma = false;
+  bool invariant_domain_flux = false;
+  const ParGridFunction* sigma_field = nullptr;
+  real_t sigma_rho_floor = 1.0e-12;
+  real_t invariant_domain_pressure_floor = dg_igr::LimiterDefaults::kPMin;
+  if (flux_igr && flux_igr->GetSigmaField())
+  {
+    sigma_field = flux_igr->GetSigmaField();
+    MFEM_VERIFY(BuildWeakDivSigmaData_(*sigma_field),
+                "Fused element residual requires volume sigma interpolation "
+                "metadata.");
+    use_sigma = true;
+    invariant_domain_flux = flux_igr->GetInvariantDomainFlux();
+    sigma_rho_floor = flux_igr->GetVelocityRhoFloor();
+    invariant_domain_pressure_floor =
+      flux_igr->GetInvariantDomainPressureFloor();
+  }
+  MFEM_VERIFY(!invariant_domain_flux || flux_igr->GetGamma() == dgsem_gamma_,
+              "Fused invariant-domain volume flux requires one Euler gamma.");
+
+  const int ne = vfes.GetNE();
+  const int dof = weakdiv_elem_dof_;
+  const int neq = num_equations;
+  const bool track_volume_speed =
+    invariant_domain_volume_speed_tracking_ && use_sigma &&
+    invariant_domain_flux;
+  if (invariant_domain_flux &&
+      weakdiv_q_sigma_telemetry_.Size() !=
+        ne * dof * dg_igr_detail::kFrozenSigmaTelemetryWidth)
+  {
+    dg_igr_detail::InitializeFrozenSigmaTelemetry(
+      weakdiv_q_sigma_telemetry_, ne * dof);
+  }
+  if (track_volume_speed && weakdiv_volume_speed_.Size() != ne)
+  {
+    weakdiv_volume_speed_.SetSize(ne);
+  }
+
+  y_out.SetSize(x_in.Size());
+  FusedElementOwnedEulerResidualKernel kernel;
+  kernel.dof = dof;
+  kernel.neq = neq;
+  kernel.dim = dim;
+  kernel.ldof = dof * neq;
+  kernel.sigma_ldof = use_sigma ? weakdiv_sigma_ldof_ : 0;
+  kernel.int_nq = face_int_nq_;
+  kernel.bdr_nq = face_bdr_nq_;
+  kernel.shared_nq = face_shared_nq_;
+  kernel.gamma = dgsem_gamma_;
+  kernel.sigma_rho_floor = sigma_rho_floor;
+  kernel.invariant_domain_pressure_floor = invariant_domain_pressure_floor;
+  kernel.use_sigma = use_sigma;
+  kernel.invariant_domain_flux = invariant_domain_flux;
+  kernel.track_volume_speed = track_volume_speed;
+  kernel.state_map = invmass_elem_vdof_map_.Read();
+  kernel.weakdiv = weakdiv_data_flat_.Read();
+  kernel.invmass = invmass_data_flat_.Read();
+  kernel.x = x_in.Read();
+  kernel.y = y_out.Write();
+  kernel.elem_face_offsets = fused_elem_face_offsets_.Read();
+  kernel.elem_face_kind = fused_elem_face_kind_.Read();
+  kernel.elem_face_id = fused_elem_face_id_.Read();
+  kernel.elem_face_side = fused_elem_face_side_.Read();
+  kernel.int_shape1 = face_int_shape1_.Read();
+  kernel.int_shape2 = face_int_shape2_.Read();
+  kernel.bdr_shape1 = face_bdr_shape1_.Read();
+  kernel.shared_shape1 = face_shared_shape1_.Read();
+  kernel.int_flux_record = face_int_flux_record_.Read();
+  kernel.bdr_flux_record = face_bdr_flux_record_.Read();
+  kernel.shared_flux_record = face_shared_flux_record_.Read();
+  kernel.volume_speed =
+    track_volume_speed ? weakdiv_volume_speed_.Write() : nullptr;
+  kernel.q_sigma_telemetry =
+    invariant_domain_flux ? weakdiv_q_sigma_telemetry_.ReadWrite() : nullptr;
+  kernel.sigma_map =
+    use_sigma ? weakdiv_sigma_elem_dof_map_.Read() : nullptr;
+  kernel.sigma_interp =
+    use_sigma ? weakdiv_sigma_interp_.Read() : nullptr;
+  kernel.sigma_vals = use_sigma ? sigma_field->Read() : nullptr;
+  mfem::forall(ne, kernel);
+
+  LogFusedElementResidualSelection_(true, "supported-exact-rusanov");
+  return track_volume_speed
+           ? ReduceFaceMaxSpeed_(weakdiv_volume_speed_,
+                                 weakdiv_volume_speed_reduce_workspace_)
+           : 0.0;
+#endif
+}
+
 real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
   const Vector& x_in,
   Vector& z_inout) const

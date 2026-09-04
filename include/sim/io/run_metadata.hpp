@@ -222,6 +222,9 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << ",\n";
   out << "    \"dg_backend\": "
       << detail::ToJsonString(DGBackendToString(run_cfg.dg_backend)) << ",\n";
+  out << "    \"dg_surface_flux\": "
+      << detail::ToJsonString(DGSurfaceFluxToString(run_cfg.dg_surface_flux))
+      << ",\n";
   out << "    \"time_integrator\": "
       << detail::ToJsonString(TimeIntegratorToString(run_cfg.time_integrator))
       << ",\n";
@@ -246,6 +249,8 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   out << "    \"igr_space\": " << detail::ToJsonString(run_cfg.igr_opts.space)
       << ",\n";
   out << "    \"igr_grad\": " << detail::ToJsonString(run_cfg.igr_opts.grad)
+      << ",\n";
+  out << "    \"igr_sigma_order\": " << ResolveIGRSigmaOrder(run_cfg)
       << ",\n";
   out << "    \"igr_solve_mode\": "
       << detail::ToJsonString(run_cfg.igr_opts.solve_mode) << ",\n";

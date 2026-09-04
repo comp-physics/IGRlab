@@ -3,6 +3,7 @@
 #include "physics/igr/igr_coupling.hpp"
 #include "physics/igr/igr_flux.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
+#include "numerics/riemann/hdg_trace_centered.hpp"
 #include "numerics/riemann/rusanov.hpp"
 #include "numerics/riemann/side_scope_utils.hpp"
 #include "numerics/timestepping/RK3SSPWithLimiter.hpp"
@@ -54,6 +55,32 @@ mfem::Mesh MakePeriodicMesh2D(int nx, int ny, double sx = 1.0, double sy = 1.0)
   return mfem::Mesh::MakePeriodic(
     orig_mesh,
     orig_mesh.CreatePeriodicVertexMapping(translations));
+}
+
+mfem::Mesh MakeGradedQuadMesh2D(int nx = 4,
+                                int ny = 2,
+                                double sx = 1.0,
+                                double sy = 0.6)
+{
+  mfem::Mesh mesh =
+    mfem::Mesh::MakeCartesian2D(nx,
+                                ny,
+                                mfem::Element::QUADRILATERAL,
+                                /*generate_edges=*/true,
+                                sx,
+                                sy);
+  // Monotone tensor-product grading.  Grading both coordinates makes a
+  // two-rank partition encounter unequal element sizes whether MFEM cuts the
+  // Cartesian mesh by rows or columns.
+  for (int v = 0; v < mesh.GetNV(); ++v)
+  {
+    double* x = mesh.GetVertex(v);
+    const double tx = x[0] / sx;
+    const double ty = x[1] / sy;
+    x[0] = sx * (0.18 * tx + 0.82 * tx * tx);
+    x[1] = sy * (0.18 * ty + 0.82 * ty * ty);
+  }
+  return mesh;
 }
 
 mfem::FaceElementTransformations& GetFaceTr(mfem::ParMesh& pmesh, int face)
@@ -142,6 +169,54 @@ private:
   const mfem::ParGridFunction* U_ = nullptr;
   double rho_floor_ = 0.0;
   mfem::Vector state_;
+};
+
+/// Test-only DG shell whose RHS contributes controlled cumulative q telemetry.
+class SyntheticQSigmaTelemetryDG final
+  : public mfem::DGHyperbolicConservationLaws
+{
+public:
+  using mfem::DGHyperbolicConservationLaws::DGHyperbolicConservationLaws;
+
+  void Mult(const mfem::Vector&, mfem::Vector& derivative) const override
+  {
+    derivative = 0.0;
+    telemetry_.enabled = true;
+    telemetry_.sample_count += 8;
+    if (emit_failure_)
+    {
+      telemetry_.nonpositive_count += next_nonpositive_;
+      telemetry_.nonfinite_count += next_nonfinite_;
+      emit_failure_ = false;
+    }
+  }
+
+  mfem::IGRFrozenSigmaTelemetry GetGlobalFrozenSigmaTelemetry() const override
+  {
+    return telemetry_;
+  }
+
+  void SeedHistoricalFailure(std::uint64_t nonpositive,
+                             std::uint64_t nonfinite)
+  {
+    telemetry_.enabled = true;
+    telemetry_.sample_count += nonpositive + nonfinite;
+    telemetry_.nonpositive_count += nonpositive;
+    telemetry_.nonfinite_count += nonfinite;
+  }
+
+  void FailNextRHS(std::uint64_t nonpositive, std::uint64_t nonfinite)
+  {
+    emit_failure_ = true;
+    next_nonpositive_ = nonpositive;
+    next_nonfinite_ = nonfinite;
+  }
+
+private:
+  mutable mfem::IGRFrozenSigmaTelemetry telemetry_;
+  mutable bool emit_failure_ = false;
+  mutable std::uint64_t next_nonpositive_ = 0;
+  mutable std::uint64_t next_nonfinite_ = 0;
 };
 
 class BrokenDGIGRSourceCoefficient final : public mfem::Coefficient
@@ -1388,6 +1463,109 @@ int RunIGRTests(TestContext& ctx)
       ctx.Check(GlobalMax(local_cfl_separation_err) < 5.0e-11,
                 "IGR sigma CFL and Rusanov controls are independent");
     }
+
+    // The explicit-HDG-derived flux must evaluate both conservative and IGR
+    // traces at their arithmetic face averages, and must include the trace
+    // state in the invariant-domain penalty bound.
+    igr_flux_if.SetInvariantDomainFloors(/*density_floor=*/1.0e-12,
+                                         /*pressure_floor=*/1.0e-12);
+    igr_flux_if.SetInvariantDomainFlux(true);
+    mfem::HdgTraceCenteredFlux trace_centered_flux(igr_flux_if);
+    double local_trace_formula_error = 0.0;
+    double local_trace_speed_error = 0.0;
+    int local_trace_faces = 0;
+    const auto invariant_speed = [&](const mfem::Vector& conservative,
+                                     double sigma_value,
+                                     double base_speed)
+    {
+      const double rho = conservative(0);
+      double momentum_squared = 0.0;
+      for (int d = 0; d < dim; ++d)
+      {
+        momentum_squared +=
+          conservative(1 + d) * conservative(1 + d);
+      }
+      const double pressure =
+        (gamma - 1.0) *
+        (conservative(1 + dim) - 0.5 * momentum_squared / rho);
+      const double transport_speed =
+        std::abs(DotMomentumNormal(conservative, normal_if, dim)) /
+        (rho * normal_if.Norml2());
+      return mfem::IGRFluxInvariantDomainSpeed(base_speed,
+                                                rho,
+                                                pressure,
+                                                transport_speed,
+                                                sigma_value,
+                                                gamma,
+                                                1.0e-12,
+                                                1.0e-12);
+    };
+    for (int f = 0; f < pmesh_if.GetNumFaces(); ++f)
+    {
+      mfem::FaceElementTransformations* Tr =
+        pmesh_if.GetFaceElementTransformations(f);
+      if (!Tr || !Tr->Elem2)
+      {
+        continue;
+      }
+      Tr->SetAllIntPoints(&ip_face);
+      const double sigma1 = SigmaAtElementPoint(
+        sigma_if, *Tr->Elem1, Tr->GetElement1IntPoint());
+      const double sigma2 = SigmaAtElementPoint(
+        sigma_if, *Tr->Elem2, Tr->GetElement2IntPoint());
+      const double sigma_hat = 0.5 * (sigma1 + sigma2);
+      mfem::Vector state_hat(state_left.Size());
+      for (int equation = 0; equation < state_hat.Size(); ++equation)
+      {
+        state_hat(equation) =
+          0.5 * (state_left(equation) + state_right(equation));
+      }
+
+      mfem::Vector unused_left(state_left.Size());
+      mfem::Vector unused_right(state_left.Size());
+      mfem::Vector expected_trace(state_left.Size());
+      const double base_speed1 = base_flux.ComputeFluxDotN(
+        state_left, normal_if, *Tr, unused_left);
+      const double base_speed2 = base_flux.ComputeFluxDotN(
+        state_right, normal_if, *Tr, unused_right);
+      const double base_speed_hat = base_flux.ComputeFluxDotN(
+        state_hat, normal_if, *Tr, expected_trace);
+      AddSigmaDotNTerms(
+        state_hat, normal_if, sigma_hat, expected_trace);
+      const double speed1 =
+        invariant_speed(state_left, sigma1, base_speed1);
+      const double speed2 =
+        invariant_speed(state_right, sigma2, base_speed2);
+      const double speed_hat =
+        invariant_speed(state_hat, sigma_hat, base_speed_hat);
+      const double tau = std::max({speed1, speed2, speed_hat});
+      const double scaled_tau = tau * normal_if.Norml2();
+      for (int equation = 0; equation < expected_trace.Size(); ++equation)
+      {
+        expected_trace(equation) +=
+          0.5 * scaled_tau *
+          (state_left(equation) - state_right(equation));
+      }
+
+      mfem::Vector actual_trace(state_left.Size());
+      const double actual_speed = trace_centered_flux.Eval(
+        state_left, state_right, normal_if, *Tr, actual_trace);
+      for (int equation = 0; equation < actual_trace.Size(); ++equation)
+      {
+        local_trace_formula_error =
+          std::max(local_trace_formula_error,
+                   std::abs(actual_trace(equation) -
+                            expected_trace(equation)));
+      }
+      local_trace_speed_error =
+        std::max(local_trace_speed_error, std::abs(actual_speed - tau));
+      ++local_trace_faces;
+    }
+    ctx.Check(GlobalSum(static_cast<double>(local_trace_faces)) > 0.0 &&
+                GlobalMax(local_trace_formula_error) < 5.0e-11 &&
+                GlobalMax(local_trace_speed_error) < 5.0e-12,
+              "HDG-derived trace-centered Euler+IGR flux uses Uhat, "
+              "sigmahat, and the three-state invariant-domain bound");
   }
 
   // --- Deterministic side-selection stress: explicit-side path remains stable ---
@@ -2014,6 +2192,168 @@ int RunIGRTests(TestContext& ctx)
         }
       }
 
+      // A uniform mesh cannot distinguish alpha=C_alpha*h_e^2 from a single
+      // alpha=C_alpha*h_max^2.  Exercise the explicit per-element face API and
+      // its constant-alpha compatibility overload on a deliberately graded
+      // quad mesh.
+      {
+        constexpr double c_alpha = 0.41;
+        constexpr double rho_value = 1.25;
+        constexpr double rho_floor_local = 0.2;
+        mfem::Mesh graded_mesh = MakeGradedQuadMesh2D();
+        mfem::ParMesh graded_pmesh(MPI_COMM_SELF, graded_mesh);
+        mfem::DG_FECollection graded_fec(/*order=*/2,
+                                         dim_qf,
+                                         mfem::BasisType::GaussLegendre);
+        mfem::ParFiniteElementSpace graded_fes(&graded_pmesh,
+                                               &graded_fec,
+                                               num_eq_qf,
+                                               mfem::Ordering::byNODES);
+        mfem::ParGridFunction graded_state(&graded_fes);
+        graded_state = 0.0;
+        mfem::Array<int> graded_dofs;
+        const int graded_dof = graded_fes.GetFE(0)->GetDof();
+        for (int e = 0; e < graded_fes.GetNE(); ++e)
+        {
+          graded_fes.GetElementDofs(e, graded_dofs);
+          for (int d = 0; d < graded_dof; ++d)
+          {
+            int vdof = graded_fes.DofToVDof(graded_dofs[d], 0);
+            vdof = mfem::FiniteElementSpace::DecodeDof(vdof);
+            graded_state(vdof) = rho_value;
+          }
+        }
+        graded_state.ExchangeFaceNbrData();
+
+        mfem::Vector element_alpha(graded_pmesh.GetNE());
+        double h2_min = std::numeric_limits<double>::infinity();
+        double h2_max = 0.0;
+        for (int e = 0; e < graded_pmesh.GetNE(); ++e)
+        {
+          const double h = graded_pmesh.GetElementSize(e, 1);
+          const double h2 = h * h;
+          h2_min = std::min(h2_min, h2);
+          h2_max = std::max(h2_max, h2);
+          element_alpha(e) = c_alpha * h2;
+        }
+        const double max_physical_alpha = c_alpha * h2_max;
+
+        const mfem::IntegrationRule& graded_face_ir =
+          mfem::IntRules.Get(mfem::Geometry::SEGMENT, /*order=*/5);
+        mfem::FaceQuadratureSpace graded_fqs(graded_pmesh,
+                                             graded_face_ir,
+                                             mfem::FaceType::Interior);
+        dg_igr::dg_face::InteriorFaceSideDensityProjectionScratch
+          local_alpha_scratch;
+        dg_igr::dg_face::InteriorFaceSideDensityProjectionScratch
+          max_alpha_scratch;
+        mfem::Vector local_side_q;
+        mfem::Vector max_side_q;
+        const auto local_side_info =
+          dg_igr::dg_face::ProjectInteriorFaceDensityCoefficient2D(
+            graded_fes,
+            graded_fqs,
+            graded_state,
+            element_alpha,
+            rho_floor_local,
+            local_side_q,
+            &local_alpha_scratch);
+        const auto max_side_info =
+          dg_igr::dg_face::ProjectInteriorFaceDensityCoefficient2D(
+            graded_fes,
+            graded_fqs,
+            graded_state,
+            max_physical_alpha,
+            rho_floor_local,
+            max_side_q,
+            &max_alpha_scratch);
+        MFEM_VERIFY(local_side_info.nf == max_side_info.nf &&
+                      local_side_info.nq == max_side_info.nq,
+                    "Local/max-alpha face projections must share a layout.");
+
+        const auto local_q = mfem::Reshape(local_side_q.HostRead(),
+                                           2,
+                                           local_side_info.nq,
+                                           local_side_info.nf);
+        const auto max_q = mfem::Reshape(max_side_q.HostRead(),
+                                         2,
+                                         max_side_info.nq,
+                                         max_side_info.nf);
+        const auto mapped_alpha =
+          mfem::Reshape(local_alpha_scratch.side_alpha.HostRead(),
+                        2,
+                        local_side_info.nf);
+        double max_local_q_error = 0.0;
+        double max_constant_q_error = 0.0;
+        double max_mapped_alpha_error = 0.0;
+        double max_local_vs_constant = 0.0;
+        double max_face_alpha_jump = 0.0;
+        for (int f = 0; f < local_side_info.nf; ++f)
+        {
+          const int mesh_face = graded_fqs.GetMeshFaceIndex(f);
+          mfem::FaceElementTransformations* Tr =
+            graded_pmesh.GetFaceElementTransformations(mesh_face);
+          MFEM_VERIFY(Tr && Tr->Elem1 && Tr->Elem2,
+                      "Graded local-alpha test expected an interior face.");
+          const int elements[2] = {Tr->Elem1No, Tr->Elem2No};
+          max_face_alpha_jump =
+            std::max(max_face_alpha_jump,
+                     std::abs(element_alpha(elements[0]) -
+                              element_alpha(elements[1])));
+          for (int side = 0; side < 2; ++side)
+          {
+            const double alpha_e = element_alpha(elements[side]);
+            max_mapped_alpha_error =
+              std::max(max_mapped_alpha_error,
+                       std::abs(mapped_alpha(side, f) - alpha_e));
+            for (int q = 0; q < local_side_info.nq; ++q)
+            {
+              const double expected_local = alpha_e / rho_value;
+              const double expected_constant =
+                max_physical_alpha / rho_value;
+              max_local_q_error =
+                std::max(max_local_q_error,
+                         std::abs(local_q(side, q, f) - expected_local));
+              max_constant_q_error =
+                std::max(max_constant_q_error,
+                         std::abs(max_q(side, q, f) - expected_constant));
+              max_local_vs_constant =
+                std::max(max_local_vs_constant,
+                         std::abs(local_q(side, q, f) -
+                                  max_q(side, q, f)));
+            }
+          }
+        }
+
+        ctx.LogMetric("igr_local_alpha_face_qf h2_ratio=" +
+                      FormatSci(h2_max / h2_min) +
+                      " local_err=" + FormatSci(max_local_q_error) +
+                      " max_policy_err=" +
+                      FormatSci(max_constant_q_error) +
+                      " mapped_err=" +
+                      FormatSci(max_mapped_alpha_error) +
+                      " local_vs_max=" +
+                      FormatSci(max_local_vs_constant));
+        ctx.Check(h2_max > 2.0 * h2_min,
+                  "IGR local-alpha face test uses a materially graded mesh");
+        ctx.Check(max_face_alpha_jump > 1.0e-3,
+                  "IGR local-alpha face test crosses unequal element sizes");
+        ctx.Check(local_alpha_scratch.side_alpha.Size() ==
+                    2 * local_side_info.nf &&
+                    max_alpha_scratch.side_alpha.Size() == 0,
+                  "IGR face projection retains explicit side alpha only for "
+                  "the local policy");
+        ctx.Check(max_local_q_error < 5.0e-13 &&
+                    max_mapped_alpha_error < 5.0e-13,
+                  "IGR local-alpha face qdata uses exact C_alpha*h_e^2 on "
+                  "each side");
+        ctx.Check(max_constant_q_error < 5.0e-13,
+                  "IGR constant-alpha face overload remains unchanged");
+        ctx.Check(max_local_vs_constant > 1.0e-3,
+                  "IGR local-alpha face qdata is not alpha_max everywhere");
+
+      }
+
       {
         mfem::ParGridFunction sigma_trace_qf(&sigma_fes_qf);
         sigma_trace_qf = 0.0;
@@ -2377,6 +2717,108 @@ int RunIGRTests(TestContext& ctx)
                   "IGR exact face diagonal matches assembled MFEM face diagonal");
         ctx.Check(diag_max_abs < 5.0e-13,
                   "IGR exact face diagonal max error is roundoff");
+
+        mfem::Vector refreshed_side_q(side_q_apply);
+        double* refreshed_q = refreshed_side_q.HostReadWrite();
+        for (int i = 0; i < refreshed_side_q.Size(); ++i)
+        {
+          refreshed_q[i] *= 0.71 + 0.037 * static_cast<double>(i % 7);
+        }
+
+        double refresh_apply_rel_max = 0.0;
+        double refresh_diag_rel_max = 0.0;
+        for (const auto scaling : {
+               dg_igr::dg_face::DGDiffusionFaceScaling::Arithmetic,
+               dg_igr::dg_face::DGDiffusionFaceScaling::Max,
+               dg_igr::dg_face::DGDiffusionFaceScaling::Sum,
+               dg_igr::dg_face::DGDiffusionFaceScaling::HarmonicWeighted })
+        {
+          dg_igr::dg_face::InteriorFaceDGDiffusionApplyScratch cached;
+          const auto cached_info =
+            dg_igr::dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
+              sigma_fes_qf,
+              apply_fqs,
+              side_q_apply,
+              kappa_apply,
+              cached.shape,
+              cached.weighted_normal_dshape,
+              cached.penalty,
+              cached.face_elements,
+              cached.element_vdof_map,
+              scaling,
+              &cached.normal_dshape_base,
+              &cached.penalty_metric);
+          dg_igr::dg_face::LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+            cached_info,
+            cached,
+            refreshed_side_q,
+            kappa_apply,
+            scaling);
+
+          mfem::Vector refreshed_y(sigma_face_apply.Size());
+          refreshed_y = 0.0;
+          dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+            cached_info,
+            cached,
+            sigma_face_apply,
+            ip_sigma_apply,
+            refreshed_y);
+          mfem::Vector refreshed_diag(sigma_face_apply.Size());
+          refreshed_diag = 0.0;
+          dg_igr::dg_face::AddInteriorFaceDGDiffusionDiagonal2D(
+            cached_info,
+            cached,
+            ip_sigma_apply,
+            refreshed_diag);
+
+          dg_igr::dg_face::InteriorFaceDGDiffusionApplyScratch rebuilt;
+          const auto rebuilt_info =
+            dg_igr::dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
+              sigma_fes_qf,
+              apply_fqs,
+              refreshed_side_q,
+              kappa_apply,
+              rebuilt.shape,
+              rebuilt.weighted_normal_dshape,
+              rebuilt.penalty,
+              rebuilt.face_elements,
+              rebuilt.element_vdof_map,
+              scaling);
+          mfem::Vector rebuilt_y(sigma_face_apply.Size());
+          rebuilt_y = 0.0;
+          dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+            rebuilt_info,
+            rebuilt,
+            sigma_face_apply,
+            ip_sigma_apply,
+            rebuilt_y);
+          mfem::Vector rebuilt_diag(sigma_face_apply.Size());
+          rebuilt_diag = 0.0;
+          dg_igr::dg_face::AddInteriorFaceDGDiffusionDiagonal2D(
+            rebuilt_info,
+            rebuilt,
+            ip_sigma_apply,
+            rebuilt_diag);
+
+          refreshed_y -= rebuilt_y;
+          refreshed_diag -= rebuilt_diag;
+          refresh_apply_rel_max =
+            std::max(refresh_apply_rel_max,
+                     GlobalL2Norm(refreshed_y) /
+                       std::max(GlobalL2Norm(rebuilt_y), 1.0e-30));
+          refresh_diag_rel_max =
+            std::max(refresh_diag_rel_max,
+                     GlobalL2Norm(refreshed_diag) /
+                       std::max(GlobalL2Norm(rebuilt_diag), 1.0e-30));
+        }
+        ctx.LogMetric("igr_l2_exact_face_refresh apply_rel_max=" +
+                      FormatSci(refresh_apply_rel_max) +
+                      " diag_rel_max=" +
+                      FormatSci(refresh_diag_rel_max));
+        ctx.Check(refresh_apply_rel_max < 2.0e-12,
+                  "IGR exact face coefficient refresh matches full rebuild");
+        ctx.Check(refresh_diag_rel_max < 2.0e-12,
+                  "IGR exact face diagonal refresh matches full rebuild");
       }
 
       {
@@ -2818,6 +3260,73 @@ int RunIGRTests(TestContext& ctx)
                       FormatSci(cheb_qf_ref.GetLastPCSetupSeconds()) +
                       " solve_s=" +
                       FormatSci(cheb_qf_ref.GetLastLinearSolveSeconds()));
+
+        // A deliberately useless one-step polynomial must be rejected by the
+        // independent FP64 residual certificate.  The ensuing CG solve starts
+        // from the untouched original guess and must reproduce the ordinary
+        // Chebyshev-preconditioned reference solution.
+        {
+          ScopedEnvVar reduction_free(
+            "DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV", "1");
+          ScopedEnvVar reduction_degree(
+            "DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_DEGREE", "1");
+          ScopedEnvVar reduction_lambda_min(
+            "DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_LAMBDA_MIN", "1e-6");
+          ScopedEnvVar reduction_lambda_max(
+            "DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_LAMBDA_MAX", "1e6");
+          ScopedEnvVar reduction_bound_safety(
+            "DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_BOUND_SAFETY", "1");
+          dg_igr::IGRSolver reduction_free_fallback(sigma_fes_qf,
+                                                     state_fes_qf,
+                                                     dim_qf,
+                                                     num_eq_qf,
+                                                     /*alpha=*/0.3);
+          reduction_free_fallback.SetGradBackend(
+            dg_igr::IGRGradBackend::BrokenDG);
+          reduction_free_fallback.SetIPKind(dg_igr::IGRIPKind::SIPG);
+          reduction_free_fallback.SetSolveMode(
+            dg_igr::IGRSolveMode::Krylov);
+          reduction_free_fallback.SetLinearSolver(
+            dg_igr::IGRLinearSolverType::CG);
+          reduction_free_fallback.SetPreconditioner(
+            dg_igr::IGRPrecondType::OperatorChebyshev);
+          reduction_free_fallback.SetLinearSolveParams(/*rtol=*/1.0e-8,
+                                                        /*atol=*/0.0,
+                                                        /*max_it=*/1000,
+                                                        /*print=*/0);
+          reduction_free_fallback.UpdateFromState(U_qf,
+                                                  /*warm_start=*/false);
+
+          mfem::Vector reduction_delta(
+            reduction_free_fallback.GetSigma());
+          reduction_delta -= cheb_qf_ref.GetSigma();
+          const double reduction_reference_norm =
+            std::max(GlobalL2Norm(cheb_qf_ref.GetSigma()), 1.0e-30);
+          const double reduction_relative_delta =
+            GlobalL2Norm(reduction_delta) / reduction_reference_norm;
+          ctx.LogMetric(
+            "igr_l2_cpu_reduction_free_chebyshev_fallback rel=" +
+            FormatSci(reduction_relative_delta) + " total_iters=" +
+            std::to_string(
+              reduction_free_fallback.GetLastLinearIters()) +
+            " true_residual_rel_rhs=" +
+            FormatSci(
+              reduction_free_fallback.GetLastLinearTrueResidualRelRHS()));
+          ctx.Check(reduction_free_fallback.GetLastLinearConverged() &&
+                      reduction_free_fallback.GetLastLinearIters() > 1,
+                    "IGR reduction-free Chebyshev rejects an uncertified "
+                    "candidate and completes its bounded CG fallback");
+          ctx.Check(std::isfinite(
+                      reduction_free_fallback
+                        .GetLastLinearTrueResidualRelRHS()) &&
+                      reduction_free_fallback
+                        .GetLastLinearTrueResidualRelRHS() <= 1.0e-8,
+                    "IGR reduction-free fallback passes the independent "
+                    "FP64 residual certificate");
+          ctx.Check(reduction_relative_delta < 5.0e-8,
+                    "IGR reduction-free fallback preserves the original "
+                    "guess transaction and matches ordinary CG");
+        }
       }
 
 	      {
@@ -3947,6 +4456,401 @@ int RunIGRTests(TestContext& ctx)
                              /*interval=*/3,
                              "every-n-steps");
 
+    // ExtrapolatedEveryStep is an endpoint-projected index-one DAE method:
+    // accepted endpoint closures are exact, while every RHS stage evaluates
+    // sigma_n + ((t_stage-t_n)/h_{n-1}) (sigma_n-sigma_{n-1}).  In particular,
+    // the prediction must follow physical stage time rather than stage index,
+    // because SSPRK(10,4) has non-monotone abscissae c4=2/3, c5=1/3.
+    {
+      dg_igr::IGRSolver extrapolated_solver(sigma_fes_s,
+                                            state_fes_s,
+                                            dim_s,
+                                            num_eq_s,
+                                            /*alpha=*/0.25);
+      configure_checkpoint_solver(extrapolated_solver);
+      extrapolated_solver.SetSigmaUpdatePolicy(
+        dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
+        /*interval=*/1);
+      extrapolated_solver.SetStageRtolScale(1.0);
+
+      mfem::EulerFlux extrapolated_base_flux(dim_s, gamma);
+      mfem::FluxWithIGR extrapolated_igr_flux(extrapolated_base_flux);
+      extrapolated_igr_flux.SetSigmaField(&extrapolated_solver.GetSigma());
+      mfem::RusanovFluxWithSides extrapolated_num_flux(extrapolated_igr_flux);
+      auto extrapolated_form =
+        std::make_unique<mfem::HyperbolicFormIntegrator>(
+          extrapolated_num_flux,
+          /*IntOrderOffset=*/2);
+      mfem::DGHyperbolicConservationLaws extrapolated_op(
+        state_fes_s,
+        std::move(extrapolated_form),
+        /*preassembleWeakDivergence=*/true);
+      extrapolated_op.SetNumericalFlux(&extrapolated_num_flux);
+      mfem::ParGridFunction extrapolated_state(&state_fes_s);
+      extrapolated_state = U_base;
+      extrapolated_state.ExchangeFaceNbrData();
+      mfem::EulerWithIGR extrapolated_wrapped(
+        extrapolated_op, extrapolated_solver, extrapolated_state);
+      mfem::Vector extrapolated_rhs(extrapolated_state.Size());
+
+      constexpr std::uint64_t generation0 = 400;
+      constexpr double h0 = 0.01;
+      const mfem::IGRSigmaPreparationResult initial_anchor =
+        extrapolated_wrapped.PrepareSigmaForOutput(
+          extrapolated_state,
+          generation0,
+          /*next_rk_step=*/0,
+          /*time=*/0.0,
+          /*reusable_stage0=*/true);
+      mfem::Vector sigma0(extrapolated_solver.GetSigma());
+      const int solves_after_initial_anchor =
+        extrapolated_solver.GetLinearSolveCalls();
+
+      // RunTimeLoop performs this direct RHS probe before BeginRKStep when CFL
+      // control is active. It must preserve the exact initial anchor and its
+      // stage-0 prefetch transaction.
+      extrapolated_wrapped.Mult(extrapolated_state, extrapolated_rhs);
+      ctx.Check(extrapolated_solver.GetLinearSolveCalls() ==
+                    solves_after_initial_anchor &&
+                  extrapolated_solver.HasPendingStage0PrefetchAccounting(),
+                "IGR extrapolated cadence reuses the exact initial anchor for "
+                "the pre-step CFL probe");
+
+      extrapolated_wrapped.BeginRKStep(
+        /*step=*/0, /*t=*/0.0, /*dt=*/h0, /*stage_count=*/10);
+      extrapolated_wrapped.SetRKStageState(
+        /*stage=*/0, generation0, /*stage_time=*/0.0);
+      extrapolated_wrapped.Mult(extrapolated_state, extrapolated_rhs);
+      mfem::Vector first_stage_error(extrapolated_solver.GetSigma());
+      first_stage_error -= sigma0;
+
+      extrapolated_wrapped.SetRKStageState(
+        /*stage=*/4,
+        generation0 + 1,
+        /*stage_time=*/(2.0 / 3.0) * h0);
+      extrapolated_wrapped.Mult(U_stage, extrapolated_rhs);
+      mfem::Vector startup_hold_error(extrapolated_solver.GetSigma());
+      startup_hold_error -= sigma0;
+
+      extrapolated_state = U_stage;
+      extrapolated_state.ExchangeFaceNbrData();
+      extrapolated_wrapped.EndRKStep(
+        extrapolated_state, /*t=*/h0, generation0 + 2);
+      mfem::Vector sigma1(extrapolated_solver.GetSigma());
+      mfem::Vector first_endpoint_change(sigma1);
+      first_endpoint_change -= sigma0;
+      const double endpoint_change = GlobalL2Norm(first_endpoint_change);
+
+      ctx.Check(initial_anchor.solved && initial_anchor.reusable_stage0 &&
+                  first_stage_error.Normlinf() == 0.0 &&
+                  startup_hold_error.Normlinf() == 0.0,
+                "IGR extrapolated cadence starts from one exact anchor and "
+                "holds it during the history-free startup step");
+      ctx.Check(extrapolated_solver.GetLinearSolveCalls() ==
+                    solves_after_initial_anchor + 1 &&
+                  extrapolated_wrapped.GetSigmaEndpointSolveCount() == 1 &&
+                  extrapolated_wrapped.GetSigmaExtrapolatedStageCount() == 2,
+                "IGR extrapolated cadence performs no stage solves and one "
+                "post-limiter endpoint solve");
+      ctx.Check(endpoint_change > 1.0e-8 &&
+                  extrapolated_solver.GetLastLinearConverged() &&
+                  extrapolated_wrapped.GetSigmaStateGeneration() ==
+                    generation0 + 2,
+                "IGR extrapolated cadence commits a distinct exact endpoint "
+                "with accepted-state provenance");
+
+      constexpr double h1 = 0.02;
+      const std::uint64_t generation1 = generation0 + 2;
+      extrapolated_wrapped.BeginRKStep(
+        /*step=*/1, /*t=*/h0, /*dt=*/h1, /*stage_count=*/10);
+      extrapolated_wrapped.SetRKStageState(
+        /*stage=*/0, generation1, /*stage_time=*/h0);
+      extrapolated_wrapped.Mult(extrapolated_state, extrapolated_rhs);
+      mfem::Vector second_stage0_error(extrapolated_solver.GetSigma());
+      second_stage0_error -= sigma1;
+
+      mfem::Vector sigma_delta(sigma1);
+      sigma_delta -= sigma0;
+      auto predicted_sigma = [&](double stage_time)
+      {
+        mfem::Vector prediction(sigma1);
+        prediction.Add((stage_time - h0) / h0, sigma_delta);
+        return prediction;
+      };
+      auto prediction_error = [&](double stage_time)
+      {
+        mfem::Vector error(extrapolated_solver.GetSigma());
+        error -= predicted_sigma(stage_time);
+        return error.Normlinf();
+      };
+
+      const int solves_before_predicted_stages =
+        extrapolated_solver.GetLinearSolveCalls();
+      const double stage4_time = h0 + (2.0 / 3.0) * h1;
+      extrapolated_wrapped.SetRKStageState(
+        /*stage=*/4, generation1 + 1, stage4_time);
+      extrapolated_wrapped.Mult(U_base, extrapolated_rhs);
+      const double stage4_prediction_error = prediction_error(stage4_time);
+
+      const double stage5_time = h0 + (1.0 / 3.0) * h1;
+      extrapolated_wrapped.SetRKStageState(
+        /*stage=*/5, generation1 + 2, stage5_time);
+      extrapolated_wrapped.Mult(U_stage, extrapolated_rhs);
+      const double stage5_prediction_error = prediction_error(stage5_time);
+      const double prediction_scale =
+        std::max({1.0, sigma0.Normlinf(), sigma1.Normlinf()});
+
+      ctx.Check(second_stage0_error.Normlinf() == 0.0 &&
+                  stage4_prediction_error <= 32.0 *
+                    std::numeric_limits<double>::epsilon() * prediction_scale &&
+                  stage5_prediction_error <= 32.0 *
+                    std::numeric_limits<double>::epsilon() * prediction_scale,
+                "IGR extrapolated cadence maps variable dt and non-monotone "
+                "SSPRK(10,4) abscissae to physical-time predictions");
+      ctx.Check(extrapolated_solver.GetLinearSolveCalls() ==
+                  solves_before_predicted_stages,
+                "IGR extrapolated cadence adds no closure solve at predicted "
+                "RHS stages");
+
+      // A rejected attempt must restore the exact accepted anchor and leave
+      // both endpoint history and solve counts unchanged.  The retried stage
+      // then uses its new dt with the same accepted sigma difference.
+      extrapolated_wrapped.AbortRKStep(extrapolated_state,
+                                       /*restored_time=*/h0,
+                                       generation1,
+                                       /*retry_dt=*/0.005);
+      mfem::Vector rollback_error(extrapolated_solver.GetSigma());
+      rollback_error -= sigma1;
+      ctx.Check(rollback_error.Normlinf() == 0.0 &&
+                  extrapolated_wrapped.GetSigmaStateGeneration() == generation1 &&
+                  extrapolated_solver.GetLinearSolveCalls() ==
+                    solves_before_predicted_stages &&
+                  extrapolated_wrapped.GetSigmaEndpointSolveCount() == 1,
+                "IGR extrapolated cadence rollback restores the immutable "
+                "accepted anchor without a closure solve");
+
+      constexpr double retry_dt = 0.005;
+      extrapolated_wrapped.BeginRKStep(
+        /*step=*/1, /*t=*/h0, /*dt=*/retry_dt, /*stage_count=*/10);
+      extrapolated_wrapped.SetRKStageState(
+        /*stage=*/0, generation1, /*stage_time=*/h0);
+      extrapolated_wrapped.Mult(extrapolated_state, extrapolated_rhs);
+      const double retry_stage4_time = h0 + (2.0 / 3.0) * retry_dt;
+      extrapolated_wrapped.SetRKStageState(
+        /*stage=*/4, generation1 + 1, retry_stage4_time);
+      extrapolated_wrapped.Mult(U_base, extrapolated_rhs);
+      const double retry_prediction_error =
+        prediction_error(retry_stage4_time);
+      ctx.Check(retry_prediction_error <= 32.0 *
+                  std::numeric_limits<double>::epsilon() * prediction_scale,
+                "IGR extrapolated cadence retry uses the reduced dt without "
+                "mutating accepted history");
+
+      extrapolated_state = U_base;
+      extrapolated_state.ExchangeFaceNbrData();
+      extrapolated_wrapped.EndRKStep(extrapolated_state,
+                                     /*t=*/h0 + retry_dt,
+                                     generation1 + 2);
+      const double endpoint_defect =
+        extrapolated_wrapped.GetMaximumLocalSigmaEndpointPredictionDefect();
+      const double relative_endpoint_defect = extrapolated_wrapped
+        .GetMaximumLocalRelativeSigmaEndpointPredictionDefect();
+      ctx.LogMetric("igr_extrapolated_every_step endpoint_solves=" +
+                    std::to_string(
+                      extrapolated_wrapped.GetSigmaEndpointSolveCount()) +
+                    " stage_predictions=" +
+                    std::to_string(
+                      extrapolated_wrapped.GetSigmaExtrapolatedStageCount()) +
+                    " max_endpoint_defect=" + FormatSci(endpoint_defect) +
+                    " max_relative_endpoint_defect=" +
+                    FormatSci(relative_endpoint_defect));
+      ctx.AddParity(endpoint_defect + relative_endpoint_defect);
+      ctx.Check(extrapolated_wrapped.GetSigmaEndpointSolveCount() == 2 &&
+                  extrapolated_solver.GetLinearSolveCalls() ==
+                    solves_before_predicted_stages + 1 &&
+                  std::isfinite(endpoint_defect) && endpoint_defect > 0.0 &&
+                  std::isfinite(relative_endpoint_defect),
+                "IGR extrapolated cadence certifies each accepted endpoint and "
+                "reports a finite prediction defect");
+
+      const long long stage_predictions_before_ssprk104 =
+        extrapolated_wrapped.GetSigmaExtrapolatedStageCount();
+      const long long endpoint_solves_before_ssprk104 =
+        extrapolated_wrapped.GetSigmaEndpointSolveCount();
+      const int linear_solves_before_ssprk104 =
+        extrapolated_solver.GetLinearSolveCalls();
+      mfem::RK3SSPWithLimiter extrapolated_ssprk104(
+        state_fes_s, mfem::SSPRKMethod::SSPRK104);
+      extrapolated_ssprk104.SetEulerParams(dim_s, gamma);
+      extrapolated_ssprk104.SetLimiterParams(
+        /*rho_min=*/1.0e-10,
+        /*p_min=*/1.0e-10,
+        /*quad_order=*/6,
+        /*p_bisect_iters=*/12);
+      extrapolated_ssprk104.LimitInitial(true);
+      extrapolated_ssprk104.AddZhangShuLimiter(
+        mfem::ZhangShuPointSet::kConsumer);
+      extrapolated_ssprk104.Init(extrapolated_wrapped);
+      extrapolated_ssprk104.RestoreStateGeneration(generation1 + 2);
+      extrapolated_ssprk104.SetStepCount(/*step=*/2);
+      mfem::real_t integrated_time = h0 + retry_dt;
+      mfem::real_t integrated_dt = 1.0e-8;
+      extrapolated_ssprk104.Step(
+        extrapolated_state, integrated_time, integrated_dt);
+      ctx.Check(extrapolated_wrapped.GetSigmaExtrapolatedStageCount() ==
+                    stage_predictions_before_ssprk104 + 10 &&
+                  extrapolated_wrapped.GetSigmaEndpointSolveCount() ==
+                    endpoint_solves_before_ssprk104 + 1 &&
+                  extrapolated_solver.GetLinearSolveCalls() ==
+                    linear_solves_before_ssprk104 + 1,
+                "SSPRK(10,4) drives ten extrapolated sigma stages and one "
+                "exact accepted endpoint closure while a no-op entry limiter "
+                "preserves the previous endpoint provenance");
+      ctx.CheckNear(integrated_time,
+                    h0 + retry_dt + integrated_dt,
+                    10.0 * std::numeric_limits<mfem::real_t>::epsilon(),
+                    "SSPRK(10,4) advances the extrapolated DAE candidate");
+    }
+
+    // Extrapolated-stage q_sigma admission uses only samples contributed by
+    // the just-completed RHS. A rejection restores the exact accepted anchor;
+    // its cumulative telemetry must not reject the subsequent retry again.
+    {
+      dg_igr::IGRSolver admission_solver(sigma_fes_s,
+                                         state_fes_s,
+                                         dim_s,
+                                         num_eq_s,
+                                         /*alpha=*/0.25);
+      configure_checkpoint_solver(admission_solver);
+      admission_solver.SetSigmaUpdatePolicy(
+        dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
+        /*interval=*/1);
+      admission_solver.SetStageRtolScale(1.0);
+
+      mfem::EulerFlux admission_base_flux(dim_s, gamma);
+      mfem::FluxWithIGR admission_igr_flux(admission_base_flux);
+      admission_igr_flux.SetSigmaField(&admission_solver.GetSigma());
+      mfem::RusanovFluxWithSides admission_num_flux(admission_igr_flux);
+      auto admission_form =
+        std::make_unique<mfem::HyperbolicFormIntegrator>(
+          admission_num_flux,
+          /*IntOrderOffset=*/2);
+      SyntheticQSigmaTelemetryDG admission_op(
+        state_fes_s,
+        std::move(admission_form),
+        /*preassembleWeakDivergence=*/true);
+      admission_op.SetNumericalFlux(&admission_num_flux);
+      mfem::ParGridFunction admission_state(&state_fes_s);
+      admission_state = U_base;
+      admission_state.ExchangeFaceNbrData();
+      mfem::EulerWithIGR admission_wrapped(
+        admission_op, admission_solver, admission_state);
+      mfem::Vector admission_rhs(admission_state.Size());
+
+      constexpr std::uint64_t admission_generation = 700;
+      constexpr double admission_dt = 0.01;
+      admission_wrapped.PrepareSigmaForOutput(
+        admission_state,
+        admission_generation,
+        /*next_rk_step=*/0,
+        /*time=*/0.0,
+        /*reusable_stage0=*/true);
+      const mfem::Vector accepted_sigma(admission_solver.GetSigma());
+
+      admission_op.SeedHistoricalFailure(/*nonpositive=*/11,
+                                         /*nonfinite=*/7);
+      admission_wrapped.BeginRKStep(
+        /*step=*/0,
+        /*t=*/0.0,
+        /*dt=*/admission_dt,
+        /*stage_count=*/10);
+      admission_wrapped.SetRKStageState(
+        /*stage=*/0,
+        admission_generation,
+        /*stage_time=*/0.0);
+      bool historical_failure_replayed = false;
+      try
+      {
+        admission_wrapped.Mult(admission_state, admission_rhs);
+      }
+      catch (const mfem::RecoverableRKStageAdmissionFailure&)
+      {
+        historical_failure_replayed = true;
+      }
+
+      admission_op.FailNextRHS(/*nonpositive=*/3, /*nonfinite=*/2);
+      admission_wrapped.SetRKStageState(
+        /*stage=*/4,
+        admission_generation + 1,
+        /*stage_time=*/(2.0 / 3.0) * admission_dt);
+      bool current_rhs_rejected = false;
+      try
+      {
+        admission_wrapped.Mult(admission_state, admission_rhs);
+      }
+      catch (const mfem::RecoverableRKStageAdmissionFailure& failure)
+      {
+        current_rhs_rejected =
+          failure.Reason() == mfem::RKStageAdmissionFailureReason::
+                                QSigmaNonpositiveAndNonfinite &&
+          failure.GlobalNonpositiveQSigmaSampleCount() == 3 &&
+          failure.GlobalNonfiniteQSigmaSampleCount() == 2 &&
+          failure.Stage() == 4;
+      }
+      admission_wrapped.AbortRKStep(admission_state,
+                                    /*restored_time=*/0.0,
+                                    admission_generation,
+                                    /*retry_dt=*/0.005);
+      mfem::Vector admission_rollback_error(admission_solver.GetSigma());
+      admission_rollback_error -= accepted_sigma;
+
+      admission_wrapped.BeginRKStep(
+        /*step=*/0,
+        /*t=*/0.0,
+        /*dt=*/0.005,
+        /*stage_count=*/10);
+      admission_wrapped.SetRKStageState(
+        /*stage=*/0,
+        admission_generation,
+        /*stage_time=*/0.0);
+      bool retry_replayed_failure = false;
+      try
+      {
+        admission_wrapped.Mult(admission_state, admission_rhs);
+      }
+      catch (const mfem::RecoverableRKStageAdmissionFailure&)
+      {
+        retry_replayed_failure = true;
+      }
+      admission_wrapped.AbortRKStep(admission_state,
+                                    /*restored_time=*/0.0,
+                                    admission_generation,
+                                    /*retry_dt=*/0.0);
+
+      ctx.Check(admission_wrapped.RequiresRKStepTransaction(),
+                "IGR extrapolated q_sigma admission requests an RK rollback "
+                "transaction");
+      ctx.Check(!historical_failure_replayed && current_rhs_rejected &&
+                  !retry_replayed_failure,
+                "IGR extrapolated q_sigma admission rejects only violations "
+                "newly observed by the current RHS");
+      ctx.Check(admission_rollback_error.Normlinf() == 0.0 &&
+                  admission_wrapped.GetSigmaStateGeneration() ==
+                    admission_generation,
+                "IGR extrapolated q_sigma rejection restores the immutable "
+                "accepted sigma anchor");
+      ctx.Check(admission_wrapped.GetSigmaStageAdmissionRejectionCount() == 1 &&
+                  admission_wrapped
+                      .GetSigmaStageAdmissionNonpositiveSampleCount() == 3 &&
+                  admission_wrapped
+                      .GetSigmaStageAdmissionNonfiniteSampleCount() == 2 &&
+                  std::string(admission_wrapped
+                                .GetLastSigmaStageAdmissionFailureReason()) ==
+                    "q-sigma-nonpositive-and-nonfinite",
+                "IGR extrapolated q_sigma admission reports bounded counts "
+                "and its last reason");
+    }
+
     // --- Rejected RK attempts restore IGR cadence and stage-0 provenance ---
     auto check_refresh_rejection =
       [&](dg_igr::IGRSigmaUpdateCadence cadence,
@@ -4208,13 +5112,7 @@ int RunIGRTests(TestContext& ctx)
   if (mfem::Mpi::WorldSize() > 1)
   {
     constexpr int dim_shared = 2;
-    mfem::Mesh mesh_shared =
-      mfem::Mesh::MakeCartesian2D(/*nx=*/4,
-                                  /*ny=*/2,
-                                  mfem::Element::QUADRILATERAL,
-                                  /*generate_edges=*/true,
-                                  /*sx=*/1.0,
-                                  /*sy=*/0.5);
+    mfem::Mesh mesh_shared = MakeGradedQuadMesh2D();
     mfem::ParMesh pmesh_shared(MPI_COMM_WORLD, mesh_shared);
 
     mfem::DG_FECollection shared_fec(/*order=*/1,
@@ -4278,6 +5176,134 @@ int RunIGRTests(TestContext& ctx)
         shared_fes,
         shared_face_ir,
         &shared_apply_reason);
+
+    int local_shared_alpha_bad = 0;
+    double local_shared_alpha_error = 0.0;
+    double local_shared_alpha_jump = 0.0;
+    double local_shared_alpha_vs_max = 0.0;
+    if (local_pmesh_shared > 0)
+    {
+      constexpr double shared_c_alpha = 0.39;
+      constexpr double shared_rho = 1.3;
+      constexpr double shared_rho_floor = 0.2;
+      mfem::ParGridFunction shared_density(&shared_fes);
+      shared_density = shared_rho;
+      shared_density.ExchangeFaceNbrData();
+
+      double local_h2_max = 0.0;
+      for (int e = 0; e < pmesh_shared.GetNE(); ++e)
+      {
+        const double h = pmesh_shared.GetElementSize(e, 1);
+        local_h2_max = std::max(local_h2_max, h * h);
+      }
+      double global_h2_max = 0.0;
+      MPI_Allreduce(&local_h2_max,
+                    &global_h2_max,
+                    1,
+                    MPI_DOUBLE,
+                    MPI_MAX,
+                    MPI_COMM_WORLD);
+
+      mfem::Vector face_side_alpha(2 * local_pmesh_shared);
+      auto requested_alpha =
+        mfem::Reshape(face_side_alpha.HostWrite(), 2, local_pmesh_shared);
+      for (int sf = 0; sf < local_pmesh_shared; ++sf)
+      {
+        mfem::FaceElementTransformations* Tr =
+          pmesh_shared.GetSharedFaceTransformations(sf, /*fill2=*/true);
+        MFEM_VERIFY(Tr && Tr->Elem1 && Tr->Elem2,
+                    "Shared local-alpha projection test needs two elements.");
+        const int nbr_el = Tr->Elem2No - pmesh_shared.GetNE();
+        MFEM_VERIFY(Tr->Elem1No >= 0 &&
+                      Tr->Elem1No < pmesh_shared.GetNE() && nbr_el >= 0,
+                    "Shared local-alpha projection test element mismatch.");
+        const double h0 = pmesh_shared.GetElementSize(Tr->Elem1No, 1);
+        const double h1 = pmesh_shared.GetFaceNbrElementSize(nbr_el, 1);
+        requested_alpha(0, sf) = shared_c_alpha * h0 * h0;
+        requested_alpha(1, sf) = shared_c_alpha * h1 * h1;
+        local_shared_alpha_jump =
+          std::max(local_shared_alpha_jump,
+                   std::abs(requested_alpha(0, sf) -
+                            requested_alpha(1, sf)));
+      }
+
+      mfem::Vector projected_local_q;
+      mfem::Vector projected_max_q;
+      dg_igr::dg_face::SharedFaceSideDensityProjectionScratch
+        projected_local_scratch;
+      dg_igr::dg_face::SharedFaceSideDensityProjectionScratch
+        projected_max_scratch;
+      const auto projected_local_info =
+        dg_igr::dg_face::ProjectSharedFaceDensityCoefficient2D(
+          shared_fes,
+          shared_face_ir,
+          shared_density,
+          face_side_alpha,
+          shared_rho_floor,
+          projected_local_q,
+          &projected_local_scratch);
+      const auto projected_max_info =
+        dg_igr::dg_face::ProjectSharedFaceDensityCoefficient2D(
+          shared_fes,
+          shared_face_ir,
+          shared_density,
+          shared_c_alpha * global_h2_max,
+          shared_rho_floor,
+          projected_max_q,
+          &projected_max_scratch);
+      if (projected_local_info.nf != local_pmesh_shared ||
+          projected_local_info.nf != projected_max_info.nf ||
+          projected_local_info.nq != projected_max_info.nq ||
+          projected_local_scratch.side_alpha.Size() !=
+            2 * local_pmesh_shared ||
+          projected_max_scratch.side_alpha.Size() != 0)
+      {
+        local_shared_alpha_bad = 1;
+      }
+      else
+      {
+        const auto requested =
+          mfem::Reshape(face_side_alpha.HostRead(), 2, local_pmesh_shared);
+        const auto retained =
+          mfem::Reshape(projected_local_scratch.side_alpha.HostRead(),
+                        2,
+                        local_pmesh_shared);
+        const auto local_q = mfem::Reshape(projected_local_q.HostRead(),
+                                           2,
+                                           projected_local_info.nq,
+                                           projected_local_info.nf);
+        const auto max_q = mfem::Reshape(projected_max_q.HostRead(),
+                                         2,
+                                         projected_max_info.nq,
+                                         projected_max_info.nf);
+        for (int f = 0; f < projected_local_info.nf; ++f)
+        {
+          for (int side = 0; side < 2; ++side)
+          {
+            local_shared_alpha_error =
+              std::max(local_shared_alpha_error,
+                       std::abs(retained(side, f) - requested(side, f)));
+            for (int q = 0; q < projected_local_info.nq; ++q)
+            {
+              const double expected = requested(side, f) / shared_rho;
+              const double expected_max =
+                shared_c_alpha * global_h2_max / shared_rho;
+              local_shared_alpha_error =
+                std::max({local_shared_alpha_error,
+                          std::abs(local_q(side, q, f) - expected),
+                          std::abs(max_q(side, q, f) - expected_max)});
+              local_shared_alpha_vs_max =
+                std::max(local_shared_alpha_vs_max,
+                         std::abs(local_q(side, q, f) - max_q(side, q, f)));
+            }
+          }
+        }
+        if (local_shared_alpha_error > 5.0e-13)
+        {
+          local_shared_alpha_bad = 1;
+        }
+      }
+    }
 
     int local_shared_apply_bad = 0;
     int local_shared_apply_nf = 0;
@@ -4591,7 +5617,9 @@ int RunIGRTests(TestContext& ctx)
                                             shared_state_fes,
                                             dim_shared,
                                             num_eq_shared,
-                                            /*alpha=*/0.19);
+                                            /*C_alpha=*/0.19);
+      shared_exact_solver.SetAlphaLengthScalePolicy(
+        dg_igr::IGRAlphaLengthScalePolicy::Local);
       shared_exact_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
       shared_exact_solver.SetPreconditioner(dg_igr::IGRPrecondType::None);
       shared_exact_solver.SetLinearSolveParams(/*rtol=*/1.0e-9,
@@ -4606,6 +5634,7 @@ int RunIGRTests(TestContext& ctx)
       local_exact_operator_local_nf =
         shared_exact_solver.GetLastExactFaceLocalFaceCount();
       if (!shared_exact_solver.GetLastLinearConverged() ||
+          !shared_exact_solver.GetLastExactFaceEffective() ||
           local_exact_operator_shared_nf != local_pmesh_shared ||
           local_exact_operator_local_nf <= 0)
       {
@@ -4718,6 +5747,10 @@ int RunIGRTests(TestContext& ctx)
     int global_exact_operator_converged = 0;
     int global_harmonic_operator_bad = 0;
     int global_harmonic_operator_converged = 0;
+    int global_shared_alpha_bad = 0;
+    double global_shared_alpha_error = 0.0;
+    double global_shared_alpha_jump = 0.0;
+    double global_shared_alpha_vs_max = 0.0;
     MPI_Allreduce(&local_bad_support,
                   &global_bad_support,
                   1,
@@ -4772,6 +5805,30 @@ int RunIGRTests(TestContext& ctx)
                   MPI_INT,
                   MPI_SUM,
                   MPI_COMM_WORLD);
+    MPI_Allreduce(&local_shared_alpha_bad,
+                  &global_shared_alpha_bad,
+                  1,
+                  MPI_INT,
+                  MPI_SUM,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(&local_shared_alpha_error,
+                  &global_shared_alpha_error,
+                  1,
+                  MPI_DOUBLE,
+                  MPI_MAX,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(&local_shared_alpha_jump,
+                  &global_shared_alpha_jump,
+                  1,
+                  MPI_DOUBLE,
+                  MPI_MAX,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(&local_shared_alpha_vs_max,
+                  &global_shared_alpha_vs_max,
+                  1,
+                  MPI_DOUBLE,
+                  MPI_MAX,
+                  MPI_COMM_WORLD);
 
     ctx.LogMetric("igr_l2_exact_face_shared_guard local_shared_fqs=" +
                   std::to_string(local_shared_in_fqs) +
@@ -4801,6 +5858,11 @@ int RunIGRTests(TestContext& ctx)
                   FormatSci(harmonic_symmetry_defect) +
                   " converged_ranks=" +
                   std::to_string(global_harmonic_operator_converged));
+    ctx.LogMetric("igr_local_alpha_shared_face_qf err=" +
+                  FormatSci(global_shared_alpha_error) +
+                  " side_jump=" + FormatSci(global_shared_alpha_jump) +
+                  " local_vs_max=" +
+                  FormatSci(global_shared_alpha_vs_max));
     ctx.AddParity(static_cast<double>(global_shared_in_fqs +
                                       global_pmesh_shared +
                                       global_bad_support +
@@ -4819,6 +5881,14 @@ int RunIGRTests(TestContext& ctx)
               "IGR exact-face shared-face metadata builder is valid");
     ctx.Check(global_shared_apply_nf == global_pmesh_shared,
               "IGR exact-face shared-face metadata covers ParMesh shared faces");
+    ctx.Check(global_shared_alpha_bad == 0 &&
+                global_shared_alpha_error < 5.0e-13,
+              "IGR shared-face qdata preserves exact local and neighbor "
+              "C_alpha*h_e^2 values");
+    ctx.Check(global_shared_alpha_jump > 1.0e-3 &&
+                global_shared_alpha_vs_max > 1.0e-3,
+              "IGR shared-face local alpha crosses unequal elements and is "
+              "not constant alpha_max");
     ctx.Check(global_exact_operator_bad == 0,
               "IGR exact-face MPI operator path converges with shared faces");
     ctx.Check(global_exact_operator_shared_nf == global_pmesh_shared,

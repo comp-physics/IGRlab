@@ -33,6 +33,7 @@ struct IGROptions
   std::string alpha_length_policy = "";
   std::string space = "H1";
   std::string grad = "H1";
+  int sigma_order = -1;
   std::string solve_mode = "krylov";
   std::string linear_solver = "auto";
   std::string preconditioner = "auto";
@@ -60,6 +61,13 @@ enum class DGBackend
 {
   DG,
   DGSEM
+};
+
+/// @brief Numerical flux used by the ordinary primal-DG transport path.
+enum class DGSurfaceFlux
+{
+  Rusanov,
+  HdgTraceCentered
 };
 
 /// @brief General discretization selection, including unavailable seams.
@@ -242,6 +250,7 @@ struct RunConfig
   HdgCudaEngine hdg_cuda_engine = HdgCudaEngine::Ordinary;
   Regularization regularization = Regularization::IGR;
   TimeIntegrator time_integrator = TimeIntegrator::RK3SSP;
+  DGSurfaceFlux dg_surface_flux = DGSurfaceFlux::Rusanov;
   DGSEMStabilization dgsem_stab = DGSEMStabilization::None;
   DGSEMVolumeFlux dgsem_volume_flux = DGSEMVolumeFlux::Central;
   DGSEMVolumeDissipation dgsem_volume_dissipation =
@@ -508,6 +517,11 @@ ParseIGRSigmaUpdateCadence(const std::string& value)
   {
     return dg_igr::IGRSigmaUpdateCadence::EveryStep;
   }
+  if (lower == "extrapolated-every-step" ||
+      lower == "extrapolated_every_step" || lower == "extrapolated-step")
+  {
+    return dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+  }
   if (lower == "every-n-steps" || lower == "every_n_steps" ||
       lower == "every-n" || lower == "nsteps")
   {
@@ -516,7 +530,8 @@ ParseIGRSigmaUpdateCadence(const std::string& value)
   MFEM_VERIFY(false,
               "Invalid IGR sigma cadence '"
                 << value
-                << "'. Use 'every-stage', 'every-step', or "
+                << "'. Use 'every-stage', 'every-step', "
+                   "'extrapolated-every-step', or "
                    "'every-n-steps'.");
   return dg_igr::IGRSigmaUpdateCadence::EveryStage;
 }
@@ -628,6 +643,8 @@ IGRSigmaUpdateCadenceToString(dg_igr::IGRSigmaUpdateCadence value)
     return "every-stage";
   case dg_igr::IGRSigmaUpdateCadence::EveryStep:
     return "every-step";
+  case dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep:
+    return "extrapolated-every-step";
   case dg_igr::IGRSigmaUpdateCadence::EveryNSteps:
     return "every-n-steps";
   }
@@ -1151,6 +1168,30 @@ inline bool IsBrokenDGIGRGradName(const std::string& value)
          lower == "broken-dg";
 }
 
+inline void ValidateIGRSigmaOrderSelection(const IGROptions& igr_opts)
+{
+  MFEM_VERIFY(igr_opts.sigma_order >= -1,
+              "--igr-sigma-order must be -1 (inherit Euler order) or a "
+              "nonnegative polynomial order.");
+  MFEM_VERIFY(igr_opts.sigma_order < 0 ||
+                (IsL2IGRSpaceName(igr_opts.space) &&
+                 IsBrokenDGIGRGradName(igr_opts.grad)),
+              "An explicit --igr-sigma-order requires --igr-space L2 and "
+              "--igr-grad BrokenL2.");
+}
+
+inline int ResolveIGRSigmaOrder(int euler_order,
+                                const IGROptions& igr_opts)
+{
+  ValidateIGRSigmaOrderSelection(igr_opts);
+  return igr_opts.sigma_order >= 0 ? igr_opts.sigma_order : euler_order;
+}
+
+inline int ResolveIGRSigmaOrder(const RunConfig& run_cfg)
+{
+  return ResolveIGRSigmaOrder(run_cfg.opts.order, run_cfg.igr_opts);
+}
+
 inline bool IsExactDGFaceOptionName(const std::string& value)
 {
   return value == "-iexface" || value == "--igr-exact-dg-face" ||
@@ -1495,6 +1536,38 @@ inline DGSEMSurfaceFlux ParseDGSEMSurfaceFlux(const std::string& value)
   return DGSEMSurfaceFlux::Rusanov;
 }
 
+inline DGSurfaceFlux ParseDGSurfaceFlux(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "rusanov" || lower == "lf" || lower == "lax-friedrichs")
+  {
+    return DGSurfaceFlux::Rusanov;
+  }
+  if (lower == "hdg-trace-centered" || lower == "hdg_trace_centered" ||
+      lower == "trace-centered" || lower == "trace_centered")
+  {
+    return DGSurfaceFlux::HdgTraceCentered;
+  }
+  MFEM_VERIFY(false,
+              "Invalid ordinary-DG surface flux '"
+                << value
+                << "'. Use 'rusanov' or 'hdg-trace-centered'.");
+  return DGSurfaceFlux::Rusanov;
+}
+
+inline const char* DGSurfaceFluxToString(DGSurfaceFlux flux)
+{
+  switch (flux)
+  {
+  case DGSurfaceFlux::Rusanov:
+    return "rusanov";
+  case DGSurfaceFlux::HdgTraceCentered:
+    return "hdg-trace-centered";
+  }
+  MFEM_ABORT("Unhandled DGSurfaceFlux enum value in DGSurfaceFluxToString.");
+  return "rusanov";
+}
+
 inline DGSEMEntropyJacobian ParseDGSEMEntropyJacobian(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
@@ -1683,6 +1756,11 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
                  "-ig",
                  "--igr-grad",
                  "Gradient reconstruction type: 'H1' or 'BrokenL2'.");
+  args.AddOption(&igr_opts.sigma_order,
+                 "-iso",
+                 "--igr-sigma-order",
+                 "IGR sigma polynomial order (-1 inherits the Euler order; "
+                 "an explicit order requires L2/BrokenL2).");
   args.AddOption(&igr_opts.solve_mode,
                  "-im",
                  "--igr-solve-mode",
@@ -1707,7 +1785,8 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
     &igr_opts.sigma_cadence,
     "-iscad",
     "--igr-sigma-cadence",
-    "IGR sigma update cadence: every-stage | every-step | every-n-steps.");
+    "IGR sigma update cadence: every-stage | every-step | "
+    "extrapolated-every-step | every-n-steps.");
   args.AddOption(&igr_opts.sigma_update_interval,
                  "-isn",
                  "--igr-sigma-update-interval",
@@ -1798,6 +1877,7 @@ inline RunConfig MakeRunConfig(
   Regularization regularization = Regularization::IGR,
   TimeIntegrator time_integrator = TimeIntegrator::RK3SSP)
 {
+  ValidateIGRSigmaOrderSelection(igr_opts);
   RunConfig run_cfg;
   run_cfg.case_config = case_cfg;
   const PositivityLimiterSelection positivity_limiter =
@@ -1831,6 +1911,7 @@ inline RunConfig MakeRunConfig(
                 << DiscretizationToString(run_cfg.discretization)
                 << "' is recognized but unavailable in this executable.");
   run_cfg.dg_backend = dg_backend.value_or(DGBackend::DG);
+  run_cfg.dg_surface_flux = ParseDGSurfaceFlux(opts.dg_surface_flux);
   run_cfg.dgsem_stab = ParseDGSEMStabilization(opts.dgsem_stab);
   run_cfg.dgsem_volume_flux = ParseDGSEMVolumeFlux(opts.dgsem_volume_flux);
   run_cfg.dgsem_volume_dissipation =

@@ -29,6 +29,15 @@ ConfigureDGSEMSurfaceFlux<mfem::DGSEMSurfaceFlux>(mfem::DGSEMSurfaceFlux& flux,
                                                   const RunConfig& run_cfg,
                                                   double gamma)
 {
+  if (run_cfg.dg_backend == DGBackend::DG)
+  {
+    flux.SetSurfaceFluxType(
+      run_cfg.dg_surface_flux == DGSurfaceFlux::HdgTraceCentered
+        ? mfem::DGSEMSurfaceFluxType::HdgTraceCentered
+        : mfem::DGSEMSurfaceFluxType::Rusanov);
+    flux.SetGamma(gamma);
+    return;
+  }
   auto to_mfem_surface = [](DGSEMSurfaceFlux sf)
   {
     switch (sf)

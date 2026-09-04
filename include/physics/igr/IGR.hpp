@@ -1,5 +1,6 @@
 #pragma once
 #include "mfem.hpp"
+#include "mfem/general/reducers.hpp"
 #include "utils/config/igr_config.hpp"
 #include <algorithm>
 #include <limits>
@@ -523,6 +524,7 @@ private:
   // opt-in for operator-equivalence diagnostics and PA reference runs.
   bool UseDeviceCoefficients_() const;
   void EnsureDeviceQuadrature_();
+  void EnsureDeviceElementAlpha_();
   void UpdateDeviceCoefficients_(const mfem::ParGridFunction& U);
 
   // ---------- Coefficients that depend on the current state U ----------
@@ -621,6 +623,13 @@ private:
   std::unique_ptr<mfem::QuadratureFunctionCoefficient> ck_face_qf_coef_;
   mfem::Vector device_qinterp_evec_;
   mfem::Vector device_face_restr_evec_;
+  // For the local length policy, alpha_ stores C_alpha while this cache stores
+  // the physical per-element alpha_e = C_alpha h_e^2.  It is reused until the
+  // mesh sequence or C_alpha changes.
+  mfem::Vector device_element_alpha_;
+  long device_element_alpha_mesh_sequence_ = -1;
+  double device_element_alpha_c_alpha_ =
+    std::numeric_limits<double>::quiet_NaN();
 
   /// α(x) as a coefficient derived from the selected length-scale policy.
   class AlphaPolicyCoefficient : public mfem::Coefficient
@@ -721,6 +730,45 @@ private:
   mfem::OperatorHandle Ah_; // holds the assembled operator (Hypre matrix)
   // Owns the current stage's exact-face operator while Ah_ owns the sum.
   std::unique_ptr<mfem::Operator> exact_face_operator_;
+  // Env-screened exact element-block preconditioner reused only within one
+  // explicit RK step. Staleness affects convergence, never the exact operator
+  // or the independent FP64 residual acceptance criterion.
+  std::unique_ptr<mfem::Solver> exact_element_block_step_cache_;
+  const mfem::Mesh* exact_element_block_cache_mesh_ = nullptr;
+  long exact_element_block_cache_mesh_sequence_ = -1;
+  long exact_element_block_cache_sfes_sequence_ = -1;
+  int exact_element_block_cache_rk_step_ = -1;
+  int exact_element_block_cache_vector_size_ = -1;
+  int exact_element_block_cache_block_size_ = -1;
+  double exact_element_block_cache_alpha_ =
+    std::numeric_limits<double>::quiet_NaN();
+  AlphaLengthScalePolicy exact_element_block_cache_alpha_policy_ =
+    AlphaLengthScalePolicy::Average;
+  IPKind exact_element_block_cache_ip_kind_ = IPKind::SIPG;
+  // Env-only frozen-coefficient LOR/AMG screen.  Keep the surrogate form and
+  // coefficient alive because the explicitly selected legacy LOR assembly
+  // borrows its integrators.
+  std::unique_ptr<mfem::ConstantCoefficient> static_dg_lor_mass_coef_;
+  std::unique_ptr<mfem::ConstantCoefficient> static_dg_lor_diffusion_coef_;
+  std::unique_ptr<mfem::ParBilinearForm> static_dg_lor_form_;
+  std::unique_ptr<mfem::ParLORDiscretization> static_dg_lor_discretization_;
+  std::unique_ptr<mfem::Solver> static_dg_lor_amg_;
+  mfem::Vector static_dg_lor_diagonal_;
+  const mfem::Mesh* static_dg_lor_mesh_ = nullptr;
+  long static_dg_lor_mesh_sequence_ = -1;
+  long static_dg_lor_sfes_sequence_ = -1;
+  double static_dg_lor_alpha_ = std::numeric_limits<double>::quiet_NaN();
+  double static_dg_lor_alpha_proxy_ =
+    std::numeric_limits<double>::quiet_NaN();
+  AlphaLengthScalePolicy static_dg_lor_alpha_policy_ =
+    AlphaLengthScalePolicy::Average;
+  double static_dg_lor_penalty_ = std::numeric_limits<double>::quiet_NaN();
+  int static_dg_lor_order_ = -1;
+  int static_dg_lor_amg_coarsen_type_ = -2;
+  int static_dg_lor_amg_relax_type_ = -2;
+  int static_dg_lor_amg_max_levels_ = -2;
+  double static_dg_lor_amg_strong_threshold_ =
+    std::numeric_limits<double>::quiet_NaN();
   mfem::Vector X_, B_;      // true-dof vectors
 
   // H1 projection backend storage

@@ -75,6 +75,18 @@ private:
   bool had_value_ = false;
 };
 
+class UnsupportedBoundaryState final : public mfem::BoundaryState
+{
+public:
+  void Eval(const mfem::Vector& interior,
+            const mfem::Vector&,
+            mfem::FaceElementTransformations&,
+            mfem::Vector& exterior) const override
+  {
+    exterior = interior;
+  }
+};
+
 inline bool IsSentinel(const mfem::Vector& values, double sentinel)
 {
   const double* data = values.HostRead();
@@ -1480,12 +1492,139 @@ inline void CheckDGSEMProductionMultSerialIdentityAndMove(TestContext& ctx)
             "DGSEM persistent production bridge rebinds safely after parent move");
 }
 
+inline void CheckDGSEMProductionMixedEulerBoundaries(TestContext& ctx)
+{
+  if (mfem::Mpi::WorldSize() != 1)
+  {
+    return;
+  }
+
+  constexpr int dimension = 2;
+  constexpr int equations = 4;
+  constexpr int order = 2;
+  constexpr double gamma = 1.4;
+  mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
+    2, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  mfem::ParMesh mesh(MPI_COMM_WORLD, serial_mesh);
+  const int boundary_attributes = mesh.bdr_attributes.Max();
+  ctx.Check(boundary_attributes >= 3,
+            "DGSEM mixed-boundary fixture exposes inlet/outlet/wall attributes");
+  if (boundary_attributes < 3)
+  {
+    return;
+  }
+
+  mfem::DG_FECollection fec(
+    order, dimension, mfem::BasisType::GaussLobatto);
+  mfem::ParFiniteElementSpace vfes(
+    &mesh, &fec, equations, mfem::Ordering::byNODES);
+  mfem::EulerFlux euler(dimension, gamma);
+  mfem::RusanovFluxWithSides numerical_flux(euler);
+  auto form = std::make_unique<mfem::HyperbolicFormIntegrator>(
+    numerical_flux, 2);
+  mfem::DGHyperbolicConservationLaws oper(vfes, std::move(form), true);
+  oper.SetNumericalFlux(&numerical_flux);
+  oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+  oper.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Central);
+  oper.SetDGSEMVolumeDissipation(mfem::DGSEMVolumeDissipation::None);
+  oper.SetDGSEMStabilization(mfem::DGSEMStabilization::None);
+  oper.SetDGSEMGamma(gamma);
+
+  mfem::Array<int> inlet_marker(boundary_attributes);
+  mfem::Array<int> outlet_marker(boundary_attributes);
+  mfem::Array<int> wall_marker(boundary_attributes);
+  inlet_marker = 0;
+  outlet_marker = 0;
+  wall_marker = 0;
+  inlet_marker[0] = 1;
+  outlet_marker[1] = 1;
+  for (int attr = 2; attr < boundary_attributes; ++attr)
+  {
+    wall_marker[attr] = 1;
+  }
+  const mfem::Vector inlet =
+    EulerConsFromPrim2D(1.08, 0.32, -0.04, 1.03, gamma);
+  oper.AddBdrFaceIntegrator(
+    std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+      numerical_flux,
+      std::make_unique<mfem::SupersonicInletState>(inlet),
+      2),
+    inlet_marker);
+  oper.AddBdrFaceIntegrator(
+    std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+      numerical_flux,
+      std::make_unique<mfem::SupersonicOutletState>(),
+      2),
+    outlet_marker);
+  oper.AddBdrFaceIntegrator(
+    std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+      numerical_flux,
+      std::make_unique<mfem::SlipWallState>(dimension),
+      2),
+    wall_marker);
+
+  mfem::ParGridFunction state(&vfes);
+  auto state_function = [=](const mfem::Vector& point,
+                            mfem::Vector& value)
+  {
+    value = EulerConsFromPrim2D(1.0 + 0.04 * point(0),
+                               0.18 + 0.03 * point(1),
+                               -0.06 + 0.02 * point(0),
+                               1.0 + 0.025 * point(1),
+                               gamma);
+  };
+  mfem::VectorFunctionCoefficient coefficient(equations, state_function);
+  state.ProjectCoefficient(coefficient);
+
+  mfem::dgsem::DGSEMOperator host(oper);
+  mfem::Vector weak(vfes.GetVSize());
+  const double face_speed = host.AssembleSurface(state, weak);
+  const double volume_speed = host.AssembleVolume(state, weak);
+  mfem::Vector expected(vfes.GetVSize());
+  host.ApplyInverseMass(weak, expected);
+
+  mfem::dgsem::DGSEMOperator production(oper);
+  const auto selection = production.BindProductionPolicy(true);
+  mfem::Vector actual(vfes.GetVSize());
+  actual = -9300.0;
+  const auto first = production.AssembleProductionResidual(
+    state, actual, true);
+  const auto first_counters = production.GetProductionCacheCounters();
+  mfem::Vector repeated(vfes.GetVSize());
+  repeated = -9400.0;
+  const auto second = production.AssembleProductionResidual(
+    state, repeated, true);
+  const auto second_counters = production.GetProductionCacheCounters();
+  actual -= expected;
+  repeated -= expected;
+  const double expected_speed = std::max(face_speed, volume_speed);
+  ctx.Check(selection.supported && first.executed && second.executed &&
+              actual.Norml2() < 2.0e-10 &&
+              repeated.Norml2() < 2.0e-10 &&
+              std::abs(first.max_characteristic_speed - expected_speed) <
+                5.0e-13 &&
+              std::abs(second.max_characteristic_speed - expected_speed) <
+                5.0e-13,
+            "DGSEM production mixed inlet/outlet/slip boundaries match host oracle");
+  ctx.Check(first_counters.topology_builds == 1 &&
+              second_counters.topology_builds ==
+                first_counters.topology_builds &&
+              second_counters.geometry_builds ==
+                first_counters.geometry_builds &&
+              second_counters.workspace_builds ==
+                first_counters.workspace_builds &&
+              second_counters.unchanged_cache_fast_paths ==
+                first_counters.unchanged_cache_fast_paths + 1,
+            "DGSEM mixed-boundary lowering and row-face CSR remain persistent");
+}
+
 inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
 {
   RunDGSEMProductionMultStrictRejectionProbe(ctx);
   ScopedEnvironment strict_production_mult(
     "DG_IGR_DGSEM_PRODUCTION_STRICT", "1");
   CheckDGSEMProductionMultSerialIdentityAndMove(ctx);
+  CheckDGSEMProductionMixedEulerBoundaries(ctx);
   using mfem::dgsem::DGSEMProductionReason;
   constexpr double gamma = 1.4;
   constexpr double residual_tolerance = 2.0e-10;
@@ -2167,7 +2306,7 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
             unsupported_boundary_operator.AddBdrFaceIntegrator(
               std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
                 numerical_flux,
-                std::make_unique<mfem::SupersonicOutletState>(),
+                std::make_unique<UnsupportedBoundaryState>(),
                 2),
               marker);
           }

@@ -68,6 +68,7 @@ struct Manifest
   int dim = -1;
   int equations = -1;
   int order = -1;
+  int igr_sigma_order = -1;
   int serial_refinement = -1;
   int parallel_refinement = -1;
   bool igr_enabled = false;
@@ -1211,6 +1212,8 @@ void WriteVTKRestartManifest(const std::string& dataset_dir,
   object["igr_enabled"] = picojson::value(sigma_saved);
   object["igr_space"] = picojson::value(IGRSpaceName(run_cfg));
   object["igr_grad"] = picojson::value(IGRGradName(run_cfg));
+  object["igr_sigma_order"] = picojson::value(
+    static_cast<double>(ResolveIGRSigmaOrder(run_cfg)));
   object["c_alpha"] = picojson::value(
     run_cfg.igr_opts.c_alpha_user > 0.0 ? run_cfg.igr_opts.c_alpha_user : 1.0);
   object["alpha_length_policy"] = picojson::value(std::string(
@@ -1477,6 +1480,10 @@ Manifest ReadManifest(const fs::path& path)
   result.dim = static_cast<int>(JSONLong(object, "dimension"));
   result.equations = static_cast<int>(JSONLong(object, "equations"));
   result.order = static_cast<int>(JSONLong(object, "order"));
+  result.igr_sigma_order = object.find("igr_sigma_order") != object.end()
+                             ? static_cast<int>(
+                                 JSONLong(object, "igr_sigma_order"))
+                             : result.order;
   result.serial_refinement =
     static_cast<int>(JSONLong(object, "serial_refinement"));
   result.parallel_refinement =
@@ -1663,6 +1670,7 @@ void ValidateManifest(const Manifest& manifest,
       (igr_enabled &&
        (manifest.igr_space != IGRSpaceName(run_cfg) ||
         manifest.igr_grad != IGRGradName(run_cfg) ||
+        manifest.igr_sigma_order != ResolveIGRSigmaOrder(run_cfg) ||
         !close(manifest.c_alpha, active_c_alpha) ||
         manifest.alpha_length_policy != active_alpha_policy ||
         manifest.ip_kind !=

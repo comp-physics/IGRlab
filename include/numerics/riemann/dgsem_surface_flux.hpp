@@ -11,6 +11,7 @@
 #include "numerics/dgsem/dgsem_entropy_flux.hpp"
 #include "numerics/riemann/diffusive_rusanov.hpp"
 #include "numerics/riemann/face_side.hpp"
+#include "numerics/riemann/hdg_trace_centered.hpp"
 #include "numerics/riemann/rusanov.hpp"
 #include "physics/igr/igr_flux.hpp"
 
@@ -21,6 +22,7 @@ namespace mfem
 enum class DGSEMSurfaceFluxType
 {
   Rusanov,
+  HdgTraceCentered,
   DiffusiveRusanov,
   EntropyStableWinters,
   EntropyStableLFEntropyVars
@@ -82,6 +84,7 @@ private:
     dgsem::EntropyJacobianMode::FiniteDifference;
   double gamma_ = 1.4;
   mutable RusanovFluxWithSides rusanov_;
+  mutable HdgTraceCenteredFlux hdg_trace_centered_;
   mutable DiffusiveRusanovFlux diffusive_rusanov_;
 };
 

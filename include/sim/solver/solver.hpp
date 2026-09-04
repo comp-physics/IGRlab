@@ -925,7 +925,17 @@ RunEulerCase(ExampleContext& ctx,
               << " output_only_solves="
               << sigma_provider->GetSigmaOutputOnlySolveCount()
               << " prefetch_invalidations="
-              << sigma_provider->GetSigmaPrefetchInvalidationCount() << "\n";
+              << sigma_provider->GetSigmaPrefetchInvalidationCount()
+              << " endpoint_solves="
+              << sigma_provider->GetSigmaEndpointSolveCount()
+              << " extrapolated_stages="
+              << sigma_provider->GetSigmaExtrapolatedStageCount()
+              << " max_endpoint_prediction_defect="
+              << sigma_provider->GetMaximumLocalSigmaEndpointPredictionDefect()
+              << " max_relative_endpoint_prediction_defect="
+              << sigma_provider
+                   ->GetMaximumLocalRelativeSigmaEndpointPredictionDefect()
+              << "\n";
   }
   if (run_cfg.igr_opts.igr_invariant_domain_flux)
   {
@@ -1110,6 +1120,19 @@ struct Solver
       RegularizationToString(request_resolution.regularization);
     cli_opts.time_integrator =
       TimeIntegratorToString(request_resolution.time_integrator);
+    const DGSurfaceFlux requested_dg_surface_flux =
+      ParseDGSurfaceFlux(cli_opts.dg_surface_flux);
+    if (requested_dg_surface_flux == DGSurfaceFlux::HdgTraceCentered &&
+        request_resolution.discretization != Discretization::DG)
+    {
+      if (mfem::Mpi::Root())
+      {
+        std::cerr << "--dg-surface-flux hdg-trace-centered requires "
+                     "--discretization dg. It is a face-local flux in the "
+                     "primal-DG path, not a second HDG or DGSEM backend.\n";
+      }
+      return 1;
+    }
     MFEM_VERIFY(!cli_opts.restart_vtk.empty() ||
                   (cli_opts.restart_cycle < 0 && cli_opts.restart_step < 0),
                 "--restart-cycle/--restart-step require --restart-vtk.");
@@ -1124,12 +1147,6 @@ struct Solver
       {
         rejection = "--igr-invariant-domain-flux currently requires the "
                     "ordinary DG backend.";
-      }
-      else if (ParseDGSEMSurfaceFlux(cli_opts.dgsem_surface_flux) !=
-               DGSEMSurfaceFlux::Rusanov)
-      {
-        rejection = "--igr-invariant-domain-flux requires the standard "
-                    "Rusanov surface flux.";
       }
       else if (!ResolveZhangShuPositivityLimiter(
                  cli_opts.positivity_limiter,
@@ -1276,6 +1293,17 @@ struct Solver
                 << (run_cfg.igr_opts.lin_maxit >= 0
                       ? run_cfg.igr_opts.lin_maxit
                       : run_cfg.case_config.igr_config.lin_maxit)
+                << "\n";
+    }
+    if (run_cfg.dg_backend == DGBackend::DG && mfem::Mpi::Root())
+    {
+      std::cout << "[dg-options] event=effective surface_flux="
+                << DGSurfaceFluxToString(run_cfg.dg_surface_flux)
+                << " boundary_trace_policy="
+                << (run_cfg.dg_surface_flux ==
+                          DGSurfaceFlux::HdgTraceCentered
+                      ? "ghost-state-trace-centered"
+                      : "not-applicable")
                 << "\n";
     }
     if (run_cfg.device_backend == DeviceBackend::CUDA)

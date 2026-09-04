@@ -424,7 +424,22 @@ private:
   bool AddDeviceFaceContributionsEulerRusanov_(const Vector& x_in,
                                                Vector& z_inout,
                                                real_t& max_face_speed,
-                                               bool capture_boundary_flux) const;
+                                               bool capture_boundary_flux,
+                                               bool record_flux_only = false) const;
+
+  /// Whether the opt-in element-owned fused DG residual screen is supported.
+  bool UseFusedElementResidualScreen_() const;
+
+  /// Fuse weak volume, recorded face lifts, and inverse mass by element.
+  real_t ApplyFusedElementResidualEuler_(const Vector& x_in,
+                                         Vector& y_out) const;
+
+  /// Build element-to-face incidence used by the fused residual screen.
+  bool BuildFusedElementIncidence_();
+
+  /// Emit one deterministic selection/fallback record for the research screen.
+  void LogFusedElementResidualSelection_(bool selected,
+                                         const char* reason) const;
 
   /// Reduce a per-face speed vector to max speed with device support.
   real_t ReduceFaceMaxSpeed_(const Vector& face_speed,
@@ -486,6 +501,8 @@ private:
   mutable bool face_data_dirty_ = true;
   /// Ensures weak-divergence volume path selection is logged only once.
   mutable bool weakdiv_volume_path_logged_ = false;
+  /// Ensures the opt-in fused residual screen selection is logged once.
+  mutable bool fused_residual_selection_logged_ = false;
 
   /// Default face quadrature order offset for custom DG face assembly.
   int face_int_order_offset_ = 1;
@@ -560,6 +577,20 @@ private:
   mutable Vector face_shared_speed_;
   /// Per-shared-face quadrature-point speed scratch (face, q).
   mutable Vector face_shared_speed_q_;
+
+  /// Weighted numerical-flux records, indexed by (face,q,equation).
+  mutable Vector face_int_flux_record_;
+  mutable Vector face_bdr_flux_record_;
+  mutable Vector face_shared_flux_record_;
+
+  /// CSR element-to-face incidence for deterministic element-owned lifting.
+  Array<int> fused_elem_face_offsets_;
+  Array<int> fused_elem_face_kind_;
+  Array<int> fused_elem_face_id_;
+  Array<int> fused_elem_face_side_;
+  bool fused_elem_incidence_ready_ = false;
+  /// True when local state is a zero-copy K x (elements*equations) panel.
+  bool fused_wide_panel_layout_ready_ = false;
 
 #ifdef MFEM_USE_MPI
   /// Reused alias for state L-vector neighbor exchange (avoids per-step temp

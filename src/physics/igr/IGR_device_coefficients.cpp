@@ -169,6 +169,146 @@ void LogScalarQuadratureAudit(const char* name,
 
 } // namespace
 
+namespace igr_device
+{
+
+void LaunchExactElementBlockJacobiApply(
+  int elements,
+  int block_size,
+  const mfem::Vector& inverse_blocks,
+  const mfem::Vector& x,
+  mfem::Vector& y)
+{
+  const int vector_size = elements * block_size;
+  MFEM_VERIFY(elements > 0 && block_size > 0 &&
+                inverse_blocks.Size() == elements * block_size * block_size &&
+                x.Size() == vector_size,
+              "Exact element-block Jacobi apply received inconsistent "
+              "storage.");
+  y.SetSize(vector_size);
+#ifdef DG_IGR_HAS_ACCEL_FORALL
+  y.UseDevice(true);
+  IGRExactElementBlockJacobiKernel kernel;
+  kernel.block_size = block_size;
+  kernel.inverse_blocks = inverse_blocks.Read();
+  kernel.input = x.Read();
+  kernel.output = y.Write();
+  mfem::forall(vector_size, kernel);
+#else
+  const mfem::real_t* blocks = inverse_blocks.HostRead();
+  const mfem::real_t* input = x.HostRead();
+  mfem::real_t* output = y.HostWrite();
+  for (int entry = 0; entry < vector_size; ++entry)
+  {
+    const int element = entry / block_size;
+    const int row = entry - element * block_size;
+    mfem::real_t value = 0.0;
+    for (int column = 0; column < block_size; ++column)
+    {
+      value += blocks[row + block_size *
+                              (column + block_size * element)] *
+               input[column + block_size * element];
+    }
+    output[row + block_size * element] = value;
+  }
+#endif
+}
+
+void LaunchElementMeanProjection(int elements,
+                                 int block_size,
+                                 const mfem::Vector& x,
+                                 mfem::Vector& y)
+{
+  const int vector_size = elements * block_size;
+  MFEM_VERIFY(elements > 0 && block_size > 0 && x.Size() == vector_size,
+              "Element mean projection received inconsistent storage.");
+  y.SetSize(vector_size);
+#ifdef DG_IGR_HAS_ACCEL_FORALL
+  y.UseDevice(true);
+  IGRElementMeanProjectionKernel kernel;
+  kernel.block_size = block_size;
+  kernel.input = x.Read();
+  kernel.output = y.Write();
+  mfem::forall(elements, kernel);
+#else
+  const mfem::real_t* input = x.HostRead();
+  mfem::real_t* output = y.HostWrite();
+  for (int element = 0; element < elements; ++element)
+  {
+    mfem::real_t mean = 0.0;
+    for (int local = 0; local < block_size; ++local)
+    {
+      mean += input[local + block_size * element];
+    }
+    mean /= static_cast<mfem::real_t>(block_size);
+    for (int local = 0; local < block_size; ++local)
+    {
+      output[local + block_size * element] =
+        input[local + block_size * element] - mean;
+    }
+  }
+#endif
+}
+
+void LaunchElementConstantRestriction(int elements,
+                                      int block_size,
+                                      const mfem::Vector& x,
+                                      mfem::Vector& coarse)
+{
+  MFEM_VERIFY(elements > 0 && block_size > 0 &&
+                x.Size() == elements * block_size,
+              "Element constant restriction received inconsistent storage.");
+  coarse.SetSize(elements);
+#ifdef DG_IGR_HAS_ACCEL_FORALL
+  coarse.UseDevice(true);
+  IGRElementConstantRestrictionKernel kernel;
+  kernel.block_size = block_size;
+  kernel.input = x.Read();
+  kernel.coarse = coarse.Write();
+  mfem::forall(elements, kernel);
+#else
+  const mfem::real_t* input = x.HostRead();
+  mfem::real_t* output = coarse.HostWrite();
+  for (int element = 0; element < elements; ++element)
+  {
+    mfem::real_t value = 0.0;
+    for (int local = 0; local < block_size; ++local)
+    {
+      value += input[local + block_size * element];
+    }
+    output[element] = value;
+  }
+#endif
+}
+
+void LaunchElementConstantProlongation(int elements,
+                                       int block_size,
+                                       const mfem::Vector& coarse,
+                                       mfem::Vector& y)
+{
+  const int vector_size = elements * block_size;
+  MFEM_VERIFY(elements > 0 && block_size > 0 && coarse.Size() == elements,
+              "Element constant prolongation received inconsistent storage.");
+  y.SetSize(vector_size);
+#ifdef DG_IGR_HAS_ACCEL_FORALL
+  y.UseDevice(true);
+  IGRElementConstantProlongationKernel kernel;
+  kernel.block_size = block_size;
+  kernel.coarse = coarse.Read();
+  kernel.output = y.Write();
+  mfem::forall(vector_size, kernel);
+#else
+  const mfem::real_t* input = coarse.HostRead();
+  mfem::real_t* output = y.HostWrite();
+  for (int entry = 0; entry < vector_size; ++entry)
+  {
+    output[entry] = input[entry / block_size];
+  }
+#endif
+}
+
+} // namespace igr_device
+
 void IGRSolver::EnsureH1VelocitySpace_()
 {
   if (backend_ != GradBackend::H1Projection)
@@ -222,16 +362,33 @@ void IGRSolver::EnsureDeviceQuadrature_()
   const long vfes_seq = vfes_.GetSequence();
 
   const mfem::FiniteElement& sigma_fe = *sfes_.GetFE(0);
+  const int state_order = SpaceOrder(vfes_);
+  const int state_coefficient_order = 2 * state_order;
   mfem::ElementTransformation* typical_T =
     mesh->GetTypicalElementTransformation();
   MFEM_VERIFY(typical_T,
               "IGR device coefficients require a typical element transform.");
-  const mfem::IntegrationRule& mass_ir =
+  const mfem::IntegrationRule& native_mass_ir =
     mfem::MassIntegrator::GetRule(sigma_fe, sigma_fe, *typical_T);
-  const mfem::IntegrationRule& diff_ir =
+  const mfem::IntegrationRule& native_diff_ir =
     mfem::DiffusionIntegrator::GetRule(sigma_fe, sigma_fe);
+  // The coefficients and source are reconstructed from the Euler state, not
+  // from the (possibly lower-order) sigma space.  A mixed-order closure must
+  // therefore retain enough quadrature to see the supplied state.  Otherwise
+  // p2/p3 Euler with p0/p1 sigma silently aliases the nonlinear 1/rho and
+  // velocity-gradient data at the sigma rule.
+  const int mass_rule_order =
+    std::max(native_mass_ir.GetOrder(), state_coefficient_order);
+  const int diff_rule_order =
+    std::max(native_diff_ir.GetOrder(), state_coefficient_order);
+  const int rhs_rule_order =
+    std::max(2 * sigma_fe.GetOrder(), state_coefficient_order);
+  const mfem::IntegrationRule& mass_ir =
+    mfem::IntRules.Get(sigma_fe.GetGeomType(), mass_rule_order);
+  const mfem::IntegrationRule& diff_ir =
+    mfem::IntRules.Get(sigma_fe.GetGeomType(), diff_rule_order);
   const mfem::IntegrationRule& rhs_ir =
-    mfem::IntRules.Get(sigma_fe.GetGeomType(), 2 * sigma_fe.GetOrder());
+    mfem::IntRules.Get(sigma_fe.GetGeomType(), rhs_rule_order);
   const int mass_qorder = mass_ir.GetOrder();
   const int diff_qorder = diff_ir.GetOrder();
   const int rhs_qorder = rhs_ir.GetOrder();
@@ -351,11 +508,56 @@ void IGRSolver::EnsureDeviceQuadrature_()
   device_face_qorder_ = face_qorder;
 }
 
+void IGRSolver::EnsureDeviceElementAlpha_()
+{
+  if (alpha_length_scale_policy_ != AlphaLengthScalePolicy::Local)
+  {
+    return;
+  }
+
+  mfem::Mesh* mesh = sfes_.GetMesh();
+  MFEM_VERIFY(mesh,
+              "IGR local-alpha device coefficients require a valid mesh.");
+  MFEM_VERIFY(mesh == vfes_.GetMesh(),
+              "IGR local-alpha device coefficients expect sigma and state "
+              "meshes to match.");
+
+  const int ne = mesh->GetNE();
+  const long mesh_sequence = mesh->GetSequence();
+  const bool needs_refresh =
+    device_element_alpha_.Size() != ne ||
+    device_element_alpha_mesh_sequence_ != mesh_sequence ||
+    device_element_alpha_c_alpha_ != alpha_;
+  if (!needs_refresh)
+  {
+    return;
+  }
+
+  device_element_alpha_.SetSize(ne);
+  device_element_alpha_.UseDevice(true);
+  mfem::real_t* element_alpha = device_element_alpha_.HostWrite();
+  for (int e = 0; e < ne; ++e)
+  {
+    const double h = static_cast<double>(mesh->GetElementSize(e, 1));
+    element_alpha[e] = static_cast<mfem::real_t>(alpha_ * h * h);
+  }
+  device_element_alpha_mesh_sequence_ = mesh_sequence;
+  device_element_alpha_c_alpha_ = alpha_;
+}
+
 void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
 {
   EnsureDeviceQuadrature_();
   MFEM_VERIFY(mass_qs_ && sigma_qs_ && rhs_qs_,
               "IGR device coefficients require quadrature spaces.");
+  const bool use_element_local_alpha =
+    alpha_length_scale_policy_ == AlphaLengthScalePolicy::Local;
+  if (use_element_local_alpha)
+  {
+    // Refresh this host-derived geometry cache before launching state
+    // interpolation so the common steady-state path remains device-only.
+    EnsureDeviceElementAlpha_();
+  }
 
   const bool debug_qf =
     ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DEBUG_QF", false);
@@ -424,6 +626,13 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
   const int diff_nq = sigma_qs_->GetIntRule(0).GetNPoints();
   const int rhs_ne = rhs_qs_->GetNE();
   const int rhs_nq = rhs_qs_->GetIntRule(0).GetNPoints();
+  if (use_element_local_alpha)
+  {
+    MFEM_VERIFY(device_element_alpha_.Size() == diff_ne &&
+                  device_element_alpha_.Size() == rhs_ne,
+                "IGR local-alpha element cache must match volume quadrature "
+                "element counts.");
+  }
 
   const mfem::real_t* u_mass_data = u_mass_qf_->Read();
   const mfem::real_t* u_diff_data = u_qf_->Read();
@@ -447,27 +656,56 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
   invrho_kernel.invrho = invrho_data;
   mfem::forall(mass_ne * mass_nq, invrho_kernel);
 
-  igr_device::IGRDeviceAlphaOverRhoKernel ck_kernel;
-  ck_kernel.nq = diff_nq;
-  ck_kernel.ne = diff_ne;
-  ck_kernel.num_eq = num_eq;
-  ck_kernel.alpha = alpha;
-  ck_kernel.rho_floor = rho_floor;
-  ck_kernel.u = u_diff_data;
-  ck_kernel.ck = ck_data;
-  mfem::forall(diff_ne * diff_nq, ck_kernel);
+  if (use_element_local_alpha)
+  {
+    const mfem::real_t* element_alpha = device_element_alpha_.Read();
 
-  igr_device::IGRDeviceSourceKernel src_kernel;
-  src_kernel.nq = rhs_nq;
-  src_kernel.ne = rhs_ne;
-  src_kernel.dim = dim;
-  src_kernel.num_eq = num_eq;
-  src_kernel.alpha = alpha;
-  src_kernel.rho_floor = rho_floor;
-  src_kernel.u = u_rhs_data;
-  src_kernel.grad = grad_rhs_data;
-  src_kernel.src = src_data;
-  mfem::forall(rhs_ne * rhs_nq, src_kernel);
+    igr_device::IGRDeviceLocalAlphaOverRhoKernel ck_kernel;
+    ck_kernel.nq = diff_nq;
+    ck_kernel.ne = diff_ne;
+    ck_kernel.num_eq = num_eq;
+    ck_kernel.rho_floor = rho_floor;
+    ck_kernel.element_alpha = element_alpha;
+    ck_kernel.u = u_diff_data;
+    ck_kernel.ck = ck_data;
+    mfem::forall(diff_ne * diff_nq, ck_kernel);
+
+    igr_device::IGRDeviceLocalSourceKernel src_kernel;
+    src_kernel.nq = rhs_nq;
+    src_kernel.ne = rhs_ne;
+    src_kernel.dim = dim;
+    src_kernel.num_eq = num_eq;
+    src_kernel.rho_floor = rho_floor;
+    src_kernel.element_alpha = element_alpha;
+    src_kernel.u = u_rhs_data;
+    src_kernel.grad = grad_rhs_data;
+    src_kernel.src = src_data;
+    mfem::forall(rhs_ne * rhs_nq, src_kernel);
+  }
+  else
+  {
+    igr_device::IGRDeviceAlphaOverRhoKernel ck_kernel;
+    ck_kernel.nq = diff_nq;
+    ck_kernel.ne = diff_ne;
+    ck_kernel.num_eq = num_eq;
+    ck_kernel.alpha = alpha;
+    ck_kernel.rho_floor = rho_floor;
+    ck_kernel.u = u_diff_data;
+    ck_kernel.ck = ck_data;
+    mfem::forall(diff_ne * diff_nq, ck_kernel);
+
+    igr_device::IGRDeviceSourceKernel src_kernel;
+    src_kernel.nq = rhs_nq;
+    src_kernel.ne = rhs_ne;
+    src_kernel.dim = dim;
+    src_kernel.num_eq = num_eq;
+    src_kernel.alpha = alpha;
+    src_kernel.rho_floor = rho_floor;
+    src_kernel.u = u_rhs_data;
+    src_kernel.grad = grad_rhs_data;
+    src_kernel.src = src_data;
+    mfem::forall(rhs_ne * rhs_nq, src_kernel);
+  }
 #else
   const auto u_mass = mfem::Reshape(u_mass_data, num_eq, mass_nq, mass_ne);
   auto invrho = mfem::Reshape(invrho_data, mass_nq, mass_ne);
@@ -483,11 +721,15 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
 
   const auto u_diff = mfem::Reshape(u_diff_data, num_eq, diff_nq, diff_ne);
   auto ck = mfem::Reshape(ck_data, diff_nq, diff_ne);
+  const mfem::real_t* element_alpha =
+    use_element_local_alpha ? device_element_alpha_.HostRead() : nullptr;
   for (int e = 0; e < diff_ne; ++e)
   {
+    const mfem::real_t alpha_e =
+      use_element_local_alpha ? element_alpha[e] : alpha;
     for (int q = 0; q < diff_nq; ++q)
     {
-      ck(q, e) = frozen_scalar_igr_algebra::AlphaOverDensity(alpha,
+      ck(q, e) = frozen_scalar_igr_algebra::AlphaOverDensity(alpha_e,
                                                              u_diff(0, q, e),
                                                              rho_floor);
     }
@@ -496,6 +738,8 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
   auto src = mfem::Reshape(src_data, rhs_nq, rhs_ne);
   for (int e = 0; e < rhs_ne; ++e)
   {
+    const mfem::real_t alpha_e =
+      use_element_local_alpha ? element_alpha[e] : alpha;
     for (int q = 0; q < rhs_nq; ++q)
     {
       src(q, e) =
@@ -506,7 +750,7 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
           grad_rhs_data + num_eq * dim * (q + rhs_nq * e),
           1,
           num_eq,
-          alpha,
+          alpha_e,
           rho_floor);
     }
   }

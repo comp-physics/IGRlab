@@ -128,6 +128,9 @@ void RK3SSPWithLimiter::Init(TimeDependentOperator& f_)
   accepted_characteristic_speed_ = 0.0;
   attempted_characteristic_speed_available_ = false;
   accepted_characteristic_speed_available_ = false;
+  const auto* stage_aware = dynamic_cast<const RKStageAwareOperator*>(&f_);
+  rhs_requires_step_transaction_ =
+    stage_aware && stage_aware->RequiresRKStepTransaction();
   boundary_flux_provider_ =
     dynamic_cast<const PhysicalBoundaryFluxIntegralProvider*>(&f_);
   cumulative_physical_boundary_flux_available_ = false;
@@ -180,7 +183,8 @@ int RK3SSPWithLimiter::AutoQuadOrder() const
 
 bool RK3SSPWithLimiter::ApplyCallbacks(Vector& v,
                                        double t,
-                                       bool apply_optional)
+                                       bool apply_optional,
+                                       bool report_state_mutation)
 {
   // Quick exit if no callbacks at all.
   if (always_callbacks_.empty() &&
@@ -191,6 +195,7 @@ bool RK3SSPWithLimiter::ApplyCallbacks(Vector& v,
 
   // Non-owning view of v as a ParGridFunction.
   ParGridFunction U(&vfes_, v);
+  bool local_state_modified = false;
 
   // Apply dissipative/reconstruction limiters first. An always-on admissibility
   // callback such as Zhang--Shu must see their final state before the next RHS
@@ -199,7 +204,9 @@ bool RK3SSPWithLimiter::ApplyCallbacks(Vector& v,
   {
     for (auto& cb : optional_callbacks_)
     {
-      cb(vfes_, U, t);
+      const bool callback_modified =
+        cb(vfes_, U, t, report_state_mutation);
+      local_state_modified = local_state_modified || callback_modified;
     }
   }
 
@@ -208,13 +215,29 @@ bool RK3SSPWithLimiter::ApplyCallbacks(Vector& v,
   // invalidate a preceding positivity projection.
   for (auto& cb : always_callbacks_)
   {
-    cb(vfes_, U, t);
+    const bool callback_modified = cb(vfes_, U, t, report_state_mutation);
+    local_state_modified = local_state_modified || callback_modified;
   }
 
   // Callbacks may update the non-owning view on the device. Propagate its
   // memory validity to the owning RK vector before host diagnostics or output.
   U.SyncAliasMemory(v);
-  return true;
+  if (!report_state_mutation)
+  {
+    return false;
+  }
+
+  int modified = local_state_modified ? 1 : 0;
+  if (mfem::Mpi::IsInitialized() && !mfem::Mpi::IsFinalized())
+  {
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &modified,
+                  1,
+                  MPI_INT,
+                  MPI_MAX,
+                  vfes_.GetComm());
+  }
+  return modified != 0;
 }
 
 void RK3SSPWithLimiter::AdvanceStateGeneration()
@@ -250,26 +273,31 @@ void RK3SSPWithLimiter::AddZhangShuLimiter(ZhangShuPointSet point_set,
              face_qords,
              iters,
              point_set,
-             enforce_vtk_points](
-              ParFiniteElementSpace& vf, ParGridFunction& U, double /*t*/)
+             enforce_vtk_points](ParFiniteElementSpace& vf,
+                                 ParGridFunction& U,
+                                 double /*t*/,
+                                 bool report_state_mutation)
   {
     mfem::ZhangShuLimiterElementDiagnostics* diagnostics_ptr =
       (zhang_shu_active_field_ != nullptr && zhang_shu_theta_rho_field_ != nullptr &&
        zhang_shu_theta_p_field_ != nullptr)
         ? &zhang_shu_diagnostics_
         : nullptr;
-    ApplyZhangShuPositivityLimiter(vf,
-                                   U,
-                                   dim,
-                                   gamma,
-                                   rhomin,
-                                   pmin,
-                                   qord,
-                                   face_qords,
-                                   iters,
-                                   point_set,
-                                   diagnostics_ptr,
-                                   enforce_vtk_points);
+    bool local_state_modified = false;
+    ApplyZhangShuPositivityLimiter(
+      vf,
+      U,
+      dim,
+      gamma,
+      rhomin,
+      pmin,
+      qord,
+      face_qords,
+      iters,
+      point_set,
+      diagnostics_ptr,
+      enforce_vtk_points,
+      report_state_mutation ? &local_state_modified : nullptr);
     if (diagnostics_ptr != nullptr)
     {
       // Publish only after the complete RK attempt has been accepted. A later
@@ -277,15 +305,16 @@ void RK3SSPWithLimiter::AddZhangShuLimiter(ZhangShuPointSet point_set,
       // last committed diagnostic fields rather than an abandoned stage.
       zhang_shu_diagnostics_pending_ = true;
     }
+    return local_state_modified;
   };
 
   if (always_on)
   {
-    AddAlwaysCallback(std::move(cb));
+    always_callbacks_.push_back(std::move(cb));
   }
   else
   {
-    AddOptionalCallback(std::move(cb));
+    optional_callbacks_.push_back(std::move(cb));
   }
 }
 
@@ -603,7 +632,10 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   //   - Optional-callbacks: only early steps if apply_optional = true.
   if (limit_initial_)
   {
-    if (ApplyCallbacks(x, t, apply_optional))
+    if (ApplyCallbacks(x,
+                       t,
+                       apply_optional,
+                       /*report_state_mutation=*/true))
     {
       AdvanceStateGeneration();
     }
@@ -618,7 +650,7 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   {
     if (stage_aware)
     {
-      stage_aware->SetRKStageState(stage, state_generation_);
+      stage_aware->SetRKStageState(stage, state_generation_, stage_time);
     }
     f->SetTime(stage_time);
     ++rhs_evaluation_count_;

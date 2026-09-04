@@ -203,23 +203,45 @@ public:
    */
   void AddAlwaysCallback(StageCallback cb)
   {
-    always_callbacks_.push_back(std::move(cb));
+    always_callbacks_.push_back(
+      [callback = std::move(cb)](ParFiniteElementSpace& vfes,
+                                 ParGridFunction& state,
+                                 double time,
+                                 bool report_state_mutation) mutable
+      {
+        callback(vfes, state, time);
+        // The legacy callback contract has no mutation result.  When exact
+        // provenance matters, conservatively assume that invoking it changed
+        // the conservative state.  Intermediate/final stages already acquire
+        // a new generation from their RK update and do not request a report.
+        return report_state_mutation;
+      });
   }
 
   /// Append a callback that only runs for the first max_limiter_steps_ steps.
   void AddOptionalCallback(StageCallback cb)
   {
-    optional_callbacks_.push_back(std::move(cb));
+    optional_callbacks_.push_back(
+      [callback = std::move(cb)](ParFiniteElementSpace& vfes,
+                                 ParGridFunction& state,
+                                 double time,
+                                 bool report_state_mutation) mutable
+      {
+        callback(vfes, state, time);
+        return report_state_mutation;
+      });
   }
 
   /// Backward-compatible: generic AddCallback() -> treat as optional.
   void AddCallback(StageCallback cb) { AddOptionalCallback(std::move(cb)); }
 
   /// Whether an outer time loop must retain a rollback copy for callbacks.
-  /// Callback-free transport cannot raise a recoverable limiter rejection.
+  /// Callback-free transport can still require a transaction when its
+  /// stage-aware RHS performs a recoverable admission check.
   bool RequiresStepTransaction() const
   {
-    return !always_callbacks_.empty() || !optional_callbacks_.empty();
+    return !always_callbacks_.empty() || !optional_callbacks_.empty() ||
+           rhs_requires_step_transaction_;
   }
 
   // ---- Convenience: push common limiters as callbacks (defined in .cpp) ----
@@ -276,9 +298,16 @@ private:
   bool zhang_shu_diagnostics_pending_ = false;
   bool limit_initial_ = dg_igr::RK3Defaults::kLimitInitial;
 
-  // Callback pipelines
-  std::vector<StageCallback> always_callbacks_;   ///< Always run
-  std::vector<StageCallback> optional_callbacks_; ///< Only early steps
+  // Internal callbacks optionally report whether they changed the
+  // conservative state.  Public legacy callbacks remain conservative: when a
+  // report is requested they are treated as mutating.  Built-in callbacks
+  // with an exact mutation result can preserve accepted-state provenance.
+  using InternalStageCallback = std::function<bool(ParFiniteElementSpace&,
+                                                    ParGridFunction&,
+                                                    double,
+                                                    bool)>;
+  std::vector<InternalStageCallback> always_callbacks_;   ///< Always run
+  std::vector<InternalStageCallback> optional_callbacks_; ///< Only early steps
 
   // Optional limiter scheduling
   long step_count_ = 0; ///< number of completed Step() calls
@@ -295,6 +324,7 @@ private:
   real_t accepted_characteristic_speed_ = 0.0;
   bool attempted_characteristic_speed_available_ = false;
   bool accepted_characteristic_speed_available_ = false;
+  bool rhs_requires_step_transaction_ = false;
   const PhysicalBoundaryFluxIntegralProvider* boundary_flux_provider_ = nullptr;
   bool physical_boundary_flux_tracking_enabled_ = false;
   bool cumulative_physical_boundary_flux_available_ = false;
@@ -307,8 +337,16 @@ private:
   Vector cumulative_physical_boundary_flux_absolute_integral_;
 
   // Helpers
-  /// Apply both always-on and (optionally) optional callbacks to vector v.
-  bool ApplyCallbacks(Vector& v, double t, bool apply_optional);
+  /** Apply both callback groups and optionally report state mutation.
+   *
+   * Mutation reporting is requested only for the accepted state at Step()
+   * entry.  Every other callback boundary follows an RK state update and
+   * therefore advances provenance independently of limiter activity.
+   */
+  bool ApplyCallbacks(Vector& v,
+                      double t,
+                      bool apply_optional,
+                      bool report_state_mutation = false);
   void AdvanceStateGeneration();
   void MaybeScanVector(Vector& v, double t, const char* label);
   void MaybeScanAdmissibility(Vector& v, double t, const char* label);

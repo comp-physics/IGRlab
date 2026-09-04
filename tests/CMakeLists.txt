@@ -333,6 +333,32 @@ if (MFEM_USE_CUDA)
     TIMEOUT 120
     RUN_SERIAL TRUE
   )
+
+  set(DG_IGR_TRACE_CENTERED_DEVICE_PARITY_REF
+      "${CMAKE_CURRENT_BINARY_DIR}/trace-centered-device-parity-reference.txt")
+  add_test(NAME dg_igr_trace_centered_device_parity_cpu_reference
+    COMMAND $<TARGET_FILE:dg_igr_exact_iid_device_parity_test>
+            cpu --write-reference ${DG_IGR_TRACE_CENTERED_DEVICE_PARITY_REF}
+            hdg-trace-centered
+  )
+  set_tests_properties(
+    dg_igr_trace_centered_device_parity_cpu_reference PROPERTIES
+    FIXTURES_SETUP dg_igr_trace_centered_device_parity_reference
+    LABELS "cpu-reference;dg;igr;hdg-trace-centered;invariant-domain-flux;parity"
+    TIMEOUT 120
+    RUN_SERIAL TRUE
+  )
+  add_test(NAME dg_igr_trace_centered_device_parity_cuda
+    COMMAND $<TARGET_FILE:dg_igr_exact_iid_device_parity_test>
+            cuda --compare ${DG_IGR_TRACE_CENTERED_DEVICE_PARITY_REF}
+            hdg-trace-centered
+  )
+  set_tests_properties(dg_igr_trace_centered_device_parity_cuda PROPERTIES
+    FIXTURES_REQUIRED dg_igr_trace_centered_device_parity_reference
+    LABELS "cuda;dg;igr;hdg-trace-centered;invariant-domain-flux;parity"
+    TIMEOUT 120
+    RUN_SERIAL TRUE
+  )
 endif()
 
 add_test(NAME dg_igr_euler_tests COMMAND dg_igr_unit_tests --euler)

@@ -105,6 +105,11 @@ struct ZhangShuLimiterElementDiagnostics
  *       sol.ExchangeFaceNbrData() after limiting to refresh ghosts.
  * @param[in] enforce_vtk_points Explicit refined-VTK-point policy. Omission
  *       preserves the legacy DG_IGR_LIMITER_ENFORCE_VTK_POINTS fallback.
+ * @param[out] local_state_modified Optional exact local-rank mutation result.
+ *       It is true iff at least one element polynomial was blended and the
+ *       stage was committed. Diagnostic-field updates are not state mutation.
+ *       The caller is responsible for a collective OR when it uses a shared
+ *       state-generation token.
  */
 void ApplyZhangShuPositivityLimiter(mfem::ParFiniteElementSpace& vfes,
                                     mfem::ParGridFunction& U,
@@ -120,6 +125,7 @@ void ApplyZhangShuPositivityLimiter(mfem::ParFiniteElementSpace& vfes,
                                     ZhangShuLimiterElementDiagnostics*
                                       diagnostics = nullptr,
                                     std::optional<bool> enforce_vtk_points =
-                                      std::nullopt);
+                                      std::nullopt,
+                                    bool* local_state_modified = nullptr);
 
 } // namespace mfem

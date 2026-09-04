@@ -602,6 +602,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
   //     the volume term (F(u_h), ∇v):
   //     z += (F(u_h), ∇v)
   bool used_device_face = false;
+  bool used_fused_element_residual = false;
   real_t device_face_speed = 0.0;
   if (Device::Allows(Backend::DEVICE_MASK))
   {
@@ -609,8 +610,15 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     const bool force_nonlinearform_face =
       ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DG_FORCE_NLFORM_FACE",
                                       default_force_nonlinearform_face);
+    const bool fused_screen_requested = ::dg_igr::EnvFlagEnabledDefault(
+      "DG_IGR_DG_FUSED_ELEMENT_RESIDUAL", false);
     if (force_nonlinearform_face)
     {
+      if (fused_screen_requested)
+      {
+        LogFusedElementResidualSelection_(false,
+                                          "nonlinearform-face-forced");
+      }
       ::dg_igr::NVTXRange range("DG/face-domain-mfem-nonlinearform");
       nonlinearForm->Mult(*x_eval, z_eval);
       used_device_face = false;
@@ -629,7 +637,12 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     }
     else
     {
-      ::dg_igr::NVTXRange range("DG/face-packed-euler-rusanov");
+      used_fused_element_residual =
+        fused_screen_requested && UseFusedElementResidualScreen_();
+      ::dg_igr::NVTXRange range(
+        used_fused_element_residual
+          ? "DG/face-flux-records-euler-rusanov"
+          : "DG/face-packed-euler-rusanov");
       MFEM_VERIFY(UseDeviceFaceResidual_(),
                   "DG device-closure requires packed device face residual path "
                   "(no host fallback).");
@@ -637,14 +650,18 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
         AddDeviceFaceContributionsEulerRusanov_(*x_eval,
                                                 z_eval,
                                                 device_face_speed,
-                                                capture_boundary_flux);
+                                                capture_boundary_flux,
+                                                used_fused_element_residual);
       MFEM_VERIFY(used_device_face,
                   "DG device-closure requires packed Euler/Rusanov face kernels "
                   "and supported boundary/sigma metadata (no fallback).");
       if (!dg_face_path_logged_ && mfem::Mpi::Root())
       {
         std::cout << "[dg-device] event=face-domain-path"
-                  << " selected=packed-mfem-forall-euler-rusanov"
+                  << " selected="
+                  << (used_fused_element_residual
+                        ? "face-records-element-owned-euler-rusanov"
+                        : "packed-mfem-forall-euler-rusanov")
                   << " backend=device"
                   << " lvec_mode=" << (prolongation ? "P-x-PT" : "identity")
                   << " x_size=" << x.Size()
@@ -661,15 +678,27 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
   }
 
   real_t volume_speed = 0.0;
-  if (!weakdiv.empty()) // weak divergence WAS preassembled element-wise
+  if (used_fused_element_residual)
+  {
+    ::dg_igr::NVTXRange range("DG/fused-volume-face-invmass");
+    Vector& fused_output = prolongation ? y_local : y;
+    volume_speed = ApplyFusedElementResidualEuler_(*x_eval, fused_output);
+    if (prolongation)
+    {
+      y = 0.0;
+      prolongation->MultTranspose(y_local, y);
+    }
+  }
+  else if (!weakdiv.empty()) // weak divergence WAS preassembled element-wise
   {
     ::dg_igr::NVTXRange range("DG/weak-divergence");
     // Compute (I_h F(u_h), ∇v) and accumulate directly into z.
     volume_speed = AddPreassembledWeakDivergence_(*x_eval, z_eval);
   }
 
-  // Apply inverse mass after all contributions have been assembled in z.
-  if (prolongation)
+  // Apply inverse mass after all contributions have been assembled in z. The
+  // fused screen has already completed this work in its element-owned kernel.
+  if (!used_fused_element_residual && prolongation)
   {
     ::dg_igr::NVTXRange range("DG/inverse-mass-local-and-restrict");
     y_local.SetSize(z_eval.Size());
@@ -677,7 +706,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     y = 0.0;
     prolongation->MultTranspose(y_local, y);
   }
-  else
+  else if (!used_fused_element_residual)
   {
     ::dg_igr::NVTXRange range("DG/inverse-mass");
     ApplyInverseMass_(z_eval, y);

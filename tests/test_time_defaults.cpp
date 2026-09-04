@@ -43,6 +43,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "HDG IGR defaults: alpha and beta are one");
     ctx.Check(opts.hdg_cuda_engine == "ordinary",
               "HDG CUDA engine defaults to ordinary");
+    ctx.Check(opts.dg_surface_flux == "rusanov",
+              "ordinary-DG surface flux defaults to Rusanov");
     ctx.Check(opts.time_atol == 1.0e-8 && opts.time_rtol == 1.0e-5,
               "adaptive time tolerances retain their typed opt-in defaults");
     ctx.Check(dg_sim::ParseZhangShuPointSet("consumer") ==
@@ -716,6 +718,65 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "IGR options: invariant-domain flux disable flag parses");
   }
 
+  // --- Explicit-HDG-derived face elimination is a typed DG-only flux ---
+  {
+    char program_name[] = "test";
+    char option_name[] = "--dg-surface-flux";
+    char option_value[] = "hdg-trace-centered";
+    char* argv[] = {program_name, option_name, option_value};
+    dg_sim::CommonOptions opts;
+    mfem::OptionsParser parser(3, argv);
+    dg_sim::AddCommonOptions(parser, opts, "mesh");
+    parser.Parse();
+    dg_sim::CaseConfig case_cfg;
+    dg_sim::IGROptions igr_opts;
+    const dg_sim::RunConfig run_cfg =
+      dg_sim::MakeRunConfig(case_cfg, opts, igr_opts);
+    ctx.Check(parser.Good() &&
+                run_cfg.dg_surface_flux ==
+                  dg_sim::DGSurfaceFlux::HdgTraceCentered &&
+                std::string(dg_sim::DGSurfaceFluxToString(
+                  run_cfg.dg_surface_flux)) == "hdg-trace-centered" &&
+                dg_sim::ParseDGSurfaceFlux("trace_centered") ==
+                  run_cfg.dg_surface_flux,
+              "ordinary-DG HDG-derived trace-centered flux parses and "
+              "round-trips without changing the default");
+  }
+
+  // --- Extrapolated endpoint cadence has a stable typed spelling ---
+  {
+    const auto cadence =
+      dg_sim::ParseIGRSigmaUpdateCadence("EXTRAPOLATED-EVERY-STEP");
+    ctx.Check(
+      cadence == dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep &&
+        std::string(dg_sim::IGRSigmaUpdateCadenceToString(cadence)) ==
+          "extrapolated-every-step" &&
+        dg_sim::ParseIGRSigmaUpdateCadence("extrapolated_every_step") == cadence,
+      "IGR options: extrapolated-every-step cadence parses and round-trips");
+  }
+
+  // --- IGR sigma order is a typed L2/BrokenL2-only override ---
+  {
+    char program_name[] = "test";
+    char option_name[] = "--igr-sigma-order";
+    char option_value[] = "0";
+    char* argv[] = {program_name, option_name, option_value};
+    dg_sim::IGROptions igr_opts;
+    igr_opts.space = "L2";
+    igr_opts.grad = "BrokenL2";
+    mfem::OptionsParser parser(3, argv);
+    dg_sim::AddIGROptions(parser, igr_opts);
+    parser.Parse();
+    ctx.Check(parser.Good() && igr_opts.sigma_order == 0 &&
+                dg_sim::ResolveIGRSigmaOrder(/*euler_order=*/3, igr_opts) == 0,
+              "IGR options: explicit sigma order parses and resolves");
+
+    dg_sim::IGROptions inherited;
+    ctx.Check(inherited.sigma_order == -1 &&
+                dg_sim::ResolveIGRSigmaOrder(/*euler_order=*/2, inherited) == 2,
+              "IGR options: sigma order inherits the Euler order by default");
+  }
+
   // --- Refined VTK limiter points have typed CLI and legacy-env controls ---
   {
     constexpr const char* vtk_points_env =
@@ -1096,6 +1157,20 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "VTK dataset: SSPRK(10,4) has a typed suffix");
     ctx.Check(rk3_name.find("_ti_") == std::string::npos,
               "VTK dataset: established RK3SSP name remains unchanged");
+    dataset_run.dg_surface_flux =
+      dg_sim::DGSurfaceFlux::HdgTraceCentered;
+    const std::string trace_centered_name =
+      dg_sim::MakeCaseVTKDatasetName(dataset_case, dataset_run);
+    ctx.Check(trace_centered_name ==
+                ssprk104_name + "_dgsf_hdg-trace-centered",
+              "VTK dataset: HDG-derived DG face flux has a typed suffix");
+    dataset_run.dg_surface_flux = dg_sim::DGSurfaceFlux::Rusanov;
+    dataset_run.igr_opts.sigma_order = 0;
+    const std::string sigma_order_name =
+      dg_sim::MakeCaseVTKDatasetName(dataset_case, dataset_run);
+    ctx.Check(sigma_order_name.find("_iso_0") != std::string::npos,
+              "VTK dataset: explicit sigma order has a typed suffix");
+    dataset_run.igr_opts.sigma_order = -1;
     dataset_run.igr_opts.igr_invariant_domain_flux = true;
     const std::string invariant_flux_name =
       dg_sim::MakeCaseVTKDatasetName(dataset_case, dataset_run);
@@ -1141,6 +1216,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
     metadata_run.opts.order = 2;
     metadata_run.igr_opts.space = "L2";
     metadata_run.igr_opts.grad = "BrokenL2";
+    metadata_run.dg_surface_flux =
+      dg_sim::DGSurfaceFlux::HdgTraceCentered;
     metadata_run.igr_opts.igr_invariant_domain_flux = true;
     metadata_run.opts.zhang_shu_vtk_points = true;
     const std::vector<dg_sim::TimeIntegrator> methods = {
@@ -1202,6 +1279,10 @@ int RunTimeDefaultsTests(TestContext& ctx)
             std::string::npos &&
           contents.find("\"igr_invariant_domain_flux\": true") !=
             std::string::npos &&
+          contents.find(
+            "\"dg_surface_flux\": \"hdg-trace-centered\"") !=
+            std::string::npos &&
+          contents.find("\"igr_sigma_order\": 2") != std::string::npos &&
           contents.find("\"zhang_shu_vtk_points\": true") !=
             std::string::npos &&
           contents.find("\"success\": true") != std::string::npos &&
@@ -1457,6 +1538,40 @@ int RunTimeDefaultsTests(TestContext& ctx)
     }
   };
 
+  struct TimeLoopQSigmaRetryStepper
+  {
+    int calls = 0;
+    bool reject_next_attempt = true;
+    std::uint64_t generation = 19;
+    std::vector<mfem::real_t> attempted_dts;
+
+    bool RequiresStepTransaction() const { return true; }
+    std::uint64_t GetStateGeneration() const { return generation; }
+    void RestoreStateGeneration(std::uint64_t value) { generation = value; }
+
+    void Step(mfem::Vector& state, mfem::real_t& t, mfem::real_t& dt)
+    {
+      ++calls;
+      attempted_dts.push_back(dt);
+      if (state.Size() > 0)
+      {
+        state.HostReadWrite()[0] += dt;
+      }
+      t += dt;
+      ++generation;
+      if (reject_next_attempt)
+      {
+        reject_next_attempt = false;
+        throw mfem::RecoverableRKStageAdmissionFailure(
+          mfem::RKStageAdmissionFailureReason::
+            QSigmaNonpositiveAndNonfinite,
+          /*global_nonpositive_q_sigma_samples=*/3,
+          /*global_nonfinite_q_sigma_samples=*/2,
+          /*stage=*/6);
+      }
+    }
+  };
+
   struct TimeLoopRejectAfterAcceptedStepper
   {
     explicit TimeLoopRejectAfterAcceptedStepper(int accepted_before_reject)
@@ -1578,6 +1693,59 @@ int RunTimeDefaultsTests(TestContext& ctx)
     }
     ctx.Check(stepper.GetStateGeneration() == 9,
               "time loop retry: rejected generation is rolled back");
+    bundle.sol = state_before;
+  }
+
+  // --- an RHS q_sigma failure uses the same exact rollback/retry path ---
+  {
+    TimeLoopDummyOperator op;
+    TimeLoopQSigmaRetryStepper stepper;
+    const mfem::Vector state_before(bundle.sol);
+    const mfem::real_t first_value_before =
+      bundle.sol.Size() > 0 ? bundle.sol.HostRead()[0] : 0.0;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.1;
+    cfg.dt = 0.1;
+    cfg.dt_min = 0.01;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = false;
+
+    const dg_sim::TimeLoopResult result =
+      dg_sim::RunTimeLoop(
+        op, example_ctx.Mesh(), bundle.sol, stepper, cfg);
+    ctx.Check(result.success && result.steps == 2 &&
+                result.accepted_attempts == 2 &&
+                result.rejected_attempts == 1,
+              "q_sigma admission retry: only accepted attempts commit");
+    ctx.Check(result.rejected_limiter_elements == 0 &&
+                result.rejected_q_sigma_attempts == 1 &&
+                result.rejected_q_sigma_nonpositive_samples == 3 &&
+                result.rejected_q_sigma_nonfinite_samples == 2 &&
+                result.last_q_sigma_rejection_reason ==
+                  "q-sigma-nonpositive-and-nonfinite" &&
+                result.last_q_sigma_rejection_stage == 6,
+              "q_sigma admission retry: bounded reason and sample counts are "
+              "reported without masquerading as limiter work");
+    ctx.Check(stepper.calls == 3 && stepper.attempted_dts.size() == 3 &&
+                stepper.attempted_dts[0] == 0.1 &&
+                stepper.attempted_dts[1] == 0.05 &&
+                stepper.attempted_dts[2] == 0.05 &&
+                stepper.GetStateGeneration() == 21,
+              "q_sigma admission retry: failed generation is rolled back and "
+              "the timestep is halved");
+    ctx.Check(op.abort_calls == 1 && op.last_abort_time == 0.0 &&
+                op.last_abort_generation == 19 &&
+                op.last_abort_retry_dt == 0.05,
+              "q_sigma admission retry: operator abort sees the accepted "
+              "transaction and retry timestep");
+    if (bundle.sol.Size() > 0)
+    {
+      ctx.CheckNear(bundle.sol.HostRead()[0],
+                    first_value_before + 0.1,
+                    1.0e-14,
+                    "q_sigma admission retry: failed state mutation is not "
+                    "committed");
+    }
     bundle.sol = state_before;
   }
 

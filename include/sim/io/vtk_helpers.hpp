@@ -39,12 +39,22 @@ inline std::string MakeCaseVTKDatasetName(
   std::ostringstream name;
   name << case_cfg.case_name << "_p_" << run_cfg.opts.order << "_ref_"
        << total_ref << "_is_" << run_cfg.igr_opts.space << "_ig_"
-       << run_cfg.igr_opts.grad << "_ca_" << c_alpha;
+       << run_cfg.igr_opts.grad;
+  if (run_cfg.igr_opts.sigma_order >= 0)
+  {
+    name << "_iso_" << ResolveIGRSigmaOrder(run_cfg);
+  }
+  name << "_ca_" << c_alpha;
   // Preserve the established RK3SSP dataset name while keeping the typed
   // SSPRK(10,4) output from colliding with it.
   if (run_cfg.time_integrator == TimeIntegrator::SSPRK104)
   {
     name << "_ti_" << TimeIntegratorToString(run_cfg.time_integrator);
+  }
+  if (run_cfg.dg_backend == DGBackend::DG &&
+      run_cfg.dg_surface_flux != DGSurfaceFlux::Rusanov)
+  {
+    name << "_dgsf_" << DGSurfaceFluxToString(run_cfg.dg_surface_flux);
   }
   // The exact IGR-aware invariant-domain face speed changes the numerical
   // flux and therefore must never share an output directory with the legacy

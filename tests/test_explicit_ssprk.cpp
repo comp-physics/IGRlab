@@ -143,6 +143,11 @@ public:
 
   mfem::real_t GetMaxCharSpeed() const { return reported_characteristic_speed; }
 
+  bool RequiresRKStepTransaction() const override
+  {
+    return requires_rk_step_transaction;
+  }
+
   void Mult(const mfem::Vector& state, mfem::Vector& derivative) const override
   {
     rhs_times.push_back(GetTime());
@@ -279,6 +284,7 @@ public:
   mfem::real_t initial_characteristic_speed = 1.0;
   std::vector<mfem::real_t> stage_characteristic_speeds;
   mutable mfem::real_t reported_characteristic_speed = 1.0;
+  bool requires_rk_step_transaction = false;
 
 private:
   bool time_scaled_ = false;
@@ -455,6 +461,93 @@ void CheckRejectedLimiterDiagnosticsStayCommitted(TestContext& ctx)
               theta_p.HostRead()[0] == -9.0,
             "a rejected RK attempt leaves published limiter diagnostic "
             "fields at their last committed values");
+}
+
+void CheckZhangShuMutationAwareGeneration(TestContext& ctx)
+{
+  constexpr double gamma = 1.4;
+  mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian1D(1, 1.0);
+  mfem::ParMesh mesh(MPI_COMM_SELF, serial_mesh);
+  mfem::L2_FECollection state_fec(
+    /*order=*/1, /*dim=*/1, mfem::BasisType::GaussLobatto);
+  mfem::ParFiniteElementSpace state_fes(&mesh,
+                                        &state_fec,
+                                        /*vdim=*/3,
+                                        mfem::Ordering::byNODES);
+  mfem::L2_FECollection diagnostic_fec(/*order=*/0, /*dim=*/1);
+  mfem::ParFiniteElementSpace diagnostic_fes(&mesh, &diagnostic_fec);
+
+  auto configure = [&](mfem::RK3SSPWithLimiter& stepper,
+                       mfem::ParGridFunction& active,
+                       mfem::ParGridFunction& theta_rho,
+                       mfem::ParGridFunction& theta_p)
+  {
+    stepper.SetEulerParams(/*dim=*/1, gamma);
+    stepper.SetLimiterParams(/*rho_min=*/0.5,
+                             /*p_min=*/1.0e-10,
+                             /*quad_order=*/4,
+                             /*p_bisect_iters=*/12);
+    stepper.LimitInitial(true);
+    stepper.SetZhangShuDiagnosticsFields(&active, &theta_rho, &theta_p);
+    stepper.AddZhangShuLimiter(mfem::ZhangShuPointSet::kConsumer);
+  };
+
+  const mfem::Vector admitted =
+    dg_igr_tests::EulerConsFromPrim1D(1.0, 0.0, 1.0, gamma);
+
+  // An already admitted endpoint runs the limiter and updates its diagnostic
+  // fields, but it must retain the exact accepted-state generation at stage 0.
+  mfem::ParGridFunction unchanged_state(&state_fes);
+  dg_igr_tests::FillConstantState(admitted, unchanged_state);
+  mfem::ParGridFunction unchanged_active(&diagnostic_fes);
+  mfem::ParGridFunction unchanged_theta_rho(&diagnostic_fes);
+  mfem::ParGridFunction unchanged_theta_p(&diagnostic_fes);
+  RecordingLinearOperator unchanged_op(unchanged_state.Size());
+  mfem::RK3SSPWithLimiter unchanged_stepper(
+    state_fes, mfem::SSPRKMethod::SSPRK33);
+  configure(unchanged_stepper,
+            unchanged_active,
+            unchanged_theta_rho,
+            unchanged_theta_p);
+  unchanged_stepper.Init(unchanged_op);
+  mfem::real_t unchanged_time = 0.0;
+  mfem::real_t dt = 1.0e-3;
+  unchanged_stepper.Step(unchanged_state, unchanged_time, dt);
+  ctx.Check(!unchanged_op.rhs_generations.empty() &&
+              unchanged_op.rhs_generations.front() == 0u &&
+              unchanged_stepper.GetStateGeneration() == 3u &&
+              unchanged_active.HostRead()[0] == 0.0,
+            "a no-op Zhang-Shu entry gate preserves accepted-state "
+            "provenance while diagnostics remain bookkeeping-only");
+
+  // Make one nodal density inadmissible while retaining an admissible mean.
+  // The entry limiter must report the actual blend and advance generation
+  // before stage 0 consumes the state.
+  mfem::ParGridFunction limited_state(&state_fes);
+  dg_igr_tests::FillConstantState(admitted, limited_state);
+  MFEM_VERIFY(state_fes.GetNDofs() == 2,
+              "mutation-generation test expects one p1 segment element.");
+  mfem::real_t* limited_values = limited_state.HostReadWrite();
+  limited_values[0] = 0.25;
+  limited_values[1] = 1.75;
+  mfem::ParGridFunction limited_active(&diagnostic_fes);
+  mfem::ParGridFunction limited_theta_rho(&diagnostic_fes);
+  mfem::ParGridFunction limited_theta_p(&diagnostic_fes);
+  RecordingLinearOperator limited_op(limited_state.Size());
+  mfem::RK3SSPWithLimiter limited_stepper(
+    state_fes, mfem::SSPRKMethod::SSPRK33);
+  configure(limited_stepper,
+            limited_active,
+            limited_theta_rho,
+            limited_theta_p);
+  limited_stepper.Init(limited_op);
+  mfem::real_t limited_time = 0.0;
+  limited_stepper.Step(limited_state, limited_time, dt);
+  ctx.Check(!limited_op.rhs_generations.empty() &&
+              limited_op.rhs_generations.front() == 1u &&
+              limited_stepper.GetStateGeneration() == 4u,
+            "an active Zhang-Shu entry gate advances state provenance before "
+            "the first RHS");
 }
 
 template <typename Coefficients>
@@ -1002,6 +1095,14 @@ int main(int argc, char** argv)
   ctx.Check(default_stepper.GetMethod() == mfem::SSPRKMethod::SSPRK33,
             "historical RK stepper defaults to SSPRK(3,3)");
 
+  RecordingLinearOperator admission_op(fes.GetTrueVSize());
+  admission_op.requires_rk_step_transaction = true;
+  mfem::RK3SSPWithLimiter admission_stepper(fes);
+  admission_stepper.Init(admission_op);
+  ctx.Check(admission_stepper.RequiresStepTransaction(),
+            "stage-aware recoverable RHS admission requests an outer RK "
+            "transaction even without limiter callbacks");
+
   CheckLifecycle<mfem::SSPRK33Coefficients>(ctx,
                                              fes,
                                              mfem::SSPRKMethod::SSPRK33,
@@ -1041,6 +1142,7 @@ int main(int argc, char** argv)
   CheckAcceptedCharacteristicSpeedTransaction(ctx, mesh, fes);
   CheckTerminalAlwaysCallbackOrdering(ctx, fes);
   CheckRejectedLimiterDiagnosticsStayCommitted(ctx);
+  CheckZhangShuMutationAwareGeneration(ctx);
 
   CheckSSPRK104TransactionalRollback(
     ctx,

@@ -18,6 +18,7 @@
 
 #include "mfem.hpp"
 #include "numerics/limiters/zhang_shu.hpp"
+#include "numerics/timestepping/stage_aware_operator.hpp"
 #include "utils/diagnostics/non_finite.hpp"
 
 namespace dg_sim
@@ -76,6 +77,13 @@ struct TimeLoopResult
   int rejected_attempts = 0;
   /// Sum of failed element admissions over rejected limiter attempts.
   long long rejected_limiter_elements = 0;
+  /// Attempts rejected because an extrapolated RHS left the q_sigma set.
+  std::uint64_t rejected_q_sigma_attempts = 0;
+  /// Newly observed q_sigma violations in rejected RHS evaluations.
+  std::uint64_t rejected_q_sigma_nonpositive_samples = 0;
+  std::uint64_t rejected_q_sigma_nonfinite_samples = 0;
+  std::string last_q_sigma_rejection_reason = "none";
+  int last_q_sigma_rejection_stage = -1;
   long long rhs_evaluations = 0;
   mfem::real_t initial_time = 0.0;
   mfem::real_t final_time = 0.0;
@@ -628,6 +636,81 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
         dt_real = retry_dt;
         hit_save_boundary = false;
       }
+      catch (const mfem::RecoverableRKStageAdmissionFailure& failure)
+      {
+        MFEM_VERIFY(requires_step_transaction,
+                    "A recoverable RK-stage admission rejection requires a "
+                    "pre-attempt state transaction.");
+        sol = pre_attempt_state;
+        t = pre_attempt_time;
+        time_loop_detail::StateGenerationTransaction<StepperType>::Restore(
+          stepper, pre_attempt_generation);
+        sol.ExchangeFaceNbrData();
+        ++result.rejected_attempts;
+        result.last_q_sigma_rejection_reason = failure.ReasonName();
+        result.last_q_sigma_rejection_stage = failure.Stage();
+        const auto saturating_add = [](std::uint64_t& total,
+                                       std::uint64_t increment)
+        {
+          const std::uint64_t maximum =
+            std::numeric_limits<std::uint64_t>::max();
+          total = increment > maximum - total ? maximum : total + increment;
+        };
+        saturating_add(result.rejected_q_sigma_attempts, 1);
+        saturating_add(result.rejected_q_sigma_nonpositive_samples,
+                       failure.GlobalNonpositiveQSigmaSampleCount());
+        saturating_add(result.rejected_q_sigma_nonfinite_samples,
+                       failure.GlobalNonfiniteQSigmaSampleCount());
+        ++retries_this_step;
+
+        mfem::real_t retry_dt = 0.0;
+        if (retries_this_step < kMaximumRetriesPerStep)
+        {
+          if (dt_min > 0.0 && attempted_dt > dt_min)
+          {
+            retry_dt = std::max(dt_min, 0.5 * attempted_dt);
+          }
+          else if (dt_min <= 0.0)
+          {
+            retry_dt = 0.5 * attempted_dt;
+          }
+        }
+        const bool retry_is_valid =
+          std::isfinite(retry_dt) && retry_dt > 0.0 &&
+          retry_dt < attempted_dt;
+
+        time_loop_detail::OperatorStepTransaction<OperatorType>::Abort(
+          op,
+          sol,
+          t,
+          pre_attempt_generation,
+          retry_is_valid ? retry_dt : 0.0);
+
+        if (hooks.on_rejected_attempt)
+        {
+          hooks.on_rejected_attempt(result.steps,
+                                    t,
+                                    attempted_dt,
+                                    retry_is_valid ? retry_dt : 0.0);
+        }
+
+        if (!retry_is_valid)
+        {
+          const bool admission_dt_min =
+            dt_min > 0.0 && attempted_dt <= dt_min;
+          result.dt_min_reached = admission_dt_min;
+          result.termination_reason = admission_dt_min
+                                        ? "q-sigma-admission-dt-min"
+                                        : "q-sigma-admission-retry-limit";
+          terminal_rejection = true;
+          done = true;
+          break;
+        }
+
+        dt = retry_dt;
+        dt_real = retry_dt;
+        hit_save_boundary = false;
+      }
     }
 
     if (terminal_rejection)
@@ -817,6 +900,16 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
               << " rejected_attempts=" << result.rejected_attempts
               << " rejected_limiter_elements="
               << result.rejected_limiter_elements
+              << " rejected_q_sigma_attempts="
+              << result.rejected_q_sigma_attempts
+              << " rejected_q_sigma_nonpositive_samples="
+              << result.rejected_q_sigma_nonpositive_samples
+              << " rejected_q_sigma_nonfinite_samples="
+              << result.rejected_q_sigma_nonfinite_samples
+              << " last_q_sigma_rejection_reason="
+              << result.last_q_sigma_rejection_reason
+              << " last_q_sigma_rejection_stage="
+              << result.last_q_sigma_rejection_stage
               << " minimum_attempted_dt=" << minimum_attempted_dt
               << " maximum_attempted_dt=" << result.maximum_attempted_dt
               << " minimum_accepted_dt=" << minimum_accepted_dt

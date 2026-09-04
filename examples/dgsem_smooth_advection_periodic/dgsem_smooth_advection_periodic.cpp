@@ -22,6 +22,7 @@ namespace
 struct SmoothAdvectionOptions
 {
   double static_source = 0.0;
+  bool active_igr_wave = false;
   // Preserve the historical HDG-only spelling: DG/DGSEM deliberately ignore
   // this compatibility option.
   double hdg_static_source = 0.0;
@@ -85,6 +86,26 @@ MakeSmoothAdvectionInitialCondition(const double gamma)
 }
 
 std::unique_ptr<mfem::VectorCoefficient>
+MakeActiveIGRWaveInitialCondition(const double gamma)
+{
+  constexpr double pi = 3.141592653589793238462643383279502884;
+  auto ic_fun = [gamma](const mfem::Vector& x, mfem::Vector& U)
+  {
+    const double sx = std::sin(2.0 * pi * x(0));
+    const double cx = std::cos(2.0 * pi * x(0));
+    const double sy = std::sin(2.0 * pi * x(1));
+    const double cy = std::cos(2.0 * pi * x(1));
+    mfem::Vector primitive(4);
+    primitive(0) = 1.0 + 0.05 * sx * cy;
+    primitive(1) = 0.20 + 0.03 * cy;
+    primitive(2) = -0.10 + 0.02 * sx;
+    primitive(3) = 1.0 + 0.03 * cx * sy;
+    mfem::EulerPrimToConservative(primitive, /*dim=*/2, gamma, U);
+  };
+  return dg_sim::MakeVectorFunctionIC(4, ic_fun);
+}
+
+std::unique_ptr<mfem::VectorCoefficient>
 MakeSmoothAdvectionStaticSource(const double density_source)
 {
   auto source_fun = [density_source](const mfem::Vector&, mfem::Vector& S)
@@ -123,11 +144,13 @@ int main(int argc, char* argv[])
     cfg.limiter_pipeline.zhang_shu = false;
   };
 
-  spec.make_ic = [](const SmoothAdvectionOptions&,
+  spec.make_ic = [](const SmoothAdvectionOptions& opts,
                     const dg_sim::ExampleContext&,
                     double gamma)
   {
-    return MakeSmoothAdvectionInitialCondition(gamma);
+    return opts.active_igr_wave
+             ? MakeActiveIGRWaveInitialCondition(gamma)
+             : MakeSmoothAdvectionInitialCondition(gamma);
   };
 
   spec.make_static_source = [](const SmoothAdvectionOptions& opts,
@@ -147,6 +170,13 @@ int main(int argc, char* argv[])
                    "-ss",
                    "--static-source",
                    "Uniform mass-component source for ordinary DG or HDG.");
+    args.AddOption(&opts.active_igr_wave,
+                   "-aiw",
+                   "--active-igr-wave",
+                   "-no-aiw",
+                   "--no-active-igr-wave",
+                   "Use a smooth periodic Euler state with nonzero IGR "
+                   "closure forcing.");
     args.AddOption(&opts.hdg_static_source,
                    "-hss",
                    "--hdg-static-source",
@@ -174,12 +204,14 @@ int main(int argc, char* argv[])
     const bool source_active =
       opts.static_source != 0.0 ||
       (hdg_selected && opts.hdg_static_source != 0.0);
-    if (source_active)
+    if (source_active || opts.active_igr_wave)
     {
       if (mfem::Mpi::Root())
       {
         std::cout << "[smooth-error] status=skipped"
-                  << " reason=nonzero-static-source"
+                  << " reason="
+                  << (opts.active_igr_wave ? "active-igr-wave"
+                                           : "nonzero-static-source")
                   << " exact_reference=unavailable" << std::endl;
       }
       return 0;

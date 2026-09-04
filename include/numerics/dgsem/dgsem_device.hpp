@@ -14,6 +14,9 @@
 
 #include "mfem.hpp"
 
+#include <cstddef>
+#include <memory>
+
 namespace mfem
 {
 namespace dgsem
@@ -76,17 +79,18 @@ void InterpolateSharedFaceScalarDevice(
   const Vector& scalar_face_neighbor_data,
   Vector& packed_shared_scalar);
 
-/** Gather persistent nodal face maps and apply the statically bound slip wall.
+/** Gather persistent nodal face maps and apply lowered Euler boundaries.
  *
  * Local and shared rows obtain their right state from the local packed batch
- * or MFEM face-neighbor vector, respectively. Boundary rows execute the one
- * accepted production boundary policy: adiabatic slip reflection. There is no
- * model, flux, or boundary-policy switch inside the point kernel.
+ * or MFEM face-neighbor vector, respectively. Boundary rows consume a packed
+ * boundary kind and conservative reference state prepared during host-once
+ * topology setup. The point kernel has no runtime polymorphism.
  */
-void GatherEulerRusanovSlipFacesDevice(
+void GatherEulerRusanovFacesDevice(
   int dim,
   int ne,
   int dof,
+  real_t gamma,
   const DenseMatrix& packed_states,
   const Vector& packed_sigma,
   const Vector& face_neighbor_state,
@@ -98,6 +102,9 @@ void GatherEulerRusanovSlipFacesDevice(
   const Array<int>& right_elements,
   const Array<int>& right_local_dofs,
   const Array<int>& ownership,
+  const Array<int>& boundary_kinds,
+  const DenseMatrix& boundary_reference_states,
+  const Vector& boundary_density_floors,
   DenseMatrix& left_states,
   DenseMatrix& right_states,
   Vector& left_sigma,
@@ -164,6 +171,25 @@ void BuildEulerContravariantFluxDevice(int dim,
                                        DenseMatrix& contravariant_flux,
                                        Vector& nodal_speeds);
 
+/** Build the same nodal flux directly in the wide volume-panel layout.
+ *
+ * The panel has shape `(dim*dof) x (ne*num_equations)`.  Its column
+ * `element + ne*equation` contains all reference-direction fluxes for one
+ * element/equation pair.  This layout feeds the shared reference operator
+ * without a packing pass.
+ */
+void BuildEulerContravariantFluxPanelDevice(
+  int dim,
+  int ne,
+  int dof,
+  real_t gamma,
+  real_t velocity_density_floor,
+  const DenseMatrix& states,
+  const Vector& sigma,
+  const DenseMatrix& metrics,
+  DenseMatrix& contravariant_flux_panel,
+  Vector& nodal_speeds);
+
 /** Apply the accepted central symmetric DGSEM volume contraction.
  *
  * All elements in the batch have the same `n1d`, dimension, and local tensor
@@ -177,13 +203,138 @@ void ApplyCentralVolumeDevice(int dim,
                               const DenseMatrix& contravariant_flux,
                               DenseMatrix& weak_volume);
 
+/** Build the shared reference-only central-volume panel operator.
+ *
+ * Metric and state dependence remain in the contravariant flux panel, so one
+ * `dof x (dim*dof)` operator is shared by every element and Euler equation,
+ * including on bilinear quadrilateral geometry.
+ */
+void BuildCentralVolumePanelOperator(int dim,
+                                     int n1d,
+                                     const Array<int>& lex_to_local,
+                                     const DenseMatrix& split_matrix,
+                                     const Vector& weights,
+                                     DenseTensor& panel_operator);
+
+/** Apply the shared central-volume operator with native FP64 GPU BLAS.
+ *
+ * The input/output matrices must use the layouts documented by
+ * BuildEulerContravariantFluxPanelDevice().  This entry point is deliberately
+ * precision-specific: the separately selected fixed-point emulation screen is
+ * certified against this path rather than silently changing its arithmetic.
+ */
+void ApplyCentralVolumePanelFP64Device(
+  int dim,
+  int ne,
+  int dof,
+  int num_equations,
+  const DenseTensor& panel_operator,
+  const DenseMatrix& contravariant_flux_panel,
+  DenseMatrix& weak_volume);
+
+/** Result of one opt-in cuBLAS fixed-point FP64-emulation operation.
+ *
+ * The emulated operation keeps FP64 inputs and outputs.  cuBLAS performs
+ * row/column power-of-two scaling and an Ozaki fixed-point decomposition
+ * internally; this status makes both the selected precision and any native
+ * FP64 fallback observable to the caller.
+ */
+struct DGSEMFixedPointPanelStatus
+{
+  bool compiled = false;
+  bool initialized = false;
+  bool launch_succeeded = false;
+  bool emulation_observed = false;
+  bool retained_status_valid = false;
+  int cublas_status = 0;
+  int cuda_status = 0;
+  int retained_mantissa_bits = -1;
+  int max_mantissa_bits = 0;
+  int compute_capability_major = 0;
+  int compute_capability_minor = 0;
+  int m = 0;
+  int n = 0;
+  int k = 0;
+  std::size_t workspace_bytes = 0;
+};
+
+/** Persistent, dedicated cuBLAS context for Ozaki fixed-point FP64 GEMM.
+ *
+ * A dedicated handle prevents the experimental emulation controls from
+ * mutating MFEM's process-global GPU BLAS handle.  Initialization allocates
+ * all workspace once; Mult() performs no allocation or synchronization.
+ */
+class DGSEMFixedPointVolumeContext
+{
+public:
+  DGSEMFixedPointVolumeContext();
+  ~DGSEMFixedPointVolumeContext();
+  DGSEMFixedPointVolumeContext(const DGSEMFixedPointVolumeContext&) = delete;
+  DGSEMFixedPointVolumeContext& operator=(
+    const DGSEMFixedPointVolumeContext&) = delete;
+
+  DGSEMFixedPointPanelStatus Initialize(int m,
+                                        int n,
+                                        int k,
+                                        int max_mantissa_bits,
+                                        std::size_t workspace_limit_bytes);
+
+  DGSEMFixedPointPanelStatus Mult(
+    const DenseTensor& panel_operator,
+    const DenseMatrix& contravariant_flux_panel,
+    DenseMatrix& weak_volume);
+
+  /// Synchronize only the retained-bit telemetry after an audited operation.
+  DGSEMFixedPointPanelStatus SynchronizeStatus();
+
+private:
+  struct Implementation;
+  std::unique_ptr<Implementation> implementation_;
+};
+
+/** Reduce an emulated/native panel comparison to three FP64 audit scalars.
+ *
+ * The output is `(max_abs_reference, max_abs_error, non_finite_count)`.
+ * This is deliberately independent of the emulated cuBLAS handle.
+ */
+void AuditCentralVolumePanelDevice(const DenseMatrix& candidate,
+                                   const DenseMatrix& reference,
+                                   Vector& audit);
+
+/// Copy identically shaped packed matrices without host staging.
+void CopyPackedMatrixDevice(const DenseMatrix& source, DenseMatrix& target);
+
+/// Number of unique coordinate-line pairs used by the LLF volume kernel.
+int DGSEMVolumePairCount(int dim, int ne, int n1d);
+
+/** Add conservative local-Lax--Friedrichs volume dissipation on device.
+ *
+ * A first kernel evaluates each unique unordered nodal pair once and stores
+ * all Euler components.  A second deterministic gather applies Dsplit in the
+ * exact legacy pair orientation/order without atomics.  `pair_dissipation`
+ * is a persistent `(DGSEMVolumePairCount x num_equations)` workspace.
+ */
+void AddEulerLLFVolumeDissipationDevice(
+  int dim,
+  int ne,
+  int n1d,
+  real_t gamma,
+  const Array<int>& lex_to_local,
+  const DenseMatrix& split_matrix,
+  const Vector& weights,
+  const DenseMatrix& states,
+  const Vector& sigma,
+  const DenseMatrix& metrics,
+  DenseMatrix& pair_dissipation,
+  DenseMatrix& weak_volume);
+
 /** Assemble packed Euler Rusanov face contributions deterministically.
  *
  * Face states and normals are prepared host-once after MFEM orientation and
- * exchange setup. A local face writes both elements, while shared and boundary
- * faces write only the locally owned left element. Each output entry scans the
- * face list in its declared order, avoiding atomics and preserving a stable
- * correctness reference.
+ * exchange setup. Host-once CSR adjacency lists the incident face ids and
+ * deterministic signs for each element row. Surface accumulation therefore
+ * remains atomic-free and face-order deterministic without scanning every
+ * packed face for every output row.
  */
 void AssembleEulerRusanovFacesDevice(int dim,
                                      int ne,
@@ -196,11 +347,9 @@ void AssembleEulerRusanovFacesDevice(int dim,
                                      const Vector& left_sigma,
                                      const Vector& right_sigma,
                                      const Vector& face_weights,
-                                     const Array<int>& left_elements,
-                                     const Array<int>& left_local_dofs,
-                                     const Array<int>& right_elements,
-                                     const Array<int>& right_local_dofs,
-                                     const Array<int>& ownership,
+                                     const Array<int>& row_face_offsets,
+                                     const Array<int>& row_face_ids,
+                                     const Array<int>& row_face_signs,
                                      DenseMatrix& face_flux,
                                      Vector& face_speeds,
                                      DenseMatrix& weak_surface);

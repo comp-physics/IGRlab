@@ -1364,7 +1364,8 @@ void ApplyDeviceZhangShuPositivityLimiter(
   int p_bisect_iters,
   mfem::ZhangShuPointSet point_set,
   bool enforce_vtk_points,
-  mfem::ZhangShuLimiterElementDiagnostics* diagnostics)
+  mfem::ZhangShuLimiterElementDiagnostics* diagnostics,
+  bool* local_state_modified)
 {
   ::dg_igr::NVTXRange limiter_range("Limiter/Zhang-Shu");
   LimiterTimingState& timing = GetLimiterTimingState();
@@ -1757,6 +1758,12 @@ void ApplyDeviceZhangShuPositivityLimiter(
   {
     throw mfem::RecoverableLimiterFailure(global_rejected_elements);
   }
+  if (local_state_modified != nullptr)
+  {
+    *local_state_modified =
+      CountActiveElements(&cache.active,
+                          cache.admissibility_reduce_workspace) > 0.0;
+  }
 }
 
 } // namespace
@@ -1775,10 +1782,17 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
                                     int p_bisect_iters,
                                     ZhangShuPointSet point_set,
                                     ZhangShuLimiterElementDiagnostics* diagnostics,
-                                    std::optional<bool> enforce_vtk_points)
+                                    std::optional<bool> enforce_vtk_points,
+                                    bool* local_state_modified)
 {
   MFEM_VERIFY(vfes.GetOrdering() == Ordering::byNODES,
               "Positivity limiter assumes byNODES ordering.");
+  if (local_state_modified != nullptr)
+  {
+    // A rejected stage commits no conservative-state update.  Initialize the
+    // optional result accordingly before any collective admission can throw.
+    *local_state_modified = false;
+  }
 
   const int num_eq = dim + 2;
   const int NE = vfes.GetNE();
@@ -1818,7 +1832,8 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
                                          p_bisect_iters,
                                          point_set,
                                          effective_enforce_vtk_points,
-                                         diagnostics);
+                                         diagnostics,
+                                         local_state_modified);
     return;
   }
 
@@ -2274,6 +2289,10 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
         timing.avg_node_points += phase.node_points;
       }
     }
+  }
+  if (local_state_modified != nullptr)
+  {
+    *local_state_modified = phase.active_elements > 0.0;
   }
 }
 
