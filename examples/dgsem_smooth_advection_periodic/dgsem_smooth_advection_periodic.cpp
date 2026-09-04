@@ -258,7 +258,9 @@ int main(int argc, char* argv[])
     case_data.numerical_policy =
       dg::hdg::generic::DefaultEulerHdgNumericalPolicy(options.order);
     case_data.initial_condition =
-      MakeSmoothAdvectionInitialCondition(case_config.gamma);
+      opts.active_igr_wave
+        ? MakeActiveIGRWaveInitialCondition(case_config.gamma)
+        : MakeSmoothAdvectionInitialCondition(case_config.gamma);
     if (hdg_source != 0.0)
     {
       case_data.static_source =

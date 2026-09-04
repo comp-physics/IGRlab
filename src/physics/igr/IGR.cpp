@@ -261,8 +261,14 @@ bool IGRSolver::UseDeviceCoefficients_() const
 {
   const bool device_backend =
     mfem::Device::Allows(mfem::Backend::DEVICE_MASK);
-  const bool qf_enabled =
-    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_DEVICE_QF", device_backend);
+  // The exact side-aware DG face operator consumes the element coefficient
+  // QFunctions on every backend; it is therefore a typed dependency, not a
+  // hidden environment prerequisite.  The environment switch remains an
+  // opt-in/opt-out control only for closure paths that do not request exact
+  // faces.
+  const bool qf_enabled = UseExactDGFaceOperator_() ||
+                          ::dg_igr::EnvFlagEnabledDefault(
+                            "DG_IGR_IGR_DEVICE_QF", device_backend);
   if (!qf_enabled)
   {
     return false;

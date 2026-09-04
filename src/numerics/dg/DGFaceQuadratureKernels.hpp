@@ -5,7 +5,9 @@
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -21,6 +23,20 @@ enum class DGDiffusionFaceScaling
   Sum,
   HarmonicWeighted
 };
+
+/** Return a process-local revision for one rebuilt face-connectivity pack.
+ *
+ * Incidence data is derived from the packed face-element array.  Counts alone
+ * cannot identify that array: two reordered meshes may have identical
+ * element/face counts.  A revision is assigned while the geometry is already
+ * being rebuilt on the host, so an apply only needs a scalar comparison and
+ * never hashes or synchronizes connectivity.
+ */
+inline std::uint64_t NextDGFaceConnectivityRevision()
+{
+  static std::atomic<std::uint64_t> next_revision{1};
+  return next_revision.fetch_add(1, std::memory_order_relaxed);
+}
 
 struct FaceQFProjectInfo
 {
@@ -93,6 +109,8 @@ struct InteriorFaceDGDiffusionApplyInfo
   int penalty_size = 0;
   int face_element_size = 0;
   int element_vdof_map_size = 0;
+  /// Changes whenever BuildInteriorFaceDGDiffusionApplyData2D repacks faces.
+  std::uint64_t connectivity_revision = 0;
 };
 
 struct InteriorFaceDGDiffusionApplyScratch
@@ -112,6 +130,8 @@ struct InteriorFaceDGDiffusionApplyScratch
   mutable mfem::Array<int> element_face_offsets;
   mutable mfem::Array<int> element_face_ids;
   mutable mfem::Array<int> element_face_sides;
+  /// Revision from which the incidence arrays were derived.
+  mutable std::uint64_t incidence_connectivity_revision = 0;
   /// Per-face row contributions written without atomics before the gather.
   mutable mfem::Vector face_contribution;
 };
@@ -131,6 +151,8 @@ struct SharedFaceDGDiffusionApplyInfo
   int face_element_size = 0;
   int element_vdof_map_size = 0;
   int face_nbr_dof_map_size = 0;
+  /// Changes whenever BuildSharedFaceDGDiffusionApplyData2D repacks faces.
+  std::uint64_t connectivity_revision = 0;
 };
 
 struct SharedFaceDGDiffusionApplyScratch
@@ -147,6 +169,8 @@ struct SharedFaceDGDiffusionApplyScratch
   /// Fixed-order local-element-to-shared-face CSR for the CUDA row gather.
   mutable mfem::Array<int> element_face_offsets;
   mutable mfem::Array<int> element_face_ids;
+  /// Revision from which the incidence arrays were derived.
+  mutable std::uint64_t incidence_connectivity_revision = 0;
   /// Per-shared-face local-row contributions written before the gather.
   mutable mfem::Vector face_contribution;
 };
@@ -551,7 +575,9 @@ inline void EnsureInteriorFaceElementIncidence2D(
   const InteriorFaceDGDiffusionApplyScratch& work)
 {
   const int incidence_count = 2 * info.nf;
-  if (work.element_face_offsets.Size() == info.ne + 1 &&
+  if (info.connectivity_revision != 0 &&
+      work.incidence_connectivity_revision == info.connectivity_revision &&
+      work.element_face_offsets.Size() == info.ne + 1 &&
       work.element_face_ids.Size() == incidence_count &&
       work.element_face_sides.Size() == incidence_count)
   {
@@ -599,13 +625,16 @@ inline void EnsureInteriorFaceElementIncidence2D(
   work.element_face_offsets.GetMemory().UseDevice(true);
   work.element_face_ids.GetMemory().UseDevice(true);
   work.element_face_sides.GetMemory().UseDevice(true);
+  work.incidence_connectivity_revision = info.connectivity_revision;
 }
 
 inline void EnsureSharedFaceElementIncidence2D(
   const SharedFaceDGDiffusionApplyInfo& info,
   const SharedFaceDGDiffusionApplyScratch& work)
 {
-  if (work.element_face_offsets.Size() == info.ne + 1 &&
+  if (info.connectivity_revision != 0 &&
+      work.incidence_connectivity_revision == info.connectivity_revision &&
+      work.element_face_offsets.Size() == info.ne + 1 &&
       work.element_face_ids.Size() == info.nf)
   {
     return;
@@ -640,6 +669,7 @@ inline void EnsureSharedFaceElementIncidence2D(
   }
   work.element_face_offsets.GetMemory().UseDevice(true);
   work.element_face_ids.GetMemory().UseDevice(true);
+  work.incidence_connectivity_revision = info.connectivity_revision;
 }
 
 inline InteriorFaceSideDensityProjectionInfo
@@ -857,6 +887,7 @@ BuildInteriorFaceDGDiffusionApplyData2D(
   info.penalty_size = info.nq * info.nf;
   info.face_element_size = 2 * info.nf;
   info.element_vdof_map_size = info.dof * info.vdim * info.ne;
+  info.connectivity_revision = NextDGFaceConnectivityRevision();
 
   MFEM_VERIFY(side_q.Size() == 2 * info.nq * info.nf,
               "Exact DG diffusion face apply received mismatched side qdata.");
@@ -1078,6 +1109,7 @@ BuildSharedFaceDGDiffusionApplyData2D(
   info.face_element_size = info.nf;
   info.element_vdof_map_size = info.dof * info.vdim * info.ne;
   info.face_nbr_dof_map_size = info.dof * info.vdim * info.nf;
+  info.connectivity_revision = NextDGFaceConnectivityRevision();
 
   MFEM_VERIFY(side_q.Size() == 2 * info.nq * info.nf,
               "Shared exact DG diffusion face data received mismatched "

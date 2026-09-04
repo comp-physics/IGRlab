@@ -188,7 +188,7 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
 
   out << std::setprecision(17);
   out << "{\n";
-  out << "  \"schema_version\": 1,\n";
+  out << "  \"schema_version\": 2,\n";
   out << "  \"timestamp_utc\": "
       << detail::ToJsonString(detail::ISO8601NowUTC()) << ",\n";
   out << "  \"status\": {\n";
@@ -222,9 +222,6 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << ",\n";
   out << "    \"dg_backend\": "
       << detail::ToJsonString(DGBackendToString(run_cfg.dg_backend)) << ",\n";
-  out << "    \"dg_surface_flux\": "
-      << detail::ToJsonString(DGSurfaceFluxToString(run_cfg.dg_surface_flux))
-      << ",\n";
   out << "    \"time_integrator\": "
       << detail::ToJsonString(TimeIntegratorToString(run_cfg.time_integrator))
       << ",\n";
@@ -240,6 +237,9 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << detail::ToJsonString(
            DGSEMSurfaceFluxToString(run_cfg.dgsem_surface_flux))
       << ",\n";
+  out << "    \"dgsem_stabilization\": "
+      << detail::ToJsonString(DGSEMStabilizationToString(run_cfg.dgsem_stab))
+      << ",\n";
   out << "    \"dgsem_entropy_jacobian\": "
       << detail::ToJsonString(
            DGSEMEntropyJacobianToString(run_cfg.dgsem_entropy_jacobian))
@@ -249,8 +249,6 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   out << "    \"igr_space\": " << detail::ToJsonString(run_cfg.igr_opts.space)
       << ",\n";
   out << "    \"igr_grad\": " << detail::ToJsonString(run_cfg.igr_opts.grad)
-      << ",\n";
-  out << "    \"igr_sigma_order\": " << ResolveIGRSigmaOrder(run_cfg)
       << ",\n";
   out << "    \"igr_solve_mode\": "
       << detail::ToJsonString(run_cfg.igr_opts.solve_mode) << ",\n";
@@ -264,13 +262,24 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << (run_cfg.igr_opts.sigma_aware_cfl ? "true" : "false") << ",\n";
   out << "    \"igr_sigma_rusanov\": "
       << (run_cfg.igr_opts.sigma_aware_rusanov ? "true" : "false") << ",\n";
+  out << "    \"igr_frozen_sigma_spectral_speed\": "
+      << (UsesFrozenSigmaSpectralSpeed(run_cfg) ? "true" : "false")
+      << ",\n";
   out << "    \"igr_invariant_domain_flux\": "
       << (run_cfg.igr_opts.igr_invariant_domain_flux ? "true" : "false")
       << ",\n";
+  const auto effective_sigma_cadence =
+    ResolveEffectiveIGRSigmaUpdateCadence(run_cfg);
   out << "    \"igr_sigma_cadence\": "
-      << detail::ToJsonString(run_cfg.igr_opts.sigma_cadence) << ",\n";
+      << detail::ToJsonString(
+           IGRSigmaUpdateCadenceToString(effective_sigma_cadence))
+      << ",\n";
   out << "    \"igr_sigma_update_interval\": "
-      << run_cfg.igr_opts.sigma_update_interval << ",\n";
+      << ResolveEffectiveIGRSigmaUpdateInterval(run_cfg) << ",\n";
+  out << "    \"igr_alpha_length_policy\": "
+      << detail::ToJsonString(IGRAlphaLengthScalePolicyToString(
+           ResolveIGRAlphaLengthScalePolicy(run_cfg)))
+      << ",\n";
   out << "    \"igr_stage_rtol_scale\": " << run_cfg.igr_opts.stage_rtol_scale
       << ",\n";
   out << "    \"igr_lin_rtol\": "
@@ -374,6 +383,8 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
         << summary->maximum_attempted_dt << ",\n";
     out << "    \"maximum_accepted_dt\": "
         << summary->maximum_accepted_dt << ",\n";
+    out << "    \"maximum_accepted_step_growth_ratio\": "
+        << summary->maximum_accepted_step_growth_ratio << ",\n";
     out << "    \"dt_min_reached\": "
         << (summary->dt_min_reached ? "true" : "false") << ",\n";
     out << "    \"success\": " << (summary->success ? "true" : "false")
@@ -404,6 +415,7 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
     out << "    \"minimum_accepted_dt\": 0.0,\n";
     out << "    \"maximum_attempted_dt\": 0.0,\n";
     out << "    \"maximum_accepted_dt\": 0.0,\n";
+    out << "    \"maximum_accepted_step_growth_ratio\": 0.0,\n";
     out << "    \"dt_min_reached\": false,\n";
     out << "    \"success\": false,\n";
     out << "    \"termination_reason\": \"not-started\",\n";

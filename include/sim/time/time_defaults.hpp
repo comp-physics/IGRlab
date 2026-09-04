@@ -271,6 +271,8 @@ inline RunSummary BuildRunSummary(const ExampleContext& ctx,
                                              : 0.0;
   summary.maximum_attempted_dt = result.maximum_attempted_dt;
   summary.maximum_accepted_dt = result.maximum_accepted_dt;
+  summary.maximum_accepted_step_growth_ratio =
+    result.maximum_accepted_step_growth_ratio;
   summary.dt_min_reached = result.dt_min_reached;
   summary.success = result.success;
   summary.termination_reason = result.termination_reason;
@@ -372,6 +374,8 @@ inline void PrintSummaryBox(const RunSummary& summary)
        << " | dt range (accepted): "
        << FormatSci(summary.minimum_accepted_dt) << " / "
        << FormatSci(summary.maximum_accepted_dt)
+       << " | max accepted dt growth: "
+       << FormatSci(summary.maximum_accepted_step_growth_ratio)
        << " | termination: " << summary.termination_reason;
     return os.str();
   };

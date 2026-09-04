@@ -3,7 +3,6 @@
 #include "physics/igr/igr_coupling.hpp"
 #include "physics/igr/igr_flux.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
-#include "numerics/riemann/hdg_trace_centered.hpp"
 #include "numerics/riemann/rusanov.hpp"
 #include "numerics/riemann/side_scope_utils.hpp"
 #include "numerics/timestepping/RK3SSPWithLimiter.hpp"
@@ -12,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <cmath>
 #include <limits>
@@ -196,6 +196,22 @@ public:
     return telemetry_;
   }
 
+  mfem::IGRFrozenSigmaTelemetry InspectFrozenSigmaStateForAdmission(
+    const mfem::Vector&) const override
+  {
+    mfem::IGRFrozenSigmaTelemetry fresh;
+    fresh.enabled = true;
+    fresh.sample_count = 8;
+    if (emit_endpoint_failure_)
+    {
+      fresh.nonpositive_count = next_endpoint_nonpositive_;
+      fresh.nonfinite_count = next_endpoint_nonfinite_;
+      emit_endpoint_failure_ = false;
+    }
+    telemetry_.Merge(fresh);
+    return fresh;
+  }
+
   void SeedHistoricalFailure(std::uint64_t nonpositive,
                              std::uint64_t nonfinite)
   {
@@ -212,11 +228,22 @@ public:
     next_nonfinite_ = nonfinite;
   }
 
+  void FailNextEndpointAdmission(std::uint64_t nonpositive,
+                                 std::uint64_t nonfinite)
+  {
+    emit_endpoint_failure_ = true;
+    next_endpoint_nonpositive_ = nonpositive;
+    next_endpoint_nonfinite_ = nonfinite;
+  }
+
 private:
   mutable mfem::IGRFrozenSigmaTelemetry telemetry_;
   mutable bool emit_failure_ = false;
   mutable std::uint64_t next_nonpositive_ = 0;
   mutable std::uint64_t next_nonfinite_ = 0;
+  mutable bool emit_endpoint_failure_ = false;
+  mutable std::uint64_t next_endpoint_nonpositive_ = 0;
+  mutable std::uint64_t next_endpoint_nonfinite_ = 0;
 };
 
 class BrokenDGIGRSourceCoefficient final : public mfem::Coefficient
@@ -606,6 +633,24 @@ void FillDeterministicProbeVector(mfem::Vector& v, int seed)
   }
 }
 
+bool SameVectorBits(const mfem::Vector& a, const mfem::Vector& b)
+{
+  if (a.Size() != b.Size())
+  {
+    return false;
+  }
+  if (a.Size() == 0)
+  {
+    return true;
+  }
+  const mfem::real_t* a_data = a.HostRead();
+  const mfem::real_t* b_data = b.HostRead();
+  return std::memcmp(a_data,
+                     b_data,
+                     static_cast<std::size_t>(a.Size()) *
+                       sizeof(mfem::real_t)) == 0;
+}
+
 SPDProbeSummary
 ProbeSPD(const mfem::HypreParMatrix& A, MPI_Comm comm, int samples = 4)
 {
@@ -883,6 +928,43 @@ int RunIGRTests(TestContext& ctx)
                 tol,
                 "FluxWithIGR opt-in includes sigma pressure scale in face speed");
 
+  // The typed extrapolated-DGSEM mode uses the exact local frozen-sigma
+  // acoustic spectrum for both CFL reporting and Rusanov dissipation.
+  igr_flux.SetSigmaAwareCFL(false);
+  igr_flux.SetSigmaAwareRusanov(false);
+  mfem::FluxWithIGR frozen_spectral_igr_flux(base_flux, gamma);
+  frozen_spectral_igr_flux.SetSigmaField(&sigma);
+  frozen_spectral_igr_flux.SetFrozenSigmaSpectralSpeed(true);
+  mfem::Vector frozen_spectral_flux(dim + 2);
+  const double frozen_spectral_speed =
+    frozen_spectral_igr_flux.ComputeFluxDotN(
+      state, normal, Tr_face, frozen_spectral_flux);
+  const double normal_norm = normal.Norml2();
+  const double unit_normal_velocity = std::abs(un) / normal_norm;
+  const double pressure = 1.0;
+  const double q_sigma = gamma * pressure + (gamma - 1.0) * sigma_value;
+  const double expected_frozen_spectral_speed =
+    unit_normal_velocity + std::sqrt(q_sigma / rho);
+  ctx.Check(frozen_spectral_igr_flux.GetFrozenSigmaSpectralSpeed(),
+            "FluxWithIGR exposes the typed frozen-sigma spectral policy");
+  ctx.CheckNear(frozen_spectral_speed,
+                expected_frozen_spectral_speed,
+                tol,
+                "FluxWithIGR reports the exact frozen-sigma normal spectrum");
+  ctx.CheckNear(
+    frozen_spectral_igr_flux.SelectRusanovDissipationSpeed(
+      frozen_spectral_speed, rho, sigma_value),
+    expected_frozen_spectral_speed,
+    0.0,
+    "FluxWithIGR couples frozen-sigma Rusanov dissipation to its CFL speed");
+  for (int i = 0; i < igr_fn.Size(); ++i)
+  {
+    ctx.CheckNear(frozen_spectral_flux(i),
+                  igr_fn(i),
+                  tol,
+                  "Frozen-sigma spectral mode preserves physical flux, component " +
+                    std::to_string(i));
+  }
   // The IGR bound is the exact pressure threshold for both frozen-stage
   // Lax-Friedrichs split states. This low-pressure case distinguishes it from
   // the former sqrt(|sigma|/rho) heuristic by several orders of magnitude.
@@ -1463,109 +1545,6 @@ int RunIGRTests(TestContext& ctx)
       ctx.Check(GlobalMax(local_cfl_separation_err) < 5.0e-11,
                 "IGR sigma CFL and Rusanov controls are independent");
     }
-
-    // The explicit-HDG-derived flux must evaluate both conservative and IGR
-    // traces at their arithmetic face averages, and must include the trace
-    // state in the invariant-domain penalty bound.
-    igr_flux_if.SetInvariantDomainFloors(/*density_floor=*/1.0e-12,
-                                         /*pressure_floor=*/1.0e-12);
-    igr_flux_if.SetInvariantDomainFlux(true);
-    mfem::HdgTraceCenteredFlux trace_centered_flux(igr_flux_if);
-    double local_trace_formula_error = 0.0;
-    double local_trace_speed_error = 0.0;
-    int local_trace_faces = 0;
-    const auto invariant_speed = [&](const mfem::Vector& conservative,
-                                     double sigma_value,
-                                     double base_speed)
-    {
-      const double rho = conservative(0);
-      double momentum_squared = 0.0;
-      for (int d = 0; d < dim; ++d)
-      {
-        momentum_squared +=
-          conservative(1 + d) * conservative(1 + d);
-      }
-      const double pressure =
-        (gamma - 1.0) *
-        (conservative(1 + dim) - 0.5 * momentum_squared / rho);
-      const double transport_speed =
-        std::abs(DotMomentumNormal(conservative, normal_if, dim)) /
-        (rho * normal_if.Norml2());
-      return mfem::IGRFluxInvariantDomainSpeed(base_speed,
-                                                rho,
-                                                pressure,
-                                                transport_speed,
-                                                sigma_value,
-                                                gamma,
-                                                1.0e-12,
-                                                1.0e-12);
-    };
-    for (int f = 0; f < pmesh_if.GetNumFaces(); ++f)
-    {
-      mfem::FaceElementTransformations* Tr =
-        pmesh_if.GetFaceElementTransformations(f);
-      if (!Tr || !Tr->Elem2)
-      {
-        continue;
-      }
-      Tr->SetAllIntPoints(&ip_face);
-      const double sigma1 = SigmaAtElementPoint(
-        sigma_if, *Tr->Elem1, Tr->GetElement1IntPoint());
-      const double sigma2 = SigmaAtElementPoint(
-        sigma_if, *Tr->Elem2, Tr->GetElement2IntPoint());
-      const double sigma_hat = 0.5 * (sigma1 + sigma2);
-      mfem::Vector state_hat(state_left.Size());
-      for (int equation = 0; equation < state_hat.Size(); ++equation)
-      {
-        state_hat(equation) =
-          0.5 * (state_left(equation) + state_right(equation));
-      }
-
-      mfem::Vector unused_left(state_left.Size());
-      mfem::Vector unused_right(state_left.Size());
-      mfem::Vector expected_trace(state_left.Size());
-      const double base_speed1 = base_flux.ComputeFluxDotN(
-        state_left, normal_if, *Tr, unused_left);
-      const double base_speed2 = base_flux.ComputeFluxDotN(
-        state_right, normal_if, *Tr, unused_right);
-      const double base_speed_hat = base_flux.ComputeFluxDotN(
-        state_hat, normal_if, *Tr, expected_trace);
-      AddSigmaDotNTerms(
-        state_hat, normal_if, sigma_hat, expected_trace);
-      const double speed1 =
-        invariant_speed(state_left, sigma1, base_speed1);
-      const double speed2 =
-        invariant_speed(state_right, sigma2, base_speed2);
-      const double speed_hat =
-        invariant_speed(state_hat, sigma_hat, base_speed_hat);
-      const double tau = std::max({speed1, speed2, speed_hat});
-      const double scaled_tau = tau * normal_if.Norml2();
-      for (int equation = 0; equation < expected_trace.Size(); ++equation)
-      {
-        expected_trace(equation) +=
-          0.5 * scaled_tau *
-          (state_left(equation) - state_right(equation));
-      }
-
-      mfem::Vector actual_trace(state_left.Size());
-      const double actual_speed = trace_centered_flux.Eval(
-        state_left, state_right, normal_if, *Tr, actual_trace);
-      for (int equation = 0; equation < actual_trace.Size(); ++equation)
-      {
-        local_trace_formula_error =
-          std::max(local_trace_formula_error,
-                   std::abs(actual_trace(equation) -
-                            expected_trace(equation)));
-      }
-      local_trace_speed_error =
-        std::max(local_trace_speed_error, std::abs(actual_speed - tau));
-      ++local_trace_faces;
-    }
-    ctx.Check(GlobalSum(static_cast<double>(local_trace_faces)) > 0.0 &&
-                GlobalMax(local_trace_formula_error) < 5.0e-11 &&
-                GlobalMax(local_trace_speed_error) < 5.0e-12,
-              "HDG-derived trace-centered Euler+IGR flux uses Uhat, "
-              "sigmahat, and the three-state invariant-domain bound");
   }
 
   // --- Deterministic side-selection stress: explicit-side path remains stable ---
@@ -2592,10 +2571,31 @@ int RunIGRTests(TestContext& ctx)
             exact_face_y,
             &apply_scratch);
 
+        mfem::Vector deterministic_face_y0(sigma_face_apply.Size());
+        mfem::Vector deterministic_face_y1(sigma_face_apply.Size());
+        deterministic_face_y0 = 0.0;
+        deterministic_face_y1 = 0.0;
+        dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+          apply_info,
+          apply_scratch,
+          sigma_face_apply,
+          ip_sigma_apply,
+          deterministic_face_y0);
+        dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+          apply_info,
+          apply_scratch,
+          sigma_face_apply,
+          ip_sigma_apply,
+          deterministic_face_y1);
+        const bool deterministic_face_repeat =
+          SameVectorBits(deterministic_face_y0, deterministic_face_y1);
+
         ctx.Check(coeff_info.qf_size == 2 * apply_info.nq * apply_info.nf,
                   "IGR exact face apply receives matching side-coefficient qdata");
         ctx.Check(apply_info.nf > 0,
                   "IGR exact face apply sees interior faces");
+        ctx.Check(deterministic_face_repeat,
+                  "IGR exact face row gather repeats bit-for-bit");
 
         mfem::Vector exact_face_diag(sigma_face_apply.Size());
         exact_face_diag = 0.0;
@@ -2819,6 +2819,192 @@ int RunIGRTests(TestContext& ctx)
                   "IGR exact face coefficient refresh matches full rebuild");
         ctx.Check(refresh_diag_rel_max < 2.0e-12,
                   "IGR exact face diagonal refresh matches full rebuild");
+      }
+
+      // Reusing an apply scratch on an equal-sized, reordered topology must
+      // invalidate its derived element-to-face incidence. Counts alone cannot
+      // distinguish these two packs.
+      {
+        mfem::Mesh mesh_incidence_a =
+          mfem::Mesh::MakeCartesian2D(/*nx=*/3,
+                                      /*ny=*/2,
+                                      mfem::Element::QUADRILATERAL,
+                                      /*generate_edges=*/true,
+                                      /*sx=*/1.0,
+                                      /*sy=*/0.7);
+        mfem::Mesh mesh_incidence_b =
+          mfem::Mesh::MakeCartesian2D(/*nx=*/3,
+                                      /*ny=*/2,
+                                      mfem::Element::QUADRILATERAL,
+                                      /*generate_edges=*/true,
+                                      /*sx=*/1.0,
+                                      /*sy=*/0.7);
+        mfem::Array<int> element_reordering(6);
+        const int reordered_index[6] = {2, 5, 0, 4, 1, 3};
+        for (int e = 0; e < element_reordering.Size(); ++e)
+        {
+          element_reordering[e] = reordered_index[e];
+        }
+        mesh_incidence_b.ReorderElements(element_reordering,
+                                         /*reorder_vertices=*/false);
+
+        mfem::ParMesh pmesh_incidence_a(MPI_COMM_SELF, mesh_incidence_a);
+        mfem::ParMesh pmesh_incidence_b(MPI_COMM_SELF, mesh_incidence_b);
+        mfem::DG_FECollection incidence_fec(
+          /*order=*/1, dim_qf, mfem::BasisType::GaussLegendre);
+        mfem::ParFiniteElementSpace incidence_fes_a(
+          &pmesh_incidence_a,
+          &incidence_fec,
+          /*vdim=*/1,
+          mfem::Ordering::byNODES);
+        mfem::ParFiniteElementSpace incidence_fes_b(
+          &pmesh_incidence_b,
+          &incidence_fec,
+          /*vdim=*/1,
+          mfem::Ordering::byNODES);
+        const mfem::IntegrationRule& incidence_ir =
+          mfem::IntRules.Get(mfem::Geometry::SEGMENT, /*order=*/4);
+        mfem::FaceQuadratureSpace incidence_fqs_a(
+          pmesh_incidence_a, incidence_ir, mfem::FaceType::Interior);
+        mfem::FaceQuadratureSpace incidence_fqs_b(
+          pmesh_incidence_b, incidence_ir, mfem::FaceType::Interior);
+
+        const int incidence_nq = incidence_ir.GetNPoints();
+        const int incidence_nf_a =
+          dg_igr::dg_face::CountLocalInteriorFaces(incidence_fes_a,
+                                                   incidence_fqs_a);
+        const int incidence_nf_b =
+          dg_igr::dg_face::CountLocalInteriorFaces(incidence_fes_b,
+                                                   incidence_fqs_b);
+        mfem::Vector side_q_a(2 * incidence_nq * incidence_nf_a);
+        mfem::Vector side_q_b(2 * incidence_nq * incidence_nf_b);
+        side_q_a = 0.37 / 1.3;
+        side_q_b = 0.37 / 1.3;
+        mfem::ParGridFunction sigma_a(&incidence_fes_a);
+        mfem::ParGridFunction sigma_b(&incidence_fes_b);
+        FillDeterministicProbeVector(sigma_a, /*seed=*/71);
+        FillDeterministicProbeVector(sigma_b, /*seed=*/73);
+
+        constexpr double incidence_ip_sigma = -1.0;
+        constexpr double incidence_kappa = 2.4;
+        dg_igr::dg_face::InteriorFaceDGDiffusionApplyScratch reused_scratch;
+        const auto incidence_info_a =
+          dg_igr::dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
+            incidence_fes_a,
+            incidence_fqs_a,
+            side_q_a,
+            incidence_kappa,
+            reused_scratch.shape,
+            reused_scratch.weighted_normal_dshape,
+            reused_scratch.penalty,
+            reused_scratch.face_elements,
+            reused_scratch.element_vdof_map);
+        mfem::Vector throwaway_y(sigma_a.Size());
+        throwaway_y = 0.0;
+        dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+          incidence_info_a,
+          reused_scratch,
+          sigma_a,
+          incidence_ip_sigma,
+          throwaway_y);
+        std::vector<int> first_connectivity(
+          static_cast<std::size_t>(reused_scratch.face_elements.Size()));
+        const int* first_faces = reused_scratch.face_elements.HostRead();
+        std::copy(first_faces,
+                  first_faces + reused_scratch.face_elements.Size(),
+                  first_connectivity.begin());
+        const std::uint64_t first_incidence_revision =
+          reused_scratch.incidence_connectivity_revision;
+
+        const auto incidence_info_b =
+          dg_igr::dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
+            incidence_fes_b,
+            incidence_fqs_b,
+            side_q_b,
+            incidence_kappa,
+            reused_scratch.shape,
+            reused_scratch.weighted_normal_dshape,
+            reused_scratch.penalty,
+            reused_scratch.face_elements,
+            reused_scratch.element_vdof_map);
+        bool packed_connectivity_changed =
+          first_connectivity.size() ==
+          static_cast<std::size_t>(reused_scratch.face_elements.Size());
+        const int* second_faces = reused_scratch.face_elements.HostRead();
+        if (packed_connectivity_changed)
+        {
+          packed_connectivity_changed = false;
+          for (int i = 0; i < reused_scratch.face_elements.Size(); ++i)
+          {
+            packed_connectivity_changed =
+              packed_connectivity_changed ||
+              first_connectivity[static_cast<std::size_t>(i)] !=
+                second_faces[i];
+          }
+        }
+        const bool equal_sized_rebuild =
+          incidence_info_a.ne == incidence_info_b.ne &&
+          incidence_info_a.nf == incidence_info_b.nf &&
+          incidence_info_a.dof == incidence_info_b.dof;
+        const bool revision_invalidated =
+          first_incidence_revision == incidence_info_a.connectivity_revision &&
+          incidence_info_b.connectivity_revision !=
+            incidence_info_a.connectivity_revision &&
+          reused_scratch.incidence_connectivity_revision ==
+            first_incidence_revision;
+
+        mfem::Vector reused_y(sigma_b.Size());
+        reused_y = 0.0;
+        dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+          incidence_info_b,
+          reused_scratch,
+          sigma_b,
+          incidence_ip_sigma,
+          reused_y);
+        const bool incidence_revision_refreshed =
+          reused_scratch.incidence_connectivity_revision ==
+          incidence_info_b.connectivity_revision;
+
+        dg_igr::dg_face::InteriorFaceDGDiffusionApplyScratch fresh_scratch;
+        const auto fresh_info =
+          dg_igr::dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
+            incidence_fes_b,
+            incidence_fqs_b,
+            side_q_b,
+            incidence_kappa,
+            fresh_scratch.shape,
+            fresh_scratch.weighted_normal_dshape,
+            fresh_scratch.penalty,
+            fresh_scratch.face_elements,
+            fresh_scratch.element_vdof_map);
+        mfem::Vector fresh_y(sigma_b.Size());
+        fresh_y = 0.0;
+        dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+          fresh_info,
+          fresh_scratch,
+          sigma_b,
+          incidence_ip_sigma,
+          fresh_y);
+        mfem::Vector reused_repeat_y(sigma_b.Size());
+        reused_repeat_y = 0.0;
+        dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+          incidence_info_b,
+          reused_scratch,
+          sigma_b,
+          incidence_ip_sigma,
+          reused_repeat_y);
+
+        ctx.Check(equal_sized_rebuild && packed_connectivity_changed,
+                  "IGR incidence cache regression uses equal counts and "
+                  "different packed connectivity");
+        ctx.Check(revision_invalidated && incidence_revision_refreshed,
+                  "IGR incidence cache revision invalidates on connectivity "
+                  "rebuild");
+        ctx.Check(SameVectorBits(reused_y, fresh_y),
+                  "IGR reordered scratch reuse matches a fresh incidence "
+                  "build bit-for-bit");
+        ctx.Check(SameVectorBits(reused_y, reused_repeat_y),
+                  "IGR reordered incidence gather remains repeatable");
       }
 
       {
@@ -3260,73 +3446,102 @@ int RunIGRTests(TestContext& ctx)
                       FormatSci(cheb_qf_ref.GetLastPCSetupSeconds()) +
                       " solve_s=" +
                       FormatSci(cheb_qf_ref.GetLastLinearSolveSeconds()));
+      }
 
-        // A deliberately useless one-step polynomial must be rejected by the
-        // independent FP64 residual certificate.  The ensuing CG solve starts
-        // from the untouched original guess and must reproduce the ordinary
-        // Chebyshev-preconditioned reference solution.
-        {
-          ScopedEnvVar reduction_free(
-            "DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV", "1");
-          ScopedEnvVar reduction_degree(
-            "DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_DEGREE", "1");
-          ScopedEnvVar reduction_lambda_min(
-            "DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_LAMBDA_MIN", "1e-6");
-          ScopedEnvVar reduction_lambda_max(
-            "DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_LAMBDA_MAX", "1e6");
-          ScopedEnvVar reduction_bound_safety(
-            "DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_BOUND_SAFETY", "1");
-          dg_igr::IGRSolver reduction_free_fallback(sigma_fes_qf,
-                                                     state_fes_qf,
-                                                     dim_qf,
-                                                     num_eq_qf,
-                                                     /*alpha=*/0.3);
-          reduction_free_fallback.SetGradBackend(
-            dg_igr::IGRGradBackend::BrokenDG);
-          reduction_free_fallback.SetIPKind(dg_igr::IGRIPKind::SIPG);
-          reduction_free_fallback.SetSolveMode(
-            dg_igr::IGRSolveMode::Krylov);
-          reduction_free_fallback.SetLinearSolver(
-            dg_igr::IGRLinearSolverType::CG);
-          reduction_free_fallback.SetPreconditioner(
-            dg_igr::IGRPrecondType::OperatorChebyshev);
-          reduction_free_fallback.SetLinearSolveParams(/*rtol=*/1.0e-8,
-                                                        /*atol=*/0.0,
-                                                        /*max_it=*/1000,
-                                                        /*print=*/0);
-          reduction_free_fallback.UpdateFromState(U_qf,
-                                                  /*warm_start=*/false);
+      {
+        ScopedEnvVar force_pa("DG_IGR_IGR_PARTIAL_ASSEMBLY", "1");
+        ScopedEnvVar force_qf("DG_IGR_IGR_DEVICE_QF", "1");
+        ScopedEnvVar request_base_operator(
+          "DG_IGR_IGR_CHEB_BASE_OPERATOR", "1");
+        ScopedEnvVar cheb_order("DG_IGR_IGR_CHEB_ORDER", "3");
+        ScopedEnvVar cheb_power_iters(
+          "DG_IGR_IGR_CHEB_POWER_ITERATIONS", "4");
+        dg_igr::IGRSolver extrapolated_cheb_ref(sigma_fes_qf,
+                                                state_fes_qf,
+                                                dim_qf,
+                                                num_eq_qf,
+                                                /*alpha=*/0.3);
+        configure_qf_solver(extrapolated_cheb_ref);
+        extrapolated_cheb_ref.SetExactDGFaceOperator(true);
+        extrapolated_cheb_ref.SetSigmaUpdatePolicy(
+          dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
+          /*interval=*/1);
+        extrapolated_cheb_ref.SetPreconditioner(
+          dg_igr::IGRPrecondType::OperatorChebyshev);
+        extrapolated_cheb_ref.SetLinearSolveParams(/*rtol=*/1.0e-8,
+                                                   /*atol=*/0.0,
+                                                   /*max_it=*/1000,
+                                                   /*print=*/0);
+        extrapolated_cheb_ref.UpdateFromState(U_qf, /*warm_start=*/false);
+        ctx.Check(extrapolated_cheb_ref.GetLastLinearConverged(),
+                  "IGR extrapolated exact-face full-system Chebyshev "
+                  "preconditioner converges");
+        ctx.Check(extrapolated_cheb_ref.GetLastExactFaceEffective(),
+                  "IGR extrapolated Chebyshev regression exercises the "
+                  "exact-face operator");
+        ctx.Check(extrapolated_cheb_ref.GetLastPrecondName() ==
+                    "operatorchebyshev",
+                  "IGR extrapolated cadence ignores the legacy base-operator "
+                  "environment request");
+      }
 
-          mfem::Vector reduction_delta(
-            reduction_free_fallback.GetSigma());
-          reduction_delta -= cheb_qf_ref.GetSigma();
-          const double reduction_reference_norm =
-            std::max(GlobalL2Norm(cheb_qf_ref.GetSigma()), 1.0e-30);
-          const double reduction_relative_delta =
-            GlobalL2Norm(reduction_delta) / reduction_reference_norm;
-          ctx.LogMetric(
-            "igr_l2_cpu_reduction_free_chebyshev_fallback rel=" +
-            FormatSci(reduction_relative_delta) + " total_iters=" +
-            std::to_string(
-              reduction_free_fallback.GetLastLinearIters()) +
-            " true_residual_rel_rhs=" +
-            FormatSci(
-              reduction_free_fallback.GetLastLinearTrueResidualRelRHS()));
-          ctx.Check(reduction_free_fallback.GetLastLinearConverged() &&
-                      reduction_free_fallback.GetLastLinearIters() > 1,
-                    "IGR reduction-free Chebyshev rejects an uncertified "
-                    "candidate and completes its bounded CG fallback");
-          ctx.Check(std::isfinite(
-                      reduction_free_fallback
-                        .GetLastLinearTrueResidualRelRHS()) &&
-                      reduction_free_fallback
-                        .GetLastLinearTrueResidualRelRHS() <= 1.0e-8,
-                    "IGR reduction-free fallback passes the independent "
-                    "FP64 residual certificate");
-          ctx.Check(reduction_relative_delta < 5.0e-8,
-                    "IGR reduction-free fallback preserves the original "
-                    "guess transaction and matches ordinary CG");
-        }
+      mfem::Vector extrapolated_arithmetic_sigma;
+      {
+        ScopedEnvVar force_pa("DG_IGR_IGR_PARTIAL_ASSEMBLY", "1");
+        ScopedEnvVar force_qf("DG_IGR_IGR_DEVICE_QF", "1");
+        ScopedEnvVar request_arithmetic_scaling(
+          "DG_IGR_IGR_IPDG_FACE_SCALING", "arithmetic");
+        dg_igr::IGRSolver arithmetic_scaling_ref(sigma_fes_qf,
+                                                 state_fes_qf,
+                                                 dim_qf,
+                                                 num_eq_qf,
+                                                 /*alpha=*/0.3);
+        configure_qf_solver(arithmetic_scaling_ref);
+        arithmetic_scaling_ref.SetExactDGFaceOperator(true);
+        arithmetic_scaling_ref.SetSigmaUpdatePolicy(
+          dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
+          /*interval=*/1);
+        arithmetic_scaling_ref.UpdateFromState(U_qf, /*warm_start=*/false);
+        ctx.Check(arithmetic_scaling_ref.GetLastLinearConverged(),
+                  "IGR extrapolated arithmetic face-scaling reference "
+                  "converges");
+        extrapolated_arithmetic_sigma = arithmetic_scaling_ref.GetSigma();
+      }
+
+      {
+        ScopedEnvVar force_pa("DG_IGR_IGR_PARTIAL_ASSEMBLY", "1");
+        ScopedEnvVar force_qf("DG_IGR_IGR_DEVICE_QF", "1");
+        ScopedEnvVar request_harmonic_scaling(
+          "DG_IGR_IGR_IPDG_FACE_SCALING", "harmonic");
+        dg_igr::IGRSolver extrapolated_scaling_ref(sigma_fes_qf,
+                                                   state_fes_qf,
+                                                   dim_qf,
+                                                   num_eq_qf,
+                                                   /*alpha=*/0.3);
+        configure_qf_solver(extrapolated_scaling_ref);
+        extrapolated_scaling_ref.SetExactDGFaceOperator(true);
+        extrapolated_scaling_ref.SetSigmaUpdatePolicy(
+          dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
+          /*interval=*/1);
+        extrapolated_scaling_ref.UpdateFromState(U_qf,
+                                                 /*warm_start=*/false);
+        ctx.Check(extrapolated_scaling_ref.GetLastLinearConverged(),
+                  "IGR extrapolated hostile face-scaling regression "
+                  "converges");
+        ctx.Check(extrapolated_scaling_ref.GetLastExactFaceEffective(),
+                  "IGR extrapolated face-scaling regression exercises the "
+                  "exact-face operator");
+        mfem::Vector scaling_delta(extrapolated_scaling_ref.GetSigma());
+        scaling_delta -= extrapolated_arithmetic_sigma;
+        const double scaling_rel =
+          GlobalL2Norm(scaling_delta) /
+          std::max(GlobalL2Norm(extrapolated_arithmetic_sigma), 1.0e-30);
+        ctx.LogMetric("igr_l2_extrapolated_face_scaling_override_rel=" +
+                      FormatSci(scaling_rel));
+        ctx.AddParity(scaling_rel);
+        ctx.Check(scaling_rel < 5.0e-12,
+                  "IGR extrapolated cadence ignores the legacy face-scaling "
+                  "environment request");
       }
 
 	      {
@@ -3398,8 +3613,10 @@ int RunIGRTests(TestContext& ctx)
 	      }
 
 	      {
-	        ScopedEnvVar force_pa("DG_IGR_IGR_PARTIAL_ASSEMBLY", "1");
-	        ScopedEnvVar force_qf("DG_IGR_IGR_DEVICE_QF", "1");
+	        ScopedEnvVar legacy_pa_opt_out("DG_IGR_IGR_PARTIAL_ASSEMBLY", "0");
+	        // Exact side-aware faces own these dependencies; unrelated legacy
+	        // PA/QF opt-outs must not make the typed closure fail at runtime.
+	        ScopedEnvVar legacy_qf_opt_out("DG_IGR_IGR_DEVICE_QF", "0");
 	        ScopedEnvVar force_exact("DG_IGR_IGR_EXACT_DG_FACE_OPERATOR", "1");
 	        dg_igr::IGRSolver exact_face_ref(sigma_fes_qf,
 	                                         state_fes_qf,
@@ -3411,7 +3628,7 @@ int RunIGRTests(TestContext& ctx)
         ctx.Check(exact_face_ref.GetLastLinearConverged(),
                   "IGR CPU L2 exact-face PA/QF reference solve converges");
         ctx.Check(exact_face_ref.GetAssembledOperator() == nullptr,
-                  "IGR CPU L2 exact-face PA/QF uses operator path");
+                  "IGR CPU L2 exact-face implies the PA/QF operator path");
 
 	        const mfem::Operator* assembled_op =
 	          assembled_qf_ref.GetLinearOperator();
@@ -4476,6 +4693,7 @@ int RunIGRTests(TestContext& ctx)
       mfem::EulerFlux extrapolated_base_flux(dim_s, gamma);
       mfem::FluxWithIGR extrapolated_igr_flux(extrapolated_base_flux);
       extrapolated_igr_flux.SetSigmaField(&extrapolated_solver.GetSigma());
+      extrapolated_igr_flux.SetFrozenSigmaSpectralSpeed(true);
       mfem::RusanovFluxWithSides extrapolated_num_flux(extrapolated_igr_flux);
       auto extrapolated_form =
         std::make_unique<mfem::HyperbolicFormIntegrator>(
@@ -4505,6 +4723,8 @@ int RunIGRTests(TestContext& ctx)
       mfem::Vector sigma0(extrapolated_solver.GetSigma());
       const int solves_after_initial_anchor =
         extrapolated_solver.GetLinearSolveCalls();
+      const long long certificates_after_initial_anchor =
+        extrapolated_wrapped.GetSigmaExactCertificateCount();
 
       // RunTimeLoop performs this direct RHS probe before BeginRKStep when CFL
       // control is active. It must preserve the exact initial anchor and its
@@ -4542,22 +4762,33 @@ int RunIGRTests(TestContext& ctx)
       const double endpoint_change = GlobalL2Norm(first_endpoint_change);
 
       ctx.Check(initial_anchor.solved && initial_anchor.reusable_stage0 &&
+                  certificates_after_initial_anchor == 1 &&
                   first_stage_error.Normlinf() == 0.0 &&
                   startup_hold_error.Normlinf() == 0.0,
                 "IGR extrapolated cadence starts from one exact anchor and "
-                "holds it during the history-free startup step");
+                "an independent FP64 certificate, then holds it during the "
+                "history-free startup step");
       ctx.Check(extrapolated_solver.GetLinearSolveCalls() ==
                     solves_after_initial_anchor + 1 &&
                   extrapolated_wrapped.GetSigmaEndpointSolveCount() == 1 &&
-                  extrapolated_wrapped.GetSigmaExtrapolatedStageCount() == 2,
+                  extrapolated_wrapped.GetSigmaExtrapolatedStageCount() == 2 &&
+                  extrapolated_wrapped.GetSigmaExactCertificateCount() == 2 &&
+                  extrapolated_wrapped
+                      .GetMaximumLocalSigmaExactCertificateAcceptanceRatio() <=
+                    1.0,
                 "IGR extrapolated cadence performs no stage solves and one "
-                "post-limiter endpoint solve");
+                "independently certified post-limiter endpoint solve");
       ctx.Check(endpoint_change > 1.0e-8 &&
                   extrapolated_solver.GetLastLinearConverged() &&
                   extrapolated_wrapped.GetSigmaStateGeneration() ==
                     generation0 + 2,
                 "IGR extrapolated cadence commits a distinct exact endpoint "
                 "with accepted-state provenance");
+      ctx.Check(extrapolated_wrapped.LimitProposedRKStepSize(0.005) == 0.005 &&
+                  extrapolated_wrapped.LimitProposedRKStepSize(0.02) == 0.02 &&
+                  extrapolated_wrapped.LimitProposedRKStepSize(0.03) == 0.02,
+                "IGR extrapolated cadence bounds accepted-step growth at two "
+                "without perturbing smaller proposals");
 
       constexpr double h1 = 0.02;
       const std::uint64_t generation1 = generation0 + 2;
@@ -4827,6 +5058,45 @@ int RunIGRTests(TestContext& ctx)
                                     admission_generation,
                                     /*retry_dt=*/0.0);
 
+      // Stage samples can all be admissible while the exact closure
+      // reconstructed after the terminal limiter is not. That endpoint must
+      // reject before committing sigma history, and the producing step must
+      // remain rollback-safe.
+      admission_wrapped.BeginRKStep(
+        /*step=*/0,
+        /*t=*/0.0,
+        /*dt=*/admission_dt,
+        /*stage_count=*/10);
+      admission_wrapped.SetRKStageState(
+        /*stage=*/0,
+        admission_generation,
+        /*stage_time=*/0.0);
+      admission_wrapped.Mult(admission_state, admission_rhs);
+      admission_op.FailNextEndpointAdmission(/*nonpositive=*/4,
+                                             /*nonfinite=*/1);
+      bool exact_endpoint_rejected = false;
+      try
+      {
+        admission_wrapped.EndRKStep(admission_state,
+                                    /*t=*/admission_dt,
+                                    admission_generation + 1);
+      }
+      catch (const mfem::RecoverableRKStageAdmissionFailure& failure)
+      {
+        exact_endpoint_rejected =
+          failure.Reason() == mfem::RKStageAdmissionFailureReason::
+                                QSigmaNonpositiveAndNonfinite &&
+          failure.GlobalNonpositiveQSigmaSampleCount() == 4 &&
+          failure.GlobalNonfiniteQSigmaSampleCount() == 1 &&
+          failure.Stage() == -1;
+      }
+      admission_wrapped.AbortRKStep(admission_state,
+                                    /*restored_time=*/0.0,
+                                    admission_generation,
+                                    /*retry_dt=*/0.005);
+      mfem::Vector endpoint_rollback_error(admission_solver.GetSigma());
+      endpoint_rollback_error -= accepted_sigma;
+
       ctx.Check(admission_wrapped.RequiresRKStepTransaction(),
                 "IGR extrapolated q_sigma admission requests an RK rollback "
                 "transaction");
@@ -4835,20 +5105,22 @@ int RunIGRTests(TestContext& ctx)
                 "IGR extrapolated q_sigma admission rejects only violations "
                 "newly observed by the current RHS");
       ctx.Check(admission_rollback_error.Normlinf() == 0.0 &&
+                  exact_endpoint_rejected &&
+                  endpoint_rollback_error.Normlinf() == 0.0 &&
                   admission_wrapped.GetSigmaStateGeneration() ==
                     admission_generation,
-                "IGR extrapolated q_sigma rejection restores the immutable "
-                "accepted sigma anchor");
-      ctx.Check(admission_wrapped.GetSigmaStageAdmissionRejectionCount() == 1 &&
+                "IGR extrapolated stage and exact-endpoint q_sigma rejection "
+                "restore the immutable accepted sigma anchor");
+      ctx.Check(admission_wrapped.GetSigmaStageAdmissionRejectionCount() == 2 &&
                   admission_wrapped
-                      .GetSigmaStageAdmissionNonpositiveSampleCount() == 3 &&
+                      .GetSigmaStageAdmissionNonpositiveSampleCount() == 7 &&
                   admission_wrapped
-                      .GetSigmaStageAdmissionNonfiniteSampleCount() == 2 &&
+                      .GetSigmaStageAdmissionNonfiniteSampleCount() == 3 &&
                   std::string(admission_wrapped
                                 .GetLastSigmaStageAdmissionFailureReason()) ==
                     "q-sigma-nonpositive-and-nonfinite",
-                "IGR extrapolated q_sigma admission reports bounded counts "
-                "and its last reason");
+                "IGR extrapolated stage and exact-endpoint q_sigma admission "
+                "report bounded attempted-work counts and the last reason");
     }
 
     // --- Rejected RK attempts restore IGR cadence and stage-0 provenance ---
@@ -5306,6 +5578,7 @@ int RunIGRTests(TestContext& ctx)
     }
 
     int local_shared_apply_bad = 0;
+    int local_shared_repeat_bad = 0;
     int local_shared_apply_nf = 0;
     if (local_pmesh_shared > 0)
     {
@@ -5426,6 +5699,64 @@ int RunIGRTests(TestContext& ctx)
             shared_kappa,
             shared_apply_y,
             &shared_apply_scratch);
+
+        mfem::Vector shared_repeat_y0(shared_sigma.Size());
+        mfem::Vector shared_repeat_y1(shared_sigma.Size());
+        shared_repeat_y0 = 0.0;
+        shared_repeat_y1 = 0.0;
+        dg_igr::dg_face::LaunchSharedFaceDGDiffusionApply2D(
+          shared_apply_info,
+          shared_apply_scratch,
+          shared_sigma,
+          shared_sigma.FaceNbrData(),
+          shared_ip_sigma,
+          shared_repeat_y0);
+        dg_igr::dg_face::LaunchSharedFaceDGDiffusionApply2D(
+          shared_apply_info,
+          shared_apply_scratch,
+          shared_sigma,
+          shared_sigma.FaceNbrData(),
+          shared_ip_sigma,
+          shared_repeat_y1);
+        if (!SameVectorBits(shared_repeat_y0, shared_repeat_y1))
+        {
+          local_shared_repeat_bad = 1;
+        }
+        const std::uint64_t shared_first_revision =
+          shared_apply_scratch.incidence_connectivity_revision;
+        const auto shared_rebuilt_info =
+          dg_igr::dg_face::BuildSharedFaceDGDiffusionApplyData2D(
+            shared_fes,
+            shared_face_ir,
+            shared_side_q,
+            shared_kappa,
+            shared_apply_scratch.shape,
+            shared_apply_scratch.weighted_normal_dshape,
+            shared_apply_scratch.penalty,
+            shared_apply_scratch.face_elements,
+            shared_apply_scratch.element_vdof_map,
+            shared_apply_scratch.face_nbr_dof_map);
+        const bool shared_revision_invalidated =
+          shared_first_revision == shared_apply_info.connectivity_revision &&
+          shared_rebuilt_info.connectivity_revision != shared_first_revision &&
+          shared_apply_scratch.incidence_connectivity_revision ==
+            shared_first_revision;
+        mfem::Vector shared_rebuilt_y(shared_sigma.Size());
+        shared_rebuilt_y = 0.0;
+        dg_igr::dg_face::LaunchSharedFaceDGDiffusionApply2D(
+          shared_rebuilt_info,
+          shared_apply_scratch,
+          shared_sigma,
+          shared_sigma.FaceNbrData(),
+          shared_ip_sigma,
+          shared_rebuilt_y);
+        if (!shared_revision_invalidated ||
+            shared_apply_scratch.incidence_connectivity_revision !=
+              shared_rebuilt_info.connectivity_revision ||
+            !SameVectorBits(shared_repeat_y0, shared_rebuilt_y))
+        {
+          local_shared_repeat_bad = 1;
+        }
 
         mfem::Vector shared_diag(shared_sigma.Size());
         shared_diag = 0.0;
@@ -5740,6 +6071,7 @@ int RunIGRTests(TestContext& ctx)
        (!side_supported || !trace_supported)) ? 1 : 0;
     int global_bad_support = 0;
     int global_shared_apply_bad = 0;
+    int global_shared_repeat_bad = 0;
     int global_shared_apply_nf = 0;
     int global_exact_operator_bad = 0;
     int global_exact_operator_shared_nf = 0;
@@ -5759,6 +6091,12 @@ int RunIGRTests(TestContext& ctx)
                   MPI_COMM_WORLD);
     MPI_Allreduce(&local_shared_apply_bad,
                   &global_shared_apply_bad,
+                  1,
+                  MPI_INT,
+                  MPI_SUM,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(&local_shared_repeat_bad,
+                  &global_shared_repeat_bad,
                   1,
                   MPI_INT,
                   MPI_SUM,
@@ -5867,6 +6205,7 @@ int RunIGRTests(TestContext& ctx)
                                       global_pmesh_shared +
                                       global_bad_support +
                                       global_shared_apply_bad +
+                                      global_shared_repeat_bad +
                                       global_shared_apply_nf +
                                       global_exact_operator_bad +
                                       global_exact_operator_shared_nf +
@@ -5879,6 +6218,8 @@ int RunIGRTests(TestContext& ctx)
               "IGR exact-face local helpers support parallel face spaces");
     ctx.Check(global_shared_apply_bad == 0,
               "IGR exact-face shared-face metadata builder is valid");
+    ctx.Check(global_shared_repeat_bad == 0,
+              "IGR exact-face shared row gather repeats bit-for-bit");
     ctx.Check(global_shared_apply_nf == global_pmesh_shared,
               "IGR exact-face shared-face metadata covers ParMesh shared faces");
     ctx.Check(global_shared_alpha_bad == 0 &&

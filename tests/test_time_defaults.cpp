@@ -43,8 +43,6 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "HDG IGR defaults: alpha and beta are one");
     ctx.Check(opts.hdg_cuda_engine == "ordinary",
               "HDG CUDA engine defaults to ordinary");
-    ctx.Check(opts.dg_surface_flux == "rusanov",
-              "ordinary-DG surface flux defaults to Rusanov");
     ctx.Check(opts.time_atol == 1.0e-8 && opts.time_rtol == 1.0e-5,
               "adaptive time tolerances retain their typed opt-in defaults");
     ctx.Check(dg_sim::ParseZhangShuPointSet("consumer") ==
@@ -718,31 +716,6 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "IGR options: invariant-domain flux disable flag parses");
   }
 
-  // --- Explicit-HDG-derived face elimination is a typed DG-only flux ---
-  {
-    char program_name[] = "test";
-    char option_name[] = "--dg-surface-flux";
-    char option_value[] = "hdg-trace-centered";
-    char* argv[] = {program_name, option_name, option_value};
-    dg_sim::CommonOptions opts;
-    mfem::OptionsParser parser(3, argv);
-    dg_sim::AddCommonOptions(parser, opts, "mesh");
-    parser.Parse();
-    dg_sim::CaseConfig case_cfg;
-    dg_sim::IGROptions igr_opts;
-    const dg_sim::RunConfig run_cfg =
-      dg_sim::MakeRunConfig(case_cfg, opts, igr_opts);
-    ctx.Check(parser.Good() &&
-                run_cfg.dg_surface_flux ==
-                  dg_sim::DGSurfaceFlux::HdgTraceCentered &&
-                std::string(dg_sim::DGSurfaceFluxToString(
-                  run_cfg.dg_surface_flux)) == "hdg-trace-centered" &&
-                dg_sim::ParseDGSurfaceFlux("trace_centered") ==
-                  run_cfg.dg_surface_flux,
-              "ordinary-DG HDG-derived trace-centered flux parses and "
-              "round-trips without changing the default");
-  }
-
   // --- Extrapolated endpoint cadence has a stable typed spelling ---
   {
     const auto cadence =
@@ -755,26 +728,121 @@ int RunTimeDefaultsTests(TestContext& ctx)
       "IGR options: extrapolated-every-step cadence parses and round-trips");
   }
 
-  // --- IGR sigma order is a typed L2/BrokenL2-only override ---
+  // --- Extrapolated IGR remains a bounded, production-qualified tuple ---
   {
-    char program_name[] = "test";
-    char option_name[] = "--igr-sigma-order";
-    char option_value[] = "0";
-    char* argv[] = {program_name, option_name, option_value};
+    dg_sim::CaseConfig case_cfg;
+    dg_sim::CommonOptions opts;
     dg_sim::IGROptions igr_opts;
+    opts.discretization = "dgsem";
+    opts.dg_backend = "dgsem";
+    opts.positivity_limiter = "zhang-shu";
+    opts.zhang_shu_points = "consumer";
+    opts.dgsem_stab = "none";
+    opts.dgsem_volume_flux = "central";
+    opts.dgsem_volume_dissipation = "llf";
+    opts.dgsem_surface_flux = "rusanov";
+    igr_opts.alpha_length_policy = "local";
     igr_opts.space = "L2";
     igr_opts.grad = "BrokenL2";
-    mfem::OptionsParser parser(3, argv);
-    dg_sim::AddIGROptions(parser, igr_opts);
-    parser.Parse();
-    ctx.Check(parser.Good() && igr_opts.sigma_order == 0 &&
-                dg_sim::ResolveIGRSigmaOrder(/*euler_order=*/3, igr_opts) == 0,
-              "IGR options: explicit sigma order parses and resolves");
+    igr_opts.ip_kind = "sipg";
+    igr_opts.solve_mode = "krylov";
+    igr_opts.linear_solver = "cg";
+    igr_opts.preconditioner = "chebyshev";
+    igr_opts.sigma_cadence = "extrapolated-every-step";
+    igr_opts.exact_dg_face_operator = true;
+    igr_opts.nonconvergence_policy = "error";
+    const dg_sim::RunConfig qualified = dg_sim::MakeRunConfig(
+      case_cfg,
+      opts,
+      igr_opts,
+      dg_sim::DiscretizationProvenance::DiscretizationOption,
+      dg_sim::Regularization::IGR,
+      dg_sim::TimeIntegrator::SSPRK104);
+    ctx.Check(
+      dg_sim::ValidateExtrapolatedEveryStepIGRSelection(qualified).empty(),
+      "extrapolated IGR selection: qualified DGSEM tuple is admitted");
 
-    dg_sim::IGROptions inherited;
-    ctx.Check(inherited.sigma_order == -1 &&
-                dg_sim::ResolveIGRSigmaOrder(/*euler_order=*/2, inherited) == 2,
-              "IGR options: sigma order inherits the Euler order by default");
+    dg_sim::RunConfig extrapolated_with_legacy_entry_limit = qualified;
+    extrapolated_with_legacy_entry_limit.case_config.rk3_config.limit_initial =
+      true;
+    ctx.Check(
+      !dg_sim::ResolveRK3StepperConfig(extrapolated_with_legacy_entry_limit)
+         .limit_initial,
+      "extrapolated IGR selection: redundant RK-entry limiting is disabled");
+
+    dg_sim::RunConfig wrong_transport = qualified;
+    wrong_transport.dgsem_volume_dissipation =
+      dg_sim::DGSEMVolumeDissipation::None;
+    ctx.Check(
+      !dg_sim::ValidateExtrapolatedEveryStepIGRSelection(wrong_transport)
+         .empty(),
+      "extrapolated IGR selection: unqualified transport is rejected");
+
+    dg_sim::RunConfig extra_limiter = qualified;
+    extra_limiter.case_config.limiter_pipeline.krivodonova = true;
+    ctx.Check(
+      !dg_sim::ValidateExtrapolatedEveryStepIGRSelection(extra_limiter)
+         .empty(),
+      "extrapolated IGR selection: unqualified extra limiter is rejected");
+
+    dg_sim::RunConfig wrong_closure = qualified;
+    wrong_closure.igr_opts.grad = "H1";
+    ctx.Check(
+      !dg_sim::ValidateExtrapolatedEveryStepIGRSelection(wrong_closure)
+         .empty(),
+      "extrapolated IGR selection: conforming closure is rejected");
+
+    dg_sim::RunConfig uncertified_solver = qualified;
+    uncertified_solver.igr_opts.solve_mode = "smoother";
+    ctx.Check(
+      !dg_sim::ValidateExtrapolatedEveryStepIGRSelection(uncertified_solver)
+         .empty(),
+      "extrapolated IGR selection: a closure without independent FP64 "
+      "residual certification is rejected");
+
+    dg_sim::RunConfig every_stage = qualified;
+    every_stage.igr_opts.sigma_cadence = "every-stage";
+    every_stage.case_config.rk3_config.limit_initial = true;
+    every_stage.dgsem_volume_dissipation =
+      dg_sim::DGSEMVolumeDissipation::None;
+    ctx.Check(
+      dg_sim::ValidateExtrapolatedEveryStepIGRSelection(every_stage).empty(),
+      "extrapolated IGR selection: other cadences retain their general surface");
+    ctx.Check(dg_sim::ResolveRK3StepperConfig(every_stage).limit_initial,
+              "every-stage IGR selection: RK-entry limiting is preserved");
+
+    dg_sim::IGROptions hdg_igr_opts = igr_opts;
+    ctx.Check(
+      !dg_sim::ValidateHdgIGRSigmaCadence(
+         dg_sim::Discretization::HDG,
+         dg_sim::Regularization::IGR,
+         case_cfg,
+         hdg_igr_opts).empty(),
+      "HDG IGR selection: extrapolated cadence is rejected before dispatch");
+    hdg_igr_opts.sigma_cadence = "every-stage";
+    ctx.Check(
+      dg_sim::ValidateHdgIGRSigmaCadence(
+        dg_sim::Discretization::HDG,
+        dg_sim::Regularization::IGR,
+        case_cfg,
+        hdg_igr_opts).empty(),
+      "HDG IGR selection: stage-consistent cadence is admitted");
+    hdg_igr_opts.sigma_cadence = "every-step";
+    ctx.Check(
+      !dg_sim::ValidateHdgIGRSigmaCadence(
+         dg_sim::Discretization::HDG,
+         dg_sim::Regularization::None,
+         case_cfg,
+         hdg_igr_opts).empty(),
+      "conventional HDG selection: explicit unsupported cadence is not ignored");
+    hdg_igr_opts.sigma_cadence.clear();
+    ctx.Check(
+      dg_sim::ValidateHdgIGRSigmaCadence(
+        dg_sim::Discretization::HDG,
+        dg_sim::Regularization::None,
+        case_cfg,
+        hdg_igr_opts).empty(),
+      "conventional HDG selection: absent IGR cadence remains irrelevant");
   }
 
   // --- Refined VTK limiter points have typed CLI and legacy-env controls ---
@@ -1139,6 +1207,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     dg_sim::CaseConfig dataset_case;
     dataset_case.case_name = "ssprk-dataset";
     dg_sim::RunConfig dataset_run;
+    dataset_run.case_config = dataset_case;
     dataset_run.opts.order = 3;
     dataset_run.opts.ser_ref_levels = 1;
     dataset_run.opts.par_ref_levels = 2;
@@ -1155,22 +1224,34 @@ int RunTimeDefaultsTests(TestContext& ctx)
 
     ctx.Check(ssprk104_name == rk3_name + "_ti_ssprk104",
               "VTK dataset: SSPRK(10,4) has a typed suffix");
-    ctx.Check(rk3_name.find("_ti_") == std::string::npos,
+    ctx.Check(rk3_name ==
+                "ssprk-dataset_p_3_ref_3_is_L2_ig_BrokenL2_ca_0.25",
               "VTK dataset: established RK3SSP name remains unchanged");
-    dataset_run.dg_surface_flux =
-      dg_sim::DGSurfaceFlux::HdgTraceCentered;
-    const std::string trace_centered_name =
+    dataset_run.dg_backend = dg_sim::DGBackend::DGSEM;
+    dataset_run.dgsem_volume_dissipation =
+      dg_sim::DGSEMVolumeDissipation::LLF;
+    const std::string dgsem_llf_name =
       dg_sim::MakeCaseVTKDatasetName(dataset_case, dataset_run);
-    ctx.Check(trace_centered_name ==
-                ssprk104_name + "_dgsf_hdg-trace-centered",
-              "VTK dataset: HDG-derived DG face flux has a typed suffix");
-    dataset_run.dg_surface_flux = dg_sim::DGSurfaceFlux::Rusanov;
-    dataset_run.igr_opts.sigma_order = 0;
-    const std::string sigma_order_name =
+    ctx.Check(dgsem_llf_name == ssprk104_name + "_dvd_llf",
+              "VTK dataset: DGSEM LLF volume dissipation has a typed suffix");
+    dataset_run.case_config.igr_config.sigma_cadence =
+      dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+    dataset_run.igr_opts.alpha_length_policy = "local";
+    dataset_run.igr_opts.exact_dg_face_operator = true;
+    const std::string shock_candidate_name =
       dg_sim::MakeCaseVTKDatasetName(dataset_case, dataset_run);
-    ctx.Check(sigma_order_name.find("_iso_0") != std::string::npos,
-              "VTK dataset: explicit sigma order has a typed suffix");
-    dataset_run.igr_opts.sigma_order = -1;
+    ctx.Check(shock_candidate_name ==
+                dgsem_llf_name +
+                  "_iscad_extrapolated-every-step_ial_local_iexface",
+              "VTK dataset: effective extrapolated cadence, local alpha, and "
+              "exact faces have typed suffixes");
+    dataset_run.dg_backend = dg_sim::DGBackend::DG;
+    dataset_run.dgsem_volume_dissipation =
+      dg_sim::DGSEMVolumeDissipation::None;
+    dataset_run.case_config.igr_config.sigma_cadence =
+      dg_igr::IGRSigmaUpdateCadence::EveryStage;
+    dataset_run.igr_opts.alpha_length_policy.clear();
+    dataset_run.igr_opts.exact_dg_face_operator = false;
     dataset_run.igr_opts.igr_invariant_domain_flux = true;
     const std::string invariant_flux_name =
       dg_sim::MakeCaseVTKDatasetName(dataset_case, dataset_run);
@@ -1183,7 +1264,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "VTK dataset: refined limiter points have a typed suffix");
   }
 
-  // --- Run metadata records the new explicit time-integrator identity ---
+  // --- Run metadata records the effective explicit-method identity ---
   {
     constexpr const char* prefix_env_name = "DG_IGR_VTK_PREFIX_PATH";
     const char* original_prefix_text = std::getenv(prefix_env_name);
@@ -1210,14 +1291,20 @@ int RunTimeDefaultsTests(TestContext& ctx)
 
     dg_sim::CaseConfig metadata_case;
     metadata_case.case_name = "ssprk-metadata";
+    metadata_case.igr_config.sigma_cadence =
+      dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+    metadata_case.igr_config.alpha_length_scale_policy =
+      dg_igr::IGRAlphaLengthScalePolicy::Local;
     dg_sim::RunConfig metadata_run;
     metadata_run.case_config = metadata_case;
     metadata_run.opts.vtk_save = true;
     metadata_run.opts.order = 2;
+    metadata_run.dg_backend = dg_sim::DGBackend::DGSEM;
+    metadata_run.dgsem_volume_dissipation =
+      dg_sim::DGSEMVolumeDissipation::LLF;
     metadata_run.igr_opts.space = "L2";
     metadata_run.igr_opts.grad = "BrokenL2";
-    metadata_run.dg_surface_flux =
-      dg_sim::DGSurfaceFlux::HdgTraceCentered;
+    metadata_run.igr_opts.exact_dg_face_operator = true;
     metadata_run.igr_opts.igr_invariant_domain_flux = true;
     metadata_run.opts.zhang_shu_vtk_points = true;
     const std::vector<dg_sim::TimeIntegrator> methods = {
@@ -1231,6 +1318,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     metadata_summary.minimum_accepted_dt = 0.05;
     metadata_summary.maximum_attempted_dt = 0.2;
     metadata_summary.maximum_accepted_dt = 0.1;
+    metadata_summary.maximum_accepted_step_growth_ratio = 1.75;
     metadata_summary.success = true;
     metadata_summary.termination_reason = "target-reached";
     std::vector<std::string> dataset_names;
@@ -1268,6 +1356,26 @@ int RunTimeDefaultsTests(TestContext& ctx)
           std::string(dg_sim::TimeIntegratorToString(methods[i])) + "\"";
         metadata_fields_ok[i] = static_cast<int>(
           opened && contents.find(expected) != std::string::npos &&
+          contents.find("\"schema_version\": 2") != std::string::npos &&
+          contents.find("\"dgsem_stabilization\": \"none\"") !=
+            std::string::npos &&
+          contents.find("\"dgsem_volume_flux\": \"central\"") !=
+            std::string::npos &&
+          contents.find("\"dgsem_volume_dissipation\": \"llf\"") !=
+            std::string::npos &&
+          contents.find("\"dgsem_surface_flux\": \"rusanov\"") !=
+            std::string::npos &&
+          contents.find("\"dgsem_entropy_jacobian\": \"fd\"") !=
+            std::string::npos &&
+          contents.find(
+            "\"igr_sigma_cadence\": \"extrapolated-every-step\"") !=
+            std::string::npos &&
+          contents.find("\"igr_sigma_update_interval\": 1") !=
+            std::string::npos &&
+          contents.find("\"igr_alpha_length_policy\": \"local\"") !=
+            std::string::npos &&
+          contents.find("\"igr_exact_dg_face_operator\": true") !=
+            std::string::npos &&
           contents.find("\"accepted_attempts\": 4") != std::string::npos &&
           contents.find("\"rejected_attempts\": 1") != std::string::npos &&
           contents.find("\"rejected_limiter_elements\": 3") !=
@@ -1277,12 +1385,11 @@ int RunTimeDefaultsTests(TestContext& ctx)
             std::string::npos &&
           contents.find("\"maximum_accepted_dt\": 0.1") !=
             std::string::npos &&
+          contents.find(
+            "\"maximum_accepted_step_growth_ratio\": 1.75") !=
+            std::string::npos &&
           contents.find("\"igr_invariant_domain_flux\": true") !=
             std::string::npos &&
-          contents.find(
-            "\"dg_surface_flux\": \"hdg-trace-centered\"") !=
-            std::string::npos &&
-          contents.find("\"igr_sigma_order\": 2") != std::string::npos &&
           contents.find("\"zhang_shu_vtk_points\": true") !=
             std::string::npos &&
           contents.find("\"success\": true") != std::string::npos &&
@@ -1296,7 +1403,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
               0,
               MPI_COMM_WORLD);
     ctx.Check(metadata_fields_ok[0] == 1,
-              "run metadata: SSPRK(10,4) identity and retry aggregates persist");
+              "run metadata: effective transport/cadence identity and retry "
+              "aggregates persist");
 
     MPI_Barrier(MPI_COMM_WORLD);
     if (mfem::Mpi::Root())
@@ -1454,12 +1562,20 @@ int RunTimeDefaultsTests(TestContext& ctx)
   struct TimeLoopDummyOperator
   {
     int abort_calls = 0;
+    mutable int proposed_step_limit_calls = 0;
     mfem::real_t last_abort_time = -1.0;
     std::uint64_t last_abort_generation = 0;
     mfem::real_t last_abort_retry_dt = -1.0;
+    mfem::real_t proposed_step_limit =
+      std::numeric_limits<mfem::real_t>::infinity();
 
     void Mult(const mfem::Vector&, mfem::Vector& y) const { y = 0.0; }
     mfem::real_t GetMaxCharSpeed() const { return 1.0; }
+    mfem::real_t LimitProposedRKStepSize(mfem::real_t proposed_dt) const
+    {
+      ++proposed_step_limit_calls;
+      return std::min(proposed_dt, proposed_step_limit);
+    }
     void AbortRKStep(const mfem::Vector&,
                      mfem::real_t restored_time,
                      std::uint64_t restored_generation,
@@ -1471,12 +1587,74 @@ int RunTimeDefaultsTests(TestContext& ctx)
       last_abort_retry_dt = retry_dt;
     }
   };
+  struct TimeLoopInitialQSigmaOperator
+  {
+    struct Admission
+    {
+      bool enabled = true;
+      std::uint64_t sample_count = 8;
+      std::uint64_t nonpositive_count = 3;
+      std::uint64_t nonfinite_count = 2;
+    };
+
+    mutable int admission_calls = 0;
+    mutable int rhs_calls = 0;
+    mutable int speed_calls = 0;
+
+    Admission InspectAcceptedStateForTransport(const mfem::Vector&,
+                                                mfem::real_t) const
+    {
+      ++admission_calls;
+      return {};
+    }
+    void Mult(const mfem::Vector&, mfem::Vector& y) const
+    {
+      ++rhs_calls;
+      y = 0.0;
+    }
+    mfem::real_t GetMaxCharSpeed() const
+    {
+      ++speed_calls;
+      return 1.0;
+    }
+  };
   struct TimeLoopCountingStepper
   {
     int calls = 0;
     void Step(mfem::Vector&, mfem::real_t& t, mfem::real_t& dt)
     {
       ++calls;
+      t += dt;
+    }
+  };
+  struct TimeLoopGrowthBoundOperator
+  {
+    mfem::real_t previous_accepted_dt =
+      std::numeric_limits<mfem::real_t>::quiet_NaN();
+
+    void Mult(const mfem::Vector&, mfem::Vector& y) const { y = 0.0; }
+    mfem::real_t GetMaxCharSpeed() const { return 1.0; }
+    mfem::real_t LimitProposedRKStepSize(mfem::real_t proposed_dt) const
+    {
+      return std::isfinite(previous_accepted_dt)
+               ? std::min(proposed_dt, 2.0 * previous_accepted_dt)
+               : proposed_dt;
+    }
+  };
+  struct TimeLoopGrowthBoundStepper
+  {
+    explicit TimeLoopGrowthBoundStepper(TimeLoopGrowthBoundOperator& op)
+      : op(op)
+    {
+    }
+
+    TimeLoopGrowthBoundOperator& op;
+    std::vector<mfem::real_t> accepted_dts;
+
+    void Step(mfem::Vector&, mfem::real_t& t, mfem::real_t& dt)
+    {
+      accepted_dts.push_back(dt);
+      op.previous_accepted_dt = dt;
       t += dt;
     }
   };
@@ -1597,6 +1775,74 @@ int RunTimeDefaultsTests(TestContext& ctx)
       }
     }
   };
+
+  // --- an invalid exact initial/restart anchor fails before the CFL RHS ---
+  {
+    TimeLoopInitialQSigmaOperator op;
+    TimeLoopCountingStepper stepper;
+    const mfem::Vector state_before(bundle.sol);
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.6;
+    cfg.dt = 0.1;
+    cfg.dt_min = 0.01;
+    cfg.cfl = 0.5;
+    cfg.order = 1;
+    cfg.vtk_save = false;
+    cfg.initial_time = 0.5;
+    cfg.initial_step = 9;
+
+    const dg_sim::TimeLoopResult result =
+      dg_sim::RunTimeLoop(
+        op, example_ctx.Mesh(), bundle.sol, stepper, cfg);
+    mfem::Vector state_error(bundle.sol);
+    state_error -= state_before;
+    ctx.Check(!result.success && result.steps == 9 &&
+                result.accepted_attempts == 0 &&
+                result.rejected_attempts == 1 &&
+                result.rejected_q_sigma_attempts == 1 &&
+                result.rejected_q_sigma_nonpositive_samples == 3 &&
+                result.rejected_q_sigma_nonfinite_samples == 2 &&
+                result.last_q_sigma_rejection_reason ==
+                  "q-sigma-nonpositive-and-nonfinite" &&
+                result.last_q_sigma_rejection_stage == -1 &&
+                result.rhs_evaluations == 0 &&
+                result.characteristic_speed_probes == 0 &&
+                result.termination_reason ==
+                  "initial-q-sigma-admission-failed",
+              "initial q_sigma admission reports one bounded accepted-state "
+              "failure");
+    ctx.Check(op.admission_calls == 1 && op.rhs_calls == 0 &&
+                op.speed_calls == 0 && stepper.calls == 0 &&
+                state_error.Normlinf() == 0.0,
+              "initial q_sigma admission precedes the restart CFL probe and "
+              "leaves state untouched");
+    ctx.CheckNear(result.final_time,
+                  cfg.initial_time,
+                  0.0,
+                  "initial q_sigma admission remains at the restart horizon");
+  }
+
+  // --- a solver-level successful preflight is not repeated in the loop ---
+  {
+    TimeLoopInitialQSigmaOperator op;
+    TimeLoopCountingStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.1;
+    cfg.dt = 0.1;
+    cfg.dt_min = 0.01;
+    cfg.cfl = 0.0;
+    cfg.order = 1;
+    cfg.vtk_save = false;
+    cfg.initial_q_sigma_admitted = true;
+
+    const dg_sim::TimeLoopResult result =
+      dg_sim::RunTimeLoop(
+        op, example_ctx.Mesh(), bundle.sol, stepper, cfg);
+    ctx.Check(result.success && result.accepted_attempts == 1 &&
+                op.admission_calls == 0 && stepper.calls == 1,
+              "time loop trusts one explicitly completed solver-level "
+              "accepted-state q_sigma preflight");
+  }
 
   // --- limiter-stage rejection restores the transaction and retries at 1/2 dt ---
   {
@@ -2169,6 +2415,66 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   "time loop: clipped final dt_real reaches target final time");
     ctx.Check(result.success && result.termination_reason == "target-reached",
               "time loop: clipped final step records successful termination");
+  }
+
+  // --- an operator can bound nominal growth before horizon/save clipping ---
+  {
+    TimeLoopDummyOperator op;
+    op.proposed_step_limit = 0.06;
+    TimeLoopCountingStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.14;
+    cfg.dt = 0.2;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = false;
+
+    const dg_sim::TimeLoopResult result =
+      dg_sim::RunTimeLoop(op, example_ctx.Mesh(), bundle.sol, stepper, cfg);
+    ctx.Check(result.success && result.steps == 3 && stepper.calls == 3 &&
+                op.proposed_step_limit_calls == 3,
+              "time loop: operator step-growth limit applies before every "
+              "attempt and preserves final-horizon clipping");
+    ctx.CheckNear(result.minimum_accepted_dt,
+                  0.02,
+                  1.0e-12,
+                  "time loop: operator growth limit leaves the final clip");
+    ctx.CheckNear(result.maximum_accepted_dt,
+                  0.06,
+                  1.0e-12,
+                  "time loop: operator growth limit bounds nominal steps");
+  }
+
+  // --- a tiny save clip cannot amplify the next accepted step above 2x ---
+  {
+    TimeLoopGrowthBoundOperator op;
+    TimeLoopGrowthBoundStepper stepper(op);
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.18;
+    cfg.dt = 0.05;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = true;
+    cfg.dt_save = 0.07;
+
+    const dg_sim::TimeLoopResult result =
+      dg_sim::RunTimeLoop(op, example_ctx.Mesh(), bundle.sol, stepper, cfg);
+    bool ratios_bounded = stepper.accepted_dts.size() == 5;
+    for (std::size_t i = 1; i < stepper.accepted_dts.size(); ++i)
+    {
+      ratios_bounded = ratios_bounded &&
+                       stepper.accepted_dts[i] <=
+                         2.0 * stepper.accepted_dts[i - 1] + 1.0e-14;
+    }
+    ctx.Check(result.success && ratios_bounded,
+              "time loop: output-clipped accepted step limits every later "
+              "growth ratio to the operator policy");
+    ctx.CheckNear(result.maximum_accepted_step_growth_ratio,
+                  2.0,
+                  1.0e-12,
+                  "time loop: bounded maximum accepted growth is measured");
+    ctx.CheckNear(result.final_time,
+                  0.18,
+                  1.0e-12,
+                  "time loop: growth limiting preserves the physical horizon");
   }
 
   // --- dt_min after CFL update records current step and emits final save ---

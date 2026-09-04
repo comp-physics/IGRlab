@@ -33,7 +33,6 @@ struct IGROptions
   std::string alpha_length_policy = "";
   std::string space = "H1";
   std::string grad = "H1";
-  int sigma_order = -1;
   std::string solve_mode = "krylov";
   std::string linear_solver = "auto";
   std::string preconditioner = "auto";
@@ -61,13 +60,6 @@ enum class DGBackend
 {
   DG,
   DGSEM
-};
-
-/// @brief Numerical flux used by the ordinary primal-DG transport path.
-enum class DGSurfaceFlux
-{
-  Rusanov,
-  HdgTraceCentered
 };
 
 /// @brief General discretization selection, including unavailable seams.
@@ -250,7 +242,6 @@ struct RunConfig
   HdgCudaEngine hdg_cuda_engine = HdgCudaEngine::Ordinary;
   Regularization regularization = Regularization::IGR;
   TimeIntegrator time_integrator = TimeIntegrator::RK3SSP;
-  DGSurfaceFlux dg_surface_flux = DGSurfaceFlux::Rusanov;
   DGSEMStabilization dgsem_stab = DGSEMStabilization::None;
   DGSEMVolumeFlux dgsem_volume_flux = DGSEMVolumeFlux::Central;
   DGSEMVolumeDissipation dgsem_volume_dissipation =
@@ -1168,30 +1159,6 @@ inline bool IsBrokenDGIGRGradName(const std::string& value)
          lower == "broken-dg";
 }
 
-inline void ValidateIGRSigmaOrderSelection(const IGROptions& igr_opts)
-{
-  MFEM_VERIFY(igr_opts.sigma_order >= -1,
-              "--igr-sigma-order must be -1 (inherit Euler order) or a "
-              "nonnegative polynomial order.");
-  MFEM_VERIFY(igr_opts.sigma_order < 0 ||
-                (IsL2IGRSpaceName(igr_opts.space) &&
-                 IsBrokenDGIGRGradName(igr_opts.grad)),
-              "An explicit --igr-sigma-order requires --igr-space L2 and "
-              "--igr-grad BrokenL2.");
-}
-
-inline int ResolveIGRSigmaOrder(int euler_order,
-                                const IGROptions& igr_opts)
-{
-  ValidateIGRSigmaOrderSelection(igr_opts);
-  return igr_opts.sigma_order >= 0 ? igr_opts.sigma_order : euler_order;
-}
-
-inline int ResolveIGRSigmaOrder(const RunConfig& run_cfg)
-{
-  return ResolveIGRSigmaOrder(run_cfg.opts.order, run_cfg.igr_opts);
-}
-
 inline bool IsExactDGFaceOptionName(const std::string& value)
 {
   return value == "-iexface" || value == "--igr-exact-dg-face" ||
@@ -1536,38 +1503,6 @@ inline DGSEMSurfaceFlux ParseDGSEMSurfaceFlux(const std::string& value)
   return DGSEMSurfaceFlux::Rusanov;
 }
 
-inline DGSurfaceFlux ParseDGSurfaceFlux(const std::string& value)
-{
-  const std::string lower = ToLowerCopy(value);
-  if (lower == "rusanov" || lower == "lf" || lower == "lax-friedrichs")
-  {
-    return DGSurfaceFlux::Rusanov;
-  }
-  if (lower == "hdg-trace-centered" || lower == "hdg_trace_centered" ||
-      lower == "trace-centered" || lower == "trace_centered")
-  {
-    return DGSurfaceFlux::HdgTraceCentered;
-  }
-  MFEM_VERIFY(false,
-              "Invalid ordinary-DG surface flux '"
-                << value
-                << "'. Use 'rusanov' or 'hdg-trace-centered'.");
-  return DGSurfaceFlux::Rusanov;
-}
-
-inline const char* DGSurfaceFluxToString(DGSurfaceFlux flux)
-{
-  switch (flux)
-  {
-  case DGSurfaceFlux::Rusanov:
-    return "rusanov";
-  case DGSurfaceFlux::HdgTraceCentered:
-    return "hdg-trace-centered";
-  }
-  MFEM_ABORT("Unhandled DGSurfaceFlux enum value in DGSurfaceFluxToString.");
-  return "rusanov";
-}
-
 inline DGSEMEntropyJacobian ParseDGSEMEntropyJacobian(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
@@ -1756,11 +1691,6 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
                  "-ig",
                  "--igr-grad",
                  "Gradient reconstruction type: 'H1' or 'BrokenL2'.");
-  args.AddOption(&igr_opts.sigma_order,
-                 "-iso",
-                 "--igr-sigma-order",
-                 "IGR sigma polynomial order (-1 inherits the Euler order; "
-                 "an explicit order requires L2/BrokenL2).");
   args.AddOption(&igr_opts.solve_mode,
                  "-im",
                  "--igr-solve-mode",
@@ -1877,7 +1807,6 @@ inline RunConfig MakeRunConfig(
   Regularization regularization = Regularization::IGR,
   TimeIntegrator time_integrator = TimeIntegrator::RK3SSP)
 {
-  ValidateIGRSigmaOrderSelection(igr_opts);
   RunConfig run_cfg;
   run_cfg.case_config = case_cfg;
   const PositivityLimiterSelection positivity_limiter =
@@ -1911,7 +1840,6 @@ inline RunConfig MakeRunConfig(
                 << DiscretizationToString(run_cfg.discretization)
                 << "' is recognized but unavailable in this executable.");
   run_cfg.dg_backend = dg_backend.value_or(DGBackend::DG);
-  run_cfg.dg_surface_flux = ParseDGSurfaceFlux(opts.dg_surface_flux);
   run_cfg.dgsem_stab = ParseDGSEMStabilization(opts.dgsem_stab);
   run_cfg.dgsem_volume_flux = ParseDGSEMVolumeFlux(opts.dgsem_volume_flux);
   run_cfg.dgsem_volume_dissipation =
@@ -1931,6 +1859,161 @@ ResolveIGRAlphaLengthScalePolicy(const RunConfig& run_cfg)
     return ParseIGRAlphaLengthScalePolicy(run_cfg.igr_opts.alpha_length_policy);
   }
   return run_cfg.case_config.igr_config.alpha_length_scale_policy;
+}
+
+/// Exact frozen-sigma acoustic speeds belong to the typed extrapolated route.
+inline bool UsesFrozenSigmaSpectralSpeed(const RunConfig& run_cfg)
+{
+  const dg_igr::IGRSigmaUpdateCadence cadence =
+    run_cfg.igr_opts.sigma_cadence.empty()
+      ? run_cfg.case_config.igr_config.sigma_cadence
+      : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
+  return run_cfg.regularization == Regularization::IGR &&
+         run_cfg.discretization == Discretization::DGSEM &&
+         cadence == dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+}
+
+/** Reject cadence requests that the existing HDG DAE backend cannot honor.
+ *
+ * The HDG adapter reconstructs its algebraic variables inside the implicit
+ * stage solve and has no implementation of frozen/extrapolated sigma stages.
+ * Validate this before the adapter's early return so a DG-only cadence is
+ * never accepted and then silently ignored.
+ */
+inline std::string ValidateHdgIGRSigmaCadence(
+  Discretization discretization,
+  Regularization regularization,
+  const CaseConfig& case_cfg,
+  const IGROptions& igr_opts)
+{
+  if (discretization != Discretization::HDG)
+  {
+    return {};
+  }
+  // A conventional HDG run has no sigma state, but an explicit cadence flag
+  // is still a user request and must not disappear at the adapter boundary.
+  // Only active IGR inherits the case default when no flag was supplied.
+  if (igr_opts.sigma_cadence.empty() &&
+      regularization != Regularization::IGR)
+  {
+    return {};
+  }
+  const dg_igr::IGRSigmaUpdateCadence cadence =
+    igr_opts.sigma_cadence.empty()
+      ? case_cfg.igr_config.sigma_cadence
+      : ParseIGRSigmaUpdateCadence(igr_opts.sigma_cadence);
+  if (cadence == dg_igr::IGRSigmaUpdateCadence::EveryStage)
+  {
+    return {};
+  }
+  return "The HDG instantaneous-IGR backend supports only "
+         "--igr-sigma-cadence every-stage; split and extrapolated cadences "
+         "are qualified only on their explicitly supported DG/DGSEM routes.";
+}
+
+/** Validate the production-qualified extrapolated instantaneous-IGR tuple.
+ *
+ * Extrapolating the algebraic closure is a distinct temporal discretization,
+ * not a generic cadence optimization.  Keep it an explicit typed selection:
+ * every other DG/IGR configuration retains its established every-stage or
+ * every-step behavior instead of silently inheriting an unqualified split.
+ */
+inline std::string
+ValidateExtrapolatedEveryStepIGRSelection(const RunConfig& run_cfg)
+{
+  const dg_igr::IGRSigmaUpdateCadence cadence =
+    run_cfg.igr_opts.sigma_cadence.empty()
+      ? run_cfg.case_config.igr_config.sigma_cadence
+      : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
+  if (cadence != dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep)
+  {
+    return {};
+  }
+
+  const char* prefix =
+    "--igr-sigma-cadence extrapolated-every-step requires ";
+  if (run_cfg.regularization != Regularization::IGR)
+  {
+    return std::string(prefix) + "active IGR.";
+  }
+  if (run_cfg.discretization != Discretization::DGSEM ||
+      run_cfg.dg_backend != DGBackend::DGSEM)
+  {
+    return std::string(prefix) + "the DGSEM discretization.";
+  }
+  if (run_cfg.time_integrator != TimeIntegrator::SSPRK104)
+  {
+    return std::string(prefix) + "the SSPRK(10,4) time integrator.";
+  }
+  if (!run_cfg.case_config.limiter_pipeline.zhang_shu ||
+      run_cfg.case_config.limiter_pipeline.zhang_shu_points !=
+        mfem::ZhangShuPointSet::kConsumer)
+  {
+    return std::string(prefix) +
+           "the stagewise Zhang-Shu limiter on consumer points.";
+  }
+  const mfem::LimiterPipelineConfig& limiter =
+    run_cfg.case_config.limiter_pipeline;
+  if (limiter.bj_mode != mfem::BJLimiterMode::kNone ||
+      limiter.tvb_mode != mfem::TVBLimiterMode::kNone ||
+      limiter.venkat_mode != mfem::VenkatLimiterMode::kNone ||
+      limiter.krivodonova)
+  {
+    return std::string(prefix) +
+           "the qualified Zhang-Shu-only limiter pipeline.";
+  }
+  if (run_cfg.dgsem_stab != DGSEMStabilization::None ||
+      run_cfg.dgsem_volume_flux != DGSEMVolumeFlux::Central ||
+      run_cfg.dgsem_volume_dissipation != DGSEMVolumeDissipation::LLF ||
+      run_cfg.dgsem_surface_flux != DGSEMSurfaceFlux::Rusanov)
+  {
+    return std::string(prefix) +
+           "DGSEM central volume flux, LLF volume dissipation, Rusanov "
+           "surface flux, and no additional DGSEM stabilization.";
+  }
+  if (!IsL2IGRSpaceName(run_cfg.igr_opts.space) ||
+      !IsBrokenDGIGRGradName(run_cfg.igr_opts.grad) ||
+      ParseIGRIPKind(run_cfg.igr_opts.ip_kind) != dg_igr::IGRIPKind::SIPG ||
+      !run_cfg.igr_opts.exact_dg_face_operator)
+  {
+    return std::string(prefix) +
+           "the L2/BrokenL2 SIPG closure with exact DG faces.";
+  }
+  if (ParseIGRSolveMode(run_cfg.igr_opts.solve_mode) !=
+        dg_igr::IGRSolveMode::Krylov ||
+      ParseIGRLinearSolverType(run_cfg.igr_opts.linear_solver) !=
+        dg_igr::IGRLinearSolverType::CG ||
+      ParseIGRPrecondType(run_cfg.igr_opts.preconditioner) !=
+        dg_igr::IGRPrecondType::OperatorChebyshev)
+  {
+    return std::string(prefix) +
+           "Krylov CG with the full-system operator-Chebyshev preconditioner "
+           "so every exact algebraic anchor can receive an independent FP64 "
+           "residual certificate.";
+  }
+  if (ResolveIGRAlphaLengthScalePolicy(run_cfg) !=
+      dg_igr::IGRAlphaLengthScalePolicy::Local)
+  {
+    return std::string(prefix) +
+           "the local alpha=C_alpha*h_eff^2 policy.";
+  }
+  if (run_cfg.igr_opts.igr_invariant_domain_flux ||
+      run_cfg.igr_opts.sigma_aware_cfl ||
+      run_cfg.igr_opts.sigma_aware_rusanov)
+  {
+    return std::string(prefix) +
+           "its intrinsic frozen-sigma spectral speed policy (legacy "
+           "invariant-domain, sigma-CFL, and sigma-Rusanov toggles off).";
+  }
+  if (run_cfg.igr_opts.nonconvergence_policy.empty() ||
+      ParseIGRNonconvergencePolicy(
+        run_cfg.igr_opts.nonconvergence_policy) !=
+      dg_igr::IGRNonconvergencePolicy::Error)
+  {
+    return std::string(prefix) +
+           "--igr-nonconvergence-policy error.";
+  }
+  return {};
 }
 
 inline TimeLoopConfig MakeTimeLoopConfig(const RunConfig& run_cfg)

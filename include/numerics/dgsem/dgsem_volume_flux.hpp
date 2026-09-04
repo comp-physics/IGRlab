@@ -7,6 +7,8 @@
  */
 
 #include "mfem.hpp"
+#include "physics/igr/frozen_scalar_igr_algebra.hpp"
+#include "utils/config/dg_igr_defaults.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -51,15 +53,19 @@ inline void SymmetricAverageContravariantFlux(const DenseMatrix& flux,
 /**
  * @brief Euler directional LF speed for flux projected along a contravariant vector.
  *
- * Uses lambda = |u dot a| + c |a| where `a` is the contravariant direction
- * vector associated with the reference-space derivative direction.
+ * Uses lambda = |u dot a| + sqrt(|q_sigma|/rho)|a| where `a` is the
+ * contravariant direction and q_sigma=gamma*p+(gamma-1)*sigma. For admitted
+ * q_sigma>0 states this is the exact frozen-sigma directional spectral
+ * radius. The modulus branch merely lets a rejected stage unwind.
  */
 inline double
 EulerDirectionalLaxFriedrichsScale(const Vector& state,
                                    const Vector& contravariant_dir,
                                    int dim,
                                    double gamma,
-                                   double sigma = 0.0)
+                                   double sigma = 0.0,
+                                   double density_floor =
+                                     dg_igr::LimiterDefaults::kRhoMin)
 {
   MFEM_VERIFY(
     state.Size() == dim + 2,
@@ -67,8 +73,7 @@ EulerDirectionalLaxFriedrichsScale(const Vector& state,
   MFEM_VERIFY(contravariant_dir.Size() == dim,
               "EulerDirectionalLaxFriedrichsScale direction size mismatch.");
 
-  constexpr double kFloor = 1.0e-14;
-  const double rho = std::max(state(0), kFloor);
+  const double rho = std::max(state(0), density_floor);
   const double rhoE = state(1 + dim);
 
   double mom2 = 0.0;
@@ -84,10 +89,15 @@ EulerDirectionalLaxFriedrichsScale(const Vector& state,
   }
 
   const double kinetic = 0.5 * mom2 / rho;
-  const double p = std::max((gamma - 1.0) * (rhoE - kinetic) + sigma, kFloor);
-  const double c = std::sqrt(std::max(gamma * p / rho, kFloor));
+  const double pressure = (gamma - 1.0) * (rhoE - kinetic);
   const double a_norm = std::sqrt(std::max(a2, 0.0));
-  const double speed = std::abs(u_dot_a) + c * a_norm;
+  const double acoustic_numerator =
+    ::dg_igr::frozen_scalar_igr_algebra::
+      FrozenSigmaLocalHyperbolicityMargin(pressure, sigma, gamma);
+  // The absolute-value branch is finite solely so a rejected non-hyperbolic
+  // stage can unwind. Production admission separately requires q_sigma > 0.
+  const double speed = std::abs(u_dot_a) +
+                       std::sqrt(std::abs(acoustic_numerator) / rho) * a_norm;
   return std::isfinite(speed) ? speed : 0.0;
 }
 

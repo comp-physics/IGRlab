@@ -41,7 +41,10 @@ DGSEMOperator::FindBdrIntegrator(int attr) const
   return nullptr;
 }
 
-real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
+real_t DGSEMOperator::AssembleSurface(
+  const Vector& x,
+  Vector& z,
+  Vector* physical_boundary_flux) const
 {
   MFEM_VERIFY(DGSEMOperatorSupportsDimension(op_->dim),
               "DGSEM legacy surface oracle supports only 1D/2D.");
@@ -50,6 +53,13 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
               "DGHyperbolicConservationLaws::SetNumericalFlux().");
 
   z = 0.0;
+  real_t* boundary_flux_values = nullptr;
+  if (physical_boundary_flux)
+  {
+    physical_boundary_flux->SetSize(op_->num_equations);
+    *physical_boundary_flux = 0.0;
+    boundary_flux_values = physical_boundary_flux->HostReadWrite();
+  }
   real_t max_face_speed = 0.0;
 
   Mesh& mesh = *op_->vfes.GetMesh();
@@ -375,6 +385,10 @@ real_t DGSEMOperator::AssembleSurface(const Vector& x, Vector& z) const
 
       for (int eq = 0; eq < op_->num_equations; ++eq)
       {
+        if (boundary_flux_values)
+        {
+          boundary_flux_values[eq] += ip.weight * fluxN(eq);
+        }
         elvect1(local1, eq) += -ip.weight * fluxN(eq);
       }
     }
@@ -611,6 +625,9 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
         (flux_igr && !sigma_nodes.empty()) ? sigma_nodes[local_i] : 0.0;
       const double sigma_j =
         (flux_igr && !sigma_nodes.empty()) ? sigma_nodes[local_j] : 0.0;
+      const double density_floor =
+        flux_igr ? flux_igr->GetVelocityRhoFloor()
+                 : dg_igr::LimiterDefaults::kRhoMin;
 
       for (int k = 0; k < op_->dim; ++k)
       {
@@ -622,13 +639,15 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
                                                   contravariant_dir,
                                                   op_->dim,
                                                   gamma,
-                                                  sigma_i);
+                                                  sigma_i,
+                                                  density_floor);
       const double lf_j =
         dgsem::EulerDirectionalLaxFriedrichsScale(state_j,
                                                   contravariant_dir,
                                                   op_->dim,
                                                   gamma,
-                                                  sigma_j);
+                                                  sigma_j,
+                                                  density_floor);
       const double scale = std::max(lf_i, lf_j);
 
       if (vol_diss_mode == DGSEMVolumeDissipation::LLF)

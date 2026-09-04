@@ -142,6 +142,25 @@ inline mfem::RK3SSPWithLimiter MakeRK3Stepper(
   return rk3;
 }
 
+/** Resolve the RK configuration that the application actually executes.
+ *
+ * The extrapolated instantaneous-IGR route admits and limits the initialized
+ * (or restarted) Euler state before constructing its first exact algebraic
+ * anchor.  Reapplying the legacy per-step entry limiter after BeginRKStep
+ * could mutate that state, force an extra anchor, and discard the two-point
+ * extrapolation history.  Stage and accepted-endpoint limiting remain active;
+ * only that redundant RK-entry callback is disabled for this typed route.
+ */
+inline mfem::RK3Config ResolveRK3StepperConfig(const RunConfig& run_cfg)
+{
+  mfem::RK3Config cfg = run_cfg.case_config.rk3_config;
+  if (UsesFrozenSigmaSpectralSpeed(run_cfg))
+  {
+    cfg.limit_initial = false;
+  }
+  return cfg;
+}
+
 inline dg_igr::IGRSolver MakeIGRSolver(DGSpaces& spaces,
                                        int dim,
                                        int num_equations,

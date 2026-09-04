@@ -44,6 +44,28 @@ void CurveMesh(mfem::Mesh& mesh)
   }
 }
 
+void CurveDGSEMMesh(mfem::Mesh& mesh)
+{
+  // Use two independent polynomial perturbations so the metric determinant is
+  // not integrated exactly by the p+1 point GLL rule accidentally.  The
+  // boundary remains fixed and the modest amplitudes keep the map regular.
+  mesh.SetCurvature(3, false, kDim, mfem::Ordering::byNODES);
+  mfem::GridFunction* nodes = mesh.GetNodes();
+  MFEM_VERIFY(nodes != nullptr,
+              "Curved DGSEM limiter test requires mesh nodes.");
+  const int ndofs = nodes->FESpace()->GetNDofs();
+  double* coordinates = nodes->HostReadWrite();
+  for (int i = 0; i < ndofs; ++i)
+  {
+    const double x = coordinates[i];
+    const double y = coordinates[i + ndofs];
+    const double bubble = x * (1.0 - x) * y * (1.0 - y);
+    coordinates[i] = x + 0.45 * bubble * (1.0 + 0.5 * x);
+    coordinates[i + ndofs] =
+      y - 0.35 * bubble * (1.0 + 0.3 * x + 0.4 * y);
+  }
+}
+
 mfem::Vector ElementAverage(mfem::ParFiniteElementSpace& fes,
                             const mfem::ParGridFunction& state,
                             int element,
@@ -64,6 +86,50 @@ mfem::Vector ElementAverage(mfem::ParFiniteElementSpace& fes,
     quadrature_order,
     average);
   return average;
+}
+
+struct DGSEMIntegral
+{
+  mfem::Vector conservative;
+  double measure = 0.0;
+};
+
+DGSEMIntegral CollocatedDGSEMIntegral(
+  mfem::ParFiniteElementSpace& fes,
+  const mfem::ParGridFunction& state,
+  int element)
+{
+  const mfem::FiniteElement& fe = *fes.GetFE(element);
+  mfem::ElementTransformation& transformation =
+    *fes.GetElementTransformation(element);
+  static mfem::IntegrationRules lgl_rules(
+    0, mfem::Quadrature1D::GaussLobatto);
+  const mfem::IntegrationRule& rule = lgl_rules.Get(
+    transformation.GetGeometryType(), std::max(1, 2 * fe.GetOrder() - 1));
+
+  mfem::Array<int> vdofs;
+  mfem::Vector element_state;
+  fes.GetElementVDofs(element, vdofs);
+  state.GetSubVector(vdofs, element_state);
+  mfem::DenseMatrix values(element_state.GetData(), fe.GetDof(), kNumEq);
+  mfem::Vector shape(fe.GetDof());
+  mfem::Vector point_state(kNumEq);
+  DGSEMIntegral result;
+  result.conservative.SetSize(kNumEq);
+  result.conservative = 0.0;
+  for (int q = 0; q < rule.GetNPoints(); ++q)
+  {
+    const mfem::IntegrationPoint& point = rule.IntPoint(q);
+    transformation.SetIntPoint(&point);
+    fe.CalcShape(point, shape);
+    values.MultTranspose(shape, point_state);
+    const double weight = point.weight * transformation.Weight();
+    result.conservative.Add(weight, point_state);
+    result.measure += weight;
+  }
+  MFEM_VERIFY(result.measure > 0.0,
+              "Curved DGSEM limiter fixture has a non-positive measure.");
+  return result;
 }
 
 mfem::Vector ElementValue(mfem::ParFiniteElementSpace& fes,
@@ -296,6 +362,186 @@ int ManufacturedLimiterCase(ManufacturedCase kind, bool curved)
               << " curved=" << curved
               << " theta_rho=" << expected_theta_rho
               << " theta_p=" << expected_theta_pressure << "\n";
+  }
+  return 0;
+}
+
+int CurvedDGSEMConservationCase(int order)
+{
+  mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
+    1, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  CurveDGSEMMesh(serial_mesh);
+  mfem::ParMesh mesh(MPI_COMM_WORLD, serial_mesh);
+  mfem::DG_FECollection fec(order,
+                            kDim,
+                            mfem::BasisType::GaussLobatto);
+  mfem::ParFiniteElementSpace fes(
+    &mesh, &fec, kNumEq, mfem::Ordering::byNODES);
+  MFEM_VERIFY(fes.GetNE() == 1,
+              "Curved DGSEM limiter test expects one local element.");
+
+  const mfem::Vector baseline =
+    []
+    {
+      mfem::Vector value(kNumEq);
+      value(0) = 1.0;
+      value(1) = 0.2;
+      value(2) = -0.1;
+      value(3) = 2.525;
+      return value;
+    }();
+  mfem::Vector bad_node(kNumEq);
+  bad_node(0) = -0.2;
+  bad_node(1) = 0.35;
+  bad_node(2) = -0.25;
+  bad_node(3) = 0.02;
+
+  mfem::ParGridFunction state(&fes);
+  mfem::Array<int> vdofs;
+  fes.GetElementVDofs(0, vdofs);
+  mfem::Vector element_state(vdofs.Size());
+  mfem::DenseMatrix values(element_state.GetData(),
+                           fes.GetFE(0)->GetDof(),
+                           kNumEq);
+  int corner = 0;
+  const mfem::IntegrationRule& nodes = fes.GetFE(0)->GetNodes();
+  for (int node = 1; node < nodes.GetNPoints(); ++node)
+  {
+    const mfem::IntegrationPoint& candidate = nodes.IntPoint(node);
+    const mfem::IntegrationPoint& current = nodes.IntPoint(corner);
+    if (candidate.x + candidate.y < current.x + current.y)
+    {
+      corner = node;
+    }
+  }
+  for (int node = 0; node < values.Height(); ++node)
+  {
+    values.SetRow(node, node == corner ? bad_node : baseline);
+  }
+  state.SetSubVector(vdofs, element_state);
+  mfem::ParGridFunction initial(&fes);
+  initial = state;
+
+  const DGSEMIntegral before = CollocatedDGSEMIntegral(fes, state, 0);
+  mfem::Vector discrete_mean(before.conservative);
+  discrete_mean /= before.measure;
+  const mfem::Vector overintegrated_mean =
+    ElementAverage(fes, state, 0, 2 * order + 8);
+  mfem::Vector rule_difference(overintegrated_mean);
+  rule_difference -= discrete_mean;
+  if (!(discrete_mean(0) > kRhoMin) ||
+      !(Pressure(discrete_mean) > kPressureMin) ||
+      !(rule_difference.Normlinf() > 1.0e-10))
+  {
+    std::cerr << "[FAIL] curved DGSEM p" << order
+              << " fixture does not distinguish its collocated mass mean"
+              << " rho_bar=" << discrete_mean(0)
+              << " p_bar=" << Pressure(discrete_mean)
+              << " rule_difference=" << rule_difference.Normlinf() << "\n";
+    return 6;
+  }
+
+  mfem::ZhangShuLimiterElementDiagnostics diagnostics;
+  bool state_modified = false;
+  const int positivity_order = 2 * order + 4;
+  mfem::ApplyZhangShuPositivityLimiter(
+    fes,
+    state,
+    kDim,
+    kGamma,
+    kRhoMin,
+    kPressureMin,
+    positivity_order,
+    {positivity_order},
+    kBisectionIterations,
+    mfem::ZhangShuPointSet::kConsumer,
+    &diagnostics,
+    /*enforce_vtk_points=*/false,
+    &state_modified);
+
+  const DGSEMIntegral after = CollocatedDGSEMIntegral(fes, state, 0);
+  bool conservative = Near(after.measure, before.measure, 2.0e-13);
+  double maximum_balance_error = 0.0;
+  for (int component = 0; component < kNumEq; ++component)
+  {
+    const double scale = std::max(
+      1.0, std::abs(before.conservative(component)));
+    const double error = std::abs(after.conservative(component) -
+                                  before.conservative(component)) / scale;
+    maximum_balance_error = std::max(maximum_balance_error, error);
+    conservative = conservative && error <= 5.0e-12;
+  }
+
+  const double theta_rho = diagnostics.theta_rho.HostRead()[0];
+  const double theta_p = diagnostics.theta_p.HostRead()[0];
+  const double effective_theta = theta_rho * theta_p;
+  mfem::Array<int> initial_vdofs;
+  mfem::Vector initial_element;
+  mfem::Vector limited_element;
+  fes.GetElementVDofs(0, initial_vdofs);
+  initial.GetSubVector(initial_vdofs, initial_element);
+  state.GetSubVector(initial_vdofs, limited_element);
+  mfem::DenseMatrix initial_values(initial_element.GetData(),
+                                   fes.GetFE(0)->GetDof(),
+                                   kNumEq);
+  mfem::DenseMatrix limited_values(limited_element.GetData(),
+                                   fes.GetFE(0)->GetDof(),
+                                   kNumEq);
+  double maximum_contraction_error = 0.0;
+  double minimum_density = std::numeric_limits<double>::infinity();
+  double minimum_pressure = std::numeric_limits<double>::infinity();
+  mfem::Vector initial_value(kNumEq);
+  mfem::Vector limited_value(kNumEq);
+  for (int node = 0; node < limited_values.Height(); ++node)
+  {
+    initial_values.GetRow(node, initial_value);
+    limited_values.GetRow(node, limited_value);
+    for (int component = 0; component < kNumEq; ++component)
+    {
+      const double expected = discrete_mean(component) +
+                              effective_theta *
+                                (initial_value(component) -
+                                 discrete_mean(component));
+      maximum_contraction_error = std::max(
+        maximum_contraction_error,
+        std::abs(limited_value(component) - expected));
+    }
+    minimum_density = std::min(minimum_density, limited_value(0));
+    minimum_pressure = std::min(minimum_pressure, Pressure(limited_value));
+  }
+
+  const bool active = state_modified &&
+                      diagnostics.active.HostRead()[0] == 1.0 &&
+                      theta_rho >= 0.0 && theta_rho < 1.0 &&
+                      theta_p >= 0.0 && theta_p <= 1.0 &&
+                      effective_theta < 1.0;
+  const bool admissible = minimum_density >= 0.99 * kRhoMin &&
+                          minimum_pressure >= 0.99 * kPressureMin;
+  const bool contraction = maximum_contraction_error <= 5.0e-12;
+  if (!conservative || !active || !admissible || !contraction)
+  {
+    std::cerr << "[FAIL] curved DGSEM p" << order
+              << " Zhang-Shu collocated conservation"
+              << " active=" << active
+              << " admissible=" << admissible
+              << " conservative=" << conservative
+              << " theta_rho=" << theta_rho
+              << " theta_p=" << theta_p
+              << " balance_error=" << maximum_balance_error
+              << " contraction_error=" << maximum_contraction_error
+              << " min_rho=" << minimum_density
+              << " min_p=" << minimum_pressure << "\n";
+    return 7;
+  }
+
+  if (mfem::Mpi::Root())
+  {
+    // This executable is registered for both CPU and CUDA, so both backends
+    // are held to the same FP64 collocated-integral and contraction oracle.
+    std::cout << "[PASS] curved DGSEM p" << order
+              << " Zhang-Shu preserves every GLL-mass conserved component"
+              << " theta=" << effective_theta
+              << " balance_error=" << maximum_balance_error << "\n";
   }
   return 0;
 }
@@ -584,6 +830,11 @@ int main(int argc, char** argv)
       const int result = ManufacturedLimiterCase(kind, curved);
       if (result != 0) { return result; }
     }
+  }
+  for (int order = 1; order <= 3; ++order)
+  {
+    const int result = CurvedDGSEMConservationCase(order);
+    if (result != 0) { return result; }
   }
   const int invalid_density = InvalidAverageCase();
   if (invalid_density != 0) { return invalid_density; }

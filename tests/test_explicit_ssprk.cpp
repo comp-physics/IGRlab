@@ -240,6 +240,10 @@ public:
     ++end_calls;
     end_time = time;
     end_generation = generation;
+    if (endpoint_characteristic_speed >= 0.0)
+    {
+      reported_characteristic_speed = endpoint_characteristic_speed;
+    }
   }
 
   void AbortRKStep(const mfem::Vector& restored_state,
@@ -284,6 +288,7 @@ public:
   mfem::real_t initial_characteristic_speed = 1.0;
   std::vector<mfem::real_t> stage_characteristic_speeds;
   mutable mfem::real_t reported_characteristic_speed = 1.0;
+  mfem::real_t endpoint_characteristic_speed = -1.0;
   bool requires_rk_step_transaction = false;
 
 private:
@@ -298,6 +303,7 @@ void CheckAcceptedCharacteristicSpeedTransaction(
   RecordingLinearOperator op(fes.GetTrueVSize());
   op.stage_characteristic_speeds =
     {2.0, 3.0, 4.0, 17.0, 5.0, 6.0, 7.0, 8.0, 9.0, 1.0};
+  op.endpoint_characteristic_speed = 23.0;
   mfem::RK3SSPWithLimiter stepper(fes, mfem::SSPRKMethod::SSPRK104);
   bool reject_final_callback = false;
   stepper.AddAlwaysCallback(
@@ -321,8 +327,9 @@ void CheckAcceptedCharacteristicSpeedTransaction(
   mfem::real_t dt = 0.01;
   stepper.Step(state, time, dt);
   ctx.Check(stepper.HasAcceptedCharacteristicSpeed() &&
-              stepper.GetAcceptedCharacteristicSpeed() == 17.0,
-            "SSPRK(10,4) commits the maximum speed across every RHS stage");
+              stepper.GetAcceptedCharacteristicSpeed() == 23.0,
+            "SSPRK(10,4) commits the maximum speed across every RHS stage "
+            "and the accepted endpoint reconstruction");
 
   op.stage_characteristic_speeds =
     {20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0};
@@ -337,7 +344,7 @@ void CheckAcceptedCharacteristicSpeedTransaction(
     rejected = true;
   }
   ctx.Check(rejected && stepper.HasAcceptedCharacteristicSpeed() &&
-              stepper.GetAcceptedCharacteristicSpeed() == 17.0,
+              stepper.GetAcceptedCharacteristicSpeed() == 23.0,
             "SSPRK rejected work cannot publish its attempted stage-speed "
             "maximum");
 

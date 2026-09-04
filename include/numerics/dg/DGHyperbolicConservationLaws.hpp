@@ -223,16 +223,27 @@ public:
     return invariant_domain_volume_speed_tracking_;
   }
 
-  /** Communicator-wide aggregate over every exact-mode q_sigma sample.
+  /** Communicator-wide aggregate over every qualified q_sigma sample.
    *
    * Counts include CFL probes, accepted-stage evaluations, and work from
-   * rejected attempts. MPI sums rank-local execution counts, so the two
-   * executions of a shared-face sample are deliberately two work samples,
-   * not one deduplicated physical point. Reading this bounded aggregate
-   * synchronizes packed-device telemetry only once at the caller-selected
-   * summary point.
+   * rejected attempts. Ordinary DG exact-mode paths sample their active
+   * volume/face speed points. Packed DGSEM independently scans each
+   * element-owned LGL node in FP64; its face nodes are a subset and shared
+   * neighbors are owned by another rank. MPI sums rank-local work samples.
    */
   IGRFrozenSigmaTelemetry GetGlobalFrozenSigmaTelemetry() const override;
+
+  /** Inspect one state against the currently bound frozen sigma.
+   *
+   * The supported packed DGSEM implementation reuses its production
+   * gather/exchange and FP64 state scans without evaluating a residual. The
+   * returned telemetry is fresh for this call and communicator-wide. Other
+   * DG research paths return a disabled aggregate unless they provide a
+   * compatible override; the typed extrapolated production route requires
+   * packed DGSEM support.
+   */
+  virtual IGRFrozenSigmaTelemetry InspectFrozenSigmaStateForAdmission(
+    const Vector& state) const;
 
   /// Install a time-independent source already projected into this DG space.
   /// An identically zero source is discarded, leaving the RHS hot path free of
@@ -244,7 +255,7 @@ public:
     return static_source_requires_rebind_;
   }
 
-  /// Whether the active DG volume/boundary path can capture the complete flux.
+  /// Whether the active DG/DGSEM boundary path can capture the complete flux.
   bool SupportsPhysicalBoundaryFluxIntegral() const override;
 
   /**
@@ -343,6 +354,8 @@ private:
   mutable Vector dgsem_x_local_workspace_;
   mutable Vector dgsem_z_local_workspace_;
   mutable Vector dgsem_y_local_workspace_;
+  /// Cumulative independent FP64 q_sigma scan over packed DGSEM LGL nodes.
+  mutable IGRFrozenSigmaTelemetry dgsem_q_sigma_telemetry_;
   mutable bool dgsem_production_dispatch_observed_ = false;
   mutable bool dgsem_production_dispatch_supported_ = false;
   mutable bool dgsem_production_dispatch_strict_ = false;
@@ -424,22 +437,7 @@ private:
   bool AddDeviceFaceContributionsEulerRusanov_(const Vector& x_in,
                                                Vector& z_inout,
                                                real_t& max_face_speed,
-                                               bool capture_boundary_flux,
-                                               bool record_flux_only = false) const;
-
-  /// Whether the opt-in element-owned fused DG residual screen is supported.
-  bool UseFusedElementResidualScreen_() const;
-
-  /// Fuse weak volume, recorded face lifts, and inverse mass by element.
-  real_t ApplyFusedElementResidualEuler_(const Vector& x_in,
-                                         Vector& y_out) const;
-
-  /// Build element-to-face incidence used by the fused residual screen.
-  bool BuildFusedElementIncidence_();
-
-  /// Emit one deterministic selection/fallback record for the research screen.
-  void LogFusedElementResidualSelection_(bool selected,
-                                         const char* reason) const;
+                                               bool capture_boundary_flux) const;
 
   /// Reduce a per-face speed vector to max speed with device support.
   real_t ReduceFaceMaxSpeed_(const Vector& face_speed,
@@ -501,8 +499,6 @@ private:
   mutable bool face_data_dirty_ = true;
   /// Ensures weak-divergence volume path selection is logged only once.
   mutable bool weakdiv_volume_path_logged_ = false;
-  /// Ensures the opt-in fused residual screen selection is logged once.
-  mutable bool fused_residual_selection_logged_ = false;
 
   /// Default face quadrature order offset for custom DG face assembly.
   int face_int_order_offset_ = 1;
@@ -577,20 +573,6 @@ private:
   mutable Vector face_shared_speed_;
   /// Per-shared-face quadrature-point speed scratch (face, q).
   mutable Vector face_shared_speed_q_;
-
-  /// Weighted numerical-flux records, indexed by (face,q,equation).
-  mutable Vector face_int_flux_record_;
-  mutable Vector face_bdr_flux_record_;
-  mutable Vector face_shared_flux_record_;
-
-  /// CSR element-to-face incidence for deterministic element-owned lifting.
-  Array<int> fused_elem_face_offsets_;
-  Array<int> fused_elem_face_kind_;
-  Array<int> fused_elem_face_id_;
-  Array<int> fused_elem_face_side_;
-  bool fused_elem_incidence_ready_ = false;
-  /// True when local state is a zero-copy K x (elements*equations) panel.
-  bool fused_wide_panel_layout_ready_ = false;
 
 #ifdef MFEM_USE_MPI
   /// Reused alias for state L-vector neighbor exchange (avoids per-step temp

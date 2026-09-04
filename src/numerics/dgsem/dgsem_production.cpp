@@ -12,7 +12,6 @@
 #include "physics/bc/detail/euler_boundary_state.hpp"
 #include "physics/igr/igr_flux.hpp"
 #include "utils/config/dg_igr_defaults.hpp"
-#include "utils/config/env_flags.hpp"
 
 #include <algorithm>
 #include <array>
@@ -40,15 +39,6 @@ inline bool Finite(real_t value)
 {
   return std::isfinite(static_cast<double>(value));
 }
-
-constexpr int kFixedPointMantissaBits = 79;
-constexpr std::uint64_t kFixedPointAuditInterval = 128;
-constexpr std::size_t kFixedPointWorkspaceLimitBytes =
-  std::size_t(512) * 1024 * 1024;
-constexpr real_t kFixedPointAuditAbsoluteTolerance =
-  512.0 * std::numeric_limits<real_t>::epsilon();
-constexpr real_t kFixedPointAuditRelativeTolerance =
-  512.0 * std::numeric_limits<real_t>::epsilon();
 
 inline int FindNode(const Vector& nodes, real_t coordinate)
 {
@@ -204,7 +194,10 @@ struct LoweredEulerBoundary
     detail::EulerBoundaryStateKind::unsupported;
   const Vector* reference_state = nullptr;
   int dimension = -1;
+  real_t gamma = 1.4;
+  real_t pressure_out = 0.0;
   real_t density_floor = kEulerBoundaryDensityFloor;
+  real_t pressure_floor = kEulerBoundaryPressureFloor;
 };
 
 LoweredEulerBoundary LowerEulerBoundary(const BoundaryState* state)
@@ -219,11 +212,50 @@ LoweredEulerBoundary LowerEulerBoundary(const BoundaryState* state)
   {
     lowered.kind = detail::EulerBoundaryStateKind::supersonic_outlet;
   }
+  else if (const auto* inlet = dynamic_cast<const SubsonicInletState*>(state))
+  {
+    lowered.kind = detail::EulerBoundaryStateKind::subsonic_inlet;
+    lowered.reference_state = &inlet->GetInletState();
+    lowered.dimension = inlet->GetDimension();
+    lowered.gamma = inlet->GetGamma();
+    lowered.density_floor = inlet->GetDensityFloor();
+    lowered.pressure_floor = inlet->GetPressureFloor();
+  }
+  else if (const auto* outlet =
+             dynamic_cast<const SubsonicOutletPressureState*>(state))
+  {
+    lowered.kind = detail::EulerBoundaryStateKind::subsonic_outlet_pressure;
+    lowered.dimension = outlet->GetDimension();
+    lowered.gamma = outlet->GetGamma();
+    lowered.pressure_out = outlet->GetOutletPressure();
+    lowered.density_floor = outlet->GetDensityFloor();
+    lowered.pressure_floor = outlet->GetPressureFloor();
+  }
+  else if (const auto* far_field = dynamic_cast<const FarFieldState*>(state))
+  {
+    lowered.kind = detail::EulerBoundaryStateKind::far_field;
+    lowered.reference_state = &far_field->GetFarFieldState();
+    lowered.dimension = far_field->GetDimension();
+    lowered.gamma = far_field->GetGamma();
+    lowered.density_floor = far_field->GetDensityFloor();
+    lowered.pressure_floor = far_field->GetPressureFloor();
+  }
+  else if (const auto* outlet =
+             dynamic_cast<const NonReflectingOutletState*>(state))
+  {
+    lowered.kind = detail::EulerBoundaryStateKind::nonreflecting_outlet;
+    lowered.reference_state = &outlet->GetReferenceState();
+    lowered.dimension = outlet->GetDimension();
+    lowered.gamma = outlet->GetGamma();
+    lowered.density_floor = outlet->GetDensityFloor();
+    lowered.pressure_floor = outlet->GetPressureFloor();
+  }
   else if (const auto* wall = dynamic_cast<const SlipWallState*>(state))
   {
     lowered.kind = detail::EulerBoundaryStateKind::slip_wall;
     lowered.dimension = wall->GetDimension();
     lowered.density_floor = wall->GetDensityFloor();
+    lowered.pressure_floor = wall->GetPressureFloor();
   }
   return lowered;
 }
@@ -318,17 +350,18 @@ void ExchangeFaceNeighborVector(
     return;
   }
 
-  const int* send_ldof =
-    mfem::Read(pfes.send_face_nbr_ldof.GetJMemory(), send_size);
-  const real_t* input = local.Read();
-  real_t* send_value = send.Write();
-  mfem::forall(
-    send_size,
-    [=] MFEM_HOST_DEVICE(int i)
-    {
-      const int ldof = send_ldof[i];
-      send_value[i] = input[ldof >= 0 ? ldof : -1 - ldof];
-    });
+  // This translation unit is intentionally host-compiled.  Stage both the
+  // map and values before packing so a CUDA-selected MFEM memory class never
+  // exposes device pointers to this host loop.  MPI below is likewise
+  // deliberately non-GPU-aware and exchanges these persistent host buffers.
+  const int* send_ldof = pfes.send_face_nbr_ldof.HostReadJ();
+  const real_t* input = local.HostRead();
+  real_t* send_value = send.HostWrite();
+  for (int i = 0; i < send_size; ++i)
+  {
+    const int ldof = send_ldof[i];
+    send_value[i] = input[ldof >= 0 ? ldof : -1 - ldof];
+  }
 
   const real_t* send_host = send.HostRead();
   real_t* neighbor_host = neighbor.HostWrite();
@@ -714,6 +747,212 @@ DGSEMProductionReason ValidateDGSEMProductionState(
   return DGSEMProductionReason::None;
 }
 
+namespace
+{
+
+struct DGSEMDeviceStateScan
+{
+  DGSEMProductionReason reason = DGSEMProductionReason::None;
+  IGRFrozenSigmaTelemetry q_sigma;
+};
+
+/** Validate the packed stage and collect q_sigma telemetry without migrating
+ * the state or face panels to the host.
+ *
+ * A fixed set of deterministic device lanes scans the packed inputs and a
+ * bounded ordered fold reduces their summaries. Only six FP64 result scalars
+ * cross the device boundary. Element states are admitted before exchange and
+ * face inputs afterward; no physical flux or caller output is evaluated until
+ * both scans succeed collectively.
+ */
+DGSEMDeviceStateScan ScanDGSEMProductionStateDevice(
+  int dimension,
+  real_t gamma,
+  real_t density_floor,
+  bool scan_owned_states,
+  bool scan_face_states,
+  const DenseMatrix& states,
+  const Vector& sigma,
+  const DenseMatrix& left_states,
+  const Vector& left_sigma,
+  const DenseMatrix& right_states,
+  const Vector& right_sigma,
+  Array<double>& slot_workspace,
+  Array<double>& result_workspace)
+{
+  ScanEulerIGRStatePanelsDevice(dimension,
+                                gamma,
+                                density_floor,
+                                scan_owned_states,
+                                scan_face_states,
+                                states,
+                                sigma,
+                                left_states,
+                                left_sigma,
+                                right_states,
+                                right_sigma,
+                                slot_workspace,
+                                result_workspace);
+  const double* const host_result = result_workspace.HostRead();
+  DGSEMDeviceStateScan scan;
+  const int expected_samples = scan_owned_states
+                                 ? states.Height()
+                                 : 2 * left_states.Height();
+  auto integral_count = [expected_samples](double value)
+  {
+    return std::isfinite(value) && value >= 0.0 &&
+           value <= static_cast<double>(expected_samples) &&
+           std::trunc(value) == value;
+  };
+  const bool status_well_formed =
+    std::isfinite(host_result[0]) && std::trunc(host_result[0]) == host_result[0] &&
+    host_result[0] >= static_cast<double>(DGSEMDeviceStateStatus::Valid) &&
+    host_result[0] <= static_cast<double>(DGSEMDeviceStateStatus::InvalidPressure);
+  const bool counts_well_formed = integral_count(host_result[1]) &&
+                                  integral_count(host_result[2]) &&
+                                  integral_count(host_result[3]) &&
+                                  host_result[2] <= host_result[1] &&
+                                  host_result[3] <= host_result[1];
+  if (!status_well_formed || !counts_well_formed)
+  {
+    scan.reason = DGSEMProductionReason::InvalidPressure;
+    return scan;
+  }
+  const auto status =
+    static_cast<DGSEMDeviceStateStatus>(static_cast<int>(host_result[0]));
+  if (status == DGSEMDeviceStateStatus::Valid &&
+      host_result[1] != static_cast<double>(expected_samples))
+  {
+    scan.reason = DGSEMProductionReason::InvalidPressure;
+    return scan;
+  }
+  switch (status)
+  {
+  case DGSEMDeviceStateStatus::Valid:
+    scan.reason = DGSEMProductionReason::None;
+    break;
+  case DGSEMDeviceStateStatus::InvalidSigma:
+    scan.reason = DGSEMProductionReason::InvalidSigma;
+    break;
+  case DGSEMDeviceStateStatus::InvalidDensity:
+    scan.reason = DGSEMProductionReason::InvalidDensity;
+    break;
+  case DGSEMDeviceStateStatus::DensityBelowFloor:
+    scan.reason = DGSEMProductionReason::DensityBelowBoundaryFloor;
+    break;
+  case DGSEMDeviceStateStatus::InvalidPressure:
+    scan.reason = DGSEMProductionReason::InvalidPressure;
+    break;
+  default:
+    scan.reason = DGSEMProductionReason::InvalidPressure;
+    break;
+  }
+  scan.q_sigma.enabled = true;
+  scan.q_sigma.sample_count =
+    static_cast<std::uint64_t>(host_result[1]);
+  scan.q_sigma.nonpositive_count =
+    static_cast<std::uint64_t>(host_result[2]);
+  scan.q_sigma.nonfinite_count =
+    static_cast<std::uint64_t>(host_result[3]);
+  scan.q_sigma.minimum_raw_q_sigma = host_result[4];
+  scan.q_sigma.minimum_q_sigma_over_gamma_p = host_result[5];
+  return scan;
+}
+
+/** Return the fresh q_sigma aggregate over the owning FE-space communicator.
+ *
+ * This reduction is reserved for the once-per-step endpoint admission scan;
+ * ordinary residual calls continue to expose their cumulative telemetry
+ * through DGHyperbolicConservationLaws without adding collectives here.
+ */
+IGRFrozenSigmaTelemetry ReduceFreshQSigmaTelemetry(
+  const ProductionCommunicator& context,
+  const IGRFrozenSigmaTelemetry& local,
+  std::int64_t& reductions)
+{
+  IGRFrozenSigmaTelemetry global = local;
+#ifdef MFEM_USE_MPI
+  if (context.active && context.size > 1)
+  {
+    int enabled = local.enabled ? 1 : 0;
+    unsigned long long counts[3] = {
+      static_cast<unsigned long long>(local.sample_count),
+      static_cast<unsigned long long>(local.nonpositive_count),
+      static_cast<unsigned long long>(local.nonfinite_count)};
+    double minima[2] = {local.minimum_raw_q_sigma,
+                        local.minimum_q_sigma_over_gamma_p};
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &enabled,
+                  1,
+                  MPI_INT,
+                  MPI_MAX,
+                  context.comm);
+    MPI_Allreduce(MPI_IN_PLACE,
+                  counts,
+                  3,
+                  MPI_UNSIGNED_LONG_LONG,
+                  MPI_SUM,
+                  context.comm);
+    MPI_Allreduce(MPI_IN_PLACE,
+                  minima,
+                  2,
+                  MPI_DOUBLE,
+                  MPI_MIN,
+                  context.comm);
+    reductions += 3;
+    global.enabled = enabled != 0;
+    global.sample_count = static_cast<std::uint64_t>(counts[0]);
+    global.nonpositive_count = static_cast<std::uint64_t>(counts[1]);
+    global.nonfinite_count = static_cast<std::uint64_t>(counts[2]);
+    global.minimum_raw_q_sigma = minima[0];
+    global.minimum_q_sigma_over_gamma_p = minima[1];
+  }
+#else
+  (void)context;
+  (void)reductions;
+#endif
+  return global;
+}
+
+real_t ReducePackedCharacteristicSpeed(
+  const ProductionCommunicator& context,
+  const Vector& nodal_speeds,
+  const Vector& face_speeds,
+  Vector& nodal_maximum,
+  Vector& face_maximum,
+  std::int64_t& host_synchronizations,
+  std::int64_t& mpi_reductions)
+{
+  DeterministicMaximumDevice(nodal_speeds, nodal_maximum);
+  DeterministicMaximumDevice(face_speeds, face_maximum);
+
+  ++host_synchronizations;
+  const real_t nodal_max = nodal_maximum.HostRead()[0];
+  ++host_synchronizations;
+  const real_t face_max = face_maximum.HostRead()[0];
+  real_t maximum = std::max(nodal_max, face_max);
+#ifdef MFEM_USE_MPI
+  if (context.active && context.size > 1)
+  {
+    real_t global_maximum = maximum;
+    MPI_Allreduce(&maximum,
+                  &global_maximum,
+                  1,
+                  MPITypeMap<real_t>::mpi_type,
+                  MPI_MAX,
+                  context.comm);
+    maximum = global_maximum;
+    ++mpi_reductions;
+  }
+#else
+  (void)context;
+  (void)mpi_reductions;
+#endif
+  return maximum;
+}
+
+} // namespace
+
 struct DGSEMProductionCache
 {
   DGSEMProductionSelection selection;
@@ -739,17 +978,8 @@ struct DGSEMProductionCache
   bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
-  bool volume_panel_requested = false;
-  bool volume_panel_active = false;
-  bool volume_fixedpoint_requested = false;
-  bool volume_fixedpoint_active = false;
-  bool volume_fixedpoint_permanent_fallback = false;
-  bool device_llf_volume_requested = false;
-  bool device_llf_volume_active = false;
-  std::uint64_t volume_fixedpoint_calls = 0;
-  std::uint64_t volume_fixedpoint_audits = 0;
-  std::uint64_t volume_fixedpoint_failures = 0;
-  DGSEMFixedPointPanelStatus volume_fixedpoint_status;
+  bool frozen_sigma_spectral_speed = false;
+  bool llf_volume_active = false;
   std::uint64_t policy_fingerprint = 0;
   DGSEMProductionWorkspaceEvidence workspace_evidence;
   int ne = 0;
@@ -778,7 +1008,10 @@ struct DGSEMProductionCache
   Array<int> ownership;
   Array<int> boundary_kinds;
   DenseMatrix boundary_reference_states;
+  Vector boundary_gammas;
+  Vector boundary_outlet_pressures;
   Vector boundary_density_floors;
+  Vector boundary_pressure_floors;
   Array<int> row_face_offsets;
   Array<int> row_face_ids;
   Array<int> row_face_signs;
@@ -794,10 +1027,6 @@ struct DGSEMProductionCache
   DenseMatrix states;
   Vector sigma_nodes;
   DenseMatrix contravariant_flux;
-  DenseTensor central_volume_panel_operator;
-  DenseMatrix volume_panel_fp64_audit;
-  Vector volume_panel_audit_metrics;
-  std::unique_ptr<DGSEMFixedPointVolumeContext> volume_fixedpoint_context;
   DenseMatrix volume_pair_dissipation;
   Vector nodal_speeds;
   DenseMatrix weak_volume;
@@ -812,6 +1041,8 @@ struct DGSEMProductionCache
   DenseMatrix strong;
   Vector nodal_max;
   Vector face_max;
+  Array<double> state_scan_slots;
+  Array<double> state_scan_result;
   Vector empty_face_neighbor;
 #ifdef MFEM_USE_MPI
   Vector state_send;
@@ -855,27 +1086,6 @@ void AppendMatrixWorkspace(const DenseMatrix& matrix,
                                            matrix.Read(true));
 }
 
-void AppendTensorWorkspace(const DenseTensor& tensor,
-                           DGSEMProductionWorkspaceEvidence& evidence)
-{
-  evidence.size_signature = HashCombine(
-    evidence.size_signature,
-    static_cast<std::uint64_t>(tensor.SizeI()));
-  evidence.size_signature = HashCombine(
-    evidence.size_signature,
-    static_cast<std::uint64_t>(tensor.SizeJ()));
-  evidence.size_signature = HashCombine(
-    evidence.size_signature,
-    static_cast<std::uint64_t>(tensor.SizeK()));
-  evidence.capacity_signature = HashCombine(
-    evidence.capacity_signature,
-    static_cast<std::uint64_t>(tensor.GetMemory().Capacity()));
-  evidence.storage_signature = HashPointer(evidence.storage_signature,
-                                           tensor.HostRead());
-  evidence.storage_signature = HashPointer(evidence.storage_signature,
-                                           tensor.Read(true));
-}
-
 DGSEMProductionWorkspaceEvidence SnapshotWorkspaces(
   const DGSEMProductionCache& cache)
 {
@@ -887,9 +1097,6 @@ DGSEMProductionWorkspaceEvidence SnapshotWorkspaces(
   AppendMatrixWorkspace(cache.states, evidence);
   AppendVectorWorkspace(cache.sigma_nodes, evidence);
   AppendMatrixWorkspace(cache.contravariant_flux, evidence);
-  AppendTensorWorkspace(cache.central_volume_panel_operator, evidence);
-  AppendMatrixWorkspace(cache.volume_panel_fp64_audit, evidence);
-  AppendVectorWorkspace(cache.volume_panel_audit_metrics, evidence);
   AppendMatrixWorkspace(cache.volume_pair_dissipation, evidence);
   AppendVectorWorkspace(cache.nodal_speeds, evidence);
   AppendMatrixWorkspace(cache.weak_volume, evidence);
@@ -904,6 +1111,32 @@ DGSEMProductionWorkspaceEvidence SnapshotWorkspaces(
   AppendMatrixWorkspace(cache.strong, evidence);
   AppendVectorWorkspace(cache.nodal_max, evidence);
   AppendVectorWorkspace(cache.face_max, evidence);
+  evidence.size_signature = HashCombine(
+    evidence.size_signature,
+    static_cast<std::uint64_t>(cache.state_scan_slots.Size()));
+  evidence.capacity_signature = HashCombine(
+    evidence.capacity_signature,
+    static_cast<std::uint64_t>(
+      cache.state_scan_slots.GetMemory().Capacity()));
+  evidence.storage_signature = HashPointer(
+    evidence.storage_signature,
+    cache.state_scan_slots.HostRead());
+  evidence.storage_signature = HashPointer(
+    evidence.storage_signature,
+    cache.state_scan_slots.Read(true));
+  evidence.size_signature = HashCombine(
+    evidence.size_signature,
+    static_cast<std::uint64_t>(cache.state_scan_result.Size()));
+  evidence.capacity_signature = HashCombine(
+    evidence.capacity_signature,
+    static_cast<std::uint64_t>(
+      cache.state_scan_result.GetMemory().Capacity()));
+  evidence.storage_signature = HashPointer(
+    evidence.storage_signature,
+    cache.state_scan_result.HostRead());
+  evidence.storage_signature = HashPointer(
+    evidence.storage_signature,
+    cache.state_scan_result.Read(true));
   AppendVectorWorkspace(cache.empty_face_neighbor, evidence);
 #ifdef MFEM_USE_MPI
   AppendVectorWorkspace(cache.state_send, evidence);
@@ -938,15 +1171,6 @@ DGSEMProductionWorkspaceEvidence SnapshotWorkspaces(
   return evidence;
 }
 
-bool SameWorkspaceStorage(const DGSEMProductionWorkspaceEvidence& left,
-                          const DGSEMProductionWorkspaceEvidence& right)
-{
-  return left.ready && right.ready &&
-         left.size_signature == right.size_signature &&
-         left.capacity_signature == right.capacity_signature &&
-         left.storage_signature == right.storage_signature;
-}
-
 DGSEMOperator::DGSEMOperator(const DGHyperbolicConservationLaws& op)
   : op_(&op)
 {
@@ -978,8 +1202,16 @@ DGSEMProductionSelection DGSEMOperator::GetProductionSelection() const
 DGSEMProductionWorkspaceEvidence
 DGSEMOperator::GetProductionWorkspaceEvidence() const
 {
-  return production_ ? production_->workspace_evidence
-                     : DGSEMProductionWorkspaceEvidence{};
+  if (!production_ || !production_->workspaces_ready)
+  {
+    return {};
+  }
+  // Evidence is intentionally sampled only on explicit request. HostRead()
+  // here may synchronize device storage, so it must never run in Mult().
+  DGSEMProductionWorkspaceEvidence evidence = SnapshotWorkspaces(*production_);
+  evidence.checks = production_->workspace_evidence.checks;
+  evidence.failures = production_->workspace_evidence.failures;
+  return evidence;
 }
 
 void DGSEMOperator::InvalidateProductionCache(
@@ -1039,17 +1271,10 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   const bool sigma_aware_cfl = flux_igr && flux_igr->GetSigmaAwareCFL();
   const bool sigma_aware_rusanov =
     flux_igr && flux_igr->GetSigmaAwareRusanov();
+  const bool frozen_sigma_spectral_speed =
+    flux_igr && flux_igr->GetFrozenSigmaSpectralSpeed();
   const bool cuda = Device::Allows(Backend::CUDA_MASK);
-  const bool volume_fixedpoint_requested =
-    ::dg_igr::EnvFlagEnabledDefault(
-      "DG_IGR_DGSEM_VOLUME_PANEL_FIXEDPOINT", false);
-  const bool volume_panel_requested = volume_fixedpoint_requested ||
-    ::dg_igr::EnvFlagEnabledDefault(
-      "DG_IGR_DGSEM_VOLUME_PANEL_GEMM", false);
-  const bool device_llf_volume_requested = ::dg_igr::EnvFlagEnabledDefault(
-    "DG_IGR_DGSEM_DEVICE_LLF_VOLUME", false);
-  const bool device_llf_volume_selected =
-    device_llf_volume_requested && cuda &&
+  const bool llf_volume_selected =
     op_->GetDGSEMVolumeDissipation() == DGSEMVolumeDissipation::LLF;
   const long vfes_sequence = op_->vfes.GetSequence();
   const long mesh_sequence = mesh ? mesh->GetSequence() : -1;
@@ -1096,12 +1321,9 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   fingerprint = HashCombine(fingerprint, invariant_domain_flux ? 1 : 0);
   fingerprint = HashCombine(fingerprint, sigma_aware_cfl ? 1 : 0);
   fingerprint = HashCombine(fingerprint, sigma_aware_rusanov ? 1 : 0);
+  fingerprint = HashCombine(
+    fingerprint, frozen_sigma_spectral_speed ? 1 : 0);
   fingerprint = HashCombine(fingerprint, cuda ? 1 : 0);
-  fingerprint = HashCombine(fingerprint, volume_panel_requested ? 1 : 0);
-  fingerprint = HashCombine(
-    fingerprint, volume_fixedpoint_requested ? 1 : 0);
-  fingerprint = HashCombine(
-    fingerprint, device_llf_volume_requested ? 1 : 0);
 
   semantic = HashCombine(semantic, static_cast<std::uint64_t>(op_->dim));
   semantic = HashCombine(semantic,
@@ -1128,10 +1350,8 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   semantic = HashCombine(semantic, invariant_domain_flux ? 1 : 0);
   semantic = HashCombine(semantic, sigma_aware_cfl ? 1 : 0);
   semantic = HashCombine(semantic, sigma_aware_rusanov ? 1 : 0);
+  semantic = HashCombine(semantic, frozen_sigma_spectral_speed ? 1 : 0);
   semantic = HashCombine(semantic, cuda ? 1 : 0);
-  semantic = HashCombine(semantic, volume_panel_requested ? 1 : 0);
-  semantic = HashCombine(semantic, volume_fixedpoint_requested ? 1 : 0);
-  semantic = HashCombine(semantic, device_llf_volume_requested ? 1 : 0);
 
   int surface_type = -1;
   if (const auto* dgsem_flux =
@@ -1185,7 +1405,10 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
     fingerprint = HashCombine(
       fingerprint,
       static_cast<std::uint64_t>(lowered.dimension));
+    fingerprint = HashReal(fingerprint, lowered.gamma);
+    fingerprint = HashReal(fingerprint, lowered.pressure_out);
     fingerprint = HashReal(fingerprint, lowered.density_floor);
+    fingerprint = HashReal(fingerprint, lowered.pressure_floor);
     semantic = HashCombine(semantic, boundary ? 1 : 0);
     semantic = HashCombine(
       semantic,
@@ -1193,7 +1416,10 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
     semantic = HashCombine(
       semantic,
       static_cast<std::uint64_t>(lowered.dimension));
+    semantic = HashReal(semantic, lowered.gamma);
+    semantic = HashReal(semantic, lowered.pressure_out);
     semantic = HashReal(semantic, lowered.density_floor);
+    semantic = HashReal(semantic, lowered.pressure_floor);
     semantic = HashCombine(
       semantic,
       boundary_numerical_flux == op_->num_flux_ ? 1 : 0);
@@ -1252,9 +1478,8 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
     c.selection.strict = collective_strict;
     c.selection.cuda = cuda;
     c.selection.uses_sigma = sigma_field != nullptr;
-    c.selection.volume_panel_requested = volume_panel_requested;
-    c.selection.volume_fixedpoint_requested =
-      volume_fixedpoint_requested;
+    c.selection.frozen_sigma_spectral_speed =
+      frozen_sigma_spectral_speed;
     c.selection.dimension = op_->dim;
     c.selection.elements = op_->vfes.GetNE();
     c.selection.ranks = context.size;
@@ -1295,7 +1520,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   }
   else if (op_->GetDGSEMVolumeDissipation() !=
              DGSEMVolumeDissipation::None &&
-           !device_llf_volume_selected)
+           !llf_volume_selected)
   {
     policy_reason = DGSEMProductionReason::UnsupportedVolumeDissipation;
   }
@@ -1365,7 +1590,8 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   }
 
   if (policy_reason == DGSEMProductionReason::None &&
-      (invariant_domain_flux || sigma_aware_cfl || sigma_aware_rusanov))
+      (invariant_domain_flux || sigma_aware_cfl || sigma_aware_rusanov ||
+       (frozen_sigma_spectral_speed && !sigma_field)))
   {
     policy_reason = DGSEMProductionReason::UnsupportedSigmaSpeedPolicy;
   }
@@ -1373,11 +1599,6 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
       surface_type != static_cast<int>(DGSEMSurfaceFluxType::Rusanov))
   {
     policy_reason = DGSEMProductionReason::UnsupportedSurfaceFlux;
-  }
-  if (policy_reason == DGSEMProductionReason::None && cuda &&
-      context.size != 1)
-  {
-    policy_reason = DGSEMProductionReason::MultiRankCuda;
   }
   if (policy_reason == DGSEMProductionReason::None && sigma_field &&
       (!sigma_fes || sigma_fes->GetMesh() != mesh ||
@@ -1474,6 +1695,16 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
                  !(boundary.density_floor > 0.0))
         {
           policy_reason = DGSEMProductionReason::InvalidDensityFloor;
+        }
+        else if (!Finite(boundary.gamma) || !(boundary.gamma > 1.0))
+        {
+          policy_reason = DGSEMProductionReason::InvalidGamma;
+        }
+        else if (!Finite(boundary.pressure_out) ||
+                 !Finite(boundary.pressure_floor) ||
+                 !(boundary.pressure_floor > 0.0))
+        {
+          policy_reason = DGSEMProductionReason::InvalidPressure;
         }
         else if (&selected->GetNumericalFlux() != op_->num_flux_ ||
                  &selected->GetNumericalFlux().GetFluxFunction() !=
@@ -1733,16 +1964,9 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
   const bool sigma_aware_cfl = flux_igr && flux_igr->GetSigmaAwareCFL();
   const bool sigma_aware_rusanov =
     flux_igr && flux_igr->GetSigmaAwareRusanov();
-  const bool volume_fixedpoint_requested =
-    ::dg_igr::EnvFlagEnabledDefault(
-      "DG_IGR_DGSEM_VOLUME_PANEL_FIXEDPOINT", false);
-  const bool volume_panel_requested = volume_fixedpoint_requested ||
-    ::dg_igr::EnvFlagEnabledDefault(
-      "DG_IGR_DGSEM_VOLUME_PANEL_GEMM", false);
-  const bool device_llf_volume_requested = ::dg_igr::EnvFlagEnabledDefault(
-    "DG_IGR_DGSEM_DEVICE_LLF_VOLUME", false);
-  const bool device_llf_volume_selected =
-    device_llf_volume_requested && cuda &&
+  const bool frozen_sigma_spectral_speed =
+    flux_igr && flux_igr->GetFrozenSigmaSpectralSpeed();
+  const bool llf_volume_selected =
     op_->GetDGSEMVolumeDissipation() == DGSEMVolumeDissipation::LLF;
 
   const bool sigma_metadata_changed =
@@ -1763,9 +1987,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     c.invariant_domain_flux != invariant_domain_flux ||
     c.sigma_aware_cfl != sigma_aware_cfl ||
     c.sigma_aware_rusanov != sigma_aware_rusanov ||
-    c.volume_panel_requested != volume_panel_requested ||
-    c.volume_fixedpoint_requested != volume_fixedpoint_requested ||
-    c.device_llf_volume_requested != device_llf_volume_requested;
+    c.frozen_sigma_spectral_speed != frozen_sigma_spectral_speed;
 
   if (c.topology_ready &&
       (c.vfes_sequence != vfes_sequence || c.mesh_sequence != mesh_sequence ||
@@ -1806,16 +2028,13 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
   c.invariant_domain_flux = invariant_domain_flux;
   c.sigma_aware_cfl = sigma_aware_cfl;
   c.sigma_aware_rusanov = sigma_aware_rusanov;
-  c.volume_panel_requested = volume_panel_requested;
-  c.volume_fixedpoint_requested = volume_fixedpoint_requested;
-  c.device_llf_volume_requested = device_llf_volume_requested;
-
+  c.frozen_sigma_spectral_speed = frozen_sigma_spectral_speed;
   c.selection = DGSEMProductionSelection{};
   c.selection.strict = strict;
   c.selection.cuda = cuda;
   c.selection.uses_sigma = sigma_field != nullptr;
-  c.selection.volume_panel_requested = volume_panel_requested;
-  c.selection.volume_fixedpoint_requested = volume_fixedpoint_requested;
+  c.selection.frozen_sigma_spectral_speed =
+    frozen_sigma_spectral_speed;
   c.selection.dimension = op_->dim;
   c.selection.elements = op_->vfes.GetNE();
   c.selection.ranks = ranks;
@@ -1848,7 +2067,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     return fail(DGSEMProductionReason::UnsupportedVolumeFlux);
   }
   if (op_->GetDGSEMVolumeDissipation() != DGSEMVolumeDissipation::None &&
-      !device_llf_volume_selected)
+      !llf_volume_selected)
   {
     return fail(DGSEMProductionReason::UnsupportedVolumeDissipation);
   }
@@ -1868,7 +2087,8 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
   {
     return fail(DGSEMProductionReason::UnsupportedModel);
   }
-  if (invariant_domain_flux || sigma_aware_cfl || sigma_aware_rusanov)
+  if (invariant_domain_flux || sigma_aware_cfl || sigma_aware_rusanov ||
+      (frozen_sigma_spectral_speed && !sigma_field))
   {
     return fail(DGSEMProductionReason::UnsupportedSigmaSpeedPolicy);
   }
@@ -1883,10 +2103,6 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
   if (!surface_supported)
   {
     return fail(DGSEMProductionReason::UnsupportedSurfaceFlux);
-  }
-  if (cuda && ranks != 1)
-  {
-    return fail(DGSEMProductionReason::MultiRankCuda);
   }
   for (int b = 0; b < mesh->GetNBE(); ++b)
   {
@@ -2057,7 +2273,10 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     std::vector<int> ownership;
     std::vector<int> boundary_kinds;
     std::vector<std::array<real_t, 4>> boundary_references;
+    std::vector<real_t> boundary_gammas;
+    std::vector<real_t> boundary_outlet_pressures;
     std::vector<real_t> boundary_density_floors;
+    std::vector<real_t> boundary_pressure_floors;
     std::vector<std::array<int, 4>> neighbor_state_maps;
     std::vector<int> neighbor_elements;
     std::vector<std::array<real_t, 2>> neighbor_points;
@@ -2162,7 +2381,10 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
         }
       }
       boundary_references.push_back(reference);
+      boundary_gammas.push_back(boundary.gamma);
+      boundary_outlet_pressures.push_back(boundary.pressure_out);
       boundary_density_floors.push_back(boundary.density_floor);
+      boundary_pressure_floors.push_back(boundary.pressure_floor);
       face_normals.push_back(normal);
       face_weights.push_back(weight);
       neighbor_state_maps.push_back(neighbor_map);
@@ -2351,7 +2573,10 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     c.ownership.SetSize(nfaces);
     c.boundary_kinds.SetSize(nfaces);
     c.boundary_reference_states.SetSize(nfaces, c.equations);
+    c.boundary_gammas.SetSize(nfaces);
+    c.boundary_outlet_pressures.SetSize(nfaces);
     c.boundary_density_floors.SetSize(nfaces);
+    c.boundary_pressure_floors.SetSize(nfaces);
     c.shared_state_vdofs.SetSize(nfaces * c.equations);
     c.shared_neighbor_elements.SetSize(nfaces);
     c.shared_neighbor_points.SetSize(nfaces, op_->dim);
@@ -2365,8 +2590,14 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       c.ownership[face] = ownership[static_cast<std::size_t>(face)];
       c.boundary_kinds[face] =
         boundary_kinds[static_cast<std::size_t>(face)];
+      c.boundary_gammas(face) =
+        boundary_gammas[static_cast<std::size_t>(face)];
+      c.boundary_outlet_pressures(face) =
+        boundary_outlet_pressures[static_cast<std::size_t>(face)];
       c.boundary_density_floors(face) =
         boundary_density_floors[static_cast<std::size_t>(face)];
+      c.boundary_pressure_floors(face) =
+        boundary_pressure_floors[static_cast<std::size_t>(face)];
       c.shared_neighbor_elements[face] =
         neighbor_elements[static_cast<std::size_t>(face)];
       for (int d = 0; d < op_->dim; ++d)
@@ -2611,46 +2842,15 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     }
   }
 
-  c.volume_panel_active =
-    c.volume_panel_requested && cuda && op_->dim == 2 &&
-    (c.n1d == 3 || c.n1d == 4) && sizeof(real_t) == sizeof(double) &&
-    BatchedLinAlg::IsAvailable(BatchedLinAlg::GPU_BLAS);
-  c.device_llf_volume_active = device_llf_volume_selected;
+  c.llf_volume_active = llf_volume_selected;
 
   if (!c.workspaces_ready)
   {
-    c.volume_fixedpoint_context.reset();
-    c.volume_fixedpoint_status = DGSEMFixedPointPanelStatus{};
-    c.volume_fixedpoint_calls = 0;
-    c.volume_fixedpoint_audits = 0;
-    c.volume_fixedpoint_failures = 0;
-    c.volume_fixedpoint_active =
-      c.volume_fixedpoint_requested && c.volume_panel_active && c.n1d == 4;
-    c.volume_fixedpoint_permanent_fallback =
-      c.volume_fixedpoint_requested && !c.volume_fixedpoint_active;
     const int nfaces = c.normals.Height();
     c.states.SetSize(c.rows, c.equations);
     c.sigma_nodes.SetSize(c.rows);
-    if (c.volume_panel_active)
-    {
-      c.contravariant_flux.SetSize(op_->dim * c.dof,
-                                  c.ne * c.equations);
-      const LGLBasis1D& basis = GetLGLBasis1D(c.n1d - 1);
-      BuildCentralVolumePanelOperator(op_->dim,
-                                      c.n1d,
-                                      c.lex_to_local,
-                                      basis.Dsplit,
-                                      basis.weights,
-                                      c.central_volume_panel_operator);
-      c.central_volume_panel_operator.GetMemory().UseDevice(true);
-      c.central_volume_panel_operator.Read(true);
-    }
-    else
-    {
-      c.contravariant_flux.SetSize(c.rows, op_->dim * c.equations);
-      c.central_volume_panel_operator.SetSize(0, 0, 0);
-    }
-    if (c.device_llf_volume_active)
+    c.contravariant_flux.SetSize(c.rows, op_->dim * c.equations);
+    if (c.llf_volume_active)
     {
       c.volume_pair_dissipation.SetSize(
         DGSEMVolumePairCount(op_->dim, c.ne, c.n1d), c.equations);
@@ -2661,16 +2861,6 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     }
     c.nodal_speeds.SetSize(c.rows);
     c.weak_volume.SetSize(c.rows, c.equations);
-    if (c.volume_fixedpoint_active)
-    {
-      c.volume_panel_fp64_audit.SetSize(c.rows, c.equations);
-      c.volume_panel_audit_metrics.SetSize(3);
-    }
-    else
-    {
-      c.volume_panel_fp64_audit.SetSize(0, 0);
-      c.volume_panel_audit_metrics.SetSize(0);
-    }
     c.left_states.SetSize(nfaces, c.equations);
     c.right_states.SetSize(nfaces, c.equations);
     c.left_sigma.SetSize(nfaces);
@@ -2682,6 +2872,8 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     c.strong.SetSize(c.rows, c.equations);
     c.nodal_max.SetSize(1);
     c.face_max.SetSize(1);
+    c.state_scan_slots.SetSize(kDGSEMDeviceStateScanWorkspaceSize);
+    c.state_scan_result.SetSize(6);
     c.empty_face_neighbor.SetSize(0);
     c.states.GetMemory().UseDevice(true);
     c.sigma_nodes.UseDevice(true);
@@ -2689,8 +2881,6 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     c.volume_pair_dissipation.GetMemory().UseDevice(true);
     c.nodal_speeds.UseDevice(true);
     c.weak_volume.GetMemory().UseDevice(true);
-    c.volume_panel_fp64_audit.GetMemory().UseDevice(true);
-    c.volume_panel_audit_metrics.UseDevice(true);
     c.left_states.GetMemory().UseDevice(true);
     c.right_states.GetMemory().UseDevice(true);
     c.left_sigma.UseDevice(true);
@@ -2702,48 +2892,8 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     c.strong.GetMemory().UseDevice(true);
     c.nodal_max.UseDevice(true);
     c.face_max.UseDevice(true);
-    if (c.volume_fixedpoint_active)
-    {
-      c.volume_fixedpoint_context =
-        std::make_unique<DGSEMFixedPointVolumeContext>();
-      c.volume_fixedpoint_status = c.volume_fixedpoint_context->Initialize(
-        c.dof,
-        c.ne * c.equations,
-        op_->dim * c.dof,
-        kFixedPointMantissaBits,
-        kFixedPointWorkspaceLimitBytes);
-      c.volume_fixedpoint_active =
-        c.volume_fixedpoint_status.initialized;
-      c.volume_fixedpoint_permanent_fallback =
-        !c.volume_fixedpoint_active;
-      mfem::out << "DGSEM_FIXEDPOINT_PANEL init="
-                << (c.volume_fixedpoint_active ? 1 : 0)
-                << " compiled="
-                << (c.volume_fixedpoint_status.compiled ? 1 : 0)
-                << " cc="
-                << c.volume_fixedpoint_status.compute_capability_major << '.'
-                << c.volume_fixedpoint_status.compute_capability_minor
-                << " shape=" << c.dof << 'x' << op_->dim * c.dof << 'x'
-                << c.ne * c.equations
-                << " scaling=cublas_row_column_power_of_two"
-                << " mantissa=dynamic max_bits="
-                << kFixedPointMantissaBits
-                << " workspace_bytes="
-                << c.volume_fixedpoint_status.workspace_bytes
-                << " cublas_status="
-                << c.volume_fixedpoint_status.cublas_status
-                << " cuda_status="
-                << c.volume_fixedpoint_status.cuda_status << '\n';
-      if (!c.volume_fixedpoint_active)
-      {
-        c.volume_fixedpoint_context.reset();
-      }
-    }
-    else if (c.volume_fixedpoint_requested)
-    {
-      mfem::out << "DGSEM_FIXEDPOINT_PANEL init=0"
-                << " reason=requires_single_rank_cuda_fp64_p3_panel\n";
-    }
+    c.state_scan_slots.GetMemory().UseDevice(true);
+    c.state_scan_result.GetMemory().UseDevice(true);
     if (!sigma_field)
     {
       c.sigma_nodes = 0.0;
@@ -2782,13 +2932,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
   c.selection.has_local_faces = c.local_faces > 0;
   c.selection.has_shared_faces = c.shared_faces > 0;
   c.selection.has_boundary_faces = c.boundary_faces > 0;
-  c.selection.volume_panel_requested = c.volume_panel_requested;
-  c.selection.volume_panel_active = c.volume_panel_active;
-  c.selection.volume_fixedpoint_requested = c.volume_fixedpoint_requested;
-  c.selection.volume_fixedpoint_active = c.volume_fixedpoint_active;
-  c.selection.volume_fixedpoint_permanent_fallback =
-    c.volume_fixedpoint_permanent_fallback;
-  c.selection.device_llf_volume_active = c.device_llf_volume_active;
+  c.selection.llf_volume_active = c.llf_volume_active;
   return DGSEMProductionReason::None;
 }
 
@@ -2801,8 +2945,12 @@ DGSEMProductionSelection DGSEMOperator::BindProductionPolicy(bool strict) const
 DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
   const Vector& x_local,
   Vector& y_local,
-  bool strict) const
+  bool strict,
+  Vector* physical_boundary_flux,
+  bool admission_only) const
 {
+  MFEM_VERIFY(!admission_only || physical_boundary_flux == nullptr,
+              "A DGSEM admission-only scan cannot capture boundary flux.");
   DGSEMProductionResult result;
   const DGSEMProductionReason cache_reason = EnsureProductionCache_(strict);
   if (cache_reason != DGSEMProductionReason::None || !production_)
@@ -2814,14 +2962,21 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
   DGSEMProductionCache& c = *production_;
   const ProductionCommunicator context =
     GetProductionCommunicator(op_->vfes);
-  ++c.counters.stage_calls;
+  if (admission_only)
+  {
+    ++c.counters.admission_calls;
+  }
+  else
+  {
+    ++c.counters.stage_calls;
+  }
 
   DGSEMProductionReason local_gate = DGSEMProductionReason::None;
   if (x_local.Size() != op_->vfes.GetVSize())
   {
     local_gate = DGSEMProductionReason::InputSizeMismatch;
   }
-  else if (y_local.Size() != op_->vfes.GetVSize())
+  else if (!admission_only && y_local.Size() != op_->vfes.GetVSize())
   {
     local_gate = DGSEMProductionReason::OutputSizeMismatch;
   }
@@ -2838,18 +2993,6 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
     local_gate = DGSEMProductionReason::StaleCache;
   }
 
-  if (local_gate == DGSEMProductionReason::None &&
-      c.workspace_evidence.ready)
-  {
-    ++c.counters.host_synchronizations;
-    const DGSEMProductionWorkspaceEvidence current = SnapshotWorkspaces(c);
-    ++c.workspace_evidence.checks;
-    ++c.counters.workspace_identity_checks;
-    if (!SameWorkspaceStorage(c.workspace_evidence, current))
-    {
-      local_gate = DGSEMProductionReason::WorkspaceIdentityChanged;
-    }
-  }
   DGSEMProductionReason gate_reason = ReduceReason(
     context,
     local_gate,
@@ -2886,21 +3029,39 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
     c.shared_sigma = 0.0;
   }
 
+  // Validate owned stage data before any MPI exchange. The packed fields stay
+  // resident; only the six-scalar FP64 admission summary is synchronized.
+  const DGSEMDeviceStateScan owned_scan = ScanDGSEMProductionStateDevice(
+    op_->dim,
+    c.gamma,
+    c.velocity_density_floor,
+    true,
+    false,
+    c.states,
+    c.sigma_nodes,
+    c.left_states,
+    c.left_sigma,
+    c.right_states,
+    c.right_sigma,
+    c.state_scan_slots,
+    c.state_scan_result);
   ++c.counters.host_synchronizations;
-  DGSEMProductionReason local_state_reason =
-    ValidateDGSEMProductionState(op_->dim,
-                                 c.gamma,
-                                 c.velocity_density_floor,
-                                 c.states,
-                                 c.sigma_nodes);
-  const DGSEMProductionReason state_reason = ReduceReason(
+  const DGSEMProductionReason owned_state_reason = ReduceReason(
     context,
-    local_state_reason,
+    owned_scan.reason,
     c.counters.stage_reason_reductions);
-  if (state_reason != DGSEMProductionReason::None)
+  if (owned_state_reason != DGSEMProductionReason::None)
   {
-    result.reason = state_reason;
+    result.reason = owned_state_reason;
     return result;
+  }
+  if (c.sigma_field)
+  {
+    op_->dgsem_q_sigma_telemetry_.Merge(owned_scan.q_sigma);
+    if (admission_only)
+    {
+      result.admission_q_sigma.Merge(owned_scan.q_sigma);
+    }
   }
 
   const Vector* face_neighbor_state = &c.empty_face_neighbor;
@@ -2974,7 +3135,6 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
   GatherEulerRusanovFacesDevice(op_->dim,
                                 c.ne,
                                 c.dof,
-                                c.gamma,
                                 c.states,
                                 c.sigma_nodes,
                                 *face_neighbor_state,
@@ -2988,170 +3148,130 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
                                 c.ownership,
                                 c.boundary_kinds,
                                 c.boundary_reference_states,
+                                c.boundary_gammas,
+                                c.boundary_outlet_pressures,
                                 c.boundary_density_floors,
+                                c.boundary_pressure_floors,
                                 c.left_states,
                                 c.right_states,
                                 c.left_sigma,
                                 c.right_sigma);
 
+  // Validate and qualify every numerical-flux input, including prescribed
+  // boundary ghosts, after exchange and before evaluating a physical flux.
+  const DGSEMDeviceStateScan face_scan = ScanDGSEMProductionStateDevice(
+    op_->dim,
+    c.gamma,
+    c.velocity_density_floor,
+    false,
+    true,
+    c.states,
+    c.sigma_nodes,
+    c.left_states,
+    c.left_sigma,
+    c.right_states,
+    c.right_sigma,
+    c.state_scan_slots,
+    c.state_scan_result);
   ++c.counters.host_synchronizations;
-  DGSEMProductionReason local_face_reason =
-    ValidateDGSEMProductionState(op_->dim,
-                                 c.gamma,
-                                 c.velocity_density_floor,
-                                 c.left_states,
-                                 c.left_sigma);
-  if (local_face_reason == DGSEMProductionReason::None)
-  {
-    ++c.counters.host_synchronizations;
-    local_face_reason =
-      ValidateDGSEMProductionState(op_->dim,
-                                   c.gamma,
-                                   c.velocity_density_floor,
-                                   c.right_states,
-                                   c.right_sigma);
-  }
-  const DGSEMProductionReason face_reason = ReduceReason(
+  const DGSEMProductionReason state_reason = ReduceReason(
     context,
-    local_face_reason,
+    face_scan.reason,
     c.counters.stage_reason_reductions);
-  if (face_reason != DGSEMProductionReason::None)
+  if (state_reason != DGSEMProductionReason::None)
   {
-    result.reason = face_reason;
+    result.reason = state_reason;
+    return result;
+  }
+  if (c.sigma_field)
+  {
+    op_->dgsem_q_sigma_telemetry_.Merge(face_scan.q_sigma);
+    if (admission_only)
+    {
+      result.admission_q_sigma.Merge(face_scan.q_sigma);
+    }
+  }
+
+  if (admission_only)
+  {
+    result.admission_q_sigma = ReduceFreshQSigmaTelemetry(
+      context,
+      result.admission_q_sigma,
+      c.counters.mpi_reductions);
+
+    // All ranks take the same branch because q_sigma is already reduced on
+    // the owning communicator. Do not evaluate the frozen-sigma acoustic
+    // radius on a state that the caller must reject.
+    const bool speed_admissible =
+      !result.admission_q_sigma.enabled ||
+      (result.admission_q_sigma.enabled &&
+       result.admission_q_sigma.sample_count > 0 &&
+       result.admission_q_sigma.nonpositive_count == 0 &&
+       result.admission_q_sigma.nonfinite_count == 0 &&
+       std::isfinite(result.admission_q_sigma.minimum_raw_q_sigma) &&
+       result.admission_q_sigma.minimum_raw_q_sigma > 0.0 &&
+       std::isfinite(
+         result.admission_q_sigma.minimum_q_sigma_over_gamma_p) &&
+       result.admission_q_sigma.minimum_q_sigma_over_gamma_p > 0.0);
+    if (speed_admissible)
+    {
+      ComputeEulerNodalCharacteristicSpeedsDevice(
+        op_->dim,
+        c.gamma,
+        c.velocity_density_floor,
+        c.states,
+        c.sigma_nodes,
+        c.nodal_speeds,
+        c.frozen_sigma_spectral_speed);
+      ComputeEulerRusanovFaceCharacteristicSpeedsDevice(
+        op_->dim,
+        c.gamma,
+        c.velocity_density_floor,
+        c.left_states,
+        c.right_states,
+        c.normals,
+        c.left_sigma,
+        c.right_sigma,
+        c.face_speeds,
+        c.frozen_sigma_spectral_speed);
+      result.max_characteristic_speed = ReducePackedCharacteristicSpeed(
+        context,
+        c.nodal_speeds,
+        c.face_speeds,
+        c.nodal_max,
+        c.face_max,
+        c.counters.host_synchronizations,
+        c.counters.mpi_reductions);
+    }
+    result.executed = true;
+    result.reason = DGSEMProductionReason::None;
     return result;
   }
 
   const LGLBasis1D& basis = GetLGLBasis1D(c.selection.order);
-  if (c.volume_panel_active)
-  {
-    BuildEulerContravariantFluxPanelDevice(op_->dim,
-                                           c.ne,
-                                           c.dof,
-                                           c.gamma,
-                                           c.velocity_density_floor,
-                                           c.states,
-                                           c.sigma_nodes,
-                                           c.metrics,
-                                           c.contravariant_flux,
-                                           c.nodal_speeds);
-    bool panel_complete = false;
-    if (c.volume_fixedpoint_active &&
-        !c.volume_fixedpoint_permanent_fallback &&
-        c.volume_fixedpoint_context)
-    {
-      ++c.volume_fixedpoint_calls;
-      ++c.counters.fixedpoint_panel_calls;
-      c.volume_fixedpoint_status = c.volume_fixedpoint_context->Mult(
-        c.central_volume_panel_operator,
-        c.contravariant_flux,
-        c.weak_volume);
-      if (c.volume_fixedpoint_status.launch_succeeded)
-      {
-        panel_complete = true;
-        const bool audit_now = c.volume_fixedpoint_calls == 1 ||
-          c.volume_fixedpoint_calls % kFixedPointAuditInterval == 0;
-        if (audit_now)
-        {
-          ++c.volume_fixedpoint_audits;
-          ++c.counters.fixedpoint_panel_audits;
-          ApplyCentralVolumePanelFP64Device(
-            op_->dim,
-            c.ne,
-            c.dof,
-            c.equations,
-            c.central_volume_panel_operator,
-            c.contravariant_flux,
-            c.volume_panel_fp64_audit);
-          AuditCentralVolumePanelDevice(c.weak_volume,
-                                        c.volume_panel_fp64_audit,
-                                        c.volume_panel_audit_metrics);
-          ++c.counters.host_synchronizations;
-          const real_t* audit = c.volume_panel_audit_metrics.HostRead();
-          ++c.counters.host_synchronizations;
-          c.volume_fixedpoint_status =
-            c.volume_fixedpoint_context->SynchronizeStatus();
-          const real_t tolerance = kFixedPointAuditAbsoluteTolerance +
-            kFixedPointAuditRelativeTolerance * audit[0];
-          const bool passed = c.volume_fixedpoint_status.launch_succeeded &&
-            c.volume_fixedpoint_status.emulation_observed &&
-            Finite(audit[0]) && Finite(audit[1]) && audit[2] == 0.0 &&
-            audit[1] <= tolerance;
-          mfem::out << "DGSEM_FIXEDPOINT_PANEL audit="
-                    << c.volume_fixedpoint_audits
-                    << " call=" << c.volume_fixedpoint_calls
-                    << " retained_bits="
-                    << c.volume_fixedpoint_status.retained_mantissa_bits
-                    << " max_reference=" << audit[0]
-                    << " max_error=" << audit[1]
-                    << " tolerance=" << tolerance
-                    << " pass=" << (passed ? 1 : 0) << '\n';
-          if (!passed)
-          {
-            ++c.volume_fixedpoint_failures;
-            ++c.counters.fixedpoint_panel_failures;
-            CopyPackedMatrixDevice(c.volume_panel_fp64_audit,
-                                   c.weak_volume);
-            c.volume_fixedpoint_active = false;
-            c.volume_fixedpoint_permanent_fallback = true;
-            c.selection.volume_fixedpoint_active = false;
-            c.selection.volume_fixedpoint_permanent_fallback = true;
-            c.volume_fixedpoint_context.reset();
-            mfem::out << "DGSEM_FIXEDPOINT_PANEL permanent_fallback=1"
-                      << " reason=fp64_audit_or_emulation_status\n";
-          }
-        }
-      }
-      else
-      {
-        ++c.volume_fixedpoint_failures;
-        ++c.counters.fixedpoint_panel_failures;
-        c.volume_fixedpoint_active = false;
-        c.volume_fixedpoint_permanent_fallback = true;
-        c.selection.volume_fixedpoint_active = false;
-        c.selection.volume_fixedpoint_permanent_fallback = true;
-        c.volume_fixedpoint_context.reset();
-        mfem::out << "DGSEM_FIXEDPOINT_PANEL permanent_fallback=1"
-                  << " reason=launch cublas_status="
-                  << c.volume_fixedpoint_status.cublas_status
-                  << " cuda_status="
-                  << c.volume_fixedpoint_status.cuda_status << '\n';
-      }
-    }
-    if (!panel_complete)
-    {
-      ApplyCentralVolumePanelFP64Device(op_->dim,
-                                        c.ne,
-                                        c.dof,
-                                        c.equations,
-                                        c.central_volume_panel_operator,
-                                        c.contravariant_flux,
-                                        c.weak_volume);
-    }
-  }
-  else
-  {
-    BuildEulerContravariantFluxDevice(op_->dim,
-                                      c.gamma,
-                                      c.velocity_density_floor,
-                                      c.states,
-                                      c.sigma_nodes,
-                                      c.metrics,
-                                      c.contravariant_flux,
-                                      c.nodal_speeds);
-    ApplyCentralVolumeDevice(op_->dim,
-                             c.n1d,
-                             c.lex_to_local,
-                             basis.Dsplit,
-                             basis.weights,
-                             c.contravariant_flux,
-                             c.weak_volume);
-  }
-  if (c.device_llf_volume_active)
+  BuildEulerContravariantFluxDevice(op_->dim,
+                                    c.gamma,
+                                    c.velocity_density_floor,
+                                    c.states,
+                                    c.sigma_nodes,
+                                    c.metrics,
+                                    c.contravariant_flux,
+                                    c.nodal_speeds,
+                                    c.frozen_sigma_spectral_speed);
+  ApplyCentralVolumeDevice(op_->dim,
+                           c.n1d,
+                           c.lex_to_local,
+                           basis.Dsplit,
+                           basis.weights,
+                           c.contravariant_flux,
+                           c.weak_volume);
+  if (c.llf_volume_active)
   {
     AddEulerLLFVolumeDissipationDevice(op_->dim,
                                        c.ne,
                                        c.n1d,
                                        c.gamma,
+                                       c.velocity_density_floor,
                                        c.lex_to_local,
                                        basis.Dsplit,
                                        basis.weights,
@@ -3162,9 +3282,6 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
                                        c.weak_volume);
   }
 
-  // The accepted face kernel retains its packed host normal preflight. This
-  // is one explicit, accounted synchronization per production stage.
-  ++c.counters.host_synchronizations;
   AssembleEulerRusanovFacesDevice(op_->dim,
                                   c.ne,
                                   c.dof,
@@ -3181,65 +3298,29 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
                                   c.row_face_signs,
                                   c.face_flux,
                                   c.face_speeds,
-                                  c.weak_surface);
+                                  c.weak_surface,
+                                  c.frozen_sigma_spectral_speed);
+  if (physical_boundary_flux)
+  {
+    IntegratePhysicalBoundaryFluxDevice(c.ownership,
+                                        c.face_weights,
+                                        c.face_flux,
+                                        *physical_boundary_flux);
+  }
   AddPackedMatricesDevice(c.weak_surface, c.weak_volume);
   ApplyInverseMassDevice(c.ne,
                          c.dof,
                          c.inverse_mass,
                          c.weak_volume,
                          c.strong);
-  DeterministicMaximumDevice(c.nodal_speeds, c.nodal_max);
-  DeterministicMaximumDevice(c.face_speeds, c.face_max);
-
-  ++c.counters.host_synchronizations;
-  const DGSEMProductionWorkspaceEvidence current = SnapshotWorkspaces(c);
-  DGSEMProductionReason local_workspace_reason =
-    DGSEMProductionReason::None;
-  if (!c.workspace_evidence.ready)
-  {
-    c.workspace_evidence = current;
-  }
-  else
-  {
-    ++c.workspace_evidence.checks;
-    ++c.counters.workspace_identity_checks;
-    if (!SameWorkspaceStorage(c.workspace_evidence, current))
-    {
-      local_workspace_reason =
-        DGSEMProductionReason::WorkspaceIdentityChanged;
-    }
-  }
-  const DGSEMProductionReason workspace_reason = ReduceReason(
+  const real_t max_speed = ReducePackedCharacteristicSpeed(
     context,
-    local_workspace_reason,
-    c.counters.stage_reason_reductions);
-  if (workspace_reason != DGSEMProductionReason::None)
-  {
-    ++c.workspace_evidence.failures;
-    ++c.counters.workspace_identity_failures;
-    result.reason = workspace_reason;
-    return result;
-  }
-
-  ++c.counters.host_synchronizations;
-  const real_t nodal_max = c.nodal_max.HostRead()[0];
-  ++c.counters.host_synchronizations;
-  const real_t face_max = c.face_max.HostRead()[0];
-  real_t max_speed = std::max(nodal_max, face_max);
-#ifdef MFEM_USE_MPI
-  if (context.active && context.size > 1)
-  {
-    real_t global_max = max_speed;
-    MPI_Allreduce(&max_speed,
-                  &global_max,
-                  1,
-                  MPITypeMap<real_t>::mpi_type,
-                  MPI_MAX,
-                  context.comm);
-    max_speed = global_max;
-    ++c.counters.mpi_reductions;
-  }
-#endif
+    c.nodal_speeds,
+    c.face_speeds,
+    c.nodal_max,
+    c.face_max,
+    c.counters.host_synchronizations,
+    c.counters.mpi_reductions);
 
   // This is the first write to the caller-owned output in the whole stage.
   ScatterElementStateDevice(c.ne,

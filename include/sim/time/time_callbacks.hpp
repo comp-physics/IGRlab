@@ -79,6 +79,7 @@ struct RunSummary
   double minimum_accepted_dt = 0.0;
   double maximum_attempted_dt = 0.0;
   double maximum_accepted_dt = 0.0;
+  double maximum_accepted_step_growth_ratio = 0.0;
   bool dt_min_reached = false;
   bool success = false;
   std::string termination_reason = "not-started";

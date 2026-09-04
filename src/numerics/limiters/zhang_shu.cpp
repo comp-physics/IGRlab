@@ -19,6 +19,69 @@
 namespace
 {
 
+bool UsesCollocatedLGLMean(const mfem::ParFiniteElementSpace& vfes,
+                           const mfem::FiniteElement& fe)
+{
+  const auto* collection =
+    dynamic_cast<const mfem::L2_FECollection*>(vfes.FEColl());
+  const auto* tensor = dynamic_cast<const mfem::TensorBasisElement*>(&fe);
+  return collection != nullptr && tensor != nullptr &&
+         collection->GetBasisType() == mfem::BasisType::GaussLobatto &&
+         tensor->GetBasisType() == mfem::BasisType::GaussLobatto;
+}
+
+const mfem::IntegrationRule& ZhangShuAverageRule(
+  const mfem::ParFiniteElementSpace& vfes,
+  const mfem::FiniteElement& fe,
+  mfem::ElementTransformation& transformation,
+  int quadrature_order)
+{
+  if (UsesCollocatedLGLMean(vfes, fe))
+  {
+    // Match DGHyperbolicConservationLaws::ComputeInvMass exactly.  DGSEM's
+    // diagonal mass is defined by the p+1 point GLL rule, including the
+    // Jacobian sampled at those collocation nodes.  Contracting around a mean
+    // formed with a higher-order rule is not conservative in that discrete
+    // norm on curved elements.
+    static mfem::IntegrationRules lgl_rules(
+      0, mfem::Quadrature1D::GaussLobatto);
+    const int order = std::max(1, 2 * fe.GetOrder() - 1);
+    return lgl_rules.Get(transformation.GetGeometryType(), order);
+  }
+  return mfem::IntRules.Get(transformation.GetGeometryType(),
+                            quadrature_order);
+}
+
+void ZhangShuElementAverage(const mfem::ParFiniteElementSpace& vfes,
+                            const mfem::FiniteElement& fe,
+                            mfem::ElementTransformation& transformation,
+                            const mfem::DenseMatrix& element_state,
+                            int num_equations,
+                            int quadrature_order,
+                            mfem::Vector& average)
+{
+  const mfem::IntegrationRule& rule = ZhangShuAverageRule(
+    vfes, fe, transformation, quadrature_order);
+  mfem::Vector shape(fe.GetDof());
+  mfem::Vector point_state(num_equations);
+  average.SetSize(num_equations);
+  average = 0.0;
+  double measure = 0.0;
+  for (int q = 0; q < rule.GetNPoints(); ++q)
+  {
+    const mfem::IntegrationPoint& point = rule.IntPoint(q);
+    transformation.SetIntPoint(&point);
+    fe.CalcShape(point, shape);
+    element_state.MultTranspose(shape, point_state);
+    const double weight = point.weight * transformation.Weight();
+    average.Add(weight, point_state);
+    measure += weight;
+  }
+  MFEM_VERIFY(measure > 0.0,
+              "Zhang-Shu limiter encountered a non-positive element measure.");
+  average /= measure;
+}
+
 struct ElementFaceCacheEntry
 {
   long mesh_sequence = -1;
@@ -37,6 +100,7 @@ struct DeviceLimiterCache
   int dim = 0;
   int d1d = 0;
   int num_eq = 0;
+  bool collocated_lgl_average = false;
   bool tensor_points = false;
   bool mfem_volume_points = false;
   bool mfem_face_points = false;
@@ -864,6 +928,8 @@ DeviceLimiterCache& GetDeviceLimiterCache(
     mfem::QuadratureInterpolator::SupportsFESpace(vfes);
   const bool requested_mfem_face_points =
     ne > 0 && SupportsMfemFaceLimiterPath(vfes, face_qords);
+  const bool requested_collocated_lgl_average =
+    ne > 0 && UsesCollocatedLGLMean(vfes, *vfes.GetFE(0));
   const auto* l2_fec =
     dynamic_cast<const mfem::L2_FECollection*>(vfes.FEColl());
   const bool consumer_points =
@@ -892,6 +958,8 @@ DeviceLimiterCache& GetDeviceLimiterCache(
     cache_ptr->qord != qord || cache_ptr->ne != ne ||
     cache_ptr->dof != dof || cache_ptr->num_eq != num_eq ||
     cache_ptr->face_qords != face_qords ||
+    cache_ptr->collocated_lgl_average !=
+      requested_collocated_lgl_average ||
     cache_ptr->mfem_volume_points != requested_mfem_volume_points ||
     cache_ptr->mfem_face_points != requested_mfem_face_points ||
     cache_ptr->enforce_nodes != requested_enforce_nodes ||
@@ -919,6 +987,7 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   cache.dim = mesh.Dimension();
   cache.num_eq = num_eq;
   cache.face_qords = face_qords;
+  cache.collocated_lgl_average = requested_collocated_lgl_average;
   cache.restriction = current_restriction;
   MFEM_VERIFY(cache.restriction != nullptr,
               "Device positivity limiter requires an element restriction.");
@@ -1019,20 +1088,30 @@ DeviceLimiterCache& GetDeviceLimiterCache(
       *vfes.GetElementTransformation(e);
     const mfem::IntegrationRule& volume_rule =
       mfem::IntRules.Get(transformation.GetGeometryType(), qord);
+    const mfem::IntegrationRule& average_rule = ZhangShuAverageRule(
+      vfes, fe, transformation, qord);
     shape.SetSize(dof);
     mfem::Vector integral(dof);
     integral = 0.0;
     double volume = 0.0;
-    for (int q = 0; q < volume_rule.GetNPoints(); ++q)
+    for (int q = 0; q < average_rule.GetNPoints(); ++q)
     {
-      const mfem::IntegrationPoint& ip = volume_rule.IntPoint(q);
+      const mfem::IntegrationPoint& ip = average_rule.IntPoint(q);
       transformation.SetIntPoint(&ip);
       fe.CalcShape(ip, shape);
       const double weight = ip.weight * transformation.Weight();
       volume += weight;
       integral.Add(weight, shape);
-      if (!cache.mfem_volume_points)
+    }
+    if (!cache.mfem_volume_points)
+    {
+      // Average and positivity-point rules intentionally differ for DGSEM:
+      // retain the caller-selected volume points while using the collocated
+      // GLL rule only for the mean that defines the contraction.
+      for (int q = 0; q < volume_rule.GetNPoints(); ++q)
       {
+        const mfem::IntegrationPoint& ip = volume_rule.IntPoint(q);
+        fe.CalcShape(ip, shape);
         for (int d = 0; d < dof; ++d)
         {
           point_shapes.push_back(shape(NativeDof(fe, d)));
@@ -1869,8 +1948,13 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
     elmat.UseExternalData(elvec.GetData(), dof, num_eq);
 
     const auto average_start = phase_start();
-    dg_igr::limiters_detail::ElementAverage(
-      *fe, *Tr, elmat, num_eq, qord, Ubar);
+    ZhangShuElementAverage(vfes,
+                           *fe,
+                           *Tr,
+                           elmat,
+                           num_eq,
+                           qord,
+                           Ubar);
     phase_add(average_start, phase.average_seconds);
     for (int component = 0; component < num_eq; ++component)
     {

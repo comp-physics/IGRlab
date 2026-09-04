@@ -244,7 +244,7 @@ def manifest_checks(
         manifest_path = pvtu.parent / "restart.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         expected = {
-            "schema_version": 3,
+            "schema_version": 4,
             "complete": True,
             "cycle": cycle,
             "time": time,

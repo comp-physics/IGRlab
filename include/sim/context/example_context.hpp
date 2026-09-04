@@ -34,7 +34,6 @@ struct DGSpaces
            int num_equations,
            int basis_type,
            const std::string& sigma_space,
-           int sigma_order,
            bool need_sigma,
            bool need_h1)
     : fec(order, dim, basis_type),
@@ -44,7 +43,7 @@ struct DGSpaces
   {
     if (need_sigma)
     {
-      sigma_fec = BuildSigmaCollection(sigma_order, dim, sigma_space);
+      sigma_fec = BuildSigmaCollection(order, dim, sigma_space);
       sigma_fes =
         std::make_unique<mfem::ParFiniteElementSpace>(&pmesh, sigma_fec.get());
     }
@@ -110,7 +109,6 @@ struct ExampleContext
              num_equations,
              BasisTypeForBackend(cfg.dg_backend),
              sigma_space,
-             ResolveIGRSigmaOrder(cfg),
              need_sigma,
              need_h1)
   {

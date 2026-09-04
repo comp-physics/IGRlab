@@ -174,6 +174,27 @@ target_include_directories(dg_igr_unit_tests PRIVATE
 )
 
 if(MFEM_USE_MPI AND MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
+  add_executable(dg_igr_q_sigma_subcommunicator_test
+    test_q_sigma_subcommunicator.cpp
+  )
+  target_link_libraries(dg_igr_q_sigma_subcommunicator_test PRIVATE
+    igr_mfem
+    mfem
+  )
+  target_include_directories(dg_igr_q_sigma_subcommunicator_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+  )
+  add_test(NAME dg_igr_q_sigma_subcommunicator_cpu
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4
+            $<TARGET_FILE:dg_igr_q_sigma_subcommunicator_test>
+  )
+  set_tests_properties(dg_igr_q_sigma_subcommunicator_cpu PROPERTIES
+    LABELS "cpu-reference;mpi;subcommunicator;igr;extrapolated;admission;rollback"
+    TIMEOUT 180
+    RUN_SERIAL TRUE
+    PROCESSORS 4
+  )
+
   add_executable(dg_igr_vtk_restart_subcommunicator_test
     test_vtk_restart_subcommunicator.cpp
   )
@@ -333,32 +354,6 @@ if (MFEM_USE_CUDA)
     TIMEOUT 120
     RUN_SERIAL TRUE
   )
-
-  set(DG_IGR_TRACE_CENTERED_DEVICE_PARITY_REF
-      "${CMAKE_CURRENT_BINARY_DIR}/trace-centered-device-parity-reference.txt")
-  add_test(NAME dg_igr_trace_centered_device_parity_cpu_reference
-    COMMAND $<TARGET_FILE:dg_igr_exact_iid_device_parity_test>
-            cpu --write-reference ${DG_IGR_TRACE_CENTERED_DEVICE_PARITY_REF}
-            hdg-trace-centered
-  )
-  set_tests_properties(
-    dg_igr_trace_centered_device_parity_cpu_reference PROPERTIES
-    FIXTURES_SETUP dg_igr_trace_centered_device_parity_reference
-    LABELS "cpu-reference;dg;igr;hdg-trace-centered;invariant-domain-flux;parity"
-    TIMEOUT 120
-    RUN_SERIAL TRUE
-  )
-  add_test(NAME dg_igr_trace_centered_device_parity_cuda
-    COMMAND $<TARGET_FILE:dg_igr_exact_iid_device_parity_test>
-            cuda --compare ${DG_IGR_TRACE_CENTERED_DEVICE_PARITY_REF}
-            hdg-trace-centered
-  )
-  set_tests_properties(dg_igr_trace_centered_device_parity_cuda PROPERTIES
-    FIXTURES_REQUIRED dg_igr_trace_centered_device_parity_reference
-    LABELS "cuda;dg;igr;hdg-trace-centered;invariant-domain-flux;parity"
-    TIMEOUT 120
-    RUN_SERIAL TRUE
-  )
 endif()
 
 add_test(NAME dg_igr_euler_tests COMMAND dg_igr_unit_tests --euler)
@@ -368,6 +363,19 @@ add_test(NAME dg_igr_dg_operator_tests COMMAND dg_igr_unit_tests --dg-operator)
 add_test(NAME dg_igr_dgsem_basis_tests COMMAND dg_igr_unit_tests --dgsem-basis)
 add_test(NAME dg_igr_dgsem_flux_tests COMMAND dg_igr_unit_tests --dgsem-flux)
 add_test(NAME dg_igr_dgsem_operator_tests COMMAND dg_igr_unit_tests --dgsem-operator)
+if(MFEM_USE_CUDA)
+  add_test(NAME dg_igr_dgsem_operator_cuda
+    COMMAND ${CMAKE_COMMAND} -E env
+            DG_IGR_TEST_DEVICE=cuda
+            DG_IGR_DGSEM_DEVICE=cuda
+            $<TARGET_FILE:dg_igr_unit_tests> --dgsem-operator
+  )
+  set_tests_properties(dg_igr_dgsem_operator_cuda PROPERTIES
+    LABELS "cuda;dgsem;production;llf"
+    TIMEOUT 180
+    RUN_SERIAL TRUE
+  )
+endif()
 add_test(NAME dg_igr_dgsem_advection_tests COMMAND dg_igr_unit_tests --dgsem-advection)
 add_test(NAME dg_igr_dgsem_igr_tests COMMAND dg_igr_unit_tests --dgsem-igr)
 add_test(NAME dg_igr_dgsem_portability_refactor_tests
@@ -713,6 +721,21 @@ if (TARGET dgsem_sedov_taylor_blast)
     RUN_SERIAL TRUE
   )
 
+  add_test(NAME dgsem_vtk_restart_extrapolated_llf_p1_cpu
+    COMMAND /usr/bin/env python3
+            ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+            --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
+            --device cpu
+            --order 1
+            --extrapolated-llf
+            --out-dir ${CMAKE_BINARY_DIR}/tests/dgsem-vtk-restart-extrapolated-llf-p1-cpu
+  )
+  set_tests_properties(dgsem_vtk_restart_extrapolated_llf_p1_cpu PROPERTIES
+    LABELS "cpu-reference;dgsem;vtk;restart;cold;llf;igr;extrapolated;packed-production"
+    TIMEOUT 600
+    RUN_SERIAL TRUE
+  )
+
   if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
     add_test(NAME dgsem_vtk_restart_p2_mpi_cpu
       COMMAND /usr/bin/env python3
@@ -729,6 +752,27 @@ if (TARGET dgsem_sedov_taylor_blast)
     set_tests_properties(dgsem_vtk_restart_p2_mpi_cpu PROPERTIES
       LABELS "mpi;dgsem;vtk;restart;cold;gauss-lobatto;host-route"
       TIMEOUT 300
+      RUN_SERIAL TRUE
+      PROCESSORS 2
+      SKIP_RETURN_CODE 75
+    )
+
+    add_test(NAME dgsem_vtk_restart_extrapolated_llf_p1_mpi_cpu
+      COMMAND /usr/bin/env python3
+              ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+              --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
+              --device cpu
+              --order 1
+              --extrapolated-llf
+              --mpi-ranks 2
+              --mpiexec ${MPIEXEC_EXECUTABLE}
+              --mpi-numproc-flag=${MPIEXEC_NUMPROC_FLAG}
+              --out-dir ${CMAKE_BINARY_DIR}/tests/dgsem-vtk-restart-extrapolated-llf-p1-mpi-cpu
+    )
+    set_tests_properties(
+      dgsem_vtk_restart_extrapolated_llf_p1_mpi_cpu PROPERTIES
+      LABELS "cpu-reference;mpi;dgsem;vtk;restart;cold;llf;igr;extrapolated;packed-production"
+      TIMEOUT 600
       RUN_SERIAL TRUE
       PROCESSORS 2
       SKIP_RETURN_CODE 75
@@ -750,6 +794,45 @@ if (TARGET dgsem_sedov_taylor_blast)
       RUN_SERIAL TRUE
       SKIP_RETURN_CODE 75
     )
+
+    add_test(NAME dgsem_vtk_restart_extrapolated_llf_p1_cuda
+      COMMAND /usr/bin/env python3
+              ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+              --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
+              --device cuda
+              --order 1
+              --extrapolated-llf
+              --out-dir ${CMAKE_BINARY_DIR}/tests/dgsem-vtk-restart-extrapolated-llf-p1-cuda
+    )
+    set_tests_properties(dgsem_vtk_restart_extrapolated_llf_p1_cuda PROPERTIES
+      LABELS "cuda;dgsem;vtk;restart;cold;llf;igr;extrapolated;packed-production"
+      TIMEOUT 600
+      RUN_SERIAL TRUE
+      SKIP_RETURN_CODE 75
+    )
+
+    if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
+      add_test(NAME dgsem_vtk_restart_extrapolated_llf_p1_mpi_cuda
+        COMMAND /usr/bin/env python3
+                ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+                --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
+                --device cuda
+                --order 1
+                --extrapolated-llf
+                --mpi-ranks 2
+                --mpiexec ${MPIEXEC_EXECUTABLE}
+                --mpi-numproc-flag=${MPIEXEC_NUMPROC_FLAG}
+                --out-dir ${CMAKE_BINARY_DIR}/tests/dgsem-vtk-restart-extrapolated-llf-p1-mpi-cuda
+      )
+      set_tests_properties(
+        dgsem_vtk_restart_extrapolated_llf_p1_mpi_cuda PROPERTIES
+        LABELS "cuda;mpi;dgsem;vtk;restart;cold;llf;igr;extrapolated;packed-production"
+        TIMEOUT 600
+        RUN_SERIAL TRUE
+        PROCESSORS 2
+        SKIP_RETURN_CODE 75
+      )
+    endif()
   endif()
 endif()
 
@@ -1050,6 +1133,40 @@ if (MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
     LABELS "mpi"
     TIMEOUT 120
   )
+
+  if(MFEM_USE_CUDA)
+    add_test(NAME dg_igr_dgsem_operator_mpi_2rank_cuda
+      COMMAND ${CMAKE_COMMAND} -E env
+              DG_IGR_TEST_DEVICE=cuda
+              DG_IGR_DGSEM_DEVICE=cuda
+              ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+              $<TARGET_FILE:dg_igr_unit_tests> --dgsem-operator
+              ${MPIEXEC_POSTFLAGS}
+    )
+    set_tests_properties(dg_igr_dgsem_operator_mpi_2rank_cuda PROPERTIES
+      LABELS "cuda;mpi;dgsem;production;llf"
+      TIMEOUT 180
+      RUN_SERIAL TRUE
+      PROCESSORS 2
+    )
+
+    add_test(NAME dg_igr_dgsem_operator_split_mpi_4rank_cuda
+      COMMAND ${CMAKE_COMMAND} -E env
+              DG_IGR_TEST_DEVICE=cuda
+              DG_IGR_DGSEM_DEVICE=cuda
+              DG_IGR_DGSEM_SPLIT_COMM_PROBE=1
+              ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+              $<TARGET_FILE:dg_igr_unit_tests> --dgsem-operator
+              ${MPIEXEC_POSTFLAGS}
+    )
+    set_tests_properties(
+      dg_igr_dgsem_operator_split_mpi_4rank_cuda PROPERTIES
+      LABELS "cuda;mpi;subcommunicator;dgsem;production;llf"
+      TIMEOUT 180
+      RUN_SERIAL TRUE
+      PROCESSORS 4
+    )
+  endif()
 
   add_test(NAME dg_igr_diagnostics_mpi_2rank
     COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}

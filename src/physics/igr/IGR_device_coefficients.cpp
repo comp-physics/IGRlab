@@ -169,146 +169,6 @@ void LogScalarQuadratureAudit(const char* name,
 
 } // namespace
 
-namespace igr_device
-{
-
-void LaunchExactElementBlockJacobiApply(
-  int elements,
-  int block_size,
-  const mfem::Vector& inverse_blocks,
-  const mfem::Vector& x,
-  mfem::Vector& y)
-{
-  const int vector_size = elements * block_size;
-  MFEM_VERIFY(elements > 0 && block_size > 0 &&
-                inverse_blocks.Size() == elements * block_size * block_size &&
-                x.Size() == vector_size,
-              "Exact element-block Jacobi apply received inconsistent "
-              "storage.");
-  y.SetSize(vector_size);
-#ifdef DG_IGR_HAS_ACCEL_FORALL
-  y.UseDevice(true);
-  IGRExactElementBlockJacobiKernel kernel;
-  kernel.block_size = block_size;
-  kernel.inverse_blocks = inverse_blocks.Read();
-  kernel.input = x.Read();
-  kernel.output = y.Write();
-  mfem::forall(vector_size, kernel);
-#else
-  const mfem::real_t* blocks = inverse_blocks.HostRead();
-  const mfem::real_t* input = x.HostRead();
-  mfem::real_t* output = y.HostWrite();
-  for (int entry = 0; entry < vector_size; ++entry)
-  {
-    const int element = entry / block_size;
-    const int row = entry - element * block_size;
-    mfem::real_t value = 0.0;
-    for (int column = 0; column < block_size; ++column)
-    {
-      value += blocks[row + block_size *
-                              (column + block_size * element)] *
-               input[column + block_size * element];
-    }
-    output[row + block_size * element] = value;
-  }
-#endif
-}
-
-void LaunchElementMeanProjection(int elements,
-                                 int block_size,
-                                 const mfem::Vector& x,
-                                 mfem::Vector& y)
-{
-  const int vector_size = elements * block_size;
-  MFEM_VERIFY(elements > 0 && block_size > 0 && x.Size() == vector_size,
-              "Element mean projection received inconsistent storage.");
-  y.SetSize(vector_size);
-#ifdef DG_IGR_HAS_ACCEL_FORALL
-  y.UseDevice(true);
-  IGRElementMeanProjectionKernel kernel;
-  kernel.block_size = block_size;
-  kernel.input = x.Read();
-  kernel.output = y.Write();
-  mfem::forall(elements, kernel);
-#else
-  const mfem::real_t* input = x.HostRead();
-  mfem::real_t* output = y.HostWrite();
-  for (int element = 0; element < elements; ++element)
-  {
-    mfem::real_t mean = 0.0;
-    for (int local = 0; local < block_size; ++local)
-    {
-      mean += input[local + block_size * element];
-    }
-    mean /= static_cast<mfem::real_t>(block_size);
-    for (int local = 0; local < block_size; ++local)
-    {
-      output[local + block_size * element] =
-        input[local + block_size * element] - mean;
-    }
-  }
-#endif
-}
-
-void LaunchElementConstantRestriction(int elements,
-                                      int block_size,
-                                      const mfem::Vector& x,
-                                      mfem::Vector& coarse)
-{
-  MFEM_VERIFY(elements > 0 && block_size > 0 &&
-                x.Size() == elements * block_size,
-              "Element constant restriction received inconsistent storage.");
-  coarse.SetSize(elements);
-#ifdef DG_IGR_HAS_ACCEL_FORALL
-  coarse.UseDevice(true);
-  IGRElementConstantRestrictionKernel kernel;
-  kernel.block_size = block_size;
-  kernel.input = x.Read();
-  kernel.coarse = coarse.Write();
-  mfem::forall(elements, kernel);
-#else
-  const mfem::real_t* input = x.HostRead();
-  mfem::real_t* output = coarse.HostWrite();
-  for (int element = 0; element < elements; ++element)
-  {
-    mfem::real_t value = 0.0;
-    for (int local = 0; local < block_size; ++local)
-    {
-      value += input[local + block_size * element];
-    }
-    output[element] = value;
-  }
-#endif
-}
-
-void LaunchElementConstantProlongation(int elements,
-                                       int block_size,
-                                       const mfem::Vector& coarse,
-                                       mfem::Vector& y)
-{
-  const int vector_size = elements * block_size;
-  MFEM_VERIFY(elements > 0 && block_size > 0 && coarse.Size() == elements,
-              "Element constant prolongation received inconsistent storage.");
-  y.SetSize(vector_size);
-#ifdef DG_IGR_HAS_ACCEL_FORALL
-  y.UseDevice(true);
-  IGRElementConstantProlongationKernel kernel;
-  kernel.block_size = block_size;
-  kernel.coarse = coarse.Read();
-  kernel.output = y.Write();
-  mfem::forall(vector_size, kernel);
-#else
-  const mfem::real_t* input = coarse.HostRead();
-  mfem::real_t* output = y.HostWrite();
-  for (int entry = 0; entry < vector_size; ++entry)
-  {
-    output[entry] = input[entry / block_size];
-  }
-#endif
-}
-
-} // namespace igr_device
-
 void IGRSolver::EnsureH1VelocitySpace_()
 {
   if (backend_ != GradBackend::H1Projection)
@@ -362,33 +222,16 @@ void IGRSolver::EnsureDeviceQuadrature_()
   const long vfes_seq = vfes_.GetSequence();
 
   const mfem::FiniteElement& sigma_fe = *sfes_.GetFE(0);
-  const int state_order = SpaceOrder(vfes_);
-  const int state_coefficient_order = 2 * state_order;
   mfem::ElementTransformation* typical_T =
     mesh->GetTypicalElementTransformation();
   MFEM_VERIFY(typical_T,
               "IGR device coefficients require a typical element transform.");
-  const mfem::IntegrationRule& native_mass_ir =
-    mfem::MassIntegrator::GetRule(sigma_fe, sigma_fe, *typical_T);
-  const mfem::IntegrationRule& native_diff_ir =
-    mfem::DiffusionIntegrator::GetRule(sigma_fe, sigma_fe);
-  // The coefficients and source are reconstructed from the Euler state, not
-  // from the (possibly lower-order) sigma space.  A mixed-order closure must
-  // therefore retain enough quadrature to see the supplied state.  Otherwise
-  // p2/p3 Euler with p0/p1 sigma silently aliases the nonlinear 1/rho and
-  // velocity-gradient data at the sigma rule.
-  const int mass_rule_order =
-    std::max(native_mass_ir.GetOrder(), state_coefficient_order);
-  const int diff_rule_order =
-    std::max(native_diff_ir.GetOrder(), state_coefficient_order);
-  const int rhs_rule_order =
-    std::max(2 * sigma_fe.GetOrder(), state_coefficient_order);
   const mfem::IntegrationRule& mass_ir =
-    mfem::IntRules.Get(sigma_fe.GetGeomType(), mass_rule_order);
+    mfem::MassIntegrator::GetRule(sigma_fe, sigma_fe, *typical_T);
   const mfem::IntegrationRule& diff_ir =
-    mfem::IntRules.Get(sigma_fe.GetGeomType(), diff_rule_order);
+    mfem::DiffusionIntegrator::GetRule(sigma_fe, sigma_fe);
   const mfem::IntegrationRule& rhs_ir =
-    mfem::IntRules.Get(sigma_fe.GetGeomType(), rhs_rule_order);
+    mfem::IntRules.Get(sigma_fe.GetGeomType(), 2 * sigma_fe.GetOrder());
   const int mass_qorder = mass_ir.GetOrder();
   const int diff_qorder = diff_ir.GetOrder();
   const int rhs_qorder = rhs_ir.GetOrder();

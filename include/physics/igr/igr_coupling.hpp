@@ -57,6 +57,41 @@ public:
   virtual long long GetSigmaPrefetchInvalidationCount() const = 0;
   virtual long long GetSigmaEndpointSolveCount() const { return 0; }
   virtual long long GetSigmaExtrapolatedStageCount() const { return 0; }
+  virtual long long GetSigmaExactCertificateCount() const { return 0; }
+  virtual double GetMaximumLocalSigmaExactCertificateResidualRelRHS() const
+  {
+    return 0.0;
+  }
+  virtual double GetMaximumLocalSigmaExactCertificateRelativeLimit() const
+  {
+    return 0.0;
+  }
+  virtual double GetMaximumLocalSigmaExactCertificateResidualAbs() const
+  {
+    return 0.0;
+  }
+  virtual double GetMaximumLocalSigmaExactCertificateAbsoluteLimit() const
+  {
+    return 0.0;
+  }
+  virtual double GetMaximumLocalSigmaExactCertificateAcceptanceRatio() const
+  {
+    return 0.0;
+  }
+  virtual double
+  GetMaximumLocalSigmaExactCertificateRelativePassResidualRelRHS() const
+  {
+    return 0.0;
+  }
+  virtual double
+  GetMaximumLocalSigmaExactCertificateAbsoluteOnlyResidualAbs() const
+  {
+    return 0.0;
+  }
+  virtual long long GetSigmaExactCertificateAbsoluteOnlyPassCount() const
+  {
+    return 0;
+  }
   virtual std::uint64_t GetSigmaStageAdmissionRejectionCount() const
   {
     return 0;
@@ -114,6 +149,29 @@ public:
   bool RequiresRKStepTransaction() const override
   {
     return IsExtrapolatedEveryStep();
+  }
+
+  /** Bound variable-step growth while two accepted anchors are extrapolated.
+   *
+   * Save-time clipping and a rapidly changing CFL estimate can otherwise make
+   * h_n/h_{n-1} arbitrarily large.  Keeping the ratio at most two bounds every
+   * physical-time extrapolation coefficient without changing the
+   * instantaneous endpoint closure. Other cadence policies are untouched.
+   */
+  real_t LimitProposedRKStepSize(real_t proposed_dt) const
+  {
+    MFEM_VERIFY(std::isfinite(proposed_dt) && proposed_dt > 0.0,
+                "IGR step-size limiting requires a finite positive proposal.");
+    if (!IsExtrapolatedEveryStep() || !extrapolated_previous_valid_)
+    {
+      return proposed_dt;
+    }
+    MFEM_VERIFY(std::isfinite(extrapolated_previous_dt_) &&
+                  extrapolated_previous_dt_ > 0.0,
+                "Extrapolated IGR history has an invalid accepted timestep.");
+    constexpr real_t kMaximumAcceptedStepRatio = 2.0;
+    return std::min(proposed_dt,
+                    kMaximumAcceptedStepRatio * extrapolated_previous_dt_);
   }
 
   void BeginRKStep(int step, real_t t, real_t dt) override
@@ -290,7 +348,7 @@ public:
       ParGridFunction restored_grid_state(state_.ParFESpace(),
                                           const_cast<Vector&>(restored_state),
                                           /*base_offset=*/0);
-      if (mfem::Mpi::WorldSize() > 1)
+      if (HasMultipleOwningRanks())
       {
         restored_grid_state.ExchangeFaceNbrData();
       }
@@ -428,9 +486,8 @@ public:
         result.independent_residual_absolute_limit =
           igr_.GetLastIndependentCertificateAbsoluteLimit();
         result.independent_residual_certified =
-          certify_residual && igr_.GetLastLinearConverged() &&
-          std::isfinite(result.independent_residual_rel_rhs);
-        if (mfem::Mpi::WorldSize() > 1)
+          certify_residual && igr_.GetLastLinearConverged();
+        if (HasMultipleOwningRanks())
         {
           igr_.GetSigma().ExchangeFaceNbrData();
         }
@@ -478,9 +535,8 @@ public:
       result.independent_residual_absolute_limit =
         igr_.GetLastIndependentCertificateAbsoluteLimit();
       result.independent_residual_certified =
-        certify_residual && igr_.GetLastLinearConverged() &&
-        std::isfinite(result.independent_residual_rel_rhs);
-      if (mfem::Mpi::WorldSize() > 1)
+        certify_residual && igr_.GetLastLinearConverged();
+      if (HasMultipleOwningRanks())
       {
         igr_.GetSigma().ExchangeFaceNbrData();
       }
@@ -538,6 +594,45 @@ public:
   long long GetSigmaExtrapolatedStageCount() const override
   {
     return sigma_extrapolated_stage_count_;
+  }
+  long long GetSigmaExactCertificateCount() const override
+  {
+    return sigma_exact_certificate_count_;
+  }
+  double GetMaximumLocalSigmaExactCertificateResidualRelRHS() const override
+  {
+    return maximum_local_sigma_exact_certificate_residual_rel_rhs_;
+  }
+  double GetMaximumLocalSigmaExactCertificateRelativeLimit() const override
+  {
+    return maximum_local_sigma_exact_certificate_relative_limit_;
+  }
+  double GetMaximumLocalSigmaExactCertificateResidualAbs() const override
+  {
+    return maximum_local_sigma_exact_certificate_residual_abs_;
+  }
+  double GetMaximumLocalSigmaExactCertificateAbsoluteLimit() const override
+  {
+    return maximum_local_sigma_exact_certificate_absolute_limit_;
+  }
+  double GetMaximumLocalSigmaExactCertificateAcceptanceRatio() const override
+  {
+    return maximum_local_sigma_exact_certificate_acceptance_ratio_;
+  }
+  double
+  GetMaximumLocalSigmaExactCertificateRelativePassResidualRelRHS()
+    const override
+  {
+    return maximum_local_sigma_exact_certificate_relative_pass_residual_rel_rhs_;
+  }
+  double GetMaximumLocalSigmaExactCertificateAbsoluteOnlyResidualAbs()
+    const override
+  {
+    return maximum_local_sigma_exact_certificate_absolute_only_residual_abs_;
+  }
+  long long GetSigmaExactCertificateAbsoluteOnlyPassCount() const override
+  {
+    return sigma_exact_certificate_absolute_only_pass_count_;
   }
   std::uint64_t GetSigmaStageAdmissionRejectionCount() const override
   {
@@ -598,6 +693,69 @@ public:
   IGRFrozenSigmaTelemetry GetGlobalFrozenSigmaTelemetry() const override
   {
     return base_.GetGlobalFrozenSigmaTelemetry();
+  }
+
+  /** Prepare and inspect the exact algebraic state at an accepted step boundary.
+   *
+   * The extrapolated method must not use the modulus continuation of a
+   * non-hyperbolic frozen-sigma flux to choose its initial/restart CFL step.
+   * This hook is called before the time loop's first CFL RHS: it constructs (or
+   * reuses) the exact accepted sigma anchor and performs the same fresh packed
+   * FP64 q_sigma scan used at accepted endpoints, without evaluating an Euler
+   * residual.  Non-extrapolated library users retain their existing behavior.
+   */
+  IGRFrozenSigmaTelemetry InspectAcceptedStateForTransport(
+    const Vector& state,
+    real_t time) const
+  {
+    IGRFrozenSigmaTelemetry unsupported;
+    if (!IsExtrapolatedEveryStep())
+    {
+      return unsupported;
+    }
+    MFEM_VERIFY(!rk_step_snapshot_.active,
+                "Accepted-state q_sigma admission requires an RK step "
+                "boundary.");
+    MFEM_VERIFY(&state == static_cast<const Vector*>(&state_),
+                "Accepted-state q_sigma admission requires the bound "
+                "conservative state.");
+    MFEM_VERIFY(std::isfinite(time),
+                "Accepted-state q_sigma admission requires a finite time.");
+    base_.SetTime(time);
+    igr_.SetCurrentTime(time);
+
+    const bool restore_accepted_anchor =
+      PrepareExtrapolatedNonStageSigma(state);
+    MFEM_VERIFY(!restore_accepted_anchor,
+                "Accepted-state q_sigma admission unexpectedly prepared a "
+                "temporary algebraic state.");
+    const IGRFrozenSigmaTelemetry admission =
+      base_.InspectFrozenSigmaStateForAdmission(state);
+    if (!admission.enabled)
+    {
+      MFEM_VERIFY(base_.GetVolumeMode() != VolumeMode::DGSEMFluxDiff,
+                  "Extrapolated IGR with DGSEM requires a fresh packed "
+                  "q_sigma accepted-state admission scan.");
+      return admission;
+    }
+    MFEM_VERIFY(admission.sample_count > 0,
+                "Extrapolated IGR accepted-state admission produced no fresh "
+                "q_sigma samples.");
+
+    if (admission.nonpositive_count > 0 || admission.nonfinite_count > 0)
+    {
+      RecordExtrapolatedQSigmaAdmissionFailure(
+        admission.nonpositive_count, admission.nonfinite_count);
+      // An output/restart preparation may have left its exact solve pending as
+      // a stage-0 prefetch.  No RK stage will consume it after this fail-fast
+      // admission, so settle that measured work without changing live sigma.
+      if (extrapolated_stage0_reuse_pending_)
+      {
+        AbandonPendingStage0Prefetch(/*restore_warm_start=*/false);
+        extrapolated_stage0_reuse_pending_ = false;
+      }
+    }
+    return admission;
   }
 
   void Mult(const Vector& U, Vector& dUdt) const override
@@ -712,7 +870,7 @@ public:
         igr_.UpdateFromState(stage_state, /*warm_start=*/true);
 
         // Make sigma available on face neighbors across MPI subdomains.
-        if (mfem::Mpi::WorldSize() > 1)
+        if (HasMultipleOwningRanks())
         {
           igr_.GetSigma().ExchangeFaceNbrData();
         }
@@ -775,11 +933,58 @@ private:
            ::dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
   }
 
+  bool HasMultipleOwningRanks() const
+  {
+#ifdef MFEM_USE_MPI
+    if (mfem::Mpi::IsInitialized() && !mfem::Mpi::IsFinalized())
+    {
+      int size = 1;
+      MPI_Comm_size(state_.ParFESpace()->GetComm(), &size);
+      return size > 1;
+    }
+#endif
+    return false;
+  }
+
   static void SaturatingAdd(std::uint64_t& total, std::uint64_t increment)
   {
     const std::uint64_t maximum =
       std::numeric_limits<std::uint64_t>::max();
     total = increment > maximum - total ? maximum : total + increment;
+  }
+
+  void RecordExtrapolatedQSigmaAdmissionFailure(
+    std::uint64_t new_nonpositive,
+    std::uint64_t new_nonfinite) const
+  {
+    SaturatingAdd(sigma_stage_admission_rejection_count_, 1);
+    SaturatingAdd(sigma_stage_admission_nonpositive_sample_count_,
+                  new_nonpositive);
+    SaturatingAdd(sigma_stage_admission_nonfinite_sample_count_,
+                  new_nonfinite);
+    last_sigma_stage_admission_failure_reason_ =
+      new_nonpositive > 0 && new_nonfinite > 0
+        ? RKStageAdmissionFailureReason::QSigmaNonpositiveAndNonfinite
+        : (new_nonfinite > 0
+             ? RKStageAdmissionFailureReason::QSigmaNonfinite
+             : RKStageAdmissionFailureReason::QSigmaNonpositive);
+  }
+
+  void RejectExtrapolatedQSigmaAdmission(std::uint64_t new_nonpositive,
+                                         std::uint64_t new_nonfinite,
+                                         int stage) const
+  {
+    if (new_nonpositive == 0 && new_nonfinite == 0)
+    {
+      return;
+    }
+
+    RecordExtrapolatedQSigmaAdmissionFailure(new_nonpositive, new_nonfinite);
+    throw RecoverableRKStageAdmissionFailure(
+      last_sigma_stage_admission_failure_reason_,
+      new_nonpositive,
+      new_nonfinite,
+      stage);
   }
 
   void AdmitExtrapolatedStageRHS() const
@@ -797,6 +1002,9 @@ private:
       base_.GetGlobalFrozenSigmaTelemetry();
     const IGRFrozenSigmaTelemetry before =
       extrapolated_q_sigma_rhs_baseline_;
+    MFEM_VERIFY(after.enabled && after.sample_count > before.sample_count,
+                "Extrapolated IGR stage admission requires fresh q_sigma "
+                "telemetry from every completed RHS evaluation.");
     MFEM_VERIFY(after.nonpositive_count >= before.nonpositive_count &&
                   after.nonfinite_count >= before.nonfinite_count &&
                   after.sample_count >= before.sample_count,
@@ -807,28 +1015,9 @@ private:
     const std::uint64_t new_nonfinite =
       after.nonfinite_count - before.nonfinite_count;
     extrapolated_q_sigma_rhs_baseline_ = after;
-
-    if (new_nonpositive == 0 && new_nonfinite == 0)
-    {
-      return;
-    }
-
-    SaturatingAdd(sigma_stage_admission_rejection_count_, 1);
-    SaturatingAdd(sigma_stage_admission_nonpositive_sample_count_,
-                  new_nonpositive);
-    SaturatingAdd(sigma_stage_admission_nonfinite_sample_count_,
-                  new_nonfinite);
-    last_sigma_stage_admission_failure_reason_ =
-      new_nonpositive > 0 && new_nonfinite > 0
-        ? RKStageAdmissionFailureReason::QSigmaNonpositiveAndNonfinite
-        : (new_nonfinite > 0
-             ? RKStageAdmissionFailureReason::QSigmaNonfinite
-             : RKStageAdmissionFailureReason::QSigmaNonpositive);
-    throw RecoverableRKStageAdmissionFailure(
-      last_sigma_stage_admission_failure_reason_,
-      new_nonpositive,
-      new_nonfinite,
-      rk_stage_);
+    RejectExtrapolatedQSigmaAdmission(new_nonpositive,
+                                      new_nonfinite,
+                                      rk_stage_);
   }
 
   void CommitExtrapolatedCurrentAnchor(std::uint64_t state_generation,
@@ -852,7 +1041,7 @@ private:
     MFEM_VERIFY(extrapolated_current_valid_,
                 "Extrapolated IGR has no accepted anchor to restore.");
     igr_.GetSigma() = extrapolated_current_sigma_;
-    if (mfem::Mpi::WorldSize() > 1)
+    if (HasMultipleOwningRanks())
     {
       igr_.GetSigma().ExchangeFaceNbrData();
     }
@@ -866,7 +1055,7 @@ private:
                               real_t time,
                               bool warm_start,
                               ::dg_igr::IGRSolvePurpose purpose,
-                              bool certify_residual) const
+                              bool /*certify_residual*/) const
   {
     MFEM_VERIFY(!igr_.HasPendingStage0PrefetchAccounting(),
                 "Extrapolated IGR coupling cannot consume a stage-0 "
@@ -875,10 +1064,107 @@ private:
     igr_.SetRKStageIndex(-1);
     igr_.SetCurrentTime(time);
     igr_.SetCurrentTimeStep(std::numeric_limits<real_t>::quiet_NaN());
-    igr_.UpdateFromState(state, warm_start, purpose, certify_residual);
+    // Every exact anchor can influence the future DAE trajectory.  A final
+    // endpoint projection cannot repair algebraic error already injected by
+    // an under-solved earlier anchor, so the extrapolated route always gates
+    // these solves with an independently recomputed FP64 residual.
+    MFEM_VERIFY(igr_.GetSolveMode() == ::dg_igr::IGRSolveMode::Krylov,
+                "Extrapolated IGR exact anchors require a Krylov solve for "
+                "independent FP64 residual certification.");
+    igr_.UpdateFromState(state,
+                         warm_start,
+                         purpose,
+                         /*certify_residual=*/true);
+    const double certificate_residual =
+      igr_.GetLastLinearTrueResidualRelRHS();
+    const double certificate_limit =
+      igr_.GetLastIndependentCertificateRelativeLimit();
+    const double certificate_residual_abs =
+      igr_.GetLastLinearTrueResidualAbs();
+    const double certificate_absolute_limit =
+      igr_.GetLastIndependentCertificateAbsoluteLimit();
+    const bool relative_pass = std::isfinite(certificate_residual) &&
+                               std::isfinite(certificate_limit) &&
+                               certificate_residual <= certificate_limit;
+    const bool absolute_pass = std::isfinite(certificate_residual_abs) &&
+                               std::isfinite(certificate_absolute_limit) &&
+                               certificate_residual_abs <=
+                                 certificate_absolute_limit;
+    const auto normalized_residual = [](double residual, double limit)
+    {
+      if (!std::isfinite(residual) || !std::isfinite(limit) ||
+          residual < 0.0 || limit < 0.0)
+      {
+        return std::numeric_limits<double>::infinity();
+      }
+      if (limit == 0.0)
+      {
+        return residual == 0.0
+                 ? 0.0
+                 : std::numeric_limits<double>::infinity();
+      }
+      return residual / limit;
+    };
+    const double certificate_acceptance_ratio =
+      std::min(normalized_residual(certificate_residual, certificate_limit),
+               normalized_residual(certificate_residual_abs,
+                                   certificate_absolute_limit));
+    MFEM_VERIFY(igr_.GetLastLinearConverged() &&
+                  (relative_pass || absolute_pass) &&
+                  std::isfinite(certificate_acceptance_ratio) &&
+                  certificate_acceptance_ratio <= 1.0,
+                "Extrapolated IGR exact-anchor FP64 residual certificate "
+                "failed: residual_rel_rhs="
+                  << certificate_residual << " relative_limit="
+                  << certificate_limit << " residual_abs="
+                  << certificate_residual_abs << " absolute_limit="
+                  << certificate_absolute_limit << ".");
+    ++sigma_exact_certificate_count_;
+    if (!relative_pass && absolute_pass)
+    {
+      ++sigma_exact_certificate_absolute_only_pass_count_;
+      maximum_local_sigma_exact_certificate_absolute_only_residual_abs_ =
+        std::max(
+          maximum_local_sigma_exact_certificate_absolute_only_residual_abs_,
+          certificate_residual_abs);
+    }
+    if (relative_pass)
+    {
+      maximum_local_sigma_exact_certificate_relative_pass_residual_rel_rhs_ =
+        std::max(
+          maximum_local_sigma_exact_certificate_relative_pass_residual_rel_rhs_,
+          certificate_residual);
+    }
+    maximum_local_sigma_exact_certificate_acceptance_ratio_ =
+      std::max(maximum_local_sigma_exact_certificate_acceptance_ratio_,
+               certificate_acceptance_ratio);
+    if (std::isfinite(certificate_residual))
+    {
+      maximum_local_sigma_exact_certificate_residual_rel_rhs_ =
+        std::max(maximum_local_sigma_exact_certificate_residual_rel_rhs_,
+                 certificate_residual);
+    }
+    if (std::isfinite(certificate_limit))
+    {
+      maximum_local_sigma_exact_certificate_relative_limit_ =
+        std::max(maximum_local_sigma_exact_certificate_relative_limit_,
+                 certificate_limit);
+    }
+    if (std::isfinite(certificate_residual_abs))
+    {
+      maximum_local_sigma_exact_certificate_residual_abs_ =
+        std::max(maximum_local_sigma_exact_certificate_residual_abs_,
+                 certificate_residual_abs);
+    }
+    if (std::isfinite(certificate_absolute_limit))
+    {
+      maximum_local_sigma_exact_certificate_absolute_limit_ =
+        std::max(maximum_local_sigma_exact_certificate_absolute_limit_,
+                 certificate_absolute_limit);
+    }
     MFEM_VERIFY(igr_.GetSigma().CheckFinite() == 0,
                 "Extrapolated IGR exact closure produced a non-finite field.");
-    if (mfem::Mpi::WorldSize() > 1)
+    if (HasMultipleOwningRanks())
     {
       igr_.GetSigma().ExchangeFaceNbrData();
     }
@@ -933,8 +1219,7 @@ private:
       result.independent_residual_absolute_limit =
         igr_.GetLastIndependentCertificateAbsoluteLimit();
       result.independent_residual_certified =
-        certify_residual && igr_.GetLastLinearConverged() &&
-        std::isfinite(result.independent_residual_rel_rhs);
+        certify_residual && igr_.GetLastLinearConverged();
 
       // A cold or mismatched anchor has no trustworthy predecessor. A
       // same-generation certificate only tightens the current endpoint and
@@ -1003,7 +1288,7 @@ private:
                            base_.GetTime(),
                            /*warm_start=*/extrapolated_current_valid_,
                            ::dg_igr::IGRSolvePurpose::ProductionStage,
-                           /*certify_residual=*/false);
+                           /*certify_residual=*/true);
     if (!restore_accepted_anchor)
     {
       CommitExtrapolatedCurrentAnchor(generation, /*reset_history=*/true);
@@ -1105,7 +1390,7 @@ private:
     igr_.GetSigma().Add(theta, extrapolated_attempt_delta_);
     MFEM_VERIFY(igr_.GetSigma().CheckFinite() == 0,
                 "Extrapolated IGR stage prediction is non-finite.");
-    if (mfem::Mpi::WorldSize() > 1)
+    if (HasMultipleOwningRanks())
     {
       igr_.GetSigma().ExchangeFaceNbrData();
     }
@@ -1149,6 +1434,32 @@ private:
                            ::dg_igr::IGRSolvePurpose::ProductionStage,
                            /*certify_residual=*/false);
     ++sigma_endpoint_solve_count_;
+
+    // The terminal limiter ran before this exact algebraic reconstruction.
+    // Re-scan the accepted conservative state with the reconstructed sigma:
+    // an admissible stage history does not imply q_sigma > 0 at the exact
+    // endpoint. Packed DGSEM reuses its gather/exchange and FP64 scans here
+    // without paying for another residual. Throwing before any endpoint
+    // history is committed lets the outer step transaction restore the
+    // producing state and immutable accepted sigma anchor before retrying.
+    const IGRFrozenSigmaTelemetry endpoint_admission =
+      base_.InspectFrozenSigmaStateForAdmission(state);
+    if (!endpoint_admission.enabled)
+    {
+      MFEM_VERIFY(base_.GetVolumeMode() != VolumeMode::DGSEMFluxDiff,
+                  "Extrapolated IGR with DGSEM requires a fresh packed "
+                  "q_sigma endpoint admission scan.");
+    }
+    else
+    {
+      MFEM_VERIFY(endpoint_admission.sample_count > 0,
+                  "Extrapolated IGR endpoint admission produced no fresh "
+                  "q_sigma samples.");
+      RejectExtrapolatedQSigmaAdmission(
+        endpoint_admission.nonpositive_count,
+        endpoint_admission.nonfinite_count,
+        /*stage=*/-1);
+    }
 
     extrapolated_endpoint_defect_work_ = igr_.GetSigma();
     extrapolated_endpoint_defect_work_ -= extrapolated_endpoint_prediction_;
@@ -1197,7 +1508,7 @@ private:
         extrapolated_current_generation_ == restored_state_generation)
     {
       igr_.GetSigma() = extrapolated_current_sigma_;
-      if (mfem::Mpi::WorldSize() > 1)
+      if (HasMultipleOwningRanks())
       {
         igr_.GetSigma().ExchangeFaceNbrData();
       }
@@ -1311,7 +1622,7 @@ private:
                 "Temporary output sigma unexpectedly owns production "
                 "prefetch accounting.");
     igr_.GetSigma() = temporary_output_snapshot_.sigma;
-    if (mfem::Mpi::WorldSize() > 1)
+    if (HasMultipleOwningRanks())
     {
       igr_.GetSigma().ExchangeFaceNbrData();
     }
@@ -1450,6 +1761,18 @@ private:
     std::numeric_limits<real_t>::quiet_NaN();
   mutable long long sigma_endpoint_solve_count_ = 0;
   mutable long long sigma_extrapolated_stage_count_ = 0;
+  mutable long long sigma_exact_certificate_count_ = 0;
+  mutable double maximum_local_sigma_exact_certificate_residual_rel_rhs_ =
+    0.0;
+  mutable double maximum_local_sigma_exact_certificate_relative_limit_ = 0.0;
+  mutable double maximum_local_sigma_exact_certificate_residual_abs_ = 0.0;
+  mutable double maximum_local_sigma_exact_certificate_absolute_limit_ = 0.0;
+  mutable double maximum_local_sigma_exact_certificate_acceptance_ratio_ = 0.0;
+  mutable double
+    maximum_local_sigma_exact_certificate_relative_pass_residual_rel_rhs_ = 0.0;
+  mutable double
+    maximum_local_sigma_exact_certificate_absolute_only_residual_abs_ = 0.0;
+  mutable long long sigma_exact_certificate_absolute_only_pass_count_ = 0;
   mutable IGRFrozenSigmaTelemetry extrapolated_q_sigma_rhs_baseline_;
   mutable bool extrapolated_q_sigma_rhs_baseline_valid_ = false;
   mutable std::uint64_t sigma_stage_admission_rejection_count_ = 0;

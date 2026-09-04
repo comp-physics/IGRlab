@@ -41,12 +41,15 @@ using tinyxml2::XMLElement;
 
 constexpr int legacy_manifest_schema = 1;
 constexpr int typed_integrator_manifest_schema = 2;
-constexpr int current_manifest_schema = 3;
+constexpr int static_source_manifest_schema = 3;
+constexpr int transport_manifest_schema = 4;
+constexpr int current_manifest_schema = transport_manifest_schema;
 
 bool IsSupportedManifestSchema(int schema)
 {
   return schema == legacy_manifest_schema ||
          schema == typed_integrator_manifest_schema ||
+         schema == static_source_manifest_schema ||
          schema == current_manifest_schema;
 }
 
@@ -68,7 +71,6 @@ struct Manifest
   int dim = -1;
   int equations = -1;
   int order = -1;
-  int igr_sigma_order = -1;
   int serial_refinement = -1;
   int parallel_refinement = -1;
   bool igr_enabled = false;
@@ -84,6 +86,11 @@ struct Manifest
   std::string case_name;
   std::string dg_backend;
   std::string time_integrator;
+  std::string dgsem_stabilization;
+  std::string dgsem_volume_flux;
+  std::string dgsem_volume_dissipation;
+  std::string dgsem_surface_flux;
+  std::string dgsem_entropy_jacobian;
   std::string basis;
   std::string ordering;
   std::string data_type;
@@ -94,6 +101,7 @@ struct Manifest
   std::string alpha_length_policy;
   std::string ip_kind;
   std::string sigma_cadence;
+  std::string sigma_restart_policy;
   bool static_source_present = false;
   std::string static_source_fingerprint;
 };
@@ -386,6 +394,7 @@ std::string BackendName(const RunConfig& run_cfg);
 std::string BasisName(const RunConfig& run_cfg);
 std::string IGRSpaceName(const RunConfig& run_cfg);
 std::string IGRGradName(const RunConfig& run_cfg);
+std::string SigmaRestartPolicy(const RunConfig& run_cfg);
 void ValidateManifest(const Manifest& manifest,
                       const PVDEntry& entry,
                       const RunConfig& run_cfg,
@@ -867,14 +876,18 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
   {
     if (igr_enabled)
     {
-      const auto cadence = run_cfg.igr_opts.sigma_cadence.empty()
-                             ? run_cfg.case_config.igr_config.sigma_cadence
-                             : ParseIGRSigmaUpdateCadence(
-                                 run_cfg.igr_opts.sigma_cadence);
-      if (cadence != dg_igr::IGRSigmaUpdateCadence::EveryStage)
+      const auto cadence = ResolveEffectiveIGRSigmaUpdateCadence(run_cfg);
+      if (cadence != dg_igr::IGRSigmaUpdateCadence::EveryStage &&
+          cadence !=
+            dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep)
       {
-        Fail("production VTK restart requires every-stage IGR sigma updates");
+        Fail("production VTK restart supports only every-stage or "
+             "extrapolated-every-step IGR sigma updates");
       }
+      // Only conservative state is serialized. RunEulerCase passes a cold
+      // start to PrepareSigmaForOutput after this load, which exactly
+      // reconstructs the accepted sigma anchor and deliberately clears the
+      // extrapolation predecessor/history before the first resumed step.
       if (IsL2IGRSpaceName(run_cfg.igr_opts.space) &&
           IsBrokenDGIGRGradName(run_cfg.igr_opts.grad) &&
           !run_cfg.igr_opts.exact_dg_face_operator)
@@ -1174,6 +1187,16 @@ void WriteVTKRestartManifest(const std::string& dataset_dir,
   object["dg_backend"] = picojson::value(BackendName(run_cfg));
   object["time_integrator"] = picojson::value(
     std::string(TimeIntegratorToString(run_cfg.time_integrator)));
+  object["dgsem_stabilization"] = picojson::value(
+    std::string(DGSEMStabilizationToString(run_cfg.dgsem_stab)));
+  object["dgsem_volume_flux"] = picojson::value(
+    std::string(DGSEMVolumeFluxToString(run_cfg.dgsem_volume_flux)));
+  object["dgsem_volume_dissipation"] = picojson::value(std::string(
+    DGSEMVolumeDissipationToString(run_cfg.dgsem_volume_dissipation)));
+  object["dgsem_surface_flux"] = picojson::value(
+    std::string(DGSEMSurfaceFluxToString(run_cfg.dgsem_surface_flux)));
+  object["dgsem_entropy_jacobian"] = picojson::value(std::string(
+    DGSEMEntropyJacobianToString(run_cfg.dgsem_entropy_jacobian)));
   object["basis"] = picojson::value(BasisName(run_cfg));
   object["ordering"] = picojson::value(std::string("byNODES"));
   const auto vtk_config = MakeCaseVTKConfig(run_cfg.case_config);
@@ -1212,8 +1235,6 @@ void WriteVTKRestartManifest(const std::string& dataset_dir,
   object["igr_enabled"] = picojson::value(sigma_saved);
   object["igr_space"] = picojson::value(IGRSpaceName(run_cfg));
   object["igr_grad"] = picojson::value(IGRGradName(run_cfg));
-  object["igr_sigma_order"] = picojson::value(
-    static_cast<double>(ResolveIGRSigmaOrder(run_cfg)));
   object["c_alpha"] = picojson::value(
     run_cfg.igr_opts.c_alpha_user > 0.0 ? run_cfg.igr_opts.c_alpha_user : 1.0);
   object["alpha_length_policy"] = picojson::value(std::string(
@@ -1224,19 +1245,14 @@ void WriteVTKRestartManifest(const std::string& dataset_dir,
     picojson::value(run_cfg.igr_opts.exact_dg_face_operator);
   object["igr_invariant_domain_flux"] =
     picojson::value(run_cfg.igr_opts.igr_invariant_domain_flux);
-  const auto sigma_cadence = run_cfg.igr_opts.sigma_cadence.empty()
-                               ? run_cfg.case_config.igr_config.sigma_cadence
-                               : ParseIGRSigmaUpdateCadence(
-                                   run_cfg.igr_opts.sigma_cadence);
+  const auto sigma_cadence = ResolveEffectiveIGRSigmaUpdateCadence(run_cfg);
   object["sigma_cadence"] = picojson::value(
     std::string(IGRSigmaUpdateCadenceToString(sigma_cadence)));
   object["sigma_update_interval"] = picojson::value(static_cast<double>(
-    run_cfg.igr_opts.sigma_update_interval > 0
-      ? run_cfg.igr_opts.sigma_update_interval
-      : run_cfg.case_config.igr_config.sigma_update_interval));
+    ResolveEffectiveIGRSigmaUpdateInterval(run_cfg)));
   object["sigma_saved"] = picojson::value(sigma_saved);
   object["sigma_restart_policy"] =
-    picojson::value(std::string("cold-recompute-from-conservative-state"));
+    picojson::value(SigmaRestartPolicy(run_cfg));
 
   std::ostringstream cycle_name;
   cycle_name << "Cycle" << std::setfill('0') << std::setw(6) << cycle;
@@ -1480,10 +1496,6 @@ Manifest ReadManifest(const fs::path& path)
   result.dim = static_cast<int>(JSONLong(object, "dimension"));
   result.equations = static_cast<int>(JSONLong(object, "equations"));
   result.order = static_cast<int>(JSONLong(object, "order"));
-  result.igr_sigma_order = object.find("igr_sigma_order") != object.end()
-                             ? static_cast<int>(
-                                 JSONLong(object, "igr_sigma_order"))
-                             : result.order;
   result.serial_refinement =
     static_cast<int>(JSONLong(object, "serial_refinement"));
   result.parallel_refinement =
@@ -1506,8 +1518,7 @@ Manifest ReadManifest(const fs::path& path)
   result.alpha_length_policy = JSONString(object, "alpha_length_policy");
   result.ip_kind = JSONString(object, "ip_kind");
   result.sigma_cadence = JSONString(object, "sigma_cadence");
-  if (result.schema == typed_integrator_manifest_schema ||
-      result.schema == current_manifest_schema)
+  if (result.schema >= typed_integrator_manifest_schema)
   {
     result.time_integrator = JSONString(object, "time_integrator");
     result.igr_invariant_domain_flux =
@@ -1525,7 +1536,7 @@ Manifest ReadManifest(const fs::path& path)
     result.time_integrator = "rk3ssp";
     result.igr_invariant_domain_flux = false;
   }
-  if (result.schema == current_manifest_schema)
+  if (result.schema >= static_source_manifest_schema)
   {
     result.static_source_present =
       JSONBool(object, "static_source_present");
@@ -1538,6 +1549,19 @@ Manifest ReadManifest(const fs::path& path)
     // usable only when the active run is source-free.
     result.static_source_present = false;
     result.static_source_fingerprint = "none";
+  }
+  if (result.schema >= transport_manifest_schema)
+  {
+    result.dgsem_stabilization =
+      JSONString(object, "dgsem_stabilization");
+    result.dgsem_volume_flux = JSONString(object, "dgsem_volume_flux");
+    result.dgsem_volume_dissipation =
+      JSONString(object, "dgsem_volume_dissipation");
+    result.dgsem_surface_flux = JSONString(object, "dgsem_surface_flux");
+    result.dgsem_entropy_jacobian =
+      JSONString(object, "dgsem_entropy_jacobian");
+    result.sigma_restart_policy =
+      JSONString(object, "sigma_restart_policy");
   }
   return result;
 }
@@ -1569,6 +1593,14 @@ std::string IGRGradName(const RunConfig& run_cfg)
   return IsBrokenDGIGRGradName(run_cfg.igr_opts.grad) ? "brokenl2" : "h1";
 }
 
+std::string SigmaRestartPolicy(const RunConfig& run_cfg)
+{
+  return ResolveEffectiveIGRSigmaUpdateCadence(run_cfg) ==
+           dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep
+           ? "cold-recompute-and-reset-extrapolation-history"
+           : "cold-recompute-from-conservative-state";
+}
+
 void ValidateManifest(const Manifest& manifest,
                       const PVDEntry& entry,
                       const RunConfig& run_cfg,
@@ -1598,12 +1630,13 @@ void ValidateManifest(const Manifest& manifest,
     Fail("restart manifest schema 1 is compatible only with rk3ssp and "
          "invariant-domain flux and VTK-point limiter enforcement disabled");
   }
-  if (manifest.schema < current_manifest_schema && static_source != nullptr)
+  if (manifest.schema < static_source_manifest_schema &&
+      static_source != nullptr)
   {
     Fail("restart manifest schema " + std::to_string(manifest.schema) +
          " cannot certify the active static source");
   }
-  if (manifest.schema == current_manifest_schema)
+  if (manifest.schema >= static_source_manifest_schema)
   {
     const bool active_static_source = static_source != nullptr;
     const std::string active_static_source_fingerprint =
@@ -1629,14 +1662,31 @@ void ValidateManifest(const Manifest& manifest,
                                   : 1.0;
   const std::string active_alpha_policy = IGRAlphaLengthScalePolicyToString(
     ResolveIGRAlphaLengthScalePolicy(run_cfg));
-  const auto active_sigma_cadence = run_cfg.igr_opts.sigma_cadence.empty()
-                                      ? run_cfg.case_config.igr_config.sigma_cadence
-                                      : ParseIGRSigmaUpdateCadence(
-                                          run_cfg.igr_opts.sigma_cadence);
+  const auto active_sigma_cadence =
+    ResolveEffectiveIGRSigmaUpdateCadence(run_cfg);
   const int active_sigma_interval =
-    run_cfg.igr_opts.sigma_update_interval > 0
-      ? run_cfg.igr_opts.sigma_update_interval
-      : run_cfg.case_config.igr_config.sigma_update_interval;
+    ResolveEffectiveIGRSigmaUpdateInterval(run_cfg);
+  const bool active_nondefault_dgsem_transport =
+    run_cfg.dg_backend == DGBackend::DGSEM &&
+    (run_cfg.dgsem_stab != DGSEMStabilization::None ||
+     run_cfg.dgsem_volume_flux != DGSEMVolumeFlux::Central ||
+     run_cfg.dgsem_volume_dissipation != DGSEMVolumeDissipation::None ||
+     run_cfg.dgsem_surface_flux != DGSEMSurfaceFlux::Rusanov ||
+     run_cfg.dgsem_entropy_jacobian !=
+       DGSEMEntropyJacobian::FiniteDifference);
+  if (manifest.schema < transport_manifest_schema &&
+      active_nondefault_dgsem_transport)
+  {
+    Fail("restart manifest schema " + std::to_string(manifest.schema) +
+         " cannot certify the active non-default DGSEM transport tuple");
+  }
+  if (manifest.schema < transport_manifest_schema && igr_enabled &&
+      active_sigma_cadence ==
+        dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep)
+  {
+    Fail("restart manifest schema " + std::to_string(manifest.schema) +
+         " cannot certify extrapolation-history reset semantics");
+  }
   const auto close = [](double a, double b)
   {
     return std::abs(a - b) <= 64.0 * std::numeric_limits<double>::epsilon() *
@@ -1653,6 +1703,22 @@ void ValidateManifest(const Manifest& manifest,
      manifest.zhang_shu_vtk_points != run_cfg.opts.zhang_shu_vtk_points ||
      manifest.rho_floor != run_cfg.case_config.rk3_config.rho_min ||
      manifest.pressure_floor != run_cfg.case_config.rk3_config.p_min);
+  const bool dgsem_transport_mismatch =
+    manifest.schema >= transport_manifest_schema &&
+    run_cfg.dg_backend == DGBackend::DGSEM &&
+    (manifest.dgsem_stabilization !=
+       DGSEMStabilizationToString(run_cfg.dgsem_stab) ||
+     manifest.dgsem_volume_flux !=
+       DGSEMVolumeFluxToString(run_cfg.dgsem_volume_flux) ||
+     manifest.dgsem_volume_dissipation !=
+       DGSEMVolumeDissipationToString(run_cfg.dgsem_volume_dissipation) ||
+     manifest.dgsem_surface_flux !=
+       DGSEMSurfaceFluxToString(run_cfg.dgsem_surface_flux) ||
+     manifest.dgsem_entropy_jacobian !=
+       DGSEMEntropyJacobianToString(run_cfg.dgsem_entropy_jacobian));
+  const bool sigma_restart_policy_mismatch =
+    manifest.schema >= transport_manifest_schema && igr_enabled &&
+    manifest.sigma_restart_policy != SigmaRestartPolicy(run_cfg);
   if (manifest.ranks != comm_size || manifest.dim != ctx.dim ||
       manifest.equations != ctx.num_equations ||
       manifest.order != run_cfg.opts.order ||
@@ -1667,10 +1733,10 @@ void ValidateManifest(const Manifest& manifest,
       manifest.zhang_shu_points != run_cfg.opts.zhang_shu_points ||
       manifest.igr_enabled != igr_enabled ||
       current_method_mismatch ||
+      dgsem_transport_mismatch || sigma_restart_policy_mismatch ||
       (igr_enabled &&
        (manifest.igr_space != IGRSpaceName(run_cfg) ||
         manifest.igr_grad != IGRGradName(run_cfg) ||
-        manifest.igr_sigma_order != ResolveIGRSigmaOrder(run_cfg) ||
         !close(manifest.c_alpha, active_c_alpha) ||
         manifest.alpha_length_policy != active_alpha_policy ||
         manifest.ip_kind !=

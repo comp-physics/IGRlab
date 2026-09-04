@@ -44,8 +44,16 @@ public:
    */
   bool Rebind(const DGHyperbolicConservationLaws& op);
 
-  /// @brief Assemble DGSEM surface contributions into z (overwrites z).
-  real_t AssembleSurface(const Vector& x, Vector& z) const;
+  /** Assemble DGSEM surface contributions into z (overwrites z).
+   *
+   * When non-null, `physical_boundary_flux` is overwritten with the
+   * rank-local integral of the outward numerical flux actually used by this
+   * surface assembly. Communicator reduction remains the parent operator's
+   * responsibility.
+   */
+  real_t AssembleSurface(const Vector& x,
+                         Vector& z,
+                         Vector* physical_boundary_flux = nullptr) const;
 
   /// @brief Add DGSEM volume contributions into z (accumulates into z).
   real_t AssembleVolume(const Vector& x, Vector& z) const;
@@ -69,12 +77,22 @@ public:
    *
    * State/sigma admissibility is checked before `y_local` is written. The
    * caller is responsible for true-to-local `P x` before this call and local-
-   * to-true `P^T y` afterward.
+   * to-true `P^T y` afterward. When requested, `physical_boundary_flux` is
+   * overwritten with the rank-local outward flux used by the packed face
+   * residual; communicator reduction remains the caller's responsibility.
+   *
+   * With `admission_only=true`, the same packed gather, exchange, and FP64
+   * owned/face scans run, but no flux, inverse mass, speed reduction,
+   * boundary-flux capture, or caller-output write occurs. The result then
+   * carries the fresh communicator-wide q_sigma aggregate for this call.
+   * The default remains the complete residual operation.
    */
   DGSEMProductionResult AssembleProductionResidual(
     const Vector& x_local,
     Vector& y_local,
-    bool strict) const;
+    bool strict,
+    Vector* physical_boundary_flux = nullptr,
+    bool admission_only = false) const;
 
   /// Invalidate only the named cache layer after an owning lifecycle change.
   void InvalidateProductionCache(DGSEMProductionInvalidation invalidation) const;

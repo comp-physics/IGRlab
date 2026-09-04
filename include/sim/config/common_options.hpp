@@ -25,8 +25,6 @@ struct CommonOptions
   int order = 3;                 ///< DG polynomial order.
   std::string device = "cpu";    ///< Runtime device backend: "cpu" or "cuda".
   std::string dg_backend = "dg"; ///< DG backend: "dg" or "dgsem".
-  std::string dg_surface_flux = "rusanov";
-  ///< Ordinary-DG face flux: "rusanov" or "hdg-trace-centered".
   std::string discretization;
   ///< General discretization selector; empty retains the per-case default.
   std::string regularization;
@@ -132,13 +130,6 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-dg",
                  "--dg-backend",
                  "DG backend: dg | dgsem (default set per case).");
-  args.AddOption(
-    &opts.dg_surface_flux,
-    "-dgsf",
-    "--dg-surface-flux",
-    "Ordinary-DG face flux: rusanov | hdg-trace-centered. The latter is "
-    "the face-local equal-penalty interior HDG elimination; physical "
-    "boundaries use the existing DG ghost state.");
   args.AddOption(&opts.discretization,
                  "-disc",
                  "--discretization",

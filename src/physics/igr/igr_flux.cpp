@@ -76,6 +76,42 @@ real_t FluxWithIGR::InvariantDomainSpeed(const Vector& U,
                                      invariant_domain_pressure_floor_);
 }
 
+real_t FluxWithIGR::FrozenSigmaSpectralSpeed(const Vector& U,
+                                             const Vector* normal,
+                                             real_t sigma) const
+{
+  const real_t density = U(0);
+  const real_t safe_density = std::max(density, rho_vel_floor_);
+  real_t momentum_sq = 0.0;
+  real_t momentum_dot_normal = 0.0;
+  for (int d = 0; d < dim; ++d)
+  {
+    const real_t momentum = U(1 + d);
+    momentum_sq += momentum * momentum;
+    if (normal)
+    {
+      momentum_dot_normal += momentum * (*normal)(d);
+    }
+  }
+  const real_t pressure =
+    (gamma_ - 1.0) * (U(1 + dim) - 0.5 * momentum_sq / safe_density);
+  RecordFrozenSigmaSample(pressure, sigma);
+  const real_t normal_norm = normal ? normal->Norml2() : 0.0;
+  const real_t transport_speed = normal
+                                   ? (normal_norm > 0.0
+                                        ? std::abs(momentum_dot_normal) /
+                                            (safe_density * normal_norm)
+                                        : 0.0)
+                                   : std::sqrt(momentum_sq) / safe_density;
+  return ::dg_igr::frozen_scalar_igr_algebra::
+    FrozenSigmaCharacteristicModulusBound(density,
+                                          pressure,
+                                          transport_speed,
+                                          sigma,
+                                          gamma_,
+                                          rho_vel_floor_);
+}
+
 real_t FluxWithIGR::ComputeFlux(const Vector& U,
                                 ElementTransformation& Tr,
                                 DenseMatrix& F) const
@@ -91,6 +127,10 @@ real_t FluxWithIGR::ComputeFlux(const Vector& U,
   if (invariant_domain_flux_)
   {
     return InvariantDomainSpeed(U, nullptr, sigma, mcs);
+  }
+  if (frozen_sigma_spectral_speed_)
+  {
+    return FrozenSigmaSpectralSpeed(U, nullptr, sigma);
   }
   return sigma_aware_cfl_
            ? IGRFluxCharacteristicSpeed(mcs, U(0), sigma, rho_vel_floor_)
@@ -122,6 +162,10 @@ real_t FluxWithIGR::ComputeFluxDotNAtSide(const Vector& U,
   if (invariant_domain_flux_)
   {
     return InvariantDomainSpeed(U, &n, sigma_face, mcs);
+  }
+  if (frozen_sigma_spectral_speed_)
+  {
+    return FrozenSigmaSpectralSpeed(U, &n, sigma_face);
   }
   return sigma_aware_cfl_
            ? IGRFluxCharacteristicSpeed(
@@ -161,6 +205,11 @@ real_t FluxWithIGR::ComputeAvgFluxDotNAtSide(const Vector& U1,
   {
     return std::max(InvariantDomainSpeed(U1, &n, sigma_face, mcs),
                     InvariantDomainSpeed(U2, &n, sigma_face, mcs));
+  }
+  if (frozen_sigma_spectral_speed_)
+  {
+    return std::max(FrozenSigmaSpectralSpeed(U1, &n, sigma_face),
+                    FrozenSigmaSpectralSpeed(U2, &n, sigma_face));
   }
   return sigma_aware_cfl_
            ? IGRFluxCharacteristicSpeed(

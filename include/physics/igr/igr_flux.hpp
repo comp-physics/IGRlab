@@ -120,11 +120,11 @@ MFEM_HOST_DEVICE inline real_t IGRFluxInvariantDomainSpeed(
  *  - Normal flux (F(U)·n):       momentum +Sigma n,   energy +Sigma (u·n).
  *
  * Notes
- *  - The returned max characteristic speed includes the pressure-like IGR
- *    scale sqrt(|Sigma|/rho) when Sigma is active and sigma-aware CFL is on.
- *    The invariant-domain mode instead reports the combined frozen-stage
- *    split/characteristic bound and uses that same bound for Rusanov
- *    dissipation.
+ *  - The typed frozen-sigma spectral mode reports the exact local acoustic
+ *    radius |u_n|+sqrt((gamma*p+(gamma-1)*Sigma)/rho) on admitted states and
+ *    uses it for Rusanov dissipation. The two legacy sigma-aware toggles retain
+ *    their independent heuristic behavior. The invariant-domain mode instead
+ *    reports the combined frozen-stage split/characteristic bound.
  *  - On faces, Sigma is taken from the explicit side argument in
  *    ComputeFluxDotNAtSide/ComputeAvgFluxDotNAtSide.
  *    On boundary faces (Elem2 == nullptr) the interior (Left) value is used.
@@ -175,6 +175,18 @@ public:
   /// Disabled by default; enable it explicitly when requested by the case.
   void SetSigmaAwareRusanov(bool enabled) { sigma_aware_rusanov_ = enabled; }
 
+  /** Couple CFL reporting and Rusanov dissipation to the exact local
+   * frozen-sigma spectrum. The extrapolated DGSEM production method owns this
+   * typed policy; q_sigma admission is enforced separately at every stage and
+   * exact endpoint.
+   */
+  void SetFrozenSigmaSpectralSpeed(bool enabled)
+  {
+    MFEM_VERIFY(!enabled || HasEulerBase(),
+                "The frozen-sigma spectral speed requires an Euler base flux.");
+    frozen_sigma_spectral_speed_ = enabled;
+  }
+
   /** Use the frozen-stage IGR split/characteristic speed for both CFL
    * accounting and Rusanov dissipation. This typed mode takes precedence over
    * the two independent legacy sigma-speed heuristics. "Invariant-domain"
@@ -190,6 +202,10 @@ public:
 
   bool GetSigmaAwareCFL() const { return sigma_aware_cfl_; }
   bool GetSigmaAwareRusanov() const { return sigma_aware_rusanov_; }
+  bool GetFrozenSigmaSpectralSpeed() const
+  {
+    return frozen_sigma_spectral_speed_;
+  }
   bool GetInvariantDomainFlux() const { return invariant_domain_flux_; }
   real_t GetGamma() const { return gamma_; }
 
@@ -209,6 +225,10 @@ public:
                                        real_t sigma) const
   {
     if (invariant_domain_flux_)
+    {
+      return reported_speed;
+    }
+    if (frozen_sigma_spectral_speed_)
     {
       return reported_speed;
     }
@@ -309,6 +329,7 @@ private:
   double invariant_domain_pressure_floor_ = dg_igr::LimiterDefaults::kPMin;
   bool sigma_aware_cfl_ = false;
   bool sigma_aware_rusanov_ = false;
+  bool frozen_sigma_spectral_speed_ = false;
   bool invariant_domain_flux_ = false;
   mutable IGRFrozenSigmaTelemetry frozen_sigma_telemetry_;
 
@@ -318,6 +339,10 @@ private:
                               const Vector* normal,
                               real_t sigma,
                               real_t base_speed) const;
+
+  real_t FrozenSigmaSpectralSpeed(const Vector& U,
+                                  const Vector* normal,
+                                  real_t sigma) const;
 
   void RecordFrozenSigmaSample(real_t pressure, real_t sigma) const;
 

@@ -19,6 +19,10 @@ sys.dont_write_bytecode = True
 from shock_architecture_matrix import (  # noqa: E402
     DG_RK3SSP,
     DG_SSPRK104,
+    DGSEM_SSPRK104_EVERY_STAGE,
+    DGSEM_SSPRK104_EXTRAPOLATED,
+    EXACT_IID_Q_SIGMA_SCOPE,
+    EXTRAPOLATED_Q_SIGMA_SCOPE,
     HDG_RODAS3_ORDINARY,
     HDG_RODAS3_TENSOR,
     METHODS,
@@ -29,6 +33,7 @@ from shock_architecture_matrix import (  # noqa: E402
     _argument_parser,
     aggregate_runs,
     build_method_arguments,
+    campaign_child_environment,
     capture_file_identity,
     classify_execution,
     classify_selection,
@@ -45,6 +50,7 @@ from shock_architecture_matrix import (  # noqa: E402
     pin_qoi_input_files,
     qoi_command,
     render_markdown,
+    required_q_sigma_scope,
     rotated_schedule,
     run_campaign,
     run_timed_process,
@@ -71,13 +77,18 @@ def controls(*, device: str = "cuda", vtk: bool = False,
         conservation_balance=False,
         zhang_shu_vtk_points=zhang_shu_vtk_points,
         closure_certificate_max_relative_residual=1.0e-7,
+        closure_certificate_max_absolute_residual=0.0,
         explicit_dt_by_method={
             DG_RK3SSP: 1.0e-4,
             DG_SSPRK104: 3.0e-4,
+            DGSEM_SSPRK104_EVERY_STAGE: 4.0e-4,
+            DGSEM_SSPRK104_EXTRAPOLATED: 5.0e-4,
         },
         explicit_cfl_by_method={
             DG_RK3SSP: 0.5,
             DG_SSPRK104: 1.0,
+            DGSEM_SSPRK104_EVERY_STAGE: 2.0,
+            DGSEM_SSPRK104_EXTRAPOLATED: 3.0,
         },
         dt_min=1.0e-10,
         igr_linear_rtol=1.0e-5,
@@ -109,17 +120,43 @@ def certified_closure() -> dict[str, object]:
         "certified": True,
         "run_success": True,
         "residual_rel_rhs": 2.0e-8,
+        "residual_abs": 1.0e-9,
         "residual_reported": True,
         "residual_finite": True,
         "relative_limit": 5.0e-5,
+        "absolute_limit": 0.0,
         "skipped_nonfinite": False,
     }
 
 
-def positive_q_sigma_telemetry() -> dict[str, object]:
+def certified_extrapolated_lifecycle(
+        *, endpoint_solves: int = 34,
+        absolute_only_passes: int = 0) -> dict[str, object]:
     return {
         "reported": True,
-        "scope": "application-total-attempted-speed-work",
+        "endpoint_solves": endpoint_solves,
+        "exact_anchor_certificates": endpoint_solves + 2,
+        "exact_anchor_absolute_only_passes": absolute_only_passes,
+        "max_exact_anchor_certificate_acceptance_ratio": 0.5,
+        "max_exact_anchor_relative_pass_residual_rel_rhs": 2.5e-8,
+        "max_exact_anchor_absolute_only_residual_abs": 0.0,
+    }
+
+
+def certified_extrapolated_scalar_closure() -> dict[str, object]:
+    return {
+        "reported": True,
+        "last_solver": "cg",
+        "last_precond": "operatorchebyshev",
+        "exact_face_effective": True,
+    }
+
+
+def positive_q_sigma_telemetry(
+        scope: str = EXACT_IID_Q_SIGMA_SCOPE) -> dict[str, object]:
+    return {
+        "reported": True,
+        "scope": scope,
         "precision": "fp64",
         "rejected_attempts_included": True,
         "sample_count": 100,
@@ -127,6 +164,36 @@ def positive_q_sigma_telemetry() -> dict[str, object]:
         "nonfinite_count": 0,
         "minimum_raw_q_sigma": 0.125,
         "minimum_q_sigma_over_gamma_p": 0.05,
+    }
+
+
+def q_sigma_rejection_summary(
+        *, attempts: int = 0, nonpositive: int = 0, nonfinite: int = 0,
+        rejected_attempts: int | None = None,
+        reason: str | None = None, stage: int | None = None
+        ) -> dict[str, object]:
+    if rejected_attempts is None:
+        rejected_attempts = attempts
+    if reason is None:
+        if attempts == 0:
+            reason = "none"
+        elif nonpositive > 0 and nonfinite > 0:
+            reason = "q-sigma-nonpositive-and-nonfinite"
+        elif nonfinite > 0:
+            reason = "q-sigma-nonfinite"
+        else:
+            reason = "q-sigma-nonpositive"
+    if stage is None:
+        stage = -1 if attempts == 0 else 6
+    return {
+        "reported": True,
+        "success": True,
+        "rejected_attempts": rejected_attempts,
+        "rejected_q_sigma_attempts": attempts,
+        "rejected_q_sigma_nonpositive_samples": nonpositive,
+        "rejected_q_sigma_nonfinite_samples": nonfinite,
+        "last_q_sigma_rejection_reason": reason,
+        "last_q_sigma_rejection_stage": stage,
     }
 
 
@@ -299,6 +366,89 @@ class ScheduleAndCardTests(unittest.TestCase):
                     controls().explicit_cfl_by_method[method],
                 )
 
+    def test_selected_dgsem_cards_pin_exact_transport_and_closure_tuple(
+            self) -> None:
+        local = controls()
+        local = HarnessControls(**{
+            **local.__dict__,
+            "alpha_length_policy": "max",
+            "dgsem_surface_flux": "es-winters",
+            "igr_invariant_domain_flux": True,
+            "igr_sigma_cfl": True,
+            "igr_sigma_rusanov": True,
+        })
+        expected_cadences = {
+            DGSEM_SSPRK104_EVERY_STAGE: "every-stage",
+            DGSEM_SSPRK104_EXTRAPOLATED: "extrapolated-every-step",
+        }
+        for method, cadence in expected_cadences.items():
+            with self.subTest(method=method):
+                arguments = build_method_arguments(
+                    method, "/mesh/cylinder.msh", local
+                )
+                expected_options = {
+                    "--discretization": "dgsem",
+                    "--dg-backend": "dgsem",
+                    "--time-integrator": "ssprk104",
+                    "--igr-alpha-length": "local",
+                    "--igr-space": "L2",
+                    "--igr-grad": "BrokenL2",
+                    "--igr-solve-mode": "krylov",
+                    "--igr-ip-kind": "sipg",
+                    "--igr-linear-solver": "cg",
+                    "--igr-preconditioner": "chebyshev",
+                    "--igr-sigma-cadence": cadence,
+                    "--igr-stage-rtol-scale": "1",
+                    "--dgsem-stab": "none",
+                    "--dgsem-volume-flux": "central",
+                    "--dgsem-volume-dissipation": "llf",
+                    "--dgsem-surface-flux": "rusanov",
+                    "--dgsem-entropy-jacobian": "fd",
+                }
+                for option, expected in expected_options.items():
+                    self.assertEqual(option_value(arguments, option), expected)
+                self.assertIn("--igr-exact-dg-face", arguments)
+                self.assertIn("--no-igr-invariant-domain-flux", arguments)
+                self.assertIn("--no-igr-sigma-cfl", arguments)
+                self.assertIn("--no-igr-sigma-rusanov", arguments)
+                self.assertIn("--no-vtk-h1-diagnostics", arguments)
+                self.assertIn("--no-vtk-l2-diagnostics", arguments)
+                self.assertIn("--no-vtk-mpi-rank-field", arguments)
+                self.assertIn("--no-vtk-zhang-shu-diagnostics", arguments)
+                self.assertEqual(
+                    float(option_value(arguments, "--time-step")),
+                    local.explicit_dt_by_method[method],
+                )
+                self.assertEqual(
+                    float(option_value(arguments, "--cfl-number")),
+                    local.explicit_cfl_by_method[method],
+                )
+
+    def test_q_sigma_contract_is_method_specific(self) -> None:
+        self.assertIsNone(required_q_sigma_scope(
+            DG_RK3SSP, igr_invariant_domain_flux=False
+        ))
+        self.assertEqual(
+            required_q_sigma_scope(
+                DG_SSPRK104, igr_invariant_domain_flux=True
+            ),
+            EXACT_IID_Q_SIGMA_SCOPE,
+        )
+        self.assertIsNone(required_q_sigma_scope(
+            DGSEM_SSPRK104_EVERY_STAGE,
+            igr_invariant_domain_flux=True,
+        ))
+        self.assertEqual(
+            required_q_sigma_scope(
+                DGSEM_SSPRK104_EXTRAPOLATED,
+                igr_invariant_domain_flux=False,
+            ),
+            EXTRAPOLATED_Q_SIGMA_SCOPE,
+        )
+        self.assertIsNone(required_q_sigma_scope(
+            HDG_RODAS3_ORDINARY, igr_invariant_domain_flux=True
+        ))
+
     def test_zhang_shu_vtk_point_control_is_default_off_and_explicit_only(
             self) -> None:
         base_cli = [
@@ -454,6 +604,8 @@ class ScheduleAndCardTests(unittest.TestCase):
         )
         self.assertEqual(values[DG_RK3SSP], 0.4)
         self.assertEqual(values[DG_SSPRK104], 0.5)
+        self.assertEqual(values[DGSEM_SSPRK104_EVERY_STAGE], 0.5)
+        self.assertEqual(values[DGSEM_SSPRK104_EXTRAPOLATED], 0.5)
         fixed = parse_method_float_overrides(
             ("dg-ssprk104=0",), option_name="--method-explicit-cfl",
             default=0.5, allow_zero=True,
@@ -473,18 +625,35 @@ class ScheduleAndCardTests(unittest.TestCase):
 
 
 class SyntheticLogParserTests(unittest.TestCase):
+    def test_campaign_environment_pins_full_chebyshev_operator(self) -> None:
+        source = {
+            "PATH": "/closed/path",
+            "DG_IGR_VTK_PREFIX_PATH": "/stale/vtk",
+            "DG_IGR_LIMITER_TIMING": "stale",
+            "DG_IGR_IGR_CHEB_BASE_OPERATOR": "1",
+        }
+        environment = campaign_child_environment(
+            source, enable_limiter_timing=False
+        )
+        self.assertEqual(environment["PATH"], "/closed/path")
+        self.assertEqual(
+            environment["DG_IGR_IGR_CHEB_BASE_OPERATOR"], "0"
+        )
+        self.assertNotIn("DG_IGR_VTK_PREFIX_PATH", environment)
+        self.assertNotIn("DG_IGR_LIMITER_TIMING", environment)
+
     def test_explicit_success_parses_retry_closure_limiter_and_work(self) -> None:
         log = """
 [alive] step     20 | t     0.125000 | dt 1.0e-03 | avg/step 1s
 steps (cumulative/segment): 32 / 32 | elapsed: 4.250000 s
 time (initial/final): 0.000000 / 0.200000
 [explicit-retry] event=run-summary accepted_attempts=999 rejected_attempts=999 minimum_accepted_dt=9
-[explicit-time] event=run-summary steps=32 final_time=0.2 rhs_evaluations=103 accepted_attempts=32 rejected_attempts=2 rejected_limiter_elements=7 characteristic_speed_probes=35 minimum_characteristic_speed=2.25 maximum_characteristic_speed=19.5 minimum_attempted_dt=0.00025 maximum_attempted_dt=0.002 minimum_accepted_dt=0.0005 maximum_accepted_dt=0.001 dt_min_reached=0 success=1 termination_reason=target-reached
+[explicit-time] event=run-summary steps=32 final_time=0.2 rhs_evaluations=103 accepted_attempts=32 rejected_attempts=2 rejected_limiter_elements=7 rejected_q_sigma_attempts=1 rejected_q_sigma_nonpositive_samples=3 rejected_q_sigma_nonfinite_samples=0 last_q_sigma_rejection_reason=q-sigma-nonpositive last_q_sigma_rejection_stage=6 characteristic_speed_probes=35 minimum_characteristic_speed=2.25 maximum_characteristic_speed=19.5 minimum_attempted_dt=0.00025 maximum_attempted_dt=0.002 minimum_accepted_dt=0.0005 maximum_accepted_dt=0.001 maximum_accepted_step_growth_ratio=1.75 dt_min_reached=0 success=1 termination_reason=target-reached
 [igr-closure-certificate] event=accepted-state scope=final-committed-accepted-state precision=fp64 time=0.2 state_generation=32 solved=1 supported=1 certified=1 residual_rel_rhs=2.5e-8 run_success=1 residual_abs=1e-9 relative_limit=5e-5 absolute_limit=0 skipped_nonfinite=0
 [explicit-conservation] event=accepted-trajectory supported=1 source_supported=1 components=4 domain_measure=2 initial=1,2,3,4 final=1.1,2.2,3.3,4.4 boundary_flux=-0.1,-0.2,-0.3,-0.4 boundary_flux_scale=0.2,0.3,0.4,0.5 defect=1e-14,2e-14,3e-14,4e-14 relative_defect=1e-15,2e-15,3e-15,4e-15 maximum_absolute_error=4e-14 maximum_relative_error=4e-15 accepted_attempts=32 rejected_attempts=2 run_success=1
 [explicit-time] event=final-status final_time=0.2 success=1 termination_reason=target-reached
 [igr-regularization] event=resolved c_alpha=1 h_eff_policy=max h_min=0.04 h_average=0.06 h_max=0.08 h_eff_reference=0.08 alpha_effective_min=0.0064 alpha_effective_max=0.0064
-[igr-sigma-lifecycle] event=run-summary prefetch_solves=1 stage0_reuses=2 output_only_solves=0 prefetch_invalidations=2
+[igr-sigma-lifecycle] event=run-summary prefetch_solves=1 stage0_reuses=2 output_only_solves=0 prefetch_invalidations=2 endpoint_solves=34 extrapolated_stages=321 exact_anchor_certificates=36 exact_anchor_absolute_only_passes=0 max_exact_anchor_certificate_residual_rel_rhs=2.5e-8 max_exact_anchor_certificate_relative_limit=5e-5 max_exact_anchor_certificate_residual_abs=1e-9 max_exact_anchor_certificate_absolute_limit=0 max_exact_anchor_certificate_acceptance_ratio=0.5 max_exact_anchor_relative_pass_residual_rel_rhs=2.5e-8 max_exact_anchor_absolute_only_residual_abs=0 max_endpoint_prediction_defect=0.0125 max_relative_endpoint_prediction_defect=0.025
 [igr-q-sigma] event=run-summary scope=application-total-attempted-speed-work rejected_attempts_included=1 precision=fp64 sample_count=15000 nonpositive_count=3 nonfinite_count=0 minimum_raw_q_sigma=-0.125 minimum_q_sigma_over_gamma_p=-0.05
 [igr-linear] event=run-summary calls=103 converged_calls=103 production_calls=102 production_converged_calls=102 output_only_calls=1 output_only_converged_calls=1 output_only_iters=3 total_iters=420 avg_iters=4.077 max_iters=9 total_assemble_s=0.4 total_form_s=0.2 total_pc_setup_s=0.3 total_solve_s=1.5 total_igr_s=2.5 total_update_s=2.7 total_krylov_operator_apply_count=525 total_krylov_preconditioner_apply_count=420 total_krylov_preconditioner_operator_apply_count=1260 last_solver=minres last_precond=operatorchebyshev-base exact_face_requested=1 exact_face_effective=1 exact_face_operator_uses=103 exact_face_last_mult_calls=7
 [limiter] event=run-summary rank=0 calls=98 active_calls=20 limited_elements=70 element_call_opportunities=1960 limited_element_fraction=0.0357142857143 minimum_theta=0.2 aggregation=element-call-incidence limited_fraction_denominator=element_call_opportunities total_s=0.6 avg_s=0.00612 avg_active_elements=0.714285714286 avg_tensor_points=16
@@ -507,6 +676,25 @@ ARCHITECTURE_SELECTION_POINT nonlinear_updates=0 linear_iterations=420 trace_sol
         self.assertEqual(parsed["explicit_time"]["rhs_evaluations"], 103)
         self.assertEqual(parsed["explicit_time"]["rejected_limiter_elements"], 7)
         self.assertEqual(
+            parsed["explicit_time"]["rejected_q_sigma_attempts"], 1
+        )
+        self.assertEqual(
+            parsed["explicit_time"]
+            ["rejected_q_sigma_nonpositive_samples"],
+            3,
+        )
+        self.assertEqual(
+            parsed["explicit_time"]["rejected_q_sigma_nonfinite_samples"],
+            0,
+        )
+        self.assertEqual(
+            parsed["explicit_time"]["last_q_sigma_rejection_reason"],
+            "q-sigma-nonpositive",
+        )
+        self.assertEqual(
+            parsed["explicit_time"]["last_q_sigma_rejection_stage"], 6
+        )
+        self.assertEqual(
             parsed["explicit_time"]["characteristic_speed_probes"], 35
         )
         self.assertEqual(
@@ -516,6 +704,10 @@ ARCHITECTURE_SELECTION_POINT nonlinear_updates=0 linear_iterations=420 trace_sol
             parsed["explicit_time"]["maximum_characteristic_speed"], 19.5
         )
         self.assertEqual(parsed["explicit_time"]["maximum_accepted_dt"], 0.001)
+        self.assertEqual(
+            parsed["explicit_time"]["maximum_accepted_step_growth_ratio"],
+            1.75,
+        )
         self.assertTrue(parsed["explicit_time"]["success"])
         self.assertEqual(
             parsed["explicit_time"]["termination_reason"], "target-reached"
@@ -548,6 +740,62 @@ ARCHITECTURE_SELECTION_POINT nonlinear_updates=0 linear_iterations=420 trace_sol
         self.assertEqual(parsed["scalar_closure"]["total_iters"], 420)
         self.assertTrue(parsed["scalar_closure"]["exact_face_effective"])
         self.assertEqual(parsed["scalar_lifecycle"]["stage0_reuses"], 2)
+        self.assertEqual(parsed["scalar_lifecycle"]["endpoint_solves"], 34)
+        self.assertEqual(
+            parsed["scalar_lifecycle"]["extrapolated_stages"], 321
+        )
+        self.assertEqual(
+            parsed["scalar_lifecycle"]["exact_anchor_certificates"], 36
+        )
+        self.assertEqual(
+            parsed["scalar_lifecycle"]
+            ["exact_anchor_absolute_only_passes"],
+            0,
+        )
+        self.assertEqual(
+            parsed["scalar_lifecycle"]
+            ["max_exact_anchor_certificate_residual_rel_rhs"],
+            2.5e-8,
+        )
+        self.assertEqual(
+            parsed["scalar_lifecycle"]
+            ["max_exact_anchor_certificate_relative_limit"],
+            5.0e-5,
+        )
+        self.assertEqual(
+            parsed["scalar_lifecycle"]
+            ["max_exact_anchor_certificate_residual_abs"],
+            1.0e-9,
+        )
+        self.assertEqual(
+            parsed["scalar_lifecycle"]
+            ["max_exact_anchor_certificate_absolute_limit"],
+            0.0,
+        )
+        self.assertEqual(
+            parsed["scalar_lifecycle"]
+            ["max_exact_anchor_certificate_acceptance_ratio"],
+            0.5,
+        )
+        self.assertEqual(
+            parsed["scalar_lifecycle"]
+            ["max_exact_anchor_relative_pass_residual_rel_rhs"],
+            2.5e-8,
+        )
+        self.assertEqual(
+            parsed["scalar_lifecycle"]
+            ["max_exact_anchor_absolute_only_residual_abs"],
+            0.0,
+        )
+        self.assertEqual(
+            parsed["scalar_lifecycle"]["max_endpoint_prediction_defect"],
+            0.0125,
+        )
+        self.assertEqual(
+            parsed["scalar_lifecycle"]
+            ["max_relative_endpoint_prediction_defect"],
+            0.025,
+        )
         q_sigma = parsed["frozen_sigma_telemetry"]
         self.assertTrue(q_sigma["reported"])
         self.assertTrue(q_sigma["rejected_attempts_included"])
@@ -613,6 +861,12 @@ time (initial/final): 0 / 0.2
         self.assertIsNone(parsed["rejected_attempts"])
         self.assertFalse(parsed["explicit_time"]["reported"])
         self.assertIsNone(parsed["explicit_time"]["rhs_evaluations"])
+        self.assertIsNone(
+            parsed["explicit_time"]["rejected_q_sigma_attempts"]
+        )
+        self.assertIsNone(
+            parsed["explicit_time"]["last_q_sigma_rejection_reason"]
+        )
         self.assertIsNone(
             parsed["explicit_time"]["characteristic_speed_probes"]
         )
@@ -899,7 +1153,7 @@ class OutcomeAndReportTests(unittest.TestCase):
             hdg_quality["reason"], "hdg_quality_contract_not_implemented"
         )
 
-    def test_exact_iid_quality_requires_positive_finite_q_sigma_samples(
+    def test_exact_iid_quality_requires_reconciled_q_sigma_samples(
             self) -> None:
         execution = classify_execution(
             {"time_reached": 0.2}, returncode=0, timed_out=False,
@@ -915,13 +1169,63 @@ class OutcomeAndReportTests(unittest.TestCase):
             "requirements": requirements,
             "qoi_failure": None,
             "closure_certificate": certified_closure(),
-            "require_positive_q_sigma": True,
+            "scalar_lifecycle": certified_extrapolated_lifecycle(),
+            "explicit_time": q_sigma_rejection_summary(),
+            "required_q_sigma_evidence_scope": EXACT_IID_Q_SIGMA_SCOPE,
         }
         passed = evaluate_quality(
             **common,
             frozen_sigma_telemetry=positive_q_sigma_telemetry(),
         )
         self.assertTrue(passed["qualified"])
+        self.assertTrue(passed["q_sigma_containment"]["contained"])
+
+        contained_telemetry = {
+            **positive_q_sigma_telemetry(),
+            "sample_count": 120,
+            "nonpositive_count": 3,
+            "nonfinite_count": 2,
+            "minimum_raw_q_sigma": -0.125,
+            "minimum_q_sigma_over_gamma_p": -0.05,
+        }
+        contained = evaluate_quality(
+            **{
+                **common,
+                "explicit_time": q_sigma_rejection_summary(
+                    attempts=1, nonpositive=3, nonfinite=2
+                ),
+            },
+            frozen_sigma_telemetry=contained_telemetry,
+        )
+        self.assertTrue(contained["qualified"])
+        self.assertTrue(contained["q_sigma_containment"]["contained"])
+        self.assertTrue(
+            contained["q_sigma_containment"]["counts_reconciled"]
+        )
+
+        underreported_attempts_telemetry = {
+            **positive_q_sigma_telemetry(),
+            "nonpositive_count": 1,
+            "minimum_raw_q_sigma": -0.125,
+            "minimum_q_sigma_over_gamma_p": -0.05,
+        }
+        underreported_attempts = evaluate_quality(
+            **{
+                **common,
+                "explicit_time": q_sigma_rejection_summary(
+                    attempts=2, nonpositive=1, nonfinite=0
+                ),
+            },
+            frozen_sigma_telemetry=underreported_attempts_telemetry,
+        )
+        self.assertFalse(underreported_attempts["qualified"])
+        self.assertEqual(
+            underreported_attempts["reason"],
+            "invalid_exact_iid_q_sigma_telemetry",
+        )
+        self.assertFalse(
+            underreported_attempts["q_sigma_containment"]["contained"]
+        )
 
         cases = (
             ({"reported": False}, "missing_exact_iid_q_sigma"),
@@ -954,6 +1258,57 @@ class OutcomeAndReportTests(unittest.TestCase):
                 self.assertEqual(failed["status"], "failed")
                 self.assertIn(reason, failed["reason"])
 
+        for time_summary in (
+            q_sigma_rejection_summary(
+                attempts=1, nonpositive=2, nonfinite=2
+            ),
+            q_sigma_rejection_summary(
+                attempts=1, nonpositive=3, nonfinite=4
+            ),
+            q_sigma_rejection_summary(
+                attempts=0, nonpositive=3, nonfinite=2
+            ),
+            q_sigma_rejection_summary(
+                attempts=1, nonpositive=3, nonfinite=2,
+                reason="none",
+            ),
+            q_sigma_rejection_summary(
+                attempts=1, nonpositive=3, nonfinite=2, stage=-2
+            ),
+            {"reported": False},
+        ):
+            with self.subTest(time_summary=time_summary):
+                failed = evaluate_quality(
+                    **{**common, "explicit_time": time_summary},
+                    frozen_sigma_telemetry=contained_telemetry,
+                )
+                self.assertFalse(failed["qualified"])
+                self.assertEqual(
+                    failed["reason"],
+                    "invalid_exact_iid_q_sigma_telemetry",
+                )
+                self.assertFalse(
+                    failed["q_sigma_containment"]["contained"]
+                )
+
+        failed_certificate = evaluate_quality(
+            **{
+                **common,
+                "closure_certificate": {
+                    **certified_closure(), "certified": False
+                },
+                "explicit_time": q_sigma_rejection_summary(
+                    attempts=1, nonpositive=3, nonfinite=2
+                ),
+            },
+            frozen_sigma_telemetry=contained_telemetry,
+        )
+        self.assertFalse(failed_certificate["qualified"])
+        self.assertEqual(
+            failed_certificate["reason"],
+            "uncertified_dg_accepted_state_closure",
+        )
+
         measurement_only = evaluate_quality(
             **{**common, "qualification_mode": False},
             frozen_sigma_telemetry={"reported": False},
@@ -968,6 +1323,198 @@ class OutcomeAndReportTests(unittest.TestCase):
         self.assertEqual(
             hdg["reason"], "hdg_quality_contract_not_implemented"
         )
+
+    def test_extrapolated_quality_requires_frozen_sigma_scope(self) -> None:
+        execution = classify_execution(
+            {"time_reached": 0.2}, returncode=0, timed_out=False,
+            target_time=0.2, application_wall_seconds=3.0,
+        )
+        common = {
+            "qualification_mode": True,
+            "method": DGSEM_SSPRK104_EXTRAPOLATED,
+            "execution": execution,
+            "qoi_status": "success",
+            "qoi_values": {"shock_position": 1.0},
+            "requirements": parse_qoi_requirements((
+                "shock_position=1.0:0.1",
+            )),
+            "qoi_failure": None,
+            "closure_certificate": certified_closure(),
+            "scalar_closure": certified_extrapolated_scalar_closure(),
+            "scalar_lifecycle": certified_extrapolated_lifecycle(),
+            "explicit_time": q_sigma_rejection_summary(),
+            "required_q_sigma_evidence_scope": EXTRAPOLATED_Q_SIGMA_SCOPE,
+        }
+        passed = evaluate_quality(
+            **common,
+            frozen_sigma_telemetry=positive_q_sigma_telemetry(
+                EXTRAPOLATED_Q_SIGMA_SCOPE
+            ),
+        )
+        self.assertTrue(passed["qualified"])
+
+        contained_telemetry = {
+            **positive_q_sigma_telemetry(EXTRAPOLATED_Q_SIGMA_SCOPE),
+            "nonpositive_count": 4,
+            "minimum_raw_q_sigma": -0.25,
+            "minimum_q_sigma_over_gamma_p": -0.1,
+        }
+        contained = evaluate_quality(
+            **{
+                **common,
+                "explicit_time": q_sigma_rejection_summary(
+                    attempts=1, nonpositive=4
+                ),
+            },
+            frozen_sigma_telemetry=contained_telemetry,
+        )
+        self.assertTrue(contained["qualified"])
+        self.assertTrue(contained["q_sigma_containment"]["contained"])
+
+        wrong_scope = evaluate_quality(
+            **common,
+            frozen_sigma_telemetry=positive_q_sigma_telemetry(
+                EXACT_IID_Q_SIGMA_SCOPE
+            ),
+        )
+        self.assertFalse(wrong_scope["qualified"])
+        self.assertEqual(
+            wrong_scope["reason"], "invalid_frozen_sigma_q_sigma_telemetry"
+        )
+
+    def test_closure_certificate_accepts_bounded_absolute_alternative(
+            self) -> None:
+        execution = classify_execution(
+            {"time_reached": 0.2}, returncode=0, timed_out=False,
+            target_time=0.2, application_wall_seconds=3.0,
+        )
+        certificate = {
+            **certified_closure(),
+            "residual_rel_rhs": None,
+            "residual_finite": False,
+            "residual_abs": 1.0e-12,
+            "absolute_limit": 5.0e-12,
+        }
+        common = {
+            "qualification_mode": True,
+            "method": DG_RK3SSP,
+            "execution": execution,
+            "qoi_status": "success",
+            "qoi_values": {},
+            "requirements": {},
+            "qoi_failure": None,
+            "closure_certificate": certificate,
+        }
+        rejected = evaluate_quality(**common)
+        self.assertFalse(rejected["qualified"])
+        accepted = evaluate_quality(
+            **common,
+            closure_certificate_max_absolute_residual=2.0e-12,
+        )
+        self.assertTrue(accepted["qualified"])
+
+    def test_extrapolated_quality_gates_complete_anchor_history(self) -> None:
+        execution = classify_execution(
+            {"time_reached": 0.2}, returncode=0, timed_out=False,
+            target_time=0.2, application_wall_seconds=3.0,
+        )
+        common = {
+            "qualification_mode": True,
+            "method": DGSEM_SSPRK104_EXTRAPOLATED,
+            "execution": execution,
+            "qoi_status": "success",
+            "qoi_values": {},
+            "requirements": {},
+            "qoi_failure": None,
+            "closure_certificate": certified_closure(),
+            "scalar_closure": certified_extrapolated_scalar_closure(),
+            "explicit_time": q_sigma_rejection_summary(),
+            "frozen_sigma_telemetry": positive_q_sigma_telemetry(
+                EXTRAPOLATED_Q_SIGMA_SCOPE
+            ),
+            "required_q_sigma_evidence_scope": EXTRAPOLATED_Q_SIGMA_SCOPE,
+        }
+        invalid_histories = (
+            {"reported": False},
+            {**certified_extrapolated_lifecycle(),
+             "exact_anchor_certificates": 35},
+            {**certified_extrapolated_lifecycle(),
+             "max_exact_anchor_certificate_acceptance_ratio": 1.01},
+            {**certified_extrapolated_lifecycle(),
+             "max_exact_anchor_certificate_acceptance_ratio": float("nan")},
+            {**certified_extrapolated_lifecycle(),
+             "max_exact_anchor_relative_pass_residual_rel_rhs": 2.0e-6},
+            {**certified_extrapolated_lifecycle(absolute_only_passes=1),
+             "max_exact_anchor_absolute_only_residual_abs": 1.0e-12},
+            {**certified_extrapolated_lifecycle(absolute_only_passes=37)},
+        )
+        for lifecycle in invalid_histories:
+            with self.subTest(lifecycle=lifecycle):
+                result = evaluate_quality(
+                    **common, scalar_lifecycle=lifecycle
+                )
+                self.assertFalse(result["qualified"])
+                self.assertEqual(
+                    result["reason"],
+                    "invalid_dg_exact_anchor_certificate_history",
+                )
+        absolute_history = {
+            **certified_extrapolated_lifecycle(absolute_only_passes=1),
+            "max_exact_anchor_absolute_only_residual_abs": 1.0e-12,
+        }
+        accepted = evaluate_quality(
+            **common,
+            scalar_lifecycle=absolute_history,
+            closure_certificate_max_absolute_residual=2.0e-12,
+        )
+        self.assertTrue(accepted["qualified"])
+
+    def test_extrapolated_quality_requires_full_cg_chebyshev_policy(
+            self) -> None:
+        execution = classify_execution(
+            {"time_reached": 0.2}, returncode=0, timed_out=False,
+            target_time=0.2, application_wall_seconds=3.0,
+        )
+        common = {
+            "qualification_mode": True,
+            "method": DGSEM_SSPRK104_EXTRAPOLATED,
+            "execution": execution,
+            "qoi_status": "success",
+            "qoi_values": {},
+            "requirements": {},
+            "qoi_failure": None,
+            "closure_certificate": certified_closure(),
+            "scalar_lifecycle": certified_extrapolated_lifecycle(),
+            "explicit_time": q_sigma_rejection_summary(),
+            "frozen_sigma_telemetry": positive_q_sigma_telemetry(
+                EXTRAPOLATED_Q_SIGMA_SCOPE
+            ),
+            "required_q_sigma_evidence_scope": EXTRAPOLATED_Q_SIGMA_SCOPE,
+        }
+        for scalar_closure in (
+            {"reported": False},
+            {**certified_extrapolated_scalar_closure(),
+             "last_solver": "minres"},
+            {**certified_extrapolated_scalar_closure(),
+             "last_precond": "operatorchebyshev-base"},
+            {**certified_extrapolated_scalar_closure(),
+             "exact_face_effective": False},
+        ):
+            with self.subTest(scalar_closure=scalar_closure):
+                result = evaluate_quality(
+                    **common, scalar_closure=scalar_closure
+                )
+                self.assertFalse(result["qualified"])
+                self.assertEqual(
+                    result["reason"],
+                    "invalid_dg_extrapolated_closure_solver_policy",
+                )
+
+        passed = evaluate_quality(
+            **common,
+            scalar_closure=certified_extrapolated_scalar_closure(),
+        )
+        self.assertTrue(passed["qualified"])
 
     def test_qoi_contract_is_fixed_numeric_and_nullable(self) -> None:
         parsed = parse_qoi_json(
@@ -1131,6 +1678,32 @@ class OutcomeAndReportTests(unittest.TestCase):
             "minimum_theta": 0.3,
             "total_s": 0.5,
         }
+        run["progress"]["explicit_time"] = q_sigma_rejection_summary(
+            attempts=1, nonpositive=3, rejected_attempts=2
+        )
+        run["progress"]["scalar_lifecycle"] = {
+            "prefetch_solves": 1,
+            "stage0_reuses": 2,
+            "output_only_solves": 0,
+            "prefetch_invalidations": 1,
+            "endpoint_solves": 11,
+            "extrapolated_stages": 100,
+            "exact_anchor_certificates": 13,
+            "exact_anchor_absolute_only_passes": 0,
+            "max_exact_anchor_certificate_residual_rel_rhs": 2.0e-8,
+            "max_exact_anchor_certificate_relative_limit": 5.0e-5,
+            "max_exact_anchor_certificate_residual_abs": 1.0e-9,
+            "max_exact_anchor_certificate_absolute_limit": 0.0,
+            "max_exact_anchor_certificate_acceptance_ratio": 0.5,
+            "max_exact_anchor_relative_pass_residual_rel_rhs": 2.0e-8,
+            "max_exact_anchor_absolute_only_residual_abs": 0.0,
+            "max_endpoint_prediction_defect": 0.01,
+            "max_relative_endpoint_prediction_defect": 0.02,
+        }
+        run["quality"]["q_sigma_containment"] = {
+            "counts_reconciled": True,
+            "contained": True,
+        }
         run.update({
             "run_index": 1,
             "repetition": 1,
@@ -1165,13 +1738,29 @@ class OutcomeAndReportTests(unittest.TestCase):
         self.assertIn("right-censored", markdown)
         self.assertIn("| censored |", markdown)
         self.assertNotIn("Median exec time to solution (s) | 9", markdown)
-        self.assertIn("## DG limiter aggregates", markdown)
+        self.assertIn("## Explicit DG/DGSEM limiter aggregates", markdown)
         self.assertIn("## Frozen-sigma speed-sample telemetry", markdown)
-        self.assertIn("## DG accepted-trajectory conservation balance", markdown)
+        self.assertIn("## q_sigma rollback containment", markdown)
+        self.assertIn("## Instantaneous IGR sigma lifecycle", markdown)
+        self.assertIn(
+            "## Explicit DG/DGSEM accepted-trajectory conservation balance",
+            markdown,
+        )
         self.assertIn("committed SSPRK stages", markdown)
         self.assertIn("Pinned QoI input files", markdown)
         self.assertIn("/reference/profile.json", markdown)
         self.assertIn("e" * 64, markdown)
+        self.assertIn(
+            "| 1 | dg-rk3ssp | 1 | 3 | 0 | q-sigma-nonpositive | 6 | "
+            "True | True |",
+            markdown,
+        )
+        self.assertIn(
+            "| 1 | dg-rk3ssp | 1 | 2 | 0 | 1 | 11 | 100 | 13 | 0 | "
+            "2e-08 | 5e-05 | 1e-09 | 0 | 0.5 | 2e-08 | 0 | 0.01 | "
+            "0.02 |",
+            markdown,
+        )
         self.assertIn("| 1 | dg-rk3ssp | 1 | 10 | 4 | 8 | 100 | 0.08 | 0.3 | 0.5 |", markdown)
         self.assertIn("element-call incidence ratio", markdown)
 
@@ -1276,7 +1865,7 @@ print(json.dumps({"shock_position": 1.0}))
             self.assertEqual(
                 report["provenance"]["typed_application_controls"]
                 ["zhang_shu_vtk_points"],
-                {"enabled": True, "scope": "explicit-dg-only"},
+                {"enabled": True, "scope": "explicit-dg-and-dgsem-only"},
             )
             self.assertTrue(
                 report["runs"][0]["provenance"]

@@ -3,7 +3,6 @@
 #include "numerics/timestepping/ssprk_coefficients.hpp"
 #include "utils/config/env_flags.hpp"
 #include "utils/profiling/nvtx.hpp"
-#include "IGR_device_kernels.hpp"
 #include "IGR_internal_utils.hpp"
 #include "../../numerics/dg/DGFaceQuadratureKernels.hpp"
 
@@ -15,11 +14,9 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
-#include <map>
 #include <memory>
 #include <sstream>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace dg_igr
@@ -939,15 +936,6 @@ private:
   KrylovApplyTelemetry& telemetry_;
 };
 
-struct ExactLocalFacePairCoupling
-{
-  int first_element = -1;
-  int second_element = -1;
-  int contributing_faces = 0;
-  mfem::DenseMatrix first_to_second;
-  mfem::DenseMatrix second_to_first;
-};
-
 class ExactL2DGFaceOperator final : public mfem::Operator
 {
 public:
@@ -1188,214 +1176,6 @@ public:
     }
   }
 
-  void AddElementDiagonalBlocks(
-    std::vector<mfem::DenseMatrix>& blocks) const
-  {
-    const int ne = sfes_.GetNE();
-    const int dof = info_.dof;
-    MFEM_VERIFY(static_cast<int>(blocks.size()) == ne && dof > 0,
-                "Exact L2 DG face block assembly received inconsistent "
-                "element storage.");
-    for (const mfem::DenseMatrix& block : blocks)
-    {
-      MFEM_VERIFY(block.Height() == dof && block.Width() == dof,
-                  "Exact L2 DG face block assembly received inconsistent "
-                  "block dimensions.");
-    }
-
-    const auto add_side_block =
-      [this, dof](int side,
-                  int nq,
-                  int face,
-                  const mfem::Vector& shape,
-                  const mfem::Vector& weighted_normal_dshape,
-                  const mfem::Vector& penalty,
-                  mfem::DenseMatrix& block)
-    {
-      const mfem::real_t* S = shape.HostRead();
-      const mfem::real_t* N = weighted_normal_dshape.HostRead();
-      const mfem::real_t* P = penalty.HostRead();
-      for (int q = 0; q < nq; ++q)
-      {
-        for (int row = 0; row < dof; ++row)
-        {
-          const int row_index = side + 2 * (q + nq * (row + dof * face));
-          const mfem::real_t sr = S[row_index];
-          const mfem::real_t nr = N[row_index];
-          for (int column = 0; column < dof; ++column)
-          {
-            const int column_index =
-              side + 2 * (q + nq * (column + dof * face));
-            const mfem::real_t sc = S[column_index];
-            const mfem::real_t nc = N[column_index];
-            if (side == 0)
-            {
-              block(row, column) +=
-                -sr * nc + ip_sigma_ * nr * sc +
-                P[q + nq * face] * sr * sc;
-            }
-            else
-            {
-              block(row, column) +=
-                sr * nc - ip_sigma_ * nr * sc +
-                P[q + nq * face] * sr * sc;
-            }
-          }
-        }
-      }
-    };
-
-    const auto local_faces =
-      mfem::Reshape(scratch_.face_elements.HostRead(), 2, info_.nf);
-    for (int face = 0; face < info_.nf; ++face)
-    {
-      for (int side = 0; side < 2; ++side)
-      {
-        const int element = local_faces(side, face);
-        MFEM_VERIFY(element >= 0 && element < ne,
-                    "Exact L2 DG face block assembly received an invalid "
-                    "local element.");
-        add_side_block(side,
-                       info_.nq,
-                       face,
-                       scratch_.shape,
-                       scratch_.weighted_normal_dshape,
-                       scratch_.penalty,
-                       blocks[static_cast<std::size_t>(element)]);
-      }
-    }
-
-    if (has_shared_)
-    {
-      const int* shared_elements = shared_scratch_.face_elements.HostRead();
-      for (int face = 0; face < shared_info_.nf; ++face)
-      {
-        const int element = shared_elements[face];
-        MFEM_VERIFY(element >= 0 && element < ne,
-                    "Exact L2 DG face block assembly received an invalid "
-                    "shared-face element.");
-        add_side_block(0,
-                       shared_info_.nq,
-                       face,
-                       shared_scratch_.shape,
-                       shared_scratch_.weighted_normal_dshape,
-                       shared_scratch_.penalty,
-                       blocks[static_cast<std::size_t>(element)]);
-      }
-    }
-  }
-
-  bool BuildLocalFacePairCouplings(
-    std::vector<ExactLocalFacePairCoupling>& pairs,
-    std::string& reason) const
-  {
-    pairs.clear();
-    reason = "not-attempted";
-    const int ne = sfes_.GetNE();
-    const int dof = info_.dof;
-    if (ne <= 1 || dof <= 0 || info_.nf <= 0)
-    {
-      reason = "requires-local-interior-face-pairs";
-      return false;
-    }
-
-    const auto local_faces =
-      mfem::Reshape(scratch_.face_elements.HostRead(), 2, info_.nf);
-    const mfem::real_t* shape = scratch_.shape.HostRead();
-    const mfem::real_t* normal =
-      scratch_.weighted_normal_dshape.HostRead();
-    const mfem::real_t* penalty = scratch_.penalty.HostRead();
-    std::map<std::pair<int, int>, std::size_t> pair_index;
-
-    for (int face = 0; face < info_.nf; ++face)
-    {
-      const int element0 = local_faces(0, face);
-      const int element1 = local_faces(1, face);
-      if (element0 < 0 || element0 >= ne || element1 < 0 || element1 >= ne)
-      {
-        reason = "invalid-local-face-element";
-        return false;
-      }
-      if (element0 == element1)
-      {
-        reason = "self-coupled-local-face";
-        return false;
-      }
-
-      const int first = std::min(element0, element1);
-      const int second = std::max(element0, element1);
-      const std::pair<int, int> key(first, second);
-      auto found = pair_index.find(key);
-      if (found == pair_index.end())
-      {
-        ExactLocalFacePairCoupling coupling;
-        coupling.first_element = first;
-        coupling.second_element = second;
-        coupling.first_to_second.SetSize(dof);
-        coupling.second_to_first.SetSize(dof);
-        coupling.first_to_second = 0.0;
-        coupling.second_to_first = 0.0;
-        pairs.emplace_back(std::move(coupling));
-        found = pair_index.emplace(key, pairs.size() - 1).first;
-      }
-
-      ExactLocalFacePairCoupling& coupling = pairs[found->second];
-      ++coupling.contributing_faces;
-      for (int q = 0; q < info_.nq; ++q)
-      {
-        const mfem::real_t p = penalty[q + info_.nq * face];
-        for (int row = 0; row < dof; ++row)
-        {
-          const int row0 =
-            0 + 2 * (q + info_.nq * (row + dof * face));
-          const int row1 =
-            1 + 2 * (q + info_.nq * (row + dof * face));
-          const mfem::real_t s0r = shape[row0];
-          const mfem::real_t s1r = shape[row1];
-          const mfem::real_t n0r = normal[row0];
-          const mfem::real_t n1r = normal[row1];
-          for (int column = 0; column < dof; ++column)
-          {
-            const int column0 =
-              0 + 2 * (q + info_.nq * (column + dof * face));
-            const int column1 =
-              1 + 2 * (q + info_.nq * (column + dof * face));
-            const mfem::real_t s0c = shape[column0];
-            const mfem::real_t s1c = shape[column1];
-            const mfem::real_t n0c = normal[column0];
-            const mfem::real_t n1c = normal[column1];
-
-            // These are the exact off-diagonal blocks encoded by
-            // InteriorFaceDGDiffusionApply2D: row side 0 / column side 1
-            // and row side 1 / column side 0, respectively.
-            const mfem::real_t block01 =
-              -s0r * n1c - ip_sigma_ * n0r * s1c - p * s0r * s1c;
-            const mfem::real_t block10 =
-              s1r * n0c + ip_sigma_ * n1r * s0c - p * s1r * s0c;
-            if (element0 == first)
-            {
-              coupling.first_to_second(row, column) += block01;
-              coupling.second_to_first(row, column) += block10;
-            }
-            else
-            {
-              coupling.first_to_second(row, column) += block10;
-              coupling.second_to_first(row, column) += block01;
-            }
-          }
-        }
-      }
-    }
-
-    if (pairs.empty())
-    {
-      reason = "empty-local-face-pair-set";
-      return false;
-    }
-    reason = "active";
-    return true;
-  }
-
 private:
   const mfem::ParFiniteElementSpace& sfes_;
   const mfem::Operator* prolong_ = nullptr;
@@ -1459,29 +1239,6 @@ public:
 
   mfem::Operator& BaseOperator() const { return *base_; }
   mfem::Operator& FaceOperator() const { return *face_; }
-
-  bool AddElementDiagonalFaceBlocks(
-    std::vector<mfem::DenseMatrix>& blocks) const
-  {
-    if (!exact_face_)
-    {
-      return false;
-    }
-    exact_face_->AddElementDiagonalBlocks(blocks);
-    return true;
-  }
-
-  bool BuildLocalFacePairCouplings(
-    std::vector<ExactLocalFacePairCoupling>& pairs,
-    std::string& reason) const
-  {
-    if (!exact_face_)
-    {
-      reason = "requires-exact-face-operator";
-      return false;
-    }
-    return exact_face_->BuildLocalFacePairCouplings(pairs, reason);
-  }
 
   void ResetTiming() const
   {
@@ -1638,1206 +1395,6 @@ private:
   mutable ExactFaceTimingStats timing_;
 };
 
-class ExactElementBlockJacobi final : public mfem::Solver
-{
-public:
-  ExactElementBlockJacobi(
-    int vector_size,
-    int elements,
-    int block_size,
-    const std::vector<mfem::DenseMatrix>& inverse_blocks)
-    : mfem::Solver(vector_size, false),
-      elements_(elements),
-      block_size_(block_size),
-      inverse_blocks_(elements * block_size * block_size)
-  {
-    MFEM_VERIFY(vector_size > 0 && elements > 0 && block_size > 0 &&
-                  vector_size == elements * block_size &&
-                  static_cast<int>(inverse_blocks.size()) == elements,
-                "Exact element-block Jacobi received invalid block storage.");
-    double* blocks = inverse_blocks_.HostWrite();
-    for (int element = 0; element < elements_; ++element)
-    {
-      const mfem::DenseMatrix& block =
-        inverse_blocks[static_cast<std::size_t>(element)];
-      MFEM_VERIFY(block.Height() == block_size_ &&
-                    block.Width() == block_size_,
-                  "Exact element-block Jacobi received inconsistent block "
-                  "dimensions.");
-      for (int column = 0; column < block_size_; ++column)
-      {
-        for (int row = 0; row < block_size_; ++row)
-        {
-          blocks[row + block_size_ * (column + block_size_ * element)] =
-            block(row, column);
-        }
-      }
-    }
-    inverse_blocks_.UseDevice(true);
-  }
-
-  void SetOperator(const mfem::Operator& op) override
-  {
-    MFEM_VERIFY(op.Height() == Height() && op.Width() == Width(),
-                "Exact element-block Jacobi received a size-changing "
-                "operator update.");
-  }
-
-  void Mult(const mfem::Vector& x, mfem::Vector& y) const override
-  {
-    MFEM_VERIFY(x.Size() == Width(),
-                "Exact element-block Jacobi received a mismatched input.");
-    igr_device::LaunchExactElementBlockJacobiApply(
-      elements_, block_size_, inverse_blocks_, x, y);
-  }
-
-  void MultTranspose(const mfem::Vector& x, mfem::Vector& y) const override
-  {
-    // Each stored inverse block is explicitly symmetrized at construction.
-    Mult(x, y);
-  }
-
-  mfem::MemoryClass GetMemoryClass() const override
-  {
-    return mfem::Device::GetDeviceMemoryClass();
-  }
-
-private:
-  int elements_ = 0;
-  int block_size_ = 0;
-  mfem::Vector inverse_blocks_;
-};
-
-class ExactFacePairAdditiveSchwarz final : public mfem::Solver
-{
-public:
-  ExactFacePairAdditiveSchwarz(
-    int vector_size,
-    int elements,
-    int element_block_size,
-    const std::vector<ExactLocalFacePairCoupling>& pairs,
-    const std::vector<int>& overlap,
-    const std::vector<mfem::DenseMatrix>& inverse_patches)
-    : mfem::Solver(vector_size, false),
-      elements_(elements),
-      element_block_size_(element_block_size),
-      patch_size_(2 * element_block_size),
-      patches_(static_cast<int>(pairs.size())),
-      patch_dofs_(patches_ * patch_size_),
-      patch_weights_(patches_ * patch_size_),
-      patch_inverse_(patches_ * patch_size_,
-                     patches_,
-                     patch_size_,
-                     inverse_patches),
-      patch_rhs_(patches_ * patch_size_),
-      patch_solution_(patches_ * patch_size_)
-  {
-    MFEM_VERIFY(vector_size > 0 && elements_ > 1 &&
-                  element_block_size_ > 0 &&
-                  vector_size == elements_ * element_block_size_ &&
-                  patches_ > 0 &&
-                  static_cast<int>(overlap.size()) == elements_ &&
-                  static_cast<int>(inverse_patches.size()) == patches_,
-                "Exact face-pair Schwarz received inconsistent storage.");
-    int* patch_dofs = patch_dofs_.HostWrite();
-    mfem::real_t* patch_weights = patch_weights_.HostWrite();
-    for (int patch = 0; patch < patches_; ++patch)
-    {
-      const ExactLocalFacePairCoupling& pair =
-        pairs[static_cast<std::size_t>(patch)];
-      MFEM_VERIFY(pair.first_element >= 0 &&
-                    pair.first_element < elements_ &&
-                    pair.second_element >= 0 &&
-                    pair.second_element < elements_ &&
-                    pair.first_element != pair.second_element,
-                  "Exact face-pair Schwarz received an invalid patch.");
-      const int patch_elements[2] = {pair.first_element,
-                                     pair.second_element};
-      for (int side = 0; side < 2; ++side)
-      {
-        const int element = patch_elements[side];
-        MFEM_VERIFY(overlap[static_cast<std::size_t>(element)] > 0,
-                    "Exact face-pair Schwarz requires positive overlap.");
-        const mfem::real_t weight =
-          1.0 / std::sqrt(static_cast<mfem::real_t>(
-                  overlap[static_cast<std::size_t>(element)]));
-        min_overlap_ =
-          std::min(min_overlap_, overlap[static_cast<std::size_t>(element)]);
-        max_overlap_ =
-          std::max(max_overlap_, overlap[static_cast<std::size_t>(element)]);
-        for (int local = 0; local < element_block_size_; ++local)
-        {
-          const int row =
-            local + element_block_size_ * (side + 2 * patch);
-          patch_dofs[row] = local + element_block_size_ * element;
-          patch_weights[row] = weight;
-        }
-      }
-    }
-    patch_dofs_.GetMemory().UseDevice(true);
-    patch_weights_.UseDevice(true);
-    patch_rhs_.UseDevice(true);
-    patch_solution_.UseDevice(true);
-  }
-
-  void SetOperator(const mfem::Operator& op) override
-  {
-    MFEM_VERIFY(op.Height() == Height() && op.Width() == Width(),
-                "Exact face-pair Schwarz received a size-changing operator "
-                "update.");
-  }
-
-  void Mult(const mfem::Vector& x, mfem::Vector& y) const override
-  {
-    MFEM_VERIFY(x.Size() == Width(),
-                "Exact face-pair Schwarz received a mismatched input.");
-    ::dg_igr::NVTXRange range("IGR/exact-face-pair-schwarz/Mult");
-    const int patch_entries = patches_ * patch_size_;
-    const int* patch_dofs = patch_dofs_.Read();
-    const mfem::real_t* patch_weights = patch_weights_.Read();
-    const mfem::real_t* input = x.Read();
-    mfem::real_t* patch_rhs = patch_rhs_.Write();
-    mfem::forall(patch_entries,
-                 [=] MFEM_HOST_DEVICE(int entry)
-                 {
-                   patch_rhs[entry] =
-                     patch_weights[entry] * input[patch_dofs[entry]];
-                 });
-    patch_inverse_.Mult(patch_rhs_, patch_solution_);
-    y.SetSize(Width());
-    y.UseDevice(true);
-    y = 0.0;
-    const mfem::real_t* patch_solution = patch_solution_.Read();
-    mfem::real_t* output = y.ReadWrite();
-    mfem::forall(patch_entries,
-                 [=] MFEM_HOST_DEVICE(int entry)
-                 {
-                   ::AtomicAdd(output[patch_dofs[entry]],
-                               patch_weights[entry] * patch_solution[entry]);
-                 });
-  }
-
-  void MultTranspose(const mfem::Vector& x, mfem::Vector& y) const override
-  {
-    // P = R_w^T diag(A_patch^{-1}) R_w is symmetric because every patch
-    // inverse is explicitly symmetrized after an FP64 Cholesky inversion.
-    Mult(x, y);
-  }
-
-  mfem::MemoryClass GetMemoryClass() const override
-  {
-    return mfem::Device::GetDeviceMemoryClass();
-  }
-
-  int PatchCount() const { return patches_; }
-  int PatchSize() const { return patch_size_; }
-  int MinOverlap() const { return min_overlap_; }
-  int MaxOverlap() const { return max_overlap_; }
-  long long RestrictionNonzeros() const
-  {
-    return static_cast<long long>(patches_) * patch_size_;
-  }
-  long long InverseEntries() const
-  {
-    return static_cast<long long>(patches_) * patch_size_ * patch_size_;
-  }
-
-private:
-  int elements_ = 0;
-  int element_block_size_ = 0;
-  int patch_size_ = 0;
-  int patches_ = 0;
-  int min_overlap_ = std::numeric_limits<int>::max();
-  int max_overlap_ = 0;
-  mfem::Array<int> patch_dofs_;
-  mfem::Vector patch_weights_;
-  ExactElementBlockJacobi patch_inverse_;
-  mutable mfem::Vector patch_rhs_;
-  mutable mfem::Vector patch_solution_;
-};
-
-class SharedCorrelationBlockJacobi final : public mfem::Solver
-{
-public:
-  SharedCorrelationBlockJacobi(
-    int vector_size,
-    int elements,
-    int block_size,
-    const mfem::DenseMatrix& inverse_correlation,
-    const std::vector<mfem::real_t>& inverse_sqrt_diagonal)
-    : mfem::Solver(vector_size, false),
-      elements_(elements),
-      block_size_(block_size),
-      inverse_correlation_(block_size, block_size, 1),
-      inverse_sqrt_diagonal_(vector_size),
-      scaled_(vector_size)
-  {
-    MFEM_VERIFY(vector_size > 0 && elements > 0 && block_size > 0 &&
-                  vector_size == elements * block_size &&
-                  inverse_correlation.Height() == block_size &&
-                  inverse_correlation.Width() == block_size &&
-                  static_cast<int>(inverse_sqrt_diagonal.size()) ==
-                    vector_size,
-                "Shared-correlation block Jacobi received inconsistent "
-                "storage.");
-    mfem::real_t* matrix = inverse_correlation_.HostWrite();
-    for (int column = 0; column < block_size_; ++column)
-    {
-      for (int row = 0; row < block_size_; ++row)
-      {
-        matrix[row + block_size_ * column] =
-          inverse_correlation(row, column);
-      }
-    }
-    std::copy(inverse_sqrt_diagonal.begin(),
-              inverse_sqrt_diagonal.end(),
-              inverse_sqrt_diagonal_.HostWrite());
-    inverse_correlation_.Read();
-    inverse_sqrt_diagonal_.UseDevice(true);
-    scaled_.UseDevice(true);
-  }
-
-  void SetOperator(const mfem::Operator& op) override
-  {
-    MFEM_VERIFY(op.Height() == Height() && op.Width() == Width(),
-                "Shared-correlation block Jacobi received a size-changing "
-                "operator update.");
-  }
-
-  void Mult(const mfem::Vector& x, mfem::Vector& y) const override
-  {
-    MFEM_VERIFY(x.Size() == Width(),
-                "Shared-correlation block Jacobi received a mismatched "
-                "input.");
-    scaled_ = x;
-    scaled_ *= inverse_sqrt_diagonal_;
-    y.SetSize(Height());
-    y.UseDevice(true);
-    // With one shared matrix, the GPU-BLAS backend sees X as an
-    // (block_size x elements) panel and issues one true GEMM rather than a
-    // batch of unrelated one-RHS GEMVs.
-    mfem::BatchedLinAlg::Mult(inverse_correlation_, scaled_, y);
-    y *= inverse_sqrt_diagonal_;
-  }
-
-  void MultTranspose(const mfem::Vector& x, mfem::Vector& y) const override
-  {
-    Mult(x, y);
-  }
-
-  mfem::MemoryClass GetMemoryClass() const override
-  {
-    return mfem::Device::GetDeviceMemoryClass();
-  }
-
-private:
-  int elements_ = 0;
-  int block_size_ = 0;
-  mfem::DenseTensor inverse_correlation_;
-  mfem::Vector inverse_sqrt_diagonal_;
-  mutable mfem::Vector scaled_;
-};
-
-// Symmetric diagonal congruence for a persistent approximate inverse.  If the
-// current stage operator is approximately A_k = D A_0 D, this applies
-// D^{-1} A_0^{-1} D^{-1}.  The exact stage operator and stopping certificate
-// are unchanged; this is an env-only screen for coefficient-aware reuse of a
-// static LOR hierarchy.
-class SymmetricDiagonalScaledSolver final : public mfem::Solver
-{
-public:
-  SymmetricDiagonalScaledSolver(mfem::Solver& base,
-                                const mfem::Vector& base_diagonal,
-                                const mfem::Operator& current_operator)
-    : mfem::Solver(base.Height(), false),
-      base_(&base),
-      scale_(base.Height()),
-      scratch_(base.Height())
-  {
-    MFEM_VERIFY(base.Height() == base.Width() &&
-                  base_diagonal.Size() == base.Height() &&
-                  current_operator.Height() == base.Height() &&
-                  current_operator.Width() == base.Width(),
-                "Scaled LOR preconditioner received inconsistent sizes.");
-    mfem::Vector current_diagonal(base.Height());
-    current_operator.AssembleDiagonal(current_diagonal);
-    const mfem::real_t* base_data = base_diagonal.HostRead();
-    const mfem::real_t* current_data = current_diagonal.HostRead();
-    mfem::real_t* scale_data = scale_.HostWrite();
-    for (int i = 0; i < scale_.Size(); ++i)
-    {
-      MFEM_VERIFY(std::isfinite(base_data[i]) && base_data[i] > 0.0 &&
-                    std::isfinite(current_data[i]) && current_data[i] > 0.0,
-                  "Scaled LOR preconditioner requires positive diagonals.");
-      scale_data[i] = std::sqrt(base_data[i] / current_data[i]);
-    }
-    scale_.UseDevice(true);
-    scratch_.UseDevice(true);
-  }
-
-  void SetOperator(const mfem::Operator& op) override
-  {
-    MFEM_VERIFY(op.Height() == Height() && op.Width() == Width(),
-                "Scaled LOR preconditioner received a size-changing update.");
-  }
-
-  void Mult(const mfem::Vector& x, mfem::Vector& y) const override
-  {
-    scratch_ = x;
-    scratch_ *= scale_;
-    base_->Mult(scratch_, y);
-    y *= scale_;
-  }
-
-  void MultTranspose(const mfem::Vector& x, mfem::Vector& y) const override
-  {
-    Mult(x, y);
-  }
-
-  mfem::MemoryClass GetMemoryClass() const override
-  {
-    return mfem::Device::GetDeviceMemoryClass();
-  }
-
-private:
-  mfem::Solver* base_ = nullptr;
-  mfem::Vector scale_;
-  mutable mfem::Vector scratch_;
-};
-
-class AdditiveOwnedSolver final : public mfem::Solver
-{
-public:
-  AdditiveOwnedSolver(std::unique_ptr<mfem::Solver> first,
-                      std::unique_ptr<mfem::Solver> second)
-    : mfem::Solver(first ? first->Height() : 0, false),
-      first_(std::move(first)),
-      second_(std::move(second)),
-      scratch_(Height())
-  {
-    MFEM_VERIFY(first_ && second_ && Height() == Width() &&
-                  second_->Height() == Height() &&
-                  second_->Width() == Width(),
-                "Additive preconditioner received inconsistent solvers.");
-    scratch_.UseDevice(true);
-  }
-
-  void SetOperator(const mfem::Operator& op) override
-  {
-    MFEM_VERIFY(op.Height() == Height() && op.Width() == Width(),
-                "Additive preconditioner received a size-changing update.");
-  }
-
-  void Mult(const mfem::Vector& x, mfem::Vector& y) const override
-  {
-    first_->Mult(x, y);
-    second_->Mult(x, scratch_);
-    y += scratch_;
-  }
-
-  void MultTranspose(const mfem::Vector& x, mfem::Vector& y) const override
-  {
-    Mult(x, y);
-  }
-
-  mfem::MemoryClass GetMemoryClass() const override
-  {
-    return mfem::Device::GetDeviceMemoryClass();
-  }
-
-private:
-  std::unique_ptr<mfem::Solver> first_;
-  std::unique_ptr<mfem::Solver> second_;
-  mutable mfem::Vector scratch_;
-};
-
-class ElementMeanZeroSolver final : public mfem::Solver
-{
-public:
-  ElementMeanZeroSolver(std::unique_ptr<mfem::Solver> base,
-                        int elements,
-                        int block_size)
-    : mfem::Solver(base ? base->Height() : 0, false),
-      base_(std::move(base)),
-      elements_(elements),
-      block_size_(block_size),
-      projected_(Height()),
-      applied_(Height())
-  {
-    MFEM_VERIFY(base_ && elements_ > 0 && block_size_ > 1 &&
-                  Height() == elements_ * block_size_,
-                "Mean-zero element solver received inconsistent storage.");
-    projected_.UseDevice(true);
-    applied_.UseDevice(true);
-  }
-
-  void SetOperator(const mfem::Operator& op) override
-  {
-    MFEM_VERIFY(op.Height() == Height() && op.Width() == Width(),
-                "Mean-zero element solver received a size-changing update.");
-  }
-
-  void Mult(const mfem::Vector& x, mfem::Vector& y) const override
-  {
-    igr_device::LaunchElementMeanProjection(
-      elements_, block_size_, x, projected_);
-    base_->Mult(projected_, applied_);
-    igr_device::LaunchElementMeanProjection(
-      elements_, block_size_, applied_, y);
-  }
-
-  void MultTranspose(const mfem::Vector& x, mfem::Vector& y) const override
-  {
-    Mult(x, y);
-  }
-
-  mfem::MemoryClass GetMemoryClass() const override
-  {
-    return mfem::Device::GetDeviceMemoryClass();
-  }
-
-private:
-  std::unique_ptr<mfem::Solver> base_;
-  int elements_ = 0;
-  int block_size_ = 0;
-  mutable mfem::Vector projected_;
-  mutable mfem::Vector applied_;
-};
-
-class OriginalElementDG0Correction final : public mfem::Solver
-{
-public:
-  OriginalElementDG0Correction(
-    int high_order_size,
-    int elements,
-    int block_size,
-    std::unique_ptr<mfem::DG_FECollection> coarse_collection,
-    std::unique_ptr<mfem::ParFiniteElementSpace> coarse_space,
-    std::unique_ptr<mfem::ParBilinearForm> coarse_form,
-    std::unique_ptr<mfem::HypreParMatrix> coarse_matrix,
-    std::unique_ptr<mfem::HypreBoomerAMG> coarse_solver)
-    : mfem::Solver(high_order_size, false),
-      elements_(elements),
-      block_size_(block_size),
-      coarse_collection_(std::move(coarse_collection)),
-      coarse_space_(std::move(coarse_space)),
-      coarse_form_(std::move(coarse_form)),
-      coarse_matrix_(std::move(coarse_matrix)),
-      coarse_solver_(std::move(coarse_solver)),
-      coarse_rhs_(elements),
-      coarse_solution_(elements)
-  {
-    MFEM_VERIFY(elements_ > 0 && block_size_ > 1 &&
-                  Height() == elements_ * block_size_ &&
-                  coarse_collection_ && coarse_space_ && coarse_form_ &&
-                  coarse_matrix_ && coarse_solver_ &&
-                  coarse_space_->GetTrueVSize() == elements_ &&
-                  coarse_matrix_->Height() == elements_ &&
-                  coarse_matrix_->Width() == elements_,
-                "Original-element DG0 correction received inconsistent "
-                "storage.");
-    coarse_rhs_.UseDevice(true);
-    coarse_solution_.UseDevice(true);
-  }
-
-  void SetOperator(const mfem::Operator& op) override
-  {
-    MFEM_VERIFY(op.Height() == Height() && op.Width() == Width(),
-                "Original-element DG0 correction received a size-changing "
-                "update.");
-  }
-
-  void Mult(const mfem::Vector& x, mfem::Vector& y) const override
-  {
-    igr_device::LaunchElementConstantRestriction(
-      elements_, block_size_, x, coarse_rhs_);
-    coarse_solver_->Mult(coarse_rhs_, coarse_solution_);
-    igr_device::LaunchElementConstantProlongation(
-      elements_, block_size_, coarse_solution_, y);
-  }
-
-  void MultTranspose(const mfem::Vector& x, mfem::Vector& y) const override
-  {
-    Mult(x, y);
-  }
-
-  mfem::MemoryClass GetMemoryClass() const override
-  {
-    return mfem::Device::GetDeviceMemoryClass();
-  }
-
-private:
-  int elements_ = 0;
-  int block_size_ = 0;
-  std::unique_ptr<mfem::DG_FECollection> coarse_collection_;
-  std::unique_ptr<mfem::ParFiniteElementSpace> coarse_space_;
-  std::unique_ptr<mfem::ParBilinearForm> coarse_form_;
-  std::unique_ptr<mfem::HypreParMatrix> coarse_matrix_;
-  std::unique_ptr<mfem::HypreBoomerAMG> coarse_solver_;
-  mutable mfem::Vector coarse_rhs_;
-  mutable mfem::Vector coarse_solution_;
-};
-
-struct ExactElementBlockJacobiBuild
-{
-  std::unique_ptr<mfem::Solver> solver;
-  std::string reason = "not-attempted";
-  int colors = 0;
-  int block_size = 0;
-  int patch_count = 0;
-  int patch_size = 0;
-  int min_overlap = 0;
-  int max_overlap = 0;
-  int max_faces_per_pair = 0;
-  long long operator_applies = 0;
-  long long restriction_nonzeros = 0;
-  long long inverse_entries = 0;
-  double max_symmetry_defect = 0.0;
-  double max_inverse_residual = 0.0;
-};
-
-bool InvertSymmetricPositiveBlock(const mfem::DenseMatrix& input,
-                                  mfem::DenseMatrix& inverse,
-                                  double& relative_inverse_residual,
-                                  std::string& reason)
-{
-  const int n = input.Height();
-  if (n <= 0 || input.Width() != n)
-  {
-    reason = "invalid-block-size";
-    return false;
-  }
-
-  std::vector<double> diagonal_scale(static_cast<std::size_t>(n), 0.0);
-  double max_diagonal = 0.0;
-  for (int i = 0; i < n; ++i)
-  {
-    const double diagonal = input(i, i);
-    if (!std::isfinite(diagonal) || diagonal <= 0.0)
-    {
-      reason = "nonpositive-block-diagonal";
-      return false;
-    }
-    diagonal_scale[static_cast<std::size_t>(i)] = std::sqrt(diagonal);
-    max_diagonal = std::max(max_diagonal, diagonal);
-  }
-  if (!std::isfinite(max_diagonal) || max_diagonal <= 0.0)
-  {
-    reason = "invalid-block-scale";
-    return false;
-  }
-
-  // Cholesky-factor the symmetrically diagonally scaled block. Scaling its
-  // diagonal to one avoids treating small physical units as small pivots.
-  std::vector<double> lower(static_cast<std::size_t>(n * n), 0.0);
-  const double pivot_floor =
-    256.0 * std::numeric_limits<double>::epsilon() *
-    static_cast<double>(n);
-  for (int i = 0; i < n; ++i)
-  {
-    for (int j = 0; j <= i; ++j)
-    {
-      double value = input(i, j) /
-                     (diagonal_scale[static_cast<std::size_t>(i)] *
-                      diagonal_scale[static_cast<std::size_t>(j)]);
-      for (int k = 0; k < j; ++k)
-      {
-        value -= lower[static_cast<std::size_t>(i * n + k)] *
-                 lower[static_cast<std::size_t>(j * n + k)];
-      }
-      if (i == j)
-      {
-        if (!std::isfinite(value) || value <= pivot_floor)
-        {
-          reason = "block-cholesky-failed";
-          return false;
-        }
-        lower[static_cast<std::size_t>(i * n + j)] = std::sqrt(value);
-      }
-      else
-      {
-        const double pivot =
-          lower[static_cast<std::size_t>(j * n + j)];
-        value /= pivot;
-        if (!std::isfinite(value))
-        {
-          reason = "nonfinite-block-factor";
-          return false;
-        }
-        lower[static_cast<std::size_t>(i * n + j)] = value;
-      }
-    }
-  }
-
-  mfem::DenseMatrix scaled_inverse(n);
-  scaled_inverse = 0.0;
-  std::vector<double> forward(static_cast<std::size_t>(n), 0.0);
-  std::vector<double> solution(static_cast<std::size_t>(n), 0.0);
-  for (int column = 0; column < n; ++column)
-  {
-    std::fill(forward.begin(), forward.end(), 0.0);
-    std::fill(solution.begin(), solution.end(), 0.0);
-    for (int i = 0; i < n; ++i)
-    {
-      double value = (i == column) ? 1.0 : 0.0;
-      for (int k = 0; k < i; ++k)
-      {
-        value -= lower[static_cast<std::size_t>(i * n + k)] *
-                 forward[static_cast<std::size_t>(k)];
-      }
-      value /= lower[static_cast<std::size_t>(i * n + i)];
-      forward[static_cast<std::size_t>(i)] = value;
-    }
-    for (int i = n - 1; i >= 0; --i)
-    {
-      double value = forward[static_cast<std::size_t>(i)];
-      for (int k = i + 1; k < n; ++k)
-      {
-        value -= lower[static_cast<std::size_t>(k * n + i)] *
-                 solution[static_cast<std::size_t>(k)];
-      }
-      value /= lower[static_cast<std::size_t>(i * n + i)];
-      solution[static_cast<std::size_t>(i)] = value;
-    }
-    for (int i = 0; i < n; ++i)
-    {
-      scaled_inverse(i, column) = solution[static_cast<std::size_t>(i)];
-    }
-  }
-
-  inverse.SetSize(n);
-  for (int i = 0; i < n; ++i)
-  {
-    for (int j = 0; j < n; ++j)
-    {
-      inverse(i, j) =
-        scaled_inverse(i, j) /
-        (diagonal_scale[static_cast<std::size_t>(i)] *
-         diagonal_scale[static_cast<std::size_t>(j)]);
-      if (!std::isfinite(inverse(i, j)))
-      {
-        reason = "nonfinite-block-inverse";
-        return false;
-      }
-    }
-  }
-  // Preserve exact symmetry in the stored preconditioner even when the two
-  // triangular solves differ by the final roundoff bit.
-  for (int i = 0; i < n; ++i)
-  {
-    for (int j = i + 1; j < n; ++j)
-    {
-      const double symmetric = 0.5 * (inverse(i, j) + inverse(j, i));
-      inverse(i, j) = symmetric;
-      inverse(j, i) = symmetric;
-    }
-  }
-
-  double norm_input = 0.0;
-  double norm_inverse = 0.0;
-  double norm_residual = 0.0;
-  for (int i = 0; i < n; ++i)
-  {
-    double input_row_sum = 0.0;
-    double inverse_row_sum = 0.0;
-    double residual_row_sum = 0.0;
-    for (int j = 0; j < n; ++j)
-    {
-      input_row_sum += std::abs(input(i, j));
-      inverse_row_sum += std::abs(inverse(i, j));
-      double product = 0.0;
-      for (int k = 0; k < n; ++k)
-      {
-        product += input(i, k) * inverse(k, j);
-      }
-      residual_row_sum +=
-        std::abs(product - ((i == j) ? 1.0 : 0.0));
-    }
-    norm_input = std::max(norm_input, input_row_sum);
-    norm_inverse = std::max(norm_inverse, inverse_row_sum);
-    norm_residual = std::max(norm_residual, residual_row_sum);
-  }
-  const double residual_scale = norm_input * norm_inverse;
-  if (!std::isfinite(norm_input) || !std::isfinite(norm_inverse) ||
-      !std::isfinite(norm_residual) || !std::isfinite(residual_scale))
-  {
-    reason = "nonfinite-block-inverse-validation";
-    return false;
-  }
-  relative_inverse_residual =
-    norm_residual / std::max(1.0, residual_scale);
-  if (!std::isfinite(relative_inverse_residual) ||
-      relative_inverse_residual > 1.0e-10)
-  {
-    reason = "block-inverse-residual";
-    return false;
-  }
-  for (int i = 0; i < n; ++i)
-  {
-    if (!std::isfinite(inverse(i, i)) || inverse(i, i) <= 0.0)
-    {
-      reason = "nonpositive-inverse-diagonal";
-      return false;
-    }
-  }
-  return true;
-}
-
-ExactElementBlockJacobiBuild BuildExactElementBlockJacobi(
-  const mfem::ParFiniteElementSpace& sfes,
-  ExactFaceSumOperator& op,
-  bool shared_correlation,
-  bool face_pair_schwarz)
-{
-  ExactElementBlockJacobiBuild result;
-  mfem::Mesh* mesh = sfes.GetMesh();
-  if (!mesh || sfes.GetNE() <= 0)
-  {
-    result.reason = "invalid-mesh";
-    return result;
-  }
-  if (mesh->Nonconforming())
-  {
-    result.reason = "requires-conforming-mesh";
-    return result;
-  }
-
-  const int ne = sfes.GetNE();
-  const int vector_size = sfes.GetVSize();
-  if (op.Height() != vector_size || op.Width() != vector_size)
-  {
-    result.reason = "operator-size-mismatch";
-    return result;
-  }
-
-  std::vector<std::vector<int>> element_dofs(static_cast<std::size_t>(ne));
-  std::vector<int> dof_owner(static_cast<std::size_t>(vector_size), -1);
-  mfem::Array<int> vdofs;
-  int block_size = -1;
-  for (int element = 0; element < ne; ++element)
-  {
-    sfes.GetElementVDofs(element, vdofs);
-    if (block_size < 0)
-    {
-      block_size = vdofs.Size();
-    }
-    if (block_size <= 0 || vdofs.Size() != block_size)
-    {
-      result.reason = "nonuniform-element-block-size";
-      return result;
-    }
-    auto& dofs = element_dofs[static_cast<std::size_t>(element)];
-    dofs.resize(static_cast<std::size_t>(block_size));
-    for (int local = 0; local < block_size; ++local)
-    {
-      const int dof = vdofs[local];
-      if (dof < 0 || dof >= vector_size)
-      {
-        result.reason = "signed-or-invalid-element-dof";
-        return result;
-      }
-      if (dof_owner[static_cast<std::size_t>(dof)] >= 0)
-      {
-        result.reason = "non-discontinuous-element-dofs";
-        return result;
-      }
-      if (dof != local + block_size * element)
-      {
-        result.reason = "requires-contiguous-element-dofs";
-        return result;
-      }
-      dof_owner[static_cast<std::size_t>(dof)] = element;
-      dofs[static_cast<std::size_t>(local)] = dof;
-    }
-  }
-  if (std::find(dof_owner.begin(), dof_owner.end(), -1) != dof_owner.end())
-  {
-    result.reason = "element-dofs-do-not-cover-vector";
-    return result;
-  }
-
-  // The base operator is element-local. Seed the same local basis column in
-  // every element and recover all base principal blocks at once. The exact
-  // face operator contributes its self blocks directly from persistent face
-  // quadrature data, avoiding graph-colored complete-operator applications.
-  result.colors = 1;
-  result.block_size = block_size;
-
-  std::vector<mfem::DenseMatrix> blocks;
-  blocks.reserve(static_cast<std::size_t>(ne));
-  for (int element = 0; element < ne; ++element)
-  {
-    blocks.emplace_back(block_size);
-    blocks.back() = 0.0;
-  }
-
-  mfem::Vector probe(vector_size);
-  mfem::Vector response(vector_size);
-  for (int column = 0; column < block_size; ++column)
-  {
-    double* probe_data = probe.HostWrite();
-    std::fill(probe_data, probe_data + vector_size, 0.0);
-    for (int element = 0; element < ne; ++element)
-    {
-      const int dof = element_dofs[static_cast<std::size_t>(element)]
-                                  [static_cast<std::size_t>(column)];
-      probe_data[dof] = 1.0;
-    }
-    op.BaseOperator().Mult(probe, response);
-    ++result.operator_applies;
-    const double* response_data = response.HostRead();
-    for (int element = 0; element < ne; ++element)
-    {
-      mfem::DenseMatrix& block = blocks[static_cast<std::size_t>(element)];
-      const auto& dofs = element_dofs[static_cast<std::size_t>(element)];
-      for (int row = 0; row < block_size; ++row)
-      {
-        block(row, column) =
-          response_data[dofs[static_cast<std::size_t>(row)]];
-      }
-    }
-  }
-  if (!op.AddElementDiagonalFaceBlocks(blocks))
-  {
-    result.reason = "requires-exact-face-block-data";
-    return result;
-  }
-
-  for (int element = 0; element < ne; ++element)
-  {
-    mfem::DenseMatrix& block = blocks[static_cast<std::size_t>(element)];
-    double max_entry = 0.0;
-    double max_asymmetry = 0.0;
-    for (int i = 0; i < block_size; ++i)
-    {
-      for (int j = 0; j < block_size; ++j)
-      {
-        if (!std::isfinite(block(i, j)))
-        {
-          result.reason = "nonfinite-probed-block";
-          return result;
-        }
-        max_entry = std::max(max_entry, std::abs(block(i, j)));
-        max_asymmetry =
-          std::max(max_asymmetry, std::abs(block(i, j) - block(j, i)));
-      }
-    }
-    const double symmetry_defect =
-      max_asymmetry / std::max(max_entry, 1.0e-300);
-    result.max_symmetry_defect =
-      std::max(result.max_symmetry_defect, symmetry_defect);
-    if (!std::isfinite(symmetry_defect) || symmetry_defect > 1.0e-9)
-    {
-      result.reason = "probed-block-not-symmetric";
-      return result;
-    }
-    for (int i = 0; i < block_size; ++i)
-    {
-      for (int j = i + 1; j < block_size; ++j)
-      {
-        const double symmetric = 0.5 * (block(i, j) + block(j, i));
-        block(i, j) = symmetric;
-        block(j, i) = symmetric;
-      }
-    }
-
-  }
-
-  if (face_pair_schwarz)
-  {
-    if (shared_correlation)
-    {
-      result.reason = "face-pair-excludes-shared-correlation";
-      return result;
-    }
-    if (std::numeric_limits<mfem::real_t>::digits <
-        std::numeric_limits<double>::digits)
-    {
-      result.reason = "face-pair-requires-fp64-real";
-      return result;
-    }
-    int comm_size = 1;
-#ifdef MFEM_USE_MPI
-    MPI_Comm_size(sfes.GetComm(), &comm_size);
-#endif
-    if (comm_size != 1)
-    {
-      // The minimum oracle deliberately avoids pretending that a local-only
-      // pair cover is the same method under a different MPI partition. A
-      // production distributed Schwarz version needs explicit shared-patch
-      // ownership, halo restriction, and the same symmetric weights on both
-      // ranks.
-      result.reason = "face-pair-screen-requires-one-rank";
-      return result;
-    }
-
-    std::vector<ExactLocalFacePairCoupling> pairs;
-    std::string pair_reason;
-    if (!op.BuildLocalFacePairCouplings(pairs, pair_reason))
-    {
-      result.reason = "face-pair-" + pair_reason;
-      return result;
-    }
-
-    std::vector<int> overlap(static_cast<std::size_t>(ne), 0);
-    result.patch_count = static_cast<int>(pairs.size());
-    result.patch_size = 2 * block_size;
-    for (const ExactLocalFacePairCoupling& pair : pairs)
-    {
-      if (pair.first_element < 0 || pair.first_element >= ne ||
-          pair.second_element < 0 || pair.second_element >= ne ||
-          pair.first_element == pair.second_element ||
-          pair.first_to_second.Height() != block_size ||
-          pair.first_to_second.Width() != block_size ||
-          pair.second_to_first.Height() != block_size ||
-          pair.second_to_first.Width() != block_size)
-      {
-        result.reason = "invalid-face-pair-coupling";
-        return result;
-      }
-      ++overlap[static_cast<std::size_t>(pair.first_element)];
-      ++overlap[static_cast<std::size_t>(pair.second_element)];
-      result.max_faces_per_pair =
-        std::max(result.max_faces_per_pair, pair.contributing_faces);
-    }
-    result.min_overlap = std::numeric_limits<int>::max();
-    for (int count : overlap)
-    {
-      if (count <= 0)
-      {
-        result.reason = "face-pair-cover-misses-element";
-        return result;
-      }
-      result.min_overlap = std::min(result.min_overlap, count);
-      result.max_overlap = std::max(result.max_overlap, count);
-    }
-
-    std::vector<mfem::DenseMatrix> inverse_patches;
-    inverse_patches.reserve(pairs.size());
-    for (const ExactLocalFacePairCoupling& pair : pairs)
-    {
-      mfem::DenseMatrix patch(result.patch_size);
-      patch = 0.0;
-      const mfem::DenseMatrix& first_diagonal =
-        blocks[static_cast<std::size_t>(pair.first_element)];
-      const mfem::DenseMatrix& second_diagonal =
-        blocks[static_cast<std::size_t>(pair.second_element)];
-      for (int column = 0; column < block_size; ++column)
-      {
-        for (int row = 0; row < block_size; ++row)
-        {
-          patch(row, column) = first_diagonal(row, column);
-          patch(row + block_size, column + block_size) =
-            second_diagonal(row, column);
-          patch(row, column + block_size) =
-            pair.first_to_second(row, column);
-          patch(row + block_size, column) =
-            pair.second_to_first(row, column);
-        }
-      }
-
-      double max_entry = 0.0;
-      double max_asymmetry = 0.0;
-      for (int i = 0; i < result.patch_size; ++i)
-      {
-        for (int j = 0; j < result.patch_size; ++j)
-        {
-          if (!std::isfinite(patch(i, j)))
-          {
-            result.reason = "nonfinite-face-pair-patch";
-            return result;
-          }
-          max_entry = std::max(max_entry, std::abs(patch(i, j)));
-          max_asymmetry =
-            std::max(max_asymmetry,
-                     std::abs(patch(i, j) - patch(j, i)));
-        }
-      }
-      const double symmetry_defect =
-        max_asymmetry / std::max(max_entry, 1.0e-300);
-      result.max_symmetry_defect =
-        std::max(result.max_symmetry_defect, symmetry_defect);
-      if (!std::isfinite(symmetry_defect) || symmetry_defect > 1.0e-9)
-      {
-        result.reason = "face-pair-patch-not-symmetric";
-        return result;
-      }
-      for (int i = 0; i < result.patch_size; ++i)
-      {
-        for (int j = i + 1; j < result.patch_size; ++j)
-        {
-          const double symmetric = 0.5 * (patch(i, j) + patch(j, i));
-          patch(i, j) = symmetric;
-          patch(j, i) = symmetric;
-        }
-      }
-
-      mfem::DenseMatrix inverse;
-      double inverse_residual = 0.0;
-      std::string inversion_reason;
-      if (!InvertSymmetricPositiveBlock(patch,
-                                        inverse,
-                                        inverse_residual,
-                                        inversion_reason))
-      {
-        result.reason = "face-pair-" + inversion_reason;
-        return result;
-      }
-      result.max_inverse_residual =
-        std::max(result.max_inverse_residual, inverse_residual);
-      inverse_patches.emplace_back(std::move(inverse));
-    }
-
-    result.restriction_nonzeros =
-      static_cast<long long>(result.patch_count) * result.patch_size;
-    result.inverse_entries =
-      static_cast<long long>(result.patch_count) * result.patch_size *
-      result.patch_size;
-    result.solver = std::make_unique<ExactFacePairAdditiveSchwarz>(
-      vector_size,
-      ne,
-      block_size,
-      pairs,
-      overlap,
-      inverse_patches);
-    result.reason = "active-face-pair";
-    return result;
-  }
-
-  if (shared_correlation)
-  {
-    std::vector<mfem::real_t> inverse_sqrt_diagonal(
-      static_cast<std::size_t>(vector_size), 0.0);
-    std::vector<double> local_correlation_sum(
-      static_cast<std::size_t>(block_size * block_size), 0.0);
-    for (int element = 0; element < ne; ++element)
-    {
-      const mfem::DenseMatrix& block =
-        blocks[static_cast<std::size_t>(element)];
-      for (int i = 0; i < block_size; ++i)
-      {
-        const double diagonal = block(i, i);
-        if (!std::isfinite(diagonal) || diagonal <= 0.0)
-        {
-          result.reason = "nonpositive-correlation-block-diagonal";
-          return result;
-        }
-        inverse_sqrt_diagonal[static_cast<std::size_t>(
-          i + block_size * element)] = 1.0 / std::sqrt(diagonal);
-      }
-      for (int column = 0; column < block_size; ++column)
-      {
-        const double column_scale = inverse_sqrt_diagonal[static_cast<
-          std::size_t>(column + block_size * element)];
-        for (int row = 0; row < block_size; ++row)
-        {
-          const double row_scale = inverse_sqrt_diagonal[static_cast<
-            std::size_t>(row + block_size * element)];
-          local_correlation_sum[static_cast<std::size_t>(
-            row + block_size * column)] +=
-            row_scale * block(row, column) * column_scale;
-        }
-      }
-    }
-
-    std::vector<double> global_correlation_sum(
-      local_correlation_sum.size(), 0.0);
-    long long local_elements = ne;
-    long long global_elements = 0;
-#ifdef MFEM_USE_MPI
-    MPI_Allreduce(local_correlation_sum.data(),
-                  global_correlation_sum.data(),
-                  block_size * block_size,
-                  MPI_DOUBLE,
-                  MPI_SUM,
-                  sfes.GetComm());
-    MPI_Allreduce(&local_elements,
-                  &global_elements,
-                  1,
-                  MPI_LONG_LONG,
-                  MPI_SUM,
-                  sfes.GetComm());
-#else
-    global_correlation_sum = local_correlation_sum;
-    global_elements = local_elements;
-#endif
-    if (global_elements <= 0)
-    {
-      result.reason = "empty-global-correlation-block";
-      return result;
-    }
-
-    mfem::DenseMatrix correlation(block_size);
-    for (int column = 0; column < block_size; ++column)
-    {
-      for (int row = 0; row < block_size; ++row)
-      {
-        correlation(row, column) =
-          global_correlation_sum[static_cast<std::size_t>(
-            row + block_size * column)] /
-          static_cast<double>(global_elements);
-      }
-    }
-    for (int i = 0; i < block_size; ++i)
-    {
-      for (int j = i + 1; j < block_size; ++j)
-      {
-        const double symmetric =
-          0.5 * (correlation(i, j) + correlation(j, i));
-        correlation(i, j) = symmetric;
-        correlation(j, i) = symmetric;
-      }
-    }
-
-    mfem::DenseMatrix inverse_correlation;
-    double inverse_residual = 0.0;
-    std::string inversion_reason;
-    if (!InvertSymmetricPositiveBlock(correlation,
-                                      inverse_correlation,
-                                      inverse_residual,
-                                      inversion_reason))
-    {
-      result.reason = "correlation-" + inversion_reason;
-      return result;
-    }
-    result.max_inverse_residual = inverse_residual;
-    result.solver = std::make_unique<SharedCorrelationBlockJacobi>(
-      vector_size,
-      ne,
-      block_size,
-      inverse_correlation,
-      inverse_sqrt_diagonal);
-    result.reason = "active-shared-correlation";
-    return result;
-  }
-
-  std::vector<mfem::DenseMatrix> inverse_blocks;
-  inverse_blocks.reserve(static_cast<std::size_t>(ne));
-  for (int element = 0; element < ne; ++element)
-  {
-    mfem::DenseMatrix block_inverse;
-    double inverse_residual = 0.0;
-    std::string inversion_reason;
-    if (!InvertSymmetricPositiveBlock(blocks[static_cast<std::size_t>(element)],
-                                      block_inverse,
-                                      inverse_residual,
-                                      inversion_reason))
-    {
-      result.reason = inversion_reason;
-      return result;
-    }
-    result.max_inverse_residual =
-      std::max(result.max_inverse_residual, inverse_residual);
-    inverse_blocks.emplace_back(block_inverse);
-  }
-  result.solver = std::make_unique<ExactElementBlockJacobi>(vector_size,
-                                                            ne,
-                                                            block_size,
-                                                            inverse_blocks);
-  result.reason = "active";
-  return result;
-}
-
 } // namespace
 
 const mfem::Operator* IGRSolver::GetLinearBaseOperator() const
@@ -2964,6 +1521,23 @@ bool IGRSolver::ShouldUsePartialAssembly_() const
 {
   const bool device_backend =
     mfem::Device::Allows(mfem::Backend::DEVICE_MASK);
+  const bool exact_face = UseExactDGFaceOperator_();
+  if (exact_face)
+  {
+    MFEM_VERIFY(
+      !PreconditionerRequiresAssembledMatrix(prec_type_),
+      "The exact side-aware DG face operator requires partial assembly and "
+      "is incompatible with an assembled-matrix IGR preconditioner.");
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[igr-linear] event=partial-assembly-policy"
+                << " requested=on"
+                << " effective=on"
+                << " reason=exact-dg-face-required-partial-assembly"
+                << " precond=" << PrecondTypeName(prec_type_) << "\n";
+    }
+    return true;
+  }
   if (device_backend)
   {
     const bool requested =
@@ -3141,12 +1715,6 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
   {
     ::dg_igr::NVTXRange coeff_range("IGR/device-coefficients");
     UpdateDeviceCoefficients_(U);
-    // Keep the host coefficient views coherent for env-only assembled
-    // preconditioner screens.  Their evaluation triggers a host read only if
-    // such a screen is actually selected; the production device operator
-    // continues to consume the QuadratureFunction coefficients above.
-    invrho_coef_->SetState(U);
-    invrho_coef_->SetRhoFloor(rho_floor_);
   }
   else
   {
@@ -3263,10 +1831,8 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
     }
     auto* pmesh = dynamic_cast<mfem::ParMesh*>(mesh);
     const mfem::Geometry::Type face_geom = mesh->GetTypicalFaceGeometry();
-    const int exact_face_order =
-      2 * std::max(SpaceOrder(sfes_), SpaceOrder(vfes_));
     const mfem::IntegrationRule& exact_face_ir =
-      mfem::IntRules.Get(face_geom, exact_face_order);
+      mfem::IntRules.Get(face_geom, 2 * SpaceOrder(sfes_));
     mfem::FaceQuadratureSpace exact_fqs(*mesh,
                                         exact_face_ir,
                                         mfem::FaceType::Interior);
@@ -3398,7 +1964,9 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
     const mfem::real_t face_kappa =
       static_cast<mfem::real_t>(IPDGPenalty(sfes_));
     const dg_face::DGDiffusionFaceScaling face_scaling =
-      ReadIPDGFaceScaling();
+      sigma_cadence_ == IGRSigmaUpdateCadence::ExtrapolatedEveryStep
+        ? dg_face::DGDiffusionFaceScaling::Arithmetic
+        : ReadIPDGFaceScaling();
     face_op = dynamic_cast<ExactL2DGFaceOperator*>(
       exact_face_operator_.get());
     const bool reused_face_geometry =
@@ -3586,8 +2154,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     ReadEnvReal("DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR", 5.0);
   MFEM_VERIFY(extended_certificate_start > 0,
               "DG_IGR_IGR_EXTENDED_CERTIFICATE_START must be positive.");
-  MFEM_VERIFY(extended_certificate_factor > 0.0,
-              "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR must be positive.");
+  MFEM_VERIFY(std::isfinite(extended_certificate_factor) &&
+                extended_certificate_factor > 0.0,
+              "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR must be finite and "
+              "positive.");
   const bool extended_certificate_enabled =
     ::dg_igr::EnvFlagEnabledDefault(
       "DG_IGR_IGR_EXTENDED_CERTIFICATE", false) &&
@@ -3747,627 +2317,14 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
 
   const auto pc_setup_start = std::chrono::steady_clock::now();
   std::unique_ptr<KrylovTelemetryOperator> cheb_operator_telemetry;
-  std::unique_ptr<mfem::Solver> owned_prec;
-  mfem::Solver* prec = nullptr;
-  auto set_owned_preconditioner =
-    [&](std::unique_ptr<mfem::Solver> candidate)
-    {
-      owned_prec = std::move(candidate);
-      prec = owned_prec.get();
-    };
+  std::unique_ptr<mfem::Solver> prec;
   bool using_operator_jacobi = false;
   bool using_operator_jacobi_exact_face_diag = false;
   bool using_operator_chebyshev = false;
   bool using_operator_chebyshev_base = false;
-  bool using_static_dg_lor_amg = false;
-  bool static_dg_lor_amg_reused = false;
-  std::string static_dg_lor_amg_reason = "not-requested";
-  double static_dg_lor_amg_setup_seconds = 0.0;
-  double static_dg_lor_alpha_proxy =
-    std::numeric_limits<double>::quiet_NaN();
-  const bool static_dg_lor_amg_requested =
-    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_STATIC_DG_LOR_AMG", false);
-  bool using_exact_element_block_jacobi = false;
-  const bool exact_element_block_jacobi_env_requested =
-    ::dg_igr::EnvFlagEnabledDefault(
-      "DG_IGR_IGR_EXACT_ELEMENT_BLOCK_JACOBI", false);
-  const bool exact_face_pair_schwarz_requested =
-    ::dg_igr::EnvFlagEnabledDefault(
-      "DG_IGR_IGR_EXACT_FACE_PAIR_SCHWARZ", false);
-  const bool exact_element_block_jacobi_requested =
-    exact_element_block_jacobi_env_requested ||
-    exact_face_pair_schwarz_requested;
-  const bool exact_element_block_step_reuse_requested =
-    ::dg_igr::EnvFlagEnabledDefault(
-      "DG_IGR_IGR_EXACT_ELEMENT_BLOCK_STEP_REUSE", false);
-  const bool shared_correlation_block_requested =
-    ::dg_igr::EnvFlagEnabledDefault(
-      "DG_IGR_IGR_SHARED_CORRELATION_BLOCK", false);
-  const bool original_dg0_two_level_requested =
-    ::dg_igr::EnvFlagEnabledDefault(
-      "DG_IGR_IGR_ORIGINAL_DG0_TWO_LEVEL", false);
-  MFEM_VERIFY(!original_dg0_two_level_requested ||
-                (!static_dg_lor_amg_requested &&
-                 exact_element_block_jacobi_env_requested &&
-                 !exact_face_pair_schwarz_requested),
-              "DG_IGR_IGR_ORIGINAL_DG0_TWO_LEVEL requires exact element "
-              "blocks and excludes the refined LOR prototype.");
-  MFEM_VERIFY(!exact_element_block_step_reuse_requested ||
-                (exact_element_block_jacobi_requested &&
-                 !static_dg_lor_amg_requested &&
-                 !original_dg0_two_level_requested),
-              "DG_IGR_IGR_EXACT_ELEMENT_BLOCK_STEP_REUSE requires exact "
-              "local blocks and excludes the LOR/DG0 prototypes.");
-  MFEM_VERIFY(!shared_correlation_block_requested ||
-                (exact_element_block_jacobi_env_requested &&
-                 !exact_face_pair_schwarz_requested),
-              "DG_IGR_IGR_SHARED_CORRELATION_BLOCK requires exact element "
-              "blocks and excludes the face-pair Schwarz screen.");
-  MFEM_VERIFY(!exact_face_pair_schwarz_requested ||
-                (!static_dg_lor_amg_requested &&
-                 !original_dg0_two_level_requested &&
-                 !shared_correlation_block_requested),
-              "DG_IGR_IGR_EXACT_FACE_PAIR_SCHWARZ is an isolated exact "
-              "local-patch screen and excludes the LOR, DG0, and shared-"
-              "correlation prototypes.");
-  bool using_original_dg0_two_level = false;
-  ExactElementBlockJacobiBuild exact_element_block_build;
-  std::unique_ptr<mfem::Solver> exact_element_block_prec;
-  mfem::Solver* cached_exact_element_block_prec = nullptr;
-  bool exact_element_block_cache_reused = false;
-  double exact_element_block_setup_seconds = 0.0;
   {
     ::dg_igr::NVTXRange pc_range("IGR/preconditioner-setup");
-    if (static_dg_lor_amg_requested)
-    {
-      const auto lor_setup_start = Clock::now();
-      mfem::Mesh* mesh = sfes_.GetMesh();
-      const auto* l2_collection =
-        dynamic_cast<const mfem::L2_FECollection*>(sfes_.FEColl());
-      const int order = sfes_.GetNE() > 0 ? SpaceOrder(sfes_) : -1;
-      const double penalty = order >= 0
-        ? IPDGPenalty(sfes_)
-        : std::numeric_limits<double>::quiet_NaN();
-      if (!is_dg || sfes_.GetVDim() != 1 ||
-          l2_collection == nullptr)
-      {
-        static_dg_lor_amg_reason = "requires-scalar-l2";
-      }
-      else if (ip_kind_ != IPKind::SIPG || !spd_ok)
-      {
-        static_dg_lor_amg_reason = "requires-sipg";
-      }
-      else if (!exact_face_sum_op || !last_exact_face_effective_)
-      {
-        static_dg_lor_amg_reason = "requires-exact-face-operator";
-      }
-      else if (!direct_identity_system_)
-      {
-        static_dg_lor_amg_reason = "requires-direct-identity-system";
-      }
-      else if (ess_bdr_.Size() != 0 || ess_tdof_list_.Size() != 0)
-      {
-        static_dg_lor_amg_reason = "requires-natural-boundary";
-      }
-      else if (!mesh)
-      {
-        static_dg_lor_amg_reason = "requires-valid-mesh";
-      }
-      else if (mesh->Nonconforming())
-      {
-        static_dg_lor_amg_reason = "requires-conforming-mesh";
-      }
-      else if (mesh->Dimension() != 2 ||
-               mesh->GetNumGeometries(mesh->Dimension()) != 1 ||
-               mesh->GetTypicalElementGeometry() != mfem::Geometry::SQUARE ||
-               !mfem::UsesTensorBasis(sfes_))
-      {
-        static_dg_lor_amg_reason = "requires-tensor-product-quads";
-      }
-      else if (sfes_.IsVariableOrder() || order < 1 || order > 3)
-      {
-        static_dg_lor_amg_reason = "requires-uniform-p1-p3";
-      }
-      else if (!alpha_coef_ || !std::isfinite(alpha_) || alpha_ <= 0.0)
-      {
-        static_dg_lor_amg_reason = "requires-positive-finite-alpha";
-      }
-      else
-      {
-        const bool cache_matches =
-          static_dg_lor_amg_ && static_dg_lor_discretization_ &&
-          static_dg_lor_form_ && static_dg_lor_mass_coef_ &&
-          static_dg_lor_diffusion_coef_ &&
-          static_dg_lor_diagonal_.Size() == A_op->Height() &&
-          static_dg_lor_mesh_ == mesh &&
-          static_dg_lor_mesh_sequence_ == mesh->GetSequence() &&
-          static_dg_lor_sfes_sequence_ == sfes_.GetSequence() &&
-          static_dg_lor_alpha_ == alpha_ &&
-          static_dg_lor_alpha_policy_ == alpha_length_scale_policy_ &&
-          static_dg_lor_penalty_ == penalty &&
-          static_dg_lor_order_ == order &&
-          static_dg_lor_amg_coarsen_type_ == amg_coarsen_type_ &&
-          static_dg_lor_amg_relax_type_ == amg_relax_type_ &&
-          static_dg_lor_amg_max_levels_ == amg_max_levels_ &&
-          static_dg_lor_amg_strong_threshold_ == amg_strong_threshold_ &&
-          static_dg_lor_amg_->Height() == A_op->Height() &&
-          static_dg_lor_amg_->Width() == A_op->Width();
-        if (cache_matches)
-        {
-          prec = static_dg_lor_amg_.get();
-          using_static_dg_lor_amg = true;
-          static_dg_lor_amg_reused = true;
-          static_dg_lor_amg_reason = "active";
-          static_dg_lor_alpha_proxy = static_dg_lor_alpha_proxy_;
-        }
-        else
-        {
-          ::dg_igr::NVTXRange lor_range("IGR/static-dg-lor-amg-setup");
-          // Tear down in dependency order: solver -> LOR -> borrowed form ->
-          // coefficient.  The new objects are committed only after dimensions
-          // are checked against the unchanged exact solve operator.
-          static_dg_lor_amg_.reset();
-          static_dg_lor_discretization_.reset();
-          static_dg_lor_form_.reset();
-          static_dg_lor_diffusion_coef_.reset();
-          static_dg_lor_mass_coef_.reset();
-          static_dg_lor_diagonal_.SetSize(0);
-
-          static_dg_lor_alpha_proxy = alpha_;
-          if (alpha_length_scale_policy_ == AlphaLengthScalePolicy::Local)
-          {
-            MFEM_VERIFY(device_element_alpha_.Size() == sfes_.GetNE(),
-                        "Static DG LOR/AMG local-alpha proxy requires the "
-                        "current element-alpha cache.");
-            const mfem::real_t* element_alpha =
-              device_element_alpha_.HostRead();
-            double local_alpha_sum = 0.0;
-            long long local_alpha_count = device_element_alpha_.Size();
-            for (int element = 0; element < device_element_alpha_.Size();
-                 ++element)
-            {
-              MFEM_VERIFY(std::isfinite(element_alpha[element]) &&
-                            element_alpha[element] > 0.0,
-                          "Static DG LOR/AMG received invalid local alpha.");
-              local_alpha_sum += element_alpha[element];
-            }
-            double global_alpha_sum = 0.0;
-            long long global_alpha_count = 0;
-            MPI_Allreduce(&local_alpha_sum,
-                          &global_alpha_sum,
-                          1,
-                          MPI_DOUBLE,
-                          MPI_SUM,
-                          comm);
-            MPI_Allreduce(&local_alpha_count,
-                          &global_alpha_count,
-                          1,
-                          MPI_LONG_LONG,
-                          MPI_SUM,
-                          comm);
-            MFEM_VERIFY(global_alpha_count > 0 &&
-                          std::isfinite(global_alpha_sum) &&
-                          global_alpha_sum > 0.0,
-                        "Static DG LOR/AMG could not form a positive global "
-                        "local-alpha proxy.");
-            static_dg_lor_alpha_proxy =
-              global_alpha_sum / static_cast<double>(global_alpha_count);
-          }
-          MFEM_VERIFY(std::isfinite(static_dg_lor_alpha_proxy) &&
-                        static_dg_lor_alpha_proxy > 0.0,
-                      "Static DG LOR/AMG alpha proxy must be positive and "
-                      "finite.");
-          auto mass_coef =
-            std::make_unique<mfem::ConstantCoefficient>(1.0);
-          auto diffusion_coef =
-            std::make_unique<mfem::ConstantCoefficient>(
-              static_dg_lor_alpha_proxy);
-          auto surrogate =
-            std::make_unique<mfem::ParBilinearForm>(&sfes_);
-          surrogate->AddDomainIntegrator(
-            new mfem::MassIntegrator(*mass_coef));
-          surrogate->AddDomainIntegrator(
-            new mfem::DiffusionIntegrator(*diffusion_coef));
-          surrogate->AddInteriorFaceIntegrator(
-            new mfem::DGDiffusionIntegrator(*diffusion_coef,
-                                            -1.0,
-                                            penalty));
-
-          auto lor = std::make_unique<mfem::ParLORDiscretization>(
-            sfes_, mfem::BasisType::GaussLobatto);
-          // Pinned MFEM's batched DG-LOR path inserts a physical-boundary
-          // penalty even when the high-order form has natural boundaries.
-          // Explicit legacy assembly honors the form's missing boundary-face
-          // integrator and therefore preserves the intended surrogate BC.
-          lor->LegacyAssembleSystem(*surrogate, ess_tdof_list_);
-          auto lor_amg =
-            std::make_unique<mfem::LORSolver<mfem::HypreBoomerAMG>>(*lor);
-          mfem::Vector lor_diagonal(A_op->Height());
-          lor->GetAssembledMatrix().GetDiag(lor_diagonal);
-          mfem::HypreBoomerAMG& amg = lor_amg->GetSolver();
-          amg.SetPrintLevel(0);
-          amg.SetMaxIter(1);
-          amg.SetTol(0.0);
-          if (amg_coarsen_type_ >= 0)
-          {
-            amg.SetCoarsening(amg_coarsen_type_);
-          }
-          if (amg_relax_type_ >= 0)
-          {
-            amg.SetRelaxType(amg_relax_type_);
-          }
-          if (amg_max_levels_ >= 0)
-          {
-            amg.SetMaxLevels(amg_max_levels_);
-          }
-          if (amg_strong_threshold_ >= 0.0)
-          {
-            amg.SetStrengthThresh(amg_strong_threshold_);
-          }
-
-          if (lor_amg->Height() != A_op->Height() ||
-              lor_amg->Width() != A_op->Width())
-          {
-            static_dg_lor_amg_reason = "lor-operator-size-mismatch";
-          }
-          else
-          {
-            static_dg_lor_mass_coef_ = std::move(mass_coef);
-            static_dg_lor_diffusion_coef_ = std::move(diffusion_coef);
-            static_dg_lor_form_ = std::move(surrogate);
-            static_dg_lor_discretization_ = std::move(lor);
-            static_dg_lor_amg_ = std::move(lor_amg);
-            static_dg_lor_diagonal_ = lor_diagonal;
-            static_dg_lor_diagonal_.UseDevice(true);
-            static_dg_lor_mesh_ = mesh;
-            static_dg_lor_mesh_sequence_ = mesh->GetSequence();
-            static_dg_lor_sfes_sequence_ = sfes_.GetSequence();
-            static_dg_lor_alpha_ = alpha_;
-            static_dg_lor_alpha_proxy_ = static_dg_lor_alpha_proxy;
-            static_dg_lor_alpha_policy_ = alpha_length_scale_policy_;
-            static_dg_lor_penalty_ = penalty;
-            static_dg_lor_order_ = order;
-            static_dg_lor_amg_coarsen_type_ = amg_coarsen_type_;
-            static_dg_lor_amg_relax_type_ = amg_relax_type_;
-            static_dg_lor_amg_max_levels_ = amg_max_levels_;
-            static_dg_lor_amg_strong_threshold_ = amg_strong_threshold_;
-            prec = static_dg_lor_amg_.get();
-            using_static_dg_lor_amg = true;
-            static_dg_lor_amg_reason = "active";
-          }
-        }
-      }
-      static_dg_lor_amg_setup_seconds = ElapsedSeconds(lor_setup_start);
-      if (mfem::Mpi::Root())
-      {
-        const char* alpha_policy = "unknown";
-        switch (alpha_length_scale_policy_)
-        {
-        case AlphaLengthScalePolicy::Min: alpha_policy = "min"; break;
-        case AlphaLengthScalePolicy::Average:
-          alpha_policy = "average";
-          break;
-        case AlphaLengthScalePolicy::Max: alpha_policy = "max"; break;
-        case AlphaLengthScalePolicy::Local: alpha_policy = "local"; break;
-        }
-        std::cout << "[igr-linear] event=static-dg-lor-amg"
-                  << " solve_call=" << solve_call
-                  << " requested=1"
-                  << " effective=" << (using_static_dg_lor_amg ? 1 : 0)
-                  << " reason=" << static_dg_lor_amg_reason
-                  << " cache="
-                  << (using_static_dg_lor_amg
-                        ? (static_dg_lor_amg_reused ? "reused" : "built")
-                        : "none")
-                  << " setup_s=" << static_dg_lor_amg_setup_seconds
-                  << " order=" << order
-                  << " penalty=" << penalty
-                  << " alpha=" << alpha_
-                  << " alpha_proxy=" << static_dg_lor_alpha_proxy
-                  << " alpha_policy=" << alpha_policy
-                  << " surrogate_alpha=constant-global-arithmetic-mean"
-                  << " exact_operator_local_alpha="
-                  << (alpha_length_scale_policy_ ==
-                        AlphaLengthScalePolicy::Local
-                        ? 1
-                        : 0)
-                  << " assembly=legacy-natural"
-                  << " high_order_basis="
-                  << (l2_collection
-                        ? mfem::BasisType::Name(
-                            l2_collection->GetBasisType())
-                        : "unknown")
-                  << " lor_identity_mapping=prototype-unqualified"
-                  << std::endl;
-      }
-    }
-
-    if (exact_element_block_jacobi_requested)
-    {
-      const auto block_setup_start = Clock::now();
-      if (prec_choice != PrecondType::OperatorChebyshev &&
-          prec_choice != PrecondType::HypreSmoother)
-      {
-        exact_element_block_build.reason = "unsupported-preconditioner";
-      }
-      else if (!is_dg || sfes_.GetVDim() != 1)
-      {
-        exact_element_block_build.reason = "requires-scalar-dg";
-      }
-      else if (!spd_ok)
-      {
-        exact_element_block_build.reason = "requires-spd-operator";
-      }
-      else if (!exact_face_sum_op)
-      {
-        exact_element_block_build.reason = "requires-exact-face-operator";
-      }
-      else if (!direct_identity_system_)
-      {
-        exact_element_block_build.reason = "requires-direct-identity-system";
-      }
-      else if (sfes_.GetTrueVSize() != sfes_.GetVSize() ||
-               !mfem::IsIdentityProlongation(sfes_.GetProlongationMatrix()))
-      {
-        exact_element_block_build.reason = "requires-true-local-identity";
-      }
-      else if (ess_tdof_list_.Size() != 0)
-      {
-        exact_element_block_build.reason = "requires-no-essential-dofs";
-      }
-      else
-      {
-        const mfem::Mesh* mesh = sfes_.GetMesh();
-        const bool may_reuse = exact_element_block_step_reuse_requested &&
-                               rk_step_index_ >= 0;
-        const bool cache_matches =
-          may_reuse && exact_element_block_step_cache_ && mesh &&
-          exact_element_block_cache_mesh_ == mesh &&
-          exact_element_block_cache_mesh_sequence_ == mesh->GetSequence() &&
-          exact_element_block_cache_sfes_sequence_ == sfes_.GetSequence() &&
-          exact_element_block_cache_rk_step_ == rk_step_index_ &&
-          exact_element_block_cache_vector_size_ == A_op->Height() &&
-          exact_element_block_cache_alpha_ == alpha_ &&
-          exact_element_block_cache_alpha_policy_ ==
-            alpha_length_scale_policy_ &&
-          exact_element_block_cache_ip_kind_ == ip_kind_ &&
-          (exact_face_pair_schwarz_requested ==
-           (dynamic_cast<const ExactFacePairAdditiveSchwarz*>(
-              exact_element_block_step_cache_.get()) != nullptr));
-        if (cache_matches)
-        {
-          cached_exact_element_block_prec =
-            exact_element_block_step_cache_.get();
-          using_exact_element_block_jacobi = true;
-          exact_element_block_cache_reused = true;
-          exact_element_block_build.reason =
-            exact_face_pair_schwarz_requested ? "active-face-pair" : "active";
-          exact_element_block_build.block_size =
-            exact_element_block_cache_block_size_;
-          if (const auto* face_pair =
-                dynamic_cast<const ExactFacePairAdditiveSchwarz*>(
-                  cached_exact_element_block_prec))
-          {
-            exact_element_block_build.patch_count = face_pair->PatchCount();
-            exact_element_block_build.patch_size = face_pair->PatchSize();
-            exact_element_block_build.min_overlap = face_pair->MinOverlap();
-            exact_element_block_build.max_overlap = face_pair->MaxOverlap();
-            exact_element_block_build.restriction_nonzeros =
-              face_pair->RestrictionNonzeros();
-            exact_element_block_build.inverse_entries =
-              face_pair->InverseEntries();
-          }
-        }
-        else
-        {
-          ::dg_igr::NVTXRange block_range(
-            exact_face_pair_schwarz_requested
-              ? "IGR/exact-face-pair-schwarz-setup"
-              : "IGR/exact-element-block-jacobi-setup");
-          exact_element_block_build =
-            BuildExactElementBlockJacobi(sfes_,
-                                         *exact_face_sum_op,
-                                         shared_correlation_block_requested,
-                                         exact_face_pair_schwarz_requested);
-          if (exact_element_block_build.solver)
-          {
-            using_exact_element_block_jacobi = true;
-            if (may_reuse)
-            {
-              exact_element_block_step_cache_ =
-                std::move(exact_element_block_build.solver);
-              exact_element_block_cache_mesh_ = mesh;
-              exact_element_block_cache_mesh_sequence_ = mesh->GetSequence();
-              exact_element_block_cache_sfes_sequence_ = sfes_.GetSequence();
-              exact_element_block_cache_rk_step_ = rk_step_index_;
-              exact_element_block_cache_vector_size_ = A_op->Height();
-              exact_element_block_cache_block_size_ =
-                exact_element_block_build.block_size;
-              exact_element_block_cache_alpha_ = alpha_;
-              exact_element_block_cache_alpha_policy_ =
-                alpha_length_scale_policy_;
-              exact_element_block_cache_ip_kind_ = ip_kind_;
-              cached_exact_element_block_prec =
-                exact_element_block_step_cache_.get();
-            }
-            else
-            {
-              exact_element_block_prec =
-                std::move(exact_element_block_build.solver);
-            }
-          }
-        }
-      }
-      exact_element_block_setup_seconds =
-        ElapsedSeconds(block_setup_start);
-      if (mfem::Mpi::Root())
-      {
-        std::cout << "[igr-linear] event="
-                  << (exact_face_pair_schwarz_requested
-                        ? "exact-face-pair-schwarz"
-                        : "exact-element-block-jacobi")
-                  << " solve_call=" << solve_call
-                  << " requested=1"
-                  << " effective="
-                  << (using_exact_element_block_jacobi ? 1 : 0)
-                  << " reason=" << exact_element_block_build.reason
-                  << " shared_correlation="
-                  << (shared_correlation_block_requested ? 1 : 0)
-                  << " cache="
-                  << (cached_exact_element_block_prec
-                        ? (exact_element_block_cache_reused ? "reused"
-                                                            : "built")
-                        : "none")
-                  << " setup_s=" << exact_element_block_setup_seconds
-                  << " colors=" << exact_element_block_build.colors
-                  << " block_size=" << exact_element_block_build.block_size
-                  << " patch_count=" << exact_element_block_build.patch_count
-                  << " patch_size=" << exact_element_block_build.patch_size
-                  << " min_overlap=" << exact_element_block_build.min_overlap
-                  << " max_overlap=" << exact_element_block_build.max_overlap
-                  << " max_faces_per_pair="
-                  << exact_element_block_build.max_faces_per_pair
-                  << " restriction_nnz="
-                  << exact_element_block_build.restriction_nonzeros
-                  << " inverse_entries="
-                  << exact_element_block_build.inverse_entries
-                  << " inverse_bytes="
-                  << exact_element_block_build.inverse_entries *
-                       static_cast<long long>(sizeof(mfem::real_t))
-                  << " overlap_weighting="
-                  << (exact_face_pair_schwarz_requested
-                        ? "symmetric-inverse-sqrt-multiplicity"
-                        : "none")
-                  << " pair_scope="
-                  << (exact_face_pair_schwarz_requested
-                        ? "single-rank-local-interior-faces"
-                        : "inactive")
-                  << " probe_operator_applies="
-                  << exact_element_block_build.operator_applies
-                  << " max_symmetry_defect="
-                  << exact_element_block_build.max_symmetry_defect
-                  << " max_inverse_residual="
-                  << exact_element_block_build.max_inverse_residual
-                  << std::endl;
-      }
-    }
-
-    if (original_dg0_two_level_requested &&
-        using_exact_element_block_jacobi && exact_element_block_prec)
-    {
-      const auto coarse_setup_start = Clock::now();
-      mfem::Mesh* mesh = sfes_.GetMesh();
-      const int ne = sfes_.GetNE();
-      const int block_size = exact_element_block_build.block_size;
-      MFEM_VERIFY(mesh && ne > 0 && block_size > 1 &&
-                    sfes_.GetVSize() == ne * block_size &&
-                    sfes_.GetTrueVSize() == sfes_.GetVSize(),
-                  "Original-element DG0 screen requires contiguous scalar "
-                  "DG element blocks.");
-
-      auto coarse_collection =
-        std::make_unique<mfem::DG_FECollection>(0, mesh->Dimension());
-      auto coarse_space = std::make_unique<mfem::ParFiniteElementSpace>(
-        dynamic_cast<mfem::ParMesh*>(mesh), coarse_collection.get());
-      MFEM_VERIFY(coarse_space->GetTrueVSize() == ne,
-                  "Original-element DG0 screen requires one local true DOF "
-                  "per element.");
-      auto coarse_form =
-        std::make_unique<mfem::ParBilinearForm>(coarse_space.get());
-      coarse_form->AddDomainIntegrator(
-        new mfem::MassIntegrator(*invrho_coef_));
-      coarse_form->AddInteriorFaceIntegrator(
-        new mfem::DGDiffusionIntegrator(*ck_coef_,
-                                        -1.0,
-                                        IPDGPenalty(sfes_)));
-      constexpr int keep_zeros = 0;
-      coarse_form->Assemble(keep_zeros);
-      coarse_form->Finalize(keep_zeros);
-      auto coarse_matrix = std::unique_ptr<mfem::HypreParMatrix>(
-        coarse_form->ParallelAssemble());
-      MFEM_VERIFY(coarse_matrix && coarse_matrix->Height() == ne &&
-                    coarse_matrix->Width() == ne,
-                  "Original-element DG0 assembly produced an invalid graph.");
-      auto coarse_amg =
-        std::make_unique<mfem::HypreBoomerAMG>(*coarse_matrix);
-      coarse_amg->SetPrintLevel(0);
-      coarse_amg->SetMaxIter(1);
-      coarse_amg->SetTol(0.0);
-
-      auto coarse_correction =
-        std::make_unique<OriginalElementDG0Correction>(
-          sfes_.GetVSize(),
-          ne,
-          block_size,
-          std::move(coarse_collection),
-          std::move(coarse_space),
-          std::move(coarse_form),
-          std::move(coarse_matrix),
-          std::move(coarse_amg));
-      auto fluctuation_smoother =
-        std::make_unique<ElementMeanZeroSolver>(
-          std::move(exact_element_block_prec), ne, block_size);
-      set_owned_preconditioner(std::make_unique<AdditiveOwnedSolver>(
-        std::move(fluctuation_smoother), std::move(coarse_correction)));
-      using_original_dg0_two_level = true;
-      if (mfem::Mpi::Root())
-      {
-        std::cout << "[igr-linear] event=original-dg0-two-level"
-                  << " solve_call=" << solve_call
-                  << " effective=1"
-                  << " coarse_dofs=" << ne
-                  << " fine_dofs=" << sfes_.GetVSize()
-                  << " fluctuation_block_size=" << (block_size - 1)
-                  << " setup_s=" << ElapsedSeconds(coarse_setup_start)
-                  << " coarse_operator=assembled-current-coefficient-sipg"
-                  << " local_operator=exact-mean-zero-element-block"
-                  << std::endl;
-      }
-    }
-
-    if (using_original_dg0_two_level)
-    {
-      // The orthogonal mean/fluctuation components were installed above.
-    }
-    else if (using_static_dg_lor_amg)
-    {
-      if (::dg_igr::EnvFlagEnabledDefault(
-            "DG_IGR_IGR_STATIC_DG_LOR_DIAG_SCALE", false))
-      {
-        auto scaled_lor =
-          std::make_unique<SymmetricDiagonalScaledSolver>(
-            *static_dg_lor_amg_, static_dg_lor_diagonal_, *A_op);
-        if (exact_element_block_prec)
-        {
-          set_owned_preconditioner(std::make_unique<AdditiveOwnedSolver>(
-            std::move(exact_element_block_prec), std::move(scaled_lor)));
-        }
-        else
-        {
-          set_owned_preconditioner(std::move(scaled_lor));
-        }
-      }
-      else if (exact_element_block_prec)
-      {
-        // The unscaled static hierarchy is deliberately not combined: the
-        // coefficient-scaled form is the symmetry-preserving co-design being
-        // screened here.
-        set_owned_preconditioner(std::move(exact_element_block_prec));
-        using_static_dg_lor_amg = false;
-      }
-    }
-    else if (using_exact_element_block_jacobi)
-    {
-      if (cached_exact_element_block_prec)
-      {
-        prec = cached_exact_element_block_prec;
-      }
-      else
-      {
-        set_owned_preconditioner(std::move(exact_element_block_prec));
-      }
-    }
-    else if (prec_choice == PrecondType::BoomerAMG)
+    if (prec_choice == PrecondType::BoomerAMG)
     {
       MFEM_VERIFY(A_hypre != nullptr,
                   "BoomerAMG preconditioner requires a Hypre matrix operator.");
@@ -4392,7 +2349,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       {
         amg->SetStrengthThresh(amg_strong_threshold_);
       }
-      set_owned_preconditioner(std::move(amg));
+      prec = std::move(amg);
     }
     else if (prec_choice == PrecondType::HypreILU)
     {
@@ -4403,7 +2360,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       ilu->SetMaxIter(1);
       ilu->SetTol(0.0);
       ilu->SetOperator(*A_hypre);
-      set_owned_preconditioner(std::move(ilu));
+      prec = std::move(ilu);
     }
     else if (prec_choice == PrecondType::HypreEuclid)
     {
@@ -4411,7 +2368,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                   "HypreEuclid preconditioner requires a Hypre matrix operator.");
       auto euclid = std::make_unique<mfem::HypreEuclid>(*A_hypre);
       euclid->SetStats(0);
-      set_owned_preconditioner(std::move(euclid));
+      prec = std::move(euclid);
     }
     else if (prec_choice == PrecondType::ParaSails)
     {
@@ -4419,7 +2376,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                   "ParaSails preconditioner requires a Hypre matrix operator.");
       auto parasails = std::make_unique<mfem::HypreParaSails>(*A_hypre);
       parasails->SetLogging(0);
-      set_owned_preconditioner(std::move(parasails));
+      prec = std::move(parasails);
     }
     else if (prec_choice == PrecondType::HypreSmoother)
     {
@@ -4445,7 +2402,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
           break;
         }
         sm->SetPositiveDiagonal(true);
-        set_owned_preconditioner(std::move(sm));
+        prec = std::move(sm);
       }
       else
       {
@@ -4456,14 +2413,12 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
             false);
         if (use_exact_face_diag)
         {
-          set_owned_preconditioner(
-            MakePositiveOperatorJacobi(*A_op, ess_tdof_list_));
+          prec = MakePositiveOperatorJacobi(*A_op, ess_tdof_list_);
           using_operator_jacobi_exact_face_diag = true;
         }
         else
         {
-          set_owned_preconditioner(
-            MakePositiveOperatorJacobi(*a_, ess_tdof_list_));
+          prec = MakePositiveOperatorJacobi(*a_, ess_tdof_list_);
         }
         using_operator_jacobi = true;
       }
@@ -4471,8 +2426,13 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     else if (prec_choice == PrecondType::OperatorChebyshev)
     {
       ::dg_igr::NVTXRange cheb_range("IGR/chebyshev-setup");
+      // The qualified extrapolated instantaneous-IGR route uses the complete
+      // exact-face operator for both Krylov and Chebyshev applications.  Do
+      // not let the legacy experimental environment knob silently substitute
+      // the volume/base operator in that typed temporal discretization.
       const bool use_base_operator =
         exact_face_sum_op &&
+        sigma_cadence_ != IGRSigmaUpdateCadence::ExtrapolatedEveryStep &&
         ::dg_igr::EnvFlagEnabledDefault(
           "DG_IGR_IGR_CHEB_BASE_OPERATOR",
           false);
@@ -4557,7 +2517,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       last_chebyshev_setup_seconds_ = ElapsedSeconds(cheb_setup_start);
       total_chebyshev_setup_seconds_ += last_chebyshev_setup_seconds_;
       ++total_chebyshev_smoother_builds_;
-      set_owned_preconditioner(std::move(cheb));
+      prec = std::move(cheb);
       using_operator_chebyshev = true;
       using_operator_chebyshev_base = use_base_operator;
     }
@@ -4677,109 +2637,6 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     mfem::IsIntermediateRKStage(rk_stage_index_, rk_stage_count_);
   const double effective_rtol =
     is_intermediate_stage ? (lin_rtol_ * stage_rtol_scale_) : lin_rtol_;
-  const bool reduction_free_chebyshev_requested =
-    ::dg_igr::EnvFlagEnabledDefault(
-      "DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV", false);
-  const int reduction_free_chebyshev_degree =
-    ReadEnvInt("DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_DEGREE", 64);
-  const char* reduction_free_lower_text =
-    std::getenv("DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_LAMBDA_MIN");
-  const char* reduction_free_upper_text =
-    std::getenv("DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_LAMBDA_MAX");
-  const bool reduction_free_bounds_supplied =
-    reduction_free_lower_text && reduction_free_lower_text[0] != '\0' &&
-    reduction_free_upper_text && reduction_free_upper_text[0] != '\0';
-  const double reduction_free_bound_safety =
-    ReadEnvReal("DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_BOUND_SAFETY", 1.05);
-  const double reduction_free_input_lambda_min =
-    reduction_free_bounds_supplied
-      ? ReadEnvReal("DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_LAMBDA_MIN", 0.0)
-      : std::numeric_limits<double>::quiet_NaN();
-  const double reduction_free_input_lambda_max =
-    reduction_free_bounds_supplied
-      ? ReadEnvReal("DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_LAMBDA_MAX", 0.0)
-      : std::numeric_limits<double>::quiet_NaN();
-  if (reduction_free_chebyshev_requested)
-  {
-    MFEM_VERIFY(reduction_free_chebyshev_degree >= 1 &&
-                  reduction_free_chebyshev_degree <= 4096,
-                "DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_DEGREE must be "
-                "between 1 and 4096.");
-    MFEM_VERIFY(reduction_free_bounds_supplied,
-                "DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV requires explicit "
-                "LAMBDA_MIN and LAMBDA_MAX bounds for the preconditioned "
-                "operator.");
-    MFEM_VERIFY(std::isfinite(reduction_free_input_lambda_min) &&
-                  std::isfinite(reduction_free_input_lambda_max) &&
-                  reduction_free_input_lambda_min > 0.0 &&
-                  reduction_free_input_lambda_max >
-                    reduction_free_input_lambda_min,
-                "Reduction-free Chebyshev spectral bounds must satisfy "
-                "0 < LAMBDA_MIN < LAMBDA_MAX.");
-    MFEM_VERIFY(std::isfinite(reduction_free_bound_safety) &&
-                  reduction_free_bound_safety >= 1.0,
-                "DG_IGR_IGR_REDUCTION_FREE_CHEBYSHEV_BOUND_SAFETY must "
-                "be finite and at least one.");
-  }
-  const double reduction_free_lambda_min =
-    reduction_free_input_lambda_min / reduction_free_bound_safety;
-  const double reduction_free_lambda_max =
-    reduction_free_input_lambda_max * reduction_free_bound_safety;
-  if (reduction_free_chebyshev_requested)
-  {
-    MFEM_VERIFY(std::isfinite(reduction_free_lambda_min) &&
-                  std::isfinite(reduction_free_lambda_max) &&
-                  reduction_free_lambda_min > 0.0 &&
-                  reduction_free_lambda_max > reduction_free_lambda_min,
-                "Reduction-free Chebyshev safety expansion produced an "
-                "invalid spectral interval.");
-  }
-  std::string reduction_free_chebyshev_reason = "not-requested";
-  bool reduction_free_chebyshev_effective = false;
-  if (reduction_free_chebyshev_requested)
-  {
-    if (solver_choice != LinearSolverType::CG)
-    {
-      reduction_free_chebyshev_reason = "requires-cg-fallback";
-    }
-    else if (!spd_ok)
-    {
-      reduction_free_chebyshev_reason = "requires-spd-operator";
-    }
-    else if (!prec)
-    {
-      reduction_free_chebyshev_reason = "requires-spd-preconditioner";
-    }
-    else if (sizeof(mfem::real_t) != sizeof(double))
-    {
-      reduction_free_chebyshev_reason = "requires-fp64-mfem";
-    }
-    else
-    {
-      reduction_free_chebyshev_effective = true;
-      reduction_free_chebyshev_reason = "active";
-    }
-    if (mfem::Mpi::Root())
-    {
-      std::cout << "[igr-linear] event=reduction-free-chebyshev-config"
-                << " solve_call=" << solve_call
-                << " requested=1"
-                << " effective="
-                << (reduction_free_chebyshev_effective ? 1 : 0)
-                << " reason=" << reduction_free_chebyshev_reason
-                << " degree=" << reduction_free_chebyshev_degree
-                << " input_lambda_min="
-                << reduction_free_input_lambda_min
-                << " input_lambda_max="
-                << reduction_free_input_lambda_max
-                << " bound_safety=" << reduction_free_bound_safety
-                << " effective_lambda_min=" << reduction_free_lambda_min
-                << " effective_lambda_max=" << reduction_free_lambda_max
-                << " fp64="
-                << (sizeof(mfem::real_t) == sizeof(double) ? 1 : 0)
-                << std::endl;
-    }
-  }
   mfem::Vector event_initial_guess;
   if (event_capture_enabled || true_initial_residual_requested)
   {
@@ -4789,7 +2646,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   std::unique_ptr<KrylovTelemetryOperator> solve_operator_telemetry;
   std::unique_ptr<KrylovTelemetryPreconditioner> telemetry_preconditioner;
   mfem::Operator* solve_operator = A_op;
-  mfem::Solver* solve_preconditioner = prec;
+  mfem::Solver* solve_preconditioner = prec.get();
   if (use_krylov_telemetry)
   {
     solve_operator_telemetry =
@@ -4920,216 +2777,13 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     }
   };
 
-  bool reduction_free_chebyshev_attempted = false;
-  bool reduction_free_chebyshev_accepted = false;
-  bool reduction_free_chebyshev_fallback = false;
-  bool reduction_free_chebyshev_nonfinite = false;
-  bool reduction_free_chebyshev_restored_original = false;
-  double reduction_free_chebyshev_seconds = 0.0;
-  double reduction_free_certificate_seconds = 0.0;
-  double reduction_free_operator_local_reduction_seconds = 0.0;
-  double reduction_free_collective_seconds = 0.0;
-  double reduction_free_fallback_seconds = 0.0;
-  double reduction_free_candidate_residual_abs =
-    std::numeric_limits<double>::quiet_NaN();
-  double reduction_free_candidate_residual_rel_rhs =
-    std::numeric_limits<double>::quiet_NaN();
-
-  if (reduction_free_chebyshev_effective)
-  {
-    ::dg_igr::NVTXRange polynomial_range(
-      "IGR/reduction-free-preconditioned-chebyshev");
-    reduction_free_chebyshev_attempted = true;
-    // Keep X_ transactional.  A bad polynomial interval must not contaminate
-    // either the original warm start or the bounded Krylov fallback.
-    mfem::Vector candidate(X_);
-    mfem::Vector residual(B_.Size());
-    mfem::Vector operator_iterate(B_.Size());
-    mfem::Vector preconditioned_residual(B_.Size());
-    mfem::Vector direction(B_.Size());
-
-    // The interval is supplied explicitly and expanded by a safety factor.
-    // For SPD A and SPD P, the left-preconditioned operator P A is similar to
-    // the SPD operator P^(1/2) A P^(1/2), so the standard Chebyshev recurrence
-    // applies.  Its fixed-degree loop contains operator/preconditioner applies
-    // and vector updates only: no dot products or global reductions.
-    // These half-sums avoid overflowing an otherwise valid finite interval.
-    const double theta = 0.5 * reduction_free_lambda_max +
-                         0.5 * reduction_free_lambda_min;
-    const double delta = 0.5 * reduction_free_lambda_max -
-                         0.5 * reduction_free_lambda_min;
-    const double spectral_sigma = theta / delta;
-    MFEM_VERIFY(std::isfinite(theta) && std::isfinite(delta) &&
-                  std::isfinite(spectral_sigma) && delta > 0.0 &&
-                  spectral_sigma > 1.0,
-                "Reduction-free Chebyshev received an unusable spectral "
-                "interval.");
-    double rho_previous = 1.0 / spectral_sigma;
-
-    const auto polynomial_start = Clock::now();
-    solve_operator->Mult(candidate, operator_iterate);
-    residual = B_;
-    residual -= operator_iterate;
-    solve_preconditioner->Mult(residual, preconditioned_residual);
-    direction = preconditioned_residual;
-    direction *= 1.0 / theta;
-    candidate += direction;
-
-    for (int iteration = 1;
-         iteration < reduction_free_chebyshev_degree;
-         ++iteration)
-    {
-      solve_operator->Mult(candidate, operator_iterate);
-      residual = B_;
-      residual -= operator_iterate;
-      solve_preconditioner->Mult(residual, preconditioned_residual);
-      const double rho = 1.0 / (2.0 * spectral_sigma - rho_previous);
-      direction *= rho * rho_previous;
-      direction.Add((2.0 * rho) / delta, preconditioned_residual);
-      candidate += direction;
-      rho_previous = rho;
-    }
-    MFEM_DEVICE_SYNC;
-    reduction_free_chebyshev_seconds = ElapsedSeconds(polynomial_start);
-
-    const auto certificate_start = Clock::now();
-    // This bypasses telemetry and applies the authoritative FP64 SIPG
-    // operator independently.  Use MFEM's established FP64 vector reductions
-    // for the two local squared norms.  The experimental custom pair reducer
-    // was not safe on the SM120 CUDA memory path; a single two-scalar MPI
-    // collective still certifies the result without a per-iteration global
-    // reduction.
-    const auto operator_local_start = Clock::now();
-    A_op->Mult(candidate, operator_iterate);
-    residual = B_;
-    residual -= operator_iterate;
-    const double local_norm_squares[2] = {
-      static_cast<double>(residual * residual),
-      static_cast<double>(B_ * B_)};
-    reduction_free_operator_local_reduction_seconds =
-      ElapsedSeconds(operator_local_start);
-
-    double global_norm_squares[2] = {0.0, 0.0};
-    const auto collective_start = Clock::now();
-    MPI_Allreduce(local_norm_squares,
-                  global_norm_squares,
-                  2,
-                  MPI_DOUBLE,
-                  MPI_SUM,
-                  comm);
-    reduction_free_collective_seconds = ElapsedSeconds(collective_start);
-
-    const bool squared_norms_finite =
-      std::isfinite(global_norm_squares[0]) &&
-      std::isfinite(global_norm_squares[1]) &&
-      global_norm_squares[0] >= 0.0 && global_norm_squares[1] >= 0.0;
-    if (squared_norms_finite)
-    {
-      reduction_free_candidate_residual_abs =
-        std::sqrt(global_norm_squares[0]);
-      const double rhs_norm = std::sqrt(global_norm_squares[1]);
-      reduction_free_candidate_residual_rel_rhs =
-        reduction_free_candidate_residual_abs /
-        std::max(rhs_norm, 1.0e-300);
-    }
-    reduction_free_chebyshev_nonfinite =
-      !squared_norms_finite ||
-      !std::isfinite(reduction_free_candidate_residual_abs) ||
-      !std::isfinite(reduction_free_candidate_residual_rel_rhs);
-    const bool absolute_pass =
-      !reduction_free_chebyshev_nonfinite &&
-      reduction_free_candidate_residual_abs <= lin_atol_;
-    const bool relative_pass =
-      !reduction_free_chebyshev_nonfinite &&
-      reduction_free_candidate_residual_rel_rhs <= effective_rtol;
-    reduction_free_chebyshev_accepted = absolute_pass || relative_pass;
-    reduction_free_certificate_seconds = ElapsedSeconds(certificate_start);
-
-    last_linear_iters_ = reduction_free_chebyshev_degree;
-    last_linear_final_norm_ = reduction_free_candidate_residual_abs;
-    last_linear_true_residual_abs_ =
-      reduction_free_candidate_residual_abs;
-    last_linear_true_residual_rel_rhs_ =
-      reduction_free_candidate_residual_rel_rhs;
-    if (std::isfinite(last_linear_true_initial_residual_abs_))
-    {
-      last_linear_true_residual_rel_initial_ =
-        reduction_free_candidate_residual_abs /
-        std::max(last_linear_true_initial_residual_abs_, 1.0e-300);
-    }
-    last_linear_converged_ = reduction_free_chebyshev_accepted;
-
-    if (reduction_free_chebyshev_accepted)
-    {
-      X_ = candidate;
-    }
-    else
-    {
-      reduction_free_chebyshev_fallback = true;
-      // X_ was never modified, so fallback starts from the exact original
-      // guess even when the candidate became non-finite.
-      reduction_free_chebyshev_restored_original = true;
-      const int polynomial_iterations = last_linear_iters_;
-      // A failed research candidate is never allowed to poison Krylov: CG
-      // always restarts from the exact original guess.
-      const auto fallback_start = Clock::now();
-      run_krylov(effective_rtol, /*iterative_mode=*/true);
-      MFEM_DEVICE_SYNC;
-      reduction_free_fallback_seconds = ElapsedSeconds(fallback_start);
-      last_linear_iters_ += polynomial_iterations;
-    }
-
-    if (mfem::Mpi::Root())
-    {
-      std::cout << "[igr-linear] event=reduction-free-chebyshev-result"
-                << " solve_call=" << solve_call
-                << " rk_step=" << rk_step_index_
-                << " rk_stage=" << rk_stage_index_
-                << " degree=" << reduction_free_chebyshev_degree
-                << " lambda_min=" << reduction_free_lambda_min
-                << " lambda_max=" << reduction_free_lambda_max
-                << " initial_residual_reduction=elided"
-                << " candidate_residual_abs="
-                << reduction_free_candidate_residual_abs
-                << " candidate_residual_rel_rhs="
-                << reduction_free_candidate_residual_rel_rhs
-                << " rtol=" << effective_rtol
-                << " atol=" << lin_atol_
-                << " accepted="
-                << (reduction_free_chebyshev_accepted ? 1 : 0)
-                << " fallback="
-                << (reduction_free_chebyshev_fallback ? 1 : 0)
-                << " candidate_nonfinite="
-                << (reduction_free_chebyshev_nonfinite ? 1 : 0)
-                << " restored_original_guess="
-                << (reduction_free_chebyshev_restored_original ? 1 : 0)
-                << " restore_reason="
-                << (reduction_free_chebyshev_restored_original
-                      ? "certificate-failed"
-                      : "none")
-                << " polynomial_s=" << reduction_free_chebyshev_seconds
-                << " certificate_s=" << reduction_free_certificate_seconds
-                << " operator_local_reduction_s="
-                << reduction_free_operator_local_reduction_seconds
-                << " collective_s=" << reduction_free_collective_seconds
-                << " local_norm_reductions=2"
-                << " mpi_norm_collectives=1"
-                << " reduced_fp64_scalars=2"
-                << " fallback_s=" << reduction_free_fallback_seconds
-                << std::endl;
-    }
-  }
-  else
-  {
-    run_krylov(effective_rtol, enable_warm_start);
-  }
+  run_krylov(effective_rtol, enable_warm_start);
 
   const bool certify_extended_solve =
     extended_certificate_enabled &&
     last_linear_iters_ >= extended_certificate_start;
   const bool certify_independent_residual =
-    certify_current_solve_ || certify_extended_solve ||
-    reduction_free_chebyshev_attempted;
+    certify_current_solve_ || certify_extended_solve;
   auto recompute_true_residual = [&]()
   {
     mfem::Vector residual(B_);
@@ -5162,11 +2816,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       }
     }
   };
-  const bool reduction_free_certificate_is_current =
-    reduction_free_chebyshev_accepted &&
-    !reduction_free_chebyshev_fallback;
-  if ((true_residual_requested || certify_independent_residual) &&
-      !reduction_free_certificate_is_current)
+  if (true_residual_requested || certify_independent_residual)
   {
     recompute_true_residual();
   }
@@ -5175,9 +2825,13 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   int residual_replacement_retries = 0;
   if (certify_independent_residual)
   {
-    const double certificate_factor =
-      reduction_free_chebyshev_attempted ? 1.0
-                                         : extended_certificate_factor;
+    // A caller-requested production certificate is a fixed part of the
+    // method and must not be weakened by the optional diagnostic environment
+    // used to screen unusually long solves.
+    constexpr double caller_certificate_factor = 5.0;
+    const double certificate_factor = certify_current_solve_
+                                        ? caller_certificate_factor
+                                        : extended_certificate_factor;
     const double certificate_relative_limit =
       certificate_factor * effective_rtol;
     const double certificate_absolute_limit =
@@ -5235,7 +2889,11 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     // also recognizes a valid capped iterate when the Krylov recurrence's
     // reported norm has drifted from the true residual.
     last_linear_converged_ = independent_certificate_passed;
-    if (mfem::Mpi::Root())
+    const bool successful_production_anchor =
+      independent_certificate_passed &&
+      current_solve_purpose_ != IGRSolvePurpose::OutputOnly &&
+      rk_stage_index_ == -1;
+    if (mfem::Mpi::Root() && !successful_production_anchor)
     {
       std::cout << "[igr-linear] event=independent-residual-certificate"
                 << " solve_call=" << solve_call
@@ -5243,10 +2901,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                 << " rk_stage=" << rk_stage_index_
                 << " iterations=" << last_linear_iters_
                 << " reason="
-                << (reduction_free_chebyshev_attempted
-                      ? "reduction-free-chebyshev"
-                      : (certify_current_solve_ ? "restart"
-                                                : "extended-solve"))
+                << (certify_current_solve_ ? "caller-requested"
+                                           : "extended-solve")
                 << " start=" << extended_certificate_start
                 << " factor=" << certificate_factor
                 << " relative_limit=" << certificate_relative_limit
@@ -5299,23 +2955,15 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   }
 
   last_linear_solver_name_ = LinearSolverTypeName(solver_choice);
-  last_precond_name_ = using_static_dg_lor_amg
-                         ? "static-dg-lor-amg"
-                         : (using_exact_element_block_jacobi
-                              ? (exact_face_pair_schwarz_requested
-                                   ? "exact-face-pair-schwarz"
-                                   : (shared_correlation_block_requested
-                                        ? "shared-correlation-block-jacobi"
-                                        : "exact-element-block-jacobi"))
-                         : (using_operator_chebyshev
-                              ? (using_operator_chebyshev_base
-                                   ? "operatorchebyshev-base"
-                                   : "operatorchebyshev")
-                              : (using_operator_jacobi_exact_face_diag
-                                   ? "operatorjacobi-exactface"
-                                   : (using_operator_jacobi
-                                        ? "operatorjacobi"
-                                        : PrecondTypeName(prec_choice)))));
+  last_precond_name_ = using_operator_chebyshev
+                         ? (using_operator_chebyshev_base
+                              ? "operatorchebyshev-base"
+                              : "operatorchebyshev")
+                         : (using_operator_jacobi_exact_face_diag
+                              ? "operatorjacobi-exactface"
+                              : (using_operator_jacobi
+                                   ? "operatorjacobi"
+                                   : PrecondTypeName(prec_choice)));
 
   const bool capture_linear_event =
     event_capture_enabled && !linear_event_capture_written_ &&

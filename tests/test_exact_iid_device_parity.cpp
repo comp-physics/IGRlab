@@ -2,7 +2,7 @@
 
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
-#include "numerics/riemann/dgsem_surface_flux.hpp"
+#include "numerics/riemann/rusanov.hpp"
 #include "physics/bc/boundary_state.hpp"
 #include "physics/igr/igr_flux.hpp"
 
@@ -275,9 +275,7 @@ bool ValidateObservation(const Observation& observation,
   return valid;
 }
 
-bool BuildObservation(Observation& observation,
-                      Coverage& coverage,
-                      bool trace_centered)
+bool BuildObservation(Observation& observation, Coverage& coverage)
 {
   mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
     /*nx=*/2,
@@ -311,11 +309,7 @@ bool BuildObservation(Observation& observation,
   igr_flux.SetSigmaField(&sigma);
   igr_flux.SetInvariantDomainFloors(kDensityFloor, kPressureFloor);
   igr_flux.SetInvariantDomainFlux(true);
-  mfem::DGSEMSurfaceFlux numerical_flux(igr_flux);
-  numerical_flux.SetSurfaceFluxType(
-    trace_centered ? mfem::DGSEMSurfaceFluxType::HdgTraceCentered
-                   : mfem::DGSEMSurfaceFluxType::Rusanov);
-  numerical_flux.SetGamma(kGamma);
+  mfem::RusanovFluxWithSides numerical_flux(igr_flux);
   auto form_integrator = std::make_unique<mfem::HyperbolicFormIntegrator>(
     numerical_flux, kFaceOrderOffset);
   mfem::DGHyperbolicConservationLaws dg_operator(
@@ -639,8 +633,7 @@ bool CompareObservations(const Observation& reference,
 void PrintUsage(const char* executable)
 {
   std::cerr << "usage: " << executable
-            << " <cpu|cuda> <--write-reference|--compare> <reference-file> "
-               "[rusanov|hdg-trace-centered]\n";
+            << " <cpu|cuda> <--write-reference|--compare> <reference-file>\n";
 }
 
 } // namespace
@@ -648,7 +641,7 @@ void PrintUsage(const char* executable)
 int main(int argc, char** argv)
 {
   mfem::Mpi::Init(argc, argv);
-  if (argc != 4 && argc != 5)
+  if (argc != 4)
   {
     PrintUsage(argv[0]);
     return 2;
@@ -656,13 +649,10 @@ int main(int argc, char** argv)
   const std::string device_name(argv[1]);
   const std::string action(argv[2]);
   const std::string reference_path(argv[3]);
-  const std::string flux_name = argc == 5 ? argv[4] : "rusanov";
-  const bool trace_centered = flux_name == "hdg-trace-centered";
   const bool write_reference = action == "--write-reference";
   const bool compare_reference = action == "--compare";
   if ((device_name != "cpu" && device_name != "cuda") ||
       (!write_reference && !compare_reference) ||
-      (flux_name != "rusanov" && !trace_centered) ||
       (write_reference && device_name != "cpu") ||
       (compare_reference && device_name != "cuda") ||
       mfem::Mpi::WorldSize() != 1)
@@ -683,9 +673,8 @@ int main(int argc, char** argv)
 
   Observation observation;
   Coverage coverage;
-  const std::string backend_and_flux = device_name + "/" + flux_name;
-  if (!BuildObservation(observation, coverage, trace_centered) ||
-      !ValidateObservation(observation, coverage, backend_and_flux))
+  if (!BuildObservation(observation, coverage) ||
+      !ValidateObservation(observation, coverage, device_name))
   {
     return 4;
   }
@@ -697,7 +686,6 @@ int main(int argc, char** argv)
       return 5;
     }
     std::cout << "[PASS] wrote exact-IID ordinary-DG CPU reference"
-              << " surface_flux=" << flux_name
               << " samples(volume,interior,boundary)=("
               << coverage.volume_samples << ','
               << coverage.interior_face_samples << ','

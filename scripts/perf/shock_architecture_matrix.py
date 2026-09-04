@@ -72,18 +72,29 @@ QOI_HARNESS_OWNED_OPTIONS = frozenset({
 
 DG_RK3SSP = "dg-rk3ssp"
 DG_SSPRK104 = "dg-ssprk104"
+DGSEM_SSPRK104_EVERY_STAGE = "dgsem-ssprk104-every-stage"
+DGSEM_SSPRK104_EXTRAPOLATED = "dgsem-ssprk104-extrapolated"
 HDG_RODAS3_ORDINARY = "hdg-rodas3-ordinary"
 HDG_RODAS3_TENSOR = "hdg-rodas3-tensor"
 METHODS = (
     DG_RK3SSP,
     DG_SSPRK104,
+    DGSEM_SSPRK104_EVERY_STAGE,
+    DGSEM_SSPRK104_EXTRAPOLATED,
     HDG_RODAS3_ORDINARY,
     HDG_RODAS3_TENSOR,
 )
-EXPLICIT_METHODS = (DG_RK3SSP, DG_SSPRK104)
+DG_EXPLICIT_METHODS = (DG_RK3SSP, DG_SSPRK104)
+DGSEM_EXPLICIT_METHODS = (
+    DGSEM_SSPRK104_EVERY_STAGE,
+    DGSEM_SSPRK104_EXTRAPOLATED,
+)
+EXPLICIT_METHODS = (*DG_EXPLICIT_METHODS, *DGSEM_EXPLICIT_METHODS)
 METHOD_INTEGRATORS = {
     DG_RK3SSP: "rk3ssp",
     DG_SSPRK104: "ssprk104",
+    DGSEM_SSPRK104_EVERY_STAGE: "ssprk104",
+    DGSEM_SSPRK104_EXTRAPOLATED: "ssprk104",
     HDG_RODAS3_ORDINARY: "rodas3",
     HDG_RODAS3_TENSOR: "rodas3",
 }
@@ -91,6 +102,11 @@ METHOD_ENGINES = {
     HDG_RODAS3_ORDINARY: "ordinary",
     HDG_RODAS3_TENSOR: "tensor",
 }
+
+EXACT_IID_Q_SIGMA_SCOPE = "application-total-attempted-speed-work"
+EXTRAPOLATED_Q_SIGMA_SCOPE = (
+    "application-total-attempted-frozen-sigma-work"
+)
 
 PROTECTED_APP_OPTIONS = frozenset({
     "-dev", "--device", "-m", "--mesh", "-o", "--order",
@@ -187,11 +203,15 @@ ARCHITECTURE_WORK_FLOAT_FIELDS = (
 )
 EXPLICIT_TIME_INTEGER_FIELDS = (
     "steps", "rhs_evaluations", "accepted_attempts", "rejected_attempts",
-    "rejected_limiter_elements", "characteristic_speed_probes",
+    "rejected_limiter_elements", "rejected_q_sigma_attempts",
+    "rejected_q_sigma_nonpositive_samples",
+    "rejected_q_sigma_nonfinite_samples", "last_q_sigma_rejection_stage",
+    "characteristic_speed_probes",
 )
 EXPLICIT_TIME_FLOAT_FIELDS = (
     "final_time", "minimum_attempted_dt", "maximum_attempted_dt",
     "minimum_accepted_dt", "maximum_accepted_dt",
+    "maximum_accepted_step_growth_ratio",
     "minimum_characteristic_speed", "maximum_characteristic_speed",
 )
 HDG_INTEGER_FIELDS = (
@@ -247,6 +267,7 @@ class HarnessControls:
     conservation_balance: bool
     zhang_shu_vtk_points: bool
     closure_certificate_max_relative_residual: float
+    closure_certificate_max_absolute_residual: float
     explicit_dt_by_method: Mapping[str, float]
     explicit_cfl_by_method: Mapping[str, float]
     dt_min: float
@@ -355,6 +376,10 @@ def build_method_arguments(
             "HDG methods do not support the element-local alpha policy"
         )
     extras = validate_extra_app_arguments(extra_arguments)
+    alpha_length_policy = (
+        "local" if method in DGSEM_EXPLICIT_METHODS
+        else controls.alpha_length_policy
+    )
     arguments = [
         "--device", controls.device,
         "--mesh", mesh,
@@ -363,7 +388,7 @@ def build_method_arguments(
         "--parallel-refine", str(controls.parallel_refine),
         "--regularization", "igr",
         "--c-alpha", format(controls.c_alpha, ".17g"),
-        "--igr-alpha-length", controls.alpha_length_policy,
+        "--igr-alpha-length", alpha_length_policy,
         "--t-final", format(controls.final_time, ".17g"),
         "--dt-min", format(controls.dt_min, ".17g"),
         "--positivity-limiter", "zhang-shu",
@@ -384,10 +409,17 @@ def build_method_arguments(
         arguments.append("--no-vtk_save")
 
     if method in EXPLICIT_METHODS:
+        selected_dgsem = method in DGSEM_EXPLICIT_METHODS
+        sigma_cadence = (
+            "extrapolated-every-step"
+            if method == DGSEM_SSPRK104_EXTRAPOLATED
+            else "every-stage"
+        )
         arguments.extend([
-            "--discretization", "dg",
-            "--dg-backend", "dg",
-            "--dgsem-surface-flux", controls.dgsem_surface_flux,
+            "--discretization", "dgsem" if selected_dgsem else "dg",
+            "--dg-backend", "dgsem" if selected_dgsem else "dg",
+            "--dgsem-surface-flux",
+            "rusanov" if selected_dgsem else controls.dgsem_surface_flux,
             "--time-integrator", METHOD_INTEGRATORS[method],
             "--time-step",
             format(controls.explicit_dt_by_method[method], ".17g"),
@@ -397,23 +429,35 @@ def build_method_arguments(
             "--igr-grad", "BrokenL2",
             "--igr-solve-mode", "krylov",
             "--igr-ip-kind", "sipg",
-            "--igr-sigma-cadence", "every-stage",
+            "--igr-sigma-cadence", sigma_cadence,
             "--igr-stage-rtol-scale", "1",
             "--igr-lin-rtol", format(controls.igr_linear_rtol, ".17g"),
             "--igr-lin-atol", format(controls.igr_linear_atol, ".17g"),
             "--igr-lin-maxit", str(controls.igr_linear_max_iterations),
-            "--igr-linear-solver", "minres",
+            "--igr-linear-solver", "cg" if selected_dgsem else "minres",
             "--igr-preconditioner", "chebyshev",
             "--igr-exact-dg-face",
             "--igr-invariant-domain-flux"
-            if controls.igr_invariant_domain_flux
+            if controls.igr_invariant_domain_flux and not selected_dgsem
             else "--no-igr-invariant-domain-flux",
-            "--igr-sigma-cfl" if controls.igr_sigma_cfl
+            "--igr-sigma-cfl" if controls.igr_sigma_cfl and not selected_dgsem
             else "--no-igr-sigma-cfl",
-            "--igr-sigma-rusanov" if controls.igr_sigma_rusanov
+            "--igr-sigma-rusanov"
+            if controls.igr_sigma_rusanov and not selected_dgsem
             else "--no-igr-sigma-rusanov",
             "--igr-nonconvergence-policy", "error",
         ])
+        if selected_dgsem:
+            arguments.extend([
+                "--dgsem-stab", "none",
+                "--dgsem-volume-flux", "central",
+                "--dgsem-volume-dissipation", "llf",
+                "--dgsem-entropy-jacobian", "fd",
+                "--no-vtk-h1-diagnostics",
+                "--no-vtk-l2-diagnostics",
+                "--no-vtk-mpi-rank-field",
+                "--no-vtk-zhang-shu-diagnostics",
+            ])
         arguments.append(
             "--zhang-shu-vtk-points"
             if controls.zhang_shu_vtk_points
@@ -440,7 +484,7 @@ def build_method_arguments(
 
 def method_closure_policy(method: str) -> dict[str, Any]:
     """Describe the closure actually requested by each typed card."""
-    if method in EXPLICIT_METHODS:
+    if method in DG_EXPLICIT_METHODS:
         return {
             "mathematical_model": "instantaneous-igr-index-one-dae",
             "architecture": "constraint-projected-explicit-elliptic",
@@ -454,6 +498,30 @@ def method_closure_policy(method: str) -> dict[str, Any]:
                 "explicit and DG scalar-closure summaries plus the final "
                 "accepted-state closure certificate and certification-support "
                 "status"
+            ),
+        }
+    if method in DGSEM_EXPLICIT_METHODS:
+        extrapolated = method == DGSEM_SSPRK104_EXTRAPOLATED
+        return {
+            "mathematical_model": "instantaneous-igr-index-one-dae",
+            "architecture": "constraint-projected-explicit-elliptic-dgsem",
+            "transport": "dgsem-central-volume-llf-rusanov-surface",
+            "alpha_length_policy": "local",
+            "scalar_space": "L2",
+            "gradient_reconstruction": "BrokenL2",
+            "scalar_solve_mode": "krylov-cg-chebyshev",
+            "reconstruction_cadence": (
+                "extrapolated-every-step" if extrapolated else "every-stage"
+            ),
+            "linear_nonconvergence_policy": "error",
+            "exact_dg_face_operator_requested": True,
+            "invariant_domain_flux_requested": False,
+            "required_q_sigma_scope": (
+                EXTRAPOLATED_Q_SIGMA_SCOPE if extrapolated else None
+            ),
+            "application_metrics": (
+                "explicit, DGSEM, scalar-closure, cadence, limiter, and final "
+                "accepted-state certification summaries"
             ),
         }
     if method in (HDG_RODAS3_ORDINARY, HDG_RODAS3_TENSOR):
@@ -474,6 +542,18 @@ def method_closure_policy(method: str) -> dict[str, Any]:
             ),
         }
     raise ShockArchitectureError(f"unknown method: {method}")
+
+
+def required_q_sigma_scope(
+        method: str, *, igr_invariant_domain_flux: bool) -> str | None:
+    """Return the exact q_sigma evidence scope required by a typed card."""
+    if method not in METHODS:
+        raise ShockArchitectureError(f"unknown method: {method}")
+    if method == DGSEM_SSPRK104_EXTRAPOLATED:
+        return EXTRAPOLATED_Q_SIGMA_SCOPE
+    if method in DG_EXPLICIT_METHODS and igr_invariant_domain_flux:
+        return EXACT_IID_Q_SIGMA_SCOPE
+    return None
 
 
 def _parse_key_values(line: str) -> dict[str, str]:
@@ -661,7 +741,7 @@ def parse_application_log(log: str, method: str) -> dict[str, Any]:
         explicit_fields,
         integer_names=EXPLICIT_TIME_INTEGER_FIELDS,
         float_names=EXPLICIT_TIME_FLOAT_FIELDS,
-        text_names=("termination_reason",),
+        text_names=("termination_reason", "last_q_sigma_rejection_reason"),
         boolean_names=("dt_min_reached", "success"),
     )
     explicit_time["source_marker"] = (
@@ -789,9 +869,21 @@ def parse_application_log(log: str, method: str) -> dict[str, Any]:
         lifecycle_lines[-1] if lifecycle_lines else {},
         integer_names=(
             "prefetch_solves", "stage0_reuses", "output_only_solves",
-            "prefetch_invalidations",
+            "prefetch_invalidations", "endpoint_solves",
+            "extrapolated_stages", "exact_anchor_certificates",
+            "exact_anchor_absolute_only_passes",
         ),
-        float_names=(),
+        float_names=(
+            "max_endpoint_prediction_defect",
+            "max_relative_endpoint_prediction_defect",
+            "max_exact_anchor_certificate_residual_rel_rhs",
+            "max_exact_anchor_certificate_relative_limit",
+            "max_exact_anchor_certificate_residual_abs",
+            "max_exact_anchor_certificate_absolute_limit",
+            "max_exact_anchor_certificate_acceptance_ratio",
+            "max_exact_anchor_relative_pass_residual_rel_rhs",
+            "max_exact_anchor_absolute_only_residual_abs",
+        ),
     )
 
     q_sigma_rows = _structured_lines(
@@ -1103,9 +1195,13 @@ def evaluate_quality(
         requirements: Mapping[str, Mapping[str, float]],
         qoi_failure: str | None,
         closure_certificate: Mapping[str, Any],
+        scalar_closure: Mapping[str, Any] | None = None,
+        scalar_lifecycle: Mapping[str, Any] | None = None,
+        explicit_time: Mapping[str, Any] | None = None,
         frozen_sigma_telemetry: Mapping[str, Any] | None = None,
-        require_positive_q_sigma: bool = False,
-        closure_certificate_max_relative_residual: float = 1.0e-7
+        required_q_sigma_evidence_scope: str | None = None,
+        closure_certificate_max_relative_residual: float = 1.0e-7,
+        closure_certificate_max_absolute_residual: float = 0.0
         ) -> dict[str, Any]:
     """Evaluate caller-selected QoIs without changing execution outcome."""
     if not qualification_mode:
@@ -1227,14 +1323,43 @@ def evaluate_quality(
             closure_certificate.get("residual_rel_rhs")
         )
         reported_limit = _as_float(closure_certificate.get("relative_limit"))
+        certificate_residual_abs = _as_float(
+            closure_certificate.get("residual_abs")
+        )
+        reported_absolute_limit = _as_float(
+            closure_certificate.get("absolute_limit")
+        )
         external_limit = _finite_positive(
             closure_certificate_max_relative_residual,
             "closure certificate maximum relative residual",
         )
-        if (certificate_residual is None or certificate_residual < 0.0 or
-                reported_limit is None or reported_limit < 0.0 or
-                certificate_residual > reported_limit or
-                certificate_residual > external_limit):
+        external_absolute_limit = _finite_nonnegative(
+            closure_certificate_max_absolute_residual,
+            "closure certificate maximum absolute residual",
+        )
+        relative_certificate_pass = (
+            certificate_residual is not None and
+            certificate_residual >= 0.0 and
+            reported_limit is not None and reported_limit >= 0.0 and
+            certificate_residual <= reported_limit
+        )
+        absolute_certificate_pass = (
+            certificate_residual_abs is not None and
+            certificate_residual_abs >= 0.0 and
+            reported_absolute_limit is not None and
+            reported_absolute_limit >= 0.0 and
+            certificate_residual_abs <= reported_absolute_limit
+        )
+        external_certificate_pass = (
+            (certificate_residual is not None and
+             certificate_residual >= 0.0 and
+             certificate_residual <= external_limit) or
+            (certificate_residual_abs is not None and
+             certificate_residual_abs >= 0.0 and
+             certificate_residual_abs <= external_absolute_limit)
+        )
+        if (not (relative_certificate_pass or absolute_certificate_pass) or
+                not external_certificate_pass):
             return {
                 "mode": "qualification",
                 "status": "failed",
@@ -1242,14 +1367,86 @@ def evaluate_quality(
                 "reason": "invalid_dg_closure_certificate_residual",
                 "requirements": {},
             }
-        if require_positive_q_sigma:
+        if method == DGSEM_SSPRK104_EXTRAPOLATED:
+            closure = scalar_closure or {}
+            if (closure.get("reported") is not True or
+                    closure.get("last_solver") != "cg" or
+                    closure.get("last_precond") != "operatorchebyshev" or
+                    closure.get("exact_face_effective") is not True):
+                return {
+                    "mode": "qualification",
+                    "status": "failed",
+                    "qualified": False,
+                    "reason": "invalid_dg_extrapolated_closure_solver_policy",
+                    "requirements": {},
+                }
+            lifecycle = scalar_lifecycle or {}
+            endpoint_solves = _as_int(lifecycle.get("endpoint_solves"))
+            exact_certificates = _as_int(
+                lifecycle.get("exact_anchor_certificates")
+            )
+            absolute_only_passes = _as_int(
+                lifecycle.get("exact_anchor_absolute_only_passes")
+            )
+            acceptance_ratio = _as_float(
+                lifecycle.get(
+                    "max_exact_anchor_certificate_acceptance_ratio"
+                )
+            )
+            relative_pass_residual = _as_float(
+                lifecycle.get(
+                    "max_exact_anchor_relative_pass_residual_rel_rhs"
+                )
+            )
+            absolute_only_residual = _as_float(
+                lifecycle.get(
+                    "max_exact_anchor_absolute_only_residual_abs"
+                )
+            )
+            lifecycle_valid = (
+                lifecycle.get("reported") is True and
+                endpoint_solves is not None and endpoint_solves >= 0 and
+                exact_certificates is not None and
+                exact_certificates == endpoint_solves + 2 and
+                absolute_only_passes is not None and
+                0 <= absolute_only_passes <= exact_certificates and
+                acceptance_ratio is not None and
+                0.0 <= acceptance_ratio <= 1.0 and
+                relative_pass_residual is not None and
+                0.0 <= relative_pass_residual <= external_limit and
+                absolute_only_residual is not None and
+                absolute_only_residual >= 0.0 and
+                (absolute_only_passes == 0 or
+                 absolute_only_residual <= external_absolute_limit)
+            )
+            if not lifecycle_valid:
+                return {
+                    "mode": "qualification",
+                    "status": "failed",
+                    "qualified": False,
+                    "reason": "invalid_dg_exact_anchor_certificate_history",
+                    "requirements": {},
+                }
+        if required_q_sigma_evidence_scope is not None:
+            if required_q_sigma_evidence_scope not in (
+                    EXACT_IID_Q_SIGMA_SCOPE,
+                    EXTRAPOLATED_Q_SIGMA_SCOPE):
+                raise ShockArchitectureError(
+                    "unknown required q_sigma evidence scope: "
+                    f"{required_q_sigma_evidence_scope}"
+                )
+            q_sigma_contract = (
+                "exact_iid_q_sigma"
+                if required_q_sigma_evidence_scope == EXACT_IID_Q_SIGMA_SCOPE
+                else "frozen_sigma_q_sigma"
+            )
             telemetry = frozen_sigma_telemetry or {}
             if not telemetry.get("reported"):
                 return {
                     "mode": "qualification",
                     "status": "failed",
                     "qualified": False,
-                    "reason": "missing_exact_iid_q_sigma_telemetry",
+                    "reason": f"missing_{q_sigma_contract}_telemetry",
                     "requirements": {},
                 }
             sample_count = _as_int(telemetry.get("sample_count"))
@@ -1261,22 +1458,97 @@ def evaluate_quality(
             minimum_normalized = _as_float(
                 telemetry.get("minimum_q_sigma_over_gamma_p")
             )
-            if (telemetry.get("scope") !=
-                    "application-total-attempted-speed-work" or
+            time_summary = explicit_time or {}
+            rejected_attempts = _as_int(
+                time_summary.get("rejected_attempts")
+            )
+            rejected_q_sigma_attempts = _as_int(
+                time_summary.get("rejected_q_sigma_attempts")
+            )
+            rejected_q_sigma_nonpositive = _as_int(
+                time_summary.get("rejected_q_sigma_nonpositive_samples")
+            )
+            rejected_q_sigma_nonfinite = _as_int(
+                time_summary.get("rejected_q_sigma_nonfinite_samples")
+            )
+            last_rejection_reason = time_summary.get(
+                "last_q_sigma_rejection_reason"
+            )
+            last_rejection_stage = _as_int(
+                time_summary.get("last_q_sigma_rejection_stage")
+            )
+            attempted_violations = (
+                nonpositive_count is not None and
+                nonfinite_count is not None and
+                (nonpositive_count > 0 or nonfinite_count > 0)
+            )
+            rejection_reason_valid = (
+                last_rejection_reason in (
+                    "q-sigma-nonpositive",
+                    "q-sigma-nonfinite",
+                    "q-sigma-nonpositive-and-nonfinite",
+                )
+                if attempted_violations else last_rejection_reason == "none"
+            )
+            rejection_summary_valid = (
+                time_summary.get("reported") is True and
+                time_summary.get("success") is True and
+                rejected_attempts is not None and rejected_attempts >= 0 and
+                rejected_q_sigma_attempts is not None and
+                rejected_q_sigma_attempts >= 0 and
+                rejected_q_sigma_nonpositive is not None and
+                rejected_q_sigma_nonpositive >= 0 and
+                rejected_q_sigma_nonfinite is not None and
+                rejected_q_sigma_nonfinite >= 0 and
+                last_rejection_stage is not None and
+                last_rejection_stage >= -1 and
+                rejection_reason_valid and
+                rejected_q_sigma_attempts <= rejected_attempts and
+                ((rejected_q_sigma_attempts > 0) == attempted_violations) and
+                (not attempted_violations or
+                 rejected_q_sigma_attempts <=
+                 rejected_q_sigma_nonpositive +
+                 rejected_q_sigma_nonfinite)
+            )
+            counts_reconciled = (
+                nonpositive_count is not None and
+                nonfinite_count is not None and
+                rejected_q_sigma_nonpositive == nonpositive_count and
+                rejected_q_sigma_nonfinite == nonfinite_count
+            )
+            q_sigma_containment = {
+                "required": True,
+                "contained": rejection_summary_valid and counts_reconciled,
+                "counts_reconciled": counts_reconciled,
+                "accepted_endpoint_and_certificate_passed":
+                    time_summary.get("success") is True,
+                "rejected_q_sigma_attempts": rejected_q_sigma_attempts,
+                "rejected_q_sigma_nonpositive_samples":
+                    rejected_q_sigma_nonpositive,
+                "rejected_q_sigma_nonfinite_samples":
+                    rejected_q_sigma_nonfinite,
+                "last_q_sigma_rejection_reason": last_rejection_reason,
+                "last_q_sigma_rejection_stage": last_rejection_stage,
+            }
+            if (telemetry.get("scope") != required_q_sigma_evidence_scope or
                     telemetry.get("precision") != "fp64" or
                     telemetry.get("rejected_attempts_included") is not True or
                     sample_count is None or sample_count <= 0 or
                     nonpositive_count is None or nonpositive_count < 0 or
                     nonfinite_count is None or nonfinite_count < 0 or
-                    nonpositive_count != 0 or nonfinite_count != 0 or
-                    minimum_raw is None or minimum_raw <= 0.0 or
-                    minimum_normalized is None or minimum_normalized <= 0.0):
+                    nonpositive_count > sample_count or
+                    nonfinite_count > sample_count or
+                    minimum_raw is None or minimum_normalized is None or
+                    (not attempted_violations and
+                     (minimum_raw <= 0.0 or minimum_normalized <= 0.0)) or
+                    not q_sigma_containment["contained"]):
                 return {
                     "mode": "qualification",
                     "status": "failed",
                     "qualified": False,
-                    "reason": "invalid_exact_iid_q_sigma_telemetry",
+                    "reason": f"invalid_{q_sigma_contract}_telemetry",
                     "requirements": {},
+                    "q_sigma_containment": q_sigma_containment,
                 }
     else:
         return {
@@ -1303,7 +1575,7 @@ def evaluate_quality(
             "absolute_error": absolute_error,
             "passed": passed,
         }
-    return {
+    result = {
         "mode": "qualification",
         "status": "passed" if all_passed else "failed",
         "qualified": all_passed,
@@ -1311,6 +1583,9 @@ def evaluate_quality(
             "qoi_gate_failed_or_missing",
         "requirements": gates,
     }
+    if required_q_sigma_evidence_scope is not None:
+        result["q_sigma_containment"] = q_sigma_containment
+    return result
 
 
 def classify_selection(
@@ -1839,6 +2114,22 @@ def verify_git_identity(expected: Mapping[str, Any]) -> None:
         )
 
 
+def campaign_child_environment(
+        source: Mapping[str, str], *, enable_limiter_timing: bool
+        ) -> dict[str, str]:
+    """Return the reproducible child environment for selection runs."""
+    environment = dict(source)
+    environment.pop("DG_IGR_VTK_PREFIX_PATH", None)
+    environment.pop("DG_IGR_LIMITER_TIMING", None)
+    # Both the every-stage comparator and extrapolated candidate use the full
+    # exact-face solve operator. Pin the legacy experimental switch so an
+    # ambient shell cannot silently change a tournament method.
+    environment["DG_IGR_IGR_CHEB_BASE_OPERATOR"] = "0"
+    if enable_limiter_timing:
+        environment["DG_IGR_LIMITER_TIMING"] = "1"
+    return environment
+
+
 def parse_key_value_arguments(
         values: Sequence[str], name: str) -> dict[str, str]:
     result: dict[str, str] = {}
@@ -2089,8 +2380,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         f"Pinned QoI input files: {qoi_input_summary}.",
         "",
         f"Target physical time: `{controls['final_time']}`; "
-        f"C_alpha: `{controls['c_alpha']}`; h_eff policy: "
-        f"`{controls['alpha_length_policy']}`.",
+        f"C_alpha: `{controls['c_alpha']}`; legacy-DG/HDG h_eff policy: "
+        f"`{controls['alpha_length_policy']}`. Selected DGSEM cards pin "
+        "the element-local h_eff policy.",
         "",
         "Execution success means a zero application exit code and observed "
         "arrival at the target horizon. Quality qualification is reported "
@@ -2194,15 +2486,98 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         )
     lines.extend([
         "",
-        "The exact IGR route reports an MPI-reduced FP64 aggregate over all "
-        "speed evaluations performed by the application, including rejected "
-        "attempts. It retains no per-event history. A positive reported "
-        "minimum q_sigma establishes only the sampled frozen-sigma local "
-        "flux condition, not hyperbolicity of the nonlocal reduced DAE.",
+        "A typed route may require an MPI-reduced FP64 aggregate over either "
+        "all exact-IID speed evaluations or all frozen-sigma work, including "
+        "rejected attempts; the exact scope is recorded per method. It "
+        "retains no per-event history. Historical nonpositive or nonfinite "
+        "samples are admissible evidence only when their totals reconcile "
+        "exactly with rolled-back q_sigma rejections and the accepted "
+        "endpoint and closure-certificate gates pass. This establishes only "
+        "the sampled frozen-sigma local flux condition, not hyperbolicity of "
+        "the nonlocal reduced DAE.",
+        "",
+        "## q_sigma rollback containment",
+        "",
+        "| Run | Method | Rejected q_sigma attempts | Rejected nonpositive "
+        "samples | Rejected nonfinite samples | Last reason | Last stage | "
+        "Counts reconciled | Contained |",
+        "|---:|---|---:|---:|---:|---|---:|---|---|",
     ])
+    for run in report["runs"]:
+        explicit_time = run["progress"].get("explicit_time", {})
+        containment = run.get("quality", {}).get(
+            "q_sigma_containment", {}
+        )
+        rejected_q_sigma_attempts = explicit_time.get(
+            "rejected_q_sigma_attempts"
+        )
+        rejected_q_sigma_nonpositive = explicit_time.get(
+            "rejected_q_sigma_nonpositive_samples"
+        )
+        rejected_q_sigma_nonfinite = explicit_time.get(
+            "rejected_q_sigma_nonfinite_samples"
+        )
+        last_rejection_reason = explicit_time.get(
+            "last_q_sigma_rejection_reason"
+        )
+        last_rejection_stage = explicit_time.get(
+            "last_q_sigma_rejection_stage"
+        )
+        lines.append(
+            f"| {run['run_index']} | {run['method']} | "
+            f"{_markdown_value(rejected_q_sigma_attempts)} | "
+            f"{_markdown_value(rejected_q_sigma_nonpositive)} | "
+            f"{_markdown_value(rejected_q_sigma_nonfinite)} | "
+            f"{_markdown_value(last_rejection_reason)} | "
+            f"{_markdown_value(last_rejection_stage)} | "
+            f"{_markdown_value(containment.get('counts_reconciled'))} | "
+            f"{_markdown_value(containment.get('contained'))} |"
+        )
     lines.extend([
         "",
-        "## DG limiter aggregates",
+        "## Instantaneous IGR sigma lifecycle",
+        "",
+        "| Run | Method | Prefetch solves | Stage-0 reuses | Output-only "
+        "solves | Prefetch invalidations | Endpoint solves | Extrapolated "
+        "stages | Exact-anchor certificates | Absolute-only passes | Maximum "
+        "exact-anchor FP64 relative residual | Relative limit | Maximum "
+        "absolute residual | Absolute limit | Maximum acceptance ratio | "
+        "Maximum relative-pass residual | Maximum absolute-only residual | "
+        "Maximum endpoint prediction "
+        "defect | Maximum relative endpoint prediction defect |",
+        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    for run in report["runs"]:
+        lifecycle = run["progress"].get("scalar_lifecycle", {})
+        relative_endpoint_defect = lifecycle.get(
+            "max_relative_endpoint_prediction_defect"
+        )
+        endpoint_defect = lifecycle.get(
+            "max_endpoint_prediction_defect"
+        )
+        lines.append(
+            f"| {run['run_index']} | {run['method']} | "
+            f"{_markdown_value(lifecycle.get('prefetch_solves'))} | "
+            f"{_markdown_value(lifecycle.get('stage0_reuses'))} | "
+            f"{_markdown_value(lifecycle.get('output_only_solves'))} | "
+            f"{_markdown_value(lifecycle.get('prefetch_invalidations'))} | "
+            f"{_markdown_value(lifecycle.get('endpoint_solves'))} | "
+            f"{_markdown_value(lifecycle.get('extrapolated_stages'))} | "
+            f"{_markdown_value(lifecycle.get('exact_anchor_certificates'))} | "
+            f"{_markdown_value(lifecycle.get('exact_anchor_absolute_only_passes'))} | "
+            f"{_markdown_value(lifecycle.get('max_exact_anchor_certificate_residual_rel_rhs'))} | "
+            f"{_markdown_value(lifecycle.get('max_exact_anchor_certificate_relative_limit'))} | "
+            f"{_markdown_value(lifecycle.get('max_exact_anchor_certificate_residual_abs'))} | "
+            f"{_markdown_value(lifecycle.get('max_exact_anchor_certificate_absolute_limit'))} | "
+            f"{_markdown_value(lifecycle.get('max_exact_anchor_certificate_acceptance_ratio'))} | "
+            f"{_markdown_value(lifecycle.get('max_exact_anchor_relative_pass_residual_rel_rhs'))} | "
+            f"{_markdown_value(lifecycle.get('max_exact_anchor_absolute_only_residual_abs'))} | "
+            f"{_markdown_value(endpoint_defect)} | "
+            f"{_markdown_value(relative_endpoint_defect)} |"
+        )
+    lines.extend([
+        "",
+        "## Explicit DG/DGSEM limiter aggregates",
         "",
         "| Run | Method | Reported ranks | Calls | Active calls | Limited "
         "element-visits | Element-call opportunities | Limited-element "
@@ -2233,7 +2608,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         "Minimum theta is the smallest effective density-times-pressure "
         "contraction over those element-calls.",
         "",
-        "## DG accepted-trajectory conservation balance",
+        "## Explicit DG/DGSEM accepted-trajectory conservation balance",
         "",
         "| Run | Method | Balance reported | Supported | Domain measure | "
         "Maximum absolute defect | Maximum relative defect |",
@@ -2262,12 +2637,13 @@ def render_markdown(report: Mapping[str, Any]) -> str:
            "This opt-in diagnostic is disabled in these samples; they cannot "
            "support a conservation-qualified claim."),
         "",
-        "## DG accepted-state closure certification",
+        "## Explicit DG/DGSEM accepted-state closure certification",
         "",
         "| Run | Method | Marker reported | Solved | Certification supported | "
         "Certified | Time | Scope | Precision | FP64 residual / RHS | "
-        "Reported relative limit | Certificate run success |",
-        "|---:|---|---|---|---|---|---:|---|---|---:|---:|---|",
+        "Reported relative limit | FP64 absolute residual | Reported absolute "
+        "limit | Certificate run success |",
+        "|---:|---|---|---|---|---|---:|---|---|---:|---:|---:|---:|---|",
     ])
     for run in report["runs"]:
         certificate = run["progress"].get("closure_certificate", {})
@@ -2282,6 +2658,8 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f"{_markdown_value(certificate.get('precision'))} | "
             f"{_markdown_value(certificate.get('residual_rel_rhs'))} | "
             f"{_markdown_value(certificate.get('relative_limit'))} | "
+            f"{_markdown_value(certificate.get('residual_abs'))} | "
+            f"{_markdown_value(certificate.get('absolute_limit'))} | "
             f"{_markdown_value(certificate.get('run_success'))} |"
         )
     closure_policies = controls.get("closure_policy_by_method", {})
@@ -2396,6 +2774,10 @@ def _controls_from_arguments(
             arguments.closure_certificate_max_relative_residual,
             "--closure-certificate-max-relative-residual",
         ),
+        closure_certificate_max_absolute_residual=_finite_nonnegative(
+            arguments.closure_certificate_max_absolute_residual,
+            "--closure-certificate-max-absolute-residual",
+        ),
         explicit_dt_by_method=explicit_dt_by_method,
         explicit_cfl_by_method=explicit_cfl_by_method,
         dt_min=dt_min,
@@ -2445,19 +2827,26 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--alpha-length-policy", choices=("min", "average", "max", "local"),
         default="max",
+        help=(
+            "Legacy explicit-DG and HDG h_eff policy; the selected DGSEM "
+            "cards always use the element-local policy"
+        ),
     )
     parser.add_argument(
         "--dgsem-surface-flux",
         choices=("rusanov", "diffusive-rusanov", "es-winters", "es-lf-entropy"),
         default="rusanov",
-        help="Typed DG/DGSEM explicit surface flux",
+        help=(
+            "Legacy explicit-DG surface flux; selected DGSEM cards pin "
+            "Rusanov"
+        ),
     )
     parser.add_argument(
         "--igr-invariant-domain-flux", action="store_true",
         help=(
-            "Use the exact frozen-stage LF split threshold together with the "
-            "frozen-sigma characteristic-modulus bound for both explicit CFL "
-            "accounting and Rusanov face dissipation"
+            "Use the legacy explicit-DG exact frozen-stage LF split threshold "
+            "and characteristic-modulus bound; selected DGSEM cards pin this "
+            "off"
         ),
     )
     parser.add_argument(
@@ -2489,6 +2878,17 @@ def _argument_parser() -> argparse.ArgumentParser:
         help=(
             "Independent FP64 ceiling applied in addition to the closure "
             "solver's reported accepted-state certificate limit"
+        ),
+    )
+    parser.add_argument(
+        "--closure-certificate-max-absolute-residual",
+        type=float,
+        default=0.0,
+        help=(
+            "Independent FP64 absolute-residual ceiling used by the final "
+            "certificate alternative and by exact anchors that pass the "
+            "solver certificate only through its absolute criterion; zero "
+            "disables nonzero absolute-only qualification"
         ),
     )
     parser.add_argument(
@@ -2673,11 +3073,10 @@ def run_campaign(arguments: argparse.Namespace) -> dict[str, Any]:
     hardware_fields = parse_key_value_arguments(
         arguments.hardware_field, "--hardware-field"
     )
-    child_environment = dict(os.environ)
-    child_environment.pop("DG_IGR_VTK_PREFIX_PATH", None)
-    child_environment.pop("DG_IGR_LIMITER_TIMING", None)
-    if arguments.enable_limiter_timing:
-        child_environment["DG_IGR_LIMITER_TIMING"] = "1"
+    child_environment = campaign_child_environment(
+        os.environ,
+        enable_limiter_timing=arguments.enable_limiter_timing,
+    )
     selected_environment = {
         name: value for name, value in child_environment.items()
         if name.startswith("DG_IGR_") or name in {
@@ -2825,12 +3224,21 @@ def run_campaign(arguments: argparse.Namespace) -> dict[str, Any]:
                     requirements=qoi_requirements,
                     qoi_failure=qoi_failure,
                     closure_certificate=parsed["closure_certificate"],
+                    scalar_closure=parsed["scalar_closure"],
+                    scalar_lifecycle=parsed["scalar_lifecycle"],
+                    explicit_time=parsed["explicit_time"],
                     frozen_sigma_telemetry=parsed["frozen_sigma_telemetry"],
-                    require_positive_q_sigma=(
-                        controls.igr_invariant_domain_flux
+                    required_q_sigma_evidence_scope=required_q_sigma_scope(
+                        method,
+                        igr_invariant_domain_flux=(
+                            controls.igr_invariant_domain_flux
+                        ),
                     ),
                     closure_certificate_max_relative_residual=(
                         controls.closure_certificate_max_relative_residual
+                    ),
+                    closure_certificate_max_absolute_residual=(
+                        controls.closure_certificate_max_absolute_residual
                     ),
                 )
                 selection = classify_selection(
@@ -2860,6 +3268,12 @@ def run_campaign(arguments: argparse.Namespace) -> dict[str, Any]:
                             "zhang_shu_vtk_points": (
                                 controls.zhang_shu_vtk_points
                                 if method in EXPLICIT_METHODS else None
+                            ),
+                            "q_sigma_evidence_scope": required_q_sigma_scope(
+                                method,
+                                igr_invariant_domain_flux=(
+                                    controls.igr_invariant_domain_flux
+                                ),
                             ),
                         },
                     },
@@ -2933,6 +3347,13 @@ def run_campaign(arguments: argparse.Namespace) -> dict[str, Any]:
         "closure_policy_by_method": {
             method: method_closure_policy(method) for method in methods
         },
+        "q_sigma_evidence_scope_by_method": {
+            method: required_q_sigma_scope(
+                method,
+                igr_invariant_domain_flux=controls.igr_invariant_domain_flux,
+            )
+            for method in methods
+        },
     }
     invocation_arguments = list(getattr(arguments, "_driver_argv", ()))
     invocation = [str(harness_path), *invocation_arguments]
@@ -2960,7 +3381,7 @@ def run_campaign(arguments: argparse.Namespace) -> dict[str, Any]:
             "typed_application_controls": {
                 "zhang_shu_vtk_points": {
                     "enabled": controls.zhang_shu_vtk_points,
-                    "scope": "explicit-dg-only",
+                    "scope": "explicit-dg-and-dgsem-only",
                 },
             },
             "mpi_launcher": ({

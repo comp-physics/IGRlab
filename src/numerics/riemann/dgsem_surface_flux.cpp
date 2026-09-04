@@ -15,8 +15,6 @@ inline const char* SurfaceFluxTypeName(DGSEMSurfaceFluxType type)
   {
   case DGSEMSurfaceFluxType::Rusanov:
     return "rusanov";
-  case DGSEMSurfaceFluxType::HdgTraceCentered:
-    return "hdg-trace-centered";
   case DGSEMSurfaceFluxType::DiffusiveRusanov:
     return "diffusive-rusanov";
   case DGSEMSurfaceFluxType::EntropyStableWinters:
@@ -37,7 +35,6 @@ DGSEMSurfaceFlux::DGSEMSurfaceFlux(const FluxFunction& fluxFunction)
     side_explicit_flux_(
       dynamic_cast<const FaceSideExplicitFlux*>(&fluxFunction)),
     rusanov_(fluxFunction),
-    hdg_trace_centered_(fluxFunction),
     diffusive_rusanov_(fluxFunction, /*beta=*/2.0)
 {
 }
@@ -51,10 +48,6 @@ real_t DGSEMSurfaceFlux::Eval(const Vector& state1,
   if (type_ == DGSEMSurfaceFluxType::Rusanov)
   {
     return rusanov_.Eval(state1, state2, nor, Tr, flux);
-  }
-  if (type_ == DGSEMSurfaceFluxType::HdgTraceCentered)
-  {
-    return hdg_trace_centered_.Eval(state1, state2, nor, Tr, flux);
   }
   if (type_ == DGSEMSurfaceFluxType::DiffusiveRusanov)
   {
@@ -143,11 +136,6 @@ void DGSEMSurfaceFlux::Grad(int side,
     rusanov_.Grad(side, state1, state2, nor, Tr, grad);
     return;
   }
-  if (type_ == DGSEMSurfaceFluxType::HdgTraceCentered)
-  {
-    hdg_trace_centered_.Grad(side, state1, state2, nor, Tr, grad);
-    return;
-  }
   if (type_ == DGSEMSurfaceFluxType::DiffusiveRusanov)
   {
     diffusive_rusanov_.Grad(side, state1, state2, nor, Tr, grad);
@@ -170,10 +158,6 @@ real_t DGSEMSurfaceFlux::Average(const Vector& state1,
   {
     return rusanov_.Average(state1, state2, nor, Tr, flux);
   }
-  if (type_ == DGSEMSurfaceFluxType::HdgTraceCentered)
-  {
-    return hdg_trace_centered_.Average(state1, state2, nor, Tr, flux);
-  }
   if (type_ == DGSEMSurfaceFluxType::DiffusiveRusanov)
   {
     return diffusive_rusanov_.Average(state1, state2, nor, Tr, flux);
@@ -191,11 +175,6 @@ void DGSEMSurfaceFlux::AverageGrad(int side,
   if (type_ == DGSEMSurfaceFluxType::Rusanov)
   {
     rusanov_.AverageGrad(side, state1, state2, nor, Tr, grad);
-    return;
-  }
-  if (type_ == DGSEMSurfaceFluxType::HdgTraceCentered)
-  {
-    hdg_trace_centered_.AverageGrad(side, state1, state2, nor, Tr, grad);
     return;
   }
   if (type_ == DGSEMSurfaceFluxType::DiffusiveRusanov)

@@ -319,15 +319,6 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
   face_shared_speed_.SetSize(0);
   face_shared_speed_q_.SetSize(0);
   face_shared_q_sigma_telemetry_.SetSize(0);
-  face_int_flux_record_.SetSize(0);
-  face_bdr_flux_record_.SetSize(0);
-  face_shared_flux_record_.SetSize(0);
-  fused_elem_face_offsets_.SetSize(0);
-  fused_elem_face_kind_.SetSize(0);
-  fused_elem_face_id_.SetSize(0);
-  fused_elem_face_side_.SetSize(0);
-  fused_elem_incidence_ready_ = false;
-  fused_wide_panel_layout_ready_ = false;
   face_bdr_policy_ready_ = false;
   face_sigma_ready_ = false;
   face_sigma_fes_ = nullptr;
@@ -360,16 +351,12 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
     return;
   }
 
-  bool flux_supported =
-    dynamic_cast<const RusanovFluxWithSides*>(num_flux_) != nullptr ||
-    dynamic_cast<const HdgTraceCenteredFlux*>(num_flux_) != nullptr;
+  bool flux_supported = (dynamic_cast<const RusanovFluxWithSides*>(num_flux_) != nullptr);
   if (!flux_supported)
   {
     const auto* dgsem_flux = dynamic_cast<const DGSEMSurfaceFlux*>(num_flux_);
-    flux_supported = dgsem_flux &&
-      (dgsem_flux->GetSurfaceFluxType() == DGSEMSurfaceFluxType::Rusanov ||
-       dgsem_flux->GetSurfaceFluxType() ==
-         DGSEMSurfaceFluxType::HdgTraceCentered);
+    flux_supported =
+      (dgsem_flux && dgsem_flux->GetSurfaceFluxType() == DGSEMSurfaceFluxType::Rusanov);
   }
   if (!flux_supported)
   {
@@ -874,136 +861,6 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
   }
 
   face_apply_ready_ = true;
-  // Failure here only disables the opt-in research screen. The established
-  // packed face path remains available for every tuple it supported before.
-  BuildFusedElementIncidence_();
-}
-
-bool DGHyperbolicConservationLaws::BuildFusedElementIncidence_()
-{
-  fused_elem_incidence_ready_ = false;
-  fused_elem_face_offsets_.SetSize(0);
-  fused_elem_face_kind_.SetSize(0);
-  fused_elem_face_id_.SetSize(0);
-  fused_elem_face_side_.SetSize(0);
-  face_int_flux_record_.SetSize(0);
-  face_bdr_flux_record_.SetSize(0);
-  face_shared_flux_record_.SetSize(0);
-  fused_wide_panel_layout_ready_ = false;
-
-  const int ne = vfes.GetNE();
-  const int dof = face_elem_dof_;
-  if (!face_apply_ready_ || ne <= 0 || dim != 2 || num_equations != 4 ||
-      dof <= 0 || dof > 9)
-  {
-    return false;
-  }
-  for (int e = 0; e < ne; ++e)
-  {
-    const int order = vfes.GetFE(e)->GetOrder();
-    if (order < 1 || order > 2 ||
-        vfes.GetFE(e)->GetGeomType() != Geometry::SQUARE ||
-        vfes.GetFE(e)->GetDof() != dof)
-    {
-      return false;
-    }
-  }
-
-  // MFEM's byNODES vector ordering is component-major. For a uniform L2
-  // space whose scalar element dofs are consecutive, the local L-vector is
-  // already a column-major K x (elements*equations) panel. Record this as a
-  // follow-on opportunity; the fused screen itself continues to use maps.
-  fused_wide_panel_layout_ready_ =
-    vfes.GetOrdering() == Ordering::byNODES && vfes.GetNDofs() == ne * dof;
-  Array<int> element_dofs;
-  for (int e = 0; fused_wide_panel_layout_ready_ && e < ne; ++e)
-  {
-    vfes.GetElementDofs(e, element_dofs);
-    if (element_dofs.Size() != dof)
-    {
-      fused_wide_panel_layout_ready_ = false;
-      break;
-    }
-    for (int i = 0; i < dof; ++i)
-    {
-      if (element_dofs[i] != e * dof + i)
-      {
-        fused_wide_panel_layout_ready_ = false;
-        break;
-      }
-    }
-  }
-
-  std::vector<int> counts(ne, 0);
-  for (int f = 0; f < face_int_e1_.Size(); ++f)
-  {
-    ++counts[face_int_e1_[f]];
-    ++counts[face_int_e2_[f]];
-  }
-  for (int f = 0; f < face_bdr_e1_.Size(); ++f)
-  {
-    ++counts[face_bdr_e1_[f]];
-  }
-  for (int f = 0; f < face_shared_e1_.Size(); ++f)
-  {
-    ++counts[face_shared_e1_[f]];
-  }
-  for (int e = 0; e < ne; ++e)
-  {
-    // The screen is intentionally bounded to conforming quadrilateral meshes.
-    // Refuse a partial incidence graph instead of silently dropping a face.
-    if (counts[e] != 4)
-    {
-      return false;
-    }
-  }
-
-  fused_elem_face_offsets_.SetSize(ne + 1);
-  fused_elem_face_offsets_[0] = 0;
-  for (int e = 0; e < ne; ++e)
-  {
-    fused_elem_face_offsets_[e + 1] =
-      fused_elem_face_offsets_[e] + counts[e];
-  }
-  const int incidence_count = fused_elem_face_offsets_[ne];
-  fused_elem_face_kind_.SetSize(incidence_count);
-  fused_elem_face_id_.SetSize(incidence_count);
-  fused_elem_face_side_.SetSize(incidence_count);
-
-  std::vector<int> cursor(ne);
-  for (int e = 0; e < ne; ++e)
-  {
-    cursor[e] = fused_elem_face_offsets_[e];
-  }
-  const auto append = [&](int element, int kind, int face, int side)
-  {
-    const int slot = cursor[element]++;
-    fused_elem_face_kind_[slot] = kind;
-    fused_elem_face_id_[slot] = face;
-    fused_elem_face_side_[slot] = side;
-  };
-  for (int f = 0; f < face_int_e1_.Size(); ++f)
-  {
-    append(face_int_e1_[f], kFusedInteriorFace_, f, 0);
-    append(face_int_e2_[f], kFusedInteriorFace_, f, 1);
-  }
-  for (int f = 0; f < face_bdr_e1_.Size(); ++f)
-  {
-    append(face_bdr_e1_[f], kFusedBoundaryFace_, f, 0);
-  }
-  for (int f = 0; f < face_shared_e1_.Size(); ++f)
-  {
-    append(face_shared_e1_[f], kFusedSharedFace_, f, 0);
-  }
-
-  face_int_flux_record_.SetSize(face_int_e1_.Size() * face_int_nq_ *
-                                num_equations);
-  face_bdr_flux_record_.SetSize(face_bdr_e1_.Size() * face_bdr_nq_ *
-                                num_equations);
-  face_shared_flux_record_.SetSize(face_shared_e1_.Size() * face_shared_nq_ *
-                                   num_equations);
-  fused_elem_incidence_ready_ = true;
-  return true;
 }
 
 bool DGHyperbolicConservationLaws::BuildFaceSigmaData_(
@@ -1299,114 +1156,16 @@ bool DGHyperbolicConservationLaws::UseDeviceFaceResidual_() const
   return face_apply_ready_;
 }
 
-void DGHyperbolicConservationLaws::LogFusedElementResidualSelection_(
-  bool selected,
-  const char* reason) const
-{
-  if (fused_residual_selection_logged_)
-  {
-    return;
-  }
-  if (!mfem::Mpi::Root())
-  {
-    fused_residual_selection_logged_ = true;
-    return;
-  }
-  const std::int64_t weighted_flux_values =
-    static_cast<std::int64_t>(face_int_e1_.Size()) * face_int_nq_ *
-      num_equations +
-    static_cast<std::int64_t>(face_bdr_e1_.Size()) * face_bdr_nq_ *
-      num_equations +
-    static_cast<std::int64_t>(face_shared_e1_.Size()) * face_shared_nq_ *
-      num_equations;
-  const std::int64_t eliminated_atomic_updates =
-    (2LL * face_int_e1_.Size() * face_int_nq_ +
-     1LL * face_bdr_e1_.Size() * face_bdr_nq_ +
-     1LL * face_shared_e1_.Size() * face_shared_nq_) *
-    face_elem_dof_ * num_equations;
-  const int order = vfes.GetNE() > 0 ? vfes.GetFE(0)->GetOrder() : -1;
-  std::cout << "[dg-fused-screen] requested=1"
-            << " selected="
-            << (selected ? "face-record-element-owned" : "legacy-packed")
-            << " reason=" << reason
-            << " order=" << order
-            << " dof=" << face_elem_dof_
-            << " elements=" << vfes.GetNE()
-            << " incidences=" << fused_elem_face_kind_.Size()
-            << " weighted_flux_values=" << weighted_flux_values
-            << " eliminated_residual_atomics=" << eliminated_atomic_updates
-            << " lift_order=deterministic-csr"
-            << " parity_contract=paired-fp64-run"
-            << " wide_panel_layout="
-            << (fused_wide_panel_layout_ready_ ? "zero-copy" : "mapped")
-            << " p3_tensor_core=disabled"
-            << " backend="
-            << (Device::Allows(Backend::CUDA_MASK) ? "cuda" : "non-cuda")
-            << '\n';
-  fused_residual_selection_logged_ = true;
-}
-
-bool DGHyperbolicConservationLaws::UseFusedElementResidualScreen_() const
-{
-  if (!::dg_igr::EnvFlagEnabledDefault(
-        "DG_IGR_DG_FUSED_ELEMENT_RESIDUAL", false))
-  {
-    return false;
-  }
-  if (!Device::Allows(Backend::CUDA_MASK))
-  {
-    LogFusedElementResidualSelection_(false, "requires-cuda");
-    return false;
-  }
-  if (vol_mode_ != VolumeMode::WeakDivergence || weakdiv.empty() ||
-      !weakdiv_apply_ready_ || !invmass_apply_ready_)
-  {
-    LogFusedElementResidualSelection_(false, "requires-packed-weak-dg");
-    return false;
-  }
-  if (face_data_dirty_)
-  {
-    const_cast<DGHyperbolicConservationLaws*>(this)->BuildFaceApplyData_();
-  }
-  if (!face_apply_ready_)
-  {
-    LogFusedElementResidualSelection_(false, "packed-face-unavailable");
-    return false;
-  }
-  if (!fused_elem_incidence_ready_)
-  {
-    LogFusedElementResidualSelection_(false,
-                                      "requires-conforming-p1-p2-quads");
-    return false;
-  }
-  const int expected_int =
-    face_int_e1_.Size() * face_int_nq_ * num_equations;
-  const int expected_bdr =
-    face_bdr_e1_.Size() * face_bdr_nq_ * num_equations;
-  const int expected_shared =
-    face_shared_e1_.Size() * face_shared_nq_ * num_equations;
-  if (face_int_flux_record_.Size() != expected_int ||
-      face_bdr_flux_record_.Size() != expected_bdr ||
-      face_shared_flux_record_.Size() != expected_shared)
-  {
-    LogFusedElementResidualSelection_(false, "flux-record-size-mismatch");
-    return false;
-  }
-  return true;
-}
-
 bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
   const Vector& x_in,
   Vector& z_inout,
   real_t& max_face_speed,
-  bool capture_boundary_flux,
-  bool record_flux_only) const
+  bool capture_boundary_flux) const
 {
 #ifndef DG_IGR_HAS_ACCEL_FORALL
   (void)x_in;
   (void)z_inout;
   (void)capture_boundary_flux;
-  (void)record_flux_only;
   max_face_speed = 0.0;
   return false;
 #else
@@ -1418,13 +1177,6 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
 
   const FluxFunction& flux_fn = formIntegrator->GetFluxFunction();
   const auto* flux_igr = dynamic_cast<const FluxWithIGR*>(&flux_fn);
-  const auto* dgsem_surface_flux =
-    dynamic_cast<const DGSEMSurfaceFlux*>(num_flux_);
-  const bool trace_centered =
-    dynamic_cast<const HdgTraceCenteredFlux*>(num_flux_) != nullptr ||
-    (dgsem_surface_flux &&
-     dgsem_surface_flux->GetSurfaceFluxType() ==
-       DGSEMSurfaceFluxType::HdgTraceCentered);
 
   bool use_sigma = false;
   bool invariant_domain_flux = false;
@@ -1454,20 +1206,12 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
               "Packed DG invariant-domain flux requires the operator, "
               "FluxWithIGR, and Euler base flux to use one gamma.");
 
-  if (record_flux_only && !fused_elem_incidence_ready_)
-  {
-    max_face_speed = 0.0;
-    return false;
-  }
-  if (!record_flux_only)
-  {
-    z_inout = 0.0;
-  }
+  z_inout = 0.0;
 
   const int dof = face_elem_dof_;
   const int neq = num_equations;
   const int ldof = dof * neq;
-  const bool use_q_parallel = record_flux_only ||
+  const bool use_q_parallel =
     ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DG_FACE_Q_PARALLEL", true);
 
   const int* sigma_map = nullptr;
@@ -1524,7 +1268,6 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       int_kernel.invariant_domain_flux = invariant_domain_flux;
       int_kernel.sigma_aware_cfl = sigma_aware_cfl;
       int_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
-      int_kernel.trace_centered = trace_centered;
       int_kernel.state_map = invmass_elem_vdof_map_.Read();
       int_kernel.face_e1 = face_int_e1_.Read();
       int_kernel.face_e2 = face_int_e2_.Read();
@@ -1533,9 +1276,7 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       int_kernel.normals = face_int_normals_.Read();
       int_kernel.weights = face_int_weights_.Read();
       int_kernel.x = x_in.Read();
-      int_kernel.z = record_flux_only ? nullptr : z_inout.ReadWrite();
-      int_kernel.flux_record =
-        record_flux_only ? face_int_flux_record_.Write() : nullptr;
+      int_kernel.z = z_inout.ReadWrite();
       int_kernel.face_speed_q = face_int_speed_q_.Write();
       int_kernel.q_sigma_telemetry = int_q_sigma_telemetry;
       int_kernel.sigma_map = sigma_map;
@@ -1567,7 +1308,6 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       int_kernel.invariant_domain_flux = invariant_domain_flux;
       int_kernel.sigma_aware_cfl = sigma_aware_cfl;
       int_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
-      int_kernel.trace_centered = trace_centered;
       int_kernel.state_map = invmass_elem_vdof_map_.Read();
       int_kernel.face_e1 = face_int_e1_.Read();
       int_kernel.face_e2 = face_int_e2_.Read();
@@ -1620,7 +1360,6 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       bdr_kernel.invariant_domain_flux = invariant_domain_flux;
       bdr_kernel.sigma_aware_cfl = sigma_aware_cfl;
       bdr_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
-      bdr_kernel.trace_centered = trace_centered;
       bdr_kernel.bdr_max_attr = face_bdr_max_attr_;
       bdr_kernel.state_map = invmass_elem_vdof_map_.Read();
       bdr_kernel.face_e1 = face_bdr_e1_.Read();
@@ -1629,9 +1368,7 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       bdr_kernel.normals = face_bdr_normals_.Read();
       bdr_kernel.weights = face_bdr_weights_.Read();
       bdr_kernel.x = x_in.Read();
-      bdr_kernel.z = record_flux_only ? nullptr : z_inout.ReadWrite();
-      bdr_kernel.flux_record =
-        record_flux_only ? face_bdr_flux_record_.Write() : nullptr;
+      bdr_kernel.z = z_inout.ReadWrite();
       bdr_kernel.face_speed_q = face_bdr_speed_q_.Write();
       bdr_kernel.q_sigma_telemetry = bdr_q_sigma_telemetry;
       bdr_kernel.boundary_flux_integral = boundary_flux_integral;
@@ -1667,7 +1404,6 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       bdr_kernel.invariant_domain_flux = invariant_domain_flux;
       bdr_kernel.sigma_aware_cfl = sigma_aware_cfl;
       bdr_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
-      bdr_kernel.trace_centered = trace_centered;
       bdr_kernel.bdr_max_attr = face_bdr_max_attr_;
       bdr_kernel.state_map = invmass_elem_vdof_map_.Read();
       bdr_kernel.face_e1 = face_bdr_e1_.Read();
@@ -1763,7 +1499,6 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       shared_kernel.invariant_domain_flux = invariant_domain_flux;
       shared_kernel.sigma_aware_cfl = sigma_aware_cfl;
       shared_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
-      shared_kernel.trace_centered = trace_centered;
       shared_kernel.state_map = invmass_elem_vdof_map_.Read();
       shared_kernel.face_e1 = face_shared_e1_.Read();
       shared_kernel.face_nbr_vdof_map = face_shared_nbr_vdof_map_.Read();
@@ -1773,9 +1508,7 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       shared_kernel.weights = face_shared_weights_.Read();
       shared_kernel.x = x_in.Read();
       shared_kernel.x_nbr = x_nbr_vals;
-      shared_kernel.z = record_flux_only ? nullptr : z_inout.ReadWrite();
-      shared_kernel.flux_record =
-        record_flux_only ? face_shared_flux_record_.Write() : nullptr;
+      shared_kernel.z = z_inout.ReadWrite();
       shared_kernel.face_speed_q = face_shared_speed_q_.Write();
       shared_kernel.q_sigma_telemetry = shared_q_sigma_telemetry;
       shared_kernel.sigma_map = sigma_map;
@@ -1809,7 +1542,6 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       shared_kernel.invariant_domain_flux = invariant_domain_flux;
       shared_kernel.sigma_aware_cfl = sigma_aware_cfl;
       shared_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
-      shared_kernel.trace_centered = trace_centered;
       shared_kernel.state_map = invmass_elem_vdof_map_.Read();
       shared_kernel.face_e1 = face_shared_e1_.Read();
       shared_kernel.face_nbr_vdof_map = face_shared_nbr_vdof_map_.Read();

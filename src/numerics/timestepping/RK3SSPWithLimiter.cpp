@@ -821,6 +821,28 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
     stage_aware->EndRKStep(x, t, state_generation_);
   }
 
+  // A stage-aware algebraic reconstruction may tighten the characteristic
+  // bound at the accepted endpoint (for example after replacing an
+  // extrapolated IGR sigma by its exact instantaneous closure). Merge that
+  // bound before publishing the transaction. If EndRKStep throws, this code
+  // is never reached and rejected work remains unable to alter the accepted
+  // CFL state.
+  if (characteristic_speed_reader_)
+  {
+    const real_t endpoint_characteristic_speed =
+      characteristic_speed_reader_();
+    MFEM_VERIFY(std::isfinite(endpoint_characteristic_speed) &&
+                  endpoint_characteristic_speed >= 0.0,
+                "The SSPRK endpoint reported an invalid characteristic "
+                "speed.");
+    attempted_characteristic_speed_ =
+      attempted_characteristic_speed_available_
+        ? std::max(attempted_characteristic_speed_,
+                   endpoint_characteristic_speed)
+        : endpoint_characteristic_speed;
+    attempted_characteristic_speed_available_ = true;
+  }
+
   if (zhang_shu_diagnostics_pending_)
   {
     WriteDG0ElementField(*zhang_shu_active_field_,

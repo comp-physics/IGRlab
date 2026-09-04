@@ -60,12 +60,14 @@ public:
   real_t GetSSPCoefficient() const { return SSPRKCoefficient(method_); }
   long long GetRHSEvaluationCount() const { return rhs_evaluation_count_; }
 
-  /** Bind the characteristic-speed value produced by each completed RHS.
+  /** Bind the characteristic-speed value produced by the active operator.
    *
-   * The accepted aggregate is the maximum over every RHS stage in the last
-   * successfully committed attempt.  A callback rejection never publishes
-   * the attempted aggregate, so an outer rollback cannot contaminate the next
-   * adaptive-CFL decision.
+   * The accepted aggregate is the maximum over every RHS stage and the
+   * post-EndRKStep operator state in the last successfully committed attempt.
+   * The endpoint read lets an algebraic reconstruction tighten the next CFL
+   * step without evaluating another Euler residual. A callback or endpoint
+   * rejection never publishes the attempted aggregate, so an outer rollback
+   * cannot contaminate the next adaptive-CFL decision.
    */
   void SetCharacteristicSpeedReader(std::function<real_t()> reader)
   {

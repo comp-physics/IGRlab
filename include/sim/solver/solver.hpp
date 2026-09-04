@@ -5,6 +5,7 @@
  * @brief Euler-specific solver orchestration for sim-layer cases.
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -58,7 +59,8 @@ struct EulerConservedIntegral
  * conservation qualification path; device states may synchronize here.
  */
 inline EulerConservedIntegral IntegrateEulerConservedState(
-  const mfem::ParGridFunction& state)
+  const mfem::ParGridFunction& state,
+  DGBackend backend = DGBackend::DG)
 {
   const mfem::ParFiniteElementSpace* fes = state.ParFESpace();
   MFEM_VERIFY(fes != nullptr,
@@ -78,15 +80,28 @@ inline EulerConservedIntegral IntegrateEulerConservedState(
       fes->GetElementTransformation(element);
     MFEM_VERIFY(fe != nullptr && transformation != nullptr,
                 "Euler conservation integration is missing element data.");
-    // Include the transformation-weight order so curved external meshes do
-    // not turn geometry under-integration into an apparent balance defect.
-    const int integration_order =
-      2 * fe->GetOrder() + transformation->OrderW() + 2;
-    const mfem::IntegrationRule& rule =
-      mfem::IntRules.Get(fe->GetGeomType(), integration_order);
-    for (int q = 0; q < rule.GetNPoints(); ++q)
+    const mfem::IntegrationRule* rule = nullptr;
+    if (backend == DGBackend::DGSEM)
     {
-      const mfem::IntegrationPoint& point = rule.IntPoint(q);
+      // Match the GLL quadrature used to assemble the DGSEM mass exactly.
+      // In particular, using a higher-order diagnostic rule on a curved mesh
+      // would measure a different discrete conserved quantity.
+      static mfem::IntegrationRules lgl_rules(
+        0, mfem::Quadrature1D::GaussLobatto);
+      const int integration_order = std::max(1, 2 * fe->GetOrder() - 1);
+      rule = &lgl_rules.Get(fe->GetGeomType(), integration_order);
+    }
+    else
+    {
+      // Include the transformation-weight order so curved external meshes do
+      // not turn geometry under-integration into an apparent balance defect.
+      const int integration_order =
+        2 * fe->GetOrder() + transformation->OrderW() + 2;
+      rule = &mfem::IntRules.Get(fe->GetGeomType(), integration_order);
+    }
+    for (int q = 0; q < rule->GetNPoints(); ++q)
+    {
+      const mfem::IntegrationPoint& point = rule->IntPoint(q);
       transformation->SetIntPoint(&point);
       state.GetVectorValue(*transformation, point, value);
       const double weight = point.weight * transformation->Weight();
@@ -413,21 +428,23 @@ RunEulerCase(ExampleContext& ctx,
   rk3.Init(op);
   MFEM_VERIFY(!run_cfg.opts.conservation_balance ||
                 rk3.SupportsPhysicalBoundaryFluxTracking(),
-              "Accepted-trajectory conservation balance requires an ordinary "
-              "DG operator with exact physical-boundary flux capture.");
+              "Accepted-trajectory conservation balance requires the selected "
+              "DG/DGSEM operator to provide exact physical-boundary flux "
+              "capture.");
   rk3.SetStepCount(initial_step);
   std::optional<detail::EulerConservedIntegral> initial_conservation;
   std::optional<detail::EulerConservedIntegral> static_source_conservation;
   if (run_cfg.opts.conservation_balance)
   {
     initial_conservation =
-      detail::IntegrateEulerConservedState(bundle.sol);
+      detail::IntegrateEulerConservedState(bundle.sol, run_cfg.dg_backend);
     if (static_source)
     {
       MFEM_VERIFY(static_source->ParFESpace() == bundle.sol.ParFESpace(),
                   "Conservation source must use the active Euler space.");
       static_source_conservation =
-        detail::IntegrateEulerConservedState(*static_source);
+        detail::IntegrateEulerConservedState(*static_source,
+                                             run_cfg.dg_backend);
       MFEM_VERIFY(static_source_conservation->components.Size() ==
                     initial_conservation->components.Size(),
                   "Static-source conservation component count mismatch.");
@@ -499,6 +516,89 @@ RunEulerCase(ExampleContext& ctx,
                                        communicator_size,
                                        bundle.field_list.igr);
       }
+    }
+    return false;
+  }
+
+  // Output is a consumer of the accepted DAE state, not a prerequisite for
+  // admitting it.  In particular, a restart certificate or an initial-output
+  // prefetch may reconstruct sigma before RunTimeLoop performs its usual
+  // initial q_sigma check.  Fail closed here so no VTK cycle or restart
+  // manifest can publish a non-hyperbolic algebraic/conservative pair.
+  std::uint64_t initial_q_sigma_nonpositive = 0;
+  std::uint64_t initial_q_sigma_nonfinite = 0;
+  const bool initial_q_sigma_rejected =
+    time_loop_detail::AcceptedStateQSigmaAdmission<OperatorType>::Inspect(
+      op,
+      bundle.sol,
+      initial_time,
+      initial_q_sigma_nonpositive,
+      initial_q_sigma_nonfinite);
+  if (initial_q_sigma_rejected)
+  {
+    TimeLoopResult failure;
+    failure.steps = initial_step;
+    failure.initial_time = initial_time;
+    failure.final_time = initial_time;
+    failure.rejected_attempts = 1;
+    failure.rejected_q_sigma_attempts = 1;
+    failure.rejected_q_sigma_nonpositive_samples =
+      initial_q_sigma_nonpositive;
+    failure.rejected_q_sigma_nonfinite_samples = initial_q_sigma_nonfinite;
+    const mfem::RKStageAdmissionFailureReason reason =
+      initial_q_sigma_nonpositive > 0 && initial_q_sigma_nonfinite > 0
+        ? mfem::RKStageAdmissionFailureReason::
+            QSigmaNonpositiveAndNonfinite
+        : (initial_q_sigma_nonfinite > 0
+             ? mfem::RKStageAdmissionFailureReason::QSigmaNonfinite
+             : mfem::RKStageAdmissionFailureReason::QSigmaNonpositive);
+    failure.last_q_sigma_rejection_reason =
+      mfem::RKStageAdmissionFailureReasonName(reason);
+    failure.last_q_sigma_rejection_stage = -1;
+    failure.success = false;
+    failure.termination_reason = "initial-q-sigma-admission-failed";
+    if (communicator_root)
+    {
+      std::cout << "[q-sigma-admission] event=initial-rejection"
+                << " time=" << initial_time
+                << " step=" << initial_step
+                << " reason=" << failure.last_q_sigma_rejection_reason
+                << " nonpositive_samples="
+                << initial_q_sigma_nonpositive
+                << " nonfinite_samples=" << initial_q_sigma_nonfinite
+                << " rhs_evaluations=0 output_published=0\n"
+                << "[explicit-time] event=run-summary"
+                << " steps=" << initial_step
+                << " final_time=" << initial_time
+                << " rhs_evaluations=0 accepted_attempts=0"
+                << " rejected_attempts=1 rejected_limiter_elements=0"
+                << " rejected_q_sigma_attempts=1"
+                << " rejected_q_sigma_nonpositive_samples="
+                << initial_q_sigma_nonpositive
+                << " rejected_q_sigma_nonfinite_samples="
+                << initial_q_sigma_nonfinite
+                << " last_q_sigma_rejection_reason="
+                << failure.last_q_sigma_rejection_reason
+                << " last_q_sigma_rejection_stage=-1"
+                << " minimum_attempted_dt=0 maximum_attempted_dt=0"
+                << " minimum_accepted_dt=0 maximum_accepted_dt=0"
+                << " characteristic_speed_probes=0"
+                << " minimum_characteristic_speed=0"
+                << " maximum_characteristic_speed=0 dt_min_reached=0"
+                << " success=0 termination_reason="
+                << failure.termination_reason << "\n"
+                << "[explicit-time] event=final-status"
+                << " final_time=" << initial_time
+                << " success=0 termination_reason="
+                << failure.termination_reason << "\n";
+    }
+    if (summary_out)
+    {
+      *summary_out = BuildRunSummary(ctx,
+                                     failure,
+                                     /*elapsed_seconds=*/0.0,
+                                     num_procs,
+                                     bundle.field_list.igr);
     }
     return false;
   }
@@ -628,6 +728,9 @@ RunEulerCase(ExampleContext& ctx,
   io.paraview = paraview_dc.get();
   bool final_sigma_prepared = false;
   bool final_sigma_certification_skipped_nonfinite = false;
+  bool final_sigma_transport_admission_failed = false;
+  std::uint64_t final_q_sigma_nonpositive = 0;
+  std::uint64_t final_q_sigma_nonfinite = 0;
   mfem::IGRSigmaPreparationResult final_sigma_preparation;
   if (run_cfg.opts.vtk_save)
   {
@@ -658,9 +761,13 @@ RunEulerCase(ExampleContext& ctx,
     io.prepare_sigma = [sigma_provider,
                         &bundle,
                         &rk3,
+                        &op,
                         sigma_certification_supported,
                         &final_sigma_prepared,
                         &final_sigma_certification_skipped_nonfinite,
+                        &final_sigma_transport_admission_failed,
+                        &final_q_sigma_nonpositive,
+                        &final_q_sigma_nonfinite,
                         &final_sigma_preparation](int,
                                                   mfem::real_t t,
                                                   bool is_final)
@@ -669,8 +776,9 @@ RunEulerCase(ExampleContext& ctx,
       {
         return SigmaOutputPreparation{
           0.0,
-          !sigma_certification_supported ||
-            final_sigma_preparation.independent_residual_certified};
+          !final_sigma_transport_admission_failed &&
+            (!sigma_certification_supported ||
+             final_sigma_preparation.independent_residual_certified)};
       }
       if (is_final && final_sigma_certification_skipped_nonfinite)
       {
@@ -700,11 +808,21 @@ RunEulerCase(ExampleContext& ctx,
       {
         final_sigma_preparation = preparation;
         final_sigma_prepared = true;
+        final_sigma_transport_admission_failed =
+          time_loop_detail::
+            AcceptedStateQSigmaAdmission<OperatorType>::Inspect(
+              op,
+              bundle.sol,
+              t,
+              final_q_sigma_nonpositive,
+              final_q_sigma_nonfinite);
       }
       return SigmaOutputPreparation{
         SecondsSince(prepare_start),
-        !is_final || !sigma_certification_supported ||
-          preparation.independent_residual_certified};
+        !is_final ||
+          (!final_sigma_transport_admission_failed &&
+           (!sigma_certification_supported ||
+            preparation.independent_residual_certified))};
     };
   }
 
@@ -716,6 +834,10 @@ RunEulerCase(ExampleContext& ctx,
   loop_cfg.initial_time = initial_time;
   loop_cfg.initial_step = initial_step;
   loop_cfg.initial_state_saved = run_cfg.opts.vtk_save && !restart_info;
+  loop_cfg.initial_q_sigma_admitted =
+    sigma_provider &&
+    ResolveEffectiveIGRSigmaUpdateCadence(run_cfg) ==
+      dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
   loop_cfg.next_save_time =
     (run_cfg.opts.vtk_save && run_cfg.opts.dt_save > 0.0)
       ? initial_time + run_cfg.opts.dt_save
@@ -743,7 +865,8 @@ RunEulerCase(ExampleContext& ctx,
   {
     MFEM_VERIFY(initial_conservation.has_value(),
                 "Conservation balance is missing its initial integral.");
-    final_conservation = detail::IntegrateEulerConservedState(bundle.sol);
+    final_conservation =
+      detail::IntegrateEulerConservedState(bundle.sol, run_cfg.dg_backend);
     const int components = initial_conservation->components.Size();
     MFEM_VERIFY(final_conservation->components.Size() == components,
                 "Euler conservation component count changed during the run.");
@@ -827,17 +950,30 @@ RunEulerCase(ExampleContext& ctx,
       /*cold_start=*/false,
       /*certify_residual=*/sigma_certification_supported);
     final_sigma_prepared = true;
+    final_sigma_transport_admission_failed =
+      time_loop_detail::AcceptedStateQSigmaAdmission<OperatorType>::Inspect(
+        op,
+        bundle.sol,
+        result.final_time,
+        final_q_sigma_nonpositive,
+        final_q_sigma_nonfinite);
   }
   if (final_sigma_certification_skipped_nonfinite && result.success)
   {
     result.success = false;
     result.termination_reason = "nonfinite-final-state";
   }
+  if (final_sigma_transport_admission_failed && result.success)
+  {
+    result.success = false;
+    result.termination_reason = "igr-final-q-sigma-admission-failed";
+  }
   if (sigma_provider &&
       (final_sigma_prepared || final_sigma_certification_skipped_nonfinite))
   {
     const bool certificate_passed =
       final_sigma_prepared &&
+      !final_sigma_transport_admission_failed &&
       (!sigma_certification_supported ||
        final_sigma_preparation.independent_residual_certified);
     if (result.success && !certificate_passed)
@@ -847,7 +983,8 @@ RunEulerCase(ExampleContext& ctx,
     }
     if (communicator_root)
     {
-      std::cout << "[igr-closure-certificate] event=accepted-state"
+      std::cout << std::setprecision(17)
+                << "[igr-closure-certificate] event=accepted-state"
                 << " scope=final-committed-accepted-state"
                 << " precision=fp64"
                 << " time=" << result.final_time
@@ -869,8 +1006,23 @@ RunEulerCase(ExampleContext& ctx,
                 << final_sigma_preparation.independent_residual_absolute_limit
                 << " skipped_nonfinite="
                 << (final_sigma_certification_skipped_nonfinite ? 1 : 0)
+                << " q_sigma_admitted="
+                << (final_sigma_transport_admission_failed ? 0 : 1)
+                << " q_sigma_nonpositive_samples="
+                << final_q_sigma_nonpositive
+                << " q_sigma_nonfinite_samples="
+                << final_q_sigma_nonfinite
                 << "\n";
     }
+  }
+  if (final_sigma_transport_admission_failed && communicator_root)
+  {
+    std::cout << "[q-sigma-admission] event=final-certificate-rejection"
+              << " time=" << result.final_time
+              << " step=" << result.steps
+              << " nonpositive_samples=" << final_q_sigma_nonpositive
+              << " nonfinite_samples=" << final_q_sigma_nonfinite
+              << " output_published=0\n";
   }
   if (run_cfg.opts.conservation_balance && communicator_root)
   {
@@ -915,9 +1067,97 @@ RunEulerCase(ExampleContext& ctx,
               << " success=" << (result.success ? 1 : 0)
               << " termination_reason=" << result.termination_reason << "\n";
   }
+  double maximum_sigma_endpoint_prediction_defect = 0.0;
+  double maximum_relative_sigma_endpoint_prediction_defect = 0.0;
+  double maximum_sigma_exact_certificate_residual_rel_rhs = 0.0;
+  double maximum_sigma_exact_certificate_relative_limit = 0.0;
+  double maximum_sigma_exact_certificate_residual_abs = 0.0;
+  double maximum_sigma_exact_certificate_absolute_limit = 0.0;
+  double maximum_sigma_exact_certificate_acceptance_ratio = 0.0;
+  double maximum_sigma_exact_certificate_relative_pass_residual_rel_rhs = 0.0;
+  double maximum_sigma_exact_certificate_absolute_only_residual_abs = 0.0;
+  if (sigma_provider)
+  {
+    maximum_sigma_endpoint_prediction_defect =
+      sigma_provider->GetMaximumLocalSigmaEndpointPredictionDefect();
+    maximum_relative_sigma_endpoint_prediction_defect =
+      sigma_provider->GetMaximumLocalRelativeSigmaEndpointPredictionDefect();
+    maximum_sigma_exact_certificate_residual_rel_rhs =
+      sigma_provider->GetMaximumLocalSigmaExactCertificateResidualRelRHS();
+    maximum_sigma_exact_certificate_relative_limit =
+      sigma_provider->GetMaximumLocalSigmaExactCertificateRelativeLimit();
+    maximum_sigma_exact_certificate_residual_abs =
+      sigma_provider->GetMaximumLocalSigmaExactCertificateResidualAbs();
+    maximum_sigma_exact_certificate_absolute_limit =
+      sigma_provider->GetMaximumLocalSigmaExactCertificateAbsoluteLimit();
+    maximum_sigma_exact_certificate_acceptance_ratio =
+      sigma_provider->GetMaximumLocalSigmaExactCertificateAcceptanceRatio();
+    maximum_sigma_exact_certificate_relative_pass_residual_rel_rhs =
+      sigma_provider
+        ->GetMaximumLocalSigmaExactCertificateRelativePassResidualRelRHS();
+    maximum_sigma_exact_certificate_absolute_only_residual_abs =
+      sigma_provider
+        ->GetMaximumLocalSigmaExactCertificateAbsoluteOnlyResidualAbs();
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &maximum_sigma_endpoint_prediction_defect,
+                  1,
+                  MPI_DOUBLE,
+                  MPI_MAX,
+                  ctx.Mesh().GetComm());
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &maximum_relative_sigma_endpoint_prediction_defect,
+                  1,
+                  MPI_DOUBLE,
+                  MPI_MAX,
+                  ctx.Mesh().GetComm());
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &maximum_sigma_exact_certificate_residual_rel_rhs,
+                  1,
+                  MPI_DOUBLE,
+                  MPI_MAX,
+                  ctx.Mesh().GetComm());
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &maximum_sigma_exact_certificate_relative_limit,
+                  1,
+                  MPI_DOUBLE,
+                  MPI_MAX,
+                  ctx.Mesh().GetComm());
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &maximum_sigma_exact_certificate_residual_abs,
+                  1,
+                  MPI_DOUBLE,
+                  MPI_MAX,
+                  ctx.Mesh().GetComm());
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &maximum_sigma_exact_certificate_absolute_limit,
+                  1,
+                  MPI_DOUBLE,
+                  MPI_MAX,
+                  ctx.Mesh().GetComm());
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &maximum_sigma_exact_certificate_acceptance_ratio,
+                  1,
+                  MPI_DOUBLE,
+                  MPI_MAX,
+                  ctx.Mesh().GetComm());
+    MPI_Allreduce(
+      MPI_IN_PLACE,
+      &maximum_sigma_exact_certificate_relative_pass_residual_rel_rhs,
+      1,
+      MPI_DOUBLE,
+      MPI_MAX,
+      ctx.Mesh().GetComm());
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &maximum_sigma_exact_certificate_absolute_only_residual_abs,
+                  1,
+                  MPI_DOUBLE,
+                  MPI_MAX,
+                  ctx.Mesh().GetComm());
+  }
   if (sigma_provider && communicator_root)
   {
-    std::cout << "[igr-sigma-lifecycle] event=run-summary"
+    std::cout << std::setprecision(17)
+              << "[igr-sigma-lifecycle] event=run-summary"
               << " prefetch_solves="
               << sigma_provider->GetSigmaPrefetchSolveCount()
               << " stage0_reuses="
@@ -930,29 +1170,56 @@ RunEulerCase(ExampleContext& ctx,
               << sigma_provider->GetSigmaEndpointSolveCount()
               << " extrapolated_stages="
               << sigma_provider->GetSigmaExtrapolatedStageCount()
+              << " exact_anchor_certificates="
+              << sigma_provider->GetSigmaExactCertificateCount()
+              << " exact_anchor_absolute_only_passes="
+              << sigma_provider->GetSigmaExactCertificateAbsoluteOnlyPassCount()
+              << " max_exact_anchor_certificate_residual_rel_rhs="
+              << maximum_sigma_exact_certificate_residual_rel_rhs
+              << " max_exact_anchor_certificate_relative_limit="
+              << maximum_sigma_exact_certificate_relative_limit
+              << " max_exact_anchor_certificate_residual_abs="
+              << maximum_sigma_exact_certificate_residual_abs
+              << " max_exact_anchor_certificate_absolute_limit="
+              << maximum_sigma_exact_certificate_absolute_limit
+              << " max_exact_anchor_certificate_acceptance_ratio="
+              << maximum_sigma_exact_certificate_acceptance_ratio
+              << " max_exact_anchor_relative_pass_residual_rel_rhs="
+              << maximum_sigma_exact_certificate_relative_pass_residual_rel_rhs
+              << " max_exact_anchor_absolute_only_residual_abs="
+              << maximum_sigma_exact_certificate_absolute_only_residual_abs
               << " max_endpoint_prediction_defect="
-              << sigma_provider->GetMaximumLocalSigmaEndpointPredictionDefect()
+              << maximum_sigma_endpoint_prediction_defect
               << " max_relative_endpoint_prediction_defect="
-              << sigma_provider
-                   ->GetMaximumLocalRelativeSigmaEndpointPredictionDefect()
+              << maximum_relative_sigma_endpoint_prediction_defect
               << "\n";
   }
-  if (run_cfg.igr_opts.igr_invariant_domain_flux)
+  const bool report_extrapolated_q_sigma =
+    sigma_provider &&
+    ResolveEffectiveIGRSigmaUpdateCadence(run_cfg) ==
+      dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+  const bool report_q_sigma =
+    run_cfg.igr_opts.igr_invariant_domain_flux ||
+    report_extrapolated_q_sigma;
+  if (report_q_sigma)
   {
     const auto* q_sigma_provider =
       dynamic_cast<const mfem::IGRFrozenSigmaTelemetryProvider*>(&op);
     MFEM_VERIFY(q_sigma_provider,
-                "Invariant-domain IGR transport is missing q_sigma "
+                "Selected IGR transport is missing q_sigma "
                 "telemetry.");
     const mfem::IGRFrozenSigmaTelemetry q_sigma =
       q_sigma_provider->GetGlobalFrozenSigmaTelemetry();
     MFEM_VERIFY(q_sigma.enabled,
-                "Invariant-domain IGR q_sigma telemetry was not enabled.");
+                "Selected IGR q_sigma telemetry was not enabled.");
     if (communicator_root)
     {
       std::cout << std::setprecision(17)
                 << "[igr-q-sigma] event=run-summary"
-                << " scope=application-total-attempted-speed-work"
+                << " scope="
+                << (report_extrapolated_q_sigma
+                      ? "application-total-attempted-frozen-sigma-work"
+                      : "application-total-attempted-speed-work")
                 << " rejected_attempts_included=1"
                 << " precision=fp64"
                 << " sample_count=" << q_sigma.sample_count
@@ -1120,19 +1387,6 @@ struct Solver
       RegularizationToString(request_resolution.regularization);
     cli_opts.time_integrator =
       TimeIntegratorToString(request_resolution.time_integrator);
-    const DGSurfaceFlux requested_dg_surface_flux =
-      ParseDGSurfaceFlux(cli_opts.dg_surface_flux);
-    if (requested_dg_surface_flux == DGSurfaceFlux::HdgTraceCentered &&
-        request_resolution.discretization != Discretization::DG)
-    {
-      if (mfem::Mpi::Root())
-      {
-        std::cerr << "--dg-surface-flux hdg-trace-centered requires "
-                     "--discretization dg. It is a face-local flux in the "
-                     "primal-DG path, not a second HDG or DGSEM backend.\n";
-      }
-      return 1;
-    }
     MFEM_VERIFY(!cli_opts.restart_vtk.empty() ||
                   (cli_opts.restart_cycle < 0 && cli_opts.restart_step < 0),
                 "--restart-cycle/--restart-step require --restart-vtk.");
@@ -1147,6 +1401,12 @@ struct Solver
       {
         rejection = "--igr-invariant-domain-flux currently requires the "
                     "ordinary DG backend.";
+      }
+      else if (ParseDGSEMSurfaceFlux(cli_opts.dgsem_surface_flux) !=
+               DGSEMSurfaceFlux::Rusanov)
+      {
+        rejection = "--igr-invariant-domain-flux requires the standard "
+                    "Rusanov surface flux.";
       }
       else if (!ResolveZhangShuPositivityLimiter(
                  cli_opts.positivity_limiter,
@@ -1173,6 +1433,19 @@ struct Solver
     }
     if (request_resolution.discretization == Discretization::HDG)
     {
+      const std::string hdg_cadence_rejection =
+        ValidateHdgIGRSigmaCadence(request_resolution.discretization,
+                                   request_resolution.regularization,
+                                   case_cfg,
+                                   cli_igr_opts);
+      if (!hdg_cadence_rejection.empty())
+      {
+        if (mfem::Mpi::Root())
+        {
+          std::cerr << hdg_cadence_rejection << '\n';
+        }
+        return 1;
+      }
 #if defined(DG_IGR_HAS_HDG_MAIN_BACKEND) && DG_IGR_HAS_HDG_MAIN_BACKEND
       const bool c_alpha_overridden = HasCAlphaOptionOverride(argc, argv);
       const bool hdg_igr_alpha_overridden =
@@ -1261,6 +1534,16 @@ struct Solver
       request_resolution.discretization_provenance,
       request_resolution.regularization,
       request_resolution.time_integrator);
+    const std::string extrapolated_selection_rejection =
+      ValidateExtrapolatedEveryStepIGRSelection(run_cfg);
+    if (!extrapolated_selection_rejection.empty())
+    {
+      if (mfem::Mpi::Root())
+      {
+        std::cerr << extrapolated_selection_rejection << '\n';
+      }
+      return 1;
+    }
     const bool use_igr = run_cfg.regularization == Regularization::IGR;
     if (use_igr && mfem::Mpi::Root())
     {
@@ -1275,6 +1558,8 @@ struct Solver
                 << (run_cfg.igr_opts.sigma_aware_cfl ? "on" : "off")
                 << " sigma_rusanov="
                 << (run_cfg.igr_opts.sigma_aware_rusanov ? "on" : "off")
+                << " frozen_sigma_spectral_speed="
+                << (UsesFrozenSigmaSpectralSpeed(run_cfg) ? "on" : "off")
                 << " invariant_domain_flux="
                 << (run_cfg.igr_opts.igr_invariant_domain_flux ? "on" : "off")
                 << " stage_rtol_scale="
@@ -1293,17 +1578,6 @@ struct Solver
                 << (run_cfg.igr_opts.lin_maxit >= 0
                       ? run_cfg.igr_opts.lin_maxit
                       : run_cfg.case_config.igr_config.lin_maxit)
-                << "\n";
-    }
-    if (run_cfg.dg_backend == DGBackend::DG && mfem::Mpi::Root())
-    {
-      std::cout << "[dg-options] event=effective surface_flux="
-                << DGSurfaceFluxToString(run_cfg.dg_surface_flux)
-                << " boundary_trace_policy="
-                << (run_cfg.dg_surface_flux ==
-                          DGSurfaceFlux::HdgTraceCentered
-                      ? "ghost-state-trace-centered"
-                      : "not-applicable")
                 << "\n";
     }
     if (run_cfg.device_backend == DeviceBackend::CUDA)
@@ -1366,9 +1640,11 @@ struct Solver
                   "H1 velocity space was not created.");
     }
 
+    const mfem::RK3Config rk3_config = ResolveRK3StepperConfig(run_cfg);
     mfem::RK3SSPWithLimiter rk3 =
-      MakeRK3Stepper(ctx.spaces.vfes, ctx.dim,
-                     run_cfg.case_config.rk3_config,
+      MakeRK3Stepper(ctx.spaces.vfes,
+                     ctx.dim,
+                     rk3_config,
                      run_cfg.time_integrator);
     if (run_cfg.dg_backend == DGBackend::DG)
     {
@@ -1475,9 +1751,10 @@ struct Solver
         }
         else
         {
-          MFEM_VERIFY(run_cfg.dg_backend == DGBackend::DG,
+          MFEM_VERIFY(run_cfg.dg_backend == DGBackend::DG ||
+                        run_cfg.dg_backend == DGBackend::DGSEM,
                       "A nonzero CaseSpec static source currently requires the "
-                      "ordinary DG backend (or the existing HDG adapter).");
+                      "DG or DGSEM backend (or the existing HDG adapter).");
         }
       }
     }

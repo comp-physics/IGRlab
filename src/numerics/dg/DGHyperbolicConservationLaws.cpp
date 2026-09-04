@@ -10,6 +10,19 @@
 namespace mfem
 {
 
+namespace
+{
+
+bool RequiresStrictDGSEMProduction(
+  HyperbolicFormIntegrator& form_integrator)
+{
+  const auto* igr_flux = dynamic_cast<const FluxWithIGR*>(
+    &form_integrator.GetFluxFunction());
+  return igr_flux && igr_flux->GetFrozenSigmaSpectralSpeed();
+}
+
+} // namespace
+
 DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
   FiniteElementSpace& vfes_,
   std::unique_ptr<HyperbolicFormIntegrator> formIntegrator_,
@@ -99,6 +112,7 @@ DGHyperbolicConservationLaws::GetGlobalFrozenSigmaTelemetry() const
   merge_device_slots(face_int_q_sigma_telemetry_);
   merge_device_slots(face_bdr_q_sigma_telemetry_);
   merge_device_slots(face_shared_q_sigma_telemetry_);
+  local.Merge(dgsem_q_sigma_telemetry_);
 
 #ifdef MFEM_USE_MPI
   if (Mpi::IsInitialized() && !Mpi::IsFinalized())
@@ -153,6 +167,67 @@ DGHyperbolicConservationLaws::GetGlobalFrozenSigmaTelemetry() const
   return local;
 }
 
+IGRFrozenSigmaTelemetry
+DGHyperbolicConservationLaws::InspectFrozenSigmaStateForAdmission(
+  const Vector& state) const
+{
+  IGRFrozenSigmaTelemetry unsupported;
+  if (vol_mode_ != VolumeMode::DGSEMFluxDiff)
+  {
+    return unsupported;
+  }
+
+  MFEM_VERIFY(state.Size() == Width(),
+              "DGSEM frozen-sigma admission received an unexpected true "
+              "state size.");
+  const Vector* state_local = &state;
+#ifdef MFEM_USE_MPI
+  if (const auto* par_fes = dynamic_cast<const ParFiniteElementSpace*>(&vfes))
+  {
+    if (const Operator* prolongation = par_fes->GetProlongationMatrix())
+    {
+      ::dg_igr::NVTXRange range("DG/admission-prolong-true-to-local");
+      dgsem_x_local_workspace_.SetSize(par_fes->GetVSize());
+      prolongation->Mult(state, dgsem_x_local_workspace_);
+      state_local = &dgsem_x_local_workspace_;
+    }
+  }
+#endif
+
+  dgsem::DGSEMOperator& dgsem_op = GetDGSEMProductionOperator_();
+  const bool requested_strict =
+    ::dg_igr::EnvFlagEnabled("DG_IGR_DGSEM_PRODUCTION_STRICT") ||
+    RequiresStrictDGSEMProduction(*formIntegrator);
+  const dgsem::DGSEMProductionSelection selection =
+    dgsem_op.BindProductionPolicy(requested_strict);
+  if (!selection.supported)
+  {
+    return unsupported;
+  }
+
+  const dgsem::DGSEMProductionResult result =
+    dgsem_op.AssembleProductionResidual(*state_local,
+                                        dgsem_y_local_workspace_,
+                                        selection.strict,
+                                        nullptr,
+                                        /*admission_only=*/true);
+  MFEM_VERIFY(result.executed,
+              "DGSEM endpoint admission rejected before completing its "
+              "state scan: "
+                << dgsem::DGSEMProductionReasonName(result.reason));
+  const IGRFrozenSigmaTelemetry& admission = result.admission_q_sigma;
+  if (admission.enabled && admission.sample_count > 0 &&
+      admission.nonpositive_count == 0 && admission.nonfinite_count == 0)
+  {
+    MFEM_VERIFY(std::isfinite(result.max_characteristic_speed) &&
+                  result.max_characteristic_speed > 0.0,
+                "DGSEM endpoint admission produced an invalid global "
+                "characteristic-speed maximum.");
+    max_char_speed = result.max_characteristic_speed;
+  }
+  return result.admission_q_sigma;
+}
+
 void DGHyperbolicConservationLaws::SetNumericalFlux(const NumericalFlux* flux)
 {
   num_flux_ = flux;
@@ -161,9 +236,6 @@ void DGHyperbolicConservationLaws::SetNumericalFlux(const NumericalFlux* flux)
 
 void DGHyperbolicConservationLaws::SetStaticSource(const Vector& source)
 {
-  MFEM_VERIFY(vol_mode_ == VolumeMode::WeakDivergence,
-              "Static Euler sources are currently supported by ordinary DG "
-              "only.");
   MFEM_VERIFY(source.Size() == Width(),
               "Projected static source does not match the DG state size.");
 
@@ -322,7 +394,12 @@ DGHyperbolicConservationLaws::GetDGSEMProductionBridgeEvidence() const
 //
 bool DGHyperbolicConservationLaws::SupportsPhysicalBoundaryFluxIntegral() const
 {
-  if (vol_mode_ != VolumeMode::WeakDivergence)
+  if (vol_mode_ != VolumeMode::WeakDivergence &&
+      vol_mode_ != VolumeMode::DGSEMFluxDiff)
+  {
+    return false;
+  }
+  if (vol_mode_ == VolumeMode::DGSEMFluxDiff && !num_flux_)
   {
     return false;
   }
@@ -395,351 +472,13 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     }
   }
 
-  // ParNonlinearForm evaluates in local (L-vector) space as:
-  // y_true = P^T A_local (P x_true). The packed DG device path follows the
-  // same mapping when a non-trivial prolongation exists.
-  const Vector* x_eval = &x;
-  Vector& x_local = dgsem_x_local_workspace_;
-  Vector& z_local = dgsem_z_local_workspace_;
-  Vector& y_local = dgsem_y_local_workspace_;
-  const Operator* prolongation = nullptr;
-#ifdef MFEM_USE_MPI
-  if (Device::Allows(Backend::DEVICE_MASK) ||
-      vol_mode_ == VolumeMode::DGSEMFluxDiff)
+  const auto finalize_boundary_flux = [&](bool already_accumulated)
   {
-    if (const auto* pvfes = dynamic_cast<const ParFiniteElementSpace*>(&vfes))
+    if (!capture_boundary_flux)
     {
-      prolongation = pvfes->GetProlongationMatrix();
-      if (prolongation)
-      {
-        ::dg_igr::NVTXRange range("DG/prolong-true-to-local");
-        x_local.SetSize(pvfes->GetVSize());
-        prolongation->Mult(x, x_local);
-        x_eval = &x_local;
-        z_local.SetSize(pvfes->GetVSize());
-      }
-    }
-  }
-#endif
-  Vector& z_eval = prolongation ? z_local : z;
-
-  if (vol_mode_ == VolumeMode::DGSEMFluxDiff)
-  {
-    MFEM_VERIFY(dgsem_stab_ == DGSEMStabilization::None,
-                "DGSEM stabilization hooks are not implemented. "
-                "Use --dgsem-stab none.");
-    dgsem::DGSEMOperator& dgsem_op = GetDGSEMProductionOperator_();
-    const bool requested_strict =
-      ::dg_igr::EnvFlagEnabled("DG_IGR_DGSEM_PRODUCTION_STRICT");
-    const dgsem::DGSEMProductionSelection selection =
-      dgsem_op.BindProductionPolicy(requested_strict);
-    const bool strict = selection.strict;
-    const dgsem::DGSEMProductionReason reason_code = selection.reason;
-    const bool dispatch_transition =
-      !dgsem_production_dispatch_observed_ ||
-      dgsem_production_dispatch_supported_ != selection.supported ||
-      dgsem_production_dispatch_strict_ != strict ||
-      dgsem_production_dispatch_cuda_ != selection.cuda ||
-      dgsem_production_dispatch_reason_ != reason_code;
-    const auto record_dispatch = [&]()
-    {
-      dgsem_production_dispatch_observed_ = true;
-      dgsem_production_dispatch_supported_ = selection.supported;
-      dgsem_production_dispatch_strict_ = strict;
-      dgsem_production_dispatch_cuda_ = selection.cuda;
-      dgsem_production_dispatch_reason_ = reason_code;
-    };
-
-    const bool timing_enabled = IsDGSEMTimingEnabled_();
-    const auto t_mult_start = std::chrono::steady_clock::now();
-
-    if (selection.supported)
-    {
-      if (y_local.Size() != vfes.GetVSize())
-      {
-        y_local.SetSize(vfes.GetVSize());
-      }
-      const dgsem::DGSEMProductionResult result =
-        dgsem_op.AssembleProductionResidual(*x_eval, y_local, strict);
-      MFEM_VERIFY(result.executed,
-                  "DGSEM production execution rejected before output: "
-                    << dgsem::DGSEMProductionReasonName(result.reason));
-
-      if (prolongation)
-      {
-        y = 0.0;
-        prolongation->MultTranspose(y_local, y);
-      }
-      else
-      {
-        y = y_local;
-      }
-      max_char_speed = result.max_characteristic_speed;
-      ++dgsem_production_mult_calls_;
-
-      if (timing_enabled)
-      {
-        const double total_seconds = std::chrono::duration<double>(
-          std::chrono::steady_clock::now() - t_mult_start).count();
-        RecordDGSEMTiming_(0.0, 0.0, 0.0, total_seconds);
-      }
-      if (dispatch_transition && IsDGSEMProductionLogRoot_())
-      {
-        std::cout << "[dgsem-production] selected=mfem-native-packed"
-                  << " strict=" << strict
-                  << " backend=" << (selection.cuda ? "cuda" : "cpu")
-                  << " lvec_mode=" << (prolongation ? "P-x-PT" : "identity")
-                  << " order=" << selection.order
-                  << " dim=" << selection.dimension << '\n';
-      }
-      record_dispatch();
       return;
     }
-
-    if (dispatch_transition && IsDGSEMProductionLogRoot_())
-    {
-      std::cout << "[dgsem-production] selected="
-                << (strict ? "strict-rejection" : "host-oracle-fallback")
-                << " strict=" << strict
-                << " reason="
-                << dgsem::DGSEMProductionReasonName(selection.reason)
-                << " lvec_mode=" << (prolongation ? "P-x-PT" : "identity")
-                << '\n';
-    }
-    record_dispatch();
-    MFEM_VERIFY(!strict,
-                "DGSEM production strict policy rejected tuple before output: "
-                  << dgsem::DGSEMProductionReasonName(selection.reason));
-    MFEM_VERIFY(dgsem::DGSEMOperatorSupportsDimension(dim),
-                "DGSEM host oracle cannot execute rejected dimension: "
-                  << dgsem::DGSEMProductionReasonName(selection.reason));
-    ++dgsem_production_fallback_calls_;
-
-    const bool has_local_elements = vfes.GetNE() > 0;
-    const auto t_surface_start = std::chrono::steady_clock::now();
-    real_t max_face_speed = 0.0;
-    if (has_local_elements)
-    {
-      max_face_speed = dgsem_op.AssembleSurface(*x_eval, z_eval);
-    }
-    const auto t_surface_stop = std::chrono::steady_clock::now();
-
-    const auto t_volume_start = std::chrono::steady_clock::now();
-    real_t max_vol_speed = 0.0;
-    if (has_local_elements)
-    {
-      max_vol_speed = dgsem_op.AssembleVolume(*x_eval, z_eval);
-    }
-    const auto t_volume_stop = std::chrono::steady_clock::now();
-
-    const auto t_invmass_start = std::chrono::steady_clock::now();
-    if (prolongation)
-    {
-      y_local.SetSize(z_eval.Size());
-      if (has_local_elements)
-      {
-        dgsem_op.ApplyInverseMass(z_eval, y_local);
-      }
-      else
-      {
-        y_local = 0.0;
-      }
-      y = 0.0;
-      prolongation->MultTranspose(y_local, y);
-    }
-    else if (has_local_elements)
-    {
-      dgsem_op.ApplyInverseMass(z_eval, y);
-    }
-    else
-    {
-      y = 0.0;
-    }
-    const auto t_invmass_stop = std::chrono::steady_clock::now();
-
-    real_t fallback_max_speed = std::max(max_face_speed, max_vol_speed);
-#ifdef MFEM_USE_MPI
-    if (Mpi::IsInitialized() && !Mpi::IsFinalized())
-    {
-      if (const auto* par_fes =
-            dynamic_cast<const ParFiniteElementSpace*>(&vfes))
-      {
-        real_t owning_comm_max = fallback_max_speed;
-        MPI_Allreduce(&fallback_max_speed,
-                      &owning_comm_max,
-                      1,
-                      MPITypeMap<real_t>::mpi_type,
-                      MPI_MAX,
-                      par_fes->GetComm());
-        fallback_max_speed = owning_comm_max;
-      }
-    }
-#endif
-    max_char_speed = fallback_max_speed;
-
-    if (timing_enabled)
-    {
-      const auto t_mult_stop = std::chrono::steady_clock::now();
-      const double surface_seconds =
-        std::chrono::duration<double>(t_surface_stop - t_surface_start).count();
-      const double volume_seconds =
-        std::chrono::duration<double>(t_volume_stop - t_volume_start).count();
-      const double invmass_seconds =
-        std::chrono::duration<double>(t_invmass_stop - t_invmass_start).count();
-      const double total_seconds =
-        std::chrono::duration<double>(t_mult_stop - t_mult_start).count();
-      RecordDGSEMTiming_(surface_seconds,
-                         volume_seconds,
-                         invmass_seconds,
-                         total_seconds);
-    }
-    return;
-  }
-
-  // (1) Build the face contribution (and possibly the volume term) into z:
-  //     z = - < F̂(u_h, n), [[v]] >_faces
-  //     If weak-divergence is NOT preassembled, HyperbolicFormIntegrator also adds
-  //     the volume term (F(u_h), ∇v):
-  //     z += (F(u_h), ∇v)
-  bool used_device_face = false;
-  bool used_fused_element_residual = false;
-  real_t device_face_speed = 0.0;
-  if (Device::Allows(Backend::DEVICE_MASK))
-  {
-    const bool default_force_nonlinearform_face = !UseDeviceFaceResidual_();
-    const bool force_nonlinearform_face =
-      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DG_FORCE_NLFORM_FACE",
-                                      default_force_nonlinearform_face);
-    const bool fused_screen_requested = ::dg_igr::EnvFlagEnabledDefault(
-      "DG_IGR_DG_FUSED_ELEMENT_RESIDUAL", false);
-    if (force_nonlinearform_face)
-    {
-      if (fused_screen_requested)
-      {
-        LogFusedElementResidualSelection_(false,
-                                          "nonlinearform-face-forced");
-      }
-      ::dg_igr::NVTXRange range("DG/face-domain-mfem-nonlinearform");
-      nonlinearForm->Mult(*x_eval, z_eval);
-      used_device_face = false;
-      device_face_speed = formIntegrator->GetMaxCharSpeed();
-      if (!dg_face_path_logged_ && mfem::Mpi::Root())
-      {
-        std::cout << "[dg-device] event=face-domain-path"
-                  << " selected=nonlinearForm->Mult"
-                  << " backend=device-mfem-face"
-                  << " lvec_mode=" << (prolongation ? "P-x-PT" : "identity")
-                  << " x_size=" << x.Size()
-                  << " local_vsize=" << vfes.GetVSize()
-                  << " true_vsize=" << vfes.GetTrueVSize() << "\n";
-        dg_face_path_logged_ = true;
-      }
-    }
-    else
-    {
-      used_fused_element_residual =
-        fused_screen_requested && UseFusedElementResidualScreen_();
-      ::dg_igr::NVTXRange range(
-        used_fused_element_residual
-          ? "DG/face-flux-records-euler-rusanov"
-          : "DG/face-packed-euler-rusanov");
-      MFEM_VERIFY(UseDeviceFaceResidual_(),
-                  "DG device-closure requires packed device face residual path "
-                  "(no host fallback).");
-      used_device_face =
-        AddDeviceFaceContributionsEulerRusanov_(*x_eval,
-                                                z_eval,
-                                                device_face_speed,
-                                                capture_boundary_flux,
-                                                used_fused_element_residual);
-      MFEM_VERIFY(used_device_face,
-                  "DG device-closure requires packed Euler/Rusanov face kernels "
-                  "and supported boundary/sigma metadata (no fallback).");
-      if (!dg_face_path_logged_ && mfem::Mpi::Root())
-      {
-        std::cout << "[dg-device] event=face-domain-path"
-                  << " selected="
-                  << (used_fused_element_residual
-                        ? "face-records-element-owned-euler-rusanov"
-                        : "packed-mfem-forall-euler-rusanov")
-                  << " backend=device"
-                  << " lvec_mode=" << (prolongation ? "P-x-PT" : "identity")
-                  << " x_size=" << x.Size()
-                  << " local_vsize=" << vfes.GetVSize()
-                  << " true_vsize=" << vfes.GetTrueVSize() << "\n";
-        dg_face_path_logged_ = true;
-      }
-    }
-  }
-  else
-  {
-    ::dg_igr::NVTXRange range("DG/face-domain-cpu-nonlinearform");
-    nonlinearForm->Mult(x, z);
-  }
-
-  real_t volume_speed = 0.0;
-  if (used_fused_element_residual)
-  {
-    ::dg_igr::NVTXRange range("DG/fused-volume-face-invmass");
-    Vector& fused_output = prolongation ? y_local : y;
-    volume_speed = ApplyFusedElementResidualEuler_(*x_eval, fused_output);
-    if (prolongation)
-    {
-      y = 0.0;
-      prolongation->MultTranspose(y_local, y);
-    }
-  }
-  else if (!weakdiv.empty()) // weak divergence WAS preassembled element-wise
-  {
-    ::dg_igr::NVTXRange range("DG/weak-divergence");
-    // Compute (I_h F(u_h), ∇v) and accumulate directly into z.
-    volume_speed = AddPreassembledWeakDivergence_(*x_eval, z_eval);
-  }
-
-  // Apply inverse mass after all contributions have been assembled in z. The
-  // fused screen has already completed this work in its element-owned kernel.
-  if (!used_fused_element_residual && prolongation)
-  {
-    ::dg_igr::NVTXRange range("DG/inverse-mass-local-and-restrict");
-    y_local.SetSize(z_eval.Size());
-    ApplyInverseMass_(z_eval, y_local);
-    y = 0.0;
-    prolongation->MultTranspose(y_local, y);
-  }
-  else if (!used_fused_element_residual)
-  {
-    ::dg_igr::NVTXRange range("DG/inverse-mass");
-    ApplyInverseMass_(z_eval, y);
-  }
-
-  if (static_source_.Size() != 0)
-  {
-    // The supplied field is the strong-form source itself, so it is added
-    // after inverse mass on both host and device paths.
-    y.Add(1.0, static_source_);
-  }
-
-  // (4) Expose a domain-wide maximum over volume, interior/shared faces, and
-  // physical boundaries. Packed device faces already include their boundary
-  // contribution; the separate maximum is then zero and harmless.
-  real_t boundary_speed = 0.0;
-  for (const auto& integrator : ext_bdr_int_)
-  {
-    if (auto* boundary =
-          dynamic_cast<BdrHyperbolicFluxIntegrator*>(integrator.get()))
-    {
-      boundary_speed =
-        std::max(boundary_speed, boundary->GetMaxCharSpeed());
-    }
-  }
-  const real_t face_speed =
-    used_device_face ? device_face_speed : formIntegrator->GetMaxCharSpeed();
-  max_char_speed =
-    std::max(volume_speed, std::max(face_speed, boundary_speed));
-
-  if (capture_boundary_flux)
-  {
-    if (!used_device_face)
+    if (!already_accumulated)
     {
       real_t* integral = physical_boundary_flux_integral_.HostReadWrite();
       for (const auto& integrator : ext_bdr_int_)
@@ -786,7 +525,346 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     }
 #endif
     physical_boundary_flux_integral_available_ = true;
+  };
+
+  // ParNonlinearForm evaluates in local (L-vector) space as:
+  // y_true = P^T A_local (P x_true). The packed DG device path follows the
+  // same mapping when a non-trivial prolongation exists.
+  const Vector* x_eval = &x;
+  Vector& x_local = dgsem_x_local_workspace_;
+  Vector& z_local = dgsem_z_local_workspace_;
+  Vector& y_local = dgsem_y_local_workspace_;
+  const Operator* prolongation = nullptr;
+#ifdef MFEM_USE_MPI
+  if (Device::Allows(Backend::DEVICE_MASK) ||
+      vol_mode_ == VolumeMode::DGSEMFluxDiff)
+  {
+    if (const auto* pvfes = dynamic_cast<const ParFiniteElementSpace*>(&vfes))
+    {
+      prolongation = pvfes->GetProlongationMatrix();
+      if (prolongation)
+      {
+        ::dg_igr::NVTXRange range("DG/prolong-true-to-local");
+        x_local.SetSize(pvfes->GetVSize());
+        prolongation->Mult(x, x_local);
+        x_eval = &x_local;
+        z_local.SetSize(pvfes->GetVSize());
+      }
+    }
   }
+#endif
+  Vector& z_eval = prolongation ? z_local : z;
+
+  if (vol_mode_ == VolumeMode::DGSEMFluxDiff)
+  {
+    MFEM_VERIFY(dgsem_stab_ == DGSEMStabilization::None,
+                "DGSEM stabilization hooks are not implemented. "
+                "Use --dgsem-stab none.");
+    dgsem::DGSEMOperator& dgsem_op = GetDGSEMProductionOperator_();
+    const bool requested_strict =
+      ::dg_igr::EnvFlagEnabled("DG_IGR_DGSEM_PRODUCTION_STRICT") ||
+      RequiresStrictDGSEMProduction(*formIntegrator);
+    const dgsem::DGSEMProductionSelection selection =
+      dgsem_op.BindProductionPolicy(requested_strict);
+    const bool strict = selection.strict;
+    const dgsem::DGSEMProductionReason reason_code = selection.reason;
+    const bool dispatch_transition =
+      !dgsem_production_dispatch_observed_ ||
+      dgsem_production_dispatch_supported_ != selection.supported ||
+      dgsem_production_dispatch_strict_ != strict ||
+      dgsem_production_dispatch_cuda_ != selection.cuda ||
+      dgsem_production_dispatch_reason_ != reason_code;
+    const auto record_dispatch = [&]()
+    {
+      dgsem_production_dispatch_observed_ = true;
+      dgsem_production_dispatch_supported_ = selection.supported;
+      dgsem_production_dispatch_strict_ = strict;
+      dgsem_production_dispatch_cuda_ = selection.cuda;
+      dgsem_production_dispatch_reason_ = reason_code;
+    };
+
+    const bool timing_enabled = IsDGSEMTimingEnabled_();
+    const auto t_mult_start = std::chrono::steady_clock::now();
+
+    if (selection.supported)
+    {
+      if (y_local.Size() != vfes.GetVSize())
+      {
+        y_local.SetSize(vfes.GetVSize());
+      }
+      const dgsem::DGSEMProductionResult result =
+        dgsem_op.AssembleProductionResidual(
+          *x_eval,
+          y_local,
+          strict,
+          capture_boundary_flux ? &physical_boundary_flux_integral_ : nullptr);
+      MFEM_VERIFY(result.executed,
+                  "DGSEM production execution rejected before output: "
+                    << dgsem::DGSEMProductionReasonName(result.reason));
+
+      if (prolongation)
+      {
+        y = 0.0;
+        prolongation->MultTranspose(y_local, y);
+      }
+      else
+      {
+        y = y_local;
+      }
+      if (static_source_.Size() != 0)
+      {
+        y.Add(1.0, static_source_);
+      }
+      max_char_speed = result.max_characteristic_speed;
+      ++dgsem_production_mult_calls_;
+
+      if (timing_enabled)
+      {
+        const double total_seconds = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - t_mult_start).count();
+        RecordDGSEMTiming_(0.0, 0.0, 0.0, total_seconds);
+      }
+      if (dispatch_transition && IsDGSEMProductionLogRoot_())
+      {
+        std::cout << "[dgsem-production] selected=mfem-native-packed"
+                  << " strict=" << strict
+                  << " backend=" << (selection.cuda ? "cuda" : "cpu")
+                  << " lvec_mode=" << (prolongation ? "P-x-PT" : "identity")
+                  << " volume_dissipation="
+                  << (selection.llf_volume_active ? "llf" : "none")
+                  << " llf_volume_active="
+                  << (selection.llf_volume_active ? 1 : 0)
+                  << " frozen_sigma_spectral_speed="
+                  << (selection.frozen_sigma_spectral_speed ? 1 : 0)
+                  << " order=" << selection.order
+                  << " dim=" << selection.dimension << '\n';
+      }
+      finalize_boundary_flux(/*already_accumulated=*/true);
+      record_dispatch();
+      return;
+    }
+
+    if (dispatch_transition && IsDGSEMProductionLogRoot_())
+    {
+      std::cout << "[dgsem-production] selected="
+                << (strict ? "strict-rejection" : "host-oracle-fallback")
+                << " strict=" << strict
+                << " reason="
+                << dgsem::DGSEMProductionReasonName(selection.reason)
+                << " lvec_mode=" << (prolongation ? "P-x-PT" : "identity")
+                << '\n';
+    }
+    record_dispatch();
+    MFEM_VERIFY(!strict,
+                "DGSEM production strict policy rejected tuple before output: "
+                  << dgsem::DGSEMProductionReasonName(selection.reason));
+    MFEM_VERIFY(dgsem::DGSEMOperatorSupportsDimension(dim),
+                "DGSEM host oracle cannot execute rejected dimension: "
+                  << dgsem::DGSEMProductionReasonName(selection.reason));
+    ++dgsem_production_fallback_calls_;
+
+    const bool has_local_elements = vfes.GetNE() > 0;
+    const auto t_surface_start = std::chrono::steady_clock::now();
+    real_t max_face_speed = 0.0;
+    if (has_local_elements)
+    {
+      max_face_speed = dgsem_op.AssembleSurface(
+        *x_eval,
+        z_eval,
+        capture_boundary_flux ? &physical_boundary_flux_integral_ : nullptr);
+    }
+    const auto t_surface_stop = std::chrono::steady_clock::now();
+
+    const auto t_volume_start = std::chrono::steady_clock::now();
+    real_t max_vol_speed = 0.0;
+    if (has_local_elements)
+    {
+      max_vol_speed = dgsem_op.AssembleVolume(*x_eval, z_eval);
+    }
+    const auto t_volume_stop = std::chrono::steady_clock::now();
+
+    const auto t_invmass_start = std::chrono::steady_clock::now();
+    if (prolongation)
+    {
+      y_local.SetSize(z_eval.Size());
+      if (has_local_elements)
+      {
+        dgsem_op.ApplyInverseMass(z_eval, y_local);
+      }
+      else
+      {
+        y_local = 0.0;
+      }
+      y = 0.0;
+      prolongation->MultTranspose(y_local, y);
+    }
+    else if (has_local_elements)
+    {
+      dgsem_op.ApplyInverseMass(z_eval, y);
+    }
+    else
+    {
+      y = 0.0;
+    }
+    if (static_source_.Size() != 0)
+    {
+      y.Add(1.0, static_source_);
+    }
+    const auto t_invmass_stop = std::chrono::steady_clock::now();
+
+    real_t fallback_max_speed = std::max(max_face_speed, max_vol_speed);
+#ifdef MFEM_USE_MPI
+    if (Mpi::IsInitialized() && !Mpi::IsFinalized())
+    {
+      if (const auto* par_fes =
+            dynamic_cast<const ParFiniteElementSpace*>(&vfes))
+      {
+        real_t owning_comm_max = fallback_max_speed;
+        MPI_Allreduce(&fallback_max_speed,
+                      &owning_comm_max,
+                      1,
+                      MPITypeMap<real_t>::mpi_type,
+                      MPI_MAX,
+                      par_fes->GetComm());
+        fallback_max_speed = owning_comm_max;
+      }
+    }
+#endif
+    max_char_speed = fallback_max_speed;
+
+    if (timing_enabled)
+    {
+      const auto t_mult_stop = std::chrono::steady_clock::now();
+      const double surface_seconds =
+        std::chrono::duration<double>(t_surface_stop - t_surface_start).count();
+      const double volume_seconds =
+        std::chrono::duration<double>(t_volume_stop - t_volume_start).count();
+      const double invmass_seconds =
+        std::chrono::duration<double>(t_invmass_stop - t_invmass_start).count();
+      const double total_seconds =
+        std::chrono::duration<double>(t_mult_stop - t_mult_start).count();
+      RecordDGSEMTiming_(surface_seconds,
+                         volume_seconds,
+                         invmass_seconds,
+                         total_seconds);
+    }
+    finalize_boundary_flux(/*already_accumulated=*/true);
+    return;
+  }
+
+  // (1) Build the face contribution (and possibly the volume term) into z:
+  //     z = - < F̂(u_h, n), [[v]] >_faces
+  //     If weak-divergence is NOT preassembled, HyperbolicFormIntegrator also adds
+  //     the volume term (F(u_h), ∇v):
+  //     z += (F(u_h), ∇v)
+  bool used_device_face = false;
+  real_t device_face_speed = 0.0;
+  if (Device::Allows(Backend::DEVICE_MASK))
+  {
+    const bool default_force_nonlinearform_face = !UseDeviceFaceResidual_();
+    const bool force_nonlinearform_face =
+      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DG_FORCE_NLFORM_FACE",
+                                      default_force_nonlinearform_face);
+    if (force_nonlinearform_face)
+    {
+      ::dg_igr::NVTXRange range("DG/face-domain-mfem-nonlinearform");
+      nonlinearForm->Mult(*x_eval, z_eval);
+      used_device_face = false;
+      device_face_speed = formIntegrator->GetMaxCharSpeed();
+      if (!dg_face_path_logged_ && mfem::Mpi::Root())
+      {
+        std::cout << "[dg-device] event=face-domain-path"
+                  << " selected=nonlinearForm->Mult"
+                  << " backend=device-mfem-face"
+                  << " lvec_mode=" << (prolongation ? "P-x-PT" : "identity")
+                  << " x_size=" << x.Size()
+                  << " local_vsize=" << vfes.GetVSize()
+                  << " true_vsize=" << vfes.GetTrueVSize() << "\n";
+        dg_face_path_logged_ = true;
+      }
+    }
+    else
+    {
+      ::dg_igr::NVTXRange range("DG/face-packed-euler-rusanov");
+      MFEM_VERIFY(UseDeviceFaceResidual_(),
+                  "DG device-closure requires packed device face residual path "
+                  "(no host fallback).");
+      used_device_face =
+        AddDeviceFaceContributionsEulerRusanov_(*x_eval,
+                                                z_eval,
+                                                device_face_speed,
+                                                capture_boundary_flux);
+      MFEM_VERIFY(used_device_face,
+                  "DG device-closure requires packed Euler/Rusanov face kernels "
+                  "and supported boundary/sigma metadata (no fallback).");
+      if (!dg_face_path_logged_ && mfem::Mpi::Root())
+      {
+        std::cout << "[dg-device] event=face-domain-path"
+                  << " selected=packed-mfem-forall-euler-rusanov"
+                  << " backend=device"
+                  << " lvec_mode=" << (prolongation ? "P-x-PT" : "identity")
+                  << " x_size=" << x.Size()
+                  << " local_vsize=" << vfes.GetVSize()
+                  << " true_vsize=" << vfes.GetTrueVSize() << "\n";
+        dg_face_path_logged_ = true;
+      }
+    }
+  }
+  else
+  {
+    ::dg_igr::NVTXRange range("DG/face-domain-cpu-nonlinearform");
+    nonlinearForm->Mult(x, z);
+  }
+
+  real_t volume_speed = 0.0;
+  if (!weakdiv.empty()) // weak divergence WAS preassembled element-wise
+  {
+    ::dg_igr::NVTXRange range("DG/weak-divergence");
+    // Compute (I_h F(u_h), ∇v) and accumulate directly into z.
+    volume_speed = AddPreassembledWeakDivergence_(*x_eval, z_eval);
+  }
+
+  // Apply inverse mass after all contributions have been assembled in z.
+  if (prolongation)
+  {
+    ::dg_igr::NVTXRange range("DG/inverse-mass-local-and-restrict");
+    y_local.SetSize(z_eval.Size());
+    ApplyInverseMass_(z_eval, y_local);
+    y = 0.0;
+    prolongation->MultTranspose(y_local, y);
+  }
+  else
+  {
+    ::dg_igr::NVTXRange range("DG/inverse-mass");
+    ApplyInverseMass_(z_eval, y);
+  }
+
+  if (static_source_.Size() != 0)
+  {
+    // The supplied field is the strong-form source itself, so it is added
+    // after inverse mass on both host and device paths.
+    y.Add(1.0, static_source_);
+  }
+
+  // (4) Expose a domain-wide maximum over volume, interior/shared faces, and
+  // physical boundaries. Packed device faces already include their boundary
+  // contribution; the separate maximum is then zero and harmless.
+  real_t boundary_speed = 0.0;
+  for (const auto& integrator : ext_bdr_int_)
+  {
+    if (auto* boundary =
+          dynamic_cast<BdrHyperbolicFluxIntegrator*>(integrator.get()))
+    {
+      boundary_speed =
+        std::max(boundary_speed, boundary->GetMaxCharSpeed());
+    }
+  }
+  const real_t face_speed =
+    used_device_face ? device_face_speed : formIntegrator->GetMaxCharSpeed();
+  max_char_speed =
+    std::max(volume_speed, std::max(face_speed, boundary_speed));
+
+  finalize_boundary_flux(/*already_accumulated=*/used_device_face);
 }
 
 DGHyperbolicConservationLaws::~DGHyperbolicConservationLaws()

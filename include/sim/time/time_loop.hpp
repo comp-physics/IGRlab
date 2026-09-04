@@ -45,6 +45,8 @@ struct TimeLoopConfig
   mfem::real_t next_save_time = -1.0;
   /// The caller already emitted the initial state into this output series.
   bool initial_state_saved = false;
+  /// The caller already performed the exact accepted-state q_sigma preflight.
+  bool initial_q_sigma_admitted = false;
 };
 
 /**
@@ -93,6 +95,8 @@ struct TimeLoopResult
     std::numeric_limits<mfem::real_t>::infinity();
   mfem::real_t maximum_attempted_dt = 0.0;
   mfem::real_t maximum_accepted_dt = 0.0;
+  /// Largest h_n/h_{n-1} over consecutive accepted steps in this segment.
+  mfem::real_t maximum_accepted_step_growth_ratio = 0.0;
   mfem::real_t minimum_characteristic_speed =
     std::numeric_limits<mfem::real_t>::infinity();
   mfem::real_t maximum_characteristic_speed = 0.0;
@@ -266,6 +270,85 @@ struct OperatorStepTransaction<
   }
 };
 
+/** Optional operator-specific upper bound on the next attempted step.
+ *
+ * The extrapolated instantaneous-IGR route uses this seam to keep consecutive
+ * accepted-step ratios bounded. Generic explicit operators retain the exact
+ * historical time-loop behavior.
+ */
+template <typename OperatorType, typename = void>
+struct ProposedStepSizeLimit
+{
+  static mfem::real_t Apply(const OperatorType&, mfem::real_t proposed_dt)
+  {
+    return proposed_dt;
+  }
+};
+
+template <typename OperatorType>
+struct ProposedStepSizeLimit<
+  OperatorType,
+  std::void_t<decltype(std::declval<const OperatorType&>()
+                         .LimitProposedRKStepSize(
+                           std::declval<mfem::real_t>()))>>
+{
+  static mfem::real_t Apply(const OperatorType& op,
+                            mfem::real_t proposed_dt)
+  {
+    const mfem::real_t limited = op.LimitProposedRKStepSize(proposed_dt);
+    MFEM_VERIFY(std::isfinite(limited) && limited > 0.0 &&
+                  limited <= proposed_dt,
+                "An operator returned an invalid proposed-step upper bound.");
+    return limited;
+  }
+};
+
+/** Optional fail-fast admission for an accepted algebraic/conservative state.
+ *
+ * EulerWithIGR supplies this hook for the extrapolated instantaneous closure.
+ * Generic explicit operators remain unaffected.  The returned aggregate is a
+ * fresh scan, not cumulative run telemetry.
+ */
+template <typename OperatorType, typename = void>
+struct AcceptedStateQSigmaAdmission
+{
+  static bool Inspect(OperatorType&,
+                      const mfem::Vector&,
+                      mfem::real_t,
+                      std::uint64_t&,
+                      std::uint64_t&)
+  {
+    return false;
+  }
+};
+
+template <typename OperatorType>
+struct AcceptedStateQSigmaAdmission<
+  OperatorType,
+  std::void_t<decltype(std::declval<OperatorType&>()
+                         .InspectAcceptedStateForTransport(
+                           std::declval<const mfem::Vector&>(),
+                           std::declval<mfem::real_t>()))>>
+{
+  static bool Inspect(OperatorType& op,
+                      const mfem::Vector& state,
+                      mfem::real_t time,
+                      std::uint64_t& nonpositive,
+                      std::uint64_t& nonfinite)
+  {
+    const auto admission = op.InspectAcceptedStateForTransport(state, time);
+    if (!admission.enabled)
+    {
+      return false;
+    }
+    MFEM_VERIFY(admission.sample_count > 0,
+                "Accepted-state q_sigma admission returned no fresh samples.");
+    nonpositive = admission.nonpositive_count;
+    nonfinite = admission.nonfinite_count;
+    return nonpositive > 0 || nonfinite > 0;
+  }
+};
+
 } // namespace time_loop_detail
 
 inline mfem::real_t ComputeGlobalHMin(mfem::ParMesh& pmesh)
@@ -410,6 +493,49 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
     return true;
   };
 
+  // The extrapolated instantaneous-IGR route owns an exact algebraic accepted
+  // state.  Admit that state before the initial/restart CFL RHS (and also for a
+  // fixed-dt start) so a non-hyperbolic anchor cannot enter futile dt retries.
+  std::uint64_t initial_q_sigma_nonpositive = 0;
+  std::uint64_t initial_q_sigma_nonfinite = 0;
+  if (!cfg.initial_q_sigma_admitted &&
+      time_loop_detail::AcceptedStateQSigmaAdmission<OperatorType>::Inspect(
+        op,
+        sol,
+        t,
+        initial_q_sigma_nonpositive,
+        initial_q_sigma_nonfinite))
+  {
+    result.rejected_attempts = 1;
+    result.rejected_q_sigma_attempts = 1;
+    result.rejected_q_sigma_nonpositive_samples =
+      initial_q_sigma_nonpositive;
+    result.rejected_q_sigma_nonfinite_samples = initial_q_sigma_nonfinite;
+    const mfem::RKStageAdmissionFailureReason reason =
+      initial_q_sigma_nonpositive > 0 && initial_q_sigma_nonfinite > 0
+        ? mfem::RKStageAdmissionFailureReason::
+            QSigmaNonpositiveAndNonfinite
+        : (initial_q_sigma_nonfinite > 0
+             ? mfem::RKStageAdmissionFailureReason::QSigmaNonfinite
+             : mfem::RKStageAdmissionFailureReason::QSigmaNonpositive);
+    result.last_q_sigma_rejection_reason =
+      mfem::RKStageAdmissionFailureReasonName(reason);
+    result.last_q_sigma_rejection_stage = -1;
+    result.termination_reason = "initial-q-sigma-admission-failed";
+    if (communicator_root)
+    {
+      std::cout << "[q-sigma-admission] event=initial-rejection"
+                << " time=" << t
+                << " step=" << result.steps
+                << " reason=" << result.last_q_sigma_rejection_reason
+                << " nonpositive_samples="
+                << initial_q_sigma_nonpositive
+                << " nonfinite_samples=" << initial_q_sigma_nonfinite
+                << " rhs_evaluations=0\n";
+    }
+    return result;
+  }
+
   mfem::real_t dt = cfg.dt;
   mfem::real_t hmin = mfem::infinity();
   const long long cfl_probe_rhs_evaluations = cfg.cfl > 0.0 ? 1 : 0;
@@ -476,8 +602,17 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
   }
 
   bool done = false;
+  mfem::real_t previous_accepted_dt =
+    std::numeric_limits<mfem::real_t>::quiet_NaN();
   for (int segment_step = 0; !done; ++segment_step)
   {
+    const mfem::real_t unrestricted_dt = dt;
+    dt = time_loop_detail::ProposedStepSizeLimit<OperatorType>::Apply(op, dt);
+    if (dt < unrestricted_dt)
+    {
+      TraceNominalDt(
+        "operator-growth-limit", cfg.initial_step + segment_step, t, dt);
+    }
     mfem::real_t dt_real_base = std::min(dt, cfg.t_final - t);
     mfem::real_t dt_real = dt_real_base;
 
@@ -572,6 +707,13 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
           std::min(result.minimum_accepted_dt, attempted_dt);
         result.maximum_accepted_dt =
           std::max(result.maximum_accepted_dt, attempted_dt);
+        if (std::isfinite(previous_accepted_dt) && previous_accepted_dt > 0.0)
+        {
+          result.maximum_accepted_step_growth_ratio =
+            std::max(result.maximum_accepted_step_growth_ratio,
+                     attempted_dt / previous_accepted_dt);
+        }
+        previous_accepted_dt = attempted_dt;
       }
       catch (const mfem::RecoverableLimiterFailure& failure)
       {
@@ -914,6 +1056,8 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
               << " maximum_attempted_dt=" << result.maximum_attempted_dt
               << " minimum_accepted_dt=" << minimum_accepted_dt
               << " maximum_accepted_dt=" << result.maximum_accepted_dt
+              << " maximum_accepted_step_growth_ratio="
+              << result.maximum_accepted_step_growth_ratio
               << " characteristic_speed_probes="
               << result.characteristic_speed_probes
               << " minimum_characteristic_speed="
