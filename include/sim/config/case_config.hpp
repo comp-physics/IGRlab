@@ -16,6 +16,7 @@
 
 #include "mfem.hpp"
 #include "numerics/limiters/limiter_pipeline.hpp"
+#include "numerics/timestepping/ssprk_coefficients.hpp"
 #include "utils/config/igr_config.hpp"
 #include "utils/config/io_config.hpp"
 #include "utils/config/timestepping_config.hpp"
@@ -833,6 +834,24 @@ inline bool IsExplicitSSPRKTimeIntegrator(TimeIntegrator time_integrator)
 {
   return time_integrator == TimeIntegrator::RK3SSP ||
          time_integrator == TimeIntegrator::SSPRK104;
+}
+
+/// SSP coefficient used to scale the user-facing explicit CFL safety factor.
+inline std::optional<mfem::real_t>
+SSPCoefficientForTimeIntegrator(TimeIntegrator time_integrator)
+{
+  switch (time_integrator)
+  {
+  case TimeIntegrator::RK3SSP:
+    return mfem::SSPRK33Coefficients::ssp_coefficient;
+  case TimeIntegrator::SSPRK104:
+    return mfem::SSPRK104Coefficients::ssp_coefficient;
+  case TimeIntegrator::BackwardEuler:
+  case TimeIntegrator::PartitionedBackwardEuler:
+  case TimeIntegrator::Rodas3:
+    return std::nullopt;
+  }
+  return std::nullopt;
 }
 
 inline const char*
@@ -1851,6 +1870,37 @@ inline RunConfig MakeRunConfig(
   return run_cfg;
 }
 
+/** Validate the user-facing explicit SSPRK CFL convention.
+ *
+ * A positive value is a safety fraction of the selected method's SSP
+ * coefficient.  Zero explicitly disables CFL control and selects opts.dt.
+ * Keep the upper bound fail-closed: values above one would otherwise look
+ * like ordinary safety factors while silently exceeding the selected SSP
+ * normalization. This validation alone is not a spatial positivity theorem.
+ */
+inline std::string
+ValidateExplicitSSPRKCFLSelection(const RunConfig& run_cfg)
+{
+  if (!IsExplicitSSPRKTimeIntegrator(run_cfg.time_integrator))
+  {
+    return {};
+  }
+  const mfem::real_t safety_factor = run_cfg.opts.cfl;
+  if (!std::isfinite(safety_factor) || safety_factor < 0.0 ||
+      safety_factor > 1.0)
+  {
+    return "Explicit SSPRK --cfl-number is a finite safety factor in [0,1]; "
+           "the selected method's SSP coefficient is applied automatically.";
+  }
+  if (safety_factor == 0.0 &&
+      (!std::isfinite(run_cfg.opts.dt) || run_cfg.opts.dt <= 0.0))
+  {
+    return "Explicit SSPRK --cfl-number 0 requires a finite positive "
+           "--time-step.";
+  }
+  return {};
+}
+
 inline dg_igr::IGRAlphaLengthScalePolicy
 ResolveIGRAlphaLengthScalePolicy(const RunConfig& run_cfg)
 {
@@ -2023,6 +2073,8 @@ inline TimeLoopConfig MakeTimeLoopConfig(const RunConfig& run_cfg)
   cfg.t_final = opts.t_final;
   cfg.dt = opts.dt;
   cfg.dt_min = opts.dt_min;
+  // Preserve the user safety factor here. RunTimeLoop obtains the selected
+  // stepper's SSP coefficient and applies it exactly once.
   cfg.cfl = opts.cfl;
   cfg.order = opts.order;
   cfg.vis_steps = opts.vis_steps;

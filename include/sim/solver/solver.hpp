@@ -499,8 +499,11 @@ RunEulerCase(ExampleContext& ctx,
     failure.success = false;
     failure.termination_reason =
       "igr-restart-closure-certificate-failed";
+    PopulateExplicitCFLDiagnostics(
+      failure, MakeTimeLoopConfig(run_cfg), rk3);
     if (communicator_root)
     {
+      EmitExplicitTimeRunSummary(failure);
       std::cout << "[explicit-time] event=final-status"
                 << " final_time=" << initial_time
                 << " success=0"
@@ -557,6 +560,8 @@ RunEulerCase(ExampleContext& ctx,
     failure.last_q_sigma_rejection_stage = -1;
     failure.success = false;
     failure.termination_reason = "initial-q-sigma-admission-failed";
+    PopulateExplicitCFLDiagnostics(
+      failure, MakeTimeLoopConfig(run_cfg), rk3);
     if (communicator_root)
     {
       std::cout << "[q-sigma-admission] event=initial-rejection"
@@ -566,28 +571,9 @@ RunEulerCase(ExampleContext& ctx,
                 << " nonpositive_samples="
                 << initial_q_sigma_nonpositive
                 << " nonfinite_samples=" << initial_q_sigma_nonfinite
-                << " rhs_evaluations=0 output_published=0\n"
-                << "[explicit-time] event=run-summary"
-                << " steps=" << initial_step
-                << " final_time=" << initial_time
-                << " rhs_evaluations=0 accepted_attempts=0"
-                << " rejected_attempts=1 rejected_limiter_elements=0"
-                << " rejected_q_sigma_attempts=1"
-                << " rejected_q_sigma_nonpositive_samples="
-                << initial_q_sigma_nonpositive
-                << " rejected_q_sigma_nonfinite_samples="
-                << initial_q_sigma_nonfinite
-                << " last_q_sigma_rejection_reason="
-                << failure.last_q_sigma_rejection_reason
-                << " last_q_sigma_rejection_stage=-1"
-                << " minimum_attempted_dt=0 maximum_attempted_dt=0"
-                << " minimum_accepted_dt=0 maximum_accepted_dt=0"
-                << " characteristic_speed_probes=0"
-                << " minimum_characteristic_speed=0"
-                << " maximum_characteristic_speed=0 dt_min_reached=0"
-                << " success=0 termination_reason="
-                << failure.termination_reason << "\n"
-                << "[explicit-time] event=final-status"
+                << " rhs_evaluations=0 output_published=0\n";
+      EmitExplicitTimeRunSummary(failure);
+      std::cout << "[explicit-time] event=final-status"
                 << " final_time=" << initial_time
                 << " success=0 termination_reason="
                 << failure.termination_reason << "\n";
@@ -1534,6 +1520,16 @@ struct Solver
       request_resolution.discretization_provenance,
       request_resolution.regularization,
       request_resolution.time_integrator);
+    const std::string cfl_selection_rejection =
+      ValidateExplicitSSPRKCFLSelection(run_cfg);
+    if (!cfl_selection_rejection.empty())
+    {
+      if (mfem::Mpi::Root())
+      {
+        std::cerr << cfl_selection_rejection << '\n';
+      }
+      return 1;
+    }
     const std::string extrapolated_selection_rejection =
       ValidateExtrapolatedEveryStepIGRSelection(run_cfg);
     if (!extrapolated_selection_rejection.empty())
@@ -1894,6 +1890,8 @@ struct Solver
         failure.GlobalRejectedElementCount();
       initial_failure.success = false;
       initial_failure.termination_reason = "initial-limiter-admission-failed";
+      PopulateExplicitCFLDiagnostics(
+        initial_failure, MakeTimeLoopConfig(run_cfg), rk3);
 
       int communicator_size = 1;
       MPI_Comm_size(ctx.Mesh().GetComm(), &communicator_size);
@@ -1910,8 +1908,9 @@ struct Solver
                   << failure.GlobalRejectedElementCount()
                   << " state_unchanged=1"
                   << " rhs_evaluations=0"
-                  << " closure_evaluations=0\n"
-                  << "[explicit-time] event=final-status"
+                  << " closure_evaluations=0\n";
+        EmitExplicitTimeRunSummary(initial_failure);
+        std::cout << "[explicit-time] event=final-status"
                   << " final_time=" << initial_failure.final_time
                   << " success=0"
                   << " termination_reason="

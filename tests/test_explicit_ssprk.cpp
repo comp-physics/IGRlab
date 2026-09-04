@@ -359,7 +359,9 @@ void CheckAcceptedCharacteristicSpeedTransaction(
   dg_sim::TimeLoopConfig config;
   config.t_final = 1.25;
   config.dt = 0.1;
-  config.cfl = 1.0;
+  // SSPRK(10,4)'s coefficient of six turns this safety fraction into the
+  // historical unit DG CFL factor used by the expected step sequence below.
+  config.cfl = 1.0 / 6.0;
   config.order = 0;
   config.vtk_save = false;
   const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
@@ -372,6 +374,118 @@ void CheckAcceptedCharacteristicSpeedTransaction(
               result.maximum_accepted_dt == 1.0,
             "adaptive CFL consumes and reports every accepted all-stage "
             "speed maximum, including the terminal step");
+  ctx.CheckNear(result.cfl_safety_factor,
+                1.0 / 6.0,
+                0.0,
+                "adaptive CFL reports the user safety factor");
+  ctx.Check(result.cfl_control_enabled,
+            "adaptive CFL reports that characteristic-speed control is on");
+  ctx.CheckNear(result.ssp_coefficient,
+                6.0,
+                0.0,
+                "adaptive CFL reports the SSPRK(10,4) coefficient");
+  ctx.CheckNear(result.ssp_scaled_cfl_factor,
+                1.0,
+                0.0,
+                "adaptive CFL reports the combined DG CFL factor");
+  ctx.CheckNear(result.nominal_global_courant,
+                1.0,
+                0.0,
+                "adaptive CFL reports the DG-order-normalized Courant number");
+}
+
+void CheckSSPNormalizedCFLMethodScaling(TestContext& ctx,
+                                        mfem::ParMesh& mesh,
+                                        mfem::ParFiniteElementSpace& fes)
+{
+  constexpr mfem::real_t kSafetyFactor = 0.5;
+  constexpr int kDGOrder = 1;
+  constexpr mfem::real_t kOrderDenominator = 2 * kDGOrder + 1;
+  // Span several SSPRK(10,4) steps so a second, erroneous factor-of-six
+  // application cannot be hidden by clipping the first step to t_final.
+  constexpr mfem::real_t kFinalTime = 2.25;
+
+  RecordingLinearOperator ssprk33_op(fes.GetTrueVSize());
+  ssprk33_op.stage_characteristic_speeds = {1.0, 1.0, 1.0};
+  ssprk33_op.endpoint_characteristic_speed = 1.0;
+  mfem::RK3SSPWithLimiter ssprk33_stepper(
+    fes, mfem::SSPRKMethod::SSPRK33);
+  ssprk33_stepper.Init(ssprk33_op);
+  mfem::ParGridFunction ssprk33_state(&fes);
+  ssprk33_state = 1.0;
+
+  dg_sim::TimeLoopConfig config;
+  config.t_final = kFinalTime;
+  config.dt = 0.01;
+  config.cfl = kSafetyFactor;
+  config.order = kDGOrder;
+  config.vtk_save = false;
+  const dg_sim::TimeLoopResult ssprk33_result = dg_sim::RunTimeLoop(
+    ssprk33_op, mesh, ssprk33_state, ssprk33_stepper, config);
+
+  RecordingLinearOperator ssprk104_op(fes.GetTrueVSize());
+  ssprk104_op.stage_characteristic_speeds =
+    {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+  ssprk104_op.endpoint_characteristic_speed = 1.0;
+  mfem::RK3SSPWithLimiter ssprk104_stepper(
+    fes, mfem::SSPRKMethod::SSPRK104);
+  ssprk104_stepper.Init(ssprk104_op);
+  mfem::ParGridFunction ssprk104_state(&fes);
+  ssprk104_state = 1.0;
+  const dg_sim::TimeLoopResult ssprk104_result = dg_sim::RunTimeLoop(
+    ssprk104_op, mesh, ssprk104_state, ssprk104_stepper, config);
+
+  ctx.Check(ssprk33_result.success && ssprk33_result.steps == 14,
+            "SSP-normalized CFL uses the unit SSPRK(3,3) scale");
+  ctx.CheckNear(ssprk33_result.cfl_safety_factor,
+                kSafetyFactor,
+                0.0,
+                "SSPRK(3,3) preserves the user CFL safety factor");
+  ctx.CheckNear(ssprk33_result.ssp_coefficient,
+                1.0,
+                0.0,
+                "SSPRK(3,3) reports its unit SSP coefficient");
+  ctx.CheckNear(ssprk33_result.ssp_scaled_cfl_factor,
+                kSafetyFactor,
+                0.0,
+                "SSPRK(3,3) reports its combined DG CFL factor");
+  ctx.CheckNear(ssprk33_result.nominal_global_courant,
+                kSafetyFactor / kOrderDenominator,
+                2.0e-14,
+                "SSPRK(3,3) reports its nominal Courant number");
+  ctx.CheckNear(ssprk33_result.maximum_accepted_dt,
+                kSafetyFactor / kOrderDenominator,
+                2.0e-14,
+                "SSPRK(3,3) applies its CFL-scaled nominal step");
+
+  ctx.Check(ssprk104_result.success && ssprk104_result.steps == 3,
+            "SSP-normalized CFL automatically applies the SSPRK(10,4) scale");
+  ctx.CheckNear(ssprk104_result.cfl_safety_factor,
+                kSafetyFactor,
+                0.0,
+                "SSPRK(10,4) preserves the user CFL safety factor");
+  ctx.CheckNear(ssprk104_result.ssp_coefficient,
+                6.0,
+                0.0,
+                "SSPRK(10,4) reports its SSP coefficient");
+  ctx.CheckNear(ssprk104_result.ssp_scaled_cfl_factor,
+                6.0 * kSafetyFactor,
+                0.0,
+                "SSPRK(10,4) reports its combined DG CFL factor");
+  ctx.CheckNear(ssprk104_result.nominal_global_courant,
+                6.0 * kSafetyFactor / kOrderDenominator,
+                0.0,
+                "SSPRK(10,4) reports its nominal Courant number");
+  ctx.CheckNear(ssprk104_result.maximum_accepted_dt,
+                6.0 * kSafetyFactor / kOrderDenominator,
+                0.0,
+                "SSPRK(10,4) applies its CFL-scaled nominal step");
+  ctx.Check(ssprk104_op.begin_dts.size() == 3 &&
+              ssprk104_op.begin_dts[0] == 1.0 &&
+              ssprk104_op.begin_dts[1] == 1.0 &&
+              ssprk104_op.begin_dts[2] == 0.25,
+            "SSPRK(10,4) applies the method scale exactly once before the "
+            "terminal step is clipped");
 }
 
 void CheckTerminalAlwaysCallbackOrdering(TestContext& ctx,
@@ -1033,6 +1147,24 @@ void CheckSSPRK104TransactionalRollback(TestContext& ctx,
               result.rejected_attempts == 1 &&
               result.rejected_limiter_elements == kRejectedElements,
             scenario + " records accepted and rejected attempts exactly");
+  ctx.CheckNear(result.cfl_safety_factor,
+                0.0,
+                0.0,
+                scenario + " preserves fixed stepping when CFL is zero");
+  ctx.Check(!result.cfl_control_enabled,
+            scenario + " reports that fixed stepping disables CFL control");
+  ctx.CheckNear(result.ssp_coefficient,
+                6.0,
+                0.0,
+                scenario + " still reports the selected SSP coefficient");
+  ctx.CheckNear(result.ssp_scaled_cfl_factor,
+                0.0,
+                0.0,
+                scenario + " has no combined CFL factor in fixed-step mode");
+  ctx.CheckNear(result.nominal_global_courant,
+                0.0,
+                0.0,
+                scenario + " has no nominal CFL Courant in fixed-step mode");
   ctx.Check(result.rhs_evaluations == expected_rhs &&
               stepper.GetRHSEvaluationCount() == expected_rhs &&
               static_cast<long long>(op.rhs_times.size()) == expected_rhs &&
@@ -1147,6 +1279,7 @@ int main(int argc, char** argv)
                                   "SSPRK(10,4)");
 
   CheckAcceptedCharacteristicSpeedTransaction(ctx, mesh, fes);
+  CheckSSPNormalizedCFLMethodScaling(ctx, mesh, fes);
   CheckTerminalAlwaysCallbackOrdering(ctx, fes);
   CheckRejectedLimiterDiagnosticsStayCommitted(ctx);
   CheckZhangShuMutationAwareGeneration(ctx);

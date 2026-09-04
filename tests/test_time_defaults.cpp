@@ -11,6 +11,7 @@
 #include "test_utils.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -45,6 +46,10 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "HDG CUDA engine defaults to ordinary");
     ctx.Check(opts.time_atol == 1.0e-8 && opts.time_rtol == 1.0e-5,
               "adaptive time tolerances retain their typed opt-in defaults");
+    ctx.CheckNear(opts.cfl,
+                  0.3,
+                  0.0,
+                  "explicit CFL defaults to an SSP-normalized safety factor");
     ctx.Check(dg_sim::ParseZhangShuPointSet("consumer") ==
                 mfem::ZhangShuPointSet::kConsumer,
               "Zhang-Shu options: parse consumer point set");
@@ -218,6 +223,14 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   dg_sim::TimeIntegrator::SSPRK104) ==
                   mfem::SSPRKMethod::SSPRK104,
               "request: typed explicit selectors map to SSPRK methods");
+    ctx.Check(
+      dg_sim::SSPCoefficientForTimeIntegrator(
+        dg_sim::TimeIntegrator::RK3SSP) == 1.0 &&
+        dg_sim::SSPCoefficientForTimeIntegrator(
+          dg_sim::TimeIntegrator::SSPRK104) == 6.0 &&
+        !dg_sim::SSPCoefficientForTimeIntegrator(
+          dg_sim::TimeIntegrator::Rodas3),
+      "request: SSP coefficients are authoritative only for explicit SSPRK");
     ctx.Check(!dg_sim::TryParseTimeIntegrator("invalid"),
               "request: invalid time integrator is not parsed");
     ctx.Check(dg_sim::TryParseDeviceBackend("CUDA") ==
@@ -728,6 +741,36 @@ int RunTimeDefaultsTests(TestContext& ctx)
       "IGR options: extrapolated-every-step cadence parses and round-trips");
   }
 
+  // --- Explicit SSPRK CFL is a safety fraction, not a bare Courant number ---
+  {
+    dg_sim::RunConfig cfl_run;
+    cfl_run.time_integrator = dg_sim::TimeIntegrator::SSPRK104;
+    cfl_run.opts.cfl = 1.0;
+    ctx.Check(dg_sim::ValidateExplicitSSPRKCFLSelection(cfl_run).empty(),
+              "explicit CFL: unit SSP safety factor is admitted");
+
+    cfl_run.opts.cfl = 1.01;
+    ctx.Check(!dg_sim::ValidateExplicitSSPRKCFLSelection(cfl_run).empty(),
+              "explicit CFL: factors above the SSP bound fail closed");
+
+    cfl_run.opts.cfl = -0.1;
+    ctx.Check(!dg_sim::ValidateExplicitSSPRKCFLSelection(cfl_run).empty(),
+              "explicit CFL: negative safety factors are rejected");
+
+    cfl_run.opts.cfl = 0.0;
+    cfl_run.opts.dt = 1.0e-3;
+    ctx.Check(dg_sim::ValidateExplicitSSPRKCFLSelection(cfl_run).empty(),
+              "explicit CFL: zero selects a valid fixed time step");
+    cfl_run.opts.dt = -1.0e-3;
+    ctx.Check(!dg_sim::ValidateExplicitSSPRKCFLSelection(cfl_run).empty(),
+              "explicit CFL: disabled control requires a positive fixed step");
+
+    cfl_run.time_integrator = dg_sim::TimeIntegrator::Rodas3;
+    cfl_run.opts.cfl = 6.0;
+    ctx.Check(dg_sim::ValidateExplicitSSPRKCFLSelection(cfl_run).empty(),
+              "explicit CFL: non-SSPRK backends retain their own semantics");
+  }
+
   // --- Extrapolated IGR remains a bounded, production-qualified tuple ---
   {
     dg_sim::CaseConfig case_cfg;
@@ -957,11 +1000,18 @@ int RunTimeDefaultsTests(TestContext& ctx)
   run_cfg.dg_backend = dg_sim::DGBackend::DG;
 
   {
-    const dg_sim::TimeLoopConfig loop_cfg = dg_sim::MakeTimeLoopConfig(run_cfg);
+    dg_sim::RunConfig loop_config_run = run_cfg;
+    loop_config_run.opts.cfl = 0.75;
+    const dg_sim::TimeLoopConfig loop_cfg =
+      dg_sim::MakeTimeLoopConfig(loop_config_run);
     ctx.CheckNear(loop_cfg.dt_min,
                   run_cfg.opts.dt_min,
                   1.0e-16,
                   "time loop config: dt_min propagated from runtime options");
+    ctx.CheckNear(loop_cfg.cfl,
+                  0.75,
+                  0.0,
+                  "time loop config: SSP safety factor is propagated unscaled");
   }
 
   dg_sim::ExampleContext example_ctx(run_cfg,
@@ -1298,7 +1348,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
     dg_sim::RunConfig metadata_run;
     metadata_run.case_config = metadata_case;
     metadata_run.opts.vtk_save = true;
-    metadata_run.opts.order = 2;
+    metadata_run.opts.order = 1;
+    metadata_run.opts.cfl = 0.5;
     metadata_run.dg_backend = dg_sim::DGBackend::DGSEM;
     metadata_run.dgsem_volume_dissipation =
       dg_sim::DGSEMVolumeDissipation::LLF;
@@ -1356,7 +1407,29 @@ int RunTimeDefaultsTests(TestContext& ctx)
           std::string(dg_sim::TimeIntegratorToString(methods[i])) + "\"";
         metadata_fields_ok[i] = static_cast<int>(
           opened && contents.find(expected) != std::string::npos &&
-          contents.find("\"schema_version\": 2") != std::string::npos &&
+          contents.find("\"schema_version\": 3") != std::string::npos &&
+          contents.find("\"cfl\": 0.5") != std::string::npos &&
+          contents.find(
+            "\"cfl_field_semantics\": "
+            "\"integrator-normalized-safety-factor\"") !=
+            std::string::npos &&
+          contents.find("\"cfl_control_enabled\": true") !=
+            std::string::npos &&
+          contents.find("\"cfl_safety_factor\": 0.5") !=
+            std::string::npos &&
+          contents.find("\"ssp_coefficient\": 6") !=
+            std::string::npos &&
+          contents.find("\"ssp_scaled_cfl_factor\": 3") !=
+            std::string::npos &&
+          contents.find("\"nominal_global_courant\": 1") !=
+            std::string::npos &&
+          contents.find("\"cfl_diagnostics_observed\": false") !=
+            std::string::npos &&
+          contents.find("\"cfl_diagnostics_source\": \"requested-config\"") !=
+            std::string::npos &&
+          contents.find(
+            "\"cfl_convention\": \"explicit-ssprk-safety-factor\"") !=
+            std::string::npos &&
           contents.find("\"dgsem_stabilization\": \"none\"") !=
             std::string::npos &&
           contents.find("\"dgsem_volume_flux\": \"central\"") !=
@@ -1621,6 +1694,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
   struct TimeLoopCountingStepper
   {
     int calls = 0;
+    mfem::real_t GetSSPCoefficient() const { return 1.0; }
     void Step(mfem::Vector&, mfem::real_t& t, mfem::real_t& dt)
     {
       ++calls;
@@ -1776,6 +1850,61 @@ int RunTimeDefaultsTests(TestContext& ctx)
     }
   };
 
+  // --- CFL mode requires a typed SSP scale; fixed generic stepping does not ---
+  {
+    TimeLoopRetryStepper generic_stepper(/*failures=*/0);
+    ctx.Check(
+      !dg_sim::time_loop_detail::
+        RKSSPCoefficient<TimeLoopRetryStepper>::available,
+      "time loop: a generic stepper does not synthesize an SSP coefficient");
+
+    dg_sim::TimeLoopConfig fixed_cfg;
+    fixed_cfg.dt = 0.1;
+    fixed_cfg.cfl = 0.0;
+    dg_sim::TimeLoopResult fixed_diagnostics;
+    dg_sim::PopulateExplicitCFLDiagnostics(
+      fixed_diagnostics, fixed_cfg, generic_stepper);
+    ctx.Check(!fixed_diagnostics.cfl_control_enabled &&
+                fixed_diagnostics.cfl_safety_factor == 0.0 &&
+                std::isnan(fixed_diagnostics.ssp_coefficient),
+              "time loop: fixed generic stepping needs no claimed SSP scale");
+
+#ifdef MFEM_USE_EXCEPTIONS
+    const mfem::ErrorAction previous_action = mfem::get_error_action();
+    mfem::set_error_action(mfem::MFEM_ERROR_THROW);
+    bool missing_ssp_rejected = false;
+    try
+    {
+      dg_sim::TimeLoopConfig cfl_cfg = fixed_cfg;
+      cfl_cfg.cfl = 0.5;
+      dg_sim::TimeLoopResult diagnostics;
+      dg_sim::PopulateExplicitCFLDiagnostics(
+        diagnostics, cfl_cfg, generic_stepper);
+    }
+    catch (const mfem::ErrorException&)
+    {
+      missing_ssp_rejected = true;
+    }
+
+    bool invalid_fixed_dt_rejected = false;
+    try
+    {
+      dg_sim::TimeLoopConfig invalid_fixed_cfg = fixed_cfg;
+      invalid_fixed_cfg.dt = 0.0;
+      dg_sim::TimeLoopResult diagnostics;
+      dg_sim::PopulateExplicitCFLDiagnostics(
+        diagnostics, invalid_fixed_cfg, generic_stepper);
+    }
+    catch (const mfem::ErrorException&)
+    {
+      invalid_fixed_dt_rejected = true;
+    }
+    mfem::set_error_action(previous_action);
+    ctx.Check(missing_ssp_rejected && invalid_fixed_dt_rejected,
+              "time loop: invalid CFL contracts fail before operator work");
+#endif
+  }
+
   // --- an invalid exact initial/restart anchor fails before the CFL RHS ---
   {
     TimeLoopInitialQSigmaOperator op;
@@ -1820,6 +1949,32 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   cfg.initial_time,
                   0.0,
                   "initial q_sigma admission remains at the restart horizon");
+    const dg_sim::RunSummary summary =
+      dg_sim::BuildRunSummary(example_ctx,
+                              result,
+                              /*elapsed_seconds=*/0.0,
+                              /*num_ranks=*/1);
+    ctx.Check(summary.cfl_diagnostics_observed &&
+                summary.cfl_control_enabled &&
+                summary.cfl_safety_factor == 0.5 &&
+                summary.ssp_coefficient == 1.0 &&
+                summary.ssp_scaled_cfl_factor == 0.5 &&
+                summary.nominal_global_courant == 0.5 / 3.0,
+              "run summary: early failure preserves observed CFL factors");
+    std::ostringstream structured_summary;
+    dg_sim::EmitExplicitTimeRunSummary(result, structured_summary);
+    const std::string structured_text = structured_summary.str();
+    ctx.Check(structured_text.find("event=run-summary") != std::string::npos &&
+                structured_text.find("cfl_control_enabled=1") !=
+                  std::string::npos &&
+                structured_text.find("cfl_safety_factor=0.5") !=
+                  std::string::npos &&
+                structured_text.find("ssp_coefficient=1") !=
+                  std::string::npos &&
+                structured_text.find("termination_reason="
+                                     "initial-q-sigma-admission-failed") !=
+                  std::string::npos,
+              "time loop: canonical early summary exposes the CFL contract");
   }
 
   // --- a solver-level successful preflight is not repeated in the loop ---
@@ -2078,7 +2233,10 @@ int RunTimeDefaultsTests(TestContext& ctx)
         !ok && !summary.success && !summary.dt_min_reached &&
         summary.termination_reason == "limiter-retry-limit" &&
         summary.rhs_evaluations == 64 && summary.accepted_attempts == 0 &&
-        summary.rejected_attempts == 64);
+        summary.rejected_attempts == 64 &&
+        summary.cfl_diagnostics_observed &&
+        !summary.cfl_control_enabled && summary.cfl_safety_factor == 0.0 &&
+        summary.ssp_coefficient == 1.0);
     }
     MPI_Bcast(&application_failure_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
     ctx.Check(application_failure_ok == 1,
@@ -2132,6 +2290,12 @@ int RunTimeDefaultsTests(TestContext& ctx)
       metadata_ok = static_cast<int>(
         input.is_open() &&
         contents.find("\"success\": false") != std::string::npos &&
+        contents.find("\"cfl_diagnostics_observed\": true") !=
+          std::string::npos &&
+        contents.find("\"cfl_diagnostics_source\": \"run-summary\"") !=
+          std::string::npos &&
+        contents.find("\"ssp_scaled_cfl_factor\": null") !=
+          std::string::npos &&
         contents.find("\"termination_reason\": \"limiter-retry-limit\"") !=
           std::string::npos);
       std::filesystem::remove_all(output_root);

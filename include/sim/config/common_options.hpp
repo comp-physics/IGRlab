@@ -58,9 +58,12 @@ struct CommonOptions
   std::string dgsem_entropy_jacobian =
     "fd"; ///< DGSEM ES-LF entropy Jacobian: "fd" or "analytic".
   mfem::real_t t_final = 1.0; ///< Final time.
-  mfem::real_t dt = -0.01;    ///< Time step (positive skips CFL computation).
+  /// Fixed explicit step when cfl is zero; HDG also uses its sign to select
+  /// fixed, CFL-controlled, or adaptive stepping.
+  mfem::real_t dt = -0.01;
   mfem::real_t dt_min = 1.0e-12; ///< Minimum allowed dt before aborting.
-  mfem::real_t cfl = 0.3;        ///< CFL number for time step computation.
+  /// Explicit SSPRK safety factor, or the legacy HDG stable-step multiplier.
+  mfem::real_t cfl = 0.3;
   bool glvis = false;            ///< Enable GLVis visualization.
   bool vtk_save = true;          ///< Enable ParaView/VTK output.
   bool vtk_h1_diagnostics =
@@ -214,9 +217,11 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.dt,
                  "-dt",
                  "--time-step",
-                 "Time step. Positive selects fixed stepping; nonpositive "
-                 "selects CFL for Backward Euler, while negative supplies the "
-                 "initial adaptive RODAS3 step magnitude.");
+                 "Time-step input. For explicit SSPRK, it is used only when "
+                 "--cfl-number is zero; a positive CFL safety factor takes "
+                 "precedence. For HDG, positive selects fixed stepping, "
+                 "nonpositive selects CFL for Backward Euler, and negative "
+                 "supplies the initial adaptive RODAS3 step magnitude.");
   args.AddOption(&opts.dt_min,
                  "-dtmin",
                  "--dt-min",
@@ -225,7 +230,12 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.cfl,
                  "-c",
                  "--cfl-number",
-                 "CFL number for timestep calculation.");
+                 "Explicit SSPRK CFL safety factor theta in (0,1], applied as "
+                 "dt=theta*C_SSP*h_min/((2p+1)*lambda_max); zero selects the "
+                 "fixed --time-step. This normalization does not certify a "
+                 "case's spatial stability limit. For CFL-controlled HDG "
+                 "Backward Euler, this remains the backend stable-step "
+                 "multiplier.");
   args.AddOption(&opts.glvis,
                  "-glvis",
                  "--glvis",

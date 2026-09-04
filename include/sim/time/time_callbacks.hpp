@@ -6,6 +6,7 @@
  */
 
 #include <functional>
+#include <limits>
 #include <string>
 
 namespace dg_sim
@@ -80,6 +81,18 @@ struct RunSummary
   double maximum_attempted_dt = 0.0;
   double maximum_accepted_dt = 0.0;
   double maximum_accepted_step_growth_ratio = 0.0;
+  /// Whether these CFL fields were populated from the active stepper/config.
+  bool cfl_diagnostics_observed = false;
+  /// Whether characteristic-speed CFL control was active.
+  bool cfl_control_enabled = false;
+  /// User-selected safety factor before the selected SSP method scale.
+  double cfl_safety_factor = 0.0;
+  /// SSP coefficient observed from the stepper, if it exposes one.
+  double ssp_coefficient = std::numeric_limits<double>::quiet_NaN();
+  /// Product of cfl_safety_factor and ssp_coefficient in CFL mode.
+  double ssp_scaled_cfl_factor = 0.0;
+  /// Nominal lambda_max * dt / h_min before clipping or retry reduction.
+  double nominal_global_courant = 0.0;
   bool dt_min_reached = false;
   bool success = false;
   std::string termination_reason = "not-started";

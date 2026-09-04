@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -32,6 +33,7 @@ struct TimeLoopConfig
   mfem::real_t t_final = 0.0;
   mfem::real_t dt = 0.0;
   mfem::real_t dt_min = 0.0;
+  /// User safety factor; positive enables RK/SSP-scaled CFL, zero uses fixed dt.
   mfem::real_t cfl = 0.0;
   int order = 1;
   int vis_steps = 0;
@@ -101,6 +103,19 @@ struct TimeLoopResult
     std::numeric_limits<mfem::real_t>::infinity();
   mfem::real_t maximum_characteristic_speed = 0.0;
   int characteristic_speed_probes = 0;
+  /// True after the active stepper/configuration populated the CFL diagnostics.
+  bool cfl_diagnostics_observed = false;
+  /// Whether the run used characteristic-speed CFL control instead of fixed dt.
+  bool cfl_control_enabled = false;
+  /// User-selected safety fraction before the RK/SSP stability scaling.
+  mfem::real_t cfl_safety_factor = 0.0;
+  /// SSP coefficient supplied by the explicit time integrator, when available.
+  mfem::real_t ssp_coefficient =
+    std::numeric_limits<mfem::real_t>::quiet_NaN();
+  /// Product of cfl_safety_factor and ssp_coefficient in CFL mode.
+  mfem::real_t ssp_scaled_cfl_factor = 0.0;
+  /// Nominal global lambda_max * dt / h_min after the DG order denominator.
+  mfem::real_t nominal_global_courant = 0.0;
   int non_finite_count = 0;
   bool dt_min_reached = false;
   bool success = false;
@@ -190,6 +205,38 @@ struct RHSEvaluationCounter<
   static long long Read(const StepperType& stepper)
   {
     return static_cast<long long>(stepper.GetRHSEvaluationCount());
+  }
+};
+
+/** SSP stability scale used by the factorized CFL convention.
+ *
+ * Like FLEXI, the interface keeps the user safety factor separate from the
+ * method scale.  The scale here is the formal SSP coefficient, not FLEXI's
+ * empirically calibrated RK/order factor. A stepper that exposes
+ * GetSSPCoefficient() supplies its method-specific multiplier, e.g. one for
+ * SSPRK(3,3) and six for SSPRK(10,4). CFL control fails closed when that
+ * method contract is absent; fixed-step generic steppers do not require it.
+ */
+template <typename StepperType, typename = void>
+struct RKSSPCoefficient
+{
+  static constexpr bool available = false;
+  static mfem::real_t Read(const StepperType&)
+  {
+    return std::numeric_limits<mfem::real_t>::quiet_NaN();
+  }
+};
+
+template <typename StepperType>
+struct RKSSPCoefficient<
+  StepperType,
+  std::void_t<decltype(
+    std::declval<const StepperType&>().GetSSPCoefficient())>>
+{
+  static constexpr bool available = true;
+  static mfem::real_t Read(const StepperType& stepper)
+  {
+    return static_cast<mfem::real_t>(stepper.GetSSPCoefficient());
   }
 };
 
@@ -351,6 +398,118 @@ struct AcceptedStateQSigmaAdmission<
 
 } // namespace time_loop_detail
 
+/** Populate and validate the factorized explicit-CFL diagnostics.
+ *
+ * This is shared with solver-level preflight failures so every explicit run
+ * summary describes the selected stepper using the same contract as the time
+ * loop itself.
+ */
+template <typename StepperType>
+inline void PopulateExplicitCFLDiagnostics(TimeLoopResult& result,
+                                           const TimeLoopConfig& cfg,
+                                           const StepperType& stepper)
+{
+  MFEM_VERIFY(std::isfinite(cfg.cfl) && cfg.cfl >= 0.0 && cfg.cfl <= 1.0,
+              "Explicit CFL safety factor must be finite and in [0,1].");
+  const bool uses_cfl = cfg.cfl > 0.0;
+  if (!uses_cfl)
+  {
+    MFEM_VERIFY(std::isfinite(cfg.dt) && cfg.dt > 0.0,
+                "Fixed explicit stepping requires a finite positive dt when "
+                "the CFL safety factor is zero.");
+  }
+
+  result.cfl_control_enabled = uses_cfl;
+  result.cfl_safety_factor = cfg.cfl;
+  result.ssp_scaled_cfl_factor = 0.0;
+  result.nominal_global_courant = 0.0;
+  if constexpr (
+    time_loop_detail::RKSSPCoefficient<StepperType>::available)
+  {
+    result.ssp_coefficient =
+      time_loop_detail::RKSSPCoefficient<StepperType>::Read(stepper);
+  }
+  else
+  {
+    result.ssp_coefficient =
+      std::numeric_limits<mfem::real_t>::quiet_NaN();
+  }
+
+  if (uses_cfl)
+  {
+    MFEM_VERIFY(
+      time_loop_detail::RKSSPCoefficient<StepperType>::available,
+      "Explicit CFL control requires the stepper to expose "
+      "GetSSPCoefficient().");
+    MFEM_VERIFY(cfg.order >= 0,
+                "Explicit CFL control requires a nonnegative DG order.");
+    MFEM_VERIFY(std::isfinite(result.ssp_coefficient) &&
+                  result.ssp_coefficient > 0.0,
+                "An explicit CFL stepper must report a finite positive SSP "
+                "coefficient.");
+    result.ssp_scaled_cfl_factor =
+      result.cfl_safety_factor * result.ssp_coefficient;
+    result.nominal_global_courant =
+      result.ssp_scaled_cfl_factor / (2 * cfg.order + 1);
+  }
+  result.cfl_diagnostics_observed = true;
+}
+
+/// Emit the canonical machine-readable explicit time-loop summary.
+inline void EmitExplicitTimeRunSummary(const TimeLoopResult& result,
+                                       std::ostream& out = std::cout)
+{
+  const mfem::real_t minimum_attempted_dt =
+    std::isfinite(result.minimum_attempted_dt) ? result.minimum_attempted_dt
+                                               : 0.0;
+  const mfem::real_t minimum_accepted_dt =
+    std::isfinite(result.minimum_accepted_dt) ? result.minimum_accepted_dt
+                                              : 0.0;
+  const mfem::real_t minimum_characteristic_speed =
+    std::isfinite(result.minimum_characteristic_speed)
+      ? result.minimum_characteristic_speed
+      : 0.0;
+  const std::streamsize previous_precision = out.precision();
+  out << std::setprecision(std::numeric_limits<mfem::real_t>::max_digits10)
+      << "[explicit-time] event=run-summary"
+      << " steps=" << result.steps
+      << " final_time=" << result.final_time
+      << " cfl_control_enabled="
+      << (result.cfl_control_enabled ? 1 : 0)
+      << " cfl_safety_factor=" << result.cfl_safety_factor
+      << " ssp_coefficient=" << result.ssp_coefficient
+      << " ssp_scaled_cfl_factor=" << result.ssp_scaled_cfl_factor
+      << " nominal_global_courant=" << result.nominal_global_courant
+      << " rhs_evaluations=" << result.rhs_evaluations
+      << " accepted_attempts=" << result.accepted_attempts
+      << " rejected_attempts=" << result.rejected_attempts
+      << " rejected_limiter_elements=" << result.rejected_limiter_elements
+      << " rejected_q_sigma_attempts=" << result.rejected_q_sigma_attempts
+      << " rejected_q_sigma_nonpositive_samples="
+      << result.rejected_q_sigma_nonpositive_samples
+      << " rejected_q_sigma_nonfinite_samples="
+      << result.rejected_q_sigma_nonfinite_samples
+      << " last_q_sigma_rejection_reason="
+      << result.last_q_sigma_rejection_reason
+      << " last_q_sigma_rejection_stage="
+      << result.last_q_sigma_rejection_stage
+      << " minimum_attempted_dt=" << minimum_attempted_dt
+      << " maximum_attempted_dt=" << result.maximum_attempted_dt
+      << " minimum_accepted_dt=" << minimum_accepted_dt
+      << " maximum_accepted_dt=" << result.maximum_accepted_dt
+      << " maximum_accepted_step_growth_ratio="
+      << result.maximum_accepted_step_growth_ratio
+      << " characteristic_speed_probes="
+      << result.characteristic_speed_probes
+      << " minimum_characteristic_speed=" << minimum_characteristic_speed
+      << " maximum_characteristic_speed="
+      << result.maximum_characteristic_speed
+      << " dt_min_reached=" << (result.dt_min_reached ? 1 : 0)
+      << " success=" << (result.success ? 1 : 0)
+      << " termination_reason=" << result.termination_reason << '\n';
+  out.precision(previous_precision);
+}
+
 inline mfem::real_t ComputeGlobalHMin(mfem::ParMesh& pmesh)
 {
   mfem::real_t hmin = mfem::infinity();
@@ -371,7 +530,7 @@ template <typename OperatorType>
 mfem::real_t ComputeCFLDt(OperatorType& op,
                           mfem::ParMesh& pmesh,
                           mfem::ParGridFunction& sol,
-                          mfem::real_t cfl,
+                          mfem::real_t ssp_scaled_cfl_factor,
                           int order,
                           mfem::real_t hmin,
                           mfem::real_t* global_max_char_speed = nullptr)
@@ -394,9 +553,9 @@ mfem::real_t ComputeCFLDt(OperatorType& op,
 
   if (max_char_speed <= 0.0)
   {
-    return cfl * hmin / (2 * order + 1);
+    return ssp_scaled_cfl_factor * hmin / (2 * order + 1);
   }
-  return cfl * hmin / max_char_speed / (2 * order + 1);
+  return ssp_scaled_cfl_factor * hmin / max_char_speed / (2 * order + 1);
 }
 
 template <typename OperatorType, typename StepperType>
@@ -409,6 +568,8 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
 {
   TimeLoopResult result;
   result.termination_reason = "running";
+  PopulateExplicitCFLDiagnostics(result, cfg, stepper);
+  const bool uses_cfl = result.cfl_control_enabled;
   MFEM_VERIFY(cfg.initial_step >= 0, "Initial global step must be nonnegative.");
   MFEM_VERIFY(std::isfinite(cfg.initial_time), "Initial time must be finite.");
   MFEM_VERIFY(cfg.t_final >= cfg.initial_time,
@@ -421,11 +582,11 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
   MPI_Comm_rank(pmesh.GetComm(), &communicator_rank);
   const bool communicator_root = communicator_rank == 0;
   time_loop_detail::InvariantDomainVolumeSpeedTracking<OperatorType>::Configure(
-    op, cfg.cfl > 0.0);
+    op, uses_cfl);
   time_loop_detail::AcceptedCharacteristicSpeed<StepperType,
                                                 OperatorType>::Bind(stepper,
                                                                     op,
-                                                                    cfg.cfl > 0.0);
+                                                                    uses_cfl);
   const mfem::real_t dt_min = std::max<mfem::real_t>(0.0, cfg.dt_min);
   const char* dt_trace_text = std::getenv("DG_IGR_TIME_DT_TRACE");
   const bool trace_nominal_dt =
@@ -532,20 +693,27 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
                 << initial_q_sigma_nonpositive
                 << " nonfinite_samples=" << initial_q_sigma_nonfinite
                 << " rhs_evaluations=0\n";
+      EmitExplicitTimeRunSummary(result);
     }
     return result;
   }
 
   mfem::real_t dt = cfg.dt;
   mfem::real_t hmin = mfem::infinity();
-  const long long cfl_probe_rhs_evaluations = cfg.cfl > 0.0 ? 1 : 0;
+  const long long cfl_probe_rhs_evaluations = uses_cfl ? 1 : 0;
   result.rhs_evaluations = cfl_probe_rhs_evaluations;
-  if (cfg.cfl > 0.0)
+  if (uses_cfl)
   {
     hmin = ComputeGlobalHMin(pmesh);
     mfem::real_t max_char_speed = 0.0;
     dt = ComputeCFLDt(
-      op, pmesh, sol, cfg.cfl, cfg.order, hmin, &max_char_speed);
+      op,
+      pmesh,
+      sol,
+      result.ssp_scaled_cfl_factor,
+      cfg.order,
+      hmin,
+      &max_char_speed);
     result.minimum_characteristic_speed = max_char_speed;
     result.maximum_characteristic_speed = max_char_speed;
     result.characteristic_speed_probes = 1;
@@ -572,6 +740,10 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
                /*is_final=*/true,
                /*suppress_duplicate_time=*/true);
     }
+    if (communicator_root)
+    {
+      EmitExplicitTimeRunSummary(result);
+    }
     return result;
   }
   if (CheckDtMinimum(dt, "before-time-loop"))
@@ -582,6 +754,10 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
              save_idx,
              /*is_final=*/true,
              /*suppress_duplicate_time=*/true);
+    if (communicator_root)
+    {
+      EmitExplicitTimeRunSummary(result);
+    }
     return result;
   }
   mfem::real_t t_next_save =
@@ -874,7 +1050,7 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       1.0e-12 * std::max<mfem::real_t>(1.0, std::abs(cfg.t_final));
     const bool accepted_reached_target =
       t >= cfg.t_final - completion_tolerance;
-    if (cfg.cfl > 0.0)
+    if (uses_cfl)
     {
       mfem::real_t max_char_speed =
         time_loop_detail::AcceptedCharacteristicSpeed<StepperType,
@@ -893,11 +1069,12 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
       ++result.characteristic_speed_probes;
       if (!accepted_reached_target && max_char_speed > 0.0)
       {
-        dt = cfg.cfl * hmin / max_char_speed / (2 * cfg.order + 1);
+        dt = result.ssp_scaled_cfl_factor * hmin / max_char_speed /
+             (2 * cfg.order + 1);
       }
       else if (!accepted_reached_target)
       {
-        dt = cfg.cfl * hmin / (2 * cfg.order + 1);
+        dt = result.ssp_scaled_cfl_factor * hmin / (2 * cfg.order + 1);
       }
       if (!accepted_reached_target)
       {
@@ -1022,52 +1199,7 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
   }
   if (communicator_root)
   {
-    const mfem::real_t minimum_attempted_dt =
-      std::isfinite(result.minimum_attempted_dt)
-        ? result.minimum_attempted_dt
-        : 0.0;
-    const mfem::real_t minimum_accepted_dt =
-      std::isfinite(result.minimum_accepted_dt)
-        ? result.minimum_accepted_dt
-        : 0.0;
-    const mfem::real_t minimum_characteristic_speed =
-      std::isfinite(result.minimum_characteristic_speed)
-        ? result.minimum_characteristic_speed
-        : 0.0;
-    std::cout << "[explicit-time] event=run-summary"
-              << " steps=" << result.steps
-              << " final_time=" << result.final_time
-              << " rhs_evaluations=" << result.rhs_evaluations
-              << " accepted_attempts=" << result.accepted_attempts
-              << " rejected_attempts=" << result.rejected_attempts
-              << " rejected_limiter_elements="
-              << result.rejected_limiter_elements
-              << " rejected_q_sigma_attempts="
-              << result.rejected_q_sigma_attempts
-              << " rejected_q_sigma_nonpositive_samples="
-              << result.rejected_q_sigma_nonpositive_samples
-              << " rejected_q_sigma_nonfinite_samples="
-              << result.rejected_q_sigma_nonfinite_samples
-              << " last_q_sigma_rejection_reason="
-              << result.last_q_sigma_rejection_reason
-              << " last_q_sigma_rejection_stage="
-              << result.last_q_sigma_rejection_stage
-              << " minimum_attempted_dt=" << minimum_attempted_dt
-              << " maximum_attempted_dt=" << result.maximum_attempted_dt
-              << " minimum_accepted_dt=" << minimum_accepted_dt
-              << " maximum_accepted_dt=" << result.maximum_accepted_dt
-              << " maximum_accepted_step_growth_ratio="
-              << result.maximum_accepted_step_growth_ratio
-              << " characteristic_speed_probes="
-              << result.characteristic_speed_probes
-              << " minimum_characteristic_speed="
-              << minimum_characteristic_speed
-              << " maximum_characteristic_speed="
-              << result.maximum_characteristic_speed
-              << " dt_min_reached=" << (result.dt_min_reached ? 1 : 0)
-              << " success=" << (result.success ? 1 : 0)
-              << " termination_reason=" << result.termination_reason
-              << "\n";
+    EmitExplicitTimeRunSummary(result);
   }
   return result;
 }

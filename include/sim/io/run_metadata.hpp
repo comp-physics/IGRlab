@@ -12,6 +12,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 
@@ -188,7 +190,7 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
 
   out << std::setprecision(17);
   out << "{\n";
-  out << "  \"schema_version\": 2,\n";
+  out << "  \"schema_version\": 3,\n";
   out << "  \"timestamp_utc\": "
       << detail::ToJsonString(detail::ISO8601NowUTC()) << ",\n";
   out << "  \"status\": {\n";
@@ -316,7 +318,81 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << detail::ToJsonString(run_cfg.opts.zhang_shu_points) << ",\n";
   out << "    \"zhang_shu_vtk_points\": "
       << (run_cfg.opts.zhang_shu_vtk_points ? "true" : "false") << ",\n";
+  const std::optional<mfem::real_t> configured_ssp_coefficient =
+    SSPCoefficientForTimeIntegrator(run_cfg.time_integrator);
+  const bool explicit_ssprk = configured_ssp_coefficient.has_value();
+  const bool cfl_diagnostics_observed =
+    explicit_ssprk && summary != nullptr && summary->cfl_diagnostics_observed;
+  const bool cfl_control_enabled =
+    explicit_ssprk &&
+    (cfl_diagnostics_observed ? summary->cfl_control_enabled
+                              : run_cfg.opts.cfl > 0.0);
+  const mfem::real_t cfl_safety_factor =
+    explicit_ssprk
+      ? (cfl_diagnostics_observed ? summary->cfl_safety_factor
+                                  : run_cfg.opts.cfl)
+      : std::numeric_limits<mfem::real_t>::quiet_NaN();
+  const mfem::real_t ssp_coefficient =
+    explicit_ssprk
+      ? (cfl_diagnostics_observed ? summary->ssp_coefficient
+                                  : *configured_ssp_coefficient)
+      : std::numeric_limits<mfem::real_t>::quiet_NaN();
+  const mfem::real_t ssp_scaled_cfl_factor =
+    cfl_control_enabled
+      ? (cfl_diagnostics_observed ? summary->ssp_scaled_cfl_factor
+                                  : cfl_safety_factor * ssp_coefficient)
+      : std::numeric_limits<mfem::real_t>::quiet_NaN();
+  const mfem::real_t nominal_global_courant =
+    cfl_control_enabled
+      ? (cfl_diagnostics_observed
+           ? summary->nominal_global_courant
+           : (run_cfg.opts.order >= 0
+                ? ssp_scaled_cfl_factor /
+                    static_cast<mfem::real_t>(2 * run_cfg.opts.order + 1)
+                : std::numeric_limits<mfem::real_t>::quiet_NaN()))
+      : std::numeric_limits<mfem::real_t>::quiet_NaN();
+  // Retain the historical raw-option key. In metadata schema 3 it is the
+  // direct --cfl-number input; the explicit SSPRK factors below remove the
+  // ambiguity present in older schemas.
   out << "    \"cfl\": " << run_cfg.opts.cfl << ",\n";
+  out << "    \"cfl_field_semantics\": "
+      << detail::ToJsonString(
+           explicit_ssprk ? "integrator-normalized-safety-factor"
+                          : "backend-specific-raw-input")
+      << ",\n";
+  out << "    \"cfl_control_enabled\": "
+      << (cfl_control_enabled ? "true" : "false") << ",\n";
+  out << "    \"cfl_safety_factor\": "
+      << detail::ToJsonNumber(cfl_safety_factor)
+      << ",\n";
+  out << "    \"ssp_coefficient\": "
+      << detail::ToJsonNumber(ssp_coefficient)
+      << ",\n";
+  out << "    \"ssp_scaled_cfl_factor\": "
+      << detail::ToJsonNumber(ssp_scaled_cfl_factor) << ",\n";
+  out << "    \"nominal_global_courant\": "
+      << detail::ToJsonNumber(nominal_global_courant) << ",\n";
+  out << "    \"cfl_diagnostics_observed\": "
+      << (cfl_diagnostics_observed ? "true" : "false") << ",\n";
+  out << "    \"cfl_diagnostics_source\": "
+      << detail::ToJsonString(
+           cfl_diagnostics_observed
+             ? "run-summary"
+             : (explicit_ssprk ? "requested-config" : "not-applicable"))
+      << ",\n";
+  out << "    \"cfl_convention\": "
+      << detail::ToJsonString(
+           cfl_control_enabled
+             ? "explicit-ssprk-safety-factor"
+             : (explicit_ssprk ? "explicit-fixed-step" : "backend-specific"))
+      << ",\n";
+  out << "    \"cfl_formula\": "
+      << (cfl_control_enabled
+            ? detail::ToJsonString(
+                "dt=cfl_safety_factor*ssp_coefficient*h_min/"
+                "((2p+1)*lambda_max)")
+            : "null")
+      << ",\n";
   out << "    \"dt\": " << run_cfg.opts.dt << ",\n";
   out << "    \"dt_min\": " << run_cfg.opts.dt_min << ",\n";
   out << "    \"t_final\": " << run_cfg.opts.t_final << ",\n";

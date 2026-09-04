@@ -31,7 +31,9 @@ from shock_architecture_matrix import (  # noqa: E402
     HarnessControls,
     ShockArchitectureError,
     _argument_parser,
+    _controls_from_arguments,
     aggregate_runs,
+    assess_explicit_cfl_normalization,
     build_method_arguments,
     campaign_child_environment,
     capture_file_identity,
@@ -84,11 +86,11 @@ def controls(*, device: str = "cuda", vtk: bool = False,
             DGSEM_SSPRK104_EVERY_STAGE: 4.0e-4,
             DGSEM_SSPRK104_EXTRAPOLATED: 5.0e-4,
         },
-        explicit_cfl_by_method={
+        explicit_cfl_safety_factor_by_method={
             DG_RK3SSP: 0.5,
-            DG_SSPRK104: 1.0,
-            DGSEM_SSPRK104_EVERY_STAGE: 2.0,
-            DGSEM_SSPRK104_EXTRAPOLATED: 3.0,
+            DG_SSPRK104: 1.0 / 6.0,
+            DGSEM_SSPRK104_EVERY_STAGE: 2.0 / 6.0,
+            DGSEM_SSPRK104_EXTRAPOLATED: 0.5,
         },
         dt_min=1.0e-10,
         igr_linear_rtol=1.0e-5,
@@ -363,7 +365,7 @@ class ScheduleAndCardTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     float(option_value(arguments, "--cfl-number")),
-                    controls().explicit_cfl_by_method[method],
+                    controls().explicit_cfl_safety_factor_by_method[method],
                 )
 
     def test_selected_dgsem_cards_pin_exact_transport_and_closure_tuple(
@@ -421,7 +423,7 @@ class ScheduleAndCardTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     float(option_value(arguments, "--cfl-number")),
-                    local.explicit_cfl_by_method[method],
+                    local.explicit_cfl_safety_factor_by_method[method],
                 )
 
     def test_q_sigma_contract_is_method_specific(self) -> None:
@@ -599,29 +601,62 @@ class ScheduleAndCardTests(unittest.TestCase):
     def test_per_method_explicit_overrides_are_strict(self) -> None:
         values = parse_method_float_overrides(
             ("dg-rk3ssp=0.4",),
-            option_name="--method-explicit-cfl", default=0.5,
-            allow_zero=True,
+            option_name="--method-explicit-cfl-safety-factor", default=0.5,
+            allow_zero=True, maximum=1.0,
         )
         self.assertEqual(values[DG_RK3SSP], 0.4)
         self.assertEqual(values[DG_SSPRK104], 0.5)
         self.assertEqual(values[DGSEM_SSPRK104_EVERY_STAGE], 0.5)
         self.assertEqual(values[DGSEM_SSPRK104_EXTRAPOLATED], 0.5)
         fixed = parse_method_float_overrides(
-            ("dg-ssprk104=0",), option_name="--method-explicit-cfl",
-            default=0.5, allow_zero=True,
+            ("dg-ssprk104=0",),
+            option_name="--method-explicit-cfl-safety-factor",
+            default=0.5, allow_zero=True, maximum=1.0,
         )
         self.assertEqual(fixed[DG_SSPRK104], 0.0)
         for override, message in (
             ("hdg-rodas3-tensor=1", "must be one of"),
             ("dg-rk3ssp=bad", "numeric"),
             ("dg-rk3ssp=-1", "nonnegative"),
+            ("dg-ssprk104=1.01", "at most 1"),
         ):
             with self.subTest(override=override), self.assertRaisesRegex(
                     ShockArchitectureError, message):
                 parse_method_float_overrides(
-                    (override,), option_name="--method-explicit-cfl",
-                    default=0.5, allow_zero=True,
+                    (override,),
+                    option_name="--method-explicit-cfl-safety-factor",
+                    default=0.5, allow_zero=True, maximum=1.,
                 )
+
+    def test_explicit_cfl_safety_factor_cli_rejects_ambiguous_old_names(
+            self) -> None:
+        base = [
+            "--executable", "/app", "--mesh", "/mesh",
+            "--output-dir", "/output", "--methods", DG_SSPRK104,
+            "--final-time", "0.2",
+        ]
+        parser = _argument_parser()
+        canonical = parser.parse_args([
+            *base,
+            "--explicit-cfl-safety-factor", "1",
+            "--method-explicit-cfl-safety-factor", "dg-ssprk104=0.5",
+        ])
+        self.assertEqual(canonical.explicit_cfl_safety_factor, 1.0)
+        self.assertEqual(
+            canonical.method_explicit_cfl_safety_factor,
+            ["dg-ssprk104=0.5"],
+        )
+        for old_option, old_value in (
+                ("--explicit-cfl", "0.75"),
+                ("--method-explicit-cfl", "dg-ssprk104=0.25")):
+            with self.subTest(old_option=old_option), \
+                    self.assertRaises(SystemExit):
+                parser.parse_args([*base, old_option, old_value])
+        with self.assertRaisesRegex(ShockArchitectureError, r"\[0,1\]"):
+            invalid = parser.parse_args([
+                *base, "--explicit-cfl-safety-factor", "6",
+            ])
+            _controls_from_arguments(invalid, (DG_SSPRK104,))
 
 
 class SyntheticLogParserTests(unittest.TestCase):
@@ -648,7 +683,7 @@ class SyntheticLogParserTests(unittest.TestCase):
 steps (cumulative/segment): 32 / 32 | elapsed: 4.250000 s
 time (initial/final): 0.000000 / 0.200000
 [explicit-retry] event=run-summary accepted_attempts=999 rejected_attempts=999 minimum_accepted_dt=9
-[explicit-time] event=run-summary steps=32 final_time=0.2 rhs_evaluations=103 accepted_attempts=32 rejected_attempts=2 rejected_limiter_elements=7 rejected_q_sigma_attempts=1 rejected_q_sigma_nonpositive_samples=3 rejected_q_sigma_nonfinite_samples=0 last_q_sigma_rejection_reason=q-sigma-nonpositive last_q_sigma_rejection_stage=6 characteristic_speed_probes=35 minimum_characteristic_speed=2.25 maximum_characteristic_speed=19.5 minimum_attempted_dt=0.00025 maximum_attempted_dt=0.002 minimum_accepted_dt=0.0005 maximum_accepted_dt=0.001 maximum_accepted_step_growth_ratio=1.75 dt_min_reached=0 success=1 termination_reason=target-reached
+[explicit-time] event=run-summary steps=32 final_time=0.2 cfl_control_enabled=1 cfl_safety_factor=0.5 ssp_coefficient=1 ssp_scaled_cfl_factor=0.5 nominal_global_courant=0.1 rhs_evaluations=103 accepted_attempts=32 rejected_attempts=2 rejected_limiter_elements=7 rejected_q_sigma_attempts=1 rejected_q_sigma_nonpositive_samples=3 rejected_q_sigma_nonfinite_samples=0 last_q_sigma_rejection_reason=q-sigma-nonpositive last_q_sigma_rejection_stage=6 characteristic_speed_probes=35 minimum_characteristic_speed=2.25 maximum_characteristic_speed=19.5 minimum_attempted_dt=0.00025 maximum_attempted_dt=0.002 minimum_accepted_dt=0.0005 maximum_accepted_dt=0.001 maximum_accepted_step_growth_ratio=1.75 dt_min_reached=0 success=1 termination_reason=target-reached
 [igr-closure-certificate] event=accepted-state scope=final-committed-accepted-state precision=fp64 time=0.2 state_generation=32 solved=1 supported=1 certified=1 residual_rel_rhs=2.5e-8 run_success=1 residual_abs=1e-9 relative_limit=5e-5 absolute_limit=0 skipped_nonfinite=0
 [explicit-conservation] event=accepted-trajectory supported=1 source_supported=1 components=4 domain_measure=2 initial=1,2,3,4 final=1.1,2.2,3.3,4.4 boundary_flux=-0.1,-0.2,-0.3,-0.4 boundary_flux_scale=0.2,0.3,0.4,0.5 defect=1e-14,2e-14,3e-14,4e-14 relative_defect=1e-15,2e-15,3e-15,4e-15 maximum_absolute_error=4e-14 maximum_relative_error=4e-15 accepted_attempts=32 rejected_attempts=2 run_success=1
 [explicit-time] event=final-status final_time=0.2 success=1 termination_reason=target-reached
@@ -703,6 +738,15 @@ ARCHITECTURE_SELECTION_POINT nonlinear_updates=0 linear_iterations=420 trace_sol
         self.assertEqual(
             parsed["explicit_time"]["maximum_characteristic_speed"], 19.5
         )
+        self.assertEqual(parsed["explicit_time"]["cfl_safety_factor"], 0.5)
+        self.assertIs(parsed["explicit_time"]["cfl_control_enabled"], True)
+        self.assertEqual(parsed["explicit_time"]["ssp_coefficient"], 1.0)
+        self.assertEqual(
+            parsed["explicit_time"]["ssp_scaled_cfl_factor"], 0.5
+        )
+        self.assertEqual(
+            parsed["explicit_time"]["nominal_global_courant"], 0.1
+        )
         self.assertEqual(parsed["explicit_time"]["maximum_accepted_dt"], 0.001)
         self.assertEqual(
             parsed["explicit_time"]["maximum_accepted_step_growth_ratio"],
@@ -715,6 +759,7 @@ ARCHITECTURE_SELECTION_POINT nonlinear_updates=0 linear_iterations=420 trace_sol
         self.assertTrue(parsed["closure_certificate"]["certified"])
         self.assertTrue(parsed["closure_certificate"]["supported"])
         self.assertTrue(parsed["closure_certificate"]["run_success"])
+
         self.assertEqual(
             parsed["closure_certificate"]["residual_rel_rhs"], 2.5e-8
         )
@@ -820,6 +865,41 @@ ARCHITECTURE_SELECTION_POINT nonlinear_updates=0 linear_iterations=420 trace_sol
             "element_call_opportunities",
         )
         self.assertEqual(parsed["architecture_work"]["positivity_limited_elements"], 70)
+
+    def test_explicit_cfl_normalization_detects_double_or_missing_scaling(
+            self) -> None:
+        telemetry = {
+            "run_summary_reported": True,
+            "cfl_control_enabled": True,
+            "cfl_safety_factor": 0.5,
+            "ssp_coefficient": 6.0,
+            "ssp_scaled_cfl_factor": 3.0,
+            "nominal_global_courant": 1.0,
+        }
+        passed = assess_explicit_cfl_normalization(
+            DG_SSPRK104, telemetry, 0.5, 1
+        )
+        self.assertTrue(passed["passed"])
+        double_scaled = dict(telemetry, ssp_scaled_cfl_factor=18.0)
+        self.assertFalse(assess_explicit_cfl_normalization(
+            DG_SSPRK104, double_scaled, 0.5, 1
+        )["passed"])
+        missing = dict(telemetry)
+        missing.pop("ssp_coefficient")
+        self.assertFalse(assess_explicit_cfl_normalization(
+            DG_SSPRK104, missing, 0.5, 1
+        )["passed"])
+        parsed = parse_application_log(
+            "[explicit-time] event=run-summary "
+            "cfl_control_enabled=1 "
+            "cfl_safety_factor=0.16666666666666666 "
+            "ssp_coefficient=6 ssp_scaled_cfl_factor=1 "
+            "nominal_global_courant=0.33333333333333331\n",
+            DG_SSPRK104,
+        )
+        self.assertTrue(assess_explicit_cfl_normalization(
+            DG_SSPRK104, parsed["explicit_time"], 1.0 / 6.0, 1
+        )["passed"])
 
     def test_q_sigma_parser_keeps_missing_or_nonfinite_minima_nullable(
             self) -> None:
@@ -1716,6 +1796,9 @@ class OutcomeAndReportTests(unittest.TestCase):
                 "final_time": 0.2,
                 "c_alpha": 1.0,
                 "alpha_length_policy": "max",
+                "explicit_cfl_safety_factor_by_method": {
+                    DG_RK3SSP: 0.5,
+                },
             },
             "provenance": {
                 "git": {"commit": "a" * 40, "tree": "b" * 40,
@@ -1736,6 +1819,8 @@ class OutcomeAndReportTests(unittest.TestCase):
         }
         markdown = render_markdown(report)
         self.assertIn("right-censored", markdown)
+        self.assertIn("CFL controls are safety factors", markdown)
+        self.assertIn("`dg-rk3ssp` = `0.5`", markdown)
         self.assertIn("| censored |", markdown)
         self.assertNotIn("Median exec time to solution (s) | 9", markdown)
         self.assertIn("## Explicit DG/DGSEM limiter aggregates", markdown)
@@ -1792,6 +1877,9 @@ class ProcessAndProvenanceIntegrationTests(unittest.TestCase):
                 """#!/usr/bin/env python3
 print("time (initial/final): 0 / 0.2")
 print("[explicit-time] event=run-summary steps=2 final_time=0.2 "
+      "cfl_control_enabled=1 cfl_safety_factor=0.5 "
+      "ssp_coefficient=1 ssp_scaled_cfl_factor=0.5 "
+      "nominal_global_courant=0.1 "
       "rhs_evaluations=7 accepted_attempts=2 rejected_attempts=0 "
       "rejected_limiter_elements=0 minimum_attempted_dt=0.1 "
       "maximum_attempted_dt=0.1 minimum_accepted_dt=0.1 "
@@ -1860,7 +1948,20 @@ print(json.dumps({"shock_position": 1.0}))
             report = run_campaign(arguments)
 
             self.assertEqual(report["schema_version"], SCHEMA_VERSION)
-            self.assertEqual(SCHEMA_VERSION, 3)
+            self.assertEqual(SCHEMA_VERSION, 4)
+            safety_factors = {
+                DG_RK3SSP: 0.5,
+            }
+            self.assertEqual(
+                report["controls"]
+                ["explicit_cfl_safety_factor_by_method"],
+                safety_factors,
+            )
+            self.assertNotIn("explicit_cfl_by_method", report["controls"])
+            self.assertEqual(
+                report["controls"]["explicit_cfl_control"]["semantics"],
+                "integrator-normalized-safety-factor",
+            )
             self.assertTrue(report["controls"]["zhang_shu_vtk_points"])
             self.assertEqual(
                 report["provenance"]["typed_application_controls"]

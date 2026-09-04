@@ -40,7 +40,7 @@ from typing import Any, Mapping, Sequence
 sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[2]
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 REPORT_JSON = "shock-architecture-selection.json"
 REPORT_MARKDOWN = "shock-architecture-selection.md"
 DEFAULT_TIME_PROGRAM = "/usr/bin/time"
@@ -97,6 +97,12 @@ METHOD_INTEGRATORS = {
     DGSEM_SSPRK104_EXTRAPOLATED: "ssprk104",
     HDG_RODAS3_ORDINARY: "rodas3",
     HDG_RODAS3_TENSOR: "rodas3",
+}
+METHOD_SSP_COEFFICIENTS = {
+    DG_RK3SSP: 1.0,
+    DG_SSPRK104: 6.0,
+    DGSEM_SSPRK104_EVERY_STAGE: 6.0,
+    DGSEM_SSPRK104_EXTRAPOLATED: 6.0,
 }
 METHOD_ENGINES = {
     HDG_RODAS3_ORDINARY: "ordinary",
@@ -213,6 +219,11 @@ EXPLICIT_TIME_FLOAT_FIELDS = (
     "minimum_accepted_dt", "maximum_accepted_dt",
     "maximum_accepted_step_growth_ratio",
     "minimum_characteristic_speed", "maximum_characteristic_speed",
+    "cfl_safety_factor", "ssp_coefficient", "ssp_scaled_cfl_factor",
+    "nominal_global_courant",
+)
+EXPLICIT_TIME_BOOLEAN_FIELDS = (
+    "cfl_control_enabled", "dt_min_reached", "success",
 )
 HDG_INTEGER_FIELDS = (
     "step", "output_cycle", "fallback_count", "rejected_attempts",
@@ -269,7 +280,7 @@ class HarnessControls:
     closure_certificate_max_relative_residual: float
     closure_certificate_max_absolute_residual: float
     explicit_dt_by_method: Mapping[str, float]
-    explicit_cfl_by_method: Mapping[str, float]
+    explicit_cfl_safety_factor_by_method: Mapping[str, float]
     dt_min: float
     igr_linear_rtol: float
     igr_linear_atol: float
@@ -309,6 +320,13 @@ def _finite_nonnegative(value: float, name: str) -> float:
     converted = float(value)
     if not math.isfinite(converted) or converted < 0.0:
         raise ShockArchitectureError(f"{name} must be finite and nonnegative")
+    return converted
+
+
+def _finite_unit_interval(value: float, name: str) -> float:
+    converted = _finite_nonnegative(value, name)
+    if converted > 1.0:
+        raise ShockArchitectureError(f"{name} must be in [0,1]")
     return converted
 
 
@@ -424,7 +442,9 @@ def build_method_arguments(
             "--time-step",
             format(controls.explicit_dt_by_method[method], ".17g"),
             "--cfl-number",
-            format(controls.explicit_cfl_by_method[method], ".17g"),
+            format(
+                controls.explicit_cfl_safety_factor_by_method[method], ".17g"
+            ),
             "--igr-space", "L2",
             "--igr-grad", "BrokenL2",
             "--igr-solve-mode", "krylov",
@@ -742,7 +762,7 @@ def parse_application_log(log: str, method: str) -> dict[str, Any]:
         integer_names=EXPLICIT_TIME_INTEGER_FIELDS,
         float_names=EXPLICIT_TIME_FLOAT_FIELDS,
         text_names=("termination_reason", "last_q_sigma_rejection_reason"),
-        boolean_names=("dt_min_reached", "success"),
+        boolean_names=EXPLICIT_TIME_BOOLEAN_FIELDS,
     )
     explicit_time["source_marker"] = (
         "explicit-time-final-status" if explicit_final_rows else
@@ -1150,6 +1170,54 @@ def classify_execution(
     }
 
 
+def assess_explicit_cfl_normalization(
+        method: str, explicit_time: Mapping[str, Any],
+        requested_safety_factor: float, order: int) -> dict[str, Any]:
+    """Check that the application applied the selected SSP scale exactly once."""
+    if method not in EXPLICIT_METHODS:
+        return {"required": False, "passed": True}
+    coefficient = METHOD_SSP_COEFFICIENTS[method]
+    enabled = requested_safety_factor > 0.0
+    scaled_factor = requested_safety_factor * coefficient if enabled else 0.0
+    nominal_courant = scaled_factor / float(2 * order + 1) if enabled else 0.0
+    observed_safety = _as_float(explicit_time.get("cfl_safety_factor"))
+    observed_coefficient = _as_float(explicit_time.get("ssp_coefficient"))
+    observed_scaled = _as_float(
+        explicit_time.get("ssp_scaled_cfl_factor")
+    )
+    observed_courant = _as_float(
+        explicit_time.get("nominal_global_courant")
+    )
+    observed_enabled = explicit_time.get("cfl_control_enabled")
+
+    def close(observed: float | None, expected: float) -> bool:
+        return observed is not None and math.isclose(
+            observed, expected, rel_tol=1.0e-12, abs_tol=1.0e-14
+        )
+
+    passed = (
+        explicit_time.get("run_summary_reported") is True and
+        observed_enabled is enabled and
+        close(observed_safety, requested_safety_factor) and
+        close(observed_coefficient, coefficient) and
+        close(observed_scaled, scaled_factor) and
+        close(observed_courant, nominal_courant)
+    )
+    return {
+        "required": True,
+        "passed": passed,
+        "requested_safety_factor": requested_safety_factor,
+        "expected_ssp_coefficient": coefficient,
+        "expected_ssp_scaled_cfl_factor": scaled_factor,
+        "expected_nominal_global_courant": nominal_courant,
+        "observed_cfl_control_enabled": observed_enabled,
+        "observed_cfl_safety_factor": observed_safety,
+        "observed_ssp_coefficient": observed_coefficient,
+        "observed_ssp_scaled_cfl_factor": observed_scaled,
+        "observed_nominal_global_courant": observed_courant,
+    }
+
+
 def parse_qoi_requirements(values: Sequence[str]) -> dict[str, dict[str, float]]:
     """Parse FIELD=REFERENCE:ABS_TOL caller-selected quality gates."""
     result: dict[str, dict[str, float]] = {}
@@ -1198,6 +1266,7 @@ def evaluate_quality(
         scalar_closure: Mapping[str, Any] | None = None,
         scalar_lifecycle: Mapping[str, Any] | None = None,
         explicit_time: Mapping[str, Any] | None = None,
+        cfl_normalization: Mapping[str, Any] | None = None,
         frozen_sigma_telemetry: Mapping[str, Any] | None = None,
         required_q_sigma_evidence_scope: str | None = None,
         closure_certificate_max_relative_residual: float = 1.0e-7,
@@ -1244,6 +1313,16 @@ def evaluate_quality(
             "requirements": {},
         }
     if method in EXPLICIT_METHODS:
+        if (cfl_normalization is not None and
+                cfl_normalization.get("passed") is not True):
+            return {
+                "mode": "qualification",
+                "status": "failed",
+                "qualified": False,
+                "reason": "invalid_explicit_cfl_normalization",
+                "requirements": {},
+                "cfl_normalization": dict(cfl_normalization),
+            }
         if not closure_certificate.get("reported"):
             return {
                 "mode": "qualification",
@@ -2149,7 +2228,7 @@ def parse_key_value_arguments(
 
 def parse_method_float_overrides(
         values: Sequence[str], *, option_name: str, default: float,
-        allow_zero: bool) -> dict[str, float]:
+        allow_zero: bool, maximum: float | None = None) -> dict[str, float]:
     """Parse METHOD=VALUE overrides for the explicit integrators."""
     result = {method: float(default) for method in EXPLICIT_METHODS}
     seen: set[str] = set()
@@ -2180,6 +2259,10 @@ def parse_method_float_overrides(
             raise ShockArchitectureError(
                 f"{option_name} value for {method} must be finite and "
                 f"{qualifier}"
+            )
+        if maximum is not None and converted > maximum:
+            raise ShockArchitectureError(
+                f"{option_name} value for {method} must be at most {maximum:g}"
             )
         result[method] = converted
         seen.add(method)
@@ -2355,6 +2438,14 @@ def _markdown_value(value: Any, precision: int = 6) -> str:
 def render_markdown(report: Mapping[str, Any]) -> str:
     provenance = report["provenance"]
     controls = report["controls"]
+    explicit_cfl_safety_factors = controls.get(
+        "explicit_cfl_safety_factor_by_method",
+        controls.get("explicit_cfl_by_method", {}),
+    )
+    explicit_cfl_summary = ", ".join(
+        f"`{method}` = `{_markdown_value(value)}`"
+        for method, value in explicit_cfl_safety_factors.items()
+    ) if explicit_cfl_safety_factors else "none selected"
     qoi_input_files = provenance.get("qoi_input_files", [])
     qoi_input_summary = ", ".join(
         f"`{item['option']}` = `{item['file']['path']}` "
@@ -2383,6 +2474,11 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         f"C_alpha: `{controls['c_alpha']}`; legacy-DG/HDG h_eff policy: "
         f"`{controls['alpha_length_policy']}`. Selected DGSEM cards pin "
         "the element-local h_eff policy.",
+        "",
+        "Explicit SSPRK CFL controls are safety factors in `[0,1]`; the "
+        "application applies each integrator's SSP coefficient exactly once. "
+        "This normalization is not a case-level stability certificate. "
+        f"Configured factors: {explicit_cfl_summary}.",
         "",
         "Execution success means a zero application exit code and observed "
         "arrival at the target horizon. Quality qualification is reported "
@@ -2725,18 +2821,22 @@ def _controls_from_arguments(
         arguments: argparse.Namespace, methods: Sequence[str]) -> HarnessControls:
     final_time = _finite_positive(arguments.final_time, "--final-time")
     explicit_dt = _finite_positive(arguments.explicit_dt, "--explicit-dt")
-    explicit_cfl = _finite_nonnegative(arguments.explicit_cfl, "--explicit-cfl")
+    explicit_cfl_safety_factor = _finite_unit_interval(
+        arguments.explicit_cfl_safety_factor,
+        "--explicit-cfl-safety-factor",
+    )
     explicit_dt_by_method = parse_method_float_overrides(
         arguments.method_explicit_dt,
         option_name="--method-explicit-dt",
         default=explicit_dt,
         allow_zero=False,
     )
-    explicit_cfl_by_method = parse_method_float_overrides(
-        arguments.method_explicit_cfl,
-        option_name="--method-explicit-cfl",
-        default=explicit_cfl,
+    explicit_cfl_safety_factor_by_method = parse_method_float_overrides(
+        arguments.method_explicit_cfl_safety_factor,
+        option_name="--method-explicit-cfl-safety-factor",
+        default=explicit_cfl_safety_factor,
         allow_zero=True,
+        maximum=1.0,
     )
     dt_min = _finite_positive(arguments.dt_min, "--dt-min")
     rodas_initial_dt = _finite_positive(
@@ -2779,7 +2879,9 @@ def _controls_from_arguments(
             "--closure-certificate-max-absolute-residual",
         ),
         explicit_dt_by_method=explicit_dt_by_method,
-        explicit_cfl_by_method=explicit_cfl_by_method,
+        explicit_cfl_safety_factor_by_method=(
+            explicit_cfl_safety_factor_by_method
+        ),
         dt_min=dt_min,
         igr_linear_rtol=_finite_positive(
             arguments.igr_linear_rtol, "--igr-linear-rtol"
@@ -2803,6 +2905,7 @@ def _controls_from_arguments(
 
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description=(
             "Run a rotated, fresh-process shock architecture matrix. The "
             "caller owns any GPU/MPI resource lease and supplies a built "
@@ -2893,11 +2996,20 @@ def _argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--explicit-dt", type=float, default=1.0e-4,
-        help="Default explicit initial dt, or fixed dt when CFL is zero",
+        help=(
+            "Default explicit initial dt, or fixed dt when the explicit CFL "
+            "safety factor is zero"
+        ),
     )
     parser.add_argument(
-        "--explicit-cfl", type=float, default=0.5,
-        help="Default explicit CFL; zero selects the configured fixed dt",
+        "--explicit-cfl-safety-factor",
+        dest="explicit_cfl_safety_factor", type=float, default=0.5,
+        metavar="FACTOR",
+        help=(
+            "Default explicit CFL safety factor in [0,1]; the application "
+            "applies the selected integrator's SSP coefficient, and "
+            "zero selects the configured fixed dt"
+        ),
     )
     parser.add_argument(
         "--method-explicit-dt", action="append", default=[],
@@ -2905,9 +3017,13 @@ def _argument_parser() -> argparse.ArgumentParser:
         help="Per-explicit-method initial/fixed dt override",
     )
     parser.add_argument(
-        "--method-explicit-cfl", action="append", default=[],
-        metavar="METHOD=CFL",
-        help="Per-explicit-method CFL override; zero selects its fixed dt",
+        "--method-explicit-cfl-safety-factor",
+        dest="method_explicit_cfl_safety_factor", action="append", default=[],
+        metavar="METHOD=FACTOR",
+        help=(
+            "Per-explicit-method CFL safety-factor override in [0,1]; zero "
+            "selects its fixed dt"
+        ),
     )
     parser.add_argument("--dt-min", type=float, default=1.0e-12)
     parser.add_argument("--igr-linear-rtol", type=float, default=1.0e-5)
@@ -3130,6 +3246,16 @@ def run_campaign(arguments: argparse.Namespace) -> dict[str, Any]:
                 )
                 combined_log = process.stdout_tail + "\n" + process.stderr_tail
                 parsed = parse_application_log(combined_log, method)
+                parsed["cfl_normalization"] = (
+                    assess_explicit_cfl_normalization(
+                        method,
+                        parsed["explicit_time"],
+                        controls.explicit_cfl_safety_factor_by_method.get(
+                            method, 0.0
+                        ),
+                        controls.order,
+                    )
+                )
                 if process.returncode != 0 and \
                         parsed["failure_reason_from_log"] is None:
                     parsed["failure_reason_from_log"] = \
@@ -3227,6 +3353,7 @@ def run_campaign(arguments: argparse.Namespace) -> dict[str, Any]:
                     scalar_closure=parsed["scalar_closure"],
                     scalar_lifecycle=parsed["scalar_lifecycle"],
                     explicit_time=parsed["explicit_time"],
+                    cfl_normalization=parsed["cfl_normalization"],
                     frozen_sigma_telemetry=parsed["frozen_sigma_telemetry"],
                     required_q_sigma_evidence_scope=required_q_sigma_scope(
                         method,
@@ -3331,9 +3458,14 @@ def run_campaign(arguments: argparse.Namespace) -> dict[str, Any]:
             method: controls.explicit_dt_by_method[method]
             for method in methods if method in EXPLICIT_METHODS
         },
-        "explicit_cfl_by_method": {
-            method: controls.explicit_cfl_by_method[method]
+        "explicit_cfl_safety_factor_by_method": {
+            method: controls.explicit_cfl_safety_factor_by_method[method]
             for method in methods if method in EXPLICIT_METHODS
+        },
+        "explicit_cfl_control": {
+            "semantics": "integrator-normalized-safety-factor",
+            "range": "[0,1] (zero selects fixed explicit stepping)",
+            "application_option": "--cfl-number",
         },
         "instantaneous_igr_model": True,
         "limiter": "zhang-shu",

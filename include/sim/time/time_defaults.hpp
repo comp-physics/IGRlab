@@ -273,6 +273,12 @@ inline RunSummary BuildRunSummary(const ExampleContext& ctx,
   summary.maximum_accepted_dt = result.maximum_accepted_dt;
   summary.maximum_accepted_step_growth_ratio =
     result.maximum_accepted_step_growth_ratio;
+  summary.cfl_diagnostics_observed = result.cfl_diagnostics_observed;
+  summary.cfl_control_enabled = result.cfl_control_enabled;
+  summary.cfl_safety_factor = result.cfl_safety_factor;
+  summary.ssp_coefficient = result.ssp_coefficient;
+  summary.ssp_scaled_cfl_factor = result.ssp_scaled_cfl_factor;
+  summary.nominal_global_courant = result.nominal_global_courant;
   summary.dt_min_reached = result.dt_min_reached;
   summary.success = result.success;
   summary.termination_reason = result.termination_reason;
