@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <type_traits>
 
@@ -22,6 +23,13 @@ using ::dg_igr::frozen_scalar_igr_algebra::ExactAverageNormalVelocity;
 using ::dg_igr::frozen_scalar_igr_algebra::
   ExactTwoStateAverageNormalSigmaEnergyTerm;
 using ::dg_igr::frozen_scalar_igr_algebra::FluxCharacteristicSpeed;
+using ::dg_igr::frozen_scalar_igr_algebra::FluxInvariantDomainSpeed;
+using ::dg_igr::frozen_scalar_igr_algebra::
+  FrozenSigmaCharacteristicModulusBound;
+using ::dg_igr::frozen_scalar_igr_algebra::
+  FrozenSigmaFluxIsLocallyStrictlyHyperbolic;
+using ::dg_igr::frozen_scalar_igr_algebra::
+  FrozenSigmaLocalHyperbolicityMargin;
 using ::dg_igr::frozen_scalar_igr_algebra::SafeInverseDensity;
 using ::dg_igr::frozen_scalar_igr_algebra::SourceFromConservativeStateGradient;
 using ::dg_igr::frozen_scalar_igr_algebra::SourceFromVelocityGradient;
@@ -34,6 +42,15 @@ static_assert(std::is_trivially_copyable<mfem::real_t>::value,
 struct Checks
 {
   int failures = 0;
+
+  void True(bool condition, const std::string& label)
+  {
+    if (!condition)
+    {
+      ++failures;
+      std::cerr << "FAIL: " << label << '\n';
+    }
+  }
 
   void Near(mfem::real_t actual,
             mfem::real_t expected,
@@ -50,6 +67,241 @@ struct Checks
     }
   }
 };
+
+void CheckFrozenSigmaSpeedContract(Checks& checks)
+{
+  constexpr mfem::real_t density_floor =
+    static_cast<mfem::real_t>(1.0e-12);
+  constexpr mfem::real_t pressure_floor =
+    static_cast<mfem::real_t>(1.0e-12);
+
+  // This is the audit counterexample: the Euler radius and the one-state LF
+  // split threshold both underbound the positive-sigma frozen-flux radius.
+  {
+    constexpr mfem::real_t density = static_cast<mfem::real_t>(1.0);
+    constexpr mfem::real_t pressure = static_cast<mfem::real_t>(1.0);
+    constexpr mfem::real_t sigma = static_cast<mfem::real_t>(1.0);
+    constexpr mfem::real_t gamma = static_cast<mfem::real_t>(1.4);
+    constexpr mfem::real_t transport_speed = static_cast<mfem::real_t>(0.0);
+    const mfem::real_t base_speed = sqrt(gamma * pressure / density);
+    const mfem::real_t split_speed =
+      fabs(pressure + sigma) *
+      sqrt((gamma - static_cast<mfem::real_t>(1.0)) /
+           (static_cast<mfem::real_t>(2.0) * density * pressure));
+    const mfem::real_t acoustic_numerator =
+      gamma * pressure +
+      (gamma - static_cast<mfem::real_t>(1.0)) * sigma;
+    const mfem::real_t frozen_sigma_radius =
+      sqrt(acoustic_numerator / density);
+    const mfem::real_t speed = FluxInvariantDomainSpeed(base_speed,
+                                                        density,
+                                                        pressure,
+                                                        transport_speed,
+                                                        sigma,
+                                                        gamma,
+                                                        density_floor,
+                                                        pressure_floor);
+
+    checks.True(base_speed < frozen_sigma_radius &&
+                  split_speed < frozen_sigma_radius,
+                "positive-sigma counterexample underbounds the local "
+                "frozen-flux spectrum before correction");
+    checks.True(FrozenSigmaFluxIsLocallyStrictlyHyperbolic(
+                  pressure, sigma, gamma),
+                "positive-sigma counterexample is locally hyperbolic");
+    checks.Near(FrozenSigmaLocalHyperbolicityMargin(pressure, sigma, gamma),
+                acoustic_numerator,
+                static_cast<mfem::real_t>(2.0e-14),
+                "frozen-sigma acoustic numerator");
+    checks.Near(FrozenSigmaCharacteristicModulusBound(density,
+                                                       pressure,
+                                                       transport_speed,
+                                                       sigma,
+                                                       gamma,
+                                                       density_floor),
+                frozen_sigma_radius,
+                static_cast<mfem::real_t>(2.0e-14),
+                "frozen-sigma spectral radius counterexample");
+    checks.Near(speed,
+                frozen_sigma_radius,
+                static_cast<mfem::real_t>(2.0e-14),
+                "invariant-domain speed includes frozen-sigma spectrum");
+  }
+
+  // Negative sigma can remain locally hyperbolic. Its acoustic radius is
+  // then smaller than Euler's, which must still remain in the combined bound.
+  {
+    constexpr mfem::real_t density = static_cast<mfem::real_t>(0.7);
+    constexpr mfem::real_t pressure = static_cast<mfem::real_t>(2.0);
+    constexpr mfem::real_t sigma = static_cast<mfem::real_t>(-1.0);
+    constexpr mfem::real_t gamma = static_cast<mfem::real_t>(1.67);
+    constexpr mfem::real_t transport_speed = static_cast<mfem::real_t>(0.37);
+    const mfem::real_t base_speed =
+      transport_speed + sqrt(gamma * pressure / density);
+    const mfem::real_t acoustic_numerator =
+      gamma * pressure +
+      (gamma - static_cast<mfem::real_t>(1.0)) * sigma;
+    const mfem::real_t local_radius =
+      transport_speed + sqrt(acoustic_numerator / density);
+    const mfem::real_t speed = FluxInvariantDomainSpeed(base_speed,
+                                                        density,
+                                                        pressure,
+                                                        transport_speed,
+                                                        sigma,
+                                                        gamma,
+                                                        density_floor,
+                                                        pressure_floor);
+    checks.True(FrozenSigmaFluxIsLocallyStrictlyHyperbolic(
+                  pressure, sigma, gamma),
+                "moderate negative sigma remains locally hyperbolic");
+    checks.Near(FrozenSigmaCharacteristicModulusBound(density,
+                                                       pressure,
+                                                       transport_speed,
+                                                       sigma,
+                                                       gamma,
+                                                       density_floor),
+                local_radius,
+                static_cast<mfem::real_t>(2.0e-14),
+                "negative-sigma hyperbolic spectral radius");
+    checks.Near(speed,
+                base_speed,
+                static_cast<mfem::real_t>(2.0e-14),
+                "combined bound retains larger ordinary Euler radius");
+  }
+
+  // At and beyond loss of local hyperbolicity, retain finite arithmetic for
+  // Rusanov while exposing the failed q>0 contract separately.
+  {
+    constexpr mfem::real_t density = static_cast<mfem::real_t>(1.0);
+    constexpr mfem::real_t pressure = static_cast<mfem::real_t>(1.0);
+    constexpr mfem::real_t gamma = static_cast<mfem::real_t>(1.4);
+    constexpr mfem::real_t transport_speed = static_cast<mfem::real_t>(0.25);
+    constexpr mfem::real_t negative_sigma = static_cast<mfem::real_t>(-4.0);
+    const mfem::real_t base_speed =
+      transport_speed + sqrt(gamma * pressure / density);
+    const mfem::real_t negative_margin =
+      FrozenSigmaLocalHyperbolicityMargin(pressure, negative_sigma, gamma);
+    const mfem::real_t modulus_bound =
+      FrozenSigmaCharacteristicModulusBound(density,
+                                             pressure,
+                                             transport_speed,
+                                             negative_sigma,
+                                             gamma,
+                                             density_floor);
+    const mfem::real_t nonhyperbolic_speed =
+      FluxInvariantDomainSpeed(base_speed,
+                               density,
+                               pressure,
+                               transport_speed,
+                               negative_sigma,
+                               gamma,
+                               density_floor,
+                               pressure_floor);
+    checks.True(negative_margin < static_cast<mfem::real_t>(0.0) &&
+                  !FrozenSigmaFluxIsLocallyStrictlyHyperbolic(
+                    pressure, negative_sigma, gamma),
+                "large negative sigma exposes loss of local hyperbolicity");
+    checks.Near(modulus_bound,
+                transport_speed + sqrt(fabs(negative_margin) / density),
+                static_cast<mfem::real_t>(2.0e-14),
+                "non-hyperbolic acoustic roots receive a finite modulus "
+                "bound");
+    checks.True(std::isfinite(nonhyperbolic_speed) &&
+                  nonhyperbolic_speed >= base_speed &&
+                  nonhyperbolic_speed >= modulus_bound,
+                "non-hyperbolic invariant-domain arithmetic remains finite "
+                "and conservative in modulus");
+
+    constexpr mfem::real_t zero_margin_gamma =
+      static_cast<mfem::real_t>(1.5);
+    constexpr mfem::real_t zero_margin_sigma =
+      static_cast<mfem::real_t>(-3.0);
+    const mfem::real_t zero_margin_base_speed =
+      transport_speed + sqrt(zero_margin_gamma * pressure / density);
+    const mfem::real_t zero_margin_speed =
+      FluxInvariantDomainSpeed(zero_margin_base_speed,
+                               density,
+                               pressure,
+                               transport_speed,
+                               zero_margin_sigma,
+                               zero_margin_gamma,
+                               density_floor,
+                               pressure_floor);
+    checks.True(!FrozenSigmaFluxIsLocallyStrictlyHyperbolic(
+                  pressure, zero_margin_sigma, zero_margin_gamma) &&
+                  std::isfinite(zero_margin_speed),
+                "zero acoustic margin is explicitly non-strict but finite");
+  }
+
+  // The caller supplies unit-direction transport speed. Verify a near-floor,
+  // nondefault-gamma oblique state gives the same bound for a scaled normal.
+  {
+    constexpr mfem::real_t gamma = static_cast<mfem::real_t>(1.67);
+    constexpr mfem::real_t configured_density_floor =
+      static_cast<mfem::real_t>(5.0e-7);
+    constexpr mfem::real_t configured_pressure_floor =
+      static_cast<mfem::real_t>(1.0e-6);
+    const mfem::real_t density =
+      std::nextafter(configured_density_floor,
+                     std::numeric_limits<mfem::real_t>::infinity());
+    const mfem::real_t pressure =
+      std::nextafter(configured_pressure_floor,
+                     std::numeric_limits<mfem::real_t>::infinity());
+    constexpr mfem::real_t sigma = static_cast<mfem::real_t>(2.0e-6);
+    constexpr std::array<mfem::real_t, 2> velocity{{
+      static_cast<mfem::real_t>(0.4), static_cast<mfem::real_t>(-0.3)}};
+    constexpr std::array<mfem::real_t, 2> normal{{
+      static_cast<mfem::real_t>(0.6), static_cast<mfem::real_t>(-0.8)}};
+    constexpr mfem::real_t normal_scale = static_cast<mfem::real_t>(7.25);
+    auto normalized_transport = [&](mfem::real_t scale)
+    {
+      mfem::real_t dot = static_cast<mfem::real_t>(0.0);
+      mfem::real_t norm_squared = static_cast<mfem::real_t>(0.0);
+      for (int d = 0; d < 2; ++d)
+      {
+        const mfem::real_t scaled_normal = scale * normal[d];
+        dot += velocity[d] * scaled_normal;
+        norm_squared += scaled_normal * scaled_normal;
+      }
+      return fabs(dot) / sqrt(norm_squared);
+    };
+    const mfem::real_t unit_transport =
+      normalized_transport(static_cast<mfem::real_t>(1.0));
+    const mfem::real_t scaled_transport = normalized_transport(normal_scale);
+    const mfem::real_t base_speed =
+      unit_transport + sqrt(gamma * pressure / density);
+    const mfem::real_t unit_bound = FluxInvariantDomainSpeed(
+      base_speed,
+      density,
+      pressure,
+      unit_transport,
+      sigma,
+      gamma,
+      configured_density_floor,
+      configured_pressure_floor);
+    const mfem::real_t scaled_bound = FluxInvariantDomainSpeed(
+      base_speed,
+      density,
+      pressure,
+      scaled_transport,
+      sigma,
+      gamma,
+      configured_density_floor,
+      configured_pressure_floor);
+    checks.True(FrozenSigmaFluxIsLocallyStrictlyHyperbolic(
+                  pressure, sigma, gamma) && std::isfinite(unit_bound),
+                "near-floor nondefault-gamma state has a finite local "
+                "hyperbolic bound");
+    checks.Near(scaled_transport,
+                unit_transport,
+                static_cast<mfem::real_t>(2.0e-14),
+                "scaled oblique normal preserves unit-direction transport");
+    checks.Near(scaled_bound,
+                unit_bound,
+                static_cast<mfem::real_t>(2.0e-14),
+                "scaled oblique normal preserves the reported speed bound");
+  }
+}
 
 mfem::real_t ExpectedSource(int dimension)
 {
@@ -616,6 +868,7 @@ int main()
               static_cast<mfem::real_t>(3.0),
               static_cast<mfem::real_t>(2.0e-14),
               "characteristic scale uses absolute sigma and density floor");
+  CheckFrozenSigmaSpeedContract(checks);
 
   {
     const std::array<mfem::real_t, 3> state{{static_cast<mfem::real_t>(0.25),

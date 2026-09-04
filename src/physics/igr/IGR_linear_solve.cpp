@@ -1,4 +1,6 @@
 #include "physics/igr/IGR.hpp"
+
+#include "numerics/timestepping/ssprk_coefficients.hpp"
 #include "utils/config/env_flags.hpp"
 #include "utils/profiling/nvtx.hpp"
 #include "IGR_internal_utils.hpp"
@@ -261,17 +263,33 @@ void LogFaceCoefficientAudit(const char* domain,
                              double alpha,
                              double rho_floor,
                              int solve_call,
-                             MPI_Comm comm)
+                             MPI_Comm comm,
+                             const mfem::Vector* side_alpha = nullptr,
+                             int face_quadrature_points = 0)
 {
   const double* data = coefficient.HostRead();
+  const double* side_alpha_data =
+    side_alpha && side_alpha->Size() > 0 ? side_alpha->HostRead() : nullptr;
+  MFEM_VERIFY(!side_alpha_data ||
+                (face_quadrature_points > 0 &&
+                 coefficient.Size() ==
+                   side_alpha->Size() * face_quadrature_points),
+              "Face-coefficient audit received inconsistent local-alpha data.");
   double local_min = std::numeric_limits<double>::infinity();
   double local_max = -std::numeric_limits<double>::infinity();
   long long local_values = coefficient.Size();
   long long local_floor = 0;
   long long local_nonfinite = 0;
-  const double floor_value = alpha / rho_floor;
   for (int i = 0; i < coefficient.Size(); ++i)
   {
+    const int side = i % 2;
+    const int face = side_alpha_data
+      ? i / (2 * face_quadrature_points)
+      : 0;
+    const double coefficient_alpha = side_alpha_data
+      ? side_alpha_data[side + 2 * face]
+      : alpha;
+    const double floor_value = coefficient_alpha / rho_floor;
     local_min = std::min(local_min, data[i]);
     local_max = std::max(local_max, data[i]);
     local_floor += data[i] >= floor_value * (1.0 - 1.0e-12) ? 1 : 0;
@@ -313,6 +331,49 @@ void LogFaceCoefficientAudit(const char* domain,
               << " density_floor_activations=" << global_floor
               << " nonfinite=" << global_nonfinite << std::endl;
   }
+}
+
+void BuildSharedFaceSideAlpha(const mfem::ParFiniteElementSpace& fes,
+                              mfem::real_t c_alpha,
+                              mfem::Vector& face_side_alpha)
+{
+#ifndef MFEM_USE_MPI
+  (void)fes;
+  (void)c_alpha;
+  (void)face_side_alpha;
+  MFEM_ABORT("Shared local IGR alpha lowering requires MFEM MPI support.");
+#else
+  mfem::ParMesh* pmesh = fes.GetParMesh();
+  MFEM_VERIFY(pmesh != nullptr,
+              "Shared local IGR alpha lowering requires ParMesh.");
+  MFEM_VERIFY(std::isfinite(c_alpha) && c_alpha > 0.0,
+              "Shared local IGR alpha lowering requires positive finite "
+              "C_alpha.");
+  const int nf = pmesh->GetNSharedFaces();
+  face_side_alpha.SetSize(2 * nf);
+  auto alpha = mfem::Reshape(face_side_alpha.HostWrite(), 2, nf);
+  for (int sf = 0; sf < nf; ++sf)
+  {
+    mfem::FaceElementTransformations* Tr =
+      pmesh->GetSharedFaceTransformations(sf, /*fill2=*/true);
+    MFEM_VERIFY(Tr && Tr->Elem1 && Tr->Elem2,
+                "Shared local IGR alpha lowering requires two elements.");
+    const int nbr_el = Tr->Elem2No - pmesh->GetNE();
+    MFEM_VERIFY(Tr->Elem1No >= 0 && Tr->Elem1No < pmesh->GetNE() &&
+                  nbr_el >= 0 &&
+                  nbr_el < pmesh->GetNFaceNeighborElements(),
+                "Shared local IGR alpha lowering received an invalid element "
+                "pair.");
+    const mfem::real_t h0 = pmesh->GetElementSize(Tr->Elem1No, 1);
+    const mfem::real_t h1 = pmesh->GetFaceNbrElementSize(nbr_el, 1);
+    MFEM_VERIFY(std::isfinite(h0) && std::isfinite(h1) && h0 > 0.0 &&
+                  h1 > 0.0,
+                "Shared local IGR alpha lowering received an invalid element "
+                "size.");
+    alpha(0, sf) = c_alpha * h0 * h0;
+    alpha(1, sf) = c_alpha * h1 * h1;
+  }
+#endif
 }
 
 void FillOperatorProbeVector(mfem::Vector& value, int seed)
@@ -891,6 +952,10 @@ public:
       prolong_(sfes.GetProlongationMatrix()),
       restrict_(sfes.GetRestrictionOperator()),
       ip_sigma_(ip_sigma),
+      kappa_(kappa),
+      face_scaling_(face_scaling),
+      sfes_sequence_(sfes.GetSequence()),
+      mesh_sequence_(sfes.GetMesh() ? sfes.GetMesh()->GetSequence() : -1),
       local_x_gf_(const_cast<mfem::ParFiniteElementSpace*>(&sfes))
   {
     info_ = dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
@@ -903,7 +968,9 @@ public:
       scratch_.penalty,
       scratch_.face_elements,
       scratch_.element_vdof_map,
-      face_scaling);
+      face_scaling,
+      &scratch_.normal_dshape_base,
+      &scratch_.penalty_metric);
     timing_enabled_ =
       ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_EXACT_FACE_TIMING",
                                       false);
@@ -920,8 +987,41 @@ public:
         shared_scratch_.face_elements,
         shared_scratch_.element_vdof_map,
         shared_scratch_.face_nbr_dof_map,
-        face_scaling);
+        face_scaling,
+        &shared_scratch_.normal_dshape_base,
+        &shared_scratch_.penalty_metric);
       has_shared_ = (shared_info_.nf > 0);
+    }
+  }
+
+  bool CanRefresh(const mfem::ParFiniteElementSpace& sfes,
+                  const mfem::Vector& side_q,
+                  const mfem::Vector& shared_side_q,
+                  mfem::real_t kappa,
+                  dg_face::DGDiffusionFaceScaling face_scaling) const
+  {
+    const mfem::Mesh* mesh = sfes.GetMesh();
+    return &sfes == &sfes_ && sfes.GetSequence() == sfes_sequence_ && mesh &&
+           mesh->GetSequence() == mesh_sequence_ && kappa == kappa_ &&
+           face_scaling == face_scaling_ &&
+           side_q.Size() == 2 * info_.nq * info_.nf &&
+           shared_side_q.Size() == 2 * shared_info_.nq * shared_info_.nf &&
+           (shared_info_.nf > 0) == has_shared_;
+  }
+
+  void RefreshCoefficients(const mfem::Vector& side_q,
+                           const mfem::Vector& shared_side_q)
+  {
+    dg_face::LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+      info_, scratch_, side_q, kappa_, face_scaling_);
+    if (has_shared_)
+    {
+      dg_face::LaunchSharedFaceDGDiffusionCoefficientUpdate2D(
+        shared_info_,
+        shared_scratch_,
+        shared_side_q,
+        kappa_,
+        face_scaling_);
     }
   }
 
@@ -1081,6 +1181,11 @@ private:
   const mfem::Operator* prolong_ = nullptr;
   const mfem::Operator* restrict_ = nullptr;
   mfem::real_t ip_sigma_ = 0.0;
+  mfem::real_t kappa_ = 0.0;
+  dg_face::DGDiffusionFaceScaling face_scaling_ =
+    dg_face::DGDiffusionFaceScaling::Arithmetic;
+  long sfes_sequence_ = -1;
+  long mesh_sequence_ = -1;
   dg_face::InteriorFaceDGDiffusionApplyInfo info_;
   dg_face::InteriorFaceDGDiffusionApplyScratch scratch_;
   bool has_shared_ = false;
@@ -1416,6 +1521,23 @@ bool IGRSolver::ShouldUsePartialAssembly_() const
 {
   const bool device_backend =
     mfem::Device::Allows(mfem::Backend::DEVICE_MASK);
+  const bool exact_face = UseExactDGFaceOperator_();
+  if (exact_face)
+  {
+    MFEM_VERIFY(
+      !PreconditionerRequiresAssembledMatrix(prec_type_),
+      "The exact side-aware DG face operator requires partial assembly and "
+      "is incompatible with an assembled-matrix IGR preconditioner.");
+    if (mfem::Mpi::Root())
+    {
+      std::cout << "[igr-linear] event=partial-assembly-policy"
+                << " requested=on"
+                << " effective=on"
+                << " reason=exact-dg-face-required-partial-assembly"
+                << " precond=" << PrecondTypeName(prec_type_) << "\n";
+    }
+    return true;
+  }
   if (device_backend)
   {
     const bool requested =
@@ -1548,6 +1670,8 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
   const bool exact_face_requested = UseExactDGFaceOperator_();
   const bool is_dg_space = IsDGSpace(sfes_);
   const bool use_exact_face_operator = is_dg_space && exact_face_requested;
+  const bool local_alpha =
+    alpha_length_scale_policy_ == AlphaLengthScalePolicy::Local;
   last_exact_face_requested_ = exact_face_requested;
   last_exact_face_effective_ = false;
   last_exact_face_reason_ =
@@ -1572,13 +1696,6 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
       MFEM_VERIFY(false,
                   "DG_IGR_IGR_EXACT_DG_FACE_OPERATOR requires "
                   "DG_IGR_IGR_DEVICE_QF=1.");
-    }
-    if (alpha_length_scale_policy_ == AlphaLengthScalePolicy::Local)
-    {
-      last_exact_face_reason_ = "requires-nonlocal-alpha";
-      MFEM_VERIFY(false,
-                  "DG_IGR_IGR_EXACT_DG_FACE_OPERATOR currently supports only "
-                  "constant alpha policy.");
     }
     if (ess_bdr_.Size() != 0)
     {
@@ -1740,14 +1857,27 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
 
     mfem::Vector side_q;
     dg_face::InteriorFaceSideDensityProjectionScratch side_scratch;
-    const auto side_info =
-      dg_face::ProjectInteriorFaceDensityCoefficient2D(vfes_,
-                                                       exact_fqs,
-                                                       U,
-                                                       alpha_,
-                                                       rho_floor_,
-                                                       side_q,
-                                                       &side_scratch);
+    if (local_alpha)
+    {
+      MFEM_VERIFY(device_element_alpha_.Size() == vfes_.GetNE(),
+                  "Exact local-alpha face projection requires the current "
+                  "device element-alpha cache.");
+    }
+    const auto side_info = local_alpha
+      ? dg_face::ProjectInteriorFaceDensityCoefficient2D(vfes_,
+                                                         exact_fqs,
+                                                         U,
+                                                         device_element_alpha_,
+                                                         rho_floor_,
+                                                         side_q,
+                                                         &side_scratch)
+      : dg_face::ProjectInteriorFaceDensityCoefficient2D(vfes_,
+                                                         exact_fqs,
+                                                         U,
+                                                         alpha_,
+                                                         rho_floor_,
+                                                         side_q,
+                                                         &side_scratch);
     last_exact_face_local_nf_ = side_info.nf;
     const bool ingestion_audit =
       ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_INGESTION_AUDIT", false);
@@ -1758,10 +1888,15 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
                               alpha_,
                               rho_floor_,
                               linear_solve_calls_ + 1,
-                              vfes_.GetComm());
+                              vfes_.GetComm(),
+                              local_alpha
+                                ? &side_scratch.side_alpha
+                                : nullptr,
+                              side_info.nq);
     }
 
     mfem::Vector shared_side_q;
+    mfem::Vector shared_face_side_alpha;
     dg_face::SharedFaceSideDensityProjectionScratch shared_side_scratch;
     dg_face::SharedFaceSideDensityProjectionInfo shared_side_info;
     if (pmesh && pmesh->GetNSharedFaces() > 0)
@@ -1784,14 +1919,26 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
                     "Unsupported exact IGR shared sigma face operator: "
                       << reason);
       }
-      shared_side_info =
-        dg_face::ProjectSharedFaceDensityCoefficient2D(vfes_,
-                                                       exact_face_ir,
-                                                       U,
-                                                       alpha_,
-                                                       rho_floor_,
-                                                       shared_side_q,
-                                                       &shared_side_scratch);
+      if (local_alpha)
+      {
+        BuildSharedFaceSideAlpha(vfes_, alpha_, shared_face_side_alpha);
+      }
+      shared_side_info = local_alpha
+        ? dg_face::ProjectSharedFaceDensityCoefficient2D(
+            vfes_,
+            exact_face_ir,
+            U,
+            shared_face_side_alpha,
+            rho_floor_,
+            shared_side_q,
+            &shared_side_scratch)
+        : dg_face::ProjectSharedFaceDensityCoefficient2D(vfes_,
+                                                         exact_face_ir,
+                                                         U,
+                                                         alpha_,
+                                                         rho_floor_,
+                                                         shared_side_q,
+                                                         &shared_side_scratch);
       last_exact_face_shared_nf_ = shared_side_info.nf;
       if (ingestion_audit)
       {
@@ -1800,7 +1947,11 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
                                 alpha_,
                                 rho_floor_,
                                 linear_solve_calls_ + 1,
-                                vfes_.GetComm());
+                                vfes_.GetComm(),
+                                local_alpha
+                                  ? &shared_side_scratch.side_alpha
+                                  : nullptr,
+                                shared_side_info.nq);
       }
     }
 
@@ -1813,22 +1964,36 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
     const mfem::real_t face_kappa =
       static_cast<mfem::real_t>(IPDGPenalty(sfes_));
     const dg_face::DGDiffusionFaceScaling face_scaling =
-      ReadIPDGFaceScaling();
-    // Keep the stage-wise exact-face refresh on the original, fully rebuilt
-    // path until the device qdata update kernel has an end-to-end parity test.
-    // Reusing the geometry is an optimization, not a correctness requirement.
-    exact_face_operator_.reset();
-    exact_face_operator_ = std::make_unique<ExactL2DGFaceOperator>(
-      sfes_,
-      exact_fqs,
-      side_q,
-      exact_face_ir,
-      shared_side_q,
-      static_cast<mfem::real_t>(ip_kind_),
-      face_kappa,
-      face_scaling);
+      sigma_cadence_ == IGRSigmaUpdateCadence::ExtrapolatedEveryStep
+        ? dg_face::DGDiffusionFaceScaling::Arithmetic
+        : ReadIPDGFaceScaling();
     face_op = dynamic_cast<ExactL2DGFaceOperator*>(
       exact_face_operator_.get());
+    const bool reused_face_geometry =
+      face_op && face_op->CanRefresh(sfes_,
+                                     side_q,
+                                     shared_side_q,
+                                     face_kappa,
+                                     face_scaling);
+    if (reused_face_geometry)
+    {
+      face_op->RefreshCoefficients(side_q, shared_side_q);
+    }
+    else
+    {
+      exact_face_operator_.reset();
+      exact_face_operator_ = std::make_unique<ExactL2DGFaceOperator>(
+        sfes_,
+        exact_fqs,
+        side_q,
+        exact_face_ir,
+        shared_side_q,
+        static_cast<mfem::real_t>(ip_kind_),
+        face_kappa,
+        face_scaling);
+      face_op = dynamic_cast<ExactL2DGFaceOperator*>(
+        exact_face_operator_.get());
+    }
     MFEM_VERIFY(face_op != nullptr,
                 "Exact DG face operator construction failed.");
     if (!direct_identity_system_)
@@ -1852,6 +2017,7 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
                 << " shared_nf=" << shared_side_info.nf
                 << " shared_qf_size=" << shared_side_info.qf_size
                 << " face_scaling=" << IPDGFaceScalingName(face_scaling)
+                << " geometry_reused=" << (reused_face_geometry ? 1 : 0)
                 << " mode=local-and-shared-2d"
                 << std::endl;
     }
@@ -1988,8 +2154,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     ReadEnvReal("DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR", 5.0);
   MFEM_VERIFY(extended_certificate_start > 0,
               "DG_IGR_IGR_EXTENDED_CERTIFICATE_START must be positive.");
-  MFEM_VERIFY(extended_certificate_factor > 0.0,
-              "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR must be positive.");
+  MFEM_VERIFY(std::isfinite(extended_certificate_factor) &&
+                extended_certificate_factor > 0.0,
+              "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR must be finite and "
+              "positive.");
   const bool extended_certificate_enabled =
     ::dg_igr::EnvFlagEnabledDefault(
       "DG_IGR_IGR_EXTENDED_CERTIFICATE", false) &&
@@ -2030,6 +2198,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   last_linear_true_residual_abs_ =
     std::numeric_limits<double>::quiet_NaN();
   last_linear_true_residual_rel_rhs_ =
+    std::numeric_limits<double>::quiet_NaN();
+  last_independent_certificate_relative_limit_ =
+    std::numeric_limits<double>::quiet_NaN();
+  last_independent_certificate_absolute_limit_ =
     std::numeric_limits<double>::quiet_NaN();
   last_linear_true_initial_residual_abs_ =
     std::numeric_limits<double>::quiet_NaN();
@@ -2254,8 +2426,13 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     else if (prec_choice == PrecondType::OperatorChebyshev)
     {
       ::dg_igr::NVTXRange cheb_range("IGR/chebyshev-setup");
+      // The qualified extrapolated instantaneous-IGR route uses the complete
+      // exact-face operator for both Krylov and Chebyshev applications.  Do
+      // not let the legacy experimental environment knob silently substitute
+      // the volume/base operator in that typed temporal discretization.
       const bool use_base_operator =
         exact_face_sum_op &&
+        sigma_cadence_ != IGRSigmaUpdateCadence::ExtrapolatedEveryStep &&
         ::dg_igr::EnvFlagEnabledDefault(
           "DG_IGR_IGR_CHEB_BASE_OPERATOR",
           false);
@@ -2456,7 +2633,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   }
   last_warm_start_effective_ = enable_warm_start;
 
-  const bool is_intermediate_stage = (rk_stage_index_ >= 0 && rk_stage_index_ < 2);
+  const bool is_intermediate_stage =
+    mfem::IsIntermediateRKStage(rk_stage_index_, rk_stage_count_);
   const double effective_rtol =
     is_intermediate_stage ? (lin_rtol_ * stage_rtol_scale_) : lin_rtol_;
   mfem::Vector event_initial_guess;
@@ -2647,13 +2825,39 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   int residual_replacement_retries = 0;
   if (certify_independent_residual)
   {
-    const double certificate_factor = extended_certificate_factor;
-    const double certificate_limit =
+    // A caller-requested production certificate is a fixed part of the
+    // method and must not be weakened by the optional diagnostic environment
+    // used to screen unusually long solves.
+    constexpr double caller_certificate_factor = 5.0;
+    const double certificate_factor = certify_current_solve_
+                                        ? caller_certificate_factor
+                                        : extended_certificate_factor;
+    const double certificate_relative_limit =
       certificate_factor * effective_rtol;
-    independent_certificate_passed =
-      std::isfinite(last_linear_true_residual_rel_rhs_) &&
-      last_linear_true_residual_rel_rhs_ <= certificate_limit;
-    if (!independent_certificate_passed && VectorIsFinite(X_))
+    const double certificate_absolute_limit =
+      certificate_factor * lin_atol_;
+    last_independent_certificate_relative_limit_ = certificate_relative_limit;
+    last_independent_certificate_absolute_limit_ = certificate_absolute_limit;
+    auto certificate_passes = [&]()
+    {
+      const bool relative_pass =
+        std::isfinite(last_linear_true_residual_rel_rhs_) &&
+        last_linear_true_residual_rel_rhs_ <= certificate_relative_limit;
+      const bool absolute_pass =
+        std::isfinite(last_linear_true_residual_abs_) &&
+        last_linear_true_residual_abs_ <= certificate_absolute_limit;
+      return relative_pass || absolute_pass;
+    };
+    independent_certificate_passed = certificate_passes();
+    int local_solution_finite = VectorIsFinite(X_) ? 1 : 0;
+    int collective_solution_finite = 0;
+    MPI_Allreduce(&local_solution_finite,
+                  &collective_solution_finite,
+                  1,
+                  MPI_INT,
+                  MPI_MIN,
+                  comm);
+    if (!independent_certificate_passed && collective_solution_finite != 0)
     {
       const int first_attempt_iters = last_linear_iters_;
       const double first_attempt_initial_norm = last_linear_initial_norm_;
@@ -2668,7 +2872,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                   << " first_attempt_iters=" << first_attempt_iters
                   << " first_true_residual_rel_rhs="
                   << first_attempt_true_rel
-                  << " limit=" << certificate_limit
+                  << " relative_limit=" << certificate_relative_limit
+                  << " absolute_limit=" << certificate_absolute_limit
                   << " action=restart-recurrence-from-current-iterate"
                   << std::endl;
       }
@@ -2678,15 +2883,17 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       last_linear_initial_norm_ = first_attempt_initial_norm;
       ++residual_replacement_retries;
       recompute_true_residual();
-      independent_certificate_passed =
-        std::isfinite(last_linear_true_residual_rel_rhs_) &&
-        last_linear_true_residual_rel_rhs_ <= certificate_limit;
+      independent_certificate_passed = certificate_passes();
     }
     // The independent residual is authoritative for certified solves. This
     // also recognizes a valid capped iterate when the Krylov recurrence's
     // reported norm has drifted from the true residual.
     last_linear_converged_ = independent_certificate_passed;
-    if (mfem::Mpi::Root())
+    const bool successful_production_anchor =
+      independent_certificate_passed &&
+      current_solve_purpose_ != IGRSolvePurpose::OutputOnly &&
+      rk_stage_index_ == -1;
+    if (mfem::Mpi::Root() && !successful_production_anchor)
     {
       std::cout << "[igr-linear] event=independent-residual-certificate"
                 << " solve_call=" << solve_call
@@ -2694,10 +2901,12 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                 << " rk_stage=" << rk_stage_index_
                 << " iterations=" << last_linear_iters_
                 << " reason="
-                << (certify_current_solve_ ? "restart" : "extended-solve")
+                << (certify_current_solve_ ? "caller-requested"
+                                           : "extended-solve")
                 << " start=" << extended_certificate_start
                 << " factor=" << certificate_factor
-                << " limit=" << certificate_limit
+                << " relative_limit=" << certificate_relative_limit
+                << " absolute_limit=" << certificate_absolute_limit
                 << " true_residual_rel_rhs="
                 << last_linear_true_residual_rel_rhs_
                 << " true_residual_rel_initial="

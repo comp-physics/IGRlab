@@ -14,6 +14,7 @@
 
 #include "mfem.hpp"
 
+
 namespace mfem
 {
 namespace dgsem
@@ -42,6 +43,42 @@ struct DGSEMDeviceRuntimeInfo
 };
 
 DGSEMDeviceRuntimeInfo GetDGSEMDeviceRuntimeInfo();
+
+/// Fail-closed status written by the packed Euler+IGR admission scan.
+enum class DGSEMDeviceStateStatus : int
+{
+  Valid = 0,
+  InvalidSigma = 1,
+  InvalidDensity = 2,
+  DensityBelowFloor = 3,
+  InvalidPressure = 4
+};
+
+/// Fixed storage for the deterministic packed-state admission reduction.
+constexpr int kDGSEMDeviceStateScanWorkspaceSize = 256 * 7;
+
+/** Validate packed element/face panels and reduce frozen-sigma telemetry.
+ *
+ * Exactly one of `scan_owned_states` and `scan_face_states` is true. `slots`
+ * is a persistent fixed-lane reduction workspace; `result` is a persistent
+ * six-double workspace containing status, sample count, nonpositive count,
+ * nonfinite count, minimum q_sigma, and minimum q_sigma/(gamma*p). The scan
+ * executes where the input panels reside; callers need transfer only these
+ * bounded reduction scalars.
+ */
+void ScanEulerIGRStatePanelsDevice(int dim,
+                                   real_t gamma,
+                                   real_t density_floor,
+                                   bool scan_owned_states,
+                                   bool scan_face_states,
+                                   const DenseMatrix& states,
+                                   const Vector& sigma,
+                                   const DenseMatrix& left_states,
+                                   const Vector& left_sigma,
+                                   const DenseMatrix& right_states,
+                                   const Vector& right_sigma,
+                                   Array<double>& slots,
+                                   Array<double>& result);
 
 /** Gather a local MFEM L-vector into packed element/component columns.
  *
@@ -76,14 +113,14 @@ void InterpolateSharedFaceScalarDevice(
   const Vector& scalar_face_neighbor_data,
   Vector& packed_shared_scalar);
 
-/** Gather persistent nodal face maps and apply the statically bound slip wall.
+/** Gather persistent nodal face maps and apply lowered Euler boundaries.
  *
  * Local and shared rows obtain their right state from the local packed batch
- * or MFEM face-neighbor vector, respectively. Boundary rows execute the one
- * accepted production boundary policy: adiabatic slip reflection. There is no
- * model, flux, or boundary-policy switch inside the point kernel.
+ * or MFEM face-neighbor vector, respectively. Boundary rows consume a packed
+ * boundary kind and conservative reference state prepared during host-once
+ * topology setup. The point kernel has no runtime polymorphism.
  */
-void GatherEulerRusanovSlipFacesDevice(
+void GatherEulerRusanovFacesDevice(
   int dim,
   int ne,
   int dof,
@@ -98,6 +135,12 @@ void GatherEulerRusanovSlipFacesDevice(
   const Array<int>& right_elements,
   const Array<int>& right_local_dofs,
   const Array<int>& ownership,
+  const Array<int>& boundary_kinds,
+  const DenseMatrix& boundary_reference_states,
+  const Vector& boundary_gammas,
+  const Vector& boundary_outlet_pressures,
+  const Vector& boundary_density_floors,
+  const Vector& boundary_pressure_floors,
   DenseMatrix& left_states,
   DenseMatrix& right_states,
   Vector& left_sigma,
@@ -150,8 +193,10 @@ void BuildContravariantMetrics2DDevice(int ne,
 /** Build Euler plus stage-frozen scalar-sigma contravariant nodal fluxes.
  *
  * The pressure-like sigma correction exactly matches FluxWithIGR's accepted
- * tensor semantics. It does not update sigma and does not enable sigma-aware
- * CFL or Rusanov speeds. `metrics` has `dim*dim` columns ordered
+ * tensor semantics. It does not update sigma. When
+ * `frozen_sigma_spectral_speed` is true, nodal CFL speeds use the exact local
+ * frozen-sigma acoustic radius on the independently admitted q_sigma>0 set.
+ * `metrics` has `dim*dim` columns ordered
  * `reference*dim + physical`. The result has `dim*num_equations` columns
  * ordered `reference*num_equations + equation`.
  */
@@ -162,7 +207,24 @@ void BuildEulerContravariantFluxDevice(int dim,
                                        const Vector& sigma,
                                        const DenseMatrix& metrics,
                                        DenseMatrix& contravariant_flux,
-                                       Vector& nodal_speeds);
+                                       Vector& nodal_speeds,
+                                       bool frozen_sigma_spectral_speed = false);
+
+/** Evaluate only the packed nodal Euler characteristic-speed bound.
+ *
+ * This is the speed half of BuildEulerContravariantFluxDevice() and shares
+ * its exact ordinary/frozen-sigma formula. It does not build fluxes or write a
+ * residual, so an accepted endpoint can refresh the next-step CFL state
+ * without repeating the transport operator.
+ */
+void ComputeEulerNodalCharacteristicSpeedsDevice(
+  int dim,
+  real_t gamma,
+  real_t velocity_density_floor,
+  const DenseMatrix& states,
+  const Vector& sigma,
+  Vector& nodal_speeds,
+  bool frozen_sigma_spectral_speed = false);
 
 /** Apply the accepted central symmetric DGSEM volume contraction.
  *
@@ -177,13 +239,43 @@ void ApplyCentralVolumeDevice(int dim,
                               const DenseMatrix& contravariant_flux,
                               DenseMatrix& weak_volume);
 
+/// Number of unique coordinate-line pairs used by the LLF volume kernel.
+int DGSEMVolumePairCount(int dim, int ne, int n1d);
+
+/** Add conservative local-Lax--Friedrichs volume dissipation on device.
+ *
+ * A first kernel evaluates each unique unordered nodal pair once and stores
+ * all Euler components.  A second deterministic gather applies Dsplit in the
+ * exact legacy pair orientation/order without atomics.  `pair_dissipation`
+ * is a persistent `(DGSEMVolumePairCount x num_equations)` workspace. With
+ * frozen IGR sigma, the pair scale uses
+ * `|u.g| + sqrt(|gamma*p + (gamma-1)*sigma|/rho)*|g|`. For positive q_sigma
+ * this is the exact local acoustic spectral-radius bound. The modulus branch
+ * at nonpositive q_sigma is finite only so a rejected stage can unwind; the
+ * independent FP64 stage-admission scan remains the hyperbolicity gate.
+ */
+void AddEulerLLFVolumeDissipationDevice(
+  int dim,
+  int ne,
+  int n1d,
+  real_t gamma,
+  real_t velocity_density_floor,
+  const Array<int>& lex_to_local,
+  const DenseMatrix& split_matrix,
+  const Vector& weights,
+  const DenseMatrix& states,
+  const Vector& sigma,
+  const DenseMatrix& metrics,
+  DenseMatrix& pair_dissipation,
+  DenseMatrix& weak_volume);
+
 /** Assemble packed Euler Rusanov face contributions deterministically.
  *
  * Face states and normals are prepared host-once after MFEM orientation and
- * exchange setup. A local face writes both elements, while shared and boundary
- * faces write only the locally owned left element. Each output entry scans the
- * face list in its declared order, avoiding atomics and preserving a stable
- * correctness reference.
+ * exchange setup. Host-once CSR adjacency lists the incident face ids and
+ * deterministic signs for each element row. Surface accumulation therefore
+ * remains atomic-free and face-order deterministic without scanning every
+ * packed face for every output row.
  */
 void AssembleEulerRusanovFacesDevice(int dim,
                                      int ne,
@@ -196,14 +288,44 @@ void AssembleEulerRusanovFacesDevice(int dim,
                                      const Vector& left_sigma,
                                      const Vector& right_sigma,
                                      const Vector& face_weights,
-                                     const Array<int>& left_elements,
-                                     const Array<int>& left_local_dofs,
-                                     const Array<int>& right_elements,
-                                     const Array<int>& right_local_dofs,
-                                     const Array<int>& ownership,
+                                     const Array<int>& row_face_offsets,
+                                     const Array<int>& row_face_ids,
+                                     const Array<int>& row_face_signs,
                                      DenseMatrix& face_flux,
                                      Vector& face_speeds,
-                                     DenseMatrix& weak_surface);
+                                     DenseMatrix& weak_surface,
+                                     bool frozen_sigma_spectral_speed = false);
+
+/** Evaluate only the packed two-sided Rusanov characteristic-speed bound.
+ *
+ * The input panels must already contain the accepted local, shared, and
+ * physical-boundary ghost states. This shares the exact speed formula used by
+ * AssembleEulerRusanovFacesDevice() and writes neither flux nor residual.
+ */
+void ComputeEulerRusanovFaceCharacteristicSpeedsDevice(
+  int dim,
+  real_t gamma,
+  real_t velocity_density_floor,
+  const DenseMatrix& left_states,
+  const DenseMatrix& right_states,
+  const DenseMatrix& normals,
+  const Vector& left_sigma,
+  const Vector& right_sigma,
+  Vector& face_speeds,
+  bool frozen_sigma_spectral_speed = false);
+
+/** Integrate the outward numerical flux over physical boundary faces.
+ *
+ * `face_flux` is the unweighted flux produced by
+ * AssembleEulerRusanovFacesDevice(). Only packed entries whose ownership is
+ * `Boundary` contribute. The deterministic component-wise reduction uses the
+ * same face weights and scaled outward normals as the residual, and overwrites
+ * `boundary_flux` with one rank-local value per equation.
+ */
+void IntegratePhysicalBoundaryFluxDevice(const Array<int>& ownership,
+                                         const Vector& face_weights,
+                                         const DenseMatrix& face_flux,
+                                         Vector& boundary_flux);
 
 /** Apply a packed batch of element inverse-mass matrices.
  *

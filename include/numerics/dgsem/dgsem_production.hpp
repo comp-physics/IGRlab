@@ -6,13 +6,16 @@
  * @ingroup numerics_dgsem
  *
  * The production path is intentionally limited to the accepted correctness
- * tuple: 1D/2D p1--p4 Gauss--Lobatto Euler, central volume flux without
- * volume dissipation, Rusanov surfaces, and zero or prescribed stage-frozen
- * scalar sigma.  Unsupported tuples are named here so strict evidence can
- * reject them without mutating the caller's output.
+ * tuple: 1D/2D p1--p4 Gauss--Lobatto Euler, central volume flux, Rusanov
+ * surfaces, and zero or prescribed stage-frozen scalar sigma. Conservative
+ * LLF volume dissipation is supported by the same packed CPU/CUDA kernels
+ * when selected by the typed DGSEM configuration. Unsupported tuples are
+ * named here so strict evidence can reject them without mutating caller
+ * output.
  */
 
 #include "mfem.hpp"
+#include "physics/igr/igr_flux.hpp"
 
 #include <cstdint>
 
@@ -77,6 +80,8 @@ struct DGSEMProductionSelection
   bool has_local_faces = false;
   bool has_shared_faces = false;
   bool has_boundary_faces = false;
+  bool llf_volume_active = false;
+  bool frozen_sigma_spectral_speed = false;
   int dimension = 0;
   int order = 0;
   int elements = 0;
@@ -88,6 +93,8 @@ struct DGSEMProductionResult
   bool executed = false;
   DGSEMProductionReason reason = DGSEMProductionReason::CacheNotBuilt;
   real_t max_characteristic_speed = 0.0;
+  /// Fresh communicator-wide q_sigma samples for an admission-only call.
+  IGRFrozenSigmaTelemetry admission_q_sigma;
 };
 
 enum class DGSEMProductionInvalidation : int
@@ -107,6 +114,7 @@ struct DGSEMProductionCacheCounters
   std::int64_t workspace_builds = 0;
   std::int64_t update_invalidations = 0;
   std::int64_t stage_calls = 0;
+  std::int64_t admission_calls = 0;
   std::int64_t state_exchanges = 0;
   std::int64_t sigma_exchanges = 0;
   std::int64_t mpi_reductions = 0;
@@ -120,14 +128,14 @@ struct DGSEMProductionCacheCounters
   std::int64_t rebuild_preflight_entries = 0;
 };
 
-/** Exact warm-stage workspace snapshot.
+/** On-demand workspace snapshot for validation and evidence.
  *
  * The signatures cover every packed stage workspace, including MPI send,
  * receive, request, and status storage when present. The storage signature
- * includes the stable MFEM host/device addresses after warmup; size and
- * capacity signatures are kept separate so evidence can distinguish shape
- * changes from allocator relocation. This is not an allocator-wide or
- * performance measurement.
+ * includes MFEM host/device addresses; size and capacity signatures are kept
+ * separate so evidence can distinguish shape changes from allocator
+ * relocation. Capturing it may synchronize device data and therefore occurs
+ * only through the explicit evidence getter, never in the residual hot path.
  */
 struct DGSEMProductionWorkspaceEvidence
 {

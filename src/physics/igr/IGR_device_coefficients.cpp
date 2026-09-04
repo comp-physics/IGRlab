@@ -351,11 +351,56 @@ void IGRSolver::EnsureDeviceQuadrature_()
   device_face_qorder_ = face_qorder;
 }
 
+void IGRSolver::EnsureDeviceElementAlpha_()
+{
+  if (alpha_length_scale_policy_ != AlphaLengthScalePolicy::Local)
+  {
+    return;
+  }
+
+  mfem::Mesh* mesh = sfes_.GetMesh();
+  MFEM_VERIFY(mesh,
+              "IGR local-alpha device coefficients require a valid mesh.");
+  MFEM_VERIFY(mesh == vfes_.GetMesh(),
+              "IGR local-alpha device coefficients expect sigma and state "
+              "meshes to match.");
+
+  const int ne = mesh->GetNE();
+  const long mesh_sequence = mesh->GetSequence();
+  const bool needs_refresh =
+    device_element_alpha_.Size() != ne ||
+    device_element_alpha_mesh_sequence_ != mesh_sequence ||
+    device_element_alpha_c_alpha_ != alpha_;
+  if (!needs_refresh)
+  {
+    return;
+  }
+
+  device_element_alpha_.SetSize(ne);
+  device_element_alpha_.UseDevice(true);
+  mfem::real_t* element_alpha = device_element_alpha_.HostWrite();
+  for (int e = 0; e < ne; ++e)
+  {
+    const double h = static_cast<double>(mesh->GetElementSize(e, 1));
+    element_alpha[e] = static_cast<mfem::real_t>(alpha_ * h * h);
+  }
+  device_element_alpha_mesh_sequence_ = mesh_sequence;
+  device_element_alpha_c_alpha_ = alpha_;
+}
+
 void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
 {
   EnsureDeviceQuadrature_();
   MFEM_VERIFY(mass_qs_ && sigma_qs_ && rhs_qs_,
               "IGR device coefficients require quadrature spaces.");
+  const bool use_element_local_alpha =
+    alpha_length_scale_policy_ == AlphaLengthScalePolicy::Local;
+  if (use_element_local_alpha)
+  {
+    // Refresh this host-derived geometry cache before launching state
+    // interpolation so the common steady-state path remains device-only.
+    EnsureDeviceElementAlpha_();
+  }
 
   const bool debug_qf =
     ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DEBUG_QF", false);
@@ -424,6 +469,13 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
   const int diff_nq = sigma_qs_->GetIntRule(0).GetNPoints();
   const int rhs_ne = rhs_qs_->GetNE();
   const int rhs_nq = rhs_qs_->GetIntRule(0).GetNPoints();
+  if (use_element_local_alpha)
+  {
+    MFEM_VERIFY(device_element_alpha_.Size() == diff_ne &&
+                  device_element_alpha_.Size() == rhs_ne,
+                "IGR local-alpha element cache must match volume quadrature "
+                "element counts.");
+  }
 
   const mfem::real_t* u_mass_data = u_mass_qf_->Read();
   const mfem::real_t* u_diff_data = u_qf_->Read();
@@ -447,27 +499,56 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
   invrho_kernel.invrho = invrho_data;
   mfem::forall(mass_ne * mass_nq, invrho_kernel);
 
-  igr_device::IGRDeviceAlphaOverRhoKernel ck_kernel;
-  ck_kernel.nq = diff_nq;
-  ck_kernel.ne = diff_ne;
-  ck_kernel.num_eq = num_eq;
-  ck_kernel.alpha = alpha;
-  ck_kernel.rho_floor = rho_floor;
-  ck_kernel.u = u_diff_data;
-  ck_kernel.ck = ck_data;
-  mfem::forall(diff_ne * diff_nq, ck_kernel);
+  if (use_element_local_alpha)
+  {
+    const mfem::real_t* element_alpha = device_element_alpha_.Read();
 
-  igr_device::IGRDeviceSourceKernel src_kernel;
-  src_kernel.nq = rhs_nq;
-  src_kernel.ne = rhs_ne;
-  src_kernel.dim = dim;
-  src_kernel.num_eq = num_eq;
-  src_kernel.alpha = alpha;
-  src_kernel.rho_floor = rho_floor;
-  src_kernel.u = u_rhs_data;
-  src_kernel.grad = grad_rhs_data;
-  src_kernel.src = src_data;
-  mfem::forall(rhs_ne * rhs_nq, src_kernel);
+    igr_device::IGRDeviceLocalAlphaOverRhoKernel ck_kernel;
+    ck_kernel.nq = diff_nq;
+    ck_kernel.ne = diff_ne;
+    ck_kernel.num_eq = num_eq;
+    ck_kernel.rho_floor = rho_floor;
+    ck_kernel.element_alpha = element_alpha;
+    ck_kernel.u = u_diff_data;
+    ck_kernel.ck = ck_data;
+    mfem::forall(diff_ne * diff_nq, ck_kernel);
+
+    igr_device::IGRDeviceLocalSourceKernel src_kernel;
+    src_kernel.nq = rhs_nq;
+    src_kernel.ne = rhs_ne;
+    src_kernel.dim = dim;
+    src_kernel.num_eq = num_eq;
+    src_kernel.rho_floor = rho_floor;
+    src_kernel.element_alpha = element_alpha;
+    src_kernel.u = u_rhs_data;
+    src_kernel.grad = grad_rhs_data;
+    src_kernel.src = src_data;
+    mfem::forall(rhs_ne * rhs_nq, src_kernel);
+  }
+  else
+  {
+    igr_device::IGRDeviceAlphaOverRhoKernel ck_kernel;
+    ck_kernel.nq = diff_nq;
+    ck_kernel.ne = diff_ne;
+    ck_kernel.num_eq = num_eq;
+    ck_kernel.alpha = alpha;
+    ck_kernel.rho_floor = rho_floor;
+    ck_kernel.u = u_diff_data;
+    ck_kernel.ck = ck_data;
+    mfem::forall(diff_ne * diff_nq, ck_kernel);
+
+    igr_device::IGRDeviceSourceKernel src_kernel;
+    src_kernel.nq = rhs_nq;
+    src_kernel.ne = rhs_ne;
+    src_kernel.dim = dim;
+    src_kernel.num_eq = num_eq;
+    src_kernel.alpha = alpha;
+    src_kernel.rho_floor = rho_floor;
+    src_kernel.u = u_rhs_data;
+    src_kernel.grad = grad_rhs_data;
+    src_kernel.src = src_data;
+    mfem::forall(rhs_ne * rhs_nq, src_kernel);
+  }
 #else
   const auto u_mass = mfem::Reshape(u_mass_data, num_eq, mass_nq, mass_ne);
   auto invrho = mfem::Reshape(invrho_data, mass_nq, mass_ne);
@@ -483,11 +564,15 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
 
   const auto u_diff = mfem::Reshape(u_diff_data, num_eq, diff_nq, diff_ne);
   auto ck = mfem::Reshape(ck_data, diff_nq, diff_ne);
+  const mfem::real_t* element_alpha =
+    use_element_local_alpha ? device_element_alpha_.HostRead() : nullptr;
   for (int e = 0; e < diff_ne; ++e)
   {
+    const mfem::real_t alpha_e =
+      use_element_local_alpha ? element_alpha[e] : alpha;
     for (int q = 0; q < diff_nq; ++q)
     {
-      ck(q, e) = frozen_scalar_igr_algebra::AlphaOverDensity(alpha,
+      ck(q, e) = frozen_scalar_igr_algebra::AlphaOverDensity(alpha_e,
                                                              u_diff(0, q, e),
                                                              rho_floor);
     }
@@ -496,6 +581,8 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
   auto src = mfem::Reshape(src_data, rhs_nq, rhs_ne);
   for (int e = 0; e < rhs_ne; ++e)
   {
+    const mfem::real_t alpha_e =
+      use_element_local_alpha ? element_alpha[e] : alpha;
     for (int q = 0; q < rhs_nq; ++q)
     {
       src(q, e) =
@@ -506,7 +593,7 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
           grad_rhs_data + num_eq * dim * (q + rhs_nq * e),
           1,
           num_eq,
-          alpha,
+          alpha_e,
           rho_floor);
     }
   }

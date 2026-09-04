@@ -124,13 +124,19 @@ inline void AddSubsonicInlet(mfem::DGHyperbolicConservationLaws& op,
                              int int_order_offset,
                              int dim,
                              double gamma,
-                             const mfem::Array<int>& marker)
+                             const mfem::Array<int>& marker,
+                             double density_floor =
+                               mfem::kEulerBoundaryDensityFloor,
+                             double pressure_floor =
+                               mfem::kEulerBoundaryPressureFloor)
 {
   op.AddBdrFaceIntegrator(std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
                             numerical_flux,
                             std::make_unique<mfem::SubsonicInletState>(inlet_state,
                                                                         dim,
-                                                                        gamma),
+                                                                        gamma,
+                                                                        density_floor,
+                                                                        pressure_floor),
                             int_order_offset),
                           marker);
 }
@@ -142,14 +148,20 @@ AddSubsonicOutletPressure(mfem::DGHyperbolicConservationLaws& op,
                           int int_order_offset,
                           int dim,
                           double gamma,
-                          const mfem::Array<int>& marker)
+                          const mfem::Array<int>& marker,
+                          double density_floor =
+                            mfem::kEulerBoundaryDensityFloor,
+                          double pressure_floor =
+                            mfem::kEulerBoundaryPressureFloor)
 {
   op.AddBdrFaceIntegrator(
     std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
       numerical_flux,
       std::make_unique<mfem::SubsonicOutletPressureState>(dim,
                                                           gamma,
-                                                          pressure_out),
+                                                          pressure_out,
+                                                          density_floor,
+                                                          pressure_floor),
       int_order_offset),
     marker);
 }
@@ -160,14 +172,20 @@ inline void AddNonReflectingOutlet(mfem::DGHyperbolicConservationLaws& op,
                                    int int_order_offset,
                                    int dim,
                                    double gamma,
-                                   const mfem::Array<int>& marker)
+                                   const mfem::Array<int>& marker,
+                                   double density_floor =
+                                     mfem::kEulerBoundaryDensityFloor,
+                                   double pressure_floor =
+                                     mfem::kEulerBoundaryPressureFloor)
 {
   op.AddBdrFaceIntegrator(
     std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
       numerical_flux,
       std::make_unique<mfem::NonReflectingOutletState>(reference_state,
                                                        dim,
-                                                       gamma),
+                                                       gamma,
+                                                       density_floor,
+                                                       pressure_floor),
       int_order_offset),
     marker);
 }
@@ -178,12 +196,20 @@ inline void AddFarField(mfem::DGHyperbolicConservationLaws& op,
                         int int_order_offset,
                         int dim,
                         double gamma,
-                        const mfem::Array<int>& marker)
+                        const mfem::Array<int>& marker,
+                        double density_floor =
+                          mfem::kEulerBoundaryDensityFloor,
+                        double pressure_floor =
+                          mfem::kEulerBoundaryPressureFloor)
 {
   op.AddBdrFaceIntegrator(
     std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
       numerical_flux,
-      std::make_unique<mfem::FarFieldState>(farfield_state, dim, gamma),
+      std::make_unique<mfem::FarFieldState>(farfield_state,
+                                            dim,
+                                            gamma,
+                                            density_floor,
+                                            pressure_floor),
       int_order_offset),
     marker);
 }
@@ -192,11 +218,17 @@ inline void AddSlipWall(mfem::DGHyperbolicConservationLaws& op,
                         const mfem::NumericalFlux& numerical_flux,
                         int int_order_offset,
                         int dim,
-                        const mfem::Array<int>& marker)
+                        const mfem::Array<int>& marker,
+                        double density_floor =
+                          mfem::kEulerBoundaryDensityFloor,
+                        double pressure_floor =
+                          mfem::kEulerBoundaryPressureFloor)
 {
   op.AddBdrFaceIntegrator(std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
                             numerical_flux,
-                            std::make_unique<mfem::SlipWallState>(dim),
+                            std::make_unique<mfem::SlipWallState>(dim,
+                                                                  density_floor,
+                                                                  pressure_floor),
                             int_order_offset),
                           marker);
 }
@@ -210,7 +242,9 @@ inline void LowerDGEulerBoundaryPlan(
   int int_order_offset,
   int dim,
   double gamma,
-  const EulerBoundaryPlan& plan)
+  const EulerBoundaryPlan& plan,
+  double density_floor = mfem::kEulerBoundaryDensityFloor,
+  double pressure_floor = mfem::kEulerBoundaryPressureFloor)
 {
   for (const EulerBoundaryPlanEntry& entry : plan.Entries())
   {
@@ -237,7 +271,9 @@ inline void LowerDGEulerBoundaryPlan(
                          int_order_offset,
                          dim,
                          gamma,
-                         entry.marker);
+                         entry.marker,
+                         density_floor,
+                         pressure_floor);
       }
       break;
     case EulerBoundaryKind::Outlet:
@@ -255,7 +291,9 @@ inline void LowerDGEulerBoundaryPlan(
                                   int_order_offset,
                                   dim,
                                   gamma,
-                                  entry.marker);
+                                  entry.marker,
+                                  density_floor,
+                                  pressure_floor);
         break;
       case EulerOutletModel::FarField:
         MFEM_VERIFY(entry.state,
@@ -266,12 +304,20 @@ inline void LowerDGEulerBoundaryPlan(
                     int_order_offset,
                     dim,
                     gamma,
-                    entry.marker);
+                    entry.marker,
+                    density_floor,
+                    pressure_floor);
         break;
       }
       break;
     case EulerBoundaryKind::Slip:
-      AddSlipWall(op, numerical_flux, int_order_offset, dim, entry.marker);
+      AddSlipWall(op,
+                  numerical_flux,
+                  int_order_offset,
+                  dim,
+                  entry.marker,
+                  density_floor,
+                  pressure_floor);
       break;
     case EulerBoundaryKind::NonReflecting:
       MFEM_VERIFY(entry.state,
@@ -282,7 +328,9 @@ inline void LowerDGEulerBoundaryPlan(
                              int_order_offset,
                              dim,
                              gamma,
-                             entry.marker);
+                             entry.marker,
+                             density_floor,
+                             pressure_floor);
       break;
     }
   }
@@ -296,12 +344,16 @@ public:
                       const NumericalFlux& numerical_flux,
                       int int_order_offset,
                       int dim,
-                      double gamma)
+                      double gamma,
+                      double density_floor = mfem::kEulerBoundaryDensityFloor,
+                      double pressure_floor = mfem::kEulerBoundaryPressureFloor)
     : op_(op),
       numerical_flux_(numerical_flux),
       int_order_offset_(int_order_offset),
       dim_(dim),
-      gamma_(gamma)
+      gamma_(gamma),
+      density_floor_(density_floor),
+      pressure_floor_(pressure_floor)
   {
   }
 
@@ -312,7 +364,9 @@ public:
                         numerical_flux_,
                         int_order_offset_,
                         dim_,
-                        markers.At(role));
+                        markers.At(role),
+                        density_floor_,
+                        pressure_floor_);
   }
 
   void AddSupersonicOutlet(const BoundaryMarkerMap& markers,
@@ -345,7 +399,9 @@ public:
                              int_order_offset_,
                              dim_,
                              gamma_,
-                             markers.At(role));
+                             markers.At(role),
+                             density_floor_,
+                             pressure_floor_);
   }
 
   void AddSubsonicOutletPressure(const BoundaryMarkerMap& markers,
@@ -358,7 +414,9 @@ public:
                                       int_order_offset_,
                                       dim_,
                                       gamma_,
-                                      markers.At(role));
+                                      markers.At(role),
+                                      density_floor_,
+                                      pressure_floor_);
   }
 
   void AddNonReflectingOutlet(const BoundaryMarkerMap& markers,
@@ -371,7 +429,9 @@ public:
                                    int_order_offset_,
                                    dim_,
                                    gamma_,
-                                   markers.At(role));
+                                   markers.At(role),
+                                   density_floor_,
+                                   pressure_floor_);
   }
 
   void AddFarField(const BoundaryMarkerMap& markers,
@@ -384,7 +444,9 @@ public:
                         int_order_offset_,
                         dim_,
                         gamma_,
-                        markers.At(role));
+                        markers.At(role),
+                        density_floor_,
+                        pressure_floor_);
   }
 
   template <typename StateBuilder>
@@ -407,6 +469,8 @@ private:
   int int_order_offset_ = 0;
   int dim_ = 0;
   double gamma_ = 1.4;
+  double density_floor_ = mfem::kEulerBoundaryDensityFloor;
+  double pressure_floor_ = mfem::kEulerBoundaryPressureFloor;
 };
 
 } // namespace dg_sim

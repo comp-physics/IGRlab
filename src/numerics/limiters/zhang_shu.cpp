@@ -19,6 +19,69 @@
 namespace
 {
 
+bool UsesCollocatedLGLMean(const mfem::ParFiniteElementSpace& vfes,
+                           const mfem::FiniteElement& fe)
+{
+  const auto* collection =
+    dynamic_cast<const mfem::L2_FECollection*>(vfes.FEColl());
+  const auto* tensor = dynamic_cast<const mfem::TensorBasisElement*>(&fe);
+  return collection != nullptr && tensor != nullptr &&
+         collection->GetBasisType() == mfem::BasisType::GaussLobatto &&
+         tensor->GetBasisType() == mfem::BasisType::GaussLobatto;
+}
+
+const mfem::IntegrationRule& ZhangShuAverageRule(
+  const mfem::ParFiniteElementSpace& vfes,
+  const mfem::FiniteElement& fe,
+  mfem::ElementTransformation& transformation,
+  int quadrature_order)
+{
+  if (UsesCollocatedLGLMean(vfes, fe))
+  {
+    // Match DGHyperbolicConservationLaws::ComputeInvMass exactly.  DGSEM's
+    // diagonal mass is defined by the p+1 point GLL rule, including the
+    // Jacobian sampled at those collocation nodes.  Contracting around a mean
+    // formed with a higher-order rule is not conservative in that discrete
+    // norm on curved elements.
+    static mfem::IntegrationRules lgl_rules(
+      0, mfem::Quadrature1D::GaussLobatto);
+    const int order = std::max(1, 2 * fe.GetOrder() - 1);
+    return lgl_rules.Get(transformation.GetGeometryType(), order);
+  }
+  return mfem::IntRules.Get(transformation.GetGeometryType(),
+                            quadrature_order);
+}
+
+void ZhangShuElementAverage(const mfem::ParFiniteElementSpace& vfes,
+                            const mfem::FiniteElement& fe,
+                            mfem::ElementTransformation& transformation,
+                            const mfem::DenseMatrix& element_state,
+                            int num_equations,
+                            int quadrature_order,
+                            mfem::Vector& average)
+{
+  const mfem::IntegrationRule& rule = ZhangShuAverageRule(
+    vfes, fe, transformation, quadrature_order);
+  mfem::Vector shape(fe.GetDof());
+  mfem::Vector point_state(num_equations);
+  average.SetSize(num_equations);
+  average = 0.0;
+  double measure = 0.0;
+  for (int q = 0; q < rule.GetNPoints(); ++q)
+  {
+    const mfem::IntegrationPoint& point = rule.IntPoint(q);
+    transformation.SetIntPoint(&point);
+    fe.CalcShape(point, shape);
+    element_state.MultTranspose(shape, point_state);
+    const double weight = point.weight * transformation.Weight();
+    average.Add(weight, point_state);
+    measure += weight;
+  }
+  MFEM_VERIFY(measure > 0.0,
+              "Zhang-Shu limiter encountered a non-positive element measure.");
+  average /= measure;
+}
+
 struct ElementFaceCacheEntry
 {
   long mesh_sequence = -1;
@@ -37,6 +100,7 @@ struct DeviceLimiterCache
   int dim = 0;
   int d1d = 0;
   int num_eq = 0;
+  bool collocated_lgl_average = false;
   bool tensor_points = false;
   bool mfem_volume_points = false;
   bool mfem_face_points = false;
@@ -61,8 +125,11 @@ struct DeviceLimiterCache
   mfem::Vector theta_rho;
   mfem::Vector theta_p;
   mfem::Vector active;
+  mfem::Vector inadmissible_average;
+  mfem::Vector rejected_element;
   mfem::Vector collapsed_average;
   mfem::Vector average_repair;
+  mfem::Array<mfem::real_t> admissibility_reduce_workspace;
 
   struct FaceCopyPlan
   {
@@ -108,6 +175,10 @@ struct LimiterTimingState
   int warmup_calls = 0;
   int seen_calls = 0;
   int calls = 0;
+  int active_calls = 0;
+  long long limited_elements = 0;
+  long long element_call_opportunities = 0;
+  double minimum_theta = 1.0;
   double total_seconds = 0.0;
   double avg_active_elements = 0.0;
   double avg_tensor_points = 0.0;
@@ -131,6 +202,7 @@ struct LimiterTimingState
   double avg_face_points = 0.0;
   double avg_node_points = 0.0;
   mfem::Array<mfem::real_t> active_reduce_workspace;
+  mfem::Array<mfem::real_t> theta_reduce_workspace;
 
   ~LimiterTimingState()
   {
@@ -139,6 +211,11 @@ struct LimiterTimingState
       return;
     }
     const double inv_calls = 1.0 / static_cast<double>(calls);
+    const double limited_element_fraction =
+      element_call_opportunities > 0
+        ? static_cast<double>(limited_elements) /
+            static_cast<double>(element_call_opportunities)
+        : 0.0;
     const int rank =
       (mfem::Mpi::IsInitialized() && !mfem::Mpi::IsFinalized())
         ? mfem::Mpi::WorldRank()
@@ -146,6 +223,15 @@ struct LimiterTimingState
     std::cout << "[limiter] event=run-summary"
               << " rank=" << rank
               << " calls=" << calls
+              << " active_calls=" << active_calls
+              << " limited_elements=" << limited_elements
+              << " element_call_opportunities="
+              << element_call_opportunities
+              << " limited_element_fraction=" << limited_element_fraction
+              << " minimum_theta=" << minimum_theta
+              << " aggregation=element-call-incidence"
+              << " limited_fraction_denominator="
+              << "element_call_opportunities"
               << " total_s=" << total_seconds
               << " avg_s=" << total_seconds * inv_calls
               << " avg_active_elements=" << avg_active_elements * inv_calls
@@ -211,6 +297,20 @@ struct ActiveCountReductionBody
   }
 };
 
+struct MinimumThetaReductionBody
+{
+  const mfem::real_t* theta_rho = nullptr;
+  const mfem::real_t* theta_p = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int i, mfem::real_t& minimum) const
+  {
+    // The two mean-preserving contractions are applied in sequence, so their
+    // product is the effective contraction of the original polynomial.
+    const mfem::real_t theta = theta_rho[i] * theta_p[i];
+    minimum = theta < minimum ? theta : minimum;
+  }
+};
+
 double CountActiveElements(const mfem::Vector* active,
                            mfem::Array<mfem::real_t>& workspace)
 {
@@ -242,6 +342,97 @@ double CountActiveElements(const mfem::Vector* active,
   return local_active;
 }
 
+double MinimumTheta(const mfem::Vector* theta_rho,
+                    const mfem::Vector* theta_p,
+                    mfem::Array<mfem::real_t>& workspace)
+{
+  if (theta_rho == nullptr || theta_p == nullptr || theta_rho->Size() <= 0)
+  {
+    return 1.0;
+  }
+  MFEM_VERIFY(theta_rho->Size() == theta_p->Size(),
+              "Limiter theta diagnostics must have matching sizes.");
+
+  if (mfem::Device::Allows(mfem::Backend::DEVICE_MASK))
+  {
+    mfem::real_t local_minimum = 1.0;
+    MinimumThetaReductionBody body;
+    body.theta_rho = theta_rho->Read();
+    body.theta_p = theta_p->Read();
+    mfem::reduce(theta_rho->Size(),
+                 local_minimum,
+                 body,
+                 mfem::MinReducer<mfem::real_t>(),
+                 true,
+                 workspace);
+    return static_cast<double>(local_minimum);
+  }
+
+  double local_minimum = 1.0;
+  const double* density = theta_rho->HostRead();
+  const double* pressure = theta_p->HostRead();
+  for (int i = 0; i < theta_rho->Size(); ++i)
+  {
+    local_minimum = std::min(local_minimum, density[i] * pressure[i]);
+  }
+  return local_minimum;
+}
+
+void AccumulateLimiterAggregate(LimiterTimingState& timing,
+                                double local_active,
+                                int local_elements,
+                                double local_minimum_theta,
+                                MPI_Comm communicator)
+{
+  double local_counts[2] = {
+    local_active, static_cast<double>(local_elements)};
+  double global_counts[2] = {local_counts[0], local_counts[1]};
+  double global_minimum_theta = local_minimum_theta;
+  if (mfem::Mpi::IsInitialized() && !mfem::Mpi::IsFinalized())
+  {
+    MPI_Allreduce(local_counts,
+                  global_counts,
+                  2,
+                  mfem::MPITypeMap<double>::mpi_type,
+                  MPI_SUM,
+                  communicator);
+    MPI_Allreduce(&local_minimum_theta,
+                  &global_minimum_theta,
+                  1,
+                  mfem::MPITypeMap<double>::mpi_type,
+                  MPI_MIN,
+                  communicator);
+  }
+
+  const long long global_active =
+    static_cast<long long>(std::llround(global_counts[0]));
+  const long long global_elements =
+    static_cast<long long>(std::llround(global_counts[1]));
+  timing.active_calls += global_active > 0 ? 1 : 0;
+  timing.limited_elements += global_active;
+  timing.element_call_opportunities += global_elements;
+  timing.minimum_theta = std::min(timing.minimum_theta,
+                                  global_minimum_theta);
+  timing.avg_active_elements += global_counts[0];
+}
+
+int GlobalRejectedElementCount(
+  const mfem::ParFiniteElementSpace& vfes,
+  int local_rejected_elements)
+{
+  int global_rejected_elements = local_rejected_elements;
+  if (mfem::Mpi::IsInitialized() && !mfem::Mpi::IsFinalized())
+  {
+    MPI_Allreduce(&local_rejected_elements,
+                  &global_rejected_elements,
+                  1,
+                  mfem::MPITypeMap<int>::mpi_type,
+                  MPI_SUM,
+                  vfes.GetComm());
+  }
+  return global_rejected_elements;
+}
+
 LimiterTimingState& GetLimiterTimingState()
 {
   static LimiterTimingState state;
@@ -262,7 +453,10 @@ LimiterTimingState& GetLimiterTimingState()
 
 void RecordLimiterTiming(double seconds,
                          const DeviceLimiterCache& cache,
-                         const mfem::Vector* active)
+                         const mfem::Vector* active,
+                         const mfem::Vector* theta_rho,
+                         const mfem::Vector* theta_p,
+                         MPI_Comm communicator)
 {
   LimiterTimingState& timing = GetLimiterTimingState();
   if (!timing.enabled)
@@ -276,20 +470,16 @@ void RecordLimiterTiming(double seconds,
 
   double local_active =
     CountActiveElements(active, timing.active_reduce_workspace);
-  double global_active = local_active;
-  if (mfem::Mpi::IsInitialized() && !mfem::Mpi::IsFinalized())
-  {
-    MPI_Allreduce(&local_active,
-                  &global_active,
-                  1,
-                  mfem::MPITypeMap<double>::mpi_type,
-                  MPI_SUM,
-                  MPI_COMM_WORLD);
-  }
+  const double local_minimum_theta =
+    MinimumTheta(theta_rho, theta_p, timing.theta_reduce_workspace);
 
   ++timing.calls;
   timing.total_seconds += seconds;
-  timing.avg_active_elements += global_active;
+  AccumulateLimiterAggregate(timing,
+                             local_active,
+                             cache.ne,
+                             local_minimum_theta,
+                             communicator);
   timing.avg_tensor_points += cache.tensor_points ? 1.0 : 0.0;
   timing.avg_mfem_volume_points += cache.mfem_volume_points ? 1.0 : 0.0;
   timing.avg_mfem_face_points += cache.mfem_face_points ? 1.0 : 0.0;
@@ -531,6 +721,30 @@ MFEM_HOST_DEVICE inline double DevicePressure(const double* state,
          (state[1 + dim] - 0.5 * momentum_sq / rho);
 }
 
+MFEM_HOST_DEVICE inline bool ConservativeStateIsFinite(const double* state,
+                                                       int num_eq)
+{
+  bool finite = true;
+  for (int component = 0; component < num_eq; ++component)
+  {
+    finite = finite && std::isfinite(state[component]);
+  }
+  return finite;
+}
+
+MFEM_HOST_DEVICE inline bool EulerConsumerPointIsFinite(const double* state,
+                                                        int dim,
+                                                        double gamma)
+{
+  const int num_eq = dim + 2;
+  if (!ConservativeStateIsFinite(state, num_eq) ||
+      !std::isfinite(state[0]))
+  {
+    return false;
+  }
+  return std::isfinite(DevicePressure(state, dim, gamma));
+}
+
 MFEM_HOST_DEVICE inline double LimiterPointBasis(const double* shapes,
                                                  const double* factors,
                                                  bool tensor_points,
@@ -696,7 +910,8 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   int num_eq,
   int qord,
   const std::vector<int>& face_qords,
-  mfem::ZhangShuPointSet point_set)
+  mfem::ZhangShuPointSet point_set,
+  bool enforce_vtk_points)
 {
   static std::unordered_map<const mfem::ParFiniteElementSpace*,
                             std::unique_ptr<DeviceLimiterCache>> caches;
@@ -713,6 +928,8 @@ DeviceLimiterCache& GetDeviceLimiterCache(
     mfem::QuadratureInterpolator::SupportsFESpace(vfes);
   const bool requested_mfem_face_points =
     ne > 0 && SupportsMfemFaceLimiterPath(vfes, face_qords);
+  const bool requested_collocated_lgl_average =
+    ne > 0 && UsesCollocatedLGLMean(vfes, *vfes.GetFE(0));
   const auto* l2_fec =
     dynamic_cast<const mfem::L2_FECollection*>(vfes.FEColl());
   const bool consumer_points =
@@ -721,8 +938,7 @@ DeviceLimiterCache& GetDeviceLimiterCache(
     (l2_fec != nullptr &&
      l2_fec->GetBasisType() == mfem::BasisType::GaussLobatto) ||
     consumer_points;
-  const bool requested_enforce_vtk_points =
-    dg_igr::EnvFlagEnabledDefault("DG_IGR_LIMITER_ENFORCE_VTK_POINTS", false);
+  const bool requested_enforce_vtk_points = enforce_vtk_points;
   const mfem::QuadratureInterpolator* current_volume_interpolator = nullptr;
   int current_volume_nq = 0;
   if (requested_mfem_volume_points)
@@ -742,6 +958,8 @@ DeviceLimiterCache& GetDeviceLimiterCache(
     cache_ptr->qord != qord || cache_ptr->ne != ne ||
     cache_ptr->dof != dof || cache_ptr->num_eq != num_eq ||
     cache_ptr->face_qords != face_qords ||
+    cache_ptr->collocated_lgl_average !=
+      requested_collocated_lgl_average ||
     cache_ptr->mfem_volume_points != requested_mfem_volume_points ||
     cache_ptr->mfem_face_points != requested_mfem_face_points ||
     cache_ptr->enforce_nodes != requested_enforce_nodes ||
@@ -769,6 +987,7 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   cache.dim = mesh.Dimension();
   cache.num_eq = num_eq;
   cache.face_qords = face_qords;
+  cache.collocated_lgl_average = requested_collocated_lgl_average;
   cache.restriction = current_restriction;
   MFEM_VERIFY(cache.restriction != nullptr,
               "Device positivity limiter requires an element restriction.");
@@ -869,20 +1088,30 @@ DeviceLimiterCache& GetDeviceLimiterCache(
       *vfes.GetElementTransformation(e);
     const mfem::IntegrationRule& volume_rule =
       mfem::IntRules.Get(transformation.GetGeometryType(), qord);
+    const mfem::IntegrationRule& average_rule = ZhangShuAverageRule(
+      vfes, fe, transformation, qord);
     shape.SetSize(dof);
     mfem::Vector integral(dof);
     integral = 0.0;
     double volume = 0.0;
-    for (int q = 0; q < volume_rule.GetNPoints(); ++q)
+    for (int q = 0; q < average_rule.GetNPoints(); ++q)
     {
-      const mfem::IntegrationPoint& ip = volume_rule.IntPoint(q);
+      const mfem::IntegrationPoint& ip = average_rule.IntPoint(q);
       transformation.SetIntPoint(&ip);
       fe.CalcShape(ip, shape);
       const double weight = ip.weight * transformation.Weight();
       volume += weight;
       integral.Add(weight, shape);
-      if (!cache.mfem_volume_points)
+    }
+    if (!cache.mfem_volume_points)
+    {
+      // Average and positivity-point rules intentionally differ for DGSEM:
+      // retain the caller-selected volume points while using the collocated
+      // GLL rule only for the mean that defines the contraction.
+      for (int q = 0; q < volume_rule.GetNPoints(); ++q)
       {
+        const mfem::IntegrationPoint& ip = volume_rule.IntPoint(q);
+        fe.CalcShape(ip, shape);
         for (int d = 0; d < dof; ++d)
         {
           point_shapes.push_back(shape(NativeDof(fe, d)));
@@ -1059,6 +1288,8 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   cache.theta_rho.SetSize(ne);
   cache.theta_p.SetSize(ne);
   cache.active.SetSize(ne);
+  cache.inadmissible_average.SetSize(ne);
+  cache.rejected_element.SetSize(ne);
   cache.collapsed_average.SetSize(ne);
   cache.average_repair.SetSize(ne * num_eq);
   if (cache.mfem_face_points)
@@ -1099,6 +1330,8 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   cache.theta_rho.UseDevice(true);
   cache.theta_p.UseDevice(true);
   cache.active.UseDevice(true);
+  cache.inadmissible_average.UseDevice(true);
+  cache.rejected_element.UseDevice(true);
   cache.collapsed_average.UseDevice(true);
   cache.average_repair.UseDevice(true);
   cache.face_component_lvec.UseDevice(true);
@@ -1209,7 +1442,9 @@ void ApplyDeviceZhangShuPositivityLimiter(
   const std::vector<int>& face_qords,
   int p_bisect_iters,
   mfem::ZhangShuPointSet point_set,
-  mfem::ZhangShuLimiterElementDiagnostics* diagnostics)
+  bool enforce_vtk_points,
+  mfem::ZhangShuLimiterElementDiagnostics* diagnostics,
+  bool* local_state_modified)
 {
   ::dg_igr::NVTXRange limiter_range("Limiter/Zhang-Shu");
   LimiterTimingState& timing = GetLimiterTimingState();
@@ -1218,7 +1453,12 @@ void ApplyDeviceZhangShuPositivityLimiter(
 
   const int num_eq = dim + 2;
   DeviceLimiterCache& cache =
-    GetDeviceLimiterCache(vfes, num_eq, qord, face_qords, point_set);
+    GetDeviceLimiterCache(vfes,
+                          num_eq,
+                          qord,
+                          face_qords,
+                          point_set,
+                          enforce_vtk_points);
   cache.restriction->Mult(U, cache.element_state);
   if (cache.mfem_volume_points)
   {
@@ -1252,6 +1492,8 @@ void ApplyDeviceZhangShuPositivityLimiter(
   double* theta_rho = cache.theta_rho.Write();
   double* theta_p = cache.theta_p.Write();
   double* active = cache.active.Write();
+  double* inadmissible_average = cache.inadmissible_average.Write();
+  double* rejected_element = cache.rejected_element.Write();
   double* collapsed_average = cache.collapsed_average.Write();
   double* average_repair = cache.average_repair.Write();
 
@@ -1266,49 +1508,41 @@ void ApplyDeviceZhangShuPositivityLimiter(
                       state[d + dof * (c + num_eq * e)];
       }
     }
-    double original_average[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
     if (capture_diagnostics)
     {
       for (int c = 0; c < num_eq; ++c)
       {
-        original_average[c] = average[c];
         average_repair[e + ne * c] = 0.0;
       }
       collapsed_average[e] = 0.0;
     }
 
-    const double rho_bar = average[0] > rho_min ? average[0] : rho_min;
+    bool average_is_finite = true;
+    for (int c = 0; c < num_eq; ++c)
+    {
+      average_is_finite = average_is_finite && std::isfinite(average[c]);
+    }
+    const double rho_bar = average[0];
     double momentum_sq = 0.0;
     for (int d = 0; d < dim; ++d)
     {
       momentum_sq += average[1 + d] * average[1 + d];
     }
-    const double kinetic = 0.5 * momentum_sq /
-                           (rho_bar > 1.0e-16 ? rho_bar : 1.0e-16);
+    const double kinetic = average_is_finite && rho_bar > rho_min
+                             ? 0.5 * momentum_sq / rho_bar
+                             : 0.0;
     const double pressure_bar =
       (gamma - 1.0) * (average[1 + dim] - kinetic);
-    if (rho_bar <= rho_min || pressure_bar <= p_min)
+    const bool average_is_admissible =
+      average_is_finite && rho_bar > rho_min &&
+      std::isfinite(pressure_bar) && pressure_bar > p_min;
+    inadmissible_average[e] = average_is_admissible ? 0.0 : 1.0;
+    bool consumer_points_are_finite = true;
+    if (!average_is_admissible)
     {
-      average[0] = rho_bar;
-      average[1 + dim] = kinetic + p_min / (gamma - 1.0);
-      for (int d = 0; d < dof; ++d)
-      {
-        for (int c = 0; c < num_eq; ++c)
-        {
-          state[d + dof * (c + num_eq * e)] = average[c];
-        }
-      }
-      theta_rho[e] = 0.0;
-      theta_p[e] = 0.0;
-      active[e] = 1.0;
-      if (capture_diagnostics)
-      {
-        collapsed_average[e] = 1.0;
-        for (int c = 0; c < num_eq; ++c)
-        {
-          average_repair[e + ne * c] = average[c] - original_average[c];
-        }
-      }
+      theta_rho[e] = 1.0;
+      theta_p[e] = 1.0;
+      active[e] = 0.0;
     }
     else
     {
@@ -1317,8 +1551,21 @@ void ApplyDeviceZhangShuPositivityLimiter(
       {
         for (int q = 0; q < volume_nq; ++q)
         {
-          const double rho =
-            volume_values[q + volume_nq * (num_eq * e)];
+          double point_state[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+          for (int c = 0; c < num_eq; ++c)
+          {
+            point_state[c] =
+              volume_values[q + volume_nq * (c + num_eq * e)];
+          }
+          const bool point_state_is_finite =
+            EulerConsumerPointIsFinite(point_state, dim, gamma);
+          consumer_points_are_finite =
+            consumer_points_are_finite && point_state_is_finite;
+          if (!point_state_is_finite)
+          {
+            continue;
+          }
+          const double rho = point_state[0];
           if (rho < rho_min)
           {
             const double denominator = average[0] - rho;
@@ -1333,7 +1580,21 @@ void ApplyDeviceZhangShuPositivityLimiter(
       {
         for (int point = face_offsets[e]; point < face_offsets[e + 1]; ++point)
         {
-          const double rho = face_values[point];
+          double point_state[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+          for (int c = 0; c < num_eq; ++c)
+          {
+            point_state[c] =
+              face_values[point + total_face_points * c];
+          }
+          const bool point_state_is_finite =
+            EulerConsumerPointIsFinite(point_state, dim, gamma);
+          consumer_points_are_finite =
+            consumer_points_are_finite && point_state_is_finite;
+          if (!point_state_is_finite)
+          {
+            continue;
+          }
+          const double rho = point_state[0];
           if (rho < rho_min)
           {
             const double denominator = average[0] - rho;
@@ -1346,19 +1607,32 @@ void ApplyDeviceZhangShuPositivityLimiter(
       }
       for (int point = offsets[e]; point < offsets[e + 1]; ++point)
       {
-        double rho = 0.0;
+        double point_state[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
         for (int d = 0; d < dof; ++d)
         {
-          rho += LimiterPointBasis(shapes,
-                                   factors,
-                                   tensor_points,
-                                   point,
-                                   d,
-                                   dof,
-                                   dim,
-                                   d1d) *
-                 state[d + dof * (num_eq * e)];
+          const double basis = LimiterPointBasis(shapes,
+                                                 factors,
+                                                 tensor_points,
+                                                 point,
+                                                 d,
+                                                 dof,
+                                                 dim,
+                                                 d1d);
+          for (int c = 0; c < num_eq; ++c)
+          {
+            point_state[c] +=
+              basis * state[d + dof * (c + num_eq * e)];
+          }
         }
+        const bool point_state_is_finite =
+          EulerConsumerPointIsFinite(point_state, dim, gamma);
+        consumer_points_are_finite =
+          consumer_points_are_finite && point_state_is_finite;
+        if (!point_state_is_finite)
+        {
+          continue;
+        }
+        const double rho = point_state[0];
         if (rho < rho_min)
         {
           const double denominator = average[0] - rho;
@@ -1394,6 +1668,14 @@ void ApplyDeviceZhangShuPositivityLimiter(
             point_state[c] = average[c] +
                              rho_theta * (original - average[c]);
           }
+          const bool point_state_is_finite =
+            EulerConsumerPointIsFinite(point_state, dim, gamma);
+          consumer_points_are_finite =
+            consumer_points_are_finite && point_state_is_finite;
+          if (!point_state_is_finite)
+          {
+            continue;
+          }
           if (DevicePressure(point_state, dim, gamma) < p_min)
           {
             const double candidate =
@@ -1421,6 +1703,14 @@ void ApplyDeviceZhangShuPositivityLimiter(
               face_values[point + total_face_points * c];
             point_state[c] = average[c] +
                              rho_theta * (original - average[c]);
+          }
+          const bool point_state_is_finite =
+            EulerConsumerPointIsFinite(point_state, dim, gamma);
+          consumer_points_are_finite =
+            consumer_points_are_finite && point_state_is_finite;
+          if (!point_state_is_finite)
+          {
+            continue;
           }
           if (DevicePressure(point_state, dim, gamma) < p_min)
           {
@@ -1457,6 +1747,14 @@ void ApplyDeviceZhangShuPositivityLimiter(
                               state[d + dof * (c + num_eq * e)];
           }
         }
+        const bool point_state_is_finite =
+          EulerConsumerPointIsFinite(point_state, dim, gamma);
+        consumer_points_are_finite =
+          consumer_points_are_finite && point_state_is_finite;
+        if (!point_state_is_finite)
+        {
+          continue;
+        }
         if (DevicePressure(point_state, dim, gamma) < p_min)
         {
           const double candidate =
@@ -1488,31 +1786,62 @@ void ApplyDeviceZhangShuPositivityLimiter(
       theta_p[e] = pressure_theta;
       active[e] = (rho_theta < 1.0 || pressure_theta < 1.0) ? 1.0 : 0.0;
     }
+    rejected_element[e] =
+      (average_is_admissible && consumer_points_are_finite) ? 0.0 : 1.0;
     for (int c = 0; c < num_eq; ++c)
     {
       averages[c + num_eq * e] = average[c];
     }
   });
 
-  cache.restriction->MultTranspose(cache.element_state, U);
+  const int local_rejected_elements = static_cast<int>(
+    CountActiveElements(&cache.rejected_element,
+                        cache.admissibility_reduce_workspace));
+  const int global_rejected_elements =
+    GlobalRejectedElementCount(vfes, local_rejected_elements);
+  if (global_rejected_elements == 0)
+  {
+    cache.restriction->MultTranspose(cache.element_state, U);
+  }
   if (diagnostics != nullptr)
   {
     CopyDeviceVector(cache.theta_rho, diagnostics->theta_rho);
     CopyDeviceVector(cache.theta_p, diagnostics->theta_p);
     CopyDeviceVector(cache.active, diagnostics->active);
+    CopyDeviceVector(cache.inadmissible_average,
+                     diagnostics->inadmissible_average);
     CopyDeviceVector(cache.collapsed_average,
                      diagnostics->collapsed_average);
     CopyDeviceVector(cache.average_repair, diagnostics->average_repair);
   }
 
   if (timing.enabled) { MFEM_DEVICE_SYNC; }
-  if (timing.enabled)
+  // A rejected mean or non-finite consumer point commits no element update.
+  // Match the host path by aggregating only completed limiter applications;
+  // rejected attempts remain visible in the explicit-time summary and wall
+  // clock.
+  if (timing.enabled && global_rejected_elements == 0)
   {
     const double seconds =
       std::chrono::duration<double>(
         std::chrono::steady_clock::now() - timing_start)
         .count();
-    RecordLimiterTiming(seconds, cache, &cache.active);
+    RecordLimiterTiming(seconds,
+                        cache,
+                        &cache.active,
+                        &cache.theta_rho,
+                        &cache.theta_p,
+                        vfes.GetComm());
+  }
+  if (global_rejected_elements > 0)
+  {
+    throw mfem::RecoverableLimiterFailure(global_rejected_elements);
+  }
+  if (local_state_modified != nullptr)
+  {
+    *local_state_modified =
+      CountActiveElements(&cache.active,
+                          cache.admissibility_reduce_workspace) > 0.0;
   }
 }
 
@@ -1531,10 +1860,18 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
                                     const std::vector<int>& face_quad_orders,
                                     int p_bisect_iters,
                                     ZhangShuPointSet point_set,
-                                    ZhangShuLimiterElementDiagnostics* diagnostics)
+                                    ZhangShuLimiterElementDiagnostics* diagnostics,
+                                    std::optional<bool> enforce_vtk_points,
+                                    bool* local_state_modified)
 {
   MFEM_VERIFY(vfes.GetOrdering() == Ordering::byNODES,
               "Positivity limiter assumes byNODES ordering.");
+  if (local_state_modified != nullptr)
+  {
+    // A rejected stage commits no conservative-state update.  Initialize the
+    // optional result accordingly before any collective admission can throw.
+    *local_state_modified = false;
+  }
 
   const int num_eq = dim + 2;
   const int NE = vfes.GetNE();
@@ -1550,6 +1887,14 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
     (quad_order > 0) ? quad_order : (2 * vfes.GetFE(0)->GetOrder() + 2);
   const std::vector<int> limiter_face_qords =
     BuildFaceQuadratureOrders(vfes, qord, face_quad_orders);
+  const bool effective_enforce_vtk_points =
+    enforce_vtk_points.value_or(::dg_igr::EnvFlagEnabledDefault(
+      "DG_IGR_LIMITER_ENFORCE_VTK_POINTS", false));
+
+  if (diagnostics)
+  {
+    diagnostics->SetSize(NE, num_eq);
+  }
 
   if (Device::Allows(Backend::DEVICE_MASK))
   {
@@ -1565,13 +1910,16 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
                                          limiter_face_qords,
                                          p_bisect_iters,
                                          point_set,
-                                         diagnostics);
+                                         effective_enforce_vtk_points,
+                                         diagnostics,
+                                         local_state_modified);
     return;
   }
 
   LimiterTimingState& timing = GetLimiterTimingState();
   const auto timing_start = std::chrono::steady_clock::now();
   CpuLimiterPhaseSample phase;
+  double minimum_theta = 1.0;
   using PhaseClock = std::chrono::steady_clock;
   auto phase_start = [&]()
   {
@@ -1585,9 +1933,152 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
     }
   };
 
-  if (diagnostics)
+  mfem::Vector element_averages(NE * num_eq);
+  int local_rejected_elements = 0;
+  // The host path scatters elements in place below. Preflight the complete
+  // configured point union first so every rank reaches the collective
+  // decision and a recoverable rejection leaves the full input unchanged.
+  for (int i = 0; i < NE; ++i)
   {
-    diagnostics->SetSize(NE, num_eq);
+    const FiniteElement* fe = vfes.GetFE(i);
+    ElementTransformation* Tr = vfes.GetElementTransformation(i);
+    const int dof = fe->GetDof();
+    vfes.GetElementVDofs(i, vdofs);
+    U.GetSubVector(vdofs, elvec);
+    elmat.UseExternalData(elvec.GetData(), dof, num_eq);
+
+    const auto average_start = phase_start();
+    ZhangShuElementAverage(vfes,
+                           *fe,
+                           *Tr,
+                           elmat,
+                           num_eq,
+                           qord,
+                           Ubar);
+    phase_add(average_start, phase.average_seconds);
+    for (int component = 0; component < num_eq; ++component)
+    {
+      element_averages(component + num_eq * i) = Ubar(component);
+    }
+
+    bool average_is_finite = true;
+    for (int component = 0; component < num_eq; ++component)
+    {
+      average_is_finite =
+        average_is_finite && std::isfinite(Ubar(component));
+    }
+    double momentum_sq = 0.0;
+    for (int d = 0; d < dim; ++d)
+    {
+      momentum_sq += Ubar(1 + d) * Ubar(1 + d);
+    }
+    const double kinetic = average_is_finite && Ubar(0) > rho_min
+                             ? 0.5 * momentum_sq / Ubar(0)
+                             : 0.0;
+    const double pressure_bar =
+      (gamma - 1.0) * (Ubar(1 + dim) - kinetic);
+    const bool average_is_admissible =
+      average_is_finite && Ubar(0) > rho_min &&
+      std::isfinite(pressure_bar) && pressure_bar > p_min;
+    bool consumer_points_are_finite = true;
+    if (average_is_admissible)
+    {
+      auto check_consumer_point = [&](const mfem::Vector& point_state)
+      {
+        consumer_points_are_finite =
+          consumer_points_are_finite &&
+          EulerConsumerPointIsFinite(point_state.GetData(), dim, gamma);
+      };
+
+      const IntegrationRule& ir = IntRules.Get(Tr->GetGeometryType(), qord);
+      shape.SetSize(dof);
+      for (int q = 0; q < ir.GetNPoints(); ++q)
+      {
+        const IntegrationPoint& ip = ir.IntPoint(q);
+        Tr->SetIntPoint(&ip);
+        fe->CalcShape(ip, shape);
+        elmat.MultTranspose(shape, Up);
+        check_consumer_point(Up);
+      }
+
+      for (const int face : elem_faces[i])
+      {
+        FaceElementTransformations* FTr =
+          mesh.GetFaceElementTransformations(face);
+        if (FTr == nullptr)
+        {
+          continue;
+        }
+        int e1 = -1;
+        int e2 = -1;
+        mesh.GetFaceElements(face, &e1, &e2);
+        const bool elem_is_first = e1 == i;
+        const bool elem_is_second = e2 == i;
+        if (!elem_is_first && !elem_is_second)
+        {
+          continue;
+        }
+        for (const int fqord : limiter_face_qords)
+        {
+          const IntegrationRule& fir =
+            IntRules.Get(FTr->GetGeometryType(), fqord);
+          for (int q = 0; q < fir.GetNPoints(); ++q)
+          {
+            const IntegrationPoint& fip = fir.IntPoint(q);
+            FTr->SetAllIntPoints(&fip);
+            const IntegrationPoint& eip = elem_is_first
+                                             ? FTr->GetElement1IntPoint()
+                                             : FTr->GetElement2IntPoint();
+            fe->CalcShape(eip, shape);
+            elmat.MultTranspose(shape, Up);
+            check_consumer_point(Up);
+          }
+        }
+      }
+
+      const auto* fec_l2 =
+        dynamic_cast<const L2_FECollection*>(vfes.FEColl());
+      const bool enforce_nodes =
+        (fec_l2 != nullptr &&
+         fec_l2->GetBasisType() == BasisType::GaussLobatto) ||
+        point_set == ZhangShuPointSet::kConsumer;
+      if (enforce_nodes)
+      {
+        for (int node = 0; node < dof; ++node)
+        {
+          elmat.GetRow(node, Up);
+          check_consumer_point(Up);
+        }
+      }
+
+      if (effective_enforce_vtk_points)
+      {
+        const RefinedGeometry* refined =
+          GlobGeometryRefiner.Refine(fe->GetGeomType(), fe->GetOrder(), 1);
+        for (int q = 0; q < refined->RefPts.GetNPoints(); ++q)
+        {
+          fe->CalcShape(refined->RefPts.IntPoint(q), shape);
+          elmat.MultTranspose(shape, Up);
+          check_consumer_point(Up);
+        }
+      }
+    }
+
+    if (!average_is_admissible || !consumer_points_are_finite)
+    {
+      ++local_rejected_elements;
+      if (diagnostics && !average_is_admissible)
+      {
+        diagnostics->inadmissible_average(i) = 1.0;
+      }
+    }
+  }
+
+  const int global_rejected_elements =
+    GlobalRejectedElementCount(vfes, local_rejected_elements);
+  if (global_rejected_elements > 0)
+  {
+    throw RecoverableLimiterFailure(global_rejected_elements);
   }
 
   for (int i = 0; i < NE; i++)
@@ -1598,9 +2089,7 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
     const bool enforce_nodes =
       (fec_l2 != nullptr && fec_l2->GetBasisType() == BasisType::GaussLobatto) ||
       consumer_points;
-    const bool enforce_vtk_points =
-      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_LIMITER_ENFORCE_VTK_POINTS",
-                                      false);
+    const bool enforce_vtk_points = effective_enforce_vtk_points;
     ElementTransformation* Tr = vfes.GetElementTransformation(i);
     const int dof = fe->GetDof();
     vfes.GetElementVDofs(i, vdofs);
@@ -1608,56 +2097,11 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
     U.GetSubVector(vdofs, elvec);
     elmat.UseExternalData(elvec.GetData(), dof, num_eq);
 
-    // --- compute cell average ---
-    const auto average_start = phase_start();
-    dg_igr::limiters_detail::ElementAverage(
-      *fe, *Tr, elmat, num_eq, qord, Ubar);
-    phase_add(average_start, phase.average_seconds);
-
-    // If the average itself is unphysical, collapse element to constant admissible state
+    // The collective preflight above established that this mean is admissible.
+    // Reuse it so strict validation does not duplicate the average work.
+    for (int component = 0; component < num_eq; ++component)
     {
-      const auto admissible_average_start = phase_start();
-      const double original_rho_bar = Ubar(0);
-      const double rho_bar = std::max(Ubar(0), rho_min);
-      double mom2_bar = 0.0;
-      for (int d = 0; d < dim; ++d)
-        mom2_bar += Ubar(1 + d) * Ubar(1 + d);
-      const double k_bar = 0.5 * mom2_bar / std::max(rho_bar, 1e-16);
-      double E_bar = Ubar(1 + dim);
-      const double original_energy_bar = E_bar;
-      double p_bar = (gamma - 1.0) * (E_bar - k_bar);
-
-      if (rho_bar <= rho_min || p_bar <= p_min)
-      {
-        phase.collapsed_elements += 1.0;
-        phase.active_elements += 1.0;
-        Ubar(0) = rho_bar;
-        E_bar = k_bar + p_min / (gamma - 1.0);
-        Ubar(1 + dim) = E_bar;
-
-        for (int j = 0; j < dof; ++j)
-        {
-          elmat.GetRow(j, row);
-          row = Ubar;
-          elmat.SetRow(j, row);
-        }
-        U.SetSubVector(vdofs, elmat.GetData());
-        if (diagnostics)
-        {
-          diagnostics->active(i) = 1.0;
-          diagnostics->theta_rho(i) = 0.0;
-          diagnostics->theta_p(i) = 0.0;
-          diagnostics->collapsed_average(i) = 1.0;
-          diagnostics->average_repair(i) = Ubar(0) - original_rho_bar;
-          diagnostics->average_repair(i + NE * (1 + dim)) =
-            Ubar(1 + dim) - original_energy_bar;
-        }
-        phase_add(admissible_average_start,
-                  phase.admissible_average_seconds);
-        continue; // done with this element
-      }
-      phase_add(admissible_average_start,
-                phase.admissible_average_seconds);
+      Ubar(component) = element_averages(component + num_eq * i);
     }
 
     // --- positivity points (use same IR as average) ---
@@ -1879,6 +2323,7 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
     {
       phase.active_elements += 1.0;
     }
+    minimum_theta = std::min(minimum_theta, theta_rho * theta_p);
 
     if (diagnostics)
     {
@@ -1896,23 +2341,16 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
   {
     if (timing.seen_calls++ >= timing.warmup_calls)
     {
-      const double local_active = phase.active_elements;
-      double global_active = local_active;
-      if (Mpi::IsInitialized() && !Mpi::IsFinalized())
-      {
-        MPI_Allreduce(&local_active,
-                      &global_active,
-                      1,
-                      MPITypeMap<double>::mpi_type,
-                      MPI_SUM,
-                      MPI_COMM_WORLD);
-      }
       ++timing.calls;
       timing.total_seconds +=
         std::chrono::duration<double>(
           std::chrono::steady_clock::now() - timing_start)
           .count();
-      timing.avg_active_elements += global_active;
+      AccumulateLimiterAggregate(timing,
+                                 phase.active_elements,
+                                 NE,
+                                 minimum_theta,
+                                 vfes.GetComm());
       timing.avg_tensor_points += 0.0;
       timing.avg_point_count += 0.0;
       if (timing.phase_enabled)
@@ -1935,6 +2373,10 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
         timing.avg_node_points += phase.node_points;
       }
     }
+  }
+  if (local_state_modified != nullptr)
+  {
+    *local_state_modified = phase.active_elements > 0.0;
   }
 }
 

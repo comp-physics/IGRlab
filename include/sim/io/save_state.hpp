@@ -27,10 +27,12 @@ inline void SaveInitialEulerState(ExampleContext& ctx,
                                   const std::string& output_dir = ".")
 {
   std::filesystem::create_directories(output_dir);
+  int communicator_rank = 0;
+  MPI_Comm_rank(ctx.Mesh().GetComm(), &communicator_rank);
 
   std::ostringstream mesh_name;
   mesh_name << mesh_prefix << "." << std::setfill('0') << std::setw(6)
-            << mfem::Mpi::WorldRank();
+            << communicator_rank;
   const std::filesystem::path mesh_path =
     std::filesystem::path(output_dir) / mesh_name.str();
   std::ofstream mesh_ofs(mesh_path.string().c_str());
@@ -43,7 +45,7 @@ inline void SaveInitialEulerState(ExampleContext& ctx,
                              sol.GetData() + k * ctx.spaces.fes.GetNDofs());
     std::ostringstream sol_name;
     sol_name << field_prefix << "-" << k << "-init." << std::setfill('0')
-             << std::setw(6) << mfem::Mpi::WorldRank();
+             << std::setw(6) << communicator_rank;
     const std::filesystem::path sol_path =
       std::filesystem::path(output_dir) / sol_name.str();
     std::ofstream sol_ofs(sol_path.string().c_str());
@@ -62,10 +64,12 @@ SaveFinalEulerState(ExampleContext& ctx,
                     const std::string& output_dir = ".")
 {
   std::filesystem::create_directories(output_dir);
+  int communicator_rank = 0;
+  MPI_Comm_rank(ctx.Mesh().GetComm(), &communicator_rank);
 
   std::ostringstream mesh_name;
   mesh_name << mesh_prefix << "." << std::setfill('0') << std::setw(6)
-            << mfem::Mpi::WorldRank();
+            << communicator_rank;
   const std::filesystem::path mesh_path =
     std::filesystem::path(output_dir) / mesh_name.str();
   std::ofstream mesh_ofs(mesh_path.string().c_str());
@@ -78,7 +82,7 @@ SaveFinalEulerState(ExampleContext& ctx,
                              sol.GetData() + k * ctx.spaces.fes.GetNDofs());
     std::ostringstream sol_name;
     sol_name << field_prefix << "-" << k << "-final." << std::setfill('0')
-             << std::setw(6) << mfem::Mpi::WorldRank();
+             << std::setw(6) << communicator_rank;
     const std::filesystem::path sol_path =
       std::filesystem::path(output_dir) / sol_name.str();
     std::ofstream sol_ofs(sol_path.string().c_str());

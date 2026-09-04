@@ -131,12 +131,36 @@ int main(int argc, char** argv)
     6,
     {5},
     16,
-    mfem::ZhangShuPointSet::kQuadrature);
+    mfem::ZhangShuPointSet::kQuadrature,
+    /*diagnostics=*/nullptr,
+    /*enforce_vtk_points=*/false);
   if (!(MinDofPressure(vfes, quadrature_only) < 0.0))
   {
     std::cerr
       << "[FAIL] CUDA quadrature policy unexpectedly constrained FE nodes\n";
     return 3;
+  }
+
+  mfem::ParGridFunction vtk_points(&vfes);
+  vtk_points = point_set_initial;
+  mfem::ApplyZhangShuPositivityLimiter(
+    vfes,
+    vtk_points,
+    kDim,
+    kGamma,
+    1.0e-10,
+    1.0e-10,
+    6,
+    {5},
+    16,
+    mfem::ZhangShuPointSet::kQuadrature,
+    /*diagnostics=*/nullptr,
+    /*enforce_vtk_points=*/true);
+  if (!(MinDofPressure(vfes, vtk_points) >= 0.99e-10))
+  {
+    std::cerr << "[FAIL] CUDA VTK-point policy did not constrain refined "
+                 "output points\n";
+    return 7;
   }
 
   mfem::ParGridFunction consumer(&vfes);
@@ -177,6 +201,105 @@ int main(int argc, char** argv)
     return 2;
   }
 
+  int global_ndofs = ndofs;
+  MPI_Allreduce(MPI_IN_PLACE,
+                &global_ndofs,
+                1,
+                mfem::MPITypeMap<int>::mpi_type,
+                MPI_SUM,
+                vfes.GetComm());
+  bool nonfinite_scan_ok = true;
+  for (int component = 0; component < kNumEq; ++component)
+  {
+    mfem::ParGridFunction nonfinite_state(&vfes);
+    nonfinite_state = initial;
+    double* nonfinite_data = nonfinite_state.HostReadWrite();
+    for (int d = 0; d < ndofs; ++d)
+    {
+      nonfinite_data[d + component * ndofs] =
+        std::numeric_limits<double>::quiet_NaN();
+    }
+    const auto scan = mfem::dg_igr::ScanEulerAdmissibility(
+      vfes,
+      nonfinite_state,
+      kDim,
+      kGamma,
+      1.0e-10,
+      p_min,
+      0,
+      {},
+      mfem::dg_igr::EulerAdmissibilityPointSet::Dof);
+    nonfinite_scan_ok = nonfinite_scan_ok &&
+                        scan.global_bad_pressure == global_ndofs &&
+                        scan.global_bad_rho ==
+                          (component == 0 ? global_ndofs : 0);
+  }
+
+  mfem::ParGridFunction nonfinite_pressure(&vfes);
+  nonfinite_pressure = initial;
+  double* nonfinite_pressure_data = nonfinite_pressure.HostReadWrite();
+  for (int d = 0; d < ndofs; ++d)
+  {
+    nonfinite_pressure_data[d + 3 * ndofs] =
+      std::numeric_limits<double>::max();
+  }
+  const auto nonfinite_pressure_scan =
+    mfem::dg_igr::ScanEulerAdmissibility(
+      vfes,
+      nonfinite_pressure,
+      kDim,
+      /*gamma=*/3.0,
+      1.0e-10,
+      p_min,
+      0,
+      {},
+      mfem::dg_igr::EulerAdmissibilityPointSet::Dof);
+  nonfinite_scan_ok = nonfinite_scan_ok &&
+                      nonfinite_pressure_scan.global_bad_rho == 0 &&
+                      nonfinite_pressure_scan.global_bad_pressure ==
+                        global_ndofs;
+  if (!nonfinite_scan_ok)
+  {
+    std::cerr << "[FAIL] admissibility scan accepted a nonfinite state or "
+                 "derived pressure\n";
+    return 6;
+  }
+
+  mfem::ParGridFunction invalid_mean(&vfes);
+  invalid_mean = initial;
+  double* invalid_data = invalid_mean.HostReadWrite();
+  for (int d = 0; d < ndofs; ++d)
+  {
+    invalid_data[d] = -1.0;
+  }
+  const mfem::Vector invalid_before(invalid_mean);
+  int rejected_elements = 0;
+  try
+  {
+    mfem::ApplyZhangShuPositivityLimiter(
+      vfes,
+      invalid_mean,
+      kDim,
+      kGamma,
+      1.0e-10,
+      p_min,
+      6,
+      {5},
+      16,
+      mfem::ZhangShuPointSet::kConsumer);
+  }
+  catch (const mfem::RecoverableLimiterFailure& failure)
+  {
+    rejected_elements = failure.GlobalRejectedElementCount();
+  }
+  mfem::Vector invalid_error(invalid_mean);
+  invalid_error -= invalid_before;
+  if (rejected_elements <= 0 || invalid_error.Normlinf() != 0.0)
+  {
+    std::cerr << "[FAIL] device limiter repaired or committed an invalid mean\n";
+    return 5;
+  }
+
   mfem::Vector x;
   initial.GetTrueDofs(x);
   StageOneInadmissibilityOperator op(vfes);
@@ -203,6 +326,10 @@ int main(int argc, char** argv)
   if (mfem::Mpi::Root())
   {
     std::cout << "[PASS] CUDA consumer point policy constrains FE nodes\n";
+    std::cout << "[PASS] CUDA typed VTK-point policy constrains output points\n";
+    std::cout << "[PASS] admissibility scan rejects nonfinite states and "
+                 "derived pressure\n";
+    std::cout << "[PASS] CUDA invalid mean rejection is transactional\n";
     std::cout << "[PASS] next RHS observes the limited device alias\n";
   }
   return 0;

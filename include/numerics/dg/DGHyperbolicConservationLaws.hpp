@@ -30,6 +30,7 @@
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 #include "numerics/dgsem/dgsem_production.hpp"
 #include "numerics/riemann/fluxfunctions.hpp"
+#include "physics/igr/igr_flux.hpp"
 
 namespace mfem
 {
@@ -71,6 +72,21 @@ enum class DGSEMVolumeDissipation
   EntropyVarsLF
 };
 
+/// Optional one-shot provider for an operator's physical-boundary flux.
+///
+/// A caller arms the provider immediately before the RHS Mult() it wants to
+/// observe. The completed vector is the communicator-wide integral of the
+/// outward numerical flux used by that Mult(); unarmed calls preserve it.
+class PhysicalBoundaryFluxIntegralProvider
+{
+public:
+  virtual ~PhysicalBoundaryFluxIntegralProvider() = default;
+  virtual bool SupportsPhysicalBoundaryFluxIntegral() const = 0;
+  virtual void ArmPhysicalBoundaryFluxIntegral() const = 0;
+  virtual bool HasLastPhysicalBoundaryFluxIntegral() const = 0;
+  virtual const Vector& GetLastPhysicalBoundaryFluxIntegral() const = 0;
+};
+
 /// ---------------------------------------------------------------------------
 /// @brief Time-dependent DG operator for hyperbolic conservation laws.
 /// @ingroup numerics_dg
@@ -83,7 +99,10 @@ enum class DGSEMVolumeDissipation
 ///  - WeakDivergence (default): preassembled (I_h F(u), ∇v) via a local matrix
 ///  - DGSEMFluxDiff: DGSEM flux-difference approach at nodal points
 /// ---------------------------------------------------------------------------
-class DGHyperbolicConservationLaws : public TimeDependentOperator
+class DGHyperbolicConservationLaws
+  : public TimeDependentOperator,
+    public PhysicalBoundaryFluxIntegralProvider,
+    public IGRFrozenSigmaTelemetryProvider
 {
 public:
   /**
@@ -186,6 +205,87 @@ public:
   /// Max characteristic speed seen during the last Mult() (for CFL).
   real_t GetMaxCharSpeed() { return max_char_speed; }
 
+  /** Request volume-node CFL accounting for exact Euler+IGR fluxes.
+   *
+   * Disabled by default so fixed-step runs and legacy fluxes retain their
+   * original volume-residual hot path. Even when requested, volume speeds are
+   * evaluated only when an active FluxWithIGR uses invariant-domain fluxes;
+   * all other configurations continue to report face/boundary speeds only.
+   * The time loop should enable this only while adaptive CFL selection needs
+   * the additional volume-node bound.
+   */
+  void SetInvariantDomainVolumeSpeedTracking(bool enabled)
+  {
+    invariant_domain_volume_speed_tracking_ = enabled;
+  }
+  bool GetInvariantDomainVolumeSpeedTracking() const
+  {
+    return invariant_domain_volume_speed_tracking_;
+  }
+
+  /** Communicator-wide aggregate over every qualified q_sigma sample.
+   *
+   * Counts include CFL probes, accepted-stage evaluations, and work from
+   * rejected attempts. Ordinary DG exact-mode paths sample their active
+   * volume/face speed points. Packed DGSEM independently scans each
+   * element-owned LGL node in FP64; its face nodes are a subset and shared
+   * neighbors are owned by another rank. MPI sums rank-local work samples.
+   */
+  IGRFrozenSigmaTelemetry GetGlobalFrozenSigmaTelemetry() const override;
+
+  /** Inspect one state against the currently bound frozen sigma.
+   *
+   * The supported packed DGSEM implementation reuses its production
+   * gather/exchange and FP64 state scans without evaluating a residual. The
+   * returned telemetry is fresh for this call and communicator-wide. Other
+   * DG research paths return a disabled aggregate unless they provide a
+   * compatible override; the typed extrapolated production route requires
+   * packed DGSEM support.
+   */
+  virtual IGRFrozenSigmaTelemetry InspectFrozenSigmaStateForAdmission(
+    const Vector& state) const;
+
+  /// Install a time-independent source already projected into this DG space.
+  /// An identically zero source is discarded, leaving the RHS hot path free of
+  /// source vector work.
+  void SetStaticSource(const Vector& source);
+  bool HasStaticSource() const { return static_source_.Size() != 0; }
+  bool StaticSourceRequiresRebind() const
+  {
+    return static_source_requires_rebind_;
+  }
+
+  /// Whether the active DG/DGSEM boundary path can capture the complete flux.
+  bool SupportsPhysicalBoundaryFluxIntegral() const override;
+
+  /**
+   * @brief Arm a one-shot outward physical-boundary flux integral.
+   *
+   * The next Mult() consumes the request. Unarmed Mult() calls, including CFL
+   * probes, neither accumulate into nor overwrite the last completed capture.
+   * On a parallel finite-element space this request must be armed collectively
+   * because the completed integral is summed over the space communicator.
+   */
+  void ArmPhysicalBoundaryFluxIntegral() const override
+  {
+    physical_boundary_flux_integral_armed_ = true;
+    physical_boundary_flux_integral_available_ = false;
+  }
+
+  /// Whether a requested Mult() completed a supported flux capture.
+  bool HasLastPhysicalBoundaryFluxIntegral() const override
+  {
+    return physical_boundary_flux_integral_available_;
+  }
+
+  /// Last completed communicator-wide outward numerical-flux integral.
+  const Vector& GetLastPhysicalBoundaryFluxIntegral() const override
+  {
+    MFEM_VERIFY(physical_boundary_flux_integral_available_,
+                "No completed physical-boundary flux integral is available.");
+    return physical_boundary_flux_integral_;
+  }
+
   /// Read-only production selection from the persistent Mult bridge.
   dgsem::DGSEMProductionSelection GetDGSEMProductionSelection() const;
 
@@ -243,11 +343,19 @@ private:
   mutable real_t max_char_speed =
     0.0;            ///< updated during Mult() by the form integrator
   mutable Vector z; ///< scratch for the assembled RHS before M⁻¹
+  Vector static_source_; ///< optional projected source in conservative ordering
+  bool static_source_requires_rebind_ = false;
+  bool invariant_domain_volume_speed_tracking_ = false;
+  mutable bool physical_boundary_flux_integral_armed_ = false;
+  mutable bool physical_boundary_flux_integral_available_ = false;
+  mutable Vector physical_boundary_flux_integral_;
 
   mutable std::unique_ptr<dgsem::DGSEMOperator> dgsem_production_operator_;
   mutable Vector dgsem_x_local_workspace_;
   mutable Vector dgsem_z_local_workspace_;
   mutable Vector dgsem_y_local_workspace_;
+  /// Cumulative independent FP64 q_sigma scan over packed DGSEM LGL nodes.
+  mutable IGRFrozenSigmaTelemetry dgsem_q_sigma_telemetry_;
   mutable bool dgsem_production_dispatch_observed_ = false;
   mutable bool dgsem_production_dispatch_supported_ = false;
   mutable bool dgsem_production_dispatch_strict_ = false;
@@ -304,8 +412,8 @@ private:
   void ApplyInverseMass_(const Vector& z_in, Vector& y_out) const;
 
   /// Add the preassembled weak-divergence volume contribution into z.
-  void AddPreassembledWeakDivergence_(const Vector& x_in,
-                                      Vector& z_inout) const;
+  real_t AddPreassembledWeakDivergence_(const Vector& x_in,
+                                        Vector& z_inout) const;
 
   /// Build interpolation data for sigma(e, state-node) sampling on device.
   bool BuildWeakDivSigmaData_(const ParGridFunction& sigma) const;
@@ -328,19 +436,23 @@ private:
   /// Add DG face contributions with a packed Euler/Rusanov device path.
   bool AddDeviceFaceContributionsEulerRusanov_(const Vector& x_in,
                                                Vector& z_inout,
-                                               real_t& max_face_speed) const;
+                                               real_t& max_face_speed,
+                                               bool capture_boundary_flux) const;
 
   /// Reduce a per-face speed vector to max speed with device support.
   real_t ReduceFaceMaxSpeed_(const Vector& face_speed,
                              Array<real_t>& workspace) const;
 
   /// Device weak-divergence path for Euler-family fluxes.
-  void AddPreassembledWeakDivergenceDeviceEuler_(
+  real_t AddPreassembledWeakDivergenceDeviceEuler_(
     const Vector& x_in,
     Vector& z_inout,
     bool use_sigma,
     const ParGridFunction* sigma_field,
-    real_t sigma_rho_floor) const;
+    real_t sigma_rho_floor,
+    real_t invariant_domain_pressure_floor,
+    bool invariant_domain_flux,
+    bool track_volume_speed) const;
 
   /// Packed inverse-mass apply (element-major, equation-minor map).
   void ApplyInverseMassPacked_(const Vector& z_in, Vector& y_out) const;
@@ -514,6 +626,12 @@ private:
   int weakdiv_elem_dof_ = 0;
   /// Flattened per-element weak-divergence blocks (row-major dof x (dof*dim)).
   Vector weakdiv_data_flat_;
+  /// Per-element maximum volume-node characteristic speed scratch.
+  mutable Vector weakdiv_volume_speed_;
+  /// Persistent per-volume-node q_sigma aggregates (five FP64 scalars/slot).
+  mutable Array<double> weakdiv_q_sigma_telemetry_;
+  /// Reduction workspace for the volume-node maximum speed.
+  mutable Array<real_t> weakdiv_volume_speed_reduce_workspace_;
   /// Whether packed weak-divergence data is available.
   bool weakdiv_apply_ready_ = false;
 
@@ -529,6 +647,11 @@ private:
   mutable const FiniteElementSpace* weakdiv_sigma_fes_ = nullptr;
   /// Sigma FE-space sequence used to build interpolation data.
   mutable long weakdiv_sigma_fes_sequence_ = -1;
+
+  /// Persistent per-face-quadrature-point q_sigma aggregates.
+  mutable Array<double> face_int_q_sigma_telemetry_;
+  mutable Array<double> face_bdr_q_sigma_telemetry_;
+  mutable Array<double> face_shared_q_sigma_telemetry_;
 
   /// MFEM-native vector-mass form (serial).
   std::unique_ptr<BilinearForm> mass_form_;

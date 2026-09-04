@@ -14,6 +14,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -73,6 +74,18 @@ private:
   std::string name_;
   std::string previous_;
   bool had_value_ = false;
+};
+
+class UnsupportedBoundaryState final : public mfem::BoundaryState
+{
+public:
+  void Eval(const mfem::Vector& interior,
+            const mfem::Vector&,
+            mfem::FaceElementTransformations&,
+            mfem::Vector& exterior) const override
+  {
+    exterior = interior;
+  }
 };
 
 inline bool IsSentinel(const mfem::Vector& values, double sentinel)
@@ -689,8 +702,7 @@ inline void CheckCollectiveRejectionSemantics(TestContext& ctx,
 {
 #ifdef MFEM_USE_MPI
   using mfem::dgsem::DGSEMProductionReason;
-  if (mfem::Mpi::WorldSize() != 2 ||
-      mfem::Device::Allows(mfem::Backend::CUDA_MASK))
+  if (mfem::Mpi::WorldSize() != 2)
   {
     return;
   }
@@ -957,11 +969,20 @@ inline void RunDGSEMProductionSplitCommunicatorTests(TestContext& ctx)
   const int world_size = mfem::Mpi::WorldSize();
   ctx.Check(world_size == 4,
             "DGSEM split-communicator probe requires exactly four ranks");
-  if (world_size != 4 ||
-      mfem::Device::Allows(mfem::Backend::CUDA_MASK))
+  if (world_size != 4)
   {
     return;
   }
+
+#if defined(HYPRE_USING_UMPIRE_DEVICE)
+  // Four tiny MPI ranks share one CI GPU in this probe.  Size HYPRE's
+  // growable device pool before its first allocation so four default 4 GiB
+  // pools do not exhaust the device merely while constructing ParFES data.
+  const HYPRE_Int pool_status = HYPRE_SetUmpireDevicePoolSize(
+    std::size_t{256} * 1024 * 1024);
+  ctx.Check(pool_status == 0,
+            "DGSEM split probe configures its test-only HYPRE device pool");
+#endif
 
   int world_rank = 0;
   MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
@@ -1134,6 +1155,22 @@ inline void RunDGSEMProductionSplitCommunicatorTests(TestContext& ctx)
     const auto result = production.AssembleProductionResidual(
       input, output, true);
     const double direct_cfl = result.max_characteristic_speed;
+    mfem::Vector admission_output(vfes.GetVSize());
+    admission_output = -8350.0 - group;
+    const auto admission_result =
+      production.AssembleProductionResidual(input,
+                                            admission_output,
+                                            true,
+                                            nullptr,
+                                            /*admission_only=*/true);
+    ctx.Check(admission_result.executed &&
+                admission_result.reason == DGSEMProductionReason::None &&
+                !admission_result.admission_q_sigma.enabled &&
+                std::abs(admission_result.max_characteristic_speed -
+                         expected_cfl) < 5.0e-13 &&
+                IsSentinel(admission_output, -8350.0 - group),
+              "DGSEM split-subcommunicator admission refresh reduces its "
+              "CFL maximum without writing a residual");
     mfem::Vector host_local(vfes.GetVSize());
     host.ApplyInverseMass(host_weak, host_local);
     mfem::Vector host_true(vfes.GetTrueVSize());
@@ -1480,12 +1517,394 @@ inline void CheckDGSEMProductionMultSerialIdentityAndMove(TestContext& ctx)
             "DGSEM persistent production bridge rebinds safely after parent move");
 }
 
+inline void CheckDGSEMProductionMixedEulerBoundaries(TestContext& ctx)
+{
+  if (mfem::Mpi::WorldSize() != 1)
+  {
+    return;
+  }
+
+  constexpr int dimension = 2;
+  constexpr int equations = 4;
+  constexpr int order = 2;
+  constexpr double gamma = 1.4;
+  mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
+    2, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  mfem::ParMesh mesh(MPI_COMM_WORLD, serial_mesh);
+  const int boundary_attributes = mesh.bdr_attributes.Max();
+  ctx.Check(boundary_attributes >= 3,
+            "DGSEM mixed-boundary fixture exposes inlet/outlet/wall attributes");
+  if (boundary_attributes < 3)
+  {
+    return;
+  }
+
+  mfem::DG_FECollection fec(
+    order, dimension, mfem::BasisType::GaussLobatto);
+  mfem::ParFiniteElementSpace vfes(
+    &mesh, &fec, equations, mfem::Ordering::byNODES);
+  mfem::EulerFlux euler(dimension, gamma);
+  mfem::RusanovFluxWithSides numerical_flux(euler);
+  auto form = std::make_unique<mfem::HyperbolicFormIntegrator>(
+    numerical_flux, 2);
+  mfem::DGHyperbolicConservationLaws oper(vfes, std::move(form), true);
+  oper.SetNumericalFlux(&numerical_flux);
+  oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+  oper.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Central);
+  oper.SetDGSEMVolumeDissipation(mfem::DGSEMVolumeDissipation::None);
+  oper.SetDGSEMStabilization(mfem::DGSEMStabilization::None);
+  oper.SetDGSEMGamma(gamma);
+
+  mfem::Array<int> inlet_marker(boundary_attributes);
+  mfem::Array<int> outlet_marker(boundary_attributes);
+  mfem::Array<int> wall_marker(boundary_attributes);
+  inlet_marker = 0;
+  outlet_marker = 0;
+  wall_marker = 0;
+  inlet_marker[0] = 1;
+  outlet_marker[1] = 1;
+  for (int attr = 2; attr < boundary_attributes; ++attr)
+  {
+    wall_marker[attr] = 1;
+  }
+  const mfem::Vector inlet =
+    EulerConsFromPrim2D(1.08, 0.32, -0.04, 1.03, gamma);
+  oper.AddBdrFaceIntegrator(
+    std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+      numerical_flux,
+      std::make_unique<mfem::SupersonicInletState>(inlet),
+      2),
+    inlet_marker);
+  oper.AddBdrFaceIntegrator(
+    std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+      numerical_flux,
+      std::make_unique<mfem::SupersonicOutletState>(),
+      2),
+    outlet_marker);
+  oper.AddBdrFaceIntegrator(
+    std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+      numerical_flux,
+      std::make_unique<mfem::SlipWallState>(dimension),
+      2),
+    wall_marker);
+
+  mfem::ParGridFunction state(&vfes);
+  auto state_function = [=](const mfem::Vector& point,
+                            mfem::Vector& value)
+  {
+    value = EulerConsFromPrim2D(1.0 + 0.04 * point(0),
+                               0.18 + 0.03 * point(1),
+                               -0.06 + 0.02 * point(0),
+                               1.0 + 0.025 * point(1),
+                               gamma);
+  };
+  mfem::VectorFunctionCoefficient coefficient(equations, state_function);
+  state.ProjectCoefficient(coefficient);
+
+  mfem::dgsem::DGSEMOperator host(oper);
+  mfem::Vector weak(vfes.GetVSize());
+  mfem::Vector host_boundary_flux;
+  const double face_speed =
+    host.AssembleSurface(state, weak, &host_boundary_flux);
+  const double volume_speed = host.AssembleVolume(state, weak);
+  const int scalar_vsize = vfes.GetVSize() / equations;
+  const double* weak_values = weak.HostRead();
+  const double* host_boundary_values = host_boundary_flux.HostRead();
+  double maximum_balance_defect = 0.0;
+  for (int equation = 0; equation < equations; ++equation)
+  {
+    double weak_integral = 0.0;
+    for (int dof = 0; dof < scalar_vsize; ++dof)
+    {
+      weak_integral += weak_values[dof + scalar_vsize * equation];
+    }
+    maximum_balance_defect = std::max(
+      maximum_balance_defect,
+      std::abs(weak_integral + host_boundary_values[equation]));
+  }
+  mfem::Vector expected(vfes.GetVSize());
+  host.ApplyInverseMass(weak, expected);
+
+  mfem::dgsem::DGSEMOperator production(oper);
+  const auto selection = production.BindProductionPolicy(true);
+  mfem::Vector actual(vfes.GetVSize());
+  actual = -9300.0;
+  mfem::Vector production_boundary_flux;
+  const auto first = production.AssembleProductionResidual(
+    state, actual, true, &production_boundary_flux);
+  const auto first_counters = production.GetProductionCacheCounters();
+  mfem::Vector repeated(vfes.GetVSize());
+  repeated = -9400.0;
+  const auto second = production.AssembleProductionResidual(
+    state, repeated, true);
+  const auto second_counters = production.GetProductionCacheCounters();
+  actual -= expected;
+  repeated -= expected;
+  const double expected_speed = std::max(face_speed, volume_speed);
+  mfem::Vector boundary_difference(production_boundary_flux);
+  boundary_difference -= host_boundary_flux;
+  ctx.Check(selection.supported && first.executed && second.executed &&
+              actual.Norml2() < 2.0e-10 &&
+              repeated.Norml2() < 2.0e-10 &&
+              std::abs(first.max_characteristic_speed - expected_speed) <
+                5.0e-13 &&
+              std::abs(second.max_characteristic_speed - expected_speed) <
+                5.0e-13,
+            "DGSEM production mixed inlet/outlet/slip boundaries match host oracle");
+  ctx.Check(host_boundary_flux.Normlinf() > 1.0e-12 &&
+              boundary_difference.Normlinf() < 5.0e-13 &&
+              maximum_balance_defect < 2.0e-10,
+            "DGSEM packed physical-boundary flux matches the host oracle and "
+            "closes the weak conservation balance");
+  ctx.Check(first_counters.topology_builds == 1 &&
+              second_counters.topology_builds ==
+                first_counters.topology_builds &&
+              second_counters.geometry_builds ==
+                first_counters.geometry_builds &&
+              second_counters.workspace_builds ==
+                first_counters.workspace_builds &&
+              second_counters.unchanged_cache_fast_paths ==
+                first_counters.unchanged_cache_fast_paths + 1,
+            "DGSEM mixed-boundary lowering and row-face CSR remain persistent");
+
+  mfem::Vector true_state;
+  state.GetTrueDofs(true_state);
+  mfem::Vector mult_result(vfes.GetTrueVSize());
+  ctx.Check(oper.SupportsPhysicalBoundaryFluxIntegral(),
+            "DGSEM advertises exact physical-boundary flux capture");
+  oper.Mult(true_state, mult_result);
+  ctx.Check(!oper.HasLastPhysicalBoundaryFluxIntegral(),
+            "unarmed DGSEM Mult does not create a boundary-flux capture");
+  oper.ArmPhysicalBoundaryFluxIntegral();
+  oper.Mult(true_state, mult_result);
+  mfem::Vector captured_boundary_flux(
+    oper.GetLastPhysicalBoundaryFluxIntegral());
+  captured_boundary_flux -= host_boundary_flux;
+  ctx.Check(oper.HasLastPhysicalBoundaryFluxIntegral() &&
+              captured_boundary_flux.Normlinf() < 5.0e-13,
+            "armed DGSEM Mult publishes the communicator-wide packed "
+            "boundary-flux integral");
+  mfem::Vector capture_snapshot(
+    oper.GetLastPhysicalBoundaryFluxIntegral());
+  oper.Mult(true_state, mult_result);
+  mfem::Vector preserved_capture(
+    oper.GetLastPhysicalBoundaryFluxIntegral());
+  preserved_capture -= capture_snapshot;
+  ctx.Check(oper.HasLastPhysicalBoundaryFluxIntegral() &&
+              preserved_capture.Normlinf() == 0.0,
+            "unarmed DGSEM Mult preserves the last completed one-shot capture");
+}
+
+inline void CheckDGSEMProductionEulerBoundaryCatalog(TestContext& ctx)
+{
+  if (mfem::Mpi::WorldSize() != 1)
+  {
+    return;
+  }
+
+  constexpr int dimension = 2;
+  constexpr int equations = dimension + 2;
+  constexpr int order = 2;
+  constexpr double gamma = 1.4;
+  constexpr double boundary_gamma = 1.32;
+  constexpr double density_floor = 0.4;
+  constexpr double pressure_floor = 0.55;
+  constexpr double outlet_pressure = 0.64;
+  const std::array<const char*, 7> labels{{
+    "supersonic-inlet",
+    "supersonic-outlet",
+    "subsonic-inlet",
+    "subsonic-outlet-pressure",
+    "far-field",
+    "nonreflecting-outlet",
+    "slip-wall"}};
+
+  mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian2D(
+    1, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  mfem::ParMesh mesh(MPI_COMM_WORLD, serial_mesh);
+  mfem::DG_FECollection fec(
+    order, dimension, mfem::BasisType::GaussLobatto);
+  mfem::ParFiniteElementSpace vfes(
+    &mesh, &fec, equations, mfem::Ordering::byNODES);
+  mfem::Array<int> marker(mesh.bdr_attributes.Max());
+  marker = 1;
+
+  mfem::ParGridFunction state(&vfes);
+  auto state_function = [=](const mfem::Vector& point,
+                            mfem::Vector& value)
+  {
+    value = EulerConsFromPrim2D(0.78 + 0.04 * point(0),
+                               0.11 + 0.02 * point(1),
+                               -0.07 + 0.015 * point(0),
+                               0.46 + 0.025 * point(1),
+                               gamma);
+  };
+  mfem::VectorFunctionCoefficient coefficient(equations, state_function);
+  state.ProjectCoefficient(coefficient);
+  const mfem::Vector reference =
+    EulerConsFromPrim2D(0.93, -0.08, 0.035, 0.72, boundary_gamma);
+
+  for (int boundary_case = 0;
+       boundary_case < static_cast<int>(labels.size());
+       ++boundary_case)
+  {
+    std::unique_ptr<mfem::BoundaryState> boundary;
+    switch (boundary_case)
+    {
+    case 0:
+      boundary = std::make_unique<mfem::SupersonicInletState>(reference);
+      break;
+    case 1:
+      boundary = std::make_unique<mfem::SupersonicOutletState>();
+      break;
+    case 2:
+      boundary = std::make_unique<mfem::SubsonicInletState>(
+        reference,
+        dimension,
+        boundary_gamma,
+        density_floor,
+        pressure_floor);
+      break;
+    case 3:
+      boundary = std::make_unique<mfem::SubsonicOutletPressureState>(
+        dimension,
+        boundary_gamma,
+        outlet_pressure,
+        density_floor,
+        pressure_floor);
+      break;
+    case 4:
+      boundary = std::make_unique<mfem::FarFieldState>(reference,
+                                                       dimension,
+                                                       boundary_gamma,
+                                                       density_floor,
+                                                       pressure_floor);
+      break;
+    case 5:
+      boundary = std::make_unique<mfem::NonReflectingOutletState>(
+        reference,
+        dimension,
+        boundary_gamma,
+        density_floor,
+        pressure_floor);
+      break;
+    case 6:
+      boundary = std::make_unique<mfem::SlipWallState>(dimension,
+                                                       density_floor,
+                                                       pressure_floor);
+      break;
+    default:
+      MFEM_ABORT("Invalid DGSEM Euler boundary catalog case.");
+    }
+
+    mfem::EulerFlux euler(dimension, gamma);
+    mfem::RusanovFluxWithSides numerical_flux(euler);
+    auto form = std::make_unique<mfem::HyperbolicFormIntegrator>(
+      numerical_flux, 2);
+    mfem::DGHyperbolicConservationLaws oper(vfes, std::move(form), true);
+    oper.SetNumericalFlux(&numerical_flux);
+    oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+    oper.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Central);
+    oper.SetDGSEMVolumeDissipation(mfem::DGSEMVolumeDissipation::None);
+    oper.SetDGSEMStabilization(mfem::DGSEMStabilization::None);
+    oper.SetDGSEMGamma(gamma);
+    oper.AddBdrFaceIntegrator(
+      std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+        numerical_flux, std::move(boundary), 2),
+      marker);
+
+    mfem::dgsem::DGSEMOperator host(oper);
+    mfem::Vector weak(vfes.GetVSize());
+    mfem::Vector host_boundary_flux;
+    const double face_speed =
+      host.AssembleSurface(state, weak, &host_boundary_flux);
+    const double volume_speed = host.AssembleVolume(state, weak);
+    mfem::Vector expected(vfes.GetVSize());
+    host.ApplyInverseMass(weak, expected);
+
+    mfem::dgsem::DGSEMOperator production(oper);
+    const auto selection = production.BindProductionPolicy(true);
+    mfem::Vector actual(vfes.GetVSize());
+    actual = -9700.0;
+    mfem::Vector packed_boundary_flux;
+    const auto result = production.AssembleProductionResidual(
+      state, actual, true, &packed_boundary_flux);
+    actual -= expected;
+    packed_boundary_flux -= host_boundary_flux;
+    ctx.Check(selection.supported && result.executed &&
+                actual.Norml2() < 2.0e-10 &&
+                packed_boundary_flux.Normlinf() < 5.0e-13 &&
+                std::abs(result.max_characteristic_speed -
+                         std::max(face_speed, volume_speed)) < 5.0e-13,
+              std::string("DGSEM packed ") + labels[boundary_case] +
+                " boundary matches the shared host boundary semantics");
+  }
+}
+
+inline void CheckDGSEMProductionStaticSource(TestContext& ctx)
+{
+  constexpr int dimension = 1;
+  constexpr int equations = dimension + 2;
+  constexpr double gamma = 1.4;
+  mfem::Mesh serial_mesh = mfem::Mesh::MakeCartesian1D(2, 1.0);
+  mfem::ParMesh mesh(MPI_COMM_SELF, serial_mesh);
+  mfem::DG_FECollection fec(1, dimension, mfem::BasisType::GaussLobatto);
+  mfem::ParFiniteElementSpace vfes(
+    &mesh, &fec, equations, mfem::Ordering::byNODES);
+  mfem::ParGridFunction state(&vfes);
+  FillConstantState(EulerConsFromPrim1D(1.0, 0.0, 1.0, gamma), state);
+
+  mfem::EulerFlux euler(dimension, gamma);
+  mfem::RusanovFluxWithSides numerical_flux(euler);
+  auto form = std::make_unique<mfem::HyperbolicFormIntegrator>(
+    numerical_flux, 2);
+  mfem::DGHyperbolicConservationLaws oper(vfes, std::move(form), true);
+  oper.SetNumericalFlux(&numerical_flux);
+  oper.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);
+  oper.SetDGSEMVolumeFlux(mfem::DGSEMVolumeFlux::Central);
+  oper.SetDGSEMVolumeDissipation(mfem::DGSEMVolumeDissipation::LLF);
+  oper.SetDGSEMStabilization(mfem::DGSEMStabilization::None);
+  oper.SetDGSEMGamma(gamma);
+  mfem::Array<int> marker(mesh.bdr_attributes.Max());
+  if (marker.Size() > 0)
+  {
+    marker = 1;
+    oper.AddBdrFaceIntegrator(
+      std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
+        numerical_flux,
+        std::make_unique<mfem::SlipWallState>(dimension),
+        2),
+      marker);
+  }
+
+  mfem::Vector input;
+  state.GetTrueDofs(input);
+  mfem::Vector baseline(vfes.GetTrueVSize());
+  oper.Mult(input, baseline);
+  mfem::Vector source(vfes.GetTrueVSize());
+  source = 0.125;
+  oper.SetStaticSource(source);
+  mfem::Vector sourced(vfes.GetTrueVSize());
+  oper.Mult(input, sourced);
+  sourced -= baseline;
+  sourced -= source;
+  const auto selection = oper.GetDGSEMProductionSelection();
+  ctx.Check(selection.supported &&
+              selection.llf_volume_active &&
+              oper.HasStaticSource() &&
+              GlobalL2Norm(sourced) < 1.0e-12,
+            "DGSEM strong static source is exact on the selected CPU/CUDA path");
+}
+
 inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
 {
   RunDGSEMProductionMultStrictRejectionProbe(ctx);
   ScopedEnvironment strict_production_mult(
     "DG_IGR_DGSEM_PRODUCTION_STRICT", "1");
   CheckDGSEMProductionMultSerialIdentityAndMove(ctx);
+  CheckDGSEMProductionMixedEulerBoundaries(ctx);
+  CheckDGSEMProductionEulerBoundaryCatalog(ctx);
+  CheckDGSEMProductionStaticSource(ctx);
   using mfem::dgsem::DGSEMProductionReason;
   constexpr double gamma = 1.4;
   constexpr double residual_tolerance = 2.0e-10;
@@ -1494,7 +1913,7 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
   constexpr int validation_control_cases = 3;
   constexpr int direct_validation_rejection_cases = 18;
   ctx.Check(world_size == 1 || world_size == 2,
-            "DGSEM production fixture is bounded to one/two CPU ranks");
+            "DGSEM production fixture is bounded to one/two ranks");
 
   int negative_checks = 0;
   int assemble_rejections = 0;
@@ -1694,6 +2113,14 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
                                  double& max_speed,
                                  mfem::Vector* weak_output)
         {
+          // The direct host oracle does not own FluxWithIGR's auxiliary
+          // neighbor exchange.  Refresh it explicitly after tests mutate and
+          // restore sigma so shared faces compare the same current field as
+          // the packed production path.
+          if (sigma)
+          {
+            sigma->ExchangeFaceNbrData();
+          }
           mfem::Vector weak(vfes.GetVSize());
           const double face_speed =
             host_operator.AssembleSurface(local_state, weak);
@@ -1965,13 +2392,50 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
                       warm_workspace.capacity_signature &&
                     repeated_workspace.storage_signature ==
                       warm_workspace.storage_signature &&
-                    repeated_workspace.checks >=
-                      warm_workspace.checks + 2 &&
+                    repeated_workspace.checks ==
+                      warm_workspace.checks &&
                     repeated_workspace.failures == 0,
-                  "DGSEM production warm stage preserves exact workspace "
-                  "shape/capacity/storage and unchanged-cache branch p" +
+                  "DGSEM on-demand evidence confirms persistent workspace "
+                  "shape/capacity/storage without hot-path scans p" +
                     std::to_string(order) + " " + std::to_string(dim) +
                     "D sigma=" + std::to_string(sigma_mode));
+
+        mfem::Vector admission_sentinel(vfes.GetVSize());
+        admission_sentinel = 7193.25;
+        const auto counters_before_valid_admission =
+          production_operator.GetProductionCacheCounters();
+        const auto valid_admission =
+          production_operator.AssembleProductionResidual(
+            state_local,
+            admission_sentinel,
+            true,
+            nullptr,
+            /*admission_only=*/true);
+        const auto counters_after_valid_admission =
+          production_operator.GetProductionCacheCounters();
+        const bool admission_q_ok =
+          sigma ? (valid_admission.admission_q_sigma.enabled &&
+                   valid_admission.admission_q_sigma.sample_count > 0 &&
+                   valid_admission.admission_q_sigma.nonpositive_count == 0 &&
+                   valid_admission.admission_q_sigma.nonfinite_count == 0)
+                : !valid_admission.admission_q_sigma.enabled;
+        ctx.Check(
+          valid_admission.executed &&
+            valid_admission.reason == DGSEMProductionReason::None &&
+            admission_q_ok &&
+            std::abs(valid_admission.max_characteristic_speed -
+                     production_result.max_characteristic_speed) < 5.0e-13 &&
+            IsSentinel(admission_sentinel, 7193.25) &&
+            counters_after_valid_admission.admission_calls ==
+              counters_before_valid_admission.admission_calls + 1 &&
+            counters_after_valid_admission.stage_calls ==
+              counters_before_valid_admission.stage_calls &&
+            counters_after_valid_admission.output_scatters ==
+              counters_before_valid_admission.output_scatters,
+          "DGSEM admission-only speed refresh matches the full packed CFL "
+          "maximum without writing a residual p" +
+            std::to_string(order) + " " + std::to_string(dim) +
+            "D sigma=" + std::to_string(sigma_mode));
 
         if (world_size == 1 && dim == 2 && geometry_mode == 1 &&
             order == 2 && sigma_mode == 1)
@@ -2114,20 +2578,25 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
 
           oper.SetDGSEMVolumeDissipation(
             mfem::DGSEMVolumeDissipation::LLF);
-          const auto unsupported_dissipation =
-            production_operator.BindProductionPolicy(true);
-          sentinel = 1234.5;
-          const auto unsupported_dissipation_result =
-            production_operator.AssembleProductionResidual(
-              state_local, sentinel, true);
-          ctx.Check(!unsupported_dissipation.supported &&
-                      unsupported_dissipation.reason ==
-                        DGSEMProductionReason::UnsupportedVolumeDissipation &&
-                      !unsupported_dissipation_result.executed &&
-                      IsSentinel(sentinel, 1234.5),
-                    "DGSEM production unsupported dissipation fails closed");
-          ++negative_checks;
-          ++assemble_rejections;
+          mfem::dgsem::DGSEMOperator llf_production_operator(oper);
+          const auto llf_selection =
+            llf_production_operator.BindProductionPolicy(true);
+          mfem::Vector llf_host;
+          double llf_host_speed = 0.0;
+          host_residual(state_local, llf_host, llf_host_speed, nullptr);
+          mfem::Vector llf_packed(vfes.GetVSize());
+          llf_packed = 1234.5;
+          const auto llf_result =
+            llf_production_operator.AssembleProductionResidual(
+              state_local, llf_packed, true);
+          llf_packed -= llf_host;
+          ctx.Check(llf_selection.supported &&
+                      llf_selection.llf_volume_active &&
+                      llf_result.executed &&
+                      GlobalL2Norm(llf_packed) < residual_tolerance &&
+                      std::abs(llf_result.max_characteristic_speed -
+                               llf_host_speed) < 5.0e-13,
+                    "typed CPU/CUDA DGSEM LLF selection matches its host oracle");
           oper.SetDGSEMVolumeDissipation(
             mfem::DGSEMVolumeDissipation::None);
 
@@ -2167,7 +2636,7 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
             unsupported_boundary_operator.AddBdrFaceIntegrator(
               std::make_unique<mfem::BdrHyperbolicFluxIntegrator>(
                 numerical_flux,
-                std::make_unique<mfem::SupersonicOutletState>(),
+                std::make_unique<UnsupportedBoundaryState>(),
                 2),
               marker);
           }
@@ -2260,6 +2729,128 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
           ++negative_checks;
           ++assemble_rejections;
           *sigma = sigma_backup;
+
+          *sigma = -10.0;
+          mfem::Vector admission_sentinel(vfes.GetVSize());
+          admission_sentinel = 8765.25;
+          const auto counters_before_admission =
+            production_operator.GetProductionCacheCounters();
+          const auto q_admission =
+            production_operator.AssembleProductionResidual(
+              state_local,
+              admission_sentinel,
+              true,
+              nullptr,
+              /*admission_only=*/true);
+          const auto counters_after_admission =
+            production_operator.GetProductionCacheCounters();
+          const std::uint64_t expected_owned_q_samples =
+            static_cast<std::uint64_t>(GlobalSum(
+              static_cast<double>(vfes.GetNE() *
+                                  vfes.GetFE(0)->GetDof())));
+          ctx.Check(q_admission.executed &&
+                      q_admission.reason == DGSEMProductionReason::None &&
+                      q_admission.admission_q_sigma.enabled &&
+                      q_admission.admission_q_sigma.sample_count >
+                        expected_owned_q_samples &&
+                      q_admission.admission_q_sigma.nonpositive_count ==
+                        q_admission.admission_q_sigma.sample_count &&
+                      q_admission.admission_q_sigma.nonfinite_count == 0 &&
+                      q_admission.admission_q_sigma.minimum_raw_q_sigma < 0.0 &&
+                      q_admission.max_characteristic_speed == 0.0 &&
+                      IsSentinel(admission_sentinel, 8765.25) &&
+                      counters_after_admission.admission_calls ==
+                        counters_before_admission.admission_calls + 1 &&
+                      counters_after_admission.stage_calls ==
+                        counters_before_admission.stage_calls &&
+                      counters_after_admission.output_scatters ==
+                        counters_before_admission.output_scatters,
+                    "packed DGSEM admission-only scan detects fresh q_sigma "
+                    "violations without evaluating a characteristic radius "
+                    "or writing a residual");
+
+          const mfem::IGRFrozenSigmaTelemetry q_before =
+            oper.GetGlobalFrozenSigmaTelemetry();
+          mfem::Vector negative_q_output(vfes.GetVSize());
+          const auto negative_q_result =
+            production_operator.AssembleProductionResidual(
+              state_local, negative_q_output, true);
+          const mfem::IGRFrozenSigmaTelemetry q_after =
+            oper.GetGlobalFrozenSigmaTelemetry();
+          const std::uint64_t new_q_samples =
+            q_after.sample_count - q_before.sample_count;
+          ctx.Check(negative_q_result.executed && q_after.enabled &&
+                      new_q_samples > expected_owned_q_samples &&
+                      q_after.nonpositive_count - q_before.nonpositive_count ==
+                        new_q_samples &&
+                      q_after.nonfinite_count == q_before.nonfinite_count &&
+                      q_after.minimum_raw_q_sigma < 0.0,
+                    "packed DGSEM records owned and two-sided face q_sigma "
+                    "samples for stage admission");
+          *sigma = sigma_backup;
+
+          igr_flux->SetFrozenSigmaSpectralSpeed(true);
+          oper.SetDGSEMVolumeDissipation(
+            mfem::DGSEMVolumeDissipation::LLF);
+          mfem::dgsem::DGSEMOperator frozen_spectral_operator(oper);
+          const auto frozen_spectral_selection =
+            frozen_spectral_operator.BindProductionPolicy(true);
+          mfem::Vector frozen_spectral_host;
+          mfem::Vector frozen_spectral_packed(vfes.GetVSize());
+          double frozen_spectral_host_speed = 0.0;
+          host_residual(state_local,
+                        frozen_spectral_host,
+                        frozen_spectral_host_speed,
+                        nullptr);
+          const auto frozen_spectral_result =
+            frozen_spectral_operator.AssembleProductionResidual(
+              state_local, frozen_spectral_packed, true);
+          const mfem::IGRFrozenSigmaTelemetry endpoint_admission =
+            oper.InspectFrozenSigmaStateForAdmission(state_true);
+          const double endpoint_admission_speed = oper.GetMaxCharSpeed();
+          frozen_spectral_packed -= frozen_spectral_host;
+          ctx.Check(
+              frozen_spectral_selection.supported &&
+              frozen_spectral_selection.strict &&
+              frozen_spectral_selection.frozen_sigma_spectral_speed &&
+              frozen_spectral_selection.llf_volume_active &&
+              frozen_spectral_result.executed &&
+              endpoint_admission.enabled &&
+              endpoint_admission.sample_count > 0 &&
+              endpoint_admission.nonpositive_count == 0 &&
+              endpoint_admission.nonfinite_count == 0 &&
+              frozen_spectral_result.max_characteristic_speed >
+                production_result.max_characteristic_speed &&
+              std::abs(frozen_spectral_result.max_characteristic_speed -
+                       frozen_spectral_host_speed) < 5.0e-13 &&
+              std::abs(endpoint_admission_speed -
+                       frozen_spectral_result.max_characteristic_speed) <
+                5.0e-13 &&
+              GlobalL2Norm(frozen_spectral_packed) < residual_tolerance,
+            "typed packed DGSEM frozen-sigma endpoint admission publishes "
+            "the same CFL maximum used by Rusanov/LLF and the host oracle "
+            "supported=" +
+              std::to_string(frozen_spectral_selection.supported ? 1 : 0) +
+              " strict=" +
+              std::to_string(frozen_spectral_selection.strict ? 1 : 0) +
+              " spectral=" +
+              std::to_string(
+                frozen_spectral_selection.frozen_sigma_spectral_speed ? 1 : 0) +
+              " llf=" +
+              std::to_string(
+                frozen_spectral_selection.llf_volume_active ? 1 : 0) +
+              " executed=" +
+              std::to_string(frozen_spectral_result.executed ? 1 : 0) +
+              " speed=" +
+              FormatSci(frozen_spectral_result.max_characteristic_speed) +
+              " admitted_speed=" + FormatSci(endpoint_admission_speed) +
+              " baseline=" +
+              FormatSci(production_result.max_characteristic_speed) +
+              " host_speed=" + FormatSci(frozen_spectral_host_speed) +
+              " residual=" + FormatSci(GlobalL2Norm(frozen_spectral_packed)));
+          oper.SetDGSEMVolumeDissipation(
+            mfem::DGSEMVolumeDissipation::None);
+          igr_flux->SetFrozenSigmaSpectralSpeed(false);
 
           igr_flux->SetSigmaAwareRusanov(true);
           const auto unsupported_sigma_policy =
@@ -2499,9 +3090,9 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
   ctx.Check(max_topology_builds == 1 && max_geometry_builds == 1 &&
               max_sigma_builds == 1 && max_workspace_builds == 1,
             "DGSEM production cache layers build once before invalidation");
-  ctx.Check(max_workspace_identity_checks > 0 &&
+  ctx.Check(max_workspace_identity_checks == 0 &&
               max_workspace_identity_failures == 0,
-            "DGSEM production warm workspace identities remain exact");
+            "DGSEM production keeps workspace evidence out of the hot path");
   ctx.Check(max_unchanged_cache_fast_paths > 0 &&
               max_rebuild_preflight_entries > 0,
             "DGSEM production accounts unchanged-cache versus rebuild paths");
@@ -2517,7 +3108,8 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
                 max_stage_reason_reductions > 0,
               "DGSEM production accounts collective selection/stage reasons");
   }
-  const int expected_assemble_rejections = world_size == 1 ? 21 : 15;
+  const int expected_assemble_rejections =
+    world_size == 1 ? 20 : 14;
   ctx.Check(assemble_rejections == expected_assemble_rejections,
             "DGSEM production counts exact no-write assembly rejections");
   ctx.Check(negative_checks == validation_control_cases +

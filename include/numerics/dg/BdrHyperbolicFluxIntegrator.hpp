@@ -65,6 +65,12 @@ private:
   const std::unique_ptr<BoundaryState> bc;
   const int IntOrderOffset; // integration order offset, 2*p + IntOrderOffset.
   const real_t sign;
+  bool invariant_domain_boundary_contract_ = false;
+  real_t invariant_domain_gamma_ = 1.4;
+  real_t invariant_domain_density_floor_ = 1.0e-12;
+  real_t invariant_domain_pressure_floor_ = 1.0e-12;
+  bool boundary_flux_integral_capture_active_ = false;
+  Vector boundary_flux_integral_;
 #ifndef MFEM_THREAD_SAFE
   // Local storage for element integration
   Vector shape;       // shape function value at an integration point
@@ -107,6 +113,27 @@ public:
   const FluxFunction& GetFluxFunction() { return fluxFunction; }
   const NumericalFlux& GetNumericalFlux() const { return numFlux; }
   const BoundaryState& GetBoundaryState() const { return *bc; }
+
+  /**
+   * @brief Begin one bounded physical-boundary flux-integral capture.
+   *
+   * While armed, AssembleFaceVector accumulates the same outward numerical
+   * flux returned by NumericalFlux::Eval(), before the residual sign and test
+   * function are applied. Storage is exactly one entry per equation.
+   */
+  void BeginBoundaryFluxIntegralCapture();
+
+  /// Stop capture without changing the most recently accumulated integral.
+  void EndBoundaryFluxIntegralCapture()
+  {
+    boundary_flux_integral_capture_active_ = false;
+  }
+
+  /// Local contribution accumulated since BeginBoundaryFluxIntegralCapture().
+  const Vector& GetBoundaryFluxIntegral() const
+  {
+    return boundary_flux_integral_;
+  }
 
   /**
     * @brief Implements <-F̂(u⁻,u⁺,x) n, [v]> with abstract F̂ computed by

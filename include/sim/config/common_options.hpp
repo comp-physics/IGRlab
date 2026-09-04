@@ -8,6 +8,7 @@
 #include <string>
 
 #include "mfem.hpp"
+#include "utils/config/env_flags.hpp"
 
 namespace dg_sim
 {
@@ -44,6 +45,8 @@ struct CommonOptions
   ///< Positivity limiter selector: case | none | zhang-shu.
   std::string zhang_shu_points =
     "consumer"; ///< Zhang-Shu point set: "consumer" or "quadrature".
+  bool zhang_shu_vtk_points = false;
+  ///< Also enforce positivity at the refined points used for VTK output.
   std::string dgsem_stab =
     "none"; ///< DGSEM stabilization: "none", "split", or "filter".
   std::string dgsem_volume_flux =
@@ -55,9 +58,12 @@ struct CommonOptions
   std::string dgsem_entropy_jacobian =
     "fd"; ///< DGSEM ES-LF entropy Jacobian: "fd" or "analytic".
   mfem::real_t t_final = 1.0; ///< Final time.
-  mfem::real_t dt = -0.01;    ///< Time step (positive skips CFL computation).
+  /// Fixed explicit step when cfl is zero; HDG also uses its sign to select
+  /// fixed, CFL-controlled, or adaptive stepping.
+  mfem::real_t dt = -0.01;
   mfem::real_t dt_min = 1.0e-12; ///< Minimum allowed dt before aborting.
-  mfem::real_t cfl = 0.3;        ///< CFL number for time step computation.
+  /// Explicit SSPRK safety factor, or the legacy HDG stable-step multiplier.
+  mfem::real_t cfl = 0.3;
   bool glvis = false;            ///< Enable GLVis visualization.
   bool vtk_save = true;          ///< Enable ParaView/VTK output.
   bool vtk_h1_diagnostics =
@@ -79,6 +85,8 @@ struct CommonOptions
   bool nan_scan = false; ///< Enable NaN/inf scanning during the time loop.
   bool admissibility_scan =
     false; ///< Enable Euler density/pressure admissibility scans during the time loop.
+  bool conservation_balance =
+    false; ///< Enable bounded accepted-step Euler conservation diagnostics.
   std::string restart_vtk; ///< PVD file or dataset directory to restart from.
   int restart_cycle = -1;  ///< Selected PVD cycle; -1 selects the latest cycle.
   int restart_step = -1;   ///< Completed global step for legacy VTK cycles.
@@ -99,6 +107,11 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                              CommonOptions& opts,
                              const std::string& mesh_help)
 {
+  // Preserve the historical environment-only control as a default seed.
+  // Either typed CLI spelling registered below remains authoritative.
+  opts.zhang_shu_vtk_points = dg_igr::EnvFlagEnabledDefault(
+    "DG_IGR_LIMITER_ENFORCE_VTK_POINTS", opts.zhang_shu_vtk_points);
+
   args.AddOption(&opts.mesh_file, "-m", "--mesh", mesh_help.c_str());
   args.AddOption(&opts.ser_ref_levels,
                  "-rs",
@@ -146,8 +159,8 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.time_integrator,
                  "-ti",
                  "--time-integrator",
-                 "Time integrator: rk3ssp | backward-euler | "
-                 "partitioned-backward-euler | rodas3 "
+                 "Time integrator: rk3ssp | ssprk104 | "
+                 "backward-euler | partitioned-backward-euler | rodas3 "
                  "(discretization support required).");
   args.AddOption(&opts.time_atol,
                  "-tatol",
@@ -167,6 +180,13 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-zsp",
                  "--zhang-shu-points",
                  "Zhang-Shu positivity points: consumer | quadrature.");
+  args.AddOption(&opts.zhang_shu_vtk_points,
+                 "-zsvtk",
+                 "--zhang-shu-vtk-points",
+                 "-no-zsvtk",
+                 "--no-zhang-shu-vtk-points",
+                 "Enable or disable Zhang-Shu enforcement at the refined "
+                 "points used for VTK output (default off).");
   args.AddOption(
     &opts.dgsem_stab,
     "-ds",
@@ -197,9 +217,11 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.dt,
                  "-dt",
                  "--time-step",
-                 "Time step. Positive selects fixed stepping; nonpositive "
-                 "selects CFL for Backward Euler, while negative supplies the "
-                 "initial adaptive RODAS3 step magnitude.");
+                 "Time-step input. For explicit SSPRK, it is used only when "
+                 "--cfl-number is zero; a positive CFL safety factor takes "
+                 "precedence. For HDG, positive selects fixed stepping, "
+                 "nonpositive selects CFL for Backward Euler, and negative "
+                 "supplies the initial adaptive RODAS3 step magnitude.");
   args.AddOption(&opts.dt_min,
                  "-dtmin",
                  "--dt-min",
@@ -208,7 +230,12 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.cfl,
                  "-c",
                  "--cfl-number",
-                 "CFL number for timestep calculation.");
+                 "Explicit SSPRK CFL safety factor theta in (0,1], applied as "
+                 "dt=theta*C_SSP*h_min/((2p+1)*lambda_max); zero selects the "
+                 "fixed --time-step. This normalization does not certify a "
+                 "case's spatial stability limit. For CFL-controlled HDG "
+                 "Backward Euler, this remains the backend stable-step "
+                 "multiplier.");
   args.AddOption(&opts.glvis,
                  "-glvis",
                  "--glvis",
@@ -288,6 +315,15 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "--no-admissibility-scan",
                  "Enable or disable Euler density/pressure admissibility "
                  "scans during time integration.");
+  args.AddOption(&opts.conservation_balance,
+                 "-conservation-balance",
+                 "--conservation-balance",
+                 "-no-conservation-balance",
+                 "--no-conservation-balance",
+                 "Enable or disable bounded accepted-step Euler physical-"
+                 "boundary conservation diagnostics. This qualification "
+                 "mode adds reductions and is excluded from performance "
+                 "timings.");
   args.AddOption(&opts.restart_vtk,
                  "-restart-vtk",
                  "--restart-vtk",

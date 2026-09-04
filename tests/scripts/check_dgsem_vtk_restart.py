@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Verify exact Gauss-Lobatto DGSEM VTK cold-restart semantics.
 
-This exercises the currently integrated host DGSEM route.  In particular, it
-does not claim packed-production DGSEM Mult coverage.  Only conservative state
-is reconstructed; solver-owned IGR sigma is certified as a cold recomputation.
+The default mode exercises the established host DGSEM route and does not claim
+packed-production DGSEM Mult coverage.  Only conservative state is
+reconstructed; solver-owned IGR sigma is certified as a cold recomputation.
+The optional extrapolated-LLF mode verifies the production candidate's exact
+cold reconstruction and intentional extrapolation-history reset contract.
 """
 
 from __future__ import annotations
@@ -32,6 +34,13 @@ LOCK_PATH = Path("/tmp/dg_igr-sm120.lock")
 FINAL_TIME = 2.0e-6
 SAVE_DT = 1.0e-6
 GLOBAL_ELEMENTS = 2
+# Restarting extrapolated cadence deliberately discards the predecessor sigma
+# endpoint, so the first resumed step is not bitwise equivalent to an
+# uninterrupted step.  This short two-step qualification nevertheless requires
+# the resulting conservative-state drift to remain well below one part per
+# million in both a scale-aware max norm and the global relative L2 norm.
+COLD_HISTORY_RESET_MAX_REL_LINF = 5.0e-7
+COLD_HISTORY_RESET_REL_L2 = 5.0e-8
 MESH_TEXT = """MFEM mesh v1.0
 
 dimension
@@ -191,6 +200,12 @@ def make_mesh(path: Path) -> None:
 
 def base_command(args: argparse.Namespace, mesh: Path) -> list[str]:
     linear_rtol = "1.0e-5" if args.device == "cuda" else "1.0e-10"
+    volume_dissipation = "llf" if args.extrapolated_llf else "none"
+    time_integrator = "ssprk104" if args.extrapolated_llf else "rk3ssp"
+    alpha_policy = "local" if args.extrapolated_llf else "max"
+    igr_space = "L2" if args.extrapolated_llf else "H1"
+    igr_grad = "BrokenL2" if args.extrapolated_llf else "H1"
+    linear_solver = "cg" if args.extrapolated_llf else "minres"
     app = [
         str(Path(args.exe).resolve()),
         "--device", args.device,
@@ -204,8 +219,9 @@ def base_command(args: argparse.Namespace, mesh: Path) -> list[str]:
         "-dg", "dgsem",
         "-ds", "none",
         "-dvf", "central",
-        "-dvd", "none",
+        "-dvd", volume_dissipation,
         "-dsf", "rusanov",
+        "--time-integrator", time_integrator,
         "-as", "0",
         "-no-glvis",
         "-vtk",
@@ -216,15 +232,23 @@ def base_command(args: argparse.Namespace, mesh: Path) -> list[str]:
         "-no-vtk-zs",
         "-no-save-state",
         "-ca", "1.0",
-        "-ial", "max",
-        "-is", "H1",
-        "-ig", "H1",
-        "-ils", "minres",
+        "-ial", alpha_policy,
+        "-is", igr_space,
+        "-ig", igr_grad,
+        "-ils", linear_solver,
         "-ipc", "chebyshev",
+        "--igr-nonconvergence-policy", "error",
         "-irtol", linear_rtol,
         "-imaxit", "1000",
         "-iprint", "0",
     ]
+    if args.extrapolated_llf:
+        app.extend(
+            [
+                "--igr-exact-dg-face",
+                "--igr-sigma-cadence", "extrapolated-every-step",
+            ]
+        )
     if args.mpi_ranks > 1:
         return [args.mpiexec, args.mpi_numproc_flag, str(args.mpi_ranks), *app]
     return app
@@ -236,7 +260,7 @@ def replace_option(command: list[str], option: str, value: str) -> list[str]:
     return changed
 
 
-def entries_contract(pvd: Path, ranks: int, order: int) -> dict[str, object]:
+def entries_contract(pvd: Path, args: argparse.Namespace) -> dict[str, object]:
     entries = vtk.pvd_entries(pvd)
     expected = [(0, 0.0), (1, SAVE_DT), (2, FINAL_TIME)]
     if len(entries) != len(expected):
@@ -248,27 +272,58 @@ def entries_contract(pvd: Path, ranks: int, order: int) -> dict[str, object]:
             raise RuntimeError(f"unexpected PVD cycle/time: {(cycle, time)}")
         manifest_path = pvtu.parent / "restart.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        sigma_policy = (
+            "cold-recompute-and-reset-extrapolation-history"
+            if args.extrapolated_llf
+            else "cold-recompute-from-conservative-state"
+        )
         required = {
-            "schema_version": 1,
+            "schema_version": 4,
             "complete": True,
             "case": "dgsem_sedov_taylor_blast",
             "cycle": cycle,
             "time": time,
             "step": cycle,
-            "ranks": ranks,
+            "ranks": args.mpi_ranks,
             "global_elements": GLOBAL_ELEMENTS,
-            "order": order,
+            "order": args.order,
             "serial_refinement": 0,
             "parallel_refinement": 0,
             "dg_backend": "dgsem",
+            "time_integrator": (
+                "ssprk104" if args.extrapolated_llf else "rk3ssp"
+            ),
+            "dgsem_stabilization": "none",
+            "dgsem_volume_flux": "central",
+            "dgsem_volume_dissipation": (
+                "llf" if args.extrapolated_llf else "none"
+            ),
+            "dgsem_surface_flux": "rusanov",
+            "dgsem_entropy_jacobian": "fd",
             "basis": "GaussLobatto",
             "ordering": "byNODES",
             "data_type": "Float64",
             "vtk_format": "binary",
             "piece_pattern": "proc%06d.vtu",
             "igr_enabled": True,
+            "igr_space": "l2" if args.extrapolated_llf else "h1",
+            "igr_grad": "brokenl2" if args.extrapolated_llf else "h1",
+            "alpha_length_policy": "local" if args.extrapolated_llf else "max",
+            "exact_dg_face": args.extrapolated_llf,
+            "sigma_cadence": (
+                "extrapolated-every-step"
+                if args.extrapolated_llf
+                else "every-stage"
+            ),
+            "sigma_update_interval": 1,
+            "igr_invariant_domain_flux": False,
+            "zhang_shu_limiter": True,
+            "rho_floor": 5.0e-7,
+            "pressure_floor": 1.0e-6,
             "sigma_saved": True,
-            "sigma_restart_policy": "cold-recompute-from-conservative-state",
+            "sigma_restart_policy": sigma_policy,
+            "static_source_present": False,
+            "static_source_fingerprint": "none",
         }
         for key, want in required.items():
             if manifest.get(key) != want:
@@ -278,14 +333,16 @@ def entries_contract(pvd: Path, ranks: int, order: int) -> dict[str, object]:
         local_elements = manifest.get("local_elements")
         if (
             not isinstance(local_elements, list)
-            or len(local_elements) != ranks
+            or len(local_elements) != args.mpi_ranks
             or sum(local_elements) != GLOBAL_ELEMENTS
             or any(int(count) <= 0 for count in local_elements)
         ):
             raise RuntimeError(f"invalid same-rank element partition: {local_elements}")
         pieces = vtk.piece_paths(pvtu)
         names = [piece.name for piece in pieces]
-        expected_names = [f"proc{rank:06d}.vtu" for rank in range(ranks)]
+        expected_names = [
+            f"proc{rank:06d}.vtu" for rank in range(args.mpi_ranks)
+        ]
         if names != expected_names or any(not piece.is_file() for piece in pieces):
             raise RuntimeError(f"invalid same-rank piece identity: {names}")
         manifests.append(manifest)
@@ -334,6 +391,7 @@ def compare_final(
     control_pvtu: Path,
     restart_pvtu: Path,
     device: str,
+    cold_history_reset: bool = False,
 ) -> dict[str, object]:
     control_pieces = vtk.piece_paths(control_pvtu)
     restart_pieces = vtk.piece_paths(restart_pvtu)
@@ -342,11 +400,12 @@ def compare_final(
         raise RuntimeError("control PVTU piece ordering is not same-rank")
     if [path.name for path in restart_pieces] != expected_names:
         raise RuntimeError("restart PVTU piece ordering is not same-rank")
-    max_limit = 2.0e-8 if device == "cuda" else 5.0e-10
-    rel_limit = 1.0e-9 if device == "cuda" else 2.0e-11
+    backend_max_limit = 2.0e-8 if device == "cuda" else 5.0e-10
+    backend_rel_limit = 1.0e-9 if device == "cuda" else 2.0e-11
     max_abs = 0.0
     diff_sq = 0.0
     ref_sq = 0.0
+    ref_linf = 0.0
     field_hashes: dict[str, list[dict[str, str]]] = {
         name: [] for name in ("density", "momentum", "energy")
     }
@@ -383,16 +442,51 @@ def compare_final(
                 max_abs = max(max_abs, abs(diff))
                 diff_sq += diff * diff
                 ref_sq += float(expected) * float(expected)
+                ref_linf = max(ref_linf, abs(float(expected)))
     rel_l2 = math.sqrt(diff_sq / max(ref_sq, 1.0e-300))
-    if max_abs > max_limit or rel_l2 > rel_limit:
+    relative_linf = max_abs / max(ref_linf, 1.0)
+    if (
+        not math.isfinite(max_abs)
+        or not math.isfinite(relative_linf)
+        or not math.isfinite(rel_l2)
+    ):
         raise RuntimeError(
-            f"DGSEM split-run drift too large: max_abs={max_abs:.6e} rel_l2={rel_l2:.6e}"
+            "DGSEM split-run drift is non-finite: "
+            f"max_abs={max_abs} relative_linf={relative_linf} rel_l2={rel_l2}"
+        )
+    if cold_history_reset:
+        comparison_policy = "bounded-cold-history-reset"
+        max_limit = max(
+            backend_max_limit,
+            COLD_HISTORY_RESET_MAX_REL_LINF * max(ref_linf, 1.0),
+        )
+        relative_linf_limit = COLD_HISTORY_RESET_MAX_REL_LINF
+        rel_limit = max(backend_rel_limit, COLD_HISTORY_RESET_REL_L2)
+    else:
+        comparison_policy = "split-equivalence"
+        max_limit = backend_max_limit
+        relative_linf_limit = max_limit / max(ref_linf, 1.0)
+        rel_limit = backend_rel_limit
+    if (
+        max_abs > max_limit
+        or relative_linf > relative_linf_limit
+        or rel_l2 > rel_limit
+    ):
+        raise RuntimeError(
+            "DGSEM split-run drift exceeds "
+            f"{comparison_policy} tolerance: max_abs={max_abs:.6e} "
+            f"relative_linf={relative_linf:.6e} rel_l2={rel_l2:.6e}"
         )
     return {
+        "policy": comparison_policy,
         "max_abs": max_abs,
+        "reference_linf": ref_linf,
+        "relative_linf": relative_linf,
         "rel_l2": rel_l2,
         "max_abs_tolerance": max_limit,
+        "relative_linf_tolerance": relative_linf_limit,
         "rel_l2_tolerance": rel_limit,
+        "cold_history_reset": cold_history_reset,
         "field_sha256": field_hashes,
         "mesh_sha256": mesh_hashes,
         "same_rank_piece_names": expected_names,
@@ -416,13 +510,14 @@ def restart_diagnostics(log: str) -> dict[str, object]:
         raise RuntimeError(f"restart mesh/admissibility certificate is invalid: {values}")
     sigma = vtk.require(
         r"\[vtk-restart\] event=sigma-initialization solved=(\d+) cold_start=(\d+) "
-        r"reusable_stage0=(\d+) independent_residual_certified=(\d+) "
+        r"reusable_stage0=(\d+) certification_supported=(\d+) "
+        r"independent_residual_certified=(\d+) "
         r"independent_residual_rel_rhs=([0-9.eE+-]+)",
         log,
         "cold sigma recomputation certificate",
     )
-    sigma_values = [int(value) for value in sigma.groups()[:4]]
-    if sigma_values != [1, 1, 1, 1]:
+    sigma_values = [int(value) for value in sigma.groups()[:5]]
+    if sigma_values != [1, 1, 1, 1, 1]:
         raise RuntimeError(f"sigma was not cold-recomputed and certified: {sigma.groups()}")
     lifecycle = vtk.require(
         r"\[igr-sigma-lifecycle\] event=run-summary prefetch_solves=(\d+) "
@@ -444,8 +539,9 @@ def restart_diagnostics(log: str) -> dict[str, object]:
             "solved": sigma_values[0],
             "cold_start": sigma_values[1],
             "reusable_stage0": sigma_values[2],
-            "independent_residual_certified": sigma_values[3],
-            "independent_residual_rel_rhs": float(sigma.group(5)),
+            "certification_supported": sigma_values[3],
+            "independent_residual_certified": sigma_values[4],
+            "independent_residual_rel_rhs": float(sigma.group(6)),
         },
         "sigma_lifecycle": {
             "prefetch_solves": lifecycle_values[0],
@@ -453,6 +549,33 @@ def restart_diagnostics(log: str) -> dict[str, object]:
             "output_only_solves": lifecycle_values[2],
             "prefetch_invalidations": lifecycle_values[3],
         },
+    }
+
+
+def packed_dispatch_diagnostics(
+    log: str, args: argparse.Namespace, label: str
+) -> dict[str, object]:
+    dispatch = vtk.require(
+        r"\[dgsem-production\] selected=mfem-native-packed strict=1 "
+        r"backend=(cpu|cuda) .*?volume_dissipation=llf "
+        r"llf_volume_active=1 frozen_sigma_spectral_speed=1 "
+        r"order=(\d+) dim=2",
+        log,
+        f"{label} strict packed DGSEM dispatch",
+    )
+    backend, order = dispatch.groups()
+    if backend != args.device or int(order) != args.order:
+        raise RuntimeError(
+            f"{label} packed dispatch mismatch: backend={backend} order={order}"
+        )
+    return {
+        "selected": "mfem-native-packed",
+        "strict": True,
+        "backend": backend,
+        "volume_dissipation": "llf",
+        "frozen_sigma_spectral_speed": True,
+        "order": int(order),
+        "dimension": 2,
     }
 
 
@@ -567,6 +690,19 @@ def run_negative_controls(
         restart(pvd),
         r"manifest is incompatible",
         {"active_backend": "dgsem", "manifest_basis": "GaussLegendre"},
+    )
+
+    pvd = copy_variant(source_pvd, root / "wrong-dgsem-transport" / "source")
+    update_manifest(pvd, dgsem_volume_dissipation="llf")
+    execute(
+        "wrong-dgsem-transport",
+        pvd,
+        restart(pvd),
+        r"manifest is incompatible",
+        {
+            "active_volume_dissipation": "none",
+            "manifest_volume_dissipation": "llf",
+        },
     )
 
     pvd = copy_variant(source_pvd, root / "dg-gausslobatto" / "source")
@@ -828,7 +964,7 @@ def execute(args: argparse.Namespace, attempt: Path, runner: Runner) -> dict[str
     control_root = attempt / "control" / "vtk"
     control_log = runner.run(base, attempt / "control" / "run.log", control_root)
     source_pvd = vtk.dataset_pvd(control_root)
-    source_contract = entries_contract(source_pvd, args.mpi_ranks, args.order)
+    source_contract = entries_contract(source_pvd, args)
     source_hashes = vtk.tree_hashes(source_pvd.parent)
 
     restart_root = attempt / "restart" / "vtk"
@@ -843,6 +979,16 @@ def execute(args: argparse.Namespace, attempt: Path, runner: Runner) -> dict[str
         restart_root,
     )
     diagnostics = restart_diagnostics(restart_log)
+    packed_dispatch: dict[str, object] | None = None
+    if args.extrapolated_llf:
+        packed_dispatch = {
+            "control": packed_dispatch_diagnostics(
+                control_log, args, "control"
+            ),
+            "restart": packed_dispatch_diagnostics(
+                restart_log, args, "restart"
+            ),
+        }
     if vtk.tree_hashes(source_pvd.parent) != source_hashes:
         raise RuntimeError("successful cold restart modified its source dataset")
 
@@ -857,17 +1003,60 @@ def execute(args: argparse.Namespace, attempt: Path, runner: Runner) -> dict[str
     )
     if restart_manifest.get("step") != 2 or restart_manifest.get("next_cycle") != 3:
         raise RuntimeError("restart manifest step/cycle continuation is wrong")
+    expected_sigma_policy = (
+        "cold-recompute-and-reset-extrapolation-history"
+        if args.extrapolated_llf
+        else "cold-recompute-from-conservative-state"
+    )
+    if restart_manifest.get("sigma_restart_policy") != expected_sigma_policy:
+        raise RuntimeError("restart manifest has the wrong sigma cold-start policy")
     metadata = json.loads(
         (restart_pvd.parent / "run_metadata.json").read_text(encoding="utf-8")
     )
+    runtime = metadata.get("runtime", {})
+    igr_linear = metadata.get("igr_linear", {})
     if (
-        metadata.get("restart", {}).get("cycle") != 1
+        metadata.get("schema_version") != 3
+        or metadata.get("restart", {}).get("cycle") != 1
         or metadata.get("performance", {}).get("segment_steps") != 1
+        or runtime.get("dgsem_stabilization") != "none"
+        or runtime.get("dgsem_volume_flux") != "central"
+        or runtime.get("dgsem_volume_dissipation")
+        != ("llf" if args.extrapolated_llf else "none")
+        or runtime.get("dgsem_surface_flux") != "rusanov"
+        or runtime.get("dgsem_entropy_jacobian") != "fd"
+        or runtime.get("igr_sigma_cadence")
+        != (
+            "extrapolated-every-step"
+            if args.extrapolated_llf
+            else "every-stage"
+        )
+        or runtime.get("igr_sigma_update_interval") != 1
+        or runtime.get("igr_alpha_length_policy")
+        != ("local" if args.extrapolated_llf else "max")
+        or runtime.get("igr_exact_dg_face_operator")
+        != args.extrapolated_llf
+        or runtime.get("igr_frozen_sigma_spectral_speed")
+        != args.extrapolated_llf
+        or (
+            args.extrapolated_llf
+            and (
+                igr_linear.get("last_solver") != "cg"
+                or igr_linear.get("last_precond") != "operatorchebyshev"
+            )
+        )
     ):
-        raise RuntimeError("restart metadata lacks source/segment provenance")
+        raise RuntimeError(
+            "restart metadata lacks effective method/source/segment provenance"
+        )
 
     control_final = next(entry[2] for entry in vtk.pvd_entries(source_pvd) if entry[0] == 2)
-    comparison = compare_final(control_final, restart_entries[0][2], args.device)
+    comparison = compare_final(
+        control_final,
+        restart_entries[0][2],
+        args.device,
+        cold_history_reset=args.extrapolated_llf,
+    )
     negatives: dict[str, object] = {}
     if args.negative_controls:
         if args.device != "cpu" or args.mpi_ranks != 1:
@@ -895,13 +1084,28 @@ def execute(args: argparse.Namespace, attempt: Path, runner: Runner) -> dict[str
         if vtk.tree_hashes(source_pvd.parent) != source_hashes:
             raise RuntimeError("rank reorder control modified the positive source dataset")
 
-    vtk.require(r"production_calls=6 production_converged_calls=6", control_log, "control IGR solves")
+    production = vtk.require(
+        r"production_calls=(\d+) production_converged_calls=(\d+)",
+        control_log,
+        "control IGR solves",
+    )
+    production_calls = int(production.group(1))
+    production_converged_calls = int(production.group(2))
+    if production_calls < 1 or production_converged_calls != production_calls:
+        raise RuntimeError(
+            "control IGR production solves did not all converge: "
+            f"{production.groups()}"
+        )
     return {
         "schema_version": 1,
         "status": "pass",
         "task": "DGSEM-RESTART-01",
         "claim_scope": (
-            "pre-composition host DGSEM cold-restart evidence; not packed-production Mult evidence"
+            "DGSEM extrapolated-LLF cold restart with exact reconstruction and "
+            "intentional history reset"
+            if args.extrapolated_llf
+            else "pre-composition host DGSEM cold-restart evidence; not "
+            "packed-production Mult evidence"
         ),
         "case": "dgsem_sedov_taylor_blast",
         "boundary_condition": "all-slip",
@@ -910,8 +1114,14 @@ def execute(args: argparse.Namespace, attempt: Path, runner: Runner) -> dict[str
             "basis": "GaussLobatto",
             "order": args.order,
             "volume_flux": "central",
-            "volume_dissipation": "none",
+            "volume_dissipation": "llf" if args.extrapolated_llf else "none",
             "surface_flux": "rusanov",
+            "stabilization": "none",
+            "sigma_cadence": (
+                "extrapolated-every-step"
+                if args.extrapolated_llf
+                else "every-stage"
+            ),
         },
         "device": args.device,
         "ranks": args.mpi_ranks,
@@ -935,10 +1145,16 @@ def execute(args: argparse.Namespace, attempt: Path, runner: Runner) -> dict[str
             **diagnostics,
         },
         "comparison": comparison,
+        "igr_production_solves": {
+            "calls": production_calls,
+            "converged_calls": production_converged_calls,
+        },
+        "dgsem_packed_dispatch": packed_dispatch,
         "sigma_truth": {
             "serialized_sigma_persistence_claimed": False,
             "conservative_state_reconstructed": True,
-            "policy": "cold-recompute-from-conservative-state",
+            "policy": expected_sigma_policy,
+            "extrapolation_history_restored": False,
             "independent_residual_certified": True,
         },
         "negative_controls_run": (
@@ -960,9 +1176,21 @@ def main() -> int:
     parser.add_argument("--mpi-numproc-flag", default="-n")
     parser.add_argument("--negative-controls", action="store_true")
     parser.add_argument("--rank-piece-reorder-negative", action="store_true")
+    parser.add_argument(
+        "--extrapolated-llf",
+        action="store_true",
+        help=(
+            "exercise DGSEM LLF with local-alpha exact-face IGR and "
+            "extrapolated-every-step cold-history reset"
+        ),
+    )
     args = parser.parse_args()
     if args.mpi_ranks < 1:
         raise RuntimeError("--mpi-ranks must be positive")
+    if args.extrapolated_llf and args.negative_controls:
+        raise RuntimeError(
+            "--negative-controls exercise the legacy/default transport tuple"
+        )
 
     attempt = create_attempt(Path(args.out_dir).resolve())
     write_json(
@@ -972,12 +1200,20 @@ def main() -> int:
     environment = os.environ.copy()
     environment.update(
         {
-            "DG_IGR_IGR_PARTIAL_ASSEMBLY": "1",
-            "DG_IGR_IGR_DEVICE_QF": "1",
             "DG_IGR_IGR_CHEB_ORDER": "3",
-            "DG_IGR_IGR_CHEB_BASE_OPERATOR": "1",
+            "DG_IGR_IGR_CHEB_BASE_OPERATOR": (
+                "0" if args.extrapolated_llf else "1"
+            ),
         }
     )
+    if args.extrapolated_llf:
+        environment["DG_IGR_DGSEM_PRODUCTION_STRICT"] = "1"
+    else:
+        # Retain the legacy closure controls only for the pre-composition
+        # restart surface. Exact DG faces make both policies intrinsic to the
+        # selected extrapolated tuple.
+        environment["DG_IGR_IGR_PARTIAL_ASSEMBLY"] = "1"
+        environment["DG_IGR_IGR_DEVICE_QF"] = "1"
     runner = Runner(attempt, environment)
     lease = Lease(attempt, args.mpi_ranks > 1 or args.device == "cuda")
     if not lease.acquire():

@@ -18,6 +18,23 @@
 namespace dg_sim
 {
 
+/// @brief Resolve the sigma cadence after applying the case default.
+inline dg_igr::IGRSigmaUpdateCadence
+ResolveEffectiveIGRSigmaUpdateCadence(const RunConfig& run_cfg)
+{
+  return run_cfg.igr_opts.sigma_cadence.empty()
+           ? run_cfg.case_config.igr_config.sigma_cadence
+           : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
+}
+
+/// @brief Resolve the sigma update interval after applying the case default.
+inline int ResolveEffectiveIGRSigmaUpdateInterval(const RunConfig& run_cfg)
+{
+  return run_cfg.igr_opts.sigma_update_interval > 0
+           ? run_cfg.igr_opts.sigma_update_interval
+           : run_cfg.case_config.igr_config.sigma_update_interval;
+}
+
 /// @brief Default VTK output directory for a case (prefix_path/case_name).
 inline std::string DefaultCaseVTKOutputDir(const CaseConfig& case_cfg)
 {
@@ -40,6 +57,75 @@ inline std::string MakeCaseVTKDatasetName(
   name << case_cfg.case_name << "_p_" << run_cfg.opts.order << "_ref_"
        << total_ref << "_is_" << run_cfg.igr_opts.space << "_ig_"
        << run_cfg.igr_opts.grad << "_ca_" << c_alpha;
+  // Preserve the established RK3SSP dataset name while keeping the typed
+  // SSPRK(10,4) output from colliding with it.
+  if (run_cfg.time_integrator == TimeIntegrator::SSPRK104)
+  {
+    name << "_ti_" << TimeIntegratorToString(run_cfg.time_integrator);
+  }
+  // Preserve the historical DGSEM tuple's name while distinguishing every
+  // non-default transport selector that changes the discrete operator.
+  if (run_cfg.dg_backend == DGBackend::DGSEM)
+  {
+    if (run_cfg.dgsem_stab != DGSEMStabilization::None)
+    {
+      name << "_dstab_" << DGSEMStabilizationToString(run_cfg.dgsem_stab);
+    }
+    if (run_cfg.dgsem_volume_flux != DGSEMVolumeFlux::Central)
+    {
+      name << "_dvf_" << DGSEMVolumeFluxToString(run_cfg.dgsem_volume_flux);
+    }
+    if (run_cfg.dgsem_volume_dissipation != DGSEMVolumeDissipation::None)
+    {
+      name << "_dvd_"
+           << DGSEMVolumeDissipationToString(
+                run_cfg.dgsem_volume_dissipation);
+    }
+    if (run_cfg.dgsem_surface_flux != DGSEMSurfaceFlux::Rusanov)
+    {
+      name << "_dsf_" << DGSEMSurfaceFluxToString(run_cfg.dgsem_surface_flux);
+    }
+    if (run_cfg.dgsem_entropy_jacobian !=
+        DGSEMEntropyJacobian::FiniteDifference)
+    {
+      name << "_dej_"
+           << DGSEMEntropyJacobianToString(run_cfg.dgsem_entropy_jacobian);
+    }
+  }
+  if (run_cfg.regularization == Regularization::IGR)
+  {
+    const auto cadence = ResolveEffectiveIGRSigmaUpdateCadence(run_cfg);
+    if (cadence != dg_igr::IGRSigmaUpdateCadence::EveryStage)
+    {
+      name << "_iscad_" << IGRSigmaUpdateCadenceToString(cadence);
+      if (cadence == dg_igr::IGRSigmaUpdateCadence::EveryNSteps)
+      {
+        name << "_isn_" << ResolveEffectiveIGRSigmaUpdateInterval(run_cfg);
+      }
+    }
+    const auto alpha_policy = ResolveIGRAlphaLengthScalePolicy(run_cfg);
+    if (alpha_policy == dg_igr::IGRAlphaLengthScalePolicy::Local)
+    {
+      name << "_ial_" << IGRAlphaLengthScalePolicyToString(alpha_policy);
+    }
+    if (run_cfg.igr_opts.exact_dg_face_operator)
+    {
+      name << "_iexface";
+    }
+  }
+  // The exact IGR-aware invariant-domain face speed changes the numerical
+  // flux and therefore must never share an output directory with the legacy
+  // Rusanov selection.
+  if (run_cfg.igr_opts.igr_invariant_domain_flux)
+  {
+    name << "_iidflux";
+  }
+  // Refined VTK points enlarge the limiter's enforced point set and therefore
+  // define a distinct numerical policy even when all other selectors match.
+  if (run_cfg.opts.zhang_shu_vtk_points)
+  {
+    name << "_zsvtk";
+  }
   return name.str();
 }
 

@@ -4,7 +4,12 @@
 
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
 
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace dg_igr
 {
@@ -18,6 +23,20 @@ enum class DGDiffusionFaceScaling
   Sum,
   HarmonicWeighted
 };
+
+/** Return a process-local revision for one rebuilt face-connectivity pack.
+ *
+ * Incidence data is derived from the packed face-element array.  Counts alone
+ * cannot identify that array: two reordered meshes may have identical
+ * element/face counts.  A revision is assigned while the geometry is already
+ * being rebuilt on the host, so an apply only needs a scalar comparison and
+ * never hashes or synchronizes connectivity.
+ */
+inline std::uint64_t NextDGFaceConnectivityRevision()
+{
+  static std::atomic<std::uint64_t> next_revision{1};
+  return next_revision.fetch_add(1, std::memory_order_relaxed);
+}
 
 struct FaceQFProjectInfo
 {
@@ -47,6 +66,8 @@ struct InteriorFaceSideDensityProjectionInfo
 struct InteriorFaceSideDensityProjectionScratch
 {
   mfem::Vector shape;
+  /// Mapped explicit per-face, per-side alpha; empty for scalar-alpha input.
+  mfem::Vector side_alpha;
   mfem::Array<int> face_elements;
   mfem::Array<int> element_vdof_map;
 };
@@ -88,6 +109,8 @@ struct InteriorFaceDGDiffusionApplyInfo
   int penalty_size = 0;
   int face_element_size = 0;
   int element_vdof_map_size = 0;
+  /// Changes whenever BuildInteriorFaceDGDiffusionApplyData2D repacks faces.
+  std::uint64_t connectivity_revision = 0;
 };
 
 struct InteriorFaceDGDiffusionApplyScratch
@@ -95,8 +118,22 @@ struct InteriorFaceDGDiffusionApplyScratch
   mfem::Vector shape;
   mfem::Vector weighted_normal_dshape;
   mfem::Vector penalty;
+  /// Geometry-only normal derivative used to refresh state-dependent qdata.
+  mfem::Vector normal_dshape_base;
+  /// Geometry-only [side][quadrature][face] penalty metric.
+  mfem::Vector penalty_metric;
+  /// Persistent copy of the current [side][quadrature][face] alpha/rho data.
+  mfem::Vector side_coefficient;
   mfem::Array<int> face_elements;
   mfem::Array<int> element_vdof_map;
+  /// Fixed-order element-to-(face,side) CSR used by the CUDA row gather.
+  mutable mfem::Array<int> element_face_offsets;
+  mutable mfem::Array<int> element_face_ids;
+  mutable mfem::Array<int> element_face_sides;
+  /// Revision from which the incidence arrays were derived.
+  mutable std::uint64_t incidence_connectivity_revision = 0;
+  /// Per-face row contributions written without atomics before the gather.
+  mutable mfem::Vector face_contribution;
 };
 
 struct SharedFaceDGDiffusionApplyInfo
@@ -114,6 +151,8 @@ struct SharedFaceDGDiffusionApplyInfo
   int face_element_size = 0;
   int element_vdof_map_size = 0;
   int face_nbr_dof_map_size = 0;
+  /// Changes whenever BuildSharedFaceDGDiffusionApplyData2D repacks faces.
+  std::uint64_t connectivity_revision = 0;
 };
 
 struct SharedFaceDGDiffusionApplyScratch
@@ -121,9 +160,19 @@ struct SharedFaceDGDiffusionApplyScratch
   mfem::Vector shape;
   mfem::Vector weighted_normal_dshape;
   mfem::Vector penalty;
+  mfem::Vector normal_dshape_base;
+  mfem::Vector penalty_metric;
+  mfem::Vector side_coefficient;
   mfem::Array<int> face_elements;
   mfem::Array<int> element_vdof_map;
   mfem::Array<int> face_nbr_dof_map;
+  /// Fixed-order local-element-to-shared-face CSR for the CUDA row gather.
+  mutable mfem::Array<int> element_face_offsets;
+  mutable mfem::Array<int> element_face_ids;
+  /// Revision from which the incidence arrays were derived.
+  mutable std::uint64_t incidence_connectivity_revision = 0;
+  /// Per-shared-face local-row contributions written before the gather.
+  mutable mfem::Vector face_contribution;
 };
 
 struct SharedFaceSideDensityProjectionInfo
@@ -145,6 +194,8 @@ struct SharedFaceSideDensityProjectionInfo
 struct SharedFaceSideDensityProjectionScratch
 {
   mfem::Vector shape;
+  /// Copied explicit per-face, per-side alpha; empty for scalar-alpha input.
+  mfem::Vector side_alpha;
   mfem::Array<int> face_elements;
   mfem::Array<int> element_vdof_map;
   mfem::Array<int> face_nbr_dof_map;
@@ -164,6 +215,27 @@ void LaunchSharedFaceDGDiffusionApply2D(
   const mfem::Vector& scalar_face_nbr,
   mfem::real_t ip_sigma,
   mfem::Vector& y);
+
+/** Refresh only the coefficient-dependent packed face data on the device.
+ *
+ * The shape, geometry-normal derivative, penalty metric, and connectivity are
+ * immutable until the mesh/FESpace changes.  Keeping those arrays persistent
+ * avoids rebuilding and retransferring the complete face operator at every
+ * instantaneous-IGR stage.
+ */
+void LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  InteriorFaceDGDiffusionApplyScratch& work,
+  const mfem::Vector& side_q,
+  mfem::real_t kappa,
+  DGDiffusionFaceScaling face_scaling);
+
+void LaunchSharedFaceDGDiffusionCoefficientUpdate2D(
+  const SharedFaceDGDiffusionApplyInfo& info,
+  SharedFaceDGDiffusionApplyScratch& work,
+  const mfem::Vector& side_q,
+  mfem::real_t kappa,
+  DGDiffusionFaceScaling face_scaling);
 
 inline int ReferenceNormalComponent2D(int local_face_id)
 {
@@ -490,6 +562,116 @@ inline void BuildNativeElementVDofMap(
   element_vdof_map.GetMemory().UseDevice(true);
 }
 
+/** Build a persistent, fixed-order local-element incidence map.
+ *
+ * The face apply used to launch one thread per face and atomically add into
+ * both adjacent elements.  That is algebraically correct, but the arrival
+ * order of FP64 atomic additions is not reproducible.  This CSR orders each
+ * element's incidences by packed face id (and then by side for a self-face),
+ * so a later row gather performs the same two-sided SIPG sum deterministically.
+ */
+inline void EnsureInteriorFaceElementIncidence2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work)
+{
+  const int incidence_count = 2 * info.nf;
+  if (info.connectivity_revision != 0 &&
+      work.incidence_connectivity_revision == info.connectivity_revision &&
+      work.element_face_offsets.Size() == info.ne + 1 &&
+      work.element_face_ids.Size() == incidence_count &&
+      work.element_face_sides.Size() == incidence_count)
+  {
+    return;
+  }
+
+  work.element_face_offsets.SetSize(info.ne + 1);
+  work.element_face_ids.SetSize(incidence_count);
+  work.element_face_sides.SetSize(incidence_count);
+  int* offsets = work.element_face_offsets.HostWrite();
+  std::fill(offsets, offsets + info.ne + 1, 0);
+  const auto faces =
+    mfem::Reshape(work.face_elements.HostRead(), 2, info.nf);
+  for (int face = 0; face < info.nf; ++face)
+  {
+    for (int side = 0; side < 2; ++side)
+    {
+      const int element = faces(side, face);
+      MFEM_VERIFY(element >= 0 && element < info.ne,
+                  "Interior exact-face incidence received an invalid "
+                  "element.");
+      ++offsets[element + 1];
+    }
+  }
+  for (int element = 0; element < info.ne; ++element)
+  {
+    offsets[element + 1] += offsets[element];
+  }
+  MFEM_VERIFY(offsets[info.ne] == incidence_count,
+              "Interior exact-face incidence count mismatch.");
+
+  std::vector<int> cursor(offsets, offsets + info.ne);
+  int* face_ids = work.element_face_ids.HostWrite();
+  int* face_sides = work.element_face_sides.HostWrite();
+  for (int face = 0; face < info.nf; ++face)
+  {
+    for (int side = 0; side < 2; ++side)
+    {
+      const int element = faces(side, face);
+      const int slot = cursor[static_cast<std::size_t>(element)]++;
+      face_ids[slot] = face;
+      face_sides[slot] = side;
+    }
+  }
+  work.element_face_offsets.GetMemory().UseDevice(true);
+  work.element_face_ids.GetMemory().UseDevice(true);
+  work.element_face_sides.GetMemory().UseDevice(true);
+  work.incidence_connectivity_revision = info.connectivity_revision;
+}
+
+inline void EnsureSharedFaceElementIncidence2D(
+  const SharedFaceDGDiffusionApplyInfo& info,
+  const SharedFaceDGDiffusionApplyScratch& work)
+{
+  if (info.connectivity_revision != 0 &&
+      work.incidence_connectivity_revision == info.connectivity_revision &&
+      work.element_face_offsets.Size() == info.ne + 1 &&
+      work.element_face_ids.Size() == info.nf)
+  {
+    return;
+  }
+
+  work.element_face_offsets.SetSize(info.ne + 1);
+  work.element_face_ids.SetSize(info.nf);
+  int* offsets = work.element_face_offsets.HostWrite();
+  std::fill(offsets, offsets + info.ne + 1, 0);
+  const int* faces = work.face_elements.HostRead();
+  for (int face = 0; face < info.nf; ++face)
+  {
+    const int element = faces[face];
+    MFEM_VERIFY(element >= 0 && element < info.ne,
+                "Shared exact-face incidence received an invalid local "
+                "element.");
+    ++offsets[element + 1];
+  }
+  for (int element = 0; element < info.ne; ++element)
+  {
+    offsets[element + 1] += offsets[element];
+  }
+  MFEM_VERIFY(offsets[info.ne] == info.nf,
+              "Shared exact-face incidence count mismatch.");
+
+  std::vector<int> cursor(offsets, offsets + info.ne);
+  int* face_ids = work.element_face_ids.HostWrite();
+  for (int face = 0; face < info.nf; ++face)
+  {
+    const int element = faces[face];
+    face_ids[cursor[static_cast<std::size_t>(element)]++] = face;
+  }
+  work.element_face_offsets.GetMemory().UseDevice(true);
+  work.element_face_ids.GetMemory().UseDevice(true);
+  work.incidence_connectivity_revision = info.connectivity_revision;
+}
+
 inline InteriorFaceSideDensityProjectionInfo
 BuildInteriorFaceSideDensityProjectionData2D(
   const mfem::FiniteElementSpace& vfes,
@@ -685,7 +867,9 @@ BuildInteriorFaceDGDiffusionApplyData2D(
   mfem::Vector& penalty,
   mfem::Array<int>& face_elements,
   mfem::Array<int>& element_vdof_map,
-  DGDiffusionFaceScaling face_scaling = DGDiffusionFaceScaling::Arithmetic)
+  DGDiffusionFaceScaling face_scaling = DGDiffusionFaceScaling::Arithmetic,
+  mfem::Vector* normal_dshape_base = nullptr,
+  mfem::Vector* side_penalty_metric = nullptr)
 {
   std::string reason;
   MFEM_VERIFY(SupportsInteriorFaceScalarTraceProjection2D(sfes, fqs, &reason),
@@ -703,6 +887,7 @@ BuildInteriorFaceDGDiffusionApplyData2D(
   info.penalty_size = info.nq * info.nf;
   info.face_element_size = 2 * info.nf;
   info.element_vdof_map_size = info.dof * info.vdim * info.ne;
+  info.connectivity_revision = NextDGFaceConnectivityRevision();
 
   MFEM_VERIFY(side_q.Size() == 2 * info.nq * info.nf,
               "Exact DG diffusion face apply received mismatched side qdata.");
@@ -713,6 +898,16 @@ BuildInteriorFaceDGDiffusionApplyData2D(
   shape.UseDevice(true);
   weighted_normal_dshape.UseDevice(true);
   penalty.UseDevice(true);
+  if (normal_dshape_base)
+  {
+    normal_dshape_base->SetSize(info.weighted_normal_dshape_size);
+    normal_dshape_base->UseDevice(true);
+  }
+  if (side_penalty_metric)
+  {
+    side_penalty_metric->SetSize(2 * info.nq * info.nf);
+    side_penalty_metric->UseDevice(true);
+  }
   face_elements.SetSize(info.face_element_size);
 
   auto shape_out = mfem::Reshape(shape.HostWrite(),
@@ -726,6 +921,17 @@ BuildInteriorFaceDGDiffusionApplyData2D(
                                    info.dof,
                                    info.nf);
   auto penalty_out = mfem::Reshape(penalty.HostWrite(), info.nq, info.nf);
+  mfem::real_t* normal_base_data =
+    normal_dshape_base ? normal_dshape_base->HostWrite() : nullptr;
+  auto normal_base_out = mfem::Reshape(normal_base_data,
+                                       2,
+                                       info.nq,
+                                       info.dof,
+                                       info.nf);
+  mfem::real_t* penalty_metric_data =
+    side_penalty_metric ? side_penalty_metric->HostWrite() : nullptr;
+  auto penalty_metric_out =
+    mfem::Reshape(penalty_metric_data, 2, info.nq, info.nf);
   auto face_out = mfem::Reshape(face_elements.HostWrite(), 2, info.nf);
   const auto qside = mfem::Reshape(side_q.HostRead(), 2, info.nq, info.nf);
 
@@ -788,11 +994,20 @@ BuildInteriorFaceDGDiffusionApplyData2D(
         side_dshape.Mult(nh, side_dshape_dn);
         penalty_metric[side] = side_q_value * penalty_factor_value;
 
+        if (side_penalty_metric)
+        {
+          penalty_metric_out(side, q, of) = penalty_factor_value;
+        }
+
         for (int d = 0; d < info.dof; ++d)
         {
           shape_out(side, q, d, of) = side_shape(d);
           ndshape_out(side, q, d, of) =
             side_q_value * side_dshape_dn(d);
+          if (normal_dshape_base)
+          {
+            normal_base_out(side, q, d, of) = side_dshape_dn(d);
+          }
         }
       }
       const mfem::real_t metric_sum =
@@ -851,7 +1066,9 @@ BuildSharedFaceDGDiffusionApplyData2D(
   mfem::Array<int>& face_elements,
   mfem::Array<int>& element_vdof_map,
   mfem::Array<int>& face_nbr_dof_map,
-  DGDiffusionFaceScaling face_scaling = DGDiffusionFaceScaling::Arithmetic)
+  DGDiffusionFaceScaling face_scaling = DGDiffusionFaceScaling::Arithmetic,
+  mfem::Vector* normal_dshape_base = nullptr,
+  mfem::Vector* side_penalty_metric = nullptr)
 {
 #ifndef MFEM_USE_MPI
   (void)sfes;
@@ -865,6 +1082,8 @@ BuildSharedFaceDGDiffusionApplyData2D(
   (void)element_vdof_map;
   (void)face_nbr_dof_map;
   (void)face_scaling;
+  (void)normal_dshape_base;
+  (void)side_penalty_metric;
   MFEM_ABORT("Shared exact DG diffusion face data requires MFEM MPI support.");
   return {};
 #else
@@ -890,6 +1109,7 @@ BuildSharedFaceDGDiffusionApplyData2D(
   info.face_element_size = info.nf;
   info.element_vdof_map_size = info.dof * info.vdim * info.ne;
   info.face_nbr_dof_map_size = info.dof * info.vdim * info.nf;
+  info.connectivity_revision = NextDGFaceConnectivityRevision();
 
   MFEM_VERIFY(side_q.Size() == 2 * info.nq * info.nf,
               "Shared exact DG diffusion face data received mismatched "
@@ -901,6 +1121,16 @@ BuildSharedFaceDGDiffusionApplyData2D(
   shape.UseDevice(true);
   weighted_normal_dshape.UseDevice(true);
   penalty.UseDevice(true);
+  if (normal_dshape_base)
+  {
+    normal_dshape_base->SetSize(info.weighted_normal_dshape_size);
+    normal_dshape_base->UseDevice(true);
+  }
+  if (side_penalty_metric)
+  {
+    side_penalty_metric->SetSize(2 * info.nq * info.nf);
+    side_penalty_metric->UseDevice(true);
+  }
   face_elements.SetSize(info.face_element_size);
   face_nbr_dof_map.SetSize(info.face_nbr_dof_map_size);
 
@@ -915,6 +1145,17 @@ BuildSharedFaceDGDiffusionApplyData2D(
                                    info.dof,
                                    info.nf);
   auto penalty_out = mfem::Reshape(penalty.HostWrite(), info.nq, info.nf);
+  mfem::real_t* normal_base_data =
+    normal_dshape_base ? normal_dshape_base->HostWrite() : nullptr;
+  auto normal_base_out = mfem::Reshape(normal_base_data,
+                                       2,
+                                       info.nq,
+                                       info.dof,
+                                       info.nf);
+  mfem::real_t* penalty_metric_data =
+    side_penalty_metric ? side_penalty_metric->HostWrite() : nullptr;
+  auto penalty_metric_out =
+    mfem::Reshape(penalty_metric_data, 2, info.nq, info.nf);
   auto face_out = face_elements.HostWrite();
   auto nbr_out = mfem::Reshape(face_nbr_dof_map.HostWrite(),
                                info.dof,
@@ -993,11 +1234,20 @@ BuildSharedFaceDGDiffusionApplyData2D(
         side_dshape.Mult(nh, side_dshape_dn);
         penalty_metric[side] = side_q_value * penalty_factor_value;
 
+        if (side_penalty_metric)
+        {
+          penalty_metric_out(side, q, sf) = penalty_factor_value;
+        }
+
         for (int d = 0; d < info.dof; ++d)
         {
           shape_out(side, q, d, sf) = side_shape(d);
           ndshape_out(side, q, d, sf) =
             side_q_value * side_dshape_dn(d);
+          if (normal_dshape_base)
+          {
+            normal_base_out(side, q, d, sf) = side_dshape_dn(d);
+          }
         }
       }
       const mfem::real_t metric_sum =
@@ -1172,6 +1422,7 @@ struct InteriorFaceSideDensityProjection2D
   mfem::real_t alpha = 0.0;
   mfem::real_t rho_floor = 0.0;
   const mfem::real_t* shape = nullptr;
+  const mfem::real_t* side_alpha = nullptr;
   const int* face_elements = nullptr;
   const int* element_vdof_map = nullptr;
   const mfem::real_t* state = nullptr;
@@ -1183,6 +1434,7 @@ struct InteriorFaceSideDensityProjection2D
     auto F = mfem::Reshape(face_elements, 2, nf);
     auto D = mfem::Reshape(element_vdof_map, dof, vdim, ne);
     auto Q = mfem::Reshape(side_q, 2, nq, nf);
+    auto A = mfem::Reshape(side_alpha, 2, nf);
 
     MFEM_FOREACH_THREAD(qs, x, 2 * nq)
     {
@@ -1194,8 +1446,11 @@ struct InteriorFaceSideDensityProjection2D
       {
         rho += S(side, q, d, face) * state[D(d, 0, e)];
       }
-      Q(side, q, face) =
-        frozen_scalar_igr_algebra::AlphaOverDensity(alpha, rho, rho_floor);
+      const mfem::real_t side_alpha_value = side_alpha ? A(side, face) : alpha;
+      Q(side, q, face) = frozen_scalar_igr_algebra::AlphaOverDensity(
+        side_alpha_value,
+        rho,
+        rho_floor);
     }
   }
 };
@@ -1243,7 +1498,7 @@ struct InteriorFaceScalarTraceProjection2D
   }
 };
 
-struct InteriorFaceDGDiffusionApply2D
+struct InteriorFaceDGDiffusionRecord2D
 {
   int dof = 0;
   int vdim = 0;
@@ -1257,7 +1512,7 @@ struct InteriorFaceDGDiffusionApply2D
   const int* face_elements = nullptr;
   const int* element_vdof_map = nullptr;
   const mfem::real_t* x = nullptr;
-  mfem::real_t* y = nullptr;
+  mfem::real_t* contribution = nullptr;
 
   MFEM_HOST_DEVICE void operator()(int face) const
   {
@@ -1266,6 +1521,15 @@ struct InteriorFaceDGDiffusionApply2D
     auto P = mfem::Reshape(penalty, nq, nf);
     auto F = mfem::Reshape(face_elements, 2, nf);
     auto D = mfem::Reshape(element_vdof_map, dof, vdim, ne);
+    auto C = mfem::Reshape(contribution, dof, 2, nf);
+
+    for (int side = 0; side < 2; ++side)
+    {
+      for (int d = 0; d < dof; ++d)
+      {
+        C(d, side, face) = 0.0;
+      }
+    }
 
     for (int q = 0; q < nq; ++q)
     {
@@ -1286,8 +1550,6 @@ struct InteriorFaceDGDiffusionApply2D
       const mfem::real_t avg_flux = normal_flux[0] + normal_flux[1];
       const mfem::real_t penalty_jump = P(q, face) * jump;
 
-      const int e0 = F(0, face);
-      const int e1 = F(1, face);
       for (int d = 0; d < dof; ++d)
       {
         const mfem::real_t y0 =
@@ -1298,14 +1560,48 @@ struct InteriorFaceDGDiffusionApply2D
           S(1, q, d, face) * avg_flux +
           ip_sigma * N(1, q, d, face) * jump -
           S(1, q, d, face) * penalty_jump;
-        ::AtomicAdd(y[D(d, 0, e0)], y0);
-        ::AtomicAdd(y[D(d, 0, e1)], y1);
+        C(d, 0, face) += y0;
+        C(d, 1, face) += y1;
       }
     }
   }
 };
 
-struct SharedFaceDGDiffusionApply2D
+struct InteriorFaceDGDiffusionGather2D
+{
+  int dof = 0;
+  int vdim = 0;
+  int ne = 0;
+  int nf = 0;
+  const int* element_vdof_map = nullptr;
+  const int* element_face_offsets = nullptr;
+  const int* element_face_ids = nullptr;
+  const int* element_face_sides = nullptr;
+  const mfem::real_t* contribution = nullptr;
+  mfem::real_t* y = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int row) const
+  {
+    const int element = row / dof;
+    const int local_dof = row - element * dof;
+    auto D = mfem::Reshape(element_vdof_map, dof, vdim, ne);
+    auto C = mfem::Reshape(contribution, dof, 2, nf);
+    mfem::real_t sum = 0.0;
+    for (int incidence = element_face_offsets[element];
+         incidence < element_face_offsets[element + 1];
+         ++incidence)
+    {
+      sum += C(local_dof,
+               element_face_sides[incidence],
+               element_face_ids[incidence]);
+    }
+    // One CUDA row owns each discontinuous scalar dof.  Interior and shared
+    // gathers execute in stream order, so the latter may safely add here.
+    y[D(local_dof, 0, element)] += sum;
+  }
+};
+
+struct SharedFaceDGDiffusionRecord2D
 {
   int dof = 0;
   int vdim = 0;
@@ -1321,7 +1617,7 @@ struct SharedFaceDGDiffusionApply2D
   const int* face_nbr_dof_map = nullptr;
   const mfem::real_t* x = nullptr;
   const mfem::real_t* x_face_nbr = nullptr;
-  mfem::real_t* y = nullptr;
+  mfem::real_t* contribution = nullptr;
 
   MFEM_HOST_DEVICE mfem::real_t FaceNbrValue(int vdof) const
   {
@@ -1336,8 +1632,13 @@ struct SharedFaceDGDiffusionApply2D
     auto F = mfem::Reshape(face_elements, nf);
     auto D = mfem::Reshape(element_vdof_map, dof, vdim, ne);
     auto DN = mfem::Reshape(face_nbr_dof_map, dof, vdim, nf);
+    auto C = mfem::Reshape(contribution, dof, nf);
 
     const int e0 = F(face);
+    for (int d = 0; d < dof; ++d)
+    {
+      C(d, face) = 0.0;
+    }
     for (int q = 0; q < nq; ++q)
     {
       mfem::real_t value[2] = {0.0, 0.0};
@@ -1362,21 +1663,145 @@ struct SharedFaceDGDiffusionApply2D
           -S(0, q, d, face) * avg_flux +
           ip_sigma * N(0, q, d, face) * jump +
           S(0, q, d, face) * penalty_jump;
-        ::AtomicAdd(y[D(d, 0, e0)], y0);
+        C(d, face) += y0;
       }
     }
   }
 };
 
+struct SharedFaceDGDiffusionGather2D
+{
+  int dof = 0;
+  int vdim = 0;
+  int ne = 0;
+  int nf = 0;
+  const int* element_vdof_map = nullptr;
+  const int* element_face_offsets = nullptr;
+  const int* element_face_ids = nullptr;
+  const mfem::real_t* contribution = nullptr;
+  mfem::real_t* y = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int row) const
+  {
+    const int element = row / dof;
+    const int local_dof = row - element * dof;
+    auto D = mfem::Reshape(element_vdof_map, dof, vdim, ne);
+    auto C = mfem::Reshape(contribution, dof, nf);
+    mfem::real_t sum = 0.0;
+    for (int incidence = element_face_offsets[element];
+         incidence < element_face_offsets[element + 1];
+         ++incidence)
+    {
+      sum += C(local_dof, element_face_ids[incidence]);
+    }
+    y[D(local_dof, 0, element)] += sum;
+  }
+};
+
+inline void AddInteriorFaceDGDiffusionApplyDevice2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const InteriorFaceDGDiffusionApplyScratch& work,
+  const mfem::Vector& scalar,
+  mfem::real_t ip_sigma,
+  mfem::Vector& y)
+{
+  MFEM_VERIFY(info.vdim == 1 &&
+                scalar.Size() == info.ne * info.dof &&
+                y.Size() == scalar.Size(),
+              "Deterministic exact DG face gather requires one uniquely "
+              "owned scalar row per discontinuous element dof.");
+  EnsureInteriorFaceElementIncidence2D(info, work);
+  work.face_contribution.SetSize(2 * info.dof * info.nf);
+  work.face_contribution.UseDevice(true);
+
+  InteriorFaceDGDiffusionRecord2D record;
+  record.dof = info.dof;
+  record.vdim = info.vdim;
+  record.nq = info.nq;
+  record.nf = info.nf;
+  record.ne = info.ne;
+  record.ip_sigma = ip_sigma;
+  record.shape = work.shape.Read();
+  record.weighted_normal_dshape = work.weighted_normal_dshape.Read();
+  record.penalty = work.penalty.Read();
+  record.face_elements = work.face_elements.Read();
+  record.element_vdof_map = work.element_vdof_map.Read();
+  record.x = scalar.Read();
+  record.contribution = work.face_contribution.Write();
+  mfem::forall(info.nf, record);
+
+  InteriorFaceDGDiffusionGather2D gather;
+  gather.dof = info.dof;
+  gather.vdim = info.vdim;
+  gather.ne = info.ne;
+  gather.nf = info.nf;
+  gather.element_vdof_map = work.element_vdof_map.Read();
+  gather.element_face_offsets = work.element_face_offsets.Read();
+  gather.element_face_ids = work.element_face_ids.Read();
+  gather.element_face_sides = work.element_face_sides.Read();
+  gather.contribution = work.face_contribution.Read();
+  gather.y = y.ReadWrite();
+  mfem::forall(info.ne * info.dof, gather);
+}
+
+inline void AddSharedFaceDGDiffusionApplyDevice2D(
+  const SharedFaceDGDiffusionApplyInfo& info,
+  const SharedFaceDGDiffusionApplyScratch& work,
+  const mfem::Vector& scalar,
+  const mfem::Vector& scalar_face_nbr,
+  mfem::real_t ip_sigma,
+  mfem::Vector& y)
+{
+  MFEM_VERIFY(info.vdim == 1 &&
+                scalar.Size() == info.ne * info.dof &&
+                y.Size() == scalar.Size(),
+              "Deterministic shared exact DG face gather requires one "
+              "uniquely owned scalar row per discontinuous element dof.");
+  EnsureSharedFaceElementIncidence2D(info, work);
+  work.face_contribution.SetSize(info.dof * info.nf);
+  work.face_contribution.UseDevice(true);
+
+  SharedFaceDGDiffusionRecord2D record;
+  record.dof = info.dof;
+  record.vdim = info.vdim;
+  record.nq = info.nq;
+  record.nf = info.nf;
+  record.ne = info.ne;
+  record.ip_sigma = ip_sigma;
+  record.shape = work.shape.Read();
+  record.weighted_normal_dshape = work.weighted_normal_dshape.Read();
+  record.penalty = work.penalty.Read();
+  record.face_elements = work.face_elements.Read();
+  record.element_vdof_map = work.element_vdof_map.Read();
+  record.face_nbr_dof_map = work.face_nbr_dof_map.Read();
+  record.x = scalar.Read();
+  record.x_face_nbr = scalar_face_nbr.Read();
+  record.contribution = work.face_contribution.Write();
+  mfem::forall(info.nf, record);
+
+  SharedFaceDGDiffusionGather2D gather;
+  gather.dof = info.dof;
+  gather.vdim = info.vdim;
+  gather.ne = info.ne;
+  gather.nf = info.nf;
+  gather.element_vdof_map = work.element_vdof_map.Read();
+  gather.element_face_offsets = work.element_face_offsets.Read();
+  gather.element_face_ids = work.element_face_ids.Read();
+  gather.contribution = work.face_contribution.Read();
+  gather.y = y.ReadWrite();
+  mfem::forall(info.ne * info.dof, gather);
+}
+
 inline InteriorFaceSideDensityProjectionInfo
-ProjectInteriorFaceDensityCoefficient2D(
+ProjectInteriorFaceDensityCoefficient2DImpl(
   const mfem::FiniteElementSpace& vfes,
   const mfem::FaceQuadratureSpace& fqs,
   const mfem::ParGridFunction& state,
   mfem::real_t alpha,
+  const mfem::Vector* element_alpha,
   mfem::real_t rho_floor,
   mfem::Vector& side_q,
-  InteriorFaceSideDensityProjectionScratch* scratch = nullptr)
+  InteriorFaceSideDensityProjectionScratch* scratch)
 {
   MFEM_VERIFY(state.ParFESpace() == &vfes,
               "Side-density projection state/FESpace mismatch.");
@@ -1393,6 +1818,29 @@ ProjectInteriorFaceDensityCoefficient2D(
   side_q.SetSize(2 * info.nq * info.nf);
   side_q.UseDevice(true);
 
+  work.side_alpha.SetSize(element_alpha ? 2 * info.nf : 0);
+  if (element_alpha)
+  {
+    MFEM_VERIFY(element_alpha->Size() == info.ne,
+                "Side-density projection received mismatched per-element "
+                "alpha data.");
+    const mfem::real_t* element_alpha_data = element_alpha->HostRead();
+    const auto F = mfem::Reshape(work.face_elements.HostRead(), 2, info.nf);
+    auto A = mfem::Reshape(work.side_alpha.HostWrite(), 2, info.nf);
+    for (int f = 0; f < info.nf; ++f)
+    {
+      for (int side = 0; side < 2; ++side)
+      {
+        const mfem::real_t alpha_e = element_alpha_data[F(side, f)];
+        MFEM_VERIFY(alpha_e > 0.0 && std::isfinite(alpha_e),
+                    "Side-density projection received invalid per-element "
+                    "alpha data.");
+        A(side, f) = alpha_e;
+      }
+    }
+    work.side_alpha.UseDevice(true);
+  }
+
 #if (defined(MFEM_USE_CUDA) && !defined(__CUDACC__)) || \
     (defined(MFEM_USE_HIP) && !defined(__HIPCC__))
   const auto S = mfem::Reshape(work.shape.HostRead(),
@@ -1407,6 +1855,9 @@ ProjectInteriorFaceDensityCoefficient2D(
                                info.ne);
   const mfem::real_t* state_data = state.HostRead();
   auto Q = mfem::Reshape(side_q.HostWrite(), 2, info.nq, info.nf);
+  const mfem::real_t* side_alpha_data =
+    element_alpha ? work.side_alpha.HostRead() : nullptr;
+  const auto A = mfem::Reshape(side_alpha_data, 2, info.nf);
 
   for (int f = 0; f < info.nf; ++f)
   {
@@ -1420,8 +1871,11 @@ ProjectInteriorFaceDensityCoefficient2D(
         {
           rho += S(side, q, d, f) * state_data[D(d, 0, e)];
         }
-        Q(side, q, f) =
-          frozen_scalar_igr_algebra::AlphaOverDensity(alpha, rho, rho_floor);
+        const mfem::real_t side_alpha_value = element_alpha ? A(side, f) : alpha;
+        Q(side, q, f) = frozen_scalar_igr_algebra::AlphaOverDensity(
+          side_alpha_value,
+          rho,
+          rho_floor);
       }
     }
   }
@@ -1435,6 +1889,7 @@ ProjectInteriorFaceDensityCoefficient2D(
   kernel.alpha = alpha;
   kernel.rho_floor = rho_floor;
   kernel.shape = work.shape.Read();
+  kernel.side_alpha = element_alpha ? work.side_alpha.Read() : nullptr;
   kernel.face_elements = work.face_elements.Read();
   kernel.element_vdof_map = work.element_vdof_map.Read();
   kernel.state = state.Read();
@@ -1448,14 +1903,15 @@ ProjectInteriorFaceDensityCoefficient2D(
 }
 
 inline SharedFaceSideDensityProjectionInfo
-ProjectSharedFaceDensityCoefficient2D(
+ProjectSharedFaceDensityCoefficient2DImpl(
   const mfem::ParFiniteElementSpace& vfes,
   const mfem::IntegrationRule& ir,
   const mfem::ParGridFunction& state,
   mfem::real_t alpha,
+  const mfem::Vector* face_side_alpha,
   mfem::real_t rho_floor,
   mfem::Vector& side_q,
-  SharedFaceSideDensityProjectionScratch* scratch = nullptr)
+  SharedFaceSideDensityProjectionScratch* scratch)
 {
   MFEM_VERIFY(state.ParFESpace() == &vfes,
               "Shared side-density projection state/FESpace mismatch.");
@@ -1476,6 +1932,24 @@ ProjectSharedFaceDensityCoefficient2D(
   side_q.SetSize(2 * info.nq * info.nf);
   side_q.UseDevice(true);
 
+  work.side_alpha.SetSize(face_side_alpha ? 2 * info.nf : 0);
+  if (face_side_alpha)
+  {
+    MFEM_VERIFY(face_side_alpha->Size() == 2 * info.nf,
+                "Shared side-density projection received mismatched per-side "
+                "alpha data.");
+    const mfem::real_t* alpha_in = face_side_alpha->HostRead();
+    mfem::real_t* alpha_out = work.side_alpha.HostWrite();
+    for (int i = 0; i < face_side_alpha->Size(); ++i)
+    {
+      MFEM_VERIFY(alpha_in[i] > 0.0 && std::isfinite(alpha_in[i]),
+                  "Shared side-density projection received invalid per-side "
+                  "alpha data.");
+      alpha_out[i] = alpha_in[i];
+    }
+    work.side_alpha.UseDevice(true);
+  }
+
   const auto S = mfem::Reshape(work.shape.HostRead(),
                                2,
                                info.nq,
@@ -1493,6 +1967,9 @@ ProjectSharedFaceDensityCoefficient2D(
   const mfem::real_t* state_data = state.HostRead();
   const mfem::real_t* nbr_data = mutable_state.FaceNbrData().HostRead();
   auto Q = mfem::Reshape(side_q.HostWrite(), 2, info.nq, info.nf);
+  const mfem::real_t* side_alpha_data =
+    face_side_alpha ? work.side_alpha.HostRead() : nullptr;
+  const auto A = mfem::Reshape(side_alpha_data, 2, info.nf);
 
   for (int f = 0; f < info.nf; ++f)
   {
@@ -1510,16 +1987,106 @@ ProjectSharedFaceDensityCoefficient2D(
                           : -nbr_data[-1 - nbr_vdof];
         rho1 += S(1, q, d, f) * nbr_value;
       }
-      Q(0, q, f) =
-        frozen_scalar_igr_algebra::AlphaOverDensity(alpha, rho0, rho_floor);
-      Q(1, q, f) =
-        frozen_scalar_igr_algebra::AlphaOverDensity(alpha, rho1, rho_floor);
+      const mfem::real_t alpha0 = face_side_alpha ? A(0, f) : alpha;
+      const mfem::real_t alpha1 = face_side_alpha ? A(1, f) : alpha;
+      Q(0, q, f) = frozen_scalar_igr_algebra::AlphaOverDensity(
+        alpha0,
+        rho0,
+        rho_floor);
+      Q(1, q, f) = frozen_scalar_igr_algebra::AlphaOverDensity(
+        alpha1,
+        rho1,
+        rho_floor);
     }
   }
 
   SharedFaceSideDensityProjectionInfo out = info;
   out.qf_size = side_q.Size();
   return out;
+}
+
+/** Project alpha/rho with one constant alpha on both sides of every local face. */
+inline InteriorFaceSideDensityProjectionInfo
+ProjectInteriorFaceDensityCoefficient2D(
+  const mfem::FiniteElementSpace& vfes,
+  const mfem::FaceQuadratureSpace& fqs,
+  const mfem::ParGridFunction& state,
+  mfem::real_t alpha,
+  mfem::real_t rho_floor,
+  mfem::Vector& side_q,
+  InteriorFaceSideDensityProjectionScratch* scratch = nullptr)
+{
+  return ProjectInteriorFaceDensityCoefficient2DImpl(vfes,
+                                                      fqs,
+                                                      state,
+                                                      alpha,
+                                                      nullptr,
+                                                      rho_floor,
+                                                      side_q,
+                                                      scratch);
+}
+
+/** Project alpha_e/rho using explicit alpha data indexed by local element. */
+inline InteriorFaceSideDensityProjectionInfo
+ProjectInteriorFaceDensityCoefficient2D(
+  const mfem::FiniteElementSpace& vfes,
+  const mfem::FaceQuadratureSpace& fqs,
+  const mfem::ParGridFunction& state,
+  const mfem::Vector& element_alpha,
+  mfem::real_t rho_floor,
+  mfem::Vector& side_q,
+  InteriorFaceSideDensityProjectionScratch* scratch = nullptr)
+{
+  return ProjectInteriorFaceDensityCoefficient2DImpl(vfes,
+                                                      fqs,
+                                                      state,
+                                                      0.0,
+                                                      &element_alpha,
+                                                      rho_floor,
+                                                      side_q,
+                                                      scratch);
+}
+
+/** Project alpha/rho with one constant alpha on both sides of every shared face. */
+inline SharedFaceSideDensityProjectionInfo
+ProjectSharedFaceDensityCoefficient2D(
+  const mfem::ParFiniteElementSpace& vfes,
+  const mfem::IntegrationRule& ir,
+  const mfem::ParGridFunction& state,
+  mfem::real_t alpha,
+  mfem::real_t rho_floor,
+  mfem::Vector& side_q,
+  SharedFaceSideDensityProjectionScratch* scratch = nullptr)
+{
+  return ProjectSharedFaceDensityCoefficient2DImpl(vfes,
+                                                    ir,
+                                                    state,
+                                                    alpha,
+                                                    nullptr,
+                                                    rho_floor,
+                                                    side_q,
+                                                    scratch);
+}
+
+/** Project alpha/rho using explicit [side][shared-face] alpha data. */
+inline SharedFaceSideDensityProjectionInfo
+ProjectSharedFaceDensityCoefficient2D(
+  const mfem::ParFiniteElementSpace& vfes,
+  const mfem::IntegrationRule& ir,
+  const mfem::ParGridFunction& state,
+  const mfem::Vector& face_side_alpha,
+  mfem::real_t rho_floor,
+  mfem::Vector& side_q,
+  SharedFaceSideDensityProjectionScratch* scratch = nullptr)
+{
+  return ProjectSharedFaceDensityCoefficient2DImpl(vfes,
+                                                    ir,
+                                                    state,
+                                                    0.0,
+                                                    &face_side_alpha,
+                                                    rho_floor,
+                                                    side_q,
+                                                    scratch);
 }
 
 inline InteriorFaceDGDiffusionApplyInfo
@@ -1553,7 +2120,10 @@ AddInteriorFaceDGDiffusionApply2D(
     work.weighted_normal_dshape,
     work.penalty,
     work.face_elements,
-    work.element_vdof_map);
+    work.element_vdof_map,
+    DGDiffusionFaceScaling::Arithmetic,
+    &work.normal_dshape_base,
+    &work.penalty_metric);
 
 #if (defined(MFEM_USE_CUDA) && !defined(__CUDACC__)) || \
     (defined(MFEM_USE_HIP) && !defined(__HIPCC__))
@@ -1613,21 +2183,8 @@ AddInteriorFaceDGDiffusionApply2D(
     }
   }
 #else
-  InteriorFaceDGDiffusionApply2D kernel;
-  kernel.dof = info.dof;
-  kernel.vdim = info.vdim;
-  kernel.nq = info.nq;
-  kernel.nf = info.nf;
-  kernel.ne = info.ne;
-  kernel.ip_sigma = ip_sigma;
-  kernel.shape = work.shape.Read();
-  kernel.weighted_normal_dshape = work.weighted_normal_dshape.Read();
-  kernel.penalty = work.penalty.Read();
-  kernel.face_elements = work.face_elements.Read();
-  kernel.element_vdof_map = work.element_vdof_map.Read();
-  kernel.x = scalar.Read();
-  kernel.y = y.ReadWrite();
-  mfem::forall(info.nf, kernel);
+  AddInteriorFaceDGDiffusionApplyDevice2D(
+    info, work, scalar, ip_sigma, y);
 #endif
 
   return info;
@@ -1725,21 +2282,8 @@ inline void AddInteriorFaceDGDiffusionApply2D(
     }
   }
 #else
-  InteriorFaceDGDiffusionApply2D kernel;
-  kernel.dof = info.dof;
-  kernel.vdim = info.vdim;
-  kernel.nq = info.nq;
-  kernel.nf = info.nf;
-  kernel.ne = info.ne;
-  kernel.ip_sigma = ip_sigma;
-  kernel.shape = work.shape.Read();
-  kernel.weighted_normal_dshape = work.weighted_normal_dshape.Read();
-  kernel.penalty = work.penalty.Read();
-  kernel.face_elements = work.face_elements.Read();
-  kernel.element_vdof_map = work.element_vdof_map.Read();
-  kernel.x = scalar.Read();
-  kernel.y = y.ReadWrite();
-  mfem::forall(info.nf, kernel);
+  AddInteriorFaceDGDiffusionApplyDevice2D(
+    info, work, scalar, ip_sigma, y);
 #endif
 }
 
@@ -1876,23 +2420,8 @@ inline void AddSharedFaceDGDiffusionApply2D(
     }
   }
 #else
-  SharedFaceDGDiffusionApply2D kernel;
-  kernel.dof = info.dof;
-  kernel.vdim = info.vdim;
-  kernel.nq = info.nq;
-  kernel.nf = info.nf;
-  kernel.ne = info.ne;
-  kernel.ip_sigma = ip_sigma;
-  kernel.shape = work.shape.Read();
-  kernel.weighted_normal_dshape = work.weighted_normal_dshape.Read();
-  kernel.penalty = work.penalty.Read();
-  kernel.face_elements = work.face_elements.Read();
-  kernel.element_vdof_map = work.element_vdof_map.Read();
-  kernel.face_nbr_dof_map = work.face_nbr_dof_map.Read();
-  kernel.x = scalar.Read();
-  kernel.x_face_nbr = scalar_face_nbr.Read();
-  kernel.y = y.ReadWrite();
-  mfem::forall(info.nf, kernel);
+  AddSharedFaceDGDiffusionApplyDevice2D(
+    info, work, scalar, scalar_face_nbr, ip_sigma, y);
 #endif
 }
 
@@ -1974,7 +2503,10 @@ AddSharedFaceDGDiffusionApply2D(
     work.penalty,
     work.face_elements,
     work.element_vdof_map,
-    work.face_nbr_dof_map);
+    work.face_nbr_dof_map,
+    DGDiffusionFaceScaling::Arithmetic,
+    &work.normal_dshape_base,
+    &work.penalty_metric);
 
   MFEM_VERIFY(scalar_face_nbr.Size() == info.face_nbr_vsize,
               "Shared exact DG diffusion face apply neighbor data size "
@@ -2040,23 +2572,8 @@ AddSharedFaceDGDiffusionApply2D(
     }
   }
 #else
-  SharedFaceDGDiffusionApply2D kernel;
-  kernel.dof = info.dof;
-  kernel.vdim = info.vdim;
-  kernel.nq = info.nq;
-  kernel.nf = info.nf;
-  kernel.ne = info.ne;
-  kernel.ip_sigma = ip_sigma;
-  kernel.shape = work.shape.Read();
-  kernel.weighted_normal_dshape = work.weighted_normal_dshape.Read();
-  kernel.penalty = work.penalty.Read();
-  kernel.face_elements = work.face_elements.Read();
-  kernel.element_vdof_map = work.element_vdof_map.Read();
-  kernel.face_nbr_dof_map = work.face_nbr_dof_map.Read();
-  kernel.x = scalar.Read();
-  kernel.x_face_nbr = scalar_face_nbr.Read();
-  kernel.y = y.ReadWrite();
-  mfem::forall(info.nf, kernel);
+  AddSharedFaceDGDiffusionApplyDevice2D(
+    info, work, scalar, scalar_face_nbr, ip_sigma, y);
 #endif
 
   return info;

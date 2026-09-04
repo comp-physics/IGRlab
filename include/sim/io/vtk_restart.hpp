@@ -46,7 +46,8 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
                                    const RunConfig& run_cfg,
                                    const ExampleContext& ctx,
                                    mfem::ParGridFunction& state,
-                                   bool igr_enabled);
+                                   bool igr_enabled,
+                                   const mfem::ParGridFunction* static_source);
 
 /// Write the versioned completion marker for a successfully saved VTK cycle.
 void WriteVTKRestartManifest(const std::string& dataset_dir,
@@ -57,10 +58,16 @@ void WriteVTKRestartManifest(const std::string& dataset_dir,
                              const RunConfig& run_cfg,
                              const ExampleContext& ctx,
                              bool sigma_saved,
-                             int vtk_compression_level);
+                             int vtk_compression_level,
+                             const mfem::ParGridFunction* static_source);
 
 /// Stable same-partition mesh/config fingerprint used by restart manifests.
 std::uint64_t ComputeVTKRestartMeshFingerprint(const RunConfig& run_cfg,
                                                const ExampleContext& ctx);
+
+/// Stable same-partition fingerprint of a projected distributed field.
+std::uint64_t ComputeVTKRestartFieldFingerprint(
+  const mfem::ParGridFunction& field,
+  const ExampleContext& ctx);
 
 } // namespace dg_sim

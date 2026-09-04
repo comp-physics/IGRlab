@@ -5,9 +5,23 @@
 #include "utils/profiling/nvtx.hpp"
 
 #include <chrono>
+#include <cmath>
 
 namespace mfem
 {
+
+namespace
+{
+
+bool RequiresStrictDGSEMProduction(
+  HyperbolicFormIntegrator& form_integrator)
+{
+  const auto* igr_flux = dynamic_cast<const FluxWithIGR*>(
+    &form_integrator.GetFluxFunction());
+  return igr_flux && igr_flux->GetFrozenSigmaSpectralSpeed();
+}
+
+} // namespace
 
 DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
   FiniteElementSpace& vfes_,
@@ -54,10 +68,196 @@ DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
 DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
   DGHyperbolicConservationLaws&&) = default;
 
+IGRFrozenSigmaTelemetry
+DGHyperbolicConservationLaws::GetGlobalFrozenSigmaTelemetry() const
+{
+  IGRFrozenSigmaTelemetry local;
+  const auto* flux_igr = dynamic_cast<const FluxWithIGR*>(
+    &formIntegrator->GetFluxFunction());
+  if (flux_igr)
+  {
+    local = flux_igr->GetFrozenSigmaTelemetry();
+    local.enabled = local.enabled ||
+                    (flux_igr->GetInvariantDomainFlux() &&
+                     flux_igr->GetSigmaField());
+  }
+
+  const auto merge_device_slots = [&local](const Array<double>& storage)
+  {
+    constexpr int width = dg_igr_detail::kFrozenSigmaTelemetryWidth;
+    MFEM_VERIFY(storage.Size() % width == 0,
+                "Corrupt packed frozen-sigma telemetry storage.");
+    const double* const values = storage.HostRead();
+    const int slots = storage.Size() / width;
+    for (int slot = 0; slot < slots; ++slot)
+    {
+      const int offset = slot * width;
+      const double samples = values[offset + 0];
+      const double nonpositive = values[offset + 1];
+      const double nonfinite = values[offset + 2];
+      MFEM_VERIFY(std::isfinite(samples) && samples >= 0.0 &&
+                    std::isfinite(nonpositive) && nonpositive >= 0.0 &&
+                    std::isfinite(nonfinite) && nonfinite >= 0.0,
+                  "Invalid packed frozen-sigma telemetry count.");
+      local.sample_count += static_cast<std::uint64_t>(samples);
+      local.nonpositive_count += static_cast<std::uint64_t>(nonpositive);
+      local.nonfinite_count += static_cast<std::uint64_t>(nonfinite);
+      local.minimum_raw_q_sigma =
+        std::min(local.minimum_raw_q_sigma, values[offset + 3]);
+      local.minimum_q_sigma_over_gamma_p =
+        std::min(local.minimum_q_sigma_over_gamma_p, values[offset + 4]);
+    }
+  };
+  merge_device_slots(weakdiv_q_sigma_telemetry_);
+  merge_device_slots(face_int_q_sigma_telemetry_);
+  merge_device_slots(face_bdr_q_sigma_telemetry_);
+  merge_device_slots(face_shared_q_sigma_telemetry_);
+  local.Merge(dgsem_q_sigma_telemetry_);
+
+#ifdef MFEM_USE_MPI
+  if (Mpi::IsInitialized() && !Mpi::IsFinalized())
+  {
+    if (const auto* par_fes =
+          dynamic_cast<const ParFiniteElementSpace*>(&vfes))
+    {
+      int enabled = local.enabled ? 1 : 0;
+      unsigned long long counts[3] = {
+        static_cast<unsigned long long>(local.sample_count),
+        static_cast<unsigned long long>(local.nonpositive_count),
+        static_cast<unsigned long long>(local.nonfinite_count)};
+      double minima[2] = {local.minimum_raw_q_sigma,
+                          local.minimum_q_sigma_over_gamma_p};
+      MPI_Allreduce(MPI_IN_PLACE,
+                    &enabled,
+                    1,
+                    MPI_INT,
+                    MPI_MAX,
+                    par_fes->GetComm());
+      MPI_Allreduce(MPI_IN_PLACE,
+                    counts,
+                    3,
+                    MPI_UNSIGNED_LONG_LONG,
+                    MPI_SUM,
+                    par_fes->GetComm());
+      MPI_Allreduce(MPI_IN_PLACE,
+                    minima,
+                    2,
+                    MPI_DOUBLE,
+                    MPI_MIN,
+                    par_fes->GetComm());
+      local.enabled = enabled != 0;
+      local.sample_count = static_cast<std::uint64_t>(counts[0]);
+      local.nonpositive_count = static_cast<std::uint64_t>(counts[1]);
+      local.nonfinite_count = static_cast<std::uint64_t>(counts[2]);
+      local.minimum_raw_q_sigma = minima[0];
+      local.minimum_q_sigma_over_gamma_p = minima[1];
+    }
+  }
+#endif
+
+  if (!std::isfinite(local.minimum_raw_q_sigma))
+  {
+    local.minimum_raw_q_sigma = std::numeric_limits<double>::quiet_NaN();
+  }
+  if (!std::isfinite(local.minimum_q_sigma_over_gamma_p))
+  {
+    local.minimum_q_sigma_over_gamma_p =
+      std::numeric_limits<double>::quiet_NaN();
+  }
+  return local;
+}
+
+IGRFrozenSigmaTelemetry
+DGHyperbolicConservationLaws::InspectFrozenSigmaStateForAdmission(
+  const Vector& state) const
+{
+  IGRFrozenSigmaTelemetry unsupported;
+  if (vol_mode_ != VolumeMode::DGSEMFluxDiff)
+  {
+    return unsupported;
+  }
+
+  MFEM_VERIFY(state.Size() == Width(),
+              "DGSEM frozen-sigma admission received an unexpected true "
+              "state size.");
+  const Vector* state_local = &state;
+#ifdef MFEM_USE_MPI
+  if (const auto* par_fes = dynamic_cast<const ParFiniteElementSpace*>(&vfes))
+  {
+    if (const Operator* prolongation = par_fes->GetProlongationMatrix())
+    {
+      ::dg_igr::NVTXRange range("DG/admission-prolong-true-to-local");
+      dgsem_x_local_workspace_.SetSize(par_fes->GetVSize());
+      prolongation->Mult(state, dgsem_x_local_workspace_);
+      state_local = &dgsem_x_local_workspace_;
+    }
+  }
+#endif
+
+  dgsem::DGSEMOperator& dgsem_op = GetDGSEMProductionOperator_();
+  const bool requested_strict =
+    ::dg_igr::EnvFlagEnabled("DG_IGR_DGSEM_PRODUCTION_STRICT") ||
+    RequiresStrictDGSEMProduction(*formIntegrator);
+  const dgsem::DGSEMProductionSelection selection =
+    dgsem_op.BindProductionPolicy(requested_strict);
+  if (!selection.supported)
+  {
+    return unsupported;
+  }
+
+  const dgsem::DGSEMProductionResult result =
+    dgsem_op.AssembleProductionResidual(*state_local,
+                                        dgsem_y_local_workspace_,
+                                        selection.strict,
+                                        nullptr,
+                                        /*admission_only=*/true);
+  MFEM_VERIFY(result.executed,
+              "DGSEM endpoint admission rejected before completing its "
+              "state scan: "
+                << dgsem::DGSEMProductionReasonName(result.reason));
+  const IGRFrozenSigmaTelemetry& admission = result.admission_q_sigma;
+  if (admission.enabled && admission.sample_count > 0 &&
+      admission.nonpositive_count == 0 && admission.nonfinite_count == 0)
+  {
+    MFEM_VERIFY(std::isfinite(result.max_characteristic_speed) &&
+                  result.max_characteristic_speed > 0.0,
+                "DGSEM endpoint admission produced an invalid global "
+                "characteristic-speed maximum.");
+    max_char_speed = result.max_characteristic_speed;
+  }
+  return result.admission_q_sigma;
+}
+
 void DGHyperbolicConservationLaws::SetNumericalFlux(const NumericalFlux* flux)
 {
   num_flux_ = flux;
   face_data_dirty_ = true;
+}
+
+void DGHyperbolicConservationLaws::SetStaticSource(const Vector& source)
+{
+  MFEM_VERIFY(source.Size() == Width(),
+              "Projected static source does not match the DG state size.");
+
+  bool nonzero = false;
+  const real_t* values = source.HostRead();
+  for (int i = 0; i < source.Size(); ++i)
+  {
+    MFEM_VERIFY(std::isfinite(values[i]),
+                "Projected static source contains a non-finite value.");
+    nonzero = nonzero || values[i] != 0.0;
+  }
+  if (!nonzero)
+  {
+    static_source_.SetSize(0);
+    static_source_requires_rebind_ = false;
+    return;
+  }
+
+  static_source_.SetSize(source.Size());
+  static_source_.UseDevice(Device::Allows(Backend::DEVICE_MASK));
+  static_source_ = source;
+  static_source_requires_rebind_ = false;
 }
 
 dgsem::DGSEMOperator&
@@ -192,12 +392,140 @@ DGHyperbolicConservationLaws::GetDGSEMProductionBridgeEvidence() const
 // (3) Apply inverse mass element-wise and scatter to y.
 // (4) Update max_char_speed from integrator.
 //
+bool DGHyperbolicConservationLaws::SupportsPhysicalBoundaryFluxIntegral() const
+{
+  if (vol_mode_ != VolumeMode::WeakDivergence &&
+      vol_mode_ != VolumeMode::DGSEMFluxDiff)
+  {
+    return false;
+  }
+  if (vol_mode_ == VolumeMode::DGSEMFluxDiff && !num_flux_)
+  {
+    return false;
+  }
+
+  for (size_t i = 0; i < ext_bdr_int_.size(); ++i)
+  {
+    bool marker_active = false;
+    const Array<int>* marker = ext_bdr_markers_[i].get();
+    if (marker)
+    {
+      for (int attr = 0; attr < marker->Size(); ++attr)
+      {
+        marker_active = marker_active || ((*marker)[attr] != 0);
+      }
+    }
+    if (marker_active &&
+        !dynamic_cast<BdrHyperbolicFluxIntegrator*>(ext_bdr_int_[i].get()))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
 {
   ::dg_igr::NVTXRange mult_range("DG/Mult");
+  MFEM_VERIFY(!static_source_requires_rebind_,
+              "DG operator topology changed after a static source was "
+              "installed; project and call SetStaticSource again before "
+              "the next RHS evaluation.");
+
+  const bool boundary_flux_requested =
+    physical_boundary_flux_integral_armed_;
+  physical_boundary_flux_integral_armed_ = false;
+  if (boundary_flux_requested)
+  {
+    physical_boundary_flux_integral_available_ = false;
+  }
 
   // (0) Reset the running max wave speed (used for CFL after Mult()).
   formIntegrator->ResetMaxCharSpeed();
+  for (const auto& integrator : ext_bdr_int_)
+  {
+    if (auto* boundary =
+          dynamic_cast<BdrHyperbolicFluxIntegrator*>(integrator.get()))
+    {
+      boundary->ResetMaxCharSpeed();
+      // A failed or interrupted earlier Mult must never leave an integrator
+      // accumulating during an unarmed CFL probe.
+      boundary->EndBoundaryFluxIntegralCapture();
+    }
+  }
+
+  const bool capture_boundary_flux =
+    boundary_flux_requested && SupportsPhysicalBoundaryFluxIntegral();
+  if (capture_boundary_flux)
+  {
+    physical_boundary_flux_integral_.SetSize(num_equations);
+    physical_boundary_flux_integral_.UseDevice(
+      Device::Allows(Backend::DEVICE_MASK));
+    physical_boundary_flux_integral_ = 0.0;
+    for (const auto& integrator : ext_bdr_int_)
+    {
+      if (auto* boundary =
+            dynamic_cast<BdrHyperbolicFluxIntegrator*>(integrator.get()))
+      {
+        boundary->BeginBoundaryFluxIntegralCapture();
+      }
+    }
+  }
+
+  const auto finalize_boundary_flux = [&](bool already_accumulated)
+  {
+    if (!capture_boundary_flux)
+    {
+      return;
+    }
+    if (!already_accumulated)
+    {
+      real_t* integral = physical_boundary_flux_integral_.HostReadWrite();
+      for (const auto& integrator : ext_bdr_int_)
+      {
+        auto* boundary =
+          dynamic_cast<BdrHyperbolicFluxIntegrator*>(integrator.get());
+        if (!boundary)
+        {
+          continue;
+        }
+        const Vector& local = boundary->GetBoundaryFluxIntegral();
+        MFEM_VERIFY(local.Size() == num_equations,
+                    "Boundary flux-integral component count mismatch.");
+        const real_t* local_values = local.HostRead();
+        for (int eq = 0; eq < num_equations; ++eq)
+        {
+          integral[eq] += local_values[eq];
+        }
+      }
+    }
+    for (const auto& integrator : ext_bdr_int_)
+    {
+      if (auto* boundary =
+            dynamic_cast<BdrHyperbolicFluxIntegrator*>(integrator.get()))
+      {
+        boundary->EndBoundaryFluxIntegralCapture();
+      }
+    }
+
+#ifdef MFEM_USE_MPI
+    if (Mpi::IsInitialized() && !Mpi::IsFinalized())
+    {
+      if (const auto* par_fes =
+            dynamic_cast<const ParFiniteElementSpace*>(&vfes))
+      {
+        real_t* integral = physical_boundary_flux_integral_.HostReadWrite();
+        MPI_Allreduce(MPI_IN_PLACE,
+                      integral,
+                      num_equations,
+                      MPITypeMap<real_t>::mpi_type,
+                      MPI_SUM,
+                      par_fes->GetComm());
+      }
+    }
+#endif
+    physical_boundary_flux_integral_available_ = true;
+  };
 
   // ParNonlinearForm evaluates in local (L-vector) space as:
   // y_true = P^T A_local (P x_true). The packed DG device path follows the
@@ -234,7 +562,8 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
                 "Use --dgsem-stab none.");
     dgsem::DGSEMOperator& dgsem_op = GetDGSEMProductionOperator_();
     const bool requested_strict =
-      ::dg_igr::EnvFlagEnabled("DG_IGR_DGSEM_PRODUCTION_STRICT");
+      ::dg_igr::EnvFlagEnabled("DG_IGR_DGSEM_PRODUCTION_STRICT") ||
+      RequiresStrictDGSEMProduction(*formIntegrator);
     const dgsem::DGSEMProductionSelection selection =
       dgsem_op.BindProductionPolicy(requested_strict);
     const bool strict = selection.strict;
@@ -264,7 +593,11 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
         y_local.SetSize(vfes.GetVSize());
       }
       const dgsem::DGSEMProductionResult result =
-        dgsem_op.AssembleProductionResidual(*x_eval, y_local, strict);
+        dgsem_op.AssembleProductionResidual(
+          *x_eval,
+          y_local,
+          strict,
+          capture_boundary_flux ? &physical_boundary_flux_integral_ : nullptr);
       MFEM_VERIFY(result.executed,
                   "DGSEM production execution rejected before output: "
                     << dgsem::DGSEMProductionReasonName(result.reason));
@@ -277,6 +610,10 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
       else
       {
         y = y_local;
+      }
+      if (static_source_.Size() != 0)
+      {
+        y.Add(1.0, static_source_);
       }
       max_char_speed = result.max_characteristic_speed;
       ++dgsem_production_mult_calls_;
@@ -293,9 +630,16 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
                   << " strict=" << strict
                   << " backend=" << (selection.cuda ? "cuda" : "cpu")
                   << " lvec_mode=" << (prolongation ? "P-x-PT" : "identity")
+                  << " volume_dissipation="
+                  << (selection.llf_volume_active ? "llf" : "none")
+                  << " llf_volume_active="
+                  << (selection.llf_volume_active ? 1 : 0)
+                  << " frozen_sigma_spectral_speed="
+                  << (selection.frozen_sigma_spectral_speed ? 1 : 0)
                   << " order=" << selection.order
                   << " dim=" << selection.dimension << '\n';
       }
+      finalize_boundary_flux(/*already_accumulated=*/true);
       record_dispatch();
       return;
     }
@@ -324,7 +668,10 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     real_t max_face_speed = 0.0;
     if (has_local_elements)
     {
-      max_face_speed = dgsem_op.AssembleSurface(*x_eval, z_eval);
+      max_face_speed = dgsem_op.AssembleSurface(
+        *x_eval,
+        z_eval,
+        capture_boundary_flux ? &physical_boundary_flux_integral_ : nullptr);
     }
     const auto t_surface_stop = std::chrono::steady_clock::now();
 
@@ -358,6 +705,10 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     else
     {
       y = 0.0;
+    }
+    if (static_source_.Size() != 0)
+    {
+      y.Add(1.0, static_source_);
     }
     const auto t_invmass_stop = std::chrono::steady_clock::now();
 
@@ -397,6 +748,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
                          invmass_seconds,
                          total_seconds);
     }
+    finalize_boundary_flux(/*already_accumulated=*/true);
     return;
   }
 
@@ -438,7 +790,10 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
                   "DG device-closure requires packed device face residual path "
                   "(no host fallback).");
       used_device_face =
-        AddDeviceFaceContributionsEulerRusanov_(*x_eval, z_eval, device_face_speed);
+        AddDeviceFaceContributionsEulerRusanov_(*x_eval,
+                                                z_eval,
+                                                device_face_speed,
+                                                capture_boundary_flux);
       MFEM_VERIFY(used_device_face,
                   "DG device-closure requires packed Euler/Rusanov face kernels "
                   "and supported boundary/sigma metadata (no fallback).");
@@ -461,11 +816,12 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     nonlinearForm->Mult(x, z);
   }
 
+  real_t volume_speed = 0.0;
   if (!weakdiv.empty()) // weak divergence WAS preassembled element-wise
   {
     ::dg_igr::NVTXRange range("DG/weak-divergence");
     // Compute (I_h F(u_h), ∇v) and accumulate directly into z.
-    AddPreassembledWeakDivergence_(*x_eval, z_eval);
+    volume_speed = AddPreassembledWeakDivergence_(*x_eval, z_eval);
   }
 
   // Apply inverse mass after all contributions have been assembled in z.
@@ -483,9 +839,32 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     ApplyInverseMass_(z_eval, y);
   }
 
-  // (4) Expose the maximum characteristic speed accumulated inside the integrators
-  max_char_speed =
+  if (static_source_.Size() != 0)
+  {
+    // The supplied field is the strong-form source itself, so it is added
+    // after inverse mass on both host and device paths.
+    y.Add(1.0, static_source_);
+  }
+
+  // (4) Expose a domain-wide maximum over volume, interior/shared faces, and
+  // physical boundaries. Packed device faces already include their boundary
+  // contribution; the separate maximum is then zero and harmless.
+  real_t boundary_speed = 0.0;
+  for (const auto& integrator : ext_bdr_int_)
+  {
+    if (auto* boundary =
+          dynamic_cast<BdrHyperbolicFluxIntegrator*>(integrator.get()))
+    {
+      boundary_speed =
+        std::max(boundary_speed, boundary->GetMaxCharSpeed());
+    }
+  }
+  const real_t face_speed =
     used_device_face ? device_face_speed : formIntegrator->GetMaxCharSpeed();
+  max_char_speed =
+    std::max(volume_speed, std::max(face_speed, boundary_speed));
+
+  finalize_boundary_flux(/*already_accumulated=*/used_device_face);
 }
 
 DGHyperbolicConservationLaws::~DGHyperbolicConservationLaws()
@@ -501,6 +880,11 @@ DGHyperbolicConservationLaws::~DGHyperbolicConservationLaws()
 // -----------------------------------------------------------------------------
 void DGHyperbolicConservationLaws::Update()
 {
+  const bool had_static_source = static_source_.Size() != 0;
+  static_source_.SetSize(0);
+  static_source_requires_rebind_ =
+    static_source_requires_rebind_ || had_static_source;
+
   // Refresh the nonlinear form's internal data (quadrature, face pairs, etc.)
   nonlinearForm->Update();
 

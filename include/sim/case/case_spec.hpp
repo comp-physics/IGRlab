@@ -88,6 +88,12 @@ template <typename CaseOptions, typename NumericalFlux> struct CaseSpec
                                                          const ExampleContext&,
                                                          double gamma)>
     make_ic;
+  /// Optional time-independent four-component Euler source. Returning null
+  /// selects the source-free production path.
+  std::function<std::unique_ptr<mfem::VectorCoefficient>(const CaseOptions&,
+                                                         const ExampleContext&,
+                                                         double gamma)>
+    make_static_source;
   std::function<BoundaryMarkerMap(ExampleContext&)> build_markers;
   std::function<void(const CaseOptions&,
                      const ExampleContext&,

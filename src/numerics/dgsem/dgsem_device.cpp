@@ -1,7 +1,9 @@
 #include "numerics/dgsem/dgsem_device.hpp"
+#include "physics/bc/detail/euler_boundary_state.hpp"
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
 
 #include <cmath>
+#include <limits>
 
 namespace mfem
 {
@@ -32,6 +34,36 @@ EulerPressure(const real_t* state, int stride, int dim, real_t gamma)
   }
   const real_t energy = state[(1 + dim) * stride];
   return (gamma - 1.0) * (energy - 0.5 * momentum_squared / rho);
+}
+
+MFEM_HOST_DEVICE inline real_t EulerNodalCharacteristicSpeed(
+  const real_t* state,
+  int stride,
+  int dim,
+  real_t gamma,
+  real_t sigma,
+  real_t density_floor,
+  bool frozen_sigma_spectral_speed)
+{
+  const real_t rho = state[0];
+  const real_t pressure = EulerPressure(state, stride, dim, gamma);
+  real_t momentum_squared = 0.0;
+  for (int d = 0; d < dim; ++d)
+  {
+    const real_t momentum = state[(1 + d) * stride];
+    momentum_squared += momentum * momentum;
+  }
+  const real_t transport_speed =
+    sqrt(momentum_squared) / fmax(rho, density_floor);
+  return frozen_sigma_spectral_speed
+           ? dg_igr::frozen_scalar_igr_algebra::
+               FrozenSigmaCharacteristicModulusBound(rho,
+                                                      pressure,
+                                                      transport_speed,
+                                                      sigma,
+                                                      gamma,
+                                                      density_floor)
+           : transport_speed + sqrt(gamma * pressure / rho);
 }
 
 MFEM_HOST_DEVICE inline real_t EulerTensorFluxEntry(const real_t* state,
@@ -124,6 +156,124 @@ MFEM_HOST_DEVICE inline real_t EulerSpeed(const real_t* state,
   return fabs(momentum_dot_normal / rho) / sqrt(normal_squared) + sound;
 }
 
+MFEM_HOST_DEVICE inline real_t FrozenSigmaNormalSpeed(
+  const real_t* state,
+  int stride,
+  const real_t* normal,
+  int normal_stride,
+  int dim,
+  real_t gamma,
+  real_t sigma,
+  real_t density_floor)
+{
+  const real_t rho = state[0];
+  const real_t pressure = EulerPressure(state, stride, dim, gamma);
+  real_t normal_squared = 0.0;
+  real_t momentum_dot_normal = 0.0;
+  for (int d = 0; d < dim; ++d)
+  {
+    const real_t normal_value = normal[d * normal_stride];
+    momentum_dot_normal += state[(1 + d) * stride] * normal_value;
+    normal_squared += normal_value * normal_value;
+  }
+  const real_t normal_norm = sqrt(normal_squared);
+  const real_t transport_speed =
+    fabs(momentum_dot_normal) / (fmax(rho, density_floor) * normal_norm);
+  return dg_igr::frozen_scalar_igr_algebra::
+    FrozenSigmaCharacteristicModulusBound(rho,
+                                          pressure,
+                                          transport_speed,
+                                          sigma,
+                                          gamma,
+                                          density_floor);
+}
+
+MFEM_HOST_DEVICE inline real_t EulerRusanovFaceCharacteristicSpeed(
+  const real_t* left,
+  const real_t* right,
+  int state_stride,
+  const real_t* normal,
+  int normal_stride,
+  int dim,
+  real_t gamma,
+  real_t sigma_left,
+  real_t sigma_right,
+  real_t density_floor,
+  bool frozen_sigma_spectral_speed)
+{
+  const real_t speed_left =
+    frozen_sigma_spectral_speed
+      ? FrozenSigmaNormalSpeed(left,
+                               state_stride,
+                               normal,
+                               normal_stride,
+                               dim,
+                               gamma,
+                               sigma_left,
+                               density_floor)
+      : EulerSpeed(left,
+                   state_stride,
+                   normal,
+                   normal_stride,
+                   dim,
+                   gamma);
+  const real_t speed_right =
+    frozen_sigma_spectral_speed
+      ? FrozenSigmaNormalSpeed(right,
+                               state_stride,
+                               normal,
+                               normal_stride,
+                               dim,
+                               gamma,
+                               sigma_right,
+                               density_floor)
+      : EulerSpeed(right,
+                   state_stride,
+                   normal,
+                   normal_stride,
+                   dim,
+                   gamma);
+  return fmax(speed_left, speed_right);
+}
+
+MFEM_HOST_DEVICE inline real_t EulerDirectionalLLFScale(
+  const real_t* state,
+  int stride,
+  const real_t* direction,
+  int dim,
+  real_t gamma,
+  real_t sigma,
+  real_t density_floor)
+{
+  const real_t rho = fmax(state[0], density_floor);
+  real_t momentum_squared = 0.0;
+  real_t velocity_dot_direction = 0.0;
+  real_t direction_squared = 0.0;
+  for (int d = 0; d < dim; ++d)
+  {
+    const real_t momentum = state[(1 + d) * stride];
+    momentum_squared += momentum * momentum;
+    velocity_dot_direction += (momentum / rho) * direction[d];
+    direction_squared += direction[d] * direction[d];
+  }
+  const real_t energy = state[(1 + dim) * stride];
+  const real_t kinetic = 0.5 * momentum_squared / rho;
+  const real_t pressure = (gamma - 1.0) * (energy - kinetic);
+  const real_t acoustic_numerator =
+    dg_igr::frozen_scalar_igr_algebra::
+      FrozenSigmaLocalHyperbolicityMargin(pressure, sigma, gamma);
+  const real_t direction_norm = sqrt(fmax(direction_squared, 0.0));
+  const real_t speed =
+    fabs(velocity_dot_direction) +
+    sqrt(fabs(acoustic_numerator) / rho) * direction_norm;
+  return isfinite(speed) ? speed : 0.0;
+}
+
+MFEM_HOST_DEVICE inline int PairOrdinal(int low, int high, int n1d)
+{
+  return low * (2 * n1d - low - 1) / 2 + high - low - 1;
+}
+
 } // namespace
 
 DGSEMDeviceRuntimeInfo GetDGSEMDeviceRuntimeInfo()
@@ -139,6 +289,211 @@ DGSEMDeviceRuntimeInfo GetDGSEMDeviceRuntimeInfo()
   info.host_memory_class = Device::GetHostMemoryClass();
   info.device_memory_class = Device::GetDeviceMemoryClass();
   return info;
+}
+
+void ScanEulerIGRStatePanelsDevice(int dim,
+                                   real_t gamma,
+                                   real_t density_floor,
+                                   bool scan_owned_states,
+                                   bool scan_face_states,
+                                   const DenseMatrix& states,
+                                   const Vector& sigma,
+                                   const DenseMatrix& left_states,
+                                   const Vector& left_sigma,
+                                   const DenseMatrix& right_states,
+                                   const Vector& right_sigma,
+                                   Array<double>& slots,
+                                   Array<double>& result)
+{
+  const int rows = states.Height();
+  const int face_rows = left_states.Height();
+  MFEM_VERIFY((dim == 1 || dim == 2) && states.Width() == dim + 2 &&
+                sigma.Size() == rows && left_states.Width() == dim + 2 &&
+                right_states.Height() == face_rows &&
+                right_states.Width() == dim + 2 &&
+                left_sigma.Size() == face_rows &&
+                right_sigma.Size() == face_rows &&
+                std::isfinite(static_cast<double>(gamma)) && gamma > 1.0 &&
+                std::isfinite(static_cast<double>(density_floor)) &&
+                density_floor > 0.0 &&
+                scan_owned_states != scan_face_states,
+              "DGSEM device state scan received inconsistent packed fields.");
+  constexpr int result_width = 6;
+  constexpr int slot_width = 7;
+  constexpr int lanes = 256;
+  static_assert(lanes * slot_width == kDGSEMDeviceStateScanWorkspaceSize,
+                "DGSEM state-scan workspace contract drifted.");
+  const int samples = scan_owned_states ? rows : 2 * face_rows;
+  if (slots.Size() < kDGSEMDeviceStateScanWorkspaceSize)
+  {
+    slots.SetSize(kDGSEMDeviceStateScanWorkspaceSize);
+  }
+  slots.GetMemory().UseDevice(true);
+  if (result.Size() != result_width)
+  {
+    result.SetSize(result_width);
+  }
+  result.GetMemory().UseDevice(true);
+
+  const real_t* const state = scan_owned_states ? states.Read() : nullptr;
+  const real_t* const sigma_value =
+    scan_owned_states ? sigma.Read() : nullptr;
+  const real_t* const left = scan_face_states ? left_states.Read() : nullptr;
+  const real_t* const sigma_left =
+    scan_face_states ? left_sigma.Read() : nullptr;
+  const real_t* const right = scan_face_states ? right_states.Read() : nullptr;
+  const real_t* const sigma_right =
+    scan_face_states ? right_sigma.Read() : nullptr;
+  double* const sample_result = slots.Write();
+  double* const reduced = result.Write();
+  const double gamma64 = static_cast<double>(gamma);
+  const double density_floor64 = static_cast<double>(density_floor);
+  const double infinity = std::numeric_limits<double>::infinity();
+  const int invalid_density =
+    static_cast<int>(DGSEMDeviceStateStatus::InvalidDensity);
+  const int density_below_floor =
+    static_cast<int>(DGSEMDeviceStateStatus::DensityBelowFloor);
+  const int invalid_pressure =
+    static_cast<int>(DGSEMDeviceStateStatus::InvalidPressure);
+  const int invalid_sigma =
+    static_cast<int>(DGSEMDeviceStateStatus::InvalidSigma);
+
+  // Fixed lanes scan coalesced sample strides and write bounded summaries.
+  // The second kernel folds only these lane records, not the full state.
+  mfem::forall(
+    lanes,
+    [=] MFEM_HOST_DEVICE(int lane)
+    {
+      int first_bad = samples;
+      int first_status = static_cast<int>(DGSEMDeviceStateStatus::Valid);
+      double count = 0.0;
+      double nonpositive = 0.0;
+      double nonfinite = 0.0;
+      double minimum_q = infinity;
+      double minimum_ratio = infinity;
+
+      for (int sample = lane; sample < samples; sample += lanes)
+      {
+        const int stride = scan_owned_states ? rows : face_rows;
+        const int row = scan_owned_states ? sample : sample % face_rows;
+        const bool right_side = scan_face_states && sample >= face_rows;
+        const real_t* const sample_state =
+          scan_owned_states ? state : (right_side ? right : left);
+        const real_t* const sample_sigma =
+          scan_owned_states
+            ? sigma_value
+            : (right_side ? sigma_right : sigma_left);
+        int status = static_cast<int>(DGSEMDeviceStateStatus::Valid);
+        for (int equation = 0; equation < dim + 2; ++equation)
+        {
+          if (!isfinite(static_cast<double>(
+                sample_state[row + stride * equation])))
+          {
+            status = equation == 0 ? invalid_density : invalid_pressure;
+            break;
+          }
+        }
+        if (status == static_cast<int>(DGSEMDeviceStateStatus::Valid) &&
+            !isfinite(static_cast<double>(sample_sigma[row])))
+        {
+          status = invalid_sigma;
+        }
+        const double density = static_cast<double>(sample_state[row]);
+        if (status == static_cast<int>(DGSEMDeviceStateStatus::Valid) &&
+            !(density > 0.0))
+        {
+          status = invalid_density;
+        }
+        if (status == static_cast<int>(DGSEMDeviceStateStatus::Valid) &&
+            density < density_floor64)
+        {
+          status = density_below_floor;
+        }
+        if (status != static_cast<int>(DGSEMDeviceStateStatus::Valid))
+        {
+          first_bad = sample;
+          first_status = status;
+          break;
+        }
+
+        double momentum_squared = 0.0;
+        for (int d = 0; d < dim; ++d)
+        {
+          const double momentum = static_cast<double>(
+            sample_state[row + stride * (1 + d)]);
+          momentum_squared += momentum * momentum;
+        }
+        const double energy = static_cast<double>(
+          sample_state[row + stride * (1 + dim)]);
+        const double pressure =
+          (gamma64 - 1.0) *
+          (energy - 0.5 * momentum_squared / density);
+        if (!isfinite(pressure) || !(pressure > 0.0))
+        {
+          first_bad = sample;
+          first_status = invalid_pressure;
+          break;
+        }
+
+        const double sigma64 = static_cast<double>(sample_sigma[row]);
+        const double q_sigma =
+          gamma64 * pressure + (gamma64 - 1.0) * sigma64;
+        const double ratio = q_sigma / (gamma64 * pressure);
+        count += 1.0;
+        const bool q_finite = isfinite(q_sigma);
+        const bool ratio_finite = isfinite(ratio);
+        nonfinite += !q_finite || !ratio_finite ? 1.0 : 0.0;
+        if (q_finite)
+        {
+          nonpositive += q_sigma <= 0.0 ? 1.0 : 0.0;
+          minimum_q = fmin(minimum_q, q_sigma);
+        }
+        if (ratio_finite)
+        {
+          minimum_ratio = fmin(minimum_ratio, ratio);
+        }
+      }
+
+      const int offset = lane * slot_width;
+      sample_result[offset + 0] = static_cast<double>(first_bad);
+      sample_result[offset + 1] = static_cast<double>(first_status);
+      sample_result[offset + 2] = count;
+      sample_result[offset + 3] = nonpositive;
+      sample_result[offset + 4] = nonfinite;
+      sample_result[offset + 5] = minimum_q;
+      sample_result[offset + 6] = minimum_ratio;
+    });
+
+  // Deterministic fold selects the smallest failing sample ordinal and merges
+  // bounded lane aggregates. Only the six final scalars leave the device.
+  mfem::forall(
+    1,
+    [=] MFEM_HOST_DEVICE(int)
+    {
+      reduced[0] =
+        static_cast<double>(static_cast<int>(DGSEMDeviceStateStatus::Valid));
+      reduced[1] = 0.0;
+      reduced[2] = 0.0;
+      reduced[3] = 0.0;
+      reduced[4] = infinity;
+      reduced[5] = infinity;
+      int first_bad = samples;
+      for (int lane = 0; lane < lanes; ++lane)
+      {
+        const int offset = lane * slot_width;
+        const int lane_bad = static_cast<int>(sample_result[offset + 0]);
+        if (lane_bad < first_bad)
+        {
+          first_bad = lane_bad;
+          reduced[0] = sample_result[offset + 1];
+        }
+        reduced[1] += sample_result[offset + 2];
+        reduced[2] += sample_result[offset + 3];
+        reduced[3] += sample_result[offset + 4];
+        reduced[4] = fmin(reduced[4], sample_result[offset + 5]);
+        reduced[5] = fmin(reduced[5], sample_result[offset + 6]);
+      }
+    });
 }
 
 void GatherElementStateDevice(int ne,
@@ -253,7 +608,7 @@ void InterpolateSharedFaceScalarDevice(
     });
 }
 
-void GatherEulerRusanovSlipFacesDevice(
+void GatherEulerRusanovFacesDevice(
   int dim,
   int ne,
   int dof,
@@ -268,6 +623,12 @@ void GatherEulerRusanovSlipFacesDevice(
   const Array<int>& right_elements,
   const Array<int>& right_local_dofs,
   const Array<int>& ownership,
+  const Array<int>& boundary_kinds,
+  const DenseMatrix& boundary_reference_states,
+  const Vector& boundary_gammas,
+  const Vector& boundary_outlet_pressures,
+  const Vector& boundary_density_floors,
+  const Vector& boundary_pressure_floors,
   DenseMatrix& left_states,
   DenseMatrix& right_states,
   Vector& left_sigma,
@@ -285,6 +646,13 @@ void GatherEulerRusanovSlipFacesDevice(
                 right_elements.Size() == nfaces &&
                 right_local_dofs.Size() == nfaces &&
                 ownership.Size() == nfaces &&
+                boundary_kinds.Size() == nfaces &&
+                boundary_reference_states.Height() == nfaces &&
+                boundary_reference_states.Width() == num_equations &&
+                boundary_gammas.Size() == nfaces &&
+                boundary_outlet_pressures.Size() == nfaces &&
+                boundary_density_floors.Size() == nfaces &&
+                boundary_pressure_floors.Size() == nfaces &&
                 shared_state_vdofs.Size() == nfaces * num_equations &&
                 shared_sigma.Size() == nfaces,
               "DGSEM production face gather size mismatch.");
@@ -323,6 +691,13 @@ void GatherEulerRusanovSlipFacesDevice(
   const int* element_r = right_elements.Read();
   const int* local_r = right_local_dofs.Read();
   const int* owner = ownership.Read();
+  const int* boundary_kind = boundary_kinds.Read();
+  const real_t* boundary_reference = boundary_reference_states.Read();
+  const real_t* boundary_gamma = boundary_gammas.Read();
+  const real_t* boundary_outlet_pressure =
+    boundary_outlet_pressures.Read();
+  const real_t* boundary_density_floor = boundary_density_floors.Read();
+  const real_t* boundary_pressure_floor = boundary_pressure_floors.Read();
   real_t* left = left_states.Write();
   real_t* right = right_states.Write();
   real_t* sigma_l = left_sigma.Write();
@@ -364,25 +739,40 @@ void GatherEulerRusanovSlipFacesDevice(
       }
       else
       {
+        real_t interior[4] = {0.0, 0.0, 0.0, 0.0};
+        real_t exterior[4] = {0.0, 0.0, 0.0, 0.0};
+        real_t reference[4] = {0.0, 0.0, 0.0, 0.0};
+        real_t scaled_normal[2] = {0.0, 0.0};
         for (int equation = 0; equation < num_equations; ++equation)
         {
-          right[face + nfaces * equation] =
-            left[face + nfaces * equation];
+          interior[equation] = left[face + nfaces * equation];
+          exterior[equation] = interior[equation];
+          reference[equation] =
+            boundary_reference[face + nfaces * equation];
         }
-        real_t normal_squared = 0.0;
-        real_t momentum_dot_normal = 0.0;
         for (int d = 0; d < dim; ++d)
         {
-          const real_t normal_value = normal[face + nfaces * d];
-          normal_squared += normal_value * normal_value;
-          momentum_dot_normal +=
-            left[face + nfaces * (1 + d)] * normal_value;
+          scaled_normal[d] = normal[face + nfaces * d];
         }
-        const real_t scale = 2.0 * momentum_dot_normal / normal_squared;
-        for (int d = 0; d < dim; ++d)
+        const bool boundary_ok = detail::EvaluateEulerBoundaryState(
+          static_cast<detail::EulerBoundaryStateKind>(boundary_kind[face]),
+          dim,
+          num_equations,
+          boundary_gamma[face],
+          boundary_outlet_pressure[face],
+          reference,
+          scaled_normal,
+          interior,
+          exterior,
+          boundary_density_floor[face],
+          boundary_pressure_floor[face]);
+        if (!boundary_ok)
         {
-          right[face + nfaces * (1 + d)] -=
-            scale * normal[face + nfaces * d];
+          exterior[0] = -1.0;
+        }
+        for (int equation = 0; equation < num_equations; ++equation)
+        {
+          right[face + nfaces * equation] = exterior[equation];
         }
         sigma_r[face] = sigma_l[face];
       }
@@ -590,6 +980,44 @@ void BuildContravariantMetrics2DDevice(int ne,
     });
 }
 
+void ComputeEulerNodalCharacteristicSpeedsDevice(
+  int dim,
+  real_t gamma,
+  real_t velocity_density_floor,
+  const DenseMatrix& states,
+  const Vector& sigma,
+  Vector& nodal_speeds,
+  bool frozen_sigma_spectral_speed)
+{
+  const int rows = states.Height();
+  const int num_equations = dim + 2;
+  MFEM_VERIFY(dim == 1 || dim == 2,
+              "DGSEM device Euler speed supports dimensions 1 and 2 only.");
+  MFEM_VERIFY(states.Width() == num_equations && sigma.Size() == rows,
+              "DGSEM device Euler speed state/sigma size mismatch.");
+  if (nodal_speeds.Size() != rows)
+  {
+    nodal_speeds.SetSize(rows);
+  }
+  nodal_speeds.UseDevice(true);
+  const real_t* state = states.Read();
+  const real_t* sigma_value = sigma.Read();
+  real_t* speed = nodal_speeds.Write();
+
+  mfem::forall(rows,
+               [=] MFEM_HOST_DEVICE(int row)
+               {
+                 speed[row] = EulerNodalCharacteristicSpeed(
+                   state + row,
+                   rows,
+                   dim,
+                   gamma,
+                   sigma_value[row],
+                   velocity_density_floor,
+                   frozen_sigma_spectral_speed);
+               });
+}
+
 void BuildEulerContravariantFluxDevice(int dim,
                                        real_t gamma,
                                        real_t velocity_density_floor,
@@ -597,7 +1025,8 @@ void BuildEulerContravariantFluxDevice(int dim,
                                        const Vector& sigma,
                                        const DenseMatrix& metrics,
                                        DenseMatrix& contravariant_flux,
-                                       Vector& nodal_speeds)
+                                       Vector& nodal_speeds,
+                                       bool frozen_sigma_spectral_speed)
 {
   const int rows = states.Height();
   const int num_equations = dim + 2;
@@ -613,17 +1042,11 @@ void BuildEulerContravariantFluxDevice(int dim,
   {
     contravariant_flux.SetSize(rows, dim * num_equations);
   }
-  if (nodal_speeds.Size() != rows)
-  {
-    nodal_speeds.SetSize(rows);
-  }
   contravariant_flux.GetMemory().UseDevice(true);
-  nodal_speeds.UseDevice(true);
   const real_t* state = states.Read();
   const real_t* sigma_value = sigma.Read();
   const real_t* metric = metrics.Read();
   real_t* flux = contravariant_flux.Write();
-  real_t* speed = nodal_speeds.Write();
 
   mfem::forall(
     rows * dim * num_equations,
@@ -648,22 +1071,13 @@ void BuildEulerContravariantFluxDevice(int dim,
       }
       flux[entry] = value;
     });
-
-  mfem::forall(rows,
-               [=] MFEM_HOST_DEVICE(int row)
-               {
-                 const real_t rho = state[row];
-                 const real_t pressure =
-                   EulerPressure(state + row, rows, dim, gamma);
-                 real_t momentum_squared = 0.0;
-                 for (int d = 0; d < dim; ++d)
-                 {
-                   const real_t momentum = state[row + rows * (1 + d)];
-                   momentum_squared += momentum * momentum;
-                 }
-                 speed[row] =
-                   sqrt(momentum_squared) / rho + sqrt(gamma * pressure / rho);
-               });
+  ComputeEulerNodalCharacteristicSpeedsDevice(dim,
+                                              gamma,
+                                              velocity_density_floor,
+                                              states,
+                                              sigma,
+                                              nodal_speeds,
+                                              frozen_sigma_spectral_speed);
 }
 
 void ApplyCentralVolumeDevice(int dim,
@@ -756,6 +1170,236 @@ void ApplyCentralVolumeDevice(int dim,
                });
 }
 
+int DGSEMVolumePairCount(int dim, int ne, int n1d)
+{
+  MFEM_VERIFY(dim == 1 || dim == 2,
+              "DGSEM volume pairs support dimensions 1 and 2.");
+  MFEM_VERIFY(ne >= 0 && n1d >= 2,
+              "DGSEM volume pair dimensions are invalid.");
+  const int lines = dim == 1 ? 1 : n1d;
+  const int pairs_per_line = n1d * (n1d - 1) / 2;
+  return ne * dim * lines * pairs_per_line;
+}
+
+void AddEulerLLFVolumeDissipationDevice(
+  int dim,
+  int ne,
+  int n1d,
+  real_t gamma,
+  real_t velocity_density_floor,
+  const Array<int>& lex_to_local,
+  const DenseMatrix& split_matrix,
+  const Vector& weights,
+  const DenseMatrix& states,
+  const Vector& sigma,
+  const DenseMatrix& metrics,
+  DenseMatrix& pair_dissipation,
+  DenseMatrix& weak_volume)
+{
+  MFEM_VERIFY(dim == 1 || dim == 2,
+              "DGSEM device LLF volume supports dimensions 1 and 2.");
+  const int dof = dim == 1 ? n1d : n1d * n1d;
+  const int rows = ne * dof;
+  const int num_equations = dim + 2;
+  const int lines = dim == 1 ? 1 : n1d;
+  const int pairs_per_line = n1d * (n1d - 1) / 2;
+  const int pairs_per_element = dim * lines * pairs_per_line;
+  const int total_pairs = DGSEMVolumePairCount(dim, ne, n1d);
+  MFEM_VERIFY(ne > 0 && n1d >= 2 && lex_to_local.Size() == dof,
+              "DGSEM device LLF volume tensor map mismatch.");
+  MFEM_VERIFY(split_matrix.Height() == n1d &&
+                split_matrix.Width() == n1d && weights.Size() == n1d,
+              "DGSEM device LLF volume basis size mismatch.");
+  MFEM_VERIFY(states.Height() == rows &&
+                states.Width() == num_equations && sigma.Size() == rows,
+              "DGSEM device LLF volume state/sigma size mismatch.");
+  MFEM_VERIFY(metrics.Height() == rows && metrics.Width() == dim * dim,
+              "DGSEM device LLF volume metric size mismatch.");
+  MFEM_VERIFY(weak_volume.Height() == rows &&
+                weak_volume.Width() == num_equations,
+              "DGSEM device LLF weak-volume size mismatch.");
+  if (pair_dissipation.Height() != total_pairs ||
+      pair_dissipation.Width() != num_equations)
+  {
+    pair_dissipation.SetSize(total_pairs, num_equations);
+  }
+  pair_dissipation.GetMemory().UseDevice(true);
+  weak_volume.GetMemory().UseDevice(true);
+
+  const int* local = lex_to_local.Read();
+  const real_t* state = states.Read();
+  const real_t* sigma_value = sigma.Read();
+  const real_t* metric = metrics.Read();
+  real_t* pair = pair_dissipation.Write();
+
+  // Evaluate the nonlinear directional wave speed once per unordered pair.
+  // The low/high orientation exactly matches the legacy host pair loop.
+  mfem::forall(
+    total_pairs,
+    [=] MFEM_HOST_DEVICE(int pair_row)
+    {
+      const int element = pair_row / pairs_per_element;
+      const int pair_local = pair_row - element * pairs_per_element;
+      const int direction = pair_local / (lines * pairs_per_line);
+      const int direction_local = pair_local -
+                                  direction * lines * pairs_per_line;
+      const int line = direction_local / pairs_per_line;
+      int ordinal = direction_local - line * pairs_per_line;
+      int low = 0;
+      while (ordinal >= n1d - low - 1)
+      {
+        ordinal -= n1d - low - 1;
+        ++low;
+      }
+      const int high = low + ordinal + 1;
+      const int low_lex = direction == 0
+                            ? low + n1d * line
+                            : line + n1d * low;
+      const int high_lex = direction == 0
+                             ? high + n1d * line
+                             : line + n1d * high;
+      const int row_low = element * dof + local[low_lex];
+      const int row_high = element * dof + local[high_lex];
+      real_t average_metric[2] = {0.0, 0.0};
+      for (int physical = 0; physical < dim; ++physical)
+      {
+        const int metric_column = direction * dim + physical;
+        average_metric[physical] =
+          0.5 * (metric[row_low + rows * metric_column] +
+                 metric[row_high + rows * metric_column]);
+      }
+      const real_t scale_low = EulerDirectionalLLFScale(state + row_low,
+                                                         rows,
+                                                         average_metric,
+                                                         dim,
+                                                         gamma,
+                                                         sigma_value[row_low],
+                                                         velocity_density_floor);
+      const real_t scale_high =
+        EulerDirectionalLLFScale(state + row_high,
+                                 rows,
+                                 average_metric,
+                                 dim,
+                                 gamma,
+                                 sigma_value[row_high],
+                                 velocity_density_floor);
+      const real_t scale = fmax(scale_low, scale_high);
+      for (int equation = 0; equation < num_equations; ++equation)
+      {
+        pair[pair_row + total_pairs * equation] =
+          -0.5 * scale *
+          (state[row_high + rows * equation] -
+           state[row_low + rows * equation]);
+      }
+    });
+
+  const real_t* split = split_matrix.Read();
+  const real_t* weight = weights.Read();
+  const real_t* pair_value = pair_dissipation.Read();
+  real_t* volume = weak_volume.ReadWrite();
+  mfem::forall(
+    rows * num_equations,
+    [=] MFEM_HOST_DEVICE(int entry)
+    {
+      const int row = entry % rows;
+      const int equation = entry / rows;
+      const int element = row / dof;
+      const int element_local = row - element * dof;
+      int lex = 0;
+      for (; lex < dof; ++lex)
+      {
+        if (local[lex] == element_local)
+        {
+          break;
+        }
+      }
+      const int i = lex % n1d;
+      const int j = dim == 2 ? lex / n1d : 0;
+      real_t value = 0.0;
+      for (int direction = 0; direction < dim; ++direction)
+      {
+        const int coordinate = direction == 0 ? i : j;
+        const int line = dim == 1 ? 0 : (direction == 0 ? j : i);
+        for (int other = 0; other < n1d; ++other)
+        {
+          if (other == coordinate)
+          {
+            continue;
+          }
+          const int low = coordinate < other ? coordinate : other;
+          const int high = coordinate < other ? other : coordinate;
+          const int pair_local =
+            direction * lines * pairs_per_line + line * pairs_per_line +
+            PairOrdinal(low, high, n1d);
+          const int pair_row = element * pairs_per_element + pair_local;
+          value -= split[coordinate + n1d * other] *
+                   pair_value[pair_row + total_pairs * equation];
+        }
+      }
+      real_t tensor_weight = weight[i];
+      if (dim == 2)
+      {
+        tensor_weight *= weight[j];
+      }
+      volume[entry] += tensor_weight * value;
+    });
+}
+
+void ComputeEulerRusanovFaceCharacteristicSpeedsDevice(
+  int dim,
+  real_t gamma,
+  real_t velocity_density_floor,
+  const DenseMatrix& left_states,
+  const DenseMatrix& right_states,
+  const DenseMatrix& normals,
+  const Vector& left_sigma,
+  const Vector& right_sigma,
+  Vector& face_speeds,
+  bool frozen_sigma_spectral_speed)
+{
+  const int nfaces = left_states.Height();
+  const int num_equations = dim + 2;
+  MFEM_VERIFY(dim == 1 || dim == 2,
+              "DGSEM device Rusanov speeds support dimensions 1 and 2 only.");
+  MFEM_VERIFY(left_states.Width() == num_equations &&
+                right_states.Height() == nfaces &&
+                right_states.Width() == num_equations,
+              "DGSEM device Rusanov speed state size mismatch.");
+  MFEM_VERIFY(normals.Height() == nfaces && normals.Width() == dim &&
+                left_sigma.Size() == nfaces && right_sigma.Size() == nfaces,
+              "DGSEM device Rusanov speed face data size mismatch.");
+
+  if (face_speeds.Size() != nfaces)
+  {
+    face_speeds.SetSize(nfaces);
+  }
+  face_speeds.UseDevice(true);
+  const real_t* left = left_states.Read();
+  const real_t* right = right_states.Read();
+  const real_t* normal = normals.Read();
+  const real_t* sigma_l = left_sigma.Read();
+  const real_t* sigma_r = right_sigma.Read();
+  real_t* speed = face_speeds.Write();
+
+  mfem::forall(
+    nfaces,
+    [=] MFEM_HOST_DEVICE(int face)
+    {
+      speed[face] = EulerRusanovFaceCharacteristicSpeed(
+        left + face,
+        right + face,
+        nfaces,
+        normal + face,
+        nfaces,
+        dim,
+        gamma,
+        sigma_l[face],
+        sigma_r[face],
+        velocity_density_floor,
+        frozen_sigma_spectral_speed);
+    });
+}
+
 void AssembleEulerRusanovFacesDevice(int dim,
                                      int ne,
                                      int dof,
@@ -767,14 +1411,13 @@ void AssembleEulerRusanovFacesDevice(int dim,
                                      const Vector& left_sigma,
                                      const Vector& right_sigma,
                                      const Vector& face_weights,
-                                     const Array<int>& left_elements,
-                                     const Array<int>& left_local_dofs,
-                                     const Array<int>& right_elements,
-                                     const Array<int>& right_local_dofs,
-                                     const Array<int>& ownership,
+                                     const Array<int>& row_face_offsets,
+                                     const Array<int>& row_face_ids,
+                                     const Array<int>& row_face_signs,
                                      DenseMatrix& face_flux,
                                      Vector& face_speeds,
-                                     DenseMatrix& weak_surface)
+                                     DenseMatrix& weak_surface,
+                                     bool frozen_sigma_spectral_speed)
 {
   const int nfaces = left_states.Height();
   const int num_equations = dim + 2;
@@ -788,28 +1431,11 @@ void AssembleEulerRusanovFacesDevice(int dim,
                 left_sigma.Size() == nfaces && right_sigma.Size() == nfaces &&
                 face_weights.Size() == nfaces,
               "DGSEM device Rusanov face data size mismatch.");
-  MFEM_VERIFY(left_elements.Size() == nfaces &&
-                left_local_dofs.Size() == nfaces &&
-                right_elements.Size() == nfaces &&
-                right_local_dofs.Size() == nfaces && ownership.Size() == nfaces,
-              "DGSEM device Rusanov face map size mismatch.");
-
-  // One packed host preflight avoids a separate device synchronization for
-  // every point while keeping the bounded correctness fixture well-defined.
-  const real_t* host_normal = normals.HostRead();
-  for (int face = 0; face < nfaces; ++face)
-  {
-    real_t normal_squared = 0.0;
-    for (int d = 0; d < dim; ++d)
-    {
-      const real_t value = host_normal[face + nfaces * d];
-      normal_squared += value * value;
-    }
-    MFEM_VERIFY(normal_squared > 0.0,
-                "DGSEM device Rusanov face normal must be nonzero.");
-  }
-
   const int rows = ne * dof;
+  MFEM_VERIFY(row_face_offsets.Size() == rows + 1 &&
+                row_face_ids.Size() == row_face_signs.Size(),
+              "DGSEM device Rusanov row-face adjacency size mismatch.");
+
   if (face_flux.Height() != nfaces || face_flux.Width() != num_equations)
   {
     face_flux.SetSize(nfaces, num_equations);
@@ -832,11 +1458,9 @@ void AssembleEulerRusanovFacesDevice(int dim,
   const real_t* sigma_l = left_sigma.Read();
   const real_t* sigma_r = right_sigma.Read();
   const real_t* weight = face_weights.Read();
-  const int* element_l = left_elements.Read();
-  const int* local_l = left_local_dofs.Read();
-  const int* element_r = right_elements.Read();
-  const int* local_r = right_local_dofs.Read();
-  const int* owner = ownership.Read();
+  const int* row_offset = row_face_offsets.Read();
+  const int* row_face = row_face_ids.Read();
+  const int* row_sign = row_face_signs.Read();
   real_t* numerical_flux = face_flux.Write();
   real_t* speed = face_speeds.Write();
   real_t* surface = weak_surface.Write();
@@ -845,11 +1469,18 @@ void AssembleEulerRusanovFacesDevice(int dim,
     nfaces,
     [=] MFEM_HOST_DEVICE(int face)
     {
-      const real_t speed_l =
-        EulerSpeed(left + face, nfaces, normal + face, nfaces, dim, gamma);
-      const real_t speed_r =
-        EulerSpeed(right + face, nfaces, normal + face, nfaces, dim, gamma);
-      const real_t max_speed = fmax(speed_l, speed_r);
+      const real_t max_speed = EulerRusanovFaceCharacteristicSpeed(
+        left + face,
+        right + face,
+        nfaces,
+        normal + face,
+        nfaces,
+        dim,
+        gamma,
+        sigma_l[face],
+        sigma_r[face],
+        velocity_density_floor,
+        frozen_sigma_spectral_speed);
       real_t normal_squared = 0.0;
       for (int d = 0; d < dim; ++d)
       {
@@ -891,24 +1522,66 @@ void AssembleEulerRusanovFacesDevice(int dim,
     {
       const int row = entry % rows;
       const int equation = entry / rows;
-      const int element = row / dof;
-      const int element_local = row - element * dof;
       real_t value = 0.0;
-      for (int face = 0; face < nfaces; ++face)
+      for (int adjacent = row_offset[row];
+           adjacent < row_offset[row + 1];
+           ++adjacent)
       {
+        const int face = row_face[adjacent];
         const real_t weighted_flux =
           weight[face] * numerical_flux[face + nfaces * equation];
-        if (element_l[face] == element && local_l[face] == element_local)
+        if (row_sign[adjacent] < 0)
         {
           value -= weighted_flux;
         }
-        if (owner[face] == static_cast<int>(DGSEMDeviceFaceOwnership::Local) &&
-            element_r[face] == element && local_r[face] == element_local)
+        else
         {
           value += weighted_flux;
         }
       }
       surface[entry] = value;
+    });
+}
+
+void IntegratePhysicalBoundaryFluxDevice(const Array<int>& ownership,
+                                         const Vector& face_weights,
+                                         const DenseMatrix& face_flux,
+                                         Vector& boundary_flux)
+{
+  const int nfaces = face_flux.Height();
+  const int num_equations = face_flux.Width();
+  MFEM_VERIFY(num_equations > 0 && ownership.Size() == nfaces &&
+                face_weights.Size() == nfaces,
+              "DGSEM physical-boundary flux reduction size mismatch.");
+
+  if (boundary_flux.Size() != num_equations)
+  {
+    boundary_flux.SetSize(num_equations);
+  }
+  boundary_flux.UseDevice(true);
+  const int* owner = ownership.Read();
+  const real_t* weight = face_weights.Read();
+  const real_t* flux = face_flux.Read();
+  real_t* integral = boundary_flux.Write();
+  const int boundary_owner =
+    static_cast<int>(DGSEMDeviceFaceOwnership::Boundary);
+
+  // One deterministic loop per conserved component avoids both FP64 atomics
+  // and cancellation through local/shared faces. This path is opt-in
+  // qualification work, not part of an unarmed production residual.
+  mfem::forall(
+    num_equations,
+    [=] MFEM_HOST_DEVICE(int equation)
+    {
+      real_t value = 0.0;
+      for (int face = 0; face < nfaces; ++face)
+      {
+        if (owner[face] == boundary_owner)
+        {
+          value += weight[face] * flux[face + nfaces * equation];
+        }
+      }
+      integral[equation] = value;
     });
 }
 

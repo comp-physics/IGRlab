@@ -16,6 +16,7 @@
 
 #include "mfem.hpp"
 #include "numerics/limiters/limiter_pipeline.hpp"
+#include "numerics/timestepping/ssprk_coefficients.hpp"
 #include "utils/config/igr_config.hpp"
 #include "utils/config/io_config.hpp"
 #include "utils/config/timestepping_config.hpp"
@@ -50,6 +51,7 @@ struct IGROptions
   int amg_max_levels = -1;
   double amg_strong_threshold = -1.0;
   bool exact_dg_face_operator = false;
+  bool igr_invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
 };
@@ -96,7 +98,8 @@ enum class TimeIntegrator
   RK3SSP = 0,
   BackwardEuler = 1,
   PartitionedBackwardEuler = 2,
-  Rodas3 = 3
+  Rodas3 = 3,
+  SSPRK104 = 4
 };
 
 /// @brief Source of the effective general discretization selection.
@@ -506,6 +509,11 @@ ParseIGRSigmaUpdateCadence(const std::string& value)
   {
     return dg_igr::IGRSigmaUpdateCadence::EveryStep;
   }
+  if (lower == "extrapolated-every-step" ||
+      lower == "extrapolated_every_step" || lower == "extrapolated-step")
+  {
+    return dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+  }
   if (lower == "every-n-steps" || lower == "every_n_steps" ||
       lower == "every-n" || lower == "nsteps")
   {
@@ -514,7 +522,8 @@ ParseIGRSigmaUpdateCadence(const std::string& value)
   MFEM_VERIFY(false,
               "Invalid IGR sigma cadence '"
                 << value
-                << "'. Use 'every-stage', 'every-step', or "
+                << "'. Use 'every-stage', 'every-step', "
+                   "'extrapolated-every-step', or "
                    "'every-n-steps'.");
   return dg_igr::IGRSigmaUpdateCadence::EveryStage;
 }
@@ -626,6 +635,8 @@ IGRSigmaUpdateCadenceToString(dg_igr::IGRSigmaUpdateCadence value)
     return "every-stage";
   case dg_igr::IGRSigmaUpdateCadence::EveryStep:
     return "every-step";
+  case dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep:
+    return "extrapolated-every-step";
   case dg_igr::IGRSigmaUpdateCadence::EveryNSteps:
     return "every-n-steps";
   }
@@ -782,6 +793,10 @@ TryParseTimeIntegrator(const std::string& value)
   {
     return TimeIntegrator::RK3SSP;
   }
+  if (lower == "ssprk104")
+  {
+    return TimeIntegrator::SSPRK104;
+  }
   if (lower == "backward-euler")
   {
     return TimeIntegrator::BackwardEuler;
@@ -803,6 +818,8 @@ inline const char* TimeIntegratorToString(TimeIntegrator time_integrator)
   {
   case TimeIntegrator::RK3SSP:
     return "rk3ssp";
+  case TimeIntegrator::SSPRK104:
+    return "ssprk104";
   case TimeIntegrator::BackwardEuler:
     return "backward-euler";
   case TimeIntegrator::PartitionedBackwardEuler:
@@ -811,6 +828,30 @@ inline const char* TimeIntegratorToString(TimeIntegrator time_integrator)
     return "rodas3";
   }
   return "rk3ssp";
+}
+
+inline bool IsExplicitSSPRKTimeIntegrator(TimeIntegrator time_integrator)
+{
+  return time_integrator == TimeIntegrator::RK3SSP ||
+         time_integrator == TimeIntegrator::SSPRK104;
+}
+
+/// SSP coefficient used to scale the user-facing explicit CFL safety factor.
+inline std::optional<mfem::real_t>
+SSPCoefficientForTimeIntegrator(TimeIntegrator time_integrator)
+{
+  switch (time_integrator)
+  {
+  case TimeIntegrator::RK3SSP:
+    return mfem::SSPRK33Coefficients::ssp_coefficient;
+  case TimeIntegrator::SSPRK104:
+    return mfem::SSPRK104Coefficients::ssp_coefficient;
+  case TimeIntegrator::BackwardEuler:
+  case TimeIntegrator::PartitionedBackwardEuler:
+  case TimeIntegrator::Rodas3:
+    return std::nullopt;
+  }
+  return std::nullopt;
 }
 
 inline const char*
@@ -1065,30 +1106,34 @@ ResolveSolverRequest(const std::string& case_default_dg_backend,
     {
       result.status = SolverRequestResolutionStatus::InvalidTimeIntegrator;
       result.message = "Invalid time integrator '" + time_integrator_value +
-                       "'. Use 'rk3ssp', 'backward-euler', or "
-                       "'partitioned-backward-euler', or 'rodas3'.";
+                       "'. Use 'rk3ssp', 'ssprk104', "
+                       "'backward-euler', 'partitioned-backward-euler', or "
+                       "'rodas3'.";
       return result;
     }
     result.time_integrator = *time_integrator;
   }
 
   if (result.discretization != Discretization::HDG &&
-      result.time_integrator != TimeIntegrator::RK3SSP)
+      !IsExplicitSSPRKTimeIntegrator(result.time_integrator))
   {
     result.status = SolverRequestResolutionStatus::UnsupportedTimeIntegrator;
     result.message = "Time integrator '" +
                      std::string(TimeIntegratorToString(
                        result.time_integrator)) +
-                     "' is unavailable for DG/DGSEM; use 'rk3ssp'.";
+                     "' is unavailable for DG/DGSEM; use 'rk3ssp' or "
+                     "'ssprk104'.";
     return result;
   }
   if (result.discretization == Discretization::HDG &&
-      result.time_integrator == TimeIntegrator::RK3SSP)
+      IsExplicitSSPRKTimeIntegrator(result.time_integrator))
   {
     result.status = SolverRequestResolutionStatus::UnsupportedTimeIntegrator;
-    result.message = "Time integrator 'rk3ssp' is unavailable for HDG; use "
-                     "'backward-euler', 'partitioned-backward-euler', or "
-                     "'rodas3'.";
+    result.message = "Time integrator '" +
+                     std::string(TimeIntegratorToString(
+                       result.time_integrator)) +
+                     "' is unavailable for HDG; use 'backward-euler', "
+                     "'partitioned-backward-euler', or 'rodas3'.";
     return result;
   }
   return result;
@@ -1689,7 +1734,8 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
     &igr_opts.sigma_cadence,
     "-iscad",
     "--igr-sigma-cadence",
-    "IGR sigma update cadence: every-stage | every-step | every-n-steps.");
+    "IGR sigma update cadence: every-stage | every-step | "
+    "extrapolated-every-step | every-n-steps.");
   args.AddOption(&igr_opts.sigma_update_interval,
                  "-isn",
                  "--igr-sigma-update-interval",
@@ -1760,6 +1806,15 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
     "--no-igr-sigma-rusanov",
     "Include or exclude the IGR sigma speed in Rusanov dissipation "
     "(default off).");
+  args.AddOption(
+    &igr_opts.igr_invariant_domain_flux,
+    "-iidflux",
+    "--igr-invariant-domain-flux",
+    "-ino-iidflux",
+    "--no-igr-invariant-domain-flux",
+    "Use or disable the exact frozen-stage LF split threshold together with "
+    "the frozen-sigma characteristic-modulus bound for both CFL accounting "
+    "and Rusanov dissipation (default off).");
 }
 
 inline RunConfig MakeRunConfig(
@@ -1781,6 +1836,8 @@ inline RunConfig MakeRunConfig(
     ResolveZhangShuPositivityLimiter(
       positivity_limiter, case_cfg.limiter_pipeline.zhang_shu);
   run_cfg.case_config.limiter_pipeline.zhang_shu_points = zhang_shu_points;
+  run_cfg.case_config.limiter_pipeline.zhang_shu_vtk_points =
+    opts.zhang_shu_vtk_points;
   run_cfg.opts = opts;
   run_cfg.opts.positivity_limiter =
     PositivityLimiterSelectionToString(positivity_limiter);
@@ -1813,6 +1870,37 @@ inline RunConfig MakeRunConfig(
   return run_cfg;
 }
 
+/** Validate the user-facing explicit SSPRK CFL convention.
+ *
+ * A positive value is a safety fraction of the selected method's SSP
+ * coefficient.  Zero explicitly disables CFL control and selects opts.dt.
+ * Keep the upper bound fail-closed: values above one would otherwise look
+ * like ordinary safety factors while silently exceeding the selected SSP
+ * normalization. This validation alone is not a spatial positivity theorem.
+ */
+inline std::string
+ValidateExplicitSSPRKCFLSelection(const RunConfig& run_cfg)
+{
+  if (!IsExplicitSSPRKTimeIntegrator(run_cfg.time_integrator))
+  {
+    return {};
+  }
+  const mfem::real_t safety_factor = run_cfg.opts.cfl;
+  if (!std::isfinite(safety_factor) || safety_factor < 0.0 ||
+      safety_factor > 1.0)
+  {
+    return "Explicit SSPRK --cfl-number is a finite safety factor in [0,1]; "
+           "the selected method's SSP coefficient is applied automatically.";
+  }
+  if (safety_factor == 0.0 &&
+      (!std::isfinite(run_cfg.opts.dt) || run_cfg.opts.dt <= 0.0))
+  {
+    return "Explicit SSPRK --cfl-number 0 requires a finite positive "
+           "--time-step.";
+  }
+  return {};
+}
+
 inline dg_igr::IGRAlphaLengthScalePolicy
 ResolveIGRAlphaLengthScalePolicy(const RunConfig& run_cfg)
 {
@@ -1823,6 +1911,161 @@ ResolveIGRAlphaLengthScalePolicy(const RunConfig& run_cfg)
   return run_cfg.case_config.igr_config.alpha_length_scale_policy;
 }
 
+/// Exact frozen-sigma acoustic speeds belong to the typed extrapolated route.
+inline bool UsesFrozenSigmaSpectralSpeed(const RunConfig& run_cfg)
+{
+  const dg_igr::IGRSigmaUpdateCadence cadence =
+    run_cfg.igr_opts.sigma_cadence.empty()
+      ? run_cfg.case_config.igr_config.sigma_cadence
+      : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
+  return run_cfg.regularization == Regularization::IGR &&
+         run_cfg.discretization == Discretization::DGSEM &&
+         cadence == dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+}
+
+/** Reject cadence requests that the existing HDG DAE backend cannot honor.
+ *
+ * The HDG adapter reconstructs its algebraic variables inside the implicit
+ * stage solve and has no implementation of frozen/extrapolated sigma stages.
+ * Validate this before the adapter's early return so a DG-only cadence is
+ * never accepted and then silently ignored.
+ */
+inline std::string ValidateHdgIGRSigmaCadence(
+  Discretization discretization,
+  Regularization regularization,
+  const CaseConfig& case_cfg,
+  const IGROptions& igr_opts)
+{
+  if (discretization != Discretization::HDG)
+  {
+    return {};
+  }
+  // A conventional HDG run has no sigma state, but an explicit cadence flag
+  // is still a user request and must not disappear at the adapter boundary.
+  // Only active IGR inherits the case default when no flag was supplied.
+  if (igr_opts.sigma_cadence.empty() &&
+      regularization != Regularization::IGR)
+  {
+    return {};
+  }
+  const dg_igr::IGRSigmaUpdateCadence cadence =
+    igr_opts.sigma_cadence.empty()
+      ? case_cfg.igr_config.sigma_cadence
+      : ParseIGRSigmaUpdateCadence(igr_opts.sigma_cadence);
+  if (cadence == dg_igr::IGRSigmaUpdateCadence::EveryStage)
+  {
+    return {};
+  }
+  return "The HDG instantaneous-IGR backend supports only "
+         "--igr-sigma-cadence every-stage; split and extrapolated cadences "
+         "are qualified only on their explicitly supported DG/DGSEM routes.";
+}
+
+/** Validate the production-qualified extrapolated instantaneous-IGR tuple.
+ *
+ * Extrapolating the algebraic closure is a distinct temporal discretization,
+ * not a generic cadence optimization.  Keep it an explicit typed selection:
+ * every other DG/IGR configuration retains its established every-stage or
+ * every-step behavior instead of silently inheriting an unqualified split.
+ */
+inline std::string
+ValidateExtrapolatedEveryStepIGRSelection(const RunConfig& run_cfg)
+{
+  const dg_igr::IGRSigmaUpdateCadence cadence =
+    run_cfg.igr_opts.sigma_cadence.empty()
+      ? run_cfg.case_config.igr_config.sigma_cadence
+      : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
+  if (cadence != dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep)
+  {
+    return {};
+  }
+
+  const char* prefix =
+    "--igr-sigma-cadence extrapolated-every-step requires ";
+  if (run_cfg.regularization != Regularization::IGR)
+  {
+    return std::string(prefix) + "active IGR.";
+  }
+  if (run_cfg.discretization != Discretization::DGSEM ||
+      run_cfg.dg_backend != DGBackend::DGSEM)
+  {
+    return std::string(prefix) + "the DGSEM discretization.";
+  }
+  if (run_cfg.time_integrator != TimeIntegrator::SSPRK104)
+  {
+    return std::string(prefix) + "the SSPRK(10,4) time integrator.";
+  }
+  if (!run_cfg.case_config.limiter_pipeline.zhang_shu ||
+      run_cfg.case_config.limiter_pipeline.zhang_shu_points !=
+        mfem::ZhangShuPointSet::kConsumer)
+  {
+    return std::string(prefix) +
+           "the stagewise Zhang-Shu limiter on consumer points.";
+  }
+  const mfem::LimiterPipelineConfig& limiter =
+    run_cfg.case_config.limiter_pipeline;
+  if (limiter.bj_mode != mfem::BJLimiterMode::kNone ||
+      limiter.tvb_mode != mfem::TVBLimiterMode::kNone ||
+      limiter.venkat_mode != mfem::VenkatLimiterMode::kNone ||
+      limiter.krivodonova)
+  {
+    return std::string(prefix) +
+           "the qualified Zhang-Shu-only limiter pipeline.";
+  }
+  if (run_cfg.dgsem_stab != DGSEMStabilization::None ||
+      run_cfg.dgsem_volume_flux != DGSEMVolumeFlux::Central ||
+      run_cfg.dgsem_volume_dissipation != DGSEMVolumeDissipation::LLF ||
+      run_cfg.dgsem_surface_flux != DGSEMSurfaceFlux::Rusanov)
+  {
+    return std::string(prefix) +
+           "DGSEM central volume flux, LLF volume dissipation, Rusanov "
+           "surface flux, and no additional DGSEM stabilization.";
+  }
+  if (!IsL2IGRSpaceName(run_cfg.igr_opts.space) ||
+      !IsBrokenDGIGRGradName(run_cfg.igr_opts.grad) ||
+      ParseIGRIPKind(run_cfg.igr_opts.ip_kind) != dg_igr::IGRIPKind::SIPG ||
+      !run_cfg.igr_opts.exact_dg_face_operator)
+  {
+    return std::string(prefix) +
+           "the L2/BrokenL2 SIPG closure with exact DG faces.";
+  }
+  if (ParseIGRSolveMode(run_cfg.igr_opts.solve_mode) !=
+        dg_igr::IGRSolveMode::Krylov ||
+      ParseIGRLinearSolverType(run_cfg.igr_opts.linear_solver) !=
+        dg_igr::IGRLinearSolverType::CG ||
+      ParseIGRPrecondType(run_cfg.igr_opts.preconditioner) !=
+        dg_igr::IGRPrecondType::OperatorChebyshev)
+  {
+    return std::string(prefix) +
+           "Krylov CG with the full-system operator-Chebyshev preconditioner "
+           "so every exact algebraic anchor can receive an independent FP64 "
+           "residual certificate.";
+  }
+  if (ResolveIGRAlphaLengthScalePolicy(run_cfg) !=
+      dg_igr::IGRAlphaLengthScalePolicy::Local)
+  {
+    return std::string(prefix) +
+           "the local alpha=C_alpha*h_eff^2 policy.";
+  }
+  if (run_cfg.igr_opts.igr_invariant_domain_flux ||
+      run_cfg.igr_opts.sigma_aware_cfl ||
+      run_cfg.igr_opts.sigma_aware_rusanov)
+  {
+    return std::string(prefix) +
+           "its intrinsic frozen-sigma spectral speed policy (legacy "
+           "invariant-domain, sigma-CFL, and sigma-Rusanov toggles off).";
+  }
+  if (run_cfg.igr_opts.nonconvergence_policy.empty() ||
+      ParseIGRNonconvergencePolicy(
+        run_cfg.igr_opts.nonconvergence_policy) !=
+      dg_igr::IGRNonconvergencePolicy::Error)
+  {
+    return std::string(prefix) +
+           "--igr-nonconvergence-policy error.";
+  }
+  return {};
+}
+
 inline TimeLoopConfig MakeTimeLoopConfig(const RunConfig& run_cfg)
 {
   const CommonOptions& opts = run_cfg.opts;
@@ -1830,6 +2073,8 @@ inline TimeLoopConfig MakeTimeLoopConfig(const RunConfig& run_cfg)
   cfg.t_final = opts.t_final;
   cfg.dt = opts.dt;
   cfg.dt_min = opts.dt_min;
+  // Preserve the user safety factor here. RunTimeLoop obtains the selected
+  // stepper's SSP coefficient and applies it exactly once.
   cfg.cfl = opts.cfl;
   cfg.order = opts.order;
   cfg.vis_steps = opts.vis_steps;

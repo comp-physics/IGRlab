@@ -227,6 +227,7 @@ execute_process(
 if(NOT _source_status EQUAL 0 OR
    NOT _source_stdout MATCHES
      "\\[hdg-main\\] status=Success.*regularization=igr" OR
+   _source_stdout MATCHES "Solution error:" OR
    NOT _source_stderr STREQUAL "")
   message(FATAL_ERROR
     "periodic HDG static-source execution failed: ${_source_status}\\n${_source_stdout}\\n${_source_stderr}")

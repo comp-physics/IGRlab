@@ -105,11 +105,33 @@ inline void ApplyIGRRuntimeOptionOverrides(const IGROptions& igr_opts,
   cfg.exact_dg_face_operator = igr_opts.exact_dg_face_operator;
 }
 
-inline mfem::RK3SSPWithLimiter MakeRK3Stepper(mfem::ParFiniteElementSpace& vfes,
-                                              int dim,
-                                              const mfem::RK3Config& cfg)
+inline mfem::SSPRKMethod SSPRKMethodForTimeIntegrator(
+  TimeIntegrator time_integrator)
 {
-  mfem::RK3SSPWithLimiter rk3(vfes);
+  switch (time_integrator)
+  {
+  case TimeIntegrator::RK3SSP:
+    return mfem::SSPRKMethod::SSPRK33;
+  case TimeIntegrator::SSPRK104:
+    return mfem::SSPRKMethod::SSPRK104;
+  case TimeIntegrator::BackwardEuler:
+  case TimeIntegrator::PartitionedBackwardEuler:
+  case TimeIntegrator::Rodas3:
+    break;
+  }
+  MFEM_VERIFY(false,
+              "Selected time integrator is not an explicit SSPRK method.");
+  return mfem::SSPRKMethod::SSPRK33;
+}
+
+inline mfem::RK3SSPWithLimiter MakeRK3Stepper(
+  mfem::ParFiniteElementSpace& vfes,
+  int dim,
+  const mfem::RK3Config& cfg,
+  TimeIntegrator time_integrator = TimeIntegrator::RK3SSP)
+{
+  mfem::RK3SSPWithLimiter rk3(
+    vfes, SSPRKMethodForTimeIntegrator(time_integrator));
   rk3.SetEulerParams(dim, cfg.gamma);
   rk3.SetLimiterParams(cfg.rho_min,
                        cfg.p_min,
@@ -118,6 +140,25 @@ inline mfem::RK3SSPWithLimiter MakeRK3Stepper(mfem::ParFiniteElementSpace& vfes,
   rk3.LimitInitial(cfg.limit_initial);
   rk3.SetLimiterSteps(cfg.max_limiter_steps);
   return rk3;
+}
+
+/** Resolve the RK configuration that the application actually executes.
+ *
+ * The extrapolated instantaneous-IGR route admits and limits the initialized
+ * (or restarted) Euler state before constructing its first exact algebraic
+ * anchor.  Reapplying the legacy per-step entry limiter after BeginRKStep
+ * could mutate that state, force an extra anchor, and discard the two-point
+ * extrapolation history.  Stage and accepted-endpoint limiting remain active;
+ * only that redundant RK-entry callback is disabled for this typed route.
+ */
+inline mfem::RK3Config ResolveRK3StepperConfig(const RunConfig& run_cfg)
+{
+  mfem::RK3Config cfg = run_cfg.case_config.rk3_config;
+  if (UsesFrozenSigmaSpectralSpeed(run_cfg))
+  {
+    cfg.limit_initial = false;
+  }
+  return cfg;
 }
 
 inline dg_igr::IGRSolver MakeIGRSolver(DGSpaces& spaces,

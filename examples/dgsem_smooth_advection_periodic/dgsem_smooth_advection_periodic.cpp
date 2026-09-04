@@ -3,6 +3,8 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -19,8 +21,10 @@ namespace
 
 struct SmoothAdvectionOptions
 {
-  // This is deliberately HDG-only: DG/DGSEM retain their established
-  // source-free trajectory regardless of this option.
+  double static_source = 0.0;
+  bool active_igr_wave = false;
+  // Preserve the historical HDG-only spelling: DG/DGSEM deliberately ignore
+  // this compatibility option.
   double hdg_static_source = 0.0;
 };
 
@@ -82,6 +86,26 @@ MakeSmoothAdvectionInitialCondition(const double gamma)
 }
 
 std::unique_ptr<mfem::VectorCoefficient>
+MakeActiveIGRWaveInitialCondition(const double gamma)
+{
+  constexpr double pi = 3.141592653589793238462643383279502884;
+  auto ic_fun = [gamma](const mfem::Vector& x, mfem::Vector& U)
+  {
+    const double sx = std::sin(2.0 * pi * x(0));
+    const double cx = std::cos(2.0 * pi * x(0));
+    const double sy = std::sin(2.0 * pi * x(1));
+    const double cy = std::cos(2.0 * pi * x(1));
+    mfem::Vector primitive(4);
+    primitive(0) = 1.0 + 0.05 * sx * cy;
+    primitive(1) = 0.20 + 0.03 * cy;
+    primitive(2) = -0.10 + 0.02 * sx;
+    primitive(3) = 1.0 + 0.03 * cx * sy;
+    mfem::EulerPrimToConservative(primitive, /*dim=*/2, gamma, U);
+  };
+  return dg_sim::MakeVectorFunctionIC(4, ic_fun);
+}
+
+std::unique_ptr<mfem::VectorCoefficient>
 MakeSmoothAdvectionStaticSource(const double density_source)
 {
   auto source_fun = [density_source](const mfem::Vector&, mfem::Vector& S)
@@ -120,19 +144,43 @@ int main(int argc, char* argv[])
     cfg.limiter_pipeline.zhang_shu = false;
   };
 
-  spec.make_ic = [](const SmoothAdvectionOptions&,
+  spec.make_ic = [](const SmoothAdvectionOptions& opts,
                     const dg_sim::ExampleContext&,
                     double gamma)
   {
-    return MakeSmoothAdvectionInitialCondition(gamma);
+    return opts.active_igr_wave
+             ? MakeActiveIGRWaveInitialCondition(gamma)
+             : MakeSmoothAdvectionInitialCondition(gamma);
+  };
+
+  spec.make_static_source = [](const SmoothAdvectionOptions& opts,
+                               const dg_sim::ExampleContext&,
+                               double)
+  {
+    MFEM_VERIFY(std::isfinite(opts.static_source),
+                "--static-source must be finite.");
+    return opts.static_source == 0.0
+             ? std::unique_ptr<mfem::VectorCoefficient>{}
+             : MakeSmoothAdvectionStaticSource(opts.static_source);
   };
 
   spec.add_options = [](mfem::OptionsParser& args, SmoothAdvectionOptions& opts)
   {
+    args.AddOption(&opts.static_source,
+                   "-ss",
+                   "--static-source",
+                   "Uniform mass-component source for ordinary DG or HDG.");
+    args.AddOption(&opts.active_igr_wave,
+                   "-aiw",
+                   "--active-igr-wave",
+                   "-no-aiw",
+                   "--no-active-igr-wave",
+                   "Use a smooth periodic Euler state with nonzero IGR "
+                   "closure forcing.");
     args.AddOption(&opts.hdg_static_source,
                    "-hss",
                    "--hdg-static-source",
-                   "HDG-only uniform mass-component source; ignored by DG/DGSEM.");
+                   "HDG-only compatibility option; ignored by DG/DGSEM.");
   };
 
   spec.build_markers = [](dg_sim::ExampleContext&)
@@ -146,23 +194,77 @@ int main(int argc, char* argv[])
                      const auto&) {
   };
 
+  spec.postprocess = [](const SmoothAdvectionOptions& opts,
+                        const dg_sim::ExampleContext& context,
+                        const dg_sim::EulerStateBundle& state,
+                        mfem::VectorCoefficient& initial_condition)
+  {
+    const bool hdg_selected =
+      context.run_cfg.discretization == dg_sim::Discretization::HDG;
+    const bool source_active =
+      opts.static_source != 0.0 ||
+      (hdg_selected && opts.hdg_static_source != 0.0);
+    if (source_active || opts.active_igr_wave)
+    {
+      if (mfem::Mpi::Root())
+      {
+        std::cout << "[smooth-error] status=skipped"
+                  << " reason="
+                  << (opts.active_igr_wave ? "active-igr-wave"
+                                           : "nonzero-static-source")
+                  << " exact_reference=unavailable" << std::endl;
+      }
+      return 0;
+    }
+
+    // The prescribed velocity is two unit lengths per unit time. At integer
+    // advection periods the periodic exact solution is precisely the supplied
+    // initial state, providing a conventional smooth spatial/order guard
+    // without a benchmark-only application or duplicate physics path.
+    const double completed_periods = 2.0 * context.run_cfg.opts.t_final;
+    const double nearest_period = std::round(completed_periods);
+    const double period_tolerance =
+      64.0 * std::numeric_limits<double>::epsilon() *
+      std::max(1.0, std::abs(completed_periods));
+    if (std::abs(completed_periods - nearest_period) <= period_tolerance)
+    {
+      const mfem::real_t error =
+        state.sol.ComputeLpError(2, initial_condition);
+      if (mfem::Mpi::Root())
+      {
+        std::cout << "Solution error: " << error << std::endl;
+      }
+    }
+    return 0;
+  };
+
 #if DG_IGR_HAS_HDG_MAIN_BACKEND
   spec.make_hdg_case_data = [](const SmoothAdvectionOptions& opts,
                                 const dg_sim::CaseConfig& case_config,
                                 const dg_sim::CommonOptions& options,
                                 const dg_sim::CaseContext& context)
   {
-    MFEM_VERIFY(std::isfinite(opts.hdg_static_source),
-                "--hdg-static-source must be finite.");
+    MFEM_VERIFY(std::isfinite(opts.static_source) &&
+                  std::isfinite(opts.hdg_static_source),
+                "--static-source and --hdg-static-source must be finite.");
+    MFEM_VERIFY(opts.static_source == 0.0 ||
+                  opts.hdg_static_source == 0.0 ||
+                  opts.static_source == opts.hdg_static_source,
+                "--static-source and --hdg-static-source disagree.");
+    const double hdg_source = opts.static_source != 0.0
+                                ? opts.static_source
+                                : opts.hdg_static_source;
     dg_sim::hdg::HdgEulerCaseData case_data;
     case_data.numerical_policy =
       dg::hdg::generic::DefaultEulerHdgNumericalPolicy(options.order);
     case_data.initial_condition =
-      MakeSmoothAdvectionInitialCondition(case_config.gamma);
-    if (opts.hdg_static_source != 0.0)
+      opts.active_igr_wave
+        ? MakeActiveIGRWaveInitialCondition(case_config.gamma)
+        : MakeSmoothAdvectionInitialCondition(case_config.gamma);
+    if (hdg_source != 0.0)
     {
       case_data.static_source =
-        MakeSmoothAdvectionStaticSource(opts.hdg_static_source);
+        MakeSmoothAdvectionStaticSource(hdg_source);
     }
     const int boundary_attributes = context.Mesh().bdr_attributes.Size() == 0
       ? 0

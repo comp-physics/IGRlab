@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <unordered_map>
 #include <vector>
@@ -208,13 +209,40 @@ ScanEulerAdmissibility(const mfem::ParFiniteElementSpace& vfes,
                            int scalar_dof)
   {
     const double rho = U(0);
+    bool conservative_finite = true;
+    for (int eq = 0; eq < num_eq; ++eq)
+    {
+      conservative_finite = conservative_finite && std::isfinite(U(eq));
+    }
+
+    double momentum_squared = 0.0;
+    for (int d = 0; d < dim; ++d)
+    {
+      momentum_squared += U(1 + d) * U(1 + d);
+    }
+    const double kinetic =
+      0.5 * momentum_squared / std::max(rho, 1.0e-16);
     const double pressure =
       mfem::EulerPressureFromConservative(U, dim, gamma, /*rho_floor=*/1e-16);
-    local_min_rho = std::min(local_min_rho, rho);
-    local_min_pressure = std::min(local_min_pressure, pressure);
 
-    const bool bad_rho = rho < rho_min;
-    const bool bad_pressure = pressure < p_min;
+    const bool rho_finite = std::isfinite(rho);
+    const bool kinetic_finite = std::isfinite(kinetic);
+    const bool pressure_finite = std::isfinite(pressure);
+    if (rho_finite)
+    {
+      local_min_rho = std::min(local_min_rho, rho);
+    }
+    if (pressure_finite)
+    {
+      local_min_pressure = std::min(local_min_pressure, pressure);
+    }
+
+    const bool bad_rho = !rho_finite || rho < rho_min;
+    // The existing pressure counter is also the thermodynamic/state-invalid
+    // counter.  In particular, do not let NaN comparisons make a nonfinite
+    // conservative component or derived kinetic/pressure value look valid.
+    const bool bad_pressure = !conservative_finite || !kinetic_finite ||
+                              !pressure_finite || pressure < p_min;
     local_bad_rho += bad_rho ? 1 : 0;
     local_bad_pressure += bad_pressure ? 1 : 0;
 

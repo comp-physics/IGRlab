@@ -16,6 +16,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace dg_igr_tests
 {
@@ -48,6 +49,62 @@ inline double MaxAbs(const mfem::DenseMatrix& values)
     maximum = std::max(maximum, std::abs(static_cast<double>(data[i])));
   }
   return maximum;
+}
+
+inline void BuildRowFaceAdjacency(
+  int ne,
+  int dof,
+  const mfem::Array<int>& left_elements,
+  const mfem::Array<int>& left_local,
+  const mfem::Array<int>& right_elements,
+  const mfem::Array<int>& right_local,
+  const mfem::Array<int>& ownership,
+  mfem::Array<int>& offsets,
+  mfem::Array<int>& face_ids,
+  mfem::Array<int>& signs)
+{
+  const int rows = ne * dof;
+  const int nfaces = left_elements.Size();
+  std::vector<int> counts(static_cast<std::size_t>(rows), 0);
+  for (int face = 0; face < nfaces; ++face)
+  {
+    ++counts[static_cast<std::size_t>(
+      left_elements[face] * dof + left_local[face])];
+    if (ownership[face] == static_cast<int>(
+          mfem::dgsem::DGSEMDeviceFaceOwnership::Local))
+    {
+      ++counts[static_cast<std::size_t>(
+        right_elements[face] * dof + right_local[face])];
+    }
+  }
+  offsets.SetSize(rows + 1);
+  offsets[0] = 0;
+  for (int row = 0; row < rows; ++row)
+  {
+    offsets[row + 1] = offsets[row] + counts[static_cast<std::size_t>(row)];
+  }
+  face_ids.SetSize(offsets[rows]);
+  signs.SetSize(offsets[rows]);
+  std::vector<int> cursor(static_cast<std::size_t>(rows));
+  for (int row = 0; row < rows; ++row)
+  {
+    cursor[static_cast<std::size_t>(row)] = offsets[row];
+  }
+  for (int face = 0; face < nfaces; ++face)
+  {
+    const int left_row = left_elements[face] * dof + left_local[face];
+    int adjacent = cursor[static_cast<std::size_t>(left_row)]++;
+    face_ids[adjacent] = face;
+    signs[adjacent] = -1;
+    if (ownership[face] == static_cast<int>(
+          mfem::dgsem::DGSEMDeviceFaceOwnership::Local))
+    {
+      const int right_row = right_elements[face] * dof + right_local[face];
+      adjacent = cursor[static_cast<std::size_t>(right_row)]++;
+      face_ids[adjacent] = face;
+      signs[adjacent] = 1;
+    }
+  }
 }
 
 inline double
@@ -643,6 +700,19 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
       mfem::DenseMatrix boundary_flux;
       mfem::Vector boundary_speeds;
       mfem::DenseMatrix constant_surface;
+      mfem::Array<int> boundary_row_offsets;
+      mfem::Array<int> boundary_row_face_ids;
+      mfem::Array<int> boundary_row_face_signs;
+      BuildRowFaceAdjacency(1,
+                            dof,
+                            boundary_left_elements,
+                            boundary_left_local,
+                            boundary_right_elements,
+                            boundary_right_local,
+                            boundary_ownership,
+                            boundary_row_offsets,
+                            boundary_row_face_ids,
+                            boundary_row_face_signs);
       mfem::dgsem::AssembleEulerRusanovFacesDevice(dim,
                                                    1,
                                                    dof,
@@ -654,11 +724,9 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
                                                    boundary_sigma_left,
                                                    boundary_sigma_right,
                                                    boundary_weights,
-                                                   boundary_left_elements,
-                                                   boundary_left_local,
-                                                   boundary_right_elements,
-                                                   boundary_right_local,
-                                                   boundary_ownership,
+                                                   boundary_row_offsets,
+                                                   boundary_row_face_ids,
+                                                   boundary_row_face_signs,
                                                    boundary_flux,
                                                    boundary_speeds,
                                                    constant_surface);
@@ -846,6 +914,19 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
       mfem::DenseMatrix host_face_flux;
       mfem::Vector host_face_speeds;
       mfem::DenseMatrix host_surface;
+      mfem::Array<int> row_offsets;
+      mfem::Array<int> row_face_ids;
+      mfem::Array<int> row_face_signs;
+      BuildRowFaceAdjacency(2,
+                            face_dof,
+                            left_elements,
+                            left_local,
+                            right_elements,
+                            right_local,
+                            ownership,
+                            row_offsets,
+                            row_face_ids,
+                            row_face_signs);
       mfem::dgsem::AssembleEulerRusanovFacesDevice(dim,
                                                    2,
                                                    face_dof,
@@ -857,11 +938,9 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
                                                    sigma_left,
                                                    sigma_right,
                                                    weights,
-                                                   left_elements,
-                                                   left_local,
-                                                   right_elements,
-                                                   right_local,
-                                                   ownership,
+                                                   row_offsets,
+                                                   row_face_ids,
+                                                   row_face_signs,
                                                    device_face_flux,
                                                    device_face_speeds,
                                                    device_surface);

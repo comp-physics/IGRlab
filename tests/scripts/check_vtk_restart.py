@@ -225,7 +225,14 @@ def compare_final(
     return max_abs, rel_l2
 
 
-def manifest_checks(pvd: Path, ranks: int) -> None:
+def manifest_checks(
+    pvd: Path,
+    ranks: int,
+    time_integrator: str,
+    invariant_domain_flux: bool,
+    zhang_shu_limiter: bool,
+    zhang_shu_vtk_points: bool,
+) -> None:
     entries = pvd_entries(pvd)
     if [(cycle, time) for cycle, time, _ in entries] != [
         (0, 0.0),
@@ -236,7 +243,22 @@ def manifest_checks(pvd: Path, ranks: int) -> None:
     for cycle, time, pvtu in entries:
         manifest_path = pvtu.parent / "restart.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        expected = {"schema_version": 1, "complete": True, "cycle": cycle, "time": time, "step": cycle, "ranks": ranks}
+        expected = {
+            "schema_version": 4,
+            "complete": True,
+            "cycle": cycle,
+            "time": time,
+            "step": cycle,
+            "ranks": ranks,
+            "time_integrator": time_integrator,
+            "igr_invariant_domain_flux": invariant_domain_flux,
+            "zhang_shu_limiter": zhang_shu_limiter,
+            "zhang_shu_vtk_points": zhang_shu_vtk_points,
+            "rho_floor": 5.0e-7,
+            "pressure_floor": 1.0e-6,
+            "static_source_present": False,
+            "static_source_fingerprint": "none",
+        }
         for key, value in expected.items():
             if manifest.get(key) != value:
                 raise RuntimeError(f"manifest {manifest_path} has {key}={manifest.get(key)!r}, expected {value!r}")
@@ -262,6 +284,9 @@ def base_command(
     order: int,
     with_igr: bool,
     cfl_driven: bool,
+    time_integrator: str,
+    invariant_domain_flux: bool,
+    zhang_shu_vtk_points: bool,
 ) -> list[str]:
     linear_rtol = "1.0e-5" if device == "cuda" else "1.0e-8"
     app = [
@@ -270,7 +295,8 @@ def base_command(
         "-c", "0.3" if cfl_driven else "0.0", "-dg", "dg", "-as", "0",
         "-no-glvis", "-vtk", "-dt_save", "1.0e-4",
         "-no-vtk-h1", "-no-vtk-l2", "-no-vtk-rank", "-no-vtk-zs",
-        "-no-save-state", "-iprint", "0",
+        "-no-save-state", "-iprint", "0", "--time-integrator",
+        time_integrator,
     ]
     if with_igr:
         app.extend([
@@ -279,6 +305,10 @@ def base_command(
             "-imaxit", "1000",
             "-iexface",
         ])
+        if invariant_domain_flux:
+            app.append("--igr-invariant-domain-flux")
+    if zhang_shu_vtk_points:
+        app.append("--zhang-shu-vtk-points")
     return [mpiexec, np_flag, str(ranks), *app] if ranks > 1 else app
 
 
@@ -320,7 +350,15 @@ def run_format_controls(base: list[str], env: dict[str, str], source_pvd: Path, 
         require(r"reconstruction_max_abs=([0-9.eE+-]+)", text, f"{mode} reconstruction")
 
 
-def run_negative_controls(base: list[str], env: dict[str, str], source_pvd: Path, root: Path) -> None:
+def run_negative_controls(
+    base: list[str],
+    env: dict[str, str],
+    source_pvd: Path,
+    root: Path,
+    time_integrator: str,
+    invariant_domain_flux: bool,
+    with_igr: bool,
+) -> None:
     restart = [*base, "--restart-vtk", str(source_pvd), "--restart-cycle", "1"]
 
     def incompatible_manifest(name: str, key: str, value: object) -> None:
@@ -333,7 +371,13 @@ def run_negative_controls(base: list[str], env: dict[str, str], source_pvd: Path
         manifest[key] = value
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         command = [*base, "--restart-vtk", str(pvd), "--restart-cycle", "1"]
-        failure(command, env, root, name, r"manifest is incompatible")
+        failure(
+            command,
+            env,
+            root,
+            name,
+            r"manifest (?:static source )?is incompatible",
+        )
 
     source_hashes = tree_hashes(source_pvd.parent)
     same_prefix = source_pvd.parent.parent
@@ -371,23 +415,87 @@ def run_negative_controls(base: list[str], env: dict[str, str], source_pvd: Path
     incompatible_manifest("wrong-equations", "equations", 5)
     incompatible_manifest("wrong-basis", "basis", "GaussLobatto")
     incompatible_manifest("wrong-mesh", "mesh_fingerprint", "0000000000000000")
+    incompatible_manifest(
+        "wrong-effective-zhang-shu",
+        "zhang_shu_limiter",
+        not with_igr,
+    )
+    incompatible_manifest(
+        "wrong-zhang-shu-vtk-points",
+        "zhang_shu_vtk_points",
+        "--zhang-shu-vtk-points" not in base,
+    )
+    incompatible_manifest("wrong-rho-floor", "rho_floor", 1.0e-8)
+    incompatible_manifest("wrong-pressure-floor", "pressure_floor", 2.0e-8)
+    incompatible_manifest("wrong-static-source-presence", "static_source_present", True)
+    incompatible_manifest(
+        "wrong-static-source-fingerprint",
+        "static_source_fingerprint",
+        "0123456789abcdef",
+    )
+
+    wrong_time_integrator = list(restart)
+    time_index = wrong_time_integrator.index("--time-integrator") + 1
+    wrong_time_integrator[time_index] = (
+        "rk3ssp" if time_integrator == "ssprk104" else "ssprk104"
+    )
+    failure(
+        wrong_time_integrator,
+        env,
+        root,
+        "wrong-time-integrator",
+        r"manifest is incompatible",
+    )
+
+    if with_igr:
+        wrong_invariant_flux = list(restart)
+        invariant_flag = "--igr-invariant-domain-flux"
+        if invariant_domain_flux:
+            wrong_invariant_flux.remove(invariant_flag)
+        else:
+            wrong_invariant_flux.append(invariant_flag)
+        failure(
+            wrong_invariant_flux,
+            env,
+            root,
+            "wrong-invariant-domain-flux",
+            r"manifest is incompatible",
+        )
 
     wrong_backend = list(restart)
     wrong_backend[wrong_backend.index("-dg") + 1] = "dgsem"
-    failure(wrong_backend, env, root, "wrong-backend", r"manifest is incompatible|supports the L2 DG backend only")
+    failure(
+        wrong_backend,
+        env,
+        root,
+        "wrong-backend",
+        r"manifest is incompatible|supports the L2 DG backend only|requires the ordinary DG backend",
+    )
 
     wrong_alpha = list(restart)
     wrong_alpha[wrong_alpha.index("-ca") + 1] = "2.0"
     failure(wrong_alpha, env, root, "wrong-alpha", r"manifest is incompatible")
 
     wrong_limiter = [*restart, "--zhang-shu-points", "quadrature"]
-    failure(wrong_limiter, env, root, "wrong-limiter-points", r"manifest is incompatible")
+    failure(
+        wrong_limiter,
+        env,
+        root,
+        "wrong-limiter-points",
+        r"manifest is incompatible|requires --zhang-shu-points consumer",
+    )
 
     no_exact_face = [item for item in restart if item != "-iexface"]
     failure(no_exact_face, env, root, "missing-exact-face", r"requires exact DG faces")
 
     thinned_sigma = [*restart, "--igr-sigma-cadence", "every-step"]
-    failure(thinned_sigma, env, root, "thinned-sigma", r"requires every-stage")
+    failure(
+        thinned_sigma,
+        env,
+        root,
+        "thinned-sigma",
+        r"supports only every-stage or extrapolated-every-step",
+    )
 
     changed_solver = list(restart)
     changed_solver[changed_solver.index("-irtol") + 1] = "1.0e-6"
@@ -440,6 +548,76 @@ def run_negative_controls(base: list[str], env: dict[str, str], source_pvd: Path
     command = [*base, "--restart-vtk", str(fallback_pvd)]
     text = run(command, with_output(env, root / "latest-complete-fallback" / "vtk"), root / "latest-complete-fallback" / "run.log")
     require(r"cycle=1 time=0\.0001 step=1 legacy=0", text, "latest complete fallback")
+
+    schema2_root = root / "schema2-source"
+    shutil.copytree(source_pvd.parent, schema2_root)
+    schema2_pvd = schema2_root / source_pvd.name
+    schema2_entry = next(item for item in pvd_entries(schema2_pvd) if item[0] == 1)
+    schema2_path = schema2_entry[2].parent / "restart.json"
+    schema2 = json.loads(schema2_path.read_text(encoding="utf-8"))
+    schema2["schema_version"] = 2
+    schema2.pop("static_source_present", None)
+    schema2.pop("static_source_fingerprint", None)
+    schema2_path.write_text(json.dumps(schema2), encoding="utf-8")
+    schema2_command = [
+        *base,
+        "--restart-vtk",
+        str(schema2_pvd),
+        "--restart-cycle",
+        "1",
+    ]
+    text = run(
+        schema2_command,
+        with_output(env, root / "schema2-compatible" / "vtk"),
+        root / "schema2-compatible" / "run.log",
+    )
+    require(r"legacy=0", text, "source-free schema-2 compatibility")
+
+    schema1_root = root / "schema1-source"
+    shutil.copytree(source_pvd.parent, schema1_root)
+    schema1_pvd = schema1_root / source_pvd.name
+    schema1_entry = next(item for item in pvd_entries(schema1_pvd) if item[0] == 1)
+    schema1_path = schema1_entry[2].parent / "restart.json"
+    schema1 = json.loads(schema1_path.read_text(encoding="utf-8"))
+    schema1["schema_version"] = 1
+    for key in (
+        "time_integrator",
+        "igr_invariant_domain_flux",
+        "zhang_shu_limiter",
+        "zhang_shu_vtk_points",
+        "rho_floor",
+        "pressure_floor",
+        "static_source_present",
+        "static_source_fingerprint",
+    ):
+        schema1.pop(key, None)
+    schema1_path.write_text(json.dumps(schema1), encoding="utf-8")
+    schema1_command = [
+        *base,
+        "--restart-vtk",
+        str(schema1_pvd),
+        "--restart-cycle",
+        "1",
+    ]
+    if (
+        time_integrator == "rk3ssp"
+        and not invariant_domain_flux
+        and "--zhang-shu-vtk-points" not in base
+    ):
+        text = run(
+            schema1_command,
+            with_output(env, root / "schema1-compatible" / "vtk"),
+            root / "schema1-compatible" / "run.log",
+        )
+        require(r"legacy=0", text, "schema-1 compatibility")
+    else:
+        failure(
+            schema1_command,
+            env,
+            root,
+            "schema1-new-method",
+            r"schema 1 is compatible only with rk3ssp",
+        )
 
     legacy = variant_copy(source_pvd, root / "legacy-source")
     command = [*base, "--restart-vtk", str(legacy), "--restart-cycle", "1"]
@@ -584,7 +762,17 @@ def main() -> int:
     parser.add_argument("--negative-controls", action="store_true")
     parser.add_argument("--no-igr", action="store_true")
     parser.add_argument("--cfl-driven", action="store_true")
+    parser.add_argument(
+        "--time-integrator",
+        choices=("rk3ssp", "ssprk104"),
+        default="rk3ssp",
+    )
+    parser.add_argument("--invariant-domain-flux", action="store_true")
+    parser.add_argument("--zhang-shu-vtk-points", action="store_true")
     args = parser.parse_args()
+
+    if args.no_igr and args.invariant_domain_flux:
+        raise RuntimeError("--invariant-domain-flux requires IGR in this harness")
 
     output = Path(args.out_dir).resolve()
     if output.exists():
@@ -608,12 +796,22 @@ def main() -> int:
         args.order,
         not args.no_igr,
         args.cfl_driven,
+        args.time_integrator,
+        args.invariant_domain_flux,
+        args.zhang_shu_vtk_points,
     )
 
     control_root = output / "control" / "vtk"
     control_log = run(base, with_output(env, control_root), output / "control" / "run.log")
     source_pvd = dataset_pvd(control_root)
-    manifest_checks(source_pvd, args.mpi_ranks)
+    manifest_checks(
+        source_pvd,
+        args.mpi_ranks,
+        args.time_integrator,
+        args.invariant_domain_flux,
+        not args.no_igr,
+        args.zhang_shu_vtk_points,
+    )
 
     restart_root = output / "restart" / "vtk"
     restart_command = [*base, "--restart-vtk", str(source_pvd), "--restart-cycle", "1"]
@@ -674,15 +872,32 @@ def main() -> int:
     if args.negative_controls:
         if args.mpi_ranks != 1:
             raise RuntimeError("negative controls are intended for one rank")
-        run_negative_controls(base, env, source_pvd, output / "negative")
+        run_negative_controls(
+            base,
+            env,
+            source_pvd,
+            output / "negative",
+            args.time_integrator,
+            args.invariant_domain_flux,
+            not args.no_igr,
+        )
 
     if not args.no_igr:
-        require(r"production_calls=6 production_converged_calls=6", control_log, "control solve accounting")
+        production_calls = 20 if args.time_integrator == "ssprk104" else 6
+        require(
+            rf"production_calls={production_calls} "
+            rf"production_converged_calls={production_calls}",
+            control_log,
+            "control solve accounting",
+        )
     print(
         "vtk-restart: PASS"
         f" device={args.device} ranks={args.mpi_ranks} order={args.order}"
         f" igr={int(not args.no_igr)}"
         f" cfl={int(args.cfl_driven)}"
+        f" time_integrator={args.time_integrator}"
+        f" invariant_domain_flux={int(args.invariant_domain_flux)}"
+        f" zhang_shu_vtk_points={int(args.zhang_shu_vtk_points)}"
         f" max_abs={max_abs:.6e} rel_l2={rel_l2:.6e}"
         f" formats={int(args.format_controls)} negatives={int(args.negative_controls)}"
     )

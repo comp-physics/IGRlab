@@ -120,7 +120,9 @@ void ConfigureLimiterPipeline(RK3SSPWithLimiter& rk3,
 
   if (config.zhang_shu)
   {
-    rk3.AddZhangShuLimiter(config.zhang_shu_points);
+    rk3.AddZhangShuLimiter(config.zhang_shu_points,
+                           /*always_on=*/true,
+                           config.zhang_shu_vtk_points);
   }
 }
 

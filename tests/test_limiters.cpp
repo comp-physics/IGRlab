@@ -1,5 +1,6 @@
 #include "numerics/limiters/bj.hpp"
 #include "numerics/limiters/krivodonova.hpp"
+#include "numerics/limiters/limiter_pipeline.hpp"
 #include "numerics/limiters/tvb.hpp"
 #include "numerics/limiters/venkat.hpp"
 #include "numerics/limiters/zhang_shu.hpp"
@@ -34,7 +35,7 @@ constexpr double kGamma = 1.4;
 constexpr double kPi = dg_sim::math::kPi;
 constexpr double kBoundTol = 1.0e-2;
 
-double GlobalSum(double local)
+double LimiterGlobalSum(double local)
 {
   double global = 0.0;
   MPI_Allreduce(&local,
@@ -163,8 +164,8 @@ double GlobalRelativeChange(const mfem::ParGridFunction& before,
 
   const double local_diff_sq = diff * diff;
   const double local_base_sq = before * before;
-  const double diff_sq = GlobalSum(local_diff_sq);
-  const double base_sq = GlobalSum(local_base_sq);
+  const double diff_sq = LimiterGlobalSum(local_diff_sq);
+  const double base_sq = LimiterGlobalSum(local_base_sq);
 
   const double diff_norm = std::sqrt(diff_sq);
   const double base_norm = std::sqrt(base_sq);
@@ -604,7 +605,7 @@ int RunLimiterTests(TestContext& ctx)
     const std::optional<std::string> original_vtk = original_vtk_text
       ? std::optional<std::string>(original_vtk_text)
       : std::nullopt;
-    setenv(vtk_env, "0", 1);
+    setenv(vtk_env, "1", 1);
 
     mfem::ParGridFunction current(&vfes);
     current = initial;
@@ -618,13 +619,84 @@ int RunLimiterTests(TestContext& ctx)
       6,
       {5},
       16,
-      mfem::ZhangShuPointSet::kQuadrature);
+      mfem::ZhangShuPointSet::kQuadrature,
+      /*diagnostics=*/nullptr,
+      /*enforce_vtk_points=*/false);
     ctx.Check(nodal_min_pressure(current) < 0.0,
-              "Zhang-Shu GL control exposes omitted production node");
+              "Zhang-Shu typed VTK-point disable overrides legacy env");
+
+    mfem::ParGridFunction legacy_vtk(&vfes);
+    legacy_vtk = initial;
+    mfem::ApplyZhangShuPositivityLimiter(
+      vfes,
+      legacy_vtk,
+      kDim,
+      kGamma,
+      1.0e-10,
+      1.0e-10,
+      6,
+      {5},
+      16,
+      mfem::ZhangShuPointSet::kQuadrature);
+    ctx.Check(nodal_min_pressure(legacy_vtk) >= 0.99e-10,
+              "Zhang-Shu legacy env still enables refined VTK points");
+
+    setenv(vtk_env, "0", 1);
+    mfem::ParGridFunction typed_vtk(&vfes);
+    typed_vtk = initial;
+    mfem::ApplyZhangShuPositivityLimiter(
+      vfes,
+      typed_vtk,
+      kDim,
+      kGamma,
+      1.0e-10,
+      1.0e-10,
+      6,
+      {5},
+      16,
+      mfem::ZhangShuPointSet::kQuadrature,
+      /*diagnostics=*/nullptr,
+      /*enforce_vtk_points=*/true);
+    ctx.Check(nodal_min_pressure(typed_vtk) >= 0.99e-10,
+              "Zhang-Shu typed policy enforces refined VTK points");
+
+    struct ZeroOperator final : public mfem::TimeDependentOperator
+    {
+      explicit ZeroOperator(int n) : mfem::TimeDependentOperator(n) {}
+      void Mult(const mfem::Vector&, mfem::Vector& y) const override
+      {
+        y.SetSize(height);
+        y = 0.0;
+      }
+    } zero(vfes.GetTrueVSize());
+    mfem::RK3SSPWithLimiter vtk_rk(vfes);
+    vtk_rk.SetEulerParams(kDim, kGamma);
+    vtk_rk.SetLimiterParams(1.0e-10, 1.0e-10, 6, 16);
+    vtk_rk.SetLimiterFaceQuadratureOrders({5});
+    mfem::LimiterPipelineConfig vtk_pipeline;
+    vtk_pipeline.zhang_shu = true;
+    vtk_pipeline.zhang_shu_points = mfem::ZhangShuPointSet::kQuadrature;
+    vtk_pipeline.zhang_shu_vtk_points = true;
+    mfem::ConfigureLimiterPipeline(vtk_rk,
+                                   vtk_pipeline,
+                                   vfes,
+                                   kDim,
+                                   kGamma);
+    vtk_rk.Init(zero);
+    mfem::Vector vtk_rk_state;
+    initial.GetTrueDofs(vtk_rk_state);
+    double vtk_rk_time = 0.0;
+    double vtk_rk_dt = 1.0e-3;
+    vtk_rk.Step(vtk_rk_state, vtk_rk_time, vtk_rk_dt);
+    mfem::ParGridFunction vtk_rk_result(&vfes);
+    vtk_rk_result.SetFromTrueDofs(vtk_rk_state);
+    ctx.Check(nodal_min_pressure(vtk_rk_result) >= 0.99e-10,
+              "Zhang-Shu pipeline forwards the refined VTK-point policy");
 
     mfem::ParGridFunction nodal(&vfes);
     nodal = initial;
     const auto averages_before = ComputeElementAverages(vfes, nodal, 6);
+    mfem::ZhangShuLimiterElementDiagnostics limiter_diagnostics;
     mfem::ApplyZhangShuPositivityLimiter(
       vfes,
       nodal,
@@ -635,12 +707,41 @@ int RunLimiterTests(TestContext& ctx)
       6,
       {5},
       16,
-      mfem::ZhangShuPointSet::kConsumer);
+      mfem::ZhangShuPointSet::kConsumer,
+      &limiter_diagnostics);
     const auto averages_after = ComputeElementAverages(vfes, nodal, 6);
     ctx.Check(nodal_min_pressure(nodal) >= 0.99e-10,
               "Zhang-Shu nodal union protects production GL nodes");
     ctx.Check(MaxRelativeAverageChange(averages_before, averages_after) < 1.0e-12,
               "Zhang-Shu nodal union preserves element average");
+
+    double local_limited_elements = 0.0;
+    double local_minimum_theta = 1.0;
+    const double* active = limiter_diagnostics.active.HostRead();
+    const double* theta_rho = limiter_diagnostics.theta_rho.HostRead();
+    const double* theta_p = limiter_diagnostics.theta_p.HostRead();
+    for (int i = 0; i < limiter_diagnostics.active.Size(); ++i)
+    {
+      local_limited_elements += active[i] != 0.0 ? 1.0 : 0.0;
+      local_minimum_theta =
+        std::min(local_minimum_theta, theta_rho[i] * theta_p[i]);
+    }
+    const double global_limited_elements =
+      LimiterGlobalSum(local_limited_elements);
+    const double global_element_opportunities =
+      LimiterGlobalSum(static_cast<double>(vfes.GetNE()));
+    const double global_minimum_theta =
+      LimiterGlobalMin(local_minimum_theta);
+    const double limited_element_fraction =
+      global_limited_elements / global_element_opportunities;
+    ctx.Check(global_limited_elements > 0.0 &&
+                global_limited_elements <= global_element_opportunities,
+              "Zhang-Shu diagnostics count limited element-call incidences");
+    ctx.Check(limited_element_fraction > 0.0 &&
+                limited_element_fraction <= 1.0,
+              "Zhang-Shu limited-element fraction uses owned elements as its denominator");
+    ctx.Check(global_minimum_theta >= 0.0 && global_minimum_theta < 1.0,
+              "Zhang-Shu diagnostics expose the minimum effective theta");
 
     mfem::ParGridFunction smooth(&vfes);
     for (int element_index = 0; element_index < vfes.GetNE(); ++element_index)
@@ -718,7 +819,7 @@ int RunLimiterTests(TestContext& ctx)
     else { unsetenv(vtk_env); }
   }
 
-  // --- Zhang-Shu positivity on order-0 space ---
+  // --- Zhang-Shu strict mean rejection on order-0 space ---
   {
     mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
       /*nx=*/2,
@@ -742,31 +843,37 @@ int RunLimiterTests(TestContext& ctx)
                                                         /*p=*/1.0);
     FillConstantState(vfes, cons, U);
 
-    if (vfes.GetNDofs() > 0)
+    if (mfem::Mpi::WorldRank() == 0 && vfes.GetNDofs() > 0)
     {
       U(0) = -1.0;
-      U(3) = 0.1;
     }
 
     const double rho_min = 1e-8;
     const double p_min = 1e-8;
-    mfem::ApplyZhangShuPositivityLimiter(vfes,
-                                         U,
-                                         kDim,
-                                         kGamma,
-                                         rho_min,
-                                         p_min,
-                                         /*quad_order=*/0,
-                                         /*face_quad_orders=*/{},
-                                         /*p_bisect_iters=*/12);
-
-    double min_rho = 0.0;
-    double min_p = 0.0;
-    MinRhoPressure(vfes, U, /*quad_order=*/0, min_rho, min_p);
-    ctx.Check(min_rho >= 0.99 * rho_min,
-              "Zhang-Shu limiter enforces rho floor");
-    ctx.Check(min_p >= 0.99 * p_min,
-              "Zhang-Shu limiter enforces pressure floor");
+    const mfem::Vector state_before(U);
+    int rejected_elements = 0;
+    try
+    {
+      mfem::ApplyZhangShuPositivityLimiter(vfes,
+                                           U,
+                                           kDim,
+                                           kGamma,
+                                           rho_min,
+                                           p_min,
+                                           /*quad_order=*/0,
+                                           /*face_quad_orders=*/{},
+                                           /*p_bisect_iters=*/12);
+    }
+    catch (const mfem::RecoverableLimiterFailure& failure)
+    {
+      rejected_elements = failure.GlobalRejectedElementCount();
+    }
+    mfem::Vector state_error(U);
+    state_error -= state_before;
+    ctx.Check(rejected_elements == 1,
+              "Zhang-Shu limiter collectively rejects one bad-rank element mean");
+    ctx.Check(state_error.Normlinf() == 0.0,
+              "Zhang-Shu mean rejection leaves the complete state unchanged");
   }
 
   // --- Slope limiters on order-1 space ---

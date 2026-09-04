@@ -21,14 +21,25 @@ template <typename NumericalFlux> struct EulerIGRFluxBundle
                      double gamma,
                      dg_igr::IGRSolver& igr,
                      bool sigma_aware_cfl,
-                     bool sigma_aware_rusanov)
+                     bool sigma_aware_rusanov,
+                     bool invariant_domain_flux,
+                     bool frozen_sigma_spectral_speed,
+                     double limiter_density_floor,
+                     double limiter_pressure_floor)
     : base_flux(dim, gamma),
-      igr_flux(base_flux),
+      igr_flux(base_flux, gamma),
       numerical_flux(igr_flux)
   {
     igr_flux.SetSigmaField(&igr.GetSigma());
     igr_flux.SetSigmaAwareCFL(sigma_aware_cfl);
     igr_flux.SetSigmaAwareRusanov(sigma_aware_rusanov);
+    igr_flux.SetFrozenSigmaSpectralSpeed(frozen_sigma_spectral_speed);
+    if (invariant_domain_flux || frozen_sigma_spectral_speed)
+    {
+      igr_flux.SetInvariantDomainFloors(limiter_density_floor,
+                                        limiter_pressure_floor);
+    }
+    igr_flux.SetInvariantDomainFlux(invariant_domain_flux);
   }
 };
 

@@ -86,6 +86,8 @@ enum class IGRSigmaUpdateCadence
 {
   EveryStage,
   EveryStep,
+  /// Exact accepted endpoints with linear-in-time stage extrapolation.
+  ExtrapolatedEveryStep,
   EveryNSteps
 };
 

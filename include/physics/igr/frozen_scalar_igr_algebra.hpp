@@ -453,6 +453,67 @@ SelectRusanovDissipationSpeed(mfem::real_t reported_speed,
   return base_speed + (sigma_aware_rusanov ? sigma_scale : 0.0);
 }
 
+/** Frozen-sigma acoustic numerator for the local full-energy Euler flux.
+ *
+ * For an admitted state and a unit normal, freezing sigma while
+ * differentiating the local flux gives
+ *
+ *   det(A_n - lambda I)
+ *     = (u_n - lambda)^dimension
+ *       ((u_n - lambda)^2 - q_sigma / rho),
+ *   q_sigma = gamma p + (gamma - 1) sigma.
+ *
+ * Thus q_sigma > 0 is the local strict-hyperbolicity condition for the two
+ * acoustic fields.  This says nothing about the nonlocal reduced Jacobian of
+ * the instantaneous elliptic DAE; it is only a frozen-sigma point-flux
+ * contract.
+ */
+MFEM_HOST_DEVICE inline mfem::real_t
+FrozenSigmaLocalHyperbolicityMargin(mfem::real_t pressure,
+                                    mfem::real_t sigma,
+                                    mfem::real_t gamma)
+{
+  return gamma * pressure + (gamma - static_cast<mfem::real_t>(1.0)) * sigma;
+}
+
+MFEM_HOST_DEVICE inline bool
+FrozenSigmaFluxIsLocallyStrictlyHyperbolic(mfem::real_t pressure,
+                                           mfem::real_t sigma,
+                                           mfem::real_t gamma)
+{
+  // The ordered comparison also fails closed for a NaN margin.
+  return FrozenSigmaLocalHyperbolicityMargin(pressure, sigma, gamma) >
+         static_cast<mfem::real_t>(0.0);
+}
+
+/** Finite modulus bound for the local frozen-sigma characteristic roots.
+ *
+ * When q_sigma > 0 this is the exact scalar spectral-radius bound
+ * |u_n| + sqrt(q_sigma/rho).  At q_sigma == 0 it remains finite.  When
+ * q_sigma < 0 the acoustic roots are complex and the same expression with
+ * |q_sigma| bounds their moduli, but it is not a hyperbolic wave-speed or a
+ * stability guarantee.  Callers making a hyperbolicity claim must separately
+ * require FrozenSigmaFluxIsLocallyStrictlyHyperbolic().
+ *
+ * The density floor prevents singular arithmetic outside the admitted set;
+ * the spectral statement applies where density is above that configured
+ * floor, so that the frozen-sigma energy flux is differentiable in density.
+ */
+MFEM_HOST_DEVICE inline mfem::real_t
+FrozenSigmaCharacteristicModulusBound(mfem::real_t density,
+                                      mfem::real_t pressure,
+                                      mfem::real_t transport_speed,
+                                      mfem::real_t sigma,
+                                      mfem::real_t gamma,
+                                      mfem::real_t density_floor)
+{
+  const mfem::real_t safe_density = fmax(density, density_floor);
+  const mfem::real_t acoustic_numerator =
+    FrozenSigmaLocalHyperbolicityMargin(pressure, sigma, gamma);
+  return fabs(transport_speed) +
+         sqrt(fabs(acoustic_numerator) / safe_density);
+}
+
 MFEM_HOST_DEVICE inline mfem::real_t
 FluxInvariantDomainSpeed(mfem::real_t base_speed,
                          mfem::real_t density,
@@ -469,7 +530,15 @@ FluxInvariantDomainSpeed(mfem::real_t base_speed,
     sqrt(fmax((gamma - 1.0) / (2.0 * safe_density * safe_pressure), 0.0));
   const mfem::real_t split_speed =
     transport_speed + fabs(pressure + sigma) * pressure_scale;
-  return fmax(base_speed, split_speed);
+  const mfem::real_t frozen_sigma_modulus_bound =
+    FrozenSigmaCharacteristicModulusBound(density,
+                                          pressure,
+                                          transport_speed,
+                                          sigma,
+                                          gamma,
+                                          density_floor);
+  return fmax(fmax(base_speed, split_speed),
+              frozen_sigma_modulus_bound);
 }
 
 } // namespace frozen_scalar_igr_algebra

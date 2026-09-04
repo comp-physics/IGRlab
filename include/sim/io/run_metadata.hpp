@@ -7,10 +7,13 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 
@@ -132,18 +135,46 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
                                     char** argv,
                                     bool success,
                                     const std::string& output_dataset_name = {},
-                                    const VTKRestartInfo* restart_info = nullptr)
+                                    const VTKRestartInfo* restart_info = nullptr,
+                                    MPI_Comm communicator = MPI_COMM_WORLD,
+                                    const mfem::ParGridFunction* static_source = nullptr,
+                                    const ExampleContext* context = nullptr)
 {
-  if (!run_cfg.opts.vtk_save || !mfem::Mpi::Root())
+  int communicator_rank = 0;
+  int communicator_size = 1;
+  MPI_Comm_rank(communicator, &communicator_rank);
+  MPI_Comm_size(communicator, &communicator_size);
+  if (!run_cfg.opts.vtk_save)
+  {
+    return;
+  }
+  std::string static_source_fingerprint = "none";
+  if (static_source)
+  {
+    MFEM_VERIFY(context != nullptr,
+                "Run metadata needs the active context to identify a static "
+                "source.");
+    const std::uint64_t fingerprint =
+      ComputeVTKRestartFieldFingerprint(*static_source, *context);
+    std::ostringstream fingerprint_text;
+    fingerprint_text << std::hex << std::setfill('0') << std::setw(16)
+                     << fingerprint;
+    static_source_fingerprint = fingerprint_text.str();
+  }
+  if (communicator_rank != 0)
   {
     return;
   }
 
   const mfem::io::VTKOutputConfig vtk_cfg = MakeCaseVTKConfig(case_cfg);
-  const std::string dataset_name = output_dataset_name.empty()
-                                     ? MakeCaseVTKDatasetName(
-                                         case_cfg, run_cfg, c_alpha_value)
-                                     : output_dataset_name;
+  std::string dataset_name = output_dataset_name.empty()
+                               ? MakeCaseVTKDatasetName(
+                                   case_cfg, run_cfg, c_alpha_value)
+                               : output_dataset_name;
+  if (output_dataset_name.empty() && static_source)
+  {
+    dataset_name += "_src_" + static_source_fingerprint;
+  }
   const std::filesystem::path output_dir =
     std::filesystem::path(vtk_cfg.prefix_path) / dataset_name;
   std::filesystem::create_directories(output_dir);
@@ -159,7 +190,7 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
 
   out << std::setprecision(17);
   out << "{\n";
-  out << "  \"schema_version\": 1,\n";
+  out << "  \"schema_version\": 3,\n";
   out << "  \"timestamp_utc\": "
       << detail::ToJsonString(detail::ISO8601NowUTC()) << ",\n";
   out << "  \"status\": {\n";
@@ -174,7 +205,7 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   out << "    \"gamma\": " << case_cfg.gamma << "\n";
   out << "  },\n";
   out << "  \"runtime\": {\n";
-  out << "    \"mpi_ranks\": " << mfem::Mpi::WorldSize() << ",\n";
+  out << "    \"mpi_ranks\": " << communicator_size << ",\n";
   out << "    \"order\": " << run_cfg.opts.order << ",\n";
   out << "    \"serial_refinement\": " << run_cfg.opts.ser_ref_levels << ",\n";
   out << "    \"parallel_refinement\": " << run_cfg.opts.par_ref_levels
@@ -193,6 +224,9 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << ",\n";
   out << "    \"dg_backend\": "
       << detail::ToJsonString(DGBackendToString(run_cfg.dg_backend)) << ",\n";
+  out << "    \"time_integrator\": "
+      << detail::ToJsonString(TimeIntegratorToString(run_cfg.time_integrator))
+      << ",\n";
   out << "    \"dgsem_volume_flux\": "
       << detail::ToJsonString(
            DGSEMVolumeFluxToString(run_cfg.dgsem_volume_flux))
@@ -204,6 +238,9 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   out << "    \"dgsem_surface_flux\": "
       << detail::ToJsonString(
            DGSEMSurfaceFluxToString(run_cfg.dgsem_surface_flux))
+      << ",\n";
+  out << "    \"dgsem_stabilization\": "
+      << detail::ToJsonString(DGSEMStabilizationToString(run_cfg.dgsem_stab))
       << ",\n";
   out << "    \"dgsem_entropy_jacobian\": "
       << detail::ToJsonString(
@@ -227,10 +264,24 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << (run_cfg.igr_opts.sigma_aware_cfl ? "true" : "false") << ",\n";
   out << "    \"igr_sigma_rusanov\": "
       << (run_cfg.igr_opts.sigma_aware_rusanov ? "true" : "false") << ",\n";
+  out << "    \"igr_frozen_sigma_spectral_speed\": "
+      << (UsesFrozenSigmaSpectralSpeed(run_cfg) ? "true" : "false")
+      << ",\n";
+  out << "    \"igr_invariant_domain_flux\": "
+      << (run_cfg.igr_opts.igr_invariant_domain_flux ? "true" : "false")
+      << ",\n";
+  const auto effective_sigma_cadence =
+    ResolveEffectiveIGRSigmaUpdateCadence(run_cfg);
   out << "    \"igr_sigma_cadence\": "
-      << detail::ToJsonString(run_cfg.igr_opts.sigma_cadence) << ",\n";
+      << detail::ToJsonString(
+           IGRSigmaUpdateCadenceToString(effective_sigma_cadence))
+      << ",\n";
   out << "    \"igr_sigma_update_interval\": "
-      << run_cfg.igr_opts.sigma_update_interval << ",\n";
+      << ResolveEffectiveIGRSigmaUpdateInterval(run_cfg) << ",\n";
+  out << "    \"igr_alpha_length_policy\": "
+      << detail::ToJsonString(IGRAlphaLengthScalePolicyToString(
+           ResolveIGRAlphaLengthScalePolicy(run_cfg)))
+      << ",\n";
   out << "    \"igr_stage_rtol_scale\": " << run_cfg.igr_opts.stage_rtol_scale
       << ",\n";
   out << "    \"igr_lin_rtol\": "
@@ -265,12 +316,94 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << ",\n";
   out << "    \"zhang_shu_points\": "
       << detail::ToJsonString(run_cfg.opts.zhang_shu_points) << ",\n";
+  out << "    \"zhang_shu_vtk_points\": "
+      << (run_cfg.opts.zhang_shu_vtk_points ? "true" : "false") << ",\n";
+  const std::optional<mfem::real_t> configured_ssp_coefficient =
+    SSPCoefficientForTimeIntegrator(run_cfg.time_integrator);
+  const bool explicit_ssprk = configured_ssp_coefficient.has_value();
+  const bool cfl_diagnostics_observed =
+    explicit_ssprk && summary != nullptr && summary->cfl_diagnostics_observed;
+  const bool cfl_control_enabled =
+    explicit_ssprk &&
+    (cfl_diagnostics_observed ? summary->cfl_control_enabled
+                              : run_cfg.opts.cfl > 0.0);
+  const mfem::real_t cfl_safety_factor =
+    explicit_ssprk
+      ? (cfl_diagnostics_observed ? summary->cfl_safety_factor
+                                  : run_cfg.opts.cfl)
+      : std::numeric_limits<mfem::real_t>::quiet_NaN();
+  const mfem::real_t ssp_coefficient =
+    explicit_ssprk
+      ? (cfl_diagnostics_observed ? summary->ssp_coefficient
+                                  : *configured_ssp_coefficient)
+      : std::numeric_limits<mfem::real_t>::quiet_NaN();
+  const mfem::real_t ssp_scaled_cfl_factor =
+    cfl_control_enabled
+      ? (cfl_diagnostics_observed ? summary->ssp_scaled_cfl_factor
+                                  : cfl_safety_factor * ssp_coefficient)
+      : std::numeric_limits<mfem::real_t>::quiet_NaN();
+  const mfem::real_t nominal_global_courant =
+    cfl_control_enabled
+      ? (cfl_diagnostics_observed
+           ? summary->nominal_global_courant
+           : (run_cfg.opts.order >= 0
+                ? ssp_scaled_cfl_factor /
+                    static_cast<mfem::real_t>(2 * run_cfg.opts.order + 1)
+                : std::numeric_limits<mfem::real_t>::quiet_NaN()))
+      : std::numeric_limits<mfem::real_t>::quiet_NaN();
+  // Retain the historical raw-option key. In metadata schema 3 it is the
+  // direct --cfl-number input; the explicit SSPRK factors below remove the
+  // ambiguity present in older schemas.
   out << "    \"cfl\": " << run_cfg.opts.cfl << ",\n";
+  out << "    \"cfl_field_semantics\": "
+      << detail::ToJsonString(
+           explicit_ssprk ? "integrator-normalized-safety-factor"
+                          : "backend-specific-raw-input")
+      << ",\n";
+  out << "    \"cfl_control_enabled\": "
+      << (cfl_control_enabled ? "true" : "false") << ",\n";
+  out << "    \"cfl_safety_factor\": "
+      << detail::ToJsonNumber(cfl_safety_factor)
+      << ",\n";
+  out << "    \"ssp_coefficient\": "
+      << detail::ToJsonNumber(ssp_coefficient)
+      << ",\n";
+  out << "    \"ssp_scaled_cfl_factor\": "
+      << detail::ToJsonNumber(ssp_scaled_cfl_factor) << ",\n";
+  out << "    \"nominal_global_courant\": "
+      << detail::ToJsonNumber(nominal_global_courant) << ",\n";
+  out << "    \"cfl_diagnostics_observed\": "
+      << (cfl_diagnostics_observed ? "true" : "false") << ",\n";
+  out << "    \"cfl_diagnostics_source\": "
+      << detail::ToJsonString(
+           cfl_diagnostics_observed
+             ? "run-summary"
+             : (explicit_ssprk ? "requested-config" : "not-applicable"))
+      << ",\n";
+  out << "    \"cfl_convention\": "
+      << detail::ToJsonString(
+           cfl_control_enabled
+             ? "explicit-ssprk-safety-factor"
+             : (explicit_ssprk ? "explicit-fixed-step" : "backend-specific"))
+      << ",\n";
+  out << "    \"cfl_formula\": "
+      << (cfl_control_enabled
+            ? detail::ToJsonString(
+                "dt=cfl_safety_factor*ssp_coefficient*h_min/"
+                "((2p+1)*lambda_max)")
+            : "null")
+      << ",\n";
   out << "    \"dt\": " << run_cfg.opts.dt << ",\n";
   out << "    \"dt_min\": " << run_cfg.opts.dt_min << ",\n";
   out << "    \"t_final\": " << run_cfg.opts.t_final << ",\n";
   out << "    \"nan_scan\": " << (run_cfg.opts.nan_scan ? "true" : "false")
       << ",\n";
+  out << "    \"conservation_balance\": "
+      << (run_cfg.opts.conservation_balance ? "true" : "false") << ",\n";
+  out << "    \"static_source_present\": "
+      << (static_source ? "true" : "false") << ",\n";
+  out << "    \"static_source_fingerprint\": "
+      << detail::ToJsonString(static_source_fingerprint) << ",\n";
   out << "    \"save_state_files\": "
       << (run_cfg.opts.save_state_files ? "true" : "false") << ",\n";
   out << "    \"vtk_h1_diagnostics\": "
@@ -308,8 +441,32 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   {
     out << "    \"steps\": " << summary->steps << ",\n";
     out << "    \"segment_steps\": " << summary->segment_steps << ",\n";
+    out << "    \"accepted_attempts\": " << summary->accepted_attempts
+        << ",\n";
+    out << "    \"rejected_attempts\": " << summary->rejected_attempts
+        << ",\n";
+    out << "    \"rejected_limiter_elements\": "
+        << summary->rejected_limiter_elements << ",\n";
+    out << "    \"rhs_evaluations\": " << summary->rhs_evaluations
+        << ",\n";
     out << "    \"initial_time\": " << summary->initial_time << ",\n";
     out << "    \"final_time\": " << summary->final_time << ",\n";
+    out << "    \"minimum_attempted_dt\": "
+        << summary->minimum_attempted_dt << ",\n";
+    out << "    \"minimum_accepted_dt\": " << summary->minimum_accepted_dt
+        << ",\n";
+    out << "    \"maximum_attempted_dt\": "
+        << summary->maximum_attempted_dt << ",\n";
+    out << "    \"maximum_accepted_dt\": "
+        << summary->maximum_accepted_dt << ",\n";
+    out << "    \"maximum_accepted_step_growth_ratio\": "
+        << summary->maximum_accepted_step_growth_ratio << ",\n";
+    out << "    \"dt_min_reached\": "
+        << (summary->dt_min_reached ? "true" : "false") << ",\n";
+    out << "    \"success\": " << (summary->success ? "true" : "false")
+        << ",\n";
+    out << "    \"termination_reason\": "
+        << detail::ToJsonString(summary->termination_reason) << ",\n";
     out << "    \"elapsed\": " << summary->elapsed << ",\n";
     out << "    \"avg_step\": " << summary->avg_step << ",\n";
     out << "    \"avg_step_per_dof_local\": " << summary->avg_step_per_dof_local
@@ -324,15 +481,27 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   {
     out << "    \"steps\": 0,\n";
     out << "    \"segment_steps\": 0,\n";
+    out << "    \"accepted_attempts\": 0,\n";
+    out << "    \"rejected_attempts\": 0,\n";
+    out << "    \"rejected_limiter_elements\": 0,\n";
+    out << "    \"rhs_evaluations\": 0,\n";
     out << "    \"initial_time\": 0.0,\n";
     out << "    \"final_time\": 0.0,\n";
+    out << "    \"minimum_attempted_dt\": 0.0,\n";
+    out << "    \"minimum_accepted_dt\": 0.0,\n";
+    out << "    \"maximum_attempted_dt\": 0.0,\n";
+    out << "    \"maximum_accepted_dt\": 0.0,\n";
+    out << "    \"maximum_accepted_step_growth_ratio\": 0.0,\n";
+    out << "    \"dt_min_reached\": false,\n";
+    out << "    \"success\": false,\n";
+    out << "    \"termination_reason\": \"not-started\",\n";
     out << "    \"elapsed\": 0.0,\n";
     out << "    \"avg_step\": 0.0,\n";
     out << "    \"avg_step_per_dof_local\": 0.0,\n";
     out << "    \"avg_step_per_dof_rank\": 0.0,\n";
     out << "    \"local_dofs\": 0,\n";
     out << "    \"global_dofs\": 0,\n";
-    out << "    \"ranks\": " << mfem::Mpi::WorldSize() << "\n";
+    out << "    \"ranks\": " << communicator_size << "\n";
   }
   out << "  },\n";
 

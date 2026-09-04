@@ -11,6 +11,9 @@
 namespace mfem
 {
 
+inline constexpr double kEulerBoundaryDensityFloor = 1.0e-12;
+inline constexpr double kEulerBoundaryPressureFloor = 1.0e-12;
+
 /**
  * @brief Physical exterior-state mappings shared by DG and HDG boundary code.
  *
@@ -36,7 +39,11 @@ void EvaluateEulerExteriorState(EulerExteriorStateKind kind,
                                 double gamma,
                                 const mfem::Vector* reference_state,
                                 double pressure_out,
-                                mfem::Vector& Uplus);
+                                mfem::Vector& Uplus,
+                                double density_floor =
+                                  kEulerBoundaryDensityFloor,
+                                double pressure_floor =
+                                  kEulerBoundaryPressureFloor);
 
 /**
  * @brief Abstract boundary “ghost state” policy for DG hyperbolic problems.
@@ -118,7 +125,12 @@ public:
 class SubsonicOutletPressureState : public BoundaryState
 {
 public:
-  SubsonicOutletPressureState(int dim, double gamma, double pressure_out);
+  SubsonicOutletPressureState(
+    int dim,
+    double gamma,
+    double pressure_out,
+    double density_floor = kEulerBoundaryDensityFloor,
+    double pressure_floor = kEulerBoundaryPressureFloor);
 
   void Eval(const mfem::Vector& Uminus,
             const mfem::Vector& nor,
@@ -128,11 +140,15 @@ public:
   int GetDimension() const { return dim_; }
   double GetGamma() const { return gamma_; }
   double GetOutletPressure() const { return p_out_; }
+  double GetDensityFloor() const { return density_floor_; }
+  double GetPressureFloor() const { return pressure_floor_; }
 
 private:
   int dim_ = 0;
   double gamma_ = 1.4;
   double p_out_ = 1.0;
+  double density_floor_ = kEulerBoundaryDensityFloor;
+  double pressure_floor_ = kEulerBoundaryPressureFloor;
 };
 
 /**
@@ -146,7 +162,12 @@ private:
 class NonReflectingOutletState : public BoundaryState
 {
 public:
-  NonReflectingOutletState(const mfem::Vector& Uref, int dim, double gamma);
+  NonReflectingOutletState(
+    const mfem::Vector& Uref,
+    int dim,
+    double gamma,
+    double density_floor = kEulerBoundaryDensityFloor,
+    double pressure_floor = kEulerBoundaryPressureFloor);
 
   void Eval(const mfem::Vector& Uminus,
             const mfem::Vector& nor,
@@ -156,11 +177,15 @@ public:
   const mfem::Vector& GetReferenceState() const { return Uref_; }
   int GetDimension() const { return dim_; }
   double GetGamma() const { return gamma_; }
+  double GetDensityFloor() const { return density_floor_; }
+  double GetPressureFloor() const { return pressure_floor_; }
 
 private:
   mfem::Vector Uref_;
   int dim_ = 0;
   double gamma_ = 1.4;
+  double density_floor_ = kEulerBoundaryDensityFloor;
+  double pressure_floor_ = kEulerBoundaryPressureFloor;
 };
 
 /**
@@ -173,7 +198,12 @@ private:
 class SubsonicInletState : public BoundaryState
 {
 public:
-  SubsonicInletState(const mfem::Vector& Uin, int dim, double gamma);
+  SubsonicInletState(
+    const mfem::Vector& Uin,
+    int dim,
+    double gamma,
+    double density_floor = kEulerBoundaryDensityFloor,
+    double pressure_floor = kEulerBoundaryPressureFloor);
 
   void Eval(const mfem::Vector& Uminus,
             const mfem::Vector& nor,
@@ -183,11 +213,15 @@ public:
   const mfem::Vector& GetInletState() const { return Uin_; }
   int GetDimension() const { return dim_; }
   double GetGamma() const { return gamma_; }
+  double GetDensityFloor() const { return density_floor_; }
+  double GetPressureFloor() const { return pressure_floor_; }
 
 private:
   mfem::Vector Uin_;
   int dim_ = 0;
   double gamma_ = 1.4;
+  double density_floor_ = kEulerBoundaryDensityFloor;
+  double pressure_floor_ = kEulerBoundaryPressureFloor;
 };
 
 /**
@@ -199,7 +233,12 @@ private:
 class FarFieldState : public BoundaryState
 {
 public:
-  FarFieldState(const mfem::Vector& Ufar, int dim, double gamma);
+  FarFieldState(
+    const mfem::Vector& Ufar,
+    int dim,
+    double gamma,
+    double density_floor = kEulerBoundaryDensityFloor,
+    double pressure_floor = kEulerBoundaryPressureFloor);
 
   void Eval(const mfem::Vector& Uminus,
             const mfem::Vector& nor,
@@ -209,11 +248,15 @@ public:
   const mfem::Vector& GetFarFieldState() const { return Ufar_; }
   int GetDimension() const { return dim_; }
   double GetGamma() const { return gamma_; }
+  double GetDensityFloor() const { return density_floor_; }
+  double GetPressureFloor() const { return pressure_floor_; }
 
 private:
   mfem::Vector Ufar_;
   int dim_ = 0;
   double gamma_ = 1.4;
+  double density_floor_ = kEulerBoundaryDensityFloor;
+  double pressure_floor_ = kEulerBoundaryPressureFloor;
 };
 
 /**
@@ -226,7 +269,10 @@ private:
 class SlipWallState : public BoundaryState
 {
 public:
-  explicit SlipWallState(int dim);
+  explicit SlipWallState(
+    int dim,
+    double density_floor = kEulerBoundaryDensityFloor,
+    double pressure_floor = kEulerBoundaryPressureFloor);
 
   void Eval(const mfem::Vector& Uminus,
             const mfem::Vector& nor,
@@ -234,9 +280,13 @@ public:
             mfem::Vector& Uplus) const override;
 
   int GetDimension() const { return dim_; }
+  double GetDensityFloor() const { return density_floor_; }
+  double GetPressureFloor() const { return pressure_floor_; }
 
 private:
   int dim_;
+  double density_floor_ = kEulerBoundaryDensityFloor;
+  double pressure_floor_ = kEulerBoundaryPressureFloor;
 };
 
 } // namespace mfem

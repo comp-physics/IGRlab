@@ -11,6 +11,9 @@ void DGHyperbolicConservationLaws::BuildWeakDivApplyData_()
   face_data_dirty_ = true;
   weakdiv_elem_dof_ = 0;
   weakdiv_data_flat_.SetSize(0);
+  weakdiv_volume_speed_.SetSize(0);
+  weakdiv_q_sigma_telemetry_.SetSize(0);
+  weakdiv_volume_speed_reduce_workspace_.SetSize(0);
 
   if (weakdiv.empty() || !invmass_apply_ready_)
   {
@@ -50,6 +53,14 @@ void DGHyperbolicConservationLaws::BuildWeakDivApplyData_()
   }
 
   weakdiv_elem_dof_ = dof;
+  const auto* flux_igr = dynamic_cast<const FluxWithIGR*>(
+    &formIntegrator->GetFluxFunction());
+  if (flux_igr && flux_igr->GetSigmaField() &&
+      flux_igr->GetInvariantDomainFlux())
+  {
+    dg_igr_detail::InitializeFrozenSigmaTelemetry(
+      weakdiv_q_sigma_telemetry_, ne * dof);
+  }
   weakdiv_apply_ready_ = true;
 
   // Sigma interpolation cache depends on the state-node layout; invalidate.
@@ -155,12 +166,15 @@ bool DGHyperbolicConservationLaws::BuildWeakDivSigmaData_(
   return true;
 }
 
-void DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
+real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   const Vector& x_in,
   Vector& z_inout,
   bool use_sigma,
   const ParGridFunction* sigma_field,
-  real_t sigma_rho_floor) const
+  real_t sigma_rho_floor,
+  real_t invariant_domain_pressure_floor,
+  bool invariant_domain_flux,
+  bool track_volume_speed) const
 {
   MFEM_VERIFY(weakdiv_apply_ready_ && invmass_apply_ready_,
               "Packed weak-divergence device path requires packed element maps.");
@@ -188,7 +202,22 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
     sigma_ldof = weakdiv_sigma_ldof_;
   }
 
+  if (invariant_domain_flux &&
+      weakdiv_q_sigma_telemetry_.Size() !=
+        ne * dof * dg_igr_detail::kFrozenSigmaTelemetryWidth)
+  {
+    dg_igr_detail::InitializeFrozenSigmaTelemetry(
+      weakdiv_q_sigma_telemetry_, ne * dof);
+  }
+  MFEM_VERIFY(!track_volume_speed || invariant_domain_flux,
+              "Volume-node speed tracking is restricted to exact "
+              "invariant-domain Euler+IGR fluxes.");
+
 #ifdef DG_IGR_HAS_ACCEL_FORALL
+  if (track_volume_speed && weakdiv_volume_speed_.Size() != ne)
+  {
+    weakdiv_volume_speed_.SetSize(ne);
+  }
   PackedWeakDivEulerKernel kernel;
   kernel.dof = dof;
   kernel.neq = neq;
@@ -197,11 +226,18 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   kernel.sigma_ldof = sigma_ldof;
   kernel.gamma = dgsem_gamma_;
   kernel.sigma_rho_floor = sigma_rho_floor;
+  kernel.invariant_domain_pressure_floor = invariant_domain_pressure_floor;
   kernel.use_sigma = use_sigma;
+  kernel.invariant_domain_flux = invariant_domain_flux;
+  kernel.track_volume_speed = track_volume_speed;
   kernel.state_map = invmass_elem_vdof_map_.Read();
   kernel.weakdiv = weakdiv_data_flat_.Read();
   kernel.x = x_in.Read();
   kernel.z = z_inout.ReadWrite();
+  kernel.volume_speed =
+    track_volume_speed ? weakdiv_volume_speed_.Write() : nullptr;
+  kernel.q_sigma_telemetry =
+    invariant_domain_flux ? weakdiv_q_sigma_telemetry_.ReadWrite() : nullptr;
   kernel.sigma_map = sigma_map;
   kernel.sigma_interp = sigma_interp;
   kernel.sigma_vals = sigma_vals;
@@ -215,6 +251,15 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
   auto sigma_interp_h = weakdiv_sigma_interp_.HostRead();
   auto sigma_vals_h =
     use_sigma ? sigma_field->HostRead() : static_cast<const real_t*>(nullptr);
+  if (track_volume_speed && weakdiv_volume_speed_.Size() != ne)
+  {
+    weakdiv_volume_speed_.SetSize(ne);
+  }
+  real_t* const volume_speed_h =
+    track_volume_speed ? weakdiv_volume_speed_.HostWrite() : nullptr;
+  double* const q_sigma_telemetry_h =
+    invariant_domain_flux ? weakdiv_q_sigma_telemetry_.HostReadWrite()
+                          : nullptr;
 
   const int energy_eq = 1 + dim;
   const real_t gm1 = dgsem_gamma_ - 1.0;
@@ -224,6 +269,7 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
     const int weak_off = e * dof * dof * dim;
     const int sigma_map_off = e * sigma_ldof;
     const int sigma_interp_off = e * dof * sigma_ldof;
+    real_t element_max_speed = 0.0;
 
     for (int j = 0; j < dof; ++j)
     {
@@ -253,6 +299,47 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
       }
       const real_t inv_rho_sigma =
         (use_sigma ? 1.0 / std::max(rho, sigma_rho_floor) : 0.0);
+      if (invariant_domain_flux)
+      {
+        constexpr int telemetry_width =
+          dg_igr_detail::kFrozenSigmaTelemetryWidth;
+        double* const slot =
+          q_sigma_telemetry_h + (e * dof + j) * telemetry_width;
+        const double q_sigma = static_cast<double>(dgsem_gamma_) * pressure +
+          (static_cast<double>(dgsem_gamma_) - 1.0) * sigma_j;
+        const double ratio =
+          q_sigma / (static_cast<double>(dgsem_gamma_) * pressure);
+        slot[0] += 1.0;
+        if (!std::isfinite(q_sigma) || !std::isfinite(ratio))
+        {
+          slot[2] += 1.0;
+        }
+        if (std::isfinite(q_sigma))
+        {
+          slot[1] += q_sigma <= 0.0 ? 1.0 : 0.0;
+          slot[3] = std::min(slot[3], q_sigma);
+        }
+        if (std::isfinite(ratio))
+        {
+          slot[4] = std::min(slot[4], ratio);
+        }
+      }
+      if (track_volume_speed)
+      {
+        const real_t transport_speed = std::sqrt(mom2) * inv_rho;
+        const real_t base_speed =
+          transport_speed + std::sqrt(dgsem_gamma_ * pressure * inv_rho);
+        const real_t nodal_speed =
+          IGRFluxInvariantDomainSpeed(base_speed,
+                                      rho,
+                                      pressure,
+                                      transport_speed,
+                                      sigma_j,
+                                      dgsem_gamma_,
+                                      sigma_rho_floor,
+                                      invariant_domain_pressure_floor);
+        element_max_speed = std::max(element_max_speed, nodal_speed);
+      }
 
       for (int i = 0; i < dof; ++i)
       {
@@ -300,6 +387,10 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
         zh[state_map[state_off + i * neq + energy_eq]] += sum_e;
       }
     }
+    if (track_volume_speed)
+    {
+      volume_speed_h[e] = element_max_speed;
+    }
   }
 #endif
 
@@ -312,15 +403,19 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
               << " backend=device\n";
     weakdiv_volume_path_logged_ = true;
   }
+  return track_volume_speed
+           ? ReduceFaceMaxSpeed_(weakdiv_volume_speed_,
+                                 weakdiv_volume_speed_reduce_workspace_)
+           : 0.0;
 }
 
-void DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
+real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
   const Vector& x_in,
   Vector& z_inout) const
 {
   if (weakdiv.empty())
   {
-    return;
+    return 0.0;
   }
 
   const FluxFunction& fluxFunction = formIntegrator->GetFluxFunction();
@@ -340,8 +435,11 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
                 "divergence only.");
 
     bool use_sigma = false;
+    bool invariant_domain_flux = false;
     const ParGridFunction* sigma_field = nullptr;
     real_t sigma_rho_floor = 1.0e-12;
+    real_t invariant_domain_pressure_floor =
+      dg_igr::LimiterDefaults::kPMin;
     if (flux_igr && flux_igr->GetSigmaField())
     {
       sigma_field = flux_igr->GetSigmaField();
@@ -350,15 +448,134 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
                   "metadata on device.");
       use_sigma = true;
       sigma_rho_floor = flux_igr->GetVelocityRhoFloor();
+      invariant_domain_pressure_floor =
+        flux_igr->GetInvariantDomainPressureFloor();
+      invariant_domain_flux = flux_igr->GetInvariantDomainFlux();
+    }
+    MFEM_VERIFY(!invariant_domain_flux ||
+                  flux_igr->GetGamma() == dgsem_gamma_,
+                "Packed DG invariant-domain volume flux requires the "
+                "operator and FluxWithIGR to use one gamma.");
+
+    const bool track_volume_speed =
+      invariant_domain_volume_speed_tracking_ && use_sigma &&
+      invariant_domain_flux;
+    return AddPreassembledWeakDivergenceDeviceEuler_(
+      x_in,
+      z_inout,
+      use_sigma,
+      sigma_field,
+      sigma_rho_floor,
+      invariant_domain_pressure_floor,
+      invariant_domain_flux,
+      track_volume_speed);
+  }
+
+  const auto* host_flux_igr =
+    dynamic_cast<const FluxWithIGR*>(&fluxFunction);
+  const bool host_exact_mode =
+    host_flux_igr && host_flux_igr->GetSigmaField() &&
+    host_flux_igr->GetInvariantDomainFlux();
+  const bool track_host_volume_speed =
+    invariant_domain_volume_speed_tracking_ && host_exact_mode;
+  int host_volume_sample_slots = 0;
+  if (host_exact_mode)
+  {
+    for (int e = 0; e < vfes.GetNE(); ++e)
+    {
+      host_volume_sample_slots += vfes.GetFE(e)->GetDof();
+    }
+    if (weakdiv_q_sigma_telemetry_.Size() !=
+        host_volume_sample_slots *
+          dg_igr_detail::kFrozenSigmaTelemetryWidth)
+    {
+      dg_igr_detail::InitializeFrozenSigmaTelemetry(
+        weakdiv_q_sigma_telemetry_, host_volume_sample_slots);
+    }
+  }
+  double* const host_volume_telemetry =
+    host_exact_mode ? weakdiv_q_sigma_telemetry_.HostReadWrite() : nullptr;
+
+  // FluxWithIGR::ComputeFlux returns its invariant-domain speed and therefore
+  // performs the additional characteristic square roots unconditionally.
+  // Reproduce its tensor flux directly so fixed-step host runs retain q_sigma
+  // telemetry without paying for a volume speed that no caller consumes.
+  const auto evaluate_host_volume_flux =
+    [&](const Vector& state,
+        ElementTransformation& transformation,
+        DenseMatrix& flux,
+        int telemetry_slot) -> real_t
+  {
+    if (!host_exact_mode)
+    {
+      fluxFunction.ComputeFlux(state, transformation, flux);
+      return 0.0;
     }
 
-    AddPreassembledWeakDivergenceDeviceEuler_(x_in,
-                                              z_inout,
-                                              use_sigma,
-                                              sigma_field,
-                                              sigma_rho_floor);
-    return;
-  }
+    const real_t base_speed = host_flux_igr->GetBaseFlux().ComputeFlux(
+      state, transformation, flux);
+    const real_t sigma = host_flux_igr->GetSigmaAtPoint(transformation);
+    const real_t rho_floor = host_flux_igr->GetVelocityRhoFloor();
+    ::dg_igr::frozen_scalar_igr_algebra::AddTensorSigmaFlux(
+      dim,
+      state.GetData(),
+      1,
+      sigma,
+      rho_floor,
+      flux.GetData(),
+      1,
+      flux.Height());
+
+    const real_t density = state(0);
+    const real_t safe_density = std::max(density, rho_floor);
+    real_t momentum_sq = 0.0;
+    for (int d = 0; d < dim; ++d)
+    {
+      momentum_sq += state(1 + d) * state(1 + d);
+    }
+    const real_t gamma = host_flux_igr->GetGamma();
+    const real_t pressure =
+      (gamma - 1.0) *
+      (state(1 + dim) - 0.5 * momentum_sq / safe_density);
+
+    constexpr int telemetry_width =
+      dg_igr_detail::kFrozenSigmaTelemetryWidth;
+    double* const slot =
+      host_volume_telemetry + telemetry_slot * telemetry_width;
+    const double q_sigma = static_cast<double>(gamma) * pressure +
+      (static_cast<double>(gamma) - 1.0) * sigma;
+    const double ratio = q_sigma / (static_cast<double>(gamma) * pressure);
+    slot[0] += 1.0;
+    if (!std::isfinite(q_sigma) || !std::isfinite(ratio))
+    {
+      slot[2] += 1.0;
+    }
+    if (std::isfinite(q_sigma))
+    {
+      slot[1] += q_sigma <= 0.0 ? 1.0 : 0.0;
+      slot[3] = std::min(slot[3], q_sigma);
+    }
+    if (std::isfinite(ratio))
+    {
+      slot[4] = std::min(slot[4], ratio);
+    }
+
+    if (!track_host_volume_speed)
+    {
+      return 0.0;
+    }
+    const real_t transport_speed =
+      std::sqrt(momentum_sq) / safe_density;
+    return IGRFluxInvariantDomainSpeed(
+      base_speed,
+      density,
+      pressure,
+      transport_speed,
+      sigma,
+      gamma,
+      rho_floor,
+      host_flux_igr->GetInvariantDomainPressureFloor());
+  };
 
   // Fast host path: use the packed node-major/equation-minor element map to
   // avoid per-element GetSubVector/SetSubVector staging.
@@ -375,6 +592,7 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
 
     Vector state(neq);
     DenseMatrix flux(neq, dim * dof);
+    real_t max_volume_speed = 0.0;
     for (int e = 0; e < ne; ++e)
     {
       ElementTransformation* Tr = vfes.GetElementTransformation(e);
@@ -396,7 +614,12 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
         const IntegrationPoint& ip = nodes.IntPoint(j);
         Tr->SetIntPoint(&ip);
         DenseMatrix flux_j(flux.GetData() + j * neq * dim, neq, dim);
-        fluxFunction.ComputeFlux(state, *Tr, flux_j);
+        const real_t node_speed =
+          evaluate_host_volume_flux(state, *Tr, flux_j, e * dof + j);
+        if (track_host_volume_speed)
+        {
+          max_volume_speed = std::max(max_volume_speed, node_speed);
+        }
       }
 
       for (int i = 0; i < dof; ++i)
@@ -427,7 +650,7 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
                 << " backend=device\n";
       weakdiv_volume_path_logged_ = true;
     }
-    return;
+    return max_volume_speed;
   }
 
   // Fallback for mixed element spaces where packed maps are unavailable.
@@ -437,6 +660,8 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
   DenseMatrix Zmat;
   Array<int> vdofs;
   Vector xval, zval;
+  real_t max_volume_speed = 0.0;
+  int telemetry_slot_offset = 0;
 
   for (int i = 0; i < vfes.GetNE(); ++i)
   {
@@ -462,13 +687,19 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
       DenseMatrix flux_j(flux.GetData() + j * num_equations * dim,
                          num_equations,
                          dim);
-      fluxFunction.ComputeFlux(state, *Tr, flux_j);
+      const real_t node_speed = evaluate_host_volume_flux(
+        state, *Tr, flux_j, telemetry_slot_offset + j);
+      if (track_host_volume_speed)
+      {
+        max_volume_speed = std::max(max_volume_speed, node_speed);
+      }
     }
 
     z_inout.GetSubVector(vdofs, zval);
     Zmat.UseExternalData(zval.GetData(), dof, num_equations);
     mfem::AddMult_a_ABt(1.0, weakdiv[i], flux, Zmat);
     z_inout.SetSubVector(vdofs, zval);
+    telemetry_slot_offset += dof;
   }
 
   if (Device::Allows(Backend::DEVICE_MASK) && !weakdiv_volume_path_logged_ &&
@@ -479,6 +710,7 @@ void DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
               << " backend=device\n";
     weakdiv_volume_path_logged_ = true;
   }
+  return max_volume_speed;
 }
 
 // -----------------------------------------------------------------------------

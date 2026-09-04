@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -361,6 +362,11 @@ int main(int argc, char** argv)
   }
 
   mfem::Mpi::Init(argc, argv);
+  std::unique_ptr<mfem::Device> requested_device;
+  if (const char* device = std::getenv("DG_IGR_TEST_DEVICE"))
+  {
+    requested_device = std::make_unique<mfem::Device>(device);
+  }
   mfem::Hypre::Init();
 
   dg_igr_tests::TestContext ctx;
