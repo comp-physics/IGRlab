@@ -14,6 +14,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -972,6 +973,16 @@ inline void RunDGSEMProductionSplitCommunicatorTests(TestContext& ctx)
   {
     return;
   }
+
+#if defined(HYPRE_USING_UMPIRE_DEVICE)
+  // Four tiny MPI ranks share one CI GPU in this probe.  Size HYPRE's
+  // growable device pool before its first allocation so four default 4 GiB
+  // pools do not exhaust the device merely while constructing ParFES data.
+  const HYPRE_Int pool_status = HYPRE_SetUmpireDevicePoolSize(
+    std::size_t{256} * 1024 * 1024);
+  ctx.Check(pool_status == 0,
+            "DGSEM split probe configures its test-only HYPRE device pool");
+#endif
 
   int world_rank = 0;
   MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);

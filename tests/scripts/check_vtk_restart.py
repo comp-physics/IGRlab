@@ -489,7 +489,13 @@ def run_negative_controls(
     failure(no_exact_face, env, root, "missing-exact-face", r"requires exact DG faces")
 
     thinned_sigma = [*restart, "--igr-sigma-cadence", "every-step"]
-    failure(thinned_sigma, env, root, "thinned-sigma", r"requires every-stage")
+    failure(
+        thinned_sigma,
+        env,
+        root,
+        "thinned-sigma",
+        r"supports only every-stage or extrapolated-every-step",
+    )
 
     changed_solver = list(restart)
     changed_solver[changed_solver.index("-irtol") + 1] = "1.0e-6"
