@@ -1593,7 +1593,8 @@ void ApplyInverseMassDevice(int ne,
 {
   const int rows = ne * dof;
   MFEM_VERIFY(ne >= 0 && dof > 0 && inverse_mass.Height() == rows &&
-                inverse_mass.Width() == dof && weak.Height() == rows,
+                (inverse_mass.Width() == dof || inverse_mass.Width() == 1) &&
+                weak.Height() == rows,
               "DGSEM device inverse-mass size mismatch.");
   const int num_equations = weak.Width();
   if (strong.Height() != rows || strong.Width() != num_equations)
@@ -1604,6 +1605,16 @@ void ApplyInverseMassDevice(int ne,
   const real_t* mass = inverse_mass.Read();
   const real_t* input = weak.Read();
   real_t* output = strong.Write();
+
+  if (inverse_mass.Width() == 1)
+  {
+    mfem::forall(rows * num_equations,
+                 [=] MFEM_HOST_DEVICE(int entry)
+                 {
+                   output[entry] = mass[entry % rows] * input[entry];
+                 });
+    return;
+  }
 
   mfem::forall(rows * num_equations,
                [=] MFEM_HOST_DEVICE(int entry)

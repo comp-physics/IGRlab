@@ -64,6 +64,11 @@ endif()
 # Create library
 add_library(igr_mfem STATIC ${SOURCES})
 
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+    target_sources(igr_mfem PRIVATE physics/igr/IGR_dense_inverse_cuda.cu)
+    target_compile_definitions(igr_mfem PRIVATE DG_IGR_HAS_DENSE_INVERSE_CUDA=1)
+endif()
+
 set(_dg_igr_default_accel_sources "")
 if(DG_IGR_ACCELERATOR_LANGUAGE)
     list(APPEND _dg_igr_default_accel_sources

@@ -686,6 +686,10 @@ private:
   SolveMode solve_mode_ = SolveMode::Krylov;
   LinearSolverType lin_solver_type_ = LinearSolverType::Auto;
   PrecondType prec_type_ = PrecondType::Auto;
+  // Opt-in CUDA research preconditioner; current closure operators still
+  // rebuild every stage. This cache owns only the first operator's inverse.
+  std::unique_ptr<mfem::Solver> dense_inverse_preconditioner_;
+  std::string dense_inverse_precision_;
   NonconvergencePolicy nonconvergence_policy_ =
     NonconvergencePolicy::Accept;
   int amg_coarsen_type_ = -1;

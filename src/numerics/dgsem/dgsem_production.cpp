@@ -561,7 +561,8 @@ ValidateDGSEMProductionMetadata(const DGSEMProductionMetadataView& m)
   }
 
   if (!m.inverse_mass || m.inverse_mass->Height() != rows ||
-      m.inverse_mass->Width() != m.dofs_per_element)
+      (m.inverse_mass->Width() != m.dofs_per_element &&
+       m.inverse_mass->Width() != 1))
   {
     return DGSEMProductionReason::InvalidMetric;
   }
@@ -569,7 +570,7 @@ ValidateDGSEMProductionMetadata(const DGSEMProductionMetadataView& m)
   for (int row = 0; row < rows; ++row)
   {
     real_t row_norm = 0.0;
-    for (int j = 0; j < m.dofs_per_element; ++j)
+    for (int j = 0; j < m.inverse_mass->Width(); ++j)
     {
       const real_t value = inverse[row + rows * j];
       if (!Finite(value))
@@ -2164,8 +2165,38 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       c.lex_to_local[lex] = local;
     }
 
+    // LGL quadrature is collocated, so the assembled inverse mass is normally
+    // exactly diagonal. Inspect the supplied matrices once and retain the
+    // dense representation if any off-diagonal entry is nonzero; no tolerance
+    // or change to the mass discretization is involved.
+    bool diagonal_inverse_mass = true;
+    for (int e = 0; e < c.ne; ++e)
+    {
+      if (e >= static_cast<int>(op_->invmass.size()) ||
+          op_->invmass[static_cast<std::size_t>(e)].Height() != c.dof ||
+          op_->invmass[static_cast<std::size_t>(e)].Width() != c.dof)
+      {
+        // Defer rejection until after the element topology checks below, so
+        // mixed-order and malformed-map diagnostics keep their precedence.
+        diagonal_inverse_mass = false;
+        continue;
+      }
+      const DenseMatrix& inverse = op_->invmass[static_cast<std::size_t>(e)];
+      for (int j = 0; diagonal_inverse_mass && j < c.dof; ++j)
+      {
+        for (int i = 0; i < c.dof; ++i)
+        {
+          if (i != j && inverse(i, j) != 0.0)
+          {
+            diagonal_inverse_mass = false;
+            break;
+          }
+        }
+      }
+    }
+
     c.element_vdofs.SetSize(c.rows * c.equations);
-    c.inverse_mass.SetSize(c.rows, c.dof);
+    c.inverse_mass.SetSize(c.rows, diagonal_inverse_mass ? 1 : c.dof);
     c.coordinates.SetSize(c.rows, op_->dim);
     Array<int> vdofs;
     Vector physical(op_->dim);
@@ -2224,10 +2255,11 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       }
       for (int i = 0; i < c.dof; ++i)
       {
-        for (int j = 0; j < c.dof; ++j)
+        for (int j = 0; j < c.inverse_mass.Width(); ++j)
         {
           c.inverse_mass(e * c.dof + i, j) =
-            op_->invmass[static_cast<std::size_t>(e)](i, j);
+            op_->invmass[static_cast<std::size_t>(e)](
+              i, diagonal_inverse_mass ? i : j);
         }
       }
       ElementTransformation* transformation =

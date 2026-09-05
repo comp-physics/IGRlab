@@ -790,6 +790,57 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
       max_inverse_mass_error =
         std::max(max_inverse_mass_error,
                  MaxDifference(device_strong, host_strong));
+
+      // The collocated mass has an exact compact representation. Exercise
+      // both device branches on identical data before introducing a truly
+      // dense matrix, so a diagonal-only implementation cannot pass parity.
+      mfem::DenseMatrix diagonal_mass(inverse_rows, 1);
+      for (int row = 0; row < inverse_rows; ++row)
+      {
+        diagonal_mass(row, 0) = inverse_mass(row, row % dof);
+      }
+      mfem::DenseMatrix diagonal_strong;
+      mfem::dgsem::ApplyInverseMassDevice(inverse_ne,
+                                          dof,
+                                          diagonal_mass,
+                                          weak,
+                                          diagonal_strong);
+      max_inverse_mass_error =
+        std::max(max_inverse_mass_error,
+                 MaxDifference(diagonal_strong, device_strong));
+
+      inverse_mass.HostReadWrite();
+      for (int row = 0; row < inverse_rows; ++row)
+      {
+        for (int j = 0; j < dof; ++j)
+        {
+          if (j != row % dof)
+          {
+            inverse_mass(row, j) = 0.015 * (1 + row + j) / dof;
+          }
+        }
+      }
+      mfem::dgsem::ApplyInverseMassDevice(inverse_ne,
+                                          dof,
+                                          inverse_mass,
+                                          weak,
+                                          device_strong);
+      for (int row = 0; row < inverse_rows; ++row)
+      {
+        for (int equation = 0; equation < num_equations; ++equation)
+        {
+          double value = 0.0;
+          for (int j = 0; j < dof; ++j)
+          {
+            value += inverse_mass(row, j) *
+                     weak((row / dof) * dof + j, equation);
+          }
+          host_strong(row, equation) = value;
+        }
+      }
+      max_inverse_mass_error =
+        std::max(max_inverse_mass_error,
+                 MaxDifference(device_strong, host_strong));
     }
 
     for (int face_order = 1; face_order <= 4; ++face_order)

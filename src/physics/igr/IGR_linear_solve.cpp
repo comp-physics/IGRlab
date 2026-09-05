@@ -4,6 +4,7 @@
 #include "utils/config/env_flags.hpp"
 #include "utils/profiling/nvtx.hpp"
 #include "IGR_internal_utils.hpp"
+#include "IGR_dense_inverse.hpp"
 #include "../../numerics/dg/DGFaceQuadratureKernels.hpp"
 
 #include <algorithm>
@@ -2188,6 +2189,16 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const bool is_dg = IsDGSpace(sfes_);
   const bool spd_ok = IsSPD_DefaultAssumption(sfes_, ip_kind_);
   const bool using_cuda = IsCudaBackendActive();
+  const char* dense_inverse_env = std::getenv("DG_IGR_IGR_DENSE_INVERSE");
+  const std::string dense_inverse_precision =
+    dense_inverse_env ? dense_inverse_env : "";
+  const bool using_dense_inverse = !dense_inverse_precision.empty();
+  MFEM_VERIFY(!using_dense_inverse || dense_inverse_precision == "fp64" ||
+                dense_inverse_precision == "fp32" ||
+                dense_inverse_precision == "tf32",
+              "DG_IGR_IGR_DENSE_INVERSE must be fp64|fp32|tf32 or unset.");
+  MFEM_VERIFY(!using_dense_inverse || using_cuda,
+              "DG_IGR_IGR_DENSE_INVERSE requires the CUDA backend.");
   const bool prev_linear_converged = last_linear_converged_;
   const double prev_linear_final_norm = last_linear_final_norm_;
 
@@ -2234,6 +2245,9 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   {
     solver_choice = is_dg ? LinearSolverType::GMRES : LinearSolverType::CG;
   }
+  MFEM_VERIFY(!using_dense_inverse || dense_inverse_precision == "fp64" ||
+                solver_choice == LinearSolverType::FGMRES,
+              "Mixed-precision dense inverse requires explicit FGMRES.");
 
   // Guardrail: do not use SPD-only Krylov methods when SPD assumptions fail.
   if (RequiresSPD(solver_choice) && !spd_ok)
@@ -2317,14 +2331,32 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
 
   const auto pc_setup_start = std::chrono::steady_clock::now();
   std::unique_ptr<KrylovTelemetryOperator> cheb_operator_telemetry;
-  std::unique_ptr<mfem::Solver> prec;
+  std::unique_ptr<mfem::Solver> owned_prec;
+  mfem::Solver* prec = nullptr;
   bool using_operator_jacobi = false;
   bool using_operator_jacobi_exact_face_diag = false;
   bool using_operator_chebyshev = false;
   bool using_operator_chebyshev_base = false;
   {
     ::dg_igr::NVTXRange pc_range("IGR/preconditioner-setup");
-    if (prec_choice == PrecondType::BoomerAMG)
+    if (using_dense_inverse)
+    {
+#if defined(DG_IGR_HAS_DENSE_INVERSE_CUDA)
+      if (!dense_inverse_preconditioner_)
+      {
+        dense_inverse_preconditioner_ =
+          MakeDenseInversePreconditioner(*A_op, dense_inverse_precision, comm);
+        dense_inverse_precision_ = dense_inverse_precision;
+      }
+      MFEM_VERIFY(dense_inverse_precision_ == dense_inverse_precision,
+                  "Cannot change dense inverse precision on a live solver.");
+      dense_inverse_preconditioner_->SetOperator(*A_op);
+      prec = dense_inverse_preconditioner_.get();
+#else
+      MFEM_ABORT("Dense inverse experiment requires a CUDA build.");
+#endif
+    }
+    else if (prec_choice == PrecondType::BoomerAMG)
     {
       MFEM_VERIFY(A_hypre != nullptr,
                   "BoomerAMG preconditioner requires a Hypre matrix operator.");
@@ -2349,7 +2381,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       {
         amg->SetStrengthThresh(amg_strong_threshold_);
       }
-      prec = std::move(amg);
+      owned_prec = std::move(amg);
     }
     else if (prec_choice == PrecondType::HypreILU)
     {
@@ -2360,7 +2392,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       ilu->SetMaxIter(1);
       ilu->SetTol(0.0);
       ilu->SetOperator(*A_hypre);
-      prec = std::move(ilu);
+      owned_prec = std::move(ilu);
     }
     else if (prec_choice == PrecondType::HypreEuclid)
     {
@@ -2368,7 +2400,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                   "HypreEuclid preconditioner requires a Hypre matrix operator.");
       auto euclid = std::make_unique<mfem::HypreEuclid>(*A_hypre);
       euclid->SetStats(0);
-      prec = std::move(euclid);
+      owned_prec = std::move(euclid);
     }
     else if (prec_choice == PrecondType::ParaSails)
     {
@@ -2376,7 +2408,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                   "ParaSails preconditioner requires a Hypre matrix operator.");
       auto parasails = std::make_unique<mfem::HypreParaSails>(*A_hypre);
       parasails->SetLogging(0);
-      prec = std::move(parasails);
+      owned_prec = std::move(parasails);
     }
     else if (prec_choice == PrecondType::HypreSmoother)
     {
@@ -2402,7 +2434,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
           break;
         }
         sm->SetPositiveDiagonal(true);
-        prec = std::move(sm);
+        owned_prec = std::move(sm);
       }
       else
       {
@@ -2413,12 +2445,12 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
             false);
         if (use_exact_face_diag)
         {
-          prec = MakePositiveOperatorJacobi(*A_op, ess_tdof_list_);
+          owned_prec = MakePositiveOperatorJacobi(*A_op, ess_tdof_list_);
           using_operator_jacobi_exact_face_diag = true;
         }
         else
         {
-          prec = MakePositiveOperatorJacobi(*a_, ess_tdof_list_);
+          owned_prec = MakePositiveOperatorJacobi(*a_, ess_tdof_list_);
         }
         using_operator_jacobi = true;
       }
@@ -2517,11 +2549,12 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       last_chebyshev_setup_seconds_ = ElapsedSeconds(cheb_setup_start);
       total_chebyshev_setup_seconds_ += last_chebyshev_setup_seconds_;
       ++total_chebyshev_smoother_builds_;
-      prec = std::move(cheb);
+      owned_prec = std::move(cheb);
       using_operator_chebyshev = true;
       using_operator_chebyshev_base = use_base_operator;
     }
     // else None -> leave prec null
+    if (!using_dense_inverse) { prec = owned_prec.get(); }
   }
   const auto pc_setup_stop = std::chrono::steady_clock::now();
   last_pc_setup_seconds_ =
@@ -2646,7 +2679,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   std::unique_ptr<KrylovTelemetryOperator> solve_operator_telemetry;
   std::unique_ptr<KrylovTelemetryPreconditioner> telemetry_preconditioner;
   mfem::Operator* solve_operator = A_op;
-  mfem::Solver* solve_preconditioner = prec.get();
+  mfem::Solver* solve_preconditioner = prec;
   if (use_krylov_telemetry)
   {
     solve_operator_telemetry =
@@ -2964,6 +2997,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                               : (using_operator_jacobi
                                    ? "operatorjacobi"
                                    : PrecondTypeName(prec_choice)));
+  if (using_dense_inverse)
+  {
+    last_precond_name_ = "dense-inverse-" + dense_inverse_precision;
+  }
 
   const bool capture_linear_event =
     event_capture_enabled && !linear_event_capture_written_ &&

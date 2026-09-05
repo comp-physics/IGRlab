@@ -329,8 +329,10 @@ void IntegratePhysicalBoundaryFluxDevice(const Array<int>& ownership,
 
 /** Apply a packed batch of element inverse-mass matrices.
  *
- * `inverse_mass` has height `ne*dof` and width `dof`; row `e*dof+i` contains
- * row `i` of element `e`'s inverse matrix.
+ * `inverse_mass` has height `ne*dof`. Width `dof` stores row `i` of element
+ * `e`'s inverse matrix at row `e*dof+i`; width one stores only its diagonal.
+ * The compact representation is an exact algebraic optimization: callers
+ * must verify that every omitted off-diagonal entry is exactly zero.
  */
 void ApplyInverseMassDevice(int ne,
                             int dof,
