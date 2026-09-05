@@ -1,5 +1,6 @@
 #include "mfem.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -13,7 +14,11 @@
 namespace
 {
 
-using InoueHattoriStationaryShock1DYOptions = dg_sim::EmptyCaseOptions;
+struct InoueHattoriStationaryShock1DYOptions
+{
+  double shock_x = 0.0;
+  double shock_width = -1.0;
+};
 
 constexpr int kNx = 32;
 constexpr int kNy = 1;
@@ -27,7 +32,6 @@ constexpr double kYBottom = -20.0;
 constexpr double kYTop = 20.0;
 constexpr double kVortexX = 4.0;
 constexpr double kVortexY = 0.0;
-constexpr double kShockX = 0.0;
 
 std::string EnsureOneCellYMesh(const char* case_source_file)
 {
@@ -102,7 +106,16 @@ int main(int argc, char* argv[])
     cfg.igr_config.stage_rtol_scale = 10.0;
   };
 
-  spec.make_ic = [](const InoueHattoriStationaryShock1DYOptions&,
+  spec.add_options = [](mfem::OptionsParser& args,
+                        InoueHattoriStationaryShock1DYOptions& opts)
+  {
+    args.AddOption(&opts.shock_x, "-shock-x", "--shock-x",
+                   "Initial shock position in physical coordinates.");
+    args.AddOption(&opts.shock_width, "-shock-width", "--shock-width",
+                   "Physical initial tanh width; -1 retains the mesh-scaled default.");
+  };
+
+  spec.make_ic = [](const InoueHattoriStationaryShock1DYOptions& opts,
                     const dg_sim::ExampleContext& ctx,
                     double gamma)
   {
@@ -110,20 +123,33 @@ int main(int argc, char* argv[])
       ctx.run_cfg.opts.ser_ref_levels + ctx.run_cfg.opts.par_ref_levels;
     const int mx = kNx << total_ref;
     const int my = kNy << total_ref;
+    MFEM_VERIFY(std::isfinite(opts.shock_x) && opts.shock_x > kXLeft &&
+                  opts.shock_x < kXRight,
+                "Shock position must be finite and inside the domain.");
+    MFEM_VERIFY(std::isfinite(opts.shock_width) &&
+                  (opts.shock_width == -1.0 || opts.shock_width > 0.0),
+                "Shock width must be positive, or -1 for the default.");
+    const double base_width = std::min((kXRight - kXLeft) / mx,
+                                      (kYTop - kYBottom) / my);
+    MFEM_VERIFY(opts.shock_width == -1.0 || opts.shock_width >= 1.0e-6 * base_width,
+                "Requested width is below the shared initializer's smoothing floor.");
+    const double smoothing = opts.shock_width > 0.0
+                               ? opts.shock_width / base_width
+                               : kShockSmoothing;
 
     auto ic_fun = mfem::GetShockVortexInoueHattoriInitCustom(gamma,
                                                              mx,
                                                              my,
                                                              kShockMach,
                                                              kVortexMach,
-                                                             kShockSmoothing,
+                                                             smoothing,
                                                              kXLeft,
                                                              kXRight,
                                                              kYBottom,
                                                              kYTop,
                                                              kVortexX,
                                                              kVortexY,
-                                                             kShockX);
+                                                             opts.shock_x);
     return dg_sim::MakeVectorFunctionIC(4, ic_fun);
   };
 

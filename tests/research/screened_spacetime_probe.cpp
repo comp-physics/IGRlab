@@ -42,6 +42,9 @@ struct Work
   std::uint64_t residual_elements=0, face_fluxes=0, outer_exchanges=0;
   std::uint64_t certificate_calls=0, accepted_steps=0;
   std::uint64_t startup_rk4_steps=0;
+  std::uint64_t joint_factors=0, joint_jacobian_columns=0;
+  std::uint64_t joint_residual_calls=0, joint_iterations=0, joint_line_searches=0;
+  std::uint64_t attempted_steps=0, rejected_steps=0;
   double factor_flops=0, solve_flops=0, setup_seconds=0;
   std::size_t retained_factor_bytes=0;
 };
@@ -52,7 +55,9 @@ struct Options
   double closure_tolerance=1.e-10, state_tolerance=1.e-11;
   std::string initial_case="smooth", method="both";
   std::string sigma_predictor="constant", state_predictor="constant";
-  bool self_test=false;
+  int joint_block_elements=0, joint_block_offset=0, joint_rebuild=0, joint_max=40;
+  double alpha_power=0.;
+  bool alpha_from_h=false, self_test=false;
 };
 double Norm(const State& x)
 { long double s=0; for(double v:x){if(!std::isfinite(v))return INFINITY;
@@ -389,6 +394,147 @@ State PatchStep(const Problem& pr,const State& initial,const Stages& seed_u,
   return result;
 }
 
+// Joint current-equation residual: a coupled two-stage nonlinear solve. Sigma
+// is an unknown, so no elliptic factorization occurs inside an evaluation.
+// This small CPU screen intentionally charges finite-difference Jacobians.
+int JointIndex(const Problem& pr,int stage,int e,int component)
+{return (stage*pr.ne+e)*(4*pr.n+pr.p)+component;}
+State PackJoint(const Problem& pr,const Stages& u,const Stages& sigma)
+{
+  State z(2*pr.ne*(4*pr.n+pr.p));
+  for(int st=0;st<2;++st)for(int e=0;e<pr.ne;++e)
+  {
+    for(int i=0;i<4*pr.n;++i)z[JointIndex(pr,st,e,i)]=u[st][e*4*pr.n+i];
+    for(int i=0;i<pr.p;++i)z[JointIndex(pr,st,e,4*pr.n+i)]=sigma[st][e*pr.p+i];
+  }
+  return z;
+}
+void UnpackJoint(const Problem& pr,const State& z,Stages& u,Stages& sigma)
+{
+  for(int st=0;st<2;++st)
+  {
+    u[st].resize(pr.ne*pr.n*4);sigma[st].resize(pr.ne*pr.p);
+    for(int e=0;e<pr.ne;++e)
+    {
+      for(int i=0;i<4*pr.n;++i)u[st][e*4*pr.n+i]=z[JointIndex(pr,st,e,i)];
+      for(int i=0;i<pr.p;++i)sigma[st][e*pr.p+i]=z[JointIndex(pr,st,e,4*pr.n+i)];
+    }
+  }
+}
+State JointResidual(const Problem& pr,const State& initial,double dt,
+                    const State& z,Work& w,Certificate* certificate=nullptr)
+{
+  ++w.joint_residual_calls; // Count attempted evaluations, including admission failure.
+  Stages u,sigma,f,sr;UnpackJoint(pr,z,u,sigma);Certificate c{0,0};
+  for(int st=0;st<2;++st)
+  {
+    mfem::DenseMatrix a;State b;pr.Assemble(u[st],pr.ne,true,a,b,w);
+    sr[st]=b;
+    for(int i=0;i<a.Height();++i)
+    {sr[st][i]=-b[i];for(int j=0;j<a.Width();++j)sr[st][i]+=a(i,j)*sigma[st][j];}
+    c.closure=std::max(c.closure,Norm(sr[st])/std::max(Norm(b),1.e-20));
+    f[st]=pr.Residual(u[st],sigma[st],pr.ne,true,0,nullptr,nullptr,w);
+  }
+  Stages ur=u;
+  for(int st=0;st<2;++st)
+  {
+    for(std::size_t i=0;i<initial.size();++i)
+      ur[st][i]-=initial[i]+dt*(q[st][0]*f[0][i]+q[st][1]*f[1][i]);
+    c.state=std::max(c.state,Norm(ur[st])/std::max(Norm(initial),1.e-20));
+  }
+  if(certificate)*certificate=c;
+  return PackJoint(pr,ur,sr);
+}
+struct JointBlock
+{
+  std::vector<int> indices;mfem::DenseMatrix matrix;
+  std::unique_ptr<mfem::DenseMatrixInverse> inverse;
+};
+struct JointCache {std::vector<JointBlock> blocks;int age=0;double dt=-1;};
+void BuildJointFactors(const Problem& pr,const State& initial,double dt,
+                      const State& z,const State& residual,JointCache& cache,Work& w)
+{
+  const auto start=Clock::now();cache.blocks.clear();
+  const int count=pr.o.joint_block_elements?pr.o.joint_block_elements:pr.ne;
+  std::size_t bytes=0;
+  for(int first=0;first<pr.ne;first+=count)
+  {
+    cache.blocks.emplace_back();auto& block=cache.blocks.back();
+    for(int st=0;st<2;++st)for(int e=first;e<std::min(first+count,pr.ne);++e)
+      for(int i=0;i<4*pr.n+pr.p;++i)
+        block.indices.push_back(JointIndex(pr,st,pr.Mod(e+pr.o.joint_block_offset),i));
+    const int n=static_cast<int>(block.indices.size());block.matrix.SetSize(n);
+    for(int j=0;j<n;++j)
+    {
+      const int col=block.indices[j];State perturbed=z;
+      const double eps=2.e-7*std::max(std::abs(z[col]),.01);
+      perturbed[col]+=eps;
+      const State r=JointResidual(pr,initial,dt,perturbed,w);
+      for(int i=0;i<n;++i)block.matrix(i,j)=(r[block.indices[i]]-residual[block.indices[i]])/eps;
+      ++w.joint_jacobian_columns;
+    }
+    block.inverse=std::make_unique<mfem::DenseMatrixInverse>(block.matrix,false);
+    ++w.joint_factors;w.factor_flops+=2.*double(n)*n*n/3.;
+    bytes+=std::size_t(n)*n*sizeof(double);
+  }
+  cache.age=0;cache.dt=dt;w.retained_factor_bytes=std::max(w.retained_factor_bytes,bytes);
+  w.setup_seconds+=Wall(start);
+}
+bool JointPassed(const Problem& pr,const Certificate& c)
+{return c.closure<=pr.o.closure_tolerance && c.state<=pr.o.state_tolerance;}
+double JointMerit(const Problem& pr,const Certificate& c)
+{return std::hypot(c.closure/pr.o.closure_tolerance,c.state/pr.o.state_tolerance);}
+State JointStep(const Problem& pr,const State& initial,const Stages& seed_u,
+                const Stages& seed_sigma,double dt,JointCache& cache,
+                Work& w,Certificate& worst)
+{
+  State z=PackJoint(pr,seed_u,seed_sigma);Certificate current;
+  State residual=JointResidual(pr,initial,dt,z,w,&current);
+  const bool rebuild=cache.blocks.empty()||std::abs(cache.dt-dt)>1.e-14||
+    (pr.o.joint_rebuild>0&&cache.age>=pr.o.joint_rebuild);
+  if(!JointPassed(pr,current)&&rebuild)
+    BuildJointFactors(pr,initial,dt,z,residual,cache,w);
+  for(int iteration=0;!JointPassed(pr,current)&&iteration<pr.o.joint_max;++iteration)
+  {
+    State delta(z.size(),0.);
+    for(const auto& block:cache.blocks)
+    {
+      const int n=static_cast<int>(block.indices.size());State rb(n),db(n);
+      for(int i=0;i<n;++i)rb[i]=-residual[block.indices[i]];
+      mfem::Vector rv(rb.data(),n),dv(db.data(),n);block.inverse->Mult(rv,dv);
+      for(int i=0;i<n;++i)delta[block.indices[i]]=db[i];
+      w.solve_flops+=2.*double(n)*n;
+    }
+    bool accepted=false;
+    for(int line=0;line<12;++line)
+    {
+      ++w.joint_line_searches;const double fraction=std::ldexp(1.,-line);
+      State trial=z;for(std::size_t i=0;i<z.size();++i)trial[i]+=fraction*delta[i];
+      try
+      {
+        Certificate candidate;State rr=JointResidual(pr,initial,dt,trial,w,&candidate);
+        if(JointMerit(pr,candidate)<(1.-1.e-4*fraction)*JointMerit(pr,current)||JointPassed(pr,candidate))
+        {z.swap(trial);residual.swap(rr);current=candidate;accepted=true;break;}
+      }
+      catch(const std::runtime_error&){/* Failed admission is charged, never committed. */}
+    }
+    ++w.joint_iterations;
+    if(!accepted)
+    {worst.closure=std::max(worst.closure,current.closure);
+     worst.state=std::max(worst.state,current.state);
+     throw std::runtime_error("joint chord-Newton line search failed");}
+  }
+  worst.closure=std::max(worst.closure,current.closure);
+  worst.state=std::max(worst.state,current.state);
+  if(!JointPassed(pr,current))throw std::runtime_error("joint current-equation certification failed");
+  ++w.certificate_calls;++cache.age;
+  Stages u,sigma,f;UnpackJoint(pr,z,u,sigma);
+  for(int st=0;st<2;++st)f[st]=pr.Residual(u[st],sigma[st],pr.ne,true,0,nullptr,nullptr,w);
+  State result(initial.size());
+  for(std::size_t i=0;i<result.size();++i)result[i]=initial[i]+.5*dt*(f[0][i]+f[1][i]);
+  return result;
+}
+
 struct Result
 {
   State u,sigma;Work work;Certificate certificate{0,0};
@@ -427,13 +573,14 @@ Result Run(const Problem& pr,const std::string& method,double step)
   try
   {
     r.sigma=pr.ExactClosure(r.u,r.work);
-    std::vector<Anchor> history{{0.,r.u,r.sigma}};
+    std::vector<Anchor> history{{0.,r.u,r.sigma}};JointCache joint_cache;
     while(r.time<pr.o.final_time-1.e-14)
     {
       const double dt=std::min(step,pr.o.final_time-r.time);
       const bool use_history=pr.o.sigma_predictor=="history3" ||
           pr.o.state_predictor=="history3";
-      const bool startup=method=="patch" && use_history && history.size()<4;
+      const bool startup=(method=="patch"||method=="joint") && use_history && history.size()<4;
+      ++r.work.attempted_steps;
       State trial;
       if(method=="rk4" || startup)trial=RK4Step(pr,r.u,r.sigma,dt,r.work);
       else
@@ -447,7 +594,8 @@ Result Run(const Problem& pr,const std::string& method,double step)
           if(pr.o.state_predictor=="history3")
             seed_u[stage]=PredictHistory(history,time,false);
         }
-        trial=PatchStep(pr,r.u,seed_u,seed_sigma,dt,r.work,r.certificate,r.certified);
+        if(method=="joint")trial=JointStep(pr,r.u,seed_u,seed_sigma,dt,joint_cache,r.work,r.certificate);
+        else trial=PatchStep(pr,r.u,seed_u,seed_sigma,dt,r.work,r.certificate,r.certified);
       }
       // Instantaneous endpoint closure is always recomputed, including in
       // uncertified fixed-sweep ablations. A failed attempt is not committed.
@@ -461,7 +609,8 @@ Result Run(const Problem& pr,const std::string& method,double step)
     }
     r.complete=true;
   }
-  catch(const std::exception& error){r.failure=error.what();}
+  catch(const std::exception& error){r.failure=error.what();
+    r.work.rejected_steps=r.work.attempted_steps-r.work.accepted_steps;r.certified=false;}
   r.seconds=Wall(start);return r;
 }
 
@@ -484,8 +633,9 @@ void Print(const Problem& pr,const std::string& method,const Result& r,
     <<",\"halo\":"<<pr.o.halo<<",\"screen_length_over_h\":"<<std::sqrt(pr.o.alpha)/pr.h
     <<",\"inner_sweeps\":"<<pr.o.inner<<",\"fixed_outer\":"<<pr.o.fixed_outer
     <<",\"temporal_method\":\""<<(method=="rk4"?"rk4":
+       method=="joint-chord-Newton"?"joint-Gauss-chord-Newton":
        pr.o.inner==0?"cubic-history-Gauss-flux-quadrature":"space-time-Schwarz-collocation")<<"\""
-    <<",\"collocation_is_target_equation\":"<<(method!="rk4"&&pr.o.inner>0?"true":"false")
+    <<",\"collocation_is_target_equation\":"<<(method=="joint-chord-Newton"||(method!="rk4"&&pr.o.inner>0)?"true":"false")
     <<",\"sigma_predictor\":\""<<pr.o.sigma_predictor
     <<"\",\"state_predictor\":\""<<pr.o.state_predictor<<"\""
     <<",\"complete\":"<<(r.complete?"true":"false")
@@ -504,6 +654,17 @@ void Print(const Problem& pr,const std::string& method,const Result& r,
     <<",\"outer_waveform_exchanges\":"<<w.outer_exchanges
     <<",\"global_certificates\":"<<w.certificate_calls<<",\"accepted_steps\":"<<w.accepted_steps
     <<",\"startup_rk4_steps\":"<<w.startup_rk4_steps
+    <<",\"attempted_steps\":"<<w.attempted_steps<<",\"rejected_steps\":"<<w.rejected_steps
+    <<",\"joint_block_elements\":"<<pr.o.joint_block_elements
+    <<",\"joint_block_offset\":"<<pr.o.joint_block_offset
+    <<",\"joint_rebuild_interval\":"<<pr.o.joint_rebuild
+    <<",\"joint_factors\":"<<w.joint_factors
+    <<",\"joint_jacobian_columns\":"<<w.joint_jacobian_columns
+    <<",\"joint_residual_calls\":"<<w.joint_residual_calls
+    <<",\"joint_iterations\":"<<w.joint_iterations
+    <<",\"joint_line_searches\":"<<w.joint_line_searches
+    <<",\"alpha_from_h\":"<<(pr.o.alpha_from_h?"true":"false")
+    <<",\"alpha_power\":"<<pr.o.alpha_power
     <<",\"dense_factor_flops_estimate\":"<<w.factor_flops
     <<",\"dense_solve_flops_estimate\":"<<w.solve_flops
     <<",\"patch_setup_seconds\":"<<w.setup_seconds
@@ -527,6 +688,11 @@ Options Parse(int argc,char** argv)
     else if(key=="--outer-max")o.outer_max=std::stoi(value);
     else if(key=="--fixed-outer")o.fixed_outer=std::stoi(value);
     else if(key=="--alpha")o.alpha=std::stod(value);
+    else if(key=="--alpha-h-power"){o.alpha_power=std::stod(value);o.alpha_from_h=true;}
+    else if(key=="--joint-block-elements")o.joint_block_elements=std::stoi(value);
+    else if(key=="--joint-block-offset")o.joint_block_offset=std::stoi(value);
+    else if(key=="--joint-rebuild")o.joint_rebuild=std::stoi(value);
+    else if(key=="--joint-max")o.joint_max=std::stoi(value);
     else if(key=="--dt")o.dt=std::stod(value);
     else if(key=="--final-time")o.final_time=std::stod(value);
     else if(key=="--reference-dt")o.reference_dt=std::stod(value);
@@ -538,7 +704,11 @@ Options Parse(int argc,char** argv)
     else if(key=="--state-predictor")o.state_predictor=value;
     else throw std::runtime_error("unknown option "+key);
   }
-  if(o.elements<3||o.order<1||o.order>7||o.halo<0||2*o.halo+1>=o.elements||
+  if(o.alpha_from_h)o.alpha=1./(double(o.elements)*o.elements*std::pow(o.order+1.,o.alpha_power));
+  if(o.joint_block_elements<0||o.joint_block_elements>o.elements||
+     o.joint_block_offset<0||o.joint_block_offset>=o.elements||o.joint_rebuild<0||
+     o.joint_max<1||!std::isfinite(o.alpha_power)||o.alpha_power<0||
+     o.elements<3||o.order<1||o.order>7||o.halo<0||2*o.halo+1>=o.elements||
      o.inner<0||o.outer_max<1||o.fixed_outer<0||!(o.alpha>0)||!(o.dt>0)||
      !(o.final_time>0)||!(o.reference_dt>0)||!(o.closure_tolerance>0)||
      !(o.state_tolerance>0)||!std::isfinite(o.alpha+o.dt+o.final_time+o.reference_dt+
@@ -546,7 +716,7 @@ Options Parse(int argc,char** argv)
      (o.initial_case!="smooth"&&o.initial_case!="compression")||
      (o.sigma_predictor!="constant"&&o.sigma_predictor!="history3")||
      (o.state_predictor!="constant"&&o.state_predictor!="history3")||
-     (o.method!="rk4"&&o.method!="patch"&&o.method!="both"))
+     (o.method!="rk4"&&o.method!="patch"&&o.method!="both"&&o.method!="joint"&&o.method!="rk4-joint"))
     throw std::runtime_error("unsupported/nonfinite probe options");
   if(o.inner==0 && (o.fixed_outer<1 || o.sigma_predictor!="history3" ||
                       o.state_predictor!="history3"))
@@ -595,7 +765,23 @@ bool SelfTest()
   local={{constant,constant}};
   for(auto& s:lsigma){std::fill(s.begin(),s.end(),0.);s.front()=.1;s.back()=.2;}
   PatchClosures(pr,patch,local,lsigma,w);
-  std::cout<<"screened space-time shared flux conservation and current-density patch correction PASS\n";
+  // A converged joint solve must satisfy the original stage equations and
+  // share the same conservative update, including with a retained Jacobian.
+  Options jo;jo.elements=4;jo.order=1;jo.halo=0;jo.dt=.002;
+  jo.final_time=.004;jo.reference_dt=.0000625;
+  Problem jp(jo);const Result reference=Run(jp,"rk4",jo.reference_dt);
+  const Result joint=Run(jp,"joint",jo.dt);
+  if(!reference.complete||!joint.complete||!joint.certified||
+     joint.work.joint_factors!=1||joint.work.joint_iterations<2||
+     jp.Error(joint.u,reference.u)>1.e-8)return false;
+  const auto jbefore=jp.Integrals(jp.Initial()),jafter=jp.Integrals(joint.u);
+  for(int c=0;c<4;++c)if(std::abs(jafter[c]-jbefore[c])>2.e-12)return false;
+  jo.joint_block_elements=2;jo.joint_block_offset=1;jo.alpha=.0001;
+  Problem shifted(jo);const Result shift_ref=Run(shifted,"rk4",jo.reference_dt);
+  const Result shift_joint=Run(shifted,"joint",jo.dt);
+  if(!shift_ref.complete||!shift_joint.complete||!shift_joint.certified||
+     shift_joint.work.joint_factors!=2||shifted.Error(shift_joint.u,shift_ref.u)>1.e-8)return false;
+  std::cout<<"screened space-time conservation, current-density correction, and joint chord-Newton PASS\n";
   return true;
 }
 } // namespace
@@ -608,7 +794,9 @@ int main(int argc,char** argv)
     const Options o=Parse(argc,argv);if(o.self_test)return SelfTest()?0:1;
     Problem pr(o);const Result reference=Run(pr,"rk4",o.reference_dt);
     if(!reference.complete)throw std::runtime_error("reference failed: "+reference.failure);
-    if(o.method=="both"||o.method=="rk4")Print(pr,"rk4",Run(pr,"rk4",o.dt),reference);
+    if(o.method=="both"||o.method=="rk4"||o.method=="rk4-joint")Print(pr,"rk4",Run(pr,"rk4",o.dt),reference);
+    if(o.method=="joint"||o.method=="rk4-joint")
+      Print(pr,"joint-chord-Newton",Run(pr,"joint",o.dt),reference);
     if(o.method=="both"||o.method=="patch")
       Print(pr,o.inner==0?"cubic-history-Gauss-quadrature":"space-time-Schwarz",
             Run(pr,"patch",o.dt),reference);

@@ -86,3 +86,54 @@ factor/solve FLOPs are estimates for those operations alone. Patch factor
 storage is reported separately from its retained source matrix; temporary
 fields, current matrices, and global reference storage are additional. No CPU
 timing or work estimate establishes a GPU/application speedup.
+
+## Joint chord-Newton screen
+
+`--method rk4-joint` compares RK4 with a materially different solution of the
+same two-node Gauss equations. It treats both conservative stage states and
+both scalar stage responses as unknowns. Each nonlinear residual constructs
+the **current** reaction, diffusion, quadratic source and Euler flux; it does
+not call an elliptic solve inside the stage iteration. A finite-difference
+Jacobian is factored once and reused as a chord-Newton approximation. The
+current closure and collocation residuals must both pass before accepting a
+step. The accepted endpoint is independently reclosed and checked.
+
+`--joint-block-elements 0` factors the complete small Jacobian as an oracle.
+Positive values retain only contiguous element-block principal Jacobians,
+with the two stages, all four Euler components and owned scalar nodes in each
+block. This is a nonoverlapping block-Jacobi nonlinear correction, not exact
+nonlinear elimination or a converged independent-element method. Current
+residual evaluations retain the interblock flux and elliptic coupling.
+`--joint-rebuild 0` retains these factors for the entire run; a positive value
+rebuilds after that many accepted joint steps. A changed timestep rebuilds the
+factors. A backtracking line search checks current equations and physical
+admission; failed trial evaluations count toward the total work. Failure to
+converge ends the candidate at its last accepted horizon. There is no hidden
+RK fallback or timestep retry.
+
+The current finite-difference constructor evaluates the complete residual for
+every block column. All of that coefficient and flux work is charged; it is a
+small research implementation, not a claim of an optimal sparse Jacobian
+constructor. `joint_jacobian_columns`, `joint_factors`, `joint_iterations`,
+`joint_residual_calls`, `joint_line_searches`, and rejected step counts expose
+its mechanism. Existing `patch_setup_seconds` and retained-factor byte fields
+include the joint factors too, for compatibility with the earlier JSON schema.
+
+`--alpha-h-power s` sets `alpha=h^2/(p+1)^s`. The default remains an explicitly
+specified physical `--alpha`; it does not secretly depend on polynomial order.
+Comparisons between temporal methods at one alpha solve the same semidiscrete
+problem. Comparisons across these alpha values change the regularization and
+must not be reported as matched-physics time-to-solution improvements.
+
+```bash
+PROBE --method rk4-joint --elements 8 --order 2 --case compression \
+  --dt .004 --final-time .04 --reference-dt .00003125 \
+  --joint-block-elements 2 --joint-rebuild 0 --alpha-h-power 2
+```
+
+`--joint-block-offset 1` rotates the same contiguous joint blocks by one
+periodic element. This changes only the nonlinear preconditioner partition;
+it preserves the DG mesh, initial condition, alpha and target equations. For
+eight elements and two-element blocks, the compression fronts at x=0 and x=.5
+lie at block cuts with offset zero and inside blocks with offset one. This
+is a same-physics test of source proximity to a block boundary.

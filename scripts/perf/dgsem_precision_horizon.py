@@ -48,6 +48,8 @@ def main():
     parser.add_argument("--volume-dissipation", choices=("none", "llf"), default="none")
     parser.add_argument("--positivity-limiter", choices=("none", "zhangshu"), default="none")
     parser.add_argument("--c-alpha", type=float, default=1.0)
+    parser.add_argument("--shock-x", type=float)
+    parser.add_argument("--shock-width", type=float)
     parser.add_argument("--sigma-basis", choices=("lgl",))
     parser.add_argument("--fused-residual", action="store_true")
     parser.add_argument("--fused-dmma", action="store_true")
@@ -57,6 +59,13 @@ def main():
     parser.add_argument("--conservation-balance", action="store_true")
     parser.add_argument("--timeout", type=float, default=180)
     args = parser.parse_args()
+    if args.shock_x is not None or args.shock_width is not None:
+        if args.case != "stationary-shock":
+            parser.error("shock position/width options require the stationary-shock case")
+        if ((args.shock_x is not None and not math.isfinite(args.shock_x)) or
+                (args.shock_width is not None and
+                 (not math.isfinite(args.shock_width) or args.shock_width <= 0))):
+            parser.error("shock position must be finite and physical width positive")
     for value in (args.dt, args.final_time, args.linear_rtol, args.timeout, args.c_alpha):
         if not math.isfinite(value) or value <= 0:
             parser.error("time, tolerance, and timeout must be finite and positive")
@@ -120,6 +129,10 @@ def main():
     ]
     if args.case == "active-wave":
         command.append("--active-igr-wave")
+    if args.shock_x is not None:
+        command.extend(("--shock-x", format(args.shock_x, ".17g")))
+    if args.shock_width is not None:
+        command.extend(("--shock-width", format(args.shock_width, ".17g")))
     if args.conservation_balance:
         command.append("--conservation-balance")
     environment = os.environ.copy()
@@ -198,7 +211,7 @@ def main():
     record["wall_seconds"] = time.perf_counter() - start
     summaries = {}
     for line in (out / "stdout.txt").read_text().splitlines():
-        if line.startswith(("[explicit-time]", "[igr-closure-certificate]",
+        if line.startswith(("[explicit-time]", "[explicit-conservation]", "[igr-closure-certificate]",
                             "[igr-linear] event=run-summary", "[igr-dense-inverse]",
                             "[igr-two-level]", "[igr-sigma-basis]",
                             "[igr-screened-patch]",
