@@ -30,7 +30,7 @@ def main():
     parser.add_argument("--linear-solver", choices=("cg", "fgmres"), default="cg")
     parser.add_argument("--dense-inverse", choices=("fp64", "fp32", "tf32"))
     parser.add_argument("--two-level-inverse", choices=("dense", "cg"))
-    parser.add_argument("--integrator", choices=("rk3ssp", "ssprk104"), default="rk3ssp")
+    parser.add_argument("--integrator", choices=("rk3ssp", "ssprk104", "rk4", "dopri5", "radau-picard5"), default="rk3ssp")
     parser.add_argument("--sigma-space", choices=("L2", "H1"), default="L2")
     parser.add_argument("--sigma-cadence", choices=("every-stage", "extrapolated-every-step"),
                         default="every-stage")
@@ -40,6 +40,9 @@ def main():
     parser.add_argument("--c-alpha", type=float, default=1.0)
     parser.add_argument("--sigma-basis", choices=("lgl",))
     parser.add_argument("--fused-residual", action="store_true")
+    parser.add_argument("--fused-dmma", action="store_true")
+    parser.add_argument("--frozen-sigma-reference", action="store_true")
+    parser.add_argument("--stationary-sweeps", type=int, choices=range(1, 17))
     parser.add_argument("--timeout", type=float, default=180)
     args = parser.parse_args()
     for value in (args.dt, args.final_time, args.linear_rtol, args.timeout, args.c_alpha):
@@ -51,6 +54,10 @@ def main():
         parser.error("two-level inverse requires FGMRES and excludes the global dense inverse")
     if args.extrapolation_degree and args.sigma_cadence != "extrapolated-every-step":
         parser.error("extrapolation degree requires extrapolated-every-step cadence")
+    if args.fused_dmma and not args.fused_residual:
+        parser.error("DMMA requires fused residual")
+    if args.stationary_sweeps and args.linear_solver != "fgmres":
+        parser.error("stationary correction requires FGMRES fallback")
     source = Path(__file__).resolve().parents[2]
     executable = args.executable.resolve(strict=True)
     mesh = (args.mesh or source / "examples/dgsem_smooth_advection_periodic/"
@@ -84,7 +91,9 @@ def main():
     environment = os.environ.copy()
     for key in ("DG_IGR_IGR_DENSE_INVERSE", "DG_IGR_IGR_TWO_LEVEL_INVERSE",
                 "DG_IGR_IGR_TWO_LEVEL_COARSE", "DG_IGR_IGR_EXTRAPOLATION_DEGREE",
-                "DG_IGR_IGR_SIGMA_BASIS", "DG_IGR_DGSEM_FUSED_RESIDUAL"):
+                "DG_IGR_IGR_SIGMA_BASIS", "DG_IGR_DGSEM_FUSED_RESIDUAL",
+                "DG_IGR_DGSEM_FUSED_DMMA", "DG_IGR_IGR_STATIONARY_SWEEPS",
+                "DG_IGR_IGR_FROZEN_SIGMA_REFERENCE"):
         environment.pop(key, None)
     environment.update({
         "OMP_NUM_THREADS": "1", "DG_IGR_DGSEM_PRODUCTION_STRICT": "1",
@@ -102,6 +111,12 @@ def main():
         environment["DG_IGR_IGR_SIGMA_BASIS"] = args.sigma_basis
     if args.fused_residual:
         environment["DG_IGR_DGSEM_FUSED_RESIDUAL"] = "1"
+    if args.fused_dmma:
+        environment["DG_IGR_DGSEM_FUSED_DMMA"] = "1"
+    if args.stationary_sweeps:
+        environment["DG_IGR_IGR_STATIONARY_SWEEPS"] = str(args.stationary_sweeps)
+    if args.frozen_sigma_reference:
+        environment["DG_IGR_IGR_FROZEN_SIGMA_REFERENCE"] = "1"
     record = {
         "command": command,
         "environment": {k: v for k, v in environment.items()
@@ -134,8 +149,9 @@ def main():
     for line in (out / "stdout.txt").read_text().splitlines():
         if line.startswith(("[explicit-time]", "[igr-closure-certificate]",
                             "[igr-linear] event=run-summary", "[igr-dense-inverse]",
-                            "[igr-two-level-inverse]", "[igr-sigma-basis]",
+                            "[igr-two-level]", "[igr-sigma-basis]",
                             "[igr-sigma-predictor]", "[dgsem-fused-residual]",
+                            "[igr-stationary]", "[dgsem-sigma-interpolation]",
                             "[dgsem-op] event=run-summary")):
             fields = dict(token.split("=", 1) for token in line.split() if "=" in token)
             summaries[line.split()[0] + ":" + fields.get("event", "setup")] = fields
@@ -144,16 +160,23 @@ def main():
     certificate = summaries.get("[igr-closure-certificate]:accepted-state", {})
     dense_setup = summaries.get("[igr-dense-inverse]:setup", {})
     linear = summaries.get("[igr-linear]:run-summary", {})
-    two_level_setup = summaries.get("[igr-two-level-inverse]:setup", {})
-    record["requested_preconditioner_executed"] = (
-        dense_setup.get("precision") == args.dense_inverse and
-        linear.get("last_precond") == "dense-inverse-" + args.dense_inverse and
-        linear.get("last_solver") == args.linear_solver
-        if args.dense_inverse else bool(two_level_setup) and
-        linear.get("last_precond") == "two-level-inverse-fp64" and
-        linear.get("last_solver") == "fgmres" if args.two_level_inverse else not dense_setup and
-        not linear.get("last_precond", "").startswith("dense-inverse-"))
+    two_level_setup = summaries.get("[igr-two-level]:setup", {})
+    if args.dense_inverse:
+        requested_pc = (dense_setup.get("precision") == args.dense_inverse and
+                        linear.get("last_precond") == "dense-inverse-" + args.dense_inverse and
+                        linear.get("last_solver") == args.linear_solver)
+    elif args.two_level_inverse:
+        requested_pc = (bool(two_level_setup) and
+                        linear.get("last_precond") == "two-level-inverse-fp64" and
+                        linear.get("last_solver") == "fgmres")
+    else:
+        requested_pc = (not dense_setup and not two_level_setup and
+                        not linear.get("last_precond", "").startswith("dense-inverse-"))
+    record["requested_preconditioner_executed"] = requested_pc
     record["requested_execution_executed"] = (
+        (not args.stationary_sweeps or bool(summaries.get("[igr-stationary]:setup"))) and
+        (not args.fused_dmma or summaries.get("[dgsem-fused-residual]:setup", {}).get(
+            "contraction") == "dmma8x8x4") and
         (not args.sigma_basis or bool(summaries.get("[igr-sigma-basis]:setup"))) and
         (not args.fused_residual or bool(summaries.get("[dgsem-fused-residual]:setup"))) and
         (not args.extrapolation_degree or

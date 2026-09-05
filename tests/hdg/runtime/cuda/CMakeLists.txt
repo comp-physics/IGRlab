@@ -964,6 +964,25 @@ endforeach()
 # CUDA accepted-step lifecycles at p1-p3.  This is intentionally a build
 # target, not a CTest: its default no-export 10,816-element workload performs
 # one warmup and five measured samples.
+add_executable(dg_igr_igr_stationary_correction_cuda_test
+  "${PROJECT_SOURCE_DIR}/tests/test_igr_stationary_correction_cuda.cu")
+target_include_directories(dg_igr_igr_stationary_correction_cuda_test PRIVATE
+  "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_igr_stationary_correction_cuda_test PRIVATE
+  igr_mfem mfem umpire MPI::MPI_CXX CUDA::cublas)
+target_compile_options(dg_igr_igr_stationary_correction_cuda_test PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+set_target_properties(dg_igr_igr_stationary_correction_cuda_test PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+  CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF
+  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+  CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_test(NAME dg_igr_igr_stationary_correction_cuda
+  COMMAND dg_igr_igr_stationary_correction_cuda_test)
+set_tests_properties(dg_igr_igr_stationary_correction_cuda PROPERTIES
+  LABELS "cuda;igr;two-level" TIMEOUT 90 RUN_SERIAL TRUE)
+
 add_executable(dg_igr_igr_two_level_inverse_cuda_test
   "${PROJECT_SOURCE_DIR}/tests/test_igr_two_level_inverse_cuda.cu")
 target_include_directories(dg_igr_igr_two_level_inverse_cuda_test PRIVATE

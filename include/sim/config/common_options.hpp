@@ -159,7 +159,7 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.time_integrator,
                  "-ti",
                  "--time-integrator",
-                 "Time integrator: rk3ssp | ssprk104 | "
+                 "Time integrator: rk3ssp | ssprk104 | rk4 | dopri5 | radau-picard5 | "
                  "backward-euler | partitioned-backward-euler | rodas3 "
                  "(discretization support required).");
   args.AddOption(&opts.time_atol,

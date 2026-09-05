@@ -104,6 +104,12 @@ inline real_t PhysicalBoundaryFluxStageWeight(SSPRKMethod method, int stage)
     return SSPRK33Coefficients::b[static_cast<std::size_t>(stage)];
   case SSPRKMethod::SSPRK104:
     return SSPRK104Coefficients::b[static_cast<std::size_t>(stage)];
+  case SSPRKMethod::ResearchRK4:
+    return ResearchRK4Coefficients::b[static_cast<std::size_t>(stage)];
+  case SSPRKMethod::ResearchDOPRI5:
+    return ResearchDOPRI5Coefficients::b[static_cast<std::size_t>(stage)];
+  case SSPRKMethod::ResearchRadauPicard5:
+    return stage < 10 ? 0.0 : ResearchRadauPicard5Coefficients::b[stage - 10];
   }
   MFEM_ABORT("Unsupported SSPRK method for physical-boundary flux tracking.");
   return 0.0;
@@ -706,7 +712,8 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
       for (int component = 0; component < stage_flux.Size(); ++component)
       {
         attempted[component] += weight * flux[component];
-        attempted_absolute[component] += weight * std::abs(flux[component]);
+        attempted_absolute[component] +=
+          std::abs(weight) * std::abs(flux[component]);
       }
     }
     MaybeScanVector(k_, stage_time, label);
@@ -728,6 +735,44 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
 
   const char* final_prelimit_label = "stage3-prelimit";
   const char* final_postlimit_label = "stage3";
+
+  auto tableau_step = [&](const auto& a, const auto& b, const auto& c)
+  {
+    const int stages = static_cast<int>(b.size());
+    for (int stage = 0; stage < stages; ++stage)
+    {
+      research_stage_work_[stage].SetSize(x.Size(), mem_type);
+      if (stage == 0)
+      {
+        evaluate_rhs(stage, x, t, "research-rk-rhs");
+      }
+      else
+      {
+        y_ = x;
+        for (int j = 0; j < stage; ++j)
+        {
+          if (a[stage][j] != 0.0)
+          {
+            y_.Add(dt * a[stage][j], research_stage_work_[j]);
+          }
+        }
+        const real_t stage_time = t + c[stage] * dt;
+        finish_stage(y_, stage_time, /*stage_optional=*/false,
+                     "research-rk-stage-prelimit", "research-rk-stage");
+        evaluate_rhs(stage, y_, stage_time, "research-rk-rhs");
+      }
+      research_stage_work_[stage] = k_;
+    }
+    for (int stage = 0; stage < stages; ++stage)
+    {
+      if (b[stage] != 0.0)
+      {
+        x.Add(dt * b[stage], research_stage_work_[stage]);
+      }
+    }
+    final_prelimit_label = "research-rk-final-prelimit";
+    final_postlimit_label = "research-rk-final";
+  };
 
   switch (method_)
   {
@@ -802,6 +847,63 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
     x.Add(dt / 10.0, k_);
     final_prelimit_label = "ssprk104-final-prelimit";
     final_postlimit_label = "ssprk104-final";
+    break;
+  }
+  case SSPRKMethod::ResearchRK4:
+    tableau_step(ResearchRK4Coefficients::a,
+                  ResearchRK4Coefficients::b, ResearchRK4Coefficients::c);
+    break;
+  case SSPRKMethod::ResearchDOPRI5:
+    tableau_step(ResearchDOPRI5Coefficients::a,
+                  ResearchDOPRI5Coefficients::b,
+                  ResearchDOPRI5Coefficients::c);
+    break;
+  case SSPRKMethod::ResearchRadauPicard5:
+  {
+    using Coefficients = ResearchRadauPicard5Coefficients;
+    for (Vector& work : research_stage_work_)
+    {
+      work.SetSize(x.Size(), mem_type);
+    }
+    evaluate_rhs(0, x, t, "radau-picard-initial-rhs");
+    for (int node = 0; node < 3; ++node)
+    {
+      add(x, dt * Coefficients::c[node], k_, research_stage_work_[node]);
+    }
+    for (int sweep = 0; sweep < Coefficients::sweeps; ++sweep)
+    {
+      // Every node consumes the previous sweep. No within-sweep stage
+      // dependency is hidden by the serial ordinary-CUDA evaluation here.
+      for (int node = 0; node < 3; ++node)
+      {
+        Vector& state = research_stage_work_[node];
+        const real_t stage_time = t + dt * Coefficients::c[node];
+        finish_stage(state, stage_time, /*stage_optional=*/false,
+                     "radau-picard-node-prelimit", "radau-picard-node");
+        evaluate_rhs(1 + 3 * sweep + node, state, stage_time,
+                      "radau-picard-node-rhs");
+        research_stage_work_[3 + node] = k_;
+      }
+      if (sweep + 1 < Coefficients::sweeps)
+      {
+        for (int node = 0; node < 3; ++node)
+        {
+          Vector& state = research_stage_work_[node];
+          state = x;
+          for (int j = 0; j < 3; ++j)
+          {
+            state.Add(dt * Coefficients::q[node][j],
+                       research_stage_work_[3 + j]);
+          }
+        }
+      }
+    }
+    for (int node = 0; node < 3; ++node)
+    {
+      x.Add(dt * Coefficients::b[node], research_stage_work_[3 + node]);
+    }
+    final_prelimit_label = "radau-picard-final-prelimit";
+    final_postlimit_label = "radau-picard-final";
     break;
   }
   }

@@ -41,6 +41,50 @@ inline bool Finite(real_t value)
   return std::isfinite(static_cast<double>(value));
 }
 
+bool BuildExactScalarNodeMap(FiniteElementSpace& scalar_fes,
+                             const FiniteElementSpace& state_fes,
+                             int dof,
+                             Array<int>& map)
+{
+  map.SetSize(state_fes.GetNE() * dof);
+  Array<int> scalar_dofs;
+  for (int element = 0; element < state_fes.GetNE(); ++element)
+  {
+    const FiniteElement& scalar = *scalar_fes.GetFE(element);
+    const FiniteElement& state = *state_fes.GetFE(element);
+    if (!dynamic_cast<const NodalFiniteElement*>(&scalar) ||
+        scalar.GetMapType() != FiniteElement::VALUE ||
+        scalar.GetDim() != state.GetDim() ||
+        scalar.GetGeomType() != state.GetGeomType() ||
+        scalar.GetDof() != dof || scalar.GetNodes().GetNPoints() != dof ||
+        state.GetNodes().GetNPoints() != dof)
+      return false;
+    scalar_fes.GetElementDofs(element, scalar_dofs);
+    if (scalar_dofs.Size() != dof) return false;
+    std::vector<char> seen(static_cast<std::size_t>(dof), 0);
+    for (int local = 0; local < dof; ++local)
+    {
+      const IntegrationPoint& target = state.GetNodes().IntPoint(local);
+      int match = -1;
+      for (int j = 0; j < dof; ++j)
+      {
+        const IntegrationPoint& node = scalar.GetNodes().IntPoint(j);
+        // This is an exact nodal identity, not a sparsification threshold.
+        if (target.x == node.x &&
+            (state.GetDim() == 1 || target.y == node.y))
+        {
+          match = j;
+          break;
+        }
+      }
+      if (match < 0 || seen[static_cast<std::size_t>(match)]) return false;
+      seen[static_cast<std::size_t>(match)] = 1;
+      map[element * dof + local] = scalar_dofs[match];
+    }
+  }
+  return true;
+}
+
 inline int FindNode(const Vector& nodes, real_t coordinate)
 {
   int best = 0;
@@ -2779,31 +2823,36 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       {
         return fail(DGSEMProductionReason::UnsupportedSigma);
       }
-      c.sigma_element_dofs.SetSize(c.rows * c.sigma_ldof);
-      c.sigma_interpolation.SetSize(c.rows, c.sigma_ldof);
-      Array<int> scalar_dofs;
+      const bool exact_nodal_gather = BuildExactScalarNodeMap(
+          *scalar_fes, op_->vfes, c.dof, c.sigma_element_dofs);
       Vector shape(c.sigma_ldof);
-      for (int e = 0; e < c.ne; ++e)
+      if (exact_nodal_gather)
       {
-        const FiniteElement& scalar_fe = *scalar_fes->GetFE(e);
-        const FiniteElement& state_fe = *op_->vfes.GetFE(e);
-        if (scalar_fe.GetDof() != c.sigma_ldof)
+        c.sigma_interpolation.SetSize(0, 0);
+      }
+      else
+      {
+        c.sigma_element_dofs.SetSize(c.rows * c.sigma_ldof);
+        c.sigma_interpolation.SetSize(c.rows, c.sigma_ldof);
+        Array<int> scalar_dofs;
+        for (int e = 0; e < c.ne; ++e)
         {
-          return fail(DGSEMProductionReason::UnsupportedSigma);
-        }
-        scalar_fes->GetElementDofs(e, scalar_dofs);
-        if (scalar_dofs.Size() != c.sigma_ldof)
-        {
-          return fail(DGSEMProductionReason::UnsupportedSigma);
-        }
-        for (int local = 0; local < c.dof; ++local)
-        {
-          const int row = e * c.dof + local;
-          scalar_fe.CalcShape(state_fe.GetNodes().IntPoint(local), shape);
-          for (int j = 0; j < c.sigma_ldof; ++j)
+          const FiniteElement& scalar_fe = *scalar_fes->GetFE(e);
+          const FiniteElement& state_fe = *op_->vfes.GetFE(e);
+          if (scalar_fe.GetDof() != c.sigma_ldof)
+            return fail(DGSEMProductionReason::UnsupportedSigma);
+          scalar_fes->GetElementDofs(e, scalar_dofs);
+          if (scalar_dofs.Size() != c.sigma_ldof)
+            return fail(DGSEMProductionReason::UnsupportedSigma);
+          for (int local = 0; local < c.dof; ++local)
           {
-            c.sigma_element_dofs[row + c.rows * j] = scalar_dofs[j];
-            c.sigma_interpolation(row, j) = shape(j);
+            const int row = e * c.dof + local;
+            scalar_fe.CalcShape(state_fe.GetNodes().IntPoint(local), shape);
+            for (int j = 0; j < c.sigma_ldof; ++j)
+            {
+              c.sigma_element_dofs[row + c.rows * j] = scalar_dofs[j];
+              c.sigma_interpolation(row, j) = shape(j);
+            }
           }
         }
       }
@@ -2873,6 +2922,18 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       c.sigma_fes_sequence = scalar_fes->GetSequence();
       c.sigma_ready = true;
       ++c.counters.sigma_metadata_builds;
+      if (exact_nodal_gather)
+      {
+        int logging_rank = 0;
+#ifdef MFEM_USE_MPI
+        const auto context = GetProductionCommunicator(op_->vfes);
+        if (context.active) MPI_Comm_rank(context.comm, &logging_rank);
+#endif
+        if (logging_rank == 0)
+          std::cout << "[dgsem-sigma-interpolation] mode=exact-nodal-gather"
+                    << " rows=" << c.rows << " scalar_dofs=" << c.sigma_ldof
+                    << " shared_faces=dense" << std::endl;
+      }
     }
   }
 
@@ -3285,6 +3346,10 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
   const LGLBasis1D& basis = GetLGLBasis1D(c.selection.order);
   const bool fused_residual = ::dg_igr::EnvFlagEnabledDefault(
       "DG_IGR_DGSEM_FUSED_RESIDUAL", false);
+  const bool fused_dmma = ::dg_igr::EnvFlagEnabledDefault(
+      "DG_IGR_DGSEM_FUSED_DMMA", false);
+  MFEM_VERIFY(!fused_dmma || fused_residual,
+              "DG_IGR_DGSEM_FUSED_DMMA requires DG_IGR_DGSEM_FUSED_RESIDUAL.");
   if (fused_residual)
   {
     MFEM_VERIFY(op_->dim == 2 && c.n1d >= 2 && c.n1d <= 5 &&
@@ -3299,6 +3364,7 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
 #endif
       if (logging_rank == 0)
         std::cout << "[dgsem-fused-residual] enabled=1 precision=fp64"
+                  << " contraction=" << (fused_dmma ? "dmma8x8x4" : "simt")
                   << " elements=" << c.ne << " order=" << c.selection.order
                   << " llf_volume=" << (c.llf_volume_active ? 1 : 0)
                   << " unique_face_flux=1 packed_output=1" << std::endl;
@@ -3374,7 +3440,7 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
         c.frozen_sigma_spectral_speed, c.lex_to_local, basis.Dsplit,
         basis.weights, c.states, c.sigma_nodes, c.metrics, c.inverse_mass,
         c.face_weights, c.row_face_offsets, c.row_face_ids, c.row_face_signs,
-        c.face_flux, c.nodal_speeds, c.strong);
+        c.face_flux, c.nodal_speeds, c.strong, fused_dmma);
   }
   else
   {

@@ -114,13 +114,19 @@ inline mfem::SSPRKMethod SSPRKMethodForTimeIntegrator(
     return mfem::SSPRKMethod::SSPRK33;
   case TimeIntegrator::SSPRK104:
     return mfem::SSPRKMethod::SSPRK104;
+  case TimeIntegrator::ResearchRK4:
+    return mfem::SSPRKMethod::ResearchRK4;
+  case TimeIntegrator::ResearchDOPRI5:
+    return mfem::SSPRKMethod::ResearchDOPRI5;
+  case TimeIntegrator::ResearchRadauPicard5:
+    return mfem::SSPRKMethod::ResearchRadauPicard5;
   case TimeIntegrator::BackwardEuler:
   case TimeIntegrator::PartitionedBackwardEuler:
   case TimeIntegrator::Rodas3:
     break;
   }
   MFEM_VERIFY(false,
-              "Selected time integrator is not an explicit SSPRK method.");
+              "Selected time integrator is not an explicit RK method.");
   return mfem::SSPRKMethod::SSPRK33;
 }
 

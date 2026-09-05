@@ -92,7 +92,10 @@ void GatherElementStateDevice(int ne,
                               const Vector& local_state,
                               DenseMatrix& packed_state);
 
-/** Interpolate a scalar finite-element field to packed DGSEM state nodes. */
+/** Interpolate a scalar finite-element field to packed DGSEM state nodes.
+ * An empty interpolation matrix selects an exact nodal gather; in that case
+ * scalar_element_dofs contains one signed scalar dof per output row.
+ */
 void InterpolateElementScalarDevice(int rows,
                                     int scalar_dofs_per_element,
                                     const Array<int>& scalar_element_dofs,
@@ -304,6 +307,8 @@ void AssembleEulerRusanovFacesDevice(int dim,
  * mass are combined without full-field intermediate writes. This changes
  * algebraic evaluation only; sigma must still belong to the current stage.
  * The packed output remains private until the caller's normal final scatter.
+ * tensor_contraction selects an on-chip FP64 8x8x4 WMMA central contraction;
+ * the default uses the same precombined operator with ordinary FP64 arithmetic.
  */
 void ApplyFusedEulerResidualDevice(
     int ne, int n1d, real_t gamma, real_t density_floor,
@@ -313,7 +318,8 @@ void ApplyFusedEulerResidualDevice(
     const DenseMatrix& metrics, const DenseMatrix& inverse_mass,
     const Vector& face_weights, const Array<int>& row_face_offsets,
     const Array<int>& row_face_ids, const Array<int>& row_face_signs,
-    const DenseMatrix& face_flux, Vector& nodal_speeds, DenseMatrix& strong);
+    const DenseMatrix& face_flux, Vector& nodal_speeds, DenseMatrix& strong,
+    bool tensor_contraction = false);
 
 /** Evaluate only the packed two-sided Rusanov characteristic-speed bound.
  *

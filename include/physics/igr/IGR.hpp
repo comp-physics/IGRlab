@@ -692,6 +692,8 @@ private:
   std::string dense_inverse_precision_;
   std::unique_ptr<mfem::Solver> two_level_inverse_preconditioner_;
   std::string two_level_coarse_mode_;
+  std::unique_ptr<mfem::IterativeSolver> stationary_correction_;
+  int stationary_sweeps_ = 0;
   NonconvergencePolicy nonconvergence_policy_ =
     NonconvergencePolicy::Accept;
   int amg_coarsen_type_ = -1;

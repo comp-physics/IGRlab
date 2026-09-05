@@ -8,10 +8,12 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 #include "mfem.hpp"
@@ -99,7 +101,10 @@ enum class TimeIntegrator
   BackwardEuler = 1,
   PartitionedBackwardEuler = 2,
   Rodas3 = 3,
-  SSPRK104 = 4
+  SSPRK104 = 4,
+  ResearchRK4 = 5,
+  ResearchDOPRI5 = 6,
+  ResearchRadauPicard5 = 7
 };
 
 /// @brief Source of the effective general discretization selection.
@@ -797,6 +802,12 @@ TryParseTimeIntegrator(const std::string& value)
   {
     return TimeIntegrator::SSPRK104;
   }
+  if (lower == "rk4") { return TimeIntegrator::ResearchRK4; }
+  if (lower == "dopri5") { return TimeIntegrator::ResearchDOPRI5; }
+  if (lower == "radau-picard5")
+  {
+    return TimeIntegrator::ResearchRadauPicard5;
+  }
   if (lower == "backward-euler")
   {
     return TimeIntegrator::BackwardEuler;
@@ -820,6 +831,12 @@ inline const char* TimeIntegratorToString(TimeIntegrator time_integrator)
     return "rk3ssp";
   case TimeIntegrator::SSPRK104:
     return "ssprk104";
+  case TimeIntegrator::ResearchRK4:
+    return "rk4";
+  case TimeIntegrator::ResearchDOPRI5:
+    return "dopri5";
+  case TimeIntegrator::ResearchRadauPicard5:
+    return "radau-picard5";
   case TimeIntegrator::BackwardEuler:
     return "backward-euler";
   case TimeIntegrator::PartitionedBackwardEuler:
@@ -836,6 +853,19 @@ inline bool IsExplicitSSPRKTimeIntegrator(TimeIntegrator time_integrator)
          time_integrator == TimeIntegrator::SSPRK104;
 }
 
+inline bool IsResearchExplicitRKTimeIntegrator(TimeIntegrator integrator)
+{
+  return integrator == TimeIntegrator::ResearchRK4 ||
+         integrator == TimeIntegrator::ResearchDOPRI5 ||
+         integrator == TimeIntegrator::ResearchRadauPicard5;
+}
+
+inline bool IsExplicitRKTimeIntegrator(TimeIntegrator integrator)
+{
+  return IsExplicitSSPRKTimeIntegrator(integrator) ||
+         IsResearchExplicitRKTimeIntegrator(integrator);
+}
+
 /// SSP coefficient used to scale the user-facing explicit CFL safety factor.
 inline std::optional<mfem::real_t>
 SSPCoefficientForTimeIntegrator(TimeIntegrator time_integrator)
@@ -846,6 +876,9 @@ SSPCoefficientForTimeIntegrator(TimeIntegrator time_integrator)
     return mfem::SSPRK33Coefficients::ssp_coefficient;
   case TimeIntegrator::SSPRK104:
     return mfem::SSPRK104Coefficients::ssp_coefficient;
+  case TimeIntegrator::ResearchRK4:
+  case TimeIntegrator::ResearchDOPRI5:
+  case TimeIntegrator::ResearchRadauPicard5:
   case TimeIntegrator::BackwardEuler:
   case TimeIntegrator::PartitionedBackwardEuler:
   case TimeIntegrator::Rodas3:
@@ -1106,7 +1139,8 @@ ResolveSolverRequest(const std::string& case_default_dg_backend,
     {
       result.status = SolverRequestResolutionStatus::InvalidTimeIntegrator;
       result.message = "Invalid time integrator '" + time_integrator_value +
-                       "'. Use 'rk3ssp', 'ssprk104', "
+                       "'. Use 'rk3ssp', 'ssprk104', 'rk4', 'dopri5', "
+                       "'radau-picard5', "
                        "'backward-euler', 'partitioned-backward-euler', or "
                        "'rodas3'.";
       return result;
@@ -1115,18 +1149,18 @@ ResolveSolverRequest(const std::string& case_default_dg_backend,
   }
 
   if (result.discretization != Discretization::HDG &&
-      !IsExplicitSSPRKTimeIntegrator(result.time_integrator))
+      !IsExplicitRKTimeIntegrator(result.time_integrator))
   {
     result.status = SolverRequestResolutionStatus::UnsupportedTimeIntegrator;
     result.message = "Time integrator '" +
                      std::string(TimeIntegratorToString(
                        result.time_integrator)) +
                      "' is unavailable for DG/DGSEM; use 'rk3ssp' or "
-                     "'ssprk104'.";
+                     "'ssprk104', or a research explicit RK method.";
     return result;
   }
   if (result.discretization == Discretization::HDG &&
-      IsExplicitSSPRKTimeIntegrator(result.time_integrator))
+      IsExplicitRKTimeIntegrator(result.time_integrator))
   {
     result.status = SolverRequestResolutionStatus::UnsupportedTimeIntegrator;
     result.message = "Time integrator '" +
@@ -1881,6 +1915,37 @@ inline RunConfig MakeRunConfig(
 inline std::string
 ValidateExplicitSSPRKCFLSelection(const RunConfig& run_cfg)
 {
+  if (IsResearchExplicitRKTimeIntegrator(run_cfg.time_integrator))
+  {
+    if (run_cfg.opts.cfl != 0.0 || !std::isfinite(run_cfg.opts.dt) ||
+        run_cfg.opts.dt <= 0.0)
+    {
+      return "Research rk4/dopri5/radau-picard5 require --cfl-number 0 and "
+             "a finite positive --time-step; no SSP coefficient or adaptive "
+             "error controller is supplied.";
+    }
+    const mfem::LimiterPipelineConfig& limiter =
+      run_cfg.case_config.limiter_pipeline;
+    if (limiter.zhang_shu || limiter.bj_mode != mfem::BJLimiterMode::kNone ||
+        limiter.tvb_mode != mfem::TVBLimiterMode::kNone ||
+        limiter.venkat_mode != mfem::VenkatLimiterMode::kNone ||
+        limiter.krivodonova)
+    {
+      return "Research rk4/dopri5/radau-picard5 currently require an inactive "
+             "limiter pipeline (--positivity-limiter none).";
+    }
+    const dg_igr::IGRSigmaUpdateCadence cadence =
+      run_cfg.igr_opts.sigma_cadence.empty()
+        ? run_cfg.case_config.igr_config.sigma_cadence
+        : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
+    if (run_cfg.regularization == Regularization::IGR &&
+        cadence != dg_igr::IGRSigmaUpdateCadence::EveryStage)
+    {
+      return "Research rk4/dopri5/radau-picard5 with active IGR require "
+             "--igr-sigma-cadence every-stage.";
+    }
+    return {};
+  }
   if (!IsExplicitSSPRKTimeIntegrator(run_cfg.time_integrator))
   {
     return {};
@@ -1912,12 +1977,28 @@ ResolveIGRAlphaLengthScalePolicy(const RunConfig& run_cfg)
 }
 
 /// Exact frozen-sigma acoustic speeds belong to the typed extrapolated route.
+/// A bounded research override gives every-stage temporal references exactly
+/// the same spatial dissipation, while retaining current-equation sigma solves.
 inline bool UsesFrozenSigmaSpectralSpeed(const RunConfig& run_cfg)
 {
   const dg_igr::IGRSigmaUpdateCadence cadence =
     run_cfg.igr_opts.sigma_cadence.empty()
       ? run_cfg.case_config.igr_config.sigma_cadence
       : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
+  if (const char* reference =
+        std::getenv("DG_IGR_IGR_FROZEN_SIGMA_REFERENCE"))
+  {
+    if (std::string(reference) != "1" ||
+        run_cfg.regularization != Regularization::IGR ||
+        run_cfg.discretization != Discretization::DGSEM ||
+        cadence != dg_igr::IGRSigmaUpdateCadence::EveryStage)
+    {
+      throw std::invalid_argument(
+        "DG_IGR_IGR_FROZEN_SIGMA_REFERENCE requires value exactly 1 and "
+        "active IGR with DGSEM and every-stage sigma cadence.");
+    }
+    return true;
+  }
   return run_cfg.regularization == Regularization::IGR &&
          run_cfg.discretization == Discretization::DGSEM &&
          cadence == dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;

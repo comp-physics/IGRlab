@@ -58,8 +58,8 @@ inline std::string MakeCaseVTKDatasetName(
        << total_ref << "_is_" << run_cfg.igr_opts.space << "_ig_"
        << run_cfg.igr_opts.grad << "_ca_" << c_alpha;
   // Preserve the established RK3SSP dataset name while keeping the typed
-  // SSPRK(10,4) output from colliding with it.
-  if (run_cfg.time_integrator == TimeIntegrator::SSPRK104)
+  // alternative integrator outputs from colliding with it.
+  if (run_cfg.time_integrator != TimeIntegrator::RK3SSP)
   {
     name << "_ti_" << TimeIntegratorToString(run_cfg.time_integrator);
   }

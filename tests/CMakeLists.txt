@@ -174,6 +174,13 @@ target_include_directories(dg_igr_unit_tests PRIVATE
 )
 
 if(MFEM_USE_MPI AND MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
+  add_executable(dg_igr_research_rk_test test_research_rk.cpp)
+  target_link_libraries(dg_igr_research_rk_test PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_research_rk_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  add_test(NAME dg_igr_research_rk_cpu COMMAND dg_igr_research_rk_test)
+  set_tests_properties(dg_igr_research_rk_cpu PROPERTIES
+    LABELS "cpu-reference;timestepping;research" TIMEOUT 120)
+
   add_executable(dg_igr_igr_extrapolation_history_test
     test_igr_extrapolation_history.cpp)
   target_link_libraries(dg_igr_igr_extrapolation_history_test PRIVATE igr_mfem mfem)

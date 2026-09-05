@@ -6,6 +6,7 @@
 #include "IGR_internal_utils.hpp"
 #include "IGR_dense_inverse.hpp"
 #include "IGR_two_level_inverse.hpp"
+#include "IGR_stationary_correction.hpp"
 #include "../../numerics/dg/DGFaceQuadratureKernels.hpp"
 
 #include <algorithm>
@@ -2783,11 +2784,55 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     exact_face_sum_op->ResetTiming();
   }
 
+  const char* stationary_env = std::getenv("DG_IGR_IGR_STATIONARY_SWEEPS");
+  int stationary_sweeps = 0;
+  if (stationary_env && stationary_env[0])
+  {
+    char* end = nullptr;
+    const long requested = std::strtol(stationary_env, &end, 10);
+    MFEM_VERIFY(end && *end == '\0' && requested >= 1 && requested <= 16 &&
+                  using_cuda && solver_choice == LinearSolverType::FGMRES &&
+                  solve_preconditioner,
+                "Stationary correction requires CUDA, FGMRES, a preconditioner, and 1..16 sweeps.");
+    stationary_sweeps = static_cast<int>(requested);
+#ifdef DG_IGR_HAS_STATIONARY_CORRECTION_CUDA
+    if (!stationary_correction_)
+    {
+      stationary_correction_ = MakeStationaryCorrectionSolver(comm, stationary_sweeps);
+      stationary_sweeps_ = stationary_sweeps;
+      if (mfem::Mpi::Root())
+      {
+        std::cout << "[igr-stationary] event=setup sweeps=" << stationary_sweeps
+                  << " damping=1 precision=fp64 gate=current-true-residual fallback=fgmres"
+                  << std::endl;
+      }
+    }
+    MFEM_VERIFY(stationary_sweeps_ == stationary_sweeps,
+                "Stationary sweep count cannot change during a solver lifetime.");
+#else
+    MFEM_ABORT("Stationary correction requires the CUDA implementation.");
+#endif
+  }
+
   const auto solve_start = std::chrono::steady_clock::now();
 
   auto run_krylov = [&](double relative_tolerance, bool iterative_mode)
   {
     ::dg_igr::NVTXRange krylov_range("IGR/krylov-solve");
+    if (stationary_sweeps)
+    {
+      configure_solver(*stationary_correction_, relative_tolerance, iterative_mode);
+      stationary_correction_->Mult(B_, X_);
+      if (stationary_correction_->GetConverged())
+      {
+        last_linear_iters_ = stationary_correction_->GetNumIterations();
+        last_linear_converged_ = true;
+        last_linear_final_norm_ = stationary_correction_->GetFinalNorm();
+        last_linear_initial_norm_ = stationary_correction_->GetInitialNorm();
+        return;
+      }
+      // The rejected trial restores X_; charge both trial and Krylov work.
+    }
     if (solver_choice == LinearSolverType::CG)
     {
       mfem::CGSolver solver(comm);
@@ -2842,6 +2887,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     {
       MFEM_ABORT("Unsupported IGR linear solver selection.");
     }
+    last_linear_iters_ += stationary_sweeps;
   };
 
   run_krylov(effective_rtol, enable_warm_start);

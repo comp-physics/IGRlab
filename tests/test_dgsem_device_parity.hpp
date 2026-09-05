@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,9 @@ inline double MaxDifference(const mfem::DenseMatrix& left,
   const mfem::real_t* right_data = right.HostRead();
   for (int i = 0; i < left.TotalSize(); ++i)
   {
+    if (!std::isfinite(static_cast<double>(left_data[i])) ||
+        !std::isfinite(static_cast<double>(right_data[i])))
+      return std::numeric_limits<double>::infinity();
     maximum =
       std::max(maximum,
                std::abs(static_cast<double>(left_data[i] - right_data[i])));
@@ -46,6 +50,8 @@ inline double MaxAbs(const mfem::DenseMatrix& values)
   const mfem::real_t* data = values.HostRead();
   for (int i = 0; i < values.TotalSize(); ++i)
   {
+    if (!std::isfinite(static_cast<double>(data[i])))
+      return std::numeric_limits<double>::infinity();
     maximum = std::max(maximum, std::abs(static_cast<double>(data[i])));
   }
   return maximum;
@@ -481,6 +487,49 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
           const int j = dof_to_ijk[static_cast<std::size_t>(local)][1];
           lex_to_local[i + n1d * j] = local;
         }
+
+        // H1 and L2 use different local ordering at the same LGL nodes.
+        // Compare the compact gather against actual FE shape evaluation.
+        mfem::H1_FECollection scalar_fec(order, dim,
+                                        mfem::BasisType::GaussLobatto);
+        mfem::FiniteElementSpace scalar_fes(&mesh, &scalar_fec);
+        const auto& scalar_fe = *scalar_fes.GetFE(0);
+        mfem::Array<int> scalar_dofs, nodal_map(dof), dense_map(dof * dof);
+        scalar_fes.GetElementDofs(0, scalar_dofs);
+        mfem::Vector scalar_field(scalar_fes.GetVSize()), shape(dof);
+        for (int j = 0; j < scalar_field.Size(); ++j)
+          scalar_field[j] = std::sin(0.37 * j) + 0.05 * j;
+        mfem::DenseMatrix interpolation(dof, dof), nodal_interpolation;
+        bool complete_node_map = true;
+        for (int row = 0; row < dof; ++row)
+        {
+          const auto& point = fes.GetFE(0)->GetNodes().IntPoint(row);
+          scalar_fe.CalcShape(point, shape);
+          int match = -1;
+          for (int j = 0; j < dof; ++j)
+          {
+            dense_map[row + dof * j] = scalar_dofs[j];
+            interpolation(row, j) = shape[j];
+            const auto& node = scalar_fe.GetNodes().IntPoint(j);
+            if (point.x == node.x && point.y == node.y) match = j;
+          }
+          complete_node_map = complete_node_map && match >= 0;
+          nodal_map[row] = match >= 0 ? scalar_dofs[match] : 0;
+        }
+        ctx.Check(complete_node_map,
+                  "H1/L2 LGL points admit an exact scalar node permutation");
+        mfem::Vector dense_scalar, gathered_scalar;
+        mfem::dgsem::InterpolateElementScalarDevice(dof, dof, dense_map,
+            interpolation, scalar_field, dense_scalar);
+        mfem::dgsem::InterpolateElementScalarDevice(dof, dof, nodal_map,
+            nodal_interpolation, scalar_field, gathered_scalar);
+        dense_scalar.HostRead(); gathered_scalar.HostRead();
+        double interpolation_error = 0.0;
+        for (int row = 0; row < dof; ++row)
+          interpolation_error = std::max(interpolation_error,
+              std::abs(double(dense_scalar[row] - gathered_scalar[row])));
+        ctx.Check(interpolation_error < pointwise_tol,
+                  "Exact scalar node gather matches dense FE interpolation");
       }
 
       mfem::DenseMatrix metrics;
@@ -815,6 +864,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
               expected(row, equation) *= compact_mass(row, 0);
             }
           for (bool frozen_speed : {false, true})
+          for (bool tensor_contraction : {false, true})
           {
             mfem::DenseMatrix fused;
             mfem::Vector fused_speeds, ordinary_speeds;
@@ -822,19 +872,75 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
                 rho_floor, llf, frozen_speed, lex_to_local, basis.Dsplit,
                 basis.weights, states, sigma, fused_metric, compact_mass,
                 boundary_weights, boundary_row_offsets, boundary_row_face_ids,
-                boundary_row_face_signs, unique_flux, fused_speeds, fused);
+                boundary_row_face_signs, unique_flux, fused_speeds, fused,
+                tensor_contraction);
             mfem::dgsem::ComputeEulerNodalCharacteristicSpeedsDevice(2, gamma,
                 rho_floor, states, sigma, ordinary_speeds, frozen_speed);
             ctx.Check(MaxDifference(fused, expected) < 32.0 * pointwise_tol,
-                      "Fused CUDA residual matches independent central/LLF host algebra");
+                      tensor_contraction
+                        ? "Fused FP64 DMMA residual matches central/LLF host algebra"
+                        : "Fused FP64 SIMT residual matches central/LLF host algebra");
             fused_speeds.HostRead(); ordinary_speeds.HostRead();
             double speed_error = 0.0;
             for (int row = 0; row < dof; ++row)
+            {
+              if (!std::isfinite(double(fused_speeds[row])) ||
+                  !std::isfinite(double(ordinary_speeds[row])))
+              {
+                speed_error = std::numeric_limits<double>::infinity();
+                break;
+              }
               speed_error = std::max(speed_error,
                   std::abs(double(fused_speeds[row] - ordinary_speeds[row])));
+            }
             ctx.Check(speed_error < pointwise_tol,
                       "Fused CUDA residual retains nodal characteristic speeds");
           }
+        }
+        // LLF floors density inside its pressure calculation, independently
+        // of the raw-density physical flux. Compare this rare branch with the
+        // existing unfused implementation using substantial kinetic energy.
+        mfem::DenseMatrix floored_states(states), floored_flux;
+        floored_states.HostReadWrite();
+        floored_states(0, 0) = 0.5 * rho_floor;
+        floored_states(0, 1) = 0.125 * std::sqrt(rho_floor);
+        floored_states(0, 2) = 0.0625 * std::sqrt(rho_floor);
+        mfem::DenseMatrix ordinary_weak, pair_dissipation;
+        mfem::Vector ordinary_speeds;
+        mfem::dgsem::BuildEulerContravariantFluxDevice(2, gamma, rho_floor,
+            floored_states, sigma, fused_metric, floored_flux, ordinary_speeds);
+        mfem::dgsem::ApplyCentralVolumeDevice(2, n1d, lex_to_local,
+            basis.Dsplit, basis.weights, floored_flux, ordinary_weak);
+        mfem::dgsem::AddEulerLLFVolumeDissipationDevice(2, 1, n1d, gamma,
+            rho_floor, lex_to_local, basis.Dsplit, basis.weights,
+            floored_states, sigma, fused_metric, pair_dissipation,
+            ordinary_weak);
+        ordinary_weak.HostReadWrite();
+        for (int row = 0; row < dof; ++row)
+          for (int equation = 0; equation < 4; ++equation)
+          {
+            for (int adjacent = boundary_row_offsets[row];
+                 adjacent < boundary_row_offsets[row + 1]; ++adjacent)
+            {
+              const int face = boundary_row_face_ids[adjacent];
+              ordinary_weak(row, equation) += boundary_row_face_signs[adjacent] *
+                  boundary_weights(face) * unique_flux(face, equation);
+            }
+            ordinary_weak(row, equation) *= compact_mass(row, 0);
+          }
+        for (bool tensor_contraction : {false, true})
+        {
+          mfem::DenseMatrix fused;
+          mfem::Vector fused_speeds;
+          mfem::dgsem::ApplyFusedEulerResidualDevice(1, n1d, gamma, rho_floor,
+              true, false, lex_to_local, basis.Dsplit, basis.weights,
+              floored_states, sigma, fused_metric, compact_mass,
+              boundary_weights, boundary_row_offsets, boundary_row_face_ids,
+              boundary_row_face_signs, unique_flux, fused_speeds, fused,
+              tensor_contraction);
+          ctx.Check(MaxDifference(fused, ordinary_weak) <
+                        64.0 * pointwise_tol * std::max(1.0, MaxAbs(ordinary_weak)),
+                    "Fused LLF residual preserves floored-density helper algebra");
         }
       }
       constant_volume.HostRead();

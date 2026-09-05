@@ -37,7 +37,7 @@ namespace mfem
 
 class PhysicalBoundaryFluxIntegralProvider;
 
-/// Explicit SSPRK(3,3) or SSPRK(10,4) with stage callbacks.
+/// Explicit RK with stage callbacks; research methods have SSP coefficient zero.
 ///
 /// The historical class name is retained so existing limiter and application
 /// plumbing remains source-compatible. SSPRK(3,3) remains the default method.
@@ -333,6 +333,7 @@ private:
 
   // Work vectors
   Vector y_, k_;
+  std::array<Vector, 6> research_stage_work_;
   Vector attempted_physical_boundary_flux_integral_;
   Vector attempted_physical_boundary_flux_absolute_integral_;
   Vector cumulative_physical_boundary_flux_integral_;

@@ -7,6 +7,7 @@
 
 #if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
 #include <cuda_runtime.h>
+#include <mma.h>
 #endif
 
 namespace mfem
@@ -549,11 +550,14 @@ void InterpolateElementScalarDevice(int rows,
                                     const Vector& scalar_field,
                                     Vector& packed_scalar)
 {
+  const bool exact_nodal_gather =
+      interpolation.Height() == 0 && interpolation.Width() == 0;
   MFEM_VERIFY(rows >= 0 && scalar_dofs_per_element > 0 &&
                 scalar_element_dofs.Size() ==
-                  rows * scalar_dofs_per_element &&
-                interpolation.Height() == rows &&
-                interpolation.Width() == scalar_dofs_per_element,
+                  rows * (exact_nodal_gather ? 1 : scalar_dofs_per_element) &&
+                (exact_nodal_gather ||
+                 (interpolation.Height() == rows &&
+                  interpolation.Width() == scalar_dofs_per_element)),
               "DGSEM production sigma interpolation size mismatch.");
   if (packed_scalar.Size() != rows)
   {
@@ -561,9 +565,19 @@ void InterpolateElementScalarDevice(int rows,
   }
   packed_scalar.UseDevice(true);
   const int* map = scalar_element_dofs.Read();
-  const real_t* shape = interpolation.Read();
   const real_t* field = scalar_field.Read();
   real_t* output = packed_scalar.Write();
+  if (exact_nodal_gather)
+  {
+    mfem::forall(rows, [=] MFEM_HOST_DEVICE(int row)
+    {
+      const int dof_index = map[row];
+      output[row] = dof_index >= 0
+          ? field[dof_index] : -field[-1 - dof_index];
+    });
+    return;
+  }
+  const real_t* shape = interpolation.Read();
   mfem::forall(
     rows,
     [=] MFEM_HOST_DEVICE(int row)
@@ -1630,7 +1644,7 @@ struct FusedResidualData
   real_t* strong = nullptr;
 };
 
-template<int N, bool LLF>
+template<int N, bool LLF, bool Tensor>
 __global__ void FusedEulerResidualKernel(FusedResidualData data)
 {
   constexpr int dof = N * N;
@@ -1645,6 +1659,8 @@ __global__ void FusedEulerResidualKernel(FusedResidualData data)
   __shared__ real_t acoustic[dof];
   __shared__ real_t matrix[dof];
   __shared__ real_t pair[LLF ? 4 * pairs : 1];
+  __shared__ real_t central[Tensor ? 8 * dof : 1];
+  __shared__ __align__(32) double tensor_scratch[Tensor ? 4 * 128 : 1];
 
   // The complete node state is loaded once. All physical flux entries share
   // one pressure calculation and the established scalar-IGR algebra helpers.
@@ -1679,11 +1695,15 @@ __global__ void FusedEulerResidualKernel(FusedResidualData data)
     if constexpr (LLF)
     {
       const real_t rho = fmax(u[0], data.density_floor);
+      const real_t llf_pressure = u[0] < data.density_floor
+          ? (data.gamma - 1.0) *
+              (u[3] - 0.5 * (u[1] * u[1] + u[2] * u[2]) / rho)
+          : pressure;
       velocity[thread] = u[1] / rho;
       velocity[thread + dof] = u[2] / rho;
       acoustic[thread] = sqrt(fabs(
           dg_igr::frozen_scalar_igr_algebra::
-              FrozenSigmaLocalHyperbolicityMargin(pressure, sigma,
+              FrozenSigmaLocalHyperbolicityMargin(llf_pressure, sigma,
                                                    data.gamma)) / rho);
     }
 
@@ -1736,6 +1756,65 @@ __global__ void FusedEulerResidualKernel(FusedResidualData data)
     __syncthreads();
   }
 
+  if constexpr (Tensor)
+  {
+    // The four conserved fields supply real columns, not duplicated right-
+    // hand sides. Directional lines remain on chip with their nodal physics.
+    // The 8-row extent, final 8-column tile, and final inner chunk are padded.
+    constexpr int column_tiles = (4 * N + 7) / 8;
+    const int warp = thread / 32;
+    const int lane = thread % 32;
+    double* const a_values = tensor_scratch + warp * 128;
+    double* const b_values = a_values + 32;
+    double* const product = a_values + 64;
+    namespace wmma = nvcuda::wmma;
+    for (int tile = warp; tile < 2 * column_tiles; tile += 4)
+    {
+      const int direction = tile / column_tiles;
+      const int first_column = (tile % column_tiles) * 8;
+      wmma::fragment<wmma::accumulator, 8, 8, 4, double> accumulator;
+      wmma::fill_fragment(accumulator, 0.0);
+      for (int chunk = 0; chunk < N; chunk += 4)
+      {
+        const int a_row = lane / 4;
+        const int a_inner = chunk + lane % 4;
+        a_values[lane] = a_row < N && a_inner < N
+            ? matrix[a_row + N * a_inner] : 0.0;
+        const int inner = chunk + lane / 8;
+        const int column = first_column + lane % 8;
+        const int equation = column / N;
+        const int line = column % N;
+        const int node = direction == 0 ? inner + N * line : line + N * inner;
+        b_values[lane] = inner < N && equation < 4
+            ? flux[node + dof * (equation + 4 * direction)] : 0.0;
+        __syncwarp();
+        wmma::fragment<wmma::matrix_a, 8, 8, 4, double, wmma::row_major> a;
+        wmma::fragment<wmma::matrix_b, 8, 8, 4, double, wmma::row_major> b;
+        wmma::load_matrix_sync(a, a_values, 4);
+        wmma::load_matrix_sync(b, b_values, 8);
+        wmma::mma_sync(accumulator, a, b, accumulator);
+        __syncwarp();
+      }
+      wmma::store_matrix_sync(product, accumulator, 8, wmma::mem_row_major);
+      __syncwarp();
+      for (int entry = lane; entry < 64; entry += 32)
+      {
+        const int coordinate = entry / 8;
+        const int column = first_column + entry % 8;
+        const int equation = column / N;
+        const int line = column % N;
+        if (coordinate < N && equation < 4)
+        {
+          const int node = direction == 0
+              ? coordinate + N * line : line + N * coordinate;
+          central[node + dof * (equation + 4 * direction)] = product[entry];
+        }
+      }
+      __syncwarp();
+    }
+    __syncthreads();
+  }
+
   for (int entry = thread; entry < 4 * dof; entry += blockDim.x)
   {
     const int node = entry % dof;
@@ -1745,12 +1824,20 @@ __global__ void FusedEulerResidualKernel(FusedResidualData data)
     const int row = element * dof + data.local[node];
     real_t x = 0.0;
     real_t y = 0.0;
-    for (int other = 0; other < N; ++other)
+    if constexpr (Tensor)
     {
-      x += matrix[i + N * other] *
-          flux[other + N * j + dof * equation];
-      y += matrix[j + N * other] *
-          flux[i + N * other + dof * (equation + 4)];
+      x = central[node + dof * equation];
+      y = central[node + dof * (equation + 4)];
+    }
+    else
+    {
+      for (int other = 0; other < N; ++other)
+      {
+        x += matrix[i + N * other] *
+            flux[other + N * j + dof * equation];
+        y += matrix[j + N * other] *
+            flux[i + N * other + dof * (equation + 4)];
+      }
     }
     const real_t weight = data.weights[i] * data.weights[j];
     real_t value = weight * (x + y);
@@ -1790,10 +1877,19 @@ __global__ void FusedEulerResidualKernel(FusedResidualData data)
 }
 
 template<int N>
-void LaunchFusedResidual(int ne, bool llf, const FusedResidualData& data)
+void LaunchFusedResidual(int ne, bool llf, bool tensor,
+                         const FusedResidualData& data)
 {
-  if (llf) FusedEulerResidualKernel<N, true><<<ne, 128>>>(data);
-  else FusedEulerResidualKernel<N, false><<<ne, 128>>>(data);
+  if (tensor)
+  {
+    if (llf) FusedEulerResidualKernel<N, true, true><<<ne, 128>>>(data);
+    else FusedEulerResidualKernel<N, false, true><<<ne, 128>>>(data);
+  }
+  else
+  {
+    if (llf) FusedEulerResidualKernel<N, true, false><<<ne, 128>>>(data);
+    else FusedEulerResidualKernel<N, false, false><<<ne, 128>>>(data);
+  }
 }
 #endif
 } // namespace
@@ -1806,7 +1902,8 @@ void ApplyFusedEulerResidualDevice(
     const DenseMatrix& metrics, const DenseMatrix& inverse_mass,
     const Vector& face_weights, const Array<int>& row_face_offsets,
     const Array<int>& row_face_ids, const Array<int>& row_face_signs,
-    const DenseMatrix& face_flux, Vector& nodal_speeds, DenseMatrix& strong)
+    const DenseMatrix& face_flux, Vector& nodal_speeds, DenseMatrix& strong,
+    bool tensor_contraction)
 {
   const int dof = n1d * n1d;
   const int rows = ne * dof;
@@ -1849,16 +1946,17 @@ void ApplyFusedEulerResidualDevice(
   data.strong = strong.Write();
   switch (n1d)
   {
-    case 2: LaunchFusedResidual<2>(ne, llf_volume, data); break;
-    case 3: LaunchFusedResidual<3>(ne, llf_volume, data); break;
-    case 4: LaunchFusedResidual<4>(ne, llf_volume, data); break;
-    case 5: LaunchFusedResidual<5>(ne, llf_volume, data); break;
+    case 2: LaunchFusedResidual<2>(ne, llf_volume, tensor_contraction, data); break;
+    case 3: LaunchFusedResidual<3>(ne, llf_volume, tensor_contraction, data); break;
+    case 4: LaunchFusedResidual<4>(ne, llf_volume, tensor_contraction, data); break;
+    case 5: LaunchFusedResidual<5>(ne, llf_volume, tensor_contraction, data); break;
   }
   MFEM_VERIFY(cudaGetLastError() == cudaSuccess,
               "Fused DGSEM residual CUDA launch failed.");
 #else
   (void)gamma; (void)density_floor; (void)llf_volume;
   (void)frozen_sigma_spectral_speed;
+  (void)tensor_contraction;
   MFEM_ABORT("Fused DGSEM residual requires a CUDA-compiled device source.");
 #endif
 }
