@@ -174,6 +174,18 @@ target_include_directories(dg_igr_unit_tests PRIVATE
 )
 
 if(MFEM_USE_MPI AND MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
+  add_executable(dg_igr_screened_locality_probe igr_screened_locality_probe.cpp)
+  target_link_libraries(dg_igr_screened_locality_probe PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_screened_locality_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+  add_executable(dg_igr_screened_spacetime_probe research/screened_spacetime_probe.cpp)
+  target_link_libraries(dg_igr_screened_spacetime_probe PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_screened_spacetime_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  add_test(NAME dg_igr_screened_spacetime_cpu
+    COMMAND dg_igr_screened_spacetime_probe --self-test)
+  set_tests_properties(dg_igr_screened_spacetime_cpu PROPERTIES
+    LABELS "cpu-reference;igr;timestepping;research" TIMEOUT 120)
+
   add_executable(dg_igr_research_rk_test test_research_rk.cpp)
   target_link_libraries(dg_igr_research_rk_test PRIVATE igr_mfem mfem)
   target_include_directories(dg_igr_research_rk_test PRIVATE ${CMAKE_SOURCE_DIR}/include)

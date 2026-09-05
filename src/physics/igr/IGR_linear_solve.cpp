@@ -6,6 +6,7 @@
 #include "IGR_internal_utils.hpp"
 #include "IGR_dense_inverse.hpp"
 #include "IGR_two_level_inverse.hpp"
+#include "IGR_screened_patch_inverse.hpp"
 #include "IGR_stationary_correction.hpp"
 #include "../../numerics/dg/DGFaceQuadratureKernels.hpp"
 
@@ -2197,6 +2198,25 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const bool using_dense_inverse = !dense_inverse_precision.empty();
   const char* two_level_env = std::getenv("DG_IGR_IGR_TWO_LEVEL_INVERSE");
   const bool using_two_level_inverse = two_level_env && two_level_env[0];
+  const char* patch_env = std::getenv("DG_IGR_IGR_PATCH_RADIUS");
+  const bool using_screened_patch = patch_env && patch_env[0];
+  const int patch_radius = using_screened_patch
+    ? ReadEnvInt("DG_IGR_IGR_PATCH_RADIUS", -1) : -1;
+  const char* patch_precision_env = std::getenv("DG_IGR_IGR_PATCH_PRECISION");
+  const std::string patch_precision = using_screened_patch && patch_precision_env
+    ? patch_precision_env : "fp64";
+  const int patch_rebuild_interval = using_screened_patch
+    ? ReadEnvInt("DG_IGR_IGR_PATCH_REBUILD_INTERVAL", 0) : 0;
+  const std::string patch_key = std::to_string(patch_radius) + ":" + patch_precision +
+    ":" + std::to_string(patch_rebuild_interval);
+  MFEM_VERIFY(!using_screened_patch ||
+                (using_cuda && !using_dense_inverse && !using_two_level_inverse &&
+                 patch_radius >= 0 && patch_radius <= 6 &&
+                 patch_rebuild_interval >= 0 &&
+                 (patch_precision == "fp64" || patch_precision == "fp32")),
+              "Screened patch inverse requires CUDA, radius 0..6, fp64|fp32, "
+              "a nonnegative rebuild interval, "
+              "and no global dense or two-level inverse.");
   const char* two_level_coarse_env = std::getenv("DG_IGR_IGR_TWO_LEVEL_COARSE");
   const std::string two_level_coarse =
     two_level_coarse_env ? two_level_coarse_env : "dense";
@@ -2268,6 +2288,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   MFEM_VERIFY(!using_two_level_inverse ||
                 solver_choice == LinearSolverType::FGMRES,
               "Two-level inverse experiment requires explicit FGMRES.");
+  MFEM_VERIFY(!using_screened_patch || solver_choice == LinearSolverType::FGMRES,
+              "Restricted screened patch inverse requires explicit FGMRES.");
 
   // Guardrail: do not use SPD-only Krylov methods when SPD assumptions fail.
   if (RequiresSPD(solver_choice) && !spd_ok)
@@ -2359,7 +2381,30 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   bool using_operator_chebyshev_base = false;
   {
     ::dg_igr::NVTXRange pc_range("IGR/preconditioner-setup");
-    if (using_two_level_inverse)
+    if (using_screened_patch)
+    {
+#if defined(DG_IGR_HAS_SCREENED_PATCH_CUDA)
+      MFEM_VERIFY(!screened_patch_preconditioner_ || screened_patch_key_ == patch_key,
+                  "Cannot change screened patch configuration on a live solver.");
+      if (!screened_patch_preconditioner_ ||
+          (patch_rebuild_interval > 0 && (solve_call - 1) % patch_rebuild_interval == 0))
+      {
+        screened_patch_preconditioner_ = MakeScreenedPatchInversePreconditioner(
+          *A_op, sfes_, patch_radius, patch_precision);
+        screened_patch_key_ = patch_key;
+        if (patch_rebuild_interval > 0 && mfem::Mpi::WorldRank() == 0)
+        {
+          std::cout << "[igr-screened-patch] event=rebuild solve_call=" << solve_call
+                    << " interval=" << patch_rebuild_interval << std::endl;
+        }
+      }
+      screened_patch_preconditioner_->SetOperator(*A_op);
+      prec = screened_patch_preconditioner_.get();
+#else
+      MFEM_ABORT("Screened patch inverse requires a CUDA build.");
+#endif
+    }
+    else if (using_two_level_inverse)
     {
 #if defined(DG_IGR_HAS_TWO_LEVEL_INVERSE_CUDA)
       if (!two_level_inverse_preconditioner_)
@@ -2591,7 +2636,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       using_operator_chebyshev_base = use_base_operator;
     }
     // else None -> leave prec null
-    if (!using_dense_inverse && !using_two_level_inverse)
+    if (!using_dense_inverse && !using_two_level_inverse && !using_screened_patch)
     { prec = owned_prec.get(); }
   }
   const auto pc_setup_stop = std::chrono::steady_clock::now();
@@ -3087,6 +3132,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   if (using_two_level_inverse)
   {
     last_precond_name_ = "two-level-inverse-fp64";
+  }
+  if (using_screened_patch)
+  {
+    last_precond_name_ = "screened-patch-" + patch_precision;
   }
 
   const bool capture_linear_event =

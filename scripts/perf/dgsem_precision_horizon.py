@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded active-wave full-application precision experiment.
+"""Bounded active-wave or stationary-shock application precision experiment.
 
 Build with build.sh first. The caller owns the GPU lease. This helper runs the
 existing smooth-wave application, retains its ordinary output, and records
@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--executable", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--mesh", type=Path)
+    parser.add_argument("--case", choices=("active-wave", "stationary-shock", "supersonic-cylinder"), default="active-wave")
     parser.add_argument("--order", type=int, choices=(1, 2, 3, 4), default=3)
     parser.add_argument("--refine", type=int, choices=(0, 1, 2), default=0)
     parser.add_argument("--dt", type=float, default=0.001)
@@ -34,6 +35,9 @@ def main():
     parser.add_argument("--dense-inverse", choices=("fp64", "fp32", "tf32"))
     parser.add_argument("--two-level-inverse", choices=("dense", "cg"))
     parser.add_argument("--two-level-order", type=int, choices=(1, 2, 3, 4))
+    parser.add_argument("--patch-radius", type=int, choices=range(7))
+    parser.add_argument("--patch-precision", choices=("fp64", "fp32"), default="fp64")
+    parser.add_argument("--patch-rebuild-interval", type=int, default=0)
     parser.add_argument("--dense-setup", choices=("host", "cusolver"))
     parser.add_argument("--integrator", choices=("rk3ssp", "ssprk104", "rk4", "dopri5", "radau-picard5"), default="rk3ssp")
     parser.add_argument("--sigma-space", choices=("L2", "H1"), default="L2")
@@ -49,6 +53,7 @@ def main():
     parser.add_argument("--frozen-sigma-reference", action="store_true")
     parser.add_argument("--stationary-sweeps", type=int, choices=range(1, 17))
     parser.add_argument("--diagnostic-scans", choices=("on", "off"), default="on")
+    parser.add_argument("--conservation-balance", action="store_true")
     parser.add_argument("--timeout", type=float, default=180)
     args = parser.parse_args()
     for value in (args.dt, args.final_time, args.linear_rtol, args.timeout, args.c_alpha):
@@ -62,6 +67,12 @@ def main():
         parser.error("dense setup requires global dense inverse")
     if args.two_level_order and not args.two_level_inverse:
         parser.error("two-level order requires two-level inverse")
+    if args.patch_radius is not None and (args.dense_inverse or args.two_level_inverse or
+                                          args.linear_solver != "fgmres" or args.sigma_space != "L2"):
+        parser.error("screened patches require FGMRES, L2 sigma, and no dense/two-level inverse")
+    if args.patch_rebuild_interval < 0 or (args.patch_radius is None and
+            (args.patch_rebuild_interval or args.patch_precision != "fp64")):
+        parser.error("patch precision/rebuilding requires patches and a nonnegative interval")
     if args.extrapolation_degree and args.sigma_cadence != "extrapolated-every-step":
         parser.error("extrapolation degree requires extrapolated-every-step cadence")
     if args.fused_dmma and not args.fused_residual:
@@ -70,13 +81,17 @@ def main():
         parser.error("stationary correction requires FGMRES fallback")
     source = Path(__file__).resolve().parents[2]
     executable = args.executable.resolve(strict=True)
-    mesh = (args.mesh or source / "examples/dgsem_smooth_advection_periodic/"
-            "smooth_advection_periodic_n6.mesh").resolve(strict=True)
+    default_mesh = {
+        "active-wave": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n6.mesh",
+        "stationary-shock": "examples/inoue_hattori_stationary_shock_1dy/inoue_hattori_stationary_shock_1dy.mesh",
+        "supersonic-cylinder": "examples/supersonic_example_w_igr/supersonic_cylinder.msh",
+    }[args.case]
+    mesh = (args.mesh or source / default_mesh).resolve(strict=True)
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=False)
     command = [
         str(executable), "--device", "cuda", "--mesh", str(mesh),
-        "--active-igr-wave", "--discretization", "dgsem", "--dg-backend", "dgsem",
+        "--discretization", "dgsem", "--dg-backend", "dgsem",
         "--order", str(args.order), "--serial-refine", str(args.refine),
         "--parallel-refine", "0", "--regularization", "igr", "--c-alpha", str(args.c_alpha),
         "--igr-alpha-length", "local", "--dgsem-stab", "none",
@@ -100,9 +115,15 @@ def main():
         "--no-glvis", "--no-save-state", "--no-vtk-h1-diagnostics",
         "--no-vtk-l2-diagnostics", "--no-vtk-mpi-rank-field", "--no-vtk-zhang-shu-diagnostics",
     ]
+    if args.case == "active-wave":
+        command.append("--active-igr-wave")
+    if args.conservation_balance:
+        command.append("--conservation-balance")
     environment = os.environ.copy()
     for key in ("DG_IGR_IGR_DENSE_INVERSE", "DG_IGR_IGR_TWO_LEVEL_INVERSE",
                 "DG_IGR_IGR_TWO_LEVEL_COARSE", "DG_IGR_IGR_TWO_LEVEL_ORDER",
+                "DG_IGR_IGR_PATCH_RADIUS", "DG_IGR_IGR_PATCH_PRECISION",
+                "DG_IGR_IGR_PATCH_REBUILD_INTERVAL",
                 "DG_IGR_IGR_DENSE_SETUP", "DG_IGR_IGR_CHEB_ORDER", "DG_IGR_IGR_CHEB_POWER_ITERATIONS",
                 "DG_IGR_IGR_EXTRAPOLATION_DEGREE",
                 "DG_IGR_IGR_SIGMA_BASIS", "DG_IGR_DGSEM_FUSED_RESIDUAL",
@@ -127,6 +148,10 @@ def main():
         environment["DG_IGR_IGR_DENSE_SETUP"] = args.dense_setup
     if args.two_level_order:
         environment["DG_IGR_IGR_TWO_LEVEL_ORDER"] = str(args.two_level_order)
+    if args.patch_radius is not None:
+        environment["DG_IGR_IGR_PATCH_RADIUS"] = str(args.patch_radius)
+        environment["DG_IGR_IGR_PATCH_PRECISION"] = args.patch_precision
+        environment["DG_IGR_IGR_PATCH_REBUILD_INTERVAL"] = str(args.patch_rebuild_interval)
     if args.extrapolation_degree:
         environment["DG_IGR_IGR_EXTRAPOLATION_DEGREE"] = str(args.extrapolation_degree)
     if args.sigma_basis:
@@ -172,6 +197,7 @@ def main():
         if line.startswith(("[explicit-time]", "[igr-closure-certificate]",
                             "[igr-linear] event=run-summary", "[igr-dense-inverse]",
                             "[igr-two-level]", "[igr-sigma-basis]",
+                            "[igr-screened-patch]",
                             "[igr-sigma-predictor]", "[dgsem-fused-residual]",
                             "[igr-stationary]", "[dgsem-sigma-interpolation]",
                             "[dgsem-op] event=run-summary")):
@@ -183,16 +209,22 @@ def main():
     dense_setup = summaries.get("[igr-dense-inverse]:setup", {})
     linear = summaries.get("[igr-linear]:run-summary", {})
     two_level_setup = summaries.get("[igr-two-level]:setup", {})
+    patch_setup = summaries.get("[igr-screened-patch]:setup", {})
     if args.dense_inverse:
         requested_pc = (dense_setup.get("precision") == args.dense_inverse and
                         linear.get("last_precond") == "dense-inverse-" + args.dense_inverse and
                         linear.get("last_solver") == args.linear_solver)
+    elif args.patch_radius is not None:
+        requested_pc = (patch_setup.get("radius") == str(args.patch_radius) and
+                        patch_setup.get("precision") == args.patch_precision and
+                        linear.get("last_precond") == "screened-patch-" + args.patch_precision and
+                        linear.get("last_solver") == "fgmres")
     elif args.two_level_inverse:
         requested_pc = (bool(two_level_setup) and
                         linear.get("last_precond") == "two-level-inverse-fp64" and
                         linear.get("last_solver") == "fgmres")
     else:
-        requested_pc = (not dense_setup and not two_level_setup and
+        requested_pc = (not dense_setup and not two_level_setup and not patch_setup and
                         not linear.get("last_precond", "").startswith("dense-inverse-"))
     record["requested_preconditioner_executed"] = requested_pc
     record["requested_execution_executed"] = (
