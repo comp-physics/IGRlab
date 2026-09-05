@@ -2200,7 +2200,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const char* two_level_coarse_env = std::getenv("DG_IGR_IGR_TWO_LEVEL_COARSE");
   const std::string two_level_coarse =
     two_level_coarse_env ? two_level_coarse_env : "dense";
-  const int two_level_order = ReadEnvInt("DG_IGR_IGR_TWO_LEVEL_ORDER", 1);
+  const int two_level_order = using_two_level_inverse
+    ? ReadEnvInt("DG_IGR_IGR_TWO_LEVEL_ORDER", 1) : 1;
   const std::string two_level_key = two_level_coarse + ":" + std::to_string(two_level_order);
   MFEM_VERIFY(!using_two_level_inverse ||
                 (std::string(two_level_env) == "fp64" && using_cuda &&
