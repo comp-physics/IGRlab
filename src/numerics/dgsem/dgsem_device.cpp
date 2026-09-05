@@ -5,6 +5,10 @@
 #include <cmath>
 #include <limits>
 
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+#include <cuda_runtime.h>
+#endif
+
 namespace mfem
 {
 namespace dgsem
@@ -66,18 +70,17 @@ MFEM_HOST_DEVICE inline real_t EulerNodalCharacteristicSpeed(
            : transport_speed + sqrt(gamma * pressure / rho);
 }
 
-MFEM_HOST_DEVICE inline real_t EulerTensorFluxEntry(const real_t* state,
+MFEM_HOST_DEVICE inline real_t EulerTensorFluxEntryWithPressure(const real_t* state,
                                                     int stride,
                                                     int dim,
                                                     int equation,
                                                     int physical_direction,
-                                                    real_t gamma,
+                                                    real_t pressure,
                                                     real_t sigma,
                                                     real_t rho_floor)
 {
   const real_t rho = state[0];
   const real_t momentum_direction = state[(1 + physical_direction) * stride];
-  const real_t pressure = EulerPressure(state, stride, dim, gamma);
   if (equation == 0)
   {
     return momentum_direction;
@@ -96,6 +99,20 @@ MFEM_HOST_DEVICE inline real_t EulerTensorFluxEntry(const real_t* state,
   return momentum_direction * (energy + pressure) / rho +
          dg_igr::frozen_scalar_igr_algebra::TensorSigmaEnergyTerm(
            sigma, momentum_direction, rho, rho_floor);
+}
+
+MFEM_HOST_DEVICE inline real_t EulerTensorFluxEntry(const real_t* state,
+                                                    int stride,
+                                                    int dim,
+                                                    int equation,
+                                                    int physical_direction,
+                                                    real_t gamma,
+                                                    real_t sigma,
+                                                    real_t rho_floor)
+{
+  return EulerTensorFluxEntryWithPressure(state, stride, dim, equation,
+      physical_direction, EulerPressure(state, stride, dim, gamma), sigma,
+      rho_floor);
 }
 
 MFEM_HOST_DEVICE inline real_t EulerNormalFluxEntry(const real_t* state,
@@ -1417,7 +1434,8 @@ void AssembleEulerRusanovFacesDevice(int dim,
                                      DenseMatrix& face_flux,
                                      Vector& face_speeds,
                                      DenseMatrix& weak_surface,
-                                     bool frozen_sigma_spectral_speed)
+                                     bool frozen_sigma_spectral_speed,
+                                     bool assemble_weak_surface)
 {
   const int nfaces = left_states.Height();
   const int num_equations = dim + 2;
@@ -1463,7 +1481,7 @@ void AssembleEulerRusanovFacesDevice(int dim,
   const int* row_sign = row_face_signs.Read();
   real_t* numerical_flux = face_flux.Write();
   real_t* speed = face_speeds.Write();
-  real_t* surface = weak_surface.Write();
+  real_t* surface = assemble_weak_surface ? weak_surface.Write() : nullptr;
 
   mfem::forall(
     nfaces,
@@ -1516,6 +1534,7 @@ void AssembleEulerRusanovFacesDevice(int dim,
       }
     });
 
+  if (!assemble_weak_surface) return;
   mfem::forall(
     rows * num_equations,
     [=] MFEM_HOST_DEVICE(int entry)
@@ -1583,6 +1602,265 @@ void IntegratePhysicalBoundaryFluxDevice(const Array<int>& ownership,
       }
       integral[equation] = value;
     });
+}
+
+namespace
+{
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+struct FusedResidualData
+{
+  int rows = 0;
+  int face_rows = 0;
+  real_t gamma = 1.4;
+  real_t density_floor = 1.e-12;
+  bool frozen_sigma_speed = false;
+  const int* local = nullptr;
+  const real_t* split = nullptr;
+  const real_t* weights = nullptr;
+  const real_t* state = nullptr;
+  const real_t* sigma = nullptr;
+  const real_t* metrics = nullptr;
+  const real_t* inverse_mass = nullptr;
+  const real_t* face_weights = nullptr;
+  const int* row_offsets = nullptr;
+  const int* row_faces = nullptr;
+  const int* row_signs = nullptr;
+  const real_t* face_flux = nullptr;
+  real_t* speeds = nullptr;
+  real_t* strong = nullptr;
+};
+
+template<int N, bool LLF>
+__global__ void FusedEulerResidualKernel(FusedResidualData data)
+{
+  constexpr int dof = N * N;
+  constexpr int pairs_per_line = N * (N - 1) / 2;
+  constexpr int pairs = 2 * N * pairs_per_line;
+  const int element = blockIdx.x;
+  const int thread = threadIdx.x;
+  __shared__ real_t state[4 * dof];
+  __shared__ real_t flux[8 * dof];
+  __shared__ real_t metric[4 * dof];
+  __shared__ real_t velocity[2 * dof];
+  __shared__ real_t acoustic[dof];
+  __shared__ real_t matrix[dof];
+  __shared__ real_t pair[LLF ? 4 * pairs : 1];
+
+  // The complete node state is loaded once. All physical flux entries share
+  // one pressure calculation and the established scalar-IGR algebra helpers.
+  if (thread < dof)
+  {
+    const int row = element * dof + data.local[thread];
+    real_t u[4];
+    for (int equation = 0; equation < 4; ++equation)
+    {
+      u[equation] = data.state[row + data.rows * equation];
+      state[thread + dof * equation] = u[equation];
+    }
+    const real_t sigma = data.sigma[row];
+    const real_t pressure = EulerPressure(u, 1, 2, data.gamma);
+    for (int component = 0; component < 4; ++component)
+      metric[thread + dof * component] =
+          data.metrics[row + data.rows * component];
+    for (int equation = 0; equation < 4; ++equation)
+    {
+      const real_t fx = EulerTensorFluxEntryWithPressure(
+          u, 1, 2, equation, 0, pressure, sigma, data.density_floor);
+      const real_t fy = EulerTensorFluxEntryWithPressure(
+          u, 1, 2, equation, 1, pressure, sigma, data.density_floor);
+      for (int direction = 0; direction < 2; ++direction)
+        flux[thread + dof * (equation + 4 * direction)] =
+            metric[thread + dof * (2 * direction)] * fx +
+            metric[thread + dof * (2 * direction + 1)] * fy;
+    }
+    data.speeds[row] = EulerNodalCharacteristicSpeed(
+        u, 1, 2, data.gamma, sigma, data.density_floor,
+        data.frozen_sigma_speed);
+    if constexpr (LLF)
+    {
+      const real_t rho = fmax(u[0], data.density_floor);
+      velocity[thread] = u[1] / rho;
+      velocity[thread + dof] = u[2] / rho;
+      acoustic[thread] = sqrt(fabs(
+          dg_igr::frozen_scalar_igr_algebra::
+              FrozenSigmaLocalHyperbolicityMargin(pressure, sigma,
+                                                   data.gamma)) / rho);
+    }
+
+    // Exact separable central operator. This folds the two-point arithmetic
+    // average into one matrix and a diagonal row-sum term, including endpoints.
+    const int i = thread % N;
+    const int m = thread / N;
+    real_t coefficient = 0.0;
+    if (i != m)
+      coefficient = -0.5 * data.split[i + N * m];
+    else
+      for (int other = 0; other < N; ++other)
+        if (other != i) coefficient -= 0.5 * data.split[i + N * other];
+    matrix[thread] = coefficient;
+  }
+  __syncthreads();
+
+  if constexpr (LLF)
+  {
+    for (int index = thread; index < pairs; index += blockDim.x)
+    {
+      const int direction = index / (N * pairs_per_line);
+      const int rest = index - direction * N * pairs_per_line;
+      const int line = rest / pairs_per_line;
+      int ordinal = rest - line * pairs_per_line;
+      int low = 0;
+      while (ordinal >= N - low - 1)
+      {
+        ordinal -= N - low - 1;
+        ++low;
+      }
+      const int high = low + ordinal + 1;
+      const int left = direction == 0 ? low + N * line : line + N * low;
+      const int right = direction == 0 ? high + N * line : line + N * high;
+      const real_t mx = 0.5 * (metric[left + dof * (2 * direction)] +
+                               metric[right + dof * (2 * direction)]);
+      const real_t my = 0.5 * (metric[left + dof * (2 * direction + 1)] +
+                               metric[right + dof * (2 * direction + 1)]);
+      const real_t norm = sqrt(fmax(mx * mx + my * my, 0.0));
+      const real_t speed_left = fabs(velocity[left] * mx +
+          velocity[left + dof] * my) + acoustic[left] * norm;
+      const real_t speed_right = fabs(velocity[right] * mx +
+          velocity[right + dof] * my) + acoustic[right] * norm;
+      const real_t scale = fmax(isfinite(speed_left) ? speed_left : 0.0,
+                                isfinite(speed_right) ? speed_right : 0.0);
+      for (int equation = 0; equation < 4; ++equation)
+        pair[index + pairs * equation] = -0.5 * scale *
+            (state[right + dof * equation] - state[left + dof * equation]);
+    }
+    __syncthreads();
+  }
+
+  for (int entry = thread; entry < 4 * dof; entry += blockDim.x)
+  {
+    const int node = entry % dof;
+    const int equation = entry / dof;
+    const int i = node % N;
+    const int j = node / N;
+    const int row = element * dof + data.local[node];
+    real_t x = 0.0;
+    real_t y = 0.0;
+    for (int other = 0; other < N; ++other)
+    {
+      x += matrix[i + N * other] *
+          flux[other + N * j + dof * equation];
+      y += matrix[j + N * other] *
+          flux[i + N * other + dof * (equation + 4)];
+    }
+    const real_t weight = data.weights[i] * data.weights[j];
+    real_t value = weight * (x + y);
+    if constexpr (LLF)
+    {
+      real_t dissipative = 0.0;
+      for (int direction = 0; direction < 2; ++direction)
+      {
+        const int coordinate = direction == 0 ? i : j;
+        const int line = direction == 0 ? j : i;
+        for (int other = 0; other < N; ++other)
+        {
+          if (other == coordinate) continue;
+          const int low = other < coordinate ? other : coordinate;
+          const int high = other < coordinate ? coordinate : other;
+          const int index = direction * N * pairs_per_line +
+              line * pairs_per_line + PairOrdinal(low, high, N);
+          dissipative -= data.split[coordinate + N * other] *
+                         pair[index + pairs * equation];
+        }
+      }
+      value += weight * dissipative;
+    }
+    real_t surface = 0.0;
+    for (int adjacent = data.row_offsets[row];
+         adjacent < data.row_offsets[row + 1]; ++adjacent)
+    {
+      const int face = data.row_faces[adjacent];
+      const real_t weighted = data.face_weights[face] *
+          data.face_flux[face + data.face_rows * equation];
+      if (data.row_signs[adjacent] < 0) surface -= weighted;
+      else surface += weighted;
+    }
+    value += surface;
+    data.strong[row + data.rows * equation] = data.inverse_mass[row] * value;
+  }
+}
+
+template<int N>
+void LaunchFusedResidual(int ne, bool llf, const FusedResidualData& data)
+{
+  if (llf) FusedEulerResidualKernel<N, true><<<ne, 128>>>(data);
+  else FusedEulerResidualKernel<N, false><<<ne, 128>>>(data);
+}
+#endif
+} // namespace
+
+void ApplyFusedEulerResidualDevice(
+    int ne, int n1d, real_t gamma, real_t density_floor,
+    bool llf_volume, bool frozen_sigma_spectral_speed,
+    const Array<int>& lex_to_local, const DenseMatrix& split_matrix,
+    const Vector& weights, const DenseMatrix& states, const Vector& sigma,
+    const DenseMatrix& metrics, const DenseMatrix& inverse_mass,
+    const Vector& face_weights, const Array<int>& row_face_offsets,
+    const Array<int>& row_face_ids, const Array<int>& row_face_signs,
+    const DenseMatrix& face_flux, Vector& nodal_speeds, DenseMatrix& strong)
+{
+  const int dof = n1d * n1d;
+  const int rows = ne * dof;
+  MFEM_VERIFY(ne > 0 && n1d >= 2 && n1d <= 5 && states.Height() == rows &&
+      states.Width() == 4 && sigma.Size() == rows &&
+      lex_to_local.Size() == dof && split_matrix.Height() == n1d &&
+      split_matrix.Width() == n1d && weights.Size() == n1d &&
+      metrics.Height() == rows && metrics.Width() == 4 &&
+      inverse_mass.Height() == rows && inverse_mass.Width() == 1 &&
+      face_flux.Width() == 4 && face_flux.Height() == face_weights.Size() &&
+      row_face_offsets.Size() == rows + 1 &&
+      row_face_ids.Size() == row_face_signs.Size(),
+      "Fused DGSEM residual requires 2D p1--p4 and compact diagonal mass.");
+  if (strong.Height() != rows || strong.Width() != 4) strong.SetSize(rows, 4);
+  if (nodal_speeds.Size() != rows) nodal_speeds.SetSize(rows);
+  strong.GetMemory().UseDevice(true);
+  nodal_speeds.UseDevice(true);
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+  MFEM_VERIFY(Device::Allows(Backend::CUDA_MASK),
+              "Fused DGSEM residual requires the CUDA backend.");
+  FusedResidualData data;
+  data.rows = rows;
+  data.face_rows = face_flux.Height();
+  data.gamma = gamma;
+  data.density_floor = density_floor;
+  data.frozen_sigma_speed = frozen_sigma_spectral_speed;
+  data.local = lex_to_local.Read();
+  data.split = split_matrix.Read();
+  data.weights = weights.Read();
+  data.state = states.Read();
+  data.sigma = sigma.Read();
+  data.metrics = metrics.Read();
+  data.inverse_mass = inverse_mass.Read();
+  data.face_weights = face_weights.Read();
+  data.row_offsets = row_face_offsets.Read();
+  data.row_faces = row_face_ids.Read();
+  data.row_signs = row_face_signs.Read();
+  data.face_flux = face_flux.Read();
+  data.speeds = nodal_speeds.Write();
+  data.strong = strong.Write();
+  switch (n1d)
+  {
+    case 2: LaunchFusedResidual<2>(ne, llf_volume, data); break;
+    case 3: LaunchFusedResidual<3>(ne, llf_volume, data); break;
+    case 4: LaunchFusedResidual<4>(ne, llf_volume, data); break;
+    case 5: LaunchFusedResidual<5>(ne, llf_volume, data); break;
+  }
+  MFEM_VERIFY(cudaGetLastError() == cudaSuccess,
+              "Fused DGSEM residual CUDA launch failed.");
+#else
+  (void)gamma; (void)density_floor; (void)llf_volume;
+  (void)frozen_sigma_spectral_speed;
+  MFEM_ABORT("Fused DGSEM residual requires a CUDA-compiled device source.");
+#endif
 }
 
 void ApplyInverseMassDevice(int ne,

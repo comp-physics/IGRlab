@@ -6,6 +6,7 @@
  */
 
 #include <memory>
+#include <cstdlib>
 #include <string>
 
 #include "mfem.hpp"
@@ -70,6 +71,19 @@ private:
     if (lower == "l2" || lower == "dg" || lower == "brokendg" ||
         lower == "brokenl2")
     {
+      const char* basis = std::getenv("DG_IGR_IGR_SIGMA_BASIS");
+      if (basis && basis[0])
+      {
+        MFEM_VERIFY(std::string(basis) == "lgl",
+                    "DG_IGR_IGR_SIGMA_BASIS must be lgl or unset.");
+        if (mfem::Mpi::Root())
+        {
+          std::cout << "[igr-sigma-basis] basis=lgl order=" << order
+                    << " representation=equivalent-L2-space" << std::endl;
+        }
+        return std::make_unique<mfem::DG_FECollection>(
+          order, dim, mfem::BasisType::GaussLobatto);
+      }
       return std::make_unique<mfem::DG_FECollection>(order, dim);
     }
     MFEM_VERIFY(false,

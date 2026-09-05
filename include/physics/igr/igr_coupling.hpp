@@ -1,8 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -138,6 +140,31 @@ public:
   {
     sigma_cadence_ = igr_.GetSigmaUpdateCadence();
     sigma_interval_ = std::max(1, igr_.GetSigmaUpdateInterval());
+    const char* degree = std::getenv("DG_IGR_IGR_EXTRAPOLATION_DEGREE");
+    if (degree && *degree)
+    {
+      MFEM_VERIFY(std::strcmp(degree, "1") == 0 ||
+                    std::strcmp(degree, "2") == 0 ||
+                    std::strcmp(degree, "3") == 0,
+                  "DG_IGR_IGR_EXTRAPOLATION_DEGREE must be 1, 2, or 3.");
+      extrapolation_degree_ = degree[0] - '0';
+      MFEM_VERIFY(IsExtrapolatedEveryStep(),
+                  "An explicit IGR extrapolation degree requires the "
+                  "extrapolated-every-step cadence.");
+    }
+    if (degree && *degree)
+    {
+      int rank = 0;
+      MPI_Comm_rank(state_.ParFESpace()->GetComm(), &rank);
+      if (rank == 0)
+      {
+        mfem::out << "[igr-sigma-predictor] degree=" << extrapolation_degree_
+                  << " startup="
+                  << (extrapolation_degree_ == 1 ? "initial-hold"
+                                                 : "every-stage")
+                  << " endpoint=current-equation history=accepted-only\n";
+      }
+    }
   }
 
   void SetTime(double t) override
@@ -1029,6 +1056,7 @@ private:
     if (reset_history)
     {
       extrapolated_previous_valid_ = false;
+      extrapolated_older_count_ = 0;
       extrapolated_previous_dt_ =
         std::numeric_limits<real_t>::quiet_NaN();
     }
@@ -1375,6 +1403,47 @@ private:
       extrapolated_attempt_ready_ = true;
     }
 
+    if (extrapolation_degree_ > 1)
+    {
+      // A lower-order startup hold would leave an O(h^2) state error even
+      // after enough high-order history exists. Solve every startup RHS at
+      // its current state until degree+1 accepted anchors are available.
+      if (!HasHighOrderExtrapolationHistory())
+      {
+        if (rk_stage_ == 0)
+        {
+          igr_.GetSigma() = extrapolated_attempt_anchor_;
+        }
+        else
+        {
+          ParGridFunction state_view(state_.ParFESpace(),
+                                     const_cast<Vector&>(state), 0);
+          SolveExtrapolatedExact(state_view,
+                                 rk_state_generation_,
+                                 rk_step_,
+                                 rk_stage_time_,
+                                 /*warm_start=*/true,
+                                 ::dg_igr::IGRSolvePurpose::ProductionStage,
+                                 /*certify_residual=*/true);
+        }
+      }
+      else
+      {
+        PredictHighOrderExtrapolatedSigma(rk_stage_time_ - rk_step_time_,
+                                          igr_.GetSigma());
+        ++sigma_extrapolated_stage_count_;
+      }
+      MFEM_VERIFY(igr_.GetSigma().CheckFinite() == 0,
+                  "High-order IGR stage prediction is non-finite.");
+      if (HasMultipleOwningRanks())
+      {
+        igr_.GetSigma().ExchangeFaceNbrData();
+      }
+      sigma_initialized_ = true;
+      sigma_state_generation_ = rk_state_generation_;
+      return;
+    }
+
     // Linear extrapolation from two exact accepted endpoints is second-order
     // accurate in sigma. The one history-free startup hold contributes one
     // O(h^2) conservative-state error, so the coupled index-one DAE method is
@@ -1409,7 +1478,12 @@ private:
                 "Extrapolated IGR endpoint has an invalid accepted timestep.");
 
     extrapolated_endpoint_prediction_ = extrapolated_attempt_anchor_;
-    if (extrapolated_attempt_history_valid_)
+    if (extrapolation_degree_ > 1 && HasHighOrderExtrapolationHistory())
+    {
+      PredictHighOrderExtrapolatedSigma(rk_step_dt_,
+                                        extrapolated_endpoint_prediction_);
+    }
+    else if (extrapolated_attempt_history_valid_)
     {
       const real_t theta = rk_step_dt_ / extrapolated_previous_dt_;
       MFEM_VERIFY(std::isfinite(theta),
@@ -1473,6 +1547,28 @@ private:
       std::max(maximum_local_relative_sigma_endpoint_prediction_defect_,
                relative_defect);
 
+    if (extrapolation_degree_ > 1)
+    {
+      // No history mutation occurs before the current endpoint solve and
+      // admission succeed. A rejected attempt therefore cannot enter a later
+      // predictor. An invalidated starting anchor discards older history.
+      if (!extrapolated_attempt_history_valid_)
+      {
+        extrapolated_older_count_ = 0;
+      }
+      else
+      {
+        if (extrapolation_degree_ == 3 && extrapolated_older_count_ > 0)
+        {
+          extrapolated_older_sigma_[1] = extrapolated_older_sigma_[0];
+          extrapolated_older_dt_[1] = extrapolated_older_dt_[0];
+        }
+        extrapolated_older_sigma_[0] = extrapolated_previous_sigma_;
+        extrapolated_older_dt_[0] = extrapolated_previous_dt_;
+        extrapolated_older_count_ =
+          std::min(extrapolation_degree_ - 1, extrapolated_older_count_ + 1);
+      }
+    }
     extrapolated_previous_sigma_ = extrapolated_attempt_anchor_;
     extrapolated_previous_valid_ = true;
     extrapolated_previous_dt_ = rk_step_dt_;
@@ -1481,6 +1577,53 @@ private:
     last_sigma_step_ = rk_step_;
     extrapolated_attempt_ready_ = false;
     extrapolated_attempt_anchor_was_solved_ = false;
+  }
+
+  bool HasHighOrderExtrapolationHistory() const
+  {
+    return extrapolated_attempt_history_valid_ &&
+           extrapolated_older_count_ >= extrapolation_degree_ - 1;
+  }
+
+  void PredictHighOrderExtrapolatedSigma(real_t offset,
+                                         Vector& prediction) const
+  {
+    MFEM_VERIFY(extrapolation_degree_ >= 2 &&
+                  extrapolation_degree_ <= 3 &&
+                  HasHighOrderExtrapolationHistory(),
+                "High-order IGR prediction is missing accepted history.");
+    // Translate accepted times to the current anchor and scale by the most
+    // recent accepted dt. This is nonuniform-time Lagrange interpolation,
+    // without subtracting nearby absolute simulation times.
+    const real_t scale = extrapolated_previous_dt_;
+    const real_t coordinate = offset / scale;
+    std::array<real_t, 4> nodes = {{0.0, -1.0, 0.0, 0.0}};
+    std::array<const Vector*, 4> values = {{
+      &extrapolated_attempt_anchor_, &extrapolated_previous_sigma_,
+      &extrapolated_older_sigma_[0], &extrapolated_older_sigma_[1]}};
+    for (int i = 2; i <= extrapolation_degree_; ++i)
+    {
+      const real_t interval = extrapolated_older_dt_[i - 2];
+      MFEM_VERIFY(std::isfinite(interval) && interval > 0.0,
+                  "High-order IGR history has an invalid accepted interval.");
+      nodes[i] = nodes[i - 1] - interval / scale;
+    }
+    prediction.SetSize(extrapolated_attempt_anchor_.Size());
+    prediction = 0.0;
+    for (int i = 0; i <= extrapolation_degree_; ++i)
+    {
+      real_t weight = 1.0;
+      for (int j = 0; j <= extrapolation_degree_; ++j)
+      {
+        if (j != i)
+        {
+          weight *= (coordinate - nodes[j]) / (nodes[i] - nodes[j]);
+        }
+      }
+      MFEM_VERIFY(std::isfinite(weight),
+                  "High-order IGR extrapolation weight is non-finite.");
+      prediction.Add(weight, *values[i]);
+    }
   }
 
   void AbortExtrapolatedRKStep(const Vector&,
@@ -1724,6 +1867,7 @@ private:
   ::dg_igr::IGRSigmaUpdateCadence sigma_cadence_ =
     ::dg_igr::IGRSigmaUpdateCadence::EveryStage;
   int sigma_interval_ = 1;
+  int extrapolation_degree_ = 1;
   mutable int rk_step_ = -1;
   mutable int rk_stage_ = -1;
   mutable int rk_stage_count_ = -1;
@@ -1744,6 +1888,9 @@ private:
   mutable long long sigma_prefetch_invalidation_count_ = 0;
   mutable Vector extrapolated_current_sigma_;
   mutable Vector extrapolated_previous_sigma_;
+  mutable std::array<Vector, 2> extrapolated_older_sigma_;
+  mutable std::array<real_t, 2> extrapolated_older_dt_ = {{0.0, 0.0}};
+  mutable int extrapolated_older_count_ = 0;
   mutable Vector extrapolated_attempt_anchor_;
   mutable Vector extrapolated_attempt_delta_;
   mutable Vector extrapolated_endpoint_prediction_;

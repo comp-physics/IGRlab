@@ -5,6 +5,7 @@
 #include "utils/profiling/nvtx.hpp"
 #include "IGR_internal_utils.hpp"
 #include "IGR_dense_inverse.hpp"
+#include "IGR_two_level_inverse.hpp"
 #include "../../numerics/dg/DGFaceQuadratureKernels.hpp"
 
 #include <algorithm>
@@ -2193,6 +2194,18 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const std::string dense_inverse_precision =
     dense_inverse_env ? dense_inverse_env : "";
   const bool using_dense_inverse = !dense_inverse_precision.empty();
+  const char* two_level_env = std::getenv("DG_IGR_IGR_TWO_LEVEL_INVERSE");
+  const bool using_two_level_inverse = two_level_env && two_level_env[0];
+  const char* two_level_coarse_env = std::getenv("DG_IGR_IGR_TWO_LEVEL_COARSE");
+  const std::string two_level_coarse =
+    two_level_coarse_env ? two_level_coarse_env : "dense";
+  MFEM_VERIFY(!using_two_level_inverse ||
+                (std::string(two_level_env) == "fp64" && using_cuda &&
+                 !using_dense_inverse),
+              "Two-level inverse requires CUDA, fp64 and no global dense inverse.");
+  MFEM_VERIFY(!using_two_level_inverse ||
+                two_level_coarse == "dense" || two_level_coarse == "cg",
+              "DG_IGR_IGR_TWO_LEVEL_COARSE must be dense|cg.");
   MFEM_VERIFY(!using_dense_inverse || dense_inverse_precision == "fp64" ||
                 dense_inverse_precision == "fp32" ||
                 dense_inverse_precision == "tf32",
@@ -2248,6 +2261,9 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   MFEM_VERIFY(!using_dense_inverse || dense_inverse_precision == "fp64" ||
                 solver_choice == LinearSolverType::FGMRES,
               "Mixed-precision dense inverse requires explicit FGMRES.");
+  MFEM_VERIFY(!using_two_level_inverse ||
+                solver_choice == LinearSolverType::FGMRES,
+              "Two-level inverse experiment requires explicit FGMRES.");
 
   // Guardrail: do not use SPD-only Krylov methods when SPD assumptions fail.
   if (RequiresSPD(solver_choice) && !spd_ok)
@@ -2339,7 +2355,24 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   bool using_operator_chebyshev_base = false;
   {
     ::dg_igr::NVTXRange pc_range("IGR/preconditioner-setup");
-    if (using_dense_inverse)
+    if (using_two_level_inverse)
+    {
+#if defined(DG_IGR_HAS_TWO_LEVEL_INVERSE_CUDA)
+      if (!two_level_inverse_preconditioner_)
+      {
+        two_level_inverse_preconditioner_ =
+          MakeTwoLevelInversePreconditioner(*A_op, sfes_, two_level_coarse);
+        two_level_coarse_mode_ = two_level_coarse;
+      }
+      MFEM_VERIFY(two_level_coarse_mode_ == two_level_coarse,
+                  "Cannot change two-level coarse mode on a live solver.");
+      two_level_inverse_preconditioner_->SetOperator(*A_op);
+      prec = two_level_inverse_preconditioner_.get();
+#else
+      MFEM_ABORT("Two-level inverse experiment requires a CUDA build.");
+#endif
+    }
+    else if (using_dense_inverse)
     {
 #if defined(DG_IGR_HAS_DENSE_INVERSE_CUDA)
       if (!dense_inverse_preconditioner_)
@@ -2554,7 +2587,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       using_operator_chebyshev_base = use_base_operator;
     }
     // else None -> leave prec null
-    if (!using_dense_inverse) { prec = owned_prec.get(); }
+    if (!using_dense_inverse && !using_two_level_inverse)
+    { prec = owned_prec.get(); }
   }
   const auto pc_setup_stop = std::chrono::steady_clock::now();
   last_pc_setup_seconds_ =
@@ -3000,6 +3034,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   if (using_dense_inverse)
   {
     last_precond_name_ = "dense-inverse-" + dense_inverse_precision;
+  }
+  if (using_two_level_inverse)
+  {
+    last_precond_name_ = "two-level-inverse-fp64";
   }
 
   const bool capture_linear_event =

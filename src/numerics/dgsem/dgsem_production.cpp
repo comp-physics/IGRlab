@@ -12,6 +12,7 @@
 #include "physics/bc/detail/euler_boundary_state.hpp"
 #include "physics/igr/igr_flux.hpp"
 #include "utils/config/dg_igr_defaults.hpp"
+#include "utils/config/env_flags.hpp"
 
 #include <algorithm>
 #include <array>
@@ -981,6 +982,7 @@ struct DGSEMProductionCache
   bool sigma_aware_rusanov = false;
   bool frozen_sigma_spectral_speed = false;
   bool llf_volume_active = false;
+  bool fused_residual_logged = false;
   std::uint64_t policy_fingerprint = 0;
   DGSEMProductionWorkspaceEvidence workspace_evidence;
   int ne = 0;
@@ -3281,7 +3283,31 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
   }
 
   const LGLBasis1D& basis = GetLGLBasis1D(c.selection.order);
-  BuildEulerContravariantFluxDevice(op_->dim,
+  const bool fused_residual = ::dg_igr::EnvFlagEnabledDefault(
+      "DG_IGR_DGSEM_FUSED_RESIDUAL", false);
+  if (fused_residual)
+  {
+    MFEM_VERIFY(op_->dim == 2 && c.n1d >= 2 && c.n1d <= 5 &&
+        c.inverse_mass.Width() == 1 && Device::Allows(Backend::CUDA_MASK),
+        "DG_IGR_DGSEM_FUSED_RESIDUAL requires CUDA 2D p1--p4 with "
+        "compact diagonal mass.");
+    if (!c.fused_residual_logged)
+    {
+      int logging_rank = 0;
+#ifdef MFEM_USE_MPI
+      if (context.active) MPI_Comm_rank(context.comm, &logging_rank);
+#endif
+      if (logging_rank == 0)
+        std::cout << "[dgsem-fused-residual] enabled=1 precision=fp64"
+                  << " elements=" << c.ne << " order=" << c.selection.order
+                  << " llf_volume=" << (c.llf_volume_active ? 1 : 0)
+                  << " unique_face_flux=1 packed_output=1" << std::endl;
+      c.fused_residual_logged = true;
+    }
+  }
+  if (!fused_residual)
+  {
+    BuildEulerContravariantFluxDevice(op_->dim,
                                     c.gamma,
                                     c.velocity_density_floor,
                                     c.states,
@@ -3290,16 +3316,16 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
                                     c.contravariant_flux,
                                     c.nodal_speeds,
                                     c.frozen_sigma_spectral_speed);
-  ApplyCentralVolumeDevice(op_->dim,
+    ApplyCentralVolumeDevice(op_->dim,
                            c.n1d,
                            c.lex_to_local,
                            basis.Dsplit,
                            basis.weights,
                            c.contravariant_flux,
                            c.weak_volume);
-  if (c.llf_volume_active)
-  {
-    AddEulerLLFVolumeDissipationDevice(op_->dim,
+    if (c.llf_volume_active)
+    {
+      AddEulerLLFVolumeDissipationDevice(op_->dim,
                                        c.ne,
                                        c.n1d,
                                        c.gamma,
@@ -3312,6 +3338,7 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
                                        c.metrics,
                                        c.volume_pair_dissipation,
                                        c.weak_volume);
+    }
   }
 
   AssembleEulerRusanovFacesDevice(op_->dim,
@@ -3331,7 +3358,8 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
                                   c.face_flux,
                                   c.face_speeds,
                                   c.weak_surface,
-                                  c.frozen_sigma_spectral_speed);
+                                  c.frozen_sigma_spectral_speed,
+                                  !fused_residual);
   if (physical_boundary_flux)
   {
     IntegratePhysicalBoundaryFluxDevice(c.ownership,
@@ -3339,12 +3367,21 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
                                         c.face_flux,
                                         *physical_boundary_flux);
   }
-  AddPackedMatricesDevice(c.weak_surface, c.weak_volume);
-  ApplyInverseMassDevice(c.ne,
-                         c.dof,
-                         c.inverse_mass,
-                         c.weak_volume,
-                         c.strong);
+  if (fused_residual)
+  {
+    ApplyFusedEulerResidualDevice(c.ne, c.n1d, c.gamma,
+        c.velocity_density_floor, c.llf_volume_active,
+        c.frozen_sigma_spectral_speed, c.lex_to_local, basis.Dsplit,
+        basis.weights, c.states, c.sigma_nodes, c.metrics, c.inverse_mass,
+        c.face_weights, c.row_face_offsets, c.row_face_ids, c.row_face_signs,
+        c.face_flux, c.nodal_speeds, c.strong);
+  }
+  else
+  {
+    AddPackedMatricesDevice(c.weak_surface, c.weak_volume);
+    ApplyInverseMassDevice(c.ne, c.dof, c.inverse_mass, c.weak_volume,
+                           c.strong);
+  }
   const real_t max_speed = ReducePackedCharacteristicSpeed(
     context,
     c.nodal_speeds,

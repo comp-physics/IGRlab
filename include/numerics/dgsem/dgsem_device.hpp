@@ -294,7 +294,26 @@ void AssembleEulerRusanovFacesDevice(int dim,
                                      DenseMatrix& face_flux,
                                      Vector& face_speeds,
                                      DenseMatrix& weak_surface,
-                                     bool frozen_sigma_spectral_speed = false);
+                                     bool frozen_sigma_spectral_speed = false,
+                                     bool assemble_weak_surface = true);
+
+/** Fused FP64 CUDA residual for admitted 2D p1--p4 LGL element batches.
+ *
+ * Consumes the unique unweighted face fluxes above. Central transport,
+ * optional LLF volume dissipation, signed face incidence, and diagonal inverse
+ * mass are combined without full-field intermediate writes. This changes
+ * algebraic evaluation only; sigma must still belong to the current stage.
+ * The packed output remains private until the caller's normal final scatter.
+ */
+void ApplyFusedEulerResidualDevice(
+    int ne, int n1d, real_t gamma, real_t density_floor,
+    bool llf_volume, bool frozen_sigma_spectral_speed,
+    const Array<int>& lex_to_local, const DenseMatrix& split_matrix,
+    const Vector& weights, const DenseMatrix& states, const Vector& sigma,
+    const DenseMatrix& metrics, const DenseMatrix& inverse_mass,
+    const Vector& face_weights, const Array<int>& row_face_offsets,
+    const Array<int>& row_face_ids, const Array<int>& row_face_signs,
+    const DenseMatrix& face_flux, Vector& nodal_speeds, DenseMatrix& strong);
 
 /** Evaluate only the packed two-sided Rusanov characteristic-speed bound.
  *

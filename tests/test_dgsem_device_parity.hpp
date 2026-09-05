@@ -730,6 +730,113 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
                                                    boundary_flux,
                                                    boundary_speeds,
                                                    constant_surface);
+      if (runtime.cuda && dim == 2)
+      {
+        // Nonconstant metric coefficients and arbitrary nonconstant unique
+        // face fluxes test the fused algebra independently of free-stream
+        // cancellation. Every existing LGL order and native dof map is used.
+        mfem::DenseMatrix fused_metric(dof, 4), unique_flux(boundary_faces, 4);
+        mfem::DenseMatrix compact_mass(dof, 1), reference_flux(dof, 8);
+        metrics.HostRead(); states.HostRead(); sigma.HostRead();
+        boundary_flux.HostRead();
+        for (int row = 0; row < dof; ++row)
+        {
+          compact_mass(row, 0) = 1.0 + 0.03 * row;
+          for (int component = 0; component < 4; ++component)
+            fused_metric(row, component) = metrics(row, component) *
+                (1.0 + 0.005 * (component + 1) * row);
+          for (int direction = 0; direction < 2; ++direction)
+            for (int equation = 0; equation < 4; ++equation)
+            {
+              double value = 0.0;
+              for (int physical = 0; physical < 2; ++physical)
+                value += fused_metric(row, direction * 2 + physical) *
+                    EulerTensorFluxEntry(states, row, 2, equation, physical,
+                                         gamma, sigma(row), rho_floor);
+              reference_flux(row, equation + 4 * direction) = value;
+            }
+        }
+        for (int face = 0; face < boundary_faces; ++face)
+          for (int equation = 0; equation < 4; ++equation)
+            unique_flux(face, equation) = boundary_flux(face, equation) *
+                                         (1.0 + 0.017 * face);
+        for (bool llf : {false, true})
+        {
+          mfem::DenseMatrix expected;
+          HostCentralVolume(2, n1d, lex_to_local, basis.Dsplit,
+                            basis.weights, reference_flux, expected);
+          if (llf)
+          {
+            for (int direction = 0; direction < 2; ++direction)
+              for (int line = 0; line < n1d; ++line)
+                for (int low = 0; low < n1d; ++low)
+                  for (int high = low + 1; high < n1d; ++high)
+                  {
+                    const int left = lex_to_local[direction == 0
+                        ? low + n1d * line : line + n1d * low];
+                    const int right = lex_to_local[direction == 0
+                        ? high + n1d * line : line + n1d * high];
+                    const double mx = 0.5 * (fused_metric(left, 2 * direction) +
+                                             fused_metric(right, 2 * direction));
+                    const double my = 0.5 * (fused_metric(left, 2 * direction + 1) +
+                                             fused_metric(right, 2 * direction + 1));
+                    auto speed = [&](int row)
+                    {
+                      const double rho = states(row, 0);
+                      const double px = states(row, 1), py = states(row, 2);
+                      const double pressure = (gamma - 1.0) *
+                          (states(row, 3) - 0.5 * (px * px + py * py) / rho);
+                      const double q = gamma * pressure + (gamma - 1.0) * sigma(row);
+                      return std::abs((px / rho) * mx + (py / rho) * my) +
+                          std::sqrt(std::abs(q) / rho) * std::sqrt(mx * mx + my * my);
+                    };
+                    const double scale = std::max(speed(left), speed(right));
+                    for (int equation = 0; equation < 4; ++equation)
+                    {
+                      const double pair = -0.5 * scale *
+                          (states(right, equation) - states(left, equation));
+                      expected(left, equation) -= basis.weights(low) *
+                          basis.weights(line) * basis.Dsplit(low, high) * pair;
+                      expected(right, equation) -= basis.weights(high) *
+                          basis.weights(line) * basis.Dsplit(high, low) * pair;
+                    }
+                  }
+          }
+          for (int row = 0; row < dof; ++row)
+            for (int equation = 0; equation < 4; ++equation)
+            {
+              for (int adjacent = boundary_row_offsets[row];
+                   adjacent < boundary_row_offsets[row + 1]; ++adjacent)
+              {
+                const int face = boundary_row_face_ids[adjacent];
+                expected(row, equation) += boundary_row_face_signs[adjacent] *
+                    boundary_weights(face) * unique_flux(face, equation);
+              }
+              expected(row, equation) *= compact_mass(row, 0);
+            }
+          for (bool frozen_speed : {false, true})
+          {
+            mfem::DenseMatrix fused;
+            mfem::Vector fused_speeds, ordinary_speeds;
+            mfem::dgsem::ApplyFusedEulerResidualDevice(1, n1d, gamma,
+                rho_floor, llf, frozen_speed, lex_to_local, basis.Dsplit,
+                basis.weights, states, sigma, fused_metric, compact_mass,
+                boundary_weights, boundary_row_offsets, boundary_row_face_ids,
+                boundary_row_face_signs, unique_flux, fused_speeds, fused);
+            mfem::dgsem::ComputeEulerNodalCharacteristicSpeedsDevice(2, gamma,
+                rho_floor, states, sigma, ordinary_speeds, frozen_speed);
+            ctx.Check(MaxDifference(fused, expected) < 32.0 * pointwise_tol,
+                      "Fused CUDA residual matches independent central/LLF host algebra");
+            fused_speeds.HostRead(); ordinary_speeds.HostRead();
+            double speed_error = 0.0;
+            for (int row = 0; row < dof; ++row)
+              speed_error = std::max(speed_error,
+                  std::abs(double(fused_speeds[row] - ordinary_speeds[row])));
+            ctx.Check(speed_error < pointwise_tol,
+                      "Fused CUDA residual retains nodal characteristic speeds");
+          }
+        }
+      }
       constant_volume.HostRead();
       constant_surface.HostRead();
       constant_surface += constant_volume;
