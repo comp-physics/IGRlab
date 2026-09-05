@@ -75,6 +75,126 @@ void Oracle(const mfem::DenseMatrix& a, mfem::ParFiniteElementSpace& fes,
     for (int i : core) y(ids[i]) = solution(i);
   }
 }
+
+// Independent representation oracle: form the full congruence using MFEM's
+// LGL shape evaluation, solve each vertex principal RHS, then transform back.
+// The implementation instead samples face blocks and stores composite GL rows.
+void VertexOracle(const mfem::DenseMatrix& a, mfem::ParFiniteElementSpace& fes,
+                  const mfem::Vector& x, mfem::Vector& y)
+{
+  const int n = fes.GetVSize();
+  mfem::L2_FECollection corner_collection(1, 2, mfem::BasisType::GaussLobatto);
+  const auto* corners = corner_collection.FiniteElementForGeometry(mfem::Geometry::SQUARE);
+  mfem::DenseMatrix transform(n), product(n), congruent(n);
+  transform = 0.0;
+  std::vector<std::vector<int>> groups(fes.GetMesh()->GetNV());
+  mfem::Array<int> dofs, vertices;
+  mfem::Vector shape(4);
+  for (int e = 0; e < fes.GetNE(); ++e)
+  {
+    fes.GetElementDofs(e, dofs); fes.GetMesh()->GetElementVertices(e, vertices);
+    for (int j = 0; j < 4; ++j)
+    {
+      const auto& point = corners->GetNodes().IntPoint(j);
+      const int corner = point.y < 0.5 ? (point.x < 0.5 ? 0 : 1)
+                                         : (point.x < 0.5 ? 3 : 2);
+      groups[vertices[corner]].push_back(4 * e + j);
+    }
+    for (int i = 0; i < 4; ++i)
+    {
+      corners->CalcShape(fes.GetFE(e)->GetNodes().IntPoint(i), shape);
+      for (int j = 0; j < 4; ++j) transform(dofs[i], 4 * e + j) = shape(j);
+    }
+  }
+  mfem::Mult(a, transform, product); mfem::MultAtB(transform, product, congruent);
+  mfem::Vector transformed_rhs(n), transformed_solution(n);
+  const double* input = x.HostRead(); transformed_rhs = 0.0; transformed_solution = 0.0;
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) transformed_rhs(j) += transform(i, j) * input[i];
+  for (const auto& group : groups)
+  {
+    const int count = static_cast<int>(group.size());
+    if (count == 0) continue;
+    mfem::DenseMatrix principal(count); mfem::Vector rhs(count), solution(count);
+    for (int i = 0; i < count; ++i)
+    {
+      rhs(i) = transformed_rhs(group[i]);
+      for (int j = 0; j < count; ++j) principal(i, j) = congruent(group[i], group[j]);
+    }
+    mfem::DenseMatrixInverse inverse(principal); inverse.Mult(rhs, solution);
+    for (int i = 0; i < count; ++i) transformed_solution(group[i]) = solution(i);
+  }
+  y.SetSize(n); transform.Mult(transformed_solution, y);
+}
+
+void TestVertex(mfem::ParMesh& mesh, mfem::Coefficient& reaction,
+                mfem::Coefficient& diffusion, mfem::Coefficient& changed_reaction,
+                mfem::Coefficient& changed_diffusion)
+{
+  mfem::L2_FECollection collection(1, 2, mfem::BasisType::GaussLegendre);
+  mfem::ParFiniteElementSpace fes(&mesh, &collection);
+  mfem::Vector zero({0.0, 0.0}); mfem::VectorConstantCoefficient convection(zero);
+  mfem::BilinearForm initial(&fes), current(&fes);
+  Assemble(initial, reaction, diffusion, convection);
+  Assemble(current, changed_reaction, changed_diffusion, convection);
+  mfem::DenseMatrix dense, changed_dense;
+  initial.SpMat().ToDenseMatrix(dense); current.SpMat().ToDenseMatrix(changed_dense);
+  const int n = fes.GetVSize();
+  mfem::Vector rhs(n), exact(n), current_rhs(n), reference(n), expected(n), before(n), after(n);
+  for (int i = 0; i < n; ++i)
+  { rhs(i) = std::sin(0.31 * (i + 1)) + 0.17 * std::cos(0.43 * i);
+    exact(i) = 1.0 + 0.21 * std::cos(0.27 * i); }
+  changed_dense.Mult(exact, current_rhs);
+  mfem::DenseMatrixInverse inverse(changed_dense); inverse.Mult(current_rhs, reference);
+  auto preconditioner = dg_igr::igr_internal::MakeScreenedPatchInversePreconditioner(
+    initial.SpMat(), fes, 0, "fp64", "vertex-p1");
+  VertexOracle(dense, fes, rhs, expected); preconditioner->Mult(rhs, before);
+  MFEM_VERIFY(Relative(before, expected) < 1.0e-11, "Vertex composite action differs from independent congruent solve.");
+  // Assemble only this tiny test preconditioner to verify symmetry and SPD.
+  mfem::DenseMatrix assembled(n); mfem::Vector unit(n), column(n), oracle_column(n);
+  for (int j = 0; j < n; ++j)
+  {
+    // The previous application has made a device copy valid. Mark the whole
+    // host write explicitly before constructing the next basis vector.
+    double* input = unit.HostWrite(); std::fill(input, input + n, 0.0); input[j] = 1.0;
+    preconditioner->Mult(unit, column);
+    VertexOracle(dense, fes, unit, oracle_column);
+    MFEM_VERIFY(Relative(column, oracle_column) < 1.0e-11,
+                "Vertex basis-column action differs from independent congruent solve: column=" << j);
+    const double* values = column.HostRead();
+    for (int i = 0; i < n; ++i) assembled(i, j) = values[i];
+  }
+  double asymmetry = 0.0, scale = 0.0;
+  for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j)
+  { asymmetry = std::max(asymmetry, std::abs(assembled(i, j) - assembled(j, i)));
+    scale = std::max(scale, std::abs(assembled(i, j))); }
+  MFEM_VERIFY(asymmetry < 1.0e-12 * scale,
+              "Vertex application is not symmetric: relative=" << asymmetry / scale
+              << " absolute=" << asymmetry << " scale=" << scale);
+  mfem::DenseMatrixInverse positive_check(assembled, true);
+  preconditioner->SetOperator(current.SpMat()); preconditioner->Mult(rhs, after);
+  MFEM_VERIFY(Relative(after, before) < 1.0e-14, "Vertex factors changed unexpectedly with current A.");
+  for (bool cg : {false, true})
+  {
+    std::unique_ptr<mfem::IterativeSolver> solver;
+    if (cg) solver = std::make_unique<mfem::CGSolver>(MPI_COMM_WORLD);
+    else
+    { auto fgmres = std::make_unique<mfem::FGMRESSolver>(MPI_COMM_WORLD);
+      fgmres->SetKDim(80); solver = std::move(fgmres); }
+    solver->SetOperator(current.SpMat()); solver->SetPreconditioner(*preconditioner);
+    solver->SetRelTol(1.0e-12); solver->SetAbsTol(0.0);
+    solver->SetMaxIter(300); solver->SetPrintLevel(0); solver->iterative_mode = false;
+    mfem::Vector solution(n), action(n); solution.UseDevice(true);
+    solver->Mult(current_rhs, solution); current.SpMat().Mult(solution, action);
+    const double residual = Relative(action, current_rhs), error = Relative(solution, reference);
+    MFEM_VERIFY(solver->GetConverged() && residual < 1.0e-10 && error < 1.0e-9,
+                "Retained vertex correction failed with current operator.");
+    std::cout << "screened_vertex_test solver=" << (cg ? "cg" : "fgmres")
+              << " action_error=" << Relative(before, expected) << " symmetry=" << asymmetry / scale
+              << " residual=" << residual << " solution_error=" << error
+              << " iterations=" << solver->GetNumIterations() << '\n';
+  }
+}
 }
 
 int main(int argc, char** argv)
@@ -141,5 +261,6 @@ int main(int argc, char** argv)
               << " solution_error=" << error << " iterations=" << solver.GetNumIterations()
               << '\n';
   }
+  TestVertex(mesh, reaction, diffusion, changed_reaction, changed_diffusion);
   return 0;
 }

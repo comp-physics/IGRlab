@@ -2205,18 +2205,24 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const char* patch_precision_env = std::getenv("DG_IGR_IGR_PATCH_PRECISION");
   const std::string patch_precision = using_screened_patch && patch_precision_env
     ? patch_precision_env : "fp64";
+  const char* patch_kind_env = std::getenv("DG_IGR_IGR_PATCH_KIND");
+  const std::string patch_kind = using_screened_patch && patch_kind_env
+    ? patch_kind_env : "ras";
   const int patch_rebuild_interval = using_screened_patch
     ? ReadEnvInt("DG_IGR_IGR_PATCH_REBUILD_INTERVAL", 0) : 0;
   const std::string patch_key = std::to_string(patch_radius) + ":" + patch_precision +
-    ":" + std::to_string(patch_rebuild_interval);
+    ":" + std::to_string(patch_rebuild_interval) + ":" + patch_kind;
   MFEM_VERIFY(!using_screened_patch ||
                 (using_cuda && !using_dense_inverse && !using_two_level_inverse &&
                  patch_radius >= 0 && patch_radius <= 6 &&
                  patch_rebuild_interval >= 0 &&
-                 (patch_precision == "fp64" || patch_precision == "fp32")),
+                 (patch_precision == "fp64" || patch_precision == "fp32") &&
+                 (patch_kind == "ras" || (patch_kind == "vertex-p1" &&
+                    patch_radius == 0 && patch_precision == "fp64" && spd_ok))),
               "Screened patch inverse requires CUDA, radius 0..6, fp64|fp32, "
               "a nonnegative rebuild interval, "
-              "and no global dense or two-level inverse.");
+              "and no global dense or two-level inverse. kind=vertex-p1 additionally "
+              "requires radius=0, fp64 and symmetric SIPG.");
   const char* two_level_coarse_env = std::getenv("DG_IGR_IGR_TWO_LEVEL_COARSE");
   const std::string two_level_coarse =
     two_level_coarse_env ? two_level_coarse_env : "dense";
@@ -2288,8 +2294,9 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   MFEM_VERIFY(!using_two_level_inverse ||
                 solver_choice == LinearSolverType::FGMRES,
               "Two-level inverse experiment requires explicit FGMRES.");
-  MFEM_VERIFY(!using_screened_patch || solver_choice == LinearSolverType::FGMRES,
-              "Restricted screened patch inverse requires explicit FGMRES.");
+  MFEM_VERIFY(!using_screened_patch || solver_choice == LinearSolverType::FGMRES ||
+                (patch_kind == "vertex-p1" && solver_choice == LinearSolverType::CG),
+              "Screened RAS requires explicit FGMRES; vertex-p1 permits CG or FGMRES.");
 
   // Guardrail: do not use SPD-only Krylov methods when SPD assumptions fail.
   if (RequiresSPD(solver_choice) && !spd_ok)
@@ -2390,7 +2397,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
           (patch_rebuild_interval > 0 && (solve_call - 1) % patch_rebuild_interval == 0))
       {
         screened_patch_preconditioner_ = MakeScreenedPatchInversePreconditioner(
-          *A_op, sfes_, patch_radius, patch_precision);
+          *A_op, sfes_, patch_radius, patch_precision, patch_kind);
         screened_patch_key_ = patch_key;
         if (patch_rebuild_interval > 0 && mfem::Mpi::WorldRank() == 0)
         {
@@ -3135,7 +3142,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   }
   if (using_screened_patch)
   {
-    last_precond_name_ = "screened-patch-" + patch_precision;
+    last_precond_name_ = patch_kind == "ras" ? "screened-patch-" + patch_precision
+                                            : "screened-vertex-p1-fp64";
   }
 
   const bool capture_linear_event =

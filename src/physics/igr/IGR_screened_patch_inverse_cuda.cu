@@ -47,7 +47,8 @@ class ScreenedPatchInverse final : public mfem::Solver
 public:
   ScreenedPatchInverse(const mfem::Operator& op,
                        mfem::ParFiniteElementSpace& sfes, int radius,
-                       const std::string& precision) : mfem::Solver(op.Height())
+                       const std::string& precision, const std::string& kind)
+    : mfem::Solver(op.Height())
   {
     const auto start = Clock::now();
     int ranks = 0;
@@ -59,6 +60,8 @@ public:
     MFEM_VERIFY((precision == "fp64" || precision == "fp32") && radius >= 0 && radius <= 6,
                 "Screened patch inverse requires fp64|fp32 and radius 0..6.");
     fp32_ = precision == "fp32";
+    MFEM_VERIFY(kind == "ras" || kind == "vertex-p1", "Unknown screened patch kind.");
+    const bool vertex = kind == "vertex-p1";
     MFEM_VERIFY(dynamic_cast<const mfem::L2_FECollection*>(sfes.FEColl()) &&
                   sfes.GetVDim() == 1 && sfes.GetMesh()->Dimension() == 2 &&
                   ne > 0 && dof_ > 0 && dof_ <= 256 && op.Width() == height &&
@@ -70,6 +73,10 @@ public:
     std::vector<char> seen(height, 0);
     mfem::Array<int> dofs;
     const int order = sfes.GetFE(0)->GetOrder();
+    const auto* l2 = dynamic_cast<const mfem::L2_FECollection*>(sfes.FEColl());
+    MFEM_VERIFY(!vertex || (order == 1 && dof_ == 4 && radius == 0 && !fp32_ &&
+                            l2->GetBasisType() == mfem::BasisType::GaussLegendre),
+                "Vertex inverse requires p1 Gauss-Legendre L2 quads, fp64 and radius=0.");
     for (int e = 0; e < ne; ++e)
     {
       const auto& fe = *sfes.GetFE(e);
@@ -184,8 +191,121 @@ public:
                      positions(ne, -1);
     std::vector<double> packed_rows;
     int max_patch_dofs = 0;
+    int max_factor_dofs = 0, vertex_groups = 0;
     long long factor_entries = 0;
     double local_inverse_error = 0.0;
+    if (vertex)
+    {
+      // Corner columns follow MFEM's cyclic local vertex order. For p1 this
+      // evaluates the LGL/corner polynomial directly at the current GL nodes.
+      mfem::DenseMatrix transform(4);
+      const auto& nodes = sfes.GetFE(0)->GetNodes();
+      for (int i = 0; i < 4; ++i)
+      {
+        const double x = nodes.IntPoint(i).x, y = nodes.IntPoint(i).y;
+        transform(i, 0) = (1.0 - x) * (1.0 - y);
+        transform(i, 1) = x * (1.0 - y);
+        transform(i, 2) = x * y;
+        transform(i, 3) = (1.0 - x) * y;
+      }
+      struct Copy { int element, corner; };
+      const int nv = sfes.GetMesh()->GetNV();
+      std::vector<std::vector<Copy>> copies(nv);
+      std::vector<std::vector<int>> vertices(ne), copy_positions(ne, std::vector<int>(4));
+      mfem::Array<int> ids;
+      for (int e = 0; e < ne; ++e)
+      {
+        sfes.GetMesh()->GetElementVertices(e, ids);
+        MFEM_VERIFY(ids.Size() == 4, "Vertex inverse requires quadrilateral topology.");
+        vertices[e].assign(ids.begin(), ids.end());
+        for (int c = 0; c < 4; ++c)
+        {
+          MFEM_VERIFY(ids[c] >= 0 && ids[c] < nv, "Invalid physical vertex index.");
+          copy_positions[e][c] = static_cast<int>(copies[ids[c]].size());
+          copies[ids[c]].push_back({e, c});
+        }
+      }
+      const auto entry = [&](int e, int f, int i, int j)
+      {
+        const auto found = support[e].find(f);
+        if (found == support[e].end()) return 0.0;
+        const int slot = block_offsets[e] + static_cast<int>(std::distance(support[e].begin(), found));
+        return blocks[(std::size_t(slot) * 4 + j) * 4 + i];
+      };
+      std::vector<mfem::DenseMatrix> inverses(nv);
+      for (int v = 0; v < nv; ++v)
+      {
+        const int count = static_cast<int>(copies[v].size());
+        if (count == 0) continue;
+        MFEM_VERIFY(count <= 512, "Physical vertex exceeds bounded local factor size.");
+        ++vertex_groups;
+        max_factor_dofs = std::max(max_factor_dofs, count);
+        factor_entries += static_cast<long long>(count) * count;
+        mfem::DenseMatrix group(count);
+        for (int k = 0; k < count; ++k)
+          for (int l = 0; l < count; ++l)
+          {
+            double value = 0.0;
+            for (int i = 0; i < 4; ++i)
+              for (int j = 0; j < 4; ++j)
+                value += transform(i, copies[v][k].corner) *
+                         entry(copies[v][k].element, copies[v][l].element, i, j) *
+                         transform(j, copies[v][l].corner);
+            group(k, l) = value;
+          }
+        double asymmetry = 0.0, scale = 0.0;
+        for (int k = 0; k < count; ++k)
+          for (int l = 0; l < count; ++l)
+          { asymmetry = std::max(asymmetry, std::abs(group(k, l) - group(l, k)));
+            scale = std::max(scale, std::abs(group(k, l))); }
+        MFEM_VERIFY(asymmetry <= 1.0e-10 * std::max(scale, 1.0e-300),
+                    "Vertex inverse requires symmetric transformed principal blocks.");
+        for (int k = 0; k < count; ++k)
+          for (int l = 0; l < k; ++l)
+            group(k, l) = group(l, k) = 0.5 * (group(k, l) + group(l, k));
+        mfem::DenseMatrixInverse inverse(group, true);
+        inverses[v].SetSize(count);
+        mfem::Vector unit(count), column(count), residual(count);
+        for (int l = 0; l < count; ++l)
+        {
+          unit = 0.0; unit(l) = 1.0; inverse.Mult(unit, column);
+          group.Mult(column, residual); residual -= unit;
+          local_inverse_error = std::max(local_inverse_error, residual.Norml2());
+          for (int k = 0; k < count; ++k)
+          { MFEM_VERIFY(std::isfinite(column(k)), "Nonfinite vertex inverse.");
+            inverses[v](k, l) = column(k); }
+        }
+      }
+      for (int center = 0; center < ne; ++center)
+      {
+        std::set<int> patch;
+        for (int v : vertices[center])
+          for (const auto& copy : copies[v]) patch.insert(copy.element);
+        const int np = static_cast<int>(patch.size()) * 4;
+        MFEM_VERIFY(np <= 512 && packed_rows.size() + std::size_t(np) * 4 <= (std::size_t(1) << 27),
+                    "Vertex composite rows exceed bounded storage.");
+        max_patch_dofs = std::max(max_patch_dofs, np);
+        int k = 0;
+        for (int e : patch)
+        { positions[e] = k++; for (int i = 0; i < 4; ++i) input_indices.push_back(element_dofs_[e * 4 + i]); }
+        const std::size_t first = packed_rows.size();
+        packed_rows.resize(first + std::size_t(np) * 4, 0.0);
+        for (int c = 0; c < 4; ++c)
+        {
+          const int v = vertices[center][c], local = copy_positions[center][c];
+          for (int l = 0; l < static_cast<int>(copies[v].size()); ++l)
+          {
+            const auto& copy = copies[v][l];
+            for (int i = 0; i < 4; ++i)
+              for (int j = 0; j < 4; ++j)
+                packed_rows[first + std::size_t(i) * np + positions[copy.element] * 4 + j] +=
+                  transform(i, c) * inverses[v](local, l) * transform(j, copy.corner);
+          }
+        }
+        row_offsets[center + 1] = static_cast<int>(input_indices.size());
+      }
+    }
+    else
     for (int center = 0; center < ne; ++center)
     {
       std::vector<int> patch{center}, hops{0};
@@ -199,6 +319,7 @@ public:
       MFEM_VERIFY(packed_rows.size() + std::size_t(np) * dof_ <= (std::size_t(1) << 27),
                   "Screened inverse rows exceed bounded 1 GiB storage.");
       max_patch_dofs = std::max(max_patch_dofs, np);
+      max_factor_dofs = std::max(max_factor_dofs, np);
       factor_entries += static_cast<long long>(np) * np;
       for (int k = 0; k < static_cast<int>(patch.size()); ++k) positions[patch[k]] = k;
       mfem::DenseMatrix transpose(np);
@@ -272,10 +393,12 @@ public:
     const long long index_bytes = static_cast<long long>(height + ne + 1 + input_indices.size()) * sizeof(int);
     std::cout << "[igr-screened-patch] event=setup n=" << height << " ne=" << ne
               << " p=" << order << " dof=" << dof_ << " radius=" << radius
+              << " kind=" << kind << " vertex_groups=" << vertex_groups
               << " precision=" << precision << " arithmetic=ordinary_cuda"
               << " accumulation=" << precision << " colors=" << color_count
               << " operator_probes=" << color_count * dof_ + 3
               << " max_patch_dofs=" << max_patch_dofs
+              << " max_factor_dofs=" << max_factor_dofs
               << " sampled_block_bytes=" << block_entries * sizeof(double)
               << " factor_entries=" << factor_entries << " row_bytes=" << row_bytes
               << " index_bytes=" << index_bytes
@@ -309,7 +432,7 @@ public:
 
 std::unique_ptr<mfem::Solver> MakeScreenedPatchInversePreconditioner(
   const mfem::Operator& op, mfem::ParFiniteElementSpace& sfes, int radius,
-  const std::string& precision)
-{ return std::make_unique<ScreenedPatchInverse>(op, sfes, radius, precision); }
+  const std::string& precision, const std::string& kind)
+{ return std::make_unique<ScreenedPatchInverse>(op, sfes, radius, precision, kind); }
 }
 }

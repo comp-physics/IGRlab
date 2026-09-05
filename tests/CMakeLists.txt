@@ -178,6 +178,15 @@ if(MFEM_USE_MPI AND MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
   target_link_libraries(dg_igr_screened_locality_probe PRIVATE igr_mfem mfem)
   target_include_directories(dg_igr_screened_locality_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
+  add_executable(dg_igr_local_operator_probe research/igr_local_operator_probe.cpp)
+  target_link_libraries(dg_igr_local_operator_probe PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_local_operator_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  add_test(NAME dg_igr_local_operator_cpu
+    COMMAND dg_igr_local_operator_probe --nx 3 --ny 2 --order 3
+      --output ${CMAKE_CURRENT_BINARY_DIR}/igr_local_operator_smoke.json)
+  set_tests_properties(dg_igr_local_operator_cpu PROPERTIES
+    LABELS "cpu-reference;igr;research" TIMEOUT 120)
+
   add_executable(dg_igr_screened_spacetime_probe research/screened_spacetime_probe.cpp)
   target_link_libraries(dg_igr_screened_spacetime_probe PRIVATE igr_mfem mfem)
   target_include_directories(dg_igr_screened_spacetime_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)

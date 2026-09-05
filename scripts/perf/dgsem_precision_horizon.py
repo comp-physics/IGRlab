@@ -36,6 +36,7 @@ def main():
     parser.add_argument("--two-level-inverse", choices=("dense", "cg"))
     parser.add_argument("--two-level-order", type=int, choices=(1, 2, 3, 4))
     parser.add_argument("--patch-radius", type=int, choices=range(7))
+    parser.add_argument("--patch-kind", choices=("ras", "vertex-p1"), default="ras")
     parser.add_argument("--patch-precision", choices=("fp64", "fp32"), default="fp64")
     parser.add_argument("--patch-rebuild-interval", type=int, default=0)
     parser.add_argument("--dense-setup", choices=("host", "cusolver"))
@@ -68,8 +69,8 @@ def main():
     if args.two_level_order and not args.two_level_inverse:
         parser.error("two-level order requires two-level inverse")
     if args.patch_radius is not None and (args.dense_inverse or args.two_level_inverse or
-                                          args.linear_solver != "fgmres" or args.sigma_space != "L2"):
-        parser.error("screened patches require FGMRES, L2 sigma, and no dense/two-level inverse")
+            (args.linear_solver != "fgmres" and args.patch_kind != "vertex-p1") or args.sigma_space != "L2"):
+        parser.error("screened patches require FGMRES (or CG for vertex-p1), L2 sigma, and no dense/two-level inverse")
     if args.patch_rebuild_interval < 0 or (args.patch_radius is None and
             (args.patch_rebuild_interval or args.patch_precision != "fp64")):
         parser.error("patch precision/rebuilding requires patches and a nonnegative interval")
@@ -79,6 +80,8 @@ def main():
         parser.error("DMMA requires fused residual")
     if args.stationary_sweeps and args.linear_solver != "fgmres":
         parser.error("stationary correction requires FGMRES fallback")
+    if args.patch_kind == "vertex-p1" and (args.patch_radius != 0 or args.order != 1 or args.patch_precision != "fp64"):
+        parser.error("vertex-p1 requires --order 1 --patch-radius 0 --patch-precision fp64")
     source = Path(__file__).resolve().parents[2]
     executable = args.executable.resolve(strict=True)
     default_mesh = {
@@ -122,7 +125,7 @@ def main():
     environment = os.environ.copy()
     for key in ("DG_IGR_IGR_DENSE_INVERSE", "DG_IGR_IGR_TWO_LEVEL_INVERSE",
                 "DG_IGR_IGR_TWO_LEVEL_COARSE", "DG_IGR_IGR_TWO_LEVEL_ORDER",
-                "DG_IGR_IGR_PATCH_RADIUS", "DG_IGR_IGR_PATCH_PRECISION",
+                "DG_IGR_IGR_PATCH_RADIUS", "DG_IGR_IGR_PATCH_PRECISION", "DG_IGR_IGR_PATCH_KIND",
                 "DG_IGR_IGR_PATCH_REBUILD_INTERVAL",
                 "DG_IGR_IGR_DENSE_SETUP", "DG_IGR_IGR_CHEB_ORDER", "DG_IGR_IGR_CHEB_POWER_ITERATIONS",
                 "DG_IGR_IGR_EXTRAPOLATION_DEGREE",
@@ -150,6 +153,7 @@ def main():
         environment["DG_IGR_IGR_TWO_LEVEL_ORDER"] = str(args.two_level_order)
     if args.patch_radius is not None:
         environment["DG_IGR_IGR_PATCH_RADIUS"] = str(args.patch_radius)
+        environment["DG_IGR_IGR_PATCH_KIND"] = args.patch_kind
         environment["DG_IGR_IGR_PATCH_PRECISION"] = args.patch_precision
         environment["DG_IGR_IGR_PATCH_REBUILD_INTERVAL"] = str(args.patch_rebuild_interval)
     if args.extrapolation_degree:
@@ -216,9 +220,11 @@ def main():
                         linear.get("last_solver") == args.linear_solver)
     elif args.patch_radius is not None:
         requested_pc = (patch_setup.get("radius") == str(args.patch_radius) and
+                        patch_setup.get("kind", "ras") == args.patch_kind and
                         patch_setup.get("precision") == args.patch_precision and
-                        linear.get("last_precond") == "screened-patch-" + args.patch_precision and
-                        linear.get("last_solver") == "fgmres")
+                        linear.get("last_precond") == ("screened-patch-" + args.patch_precision
+                            if args.patch_kind == "ras" else "screened-vertex-p1-fp64") and
+                        linear.get("last_solver") == args.linear_solver)
     elif args.two_level_inverse:
         requested_pc = (bool(two_level_setup) and
                         linear.get("last_precond") == "two-level-inverse-fp64" and
