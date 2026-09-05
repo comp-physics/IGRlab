@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -136,8 +137,14 @@ int main(int argc, char** argv)
   MFEM_VERIFY(RelativeDifference(reference, exact) <= 1.0e-13,
               "Host reference disagrees with manufactured solution.");
 
-  for (const std::string mode : {"fp64", "fp32", "tf32"})
+  const char* saved_setup_env = std::getenv("DG_IGR_IGR_DENSE_SETUP");
+  const bool had_setup_env = saved_setup_env != nullptr;
+  const std::string saved_setup = saved_setup_env ? saved_setup_env : "";
+  mfem::Vector host_fp64_direct(initial.Height()), host_fp64_transpose(initial.Height());
+  auto run_mode = [&](const std::string& setup, const std::string& mode)
   {
+    MFEM_VERIFY(setenv("DG_IGR_IGR_DENSE_SETUP", setup.c_str(), 1) == 0,
+                "Could not select dense inverse test setup.");
     auto preconditioner = dg_igr::igr_internal::MakeDenseInversePreconditioner(
       initial, mode, MPI_COMM_WORLD);
     const double apply_tolerance = mode == "fp64" ? 1.0e-12 :
@@ -149,6 +156,17 @@ int main(int argc, char** argv)
     const double transpose_error = RelativeDifference(transpose, exact);
     MFEM_VERIFY(direct_error <= apply_tolerance && transpose_error <= apply_tolerance,
                 "Dense inverse direct/transpose accuracy failed in " << mode);
+    if (setup == "host" && mode == "fp64")
+    {
+      host_fp64_direct = direct;
+      host_fp64_transpose = transpose;
+    }
+    if (setup == "cusolver" && mode == "fp64")
+    {
+      MFEM_VERIFY(RelativeDifference(direct, host_fp64_direct) <= 1.0e-12 &&
+                    RelativeDifference(transpose, host_fp64_transpose) <= 1.0e-12,
+                  "cuSolver FP64 inverse disagrees with host FP64 setup.");
+    }
 
     preconditioner->SetOperator(current);
     preconditioner->Mult(original_rhs, reused);
@@ -176,13 +194,20 @@ int main(int argc, char** argv)
     MFEM_VERIFY(solver.GetConverged() && residual <= 1.0e-10 && solution_error <= 1.0e-9,
                 "Current-operator corrected solve failed in " << mode
                 << ": residual=" << residual << " error=" << solution_error);
-    std::cout << "dense_inverse_test mode=" << mode
+    std::cout << "dense_inverse_test setup=" << setup << " mode=" << mode
               << " direct_error=" << direct_error
               << " transpose_error=" << transpose_error
               << " uncorrected_residual=" << uncorrected_residual
               << " corrected_residual=" << residual
               << " corrected_solution_error=" << solution_error
               << " iterations=" << solver.GetNumIterations() << '\n';
+  };
+  for (const std::string setup : {"host", "cusolver"})
+  {
+    for (const std::string mode : {"fp64", "fp32", "tf32"})
+    { run_mode(setup, mode); }
   }
+  if (had_setup_env) { setenv("DG_IGR_IGR_DENSE_SETUP", saved_setup.c_str(), 1); }
+  else { unsetenv("DG_IGR_IGR_DENSE_SETUP"); }
   return 0;
 }

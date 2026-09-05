@@ -2,9 +2,11 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cusolverDn.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <type_traits>
 #include <vector>
@@ -25,6 +27,75 @@ void CheckBlas(cublasStatus_t status)
 {
   MFEM_VERIFY(status == CUBLAS_STATUS_SUCCESS,
               "Dense inverse cuBLAS error " << static_cast<int>(status));
+}
+
+void CheckSolver(cusolverStatus_t status)
+{
+  MFEM_VERIFY(status == CUSOLVER_STATUS_SUCCESS,
+              "Dense inverse cuSolver error " << static_cast<int>(status));
+}
+
+__global__ void SetIdentityDiagonal(double* matrix, int n)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) { matrix[i + n * i] = 1.0; }
+}
+
+std::size_t InvertWithCuSolver(mfem::DenseMatrix& inverse)
+{
+  // These buffers exist only during setup and are freed before the retained
+  // inverse is uploaded. Report all explicit device setup storage, including LU.
+  struct Buffers
+  {
+    cusolverDnHandle_t handle = nullptr;
+    double* lu = nullptr;
+    double* solution = nullptr;
+    double* workspace = nullptr;
+    int* pivots = nullptr;
+    int* info = nullptr;
+    ~Buffers()
+    {
+      if (handle) { cusolverDnDestroy(handle); }
+      cudaFree(lu);
+      cudaFree(solution);
+      cudaFree(workspace);
+      cudaFree(pivots);
+      cudaFree(info);
+    }
+  } buffers;
+  const int n = inverse.Height();
+  const std::size_t matrix_bytes = std::size_t(n) * n * sizeof(double);
+  CheckSolver(cusolverDnCreate(&buffers.handle));
+  CheckSolver(cusolverDnSetStream(buffers.handle, nullptr));
+  CheckCuda(cudaMalloc(reinterpret_cast<void**>(&buffers.lu), matrix_bytes));
+  CheckCuda(cudaMalloc(reinterpret_cast<void**>(&buffers.solution), matrix_bytes));
+  CheckCuda(cudaMalloc(reinterpret_cast<void**>(&buffers.pivots), n * sizeof(int)));
+  CheckCuda(cudaMalloc(reinterpret_cast<void**>(&buffers.info), sizeof(int)));
+  CheckCuda(cudaMemcpy(buffers.lu, inverse.HostRead(), matrix_bytes,
+                        cudaMemcpyHostToDevice));
+  int workspace_size = 0;
+  CheckSolver(cusolverDnDgetrf_bufferSize(buffers.handle, n, n,
+                                         buffers.lu, n, &workspace_size));
+  MFEM_VERIFY(workspace_size >= 0, "Invalid cuSolver LU workspace size.");
+  const std::size_t workspace_bytes = std::size_t(workspace_size) * sizeof(double);
+  if (workspace_bytes)
+  { CheckCuda(cudaMalloc(reinterpret_cast<void**>(&buffers.workspace), workspace_bytes)); }
+  CheckCuda(cudaMemset(buffers.solution, 0, matrix_bytes));
+  SetIdentityDiagonal<<<(n + 255) / 256, 256>>>(buffers.solution, n);
+  CheckCuda(cudaGetLastError());
+  CheckSolver(cusolverDnDgetrf(buffers.handle, n, n, buffers.lu, n,
+                              buffers.workspace, buffers.pivots, buffers.info));
+  int info = 0;
+  CheckCuda(cudaMemcpy(&info, buffers.info, sizeof(int), cudaMemcpyDeviceToHost));
+  MFEM_VERIFY(info == 0, "cuSolver pivoted LU failed, info=" << info);
+  CheckSolver(cusolverDnDgetrs(buffers.handle, CUBLAS_OP_N, n, n,
+                              buffers.lu, n, buffers.pivots,
+                              buffers.solution, n, buffers.info));
+  CheckCuda(cudaMemcpy(&info, buffers.info, sizeof(int), cudaMemcpyDeviceToHost));
+  MFEM_VERIFY(info == 0, "cuSolver identity solve failed, info=" << info);
+  CheckCuda(cudaMemcpy(inverse.HostWrite(), buffers.solution, matrix_bytes,
+                        cudaMemcpyDeviceToHost));
+  return 2 * matrix_bytes + workspace_bytes + std::size_t(n + 1) * sizeof(int);
 }
 
 __global__ void PackRhs(const double* input, float* packed,
@@ -57,12 +128,18 @@ public:
     static_assert(std::is_same<mfem::real_t, double>::value,
                   "Dense inverse experiment requires FP64 MFEM.");
     const auto start = std::chrono::steady_clock::now();
+    const char* setup_env = std::getenv("DG_IGR_IGR_DENSE_SETUP");
+    const std::string setup = setup_env && setup_env[0] ? setup_env : "host";
+    MFEM_VERIFY(setup == "host" || setup == "cusolver",
+                "DG_IGR_IGR_DENSE_SETUP must be host|cusolver or unset.");
     int ranks = 0;
     MPI_Comm_size(comm, &ranks);
     MFEM_VERIFY(ranks == 1 && mfem::Device::Allows(mfem::Backend::CUDA),
                 "Dense inverse experiment requires one MPI rank and CUDA.");
-    MFEM_VERIFY(height > 0 && height <= 2048 && op.Width() == height,
-                "Dense inverse experiment requires a square system, n<=2048.");
+    const int maximum_size = setup == "cusolver" ? 4096 : 2048;
+    MFEM_VERIFY(height > 0 && height <= maximum_size && op.Width() == height,
+                "Dense inverse experiment requires a square system, n<="
+                << maximum_size << " for setup=" << setup << '.');
     MFEM_VERIFY(precision == "fp64" || precision == "fp32" ||
                   precision == "tf32", "Invalid dense inverse precision.");
 
@@ -94,9 +171,13 @@ public:
                                   std::abs(inverse(i, j) - inverse(j, i)));
       }
     }
-    // MFEM uses pivoted LU with LAPACK, or pivoted elimination without it.
-    // Preserve all entries; do not impose symmetry on the sampled operator.
-    inverse.Invert();
+    const auto sampled = std::chrono::steady_clock::now();
+    std::size_t setup_device_bytes = 0;
+    // Both engines use pivoted FP64 algebra. Preserve the sampled entries;
+    // do not impose symmetry or alter the stage equation.
+    if (setup == "cusolver") { setup_device_bytes = InvertWithCuSolver(inverse); }
+    else { inverse.Invert(); }
+    const auto inverted = std::chrono::steady_clock::now();
     for (int entry = 0; entry < inverse.TotalSize(); ++entry)
     {
       MFEM_VERIFY(std::isfinite(inverse.Data()[entry]),
@@ -121,6 +202,7 @@ public:
     }
     MFEM_VERIFY(std::isfinite(inverse_residual) && inverse_residual < 1.0e-7,
                 "Dense inverse FP64 setup residual failed: " << inverse_residual);
+    const auto validated = std::chrono::steady_clock::now();
     CheckBlas(cublasCreate(&handle_));
     CheckBlas(cublasSetStream(handle_, nullptr));
     const std::size_t matrix_entries = std::size_t(padded_) * padded_;
@@ -154,11 +236,18 @@ public:
       CheckCuda(cudaMalloc(reinterpret_cast<void**>(&result32_), panel_bytes));
     }
     CheckCuda(cudaDeviceSynchronize());
+    const auto finished = std::chrono::steady_clock::now();
     const double elapsed = std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - start).count();
+      finished - start).count();
     std::cout << "[igr-dense-inverse] n=" << height
               << " precision=" << precision_ << " padded=" << padded_
               << " rhs_columns=" << columns_ << " device_bytes=" << device_bytes
+              << " setup_engine=" << setup
+              << " setup_explicit_device_bytes=" << setup_device_bytes
+              << " sampling_seconds=" << std::chrono::duration<double>(sampled - start).count()
+              << " inversion_seconds=" << std::chrono::duration<double>(inverted - sampled).count()
+              << " validation_seconds=" << std::chrono::duration<double>(validated - inverted).count()
+              << " conversion_upload_seconds=" << std::chrono::duration<double>(finished - validated).count()
               << " setup_seconds=" << elapsed
               << " fp64_inverse_probe_rel=" << inverse_residual
               << " sampled_symmetry_rel=" << symmetry_error / matrix_max

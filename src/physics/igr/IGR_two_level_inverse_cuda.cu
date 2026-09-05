@@ -82,7 +82,7 @@ class TwoLevelInverse final : public mfem::Solver
 {
 public:
   TwoLevelInverse(const mfem::Operator& op, mfem::ParFiniteElementSpace& sfes,
-                  const std::string& coarse_mode)
+                  const std::string& coarse_mode, int coarse_order)
     : mfem::Solver(op.Height()), ne_(sfes.GetNE()),
       dof_(ne_ > 0 ? sfes.GetFE(0)->GetDof() : 0), coarse_mode_(coarse_mode)
   {
@@ -100,6 +100,9 @@ public:
                 "with identity true/local map and <=256 local DOFs.");
     MFEM_VERIFY(coarse_mode == "dense" || coarse_mode == "cg",
                 "Two-level coarse mode must be dense|cg.");
+    const int fine_order = sfes.GetFE(0)->GetOrder();
+    MFEM_VERIFY(coarse_order >= 1 && coarse_order <= fine_order,
+                "Two-level coarse order must be between 1 and the sigma FE order.");
 
     Graph adjacent(ne_);
     for (int face = 0; face < sfes.GetMesh()->GetNumFaces(); ++face)
@@ -114,7 +117,7 @@ public:
     }
     const auto element_colors = ColorGraph(adjacent);
     const int element_color_count = ColorCount(element_colors);
-    mfem::H1_FECollection coarse_collection(1, 2);
+    mfem::H1_FECollection coarse_collection(coarse_order, 2);
     mfem::FiniteElementSpace coarse_space(sfes.GetMesh(), &coarse_collection);
     MFEM_VERIFY(coarse_space.GetConformingProlongation() == nullptr,
                 "Two-level inverse requires a conforming mesh.");
@@ -133,7 +136,7 @@ public:
       const auto& fine_fe = *sfes.GetFE(e);
       const auto& coarse_fe = *coarse_space.GetFE(e);
       MFEM_VERIFY(fine_fe.GetGeomType() == mfem::Geometry::SQUARE &&
-                    fine_fe.GetDof() == dof_ && fine_fe.GetOrder() >= 1 &&
+                    fine_fe.GetDof() == dof_ && fine_fe.GetOrder() == fine_order &&
                     fine_fe.GetMapType() == mfem::FiniteElement::VALUE &&
                     fine_fe.GetNodes().GetNPoints() == dof_,
                   "Two-level inverse requires uniform nodal quadrilaterals.");
@@ -152,7 +155,7 @@ public:
         coarse_fe.CalcShape(fine_fe.GetNodes().IntPoint(i), shape);
         for (int j = 0; j < coarse_dofs.Size(); ++j)
         {
-          MFEM_VERIFY(coarse_dofs[j] >= 0, "Signed Q1 coarse map unsupported.");
+          MFEM_VERIFY(coarse_dofs[j] >= 0, "Signed H1 coarse map unsupported.");
           prolong_->Add(row, coarse_dofs[j], shape(j));
         }
       }
@@ -293,7 +296,7 @@ public:
       coarse_->GetDiag(diagonal);
       (void)diagonal.HostRead();
       for (int i = 0; i < nc; ++i)
-      { MFEM_VERIFY(diagonal(i) > 0.0 && std::isfinite(diagonal(i)), "Nonpositive Q1 coarse diagonal."); }
+      { MFEM_VERIFY(diagonal(i) > 0.0 && std::isfinite(diagonal(i)), "Nonpositive H1 coarse diagonal."); }
       coarse_jacobi_ = std::make_unique<mfem::OperatorJacobiSmoother>(
         diagonal, coarse_essential_, 1.0);
       coarse_cg_ = std::make_unique<mfem::CGSolver>(sfes.GetComm());
@@ -313,6 +316,7 @@ public:
     std::cout << "[igr-two-level] n=" << height << " elements=" << ne_
               << " block_dof=" << dof_ << " coarse_n=" << nc
               << " coarse_mode=" << coarse_mode
+              << " coarse_order=" << coarse_order
               << " element_colors=" << element_color_count
               << " coarse_colors=" << coarse_color_count
               << " operator_probes=" << operator_probes
@@ -389,9 +393,9 @@ private:
 
 std::unique_ptr<mfem::Solver> MakeTwoLevelInversePreconditioner(
   const mfem::Operator& op, mfem::ParFiniteElementSpace& sfes,
-  const std::string& coarse_mode)
+  const std::string& coarse_mode, int coarse_order)
 {
-  return std::make_unique<TwoLevelInverse>(op, sfes, coarse_mode);
+  return std::make_unique<TwoLevelInverse>(op, sfes, coarse_mode, coarse_order);
 }
 }
 }

@@ -30,6 +30,8 @@ def main():
     parser.add_argument("--linear-solver", choices=("cg", "fgmres"), default="cg")
     parser.add_argument("--dense-inverse", choices=("fp64", "fp32", "tf32"))
     parser.add_argument("--two-level-inverse", choices=("dense", "cg"))
+    parser.add_argument("--two-level-order", type=int, choices=(1, 2, 3, 4))
+    parser.add_argument("--dense-setup", choices=("host", "cusolver"))
     parser.add_argument("--integrator", choices=("rk3ssp", "ssprk104", "rk4", "dopri5", "radau-picard5"), default="rk3ssp")
     parser.add_argument("--sigma-space", choices=("L2", "H1"), default="L2")
     parser.add_argument("--sigma-cadence", choices=("every-stage", "extrapolated-every-step"),
@@ -52,6 +54,10 @@ def main():
         parser.error("mixed precision requires --linear-solver fgmres")
     if args.two_level_inverse and (args.dense_inverse or args.linear_solver != "fgmres"):
         parser.error("two-level inverse requires FGMRES and excludes the global dense inverse")
+    if args.dense_setup and not args.dense_inverse:
+        parser.error("dense setup requires global dense inverse")
+    if args.two_level_order and not args.two_level_inverse:
+        parser.error("two-level order requires two-level inverse")
     if args.extrapolation_degree and args.sigma_cadence != "extrapolated-every-step":
         parser.error("extrapolation degree requires extrapolated-every-step cadence")
     if args.fused_dmma and not args.fused_residual:
@@ -90,7 +96,8 @@ def main():
     ]
     environment = os.environ.copy()
     for key in ("DG_IGR_IGR_DENSE_INVERSE", "DG_IGR_IGR_TWO_LEVEL_INVERSE",
-                "DG_IGR_IGR_TWO_LEVEL_COARSE", "DG_IGR_IGR_EXTRAPOLATION_DEGREE",
+                "DG_IGR_IGR_TWO_LEVEL_COARSE", "DG_IGR_IGR_TWO_LEVEL_ORDER",
+                "DG_IGR_IGR_DENSE_SETUP", "DG_IGR_IGR_EXTRAPOLATION_DEGREE",
                 "DG_IGR_IGR_SIGMA_BASIS", "DG_IGR_DGSEM_FUSED_RESIDUAL",
                 "DG_IGR_DGSEM_FUSED_DMMA", "DG_IGR_IGR_STATIONARY_SWEEPS",
                 "DG_IGR_IGR_FROZEN_SIGMA_REFERENCE"):
@@ -105,6 +112,10 @@ def main():
     if args.two_level_inverse:
         environment["DG_IGR_IGR_TWO_LEVEL_INVERSE"] = "fp64"
         environment["DG_IGR_IGR_TWO_LEVEL_COARSE"] = args.two_level_inverse
+    if args.dense_setup:
+        environment["DG_IGR_IGR_DENSE_SETUP"] = args.dense_setup
+    if args.two_level_order:
+        environment["DG_IGR_IGR_TWO_LEVEL_ORDER"] = str(args.two_level_order)
     if args.extrapolation_degree:
         environment["DG_IGR_IGR_EXTRAPOLATION_DEGREE"] = str(args.extrapolation_degree)
     if args.sigma_basis:
@@ -174,6 +185,8 @@ def main():
                         not linear.get("last_precond", "").startswith("dense-inverse-"))
     record["requested_preconditioner_executed"] = requested_pc
     record["requested_execution_executed"] = (
+        (not args.dense_setup or dense_setup.get("setup_engine") == args.dense_setup) and
+        (not args.two_level_order or two_level_setup.get("coarse_order") == str(args.two_level_order)) and
         (not args.stationary_sweeps or bool(summaries.get("[igr-stationary]:setup"))) and
         (not args.fused_dmma or summaries.get("[dgsem-fused-residual]:setup", {}).get(
             "contraction") == "dmma8x8x4") and

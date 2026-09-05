@@ -2200,6 +2200,8 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const char* two_level_coarse_env = std::getenv("DG_IGR_IGR_TWO_LEVEL_COARSE");
   const std::string two_level_coarse =
     two_level_coarse_env ? two_level_coarse_env : "dense";
+  const int two_level_order = ReadEnvInt("DG_IGR_IGR_TWO_LEVEL_ORDER", 1);
+  const std::string two_level_key = two_level_coarse + ":" + std::to_string(two_level_order);
   MFEM_VERIFY(!using_two_level_inverse ||
                 (std::string(two_level_env) == "fp64" && using_cuda &&
                  !using_dense_inverse),
@@ -2362,10 +2364,10 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       if (!two_level_inverse_preconditioner_)
       {
         two_level_inverse_preconditioner_ =
-          MakeTwoLevelInversePreconditioner(*A_op, sfes_, two_level_coarse);
-        two_level_coarse_mode_ = two_level_coarse;
+          MakeTwoLevelInversePreconditioner(*A_op, sfes_, two_level_coarse, two_level_order);
+        two_level_coarse_mode_ = two_level_key;
       }
-      MFEM_VERIFY(two_level_coarse_mode_ == two_level_coarse,
+      MFEM_VERIFY(two_level_coarse_mode_ == two_level_key,
                   "Cannot change two-level coarse mode on a live solver.");
       two_level_inverse_preconditioner_->SetOperator(*A_op);
       prec = two_level_inverse_preconditioner_.get();

@@ -65,6 +65,7 @@ endif()
 add_library(igr_mfem STATIC ${SOURCES})
 
 if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+    target_link_libraries(igr_mfem PRIVATE CUDA::cusolver)
     target_sources(igr_mfem PRIVATE physics/igr/IGR_dense_inverse_cuda.cu
                                   physics/igr/IGR_two_level_inverse_cuda.cu
                                   physics/igr/IGR_stationary_correction_cuda.cu)

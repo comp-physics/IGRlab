@@ -58,7 +58,7 @@ public:
     double* result = rhs.HostWrite();
     for (int i = 0; i < state.Size(); ++i)
     {
-      result[i] = nonautonomous_ ? 2.0 * GetTime() * values[i]
+      result[i] = nonautonomous_ ? (2.0 + 2.0 * GetTime()) * values[i]
                                  : values[i] * values[i];
     }
     if (armed_)
@@ -116,23 +116,41 @@ double Integrate(mfem::ParFiniteElementSpace& fes, mfem::SSPRKMethod method,
     double dt = final_time / steps;
     stepper.Step(state, time, dt);
   }
-  const double exact = nonautonomous ? std::exp(final_time * final_time)
+  const double exact = nonautonomous
+      ? std::exp(2.0 * final_time + final_time * final_time)
                                      : 1.0 / (1.0 - final_time);
   const double signed_flux =
     stepper.GetCumulativePhysicalBoundaryFluxIntegral()[0];
   const double absolute_flux =
     stepper.GetCumulativePhysicalBoundaryFluxAbsoluteIntegral()[0];
-  ok = ok && rhs.ok && rhs.accepted_steps == steps &&
-       stepper.GetRHSEvaluationCount() == steps * stepper.GetStageCount() &&
-       stepper.GetSSPCoefficient() == 0.0 &&
-       std::abs(time - final_time) < 2e-15 &&
-       std::abs(signed_flux - final_time - 0.5*final_time*final_time) < 2e-14 &&
-       absolute_flux >= std::abs(signed_flux) - 2e-14;
+  const auto check = [&](bool passed, const char* label)
+  {
+    if (!passed)
+      std::cerr << "research-rk invariant-failed=" << label
+                << " method=" << static_cast<int>(method)
+                << " nonautonomous=" << nonautonomous
+                << " steps=" << steps << " accepted=" << rhs.accepted_steps
+                << " rhs_count=" << stepper.GetRHSEvaluationCount()
+                << " time=" << time << " signed_flux=" << signed_flux
+                << " absolute_flux=" << absolute_flux << '\n';
+    ok = passed && ok;
+  };
+  check(rhs.ok, "stage-callbacks");
+  check(rhs.accepted_steps == steps, "accepted-count");
+  check(stepper.GetRHSEvaluationCount() == steps * stepper.GetStageCount(),
+        "rhs-count");
+  check(stepper.GetSSPCoefficient() == 0.0, "no-ssp-coefficient");
+  check(std::abs(time - final_time) < 2e-15, "final-time");
+  check(std::abs(signed_flux - final_time - 0.5*final_time*final_time) < 2e-14,
+        "signed-flux-integral");
+  check(absolute_flux >= std::abs(signed_flux) - 2e-14,
+        "absolute-flux-bound");
   if (method == mfem::SSPRKMethod::ResearchDOPRI5)
   {
     // The principal formula has a negative output weight. Its absolute flux
     // census must use |b_i|, rather than applying a signed weight to |flux_i|.
-    ok = ok && absolute_flux > 1.1 * std::abs(signed_flux);
+    check(absolute_flux > 1.1 * std::abs(signed_flux),
+          "negative-output-weight-absolute-flux");
   }
   return std::abs(state[0] - exact);
 }
@@ -145,6 +163,9 @@ bool CheckMethod(mfem::ParFiniteElementSpace& fes,
   bool ok = true;
   for (bool nonautonomous : {false, true})
   {
+    // y'=(2+2t)y keeps stage-time dependence and a visible leading error.
+    // Unlike y'=2ty at t=0, this window avoids coarse-level cancellation in
+    // DOPRI5; all finest errors remain well above FP64 rounding error.
     std::array<double, 3> errors;
     for (int level = 0; level < 3; ++level)
     {
@@ -152,13 +173,21 @@ bool CheckMethod(mfem::ParFiniteElementSpace& fes,
     }
     const double order1 = std::log2(errors[0] / errors[1]);
     const double order2 = std::log2(errors[1] / errors[2]);
-    ok = ok && std::isfinite(order1) && std::isfinite(order2) &&
-         order1 > order - 0.65 && order2 > order - 0.4;
+    const bool order_ok = std::isfinite(order1) && std::isfinite(order2) &&
+         order1 > order - 0.25 && order2 > order - 0.15;
+    ok = order_ok && ok;
     std::cout << "research-rk method="
               << dg_sim::TimeIntegratorToString(integrator)
               << " nonautonomous=" << nonautonomous << " errors="
               << errors[0] << ',' << errors[1] << ',' << errors[2]
-              << " orders=" << order1 << ',' << order2 << '\n';
+              << " orders=" << order1 << ',' << order2
+              << " order_pass=" << order_ok << '\n';
+    if (!order_ok)
+      std::cerr << "research-rk order-failed method="
+                << dg_sim::TimeIntegratorToString(integrator)
+                << " nonautonomous=" << nonautonomous
+                << " required_minima=" << order - 0.25 << ',' << order - 0.15
+                << '\n';
   }
   dg_sim::RunConfig cfg;
   cfg.time_integrator = integrator;

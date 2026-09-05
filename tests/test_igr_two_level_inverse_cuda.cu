@@ -39,7 +39,8 @@ int main(int argc, char** argv)
   mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
     3, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
   mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
-  mfem::L2_FECollection collection(2, 2, mfem::BasisType::GaussLegendre);
+  constexpr int fine_order = 3;
+  mfem::L2_FECollection collection(fine_order, 2, mfem::BasisType::GaussLegendre);
   mfem::ParFiniteElementSpace sfes(&pmesh, &collection);
   mfem::FunctionCoefficient reaction([](const mfem::Vector& x)
   { return 1.0 + 0.2 * x(0); });
@@ -67,9 +68,10 @@ int main(int argc, char** argv)
               "Global FP64 reference disagrees with manufactured solution.");
 
   for (const std::string mode : {"dense", "cg"})
+  for (int coarse_order = 1; coarse_order <= fine_order; ++coarse_order)
   {
     auto preconditioner = dg_igr::igr_internal::MakeTwoLevelInversePreconditioner(
-      initial.SpMat(), sfes, mode);
+      initial.SpMat(), sfes, mode, coarse_order);
     mfem::Vector before(n), after(n), solution(n), action(n);
     preconditioner->Mult(original_rhs, before);
     preconditioner->SetOperator(current.SpMat());
@@ -92,8 +94,10 @@ int main(int argc, char** argv)
     const double error = RelativeDifference(solution, dense_reference);
     MFEM_VERIFY(solver.GetConverged() && residual < 1.0e-10 && error < 1.0e-9,
                 "Two-level current-equation correction failed: " << mode
+                << " coarse_order=" << coarse_order
                 << " residual=" << residual << " solution_error=" << error);
     std::cout << "two_level_test coarse=" << mode << " n=" << n
+              << " fine_order=" << fine_order << " coarse_order=" << coarse_order
               << " true_residual=" << residual << " solution_error=" << error
               << " iterations=" << solver.GetNumIterations() << '\n';
   }
