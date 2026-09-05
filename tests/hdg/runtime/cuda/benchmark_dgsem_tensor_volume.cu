@@ -144,6 +144,98 @@ template<class T> void LaunchOrdinaryMatrix(int n,int ne,const double* f,
   }
 }
 
+// Native FP64 WMMA: one warp per 8x8 directional output tile. The shared
+// coefficient and flux panels are loaded once; padding, tile staging, and the
+// final weighted directional sum are all charged inside this single kernel.
+// N=8 and N=16 have no padded arithmetic. Small N packs multiple elements.
+template<int N> __global__ void FusedDoubleLines(
+    const double* flux,const double* matrix,const double* weights,
+    double* output,int ne)
+{
+#if __CUDA_ARCH__ >= 800
+  constexpr int group=N<=8?8/N:1,dof=N*N;
+  constexpr int row_tiles=(N+7)/8,column_tiles=(group*N+7)/8;
+  constexpr int warps=2*row_tiles*column_tiles;
+  const int batches=(ne+group-1)/group;
+  const int eq=blockIdx.x/batches,first=(blockIdx.x%batches)*group;
+  const int thread=threadIdx.x,lane=thread%32,warp=thread/32,rows=ne*dof;
+  const int direction=warp/(row_tiles*column_tiles);
+  const int row_start=8*(warp%row_tiles);
+  const int column_start=8*((warp/row_tiles)%column_tiles);
+  __shared__ double a[dof],f[2*group*dof],c[2*group*dof];
+  __shared__ __align__(32) double scratch[warps*128];
+  for(int k=thread;k<dof;k+=blockDim.x)
+    a[k]=matrix[k%N+16*(k/N)];
+  for(int k=thread;k<2*group*dof;k+=blockDim.x)
+  {
+    const int dir=k/(group*dof),element=(k/dof)%group,node=k%dof;
+    f[k]=first+element<ne?
+        flux[(first+element)*dof+node+rows*(eq+4*dir)]:0.0;
+  }
+  __syncthreads();
+  double* at=scratch+warp*128;
+  double* bt=at+32;
+  double* product=at+64;
+  namespace wmma=nvcuda::wmma;
+  wmma::fragment<wmma::accumulator,8,8,4,double> accumulator;
+  wmma::fill_fragment(accumulator,0.0);
+  #pragma unroll
+  for(int chunk=0;chunk<N;chunk+=4)
+  {
+    const int row=row_start+lane/4,inner_a=chunk+lane%4;
+    at[lane]=row<N&&inner_a<N?a[row+N*inner_a]:0.0;
+    const int inner_b=chunk+lane/8,column=column_start+lane%8;
+    const int element=column/N,line=column%N;
+    const int node=direction==0?inner_b+N*line:line+N*inner_b;
+    bt[lane]=inner_b<N&&element<group?
+        f[direction*group*dof+element*dof+node]:0.0;
+    __syncwarp();
+    wmma::fragment<wmma::matrix_a,8,8,4,double,wmma::row_major> af;
+    wmma::fragment<wmma::matrix_b,8,8,4,double,wmma::row_major> bf;
+    wmma::load_matrix_sync(af,at,4);
+    wmma::load_matrix_sync(bf,bt,8);
+    wmma::mma_sync(accumulator,af,bf,accumulator);
+    __syncwarp();
+  }
+  wmma::store_matrix_sync(product,accumulator,8,wmma::mem_row_major);
+  __syncwarp();
+  for(int entry=lane;entry<64;entry+=32)
+  {
+    const int coordinate=row_start+entry/8,column=column_start+entry%8;
+    const int element=column/N,line=column%N;
+    if(coordinate<N&&element<group)
+    {
+      const int node=direction==0?coordinate+N*line:line+N*coordinate;
+      c[direction*group*dof+element*dof+node]=product[entry];
+    }
+  }
+  __syncthreads();
+  for(int k=thread;k<group*dof;k+=blockDim.x)
+  {
+    const int element=k/dof,node=k%dof,i=node%N,j=node/N;
+    if(first+element<ne)
+      output[(first+element)*dof+node+rows*eq]=
+          weights[i]*weights[j]*(c[k]+c[group*dof+k]);
+  }
+#endif
+}
+
+void LaunchFusedDoubleLines(int n,int ne,const double* f,const double* a,
+    const double* w,double* o)
+{
+  const int group=std::max(1,8/n),row_tiles=(n+7)/8;
+  const int blocks=4*((ne+group-1)/group);
+  const int threads=64*row_tiles*((group*n+7)/8);
+  switch(n)
+  {
+    case 2:FusedDoubleLines<2><<<blocks,threads>>>(f,a,w,o,ne);break;
+    case 4:FusedDoubleLines<4><<<blocks,threads>>>(f,a,w,o,ne);break;
+    case 5:FusedDoubleLines<5><<<blocks,threads>>>(f,a,w,o,ne);break;
+    case 8:FusedDoubleLines<8><<<blocks,threads>>>(f,a,w,o,ne);break;
+    case 16:FusedDoubleLines<16><<<blocks,threads>>>(f,a,w,o,ne);break;
+  }
+}
+
 __device__ float Tf32(float value)
 {
 #if __CUDA_ARCH__ >= 800
@@ -538,6 +630,17 @@ void Run(int n,int ne,int iterations,cublasHandle_t handle)
     Print("cooperative-matrix-fp64",n,ne,iterations,matrix64_seconds,
         Compare(output.p,reference),matrix64_setup,0,0,0,0,
         256*sizeof(double),3*n*n*sizeof(double),warmup);
+    auto fused64=[&]{LaunchFusedDoubleLines(n,ne,f,ad.p,w,output.p);};
+    const double fused64_seconds=Seconds(fused64,iterations,&warmup);
+    const int double_group=std::max(1,8/n),double_row_tiles=(n+7)/8;
+    const int double_column_tiles=(double_group*n+7)/8;
+    const int double_warps=2*double_row_tiles*double_column_tiles;
+    const long long double_blocks=4LL*((ne+double_group-1)/double_group);
+    Print("fused-lines-fp64-wmma",n,ne,iterations,fused64_seconds,
+        Compare(output.p,reference),matrix64_setup,0,0,0,
+        double_blocks*double_warps*((n+3)/4)*512,
+        256*sizeof(double),sizeof(double)*(n*n+4*double_group*n*n+128*double_warps),
+        warmup);
     auto matrix32=[&]{LaunchOrdinaryMatrix(n,ne,f,af.p,w,output.p);};
     const double matrix32_seconds=Seconds(matrix32,iterations,&warmup);
     Print("cooperative-matrix-fp32",n,ne,iterations,matrix32_seconds,

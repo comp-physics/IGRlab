@@ -28,6 +28,9 @@ def main():
     parser.add_argument("--final-time", type=float, default=0.01)
     parser.add_argument("--linear-rtol", type=float, default=1e-10)
     parser.add_argument("--linear-solver", choices=("cg", "fgmres"), default="cg")
+    parser.add_argument("--preconditioner", choices=("chebyshev", "hypresmoother", "none"), default="chebyshev")
+    parser.add_argument("--cheb-order", type=int, choices=(1, 2, 3, 4, 5))
+    parser.add_argument("--cheb-power-iterations", type=int, choices=range(1, 21))
     parser.add_argument("--dense-inverse", choices=("fp64", "fp32", "tf32"))
     parser.add_argument("--two-level-inverse", choices=("dense", "cg"))
     parser.add_argument("--two-level-order", type=int, choices=(1, 2, 3, 4))
@@ -45,6 +48,7 @@ def main():
     parser.add_argument("--fused-dmma", action="store_true")
     parser.add_argument("--frozen-sigma-reference", action="store_true")
     parser.add_argument("--stationary-sweeps", type=int, choices=range(1, 17))
+    parser.add_argument("--diagnostic-scans", choices=("on", "off"), default="on")
     parser.add_argument("--timeout", type=float, default=180)
     args = parser.parse_args()
     for value in (args.dt, args.final_time, args.linear_rtol, args.timeout, args.c_alpha):
@@ -83,12 +87,14 @@ def main():
         "--igr-grad", "BrokenL2", "--igr-solve-mode", "krylov",
         "--igr-ip-kind", "sipg", "--igr-exact-dg-face",
         "--igr-sigma-cadence", args.sigma_cadence, "--igr-stage-rtol-scale", "1",
-        "--igr-linear-solver", args.linear_solver, "--igr-preconditioner", "chebyshev",
+        "--igr-linear-solver", args.linear_solver, "--igr-preconditioner", args.preconditioner,
         "--igr-lin-rtol", format(args.linear_rtol, ".17g"),
         "--igr-lin-atol", "0", "--igr-lin-maxit", "2000",
         "--igr-nonconvergence-policy", "error", "--igr-lin-print", "0",
         "--no-igr-sigma-cfl", "--no-igr-sigma-rusanov", "--no-igr-invariant-domain-flux",
-        "--positivity-limiter", args.positivity_limiter, "--nan-scan", "--admissibility-scan",
+        "--positivity-limiter", args.positivity_limiter,
+        "--nan-scan" if args.diagnostic_scans == "on" else "--no-nan-scan",
+        "--admissibility-scan" if args.diagnostic_scans == "on" else "--no-admissibility-scan",
         "--analysis-steps", "0", "--visualization-steps", "1000000",
         "--vtk_save", "--time-step-save", format(args.final_time, ".17g"),
         "--no-glvis", "--no-save-state", "--no-vtk-h1-diagnostics",
@@ -97,7 +103,8 @@ def main():
     environment = os.environ.copy()
     for key in ("DG_IGR_IGR_DENSE_INVERSE", "DG_IGR_IGR_TWO_LEVEL_INVERSE",
                 "DG_IGR_IGR_TWO_LEVEL_COARSE", "DG_IGR_IGR_TWO_LEVEL_ORDER",
-                "DG_IGR_IGR_DENSE_SETUP", "DG_IGR_IGR_EXTRAPOLATION_DEGREE",
+                "DG_IGR_IGR_DENSE_SETUP", "DG_IGR_IGR_CHEB_ORDER", "DG_IGR_IGR_CHEB_POWER_ITERATIONS",
+                "DG_IGR_IGR_EXTRAPOLATION_DEGREE",
                 "DG_IGR_IGR_SIGMA_BASIS", "DG_IGR_DGSEM_FUSED_RESIDUAL",
                 "DG_IGR_DGSEM_FUSED_DMMA", "DG_IGR_IGR_STATIONARY_SWEEPS",
                 "DG_IGR_IGR_FROZEN_SIGMA_REFERENCE"):
@@ -112,6 +119,10 @@ def main():
     if args.two_level_inverse:
         environment["DG_IGR_IGR_TWO_LEVEL_INVERSE"] = "fp64"
         environment["DG_IGR_IGR_TWO_LEVEL_COARSE"] = args.two_level_inverse
+    if args.cheb_order:
+        environment["DG_IGR_IGR_CHEB_ORDER"] = str(args.cheb_order)
+    if args.cheb_power_iterations:
+        environment["DG_IGR_IGR_CHEB_POWER_ITERATIONS"] = str(args.cheb_power_iterations)
     if args.dense_setup:
         environment["DG_IGR_IGR_DENSE_SETUP"] = args.dense_setup
     if args.two_level_order:
