@@ -21,7 +21,14 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
+
+static_assert(&::dg_igr::GetEnv == &::igrlab::GetEnv,
+              "the legacy global namespace must remain usable");
+static_assert(std::is_same_v<mfem::dg_igr::EulerAdmissibilityPointSet,
+                             mfem::igrlab::EulerAdmissibilityPointSet>,
+              "the legacy MFEM extension namespace must remain usable");
 
 namespace dg_igr_tests
 {
