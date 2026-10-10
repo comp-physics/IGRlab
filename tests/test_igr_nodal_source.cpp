@@ -10,7 +10,7 @@
 #include <vector>
 
 using namespace mfem;
-using namespace igrlab::igr_internal;
+using namespace ::igrlab::igr_internal;
 
 // Independent oracle: assemble vector loads from the current traces, solve
 // each local mass, then evaluate the resulting polynomial gradient correction.
@@ -86,7 +86,7 @@ Vector Reference(ParFiniteElementSpace& fes, const QuadratureSpace& qs,
       velocity.GetVectorGradient(*tr,grad); fes.GetFE(e)->CalcShape(ip,shape);
       for(int d=0;d<2;++d)for(int v=0;v<2;++v)for(int j=0;j<nd;++j)
         grad(v,d)+=shape(j)*correction[e][j+nd*(v+2*d)];
-      result[q+nq*e]=igrlab::frozen_scalar_igr_algebra::SourceFromVelocityGradient(2,grad.Data(),1,2,alpha[e]);
+      result[q+nq*e]=::igrlab::frozen_scalar_igr_algebra::SourceFromVelocityGradient(2,grad.Data(),1,2,alpha[e]);
     }
   }
   return result;

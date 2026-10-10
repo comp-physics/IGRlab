@@ -16,8 +16,8 @@ namespace dg::hdg::device
 namespace
 {
 using core::Status;
-using ScopedRegion = igrlab::observability::ScopedRegion<
-    igrlab::observability::DefaultBackend>;
+using ScopedRegion = ::igrlab::observability::ScopedRegion<
+    ::igrlab::observability::DefaultBackend>;
 
 constexpr double pivot_scale = 64.0 * 2.2204460492503131e-16;
 
@@ -267,7 +267,7 @@ Status DeviceCoreEngine::Condense(const core::LocalSystemBatchView& input,
                                   const core::CondensedBatchView& output)
 {
   ScopedRegion condensation(
-      igrlab::observability::RegionId::hdg_condensation);
+      ::igrlab::observability::RegionId::hdg_condensation);
   const Status reference_status = reference_.Condense(input, output);
   if (reference_status != Status::success)
   {
@@ -317,7 +317,7 @@ Status DeviceCoreEngine::Condense(const core::LocalSystemBatchView& input,
   }
   {
     ScopedRegion packing(
-        igrlab::observability::RegionId::hdg_packing);
+        ::igrlab::observability::RegionId::hdg_packing);
     Pack(input.a, lu_.HostWrite());
     Pack(input.b, b_.HostWrite());
     Pack(input.c, c_.HostWrite());
@@ -445,7 +445,7 @@ Status DeviceCoreEngine::ApplySchur(const StridedBlockView<const double> trace,
                                     const StridedBlockView<double> result) noexcept
 {
   ScopedRegion action_region(
-      igrlab::observability::RegionId::hdg_schur_action);
+      ::igrlab::observability::RegionId::hdg_schur_action);
   if (!ready_) { return Status::not_ready; }
   if (path_ != ExecutionPath::mfem_device)
   {
@@ -523,7 +523,7 @@ Status DeviceCoreEngine::Recover(const StridedBlockView<const double> trace,
                                  const StridedBlockView<double> interior) noexcept
 {
   ScopedRegion recovery_region(
-      igrlab::observability::RegionId::hdg_interior_recovery);
+      ::igrlab::observability::RegionId::hdg_interior_recovery);
   if (!ready_) { return Status::not_ready; }
   if (path_ != ExecutionPath::mfem_device)
   {

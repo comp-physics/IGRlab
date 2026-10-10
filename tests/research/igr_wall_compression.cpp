@@ -80,11 +80,11 @@ int main(int argc,char** argv)
   spec.configure_case=[](dg_sim::CaseConfig& cfg)
   {
     cfg.defaults.t_final=.08;cfg.defaults.par_ref_levels=0;cfg.rk3_config.limit_initial=false;
-    cfg.igr_config.solve_mode=igrlab::IGRSolveMode::Krylov;
-    cfg.igr_config.lin_solver_type=igrlab::IGRLinearSolverType::Auto;
-    cfg.igr_config.prec_type=igrlab::IGRPrecondType::Auto;cfg.igr_config.ip_kind=igrlab::IGRIPKind::SIPG;
+    cfg.igr_config.solve_mode=::igrlab::IGRSolveMode::Krylov;
+    cfg.igr_config.lin_solver_type=::igrlab::IGRLinearSolverType::Auto;
+    cfg.igr_config.prec_type=::igrlab::IGRPrecondType::Auto;cfg.igr_config.ip_kind=::igrlab::IGRIPKind::SIPG;
     cfg.igr_config.lin_rtol=1e-8;cfg.igr_config.lin_atol=0.;cfg.igr_config.lin_maxit=1000;cfg.igr_config.lin_print=0;
-    cfg.igr_config.sigma_cadence=igrlab::IGRSigmaUpdateCadence::EveryStep;
+    cfg.igr_config.sigma_cadence=::igrlab::IGRSigmaUpdateCadence::EveryStep;
     cfg.igr_config.sigma_update_interval=1;cfg.igr_config.stage_rtol_scale=1.;
   };
   spec.add_options=[](mfem::OptionsParser& args,WallOptions& opts)

@@ -307,10 +307,10 @@ inline void PublishInitialZhangShuDiagnostics(
 template <typename NumericalFlux, typename BcSetup, typename Func>
 bool WithEulerOperator(ExampleContext& ctx,
                        double gamma,
-                       igrlab::IGRSolver* igr,
+                       ::igrlab::IGRSolver* igr,
                        mfem::ParGridFunction& sol,
                        const mfem::Vector* static_source,
-                       igrlab::igr_internal::CompactSubcellRecovery* subcell_recovery,
+                       ::igrlab::igr_internal::CompactSubcellRecovery* subcell_recovery,
                        const BoundaryMarkerMap& markers,
                        BcSetup&& bc_setup,
                        Func&& func)
@@ -835,7 +835,7 @@ RunEulerCase(ExampleContext& ctx,
   loop_cfg.initial_q_sigma_admitted =
     sigma_provider &&
     ResolveEffectiveIGRSigmaUpdateCadence(run_cfg) ==
-      igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+      ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
   loop_cfg.next_save_time =
     (run_cfg.opts.vtk_save && run_cfg.opts.dt_save > 0.0)
       ? initial_time + run_cfg.opts.dt_save
@@ -1195,7 +1195,7 @@ RunEulerCase(ExampleContext& ctx,
   const bool report_extrapolated_q_sigma =
     sigma_provider &&
     ResolveEffectiveIGRSigmaUpdateCadence(run_cfg) ==
-      igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+      ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
   const bool report_q_sigma =
     run_cfg.igr_opts.igr_invariant_domain_flux ||
     report_extrapolated_q_sigma;
@@ -1490,11 +1490,11 @@ struct Solver
       {
         return spec.make_hdg_case_data(case_opts, case_cfg, cli_opts, context);
       };
-      const std::optional<igrlab::IGRAlphaLengthScalePolicy>
+      const std::optional<::igrlab::IGRAlphaLengthScalePolicy>
         hdg_alpha_length_policy_override =
           cli_igr_opts.alpha_length_policy.empty()
             ? std::nullopt
-            : std::optional<igrlab::IGRAlphaLengthScalePolicy>{
+            : std::optional<::igrlab::IGRAlphaLengthScalePolicy>{
                 ParseIGRAlphaLengthScalePolicy(
                   cli_igr_opts.alpha_length_policy)};
       const hdg::HdgEulerMainRequest hdg_request{
@@ -1679,7 +1679,7 @@ struct Solver
     const bool subcell_muscl = subcell_transport == "muscl";
     MFEM_VERIFY(!subcell_muscl || (use_subcell_recovery && mfem::Device::Allows(mfem::Backend::CUDA_MASK)),
                 "Subcell MUSCL transport requires the subcell recovery bridge and CUDA packed DG faces.");
-    std::unique_ptr<igrlab::igr_internal::CompactSubcellRecovery> subcell_recovery;
+    std::unique_ptr<::igrlab::igr_internal::CompactSubcellRecovery> subcell_recovery;
     if (use_subcell_recovery)
     {
       MFEM_VERIFY(use_igr && run_cfg.dg_backend == DGBackend::DG && run_cfg.opts.order == 0 &&
@@ -1698,7 +1698,7 @@ struct Solver
       MFEM_VERIFY(closure_order_text == "1" || closure_order_text == "2",
                   "DG_IGR_IGR_SUBCELL_CLOSURE_ORDER must be 1 or 2.");
       const int closure_order = closure_order_text == "1" ? 1 : 2;
-      subcell_recovery = std::make_unique<igrlab::igr_internal::CompactSubcellRecovery>(
+      subcell_recovery = std::make_unique<::igrlab::igr_internal::CompactSubcellRecovery>(
         ctx.spaces.vfes, run_cfg.case_config.gamma, run_cfg.case_config.rk3_config.rho_min,
         run_cfg.case_config.rk3_config.p_min, recovery_kind == "linear", subcell_muscl);
       // The context owns sigma for output/flux consumers; its state-space order
@@ -1736,7 +1736,7 @@ struct Solver
     rk3.EnableStageAdmissibilityScan(run_cfg.opts.admissibility_scan);
 
     const double rho_floor = run_cfg.case_config.rk3_config.rho_min;
-    std::unique_ptr<igrlab::IGRSolver> igr;
+    std::unique_ptr<::igrlab::IGRSolver> igr;
     double vtk_c_alpha = spec.vtk.c_alpha_value;
     if (use_igr)
     {
@@ -1747,7 +1747,7 @@ struct Solver
                          alpha_policy);
       if (subcell_recovery)
       {
-        MFEM_VERIFY(alpha_policy != igrlab::IGRAlphaLengthScalePolicy::Local,
+        MFEM_VERIFY(alpha_policy != ::igrlab::IGRAlphaLengthScalePolicy::Local,
                     "Subcell bridge requires a fixed physical alpha, not per-subcell h scaling.");
         const char* alpha_text = ::igrlab::GetEnv("DG_IGR_IGR_SUBCELL_ALPHA");
         char* end = nullptr;
@@ -1758,7 +1758,7 @@ struct Solver
         alpha_info.c_alpha = fixed_alpha/(alpha_info.dx_eff*alpha_info.dx_eff);
       }
       const bool element_local_alpha =
-        alpha_info.policy == igrlab::IGRAlphaLengthScalePolicy::Local;
+        alpha_info.policy == ::igrlab::IGRAlphaLengthScalePolicy::Local;
       const double alpha_effective_min =
         element_local_alpha
           ? alpha_info.c_alpha * alpha_info.hmin * alpha_info.hmin
@@ -1781,7 +1781,7 @@ struct Solver
                   << " alpha_effective_max=" << alpha_effective_max << "\n";
       }
       vtk_c_alpha = std::isnan(vtk_c_alpha) ? alpha_info.c_alpha : vtk_c_alpha;
-      igr = std::make_unique<igrlab::IGRSolver>(MakeIGRSolver(ctx.spaces,
+      igr = std::make_unique<::igrlab::IGRSolver>(MakeIGRSolver(ctx.spaces,
                                                               ctx.dim,
                                                               ctx.num_equations,
                                                               run_cfg,
@@ -1790,9 +1790,9 @@ struct Solver
                                                               subcell_recovery ? &subcell_recovery->StateSpace() : nullptr));
       if (subcell_recovery)
       {
-        MFEM_VERIFY(igr->GetSigmaUpdateCadence() == igrlab::IGRSigmaUpdateCadence::EveryStage,
+        MFEM_VERIFY(igr->GetSigmaUpdateCadence() == ::igrlab::IGRSigmaUpdateCadence::EveryStage,
                     "Subcell bridge requires --igr-sigma-cadence every-stage.");
-        igr->SetGradBackend(igrlab::IGRGradBackend::BrokenDG);
+        igr->SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
         igr->SetSubcellQuadratureMinimumOrder(subcell_quadrature_min_order);
       }
     }

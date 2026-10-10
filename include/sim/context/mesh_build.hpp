@@ -75,8 +75,8 @@ struct AlphaInfo
   mfem::real_t dx_eff = mfem::infinity();
   double c_alpha = 1.0;
   mfem::real_t alpha = 1.0;
-  igrlab::IGRAlphaLengthScalePolicy policy =
-    igrlab::IGRAlphaLengthScalePolicy::Average;
+  ::igrlab::IGRAlphaLengthScalePolicy policy =
+    ::igrlab::IGRAlphaLengthScalePolicy::Average;
 };
 
 inline mfem::Mesh LoadSerialMesh(const std::string& mesh_path,
@@ -100,7 +100,7 @@ inline void RefineParMesh(mfem::ParMesh& pmesh, int par_ref_levels)
 
 inline AlphaInfo ComputeAlphaInfo(const mfem::ParMesh& pmesh,
                                   double c_alpha_user,
-                                  igrlab::IGRAlphaLengthScalePolicy policy)
+                                  ::igrlab::IGRAlphaLengthScalePolicy policy)
 {
   AlphaInfo info;
   info.policy = policy;
@@ -142,22 +142,22 @@ inline AlphaInfo ComputeAlphaInfo(const mfem::ParMesh& pmesh,
                 : info.hmin;
   switch (policy)
   {
-  case igrlab::IGRAlphaLengthScalePolicy::Min:
+  case ::igrlab::IGRAlphaLengthScalePolicy::Min:
     info.dx_eff = info.hmin;
     info.alpha = static_cast<mfem::real_t>(info.c_alpha * info.dx_eff *
                                            info.dx_eff);
     break;
-  case igrlab::IGRAlphaLengthScalePolicy::Average:
+  case ::igrlab::IGRAlphaLengthScalePolicy::Average:
     info.dx_eff = info.havg;
     info.alpha = static_cast<mfem::real_t>(info.c_alpha * info.dx_eff *
                                            info.dx_eff);
     break;
-  case igrlab::IGRAlphaLengthScalePolicy::Max:
+  case ::igrlab::IGRAlphaLengthScalePolicy::Max:
     info.dx_eff = info.hmax;
     info.alpha = static_cast<mfem::real_t>(info.c_alpha * info.dx_eff *
                                            info.dx_eff);
     break;
-  case igrlab::IGRAlphaLengthScalePolicy::Local:
+  case ::igrlab::IGRAlphaLengthScalePolicy::Local:
     info.dx_eff = info.havg;
     info.alpha = static_cast<mfem::real_t>(info.c_alpha);
     break;

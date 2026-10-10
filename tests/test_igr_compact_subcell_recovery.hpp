@@ -12,7 +12,7 @@
 #include <cstdlib>
 #include <string>
 
-inline void CheckCompactQuadratureFloor(igrlab::IGRSolver& igr,
+inline void CheckCompactQuadratureFloor(::igrlab::IGRSolver& igr,
                                         mfem::ParFiniteElementSpace& sfes,
                                         const mfem::ParGridFunction& recovered)
 {
@@ -26,7 +26,7 @@ inline void CheckCompactQuadratureFloor(igrlab::IGRSolver& igr,
       if(kind_==0)return 1./u(0);
       if(kind_==1)return .04/u(0);
       mfem::DenseMatrix gradient(4,2); state_.GetVectorGradient(tr,gradient);
-      return igrlab::frozen_scalar_igr_algebra::SourceFromConservativeStateGradient(
+      return ::igrlab::frozen_scalar_igr_algebra::SourceFromConservativeStateGradient(
         2,u.GetData(),1,gradient.GetData(),1,gradient.Height(),.04,1e-12);
     }
   private:
@@ -112,7 +112,7 @@ inline void TestCompactMUSCLFaces(MPI_Comm comm)
     mfem::L2_FECollection scalar_collection(closure_order,2,mfem::BasisType::GaussLegendre);
     mfem::ParFiniteElementSpace fes(&mesh,&constants,4,ordering), sfes(&mesh,&scalar_collection);
     mfem::ParGridFunction means(&fes), sigma(&sfes);
-    igrlab::igr_internal::CompactSubcellRecovery recovery(fes,1.4,1e-12,1e-12,false,true);
+    ::igrlab::igr_internal::CompactSubcellRecovery recovery(fes,1.4,1e-12,1e-12,false,true);
     MFEM_VERIFY(recovery.StateSpace().GetMaxElementOrder()==2 && sfes.GetMaxElementOrder()==closure_order,
                 "Mixed-order closure test changed the current quadratic recovery space.");
     mfem::VectorFunctionCoefficient initial(4,[](const mfem::Vector& x,mfem::Vector& u)
@@ -173,12 +173,12 @@ inline void TestCompactMUSCLFaces(MPI_Comm comm)
     // at stage zero and a later distinct device-resident stage vector.
     if (ordering == mfem::Ordering::byNODES)
     {
-      igrlab::IGRSolver igr(sfes,recovery.StateSpace(),2,4,.04);
-      igr.SetGradBackend(igrlab::IGRGradBackend::BrokenDG);
-      igr.SetIPKind(igrlab::IGRIPKind::SIPG); igr.SetExactDGFaceOperator(true);
-      igr.SetSolveMode(igrlab::IGRSolveMode::Krylov);
-      igr.SetLinearSolver(igrlab::IGRLinearSolverType::CG);
-      igr.SetPreconditioner(igrlab::IGRPrecondType::Auto);
+      ::igrlab::IGRSolver igr(sfes,recovery.StateSpace(),2,4,.04);
+      igr.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+      igr.SetIPKind(::igrlab::IGRIPKind::SIPG); igr.SetExactDGFaceOperator(true);
+      igr.SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+      igr.SetLinearSolver(::igrlab::IGRLinearSolverType::CG);
+      igr.SetPreconditioner(::igrlab::IGRPrecondType::Auto);
       igr.SetLinearSolveParams(1e-10,0.,1000,0);
       igr.SetStageRtolScale(1.0);
       igr.SetSubcellQuadratureMinimumOrder(quadrature_floor);
@@ -199,7 +199,7 @@ inline void TestCompactMUSCLFaces(MPI_Comm comm)
       mfem::Vector expected = CompactMUSCLFaceOracle(stage,current_slopes,flux); expected-=result;
       MFEM_VERIFY(expected.Normlinf()<3e-12,"Coupled stage used stale reconstructed transport traces.");
       mfem::Vector stage_sigma(igr.GetSigma());
-      igr.UpdateFromState(recovery.Rebuild(stage),false,igrlab::IGRSolvePurpose::ProductionStage,true);
+      igr.UpdateFromState(recovery.Rebuild(stage),false,::igrlab::IGRSolvePurpose::ProductionStage,true);
       MFEM_VERIFY(igr.GetLastLinearConverged() &&
                     std::isfinite(igr.GetLastLinearTrueResidualRelRHS()) &&
                     igr.GetLastLinearTrueResidualRelRHS()<=igr.GetLastIndependentCertificateRelativeLimit(),
@@ -255,7 +255,7 @@ inline void TestCompactSubcellRecovery(MPI_Comm comm)
   {
     mfem::ParFiniteElementSpace fes(&mesh,&constants,4,ordering);
     mfem::ParGridFunction means(&fes);
-    igrlab::igr_internal::CompactSubcellRecovery recovery(fes,1.4,1e-12,1e-12,linear);
+    ::igrlab::igr_internal::CompactSubcellRecovery recovery(fes,1.4,1e-12,1e-12,linear);
     mfem::VectorFunctionCoefficient initial(4,[](const mfem::Vector& x,mfem::Vector& u)
     {
       u(0) = 2+.01*x(0)+.002*x(0)*x(0);

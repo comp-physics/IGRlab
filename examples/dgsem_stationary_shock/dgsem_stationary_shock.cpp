@@ -54,13 +54,13 @@ int main(int argc, char* argv[])
     //   -iatol/--igr-lin-atol
     //   -imaxit/--igr-lin-maxit
     //   -iprint/--igr-lin-print
-    cfg.igr_config.solve_mode = igrlab::IGRSolveMode::Krylov;
+    cfg.igr_config.solve_mode = ::igrlab::IGRSolveMode::Krylov;
     // Auto policy:
     //   H1 -> CG + BoomerAMG
     //   L2/DG -> GMRES + BoomerAMG
-    cfg.igr_config.lin_solver_type = igrlab::IGRLinearSolverType::Auto;
-    cfg.igr_config.prec_type = igrlab::IGRPrecondType::Auto;
-    cfg.igr_config.ip_kind = igrlab::IGRIPKind::SIPG;
+    cfg.igr_config.lin_solver_type = ::igrlab::IGRLinearSolverType::Auto;
+    cfg.igr_config.prec_type = ::igrlab::IGRPrecondType::Auto;
+    cfg.igr_config.ip_kind = ::igrlab::IGRIPKind::SIPG;
     cfg.igr_config.lin_rtol = 1.0e-6;
     cfg.igr_config.lin_atol = 0.0;
     cfg.igr_config.lin_maxit = 1000;

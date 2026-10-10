@@ -605,17 +605,17 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   "IGR defaults: CUDA L2/BrokenL2 DG uses zero atol");
     ctx.Check(igr_opts.lin_maxit == 500,
               "IGR defaults: CUDA L2/BrokenL2 DG uses production iteration cap");
-    igrlab::IGRConfig igr_config;
+    ::igrlab::IGRConfig igr_config;
     ctx.Check(igr_config.nonconvergence_policy ==
-                igrlab::IGRNonconvergencePolicy::Accept,
+                ::igrlab::IGRNonconvergencePolicy::Accept,
               "IGR defaults: linear nonconvergence retains capped iterate");
     ctx.Check(dg_sim::ParseIGRNonconvergencePolicy("error") ==
-                igrlab::IGRNonconvergencePolicy::Error,
+                ::igrlab::IGRNonconvergencePolicy::Error,
               "IGR options: explicit strict error policy parses");
     igr_opts.nonconvergence_policy = "error";
     dg_sim::ApplyIGRRuntimeOptionOverrides(igr_opts, igr_config);
     ctx.Check(igr_config.nonconvergence_policy ==
-                igrlab::IGRNonconvergencePolicy::Error,
+                ::igrlab::IGRNonconvergencePolicy::Error,
               "IGR options: strict nonconvergence policy reaches solver config");
   }
 
@@ -764,7 +764,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     const auto cadence =
       dg_sim::ParseIGRSigmaUpdateCadence("EXTRAPOLATED-EVERY-STEP");
     ctx.Check(
-      cadence == igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep &&
+      cadence == ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep &&
         std::string(dg_sim::IGRSigmaUpdateCadenceToString(cadence)) ==
           "extrapolated-every-step" &&
         dg_sim::ParseIGRSigmaUpdateCadence("extrapolated_every_step") == cadence,
@@ -798,7 +798,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "modal damping: M16 physical rate parses");
 
     case_cfg.igr_config.sigma_cadence =
-      igrlab::IGRSigmaUpdateCadence::EveryStage;
+      ::igrlab::IGRSigmaUpdateCadence::EveryStage;
     ctx.Check(validate(dg_sim::Discretization::DG,
                        dg_sim::Regularization::IGR).empty() &&
                 validate(dg_sim::Discretization::DGSEM,
@@ -809,7 +809,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "modal damping: positive HDG request is rejected before dispatch");
 
     case_cfg.igr_config.sigma_cadence =
-      igrlab::IGRSigmaUpdateCadence::EveryStep;
+      ::igrlab::IGRSigmaUpdateCadence::EveryStep;
     ctx.Check(!validate(dg_sim::Discretization::DG,
                         dg_sim::Regularization::IGR).empty(),
               "modal damping: inherited frozen IGR cadence is rejected");
@@ -1378,7 +1378,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     ctx.Check(dgsem_llf_name == ssprk104_name + "_dvd_llf",
               "VTK dataset: DGSEM LLF volume dissipation has a typed suffix");
     dataset_run.case_config.igr_config.sigma_cadence =
-      igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+      ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
     dataset_run.igr_opts.alpha_length_policy = "local";
     dataset_run.igr_opts.exact_dg_face_operator = true;
     const std::string shock_candidate_name =
@@ -1392,7 +1392,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     dataset_run.dgsem_volume_dissipation =
       dg_sim::DGSEMVolumeDissipation::None;
     dataset_run.case_config.igr_config.sigma_cadence =
-      igrlab::IGRSigmaUpdateCadence::EveryStage;
+      ::igrlab::IGRSigmaUpdateCadence::EveryStage;
     dataset_run.igr_opts.alpha_length_policy.clear();
     dataset_run.igr_opts.exact_dg_face_operator = false;
     dataset_run.igr_opts.igr_invariant_domain_flux = true;
@@ -1439,9 +1439,9 @@ int RunTimeDefaultsTests(TestContext& ctx)
     dg_sim::CaseConfig metadata_case;
     metadata_case.case_name = "ssprk-metadata";
     metadata_case.igr_config.sigma_cadence =
-      igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+      ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
     metadata_case.igr_config.alpha_length_scale_policy =
-      igrlab::IGRAlphaLengthScalePolicy::Local;
+      ::igrlab::IGRAlphaLengthScalePolicy::Local;
     dg_sim::RunConfig metadata_run;
     metadata_run.case_config = metadata_case;
     metadata_run.opts.vtk_save = true;

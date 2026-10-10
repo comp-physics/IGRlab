@@ -231,7 +231,7 @@ struct CaseConfig
   mfem::real_t gamma = 1.4;
   CommonOptions defaults;
   mfem::RK3Config rk3_config;
-  igrlab::IGRConfig igr_config;
+  ::igrlab::IGRConfig igr_config;
   mfem::LimiterPipelineConfig limiter_pipeline;
   mfem::io::VTKOutputConfig vtk_config;
 };
@@ -369,162 +369,162 @@ ZhangShuPointSetToString(mfem::ZhangShuPointSet point_set)
   return "consumer";
 }
 
-inline igrlab::IGRIPKind ParseIGRIPKind(const std::string& value)
+inline ::igrlab::IGRIPKind ParseIGRIPKind(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "sipg")
   {
-    return igrlab::IGRIPKind::SIPG;
+    return ::igrlab::IGRIPKind::SIPG;
   }
   if (lower == "iipg")
   {
-    return igrlab::IGRIPKind::IIPG;
+    return ::igrlab::IGRIPKind::IIPG;
   }
   if (lower == "nipg")
   {
-    return igrlab::IGRIPKind::NIPG;
+    return ::igrlab::IGRIPKind::NIPG;
   }
   MFEM_VERIFY(false,
               "Invalid IGR IP kind '" << value
                                       << "'. Use 'sipg', 'iipg', or 'nipg'.");
-  return igrlab::IGRIPKind::SIPG;
+  return ::igrlab::IGRIPKind::SIPG;
 }
 
-inline igrlab::IGRSolveMode ParseIGRSolveMode(const std::string& value)
+inline ::igrlab::IGRSolveMode ParseIGRSolveMode(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "smoother" || lower == "smoother-sweeps" || lower == "sweeps")
   {
-    return igrlab::IGRSolveMode::SmootherSweeps;
+    return ::igrlab::IGRSolveMode::SmootherSweeps;
   }
   if (lower == "krylov")
   {
-    return igrlab::IGRSolveMode::Krylov;
+    return ::igrlab::IGRSolveMode::Krylov;
   }
   MFEM_VERIFY(false,
               "Invalid IGR solve mode '" << value
                                          << "'. Use 'smoother' or 'krylov'.");
-  return igrlab::IGRSolveMode::Krylov;
+  return ::igrlab::IGRSolveMode::Krylov;
 }
 
-inline igrlab::IGRLinearSolverType
+inline ::igrlab::IGRLinearSolverType
 ParseIGRLinearSolverType(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "auto")
   {
-    return igrlab::IGRLinearSolverType::Auto;
+    return ::igrlab::IGRLinearSolverType::Auto;
   }
   if (lower == "cg")
   {
-    return igrlab::IGRLinearSolverType::CG;
+    return ::igrlab::IGRLinearSolverType::CG;
   }
   if (lower == "gmres")
   {
-    return igrlab::IGRLinearSolverType::GMRES;
+    return ::igrlab::IGRLinearSolverType::GMRES;
   }
   if (lower == "fgmres")
   {
-    return igrlab::IGRLinearSolverType::FGMRES;
+    return ::igrlab::IGRLinearSolverType::FGMRES;
   }
   if (lower == "bicgstab")
   {
-    return igrlab::IGRLinearSolverType::BiCGSTAB;
+    return ::igrlab::IGRLinearSolverType::BiCGSTAB;
   }
   if (lower == "minres")
   {
-    return igrlab::IGRLinearSolverType::MINRES;
+    return ::igrlab::IGRLinearSolverType::MINRES;
   }
   MFEM_VERIFY(false,
               "Invalid IGR linear solver '"
                 << value << "'. Use 'auto', 'cg', 'gmres', 'fgmres', "
                 << "'bicgstab', or 'minres'.");
-  return igrlab::IGRLinearSolverType::Auto;
+  return ::igrlab::IGRLinearSolverType::Auto;
 }
 
-inline igrlab::IGRPrecondType ParseIGRPrecondType(const std::string& value)
+inline ::igrlab::IGRPrecondType ParseIGRPrecondType(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "auto")
   {
-    return igrlab::IGRPrecondType::Auto;
+    return ::igrlab::IGRPrecondType::Auto;
   }
   if (lower == "boomeramg" || lower == "amg")
   {
-    return igrlab::IGRPrecondType::BoomerAMG;
+    return ::igrlab::IGRPrecondType::BoomerAMG;
   }
   if (lower == "hypreilu" || lower == "ilu")
   {
-    return igrlab::IGRPrecondType::HypreILU;
+    return ::igrlab::IGRPrecondType::HypreILU;
   }
   if (lower == "hypreeuclid" || lower == "euclid")
   {
-    return igrlab::IGRPrecondType::HypreEuclid;
+    return ::igrlab::IGRPrecondType::HypreEuclid;
   }
   if (lower == "parasails" || lower == "hypreparasails")
   {
-    return igrlab::IGRPrecondType::ParaSails;
+    return ::igrlab::IGRPrecondType::ParaSails;
   }
   if (lower == "hypresmoother" || lower == "smoother")
   {
-    return igrlab::IGRPrecondType::HypreSmoother;
+    return ::igrlab::IGRPrecondType::HypreSmoother;
   }
   if (lower == "chebyshev" || lower == "operatorchebyshev" ||
       lower == "operator-chebyshev")
   {
-    return igrlab::IGRPrecondType::OperatorChebyshev;
+    return ::igrlab::IGRPrecondType::OperatorChebyshev;
   }
   if (lower == "none")
   {
-    return igrlab::IGRPrecondType::None;
+    return ::igrlab::IGRPrecondType::None;
   }
   MFEM_VERIFY(false,
               "Invalid IGR preconditioner '"
                 << value << "'. Use 'auto', 'boomeramg', 'hypreilu', "
                 << "'hypreeuclid', 'parasails', "
                 << "'hypresmoother', 'chebyshev', or 'none'.");
-  return igrlab::IGRPrecondType::Auto;
+  return ::igrlab::IGRPrecondType::Auto;
 }
 
-inline igrlab::IGRNonconvergencePolicy
+inline ::igrlab::IGRNonconvergencePolicy
 ParseIGRNonconvergencePolicy(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "error" || lower == "fail")
   {
-    return igrlab::IGRNonconvergencePolicy::Error;
+    return ::igrlab::IGRNonconvergencePolicy::Error;
   }
   if (lower == "accept" || lower == "legacy")
   {
-    return igrlab::IGRNonconvergencePolicy::Accept;
+    return ::igrlab::IGRNonconvergencePolicy::Accept;
   }
   MFEM_VERIFY(false,
               "Invalid IGR nonconvergence policy '"
                 << value << "'. Use 'error' or 'accept'.");
-  return igrlab::IGRNonconvergencePolicy::Error;
+  return ::igrlab::IGRNonconvergencePolicy::Error;
 }
 
-inline igrlab::IGRSigmaUpdateCadence
+inline ::igrlab::IGRSigmaUpdateCadence
 ParseIGRSigmaUpdateCadence(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "every-stage" || lower == "every_stage" || lower == "stage")
   {
-    return igrlab::IGRSigmaUpdateCadence::EveryStage;
+    return ::igrlab::IGRSigmaUpdateCadence::EveryStage;
   }
   if (lower == "every-step" || lower == "every_step" || lower == "step")
   {
-    return igrlab::IGRSigmaUpdateCadence::EveryStep;
+    return ::igrlab::IGRSigmaUpdateCadence::EveryStep;
   }
   if (lower == "extrapolated-every-step" ||
       lower == "extrapolated_every_step" || lower == "extrapolated-step")
   {
-    return igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+    return ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
   }
   if (lower == "every-n-steps" || lower == "every_n_steps" ||
       lower == "every-n" || lower == "nsteps")
   {
-    return igrlab::IGRSigmaUpdateCadence::EveryNSteps;
+    return ::igrlab::IGRSigmaUpdateCadence::EveryNSteps;
   }
   MFEM_VERIFY(false,
               "Invalid IGR sigma cadence '"
@@ -532,136 +532,136 @@ ParseIGRSigmaUpdateCadence(const std::string& value)
                 << "'. Use 'every-stage', 'every-step', "
                    "'extrapolated-every-step', or "
                    "'every-n-steps'.");
-  return igrlab::IGRSigmaUpdateCadence::EveryStage;
+  return ::igrlab::IGRSigmaUpdateCadence::EveryStage;
 }
 
-inline igrlab::IGRAlphaLengthScalePolicy
+inline ::igrlab::IGRAlphaLengthScalePolicy
 ParseIGRAlphaLengthScalePolicy(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "min" || lower == "minimum")
   {
-    return igrlab::IGRAlphaLengthScalePolicy::Min;
+    return ::igrlab::IGRAlphaLengthScalePolicy::Min;
   }
   if (lower == "avg" || lower == "average" || lower == "mean")
   {
-    return igrlab::IGRAlphaLengthScalePolicy::Average;
+    return ::igrlab::IGRAlphaLengthScalePolicy::Average;
   }
   if (lower == "max" || lower == "maximum")
   {
-    return igrlab::IGRAlphaLengthScalePolicy::Max;
+    return ::igrlab::IGRAlphaLengthScalePolicy::Max;
   }
   if (lower == "local" || lower == "local-dx" || lower == "element-local")
   {
-    return igrlab::IGRAlphaLengthScalePolicy::Local;
+    return ::igrlab::IGRAlphaLengthScalePolicy::Local;
   }
   MFEM_VERIFY(false,
               "Invalid IGR alpha length-scale policy '"
                 << value
                 << "'. Use 'min', 'average', 'max', or 'local'.");
-  return igrlab::IGRAlphaLengthScalePolicy::Average;
+  return ::igrlab::IGRAlphaLengthScalePolicy::Average;
 }
 
-inline const char* IGRIPKindToString(igrlab::IGRIPKind value)
+inline const char* IGRIPKindToString(::igrlab::IGRIPKind value)
 {
   switch (value)
   {
-  case igrlab::IGRIPKind::SIPG:
+  case ::igrlab::IGRIPKind::SIPG:
     return "sipg";
-  case igrlab::IGRIPKind::IIPG:
+  case ::igrlab::IGRIPKind::IIPG:
     return "iipg";
-  case igrlab::IGRIPKind::NIPG:
+  case ::igrlab::IGRIPKind::NIPG:
     return "nipg";
   }
   return "sipg";
 }
 
-inline const char* IGRSolveModeToString(igrlab::IGRSolveMode value)
+inline const char* IGRSolveModeToString(::igrlab::IGRSolveMode value)
 {
   switch (value)
   {
-  case igrlab::IGRSolveMode::SmootherSweeps:
+  case ::igrlab::IGRSolveMode::SmootherSweeps:
     return "smoother";
-  case igrlab::IGRSolveMode::Krylov:
+  case ::igrlab::IGRSolveMode::Krylov:
     return "krylov";
   }
   return "krylov";
 }
 
 inline const char*
-IGRLinearSolverTypeToString(igrlab::IGRLinearSolverType value)
+IGRLinearSolverTypeToString(::igrlab::IGRLinearSolverType value)
 {
   switch (value)
   {
-  case igrlab::IGRLinearSolverType::Auto:
+  case ::igrlab::IGRLinearSolverType::Auto:
     return "auto";
-  case igrlab::IGRLinearSolverType::CG:
+  case ::igrlab::IGRLinearSolverType::CG:
     return "cg";
-  case igrlab::IGRLinearSolverType::GMRES:
+  case ::igrlab::IGRLinearSolverType::GMRES:
     return "gmres";
-  case igrlab::IGRLinearSolverType::FGMRES:
+  case ::igrlab::IGRLinearSolverType::FGMRES:
     return "fgmres";
-  case igrlab::IGRLinearSolverType::BiCGSTAB:
+  case ::igrlab::IGRLinearSolverType::BiCGSTAB:
     return "bicgstab";
-  case igrlab::IGRLinearSolverType::MINRES:
+  case ::igrlab::IGRLinearSolverType::MINRES:
     return "minres";
   }
   return "auto";
 }
 
-inline const char* IGRPrecondTypeToString(igrlab::IGRPrecondType value)
+inline const char* IGRPrecondTypeToString(::igrlab::IGRPrecondType value)
 {
   switch (value)
   {
-  case igrlab::IGRPrecondType::Auto:
+  case ::igrlab::IGRPrecondType::Auto:
     return "auto";
-  case igrlab::IGRPrecondType::BoomerAMG:
+  case ::igrlab::IGRPrecondType::BoomerAMG:
     return "boomeramg";
-  case igrlab::IGRPrecondType::HypreILU:
+  case ::igrlab::IGRPrecondType::HypreILU:
     return "hypreilu";
-  case igrlab::IGRPrecondType::HypreEuclid:
+  case ::igrlab::IGRPrecondType::HypreEuclid:
     return "hypreeuclid";
-  case igrlab::IGRPrecondType::ParaSails:
+  case ::igrlab::IGRPrecondType::ParaSails:
     return "parasails";
-  case igrlab::IGRPrecondType::HypreSmoother:
+  case ::igrlab::IGRPrecondType::HypreSmoother:
     return "hypresmoother";
-  case igrlab::IGRPrecondType::OperatorChebyshev:
+  case ::igrlab::IGRPrecondType::OperatorChebyshev:
     return "chebyshev";
-  case igrlab::IGRPrecondType::None:
+  case ::igrlab::IGRPrecondType::None:
     return "none";
   }
   return "auto";
 }
 
 inline const char*
-IGRSigmaUpdateCadenceToString(igrlab::IGRSigmaUpdateCadence value)
+IGRSigmaUpdateCadenceToString(::igrlab::IGRSigmaUpdateCadence value)
 {
   switch (value)
   {
-  case igrlab::IGRSigmaUpdateCadence::EveryStage:
+  case ::igrlab::IGRSigmaUpdateCadence::EveryStage:
     return "every-stage";
-  case igrlab::IGRSigmaUpdateCadence::EveryStep:
+  case ::igrlab::IGRSigmaUpdateCadence::EveryStep:
     return "every-step";
-  case igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep:
+  case ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep:
     return "extrapolated-every-step";
-  case igrlab::IGRSigmaUpdateCadence::EveryNSteps:
+  case ::igrlab::IGRSigmaUpdateCadence::EveryNSteps:
     return "every-n-steps";
   }
   return "every-stage";
 }
 
 inline const char*
-IGRAlphaLengthScalePolicyToString(igrlab::IGRAlphaLengthScalePolicy value)
+IGRAlphaLengthScalePolicyToString(::igrlab::IGRAlphaLengthScalePolicy value)
 {
   switch (value)
   {
-  case igrlab::IGRAlphaLengthScalePolicy::Min:
+  case ::igrlab::IGRAlphaLengthScalePolicy::Min:
     return "min";
-  case igrlab::IGRAlphaLengthScalePolicy::Average:
+  case ::igrlab::IGRAlphaLengthScalePolicy::Average:
     return "average";
-  case igrlab::IGRAlphaLengthScalePolicy::Max:
+  case ::igrlab::IGRAlphaLengthScalePolicy::Max:
     return "max";
-  case igrlab::IGRAlphaLengthScalePolicy::Local:
+  case ::igrlab::IGRAlphaLengthScalePolicy::Local:
     return "local";
   }
   return "average";
@@ -1682,7 +1682,7 @@ inline void ApplyExampleDefaults(CaseConfig& cfg)
 {
   cfg.defaults = CommonOptions{};
   cfg.rk3_config = mfem::RK3Config{};
-  cfg.igr_config = igrlab::IGRConfig{};
+  cfg.igr_config = ::igrlab::IGRConfig{};
   cfg.limiter_pipeline = mfem::LimiterPipelineConfig{};
   cfg.vtk_config = mfem::io::VTKOutputConfig{};
 
@@ -1701,8 +1701,8 @@ inline void ApplyExampleDefaults(CaseConfig& cfg)
   cfg.igr_config.lin_maxit = 1000;
   cfg.igr_config.lin_print = 0;
   cfg.igr_config.alpha_length_scale_policy =
-    igrlab::IGRAlphaLengthScalePolicy::Average;
-  cfg.igr_config.sigma_cadence = igrlab::IGRSigmaUpdateCadence::EveryStage;
+    ::igrlab::IGRAlphaLengthScalePolicy::Average;
+  cfg.igr_config.sigma_cadence = ::igrlab::IGRSigmaUpdateCadence::EveryStage;
   cfg.igr_config.sigma_update_interval = 1;
   cfg.igr_config.stage_rtol_scale = 1.0;
   cfg.igr_config.amg_coarsen_type = -1;
@@ -1934,11 +1934,11 @@ inline std::string ValidateModalDampingSelection(
   }
   if (regularization == Regularization::IGR)
   {
-    const igrlab::IGRSigmaUpdateCadence cadence =
+    const ::igrlab::IGRSigmaUpdateCadence cadence =
       igr_opts.sigma_cadence.empty()
         ? case_cfg.igr_config.sigma_cadence
         : ParseIGRSigmaUpdateCadence(igr_opts.sigma_cadence);
-    if (cadence != igrlab::IGRSigmaUpdateCadence::EveryStage)
+    if (cadence != ::igrlab::IGRSigmaUpdateCadence::EveryStage)
     {
       return "Positive --modal-damping-rate with active IGR requires "
              "--igr-sigma-cadence every-stage.";
@@ -1977,12 +1977,12 @@ ValidateExplicitSSPRKCFLSelection(const RunConfig& run_cfg)
       return "Research rk4/dopri5/radau-picard5 currently require an inactive "
              "limiter pipeline (--positivity-limiter none).";
     }
-    const igrlab::IGRSigmaUpdateCadence cadence =
+    const ::igrlab::IGRSigmaUpdateCadence cadence =
       run_cfg.igr_opts.sigma_cadence.empty()
         ? run_cfg.case_config.igr_config.sigma_cadence
         : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
     if (run_cfg.regularization == Regularization::IGR &&
-        cadence != igrlab::IGRSigmaUpdateCadence::EveryStage)
+        cadence != ::igrlab::IGRSigmaUpdateCadence::EveryStage)
     {
       return "Research rk4/dopri5/radau-picard5 with active IGR require "
              "--igr-sigma-cadence every-stage.";
@@ -2009,7 +2009,7 @@ ValidateExplicitSSPRKCFLSelection(const RunConfig& run_cfg)
   return {};
 }
 
-inline igrlab::IGRAlphaLengthScalePolicy
+inline ::igrlab::IGRAlphaLengthScalePolicy
 ResolveIGRAlphaLengthScalePolicy(const RunConfig& run_cfg)
 {
   if (!run_cfg.igr_opts.alpha_length_policy.empty())
@@ -2024,7 +2024,7 @@ ResolveIGRAlphaLengthScalePolicy(const RunConfig& run_cfg)
 /// the same spatial dissipation, while retaining current-equation sigma solves.
 inline bool UsesFrozenSigmaSpectralSpeed(const RunConfig& run_cfg)
 {
-  const igrlab::IGRSigmaUpdateCadence cadence =
+  const ::igrlab::IGRSigmaUpdateCadence cadence =
     run_cfg.igr_opts.sigma_cadence.empty()
       ? run_cfg.case_config.igr_config.sigma_cadence
       : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
@@ -2034,7 +2034,7 @@ inline bool UsesFrozenSigmaSpectralSpeed(const RunConfig& run_cfg)
     if (std::string(reference) != "1" ||
         run_cfg.regularization != Regularization::IGR ||
         run_cfg.discretization != Discretization::DGSEM ||
-        cadence != igrlab::IGRSigmaUpdateCadence::EveryStage)
+        cadence != ::igrlab::IGRSigmaUpdateCadence::EveryStage)
     {
       throw std::invalid_argument(
         "DG_IGR_IGR_FROZEN_SIGMA_REFERENCE requires value exactly 1 and "
@@ -2044,7 +2044,7 @@ inline bool UsesFrozenSigmaSpectralSpeed(const RunConfig& run_cfg)
   }
   return run_cfg.regularization == Regularization::IGR &&
          run_cfg.discretization == Discretization::DGSEM &&
-         cadence == igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+         cadence == ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
 }
 
 /** Reject cadence requests that the existing HDG DAE backend cannot honor.
@@ -2072,11 +2072,11 @@ inline std::string ValidateHdgIGRSigmaCadence(
   {
     return {};
   }
-  const igrlab::IGRSigmaUpdateCadence cadence =
+  const ::igrlab::IGRSigmaUpdateCadence cadence =
     igr_opts.sigma_cadence.empty()
       ? case_cfg.igr_config.sigma_cadence
       : ParseIGRSigmaUpdateCadence(igr_opts.sigma_cadence);
-  if (cadence == igrlab::IGRSigmaUpdateCadence::EveryStage)
+  if (cadence == ::igrlab::IGRSigmaUpdateCadence::EveryStage)
   {
     return {};
   }
@@ -2095,11 +2095,11 @@ inline std::string ValidateHdgIGRSigmaCadence(
 inline std::string
 ValidateExtrapolatedEveryStepIGRSelection(const RunConfig& run_cfg)
 {
-  const igrlab::IGRSigmaUpdateCadence cadence =
+  const ::igrlab::IGRSigmaUpdateCadence cadence =
     run_cfg.igr_opts.sigma_cadence.empty()
       ? run_cfg.case_config.igr_config.sigma_cadence
       : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
-  if (cadence != igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep)
+  if (cadence != ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep)
   {
     return {};
   }
@@ -2147,18 +2147,18 @@ ValidateExtrapolatedEveryStepIGRSelection(const RunConfig& run_cfg)
   }
   if (!IsL2IGRSpaceName(run_cfg.igr_opts.space) ||
       !IsBrokenDGIGRGradName(run_cfg.igr_opts.grad) ||
-      ParseIGRIPKind(run_cfg.igr_opts.ip_kind) != igrlab::IGRIPKind::SIPG ||
+      ParseIGRIPKind(run_cfg.igr_opts.ip_kind) != ::igrlab::IGRIPKind::SIPG ||
       !run_cfg.igr_opts.exact_dg_face_operator)
   {
     return std::string(prefix) +
            "the L2/BrokenL2 SIPG closure with exact DG faces.";
   }
   if (ParseIGRSolveMode(run_cfg.igr_opts.solve_mode) !=
-        igrlab::IGRSolveMode::Krylov ||
+        ::igrlab::IGRSolveMode::Krylov ||
       ParseIGRLinearSolverType(run_cfg.igr_opts.linear_solver) !=
-        igrlab::IGRLinearSolverType::CG ||
+        ::igrlab::IGRLinearSolverType::CG ||
       ParseIGRPrecondType(run_cfg.igr_opts.preconditioner) !=
-        igrlab::IGRPrecondType::OperatorChebyshev)
+        ::igrlab::IGRPrecondType::OperatorChebyshev)
   {
     return std::string(prefix) +
            "Krylov CG with the full-system operator-Chebyshev preconditioner "
@@ -2166,7 +2166,7 @@ ValidateExtrapolatedEveryStepIGRSelection(const RunConfig& run_cfg)
            "residual certificate.";
   }
   if (ResolveIGRAlphaLengthScalePolicy(run_cfg) !=
-      igrlab::IGRAlphaLengthScalePolicy::Local)
+      ::igrlab::IGRAlphaLengthScalePolicy::Local)
   {
     return std::string(prefix) +
            "the local alpha=C_alpha*h_eff^2 policy.";
@@ -2182,7 +2182,7 @@ ValidateExtrapolatedEveryStepIGRSelection(const RunConfig& run_cfg)
   if (run_cfg.igr_opts.nonconvergence_policy.empty() ||
       ParseIGRNonconvergencePolicy(
         run_cfg.igr_opts.nonconvergence_policy) !=
-      igrlab::IGRNonconvergencePolicy::Error)
+      ::igrlab::IGRNonconvergencePolicy::Error)
   {
     return std::string(prefix) +
            "--igr-nonconvergence-policy error.";

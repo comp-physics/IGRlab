@@ -22,7 +22,7 @@ namespace dg_sim
 {
 
 /// @brief Resolve the sigma cadence after applying the case default.
-inline igrlab::IGRSigmaUpdateCadence
+inline ::igrlab::IGRSigmaUpdateCadence
 ResolveEffectiveIGRSigmaUpdateCadence(const RunConfig& run_cfg)
 {
   return run_cfg.igr_opts.sigma_cadence.empty()
@@ -98,16 +98,16 @@ inline std::string MakeCaseVTKDatasetName(
   if (run_cfg.regularization == Regularization::IGR)
   {
     const auto cadence = ResolveEffectiveIGRSigmaUpdateCadence(run_cfg);
-    if (cadence != igrlab::IGRSigmaUpdateCadence::EveryStage)
+    if (cadence != ::igrlab::IGRSigmaUpdateCadence::EveryStage)
     {
       name << "_iscad_" << IGRSigmaUpdateCadenceToString(cadence);
-      if (cadence == igrlab::IGRSigmaUpdateCadence::EveryNSteps)
+      if (cadence == ::igrlab::IGRSigmaUpdateCadence::EveryNSteps)
       {
         name << "_isn_" << ResolveEffectiveIGRSigmaUpdateInterval(run_cfg);
       }
     }
     const auto alpha_policy = ResolveIGRAlphaLengthScalePolicy(run_cfg);
-    if (alpha_policy == igrlab::IGRAlphaLengthScalePolicy::Local)
+    if (alpha_policy == ::igrlab::IGRAlphaLengthScalePolicy::Local)
     {
       name << "_ial_" << IGRAlphaLengthScalePolicyToString(alpha_policy);
     }

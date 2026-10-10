@@ -37,7 +37,7 @@ struct EulerFieldList
   EulerStateViews* state = nullptr;
   EulerPressureView* pressure = nullptr;
   EulerVelocityView* velocity = nullptr;
-  igrlab::IGRSolver* igr = nullptr;
+  ::igrlab::IGRSolver* igr = nullptr;
   const mfem::ParGridFunction* sigma = nullptr;
   H1Diagnostics* h1_diag = nullptr;
   L2Diagnostics* l2_diag = nullptr;

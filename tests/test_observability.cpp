@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace obs = igrlab::observability;
+namespace obs = ::igrlab::observability;
 
 static_assert(static_cast<std::uint16_t>(obs::RegionId::dg_mult) == 100);
 static_assert(static_cast<std::uint16_t>(obs::RegionId::igr_krylov_solve) == 246);
@@ -94,7 +94,7 @@ static int check_caliper_adapter()
   // enabled adapter's attribute setup, region enter/exit, and counter path.
   obs::set_runtime_enabled(true);
   {
-    igrlab::NVTXRange region(obs::RegionId::dg_mult);
+    ::igrlab::NVTXRange region(obs::RegionId::dg_mult);
     obs::record_counter(obs::CounterId::iterations, std::int64_t{1} << 40);
   }
   obs::set_runtime_enabled(false);
@@ -106,13 +106,13 @@ static_assert(!obs::compile_enabled);
 static_assert(!obs::nvtx_backend_enabled);
 static_assert(!obs::caliper_backend_enabled);
 static_assert(std::is_same<obs::DefaultBackend, obs::NoopBackend>::value);
-static_assert(std::is_empty<igrlab::NVTXRange>::value);
-static_assert(std::is_trivially_destructible<igrlab::NVTXRange>::value);
-static_assert(noexcept(igrlab::NVTXRange("DG/Mult")));
+static_assert(std::is_empty<::igrlab::NVTXRange>::value);
+static_assert(std::is_trivially_destructible<::igrlab::NVTXRange>::value);
+static_assert(noexcept(::igrlab::NVTXRange("DG/Mult")));
 
 static int disabled_probe(const int input) noexcept
 {
-  igrlab::NVTXRange range("DG/Mult");
+  ::igrlab::NVTXRange range("DG/Mult");
   obs::record_counter(obs::CounterId::iterations, input);
   return input + 1;
 }
@@ -127,7 +127,7 @@ int main()
 #if DG_IGR_ENABLE_OBSERVABILITY && !DG_IGR_OBSERVABILITY_USE_CALIPER
   static_assert(obs::compile_enabled);
   static_assert(!obs::nvtx_backend_enabled);
-  igrlab::NVTXRange compatibility("DG/Mult");
+  ::igrlab::NVTXRange compatibility("DG/Mult");
   return check_recording_backend();
 #elif DG_IGR_ENABLE_OBSERVABILITY
   return check_caliper_adapter();

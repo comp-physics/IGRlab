@@ -26,7 +26,7 @@ namespace
 using Cons = std::array<double,4>;
 using State = std::vector<Cons>;
 using Clock = std::chrono::steady_clock;
-namespace igr = igrlab::frozen_scalar_igr_algebra;
+namespace igr = ::igrlab::frozen_scalar_igr_algebra;
 constexpr double gamma_value = 1.4, admission_floor = 1.e-10;
 double Wall(Clock::time_point t) { return std::chrono::duration<double>(Clock::now()-t).count(); }
 struct Options

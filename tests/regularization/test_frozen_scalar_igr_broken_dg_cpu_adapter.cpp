@@ -13,8 +13,8 @@
 #include <type_traits>
 #include <vector>
 
-namespace regularization = igrlab::regularization;
-namespace algebra = igrlab::frozen_scalar_igr_algebra;
+namespace regularization = ::igrlab::regularization;
+namespace algebra = ::igrlab::frozen_scalar_igr_algebra;
 
 namespace
 {

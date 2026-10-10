@@ -2177,7 +2177,7 @@ bool RunArchitectureSelectionScreen(
   try
   {
     resolved_regularization = dg_sim::hdg::ResolveHdgRegularization(
-        mesh, igrlab::IGRAlphaLengthScalePolicy::Average,
+        mesh, ::igrlab::IGRAlphaLengthScalePolicy::Average,
         dg_sim::hdg::HdgRegularizationRequest{
             dg::hdg::generic::RegularizationKind::igr, 1.0, 1.0});
     regularization_resolved = true;
@@ -2188,7 +2188,7 @@ bool RunArchitectureSelectionScreen(
           dg::hdg::generic::RegularizationKind::igr &&
       resolved_regularization.alpha_info.c_alpha == 1.0 &&
       resolved_regularization.alpha_info.policy ==
-          igrlab::IGRAlphaLengthScalePolicy::Average &&
+          ::igrlab::IGRAlphaLengthScalePolicy::Average &&
       std::isfinite(resolved_regularization.alpha_info.dx_eff) &&
       resolved_regularization.alpha_info.dx_eff > 0.0 &&
       std::isfinite(resolved_regularization.selection.alpha) &&

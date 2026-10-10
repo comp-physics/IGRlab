@@ -80,7 +80,7 @@ int main(int argc, char** argv)
     guess(i) = 0.2 * std::sin(0.53 * i);
   }
   changed.Mult(exact, rhs);
-  auto solver = igrlab::igr_internal::MakeStationaryCorrectionSolver(MPI_COMM_WORLD, 8);
+  auto solver = ::igrlab::igr_internal::MakeStationaryCorrectionSolver(MPI_COMM_WORLD, 8);
   Configure(*solver, changed, retained_inverse);
   x = guess;
   const double initial_norm = Residual(changed, x, rhs);

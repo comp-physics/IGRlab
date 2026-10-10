@@ -25,7 +25,7 @@ template <typename NumericalFlux> struct EulerIGRPhysics
   template <typename BcSetup>
   EulerIGRPhysics(ExampleContext& ctx,
                   double gamma,
-                  igrlab::IGRSolver& igr,
+                  ::igrlab::IGRSolver& igr,
                   const BoundaryMarkerMap& markers,
                   BcSetup&& bc_setup)
     : flux(ctx.dim,
@@ -64,7 +64,7 @@ template <typename NumericalFlux, typename BcSetup>
 inline EulerIGRPhysics<NumericalFlux>
 MakeEulerIGRPhysics(ExampleContext& ctx,
                     double gamma,
-                    igrlab::IGRSolver& igr,
+                    ::igrlab::IGRSolver& igr,
                     const BoundaryMarkerMap& markers,
                     BcSetup&& bc_setup)
 {

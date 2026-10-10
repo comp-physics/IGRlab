@@ -144,10 +144,10 @@ int main(int argc,char** argv)
     }
   }
   if(input.is_open()){std::string extra;MFEM_VERIFY(!(input>>extra),"Unexpected trailing nodal input.");}
-  igrlab::IGRSolver igr(sfes,ufes,2,4,c_alpha);
-  igr.SetAlphaLengthScalePolicy(igrlab::IGRAlphaLengthScalePolicy::Local);
-  igr.SetGradBackend(igrlab::IGRGradBackend::BrokenDG);igr.SetExactDGFaceOperator(true);
-  igr.SetSolveMode(igrlab::IGRSolveMode::SmootherSweeps);igr.SetSweeps(0,0);
+  ::igrlab::IGRSolver igr(sfes,ufes,2,4,c_alpha);
+  igr.SetAlphaLengthScalePolicy(::igrlab::IGRAlphaLengthScalePolicy::Local);
+  igr.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);igr.SetExactDGFaceOperator(true);
+  igr.SetSolveMode(::igrlab::IGRSolveMode::SmootherSweeps);igr.SetSweeps(0,0);
   const auto form_start=Clock::now();igr.UpdateFromState(state,false);double form_s=Seconds(form_start);
   const auto* op=igr.GetLinearOperator();
   MFEM_VERIFY(op && op->Height()==n && igr.GetLastExactFaceEffective(),"Production face operator unavailable.");

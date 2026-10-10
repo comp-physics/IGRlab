@@ -37,7 +37,7 @@ struct EulerStateBundle
     field_list.velocity = &velocity_view;
   }
 
-  void AttachIGR(igrlab::IGRSolver& igr)
+  void AttachIGR(::igrlab::IGRSolver& igr)
   {
     field_list.igr = &igr;
     field_list.sigma = &igr.GetSigma();

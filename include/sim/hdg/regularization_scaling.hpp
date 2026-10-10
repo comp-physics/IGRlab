@@ -60,7 +60,7 @@ inline bool ValidHdgRegularizationRequest(
  */
 inline ResolvedHdgRegularization ResolveHdgRegularization(
     const mfem::ParMesh& mesh,
-    const igrlab::IGRAlphaLengthScalePolicy policy,
+    const ::igrlab::IGRAlphaLengthScalePolicy policy,
     const HdgRegularizationRequest& request)
 {
   using dg::hdg::generic::RegularizationKind;
@@ -73,7 +73,7 @@ inline ResolvedHdgRegularization ResolveHdgRegularization(
   {
     return {};
   }
-  if (policy == igrlab::IGRAlphaLengthScalePolicy::Local)
+  if (policy == ::igrlab::IGRAlphaLengthScalePolicy::Local)
   {
     throw std::invalid_argument(
         "HDG IGR does not support the element-local alpha length policy");

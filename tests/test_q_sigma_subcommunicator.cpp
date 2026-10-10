@@ -143,17 +143,17 @@ bool RunSplitAdmission()
     }
     state.ExchangeFaceNbrData();
 
-    igrlab::IGRSolver igr(
+    ::igrlab::IGRSolver igr(
       sigma_space, state_space, dim, equations, /*alpha=*/0.1);
-    igr.SetGradBackend(igrlab::IGRGradBackend::BrokenDG);
-    igr.SetIPKind(igrlab::IGRIPKind::SIPG);
-    igr.SetSolveMode(igrlab::IGRSolveMode::Krylov);
-    igr.SetLinearSolver(igrlab::IGRLinearSolverType::CG);
-    igr.SetPreconditioner(igrlab::IGRPrecondType::None);
+    igr.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+    igr.SetIPKind(::igrlab::IGRIPKind::SIPG);
+    igr.SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+    igr.SetLinearSolver(::igrlab::IGRLinearSolverType::CG);
+    igr.SetPreconditioner(::igrlab::IGRPrecondType::None);
     igr.SetLinearSolveParams(
       /*rtol=*/1.0e-12, /*atol=*/0.0, /*max_it=*/400, /*print=*/0);
     igr.SetSigmaUpdatePolicy(
-      igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
+      ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
       /*interval=*/1);
     igr.SetStageRtolScale(1.0);
 

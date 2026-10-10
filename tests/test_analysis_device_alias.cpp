@@ -140,7 +140,7 @@ int main(int argc, char** argv)
   alpha_over_rho.UseDevice(true);
   igr_source.UseDevice(true);
 
-  igrlab::igr_device::IGRDeviceLocalAlphaOverRhoKernel coefficient_kernel;
+  ::igrlab::igr_device::IGRDeviceLocalAlphaOverRhoKernel coefficient_kernel;
   coefficient_kernel.nq = igr_nq;
   coefficient_kernel.ne = igr_ne;
   coefficient_kernel.num_eq = igr_num_eq;
@@ -150,7 +150,7 @@ int main(int argc, char** argv)
   coefficient_kernel.ck = alpha_over_rho.Write();
   mfem::forall(igr_ne * igr_nq, coefficient_kernel);
 
-  igrlab::igr_device::IGRDeviceLocalSourceKernel source_kernel;
+  ::igrlab::igr_device::IGRDeviceLocalSourceKernel source_kernel;
   source_kernel.nq = igr_nq;
   source_kernel.ne = igr_ne;
   source_kernel.dim = igr_dim;
@@ -179,13 +179,13 @@ int main(int argc, char** argv)
       const int state_base = igr_num_eq * q_index;
       const int gradient_base = igr_num_eq * igr_dim * q_index;
       const double expected_coefficient =
-        igrlab::frozen_scalar_igr_algebra::AlphaOverDensity(
+        ::igrlab::frozen_scalar_igr_algebra::AlphaOverDensity(
           alpha_e, state_values[state_base], rho_floor);
       const double max_policy_coefficient =
-        igrlab::frozen_scalar_igr_algebra::AlphaOverDensity(
+        ::igrlab::frozen_scalar_igr_algebra::AlphaOverDensity(
           max_physical_alpha, state_values[state_base], rho_floor);
       const double expected_source =
-        igrlab::frozen_scalar_igr_algebra::
+        ::igrlab::frozen_scalar_igr_algebra::
           SourceFromConservativeStateGradient(
             igr_dim,
             state_values + state_base,
@@ -196,7 +196,7 @@ int main(int argc, char** argv)
             alpha_e,
             rho_floor);
       const double max_policy_source =
-        igrlab::frozen_scalar_igr_algebra::
+        ::igrlab::frozen_scalar_igr_algebra::
           SourceFromConservativeStateGradient(
             igr_dim,
             state_values + state_base,

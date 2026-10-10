@@ -878,9 +878,9 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
     if (igr_enabled)
     {
       const auto cadence = ResolveEffectiveIGRSigmaUpdateCadence(run_cfg);
-      if (cadence != igrlab::IGRSigmaUpdateCadence::EveryStage &&
+      if (cadence != ::igrlab::IGRSigmaUpdateCadence::EveryStage &&
           cadence !=
-            igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep)
+            ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep)
       {
         Fail("production VTK restart supports only every-stage or "
              "extrapolated-every-step IGR sigma updates");
@@ -1597,7 +1597,7 @@ std::string IGRGradName(const RunConfig& run_cfg)
 std::string SigmaRestartPolicy(const RunConfig& run_cfg)
 {
   return ResolveEffectiveIGRSigmaUpdateCadence(run_cfg) ==
-           igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep
+           ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep
            ? "cold-recompute-and-reset-extrapolation-history"
            : "cold-recompute-from-conservative-state";
 }
@@ -1683,7 +1683,7 @@ void ValidateManifest(const Manifest& manifest,
   }
   if (manifest.schema < transport_manifest_schema && igr_enabled &&
       active_sigma_cadence ==
-        igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep)
+        ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep)
   {
     Fail("restart manifest schema " + std::to_string(manifest.schema) +
          " cannot certify extrapolation-history reset semantics");

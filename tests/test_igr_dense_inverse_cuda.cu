@@ -146,7 +146,7 @@ int main(int argc, char** argv)
   {
     MFEM_VERIFY(setenv("DG_IGR_IGR_DENSE_SETUP", setup.c_str(), 1) == 0,
                 "Could not select dense inverse test setup.");
-    auto preconditioner = igrlab::igr_internal::MakeDenseInversePreconditioner(
+    auto preconditioner = ::igrlab::igr_internal::MakeDenseInversePreconditioner(
       initial, mode, MPI_COMM_WORLD);
     const double apply_tolerance = mode == "fp64" ? 1.0e-12 :
                                    (mode == "fp32" ? 2.0e-6 : 5.0e-3);

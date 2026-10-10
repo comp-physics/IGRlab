@@ -440,8 +440,8 @@ LimiterTimingState& GetLimiterTimingState()
   if (!state.initialized)
   {
     state.phase_enabled =
-      igrlab::EnvFlagEnabled("DG_IGR_LIMITER_CPU_PHASE_TIMING");
-    state.enabled = igrlab::EnvFlagEnabled("DG_IGR_LIMITER_TIMING") ||
+      ::igrlab::EnvFlagEnabled("DG_IGR_LIMITER_CPU_PHASE_TIMING");
+    state.enabled = ::igrlab::EnvFlagEnabled("DG_IGR_LIMITER_TIMING") ||
                     state.phase_enabled;
     if (const char* value = ::igrlab::GetEnv("DG_IGR_TIMING_WARMUP_CALLS"))
     {
@@ -641,7 +641,7 @@ bool SupportsMfemFaceLimiterPath(const mfem::ParFiniteElementSpace& vfes,
   {
     return false;
   }
-  if (!igrlab::EnvFlagEnabledDefault("DG_IGR_LIMITER_MFEM_FACE_QI", true))
+  if (!::igrlab::EnvFlagEnabledDefault("DG_IGR_LIMITER_MFEM_FACE_QI", true))
   {
     return false;
   }
@@ -925,7 +925,7 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   const bool tensor_basis = mfem::UsesTensorBasis(vfes);
   const bool requested_mfem_volume_points =
     ne > 0 && tensor_basis &&
-    igrlab::EnvFlagEnabledDefault("DG_IGR_LIMITER_MFEM_VOLUME_QI", true) &&
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_LIMITER_MFEM_VOLUME_QI", true) &&
     mfem::QuadratureInterpolator::SupportsFESpace(vfes);
   const bool requested_mfem_face_points =
     ne > 0 && SupportsMfemFaceLimiterPath(vfes, face_qords);

@@ -2628,22 +2628,22 @@ int RunBenchmark(const Options& options)
     bool step_succeeded = false;
     if (profile_this_step)
     {
-      igrlab::observability::set_runtime_enabled(true);
+      ::igrlab::observability::set_runtime_enabled(true);
       if (cudaProfilerStart() != cudaSuccess)
       {
-        igrlab::observability::set_runtime_enabled(false);
+        ::igrlab::observability::set_runtime_enabled(false);
         std::cerr << "{\"schema\":2,\"success\":false,"
                      "\"error\":\"CUDA profiler start failed\"}\n";
         return 1;
       }
       {
-        [[maybe_unused]] igrlab::NVTXRange accepted_step_range(
+        [[maybe_unused]] ::igrlab::NVTXRange accepted_step_range(
             "HDG/profiled-accepted-step");
         step_succeeded = run_step();
       }
       const cudaError_t profile_sync_status = cudaDeviceSynchronize();
       const cudaError_t profile_stop_status = cudaProfilerStop();
-      igrlab::observability::set_runtime_enabled(false);
+      ::igrlab::observability::set_runtime_enabled(false);
       if (profile_sync_status != cudaSuccess ||
           profile_stop_status != cudaSuccess)
       {
@@ -3058,7 +3058,7 @@ int main(int argc, char* argv[])
     return 2;
   }
   if (options.profile_measured_step >= 0 &&
-      !igrlab::observability::nvtx_backend_enabled)
+      !::igrlab::observability::nvtx_backend_enabled)
   {
     std::cerr << "{\"schema\":2,\"success\":false,"
                  "\"error\":\"NVTX profiler build required\"}\n";

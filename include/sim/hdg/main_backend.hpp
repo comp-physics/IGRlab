@@ -55,7 +55,7 @@ struct HdgEulerMainRequest
   const CommonOptions& options;
   const HdgEulerCaseDataFactory& make_case_data;
   MPI_Comm communicator = MPI_COMM_WORLD;
-  std::optional<igrlab::IGRAlphaLengthScalePolicy>
+  std::optional<::igrlab::IGRAlphaLengthScalePolicy>
       alpha_length_scale_policy_override;
 };
 

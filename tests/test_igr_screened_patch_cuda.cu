@@ -152,7 +152,7 @@ void TestVertex(mfem::ParMesh& mesh, mfem::Coefficient& reaction,
     exact(i) = 1.0 + 0.21 * std::cos(0.27 * i); }
   changed_dense.Mult(exact, current_rhs);
   mfem::DenseMatrixInverse inverse(changed_dense); inverse.Mult(current_rhs, reference);
-  auto preconditioner = igrlab::igr_internal::MakeScreenedPatchInversePreconditioner(
+  auto preconditioner = ::igrlab::igr_internal::MakeScreenedPatchInversePreconditioner(
     initial.SpMat(), fes, 0, "fp64", "vertex-p1");
   VertexOracle(dense, fes, rhs, expected); preconditioner->Mult(rhs, before);
   MFEM_VERIFY(Relative(before, expected) < 1.0e-11, "Vertex composite action differs from independent congruent solve.");
@@ -225,7 +225,7 @@ void TestCondensed(mfem::ParMesh& mesh, mfem::Coefficient& reaction,
     changed.Mult(exact, current_rhs);
     for (const std::string precision : {"fp64", "fp32", "tf32"})
     {
-      auto pc = igrlab::igr_internal::MakeScreenedPatchInversePreconditioner(initial.SpMat(), fes, 0, precision, kind);
+      auto pc = ::igrlab::igr_internal::MakeScreenedPatchInversePreconditioner(initial.SpMat(), fes, 0, precision, kind);
       mfem::Vector before(n), after(n), solution(n), action(n);
       pc->Mult(rhs, before);
       const double discrepancy = Relative(before, expected);
@@ -266,7 +266,7 @@ void Benchmark(int nx, int p, double alpha, int repeats, const std::string& prec
   x.UseDevice(true); y.UseDevice(true); rhs.UseDevice(true);
   form.SpMat().Mult(x, rhs);
   const auto start = std::chrono::steady_clock::now();
-  auto pc = igrlab::igr_internal::MakeScreenedPatchInversePreconditioner(form.SpMat(), fes, radius, precision, kind);
+  auto pc = ::igrlab::igr_internal::MakeScreenedPatchInversePreconditioner(form.SpMat(), fes, radius, precision, kind);
   cudaDeviceSynchronize();
   const double setup = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   for (int i = 0; i < 10; ++i) pc->Mult(rhs, y);
@@ -332,7 +332,7 @@ int main(int argc, char** argv)
   for (const std::string precision : {"fp64", "fp32", "tf32"})
   for (int radius : {0, 1, 2, 3})
   {
-    auto preconditioner = igrlab::igr_internal::MakeScreenedPatchInversePreconditioner(
+    auto preconditioner = ::igrlab::igr_internal::MakeScreenedPatchInversePreconditioner(
       initial.SpMat(), fes, radius, precision);
     mfem::Vector expected(n), before(n), after(n), solution(n), action(n);
     Oracle(dense, fes, radius, rhs, expected);

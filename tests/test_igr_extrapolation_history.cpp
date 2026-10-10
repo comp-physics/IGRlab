@@ -101,7 +101,7 @@ struct Fixture
     &mesh, &collection, 1, mfem::Ordering::byNODES};
   mfem::ParGridFunction state{&state_space};
   mfem::ParGridFunction shape{&sigma_space};
-  igrlab::IGRSolver igr{sigma_space, state_space, 1, 3, 0.1};
+  ::igrlab::IGRSolver igr{sigma_space, state_space, 1, 3, 0.1};
   mfem::EulerFlux euler_flux{1, 1.4};
   mfem::FluxWithIGR igr_flux{euler_flux};
   mfem::RusanovFluxWithSides numerical_flux{igr_flux};
@@ -119,14 +119,14 @@ struct Fixture
     });
     shape.ProjectCoefficient(profile);
     SetAmplitude(1.0);
-    igr.SetGradBackend(igrlab::IGRGradBackend::BrokenDG);
-    igr.SetIPKind(igrlab::IGRIPKind::SIPG);
-    igr.SetSolveMode(igrlab::IGRSolveMode::Krylov);
-    igr.SetLinearSolver(igrlab::IGRLinearSolverType::CG);
-    igr.SetPreconditioner(igrlab::IGRPrecondType::None);
+    igr.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+    igr.SetIPKind(::igrlab::IGRIPKind::SIPG);
+    igr.SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+    igr.SetLinearSolver(::igrlab::IGRLinearSolverType::CG);
+    igr.SetPreconditioner(::igrlab::IGRPrecondType::None);
     igr.SetLinearSolveParams(1e-13, 0.0, 400, 0);
     igr.SetSigmaUpdatePolicy(
-      igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep, 1);
+      ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep, 1);
     igr.SetStageRtolScale(1.0);
     igr.UpdateFromState(state, false);
     sigma_shape = igr.GetSigma();

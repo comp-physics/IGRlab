@@ -63,7 +63,7 @@ MFEM_HOST_DEVICE inline real_t EulerNodalCharacteristicSpeed(
   const real_t transport_speed =
     sqrt(momentum_squared) / fmax(rho, density_floor);
   return frozen_sigma_spectral_speed
-           ? igrlab::frozen_scalar_igr_algebra::
+           ? ::igrlab::frozen_scalar_igr_algebra::
                FrozenSigmaCharacteristicModulusBound(rho,
                                                       pressure,
                                                       transport_speed,
@@ -93,14 +93,14 @@ MFEM_HOST_DEVICE inline real_t EulerTensorFluxEntryWithPressure(const real_t* st
     const real_t momentum_equation = state[equation * stride];
     const real_t diagonal = equation == 1 + physical_direction
                               ? pressure +
-                                  igrlab::frozen_scalar_igr_algebra::
+                                  ::igrlab::frozen_scalar_igr_algebra::
                                     TensorSigmaMomentumDiagonalTerm(sigma)
                               : 0.0;
     return momentum_equation * momentum_direction / rho + diagonal;
   }
   const real_t energy = state[(1 + dim) * stride];
   return momentum_direction * (energy + pressure) / rho +
-         igrlab::frozen_scalar_igr_algebra::TensorSigmaEnergyTerm(
+         ::igrlab::frozen_scalar_igr_algebra::TensorSigmaEnergyTerm(
            sigma, momentum_direction, rho, rho_floor);
 }
 
@@ -145,12 +145,12 @@ MFEM_HOST_DEVICE inline real_t EulerNormalFluxEntry(const real_t* state,
     const int direction = equation - 1;
     return normal_velocity * state[equation * stride] +
            (pressure +
-            igrlab::frozen_scalar_igr_algebra::
+            ::igrlab::frozen_scalar_igr_algebra::
               TensorSigmaMomentumDiagonalTerm(sigma)) *
              normal[direction * normal_stride];
   }
   return normal_velocity * (state[(1 + dim) * stride] + pressure) +
-         igrlab::frozen_scalar_igr_algebra::TensorSigmaEnergyTerm(
+         ::igrlab::frozen_scalar_igr_algebra::TensorSigmaEnergyTerm(
            sigma, momentum_dot_normal, rho, rho_floor);
 }
 
@@ -199,7 +199,7 @@ MFEM_HOST_DEVICE inline real_t FrozenSigmaNormalSpeed(
   const real_t normal_norm = sqrt(normal_squared);
   const real_t transport_speed =
     fabs(momentum_dot_normal) / (fmax(rho, density_floor) * normal_norm);
-  return igrlab::frozen_scalar_igr_algebra::
+  return ::igrlab::frozen_scalar_igr_algebra::
     FrozenSigmaCharacteristicModulusBound(rho,
                                           pressure,
                                           transport_speed,
@@ -280,7 +280,7 @@ MFEM_HOST_DEVICE inline real_t EulerDirectionalLLFScale(
   const real_t kinetic = 0.5 * momentum_squared / rho;
   const real_t pressure = (gamma - 1.0) * (energy - kinetic);
   const real_t acoustic_numerator =
-    igrlab::frozen_scalar_igr_algebra::
+    ::igrlab::frozen_scalar_igr_algebra::
       FrozenSigmaLocalHyperbolicityMargin(pressure, sigma, gamma);
   const real_t direction_norm = sqrt(fmax(direction_squared, 0.0));
   const real_t speed =
@@ -1760,7 +1760,7 @@ __global__ void FusedEulerResidualKernel(FusedResidualData data)
       velocity[thread] = u[1] / rho;
       velocity[thread + dof] = u[2] / rho;
       acoustic[thread] = sqrt(fabs(
-          igrlab::frozen_scalar_igr_algebra::
+          ::igrlab::frozen_scalar_igr_algebra::
               FrozenSigmaLocalHyperbolicityMargin(llf_pressure, sigma,
                                                    data.gamma)) / rho);
     }

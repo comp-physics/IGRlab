@@ -618,7 +618,7 @@ FrozenBoundaryPlan FreezeBoundaryPlan(const EulerBoundaryPlan& source)
   return frozen;
 }
 
-igrlab::IGRAlphaLengthScalePolicy CanonicalAlphaLengthScalePolicy(
+::igrlab::IGRAlphaLengthScalePolicy CanonicalAlphaLengthScalePolicy(
     const HdgEulerMainRequest& request) noexcept
 {
   return request.alpha_length_scale_policy_override.value_or(
@@ -1282,7 +1282,7 @@ std::string Validate(const HdgEulerMainRequest& request,
     return "HDG IGR c_alpha and Euler trace penalty must be finite and positive";
   if (regularization.kind == RegularizationKind::igr &&
       CanonicalAlphaLengthScalePolicy(request) ==
-        igrlab::IGRAlphaLengthScalePolicy::Local)
+        ::igrlab::IGRAlphaLengthScalePolicy::Local)
     return "HDG IGR does not support the element-local alpha length policy";
   if (!dg::hdg::generic::IsKnownEulerHdgTimeTreatment(time_treatment))
     return "CUDA HDG time treatment is invalid";

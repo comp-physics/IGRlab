@@ -10,7 +10,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace regularization = igrlab::regularization;
+namespace regularization = ::igrlab::regularization;
 
 namespace
 {

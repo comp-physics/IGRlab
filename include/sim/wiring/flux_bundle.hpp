@@ -21,7 +21,7 @@ template <typename NumericalFlux> struct EulerIGRFluxBundle
 
   EulerIGRFluxBundle(int dim,
                      double gamma,
-                     igrlab::IGRSolver& igr,
+                     ::igrlab::IGRSolver& igr,
                      bool sigma_aware_cfl,
                      bool sigma_aware_rusanov,
                      bool invariant_domain_flux,
