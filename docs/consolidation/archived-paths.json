@@ -1,0 +1,283 @@
+{
+  "archive_volume": "primary.tar.gz",
+  "archive_root": "/home/jarias9/archives/igrlab/consolidation-20261010",
+  "files": [
+    {
+      "path": "docs/dgsem/DGSEM_OP_GPU_01_COORDINATOR_REQUEST.md",
+      "size": 10842,
+      "sha256": "95e80af426a3d3dfcf2939e9eefaa2fbff2d01af0981a91db505349f497d785a"
+    },
+    {
+      "path": "docs/hdg/PRODUCTION_TENSOR_CORE_CUDA_CAMPAIGN.md",
+      "size": 71338,
+      "sha256": "3cdd84d9007894792a9b25b1567b49f1c2c115342a201a3cf5802475a430bef4"
+    },
+    {
+      "path": "docs/research/igr_compact_response_derivation.md",
+      "size": 18451,
+      "sha256": "20a8fdeac029a118a54e9a8b9eb00431675de54f63cc9445d04448bb73e88312"
+    },
+    {
+      "path": "docs/research/igr_face_locality_derivation.md",
+      "size": 23207,
+      "sha256": "37e5e2ac7f76881031c6e5e718c54918a8a6abd3f5abd9c94fc4bb5aac7804b1"
+    },
+    {
+      "path": "docs/research/igr_hp_application_profiles.png",
+      "size": 275991,
+      "sha256": "4d9ae2c36059a9064c9091ba5c1460e980d3283d17636600de24a1ab1fbbbe9e"
+    },
+    {
+      "path": "docs/research/igr_hp_breakthrough_findings.md",
+      "size": 20484,
+      "sha256": "979ef37e69f1c0537c741cd16d8f915e7d39b3886e45d03edf7a717072e26605"
+    },
+    {
+      "path": "docs/research/igr_hp_breakthrough_results.json",
+      "size": 6555780,
+      "sha256": "28c6bc4ddf82cf816a7abe7b26bfc4711dd37ca050f605e4a8263eb0b3b7377c"
+    },
+    {
+      "path": "docs/research/igr_hp_face_findings.md",
+      "size": 15671,
+      "sha256": "957e1c7113a22fb71ba69dc7e3a23dfb7c2f9ea5e9158a99318c657cd2bbce30"
+    },
+    {
+      "path": "docs/research/igr_hp_front_findings.md",
+      "size": 18378,
+      "sha256": "00d0a37079f0ce528747a9b34af0e3e2858e9b0f6800aac6d4ee473c16621eb5"
+    },
+    {
+      "path": "docs/research/igr_hp_phase_sensitivity.png",
+      "size": 181159,
+      "sha256": "f8bf1b5ace590a1461da5b6ae43691ebbc35cd037b369cd045bdb6776142831b"
+    },
+    {
+      "path": "docs/research/igr_joint_spacetime_findings.md",
+      "size": 14954,
+      "sha256": "3a46e3ed908a4ae432db98b1d7f1a31971e097756f467fbcfd3b62c8add8446c"
+    },
+    {
+      "path": "docs/research/igr_locality_four_routes.md",
+      "size": 22353,
+      "sha256": "9ea0c76f2d7d5c83e9d5cf96ffa3325e4bf2ca15ebca862c975d86ed52c81d2f"
+    },
+    {
+      "path": "docs/research/igr_locality_four_routes_results.json",
+      "size": 2216004,
+      "sha256": "711b659dd1bdefda2a8ebb56b458f53beb59f5c2c5436166e400082d0b2f6bc3"
+    },
+    {
+      "path": "docs/research/igr_relaxation_derivation.md",
+      "size": 14753,
+      "sha256": "39d70d3a080c576a3f38ca342c09dc5b22e941798d3cbe4327b9017e409ec71e"
+    },
+    {
+      "path": "docs/research/tensor_breakthrough_search_findings.md",
+      "size": 25968,
+      "sha256": "ac1f44f8706d6b7e7ae808000c99e88018a2e233ec19aa4dd3640c16a6ab6f21"
+    },
+    {
+      "path": "docs/research/tensor_breakthrough_search_results.json",
+      "size": 2393244,
+      "sha256": "febcb0b8716e32c7913c308b8ce9b2792e7867bf76be15c1540d05582d6a96c6"
+    },
+    {
+      "path": "docs/research/tensor_broad_search_findings.md",
+      "size": 16518,
+      "sha256": "1d5b45f8bc165da703bcec8f86229e6023b39452fae60cf92fe0ff0ed69c853e"
+    },
+    {
+      "path": "docs/research/tensor_broad_search_results.json",
+      "size": 2627133,
+      "sha256": "c142988ce6dc8371f98197c78e208350ca797553431221c8dc5337e8e6d5e5a2"
+    },
+    {
+      "path": "docs/research/tensor_precision_findings.md",
+      "size": 16978,
+      "sha256": "5ec3dc6f290154d6759e6e7f4af0be85b6d32c59ea86fddb5dd72ba1ff810ef8"
+    },
+    {
+      "path": "docs/research/tensor_precision_results.json",
+      "size": 849024,
+      "sha256": "348526df0f0b25197234730a678d276c8420622ac6a142b87e366526e9f3d204"
+    },
+    {
+      "path": "docs/research/tensor_prior_evidence.md",
+      "size": 10726,
+      "sha256": "209bce4e660ce22fb21e1531bc9ab5566c9d29e0b29b95499ea675c74010c086"
+    },
+    {
+      "path": "scripts/dgsem/run_dgsem_op_gpu_01_worker_evidence.sh",
+      "size": 14316,
+      "sha256": "ca03df55db5333800478e81183e058efafff78633e68dbd9d834d2f23789f369"
+    },
+    {
+      "path": "scripts/perf/PROFILE_RECOVERY.md",
+      "size": 4667,
+      "sha256": "da528236bc2db9b7a9523d031d65cda3d16556b1496b0fe234b4a194ec8ebcb6"
+    },
+    {
+      "path": "scripts/perf/RETAINED_EVIDENCE.md",
+      "size": 7532,
+      "sha256": "86261afc36a630d2cf855433d93d5e93cc61bc56731c1142d66518d4bd71ad02"
+    },
+    {
+      "path": "tests/hdg/GATE_EVIDENCE.md",
+      "size": 5107,
+      "sha256": "9692798efd59e3d3b1a9d1a6dc575bbebc0d964b3f08d3e452af66cb40adc586"
+    },
+    {
+      "path": "tests/hdg/evidence/convergence.csv",
+      "size": 7566,
+      "sha256": "9efea4c511a08c0dd5128d2a1118f65ef8cf97baf942b660fb636865780ceb84"
+    },
+    {
+      "path": "tests/hdg/evidence/mpi_1_checks.json",
+      "size": 1933,
+      "sha256": "2acf9c4a85c4463b8a33095cc9e4ccb5df2d5dbe29c8614c75294d43b27cc6a0"
+    },
+    {
+      "path": "tests/hdg/evidence/mpi_2_checks.json",
+      "size": 2024,
+      "sha256": "0736f9ddd1abd9e1932cdeb827ab6dfcd6f3544e17daea445575ea9f87002c34"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-compile02-serial-fd-failure/logs-cpu/build.log",
+      "size": 291,
+      "sha256": "eb1eb7d8f6c1c76153da55340eb86f2ace4d8d1e81fa24a61e906fa1830c0286"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-compile02-serial-fd-failure/logs-cpu/configure.log",
+      "size": 709,
+      "sha256": "fa21354b0016c9d05b9cf7239886117880a0c94f1bd45e244e3a391309f9e4c7"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-compile02-serial-fd-failure/logs-cpu/serial.log",
+      "size": 84,
+      "sha256": "ab0f68c07ecfd4e114fb5faac37dcc8014f1d72bba5aa36fd7809c2a581fd284"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-compile02-serial-fd-failure/output-cpu/convergence.csv",
+      "size": 7566,
+      "sha256": "9efea4c511a08c0dd5128d2a1118f65ef8cf97baf942b660fb636865780ceb84"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-compile02-serial-fd-failure/output-cpu/serial_checks.json",
+      "size": 5993,
+      "sha256": "9b087767b5cb0fd51226432688d4134fa59b622b8ad0077d5c81b7c712b670ad"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-compile03-mpi-projection-crash/logs-cpu/build.log",
+      "size": 291,
+      "sha256": "921a8cd8005e668bb04dfc3b95b0e0dda7756665d599cf83042f56c7058fa973"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-compile03-mpi-projection-crash/logs-cpu/configure.log",
+      "size": 709,
+      "sha256": "530166ec5a68f7aed71a5729d93b53c8123d9ed4fa91ff968e67405c567c3f00"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-compile03-mpi-projection-crash/logs-cpu/mpi_1.log",
+      "size": 1245,
+      "sha256": "e9ba50d19cf59d71ddb6fb8a9f061caf024a433fb50c607d1480bc8aeb99c58f"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-compile03-mpi-projection-crash/logs-cpu/mpi_lease.log",
+      "size": 53,
+      "sha256": "523e39aa871b9432a498cb2d6b63999c62cf3df708ead688e609b8dc57d23c7a"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-compile03-mpi-projection-crash/logs-cpu/serial.log",
+      "size": 84,
+      "sha256": "990140f6987488252cc9eee94e3e237c7761169d4d0acfe5d1cd38dfce3513fa"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-compile03-mpi-projection-crash/output-cpu/convergence.csv",
+      "size": 7566,
+      "sha256": "9efea4c511a08c0dd5128d2a1118f65ef8cf97baf942b660fb636865780ceb84"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-compile03-mpi-projection-crash/output-cpu/serial_checks.json",
+      "size": 10097,
+      "sha256": "00dbc6325267537d5de122f05ea93facbc2b10fde17ff46450da53270daa23ed"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-final-20260718/collision_guard.txt",
+      "size": 150,
+      "sha256": "660c5c0f361aef788816848b2773d3416008bb0440de1e5eab22857a9d396bfa"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-final-20260718/logs-cpu/build.log",
+      "size": 291,
+      "sha256": "eb1eb7d8f6c1c76153da55340eb86f2ace4d8d1e81fa24a61e906fa1830c0286"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-final-20260718/logs-cpu/configure.log",
+      "size": 707,
+      "sha256": "84897209a8273c720712dd136421a8d405b021bc5ecbffd9e8229b5fbf7caef2"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-final-20260718/logs-cpu/mpi_1.log",
+      "size": 87,
+      "sha256": "c2703a2ba7f00576a30ea7c9053d358e28c8df3021ae2da634111b5d8d2ab892"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-final-20260718/logs-cpu/mpi_2.log",
+      "size": 87,
+      "sha256": "16a431bc20b89592fc4d2fb47829b7c037fe5aa1d3f408362ab5d4b29abea534"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-final-20260718/logs-cpu/mpi_lease.log",
+      "size": 106,
+      "sha256": "f70611e7b7b6db86c29cdcbd75e62c87d1a3432fb6054181799822f4e3ce9954"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-final-20260718/logs-cpu/serial.log",
+      "size": 82,
+      "sha256": "bf5d07311982b3da1f7e6c6a968c91a514716de117e29ab245c0e32b81283da8"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-final-20260718/output-cpu/convergence.csv",
+      "size": 7566,
+      "sha256": "9efea4c511a08c0dd5128d2a1118f65ef8cf97baf942b660fb636865780ceb84"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-final-20260718/output-cpu/mpi_1_checks.json",
+      "size": 1933,
+      "sha256": "2acf9c4a85c4463b8a33095cc9e4ccb5df2d5dbe29c8614c75294d43b27cc6a0"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-final-20260718/output-cpu/mpi_2_checks.json",
+      "size": 2024,
+      "sha256": "0736f9ddd1abd9e1932cdeb827ab6dfcd6f3544e17daea445575ea9f87002c34"
+    },
+    {
+      "path": "tests/hdg/evidence/runs/remediation-final-20260718/output-cpu/serial_checks.json",
+      "size": 10097,
+      "sha256": "00dbc6325267537d5de122f05ea93facbc2b10fde17ff46450da53270daa23ed"
+    },
+    {
+      "path": "tests/hdg/evidence/serial_checks.json",
+      "size": 10097,
+      "sha256": "00dbc6325267537d5de122f05ea93facbc2b10fde17ff46450da53270daa23ed"
+    },
+    {
+      "path": "tests/regularization/evidence/CONTRACT-CHAR-SPEED-01.md",
+      "size": 16158,
+      "sha256": "901f8e0258bfd5c679db97ca7da7e3103c03f106cf0330cdf08467ea19bca3f9"
+    },
+    {
+      "path": "tests/regularization/evidence/DG-ADAPTER-03.md",
+      "size": 12045,
+      "sha256": "ca8e068540a5e7e51d6f80f019efefa8db01d097da89b8d7b0df60b01d308033"
+    },
+    {
+      "path": "tests/test_dgsem_failed_attempt1_manifest.md",
+      "size": 2374,
+      "sha256": "1eb32885b6b419beab9e4e5603714bb7aba262fa03599febdff7792c74e890aa"
+    }
+  ],
+  "count": 55,
+  "bytes": 15540593
+}

@@ -3,7 +3,7 @@
 
 Consumes a frozen *production* operator export; it never constructs physics.
 Dense arrays and eigensolves are research references, not a GPU implementation.
-See docs/research/igr_face_locality_derivation.md for interpretation.
+See docs/consolidation/archived-paths.json (historical derivation in primary.tar.gz) for interpretation.
 """
 from __future__ import annotations
 
