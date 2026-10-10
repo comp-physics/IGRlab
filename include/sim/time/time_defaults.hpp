@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/time/time_defaults.hpp
  * @brief Default logging/analysis hooks for the shared time loop.
@@ -108,7 +110,7 @@ inline void PrintVTKOutputTiming(const char* phase,
                                  double paraview_save_s,
                                  MPI_Comm comm)
 {
-  if (!::dg_igr::EnvFlagEnabled("DG_IGR_VTK_OUTPUT_TIMING"))
+  if (!::igrlab::EnvFlagEnabled("DG_IGR_VTK_OUTPUT_TIMING"))
   {
     return;
   }
@@ -144,7 +146,7 @@ inline void PrintVTKOutputFieldTiming(const char* phase,
                                       const EulerOutputFieldTiming& timing,
                                       MPI_Comm comm)
 {
-  if (!::dg_igr::EnvFlagEnabled("DG_IGR_VTK_OUTPUT_TIMING"))
+  if (!::igrlab::EnvFlagEnabled("DG_IGR_VTK_OUTPUT_TIMING"))
   {
     return;
   }
@@ -251,7 +253,7 @@ inline RunSummary BuildRunSummary(const ExampleContext& ctx,
                                   const TimeLoopResult& result,
                                   double elapsed_seconds,
                                   int num_ranks,
-                                  const dg_igr::IGRSolver* igr = nullptr)
+                                  const igrlab::IGRSolver* igr = nullptr)
 {
   RunSummary summary;
   summary.steps = result.steps;
@@ -334,7 +336,7 @@ inline RunSummary BuildRunSummary(const ExampleContext& ctx,
 
 inline void FillIGRTimeInfo(TimeLoopInfo& info,
                             double elapsed,
-                            const dg_igr::IGRSolver* igr_solver)
+                            const igrlab::IGRSolver* igr_solver)
 {
   if (!igr_solver)
   {
@@ -602,7 +604,7 @@ inline TimeLoopHooks MakeEulerTimeLoopHooks(const ExampleContext& ctx,
   mfem::ParaViewDataCollection* paraview = io.paraview;
   const auto prepare_sigma = io.prepare_sigma;
   const auto after_vtk_save = io.after_vtk_save;
-  dg_igr::IGRSolver* igr_solver = bundle.field_list.igr;
+  igrlab::IGRSolver* igr_solver = bundle.field_list.igr;
   const ExampleContext* ctx_ptr = &ctx;
   EulerStateBundle* bundle_ptr = &bundle;
   TimeLoopHooks hooks;

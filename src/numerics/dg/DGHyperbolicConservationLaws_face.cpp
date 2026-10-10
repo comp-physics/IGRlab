@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "DGHyperbolicConservationLaws_impl.hpp"
 
 namespace mfem
@@ -1211,7 +1212,7 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
   const ParGridFunction* sigma_field = nullptr;
   real_t sigma_rho_floor = 1.0e-12;
   real_t invariant_domain_pressure_floor =
-    dg_igr::LimiterDefaults::kPMin;
+    igrlab::LimiterDefaults::kPMin;
   if (flux_igr && flux_igr->GetSigmaField())
   {
     sigma_field = flux_igr->GetSigmaField();
@@ -1242,7 +1243,7 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
   MFEM_VERIFY(!transport_slopes || (dof == 1 && face_shared_e1_.Size() == 0),
               "P0 MUSCL packed faces cannot use higher-order tests or shared faces.");
   const bool use_q_parallel =
-    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DG_FACE_Q_PARALLEL", true);
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_DG_FACE_Q_PARALLEL", true);
 
   const int* sigma_map = nullptr;
   const real_t* sigma_vals = nullptr;

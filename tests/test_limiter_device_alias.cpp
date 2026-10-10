@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "mfem.hpp"
 
 #include <algorithm>
@@ -57,7 +58,7 @@ public:
   {
     if (calls_ == 1)
     {
-      const auto scan = mfem::dg_igr::ScanEulerAdmissibility(
+      const auto scan = mfem::igrlab::ScanEulerAdmissibility(
         vfes_,
         x,
         kDim,
@@ -66,7 +67,7 @@ public:
         1.0e-10,
         0,
         {},
-        mfem::dg_igr::EulerAdmissibilityPointSet::Limiter);
+        mfem::igrlab::EulerAdmissibilityPointSet::Limiter);
       stage_one_bad_pressure_ = scan.global_bad_pressure;
     }
 
@@ -219,7 +220,7 @@ int main(int argc, char** argv)
       nonfinite_data[d + component * ndofs] =
         std::numeric_limits<double>::quiet_NaN();
     }
-    const auto scan = mfem::dg_igr::ScanEulerAdmissibility(
+    const auto scan = mfem::igrlab::ScanEulerAdmissibility(
       vfes,
       nonfinite_state,
       kDim,
@@ -228,7 +229,7 @@ int main(int argc, char** argv)
       p_min,
       0,
       {},
-      mfem::dg_igr::EulerAdmissibilityPointSet::Dof);
+      mfem::igrlab::EulerAdmissibilityPointSet::Dof);
     nonfinite_scan_ok = nonfinite_scan_ok &&
                         scan.global_bad_pressure == global_ndofs &&
                         scan.global_bad_rho ==
@@ -244,7 +245,7 @@ int main(int argc, char** argv)
       std::numeric_limits<double>::max();
   }
   const auto nonfinite_pressure_scan =
-    mfem::dg_igr::ScanEulerAdmissibility(
+    mfem::igrlab::ScanEulerAdmissibility(
       vfes,
       nonfinite_pressure,
       kDim,
@@ -253,7 +254,7 @@ int main(int argc, char** argv)
       p_min,
       0,
       {},
-      mfem::dg_igr::EulerAdmissibilityPointSet::Dof);
+      mfem::igrlab::EulerAdmissibilityPointSet::Dof);
   nonfinite_scan_ok = nonfinite_scan_ok &&
                       nonfinite_pressure_scan.global_bad_rho == 0 &&
                       nonfinite_pressure_scan.global_bad_pressure ==

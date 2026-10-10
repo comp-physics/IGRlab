@@ -1,9 +1,10 @@
+#include "igrlab/compat.hpp"
 #include "physics/regularization/combination.hpp"
 #include "physics/regularization/validation.hpp"
 
 #include <limits>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace regularization
 {
@@ -752,4 +753,4 @@ ValidationResult ValidateConfiguredRegularizationLaunch(
 }
 
 } // namespace regularization
-} // namespace dg_igr
+} // namespace igrlab

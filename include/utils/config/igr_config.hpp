@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include "utils/config/dg_igr_defaults.hpp"
 
 /**
@@ -8,7 +10,7 @@
  * @ingroup utils_config
  */
 
-namespace dg_igr
+namespace igrlab
 {
 
 /// @brief Smoother types used by the IGR solver.
@@ -105,8 +107,8 @@ enum class IGRAlphaLengthScalePolicy
 /// @ingroup utils_config
 struct IGRConfig
 {
-  double alpha = mfem::dg_igr::IGRDefaults::kAlpha;
-  double rho_floor = mfem::dg_igr::IGRDefaults::kRhoFloor;
+  double alpha = mfem::igrlab::IGRDefaults::kAlpha;
+  double rho_floor = mfem::igrlab::IGRDefaults::kRhoFloor;
   IGRAlphaLengthScalePolicy alpha_length_scale_policy =
     IGRAlphaLengthScalePolicy::Average;
 
@@ -114,8 +116,8 @@ struct IGRConfig
   IGRGradBackend backend = IGRGradBackend::H1Projection;
   IGRIPKind ip_kind = IGRIPKind::SIPG;
 
-  int regular_sweeps = mfem::dg_igr::IGRDefaults::kRegularSweeps;
-  int warm_start_sweeps = mfem::dg_igr::IGRDefaults::kWarmStartSweeps;
+  int regular_sweeps = mfem::igrlab::IGRDefaults::kRegularSweeps;
+  int warm_start_sweeps = mfem::igrlab::IGRDefaults::kWarmStartSweeps;
 
   IGRSolveMode solve_mode = IGRSolveMode::Krylov;
   IGRLinearSolverType lin_solver_type = IGRLinearSolverType::Auto;
@@ -123,10 +125,10 @@ struct IGRConfig
   IGRNonconvergencePolicy nonconvergence_policy =
     IGRNonconvergencePolicy::Accept;
 
-  double lin_rtol = mfem::dg_igr::IGRDefaults::kLinRtol;
-  double lin_atol = mfem::dg_igr::IGRDefaults::kLinAtol;
-  int lin_maxit = mfem::dg_igr::IGRDefaults::kLinMaxIters;
-  int lin_print = mfem::dg_igr::IGRDefaults::kLinPrint;
+  double lin_rtol = mfem::igrlab::IGRDefaults::kLinRtol;
+  double lin_atol = mfem::igrlab::IGRDefaults::kLinAtol;
+  int lin_maxit = mfem::igrlab::IGRDefaults::kLinMaxIters;
+  int lin_print = mfem::igrlab::IGRDefaults::kLinPrint;
 
   // AMG tuning knobs. Negative values keep MFEM/HYPRE defaults.
   int amg_coarsen_type = -1;
@@ -146,4 +148,4 @@ struct IGRConfig
 
 };
 
-} // namespace dg_igr
+} // namespace igrlab

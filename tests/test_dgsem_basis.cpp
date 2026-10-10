@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "numerics/dgsem/dgsem_basis.hpp"
 #include "numerics/dgsem/dgsem_reference.hpp"
 #include "numerics/dgsem/dgsem_tensor.hpp"
@@ -275,7 +276,7 @@ int RunDGSEMBasisTests(TestContext& ctx)
   ctx.Check(saw_flux_bundle_handoff,
             "DGSEM inventory freezes the actual sigma ownership handoff");
   // Optional machine-readable inventory for the reference-gate evidence run.
-  const char* output_dir = std::getenv("DG_IGR_DGSEM_REFERENCE_OUTPUT_DIR");
+  const char* output_dir = igrlab::GetEnv("DG_IGR_DGSEM_REFERENCE_OUTPUT_DIR");
   if (output_dir && mfem::Mpi::Root())
   {
     std::error_code ec;
@@ -332,4 +333,4 @@ int RunDGSEMBasisTests(TestContext& ctx)
   return ctx.failures;
 }
 
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

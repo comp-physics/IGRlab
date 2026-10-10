@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "physics/igr/IGR.hpp"
 #include "utils/config/env_flags.hpp"
 #if !((defined(MFEM_USE_CUDA) && !defined(__CUDACC__)) || \
@@ -21,7 +22,7 @@
 #include <cmath>
 #include <limits>
 
-namespace dg_igr
+namespace igrlab
 {
 using namespace igr_internal;
 
@@ -29,7 +30,7 @@ namespace igr_internal
 {
 NodalSourceMode GetNodalSourceMode()
 {
-  const char* raw = std::getenv("DG_IGR_IGR_NODAL_SOURCE");
+  const char* raw = igrlab::GetEnv("DG_IGR_IGR_NODAL_SOURCE");
   const std::string mode = raw ? raw : "baseline";
   if (mode == "baseline" || mode == "default") return NodalSourceMode::Baseline;
   if (mode == "volume") return NodalSourceMode::Volume;
@@ -44,7 +45,7 @@ const char* NodalSourceModeName(NodalSourceMode mode)
 }
 int NodalSourceQuadratureMinimumOrder()
 {
-  const char* raw = std::getenv("DG_IGR_IGR_SOURCE_QUADRATURE_MIN_ORDER");
+  const char* raw = igrlab::GetEnv("DG_IGR_IGR_SOURCE_QUADRATURE_MIN_ORDER");
   if (!raw) return 0;
   char* end = nullptr;
   errno = 0;
@@ -55,7 +56,7 @@ int NodalSourceQuadratureMinimumOrder()
 }
 int OperatorQuadratureMinimumOrder()
 {
-  const char* raw = std::getenv("DG_IGR_IGR_OPERATOR_QUADRATURE_MIN_ORDER");
+  const char* raw = igrlab::GetEnv("DG_IGR_IGR_OPERATOR_QUADRATURE_MIN_ORDER");
   if (!raw) return 0;
   char* end = nullptr;
   errno = 0;
@@ -646,7 +647,7 @@ void IGRSolver::EnsureDeviceQuadrature_()
   }
 
   const bool debug_qf =
-    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DEBUG_QF", false);
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_DEBUG_QF", false);
   mfem::Mesh* mesh = sfes_.GetMesh();
   MFEM_VERIFY(mesh, "IGR device coefficients require a valid mesh.");
   MFEM_VERIFY(mesh == vfes_.GetMesh(),
@@ -873,7 +874,7 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
   }
 
   const bool debug_qf =
-    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DEBUG_QF", false);
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_DEBUG_QF", false);
   if (debug_qf && mfem::Mpi::Root())
   {
     std::cout << "[igr-linear] event=device-qf-start" << "\n";
@@ -1083,7 +1084,7 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
       NodalSourceMirrorWalls() ? &nodal_source_slip_marker_ : nullptr);
   }
 
-  if (::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_INGESTION_AUDIT", false))
+  if (::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_INGESTION_AUDIT", false))
   {
     const int solve_call = linear_solve_calls_ + 1;
     const MPI_Comm comm = vfes_.GetComm();
@@ -1285,4 +1286,4 @@ void IGRSolver::UpdateDeviceCoefficients_(const mfem::ParGridFunction& U)
   device_coeff_logged_ = true;
 }
 
-} // namespace dg_igr
+} // namespace igrlab

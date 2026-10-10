@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 /**
  * @file sim/time/time_loop.hpp
  * @brief Shared explicit time loop used by simulation examples.
@@ -588,7 +590,7 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
                                                                     op,
                                                                     uses_cfl);
   const mfem::real_t dt_min = std::max<mfem::real_t>(0.0, cfg.dt_min);
-  const char* dt_trace_text = std::getenv("DG_IGR_TIME_DT_TRACE");
+  const char* dt_trace_text = igrlab::GetEnv("DG_IGR_TIME_DT_TRACE");
   const bool trace_nominal_dt =
     dt_trace_text != nullptr && std::string(dt_trace_text) != "0" &&
     std::string(dt_trace_text) != "false";
@@ -725,8 +727,8 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
     {
       std::cout << "[dt-check] Non-finite dt before time loop: " << dt << "\n";
     }
-    const mfem::dg_igr::NonFiniteSummary summary =
-      mfem::dg_igr::ScanNonFinite(sol);
+    const mfem::igrlab::NonFiniteSummary summary =
+      mfem::igrlab::ScanNonFinite(sol);
     result.non_finite_count =
       summary.global_non_finite > 0 ? summary.global_non_finite : 1;
     result.non_finite_min = summary.global_min;
@@ -821,8 +823,8 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
         std::cout << "[dt-check] Non-finite dt during time loop: " << dt_real
                   << " at t=" << t << "\n";
       }
-      const mfem::dg_igr::NonFiniteSummary summary =
-        mfem::dg_igr::ScanNonFinite(sol);
+      const mfem::igrlab::NonFiniteSummary summary =
+        mfem::igrlab::ScanNonFinite(sol);
       result.non_finite_count =
         summary.global_non_finite > 0 ? summary.global_non_finite : 1;
       result.non_finite_min = summary.global_min;
@@ -1097,8 +1099,8 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
             std::cout << "[dt-check] Non-finite dt after CFL update: " << dt
                       << " at t=" << t << "\n";
           }
-          const mfem::dg_igr::NonFiniteSummary summary =
-            mfem::dg_igr::ScanNonFinite(sol);
+          const mfem::igrlab::NonFiniteSummary summary =
+            mfem::igrlab::ScanNonFinite(sol);
           result.non_finite_count =
             summary.global_non_finite > 0 ? summary.global_non_finite : 1;
           result.non_finite_min = summary.global_min;
@@ -1141,8 +1143,8 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
 
     if (cfg.nan_scan)
     {
-      const mfem::dg_igr::NonFiniteSummary summary =
-        mfem::dg_igr::ScanNonFinite(sol);
+      const mfem::igrlab::NonFiniteSummary summary =
+        mfem::igrlab::ScanNonFinite(sol);
       if (summary.global_non_finite > 0)
       {
         result.non_finite_count = summary.global_non_finite;

@@ -324,6 +324,15 @@ clean_env=(
   -u SPACK_CUDA_ARCH
   -u DG_IGR_SPACK_ENV
   -u DG_IGR_OUTPUT_ROOT
+  -u IGRLAB_SPACK_ENV
+  -u IGRLAB_OUTPUT_ROOT
+  -u IGRLAB_ACCELERATOR_KERNEL_SOURCES
+  -u IGRLAB_RUN_REUSE_FIXTURES
+  -u IGRLAB_BUILD_RESEARCH_TESTS
+  -u DG_IGR_BUILD_RESEARCH_TESTS
+  -u IGRLAB_CUDA_ARCH
+  -u IGRLAB_MFEM_CUDA_ARCHS
+  -u IGRLAB_APP_CUDA_ARCHS
 )
 
 # The synthetic exact-source composition exercises normal-mode source
@@ -331,7 +340,7 @@ clean_env=(
 # The canonical sm120 plan keeps dependencies and project sources native while
 # compiling only MFEM through compatibility PTX.
 default_cache_root="${tmp_root}/default-cache"
-default_output_root="${default_cache_root}/dg-igr-build"
+default_output_root="${default_cache_root}/igrlab-build"
 plan="$("${clean_env[@]}" XDG_CACHE_HOME="${default_cache_root}" \
   bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 -j 16 --print-plan)"
 assert_contains "${plan}" "profile=cuda-sm120"
@@ -342,6 +351,28 @@ assert_contains "${plan}" "app_jobs=16"
 assert_contains "${plan}" "mfem_jobs=16"
 assert_contains "${plan}" "output_root=${default_output_root}"
 assert_not_exists "${default_output_root}"
+
+# Canonical build names preserve legacy scripts and select explicit overrides.
+canonical_output_root="${tmp_root}/canonical-output"
+legacy_output_root="${tmp_root}/legacy-output"
+canonical_plan="$("${clean_env[@]}" IGRLAB_OUTPUT_ROOT="${canonical_output_root}" \
+  DG_IGR_OUTPUT_ROOT="${legacy_output_root}" IGRLAB_CUDA_ARCH=80 \
+  bash "${fixture_root}/build.sh" --gpu --print-plan)"
+assert_contains "${canonical_plan}" "profile=cuda-sm80"
+assert_contains "${canonical_plan}" "output_root=${canonical_output_root}"
+assert_not_exists "${canonical_output_root}"
+assert_not_exists "${legacy_output_root}"
+cli_plan="$("${clean_env[@]}" IGRLAB_OUTPUT_ROOT="${canonical_output_root}" \
+  IGRLAB_CUDA_ARCH=80 bash "${fixture_root}/build.sh" --gpu --cuda-arch 120 \
+  --output-root "${legacy_output_root}" --print-plan)"
+assert_contains "${cli_plan}" "profile=cuda-sm120"
+assert_contains "${cli_plan}" "output_root=${legacy_output_root}"
+research_plan="$("${clean_env[@]}" IGRLAB_BUILD_RESEARCH_TESTS=ON \
+  bash "${fixture_root}/build.sh" --cpu-only --print-plan)"
+assert_contains "${research_plan}" "research_tests=ON"
+research_off_plan="$("${clean_env[@]}" IGRLAB_BUILD_RESEARCH_TESTS=ON \
+  bash "${fixture_root}/build.sh" --cpu-only --no-research-tests --print-plan)"
+assert_contains "${research_off_plan}" "research_tests=OFF"
 
 # A100's friendly selector and numeric interface resolve the same native tuple.
 a100_output_root="${tmp_root}/a100-output"

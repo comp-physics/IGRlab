@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "sim/hdg/main_backend.hpp"
 
 #include "numerics/hdg/runtime/app/checkpoint_codec.hpp"
@@ -308,7 +309,7 @@ int Run(const Arguments& arguments)
   constexpr int order = 2;
   dg_sim::CaseConfig case_config;
   case_config.case_name = "cuda_checkpoint_split_test";
-  case_config.gamma = mfem::dg_igr::EulerDefaults::kGamma;
+  case_config.gamma = mfem::igrlab::EulerDefaults::kGamma;
   case_config.case_dir = DG_IGR_HDG_REPOSITORY_ROOT;
   case_config.vtk_config.prefix_path = arguments.vtk_root;
 

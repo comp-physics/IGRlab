@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "IGR_screened_patch_inverse.hpp"
 #include "IGR_face_condensed_setup.hpp"
 #include <cuda_runtime.h>
@@ -10,7 +11,7 @@
 #include <set>
 #include <vector>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace igr_internal
 {

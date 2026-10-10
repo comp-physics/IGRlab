@@ -1,9 +1,11 @@
 #pragma once
+
+#include "igrlab/compat.hpp"
 #include "mfem.hpp"
 #include <memory>
 #include <string>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace igr_internal
 {

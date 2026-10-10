@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "numerics/dgsem/dgsem_operator.hpp"
 #include "dgsem_overintegrated_volume.hpp"
 
@@ -70,7 +71,7 @@ namespace
 
 int RequestedVolumeQuadratureOrder()
 {
-  const char* raw=std::getenv("DG_IGR_DGSEM_VOLUME_QUADRATURE_MIN_ORDER");
+  const char* raw=igrlab::GetEnv("DG_IGR_DGSEM_VOLUME_QUADRATURE_MIN_ORDER");
   if(!raw)return 0;
   errno=0;char* end=nullptr;const long value=std::strtol(raw,&end,10);
   MFEM_VERIFY(raw[0]&&end&&!*end&&errno==0&&value>=0&&value<=26,
@@ -82,7 +83,7 @@ int RequestedVolumeQuadratureOrder()
 // Generic packed kernels and the fused path are independently checked to p7.
 inline int MaximumDGSEMProductionOrder()
 {
-  return ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DGSEM_HIGH_ORDER_RESEARCH", false)
+  return ::igrlab::EnvFlagEnabledDefault("DG_IGR_DGSEM_HIGH_ORDER_RESEARCH", false)
       ? 7 : 4;
 }
 
@@ -827,7 +828,7 @@ DGSEMProductionReason ValidateDGSEMProductionState(
     {
       return DGSEMProductionReason::InvalidDensity;
     }
-    if (density < dg_igr::LimiterDefaults::kRhoMin)
+    if (density < igrlab::LimiterDefaults::kRhoMin)
     {
       return DGSEMProductionReason::DensityBelowBoundaryFloor;
     }
@@ -1075,7 +1076,7 @@ struct DGSEMProductionCache
   DGSEMVolumeDissipation volume_dissipation =
     DGSEMVolumeDissipation::None;
   real_t gamma = 1.4;
-  real_t velocity_density_floor = dg_igr::FluxDefaults::kRhoVelFloor;
+  real_t velocity_density_floor = igrlab::FluxDefaults::kRhoVelFloor;
   bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
@@ -1482,7 +1483,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   const real_t gamma = op_->GetDGSEMGamma();
   const real_t velocity_density_floor =
     flux_igr ? flux_igr->GetVelocityRhoFloor()
-             : dg_igr::FluxDefaults::kRhoVelFloor;
+             : igrlab::FluxDefaults::kRhoVelFloor;
   const bool invariant_domain_flux =
     flux_igr && flux_igr->GetInvariantDomainFlux();
   const bool sigma_aware_cfl = flux_igr && flux_igr->GetSigmaAwareCFL();
@@ -1503,10 +1504,10 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
                   op_->GetDGSEMVolumeFlux()==DGSEMVolumeFlux::Central&&
                   op_->GetDGSEMStabilization()==DGSEMStabilization::None&&!llf_volume_selected,
                 "Overintegrated volume requires rank-one 2D central DGSEM without volume LLF/stabilization.");
-    const char* fused_setting=std::getenv("DG_IGR_DGSEM_FUSED_RESIDUAL");
+    const char* fused_setting=igrlab::GetEnv("DG_IGR_DGSEM_FUSED_RESIDUAL");
     MFEM_VERIFY(fused_setting&&std::strcmp(fused_setting,"0")==0&&
-                  !::dg_igr::EnvFlagEnabledDefault("DG_IGR_DGSEM_FUSED_DMMA",false)&&
-                  !::dg_igr::EnvFlagEnabledDefault("DG_IGR_DGSEM_SUBCELL_BLEND",false),
+                  !::igrlab::EnvFlagEnabledDefault("DG_IGR_DGSEM_FUSED_DMMA",false)&&
+                  !::igrlab::EnvFlagEnabledDefault("DG_IGR_DGSEM_SUBCELL_BLEND",false),
                 "Overintegrated volume requires DG_IGR_DGSEM_FUSED_RESIDUAL=0 and no fused DMMA/subcell blend.");
   }
 
@@ -2193,7 +2194,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     flux_igr ? flux_igr->GetSigmaField() : nullptr;
   const real_t velocity_density_floor =
     flux_igr ? flux_igr->GetVelocityRhoFloor()
-             : dg_igr::FluxDefaults::kRhoVelFloor;
+             : igrlab::FluxDefaults::kRhoVelFloor;
   const bool cuda = Device::Allows(Backend::CUDA_MASK);
   const long vfes_sequence = op_->vfes.GetSequence();
   const long mesh_sequence = mesh ? mesh->GetSequence() : -1;
@@ -3577,11 +3578,11 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
   }
 
   const LGLBasis1D& basis = GetLGLBasis1D(c.selection.order);
-  const bool fused_residual = ::dg_igr::EnvFlagEnabledDefault(
+  const bool fused_residual = ::igrlab::EnvFlagEnabledDefault(
       "DG_IGR_DGSEM_FUSED_RESIDUAL", false);
-  const bool fused_dmma = ::dg_igr::EnvFlagEnabledDefault(
+  const bool fused_dmma = ::igrlab::EnvFlagEnabledDefault(
       "DG_IGR_DGSEM_FUSED_DMMA", false);
-  const bool subcell_blend = ::dg_igr::EnvFlagEnabledDefault(
+  const bool subcell_blend = ::igrlab::EnvFlagEnabledDefault(
       "DG_IGR_DGSEM_SUBCELL_BLEND", false);
   MFEM_VERIFY(!subcell_blend || (fused_residual && c.n1d >= 4),
       "DG_IGR_DGSEM_SUBCELL_BLEND requires the fused CUDA p3--p7 path.");
@@ -3685,7 +3686,7 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
     if (subcell_blend)
     {
       real_t threshold = 1e-4;
-      if (const char* value = std::getenv("DG_IGR_DGSEM_SUBCELL_THRESHOLD"))
+      if (const char* value = igrlab::GetEnv("DG_IGR_DGSEM_SUBCELL_THRESHOLD"))
       {
         char* end = nullptr;
         threshold = std::strtod(value, &end);

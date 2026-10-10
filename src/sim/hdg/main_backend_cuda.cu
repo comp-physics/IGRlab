@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "sim/hdg/main_backend.hpp"
 
 #include <algorithm>
@@ -617,7 +618,7 @@ FrozenBoundaryPlan FreezeBoundaryPlan(const EulerBoundaryPlan& source)
   return frozen;
 }
 
-dg_igr::IGRAlphaLengthScalePolicy CanonicalAlphaLengthScalePolicy(
+igrlab::IGRAlphaLengthScalePolicy CanonicalAlphaLengthScalePolicy(
     const HdgEulerMainRequest& request) noexcept
 {
   return request.alpha_length_scale_policy_override.value_or(
@@ -1281,7 +1282,7 @@ std::string Validate(const HdgEulerMainRequest& request,
     return "HDG IGR c_alpha and Euler trace penalty must be finite and positive";
   if (regularization.kind == RegularizationKind::igr &&
       CanonicalAlphaLengthScalePolicy(request) ==
-        dg_igr::IGRAlphaLengthScalePolicy::Local)
+        igrlab::IGRAlphaLengthScalePolicy::Local)
     return "HDG IGR does not support the element-local alpha length policy";
   if (!dg::hdg::generic::IsKnownEulerHdgTimeTreatment(time_treatment))
     return "CUDA HDG time treatment is invalid";
@@ -1355,7 +1356,7 @@ std::string Validate(const HdgEulerMainRequest& request,
   if (request.options.ser_ref_levels < 0 || request.options.par_ref_levels < 0)
     return "generic CUDA HDG refinement levels must be nonnegative";
   if (!std::isfinite(request.case_config.gamma) ||
-      request.case_config.gamma != mfem::dg_igr::EulerDefaults::kGamma)
+      request.case_config.gamma != mfem::igrlab::EulerDefaults::kGamma)
     return "generic CUDA HDG requires frozen Euler gamma 1.4";
   return {};
 }

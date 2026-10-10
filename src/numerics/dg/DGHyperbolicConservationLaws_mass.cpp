@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "DGHyperbolicConservationLaws_impl.hpp"
 
 namespace mfem
@@ -133,7 +134,7 @@ void DGHyperbolicConservationLaws::BuildNativeMassInverseSolver_()
   par_mass_form_.reset();
 #endif
 
-  if (!::dg_igr::EnvFlagEnabledDefault("DG_IGR_DG_NATIVE_MASS_INV", false))
+  if (!::igrlab::EnvFlagEnabledDefault("DG_IGR_DG_NATIVE_MASS_INV", false))
   {
     return;
   }
@@ -198,7 +199,7 @@ bool DGHyperbolicConservationLaws::UseNativeMassInverseSolver_() const
 bool DGHyperbolicConservationLaws::UsePackedInverseMassDevice_() const
 {
   return invmass_apply_ready_ && Device::Allows(Backend::DEVICE_MASK) &&
-         ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DG_PACKED_INVMASS_DEVICE",
+         ::igrlab::EnvFlagEnabledDefault("DG_IGR_DG_PACKED_INVMASS_DEVICE",
                                          true);
 }
 

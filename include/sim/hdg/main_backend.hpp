@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/hdg/main_backend.hpp
  * @brief Opt-in profile-selected main-application adapter for generic Euler HDG.
@@ -53,7 +55,7 @@ struct HdgEulerMainRequest
   const CommonOptions& options;
   const HdgEulerCaseDataFactory& make_case_data;
   MPI_Comm communicator = MPI_COMM_WORLD;
-  std::optional<dg_igr::IGRAlphaLengthScalePolicy>
+  std::optional<igrlab::IGRAlphaLengthScalePolicy>
       alpha_length_scale_policy_override;
 };
 

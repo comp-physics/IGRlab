@@ -1,33 +1,28 @@
 cmake_minimum_required(VERSION 3.14)
-project(my_mfem_stuff LANGUAGES CXX)
+project(IGRlab LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(CTest)
 include(CheckLanguage)
-option(DG_IGR_BUILD_TESTS "Build dg_igr unit tests" ON)
-option(DG_IGR_ENABLE_HDG_EULER_EXPERIMENT
-       "Build the serial smooth-Euler HDG experiment."
-       OFF)
-option(DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT
-       "Build the default-off smooth-Euler HDG CPU-fallback/device experiment."
-       OFF)
-option(DG_IGR_ENABLE_HDG_RUNTIME
-       "Build the default-off persistent HDG runtime component seam."
-       OFF)
-option(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT
-       "Build the default-off CPU-only HDG auxiliary experiment seam."
-       OFF)
-option(DG_IGR_ENABLE_OBSERVABILITY
-       "Compile the core observability contract (runtime remains default-off)."
-       OFF)
-option(DG_IGR_OBSERVABILITY_USE_NVTX
-       "Use the NVTX adapter for compiled observability regions."
-       OFF)
-option(DG_IGR_OBSERVABILITY_USE_CALIPER
-       "Use the Caliper adapter for compiled observability regions."
-       OFF)
+include(cmake/IGRlabCompatibility.cmake)
+igrlab_cache_alias(IGRLAB_BUILD_TESTS DG_IGR_BUILD_TESTS
+                   BOOL ON "Build IGRlab correctness tests")
+igrlab_cache_alias(IGRLAB_ENABLE_HDG_EULER_EXPERIMENT DG_IGR_ENABLE_HDG_EULER_EXPERIMENT
+                   BOOL OFF "Build the serial smooth-Euler HDG experiment.")
+igrlab_cache_alias(IGRLAB_ENABLE_HDG_EULER_DEVICE_EXPERIMENT DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT
+                   BOOL OFF "Build the default-off smooth-Euler HDG CPU-fallback/device experiment.")
+igrlab_cache_alias(IGRLAB_ENABLE_HDG_RUNTIME DG_IGR_ENABLE_HDG_RUNTIME
+                   BOOL OFF "Build the default-off persistent HDG runtime component seam.")
+igrlab_cache_alias(IGRLAB_ENABLE_HDG_AUXILIARY_EXPERIMENT DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT
+                   BOOL OFF "Build the default-off CPU-only HDG auxiliary experiment seam.")
+igrlab_cache_alias(IGRLAB_ENABLE_OBSERVABILITY DG_IGR_ENABLE_OBSERVABILITY
+                   BOOL OFF "Compile the core observability contract (runtime remains default-off).")
+igrlab_cache_alias(IGRLAB_OBSERVABILITY_USE_NVTX DG_IGR_OBSERVABILITY_USE_NVTX
+                   BOOL OFF "Use the NVTX adapter for compiled observability regions.")
+igrlab_cache_alias(IGRLAB_OBSERVABILITY_USE_CALIPER DG_IGR_OBSERVABILITY_USE_CALIPER
+                   BOOL OFF "Use the Caliper adapter for compiled observability regions.")
 if((DG_IGR_OBSERVABILITY_USE_NVTX OR DG_IGR_OBSERVABILITY_USE_CALIPER) AND
    NOT DG_IGR_ENABLE_OBSERVABILITY)
     message(FATAL_ERROR
@@ -45,16 +40,16 @@ if(DG_IGR_OBSERVABILITY_USE_CALIPER)
                 "The discovered Caliper package does not export the required 'caliper' target.")
     endif()
 endif()
-option(DG_IGR_REQUIRE_MFEM_CUDA
-       "Fail configure unless the discovered MFEM package has CUDA enabled."
-       OFF)
-option(DG_IGR_ENABLE_ACCELERATOR_LANGUAGE
-       "Enable local CUDA/HIP language support when MFEM backend requires it."
-       ON)
-set(DG_IGR_EXPECT_CUDA_ARCH
-    ""
-    CACHE STRING
-    "Expected concrete CUDA dependency/device arch for CUDA builds (e.g. 61, sm_61, 120).")
+igrlab_cache_alias(IGRLAB_REQUIRE_MFEM_CUDA DG_IGR_REQUIRE_MFEM_CUDA
+                   BOOL OFF "Fail configure unless the discovered MFEM package has CUDA enabled.")
+igrlab_cache_alias(IGRLAB_ENABLE_ACCELERATOR_LANGUAGE DG_IGR_ENABLE_ACCELERATOR_LANGUAGE
+                   BOOL ON "Enable local CUDA/HIP language support when MFEM backend requires it.")
+igrlab_cache_alias(IGRLAB_EXPECT_CUDA_ARCH DG_IGR_EXPECT_CUDA_ARCH
+                   STRING ""
+                   "Expected concrete CUDA dependency/device arch for CUDA builds (e.g. 80, sm_80, 120).")
+igrlab_cache_alias(IGRLAB_BUILD_RESEARCH_TESTS DG_IGR_BUILD_RESEARCH_TESTS
+                   BOOL OFF
+                   "Build standalone numerical-investigation and campaign probes.")
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -104,7 +99,7 @@ endif()
 if(MFEM_USE_CUDA AND MFEM_USE_HIP)
     message(FATAL_ERROR
             "MFEM reports both CUDA and HIP enabled for this target; "
-            "dg_igr_miniapp expects one accelerator backend at a time.")
+            "IGRlab expects one accelerator backend at a time.")
 endif()
 
 set(_dg_igr_expected_arch "")

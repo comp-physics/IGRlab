@@ -1,8 +1,7 @@
 # Collect all source files (including module subdirectories)
-set(DG_IGR_MFEM_SOURCE_ROOT
-    "${CMAKE_SOURCE_DIR}/tpl/mfem"
-    CACHE PATH
-    "Exact MFEM source checkout supplying source-internal headers.")
+igrlab_cache_alias(IGRLAB_MFEM_SOURCE_ROOT DG_IGR_MFEM_SOURCE_ROOT
+                   PATH "${CMAKE_SOURCE_DIR}/tpl/mfem"
+                   "Exact MFEM source checkout supplying source-internal headers.")
 foreach(_dg_igr_mfem_source_header IN ITEMS
         fem/picojson.h
         general/tinyxml2.h)
@@ -63,6 +62,8 @@ endif()
 
 # Create library
 add_library(igr_mfem STATIC ${SOURCES})
+# Keep the existing archive/link target while callers adopt the IGRlab name.
+add_library(IGRlab::core ALIAS igr_mfem)
 
 if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
     target_link_libraries(igr_mfem PRIVATE CUDA::cusolver)
@@ -113,10 +114,12 @@ if(DG_IGR_ACCELERATOR_LANGUAGE)
     endif()
 endif()
 
-set(DG_IGR_AUTO_DG_ACCELERATOR_SOURCE
-    ON
-    CACHE BOOL
-    "When ON, automatically compile DGHyperbolicConservationLaws.cpp with the accelerator language in CUDA/HIP builds.")
+igrlab_cache_alias(IGRLAB_AUTO_DG_ACCELERATOR_SOURCE DG_IGR_AUTO_DG_ACCELERATOR_SOURCE
+                   BOOL ON
+                   "Automatically compile DG kernels with the accelerator language in CUDA/HIP builds.")
+igrlab_cache_alias(IGRLAB_ACCELERATOR_KERNEL_SOURCES DG_IGR_ACCELERATOR_KERNEL_SOURCES
+                   STRING "${_dg_igr_default_accel_sources}"
+                   "Semicolon-separated source files to compile with the accelerator language.")
 
 if(NOT DEFINED DG_IGR_ACCELERATOR_KERNEL_SOURCES)
     set(DG_IGR_ACCELERATOR_KERNEL_SOURCES
@@ -151,6 +154,11 @@ if(DG_IGR_AUTO_DG_ACCELERATOR_SOURCE AND
         "Semicolon-separated source files (repo-relative or absolute) to compile with ${DG_IGR_ACCELERATOR_LANGUAGE} for MFEM_FORALL kernels."
         FORCE)
 endif()
+
+# Reflect any automatically required accelerator sources in both spellings.
+igrlab_cache_alias(IGRLAB_ACCELERATOR_KERNEL_SOURCES DG_IGR_ACCELERATOR_KERNEL_SOURCES
+                   STRING "${_dg_igr_default_accel_sources}"
+                   "Semicolon-separated source files to compile with the accelerator language.")
 
 # Include directories  
 target_include_directories(igr_mfem PUBLIC 

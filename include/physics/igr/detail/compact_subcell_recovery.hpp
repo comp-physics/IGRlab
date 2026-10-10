@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include "mfem.hpp"
 #include "physics/euler/eos.hpp"
 
@@ -11,7 +13,7 @@
 #include <numeric>
 #include <vector>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace igr_internal
 {
@@ -330,4 +332,4 @@ private:
 };
 
 } // namespace igr_internal
-} // namespace dg_igr
+} // namespace igrlab

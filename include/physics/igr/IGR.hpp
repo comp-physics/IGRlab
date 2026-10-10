@@ -1,4 +1,6 @@
 #pragma once
+
+#include "igrlab/compat.hpp"
 #include "mfem.hpp"
 #include "utils/config/igr_config.hpp"
 #include <algorithm>
@@ -26,7 +28,7 @@
  *  - Legacy: a few preconditioned Richardson smoother sweeps (fast/approx)
  *  - Recommended: MFEM Krylov solve to tolerance (CG/GMRES + preconditioner)
  */
-namespace dg_igr
+namespace igrlab
 {
 namespace igr_internal { struct FaceDensityCUDAProjectionCache; struct NodalVelocitySourceCache; }
 
@@ -692,8 +694,8 @@ private:
   mfem::ParFiniteElementSpace& sfes_; // scalar Σ space (H1 or DG)
   mfem::ParFiniteElementSpace& vfes_; // vector state U space (vdim=num_eq)
   int dim_, num_eq_;
-  double alpha_ = mfem::dg_igr::IGRDefaults::kAlpha;
-  double rho_floor_ = mfem::dg_igr::IGRDefaults::kRhoFloor;
+  double alpha_ = mfem::igrlab::IGRDefaults::kAlpha;
+  double rho_floor_ = mfem::igrlab::IGRDefaults::kRhoFloor;
   AlphaLengthScalePolicy alpha_length_scale_policy_ =
     AlphaLengthScalePolicy::Average;
   SmootherType smoot_ = SmootherType::L1Jacobi;
@@ -701,8 +703,8 @@ private:
   IPKind ip_kind_ = IPKind::SIPG; //default SPD
 
   // Legacy sweeps
-  int regular_sweeps_ = mfem::dg_igr::IGRDefaults::kRegularSweeps;
-  int warm_start_sweeps_ = mfem::dg_igr::IGRDefaults::kWarmStartSweeps;
+  int regular_sweeps_ = mfem::igrlab::IGRDefaults::kRegularSweeps;
+  int warm_start_sweeps_ = mfem::igrlab::IGRDefaults::kWarmStartSweeps;
   bool first_call_ = true;
 
   // New solve controls
@@ -734,10 +736,10 @@ private:
   double current_time_ = std::numeric_limits<double>::quiet_NaN();
   double current_dt_ = std::numeric_limits<double>::quiet_NaN();
 
-  double lin_rtol_ = mfem::dg_igr::IGRDefaults::kLinRtol;
-  double lin_atol_ = mfem::dg_igr::IGRDefaults::kLinAtol;
-  int lin_maxit_ = mfem::dg_igr::IGRDefaults::kLinMaxIters;
-  int lin_print_ = mfem::dg_igr::IGRDefaults::kLinPrint;
+  double lin_rtol_ = mfem::igrlab::IGRDefaults::kLinRtol;
+  double lin_atol_ = mfem::igrlab::IGRDefaults::kLinAtol;
+  int lin_maxit_ = mfem::igrlab::IGRDefaults::kLinMaxIters;
+  int lin_print_ = mfem::igrlab::IGRDefaults::kLinPrint;
 
   // Σ field
   mfem::ParGridFunction
@@ -867,4 +869,4 @@ private:
   std::string last_precond_name_ = "none";
 };
 
-} // namespace dg_igr
+} // namespace igrlab

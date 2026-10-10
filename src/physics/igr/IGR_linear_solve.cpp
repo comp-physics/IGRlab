@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "physics/igr/IGR.hpp"
 
 #include "numerics/timestepping/ssprk_coefficients.hpp"
@@ -25,7 +26,7 @@
 #include <string>
 #include <vector>
 
-namespace dg_igr
+namespace igrlab
 {
 using namespace igr_internal;
 
@@ -55,7 +56,7 @@ struct ExactFaceTimingStats
 
 int ReadEnvInt(const char* name, int default_value)
 {
-  const char* raw = std::getenv(name);
+  const char* raw = igrlab::GetEnv(name);
   if (!raw || raw[0] == '\0')
   {
     return default_value;
@@ -72,7 +73,7 @@ int ReadEnvInt(const char* name, int default_value)
 
 mfem::real_t ReadEnvReal(const char* name, mfem::real_t default_value)
 {
-  const char* raw = std::getenv(name);
+  const char* raw = igrlab::GetEnv(name);
   if (!raw || raw[0] == '\0')
   {
     return default_value;
@@ -86,7 +87,7 @@ mfem::real_t ReadEnvReal(const char* name, mfem::real_t default_value)
 
 dg_face::DGDiffusionFaceScaling ReadIPDGFaceScaling()
 {
-  const char* raw = std::getenv("DG_IGR_IGR_IPDG_FACE_SCALING");
+  const char* raw = igrlab::GetEnv("DG_IGR_IGR_IPDG_FACE_SCALING");
   const std::string value = raw ? raw : "arithmetic";
   if (value == "arithmetic")
   {
@@ -665,14 +666,14 @@ public:
       solve_call_(solve_call),
       capture_negative_quadratic_(
         base_component != nullptr && face_component != nullptr &&
-        ::dg_igr::EnvFlagEnabledDefault(
+        ::igrlab::EnvFlagEnabledDefault(
           "DG_IGR_IGR_CAPTURE_NEGATIVE_QUADRATIC", false))
   {
   }
 
   void Mult(const mfem::Vector& x, mfem::Vector& y) const override
   {
-    ::dg_igr::NVTXRange range("IGR/krylov-operator-mult");
+    ::igrlab::NVTXRange range("IGR/krylov-operator-mult");
     if (!telemetry_.record_seconds)
     {
       op_.Mult(x, y);
@@ -704,7 +705,7 @@ public:
 
   void MultTranspose(const mfem::Vector& x, mfem::Vector& y) const override
   {
-    ::dg_igr::NVTXRange range("IGR/krylov-operator-mult-transpose");
+    ::igrlab::NVTXRange range("IGR/krylov-operator-mult-transpose");
     if (!telemetry_.record_seconds)
     {
       op_.MultTranspose(x, y);
@@ -778,7 +779,7 @@ private:
                                   double face,
                                   double norm_sq) const
   {
-    const char* prefix = std::getenv("DG_IGR_IGR_NEGATIVE_CAPTURE_PREFIX");
+    const char* prefix = igrlab::GetEnv("DG_IGR_IGR_NEGATIVE_CAPTURE_PREFIX");
     if (!prefix || prefix[0] == '\0' || !state_ || !sigma_fes_ ||
         !capture_written_ || *capture_written_)
     {
@@ -880,7 +881,7 @@ public:
 
   void Mult(const mfem::Vector& x, mfem::Vector& y) const override
   {
-    ::dg_igr::NVTXRange range("IGR/krylov-preconditioner-mult");
+    ::igrlab::NVTXRange range("IGR/krylov-preconditioner-mult");
     if (!telemetry_.record_seconds)
     {
       const bool was_inside = telemetry_.inside_preconditioner;
@@ -907,7 +908,7 @@ public:
 
   void MultTranspose(const mfem::Vector& x, mfem::Vector& y) const override
   {
-    ::dg_igr::NVTXRange range("IGR/krylov-preconditioner-mult-transpose");
+    ::igrlab::NVTXRange range("IGR/krylov-preconditioner-mult-transpose");
     if (!telemetry_.record_seconds)
     {
       const bool was_inside = telemetry_.inside_preconditioner;
@@ -978,7 +979,7 @@ public:
       &scratch_.normal_dshape_base,
       &scratch_.penalty_metric);
     timing_enabled_ =
-      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_EXACT_FACE_TIMING",
+      ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_EXACT_FACE_TIMING",
                                       false);
     if (shared_side_q.Size() > 0)
     {
@@ -1044,7 +1045,7 @@ public:
 
   void Mult(const mfem::Vector& x, mfem::Vector& y) const override
   {
-    ::dg_igr::NVTXRange range("IGR/exact-face/Mult");
+    ::igrlab::NVTXRange range("IGR/exact-face/Mult");
     if (!timing_enabled_)
     {
       local_y_.SetSize(sfes_.GetVSize(), y);
@@ -1052,7 +1053,7 @@ public:
 
       if (prolong_)
       {
-        ::dg_igr::NVTXRange prolong_range("IGR/exact-face/prolong");
+        ::igrlab::NVTXRange prolong_range("IGR/exact-face/prolong");
         prolong_->Mult(x, local_x_gf_);
       }
       else
@@ -1061,7 +1062,7 @@ public:
       }
 
       {
-        ::dg_igr::NVTXRange apply_range("IGR/exact-face/local-apply");
+        ::igrlab::NVTXRange apply_range("IGR/exact-face/local-apply");
         dg_face::LaunchInteriorFaceDGDiffusionApply2D(info_,
                                                       scratch_,
                                                       local_x_gf_,
@@ -1071,11 +1072,11 @@ public:
       if (has_shared_)
       {
         {
-          ::dg_igr::NVTXRange exchange_range("IGR/exact-face/shared-exchange");
+          ::igrlab::NVTXRange exchange_range("IGR/exact-face/shared-exchange");
           local_x_gf_.ExchangeFaceNbrData();
         }
         {
-          ::dg_igr::NVTXRange apply_range("IGR/exact-face/shared-apply");
+          ::igrlab::NVTXRange apply_range("IGR/exact-face/shared-apply");
           dg_face::LaunchSharedFaceDGDiffusionApply2D(
             shared_info_,
             shared_scratch_,
@@ -1088,7 +1089,7 @@ public:
 
       if (restrict_)
       {
-        ::dg_igr::NVTXRange restrict_range("IGR/exact-face/restrict");
+        ::igrlab::NVTXRange restrict_range("IGR/exact-face/restrict");
         restrict_->Mult(local_y_, y);
       }
       else
@@ -1106,7 +1107,7 @@ public:
     const auto prolong_start = Clock::now();
     if (prolong_)
     {
-      ::dg_igr::NVTXRange prolong_range("IGR/exact-face/prolong");
+      ::igrlab::NVTXRange prolong_range("IGR/exact-face/prolong");
       prolong_->Mult(x, local_x_gf_);
     }
     else
@@ -1117,7 +1118,7 @@ public:
 
     const auto local_apply_start = Clock::now();
     {
-      ::dg_igr::NVTXRange apply_range("IGR/exact-face/local-apply");
+      ::igrlab::NVTXRange apply_range("IGR/exact-face/local-apply");
       dg_face::LaunchInteriorFaceDGDiffusionApply2D(info_,
                                                     scratch_,
                                                     local_x_gf_,
@@ -1129,14 +1130,14 @@ public:
     {
       const auto shared_exchange_start = Clock::now();
       {
-        ::dg_igr::NVTXRange exchange_range("IGR/exact-face/shared-exchange");
+        ::igrlab::NVTXRange exchange_range("IGR/exact-face/shared-exchange");
         local_x_gf_.ExchangeFaceNbrData();
       }
       timing_.shared_exchange_seconds += ElapsedSeconds(shared_exchange_start);
 
       const auto shared_apply_start = Clock::now();
       {
-        ::dg_igr::NVTXRange apply_range("IGR/exact-face/shared-apply");
+        ::igrlab::NVTXRange apply_range("IGR/exact-face/shared-apply");
         dg_face::LaunchSharedFaceDGDiffusionApply2D(shared_info_,
                                                     shared_scratch_,
                                                     local_x_gf_,
@@ -1150,7 +1151,7 @@ public:
     const auto restrict_start = Clock::now();
     if (restrict_)
     {
-      ::dg_igr::NVTXRange restrict_range("IGR/exact-face/restrict");
+      ::igrlab::NVTXRange restrict_range("IGR/exact-face/restrict");
       restrict_->Mult(local_y_, y);
     }
     else
@@ -1340,20 +1341,20 @@ public:
 
   void Mult(const mfem::Vector& x, mfem::Vector& y) const override
   {
-    ::dg_igr::NVTXRange range("IGR/exact-sum/Mult");
+    ::igrlab::NVTXRange range("IGR/exact-sum/Mult");
     ++operator_mult_calls_;
     if (!timing_enabled_)
     {
       {
-        ::dg_igr::NVTXRange base_range("IGR/exact-sum/base");
+        ::igrlab::NVTXRange base_range("IGR/exact-sum/base");
         base_->Mult(x, y);
       }
       {
-        ::dg_igr::NVTXRange face_range("IGR/exact-sum/face");
+        ::igrlab::NVTXRange face_range("IGR/exact-sum/face");
         face_->Mult(x, scratch_);
       }
       {
-        ::dg_igr::NVTXRange axpy_range("IGR/exact-sum/axpy");
+        ::igrlab::NVTXRange axpy_range("IGR/exact-sum/axpy");
         y += scratch_;
       }
       return;
@@ -1361,21 +1362,21 @@ public:
 
     const auto base_start = Clock::now();
     {
-      ::dg_igr::NVTXRange base_range("IGR/exact-sum/base");
+      ::igrlab::NVTXRange base_range("IGR/exact-sum/base");
       base_->Mult(x, y);
     }
     timing_.base_seconds += ElapsedSeconds(base_start);
 
     const auto face_start = Clock::now();
     {
-      ::dg_igr::NVTXRange face_range("IGR/exact-sum/face");
+      ::igrlab::NVTXRange face_range("IGR/exact-sum/face");
       face_->Mult(x, scratch_);
     }
     timing_.face_seconds += ElapsedSeconds(face_start);
 
     const auto axpy_start = Clock::now();
     {
-      ::dg_igr::NVTXRange axpy_range("IGR/exact-sum/axpy");
+      ::igrlab::NVTXRange axpy_range("IGR/exact-sum/axpy");
       y += scratch_;
     }
     timing_.sum_axpy_seconds += ElapsedSeconds(axpy_start);
@@ -1425,7 +1426,7 @@ void IGRSolver::BuildBilinearForm_()
   exact_face_operator_.reset();
 
   const bool debug_qf =
-    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DEBUG_QF", false);
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_DEBUG_QF", false);
   if (debug_qf && mfem::Mpi::Root())
   {
     std::cout << "[igr-linear] event=build-bilinear-start" << "\n";
@@ -1547,7 +1548,7 @@ bool IGRSolver::ShouldUsePartialAssembly_() const
   if (device_backend)
   {
     const bool requested =
-      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_PARTIAL_ASSEMBLY", true);
+      ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_PARTIAL_ASSEMBLY", true);
     if (mfem::Mpi::Root())
     {
       std::cout << "[igr-linear] event=partial-assembly-policy"
@@ -1560,7 +1561,7 @@ bool IGRSolver::ShouldUsePartialAssembly_() const
   }
 
   bool use_partial =
-    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_PARTIAL_ASSEMBLY", false);
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_PARTIAL_ASSEMBLY", false);
   if (use_partial && PreconditionerRequiresAssembledMatrix(prec_type_))
   {
     if (mfem::Mpi::Root())
@@ -1579,7 +1580,7 @@ bool IGRSolver::ShouldUsePartialAssembly_() const
 bool IGRSolver::UseExactDGFaceOperator_() const
 {
   return exact_dg_face_operator_ ||
-         ::dg_igr::EnvFlagEnabledDefault(
+         ::igrlab::EnvFlagEnabledDefault(
            "DG_IGR_IGR_EXACT_DG_FACE_OPERATOR",
            false);
 }
@@ -1588,7 +1589,7 @@ bool IGRSolver::ShouldUseDirectIdentitySystem_(bool use_device_qf,
                                                std::string& reason) const
 {
   const bool requested =
-    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_DIRECT_IDENTITY_SYSTEM",
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_DIRECT_IDENTITY_SYSTEM",
                                     true);
   if (!requested)
   {
@@ -1655,7 +1656,7 @@ mfem::Operator* IGRSolver::ActiveLinearOperator_() const
 
 void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
 {
-  ::dg_igr::NVTXRange range("IGR/assemble-system");
+  ::igrlab::NVTXRange range("IGR/assemble-system");
   const auto assemble_start = std::chrono::steady_clock::now();
 
   // Needed for DG/IPDG assembly: variable coeffs evaluated on shared faces
@@ -1665,7 +1666,7 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
   // overhead; skip it in that case as well.
   if (IsDGSpace(sfes_) && mfem::Mpi::WorldSize() > 1)
   {
-    ::dg_igr::NVTXRange exchange_range("IGR/state-face-neighbor-exchange");
+    ::igrlab::NVTXRange exchange_range("IGR/state-face-neighbor-exchange");
     const_cast<mfem::ParGridFunction&>(U).ExchangeFaceNbrData();
   }
   MFEM_VERIFY(VectorIsFinite(U),
@@ -1688,7 +1689,7 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
   last_exact_face_shared_nf_ = 0;
   last_exact_face_operator_mult_calls_ = 0;
   const bool debug_qf =
-    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DEBUG_QF", false);
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_DEBUG_QF", false);
   if (debug_qf && mfem::Mpi::Root())
   {
     std::cout << "[igr-linear] event=assemble-use-device-qf"
@@ -1719,17 +1720,17 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
 
   if (use_device_qf)
   {
-    ::dg_igr::NVTXRange coeff_range("IGR/device-coefficients");
+    ::igrlab::NVTXRange coeff_range("IGR/device-coefficients");
     UpdateDeviceCoefficients_(U);
   }
   else
   {
-    ::dg_igr::NVTXRange coeff_range("IGR/host-coefficients");
+    ::igrlab::NVTXRange coeff_range("IGR/host-coefficients");
     // Ensure host-visible state for coefficient evaluation.
     // The IGR coefficients call GridFunction::GetVectorValue(), which is host-only.
     // On device backends, default to syncing unless explicitly disabled.
     const bool hostsync_default = device_backend;
-    if (::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_FORCE_STATE_HOSTSYNC",
+    if (::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_FORCE_STATE_HOSTSYNC",
                                         hostsync_default))
     {
       (void)U.HostRead();
@@ -1775,7 +1776,7 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
 
   // Re-assemble values (sparsity pattern unchanged)
   {
-    ::dg_igr::NVTXRange assemble_form_range("IGR/mfem-form-assemble");
+    ::igrlab::NVTXRange assemble_form_range("IGR/mfem-form-assemble");
     a_->Assemble();
     b_->Assemble();
   }
@@ -1804,7 +1805,7 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
   const auto form_start = std::chrono::steady_clock::now();
   std::string direct_identity_reason;
   {
-    ::dg_igr::NVTXRange form_range("IGR/form-linear-system");
+    ::igrlab::NVTXRange form_range("IGR/form-linear-system");
     if (ShouldUseDirectIdentitySystem_(use_device_qf, direct_identity_reason))
     {
       X_.MakeRef(sigma_, 0, sigma_.Size());
@@ -1821,7 +1822,7 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
 
   if (use_exact_face_operator)
   {
-    ::dg_igr::NVTXRange exact_setup_range("IGR/exact-face-setup");
+    ::igrlab::NVTXRange exact_setup_range("IGR/exact-face-setup");
     if (!use_partial_assembly_)
     {
       last_exact_face_reason_ = "requires-partial-assembly";
@@ -1853,9 +1854,9 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
       }
     }
     const bool use_cuda_face_density =
-      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_FACE_DENSITY_CUDA", false);
+      ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_FACE_DENSITY_CUDA", false);
     const bool cache_face_density =
-      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_FACE_DENSITY_CACHE", false);
+      ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_FACE_DENSITY_CACHE", false);
     MFEM_VERIFY(!cache_face_density || use_cuda_face_density,
                 "Face-density geometry caching requires the CUDA projection option.");
     std::unique_ptr<mfem::FaceQuadratureSpace> uncached_fqs;
@@ -1942,7 +1943,7 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
                 << std::endl;
     last_exact_face_local_nf_ = side_info.nf;
     const bool ingestion_audit =
-      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_INGESTION_AUDIT", false);
+      ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_INGESTION_AUDIT", false);
     if (ingestion_audit)
     {
       LogFaceCoefficientAudit("local",
@@ -2099,7 +2100,7 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
   {
     std::cout << "[igr-linear] event=direct-identity-system"
               << " requested="
-              << (::dg_igr::EnvFlagEnabledDefault(
+              << (::igrlab::EnvFlagEnabledDefault(
                     "DG_IGR_IGR_DIRECT_IDENTITY_SYSTEM",
                     true) ? "on" : "off")
               << " effective=" << (direct_identity_system_ ? "on" : "off")
@@ -2115,7 +2116,7 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
 
 void IGRSolver::DoSmootherSweeps(int sweeps, bool /*warm_start*/)
 {
-  ::dg_igr::NVTXRange range("IGR/smoother-sweeps");
+  ::igrlab::NVTXRange range("IGR/smoother-sweeps");
   mfem::Operator* A_op = ActiveLinearOperator_();
   MFEM_VERIFY(A_op != nullptr,
               "IGR: linear operator is not assembled before smoother sweeps.");
@@ -2181,7 +2182,7 @@ void IGRSolver::DoSmootherSweeps(int sweeps, bool /*warm_start*/)
 
 void IGRSolver::SolveEllipticSystem_(bool warm_start)
 {
-  ::dg_igr::NVTXRange range("IGR/solve-elliptic-system");
+  ::igrlab::NVTXRange range("IGR/solve-elliptic-system");
   mfem::Operator* A_op = ActiveLinearOperator_();
   MFEM_VERIFY(A_op != nullptr,
               "IGR: linear operator is not assembled before Krylov solve.");
@@ -2199,16 +2200,16 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const int event_log_min_iters =
     ReadEnvInt("DG_IGR_IGR_EVENT_LOG_MIN_ITERS", 0);
   const char* event_capture_prefix_text =
-    std::getenv("DG_IGR_IGR_EVENT_CAPTURE_PREFIX");
+    igrlab::GetEnv("DG_IGR_IGR_EVENT_CAPTURE_PREFIX");
   const bool event_capture_enabled =
     event_capture_prefix_text && event_capture_prefix_text[0] != '\0';
   const int event_capture_min_iters =
     ReadEnvInt("DG_IGR_IGR_EVENT_CAPTURE_MIN_ITERS",
                event_log_min_iters > 0 ? event_log_min_iters : lin_maxit_);
   const bool true_residual_requested =
-    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_TRUE_RESIDUAL", false);
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_TRUE_RESIDUAL", false);
   const bool true_initial_residual_requested =
-    true_residual_requested && ::dg_igr::EnvFlagEnabledDefault(
+    true_residual_requested && ::igrlab::EnvFlagEnabledDefault(
                                  "DG_IGR_IGR_TRUE_INITIAL_RESIDUAL", false);
   const int extended_certificate_start =
     ReadEnvInt("DG_IGR_IGR_EXTENDED_CERTIFICATE_START", 1000);
@@ -2221,7 +2222,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
               "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR must be finite and "
               "positive.");
   const bool extended_certificate_enabled =
-    ::dg_igr::EnvFlagEnabledDefault(
+    ::igrlab::EnvFlagEnabledDefault(
       "DG_IGR_IGR_EXTENDED_CERTIFICATE", false) &&
     exact_face_sum_op && lin_maxit_ > extended_certificate_start;
   const bool run_operator_probe =
@@ -2250,20 +2251,20 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const bool is_dg = IsDGSpace(sfes_);
   const bool spd_ok = IsSPD_DefaultAssumption(sfes_, ip_kind_);
   const bool using_cuda = IsCudaBackendActive();
-  const char* dense_inverse_env = std::getenv("DG_IGR_IGR_DENSE_INVERSE");
+  const char* dense_inverse_env = igrlab::GetEnv("DG_IGR_IGR_DENSE_INVERSE");
   const std::string dense_inverse_precision =
     dense_inverse_env ? dense_inverse_env : "";
   const bool using_dense_inverse = !dense_inverse_precision.empty();
-  const char* two_level_env = std::getenv("DG_IGR_IGR_TWO_LEVEL_INVERSE");
+  const char* two_level_env = igrlab::GetEnv("DG_IGR_IGR_TWO_LEVEL_INVERSE");
   const bool using_two_level_inverse = two_level_env && two_level_env[0];
-  const char* patch_env = std::getenv("DG_IGR_IGR_PATCH_RADIUS");
+  const char* patch_env = igrlab::GetEnv("DG_IGR_IGR_PATCH_RADIUS");
   const bool using_screened_patch = patch_env && patch_env[0];
   const int patch_radius = using_screened_patch
     ? ReadEnvInt("DG_IGR_IGR_PATCH_RADIUS", -1) : -1;
-  const char* patch_precision_env = std::getenv("DG_IGR_IGR_PATCH_PRECISION");
+  const char* patch_precision_env = igrlab::GetEnv("DG_IGR_IGR_PATCH_PRECISION");
   const std::string patch_precision = using_screened_patch && patch_precision_env
     ? patch_precision_env : "fp64";
-  const char* patch_kind_env = std::getenv("DG_IGR_IGR_PATCH_KIND");
+  const char* patch_kind_env = igrlab::GetEnv("DG_IGR_IGR_PATCH_KIND");
   const std::string patch_kind = using_screened_patch && patch_kind_env
     ? patch_kind_env : "ras";
   const int patch_rebuild_interval = using_screened_patch
@@ -2281,7 +2282,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
               "a nonnegative rebuild interval, "
               "and no global dense or two-level inverse. kind=vertex-p1 additionally "
               "requires radius=0, fp64 and symmetric SIPG; face-condensed requires radius=0 and symmetric SIPG.");
-  const char* two_level_coarse_env = std::getenv("DG_IGR_IGR_TWO_LEVEL_COARSE");
+  const char* two_level_coarse_env = igrlab::GetEnv("DG_IGR_IGR_TWO_LEVEL_COARSE");
   const std::string two_level_coarse =
     two_level_coarse_env ? two_level_coarse_env : "dense";
   const int two_level_order = using_two_level_inverse
@@ -2427,14 +2428,14 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
 
   KrylovApplyTelemetry krylov_telemetry;
   krylov_telemetry.record_seconds =
-    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_KRYLOV_APPLY_TIMING",
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_KRYLOV_APPLY_TIMING",
                                     false);
   krylov_telemetry.sync =
-    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_KRYLOV_APPLY_SYNC",
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_KRYLOV_APPLY_SYNC",
                                     false);
   const bool use_krylov_telemetry =
     krylov_telemetry.record_seconds ||
-    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_KRYLOV_APPLY_COUNTS",
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_KRYLOV_APPLY_COUNTS",
                                     true);
 
   const auto pc_setup_start = std::chrono::steady_clock::now();
@@ -2446,7 +2447,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   bool using_operator_chebyshev = false;
   bool using_operator_chebyshev_base = false;
   {
-    ::dg_igr::NVTXRange pc_range("IGR/preconditioner-setup");
+    ::igrlab::NVTXRange pc_range("IGR/preconditioner-setup");
     if (using_screened_patch)
     {
 #if defined(DG_IGR_HAS_SCREENED_PATCH_CUDA)
@@ -2588,7 +2589,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       {
         const bool use_exact_face_diag =
           exact_face_sum_op &&
-          ::dg_igr::EnvFlagEnabledDefault(
+          ::igrlab::EnvFlagEnabledDefault(
             "DG_IGR_IGR_EXACT_FACE_DIAGONAL_PRECOND",
             false);
         if (use_exact_face_diag)
@@ -2605,7 +2606,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     }
     else if (prec_choice == PrecondType::OperatorChebyshev)
     {
-      ::dg_igr::NVTXRange cheb_range("IGR/chebyshev-setup");
+      ::igrlab::NVTXRange cheb_range("IGR/chebyshev-setup");
       // The qualified extrapolated instantaneous-IGR route uses the complete
       // exact-face operator for both Krylov and Chebyshev applications.  Do
       // not let the legacy experimental environment knob silently substitute
@@ -2613,7 +2614,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       const bool use_base_operator =
         exact_face_sum_op &&
         sigma_cadence_ != IGRSigmaUpdateCadence::ExtrapolatedEveryStep &&
-        ::dg_igr::EnvFlagEnabledDefault(
+        ::igrlab::EnvFlagEnabledDefault(
           "DG_IGR_IGR_CHEB_BASE_OPERATOR",
           false);
       mfem::Operator* cheb_op =
@@ -2623,7 +2624,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       mfem::Vector diag(cheb_op->Height());
       const auto cheb_diag_start = Clock::now();
       {
-        ::dg_igr::NVTXRange diag_range("IGR/chebyshev-diagonal");
+        ::igrlab::NVTXRange diag_range("IGR/chebyshev-diagonal");
         cheb_op->AssembleDiagonal(diag);
       }
       last_chebyshev_diagonal_seconds_ = ElapsedSeconds(cheb_diag_start);
@@ -2648,7 +2649,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
       MFEM_VERIFY(cheb_power_seed != 0,
                   "DG_IGR_IGR_CHEB_POWER_SEED must be nonzero.");
       if ((lin_print_ > 0 ||
-           ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DEBUG_QF", false)) &&
+           ::igrlab::EnvFlagEnabledDefault("DG_IGR_DEBUG_QF", false)) &&
           mfem::Mpi::Root())
       {
         std::cout << "[igr-linear] event=operator-chebyshev-config"
@@ -2710,7 +2711,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     std::chrono::duration<double>(pc_setup_stop - pc_setup_start).count();
   total_pc_setup_seconds_ += last_pc_setup_seconds_;
   if (run_operator_probe && prec &&
-      ::dg_igr::EnvFlagEnabledDefault(
+      ::igrlab::EnvFlagEnabledDefault(
         "DG_IGR_IGR_PRECONDITIONER_PROBE", false))
   {
     LogOperatorAlgebraProbe(
@@ -2764,9 +2765,9 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   last_zero_start_residual_norm_ =
     std::numeric_limits<double>::quiet_NaN();
   if (enable_warm_start &&
-      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_WARM_START_GUARD", false))
+      ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_WARM_START_GUARD", false))
   {
-    ::dg_igr::NVTXRange warm_guard_range("IGR/warm-start-residual-guard");
+    ::igrlab::NVTXRange warm_guard_range("IGR/warm-start-residual-guard");
     mfem::Vector operator_guess(B_.Size());
     mfem::Vector warm_residual(B_);
     A_op->Mult(X_, operator_guess);
@@ -2898,7 +2899,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     exact_face_sum_op->ResetTiming();
   }
 
-  const char* stationary_env = std::getenv("DG_IGR_IGR_STATIONARY_SWEEPS");
+  const char* stationary_env = igrlab::GetEnv("DG_IGR_IGR_STATIONARY_SWEEPS");
   int stationary_sweeps = 0;
   if (stationary_env && stationary_env[0])
   {
@@ -2932,7 +2933,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
 
   auto run_krylov = [&](double relative_tolerance, bool iterative_mode)
   {
-    ::dg_igr::NVTXRange krylov_range("IGR/krylov-solve");
+    ::igrlab::NVTXRange krylov_range("IGR/krylov-solve");
     if (stationary_sweeps)
     {
       configure_solver(*stationary_correction_, relative_tolerance, iterative_mode);
@@ -3370,4 +3371,4 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   }
 }
 
-} // namespace dg_igr
+} // namespace igrlab

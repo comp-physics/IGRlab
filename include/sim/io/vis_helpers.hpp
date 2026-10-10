@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/io/vis_helpers.hpp
  * @brief GLVis/VTK field helpers for Euler visualization.
@@ -16,7 +18,7 @@
 
 #include "sim/state/state_views.hpp"
 
-namespace dg_igr
+namespace igrlab
 {
 class IGRSolver;
 }
@@ -35,7 +37,7 @@ struct EulerFieldList
   EulerStateViews* state = nullptr;
   EulerPressureView* pressure = nullptr;
   EulerVelocityView* velocity = nullptr;
-  dg_igr::IGRSolver* igr = nullptr;
+  igrlab::IGRSolver* igr = nullptr;
   const mfem::ParGridFunction* sigma = nullptr;
   H1Diagnostics* h1_diag = nullptr;
   L2Diagnostics* l2_diag = nullptr;

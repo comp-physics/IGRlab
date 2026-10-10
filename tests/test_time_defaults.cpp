@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "sim/config/case_config.hpp"
 #include "sim/context/example_context.hpp"
 #include "sim/io/run_metadata.hpp"
@@ -28,6 +29,35 @@ namespace dg_igr_tests
 int RunTimeDefaultsTests(TestContext& ctx)
 {
   constexpr double gamma = 1.4;
+
+  // Canonical runtime names must coexist with older case-launch scripts.
+  {
+    const char* canonical_name = "IGRLAB_COMPATIBILITY_TEST";
+    const char* legacy_name = "DG_IGR_COMPATIBILITY_TEST";
+    const char* previous_canonical = std::getenv(canonical_name);
+    const char* previous_legacy = std::getenv(legacy_name);
+    const std::optional<std::string> saved_canonical = previous_canonical
+      ? std::optional<std::string>(previous_canonical) : std::nullopt;
+    const std::optional<std::string> saved_legacy = previous_legacy
+      ? std::optional<std::string>(previous_legacy) : std::nullopt;
+    unsetenv(canonical_name);
+    unsetenv(legacy_name);
+    ctx.Check(igrlab::GetEnv(legacy_name) == nullptr,
+              "IGRlab environment: missing values remain missing");
+    setenv(legacy_name, "legacy", 1);
+    ctx.Check(std::string(igrlab::GetEnv(legacy_name)) == "legacy",
+              "IGRlab environment: legacy launch scripts remain supported");
+    setenv(canonical_name, "canonical", 1);
+    ctx.Check(std::string(igrlab::GetEnv(legacy_name)) == "canonical",
+              "IGRlab environment: canonical values take precedence");
+    setenv(canonical_name, "", 1);
+    ctx.Check(std::string(igrlab::GetEnv(legacy_name)).empty(),
+              "IGRlab environment: explicit empty canonical values are respected");
+    if (saved_canonical) { setenv(canonical_name, saved_canonical->c_str(), 1); }
+    else { unsetenv(canonical_name); }
+    if (saved_legacy) { setenv(legacy_name, saved_legacy->c_str(), 1); }
+    else { unsetenv(legacy_name); }
+  }
 
   // --- Zhang-Shu point policy defaults and runtime resolution ---
   {
@@ -575,17 +605,17 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   "IGR defaults: CUDA L2/BrokenL2 DG uses zero atol");
     ctx.Check(igr_opts.lin_maxit == 500,
               "IGR defaults: CUDA L2/BrokenL2 DG uses production iteration cap");
-    dg_igr::IGRConfig igr_config;
+    igrlab::IGRConfig igr_config;
     ctx.Check(igr_config.nonconvergence_policy ==
-                dg_igr::IGRNonconvergencePolicy::Accept,
+                igrlab::IGRNonconvergencePolicy::Accept,
               "IGR defaults: linear nonconvergence retains capped iterate");
     ctx.Check(dg_sim::ParseIGRNonconvergencePolicy("error") ==
-                dg_igr::IGRNonconvergencePolicy::Error,
+                igrlab::IGRNonconvergencePolicy::Error,
               "IGR options: explicit strict error policy parses");
     igr_opts.nonconvergence_policy = "error";
     dg_sim::ApplyIGRRuntimeOptionOverrides(igr_opts, igr_config);
     ctx.Check(igr_config.nonconvergence_policy ==
-                dg_igr::IGRNonconvergencePolicy::Error,
+                igrlab::IGRNonconvergencePolicy::Error,
               "IGR options: strict nonconvergence policy reaches solver config");
   }
 
@@ -734,7 +764,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     const auto cadence =
       dg_sim::ParseIGRSigmaUpdateCadence("EXTRAPOLATED-EVERY-STEP");
     ctx.Check(
-      cadence == dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep &&
+      cadence == igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep &&
         std::string(dg_sim::IGRSigmaUpdateCadenceToString(cadence)) ==
           "extrapolated-every-step" &&
         dg_sim::ParseIGRSigmaUpdateCadence("extrapolated_every_step") == cadence,
@@ -768,7 +798,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "modal damping: M16 physical rate parses");
 
     case_cfg.igr_config.sigma_cadence =
-      dg_igr::IGRSigmaUpdateCadence::EveryStage;
+      igrlab::IGRSigmaUpdateCadence::EveryStage;
     ctx.Check(validate(dg_sim::Discretization::DG,
                        dg_sim::Regularization::IGR).empty() &&
                 validate(dg_sim::Discretization::DGSEM,
@@ -779,7 +809,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "modal damping: positive HDG request is rejected before dispatch");
 
     case_cfg.igr_config.sigma_cadence =
-      dg_igr::IGRSigmaUpdateCadence::EveryStep;
+      igrlab::IGRSigmaUpdateCadence::EveryStep;
     ctx.Check(!validate(dg_sim::Discretization::DG,
                         dg_sim::Regularization::IGR).empty(),
               "modal damping: inherited frozen IGR cadence is rejected");
@@ -955,7 +985,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
   {
     constexpr const char* vtk_points_env =
       "DG_IGR_LIMITER_ENFORCE_VTK_POINTS";
-    const char* original_env_text = std::getenv(vtk_points_env);
+    const char* original_env_text = igrlab::GetEnv(vtk_points_env);
     const std::optional<std::string> original_env = original_env_text
       ? std::optional<std::string>(original_env_text)
       : std::nullopt;
@@ -1128,7 +1158,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     const int volume_qord = 2 * local_order + 2;
     const std::vector<int> face_qords{
       2 * local_order + limiter_run.case_config.int_order_offset};
-    const auto pre_dof_scan = mfem::dg_igr::ScanEulerAdmissibility(
+    const auto pre_dof_scan = mfem::igrlab::ScanEulerAdmissibility(
       example_ctx.spaces.vfes,
       bundle.sol,
       /*dim=*/2,
@@ -1137,7 +1167,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
       limiter_run.case_config.rk3_config.p_min,
       volume_qord,
       face_qords,
-      mfem::dg_igr::EulerAdmissibilityPointSet::Dof);
+      mfem::igrlab::EulerAdmissibilityPointSet::Dof);
     const auto integral_before =
       dg_sim::detail::IntegrateEulerConservedState(bundle.sol);
     mfem::ZhangShuLimiterElementDiagnostics diagnostics;
@@ -1145,7 +1175,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
       dg_sim::detail::ApplyInitialEulerZhangShuTransaction(limiter_run,
                                                            bundle,
                                                            &diagnostics);
-    const auto post_dof_scan = mfem::dg_igr::ScanEulerAdmissibility(
+    const auto post_dof_scan = mfem::igrlab::ScanEulerAdmissibility(
       example_ctx.spaces.vfes,
       bundle.sol,
       /*dim=*/2,
@@ -1154,8 +1184,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
       limiter_run.case_config.rk3_config.p_min,
       volume_qord,
       face_qords,
-      mfem::dg_igr::EulerAdmissibilityPointSet::Dof);
-    const auto post_limiter_scan = mfem::dg_igr::ScanEulerAdmissibility(
+      mfem::igrlab::EulerAdmissibilityPointSet::Dof);
+    const auto post_limiter_scan = mfem::igrlab::ScanEulerAdmissibility(
       example_ctx.spaces.vfes,
       bundle.sol,
       /*dim=*/2,
@@ -1164,7 +1194,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
       limiter_run.case_config.rk3_config.p_min,
       volume_qord,
       face_qords,
-      mfem::dg_igr::EulerAdmissibilityPointSet::Limiter);
+      mfem::igrlab::EulerAdmissibilityPointSet::Limiter);
     const auto integral_after =
       dg_sim::detail::IntegrateEulerConservedState(bundle.sol);
     double local_active = 0.0;
@@ -1348,7 +1378,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     ctx.Check(dgsem_llf_name == ssprk104_name + "_dvd_llf",
               "VTK dataset: DGSEM LLF volume dissipation has a typed suffix");
     dataset_run.case_config.igr_config.sigma_cadence =
-      dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+      igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
     dataset_run.igr_opts.alpha_length_policy = "local";
     dataset_run.igr_opts.exact_dg_face_operator = true;
     const std::string shock_candidate_name =
@@ -1362,7 +1392,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     dataset_run.dgsem_volume_dissipation =
       dg_sim::DGSEMVolumeDissipation::None;
     dataset_run.case_config.igr_config.sigma_cadence =
-      dg_igr::IGRSigmaUpdateCadence::EveryStage;
+      igrlab::IGRSigmaUpdateCadence::EveryStage;
     dataset_run.igr_opts.alpha_length_policy.clear();
     dataset_run.igr_opts.exact_dg_face_operator = false;
     dataset_run.igr_opts.igr_invariant_domain_flux = true;
@@ -1384,7 +1414,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
   // --- Run metadata records the effective explicit-method identity ---
   {
     constexpr const char* prefix_env_name = "DG_IGR_VTK_PREFIX_PATH";
-    const char* original_prefix_text = std::getenv(prefix_env_name);
+    const char* original_prefix_text = igrlab::GetEnv(prefix_env_name);
     const std::optional<std::string> original_prefix = original_prefix_text
       ? std::optional<std::string>(original_prefix_text)
       : std::nullopt;
@@ -1409,9 +1439,9 @@ int RunTimeDefaultsTests(TestContext& ctx)
     dg_sim::CaseConfig metadata_case;
     metadata_case.case_name = "ssprk-metadata";
     metadata_case.igr_config.sigma_cadence =
-      dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+      igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
     metadata_case.igr_config.alpha_length_scale_policy =
-      dg_igr::IGRAlphaLengthScalePolicy::Local;
+      igrlab::IGRAlphaLengthScalePolicy::Local;
     dg_sim::RunConfig metadata_run;
     metadata_run.case_config = metadata_case;
     metadata_run.opts.vtk_save = true;
@@ -1568,7 +1598,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
   // --- VTK pressure can bypass the projected pressure polynomial ---
   {
     constexpr const char* prefix_env_name = "DG_IGR_VTK_PREFIX_PATH";
-    const char* original_prefix_text = std::getenv(prefix_env_name);
+    const char* original_prefix_text = igrlab::GetEnv(prefix_env_name);
     const std::optional<std::string> original_prefix = original_prefix_text
       ? std::optional<std::string>(original_prefix_text)
       : std::nullopt;
@@ -1589,7 +1619,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     }
 
     constexpr const char* env_name = "DG_IGR_VTK_PRESSURE_COEFFICIENT";
-    const char* original_text = std::getenv(env_name);
+    const char* original_text = igrlab::GetEnv(env_name);
     const std::optional<std::string> original =
       original_text ? std::optional<std::string>(original_text) : std::nullopt;
 
@@ -2318,7 +2348,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "RunEulerCase: retry exhaustion commits no conservative state");
 
     const char* prefix_env_name = "DG_IGR_VTK_PREFIX_PATH";
-    const char* old_prefix = std::getenv(prefix_env_name);
+    const char* old_prefix = igrlab::GetEnv(prefix_env_name);
     const std::optional<std::string> original_prefix =
       old_prefix ? std::optional<std::string>(old_prefix) : std::nullopt;
     long long output_token = 0;
@@ -3127,4 +3157,4 @@ int RunTimeDefaultsTests(TestContext& ctx)
   return ctx.failures;
 }
 
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

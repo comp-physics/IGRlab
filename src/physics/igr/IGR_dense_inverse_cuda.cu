@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "IGR_dense_inverse.hpp"
 
 #include <cublas_v2.h>
@@ -11,7 +12,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace igr_internal
 {
@@ -128,7 +129,7 @@ public:
     static_assert(std::is_same<mfem::real_t, double>::value,
                   "Dense inverse experiment requires FP64 MFEM.");
     const auto start = std::chrono::steady_clock::now();
-    const char* setup_env = std::getenv("DG_IGR_IGR_DENSE_SETUP");
+    const char* setup_env = igrlab::GetEnv("DG_IGR_IGR_DENSE_SETUP");
     const std::string setup = setup_env && setup_env[0] ? setup_env : "host";
     MFEM_VERIFY(setup == "host" || setup == "cusolver",
                 "DG_IGR_IGR_DENSE_SETUP must be host|cusolver or unset.");

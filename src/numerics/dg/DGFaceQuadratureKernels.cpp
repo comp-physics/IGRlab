@@ -1,7 +1,8 @@
+#include "igrlab/compat.hpp"
 #include "mfem.hpp"
 #include "DGFaceQuadratureKernels.hpp"
 
-namespace dg_igr
+namespace igrlab
 {
 namespace dg_face
 {
@@ -165,4 +166,4 @@ void LaunchSharedFaceDGDiffusionCoefficientUpdate2D(
 }
 
 } // namespace dg_face
-} // namespace dg_igr
+} // namespace igrlab

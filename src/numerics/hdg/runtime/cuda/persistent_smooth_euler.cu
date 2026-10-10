@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler.cuh"
 #include "numerics/hdg/runtime/cuda/native_rank1_trace_solver.cuh"
 #include "numerics/hdg/runtime/cuda/tensor_volume_layout.hpp"
@@ -545,8 +546,8 @@ bool CudaTransportPolicy::HostToDevice(
     const std::size_t source_capacity,
     const std::size_t destination_capacity) noexcept
 {
-  [[maybe_unused]] ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_device_transfer);
+  [[maybe_unused]] ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_device_transfer);
   const bool trace_touch = true_system_diagnostic_active &&
       category == CudaTransferCategory::initial_state &&
       site == CudaTransferSite::initial_trace_upload;
@@ -578,8 +579,8 @@ bool CudaTransportPolicy::DeviceToHost(
     const std::size_t source_capacity,
     const std::size_t destination_capacity) noexcept
 {
-  [[maybe_unused]] ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_device_transfer);
+  [[maybe_unused]] ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_device_transfer);
   const bool true_structure_copy = true_system_diagnostic_active &&
       category == CudaTransferCategory::topology &&
       site == CudaTransferSite::map_upload;
@@ -602,8 +603,8 @@ bool CudaTransportPolicy::DeviceToDevice(
     const std::size_t source_capacity,
     const std::size_t destination_capacity) noexcept
 {
-  [[maybe_unused]] ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_device_transfer);
+  [[maybe_unused]] ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_device_transfer);
   const bool success = Copy(destination, source, bytes, cudaMemcpyDeviceToDevice);
   RecordTransfer(CudaTransferDirection::device_to_device, category, site,
                  source, destination, bytes, source_capacity,
@@ -617,8 +618,8 @@ bool CudaTransportPolicy::RecordMpiStaging(
     const void* destination, const std::size_t source_capacity,
     const std::size_t destination_capacity, const bool success) noexcept
 {
-  [[maybe_unused]] ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_device_transfer);
+  [[maybe_unused]] ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_device_transfer);
   const bool sparse_staging = true_system_diagnostic_active &&
       category == CudaTransferCategory::topology &&
       site == CudaTransferSite::map_upload;
@@ -636,8 +637,8 @@ bool CudaTransportPolicy::RecordMpiStaging(
 
 bool CudaTransportPolicy::Synchronize(const CudaTransferSite site) noexcept
 {
-  [[maybe_unused]] ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_synchronization);
+  [[maybe_unused]] ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_synchronization);
   const bool true_system_sync = true_system_diagnostic_active &&
       (site == CudaTransferSite::map_upload ||
        site == CudaTransferSite::initial_trace_upload);
@@ -6378,7 +6379,7 @@ int SelectedExperimentalFaceBlockThreads() noexcept
   // Process-local and immutable: set before the first borrowed assembly.
   static const int selected=[]() noexcept
   {
-    const char* value=std::getenv("DG_IGR_HDG_FACE_BLOCK_THREADS");
+    const char* value=igrlab::GetEnv("DG_IGR_HDG_FACE_BLOCK_THREADS");
     if(value==nullptr)return 128;
     int threads=0;
     if(std::strcmp(value,"32")==0)threads=32;
@@ -6402,7 +6403,7 @@ ExperimentalVolumeArithmetic SelectedExperimentalVolumeArithmetic() noexcept
   // Process-local and immutable: numerical comparisons set this before launch.
   static const ExperimentalVolumeArithmetic selected=[]() noexcept
   {
-    const char* mode=std::getenv("DG_IGR_HDG_VOLUME_ARITHMETIC");
+    const char* mode=igrlab::GetEnv("DG_IGR_HDG_VOLUME_ARITHMETIC");
     if(mode==nullptr||*mode=='\0')return ExperimentalVolumeArithmetic::fp64_wmma;
     ExperimentalVolumeArithmetic result=ExperimentalVolumeArithmetic::invalid;
     if(std::strcmp(mode,"fp64-wmma")==0)
@@ -6433,7 +6434,7 @@ ExperimentalVolumeResidual SelectedExperimentalVolumeResidual() noexcept
 {
   static const ExperimentalVolumeResidual selected=[]() noexcept
   {
-    const char* mode=std::getenv("DG_IGR_HDG_VOLUME_RESIDUAL");
+    const char* mode=igrlab::GetEnv("DG_IGR_HDG_VOLUME_RESIDUAL");
     if(mode==nullptr||*mode=='\0')return ExperimentalVolumeResidual::matched;
     if(std::strcmp(mode,"matched")==0)
     {
@@ -6461,7 +6462,7 @@ ExperimentalCondensationArithmetic SelectedExperimentalCondensationArithmetic() 
 {
   static const ExperimentalCondensationArithmetic selected=[]() noexcept
   {
-    const char* mode=std::getenv("DG_IGR_HDG_CONDENSATION_ARITHMETIC");
+    const char* mode=igrlab::GetEnv("DG_IGR_HDG_CONDENSATION_ARITHMETIC");
     if(mode==nullptr||*mode=='\0'||std::strcmp(mode,"fp64-wmma")==0)
       return ExperimentalCondensationArithmetic::fp64_wmma;
     if(std::strcmp(mode,"simt-fp64")==0)

@@ -32,11 +32,12 @@ MODE="cpu"
 CPU_MODE_WAS_SET=0
 A100_PROFILE=0
 A100_ARCH_CONFLICT=0
-JOBS="${NPROC:-4}"
+JOBS="${IGRLAB_BUILD_JOBS:-${NPROC:-4}}"
 MFEM_JOBS=""
 CLEAN=1
 INSTALL_DEPS=1
 RUN_TESTS=1
+BUILD_RESEARCH_TESTS="${IGRLAB_BUILD_RESEARCH_TESTS:-${DG_IGR_BUILD_RESEARCH_TESTS:-OFF}}"
 TEST_REGEX=""
 RUN_SMOKE=0
 CALIPER=0
@@ -45,7 +46,7 @@ HDG_EULER_EXPERIMENT="OFF"
 HDG_EULER_DEVICE_EXPERIMENT="OFF"
 HDG_RUNTIME="OFF"
 HDG_AUXILIARY_EXPERIMENT="OFF"
-SPACK_CUDA_ARCH="${SPACK_CUDA_ARCH:-120}"
+SPACK_CUDA_ARCH="${IGRLAB_CUDA_ARCH:-${SPACK_CUDA_ARCH:-120}}"
 CUDA_ARCH_WAS_SET=0
 PRINT_PLAN=0
 OUTPUT_ROOT_REQUEST=""
@@ -147,6 +148,7 @@ MFEM_IDENTITY_INSTALL_MANIFEST_SHA256=""
 
 usage() {
   cat <<'EOF'
+IGRlab canonical build driver
 Usage: ./build.sh [--cpu-only | --gpu | --a100] [options]
 
 Modes:
@@ -165,29 +167,46 @@ Options:
   --hdg-runtime     Enable the persistent HDG runtime component seam.
   --hdg-auxiliary-experiment
                     Enable the CPU-only experimental HDG auxiliary seam.
-  -j, --jobs N      Parallel build jobs (default: NPROC or 4).
+  -j, --jobs N      Parallel build jobs (default: IGRLAB_BUILD_JOBS, NPROC or 4).
   --mfem-jobs N     Parallel MFEM build jobs (default: --jobs value).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
   --reuse-mfem-root DIR
                     Reuse a strictly stamped MFEM tuple rooted at DIR.  An
                     unstamped pinned clean checkout is a read-only seed for a
                     external fresh MFEM build, never an in-place reuse.
-  --output-root DIR  Store build outputs in DIR (default: DG_IGR_OUTPUT_ROOT,
-                    then ${XDG_CACHE_HOME:-$HOME/.cache}/dg-igr-build).
+  --output-root DIR  Store build outputs in DIR (default: IGRLAB_OUTPUT_ROOT,
+                    then DG_IGR_OUTPUT_ROOT, then
+                    ${XDG_CACHE_HOME:-$HOME/.cache}/igrlab-build).
   --print-plan      Validate and print the resolved build policy, then exit.
   --clean           Rebuild the selected mode from clean caches (default).
   --no-clean        Reuse existing build and install directories.
   --no-deps         Do not run `spack install`.
   --no-tests        Do not run CTest.
+  --research-tests  Build research-only tests and experiments (default: off).
+  --no-research-tests
+                    Exclude research-only targets, overriding the environment.
   --test-regex REGEX
                     Require REGEX to select one or more CTest tests, then run
                     only that selection.  Requires tests to remain enabled.
   --smoke           Run a short two-rank Sedov smoke test after tests.
   -h, --help        Show this help.
 
-Environment overrides:
-  DG_IGR_OUTPUT_ROOT, DG_IGR_SPACK_ENV, SPACK_CUDA_ARCH, MFEM_CUDA_ARCHS, APP_CUDA_ARCHS,
-  CMAKE_BUILD_TYPE, DG_IGR_ACCELERATOR_KERNEL_SOURCES, TMPDIR
+Environment overrides (nonempty IGRLAB_* values take precedence):
+  IGRLAB_OUTPUT_ROOT                 legacy: DG_IGR_OUTPUT_ROOT
+  IGRLAB_SPACK_ENV                   legacy: DG_IGR_SPACK_ENV
+  IGRLAB_CUDA_ARCH                   legacy: SPACK_CUDA_ARCH
+  IGRLAB_MFEM_CUDA_ARCHS              legacy: MFEM_CUDA_ARCHS
+  IGRLAB_APP_CUDA_ARCHS               legacy: APP_CUDA_ARCHS
+  IGRLAB_BUILD_TYPE                  legacy: CMAKE_BUILD_TYPE
+  IGRLAB_BUILD_JOBS                  legacy: NPROC
+  IGRLAB_BUILD_RESEARCH_TESTS        legacy: DG_IGR_BUILD_RESEARCH_TESTS
+  IGRLAB_ACCELERATOR_KERNEL_SOURCES  legacy: DG_IGR_ACCELERATOR_KERNEL_SOURCES
+  TMPDIR                            temporary-file directory
+
+Command-line options take precedence over the corresponding environment value.
+To keep using existing outputs, pass --output-root explicitly, for example:
+  ./build.sh --cpu-only --no-clean --output-root "$HOME/.cache/dg-igr-build"
+The worktree/profile layout and MFEM identity records retain their format.
 
 CUDA_ARCHS is intentionally rejected in GPU mode. Use MFEM_CUDA_ARCHS and
 APP_CUDA_ARCHS so MFEM compatibility code generation cannot be confused with
@@ -248,6 +267,8 @@ while (($#)); do
     --no-clean) CLEAN=0 ;;
     --no-deps) INSTALL_DEPS=0 ;;
     --no-tests) RUN_TESTS=0 ;;
+    --research-tests) BUILD_RESEARCH_TESTS="ON" ;;
+    --no-research-tests) BUILD_RESEARCH_TESTS="OFF" ;;
     --test-regex)
       [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
       [[ -n "$2" && "$2" != *$'\n'* && "$2" != *$'\r'* ]] || {
@@ -273,6 +294,15 @@ if ((A100_PROFILE)); then
   SPACK_CUDA_ARCH="80"
   CUDA_ARCH_WAS_SET=1
 fi
+
+case "${BUILD_RESEARCH_TESTS^^}" in
+  ON|TRUE|YES|1) BUILD_RESEARCH_TESTS="ON" ;;
+  OFF|FALSE|NO|0) BUILD_RESEARCH_TESTS="OFF" ;;
+  *)
+    echo "ERROR: IGRLAB_BUILD_RESEARCH_TESTS/DG_IGR_BUILD_RESEARCH_TESTS must be a boolean (ON or OFF)." >&2
+    exit 2
+    ;;
+esac
 
 if [[ -n "${TEST_REGEX}" && "${RUN_TESTS}" != "1" ]]; then
   echo "ERROR: --test-regex requires CTest; do not combine it with --no-tests." >&2
@@ -350,10 +380,12 @@ configure_output_layout() {
 
   if [[ -n "${OUTPUT_ROOT_REQUEST}" ]]; then
     requested="${OUTPUT_ROOT_REQUEST}"
+  elif [[ -n "${IGRLAB_OUTPUT_ROOT:-}" ]]; then
+    requested="${IGRLAB_OUTPUT_ROOT}"
   elif [[ -n "${DG_IGR_OUTPUT_ROOT:-}" ]]; then
     requested="${DG_IGR_OUTPUT_ROOT}"
   else
-    requested="${XDG_CACHE_HOME:-${HOME}/.cache}/dg-igr-build"
+    requested="${XDG_CACHE_HOME:-${HOME}/.cache}/igrlab-build"
   fi
   OUTPUT_ROOT="$(canonicalize_external_path "${requested}")"
   WORKTREE_ID="wt-$(printf '%s' "${SCRIPT_DIR}" | sha256sum | cut -c1-16)"
@@ -959,7 +991,7 @@ preflight_temp_root() {
   export TMP="${TEMP_ROOT}"
 
   probe_dir="$(mktemp -d -- \
-    "${TEMP_ROOT}/dg-igr-build-temp-preflight.XXXXXXXX")" || {
+    "${TEMP_ROOT}/igrlab-build-temp-preflight.XXXXXXXX")" || {
     echo "ERROR: selected temporary root cannot create a unique directory: ${TEMP_ROOT}" >&2
     exit 3
   }
@@ -2419,19 +2451,19 @@ if [[ "${MODE}" == "gpu" && -n "${CUDA_ARCHS+x}" ]]; then
   exit 2
 fi
 
-CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
+CMAKE_BUILD_TYPE="${IGRLAB_BUILD_TYPE:-${CMAKE_BUILD_TYPE:-Release}}"
 if [[ "${MODE}" == "gpu" ]]; then
   PROFILE="cuda-sm${SPACK_CUDA_ARCH}"
   DEPENDENCY_CUDA_ARCH="${SPACK_CUDA_ARCH}"
-  SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/${PROFILE}}"
+  SPACK_ENV="${IGRLAB_SPACK_ENV:-${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/${PROFILE}}}"
   MFEM_BUILD_NAME="build-gpu-sm${SPACK_CUDA_ARCH}"
   MFEM_INSTALL_NAME="install-gpu-sm${SPACK_CUDA_ARCH}"
   EXPECTED_MFEM_CUDA_ARCHS="${SPACK_CUDA_ARCH}"
   if [[ "${SPACK_CUDA_ARCH}" == "120" ]]; then
     EXPECTED_MFEM_CUDA_ARCHS="80-virtual"
   fi
-  MFEM_CUDA_ARCHS="${MFEM_CUDA_ARCHS:-${EXPECTED_MFEM_CUDA_ARCHS}}"
-  APP_CUDA_ARCHS="${APP_CUDA_ARCHS:-${SPACK_CUDA_ARCH}}"
+  MFEM_CUDA_ARCHS="${IGRLAB_MFEM_CUDA_ARCHS:-${MFEM_CUDA_ARCHS:-${EXPECTED_MFEM_CUDA_ARCHS}}}"
+  APP_CUDA_ARCHS="${IGRLAB_APP_CUDA_ARCHS:-${APP_CUDA_ARCHS:-${SPACK_CUDA_ARCH}}}"
 
   if [[ "${MFEM_CUDA_ARCHS}" != "${EXPECTED_MFEM_CUDA_ARCHS}" ]]; then
     echo "ERROR: CUDA profile ${SPACK_CUDA_ARCH} requires MFEM_CUDA_ARCHS=${EXPECTED_MFEM_CUDA_ARCHS}." >&2
@@ -2449,12 +2481,12 @@ else
   DEPENDENCY_CUDA_ARCH="none"
   if ((CALIPER)); then
     PROFILE="cpu-caliper"
-    SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu-caliper}"
+    SPACK_ENV="${IGRLAB_SPACK_ENV:-${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu-caliper}}"
     MFEM_BUILD_NAME="build-cpu-caliper"
     MFEM_INSTALL_NAME="install-cpu-caliper"
   else
     PROFILE="cpu"
-    SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu}"
+    SPACK_ENV="${IGRLAB_SPACK_ENV:-${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu}}"
     MFEM_BUILD_NAME="build-cpu"
     MFEM_INSTALL_NAME="install-cpu"
   fi
@@ -2495,7 +2527,7 @@ echo "[build-plan] mode=${MODE} profile=${PROFILE} dependency_cuda_arch=${DEPEND
 echo "[build-plan] output_root=${OUTPUT_ROOT} worktree_id=${WORKTREE_ID} scope=${OUTPUT_SCOPE}"
 echo "[build-plan] env=${SPACK_ENV} app_build=${APP_BUILD} app_install=${APP_INSTALL}"
 echo "[build-plan] temp_root=${TEMP_ROOT} temp_source=${TEMP_ROOT_SOURCE} temp_env=TMPDIR,TEMP,TMP"
-echo "[build-plan] hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT} nvtx_profile=${NVTX_PROFILE}"
+echo "[build-plan] hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT} nvtx_profile=${NVTX_PROFILE} research_tests=${BUILD_RESEARCH_TESTS}"
 echo "[build-plan] mfem_source=${MFEM_SOURCE_ROOT} mfem_build=${MFEM_BUILD} mfem_install=${MFEM_INSTALL} mfem_tuple_state=${MFEM_TUPLE_STATE} mfem_reuse_state=${MFEM_REUSE_STATE}"
 if [[ "${MFEM_FRESH_FROM_SEED}" == "1" ]]; then
   echo "[build-plan] mfem_route=external-fresh-from-seed seed=${MFEM_FRESH_SEED_ROOT} target=${MFEM_FRESH_TARGET_ROOT}"
@@ -2570,8 +2602,10 @@ else
     revalidate_scoped_output_layout
     rm -rf "${MFEM_BUILD}" "${MFEM_INSTALL}"
   fi
-  DG_IGR_BUILD_HELPER_CALLER="${SCRIPT_DIR}/build.sh" \
-    DG_IGR_SPACK_ENV="${SPACK_ENV}" CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+  IGRLAB_BUILD_HELPER_CALLER="${SCRIPT_DIR}/build.sh" \
+    DG_IGR_BUILD_HELPER_CALLER="${SCRIPT_DIR}/build.sh" \
+    IGRLAB_SPACK_ENV="${SPACK_ENV}" DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+    CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
     MFEM_SRC="${MFEM_SOURCE_ROOT}" MFEM_BUILD="${MFEM_BUILD}" \
     MFEM_INSTALL="${MFEM_INSTALL}" \
     "${SCRIPT_DIR}/build_mfem_tpl.sh" "${mfem_args[@]}"
@@ -2607,6 +2641,7 @@ app_cmake_args=(
   -DDG_IGR_ENABLE_HDG_EULER_EXPERIMENT="${HDG_EULER_EXPERIMENT}"
   -DDG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT="${HDG_EULER_DEVICE_EXPERIMENT}"
   -DDG_IGR_ENABLE_HDG_RUNTIME="${HDG_RUNTIME}"
+  -DIGRLAB_BUILD_RESEARCH_TESTS="${BUILD_RESEARCH_TESTS}"
   -DDG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT="${HDG_AUXILIARY_EXPERIMENT}"
   -DDG_IGR_ENABLE_OBSERVABILITY="${APP_OBSERVABILITY}"
   -DDG_IGR_OBSERVABILITY_USE_NVTX="${APP_OBSERVABILITY_NVTX}"
@@ -2625,7 +2660,7 @@ if [[ "${MODE}" == "gpu" ]]; then
   app_cmake_args+=(
     -DDG_IGR_REQUIRE_MFEM_CUDA=ON
     -DDG_IGR_EXPECT_CUDA_ARCH="${SPACK_CUDA_ARCH}"
-    -DDG_IGR_ACCELERATOR_KERNEL_SOURCES="${DG_IGR_ACCELERATOR_KERNEL_SOURCES:-}"
+    -DDG_IGR_ACCELERATOR_KERNEL_SOURCES="${IGRLAB_ACCELERATOR_KERNEL_SOURCES:-${DG_IGR_ACCELERATOR_KERNEL_SOURCES:-}}"
     -DCMAKE_CUDA_COMPILER="${CUDA_PREFIX}/bin/nvcc"
     -DCMAKE_CUDA_ARCHITECTURES="${APP_CUDA_ARCHS}"
     -DCUDAToolkit_ROOT="${CUDA_PREFIX}"

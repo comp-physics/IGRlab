@@ -21,7 +21,7 @@ function(_dg_igr_hdg_registration_anchor target extension language output_var)
   set(_dg_igr_hdg_anchor
       "${CMAKE_CURRENT_BINARY_DIR}/${target}_registration_anchor.${extension}")
   file(GENERATE OUTPUT "${_dg_igr_hdg_anchor}" CONTENT
-       "namespace dg_igr::hdg::registration { int ${_dg_igr_hdg_identifier}_anchor = 0; }\n")
+       "namespace igrlab::hdg::registration { int ${_dg_igr_hdg_identifier}_anchor = 0; }\n")
   set_source_files_properties("${_dg_igr_hdg_anchor}"
                               PROPERTIES GENERATED TRUE LANGUAGE "${language}")
   set(${output_var} "${_dg_igr_hdg_anchor}" PARENT_SCOPE)

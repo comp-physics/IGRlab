@@ -1,4 +1,6 @@
 #pragma once
+
+#include "igrlab/compat.hpp"
 #include "../src/physics/igr/IGR_face_density_cuda.hpp"
 #include <cmath>
 #include <iostream>
@@ -26,7 +28,7 @@ inline void TestFaceDensityCUDA(mfem::ParMesh& mesh)
     for (int e = 0; e < fes.GetNE(); ++e) alpha(e) = .003 * (1.0 + .09 * e);
     const auto& ir = mfem::IntRules.Get(mfem::Geometry::SEGMENT, 2 * p);
     mfem::FaceQuadratureSpace fqs(mesh, ir, mfem::FaceType::Interior);
-    dg_igr::igr_internal::FaceDensityCUDAProjectionCache cache;
+    igrlab::igr_internal::FaceDensityCUDAProjectionCache cache;
     for (bool cached : {false, true})
     for (bool local : {false, true})
       for (int change = 0; change < 2; ++change)
@@ -41,11 +43,11 @@ inline void TestFaceDensityCUDA(mfem::ParMesh& mesh)
           mfem::forall(alpha.Size(), [=] MFEM_HOST_DEVICE (int i) { current_alpha[i] *= 1.11; });
         }
         constexpr double floor = .1, scalar_alpha = .007;
-        mfem::Vector uncached_actual; dg_igr::dg_face::InteriorFaceSideDensityProjectionScratch uncached_scratch;
+        mfem::Vector uncached_actual; igrlab::dg_face::InteriorFaceSideDensityProjectionScratch uncached_scratch;
         auto& actual = cached ? cache.side_q : uncached_actual;
         auto& scratch = cached ? cache.work : uncached_scratch;
         const auto& active_fqs = cached ? cache.Prepare(fes, sfes, ir) : fqs;
-        const auto info = dg_igr::igr_internal::ProjectInteriorFaceDensityCoefficientCUDA(
+        const auto info = igrlab::igr_internal::ProjectInteriorFaceDensityCoefficientCUDA(
           fes, active_fqs, state, scalar_alpha, local ? &alpha : nullptr, floor, actual, scratch,
           cached ? &cache.info : nullptr);
         // Independent host finite-element evaluation is solely a test oracle.
@@ -106,7 +108,7 @@ inline void TestFaceDensityCUDA(mfem::ParMesh& mesh)
                 "Face cache did not preserve its owned quadrature rule.");
     // Consume the rebuilt pack after the input rule has been destroyed.
     // This checks numerical reuse after invalidation, in addition to counters.
-    dg_igr::igr_internal::ProjectInteriorFaceDensityCoefficientCUDA(
+    igrlab::igr_internal::ProjectInteriorFaceDensityCoefficientCUDA(
       fes, *cache.fqs, state, .007, &alpha, .1, cache.side_q, cache.work, &cache.info);
     const double* rebuilt = cache.side_q.HostRead();
     const double* alpha_host = alpha.HostRead();

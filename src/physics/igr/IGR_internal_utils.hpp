@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 #include "utils/config/env_flags.hpp"
 
 #include <algorithm>
@@ -7,7 +9,7 @@
 #include <cstdlib>
 #include <iostream>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace igr_internal
 {
@@ -37,7 +39,7 @@ inline double IPDGPenalty(const mfem::FiniteElementSpace& fes,
 {
   const int p = SpaceOrder(fes);
   double scale = 1.0;
-  if (const char* raw = std::getenv("DG_IGR_IGR_IPDG_PENALTY_SCALE"))
+  if (const char* raw = igrlab::GetEnv("DG_IGR_IGR_IPDG_PENALTY_SCALE"))
   {
     char* end = nullptr;
     scale = std::strtod(raw, &end);
@@ -134,7 +136,7 @@ inline bool PreconditionerRequiresAssembledMatrix(IGRSolver::PrecondType pc)
 
 inline bool StrictFiniteScanEnabled()
 {
-  return ::dg_igr::EnvFlagEnabled("DG_IGR_STRICT_FINITE_SCAN");
+  return ::igrlab::EnvFlagEnabled("DG_IGR_STRICT_FINITE_SCAN");
 }
 
 inline bool VectorIsFiniteHostScan(const mfem::Vector& v)
@@ -212,4 +214,4 @@ inline void LogIGRSelection(bool warm_start,
 }
 
 } // namespace igr_internal
-} // namespace dg_igr
+} // namespace igrlab

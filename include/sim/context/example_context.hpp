@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 /**
  * @file sim/context/example_context.hpp
  * @brief Mesh + DG space context used by sim-layer examples.
@@ -71,7 +73,7 @@ private:
     if (lower == "l2" || lower == "dg" || lower == "brokendg" ||
         lower == "brokenl2")
     {
-      const char* basis = std::getenv("DG_IGR_IGR_SIGMA_BASIS");
+      const char* basis = igrlab::GetEnv("DG_IGR_IGR_SIGMA_BASIS");
       if (basis && basis[0])
       {
         MFEM_VERIFY(std::string(basis) == "lgl",

@@ -2,15 +2,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-[[ "${DG_IGR_BUILD_HELPER_CALLER:-}" == "${SCRIPT_DIR}/build.sh" ]] || {
+[[ "${IGRLAB_BUILD_HELPER_CALLER:-${DG_IGR_BUILD_HELPER_CALLER:-}}" == "${SCRIPT_DIR}/build.sh" ]] || {
   echo "ERROR: build_mfem_tpl.sh is a private helper; invoke build.sh instead." >&2
   exit 2
 }
 MODE="cpu"
-JOBS="${NPROC:-4}"
+JOBS="${IGRLAB_BUILD_JOBS:-${NPROC:-4}}"
 CLEAN=0
 CALIPER=0
-SPACK_CUDA_ARCH="${SPACK_CUDA_ARCH:-120}"
+SPACK_CUDA_ARCH="${IGRLAB_CUDA_ARCH:-${SPACK_CUDA_ARCH:-120}}"
 CUDA_ARCH_WAS_SET=0
 CUDA_CODEGEN=""
 CUDA_CODEGEN_WAS_SET=0
@@ -18,13 +18,14 @@ PRINT_PLAN=0
 
 usage() {
   cat <<'EOF'
+IGRlab private MFEM helper; invoke build.sh
 Usage: ./build_mfem_tpl.sh [--cpu-only | --gpu] [options]
 
 Options:
   --cpu-only        Build MPI-enabled MFEM without CUDA (default).
   --gpu             Build MPI/CUDA-enabled MFEM.
   --caliper         Build CPU-only MFEM with Caliper support.
-  -j, --jobs N      Parallel build jobs (default: NPROC or 4).
+  -j, --jobs N      Parallel build jobs (default: IGRLAB_BUILD_JOBS, NPROC or 4).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
   --cuda-codegen A  MFEM CUDA code-generation architecture.
   --print-plan      Validate and print the resolved MFEM policy, then exit.
@@ -32,9 +33,10 @@ Options:
   --no-clean        Required internal helper mode from build.sh.
   -h, --help        Show this help.
 
-Environment overrides:
-  DG_IGR_SPACK_ENV, MFEM_SRC, MFEM_BUILD, MFEM_INSTALL, CMAKE_BUILD_TYPE,
-  SPACK_CUDA_ARCH
+Environment forwarded by build.sh:
+  IGRLAB_SPACK_ENV (legacy: DG_IGR_SPACK_ENV), MFEM_SRC, MFEM_BUILD, MFEM_INSTALL,
+  IGRLAB_BUILD_TYPE (legacy: CMAKE_BUILD_TYPE),
+  IGRLAB_CUDA_ARCH (legacy: SPACK_CUDA_ARCH), IGRLAB_BUILD_JOBS (legacy: NPROC)
 
 CUDA_ARCHS is intentionally rejected in GPU mode. The canonical build driver
 passes MFEM's code-generation architecture explicitly with --cuda-codegen.
@@ -105,7 +107,7 @@ fi
 MFEM_SRC="${MFEM_SRC:?private helper requires MFEM_SRC from build.sh}"
 MFEM_BUILD="${MFEM_BUILD:?private helper requires MFEM_BUILD from build.sh}"
 MFEM_INSTALL="${MFEM_INSTALL:?private helper requires MFEM_INSTALL from build.sh}"
-SPACK_ENV="${DG_IGR_SPACK_ENV:?private helper requires DG_IGR_SPACK_ENV from build.sh}"
+SPACK_ENV="${IGRLAB_SPACK_ENV:-${DG_IGR_SPACK_ENV:?private helper requires IGRLAB_SPACK_ENV or DG_IGR_SPACK_ENV from build.sh}}"
 MFEM_SRC_CANON="$(realpath -m -- "${MFEM_SRC}")" || {
   echo "ERROR: private MFEM helper cannot canonicalize MFEM_SRC." >&2
   exit 2
@@ -130,7 +132,7 @@ case "${MFEM_INSTALL_CANON}" in
     exit 2
     ;;
 esac
-CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
+CMAKE_BUILD_TYPE="${IGRLAB_BUILD_TYPE:-${CMAKE_BUILD_TYPE:-Release}}"
 
 if [[ "${MODE}" == "gpu" ]]; then
   PROFILE="cuda-sm${SPACK_CUDA_ARCH}"

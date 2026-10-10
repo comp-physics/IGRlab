@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 // Bounded test-only frozen-operator export. Uses production physics and faces;
 // no application recording or replay interface is introduced.
 #include "mfem.hpp"
@@ -143,10 +144,10 @@ int main(int argc,char** argv)
     }
   }
   if(input.is_open()){std::string extra;MFEM_VERIFY(!(input>>extra),"Unexpected trailing nodal input.");}
-  dg_igr::IGRSolver igr(sfes,ufes,2,4,c_alpha);
-  igr.SetAlphaLengthScalePolicy(dg_igr::IGRAlphaLengthScalePolicy::Local);
-  igr.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);igr.SetExactDGFaceOperator(true);
-  igr.SetSolveMode(dg_igr::IGRSolveMode::SmootherSweeps);igr.SetSweeps(0,0);
+  igrlab::IGRSolver igr(sfes,ufes,2,4,c_alpha);
+  igr.SetAlphaLengthScalePolicy(igrlab::IGRAlphaLengthScalePolicy::Local);
+  igr.SetGradBackend(igrlab::IGRGradBackend::BrokenDG);igr.SetExactDGFaceOperator(true);
+  igr.SetSolveMode(igrlab::IGRSolveMode::SmootherSweeps);igr.SetSweeps(0,0);
   const auto form_start=Clock::now();igr.UpdateFromState(state,false);double form_s=Seconds(form_start);
   const auto* op=igr.GetLinearOperator();
   MFEM_VERIFY(op && op->Height()==n && igr.GetLastExactFaceEffective(),"Production face operator unavailable.");

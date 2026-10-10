@@ -1,5 +1,27 @@
-# dg_igr_miniapp
-Repository for experimenting with IGR in a DG context using MFEM as a backend
+# IGRlab
+
+IGRlab develops Euler and information-geometric regularization methods with
+MFEM, retaining DG, DGSEM, and HDG implementations on CPU and GPU.
+
+| Backend | CPU / ordinary GPU | Specialized tensor implementation |
+|---|---|---|
+| DG | Shared application and MFEM device kernels | TF32 WMMA in the shared IGR screened-patch solve |
+| DGSEM | Reference and packed CPU/CUDA operators | Explicit FP64 WMMA fused CUDA residual |
+| HDG | Generic CPU and ordinary CUDA engines | FP64 WMMA volume/condensation, with optional arithmetic variants |
+
+Support depends on dimension, element geometry, polynomial order, numerical
+policy, and device architecture. Existing admission checks enforce these
+limits. The HDG generic application currently admits conforming two-dimensional
+quadrilateral meshes with orders p1-p3. See [A100 support](docs/a100.md) for the
+SM80 build requirements and the scope of recorded hardware validation.
+
+The C++ application namespace is `igrlab`; `dg_igr` remains a source alias.
+`IGRlab::core` names the existing library target. Canonical configuration and
+runtime environment names use `IGRLAB_*`; legacy `DG_IGR_*` names, existing
+executable/CTest names, and checkpoint formats remain supported during this
+migration. Canonical runtime environment values take precedence, including an explicitly
+empty value. [Consolidation records](docs/consolidation/README.md) describe the
+recovery archive, retained features, validation, and proposed final cleanup.
 
 ## Building
 
@@ -22,9 +44,9 @@ Then use the unified build driver:
 ```
 
 Application and locally built MFEM outputs live outside the checkout. By default they are scoped under
-`${XDG_CACHE_HOME:-$HOME/.cache}/dg-igr-build` by canonical worktree and
+`${XDG_CACHE_HOME:-$HOME/.cache}/igrlab-build` by canonical worktree and
 profile; choose another external location with `--output-root DIR` or
-`DG_IGR_OUTPUT_ROOT`. A selected output root must be outside every detected Git
+`IGRLAB_OUTPUT_ROOT`. A selected output root must be outside every detected Git
 checkout.
 
 ```bash
@@ -41,7 +63,7 @@ Spack environments live under `spack-envs/`. The CUDA profiles are
 `cuda-sm120` (Blackwell, CUDA 13 and HYPRE `develop`) and `cuda-sm80`
 (A100, CUDA 12.9.1, HYPRE 2.32.0 and Umpire 2024.07.0). The A100 manifest
 uses static HYPRE with CUDA/Umpire, as supported by older site Spack recipes. It is a portable template: configure site compilers and
-CUDA/MPI externals in a site environment selected with `DG_IGR_SPACK_ENV`,
+CUDA/MPI externals in a site environment selected with `IGRLAB_SPACK_ENV`,
 then concretize/install through the driver. For a shared x86 CPU build and
 A100 GPU allocation, constrain the site environment to a CPU target supported
 by both nodes (for example `target=x86_64_v3`), rather than the build node
@@ -79,6 +101,12 @@ cleanup, or a build.
 Both commands install dependencies, rebuild MFEM, build and install the app,
 and run CTest. Useful controls include `--no-deps`, `--no-clean`, `--no-tests`,
 and `--smoke`. Run `./build.sh --help` for the full interface.
+
+Standalone numerical campaign probes are excluded from ordinary builds.
+Enable them explicitly with `IGRLAB_BUILD_RESEARCH_TESTS=ON ./build.sh ...`.
+Direct operator, conservation, damping, source-oracle, and tensor-parity checks
+remain available in ordinary correctness-test builds. Existing caches can be
+selected with `--output-root`; the default cache root is now `igrlab-build`.
 
 ## Modal damping (M16)
 

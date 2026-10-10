@@ -1,4 +1,6 @@
 #pragma once
+
+#include "igrlab/compat.hpp"
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -6,7 +8,7 @@
 #include "mfem.hpp"
 #include "../../numerics/dg/DGFaceQuadratureKernels.hpp"
 
-namespace dg_igr
+namespace igrlab
 {
 namespace igr_internal
 {

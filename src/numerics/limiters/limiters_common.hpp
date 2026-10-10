@@ -1,12 +1,14 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <utility>
 #include <vector>
 #include "mfem.hpp"
 
-namespace mfem::dg_igr::limiters_detail
+namespace mfem::igrlab::limiters_detail
 {
 
 // Make POD for mfem::Array<T>

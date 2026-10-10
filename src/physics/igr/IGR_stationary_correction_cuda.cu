@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "IGR_stationary_correction.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -5,7 +6,7 @@
 #include <iostream>
 #include <type_traits>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace igr_internal
 {

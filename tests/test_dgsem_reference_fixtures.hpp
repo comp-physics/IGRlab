@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 #include "numerics/dgsem/dgsem_basis.hpp"
 #include "numerics/dgsem/dgsem_flux.hpp"
 #include "numerics/dgsem/dgsem_reference.hpp"
@@ -87,7 +89,7 @@ inline void RunDGSEMDeterministicFluxFixtures(TestContext& ctx)
                     std::to_string(eq));
   }
 
-  const char* output_dir = std::getenv("DG_IGR_DGSEM_REFERENCE_OUTPUT_DIR");
+  const char* output_dir = igrlab::GetEnv("DG_IGR_DGSEM_REFERENCE_OUTPUT_DIR");
   if (output_dir && mfem::Mpi::Root())
   {
     std::error_code ec;
@@ -109,4 +111,4 @@ inline void RunDGSEMDeterministicFluxFixtures(TestContext& ctx)
   }
 }
 
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 /**
  * @file numerics/hdg/runtime/cuda/persistent_smooth_euler_types.cuh
  * @brief CUDA-qualified values for bounded W8A smoke/functional paths.
@@ -2325,7 +2327,7 @@ inline bool CudaResearchVolumeUsesReducedPrecision(
     const bool borrowed_tensor_volume) noexcept
 {
   if (!borrowed_tensor_volume) return false;
-  const char* const value = std::getenv("DG_IGR_HDG_VOLUME_ARITHMETIC");
+  const char* const value = igrlab::GetEnv("DG_IGR_HDG_VOLUME_ARITHMETIC");
   if (value == nullptr) return false;
   const std::string_view arithmetic(value);
   return arithmetic == "simt-fp32" || arithmetic == "tf32" ||
@@ -2336,7 +2338,7 @@ inline bool CudaResearchVolumeUsesSimt(
     const bool borrowed_tensor_volume) noexcept
 {
   if (!borrowed_tensor_volume) return false;
-  const char* const value = std::getenv("DG_IGR_HDG_VOLUME_ARITHMETIC");
+  const char* const value = igrlab::GetEnv("DG_IGR_HDG_VOLUME_ARITHMETIC");
   if (value == nullptr) return false;
   const std::string_view arithmetic(value);
   return arithmetic == "simt-fp64" || arithmetic == "simt-fp32";

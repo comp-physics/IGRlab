@@ -3,6 +3,8 @@
 // `DGHyperbolicConservationLaws.cpp` after MFEM/CUDA/HIP backend headers.
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 namespace
 {
 
@@ -166,7 +168,7 @@ MFEM_HOST_DEVICE inline void AddSigmaDotNTerms_(const real_t* state,
                                                  real_t rho_floor,
                                                  real_t* flux_dot_n)
 {
-  ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFlux(dim,
+  ::igrlab::frozen_scalar_igr_algebra::AddNormalSigmaFlux(dim,
                                                           state,
                                                           1,
                                                           normal,
@@ -403,7 +405,7 @@ struct PackedWeakDivEulerKernel
               flux_md += pressure;
               if (use_sigma)
               {
-                flux_md += ::dg_igr::frozen_scalar_igr_algebra::
+                flux_md += ::igrlab::frozen_scalar_igr_algebra::
                   TensorSigmaMomentumDiagonalTerm(sigma_j);
               }
             }
@@ -419,7 +421,7 @@ struct PackedWeakDivEulerKernel
           real_t flux_ed = mom[d] * H;
           if (use_sigma)
           {
-            flux_ed += ::dg_igr::frozen_scalar_igr_algebra::
+            flux_ed += ::igrlab::frozen_scalar_igr_algebra::
               TensorSigmaEnergyTermFromInverseDensity(
                 sigma_j, mom[d], inv_rho_sigma);
           }

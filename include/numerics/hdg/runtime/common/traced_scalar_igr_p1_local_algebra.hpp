@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /** Fixed-size host/device algebra for one affine-Q1 traced scalar-IGR element. */
 
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
@@ -171,9 +173,9 @@ MFEM_HOST_DEVICE inline bool EulerSigma(const double* u, const double sigma,
     jacobian[3 * 5 + column] = ((column == 3 ? 1. : 0.) + dp[column]) * un +
       (energy + pressure) * dun[column];
   }
-  ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFlux(
+  ::igrlab::frozen_scalar_igr_algebra::AddNormalSigmaFlux(
     2, u, 1, normal, 1, sigma, parameters.density_floor, flux, 1);
-  ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFluxJacobian(
+  ::igrlab::frozen_scalar_igr_algebra::AddNormalSigmaFluxJacobian(
     2, u, 1, normal, 1, sigma, parameters.density_floor, jacobian, 5, 1);
   // Sigma is a mixed unknown, while the reused frozen helper differentiates U only.
   jacobian[1 * 5 + 4] = normal[0];

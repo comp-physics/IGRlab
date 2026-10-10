@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "DGHyperbolicConservationLaws_impl.hpp"
 
 namespace mfem
@@ -363,7 +364,7 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
               flux_md += pressure;
               if (use_sigma)
               {
-                flux_md += ::dg_igr::frozen_scalar_igr_algebra::
+                flux_md += ::igrlab::frozen_scalar_igr_algebra::
                   TensorSigmaMomentumDiagonalTerm(sigma_j);
               }
             }
@@ -378,7 +379,7 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergenceDeviceEuler_(
           real_t flux_ed = mom[d] * H;
           if (use_sigma)
           {
-            flux_ed += ::dg_igr::frozen_scalar_igr_algebra::
+            flux_ed += ::igrlab::frozen_scalar_igr_algebra::
               TensorSigmaEnergyTermFromInverseDensity(
                 sigma_j, mom[d], inv_rho_sigma);
           }
@@ -439,7 +440,7 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
     const ParGridFunction* sigma_field = nullptr;
     real_t sigma_rho_floor = 1.0e-12;
     real_t invariant_domain_pressure_floor =
-      dg_igr::LimiterDefaults::kPMin;
+      igrlab::LimiterDefaults::kPMin;
     if (flux_igr && flux_igr->GetSigmaField())
     {
       sigma_field = flux_igr->GetSigmaField();
@@ -516,7 +517,7 @@ real_t DGHyperbolicConservationLaws::AddPreassembledWeakDivergence_(
       state, transformation, flux);
     const real_t sigma = host_flux_igr->GetSigmaAtPoint(transformation);
     const real_t rho_floor = host_flux_igr->GetVelocityRhoFloor();
-    ::dg_igr::frozen_scalar_igr_algebra::AddTensorSigmaFlux(
+    ::igrlab::frozen_scalar_igr_algebra::AddTensorSigmaFlux(
       dim,
       state.GetData(),
       1,

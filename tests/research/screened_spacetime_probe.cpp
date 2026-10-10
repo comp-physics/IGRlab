@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 // Test-only screen-aware space-time Schwarz experiment. This is a reduced
 // pseudo-1D full-energy Euler/instantaneous-IGR discretization, not a new app.
 // It uses the production LGL basis, MFEM Euler flux and shared IGR point algebra.
@@ -29,7 +30,7 @@ namespace
 using State = std::vector<double>;
 using Stages = std::array<State, 2>;
 using Clock = std::chrono::steady_clock;
-namespace igr = dg_igr::frozen_scalar_igr_algebra;
+namespace igr = igrlab::frozen_scalar_igr_algebra;
 constexpr double gamma_euler = 1.4;
 constexpr double floor_value = 1.e-12;
 const double q[2][2] = {{.25, .25-std::sqrt(3.)/6.},

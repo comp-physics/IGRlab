@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 // Frozen-operator research probe. Host timings describe this probe, not GPU
 // performance. Production IGR forms/coefficients/faces remain authoritative.
 #include "mfem.hpp"
@@ -279,12 +280,12 @@ int main(int argc, char** argv)
     }
   }
 
-  dg_igr::IGRSolver igr(sigma_space, state_space, 2, 4, alpha);
-  igr.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
+  igrlab::IGRSolver igr(sigma_space, state_space, 2, 4, alpha);
+  igr.SetGradBackend(igrlab::IGRGradBackend::BrokenDG);
   igr.SetExactDGFaceOperator(true);
   // Materialize A and b via the existing lifecycle; do not use this zero-sweep
   // iterate as a solution or as the FP64 reference.
-  igr.SetSolveMode(dg_igr::IGRSolveMode::SmootherSweeps);
+  igr.SetSolveMode(igrlab::IGRSolveMode::SmootherSweeps);
   igr.SetSweeps(0, 0);
   const auto assembly_start = Clock::now();
   igr.UpdateFromState(state, false);

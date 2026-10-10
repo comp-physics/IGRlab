@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file numerics/dgsem/dgsem_volume_flux.hpp
  * @brief Symmetric two-point volume flux helpers for DGSEM.
@@ -65,7 +67,7 @@ EulerDirectionalLaxFriedrichsScale(const Vector& state,
                                    double gamma,
                                    double sigma = 0.0,
                                    double density_floor =
-                                     dg_igr::LimiterDefaults::kRhoMin)
+                                     igrlab::LimiterDefaults::kRhoMin)
 {
   MFEM_VERIFY(
     state.Size() == dim + 2,
@@ -92,7 +94,7 @@ EulerDirectionalLaxFriedrichsScale(const Vector& state,
   const double pressure = (gamma - 1.0) * (rhoE - kinetic);
   const double a_norm = std::sqrt(std::max(a2, 0.0));
   const double acoustic_numerator =
-    ::dg_igr::frozen_scalar_igr_algebra::
+    ::igrlab::frozen_scalar_igr_algebra::
       FrozenSigmaLocalHyperbolicityMargin(pressure, sigma, gamma);
   // The absolute-value branch is finite solely so a rejected non-hyperbolic
   // stage can unwind. Production admission separately requires q_sigma > 0.

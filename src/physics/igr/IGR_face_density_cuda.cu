@@ -1,7 +1,8 @@
+#include "igrlab/compat.hpp"
 #include "IGR_face_density_cuda.hpp"
 #include <cuda_runtime.h>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace igr_internal
 {

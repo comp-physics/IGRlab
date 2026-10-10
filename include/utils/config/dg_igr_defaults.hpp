@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file utils/config/dg_igr_defaults.hpp
  * @brief Named defaults and config scaffolding for the dg_igr miniapp.
@@ -8,7 +10,7 @@
 
 namespace mfem
 {
-namespace dg_igr
+namespace igrlab
 {
 
 struct EulerDefaults
@@ -48,5 +50,5 @@ struct RK3Defaults
   static constexpr long kLimiterSteps = -1;
 };
 
-} // namespace dg_igr
+} // namespace igrlab
 } // namespace mfem

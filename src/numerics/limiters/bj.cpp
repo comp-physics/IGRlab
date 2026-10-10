@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "numerics/limiters/bj.hpp"
 
 #include "limiters_common.hpp"
@@ -163,8 +164,8 @@ void ApplyCharacteristicBJLimiter(ParFiniteElementSpace& vfes,
   const int qord_slope =
     (opt.slope_qord > 0) ? opt.slope_qord : (2 * order + 2);
 
-  Array<dg_igr::limiters_detail::Nbr4> nbr;
-  dg_igr::limiters_detail::Build4Nbrs(mesh, nbr);
+  Array<igrlab::limiters_detail::Nbr4> nbr;
+  igrlab::limiters_detail::Build4Nbrs(mesh, nbr);
 
   // Precompute means and "sizes"
   std::vector<Vector> Ubar_all(NE, Vector(num_eq));
@@ -183,14 +184,14 @@ void ApplyCharacteristicBJLimiter(ParFiniteElementSpace& vfes,
       vfes.GetElementVDofs(i, vdofs);
       U.GetSubVector(vdofs, elvec);
       elmat.UseExternalData(elvec.GetData(), dof, num_eq);
-      dg_igr::limiters_detail::ElementAverage(*fe,
+      igrlab::limiters_detail::ElementAverage(*fe,
                                               *Tr,
                                               elmat,
                                               num_eq,
                                               qord_avg,
                                               Ubar);
       Ubar_all[i] = Ubar;
-      dxy_all[i] = dg_igr::limiters_detail::ElementDXDYFromArea(*Tr, qord_avg);
+      dxy_all[i] = igrlab::limiters_detail::ElementDXDYFromArea(*Tr, qord_avg);
     }
   }
 
@@ -217,7 +218,7 @@ void ApplyCharacteristicBJLimiter(ParFiniteElementSpace& vfes,
 
     // Candidate DG slopes from ∫ grad phi_j
     double area = 0.0;
-    dg_igr::limiters_detail::SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
+    igrlab::limiters_detail::SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
     Vector sDGx(num_eq);
     sDGx = 0.0;
     Vector sDGy(num_eq);
@@ -345,7 +346,7 @@ void ApplyCharacteristicBJLimiter(ParFiniteElementSpace& vfes,
     Vector Xc(3);
     Tr->Transform(ipc, Xc);
     Array2D<double> dof_xy;
-    dg_igr::limiters_detail::ElementDofXY(*fe, *Tr, dof_xy);
+    igrlab::limiters_detail::ElementDofXY(*fe, *Tr, dof_xy);
 
     Vector rowv(num_eq);
     for (int j = 0; j < dof; ++j)
@@ -413,7 +414,7 @@ void ApplyFaceNormalCharacteristicBJLimiter(ParFiniteElementSpace& vfes,
     DenseMatrix elmat;
     elmat.UseExternalData(elvec.GetData(), fe->GetDof(), num_eq);
     Vector Ubar(num_eq);
-    dg_igr::limiters_detail::ElementAverage(*fe,
+    igrlab::limiters_detail::ElementAverage(*fe,
                                             *Tr,
                                             elmat,
                                             num_eq,
@@ -448,7 +449,7 @@ void ApplyFaceNormalCharacteristicBJLimiter(ParFiniteElementSpace& vfes,
     const Vector& Xci = Xc_all[i];
 
     // Candidate average slopes via ∫ grad phi_j / area
-    dg_igr::limiters_detail::SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
+    igrlab::limiters_detail::SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
     Vector sDGx(num_eq);
     sDGx = 0.0;
     Vector sDGy(num_eq);
@@ -548,7 +549,7 @@ void ApplyFaceNormalCharacteristicBJLimiter(ParFiniteElementSpace& vfes,
 
       // Reconstruct: U_j = Ubar + sDGx*dx + sDGy*dy at DOF points
       Array2D<double> xy;
-      dg_igr::limiters_detail::ElementDofXY(*fe, *Tr, xy);
+      igrlab::limiters_detail::ElementDofXY(*fe, *Tr, xy);
       for (int j = 0; j < dof; ++j)
       {
         const double dxj = xy(0, j) - Xci(0);
@@ -590,8 +591,8 @@ void ApplyBarthJespersenLimiter(ParFiniteElementSpace& vfes,
     (opt.slope_qord > 0) ? opt.slope_qord : (2 * order + 2);
 
   // neighbor map and working arrays
-  Array<dg_igr::limiters_detail::Nbr4> nbr;
-  dg_igr::limiters_detail::Build4Nbrs(mesh, nbr);
+  Array<igrlab::limiters_detail::Nbr4> nbr;
+  igrlab::limiters_detail::Build4Nbrs(mesh, nbr);
 
   Array<int> vdofs;
   Vector elvec;
@@ -610,7 +611,7 @@ void ApplyBarthJespersenLimiter(ParFiniteElementSpace& vfes,
     vfes.GetElementVDofs(i, vdofs);
     U.GetSubVector(vdofs, elvec);
     elmat.UseExternalData(elvec.GetData(), dof, num_eq);
-    dg_igr::limiters_detail::ElementAverage(*fe,
+    igrlab::limiters_detail::ElementAverage(*fe,
                                             *Tr,
                                             elmat,
                                             num_eq,
@@ -653,7 +654,7 @@ void ApplyBarthJespersenLimiter(ParFiniteElementSpace& vfes,
 
     // Slope weights and candidate slopes
     double area = 0.0;
-    dg_igr::limiters_detail::SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
+    igrlab::limiters_detail::SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
     Vector sx(num_eq);
     sx = 0.0;
     Vector sy(num_eq);
@@ -673,7 +674,7 @@ void ApplyBarthJespersenLimiter(ParFiniteElementSpace& vfes,
     ipc.Set2(0.5, 0.5);
     Vector Xc(3);
     Tr->Transform(ipc, Xc);
-    dg_igr::limiters_detail::ElementDofXY(*fe, *Tr, dof_xy);
+    igrlab::limiters_detail::ElementDofXY(*fe, *Tr, dof_xy);
 
     // Decide which components to limit
     bool limit_comp[4] = {opt.limit_rho,

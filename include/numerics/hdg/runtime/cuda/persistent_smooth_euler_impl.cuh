@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 /* Included by persistent_smooth_euler.cuh inside dg::hdg::runtime::cuda_w8a. */
 
 namespace detail
@@ -4221,8 +4222,8 @@ public:
                               state_slot& workspace) noexcept
   {
     if (rodas3_) return ExecuteRodas3(config, attempt, workspace);
-    ::dg_igr::NVTXRange accepted_step_profile_region(
-        ::dg_igr::observability::RegionId::hdg_accepted_step);
+    ::igrlab::NVTXRange accepted_step_profile_region(
+        ::igrlab::observability::RegionId::hdg_accepted_step);
     CudaIluFactorAttemptEndGuard end_factor_attempt(ilu_factor_state_);
     CudaElementSchwarzAttemptEndGuard end_schwarz_attempt(
         element_schwarz_attempt_state_);
@@ -4496,8 +4497,8 @@ public:
     };
     const auto launch_condensation = [&]() noexcept
     {
-      ::dg_igr::NVTXRange profile_region(
-          ::dg_igr::observability::RegionId::hdg_condensation);
+      ::igrlab::NVTXRange profile_region(
+          ::igrlab::observability::RegionId::hdg_condensation);
       if (cuda_engine_ == generic::CudaEngineKind::tensor_core &&
           result.tensor_core.condensation_launches ==
               std::numeric_limits<std::uint64_t>::max())
@@ -4576,8 +4577,8 @@ public:
       bool recovery_launched = false;
       if (trace_distributed && Ticket(CudaFailurePhase::recovery))
       {
-        ::dg_igr::NVTXRange profile_region(
-            ::dg_igr::observability::RegionId::hdg_interior_recovery);
+        ::igrlab::NVTXRange profile_region(
+            ::igrlab::observability::RegionId::hdg_interior_recovery);
         recovery_launched = CudaLaunchRecover(view_, shape_, cuda_engine_);
       }
       const bool recovered = recovery_launched && StatusPassed();
@@ -4607,8 +4608,8 @@ public:
         // full-state device-to-device copies.
         bool trial_ready = false;
         {
-          ::dg_igr::NVTXRange profile_region(
-              ::dg_igr::observability::RegionId::hdg_nonlinear_update);
+          ::igrlab::NVTXRange profile_region(
+              ::igrlab::observability::RegionId::hdg_nonlinear_update);
           trial_ready = CudaLaunchTrial(view_, shape_, alpha);
         }
         if (!CollectiveContinue(trial_ready))
@@ -4630,8 +4631,8 @@ public:
         bool admissibility_launched = false;
         if (trace_ready)
         {
-          ::dg_igr::NVTXRange profile_region(
-              ::dg_igr::observability::RegionId::hdg_validation);
+          ::igrlab::NVTXRange profile_region(
+              ::igrlab::observability::RegionId::hdg_validation);
           admissibility_launched = CudaLaunchAdmissibility(view_, shape_);
         }
         const bool trial_admissible =
@@ -4743,8 +4744,8 @@ public:
     bool coherent_recovery_launched = false;
     if (coherent_trace_distributed && Ticket(CudaFailurePhase::recovery))
     {
-      ::dg_igr::NVTXRange profile_region(
-          ::dg_igr::observability::RegionId::hdg_interior_recovery);
+      ::igrlab::NVTXRange profile_region(
+          ::igrlab::observability::RegionId::hdg_interior_recovery);
       coherent_recovery_launched =
           CudaLaunchRecover(view_, shape_, cuda_engine_);
     }
@@ -4810,8 +4811,8 @@ public:
       // not the subsequently projected auxiliary state a^{n+1}.
       bool frozen_conservation_ready = false;
       {
-        ::dg_igr::NVTXRange profile_region(
-            ::dg_igr::observability::RegionId::hdg_validation);
+        ::igrlab::NVTXRange profile_region(
+            ::igrlab::observability::RegionId::hdg_validation);
         frozen_conservation_ready = EulerConservationBalance(
             attempt.dt, result.maximum_conservation_error,
             result.maximum_conservation_relative_error, false);
@@ -4863,8 +4864,8 @@ public:
     }
     bool admissibility_launched = false;
     {
-      ::dg_igr::NVTXRange profile_region(
-          ::dg_igr::observability::RegionId::hdg_validation);
+      ::igrlab::NVTXRange profile_region(
+          ::igrlab::observability::RegionId::hdg_validation);
       admissibility_launched = CudaLaunchAdmissibility(view_, shape_);
     }
     const bool local_admissible = admissibility_launched && StatusPassed();
@@ -4878,8 +4879,8 @@ public:
     {
       bool conservation_ready = false;
       {
-        ::dg_igr::NVTXRange profile_region(
-            ::dg_igr::observability::RegionId::hdg_validation);
+        ::igrlab::NVTXRange profile_region(
+            ::igrlab::observability::RegionId::hdg_validation);
         conservation_ready = EulerConservationBalance(
             attempt.dt, result.maximum_conservation_error,
             result.maximum_conservation_relative_error);

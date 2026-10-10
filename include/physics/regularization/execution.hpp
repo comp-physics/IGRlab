@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include "physics/regularization/combination.hpp"
 #include "physics/regularization/validation.hpp"
 
@@ -7,7 +9,7 @@
 
 #include <type_traits>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace regularization
 {
@@ -775,4 +777,4 @@ ExecuteRegularization(const RegularizationSelection& selection,
 }
 
 } // namespace regularization
-} // namespace dg_igr
+} // namespace igrlab

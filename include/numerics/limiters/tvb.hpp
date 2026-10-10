@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include "mfem.hpp"
 #include "utils/config/dg_igr_defaults.hpp"
 
@@ -17,10 +19,10 @@ namespace mfem
  */
 struct CharTVBOptions
 {
-  int dim = mfem::dg_igr::EulerDefaults::
+  int dim = mfem::igrlab::EulerDefaults::
     kDim; ///< Spatial dimension (implemented for 2D)
   double gamma =
-    mfem::dg_igr::EulerDefaults::kGamma; ///< Ratio of specific heats
+    mfem::igrlab::EulerDefaults::kGamma; ///< Ratio of specific heats
   double theta = 1.5;                    ///< Shu TVB parameter (approx 1-2)
   double M_tvb = 50.0;    ///< TVB threshold constant (tune per problem)
   double tau_flag = 0.05; ///< KXRCF-like density jump flag threshold

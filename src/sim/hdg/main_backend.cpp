@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "sim/hdg/main_backend.hpp"
 
 #include <algorithm>
@@ -388,7 +389,7 @@ FrozenBoundaryPlan FreezeBoundaryPlan(const EulerBoundaryPlan& source)
   return frozen;
 }
 
-dg_igr::IGRAlphaLengthScalePolicy CanonicalAlphaLengthScalePolicy(
+igrlab::IGRAlphaLengthScalePolicy CanonicalAlphaLengthScalePolicy(
     const HdgEulerMainRequest& request) noexcept
 {
   return request.alpha_length_scale_policy_override.value_or(
@@ -579,7 +580,7 @@ std::string Validate(const HdgEulerMainRequest& request,
   }
   if (regularization.kind == RegularizationKind::igr &&
       CanonicalAlphaLengthScalePolicy(request) ==
-        dg_igr::IGRAlphaLengthScalePolicy::Local)
+        igrlab::IGRAlphaLengthScalePolicy::Local)
   {
     return "HDG IGR does not support the element-local alpha length policy";
   }
@@ -675,7 +676,7 @@ std::string Validate(const HdgEulerMainRequest& request,
     return "HDG ParaView output requires a positive --time-step-save";
   }
   if (!std::isfinite(request.case_config.gamma) ||
-      request.case_config.gamma != mfem::dg_igr::EulerDefaults::kGamma)
+      request.case_config.gamma != mfem::igrlab::EulerDefaults::kGamma)
   {
     return "generic HDG V1 requires the frozen Euler gamma of 1.4";
   }

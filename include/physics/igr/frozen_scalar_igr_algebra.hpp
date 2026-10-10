@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include "mfem/config/config.hpp"
 #include "mfem/general/annotation.hpp"
 
@@ -15,7 +17,7 @@
  * grid-function, or regularization-contract types.
  */
 
-namespace dg_igr
+namespace igrlab
 {
 namespace frozen_scalar_igr_algebra
 {
@@ -542,4 +544,4 @@ FluxInvariantDomainSpeed(mfem::real_t base_speed,
 }
 
 } // namespace frozen_scalar_igr_algebra
-} // namespace dg_igr
+} // namespace igrlab

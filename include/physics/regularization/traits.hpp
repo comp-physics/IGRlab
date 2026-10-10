@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include "physics/regularization/axes.hpp"
 #include "physics/regularization/evaluated_field.hpp"
 
@@ -8,7 +10,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace regularization
 {
@@ -880,4 +882,4 @@ static_assert(!detail::HasDiagnosticsHook<BrokenDGContractProbeModelTag>::value,
               "disabled probe diagnostics hook must be absent");
 
 } // namespace regularization
-} // namespace dg_igr
+} // namespace igrlab

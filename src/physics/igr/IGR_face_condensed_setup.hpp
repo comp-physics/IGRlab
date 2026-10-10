@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include "mfem.hpp"
 #include <algorithm>
 #include <cmath>
@@ -9,7 +11,7 @@
 #include <tuple>
 #include <vector>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace igr_internal
 {
@@ -365,4 +367,4 @@ inline FaceCondensedRows BuildFaceCondensedRows(
 }
 
 } // namespace igr_internal
-} // namespace dg_igr
+} // namespace igrlab

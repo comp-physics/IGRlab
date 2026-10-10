@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "numerics/timestepping/RK3SSPWithLimiter.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "sim/config/case_config.hpp"
@@ -212,7 +213,7 @@ bool CheckMethod(mfem::ParFiniteElementSpace& fes,
 bool CheckFrozenSigmaReference()
 {
   constexpr const char* name = "DG_IGR_IGR_FROZEN_SIGMA_REFERENCE";
-  const char* previous = std::getenv(name);
+  const char* previous = igrlab::GetEnv(name);
   const bool had_previous = previous != nullptr;
   const std::string previous_value = previous ? previous : "";
   unsetenv(name);

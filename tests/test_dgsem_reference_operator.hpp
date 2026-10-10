@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/dgsem/dgsem_metric.hpp"
@@ -701,7 +703,7 @@ inline void RunDGSEMReferenceOperatorGate(TestContext& ctx)
     residual_samples.reserve(samples);
 
     const char* output_env =
-      std::getenv("DG_IGR_DGSEM_REFERENCE_OUTPUT_DIR");
+      igrlab::GetEnv("DG_IGR_DGSEM_REFERENCE_OUTPUT_DIR");
     const bool filesystem_output = output_env && output_env[0];
     std::filesystem::path output_path;
     if (filesystem_output)
@@ -849,7 +851,7 @@ inline void RunDGSEMReferenceOperatorGate(TestContext& ctx)
     }
   }
 
-  const char* output_dir = std::getenv("DG_IGR_DGSEM_REFERENCE_OUTPUT_DIR");
+  const char* output_dir = igrlab::GetEnv("DG_IGR_DGSEM_REFERENCE_OUTPUT_DIR");
   if (output_dir && mfem::Mpi::Root())
   {
     const std::filesystem::path path =
@@ -964,4 +966,4 @@ inline void RunDGSEMReferenceOperatorGate(TestContext& ctx)
   }
 }
 
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

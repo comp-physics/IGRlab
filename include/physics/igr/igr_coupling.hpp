@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -132,9 +134,9 @@ class EulerWithIGR : public TimeDependentOperator,
 {
 public:
   EulerWithIGR(DGHyperbolicConservationLaws& base,
-               ::dg_igr::IGRSolver& igr,
+               ::igrlab::IGRSolver& igr,
                ParGridFunction& state,
-               ::dg_igr::igr_internal::CompactSubcellRecovery* subcell_recovery = nullptr)
+               ::igrlab::igr_internal::CompactSubcellRecovery* subcell_recovery = nullptr)
     : TimeDependentOperator(base.Height()),
       base_(base),
       igr_(igr),
@@ -143,13 +145,13 @@ public:
   {
     sigma_cadence_ = igr_.GetSigmaUpdateCadence();
     MFEM_VERIFY(base_.GetModalDampingRate() == 0.0 ||
-                  sigma_cadence_ == ::dg_igr::IGRSigmaUpdateCadence::EveryStage,
+                  sigma_cadence_ == ::igrlab::IGRSigmaUpdateCadence::EveryStage,
                 "Modal damping with IGR requires a current stress solve "
                 "at every RK stage.");
-    MFEM_VERIFY(!subcell_recovery_ || sigma_cadence_ == ::dg_igr::IGRSigmaUpdateCadence::EveryStage,
+    MFEM_VERIFY(!subcell_recovery_ || sigma_cadence_ == ::igrlab::IGRSigmaUpdateCadence::EveryStage,
                 "Compact subcell recovery requires a current IGR solve at every RK stage.");
     sigma_interval_ = std::max(1, igr_.GetSigmaUpdateInterval());
-    const char* degree = std::getenv("DG_IGR_IGR_EXTRAPOLATION_DEGREE");
+    const char* degree = igrlab::GetEnv("DG_IGR_IGR_EXTRAPOLATION_DEGREE");
     if (degree && *degree)
     {
       MFEM_VERIFY(std::strcmp(degree, "1") == 0 ||
@@ -513,7 +515,7 @@ public:
         igr_.SetCurrentTimeStep(std::numeric_limits<double>::quiet_NaN());
         igr_.UpdateFromState(ClosureInput(state),
                              /*warm_start=*/!cold_start,
-                             ::dg_igr::IGRSolvePurpose::OutputOnly,
+                             ::igrlab::IGRSolvePurpose::OutputOnly,
                              certify_residual);
         result.independent_residual_rel_rhs =
           igr_.GetLastLinearTrueResidualRelRHS();
@@ -561,8 +563,8 @@ public:
         ClosureInput(state),
         /*warm_start=*/!cold_start,
         reusable_for_transport
-          ? ::dg_igr::IGRSolvePurpose::ProductionStage0Prefetch
-          : ::dg_igr::IGRSolvePurpose::OutputOnly,
+          ? ::igrlab::IGRSolvePurpose::ProductionStage0Prefetch
+          : ::igrlab::IGRSolvePurpose::OutputOnly,
         certify_residual);
       result.independent_residual_rel_rhs =
         igr_.GetLastLinearTrueResidualRelRHS();
@@ -700,7 +702,7 @@ public:
   }
   bool SupportsIndependentResidualCertification() const override
   {
-    return igr_.GetSolveMode() == ::dg_igr::IGRSolveMode::Krylov;
+    return igr_.GetSolveMode() == ::igrlab::IGRSolveMode::Krylov;
   }
 
   bool SupportsPhysicalBoundaryFluxIntegral() const override
@@ -827,16 +829,16 @@ public:
       bool update_sigma = false;
       switch (sigma_cadence_)
       {
-      case ::dg_igr::IGRSigmaUpdateCadence::EveryStage:
+      case ::igrlab::IGRSigmaUpdateCadence::EveryStage:
         update_sigma = true;
         break;
-      case ::dg_igr::IGRSigmaUpdateCadence::EveryStep:
+      case ::igrlab::IGRSigmaUpdateCadence::EveryStep:
         update_sigma = !have_rk_step
                          ? true
                          : (!sigma_initialized_ ||
                             (last_sigma_step_ != rk_step_));
         break;
-      case ::dg_igr::IGRSigmaUpdateCadence::EveryNSteps:
+      case ::igrlab::IGRSigmaUpdateCadence::EveryNSteps:
         if (!have_rk_step)
         {
           // Outside stage-aware steppers, prefer safety over cadence fidelity:
@@ -856,7 +858,7 @@ public:
           update_sigma = false;
         }
         break;
-      case ::dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep:
+      case ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep:
         MFEM_ABORT("Extrapolated IGR cadence reached the legacy update path.");
         break;
       }
@@ -878,7 +880,7 @@ public:
           AbandonPendingStage0Prefetch();
         }
         int igr_solve_stage = rk_stage_;
-        if (sigma_cadence_ != ::dg_igr::IGRSigmaUpdateCadence::EveryStage)
+        if (sigma_cadence_ != ::igrlab::IGRSigmaUpdateCadence::EveryStage)
         {
           // Stage-based rtol loosening is only meaningful when a later stage
           // solve will occur in the same RK step.
@@ -975,7 +977,7 @@ private:
   bool IsExtrapolatedEveryStep() const
   {
     return sigma_cadence_ ==
-           ::dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+           ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
   }
 
   bool HasMultipleOwningRanks() const
@@ -1100,7 +1102,7 @@ private:
                               int step,
                               real_t time,
                               bool warm_start,
-                              ::dg_igr::IGRSolvePurpose purpose,
+                              ::igrlab::IGRSolvePurpose purpose,
                               bool /*certify_residual*/) const
   {
     MFEM_VERIFY(!igr_.HasPendingStage0PrefetchAccounting(),
@@ -1114,7 +1116,7 @@ private:
     // endpoint projection cannot repair algebraic error already injected by
     // an under-solved earlier anchor, so the extrapolated route always gates
     // these solves with an independently recomputed FP64 residual.
-    MFEM_VERIFY(igr_.GetSolveMode() == ::dg_igr::IGRSolveMode::Krylov,
+    MFEM_VERIFY(igr_.GetSolveMode() == ::igrlab::IGRSolveMode::Krylov,
                 "Extrapolated IGR exact anchors require a Krylov solve for "
                 "independent FP64 residual certification.");
     igr_.UpdateFromState(ClosureInput(state),
@@ -1253,8 +1255,8 @@ private:
         time,
         /*warm_start=*/!cold_start,
         reusable_stage0
-          ? ::dg_igr::IGRSolvePurpose::ProductionStage0Prefetch
-          : ::dg_igr::IGRSolvePurpose::OutputOnly,
+          ? ::igrlab::IGRSolvePurpose::ProductionStage0Prefetch
+          : ::igrlab::IGRSolvePurpose::OutputOnly,
         certify_residual);
       result.solved = true;
       result.independent_residual_rel_rhs =
@@ -1333,7 +1335,7 @@ private:
                            /*step=*/-1,
                            base_.GetTime(),
                            /*warm_start=*/extrapolated_current_valid_,
-                           ::dg_igr::IGRSolvePurpose::ProductionStage,
+                           ::igrlab::IGRSolvePurpose::ProductionStage,
                            /*certify_residual=*/true);
     if (!restore_accepted_anchor)
     {
@@ -1402,7 +1404,7 @@ private:
                                rk_step_,
                                rk_step_time_,
                                /*warm_start=*/sigma_initialized_,
-                               ::dg_igr::IGRSolvePurpose::ProductionStage,
+                               ::igrlab::IGRSolvePurpose::ProductionStage,
                                /*certify_residual=*/false);
         extrapolated_attempt_anchor_ = igr_.GetSigma();
         extrapolated_attempt_history_valid_ = false;
@@ -1441,7 +1443,7 @@ private:
                                  rk_step_,
                                  rk_stage_time_,
                                  /*warm_start=*/true,
-                                 ::dg_igr::IGRSolvePurpose::ProductionStage,
+                                 ::igrlab::IGRSolvePurpose::ProductionStage,
                                  /*certify_residual=*/true);
         }
       }
@@ -1523,7 +1525,7 @@ private:
                            rk_step_,
                            time,
                            /*warm_start=*/true,
-                           ::dg_igr::IGRSolvePurpose::ProductionStage,
+                           ::igrlab::IGRSolvePurpose::ProductionStage,
                            /*certify_residual=*/false);
     ++sigma_endpoint_solve_count_;
 
@@ -1732,13 +1734,13 @@ private:
   {
     switch (sigma_cadence_)
     {
-    case ::dg_igr::IGRSigmaUpdateCadence::EveryStage:
+    case ::igrlab::IGRSigmaUpdateCadence::EveryStage:
       return true;
-    case ::dg_igr::IGRSigmaUpdateCadence::EveryStep:
+    case ::igrlab::IGRSigmaUpdateCadence::EveryStep:
       return !sigma_initialized || last_sigma_step != step;
-    case ::dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep:
+    case ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep:
       return !sigma_initialized;
-    case ::dg_igr::IGRSigmaUpdateCadence::EveryNSteps:
+    case ::igrlab::IGRSigmaUpdateCadence::EveryNSteps:
       return !sigma_initialized ||
              (step % sigma_interval_ == 0 && last_sigma_step != step);
     }
@@ -1880,11 +1882,11 @@ private:
   }
 
   DGHyperbolicConservationLaws& base_;
-  ::dg_igr::IGRSolver& igr_;
+  ::igrlab::IGRSolver& igr_;
   ParGridFunction& state_; // view of current state (vdim=num_eq)
-  ::dg_igr::igr_internal::CompactSubcellRecovery* subcell_recovery_ = nullptr;
-  ::dg_igr::IGRSigmaUpdateCadence sigma_cadence_ =
-    ::dg_igr::IGRSigmaUpdateCadence::EveryStage;
+  ::igrlab::igr_internal::CompactSubcellRecovery* subcell_recovery_ = nullptr;
+  ::igrlab::IGRSigmaUpdateCadence sigma_cadence_ =
+    ::igrlab::IGRSigmaUpdateCadence::EveryStage;
   int sigma_interval_ = 1;
   int extrapolation_degree_ = 1;
   mutable int rk_step_ = -1;

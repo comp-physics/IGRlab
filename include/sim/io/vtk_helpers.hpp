@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 /**
  * @file sim/io/vtk_helpers.hpp
  * @brief VTK naming/config helpers for sim-layer output.
@@ -20,7 +22,7 @@ namespace dg_sim
 {
 
 /// @brief Resolve the sigma cadence after applying the case default.
-inline dg_igr::IGRSigmaUpdateCadence
+inline igrlab::IGRSigmaUpdateCadence
 ResolveEffectiveIGRSigmaUpdateCadence(const RunConfig& run_cfg)
 {
   return run_cfg.igr_opts.sigma_cadence.empty()
@@ -96,16 +98,16 @@ inline std::string MakeCaseVTKDatasetName(
   if (run_cfg.regularization == Regularization::IGR)
   {
     const auto cadence = ResolveEffectiveIGRSigmaUpdateCadence(run_cfg);
-    if (cadence != dg_igr::IGRSigmaUpdateCadence::EveryStage)
+    if (cadence != igrlab::IGRSigmaUpdateCadence::EveryStage)
     {
       name << "_iscad_" << IGRSigmaUpdateCadenceToString(cadence);
-      if (cadence == dg_igr::IGRSigmaUpdateCadence::EveryNSteps)
+      if (cadence == igrlab::IGRSigmaUpdateCadence::EveryNSteps)
       {
         name << "_isn_" << ResolveEffectiveIGRSigmaUpdateInterval(run_cfg);
       }
     }
     const auto alpha_policy = ResolveIGRAlphaLengthScalePolicy(run_cfg);
-    if (alpha_policy == dg_igr::IGRAlphaLengthScalePolicy::Local)
+    if (alpha_policy == igrlab::IGRAlphaLengthScalePolicy::Local)
     {
       name << "_ial_" << IGRAlphaLengthScalePolicyToString(alpha_policy);
     }
@@ -140,7 +142,7 @@ inline mfem::io::VTKOutputConfig MakeCaseVTKConfig(const CaseConfig& case_cfg)
 {
   mfem::io::VTKOutputConfig cfg = case_cfg.vtk_config;
   cfg.prefix_path = DefaultCaseVTKOutputDir(case_cfg);
-  if (const char* prefix = std::getenv("DG_IGR_VTK_PREFIX_PATH"))
+  if (const char* prefix = igrlab::GetEnv("DG_IGR_VTK_PREFIX_PATH"))
   {
     if (prefix[0] != '\0') { cfg.prefix_path = prefix; }
   }

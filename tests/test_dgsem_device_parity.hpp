@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 #include "numerics/dgsem/dgsem_basis.hpp"
 #include "numerics/dgsem/dgsem_device.hpp"
 #include "numerics/dgsem/dgsem_reference.hpp"
@@ -362,7 +364,7 @@ struct DimensionalKernelErrors
 
 inline std::string RequestedDevice()
 {
-  const char* value = std::getenv("DG_IGR_DGSEM_DEVICE");
+  const char* value = igrlab::GetEnv("DG_IGR_DGSEM_DEVICE");
   return value ? std::string(value) : std::string("cpu");
 }
 
@@ -1480,7 +1482,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
                 max_constant_residual + max_local_conservation +
                 max_reduction_error);
 
-  const char* output_directory = std::getenv("DG_IGR_DGSEM_DEVICE_OUTPUT_DIR");
+  const char* output_directory = igrlab::GetEnv("DG_IGR_DGSEM_DEVICE_OUTPUT_DIR");
   if (output_directory && mfem::Mpi::Root())
   {
     std::error_code error;
@@ -1563,4 +1565,4 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
     mfem::MemoryTypeName[static_cast<int>(runtime.device_memory_type)]);
 }
 
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

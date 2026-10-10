@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/solver/solver_helpers.hpp
  * @brief Helper utilities for solver setup (RK3/IGR).
@@ -19,28 +21,28 @@
 namespace dg_sim
 {
 
-inline void ApplyGradOption(const std::string& grad_opt, dg_igr::IGRConfig& cfg)
+inline void ApplyGradOption(const std::string& grad_opt, igrlab::IGRConfig& cfg)
 {
   const std::string lower = ToLowerCopy(grad_opt);
   if (lower == "h1")
   {
-    cfg.backend = dg_igr::IGRGradBackend::H1Projection;
+    cfg.backend = igrlab::IGRGradBackend::H1Projection;
     return;
   }
   if (lower == "l2" || lower == "brokenl2" || lower == "brokendg" ||
       lower == "broken-dg")
   {
-    cfg.backend = dg_igr::IGRGradBackend::BrokenDG;
+    cfg.backend = igrlab::IGRGradBackend::BrokenDG;
     return;
   }
   MFEM_VERIFY(false,
               "Invalid IGR gradient backend '" << grad_opt
                                                << "'. Use 'H1' or 'BrokenL2'.");
-  cfg.backend = dg_igr::IGRGradBackend::BrokenDG;
+  cfg.backend = igrlab::IGRGradBackend::BrokenDG;
 }
 
 inline void ApplyIGRRuntimeOptionOverrides(const IGROptions& igr_opts,
-                                           dg_igr::IGRConfig& cfg)
+                                           igrlab::IGRConfig& cfg)
 {
   if (!igr_opts.alpha_length_policy.empty())
   {
@@ -167,7 +169,7 @@ inline mfem::RK3Config ResolveRK3StepperConfig(const RunConfig& run_cfg)
   return cfg;
 }
 
-inline dg_igr::IGRSolver MakeIGRSolver(DGSpaces& spaces,
+inline igrlab::IGRSolver MakeIGRSolver(DGSpaces& spaces,
                                        int dim,
                                        int num_equations,
                                        const RunConfig& run_cfg,
@@ -176,13 +178,13 @@ inline dg_igr::IGRSolver MakeIGRSolver(DGSpaces& spaces,
                                        mfem::ParFiniteElementSpace* closure_state_fes = nullptr)
 {
   MFEM_VERIFY(spaces.sigma_fes != nullptr, "IGR requires a sigma space.");
-  dg_igr::IGRConfig igr_cfg = run_cfg.case_config.igr_config;
+  igrlab::IGRConfig igr_cfg = run_cfg.case_config.igr_config;
   igr_cfg.alpha = alpha_info.alpha;
   igr_cfg.alpha_length_scale_policy = alpha_info.policy;
   igr_cfg.rho_floor = rho_floor;
   ApplyIGRRuntimeOptionOverrides(run_cfg.igr_opts, igr_cfg);
 
-  dg_igr::IGRSolver igr(*spaces.sigma_fes,
+  igrlab::IGRSolver igr(*spaces.sigma_fes,
                         closure_state_fes ? *closure_state_fes : spaces.vfes,
                         dim,
                         num_equations,

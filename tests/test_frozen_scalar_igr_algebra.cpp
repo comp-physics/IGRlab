@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
 
 #include <algorithm>
@@ -11,29 +12,29 @@
 namespace
 {
 
-using ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFlux;
-using ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFluxJacobian;
-using ::dg_igr::frozen_scalar_igr_algebra::AddTensorSigmaFlux;
-using ::dg_igr::frozen_scalar_igr_algebra::AddTensorSigmaFluxJacobian;
-using ::dg_igr::frozen_scalar_igr_algebra::AddTwoStateAverageNormalSigmaFlux;
-using ::dg_igr::frozen_scalar_igr_algebra::AlphaOverDensity;
-using ::dg_igr::frozen_scalar_igr_algebra::
+using ::igrlab::frozen_scalar_igr_algebra::AddNormalSigmaFlux;
+using ::igrlab::frozen_scalar_igr_algebra::AddNormalSigmaFluxJacobian;
+using ::igrlab::frozen_scalar_igr_algebra::AddTensorSigmaFlux;
+using ::igrlab::frozen_scalar_igr_algebra::AddTensorSigmaFluxJacobian;
+using ::igrlab::frozen_scalar_igr_algebra::AddTwoStateAverageNormalSigmaFlux;
+using ::igrlab::frozen_scalar_igr_algebra::AlphaOverDensity;
+using ::igrlab::frozen_scalar_igr_algebra::
   ConservativeStateGradientToVelocityGradient;
-using ::dg_igr::frozen_scalar_igr_algebra::ExactAverageNormalVelocity;
-using ::dg_igr::frozen_scalar_igr_algebra::
+using ::igrlab::frozen_scalar_igr_algebra::ExactAverageNormalVelocity;
+using ::igrlab::frozen_scalar_igr_algebra::
   ExactTwoStateAverageNormalSigmaEnergyTerm;
-using ::dg_igr::frozen_scalar_igr_algebra::FluxCharacteristicSpeed;
-using ::dg_igr::frozen_scalar_igr_algebra::FluxInvariantDomainSpeed;
-using ::dg_igr::frozen_scalar_igr_algebra::
+using ::igrlab::frozen_scalar_igr_algebra::FluxCharacteristicSpeed;
+using ::igrlab::frozen_scalar_igr_algebra::FluxInvariantDomainSpeed;
+using ::igrlab::frozen_scalar_igr_algebra::
   FrozenSigmaCharacteristicModulusBound;
-using ::dg_igr::frozen_scalar_igr_algebra::
+using ::igrlab::frozen_scalar_igr_algebra::
   FrozenSigmaFluxIsLocallyStrictlyHyperbolic;
-using ::dg_igr::frozen_scalar_igr_algebra::
+using ::igrlab::frozen_scalar_igr_algebra::
   FrozenSigmaLocalHyperbolicityMargin;
-using ::dg_igr::frozen_scalar_igr_algebra::SafeInverseDensity;
-using ::dg_igr::frozen_scalar_igr_algebra::SourceFromConservativeStateGradient;
-using ::dg_igr::frozen_scalar_igr_algebra::SourceFromVelocityGradient;
-using ::dg_igr::frozen_scalar_igr_algebra::
+using ::igrlab::frozen_scalar_igr_algebra::SafeInverseDensity;
+using ::igrlab::frozen_scalar_igr_algebra::SourceFromConservativeStateGradient;
+using ::igrlab::frozen_scalar_igr_algebra::SourceFromVelocityGradient;
+using ::igrlab::frozen_scalar_igr_algebra::
   TensorSigmaEnergyTermFromInverseDensity;
 
 static_assert(std::is_trivially_copyable<mfem::real_t>::value,

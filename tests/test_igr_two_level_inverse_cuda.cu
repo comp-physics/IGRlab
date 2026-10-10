@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "../src/physics/igr/IGR_two_level_inverse.hpp"
 #include <algorithm>
 #include <cmath>
@@ -70,7 +71,7 @@ int main(int argc, char** argv)
   for (const std::string mode : {"dense", "cg"})
   for (int coarse_order = 1; coarse_order <= fine_order; ++coarse_order)
   {
-    auto preconditioner = dg_igr::igr_internal::MakeTwoLevelInversePreconditioner(
+    auto preconditioner = igrlab::igr_internal::MakeTwoLevelInversePreconditioner(
       initial.SpMat(), sfes, mode, coarse_order);
     mfem::Vector before(n), after(n), solution(n), action(n);
     preconditioner->Mult(original_rhs, before);

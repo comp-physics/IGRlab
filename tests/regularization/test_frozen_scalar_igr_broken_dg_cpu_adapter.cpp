@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
 #include "physics/regularization/adapters/frozen_scalar_igr_broken_dg_cpu.hpp"
 
@@ -12,8 +13,8 @@
 #include <type_traits>
 #include <vector>
 
-namespace regularization = dg_igr::regularization;
-namespace algebra = dg_igr::frozen_scalar_igr_algebra;
+namespace regularization = igrlab::regularization;
+namespace algebra = igrlab::frozen_scalar_igr_algebra;
 
 namespace
 {

@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "generic_euler_convergence_fixture.hpp"
 
 #include "numerics/hdg/runtime/cpu/generic_euler.hpp"
@@ -2176,7 +2177,7 @@ bool RunArchitectureSelectionScreen(
   try
   {
     resolved_regularization = dg_sim::hdg::ResolveHdgRegularization(
-        mesh, dg_igr::IGRAlphaLengthScalePolicy::Average,
+        mesh, igrlab::IGRAlphaLengthScalePolicy::Average,
         dg_sim::hdg::HdgRegularizationRequest{
             dg::hdg::generic::RegularizationKind::igr, 1.0, 1.0});
     regularization_resolved = true;
@@ -2187,7 +2188,7 @@ bool RunArchitectureSelectionScreen(
           dg::hdg::generic::RegularizationKind::igr &&
       resolved_regularization.alpha_info.c_alpha == 1.0 &&
       resolved_regularization.alpha_info.policy ==
-          dg_igr::IGRAlphaLengthScalePolicy::Average &&
+          igrlab::IGRAlphaLengthScalePolicy::Average &&
       std::isfinite(resolved_regularization.alpha_info.dx_eff) &&
       resolved_regularization.alpha_info.dx_eff > 0.0 &&
       std::isfinite(resolved_regularization.selection.alpha) &&
@@ -3218,7 +3219,7 @@ int main(int argc, char* argv[])
   if (selection.architecture_selection_screen)
   {
     const char* const enabled =
-        std::getenv("DG_IGR_RUN_ARCHITECTURE_SELECTION_SCREEN");
+        igrlab::GetEnv("DG_IGR_RUN_ARCHITECTURE_SELECTION_SCREEN");
     if (enabled == nullptr || std::string_view{enabled} != "1")
     {
       std::cout << "ARCHITECTURE_SELECTION_GATE skipped=1 reason="

@@ -1,18 +1,20 @@
 #pragma once
+
+#include "igrlab/environment.hpp"
 #include "mfem.hpp"
 #include <cstdint>
 #include <vector>
 #include <string>
 #include <cstdlib>
 
-namespace dg_igr { namespace igr_internal {
+namespace igrlab { namespace igr_internal {
 // Private implementation interface; retained data depend only on geometry and
 // reference basis. Current primitive velocities are recomputed on every call.
 enum class NodalSourceMode { Baseline, Volume, Central };
 NodalSourceMode GetNodalSourceMode();
 inline bool NodalSourceMirrorWalls()
 {
-  const char* raw = std::getenv("DG_IGR_IGR_NODAL_WALL_MIRROR");
+  const char* raw = igrlab::GetEnv("DG_IGR_IGR_NODAL_WALL_MIRROR");
   if (!raw || std::string(raw) == "0") return false;
   MFEM_VERIFY(std::string(raw) == "1",
               "DG_IGR_IGR_NODAL_WALL_MIRROR must be 0 or 1.");

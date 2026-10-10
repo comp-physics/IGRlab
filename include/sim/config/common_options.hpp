@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/config/common_options.hpp
  * @brief Shared CLI options for sim-layer examples.
@@ -111,7 +113,7 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
 {
   // Preserve the historical environment-only control as a default seed.
   // Either typed CLI spelling registered below remains authoritative.
-  opts.zhang_shu_vtk_points = dg_igr::EnvFlagEnabledDefault(
+  opts.zhang_shu_vtk_points = igrlab::EnvFlagEnabledDefault(
     "DG_IGR_LIMITER_ENFORCE_VTK_POINTS", opts.zhang_shu_vtk_points);
 
   args.AddOption(&opts.mesh_file, "-m", "--mesh", mesh_help.c_str());

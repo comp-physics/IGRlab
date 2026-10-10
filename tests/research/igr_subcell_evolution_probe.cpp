@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 // Reduced advancing full-energy Euler/instantaneous-IGR information study.
 // Independent conservative FV means; current compact or ordinary FV closure
 // data; shared dissipative transport fluxes. No closure lag or template fit.
@@ -25,7 +26,7 @@ namespace
 using Cons = std::array<double,4>;
 using State = std::vector<Cons>;
 using Clock = std::chrono::steady_clock;
-namespace igr = dg_igr::frozen_scalar_igr_algebra;
+namespace igr = igrlab::frozen_scalar_igr_algebra;
 constexpr double gamma_value = 1.4, admission_floor = 1.e-10;
 double Wall(Clock::time_point t) { return std::chrono::duration<double>(Clock::now()-t).count(); }
 struct Options

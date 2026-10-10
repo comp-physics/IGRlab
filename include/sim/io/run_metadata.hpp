@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/io/run_metadata.hpp
  * @brief Runtime metadata sidecar writer for VTK datasets.
@@ -129,7 +131,7 @@ inline std::string JoinCLI(int argc, char** argv)
 inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
                                     const RunConfig& run_cfg,
                                     const RunSummary* summary,
-                                    const dg_igr::IGRSolver* igr,
+                                    const igrlab::IGRSolver* igr,
                                     double c_alpha_value,
                                     int argc,
                                     char** argv,

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -69,7 +71,7 @@ MFEM_HOST_DEVICE inline real_t IGRFluxCharacteristicSpeed(real_t base_speed,
                                                            real_t sigma,
                                                            real_t rho_floor)
 {
-  return ::dg_igr::frozen_scalar_igr_algebra::FluxCharacteristicSpeed(
+  return ::igrlab::frozen_scalar_igr_algebra::FluxCharacteristicSpeed(
     base_speed,
     rho,
     sigma,
@@ -99,9 +101,9 @@ MFEM_HOST_DEVICE inline real_t IGRFluxInvariantDomainSpeed(
   real_t sigma,
   real_t gamma,
   real_t rho_floor,
-  real_t pressure_floor = dg_igr::LimiterDefaults::kPMin)
+  real_t pressure_floor = igrlab::LimiterDefaults::kPMin)
 {
-  return ::dg_igr::frozen_scalar_igr_algebra::FluxInvariantDomainSpeed(
+  return ::igrlab::frozen_scalar_igr_algebra::FluxInvariantDomainSpeed(
     base_speed,
     rho,
     pressure,
@@ -135,7 +137,7 @@ public:
   /// Construct an IGR-decorated flux around an existing base FluxFunction.
   explicit FluxWithIGR(
     const FluxFunction& base,
-    real_t gamma = dg_igr::EulerDefaults::kGamma)
+    real_t gamma = igrlab::EulerDefaults::kGamma)
     : FluxFunction(base.num_equations, base.dim),
       base_(base),
       gamma_(gamma)
@@ -232,7 +234,7 @@ public:
     {
       return reported_speed;
     }
-    return ::dg_igr::frozen_scalar_igr_algebra::SelectRusanovDissipationSpeed(
+    return ::igrlab::frozen_scalar_igr_algebra::SelectRusanovDissipationSpeed(
       reported_speed,
       rho,
       sigma,
@@ -322,11 +324,11 @@ public:
 
 private:
   const FluxFunction& base_;
-  real_t gamma_ = dg_igr::EulerDefaults::kGamma;
+  real_t gamma_ = igrlab::EulerDefaults::kGamma;
   const mfem::ParGridFunction* sigma_ =
     nullptr; // non-owning; owned by IGR solver/state wiring
-  double rho_vel_floor_ = dg_igr::FluxDefaults::kRhoVelFloor;
-  double invariant_domain_pressure_floor_ = dg_igr::LimiterDefaults::kPMin;
+  double rho_vel_floor_ = igrlab::FluxDefaults::kRhoVelFloor;
+  double invariant_domain_pressure_floor_ = igrlab::LimiterDefaults::kPMin;
   bool sigma_aware_cfl_ = false;
   bool sigma_aware_rusanov_ = false;
   bool frozen_sigma_spectral_speed_ = false;
@@ -349,7 +351,7 @@ private:
   inline void
   AddTensorSigmaTerms(const Vector& U, double sigma, DenseMatrix& F) const
   {
-    ::dg_igr::frozen_scalar_igr_algebra::AddTensorSigmaFlux(dim,
+    ::igrlab::frozen_scalar_igr_algebra::AddTensorSigmaFlux(dim,
                                                             U.GetData(),
                                                             1,
                                                             sigma,
@@ -364,7 +366,7 @@ private:
                                 double sigma_face,
                                 Vector& Fn) const
   {
-    ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFlux(dim,
+    ::igrlab::frozen_scalar_igr_algebra::AddNormalSigmaFlux(dim,
                                                             U.GetData(),
                                                             1,
                                                             n.GetData(),
@@ -379,7 +381,7 @@ private:
                                           double sigma,
                                           DenseTensor& J_) const
   {
-    ::dg_igr::frozen_scalar_igr_algebra::AddTensorSigmaFluxJacobian(
+    ::igrlab::frozen_scalar_igr_algebra::AddTensorSigmaFluxJacobian(
       dim,
       U.GetData(),
       1,
@@ -396,7 +398,7 @@ private:
                                         double sigma_face,
                                         DenseMatrix& JDotN) const
   {
-    ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFluxJacobian(
+    ::igrlab::frozen_scalar_igr_algebra::AddNormalSigmaFluxJacobian(
       dim,
       U.GetData(),
       1,

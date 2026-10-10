@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "numerics/hdg/runtime/app/solver.hpp"
 
 #include "solver_entry_detail.hpp"
@@ -74,7 +75,7 @@ bool ConsumePostPublicationFault(const PostPublicationFault expected,
       ? marker_consumed : finalize_consumed;
   if (consumed) return false;
   const char* const raw =
-      std::getenv("DG_IGR_HDG_TEST_POST_PUBLICATION_FAILURE");
+      igrlab::GetEnv("DG_IGR_HDG_TEST_POST_PUBLICATION_FAILURE");
   if (raw == nullptr) return false;
   const std::string_view value{raw};
   const std::string_view phase = expected == PostPublicationFault::after_marker
@@ -116,7 +117,7 @@ bool ConsumePostPublicationFault(const PostPublicationFault expected,
 bool PostPublicationFaultAllowsRetry() noexcept
 {
   const char* const raw =
-      std::getenv("DG_IGR_HDG_TEST_POST_PUBLICATION_RETRY");
+      igrlab::GetEnv("DG_IGR_HDG_TEST_POST_PUBLICATION_RETRY");
   return raw == nullptr || std::string_view{raw} == "1";
 }
 
@@ -274,7 +275,7 @@ cuda::CudaConfig MakeCudaConfig(const ValidatedApplicationConfig& config)
   numerical.require_host_staged_rank2 = numerical.expected_rank_count == 2;
   numerical.capture_oracle = false;
   const char* const scientific_test =
-      std::getenv("DG_IGR_HDG_TEST_SCIENTIFIC_GATE_FAILURE");
+      igrlab::GetEnv("DG_IGR_HDG_TEST_SCIENTIFIC_GATE_FAILURE");
   numerical.force_private_scientific_gate_failure =
       scientific_test != nullptr && std::string_view{scientific_test} == "1";
   if (config.injection().mode == FailureInjectionModeV1::prescribed &&

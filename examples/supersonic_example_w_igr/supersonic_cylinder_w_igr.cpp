@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 //                                Supersonic Cylinder - Parallel Version
 //
 // Compile with: make supersonic_cylinder
@@ -137,7 +138,7 @@ int main(int argc, char* argv[])
     cfg.defaults.t_final = 4.0;
     cfg.rk3_config.limit_initial = true;
     cfg.igr_config.alpha_length_scale_policy =
-      dg_igr::IGRAlphaLengthScalePolicy::Max;
+      igrlab::IGRAlphaLengthScalePolicy::Max;
     //  cfg.igr_config.smoot = dg_igr::IGRSmootherType::L1GS;
     cfg.limiter_pipeline.zhang_shu = true;
     // cfg.limiter_pipeline.krivodonova = true;

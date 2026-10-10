@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -17,7 +19,7 @@
 
 namespace mfem
 {
-namespace dg_igr
+namespace igrlab
 {
 
 enum class EulerAdmissibilityPointSet
@@ -366,5 +368,5 @@ ScanEulerAdmissibility(const mfem::ParFiniteElementSpace& vfes,
   return out;
 }
 
-} // namespace dg_igr
+} // namespace igrlab
 } // namespace mfem

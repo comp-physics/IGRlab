@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "../src/physics/igr/IGR_dense_inverse.hpp"
 
 #include <algorithm>
@@ -137,7 +138,7 @@ int main(int argc, char** argv)
   MFEM_VERIFY(RelativeDifference(reference, exact) <= 1.0e-13,
               "Host reference disagrees with manufactured solution.");
 
-  const char* saved_setup_env = std::getenv("DG_IGR_IGR_DENSE_SETUP");
+  const char* saved_setup_env = igrlab::GetEnv("DG_IGR_IGR_DENSE_SETUP");
   const bool had_setup_env = saved_setup_env != nullptr;
   const std::string saved_setup = saved_setup_env ? saved_setup_env : "";
   mfem::Vector host_fp64_direct(initial.Height()), host_fp64_transpose(initial.Height());
@@ -145,7 +146,7 @@ int main(int argc, char** argv)
   {
     MFEM_VERIFY(setenv("DG_IGR_IGR_DENSE_SETUP", setup.c_str(), 1) == 0,
                 "Could not select dense inverse test setup.");
-    auto preconditioner = dg_igr::igr_internal::MakeDenseInversePreconditioner(
+    auto preconditioner = igrlab::igr_internal::MakeDenseInversePreconditioner(
       initial, mode, MPI_COMM_WORLD);
     const double apply_tolerance = mode == "fp64" ? 1.0e-12 :
                                    (mode == "fp32" ? 2.0e-6 : 5.0e-3);

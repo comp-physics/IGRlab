@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "mfem.hpp"
 #include "../../src/physics/igr/IGR_nodal_source.hpp"
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
@@ -14,7 +15,7 @@
 #include <vector>
 
 using namespace mfem;
-using namespace ::dg_igr::igr_internal;
+using namespace ::igrlab::igr_internal;
 namespace
 {
 // Independent current-trace oracle: assemble four vector loads, solve local
@@ -104,7 +105,7 @@ Vector Reference(ParFiniteElementSpace& fes,const QuadratureSpace& qs,
       velocity.GetVectorGradient(*tr,grad);fes.GetFE(e)->CalcShape(ip,shape);
       for(int d=0;d<2;++d)for(int v=0;v<2;++v)for(int j=0;j<nd;++j)
         grad(v,d)+=shape[j]*correction[e][j+nd*(v+2*d)];
-      result[q+nq*e]=::dg_igr::frozen_scalar_igr_algebra::SourceFromVelocityGradient(2,grad.Data(),1,2,.0025);
+      result[q+nq*e]=::igrlab::frozen_scalar_igr_algebra::SourceFromVelocityGradient(2,grad.Data(),1,2,.0025);
     }
   }
   return result;
@@ -270,7 +271,7 @@ int main(int argc,char** argv)
     auto serial=igr_wall_consistency::Annulus(radial,angular,geometry_order);std::ofstream output(argv[3]);
     MFEM_VERIFY(output.good(),"Cannot write annulus mesh.");output<<std::setprecision(17);serial.Print(output);output.close();
     ParMesh mesh(MPI_COMM_WORLD,serial);
-    const auto alpha=dg_sim::ComputeAlphaInfo(mesh,1.,::dg_igr::IGRAlphaLengthScalePolicy::Average);
+    const auto alpha=dg_sim::ComputeAlphaInfo(mesh,1.,::igrlab::IGRAlphaLengthScalePolicy::Average);
     std::cout<<std::setprecision(17)<<"{\"radial\":"<<radial<<",\"angular\":"<<angular<<",\"geometry_order\":"<<geometry_order<<",\"havg\":"<<alpha.havg
       <<",\"alpha\":0.0025,\"c_alpha\":"<<.0025/(alpha.havg*alpha.havg)<<"}\n";return 0;
   }

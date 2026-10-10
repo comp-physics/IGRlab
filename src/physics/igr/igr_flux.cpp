@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "physics/igr/igr_flux.hpp"
 
 #include <algorithm>
@@ -103,7 +104,7 @@ real_t FluxWithIGR::FrozenSigmaSpectralSpeed(const Vector& U,
                                             (safe_density * normal_norm)
                                         : 0.0)
                                    : std::sqrt(momentum_sq) / safe_density;
-  return ::dg_igr::frozen_scalar_igr_algebra::
+  return ::igrlab::frozen_scalar_igr_algebra::
     FrozenSigmaCharacteristicModulusBound(density,
                                           pressure,
                                           transport_speed,
@@ -190,7 +191,7 @@ real_t FluxWithIGR::ComputeAvgFluxDotNAtSide(const Vector& U1,
   MFEM_VERIFY(U1(0) > 0.0 && U2(0) > 0.0,
               "FluxWithIGR::ComputeAvgFluxDotNAtSide requires positive "
               "density endpoints for exact averaged sigma correction.");
-  ::dg_igr::frozen_scalar_igr_algebra::AddTwoStateAverageNormalSigmaFlux(
+  ::igrlab::frozen_scalar_igr_algebra::AddTwoStateAverageNormalSigmaFlux(
     dim,
     U1.GetData(),
     1,

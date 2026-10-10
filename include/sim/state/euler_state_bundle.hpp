@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/state/euler_state_bundle.hpp
  * @brief Bundled Euler state and visualization fields.
@@ -35,7 +37,7 @@ struct EulerStateBundle
     field_list.velocity = &velocity_view;
   }
 
-  void AttachIGR(dg_igr::IGRSolver& igr)
+  void AttachIGR(igrlab::IGRSolver& igr)
   {
     field_list.igr = &igr;
     field_list.sigma = &igr.GetSigma();

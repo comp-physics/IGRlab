@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 /**
  * @file sim/wiring/dg_operator.hpp
  * @brief DG operator helper for Euler examples.
@@ -64,7 +66,7 @@ MakeDGOperator(ExampleContext& ctx, const NumericalFlux& numerical_flux)
   };
   auto env_flag = [](const char* name, bool default_value)
   {
-    const char* raw = std::getenv(name);
+    const char* raw = igrlab::GetEnv(name);
     if (!raw)
     {
       return default_value;

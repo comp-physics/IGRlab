@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "numerics/timestepping/RK3SSPWithLimiter.hpp"
 
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
@@ -21,15 +22,15 @@ namespace
 {
 
 inline const char* AdmissibilityPointSetName(
-  mfem::dg_igr::EulerAdmissibilityPointSet point_set)
+  mfem::igrlab::EulerAdmissibilityPointSet point_set)
 {
   switch (point_set)
   {
-  case mfem::dg_igr::EulerAdmissibilityPointSet::Dof:
+  case mfem::igrlab::EulerAdmissibilityPointSet::Dof:
     return "dof";
-  case mfem::dg_igr::EulerAdmissibilityPointSet::Limiter:
+  case mfem::igrlab::EulerAdmissibilityPointSet::Limiter:
     return "limiter";
-  case mfem::dg_igr::EulerAdmissibilityPointSet::Output:
+  case mfem::igrlab::EulerAdmissibilityPointSet::Output:
     return "output";
   }
   return "unknown";
@@ -414,7 +415,7 @@ void RK3SSPWithLimiter::MaybeScanVector(Vector& v, double t, const char* label)
   const int vdim = stage.VectorDim();
   const auto ordering = vfes_.GetOrdering();
   const auto scan =
-    mfem::dg_igr::ScanNonFiniteDetailed(v, comm, vdim, ordering);
+    mfem::igrlab::ScanNonFiniteDetailed(v, comm, vdim, ordering);
 
   if (scan.summary.global_non_finite > 0)
   {
@@ -475,9 +476,9 @@ void RK3SSPWithLimiter::MaybeScanAdmissibility(Vector& v,
   }
 
   const auto report_scan =
-    [&](mfem::dg_igr::EulerAdmissibilityPointSet point_set)
+    [&](mfem::igrlab::EulerAdmissibilityPointSet point_set)
   {
-    const auto scan = mfem::dg_igr::ScanEulerAdmissibility(vfes_,
+    const auto scan = mfem::igrlab::ScanEulerAdmissibility(vfes_,
                                                            v,
                                                            dim_,
                                                            gamma_,
@@ -526,22 +527,22 @@ void RK3SSPWithLimiter::MaybeScanAdmissibility(Vector& v,
     }
   };
 
-  report_scan(mfem::dg_igr::EulerAdmissibilityPointSet::Dof);
-  report_scan(mfem::dg_igr::EulerAdmissibilityPointSet::Limiter);
-  report_scan(mfem::dg_igr::EulerAdmissibilityPointSet::Output);
+  report_scan(mfem::igrlab::EulerAdmissibilityPointSet::Dof);
+  report_scan(mfem::igrlab::EulerAdmissibilityPointSet::Limiter);
+  report_scan(mfem::igrlab::EulerAdmissibilityPointSet::Output);
 }
 
 void RK3SSPWithLimiter::MaybeCaptureStagePair(Vector& v,
                                               double t,
                                               const char* side)
 {
-  const char* prefix = std::getenv("DG_IGR_RK_STAGE_CAPTURE_DIR");
+  const char* prefix = igrlab::GetEnv("DG_IGR_RK_STAGE_CAPTURE_DIR");
   if (!prefix || prefix[0] == '\0' || stage_pair_capture_written_)
   {
     return;
   }
 
-  const char* min_time_text = std::getenv("DG_IGR_RK_STAGE_CAPTURE_MIN_TIME");
+  const char* min_time_text = igrlab::GetEnv("DG_IGR_RK_STAGE_CAPTURE_MIN_TIME");
   const double min_time = min_time_text ? std::strtod(min_time_text, nullptr) : 0.0;
   if (t < min_time)
   {

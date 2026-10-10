@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "physics/igr/IGR.hpp"
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
 #include "utils/config/env_flags.hpp"
@@ -9,7 +10,7 @@
 #include <chrono>
 #include <limits>
 
-namespace dg_igr
+namespace igrlab
 {
 using namespace igr_internal;
 
@@ -287,7 +288,7 @@ bool IGRSolver::UseDeviceCoefficients_() const
   // faces.
   const bool qf_enabled = nodal_source || NodalSourceQuadratureMinimumOrder() > 0 ||
                           OperatorQuadratureMinimumOrder() > 0 || UseExactDGFaceOperator_() ||
-                          ::dg_igr::EnvFlagEnabledDefault(
+                          ::igrlab::EnvFlagEnabledDefault(
                             "DG_IGR_IGR_DEVICE_QF", device_backend);
   if (!qf_enabled)
   {
@@ -355,7 +356,7 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
     pending_stage0_prefetch_last_converged_ = last_linear_converged_;
     pending_stage0_prefetch_last_final_norm_ = last_linear_final_norm_;
   }
-  ::dg_igr::NVTXRange range("IGR/update-from-state");
+  ::igrlab::NVTXRange range("IGR/update-from-state");
   const auto update_start = std::chrono::steady_clock::now();
   const int calls_before = linear_solve_calls_;
   const int iters_before = total_linear_iters_;
@@ -448,4 +449,4 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
   }
 }
 
-} // namespace dg_igr
+} // namespace igrlab

@@ -983,30 +983,33 @@ add_test(NAME dg_igr_igr_screened_patch_cuda
 set_tests_properties(dg_igr_igr_screened_patch_cuda PROPERTIES
   LABELS "cuda;igr;screening" TIMEOUT 90 RUN_SERIAL TRUE)
 
-add_executable(dg_igr_condensation_panel_cuda
-  "${PROJECT_SOURCE_DIR}/tests/research/igr_condensation_panel_cuda.cu")
-target_include_directories(dg_igr_condensation_panel_cuda PRIVATE "${PROJECT_SOURCE_DIR}/include")
-target_link_libraries(dg_igr_condensation_panel_cuda PRIVATE igr_mfem mfem umpire MPI::MPI_CXX CUDA::cublas)
-target_compile_options(dg_igr_condensation_panel_cuda PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
-  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-set_target_properties(dg_igr_condensation_panel_cuda PROPERTIES
-  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
-  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-  CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-add_test(NAME dg_igr_condensation_panel_cuda
-  COMMAND dg_igr_condensation_panel_cuda --order 3 --nx 2 --repeats 2)
-set_tests_properties(dg_igr_condensation_panel_cuda PROPERTIES
-  LABELS "cuda;igr;research" TIMEOUT 90 RUN_SERIAL TRUE)
+if(IGRLAB_BUILD_RESEARCH_TESTS)
+  add_executable(dg_igr_condensation_panel_cuda
+    "${PROJECT_SOURCE_DIR}/tests/research/igr_condensation_panel_cuda.cu")
+  target_include_directories(dg_igr_condensation_panel_cuda PRIVATE "${PROJECT_SOURCE_DIR}/include")
+  target_link_libraries(dg_igr_condensation_panel_cuda PRIVATE igr_mfem mfem umpire MPI::MPI_CXX CUDA::cublas)
+  target_compile_options(dg_igr_condensation_panel_cuda PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  set_target_properties(dg_igr_condensation_panel_cuda PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  add_test(NAME dg_igr_condensation_panel_cuda
+    COMMAND dg_igr_condensation_panel_cuda --order 3 --nx 2 --repeats 2)
+  set_tests_properties(dg_igr_condensation_panel_cuda PROPERTIES
+    LABELS "cuda;igr;research" TIMEOUT 90 RUN_SERIAL TRUE)
 
-# Manual saved-state mechanism study; input fields come from the shared DG
-# research solver. No end-to-end application claim follows from this target.
-add_executable(dg_igr_dg_source_tensor_cuda
-  "${PROJECT_SOURCE_DIR}/tests/research/igr_dg_source_tensor_cuda.cu")
-target_link_libraries(dg_igr_dg_source_tensor_cuda PRIVATE CUDA::cudart)
-set_target_properties(dg_igr_dg_source_tensor_cuda PROPERTIES
-  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
-  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  # Manual saved-state mechanism study; input fields come from the shared DG
+  # research solver. No end-to-end application claim follows from this target.
+  add_executable(dg_igr_dg_source_tensor_cuda
+    "${PROJECT_SOURCE_DIR}/tests/research/igr_dg_source_tensor_cuda.cu")
+  target_link_libraries(dg_igr_dg_source_tensor_cuda PRIVATE CUDA::cudart)
+  set_target_properties(dg_igr_dg_source_tensor_cuda PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+
+endif()
 
 add_executable(dg_igr_igr_stationary_correction_cuda_test
   "${PROJECT_SOURCE_DIR}/tests/test_igr_stationary_correction_cuda.cu")

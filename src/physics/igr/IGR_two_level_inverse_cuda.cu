@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "IGR_two_level_inverse.hpp"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -9,7 +10,7 @@
 #include <set>
 #include <vector>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace igr_internal
 {

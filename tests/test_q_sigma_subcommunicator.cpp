@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/riemann/rusanov.hpp"
 #include "physics/igr/IGR.hpp"
@@ -142,17 +143,17 @@ bool RunSplitAdmission()
     }
     state.ExchangeFaceNbrData();
 
-    dg_igr::IGRSolver igr(
+    igrlab::IGRSolver igr(
       sigma_space, state_space, dim, equations, /*alpha=*/0.1);
-    igr.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
-    igr.SetIPKind(dg_igr::IGRIPKind::SIPG);
-    igr.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
-    igr.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
-    igr.SetPreconditioner(dg_igr::IGRPrecondType::None);
+    igr.SetGradBackend(igrlab::IGRGradBackend::BrokenDG);
+    igr.SetIPKind(igrlab::IGRIPKind::SIPG);
+    igr.SetSolveMode(igrlab::IGRSolveMode::Krylov);
+    igr.SetLinearSolver(igrlab::IGRLinearSolverType::CG);
+    igr.SetPreconditioner(igrlab::IGRPrecondType::None);
     igr.SetLinearSolveParams(
       /*rtol=*/1.0e-12, /*atol=*/0.0, /*max_it=*/400, /*print=*/0);
     igr.SetSigmaUpdatePolicy(
-      dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
+      igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
       /*interval=*/1);
     igr.SetStageRtolScale(1.0);
 
