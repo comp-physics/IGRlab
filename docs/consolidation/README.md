@@ -23,6 +23,13 @@ Runtime `IGRLAB_*` values take precedence even when empty. Build-driver
 aliases use nonempty canonical values and then explicit CLI options. CMake
 cache aliases accept either spelling and reject contradictory edits.
 
+Validation also exposed two pre-existing correctness defects. The candidate
+constructs the IGR solver at its final heap address so host coefficients retain
+valid parameter references, and explicitly marks rebuilt CUDA operator maps
+as host writes after mesh/space changes. Numerical settings and formulas are
+unchanged. The tensor assembly check selects the exact `UseTensor=true`
+specialization beside the retained SIMT specialization.
+
 Checkpoint strings, durable schemas and MFEM identity stamps retain their
 existing formats. Repository and checkout names are a separate final
 migration, so the GitHub origin is still `comp-physics/dg_igr_miniapp`.
@@ -45,21 +52,31 @@ The September A100 records distinguish qualified source from an unfinished
 p4 experiment. The qualified jobs recorded 9/9 selected tests and a clean p1
 trace memcheck, plus 80/80 admissible horizons to `t=0.1`. Those are historical
 results tied to their original source and software tuple. The dirty PACE p4
-experiment failed 12/15 tests and remains archived research.
+experiment passed 12/15 tests (three checks failed) and remains archived research.
 
 ## Recovery archive
 
 The local recovery root is
 `/home/jarias9/archives/igrlab/consolidation-20261010`. It contains the full
 common Git object database, refs, stashes, reflogs and submodule metadata;
-all tracked, untracked and ignored primary files; and all three original
+all inventoried tracked, untracked and ignored primary files; and all three original
 detached worktrees, including dirty PACE and Sedov changes.
 
 `recovery_state.json`, per-volume manifests and `SHA256SUMS` record verification
 of every archived regular file and symlink. The raw Git archive also preserves
 unreachable objects and stash untracked-file parents. The archive's README
-and `restore_proof.json` describe the isolated restoration drill. Audit
-inventories and validation logs are stored under its `audit/` directory.
+and `restore_proof.json` describe the isolated restoration drill. The raw Git
+snapshot contained 210 pre-existing empty loose blob files. Their exact bodies
+were reconstructed from archived research files and verified against their
+original Git IDs in a separate supplement. Restoration verifies all named
+refs, stashes and historical reflogs with zero missing reachable objects.
+The original database was repaired using those verified bytes while retaining
+every displaced empty file; independent checks confirm that all inventoried
+original working files, dirty patches and refs remain intact. MFEM working
+files are reconstructed from the pinned archived submodule objects; external
+dependency installations and bodies behind external symlinks are excluded
+from the physical worktree volumes. Audit inventories,
+repair receipts and validation logs are stored under `audit/`.
 
 This archive is presently on the same host. A separate backup is advisable
 before making it the sole retained copy of the primary research outputs.
@@ -77,6 +94,10 @@ worktree states for 39 local branches, 61 remote branches, three old
 worktrees, and superseded PRs #37 and #38. Both PR patches already exist in
 the recovered source; current communicator and collective-admission tests
 must pass before closure. Close the PRs before retiring their head/base refs.
+The committed proposal is a review snapshot pinned to the tested numerical
+source. The final candidate HEAD and refreshed approval guards are recorded
+separately under the recovery archive’s `audit/planning-git/` directory,
+avoiding a self-referential commit hash in the committed proposal.
 
 The first batch retains main/dev, the original investigation branch, this
 candidate, both stashes, six historical archive refs, twelve unmatched
