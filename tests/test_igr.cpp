@@ -8,6 +8,7 @@
 #include "numerics/riemann/side_scope_utils.hpp"
 #include "numerics/timestepping/RK3SSPWithLimiter.hpp"
 #include "sim/io/vis_helpers.hpp"
+#include "sim/solver/solver_helpers.hpp"
 #include "../src/numerics/dg/DGFaceQuadratureKernels.hpp"
 
 #include <algorithm>
@@ -1800,6 +1801,111 @@ int RunIGRTests(TestContext& ctx)
               "DG IGR sigma CFL switch independently lowers CFL speed");
 
     igr_flux_dg.SetSigmaAwareCFL(true);
+  }
+
+  // --- Application factory keeps host coefficient parameter references alive ---
+  if (!mfem::Device::Allows(mfem::Backend::DEVICE_MASK))
+  {
+    ScopedEnvVar host_qf("IGRLAB_IGR_DEVICE_QF", "0");
+    ScopedEnvVar assembled("IGRLAB_IGR_PARTIAL_ASSEMBLY", "0");
+    ScopedEnvVar ordinary_faces("IGRLAB_IGR_EXACT_DG_FACE_OPERATOR", "0");
+    ScopedEnvVar baseline_source("IGRLAB_IGR_NODAL_SOURCE", "baseline");
+    ScopedEnvVar source_quadrature("IGRLAB_IGR_SOURCE_QUADRATURE_MIN_ORDER", "0");
+    ScopedEnvVar operator_quadrature("IGRLAB_IGR_OPERATOR_QUADRATURE_MIN_ORDER", "0");
+    ScopedEnvVar ordinary_walls("IGRLAB_IGR_NODAL_WALL_MIRROR", "0");
+
+    mfem::Mesh factory_mesh = MakeGradedQuadMesh2D();
+    mfem::ParMesh factory_pmesh(MPI_COMM_SELF, factory_mesh);
+    dg_sim::DGSpaces spaces(factory_pmesh,
+                            /*order=*/2,
+                            dim,
+                            dim + 2,
+                            mfem::BasisType::GaussLegendre,
+                            "H1",
+                            /*need_sigma=*/true,
+                            /*need_h1=*/false);
+    mfem::ParGridFunction state(&spaces.vfes);
+    mfem::VectorFunctionCoefficient state_coeff(
+      dim + 2,
+      [&](const mfem::Vector& x, mfem::Vector& cons)
+      {
+        cons = EulerConsFromPrim2D(1.0,
+                                   0.3 + 0.2 * x(0) + 0.1 * x(1),
+                                   -0.1 + 0.03 * x(0) - 0.1 * x(1),
+                                   1.0,
+                                   gamma);
+      });
+    state.ProjectCoefficient(state_coeff);
+    state.ExchangeFaceNbrData();
+
+    dg_sim::RunConfig run_cfg;
+    run_cfg.igr_opts.grad = "BrokenL2";
+    run_cfg.igr_opts.linear_solver = "cg";
+    run_cfg.igr_opts.preconditioner = "none";
+    auto& config = run_cfg.case_config.igr_config;
+    config.backend = ::igrlab::IGRGradBackend::BrokenDG;
+    config.lin_solver_type = ::igrlab::IGRLinearSolverType::CG;
+    config.prec_type = ::igrlab::IGRPrecondType::None;
+    config.lin_rtol = 1.0e-11;
+    config.lin_atol = 1.0e-14;
+    config.lin_maxit = 400;
+    config.lin_print = 0;
+    constexpr double rho_floor = 1.0e-12;
+
+    for (const auto policy : {::igrlab::IGRAlphaLengthScalePolicy::Average,
+                              ::igrlab::IGRAlphaLengthScalePolicy::Local})
+    {
+      const auto alpha_info =
+        dg_sim::ComputeAlphaInfo(factory_pmesh, /*C_alpha=*/0.6, policy);
+      // Complete the factory expression before evaluating any coefficient.
+      auto factory = dg_sim::MakeIGRSolver(
+        spaces, dim, dim + 2, run_cfg, rho_floor, alpha_info);
+      ::igrlab::IGRSolver direct(
+        *spaces.sigma_fes, spaces.vfes, dim, dim + 2, alpha_info.alpha);
+      auto reference_config = config;
+      reference_config.alpha = alpha_info.alpha;
+      reference_config.alpha_length_scale_policy = policy;
+      reference_config.rho_floor = rho_floor;
+      direct.ApplyConfig(reference_config);
+
+      const std::string label =
+        policy == ::igrlab::IGRAlphaLengthScalePolicy::Local ? "local" : "average";
+      auto CompareFactory = [&](const std::string& stage)
+      {
+        factory->UpdateFromState(state, /*warm_start=*/false);
+        direct.UpdateFromState(state, /*warm_start=*/false);
+        mfem::Vector delta(factory->GetSigma());
+        delta -= direct.GetSigma();
+        const double reference_norm = GlobalL2Norm(direct.GetSigma());
+        ctx.Check(factory->GetLastLinearConverged() && direct.GetLastLinearConverged(),
+                  "IGR factory/direct " + label + " " + stage + " solves converge");
+        ctx.Check(std::isfinite(reference_norm) && reference_norm > 1.0e-10,
+                  "IGR factory/direct " + label + " " + stage + " has nonzero sigma");
+        ctx.Check(GlobalL2Norm(delta) <= 1.0e-10 * std::max(reference_norm, 1.0e-10),
+                  "IGR factory matches direct construction for " + label + " " + stage);
+      };
+      CompareFactory("initial parameters");
+      mfem::Vector previous(factory->GetSigma());
+
+      factory->SetAlpha(1.7 * alpha_info.alpha);
+      direct.SetAlpha(1.7 * alpha_info.alpha);
+      CompareFactory("updated alpha");
+      previous -= factory->GetSigma();
+      ctx.Check(GlobalL2Norm(previous) > 1.0e-9,
+                "IGR factory " + label + " alpha update changes sigma");
+      previous = factory->GetSigma();
+
+      const auto other_policy =
+        policy == ::igrlab::IGRAlphaLengthScalePolicy::Local
+          ? ::igrlab::IGRAlphaLengthScalePolicy::Average
+          : ::igrlab::IGRAlphaLengthScalePolicy::Local;
+      factory->SetAlphaLengthScalePolicy(other_policy);
+      direct.SetAlphaLengthScalePolicy(other_policy);
+      CompareFactory("updated length policy");
+      previous -= factory->GetSigma();
+      ctx.Check(GlobalL2Norm(previous) > 1.0e-9,
+                "IGR factory " + label + " length-policy update changes sigma");
+    }
   }
 
   // --- IGR solver instance isolation: per-instance scratch/config must not alias ---

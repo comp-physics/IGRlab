@@ -1781,13 +1781,13 @@ struct Solver
                   << " alpha_effective_max=" << alpha_effective_max << "\n";
       }
       vtk_c_alpha = std::isnan(vtk_c_alpha) ? alpha_info.c_alpha : vtk_c_alpha;
-      igr = std::make_unique<::igrlab::IGRSolver>(MakeIGRSolver(ctx.spaces,
-                                                              ctx.dim,
-                                                              ctx.num_equations,
-                                                              run_cfg,
-                                                              rho_floor,
-                                                              alpha_info,
-                                                              subcell_recovery ? &subcell_recovery->StateSpace() : nullptr));
+      igr = MakeIGRSolver(ctx.spaces,
+                          ctx.dim,
+                          ctx.num_equations,
+                          run_cfg,
+                          rho_floor,
+                          alpha_info,
+                          subcell_recovery ? &subcell_recovery->StateSpace() : nullptr);
       if (subcell_recovery)
       {
         MFEM_VERIFY(igr->GetSigmaUpdateCadence() == ::igrlab::IGRSigmaUpdateCadence::EveryStage,

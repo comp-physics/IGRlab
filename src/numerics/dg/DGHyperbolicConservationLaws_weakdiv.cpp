@@ -118,6 +118,10 @@ bool DGHyperbolicConservationLaws::BuildWeakDivSigmaData_(
 
   weakdiv_sigma_elem_dof_map_.SetSize(ne * sigma_ldof0);
   weakdiv_sigma_interp_.SetSize(ne * dof * sigma_ldof0);
+  // Topology/space updates rebuild these values on the host; discard any
+  // device-valid views retained by a resize before writing the new metadata.
+  int* const sigma_map = weakdiv_sigma_elem_dof_map_.HostWrite();
+  real_t* const sigma_interp = weakdiv_sigma_interp_.HostWrite();
 
   Array<int> sigma_sdofs;
   Vector sigma_shape;
@@ -144,7 +148,7 @@ bool DGHyperbolicConservationLaws::BuildWeakDivSigmaData_(
       {
         return false;
       }
-      weakdiv_sigma_elem_dof_map_[moff + k] = sigma_sdofs[k];
+      sigma_map[moff + k] = sigma_sdofs[k];
     }
 
     sigma_shape.SetSize(sigma_ldof0);
@@ -155,7 +159,7 @@ bool DGHyperbolicConservationLaws::BuildWeakDivSigmaData_(
       const int joff = ioff + j * sigma_ldof0;
       for (int k = 0; k < sigma_ldof0; ++k)
       {
-        weakdiv_sigma_interp_(joff + k) = sigma_shape(k);
+        sigma_interp[joff + k] = sigma_shape(k);
       }
     }
   }

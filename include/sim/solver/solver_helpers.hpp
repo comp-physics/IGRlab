@@ -17,6 +17,7 @@
 
 #include <cmath>
 #include <limits>
+#include <memory>
 
 namespace dg_sim
 {
@@ -169,13 +170,14 @@ inline mfem::RK3Config ResolveRK3StepperConfig(const RunConfig& run_cfg)
   return cfg;
 }
 
-inline ::igrlab::IGRSolver MakeIGRSolver(DGSpaces& spaces,
-                                       int dim,
-                                       int num_equations,
-                                       const RunConfig& run_cfg,
-                                       double rho_floor,
-                                       const AlphaInfo& alpha_info,
-                                       mfem::ParFiniteElementSpace* closure_state_fes = nullptr)
+inline std::unique_ptr<::igrlab::IGRSolver> MakeIGRSolver(
+  DGSpaces& spaces,
+  int dim,
+  int num_equations,
+  const RunConfig& run_cfg,
+  double rho_floor,
+  const AlphaInfo& alpha_info,
+  mfem::ParFiniteElementSpace* closure_state_fes = nullptr)
 {
   MFEM_VERIFY(spaces.sigma_fes != nullptr, "IGR requires a sigma space.");
   ::igrlab::IGRConfig igr_cfg = run_cfg.case_config.igr_config;
@@ -184,12 +186,16 @@ inline ::igrlab::IGRSolver MakeIGRSolver(DGSpaces& spaces,
   igr_cfg.rho_floor = rho_floor;
   ApplyIGRRuntimeOptionOverrides(run_cfg.igr_opts, igr_cfg);
 
-  ::igrlab::IGRSolver igr(*spaces.sigma_fes,
-                        closure_state_fes ? *closure_state_fes : spaces.vfes,
-                        dim,
-                        num_equations,
-                        igr_cfg.alpha);
-  igr.ApplyConfig(igr_cfg);
+  // Coefficients retain references to this solver's alpha/policy members.
+  // Construct at its final address so returning from the factory moves only
+  // the owning pointer, rather than leaving references into a moved solver.
+  auto igr = std::make_unique<::igrlab::IGRSolver>(
+    *spaces.sigma_fes,
+    closure_state_fes ? *closure_state_fes : spaces.vfes,
+    dim,
+    num_equations,
+    igr_cfg.alpha);
+  igr->ApplyConfig(igr_cfg);
   return igr;
 }
 

@@ -82,6 +82,10 @@ void DGHyperbolicConservationLaws::BuildInvMassApplyData_()
 
   const int ldof = dof * num_equations;
   invmass_elem_vdof_map_.SetSize(ne * ldof);
+  // This map may already have a device copy from the previous topology.
+  // Rebuilding its host entries must invalidate that copy, including after
+  // SetSize grows device-valid storage.
+  int* const vdof_map = invmass_elem_vdof_map_.HostWrite();
 
   Array<int> sdofs;
   for (int e = 0; e < ne; ++e)
@@ -100,7 +104,7 @@ void DGHyperbolicConservationLaws::BuildInvMassApplyData_()
         {
           vdof = -1 - vdof;
         }
-        invmass_elem_vdof_map_[e_off + i * num_equations + eq] = vdof;
+        vdof_map[e_off + i * num_equations + eq] = vdof;
       }
     }
   }

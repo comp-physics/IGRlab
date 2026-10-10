@@ -1170,7 +1170,8 @@ if(DG_IGR_GENERIC_TENSOR_CUOBJDUMP_EXECUTABLE AND
       "${CMAKE_COMMAND}"
       "-DTEST_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime_cuda_accepted_step_benchmark>"
       "-DCUOBJDUMP_EXECUTABLE=${DG_IGR_GENERIC_TENSOR_CUOBJDUMP_EXECUTABLE}"
-      "-DEXPECTED_KERNEL_SUBSTRING=TensorBorrowedCondenseKernel"
+      # Select UseTensor=true beside the separately retained SIMT specialization.
+      "-DEXPECTED_KERNEL_SUBSTRING=TensorBorrowedCondenseKernelILb1E"
       "-DEXPECTED_VOLUME_KERNEL_SUBSTRING=BorrowedEulerTensorVolumeContractionKernel"
       "-DEVIDENCE_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/tensor-sass-evidence"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/check_generic_tensor_sass.cmake"
@@ -1183,7 +1184,8 @@ if(DG_IGR_GENERIC_TENSOR_CUOBJDUMP_EXECUTABLE AND
       "${CMAKE_COMMAND}"
       "-DTEST_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime_cuda_accepted_step_benchmark>"
       "-DCUOBJDUMP_EXECUTABLE=${DG_IGR_GENERIC_TENSOR_CUOBJDUMP_EXECUTABLE}"
-      "-DEXPECTED_KERNEL_SUBSTRING=TensorBorrowedCondenseKernel"
+      # Select UseTensor=true beside the separately retained SIMT specialization.
+      "-DEXPECTED_KERNEL_SUBSTRING=TensorBorrowedCondenseKernelILb1E"
       "-DEXPECTED_VOLUME_KERNEL_SUBSTRING=BorrowedEulerTensorVolumeContractionKernel"
       "-DEVIDENCE_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/tensor-sass-evidence"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/check_generic_tensor_sass.cmake")
