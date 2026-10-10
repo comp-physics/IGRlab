@@ -1,7 +1,7 @@
 # IGRlab consolidation
 
 The consolidation preserves the recovered numerical work and qualified A100
-fixes in an isolated application branch, with research data in a verified
+fixes in the active application, with research data in a verified
 recovery archive. DG, DGSEM and HDG retain their CPU, CUDA and specialized
 manual tensor implementations. Research executables are available explicitly
 through `--research-tests`; ordinary correctness tests remain enabled.
@@ -31,8 +31,18 @@ unchanged. The tensor assembly check selects the exact `UseTensor=true`
 specialization beside the retained SIMT specialization.
 
 Checkpoint strings, durable schemas and MFEM identity stamps retain their
-existing formats. Repository and checkout names are a separate final
-migration, so the GitHub origin is still `comp-physics/dg_igr_miniapp`.
+existing formats. The repository migration destination is
+[`comp-physics/IGRlab`](https://github.com/comp-physics/IGRlab), with a clean
+primary checkout named `IGRlab`. The consolidation integrates through `dev`
+and then promotes that tree to default `main`, preserving merge history.
+The archive's `MIGRATION.md` records the completed remote and physical checkout
+steps, exact published revisions and compatibility paths.
+
+The dirty original research checkout remains intact in a separate preserved
+location. Its old pathname is a compatibility symlink for historical chats,
+dependency views and existing build caches. New builds from the clean primary
+use the canonical driver's fresh physical-path scope. Existing caches and
+reviewed MFEM identity records retain their recorded paths and hashes.
 
 M16 conservative modal damping is retained in the shared DG/DGSEM operator at
 each Runge–Kutta stage. It remains opt-in, with the affine tensor-cell and
@@ -81,7 +91,7 @@ repair receipts and validation logs are stored under `audit/`.
 This archive is presently on the same host. A separate backup is advisable
 before making it the sole retained copy of the primary research outputs.
 
-The compact active tree retires 55 historical campaign/evidence files (14.82
+The compact active tree retires 56 historical campaign/evidence/helper files (14.82
 MiB) from the candidate, retaining their exact bytes in the recovery volume
 and Git history. [archived-paths.json](archived-paths.json) lists original paths
 and checksums. All 69 research source files and every recovered dependency
@@ -106,11 +116,13 @@ patches were reviewed and preserved with provenance; none supplies a missing
 required backend. Their numerical-policy and benchmark ablations are not
 promoted automatically.
 
-Deletion, PR closure, publication, merge and the repository/checkout migration
-are final approval steps. Before deletion, refresh the expected SHA and exact
-dirty/untracked state for every affected object. Any changed object is
-recaptured first. The original primary directory remains preserved until its
-research retirement is separately approved.
+The approved first cleanup batch completed on October 10, 2026: 39 local
+branches and 61 remote branches were retired, three old worktrees were removed
+through Git, and PRs #37 and #38 were closed without merging. The recovery
+archive's `CLEANUP.md`, execution receipts and post-cleanup checksum seal record
+the completed actions and verification. The committed proposal above remains
+the original review snapshot. The original primary research files remain
+preserved until their retirement is separately approved.
 
 ## Validation
 

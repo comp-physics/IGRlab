@@ -110,12 +110,23 @@ parallel oracle.
 
 ## Verification and tolerances
 
-`run_oracle.sh` rejects an existing run path before creating any file. It
-configures and builds only `tests/hdg` against the immutable CPU MFEM v4.9
-install at commit `d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec`. Compilation
-rejects CUDA, HIP, RAJA, or Umpire-enabled MFEM. Serial runs before MPI. The
-one-/two-rank checks acquire `/tmp/dg_igr-sm120.lock` nonblockingly and exit 75
-if busy.
+The oracle is registered in the application test suite and uses the canonical
+build driver and its admitted CPU MFEM v4.9 installation at commit
+`d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec`. From the repository root, run the
+serial check with:
+
+```bash
+./build.sh --cpu-only --hdg-runtime --no-clean --no-deps --no-research-tests \
+  --test-regex '^dg_igr_hdg_oracle_serial_cpu$' -j 16
+```
+
+The registered wrapper creates a unique run directory under the external
+build directory. The oracle is unavailable with CUDA, HIP, RAJA, or
+Umpire-enabled MFEM. When MPI resources are authorized, select
+`^dg_igr_hdg_oracle_mpi_[12]_cpu$` instead. Those checks acquire
+`/tmp/dg_igr-sm120.lock` nonblockingly and yield with exit 75 if busy.
+The former standalone `run_oracle.sh` recipe, which depended on private
+machine paths, is retained in the research archive and Git history.
 
 The local direct-solve residual tolerance is `2e-12`, tighter than the general
 comparison tolerance `2e-10`. The finite-difference Jacobian tolerance is
@@ -142,12 +153,9 @@ The deterministic suite freezes:
 - one-/two-rank MFEM true-DOF ownership maps, owner/ghost exchange, and
   `P^T S_local P` agreement with the direct skeleton residual.
 
-## Later integration request
+## Integration
 
-The coordinator should add `add_subdirectory(hdg)` to `tests/CMakeLists.txt`;
-the root file already adds `tests/` under `BUILD_TESTING AND
-DG_IGR_BUILD_TESTS`. Register serial, one-rank, and two-rank invocations of the
-lane target with unique binary-directory outputs. MPI registration must use a
-nonblocking `/tmp/dg_igr-sm120.lock`, treat exit 75 as a yielded/skipped lease,
-and serialize the MPI jobs. The lane-local `run_oracle.sh` is the exact command
-sequence to preserve in CI. No shared CMake edit belongs to this lane commit.
+`tests/CMakeLists.txt` already adds this directory. The top-level suite
+registers serial, one-rank and two-rank oracle checks with unique output
+directories; MPI tests share the resource lock and skip code described above.
+Keep application configuration, dependencies and testing under `build.sh`.

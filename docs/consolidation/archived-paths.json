@@ -263,6 +263,11 @@
       "sha256": "00dbc6325267537d5de122f05ea93facbc2b10fde17ff46450da53270daa23ed"
     },
     {
+      "path": "tests/hdg/run_oracle.sh",
+      "size": 1776,
+      "sha256": "9a87ae1d6c772f72a84d107ef184c815570bba0207bc330b94243dcd1b0cda4f"
+    },
+    {
       "path": "tests/regularization/evidence/CONTRACT-CHAR-SPEED-01.md",
       "size": 16158,
       "sha256": "901f8e0258bfd5c679db97ca7da7e3103c03f106cf0330cdf08467ea19bca3f9"
@@ -278,6 +283,6 @@
       "sha256": "1eb32885b6b419beab9e4e5603714bb7aba262fa03599febdff7792c74e890aa"
     }
   ],
-  "count": 55,
-  "bytes": 15540593
+  "count": 56,
+  "bytes": 15542369
 }
