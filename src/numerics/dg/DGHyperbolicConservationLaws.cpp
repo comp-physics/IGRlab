@@ -68,6 +68,30 @@ DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
 DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
   DGHyperbolicConservationLaws&&) = default;
 
+void DGHyperbolicConservationLaws::SetModalDampingRate(real_t rate)
+{
+  MFEM_VERIFY(std::isfinite(rate) && rate >= 0.0,
+              "Modal damping rate must be finite and nonnegative.");
+  if (rate == 0.0)
+  {
+    modal_damping_.reset();
+  }
+  else
+  {
+    modal_damping_ = std::make_unique<ConservativeModalDamping>(vfes, rate);
+  }
+}
+
+real_t DGHyperbolicConservationLaws::LimitProposedRKStepSize(real_t proposed_dt) const
+{
+  MFEM_VERIFY(std::isfinite(proposed_dt) && proposed_dt > 0.0,
+              "DG step-size limiting requires a finite positive proposal.");
+  // q <= 1 also for the max-index tensor extension. This limits the isolated
+  // relaxation step; it is not a positivity/stability theorem for Euler--IGR.
+  return modal_damping_ ? std::min(proposed_dt, 1.0 / modal_damping_->GetRate())
+                        : proposed_dt;
+}
+
 IGRFrozenSigmaTelemetry
 DGHyperbolicConservationLaws::GetGlobalFrozenSigmaTelemetry() const
 {
@@ -426,6 +450,10 @@ bool DGHyperbolicConservationLaws::SupportsPhysicalBoundaryFluxIntegral() const
 
 void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
 {
+  MFEM_VERIFY(!p0_face_reference_x_slopes_ ||
+                (Device::Allows(Backend::CUDA_MASK) && vol_mode_ == VolumeMode::WeakDivergence &&
+                 p0_face_reference_x_slopes_->Size() == vfes.GetVSize()),
+              "P0 MUSCL traces cannot use CPU or a different volume/state representation.");
   ::dg_igr::NVTXRange mult_range("DG/Mult");
   MFEM_VERIFY(!static_source_requires_rebind_,
               "DG operator topology changed after a static source was "
@@ -602,6 +630,11 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
                   "DGSEM production execution rejected before output: "
                     << dgsem::DGSEMProductionReasonName(result.reason));
 
+      if (modal_damping_)
+      {
+        modal_damping_->AddMult(*x_eval, y_local);
+      }
+
       if (prolongation)
       {
         y = 0.0;
@@ -695,6 +728,10 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
       {
         y_local = 0.0;
       }
+      if (modal_damping_)
+      {
+        modal_damping_->AddMult(*x_eval, y_local);
+      }
       y = 0.0;
       prolongation->MultTranspose(y_local, y);
     }
@@ -705,6 +742,10 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     else
     {
       y = 0.0;
+    }
+    if (!prolongation && modal_damping_)
+    {
+      modal_damping_->AddMult(*x_eval, y);
     }
     if (static_source_.Size() != 0)
     {
@@ -765,6 +806,8 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     const bool force_nonlinearform_face =
       ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DG_FORCE_NLFORM_FACE",
                                       default_force_nonlinearform_face);
+    MFEM_VERIFY(!p0_face_reference_x_slopes_ || !force_nonlinearform_face,
+                "P0 MUSCL traces require packed faces; nonlinear-form fallback would change transport.");
     if (force_nonlinearform_face)
     {
       ::dg_igr::NVTXRange range("DG/face-domain-mfem-nonlinearform");
@@ -830,6 +873,10 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     ::dg_igr::NVTXRange range("DG/inverse-mass-local-and-restrict");
     y_local.SetSize(z_eval.Size());
     ApplyInverseMass_(z_eval, y_local);
+    if (modal_damping_)
+    {
+      modal_damping_->AddMult(*x_eval, y_local);
+    }
     y = 0.0;
     prolongation->MultTranspose(y_local, y);
   }
@@ -837,6 +884,10 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
   {
     ::dg_igr::NVTXRange range("DG/inverse-mass");
     ApplyInverseMass_(z_eval, y);
+    if (modal_damping_)
+    {
+      modal_damping_->AddMult(*x_eval, y);
+    }
   }
 
   if (static_source_.Size() != 0)
@@ -880,6 +931,8 @@ DGHyperbolicConservationLaws::~DGHyperbolicConservationLaws()
 // -----------------------------------------------------------------------------
 void DGHyperbolicConservationLaws::Update()
 {
+  const real_t modal_rate = GetModalDampingRate();
+  modal_damping_.reset();
   const bool had_static_source = static_source_.Size() != 0;
   static_source_.SetSize(0);
   static_source_requires_rebind_ =
@@ -929,6 +982,7 @@ void DGHyperbolicConservationLaws::Update()
   dgsem_production_dispatch_strict_ = false;
   dgsem_production_dispatch_cuda_ = false;
   dgsem_production_dispatch_reason_ = dgsem::DGSEMProductionReason::None;
+  SetModalDampingRate(modal_rate);
 }
 
 void DGHyperbolicConservationLaws::SetFaceIntegrationRule(

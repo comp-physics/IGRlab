@@ -52,3 +52,7 @@ integration is one entry in `_dg_igr_default_accel_sources`:
 
 No root CMake, test registration, backend registration, or generic DG operator
 change is required for review of this lane.
+
+Research extension: `DG_IGR_DGSEM_HIGH_ORDER_RESEARCH=1` admits p5--p7 on the existing 1D/2D packed application path. The 2D fused residual has matching ordinary-CUDA/FP64-tensor instantiations through p7. Independent kernel and application residual parity checks cover p1--p7; this does not qualify every nonlinear shocked trajectory or change the default p1--p4 policy.
+
+`DG_IGR_DGSEM_SUBCELL_BLEND=1` selects a separate experimental numerical method on the fused CUDA p3--p7 affine-quadrilateral path. Density/pressure Legendre modal energy supplies one blend coefficient per element (`DG_IGR_DGSEM_SUBCELL_THRESHOLD`, default `1e-4`). The high-order residual is blended with a conservative adjacent-LGL-subcell LLF residual; both reuse the unique macroface flux and the same instantaneous sigma. Native Euler polynomials are retained. This changes the transport discretization, and is not an algebraically equivalent coordinate transform or an IGR entropy/positivity proof. Setup, sensor computation, private aggregate accounting, and low-order work are included in application timing. The final local-rank summary records the fraction of element/RHS visits that remained entirely DG; it includes rejected work.

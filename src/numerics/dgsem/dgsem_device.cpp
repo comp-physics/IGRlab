@@ -1,4 +1,5 @@
 #include "numerics/dgsem/dgsem_device.hpp"
+#include "dgsem_overintegrated_volume.hpp"
 #include "physics/bc/detail/euler_boundary_state.hpp"
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
 
@@ -1111,6 +1112,61 @@ void BuildEulerContravariantFluxDevice(int dim,
                                               frozen_sigma_spectral_speed);
 }
 
+namespace overintegration_internal
+{
+void InterpolateVolumeState2DDevice(int ne, int dof,
+                                    const DenseMatrix& interpolation,
+                                    const DenseMatrix& states,
+                                    const Vector& sigma_nodes,
+                                    DenseMatrix& quadrature_states,
+                                    Vector& quadrature_sigma)
+{
+  const int nq=interpolation.Height(), rows=ne*dof, qrows=ne*nq;
+  MFEM_VERIFY(ne>0&&dof>0&&nq>0&&interpolation.Width()==dof&&
+                states.Height()==rows&&states.Width()==4&&sigma_nodes.Size()==rows,
+              "Overintegrated volume interpolation layout mismatch.");
+  quadrature_states.SetSize(qrows,4);quadrature_states.GetMemory().UseDevice(true);
+  quadrature_sigma.SetSize(qrows);quadrature_sigma.UseDevice(true);
+  const real_t* b=interpolation.Read();const real_t* u=states.Read();
+  const real_t* sigma=sigma_nodes.Read();real_t* output=quadrature_states.Write();
+  real_t* output_sigma=quadrature_sigma.Write();
+  mfem::forall(qrows,[=] MFEM_HOST_DEVICE(int row)
+  {
+    const int e=row/nq,q=row%nq;
+    real_t value[4]={0.,0.,0.,0.},s=0.;
+    for(int j=0;j<dof;++j)
+    {
+      const real_t shape=b[q+nq*j];const int input=e*dof+j;
+      for(int equation=0;equation<4;++equation)value[equation]+=shape*u[input+rows*equation];
+      s+=shape*sigma[input];
+    }
+    for(int equation=0;equation<4;++equation)output[row+qrows*equation]=value[equation];
+    output_sigma[row]=s;
+  });
+}
+void ApplyWeakVolumeProjection2DDevice(int ne, int dof,
+                                       const DenseMatrix& weak_derivative,
+                                       const DenseMatrix& quadrature_flux,
+                                       DenseMatrix& weak_volume)
+{
+  const int nq=weak_derivative.Width()/2,rows=ne*dof,qrows=ne*nq;
+  MFEM_VERIFY(ne>0&&dof>0&&nq>0&&weak_derivative.Height()==dof&&
+                weak_derivative.Width()==2*nq&&quadrature_flux.Height()==qrows&&
+                quadrature_flux.Width()==8,"Overintegrated weak-volume layout mismatch.");
+  weak_volume.SetSize(rows,4);weak_volume.GetMemory().UseDevice(true);
+  const real_t* derivative=weak_derivative.Read();const real_t* flux=quadrature_flux.Read();
+  real_t* output=weak_volume.Write();
+  mfem::forall(rows*4,[=] MFEM_HOST_DEVICE(int entry)
+  {
+    const int row=entry%rows,equation=entry/rows,e=row/dof,i=row%dof;
+    real_t value=0.;
+    for(int direction=0;direction<2;++direction)for(int q=0;q<nq;++q)
+      value+=derivative[i+dof*(q+nq*direction)]*flux[e*nq+q+qrows*(equation+4*direction)];
+    output[entry]=value;
+  });
+}
+}
+
 void ApplyCentralVolumeDevice(int dim,
                               int n1d,
                               const Array<int>& lex_to_local,
@@ -1640,6 +1696,7 @@ struct FusedResidualData
   const int* row_faces = nullptr;
   const int* row_signs = nullptr;
   const real_t* face_flux = nullptr;
+  const real_t* blend = nullptr;
   real_t* speeds = nullptr;
   real_t* strong = nullptr;
 };
@@ -1692,7 +1749,7 @@ __global__ void FusedEulerResidualKernel(FusedResidualData data)
     data.speeds[row] = EulerNodalCharacteristicSpeed(
         u, 1, 2, data.gamma, sigma, data.density_floor,
         data.frozen_sigma_speed);
-    if constexpr (LLF)
+    if (LLF || data.blend)
     {
       const real_t rho = fmax(u[0], data.density_floor);
       const real_t llf_pressure = u[0] < data.density_floor
@@ -1861,6 +1918,41 @@ __global__ void FusedEulerResidualKernel(FusedResidualData data)
       }
       value += weight * dissipative;
     }
+    if (data.blend && data.blend[element] > 0.0)
+    {
+      // Internal weighted-subcell interfaces telescope. The original unique
+      // macroface flux below is shared by both residuals, preserving each
+      // element's conservative mean for any element-constant blend factor.
+      real_t low_order = 0.0;
+      for (int direction = 0; direction < 2; ++direction)
+      {
+        const int coordinate = direction == 0 ? i : j;
+        const int stride = direction == 0 ? 1 : N;
+        const real_t transverse_weight = data.weights[direction == 0 ? j : i];
+        for (int side = 0; side < 2; ++side)
+        {
+          if ((side == 0 && coordinate == 0) ||
+              (side == 1 && coordinate == N - 1)) continue;
+          const int left = side == 0 ? node - stride : node;
+          const int right = left + stride;
+          const real_t mx = metric[left + dof * (2 * direction)];
+          const real_t my = metric[left + dof * (2 * direction + 1)];
+          const real_t norm = sqrt(mx * mx + my * my);
+          const real_t speed = fmax(
+              fabs(velocity[left] * mx + velocity[left + dof] * my) +
+                  acoustic[left] * norm,
+              fabs(velocity[right] * mx + velocity[right + dof] * my) +
+                  acoustic[right] * norm);
+          const real_t face = 0.5 * (
+              flux[left + dof * (equation + 4 * direction)] +
+              flux[right + dof * (equation + 4 * direction)] - speed *
+              (state[right + dof * equation] - state[left + dof * equation]));
+          low_order += (side == 0 ? 1.0 : -1.0) * transverse_weight * face;
+        }
+      }
+      value = (1.0 - data.blend[element]) * value +
+              data.blend[element] * low_order;
+    }
     real_t surface = 0.0;
     for (int adjacent = data.row_offsets[row];
          adjacent < data.row_offsets[row + 1]; ++adjacent)
@@ -1894,6 +1986,67 @@ void LaunchFusedResidual(int ne, bool llf, bool tensor,
 #endif
 } // namespace
 
+namespace subcell_internal
+{
+void AccumulateSubcellBlendVisits(const Vector& blend, Vector& visits)
+{
+  const int ne = blend.Size();
+  MFEM_VERIFY(visits.Size() == 2 * ne, "Invalid private subcell visit workspace.");
+  const real_t* input = blend.Read();
+  real_t* output = visits.ReadWrite();
+  mfem::forall(ne, [=] MFEM_HOST_DEVICE(int e)
+  {
+    output[e] += input[e] == 0.0 ? 1.0 : 0.0;
+    output[ne + e] += input[e];
+  });
+}
+}
+
+void ComputeModalSubcellBlendDevice(
+    int ne, int n1d, real_t gamma, real_t threshold,
+    const Array<int>& lex_to_local, const DenseMatrix& modal_transform,
+    const DenseMatrix& states, Vector& blend)
+{
+  const int dof = n1d * n1d, rows = ne * dof;
+  MFEM_VERIFY(ne > 0 && n1d >= 4 && n1d <= 8 && threshold > 0.0 &&
+      states.Height() == rows && states.Width() == 4 &&
+      lex_to_local.Size() == dof && modal_transform.Height() == n1d &&
+      modal_transform.Width() == n1d, "Invalid modal subcell blend operands.");
+  if (blend.Size() != ne) blend.SetSize(ne);
+  blend.UseDevice(true);
+  const int* local = lex_to_local.Read();
+  const real_t* transform = modal_transform.Read();
+  const real_t* u = states.Read();
+  real_t* output = blend.Write();
+  mfem::forall(ne, [=] MFEM_HOST_DEVICE(int element)
+  {
+    real_t sensor = 0.0;
+    for (int direction = 0; direction < 2; ++direction)
+      for (int line = 0; line < n1d; ++line)
+        for (int field = 0; field < 2; ++field)
+        {
+          real_t total = 0.0, high = 0.0;
+          for (int mode = 0; mode < n1d; ++mode)
+          {
+            real_t coefficient = 0.0;
+            for (int node = 0; node < n1d; ++node)
+            {
+              const int lex = direction == 0 ? node + n1d * line : line + n1d * node;
+              const int row = element * dof + local[lex];
+              const real_t value = field == 0 ? u[row] : EulerPressure(u + row, rows, 2, gamma);
+              coefficient += transform[mode + n1d * node] * value;
+            }
+            const real_t energy = coefficient * coefficient / (2 * mode + 1);
+            total += energy;
+            if (mode >= n1d - 2) high += energy;
+          }
+          sensor = fmax(sensor, high / fmax(total, real_t(1e-30)));
+        }
+    output[element] = fmin(real_t(1.0), fmax(real_t(0.0),
+        real_t(0.5) * (log10(fmax(sensor / threshold, real_t(1e-30))) + 1.0)));
+  });
+}
+
 void ApplyFusedEulerResidualDevice(
     int ne, int n1d, real_t gamma, real_t density_floor,
     bool llf_volume, bool frozen_sigma_spectral_speed,
@@ -1903,11 +2056,11 @@ void ApplyFusedEulerResidualDevice(
     const Vector& face_weights, const Array<int>& row_face_offsets,
     const Array<int>& row_face_ids, const Array<int>& row_face_signs,
     const DenseMatrix& face_flux, Vector& nodal_speeds, DenseMatrix& strong,
-    bool tensor_contraction)
+    bool tensor_contraction, const Vector* subcell_blend)
 {
   const int dof = n1d * n1d;
   const int rows = ne * dof;
-  MFEM_VERIFY(ne > 0 && n1d >= 2 && n1d <= 5 && states.Height() == rows &&
+  MFEM_VERIFY(ne > 0 && n1d >= 2 && n1d <= 8 && states.Height() == rows &&
       states.Width() == 4 && sigma.Size() == rows &&
       lex_to_local.Size() == dof && split_matrix.Height() == n1d &&
       split_matrix.Width() == n1d && weights.Size() == n1d &&
@@ -1916,11 +2069,13 @@ void ApplyFusedEulerResidualDevice(
       face_flux.Width() == 4 && face_flux.Height() == face_weights.Size() &&
       row_face_offsets.Size() == rows + 1 &&
       row_face_ids.Size() == row_face_signs.Size(),
-      "Fused DGSEM residual requires 2D p1--p4 and compact diagonal mass.");
+      "Fused DGSEM residual requires 2D p1--p7 and compact diagonal mass.");
   if (strong.Height() != rows || strong.Width() != 4) strong.SetSize(rows, 4);
   if (nodal_speeds.Size() != rows) nodal_speeds.SetSize(rows);
   strong.GetMemory().UseDevice(true);
   nodal_speeds.UseDevice(true);
+  MFEM_VERIFY(!subcell_blend || subcell_blend->Size() == ne,
+              "Subcell blend requires one coefficient per element.");
 #if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
   MFEM_VERIFY(Device::Allows(Backend::CUDA_MASK),
               "Fused DGSEM residual requires the CUDA backend.");
@@ -1942,6 +2097,7 @@ void ApplyFusedEulerResidualDevice(
   data.row_faces = row_face_ids.Read();
   data.row_signs = row_face_signs.Read();
   data.face_flux = face_flux.Read();
+  data.blend = subcell_blend ? subcell_blend->Read() : nullptr;
   data.speeds = nodal_speeds.Write();
   data.strong = strong.Write();
   switch (n1d)
@@ -1950,6 +2106,9 @@ void ApplyFusedEulerResidualDevice(
     case 3: LaunchFusedResidual<3>(ne, llf_volume, tensor_contraction, data); break;
     case 4: LaunchFusedResidual<4>(ne, llf_volume, tensor_contraction, data); break;
     case 5: LaunchFusedResidual<5>(ne, llf_volume, tensor_contraction, data); break;
+    case 6: LaunchFusedResidual<6>(ne, llf_volume, tensor_contraction, data); break;
+    case 7: LaunchFusedResidual<7>(ne, llf_volume, tensor_contraction, data); break;
+    case 8: LaunchFusedResidual<8>(ne, llf_volume, tensor_contraction, data); break;
   }
   MFEM_VERIFY(cudaGetLastError() == cudaSuccess,
               "Fused DGSEM residual CUDA launch failed.");

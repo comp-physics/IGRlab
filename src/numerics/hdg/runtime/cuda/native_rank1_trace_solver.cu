@@ -2012,10 +2012,12 @@ __device__ void ApplyPreconditioner(
   grid.sync();
 }
 
+// Borrow the immutable launch record instead of introducing another local
+// struct copy in the inlined preconditioner path.
 template <bool PreserveAliasedInput, bool CoupledWarp>
 __device__ void ApplyFixedSigmaJacobiPreconditioner(
     const NativeTraceSystemView system,
-    const NativeTracePreconditionerView preconditioner,
+    const NativeTracePreconditionerView& preconditioner,
     const NativeTraceWorkspaceView workspace,
     const double* input, double* output,
     NativeTraceSolveControl* control,
@@ -2112,13 +2114,15 @@ __device__ void SetFinalResidualMetadata(
       ? residual / control->rhs_norm : residual;
 }
 
+// Keep read-only launch records in kernel parameter storage when device
+// helpers take their address, without implicit per-thread local copies.
 template <bool UseCgs2, bool FixedSigmaJacobi, bool CoupledWarp>
 __global__ void NativeRankOneTraceSolveKernel(
-    const NativeTraceSystemView system,
-    const NativeTracePreconditionerView preconditioner,
-    const NativeTraceWorkspaceView workspace,
-    const NativeTraceSolvePolicy policy,
-    const NativeTraceKernelCooperativeSupport support)
+    const __grid_constant__ NativeTraceSystemView system,
+    const __grid_constant__ NativeTracePreconditionerView preconditioner,
+    const __grid_constant__ NativeTraceWorkspaceView workspace,
+    const __grid_constant__ NativeTraceSolvePolicy policy,
+    const __grid_constant__ NativeTraceKernelCooperativeSupport support)
 {
   cg::grid_group grid = cg::this_grid();
   __shared__ double block_scratch[native_trace_cooperative_threads];
@@ -2775,9 +2779,8 @@ QueryNativeRankOneTraceCooperativeSupport(const int rows,
                 native_trace_cooperative_threads, 0);
   if (occupancy != cudaSuccess) return result;
 
-  // This leaf is an SM120 tensor-backend implementation, not a generic CUDA
-  // fallback.  A different device is rejected rather than silently rerouted.
-  if (cooperative == 0 || major != 12 || minor != 0 ||
+  // This native tensor-backend leaf admits only the configured device.
+  if (cooperative == 0 || !CudaDeviceMatchesNativeArchitecture(major, minor) ||
       multiprocessors <= 0 || active_blocks <= 0)
     return result;
 
@@ -2991,8 +2994,10 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
              kernel_preconditioner_kind) &&
          !use_coupled_warp_full_patch))) ||
       cudaGetDevice(&current_device) != cudaSuccess ||
-      current_device != support.device || support.compute_major != 12 ||
-      support.compute_minor != 0 || support.multiprocessors <= 0 ||
+      current_device != support.device ||
+      !CudaDeviceMatchesNativeArchitecture(
+          support.compute_major, support.compute_minor) ||
+      support.multiprocessors <= 0 ||
       support.threads_per_block != native_trace_cooperative_threads ||
       support.maximum_active_blocks_per_multiprocessor <= 0 ||
       support.cooperative_blocks <= 0 ||

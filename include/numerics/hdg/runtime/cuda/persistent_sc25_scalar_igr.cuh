@@ -87,7 +87,8 @@ inline constexpr double fixed_dt = cpu_sc25::persistent_dt;
 inline constexpr double relative_trace_tolerance = 1.0e-12;
 inline constexpr double absolute_trace_tolerance = 1.0e-14;
 inline constexpr double armijo_coefficient = 1.0e-4;
-inline constexpr int required_native_architecture = 1200;
+inline constexpr int required_native_architecture =
+    cuda_w8a::detail::configured_cuda_architecture;
 inline constexpr int warm_plateau_cycles = 20;
 
 namespace detail

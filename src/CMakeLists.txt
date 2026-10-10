@@ -69,10 +69,12 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
     target_sources(igr_mfem PRIVATE physics/igr/IGR_dense_inverse_cuda.cu
                                   physics/igr/IGR_two_level_inverse_cuda.cu
                                   physics/igr/IGR_screened_patch_inverse_cuda.cu
+                                  physics/igr/IGR_face_density_cuda.cu
                                   physics/igr/IGR_stationary_correction_cuda.cu)
     target_compile_definitions(igr_mfem PRIVATE DG_IGR_HAS_DENSE_INVERSE_CUDA=1
                                               DG_IGR_HAS_TWO_LEVEL_INVERSE_CUDA=1
                                               DG_IGR_HAS_SCREENED_PATCH_CUDA=1
+                                              DG_IGR_HAS_FACE_DENSITY_CUDA=1
                                               DG_IGR_HAS_STATIONARY_CORRECTION_CUDA=1)
 endif()
 
@@ -83,6 +85,7 @@ if(DG_IGR_ACCELERATOR_LANGUAGE)
          "src/numerics/dg/DGHyperbolicConservationLaws_face.cpp"
          "src/numerics/dg/DGHyperbolicConservationLaws_mass.cpp"
          "src/numerics/dg/DGHyperbolicConservationLaws_weakdiv.cpp"
+         "src/numerics/dg/modal_damping.cpp"
          "src/numerics/dg/DGFaceQuadratureKernels.cpp"
          "src/numerics/dgsem/dgsem_device.cpp"
          "src/numerics/hdg/device/device_core.cpp"

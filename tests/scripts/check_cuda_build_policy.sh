@@ -343,6 +343,47 @@ assert_contains "${plan}" "mfem_jobs=16"
 assert_contains "${plan}" "output_root=${default_output_root}"
 assert_not_exists "${default_output_root}"
 
+# A100's friendly selector and numeric interface resolve the same native tuple.
+a100_output_root="${tmp_root}/a100-output"
+a100_plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
+  --a100 --hdg-runtime --output-root "${a100_output_root}" --print-plan)"
+numeric_a100_plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
+  --gpu --cuda-arch 80 --hdg-runtime --output-root "${a100_output_root}" --print-plan)"
+[[ "${a100_plan}" == "${numeric_a100_plan}" ]] || fail "A100 alias changes the native SM80 plan"
+assert_contains "${a100_plan}" "mode=gpu profile=cuda-sm80 dependency_cuda_arch=80 mfem_cuda_archs=80 app_cuda_archs=80"
+assert_contains "${a100_plan}" "hdg_runtime=ON"
+assert_contains "${a100_plan}" "env=${fixture_root}/spack-envs/cuda-sm80"
+assert_not_exists "${a100_output_root}"
+# A command-line architecture selection overrides the environment default.
+plan="$("${clean_env[@]}" SPACK_CUDA_ARCH=120 bash "${fixture_root}/build.sh" \
+  --a100 --gpu --cuda-arch 80 --print-plan)"
+assert_contains "${plan}" "profile=cuda-sm80"
+for conflict in cpu-first cpu-last arch-first arch-last overwritten-arch hdg-unsupported; do
+  case "${conflict}" in
+    cpu-first) conflict_args=(--cpu-only --a100) ;;
+    cpu-last) conflict_args=(--a100 --cpu) ;;
+    arch-first) conflict_args=(--cuda-arch 120 --a100) ;;
+    arch-last) conflict_args=(--a100 --cuda-arch 120) ;;
+    overwritten-arch) conflict_args=(--cuda-arch 120 --cuda-arch 80 --a100) ;;
+    hdg-unsupported) conflict_args=(--gpu --cuda-arch 90 --hdg-runtime) ;;
+  esac
+  set +e
+  reject_output="$("${clean_env[@]}" PATH="${fake_bin}:/usr/bin:/bin" \
+    FAKE_HELPER_LOG="${tmp_root}/a100-${conflict}-helper.log" \
+    FAKE_SPACK_LOG="${tmp_root}/a100-${conflict}-spack.log" \
+    bash "${fixture_root}/build.sh" "${conflict_args[@]}" 2>&1)"
+  reject_rc=$?
+  set -e
+  [[ ${reject_rc} -eq 2 ]] || fail "A100 conflict ${conflict} exited ${reject_rc}, expected 2"
+  if [[ "${conflict}" == hdg-unsupported ]]; then
+    assert_contains "${reject_output}" "--hdg-runtime requires native CUDA architecture 80 or 120"
+  else
+    assert_contains "${reject_output}" "--a100 conflicts"
+  fi
+  assert_not_exists "${tmp_root}/a100-${conflict}-helper.log"
+  assert_not_exists "${tmp_root}/a100-${conflict}-spack.log"
+done
+
 explicit_output_root="${tmp_root}/explicit-output"
 plan="$("${clean_env[@]}" bash "${fixture_root}/build.sh" \
   --gpu --cuda-arch 120 --output-root "${explicit_output_root}" --print-plan)"
@@ -672,6 +713,91 @@ assert_contains "${reject_output}" "output lock is already held"
 assert_not_exists "${tmp_root}/locked-helper.log"
 assert_not_exists "${tmp_root}/locked-spack.log"
 
+# SM80's manifest owns the release pin; both dependency lookup sites must
+# accept that release while leaving the reviewed SM120 develop query unchanged.
+for driver_and_variable in "${BUILD_DRIVER}:hypre_spec" "${MFEM_DRIVER}:HYPRE_SPEC"; do
+  query_driver="${driver_and_variable%:*}"
+  query_variable="${driver_and_variable##*:}"
+  query_selection="$(awk -v variable="${query_variable}" '
+    $0 ~ "^[ ]*" variable "=\"hypre@develop" { capture = 1 }
+    capture { print }
+    capture && /^[ ]*fi$/ { exit }
+  ' "${query_driver}")"
+  [[ -n "${query_selection}" ]] || fail "missing HYPRE query in ${query_driver}"
+  for query_arch in 80 120; do
+    selected_query="$(SPACK_CUDA_ARCH="${query_arch}" bash -c \
+      "${query_selection}"$'\n''printf "%s" "${!1}"' -- "${query_variable}")"
+    if [[ "${query_arch}" == 80 ]]; then
+      [[ "${selected_query}" == "hypre+mpi+cuda cuda_arch=80" ]] || \
+        fail "SM80 HYPRE query does not admit its release pin: ${selected_query}"
+    else
+      [[ "${selected_query}" == "hypre@develop+mpi+cuda cuda_arch=120" ]] || \
+        fail "SM120 HYPRE query changed: ${selected_query}"
+    fi
+  done
+done
+
+# Exercise the production SM80 static-HYPRE linkage selector without invoking
+# a compiler. SM120 must not query OpenBLAS or gain host LAPACK dependencies.
+(
+  eval "$(awk '
+    /^configure_sm80_hypre_linalg\(\)/ { capture = 1 }
+    capture { print }
+    capture && /^}/ { exit }
+  ' "${MFEM_DRIVER}")"
+  openblas_fixture="${tmp_root}/openblas"
+  mkdir -p "${openblas_fixture}/lib64"
+  touch "${openblas_fixture}/lib64/libopenblas.so"
+  openblas_hash=0123456789abcdef0123456789abcdef
+  SPACK_ENV="${tmp_root}/linalg-env"
+  HYPRE_SPEC='hypre+mpi+cuda cuda_arch=80'
+  spack_location() { [[ "$1" == openblas ]] || return 1; printf '%s' "${openblas_fixture}"; }
+  spack() {
+    [[ "$1" == -e && "$2" == "${SPACK_ENV}" && "$3" == find && "$4" == --format ]] || return 1
+    case "$5:$6" in
+      '{hash}:openblas') printf '%s' "${openblas_hash}" ;;
+      "{^blas.hash}|{^lapack.hash}:${HYPRE_SPEC}")
+        printf '%s|%s' "${openblas_hash}" "${openblas_hash}" ;;
+      *) return 1 ;;
+    esac
+  }
+  SPACK_CUDA_ARCH=80
+  cmake_args=()
+  configure_sm80_hypre_linalg
+  for expected_arg in \
+      '-DHYPRE_REQUIRED_PACKAGES:STRING=BLAS;LAPACK;UMPIRE' \
+      -DUMPIRE_TARGET_NAMES:STRING=umpire -DUMPIRE_TARGET_FORCE:BOOL=OFF \
+      -UHYPRE_FOUND -UHYPRE_LIBRARIES -UHYPRE_INCLUDE_DIRS; do
+    [[ " ${cmake_args[*]} " == *" ${expected_arg} "* ]] || \
+      fail "SM80 static-HYPRE dependency arguments omit ${expected_arg}"
+  done
+  unset_count=0
+  for actual_arg in "${cmake_args[@]}"; do
+    case "${actual_arg}" in
+      -UHYPRE_FOUND|-UHYPRE_LIBRARIES|-UHYPRE_INCLUDE_DIRS) unset_count=$((unset_count + 1)) ;;
+      -U*) fail "SM80 clears an unrelated or broad CMake cache entry: ${actual_arg}" ;;
+    esac
+  done
+  [[ ${unset_count} -eq 3 ]] || fail "SM80 HYPRE rediscovery must clear exactly three cache entries"
+  assert_contains "${cmake_args[*]}" '-DBLA_VENDOR:STRING=OpenBLAS'
+  assert_contains "${cmake_args[*]}" "-DBLAS_openblas_LIBRARY:FILEPATH=${openblas_fixture}/lib64/libopenblas.so"
+  assert_contains "${cmake_args[*]}" "-DLAPACK_openblas_LIBRARY:FILEPATH=${openblas_fixture}/lib64/libopenblas.so"
+  [[ "${cmake_args[*]}" != *MFEM_USE_LAPACK* ]] || fail "SM80 changed MFEM's own LAPACK policy"
+  mv "${openblas_fixture}/lib64/libopenblas.so" "${tmp_root}/outside-openblas.so"
+  ln -s "${tmp_root}/outside-openblas.so" "${openblas_fixture}/lib64/libopenblas.so"
+  set +e
+  output="$(configure_sm80_hypre_linalg 2>&1)"
+  status=$?
+  set -e
+  [[ "${status}" == 3 ]] || fail "redirected OpenBLAS library was admitted"
+  SPACK_CUDA_ARCH=120
+  cmake_args=()
+  spack_location() { fail "SM120 queried an OpenBLAS prefix"; }
+  spack() { fail "SM120 queried OpenBLAS metadata"; }
+  configure_sm80_hypre_linalg
+  [[ ${#cmake_args[@]} == 0 ]] || fail "SM120 gained SM80-only linalg arguments"
+)
+
 # The reuse tuple is revalidated only after a real dependency install and
 # before any view export or build consumer can observe the transition.
 assert_reuse_transaction_order "${BUILD_DRIVER}"
@@ -705,5 +831,7 @@ if ! grep -Fq '_dg_igr_arch STREQUAL "${_dg_igr_expected_arch}-real"' \
   "${REPO_ROOT}/CMakeLists.txt"; then
   fail "application CMake no longer admits native real code generation"
 fi
+
+bash "${REPO_ROOT}/tests/scripts/check_spack_external_artifacts.sh" "${REPO_ROOT}"
 
 echo "cuda-build-policy: PASS"

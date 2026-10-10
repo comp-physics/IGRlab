@@ -4,9 +4,11 @@
 #include "utils/config/env_flags.hpp"
 #include "utils/profiling/nvtx.hpp"
 #include "IGR_internal_utils.hpp"
+#include "IGR_nodal_source.hpp"
 #include "IGR_dense_inverse.hpp"
 #include "IGR_two_level_inverse.hpp"
 #include "IGR_screened_patch_inverse.hpp"
+#include "IGR_face_density_cuda.hpp"
 #include "IGR_stationary_correction.hpp"
 #include "../../numerics/dg/DGFaceQuadratureKernels.hpp"
 
@@ -1836,12 +1838,39 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
     auto* pmesh = dynamic_cast<mfem::ParMesh*>(mesh);
     const mfem::Geometry::Type face_geom = mesh->GetTypicalFaceGeometry();
     const mfem::IntegrationRule& exact_face_ir =
-      mfem::IntRules.Get(face_geom, 2 * SpaceOrder(sfes_));
-    mfem::FaceQuadratureSpace exact_fqs(*mesh,
-                                        exact_face_ir,
-                                        mfem::FaceType::Interior);
+      mfem::IntRules.Get(face_geom, std::max({2 * SpaceOrder(sfes_),
+        subcell_quadrature_minimum_order_, OperatorQuadratureMinimumOrder()}));
+    if (OperatorQuadratureMinimumOrder() > 0)
+    {
+      static bool logged_exact_rule = false;
+      if (!logged_exact_rule)
+      {
+        std::cout << "[igr-research] event=exact-face-quadrature requested_min_order="
+                  << OperatorQuadratureMinimumOrder()
+                  << " actual_order=" << exact_face_ir.GetOrder()
+                  << " points=" << exact_face_ir.GetNPoints() << std::endl;
+        logged_exact_rule = true;
+      }
+    }
+    const bool use_cuda_face_density =
+      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_FACE_DENSITY_CUDA", false);
+    const bool cache_face_density =
+      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_FACE_DENSITY_CACHE", false);
+    MFEM_VERIFY(!cache_face_density || use_cuda_face_density,
+                "Face-density geometry caching requires the CUDA projection option.");
+    std::unique_ptr<mfem::FaceQuadratureSpace> uncached_fqs;
+    if (cache_face_density)
+    {
+      if (!face_density_cuda_cache_)
+        face_density_cuda_cache_ = std::make_shared<FaceDensityCUDAProjectionCache>();
+    }
+    else
+      uncached_fqs = std::make_unique<mfem::FaceQuadratureSpace>(
+        *mesh, exact_face_ir, mfem::FaceType::Interior);
+    const mfem::FaceQuadratureSpace& exact_fqs = cache_face_density
+      ? face_density_cuda_cache_->Prepare(vfes_, sfes_, exact_face_ir) : *uncached_fqs;
     std::string reason;
-    if (!dg_face::SupportsInteriorFaceSideDensityProjection2D(vfes_,
+    if (!cache_face_density && !dg_face::SupportsInteriorFaceSideDensityProjection2D(vfes_,
                                                               exact_fqs,
                                                               &reason))
     {
@@ -1850,7 +1879,7 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
                   "Unsupported exact IGR side-density face operator: "
                     << reason);
     }
-    if (!dg_face::SupportsInteriorFaceScalarTraceProjection2D(sfes_,
+    if (!cache_face_density && !dg_face::SupportsInteriorFaceScalarTraceProjection2D(sfes_,
                                                               exact_fqs,
                                                               &reason))
     {
@@ -1859,15 +1888,32 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
                   "Unsupported exact IGR sigma face operator: " << reason);
     }
 
-    mfem::Vector side_q;
-    dg_face::InteriorFaceSideDensityProjectionScratch side_scratch;
+    mfem::Vector uncached_side_q;
+    dg_face::InteriorFaceSideDensityProjectionScratch uncached_side_scratch;
+    mfem::Vector& side_q = cache_face_density ? face_density_cuda_cache_->side_q : uncached_side_q;
+    auto& side_scratch = cache_face_density ? face_density_cuda_cache_->work : uncached_side_scratch;
     if (local_alpha)
     {
       MFEM_VERIFY(device_element_alpha_.Size() == vfes_.GetNE(),
                   "Exact local-alpha face projection requires the current "
                   "device element-alpha cache.");
     }
-    const auto side_info = local_alpha
+    dg_face::InteriorFaceSideDensityProjectionInfo side_info;
+    if (use_cuda_face_density)
+    {
+#if defined(DG_IGR_HAS_FACE_DENSITY_CUDA)
+      MFEM_VERIFY(mfem::Device::Allows(mfem::Backend::CUDA),
+                  "CUDA face-density projection requires the CUDA backend.");
+      side_info = ProjectInteriorFaceDensityCoefficientCUDA(
+        vfes_, exact_fqs, U, alpha_, local_alpha ? &device_element_alpha_ : nullptr,
+        rho_floor_, side_q, side_scratch,
+        cache_face_density ? &face_density_cuda_cache_->info : nullptr);
+#else
+      MFEM_ABORT("CUDA face-density projection requires a CUDA build.");
+#endif
+    }
+    else
+      side_info = local_alpha
       ? dg_face::ProjectInteriorFaceDensityCoefficient2D(vfes_,
                                                          exact_fqs,
                                                          U,
@@ -1882,6 +1928,18 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
                                                          rho_floor_,
                                                          side_q,
                                                          &side_scratch);
+    if (linear_solve_calls_ == 0 && mfem::Mpi::Root())
+      std::cout << "[igr-linear] event=face-density-path arithmetic="
+                << (use_cuda_face_density ? "cuda" : "host")
+                << " scope=local-interior-faces geometry_cache="
+                << (cache_face_density ? "per-solver" : "none") << std::endl;
+    if (cache_face_density &&
+        (face_density_cuda_cache_->hits == 0 || debug_qf))
+      std::cout << "[igr-linear] event=face-density-cache rebuilds="
+                << face_density_cuda_cache_->rebuilds << " hits=" << face_density_cuda_cache_->hits
+                << " shape_entries=" << face_density_cuda_cache_->work.shape.Size()
+                << " map_entries=" << face_density_cuda_cache_->work.element_vdof_map.Size()
+                << std::endl;
     last_exact_face_local_nf_ = side_info.nf;
     const bool ingestion_audit =
       ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_INGESTION_AUDIT", false);
@@ -2216,13 +2274,13 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                 (using_cuda && !using_dense_inverse && !using_two_level_inverse &&
                  patch_radius >= 0 && patch_radius <= 6 &&
                  patch_rebuild_interval >= 0 &&
-                 (patch_precision == "fp64" || patch_precision == "fp32") &&
-                 (patch_kind == "ras" || (patch_kind == "vertex-p1" &&
+                 (patch_precision == "fp64" || patch_precision == "fp32" || patch_precision == "tf32") &&
+                 (patch_kind == "ras" || ((patch_kind == "face-condensed" || patch_kind == "trace-pairs") && patch_radius == 0 && spd_ok) || (patch_kind == "vertex-p1" &&
                     patch_radius == 0 && patch_precision == "fp64" && spd_ok))),
-              "Screened patch inverse requires CUDA, radius 0..6, fp64|fp32, "
+              "Screened patch inverse requires CUDA, radius 0..6, fp64|fp32|tf32, "
               "a nonnegative rebuild interval, "
               "and no global dense or two-level inverse. kind=vertex-p1 additionally "
-              "requires radius=0, fp64 and symmetric SIPG.");
+              "requires radius=0, fp64 and symmetric SIPG; face-condensed requires radius=0 and symmetric SIPG.");
   const char* two_level_coarse_env = std::getenv("DG_IGR_IGR_TWO_LEVEL_COARSE");
   const std::string two_level_coarse =
     two_level_coarse_env ? two_level_coarse_env : "dense";
@@ -2295,8 +2353,9 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                 solver_choice == LinearSolverType::FGMRES,
               "Two-level inverse experiment requires explicit FGMRES.");
   MFEM_VERIFY(!using_screened_patch || solver_choice == LinearSolverType::FGMRES ||
-                (patch_kind == "vertex-p1" && solver_choice == LinearSolverType::CG),
-              "Screened RAS requires explicit FGMRES; vertex-p1 permits CG or FGMRES.");
+                ((patch_kind == "vertex-p1" || patch_kind == "face-condensed" || patch_kind == "trace-pairs") &&
+                 patch_precision == "fp64" && solver_choice == LinearSolverType::CG),
+              "Screened RAS and mixed precision require FGMRES; FP64 vertex/face-condensed also permit CG.");
 
   // Guardrail: do not use SPD-only Krylov methods when SPD assumptions fail.
   if (RequiresSPD(solver_choice) && !spd_ok)
@@ -3143,7 +3202,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   if (using_screened_patch)
   {
     last_precond_name_ = patch_kind == "ras" ? "screened-patch-" + patch_precision
-                                            : "screened-vertex-p1-fp64";
+                                            : "screened-" + patch_kind + "-" + patch_precision;
   }
 
   const bool capture_linear_event =

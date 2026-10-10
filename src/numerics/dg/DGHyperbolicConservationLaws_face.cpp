@@ -5,6 +5,32 @@ namespace mfem
 
 #include "DGHyperbolicConservationLaws_device_kernels.hpp"
 
+void DGHyperbolicConservationLaws::SetP0FaceReferenceXSlopes(const Vector* slopes)
+{
+  MFEM_VERIFY(!slopes || slopes->Size() == vfes.GetVSize(),
+              "P0 MUSCL slope vector has an incompatible native layout.");
+  if (slopes && slopes != p0_face_reference_x_slopes_)
+  {
+    MFEM_VERIFY(Device::Allows(Backend::CUDA_MASK) &&
+                  vol_mode_ == VolumeMode::WeakDivergence && dim == 2 &&
+                  num_equations == 4 && slopes->Size() == vfes.GetVSize() &&
+                  vfes.GetNE() > 0,
+                "P0 MUSCL traces require 2D four-field CUDA weak-DG transport.");
+    for (int e = 0; e < vfes.GetNE(); ++e)
+      MFEM_VERIFY(vfes.GetFE(e)->GetOrder() == 0 && vfes.GetFE(e)->GetDof() == 1 &&
+                    vfes.GetFE(e)->GetGeomType() == Geometry::SQUARE,
+                  "P0 MUSCL traces require quadrilateral cell-mean test functions.");
+#ifdef MFEM_USE_MPI
+    const auto* pfes = dynamic_cast<const ParFiniteElementSpace*>(&vfes);
+    int ranks = 0;
+    if (pfes) MPI_Comm_size(pfes->GetComm(), &ranks);
+    MFEM_VERIFY(pfes && ranks == 1 && pfes->GetParMesh()->GetNSharedFaces() == 0,
+                "P0 MUSCL traces support rank one without shared faces.");
+#endif
+  }
+  p0_face_reference_x_slopes_ = slopes;
+}
+
 const BdrHyperbolicFluxIntegrator*
 DGHyperbolicConservationLaws::FindBdrIntegrator_(int attr) const
 {
@@ -1211,6 +1237,10 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
   const int dof = face_elem_dof_;
   const int neq = num_equations;
   const int ldof = dof * neq;
+  const real_t* const transport_slopes =
+    p0_face_reference_x_slopes_ ? p0_face_reference_x_slopes_->Read() : nullptr;
+  MFEM_VERIFY(!transport_slopes || (dof == 1 && face_shared_e1_.Size() == 0),
+              "P0 MUSCL packed faces cannot use higher-order tests or shared faces.");
   const bool use_q_parallel =
     ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DG_FACE_Q_PARALLEL", true);
 
@@ -1276,6 +1306,9 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       int_kernel.normals = face_int_normals_.Read();
       int_kernel.weights = face_int_weights_.Read();
       int_kernel.x = x_in.Read();
+      int_kernel.reference_x_slopes = transport_slopes;
+      int_kernel.ip1_ref = transport_slopes ? face_int_ip1_ref_.Read() : nullptr;
+      int_kernel.ip2_ref = transport_slopes ? face_int_ip2_ref_.Read() : nullptr;
       int_kernel.z = z_inout.ReadWrite();
       int_kernel.face_speed_q = face_int_speed_q_.Write();
       int_kernel.q_sigma_telemetry = int_q_sigma_telemetry;
@@ -1316,6 +1349,9 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       int_kernel.normals = face_int_normals_.Read();
       int_kernel.weights = face_int_weights_.Read();
       int_kernel.x = x_in.Read();
+      int_kernel.reference_x_slopes = transport_slopes;
+      int_kernel.ip1_ref = transport_slopes ? face_int_ip1_ref_.Read() : nullptr;
+      int_kernel.ip2_ref = transport_slopes ? face_int_ip2_ref_.Read() : nullptr;
       int_kernel.z = z_inout.ReadWrite();
       int_kernel.face_speed = face_int_speed_.Write();
       int_kernel.q_sigma_telemetry = int_q_sigma_telemetry;
@@ -1368,6 +1404,8 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       bdr_kernel.normals = face_bdr_normals_.Read();
       bdr_kernel.weights = face_bdr_weights_.Read();
       bdr_kernel.x = x_in.Read();
+      bdr_kernel.reference_x_slopes = transport_slopes;
+      bdr_kernel.ip1_ref = transport_slopes ? face_bdr_ip1_ref_.Read() : nullptr;
       bdr_kernel.z = z_inout.ReadWrite();
       bdr_kernel.face_speed_q = face_bdr_speed_q_.Write();
       bdr_kernel.q_sigma_telemetry = bdr_q_sigma_telemetry;
@@ -1412,6 +1450,8 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       bdr_kernel.normals = face_bdr_normals_.Read();
       bdr_kernel.weights = face_bdr_weights_.Read();
       bdr_kernel.x = x_in.Read();
+      bdr_kernel.reference_x_slopes = transport_slopes;
+      bdr_kernel.ip1_ref = transport_slopes ? face_bdr_ip1_ref_.Read() : nullptr;
       bdr_kernel.z = z_inout.ReadWrite();
       bdr_kernel.face_speed = face_bdr_speed_.Write();
       bdr_kernel.q_sigma_telemetry = bdr_q_sigma_telemetry;

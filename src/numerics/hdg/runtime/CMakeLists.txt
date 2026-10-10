@@ -100,6 +100,7 @@ endif()
 if(DG_IGR_ENABLE_HDG_RUNTIME)
   if(MFEM_USE_CUDA)
     set(_dg_igr_hdg_runtime_cuda_production_sources
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/generic_euler_app.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda/persistent_smooth_euler.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda/native_rank1_trace_solver.cu")
     set(_dg_igr_hdg_frozen_test_only_cuda_sources
@@ -271,6 +272,14 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
       SOURCES ${_dg_igr_hdg_runtime_cuda_production_sources}
       PUBLIC_LINK_LIBRARIES dg_igr_hdg_runtime_common
       PRIVATE_LINK_LIBRARIES dg_igr_hdg_generic_cpu)
+    if(DG_IGR_OBSERVABILITY_USE_NVTX)
+      # Preserve optimized native trace code while retaining source locations
+      # for profiler and Compute Sanitizer reports.
+      set_property(SOURCE
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda/native_rank1_trace_solver.cu"
+        APPEND PROPERTY COMPILE_OPTIONS
+        "$<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:-lineinfo>")
+    endif()
     dg_igr_hdg_require_target_link_closure_absent(
       dg_igr_hdg_runtime_cuda dg_igr_hdg_sc25_oracle_cpu)
 
@@ -286,10 +295,12 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
       CUDA_STANDARD 17
       CUDA_STANDARD_REQUIRED ON
       CUDA_EXTENSIONS OFF
-      CUDA_ARCHITECTURES 120
+      CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
       CUDA_SEPARABLE_COMPILATION ON
       CUDA_RESOLVE_DEVICE_SYMBOLS OFF
       EXCLUDE_FROM_ALL TRUE)
+    target_compile_definitions(dg_igr_hdg_sc25_oracle_cuda PUBLIC
+      DG_IGR_HDG_NATIVE_CUDA_ARCH=${DG_IGR_HDG_NATIVE_CUDA_ARCH})
     target_include_directories(dg_igr_hdg_sc25_oracle_cuda PUBLIC
                                "${PROJECT_SOURCE_DIR}/include")
     target_compile_options(dg_igr_hdg_sc25_oracle_cuda PRIVATE
@@ -316,6 +327,18 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
         dg_igr_hdg_runtime_cuda
         dg_igr_hdg_generic_cpu
         dg_igr_hdg_runtime_app_contract)
+    # The application only uses the opaque host facade. All persistent engine
+    # ownership, including MFEM's CUDA-dependent SparseMatrix layout, stays in
+    # generic_euler_app.cu; keep this host-only wrapper out of device compilation.
+    set_source_files_properties(
+      "${PROJECT_SOURCE_DIR}/src/sim/hdg/main_backend_cuda.cu"
+      PROPERTIES LANGUAGE CXX)
+    # The project also supports CMake versions before CMP0119, where LANGUAGE
+    # selects the compiler without forcing its input language for a .cu file.
+    set_property(SOURCE
+      "${PROJECT_SOURCE_DIR}/src/sim/hdg/main_backend_cuda.cu"
+      APPEND PROPERTY COMPILE_OPTIONS
+      "$<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-x;c++>")
   elseif(_dg_igr_hdg_runtime_cuda_sources)
     message(STATUS
             "HDG CUDA sources are reserved but not built by the requested CPU profile.")

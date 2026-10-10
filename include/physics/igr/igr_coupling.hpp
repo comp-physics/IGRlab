@@ -12,6 +12,7 @@
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/timestepping/stage_aware_operator.hpp"
 #include "physics/igr/IGR.hpp"
+#include "physics/igr/detail/compact_subcell_recovery.hpp"
 
 /**
  * @file physics/igr/igr_coupling.hpp
@@ -132,13 +133,21 @@ class EulerWithIGR : public TimeDependentOperator,
 public:
   EulerWithIGR(DGHyperbolicConservationLaws& base,
                ::dg_igr::IGRSolver& igr,
-               ParGridFunction& state)
+               ParGridFunction& state,
+               ::dg_igr::igr_internal::CompactSubcellRecovery* subcell_recovery = nullptr)
     : TimeDependentOperator(base.Height()),
       base_(base),
       igr_(igr),
-      state_(state)
+      state_(state),
+      subcell_recovery_(subcell_recovery)
   {
     sigma_cadence_ = igr_.GetSigmaUpdateCadence();
+    MFEM_VERIFY(base_.GetModalDampingRate() == 0.0 ||
+                  sigma_cadence_ == ::dg_igr::IGRSigmaUpdateCadence::EveryStage,
+                "Modal damping with IGR requires a current stress solve "
+                "at every RK stage.");
+    MFEM_VERIFY(!subcell_recovery_ || sigma_cadence_ == ::dg_igr::IGRSigmaUpdateCadence::EveryStage,
+                "Compact subcell recovery requires a current IGR solve at every RK stage.");
     sigma_interval_ = std::max(1, igr_.GetSigmaUpdateInterval());
     const char* degree = std::getenv("DG_IGR_IGR_EXTRAPOLATION_DEGREE");
     if (degree && *degree)
@@ -178,17 +187,18 @@ public:
     return IsExtrapolatedEveryStep();
   }
 
-  /** Bound variable-step growth while two accepted anchors are extrapolated.
+  /** Apply the base stability bound and limit extrapolated-step growth.
    *
    * Save-time clipping and a rapidly changing CFL estimate can otherwise make
    * h_n/h_{n-1} arbitrarily large.  Keeping the ratio at most two bounds every
    * physical-time extrapolation coefficient without changing the
-   * instantaneous endpoint closure. Other cadence policies are untouched.
+   * instantaneous endpoint closure. Other cadences retain the base bound.
    */
   real_t LimitProposedRKStepSize(real_t proposed_dt) const
   {
     MFEM_VERIFY(std::isfinite(proposed_dt) && proposed_dt > 0.0,
                 "IGR step-size limiting requires a finite positive proposal.");
+    proposed_dt = base_.LimitProposedRKStepSize(proposed_dt);
     if (!IsExtrapolatedEveryStep() || !extrapolated_previous_valid_)
     {
       return proposed_dt;
@@ -501,7 +511,7 @@ public:
         igr_.SetRKStageIndex(-1);
         igr_.SetCurrentTime(time);
         igr_.SetCurrentTimeStep(std::numeric_limits<double>::quiet_NaN());
-        igr_.UpdateFromState(state,
+        igr_.UpdateFromState(ClosureInput(state),
                              /*warm_start=*/!cold_start,
                              ::dg_igr::IGRSolvePurpose::OutputOnly,
                              certify_residual);
@@ -548,7 +558,7 @@ public:
       igr_.SetCurrentTime(time);
       igr_.SetCurrentTimeStep(std::numeric_limits<double>::quiet_NaN());
       igr_.UpdateFromState(
-        state,
+        ClosureInput(state),
         /*warm_start=*/!cold_start,
         reusable_for_transport
           ? ::dg_igr::IGRSolvePurpose::ProductionStage0Prefetch
@@ -894,7 +904,7 @@ public:
         {
           igr_.SetRKStageIndex(-1);
         }
-        igr_.UpdateFromState(stage_state, /*warm_start=*/true);
+        igr_.UpdateFromState(ClosureInput(stage_state), /*warm_start=*/true);
 
         // Make sigma available on face neighbors across MPI subdomains.
         if (HasMultipleOwningRanks())
@@ -921,6 +931,9 @@ public:
         last_sigma_step_ = rk_step_;
       }
     }
+
+    if (subcell_recovery_ && subcell_recovery_->UsesMUSCLTransport())
+      base_.SetP0FaceReferenceXSlopes(&subcell_recovery_->RebuildTransportSlopes(U));
 
     // Delay forwarding the arm until immediately before base_.Mult. If an IGR
     // closure fails first, no armed request can leak into a later CFL probe.
@@ -954,6 +967,11 @@ public:
   }
 
 private:
+  const ParGridFunction& ClosureInput(const ParGridFunction& state) const
+  {
+    return subcell_recovery_ ? subcell_recovery_->Rebuild(state) : state;
+  }
+
   bool IsExtrapolatedEveryStep() const
   {
     return sigma_cadence_ ==
@@ -1099,7 +1117,7 @@ private:
     MFEM_VERIFY(igr_.GetSolveMode() == ::dg_igr::IGRSolveMode::Krylov,
                 "Extrapolated IGR exact anchors require a Krylov solve for "
                 "independent FP64 residual certification.");
-    igr_.UpdateFromState(state,
+    igr_.UpdateFromState(ClosureInput(state),
                          warm_start,
                          purpose,
                          /*certify_residual=*/true);
@@ -1864,6 +1882,7 @@ private:
   DGHyperbolicConservationLaws& base_;
   ::dg_igr::IGRSolver& igr_;
   ParGridFunction& state_; // view of current state (vdim=num_eq)
+  ::dg_igr::igr_internal::CompactSubcellRecovery* subcell_recovery_ = nullptr;
   ::dg_igr::IGRSigmaUpdateCadence sigma_cadence_ =
     ::dg_igr::IGRSigmaUpdateCadence::EveryStage;
   int sigma_interval_ = 1;

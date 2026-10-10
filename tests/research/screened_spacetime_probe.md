@@ -137,3 +137,48 @@ it preserves the DG mesh, initial condition, alpha and target equations. For
 eight elements and two-element blocks, the compression fronts at x=0 and x=.5
 lie at block cuts with offset zero and inside blocks with offset one. This
 is a same-physics test of source proximity to a block boundary.
+
+## Analytic two-derivative factor reuse
+
+`--method rk4-tdrk4` compares RK4 with a two-stage fourth-order two-derivative
+method. It differentiates the current constraint analytically:
+`A dot_sigma = dot_b - dot_A sigma`, including density changes in both the
+reaction and diffusion. The current factor supplies sigma and its physical-time
+tangent; no dense joint Jacobian or nonlinear stage iteration is used. Both
+Rusanov flux and dissipation-speed derivatives are included. Exact max/abs ties
+use forward directional derivatives, which do not imply smooth fourth-order
+accuracy through a wave-speed switch.
+
+The accepted endpoint factor is retained for the next step. A completed run
+uses `1+2*steps` current matrix constructions/factors and `2*steps` additional
+tangent RHS solves, versus RK4's `1+4*steps` current factors. The total scalar
+RHS count remains the same. Tangent source, flux and face work have separate
+JSON counters; `reuse_setup_seconds` includes current factor construction and
+its sigma solve. Endpoint closure is directly solved and physical admission is
+checked. Independent self-tests audit analytic closure/flux tangents, a
+nonzero-jump speed switch, conservation, factor counts and smooth order.
+
+```bash
+"$PROBE" --method rk4-tdrk4 --elements 12 --order 3 --halo 0 \
+  --case compression --alpha .0025 --dt .001 --final-time .2 \
+  --reference-dt .00003125
+```
+
+The two-derivative method is neither the previous Gauss predictor nor an ADER
+implementation. Its linear stability polynomial equals RK4's; the hypothesis
+is cheaper current coefficient/factor construction, not a larger linear CFL.
+
+`--speed-smoothing epsilon` is a separate numerical-flux control. Positive
+epsilon replaces absolute velocity and the face maximum with smooth upper
+envelopes. The face dissipation remains no smaller than the original bound,
+and its excess is at most `1.5*epsilon`. This changes DG numerical dissipation;
+it is not an algebraic optimization. For every positive-epsilon run, the
+executable also computes an unsmoothed reference and reports
+`state_error_to_unsmoothed_reference` and
+`reference_flux_change_relative_l2`, so improved temporal order cannot conceal
+the changed spatial solution. Those independent reference costs are excluded
+from candidate timing and reported separately.
+
+The calibrated analytic-reuse study is documented in
+[`igr_spacetime_reuse_findings.md`](../../docs/research/igr_spacetime_reuse_findings.md),
+with all successful, failed and less accurate rows in its accompanying JSON.

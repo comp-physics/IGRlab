@@ -3,6 +3,26 @@
 namespace detail
 {
 
+// Explicit research SIMT contractions preserve the tensor engine's dataflow
+// and solver policy but issue no volume MMA instructions. Keep the default
+// accounting contract unchanged for all other routes.
+inline bool CudaAccumulateResearchVolumeWork(
+    const bool tensor_selected, const bool borrowed_host_inputs,
+    const std::uint64_t invocation_mma_tiles,
+    std::uint64_t& volume_assembly_launches,
+    std::uint64_t& volume_mma_tiles) noexcept
+{
+  if (!CudaResearchVolumeUsesSimt(tensor_selected && borrowed_host_inputs))
+    return AccumulateTensorVolumeWork(
+        tensor_selected, invocation_mma_tiles,
+        volume_assembly_launches, volume_mma_tiles);
+  if (invocation_mma_tiles != 0 || volume_mma_tiles != 0 ||
+      volume_assembly_launches == std::numeric_limits<std::uint64_t>::max())
+    return false;
+  ++volume_assembly_launches;
+  return true;
+}
+
 // Qualification of a supplied RODAS3 entry state uses the same normalized
 // algebraic correction as the CPU leaf. Keep the reduction private to this
 // implementation: it is one scalar gate, not retained diagnostic history.
@@ -4128,8 +4148,12 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
   // fallback: rank-one tensor-native, rank-one ordinary ParCSR, or the exact
   // engine-default rank-two host-staged ParCSR leaf.
   result.tensor_core.fallback_accounting_complete = true;
-  result.precision_work.all_fp64_policy = true;
-  result.precision_work.accounting_complete = true;
+  const bool reduced_precision_volume =
+      detail::CudaResearchVolumeUsesReducedPrecision(
+          shape_.borrowed_host_inputs &&
+          cuda_engine_ == generic::CudaEngineKind::tensor_core);
+  result.precision_work.all_fp64_policy = !reduced_precision_volume;
+  result.precision_work.accounting_complete = !reduced_precision_volume;
   (void)CudaInitializeIluEvidence(
       result.tensor_core, trace_preconditioner_, shape_.igr_active);
 
@@ -5501,8 +5525,9 @@ AssemblePartitionedScalarClosure(
       cuda_engine_ == generic::CudaEngineKind::tensor_core;
   const bool accounted =
       (cuda_engine_ == generic::CudaEngineKind::ordinary || tensor_selected) &&
-      AccumulateTensorVolumeWork(
-          tensor_selected, invocation_volume_mma_tiles,
+      CudaAccumulateResearchVolumeWork(
+          tensor_selected, shape_.borrowed_host_inputs,
+          invocation_volume_mma_tiles,
           volume_launches, volume_tiles);
   if (!CollectiveContinue(accounted)) return false;
   tensor_core_evidence.volume_assembly_launches = volume_launches;
@@ -5938,8 +5963,9 @@ AssembleAndNorm(state_slot&, const double dt, double& norm,
   const bool tensor_selected =
       cuda_engine_ == generic::CudaEngineKind::tensor_core;
   const bool volume_work_accounted = known_engine &&
-      AccumulateTensorVolumeWork(
-          tensor_selected, invocation_volume_mma_tiles,
+      CudaAccumulateResearchVolumeWork(
+          tensor_selected, shape_.borrowed_host_inputs,
+          invocation_volume_mma_tiles,
           updated_volume_assembly_launches, updated_volume_mma_tiles);
   if (!CollectiveContinue(volume_work_accounted)) return false;
   tensor_core_evidence.volume_assembly_launches =

@@ -236,12 +236,40 @@ void LaunchFusedDoubleLines(int n,int ne,const double* f,const double* a,
   }
 }
 
+__host__ __device__ constexpr unsigned Tf32RoundBits(unsigned bits)
+{
+  // Drop 13 FP32 fraction bits, rounding ties to an even retained bit.
+  // Keep infinities and quiet NaNs before the rounding addition can carry.
+  const unsigned magnitude=bits&0x7fffffffu;
+  if(magnitude>=0x7f800000u)
+    return magnitude==0x7f800000u?bits:(bits&0xffffe000u)|0x00400000u;
+  return (bits+0xfffu+((bits>>13)&1u))&0xffffe000u;
+}
+
+static_assert(Tf32RoundBits(0x3f801000u)==0x3f800000u &&
+    Tf32RoundBits(0x3f803000u)==0x3f804000u &&
+    Tf32RoundBits(0xbf801000u)==0xbf800000u &&
+    Tf32RoundBits(0xbf803000u)==0xbf804000u,"TF32 ties must round to even");
+static_assert(Tf32RoundBits(0x3f800fffu)==0x3f800000u &&
+    Tf32RoundBits(0x3f801001u)==0x3f802000u &&
+    Tf32RoundBits(0x3ffff000u)==0x40000000u,"TF32 rounding and exponent carry");
+static_assert(Tf32RoundBits(0x80000000u)==0x80000000u &&
+    Tf32RoundBits(0x00001000u)==0x00000000u &&
+    Tf32RoundBits(0x00003000u)==0x00004000u,"TF32 zero and subnormal rounding");
+static_assert(Tf32RoundBits(0x7f7fffffu)==0x7f800000u &&
+    Tf32RoundBits(0xff800000u)==0xff800000u &&
+    (Tf32RoundBits(0x7f800001u)&0x7fffffffu)>0x7f800000u,
+    "TF32 overflow, infinity and NaN");
+
 __device__ float Tf32(float value)
 {
-#if __CUDA_ARCH__ >= 800
+#if __CUDA_ARCH__ >= 900
   float result;
   asm("cvt.rn.tf32.f32 %0, %1;" : "=f"(result) : "f"(value));
   return result;
+#elif __CUDA_ARCH__ >= 800
+  // PTX cvt.rn.tf32 requires SM90; SM80's .rna uses ties away from zero.
+  return __uint_as_float(Tf32RoundBits(__float_as_uint(value)));
 #else
   return value;
 #endif

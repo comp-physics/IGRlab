@@ -28,6 +28,7 @@
  */
 namespace dg_igr
 {
+namespace igr_internal { struct FaceDensityCUDAProjectionCache; struct NodalVelocitySourceCache; }
 
 enum class IGRSolvePurpose
 {
@@ -76,10 +77,26 @@ public:
   /// Set essential (Dirichlet) boundary attributes for Σ; default is none (natural Neumann).
   void SetDirichletBC(const mfem::Array<int>& ess_bdr);
 
+  /// Physical Euler slip attributes for the optional central-source mirror
+  /// trace. Configure from the same boundary wiring as the Euler operator.
+  /// This does not change scalar closure boundary conditions.
+  void SetNodalSourceSlipBoundaryMarker(const mfem::Array<int>& marker)
+  {
+    nodal_source_slip_marker_ = marker;
+    nodal_source_boundary_ready_ = true;
+  }
+  bool HasNodalSourceBoundaryMarker() const
+  { return nodal_source_boundary_ready_; }
+
   /// Select which gradient backend to use for the Σ RHS.
   void SetGradBackend(GradBackend b) { backend_ = b; }
   void SetIPKind(IPKind k);
   void SetExactDGFaceOperator(bool enabled);
+
+  /// Bounded subcell-bridge control: zero keeps native rules; four floors
+  /// current coefficient/source and closure-face quadrature orders on CUDA.
+  /// Configure before the first state update.
+  void SetSubcellQuadratureMinimumOrder(int order);
 
   // ---- Legacy smoother-sweep knobs (still supported) ----
   void SetSmoother(SmootherType t);
@@ -621,12 +638,18 @@ private:
   std::unique_ptr<mfem::QuadratureFunctionCoefficient> src_qf_coef_;
   std::unique_ptr<mfem::QuadratureFunctionCoefficient> ck_face_qf_coef_;
   mfem::Vector device_qinterp_evec_;
+  std::shared_ptr<igr_internal::NodalVelocitySourceCache> nodal_velocity_source_cache_;
   mfem::Vector device_face_restr_evec_;
+  // Per-solver reference/geometry metadata only; current face coefficients
+  // are recomputed on every invocation. shared_ptr permits this private
+  // implementation type to remain incomplete in the public class header.
+  std::shared_ptr<igr_internal::FaceDensityCUDAProjectionCache> face_density_cuda_cache_;
   // For the local length policy, alpha_ stores C_alpha while this cache stores
   // the physical per-element alpha_e = C_alpha h_e^2.  It is reused until the
   // mesh sequence or C_alpha changes.
   mfem::Vector device_element_alpha_;
   long device_element_alpha_mesh_sequence_ = -1;
+  bool device_element_alpha_positive_validated_ = false;
   double device_element_alpha_c_alpha_ =
     std::numeric_limits<double>::quiet_NaN();
 
@@ -735,6 +758,8 @@ private:
 
   // Linear system objects
   mfem::Array<int> ess_bdr_;
+  mfem::Array<int> nodal_source_slip_marker_;
+  bool nodal_source_boundary_ready_ = false;
   mfem::Array<int> ess_tdof_list_;
   mfem::OperatorHandle Ah_; // holds the assembled operator (Hypre matrix)
   // Owns the current stage's exact-face operator while Ah_ owns the sum.
@@ -828,6 +853,7 @@ private:
   int direct_identity_system_uses_ = 0;
   std::string last_direct_identity_reason_ = "not-evaluated";
   bool exact_dg_face_operator_ = false;
+  int subcell_quadrature_minimum_order_ = 0;
   bool negative_quadratic_capture_written_ = false;
   bool linear_event_capture_written_ = false;
   bool last_exact_face_requested_ = false;

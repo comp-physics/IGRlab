@@ -142,6 +142,70 @@ add_executable(dg_igr_unit_tests
   test_diagnostics.cpp
 )
 
+add_executable(dg_igr_nodal_source_test test_igr_nodal_source.cpp)
+target_link_libraries(dg_igr_nodal_source_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_nodal_source_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME dg_igr_nodal_source_cpu COMMAND dg_igr_nodal_source_test cpu)
+set_tests_properties(dg_igr_nodal_source_cpu PROPERTIES LABELS "igr;source;research;cpu" TIMEOUT 90)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  set_source_files_properties(test_igr_nodal_source.cpp PROPERTIES LANGUAGE CUDA)
+  target_compile_options(dg_igr_nodal_source_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  add_test(NAME dg_igr_nodal_source_cuda COMMAND dg_igr_nodal_source_test cuda)
+  set_tests_properties(dg_igr_nodal_source_cuda PROPERTIES
+    LABELS "igr;source;research;cuda" TIMEOUT 90 RUN_SERIAL TRUE)
+endif()
+
+# Bounded research controls for volume quadrature and physical slip-wall lifts.
+add_executable(dg_igr_overintegrated_volume_test test_dgsem_overintegrated_volume.cpp)
+add_executable(dg_igr_wall_source_probe research/igr_wall_source_probe.cpp)
+add_executable(dg_igr_wall_compression research/igr_wall_compression.cpp)
+foreach(target IN ITEMS dg_igr_overintegrated_volume_test dg_igr_wall_source_probe dg_igr_wall_compression)
+  target_link_libraries(${target} PRIVATE igr_mfem mfem)
+  target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR}/include)
+endforeach()
+foreach(pair IN ITEMS overintegrated_volume wall_source)
+  if(pair STREQUAL "overintegrated_volume")
+    set(probe dg_igr_overintegrated_volume_test)
+  else()
+    set(probe dg_igr_wall_source_probe)
+  endif()
+  add_test(NAME dg_igr_${pair}_cpu COMMAND ${probe} cpu)
+  set_tests_properties(dg_igr_${pair}_cpu PROPERTIES LABELS "igr;research;cpu" TIMEOUT 120)
+  if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+    add_test(NAME dg_igr_${pair}_cuda COMMAND ${probe} cuda)
+    set_tests_properties(dg_igr_${pair}_cuda PROPERTIES LABELS "igr;research;cuda" TIMEOUT 120 RUN_SERIAL TRUE)
+  endif()
+endforeach()
+add_test(NAME dg_igr_wall_annulus_source_cpu COMMAND dg_igr_wall_source_probe cpu --annulus)
+set_tests_properties(dg_igr_wall_annulus_source_cpu PROPERTIES LABELS "igr;research;cpu" TIMEOUT 120)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_test(NAME dg_igr_wall_annulus_source_cuda COMMAND dg_igr_wall_source_probe cuda --annulus)
+  set_tests_properties(dg_igr_wall_annulus_source_cuda PROPERTIES LABELS "igr;research;cuda" TIMEOUT 120 RUN_SERIAL TRUE)
+endif()
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  set_source_files_properties(test_dgsem_overintegrated_volume.cpp PROPERTIES LANGUAGE CUDA)
+  target_compile_options(dg_igr_overintegrated_volume_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+endif()
+
+add_executable(dg_igr_modal_damping_test test_modal_damping.cpp)
+target_link_libraries(dg_igr_modal_damping_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_modal_damping_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME dg_igr_modal_damping_cpu COMMAND dg_igr_modal_damping_test cpu)
+set_tests_properties(dg_igr_modal_damping_cpu PROPERTIES
+  LABELS "modal-damping;conservation;timestepping;cpu"
+  TIMEOUT 90
+)
+if(MFEM_USE_CUDA)
+  add_test(NAME dg_igr_modal_damping_cuda COMMAND dg_igr_modal_damping_test cuda)
+  set_tests_properties(dg_igr_modal_damping_cuda PROPERTIES
+    LABELS "modal-damping;conservation;timestepping;cuda"
+    TIMEOUT 90
+    RUN_SERIAL TRUE
+  )
+endif()
+
 add_executable(dg_igr_explicit_ssprk_test
   test_explicit_ssprk.cpp
 )
@@ -193,6 +257,98 @@ if(MFEM_USE_MPI AND MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
   add_test(NAME dg_igr_screened_spacetime_cpu
     COMMAND dg_igr_screened_spacetime_probe --self-test)
   set_tests_properties(dg_igr_screened_spacetime_cpu PROPERTIES
+    LABELS "cpu-reference;igr;timestepping;research" TIMEOUT 120)
+
+  add_executable(dg_igr_local_predictor_probe research/igr_local_predictor_probe.cpp)
+  target_link_libraries(dg_igr_local_predictor_probe PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_local_predictor_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  add_test(NAME dg_igr_local_predictor_cpu COMMAND dg_igr_local_predictor_probe --self-test)
+  set_tests_properties(dg_igr_local_predictor_cpu PROPERTIES
+    LABELS "cpu-reference;igr;timestepping;research" TIMEOUT 120)
+
+  add_executable(dg_igr_high_order_hybrid_probe research/igr_high_order_hybrid_probe.cpp)
+  target_link_libraries(dg_igr_high_order_hybrid_probe PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_high_order_hybrid_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  add_test(NAME dg_igr_high_order_hybrid_cpu COMMAND dg_igr_high_order_hybrid_probe --self-test)
+  set_tests_properties(dg_igr_high_order_hybrid_cpu PROPERTIES
+    LABELS "cpu-reference;igr;research" TIMEOUT 120)
+
+  add_executable(dg_igr_hp_causal_probe research/igr_hp_causal_probe.cpp)
+  target_link_libraries(dg_igr_hp_causal_probe PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_hp_causal_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  add_test(NAME dg_igr_hp_causal_cpu COMMAND dg_igr_hp_causal_probe --self-test)
+  set_tests_properties(dg_igr_hp_causal_cpu PROPERTIES
+    LABELS "cpu-reference;igr;research" TIMEOUT 120)
+
+  add_executable(dg_igr_hp_front_tracking_probe research/igr_hp_front_tracking_probe.cpp)
+  target_link_libraries(dg_igr_hp_front_tracking_probe PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_hp_front_tracking_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  add_test(NAME dg_igr_hp_front_tracking_cpu COMMAND dg_igr_hp_front_tracking_probe --self-test)
+  set_tests_properties(dg_igr_hp_front_tracking_cpu PROPERTIES
+    LABELS "cpu-reference;igr;research" TIMEOUT 120)
+
+  add_executable(dg_igr_hp_enriched_probe research/igr_hp_enriched_probe.cpp)
+  target_link_libraries(dg_igr_hp_enriched_probe PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_hp_enriched_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  add_test(NAME dg_igr_hp_enriched_cpu COMMAND dg_igr_hp_enriched_probe --self-test)
+  set_tests_properties(dg_igr_hp_enriched_cpu PROPERTIES
+    LABELS "cpu-reference;igr;research" TIMEOUT 120)
+
+  add_executable(dg_igr_hp_moving_time_probe research/igr_hp_moving_time_probe.cpp)
+  target_link_libraries(dg_igr_hp_moving_time_probe PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_hp_moving_time_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  add_test(NAME dg_igr_hp_moving_time_cpu COMMAND dg_igr_hp_moving_time_probe --self-test)
+  set_tests_properties(dg_igr_hp_moving_time_cpu PROPERTIES
+    LABELS "cpu-reference;igr;timestepping;research" TIMEOUT 120)
+
+  foreach(compatibility_probe IN ITEMS work evolution)
+    add_executable(dg_igr_dg_compatibility_${compatibility_probe}_probe
+      research/igr_dg_compatibility_${compatibility_probe}_probe.cpp)
+    target_link_libraries(dg_igr_dg_compatibility_${compatibility_probe}_probe PRIVATE igr_mfem mfem)
+    target_include_directories(dg_igr_dg_compatibility_${compatibility_probe}_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME dg_igr_dg_compatibility_${compatibility_probe}_cpu
+      COMMAND dg_igr_dg_compatibility_${compatibility_probe}_probe --self-test)
+    set_tests_properties(dg_igr_dg_compatibility_${compatibility_probe}_cpu PROPERTIES
+      LABELS "cpu-reference;igr;research" TIMEOUT 120)
+  endforeach()
+
+  foreach(boundary_probe IN ITEMS boundary_evolution wall_work recovery_evolution source_tangent moment_memory primitive_moments kinetic_product primitive_wall slope_penalty radial_wall ordinary_slope curvature_penalty hp_patch front_tangent commuting_evolution gradient_evolution entropy_coupled signed_enrichment signed_predictor entropy_coupled_functional predictor_curvature predictor_curvature_picard)
+    add_executable(dg_igr_dg_${boundary_probe}_probe
+      research/igr_dg_${boundary_probe}_probe.cpp)
+    target_link_libraries(dg_igr_dg_${boundary_probe}_probe PRIVATE igr_mfem mfem)
+    target_include_directories(dg_igr_dg_${boundary_probe}_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME dg_igr_dg_${boundary_probe}_cpu
+      COMMAND dg_igr_dg_${boundary_probe}_probe --self-test)
+    set_tests_properties(dg_igr_dg_${boundary_probe}_cpu PROPERTIES
+      LABELS "cpu-reference;igr;research" TIMEOUT 120)
+  endforeach()
+
+  add_executable(dg_igr_high_order_condensation_probe research/igr_high_order_condensation_probe.cpp)
+  target_link_libraries(dg_igr_high_order_condensation_probe PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_high_order_condensation_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  add_test(NAME dg_igr_high_order_condensation_cpu COMMAND dg_igr_high_order_condensation_probe --self-test)
+  set_tests_properties(dg_igr_high_order_condensation_cpu PROPERTIES
+    LABELS "cpu-reference;igr;research" TIMEOUT 120)
+
+  add_executable(dg_igr_high_order_composite_probe research/igr_high_order_composite_probe.cpp)
+  target_link_libraries(dg_igr_high_order_composite_probe PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_high_order_composite_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  add_test(NAME dg_igr_high_order_composite_cpu COMMAND dg_igr_high_order_composite_probe --self-test)
+  set_tests_properties(dg_igr_high_order_composite_cpu PROPERTIES
+    LABELS "cpu-reference;igr;research" TIMEOUT 120)
+
+  add_executable(dg_igr_subcell_evolution_probe research/igr_subcell_evolution_probe.cpp)
+  target_link_libraries(dg_igr_subcell_evolution_probe PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_subcell_evolution_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  add_test(NAME dg_igr_subcell_evolution_cpu COMMAND dg_igr_subcell_evolution_probe --self-test)
+  set_tests_properties(dg_igr_subcell_evolution_cpu PROPERTIES
+    LABELS "cpu-reference;igr;research" TIMEOUT 120)
+
+  add_executable(dg_igr_subcell_predictor_probe research/igr_subcell_predictor_probe.cpp)
+  target_link_libraries(dg_igr_subcell_predictor_probe PRIVATE igr_mfem mfem)
+  target_include_directories(dg_igr_subcell_predictor_probe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  add_test(NAME dg_igr_subcell_predictor_cpu COMMAND dg_igr_subcell_predictor_probe --self-test)
+  set_tests_properties(dg_igr_subcell_predictor_cpu PROPERTIES
     LABELS "cpu-reference;igr;timestepping;research" TIMEOUT 120)
 
   add_executable(dg_igr_research_rk_test test_research_rk.cpp)
@@ -1479,4 +1635,22 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/time_backend/CMakeLists.txt")
   add_subdirectory(time_backend)
 endif()
 add_subdirectory(hdg)
+if(TARGET dg_igr_hdg_generic_cpu AND MFEM_USE_MPI)
+  add_executable(dg_igr_hdg_wall_evolution_probe research/igr_hdg_wall_evolution_probe.cpp)
+  target_link_libraries(dg_igr_hdg_wall_evolution_probe PRIVATE
+    dg_igr_hdg_generic_cpu mfem MPI::MPI_CXX)
+  target_include_directories(dg_igr_hdg_wall_evolution_probe PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  target_compile_features(dg_igr_hdg_wall_evolution_probe PRIVATE cxx_std_17)
+  add_test(NAME dg_igr_hdg_wall_evolution_cpu COMMAND dg_igr_hdg_wall_evolution_probe --self-test)
+  set_tests_properties(dg_igr_hdg_wall_evolution_cpu PROPERTIES
+    LABELS "cpu-reference;igr;research;hdg" TIMEOUT 120)
+  add_executable(dg_igr_hdg_wall_step_probe research/igr_hdg_wall_step_probe.cpp)
+  target_link_libraries(dg_igr_hdg_wall_step_probe PRIVATE
+    dg_igr_hdg_generic_cpu mfem MPI::MPI_CXX)
+  target_include_directories(dg_igr_hdg_wall_step_probe PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  target_compile_features(dg_igr_hdg_wall_step_probe PRIVATE cxx_std_17)
+  add_test(NAME dg_igr_hdg_wall_step_cpu COMMAND dg_igr_hdg_wall_step_probe --self-test)
+  set_tests_properties(dg_igr_hdg_wall_step_cpu PROPERTIES
+    LABELS "cpu-reference;igr;research;hdg" TIMEOUT 120)
+endif()
 add_subdirectory(regularization)

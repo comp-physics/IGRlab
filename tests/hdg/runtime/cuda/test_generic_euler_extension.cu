@@ -16,6 +16,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <string>
@@ -249,6 +250,9 @@ struct CudaBorrowedAssemblyFusionAudit
       std::numeric_limits<double>::infinity(),
       std::numeric_limits<double>::infinity()}};
   std::array<bool, 8> bitwise_equal{};
+  int volume_points = 0;
+  double fp64_comparison_tolerance = 0.0;
+  bool passes_fp64_threshold = false;
   int elements = 0;
   int interior_dofs = 0;
   int trace_dofs = 0;
@@ -1134,6 +1138,9 @@ struct CudaQualificationTestAccess
     audit.status_all_passed = std::all_of(
         fused.status.begin(), fused.status.end(),
         [](const double value) { return value == 1.0; });
+    audit.volume_points = shape.volume_points;
+    audit.fp64_comparison_tolerance = tensor_tolerance;
+    audit.passes_fp64_threshold = within_tolerance;
     audit.elements = shape.elements;
     audit.interior_dofs = shape.interior_dofs;
     audit.trace_dofs = shape.trace_dofs;
@@ -8505,12 +8512,80 @@ bool CheckRodas3RankTwoScreen(
   return conventional_passed && igr_passed;
 }
 
+// A measurement-only path for arithmetic experiments.  Success means the
+// unchanged FP64 reference and candidate both produced finite local blocks;
+// satisfying the original FP64 error envelope is reported separately.
+bool MeasureAssemblyArithmetic(const int order, const int rank)
+{
+  if(selected_cuda_engine!=CudaEngineKind::tensor_core)return false;
+  constexpr std::array<const char*,8> names{{
+      "residual_r","residual_g","A","B","C","D","f","g"}};
+  const char* requested=std::getenv("DG_IGR_HDG_VOLUME_ARITHMETIC");
+  const char* mode=requested&&*requested?requested:"fp64-wmma";
+  bool all_valid=true;
+  for(const bool physical : {false,true})
+    for(const auto kind : {RegularizationKind::none,RegularizationKind::igr})
+    {
+      mfem::ParMesh mesh=physical?MakePhysicalMesh():MakePeriodicMesh();
+      BorrowedFields fields=MakeBorrowedFields(
+          mesh,order,SourceMode::nonzero,InitialMode::smooth_periodic);
+      BoundaryContext boundary{};
+      EulerHdgRequest request=MakeRequest(
+          mesh,order,fields,boundary,physical,kind);
+      GenericEulerHdgCudaSession session;
+      const auto initialized=session.Initialize(request);
+      const bool ready=All(
+          initialized.status==HdgEulerSessionStatus::initialized,
+          request.communicator);
+      CudaBorrowedAssemblyFusionAudit audit{};
+      const bool original_gate=ready&&
+          CudaQualificationTestAccess::AuditBorrowedAssemblyFusion(session,audit);
+      const bool finite=ready&&audit.elements>0&&audit.status_bitwise_equal&&
+          audit.status_all_passed&&
+          std::all_of(audit.maximum_absolute_errors.begin(),
+              audit.maximum_absolute_errors.end(),
+              [](const double x){return std::isfinite(x);})&&
+          std::all_of(audit.maximum_scaled_errors.begin(),
+              audit.maximum_scaled_errors.end(),
+              [](const double x){return std::isfinite(x);});
+      all_valid=All(finite,request.communicator)&&all_valid;
+      if(rank==0)
+      {
+        std::cout<<std::setprecision(17)
+            <<"[assembly-arithmetic] mode="<<mode<<" order="<<order
+            <<" boundary="<<(physical?"physical":"periodic")
+            <<" regularization="<<(kind==RegularizationKind::igr?"igr":"none")
+            <<" initial=smooth_periodic elements="<<audit.elements
+            <<" volume_points="<<audit.volume_points
+            <<" interior_dofs="<<audit.interior_dofs
+            <<" trace_dofs="<<audit.trace_dofs
+            <<" fp64_threshold="<<audit.fp64_comparison_tolerance
+            <<" passes_fp64_threshold="<<audit.passes_fp64_threshold
+            <<" passes_original_fp64_gate="<<original_gate
+            <<" candidate_wmma_tiles="<<audit.tensor_volume_mma_tiles
+            <<" status_equal="<<audit.status_bitwise_equal
+            <<" status_passed="<<audit.status_all_passed
+            <<" measurements_valid="<<finite<<'\n';
+        for(std::size_t block=0;block<names.size();++block)
+          std::cout<<"[assembly-arithmetic-block] mode="<<mode
+              <<" boundary="<<(physical?"physical":"periodic")
+              <<" regularization="<<(kind==RegularizationKind::igr?"igr":"none")
+              <<" block="<<names[block]
+              <<" max_absolute="<<audit.maximum_absolute_errors[block]
+              <<" max_scaled="<<audit.maximum_scaled_errors[block]
+              <<" bitwise_equal="<<audit.bitwise_equal[block]<<'\n';
+      }
+    }
+  return all_valid;
+}
+
 struct Options
 {
   int order = -1;
   CudaEngineKind engine = CudaEngineKind::ordinary;
   EulerHdgTimeTreatment time_treatment =
       EulerHdgTimeTreatment::backward_euler;
+  bool assembly_arithmetic_only = false;
   bool partitioned_smoke = false;
   bool rodas3_screen = false;
   bool rodas3_rank2_screen = false;
@@ -8555,6 +8630,11 @@ bool ParseOptions(const int argc, char* argv[], Options& options)
         return false;
       continue;
     }
+    if (argument == "--assembly-arithmetic-only")
+    {
+      options.assembly_arithmetic_only = true;
+      continue;
+    }
     if (argument == "--partitioned-smoke")
     {
       options.partitioned_smoke = true;
@@ -8582,7 +8662,10 @@ bool ParseOptions(const int argc, char* argv[], Options& options)
       options.order <= dg::hdg::generic::maximum_polynomial_order &&
       options.partitioned_smoke == partitioned_selected &&
       any_rodas3_screen == rodas3_selected &&
-      !(options.rodas3_screen && options.rodas3_rank2_screen);
+      !(options.rodas3_screen && options.rodas3_rank2_screen) &&
+      (!options.assembly_arithmetic_only ||
+       (options.engine == CudaEngineKind::tensor_core &&
+        !options.partitioned_smoke && !any_rodas3_screen));
 }
 
 bool CheckRecoveryDispatchAdmission() noexcept
@@ -8624,7 +8707,7 @@ int main(int argc, char* argv[])
                    " [--time-treatment backward-euler|"
                    "partitioned-backward-euler|rodas3]"
                    " [--partitioned-smoke|--rodas3-screen|"
-                   "--rodas3-rank2-screen]\n";
+                   "--rodas3-rank2-screen|--assembly-arithmetic-only]\n";
     return 2;
   }
   const int order = options.order;
@@ -8635,6 +8718,9 @@ int main(int argc, char* argv[])
       (order > 0 && CheckContractAdmission(order));
   mfem::Device device("cuda");
   (void)device;
+  if (options.assembly_arithmetic_only)
+    return ranks == 1 && admission && MeasureAssemblyArithmetic(order,rank)
+        ? EXIT_SUCCESS : EXIT_FAILURE;
   if (options.rodas3_screen)
     return ranks == 1 && CheckRodas3RankOneScreen(rank)
         ? EXIT_SUCCESS : EXIT_FAILURE;

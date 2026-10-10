@@ -18,12 +18,13 @@ struct InoueHattoriStationaryShock1DYOptions
 {
   double shock_x = 0.0;
   double shock_width = -1.0;
+  double shock_mach = 2.0;
+  double shock_speed = 0.0;
 };
 
 constexpr int kNx = 32;
 constexpr int kNy = 1;
 constexpr double kGamma = 1.4;
-constexpr double kShockMach = 2.0;
 constexpr double kVortexMach = 0.0;
 constexpr double kShockSmoothing = 1.0;
 constexpr double kXLeft = -30.0;
@@ -113,6 +114,10 @@ int main(int argc, char* argv[])
                    "Initial shock position in physical coordinates.");
     args.AddOption(&opts.shock_width, "-shock-width", "--shock-width",
                    "Physical initial tanh width; -1 retains the mesh-scaled default.");
+    args.AddOption(&opts.shock_mach, "-shock-mach", "--shock-mach",
+                   "Upstream shock-frame Mach number, greater than one.");
+    args.AddOption(&opts.shock_speed, "-shock-speed", "--shock-speed",
+                   "Galilean x velocity added to both end states and initial profile.");
   };
 
   spec.make_ic = [](const InoueHattoriStationaryShock1DYOptions& opts,
@@ -129,6 +134,13 @@ int main(int argc, char* argv[])
     MFEM_VERIFY(std::isfinite(opts.shock_width) &&
                   (opts.shock_width == -1.0 || opts.shock_width > 0.0),
                 "Shock width must be positive, or -1 for the default.");
+    const double density_ratio = (gamma + 1.0) /
+      (gamma - 1.0 + 2.0 / (opts.shock_mach * opts.shock_mach));
+    MFEM_VERIFY(std::isfinite(opts.shock_mach) && opts.shock_mach > 1.0 &&
+                  std::isfinite(opts.shock_speed) &&
+                  opts.shock_speed < std::min(opts.shock_mach - 1.0,
+                                             opts.shock_mach / density_ratio) * std::sqrt(gamma),
+                "Shock Mach must exceed one; the boost must preserve right supersonic inflow and left outflow.");
     const double base_width = std::min((kXRight - kXLeft) / mx,
                                       (kYTop - kYBottom) / my);
     MFEM_VERIFY(opts.shock_width == -1.0 || opts.shock_width >= 1.0e-6 * base_width,
@@ -140,7 +152,7 @@ int main(int argc, char* argv[])
     auto ic_fun = mfem::GetShockVortexInoueHattoriInitCustom(gamma,
                                                              mx,
                                                              my,
-                                                             kShockMach,
+                                                             opts.shock_mach,
                                                              kVortexMach,
                                                              smoothing,
                                                              kXLeft,
@@ -150,7 +162,14 @@ int main(int argc, char* argv[])
                                                              kVortexX,
                                                              kVortexY,
                                                              opts.shock_x);
-    return dg_sim::MakeVectorFunctionIC(4, ic_fun);
+    auto boosted = [ic_fun, speed = opts.shock_speed](const mfem::Vector& x, mfem::Vector& u)
+    {
+      ic_fun(x, u);
+      // Transform total energy using the original momentum, preserving pressure.
+      u(3) += speed * u(1) + 0.5 * speed * speed * u(0);
+      u(1) += speed * u(0);
+    };
+    return dg_sim::MakeVectorFunctionIC(4, boosted);
   };
 
   spec.build_markers = [](dg_sim::ExampleContext& ctx)
@@ -161,7 +180,7 @@ int main(int argc, char* argv[])
                                          {dg_sim::BoundaryRole::Slip, {1, 3}}});
   };
 
-  spec.apply_bc = [](const InoueHattoriStationaryShock1DYOptions&,
+  spec.apply_bc = [](const InoueHattoriStationaryShock1DYOptions& opts,
                      const dg_sim::ExampleContext&,
                      auto& bc,
                      const auto& markers)
@@ -169,7 +188,8 @@ int main(int argc, char* argv[])
     const mfem::real_t rho1 = 1.0;
     const mfem::real_t p1 = 1.0;
     const mfem::real_t c1 = std::sqrt(kGamma * p1 / rho1);
-    const mfem::real_t u1x = -kShockMach * c1;
+    const mfem::real_t shock_frame_u1x = -opts.shock_mach * c1;
+    const mfem::real_t u1x = shock_frame_u1x + opts.shock_speed;
     const mfem::real_t u1y = 0.0;
     const mfem::real_t v1sq = u1x * u1x + u1y * u1y;
 
@@ -179,10 +199,10 @@ int main(int argc, char* argv[])
     Uin(2) = rho1 * u1y;
     Uin(3) = p1 / (kGamma - 1.0) + 0.5 * rho1 * v1sq;
 
-    const mfem::real_t m1sq = kShockMach * kShockMach;
+    const mfem::real_t m1sq = opts.shock_mach * opts.shock_mach;
     const mfem::real_t rho2 =
       rho1 * (kGamma + 1.0) / (kGamma - 1.0 + 2.0 / m1sq);
-    const mfem::real_t u2x = u1x * (rho1 / rho2);
+    const mfem::real_t u2x = shock_frame_u1x * (rho1 / rho2) + opts.shock_speed;
     const mfem::real_t u2y = 0.0;
     const mfem::real_t p2 =
       p1 * (1.0 + 2.0 * kGamma / (kGamma + 1.0) * (m1sq - 1.0));

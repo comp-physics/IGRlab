@@ -1,5 +1,7 @@
 #include "IGR_screened_patch_inverse.hpp"
+#include "IGR_face_condensed_setup.hpp"
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -37,10 +39,48 @@ __global__ void ApplyPatchRows(int n, int dof, const int* element_dofs,
   if (lane == 0) y[element_dofs[row]] = static_cast<double>(sum);
 }
 
+// One matrix-vector product is deliberately replicated across 16 columns.
+// This is a research comparison: all padded/redundant products are reported.
+// Matrix and vector TF32 rounding happen on chip; FP64 current-A correction
+// remains the responsibility of the outer flexible solver.
+__global__ void ApplyPatchRowsTF32(int dof, const int* element_dofs,
+                                 const int* offsets, const int* inputs,
+                                 const float* rows, const double* x, double* y)
+{
+  using namespace nvcuda;
+  const int e = blockIdx.x, row0 = 16 * blockIdx.y, lane = threadIdx.x;
+  const int begin = offsets[e], count = offsets[e + 1] - begin;
+  __shared__ __align__(32) float a[16 * 8], b[8 * 16], c[16 * 16];
+  wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> af;
+  wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> bf;
+  wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc;
+  wmma::fill_fragment(acc, 0.0f);
+  for (int k = 0; k < count; k += 8)
+  {
+    for (int t = lane; t < 128; t += 32)
+    {
+      const int i = row0 + t / 8, j = k + t % 8;
+      a[t] = (i < dof && j < count) ? wmma::__float_to_tf32(rows[std::size_t(begin) * dof + std::size_t(i) * count + j]) : 0.0f;
+      const int v = k + t / 16;
+      b[t] = v < count ? wmma::__float_to_tf32(static_cast<float>(x[inputs[begin + v]])) : 0.0f;
+    }
+    __syncwarp();
+    wmma::load_matrix_sync(af, a, 8);
+    wmma::load_matrix_sync(bf, b, 16);
+    wmma::mma_sync(acc, af, bf, acc);
+    __syncwarp();
+  }
+  wmma::store_matrix_sync(c, acc, 16, wmma::mem_row_major);
+  __syncwarp();
+  if (lane < 16 && row0 + lane < dof)
+    y[element_dofs[e * dof + row0 + lane]] = static_cast<double>(c[16 * lane]);
+}
+
 class ScreenedPatchInverse final : public mfem::Solver
 {
   int dof_ = 0;
   bool fp32_ = false;
+  bool tf32_ = false;
   mfem::Array<int> element_dofs_, offsets_, inputs_;
   mfem::Vector rows_;
   mfem::Array<float> rows32_;
@@ -57,11 +97,14 @@ public:
     dof_ = ne > 0 ? sfes.GetFE(0)->GetDof() : 0;
     MFEM_VERIFY(ranks == 1 && mfem::Device::Allows(mfem::Backend::CUDA),
                 "Screened patch inverse requires rank-one CUDA.");
-    MFEM_VERIFY((precision == "fp64" || precision == "fp32") && radius >= 0 && radius <= 6,
-                "Screened patch inverse requires fp64|fp32 and radius 0..6.");
-    fp32_ = precision == "fp32";
-    MFEM_VERIFY(kind == "ras" || kind == "vertex-p1", "Unknown screened patch kind.");
+    MFEM_VERIFY((precision == "fp64" || precision == "fp32" || precision == "tf32") && radius >= 0 && radius <= 6,
+                "Screened patch inverse requires fp64|fp32|tf32 and radius 0..6.");
+    tf32_ = precision == "tf32";
+    fp32_ = precision != "fp64";
+    MFEM_VERIFY(kind == "ras" || kind == "vertex-p1" || kind == "face-condensed" || kind == "trace-pairs", "Unknown screened patch kind.");
     const bool vertex = kind == "vertex-p1";
+    const bool condensed = kind == "face-condensed" || kind == "trace-pairs";
+    MFEM_VERIFY(!condensed || radius == 0, "Face condensation requires radius=0.");
     MFEM_VERIFY(dynamic_cast<const mfem::L2_FECollection*>(sfes.FEColl()) &&
                   sfes.GetVDim() == 1 && sfes.GetMesh()->Dimension() == 2 &&
                   ne > 0 && dof_ > 0 && dof_ <= 256 && op.Width() == height &&
@@ -193,8 +236,29 @@ public:
     int max_patch_dofs = 0;
     int max_factor_dofs = 0, vertex_groups = 0;
     long long factor_entries = 0;
+    long long transform_products = 0, elimination_products = 0, composition_products = 0;
+    long long interior_factor_entries = 0, face_factor_entries = 0;
     double local_inverse_error = 0.0;
-    if (vertex)
+    if (condensed)
+    {
+      std::vector<int> ids(element_dofs_.HostRead(), element_dofs_.HostRead() + height);
+      auto result = BuildFaceCondensedRows(sfes, support, block_offsets, blocks, ids, kind == "trace-pairs");
+      input_indices = std::move(result.inputs);
+      row_offsets = std::move(result.offsets);
+      packed_rows = std::move(result.rows);
+      factor_entries = result.factor_entries;
+      max_factor_dofs = result.max_factor_dofs;
+      vertex_groups = result.group_count;
+      local_inverse_error = result.local_error;
+      transform_products = result.transform_products;
+      elimination_products = result.elimination_products;
+      composition_products = result.composition_products;
+      interior_factor_entries = result.interior_factor_entries;
+      face_factor_entries = result.face_factor_entries;
+      for (int e = 0; e < ne; ++e)
+        max_patch_dofs = std::max(max_patch_dofs, row_offsets[e + 1] - row_offsets[e]);
+    }
+    else if (vertex)
     {
       // Corner columns follow MFEM's cyclic local vertex order. For p1 this
       // evaluates the LGL/corner polynomial directly at the current GL nodes.
@@ -391,19 +455,32 @@ public:
     const long long row_bytes = static_cast<long long>(packed_rows.size()) *
                                 (fp32_ ? sizeof(float) : sizeof(double));
     const long long index_bytes = static_cast<long long>(height + ne + 1 + input_indices.size()) * sizeof(int);
+    long long executed_products = 0;
+    for (int e = 0; e < ne; ++e)
+    {
+      const long long count = row_offsets[e + 1] - row_offsets[e];
+      executed_products += tf32_ ? ((dof_ + 15) / 16) * ((count + 7) / 8) * 16LL * 16 * 8
+                                : count * dof_;
+    }
     std::cout << "[igr-screened-patch] event=setup n=" << height << " ne=" << ne
               << " p=" << order << " dof=" << dof_ << " radius=" << radius
               << " kind=" << kind << " vertex_groups=" << vertex_groups
-              << " precision=" << precision << " arithmetic=ordinary_cuda"
-              << " accumulation=" << precision << " colors=" << color_count
+              << " precision=" << precision << " arithmetic=" << (tf32_ ? "wmma_tf32" : "ordinary_cuda")
+              << " accumulation=" << (fp32_ ? "fp32" : "fp64") << " colors=" << color_count
               << " operator_probes=" << color_count * dof_ + 3
               << " max_patch_dofs=" << max_patch_dofs
               << " max_factor_dofs=" << max_factor_dofs
               << " sampled_block_bytes=" << block_entries * sizeof(double)
               << " factor_entries=" << factor_entries << " row_bytes=" << row_bytes
+              << " interior_factor_entries=" << interior_factor_entries
+              << " face_factor_entries=" << face_factor_entries
+              << " transform_products=" << transform_products
+              << " elimination_products=" << elimination_products
+              << " composition_products=" << composition_products
               << " index_bytes=" << index_bytes
               << " retained_device_bytes=" << row_bytes + index_bytes
               << " apply_products=" << packed_rows.size()
+              << " executed_products=" << executed_products
               << " graph_error=" << reconstruction_error
               << " local_inverse_error=" << local_inverse_error
               << " sampling_seconds=" << sample_seconds << " validation_seconds=" << check_seconds
@@ -419,7 +496,10 @@ public:
     MFEM_VERIFY(x.Size() == width, "Screened inverse input size mismatch.");
     y.SetSize(height);
     y.UseDevice(true);
-    if (fp32_)
+    if (tf32_)
+      ApplyPatchRowsTF32<<<dim3(height / dof_, (dof_ + 15) / 16), 32>>>(dof_,
+        element_dofs_.Read(), offsets_.Read(), inputs_.Read(), rows32_.Read(), x.Read(), y.Write());
+    else if (fp32_)
       ApplyPatchRows<float><<<(height + 7) / 8, 256>>>(height, dof_, element_dofs_.Read(),
         offsets_.Read(), inputs_.Read(), rows32_.Read(), x.Read(), y.Write());
     else

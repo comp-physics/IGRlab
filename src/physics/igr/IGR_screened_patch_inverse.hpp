@@ -13,6 +13,12 @@ namespace igr_internal
 // face-hop radius 0..6 and at most 512 DOFs per local principal solve.
 // Setup/factorization is FP64. fp32 uses rounded rows, rounded input scalars and
 // FP32 accumulation in ordinary CUDA; the output vector remains FP64.
+// tf32 uses on-chip rounded WMMA with 16 redundant RHS columns and FP32
+// accumulation. It requires flexible current-operator correction.
+// kind=face-condensed eliminates all GL-to-LGL element interiors, including
+// neighbor trace couplings, and uses disjoint Schur face/vertex blocks (p1..7).
+// kind=trace-pairs uses overlapping two-element all-trace Schur groups.
+// Their fixed FP64 action is SPD; mixed precision requires FGMRES.
 // kind=vertex-p1 uses a congruent GL-to-corner change of basis and solves the
 // principal groups of discontinuous copies at each physical mesh vertex.
 // Its composite GL rows use the same CUDA application; fp64 and radius=0 only.

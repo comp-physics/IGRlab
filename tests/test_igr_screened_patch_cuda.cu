@@ -1,4 +1,9 @@
 #include "../src/physics/igr/IGR_screened_patch_inverse.hpp"
+#include "test_igr_face_condensed_oracle.hpp"
+#include "test_igr_face_density_cuda.hpp"
+#include "test_igr_compact_subcell_recovery.hpp"
+#include <cuda_runtime.h>
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -195,12 +200,106 @@ void TestVertex(mfem::ParMesh& mesh, mfem::Coefficient& reaction,
               << " iterations=" << solver->GetNumIterations() << '\n';
   }
 }
+
+void TestCondensed(mfem::ParMesh& mesh, mfem::Coefficient& reaction,
+                   mfem::Coefficient& diffusion, mfem::Coefficient& changed_reaction,
+                   mfem::Coefficient& changed_diffusion)
+{
+  for (const std::string kind : {"face-condensed", "trace-pairs"})
+  for (int p : {1, 3, 5})
+  {
+    mfem::L2_FECollection collection(p, 2, mfem::BasisType::GaussLegendre);
+    mfem::ParFiniteElementSpace fes(&mesh, &collection);
+    mfem::Vector zero({0.0, 0.0}); mfem::VectorConstantCoefficient convection(zero);
+    mfem::BilinearForm initial(&fes), current(&fes);
+    Assemble(initial, reaction, diffusion, convection);
+    Assemble(current, changed_reaction, changed_diffusion, convection);
+    mfem::DenseMatrix dense, changed;
+    initial.SpMat().ToDenseMatrix(dense); current.SpMat().ToDenseMatrix(changed);
+    const int n = fes.GetVSize();
+    mfem::Vector rhs(n), expected(n), exact(n), current_rhs(n);
+    for (int i = 0; i < n; ++i)
+    { rhs(i) = std::sin(0.37 * i) + 0.3 * std::cos(0.19 * i); exact(i) = 1.0 + 0.1 * std::cos(0.53 * i); }
+    FaceCondensedOracle(dense, fes, rhs, expected, kind == "trace-pairs");
+    changed.Mult(exact, current_rhs);
+    for (const std::string precision : {"fp64", "fp32", "tf32"})
+    {
+      auto pc = dg_igr::igr_internal::MakeScreenedPatchInversePreconditioner(initial.SpMat(), fes, 0, precision, kind);
+      mfem::Vector before(n), after(n), solution(n), action(n);
+      pc->Mult(rhs, before);
+      const double discrepancy = Relative(before, expected);
+      MFEM_VERIFY(discrepancy < (precision == "fp64" ? 1.0e-10 : precision == "fp32" ? 1.0e-5 : 0.01),
+                  "Condensed CUDA action differs from independent full algebra: " << discrepancy);
+      pc->SetOperator(current.SpMat()); pc->Mult(rhs, after);
+      MFEM_VERIFY(Relative(after, before) < 1.0e-14, "Condensed factors changed on SetOperator.");
+      std::unique_ptr<mfem::IterativeSolver> solver;
+      if (precision == "fp64") solver = std::make_unique<mfem::CGSolver>(MPI_COMM_WORLD);
+      else { auto f = std::make_unique<mfem::FGMRESSolver>(MPI_COMM_WORLD); f->SetKDim(80); solver = std::move(f); }
+      solver->SetOperator(current.SpMat()); solver->SetPreconditioner(*pc);
+      solver->SetRelTol(1.0e-11); solver->SetAbsTol(0.0); solver->SetMaxIter(400); solver->SetPrintLevel(0);
+      solver->iterative_mode = false; solution.UseDevice(true);
+      solver->Mult(current_rhs, solution); current.SpMat().Mult(solution, action);
+      MFEM_VERIFY(solver->GetConverged() && Relative(action, current_rhs) < 1.0e-9 && Relative(solution, exact) < 1.0e-8,
+                  "Condensed preconditioner failed current equation correction.");
+      std::cout << "screened_condensed_test kind=" << kind << " p=" << p << " precision=" << precision << " action_error=" << discrepancy
+                << " residual=" << Relative(action, current_rhs) << " solution_error=" << Relative(solution, exact)
+                << " iterations=" << solver->GetNumIterations() << '\n';
+    }
+  }
+}
+
+// Bounded mechanism benchmark; the application harness measures full horizons.
+void Benchmark(int nx, int p, double alpha, int repeats, const std::string& precision,
+               const std::string& kind, int radius)
+{
+  mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(nx, nx, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+  mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
+  mfem::L2_FECollection collection(p, 2, mfem::BasisType::GaussLegendre);
+  mfem::ParFiniteElementSpace fes(&mesh, &collection);
+  mfem::FunctionCoefficient reaction([](const mfem::Vector& x) { return 1.0 / (1.0 + 0.5 * std::tanh(25.0 * (x(0) - 0.43))); });
+  mfem::FunctionCoefficient diffusion([=](const mfem::Vector& x) { return alpha / (1.0 + 0.5 * std::tanh(25.0 * (x(0) - 0.43))); });
+  mfem::Vector zero({0.0, 0.0}); mfem::VectorConstantCoefficient convection(zero);
+  mfem::BilinearForm form(&fes); Assemble(form, reaction, diffusion, convection);
+  const int n = fes.GetVSize(); mfem::Vector x(n), y(n), rhs(n);
+  for (int i = 0; i < n; ++i) x(i) = 1.0 + 0.1 * std::sin(0.17 * i);
+  x.UseDevice(true); y.UseDevice(true); rhs.UseDevice(true);
+  form.SpMat().Mult(x, rhs);
+  const auto start = std::chrono::steady_clock::now();
+  auto pc = dg_igr::igr_internal::MakeScreenedPatchInversePreconditioner(form.SpMat(), fes, radius, precision, kind);
+  cudaDeviceSynchronize();
+  const double setup = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  for (int i = 0; i < 10; ++i) pc->Mult(rhs, y);
+  cudaEvent_t begin, end; cudaEventCreate(&begin); cudaEventCreate(&end);
+  cudaEventRecord(begin);
+  for (int i = 0; i < repeats; ++i) pc->Mult(rhs, y);
+  cudaEventRecord(end); cudaEventSynchronize(end);
+  float ms = 0.0f; cudaEventElapsedTime(&ms, begin, end);
+  cudaEventDestroy(begin); cudaEventDestroy(end);
+  std::unique_ptr<mfem::IterativeSolver> solver;
+  if ((kind == "face-condensed" || kind == "trace-pairs") && precision == "fp64") solver = std::make_unique<mfem::CGSolver>(MPI_COMM_WORLD);
+  else { auto f = std::make_unique<mfem::FGMRESSolver>(MPI_COMM_WORLD); f->SetKDim(80); solver = std::move(f); }
+  solver->SetOperator(form.SpMat()); solver->SetPreconditioner(*pc);
+  solver->SetRelTol(1.0e-8); solver->SetAbsTol(0.0); solver->SetMaxIter(500); solver->SetPrintLevel(0); solver->iterative_mode = false;
+  const auto solve_start = std::chrono::steady_clock::now(); solver->Mult(rhs, y); cudaDeviceSynchronize();
+  const double solve = std::chrono::duration<double>(std::chrono::steady_clock::now() - solve_start).count();
+  mfem::Vector action(n); form.SpMat().Mult(y, action);
+  std::cout << "screened_benchmark nx=" << nx << " p=" << p << " alpha=" << alpha << " precision=" << precision << " kind=" << kind
+            << " n=" << n << " setup_seconds=" << setup << " apply_us=" << 1000.0 * ms / repeats << " solve_seconds=" << solve
+            << " iterations=" << solver->GetNumIterations() << " converged=" << solver->GetConverged()
+            << " residual=" << Relative(action, rhs) << " solution_error=" << Relative(y, x) << '\n';
+  MFEM_VERIFY(solver->GetConverged() && Relative(action, rhs) < 1.0e-7, "Benchmark current residual failed.");
+}
 }
 
 int main(int argc, char** argv)
 {
   mfem::Mpi::Init(argc, argv);
   mfem::Device device("cuda");
+  if (argc == 9 && std::string(argv[1]) == "--benchmark")
+  {
+    Benchmark(std::stoi(argv[2]), std::stoi(argv[3]), std::stod(argv[4]), std::stoi(argv[5]), argv[6], argv[7], std::stoi(argv[8]));
+    return 0;
+  }
   mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
     3, 2, mfem::Element::QUADRILATERAL, true, 1.0, 0.7);
   mfem::ParMesh mesh(MPI_COMM_WORLD, serial);
@@ -229,7 +328,7 @@ int main(int argc, char** argv)
   mfem::DenseMatrixInverse global_reference(changed_dense);
   global_reference.Mult(current_rhs, reference);
   MFEM_VERIFY(Relative(reference, exact) < 1.0e-10, "Manufactured FP64 reference failed.");
-  for (const std::string precision : {"fp64", "fp32"})
+  for (const std::string precision : {"fp64", "fp32", "tf32"})
   for (int radius : {0, 1, 2, 3})
   {
     auto preconditioner = dg_igr::igr_internal::MakeScreenedPatchInversePreconditioner(
@@ -238,7 +337,7 @@ int main(int argc, char** argv)
     Oracle(dense, fes, radius, rhs, expected);
     preconditioner->Mult(rhs, before);
     const double action_error = Relative(before, expected);
-    MFEM_VERIFY(action_error < (precision == "fp64" ? 1.0e-10 : 1.0e-5),
+    MFEM_VERIFY(action_error < (precision == "fp64" ? 1.0e-10 : precision == "fp32" ? 1.0e-5 : 0.01),
                 "CUDA patch action differs from independent local solves.");
     preconditioner->SetOperator(current.SpMat());
     preconditioner->Mult(rhs, after);
@@ -262,5 +361,8 @@ int main(int argc, char** argv)
               << '\n';
   }
   TestVertex(mesh, reaction, diffusion, changed_reaction, changed_diffusion);
+  TestCondensed(mesh, reaction, diffusion, changed_reaction, changed_diffusion);
+  TestFaceDensityCUDA(mesh);
+  TestCompactSubcellRecovery(MPI_COMM_WORLD);
   return 0;
 }

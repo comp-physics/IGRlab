@@ -108,6 +108,13 @@ MakeDGOperator(ExampleContext& ctx, const NumericalFlux& numerical_flux)
   op.SetDGSEMGamma(ctx.run_cfg.case_config.gamma);
   op.SetFaceQuadratureOrderOffset(ctx.run_cfg.case_config.int_order_offset);
   op.SetNumericalFlux(&numerical_flux);
+  op.SetModalDampingRate(ctx.run_cfg.opts.modal_damping_rate);
+  if (ctx.run_cfg.opts.modal_damping_rate > 0.0 && mfem::Mpi::Root())
+  {
+    std::cout << "[modal-damping] rate=" << ctx.run_cfg.opts.modal_damping_rate
+              << " cutoff-fraction=29/39 exponent=4"
+              << " units=inverse-model-time application=stage-rhs\n";
+  }
   if (ctx.run_cfg.dg_backend == DGBackend::DGSEM)
   {
     op.SetVolumeMode(mfem::VolumeMode::DGSEMFluxDiff);

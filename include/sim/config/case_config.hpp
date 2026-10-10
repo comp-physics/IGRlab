@@ -1904,6 +1904,47 @@ inline RunConfig MakeRunConfig(
   return run_cfg;
 }
 
+/** Reject damping selections that cannot retain the requested stage RHS.
+ *
+ * This runs before HDG dispatch, where a DG-only option would otherwise be
+ * silently ignored. Active IGR must recompute stress from each stage state,
+ * as in the modal-damping research baseline.
+ */
+inline std::string ValidateModalDampingSelection(
+  Discretization discretization,
+  Regularization regularization,
+  const CaseConfig& case_cfg,
+  const CommonOptions& opts,
+  const IGROptions& igr_opts)
+{
+  if (!std::isfinite(opts.modal_damping_rate) || opts.modal_damping_rate < 0.0)
+  {
+    return "--modal-damping-rate must be finite and nonnegative (0 disables).";
+  }
+  if (opts.modal_damping_rate == 0.0)
+  {
+    return {};
+  }
+  if (discretization == Discretization::HDG)
+  {
+    return "Positive --modal-damping-rate is supported by DG and DGSEM only; "
+           "the HDG backend has no modal damping implementation.";
+  }
+  if (regularization == Regularization::IGR)
+  {
+    const dg_igr::IGRSigmaUpdateCadence cadence =
+      igr_opts.sigma_cadence.empty()
+        ? case_cfg.igr_config.sigma_cadence
+        : ParseIGRSigmaUpdateCadence(igr_opts.sigma_cadence);
+    if (cadence != dg_igr::IGRSigmaUpdateCadence::EveryStage)
+    {
+      return "Positive --modal-damping-rate with active IGR requires "
+             "--igr-sigma-cadence every-stage.";
+    }
+  }
+  return {};
+}
+
 /** Validate the user-facing explicit SSPRK CFL convention.
  *
  * A positive value is a safety fraction of the selected method's SSP

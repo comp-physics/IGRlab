@@ -172,7 +172,8 @@ inline dg_igr::IGRSolver MakeIGRSolver(DGSpaces& spaces,
                                        int num_equations,
                                        const RunConfig& run_cfg,
                                        double rho_floor,
-                                       const AlphaInfo& alpha_info)
+                                       const AlphaInfo& alpha_info,
+                                       mfem::ParFiniteElementSpace* closure_state_fes = nullptr)
 {
   MFEM_VERIFY(spaces.sigma_fes != nullptr, "IGR requires a sigma space.");
   dg_igr::IGRConfig igr_cfg = run_cfg.case_config.igr_config;
@@ -182,7 +183,7 @@ inline dg_igr::IGRSolver MakeIGRSolver(DGSpaces& spaces,
   ApplyIGRRuntimeOptionOverrides(run_cfg.igr_opts, igr_cfg);
 
   dg_igr::IGRSolver igr(*spaces.sigma_fes,
-                        spaces.vfes,
+                        closure_state_fes ? *closure_state_fes : spaces.vfes,
                         dim,
                         num_equations,
                         igr_cfg.alpha);

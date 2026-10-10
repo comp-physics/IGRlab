@@ -2,7 +2,7 @@
 """Compare saved DGSEM polynomial fields at common physical quadrature points.
 
 Supported input is rank-one MFEM XML VTK: one type-70 Lagrange quadrilateral
-per DG cell, equally spaced local output nodes, a uniform axis-aligned Cartesian
+per DG cell, equally spaced local output nodes, an axis-aligned rectilinear
 mesh, and density, two-component momentum, total energy, and sigma point data.
 The compared objects are the saved tensor-polynomial interpolants, not raw point
 arrays or derived pressure/velocity interpolants. Declare each run's native
@@ -141,8 +141,7 @@ def load_mesh(dataset, order):
     x_edges = clusters([v for cell in cells for v in cell[:2]], tolerance)
     y_edges = clusters([v for cell in cells for v in cell[2:4]], tolerance)
     for edges in (x_edges, y_edges):
-        require(np.max(np.abs(np.diff(edges) - (edges[-1] - edges[0]) / (len(edges) - 1)))
-                <= tolerance, "mesh is not uniform Cartesian")
+        require(np.all(np.diff(edges)>100*tolerance), "rectilinear edges are not strictly separated")
     nx, ny = len(x_edges) - 1, len(y_edges) - 1
     require(nx * ny == ncells, "Cartesian mesh has missing/overlapping cells")
     data = np.empty((ny, nx, n, n, len(FIELDS)))
@@ -262,15 +261,17 @@ def self_test():
     def polynomial(x, y):
         return np.array([1 + x + y*y, x*y - .2, x*x + .3*y, 4 + x*x*y*y, 2*x - y*y])
 
-    def write_fixture(path, p, nx):
+    def write_fixture(path, p, nx, graded=False):
         points, values, connectivity = [], [], []
         n = p + 1
+        edges=np.linspace(0.,1.,nx+1)**(2 if graded else 1)
         for cy in range(nx):
             for cx in range(nx):
                 local = [None] * (n*n)
                 for j in range(n):
                     for i in range(n):
-                        x, y = (cx + i/p)/nx, (cy + j/p)/nx
+                        x=edges[cx]+(edges[cx+1]-edges[cx])*i/p
+                        y=edges[cy]+(edges[cy+1]-edges[cy])*j/p
                         local[vtk_quad_index(i, j, p)] = len(points)
                         points.append([x, y, 0]); values.append(polynomial(x, y))
                 connectivity.extend(local)
@@ -311,6 +312,16 @@ def self_test():
         require(abs(shifted["l2_absolute"] - .25/3) < 1e-13 and
                 abs(shifted["integral_difference"] - .25/9) < 1e-13,
                 "piecewise-polynomial quadrature self-test failed")
+        write_fixture(pb,4,3,graded=True)
+        b=load_mesh(pb,4)
+        graded_report=compare(a,b,4,5)
+        require(max(f['l2_absolute'] for f in graded_report['fields'].values())<1e-13,
+                'graded rectilinear polynomial recovery failed')
+        b['values'][0,0,:,:,0]+=.25
+        shifted=compare(a,b,4,5)['fields']['density']
+        require(abs(shifted['l2_absolute']-.25/9)<1e-13 and
+                abs(shifted['integral_difference']-.25/81)<1e-13,
+                'graded discontinuity quadrature failed')
         tree = ET.parse(pb)
         tree.find(".//Cells/DataArray[@Name='types']").text = " ".join(["9"]*9)
         tree.write(pb)
@@ -322,7 +333,7 @@ def self_test():
             raise AssertionError("malformed cell-type self-test failed")
     return {"self_test": "passed", "coverage": ["unequal orders/meshes", "permuted point storage",
             "native/output order distinction", "analytic integrals", "DG discontinuity integration",
-            "cell type rejection"]}
+            "graded rectilinear cells", "cell type rejection"]}
 
 
 def main():

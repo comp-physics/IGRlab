@@ -62,6 +62,8 @@ namespace
 
 struct SedovOptions
 {
+  double hdg_conservation_rtol = 1.0e-10;
+  double hdg_nonlinear_rtol = 1.0e-10;
 };
 
 } // namespace
@@ -70,6 +72,15 @@ int main(int argc, char* argv[])
 {
   dg_sim::CaseSpec<SedovOptions, mfem::DGSEMSurfaceFlux> spec;
   spec.case_name = "sedov_taylor_blast";
+  spec.add_options = [](mfem::OptionsParser& args, SedovOptions& options)
+  {
+    args.AddOption(&options.hdg_conservation_rtol, "-hdg-crtol",
+        "--hdg-conservation-rtol",
+        "Relative HDG conservative/IGR balance acceptance tolerance.");
+    args.AddOption(&options.hdg_nonlinear_rtol, "-hdg-nrtol",
+        "--hdg-nonlinear-rtol",
+        "HDG nonlinear tolerance; also the RODAS algebraic residual allowance.");
+  };
   spec.default_mesh_path = mfem::SedovTaylorDefaultMeshPath();
   spec.case_file = __FILE__;
   spec.gamma = 1.4;
@@ -120,7 +131,7 @@ int main(int argc, char* argv[])
   };
 
 #if defined(DG_IGR_HAS_HDG_MAIN_BACKEND) && DG_IGR_HAS_HDG_MAIN_BACKEND
-  spec.make_hdg_case_data = [](const SedovOptions&,
+  spec.make_hdg_case_data = [](const SedovOptions& case_options,
                                 const dg_sim::CaseConfig& case_config,
                                 const dg_sim::CommonOptions& options,
                                 const dg_sim::CaseContext& context)
@@ -128,6 +139,10 @@ int main(int argc, char* argv[])
     dg_sim::hdg::HdgEulerCaseData data;
     data.numerical_policy =
       dg::hdg::generic::DefaultEulerHdgNumericalPolicy(options.order);
+    data.numerical_policy.conservation_relative_tolerance =
+        case_options.hdg_conservation_rtol;
+    data.numerical_policy.nonlinear_relative_tolerance =
+        case_options.hdg_nonlinear_rtol;
 
     constexpr int base_cells = 32;
     auto initial_condition = mfem::GetSedovTaylorBlastInit(

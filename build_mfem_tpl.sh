@@ -150,6 +150,10 @@ if [[ "${MODE}" == "gpu" ]]; then
     exit 2
   fi
   HYPRE_SPEC="hypre@develop+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
+  if [[ "${SPACK_CUDA_ARCH}" == "80" ]]; then
+    # The SM80 manifest pins a compatible release; identity still binds its DAG hash.
+    HYPRE_SPEC="hypre+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
+  fi
   MPI_SPEC="openmpi+cuda"
 else
   if ((CALIPER)); then
@@ -195,6 +199,48 @@ spack_location() {
   spack -e "${SPACK_ENV}" location -i "$1"
 }
 
+configure_sm80_hypre_linalg() {
+  [[ "${SPACK_CUDA_ARCH}" == "80" ]] || return 0
+  local prefix hash dependencies library="" candidate
+  prefix="$(spack_location openblas)"
+  prefix="$(realpath -e -- "${prefix}")" || exit 3
+  hash="$(SPACK_COLOR=never spack -e "${SPACK_ENV}" find --format '{hash}' openblas)"
+  dependencies="$(SPACK_COLOR=never spack -e "${SPACK_ENV}" find \
+    --format '{^blas.hash}|{^lapack.hash}' "${HYPRE_SPEC}")"
+  [[ "${hash}" =~ ^[a-z0-9]{32}$ && "${dependencies}" == "${hash}|${hash}" ]] || {
+    echo "ERROR: SM80 HYPRE BLAS/LAPACK must match the selected Spack OpenBLAS identity." >&2
+    exit 3
+  }
+  for candidate in "${prefix}/lib/libopenblas.so" "${prefix}/lib64/libopenblas.so"; do
+    if [[ -f "${candidate}" ]]; then
+      library="$(realpath -e -- "${candidate}")" || exit 3
+      break
+    fi
+  done
+  case "${library}" in
+    "${prefix}"/*) ;;
+    *)
+      echo "ERROR: SM80 requires a shared OpenBLAS library inside its concrete prefix: ${prefix}" >&2
+      exit 3
+      ;;
+  esac
+  # FindBLAS/FindLAPACK reset their output *_LIBRARIES variables. Pin their
+  # actual find_library cache entries while retaining their symbol checks.
+  # MFEM must export Umpire's concrete imported archive after static HYPRE;
+  # the bare umpire target can otherwise be emitted before HYPRE by consumers.
+  # Clear only HYPRE's discovery results so an iterative configure rebuilds
+  # that dependency list instead of taking FindHYPRE's cached early return.
+  cmake_args+=(
+    -UHYPRE_FOUND -UHYPRE_LIBRARIES -UHYPRE_INCLUDE_DIRS
+    '-DHYPRE_REQUIRED_PACKAGES:STRING=BLAS;LAPACK;UMPIRE'
+    -DUMPIRE_TARGET_NAMES:STRING=umpire
+    -DUMPIRE_TARGET_FORCE:BOOL=OFF
+    -DBLA_VENDOR:STRING=OpenBLAS
+    -DBLAS_openblas_LIBRARY:FILEPATH="${library}"
+    -DLAPACK_openblas_LIBRARY:FILEPATH="${library}"
+  )
+}
+
 CMAKE_PREFIX="$(spack_location cmake)"
 MPI_PREFIX="$(spack_location "${MPI_SPEC}")"
 HYPRE_PREFIX="$(spack_location "${HYPRE_SPEC}")"
@@ -227,6 +273,7 @@ if [[ "${MODE}" == "gpu" ]]; then
     -DCUDAToolkit_ROOT="${CUDA_PREFIX}"
     -DUMPIRE_DIR="${UMPIRE_PREFIX}"
   )
+  configure_sm80_hypre_linalg
 else
   cmake_args+=(
     -DMFEM_USE_CUDA=OFF

@@ -61,7 +61,8 @@ bool RunC1()
       evidence.launches.condense_launches > 0 &&
       evidence.launches.recover_launches > 0 &&
       evidence.launches.fallback_calls == 0 &&
-      evidence.launches.last_compiled_architecture == 1200 &&
+      evidence.launches.last_compiled_architecture ==
+          scalar::required_native_architecture &&
       evidence.launches.all_launches_completed;
   const bool passed = All(valid);
   int rank = 0;
@@ -330,7 +331,8 @@ bool RunC2()
       evidence.residency.trace_solve_device_resident &&
       !evidence.residency.host_numerical_fallback &&
       evidence.reuse.unchanged && evidence.launches.fallback_calls == 0 &&
-      evidence.launches.last_compiled_architecture == 1200 &&
+      evidence.launches.last_compiled_architecture ==
+          scalar::required_native_architecture &&
       std::isfinite(evidence.minimum_density) && evidence.minimum_density > 0.0 &&
       std::isfinite(evidence.minimum_pressure) && evidence.minimum_pressure > 0.0 &&
       std::isfinite(evidence.minimum_speed_margin) &&

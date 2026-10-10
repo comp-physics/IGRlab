@@ -243,6 +243,17 @@ if(DG_IGR_EXPECT_CUDA_ARCH AND MFEM_USE_CUDA)
     endif()
 endif()
 
+if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
+    if(NOT _dg_igr_expected_arch STREQUAL "80" AND
+       NOT _dg_igr_expected_arch STREQUAL "120")
+        message(FATAL_ERROR
+                "HDG CUDA components require native architecture 80 or 120.")
+    endif()
+    # Share the normalized, validated profile with every CUDA component and
+    # final executable, including tests in sibling directories.
+    set(DG_IGR_HDG_NATIVE_CUDA_ARCH "${_dg_igr_expected_arch}")
+endif()
+
 add_subdirectory(src)
 add_subdirectory(examples/supersonic_example)
 add_subdirectory(examples/supersonic_example_w_igr)

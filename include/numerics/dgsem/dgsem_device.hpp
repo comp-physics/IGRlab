@@ -304,12 +304,23 @@ void AssembleEulerRusanovFacesDevice(int dim,
  *
  * Consumes the unique unweighted face fluxes above. Central transport,
  * optional LLF volume dissipation, signed face incidence, and diagonal inverse
- * mass are combined without full-field intermediate writes. This changes
- * algebraic evaluation only; sigma must still belong to the current stage.
+ * mass are combined without full-field intermediate writes. With no subcell
+ * blend this changes algebraic evaluation only; sigma must still belong to
+ * the current stage. An optional element-constant subcell_blend changes the
+ * numerical method to a blend with an adjacent-LGL-subcell LLF residual and
+ * requires affine metrics and coefficients in [0,1].
  * The packed output remains private until the caller's normal final scatter.
  * tensor_contraction selects an on-chip FP64 8x8x4 WMMA central contraction;
  * the default uses the same precombined operator with ordinary FP64 arithmetic.
  */
+/** Density/pressure modal sensor for an element-constant conservative
+ * DG/LGL-subcell residual blend. This is a numerical-method coefficient;
+ * modal_transform maps nodal values to Legendre coefficients. */
+void ComputeModalSubcellBlendDevice(
+    int ne, int n1d, real_t gamma, real_t threshold,
+    const Array<int>& lex_to_local, const DenseMatrix& modal_transform,
+    const DenseMatrix& states, Vector& blend);
+
 void ApplyFusedEulerResidualDevice(
     int ne, int n1d, real_t gamma, real_t density_floor,
     bool llf_volume, bool frozen_sigma_spectral_speed,
@@ -319,7 +330,7 @@ void ApplyFusedEulerResidualDevice(
     const Vector& face_weights, const Array<int>& row_face_offsets,
     const Array<int>& row_face_ids, const Array<int>& row_face_signs,
     const DenseMatrix& face_flux, Vector& nodal_speeds, DenseMatrix& strong,
-    bool tensor_contraction = false);
+    bool tensor_contraction = false, const Vector* subcell_blend = nullptr);
 
 /** Evaluate only the packed two-sided Rusanov characteristic-speed bound.
  *

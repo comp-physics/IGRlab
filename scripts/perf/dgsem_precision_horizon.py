@@ -36,8 +36,8 @@ def main():
     parser.add_argument("--two-level-inverse", choices=("dense", "cg"))
     parser.add_argument("--two-level-order", type=int, choices=(1, 2, 3, 4))
     parser.add_argument("--patch-radius", type=int, choices=range(7))
-    parser.add_argument("--patch-kind", choices=("ras", "vertex-p1"), default="ras")
-    parser.add_argument("--patch-precision", choices=("fp64", "fp32"), default="fp64")
+    parser.add_argument("--patch-kind", choices=("ras", "vertex-p1", "face-condensed", "trace-pairs"), default="ras")
+    parser.add_argument("--patch-precision", choices=("fp64", "fp32", "tf32"), default="fp64")
     parser.add_argument("--patch-rebuild-interval", type=int, default=0)
     parser.add_argument("--dense-setup", choices=("host", "cusolver"))
     parser.add_argument("--integrator", choices=("rk3ssp", "ssprk104", "rk4", "dopri5", "radau-picard5"), default="rk3ssp")
@@ -50,6 +50,8 @@ def main():
     parser.add_argument("--c-alpha", type=float, default=1.0)
     parser.add_argument("--shock-x", type=float)
     parser.add_argument("--shock-width", type=float)
+    parser.add_argument("--shock-mach", type=float)
+    parser.add_argument("--shock-speed", type=float)
     parser.add_argument("--sigma-basis", choices=("lgl",))
     parser.add_argument("--fused-residual", action="store_true")
     parser.add_argument("--fused-dmma", action="store_true")
@@ -59,7 +61,7 @@ def main():
     parser.add_argument("--conservation-balance", action="store_true")
     parser.add_argument("--timeout", type=float, default=180)
     args = parser.parse_args()
-    if args.shock_x is not None or args.shock_width is not None:
+    if any(v is not None for v in (args.shock_x, args.shock_width, args.shock_mach, args.shock_speed)):
         if args.case != "stationary-shock":
             parser.error("shock position/width options require the stationary-shock case")
         if ((args.shock_x is not None and not math.isfinite(args.shock_x)) or
@@ -78,8 +80,9 @@ def main():
     if args.two_level_order and not args.two_level_inverse:
         parser.error("two-level order requires two-level inverse")
     if args.patch_radius is not None and (args.dense_inverse or args.two_level_inverse or
-            (args.linear_solver != "fgmres" and args.patch_kind != "vertex-p1") or args.sigma_space != "L2"):
-        parser.error("screened patches require FGMRES (or CG for vertex-p1), L2 sigma, and no dense/two-level inverse")
+            (args.linear_solver != "fgmres" and
+             (args.patch_kind not in ("vertex-p1", "face-condensed", "trace-pairs") or args.patch_precision != "fp64")) or args.sigma_space != "L2"):
+        parser.error("screened patches require FGMRES (or CG for FP64 vertex/face-condensed), L2 sigma, and no dense/two-level inverse")
     if args.patch_rebuild_interval < 0 or (args.patch_radius is None and
             (args.patch_rebuild_interval or args.patch_precision != "fp64")):
         parser.error("patch precision/rebuilding requires patches and a nonnegative interval")
@@ -91,6 +94,12 @@ def main():
         parser.error("stationary correction requires FGMRES fallback")
     if args.patch_kind == "vertex-p1" and (args.patch_radius != 0 or args.order != 1 or args.patch_precision != "fp64"):
         parser.error("vertex-p1 requires --order 1 --patch-radius 0 --patch-precision fp64")
+    if args.patch_kind in ("face-condensed", "trace-pairs") and args.patch_radius != 0:
+        parser.error("face-condensed requires --patch-radius 0")
+    if args.shock_mach is not None and (not math.isfinite(args.shock_mach) or args.shock_mach <= 1):
+        parser.error("shock Mach must be finite and exceed one")
+    if args.shock_speed is not None and not math.isfinite(args.shock_speed):
+        parser.error("shock speed must be finite")
     source = Path(__file__).resolve().parents[2]
     executable = args.executable.resolve(strict=True)
     default_mesh = {
@@ -135,6 +144,10 @@ def main():
         command.extend(("--shock-width", format(args.shock_width, ".17g")))
     if args.conservation_balance:
         command.append("--conservation-balance")
+    if args.shock_mach is not None:
+        command.extend(["--shock-mach", str(args.shock_mach)])
+    if args.shock_speed is not None:
+        command.extend(["--shock-speed", str(args.shock_speed)])
     environment = os.environ.copy()
     for key in ("DG_IGR_IGR_DENSE_INVERSE", "DG_IGR_IGR_TWO_LEVEL_INVERSE",
                 "DG_IGR_IGR_TWO_LEVEL_COARSE", "DG_IGR_IGR_TWO_LEVEL_ORDER",
@@ -236,7 +249,7 @@ def main():
                         patch_setup.get("kind", "ras") == args.patch_kind and
                         patch_setup.get("precision") == args.patch_precision and
                         linear.get("last_precond") == ("screened-patch-" + args.patch_precision
-                            if args.patch_kind == "ras" else "screened-vertex-p1-fp64") and
+                            if args.patch_kind == "ras" else "screened-" + args.patch_kind + "-" + args.patch_precision) and
                         linear.get("last_solver") == args.linear_solver)
     elif args.two_level_inverse:
         requested_pc = (bool(two_level_setup) and

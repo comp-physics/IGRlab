@@ -227,6 +227,12 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
   out << "    \"time_integrator\": "
       << detail::ToJsonString(TimeIntegratorToString(run_cfg.time_integrator))
       << ",\n";
+  out << "    \"modal_damping_rate\": "
+      << detail::ToJsonNumber(run_cfg.opts.modal_damping_rate) << ",\n";
+  out << "    \"modal_damping_profile\": "
+      << detail::ToJsonString(run_cfg.opts.modal_damping_rate > 0.0
+                               ? "m16-quartic-max-index" : "off")
+      << ",\n";
   out << "    \"dgsem_volume_flux\": "
       << detail::ToJsonString(
            DGSEMVolumeFluxToString(run_cfg.dgsem_volume_flux))

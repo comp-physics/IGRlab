@@ -45,6 +45,9 @@ struct Work
   std::uint64_t joint_factors=0, joint_jacobian_columns=0;
   std::uint64_t joint_residual_calls=0, joint_iterations=0, joint_line_searches=0;
   std::uint64_t attempted_steps=0, rejected_steps=0;
+  std::uint64_t tangent_rhs_solves=0, tangent_source_elements=0;
+  std::uint64_t tangent_flux_elements=0, tangent_face_fluxes=0;
+  double reuse_setup_seconds=0;
   double factor_flops=0, solve_flops=0, setup_seconds=0;
   std::size_t retained_factor_bytes=0;
 };
@@ -56,7 +59,7 @@ struct Options
   std::string initial_case="smooth", method="both";
   std::string sigma_predictor="constant", state_predictor="constant";
   int joint_block_elements=0, joint_block_offset=0, joint_rebuild=0, joint_max=40;
-  double alpha_power=0.;
+  double alpha_power=0., speed_smoothing=0.;
   bool alpha_from_h=false, self_test=false;
 };
 double Norm(const State& x)
@@ -74,6 +77,9 @@ public:
   int Mod(int e) const {return (e%ne+ne)%ne;}
   int Index(int e,int i,int c) const {return (Mod(e)*n+i)*4+c;}
   int SigmaIndex(int e,int i) const {return (Mod(e)*p+i)%(ne*p);}
+  double FaceSpeed(double left,double right) const
+  {return o.speed_smoothing>0.?.5*(left+right+std::hypot(left-right,o.speed_smoothing)):
+      std::max(left,right);}
   State Initial() const
   {
     State u(ne*n*4);
@@ -106,10 +112,11 @@ public:
   // Every call includes nonlinear coefficient reconstruction and BOTH 1/rho
   // reaction and alpha/rho diffusion. Local rows use continuous nodal numbering.
   void Assemble(const State& u,int count,bool periodic,
-                mfem::DenseMatrix& a,State& b,Work& work) const
+                mfem::DenseMatrix& a,State& b,Work& work,State* point_cache=nullptr) const
   {
     const int ns=periodic?count*p:count*p+1;
     a.SetSize(ns);a=0.;b.assign(ns,0.);work.coefficient_elements+=count;
+    if(point_cache)point_cache->resize(count*n*4);
     for(int e=0;e<count;++e)for(int k=0;k<n;++k)
     {
       const double* x=&u[(e*n+k)*4];CheckState(x);
@@ -120,6 +127,10 @@ public:
           2,x,1,du,2,1,o.alpha,floor_value);
       const double invrho=igr::SafeInverseDensity(x[0],floor_value);
       const double ck=igr::AlphaOverDensity(o.alpha,x[0],floor_value);
+      if(point_cache)
+      {double* cached=&(*point_cache)[(e*n+k)*4];cached[0]=invrho;
+       cached[1]=x[1]*invrho;cached[2]=du[0];
+       cached[3]=(du[2]-cached[1]*du[0])*invrho;}
       if(!std::isfinite(source+invrho+ck))
         throw std::runtime_error("nonfinite closure coefficient");
       const int row=(e*p+k)%ns;
@@ -152,6 +163,8 @@ public:
                             f.GetData(),1);
     speed=igr::FrozenSigmaCharacteristicModulusBound(x[0],pressure,
         x[1]/x[0],sigma,gamma_euler,floor_value);
+    if(o.speed_smoothing>0.)
+      speed+=std::hypot(x[1]/x[0],o.speed_smoothing)-std::abs(x[1]/x[0]);
     if(!std::isfinite(base)||!std::isfinite(speed))
       throw std::runtime_error("nonfinite flux speed");
     return {{f[0],f[1],f[2],f[3]}};
@@ -188,7 +201,7 @@ public:
       else
       {const int e=Mod(first+count);right=&(*exterior)[Index(e,0,0)];
        fr=Flux(right,(*exterior_sigma)[SigmaIndex(e,0)],ar);}
-      const double a=std::max(al,ar);
+      const double a=FaceSpeed(al,ar);
       for(int c=0;c<4;++c)
       {
         const double star=.5*(fl[c]+fr[c]-a*(right[c]-left[c]));
@@ -219,6 +232,128 @@ public:
   const Options o;const int ne,p,n;const double h;
   const mfem::dgsem::LGLBasis1D basis;const mfem::EulerFlux euler;
 };
+
+// Analytic physical-time differentiation of the current elliptic constraint.
+// Each factor supplies sigma and dot(sigma); the latter is a genuinely new
+// RHS, not a duplicated closure. No finite-difference Jacobian is formed.
+struct CurrentClosure
+{
+  mfem::DenseMatrix matrix;State rhs,sigma,point_cache;
+  std::unique_ptr<mfem::DenseMatrixInverse> inverse;
+  CurrentClosure(const Problem& pr,const State& u,Work& w)
+  {
+    const auto start=Clock::now();pr.Assemble(u,pr.ne,true,matrix,rhs,w,&point_cache);
+    const int ns=pr.ne*pr.p;sigma.resize(ns);
+    inverse=std::make_unique<mfem::DenseMatrixInverse>(matrix,true);
+    mfem::Vector b(rhs.data(),ns),x(sigma.data(),ns);inverse->Mult(b,x);
+    ++w.global_factors;w.factor_flops+=double(ns)*ns*ns/3.;w.solve_flops+=2.*ns*ns;
+    w.reuse_setup_seconds+=Wall(start);
+    w.retained_factor_bytes=std::max(w.retained_factor_bytes,std::size_t(2)*ns*ns*sizeof(double));
+  }
+  State Tangent(const Problem& pr,const State& u,const State& direction,Work& w) const
+  {
+    const int ns=pr.ne*pr.p;State b(ns,0.),dsigma(ns);w.tangent_source_elements+=pr.ne;
+    for(int e=0;e<pr.ne;++e)for(int k=0;k<pr.n;++k)
+    {
+      const double* cached=&point_cache[(e*pr.n+k)*4];
+      const double invrho=cached[0],vx=cached[1],drho=cached[2],ux=cached[3];
+      const double rr=direction[pr.Index(e,k,0)];
+      const double dv=(direction[pr.Index(e,k,1)]-vx*rr)*invrho;
+      double drr=0.,dmr=0.,sx=0.;
+      for(int j=0;j<pr.n;++j)
+      {const double d=pr.basis.D(k,j)/pr.h;
+       drr+=d*direction[pr.Index(e,j,0)];dmr+=d*direction[pr.Index(e,j,1)];
+       sx+=d*sigma[pr.SigmaIndex(e,j)];}
+      const double dux=(dmr-vx*drr-dv*drho-ux*rr)*invrho;
+      // In pseudo-1D, tr(grad(v)^2)+(div v)^2 = 2*(dv_x/dx)^2.
+      const int row=pr.SigmaIndex(e,k);const double wq=pr.basis.weights[k];
+      b[row]+=pr.h*wq*(4.*pr.o.alpha*ux*dux+rr*invrho*invrho*sigma[row]);
+      for(int i=0;i<pr.n;++i)
+        b[pr.SigmaIndex(e,i)]+=pr.o.alpha*rr*invrho*invrho*wq*pr.basis.D(k,i)*sx;
+    }
+    mfem::Vector bv(b.data(),ns),sv(dsigma.data(),ns);inverse->Mult(bv,sv);
+    ++w.tangent_rhs_solves;w.solve_flops+=2.*ns*ns;return dsigma;
+  }
+};
+
+struct FluxTangent {std::array<double,4> flux;double speed,dspeed;};
+FluxTangent DifferentiateFlux(const Problem& pr,const double* u,const double* du,
+                             double sigma,double dsigma)
+{
+  pr.CheckState(u);mfem::Vector state(const_cast<double*>(u),4);
+  const double rho=u[0],vx=u[1]/rho,vy=u[2]/rho;
+  const double pressure=mfem::EulerPressureFromConservative(state,2,gamma_euler);
+  if(!igr::FrozenSigmaFluxIsLocallyStrictlyHyperbolic(pressure,sigma,gamma_euler))
+    throw std::runtime_error("tangent q_sigma admission failed");
+  const double dvx=(du[1]-vx*du[0])/rho;
+  const double dp=(gamma_euler-1.)*(du[3]-vx*du[1]-vy*du[2]+.5*(vx*vx+vy*vy)*du[0]);
+  FluxTangent out;
+  out.flux={{du[1],du[1]*vx+u[1]*dvx+dp+dsigma,
+              du[2]*vx+u[2]*dvx,
+              (du[3]+dp+dsigma)*vx+(u[3]+pressure+sigma)*dvx}};
+  const double acoustic2=igr::FrozenSigmaLocalHyperbolicityMargin(pressure,sigma,gamma_euler)/rho;
+  const double acoustic=std::sqrt(acoustic2);
+  out.speed=igr::FrozenSigmaCharacteristicModulusBound(rho,pressure,vx,sigma,gamma_euler,floor_value);
+  // Forward directional derivative at the abs kink. This is not a claim of
+  // a Frechet derivative or fourth-order convergence through a speed switch.
+  if(pr.o.speed_smoothing>0.)
+    out.speed+=std::hypot(vx,pr.o.speed_smoothing)-std::abs(vx);
+  out.dspeed=(pr.o.speed_smoothing>0.?vx*dvx/std::hypot(vx,pr.o.speed_smoothing):
+    (vx==0.?std::abs(dvx):std::copysign(1.,vx)*dvx))+
+    ((gamma_euler*dp+(gamma_euler-1.)*dsigma)/rho-acoustic2*du[0]/rho)/(2.*acoustic);
+  return out;
+}
+State TangentResidual(const Problem& pr,const State& u,const State& sigma,
+                      const State& du,const State& dsigma,Work& w)
+{
+  State g(u.size(),0.);std::vector<FluxTangent> flux(pr.ne*pr.n);
+  w.tangent_flux_elements+=pr.ne;
+  for(int e=0;e<pr.ne;++e)for(int k=0;k<pr.n;++k)
+    flux[e*pr.n+k]=DifferentiateFlux(pr,&u[pr.Index(e,k,0)],&du[pr.Index(e,k,0)],
+                                   sigma[pr.SigmaIndex(e,k)],dsigma[pr.SigmaIndex(e,k)]);
+  for(int e=0;e<pr.ne;++e)for(int i=0;i<pr.n;++i)
+    for(int j=0;j<pr.n;++j)for(int c=0;c<4;++c)
+      g[pr.Index(e,i,c)]-=pr.basis.D(i,j)*flux[e*pr.n+j].flux[c]/pr.h;
+  for(int face=0;face<pr.ne;++face)
+  {
+    ++w.tangent_face_fluxes;const int le=pr.Mod(face-1),re=face;
+    const auto& l=flux[le*pr.n+pr.p];const auto& r=flux[re*pr.n];
+    const double speed=pr.FaceSpeed(l.speed,r.speed);
+    const double dspeed=pr.o.speed_smoothing>0.?
+      .5*(l.dspeed+r.dspeed+(l.speed-r.speed)*(l.dspeed-r.dspeed)/
+           std::hypot(l.speed-r.speed,pr.o.speed_smoothing)):
+      (l.speed==r.speed?std::max(l.dspeed,r.dspeed):(l.speed>r.speed?l.dspeed:r.dspeed));
+    for(int c=0;c<4;++c)
+    {
+      const int li=pr.Index(le,pr.p,c),ri=pr.Index(re,0,c);
+      const double star=.5*(l.flux[c]+r.flux[c]-
+        dspeed*(u[ri]-u[li])-speed*(du[ri]-du[li]));
+      g[li]-=(star-l.flux[c])/(pr.h*pr.basis.weights[pr.p]);
+      g[ri]+=(star-r.flux[c])/(pr.h*pr.basis.weights[0]);
+    }
+  }
+  return g;
+}
+struct TwoDerivatives {State first,second;};
+TwoDerivatives EvaluateTwoDerivatives(const Problem& pr,const State& u,
+                                      const CurrentClosure& closure,Work& w)
+{
+  TwoDerivatives f;
+  f.first=pr.Residual(u,closure.sigma,pr.ne,true,0,nullptr,nullptr,w);
+  const State dsigma=closure.Tangent(pr,u,f.first,w);
+  f.second=TangentResidual(pr,u,closure.sigma,f.first,dsigma,w);return f;
+}
+State TwoDerivativeStep(const Problem& pr,const State& u,const CurrentClosure& closure,
+                         double dt,Work& w)
+{
+  const TwoDerivatives f=EvaluateTwoDerivatives(pr,u,closure,w);State midpoint(u.size());
+  for(std::size_t i=0;i<u.size();++i)midpoint[i]=u[i]+.5*dt*f.first[i]+.125*dt*dt*f.second[i];
+  CurrentClosure middle(pr,midpoint,w);
+  const TwoDerivatives fm=EvaluateTwoDerivatives(pr,midpoint,middle,w);State result(u.size());
+  for(std::size_t i=0;i<u.size();++i)
+    result[i]=u[i]+dt*f.first[i]+dt*dt*(f.second[i]+2.*fm.second[i])/6.;
+  return result;
+}
 
 State RK4Step(const Problem& pr,const State& u,const State& current_sigma,
               double dt,Work& w)
@@ -572,7 +707,10 @@ Result Run(const Problem& pr,const std::string& method,double step)
   Result r;r.u=pr.Initial();const auto start=Clock::now();
   try
   {
-    r.sigma=pr.ExactClosure(r.u,r.work);
+    std::unique_ptr<CurrentClosure> current_closure;
+    if(method=="tdrk4")
+    {current_closure=std::make_unique<CurrentClosure>(pr,r.u,r.work);r.sigma=current_closure->sigma;}
+    else r.sigma=pr.ExactClosure(r.u,r.work);
     std::vector<Anchor> history{{0.,r.u,r.sigma}};JointCache joint_cache;
     while(r.time<pr.o.final_time-1.e-14)
     {
@@ -583,6 +721,7 @@ Result Run(const Problem& pr,const std::string& method,double step)
       ++r.work.attempted_steps;
       State trial;
       if(method=="rk4" || startup)trial=RK4Step(pr,r.u,r.sigma,dt,r.work);
+      else if(method=="tdrk4")trial=TwoDerivativeStep(pr,r.u,*current_closure,dt,r.work);
       else
       {
         Stages seed_u{{r.u,r.u}},seed_sigma{{r.sigma,r.sigma}};
@@ -599,7 +738,10 @@ Result Run(const Problem& pr,const std::string& method,double step)
       }
       // Instantaneous endpoint closure is always recomputed, including in
       // uncertified fixed-sweep ablations. A failed attempt is not committed.
-      State ss=pr.ExactClosure(trial,r.work);
+      State ss;
+      if(method=="tdrk4")
+      {current_closure=std::make_unique<CurrentClosure>(pr,trial,r.work);ss=current_closure->sigma;}
+      else ss=pr.ExactClosure(trial,r.work);
       for(int e=0;e<pr.ne;++e)for(int i=0;i<pr.n;++i)
       {double speed=0;pr.Flux(&trial[pr.Index(e,i,0)],ss[pr.SigmaIndex(e,i)],speed);}
       r.u.swap(trial);r.sigma.swap(ss);r.time+=dt;++r.work.accepted_steps;
@@ -615,7 +757,7 @@ Result Run(const Problem& pr,const std::string& method,double step)
 }
 
 void Print(const Problem& pr,const std::string& method,const Result& r,
-           const Result& reference)
+           const Result& reference,const Result* unsmoothed_reference=nullptr)
 {
   const auto initial=pr.Integrals(pr.Initial()),final=pr.Integrals(r.u);
   double conservation=0;
@@ -633,9 +775,10 @@ void Print(const Problem& pr,const std::string& method,const Result& r,
     <<",\"halo\":"<<pr.o.halo<<",\"screen_length_over_h\":"<<std::sqrt(pr.o.alpha)/pr.h
     <<",\"inner_sweeps\":"<<pr.o.inner<<",\"fixed_outer\":"<<pr.o.fixed_outer
     <<",\"temporal_method\":\""<<(method=="rk4"?"rk4":
+       method=="tdrk4"?"two-stage-two-derivative-RK4":
        method=="joint-chord-Newton"?"joint-Gauss-chord-Newton":
        pr.o.inner==0?"cubic-history-Gauss-flux-quadrature":"space-time-Schwarz-collocation")<<"\""
-    <<",\"collocation_is_target_equation\":"<<(method=="joint-chord-Newton"||(method!="rk4"&&pr.o.inner>0)?"true":"false")
+    <<",\"collocation_is_target_equation\":"<<(method=="joint-chord-Newton"||(method!="rk4"&&method!="tdrk4"&&pr.o.inner>0)?"true":"false")
     <<",\"sigma_predictor\":\""<<pr.o.sigma_predictor
     <<"\",\"state_predictor\":\""<<pr.o.state_predictor<<"\""
     <<",\"complete\":"<<(r.complete?"true":"false")
@@ -644,6 +787,12 @@ void Print(const Problem& pr,const std::string& method,const Result& r,
     <<",\"reference_dt\":"<<pr.o.reference_dt<<",\"reference_seconds\":"<<reference.seconds
     <<",\"state_relative_l2_error\":"<<(r.complete&&reference.complete?pr.Error(r.u,reference.u):-1)
     <<",\"sigma_relative_nodal_error\":"<<sigma_error
+    <<",\"speed_smoothing_epsilon\":"<<pr.o.speed_smoothing
+    <<",\"state_error_to_unsmoothed_reference\":"<<(r.complete&&reference.complete?
+         pr.Error(r.u,unsmoothed_reference?unsmoothed_reference->u:reference.u):-1)
+    <<",\"reference_flux_change_relative_l2\":"<<(unsmoothed_reference?
+         pr.Error(reference.u,unsmoothed_reference->u):0.)
+    <<",\"unsmoothed_reference_seconds\":"<<(unsmoothed_reference?unsmoothed_reference->seconds:0.)
     <<",\"maximum_conservative_integral_drift\":"<<conservation
     <<",\"maximum_current_closure_residual\":"<<r.certificate.closure
     <<",\"maximum_collocation_residual\":"<<r.certificate.state
@@ -665,6 +814,11 @@ void Print(const Problem& pr,const std::string& method,const Result& r,
     <<",\"joint_line_searches\":"<<w.joint_line_searches
     <<",\"alpha_from_h\":"<<(pr.o.alpha_from_h?"true":"false")
     <<",\"alpha_power\":"<<pr.o.alpha_power
+    <<",\"tangent_rhs_solves\":"<<w.tangent_rhs_solves
+    <<",\"tangent_source_elements\":"<<w.tangent_source_elements
+    <<",\"tangent_flux_elements\":"<<w.tangent_flux_elements
+    <<",\"tangent_face_fluxes\":"<<w.tangent_face_fluxes
+    <<",\"reuse_setup_seconds\":"<<w.reuse_setup_seconds
     <<",\"dense_factor_flops_estimate\":"<<w.factor_flops
     <<",\"dense_solve_flops_estimate\":"<<w.solve_flops
     <<",\"patch_setup_seconds\":"<<w.setup_seconds
@@ -688,6 +842,7 @@ Options Parse(int argc,char** argv)
     else if(key=="--outer-max")o.outer_max=std::stoi(value);
     else if(key=="--fixed-outer")o.fixed_outer=std::stoi(value);
     else if(key=="--alpha")o.alpha=std::stod(value);
+    else if(key=="--speed-smoothing")o.speed_smoothing=std::stod(value);
     else if(key=="--alpha-h-power"){o.alpha_power=std::stod(value);o.alpha_from_h=true;}
     else if(key=="--joint-block-elements")o.joint_block_elements=std::stoi(value);
     else if(key=="--joint-block-offset")o.joint_block_offset=std::stoi(value);
@@ -708,6 +863,7 @@ Options Parse(int argc,char** argv)
   if(o.joint_block_elements<0||o.joint_block_elements>o.elements||
      o.joint_block_offset<0||o.joint_block_offset>=o.elements||o.joint_rebuild<0||
      o.joint_max<1||!std::isfinite(o.alpha_power)||o.alpha_power<0||
+     !std::isfinite(o.speed_smoothing)||o.speed_smoothing<0||
      o.elements<3||o.order<1||o.order>7||o.halo<0||2*o.halo+1>=o.elements||
      o.inner<0||o.outer_max<1||o.fixed_outer<0||!(o.alpha>0)||!(o.dt>0)||
      !(o.final_time>0)||!(o.reference_dt>0)||!(o.closure_tolerance>0)||
@@ -716,7 +872,7 @@ Options Parse(int argc,char** argv)
      (o.initial_case!="smooth"&&o.initial_case!="compression")||
      (o.sigma_predictor!="constant"&&o.sigma_predictor!="history3")||
      (o.state_predictor!="constant"&&o.state_predictor!="history3")||
-     (o.method!="rk4"&&o.method!="patch"&&o.method!="both"&&o.method!="joint"&&o.method!="rk4-joint"))
+     (o.method!="rk4"&&o.method!="patch"&&o.method!="both"&&o.method!="joint"&&o.method!="rk4-joint"&&o.method!="tdrk4"&&o.method!="rk4-tdrk4"))
     throw std::runtime_error("unsupported/nonfinite probe options");
   if(o.inner==0 && (o.fixed_outer<1 || o.sigma_predictor!="history3" ||
                       o.state_predictor!="history3"))
@@ -781,7 +937,62 @@ bool SelfTest()
   const Result shift_joint=Run(shifted,"joint",jo.dt);
   if(!shift_ref.complete||!shift_joint.complete||!shift_joint.certified||
      shift_joint.work.joint_factors!=2||shifted.Error(shift_joint.u,shift_ref.u)>1.e-8)return false;
-  std::cout<<"screened space-time conservation, current-density correction, and joint chord-Newton PASS\n";
+  // Independent centered differences audit both density terms in dot(A),
+  // the quadratic source derivative, and the complete closed Euler tangent.
+  CurrentClosure linearized(pr,u,w);State direction=u;
+  for(std::size_t i=0;i<direction.size();++i)direction[i]=.03*std::sin(.73*(i+1));
+  const State ds=linearized.Tangent(pr,u,direction,w);
+  const State exact_tangent=TangentResidual(pr,u,linearized.sigma,direction,ds,w);
+  const double eps=1.e-6;State plus=u,minus=u;
+  for(std::size_t i=0;i<u.size();++i){plus[i]+=eps*direction[i];minus[i]-=eps*direction[i];}
+  const State sp=pr.ExactClosure(plus,w),sm=pr.ExactClosure(minus,w);
+  const State fp=pr.Residual(plus,sp,pr.ne,true,0,nullptr,nullptr,w);
+  const State fm=pr.Residual(minus,sm,pr.ne,true,0,nullptr,nullptr,w);
+  State sigma_defect=ds,flux_defect=exact_tangent;
+  for(std::size_t i=0;i<ds.size();++i)sigma_defect[i]-=(sp[i]-sm[i])/(2.*eps);
+  for(std::size_t i=0;i<exact_tangent.size();++i)flux_defect[i]-=(fp[i]-fm[i])/(2.*eps);
+  if(Norm(sigma_defect)>2.e-7*std::max(Norm(ds),1.e-20)||
+     Norm(flux_defect)>2.e-7*std::max(Norm(exact_tangent),1.e-20))return false;
+  // A max/abs switch needs a forward directional derivative. Nonzero jumps
+  // make its dissipation contribution visible, rather than cancelling it.
+  State tied(u.size()),tied_direction(u.size(),0.),zero_sigma(pr.ne*pr.p,0.);
+  for(int e=0;e<pr.ne;++e)for(int i=0;i<pr.n;++i)
+  {const double density=(e%2)?2.:1.;const int k=pr.Index(e,i,0);
+   tied[k]=density;tied[k+1]=0.;tied[k+2]=0.;tied[k+3]=2.5*density;
+   tied_direction[k+1]=((e%2)?-.1:.1)*density;
+   tied_direction[k+3]=((e%2)?-.2:.2)*density;}
+  const State switch_tangent=TangentResidual(pr,tied,zero_sigma,tied_direction,zero_sigma,w);
+  State switched=tied;for(std::size_t i=0;i<tied.size();++i)switched[i]+=eps*tied_direction[i];
+  const State f0=pr.Residual(tied,zero_sigma,pr.ne,true,0,nullptr,nullptr,w);
+  const State f1=pr.Residual(switched,zero_sigma,pr.ne,true,0,nullptr,nullptr,w);
+  State switch_defect=switch_tangent;
+  for(std::size_t i=0;i<tied.size();++i)switch_defect[i]-=(f1[i]-f0[i])/eps;
+  if(Norm(switch_defect)>3.e-6*std::max(Norm(switch_tangent),1.e-20))return false;
+  // Smoothing is a conservative upper-envelope change to the numerical
+  // dissipation. Audit both its tangent at the old kink and its bound.
+  Options smooth_options=o;smooth_options.speed_smoothing=.01;Problem smooth_problem(smooth_options);
+  const State smooth_tangent=TangentResidual(smooth_problem,tied,zero_sigma,tied_direction,zero_sigma,w);
+  State tied_minus=tied;
+  for(std::size_t i=0;i<tied.size();++i)tied_minus[i]-=eps*tied_direction[i];
+  const State smooth_plus=smooth_problem.Residual(switched,zero_sigma,pr.ne,true,0,nullptr,nullptr,w);
+  const State smooth_minus=smooth_problem.Residual(tied_minus,zero_sigma,pr.ne,true,0,nullptr,nullptr,w);
+  State smooth_defect=smooth_tangent;
+  for(std::size_t i=0;i<tied.size();++i)smooth_defect[i]-=(smooth_plus[i]-smooth_minus[i])/(2.*eps);
+  if(Norm(smooth_defect)>3.e-7*std::max(Norm(smooth_tangent),1.e-20))return false;
+  double original_speed=0.,smoothed_speed=0.;
+  pr.Flux(tied.data(),0.,original_speed);smooth_problem.Flux(tied.data(),0.,smoothed_speed);
+  const double envelope=smooth_problem.FaceSpeed(smoothed_speed,smoothed_speed);
+  if(envelope<original_speed||envelope-original_speed>1.5*smooth_options.speed_smoothing+1.e-12)return false;
+  Options to;to.elements=6;to.order=2;to.halo=0;to.final_time=.016;
+  Problem tp(to);const Result tref=Run(tp,"rk4",.00003125);
+  const Result coarse=Run(tp,"tdrk4",.004),fine=Run(tp,"tdrk4",.002);
+  if(!tref.complete||!coarse.complete||!fine.complete||
+     coarse.work.global_factors!=1+2*coarse.work.accepted_steps||
+     coarse.work.tangent_rhs_solves!=2*coarse.work.accepted_steps||
+     tp.Error(coarse.u,tref.u)<8.*tp.Error(fine.u,tref.u))return false;
+  const auto tb=tp.Integrals(tp.Initial()),te=tp.Integrals(coarse.u);
+  for(int c=0;c<4;++c)if(std::abs(tb[c]-te[c])>2.e-12)return false;
+  std::cout<<"space-time conservation, current closure, joint Newton, analytic tangent and two-derivative order PASS\n";
   return true;
 }
 } // namespace
@@ -794,12 +1005,19 @@ int main(int argc,char** argv)
     const Options o=Parse(argc,argv);if(o.self_test)return SelfTest()?0:1;
     Problem pr(o);const Result reference=Run(pr,"rk4",o.reference_dt);
     if(!reference.complete)throw std::runtime_error("reference failed: "+reference.failure);
-    if(o.method=="both"||o.method=="rk4"||o.method=="rk4-joint")Print(pr,"rk4",Run(pr,"rk4",o.dt),reference);
+    std::unique_ptr<Result> unsmoothed;
+    if(o.speed_smoothing>0.)
+    {Options raw=o;raw.speed_smoothing=0.;Problem baseline(raw);
+     unsmoothed=std::make_unique<Result>(Run(baseline,"rk4",o.reference_dt));
+     if(!unsmoothed->complete)throw std::runtime_error("unsmoothed reference failed: "+unsmoothed->failure);}
+    if(o.method=="both"||o.method=="rk4"||o.method=="rk4-joint"||o.method=="rk4-tdrk4")Print(pr,"rk4",Run(pr,"rk4",o.dt),reference,unsmoothed.get());
+    if(o.method=="tdrk4"||o.method=="rk4-tdrk4")
+      Print(pr,"tdrk4",Run(pr,"tdrk4",o.dt),reference,unsmoothed.get());
     if(o.method=="joint"||o.method=="rk4-joint")
-      Print(pr,"joint-chord-Newton",Run(pr,"joint",o.dt),reference);
+      Print(pr,"joint-chord-Newton",Run(pr,"joint",o.dt),reference,unsmoothed.get());
     if(o.method=="both"||o.method=="patch")
       Print(pr,o.inner==0?"cubic-history-Gauss-quadrature":"space-time-Schwarz",
-            Run(pr,"patch",o.dt),reference);
+            Run(pr,"patch",o.dt),reference,unsmoothed.get());
   }
   catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
   return 0;

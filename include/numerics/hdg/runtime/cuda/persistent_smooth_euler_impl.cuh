@@ -28,7 +28,7 @@ static inline void ReportCudaWarmLifetimeMarker(
 // MFEM CUDA allowed, MFEM debug-device disabled, zero incoming HYPRE error,
 // normal Hypre::Init return, zero error captured immediately after Init, Hypre
 // GPU selection, HYPRE memory query, HYPRE execution query, device memory,
-// device execution, zero post-policy HYPRE error, and an admitted SM120
+// device execution, zero post-policy HYPRE error, and the configured native
 // tensor-core target when that explicit engine is selected.  Materialized
 // MFEM and HYPRE Umpire pools are admitted only after their first real
 // allocations.
@@ -68,8 +68,8 @@ static inline void ReportCudaTensorCoreAdmissionFailure(
 {
   if (rank == 0)
     std::fprintf(stderr,
-                 "CUDA_TENSOR_CORE_UNSUPPORTED required_sm=120 actual_sm=%d\n",
-                 architecture);
+                 "CUDA_TENSOR_CORE_UNSUPPORTED required_sm=%d actual_sm=%d\n",
+                 configured_native_architecture, architecture);
 }
 
 // Private teardown diagnostics.  MFEM's DEVICE_UMPIRE Wrap(..., own=false)
@@ -1465,7 +1465,8 @@ constexpr bool CudaTicketWordsValid(
     const std::uint64_t attempt, const std::uint64_t generation,
     const int device) noexcept
 {
-  return words[0] == 1 && words[1] == 1200 && words[2] == device &&
+  return words[0] == 1 &&
+      words[1] == configured_cuda_architecture && words[2] == device &&
       words[3] == static_cast<int>(phase) &&
       static_cast<std::uint32_t>(words[4]) ==
           static_cast<std::uint32_t>(attempt) &&
@@ -2559,7 +2560,8 @@ public:
           const CudaNativeTraceCooperativeSupport& support) noexcept
       {
         return support.supported && support.device == device_ &&
-            support.compute_major == 12 && support.compute_minor == 0 &&
+            CudaDeviceMatchesNativeArchitecture(
+                support.compute_major, support.compute_minor) &&
             support.threads_per_block == 256 &&
             support.cooperative_blocks > 0;
       };
@@ -4294,11 +4296,12 @@ public:
     result.tensor_core.hardware_supported =
         tensor_core_hardware_supported_;
     result.tensor_core.fallback_accounting_complete = true;
-    // This production leaf has no mixed-precision or correction route.  Emit
-    // that fact from the numerical attempt itself so benchmark accounting is
-    // not synthesized by the harness.
-    result.precision_work.all_fp64_policy = true;
-    result.precision_work.accounting_complete = true;
+    const bool reduced_precision_volume =
+        detail::CudaResearchVolumeUsesReducedPrecision(
+            shape_.borrowed_host_inputs &&
+            cuda_engine_ == generic::CudaEngineKind::tensor_core);
+    result.precision_work.all_fp64_policy = !reduced_precision_volume;
+    result.precision_work.accounting_complete = !reduced_precision_volume;
     // The frozen non-borrowed lifecycle has no Euler conservation contract.
     // Borrowed Euler attempts remain fail-closed until their measured balance
     // has passed below.
@@ -5643,7 +5646,8 @@ private:
         cudaGetDeviceProperties(&properties, device_) == cudaSuccess;
     if (!CollectiveContinue(uuid_ready)) { return false; }
     const int device_architecture = 10 * properties.major + properties.minor;
-    tensor_core_hardware_supported_ = device_architecture == 120;
+    tensor_core_hardware_supported_ = CudaDeviceMatchesNativeArchitecture(
+        properties.major, properties.minor);
     evidence.tensor_core.selected_engine = cuda_engine_;
     evidence.tensor_core.requested_trace_policy =
         trace_policy_descriptor_.requested_selection;

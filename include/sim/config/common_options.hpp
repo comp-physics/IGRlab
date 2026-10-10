@@ -57,6 +57,8 @@ struct CommonOptions
     "rusanov"; ///< DGSEM surface flux: "rusanov", "es-winters", or "es-lf-entropy".
   std::string dgsem_entropy_jacobian =
     "fd"; ///< DGSEM ES-LF entropy Jacobian: "fd" or "analytic".
+  mfem::real_t modal_damping_rate = 0.0;
+  ///< Conservative modal RHS damping rate in inverse model time; zero disables.
   mfem::real_t t_final = 1.0; ///< Final time.
   /// Fixed explicit step when cfl is zero; HDG also uses its sign to select
   /// fixed, CFL-controlled, or adaptive stepping.
@@ -210,6 +212,13 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
     "-dej",
     "--dgsem-entropy-jacobian",
     "DGSEM entropy Jacobian: fd | analytic (ES LF entropy variables).");
+  args.AddOption(
+    &opts.modal_damping_rate,
+    "-mdr",
+    "--modal-damping-rate",
+    "Conservative modal RHS damping rate in inverse model time (0 disables; "
+    "80000 is M16). Uses a quartic ramp above 29/39 of the polynomial degree; "
+    "requires affine tensor elements and every-stage closure with active IGR.");
   args.AddOption(&opts.t_final,
                  "-tf",
                  "--t-final",

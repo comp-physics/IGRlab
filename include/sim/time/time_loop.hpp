@@ -784,6 +784,17 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
   {
     const mfem::real_t unrestricted_dt = dt;
     dt = time_loop_detail::ProposedStepSizeLimit<OperatorType>::Apply(op, dt);
+    if (CheckDtMinimum(dt, "after-operator-limit"))
+    {
+      result.final_time = t;
+      result.termination_reason = "operator-dt-min";
+      EmitSave(result.steps,
+               t,
+               save_idx,
+               /*is_final=*/true,
+               /*suppress_duplicate_time=*/true);
+      break;
+    }
     if (dt < unrestricted_dt)
     {
       TraceNominalDt(

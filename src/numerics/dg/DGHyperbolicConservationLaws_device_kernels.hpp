@@ -458,6 +458,9 @@ struct PackedInteriorFaceEulerRusanovKernel
   const real_t* normals = nullptr;
   const real_t* weights = nullptr;
   const real_t* x = nullptr;
+  const real_t* reference_x_slopes = nullptr;
+  const real_t* ip1_ref = nullptr;
+  const real_t* ip2_ref = nullptr;
   real_t* z = nullptr;
   real_t* face_speed = nullptr;
   double* q_sigma_telemetry = nullptr;
@@ -502,6 +505,11 @@ struct PackedInteriorFaceEulerRusanovKernel
           const real_t s2 = shape2[shape_off + i];
           lhs += s1 * x[state_map[state_off_1 + i * neq + eq]];
           rhs += s2 * x[state_map[state_off_2 + i * neq + eq]];
+        }
+        if (reference_x_slopes)
+        {
+          lhs += (ip1_ref[normal_off]-.5) * reference_x_slopes[state_map[state_off_1+eq]];
+          rhs += (ip2_ref[normal_off]-.5) * reference_x_slopes[state_map[state_off_2+eq]];
         }
         u1[eq] = lhs;
         u2[eq] = rhs;
@@ -805,6 +813,8 @@ struct PackedBoundaryFaceEulerRusanovKernel
   const real_t* normals = nullptr;
   const real_t* weights = nullptr;
   const real_t* x = nullptr;
+  const real_t* reference_x_slopes = nullptr;
+  const real_t* ip1_ref = nullptr;
   real_t* z = nullptr;
   real_t* face_speed = nullptr;
   double* q_sigma_telemetry = nullptr;
@@ -872,6 +882,8 @@ struct PackedBoundaryFaceEulerRusanovKernel
           const real_t s1 = shape1[shape_off + i];
           lhs += s1 * x[state_map[state_off + i * neq + eq]];
         }
+        if (reference_x_slopes)
+          lhs += (ip1_ref[normal_off]-.5) * reference_x_slopes[state_map[state_off+eq]];
         u1[eq] = lhs;
       }
 
@@ -1032,6 +1044,9 @@ struct PackedInteriorFaceEulerRusanovQKernel
   const real_t* normals = nullptr;
   const real_t* weights = nullptr;
   const real_t* x = nullptr;
+  const real_t* reference_x_slopes = nullptr;
+  const real_t* ip1_ref = nullptr;
+  const real_t* ip2_ref = nullptr;
   real_t* z = nullptr;
   real_t* face_speed_q = nullptr;
   double* q_sigma_telemetry = nullptr;
@@ -1074,6 +1089,11 @@ struct PackedInteriorFaceEulerRusanovQKernel
         const real_t s2 = shape2[shape_off + i];
         lhs += s1 * x[state_map[state_off_1 + i * neq + eq]];
         rhs += s2 * x[state_map[state_off_2 + i * neq + eq]];
+      }
+      if (reference_x_slopes)
+      {
+        lhs += (ip1_ref[normal_off]-.5) * reference_x_slopes[state_map[state_off_1+eq]];
+        rhs += (ip2_ref[normal_off]-.5) * reference_x_slopes[state_map[state_off_2+eq]];
       }
       u1[eq] = lhs;
       u2[eq] = rhs;
@@ -1368,6 +1388,8 @@ struct PackedBoundaryFaceEulerRusanovQKernel
   const real_t* normals = nullptr;
   const real_t* weights = nullptr;
   const real_t* x = nullptr;
+  const real_t* reference_x_slopes = nullptr;
+  const real_t* ip1_ref = nullptr;
   real_t* z = nullptr;
   real_t* face_speed_q = nullptr;
   double* q_sigma_telemetry = nullptr;
@@ -1433,6 +1455,8 @@ struct PackedBoundaryFaceEulerRusanovQKernel
         const real_t s1 = shape1[shape_off + i];
         lhs += s1 * x[state_map[state_off + i * neq + eq]];
       }
+      if (reference_x_slopes)
+        lhs += (ip1_ref[normal_off]-.5) * reference_x_slopes[state_map[state_off+eq]];
       u1[eq] = lhs;
     }
 

@@ -53,6 +53,7 @@ template <typename NumericalFlux> struct EulerIGRPhysics
         ? ctx.run_cfg.case_config.rk3_config.p_min
         : mfem::kEulerBoundaryPressureFloor);
     bc_setup(bc, markers);
+    igr.SetNodalSourceSlipBoundaryMarker(bc.SlipWallMarker());
   }
 };
 

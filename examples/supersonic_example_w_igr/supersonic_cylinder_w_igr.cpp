@@ -53,6 +53,7 @@
 #include <algorithm>
 #include <iostream>
 #include <memory>
+#include <string>
 
 #include "sim/igr_sim.hpp"
 
@@ -83,7 +84,33 @@ inline void AddInflowOptions(mfem::OptionsParser& args,
 struct SupersonicIGROptions
 {
   InflowOptions inflow;
+  const char* startup = "normal";
+  double startup_width = 0.0;
 };
+
+mfem::VectorFunctionCoefficient MakeCylinderStartup(
+  const SupersonicIGROptions& opts, const mfem::Vector& Uin,
+  double gamma, double hmin)
+{
+  const std::string mode = opts.startup;
+  MFEM_VERIFY(mode == "normal" || mode == "full",
+              "Cylinder startup must be normal or full.");
+  MFEM_VERIFY(std::isfinite(opts.startup_width) && opts.startup_width >= 0.0,
+              "Cylinder startup width must be finite and nonnegative.");
+  const double delta = opts.startup_width > 0.0
+                         ? opts.startup_width : std::max(8.0 * hmin, 0.08);
+  if (mfem::Mpi::Root())
+  {
+    std::cout << "[cylinder-startup] mode=" << mode << " width=" << delta
+              << " width_policy=" << (opts.startup_width > 0.0 ? "physical" : "legacy-hmin")
+              << " center_x=0.6 center_y=0 radius=0.25" << std::endl;
+  }
+  return mode == "full"
+           ? mfem::SupersonicCylinderSmoothedVelocityIC(
+               Uin, gamma, 0.6, 0.0, 0.25, delta)
+           : mfem::SupersonicCylinderSmoothedNormalVelocityIC(
+               Uin, gamma, 0.6, 0.0, 0.25, delta);
+}
 
 } // namespace
 
@@ -120,6 +147,10 @@ int main(int argc, char* argv[])
   spec.add_options = [](mfem::OptionsParser& args, SupersonicIGROptions& opts)
   {
     AddInflowOptions(args, opts.inflow);
+    args.AddOption(&opts.startup, "-startup", "--startup",
+                   "Cylinder startup velocity damping: normal (default) or full.");
+    args.AddOption(&opts.startup_width, "-startup-width", "--startup-width",
+                   "Physical radial smoothing width; zero preserves max(8*hmin,0.08).");
   };
 
   spec.make_ic = [](const SupersonicIGROptions& opts,
@@ -137,17 +168,7 @@ int main(int argc, char* argv[])
                           ctx.run_cfg.igr_opts.c_alpha_user,
                           dg_sim::ResolveIGRAlphaLengthScalePolicy(ctx.run_cfg))
                           .hmin;
-    const double xc = 0.6;
-    const double yc = 0.0;
-    const double r_cyl = 0.25;
-    const double delta = std::max(8.0 * hmin, 0.08);
-
-    auto ic_fun = mfem::SupersonicCylinderSmoothedNormalVelocityIC(Uin,
-                                                                   gamma,
-                                                                   xc,
-                                                                   yc,
-                                                                   r_cyl,
-                                                                   delta);
+    auto ic_fun = MakeCylinderStartup(opts, Uin, gamma, hmin);
     return std::make_unique<mfem::VectorFunctionCoefficient>(ic_fun);
   };
 
@@ -202,14 +223,8 @@ int main(int argc, char* argv[])
         /*c_alpha_user=*/1.0,
         case_config.igr_config.alpha_length_scale_policy)
         .hmin;
-    const double delta = std::max(8.0 * hmin, 0.08);
-    auto initial_condition =
-      mfem::SupersonicCylinderSmoothedNormalVelocityIC(Uin,
-                                                       case_config.gamma,
-                                                       /*xc=*/0.6,
-                                                       /*yc=*/0.0,
-                                                       /*r_cyl=*/0.25,
-                                                       delta);
+    auto initial_condition = MakeCylinderStartup(
+      opts, Uin, case_config.gamma, hmin);
     data.initial_condition =
       std::make_unique<mfem::VectorFunctionCoefficient>(initial_condition);
 

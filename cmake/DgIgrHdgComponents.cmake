@@ -267,9 +267,14 @@ function(dg_igr_require_hdg_cuda17_profile)
     message(FATAL_ERROR
             "HDG CUDA expected architecture must be numeric or sm_<num>.")
   endif()
-  if(NOT _dg_igr_hdg_expected_arch STREQUAL "120")
+  if(NOT _dg_igr_hdg_expected_arch STREQUAL "80" AND
+     NOT _dg_igr_hdg_expected_arch STREQUAL "120")
     message(FATAL_ERROR
-            "The frozen W8A HDG CUDA component requires native architecture 120.")
+            "HDG CUDA components require native architecture 80 or 120.")
+  endif()
+  if(NOT DG_IGR_HDG_NATIVE_CUDA_ARCH STREQUAL "${_dg_igr_hdg_expected_arch}")
+    message(FATAL_ERROR
+            "HDG CUDA native architecture does not match the validated application profile.")
   endif()
   if(NOT CMAKE_CUDA_ARCHITECTURES)
     message(FATAL_ERROR
@@ -339,11 +344,13 @@ function(dg_igr_add_hdg_cuda17_component)
                         CUDA_STANDARD 17
                         CUDA_STANDARD_REQUIRED ON
                         CUDA_EXTENSIONS OFF
-                        CUDA_ARCHITECTURES 120
+                        CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
                         CUDA_SEPARABLE_COMPILATION ON
                         CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
   target_include_directories("${HDG_TARGET}" PUBLIC
                              "${PROJECT_SOURCE_DIR}/include")
+  target_compile_definitions("${HDG_TARGET}" PUBLIC
+    DG_IGR_HDG_NATIVE_CUDA_ARCH=${DG_IGR_HDG_NATIVE_CUDA_ARCH})
   target_compile_options("${HDG_TARGET}" PRIVATE
                          $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
                          $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
@@ -380,7 +387,7 @@ function(dg_igr_configure_hdg_cuda_final_consumer target)
                         CUDA_STANDARD 17
                         CUDA_STANDARD_REQUIRED ON
                         CUDA_EXTENSIONS OFF
-                        CUDA_ARCHITECTURES 120
+                        CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
                         CUDA_SEPARABLE_COMPILATION ON
                         CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
@@ -404,10 +411,10 @@ function(dg_igr_configure_hdg_cuda_final_consumer target)
      NOT _dg_igr_hdg_final_standard STREQUAL "17" OR
      NOT _dg_igr_hdg_final_required OR
      _dg_igr_hdg_final_extensions OR
-     NOT _dg_igr_hdg_final_architectures STREQUAL "120" OR
+     NOT _dg_igr_hdg_final_architectures STREQUAL "${DG_IGR_HDG_NATIVE_CUDA_ARCH}" OR
      NOT _dg_igr_hdg_final_separable OR
      NOT _dg_igr_hdg_final_resolve STREQUAL "ON")
     message(FATAL_ERROR
-            "${target} must be a strict native-SM120 CUDA17 final executable that directly seeds igr_mfem and owns device-symbol resolution.")
+            "${target} must be a strict native-SM${DG_IGR_HDG_NATIVE_CUDA_ARCH} CUDA17 final executable that directly seeds igr_mfem and owns device-symbol resolution.")
   endif()
 endfunction()

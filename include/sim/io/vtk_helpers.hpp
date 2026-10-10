@@ -7,6 +7,7 @@
 
 #include <filesystem>
 #include <cstdlib>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -125,6 +126,11 @@ inline std::string MakeCaseVTKDatasetName(
   if (run_cfg.opts.zhang_shu_vtk_points)
   {
     name << "_zsvtk";
+  }
+  if (run_cfg.opts.modal_damping_rate > 0.0)
+  {
+    name << "_mdr_" << std::setprecision(std::numeric_limits<mfem::real_t>::max_digits10)
+         << run_cfg.opts.modal_damping_rate;
   }
   return name.str();
 }

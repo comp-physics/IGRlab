@@ -17,6 +17,7 @@
  * and exported POD are W8A-owned code.
  */
 
+#include "numerics/hdg/runtime/cuda/native_cuda_architecture.hpp"
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler_types.cuh"
 #include "numerics/hdg/runtime/cuda/native_element_schwarz_plan.hpp"
 #include "numerics/hdg/runtime/cuda/tensor_volume_layout.hpp"

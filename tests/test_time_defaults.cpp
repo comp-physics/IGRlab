@@ -741,6 +741,69 @@ int RunTimeDefaultsTests(TestContext& ctx)
       "IGR options: extrapolated-every-step cadence parses and round-trips");
   }
 
+  // --- Modal damping is opt-in and retains stage-consistent IGR coupling ---
+  {
+    dg_sim::CommonOptions opts;
+    dg_sim::CaseConfig case_cfg;
+    dg_sim::IGROptions igr_opts;
+    auto validate = [&](dg_sim::Discretization discretization,
+                        dg_sim::Regularization regularization)
+    {
+      return dg_sim::ValidateModalDampingSelection(
+        discretization, regularization, case_cfg, opts, igr_opts);
+    };
+    ctx.Check(opts.modal_damping_rate == 0.0 &&
+                validate(dg_sim::Discretization::HDG,
+                         dg_sim::Regularization::IGR).empty(),
+              "modal damping: default zero preserves all backends");
+
+    char program_name[] = "test";
+    char rate_name[] = "--modal-damping-rate";
+    char rate_value[] = "80000";
+    char* rate_argv[] = {program_name, rate_name, rate_value};
+    mfem::OptionsParser parser(3, rate_argv);
+    dg_sim::AddCommonOptions(parser, opts, "Test mesh.");
+    parser.Parse();
+    ctx.Check(parser.Good() && opts.modal_damping_rate == 80000.0,
+              "modal damping: M16 physical rate parses");
+
+    case_cfg.igr_config.sigma_cadence =
+      dg_igr::IGRSigmaUpdateCadence::EveryStage;
+    ctx.Check(validate(dg_sim::Discretization::DG,
+                       dg_sim::Regularization::IGR).empty() &&
+                validate(dg_sim::Discretization::DGSEM,
+                         dg_sim::Regularization::IGR).empty(),
+              "modal damping: DG and DGSEM admit stage-consistent IGR");
+    ctx.Check(!validate(dg_sim::Discretization::HDG,
+                        dg_sim::Regularization::None).empty(),
+              "modal damping: positive HDG request is rejected before dispatch");
+
+    case_cfg.igr_config.sigma_cadence =
+      dg_igr::IGRSigmaUpdateCadence::EveryStep;
+    ctx.Check(!validate(dg_sim::Discretization::DG,
+                        dg_sim::Regularization::IGR).empty(),
+              "modal damping: inherited frozen IGR cadence is rejected");
+    igr_opts.sigma_cadence = "every-stage";
+    ctx.Check(validate(dg_sim::Discretization::DG,
+                       dg_sim::Regularization::IGR).empty(),
+              "modal damping: explicit every-stage overrides the case cadence");
+    igr_opts.sigma_cadence = "extrapolated-every-step";
+    ctx.Check(!validate(dg_sim::Discretization::DGSEM,
+                        dg_sim::Regularization::IGR).empty() &&
+                validate(dg_sim::Discretization::DGSEM,
+                         dg_sim::Regularization::None).empty(),
+              "modal damping: cadence restriction applies to active IGR");
+    for (const mfem::real_t rate :
+         {mfem::real_t(-1.0), std::numeric_limits<mfem::real_t>::infinity(),
+          std::numeric_limits<mfem::real_t>::quiet_NaN()})
+    {
+      opts.modal_damping_rate = rate;
+      ctx.Check(!validate(dg_sim::Discretization::DG,
+                          dg_sim::Regularization::None).empty(),
+                "modal damping: negative and nonfinite rates are rejected");
+    }
+  }
+
   // --- Explicit SSPRK CFL is a safety fraction, not a bare Courant number ---
   {
     dg_sim::RunConfig cfl_run;
@@ -1312,6 +1375,10 @@ int RunTimeDefaultsTests(TestContext& ctx)
       dg_sim::MakeCaseVTKDatasetName(dataset_case, dataset_run);
     ctx.Check(vtk_point_name == invariant_flux_name + "_zsvtk",
               "VTK dataset: refined limiter points have a typed suffix");
+    dataset_run.opts.modal_damping_rate = 80000.0;
+    ctx.Check(dg_sim::MakeCaseVTKDatasetName(dataset_case, dataset_run) ==
+                vtk_point_name + "_mdr_80000",
+              "VTK dataset: M16 damping has a distinct physical-rate suffix");
   }
 
   // --- Run metadata records the effective explicit-method identity ---
@@ -1439,6 +1506,10 @@ int RunTimeDefaultsTests(TestContext& ctx)
           contents.find("\"dgsem_surface_flux\": \"rusanov\"") !=
             std::string::npos &&
           contents.find("\"dgsem_entropy_jacobian\": \"fd\"") !=
+            std::string::npos &&
+          contents.find("\"modal_damping_rate\": 0") !=
+            std::string::npos &&
+          contents.find("\"modal_damping_profile\": \"off\"") !=
             std::string::npos &&
           contents.find(
             "\"igr_sigma_cadence\": \"extrapolated-every-step\"") !=
@@ -2581,6 +2652,62 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "time loop: clipped final step records successful termination");
   }
 
+  // --- an operator bound respects dt_min before any new attempt ---
+  for (const int allowed_steps : {0, 1})
+  {
+    TimeLoopDummyOperator op;
+    op.proposed_step_limit = allowed_steps == 0 ? 0.04 : 0.06;
+    TimeLoopCountingStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.initial_time = 0.25;
+    cfg.initial_step = 7;
+    cfg.t_final = 0.5;
+    cfg.dt = 0.2;
+    cfg.dt_min = 0.05;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = true;
+    cfg.dt_save = 1.0;
+    cfg.analysis_steps = 1;
+    cfg.save_index_offset = 4;
+
+    int final_save_calls = 0;
+    int saved_step = -1;
+    int saved_cycle = -1;
+    mfem::real_t saved_time = -1.0;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_analysis = [&](int, mfem::real_t, mfem::real_t, bool)
+    {
+      op.proposed_step_limit = 0.04;
+    };
+    hooks.on_save = [&](int step, mfem::real_t time, int cycle, bool is_final)
+    {
+      if (is_final)
+      {
+        ++final_save_calls;
+        saved_step = step;
+        saved_cycle = cycle;
+        saved_time = time;
+      }
+    };
+    const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+      op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(!result.success && result.dt_min_reached &&
+                result.termination_reason == "operator-dt-min" &&
+                stepper.calls == allowed_steps &&
+                result.accepted_attempts == allowed_steps &&
+                result.segment_steps == allowed_steps &&
+                result.steps == cfg.initial_step + allowed_steps,
+              "time loop: operator dt floor preserves accepted step counts");
+    ctx.CheckNear(result.final_time,
+                  cfg.initial_time + allowed_steps * 0.06,
+                  1.0e-14,
+                  "time loop: operator dt floor retains committed time");
+    ctx.Check(final_save_calls == 1 && saved_step == result.steps &&
+                saved_cycle == cfg.save_index_offset &&
+                saved_time == result.final_time,
+              "time loop: operator dt floor saves the committed state once");
+  }
+
   // --- an operator can bound nominal growth before horizon/save clipping ---
   {
     TimeLoopDummyOperator op;
@@ -2589,12 +2716,14 @@ int RunTimeDefaultsTests(TestContext& ctx)
     dg_sim::TimeLoopConfig cfg;
     cfg.t_final = 0.14;
     cfg.dt = 0.2;
+    cfg.dt_min = 0.05;
     cfg.cfl = 0.0;
     cfg.vtk_save = false;
 
     const dg_sim::TimeLoopResult result =
       dg_sim::RunTimeLoop(op, example_ctx.Mesh(), bundle.sol, stepper, cfg);
-    ctx.Check(result.success && result.steps == 3 && stepper.calls == 3 &&
+    ctx.Check(result.success && !result.dt_min_reached && result.steps == 3 &&
+                stepper.calls == 3 &&
                 op.proposed_step_limit_calls == 3,
               "time loop: operator step-growth limit applies before every "
               "attempt and preserves final-horizon clipping");
@@ -2606,6 +2735,46 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   0.06,
                   1.0e-12,
                   "time loop: operator growth limit bounds nominal steps");
+  }
+
+  // --- short save/final clips are allowed after a valid operator bound ---
+  {
+    TimeLoopDummyOperator op;
+    op.proposed_step_limit = 0.06;
+    TimeLoopCountingStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.145;
+    cfg.dt = 0.2;
+    cfg.dt_min = 0.05;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = true;
+    cfg.dt_save = 0.07;
+    std::vector<mfem::real_t> save_times;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_save = [&](int, mfem::real_t time, int, bool)
+    {
+      save_times.push_back(time);
+    };
+    const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+      op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(result.success && !result.dt_min_reached &&
+                result.termination_reason == "target-reached" &&
+                result.steps == 5 && stepper.calls == 5 &&
+                save_times.size() == 3,
+              "time loop: operator dt floor permits short save and final clips");
+    ctx.CheckNear(result.minimum_accepted_dt,
+                  0.005,
+                  1.0e-12,
+                  "time loop: final bookkeeping clip can remain below dt_min");
+    if (save_times.size() == 3)
+    {
+      ctx.CheckNear(save_times[0], 0.07, 1.0e-12,
+                    "time loop: first short save clip reaches its boundary");
+      ctx.CheckNear(save_times[1], 0.14, 1.0e-12,
+                    "time loop: second short save clip reaches its boundary");
+      ctx.CheckNear(save_times[2], cfg.t_final, 1.0e-12,
+                    "time loop: final clip retains its final save");
+    }
   }
 
   // --- a tiny save clip cannot amplify the next accepted step above 2x ---

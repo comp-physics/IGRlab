@@ -64,11 +64,11 @@ class DeviceAllocation
 };
 
 bool CopyHashes(std::uint64_t* device_words, const std::size_t count,
-                std::array<std::uint64_t, 8>& words) noexcept
+                std::uint64_t (&words)[8]) noexcept
 {
-  words.fill(0);
+  for (auto& word : words) word = 0;
   return cudaDeviceSynchronize() == cudaSuccess &&
-      cudaMemcpy(words.data(), device_words, count * sizeof(std::uint64_t),
+      cudaMemcpy(words, device_words, count * sizeof(std::uint64_t),
                  cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 
@@ -94,9 +94,9 @@ bool CheckSingle(const double* host_values, const double* device_values,
                  const int count, std::uint64_t* device_words) noexcept
 {
   if (!CudaLaunchHash(device_values, count, device_words)) return false;
-  std::array<std::uint64_t, 8> actual{};
+  std::uint64_t actual[8]{};
   return CopyHashes(device_words, 4, actual) &&
-      CompareHash(HistoricalByteHash(host_values, count), actual.data(),
+      CompareHash(HistoricalByteHash(host_values, count), actual,
                   "single", count);
 }
 
@@ -108,12 +108,12 @@ bool CheckPair(const double* first_host, const int first_count,
   if (!CudaLaunchHashPair(first_device, first_count, second_device,
                           second_count, device_words))
     return false;
-  std::array<std::uint64_t, 8> actual{};
+  std::uint64_t actual[8]{};
   if (!CopyHashes(device_words, 8, actual)) return false;
   return CompareHash(HistoricalByteHash(first_host, first_count),
-                     actual.data(), "pair-first", first_count, second_count) &&
+                     actual, "pair-first", first_count, second_count) &&
       CompareHash(HistoricalByteHash(second_host, second_count),
-                  actual.data() + 4, "pair-second", first_count, second_count);
+                  actual + 4, "pair-second", first_count, second_count);
 }
 
 std::vector<double> MakeExactValues()

@@ -24,6 +24,58 @@ using namespace dg::hdg::runtime::cuda_w8a;
 static_assert(std::is_aggregate<CudaConfig>::value,
               "benchmark policy selection must not change CudaConfig ABI");
 
+constexpr bool NativeArchitectureAdmissionPolicy() noexcept
+{
+  using dg::hdg::runtime::cuda_w8a::detail::
+      CudaDeviceMatchesNativeArchitecture;
+  using dg::hdg::runtime::cuda_w8a::detail::configured_native_architecture;
+  return CudaDeviceMatchesNativeArchitecture(8, 0) ==
+             (configured_native_architecture == 80) &&
+      CudaDeviceMatchesNativeArchitecture(12, 0) ==
+             (configured_native_architecture == 120) &&
+      !CudaDeviceMatchesNativeArchitecture(8, 6) &&
+      !CudaDeviceMatchesNativeArchitecture(9, 0) &&
+      !CudaDeviceMatchesNativeArchitecture(12, 1) &&
+      !CudaDeviceMatchesNativeArchitecture(0, 0);
+}
+
+static_assert(NativeArchitectureAdmissionPolicy(),
+              "native CUDA admission must match only the configured device");
+
+constexpr bool CudaTicketArchitectureAndIdentityPolicy() noexcept
+{
+  using dg::hdg::runtime::cuda_w8a::detail::CudaTicketWordsValid;
+  using dg::hdg::runtime::cuda_w8a::detail::configured_cuda_architecture;
+  constexpr auto phase = CudaFailurePhase::trace_solve;
+  constexpr std::uint64_t attempt = (std::uint64_t{23} << 32U) | 17U;
+  constexpr std::uint64_t generation = (std::uint64_t{37} << 32U) | 31U;
+  constexpr int device = 3;
+  const std::array<int, 8> valid{
+      1, configured_cuda_architecture, device, static_cast<int>(phase),
+      17, 23, 31, 37};
+  if (!CudaTicketWordsValid(valid, phase, attempt, generation, device))
+    return false;
+  for (const int architecture : {0, 700, 800, 860, 900, 1200, 1210})
+  {
+    if (architecture == configured_cuda_architecture) continue;
+    auto invalid = valid;
+    invalid[1] = architecture;
+    if (CudaTicketWordsValid(invalid, phase, attempt, generation, device))
+      return false;
+  }
+  for (std::size_t word = 0; word < valid.size(); ++word)
+  {
+    auto invalid = valid;
+    ++invalid[word];
+    if (CudaTicketWordsValid(invalid, phase, attempt, generation, device))
+      return false;
+  }
+  return true;
+}
+
+static_assert(CudaTicketArchitectureAndIdentityPolicy(),
+              "CUDA tickets must reject a different image or launch identity");
+
 constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
     const dg::hdg::generic::CudaEngineKind engine, const bool igr_active,
     const CudaTracePolicyKind requested) noexcept

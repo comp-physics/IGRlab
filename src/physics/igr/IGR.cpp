@@ -2,6 +2,7 @@
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
 #include "utils/config/env_flags.hpp"
 #include "IGR_internal_utils.hpp"
+#include "IGR_nodal_source.hpp"
 #include "utils/profiling/nvtx.hpp"
 
 #include <algorithm>
@@ -232,6 +233,18 @@ void IGRSolver::SetExactDGFaceOperator(bool enabled)
   }
 }
 
+void IGRSolver::SetSubcellQuadratureMinimumOrder(int order)
+{
+  MFEM_VERIFY(order == 0 || order == 4,
+              "Subcell IGR quadrature minimum order must be zero or four.");
+  MFEM_VERIFY(order == 0 || (mfem::Device::Allows(mfem::Backend::CUDA_MASK) && UseDeviceCoefficients_()),
+              "Subcell IGR quadrature floor requires CUDA current coefficient QFunctions.");
+  if (order == subcell_quadrature_minimum_order_) return;
+  MFEM_VERIFY(first_call_, "Configure subcell quadrature before the first IGR state update.");
+  subcell_quadrature_minimum_order_ = order;
+  BuildBilinearForm_();
+}
+
 void IGRSolver::SetSweeps(int regular_sweeps, int warm_start_sweeps)
 {
   regular_sweeps_ = std::max(0, regular_sweeps);
@@ -259,6 +272,12 @@ void IGRSolver::SetDirichletBC(const mfem::Array<int>& ess_bdr)
 
 bool IGRSolver::UseDeviceCoefficients_() const
 {
+  const bool nodal_source = GetNodalSourceMode() != NodalSourceMode::Baseline;
+  MFEM_VERIFY(!NodalSourceMirrorWalls() || GetNodalSourceMode() == NodalSourceMode::Central,
+              "DG_IGR_IGR_NODAL_WALL_MIRROR requires the central nodal source.");
+  MFEM_VERIFY((!nodal_source && NodalSourceQuadratureMinimumOrder() == 0 &&
+                OperatorQuadratureMinimumOrder() == 0) || IsDGSpace(sfes_),
+              "Nodal IGR source / coefficient-quadrature override requires an L2 scalar space.");
   const bool device_backend =
     mfem::Device::Allows(mfem::Backend::DEVICE_MASK);
   // The exact side-aware DG face operator consumes the element coefficient
@@ -266,7 +285,8 @@ bool IGRSolver::UseDeviceCoefficients_() const
   // hidden environment prerequisite.  The environment switch remains an
   // opt-in/opt-out control only for closure paths that do not request exact
   // faces.
-  const bool qf_enabled = UseExactDGFaceOperator_() ||
+  const bool qf_enabled = nodal_source || NodalSourceQuadratureMinimumOrder() > 0 ||
+                          OperatorQuadratureMinimumOrder() > 0 || UseExactDGFaceOperator_() ||
                           ::dg_igr::EnvFlagEnabledDefault(
                             "DG_IGR_IGR_DEVICE_QF", device_backend);
   if (!qf_enabled)
