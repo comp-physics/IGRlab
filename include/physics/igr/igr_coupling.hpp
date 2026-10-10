@@ -151,7 +151,7 @@ public:
     MFEM_VERIFY(!subcell_recovery_ || sigma_cadence_ == ::igrlab::IGRSigmaUpdateCadence::EveryStage,
                 "Compact subcell recovery requires a current IGR solve at every RK stage.");
     sigma_interval_ = std::max(1, igr_.GetSigmaUpdateInterval());
-    const char* degree = igrlab::GetEnv("DG_IGR_IGR_EXTRAPOLATION_DEGREE");
+    const char* degree = ::igrlab::GetEnv("DG_IGR_IGR_EXTRAPOLATION_DEGREE");
     if (degree && *degree)
     {
       MFEM_VERIFY(std::strcmp(degree, "1") == 0 ||

@@ -288,7 +288,7 @@ void AssembleBoundaryShape(const mfem::ParFiniteElementSpace& vfes,
 
 void RunLegacy3DGuardProbeIfRequested()
 {
-  const char* requested = igrlab::GetEnv("DG_IGR_DGSEM_LEGACY_3D_PROBE");
+  const char* requested = ::igrlab::GetEnv("DG_IGR_DGSEM_LEGACY_3D_PROBE");
   if (!requested || requested[0] == 0)
   {
     return;
@@ -343,7 +343,7 @@ void RunLegacy3DGuardProbeIfRequested()
 
 int RunDGSEMOperatorTests(TestContext& ctx)
 {
-  if (igrlab::GetEnv("DG_IGR_DGSEM_SPLIT_COMM_PROBE"))
+  if (::igrlab::GetEnv("DG_IGR_DGSEM_SPLIT_COMM_PROBE"))
   {
     dgsem_production_test::RunDGSEMProductionSplitCommunicatorTests(ctx);
     return ctx.failures;

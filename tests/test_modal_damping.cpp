@@ -391,7 +391,7 @@ int main(int argc, char** argv)
   CheckPhysicalOperator(ctx, true, false);
   CheckPhysicalOperator(ctx, false, false);
   CheckPhysicalOperator(ctx, true, true);
-  const char* previous_strict = igrlab::GetEnv("DG_IGR_DGSEM_PRODUCTION_STRICT");
+  const char* previous_strict = ::igrlab::GetEnv("DG_IGR_DGSEM_PRODUCTION_STRICT");
   const std::optional<std::string> saved_strict = previous_strict
     ? std::optional<std::string>(previous_strict) : std::nullopt;
   setenv("DG_IGR_DGSEM_PRODUCTION_STRICT", "0", 1);

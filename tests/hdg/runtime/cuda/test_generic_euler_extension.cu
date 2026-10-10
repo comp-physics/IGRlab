@@ -8521,7 +8521,7 @@ bool MeasureAssemblyArithmetic(const int order, const int rank)
   if(selected_cuda_engine!=CudaEngineKind::tensor_core)return false;
   constexpr std::array<const char*,8> names{{
       "residual_r","residual_g","A","B","C","D","f","g"}};
-  const char* requested=igrlab::GetEnv("DG_IGR_HDG_VOLUME_ARITHMETIC");
+  const char* requested=::igrlab::GetEnv("DG_IGR_HDG_VOLUME_ARITHMETIC");
   const char* mode=requested&&*requested?requested:"fp64-wmma";
   bool all_valid=true;
   for(const bool physical : {false,true})

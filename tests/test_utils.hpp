@@ -18,7 +18,7 @@ namespace dg_igr_tests
 
 inline bool EnvEnabled(const char* name)
 {
-  const char* env = igrlab::GetEnv(name);
+  const char* env = ::igrlab::GetEnv(name);
   if (!env)
   {
     return false;
@@ -29,7 +29,7 @@ inline bool EnvEnabled(const char* name)
 
 inline bool EnvEnabledDefault(const char* name, bool default_value)
 {
-  const char* env = igrlab::GetEnv(name);
+  const char* env = ::igrlab::GetEnv(name);
   if (!env)
   {
     return default_value;

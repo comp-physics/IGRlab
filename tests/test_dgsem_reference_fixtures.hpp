@@ -89,7 +89,7 @@ inline void RunDGSEMDeterministicFluxFixtures(TestContext& ctx)
                     std::to_string(eq));
   }
 
-  const char* output_dir = igrlab::GetEnv("DG_IGR_DGSEM_REFERENCE_OUTPUT_DIR");
+  const char* output_dir = ::igrlab::GetEnv("DG_IGR_DGSEM_REFERENCE_OUTPUT_DIR");
   if (output_dir && mfem::Mpi::Root())
   {
     std::error_code ec;

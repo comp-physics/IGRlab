@@ -14,7 +14,7 @@ enum class NodalSourceMode { Baseline, Volume, Central };
 NodalSourceMode GetNodalSourceMode();
 inline bool NodalSourceMirrorWalls()
 {
-  const char* raw = igrlab::GetEnv("DG_IGR_IGR_NODAL_WALL_MIRROR");
+  const char* raw = ::igrlab::GetEnv("DG_IGR_IGR_NODAL_WALL_MIRROR");
   if (!raw || std::string(raw) == "0") return false;
   MFEM_VERIFY(std::string(raw) == "1",
               "DG_IGR_IGR_NODAL_WALL_MIRROR must be 0 or 1.");

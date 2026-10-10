@@ -30,7 +30,7 @@ namespace igr_internal
 {
 NodalSourceMode GetNodalSourceMode()
 {
-  const char* raw = igrlab::GetEnv("DG_IGR_IGR_NODAL_SOURCE");
+  const char* raw = ::igrlab::GetEnv("DG_IGR_IGR_NODAL_SOURCE");
   const std::string mode = raw ? raw : "baseline";
   if (mode == "baseline" || mode == "default") return NodalSourceMode::Baseline;
   if (mode == "volume") return NodalSourceMode::Volume;
@@ -45,7 +45,7 @@ const char* NodalSourceModeName(NodalSourceMode mode)
 }
 int NodalSourceQuadratureMinimumOrder()
 {
-  const char* raw = igrlab::GetEnv("DG_IGR_IGR_SOURCE_QUADRATURE_MIN_ORDER");
+  const char* raw = ::igrlab::GetEnv("DG_IGR_IGR_SOURCE_QUADRATURE_MIN_ORDER");
   if (!raw) return 0;
   char* end = nullptr;
   errno = 0;
@@ -56,7 +56,7 @@ int NodalSourceQuadratureMinimumOrder()
 }
 int OperatorQuadratureMinimumOrder()
 {
-  const char* raw = igrlab::GetEnv("DG_IGR_IGR_OPERATOR_QUADRATURE_MIN_ORDER");
+  const char* raw = ::igrlab::GetEnv("DG_IGR_IGR_OPERATOR_QUADRATURE_MIN_ORDER");
   if (!raw) return 0;
   char* end = nullptr;
   errno = 0;

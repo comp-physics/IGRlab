@@ -173,7 +173,7 @@ inline void RunDGSEMScalarIGRScopeFixture(TestContext& ctx)
   ctx.Check(scope.find("production wall stability") != std::string::npos,
             "DGSEM scalar-IGR fixture makes no production wall-stability claim");
 
-  const char* output_dir = igrlab::GetEnv("DG_IGR_DGSEM_REFERENCE_OUTPUT_DIR");
+  const char* output_dir = ::igrlab::GetEnv("DG_IGR_DGSEM_REFERENCE_OUTPUT_DIR");
   if (output_dir && mfem::Mpi::Root())
   {
     std::error_code ec;

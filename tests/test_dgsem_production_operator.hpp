@@ -42,7 +42,7 @@ public:
   ScopedEnvironment(const char* name, const char* value)
     : name_(name)
   {
-    if (const char* previous = igrlab::GetEnv(name))
+    if (const char* previous = ::igrlab::GetEnv(name))
     {
       had_value_ = true;
       previous_ = previous;
@@ -904,7 +904,7 @@ inline void CheckCollectiveRejectionSemantics(TestContext& ctx,
 
 inline void RunDGSEMProductionMultStrictRejectionProbe(TestContext& ctx)
 {
-  if (!igrlab::GetEnv("DG_IGR_DGSEM_MULT_STRICT_REJECTION_PROBE"))
+  if (!::igrlab::GetEnv("DG_IGR_DGSEM_MULT_STRICT_REJECTION_PROBE"))
   {
     return;
   }
@@ -3154,7 +3154,7 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
                 " negative_checks=" + std::to_string(negative_checks));
 
   const char* output_directory =
-    igrlab::GetEnv("DG_IGR_DGSEM_PRODUCTION_OUTPUT_DIR");
+    ::igrlab::GetEnv("DG_IGR_DGSEM_PRODUCTION_OUTPUT_DIR");
   if (output_directory && mfem::Mpi::Root())
   {
     std::error_code error;

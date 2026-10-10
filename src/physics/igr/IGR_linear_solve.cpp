@@ -56,7 +56,7 @@ struct ExactFaceTimingStats
 
 int ReadEnvInt(const char* name, int default_value)
 {
-  const char* raw = igrlab::GetEnv(name);
+  const char* raw = ::igrlab::GetEnv(name);
   if (!raw || raw[0] == '\0')
   {
     return default_value;
@@ -73,7 +73,7 @@ int ReadEnvInt(const char* name, int default_value)
 
 mfem::real_t ReadEnvReal(const char* name, mfem::real_t default_value)
 {
-  const char* raw = igrlab::GetEnv(name);
+  const char* raw = ::igrlab::GetEnv(name);
   if (!raw || raw[0] == '\0')
   {
     return default_value;
@@ -87,7 +87,7 @@ mfem::real_t ReadEnvReal(const char* name, mfem::real_t default_value)
 
 dg_face::DGDiffusionFaceScaling ReadIPDGFaceScaling()
 {
-  const char* raw = igrlab::GetEnv("DG_IGR_IGR_IPDG_FACE_SCALING");
+  const char* raw = ::igrlab::GetEnv("DG_IGR_IGR_IPDG_FACE_SCALING");
   const std::string value = raw ? raw : "arithmetic";
   if (value == "arithmetic")
   {
@@ -779,7 +779,7 @@ private:
                                   double face,
                                   double norm_sq) const
   {
-    const char* prefix = igrlab::GetEnv("DG_IGR_IGR_NEGATIVE_CAPTURE_PREFIX");
+    const char* prefix = ::igrlab::GetEnv("DG_IGR_IGR_NEGATIVE_CAPTURE_PREFIX");
     if (!prefix || prefix[0] == '\0' || !state_ || !sigma_fes_ ||
         !capture_written_ || *capture_written_)
     {
@@ -2200,7 +2200,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const int event_log_min_iters =
     ReadEnvInt("DG_IGR_IGR_EVENT_LOG_MIN_ITERS", 0);
   const char* event_capture_prefix_text =
-    igrlab::GetEnv("DG_IGR_IGR_EVENT_CAPTURE_PREFIX");
+    ::igrlab::GetEnv("DG_IGR_IGR_EVENT_CAPTURE_PREFIX");
   const bool event_capture_enabled =
     event_capture_prefix_text && event_capture_prefix_text[0] != '\0';
   const int event_capture_min_iters =
@@ -2251,20 +2251,20 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
   const bool is_dg = IsDGSpace(sfes_);
   const bool spd_ok = IsSPD_DefaultAssumption(sfes_, ip_kind_);
   const bool using_cuda = IsCudaBackendActive();
-  const char* dense_inverse_env = igrlab::GetEnv("DG_IGR_IGR_DENSE_INVERSE");
+  const char* dense_inverse_env = ::igrlab::GetEnv("DG_IGR_IGR_DENSE_INVERSE");
   const std::string dense_inverse_precision =
     dense_inverse_env ? dense_inverse_env : "";
   const bool using_dense_inverse = !dense_inverse_precision.empty();
-  const char* two_level_env = igrlab::GetEnv("DG_IGR_IGR_TWO_LEVEL_INVERSE");
+  const char* two_level_env = ::igrlab::GetEnv("DG_IGR_IGR_TWO_LEVEL_INVERSE");
   const bool using_two_level_inverse = two_level_env && two_level_env[0];
-  const char* patch_env = igrlab::GetEnv("DG_IGR_IGR_PATCH_RADIUS");
+  const char* patch_env = ::igrlab::GetEnv("DG_IGR_IGR_PATCH_RADIUS");
   const bool using_screened_patch = patch_env && patch_env[0];
   const int patch_radius = using_screened_patch
     ? ReadEnvInt("DG_IGR_IGR_PATCH_RADIUS", -1) : -1;
-  const char* patch_precision_env = igrlab::GetEnv("DG_IGR_IGR_PATCH_PRECISION");
+  const char* patch_precision_env = ::igrlab::GetEnv("DG_IGR_IGR_PATCH_PRECISION");
   const std::string patch_precision = using_screened_patch && patch_precision_env
     ? patch_precision_env : "fp64";
-  const char* patch_kind_env = igrlab::GetEnv("DG_IGR_IGR_PATCH_KIND");
+  const char* patch_kind_env = ::igrlab::GetEnv("DG_IGR_IGR_PATCH_KIND");
   const std::string patch_kind = using_screened_patch && patch_kind_env
     ? patch_kind_env : "ras";
   const int patch_rebuild_interval = using_screened_patch
@@ -2282,7 +2282,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
               "a nonnegative rebuild interval, "
               "and no global dense or two-level inverse. kind=vertex-p1 additionally "
               "requires radius=0, fp64 and symmetric SIPG; face-condensed requires radius=0 and symmetric SIPG.");
-  const char* two_level_coarse_env = igrlab::GetEnv("DG_IGR_IGR_TWO_LEVEL_COARSE");
+  const char* two_level_coarse_env = ::igrlab::GetEnv("DG_IGR_IGR_TWO_LEVEL_COARSE");
   const std::string two_level_coarse =
     two_level_coarse_env ? two_level_coarse_env : "dense";
   const int two_level_order = using_two_level_inverse
@@ -2899,7 +2899,7 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
     exact_face_sum_op->ResetTiming();
   }
 
-  const char* stationary_env = igrlab::GetEnv("DG_IGR_IGR_STATIONARY_SWEEPS");
+  const char* stationary_env = ::igrlab::GetEnv("DG_IGR_IGR_STATIONARY_SWEEPS");
   int stationary_sweeps = 0;
   if (stationary_env && stationary_env[0])
   {

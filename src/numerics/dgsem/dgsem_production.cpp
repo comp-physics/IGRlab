@@ -71,7 +71,7 @@ namespace
 
 int RequestedVolumeQuadratureOrder()
 {
-  const char* raw=igrlab::GetEnv("DG_IGR_DGSEM_VOLUME_QUADRATURE_MIN_ORDER");
+  const char* raw=::igrlab::GetEnv("DG_IGR_DGSEM_VOLUME_QUADRATURE_MIN_ORDER");
   if(!raw)return 0;
   errno=0;char* end=nullptr;const long value=std::strtol(raw,&end,10);
   MFEM_VERIFY(raw[0]&&end&&!*end&&errno==0&&value>=0&&value<=26,
@@ -1504,7 +1504,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
                   op_->GetDGSEMVolumeFlux()==DGSEMVolumeFlux::Central&&
                   op_->GetDGSEMStabilization()==DGSEMStabilization::None&&!llf_volume_selected,
                 "Overintegrated volume requires rank-one 2D central DGSEM without volume LLF/stabilization.");
-    const char* fused_setting=igrlab::GetEnv("DG_IGR_DGSEM_FUSED_RESIDUAL");
+    const char* fused_setting=::igrlab::GetEnv("DG_IGR_DGSEM_FUSED_RESIDUAL");
     MFEM_VERIFY(fused_setting&&std::strcmp(fused_setting,"0")==0&&
                   !::igrlab::EnvFlagEnabledDefault("DG_IGR_DGSEM_FUSED_DMMA",false)&&
                   !::igrlab::EnvFlagEnabledDefault("DG_IGR_DGSEM_SUBCELL_BLEND",false),
@@ -3686,7 +3686,7 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
     if (subcell_blend)
     {
       real_t threshold = 1e-4;
-      if (const char* value = igrlab::GetEnv("DG_IGR_DGSEM_SUBCELL_THRESHOLD"))
+      if (const char* value = ::igrlab::GetEnv("DG_IGR_DGSEM_SUBCELL_THRESHOLD"))
       {
         char* end = nullptr;
         threshold = std::strtod(value, &end);

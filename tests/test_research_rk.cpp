@@ -213,7 +213,7 @@ bool CheckMethod(mfem::ParFiniteElementSpace& fes,
 bool CheckFrozenSigmaReference()
 {
   constexpr const char* name = "DG_IGR_IGR_FROZEN_SIGMA_REFERENCE";
-  const char* previous = igrlab::GetEnv(name);
+  const char* previous = ::igrlab::GetEnv(name);
   const bool had_previous = previous != nullptr;
   const std::string previous_value = previous ? previous : "";
   unsetenv(name);

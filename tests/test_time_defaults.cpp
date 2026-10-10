@@ -42,16 +42,16 @@ int RunTimeDefaultsTests(TestContext& ctx)
       ? std::optional<std::string>(previous_legacy) : std::nullopt;
     unsetenv(canonical_name);
     unsetenv(legacy_name);
-    ctx.Check(igrlab::GetEnv(legacy_name) == nullptr,
+    ctx.Check(::igrlab::GetEnv(legacy_name) == nullptr,
               "IGRlab environment: missing values remain missing");
     setenv(legacy_name, "legacy", 1);
-    ctx.Check(std::string(igrlab::GetEnv(legacy_name)) == "legacy",
+    ctx.Check(std::string(::igrlab::GetEnv(legacy_name)) == "legacy",
               "IGRlab environment: legacy launch scripts remain supported");
     setenv(canonical_name, "canonical", 1);
-    ctx.Check(std::string(igrlab::GetEnv(legacy_name)) == "canonical",
+    ctx.Check(std::string(::igrlab::GetEnv(legacy_name)) == "canonical",
               "IGRlab environment: canonical values take precedence");
     setenv(canonical_name, "", 1);
-    ctx.Check(std::string(igrlab::GetEnv(legacy_name)).empty(),
+    ctx.Check(std::string(::igrlab::GetEnv(legacy_name)).empty(),
               "IGRlab environment: explicit empty canonical values are respected");
     if (saved_canonical) { setenv(canonical_name, saved_canonical->c_str(), 1); }
     else { unsetenv(canonical_name); }
@@ -985,7 +985,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
   {
     constexpr const char* vtk_points_env =
       "DG_IGR_LIMITER_ENFORCE_VTK_POINTS";
-    const char* original_env_text = igrlab::GetEnv(vtk_points_env);
+    const char* original_env_text = ::igrlab::GetEnv(vtk_points_env);
     const std::optional<std::string> original_env = original_env_text
       ? std::optional<std::string>(original_env_text)
       : std::nullopt;
@@ -1414,7 +1414,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
   // --- Run metadata records the effective explicit-method identity ---
   {
     constexpr const char* prefix_env_name = "DG_IGR_VTK_PREFIX_PATH";
-    const char* original_prefix_text = igrlab::GetEnv(prefix_env_name);
+    const char* original_prefix_text = ::igrlab::GetEnv(prefix_env_name);
     const std::optional<std::string> original_prefix = original_prefix_text
       ? std::optional<std::string>(original_prefix_text)
       : std::nullopt;
@@ -1598,7 +1598,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
   // --- VTK pressure can bypass the projected pressure polynomial ---
   {
     constexpr const char* prefix_env_name = "DG_IGR_VTK_PREFIX_PATH";
-    const char* original_prefix_text = igrlab::GetEnv(prefix_env_name);
+    const char* original_prefix_text = ::igrlab::GetEnv(prefix_env_name);
     const std::optional<std::string> original_prefix = original_prefix_text
       ? std::optional<std::string>(original_prefix_text)
       : std::nullopt;
@@ -1619,7 +1619,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     }
 
     constexpr const char* env_name = "DG_IGR_VTK_PRESSURE_COEFFICIENT";
-    const char* original_text = igrlab::GetEnv(env_name);
+    const char* original_text = ::igrlab::GetEnv(env_name);
     const std::optional<std::string> original =
       original_text ? std::optional<std::string>(original_text) : std::nullopt;
 
@@ -2348,7 +2348,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "RunEulerCase: retry exhaustion commits no conservative state");
 
     const char* prefix_env_name = "DG_IGR_VTK_PREFIX_PATH";
-    const char* old_prefix = igrlab::GetEnv(prefix_env_name);
+    const char* old_prefix = ::igrlab::GetEnv(prefix_env_name);
     const std::optional<std::string> original_prefix =
       old_prefix ? std::optional<std::string>(old_prefix) : std::nullopt;
     long long output_token = 0;

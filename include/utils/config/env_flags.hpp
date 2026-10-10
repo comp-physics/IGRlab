@@ -10,7 +10,7 @@ namespace igrlab
 
 inline bool EnvFlagEnabled(const char* name)
 {
-  const char* raw = igrlab::GetEnv(name);
+  const char* raw = ::igrlab::GetEnv(name);
   if (!raw)
   {
     return false;
@@ -22,7 +22,7 @@ inline bool EnvFlagEnabled(const char* name)
 
 inline bool EnvFlagEnabledDefault(const char* name, bool default_value)
 {
-  const char* raw = igrlab::GetEnv(name);
+  const char* raw = ::igrlab::GetEnv(name);
   if (!raw)
   {
     return default_value;

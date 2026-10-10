@@ -6379,7 +6379,7 @@ int SelectedExperimentalFaceBlockThreads() noexcept
   // Process-local and immutable: set before the first borrowed assembly.
   static const int selected=[]() noexcept
   {
-    const char* value=igrlab::GetEnv("DG_IGR_HDG_FACE_BLOCK_THREADS");
+    const char* value=::igrlab::GetEnv("DG_IGR_HDG_FACE_BLOCK_THREADS");
     if(value==nullptr)return 128;
     int threads=0;
     if(std::strcmp(value,"32")==0)threads=32;
@@ -6403,7 +6403,7 @@ ExperimentalVolumeArithmetic SelectedExperimentalVolumeArithmetic() noexcept
   // Process-local and immutable: numerical comparisons set this before launch.
   static const ExperimentalVolumeArithmetic selected=[]() noexcept
   {
-    const char* mode=igrlab::GetEnv("DG_IGR_HDG_VOLUME_ARITHMETIC");
+    const char* mode=::igrlab::GetEnv("DG_IGR_HDG_VOLUME_ARITHMETIC");
     if(mode==nullptr||*mode=='\0')return ExperimentalVolumeArithmetic::fp64_wmma;
     ExperimentalVolumeArithmetic result=ExperimentalVolumeArithmetic::invalid;
     if(std::strcmp(mode,"fp64-wmma")==0)
@@ -6434,7 +6434,7 @@ ExperimentalVolumeResidual SelectedExperimentalVolumeResidual() noexcept
 {
   static const ExperimentalVolumeResidual selected=[]() noexcept
   {
-    const char* mode=igrlab::GetEnv("DG_IGR_HDG_VOLUME_RESIDUAL");
+    const char* mode=::igrlab::GetEnv("DG_IGR_HDG_VOLUME_RESIDUAL");
     if(mode==nullptr||*mode=='\0')return ExperimentalVolumeResidual::matched;
     if(std::strcmp(mode,"matched")==0)
     {
@@ -6462,7 +6462,7 @@ ExperimentalCondensationArithmetic SelectedExperimentalCondensationArithmetic() 
 {
   static const ExperimentalCondensationArithmetic selected=[]() noexcept
   {
-    const char* mode=igrlab::GetEnv("DG_IGR_HDG_CONDENSATION_ARITHMETIC");
+    const char* mode=::igrlab::GetEnv("DG_IGR_HDG_CONDENSATION_ARITHMETIC");
     if(mode==nullptr||*mode=='\0'||std::strcmp(mode,"fp64-wmma")==0)
       return ExperimentalCondensationArithmetic::fp64_wmma;
     if(std::strcmp(mode,"simt-fp64")==0)

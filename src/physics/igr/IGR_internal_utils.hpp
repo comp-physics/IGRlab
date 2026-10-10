@@ -39,7 +39,7 @@ inline double IPDGPenalty(const mfem::FiniteElementSpace& fes,
 {
   const int p = SpaceOrder(fes);
   double scale = 1.0;
-  if (const char* raw = igrlab::GetEnv("DG_IGR_IGR_IPDG_PENALTY_SCALE"))
+  if (const char* raw = ::igrlab::GetEnv("DG_IGR_IGR_IPDG_PENALTY_SCALE"))
   {
     char* end = nullptr;
     scale = std::strtod(raw, &end);

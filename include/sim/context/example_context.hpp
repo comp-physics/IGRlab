@@ -73,7 +73,7 @@ private:
     if (lower == "l2" || lower == "dg" || lower == "brokendg" ||
         lower == "brokenl2")
     {
-      const char* basis = igrlab::GetEnv("DG_IGR_IGR_SIGMA_BASIS");
+      const char* basis = ::igrlab::GetEnv("DG_IGR_IGR_SIGMA_BASIS");
       if (basis && basis[0])
       {
         MFEM_VERIFY(std::string(basis) == "lgl",

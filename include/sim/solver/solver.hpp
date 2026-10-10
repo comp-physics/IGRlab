@@ -1664,7 +1664,7 @@ struct Solver
 
     const bool use_subcell_recovery =
       ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_SUBCELL_RECOVERY", false);
-    const char* quadrature_text = igrlab::GetEnv("DG_IGR_IGR_SUBCELL_QUADRATURE_MIN_ORDER");
+    const char* quadrature_text = ::igrlab::GetEnv("DG_IGR_IGR_SUBCELL_QUADRATURE_MIN_ORDER");
     const std::string subcell_quadrature_text = quadrature_text ? quadrature_text : "0";
     MFEM_VERIFY(subcell_quadrature_text == "0" || subcell_quadrature_text == "4",
                 "DG_IGR_IGR_SUBCELL_QUADRATURE_MIN_ORDER must be 0 (native) or 4.");
@@ -1672,7 +1672,7 @@ struct Solver
     MFEM_VERIFY(subcell_quadrature_min_order == 0 ||
                   (use_subcell_recovery && mfem::Device::Allows(mfem::Backend::CUDA_MASK)),
                 "A subcell quadrature floor requires the subcell recovery bridge on CUDA.");
-    const char* transport_text = igrlab::GetEnv("DG_IGR_IGR_SUBCELL_TRANSPORT");
+    const char* transport_text = ::igrlab::GetEnv("DG_IGR_IGR_SUBCELL_TRANSPORT");
     const std::string subcell_transport = transport_text ? transport_text : "first-order";
     MFEM_VERIFY(subcell_transport == "first-order" || subcell_transport == "muscl",
                 "DG_IGR_IGR_SUBCELL_TRANSPORT must be first-order or muscl.");
@@ -1689,11 +1689,11 @@ struct Solver
                   "no post-initialization edit and no restart.");
       MFEM_VERIFY(ToLowerCopy(run_cfg.igr_opts.space) == "l2" || ToLowerCopy(run_cfg.igr_opts.space) == "dg",
                   "Subcell recovery currently requires an L2 sigma space.");
-      const char* recovery_text = igrlab::GetEnv("DG_IGR_IGR_SUBCELL_RECOVERY_KIND");
+      const char* recovery_text = ::igrlab::GetEnv("DG_IGR_IGR_SUBCELL_RECOVERY_KIND");
       const std::string recovery_kind = recovery_text ? recovery_text : "compact";
       MFEM_VERIFY(recovery_kind == "compact" || recovery_kind == "linear",
                   "DG_IGR_IGR_SUBCELL_RECOVERY_KIND must be compact or linear.");
-      const char* closure_text = igrlab::GetEnv("DG_IGR_IGR_SUBCELL_CLOSURE_ORDER");
+      const char* closure_text = ::igrlab::GetEnv("DG_IGR_IGR_SUBCELL_CLOSURE_ORDER");
       const std::string closure_order_text = closure_text ? closure_text : "2";
       MFEM_VERIFY(closure_order_text == "1" || closure_order_text == "2",
                   "DG_IGR_IGR_SUBCELL_CLOSURE_ORDER must be 1 or 2.");
@@ -1749,7 +1749,7 @@ struct Solver
       {
         MFEM_VERIFY(alpha_policy != igrlab::IGRAlphaLengthScalePolicy::Local,
                     "Subcell bridge requires a fixed physical alpha, not per-subcell h scaling.");
-        const char* alpha_text = igrlab::GetEnv("DG_IGR_IGR_SUBCELL_ALPHA");
+        const char* alpha_text = ::igrlab::GetEnv("DG_IGR_IGR_SUBCELL_ALPHA");
         char* end = nullptr;
         const double fixed_alpha = alpha_text ? std::strtod(alpha_text,&end) : 0.0;
         MFEM_VERIFY(alpha_text && end && *end == '\0' && std::isfinite(fixed_alpha) && fixed_alpha > 0.0,

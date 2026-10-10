@@ -138,7 +138,7 @@ int main(int argc, char** argv)
   MFEM_VERIFY(RelativeDifference(reference, exact) <= 1.0e-13,
               "Host reference disagrees with manufactured solution.");
 
-  const char* saved_setup_env = igrlab::GetEnv("DG_IGR_IGR_DENSE_SETUP");
+  const char* saved_setup_env = ::igrlab::GetEnv("DG_IGR_IGR_DENSE_SETUP");
   const bool had_setup_env = saved_setup_env != nullptr;
   const std::string saved_setup = saved_setup_env ? saved_setup_env : "";
   mfem::Vector host_fp64_direct(initial.Height()), host_fp64_transpose(initial.Height());

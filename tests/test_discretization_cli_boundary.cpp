@@ -10,7 +10,7 @@ namespace
 
 void MarkPostSetupCallbackReached()
 {
-  const char* const path = igrlab::GetEnv("DG_IGR_CONFIG_BOUNDARY_SENTINEL");
+  const char* const path = ::igrlab::GetEnv("DG_IGR_CONFIG_BOUNDARY_SENTINEL");
   if (path)
   {
     std::ofstream(path) << "make_ic reached\n";

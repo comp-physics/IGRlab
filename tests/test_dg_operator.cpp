@@ -24,7 +24,7 @@ class ScopedEnvironment
 public:
   ScopedEnvironment(const char* name, const char* value) : name_(name)
   {
-    if (const char* previous = igrlab::GetEnv(name))
+    if (const char* previous = ::igrlab::GetEnv(name))
     {
       previous_ = std::string(previous);
     }

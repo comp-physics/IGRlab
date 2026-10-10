@@ -696,7 +696,7 @@ public:
   ScopedEnvVar(const char* name, const char* value)
     : name_(name)
   {
-    const char* prev = igrlab::GetEnv(name_.c_str());
+    const char* prev = ::igrlab::GetEnv(name_.c_str());
     if (prev)
     {
       had_prev_ = true;
@@ -3600,7 +3600,7 @@ int RunIGRTests(TestContext& ctx)
                       std::to_string(pa_qf_ref.GetLastLinearIters()));
         ctx.AddParity(pa_qf_rel);
         const bool require_l2_pa_qf_equiv =
-          igrlab::GetEnv("DG_IGR_REQUIRE_L2_PA_QF_EQUIV") != nullptr;
+          ::igrlab::GetEnv("DG_IGR_REQUIRE_L2_PA_QF_EQUIV") != nullptr;
         if (require_l2_pa_qf_equiv)
         {
           ctx.Check(pa_qf_rel < 1.0e-9,
@@ -3807,7 +3807,7 @@ int RunIGRTests(TestContext& ctx)
                       std::to_string(exact_face_ref.GetLastLinearIters()));
         ctx.AddParity(apply_rel + rhs_rel + exact_rel);
         const bool require_l2_exact_face_equiv =
-          igrlab::GetEnv("DG_IGR_REQUIRE_L2_EXACT_FACE_EQUIV") != nullptr;
+          ::igrlab::GetEnv("DG_IGR_REQUIRE_L2_EXACT_FACE_EQUIV") != nullptr;
         if (require_l2_exact_face_equiv)
         {
           ctx.Check(apply_rel < 1.0e-9,
@@ -3998,9 +3998,9 @@ int RunIGRTests(TestContext& ctx)
       "DG_IGR_IGR_TRUE_RESIDUAL";
     constexpr const char* true_initial_residual_env =
       "DG_IGR_IGR_TRUE_INITIAL_RESIDUAL";
-    const char* original_true_residual = igrlab::GetEnv(true_residual_env);
+    const char* original_true_residual = ::igrlab::GetEnv(true_residual_env);
     const char* original_true_initial_residual =
-      igrlab::GetEnv(true_initial_residual_env);
+      ::igrlab::GetEnv(true_initial_residual_env);
     const std::string original_true_residual_value =
       original_true_residual ? original_true_residual : "";
     const std::string original_true_initial_residual_value =

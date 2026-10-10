@@ -66,7 +66,7 @@ MakeDGOperator(ExampleContext& ctx, const NumericalFlux& numerical_flux)
   };
   auto env_flag = [](const char* name, bool default_value)
   {
-    const char* raw = igrlab::GetEnv(name);
+    const char* raw = ::igrlab::GetEnv(name);
     if (!raw)
     {
       return default_value;

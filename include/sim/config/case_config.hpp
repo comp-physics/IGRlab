@@ -2029,7 +2029,7 @@ inline bool UsesFrozenSigmaSpectralSpeed(const RunConfig& run_cfg)
       ? run_cfg.case_config.igr_config.sigma_cadence
       : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
   if (const char* reference =
-        igrlab::GetEnv("DG_IGR_IGR_FROZEN_SIGMA_REFERENCE"))
+        ::igrlab::GetEnv("DG_IGR_IGR_FROZEN_SIGMA_REFERENCE"))
   {
     if (std::string(reference) != "1" ||
         run_cfg.regularization != Regularization::IGR ||

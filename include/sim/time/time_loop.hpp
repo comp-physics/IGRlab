@@ -590,7 +590,7 @@ TimeLoopResult RunTimeLoop(OperatorType& op,
                                                                     op,
                                                                     uses_cfl);
   const mfem::real_t dt_min = std::max<mfem::real_t>(0.0, cfg.dt_min);
-  const char* dt_trace_text = igrlab::GetEnv("DG_IGR_TIME_DT_TRACE");
+  const char* dt_trace_text = ::igrlab::GetEnv("DG_IGR_TIME_DT_TRACE");
   const bool trace_nominal_dt =
     dt_trace_text != nullptr && std::string(dt_trace_text) != "0" &&
     std::string(dt_trace_text) != "false";

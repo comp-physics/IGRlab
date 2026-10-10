@@ -3219,7 +3219,7 @@ int main(int argc, char* argv[])
   if (selection.architecture_selection_screen)
   {
     const char* const enabled =
-        igrlab::GetEnv("DG_IGR_RUN_ARCHITECTURE_SELECTION_SCREEN");
+        ::igrlab::GetEnv("DG_IGR_RUN_ARCHITECTURE_SELECTION_SCREEN");
     if (enabled == nullptr || std::string_view{enabled} != "1")
     {
       std::cout << "ARCHITECTURE_SELECTION_GATE skipped=1 reason="

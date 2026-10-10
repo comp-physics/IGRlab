@@ -100,7 +100,7 @@ inline mfem::Vector CompactMUSCLFaceOracle(mfem::ParGridFunction& means,
 inline void TestCompactMUSCLFaces(MPI_Comm comm)
 {
   if (!mfem::Device::Allows(mfem::Backend::CUDA_MASK)) return;
-  const char* saved_q = igrlab::GetEnv("DG_IGR_DG_FACE_Q_PARALLEL");
+  const char* saved_q = ::igrlab::GetEnv("DG_IGR_DG_FACE_Q_PARALLEL");
   const bool had_q = saved_q != nullptr; const std::string original_q = saved_q ? saved_q : "";
   mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(8,1,mfem::Element::QUADRILATERAL,true,8.0,1.0);
   mfem::ParMesh mesh(comm,serial);

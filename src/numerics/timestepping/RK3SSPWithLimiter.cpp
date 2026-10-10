@@ -536,13 +536,13 @@ void RK3SSPWithLimiter::MaybeCaptureStagePair(Vector& v,
                                               double t,
                                               const char* side)
 {
-  const char* prefix = igrlab::GetEnv("DG_IGR_RK_STAGE_CAPTURE_DIR");
+  const char* prefix = ::igrlab::GetEnv("DG_IGR_RK_STAGE_CAPTURE_DIR");
   if (!prefix || prefix[0] == '\0' || stage_pair_capture_written_)
   {
     return;
   }
 
-  const char* min_time_text = igrlab::GetEnv("DG_IGR_RK_STAGE_CAPTURE_MIN_TIME");
+  const char* min_time_text = ::igrlab::GetEnv("DG_IGR_RK_STAGE_CAPTURE_MIN_TIME");
   const double min_time = min_time_text ? std::strtod(min_time_text, nullptr) : 0.0;
   if (t < min_time)
   {

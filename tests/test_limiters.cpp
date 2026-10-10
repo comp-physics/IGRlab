@@ -602,7 +602,7 @@ int RunLimiterTests(TestContext& ctx)
     };
 
     constexpr const char* vtk_env = "DG_IGR_LIMITER_ENFORCE_VTK_POINTS";
-    const char* original_vtk_text = igrlab::GetEnv(vtk_env);
+    const char* original_vtk_text = ::igrlab::GetEnv(vtk_env);
     const std::optional<std::string> original_vtk = original_vtk_text
       ? std::optional<std::string>(original_vtk_text)
       : std::nullopt;

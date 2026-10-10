@@ -234,7 +234,7 @@ double AllreduceSumDouble(double local)
 
 bool GetEnvString(const char* name, std::string& value)
 {
-  const char* env = igrlab::GetEnv(name);
+  const char* env = ::igrlab::GetEnv(name);
   if (!env)
   {
     return false;
@@ -364,7 +364,7 @@ int main(int argc, char** argv)
 
   mfem::Mpi::Init(argc, argv);
   std::unique_ptr<mfem::Device> requested_device;
-  if (const char* device = igrlab::GetEnv("DG_IGR_TEST_DEVICE"))
+  if (const char* device = ::igrlab::GetEnv("DG_IGR_TEST_DEVICE"))
   {
     requested_device = std::make_unique<mfem::Device>(device);
   }

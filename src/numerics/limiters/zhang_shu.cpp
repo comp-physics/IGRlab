@@ -443,7 +443,7 @@ LimiterTimingState& GetLimiterTimingState()
       igrlab::EnvFlagEnabled("DG_IGR_LIMITER_CPU_PHASE_TIMING");
     state.enabled = igrlab::EnvFlagEnabled("DG_IGR_LIMITER_TIMING") ||
                     state.phase_enabled;
-    if (const char* value = igrlab::GetEnv("DG_IGR_TIMING_WARMUP_CALLS"))
+    if (const char* value = ::igrlab::GetEnv("DG_IGR_TIMING_WARMUP_CALLS"))
     {
       state.warmup_calls = std::max(0, std::atoi(value));
     }

@@ -364,7 +364,7 @@ struct DimensionalKernelErrors
 
 inline std::string RequestedDevice()
 {
-  const char* value = igrlab::GetEnv("DG_IGR_DGSEM_DEVICE");
+  const char* value = ::igrlab::GetEnv("DG_IGR_DGSEM_DEVICE");
   return value ? std::string(value) : std::string("cpu");
 }
 
@@ -1482,7 +1482,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
                 max_constant_residual + max_local_conservation +
                 max_reduction_error);
 
-  const char* output_directory = igrlab::GetEnv("DG_IGR_DGSEM_DEVICE_OUTPUT_DIR");
+  const char* output_directory = ::igrlab::GetEnv("DG_IGR_DGSEM_DEVICE_OUTPUT_DIR");
   if (output_directory && mfem::Mpi::Root())
   {
     std::error_code error;
