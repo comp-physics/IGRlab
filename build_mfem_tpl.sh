@@ -2,15 +2,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-[[ "${DG_IGR_BUILD_HELPER_CALLER:-}" == "${SCRIPT_DIR}/build.sh" ]] || {
+[[ "${IGRLAB_BUILD_HELPER_CALLER:-${DG_IGR_BUILD_HELPER_CALLER:-}}" == "${SCRIPT_DIR}/build.sh" ]] || {
   echo "ERROR: build_mfem_tpl.sh is a private helper; invoke build.sh instead." >&2
   exit 2
 }
 MODE="cpu"
-JOBS="${NPROC:-4}"
+JOBS="${IGRLAB_BUILD_JOBS:-${NPROC:-4}}"
 CLEAN=0
 CALIPER=0
-SPACK_CUDA_ARCH="${SPACK_CUDA_ARCH:-120}"
+SPACK_CUDA_ARCH="${IGRLAB_CUDA_ARCH:-${SPACK_CUDA_ARCH:-120}}"
 CUDA_ARCH_WAS_SET=0
 CUDA_CODEGEN=""
 CUDA_CODEGEN_WAS_SET=0
@@ -18,13 +18,14 @@ PRINT_PLAN=0
 
 usage() {
   cat <<'EOF'
+IGRlab private MFEM helper; invoke build.sh
 Usage: ./build_mfem_tpl.sh [--cpu-only | --gpu] [options]
 
 Options:
   --cpu-only        Build MPI-enabled MFEM without CUDA (default).
   --gpu             Build MPI/CUDA-enabled MFEM.
   --caliper         Build CPU-only MFEM with Caliper support.
-  -j, --jobs N      Parallel build jobs (default: NPROC or 4).
+  -j, --jobs N      Parallel build jobs (default: IGRLAB_BUILD_JOBS, NPROC or 4).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
   --cuda-codegen A  MFEM CUDA code-generation architecture.
   --print-plan      Validate and print the resolved MFEM policy, then exit.
@@ -32,9 +33,10 @@ Options:
   --no-clean        Required internal helper mode from build.sh.
   -h, --help        Show this help.
 
-Environment overrides:
-  DG_IGR_SPACK_ENV, MFEM_SRC, MFEM_BUILD, MFEM_INSTALL, CMAKE_BUILD_TYPE,
-  SPACK_CUDA_ARCH
+Environment forwarded by build.sh:
+  IGRLAB_SPACK_ENV (legacy: DG_IGR_SPACK_ENV), MFEM_SRC, MFEM_BUILD, MFEM_INSTALL,
+  IGRLAB_BUILD_TYPE (legacy: CMAKE_BUILD_TYPE),
+  IGRLAB_CUDA_ARCH (legacy: SPACK_CUDA_ARCH), IGRLAB_BUILD_JOBS (legacy: NPROC)
 
 CUDA_ARCHS is intentionally rejected in GPU mode. The canonical build driver
 passes MFEM's code-generation architecture explicitly with --cuda-codegen.
@@ -105,7 +107,7 @@ fi
 MFEM_SRC="${MFEM_SRC:?private helper requires MFEM_SRC from build.sh}"
 MFEM_BUILD="${MFEM_BUILD:?private helper requires MFEM_BUILD from build.sh}"
 MFEM_INSTALL="${MFEM_INSTALL:?private helper requires MFEM_INSTALL from build.sh}"
-SPACK_ENV="${DG_IGR_SPACK_ENV:?private helper requires DG_IGR_SPACK_ENV from build.sh}"
+SPACK_ENV="${IGRLAB_SPACK_ENV:-${DG_IGR_SPACK_ENV:?private helper requires IGRLAB_SPACK_ENV or DG_IGR_SPACK_ENV from build.sh}}"
 MFEM_SRC_CANON="$(realpath -m -- "${MFEM_SRC}")" || {
   echo "ERROR: private MFEM helper cannot canonicalize MFEM_SRC." >&2
   exit 2
@@ -130,7 +132,7 @@ case "${MFEM_INSTALL_CANON}" in
     exit 2
     ;;
 esac
-CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
+CMAKE_BUILD_TYPE="${IGRLAB_BUILD_TYPE:-${CMAKE_BUILD_TYPE:-Release}}"
 
 if [[ "${MODE}" == "gpu" ]]; then
   PROFILE="cuda-sm${SPACK_CUDA_ARCH}"
@@ -150,6 +152,10 @@ if [[ "${MODE}" == "gpu" ]]; then
     exit 2
   fi
   HYPRE_SPEC="hypre@develop+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
+  if [[ "${SPACK_CUDA_ARCH}" == "80" ]]; then
+    # The SM80 manifest pins a compatible release; identity still binds its DAG hash.
+    HYPRE_SPEC="hypre+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
+  fi
   MPI_SPEC="openmpi+cuda"
 else
   if ((CALIPER)); then
@@ -195,6 +201,48 @@ spack_location() {
   spack -e "${SPACK_ENV}" location -i "$1"
 }
 
+configure_sm80_hypre_linalg() {
+  [[ "${SPACK_CUDA_ARCH}" == "80" ]] || return 0
+  local prefix hash dependencies library="" candidate
+  prefix="$(spack_location openblas)"
+  prefix="$(realpath -e -- "${prefix}")" || exit 3
+  hash="$(SPACK_COLOR=never spack -e "${SPACK_ENV}" find --format '{hash}' openblas)"
+  dependencies="$(SPACK_COLOR=never spack -e "${SPACK_ENV}" find \
+    --format '{^blas.hash}|{^lapack.hash}' "${HYPRE_SPEC}")"
+  [[ "${hash}" =~ ^[a-z0-9]{32}$ && "${dependencies}" == "${hash}|${hash}" ]] || {
+    echo "ERROR: SM80 HYPRE BLAS/LAPACK must match the selected Spack OpenBLAS identity." >&2
+    exit 3
+  }
+  for candidate in "${prefix}/lib/libopenblas.so" "${prefix}/lib64/libopenblas.so"; do
+    if [[ -f "${candidate}" ]]; then
+      library="$(realpath -e -- "${candidate}")" || exit 3
+      break
+    fi
+  done
+  case "${library}" in
+    "${prefix}"/*) ;;
+    *)
+      echo "ERROR: SM80 requires a shared OpenBLAS library inside its concrete prefix: ${prefix}" >&2
+      exit 3
+      ;;
+  esac
+  # FindBLAS/FindLAPACK reset their output *_LIBRARIES variables. Pin their
+  # actual find_library cache entries while retaining their symbol checks.
+  # MFEM must export Umpire's concrete imported archive after static HYPRE;
+  # the bare umpire target can otherwise be emitted before HYPRE by consumers.
+  # Clear only HYPRE's discovery results so an iterative configure rebuilds
+  # that dependency list instead of taking FindHYPRE's cached early return.
+  cmake_args+=(
+    -UHYPRE_FOUND -UHYPRE_LIBRARIES -UHYPRE_INCLUDE_DIRS
+    '-DHYPRE_REQUIRED_PACKAGES:STRING=BLAS;LAPACK;UMPIRE'
+    -DUMPIRE_TARGET_NAMES:STRING=umpire
+    -DUMPIRE_TARGET_FORCE:BOOL=OFF
+    -DBLA_VENDOR:STRING=OpenBLAS
+    -DBLAS_openblas_LIBRARY:FILEPATH="${library}"
+    -DLAPACK_openblas_LIBRARY:FILEPATH="${library}"
+  )
+}
+
 CMAKE_PREFIX="$(spack_location cmake)"
 MPI_PREFIX="$(spack_location "${MPI_SPEC}")"
 HYPRE_PREFIX="$(spack_location "${HYPRE_SPEC}")"
@@ -227,6 +275,7 @@ if [[ "${MODE}" == "gpu" ]]; then
     -DCUDAToolkit_ROOT="${CUDA_PREFIX}"
     -DUMPIRE_DIR="${UMPIRE_PREFIX}"
   )
+  configure_sm80_hypre_linalg
 else
   cmake_args+=(
     -DMFEM_USE_CUDA=OFF

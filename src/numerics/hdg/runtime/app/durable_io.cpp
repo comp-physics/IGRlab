@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "numerics/hdg/runtime/app/durable_io.hpp"
 
 #include "numerics/hdg/runtime/sha256.hpp"
@@ -505,7 +506,7 @@ DurableIoStatus ReadAuthorizedGenerationArtifact(
 bool InjectFinalDirectorySyncFailure() noexcept
 {
   const char* const value =
-      std::getenv("DG_IGR_HDG_TEST_FINAL_DIRECTORY_SYNC_FAILURE");
+      ::igrlab::GetEnv("DG_IGR_HDG_TEST_FINAL_DIRECTORY_SYNC_FAILURE");
   return value != nullptr && std::string_view{value} == "1";
 }
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -16,7 +18,7 @@ namespace dg_igr_tests
 
 inline bool EnvEnabled(const char* name)
 {
-  const char* env = std::getenv(name);
+  const char* env = ::igrlab::GetEnv(name);
   if (!env)
   {
     return false;
@@ -27,7 +29,7 @@ inline bool EnvEnabled(const char* name)
 
 inline bool EnvEnabledDefault(const char* name, bool default_value)
 {
-  const char* env = std::getenv(name);
+  const char* env = ::igrlab::GetEnv(name);
   if (!env)
   {
     return default_value;
@@ -241,4 +243,4 @@ IntegrateComponent(const mfem::GridFunction& U, int comp, int order_offset = 2)
   return GlobalSum(local);
 }
 
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

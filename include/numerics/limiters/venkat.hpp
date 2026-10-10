@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include "mfem.hpp"
 #include "utils/config/dg_igr_defaults.hpp"
 
@@ -17,8 +19,8 @@ namespace mfem
  */
 struct VenkatOptions
 {
-  int dim = mfem::dg_igr::EulerDefaults::kDim; ///< 2D supported here
-  double gamma = mfem::dg_igr::EulerDefaults::kGamma;
+  int dim = mfem::igrlab::EulerDefaults::kDim; ///< 2D supported here
+  double gamma = mfem::igrlab::EulerDefaults::kGamma;
   int slope_qord = 0;     ///< 0 => auto: 2*order+2
   double eps_kappa = 1.0; ///< Smoothness scale
 };

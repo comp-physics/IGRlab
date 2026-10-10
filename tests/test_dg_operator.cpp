@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/riemann/rusanov.hpp"
@@ -23,7 +24,7 @@ class ScopedEnvironment
 public:
   ScopedEnvironment(const char* name, const char* value) : name_(name)
   {
-    if (const char* previous = std::getenv(name))
+    if (const char* previous = ::igrlab::GetEnv(name))
     {
       previous_ = std::string(previous);
     }
@@ -754,4 +755,4 @@ int RunDGOperatorTests(TestContext& ctx)
   return ctx.failures;
 }
 
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

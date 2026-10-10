@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "sim/config/case_config.hpp"
 #include "sim/context/example_context.hpp"
 #include "sim/io/run_metadata.hpp"
@@ -20,7 +21,14 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
+
+static_assert(&::dg_igr::GetEnv == &::igrlab::GetEnv,
+              "the legacy global namespace must remain usable");
+static_assert(std::is_same_v<mfem::dg_igr::EulerAdmissibilityPointSet,
+                             mfem::igrlab::EulerAdmissibilityPointSet>,
+              "the legacy MFEM extension namespace must remain usable");
 
 namespace dg_igr_tests
 {
@@ -28,6 +36,35 @@ namespace dg_igr_tests
 int RunTimeDefaultsTests(TestContext& ctx)
 {
   constexpr double gamma = 1.4;
+
+  // Canonical runtime names must coexist with older case-launch scripts.
+  {
+    const char* canonical_name = "IGRLAB_COMPATIBILITY_TEST";
+    const char* legacy_name = "DG_IGR_COMPATIBILITY_TEST";
+    const char* previous_canonical = std::getenv(canonical_name);
+    const char* previous_legacy = std::getenv(legacy_name);
+    const std::optional<std::string> saved_canonical = previous_canonical
+      ? std::optional<std::string>(previous_canonical) : std::nullopt;
+    const std::optional<std::string> saved_legacy = previous_legacy
+      ? std::optional<std::string>(previous_legacy) : std::nullopt;
+    unsetenv(canonical_name);
+    unsetenv(legacy_name);
+    ctx.Check(::igrlab::GetEnv(legacy_name) == nullptr,
+              "IGRlab environment: missing values remain missing");
+    setenv(legacy_name, "legacy", 1);
+    ctx.Check(std::string(::igrlab::GetEnv(legacy_name)) == "legacy",
+              "IGRlab environment: legacy launch scripts remain supported");
+    setenv(canonical_name, "canonical", 1);
+    ctx.Check(std::string(::igrlab::GetEnv(legacy_name)) == "canonical",
+              "IGRlab environment: canonical values take precedence");
+    setenv(canonical_name, "", 1);
+    ctx.Check(std::string(::igrlab::GetEnv(legacy_name)).empty(),
+              "IGRlab environment: explicit empty canonical values are respected");
+    if (saved_canonical) { setenv(canonical_name, saved_canonical->c_str(), 1); }
+    else { unsetenv(canonical_name); }
+    if (saved_legacy) { setenv(legacy_name, saved_legacy->c_str(), 1); }
+    else { unsetenv(legacy_name); }
+  }
 
   // --- Zhang-Shu point policy defaults and runtime resolution ---
   {
@@ -575,17 +612,17 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   "IGR defaults: CUDA L2/BrokenL2 DG uses zero atol");
     ctx.Check(igr_opts.lin_maxit == 500,
               "IGR defaults: CUDA L2/BrokenL2 DG uses production iteration cap");
-    dg_igr::IGRConfig igr_config;
+    ::igrlab::IGRConfig igr_config;
     ctx.Check(igr_config.nonconvergence_policy ==
-                dg_igr::IGRNonconvergencePolicy::Accept,
+                ::igrlab::IGRNonconvergencePolicy::Accept,
               "IGR defaults: linear nonconvergence retains capped iterate");
     ctx.Check(dg_sim::ParseIGRNonconvergencePolicy("error") ==
-                dg_igr::IGRNonconvergencePolicy::Error,
+                ::igrlab::IGRNonconvergencePolicy::Error,
               "IGR options: explicit strict error policy parses");
     igr_opts.nonconvergence_policy = "error";
     dg_sim::ApplyIGRRuntimeOptionOverrides(igr_opts, igr_config);
     ctx.Check(igr_config.nonconvergence_policy ==
-                dg_igr::IGRNonconvergencePolicy::Error,
+                ::igrlab::IGRNonconvergencePolicy::Error,
               "IGR options: strict nonconvergence policy reaches solver config");
   }
 
@@ -734,11 +771,74 @@ int RunTimeDefaultsTests(TestContext& ctx)
     const auto cadence =
       dg_sim::ParseIGRSigmaUpdateCadence("EXTRAPOLATED-EVERY-STEP");
     ctx.Check(
-      cadence == dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep &&
+      cadence == ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep &&
         std::string(dg_sim::IGRSigmaUpdateCadenceToString(cadence)) ==
           "extrapolated-every-step" &&
         dg_sim::ParseIGRSigmaUpdateCadence("extrapolated_every_step") == cadence,
       "IGR options: extrapolated-every-step cadence parses and round-trips");
+  }
+
+  // --- Modal damping is opt-in and retains stage-consistent IGR coupling ---
+  {
+    dg_sim::CommonOptions opts;
+    dg_sim::CaseConfig case_cfg;
+    dg_sim::IGROptions igr_opts;
+    auto validate = [&](dg_sim::Discretization discretization,
+                        dg_sim::Regularization regularization)
+    {
+      return dg_sim::ValidateModalDampingSelection(
+        discretization, regularization, case_cfg, opts, igr_opts);
+    };
+    ctx.Check(opts.modal_damping_rate == 0.0 &&
+                validate(dg_sim::Discretization::HDG,
+                         dg_sim::Regularization::IGR).empty(),
+              "modal damping: default zero preserves all backends");
+
+    char program_name[] = "test";
+    char rate_name[] = "--modal-damping-rate";
+    char rate_value[] = "80000";
+    char* rate_argv[] = {program_name, rate_name, rate_value};
+    mfem::OptionsParser parser(3, rate_argv);
+    dg_sim::AddCommonOptions(parser, opts, "Test mesh.");
+    parser.Parse();
+    ctx.Check(parser.Good() && opts.modal_damping_rate == 80000.0,
+              "modal damping: M16 physical rate parses");
+
+    case_cfg.igr_config.sigma_cadence =
+      ::igrlab::IGRSigmaUpdateCadence::EveryStage;
+    ctx.Check(validate(dg_sim::Discretization::DG,
+                       dg_sim::Regularization::IGR).empty() &&
+                validate(dg_sim::Discretization::DGSEM,
+                         dg_sim::Regularization::IGR).empty(),
+              "modal damping: DG and DGSEM admit stage-consistent IGR");
+    ctx.Check(!validate(dg_sim::Discretization::HDG,
+                        dg_sim::Regularization::None).empty(),
+              "modal damping: positive HDG request is rejected before dispatch");
+
+    case_cfg.igr_config.sigma_cadence =
+      ::igrlab::IGRSigmaUpdateCadence::EveryStep;
+    ctx.Check(!validate(dg_sim::Discretization::DG,
+                        dg_sim::Regularization::IGR).empty(),
+              "modal damping: inherited frozen IGR cadence is rejected");
+    igr_opts.sigma_cadence = "every-stage";
+    ctx.Check(validate(dg_sim::Discretization::DG,
+                       dg_sim::Regularization::IGR).empty(),
+              "modal damping: explicit every-stage overrides the case cadence");
+    igr_opts.sigma_cadence = "extrapolated-every-step";
+    ctx.Check(!validate(dg_sim::Discretization::DGSEM,
+                        dg_sim::Regularization::IGR).empty() &&
+                validate(dg_sim::Discretization::DGSEM,
+                         dg_sim::Regularization::None).empty(),
+              "modal damping: cadence restriction applies to active IGR");
+    for (const mfem::real_t rate :
+         {mfem::real_t(-1.0), std::numeric_limits<mfem::real_t>::infinity(),
+          std::numeric_limits<mfem::real_t>::quiet_NaN()})
+    {
+      opts.modal_damping_rate = rate;
+      ctx.Check(!validate(dg_sim::Discretization::DG,
+                          dg_sim::Regularization::None).empty(),
+                "modal damping: negative and nonfinite rates are rejected");
+    }
   }
 
   // --- Explicit SSPRK CFL is a safety fraction, not a bare Courant number ---
@@ -892,7 +992,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
   {
     constexpr const char* vtk_points_env =
       "DG_IGR_LIMITER_ENFORCE_VTK_POINTS";
-    const char* original_env_text = std::getenv(vtk_points_env);
+    const char* original_env_text = ::igrlab::GetEnv(vtk_points_env);
     const std::optional<std::string> original_env = original_env_text
       ? std::optional<std::string>(original_env_text)
       : std::nullopt;
@@ -1065,7 +1165,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     const int volume_qord = 2 * local_order + 2;
     const std::vector<int> face_qords{
       2 * local_order + limiter_run.case_config.int_order_offset};
-    const auto pre_dof_scan = mfem::dg_igr::ScanEulerAdmissibility(
+    const auto pre_dof_scan = mfem::igrlab::ScanEulerAdmissibility(
       example_ctx.spaces.vfes,
       bundle.sol,
       /*dim=*/2,
@@ -1074,7 +1174,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
       limiter_run.case_config.rk3_config.p_min,
       volume_qord,
       face_qords,
-      mfem::dg_igr::EulerAdmissibilityPointSet::Dof);
+      mfem::igrlab::EulerAdmissibilityPointSet::Dof);
     const auto integral_before =
       dg_sim::detail::IntegrateEulerConservedState(bundle.sol);
     mfem::ZhangShuLimiterElementDiagnostics diagnostics;
@@ -1082,7 +1182,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
       dg_sim::detail::ApplyInitialEulerZhangShuTransaction(limiter_run,
                                                            bundle,
                                                            &diagnostics);
-    const auto post_dof_scan = mfem::dg_igr::ScanEulerAdmissibility(
+    const auto post_dof_scan = mfem::igrlab::ScanEulerAdmissibility(
       example_ctx.spaces.vfes,
       bundle.sol,
       /*dim=*/2,
@@ -1091,8 +1191,8 @@ int RunTimeDefaultsTests(TestContext& ctx)
       limiter_run.case_config.rk3_config.p_min,
       volume_qord,
       face_qords,
-      mfem::dg_igr::EulerAdmissibilityPointSet::Dof);
-    const auto post_limiter_scan = mfem::dg_igr::ScanEulerAdmissibility(
+      mfem::igrlab::EulerAdmissibilityPointSet::Dof);
+    const auto post_limiter_scan = mfem::igrlab::ScanEulerAdmissibility(
       example_ctx.spaces.vfes,
       bundle.sol,
       /*dim=*/2,
@@ -1101,7 +1201,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
       limiter_run.case_config.rk3_config.p_min,
       volume_qord,
       face_qords,
-      mfem::dg_igr::EulerAdmissibilityPointSet::Limiter);
+      mfem::igrlab::EulerAdmissibilityPointSet::Limiter);
     const auto integral_after =
       dg_sim::detail::IntegrateEulerConservedState(bundle.sol);
     double local_active = 0.0;
@@ -1285,7 +1385,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     ctx.Check(dgsem_llf_name == ssprk104_name + "_dvd_llf",
               "VTK dataset: DGSEM LLF volume dissipation has a typed suffix");
     dataset_run.case_config.igr_config.sigma_cadence =
-      dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+      ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
     dataset_run.igr_opts.alpha_length_policy = "local";
     dataset_run.igr_opts.exact_dg_face_operator = true;
     const std::string shock_candidate_name =
@@ -1299,7 +1399,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     dataset_run.dgsem_volume_dissipation =
       dg_sim::DGSEMVolumeDissipation::None;
     dataset_run.case_config.igr_config.sigma_cadence =
-      dg_igr::IGRSigmaUpdateCadence::EveryStage;
+      ::igrlab::IGRSigmaUpdateCadence::EveryStage;
     dataset_run.igr_opts.alpha_length_policy.clear();
     dataset_run.igr_opts.exact_dg_face_operator = false;
     dataset_run.igr_opts.igr_invariant_domain_flux = true;
@@ -1312,12 +1412,16 @@ int RunTimeDefaultsTests(TestContext& ctx)
       dg_sim::MakeCaseVTKDatasetName(dataset_case, dataset_run);
     ctx.Check(vtk_point_name == invariant_flux_name + "_zsvtk",
               "VTK dataset: refined limiter points have a typed suffix");
+    dataset_run.opts.modal_damping_rate = 80000.0;
+    ctx.Check(dg_sim::MakeCaseVTKDatasetName(dataset_case, dataset_run) ==
+                vtk_point_name + "_mdr_80000",
+              "VTK dataset: M16 damping has a distinct physical-rate suffix");
   }
 
   // --- Run metadata records the effective explicit-method identity ---
   {
     constexpr const char* prefix_env_name = "DG_IGR_VTK_PREFIX_PATH";
-    const char* original_prefix_text = std::getenv(prefix_env_name);
+    const char* original_prefix_text = ::igrlab::GetEnv(prefix_env_name);
     const std::optional<std::string> original_prefix = original_prefix_text
       ? std::optional<std::string>(original_prefix_text)
       : std::nullopt;
@@ -1342,9 +1446,9 @@ int RunTimeDefaultsTests(TestContext& ctx)
     dg_sim::CaseConfig metadata_case;
     metadata_case.case_name = "ssprk-metadata";
     metadata_case.igr_config.sigma_cadence =
-      dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+      ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
     metadata_case.igr_config.alpha_length_scale_policy =
-      dg_igr::IGRAlphaLengthScalePolicy::Local;
+      ::igrlab::IGRAlphaLengthScalePolicy::Local;
     dg_sim::RunConfig metadata_run;
     metadata_run.case_config = metadata_case;
     metadata_run.opts.vtk_save = true;
@@ -1440,6 +1544,10 @@ int RunTimeDefaultsTests(TestContext& ctx)
             std::string::npos &&
           contents.find("\"dgsem_entropy_jacobian\": \"fd\"") !=
             std::string::npos &&
+          contents.find("\"modal_damping_rate\": 0") !=
+            std::string::npos &&
+          contents.find("\"modal_damping_profile\": \"off\"") !=
+            std::string::npos &&
           contents.find(
             "\"igr_sigma_cadence\": \"extrapolated-every-step\"") !=
             std::string::npos &&
@@ -1497,7 +1605,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
   // --- VTK pressure can bypass the projected pressure polynomial ---
   {
     constexpr const char* prefix_env_name = "DG_IGR_VTK_PREFIX_PATH";
-    const char* original_prefix_text = std::getenv(prefix_env_name);
+    const char* original_prefix_text = ::igrlab::GetEnv(prefix_env_name);
     const std::optional<std::string> original_prefix = original_prefix_text
       ? std::optional<std::string>(original_prefix_text)
       : std::nullopt;
@@ -1518,7 +1626,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
     }
 
     constexpr const char* env_name = "DG_IGR_VTK_PRESSURE_COEFFICIENT";
-    const char* original_text = std::getenv(env_name);
+    const char* original_text = ::igrlab::GetEnv(env_name);
     const std::optional<std::string> original =
       original_text ? std::optional<std::string>(original_text) : std::nullopt;
 
@@ -2247,7 +2355,7 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "RunEulerCase: retry exhaustion commits no conservative state");
 
     const char* prefix_env_name = "DG_IGR_VTK_PREFIX_PATH";
-    const char* old_prefix = std::getenv(prefix_env_name);
+    const char* old_prefix = ::igrlab::GetEnv(prefix_env_name);
     const std::optional<std::string> original_prefix =
       old_prefix ? std::optional<std::string>(old_prefix) : std::nullopt;
     long long output_token = 0;
@@ -2581,6 +2689,62 @@ int RunTimeDefaultsTests(TestContext& ctx)
               "time loop: clipped final step records successful termination");
   }
 
+  // --- an operator bound respects dt_min before any new attempt ---
+  for (const int allowed_steps : {0, 1})
+  {
+    TimeLoopDummyOperator op;
+    op.proposed_step_limit = allowed_steps == 0 ? 0.04 : 0.06;
+    TimeLoopCountingStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.initial_time = 0.25;
+    cfg.initial_step = 7;
+    cfg.t_final = 0.5;
+    cfg.dt = 0.2;
+    cfg.dt_min = 0.05;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = true;
+    cfg.dt_save = 1.0;
+    cfg.analysis_steps = 1;
+    cfg.save_index_offset = 4;
+
+    int final_save_calls = 0;
+    int saved_step = -1;
+    int saved_cycle = -1;
+    mfem::real_t saved_time = -1.0;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_analysis = [&](int, mfem::real_t, mfem::real_t, bool)
+    {
+      op.proposed_step_limit = 0.04;
+    };
+    hooks.on_save = [&](int step, mfem::real_t time, int cycle, bool is_final)
+    {
+      if (is_final)
+      {
+        ++final_save_calls;
+        saved_step = step;
+        saved_cycle = cycle;
+        saved_time = time;
+      }
+    };
+    const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+      op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(!result.success && result.dt_min_reached &&
+                result.termination_reason == "operator-dt-min" &&
+                stepper.calls == allowed_steps &&
+                result.accepted_attempts == allowed_steps &&
+                result.segment_steps == allowed_steps &&
+                result.steps == cfg.initial_step + allowed_steps,
+              "time loop: operator dt floor preserves accepted step counts");
+    ctx.CheckNear(result.final_time,
+                  cfg.initial_time + allowed_steps * 0.06,
+                  1.0e-14,
+                  "time loop: operator dt floor retains committed time");
+    ctx.Check(final_save_calls == 1 && saved_step == result.steps &&
+                saved_cycle == cfg.save_index_offset &&
+                saved_time == result.final_time,
+              "time loop: operator dt floor saves the committed state once");
+  }
+
   // --- an operator can bound nominal growth before horizon/save clipping ---
   {
     TimeLoopDummyOperator op;
@@ -2589,12 +2753,14 @@ int RunTimeDefaultsTests(TestContext& ctx)
     dg_sim::TimeLoopConfig cfg;
     cfg.t_final = 0.14;
     cfg.dt = 0.2;
+    cfg.dt_min = 0.05;
     cfg.cfl = 0.0;
     cfg.vtk_save = false;
 
     const dg_sim::TimeLoopResult result =
       dg_sim::RunTimeLoop(op, example_ctx.Mesh(), bundle.sol, stepper, cfg);
-    ctx.Check(result.success && result.steps == 3 && stepper.calls == 3 &&
+    ctx.Check(result.success && !result.dt_min_reached && result.steps == 3 &&
+                stepper.calls == 3 &&
                 op.proposed_step_limit_calls == 3,
               "time loop: operator step-growth limit applies before every "
               "attempt and preserves final-horizon clipping");
@@ -2606,6 +2772,46 @@ int RunTimeDefaultsTests(TestContext& ctx)
                   0.06,
                   1.0e-12,
                   "time loop: operator growth limit bounds nominal steps");
+  }
+
+  // --- short save/final clips are allowed after a valid operator bound ---
+  {
+    TimeLoopDummyOperator op;
+    op.proposed_step_limit = 0.06;
+    TimeLoopCountingStepper stepper;
+    dg_sim::TimeLoopConfig cfg;
+    cfg.t_final = 0.145;
+    cfg.dt = 0.2;
+    cfg.dt_min = 0.05;
+    cfg.cfl = 0.0;
+    cfg.vtk_save = true;
+    cfg.dt_save = 0.07;
+    std::vector<mfem::real_t> save_times;
+    dg_sim::TimeLoopHooks hooks;
+    hooks.on_save = [&](int, mfem::real_t time, int, bool)
+    {
+      save_times.push_back(time);
+    };
+    const dg_sim::TimeLoopResult result = dg_sim::RunTimeLoop(
+      op, example_ctx.Mesh(), bundle.sol, stepper, cfg, hooks);
+    ctx.Check(result.success && !result.dt_min_reached &&
+                result.termination_reason == "target-reached" &&
+                result.steps == 5 && stepper.calls == 5 &&
+                save_times.size() == 3,
+              "time loop: operator dt floor permits short save and final clips");
+    ctx.CheckNear(result.minimum_accepted_dt,
+                  0.005,
+                  1.0e-12,
+                  "time loop: final bookkeeping clip can remain below dt_min");
+    if (save_times.size() == 3)
+    {
+      ctx.CheckNear(save_times[0], 0.07, 1.0e-12,
+                    "time loop: first short save clip reaches its boundary");
+      ctx.CheckNear(save_times[1], 0.14, 1.0e-12,
+                    "time loop: second short save clip reaches its boundary");
+      ctx.CheckNear(save_times[2], cfg.t_final, 1.0e-12,
+                    "time loop: final clip retains its final save");
+    }
   }
 
   // --- a tiny save clip cannot amplify the next accepted step above 2x ---
@@ -2958,4 +3164,4 @@ int RunTimeDefaultsTests(TestContext& ctx)
   return ctx.failures;
 }
 
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

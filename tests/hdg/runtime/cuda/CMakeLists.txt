@@ -25,7 +25,7 @@ set_target_properties(dg_igr_hdg_runtime_cuda_w8a_leaf
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
     CUDA_EXTENSIONS OFF
-    CUDA_ARCHITECTURES 120
+    CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
@@ -51,7 +51,7 @@ set_target_properties(dg_igr_hdg_runtime_cuda_hash_exact
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
     CUDA_EXTENSIONS OFF
-    CUDA_ARCHITECTURES 120
+    CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_test(
@@ -86,7 +86,7 @@ set_target_properties(dg_igr_hdg_runtime_cuda_generic_external_topology
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
     CUDA_EXTENSIONS OFF
-    CUDA_ARCHITECTURES 120
+    CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_test(
@@ -151,7 +151,7 @@ set_target_properties(dg_igr_hdg_runtime_cuda_generic_euler_session
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
     CUDA_EXTENSIONS OFF
-    CUDA_ARCHITECTURES 120
+    CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_test(
@@ -273,7 +273,7 @@ set_target_properties(dg_igr_hdg_runtime_cuda_generic_euler_extension
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
     CUDA_EXTENSIONS OFF
-    CUDA_ARCHITECTURES 120
+    CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
@@ -442,7 +442,7 @@ set_target_properties(
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
     CUDA_EXTENSIONS OFF
-    CUDA_ARCHITECTURES 120
+    CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 foreach(_order IN ITEMS 1 2 3)
@@ -703,7 +703,7 @@ set_target_properties(
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
     CUDA_EXTENSIONS OFF
-    CUDA_ARCHITECTURES 120
+    CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
@@ -964,6 +964,125 @@ endforeach()
 # CUDA accepted-step lifecycles at p1-p3.  This is intentionally a build
 # target, not a CTest: its default no-export 10,816-element workload performs
 # one warmup and five measured samples.
+add_executable(dg_igr_igr_screened_patch_cuda_test
+  "${PROJECT_SOURCE_DIR}/tests/test_igr_screened_patch_cuda.cu")
+target_include_directories(dg_igr_igr_screened_patch_cuda_test PRIVATE
+  "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_igr_screened_patch_cuda_test PRIVATE
+  igr_mfem mfem umpire MPI::MPI_CXX)
+target_compile_options(dg_igr_igr_screened_patch_cuda_test PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+set_target_properties(dg_igr_igr_screened_patch_cuda_test PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+  CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF
+  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+  CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_test(NAME dg_igr_igr_screened_patch_cuda
+  COMMAND dg_igr_igr_screened_patch_cuda_test)
+set_tests_properties(dg_igr_igr_screened_patch_cuda PROPERTIES
+  LABELS "cuda;igr;screening" TIMEOUT 90 RUN_SERIAL TRUE)
+
+if(IGRLAB_BUILD_RESEARCH_TESTS)
+  add_executable(dg_igr_condensation_panel_cuda
+    "${PROJECT_SOURCE_DIR}/tests/research/igr_condensation_panel_cuda.cu")
+  target_include_directories(dg_igr_condensation_panel_cuda PRIVATE "${PROJECT_SOURCE_DIR}/include")
+  target_link_libraries(dg_igr_condensation_panel_cuda PRIVATE igr_mfem mfem umpire MPI::MPI_CXX CUDA::cublas)
+  target_compile_options(dg_igr_condensation_panel_cuda PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  set_target_properties(dg_igr_condensation_panel_cuda PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  add_test(NAME dg_igr_condensation_panel_cuda
+    COMMAND dg_igr_condensation_panel_cuda --order 3 --nx 2 --repeats 2)
+  set_tests_properties(dg_igr_condensation_panel_cuda PROPERTIES
+    LABELS "cuda;igr;research" TIMEOUT 90 RUN_SERIAL TRUE)
+
+  # Manual saved-state mechanism study; input fields come from the shared DG
+  # research solver. No end-to-end application claim follows from this target.
+  add_executable(dg_igr_dg_source_tensor_cuda
+    "${PROJECT_SOURCE_DIR}/tests/research/igr_dg_source_tensor_cuda.cu")
+  target_link_libraries(dg_igr_dg_source_tensor_cuda PRIVATE CUDA::cudart)
+  set_target_properties(dg_igr_dg_source_tensor_cuda PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+
+endif()
+
+add_executable(dg_igr_igr_stationary_correction_cuda_test
+  "${PROJECT_SOURCE_DIR}/tests/test_igr_stationary_correction_cuda.cu")
+target_include_directories(dg_igr_igr_stationary_correction_cuda_test PRIVATE
+  "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_igr_stationary_correction_cuda_test PRIVATE
+  igr_mfem mfem umpire MPI::MPI_CXX CUDA::cublas)
+target_compile_options(dg_igr_igr_stationary_correction_cuda_test PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+set_target_properties(dg_igr_igr_stationary_correction_cuda_test PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+  CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF
+  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+  CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_test(NAME dg_igr_igr_stationary_correction_cuda
+  COMMAND dg_igr_igr_stationary_correction_cuda_test)
+set_tests_properties(dg_igr_igr_stationary_correction_cuda PROPERTIES
+  LABELS "cuda;igr;two-level" TIMEOUT 90 RUN_SERIAL TRUE)
+
+add_executable(dg_igr_igr_two_level_inverse_cuda_test
+  "${PROJECT_SOURCE_DIR}/tests/test_igr_two_level_inverse_cuda.cu")
+target_include_directories(dg_igr_igr_two_level_inverse_cuda_test PRIVATE
+  "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_igr_two_level_inverse_cuda_test PRIVATE
+  igr_mfem mfem umpire MPI::MPI_CXX CUDA::cublas)
+target_compile_options(dg_igr_igr_two_level_inverse_cuda_test PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+set_target_properties(dg_igr_igr_two_level_inverse_cuda_test PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+  CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF
+  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+  CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_test(NAME dg_igr_igr_two_level_inverse_cuda
+  COMMAND dg_igr_igr_two_level_inverse_cuda_test)
+set_tests_properties(dg_igr_igr_two_level_inverse_cuda PROPERTIES
+  LABELS "cuda;igr;two-level" TIMEOUT 90 RUN_SERIAL TRUE)
+
+add_executable(dg_igr_igr_dense_inverse_cuda_test
+  "${PROJECT_SOURCE_DIR}/tests/test_igr_dense_inverse_cuda.cu")
+target_include_directories(dg_igr_igr_dense_inverse_cuda_test PRIVATE
+  "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_igr_dense_inverse_cuda_test PRIVATE
+  igr_mfem mfem umpire MPI::MPI_CXX CUDA::cublas)
+target_compile_options(dg_igr_igr_dense_inverse_cuda_test PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+set_target_properties(dg_igr_igr_dense_inverse_cuda_test PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+  CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF
+  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+  CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_test(NAME dg_igr_igr_dense_inverse_cuda
+  COMMAND dg_igr_igr_dense_inverse_cuda_test)
+set_tests_properties(dg_igr_igr_dense_inverse_cuda PROPERTIES
+  LABELS "cuda;igr;mixed-precision" TIMEOUT 60 RUN_SERIAL TRUE)
+
+add_executable(dg_igr_dgsem_tensor_volume_benchmark
+  benchmark_dgsem_tensor_volume.cu)
+target_include_directories(dg_igr_dgsem_tensor_volume_benchmark PRIVATE
+  "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_dgsem_tensor_volume_benchmark PRIVATE
+  igr_mfem mfem umpire MPI::MPI_CXX CUDA::cublas)
+target_compile_options(dg_igr_dgsem_tensor_volume_benchmark PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+set_target_properties(dg_igr_dgsem_tensor_volume_benchmark PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+  CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF
+  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+  CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
 add_executable(dg_igr_hdg_runtime_cuda_accepted_step_benchmark
   benchmark_generic_euler_accepted_step.cu)
 find_package(Git REQUIRED)
@@ -1030,7 +1149,7 @@ set_target_properties(
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
     CUDA_EXTENSIONS OFF
-    CUDA_ARCHITECTURES 120
+    CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
@@ -1042,13 +1161,17 @@ find_program(DG_IGR_GENERIC_TENSOR_CUOBJDUMP_EXECUTABLE
   HINTS
     "${CUDAToolkit_BIN_DIR}"
     "${CMAKE_CUDA_COMPILER_TOOLKIT_ROOT}/bin")
-if(DG_IGR_GENERIC_TENSOR_CUOBJDUMP_EXECUTABLE)
+# This disassembly qualifier records CUDA 13 SM120 instruction spellings.
+# SM80 numerical tests are enabled below; SM80 SASS needs its own qualification.
+if(DG_IGR_GENERIC_TENSOR_CUOBJDUMP_EXECUTABLE AND
+   DG_IGR_HDG_NATIVE_CUDA_ARCH STREQUAL "120")
   add_custom_target(dg_igr_hdg_runtime_cuda_tensor_sass_evidence
     COMMAND
       "${CMAKE_COMMAND}"
       "-DTEST_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime_cuda_accepted_step_benchmark>"
       "-DCUOBJDUMP_EXECUTABLE=${DG_IGR_GENERIC_TENSOR_CUOBJDUMP_EXECUTABLE}"
-      "-DEXPECTED_KERNEL_SUBSTRING=TensorBorrowedCondenseKernel"
+      # Select UseTensor=true beside the separately retained SIMT specialization.
+      "-DEXPECTED_KERNEL_SUBSTRING=TensorBorrowedCondenseKernelILb1E"
       "-DEXPECTED_VOLUME_KERNEL_SUBSTRING=BorrowedEulerTensorVolumeContractionKernel"
       "-DEVIDENCE_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/tensor-sass-evidence"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/check_generic_tensor_sass.cmake"
@@ -1061,7 +1184,8 @@ if(DG_IGR_GENERIC_TENSOR_CUOBJDUMP_EXECUTABLE)
       "${CMAKE_COMMAND}"
       "-DTEST_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_runtime_cuda_accepted_step_benchmark>"
       "-DCUOBJDUMP_EXECUTABLE=${DG_IGR_GENERIC_TENSOR_CUOBJDUMP_EXECUTABLE}"
-      "-DEXPECTED_KERNEL_SUBSTRING=TensorBorrowedCondenseKernel"
+      # Select UseTensor=true beside the separately retained SIMT specialization.
+      "-DEXPECTED_KERNEL_SUBSTRING=TensorBorrowedCondenseKernelILb1E"
       "-DEXPECTED_VOLUME_KERNEL_SUBSTRING=BorrowedEulerTensorVolumeContractionKernel"
       "-DEVIDENCE_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/tensor-sass-evidence"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/check_generic_tensor_sass.cmake")
@@ -1072,7 +1196,7 @@ if(DG_IGR_GENERIC_TENSOR_CUOBJDUMP_EXECUTABLE)
       TIMEOUT 300)
 else()
   message(STATUS
-    "Generic tensor SASS evidence target disabled: cuobjdump was not found.")
+    "Generic tensor SASS evidence target requires cuobjdump and the qualified SM120 profile.")
 endif()
 
 # Borrowed generic sessions must use their request/mesh communicator.  Each
@@ -1105,7 +1229,7 @@ set_target_properties(
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
     CUDA_EXTENSIONS OFF
-    CUDA_ARCHITECTURES 120
+    CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
@@ -1356,7 +1480,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
       CUDA_STANDARD 17
       CUDA_STANDARD_REQUIRED ON
       CUDA_EXTENSIONS OFF
-      CUDA_ARCHITECTURES 120
+      CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
       CUDA_SEPARABLE_COMPILATION ON
       CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   add_test(
@@ -1395,7 +1519,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
       CUDA_STANDARD 17
       CUDA_STANDARD_REQUIRED ON
       CUDA_EXTENSIONS OFF
-      CUDA_ARCHITECTURES 120
+      CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
       CUDA_SEPARABLE_COMPILATION ON
       CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   add_test(
@@ -1439,7 +1563,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
       CUDA_STANDARD 17
       CUDA_STANDARD_REQUIRED ON
       CUDA_EXTENSIONS OFF
-      CUDA_ARCHITECTURES 120
+      CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
       CUDA_SEPARABLE_COMPILATION ON
       CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
@@ -1454,26 +1578,29 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
       "-DTEST_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_sc25_scalar_igr_cuda_rank1_test>"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/run_sc25_scalar_igr_rank1.cmake")
 
-  find_program(DG_IGR_CUOBJDUMP_EXECUTABLE
-    NAMES cuobjdump
-    HINTS "${CMAKE_CUDA_COMPILER_TOOLKIT_ROOT}/bin"
-    REQUIRED)
-  find_program(DG_IGR_NM_EXECUTABLE NAMES nm llvm-nm REQUIRED)
-  add_test(
-    NAME hdg_sc25_scalar_igr_cuda_rank1_device_object
-    COMMAND
-      "${CMAKE_COMMAND}"
-      "-DOBJECT_ROOT=${PROJECT_BINARY_DIR}"
-      "-DRUNTIME_ARCHIVE=$<TARGET_FILE:dg_igr_hdg_sc25_oracle_cuda>"
-      "-DTEST_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_sc25_scalar_igr_cuda_rank1_test>"
-      "-DCUOBJDUMP_EXECUTABLE=${DG_IGR_CUOBJDUMP_EXECUTABLE}"
-      "-DNM_EXECUTABLE=${DG_IGR_NM_EXECUTABLE}"
-      -P "${CMAKE_CURRENT_SOURCE_DIR}/check_sc25_scalar_igr_device_object.cmake")
+  # Frozen object checks distinguish native SM120 from MFEM's SM80 PTX.
+  # That distinction does not apply to the fully native SM80 profile.
+  if(DG_IGR_HDG_NATIVE_CUDA_ARCH STREQUAL "120")
+    find_program(DG_IGR_CUOBJDUMP_EXECUTABLE
+      NAMES cuobjdump
+      HINTS "${CMAKE_CUDA_COMPILER_TOOLKIT_ROOT}/bin"
+      REQUIRED)
+    find_program(DG_IGR_NM_EXECUTABLE NAMES nm llvm-nm REQUIRED)
+    add_test(
+      NAME hdg_sc25_scalar_igr_cuda_rank1_device_object
+      COMMAND
+        "${CMAKE_COMMAND}"
+        "-DOBJECT_ROOT=${PROJECT_BINARY_DIR}"
+        "-DRUNTIME_ARCHIVE=$<TARGET_FILE:dg_igr_hdg_sc25_oracle_cuda>"
+        "-DTEST_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_sc25_scalar_igr_cuda_rank1_test>"
+        "-DCUOBJDUMP_EXECUTABLE=${DG_IGR_CUOBJDUMP_EXECUTABLE}"
+        "-DNM_EXECUTABLE=${DG_IGR_NM_EXECUTABLE}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/check_sc25_scalar_igr_device_object.cmake")
+  endif()
 
   set_tests_properties(
     hdg_sc25_scalar_igr_cuda_rank1_c1
     hdg_sc25_scalar_igr_cuda_rank1_c2
-    hdg_sc25_scalar_igr_cuda_rank1_device_object
     PROPERTIES
       PROCESSORS 1
       RESOURCE_LOCK dg_igr_sm120
@@ -1506,7 +1633,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
       CUDA_STANDARD 17
       CUDA_STANDARD_REQUIRED ON
       CUDA_EXTENSIONS OFF
-      CUDA_ARCHITECTURES 120
+      CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
       CUDA_SEPARABLE_COMPILATION ON
       CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
@@ -1519,27 +1646,33 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
       $<TARGET_FILE:dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test>
       ${MPIEXEC_POSTFLAGS})
 
-  add_test(
-    NAME hdg_sc25_scalar_igr_cuda_rank2_device_object
-    COMMAND
-      "${CMAKE_COMMAND}"
-      "-DOBJECT_ROOT=${PROJECT_BINARY_DIR}"
-      "-DRUNTIME_ARCHIVE=$<TARGET_FILE:dg_igr_hdg_sc25_oracle_cuda>"
-      "-DTEST_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test>"
-      "-DCUOBJDUMP_EXECUTABLE=${DG_IGR_CUOBJDUMP_EXECUTABLE}"
-      "-DNM_EXECUTABLE=${DG_IGR_NM_EXECUTABLE}"
-      -P "${CMAKE_CURRENT_SOURCE_DIR}/check_sc25_scalar_igr_rank2_device_object.cmake")
+  if(DG_IGR_HDG_NATIVE_CUDA_ARCH STREQUAL "120")
+    add_test(
+      NAME hdg_sc25_scalar_igr_cuda_rank2_device_object
+      COMMAND
+        "${CMAKE_COMMAND}"
+        "-DOBJECT_ROOT=${PROJECT_BINARY_DIR}"
+        "-DRUNTIME_ARCHIVE=$<TARGET_FILE:dg_igr_hdg_sc25_oracle_cuda>"
+        "-DTEST_EXECUTABLE=$<TARGET_FILE:dg_igr_hdg_sc25_scalar_igr_cuda_rank2_test>"
+        "-DCUOBJDUMP_EXECUTABLE=${DG_IGR_CUOBJDUMP_EXECUTABLE}"
+        "-DNM_EXECUTABLE=${DG_IGR_NM_EXECUTABLE}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/check_sc25_scalar_igr_rank2_device_object.cmake")
+  endif()
 
   set_tests_properties(hdg_sc25_scalar_igr_cuda_rank2_c3
     PROPERTIES
       PROCESSORS 2
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 3600)
-  set_tests_properties(hdg_sc25_scalar_igr_cuda_rank2_device_object
-    PROPERTIES
-      PROCESSORS 1
-      RESOURCE_LOCK dg_igr_sm120
-      TIMEOUT 3600)
+  if(DG_IGR_HDG_NATIVE_CUDA_ARCH STREQUAL "120")
+    set_tests_properties(
+      hdg_sc25_scalar_igr_cuda_rank1_device_object
+      hdg_sc25_scalar_igr_cuda_rank2_device_object
+      PROPERTIES
+        PROCESSORS 1
+        RESOURCE_LOCK dg_igr_sm120
+        TIMEOUT 3600)
+  endif()
 
   add_executable(dg_igr_hdg_sc25_scalar_igr_cuda_rank2_smooth_transition_test
     test_persistent_sc25_scalar_igr_rank2_smooth_transition.cu)
@@ -1558,7 +1691,7 @@ if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
     dg_igr_hdg_sc25_scalar_igr_cuda_rank2_smooth_transition_test PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF
     CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF
-    CUDA_ARCHITECTURES 120 CUDA_SEPARABLE_COMPILATION ON
+    CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}" CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   add_test(
     NAME hdg_sc25_scalar_igr_cuda_rank2_w8c_smooth_transition

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file utils/profiling/nvtx.hpp
  * @brief Source-compatible name for the core observability range.
@@ -7,9 +9,9 @@
 
 #include "utils/profiling/observability.hpp"
 
-namespace dg_igr
+namespace igrlab
 {
 
 using NVTXRange = observability::ScopedRegion<observability::DefaultBackend>;
 
-} // namespace dg_igr
+} // namespace igrlab

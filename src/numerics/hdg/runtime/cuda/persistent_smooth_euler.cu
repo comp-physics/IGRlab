@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "numerics/hdg/runtime/cuda/persistent_smooth_euler.cuh"
 #include "numerics/hdg/runtime/cuda/native_rank1_trace_solver.cuh"
 #include "numerics/hdg/runtime/cuda/tensor_volume_layout.hpp"
@@ -19,11 +20,12 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
-// Source-only candidate for the native SM120 W8A path.  Every kernel records
-// __CUDA_ARCH__ and refuses to provide a valid ticket for another image.
+// Native W8A CUDA path.  Launch tickets record __CUDA_ARCH__ and are
+// accepted only for the configured native device image.
 
 namespace dg::hdg::runtime::cuda_w8a
 {
@@ -544,8 +546,8 @@ bool CudaTransportPolicy::HostToDevice(
     const std::size_t source_capacity,
     const std::size_t destination_capacity) noexcept
 {
-  [[maybe_unused]] ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_device_transfer);
+  [[maybe_unused]] ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_device_transfer);
   const bool trace_touch = true_system_diagnostic_active &&
       category == CudaTransferCategory::initial_state &&
       site == CudaTransferSite::initial_trace_upload;
@@ -577,8 +579,8 @@ bool CudaTransportPolicy::DeviceToHost(
     const std::size_t source_capacity,
     const std::size_t destination_capacity) noexcept
 {
-  [[maybe_unused]] ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_device_transfer);
+  [[maybe_unused]] ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_device_transfer);
   const bool true_structure_copy = true_system_diagnostic_active &&
       category == CudaTransferCategory::topology &&
       site == CudaTransferSite::map_upload;
@@ -601,8 +603,8 @@ bool CudaTransportPolicy::DeviceToDevice(
     const std::size_t source_capacity,
     const std::size_t destination_capacity) noexcept
 {
-  [[maybe_unused]] ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_device_transfer);
+  [[maybe_unused]] ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_device_transfer);
   const bool success = Copy(destination, source, bytes, cudaMemcpyDeviceToDevice);
   RecordTransfer(CudaTransferDirection::device_to_device, category, site,
                  source, destination, bytes, source_capacity,
@@ -616,8 +618,8 @@ bool CudaTransportPolicy::RecordMpiStaging(
     const void* destination, const std::size_t source_capacity,
     const std::size_t destination_capacity, const bool success) noexcept
 {
-  [[maybe_unused]] ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_device_transfer);
+  [[maybe_unused]] ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_device_transfer);
   const bool sparse_staging = true_system_diagnostic_active &&
       category == CudaTransferCategory::topology &&
       site == CudaTransferSite::map_upload;
@@ -635,8 +637,8 @@ bool CudaTransportPolicy::RecordMpiStaging(
 
 bool CudaTransportPolicy::Synchronize(const CudaTransferSite site) noexcept
 {
-  [[maybe_unused]] ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_synchronization);
+  [[maybe_unused]] ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_synchronization);
   const bool true_system_sync = true_system_diagnostic_active &&
       (site == CudaTransferSite::map_upload ||
        site == CudaTransferSite::initial_trace_upload);
@@ -1976,6 +1978,25 @@ bool CudaStableTrueMatrixExact(
       state.offd_nonzeros == current.offd_nonzeros;
 }
 
+// Newer HYPRE permits a separate preconditioner matrix; null means A.
+// Detect the member instead of assuming the same layout across releases.
+template <typename GmresData>
+constexpr auto CudaGmresMatrixIsExact(
+    const GmresData& data, const void* matrix, int) noexcept
+    -> decltype(data.precond_Mat, bool{})
+{
+  return data.A == matrix &&
+      (data.precond_Mat == nullptr || data.precond_Mat == matrix);
+}
+
+template <typename GmresData>
+constexpr bool CudaGmresMatrixIsExact(
+    const GmresData& data, const void* matrix, long) noexcept
+{
+  // HYPRE 2.32 passes A directly to both precond_setup and precond.
+  return data.A == matrix;
+}
+
 bool CudaExactIluGmresConfiguration(
     mfem::HypreParMatrix& matrix, mfem::HypreILU& ilu,
     mfem::HypreGMRES& gmres, const CudaTracePolicyDescriptor& policy,
@@ -2052,9 +2073,7 @@ bool CudaExactIluGmresConfiguration(
       reinterpret_cast<std::uintptr_t>(hypre_VectorData(jacobi_diagonal));
 
   const bool gmres_matrix_exact = !factor_required ||
-      (gmres_data->A == raw_matrix &&
-       (gmres_data->precond_Mat == nullptr ||
-        gmres_data->precond_Mat == raw_matrix));
+      CudaGmresMatrixIsExact(*gmres_data, raw_matrix, 0);
   hypre_MemoryLocation factor_permutation_location =
       hypre_MEMORY_UNDEFINED;
   const bool factor_permutation_required =
@@ -4943,18 +4962,24 @@ __device__ bool BorrowedEulerFaceElement(
   return true;
 }
 
+// Only face scheduling varies; each element retains the same four lanes
+// and the same scalar accumulation order as the 128-thread baseline.
+template <int BlockThreads>
 __global__ void BorrowedEulerFaceKernel(CudaDeviceView v,CudaMeshShape s,
                                         bool frozen_llf,
                                         bool differentiate_nonlinearities)
 {
+  static_assert(BlockThreads==32||BlockThreads==64||BlockThreads==128);
+  constexpr int elements_per_block=BlockThreads/borrowed_euler_group_threads;
+  static_assert(sizeof(BorrowedFaceCache)*elements_per_block<=48*1024);
   const int group=threadIdx.x/borrowed_euler_group_threads;
   const int lane=threadIdx.x%borrowed_euler_group_threads;
   const int warp_lane=threadIdx.x%borrowed_euler_warp_threads;
   const unsigned group_mask=borrowed_euler_group_mask<<
       (warp_lane-lane);
-  const int e=blockIdx.x*borrowed_euler_elements_per_block+group;
+  const int e=blockIdx.x*elements_per_block+group;
   if(e>=s.elements)return;
-  __shared__ BorrowedFaceCache caches[borrowed_euler_elements_per_block];
+  __shared__ BorrowedFaceCache caches[elements_per_block];
   (void)BorrowedEulerFaceElement(
       v,s,frozen_llf,differentiate_nonlinearities,e,lane,group_mask,
       caches[group]);
@@ -5933,12 +5958,25 @@ __global__ void BorrowedEulerTensorVolumeCoefficientKernel(
   if(threadIdx.x==0&&failed)v.status[e]=-1.0;
 }
 
-__device__ __forceinline__ double BorrowedEulerTensorVolumeRight(
-    CudaDeviceView v,CudaMeshShape s,double dt,const double* coefficient,
+// The comparison deliberately keeps nonlinear coefficient construction and
+// application storage in FP64.  Casting is part of the timed contraction.
+template <typename Real>
+struct TensorVolumeCoefficientReader
+{
+  const double* values;
+  __device__ __forceinline__ Real operator[](const int index) const
+  { return static_cast<Real>(values[index]); }
+};
+
+template <typename Real>
+__device__ __forceinline__ Real BorrowedEulerTensorVolumeRight(
+    CudaDeviceView v,CudaMeshShape s,Real dt,const double* coefficient_values,
     const int qp,const int row_component,const int output_column,
     const int feature)
 {
-  const double weight=v.volume_weight[qp];
+  const TensorVolumeCoefficientReader<Real> coefficient{coefficient_values};
+  const Real alpha=static_cast<Real>(s.igr_alpha);
+  const Real weight=static_cast<Real>(v.volume_weight[qp]);
   const int ni=s.interior_dofs;
   if(output_column==ni)
   {
@@ -5954,8 +5992,8 @@ __device__ __forceinline__ double BorrowedEulerTensorVolumeRight(
           detail::tensor_volume_flux_y_offset+row_component];
     }
     if(!s.igr_active)return 0.0;
-    const double rho=coefficient[detail::tensor_volume_igr_rho_offset];
-    const double sigma=coefficient[detail::tensor_volume_igr_sigma_offset];
+    const Real rho=coefficient[detail::tensor_volume_igr_rho_offset];
+    const Real sigma=coefficient[detail::tensor_volume_igr_sigma_offset];
     if(row_component<6)
     {
       const int direction=row_component-4;
@@ -5965,20 +6003,20 @@ __device__ __forceinline__ double BorrowedEulerTensorVolumeRight(
       return feature==direction+1?weight*sigma:0.0;
     }
     if(feature==0)
-      return weight*(sigma/rho-s.igr_alpha*
+      return weight*(sigma/rho-alpha*
           coefficient[detail::tensor_volume_igr_q_offset]);
-    return weight*s.igr_alpha*coefficient[
+    return weight*alpha*coefficient[
         detail::tensor_volume_igr_z_x_offset+feature-1];
   }
   if(output_column<0||output_column>=ni)return 0.0;
   const int si=s.scalar_interior_dofs;
   const int column_component=output_column/si;
   const int column=output_column-column_component*si;
-  const double column_phi=v.volume_shape[qp*si+column];
-  const double column_dx=v.volume_derivative[
-      (qp*si+column)*dimension];
-  const double column_dy=v.volume_derivative[
-      (qp*si+column)*dimension+1];
+  const Real column_phi=static_cast<Real>(v.volume_shape[qp*si+column]);
+  const Real column_dx=static_cast<Real>(v.volume_derivative[
+      (qp*si+column)*dimension]);
+  const Real column_dy=static_cast<Real>(v.volume_derivative[
+      (qp*si+column)*dimension+1]);
   if(row_component<conserved_components)
   {
     const int columns=s.igr_active?igr_trace_components:
@@ -5995,8 +6033,8 @@ __device__ __forceinline__ double BorrowedEulerTensorVolumeRight(
         base+row_component*columns+column_component]*column_phi;
   }
   if(!s.igr_active)return 0.0;
-  const double rho=coefficient[detail::tensor_volume_igr_rho_offset];
-  const double sigma=coefficient[detail::tensor_volume_igr_sigma_offset];
+  const Real rho=coefficient[detail::tensor_volume_igr_rho_offset];
+  const Real sigma=coefficient[detail::tensor_volume_igr_sigma_offset];
   if(row_component<6)
   {
     const int direction=row_component-4;
@@ -6013,10 +6051,10 @@ __device__ __forceinline__ double BorrowedEulerTensorVolumeRight(
   {
     const int dq_offset=detail::tensor_volume_igr_dq_offset+
         column_component*3;
-    const double dq=coefficient[dq_offset]*column_phi+
+    const Real dq=coefficient[dq_offset]*column_phi+
         coefficient[dq_offset+1]*column_dx+
         coefficient[dq_offset+2]*column_dy;
-    double derivative=-s.igr_alpha*dq;
+    Real derivative=-alpha*dq;
     if(column_component==0)
       derivative-=sigma*column_phi/(rho*rho);
     return weight*derivative;
@@ -6024,9 +6062,9 @@ __device__ __forceinline__ double BorrowedEulerTensorVolumeRight(
   if(column_component==4&&feature==0)
     return weight*column_phi/rho;
   if(column_component==5&&feature==1)
-    return weight*s.igr_alpha*column_phi;
+    return weight*alpha*column_phi;
   if(column_component==6&&feature==2)
-    return weight*s.igr_alpha*column_phi;
+    return weight*alpha*column_phi;
   return 0.0;
 }
 
@@ -6133,6 +6171,312 @@ __global__ void BorrowedEulerTensorVolumeContractionKernel(
 #else
   if(row_component==0&&threadIdx.x==0)v.status[e]=-1.0;
 #endif
+}
+
+// Matched experimental contractions.  The three alternatives use the same
+// 16x16 output tiles, K=8 panels, nonlinear coefficients, padding, and packing.
+// SIMT uses ordinary FP64/FP32 FMA; TF32 rounds FP32 operands explicitly and
+// accumulates in FP32; TF32x3 adds the two high/low cross products.
+// The surrounding Euler/IGR engine remains FP64.
+template <typename Real, int TensorProducts>
+__global__ void BorrowedEulerMatchedVolumeContractionKernel(
+    CudaDeviceView v,CudaMeshShape s,double dt,const int q_begin,
+    const int q_count,const int coefficient_stride,const bool first_chunk,
+    const bool fp64_residual)
+{
+  const int e=blockIdx.x;
+  const int row_component=blockIdx.y;
+  if(e>=s.elements||row_component>=s.interior_components||
+     v.status[e]!=1.0)return;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  constexpr int tile_extent=16,inner_extent=8,tile_warps=4;
+  const int warp=threadIdx.x/warpSize,lane=threadIdx.x%warpSize;
+  const int si=s.scalar_interior_dofs,ni=s.interior_dofs;
+  const int row_tiles=(si+tile_extent-1)/tile_extent;
+  const int column_tiles=(ni+1+tile_extent-1)/tile_extent;
+  const std::size_t workspace_doubles=
+      static_cast<std::size_t>(ni)*(s.trace_dofs+1);
+  const double* scratch=v.solve_workspace+
+      static_cast<std::size_t>(e)*workspace_doubles;
+  const std::size_t ao=static_cast<std::size_t>(e)*ni*ni;
+  const int e_i=e*ni;
+  __shared__ __align__(32) Real tile_a[tile_warps][tile_extent*inner_extent];
+  __shared__ __align__(32) Real tile_b[tile_warps][inner_extent*tile_extent];
+  __shared__ __align__(32) Real tile_product[tile_warps][tile_extent*tile_extent];
+  Real* warp_a=tile_a[warp];
+  Real* warp_b=tile_b[warp];
+  __shared__ __align__(32) Real tile_a_low[tile_warps][tile_extent*inner_extent];
+  __shared__ __align__(32) Real tile_b_low[tile_warps][inner_extent*tile_extent];
+  Real* warp_product=tile_product[warp];
+  Real* warp_a_low=tile_a_low[warp];
+  Real* warp_b_low=tile_b_low[warp];
+  for(int tile=warp;tile<row_tiles*column_tiles;tile+=tile_warps)
+  {
+    const int row_base=(tile/column_tiles)*tile_extent;
+    const int column_base=(tile%column_tiles)*tile_extent;
+    Real accumulators[8]{};
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator,16,16,8,float>
+        tensor_accumulator;
+    if constexpr((TensorProducts!=0))
+      nvcuda::wmma::fill_fragment(tensor_accumulator,0.0f);
+    for(int q_base=0;q_base<q_count;q_base+=inner_extent)
+      for(int feature=0;feature<dimension+1;++feature)
+      {
+        for(int item=lane;item<tile_extent*inner_extent;item+=warpSize)
+        {
+          const int row=row_base+item/inner_extent;
+          const int local_q=q_base+item%inner_extent;
+          Real value=Real(0);
+          if(row<si&&local_q<q_count)
+          {
+            const int qp=e*s.volume_points+q_begin+local_q;
+            value=static_cast<Real>(feature==0?v.volume_shape[qp*si+row]:
+                v.volume_derivative[(qp*si+row)*dimension+feature-1]);
+          }
+          if constexpr(TensorProducts!=0)
+          {
+            const Real high=nvcuda::wmma::__float_to_tf32(value);
+            if constexpr(TensorProducts==3)
+              warp_a_low[item]=nvcuda::wmma::__float_to_tf32(value-high);
+            value=high;
+          }
+          warp_a[item]=value;
+        }
+        for(int item=lane;item<inner_extent*tile_extent;item+=warpSize)
+        {
+          const int right_q=q_base+item/tile_extent;
+          const int output_column=column_base+item%tile_extent;
+          Real value=Real(0);
+          if(right_q<q_count&&output_column<=ni)
+          {
+            const int qp=e*s.volume_points+q_begin+right_q;
+            const double* coefficient=scratch+
+                static_cast<std::size_t>(right_q)*coefficient_stride;
+            value=BorrowedEulerTensorVolumeRight<Real>(
+                v,s,static_cast<Real>(dt),coefficient,qp,row_component,
+                output_column,feature);
+          }
+          if constexpr(TensorProducts!=0)
+          {
+            const Real high=nvcuda::wmma::__float_to_tf32(value);
+            if constexpr(TensorProducts==3)
+              warp_b_low[item]=nvcuda::wmma::__float_to_tf32(value-high);
+            value=high;
+          }
+          warp_b[item]=value;
+        }
+        __syncwarp();
+        if constexpr((TensorProducts!=0))
+        {
+          nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,16,16,8,
+              nvcuda::wmma::precision::tf32,nvcuda::wmma::row_major> matrix_a;
+          nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,16,16,8,
+              nvcuda::wmma::precision::tf32,nvcuda::wmma::row_major> matrix_b;
+          nvcuda::wmma::load_matrix_sync(matrix_a,warp_a,inner_extent);
+          nvcuda::wmma::load_matrix_sync(matrix_b,warp_b,tile_extent);
+          nvcuda::wmma::mma_sync(tensor_accumulator,matrix_a,matrix_b,
+                                tensor_accumulator);
+          if constexpr(TensorProducts==3)
+          {
+            // (A_hi+A_lo)(B_hi+B_lo): retain HH, HL, and LH.
+            // The omitted LL term is quadratic in TF32 rounding error.
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,16,16,8,
+                nvcuda::wmma::precision::tf32,nvcuda::wmma::row_major>
+                matrix_a_low;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,16,16,8,
+                nvcuda::wmma::precision::tf32,nvcuda::wmma::row_major>
+                matrix_b_low;
+            nvcuda::wmma::load_matrix_sync(matrix_a_low,warp_a_low,inner_extent);
+            nvcuda::wmma::load_matrix_sync(matrix_b_low,warp_b_low,tile_extent);
+            nvcuda::wmma::mma_sync(tensor_accumulator,matrix_a,matrix_b_low,
+                                  tensor_accumulator);
+            nvcuda::wmma::mma_sync(tensor_accumulator,matrix_a_low,matrix_b,
+                                  tensor_accumulator);
+          }
+        }
+        else
+        {
+#pragma unroll
+          for(int output=0;output<8;++output)
+          {
+            const int item=lane+output*warpSize;
+            const int row=item/tile_extent,column=item%tile_extent;
+#pragma unroll
+            for(int k=0;k<inner_extent;++k)
+              accumulators[output]+=warp_a[row*inner_extent+k]*
+                  warp_b[k*tile_extent+column];
+          }
+        }
+        // A lane must finish reading a panel before another lane replaces it.
+        __syncwarp();
+      }
+    if constexpr((TensorProducts!=0))
+    {
+      nvcuda::wmma::store_matrix_sync(warp_product,tensor_accumulator,
+                                     tile_extent,nvcuda::wmma::mem_row_major);
+      __syncwarp();
+    }
+#pragma unroll
+    for(int output=0;output<8;++output)
+    {
+      const int item=lane+output*warpSize;
+      const int row=row_base+item/tile_extent;
+      const int output_column=column_base+item%tile_extent;
+      if(row<si&&output_column<=ni&&
+         (!fp64_residual||output_column!=ni))
+      {
+        const int output_row=ByNodes(row,si,row_component);
+        const double value=static_cast<double>((TensorProducts!=0)?
+            warp_product[item]:accumulators[output]);
+        if(output_column==ni)
+        {
+          if(first_chunk)v.residual_r[e_i+output_row]=value;
+          else v.residual_r[e_i+output_row]+=value;
+        }
+        else
+        {
+          double& destination=v.a[ao+output_row*ni+output_column];
+          if(first_chunk)destination=value;
+          else destination+=value;
+        }
+      }
+    }
+    __syncwarp();
+  }
+  // Residual accuracy can be separated from Jacobian contraction precision.
+  // Each scalar test row has one owner, reusing the existing FP64 coefficient
+  // stream.  These reads and products remain inside the timed volume kernel;
+  // no extra launch, scratch allocation, or synchronization is required.
+  if(fp64_residual&&threadIdx.x<si)
+  {
+    const int row=threadIdx.x;
+    double value=0.0;
+    for(int local_q=0;local_q<q_count;++local_q)
+    {
+      const int qp=e*s.volume_points+q_begin+local_q;
+      const double* coefficient=scratch+
+          static_cast<std::size_t>(local_q)*coefficient_stride;
+      for(int feature=0;feature<dimension+1;++feature)
+      {
+        const double test=feature==0?v.volume_shape[qp*si+row]:
+            v.volume_derivative[(qp*si+row)*dimension+feature-1];
+        value+=test*BorrowedEulerTensorVolumeRight<double>(
+            v,s,dt,coefficient,qp,row_component,ni,feature);
+      }
+    }
+    const int output_row=ByNodes(row,si,row_component);
+    if(first_chunk)v.residual_r[e_i+output_row]=value;
+    else v.residual_r[e_i+output_row]+=value;
+  }
+
+#else
+  if(row_component==0&&threadIdx.x==0)v.status[e]=-1.0;
+#endif
+}
+
+int SelectedExperimentalFaceBlockThreads() noexcept
+{
+  // Process-local and immutable: set before the first borrowed assembly.
+  static const int selected=[]() noexcept
+  {
+    const char* value=::igrlab::GetEnv("DG_IGR_HDG_FACE_BLOCK_THREADS");
+    if(value==nullptr)return 128;
+    int threads=0;
+    if(std::strcmp(value,"32")==0)threads=32;
+    else if(std::strcmp(value,"64")==0)threads=64;
+    else if(std::strcmp(value,"128")==0)threads=128;
+    if(threads==0)
+      std::fprintf(stderr,"Invalid DG_IGR_HDG_FACE_BLOCK_THREADS=%s; "
+          "expected 32, 64, or 128.\n",value);
+    return threads;
+  }();
+  return selected;
+}
+
+enum class ExperimentalVolumeArithmetic
+{
+  fp64_wmma, simt_fp64, simt_fp32, tf32, tf32x3, invalid
+};
+
+ExperimentalVolumeArithmetic SelectedExperimentalVolumeArithmetic() noexcept
+{
+  // Process-local and immutable: numerical comparisons set this before launch.
+  static const ExperimentalVolumeArithmetic selected=[]() noexcept
+  {
+    const char* mode=::igrlab::GetEnv("DG_IGR_HDG_VOLUME_ARITHMETIC");
+    if(mode==nullptr||*mode=='\0')return ExperimentalVolumeArithmetic::fp64_wmma;
+    ExperimentalVolumeArithmetic result=ExperimentalVolumeArithmetic::invalid;
+    if(std::strcmp(mode,"fp64-wmma")==0)
+      result=ExperimentalVolumeArithmetic::fp64_wmma;
+    else if(std::strcmp(mode,"simt-fp64")==0)
+      result=ExperimentalVolumeArithmetic::simt_fp64;
+    else if(std::strcmp(mode,"simt-fp32")==0)
+      result=ExperimentalVolumeArithmetic::simt_fp32;
+    else if(std::strcmp(mode,"tf32")==0)
+      result=ExperimentalVolumeArithmetic::tf32;
+    else if(std::strcmp(mode,"tf32x3")==0)
+      result=ExperimentalVolumeArithmetic::tf32x3;
+    if(result==ExperimentalVolumeArithmetic::invalid)
+      std::fprintf(stderr,"Invalid DG_IGR_HDG_VOLUME_ARITHMETIC=%s; expected "
+          "fp64-wmma, simt-fp64, simt-fp32, tf32, or tf32x3.\n",mode);
+    else
+      std::fprintf(stderr,"HDG experimental volume arithmetic=%s; nonlinear "
+          "coefficients, storage, faces, condensation, and trace remain FP64.\n",
+          mode);
+    return result;
+  }();
+  return selected;
+}
+
+enum class ExperimentalVolumeResidual { matched, fp64, invalid };
+
+ExperimentalVolumeResidual SelectedExperimentalVolumeResidual() noexcept
+{
+  static const ExperimentalVolumeResidual selected=[]() noexcept
+  {
+    const char* mode=::igrlab::GetEnv("DG_IGR_HDG_VOLUME_RESIDUAL");
+    if(mode==nullptr||*mode=='\0')return ExperimentalVolumeResidual::matched;
+    if(std::strcmp(mode,"matched")==0)
+    {
+      std::fprintf(stderr,"HDG experimental volume residual=matched; "
+          "residual and Jacobian use the selected contraction arithmetic.\n");
+      return ExperimentalVolumeResidual::matched;
+    }
+    if(std::strcmp(mode,"fp64")==0)
+    {
+      std::fprintf(stderr,"HDG experimental volume residual=fp64; "
+          "matched kernels recompute only the residual in FP64, with unchanged "
+          "selected Jacobian arithmetic and solver tolerances.\n");
+      return ExperimentalVolumeResidual::fp64;
+    }
+    std::fprintf(stderr,"Invalid DG_IGR_HDG_VOLUME_RESIDUAL=%s; "
+        "expected matched or fp64.\n",mode);
+    return ExperimentalVolumeResidual::invalid;
+  }();
+  return selected;
+}
+
+enum class ExperimentalCondensationArithmetic { fp64_wmma, simt_fp64, invalid };
+
+ExperimentalCondensationArithmetic SelectedExperimentalCondensationArithmetic() noexcept
+{
+  static const ExperimentalCondensationArithmetic selected=[]() noexcept
+  {
+    const char* mode=::igrlab::GetEnv("DG_IGR_HDG_CONDENSATION_ARITHMETIC");
+    if(mode==nullptr||*mode=='\0'||std::strcmp(mode,"fp64-wmma")==0)
+      return ExperimentalCondensationArithmetic::fp64_wmma;
+    if(std::strcmp(mode,"simt-fp64")==0)
+    {
+      std::fprintf(stderr,"HDG experimental condensation arithmetic=simt-fp64; "
+          "blocked LU, pivoting, RHS solves, Schur construction, and trace policy "
+          "are unchanged.\n");
+      return ExperimentalCondensationArithmetic::simt_fp64;
+    }
+    std::fprintf(stderr,"Invalid DG_IGR_HDG_CONDENSATION_ARITHMETIC=%s; "
+        "expected fp64-wmma or simt-fp64.\n",mode);
+    return ExperimentalCondensationArithmetic::invalid;
+  }();
+  return selected;
 }
 
 __global__ void CondenseKernel(CudaDeviceView v,CudaMeshShape s)
@@ -6270,6 +6614,7 @@ __global__ void BorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
 }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+template <bool UseTensor>
 static __device__ __forceinline__ void TensorSubtractBlockedProduct(
     double* destination,const int destination_stride,
     const double* left,const int left_stride,
@@ -6300,9 +6645,11 @@ static __device__ __forceinline__ void TensorSubtractBlockedProduct(
     using TensorAccumulator=nvcuda::wmma::fragment<
         nvcuda::wmma::accumulator,8,8,4,double>;
     TensorAccumulator accumulators[tensor_column_batch_tiles];
+    double scalar_accumulators[tensor_column_batch_tiles][2]{};
 #pragma unroll
     for(int slot=0;slot<tensor_column_batch_tiles;++slot)
-      nvcuda::wmma::fill_fragment(accumulators[slot],0.0);
+      if constexpr(UseTensor)
+        nvcuda::wmma::fill_fragment(accumulators[slot],0.0);
     for(int inner_base=0;inner_base<inner;inner_base+=4)
     {
       const int local_row=lane/4,local_inner=lane%4;
@@ -6320,28 +6667,49 @@ static __device__ __forceinline__ void TensorSubtractBlockedProduct(
               ?right[right_row*right_stride+right_column]:0.0;
         }
       __syncwarp();
-      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,8,8,4,double,
-                            nvcuda::wmma::row_major> matrix_a;
-      nvcuda::wmma::load_matrix_sync(matrix_a,warp_a,4);
-      // Every nonempty tile range has slot zero.  Keep its fragments at a
-      // compile-time index, then use a real uniform loop edge for the optional
-      // second tile.  An unrolled slot<batch_width guard makes nvcc issue the
-      // slot-one warp MMA even when that uniform predicate is false.
+      if constexpr(UseTensor)
       {
-        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
-                              nvcuda::wmma::row_major> matrix_b;
-        nvcuda::wmma::load_matrix_sync(matrix_b,warp_b,8);
-        nvcuda::wmma::mma_sync(accumulators[0],matrix_a,matrix_b,
-                               accumulators[0]);
-      }
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,8,8,4,double,
+                              nvcuda::wmma::row_major> matrix_a;
+        nvcuda::wmma::load_matrix_sync(matrix_a,warp_a,4);
+        // Every nonempty tile range has slot zero.  Keep its fragments at a
+        // compile-time index, then use a real uniform loop edge for the optional
+        // second tile.  An unrolled slot<batch_width guard makes nvcc issue the
+        // slot-one warp MMA even when that uniform predicate is false.
+        {
+          nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
+                                nvcuda::wmma::row_major> matrix_b;
+          nvcuda::wmma::load_matrix_sync(matrix_b,warp_b,8);
+          nvcuda::wmma::mma_sync(accumulators[0],matrix_a,matrix_b,
+                                 accumulators[0]);
+        }
 #pragma unroll 1
-      for(int active_slot=1;active_slot<batch_width;++active_slot)
+        for(int active_slot=1;active_slot<batch_width;++active_slot)
+        {
+          nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
+                                nvcuda::wmma::row_major> matrix_b;
+          nvcuda::wmma::load_matrix_sync(matrix_b,warp_b+4*8,8);
+          nvcuda::wmma::mma_sync(accumulators[1],matrix_a,matrix_b,
+                                 accumulators[1]);
+        }
+      }
+      else
       {
-        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
-                              nvcuda::wmma::row_major> matrix_b;
-        nvcuda::wmma::load_matrix_sync(matrix_b,warp_b+4*8,8);
-        nvcuda::wmma::mma_sync(accumulators[1],matrix_a,matrix_b,
-                               accumulators[1]);
+#pragma unroll
+        for(int slot=0;slot<tensor_column_batch_tiles;++slot)
+          if(slot<batch_width)
+          {
+#pragma unroll
+            for(int part=0;part<2;++part)
+            {
+              const int item=lane+part*warpSize;
+#pragma unroll
+              for(int k=0;k<4;++k)
+                scalar_accumulators[slot][part]+=
+                    warp_a[(item/8)*4+k]*warp_b[slot*32+k*8+item%8];
+            }
+          }
+        __syncwarp();
       }
     }
 #pragma unroll
@@ -6349,17 +6717,21 @@ static __device__ __forceinline__ void TensorSubtractBlockedProduct(
       if(slot<batch_width)
       {
         const int column_base=(column_tile+slot)*8;
-        nvcuda::wmma::store_matrix_sync(
-            warp_product,accumulators[slot],8,
-            nvcuda::wmma::mem_row_major);
-        __syncwarp();
+        if constexpr(UseTensor)
+        {
+          nvcuda::wmma::store_matrix_sync(
+              warp_product,accumulators[slot],8,
+              nvcuda::wmma::mem_row_major);
+          __syncwarp();
+        }
         for(int item=lane;item<8*8;item+=warpSize)
         {
           const int output_row=row_base+item/8;
           const int output_column=column_base+item%8;
           if(output_row<rows&&output_column<columns)
             destination[output_row*destination_stride+output_column]-=
-                warp_product[item];
+                (UseTensor?warp_product[item]:
+                    scalar_accumulators[slot][item/warpSize]);
         }
         __syncwarp();
       }
@@ -6367,7 +6739,7 @@ static __device__ __forceinline__ void TensorSubtractBlockedProduct(
   }
 }
 
-template <int BatchWidth>
+template <int BatchWidth, bool UseTensor>
 static __device__ __forceinline__ void TensorSchurTileBatch(
     const double* c,const double* solved,const double* d,const double* g,
     double* schur,double* condensed_rhs,
@@ -6386,9 +6758,11 @@ static __device__ __forceinline__ void TensorSchurTileBatch(
   using TensorAccumulator=nvcuda::wmma::fragment<
       nvcuda::wmma::accumulator,8,8,4,double>;
   TensorAccumulator accumulators[BatchWidth];
+  double scalar_accumulators[BatchWidth][2]{};
 #pragma unroll
   for(int slot=0;slot<BatchWidth;++slot)
-    nvcuda::wmma::fill_fragment(accumulators[slot],0.0);
+    if constexpr(UseTensor)
+      nvcuda::wmma::fill_fragment(accumulators[slot],0.0);
   for(int inner_base=0;inner_base<interior_dofs;inner_base+=4)
   {
     const int local_row=lane/4,local_inner=lane%4;
@@ -6407,34 +6781,56 @@ static __device__ __forceinline__ void TensorSchurTileBatch(
           ?solved[b_inner*solved_columns+column]:0.0;
     }
     __syncwarp();
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,8,8,4,double,
-                          nvcuda::wmma::row_major> matrix_a;
-    nvcuda::wmma::load_matrix_sync(matrix_a,warp_a,4);
-#pragma unroll
-    for(int slot=0;slot<BatchWidth;++slot)
+    if constexpr(UseTensor)
     {
-      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
-                            nvcuda::wmma::row_major> matrix_b;
-      nvcuda::wmma::load_matrix_sync(
-          matrix_b,warp_b+slot*4*8,8);
-      nvcuda::wmma::mma_sync(accumulators[slot],matrix_a,matrix_b,
-                             accumulators[slot]);
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,8,8,4,double,
+                            nvcuda::wmma::row_major> matrix_a;
+      nvcuda::wmma::load_matrix_sync(matrix_a,warp_a,4);
+#pragma unroll
+      for(int slot=0;slot<BatchWidth;++slot)
+      {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,8,8,4,double,
+                              nvcuda::wmma::row_major> matrix_b;
+        nvcuda::wmma::load_matrix_sync(
+            matrix_b,warp_b+slot*4*8,8);
+        nvcuda::wmma::mma_sync(accumulators[slot],matrix_a,matrix_b,
+                               accumulators[slot]);
+      }
+    }
+    else
+    {
+#pragma unroll
+      for(int slot=0;slot<BatchWidth;++slot)
+#pragma unroll
+        for(int part=0;part<2;++part)
+        {
+          const int item=lane+part*warpSize;
+#pragma unroll
+          for(int k=0;k<4;++k)
+            scalar_accumulators[slot][part]+=
+                warp_a[(item/8)*4+k]*warp_b[slot*32+k*8+item%8];
+        }
+      __syncwarp();
     }
   }
 #pragma unroll
   for(int slot=0;slot<BatchWidth;++slot)
   {
     const int column_base=(first_column_tile+slot)*8;
-    nvcuda::wmma::store_matrix_sync(
-        warp_product,accumulators[slot],8,
-        nvcuda::wmma::mem_row_major);
-    __syncwarp();
+    if constexpr(UseTensor)
+    {
+      nvcuda::wmma::store_matrix_sync(
+          warp_product,accumulators[slot],8,
+          nvcuda::wmma::mem_row_major);
+      __syncwarp();
+    }
     for(int item=lane;item<8*8;item+=warpSize)
     {
       const int row=row_base+item/8,column=column_base+item%8;
       if(row<trace_dofs&&column<solved_columns)
       {
-        const double product=warp_product[item];
+        const double product=UseTensor?warp_product[item]:
+            scalar_accumulators[slot][item/warpSize];
         if(column==trace_dofs)
           condensed_rhs[row]=g[row]-product;
         else
@@ -6453,8 +6849,9 @@ static __device__ __forceinline__ void TensorSchurTileBatch(
 // The retained 33--81 genuine [B f] right-hand sides use scalar diagonal-block
 // solves and tensor off-diagonal updates.  The existing tensor Schur product
 // then consumes the same retained W used by tensor borrowed recovery.  Only
-// incomplete edge tiles are zero padded; no admitted p1-p3 shape routes to
-// ordinary CUDA.
+// incomplete edge tiles are zero padded.  The experimental SIMT specialization
+// keeps this entire algorithm and replaces only the matrix inner products.
+template <bool UseTensor>
 __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -6545,7 +6942,7 @@ __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
     }
     const int panel_width=panel_end-panel_start;
     const int trailing=ni-panel_end;
-    TensorSubtractBlockedProduct(
+    TensorSubtractBlockedProduct<UseTensor>(
         lu+panel_end*ni+panel_end,ni,
         lu+panel_end*ni+panel_start,ni,
         lu+panel_start*ni+panel_end,ni,
@@ -6582,7 +6979,7 @@ __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
     }
     const int panel_width=panel_end-panel_start;
     const int trailing=ni-panel_end;
-    TensorSubtractBlockedProduct(
+    TensorSubtractBlockedProduct<UseTensor>(
         w+panel_end*cols,cols,
         lu+panel_end*ni+panel_start,ni,
         w+panel_start*cols,cols,
@@ -6607,7 +7004,7 @@ __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
       __syncthreads();
     }
     const int panel_width=panel_end-panel_start;
-    TensorSubtractBlockedProduct(
+    TensorSubtractBlockedProduct<UseTensor>(
         w,cols,lu+panel_start,ni,w+panel_start*cols,cols,
         panel_start,cols,panel_width,
         &tensor_a[0][0],&tensor_b[0][0][0],&tensor_product[0][0]);
@@ -6632,7 +7029,7 @@ __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
     {
       const int row_tile=job/column_pairs;
       const int column_pair=job-row_tile*column_pairs;
-      TensorSchurTileBatch<2>(
+      TensorSchurTileBatch<2,UseTensor>(
           v.c+co,w,v.d+so,v.g+e*nt,
           v.schur+so,v.condensed_rhs+e*nt,
           ni,nt,cols,row_tile,2*column_pair,
@@ -6647,7 +7044,7 @@ __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
         row_tiles*(warp+1)/tensor_warps_per_block;
     for(int row_tile=first_tail_row;row_tile<last_tail_row;++row_tile)
     {
-      TensorSchurTileBatch<1>(
+      TensorSchurTileBatch<1,UseTensor>(
           v.c+co,w,v.d+so,v.g+e*nt,
           v.schur+so,v.condensed_rhs+e*nt,
           ni,nt,cols,row_tile,column_tiles-1,
@@ -8580,20 +8977,47 @@ __global__ void HashPairKernel(const double* first,int first_count,
 
 bool LaunchOk() noexcept { return cudaPeekAtLastError() == cudaSuccess; }
 int Blocks(const int n) noexcept { return (n + 127) / 128; }
+template <int BlockThreads>
+bool LaunchBorrowedEulerFace(const CudaDeviceView& v,const CudaMeshShape& s,
+                             const bool frozen_llf,
+                             const bool differentiate_nonlinearities) noexcept
+{
+  constexpr int elements_per_block=BlockThreads/borrowed_euler_group_threads;
+  const int blocks=(s.elements-1)/elements_per_block+1;
+  BorrowedEulerFaceKernel<BlockThreads><<<blocks,BlockThreads>>>(
+      v,s,frozen_llf,differentiate_nonlinearities);
+  return LaunchOk();
+}
+bool LaunchSelectedBorrowedEulerFace(
+    const CudaDeviceView& v,const CudaMeshShape& s,const int block_threads,
+    const bool frozen_llf,const bool differentiate_nonlinearities) noexcept
+{
+  switch(block_threads)
+  {
+    case 32:return LaunchBorrowedEulerFace<32>(
+        v,s,frozen_llf,differentiate_nonlinearities);
+    case 64:return LaunchBorrowedEulerFace<64>(
+        v,s,frozen_llf,differentiate_nonlinearities);
+    case 128:return LaunchBorrowedEulerFace<128>(
+        v,s,frozen_llf,differentiate_nonlinearities);
+    default:return false;
+  }
+}
 bool LaunchBorrowedEulerStages(const CudaDeviceView& v,
                                const CudaMeshShape& s,
                                const double dt,
                                const bool frozen_llf,
                                const bool differentiate_nonlinearities) noexcept
 {
+  const int face_block_threads=SelectedExperimentalFaceBlockThreads();
+  if(face_block_threads==0)return false;
   const int blocks=(s.elements-1)/borrowed_euler_elements_per_block+1;
   BorrowedEulerZeroKernel<<<blocks,borrowed_euler_block_threads>>>(v,s);
   if(!LaunchOk())return false;
   BorrowedEulerVolumeKernel<<<blocks,borrowed_euler_block_threads>>>(v,s,dt);
   if(!LaunchOk())return false;
-  BorrowedEulerFaceKernel<<<blocks,borrowed_euler_block_threads>>>(
-      v,s,frozen_llf,differentiate_nonlinearities);
-  return LaunchOk();
+  return LaunchSelectedBorrowedEulerFace(
+      v,s,face_block_threads,frozen_llf,differentiate_nonlinearities);
 }
 bool LaunchTensorBorrowedEulerAssembly(const CudaDeviceView& v,
                                        const CudaMeshShape& s,
@@ -8604,6 +9028,13 @@ bool LaunchTensorBorrowedEulerAssembly(const CudaDeviceView& v,
                                            differentiate_nonlinearities) noexcept
 {
   tensor_volume_mma_tiles=0;
+  const int face_block_threads=SelectedExperimentalFaceBlockThreads();
+  if(face_block_threads==0)return false;
+  const auto arithmetic=SelectedExperimentalVolumeArithmetic();
+  const auto residual_arithmetic=SelectedExperimentalVolumeResidual();
+  if(arithmetic==ExperimentalVolumeArithmetic::invalid||
+     residual_arithmetic==ExperimentalVolumeResidual::invalid)return false;
+  const bool fp64_residual=residual_arithmetic==ExperimentalVolumeResidual::fp64;
   if(s.elements<=0||s.order<1||s.order>3)return false;
   const int expected_components=s.igr_active?igr_interior_components:
       conserved_components;
@@ -8664,19 +9095,50 @@ bool LaunchTensorBorrowedEulerAssembly(const CudaDeviceView& v,
     const dim3 contraction_grid(
         static_cast<unsigned>(s.elements),
         static_cast<unsigned>(s.interior_components),1U);
-    BorrowedEulerTensorVolumeContractionKernel<<<
-        contraction_grid,borrowed_euler_block_threads>>>(
-            v,s,dt,q_begin,q_count,scratch.coefficient_stride,first_chunk);
+    if(arithmetic==ExperimentalVolumeArithmetic::fp64_wmma)
+      BorrowedEulerTensorVolumeContractionKernel<<<
+          contraction_grid,borrowed_euler_block_threads>>>(
+              v,s,dt,q_begin,q_count,scratch.coefficient_stride,first_chunk);
+    else if(arithmetic==ExperimentalVolumeArithmetic::simt_fp64)
+      BorrowedEulerMatchedVolumeContractionKernel<double,0><<<
+          contraction_grid,borrowed_euler_block_threads>>>(
+              v,s,dt,q_begin,q_count,scratch.coefficient_stride,first_chunk,
+              fp64_residual);
+    else if(arithmetic==ExperimentalVolumeArithmetic::simt_fp32)
+      BorrowedEulerMatchedVolumeContractionKernel<float,0><<<
+          contraction_grid,borrowed_euler_block_threads>>>(
+              v,s,dt,q_begin,q_count,scratch.coefficient_stride,first_chunk,
+              fp64_residual);
+    else
+    {
+      if(arithmetic==ExperimentalVolumeArithmetic::tf32)
+        BorrowedEulerMatchedVolumeContractionKernel<float,1><<<
+            contraction_grid,borrowed_euler_block_threads>>>(
+                v,s,dt,q_begin,q_count,scratch.coefficient_stride,first_chunk,
+              fp64_residual);
+      else
+        BorrowedEulerMatchedVolumeContractionKernel<float,3><<<
+            contraction_grid,borrowed_euler_block_threads>>>(
+                v,s,dt,q_begin,q_count,scratch.coefficient_stride,first_chunk,
+              fp64_residual);
+      // This counter counts logical 16x16x8 WMMA operations for TF32,
+      // rather than the default path's 8x8x4 operations.
+      tensor_volume_mma_tiles+=static_cast<std::uint64_t>(s.elements)*
+          s.interior_components*((s.scalar_interior_dofs+15)/16)*
+          ((s.interior_dofs+1+15)/16)*((q_count+7)/8)*(dimension+1)*
+          (arithmetic==ExperimentalVolumeArithmetic::tf32x3?3:1);
+    }
     if(!LaunchOk())return false;
     q_begin+=q_count;
     first_chunk=false;
   }
-  BorrowedEulerFaceKernel<<<blocks,borrowed_euler_block_threads>>>(
-      v,s,false,differentiate_nonlinearities);
-  if(!LaunchOk())return false;
-  tensor_volume_mma_tiles=mma_work.mma_tiles;
+  if(!LaunchSelectedBorrowedEulerFace(
+         v,s,face_block_threads,false,differentiate_nonlinearities))return false;
+  if(arithmetic==ExperimentalVolumeArithmetic::fp64_wmma)
+    tensor_volume_mma_tiles=mma_work.mma_tiles;
   return true;
 }
+
 } // namespace
 
 bool CudaLaunchTicket(int* words,const CudaFailurePhase phase,std::uint64_t attempt,std::uint64_t generation,int device) noexcept
@@ -9195,9 +9657,15 @@ bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
   if(elements!=0&&
      per_element>std::numeric_limits<std::uint64_t>::max()/elements)
     return false;
-  TensorBorrowedCondenseKernel<<<s.elements,128>>>(v,s);
+  const auto arithmetic=SelectedExperimentalCondensationArithmetic();
+  if(arithmetic==ExperimentalCondensationArithmetic::invalid)return false;
+  if(arithmetic==ExperimentalCondensationArithmetic::fp64_wmma)
+    TensorBorrowedCondenseKernel<true><<<s.elements,128>>>(v,s);
+  else
+    TensorBorrowedCondenseKernel<false><<<s.elements,128>>>(v,s);
   if(!LaunchOk())return false;
-  tensor_mma_tiles=per_element*elements;
+  if(arithmetic==ExperimentalCondensationArithmetic::fp64_wmma)
+    tensor_mma_tiles=per_element*elements;
   return true;
 }
 bool CudaLaunchCondenseRetainedLuRhs(

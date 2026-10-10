@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "mfem.hpp"
 
 #include <algorithm>
@@ -78,7 +79,7 @@ mfem::Vector ElementAverage(mfem::ParFiniteElementSpace& fes,
   const int dof = fes.GetFE(element)->GetDof();
   mfem::DenseMatrix values(element_state.GetData(), dof, kNumEq);
   mfem::Vector average;
-  mfem::dg_igr::limiters_detail::ElementAverage(
+  mfem::igrlab::limiters_detail::ElementAverage(
     *fes.GetFE(element),
     *fes.GetElementTransformation(element),
     values,

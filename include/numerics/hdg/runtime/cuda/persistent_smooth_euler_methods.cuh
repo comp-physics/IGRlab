@@ -1,7 +1,28 @@
+#include "igrlab/compat.hpp"
 /* Included inside dg::hdg::runtime::cuda_w8a. */
 
 namespace detail
 {
+
+// Explicit research SIMT contractions preserve the tensor engine's dataflow
+// and solver policy but issue no volume MMA instructions. Keep the default
+// accounting contract unchanged for all other routes.
+inline bool CudaAccumulateResearchVolumeWork(
+    const bool tensor_selected, const bool borrowed_host_inputs,
+    const std::uint64_t invocation_mma_tiles,
+    std::uint64_t& volume_assembly_launches,
+    std::uint64_t& volume_mma_tiles) noexcept
+{
+  if (!CudaResearchVolumeUsesSimt(tensor_selected && borrowed_host_inputs))
+    return AccumulateTensorVolumeWork(
+        tensor_selected, invocation_mma_tiles,
+        volume_assembly_launches, volume_mma_tiles);
+  if (invocation_mma_tiles != 0 || volume_mma_tiles != 0 ||
+      volume_assembly_launches == std::numeric_limits<std::uint64_t>::max())
+    return false;
+  ++volume_assembly_launches;
+  return true;
+}
 
 // Qualification of a supplied RODAS3 entry state uses the same normalized
 // algebraic correction as the CPU leaf. Keep the reduction private to this
@@ -2572,8 +2593,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 StatusPassed() noexcept
 {
-  ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_reduction);
+  ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_reduction);
   if (!CudaLaunchStatusReduction(view_.status, shape_.elements,
                                  view_.status_flag))
     return false;
@@ -2591,8 +2612,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 DistributeCurrentTrace(const double* true_values) noexcept
 {
-  ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_packing);
+  ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_packing);
   if (ranks_ == 1)
     return CollectiveContinue(CudaLaunchGatherLocalTrace(
         view_.signed_element_trace,
@@ -2637,8 +2658,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 DistributeTraceIncrement() noexcept
 {
-  ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_packing);
+  ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_packing);
   const double* solution =
       static_cast<const mfem::Vector&>(*hypre_solution_).Read();
   if (ranks_ == 1)
@@ -2696,8 +2717,8 @@ DistributeRodasStageIncrement(const std::size_t stage) noexcept
   if (ranks_ != 2 || view_.rodas_stage_local_trace[stage] == nullptr)
     return false;
 
-  ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_packing);
+  ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_packing);
   double* owned_host = owned_stage_.HostWrite();
   const std::size_t owned_bytes =
       static_cast<std::size_t>(shape_.true_trace_count) * sizeof(double);
@@ -2731,8 +2752,8 @@ bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 AssembleTrueVector(const double* element_values, double* true_values,
                    const bool completion_required) noexcept
 {
-  ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_trace_assembly);
+  ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_trace_assembly);
   const bool local_gather = CudaLaunchAssembleOwnedVector(
       view_, shape_, element_values, true_values) &&
       CudaLaunchGatherRemoteVector(view_, shape_, element_values);
@@ -2784,8 +2805,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 AssembleTrueSystem() noexcept
 {
-  ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_trace_assembly);
+  ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_trace_assembly);
   const bool local_gather = CudaLaunchZeroTrueSystem(
       true_device_, view_.true_rhs_scratch, shape_.true_trace_count) &&
       CudaLaunchAssembleOwnedMatrix(view_, true_device_, shape_) &&
@@ -2859,8 +2880,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 RefreshRetainedTrueRhs() noexcept
 {
-  ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_trace_assembly);
+  ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_trace_assembly);
   const bool common_admission = (ranks_ == 1 || ranks_ == 2) &&
       true_matrix_ && hypre_rhs_ && hypre_solution_;
   const bool native_admitted = common_admission &&
@@ -3331,8 +3352,8 @@ SolveTrueSystemAttempt(double& true_relative_residual,
                 int& linear_iterations,
                 CudaTensorCoreEvidence& tensor_core_evidence) noexcept
 {
-  ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_trace_solve);
+  ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_trace_solve);
   linear_iterations = 0;
   CudaSolveDiagnostics diagnostics{};
   const bool use_ilu = CudaTracePreconditionerIsIlu(
@@ -4072,8 +4093,8 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
               state_slot& workspace) noexcept -> CudaNumericalResult
 {
   using Coefficients = ::dg::hdg::time::Rodas3Coefficients;
-  ::dg_igr::NVTXRange accepted_step_profile_region(
-      ::dg_igr::observability::RegionId::hdg_accepted_step);
+  ::igrlab::NVTXRange accepted_step_profile_region(
+      ::igrlab::observability::RegionId::hdg_accepted_step);
   CudaIluFactorAttemptEndGuard end_factor_attempt(ilu_factor_state_);
   CudaElementSchwarzAttemptEndGuard end_schwarz_attempt(
       element_schwarz_attempt_state_);
@@ -4128,8 +4149,12 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
   // fallback: rank-one tensor-native, rank-one ordinary ParCSR, or the exact
   // engine-default rank-two host-staged ParCSR leaf.
   result.tensor_core.fallback_accounting_complete = true;
-  result.precision_work.all_fp64_policy = true;
-  result.precision_work.accounting_complete = true;
+  const bool reduced_precision_volume =
+      detail::CudaResearchVolumeUsesReducedPrecision(
+          shape_.borrowed_host_inputs &&
+          cuda_engine_ == generic::CudaEngineKind::tensor_core);
+  result.precision_work.all_fp64_policy = !reduced_precision_volume;
+  result.precision_work.accounting_complete = !reduced_precision_volume;
   (void)CudaInitializeIluEvidence(
       result.tensor_core, trace_preconditioner_, shape_.igr_active);
 
@@ -4252,8 +4277,8 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
     std::uint64_t mma_tiles = 0;
     bool launched = false;
     {
-      ::dg_igr::NVTXRange profile_region(
-          ::dg_igr::observability::RegionId::hdg_local_assembly);
+      ::igrlab::NVTXRange profile_region(
+          ::igrlab::observability::RegionId::hdg_local_assembly);
       launched = CudaLaunchAssembly(
           view_, shape_, Coefficients::ShiftScale(attempt.dt), cuda_engine_,
           mma_tiles, true);
@@ -4294,8 +4319,8 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
     std::uint64_t mma_tiles = 0;
     bool condensed = false;
     {
-      ::dg_igr::NVTXRange profile_region(
-          ::dg_igr::observability::RegionId::hdg_condensation);
+      ::igrlab::NVTXRange profile_region(
+          ::igrlab::observability::RegionId::hdg_condensation);
       condensed = CopyBase(workspace) &&
           CudaLaunchCondensation(view_, shape_, cuda_engine_, mma_tiles) &&
           StatusPassed();
@@ -4352,8 +4377,8 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
     if (!DistributeTraceIncrement()) return false;
     bool recovered = false;
     {
-      ::dg_igr::NVTXRange profile_region(
-          ::dg_igr::observability::RegionId::hdg_interior_recovery);
+      ::igrlab::NVTXRange profile_region(
+          ::igrlab::observability::RegionId::hdg_interior_recovery);
       recovered = algebraic_projection
           ? CudaLaunchRecover(view_, shape_, cuda_engine_)
           : CudaLaunchRecoverFromRetainedLu(view_, shape_);
@@ -4888,8 +4913,8 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
       std::uint64_t rebuild_tiles = 0;
       bool rebuilt = false;
       {
-        ::dg_igr::NVTXRange profile_region(
-            ::dg_igr::observability::RegionId::hdg_condensation);
+        ::igrlab::NVTXRange profile_region(
+            ::igrlab::observability::RegionId::hdg_condensation);
         rebuilt = CudaLaunchCondensation(
             view_, shape_, cuda_engine_, rebuild_tiles) && StatusPassed();
       }
@@ -4993,8 +5018,8 @@ ExecuteRodas3(const CudaConfig& config, const AttemptIdentity& attempt,
       std::uint64_t mma_tiles = 0;
       bool condensed = false;
       {
-        ::dg_igr::NVTXRange profile_region(
-            ::dg_igr::observability::RegionId::hdg_condensation);
+        ::igrlab::NVTXRange profile_region(
+            ::igrlab::observability::RegionId::hdg_condensation);
         condensed = CudaLaunchCondensation(
             view_, shape_, cuda_engine_, mma_tiles) && StatusPassed();
       }
@@ -5489,8 +5514,8 @@ AssemblePartitionedScalarClosure(
   std::uint64_t invocation_volume_mma_tiles = 0;
   bool launched = false;
   {
-    ::dg_igr::NVTXRange profile_region(
-        ::dg_igr::observability::RegionId::hdg_local_assembly);
+    ::igrlab::NVTXRange profile_region(
+        ::igrlab::observability::RegionId::hdg_local_assembly);
     launched = CudaLaunchAssembly(
         view_, shape_, dt, cuda_engine_, invocation_volume_mma_tiles);
   }
@@ -5501,8 +5526,9 @@ AssemblePartitionedScalarClosure(
       cuda_engine_ == generic::CudaEngineKind::tensor_core;
   const bool accounted =
       (cuda_engine_ == generic::CudaEngineKind::ordinary || tensor_selected) &&
-      AccumulateTensorVolumeWork(
-          tensor_selected, invocation_volume_mma_tiles,
+      CudaAccumulateResearchVolumeWork(
+          tensor_selected, shape_.borrowed_host_inputs,
+          invocation_volume_mma_tiles,
           volume_launches, volume_tiles);
   if (!CollectiveContinue(accounted)) return false;
   tensor_core_evidence.volume_assembly_launches = volume_launches;
@@ -5761,8 +5787,8 @@ SolvePartitionedScalarClosure(
   std::uint64_t condensation_tiles = 0;
   bool condensed = false;
   {
-    ::dg_igr::NVTXRange profile_region(
-        ::dg_igr::observability::RegionId::hdg_condensation);
+    ::igrlab::NVTXRange profile_region(
+        ::igrlab::observability::RegionId::hdg_condensation);
     condensed = CopyBase(workspace) && Ticket(CudaFailurePhase::condensation) &&
         CudaLaunchCondensation(
             view_, shape_, cuda_engine_, condensation_tiles) &&
@@ -5846,8 +5872,8 @@ SolvePartitionedScalarClosure(
   bool recovered = false;
   if (distributed && Ticket(CudaFailurePhase::recovery))
   {
-    ::dg_igr::NVTXRange profile_region(
-        ::dg_igr::observability::RegionId::hdg_interior_recovery);
+    ::igrlab::NVTXRange profile_region(
+        ::igrlab::observability::RegionId::hdg_interior_recovery);
     recovered = CudaLaunchRecover(view_, shape_, cuda_engine_) &&
         StatusPassed();
   }
@@ -5915,8 +5941,8 @@ AssembleAndNorm(state_slot&, const double dt, double& norm,
   bool assembly_launched = false;
   std::uint64_t invocation_volume_mma_tiles = 0;
   {
-    ::dg_igr::NVTXRange profile_region(
-        ::dg_igr::observability::RegionId::hdg_local_assembly);
+    ::igrlab::NVTXRange profile_region(
+        ::igrlab::observability::RegionId::hdg_local_assembly);
     assembly_launched = CudaLaunchAssembly(
         view_, shape_, dt, cuda_engine_, invocation_volume_mma_tiles);
   }
@@ -5938,8 +5964,9 @@ AssembleAndNorm(state_slot&, const double dt, double& norm,
   const bool tensor_selected =
       cuda_engine_ == generic::CudaEngineKind::tensor_core;
   const bool volume_work_accounted = known_engine &&
-      AccumulateTensorVolumeWork(
-          tensor_selected, invocation_volume_mma_tiles,
+      CudaAccumulateResearchVolumeWork(
+          tensor_selected, shape_.borrowed_host_inputs,
+          invocation_volume_mma_tiles,
           updated_volume_assembly_launches, updated_volume_mma_tiles);
   if (!CollectiveContinue(volume_work_accounted)) return false;
   tensor_core_evidence.volume_assembly_launches =
@@ -5953,8 +5980,8 @@ AssembleAndNorm(state_slot&, const double dt, double& norm,
   // status.  Later condensation/admissibility/assembly phases overwrite the
   // whole array before its next status use, so it is safe norm scratch here.
   {
-    ::dg_igr::NVTXRange profile_region(
-        ::dg_igr::observability::RegionId::hdg_reduction);
+    ::igrlab::NVTXRange profile_region(
+        ::igrlab::observability::RegionId::hdg_reduction);
     const bool norm_launched = CudaLaunchLocalSquaredNorm(
         view_.residual_r, shape_.interior_count, view_.true_residual,
         shape_.true_trace_count, view_.status, shape_.elements, view_.scalar);
@@ -5982,8 +6009,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 CopyBase(state_slot& workspace) noexcept
 {
-  ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_packing);
+  ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_packing);
   const bool interior = TransportPolicy::DeviceToDevice(
              view_.base_interior, workspace.interior.coefficients,
              workspace.interior.count * sizeof(double),
@@ -6007,8 +6034,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 RestoreBase(state_slot& workspace) noexcept
 {
-  ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_packing);
+  ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_packing);
   const bool interior = TransportPolicy::DeviceToDevice(
       workspace.interior.coefficients, view_.base_interior,
       workspace.interior.count * sizeof(double),
@@ -6034,8 +6061,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 HashState(const double* values, const int count, StateHash& hash) noexcept
 {
-  ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_validation);
+  ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_validation);
   if (!CudaLaunchHash(values, count, view_.hash_words))
     return false;
   std::array<std::uint64_t, 4> words{};
@@ -6053,8 +6080,8 @@ template <typename AllocatorPolicy, typename TransportPolicy>
 bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
 UpdateStateHashes(state_slot& workspace) noexcept
 {
-  ::dg_igr::NVTXRange profile_region(
-      ::dg_igr::observability::RegionId::hdg_validation);
+  ::igrlab::NVTXRange profile_region(
+      ::igrlab::observability::RegionId::hdg_validation);
   constexpr std::size_t words_per_hash = 4;
   std::array<std::uint64_t, 2 * words_per_hash> words{};
   const bool local_ready = CudaLaunchHashPair(

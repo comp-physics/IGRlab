@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include "utils/config/limiter_config.hpp"
 #include "utils/config/dg_igr_defaults.hpp"
 
@@ -16,8 +18,8 @@ namespace mfem
 /// @ingroup utils_config
 struct RK3Config : public LimiterConfig
 {
-  bool limit_initial = dg_igr::RK3Defaults::kLimitInitial;
-  long max_limiter_steps = dg_igr::RK3Defaults::kLimiterSteps;
+  bool limit_initial = igrlab::RK3Defaults::kLimitInitial;
+  long max_limiter_steps = igrlab::RK3Defaults::kLimiterSteps;
 };
 
 } // namespace mfem

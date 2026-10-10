@@ -86,9 +86,9 @@ if(DG_IGR_ENABLE_HDG_RUNTIME)
        _dg_igr_hdg_cuda_extensions OR
        NOT _dg_igr_hdg_cuda_separable OR
        NOT _dg_igr_hdg_cuda_resolve STREQUAL "OFF" OR
-       NOT _dg_igr_hdg_cuda_architectures STREQUAL "120")
+       NOT _dg_igr_hdg_cuda_architectures STREQUAL "${DG_IGR_HDG_NATIVE_CUDA_ARCH}")
       message(FATAL_ERROR
-              "dg_igr_hdg_runtime_cuda is not the strict non-resolving native-SM120 separable CUDA17 component.")
+              "dg_igr_hdg_runtime_cuda is not the strict non-resolving native-SM${DG_IGR_HDG_NATIVE_CUDA_ARCH} separable CUDA17 component.")
     endif()
   elseif(TARGET dg_igr_hdg_runtime_cuda)
     message(FATAL_ERROR

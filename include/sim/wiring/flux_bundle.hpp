@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/wiring/flux_bundle.hpp
  * @brief Flux bundle helpers for Euler + IGR.
@@ -19,7 +21,7 @@ template <typename NumericalFlux> struct EulerIGRFluxBundle
 
   EulerIGRFluxBundle(int dim,
                      double gamma,
-                     dg_igr::IGRSolver& igr,
+                     ::igrlab::IGRSolver& igr,
                      bool sigma_aware_cfl,
                      bool sigma_aware_rusanov,
                      bool invariant_domain_flux,

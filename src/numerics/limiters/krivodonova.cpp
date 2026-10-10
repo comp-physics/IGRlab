@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "numerics/limiters/krivodonova.hpp"
 
 #include "limiters_common.hpp"
@@ -201,8 +202,8 @@ void ApplyKrivodonovaHierarchicalLimiter(mfem::ParFiniteElementSpace& vfes,
   const int face_q = (opt.face_qord > 0) ? opt.face_qord : (p + 2);
 
   // neighbor means for bounds
-  mfem::Array<dg_igr::limiters_detail::Nbr4> nbr;
-  dg_igr::limiters_detail::Build4Nbrs(mesh, nbr);
+  mfem::Array<igrlab::limiters_detail::Nbr4> nbr;
+  igrlab::limiters_detail::Build4Nbrs(mesh, nbr);
 
   // precompute per-element means
   std::vector<mfem::Vector> Ubar_all(NE, mfem::Vector(num_eq));

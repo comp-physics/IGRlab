@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/io/run_metadata.hpp
  * @brief Runtime metadata sidecar writer for VTK datasets.
@@ -129,7 +131,7 @@ inline std::string JoinCLI(int argc, char** argv)
 inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
                                     const RunConfig& run_cfg,
                                     const RunSummary* summary,
-                                    const dg_igr::IGRSolver* igr,
+                                    const ::igrlab::IGRSolver* igr,
                                     double c_alpha_value,
                                     int argc,
                                     char** argv,
@@ -226,6 +228,12 @@ inline void WriteRunMetadataSidecar(const CaseConfig& case_cfg,
       << detail::ToJsonString(DGBackendToString(run_cfg.dg_backend)) << ",\n";
   out << "    \"time_integrator\": "
       << detail::ToJsonString(TimeIntegratorToString(run_cfg.time_integrator))
+      << ",\n";
+  out << "    \"modal_damping_rate\": "
+      << detail::ToJsonNumber(run_cfg.opts.modal_damping_rate) << ",\n";
+  out << "    \"modal_damping_profile\": "
+      << detail::ToJsonString(run_cfg.opts.modal_damping_rate > 0.0
+                               ? "m16-quartic-max-index" : "off")
       << ",\n";
   out << "    \"dgsem_volume_flux\": "
       << detail::ToJsonString(

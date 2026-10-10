@@ -10,6 +10,8 @@
  * result; the leaf does not retain iteration history or per-event records.
  */
 
+#include "numerics/hdg/runtime/cuda/native_cuda_architecture.hpp"
+
 #include <cuda_runtime_api.h>
 
 #include <algorithm>

@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "physics/euler/conversions.hpp"
 #include "physics/igr/IGR.hpp"
 #include "physics/igr/igr_coupling.hpp"
@@ -7,6 +8,7 @@
 #include "numerics/riemann/side_scope_utils.hpp"
 #include "numerics/timestepping/RK3SSPWithLimiter.hpp"
 #include "sim/io/vis_helpers.hpp"
+#include "sim/solver/solver_helpers.hpp"
 #include "../src/numerics/dg/DGFaceQuadratureKernels.hpp"
 
 #include <algorithm>
@@ -347,9 +349,9 @@ ExactFaceApplyCheckResult CompareExactFaceApplyWithAssembledMFEM(
                                 mfem::FaceType::Interior);
 
   mfem::Vector side_q;
-  dg_igr::dg_face::InteriorFaceSideDensityProjectionScratch coeff_scratch;
+  ::igrlab::dg_face::InteriorFaceSideDensityProjectionScratch coeff_scratch;
   const auto coeff_info =
-    dg_igr::dg_face::ProjectInteriorFaceDensityCoefficient2D(state_fes,
+    ::igrlab::dg_face::ProjectInteriorFaceDensityCoefficient2D(state_fes,
                                                              fqs,
                                                              state,
                                                              alpha,
@@ -359,9 +361,9 @@ ExactFaceApplyCheckResult CompareExactFaceApplyWithAssembledMFEM(
 
   mfem::Vector exact_face_y(sigma.Size());
   exact_face_y = 0.0;
-  dg_igr::dg_face::InteriorFaceDGDiffusionApplyScratch apply_scratch;
+  ::igrlab::dg_face::InteriorFaceDGDiffusionApplyScratch apply_scratch;
   const auto apply_info =
-    dg_igr::dg_face::AddInteriorFaceDGDiffusionApply2D(sigma_fes,
+    ::igrlab::dg_face::AddInteriorFaceDGDiffusionApply2D(sigma_fes,
                                                        fqs,
                                                        sigma,
                                                        side_q,
@@ -583,7 +585,7 @@ void AddSigmaDotNTerms(const mfem::Vector& state,
                        mfem::Vector& fluxN)
 {
   const int dim = normal.Size();
-  const double rho_floor = mfem::dg_igr::FluxDefaults::kRhoVelFloor;
+  const double rho_floor = mfem::igrlab::FluxDefaults::kRhoVelFloor;
   const double rho = std::max(state(0), rho_floor);
 
   for (int d = 0; d < dim; ++d)
@@ -695,7 +697,7 @@ public:
   ScopedEnvVar(const char* name, const char* value)
     : name_(name)
   {
-    const char* prev = std::getenv(name_.c_str());
+    const char* prev = ::igrlab::GetEnv(name_.c_str());
     if (prev)
     {
       had_prev_ = true;
@@ -1115,7 +1117,7 @@ int RunIGRTests(TestContext& ctx)
       floor_state, unit_oblique, dummy_face, unit_flux);
     const double scaled_base_speed = floor_base_flux.ComputeFluxDotN(
       floor_state, scaled_oblique, dummy_face, scaled_flux);
-    ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFlux(
+    ::igrlab::frozen_scalar_igr_algebra::AddNormalSigmaFlux(
       dim,
       floor_state.GetData(),
       1,
@@ -1125,7 +1127,7 @@ int RunIGRTests(TestContext& ctx)
       rho_floor,
       unit_flux.GetData(),
       1);
-    ::dg_igr::frozen_scalar_igr_algebra::AddNormalSigmaFlux(
+    ::igrlab::frozen_scalar_igr_algebra::AddNormalSigmaFlux(
       dim,
       floor_state.GetData(),
       1,
@@ -1801,6 +1803,111 @@ int RunIGRTests(TestContext& ctx)
     igr_flux_dg.SetSigmaAwareCFL(true);
   }
 
+  // --- Application factory keeps host coefficient parameter references alive ---
+  if (!mfem::Device::Allows(mfem::Backend::DEVICE_MASK))
+  {
+    ScopedEnvVar host_qf("IGRLAB_IGR_DEVICE_QF", "0");
+    ScopedEnvVar assembled("IGRLAB_IGR_PARTIAL_ASSEMBLY", "0");
+    ScopedEnvVar ordinary_faces("IGRLAB_IGR_EXACT_DG_FACE_OPERATOR", "0");
+    ScopedEnvVar baseline_source("IGRLAB_IGR_NODAL_SOURCE", "baseline");
+    ScopedEnvVar source_quadrature("IGRLAB_IGR_SOURCE_QUADRATURE_MIN_ORDER", "0");
+    ScopedEnvVar operator_quadrature("IGRLAB_IGR_OPERATOR_QUADRATURE_MIN_ORDER", "0");
+    ScopedEnvVar ordinary_walls("IGRLAB_IGR_NODAL_WALL_MIRROR", "0");
+
+    mfem::Mesh factory_mesh = MakeGradedQuadMesh2D();
+    mfem::ParMesh factory_pmesh(MPI_COMM_SELF, factory_mesh);
+    dg_sim::DGSpaces spaces(factory_pmesh,
+                            /*order=*/2,
+                            dim,
+                            dim + 2,
+                            mfem::BasisType::GaussLegendre,
+                            "H1",
+                            /*need_sigma=*/true,
+                            /*need_h1=*/false);
+    mfem::ParGridFunction state(&spaces.vfes);
+    mfem::VectorFunctionCoefficient state_coeff(
+      dim + 2,
+      [&](const mfem::Vector& x, mfem::Vector& cons)
+      {
+        cons = EulerConsFromPrim2D(1.0,
+                                   0.3 + 0.2 * x(0) + 0.1 * x(1),
+                                   -0.1 + 0.03 * x(0) - 0.1 * x(1),
+                                   1.0,
+                                   gamma);
+      });
+    state.ProjectCoefficient(state_coeff);
+    state.ExchangeFaceNbrData();
+
+    dg_sim::RunConfig run_cfg;
+    run_cfg.igr_opts.grad = "BrokenL2";
+    run_cfg.igr_opts.linear_solver = "cg";
+    run_cfg.igr_opts.preconditioner = "none";
+    auto& config = run_cfg.case_config.igr_config;
+    config.backend = ::igrlab::IGRGradBackend::BrokenDG;
+    config.lin_solver_type = ::igrlab::IGRLinearSolverType::CG;
+    config.prec_type = ::igrlab::IGRPrecondType::None;
+    config.lin_rtol = 1.0e-11;
+    config.lin_atol = 1.0e-14;
+    config.lin_maxit = 400;
+    config.lin_print = 0;
+    constexpr double rho_floor = 1.0e-12;
+
+    for (const auto policy : {::igrlab::IGRAlphaLengthScalePolicy::Average,
+                              ::igrlab::IGRAlphaLengthScalePolicy::Local})
+    {
+      const auto alpha_info =
+        dg_sim::ComputeAlphaInfo(factory_pmesh, /*C_alpha=*/0.6, policy);
+      // Complete the factory expression before evaluating any coefficient.
+      auto factory = dg_sim::MakeIGRSolver(
+        spaces, dim, dim + 2, run_cfg, rho_floor, alpha_info);
+      ::igrlab::IGRSolver direct(
+        *spaces.sigma_fes, spaces.vfes, dim, dim + 2, alpha_info.alpha);
+      auto reference_config = config;
+      reference_config.alpha = alpha_info.alpha;
+      reference_config.alpha_length_scale_policy = policy;
+      reference_config.rho_floor = rho_floor;
+      direct.ApplyConfig(reference_config);
+
+      const std::string label =
+        policy == ::igrlab::IGRAlphaLengthScalePolicy::Local ? "local" : "average";
+      auto CompareFactory = [&](const std::string& stage)
+      {
+        factory->UpdateFromState(state, /*warm_start=*/false);
+        direct.UpdateFromState(state, /*warm_start=*/false);
+        mfem::Vector delta(factory->GetSigma());
+        delta -= direct.GetSigma();
+        const double reference_norm = GlobalL2Norm(direct.GetSigma());
+        ctx.Check(factory->GetLastLinearConverged() && direct.GetLastLinearConverged(),
+                  "IGR factory/direct " + label + " " + stage + " solves converge");
+        ctx.Check(std::isfinite(reference_norm) && reference_norm > 1.0e-10,
+                  "IGR factory/direct " + label + " " + stage + " has nonzero sigma");
+        ctx.Check(GlobalL2Norm(delta) <= 1.0e-10 * std::max(reference_norm, 1.0e-10),
+                  "IGR factory matches direct construction for " + label + " " + stage);
+      };
+      CompareFactory("initial parameters");
+      mfem::Vector previous(factory->GetSigma());
+
+      factory->SetAlpha(1.7 * alpha_info.alpha);
+      direct.SetAlpha(1.7 * alpha_info.alpha);
+      CompareFactory("updated alpha");
+      previous -= factory->GetSigma();
+      ctx.Check(GlobalL2Norm(previous) > 1.0e-9,
+                "IGR factory " + label + " alpha update changes sigma");
+      previous = factory->GetSigma();
+
+      const auto other_policy =
+        policy == ::igrlab::IGRAlphaLengthScalePolicy::Local
+          ? ::igrlab::IGRAlphaLengthScalePolicy::Average
+          : ::igrlab::IGRAlphaLengthScalePolicy::Local;
+      factory->SetAlphaLengthScalePolicy(other_policy);
+      direct.SetAlphaLengthScalePolicy(other_policy);
+      CompareFactory("updated length policy");
+      previous -= factory->GetSigma();
+      ctx.Check(GlobalL2Norm(previous) > 1.0e-9,
+                "IGR factory " + label + " length-policy update changes sigma");
+    }
+  }
+
   // --- IGR solver instance isolation: per-instance scratch/config must not alias ---
   {
     constexpr int igr_dim = 2;
@@ -1839,12 +1946,12 @@ int RunIGRTests(TestContext& ctx)
     U.ProjectCoefficient(U_coeff);
     U.ExchangeFaceNbrData();
 
-    dg_igr::IGRSolver solver_a(sigma_fes,
+    ::igrlab::IGRSolver solver_a(sigma_fes,
                                state_fes,
                                igr_dim,
                                igr_num_eq,
                                /*alpha=*/0.05);
-    dg_igr::IGRSolver solver_b(sigma_fes,
+    ::igrlab::IGRSolver solver_b(sigma_fes,
                                state_fes,
                                igr_dim,
                                igr_num_eq,
@@ -1929,15 +2036,15 @@ int RunIGRTests(TestContext& ctx)
     mfem::ParFiniteElementSpace sigma_h1_fes(&pmesh_ws,
                                              &sigma_h1_fec,
                                              /*vdim=*/1);
-    dg_igr::IGRSolver h1_solver(sigma_h1_fes,
+    ::igrlab::IGRSolver h1_solver(sigma_h1_fes,
                                 state_fes_ws,
                                 dim_ws,
                                 num_eq_ws,
                                 /*alpha=*/0.5);
-    h1_solver.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
-    h1_solver.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
-    h1_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::Auto);
-    h1_solver.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+    h1_solver.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+    h1_solver.SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+    h1_solver.SetLinearSolver(::igrlab::IGRLinearSolverType::Auto);
+    h1_solver.SetPreconditioner(::igrlab::IGRPrecondType::Auto);
     h1_solver.SetLinearSolveParams(/*rtol=*/1.0e-10,
                                    /*atol=*/0.0,
                                    /*max_it=*/250,
@@ -1956,15 +2063,15 @@ int RunIGRTests(TestContext& ctx)
     // assembled-matrix path.
     {
       ScopedEnvVar force_pa("DG_IGR_IGR_PARTIAL_ASSEMBLY", "1");
-      dg_igr::IGRSolver pa_boomer_solver(sigma_h1_fes,
+      ::igrlab::IGRSolver pa_boomer_solver(sigma_h1_fes,
                                          state_fes_ws,
                                          dim_ws,
                                          num_eq_ws,
                                          /*alpha=*/0.5);
-      pa_boomer_solver.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
-      pa_boomer_solver.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
-      pa_boomer_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
-      pa_boomer_solver.SetPreconditioner(dg_igr::IGRPrecondType::BoomerAMG);
+      pa_boomer_solver.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+      pa_boomer_solver.SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+      pa_boomer_solver.SetLinearSolver(::igrlab::IGRLinearSolverType::CG);
+      pa_boomer_solver.SetPreconditioner(::igrlab::IGRPrecondType::BoomerAMG);
       pa_boomer_solver.SetLinearSolveParams(/*rtol=*/1.0e-10,
                                             /*atol=*/0.0,
                                             /*max_it=*/250,
@@ -1987,15 +2094,15 @@ int RunIGRTests(TestContext& ctx)
                                              &sigma_l2_fec,
                                              /*vdim=*/1,
                                              mfem::Ordering::byNODES);
-    dg_igr::IGRSolver l2_solver(sigma_l2_fes,
+    ::igrlab::IGRSolver l2_solver(sigma_l2_fes,
                                 state_fes_ws,
                                 dim_ws,
                                 num_eq_ws,
                                 /*alpha=*/0.5);
-    l2_solver.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
-    l2_solver.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
-    l2_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::Auto);
-    l2_solver.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+    l2_solver.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+    l2_solver.SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+    l2_solver.SetLinearSolver(::igrlab::IGRLinearSolverType::Auto);
+    l2_solver.SetPreconditioner(::igrlab::IGRPrecondType::Auto);
     l2_solver.SetLinearSolveParams(/*rtol=*/1.0e-10,
                                    /*atol=*/0.0,
                                    /*max_it=*/250,
@@ -2090,7 +2197,7 @@ int RunIGRTests(TestContext& ctx)
                                            mfem::FaceType::Interior);
         std::string side_reason;
         const bool side_supported =
-          dg_igr::dg_face::SupportsInteriorFaceSideDensityProjection2D(
+          ::igrlab::dg_face::SupportsInteriorFaceSideDensityProjection2D(
             state_fes_qf,
             side_fqs,
             &side_reason);
@@ -2101,12 +2208,12 @@ int RunIGRTests(TestContext& ctx)
 
         if (side_supported)
         {
-          dg_igr::dg_face::InteriorFaceSideDensityProjectionScratch scratch;
+          ::igrlab::dg_face::InteriorFaceSideDensityProjectionScratch scratch;
           mfem::Vector side_q;
           const double alpha_side = 0.37;
           const double rho_floor_side = 0.2;
           const auto side_info =
-            dg_igr::dg_face::ProjectInteriorFaceDensityCoefficient2D(
+            ::igrlab::dg_face::ProjectInteriorFaceDensityCoefficient2D(
               state_fes_qf,
               side_fqs,
               U_side_qf,
@@ -2222,14 +2329,14 @@ int RunIGRTests(TestContext& ctx)
         mfem::FaceQuadratureSpace graded_fqs(graded_pmesh,
                                              graded_face_ir,
                                              mfem::FaceType::Interior);
-        dg_igr::dg_face::InteriorFaceSideDensityProjectionScratch
+        ::igrlab::dg_face::InteriorFaceSideDensityProjectionScratch
           local_alpha_scratch;
-        dg_igr::dg_face::InteriorFaceSideDensityProjectionScratch
+        ::igrlab::dg_face::InteriorFaceSideDensityProjectionScratch
           max_alpha_scratch;
         mfem::Vector local_side_q;
         mfem::Vector max_side_q;
         const auto local_side_info =
-          dg_igr::dg_face::ProjectInteriorFaceDensityCoefficient2D(
+          ::igrlab::dg_face::ProjectInteriorFaceDensityCoefficient2D(
             graded_fes,
             graded_fqs,
             graded_state,
@@ -2238,7 +2345,7 @@ int RunIGRTests(TestContext& ctx)
             local_side_q,
             &local_alpha_scratch);
         const auto max_side_info =
-          dg_igr::dg_face::ProjectInteriorFaceDensityCoefficient2D(
+          ::igrlab::dg_face::ProjectInteriorFaceDensityCoefficient2D(
             graded_fes,
             graded_fqs,
             graded_state,
@@ -2362,7 +2469,7 @@ int RunIGRTests(TestContext& ctx)
                                             mfem::FaceType::Interior);
         std::string trace_reason;
         const bool trace_supported =
-          dg_igr::dg_face::SupportsInteriorFaceScalarTraceProjection2D(
+          ::igrlab::dg_face::SupportsInteriorFaceScalarTraceProjection2D(
             sigma_fes_qf,
             trace_fqs,
             &trace_reason);
@@ -2373,11 +2480,11 @@ int RunIGRTests(TestContext& ctx)
 
         if (trace_supported)
         {
-          dg_igr::dg_face::InteriorFaceScalarTraceProjectionScratch scratch;
+          ::igrlab::dg_face::InteriorFaceScalarTraceProjectionScratch scratch;
           mfem::Vector trace_value_q;
           mfem::Vector trace_normal_q;
           const auto trace_info =
-            dg_igr::dg_face::ProjectInteriorFaceScalarTrace2D(
+            ::igrlab::dg_face::ProjectInteriorFaceScalarTrace2D(
               sigma_fes_qf,
               trace_fqs,
               sigma_trace_qf,
@@ -2446,7 +2553,7 @@ int RunIGRTests(TestContext& ctx)
                 const int local_face_id =
                   face.element[side].local_face_id;
                 const int ncomp =
-                  dg_igr::dg_face::ReferenceNormalComponent2D(local_face_id);
+                  ::igrlab::dg_face::ReferenceNormalComponent2D(local_face_id);
                 double expected_value = 0.0;
                 double expected_normal = 0.0;
                 for (int d = 0; d < trace_info.dof; ++d)
@@ -2543,9 +2650,9 @@ int RunIGRTests(TestContext& ctx)
         const double alpha_apply = 0.43;
         const double rho_floor_apply = 0.19;
         mfem::Vector side_q_apply;
-        dg_igr::dg_face::InteriorFaceSideDensityProjectionScratch coeff_scratch;
+        ::igrlab::dg_face::InteriorFaceSideDensityProjectionScratch coeff_scratch;
         const auto coeff_info =
-          dg_igr::dg_face::ProjectInteriorFaceDensityCoefficient2D(
+          ::igrlab::dg_face::ProjectInteriorFaceDensityCoefficient2D(
             state_fes_qf,
             apply_fqs,
             U_face_apply,
@@ -2555,13 +2662,13 @@ int RunIGRTests(TestContext& ctx)
             &coeff_scratch);
 
         const double ip_sigma_apply =
-          static_cast<double>(dg_igr::IGRIPKind::SIPG);
+          static_cast<double>(::igrlab::IGRIPKind::SIPG);
         const double kappa_apply = 2.75;
         mfem::Vector exact_face_y(sigma_face_apply.Size());
         exact_face_y = 0.0;
-        dg_igr::dg_face::InteriorFaceDGDiffusionApplyScratch apply_scratch;
+        ::igrlab::dg_face::InteriorFaceDGDiffusionApplyScratch apply_scratch;
         const auto apply_info =
-          dg_igr::dg_face::AddInteriorFaceDGDiffusionApply2D(
+          ::igrlab::dg_face::AddInteriorFaceDGDiffusionApply2D(
             sigma_fes_qf,
             apply_fqs,
             sigma_face_apply,
@@ -2575,13 +2682,13 @@ int RunIGRTests(TestContext& ctx)
         mfem::Vector deterministic_face_y1(sigma_face_apply.Size());
         deterministic_face_y0 = 0.0;
         deterministic_face_y1 = 0.0;
-        dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+        ::igrlab::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
           apply_info,
           apply_scratch,
           sigma_face_apply,
           ip_sigma_apply,
           deterministic_face_y0);
-        dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+        ::igrlab::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
           apply_info,
           apply_scratch,
           sigma_face_apply,
@@ -2599,7 +2706,7 @@ int RunIGRTests(TestContext& ctx)
 
         mfem::Vector exact_face_diag(sigma_face_apply.Size());
         exact_face_diag = 0.0;
-        dg_igr::dg_face::AddInteriorFaceDGDiffusionDiagonal2D(
+        ::igrlab::dg_face::AddInteriorFaceDGDiffusionDiagonal2D(
           apply_info,
           apply_scratch,
           ip_sigma_apply,
@@ -2728,14 +2835,14 @@ int RunIGRTests(TestContext& ctx)
         double refresh_apply_rel_max = 0.0;
         double refresh_diag_rel_max = 0.0;
         for (const auto scaling : {
-               dg_igr::dg_face::DGDiffusionFaceScaling::Arithmetic,
-               dg_igr::dg_face::DGDiffusionFaceScaling::Max,
-               dg_igr::dg_face::DGDiffusionFaceScaling::Sum,
-               dg_igr::dg_face::DGDiffusionFaceScaling::HarmonicWeighted })
+               ::igrlab::dg_face::DGDiffusionFaceScaling::Arithmetic,
+               ::igrlab::dg_face::DGDiffusionFaceScaling::Max,
+               ::igrlab::dg_face::DGDiffusionFaceScaling::Sum,
+               ::igrlab::dg_face::DGDiffusionFaceScaling::HarmonicWeighted })
         {
-          dg_igr::dg_face::InteriorFaceDGDiffusionApplyScratch cached;
+          ::igrlab::dg_face::InteriorFaceDGDiffusionApplyScratch cached;
           const auto cached_info =
-            dg_igr::dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
+            ::igrlab::dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
               sigma_fes_qf,
               apply_fqs,
               side_q_apply,
@@ -2748,7 +2855,7 @@ int RunIGRTests(TestContext& ctx)
               scaling,
               &cached.normal_dshape_base,
               &cached.penalty_metric);
-          dg_igr::dg_face::LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
+          ::igrlab::dg_face::LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
             cached_info,
             cached,
             refreshed_side_q,
@@ -2757,7 +2864,7 @@ int RunIGRTests(TestContext& ctx)
 
           mfem::Vector refreshed_y(sigma_face_apply.Size());
           refreshed_y = 0.0;
-          dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+          ::igrlab::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
             cached_info,
             cached,
             sigma_face_apply,
@@ -2765,15 +2872,15 @@ int RunIGRTests(TestContext& ctx)
             refreshed_y);
           mfem::Vector refreshed_diag(sigma_face_apply.Size());
           refreshed_diag = 0.0;
-          dg_igr::dg_face::AddInteriorFaceDGDiffusionDiagonal2D(
+          ::igrlab::dg_face::AddInteriorFaceDGDiffusionDiagonal2D(
             cached_info,
             cached,
             ip_sigma_apply,
             refreshed_diag);
 
-          dg_igr::dg_face::InteriorFaceDGDiffusionApplyScratch rebuilt;
+          ::igrlab::dg_face::InteriorFaceDGDiffusionApplyScratch rebuilt;
           const auto rebuilt_info =
-            dg_igr::dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
+            ::igrlab::dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
               sigma_fes_qf,
               apply_fqs,
               refreshed_side_q,
@@ -2786,7 +2893,7 @@ int RunIGRTests(TestContext& ctx)
               scaling);
           mfem::Vector rebuilt_y(sigma_face_apply.Size());
           rebuilt_y = 0.0;
-          dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+          ::igrlab::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
             rebuilt_info,
             rebuilt,
             sigma_face_apply,
@@ -2794,7 +2901,7 @@ int RunIGRTests(TestContext& ctx)
             rebuilt_y);
           mfem::Vector rebuilt_diag(sigma_face_apply.Size());
           rebuilt_diag = 0.0;
-          dg_igr::dg_face::AddInteriorFaceDGDiffusionDiagonal2D(
+          ::igrlab::dg_face::AddInteriorFaceDGDiffusionDiagonal2D(
             rebuilt_info,
             rebuilt,
             ip_sigma_apply,
@@ -2871,10 +2978,10 @@ int RunIGRTests(TestContext& ctx)
 
         const int incidence_nq = incidence_ir.GetNPoints();
         const int incidence_nf_a =
-          dg_igr::dg_face::CountLocalInteriorFaces(incidence_fes_a,
+          ::igrlab::dg_face::CountLocalInteriorFaces(incidence_fes_a,
                                                    incidence_fqs_a);
         const int incidence_nf_b =
-          dg_igr::dg_face::CountLocalInteriorFaces(incidence_fes_b,
+          ::igrlab::dg_face::CountLocalInteriorFaces(incidence_fes_b,
                                                    incidence_fqs_b);
         mfem::Vector side_q_a(2 * incidence_nq * incidence_nf_a);
         mfem::Vector side_q_b(2 * incidence_nq * incidence_nf_b);
@@ -2887,9 +2994,9 @@ int RunIGRTests(TestContext& ctx)
 
         constexpr double incidence_ip_sigma = -1.0;
         constexpr double incidence_kappa = 2.4;
-        dg_igr::dg_face::InteriorFaceDGDiffusionApplyScratch reused_scratch;
+        ::igrlab::dg_face::InteriorFaceDGDiffusionApplyScratch reused_scratch;
         const auto incidence_info_a =
-          dg_igr::dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
+          ::igrlab::dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
             incidence_fes_a,
             incidence_fqs_a,
             side_q_a,
@@ -2901,7 +3008,7 @@ int RunIGRTests(TestContext& ctx)
             reused_scratch.element_vdof_map);
         mfem::Vector throwaway_y(sigma_a.Size());
         throwaway_y = 0.0;
-        dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+        ::igrlab::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
           incidence_info_a,
           reused_scratch,
           sigma_a,
@@ -2917,7 +3024,7 @@ int RunIGRTests(TestContext& ctx)
           reused_scratch.incidence_connectivity_revision;
 
         const auto incidence_info_b =
-          dg_igr::dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
+          ::igrlab::dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
             incidence_fes_b,
             incidence_fqs_b,
             side_q_b,
@@ -2955,7 +3062,7 @@ int RunIGRTests(TestContext& ctx)
 
         mfem::Vector reused_y(sigma_b.Size());
         reused_y = 0.0;
-        dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+        ::igrlab::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
           incidence_info_b,
           reused_scratch,
           sigma_b,
@@ -2965,9 +3072,9 @@ int RunIGRTests(TestContext& ctx)
           reused_scratch.incidence_connectivity_revision ==
           incidence_info_b.connectivity_revision;
 
-        dg_igr::dg_face::InteriorFaceDGDiffusionApplyScratch fresh_scratch;
+        ::igrlab::dg_face::InteriorFaceDGDiffusionApplyScratch fresh_scratch;
         const auto fresh_info =
-          dg_igr::dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
+          ::igrlab::dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
             incidence_fes_b,
             incidence_fqs_b,
             side_q_b,
@@ -2979,7 +3086,7 @@ int RunIGRTests(TestContext& ctx)
             fresh_scratch.element_vdof_map);
         mfem::Vector fresh_y(sigma_b.Size());
         fresh_y = 0.0;
-        dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+        ::igrlab::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
           fresh_info,
           fresh_scratch,
           sigma_b,
@@ -2987,7 +3094,7 @@ int RunIGRTests(TestContext& ctx)
           fresh_y);
         mfem::Vector reused_repeat_y(sigma_b.Size());
         reused_repeat_y = 0.0;
-        dg_igr::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
+        ::igrlab::dg_face::LaunchInteriorFaceDGDiffusionApply2D(
           incidence_info_b,
           reused_scratch,
           sigma_b,
@@ -3124,7 +3231,7 @@ int RunIGRTests(TestContext& ctx)
                                                  /*alpha=*/0.51,
                                                  /*rho_floor=*/0.2,
                                                  static_cast<double>(
-                                                   dg_igr::IGRIPKind::SIPG),
+                                                   ::igrlab::IGRIPKind::SIPG),
                                                  /*kappa=*/3.25);
 
         ctx.LogMetric("igr_l2_exact_face_apply_oriented_qf rel=" +
@@ -3144,13 +3251,13 @@ int RunIGRTests(TestContext& ctx)
       }
 
       auto configure_qf_solver =
-        [&](dg_igr::IGRSolver& solver)
+        [&](::igrlab::IGRSolver& solver)
       {
-        solver.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
-        solver.SetIPKind(dg_igr::IGRIPKind::SIPG);
-        solver.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
-        solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
-        solver.SetPreconditioner(dg_igr::IGRPrecondType::None);
+        solver.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+        solver.SetIPKind(::igrlab::IGRIPKind::SIPG);
+        solver.SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+        solver.SetLinearSolver(::igrlab::IGRLinearSolverType::CG);
+        solver.SetPreconditioner(::igrlab::IGRPrecondType::None);
         solver.SetLinearSolveParams(/*rtol=*/1.0e-11,
                                     /*atol=*/0.0,
                                     /*max_it=*/1000,
@@ -3161,7 +3268,7 @@ int RunIGRTests(TestContext& ctx)
       mfem::ParFiniteElementSpace sigma_h1_fes_qf(&pmesh_qf,
                                                   &sigma_h1_fec_qf,
                                                   /*vdim=*/1);
-      dg_igr::IGRSolver assembled_h1_qf_ref(sigma_h1_fes_qf,
+      ::igrlab::IGRSolver assembled_h1_qf_ref(sigma_h1_fes_qf,
                                             state_fes_qf,
                                             dim_qf,
                                             num_eq_qf,
@@ -3171,7 +3278,7 @@ int RunIGRTests(TestContext& ctx)
 	      {
 	        ScopedEnvVar force_pa("DG_IGR_IGR_PARTIAL_ASSEMBLY", "1");
 	        ScopedEnvVar force_qf("DG_IGR_IGR_DEVICE_QF", "1");
-        dg_igr::IGRSolver pa_h1_qf_ref(sigma_h1_fes_qf,
+        ::igrlab::IGRSolver pa_h1_qf_ref(sigma_h1_fes_qf,
                                        state_fes_qf,
                                        dim_qf,
                                        num_eq_qf,
@@ -3192,7 +3299,7 @@ int RunIGRTests(TestContext& ctx)
         ctx.AddParity(h1_pa_qf_rel);
       }
 
-      dg_igr::IGRSolver assembled_qf_ref(sigma_fes_qf,
+      ::igrlab::IGRSolver assembled_qf_ref(sigma_fes_qf,
                                          state_fes_qf,
                                          dim_qf,
                                          num_eq_qf,
@@ -3242,7 +3349,7 @@ int RunIGRTests(TestContext& ctx)
 	                                              dim_qf,
 	                                              num_eq_qf,
 	                                              /*alpha=*/0.3,
-	                                              mfem::dg_igr::IGRDefaults::
+	                                              mfem::igrlab::IGRDefaults::
 	                                                kRhoFloor);
 	        for (int e = 0; e < ne_vol; ++e)
 	        {
@@ -3256,7 +3363,7 @@ int RunIGRTests(TestContext& ctx)
 	            U_qf.GetVectorGradient(*T, grad_at_q);
 	            const double rho =
 	              std::max(state_at_q(0),
-	                       mfem::dg_igr::IGRDefaults::kRhoFloor);
+	                       mfem::igrlab::IGRDefaults::kRhoFloor);
 	            invrho_vals(q, e) = 1.0 / rho;
 	            ck_vals(q, e) = 0.3 / rho;
 	            src_eval.StateScratch() = state_at_q;
@@ -3267,17 +3374,17 @@ int RunIGRTests(TestContext& ctx)
 
 	        InverseRhoCoefficient invrho_cb(
 	          U_qf,
-	          mfem::dg_igr::IGRDefaults::kRhoFloor);
+	          mfem::igrlab::IGRDefaults::kRhoFloor);
 	        AlphaOverRhoCoefficient ck_cb(
 	          U_qf,
 	          /*alpha=*/0.3,
-	          mfem::dg_igr::IGRDefaults::kRhoFloor);
+	          mfem::igrlab::IGRDefaults::kRhoFloor);
 	        BrokenDGIGRSourceCoefficient src_cb(
 	          U_qf,
 	          dim_qf,
 	          num_eq_qf,
 	          /*alpha=*/0.3,
-	          mfem::dg_igr::IGRDefaults::kRhoFloor);
+	          mfem::igrlab::IGRDefaults::kRhoFloor);
 	        mfem::QuadratureFunctionCoefficient invrho_qfc(invrho_qf);
 	        mfem::QuadratureFunctionCoefficient ck_qfc(ck_qf);
 	        mfem::QuadratureFunctionCoefficient src_qfc(src_qf);
@@ -3419,17 +3526,17 @@ int RunIGRTests(TestContext& ctx)
         ScopedEnvVar force_qf("DG_IGR_IGR_DEVICE_QF", "1");
         ScopedEnvVar cheb_order("DG_IGR_IGR_CHEB_ORDER", "3");
         ScopedEnvVar cheb_power_iters("DG_IGR_IGR_CHEB_POWER_ITERATIONS", "4");
-        dg_igr::IGRSolver cheb_qf_ref(sigma_fes_qf,
+        ::igrlab::IGRSolver cheb_qf_ref(sigma_fes_qf,
                                       state_fes_qf,
                                       dim_qf,
                                       num_eq_qf,
                                       /*alpha=*/0.3);
-        cheb_qf_ref.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
-        cheb_qf_ref.SetIPKind(dg_igr::IGRIPKind::SIPG);
-        cheb_qf_ref.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
-        cheb_qf_ref.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
+        cheb_qf_ref.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+        cheb_qf_ref.SetIPKind(::igrlab::IGRIPKind::SIPG);
+        cheb_qf_ref.SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+        cheb_qf_ref.SetLinearSolver(::igrlab::IGRLinearSolverType::CG);
         cheb_qf_ref.SetPreconditioner(
-          dg_igr::IGRPrecondType::OperatorChebyshev);
+          ::igrlab::IGRPrecondType::OperatorChebyshev);
         cheb_qf_ref.SetLinearSolveParams(/*rtol=*/1.0e-8,
                                          /*atol=*/0.0,
                                          /*max_it=*/1000,
@@ -3456,7 +3563,7 @@ int RunIGRTests(TestContext& ctx)
         ScopedEnvVar cheb_order("DG_IGR_IGR_CHEB_ORDER", "3");
         ScopedEnvVar cheb_power_iters(
           "DG_IGR_IGR_CHEB_POWER_ITERATIONS", "4");
-        dg_igr::IGRSolver extrapolated_cheb_ref(sigma_fes_qf,
+        ::igrlab::IGRSolver extrapolated_cheb_ref(sigma_fes_qf,
                                                 state_fes_qf,
                                                 dim_qf,
                                                 num_eq_qf,
@@ -3464,10 +3571,10 @@ int RunIGRTests(TestContext& ctx)
         configure_qf_solver(extrapolated_cheb_ref);
         extrapolated_cheb_ref.SetExactDGFaceOperator(true);
         extrapolated_cheb_ref.SetSigmaUpdatePolicy(
-          dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
+          ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
           /*interval=*/1);
         extrapolated_cheb_ref.SetPreconditioner(
-          dg_igr::IGRPrecondType::OperatorChebyshev);
+          ::igrlab::IGRPrecondType::OperatorChebyshev);
         extrapolated_cheb_ref.SetLinearSolveParams(/*rtol=*/1.0e-8,
                                                    /*atol=*/0.0,
                                                    /*max_it=*/1000,
@@ -3491,7 +3598,7 @@ int RunIGRTests(TestContext& ctx)
         ScopedEnvVar force_qf("DG_IGR_IGR_DEVICE_QF", "1");
         ScopedEnvVar request_arithmetic_scaling(
           "DG_IGR_IGR_IPDG_FACE_SCALING", "arithmetic");
-        dg_igr::IGRSolver arithmetic_scaling_ref(sigma_fes_qf,
+        ::igrlab::IGRSolver arithmetic_scaling_ref(sigma_fes_qf,
                                                  state_fes_qf,
                                                  dim_qf,
                                                  num_eq_qf,
@@ -3499,7 +3606,7 @@ int RunIGRTests(TestContext& ctx)
         configure_qf_solver(arithmetic_scaling_ref);
         arithmetic_scaling_ref.SetExactDGFaceOperator(true);
         arithmetic_scaling_ref.SetSigmaUpdatePolicy(
-          dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
+          ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
           /*interval=*/1);
         arithmetic_scaling_ref.UpdateFromState(U_qf, /*warm_start=*/false);
         ctx.Check(arithmetic_scaling_ref.GetLastLinearConverged(),
@@ -3513,7 +3620,7 @@ int RunIGRTests(TestContext& ctx)
         ScopedEnvVar force_qf("DG_IGR_IGR_DEVICE_QF", "1");
         ScopedEnvVar request_harmonic_scaling(
           "DG_IGR_IGR_IPDG_FACE_SCALING", "harmonic");
-        dg_igr::IGRSolver extrapolated_scaling_ref(sigma_fes_qf,
+        ::igrlab::IGRSolver extrapolated_scaling_ref(sigma_fes_qf,
                                                    state_fes_qf,
                                                    dim_qf,
                                                    num_eq_qf,
@@ -3521,7 +3628,7 @@ int RunIGRTests(TestContext& ctx)
         configure_qf_solver(extrapolated_scaling_ref);
         extrapolated_scaling_ref.SetExactDGFaceOperator(true);
         extrapolated_scaling_ref.SetSigmaUpdatePolicy(
-          dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
+          ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
           /*interval=*/1);
         extrapolated_scaling_ref.UpdateFromState(U_qf,
                                                  /*warm_start=*/false);
@@ -3547,7 +3654,7 @@ int RunIGRTests(TestContext& ctx)
 	      {
 	        ScopedEnvVar force_pa("DG_IGR_IGR_PARTIAL_ASSEMBLY", "1");
         ScopedEnvVar force_qf("DG_IGR_IGR_DEVICE_QF", "1");
-        dg_igr::IGRSolver pa_qf_ref(sigma_fes_qf,
+        ::igrlab::IGRSolver pa_qf_ref(sigma_fes_qf,
                                     state_fes_qf,
                                     dim_qf,
                                     num_eq_qf,
@@ -3599,7 +3706,7 @@ int RunIGRTests(TestContext& ctx)
                       std::to_string(pa_qf_ref.GetLastLinearIters()));
         ctx.AddParity(pa_qf_rel);
         const bool require_l2_pa_qf_equiv =
-          std::getenv("DG_IGR_REQUIRE_L2_PA_QF_EQUIV") != nullptr;
+          ::igrlab::GetEnv("DG_IGR_REQUIRE_L2_PA_QF_EQUIV") != nullptr;
         if (require_l2_pa_qf_equiv)
         {
           ctx.Check(pa_qf_rel < 1.0e-9,
@@ -3618,7 +3725,7 @@ int RunIGRTests(TestContext& ctx)
 	        // PA/QF opt-outs must not make the typed closure fail at runtime.
 	        ScopedEnvVar legacy_qf_opt_out("DG_IGR_IGR_DEVICE_QF", "0");
 	        ScopedEnvVar force_exact("DG_IGR_IGR_EXACT_DG_FACE_OPERATOR", "1");
-	        dg_igr::IGRSolver exact_face_ref(sigma_fes_qf,
+	        ::igrlab::IGRSolver exact_face_ref(sigma_fes_qf,
 	                                         state_fes_qf,
 	                                         dim_qf,
                                          num_eq_qf,
@@ -3667,26 +3774,26 @@ int RunIGRTests(TestContext& ctx)
             mfem::FaceType::Interior);
 
           mfem::Vector solver_side_q;
-          dg_igr::dg_face::InteriorFaceSideDensityProjectionScratch
+          ::igrlab::dg_face::InteriorFaceSideDensityProjectionScratch
             solver_coeff_scratch;
-          dg_igr::dg_face::ProjectInteriorFaceDensityCoefficient2D(
+          ::igrlab::dg_face::ProjectInteriorFaceDensityCoefficient2D(
             state_fes_qf,
             solver_face_fqs,
             U_qf,
             /*alpha=*/0.3,
-            mfem::dg_igr::IGRDefaults::kRhoFloor,
+            mfem::igrlab::IGRDefaults::kRhoFloor,
             solver_side_q,
             &solver_coeff_scratch);
 
           const double ip_sigma_solver =
-            static_cast<double>(dg_igr::IGRIPKind::SIPG);
+            static_cast<double>(::igrlab::IGRIPKind::SIPG);
           const double kappa_solver =
             4.0 * (sigma_order_qf + 1) * (sigma_order_qf + 1);
           mfem::Vector exact_face_y(probe_local.Size());
           exact_face_y = 0.0;
-          dg_igr::dg_face::InteriorFaceDGDiffusionApplyScratch
+          ::igrlab::dg_face::InteriorFaceDGDiffusionApplyScratch
             solver_face_scratch;
-          dg_igr::dg_face::AddInteriorFaceDGDiffusionApply2D(
+          ::igrlab::dg_face::AddInteriorFaceDGDiffusionApply2D(
             sigma_fes_qf,
             solver_face_fqs,
             probe_local,
@@ -3699,7 +3806,7 @@ int RunIGRTests(TestContext& ctx)
           AlphaOverRhoCoefficient alpha_over_rho_solver(
             U_qf,
             /*alpha=*/0.3,
-            mfem::dg_igr::IGRDefaults::kRhoFloor);
+            mfem::igrlab::IGRDefaults::kRhoFloor);
           mfem::DGDiffusionIntegrator mfem_solver_face(alpha_over_rho_solver,
                                                        ip_sigma_solver,
                                                        kappa_solver);
@@ -3806,7 +3913,7 @@ int RunIGRTests(TestContext& ctx)
                       std::to_string(exact_face_ref.GetLastLinearIters()));
         ctx.AddParity(apply_rel + rhs_rel + exact_rel);
         const bool require_l2_exact_face_equiv =
-          std::getenv("DG_IGR_REQUIRE_L2_EXACT_FACE_EQUIV") != nullptr;
+          ::igrlab::GetEnv("DG_IGR_REQUIRE_L2_EXACT_FACE_EQUIV") != nullptr;
         if (require_l2_exact_face_equiv)
         {
           ctx.Check(apply_rel < 1.0e-9,
@@ -3835,9 +3942,9 @@ int RunIGRTests(TestContext& ctx)
               "IGR L2 SIPG operator is positive definite on probe vectors");
 
     // Explicit CG request with SIPG should stay on CG (no fallback).
-    l2_solver.SetIPKind(dg_igr::IGRIPKind::SIPG);
-    l2_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
-    l2_solver.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+    l2_solver.SetIPKind(::igrlab::IGRIPKind::SIPG);
+    l2_solver.SetLinearSolver(::igrlab::IGRLinearSolverType::CG);
+    l2_solver.SetPreconditioner(::igrlab::IGRPrecondType::Auto);
     l2_solver.UpdateFromState(U_ws, /*warm_start=*/false);
     ctx.Check(l2_solver.GetLastLinearConverged(),
               "IGR L2 SIPG CG solve converges");
@@ -3845,9 +3952,9 @@ int RunIGRTests(TestContext& ctx)
               "IGR L2 SIPG explicit CG request stays on CG");
 
     // Guardrail: non-symmetric IP kind must not use CG.
-    l2_solver.SetIPKind(dg_igr::IGRIPKind::NIPG);
-    l2_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
-    l2_solver.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+    l2_solver.SetIPKind(::igrlab::IGRIPKind::NIPG);
+    l2_solver.SetLinearSolver(::igrlab::IGRLinearSolverType::CG);
+    l2_solver.SetPreconditioner(::igrlab::IGRPrecondType::Auto);
     l2_solver.UpdateFromState(U_ws, /*warm_start=*/false);
     const mfem::HypreParMatrix* A_l2_nipg = l2_solver.GetAssembledOperator();
     MFEM_VERIFY(A_l2_nipg != nullptr,
@@ -3863,32 +3970,32 @@ int RunIGRTests(TestContext& ctx)
               "IGR L2 NIPG operator is measurably non-symmetric");
     ctx.Check(l2_solver.GetLastLinearSolverName() == "gmres",
               "IGR guardrail falls back from CG to GMRES for NIPG");
-    l2_solver.SetIPKind(dg_igr::IGRIPKind::SIPG);
+    l2_solver.SetIPKind(::igrlab::IGRIPKind::SIPG);
 
     // Guardrail: CG with ILU preconditioner on H1 should fallback preconditioner.
-    h1_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
-    h1_solver.SetPreconditioner(dg_igr::IGRPrecondType::HypreILU);
+    h1_solver.SetLinearSolver(::igrlab::IGRLinearSolverType::CG);
+    h1_solver.SetPreconditioner(::igrlab::IGRPrecondType::HypreILU);
     h1_solver.UpdateFromState(U_ws, /*warm_start=*/false);
     ctx.Check(h1_solver.GetLastPrecondName() == "boomeramg",
               "IGR guardrail falls back from ILU to BoomerAMG for CG");
 
     // Warm-start regression: warm-start should reduce iteration counts after step 0.
-    dg_igr::IGRSolver cold_solver(sigma_l2_fes,
+    ::igrlab::IGRSolver cold_solver(sigma_l2_fes,
                                   state_fes_ws,
                                   dim_ws,
                                   num_eq_ws,
                                   /*alpha=*/0.5);
-    dg_igr::IGRSolver warm_solver(sigma_l2_fes,
+    ::igrlab::IGRSolver warm_solver(sigma_l2_fes,
                                   state_fes_ws,
                                   dim_ws,
                                   num_eq_ws,
                                   /*alpha=*/0.5);
-    for (dg_igr::IGRSolver* s : {&cold_solver, &warm_solver})
+    for (::igrlab::IGRSolver* s : {&cold_solver, &warm_solver})
     {
-      s->SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
-      s->SetSolveMode(dg_igr::IGRSolveMode::Krylov);
-      s->SetLinearSolver(dg_igr::IGRLinearSolverType::GMRES);
-      s->SetPreconditioner(dg_igr::IGRPrecondType::None);
+      s->SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+      s->SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+      s->SetLinearSolver(::igrlab::IGRLinearSolverType::GMRES);
+      s->SetPreconditioner(::igrlab::IGRPrecondType::None);
       s->SetLinearSolveParams(/*rtol=*/1.0e-12,
                               /*atol=*/0.0,
                               /*max_it=*/500,
@@ -3953,16 +4060,16 @@ int RunIGRTests(TestContext& ctx)
       guard_state.ProjectCoefficient(guard_state_coeff);
       guard_state.ExchangeFaceNbrData();
 
-      dg_igr::IGRSolver guard_control(
+      ::igrlab::IGRSolver guard_control(
         guard_sigma_fes, guard_state_fes, 2, 4, 0.05);
-      dg_igr::IGRSolver guard_solver(
+      ::igrlab::IGRSolver guard_solver(
         guard_sigma_fes, guard_state_fes, 2, 4, 0.05);
-      for (dg_igr::IGRSolver* solver : {&guard_control, &guard_solver})
+      for (::igrlab::IGRSolver* solver : {&guard_control, &guard_solver})
       {
-        solver->SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
-        solver->SetSolveMode(dg_igr::IGRSolveMode::Krylov);
-        solver->SetLinearSolver(dg_igr::IGRLinearSolverType::GMRES);
-        solver->SetPreconditioner(dg_igr::IGRPrecondType::None);
+        solver->SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+        solver->SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+        solver->SetLinearSolver(::igrlab::IGRLinearSolverType::GMRES);
+        solver->SetPreconditioner(::igrlab::IGRPrecondType::None);
         solver->SetExactDGFaceOperator(true);
         solver->SetLinearSolveParams(1.0e-10, 0.0, 500, 0);
       }
@@ -3997,9 +4104,9 @@ int RunIGRTests(TestContext& ctx)
       "DG_IGR_IGR_TRUE_RESIDUAL";
     constexpr const char* true_initial_residual_env =
       "DG_IGR_IGR_TRUE_INITIAL_RESIDUAL";
-    const char* original_true_residual = std::getenv(true_residual_env);
+    const char* original_true_residual = ::igrlab::GetEnv(true_residual_env);
     const char* original_true_initial_residual =
-      std::getenv(true_initial_residual_env);
+      ::igrlab::GetEnv(true_initial_residual_env);
     const std::string original_true_residual_value =
       original_true_residual ? original_true_residual : "";
     const std::string original_true_initial_residual_value =
@@ -4014,15 +4121,15 @@ int RunIGRTests(TestContext& ctx)
     ctx.Check(cold_solver.GetLastLinearTrueResidualRel() <= 1.0e-10,
               "IGR converged solve satisfies independently recomputed residual");
 
-    dg_igr::IGRSolver forced_failure_solver(sigma_l2_fes,
+    ::igrlab::IGRSolver forced_failure_solver(sigma_l2_fes,
                                             state_fes_ws,
                                             dim_ws,
                                             num_eq_ws,
                                             /*alpha=*/0.5);
-    forced_failure_solver.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
-    forced_failure_solver.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
-    forced_failure_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::GMRES);
-    forced_failure_solver.SetPreconditioner(dg_igr::IGRPrecondType::None);
+    forced_failure_solver.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+    forced_failure_solver.SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+    forced_failure_solver.SetLinearSolver(::igrlab::IGRLinearSolverType::GMRES);
+    forced_failure_solver.SetPreconditioner(::igrlab::IGRPrecondType::None);
     forced_failure_solver.SetLinearSolveParams(/*rtol=*/1.0e-16,
                                                /*atol=*/0.0,
                                                /*max_it=*/1,
@@ -4158,21 +4265,21 @@ int RunIGRTests(TestContext& ctx)
                                             /*vdim=*/1,
                                             mfem::Ordering::byNODES);
 
-    dg_igr::IGRSolver igr_solver_s(sigma_fes_s,
+    ::igrlab::IGRSolver igr_solver_s(sigma_fes_s,
                                    state_fes_s,
                                    dim_s,
                                    num_eq_s,
                                    /*alpha=*/0.25);
-    igr_solver_s.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
-    igr_solver_s.SetIPKind(dg_igr::IGRIPKind::SIPG);
-    igr_solver_s.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
-    igr_solver_s.SetLinearSolver(dg_igr::IGRLinearSolverType::Auto);
-    igr_solver_s.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+    igr_solver_s.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+    igr_solver_s.SetIPKind(::igrlab::IGRIPKind::SIPG);
+    igr_solver_s.SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+    igr_solver_s.SetLinearSolver(::igrlab::IGRLinearSolverType::Auto);
+    igr_solver_s.SetPreconditioner(::igrlab::IGRPrecondType::Auto);
     igr_solver_s.SetLinearSolveParams(/*rtol=*/1.0e-12,
                                       /*atol=*/0.0,
                                       /*max_it=*/400,
                                       /*print=*/0);
-    igr_solver_s.SetSigmaUpdatePolicy(dg_igr::IGRSigmaUpdateCadence::EveryStage,
+    igr_solver_s.SetSigmaUpdatePolicy(::igrlab::IGRSigmaUpdateCadence::EveryStage,
                                       /*interval=*/1);
     igr_solver_s.SetStageRtolScale(1.0);
 
@@ -4534,24 +4641,24 @@ int RunIGRTests(TestContext& ctx)
 
     mfem::ParGridFunction U_checkpoint_next(&state_fes_s);
     project_state(U_checkpoint_next, /*phase=*/0.05);
-    auto configure_checkpoint_solver = [](dg_igr::IGRSolver& solver)
+    auto configure_checkpoint_solver = [](::igrlab::IGRSolver& solver)
     {
-      solver.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
-      solver.SetIPKind(dg_igr::IGRIPKind::SIPG);
-      solver.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
-      solver.SetLinearSolver(dg_igr::IGRLinearSolverType::Auto);
-      solver.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+      solver.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+      solver.SetIPKind(::igrlab::IGRIPKind::SIPG);
+      solver.SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+      solver.SetLinearSolver(::igrlab::IGRLinearSolverType::Auto);
+      solver.SetPreconditioner(::igrlab::IGRPrecondType::Auto);
       solver.SetLinearSolveParams(/*rtol=*/1.0e-12,
                                   /*atol=*/0.0,
                                   /*max_it=*/400,
                                   /*print=*/0);
     };
-    dg_igr::IGRSolver checkpoint_solver(sigma_fes_s,
+    ::igrlab::IGRSolver checkpoint_solver(sigma_fes_s,
                                         state_fes_s,
                                         dim_s,
                                         num_eq_s,
                                         /*alpha=*/0.25);
-    dg_igr::IGRSolver checkpoint_control(sigma_fes_s,
+    ::igrlab::IGRSolver checkpoint_control(sigma_fes_s,
                                          state_fes_s,
                                          dim_s,
                                          num_eq_s,
@@ -4564,7 +4671,7 @@ int RunIGRTests(TestContext& ctx)
     checkpoint_solver.UpdateFromState(
       U_stage,
       /*warm_start=*/true,
-      dg_igr::IGRSolvePurpose::ProductionStage0Prefetch);
+      ::igrlab::IGRSolvePurpose::ProductionStage0Prefetch);
     ctx.Check(checkpoint_solver.ReclassifyPendingStage0PrefetchAsOutputOnly(),
               "Sigma lifecycle: pending prefetch can be reclassified");
     mfem::Vector restored_sigma(checkpoint_solver.GetSigma());
@@ -4593,20 +4700,20 @@ int RunIGRTests(TestContext& ctx)
                                       wrapped.GetSigmaOutputOnlySolveCount()));
 
     auto check_non_stage_fallback =
-      [&](dg_igr::IGRSigmaUpdateCadence cadence,
+      [&](::igrlab::IGRSigmaUpdateCadence cadence,
           int interval,
           const std::string& label)
     {
-      dg_igr::IGRSolver igr_solver_fb(sigma_fes_s,
+      ::igrlab::IGRSolver igr_solver_fb(sigma_fes_s,
                                       state_fes_s,
                                       dim_s,
                                       num_eq_s,
                                       /*alpha=*/0.25);
-      igr_solver_fb.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
-      igr_solver_fb.SetIPKind(dg_igr::IGRIPKind::SIPG);
-      igr_solver_fb.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
-      igr_solver_fb.SetLinearSolver(dg_igr::IGRLinearSolverType::Auto);
-      igr_solver_fb.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+      igr_solver_fb.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+      igr_solver_fb.SetIPKind(::igrlab::IGRIPKind::SIPG);
+      igr_solver_fb.SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+      igr_solver_fb.SetLinearSolver(::igrlab::IGRLinearSolverType::Auto);
+      igr_solver_fb.SetPreconditioner(::igrlab::IGRPrecondType::Auto);
       igr_solver_fb.SetLinearSolveParams(/*rtol=*/1.0e-12,
                                          /*atol=*/0.0,
                                          /*max_it=*/400,
@@ -4666,10 +4773,10 @@ int RunIGRTests(TestContext& ctx)
                   label + ")");
     };
 
-    check_non_stage_fallback(dg_igr::IGRSigmaUpdateCadence::EveryStep,
+    check_non_stage_fallback(::igrlab::IGRSigmaUpdateCadence::EveryStep,
                              /*interval=*/1,
                              "every-step");
-    check_non_stage_fallback(dg_igr::IGRSigmaUpdateCadence::EveryNSteps,
+    check_non_stage_fallback(::igrlab::IGRSigmaUpdateCadence::EveryNSteps,
                              /*interval=*/3,
                              "every-n-steps");
 
@@ -4679,14 +4786,14 @@ int RunIGRTests(TestContext& ctx)
     // the prediction must follow physical stage time rather than stage index,
     // because SSPRK(10,4) has non-monotone abscissae c4=2/3, c5=1/3.
     {
-      dg_igr::IGRSolver extrapolated_solver(sigma_fes_s,
+      ::igrlab::IGRSolver extrapolated_solver(sigma_fes_s,
                                             state_fes_s,
                                             dim_s,
                                             num_eq_s,
                                             /*alpha=*/0.25);
       configure_checkpoint_solver(extrapolated_solver);
       extrapolated_solver.SetSigmaUpdatePolicy(
-        dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
+        ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
         /*interval=*/1);
       extrapolated_solver.SetStageRtolScale(1.0);
 
@@ -4947,14 +5054,14 @@ int RunIGRTests(TestContext& ctx)
     // the just-completed RHS. A rejection restores the exact accepted anchor;
     // its cumulative telemetry must not reject the subsequent retry again.
     {
-      dg_igr::IGRSolver admission_solver(sigma_fes_s,
+      ::igrlab::IGRSolver admission_solver(sigma_fes_s,
                                          state_fes_s,
                                          dim_s,
                                          num_eq_s,
                                          /*alpha=*/0.25);
       configure_checkpoint_solver(admission_solver);
       admission_solver.SetSigmaUpdatePolicy(
-        dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
+        ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep,
         /*interval=*/1);
       admission_solver.SetStageRtolScale(1.0);
 
@@ -5125,11 +5232,11 @@ int RunIGRTests(TestContext& ctx)
 
     // --- Rejected RK attempts restore IGR cadence and stage-0 provenance ---
     auto check_refresh_rejection =
-      [&](dg_igr::IGRSigmaUpdateCadence cadence,
+      [&](::igrlab::IGRSigmaUpdateCadence cadence,
           bool expect_abort_solve,
           const std::string& label)
     {
-      dg_igr::IGRSolver retry_solver(sigma_fes_s,
+      ::igrlab::IGRSolver retry_solver(sigma_fes_s,
                                      state_fes_s,
                                      dim_s,
                                      num_eq_s,
@@ -5214,10 +5321,10 @@ int RunIGRTests(TestContext& ctx)
         U_base, /*t=*/0.01, restored_generation + 2);
     };
 
-    check_refresh_rejection(dg_igr::IGRSigmaUpdateCadence::EveryStage,
+    check_refresh_rejection(::igrlab::IGRSigmaUpdateCadence::EveryStage,
                             /*expect_abort_solve=*/true,
                             "every-stage");
-    check_refresh_rejection(dg_igr::IGRSigmaUpdateCadence::EveryStep,
+    check_refresh_rejection(::igrlab::IGRSigmaUpdateCadence::EveryStep,
                             /*expect_abort_solve=*/false,
                             "every-step");
 
@@ -5226,14 +5333,14 @@ int RunIGRTests(TestContext& ctx)
     // accepted or rejected transport attempt. The next scheduled refresh must
     // still be recognized and reusable on retry.
     {
-      dg_igr::IGRSolver retry_solver(sigma_fes_s,
+      ::igrlab::IGRSolver retry_solver(sigma_fes_s,
                                      state_fes_s,
                                      dim_s,
                                      num_eq_s,
                                      /*alpha=*/0.25);
       configure_checkpoint_solver(retry_solver);
       retry_solver.SetSigmaUpdatePolicy(
-        dg_igr::IGRSigmaUpdateCadence::EveryNSteps, /*interval=*/3);
+        ::igrlab::IGRSigmaUpdateCadence::EveryNSteps, /*interval=*/3);
       retry_solver.SetStageRtolScale(1.0);
 
       mfem::EulerFlux retry_base_flux(dim_s, gamma);
@@ -5431,20 +5538,20 @@ int RunIGRTests(TestContext& ctx)
 
     std::string side_reason;
     const bool side_supported =
-      dg_igr::dg_face::SupportsInteriorFaceSideDensityProjection2D(
+      ::igrlab::dg_face::SupportsInteriorFaceSideDensityProjection2D(
         shared_fes,
         shared_fqs,
         &side_reason);
     std::string trace_reason;
     const bool trace_supported =
-      dg_igr::dg_face::SupportsInteriorFaceScalarTraceProjection2D(
+      ::igrlab::dg_face::SupportsInteriorFaceScalarTraceProjection2D(
         shared_fes,
         shared_fqs,
         &trace_reason);
 
     std::string shared_apply_reason;
     const bool shared_apply_supported =
-      dg_igr::dg_face::SupportsSharedFaceDGDiffusionApplyData2D(
+      ::igrlab::dg_face::SupportsSharedFaceDGDiffusionApplyData2D(
         shared_fes,
         shared_face_ir,
         &shared_apply_reason);
@@ -5501,12 +5608,12 @@ int RunIGRTests(TestContext& ctx)
 
       mfem::Vector projected_local_q;
       mfem::Vector projected_max_q;
-      dg_igr::dg_face::SharedFaceSideDensityProjectionScratch
+      ::igrlab::dg_face::SharedFaceSideDensityProjectionScratch
         projected_local_scratch;
-      dg_igr::dg_face::SharedFaceSideDensityProjectionScratch
+      ::igrlab::dg_face::SharedFaceSideDensityProjectionScratch
         projected_max_scratch;
       const auto projected_local_info =
-        dg_igr::dg_face::ProjectSharedFaceDensityCoefficient2D(
+        ::igrlab::dg_face::ProjectSharedFaceDensityCoefficient2D(
           shared_fes,
           shared_face_ir,
           shared_density,
@@ -5515,7 +5622,7 @@ int RunIGRTests(TestContext& ctx)
           projected_local_q,
           &projected_local_scratch);
       const auto projected_max_info =
-        dg_igr::dg_face::ProjectSharedFaceDensityCoefficient2D(
+        ::igrlab::dg_face::ProjectSharedFaceDensityCoefficient2D(
           shared_fes,
           shared_face_ir,
           shared_density,
@@ -5592,9 +5699,9 @@ int RunIGRTests(TestContext& ctx)
                                    shared_face_ir.GetNPoints() *
                                    local_pmesh_shared);
         shared_side_q = 1.0;
-        dg_igr::dg_face::SharedFaceDGDiffusionApplyScratch shared_scratch;
+        ::igrlab::dg_face::SharedFaceDGDiffusionApplyScratch shared_scratch;
         const auto shared_info =
-          dg_igr::dg_face::BuildSharedFaceDGDiffusionApplyData2D(
+          ::igrlab::dg_face::BuildSharedFaceDGDiffusionApplyData2D(
             shared_fes,
             shared_face_ir,
             shared_side_q,
@@ -5683,14 +5790,14 @@ int RunIGRTests(TestContext& ctx)
         }
 
         const double shared_ip_sigma =
-          static_cast<double>(dg_igr::IGRIPKind::SIPG);
+          static_cast<double>(::igrlab::IGRIPKind::SIPG);
         const double shared_kappa = 2.75;
         mfem::Vector shared_apply_y(shared_sigma.Size());
         shared_apply_y = 0.0;
-        dg_igr::dg_face::SharedFaceDGDiffusionApplyScratch
+        ::igrlab::dg_face::SharedFaceDGDiffusionApplyScratch
           shared_apply_scratch;
         const auto shared_apply_info =
-          dg_igr::dg_face::AddSharedFaceDGDiffusionApply2D(
+          ::igrlab::dg_face::AddSharedFaceDGDiffusionApply2D(
             shared_fes,
             shared_face_ir,
             shared_sigma,
@@ -5704,14 +5811,14 @@ int RunIGRTests(TestContext& ctx)
         mfem::Vector shared_repeat_y1(shared_sigma.Size());
         shared_repeat_y0 = 0.0;
         shared_repeat_y1 = 0.0;
-        dg_igr::dg_face::LaunchSharedFaceDGDiffusionApply2D(
+        ::igrlab::dg_face::LaunchSharedFaceDGDiffusionApply2D(
           shared_apply_info,
           shared_apply_scratch,
           shared_sigma,
           shared_sigma.FaceNbrData(),
           shared_ip_sigma,
           shared_repeat_y0);
-        dg_igr::dg_face::LaunchSharedFaceDGDiffusionApply2D(
+        ::igrlab::dg_face::LaunchSharedFaceDGDiffusionApply2D(
           shared_apply_info,
           shared_apply_scratch,
           shared_sigma,
@@ -5725,7 +5832,7 @@ int RunIGRTests(TestContext& ctx)
         const std::uint64_t shared_first_revision =
           shared_apply_scratch.incidence_connectivity_revision;
         const auto shared_rebuilt_info =
-          dg_igr::dg_face::BuildSharedFaceDGDiffusionApplyData2D(
+          ::igrlab::dg_face::BuildSharedFaceDGDiffusionApplyData2D(
             shared_fes,
             shared_face_ir,
             shared_side_q,
@@ -5743,7 +5850,7 @@ int RunIGRTests(TestContext& ctx)
             shared_first_revision;
         mfem::Vector shared_rebuilt_y(shared_sigma.Size());
         shared_rebuilt_y = 0.0;
-        dg_igr::dg_face::LaunchSharedFaceDGDiffusionApply2D(
+        ::igrlab::dg_face::LaunchSharedFaceDGDiffusionApply2D(
           shared_rebuilt_info,
           shared_apply_scratch,
           shared_sigma,
@@ -5760,7 +5867,7 @@ int RunIGRTests(TestContext& ctx)
 
         mfem::Vector shared_diag(shared_sigma.Size());
         shared_diag = 0.0;
-        dg_igr::dg_face::AddSharedFaceDGDiffusionLocalDiagonal2D(
+        ::igrlab::dg_face::AddSharedFaceDGDiffusionLocalDiagonal2D(
           shared_apply_info,
           shared_apply_scratch,
           shared_ip_sigma,
@@ -5944,15 +6051,15 @@ int RunIGRTests(TestContext& ctx)
         "DG_IGR_IGR_EXTENDED_CERTIFICATE_START", "1");
       ScopedEnvVar force_certificate_factor(
         "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR", "100");
-      dg_igr::IGRSolver shared_exact_solver(shared_fes,
+      ::igrlab::IGRSolver shared_exact_solver(shared_fes,
                                             shared_state_fes,
                                             dim_shared,
                                             num_eq_shared,
                                             /*C_alpha=*/0.19);
       shared_exact_solver.SetAlphaLengthScalePolicy(
-        dg_igr::IGRAlphaLengthScalePolicy::Local);
-      shared_exact_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
-      shared_exact_solver.SetPreconditioner(dg_igr::IGRPrecondType::None);
+        ::igrlab::IGRAlphaLengthScalePolicy::Local);
+      shared_exact_solver.SetLinearSolver(::igrlab::IGRLinearSolverType::CG);
+      shared_exact_solver.SetPreconditioner(::igrlab::IGRPrecondType::None);
       shared_exact_solver.SetLinearSolveParams(/*rtol=*/1.0e-9,
                                                /*atol=*/0.0,
                                                /*max_it=*/400,
@@ -5980,17 +6087,17 @@ int RunIGRTests(TestContext& ctx)
       {
         ScopedEnvVar reject_certificate_factor(
           "DG_IGR_IGR_EXTENDED_CERTIFICATE_FACTOR", "1e-12");
-        dg_igr::IGRSolver certificate_rejection_solver(shared_fes,
+        ::igrlab::IGRSolver certificate_rejection_solver(shared_fes,
                                                        shared_state_fes,
                                                        dim_shared,
                                                        num_eq_shared,
                                                        /*alpha=*/0.19);
         certificate_rejection_solver.SetLinearSolver(
-          dg_igr::IGRLinearSolverType::CG);
+          ::igrlab::IGRLinearSolverType::CG);
         certificate_rejection_solver.SetPreconditioner(
-          dg_igr::IGRPrecondType::None);
+          ::igrlab::IGRPrecondType::None);
         certificate_rejection_solver.SetNonconvergencePolicy(
-          dg_igr::IGRNonconvergencePolicy::Accept);
+          ::igrlab::IGRNonconvergencePolicy::Accept);
         certificate_rejection_solver.SetLinearSolveParams(/*rtol=*/1.0e-9,
                                                           /*atol=*/0.0,
                                                           /*max_it=*/400,
@@ -6006,13 +6113,13 @@ int RunIGRTests(TestContext& ctx)
       {
         ScopedEnvVar force_harmonic(
           "DG_IGR_IGR_IPDG_FACE_SCALING", "harmonic");
-        dg_igr::IGRSolver harmonic_solver(shared_fes,
+        ::igrlab::IGRSolver harmonic_solver(shared_fes,
                                           shared_state_fes,
                                           dim_shared,
                                           num_eq_shared,
                                           /*alpha=*/0.19);
-        harmonic_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
-        harmonic_solver.SetPreconditioner(dg_igr::IGRPrecondType::None);
+        harmonic_solver.SetLinearSolver(::igrlab::IGRLinearSolverType::CG);
+        harmonic_solver.SetPreconditioner(::igrlab::IGRPrecondType::None);
         harmonic_solver.SetLinearSolveParams(/*rtol=*/1.0e-9,
                                              /*atol=*/0.0,
                                              /*max_it=*/400,
@@ -6284,15 +6391,15 @@ int RunIGRTests(TestContext& ctx)
         &locality_sigma_fec,
         1,
         mfem::Ordering::byNODES);
-      dg_igr::IGRSolver locality_solver(locality_sigma_fes,
+      ::igrlab::IGRSolver locality_solver(locality_sigma_fes,
                                         locality_state_fes,
                                         locality_dim,
                                         locality_num_eq,
                                         h * h);
-      locality_solver.SetGradBackend(dg_igr::IGRGradBackend::BrokenDG);
-      locality_solver.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
-      locality_solver.SetLinearSolver(dg_igr::IGRLinearSolverType::CG);
-      locality_solver.SetPreconditioner(dg_igr::IGRPrecondType::None);
+      locality_solver.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+      locality_solver.SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+      locality_solver.SetLinearSolver(::igrlab::IGRLinearSolverType::CG);
+      locality_solver.SetPreconditioner(::igrlab::IGRPrecondType::None);
       locality_solver.SetLinearSolveParams(1.0e-10, 0.0, 1000, 0);
       locality_solver.UpdateFromState(locality_state, /*warm_start=*/false);
       ctx.Check(locality_solver.GetLastLinearConverged(),
@@ -6397,14 +6504,14 @@ int RunIGRTests(TestContext& ctx)
                                             /*vdim=*/1,
                                             mfem::Ordering::byNODES);
 
-    dg_igr::IGRSolver solver_q(sigma_fes_q,
+    ::igrlab::IGRSolver solver_q(sigma_fes_q,
                                state_fes_q,
                                dim_q,
                                num_eq_q,
                                /*alpha=*/0.5);
-    solver_q.SetSolveMode(dg_igr::IGRSolveMode::Krylov);
-    solver_q.SetLinearSolver(dg_igr::IGRLinearSolverType::Auto);
-    solver_q.SetPreconditioner(dg_igr::IGRPrecondType::Auto);
+    solver_q.SetSolveMode(::igrlab::IGRSolveMode::Krylov);
+    solver_q.SetLinearSolver(::igrlab::IGRLinearSolverType::Auto);
+    solver_q.SetPreconditioner(::igrlab::IGRPrecondType::Auto);
     solver_q.SetLinearSolveParams(/*rtol=*/1.0e-8,
                                   /*atol=*/0.0,
                                   /*max_it=*/500,
@@ -6505,4 +6612,4 @@ int RunIGRTests(TestContext& ctx)
   return ctx.failures;
 }
 
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

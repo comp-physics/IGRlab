@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "io/vtk_output.hpp"
 
 #include "utils/config/env_flags.hpp"
@@ -46,7 +47,7 @@ void RegisterEulerFields(mfem::ParaViewDataCollection& dc,
                      const_cast<mfem::ParGridFunction*>(fields.sigma));
   }
   if (fields.pressure_coefficient &&
-      ::dg_igr::EnvFlagEnabledDefault(
+      ::igrlab::EnvFlagEnabledDefault(
         "DG_IGR_VTK_PRESSURE_COEFFICIENT", false))
   {
     dc.RegisterCoeffField("pressure", fields.pressure_coefficient);

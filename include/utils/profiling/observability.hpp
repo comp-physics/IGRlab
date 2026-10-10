@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file utils/profiling/observability.hpp
  * @brief Allocation-free, compile-time observability contract.
@@ -54,7 +56,7 @@
 #include <caliper/cali.h>
 #endif
 
-namespace dg_igr
+namespace igrlab
 {
 namespace observability
 {
@@ -497,4 +499,4 @@ inline void record_counter(const CounterId id, const std::int64_t value) noexcep
 }
 
 } // namespace observability
-} // namespace dg_igr
+} // namespace igrlab

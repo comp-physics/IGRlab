@@ -1,8 +1,9 @@
+#include "igrlab/compat.hpp"
 #include "physics/regularization/adapters/frozen_scalar_igr_broken_dg_cpu.hpp"
 
 #include <cmath>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace regularization
 {
@@ -371,4 +372,4 @@ FrozenScalarIGRBrokenDGCPUAdapter ConfigureFrozenScalarIGRBrokenDGCPUAdapter(
 }
 
 } // namespace regularization
-} // namespace dg_igr
+} // namespace igrlab

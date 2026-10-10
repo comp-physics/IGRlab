@@ -92,7 +92,10 @@ void GatherElementStateDevice(int ne,
                               const Vector& local_state,
                               DenseMatrix& packed_state);
 
-/** Interpolate a scalar finite-element field to packed DGSEM state nodes. */
+/** Interpolate a scalar finite-element field to packed DGSEM state nodes.
+ * An empty interpolation matrix selects an exact nodal gather; in that case
+ * scalar_element_dofs contains one signed scalar dof per output row.
+ */
 void InterpolateElementScalarDevice(int rows,
                                     int scalar_dofs_per_element,
                                     const Array<int>& scalar_element_dofs,
@@ -294,7 +297,40 @@ void AssembleEulerRusanovFacesDevice(int dim,
                                      DenseMatrix& face_flux,
                                      Vector& face_speeds,
                                      DenseMatrix& weak_surface,
-                                     bool frozen_sigma_spectral_speed = false);
+                                     bool frozen_sigma_spectral_speed = false,
+                                     bool assemble_weak_surface = true);
+
+/** Fused FP64 CUDA residual for admitted 2D p1--p4 LGL element batches.
+ *
+ * Consumes the unique unweighted face fluxes above. Central transport,
+ * optional LLF volume dissipation, signed face incidence, and diagonal inverse
+ * mass are combined without full-field intermediate writes. With no subcell
+ * blend this changes algebraic evaluation only; sigma must still belong to
+ * the current stage. An optional element-constant subcell_blend changes the
+ * numerical method to a blend with an adjacent-LGL-subcell LLF residual and
+ * requires affine metrics and coefficients in [0,1].
+ * The packed output remains private until the caller's normal final scatter.
+ * tensor_contraction selects an on-chip FP64 8x8x4 WMMA central contraction;
+ * the default uses the same precombined operator with ordinary FP64 arithmetic.
+ */
+/** Density/pressure modal sensor for an element-constant conservative
+ * DG/LGL-subcell residual blend. This is a numerical-method coefficient;
+ * modal_transform maps nodal values to Legendre coefficients. */
+void ComputeModalSubcellBlendDevice(
+    int ne, int n1d, real_t gamma, real_t threshold,
+    const Array<int>& lex_to_local, const DenseMatrix& modal_transform,
+    const DenseMatrix& states, Vector& blend);
+
+void ApplyFusedEulerResidualDevice(
+    int ne, int n1d, real_t gamma, real_t density_floor,
+    bool llf_volume, bool frozen_sigma_spectral_speed,
+    const Array<int>& lex_to_local, const DenseMatrix& split_matrix,
+    const Vector& weights, const DenseMatrix& states, const Vector& sigma,
+    const DenseMatrix& metrics, const DenseMatrix& inverse_mass,
+    const Vector& face_weights, const Array<int>& row_face_offsets,
+    const Array<int>& row_face_ids, const Array<int>& row_face_signs,
+    const DenseMatrix& face_flux, Vector& nodal_speeds, DenseMatrix& strong,
+    bool tensor_contraction = false, const Vector* subcell_blend = nullptr);
 
 /** Evaluate only the packed two-sided Rusanov characteristic-speed bound.
  *
@@ -329,8 +365,10 @@ void IntegratePhysicalBoundaryFluxDevice(const Array<int>& ownership,
 
 /** Apply a packed batch of element inverse-mass matrices.
  *
- * `inverse_mass` has height `ne*dof` and width `dof`; row `e*dof+i` contains
- * row `i` of element `e`'s inverse matrix.
+ * `inverse_mass` has height `ne*dof`. Width `dof` stores row `i` of element
+ * `e`'s inverse matrix at row `e*dof+i`; width one stores only its diagonal.
+ * The compact representation is an exact algebraic optimization: callers
+ * must verify that every omitted off-diagonal entry is exactly zero.
  */
 void ApplyInverseMassDevice(int ne,
                             int dof,

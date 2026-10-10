@@ -1,8 +1,7 @@
 # Collect all source files (including module subdirectories)
-set(DG_IGR_MFEM_SOURCE_ROOT
-    "${CMAKE_SOURCE_DIR}/tpl/mfem"
-    CACHE PATH
-    "Exact MFEM source checkout supplying source-internal headers.")
+igrlab_cache_alias(IGRLAB_MFEM_SOURCE_ROOT DG_IGR_MFEM_SOURCE_ROOT
+                   PATH "${CMAKE_SOURCE_DIR}/tpl/mfem"
+                   "Exact MFEM source checkout supplying source-internal headers.")
 foreach(_dg_igr_mfem_source_header IN ITEMS
         fem/picojson.h
         general/tinyxml2.h)
@@ -63,6 +62,22 @@ endif()
 
 # Create library
 add_library(igr_mfem STATIC ${SOURCES})
+# Keep the existing archive/link target while callers adopt the IGRlab name.
+add_library(IGRlab::core ALIAS igr_mfem)
+
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+    target_link_libraries(igr_mfem PRIVATE CUDA::cusolver)
+    target_sources(igr_mfem PRIVATE physics/igr/IGR_dense_inverse_cuda.cu
+                                  physics/igr/IGR_two_level_inverse_cuda.cu
+                                  physics/igr/IGR_screened_patch_inverse_cuda.cu
+                                  physics/igr/IGR_face_density_cuda.cu
+                                  physics/igr/IGR_stationary_correction_cuda.cu)
+    target_compile_definitions(igr_mfem PRIVATE DG_IGR_HAS_DENSE_INVERSE_CUDA=1
+                                              DG_IGR_HAS_TWO_LEVEL_INVERSE_CUDA=1
+                                              DG_IGR_HAS_SCREENED_PATCH_CUDA=1
+                                              DG_IGR_HAS_FACE_DENSITY_CUDA=1
+                                              DG_IGR_HAS_STATIONARY_CORRECTION_CUDA=1)
+endif()
 
 set(_dg_igr_default_accel_sources "")
 if(DG_IGR_ACCELERATOR_LANGUAGE)
@@ -71,6 +86,7 @@ if(DG_IGR_ACCELERATOR_LANGUAGE)
          "src/numerics/dg/DGHyperbolicConservationLaws_face.cpp"
          "src/numerics/dg/DGHyperbolicConservationLaws_mass.cpp"
          "src/numerics/dg/DGHyperbolicConservationLaws_weakdiv.cpp"
+         "src/numerics/dg/modal_damping.cpp"
          "src/numerics/dg/DGFaceQuadratureKernels.cpp"
          "src/numerics/dgsem/dgsem_device.cpp"
          "src/numerics/hdg/device/device_core.cpp"
@@ -98,10 +114,12 @@ if(DG_IGR_ACCELERATOR_LANGUAGE)
     endif()
 endif()
 
-set(DG_IGR_AUTO_DG_ACCELERATOR_SOURCE
-    ON
-    CACHE BOOL
-    "When ON, automatically compile DGHyperbolicConservationLaws.cpp with the accelerator language in CUDA/HIP builds.")
+igrlab_cache_alias(IGRLAB_AUTO_DG_ACCELERATOR_SOURCE DG_IGR_AUTO_DG_ACCELERATOR_SOURCE
+                   BOOL ON
+                   "Automatically compile DG kernels with the accelerator language in CUDA/HIP builds.")
+igrlab_cache_alias(IGRLAB_ACCELERATOR_KERNEL_SOURCES DG_IGR_ACCELERATOR_KERNEL_SOURCES
+                   STRING "${_dg_igr_default_accel_sources}"
+                   "Semicolon-separated source files to compile with the accelerator language.")
 
 if(NOT DEFINED DG_IGR_ACCELERATOR_KERNEL_SOURCES)
     set(DG_IGR_ACCELERATOR_KERNEL_SOURCES
@@ -136,6 +154,11 @@ if(DG_IGR_AUTO_DG_ACCELERATOR_SOURCE AND
         "Semicolon-separated source files (repo-relative or absolute) to compile with ${DG_IGR_ACCELERATOR_LANGUAGE} for MFEM_FORALL kernels."
         FORCE)
 endif()
+
+# Reflect any automatically required accelerator sources in both spellings.
+igrlab_cache_alias(IGRLAB_ACCELERATOR_KERNEL_SOURCES DG_IGR_ACCELERATOR_KERNEL_SOURCES
+                   STRING "${_dg_igr_default_accel_sources}"
+                   "Semicolon-separated source files to compile with the accelerator language.")
 
 # Include directories  
 target_include_directories(igr_mfem PUBLIC 

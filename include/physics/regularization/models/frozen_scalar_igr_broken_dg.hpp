@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
 #include "physics/regularization/auxiliary_field.hpp"
 #include "physics/regularization/combination.hpp"
@@ -7,7 +9,7 @@
 
 #include <type_traits>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace regularization
 {
@@ -330,4 +332,4 @@ static_assert(!std::is_polymorphic<FrozenScalarIGRBrokenDGModelTag>::value,
               "frozen scalar IGR model identity must not be polymorphic");
 
 } // namespace regularization
-} // namespace dg_igr
+} // namespace igrlab

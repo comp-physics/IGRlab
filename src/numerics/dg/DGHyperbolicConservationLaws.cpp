@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 // Implementation of DGHyperbolicConservationLaws main operator flow.
 
 #include "DGHyperbolicConservationLaws_impl.hpp"
@@ -67,6 +68,30 @@ DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
 
 DGHyperbolicConservationLaws::DGHyperbolicConservationLaws(
   DGHyperbolicConservationLaws&&) = default;
+
+void DGHyperbolicConservationLaws::SetModalDampingRate(real_t rate)
+{
+  MFEM_VERIFY(std::isfinite(rate) && rate >= 0.0,
+              "Modal damping rate must be finite and nonnegative.");
+  if (rate == 0.0)
+  {
+    modal_damping_.reset();
+  }
+  else
+  {
+    modal_damping_ = std::make_unique<ConservativeModalDamping>(vfes, rate);
+  }
+}
+
+real_t DGHyperbolicConservationLaws::LimitProposedRKStepSize(real_t proposed_dt) const
+{
+  MFEM_VERIFY(std::isfinite(proposed_dt) && proposed_dt > 0.0,
+              "DG step-size limiting requires a finite positive proposal.");
+  // q <= 1 also for the max-index tensor extension. This limits the isolated
+  // relaxation step; it is not a positivity/stability theorem for Euler--IGR.
+  return modal_damping_ ? std::min(proposed_dt, 1.0 / modal_damping_->GetRate())
+                        : proposed_dt;
+}
 
 IGRFrozenSigmaTelemetry
 DGHyperbolicConservationLaws::GetGlobalFrozenSigmaTelemetry() const
@@ -186,7 +211,7 @@ DGHyperbolicConservationLaws::InspectFrozenSigmaStateForAdmission(
   {
     if (const Operator* prolongation = par_fes->GetProlongationMatrix())
     {
-      ::dg_igr::NVTXRange range("DG/admission-prolong-true-to-local");
+      ::igrlab::NVTXRange range("DG/admission-prolong-true-to-local");
       dgsem_x_local_workspace_.SetSize(par_fes->GetVSize());
       prolongation->Mult(state, dgsem_x_local_workspace_);
       state_local = &dgsem_x_local_workspace_;
@@ -196,7 +221,7 @@ DGHyperbolicConservationLaws::InspectFrozenSigmaStateForAdmission(
 
   dgsem::DGSEMOperator& dgsem_op = GetDGSEMProductionOperator_();
   const bool requested_strict =
-    ::dg_igr::EnvFlagEnabled("DG_IGR_DGSEM_PRODUCTION_STRICT") ||
+    ::igrlab::EnvFlagEnabled("DG_IGR_DGSEM_PRODUCTION_STRICT") ||
     RequiresStrictDGSEMProduction(*formIntegrator);
   const dgsem::DGSEMProductionSelection selection =
     dgsem_op.BindProductionPolicy(requested_strict);
@@ -426,7 +451,11 @@ bool DGHyperbolicConservationLaws::SupportsPhysicalBoundaryFluxIntegral() const
 
 void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
 {
-  ::dg_igr::NVTXRange mult_range("DG/Mult");
+  MFEM_VERIFY(!p0_face_reference_x_slopes_ ||
+                (Device::Allows(Backend::CUDA_MASK) && vol_mode_ == VolumeMode::WeakDivergence &&
+                 p0_face_reference_x_slopes_->Size() == vfes.GetVSize()),
+              "P0 MUSCL traces cannot use CPU or a different volume/state representation.");
+  ::igrlab::NVTXRange mult_range("DG/Mult");
   MFEM_VERIFY(!static_source_requires_rebind_,
               "DG operator topology changed after a static source was "
               "installed; project and call SetStaticSource again before "
@@ -544,7 +573,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
       prolongation = pvfes->GetProlongationMatrix();
       if (prolongation)
       {
-        ::dg_igr::NVTXRange range("DG/prolong-true-to-local");
+        ::igrlab::NVTXRange range("DG/prolong-true-to-local");
         x_local.SetSize(pvfes->GetVSize());
         prolongation->Mult(x, x_local);
         x_eval = &x_local;
@@ -562,7 +591,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
                 "Use --dgsem-stab none.");
     dgsem::DGSEMOperator& dgsem_op = GetDGSEMProductionOperator_();
     const bool requested_strict =
-      ::dg_igr::EnvFlagEnabled("DG_IGR_DGSEM_PRODUCTION_STRICT") ||
+      ::igrlab::EnvFlagEnabled("DG_IGR_DGSEM_PRODUCTION_STRICT") ||
       RequiresStrictDGSEMProduction(*formIntegrator);
     const dgsem::DGSEMProductionSelection selection =
       dgsem_op.BindProductionPolicy(requested_strict);
@@ -601,6 +630,11 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
       MFEM_VERIFY(result.executed,
                   "DGSEM production execution rejected before output: "
                     << dgsem::DGSEMProductionReasonName(result.reason));
+
+      if (modal_damping_)
+      {
+        modal_damping_->AddMult(*x_eval, y_local);
+      }
 
       if (prolongation)
       {
@@ -695,6 +729,10 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
       {
         y_local = 0.0;
       }
+      if (modal_damping_)
+      {
+        modal_damping_->AddMult(*x_eval, y_local);
+      }
       y = 0.0;
       prolongation->MultTranspose(y_local, y);
     }
@@ -705,6 +743,10 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     else
     {
       y = 0.0;
+    }
+    if (!prolongation && modal_damping_)
+    {
+      modal_damping_->AddMult(*x_eval, y);
     }
     if (static_source_.Size() != 0)
     {
@@ -763,11 +805,13 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
   {
     const bool default_force_nonlinearform_face = !UseDeviceFaceResidual_();
     const bool force_nonlinearform_face =
-      ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DG_FORCE_NLFORM_FACE",
+      ::igrlab::EnvFlagEnabledDefault("DG_IGR_DG_FORCE_NLFORM_FACE",
                                       default_force_nonlinearform_face);
+    MFEM_VERIFY(!p0_face_reference_x_slopes_ || !force_nonlinearform_face,
+                "P0 MUSCL traces require packed faces; nonlinear-form fallback would change transport.");
     if (force_nonlinearform_face)
     {
-      ::dg_igr::NVTXRange range("DG/face-domain-mfem-nonlinearform");
+      ::igrlab::NVTXRange range("DG/face-domain-mfem-nonlinearform");
       nonlinearForm->Mult(*x_eval, z_eval);
       used_device_face = false;
       device_face_speed = formIntegrator->GetMaxCharSpeed();
@@ -785,7 +829,7 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
     }
     else
     {
-      ::dg_igr::NVTXRange range("DG/face-packed-euler-rusanov");
+      ::igrlab::NVTXRange range("DG/face-packed-euler-rusanov");
       MFEM_VERIFY(UseDeviceFaceResidual_(),
                   "DG device-closure requires packed device face residual path "
                   "(no host fallback).");
@@ -812,14 +856,14 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
   }
   else
   {
-    ::dg_igr::NVTXRange range("DG/face-domain-cpu-nonlinearform");
+    ::igrlab::NVTXRange range("DG/face-domain-cpu-nonlinearform");
     nonlinearForm->Mult(x, z);
   }
 
   real_t volume_speed = 0.0;
   if (!weakdiv.empty()) // weak divergence WAS preassembled element-wise
   {
-    ::dg_igr::NVTXRange range("DG/weak-divergence");
+    ::igrlab::NVTXRange range("DG/weak-divergence");
     // Compute (I_h F(u_h), ∇v) and accumulate directly into z.
     volume_speed = AddPreassembledWeakDivergence_(*x_eval, z_eval);
   }
@@ -827,16 +871,24 @@ void DGHyperbolicConservationLaws::Mult(const Vector& x, Vector& y) const
   // Apply inverse mass after all contributions have been assembled in z.
   if (prolongation)
   {
-    ::dg_igr::NVTXRange range("DG/inverse-mass-local-and-restrict");
+    ::igrlab::NVTXRange range("DG/inverse-mass-local-and-restrict");
     y_local.SetSize(z_eval.Size());
     ApplyInverseMass_(z_eval, y_local);
+    if (modal_damping_)
+    {
+      modal_damping_->AddMult(*x_eval, y_local);
+    }
     y = 0.0;
     prolongation->MultTranspose(y_local, y);
   }
   else
   {
-    ::dg_igr::NVTXRange range("DG/inverse-mass");
+    ::igrlab::NVTXRange range("DG/inverse-mass");
     ApplyInverseMass_(z_eval, y);
+    if (modal_damping_)
+    {
+      modal_damping_->AddMult(*x_eval, y);
+    }
   }
 
   if (static_source_.Size() != 0)
@@ -880,6 +932,8 @@ DGHyperbolicConservationLaws::~DGHyperbolicConservationLaws()
 // -----------------------------------------------------------------------------
 void DGHyperbolicConservationLaws::Update()
 {
+  const real_t modal_rate = GetModalDampingRate();
+  modal_damping_.reset();
   const bool had_static_source = static_source_.Size() != 0;
   static_source_.SetSize(0);
   static_source_requires_rebind_ =
@@ -929,6 +983,7 @@ void DGHyperbolicConservationLaws::Update()
   dgsem_production_dispatch_strict_ = false;
   dgsem_production_dispatch_cuda_ = false;
   dgsem_production_dispatch_reason_ = dgsem::DGSEMProductionReason::None;
+  SetModalDampingRate(modal_rate);
 }
 
 void DGHyperbolicConservationLaws::SetFaceIntegrationRule(
@@ -948,7 +1003,7 @@ bool DGHyperbolicConservationLaws::IsDGSEMTimingEnabled_() const
 {
   if (!dgsem_timing_init_)
   {
-    dgsem_timing_enabled_ = ::dg_igr::EnvFlagEnabled("DG_IGR_DGSEM_TIMING");
+    dgsem_timing_enabled_ = ::igrlab::EnvFlagEnabled("DG_IGR_DGSEM_TIMING");
     dgsem_timing_init_ = true;
   }
   return dgsem_timing_enabled_;

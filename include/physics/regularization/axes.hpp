@@ -1,8 +1,10 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include <cstdint>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace regularization
 {
@@ -251,4 +253,4 @@ struct EntropyStableTag
 };
 
 } // namespace regularization
-} // namespace dg_igr
+} // namespace igrlab

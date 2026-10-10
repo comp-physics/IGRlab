@@ -29,11 +29,15 @@ if [[ -z "${HOME:-}" ]]; then
 fi
 
 MODE="cpu"
-JOBS="${NPROC:-4}"
+CPU_MODE_WAS_SET=0
+A100_PROFILE=0
+A100_ARCH_CONFLICT=0
+JOBS="${IGRLAB_BUILD_JOBS:-${NPROC:-4}}"
 MFEM_JOBS=""
 CLEAN=1
 INSTALL_DEPS=1
 RUN_TESTS=1
+BUILD_RESEARCH_TESTS="${IGRLAB_BUILD_RESEARCH_TESTS:-${DG_IGR_BUILD_RESEARCH_TESTS:-OFF}}"
 TEST_REGEX=""
 RUN_SMOKE=0
 CALIPER=0
@@ -42,7 +46,7 @@ HDG_EULER_EXPERIMENT="OFF"
 HDG_EULER_DEVICE_EXPERIMENT="OFF"
 HDG_RUNTIME="OFF"
 HDG_AUXILIARY_EXPERIMENT="OFF"
-SPACK_CUDA_ARCH="${SPACK_CUDA_ARCH:-120}"
+SPACK_CUDA_ARCH="${IGRLAB_CUDA_ARCH:-${SPACK_CUDA_ARCH:-120}}"
 CUDA_ARCH_WAS_SET=0
 PRINT_PLAN=0
 OUTPUT_ROOT_REQUEST=""
@@ -144,11 +148,13 @@ MFEM_IDENTITY_INSTALL_MANIFEST_SHA256=""
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh [--cpu-only | --gpu] [options]
+IGRlab canonical build driver
+Usage: ./build.sh [--cpu-only | --gpu | --a100] [options]
 
 Modes:
   --cpu-only        Build dependencies, MFEM, and the app without CUDA (default).
   --gpu             Build the CUDA dependency profile, MFEM, and the app.
+  --a100            Select the A100 profile (equivalent to --gpu --cuda-arch 80).
 
 Options:
   --caliper         Build the CPU-only Caliper observability profile.
@@ -161,29 +167,46 @@ Options:
   --hdg-runtime     Enable the persistent HDG runtime component seam.
   --hdg-auxiliary-experiment
                     Enable the CPU-only experimental HDG auxiliary seam.
-  -j, --jobs N      Parallel build jobs (default: NPROC or 4).
+  -j, --jobs N      Parallel build jobs (default: IGRLAB_BUILD_JOBS, NPROC or 4).
   --mfem-jobs N     Parallel MFEM build jobs (default: --jobs value).
   --cuda-arch N     Concrete GPU architecture profile (default: 120).
   --reuse-mfem-root DIR
                     Reuse a strictly stamped MFEM tuple rooted at DIR.  An
                     unstamped pinned clean checkout is a read-only seed for a
                     external fresh MFEM build, never an in-place reuse.
-  --output-root DIR  Store build outputs in DIR (default: DG_IGR_OUTPUT_ROOT,
-                    then ${XDG_CACHE_HOME:-$HOME/.cache}/dg-igr-build).
+  --output-root DIR  Store build outputs in DIR (default: IGRLAB_OUTPUT_ROOT,
+                    then DG_IGR_OUTPUT_ROOT, then
+                    ${XDG_CACHE_HOME:-$HOME/.cache}/igrlab-build).
   --print-plan      Validate and print the resolved build policy, then exit.
   --clean           Rebuild the selected mode from clean caches (default).
   --no-clean        Reuse existing build and install directories.
   --no-deps         Do not run `spack install`.
   --no-tests        Do not run CTest.
+  --research-tests  Build research-only tests and experiments (default: off).
+  --no-research-tests
+                    Exclude research-only targets, overriding the environment.
   --test-regex REGEX
                     Require REGEX to select one or more CTest tests, then run
                     only that selection.  Requires tests to remain enabled.
   --smoke           Run a short two-rank Sedov smoke test after tests.
   -h, --help        Show this help.
 
-Environment overrides:
-  DG_IGR_OUTPUT_ROOT, DG_IGR_SPACK_ENV, SPACK_CUDA_ARCH, MFEM_CUDA_ARCHS, APP_CUDA_ARCHS,
-  CMAKE_BUILD_TYPE, DG_IGR_ACCELERATOR_KERNEL_SOURCES, TMPDIR
+Environment overrides (nonempty IGRLAB_* values take precedence):
+  IGRLAB_OUTPUT_ROOT                 legacy: DG_IGR_OUTPUT_ROOT
+  IGRLAB_SPACK_ENV                   legacy: DG_IGR_SPACK_ENV
+  IGRLAB_CUDA_ARCH                   legacy: SPACK_CUDA_ARCH
+  IGRLAB_MFEM_CUDA_ARCHS              legacy: MFEM_CUDA_ARCHS
+  IGRLAB_APP_CUDA_ARCHS               legacy: APP_CUDA_ARCHS
+  IGRLAB_BUILD_TYPE                  legacy: CMAKE_BUILD_TYPE
+  IGRLAB_BUILD_JOBS                  legacy: NPROC
+  IGRLAB_BUILD_RESEARCH_TESTS        legacy: DG_IGR_BUILD_RESEARCH_TESTS
+  IGRLAB_ACCELERATOR_KERNEL_SOURCES  legacy: DG_IGR_ACCELERATOR_KERNEL_SOURCES
+  TMPDIR                            temporary-file directory
+
+Command-line options take precedence over the corresponding environment value.
+To keep using existing outputs, pass --output-root explicitly, for example:
+  ./build.sh --cpu-only --no-clean --output-root "$HOME/.cache/dg-igr-build"
+The worktree/profile layout and MFEM identity records retain their format.
 
 CUDA_ARCHS is intentionally rejected in GPU mode. Use MFEM_CUDA_ARCHS and
 APP_CUDA_ARCHS so MFEM compatibility code generation cannot be confused with
@@ -193,8 +216,9 @@ EOF
 
 while (($#)); do
   case "$1" in
-    --cpu|--cpu-only) MODE="cpu" ;;
+    --cpu|--cpu-only) MODE="cpu"; CPU_MODE_WAS_SET=1 ;;
     --gpu) MODE="gpu" ;;
+    --a100) A100_PROFILE=1 ;;
     --caliper) CALIPER=1 ;;
     --nvtx-profile) NVTX_PROFILE=1 ;;
     --hdg-euler-experiment) HDG_EULER_EXPERIMENT="ON" ;;
@@ -205,6 +229,9 @@ while (($#)); do
       [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
       SPACK_CUDA_ARCH="$2"
       CUDA_ARCH_WAS_SET=1
+      if [[ "$2" != "80" ]]; then
+        A100_ARCH_CONFLICT=1
+      fi
       shift
       ;;
     -j|--jobs)
@@ -240,6 +267,8 @@ while (($#)); do
     --no-clean) CLEAN=0 ;;
     --no-deps) INSTALL_DEPS=0 ;;
     --no-tests) RUN_TESTS=0 ;;
+    --research-tests) BUILD_RESEARCH_TESTS="ON" ;;
+    --no-research-tests) BUILD_RESEARCH_TESTS="OFF" ;;
     --test-regex)
       [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
       [[ -n "$2" && "$2" != *$'\n'* && "$2" != *$'\r'* ]] || {
@@ -255,6 +284,25 @@ while (($#)); do
   esac
   shift
 done
+
+if ((A100_PROFILE)); then
+  if ((CPU_MODE_WAS_SET || A100_ARCH_CONFLICT)); then
+    echo "ERROR: --a100 conflicts with --cpu-only/--cpu or --cuda-arch other than 80." >&2
+    exit 2
+  fi
+  MODE="gpu"
+  SPACK_CUDA_ARCH="80"
+  CUDA_ARCH_WAS_SET=1
+fi
+
+case "${BUILD_RESEARCH_TESTS^^}" in
+  ON|TRUE|YES|1) BUILD_RESEARCH_TESTS="ON" ;;
+  OFF|FALSE|NO|0) BUILD_RESEARCH_TESTS="OFF" ;;
+  *)
+    echo "ERROR: IGRLAB_BUILD_RESEARCH_TESTS/DG_IGR_BUILD_RESEARCH_TESTS must be a boolean (ON or OFF)." >&2
+    exit 2
+    ;;
+esac
 
 if [[ -n "${TEST_REGEX}" && "${RUN_TESTS}" != "1" ]]; then
   echo "ERROR: --test-regex requires CTest; do not combine it with --no-tests." >&2
@@ -332,10 +380,12 @@ configure_output_layout() {
 
   if [[ -n "${OUTPUT_ROOT_REQUEST}" ]]; then
     requested="${OUTPUT_ROOT_REQUEST}"
+  elif [[ -n "${IGRLAB_OUTPUT_ROOT:-}" ]]; then
+    requested="${IGRLAB_OUTPUT_ROOT}"
   elif [[ -n "${DG_IGR_OUTPUT_ROOT:-}" ]]; then
     requested="${DG_IGR_OUTPUT_ROOT}"
   else
-    requested="${XDG_CACHE_HOME:-${HOME}/.cache}/dg-igr-build"
+    requested="${XDG_CACHE_HOME:-${HOME}/.cache}/igrlab-build"
   fi
   OUTPUT_ROOT="$(canonicalize_external_path "${requested}")"
   WORKTREE_ID="wt-$(printf '%s' "${SCRIPT_DIR}" | sha256sum | cut -c1-16)"
@@ -941,7 +991,7 @@ preflight_temp_root() {
   export TMP="${TEMP_ROOT}"
 
   probe_dir="$(mktemp -d -- \
-    "${TEMP_ROOT}/dg-igr-build-temp-preflight.XXXXXXXX")" || {
+    "${TEMP_ROOT}/igrlab-build-temp-preflight.XXXXXXXX")" || {
     echo "ERROR: selected temporary root cannot create a unique directory: ${TEMP_ROOT}" >&2
     exit 3
   }
@@ -1203,6 +1253,53 @@ spack_identity() {
   printf -v "${prefix_variable}" '%s' "${prefix}"
   printf -v "${hash_variable}" '%s' "${hash}"
   printf -v "${compiler_variable}" '%s' "${compiler}"
+}
+
+# Spack excludes external packages from its view. Query the already-resolved
+# concrete identity rather than guessing from a missing view entry; installed
+# packages must still pass the view-to-prefix checks below.
+spack_artifact_root() {
+  local hash="$1" prefix="$2" view="$3" record
+  [[ "${hash}" =~ ^[a-z0-9]{32}$ ]] || {
+    echo "ERROR: Spack artifact lookup requires an exact concrete hash." >&2
+    exit 3
+  }
+  record="$(SPACK_COLOR=never spack -e "${SPACK_ENV}" find \
+      --format '{hash}|{external}' "/${hash}" 2>/dev/null)" || {
+    echo "ERROR: active Spack external status is unavailable for /${hash}." >&2
+    exit 3
+  }
+  case "${record}" in
+    "${hash}|True") printf '%s' "${prefix}" ;;
+    "${hash}|False") printf '%s' "${view}" ;;
+    *)
+      echo "ERROR: active Spack external status is missing, malformed, or ambiguous for /${hash}." >&2
+      exit 3
+      ;;
+  esac
+}
+
+# Umpire uses the platform's CMake install library directory. Preserve the
+# installed-view/external-prefix selection, then bind its config to the exact
+# concrete package prefix for either supported layout.
+umpire_package_config() {
+  local artifact_root="$1" prefix="$2" candidate config
+  prefix="$(canonical_existing_path "${prefix}")" || return 3
+  for candidate in \
+      "${artifact_root}/lib/cmake/umpire/umpire-config.cmake" \
+      "${artifact_root}/lib64/cmake/umpire/umpire-config.cmake"; do
+    [[ -f "${candidate}" ]] || continue
+    config="$(canonical_existing_path "${candidate}")" || return 3
+    case "${config}" in
+      "${prefix}"/*) printf '%s\n' "${config}"; return 0 ;;
+      *)
+        echo "ERROR: selected GPU Spack Umpire config artifact does not match its concrete Umpire prefix." >&2
+        return 3
+        ;;
+    esac
+  done
+  echo "ERROR: selected GPU Spack artifact root has no usable Umpire package config." >&2
+  return 3
 }
 
 spack_dependency_hash() {
@@ -1568,9 +1665,12 @@ validate_reused_mfem() {
   local spack_view view_mpicc view_mpicxx view_hypre_header
   local view_hypre_library view_library_candidate view_nvcc view_umpire_config
   local view_caliper_config view_metis_header view_metis_library
+  local mpi_artifact_root hypre_artifact_root metis_artifact_root
+  local caliper_artifact_root cuda_artifact_root umpire_artifact_root
   local cuda_metadata_records cuda_metadata_count cuda_metadata
   local metadata_cuda metadata_cuda_root cuda_host_compiler
   local cuda_host_compiler_id cuda_host_compiler_version
+  local metadata_cxx cmake_cache_major cmake_cache_minor cmake_cache_patch
 
   [[ "${stamp_policy}" == "require" || "${stamp_policy}" == "create" ]] || {
     echo "ERROR: internal MFEM identity stamp policy is invalid: ${stamp_policy}" >&2
@@ -1760,6 +1860,10 @@ validate_reused_mfem() {
   if [[ "${MODE}" == "gpu" ]]; then
     mpi_spec="openmpi+cuda"
     hypre_spec="hypre@develop+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
+    if [[ "${SPACK_CUDA_ARCH}" == "80" ]]; then
+      # The SM80 manifest pins a compatible release; identity still binds its DAG hash.
+      hypre_spec="hypre+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
+    fi
   else
     mpi_spec="openmpi~cuda"
     hypre_spec="hypre+mpi~cuda"
@@ -1767,6 +1871,12 @@ validate_reused_mfem() {
   spack_identity "${mpi_spec}" mpi_prefix mpi_hash mpi_compiler
   spack_identity "${hypre_spec}" hypre_prefix hypre_hash hypre_compiler
   spack_identity "${metis_spec}" metis_prefix metis_hash metis_compiler
+  mpi_artifact_root="$(spack_artifact_root \
+    "${mpi_hash}" "${mpi_prefix}" "${spack_view}")" || exit 3
+  hypre_artifact_root="$(spack_artifact_root \
+    "${hypre_hash}" "${hypre_prefix}" "${spack_view}")" || exit 3
+  metis_artifact_root="$(spack_artifact_root \
+    "${metis_hash}" "${metis_prefix}" "${spack_view}")" || exit 3
   hypre_mpi_hash="$(spack_dependency_hash "${hypre_spec}" mpi)"
   [[ "${hypre_mpi_hash}" == "${mpi_hash}" ]] || {
     echo "ERROR: active Spack HYPRE/MPI concretization mismatch: hypre-mpi=${hypre_mpi_hash} mpi=${mpi_hash}" >&2
@@ -1786,6 +1896,8 @@ validate_reused_mfem() {
     caliper_spec="caliper+mpi~cuda"
     spack_identity "${caliper_spec}" \
       caliper_prefix caliper_hash caliper_compiler
+    caliper_artifact_root="$(spack_artifact_root \
+      "${caliper_hash}" "${caliper_prefix}" "${spack_view}")" || exit 3
     [[ "${caliper_compiler}" == "${mpi_compiler}" ]] || {
       echo "ERROR: active Spack Caliper/MPI compiler mismatch: caliper=${caliper_compiler} mpi=${mpi_compiler}" >&2
       exit 3
@@ -1796,14 +1908,14 @@ validate_reused_mfem() {
       exit 3
     }
     view_caliper_config="$(canonical_existing_path \
-      "${spack_view}/share/cmake/caliper/caliper-config.cmake")" || {
-      echo "ERROR: selected Caliper Spack view has no usable package config." >&2
+      "${caliper_artifact_root}/share/cmake/caliper/caliper-config.cmake")" || {
+      echo "ERROR: selected Caliper Spack artifact root has no usable package config." >&2
       exit 3
     }
     case "${view_caliper_config}" in
       "${caliper_prefix}"/*) ;;
       *)
-        echo "ERROR: selected Spack view Caliper config does not match its concrete Caliper prefix." >&2
+        echo "ERROR: selected Spack Caliper artifact config does not match its concrete Caliper prefix." >&2
         exit 3
         ;;
     esac
@@ -1834,61 +1946,63 @@ validate_reused_mfem() {
     echo "ERROR: active Spack MPI C++ wrapper is unavailable." >&2
     exit 3
   }
-  view_mpicc="$(canonical_existing_path "${spack_view}/bin/mpicc")" || {
-    echo "ERROR: selected Spack view has no usable MPI C wrapper." >&2
+  view_mpicc="$(canonical_existing_path "${mpi_artifact_root}/bin/mpicc")" || {
+    echo "ERROR: selected Spack artifact root has no usable MPI C wrapper." >&2
     exit 3
   }
-  view_mpicxx="$(canonical_existing_path "${spack_view}/bin/mpicxx")" || {
-    echo "ERROR: selected Spack view has no usable MPI C++ wrapper." >&2
+  view_mpicxx="$(canonical_existing_path "${mpi_artifact_root}/bin/mpicxx")" || {
+    echo "ERROR: selected Spack artifact root has no usable MPI C++ wrapper." >&2
     exit 3
   }
   [[ "${view_mpicc}" == "${expected_mpicc}" &&
      "${view_mpicxx}" == "${expected_mpicxx}" ]] || {
-    echo "ERROR: selected Spack view MPI wrappers do not match its concrete OpenMPI prefix." >&2
+    echo "ERROR: selected Spack MPI artifacts do not match its concrete OpenMPI prefix." >&2
     exit 3
   }
-  view_hypre_header="$(canonical_existing_path "${spack_view}/include/HYPRE.h")" || {
-    echo "ERROR: selected Spack view has no usable HYPRE header." >&2
+  view_hypre_header="$(canonical_existing_path "${hypre_artifact_root}/include/HYPRE.h")" || {
+    echo "ERROR: selected Spack artifact root has no usable HYPRE header." >&2
     exit 3
   }
   view_hypre_library=""
   for view_library_candidate in \
-      "${spack_view}/lib/libHYPRE.so" \
-      "${spack_view}/lib64/libHYPRE.so"; do
+      "${hypre_artifact_root}/lib/libHYPRE.so" \
+      "${hypre_artifact_root}/lib64/libHYPRE.so" \
+      "${hypre_artifact_root}/lib/libHYPRE.a" \
+      "${hypre_artifact_root}/lib64/libHYPRE.a"; do
     if [[ -e "${view_library_candidate}" ]]; then
       view_hypre_library="$(canonical_existing_path "${view_library_candidate}")"
       break
     fi
   done
   [[ -n "${view_hypre_library}" ]] || {
-    echo "ERROR: selected Spack view has no usable HYPRE library." >&2
+    echo "ERROR: selected Spack artifact root has no usable HYPRE library." >&2
     exit 3
   }
   case "${view_hypre_header}" in
     "${hypre_prefix}"/*) ;;
     *)
-      echo "ERROR: selected Spack view HYPRE header does not match its concrete HYPRE prefix." >&2
+      echo "ERROR: selected Spack HYPRE artifact header does not match its concrete HYPRE prefix." >&2
       exit 3
       ;;
   esac
   case "${view_hypre_library}" in
     "${hypre_prefix}"/*) ;;
     *)
-      echo "ERROR: selected Spack view HYPRE library does not match its concrete HYPRE prefix." >&2
+      echo "ERROR: selected Spack HYPRE artifact library does not match its concrete HYPRE prefix." >&2
       exit 3
       ;;
   esac
   view_metis_header="$(canonical_existing_path \
-    "${spack_view}/include/metis.h")" || {
-    echo "ERROR: selected Spack view has no usable METIS header." >&2
+    "${metis_artifact_root}/include/metis.h")" || {
+    echo "ERROR: selected Spack artifact root has no usable METIS header." >&2
     exit 3
   }
   view_metis_library=""
   for view_library_candidate in \
-      "${spack_view}/lib/libmetis.so" \
-      "${spack_view}/lib64/libmetis.so" \
-      "${spack_view}/lib/libmetis.a" \
-      "${spack_view}/lib64/libmetis.a"; do
+      "${metis_artifact_root}/lib/libmetis.so" \
+      "${metis_artifact_root}/lib64/libmetis.so" \
+      "${metis_artifact_root}/lib/libmetis.a" \
+      "${metis_artifact_root}/lib64/libmetis.a"; do
     if [[ -e "${view_library_candidate}" ]]; then
       view_metis_library="$(canonical_existing_path \
         "${view_library_candidate}")"
@@ -1896,20 +2010,20 @@ validate_reused_mfem() {
     fi
   done
   [[ -n "${view_metis_library}" ]] || {
-    echo "ERROR: selected Spack view has no usable METIS library." >&2
+    echo "ERROR: selected Spack artifact root has no usable METIS library." >&2
     exit 3
   }
   case "${view_metis_header}" in
     "${metis_prefix}"/*) ;;
     *)
-      echo "ERROR: selected Spack view METIS header does not match its concrete METIS prefix." >&2
+      echo "ERROR: selected Spack METIS artifact header does not match its concrete METIS prefix." >&2
       exit 3
       ;;
   esac
   case "${view_metis_library}" in
     "${metis_prefix}"/*) ;;
     *)
-      echo "ERROR: selected Spack view METIS library does not match its concrete METIS prefix." >&2
+      echo "ERROR: selected Spack METIS artifact library does not match its concrete METIS prefix." >&2
       exit 3
       ;;
   esac
@@ -1984,6 +2098,10 @@ validate_reused_mfem() {
     spack_identity "${cuda_spec}" cuda_prefix cuda_hash cuda_compiler
     spack_identity "${umpire_spec}" \
       umpire_prefix umpire_hash umpire_compiler
+    cuda_artifact_root="$(spack_artifact_root \
+      "${cuda_hash}" "${cuda_prefix}" "${spack_view}")" || exit 3
+    umpire_artifact_root="$(spack_artifact_root \
+      "${umpire_hash}" "${umpire_prefix}" "${spack_view}")" || exit 3
     cache_cuda="$(canonical_existing_path "$(cache_value "${cache}" CUDAToolkit_ROOT)")" || {
       echo "ERROR: reused MFEM CUDA toolkit root is missing or moved." >&2
       exit 3
@@ -2005,23 +2123,20 @@ validate_reused_mfem() {
       echo "ERROR: reused MFEM Umpire root mismatch: expected=${umpire_prefix} actual=${cache_umpire}" >&2
       exit 3
     }
-    view_nvcc="$(canonical_existing_path "${spack_view}/bin/nvcc")" || {
-      echo "ERROR: selected GPU Spack view has no usable CUDA compiler." >&2
+    view_nvcc="$(canonical_existing_path "${cuda_artifact_root}/bin/nvcc")" || {
+      echo "ERROR: selected GPU Spack artifact root has no usable CUDA compiler." >&2
       exit 3
     }
-    view_umpire_config="$(canonical_existing_path \
-      "${spack_view}/lib/cmake/umpire/umpire-config.cmake")" || {
-      echo "ERROR: selected GPU Spack view has no usable Umpire package config." >&2
-      exit 3
-    }
+    view_umpire_config="$(umpire_package_config \
+      "${umpire_artifact_root}" "${umpire_prefix}")" || exit 3
     [[ "${view_nvcc}" == "$(canonical_existing_path "${cuda_prefix}/bin/nvcc")" ]] || {
-      echo "ERROR: selected GPU Spack view CUDA compiler does not match its concrete CUDA prefix." >&2
+      echo "ERROR: selected GPU Spack CUDA compiler artifact does not match its concrete CUDA prefix." >&2
       exit 3
     }
     case "${view_umpire_config}" in
       "${umpire_prefix}"/*) ;;
       *)
-        echo "ERROR: selected GPU Spack view Umpire config does not match its concrete Umpire prefix." >&2
+        echo "ERROR: selected GPU Spack Umpire config artifact does not match its concrete Umpire prefix." >&2
         exit 3
         ;;
     esac
@@ -2070,6 +2185,35 @@ validate_reused_mfem() {
       "${cuda_metadata}" CMAKE_CUDA_HOST_COMPILER_ID)"
     cuda_host_compiler_version="$(config_value \
       "${cuda_metadata}" CMAKE_CUDA_HOST_COMPILER_VERSION)"
+    if [[ -z "${cuda_host_compiler_id}" && -z "${cuda_host_compiler_version}" ]]; then
+      # CUDA host ID/version metadata was introduced in CMake 3.31. Older
+      # CMake must bind the same host wrapper to its adjacent, already hashed
+      # C++ metadata; absence alone never waives compiler identity checks.
+      cmake_cache_major="$(cache_value "${cache}" CMAKE_CACHE_MAJOR_VERSION)"
+      cmake_cache_minor="$(cache_value "${cache}" CMAKE_CACHE_MINOR_VERSION)"
+      cmake_cache_patch="$(cache_value "${cache}" CMAKE_CACHE_PATCH_VERSION)"
+      [[ "${cmake_cache_major}" == "3" &&
+         "${cmake_cache_minor}" =~ ^([0-9]|[12][0-9]|30)$ &&
+         "${cmake_cache_patch}" =~ ^[0-9]+$ &&
+         "${cuda_metadata%/*}" == "${build}/CMakeFiles/${cmake_cache_major}.${cmake_cache_minor}.${cmake_cache_patch}" &&
+         "${compiler_metadata}" == "${cuda_metadata%/*}/CMakeCXXCompiler.cmake" ]] || {
+        echo "ERROR: absent CUDA host identity requires matching pre-3.31 CMake/C++ metadata." >&2
+        exit 3
+      }
+      metadata_cxx="$(canonical_existing_path \
+        "$(config_value "${compiler_metadata}" CMAKE_CXX_COMPILER)")" || {
+        echo "ERROR: legacy CUDA host identity has no usable C++ metadata compiler." >&2
+        exit 3
+      }
+      [[ "${metadata_cxx}" == "${cuda_host_compiler}" ]] || {
+        echo "ERROR: legacy CUDA host compiler differs from its C++ metadata compiler." >&2
+        exit 3
+      }
+      cuda_host_compiler_id="$(config_value \
+        "${compiler_metadata}" CMAKE_CXX_COMPILER_ID)"
+      cuda_host_compiler_version="$(config_value \
+        "${compiler_metadata}" CMAKE_CXX_COMPILER_VERSION)"
+    fi
     [[ "${metadata_cuda}" == "${cache_cuda_compiler}" &&
        "${metadata_cuda_root}" == "${cuda_prefix}" &&
        "${cuda_host_compiler}" == "${expected_mpicxx}" &&
@@ -2288,6 +2432,11 @@ if [[ "${MODE}" == "cpu" && "${CUDA_ARCH_WAS_SET}" == "1" ]]; then
   echo "ERROR: --cuda-arch is only valid with --gpu." >&2
   exit 2
 fi
+if [[ "${MODE}" == "gpu" && "${HDG_RUNTIME}" == "ON" &&
+      "${SPACK_CUDA_ARCH}" != "80" && "${SPACK_CUDA_ARCH}" != "120" ]]; then
+  echo "ERROR: --hdg-runtime requires native CUDA architecture 80 or 120." >&2
+  exit 2
+fi
 if [[ "${MODE}" == "gpu" && "${CALIPER}" == "1" ]]; then
   echo "ERROR: --caliper is only valid with --cpu-only." >&2
   exit 2
@@ -2302,19 +2451,19 @@ if [[ "${MODE}" == "gpu" && -n "${CUDA_ARCHS+x}" ]]; then
   exit 2
 fi
 
-CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
+CMAKE_BUILD_TYPE="${IGRLAB_BUILD_TYPE:-${CMAKE_BUILD_TYPE:-Release}}"
 if [[ "${MODE}" == "gpu" ]]; then
   PROFILE="cuda-sm${SPACK_CUDA_ARCH}"
   DEPENDENCY_CUDA_ARCH="${SPACK_CUDA_ARCH}"
-  SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/${PROFILE}}"
+  SPACK_ENV="${IGRLAB_SPACK_ENV:-${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/${PROFILE}}}"
   MFEM_BUILD_NAME="build-gpu-sm${SPACK_CUDA_ARCH}"
   MFEM_INSTALL_NAME="install-gpu-sm${SPACK_CUDA_ARCH}"
   EXPECTED_MFEM_CUDA_ARCHS="${SPACK_CUDA_ARCH}"
   if [[ "${SPACK_CUDA_ARCH}" == "120" ]]; then
     EXPECTED_MFEM_CUDA_ARCHS="80-virtual"
   fi
-  MFEM_CUDA_ARCHS="${MFEM_CUDA_ARCHS:-${EXPECTED_MFEM_CUDA_ARCHS}}"
-  APP_CUDA_ARCHS="${APP_CUDA_ARCHS:-${SPACK_CUDA_ARCH}}"
+  MFEM_CUDA_ARCHS="${IGRLAB_MFEM_CUDA_ARCHS:-${MFEM_CUDA_ARCHS:-${EXPECTED_MFEM_CUDA_ARCHS}}}"
+  APP_CUDA_ARCHS="${IGRLAB_APP_CUDA_ARCHS:-${APP_CUDA_ARCHS:-${SPACK_CUDA_ARCH}}}"
 
   if [[ "${MFEM_CUDA_ARCHS}" != "${EXPECTED_MFEM_CUDA_ARCHS}" ]]; then
     echo "ERROR: CUDA profile ${SPACK_CUDA_ARCH} requires MFEM_CUDA_ARCHS=${EXPECTED_MFEM_CUDA_ARCHS}." >&2
@@ -2332,12 +2481,12 @@ else
   DEPENDENCY_CUDA_ARCH="none"
   if ((CALIPER)); then
     PROFILE="cpu-caliper"
-    SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu-caliper}"
+    SPACK_ENV="${IGRLAB_SPACK_ENV:-${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu-caliper}}"
     MFEM_BUILD_NAME="build-cpu-caliper"
     MFEM_INSTALL_NAME="install-cpu-caliper"
   else
     PROFILE="cpu"
-    SPACK_ENV="${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu}"
+    SPACK_ENV="${IGRLAB_SPACK_ENV:-${DG_IGR_SPACK_ENV:-${SCRIPT_DIR}/spack-envs/cpu}}"
     MFEM_BUILD_NAME="build-cpu"
     MFEM_INSTALL_NAME="install-cpu"
   fi
@@ -2378,7 +2527,7 @@ echo "[build-plan] mode=${MODE} profile=${PROFILE} dependency_cuda_arch=${DEPEND
 echo "[build-plan] output_root=${OUTPUT_ROOT} worktree_id=${WORKTREE_ID} scope=${OUTPUT_SCOPE}"
 echo "[build-plan] env=${SPACK_ENV} app_build=${APP_BUILD} app_install=${APP_INSTALL}"
 echo "[build-plan] temp_root=${TEMP_ROOT} temp_source=${TEMP_ROOT_SOURCE} temp_env=TMPDIR,TEMP,TMP"
-echo "[build-plan] hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT} nvtx_profile=${NVTX_PROFILE}"
+echo "[build-plan] hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT} nvtx_profile=${NVTX_PROFILE} research_tests=${BUILD_RESEARCH_TESTS}"
 echo "[build-plan] mfem_source=${MFEM_SOURCE_ROOT} mfem_build=${MFEM_BUILD} mfem_install=${MFEM_INSTALL} mfem_tuple_state=${MFEM_TUPLE_STATE} mfem_reuse_state=${MFEM_REUSE_STATE}"
 if [[ "${MFEM_FRESH_FROM_SEED}" == "1" ]]; then
   echo "[build-plan] mfem_route=external-fresh-from-seed seed=${MFEM_FRESH_SEED_ROOT} target=${MFEM_FRESH_TARGET_ROOT}"
@@ -2453,8 +2602,10 @@ else
     revalidate_scoped_output_layout
     rm -rf "${MFEM_BUILD}" "${MFEM_INSTALL}"
   fi
-  DG_IGR_BUILD_HELPER_CALLER="${SCRIPT_DIR}/build.sh" \
-    DG_IGR_SPACK_ENV="${SPACK_ENV}" CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+  IGRLAB_BUILD_HELPER_CALLER="${SCRIPT_DIR}/build.sh" \
+    DG_IGR_BUILD_HELPER_CALLER="${SCRIPT_DIR}/build.sh" \
+    IGRLAB_SPACK_ENV="${SPACK_ENV}" DG_IGR_SPACK_ENV="${SPACK_ENV}" \
+    CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
     MFEM_SRC="${MFEM_SOURCE_ROOT}" MFEM_BUILD="${MFEM_BUILD}" \
     MFEM_INSTALL="${MFEM_INSTALL}" \
     "${SCRIPT_DIR}/build_mfem_tpl.sh" "${mfem_args[@]}"
@@ -2490,6 +2641,7 @@ app_cmake_args=(
   -DDG_IGR_ENABLE_HDG_EULER_EXPERIMENT="${HDG_EULER_EXPERIMENT}"
   -DDG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT="${HDG_EULER_DEVICE_EXPERIMENT}"
   -DDG_IGR_ENABLE_HDG_RUNTIME="${HDG_RUNTIME}"
+  -DIGRLAB_BUILD_RESEARCH_TESTS="${BUILD_RESEARCH_TESTS}"
   -DDG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT="${HDG_AUXILIARY_EXPERIMENT}"
   -DDG_IGR_ENABLE_OBSERVABILITY="${APP_OBSERVABILITY}"
   -DDG_IGR_OBSERVABILITY_USE_NVTX="${APP_OBSERVABILITY_NVTX}"
@@ -2503,14 +2655,16 @@ fi
 if [[ "${MODE}" == "gpu" ]]; then
   CUDA_PREFIX="$(spack -e "${SPACK_ENV}" location -i cuda)"
   UMPIRE_PREFIX="$(spack -e "${SPACK_ENV}" location -i umpire)"
+  UMPIRE_CONFIG_PATH="$(umpire_package_config "${UMPIRE_PREFIX}" "${UMPIRE_PREFIX}")" || exit 3
+  UMPIRE_CONFIG_DIR="$(dirname -- "${UMPIRE_CONFIG_PATH}")"
   app_cmake_args+=(
     -DDG_IGR_REQUIRE_MFEM_CUDA=ON
     -DDG_IGR_EXPECT_CUDA_ARCH="${SPACK_CUDA_ARCH}"
-    -DDG_IGR_ACCELERATOR_KERNEL_SOURCES="${DG_IGR_ACCELERATOR_KERNEL_SOURCES:-}"
+    -DDG_IGR_ACCELERATOR_KERNEL_SOURCES="${IGRLAB_ACCELERATOR_KERNEL_SOURCES:-${DG_IGR_ACCELERATOR_KERNEL_SOURCES:-}}"
     -DCMAKE_CUDA_COMPILER="${CUDA_PREFIX}/bin/nvcc"
     -DCMAKE_CUDA_ARCHITECTURES="${APP_CUDA_ARCHS}"
     -DCUDAToolkit_ROOT="${CUDA_PREFIX}"
-    -Dumpire_DIR="${UMPIRE_PREFIX}/lib/cmake/umpire"
+    -Dumpire_DIR="${UMPIRE_CONFIG_DIR}"
   )
 fi
 configure_args=()

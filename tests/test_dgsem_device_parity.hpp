@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 #include "numerics/dgsem/dgsem_basis.hpp"
 #include "numerics/dgsem/dgsem_device.hpp"
 #include "numerics/dgsem/dgsem_reference.hpp"
@@ -15,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -33,6 +36,9 @@ inline double MaxDifference(const mfem::DenseMatrix& left,
   const mfem::real_t* right_data = right.HostRead();
   for (int i = 0; i < left.TotalSize(); ++i)
   {
+    if (!std::isfinite(static_cast<double>(left_data[i])) ||
+        !std::isfinite(static_cast<double>(right_data[i])))
+      return std::numeric_limits<double>::infinity();
     maximum =
       std::max(maximum,
                std::abs(static_cast<double>(left_data[i] - right_data[i])));
@@ -46,6 +52,8 @@ inline double MaxAbs(const mfem::DenseMatrix& values)
   const mfem::real_t* data = values.HostRead();
   for (int i = 0; i < values.TotalSize(); ++i)
   {
+    if (!std::isfinite(static_cast<double>(data[i])))
+      return std::numeric_limits<double>::infinity();
     maximum = std::max(maximum, std::abs(static_cast<double>(data[i])));
   }
   return maximum;
@@ -356,7 +364,7 @@ struct DimensionalKernelErrors
 
 inline std::string RequestedDevice()
 {
-  const char* value = std::getenv("DG_IGR_DGSEM_DEVICE");
+  const char* value = ::igrlab::GetEnv("DG_IGR_DGSEM_DEVICE");
   return value ? std::string(value) : std::string("cpu");
 }
 
@@ -413,7 +421,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
     double& max_local_conservation = errors.local_conservation;
     double& max_reduction_error = errors.reduction;
 
-    for (int order = 1; order <= 4; ++order)
+    for (int order = 1; order <= 7; ++order)
     {
       const auto& basis = mfem::dgsem::GetLGLBasis1D(order);
       const int n1d = basis.n;
@@ -481,6 +489,49 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
           const int j = dof_to_ijk[static_cast<std::size_t>(local)][1];
           lex_to_local[i + n1d * j] = local;
         }
+
+        // H1 and L2 use different local ordering at the same LGL nodes.
+        // Compare the compact gather against actual FE shape evaluation.
+        mfem::H1_FECollection scalar_fec(order, dim,
+                                        mfem::BasisType::GaussLobatto);
+        mfem::FiniteElementSpace scalar_fes(&mesh, &scalar_fec);
+        const auto& scalar_fe = *scalar_fes.GetFE(0);
+        mfem::Array<int> scalar_dofs, nodal_map(dof), dense_map(dof * dof);
+        scalar_fes.GetElementDofs(0, scalar_dofs);
+        mfem::Vector scalar_field(scalar_fes.GetVSize()), shape(dof);
+        for (int j = 0; j < scalar_field.Size(); ++j)
+          scalar_field[j] = std::sin(0.37 * j) + 0.05 * j;
+        mfem::DenseMatrix interpolation(dof, dof), nodal_interpolation;
+        bool complete_node_map = true;
+        for (int row = 0; row < dof; ++row)
+        {
+          const auto& point = fes.GetFE(0)->GetNodes().IntPoint(row);
+          scalar_fe.CalcShape(point, shape);
+          int match = -1;
+          for (int j = 0; j < dof; ++j)
+          {
+            dense_map[row + dof * j] = scalar_dofs[j];
+            interpolation(row, j) = shape[j];
+            const auto& node = scalar_fe.GetNodes().IntPoint(j);
+            if (point.x == node.x && point.y == node.y) match = j;
+          }
+          complete_node_map = complete_node_map && match >= 0;
+          nodal_map[row] = match >= 0 ? scalar_dofs[match] : 0;
+        }
+        ctx.Check(complete_node_map,
+                  "H1/L2 LGL points admit an exact scalar node permutation");
+        mfem::Vector dense_scalar, gathered_scalar;
+        mfem::dgsem::InterpolateElementScalarDevice(dof, dof, dense_map,
+            interpolation, scalar_field, dense_scalar);
+        mfem::dgsem::InterpolateElementScalarDevice(dof, dof, nodal_map,
+            nodal_interpolation, scalar_field, gathered_scalar);
+        dense_scalar.HostRead(); gathered_scalar.HostRead();
+        double interpolation_error = 0.0;
+        for (int row = 0; row < dof; ++row)
+          interpolation_error = std::max(interpolation_error,
+              std::abs(double(dense_scalar[row] - gathered_scalar[row])));
+        ctx.Check(interpolation_error < pointwise_tol,
+                  "Exact scalar node gather matches dense FE interpolation");
       }
 
       mfem::DenseMatrix metrics;
@@ -730,6 +781,295 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
                                                    boundary_flux,
                                                    boundary_speeds,
                                                    constant_surface);
+      if (runtime.cuda && dim == 2)
+      {
+        // Nonconstant metric coefficients and arbitrary nonconstant unique
+        // face fluxes test the fused algebra independently of free-stream
+        // cancellation. Every existing LGL order and native dof map is used.
+        mfem::DenseMatrix fused_metric(dof, 4), unique_flux(boundary_faces, 4);
+        mfem::DenseMatrix compact_mass(dof, 1), reference_flux(dof, 8);
+        metrics.HostRead(); states.HostRead(); sigma.HostRead();
+        boundary_flux.HostRead();
+        for (int row = 0; row < dof; ++row)
+        {
+          compact_mass(row, 0) = 1.0 + 0.03 * row;
+          for (int component = 0; component < 4; ++component)
+            fused_metric(row, component) = metrics(row, component) *
+                (1.0 + 0.005 * (component + 1) * row);
+          for (int direction = 0; direction < 2; ++direction)
+            for (int equation = 0; equation < 4; ++equation)
+            {
+              double value = 0.0;
+              for (int physical = 0; physical < 2; ++physical)
+                value += fused_metric(row, direction * 2 + physical) *
+                    EulerTensorFluxEntry(states, row, 2, equation, physical,
+                                         gamma, sigma(row), rho_floor);
+              reference_flux(row, equation + 4 * direction) = value;
+            }
+        }
+        for (int face = 0; face < boundary_faces; ++face)
+          for (int equation = 0; equation < 4; ++equation)
+            unique_flux(face, equation) = boundary_flux(face, equation) *
+                                         (1.0 + 0.017 * face);
+        for (bool llf : {false, true})
+        {
+          mfem::DenseMatrix expected;
+          HostCentralVolume(2, n1d, lex_to_local, basis.Dsplit,
+                            basis.weights, reference_flux, expected);
+          if (llf)
+          {
+            for (int direction = 0; direction < 2; ++direction)
+              for (int line = 0; line < n1d; ++line)
+                for (int low = 0; low < n1d; ++low)
+                  for (int high = low + 1; high < n1d; ++high)
+                  {
+                    const int left = lex_to_local[direction == 0
+                        ? low + n1d * line : line + n1d * low];
+                    const int right = lex_to_local[direction == 0
+                        ? high + n1d * line : line + n1d * high];
+                    const double mx = 0.5 * (fused_metric(left, 2 * direction) +
+                                             fused_metric(right, 2 * direction));
+                    const double my = 0.5 * (fused_metric(left, 2 * direction + 1) +
+                                             fused_metric(right, 2 * direction + 1));
+                    auto speed = [&](int row)
+                    {
+                      const double rho = states(row, 0);
+                      const double px = states(row, 1), py = states(row, 2);
+                      const double pressure = (gamma - 1.0) *
+                          (states(row, 3) - 0.5 * (px * px + py * py) / rho);
+                      const double q = gamma * pressure + (gamma - 1.0) * sigma(row);
+                      return std::abs((px / rho) * mx + (py / rho) * my) +
+                          std::sqrt(std::abs(q) / rho) * std::sqrt(mx * mx + my * my);
+                    };
+                    const double scale = std::max(speed(left), speed(right));
+                    for (int equation = 0; equation < 4; ++equation)
+                    {
+                      const double pair = -0.5 * scale *
+                          (states(right, equation) - states(left, equation));
+                      expected(left, equation) -= basis.weights(low) *
+                          basis.weights(line) * basis.Dsplit(low, high) * pair;
+                      expected(right, equation) -= basis.weights(high) *
+                          basis.weights(line) * basis.Dsplit(high, low) * pair;
+                    }
+                  }
+          }
+          for (int row = 0; row < dof; ++row)
+            for (int equation = 0; equation < 4; ++equation)
+            {
+              for (int adjacent = boundary_row_offsets[row];
+                   adjacent < boundary_row_offsets[row + 1]; ++adjacent)
+              {
+                const int face = boundary_row_face_ids[adjacent];
+                expected(row, equation) += boundary_row_face_signs[adjacent] *
+                    boundary_weights(face) * unique_flux(face, equation);
+              }
+              expected(row, equation) *= compact_mass(row, 0);
+            }
+          for (bool frozen_speed : {false, true})
+          for (bool tensor_contraction : {false, true})
+          {
+            mfem::DenseMatrix fused;
+            mfem::Vector fused_speeds, ordinary_speeds;
+            mfem::dgsem::ApplyFusedEulerResidualDevice(1, n1d, gamma,
+                rho_floor, llf, frozen_speed, lex_to_local, basis.Dsplit,
+                basis.weights, states, sigma, fused_metric, compact_mass,
+                boundary_weights, boundary_row_offsets, boundary_row_face_ids,
+                boundary_row_face_signs, unique_flux, fused_speeds, fused,
+                tensor_contraction);
+            mfem::dgsem::ComputeEulerNodalCharacteristicSpeedsDevice(2, gamma,
+                rho_floor, states, sigma, ordinary_speeds, frozen_speed);
+            ctx.Check(MaxDifference(fused, expected) < 32.0 * pointwise_tol,
+                      tensor_contraction
+                        ? "Fused FP64 DMMA residual matches central/LLF host algebra"
+                        : "Fused FP64 SIMT residual matches central/LLF host algebra");
+            fused_speeds.HostRead(); ordinary_speeds.HostRead();
+            double speed_error = 0.0;
+            for (int row = 0; row < dof; ++row)
+            {
+              if (!std::isfinite(double(fused_speeds[row])) ||
+                  !std::isfinite(double(ordinary_speeds[row])))
+              {
+                speed_error = std::numeric_limits<double>::infinity();
+                break;
+              }
+              speed_error = std::max(speed_error,
+                  std::abs(double(fused_speeds[row] - ordinary_speeds[row])));
+            }
+            ctx.Check(speed_error < pointwise_tol,
+                      "Fused CUDA residual retains nodal characteristic speeds");
+          }
+        }
+        if (order >= 3)
+        {
+          // Independent interface-by-interface FV oracle on affine metrics.
+          // Arbitrary macroface fluxes also check the conservative mean of
+          // every equation, including energy with the current IGR pressure.
+          mfem::DenseMatrix low(dof, 4), high, blended, modal(n1d);
+          mfem::Vector blend(1), speeds;
+          low = 0.0;
+          states.HostRead(); sigma.HostRead(); metrics.HostRead();
+          for (int direction = 0; direction < 2; ++direction)
+            for (int line = 0; line < n1d; ++line)
+              for (int i = 0; i + 1 < n1d; ++i)
+              {
+                const int left = lex_to_local[direction == 0 ? i + n1d * line : line + n1d * i];
+                const int right = lex_to_local[direction == 0 ? i + 1 + n1d * line : line + n1d * (i + 1)];
+                const double mx = metrics(left, 2 * direction), my = metrics(left, 2 * direction + 1);
+                auto speed = [&](int row)
+                {
+                  const double rho = states(row, 0), px = states(row, 1), py = states(row, 2);
+                  const double pressure = (gamma - 1.0) * (states(row, 3) - .5 * (px * px + py * py) / rho);
+                  return std::abs((px * mx + py * my) / rho) + std::sqrt(
+                      std::abs(gamma * pressure + (gamma - 1.0) * sigma(row)) / rho) * std::hypot(mx, my);
+                };
+                for (int equation = 0; equation < 4; ++equation)
+                {
+                  double flux = 0.0;
+                  for (int physical = 0; physical < 2; ++physical)
+                    flux += .5 * metrics(left, 2 * direction + physical) * (
+                        EulerTensorFluxEntry(states, left, 2, equation, physical, gamma, sigma(left), rho_floor) +
+                        EulerTensorFluxEntry(states, right, 2, equation, physical, gamma, sigma(right), rho_floor));
+                  flux -= .5 * std::max(speed(left), speed(right)) * (states(right, equation) - states(left, equation));
+                  low(left, equation) -= basis.weights[line] * flux;
+                  low(right, equation) += basis.weights[line] * flux;
+                }
+              }
+          for (int row = 0; row < dof; ++row)
+            for (int equation = 0; equation < 4; ++equation)
+            {
+              for (int k = boundary_row_offsets[row]; k < boundary_row_offsets[row + 1]; ++k)
+              {
+                const int face = boundary_row_face_ids[k];
+                low(row, equation) += boundary_row_face_signs[k] * boundary_weights[face] * unique_flux(face, equation);
+              }
+              low(row, equation) *= compact_mass(row, 0);
+            }
+          mfem::dgsem::ApplyFusedEulerResidualDevice(1, n1d, gamma, rho_floor,
+              false, true, lex_to_local, basis.Dsplit, basis.weights, states,
+              sigma, metrics, compact_mass, boundary_weights, boundary_row_offsets,
+              boundary_row_face_ids, boundary_row_face_signs, unique_flux, speeds, high);
+          high.HostRead();
+          for (double factor : {0.0, 0.37, 1.0})
+            for (bool tensor : {false, true})
+            {
+              blend = factor;
+              mfem::dgsem::ApplyFusedEulerResidualDevice(1, n1d, gamma, rho_floor,
+                  false, true, lex_to_local, basis.Dsplit, basis.weights, states,
+                  sigma, metrics, compact_mass, boundary_weights, boundary_row_offsets,
+                  boundary_row_face_ids, boundary_row_face_signs, unique_flux, speeds,
+                  blended, tensor, &blend);
+              blended.HostRead();
+              double error = 0.0, mean_error = 0.0;
+              for (int equation = 0; equation < 4; ++equation)
+              {
+                double difference = 0.0;
+                for (int row = 0; row < dof; ++row)
+                {
+                  error = std::max(error, std::abs(double(blended(row, equation) -
+                      ((1 - factor) * high(row, equation) + factor * low(row, equation)))));
+                  difference += (blended(row, equation) - high(row, equation)) / compact_mass(row, 0);
+                }
+                mean_error = std::max(mean_error, std::abs(difference));
+              }
+              ctx.Check(error < 64 * pointwise_tol, "Subcell blend matches independent FV interface oracle");
+              ctx.Check(mean_error < 64 * pointwise_tol, "Subcell blend preserves all macroelement conservative means");
+            }
+          mfem::DenseMatrix sensor_state(dof, 4);
+          for (int i = 0; i < n1d; ++i)
+          {
+            const double x = 2 * basis.nodes[i] - 1;
+            double previous = 1, current = x;
+            for (int k = 0; k < n1d; ++k)
+            {
+              modal(k, i) = basis.weights[i] * (k == 0 ? 1 : current) * (k == order ? k : 2 * k + 1);
+              if (k)
+              {
+                const double next = ((2 * k + 1) * x * current - k * previous) / (k + 1);
+                previous = current; current = next;
+              }
+            }
+          }
+          for (bool oscillatory : {false, true})
+          {
+            sensor_state.HostWrite();
+            for (int j = 0; j < n1d; ++j)
+              for (int i = 0; i < n1d; ++i)
+              {
+                const int row = lex_to_local[i + n1d * j];
+                sensor_state(row, 0) = oscillatory ? (i % 2 ? 1.2 : .8) : 1.0;
+                sensor_state(row, 1) = sensor_state(row, 2) = 0.0;
+                sensor_state(row, 3) = 2.5;
+              }
+            mfem::dgsem::ComputeModalSubcellBlendDevice(1, n1d, gamma, 1e-4,
+                lex_to_local, modal, sensor_state, blend);
+            blend.HostRead();
+            ctx.Check(oscillatory ? blend[0] == 1.0 : blend[0] == 0.0,
+                      "Modal subcell sensor separates constant and unresolved nodal modes");
+          }
+          // A known Legendre tail with energy fraction exactly the threshold
+          // must land at the middle of the logarithmic blending ramp.
+          sensor_state.HostWrite();
+          for (int j = 0; j < n1d; ++j)
+            for (int i = 0; i < n1d; ++i)
+            {
+              const int row = lex_to_local[i + n1d * j];
+              const double highest = modal(order, i) / (order * basis.weights[i]);
+              sensor_state(row, 0) = 1.0 + std::sqrt((2 * order + 1) * 1e-4 / (1.0 - 1e-4)) * highest;
+              sensor_state(row, 1) = sensor_state(row, 2) = 0.0;
+              sensor_state(row, 3) = 2.5;
+            }
+          mfem::dgsem::ComputeModalSubcellBlendDevice(1, n1d, gamma, 1e-4,
+              lex_to_local, modal, sensor_state, blend);
+          blend.HostRead();
+          ctx.Check(std::abs(blend[0] - .5) < 1e-10,
+                    "Modal blend uses physical Legendre energy normalization");
+        }
+        // LLF floors density inside its pressure calculation, independently
+        // of the raw-density physical flux. Compare this rare branch with the
+        // existing unfused implementation using substantial kinetic energy.
+        mfem::DenseMatrix floored_states(states), floored_flux;
+        floored_states.HostReadWrite();
+        floored_states(0, 0) = 0.5 * rho_floor;
+        floored_states(0, 1) = 0.125 * std::sqrt(rho_floor);
+        floored_states(0, 2) = 0.0625 * std::sqrt(rho_floor);
+        mfem::DenseMatrix ordinary_weak, pair_dissipation;
+        mfem::Vector ordinary_speeds;
+        mfem::dgsem::BuildEulerContravariantFluxDevice(2, gamma, rho_floor,
+            floored_states, sigma, fused_metric, floored_flux, ordinary_speeds);
+        mfem::dgsem::ApplyCentralVolumeDevice(2, n1d, lex_to_local,
+            basis.Dsplit, basis.weights, floored_flux, ordinary_weak);
+        mfem::dgsem::AddEulerLLFVolumeDissipationDevice(2, 1, n1d, gamma,
+            rho_floor, lex_to_local, basis.Dsplit, basis.weights,
+            floored_states, sigma, fused_metric, pair_dissipation,
+            ordinary_weak);
+        ordinary_weak.HostReadWrite();
+        for (int row = 0; row < dof; ++row)
+          for (int equation = 0; equation < 4; ++equation)
+          {
+            for (int adjacent = boundary_row_offsets[row];
+                 adjacent < boundary_row_offsets[row + 1]; ++adjacent)
+            {
+              const int face = boundary_row_face_ids[adjacent];
+              ordinary_weak(row, equation) += boundary_row_face_signs[adjacent] *
+                  boundary_weights(face) * unique_flux(face, equation);
+            }
+            ordinary_weak(row, equation) *= compact_mass(row, 0);
+          }
+        for (bool tensor_contraction : {false, true})
+        {
+          mfem::DenseMatrix fused;
+          mfem::Vector fused_speeds;
+          mfem::dgsem::ApplyFusedEulerResidualDevice(1, n1d, gamma, rho_floor,
+              true, false, lex_to_local, basis.Dsplit, basis.weights,
+              floored_states, sigma, fused_metric, compact_mass,
+              boundary_weights, boundary_row_offsets, boundary_row_face_ids,
+              boundary_row_face_signs, unique_flux, fused_speeds, fused,
+              tensor_contraction);
+          ctx.Check(MaxDifference(fused, ordinary_weak) <
+                        64.0 * pointwise_tol * std::max(1.0, MaxAbs(ordinary_weak)),
+                    "Fused LLF residual preserves floored-density helper algebra");
+        }
+      }
       constant_volume.HostRead();
       constant_surface.HostRead();
       constant_surface += constant_volume;
@@ -785,6 +1125,57 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
             }
             host_strong(element * dof + local, equation) = value;
           }
+        }
+      }
+      max_inverse_mass_error =
+        std::max(max_inverse_mass_error,
+                 MaxDifference(device_strong, host_strong));
+
+      // The collocated mass has an exact compact representation. Exercise
+      // both device branches on identical data before introducing a truly
+      // dense matrix, so a diagonal-only implementation cannot pass parity.
+      mfem::DenseMatrix diagonal_mass(inverse_rows, 1);
+      for (int row = 0; row < inverse_rows; ++row)
+      {
+        diagonal_mass(row, 0) = inverse_mass(row, row % dof);
+      }
+      mfem::DenseMatrix diagonal_strong;
+      mfem::dgsem::ApplyInverseMassDevice(inverse_ne,
+                                          dof,
+                                          diagonal_mass,
+                                          weak,
+                                          diagonal_strong);
+      max_inverse_mass_error =
+        std::max(max_inverse_mass_error,
+                 MaxDifference(diagonal_strong, device_strong));
+
+      inverse_mass.HostReadWrite();
+      for (int row = 0; row < inverse_rows; ++row)
+      {
+        for (int j = 0; j < dof; ++j)
+        {
+          if (j != row % dof)
+          {
+            inverse_mass(row, j) = 0.015 * (1 + row + j) / dof;
+          }
+        }
+      }
+      mfem::dgsem::ApplyInverseMassDevice(inverse_ne,
+                                          dof,
+                                          inverse_mass,
+                                          weak,
+                                          device_strong);
+      for (int row = 0; row < inverse_rows; ++row)
+      {
+        for (int equation = 0; equation < num_equations; ++equation)
+        {
+          double value = 0.0;
+          for (int j = 0; j < dof; ++j)
+          {
+            value += inverse_mass(row, j) *
+                     weak((row / dof) * dof + j, equation);
+          }
+          host_strong(row, equation) = value;
         }
       }
       max_inverse_mass_error =
@@ -1091,7 +1482,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
                 max_constant_residual + max_local_conservation +
                 max_reduction_error);
 
-  const char* output_directory = std::getenv("DG_IGR_DGSEM_DEVICE_OUTPUT_DIR");
+  const char* output_directory = ::igrlab::GetEnv("DG_IGR_DGSEM_DEVICE_OUTPUT_DIR");
   if (output_directory && mfem::Mpi::Root())
   {
     std::error_code error;
@@ -1118,7 +1509,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
         << mfem::MemoryTypeName[static_cast<int>(runtime.device_memory_type)]
         << "\",\n"
         << "  \"dimensions\": [1,2],\n"
-        << "  \"orders\": [1,2,3,4],\n"
+        << "  \"orders\": [1,2,3,4,5,6,7],\n"
         << "  \"direct_kernel_dimensions\": {\"basis\":[1,2],"
            "\"metric\":[2],\"euler_sigma_flux\":[1,2],"
            "\"volume\":[1,2],\"surface\":[1,2],"
@@ -1174,4 +1565,4 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
     mfem::MemoryTypeName[static_cast<int>(runtime.device_memory_type)]);
 }
 
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

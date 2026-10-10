@@ -9,8 +9,10 @@
 #include <iostream>
 #include <memory>
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 1200
-#error "HDG-EXP-SCALAR-DEVICE-01 rank-two requires native SM120"
+#if defined(__CUDA_ARCH__)
+static_assert(__CUDA_ARCH__ ==
+              dg::hdg::runtime::cuda_w8b::sc25::rank2::required_native_architecture,
+              "SC25 rank-two requires the configured native device image");
 #endif
 
 namespace

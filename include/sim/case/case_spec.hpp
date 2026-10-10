@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/case/case_spec.hpp
  * @brief Case specification types for the sim-layer solver.
@@ -64,7 +66,7 @@ template <typename CaseOptions, typename NumericalFlux> struct CaseSpec
   std::string case_name;
   std::string default_mesh_path;
   const char* case_file = nullptr;
-  double gamma = mfem::dg_igr::EulerDefaults::kGamma;
+  double gamma = mfem::igrlab::EulerDefaults::kGamma;
   DGBackend dg_backend_default = DGBackend::DG;
   /// Default regularization when --regularization is omitted.
   bool use_igr = true;

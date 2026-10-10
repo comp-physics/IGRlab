@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include "mfem.hpp"
 #include "utils/config/dg_igr_defaults.hpp"
 
@@ -18,7 +20,7 @@ namespace mfem
 struct BJOptions
 {
   int dim =
-    mfem::dg_igr::EulerDefaults::kDim; ///< Spatial dimension (2D implemented)
+    mfem::igrlab::EulerDefaults::kDim; ///< Spatial dimension (2D implemented)
   int qord_avg =
     0; ///< Quadrature order to compute cell averages (0=>2*order+2)
   int slope_qord = 0;    ///< Quadrature order for slope weights (0=>2*order+2)
@@ -43,10 +45,10 @@ void ApplyBarthJespersenLimiter(mfem::ParFiniteElementSpace& vfes,
  */
 struct CharBJOptions
 {
-  int dim = mfem::dg_igr::EulerDefaults::
+  int dim = mfem::igrlab::EulerDefaults::
     kDim; ///< Spatial dimension (implemented for 2D)
   double gamma =
-    mfem::dg_igr::EulerDefaults::kGamma; ///< Ratio of specific heats
+    mfem::igrlab::EulerDefaults::kGamma; ///< Ratio of specific heats
   int slope_qord = 0;  ///< Quadrature for slope weights (0 => auto 2*order+2)
   bool limit_x = true; ///< limit in x-direction
   bool limit_y = true; ///< limit in y-direction
@@ -67,10 +69,10 @@ void ApplyCharacteristicBJLimiter(mfem::ParFiniteElementSpace& vfes,
  */
 struct FaceBJOptions
 {
-  int dim = mfem::dg_igr::EulerDefaults::
+  int dim = mfem::igrlab::EulerDefaults::
     kDim; ///< Spatial dimension (implemented for 2D)
   double gamma =
-    mfem::dg_igr::EulerDefaults::kGamma; ///< Ratio of specific heats
+    mfem::igrlab::EulerDefaults::kGamma; ///< Ratio of specific heats
   int slope_qord = 0; ///< Quadrature for slope weights (0 => auto 2*order+2)
   double eps_rho = 1e-14; ///< Density floor used in characteristic transforms
 };

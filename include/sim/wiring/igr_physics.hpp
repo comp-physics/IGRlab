@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/wiring/igr_physics.hpp
  * @brief Euler + IGR physics bundle helper.
@@ -23,7 +25,7 @@ template <typename NumericalFlux> struct EulerIGRPhysics
   template <typename BcSetup>
   EulerIGRPhysics(ExampleContext& ctx,
                   double gamma,
-                  dg_igr::IGRSolver& igr,
+                  ::igrlab::IGRSolver& igr,
                   const BoundaryMarkerMap& markers,
                   BcSetup&& bc_setup)
     : flux(ctx.dim,
@@ -53,6 +55,7 @@ template <typename NumericalFlux> struct EulerIGRPhysics
         ? ctx.run_cfg.case_config.rk3_config.p_min
         : mfem::kEulerBoundaryPressureFloor);
     bc_setup(bc, markers);
+    igr.SetNodalSourceSlipBoundaryMarker(bc.SlipWallMarker());
   }
 };
 
@@ -61,7 +64,7 @@ template <typename NumericalFlux, typename BcSetup>
 inline EulerIGRPhysics<NumericalFlux>
 MakeEulerIGRPhysics(ExampleContext& ctx,
                     double gamma,
-                    dg_igr::IGRSolver& igr,
+                    ::igrlab::IGRSolver& igr,
                     const BoundaryMarkerMap& markers,
                     BcSetup&& bc_setup)
 {

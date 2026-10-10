@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "sim/hdg/main_backend.hpp"
 
 #include <algorithm>
@@ -23,7 +24,7 @@
 #include "numerics/hdg/generic/session_contract.hpp"
 #include "numerics/hdg/runtime/app/checkpoint_codec.hpp"
 #include "numerics/hdg/runtime/app/durable_io.hpp"
-#include "numerics/hdg/runtime/cuda/generic_euler.cuh"
+#include "numerics/hdg/runtime/cuda/generic_euler_app.cuh"
 #include "sim/context/case_context.hpp"
 #include "sim/hdg/euler_output_fields.hpp"
 #include "sim/hdg/parallel_vtk.hpp"
@@ -63,7 +64,8 @@ using dg::hdg::runtime::cuda::GenericEulerCudaCheckpointPayloadViewV1;
 using dg::hdg::runtime::cuda::GenericEulerCudaMutableCheckpointPayloadV1;
 using dg::hdg::runtime::cuda::GenericEulerCudaPrepareFailureClass;
 using dg::hdg::runtime::cuda::GenericEulerCudaPreparedStep;
-using dg::hdg::runtime::cuda::GenericEulerHdgCudaSession;
+using GenericEulerHdgCudaSession =
+    dg::hdg::runtime::cuda::GenericEulerHdgCudaAppSession;
 using dg::hdg::runtime::cuda_w8a::CudaIluAccountingKind;
 using dg::hdg::runtime::cuda_w8a::CudaIluAccountingKindName;
 using dg::hdg::runtime::cuda_w8a::CudaIluApplicationIterations;
@@ -616,7 +618,7 @@ FrozenBoundaryPlan FreezeBoundaryPlan(const EulerBoundaryPlan& source)
   return frozen;
 }
 
-dg_igr::IGRAlphaLengthScalePolicy CanonicalAlphaLengthScalePolicy(
+::igrlab::IGRAlphaLengthScalePolicy CanonicalAlphaLengthScalePolicy(
     const HdgEulerMainRequest& request) noexcept
 {
   return request.alpha_length_scale_policy_override.value_or(
@@ -1280,7 +1282,7 @@ std::string Validate(const HdgEulerMainRequest& request,
     return "HDG IGR c_alpha and Euler trace penalty must be finite and positive";
   if (regularization.kind == RegularizationKind::igr &&
       CanonicalAlphaLengthScalePolicy(request) ==
-        dg_igr::IGRAlphaLengthScalePolicy::Local)
+        ::igrlab::IGRAlphaLengthScalePolicy::Local)
     return "HDG IGR does not support the element-local alpha length policy";
   if (!dg::hdg::generic::IsKnownEulerHdgTimeTreatment(time_treatment))
     return "CUDA HDG time treatment is invalid";
@@ -1354,7 +1356,7 @@ std::string Validate(const HdgEulerMainRequest& request,
   if (request.options.ser_ref_levels < 0 || request.options.par_ref_levels < 0)
     return "generic CUDA HDG refinement levels must be nonnegative";
   if (!std::isfinite(request.case_config.gamma) ||
-      request.case_config.gamma != mfem::dg_igr::EulerDefaults::kGamma)
+      request.case_config.gamma != mfem::igrlab::EulerDefaults::kGamma)
     return "generic CUDA HDG requires frozen Euler gamma 1.4";
   return {};
 }
@@ -1791,7 +1793,15 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
             time_treatment)
       : dg::hdg::runtime::StateHash{};
 
-  GenericEulerHdgCudaSession session;
+  // The opaque CUDA facade owns its engine storage. Converge allocation
+  // failure before any rank enters the existing collective Initialize path.
+  std::optional<GenericEulerHdgCudaSession> allocated_session;
+  local_ok = true;
+  try { allocated_session.emplace(); }
+  catch (...) { local_ok = false; }
+  if (!CollectiveAll(request.communicator, local_ok))
+    return Reject(request, "generic CUDA session allocation failed");
+  auto& session = *allocated_session;
   if (session.Initialize(resolved_plan.request).status !=
       HdgEulerSessionStatus::initialized)
     return Reject(request, "generic CUDA session initialization failed");

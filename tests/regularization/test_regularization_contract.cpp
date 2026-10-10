@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "physics/regularization/regularization.hpp"
 
 #include "mfem.hpp"
@@ -9,7 +10,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace regularization = dg_igr::regularization;
+namespace regularization = ::igrlab::regularization;
 
 namespace
 {

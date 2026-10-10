@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "sim/hdg/main_backend.hpp"
 
 #include <mpi.h>
@@ -62,7 +63,7 @@ int main(int argc, char* argv[])
   {
     dg_sim::CaseConfig case_config;
     case_config.case_name = "hdg_collective_projection_rejection";
-    case_config.gamma = mfem::dg_igr::EulerDefaults::kGamma;
+    case_config.gamma = mfem::igrlab::EulerDefaults::kGamma;
     case_config.case_dir = DG_IGR_HDG_REPOSITORY_ROOT;
 
     dg_sim::CommonOptions options;

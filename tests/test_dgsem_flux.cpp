@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "numerics/dgsem/dgsem_basis.hpp"
 #include "numerics/dgsem/dgsem_entropy_flux.hpp"
 #include "numerics/dgsem/dgsem_flux.hpp"
@@ -1292,7 +1293,7 @@ int RunDGSEMFluxTests(TestContext& ctx)
     const double expected_lf = -7.91901e-4;
     const double tol_prod = 1.0e-2;
 
-    if (std::getenv("DG_IGR_PRINT_ENTROPY"))
+    if (::igrlab::GetEnv("DG_IGR_PRINT_ENTROPY"))
     {
       std::cout << "entropy_prod_winters=" << prod_winters << "\n";
       std::cout << "entropy_prod_lf_fd=" << prod_lf_fd << "\n";
@@ -1330,4 +1331,4 @@ int RunDGSEMFluxTests(TestContext& ctx)
   return ctx.failures;
 }
 
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

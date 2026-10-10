@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -15,7 +17,7 @@
 
 namespace mfem
 {
-namespace dg_igr
+namespace igrlab
 {
 
 /**
@@ -230,5 +232,5 @@ inline NonFiniteSummary ScanNonFinite(const mfem::ParGridFunction& gf)
   return ScanNonFinite(static_cast<const mfem::Vector&>(gf), pfes->GetComm());
 }
 
-} // namespace dg_igr
+} // namespace igrlab
 } // namespace mfem

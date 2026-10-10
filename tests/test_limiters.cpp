@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "numerics/limiters/bj.hpp"
 #include "numerics/limiters/krivodonova.hpp"
 #include "numerics/limiters/limiter_pipeline.hpp"
@@ -601,7 +602,7 @@ int RunLimiterTests(TestContext& ctx)
     };
 
     constexpr const char* vtk_env = "DG_IGR_LIMITER_ENFORCE_VTK_POINTS";
-    const char* original_vtk_text = std::getenv(vtk_env);
+    const char* original_vtk_text = ::igrlab::GetEnv(vtk_env);
     const std::optional<std::string> original_vtk = original_vtk_text
       ? std::optional<std::string>(original_vtk_text)
       : std::nullopt;
@@ -1166,4 +1167,4 @@ int RunLimiterTests(TestContext& ctx)
   return ctx.failures;
 }
 
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

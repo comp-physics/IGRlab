@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 /* Included by persistent_smooth_euler.cuh inside dg::hdg::runtime::cuda_w8a. */
 
 namespace detail
@@ -28,7 +29,7 @@ static inline void ReportCudaWarmLifetimeMarker(
 // MFEM CUDA allowed, MFEM debug-device disabled, zero incoming HYPRE error,
 // normal Hypre::Init return, zero error captured immediately after Init, Hypre
 // GPU selection, HYPRE memory query, HYPRE execution query, device memory,
-// device execution, zero post-policy HYPRE error, and an admitted SM120
+// device execution, zero post-policy HYPRE error, and the configured native
 // tensor-core target when that explicit engine is selected.  Materialized
 // MFEM and HYPRE Umpire pools are admitted only after their first real
 // allocations.
@@ -68,8 +69,8 @@ static inline void ReportCudaTensorCoreAdmissionFailure(
 {
   if (rank == 0)
     std::fprintf(stderr,
-                 "CUDA_TENSOR_CORE_UNSUPPORTED required_sm=120 actual_sm=%d\n",
-                 architecture);
+                 "CUDA_TENSOR_CORE_UNSUPPORTED required_sm=%d actual_sm=%d\n",
+                 configured_native_architecture, architecture);
 }
 
 // Private teardown diagnostics.  MFEM's DEVICE_UMPIRE Wrap(..., own=false)
@@ -1465,7 +1466,8 @@ constexpr bool CudaTicketWordsValid(
     const std::uint64_t attempt, const std::uint64_t generation,
     const int device) noexcept
 {
-  return words[0] == 1 && words[1] == 1200 && words[2] == device &&
+  return words[0] == 1 &&
+      words[1] == configured_cuda_architecture && words[2] == device &&
       words[3] == static_cast<int>(phase) &&
       static_cast<std::uint32_t>(words[4]) ==
           static_cast<std::uint32_t>(attempt) &&
@@ -2559,7 +2561,8 @@ public:
           const CudaNativeTraceCooperativeSupport& support) noexcept
       {
         return support.supported && support.device == device_ &&
-            support.compute_major == 12 && support.compute_minor == 0 &&
+            CudaDeviceMatchesNativeArchitecture(
+                support.compute_major, support.compute_minor) &&
             support.threads_per_block == 256 &&
             support.cooperative_blocks > 0;
       };
@@ -4219,8 +4222,8 @@ public:
                               state_slot& workspace) noexcept
   {
     if (rodas3_) return ExecuteRodas3(config, attempt, workspace);
-    ::dg_igr::NVTXRange accepted_step_profile_region(
-        ::dg_igr::observability::RegionId::hdg_accepted_step);
+    ::igrlab::NVTXRange accepted_step_profile_region(
+        ::igrlab::observability::RegionId::hdg_accepted_step);
     CudaIluFactorAttemptEndGuard end_factor_attempt(ilu_factor_state_);
     CudaElementSchwarzAttemptEndGuard end_schwarz_attempt(
         element_schwarz_attempt_state_);
@@ -4294,11 +4297,12 @@ public:
     result.tensor_core.hardware_supported =
         tensor_core_hardware_supported_;
     result.tensor_core.fallback_accounting_complete = true;
-    // This production leaf has no mixed-precision or correction route.  Emit
-    // that fact from the numerical attempt itself so benchmark accounting is
-    // not synthesized by the harness.
-    result.precision_work.all_fp64_policy = true;
-    result.precision_work.accounting_complete = true;
+    const bool reduced_precision_volume =
+        detail::CudaResearchVolumeUsesReducedPrecision(
+            shape_.borrowed_host_inputs &&
+            cuda_engine_ == generic::CudaEngineKind::tensor_core);
+    result.precision_work.all_fp64_policy = !reduced_precision_volume;
+    result.precision_work.accounting_complete = !reduced_precision_volume;
     // The frozen non-borrowed lifecycle has no Euler conservation contract.
     // Borrowed Euler attempts remain fail-closed until their measured balance
     // has passed below.
@@ -4493,8 +4497,8 @@ public:
     };
     const auto launch_condensation = [&]() noexcept
     {
-      ::dg_igr::NVTXRange profile_region(
-          ::dg_igr::observability::RegionId::hdg_condensation);
+      ::igrlab::NVTXRange profile_region(
+          ::igrlab::observability::RegionId::hdg_condensation);
       if (cuda_engine_ == generic::CudaEngineKind::tensor_core &&
           result.tensor_core.condensation_launches ==
               std::numeric_limits<std::uint64_t>::max())
@@ -4573,8 +4577,8 @@ public:
       bool recovery_launched = false;
       if (trace_distributed && Ticket(CudaFailurePhase::recovery))
       {
-        ::dg_igr::NVTXRange profile_region(
-            ::dg_igr::observability::RegionId::hdg_interior_recovery);
+        ::igrlab::NVTXRange profile_region(
+            ::igrlab::observability::RegionId::hdg_interior_recovery);
         recovery_launched = CudaLaunchRecover(view_, shape_, cuda_engine_);
       }
       const bool recovered = recovery_launched && StatusPassed();
@@ -4604,8 +4608,8 @@ public:
         // full-state device-to-device copies.
         bool trial_ready = false;
         {
-          ::dg_igr::NVTXRange profile_region(
-              ::dg_igr::observability::RegionId::hdg_nonlinear_update);
+          ::igrlab::NVTXRange profile_region(
+              ::igrlab::observability::RegionId::hdg_nonlinear_update);
           trial_ready = CudaLaunchTrial(view_, shape_, alpha);
         }
         if (!CollectiveContinue(trial_ready))
@@ -4627,8 +4631,8 @@ public:
         bool admissibility_launched = false;
         if (trace_ready)
         {
-          ::dg_igr::NVTXRange profile_region(
-              ::dg_igr::observability::RegionId::hdg_validation);
+          ::igrlab::NVTXRange profile_region(
+              ::igrlab::observability::RegionId::hdg_validation);
           admissibility_launched = CudaLaunchAdmissibility(view_, shape_);
         }
         const bool trial_admissible =
@@ -4740,8 +4744,8 @@ public:
     bool coherent_recovery_launched = false;
     if (coherent_trace_distributed && Ticket(CudaFailurePhase::recovery))
     {
-      ::dg_igr::NVTXRange profile_region(
-          ::dg_igr::observability::RegionId::hdg_interior_recovery);
+      ::igrlab::NVTXRange profile_region(
+          ::igrlab::observability::RegionId::hdg_interior_recovery);
       coherent_recovery_launched =
           CudaLaunchRecover(view_, shape_, cuda_engine_);
     }
@@ -4807,8 +4811,8 @@ public:
       // not the subsequently projected auxiliary state a^{n+1}.
       bool frozen_conservation_ready = false;
       {
-        ::dg_igr::NVTXRange profile_region(
-            ::dg_igr::observability::RegionId::hdg_validation);
+        ::igrlab::NVTXRange profile_region(
+            ::igrlab::observability::RegionId::hdg_validation);
         frozen_conservation_ready = EulerConservationBalance(
             attempt.dt, result.maximum_conservation_error,
             result.maximum_conservation_relative_error, false);
@@ -4860,8 +4864,8 @@ public:
     }
     bool admissibility_launched = false;
     {
-      ::dg_igr::NVTXRange profile_region(
-          ::dg_igr::observability::RegionId::hdg_validation);
+      ::igrlab::NVTXRange profile_region(
+          ::igrlab::observability::RegionId::hdg_validation);
       admissibility_launched = CudaLaunchAdmissibility(view_, shape_);
     }
     const bool local_admissible = admissibility_launched && StatusPassed();
@@ -4875,8 +4879,8 @@ public:
     {
       bool conservation_ready = false;
       {
-        ::dg_igr::NVTXRange profile_region(
-            ::dg_igr::observability::RegionId::hdg_validation);
+        ::igrlab::NVTXRange profile_region(
+            ::igrlab::observability::RegionId::hdg_validation);
         conservation_ready = EulerConservationBalance(
             attempt.dt, result.maximum_conservation_error,
             result.maximum_conservation_relative_error);
@@ -5643,7 +5647,8 @@ private:
         cudaGetDeviceProperties(&properties, device_) == cudaSuccess;
     if (!CollectiveContinue(uuid_ready)) { return false; }
     const int device_architecture = 10 * properties.major + properties.minor;
-    tensor_core_hardware_supported_ = device_architecture == 120;
+    tensor_core_hardware_supported_ = CudaDeviceMatchesNativeArchitecture(
+        properties.major, properties.minor);
     evidence.tensor_core.selected_engine = cuda_engine_;
     evidence.tensor_core.requested_trace_policy =
         trace_policy_descriptor_.requested_selection;

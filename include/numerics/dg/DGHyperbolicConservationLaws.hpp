@@ -28,6 +28,7 @@
 #include <cstdint>
 #include "mfem.hpp"
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
+#include "numerics/dg/modal_damping.hpp"
 #include "numerics/dgsem/dgsem_production.hpp"
 #include "numerics/riemann/fluxfunctions.hpp"
 #include "physics/igr/igr_flux.hpp"
@@ -139,6 +140,12 @@ public:
   /// Set the numerical flux used for DGSEM surface evaluation (non-owning).
   void SetNumericalFlux(const NumericalFlux* flux);
 
+  /// Optional broken linear transport traces for the bounded p0 CUDA probe.
+  /// Non-owning native-state-layout slopes multiply reference (x-1/2).
+  /// The caller refreshes the vector before each Mult; residual test functions
+  /// and mass matrices continue to belong to the evolved p0 means.
+  void SetP0FaceReferenceXSlopes(const Vector* slopes);
+
   /// Select DGSEM volume flux (central or entropy-conservative).
   void SetDGSEMVolumeFlux(DGSEMVolumeFlux f) { dgsem_vol_flux_ = f; }
 
@@ -245,6 +252,15 @@ public:
   virtual IGRFrozenSigmaTelemetry InspectFrozenSigmaStateForAdmission(
     const Vector& state) const;
 
+  /// Optional strong-form modal relaxation; zero disables it (the default).
+  void SetModalDampingRate(real_t rate);
+  real_t GetModalDampingRate() const
+  {
+    return modal_damping_ ? modal_damping_->GetRate() : 0.0;
+  }
+  /// Isolated-damping forward-Euler bound, in addition to the usual PDE CFL.
+  real_t LimitProposedRKStepSize(real_t proposed_dt) const;
+
   /// Install a time-independent source already projected into this DG space.
   /// An identically zero source is discarded, leaving the RHS hot path free of
   /// source vector work.
@@ -344,6 +360,7 @@ private:
     0.0;            ///< updated during Mult() by the form integrator
   mutable Vector z; ///< scratch for the assembled RHS before M⁻¹
   Vector static_source_; ///< optional projected source in conservative ordering
+  std::unique_ptr<ConservativeModalDamping> modal_damping_;
   bool static_source_requires_rebind_ = false;
   bool invariant_domain_volume_speed_tracking_ = false;
   mutable bool physical_boundary_flux_integral_armed_ = false;
@@ -376,6 +393,7 @@ private:
   // Volume strategy
   VolumeMode vol_mode_ = VolumeMode::WeakDivergence;
   const NumericalFlux* num_flux_ = nullptr;
+  const Vector* p0_face_reference_x_slopes_ = nullptr;
   DGSEMStabilization dgsem_stab_ = DGSEMStabilization::None;
   DGSEMVolumeFlux dgsem_vol_flux_ = DGSEMVolumeFlux::Central;
   DGSEMVolumeDissipation dgsem_vol_diss_ = DGSEMVolumeDissipation::None;

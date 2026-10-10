@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include "mfem.hpp"
@@ -21,8 +23,8 @@ namespace mfem
 struct PressureCoefficient : public mfem::Coefficient
 {
   const mfem::ParGridFunction* U = nullptr;
-  int dim = mfem::dg_igr::EulerDefaults::kDim;
-  double gamma = mfem::dg_igr::EulerDefaults::kGamma;
+  int dim = mfem::igrlab::EulerDefaults::kDim;
+  double gamma = mfem::igrlab::EulerDefaults::kGamma;
   mutable mfem::Vector state; // reuse buffer
 
   PressureCoefficient() = default;

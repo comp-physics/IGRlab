@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/hdg/regularization_scaling.hpp
  * @brief Typed lowering of mesh-independent HDG IGR controls.
@@ -58,7 +60,7 @@ inline bool ValidHdgRegularizationRequest(
  */
 inline ResolvedHdgRegularization ResolveHdgRegularization(
     const mfem::ParMesh& mesh,
-    const dg_igr::IGRAlphaLengthScalePolicy policy,
+    const ::igrlab::IGRAlphaLengthScalePolicy policy,
     const HdgRegularizationRequest& request)
 {
   using dg::hdg::generic::RegularizationKind;
@@ -71,7 +73,7 @@ inline ResolvedHdgRegularization ResolveHdgRegularization(
   {
     return {};
   }
-  if (policy == dg_igr::IGRAlphaLengthScalePolicy::Local)
+  if (policy == ::igrlab::IGRAlphaLengthScalePolicy::Local)
   {
     throw std::invalid_argument(
         "HDG IGR does not support the element-local alpha length policy");

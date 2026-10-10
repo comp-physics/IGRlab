@@ -2,6 +2,8 @@
 // This file is intentionally included after MFEM backend headers.
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
 
 #include <algorithm>
@@ -11,7 +13,7 @@
 #include <string>
 #include <vector>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace dg_face
 {
@@ -2865,4 +2867,4 @@ inline FaceQFProjectInfo ProjectFaceQuadratureValues(
 }
 
 } // namespace dg_face
-} // namespace dg_igr
+} // namespace igrlab

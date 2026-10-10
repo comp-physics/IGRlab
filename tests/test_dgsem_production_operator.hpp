@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/dgsem/dgsem_basis.hpp"
 #include "numerics/dgsem/dgsem_operator.hpp"
@@ -40,7 +42,7 @@ public:
   ScopedEnvironment(const char* name, const char* value)
     : name_(name)
   {
-    if (const char* previous = std::getenv(name))
+    if (const char* previous = ::igrlab::GetEnv(name))
     {
       had_value_ = true;
       previous_ = previous;
@@ -362,7 +364,7 @@ inline void CheckSlipWallFloorDependency(TestContext& ctx,
   mfem::Vector interior(4);
   interior = 0.0;
   interior(0) =
-    0.5 * mfem::dg_igr::LimiterDefaults::kRhoMin;
+    0.5 * mfem::igrlab::LimiterDefaults::kRhoMin;
   interior(3) = 1.0;
   mfem::Vector normal(2);
   normal = 0.0;
@@ -374,7 +376,7 @@ inline void CheckSlipWallFloorDependency(TestContext& ctx,
               "DGSEM floor equality control requires a boundary face.");
   host_wall.Eval(interior, normal, *transformation, exterior);
   ctx.Check(exterior(0) ==
-              mfem::dg_igr::LimiterDefaults::kRhoMin,
+              mfem::igrlab::LimiterDefaults::kRhoMin,
             "DGSEM production rejection floor equals host SlipWall floor");
   ++negative_checks;
 }
@@ -648,7 +650,7 @@ inline void CheckPolicyFingerprintNegatives(TestContext& ctx,
     mfem::Array<int> vdofs;
     vfes.GetElementVDofs(0, vdofs);
     below_floor.HostWrite()[AbsoluteDof(vdofs[0])] =
-      0.5 * mfem::dg_igr::LimiterDefaults::kRhoMin;
+      0.5 * mfem::igrlab::LimiterDefaults::kRhoMin;
     mfem::Vector sentinel(vfes.GetVSize());
     sentinel = 9182.0;
     const auto result = production.AssembleProductionResidual(
@@ -902,7 +904,7 @@ inline void CheckCollectiveRejectionSemantics(TestContext& ctx,
 
 inline void RunDGSEMProductionMultStrictRejectionProbe(TestContext& ctx)
 {
-  if (!std::getenv("DG_IGR_DGSEM_MULT_STRICT_REJECTION_PROBE"))
+  if (!::igrlab::GetEnv("DG_IGR_DGSEM_MULT_STRICT_REJECTION_PROBE"))
   {
     return;
   }
@@ -1974,8 +1976,10 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
     for (int geometry_mode = 0; geometry_mode < geometry_modes;
          ++geometry_mode)
     {
-      for (int order = 1; order <= 4; ++order)
+      for (int order = 1; order <= 7; ++order)
       {
+        ScopedEnvironment high_order_research(
+          "DG_IGR_DGSEM_HIGH_ORDER_RESEARCH", order > 4 ? "1" : nullptr);
         for (int sigma_mode = 0; sigma_mode <= 1; ++sigma_mode)
         {
         std::unique_ptr<mfem::Mesh> serial_mesh;
@@ -3053,11 +3057,11 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
     }
   }
 
-  ctx.Check(executed_cases == 24,
-            "DGSEM production executes affine/sheared p1-p4 1D/2D "
+  ctx.Check(executed_cases == 42,
+            "DGSEM production executes affine/sheared p1-p7 1D/2D "
             "zero/frozen-sigma cases");
-  ctx.Check(production_mult_cases == 24,
-            "DGSEM production Mult executes all focused p1-p4 1D/2D cases");
+  ctx.Check(production_mult_cases == 42,
+            "DGSEM production Mult executes all focused p1-p7 1D/2D cases");
   ctx.Check(production_mult_mapping_cases > 0,
             "DGSEM production Mult executes true/local P and P^T mapping");
   ctx.Check(max_mult_true_residual_difference < residual_tolerance &&
@@ -3150,7 +3154,7 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
                 " negative_checks=" + std::to_string(negative_checks));
 
   const char* output_directory =
-    std::getenv("DG_IGR_DGSEM_PRODUCTION_OUTPUT_DIR");
+    ::igrlab::GetEnv("DG_IGR_DGSEM_PRODUCTION_OUTPUT_DIR");
   if (output_directory && mfem::Mpi::Root())
   {
     std::error_code error;
@@ -3162,7 +3166,7 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
     out << "{\n"
         << "  \"schema\": \"dgsem-production-operator-v2\",\n"
         << "  \"dimensions\": [1, 2],\n"
-        << "  \"orders\": [1, 2, 3, 4],\n"
+        << "  \"orders\": [1, 2, 3, 4, 5, 6, 7],\n"
         << "  \"sigma_modes\": [\"zero\", \"stage-frozen\"],\n"
         << "  \"ranks\": " << world_size << ",\n"
         << "  \"executed_cases\": " << executed_cases << ",\n"
@@ -3236,4 +3240,4 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
 }
 
 } // namespace dgsem_production_test
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 #include "numerics/dgsem/dgsem_reference.hpp"
 #include "physics/euler/conversions.hpp"
 #include "physics/igr/igr_flux.hpp"
@@ -171,7 +173,7 @@ inline void RunDGSEMScalarIGRScopeFixture(TestContext& ctx)
   ctx.Check(scope.find("production wall stability") != std::string::npos,
             "DGSEM scalar-IGR fixture makes no production wall-stability claim");
 
-  const char* output_dir = std::getenv("DG_IGR_DGSEM_REFERENCE_OUTPUT_DIR");
+  const char* output_dir = ::igrlab::GetEnv("DG_IGR_DGSEM_REFERENCE_OUTPUT_DIR");
   if (output_dir && mfem::Mpi::Root())
   {
     std::error_code ec;
@@ -205,4 +207,4 @@ inline void RunDGSEMScalarIGRScopeFixture(TestContext& ctx)
   }
 }
 
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

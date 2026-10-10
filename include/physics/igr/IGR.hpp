@@ -1,4 +1,6 @@
 #pragma once
+
+#include "igrlab/compat.hpp"
 #include "mfem.hpp"
 #include "utils/config/igr_config.hpp"
 #include <algorithm>
@@ -26,8 +28,9 @@
  *  - Legacy: a few preconditioned Richardson smoother sweeps (fast/approx)
  *  - Recommended: MFEM Krylov solve to tolerance (CG/GMRES + preconditioner)
  */
-namespace dg_igr
+namespace igrlab
 {
+namespace igr_internal { struct FaceDensityCUDAProjectionCache; struct NodalVelocitySourceCache; }
 
 enum class IGRSolvePurpose
 {
@@ -76,10 +79,26 @@ public:
   /// Set essential (Dirichlet) boundary attributes for Σ; default is none (natural Neumann).
   void SetDirichletBC(const mfem::Array<int>& ess_bdr);
 
+  /// Physical Euler slip attributes for the optional central-source mirror
+  /// trace. Configure from the same boundary wiring as the Euler operator.
+  /// This does not change scalar closure boundary conditions.
+  void SetNodalSourceSlipBoundaryMarker(const mfem::Array<int>& marker)
+  {
+    nodal_source_slip_marker_ = marker;
+    nodal_source_boundary_ready_ = true;
+  }
+  bool HasNodalSourceBoundaryMarker() const
+  { return nodal_source_boundary_ready_; }
+
   /// Select which gradient backend to use for the Σ RHS.
   void SetGradBackend(GradBackend b) { backend_ = b; }
   void SetIPKind(IPKind k);
   void SetExactDGFaceOperator(bool enabled);
+
+  /// Bounded subcell-bridge control: zero keeps native rules; four floors
+  /// current coefficient/source and closure-face quadrature orders on CUDA.
+  /// Configure before the first state update.
+  void SetSubcellQuadratureMinimumOrder(int order);
 
   // ---- Legacy smoother-sweep knobs (still supported) ----
   void SetSmoother(SmootherType t);
@@ -621,12 +640,18 @@ private:
   std::unique_ptr<mfem::QuadratureFunctionCoefficient> src_qf_coef_;
   std::unique_ptr<mfem::QuadratureFunctionCoefficient> ck_face_qf_coef_;
   mfem::Vector device_qinterp_evec_;
+  std::shared_ptr<igr_internal::NodalVelocitySourceCache> nodal_velocity_source_cache_;
   mfem::Vector device_face_restr_evec_;
+  // Per-solver reference/geometry metadata only; current face coefficients
+  // are recomputed on every invocation. shared_ptr permits this private
+  // implementation type to remain incomplete in the public class header.
+  std::shared_ptr<igr_internal::FaceDensityCUDAProjectionCache> face_density_cuda_cache_;
   // For the local length policy, alpha_ stores C_alpha while this cache stores
   // the physical per-element alpha_e = C_alpha h_e^2.  It is reused until the
   // mesh sequence or C_alpha changes.
   mfem::Vector device_element_alpha_;
   long device_element_alpha_mesh_sequence_ = -1;
+  bool device_element_alpha_positive_validated_ = false;
   double device_element_alpha_c_alpha_ =
     std::numeric_limits<double>::quiet_NaN();
 
@@ -669,8 +694,8 @@ private:
   mfem::ParFiniteElementSpace& sfes_; // scalar Σ space (H1 or DG)
   mfem::ParFiniteElementSpace& vfes_; // vector state U space (vdim=num_eq)
   int dim_, num_eq_;
-  double alpha_ = mfem::dg_igr::IGRDefaults::kAlpha;
-  double rho_floor_ = mfem::dg_igr::IGRDefaults::kRhoFloor;
+  double alpha_ = mfem::igrlab::IGRDefaults::kAlpha;
+  double rho_floor_ = mfem::igrlab::IGRDefaults::kRhoFloor;
   AlphaLengthScalePolicy alpha_length_scale_policy_ =
     AlphaLengthScalePolicy::Average;
   SmootherType smoot_ = SmootherType::L1Jacobi;
@@ -678,14 +703,24 @@ private:
   IPKind ip_kind_ = IPKind::SIPG; //default SPD
 
   // Legacy sweeps
-  int regular_sweeps_ = mfem::dg_igr::IGRDefaults::kRegularSweeps;
-  int warm_start_sweeps_ = mfem::dg_igr::IGRDefaults::kWarmStartSweeps;
+  int regular_sweeps_ = mfem::igrlab::IGRDefaults::kRegularSweeps;
+  int warm_start_sweeps_ = mfem::igrlab::IGRDefaults::kWarmStartSweeps;
   bool first_call_ = true;
 
   // New solve controls
   SolveMode solve_mode_ = SolveMode::Krylov;
   LinearSolverType lin_solver_type_ = LinearSolverType::Auto;
   PrecondType prec_type_ = PrecondType::Auto;
+  // Opt-in CUDA research preconditioner; current closure operators still
+  // rebuild every stage. This cache owns only the first operator's inverse.
+  std::unique_ptr<mfem::Solver> dense_inverse_preconditioner_;
+  std::string dense_inverse_precision_;
+  std::unique_ptr<mfem::Solver> two_level_inverse_preconditioner_;
+  std::string two_level_coarse_mode_;
+  std::unique_ptr<mfem::Solver> screened_patch_preconditioner_;
+  std::string screened_patch_key_;
+  std::unique_ptr<mfem::IterativeSolver> stationary_correction_;
+  int stationary_sweeps_ = 0;
   NonconvergencePolicy nonconvergence_policy_ =
     NonconvergencePolicy::Accept;
   int amg_coarsen_type_ = -1;
@@ -701,10 +736,10 @@ private:
   double current_time_ = std::numeric_limits<double>::quiet_NaN();
   double current_dt_ = std::numeric_limits<double>::quiet_NaN();
 
-  double lin_rtol_ = mfem::dg_igr::IGRDefaults::kLinRtol;
-  double lin_atol_ = mfem::dg_igr::IGRDefaults::kLinAtol;
-  int lin_maxit_ = mfem::dg_igr::IGRDefaults::kLinMaxIters;
-  int lin_print_ = mfem::dg_igr::IGRDefaults::kLinPrint;
+  double lin_rtol_ = mfem::igrlab::IGRDefaults::kLinRtol;
+  double lin_atol_ = mfem::igrlab::IGRDefaults::kLinAtol;
+  int lin_maxit_ = mfem::igrlab::IGRDefaults::kLinMaxIters;
+  int lin_print_ = mfem::igrlab::IGRDefaults::kLinPrint;
 
   // Σ field
   mfem::ParGridFunction
@@ -725,6 +760,8 @@ private:
 
   // Linear system objects
   mfem::Array<int> ess_bdr_;
+  mfem::Array<int> nodal_source_slip_marker_;
+  bool nodal_source_boundary_ready_ = false;
   mfem::Array<int> ess_tdof_list_;
   mfem::OperatorHandle Ah_; // holds the assembled operator (Hypre matrix)
   // Owns the current stage's exact-face operator while Ah_ owns the sum.
@@ -818,6 +855,7 @@ private:
   int direct_identity_system_uses_ = 0;
   std::string last_direct_identity_reason_ = "not-evaluated";
   bool exact_dg_face_operator_ = false;
+  int subcell_quadrature_minimum_order_ = 0;
   bool negative_quadratic_capture_written_ = false;
   bool linear_event_capture_written_ = false;
   bool last_exact_face_requested_ = false;
@@ -831,4 +869,4 @@ private:
   std::string last_precond_name_ = "none";
 };
 
-} // namespace dg_igr
+} // namespace igrlab

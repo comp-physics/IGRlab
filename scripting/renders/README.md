@@ -1,7 +1,7 @@
 # Render Pipeline (Runner-Integrated)
 
 This directory contains the manifest-driven rendering workflow for
-`dg_igr_miniapp`. It consumes `summary.json` from `scripting/runner`, resolves
+`IGRlab`. It consumes `summary.json` from `scripting/runner`, resolves
 VTK datasets, renders with ParaView, optionally crops/trims images, optionally
 generates TikZ wrappers, and can optionally compile a PDF via LaTeX.
 

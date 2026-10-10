@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "numerics/dgsem/dgsem_operator.hpp"
 
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
@@ -627,7 +628,7 @@ real_t DGSEMOperator::AssembleVolume(const Vector& x, Vector& z) const
         (flux_igr && !sigma_nodes.empty()) ? sigma_nodes[local_j] : 0.0;
       const double density_floor =
         flux_igr ? flux_igr->GetVelocityRhoFloor()
-                 : dg_igr::LimiterDefaults::kRhoMin;
+                 : igrlab::LimiterDefaults::kRhoMin;
 
       for (int k = 0; k < op_->dim; ++k)
       {

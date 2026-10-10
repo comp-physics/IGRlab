@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 /**
  * @file sim/solver/solver.hpp
  * @brief Euler-specific solver orchestration for sim-layer cases.
@@ -305,9 +307,10 @@ inline void PublishInitialZhangShuDiagnostics(
 template <typename NumericalFlux, typename BcSetup, typename Func>
 bool WithEulerOperator(ExampleContext& ctx,
                        double gamma,
-                       dg_igr::IGRSolver* igr,
+                       ::igrlab::IGRSolver* igr,
                        mfem::ParGridFunction& sol,
                        const mfem::Vector* static_source,
+                       ::igrlab::igr_internal::CompactSubcellRecovery* subcell_recovery,
                        const BoundaryMarkerMap& markers,
                        BcSetup&& bc_setup,
                        Func&& func)
@@ -324,7 +327,9 @@ bool WithEulerOperator(ExampleContext& ctx,
     {
       physics.op.SetStaticSource(*static_source);
     }
-    mfem::EulerWithIGR wrapped(physics.op, *igr, sol);
+    if (subcell_recovery)
+      physics.op.SetFaceIntegrationRule(mfem::IntRules.Get(mfem::Geometry::SEGMENT, 8));
+    mfem::EulerWithIGR wrapped(physics.op, *igr, sol, subcell_recovery);
     return func(wrapped);
   }
 
@@ -658,7 +663,14 @@ RunEulerCase(ExampleContext& ctx,
   if (run_cfg.opts.vtk_save)
   {
     RegisterEulerVTKFields(*paraview_dc, bundle.field_list);
-    ApplyCaseVTKConfig(*paraview_dc, vtk_cfg, run_cfg.opts.order);
+    int output_order = run_cfg.opts.order;
+    if (::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_SUBCELL_RECOVERY", false))
+    {
+      MFEM_VERIFY(bundle.field_list.sigma && bundle.field_list.sigma->ParFESpace(),
+                  "Subcell output requires its separately represented sigma field.");
+      output_order = std::max({1,output_order,bundle.field_list.sigma->ParFESpace()->GetMaxElementOrder()});
+    }
+    ApplyCaseVTKConfig(*paraview_dc, vtk_cfg, output_order);
     if (!restart_info)
     {
       paraview_dc->SetCycle(0);
@@ -772,8 +784,8 @@ RunEulerCase(ExampleContext& ctx,
       }
       if (is_final)
       {
-        const mfem::dg_igr::NonFiniteSummary final_nonfinite =
-          mfem::dg_igr::ScanNonFinite(bundle.sol);
+        const mfem::igrlab::NonFiniteSummary final_nonfinite =
+          mfem::igrlab::ScanNonFinite(bundle.sol);
         if (final_nonfinite.global_non_finite != 0)
         {
           final_sigma_certification_skipped_nonfinite = true;
@@ -823,7 +835,7 @@ RunEulerCase(ExampleContext& ctx,
   loop_cfg.initial_q_sigma_admitted =
     sigma_provider &&
     ResolveEffectiveIGRSigmaUpdateCadence(run_cfg) ==
-      dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+      ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
   loop_cfg.next_save_time =
     (run_cfg.opts.vtk_save && run_cfg.opts.dt_save > 0.0)
       ? initial_time + run_cfg.opts.dt_save
@@ -916,8 +928,8 @@ RunEulerCase(ExampleContext& ctx,
   if (sigma_provider && !final_sigma_prepared &&
       !final_sigma_certification_skipped_nonfinite)
   {
-    const mfem::dg_igr::NonFiniteSummary final_nonfinite =
-      mfem::dg_igr::ScanNonFinite(bundle.sol);
+    const mfem::igrlab::NonFiniteSummary final_nonfinite =
+      mfem::igrlab::ScanNonFinite(bundle.sol);
     final_state_finite = final_nonfinite.global_non_finite == 0;
   }
   if (sigma_provider && !final_sigma_prepared && !final_state_finite)
@@ -1183,7 +1195,7 @@ RunEulerCase(ExampleContext& ctx,
   const bool report_extrapolated_q_sigma =
     sigma_provider &&
     ResolveEffectiveIGRSigmaUpdateCadence(run_cfg) ==
-      dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+      ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
   const bool report_q_sigma =
     run_cfg.igr_opts.igr_invariant_domain_flux ||
     report_extrapolated_q_sigma;
@@ -1417,6 +1429,20 @@ struct Solver
         return 1;
       }
     }
+    const std::string modal_damping_rejection =
+      ValidateModalDampingSelection(request_resolution.discretization,
+                                    request_resolution.regularization,
+                                    case_cfg,
+                                    cli_opts,
+                                    cli_igr_opts);
+    if (!modal_damping_rejection.empty())
+    {
+      if (mfem::Mpi::Root())
+      {
+        std::cerr << modal_damping_rejection << '\n';
+      }
+      return 1;
+    }
     if (request_resolution.discretization == Discretization::HDG)
     {
       const std::string hdg_cadence_rejection =
@@ -1464,11 +1490,11 @@ struct Solver
       {
         return spec.make_hdg_case_data(case_opts, case_cfg, cli_opts, context);
       };
-      const std::optional<dg_igr::IGRAlphaLengthScalePolicy>
+      const std::optional<::igrlab::IGRAlphaLengthScalePolicy>
         hdg_alpha_length_policy_override =
           cli_igr_opts.alpha_length_policy.empty()
             ? std::nullopt
-            : std::optional<dg_igr::IGRAlphaLengthScalePolicy>{
+            : std::optional<::igrlab::IGRAlphaLengthScalePolicy>{
                 ParseIGRAlphaLengthScalePolicy(
                   cli_igr_opts.alpha_length_policy)};
       const hdg::HdgEulerMainRequest hdg_request{
@@ -1636,6 +1662,59 @@ struct Solver
                   "H1 velocity space was not created.");
     }
 
+    const bool use_subcell_recovery =
+      ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_SUBCELL_RECOVERY", false);
+    const char* quadrature_text = ::igrlab::GetEnv("DG_IGR_IGR_SUBCELL_QUADRATURE_MIN_ORDER");
+    const std::string subcell_quadrature_text = quadrature_text ? quadrature_text : "0";
+    MFEM_VERIFY(subcell_quadrature_text == "0" || subcell_quadrature_text == "4",
+                "DG_IGR_IGR_SUBCELL_QUADRATURE_MIN_ORDER must be 0 (native) or 4.");
+    const int subcell_quadrature_min_order = subcell_quadrature_text == "4" ? 4 : 0;
+    MFEM_VERIFY(subcell_quadrature_min_order == 0 ||
+                  (use_subcell_recovery && mfem::Device::Allows(mfem::Backend::CUDA_MASK)),
+                "A subcell quadrature floor requires the subcell recovery bridge on CUDA.");
+    const char* transport_text = ::igrlab::GetEnv("DG_IGR_IGR_SUBCELL_TRANSPORT");
+    const std::string subcell_transport = transport_text ? transport_text : "first-order";
+    MFEM_VERIFY(subcell_transport == "first-order" || subcell_transport == "muscl",
+                "DG_IGR_IGR_SUBCELL_TRANSPORT must be first-order or muscl.");
+    const bool subcell_muscl = subcell_transport == "muscl";
+    MFEM_VERIFY(!subcell_muscl || (use_subcell_recovery && mfem::Device::Allows(mfem::Backend::CUDA_MASK)),
+                "Subcell MUSCL transport requires the subcell recovery bridge and CUDA packed DG faces.");
+    std::unique_ptr<::igrlab::igr_internal::CompactSubcellRecovery> subcell_recovery;
+    if (use_subcell_recovery)
+    {
+      MFEM_VERIFY(use_igr && run_cfg.dg_backend == DGBackend::DG && run_cfg.opts.order == 0 &&
+                    mesh_communicator_size == 1 && !spec.make_static_source && !spec.after_init &&
+                    run_cfg.opts.restart_vtk.empty(),
+                  "Subcell recovery requires ordinary DG p0 Euler+IGR, rank one, no static source, "
+                  "no post-initialization edit and no restart.");
+      MFEM_VERIFY(ToLowerCopy(run_cfg.igr_opts.space) == "l2" || ToLowerCopy(run_cfg.igr_opts.space) == "dg",
+                  "Subcell recovery currently requires an L2 sigma space.");
+      const char* recovery_text = ::igrlab::GetEnv("DG_IGR_IGR_SUBCELL_RECOVERY_KIND");
+      const std::string recovery_kind = recovery_text ? recovery_text : "compact";
+      MFEM_VERIFY(recovery_kind == "compact" || recovery_kind == "linear",
+                  "DG_IGR_IGR_SUBCELL_RECOVERY_KIND must be compact or linear.");
+      const char* closure_text = ::igrlab::GetEnv("DG_IGR_IGR_SUBCELL_CLOSURE_ORDER");
+      const std::string closure_order_text = closure_text ? closure_text : "2";
+      MFEM_VERIFY(closure_order_text == "1" || closure_order_text == "2",
+                  "DG_IGR_IGR_SUBCELL_CLOSURE_ORDER must be 1 or 2.");
+      const int closure_order = closure_order_text == "1" ? 1 : 2;
+      subcell_recovery = std::make_unique<::igrlab::igr_internal::CompactSubcellRecovery>(
+        ctx.spaces.vfes, run_cfg.case_config.gamma, run_cfg.case_config.rk3_config.rho_min,
+        run_cfg.case_config.rk3_config.p_min, recovery_kind == "linear", subcell_muscl);
+      // The context owns sigma for output/flux consumers; its state-space order
+      // remains p0. Recovery stays p2 for either scalar closure order. The
+      // optional integration floor is bound to IGR after its construction.
+      ctx.spaces.sigma_fes.reset();
+      ctx.spaces.sigma_fec = std::make_unique<mfem::L2_FECollection>(closure_order, 2, mfem::BasisType::GaussLegendre);
+      ctx.spaces.sigma_fes = std::make_unique<mfem::ParFiniteElementSpace>(&ctx.Mesh(),ctx.spaces.sigma_fec.get());
+      mfem::out << "[igr-subcell] event=configuration transport=p0-independent-means"
+                << " transport_reconstruction=" << subcell_transport
+                << " recovery=" << recovery_kind << "-conservative recovery_order=2 closure=L2-p" << closure_order
+                << " closure_quadrature=" << (subcell_quadrature_min_order ? "minimum-order-4" : "native-scalar-order")
+                << " boundary-recovery=constant-nearest-mean"
+                << " implementation=host unlimited=1 face_quadrature_order=8\n";
+    }
+
     const mfem::RK3Config rk3_config = ResolveRK3StepperConfig(run_cfg);
     mfem::RK3SSPWithLimiter rk3 =
       MakeRK3Stepper(ctx.spaces.vfes,
@@ -1644,9 +1723,8 @@ struct Solver
                      run_cfg.time_integrator);
     if (run_cfg.dg_backend == DGBackend::DG)
     {
-      const int dg_face_qord =
-        2 * ctx.spaces.vfes.GetFE(0)->GetOrder() +
-        run_cfg.case_config.int_order_offset;
+      const int dg_face_qord = use_subcell_recovery ? 8 :
+        2 * ctx.spaces.vfes.GetFE(0)->GetOrder() + run_cfg.case_config.int_order_offset;
       rk3.SetLimiterFaceQuadratureOrders({dg_face_qord});
     }
     ConfigureLimiterPipeline(rk3,
@@ -1658,17 +1736,29 @@ struct Solver
     rk3.EnableStageAdmissibilityScan(run_cfg.opts.admissibility_scan);
 
     const double rho_floor = run_cfg.case_config.rk3_config.rho_min;
-    std::unique_ptr<dg_igr::IGRSolver> igr;
+    std::unique_ptr<::igrlab::IGRSolver> igr;
     double vtk_c_alpha = spec.vtk.c_alpha_value;
     if (use_igr)
     {
       const auto alpha_policy = ResolveIGRAlphaLengthScalePolicy(run_cfg);
-      const AlphaInfo alpha_info =
+      AlphaInfo alpha_info =
         ComputeAlphaInfo(ctx.Mesh(),
                          run_cfg.igr_opts.c_alpha_user,
                          alpha_policy);
+      if (subcell_recovery)
+      {
+        MFEM_VERIFY(alpha_policy != ::igrlab::IGRAlphaLengthScalePolicy::Local,
+                    "Subcell bridge requires a fixed physical alpha, not per-subcell h scaling.");
+        const char* alpha_text = ::igrlab::GetEnv("DG_IGR_IGR_SUBCELL_ALPHA");
+        char* end = nullptr;
+        const double fixed_alpha = alpha_text ? std::strtod(alpha_text,&end) : 0.0;
+        MFEM_VERIFY(alpha_text && end && *end == '\0' && std::isfinite(fixed_alpha) && fixed_alpha > 0.0,
+                    "Subcell bridge requires positive physical DG_IGR_IGR_SUBCELL_ALPHA.");
+        alpha_info.alpha = fixed_alpha;
+        alpha_info.c_alpha = fixed_alpha/(alpha_info.dx_eff*alpha_info.dx_eff);
+      }
       const bool element_local_alpha =
-        alpha_info.policy == dg_igr::IGRAlphaLengthScalePolicy::Local;
+        alpha_info.policy == ::igrlab::IGRAlphaLengthScalePolicy::Local;
       const double alpha_effective_min =
         element_local_alpha
           ? alpha_info.c_alpha * alpha_info.hmin * alpha_info.hmin
@@ -1691,12 +1781,20 @@ struct Solver
                   << " alpha_effective_max=" << alpha_effective_max << "\n";
       }
       vtk_c_alpha = std::isnan(vtk_c_alpha) ? alpha_info.c_alpha : vtk_c_alpha;
-      igr = std::make_unique<dg_igr::IGRSolver>(MakeIGRSolver(ctx.spaces,
-                                                              ctx.dim,
-                                                              ctx.num_equations,
-                                                              run_cfg,
-                                                              rho_floor,
-                                                              alpha_info));
+      igr = MakeIGRSolver(ctx.spaces,
+                          ctx.dim,
+                          ctx.num_equations,
+                          run_cfg,
+                          rho_floor,
+                          alpha_info,
+                          subcell_recovery ? &subcell_recovery->StateSpace() : nullptr);
+      if (subcell_recovery)
+      {
+        MFEM_VERIFY(igr->GetSigmaUpdateCadence() == ::igrlab::IGRSigmaUpdateCadence::EveryStage,
+                    "Subcell bridge requires --igr-sigma-cadence every-stage.");
+        igr->SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+        igr->SetSubcellQuadratureMinimumOrder(subcell_quadrature_min_order);
+      }
     }
 
     MFEM_ASSERT(ctx.spaces.fes.GetOrdering() == mfem::Ordering::byNODES, "");
@@ -1731,8 +1829,8 @@ struct Solver
         static_source->UseDevice(
           run_cfg.device_backend == DeviceBackend::CUDA);
         static_source->ProjectCoefficient(*static_source_coefficient);
-        const mfem::dg_igr::NonFiniteSummary source_scan =
-          mfem::dg_igr::ScanNonFinite(*static_source);
+        const mfem::igrlab::NonFiniteSummary source_scan =
+          mfem::igrlab::ScanNonFinite(*static_source);
         MFEM_VERIFY(source_scan.global_non_finite == 0,
                     "Projected CaseSpec static source contains non-finite "
                     "values.");
@@ -1763,7 +1861,12 @@ struct Solver
     std::optional<VTKRestartInfo> restart_info;
     if (run_cfg.opts.restart_vtk.empty())
     {
-      state_bundle.ProjectIC(*ic);
+      if (subcell_recovery)
+      {
+        subcell_recovery->InitializeMeans(*ic,state_bundle.sol);
+        state_bundle.pressure_view.Update();
+      }
+      else state_bundle.ProjectIC(*ic);
     }
     else
     {
@@ -1971,6 +2074,7 @@ struct Solver
       igr.get(),
       state_bundle.sol,
       static_source.get(),
+      subcell_recovery.get(),
       bdr_markers,
       bc_setup,
       [&ctx,

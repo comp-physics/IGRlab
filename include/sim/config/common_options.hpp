@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/config/common_options.hpp
  * @brief Shared CLI options for sim-layer examples.
@@ -57,6 +59,8 @@ struct CommonOptions
     "rusanov"; ///< DGSEM surface flux: "rusanov", "es-winters", or "es-lf-entropy".
   std::string dgsem_entropy_jacobian =
     "fd"; ///< DGSEM ES-LF entropy Jacobian: "fd" or "analytic".
+  mfem::real_t modal_damping_rate = 0.0;
+  ///< Conservative modal RHS damping rate in inverse model time; zero disables.
   mfem::real_t t_final = 1.0; ///< Final time.
   /// Fixed explicit step when cfl is zero; HDG also uses its sign to select
   /// fixed, CFL-controlled, or adaptive stepping.
@@ -109,7 +113,7 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
 {
   // Preserve the historical environment-only control as a default seed.
   // Either typed CLI spelling registered below remains authoritative.
-  opts.zhang_shu_vtk_points = dg_igr::EnvFlagEnabledDefault(
+  opts.zhang_shu_vtk_points = ::igrlab::EnvFlagEnabledDefault(
     "DG_IGR_LIMITER_ENFORCE_VTK_POINTS", opts.zhang_shu_vtk_points);
 
   args.AddOption(&opts.mesh_file, "-m", "--mesh", mesh_help.c_str());
@@ -159,7 +163,7 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.time_integrator,
                  "-ti",
                  "--time-integrator",
-                 "Time integrator: rk3ssp | ssprk104 | "
+                 "Time integrator: rk3ssp | ssprk104 | rk4 | dopri5 | radau-picard5 | "
                  "backward-euler | partitioned-backward-euler | rodas3 "
                  "(discretization support required).");
   args.AddOption(&opts.time_atol,
@@ -210,6 +214,13 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
     "-dej",
     "--dgsem-entropy-jacobian",
     "DGSEM entropy Jacobian: fd | analytic (ES LF entropy variables).");
+  args.AddOption(
+    &opts.modal_damping_rate,
+    "-mdr",
+    "--modal-damping-rate",
+    "Conservative modal RHS damping rate in inverse model time (0 disables; "
+    "80000 is M16). Uses a quartic ramp above 29/39 of the polynomial degree; "
+    "requires affine tensor elements and every-stage closure with active IGR.");
   args.AddOption(&opts.t_final,
                  "-tf",
                  "--t-final",

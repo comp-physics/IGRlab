@@ -1,12 +1,14 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include "physics/regularization/auxiliary_field.hpp"
 #include "physics/regularization/axes.hpp"
 #include "physics/regularization/evaluated_field.hpp"
 
 #include <cstdint>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace regularization
 {
@@ -78,4 +80,4 @@ ValidationResult ValidateConfiguredRegularizationLaunch(
   const RegularizationOperationOutputs& outputs);
 
 } // namespace regularization
-} // namespace dg_igr
+} // namespace igrlab

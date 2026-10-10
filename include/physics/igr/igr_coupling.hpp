@@ -1,8 +1,12 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -10,6 +14,7 @@
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/timestepping/stage_aware_operator.hpp"
 #include "physics/igr/IGR.hpp"
+#include "physics/igr/detail/compact_subcell_recovery.hpp"
 
 /**
  * @file physics/igr/igr_coupling.hpp
@@ -129,15 +134,48 @@ class EulerWithIGR : public TimeDependentOperator,
 {
 public:
   EulerWithIGR(DGHyperbolicConservationLaws& base,
-               ::dg_igr::IGRSolver& igr,
-               ParGridFunction& state)
+               ::igrlab::IGRSolver& igr,
+               ParGridFunction& state,
+               ::igrlab::igr_internal::CompactSubcellRecovery* subcell_recovery = nullptr)
     : TimeDependentOperator(base.Height()),
       base_(base),
       igr_(igr),
-      state_(state)
+      state_(state),
+      subcell_recovery_(subcell_recovery)
   {
     sigma_cadence_ = igr_.GetSigmaUpdateCadence();
+    MFEM_VERIFY(base_.GetModalDampingRate() == 0.0 ||
+                  sigma_cadence_ == ::igrlab::IGRSigmaUpdateCadence::EveryStage,
+                "Modal damping with IGR requires a current stress solve "
+                "at every RK stage.");
+    MFEM_VERIFY(!subcell_recovery_ || sigma_cadence_ == ::igrlab::IGRSigmaUpdateCadence::EveryStage,
+                "Compact subcell recovery requires a current IGR solve at every RK stage.");
     sigma_interval_ = std::max(1, igr_.GetSigmaUpdateInterval());
+    const char* degree = ::igrlab::GetEnv("DG_IGR_IGR_EXTRAPOLATION_DEGREE");
+    if (degree && *degree)
+    {
+      MFEM_VERIFY(std::strcmp(degree, "1") == 0 ||
+                    std::strcmp(degree, "2") == 0 ||
+                    std::strcmp(degree, "3") == 0,
+                  "DG_IGR_IGR_EXTRAPOLATION_DEGREE must be 1, 2, or 3.");
+      extrapolation_degree_ = degree[0] - '0';
+      MFEM_VERIFY(IsExtrapolatedEveryStep(),
+                  "An explicit IGR extrapolation degree requires the "
+                  "extrapolated-every-step cadence.");
+    }
+    if (degree && *degree)
+    {
+      int rank = 0;
+      MPI_Comm_rank(state_.ParFESpace()->GetComm(), &rank);
+      if (rank == 0)
+      {
+        mfem::out << "[igr-sigma-predictor] degree=" << extrapolation_degree_
+                  << " startup="
+                  << (extrapolation_degree_ == 1 ? "initial-hold"
+                                                 : "every-stage")
+                  << " endpoint=current-equation history=accepted-only\n";
+      }
+    }
   }
 
   void SetTime(double t) override
@@ -151,17 +189,18 @@ public:
     return IsExtrapolatedEveryStep();
   }
 
-  /** Bound variable-step growth while two accepted anchors are extrapolated.
+  /** Apply the base stability bound and limit extrapolated-step growth.
    *
    * Save-time clipping and a rapidly changing CFL estimate can otherwise make
    * h_n/h_{n-1} arbitrarily large.  Keeping the ratio at most two bounds every
    * physical-time extrapolation coefficient without changing the
-   * instantaneous endpoint closure. Other cadence policies are untouched.
+   * instantaneous endpoint closure. Other cadences retain the base bound.
    */
   real_t LimitProposedRKStepSize(real_t proposed_dt) const
   {
     MFEM_VERIFY(std::isfinite(proposed_dt) && proposed_dt > 0.0,
                 "IGR step-size limiting requires a finite positive proposal.");
+    proposed_dt = base_.LimitProposedRKStepSize(proposed_dt);
     if (!IsExtrapolatedEveryStep() || !extrapolated_previous_valid_)
     {
       return proposed_dt;
@@ -474,9 +513,9 @@ public:
         igr_.SetRKStageIndex(-1);
         igr_.SetCurrentTime(time);
         igr_.SetCurrentTimeStep(std::numeric_limits<double>::quiet_NaN());
-        igr_.UpdateFromState(state,
+        igr_.UpdateFromState(ClosureInput(state),
                              /*warm_start=*/!cold_start,
-                             ::dg_igr::IGRSolvePurpose::OutputOnly,
+                             ::igrlab::IGRSolvePurpose::OutputOnly,
                              certify_residual);
         result.independent_residual_rel_rhs =
           igr_.GetLastLinearTrueResidualRelRHS();
@@ -521,11 +560,11 @@ public:
       igr_.SetCurrentTime(time);
       igr_.SetCurrentTimeStep(std::numeric_limits<double>::quiet_NaN());
       igr_.UpdateFromState(
-        state,
+        ClosureInput(state),
         /*warm_start=*/!cold_start,
         reusable_for_transport
-          ? ::dg_igr::IGRSolvePurpose::ProductionStage0Prefetch
-          : ::dg_igr::IGRSolvePurpose::OutputOnly,
+          ? ::igrlab::IGRSolvePurpose::ProductionStage0Prefetch
+          : ::igrlab::IGRSolvePurpose::OutputOnly,
         certify_residual);
       result.independent_residual_rel_rhs =
         igr_.GetLastLinearTrueResidualRelRHS();
@@ -663,7 +702,7 @@ public:
   }
   bool SupportsIndependentResidualCertification() const override
   {
-    return igr_.GetSolveMode() == ::dg_igr::IGRSolveMode::Krylov;
+    return igr_.GetSolveMode() == ::igrlab::IGRSolveMode::Krylov;
   }
 
   bool SupportsPhysicalBoundaryFluxIntegral() const override
@@ -790,16 +829,16 @@ public:
       bool update_sigma = false;
       switch (sigma_cadence_)
       {
-      case ::dg_igr::IGRSigmaUpdateCadence::EveryStage:
+      case ::igrlab::IGRSigmaUpdateCadence::EveryStage:
         update_sigma = true;
         break;
-      case ::dg_igr::IGRSigmaUpdateCadence::EveryStep:
+      case ::igrlab::IGRSigmaUpdateCadence::EveryStep:
         update_sigma = !have_rk_step
                          ? true
                          : (!sigma_initialized_ ||
                             (last_sigma_step_ != rk_step_));
         break;
-      case ::dg_igr::IGRSigmaUpdateCadence::EveryNSteps:
+      case ::igrlab::IGRSigmaUpdateCadence::EveryNSteps:
         if (!have_rk_step)
         {
           // Outside stage-aware steppers, prefer safety over cadence fidelity:
@@ -819,7 +858,7 @@ public:
           update_sigma = false;
         }
         break;
-      case ::dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep:
+      case ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep:
         MFEM_ABORT("Extrapolated IGR cadence reached the legacy update path.");
         break;
       }
@@ -841,7 +880,7 @@ public:
           AbandonPendingStage0Prefetch();
         }
         int igr_solve_stage = rk_stage_;
-        if (sigma_cadence_ != ::dg_igr::IGRSigmaUpdateCadence::EveryStage)
+        if (sigma_cadence_ != ::igrlab::IGRSigmaUpdateCadence::EveryStage)
         {
           // Stage-based rtol loosening is only meaningful when a later stage
           // solve will occur in the same RK step.
@@ -867,7 +906,7 @@ public:
         {
           igr_.SetRKStageIndex(-1);
         }
-        igr_.UpdateFromState(stage_state, /*warm_start=*/true);
+        igr_.UpdateFromState(ClosureInput(stage_state), /*warm_start=*/true);
 
         // Make sigma available on face neighbors across MPI subdomains.
         if (HasMultipleOwningRanks())
@@ -894,6 +933,9 @@ public:
         last_sigma_step_ = rk_step_;
       }
     }
+
+    if (subcell_recovery_ && subcell_recovery_->UsesMUSCLTransport())
+      base_.SetP0FaceReferenceXSlopes(&subcell_recovery_->RebuildTransportSlopes(U));
 
     // Delay forwarding the arm until immediately before base_.Mult. If an IGR
     // closure fails first, no armed request can leak into a later CFL probe.
@@ -927,10 +969,15 @@ public:
   }
 
 private:
+  const ParGridFunction& ClosureInput(const ParGridFunction& state) const
+  {
+    return subcell_recovery_ ? subcell_recovery_->Rebuild(state) : state;
+  }
+
   bool IsExtrapolatedEveryStep() const
   {
     return sigma_cadence_ ==
-           ::dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+           ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
   }
 
   bool HasMultipleOwningRanks() const
@@ -1029,6 +1076,7 @@ private:
     if (reset_history)
     {
       extrapolated_previous_valid_ = false;
+      extrapolated_older_count_ = 0;
       extrapolated_previous_dt_ =
         std::numeric_limits<real_t>::quiet_NaN();
     }
@@ -1054,7 +1102,7 @@ private:
                               int step,
                               real_t time,
                               bool warm_start,
-                              ::dg_igr::IGRSolvePurpose purpose,
+                              ::igrlab::IGRSolvePurpose purpose,
                               bool /*certify_residual*/) const
   {
     MFEM_VERIFY(!igr_.HasPendingStage0PrefetchAccounting(),
@@ -1068,10 +1116,10 @@ private:
     // endpoint projection cannot repair algebraic error already injected by
     // an under-solved earlier anchor, so the extrapolated route always gates
     // these solves with an independently recomputed FP64 residual.
-    MFEM_VERIFY(igr_.GetSolveMode() == ::dg_igr::IGRSolveMode::Krylov,
+    MFEM_VERIFY(igr_.GetSolveMode() == ::igrlab::IGRSolveMode::Krylov,
                 "Extrapolated IGR exact anchors require a Krylov solve for "
                 "independent FP64 residual certification.");
-    igr_.UpdateFromState(state,
+    igr_.UpdateFromState(ClosureInput(state),
                          warm_start,
                          purpose,
                          /*certify_residual=*/true);
@@ -1207,8 +1255,8 @@ private:
         time,
         /*warm_start=*/!cold_start,
         reusable_stage0
-          ? ::dg_igr::IGRSolvePurpose::ProductionStage0Prefetch
-          : ::dg_igr::IGRSolvePurpose::OutputOnly,
+          ? ::igrlab::IGRSolvePurpose::ProductionStage0Prefetch
+          : ::igrlab::IGRSolvePurpose::OutputOnly,
         certify_residual);
       result.solved = true;
       result.independent_residual_rel_rhs =
@@ -1287,7 +1335,7 @@ private:
                            /*step=*/-1,
                            base_.GetTime(),
                            /*warm_start=*/extrapolated_current_valid_,
-                           ::dg_igr::IGRSolvePurpose::ProductionStage,
+                           ::igrlab::IGRSolvePurpose::ProductionStage,
                            /*certify_residual=*/true);
     if (!restore_accepted_anchor)
     {
@@ -1356,7 +1404,7 @@ private:
                                rk_step_,
                                rk_step_time_,
                                /*warm_start=*/sigma_initialized_,
-                               ::dg_igr::IGRSolvePurpose::ProductionStage,
+                               ::igrlab::IGRSolvePurpose::ProductionStage,
                                /*certify_residual=*/false);
         extrapolated_attempt_anchor_ = igr_.GetSigma();
         extrapolated_attempt_history_valid_ = false;
@@ -1373,6 +1421,47 @@ private:
         extrapolated_attempt_delta_ = 0.0;
       }
       extrapolated_attempt_ready_ = true;
+    }
+
+    if (extrapolation_degree_ > 1)
+    {
+      // A lower-order startup hold would leave an O(h^2) state error even
+      // after enough high-order history exists. Solve every startup RHS at
+      // its current state until degree+1 accepted anchors are available.
+      if (!HasHighOrderExtrapolationHistory())
+      {
+        if (rk_stage_ == 0)
+        {
+          igr_.GetSigma() = extrapolated_attempt_anchor_;
+        }
+        else
+        {
+          ParGridFunction state_view(state_.ParFESpace(),
+                                     const_cast<Vector&>(state), 0);
+          SolveExtrapolatedExact(state_view,
+                                 rk_state_generation_,
+                                 rk_step_,
+                                 rk_stage_time_,
+                                 /*warm_start=*/true,
+                                 ::igrlab::IGRSolvePurpose::ProductionStage,
+                                 /*certify_residual=*/true);
+        }
+      }
+      else
+      {
+        PredictHighOrderExtrapolatedSigma(rk_stage_time_ - rk_step_time_,
+                                          igr_.GetSigma());
+        ++sigma_extrapolated_stage_count_;
+      }
+      MFEM_VERIFY(igr_.GetSigma().CheckFinite() == 0,
+                  "High-order IGR stage prediction is non-finite.");
+      if (HasMultipleOwningRanks())
+      {
+        igr_.GetSigma().ExchangeFaceNbrData();
+      }
+      sigma_initialized_ = true;
+      sigma_state_generation_ = rk_state_generation_;
+      return;
     }
 
     // Linear extrapolation from two exact accepted endpoints is second-order
@@ -1409,7 +1498,12 @@ private:
                 "Extrapolated IGR endpoint has an invalid accepted timestep.");
 
     extrapolated_endpoint_prediction_ = extrapolated_attempt_anchor_;
-    if (extrapolated_attempt_history_valid_)
+    if (extrapolation_degree_ > 1 && HasHighOrderExtrapolationHistory())
+    {
+      PredictHighOrderExtrapolatedSigma(rk_step_dt_,
+                                        extrapolated_endpoint_prediction_);
+    }
+    else if (extrapolated_attempt_history_valid_)
     {
       const real_t theta = rk_step_dt_ / extrapolated_previous_dt_;
       MFEM_VERIFY(std::isfinite(theta),
@@ -1431,7 +1525,7 @@ private:
                            rk_step_,
                            time,
                            /*warm_start=*/true,
-                           ::dg_igr::IGRSolvePurpose::ProductionStage,
+                           ::igrlab::IGRSolvePurpose::ProductionStage,
                            /*certify_residual=*/false);
     ++sigma_endpoint_solve_count_;
 
@@ -1473,6 +1567,28 @@ private:
       std::max(maximum_local_relative_sigma_endpoint_prediction_defect_,
                relative_defect);
 
+    if (extrapolation_degree_ > 1)
+    {
+      // No history mutation occurs before the current endpoint solve and
+      // admission succeed. A rejected attempt therefore cannot enter a later
+      // predictor. An invalidated starting anchor discards older history.
+      if (!extrapolated_attempt_history_valid_)
+      {
+        extrapolated_older_count_ = 0;
+      }
+      else
+      {
+        if (extrapolation_degree_ == 3 && extrapolated_older_count_ > 0)
+        {
+          extrapolated_older_sigma_[1] = extrapolated_older_sigma_[0];
+          extrapolated_older_dt_[1] = extrapolated_older_dt_[0];
+        }
+        extrapolated_older_sigma_[0] = extrapolated_previous_sigma_;
+        extrapolated_older_dt_[0] = extrapolated_previous_dt_;
+        extrapolated_older_count_ =
+          std::min(extrapolation_degree_ - 1, extrapolated_older_count_ + 1);
+      }
+    }
     extrapolated_previous_sigma_ = extrapolated_attempt_anchor_;
     extrapolated_previous_valid_ = true;
     extrapolated_previous_dt_ = rk_step_dt_;
@@ -1481,6 +1597,53 @@ private:
     last_sigma_step_ = rk_step_;
     extrapolated_attempt_ready_ = false;
     extrapolated_attempt_anchor_was_solved_ = false;
+  }
+
+  bool HasHighOrderExtrapolationHistory() const
+  {
+    return extrapolated_attempt_history_valid_ &&
+           extrapolated_older_count_ >= extrapolation_degree_ - 1;
+  }
+
+  void PredictHighOrderExtrapolatedSigma(real_t offset,
+                                         Vector& prediction) const
+  {
+    MFEM_VERIFY(extrapolation_degree_ >= 2 &&
+                  extrapolation_degree_ <= 3 &&
+                  HasHighOrderExtrapolationHistory(),
+                "High-order IGR prediction is missing accepted history.");
+    // Translate accepted times to the current anchor and scale by the most
+    // recent accepted dt. This is nonuniform-time Lagrange interpolation,
+    // without subtracting nearby absolute simulation times.
+    const real_t scale = extrapolated_previous_dt_;
+    const real_t coordinate = offset / scale;
+    std::array<real_t, 4> nodes = {{0.0, -1.0, 0.0, 0.0}};
+    std::array<const Vector*, 4> values = {{
+      &extrapolated_attempt_anchor_, &extrapolated_previous_sigma_,
+      &extrapolated_older_sigma_[0], &extrapolated_older_sigma_[1]}};
+    for (int i = 2; i <= extrapolation_degree_; ++i)
+    {
+      const real_t interval = extrapolated_older_dt_[i - 2];
+      MFEM_VERIFY(std::isfinite(interval) && interval > 0.0,
+                  "High-order IGR history has an invalid accepted interval.");
+      nodes[i] = nodes[i - 1] - interval / scale;
+    }
+    prediction.SetSize(extrapolated_attempt_anchor_.Size());
+    prediction = 0.0;
+    for (int i = 0; i <= extrapolation_degree_; ++i)
+    {
+      real_t weight = 1.0;
+      for (int j = 0; j <= extrapolation_degree_; ++j)
+      {
+        if (j != i)
+        {
+          weight *= (coordinate - nodes[j]) / (nodes[i] - nodes[j]);
+        }
+      }
+      MFEM_VERIFY(std::isfinite(weight),
+                  "High-order IGR extrapolation weight is non-finite.");
+      prediction.Add(weight, *values[i]);
+    }
   }
 
   void AbortExtrapolatedRKStep(const Vector&,
@@ -1571,13 +1734,13 @@ private:
   {
     switch (sigma_cadence_)
     {
-    case ::dg_igr::IGRSigmaUpdateCadence::EveryStage:
+    case ::igrlab::IGRSigmaUpdateCadence::EveryStage:
       return true;
-    case ::dg_igr::IGRSigmaUpdateCadence::EveryStep:
+    case ::igrlab::IGRSigmaUpdateCadence::EveryStep:
       return !sigma_initialized || last_sigma_step != step;
-    case ::dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep:
+    case ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep:
       return !sigma_initialized;
-    case ::dg_igr::IGRSigmaUpdateCadence::EveryNSteps:
+    case ::igrlab::IGRSigmaUpdateCadence::EveryNSteps:
       return !sigma_initialized ||
              (step % sigma_interval_ == 0 && last_sigma_step != step);
     }
@@ -1719,11 +1882,13 @@ private:
   }
 
   DGHyperbolicConservationLaws& base_;
-  ::dg_igr::IGRSolver& igr_;
+  ::igrlab::IGRSolver& igr_;
   ParGridFunction& state_; // view of current state (vdim=num_eq)
-  ::dg_igr::IGRSigmaUpdateCadence sigma_cadence_ =
-    ::dg_igr::IGRSigmaUpdateCadence::EveryStage;
+  ::igrlab::igr_internal::CompactSubcellRecovery* subcell_recovery_ = nullptr;
+  ::igrlab::IGRSigmaUpdateCadence sigma_cadence_ =
+    ::igrlab::IGRSigmaUpdateCadence::EveryStage;
   int sigma_interval_ = 1;
+  int extrapolation_degree_ = 1;
   mutable int rk_step_ = -1;
   mutable int rk_stage_ = -1;
   mutable int rk_stage_count_ = -1;
@@ -1744,6 +1909,9 @@ private:
   mutable long long sigma_prefetch_invalidation_count_ = 0;
   mutable Vector extrapolated_current_sigma_;
   mutable Vector extrapolated_previous_sigma_;
+  mutable std::array<Vector, 2> extrapolated_older_sigma_;
+  mutable std::array<real_t, 2> extrapolated_older_dt_ = {{0.0, 0.0}};
+  mutable int extrapolated_older_count_ = 0;
   mutable Vector extrapolated_attempt_anchor_;
   mutable Vector extrapolated_attempt_delta_;
   mutable Vector extrapolated_endpoint_prediction_;

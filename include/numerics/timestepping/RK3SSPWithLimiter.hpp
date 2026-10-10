@@ -1,4 +1,6 @@
 #pragma once
+
+#include "igrlab/compat.hpp"
 #include "mfem.hpp"
 #include "utils/config/timestepping_config.hpp"
 #include "numerics/limiters/limiters.hpp" // brings limiter option types
@@ -37,7 +39,7 @@ namespace mfem
 
 class PhysicalBoundaryFluxIntegralProvider;
 
-/// Explicit SSPRK(3,3) or SSPRK(10,4) with stage callbacks.
+/// Explicit RK with stage callbacks; research methods have SSP coefficient zero.
 ///
 /// The historical class name is retained so existing limiter and application
 /// plumbing remains source-compatible. SSPRK(3,3) remains the default method.
@@ -286,19 +288,19 @@ private:
   SSPRKMethod method_ = SSPRKMethod::SSPRK33;
 
   // Euler / helper-limiter params (only used by helper callbacks)
-  int dim_ = dg_igr::EulerDefaults::kDim;
-  double gamma_ = dg_igr::EulerDefaults::kGamma;
-  double rho_min_ = dg_igr::LimiterDefaults::kRhoMin;
-  double p_min_ = dg_igr::LimiterDefaults::kPMin;
-  int quad_order_ = dg_igr::LimiterDefaults::kQuadOrder; // 0 => auto: 2*order+2
-  int p_bisect_iters_ = dg_igr::LimiterDefaults::kBisectIters;
+  int dim_ = igrlab::EulerDefaults::kDim;
+  double gamma_ = igrlab::EulerDefaults::kGamma;
+  double rho_min_ = igrlab::LimiterDefaults::kRhoMin;
+  double p_min_ = igrlab::LimiterDefaults::kPMin;
+  int quad_order_ = igrlab::LimiterDefaults::kQuadOrder; // 0 => auto: 2*order+2
+  int p_bisect_iters_ = igrlab::LimiterDefaults::kBisectIters;
   std::vector<int> face_quad_orders_;
   ParGridFunction* zhang_shu_active_field_ = nullptr;
   ParGridFunction* zhang_shu_theta_rho_field_ = nullptr;
   ParGridFunction* zhang_shu_theta_p_field_ = nullptr;
   ZhangShuLimiterElementDiagnostics zhang_shu_diagnostics_;
   bool zhang_shu_diagnostics_pending_ = false;
-  bool limit_initial_ = dg_igr::RK3Defaults::kLimitInitial;
+  bool limit_initial_ = igrlab::RK3Defaults::kLimitInitial;
 
   // Internal callbacks optionally report whether they changed the
   // conservative state.  Public legacy callbacks remain conservative: when a
@@ -314,7 +316,7 @@ private:
   // Optional limiter scheduling
   long step_count_ = 0; ///< number of completed Step() calls
   long max_limiter_steps_ =
-    dg_igr::RK3Defaults::kLimiterSteps; ///< <0 => optional limiters always on
+    igrlab::RK3Defaults::kLimiterSteps; ///< <0 => optional limiters always on
   bool nan_scan_stages_ = false;
   bool stage_nan_detected_ = false;
   bool admissibility_scan_stages_ = false;
@@ -333,6 +335,7 @@ private:
 
   // Work vectors
   Vector y_, k_;
+  std::array<Vector, 6> research_stage_work_;
   Vector attempted_physical_boundary_flux_integral_;
   Vector attempted_physical_boundary_flux_absolute_integral_;
   Vector cumulative_physical_boundary_flux_integral_;

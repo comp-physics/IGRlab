@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "sim/io/vtk_restart.hpp"
 
 #include <algorithm>
@@ -877,9 +878,9 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
     if (igr_enabled)
     {
       const auto cadence = ResolveEffectiveIGRSigmaUpdateCadence(run_cfg);
-      if (cadence != dg_igr::IGRSigmaUpdateCadence::EveryStage &&
+      if (cadence != ::igrlab::IGRSigmaUpdateCadence::EveryStage &&
           cadence !=
-            dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep)
+            ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep)
       {
         Fail("production VTK restart supports only every-stage or "
              "extrapolated-every-step IGR sigma updates");
@@ -1011,8 +1012,8 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
                 comm);
 
   MFEM_VERIFY(candidate, "collective VTK restart candidate is unavailable");
-  const mfem::dg_igr::NonFiniteSummary finite =
-    mfem::dg_igr::ScanNonFinite(*candidate);
+  const mfem::igrlab::NonFiniteSummary finite =
+    mfem::igrlab::ScanNonFinite(*candidate);
   if (finite.global_non_finite != 0)
   {
     MFEM_ABORT("VTK restart reconstructed a non-finite conservative state.");
@@ -1027,7 +1028,7 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
   const double pressure_roundoff =
     64.0 * std::numeric_limits<double>::epsilon() *
     std::max(1.0, std::abs(pressure_floor));
-  auto admissibility = mfem::dg_igr::ScanEulerAdmissibility(
+  auto admissibility = mfem::igrlab::ScanEulerAdmissibility(
     ctx.spaces.vfes,
     *candidate,
     ctx.dim,
@@ -1036,8 +1037,8 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
     pressure_floor - pressure_roundoff,
     run_cfg.case_config.rk3_config.quad_order,
     {face_qord},
-    mfem::dg_igr::EulerAdmissibilityPointSet::Limiter);
-  const auto nodal_admissibility = mfem::dg_igr::ScanEulerAdmissibility(
+    mfem::igrlab::EulerAdmissibilityPointSet::Limiter);
+  const auto nodal_admissibility = mfem::igrlab::ScanEulerAdmissibility(
     ctx.spaces.vfes,
     *candidate,
     ctx.dim,
@@ -1046,7 +1047,7 @@ VTKRestartInfo LoadEulerVTKRestart(const VTKRestartRequest& request,
     pressure_floor - pressure_roundoff,
     run_cfg.case_config.rk3_config.quad_order,
     {face_qord},
-    mfem::dg_igr::EulerAdmissibilityPointSet::Dof);
+    mfem::igrlab::EulerAdmissibilityPointSet::Dof);
   admissibility.global_min_rho =
     std::min(admissibility.global_min_rho,
              nodal_admissibility.global_min_rho);
@@ -1596,7 +1597,7 @@ std::string IGRGradName(const RunConfig& run_cfg)
 std::string SigmaRestartPolicy(const RunConfig& run_cfg)
 {
   return ResolveEffectiveIGRSigmaUpdateCadence(run_cfg) ==
-           dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep
+           ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep
            ? "cold-recompute-and-reset-extrapolation-history"
            : "cold-recompute-from-conservative-state";
 }
@@ -1682,7 +1683,7 @@ void ValidateManifest(const Manifest& manifest,
   }
   if (manifest.schema < transport_manifest_schema && igr_enabled &&
       active_sigma_cadence ==
-        dg_igr::IGRSigmaUpdateCadence::ExtrapolatedEveryStep)
+        ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep)
   {
     Fail("restart manifest schema " + std::to_string(manifest.schema) +
          " cannot certify extrapolation-history reset semantics");

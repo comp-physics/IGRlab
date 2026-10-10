@@ -1,11 +1,13 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include "mfem.hpp"
 
 #include <cstdint>
 #include <type_traits>
 
-namespace dg_igr
+namespace igrlab
 {
 namespace regularization
 {
@@ -288,4 +290,4 @@ static_assert(TraceAuxiliaryFieldDescriptor::Topology() ==
               "trace auxiliary descriptor must retain trace topology");
 
 } // namespace regularization
-} // namespace dg_igr
+} // namespace igrlab

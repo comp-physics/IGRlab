@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "numerics/limiters/zhang_shu.hpp"
 
 #include "physics/euler/eos.hpp"
@@ -439,10 +440,10 @@ LimiterTimingState& GetLimiterTimingState()
   if (!state.initialized)
   {
     state.phase_enabled =
-      dg_igr::EnvFlagEnabled("DG_IGR_LIMITER_CPU_PHASE_TIMING");
-    state.enabled = dg_igr::EnvFlagEnabled("DG_IGR_LIMITER_TIMING") ||
+      ::igrlab::EnvFlagEnabled("DG_IGR_LIMITER_CPU_PHASE_TIMING");
+    state.enabled = ::igrlab::EnvFlagEnabled("DG_IGR_LIMITER_TIMING") ||
                     state.phase_enabled;
-    if (const char* value = std::getenv("DG_IGR_TIMING_WARMUP_CALLS"))
+    if (const char* value = ::igrlab::GetEnv("DG_IGR_TIMING_WARMUP_CALLS"))
     {
       state.warmup_calls = std::max(0, std::atoi(value));
     }
@@ -640,7 +641,7 @@ bool SupportsMfemFaceLimiterPath(const mfem::ParFiniteElementSpace& vfes,
   {
     return false;
   }
-  if (!dg_igr::EnvFlagEnabledDefault("DG_IGR_LIMITER_MFEM_FACE_QI", true))
+  if (!::igrlab::EnvFlagEnabledDefault("DG_IGR_LIMITER_MFEM_FACE_QI", true))
   {
     return false;
   }
@@ -924,7 +925,7 @@ DeviceLimiterCache& GetDeviceLimiterCache(
   const bool tensor_basis = mfem::UsesTensorBasis(vfes);
   const bool requested_mfem_volume_points =
     ne > 0 && tensor_basis &&
-    dg_igr::EnvFlagEnabledDefault("DG_IGR_LIMITER_MFEM_VOLUME_QI", true) &&
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_LIMITER_MFEM_VOLUME_QI", true) &&
     mfem::QuadratureInterpolator::SupportsFESpace(vfes);
   const bool requested_mfem_face_points =
     ne > 0 && SupportsMfemFaceLimiterPath(vfes, face_qords);
@@ -1446,7 +1447,7 @@ void ApplyDeviceZhangShuPositivityLimiter(
   mfem::ZhangShuLimiterElementDiagnostics* diagnostics,
   bool* local_state_modified)
 {
-  ::dg_igr::NVTXRange limiter_range("Limiter/Zhang-Shu");
+  ::igrlab::NVTXRange limiter_range("Limiter/Zhang-Shu");
   LimiterTimingState& timing = GetLimiterTimingState();
   if (timing.enabled) { MFEM_DEVICE_SYNC; }
   const auto timing_start = std::chrono::steady_clock::now();
@@ -1888,7 +1889,7 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
   const std::vector<int> limiter_face_qords =
     BuildFaceQuadratureOrders(vfes, qord, face_quad_orders);
   const bool effective_enforce_vtk_points =
-    enforce_vtk_points.value_or(::dg_igr::EnvFlagEnabledDefault(
+    enforce_vtk_points.value_or(::igrlab::EnvFlagEnabledDefault(
       "DG_IGR_LIMITER_ENFORCE_VTK_POINTS", false));
 
   if (diagnostics)
@@ -2208,7 +2209,7 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
       for (int j = 0; j < dof; ++j)
       {
         elmat.GetRow(j, row);
-        dg_igr::limiters_detail::BlendRow(row, Ubar, theta_rho);
+        igrlab::limiters_detail::BlendRow(row, Ubar, theta_rho);
         elmat.SetRow(j, row);
       }
     }
@@ -2313,7 +2314,7 @@ void ApplyZhangShuPositivityLimiter(ParFiniteElementSpace& vfes,
       for (int j = 0; j < dof; ++j)
       {
         elmat.GetRow(j, row);
-        dg_igr::limiters_detail::BlendRow(row, Ubar, theta_p);
+        igrlab::limiters_detail::BlendRow(row, Ubar, theta_p);
         elmat.SetRow(j, row);
       }
     }

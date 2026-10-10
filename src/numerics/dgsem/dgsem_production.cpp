@@ -1,4 +1,6 @@
+#include "igrlab/environment.hpp"
 #include "numerics/dgsem/dgsem_operator.hpp"
+#include "dgsem_overintegrated_volume.hpp"
 
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/dgsem/dgsem_basis.hpp"
@@ -12,6 +14,7 @@
 #include "physics/bc/detail/euler_boundary_state.hpp"
 #include "physics/igr/igr_flux.hpp"
 #include "utils/config/dg_igr_defaults.hpp"
+#include "utils/config/env_flags.hpp"
 
 #include <algorithm>
 #include <array>
@@ -22,13 +25,67 @@
 #include <memory>
 #include <type_traits>
 #include <vector>
+#include <chrono>
+#include <cstdlib>
+#include <cerrno>
 
 namespace mfem
 {
 namespace dgsem
 {
+namespace overintegration_internal
+{
+void BuildVolumeQuadratureMaps2D(const FiniteElement& fe,
+                                 const IntegrationRule& rule,
+                                 DenseMatrix& interpolation,
+                                 DenseMatrix& weak_derivative)
+{
+  MFEM_VERIFY(fe.GetDim()==2&&fe.GetGeomType()==Geometry::SQUARE&&
+                fe.GetMapType()==FiniteElement::VALUE,
+              "Overintegrated volume maps require value-mapped 2D quadrilaterals.");
+  const int dof=fe.GetDof(),nq=rule.GetNPoints();
+  interpolation.SetSize(nq,dof);weak_derivative.SetSize(dof,2*nq);
+  interpolation.GetMemory().UseDevice(true);weak_derivative.GetMemory().UseDevice(true);
+  real_t* b=interpolation.HostWrite();real_t* g=weak_derivative.HostWrite();
+  Vector shape(dof);DenseMatrix derivative(dof,2);
+  for(int q=0;q<nq;++q)
+  {
+    const auto& ip=rule.IntPoint(q);fe.CalcShape(ip,shape);fe.CalcDShape(ip,derivative);
+    for(int i=0;i<dof;++i)
+    {
+      b[q+nq*i]=shape[i];
+      for(int d=0;d<2;++d)g[i+dof*(q+nq*d)]=ip.weight*derivative(i,d);
+    }
+  }
+}
+}
+
+namespace subcell_internal
+{
+// Private aggregate accounting; its implementation must be CUDA-compiled,
+// because this orchestration translation unit is ordinary host C++.
+void AccumulateSubcellBlendVisits(const Vector& blend, Vector& visits);
+}
 namespace
 {
+
+int RequestedVolumeQuadratureOrder()
+{
+  const char* raw=::igrlab::GetEnv("DG_IGR_DGSEM_VOLUME_QUADRATURE_MIN_ORDER");
+  if(!raw)return 0;
+  errno=0;char* end=nullptr;const long value=std::strtol(raw,&end,10);
+  MFEM_VERIFY(raw[0]&&end&&!*end&&errno==0&&value>=0&&value<=26,
+    "DG_IGR_DGSEM_VOLUME_QUADRATURE_MIN_ORDER must be an integer in [0,26].");
+  return static_cast<int>(value);
+}
+
+// Explicit research extension; default qualification remains p1--p4.
+// Generic packed kernels and the fused path are independently checked to p7.
+inline int MaximumDGSEMProductionOrder()
+{
+  return ::igrlab::EnvFlagEnabledDefault("DG_IGR_DGSEM_HIGH_ORDER_RESEARCH", false)
+      ? 7 : 4;
+}
 
 inline int AbsoluteDof(int vdof)
 {
@@ -38,6 +95,50 @@ inline int AbsoluteDof(int vdof)
 inline bool Finite(real_t value)
 {
   return std::isfinite(static_cast<double>(value));
+}
+
+bool BuildExactScalarNodeMap(FiniteElementSpace& scalar_fes,
+                             const FiniteElementSpace& state_fes,
+                             int dof,
+                             Array<int>& map)
+{
+  map.SetSize(state_fes.GetNE() * dof);
+  Array<int> scalar_dofs;
+  for (int element = 0; element < state_fes.GetNE(); ++element)
+  {
+    const FiniteElement& scalar = *scalar_fes.GetFE(element);
+    const FiniteElement& state = *state_fes.GetFE(element);
+    if (!dynamic_cast<const NodalFiniteElement*>(&scalar) ||
+        scalar.GetMapType() != FiniteElement::VALUE ||
+        scalar.GetDim() != state.GetDim() ||
+        scalar.GetGeomType() != state.GetGeomType() ||
+        scalar.GetDof() != dof || scalar.GetNodes().GetNPoints() != dof ||
+        state.GetNodes().GetNPoints() != dof)
+      return false;
+    scalar_fes.GetElementDofs(element, scalar_dofs);
+    if (scalar_dofs.Size() != dof) return false;
+    std::vector<char> seen(static_cast<std::size_t>(dof), 0);
+    for (int local = 0; local < dof; ++local)
+    {
+      const IntegrationPoint& target = state.GetNodes().IntPoint(local);
+      int match = -1;
+      for (int j = 0; j < dof; ++j)
+      {
+        const IntegrationPoint& node = scalar.GetNodes().IntPoint(j);
+        // This is an exact nodal identity, not a sparsification threshold.
+        if (target.x == node.x &&
+            (state.GetDim() == 1 || target.y == node.y))
+        {
+          match = j;
+          break;
+        }
+      }
+      if (match < 0 || seen[static_cast<std::size_t>(match)]) return false;
+      seen[static_cast<std::size_t>(match)] = 1;
+      map[element * dof + local] = scalar_dofs[match];
+    }
+  }
+  return true;
 }
 
 inline int FindNode(const Vector& nodes, real_t coordinate)
@@ -473,7 +574,7 @@ ValidateDGSEMProductionMetadata(const DGSEMProductionMetadataView& m)
   {
     return DGSEMProductionReason::UnsupportedDimension;
   }
-  if (m.order < 1 || m.order > 4)
+  if (m.order < 1 || m.order > MaximumDGSEMProductionOrder())
   {
     return DGSEMProductionReason::UnsupportedOrder;
   }
@@ -561,7 +662,8 @@ ValidateDGSEMProductionMetadata(const DGSEMProductionMetadataView& m)
   }
 
   if (!m.inverse_mass || m.inverse_mass->Height() != rows ||
-      m.inverse_mass->Width() != m.dofs_per_element)
+      (m.inverse_mass->Width() != m.dofs_per_element &&
+       m.inverse_mass->Width() != 1))
   {
     return DGSEMProductionReason::InvalidMetric;
   }
@@ -569,7 +671,7 @@ ValidateDGSEMProductionMetadata(const DGSEMProductionMetadataView& m)
   for (int row = 0; row < rows; ++row)
   {
     real_t row_norm = 0.0;
-    for (int j = 0; j < m.dofs_per_element; ++j)
+    for (int j = 0; j < m.inverse_mass->Width(); ++j)
     {
       const real_t value = inverse[row + rows * j];
       if (!Finite(value))
@@ -726,7 +828,7 @@ DGSEMProductionReason ValidateDGSEMProductionState(
     {
       return DGSEMProductionReason::InvalidDensity;
     }
-    if (density < dg_igr::LimiterDefaults::kRhoMin)
+    if (density < igrlab::LimiterDefaults::kRhoMin)
     {
       return DGSEMProductionReason::DensityBelowBoundaryFloor;
     }
@@ -974,12 +1076,23 @@ struct DGSEMProductionCache
   DGSEMVolumeDissipation volume_dissipation =
     DGSEMVolumeDissipation::None;
   real_t gamma = 1.4;
-  real_t velocity_density_floor = dg_igr::FluxDefaults::kRhoVelFloor;
+  real_t velocity_density_floor = igrlab::FluxDefaults::kRhoVelFloor;
   bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
   bool frozen_sigma_spectral_speed = false;
   bool llf_volume_active = false;
+  bool fused_residual_logged = false;
+  int overintegration_order = -1;
+  long overintegration_nodes_sequence = -1;
+  DenseMatrix volume_interpolation, volume_weak_derivative;
+  DenseMatrix volume_quadrature_metrics, volume_quadrature_states, volume_quadrature_flux;
+  Vector volume_quadrature_sigma, volume_quadrature_speeds, volume_quadrature_max;
+  DenseMatrix subcell_modal_transform;
+  Vector subcell_blend;
+  Vector subcell_visits;
+  std::uint64_t subcell_calls = 0;
+  bool subcell_log_summary = false;
   std::uint64_t policy_fingerprint = 0;
   DGSEMProductionWorkspaceEvidence workspace_evidence;
   int ne = 0;
@@ -1044,6 +1157,29 @@ struct DGSEMProductionCache
   Array<double> state_scan_slots;
   Array<double> state_scan_result;
   Vector empty_face_neighbor;
+  void FinishSubcellBlend()
+  {
+    if (subcell_calls && subcell_log_summary)
+    {
+      const real_t* visits = subcell_visits.HostRead();
+      double full_dg = 0.0, blended = 0.0;
+      for (int e = 0; e < ne; ++e)
+      {
+        full_dg += visits[e];
+        blended += visits[ne + e];
+      }
+      std::cout << "[dgsem-subcell-blend-summary] local_elements=" << ne
+                << " rhs_calls=" << subcell_calls
+                << " fully_dg_fraction=" << full_dg / (ne * double(subcell_calls))
+                << " mean_blend=" << blended / (ne * double(subcell_calls))
+                << " native_order=" << n1d - 1 << std::endl;
+    }
+    subcell_calls = 0;
+    subcell_modal_transform.SetSize(0);
+    subcell_blend.SetSize(0);
+    subcell_visits.SetSize(0);
+  }
+  ~DGSEMProductionCache() { FinishSubcellBlend(); }
 #ifdef MFEM_USE_MPI
   Vector state_send;
   Vector state_face_neighbor;
@@ -1086,6 +1222,77 @@ void AppendMatrixWorkspace(const DenseMatrix& matrix,
                                            matrix.Read(true));
 }
 
+void PrepareOverintegratedVolume(DGSEMProductionCache& c,
+                                 FiniteElementSpace& vfes, int requested)
+{
+  Mesh* mesh=vfes.GetMesh();
+  if(c.overintegration_order==requested&&
+     c.overintegration_nodes_sequence==mesh->GetNodesSequence())return;
+  const auto start=std::chrono::steady_clock::now();
+  MFEM_VERIFY(sizeof(real_t)==sizeof(double)&&mesh->Dimension()==2&&
+                mesh->SpaceDimension()==2&&!mesh->Nonconforming(),
+              "Overintegrated DGSEM volume currently requires conforming affine FP64 2D quadrilaterals.");
+  const auto& fe=*vfes.GetFE(0);const int p=fe.GetOrder();
+  MFEM_VERIFY(p>=1&&p<=7,"Overintegrated DGSEM volume supports p1 through p7.");
+  if(c.sigma_field)
+  {
+    MFEM_VERIFY(c.sigma_fes&&dynamic_cast<const L2_FECollection*>(c.sigma_fes->FEColl())&&
+                  c.sigma_ldof==c.dof&&c.sigma_fes->GetFE(0)->GetOrder()==p,
+                "Overintegrated DGSEM volume requires current same-degree L2 sigma.");
+  }
+  if(mesh->GetNodes())
+    MFEM_VERIFY(mesh->GetNodes()->FESpace()->GetMaxElementOrder()<=p,
+                "Overintegrated DGSEM volume requires geometry degree <= state degree.");
+  const auto& ir=IntRules.Get(Geometry::SQUARE,std::max(2*p,requested));
+  const int nq=ir.GetNPoints();
+  MFEM_VERIFY(std::size_t(c.ne)*nq<=std::size_t(std::numeric_limits<int>::max()),
+              "Overintegrated volume exceeds MFEM row indexing.");
+  const int qrows=c.ne*nq;
+  overintegration_internal::BuildVolumeQuadratureMaps2D(fe,ir,c.volume_interpolation,c.volume_weak_derivative);
+  c.volume_quadrature_metrics.SetSize(qrows,4);
+  c.volume_quadrature_metrics.GetMemory().UseDevice(true);
+  real_t* qmetric=c.volume_quadrature_metrics.HostWrite();const real_t* metric=c.metrics.HostRead();
+  for(int e=0;e<c.ne;++e)
+  {
+    auto* tr=mesh->GetElementTransformation(e);
+    for(int q=0;q<nq;++q)
+    {
+      tr->SetIntPoint(&ir.IntPoint(q));const auto& jac=tr->Jacobian();
+      const real_t current[4]={jac(1,1),-jac(0,1),-jac(1,0),jac(0,0)};
+      MFEM_VERIFY(tr->Weight()>0.,"Overintegrated volume requires positive Jacobians.");
+      for(int k=0;k<4;++k)
+      {
+        const real_t value=metric[e*c.dof+c.rows*k];
+        MFEM_VERIFY(std::abs(current[k]-value)<=1e-11*std::max(real_t(1.),std::abs(value)),
+                    "Overintegrated DGSEM volume requires affine geometry; curved Jacobian detected.");
+        qmetric[e*nq+q+qrows*k]=value;
+      }
+    }
+    for(int i=0;i<c.dof;++i)for(int k=0;k<4;++k)
+      MFEM_VERIFY(std::abs(metric[e*c.dof+i+c.rows*k]-metric[e*c.dof+c.rows*k])<=
+                    1e-11*std::max(real_t(1.),std::abs(metric[e*c.dof+c.rows*k])),
+                  "Overintegrated volume requires constant contravariant nodal metrics.");
+  }
+  c.volume_quadrature_states.SetSize(qrows,4);c.volume_quadrature_states.GetMemory().UseDevice(true);
+  c.volume_quadrature_flux.SetSize(qrows,8);c.volume_quadrature_flux.GetMemory().UseDevice(true);
+  c.volume_quadrature_sigma.SetSize(qrows);c.volume_quadrature_sigma.UseDevice(true);
+  c.volume_quadrature_speeds.SetSize(qrows);c.volume_quadrature_speeds.UseDevice(true);
+  c.volume_quadrature_max.SetSize(1);c.volume_quadrature_max.UseDevice(true);
+  c.overintegration_order=requested;c.overintegration_nodes_sequence=mesh->GetNodesSequence();
+  c.workspace_evidence=DGSEMProductionWorkspaceEvidence{};
+  std::cout<<"[dgsem-overintegrated-volume] enabled=1 precision=fp64 elements="<<c.ne
+           <<" order="<<p<<" requested_quadrature_order="<<requested
+           <<" effective_quadrature_order="<<ir.GetOrder()<<" quadrature_points="<<nq
+           <<" input_nodes="<<c.dof<<" input_columns=5 projected_columns=4"
+           <<" dense_products_per_rhs="<<13*std::size_t(c.ne)*c.dof*nq
+           <<" padded_products_per_rhs=0 flux_points_per_rhs="<<qrows
+           <<" map_geometry_bytes="<<(3*std::size_t(c.dof)*nq+4*std::size_t(qrows))*sizeof(real_t)
+           <<" additional_workspace_bytes="<<(14*std::size_t(qrows)+1)*sizeof(real_t)
+           <<" setup_s="<<std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()
+           <<" mass=lgl faces=lgl-rusanov volume_admission=quadrature-and-nodes affine=1"
+           <<" limiter_consumer_points=unchanged new_point_failure=reject-before-output"<<std::endl;
+}
+
 DGSEMProductionWorkspaceEvidence SnapshotWorkspaces(
   const DGSEMProductionCache& cache)
 {
@@ -1100,6 +1307,15 @@ DGSEMProductionWorkspaceEvidence SnapshotWorkspaces(
   AppendMatrixWorkspace(cache.volume_pair_dissipation, evidence);
   AppendVectorWorkspace(cache.nodal_speeds, evidence);
   AppendMatrixWorkspace(cache.weak_volume, evidence);
+  if(cache.volume_quadrature_states.Height()>0)
+  {
+    AppendMatrixWorkspace(cache.volume_quadrature_states,evidence);
+    AppendMatrixWorkspace(cache.volume_quadrature_flux,evidence);
+    AppendVectorWorkspace(cache.volume_quadrature_sigma,evidence);
+    AppendVectorWorkspace(cache.volume_quadrature_speeds,evidence);
+    AppendVectorWorkspace(cache.volume_quadrature_max,evidence);
+  }
+
   AppendMatrixWorkspace(cache.left_states, evidence);
   AppendMatrixWorkspace(cache.right_states, evidence);
   AppendVectorWorkspace(cache.left_sigma, evidence);
@@ -1230,11 +1446,13 @@ void DGSEMOperator::InvalidateProductionCache(
   if (invalidation >= DGSEMProductionInvalidation::Geometry)
   {
     production_->topology_ready = false;
+    production_->overintegration_order = -1;
     production_->workspaces_ready = false;
   }
   if (invalidation == DGSEMProductionInvalidation::Topology)
   {
     production_->topology_ready = false;
+    production_->overintegration_order = -1;
     production_->sigma_ready = false;
     production_->workspaces_ready = false;
     ++production_->counters.update_invalidations;
@@ -1265,7 +1483,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   const real_t gamma = op_->GetDGSEMGamma();
   const real_t velocity_density_floor =
     flux_igr ? flux_igr->GetVelocityRhoFloor()
-             : dg_igr::FluxDefaults::kRhoVelFloor;
+             : igrlab::FluxDefaults::kRhoVelFloor;
   const bool invariant_domain_flux =
     flux_igr && flux_igr->GetInvariantDomainFlux();
   const bool sigma_aware_cfl = flux_igr && flux_igr->GetSigmaAwareCFL();
@@ -1276,6 +1494,23 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   const bool cuda = Device::Allows(Backend::CUDA_MASK);
   const bool llf_volume_selected =
     op_->GetDGSEMVolumeDissipation() == DGSEMVolumeDissipation::LLF;
+  const int volume_quadrature_order=RequestedVolumeQuadratureOrder();
+  if(volume_quadrature_order>0)
+  {
+    MFEM_VERIFY(collective_strict,
+                "Overintegrated DGSEM volume requires strict production dispatch (DG_IGR_DGSEM_PRODUCTION_STRICT=1).");
+    MFEM_VERIFY(mesh&&op_->dim==2&&context.size==1&&
+                  op_->GetVolumeMode()==VolumeMode::DGSEMFluxDiff&&
+                  op_->GetDGSEMVolumeFlux()==DGSEMVolumeFlux::Central&&
+                  op_->GetDGSEMStabilization()==DGSEMStabilization::None&&!llf_volume_selected,
+                "Overintegrated volume requires rank-one 2D central DGSEM without volume LLF/stabilization.");
+    const char* fused_setting=::igrlab::GetEnv("DG_IGR_DGSEM_FUSED_RESIDUAL");
+    MFEM_VERIFY(fused_setting&&std::strcmp(fused_setting,"0")==0&&
+                  !::igrlab::EnvFlagEnabledDefault("DG_IGR_DGSEM_FUSED_DMMA",false)&&
+                  !::igrlab::EnvFlagEnabledDefault("DG_IGR_DGSEM_SUBCELL_BLEND",false),
+                "Overintegrated volume requires DG_IGR_DGSEM_FUSED_RESIDUAL=0 and no fused DMMA/subcell blend.");
+  }
+
   const long vfes_sequence = op_->vfes.GetSequence();
   const long mesh_sequence = mesh ? mesh->GetSequence() : -1;
   const long sigma_sequence = sigma_fes ? sigma_fes->GetSequence() : -1;
@@ -1324,6 +1559,12 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   fingerprint = HashCombine(
     fingerprint, frozen_sigma_spectral_speed ? 1 : 0);
   fingerprint = HashCombine(fingerprint, cuda ? 1 : 0);
+  if(volume_quadrature_order>0)
+  {
+    fingerprint=HashCombine(fingerprint,static_cast<std::uint64_t>(volume_quadrature_order));
+    fingerprint=HashCombine(fingerprint,static_cast<std::uint64_t>(mesh->GetNodesSequence()));
+  }
+
 
   semantic = HashCombine(semantic, static_cast<std::uint64_t>(op_->dim));
   semantic = HashCombine(semantic,
@@ -1747,7 +1988,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   if (topology_reason == DGSEMProductionReason::None)
   {
     topology_order = op_->vfes.GetFE(0)->GetOrder();
-    if (topology_order < 1 || topology_order > 4)
+    if (topology_order < 1 || topology_order > MaximumDGSEMProductionOrder())
     {
       topology_reason = DGSEMProductionReason::UnsupportedOrder;
     }
@@ -1856,6 +2097,7 @@ DGSEMProductionReason DGSEMOperator::EnsureProductionCache_(bool strict) const
   if (topology_rebuild)
   {
     c.topology_ready = false;
+    c.overintegration_order = -1;
     c.sigma_ready = false;
     c.workspaces_ready = false;
 #ifdef MFEM_USE_MPI
@@ -1952,7 +2194,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     flux_igr ? flux_igr->GetSigmaField() : nullptr;
   const real_t velocity_density_floor =
     flux_igr ? flux_igr->GetVelocityRhoFloor()
-             : dg_igr::FluxDefaults::kRhoVelFloor;
+             : igrlab::FluxDefaults::kRhoVelFloor;
   const bool cuda = Device::Allows(Backend::CUDA_MASK);
   const long vfes_sequence = op_->vfes.GetSequence();
   const long mesh_sequence = mesh ? mesh->GetSequence() : -1;
@@ -1994,6 +2236,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
        topology_policy_changed))
   {
     c.topology_ready = false;
+    c.overintegration_order = -1;
     c.sigma_ready = false;
     c.workspaces_ready = false;
   }
@@ -2125,6 +2368,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
 
   if (!c.topology_ready)
   {
+    c.FinishSubcellBlend();
     c.ne = op_->vfes.GetNE();
     c.equations = op_->num_equations;
     if (c.ne <= 0 || op_->vfes.GetOrdering() != Ordering::byNODES)
@@ -2133,7 +2377,7 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
     }
     const FiniteElement& first_fe = *op_->vfes.GetFE(0);
     const int order = first_fe.GetOrder();
-    if (order < 1 || order > 4)
+    if (order < 1 || order > MaximumDGSEMProductionOrder())
     {
       return fail(DGSEMProductionReason::UnsupportedOrder);
     }
@@ -2164,8 +2408,38 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       c.lex_to_local[lex] = local;
     }
 
+    // LGL quadrature is collocated, so the assembled inverse mass is normally
+    // exactly diagonal. Inspect the supplied matrices once and retain the
+    // dense representation if any off-diagonal entry is nonzero; no tolerance
+    // or change to the mass discretization is involved.
+    bool diagonal_inverse_mass = true;
+    for (int e = 0; e < c.ne; ++e)
+    {
+      if (e >= static_cast<int>(op_->invmass.size()) ||
+          op_->invmass[static_cast<std::size_t>(e)].Height() != c.dof ||
+          op_->invmass[static_cast<std::size_t>(e)].Width() != c.dof)
+      {
+        // Defer rejection until after the element topology checks below, so
+        // mixed-order and malformed-map diagnostics keep their precedence.
+        diagonal_inverse_mass = false;
+        continue;
+      }
+      const DenseMatrix& inverse = op_->invmass[static_cast<std::size_t>(e)];
+      for (int j = 0; diagonal_inverse_mass && j < c.dof; ++j)
+      {
+        for (int i = 0; i < c.dof; ++i)
+        {
+          if (i != j && inverse(i, j) != 0.0)
+          {
+            diagonal_inverse_mass = false;
+            break;
+          }
+        }
+      }
+    }
+
     c.element_vdofs.SetSize(c.rows * c.equations);
-    c.inverse_mass.SetSize(c.rows, c.dof);
+    c.inverse_mass.SetSize(c.rows, diagonal_inverse_mass ? 1 : c.dof);
     c.coordinates.SetSize(c.rows, op_->dim);
     Array<int> vdofs;
     Vector physical(op_->dim);
@@ -2224,10 +2498,11 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       }
       for (int i = 0; i < c.dof; ++i)
       {
-        for (int j = 0; j < c.dof; ++j)
+        for (int j = 0; j < c.inverse_mass.Width(); ++j)
         {
           c.inverse_mass(e * c.dof + i, j) =
-            op_->invmass[static_cast<std::size_t>(e)](i, j);
+            op_->invmass[static_cast<std::size_t>(e)](
+              i, diagonal_inverse_mass ? i : j);
         }
       }
       ElementTransformation* transformation =
@@ -2745,31 +3020,36 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       {
         return fail(DGSEMProductionReason::UnsupportedSigma);
       }
-      c.sigma_element_dofs.SetSize(c.rows * c.sigma_ldof);
-      c.sigma_interpolation.SetSize(c.rows, c.sigma_ldof);
-      Array<int> scalar_dofs;
+      const bool exact_nodal_gather = BuildExactScalarNodeMap(
+          *scalar_fes, op_->vfes, c.dof, c.sigma_element_dofs);
       Vector shape(c.sigma_ldof);
-      for (int e = 0; e < c.ne; ++e)
+      if (exact_nodal_gather)
       {
-        const FiniteElement& scalar_fe = *scalar_fes->GetFE(e);
-        const FiniteElement& state_fe = *op_->vfes.GetFE(e);
-        if (scalar_fe.GetDof() != c.sigma_ldof)
+        c.sigma_interpolation.SetSize(0, 0);
+      }
+      else
+      {
+        c.sigma_element_dofs.SetSize(c.rows * c.sigma_ldof);
+        c.sigma_interpolation.SetSize(c.rows, c.sigma_ldof);
+        Array<int> scalar_dofs;
+        for (int e = 0; e < c.ne; ++e)
         {
-          return fail(DGSEMProductionReason::UnsupportedSigma);
-        }
-        scalar_fes->GetElementDofs(e, scalar_dofs);
-        if (scalar_dofs.Size() != c.sigma_ldof)
-        {
-          return fail(DGSEMProductionReason::UnsupportedSigma);
-        }
-        for (int local = 0; local < c.dof; ++local)
-        {
-          const int row = e * c.dof + local;
-          scalar_fe.CalcShape(state_fe.GetNodes().IntPoint(local), shape);
-          for (int j = 0; j < c.sigma_ldof; ++j)
+          const FiniteElement& scalar_fe = *scalar_fes->GetFE(e);
+          const FiniteElement& state_fe = *op_->vfes.GetFE(e);
+          if (scalar_fe.GetDof() != c.sigma_ldof)
+            return fail(DGSEMProductionReason::UnsupportedSigma);
+          scalar_fes->GetElementDofs(e, scalar_dofs);
+          if (scalar_dofs.Size() != c.sigma_ldof)
+            return fail(DGSEMProductionReason::UnsupportedSigma);
+          for (int local = 0; local < c.dof; ++local)
           {
-            c.sigma_element_dofs[row + c.rows * j] = scalar_dofs[j];
-            c.sigma_interpolation(row, j) = shape(j);
+            const int row = e * c.dof + local;
+            scalar_fe.CalcShape(state_fe.GetNodes().IntPoint(local), shape);
+            for (int j = 0; j < c.sigma_ldof; ++j)
+            {
+              c.sigma_element_dofs[row + c.rows * j] = scalar_dofs[j];
+              c.sigma_interpolation(row, j) = shape(j);
+            }
           }
         }
       }
@@ -2839,6 +3119,18 @@ DGSEMProductionReason DGSEMOperator::BuildProductionCacheLocal_(
       c.sigma_fes_sequence = scalar_fes->GetSequence();
       c.sigma_ready = true;
       ++c.counters.sigma_metadata_builds;
+      if (exact_nodal_gather)
+      {
+        int logging_rank = 0;
+#ifdef MFEM_USE_MPI
+        const auto context = GetProductionCommunicator(op_->vfes);
+        if (context.active) MPI_Comm_rank(context.comm, &logging_rank);
+#endif
+        if (logging_rank == 0)
+          std::cout << "[dgsem-sigma-interpolation] mode=exact-nodal-gather"
+                    << " rows=" << c.rows << " scalar_dofs=" << c.sigma_ldof
+                    << " shared_faces=dense" << std::endl;
+      }
     }
   }
 
@@ -2971,6 +3263,11 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
     ++c.counters.stage_calls;
   }
 
+  const int volume_quadrature_order=RequestedVolumeQuadratureOrder();
+  const bool overintegrated_volume=volume_quadrature_order>0;
+  if(overintegrated_volume)
+    PrepareOverintegratedVolume(c,op_->vfes,volume_quadrature_order);
+
   DGSEMProductionReason local_gate = DGSEMProductionReason::None;
   if (x_local.Size() != op_->vfes.GetVSize())
   {
@@ -3061,6 +3358,29 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
     if (admission_only)
     {
       result.admission_q_sigma.Merge(owned_scan.q_sigma);
+    }
+  }
+
+  if(overintegrated_volume)
+  {
+    overintegration_internal::InterpolateVolumeState2DDevice(c.ne,c.dof,
+      c.volume_interpolation,c.states,c.sigma_nodes,
+      c.volume_quadrature_states,c.volume_quadrature_sigma);
+    const DGSEMDeviceStateScan volume_scan=ScanDGSEMProductionStateDevice(
+      op_->dim,c.gamma,c.velocity_density_floor,true,false,
+      c.volume_quadrature_states,c.volume_quadrature_sigma,
+      c.left_states,c.left_sigma,c.right_states,c.right_sigma,
+      c.state_scan_slots,c.state_scan_result);
+    ++c.counters.host_synchronizations;
+    const auto volume_reason=ReduceReason(context,volume_scan.reason,c.counters.stage_reason_reductions);
+    if(volume_reason!=DGSEMProductionReason::None)
+    {
+      result.reason=volume_reason;return result;
+    }
+    if(c.sigma_field)
+    {
+      op_->dgsem_q_sigma_telemetry_.Merge(volume_scan.q_sigma);
+      if(admission_only)result.admission_q_sigma.Merge(volume_scan.q_sigma);
     }
   }
 
@@ -3242,6 +3562,15 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
         c.face_max,
         c.counters.host_synchronizations,
         c.counters.mpi_reductions);
+      if(overintegrated_volume)
+      {
+        ComputeEulerNodalCharacteristicSpeedsDevice(op_->dim,c.gamma,
+          c.velocity_density_floor,c.volume_quadrature_states,
+          c.volume_quadrature_sigma,c.volume_quadrature_speeds,c.frozen_sigma_spectral_speed);
+        result.max_characteristic_speed=std::max(result.max_characteristic_speed,
+          ReducePackedCharacteristicSpeed(context,c.volume_quadrature_speeds,c.face_speeds,
+            c.volume_quadrature_max,c.face_max,c.counters.host_synchronizations,c.counters.mpi_reductions));
+      }
     }
     result.executed = true;
     result.reason = DGSEMProductionReason::None;
@@ -3249,7 +3578,50 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
   }
 
   const LGLBasis1D& basis = GetLGLBasis1D(c.selection.order);
-  BuildEulerContravariantFluxDevice(op_->dim,
+  const bool fused_residual = ::igrlab::EnvFlagEnabledDefault(
+      "DG_IGR_DGSEM_FUSED_RESIDUAL", false);
+  const bool fused_dmma = ::igrlab::EnvFlagEnabledDefault(
+      "DG_IGR_DGSEM_FUSED_DMMA", false);
+  const bool subcell_blend = ::igrlab::EnvFlagEnabledDefault(
+      "DG_IGR_DGSEM_SUBCELL_BLEND", false);
+  MFEM_VERIFY(!subcell_blend || (fused_residual && c.n1d >= 4),
+      "DG_IGR_DGSEM_SUBCELL_BLEND requires the fused CUDA p3--p7 path.");
+  MFEM_VERIFY(!fused_dmma || fused_residual,
+              "DG_IGR_DGSEM_FUSED_DMMA requires DG_IGR_DGSEM_FUSED_RESIDUAL.");
+  if (fused_residual)
+  {
+    MFEM_VERIFY(op_->dim == 2 && c.n1d >= 2 && c.n1d <= 8 &&
+        c.inverse_mass.Width() == 1 && Device::Allows(Backend::CUDA_MASK),
+        "DG_IGR_DGSEM_FUSED_RESIDUAL requires CUDA 2D p1--p7 with "
+        "compact diagonal mass.");
+    if (!c.fused_residual_logged)
+    {
+      int logging_rank = 0;
+#ifdef MFEM_USE_MPI
+      if (context.active) MPI_Comm_rank(context.comm, &logging_rank);
+#endif
+      if (logging_rank == 0)
+        std::cout << "[dgsem-fused-residual] enabled=1 precision=fp64"
+                  << " contraction=" << (fused_dmma ? "dmma8x8x4" : "simt")
+                  << " elements=" << c.ne << " order=" << c.selection.order
+                  << " llf_volume=" << (c.llf_volume_active ? 1 : 0)
+                  << " unique_face_flux=1 packed_output=1" << std::endl;
+      c.fused_residual_logged = true;
+    }
+  }
+  if(overintegrated_volume)
+  {
+    BuildEulerContravariantFluxDevice(op_->dim,c.gamma,c.velocity_density_floor,
+      c.volume_quadrature_states,c.volume_quadrature_sigma,c.volume_quadrature_metrics,
+      c.volume_quadrature_flux,c.volume_quadrature_speeds,c.frozen_sigma_spectral_speed);
+    overintegration_internal::ApplyWeakVolumeProjection2DDevice(c.ne,c.dof,
+      c.volume_weak_derivative,c.volume_quadrature_flux,c.weak_volume);
+    ComputeEulerNodalCharacteristicSpeedsDevice(op_->dim,c.gamma,c.velocity_density_floor,
+      c.states,c.sigma_nodes,c.nodal_speeds,c.frozen_sigma_spectral_speed);
+  }
+  else if (!fused_residual)
+  {
+    BuildEulerContravariantFluxDevice(op_->dim,
                                     c.gamma,
                                     c.velocity_density_floor,
                                     c.states,
@@ -3258,16 +3630,16 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
                                     c.contravariant_flux,
                                     c.nodal_speeds,
                                     c.frozen_sigma_spectral_speed);
-  ApplyCentralVolumeDevice(op_->dim,
+    ApplyCentralVolumeDevice(op_->dim,
                            c.n1d,
                            c.lex_to_local,
                            basis.Dsplit,
                            basis.weights,
                            c.contravariant_flux,
                            c.weak_volume);
-  if (c.llf_volume_active)
-  {
-    AddEulerLLFVolumeDissipationDevice(op_->dim,
+    if (c.llf_volume_active)
+    {
+      AddEulerLLFVolumeDissipationDevice(op_->dim,
                                        c.ne,
                                        c.n1d,
                                        c.gamma,
@@ -3280,6 +3652,7 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
                                        c.metrics,
                                        c.volume_pair_dissipation,
                                        c.weak_volume);
+    }
   }
 
   AssembleEulerRusanovFacesDevice(op_->dim,
@@ -3299,7 +3672,8 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
                                   c.face_flux,
                                   c.face_speeds,
                                   c.weak_surface,
-                                  c.frozen_sigma_spectral_speed);
+                                  c.frozen_sigma_spectral_speed,
+                                  !fused_residual);
   if (physical_boundary_flux)
   {
     IntegratePhysicalBoundaryFluxDevice(c.ownership,
@@ -3307,13 +3681,81 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
                                         c.face_flux,
                                         *physical_boundary_flux);
   }
-  AddPackedMatricesDevice(c.weak_surface, c.weak_volume);
-  ApplyInverseMassDevice(c.ne,
-                         c.dof,
-                         c.inverse_mass,
-                         c.weak_volume,
-                         c.strong);
-  const real_t max_speed = ReducePackedCharacteristicSpeed(
+  if (fused_residual)
+  {
+    if (subcell_blend)
+    {
+      real_t threshold = 1e-4;
+      if (const char* value = ::igrlab::GetEnv("DG_IGR_DGSEM_SUBCELL_THRESHOLD"))
+      {
+        char* end = nullptr;
+        threshold = std::strtod(value, &end);
+        MFEM_VERIFY(end != value && *end == '\0' && std::isfinite(threshold) &&
+            threshold > 0.0, "Invalid modal subcell sensor threshold.");
+      }
+      if (c.subcell_modal_transform.Height() != c.n1d)
+      {
+        // The internal FV flux below uses constant contravariant metrics.
+        // Restrict this research variant to affine elements explicitly.
+        const real_t* metric = c.metrics.HostRead();
+        for (int e = 0; e < c.ne; ++e)
+          for (int component = 0; component < 4; ++component)
+            for (int i = 1; i < c.dof; ++i)
+              MFEM_VERIFY(std::abs(metric[e * c.dof + i + c.rows * component] -
+                  metric[e * c.dof + c.rows * component]) <= 1e-12 *
+                  std::max(real_t(1.0), std::abs(metric[e * c.dof + c.rows * component])),
+                  "Subcell blend research variant requires affine metrics.");
+        c.subcell_modal_transform.SetSize(c.n1d);
+        for (int i = 0; i < c.n1d; ++i)
+        {
+          const real_t x = 2.0 * basis.nodes[i] - 1.0;
+          real_t previous = 1.0, current = x;
+          for (int k = 0; k < c.n1d; ++k)
+          {
+            const real_t polynomial = k == 0 ? 1.0 : current;
+            c.subcell_modal_transform(k, i) = basis.weights[i] * polynomial *
+                (k == c.n1d - 1 ? k : 2 * k + 1);
+            if (k > 0)
+            {
+              const real_t next = ((2 * k + 1) * x * current - k * previous) / (k + 1);
+              previous = current;
+              current = next;
+            }
+          }
+        }
+        c.subcell_visits.SetSize(2 * c.ne);
+        c.subcell_visits.UseDevice(true);
+        c.subcell_visits = 0.0;
+        int rank = 0;
+#ifdef MFEM_USE_MPI
+        if (context.active) MPI_Comm_rank(context.comm, &rank);
+#endif
+        c.subcell_log_summary = rank == 0;
+        if (rank == 0)
+          std::cout << "[dgsem-subcell-blend] enabled=1 threshold=" << threshold
+                    << " native_order=" << c.n1d - 1
+                    << " current_sigma=1 unique_macroface_flux=1 affine=1" << std::endl;
+      }
+      ComputeModalSubcellBlendDevice(c.ne, c.n1d, c.gamma, threshold,
+          c.lex_to_local, c.subcell_modal_transform, c.states, c.subcell_blend);
+      subcell_internal::AccumulateSubcellBlendVisits(c.subcell_blend, c.subcell_visits);
+      ++c.subcell_calls;
+    }
+    ApplyFusedEulerResidualDevice(c.ne, c.n1d, c.gamma,
+        c.velocity_density_floor, c.llf_volume_active,
+        c.frozen_sigma_spectral_speed, c.lex_to_local, basis.Dsplit,
+        basis.weights, c.states, c.sigma_nodes, c.metrics, c.inverse_mass,
+        c.face_weights, c.row_face_offsets, c.row_face_ids, c.row_face_signs,
+        c.face_flux, c.nodal_speeds, c.strong, fused_dmma,
+        subcell_blend ? &c.subcell_blend : nullptr);
+  }
+  else
+  {
+    AddPackedMatricesDevice(c.weak_surface, c.weak_volume);
+    ApplyInverseMassDevice(c.ne, c.dof, c.inverse_mass, c.weak_volume,
+                           c.strong);
+  }
+  real_t max_speed = ReducePackedCharacteristicSpeed(
     context,
     c.nodal_speeds,
     c.face_speeds,
@@ -3321,6 +3763,11 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
     c.face_max,
     c.counters.host_synchronizations,
     c.counters.mpi_reductions);
+
+  if(overintegrated_volume)
+    max_speed=std::max(max_speed,ReducePackedCharacteristicSpeed(
+      context,c.volume_quadrature_speeds,c.face_speeds,c.volume_quadrature_max,
+      c.face_max,c.counters.host_synchronizations,c.counters.mpi_reductions));
 
   // This is the first write to the caller-owned output in the whole stage.
   ScatterElementStateDevice(c.ne,

@@ -2,10 +2,12 @@
 // This file is intentionally included from `IGR.cpp` after MFEM backend headers.
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 #include "mfem/general/annotation.hpp"
 #include "physics/igr/frozen_scalar_igr_algebra.hpp"
 
-namespace dg_igr
+namespace igrlab
 {
 namespace igr_device
 {
@@ -197,4 +199,4 @@ struct IGRDeviceFaceCoeffKernel
 };
 
 } // namespace igr_device
-} // namespace dg_igr
+} // namespace igrlab
