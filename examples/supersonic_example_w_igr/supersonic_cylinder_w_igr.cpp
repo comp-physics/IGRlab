@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 //                                Supersonic Cylinder - Parallel Version
 //
 // Compile with: make supersonic_cylinder
@@ -50,8 +51,10 @@
 
 #include "mfem.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <memory>
+#include <string>
 
 #include "sim/igr_sim.hpp"
 
@@ -82,7 +85,33 @@ inline void AddInflowOptions(mfem::OptionsParser& args,
 struct SupersonicIGROptions
 {
   InflowOptions inflow;
+  const char* startup = "normal";
+  double startup_width = 0.0;
 };
+
+mfem::VectorFunctionCoefficient MakeCylinderStartup(
+  const SupersonicIGROptions& opts, const mfem::Vector& Uin,
+  double gamma, double hmin)
+{
+  const std::string mode = opts.startup;
+  MFEM_VERIFY(mode == "normal" || mode == "full",
+              "Cylinder startup must be normal or full.");
+  MFEM_VERIFY(std::isfinite(opts.startup_width) && opts.startup_width >= 0.0,
+              "Cylinder startup width must be finite and nonnegative.");
+  const double delta = opts.startup_width > 0.0
+                         ? opts.startup_width : std::max(8.0 * hmin, 0.08);
+  if (mfem::Mpi::Root())
+  {
+    std::cout << "[cylinder-startup] mode=" << mode << " width=" << delta
+              << " width_policy=" << (opts.startup_width > 0.0 ? "physical" : "legacy-hmin")
+              << " center_x=0.6 center_y=0 radius=0.25" << std::endl;
+  }
+  return mode == "full"
+           ? mfem::SupersonicCylinderSmoothedVelocityIC(
+               Uin, gamma, 0.6, 0.0, 0.25, delta)
+           : mfem::SupersonicCylinderSmoothedNormalVelocityIC(
+               Uin, gamma, 0.6, 0.0, 0.25, delta);
+}
 
 } // namespace
 
@@ -109,7 +138,7 @@ int main(int argc, char* argv[])
     cfg.defaults.t_final = 4.0;
     cfg.rk3_config.limit_initial = true;
     cfg.igr_config.alpha_length_scale_policy =
-      dg_igr::IGRAlphaLengthScalePolicy::Max;
+      ::igrlab::IGRAlphaLengthScalePolicy::Max;
     //  cfg.igr_config.smoot = dg_igr::IGRSmootherType::L1GS;
     cfg.limiter_pipeline.zhang_shu = true;
     // cfg.limiter_pipeline.krivodonova = true;
@@ -119,6 +148,10 @@ int main(int argc, char* argv[])
   spec.add_options = [](mfem::OptionsParser& args, SupersonicIGROptions& opts)
   {
     AddInflowOptions(args, opts.inflow);
+    args.AddOption(&opts.startup, "-startup", "--startup",
+                   "Cylinder startup velocity damping: normal (default) or full.");
+    args.AddOption(&opts.startup_width, "-startup-width", "--startup-width",
+                   "Physical radial smoothing width; zero preserves max(8*hmin,0.08).");
   };
 
   spec.make_ic = [](const SupersonicIGROptions& opts,
@@ -136,17 +169,7 @@ int main(int argc, char* argv[])
                           ctx.run_cfg.igr_opts.c_alpha_user,
                           dg_sim::ResolveIGRAlphaLengthScalePolicy(ctx.run_cfg))
                           .hmin;
-    const double xc = 0.6;
-    const double yc = 0.0;
-    const double r_cyl = 0.25;
-    const double delta = std::max(8.0 * hmin, 0.08);
-
-    auto ic_fun = mfem::SupersonicCylinderSmoothedNormalVelocityIC(Uin,
-                                                                   gamma,
-                                                                   xc,
-                                                                   yc,
-                                                                   r_cyl,
-                                                                   delta);
+    auto ic_fun = MakeCylinderStartup(opts, Uin, gamma, hmin);
     return std::make_unique<mfem::VectorFunctionCoefficient>(ic_fun);
   };
 
@@ -176,6 +199,51 @@ int main(int argc, char* argv[])
     bc.AddSlipWall(markers);
     bc.AddSlipWall(markers, dg_sim::BoundaryRole::Cylinder);
   };
+
+#if defined(DG_IGR_HAS_HDG_MAIN_BACKEND) && DG_IGR_HAS_HDG_MAIN_BACKEND
+  spec.make_hdg_case_data = [](const SupersonicIGROptions& opts,
+                                const dg_sim::CaseConfig& case_config,
+                                const dg_sim::CommonOptions& options,
+                                const dg_sim::CaseContext& context)
+  {
+    dg_sim::hdg::HdgEulerCaseData data;
+    data.numerical_policy =
+      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(options.order);
+
+    mfem::Vector Uin(4);
+    Uin(0) = 1.4;
+    Uin(1) = 1.4 * opts.inflow.vx;
+    Uin(2) = 1.4 * opts.inflow.vy;
+    Uin(3) = 8.8;
+
+    // The legacy case's smoothed startup depends only on the globally reduced
+    // hmin; c_alpha and its length-scale policy do not change that quantity.
+    const double hmin =
+      dg_sim::ComputeAlphaInfo(
+        context.Mesh(),
+        /*c_alpha_user=*/1.0,
+        case_config.igr_config.alpha_length_scale_policy)
+        .hmin;
+    auto initial_condition = MakeCylinderStartup(
+      opts, Uin, case_config.gamma, hmin);
+    data.initial_condition =
+      std::make_unique<mfem::VectorFunctionCoefficient>(initial_condition);
+
+    const auto markers = dg_sim::BuildBoundaryMarkers(
+      context.Mesh(),
+      {{dg_sim::BoundaryRole::Inlet, {4}},
+       {dg_sim::BoundaryRole::Outlet, {2}},
+       {dg_sim::BoundaryRole::Slip, {1, 3}},
+       {dg_sim::BoundaryRole::Cylinder, {5}}});
+    data.boundary_plan.AddSupersonicInlet(
+      markers.At(dg_sim::BoundaryRole::Inlet), [Uin] { return Uin; });
+    data.boundary_plan.AddSupersonicOutlet(
+      markers.At(dg_sim::BoundaryRole::Outlet));
+    data.boundary_plan.AddSlipWall(markers.At(dg_sim::BoundaryRole::Slip));
+    data.boundary_plan.AddSlipWall(markers.At(dg_sim::BoundaryRole::Cylinder));
+    return data;
+  };
+#endif
 
   spec.postprocess = [](const SupersonicIGROptions&,
                         const dg_sim::ExampleContext&,

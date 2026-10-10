@@ -1,13 +1,16 @@
+#include "igrlab/compat.hpp"
 #include "physics/igr/IGR.hpp"
+#include "physics/igr/frozen_scalar_igr_algebra.hpp"
 #include "utils/config/env_flags.hpp"
 #include "IGR_internal_utils.hpp"
+#include "IGR_nodal_source.hpp"
 #include "utils/profiling/nvtx.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <limits>
 
-namespace dg_igr
+namespace igrlab
 {
 using namespace igr_internal;
 
@@ -28,8 +31,7 @@ double IGRSolver::InvRhoCoefficient::Eval(mfem::ElementTransformation& T,
   // Conservative state value at (T, ip): state.Size() == num_eq
   mfem::Vector state;
   U_->GetVectorValue(T, ip, state); // [rho, m(0..dim-1), E]
-  const double rho = std::max(state(0), rho_floor_);
-  return 1.0 / rho;
+  return frozen_scalar_igr_algebra::SafeInverseDensity(state(0), rho_floor_);
 }
 
 // ---------------- IGRSolver::VelocityFromConsCoefficient ---------------
@@ -53,12 +55,13 @@ void IGRSolver::VelocityFromConsCoefficient::Eval(
   T.SetIntPoint(&ip);
   mfem::Vector cons;
   U_->GetVectorValue(T, ip, cons); // [rho, m(0..dim-1), E]
-  const double rho = std::max(cons(0), rho_floor_);
   V.SetSize(vdim);
   for (int d = 0; d < vdim; ++d)
   {
     const double md = cons(1 + d);
-    V(d) = md / rho;
+    V(d) = frozen_scalar_igr_algebra::ConservativeVelocityComponent(md,
+                                                                    cons(0),
+                                                                    rho_floor_);
   }
 }
 
@@ -94,70 +97,29 @@ double IGRSolver::SigmaSourceCoefficient::Eval(mfem::ElementTransformation& T,
     mfem::DenseMatrix gradv(dim_, dim_);
     velH1_->GetVectorGradient(T, gradv); // gradv(i,j) = ∂_j u_i
 
-    // div u
-    double divu = 0.0;
-    for (int i = 0; i < dim_; ++i)
-    {
-      divu += gradv(i, i);
-    }
-
-    // tr((∇u)^2) = sum_ij (∂_j u_i)(∂_i u_j)
-    double trA2 = 0.0;
-    for (int i = 0; i < dim_; ++i)
-      for (int j = 0; j < dim_; ++j)
-        trA2 += gradv(i, j) * gradv(j, i);
-
     const double alpha = alpha_coeff_ ? alpha_coeff_->Eval(T, ip) : alpha_;
-    return alpha * (trA2 + divu * divu);
+    return frozen_scalar_igr_algebra::SourceFromVelocityGradient(
+      dim_,
+      gradv.GetData(),
+      1,
+      gradv.Height(),
+      alpha);
   }
 
   // BrokenDG backend: in-cell quotient rule from conservative gradients
   U_->GetVectorValue(T, ip, state_); // [rho, m(0..dim-1), E]
   U_->GetVectorGradient(T, gradU_);  // rows: components, cols: spatial derivs
 
-  const double rho = std::max(state_(0), rho_floor_);
-
-  // momentum components:
-  mfem::Vector mom(&state_(1), dim_);
-
-  // grad of rho: row 0 in gradU_
-  mfem::Vector grad_rho(dim_);
-  for (int j = 0; j < dim_; ++j)
-  {
-    grad_rho(j) = gradU_(0, j);
-  }
-
-  // Build grad(u) via quotient rule: du_i/dx_j = (rho*dm_i/dx_j - m_i*drho/dx_j)/rho^2
-  const double rho2 = rho * rho;
-  for (int i = 0; i < dim_; ++i)
-  {
-    for (int j = 0; j < dim_; ++j)
-    {
-      const double dmij = gradU_(1 + i, j);
-      gradu_(i, j) = (rho * dmij - mom(i) * grad_rho(j)) / rho2;
-    }
-  }
-
-  // divergence
-  double divu = 0.0;
-  for (int i = 0; i < dim_; ++i)
-  {
-    divu += gradu_(i, i);
-  }
-
-  // tr( (∇u)^2 ) = sum_{i,j} (∂_j u_i) (∂_i u_j)
-  double trA2 = 0.0;
-  for (int i = 0; i < dim_; ++i)
-  {
-    for (int j = 0; j < dim_; ++j)
-    {
-      trA2 += gradu_(i, j) * gradu_(j, i);
-    }
-  }
-
-  // Paper RHS: α ( tr((∇u)^2) + (tr ∇u)^2 )
   const double alpha = alpha_coeff_ ? alpha_coeff_->Eval(T, ip) : alpha_;
-  return alpha * (trA2 + divu * divu);
+  return frozen_scalar_igr_algebra::SourceFromConservativeStateGradient(
+    dim_,
+    state_.GetData(),
+    1,
+    gradU_.GetData(),
+    1,
+    gradU_.Height(),
+    alpha,
+    rho_floor_);
 }
 
 double IGRSolver::AlphaPolicyCoefficient::Eval(
@@ -272,6 +234,18 @@ void IGRSolver::SetExactDGFaceOperator(bool enabled)
   }
 }
 
+void IGRSolver::SetSubcellQuadratureMinimumOrder(int order)
+{
+  MFEM_VERIFY(order == 0 || order == 4,
+              "Subcell IGR quadrature minimum order must be zero or four.");
+  MFEM_VERIFY(order == 0 || (mfem::Device::Allows(mfem::Backend::CUDA_MASK) && UseDeviceCoefficients_()),
+              "Subcell IGR quadrature floor requires CUDA current coefficient QFunctions.");
+  if (order == subcell_quadrature_minimum_order_) return;
+  MFEM_VERIFY(first_call_, "Configure subcell quadrature before the first IGR state update.");
+  subcell_quadrature_minimum_order_ = order;
+  BuildBilinearForm_();
+}
+
 void IGRSolver::SetSweeps(int regular_sweeps, int warm_start_sweeps)
 {
   regular_sweeps_ = std::max(0, regular_sweeps);
@@ -299,10 +273,23 @@ void IGRSolver::SetDirichletBC(const mfem::Array<int>& ess_bdr)
 
 bool IGRSolver::UseDeviceCoefficients_() const
 {
+  const bool nodal_source = GetNodalSourceMode() != NodalSourceMode::Baseline;
+  MFEM_VERIFY(!NodalSourceMirrorWalls() || GetNodalSourceMode() == NodalSourceMode::Central,
+              "DG_IGR_IGR_NODAL_WALL_MIRROR requires the central nodal source.");
+  MFEM_VERIFY((!nodal_source && NodalSourceQuadratureMinimumOrder() == 0 &&
+                OperatorQuadratureMinimumOrder() == 0) || IsDGSpace(sfes_),
+              "Nodal IGR source / coefficient-quadrature override requires an L2 scalar space.");
   const bool device_backend =
     mfem::Device::Allows(mfem::Backend::DEVICE_MASK);
-  const bool qf_enabled =
-    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_IGR_DEVICE_QF", device_backend);
+  // The exact side-aware DG face operator consumes the element coefficient
+  // QFunctions on every backend; it is therefore a typed dependency, not a
+  // hidden environment prerequisite.  The environment switch remains an
+  // opt-in/opt-out control only for closure paths that do not request exact
+  // faces.
+  const bool qf_enabled = nodal_source || NodalSourceQuadratureMinimumOrder() > 0 ||
+                          OperatorQuadratureMinimumOrder() > 0 || UseExactDGFaceOperator_() ||
+                          ::igrlab::EnvFlagEnabledDefault(
+                            "DG_IGR_IGR_DEVICE_QF", device_backend);
   if (!qf_enabled)
   {
     return false;
@@ -369,7 +356,7 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
     pending_stage0_prefetch_last_converged_ = last_linear_converged_;
     pending_stage0_prefetch_last_final_norm_ = last_linear_final_norm_;
   }
-  ::dg_igr::NVTXRange range("IGR/update-from-state");
+  ::igrlab::NVTXRange range("IGR/update-from-state");
   const auto update_start = std::chrono::steady_clock::now();
   const int calls_before = linear_solve_calls_;
   const int iters_before = total_linear_iters_;
@@ -462,4 +449,4 @@ void IGRSolver::UpdateFromState(const mfem::ParGridFunction& U,
   }
 }
 
-} // namespace dg_igr
+} // namespace igrlab

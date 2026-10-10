@@ -16,6 +16,15 @@ namespace dg_sim
  */
 struct EulerStateViews
 {
+private:
+  static mfem::real_t* ComponentData(mfem::ParGridFunction& state,
+                                     const int offset) noexcept
+  {
+    mfem::real_t* const data = state.GetData();
+    return data == nullptr ? nullptr : data + offset;
+  }
+
+public:
   mfem::ParGridFunction density;
   mfem::ParGridFunction momentum;
   mfem::ParGridFunction momentum_x;
@@ -26,11 +35,11 @@ struct EulerStateViews
                   mfem::ParFiniteElementSpace& dfes,
                   mfem::ParGridFunction& sol,
                   int dim)
-    : density(&fes, sol.GetData()),
-      momentum(&dfes, sol.GetData() + fes.GetNDofs()),
-      momentum_x(&fes, sol.GetData() + 1 * fes.GetNDofs()),
-      momentum_y(&fes, sol.GetData() + 2 * fes.GetNDofs()),
-      energy(&fes, sol.GetData() + (dim + 1) * fes.GetNDofs())
+    : density(&fes, ComponentData(sol, 0)),
+      momentum(&dfes, ComponentData(sol, fes.GetNDofs())),
+      momentum_x(&fes, ComponentData(sol, 1 * fes.GetNDofs())),
+      momentum_y(&fes, ComponentData(sol, 2 * fes.GetNDofs())),
+      energy(&fes, ComponentData(sol, (dim + 1) * fes.GetNDofs()))
   {
     MFEM_VERIFY(dim == 2, "EulerStateViews assumes a 2D Euler state layout.");
   }

@@ -1,9 +1,36 @@
+#include "igrlab/compat.hpp"
 #include "DGHyperbolicConservationLaws_impl.hpp"
 
 namespace mfem
 {
 
 #include "DGHyperbolicConservationLaws_device_kernels.hpp"
+
+void DGHyperbolicConservationLaws::SetP0FaceReferenceXSlopes(const Vector* slopes)
+{
+  MFEM_VERIFY(!slopes || slopes->Size() == vfes.GetVSize(),
+              "P0 MUSCL slope vector has an incompatible native layout.");
+  if (slopes && slopes != p0_face_reference_x_slopes_)
+  {
+    MFEM_VERIFY(Device::Allows(Backend::CUDA_MASK) &&
+                  vol_mode_ == VolumeMode::WeakDivergence && dim == 2 &&
+                  num_equations == 4 && slopes->Size() == vfes.GetVSize() &&
+                  vfes.GetNE() > 0,
+                "P0 MUSCL traces require 2D four-field CUDA weak-DG transport.");
+    for (int e = 0; e < vfes.GetNE(); ++e)
+      MFEM_VERIFY(vfes.GetFE(e)->GetOrder() == 0 && vfes.GetFE(e)->GetDof() == 1 &&
+                    vfes.GetFE(e)->GetGeomType() == Geometry::SQUARE,
+                  "P0 MUSCL traces require quadrilateral cell-mean test functions.");
+#ifdef MFEM_USE_MPI
+    const auto* pfes = dynamic_cast<const ParFiniteElementSpace*>(&vfes);
+    int ranks = 0;
+    if (pfes) MPI_Comm_size(pfes->GetComm(), &ranks);
+    MFEM_VERIFY(pfes && ranks == 1 && pfes->GetParMesh()->GetNSharedFaces() == 0,
+                "P0 MUSCL traces support rank one without shared faces.");
+#endif
+  }
+  p0_face_reference_x_slopes_ = slopes;
+}
 
 const BdrHyperbolicFluxIntegrator*
 DGHyperbolicConservationLaws::FindBdrIntegrator_(int attr) const
@@ -44,6 +71,81 @@ bool DGHyperbolicConservationLaws::BuildBoundaryPolicyData_()
     return false;
   }
 
+  const FluxFunction& physical_flux = formIntegrator->GetFluxFunction();
+  const auto* igr_flux = dynamic_cast<const FluxWithIGR*>(&physical_flux);
+  const bool exact_igr_flux =
+    igr_flux && igr_flux->GetInvariantDomainFlux();
+  const real_t exact_gamma = exact_igr_flux ? igr_flux->GetGamma() : 0.0;
+  const real_t exact_density_floor =
+    exact_igr_flux ? igr_flux->GetVelocityRhoFloor() : 0.0;
+  const real_t exact_pressure_floor =
+    exact_igr_flux ? igr_flux->GetInvariantDomainPressureFloor() : 0.0;
+  if (exact_igr_flux)
+  {
+    MFEM_VERIFY(std::isfinite(exact_gamma) && exact_gamma > 1.0 &&
+                  exact_gamma == dgsem_gamma_,
+                "Packed DG invariant-domain flux requires the operator and "
+                "FluxWithIGR to use one finite gamma greater than one.");
+    MFEM_VERIFY(std::isfinite(exact_density_floor) &&
+                  exact_density_floor > 0.0 &&
+                  std::isfinite(exact_pressure_floor) &&
+                  exact_pressure_floor > 0.0,
+                "Packed DG invariant-domain flux requires finite positive "
+                "density and pressure floors.");
+  }
+
+  const auto verify_exact_gamma = [&](real_t boundary_gamma,
+                                      const char* boundary_name)
+  {
+    MFEM_VERIFY(!exact_igr_flux || boundary_gamma == exact_gamma,
+                "Packed DG invariant-domain " << boundary_name
+                                               << " gamma differs from the "
+                                                  "FluxWithIGR gamma.");
+  };
+  const auto verify_exact_floors = [&](real_t boundary_density_floor,
+                                       real_t boundary_pressure_floor,
+                                       const char* boundary_name)
+  {
+    MFEM_VERIFY(!exact_igr_flux ||
+                  (boundary_density_floor == exact_density_floor &&
+                   boundary_pressure_floor == exact_pressure_floor),
+                "Packed DG invariant-domain " << boundary_name
+                                               << " floors differ from the "
+                                                  "FluxWithIGR admitted-state "
+                                                  "contract.");
+  };
+  const auto verify_exact_state = [&](const Vector& state,
+                                      const char* state_name)
+  {
+    if (!exact_igr_flux)
+    {
+      return;
+    }
+    bool finite = state.Size() == num_equations;
+    for (int eq = 0; finite && eq < state.Size(); ++eq)
+    {
+      finite = std::isfinite(state(eq));
+    }
+    real_t pressure = -1.0;
+    if (finite && state(0) >= exact_density_floor)
+    {
+      real_t momentum_squared = 0.0;
+      for (int d = 0; d < dim; ++d)
+      {
+        momentum_squared += state(1 + d) * state(1 + d);
+      }
+      pressure = (exact_gamma - 1.0) *
+                 (state(1 + dim) -
+                  0.5 * momentum_squared / state(0));
+    }
+    MFEM_VERIFY(finite && state(0) >= exact_density_floor &&
+                  std::isfinite(pressure) &&
+                  pressure >= exact_pressure_floor,
+                "Packed DG invariant-domain " << state_name
+                                               << " violates the configured "
+                                                  "density/pressure floors.");
+  };
+
   face_bdr_max_attr_ = mesh->bdr_attributes.Max();
   if (face_bdr_max_attr_ <= 0)
   {
@@ -52,7 +154,7 @@ bool DGHyperbolicConservationLaws::BuildBoundaryPolicyData_()
   }
 
   face_bdr_type_by_attr_.SetSize(face_bdr_max_attr_ + 1);
-  face_bdr_type_by_attr_ = static_cast<int>(DeviceBoundaryType::Unsupported);
+  face_bdr_type_by_attr_ = static_cast<int>(DeviceBoundaryType::unsupported);
   face_bdr_gamma_by_attr_.SetSize(face_bdr_max_attr_ + 1);
   face_bdr_gamma_by_attr_ = 0.0;
   face_bdr_pressure_by_attr_.SetSize(face_bdr_max_attr_ + 1);
@@ -83,8 +185,10 @@ bool DGHyperbolicConservationLaws::BuildBoundaryPolicyData_()
 
     if (auto* inlet = dynamic_cast<const SupersonicInletState*>(&bc))
     {
+      verify_exact_state(inlet->GetInletState(),
+                         "supersonic-inlet reference state");
       face_bdr_type_by_attr_[attr] =
-        static_cast<int>(DeviceBoundaryType::SupersonicInlet);
+        static_cast<int>(DeviceBoundaryType::supersonic_inlet);
       face_bdr_gamma_by_attr_(attr) = dgsem_gamma_;
       set_state(attr, inlet->GetInletState());
       continue;
@@ -92,44 +196,93 @@ bool DGHyperbolicConservationLaws::BuildBoundaryPolicyData_()
     if (dynamic_cast<const SupersonicOutletState*>(&bc))
     {
       face_bdr_type_by_attr_[attr] =
-        static_cast<int>(DeviceBoundaryType::SupersonicOutlet);
+        static_cast<int>(DeviceBoundaryType::supersonic_outlet);
       face_bdr_gamma_by_attr_(attr) = dgsem_gamma_;
       continue;
     }
     if (auto* outlet_p = dynamic_cast<const SubsonicOutletPressureState*>(&bc))
     {
+      verify_exact_gamma(outlet_p->GetGamma(),
+                         "subsonic-outlet-pressure");
+      verify_exact_floors(outlet_p->GetDensityFloor(),
+                          outlet_p->GetPressureFloor(),
+                          "subsonic-outlet-pressure");
+      MFEM_VERIFY(!exact_igr_flux || outlet_p->GetDimension() == dim,
+                  "Packed DG invariant-domain subsonic-outlet dimension "
+                  "differs from the operator dimension.");
+      MFEM_VERIFY(!exact_igr_flux ||
+                    (std::isfinite(outlet_p->GetOutletPressure()) &&
+                     outlet_p->GetOutletPressure() >= exact_pressure_floor),
+                  "Packed DG invariant-domain outlet pressure violates the "
+                  "configured pressure floor.");
       face_bdr_type_by_attr_[attr] =
-        static_cast<int>(DeviceBoundaryType::SubsonicOutletPressure);
+        static_cast<int>(DeviceBoundaryType::subsonic_outlet_pressure);
       face_bdr_gamma_by_attr_(attr) = outlet_p->GetGamma();
       face_bdr_pressure_by_attr_(attr) = outlet_p->GetOutletPressure();
       continue;
     }
     if (auto* outlet_nr = dynamic_cast<const NonReflectingOutletState*>(&bc))
     {
+      verify_exact_gamma(outlet_nr->GetGamma(),
+                         "nonreflecting-outlet");
+      verify_exact_floors(outlet_nr->GetDensityFloor(),
+                          outlet_nr->GetPressureFloor(),
+                          "nonreflecting-outlet");
+      MFEM_VERIFY(!exact_igr_flux || outlet_nr->GetDimension() == dim,
+                  "Packed DG invariant-domain nonreflecting-outlet dimension "
+                  "differs from the operator dimension.");
+      verify_exact_state(outlet_nr->GetReferenceState(),
+                         "nonreflecting-outlet reference state");
       face_bdr_type_by_attr_[attr] =
-        static_cast<int>(DeviceBoundaryType::NonReflectingOutlet);
+        static_cast<int>(DeviceBoundaryType::nonreflecting_outlet);
       face_bdr_gamma_by_attr_(attr) = outlet_nr->GetGamma();
       set_state(attr, outlet_nr->GetReferenceState());
       continue;
     }
     if (auto* inlet_sub = dynamic_cast<const SubsonicInletState*>(&bc))
     {
+      verify_exact_gamma(inlet_sub->GetGamma(), "subsonic-inlet");
+      verify_exact_floors(inlet_sub->GetDensityFloor(),
+                          inlet_sub->GetPressureFloor(),
+                          "subsonic-inlet");
+      MFEM_VERIFY(!exact_igr_flux || inlet_sub->GetDimension() == dim,
+                  "Packed DG invariant-domain subsonic-inlet dimension "
+                  "differs from the operator dimension.");
+      verify_exact_state(inlet_sub->GetInletState(),
+                         "subsonic-inlet reference state");
       face_bdr_type_by_attr_[attr] =
-        static_cast<int>(DeviceBoundaryType::SubsonicInlet);
+        static_cast<int>(DeviceBoundaryType::subsonic_inlet);
       face_bdr_gamma_by_attr_(attr) = inlet_sub->GetGamma();
       set_state(attr, inlet_sub->GetInletState());
       continue;
     }
     if (auto* far = dynamic_cast<const FarFieldState*>(&bc))
     {
-      face_bdr_type_by_attr_[attr] = static_cast<int>(DeviceBoundaryType::FarField);
+      verify_exact_gamma(far->GetGamma(), "far-field");
+      verify_exact_floors(far->GetDensityFloor(),
+                          far->GetPressureFloor(),
+                          "far-field");
+      MFEM_VERIFY(!exact_igr_flux || far->GetDimension() == dim,
+                  "Packed DG invariant-domain far-field dimension differs "
+                  "from the operator dimension.");
+      verify_exact_state(far->GetFarFieldState(),
+                         "far-field reference state");
+      face_bdr_type_by_attr_[attr] =
+        static_cast<int>(DeviceBoundaryType::far_field);
       face_bdr_gamma_by_attr_(attr) = far->GetGamma();
       set_state(attr, far->GetFarFieldState());
       continue;
     }
-    if (dynamic_cast<const SlipWallState*>(&bc))
+    if (auto* slip = dynamic_cast<const SlipWallState*>(&bc))
     {
-      face_bdr_type_by_attr_[attr] = static_cast<int>(DeviceBoundaryType::SlipWall);
+      verify_exact_floors(slip->GetDensityFloor(),
+                          slip->GetPressureFloor(),
+                          "slip-wall");
+      MFEM_VERIFY(!exact_igr_flux || slip->GetDimension() == dim,
+                  "Packed DG invariant-domain slip-wall dimension differs "
+                  "from the operator dimension.");
+      face_bdr_type_by_attr_[attr] =
+        static_cast<int>(DeviceBoundaryType::slip_wall);
       face_bdr_gamma_by_attr_(attr) = dgsem_gamma_;
       continue;
     }
@@ -142,7 +295,7 @@ bool DGHyperbolicConservationLaws::BuildBoundaryPolicyData_()
   {
     const int attr = bdr_attr[i];
     if (attr <= 0 || attr > face_bdr_max_attr_ ||
-        bdr_type[attr] == static_cast<int>(DeviceBoundaryType::Unsupported))
+        bdr_type[attr] == static_cast<int>(DeviceBoundaryType::unsupported))
     {
       return false;
     }
@@ -171,6 +324,7 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
   face_int_ip2_ref_.SetSize(0);
   face_int_speed_.SetSize(0);
   face_int_speed_q_.SetSize(0);
+  face_int_q_sigma_telemetry_.SetSize(0);
   face_bdr_e1_.SetSize(0);
   face_bdr_attr_.SetSize(0);
   face_bdr_mesh_id_.SetSize(0);
@@ -180,6 +334,7 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
   face_bdr_ip1_ref_.SetSize(0);
   face_bdr_speed_.SetSize(0);
   face_bdr_speed_q_.SetSize(0);
+  face_bdr_q_sigma_telemetry_.SetSize(0);
   face_shared_e1_.SetSize(0);
   face_shared_nbr_vdof_map_.SetSize(0);
   face_shared_shape1_.SetSize(0);
@@ -190,6 +345,7 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
   face_shared_ip2_ref_.SetSize(0);
   face_shared_speed_.SetSize(0);
   face_shared_speed_q_.SetSize(0);
+  face_shared_q_sigma_telemetry_.SetSize(0);
   face_bdr_policy_ready_ = false;
   face_sigma_ready_ = false;
   face_sigma_fes_ = nullptr;
@@ -639,6 +795,12 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
   face_int_speed_ = 0.0;
   face_int_speed_q_.SetSize(face_int_e1_.Size() * std::max(face_int_nq_, 0));
   face_int_speed_q_ = 0.0;
+  if (flux_igr && flux_igr->GetSigmaField() &&
+      flux_igr->GetInvariantDomainFlux())
+  {
+    dg_igr_detail::InitializeFrozenSigmaTelemetry(
+      face_int_q_sigma_telemetry_, face_int_e1_.Size() * face_int_nq_);
+  }
 
   face_bdr_e1_.SetSize(static_cast<int>(bdr_e1.size()));
   face_bdr_attr_.SetSize(static_cast<int>(bdr_attr.size()));
@@ -667,6 +829,12 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
   face_bdr_speed_ = 0.0;
   face_bdr_speed_q_.SetSize(face_bdr_e1_.Size() * std::max(face_bdr_nq_, 0));
   face_bdr_speed_q_ = 0.0;
+  if (flux_igr && flux_igr->GetSigmaField() &&
+      flux_igr->GetInvariantDomainFlux())
+  {
+    dg_igr_detail::InitializeFrozenSigmaTelemetry(
+      face_bdr_q_sigma_telemetry_, face_bdr_e1_.Size() * face_bdr_nq_);
+  }
 
   face_shared_e1_.SetSize(static_cast<int>(shared_e1.size()));
   face_shared_nbr_vdof_map_.SetSize(static_cast<int>(shared_nbr_vdof_map.size()));
@@ -706,6 +874,13 @@ void DGHyperbolicConservationLaws::BuildFaceApplyData_()
   face_shared_speed_ = 0.0;
   face_shared_speed_q_.SetSize(face_shared_e1_.Size() * std::max(face_shared_nq_, 0));
   face_shared_speed_q_ = 0.0;
+  if (flux_igr && flux_igr->GetSigmaField() &&
+      flux_igr->GetInvariantDomainFlux())
+  {
+    dg_igr_detail::InitializeFrozenSigmaTelemetry(
+      face_shared_q_sigma_telemetry_,
+      face_shared_e1_.Size() * face_shared_nq_);
+  }
 
   if (!BuildBoundaryPolicyData_())
   {
@@ -1011,11 +1186,13 @@ bool DGHyperbolicConservationLaws::UseDeviceFaceResidual_() const
 bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
   const Vector& x_in,
   Vector& z_inout,
-  real_t& max_face_speed) const
+  real_t& max_face_speed,
+  bool capture_boundary_flux) const
 {
 #ifndef DG_IGR_HAS_ACCEL_FORALL
   (void)x_in;
   (void)z_inout;
+  (void)capture_boundary_flux;
   max_face_speed = 0.0;
   return false;
 #else
@@ -1029,10 +1206,13 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
   const auto* flux_igr = dynamic_cast<const FluxWithIGR*>(&flux_fn);
 
   bool use_sigma = false;
+  bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
   const ParGridFunction* sigma_field = nullptr;
   real_t sigma_rho_floor = 1.0e-12;
+  real_t invariant_domain_pressure_floor =
+    igrlab::LimiterDefaults::kPMin;
   if (flux_igr && flux_igr->GetSigmaField())
   {
     sigma_field = flux_igr->GetSigmaField();
@@ -1042,18 +1222,28 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       return false;
     }
     sigma_rho_floor = flux_igr->GetVelocityRhoFloor();
+    invariant_domain_pressure_floor =
+      flux_igr->GetInvariantDomainPressureFloor();
+    invariant_domain_flux = flux_igr->GetInvariantDomainFlux();
     sigma_aware_cfl = flux_igr->GetSigmaAwareCFL();
     sigma_aware_rusanov = flux_igr->GetSigmaAwareRusanov();
     use_sigma = true;
   }
+  MFEM_VERIFY(!invariant_domain_flux || flux_igr->GetGamma() == dgsem_gamma_,
+              "Packed DG invariant-domain flux requires the operator, "
+              "FluxWithIGR, and Euler base flux to use one gamma.");
 
   z_inout = 0.0;
 
   const int dof = face_elem_dof_;
   const int neq = num_equations;
   const int ldof = dof * neq;
+  const real_t* const transport_slopes =
+    p0_face_reference_x_slopes_ ? p0_face_reference_x_slopes_->Read() : nullptr;
+  MFEM_VERIFY(!transport_slopes || (dof == 1 && face_shared_e1_.Size() == 0),
+              "P0 MUSCL packed faces cannot use higher-order tests or shared faces.");
   const bool use_q_parallel =
-    ::dg_igr::EnvFlagEnabledDefault("DG_IGR_DG_FACE_Q_PARALLEL", true);
+    ::igrlab::EnvFlagEnabledDefault("DG_IGR_DG_FACE_Q_PARALLEL", true);
 
   const int* sigma_map = nullptr;
   const real_t* sigma_vals = nullptr;
@@ -1065,6 +1255,9 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
   const int* shared_sigma_nbr_dof_map = nullptr;
   const real_t* x_nbr_vals = nullptr;
   const real_t* sigma_nbr_vals = nullptr;
+  real_t* boundary_flux_integral =
+    capture_boundary_flux ? physical_boundary_flux_integral_.Write()
+                          : nullptr;
   int sigma_ldof = 0;
   if (use_sigma)
   {
@@ -1080,6 +1273,13 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
   }
 
   const int n_int = face_int_e1_.Size();
+  MFEM_VERIFY(!invariant_domain_flux ||
+                face_int_q_sigma_telemetry_.Size() ==
+                  n_int * face_int_nq_ *
+                    dg_igr_detail::kFrozenSigmaTelemetryWidth,
+              "Packed invariant-domain interior telemetry is not initialized.");
+  double* const int_q_sigma_telemetry =
+    invariant_domain_flux ? face_int_q_sigma_telemetry_.ReadWrite() : nullptr;
   if (n_int > 0)
   {
     if (use_q_parallel)
@@ -1093,7 +1293,10 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       int_kernel.sigma_ldof = sigma_ldof;
       int_kernel.gamma = dgsem_gamma_;
       int_kernel.sigma_rho_floor = sigma_rho_floor;
+      int_kernel.invariant_domain_pressure_floor =
+        invariant_domain_pressure_floor;
       int_kernel.use_sigma = use_sigma;
+      int_kernel.invariant_domain_flux = invariant_domain_flux;
       int_kernel.sigma_aware_cfl = sigma_aware_cfl;
       int_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
       int_kernel.state_map = invmass_elem_vdof_map_.Read();
@@ -1104,8 +1307,12 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       int_kernel.normals = face_int_normals_.Read();
       int_kernel.weights = face_int_weights_.Read();
       int_kernel.x = x_in.Read();
+      int_kernel.reference_x_slopes = transport_slopes;
+      int_kernel.ip1_ref = transport_slopes ? face_int_ip1_ref_.Read() : nullptr;
+      int_kernel.ip2_ref = transport_slopes ? face_int_ip2_ref_.Read() : nullptr;
       int_kernel.z = z_inout.ReadWrite();
       int_kernel.face_speed_q = face_int_speed_q_.Write();
+      int_kernel.q_sigma_telemetry = int_q_sigma_telemetry;
       int_kernel.sigma_map = sigma_map;
       int_kernel.sigma_vals = sigma_vals;
       int_kernel.sigma_shape1 = int_sigma_shape1;
@@ -1129,7 +1336,10 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       int_kernel.sigma_ldof = sigma_ldof;
       int_kernel.gamma = dgsem_gamma_;
       int_kernel.sigma_rho_floor = sigma_rho_floor;
+      int_kernel.invariant_domain_pressure_floor =
+        invariant_domain_pressure_floor;
       int_kernel.use_sigma = use_sigma;
+      int_kernel.invariant_domain_flux = invariant_domain_flux;
       int_kernel.sigma_aware_cfl = sigma_aware_cfl;
       int_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
       int_kernel.state_map = invmass_elem_vdof_map_.Read();
@@ -1140,8 +1350,12 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       int_kernel.normals = face_int_normals_.Read();
       int_kernel.weights = face_int_weights_.Read();
       int_kernel.x = x_in.Read();
+      int_kernel.reference_x_slopes = transport_slopes;
+      int_kernel.ip1_ref = transport_slopes ? face_int_ip1_ref_.Read() : nullptr;
+      int_kernel.ip2_ref = transport_slopes ? face_int_ip2_ref_.Read() : nullptr;
       int_kernel.z = z_inout.ReadWrite();
       int_kernel.face_speed = face_int_speed_.Write();
+      int_kernel.q_sigma_telemetry = int_q_sigma_telemetry;
       int_kernel.sigma_map = sigma_map;
       int_kernel.sigma_vals = sigma_vals;
       int_kernel.sigma_shape1 = int_sigma_shape1;
@@ -1151,6 +1365,13 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
   }
 
   const int n_bdr = face_bdr_e1_.Size();
+  MFEM_VERIFY(!invariant_domain_flux ||
+                face_bdr_q_sigma_telemetry_.Size() ==
+                  n_bdr * face_bdr_nq_ *
+                    dg_igr_detail::kFrozenSigmaTelemetryWidth,
+              "Packed invariant-domain boundary telemetry is not initialized.");
+  double* const bdr_q_sigma_telemetry =
+    invariant_domain_flux ? face_bdr_q_sigma_telemetry_.ReadWrite() : nullptr;
   if (n_bdr > 0)
   {
     if (!face_bdr_policy_ready_)
@@ -1170,7 +1391,10 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       bdr_kernel.sigma_ldof = sigma_ldof;
       bdr_kernel.gamma_default = dgsem_gamma_;
       bdr_kernel.sigma_rho_floor = sigma_rho_floor;
+      bdr_kernel.invariant_domain_pressure_floor =
+        invariant_domain_pressure_floor;
       bdr_kernel.use_sigma = use_sigma;
+      bdr_kernel.invariant_domain_flux = invariant_domain_flux;
       bdr_kernel.sigma_aware_cfl = sigma_aware_cfl;
       bdr_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
       bdr_kernel.bdr_max_attr = face_bdr_max_attr_;
@@ -1181,8 +1405,12 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       bdr_kernel.normals = face_bdr_normals_.Read();
       bdr_kernel.weights = face_bdr_weights_.Read();
       bdr_kernel.x = x_in.Read();
+      bdr_kernel.reference_x_slopes = transport_slopes;
+      bdr_kernel.ip1_ref = transport_slopes ? face_bdr_ip1_ref_.Read() : nullptr;
       bdr_kernel.z = z_inout.ReadWrite();
       bdr_kernel.face_speed_q = face_bdr_speed_q_.Write();
+      bdr_kernel.q_sigma_telemetry = bdr_q_sigma_telemetry;
+      bdr_kernel.boundary_flux_integral = boundary_flux_integral;
       bdr_kernel.bdr_type_by_attr = face_bdr_type_by_attr_.Read();
       bdr_kernel.bdr_gamma_by_attr = face_bdr_gamma_by_attr_.Read();
       bdr_kernel.bdr_pressure_by_attr = face_bdr_pressure_by_attr_.Read();
@@ -1209,7 +1437,10 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       bdr_kernel.sigma_ldof = sigma_ldof;
       bdr_kernel.gamma_default = dgsem_gamma_;
       bdr_kernel.sigma_rho_floor = sigma_rho_floor;
+      bdr_kernel.invariant_domain_pressure_floor =
+        invariant_domain_pressure_floor;
       bdr_kernel.use_sigma = use_sigma;
+      bdr_kernel.invariant_domain_flux = invariant_domain_flux;
       bdr_kernel.sigma_aware_cfl = sigma_aware_cfl;
       bdr_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
       bdr_kernel.bdr_max_attr = face_bdr_max_attr_;
@@ -1220,8 +1451,12 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       bdr_kernel.normals = face_bdr_normals_.Read();
       bdr_kernel.weights = face_bdr_weights_.Read();
       bdr_kernel.x = x_in.Read();
+      bdr_kernel.reference_x_slopes = transport_slopes;
+      bdr_kernel.ip1_ref = transport_slopes ? face_bdr_ip1_ref_.Read() : nullptr;
       bdr_kernel.z = z_inout.ReadWrite();
       bdr_kernel.face_speed = face_bdr_speed_.Write();
+      bdr_kernel.q_sigma_telemetry = bdr_q_sigma_telemetry;
+      bdr_kernel.boundary_flux_integral = boundary_flux_integral;
       bdr_kernel.bdr_type_by_attr = face_bdr_type_by_attr_.Read();
       bdr_kernel.bdr_gamma_by_attr = face_bdr_gamma_by_attr_.Read();
       bdr_kernel.bdr_pressure_by_attr = face_bdr_pressure_by_attr_.Read();
@@ -1234,6 +1469,14 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
   }
 
   const int n_shared = face_shared_e1_.Size();
+  MFEM_VERIFY(!invariant_domain_flux ||
+                face_shared_q_sigma_telemetry_.Size() ==
+                  n_shared * face_shared_nq_ *
+                    dg_igr_detail::kFrozenSigmaTelemetryWidth,
+              "Packed invariant-domain shared telemetry is not initialized.");
+  double* const shared_q_sigma_telemetry =
+    invariant_domain_flux ? face_shared_q_sigma_telemetry_.ReadWrite()
+                          : nullptr;
   if (n_shared > 0)
   {
 #ifdef MFEM_USE_MPI
@@ -1291,7 +1534,10 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       shared_kernel.sigma_ldof = sigma_ldof;
       shared_kernel.gamma = dgsem_gamma_;
       shared_kernel.sigma_rho_floor = sigma_rho_floor;
+      shared_kernel.invariant_domain_pressure_floor =
+        invariant_domain_pressure_floor;
       shared_kernel.use_sigma = use_sigma;
+      shared_kernel.invariant_domain_flux = invariant_domain_flux;
       shared_kernel.sigma_aware_cfl = sigma_aware_cfl;
       shared_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
       shared_kernel.state_map = invmass_elem_vdof_map_.Read();
@@ -1305,6 +1551,7 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       shared_kernel.x_nbr = x_nbr_vals;
       shared_kernel.z = z_inout.ReadWrite();
       shared_kernel.face_speed_q = face_shared_speed_q_.Write();
+      shared_kernel.q_sigma_telemetry = shared_q_sigma_telemetry;
       shared_kernel.sigma_map = sigma_map;
       shared_kernel.sigma_vals = sigma_vals;
       shared_kernel.sigma_nbr_dof_map = shared_sigma_nbr_dof_map;
@@ -1330,7 +1577,10 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       shared_kernel.sigma_ldof = sigma_ldof;
       shared_kernel.gamma = dgsem_gamma_;
       shared_kernel.sigma_rho_floor = sigma_rho_floor;
+      shared_kernel.invariant_domain_pressure_floor =
+        invariant_domain_pressure_floor;
       shared_kernel.use_sigma = use_sigma;
+      shared_kernel.invariant_domain_flux = invariant_domain_flux;
       shared_kernel.sigma_aware_cfl = sigma_aware_cfl;
       shared_kernel.sigma_aware_rusanov = sigma_aware_rusanov;
       shared_kernel.state_map = invmass_elem_vdof_map_.Read();
@@ -1344,6 +1594,7 @@ bool DGHyperbolicConservationLaws::AddDeviceFaceContributionsEulerRusanov_(
       shared_kernel.x_nbr = x_nbr_vals;
       shared_kernel.z = z_inout.ReadWrite();
       shared_kernel.face_speed = face_shared_speed_.Write();
+      shared_kernel.q_sigma_telemetry = shared_q_sigma_telemetry;
       shared_kernel.sigma_map = sigma_map;
       shared_kernel.sigma_vals = sigma_vals;
       shared_kernel.sigma_nbr_dof_map = shared_sigma_nbr_dof_map;

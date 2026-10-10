@@ -21,7 +21,7 @@ namespace mfem
  * Example: MakeMarker(pmesh, {4}) activates only attribute 4.
  */
 static void MakeMarker(mfem::Array<int>& marker,
-                       mfem::ParMesh& pmesh,
+                       const mfem::ParMesh& pmesh,
                        std::initializer_list<int> attrs)
 {
   const int nb = pmesh.bdr_attributes.Max();

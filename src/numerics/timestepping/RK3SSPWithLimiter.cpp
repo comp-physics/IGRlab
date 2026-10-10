@@ -1,9 +1,12 @@
+#include "igrlab/environment.hpp"
 #include "numerics/timestepping/RK3SSPWithLimiter.hpp"
 
+#include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "utils/diagnostics/euler_admissibility.hpp"
 #include "utils/diagnostics/non_finite.hpp"
 #include "numerics/limiters/limiters.hpp" // ApplyZhangShuPositivityLimiter, etc.
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -19,15 +22,15 @@ namespace
 {
 
 inline const char* AdmissibilityPointSetName(
-  mfem::dg_igr::EulerAdmissibilityPointSet point_set)
+  mfem::igrlab::EulerAdmissibilityPointSet point_set)
 {
   switch (point_set)
   {
-  case mfem::dg_igr::EulerAdmissibilityPointSet::Dof:
+  case mfem::igrlab::EulerAdmissibilityPointSet::Dof:
     return "dof";
-  case mfem::dg_igr::EulerAdmissibilityPointSet::Limiter:
+  case mfem::igrlab::EulerAdmissibilityPointSet::Limiter:
     return "limiter";
-  case mfem::dg_igr::EulerAdmissibilityPointSet::Output:
+  case mfem::igrlab::EulerAdmissibilityPointSet::Output:
     return "output";
   }
   return "unknown";
@@ -92,12 +95,34 @@ inline void VerifyHostLimiter(const char* name)
                    << "run this method on CPU.");
 }
 
+inline real_t PhysicalBoundaryFluxStageWeight(SSPRKMethod method, int stage)
+{
+  MFEM_VERIFY(stage >= 0 && stage < SSPRKStageCount(method),
+              "Physical-boundary flux tracking received an invalid RK stage.");
+  switch (method)
+  {
+  case SSPRKMethod::SSPRK33:
+    return SSPRK33Coefficients::b[static_cast<std::size_t>(stage)];
+  case SSPRKMethod::SSPRK104:
+    return SSPRK104Coefficients::b[static_cast<std::size_t>(stage)];
+  case SSPRKMethod::ResearchRK4:
+    return ResearchRK4Coefficients::b[static_cast<std::size_t>(stage)];
+  case SSPRKMethod::ResearchDOPRI5:
+    return ResearchDOPRI5Coefficients::b[static_cast<std::size_t>(stage)];
+  case SSPRKMethod::ResearchRadauPicard5:
+    return stage < 10 ? 0.0 : ResearchRadauPicard5Coefficients::b[stage - 10];
+  }
+  MFEM_ABORT("Unsupported SSPRK method for physical-boundary flux tracking.");
+  return 0.0;
+}
+
 } // namespace
 
 // ------------------------------- Construction & Init ----------------------------
 
-RK3SSPWithLimiter::RK3SSPWithLimiter(ParFiniteElementSpace& vfes)
-  : vfes_(vfes)
+RK3SSPWithLimiter::RK3SSPWithLimiter(ParFiniteElementSpace& vfes,
+                                     SSPRKMethod method)
+  : vfes_(vfes), method_(method)
 {
 }
 
@@ -105,6 +130,21 @@ void RK3SSPWithLimiter::Init(TimeDependentOperator& f_)
 {
   ODESolver::Init(f_);
   state_generation_ = 0;
+  rhs_evaluation_count_ = 0;
+  attempted_characteristic_speed_ = 0.0;
+  accepted_characteristic_speed_ = 0.0;
+  attempted_characteristic_speed_available_ = false;
+  accepted_characteristic_speed_available_ = false;
+  const auto* stage_aware = dynamic_cast<const RKStageAwareOperator*>(&f_);
+  rhs_requires_step_transaction_ =
+    stage_aware && stage_aware->RequiresRKStepTransaction();
+  boundary_flux_provider_ =
+    dynamic_cast<const PhysicalBoundaryFluxIntegralProvider*>(&f_);
+  cumulative_physical_boundary_flux_available_ = false;
+  attempted_physical_boundary_flux_integral_.SetSize(0);
+  attempted_physical_boundary_flux_absolute_integral_.SetSize(0);
+  cumulative_physical_boundary_flux_integral_.SetSize(0);
+  cumulative_physical_boundary_flux_absolute_integral_.SetSize(0);
   const int n = f->Width();
   y_.SetSize(n, mem_type);
   k_.SetSize(n, mem_type);
@@ -114,6 +154,29 @@ void RK3SSPWithLimiter::Init(TimeDependentOperator& f_)
   {
     quad_order_ = AutoQuadOrder();
   }
+}
+
+bool RK3SSPWithLimiter::SupportsPhysicalBoundaryFluxTracking() const
+{
+  return boundary_flux_provider_ != nullptr &&
+         boundary_flux_provider_->SupportsPhysicalBoundaryFluxIntegral();
+}
+
+const Vector&
+RK3SSPWithLimiter::GetCumulativePhysicalBoundaryFluxIntegral() const
+{
+  MFEM_VERIFY(cumulative_physical_boundary_flux_available_,
+              "No accepted physical-boundary flux integral is available.");
+  return cumulative_physical_boundary_flux_integral_;
+}
+
+const Vector&
+RK3SSPWithLimiter::GetCumulativePhysicalBoundaryFluxAbsoluteIntegral() const
+{
+  MFEM_VERIFY(cumulative_physical_boundary_flux_available_,
+              "No accepted physical-boundary absolute flux integral is "
+              "available.");
+  return cumulative_physical_boundary_flux_absolute_integral_;
 }
 
 int RK3SSPWithLimiter::AutoQuadOrder() const
@@ -127,7 +190,8 @@ int RK3SSPWithLimiter::AutoQuadOrder() const
 
 bool RK3SSPWithLimiter::ApplyCallbacks(Vector& v,
                                        double t,
-                                       bool apply_optional)
+                                       bool apply_optional,
+                                       bool report_state_mutation)
 {
   // Quick exit if no callbacks at all.
   if (always_callbacks_.empty() &&
@@ -138,26 +202,49 @@ bool RK3SSPWithLimiter::ApplyCallbacks(Vector& v,
 
   // Non-owning view of v as a ParGridFunction.
   ParGridFunction U(&vfes_, v);
+  bool local_state_modified = false;
 
-  // Always-on callbacks (e.g., Zhang–Shu positivity).
-  for (auto& cb : always_callbacks_)
-  {
-    cb(vfes_, U, t);
-  }
-
-  // Optional callbacks, only if requested this step.
+  // Apply dissipative/reconstruction limiters first. An always-on admissibility
+  // callback such as Zhang--Shu must see their final state before the next RHS
+  // or accepted endpoint is published.
   if (apply_optional)
   {
     for (auto& cb : optional_callbacks_)
     {
-      cb(vfes_, U, t);
+      const bool callback_modified =
+        cb(vfes_, U, t, report_state_mutation);
+      local_state_modified = local_state_modified || callback_modified;
     }
+  }
+
+  // Always-on callbacks are the terminal stage gate. Preserve insertion order
+  // within the group while guaranteeing that optional slope limiting cannot
+  // invalidate a preceding positivity projection.
+  for (auto& cb : always_callbacks_)
+  {
+    const bool callback_modified = cb(vfes_, U, t, report_state_mutation);
+    local_state_modified = local_state_modified || callback_modified;
   }
 
   // Callbacks may update the non-owning view on the device. Propagate its
   // memory validity to the owning RK vector before host diagnostics or output.
   U.SyncAliasMemory(v);
-  return true;
+  if (!report_state_mutation)
+  {
+    return false;
+  }
+
+  int modified = local_state_modified ? 1 : 0;
+  if (mfem::Mpi::IsInitialized() && !mfem::Mpi::IsFinalized())
+  {
+    MPI_Allreduce(MPI_IN_PLACE,
+                  &modified,
+                  1,
+                  MPI_INT,
+                  MPI_MAX,
+                  vfes_.GetComm());
+  }
+  return modified != 0;
 }
 
 void RK3SSPWithLimiter::AdvanceStateGeneration()
@@ -171,7 +258,9 @@ void RK3SSPWithLimiter::AdvanceStateGeneration()
 // ----------------------- Convenience helpers to add callbacks ------------------
 
 void RK3SSPWithLimiter::AddZhangShuLimiter(ZhangShuPointSet point_set,
-                                           bool always_on)
+                                           bool always_on,
+                                           std::optional<bool>
+                                             enforce_vtk_points)
 {
   // Capture parameters by value; the callback will call the PP limiter on the stage.
   const int dim = dim_;
@@ -190,41 +279,49 @@ void RK3SSPWithLimiter::AddZhangShuLimiter(ZhangShuPointSet point_set,
              qord,
              face_qords,
              iters,
-             point_set](
-              ParFiniteElementSpace& vf, ParGridFunction& U, double /*t*/)
+             point_set,
+             enforce_vtk_points](ParFiniteElementSpace& vf,
+                                 ParGridFunction& U,
+                                 double /*t*/,
+                                 bool report_state_mutation)
   {
     mfem::ZhangShuLimiterElementDiagnostics* diagnostics_ptr =
       (zhang_shu_active_field_ != nullptr && zhang_shu_theta_rho_field_ != nullptr &&
        zhang_shu_theta_p_field_ != nullptr)
         ? &zhang_shu_diagnostics_
         : nullptr;
-    ApplyZhangShuPositivityLimiter(vf,
-                                   U,
-                                   dim,
-                                   gamma,
-                                   rhomin,
-                                   pmin,
-                                   qord,
-                                   face_qords,
-                                   iters,
-                                   point_set,
-                                   diagnostics_ptr);
+    bool local_state_modified = false;
+    ApplyZhangShuPositivityLimiter(
+      vf,
+      U,
+      dim,
+      gamma,
+      rhomin,
+      pmin,
+      qord,
+      face_qords,
+      iters,
+      point_set,
+      diagnostics_ptr,
+      enforce_vtk_points,
+      report_state_mutation ? &local_state_modified : nullptr);
     if (diagnostics_ptr != nullptr)
     {
-      WriteDG0ElementField(*zhang_shu_active_field_, diagnostics_ptr->active);
-      WriteDG0ElementField(*zhang_shu_theta_rho_field_,
-                           diagnostics_ptr->theta_rho);
-      WriteDG0ElementField(*zhang_shu_theta_p_field_, diagnostics_ptr->theta_p);
+      // Publish only after the complete RK attempt has been accepted. A later
+      // stage may still reject, in which case failure output must retain the
+      // last committed diagnostic fields rather than an abandoned stage.
+      zhang_shu_diagnostics_pending_ = true;
     }
+    return local_state_modified;
   };
 
   if (always_on)
   {
-    AddAlwaysCallback(std::move(cb));
+    always_callbacks_.push_back(std::move(cb));
   }
   else
   {
-    AddOptionalCallback(std::move(cb));
+    optional_callbacks_.push_back(std::move(cb));
   }
 }
 
@@ -318,7 +415,7 @@ void RK3SSPWithLimiter::MaybeScanVector(Vector& v, double t, const char* label)
   const int vdim = stage.VectorDim();
   const auto ordering = vfes_.GetOrdering();
   const auto scan =
-    mfem::dg_igr::ScanNonFiniteDetailed(v, comm, vdim, ordering);
+    mfem::igrlab::ScanNonFiniteDetailed(v, comm, vdim, ordering);
 
   if (scan.summary.global_non_finite > 0)
   {
@@ -379,9 +476,9 @@ void RK3SSPWithLimiter::MaybeScanAdmissibility(Vector& v,
   }
 
   const auto report_scan =
-    [&](mfem::dg_igr::EulerAdmissibilityPointSet point_set)
+    [&](mfem::igrlab::EulerAdmissibilityPointSet point_set)
   {
-    const auto scan = mfem::dg_igr::ScanEulerAdmissibility(vfes_,
+    const auto scan = mfem::igrlab::ScanEulerAdmissibility(vfes_,
                                                            v,
                                                            dim_,
                                                            gamma_,
@@ -430,22 +527,22 @@ void RK3SSPWithLimiter::MaybeScanAdmissibility(Vector& v,
     }
   };
 
-  report_scan(mfem::dg_igr::EulerAdmissibilityPointSet::Dof);
-  report_scan(mfem::dg_igr::EulerAdmissibilityPointSet::Limiter);
-  report_scan(mfem::dg_igr::EulerAdmissibilityPointSet::Output);
+  report_scan(mfem::igrlab::EulerAdmissibilityPointSet::Dof);
+  report_scan(mfem::igrlab::EulerAdmissibilityPointSet::Limiter);
+  report_scan(mfem::igrlab::EulerAdmissibilityPointSet::Output);
 }
 
 void RK3SSPWithLimiter::MaybeCaptureStagePair(Vector& v,
                                               double t,
                                               const char* side)
 {
-  const char* prefix = std::getenv("DG_IGR_RK_STAGE_CAPTURE_DIR");
+  const char* prefix = ::igrlab::GetEnv("DG_IGR_RK_STAGE_CAPTURE_DIR");
   if (!prefix || prefix[0] == '\0' || stage_pair_capture_written_)
   {
     return;
   }
 
-  const char* min_time_text = std::getenv("DG_IGR_RK_STAGE_CAPTURE_MIN_TIME");
+  const char* min_time_text = ::igrlab::GetEnv("DG_IGR_RK_STAGE_CAPTURE_MIN_TIME");
   const double min_time = min_time_text ? std::strtod(min_time_text, nullptr) : 0.0;
   if (t < min_time)
   {
@@ -507,15 +604,31 @@ void RK3SSPWithLimiter::MaybeCaptureStagePair(Vector& v,
   }
 }
 
-// --------------------------------- SSPRK(3,3) ---------------------------------
+// ---------------------------- Explicit SSP RK methods -------------------------
 
 void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
 {
   stage_nan_detected_ = false;
+  zhang_shu_diagnostics_pending_ = false;
+  const int stage_count = GetStageCount();
+  MFEM_VERIFY(stage_count > 0, "Unsupported explicit SSPRK method.");
+  const bool track_boundary_flux = physical_boundary_flux_tracking_enabled_;
+  MFEM_VERIFY(!track_boundary_flux || SupportsPhysicalBoundaryFluxTracking(),
+              "Physical-boundary flux tracking was enabled, but the RHS "
+              "operator cannot provide exact boundary-flux integrals.");
+  const real_t attempted_dt = dt;
+  attempted_characteristic_speed_ = 0.0;
+  attempted_characteristic_speed_available_ = false;
+  if (track_boundary_flux)
+  {
+    attempted_physical_boundary_flux_integral_ = 0.0;
+    attempted_physical_boundary_flux_absolute_integral_ = 0.0;
+  }
   RKStageAwareOperator* stage_aware = dynamic_cast<RKStageAwareOperator*>(f);
   if (stage_aware)
   {
-    stage_aware->BeginRKStep(static_cast<int>(step_count_), t, dt);
+    stage_aware->BeginRKStep(
+      static_cast<int>(step_count_), t, dt, stage_count);
   }
   // Decide whether to apply optional limiters on this step.
   const bool apply_optional =
@@ -526,7 +639,10 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   //   - Optional-callbacks: only early steps if apply_optional = true.
   if (limit_initial_)
   {
-    if (ApplyCallbacks(x, t, apply_optional))
+    if (ApplyCallbacks(x,
+                       t,
+                       apply_optional,
+                       /*report_state_mutation=*/true))
     {
       AdvanceStateGeneration();
     }
@@ -534,69 +650,341 @@ void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
   MaybeScanVector(x, t, "initial");
   MaybeScanAdmissibility(x, t, "initial");
 
-  // k0 = f(t, x)
-  if (stage_aware)
+  auto evaluate_rhs = [&](int stage,
+                          Vector& state,
+                          real_t stage_time,
+                          const char* label)
   {
-    stage_aware->SetRKStageState(0, state_generation_);
-  }
-  f->SetTime(t);
-  f->Mult(x, k_);
-  MaybeScanVector(k_, t, "rhs0");
+    if (stage_aware)
+    {
+      stage_aware->SetRKStageState(stage, state_generation_, stage_time);
+    }
+    f->SetTime(stage_time);
+    ++rhs_evaluation_count_;
+    if (track_boundary_flux)
+    {
+      // Keep the one-shot arm adjacent to the actual production RHS. In
+      // particular, separate CFL probes never pass through this path.
+      boundary_flux_provider_->ArmPhysicalBoundaryFluxIntegral();
+    }
+    f->Mult(state, k_);
+    if (characteristic_speed_reader_)
+    {
+      const real_t stage_characteristic_speed =
+        characteristic_speed_reader_();
+      MFEM_VERIFY(std::isfinite(stage_characteristic_speed) &&
+                    stage_characteristic_speed >= 0.0,
+                  "The SSPRK RHS reported an invalid characteristic speed.");
+      attempted_characteristic_speed_ =
+        attempted_characteristic_speed_available_
+          ? std::max(attempted_characteristic_speed_,
+                     stage_characteristic_speed)
+          : stage_characteristic_speed;
+      attempted_characteristic_speed_available_ = true;
+    }
+    if (track_boundary_flux)
+    {
+      MFEM_VERIFY(
+        boundary_flux_provider_->HasLastPhysicalBoundaryFluxIntegral(),
+        "An armed RHS did not complete its physical-boundary flux capture.");
+      const Vector& stage_flux =
+        boundary_flux_provider_->GetLastPhysicalBoundaryFluxIntegral();
+      MFEM_VERIFY(stage_flux.Size() > 0,
+                  "Physical-boundary flux capture has no components.");
+      if (attempted_physical_boundary_flux_integral_.Size() == 0)
+      {
+        attempted_physical_boundary_flux_integral_.SetSize(stage_flux.Size());
+        attempted_physical_boundary_flux_absolute_integral_.SetSize(
+          stage_flux.Size());
+        attempted_physical_boundary_flux_integral_ = 0.0;
+        attempted_physical_boundary_flux_absolute_integral_ = 0.0;
+      }
+      MFEM_VERIFY(
+        stage_flux.Size() == attempted_physical_boundary_flux_integral_.Size(),
+        "Physical-boundary flux component count changed within an RK step.");
 
-  // ===== Stage 1: y = x + dt * k0 =====
-  add(x, dt, k_, y_);
-  MaybeScanVector(y_, t + dt, "stage1-prelimit");
-  MaybeScanAdmissibility(y_, t + dt, "stage1-prelimit");
-  ApplyCallbacks(y_, t + dt, apply_optional);
-  AdvanceStateGeneration();
-  MaybeScanVector(y_, t + dt, "stage1");
-  MaybeScanAdmissibility(y_, t + dt, "stage1");
+      const real_t weight =
+        attempted_dt * PhysicalBoundaryFluxStageWeight(method_, stage);
+      const real_t* flux = stage_flux.HostRead();
+      real_t* attempted =
+        attempted_physical_boundary_flux_integral_.HostReadWrite();
+      real_t* attempted_absolute =
+        attempted_physical_boundary_flux_absolute_integral_.HostReadWrite();
+      for (int component = 0; component < stage_flux.Size(); ++component)
+      {
+        attempted[component] += weight * flux[component];
+        attempted_absolute[component] +=
+          std::abs(weight) * std::abs(flux[component]);
+      }
+    }
+    MaybeScanVector(k_, stage_time, label);
+  };
 
-  // k1 = f(t+dt, y)
-  if (stage_aware)
+  auto finish_stage = [&](Vector& state,
+                          real_t stage_time,
+                          bool stage_optional,
+                          const char* prelimit_label,
+                          const char* postlimit_label)
   {
-    stage_aware->SetRKStageState(1, state_generation_);
-  }
-  f->SetTime(t + dt);
-  f->Mult(y_, k_);
-  MaybeScanVector(k_, t + dt, "rhs1");
+    MaybeScanVector(state, stage_time, prelimit_label);
+    MaybeScanAdmissibility(state, stage_time, prelimit_label);
+    ApplyCallbacks(state, stage_time, stage_optional);
+    AdvanceStateGeneration();
+    MaybeScanVector(state, stage_time, postlimit_label);
+    MaybeScanAdmissibility(state, stage_time, postlimit_label);
+  };
 
-  // ===== Stage 2: y = 3/4*x + 1/4 ( y + dt * k1 ) =====
-  y_.Add(dt, k_); // y := y + dt*k1
-  add(3.0 / 4.0, x, 1.0 / 4.0, y_, y_);
-  MaybeScanVector(y_, t + dt, "stage2-prelimit");
-  MaybeScanAdmissibility(y_, t + dt, "stage2-prelimit");
-  ApplyCallbacks(y_, t + dt, /*apply_optional=*/false);
-  AdvanceStateGeneration();
-  MaybeScanVector(y_, t + dt, "stage2");
-  MaybeScanAdmissibility(y_, t + dt, "stage2");
+  const char* final_prelimit_label = "stage3-prelimit";
+  const char* final_postlimit_label = "stage3";
 
-  // k2 = f(t + dt/2, y)
-  if (stage_aware)
+  auto tableau_step = [&](const auto& a, const auto& b, const auto& c)
   {
-    stage_aware->SetRKStageState(2, state_generation_);
-  }
-  f->SetTime(t + dt / 2);
-  f->Mult(y_, k_);
-  MaybeScanVector(k_, t + dt / 2, "rhs2");
+    const int stages = static_cast<int>(b.size());
+    for (int stage = 0; stage < stages; ++stage)
+    {
+      research_stage_work_[stage].SetSize(x.Size(), mem_type);
+      if (stage == 0)
+      {
+        evaluate_rhs(stage, x, t, "research-rk-rhs");
+      }
+      else
+      {
+        y_ = x;
+        for (int j = 0; j < stage; ++j)
+        {
+          if (a[stage][j] != 0.0)
+          {
+            y_.Add(dt * a[stage][j], research_stage_work_[j]);
+          }
+        }
+        const real_t stage_time = t + c[stage] * dt;
+        finish_stage(y_, stage_time, /*stage_optional=*/false,
+                     "research-rk-stage-prelimit", "research-rk-stage");
+        evaluate_rhs(stage, y_, stage_time, "research-rk-rhs");
+      }
+      research_stage_work_[stage] = k_;
+    }
+    for (int stage = 0; stage < stages; ++stage)
+    {
+      if (b[stage] != 0.0)
+      {
+        x.Add(dt * b[stage], research_stage_work_[stage]);
+      }
+    }
+    final_prelimit_label = "research-rk-final-prelimit";
+    final_postlimit_label = "research-rk-final";
+  };
 
-  // ===== Stage 3: x = 1/3*x + 2/3 ( y + dt*k2 ) =====
-  y_.Add(dt, k_); // y := y + dt*k2
-  add(1.0 / 3.0, x, 2.0 / 3.0, y_, x);
+  switch (method_)
+  {
+  case SSPRKMethod::SSPRK33:
+    // Preserve the historical SSPRK(3,3) state updates and callback cadence.
+    evaluate_rhs(/*stage=*/0, x, t, "rhs0");
+    add(x, dt, k_, y_);
+    finish_stage(y_,
+                 t + dt,
+                 apply_optional,
+                 "stage1-prelimit",
+                 "stage1");
+
+    evaluate_rhs(/*stage=*/1, y_, t + dt, "rhs1");
+    y_.Add(dt, k_);
+    add(3.0 / 4.0, x, 1.0 / 4.0, y_, y_);
+    finish_stage(y_,
+                 t + dt / 2.0,
+                 /*stage_optional=*/false,
+                 "stage2-prelimit",
+                 "stage2");
+
+    evaluate_rhs(/*stage=*/2, y_, t + dt / 2.0, "rhs2");
+    y_.Add(dt, k_);
+    add(1.0 / 3.0, x, 2.0 / 3.0, y_, x);
+    break;
+
+  case SSPRKMethod::SSPRK104:
+  {
+    // Ketcheson's 2-register Shu--Osher implementation. The non-monotone
+    // abscissae are intentional: c5=2/3 is followed by c6=1/3.
+    constexpr real_t kForwardEulerFraction = 1.0 / 6.0;
+    const auto& c = SSPRK104Coefficients::c;
+    y_ = x; // q2 retains the accepted input while q1 advances in x.
+
+    for (int stage = 0; stage < 4; ++stage)
+    {
+      evaluate_rhs(stage, x, t + c[stage] * dt, "ssprk104-rhs");
+      x.Add(kForwardEulerFraction * dt, k_);
+      finish_stage(x,
+                   t + c[stage + 1] * dt,
+                   stage == 0 && apply_optional,
+                   "ssprk104-stage-prelimit",
+                   "ssprk104-stage");
+    }
+
+    evaluate_rhs(/*stage=*/4, x, t + c[4] * dt, "ssprk104-rhs");
+    x.Add(kForwardEulerFraction * dt, k_);
+    y_ *= 1.0 / 25.0;
+    y_.Add(9.0 / 25.0, x);
+    add(15.0, y_, -5.0, x, x);
+    finish_stage(x,
+                 t + c[5] * dt,
+                 /*stage_optional=*/false,
+                 "ssprk104-stage-prelimit",
+                 "ssprk104-stage");
+
+    for (int stage = 5; stage < 9; ++stage)
+    {
+      evaluate_rhs(stage, x, t + c[stage] * dt, "ssprk104-rhs");
+      x.Add(kForwardEulerFraction * dt, k_);
+      finish_stage(x,
+                   t + c[stage + 1] * dt,
+                   /*stage_optional=*/false,
+                   "ssprk104-stage-prelimit",
+                   "ssprk104-stage");
+    }
+
+    evaluate_rhs(/*stage=*/9, x, t + c[9] * dt, "ssprk104-rhs");
+    x *= 3.0 / 5.0;
+    x.Add(1.0, y_);
+    x.Add(dt / 10.0, k_);
+    final_prelimit_label = "ssprk104-final-prelimit";
+    final_postlimit_label = "ssprk104-final";
+    break;
+  }
+  case SSPRKMethod::ResearchRK4:
+    tableau_step(ResearchRK4Coefficients::a,
+                  ResearchRK4Coefficients::b, ResearchRK4Coefficients::c);
+    break;
+  case SSPRKMethod::ResearchDOPRI5:
+    tableau_step(ResearchDOPRI5Coefficients::a,
+                  ResearchDOPRI5Coefficients::b,
+                  ResearchDOPRI5Coefficients::c);
+    break;
+  case SSPRKMethod::ResearchRadauPicard5:
+  {
+    using Coefficients = ResearchRadauPicard5Coefficients;
+    for (Vector& work : research_stage_work_)
+    {
+      work.SetSize(x.Size(), mem_type);
+    }
+    evaluate_rhs(0, x, t, "radau-picard-initial-rhs");
+    for (int node = 0; node < 3; ++node)
+    {
+      add(x, dt * Coefficients::c[node], k_, research_stage_work_[node]);
+    }
+    for (int sweep = 0; sweep < Coefficients::sweeps; ++sweep)
+    {
+      // Every node consumes the previous sweep. No within-sweep stage
+      // dependency is hidden by the serial ordinary-CUDA evaluation here.
+      for (int node = 0; node < 3; ++node)
+      {
+        Vector& state = research_stage_work_[node];
+        const real_t stage_time = t + dt * Coefficients::c[node];
+        finish_stage(state, stage_time, /*stage_optional=*/false,
+                     "radau-picard-node-prelimit", "radau-picard-node");
+        evaluate_rhs(1 + 3 * sweep + node, state, stage_time,
+                      "radau-picard-node-rhs");
+        research_stage_work_[3 + node] = k_;
+      }
+      if (sweep + 1 < Coefficients::sweeps)
+      {
+        for (int node = 0; node < 3; ++node)
+        {
+          Vector& state = research_stage_work_[node];
+          state = x;
+          for (int j = 0; j < 3; ++j)
+          {
+            state.Add(dt * Coefficients::q[node][j],
+                       research_stage_work_[3 + j]);
+          }
+        }
+      }
+    }
+    for (int node = 0; node < 3; ++node)
+    {
+      x.Add(dt * Coefficients::b[node], research_stage_work_[3 + node]);
+    }
+    final_prelimit_label = "radau-picard-final-prelimit";
+    final_postlimit_label = "radau-picard-final";
+    break;
+  }
+  }
+
   MaybeCaptureStagePair(x, t + dt, "pre");
-  MaybeScanVector(x, t + dt, "stage3-prelimit");
-  MaybeScanAdmissibility(x, t + dt, "stage3-prelimit");
+  MaybeScanVector(x, t + dt, final_prelimit_label);
+  MaybeScanAdmissibility(x, t + dt, final_prelimit_label);
   t += dt;
-  // Final limiting on x
   ApplyCallbacks(x, t, /*apply_optional=*/false);
   AdvanceStateGeneration();
   MaybeCaptureStagePair(x, t, "post");
-  MaybeScanVector(x, t, "stage3");
-  MaybeScanAdmissibility(x, t, "stage3");
+  MaybeScanVector(x, t, final_postlimit_label);
+  MaybeScanAdmissibility(x, t, final_postlimit_label);
 
   if (stage_aware)
   {
     stage_aware->EndRKStep(x, t, state_generation_);
+  }
+
+  // A stage-aware algebraic reconstruction may tighten the characteristic
+  // bound at the accepted endpoint (for example after replacing an
+  // extrapolated IGR sigma by its exact instantaneous closure). Merge that
+  // bound before publishing the transaction. If EndRKStep throws, this code
+  // is never reached and rejected work remains unable to alter the accepted
+  // CFL state.
+  if (characteristic_speed_reader_)
+  {
+    const real_t endpoint_characteristic_speed =
+      characteristic_speed_reader_();
+    MFEM_VERIFY(std::isfinite(endpoint_characteristic_speed) &&
+                  endpoint_characteristic_speed >= 0.0,
+                "The SSPRK endpoint reported an invalid characteristic "
+                "speed.");
+    attempted_characteristic_speed_ =
+      attempted_characteristic_speed_available_
+        ? std::max(attempted_characteristic_speed_,
+                   endpoint_characteristic_speed)
+        : endpoint_characteristic_speed;
+    attempted_characteristic_speed_available_ = true;
+  }
+
+  if (zhang_shu_diagnostics_pending_)
+  {
+    WriteDG0ElementField(*zhang_shu_active_field_,
+                         zhang_shu_diagnostics_.active);
+    WriteDG0ElementField(*zhang_shu_theta_rho_field_,
+                         zhang_shu_diagnostics_.theta_rho);
+    WriteDG0ElementField(*zhang_shu_theta_p_field_,
+                         zhang_shu_diagnostics_.theta_p);
+    zhang_shu_diagnostics_pending_ = false;
+  }
+
+  if (track_boundary_flux)
+  {
+    const int component_count =
+      attempted_physical_boundary_flux_integral_.Size();
+    MFEM_VERIFY(component_count > 0,
+                "Tracked RK step completed without boundary-flux samples.");
+    if (!cumulative_physical_boundary_flux_available_)
+    {
+      cumulative_physical_boundary_flux_integral_.SetSize(component_count);
+      cumulative_physical_boundary_flux_absolute_integral_.SetSize(
+        component_count);
+      cumulative_physical_boundary_flux_integral_ = 0.0;
+      cumulative_physical_boundary_flux_absolute_integral_ = 0.0;
+    }
+    MFEM_VERIFY(
+      cumulative_physical_boundary_flux_integral_.Size() == component_count,
+      "Physical-boundary flux component count changed between RK steps.");
+    cumulative_physical_boundary_flux_integral_ +=
+      attempted_physical_boundary_flux_integral_;
+    cumulative_physical_boundary_flux_absolute_integral_ +=
+      attempted_physical_boundary_flux_absolute_integral_;
+    cumulative_physical_boundary_flux_available_ = true;
+  }
+
+  if (attempted_characteristic_speed_available_)
+  {
+    accepted_characteristic_speed_ = attempted_characteristic_speed_;
+    accepted_characteristic_speed_available_ = true;
   }
 
   ++step_count_;

@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "numerics/limiters/tvb.hpp"
 
 #include "limiters_common.hpp"
@@ -53,8 +54,8 @@ void ApplyCharacteristicTVBLimiter(ParFiniteElementSpace& vfes,
   Vector Ubar(num_eq), row(num_eq);
   Vector wx, wy;
   Array2D<double> dof_xy;
-  Array<dg_igr::limiters_detail::Nbr4> nbr;
-  dg_igr::limiters_detail::Build4Nbrs(mesh, nbr);
+  Array<igrlab::limiters_detail::Nbr4> nbr;
+  igrlab::limiters_detail::Build4Nbrs(mesh, nbr);
 
   std::vector<Vector> Ubar_all(NE, Vector(num_eq));
   std::vector<std::pair<double, double>> dxy_all(NE);
@@ -66,14 +67,14 @@ void ApplyCharacteristicTVBLimiter(ParFiniteElementSpace& vfes,
     vfes.GetElementVDofs(i, vdofs);
     U.GetSubVector(vdofs, elvec);
     elmat.UseExternalData(elvec.GetData(), dof, num_eq);
-    dg_igr::limiters_detail::ElementAverage(*fe,
+    igrlab::limiters_detail::ElementAverage(*fe,
                                             *Tr,
                                             elmat,
                                             num_eq,
                                             qord_avg,
                                             Ubar);
     Ubar_all[i] = Ubar;
-    dxy_all[i] = dg_igr::limiters_detail::ElementDXDYFromArea(*Tr, qord_avg);
+    dxy_all[i] = igrlab::limiters_detail::ElementDXDYFromArea(*Tr, qord_avg);
   }
 
   for (int i = 0; i < NE; ++i)
@@ -92,7 +93,7 @@ void ApplyCharacteristicTVBLimiter(ParFiniteElementSpace& vfes,
     Ubar = Ubar_all[i];
 
     double area = 0.0;
-    dg_igr::limiters_detail::SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
+    igrlab::limiters_detail::SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
     Vector sDGx(num_eq);
     sDGx = 0.0;
     Vector sDGy(num_eq);
@@ -116,13 +117,13 @@ void ApplyCharacteristicTVBLimiter(ParFiniteElementSpace& vfes,
     const Vector& Uyp = mean_or_self(nbr[i].yp);
 
     Vector dlx(num_eq), drx(num_eq), dly(num_eq), dry(num_eq);
-    dg_igr::limiters_detail::Subtract(Ubar, Uxm, dlx);
+    igrlab::limiters_detail::Subtract(Ubar, Uxm, dlx);
     dlx /= std::max(dx, 1e-16);
-    dg_igr::limiters_detail::Subtract(Uxp, Ubar, drx);
+    igrlab::limiters_detail::Subtract(Uxp, Ubar, drx);
     drx /= std::max(dx, 1e-16);
-    dg_igr::limiters_detail::Subtract(Ubar, Uym, dly);
+    igrlab::limiters_detail::Subtract(Ubar, Uym, dly);
     dly /= std::max(dy, 1e-16);
-    dg_igr::limiters_detail::Subtract(Uyp, Ubar, dry);
+    igrlab::limiters_detail::Subtract(Uyp, Ubar, dry);
     dry /= std::max(dy, 1e-16);
 
     const double rho = std::max(Ubar(0), 1e-16);
@@ -177,7 +178,7 @@ void ApplyCharacteristicTVBLimiter(ParFiniteElementSpace& vfes,
       Vector Xc(3);
       Tr->Transform(ipc, Xc);
       Array2D<double> dof_xy;
-      dg_igr::limiters_detail::ElementDofXY(*fe, *Tr, dof_xy);
+      igrlab::limiters_detail::ElementDofXY(*fe, *Tr, dof_xy);
 
       Vector rowv(num_eq);
       for (int j = 0; j < dof; ++j)
@@ -219,8 +220,8 @@ void ApplyCharacteristicTVBFaceNormal(ParFiniteElementSpace& vfes,
     (opt.slope_qord > 0) ? opt.slope_qord : (2 * order + 2);
 
   // Per-element face normals & neighbors
-  std::vector<std::vector<dg_igr::limiters_detail::FaceNbrRec>> faces;
-  dg_igr::limiters_detail::BuildPerElementFaceNormals(mesh, faces);
+  std::vector<std::vector<igrlab::limiters_detail::FaceNbrRec>> faces;
+  igrlab::limiters_detail::BuildPerElementFaceNormals(mesh, faces);
 
   // Precompute cell averages and DG slope weights
   std::vector<Vector> Ubar_all(NE, Vector(num_eq));
@@ -241,7 +242,7 @@ void ApplyCharacteristicTVBFaceNormal(ParFiniteElementSpace& vfes,
     U.GetSubVector(vdofs, elvec);
     elmat.UseExternalData(elvec.GetData(), dof, num_eq);
 
-    dg_igr::limiters_detail::ElementAverage(*fe,
+    igrlab::limiters_detail::ElementAverage(*fe,
                                             *Tr,
                                             elmat,
                                             num_eq,
@@ -264,7 +265,7 @@ void ApplyCharacteristicTVBFaceNormal(ParFiniteElementSpace& vfes,
     Ubar = Ubar_all[i];
 
     // Candidate DG slopes via ∫ grad phi_j (vector gradient components)
-    dg_igr::limiters_detail::SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
+    igrlab::limiters_detail::SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
     Vector sDGx(num_eq);
     sDGx = 0.0;
     Vector sDGy(num_eq);
@@ -284,7 +285,7 @@ void ApplyCharacteristicTVBFaceNormal(ParFiniteElementSpace& vfes,
     Vector sUy(num_eq);
     sUy = 0.0;
 
-    for (const dg_igr::limiters_detail::FaceNbrRec& fr : faces[i])
+    for (const igrlab::limiters_detail::FaceNbrRec& fr : faces[i])
     {
       const double nx = fr.nx, ny = fr.ny;
       const double dn = std::max(fr.dn, 1e-14);
@@ -300,9 +301,9 @@ void ApplyCharacteristicTVBFaceNormal(ParFiniteElementSpace& vfes,
       const Vector& Uo = (fr.nbr >= 0) ? Ubar_all[fr.nbr] : Ubar_all[i];
 
       Vector dmn(num_eq), dpn(num_eq);
-      dg_igr::limiters_detail::Subtract(Ui, Uo, dmn);
+      igrlab::limiters_detail::Subtract(Ui, Uo, dmn);
       dmn /= dn; // "minus" (this - other) / dn
-      dg_igr::limiters_detail::Subtract(Uo, Ui, dpn);
+      igrlab::limiters_detail::Subtract(Uo, Ui, dpn);
       dpn /= dn; // "plus"  (other - this) / dn
 
       // Characteristics along n (approximate)
@@ -336,7 +337,7 @@ void ApplyCharacteristicTVBFaceNormal(ParFiniteElementSpace& vfes,
     Vector Xc(3);
     Tr->Transform(ipc, Xc);
     Array2D<double> dof_xy;
-    dg_igr::limiters_detail::ElementDofXY(*fe, *Tr, dof_xy);
+    igrlab::limiters_detail::ElementDofXY(*fe, *Tr, dof_xy);
 
     Vector rowv(num_eq);
     for (int j = 0; j < dof; ++j)

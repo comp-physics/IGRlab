@@ -1,14 +1,16 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 #include <cstdlib>
 #include <string>
 
-namespace dg_igr
+namespace igrlab
 {
 
 inline bool EnvFlagEnabled(const char* name)
 {
-  const char* raw = std::getenv(name);
+  const char* raw = ::igrlab::GetEnv(name);
   if (!raw)
   {
     return false;
@@ -20,7 +22,7 @@ inline bool EnvFlagEnabled(const char* name)
 
 inline bool EnvFlagEnabledDefault(const char* name, bool default_value)
 {
-  const char* raw = std::getenv(name);
+  const char* raw = ::igrlab::GetEnv(name);
   if (!raw)
   {
     return default_value;
@@ -28,4 +30,4 @@ inline bool EnvFlagEnabledDefault(const char* name, bool default_value)
   return EnvFlagEnabled(name);
 }
 
-} // namespace dg_igr
+} // namespace igrlab

@@ -12,6 +12,7 @@
 
 #include "mfem.hpp"
 #include "test_utils.hpp"
+#include "test_dgsem_reference_convergence.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -975,6 +976,8 @@ int RunDGSEMAdvectionTests(TestContext& ctx)
       ", inlet_flux_norm_max=" + FormatSci(diag_max.inlet_flux_norm) +
       ", outlet_flux_norm_max=" + FormatSci(diag_max.outlet_flux_norm));
   }
+
+  RunDGSEMP1P4ConvergenceGate(ctx);
 
   return ctx.failures;
 }

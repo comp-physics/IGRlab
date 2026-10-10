@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Bounded active-wave or stationary-shock application precision experiment.
+
+Build with build.sh first. The caller owns the GPU lease. This helper runs the
+existing smooth-wave application, retains its ordinary output, and records
+whole-process wall time. Compare saved fields with compare_vtk_pvd_fields.py;
+successful termination and closure certification alone are not error estimates.
+"""
+import argparse
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import subprocess
+import threading
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--executable", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--mesh", type=Path)
+    parser.add_argument("--case", choices=("active-wave", "stationary-shock", "supersonic-cylinder"), default="active-wave")
+    parser.add_argument("--order", type=int, choices=(1, 2, 3, 4), default=3)
+    parser.add_argument("--refine", type=int, choices=(0, 1, 2), default=0)
+    parser.add_argument("--dt", type=float, default=0.001)
+    parser.add_argument("--final-time", type=float, default=0.01)
+    parser.add_argument("--linear-rtol", type=float, default=1e-10)
+    parser.add_argument("--linear-solver", choices=("cg", "fgmres"), default="cg")
+    parser.add_argument("--preconditioner", choices=("chebyshev", "hypresmoother", "none"), default="chebyshev")
+    parser.add_argument("--cheb-order", type=int, choices=(1, 2, 3, 4, 5))
+    parser.add_argument("--cheb-power-iterations", type=int, choices=range(1, 21))
+    parser.add_argument("--dense-inverse", choices=("fp64", "fp32", "tf32"))
+    parser.add_argument("--two-level-inverse", choices=("dense", "cg"))
+    parser.add_argument("--two-level-order", type=int, choices=(1, 2, 3, 4))
+    parser.add_argument("--patch-radius", type=int, choices=range(7))
+    parser.add_argument("--patch-kind", choices=("ras", "vertex-p1", "face-condensed", "trace-pairs"), default="ras")
+    parser.add_argument("--patch-precision", choices=("fp64", "fp32", "tf32"), default="fp64")
+    parser.add_argument("--patch-rebuild-interval", type=int, default=0)
+    parser.add_argument("--dense-setup", choices=("host", "cusolver"))
+    parser.add_argument("--integrator", choices=("rk3ssp", "ssprk104", "rk4", "dopri5", "radau-picard5"), default="rk3ssp")
+    parser.add_argument("--sigma-space", choices=("L2", "H1"), default="L2")
+    parser.add_argument("--sigma-cadence", choices=("every-stage", "extrapolated-every-step"),
+                        default="every-stage")
+    parser.add_argument("--extrapolation-degree", type=int, choices=(1, 2, 3))
+    parser.add_argument("--volume-dissipation", choices=("none", "llf"), default="none")
+    parser.add_argument("--positivity-limiter", choices=("none", "zhangshu"), default="none")
+    parser.add_argument("--c-alpha", type=float, default=1.0)
+    parser.add_argument("--shock-x", type=float)
+    parser.add_argument("--shock-width", type=float)
+    parser.add_argument("--shock-mach", type=float)
+    parser.add_argument("--shock-speed", type=float)
+    parser.add_argument("--sigma-basis", choices=("lgl",))
+    parser.add_argument("--fused-residual", action="store_true")
+    parser.add_argument("--fused-dmma", action="store_true")
+    parser.add_argument("--frozen-sigma-reference", action="store_true")
+    parser.add_argument("--stationary-sweeps", type=int, choices=range(1, 17))
+    parser.add_argument("--diagnostic-scans", choices=("on", "off"), default="on")
+    parser.add_argument("--conservation-balance", action="store_true")
+    parser.add_argument("--timeout", type=float, default=180)
+    args = parser.parse_args()
+    if any(v is not None for v in (args.shock_x, args.shock_width, args.shock_mach, args.shock_speed)):
+        if args.case != "stationary-shock":
+            parser.error("shock position/width options require the stationary-shock case")
+        if ((args.shock_x is not None and not math.isfinite(args.shock_x)) or
+                (args.shock_width is not None and
+                 (not math.isfinite(args.shock_width) or args.shock_width <= 0))):
+            parser.error("shock position must be finite and physical width positive")
+    for value in (args.dt, args.final_time, args.linear_rtol, args.timeout, args.c_alpha):
+        if not math.isfinite(value) or value <= 0:
+            parser.error("time, tolerance, and timeout must be finite and positive")
+    if args.dense_inverse in ("fp32", "tf32") and args.linear_solver != "fgmres":
+        parser.error("mixed precision requires --linear-solver fgmres")
+    if args.two_level_inverse and (args.dense_inverse or args.linear_solver != "fgmres"):
+        parser.error("two-level inverse requires FGMRES and excludes the global dense inverse")
+    if args.dense_setup and not args.dense_inverse:
+        parser.error("dense setup requires global dense inverse")
+    if args.two_level_order and not args.two_level_inverse:
+        parser.error("two-level order requires two-level inverse")
+    if args.patch_radius is not None and (args.dense_inverse or args.two_level_inverse or
+            (args.linear_solver != "fgmres" and
+             (args.patch_kind not in ("vertex-p1", "face-condensed", "trace-pairs") or args.patch_precision != "fp64")) or args.sigma_space != "L2"):
+        parser.error("screened patches require FGMRES (or CG for FP64 vertex/face-condensed), L2 sigma, and no dense/two-level inverse")
+    if args.patch_rebuild_interval < 0 or (args.patch_radius is None and
+            (args.patch_rebuild_interval or args.patch_precision != "fp64")):
+        parser.error("patch precision/rebuilding requires patches and a nonnegative interval")
+    if args.extrapolation_degree and args.sigma_cadence != "extrapolated-every-step":
+        parser.error("extrapolation degree requires extrapolated-every-step cadence")
+    if args.fused_dmma and not args.fused_residual:
+        parser.error("DMMA requires fused residual")
+    if args.stationary_sweeps and args.linear_solver != "fgmres":
+        parser.error("stationary correction requires FGMRES fallback")
+    if args.patch_kind == "vertex-p1" and (args.patch_radius != 0 or args.order != 1 or args.patch_precision != "fp64"):
+        parser.error("vertex-p1 requires --order 1 --patch-radius 0 --patch-precision fp64")
+    if args.patch_kind in ("face-condensed", "trace-pairs") and args.patch_radius != 0:
+        parser.error("face-condensed requires --patch-radius 0")
+    if args.shock_mach is not None and (not math.isfinite(args.shock_mach) or args.shock_mach <= 1):
+        parser.error("shock Mach must be finite and exceed one")
+    if args.shock_speed is not None and not math.isfinite(args.shock_speed):
+        parser.error("shock speed must be finite")
+    source = Path(__file__).resolve().parents[2]
+    executable = args.executable.resolve(strict=True)
+    default_mesh = {
+        "active-wave": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n6.mesh",
+        "stationary-shock": "examples/inoue_hattori_stationary_shock_1dy/inoue_hattori_stationary_shock_1dy.mesh",
+        "supersonic-cylinder": "examples/supersonic_example_w_igr/supersonic_cylinder.msh",
+    }[args.case]
+    mesh = (args.mesh or source / default_mesh).resolve(strict=True)
+    out = args.output_dir.resolve()
+    out.mkdir(parents=True, exist_ok=False)
+    command = [
+        str(executable), "--device", "cuda", "--mesh", str(mesh),
+        "--discretization", "dgsem", "--dg-backend", "dgsem",
+        "--order", str(args.order), "--serial-refine", str(args.refine),
+        "--parallel-refine", "0", "--regularization", "igr", "--c-alpha", str(args.c_alpha),
+        "--igr-alpha-length", "local", "--dgsem-stab", "none",
+        "--dgsem-volume-flux", "central", "--dgsem-volume-dissipation", args.volume_dissipation,
+        "--dgsem-surface-flux", "rusanov", "--time-integrator", args.integrator,
+        "--time-step", format(args.dt, ".17g"), "--cfl-number", "0",
+        "--t-final", format(args.final_time, ".17g"), "--igr-space", args.sigma_space,
+        "--igr-grad", "BrokenL2", "--igr-solve-mode", "krylov",
+        "--igr-ip-kind", "sipg", "--igr-exact-dg-face",
+        "--igr-sigma-cadence", args.sigma_cadence, "--igr-stage-rtol-scale", "1",
+        "--igr-linear-solver", args.linear_solver, "--igr-preconditioner", args.preconditioner,
+        "--igr-lin-rtol", format(args.linear_rtol, ".17g"),
+        "--igr-lin-atol", "0", "--igr-lin-maxit", "2000",
+        "--igr-nonconvergence-policy", "error", "--igr-lin-print", "0",
+        "--no-igr-sigma-cfl", "--no-igr-sigma-rusanov", "--no-igr-invariant-domain-flux",
+        "--positivity-limiter", args.positivity_limiter,
+        "--nan-scan" if args.diagnostic_scans == "on" else "--no-nan-scan",
+        "--admissibility-scan" if args.diagnostic_scans == "on" else "--no-admissibility-scan",
+        "--analysis-steps", "0", "--visualization-steps", "1000000",
+        "--vtk_save", "--time-step-save", format(args.final_time, ".17g"),
+        "--no-glvis", "--no-save-state", "--no-vtk-h1-diagnostics",
+        "--no-vtk-l2-diagnostics", "--no-vtk-mpi-rank-field", "--no-vtk-zhang-shu-diagnostics",
+    ]
+    if args.case == "active-wave":
+        command.append("--active-igr-wave")
+    if args.shock_x is not None:
+        command.extend(("--shock-x", format(args.shock_x, ".17g")))
+    if args.shock_width is not None:
+        command.extend(("--shock-width", format(args.shock_width, ".17g")))
+    if args.conservation_balance:
+        command.append("--conservation-balance")
+    if args.shock_mach is not None:
+        command.extend(["--shock-mach", str(args.shock_mach)])
+    if args.shock_speed is not None:
+        command.extend(["--shock-speed", str(args.shock_speed)])
+    environment = os.environ.copy()
+    for key in ("DG_IGR_IGR_DENSE_INVERSE", "DG_IGR_IGR_TWO_LEVEL_INVERSE",
+                "DG_IGR_IGR_TWO_LEVEL_COARSE", "DG_IGR_IGR_TWO_LEVEL_ORDER",
+                "DG_IGR_IGR_PATCH_RADIUS", "DG_IGR_IGR_PATCH_PRECISION", "DG_IGR_IGR_PATCH_KIND",
+                "DG_IGR_IGR_PATCH_REBUILD_INTERVAL",
+                "DG_IGR_IGR_DENSE_SETUP", "DG_IGR_IGR_CHEB_ORDER", "DG_IGR_IGR_CHEB_POWER_ITERATIONS",
+                "DG_IGR_IGR_EXTRAPOLATION_DEGREE",
+                "DG_IGR_IGR_SIGMA_BASIS", "DG_IGR_DGSEM_FUSED_RESIDUAL",
+                "DG_IGR_DGSEM_FUSED_DMMA", "DG_IGR_IGR_STATIONARY_SWEEPS",
+                "DG_IGR_IGR_FROZEN_SIGMA_REFERENCE"):
+        environment.pop(key, None)
+    environment.update({
+        "OMP_NUM_THREADS": "1", "DG_IGR_DGSEM_PRODUCTION_STRICT": "1",
+        "DG_IGR_DGSEM_TIMING": "1", "DG_IGR_IGR_PARTIAL_ASSEMBLY": "1",
+        "DG_IGR_IGR_DEVICE_QF": "1", "DG_IGR_VTK_PREFIX_PATH": str(out / "vtk"),
+    })
+    if args.dense_inverse:
+        environment["DG_IGR_IGR_DENSE_INVERSE"] = args.dense_inverse
+    if args.two_level_inverse:
+        environment["DG_IGR_IGR_TWO_LEVEL_INVERSE"] = "fp64"
+        environment["DG_IGR_IGR_TWO_LEVEL_COARSE"] = args.two_level_inverse
+    if args.cheb_order:
+        environment["DG_IGR_IGR_CHEB_ORDER"] = str(args.cheb_order)
+    if args.cheb_power_iterations:
+        environment["DG_IGR_IGR_CHEB_POWER_ITERATIONS"] = str(args.cheb_power_iterations)
+    if args.dense_setup:
+        environment["DG_IGR_IGR_DENSE_SETUP"] = args.dense_setup
+    if args.two_level_order:
+        environment["DG_IGR_IGR_TWO_LEVEL_ORDER"] = str(args.two_level_order)
+    if args.patch_radius is not None:
+        environment["DG_IGR_IGR_PATCH_RADIUS"] = str(args.patch_radius)
+        environment["DG_IGR_IGR_PATCH_KIND"] = args.patch_kind
+        environment["DG_IGR_IGR_PATCH_PRECISION"] = args.patch_precision
+        environment["DG_IGR_IGR_PATCH_REBUILD_INTERVAL"] = str(args.patch_rebuild_interval)
+    if args.extrapolation_degree:
+        environment["DG_IGR_IGR_EXTRAPOLATION_DEGREE"] = str(args.extrapolation_degree)
+    if args.sigma_basis:
+        environment["DG_IGR_IGR_SIGMA_BASIS"] = args.sigma_basis
+    if args.fused_residual:
+        environment["DG_IGR_DGSEM_FUSED_RESIDUAL"] = "1"
+    if args.fused_dmma:
+        environment["DG_IGR_DGSEM_FUSED_DMMA"] = "1"
+    if args.stationary_sweeps:
+        environment["DG_IGR_IGR_STATIONARY_SWEEPS"] = str(args.stationary_sweeps)
+    if args.frozen_sigma_reference:
+        environment["DG_IGR_IGR_FROZEN_SIGMA_REFERENCE"] = "1"
+    record = {
+        "command": command,
+        "environment": {k: v for k, v in environment.items()
+                        if k.startswith(("DG_IGR_", "CUDA_", "OMP_"))},
+        "executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+        "mesh_sha256": hashlib.sha256(mesh.read_bytes()).hexdigest(),
+        "source_head": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
+        "source_status": subprocess.check_output(
+            ["git", "status", "--short"], cwd=source, text=True),
+    }
+    start = time.perf_counter()
+    with (out / "stdout.txt").open("w") as stdout, (out / "stderr.txt").open("w") as stderr:
+        process = subprocess.Popen(command, cwd=source, env=environment,
+                                   stdout=stdout, stderr=stderr)
+        timed_out = threading.Event()
+        def expire():
+            timed_out.set()
+            process.kill()
+        timer = threading.Timer(args.timeout, expire)
+        timer.daemon = True
+        timer.start()
+        try:
+            record["returncode"] = process.wait()
+        finally:
+            timer.cancel()
+        record["timeout"] = timed_out.is_set()
+    record["wall_seconds"] = time.perf_counter() - start
+    summaries = {}
+    for line in (out / "stdout.txt").read_text().splitlines():
+        if line.startswith(("[explicit-time]", "[explicit-conservation]", "[igr-closure-certificate]",
+                            "[igr-linear] event=run-summary", "[igr-dense-inverse]",
+                            "[igr-two-level]", "[igr-sigma-basis]",
+                            "[igr-screened-patch]",
+                            "[igr-sigma-predictor]", "[dgsem-fused-residual]",
+                            "[igr-stationary]", "[dgsem-sigma-interpolation]",
+                            "[dgsem-op] event=run-summary")):
+            fields = dict(token.split("=", 1) for token in line.split() if "=" in token)
+            summaries[line.split()[0] + ":" + fields.get("event", "setup")] = fields
+    record["summaries"] = summaries
+    final = summaries.get("[explicit-time]:final-status", {})
+    certificate = summaries.get("[igr-closure-certificate]:accepted-state", {})
+    dense_setup = summaries.get("[igr-dense-inverse]:setup", {})
+    linear = summaries.get("[igr-linear]:run-summary", {})
+    two_level_setup = summaries.get("[igr-two-level]:setup", {})
+    patch_setup = summaries.get("[igr-screened-patch]:setup", {})
+    if args.dense_inverse:
+        requested_pc = (dense_setup.get("precision") == args.dense_inverse and
+                        linear.get("last_precond") == "dense-inverse-" + args.dense_inverse and
+                        linear.get("last_solver") == args.linear_solver)
+    elif args.patch_radius is not None:
+        requested_pc = (patch_setup.get("radius") == str(args.patch_radius) and
+                        patch_setup.get("kind", "ras") == args.patch_kind and
+                        patch_setup.get("precision") == args.patch_precision and
+                        linear.get("last_precond") == ("screened-patch-" + args.patch_precision
+                            if args.patch_kind == "ras" else "screened-" + args.patch_kind + "-" + args.patch_precision) and
+                        linear.get("last_solver") == args.linear_solver)
+    elif args.two_level_inverse:
+        requested_pc = (bool(two_level_setup) and
+                        linear.get("last_precond") == "two-level-inverse-fp64" and
+                        linear.get("last_solver") == "fgmres")
+    else:
+        requested_pc = (not dense_setup and not two_level_setup and not patch_setup and
+                        not linear.get("last_precond", "").startswith("dense-inverse-"))
+    record["requested_preconditioner_executed"] = requested_pc
+    record["requested_execution_executed"] = (
+        (not args.dense_setup or dense_setup.get("setup_engine") == args.dense_setup) and
+        (not args.two_level_order or two_level_setup.get("coarse_order") == str(args.two_level_order)) and
+        (not args.stationary_sweeps or bool(summaries.get("[igr-stationary]:setup"))) and
+        (not args.fused_dmma or summaries.get("[dgsem-fused-residual]:setup", {}).get(
+            "contraction") == "dmma8x8x4") and
+        (not args.sigma_basis or bool(summaries.get("[igr-sigma-basis]:setup"))) and
+        (not args.fused_residual or bool(summaries.get("[dgsem-fused-residual]:setup"))) and
+        (not args.extrapolation_degree or
+         summaries.get("[igr-sigma-predictor]:setup", {}).get("degree") ==
+         str(args.extrapolation_degree)))
+    record["completed_and_certified"] = (
+        record["returncode"] == 0 and not record["timeout"] and
+        record["requested_preconditioner_executed"] and record["requested_execution_executed"] and
+        final.get("success") == "1" and
+        final.get("termination_reason") == "target-reached" and
+        abs(float(final.get("final_time", "nan")) - args.final_time) < 1e-12 and
+        abs(float(certificate.get("time", "nan")) - args.final_time) < 1e-12 and
+        certificate.get("certified") == "1" and certificate.get("run_success") == "1")
+    (out / "run.json").write_text(json.dumps(record, indent=2) + "\n")
+    print(json.dumps({"output_dir": str(out), "wall_seconds": record["wall_seconds"],
+                      "completed_and_certified": record["completed_and_certified"]}))
+    return 0 if record["completed_and_certified"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

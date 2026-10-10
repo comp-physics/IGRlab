@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "numerics/limiters/venkat.hpp"
 
 #include "limiters_common.hpp"
@@ -55,8 +56,8 @@ void ApplyCharacteristicVenkatFaceNormal(ParFiniteElementSpace& vfes,
     (opt.slope_qord > 0) ? opt.slope_qord : (2 * order + 2);
 
   // Per-element face normals & neighbors
-  std::vector<std::vector<dg_igr::limiters_detail::FaceNbrRec>> faces;
-  dg_igr::limiters_detail::BuildPerElementFaceNormals(mesh, faces);
+  std::vector<std::vector<igrlab::limiters_detail::FaceNbrRec>> faces;
+  igrlab::limiters_detail::BuildPerElementFaceNormals(mesh, faces);
 
   // Precompute cell averages
   std::vector<Vector> Ubar_all(NE, Vector(num_eq));
@@ -75,7 +76,7 @@ void ApplyCharacteristicVenkatFaceNormal(ParFiniteElementSpace& vfes,
     U.GetSubVector(vdofs, elvec);
     elmat.UseExternalData(elvec.GetData(), dof, num_eq);
 
-    dg_igr::limiters_detail::ElementAverage(*fe,
+    igrlab::limiters_detail::ElementAverage(*fe,
                                             *Tr,
                                             elmat,
                                             num_eq,
@@ -101,7 +102,7 @@ void ApplyCharacteristicVenkatFaceNormal(ParFiniteElementSpace& vfes,
     Ubar = Ubar_all[i];
 
     // Candidate DG slopes via ∫ grad phi_j
-    dg_igr::limiters_detail::SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
+    igrlab::limiters_detail::SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
     Vector sDGx(num_eq);
     sDGx = 0.0;
     Vector sDGy(num_eq);
@@ -121,7 +122,7 @@ void ApplyCharacteristicVenkatFaceNormal(ParFiniteElementSpace& vfes,
     Vector sUy(num_eq);
     sUy = 0.0;
 
-    for (const dg_igr::limiters_detail::FaceNbrRec& fr : faces[i])
+    for (const igrlab::limiters_detail::FaceNbrRec& fr : faces[i])
     {
       const double nx = fr.nx, ny = fr.ny;
       const double dn = std::max(fr.dn, 1e-14);
@@ -137,9 +138,9 @@ void ApplyCharacteristicVenkatFaceNormal(ParFiniteElementSpace& vfes,
       const Vector& Uo = (fr.nbr >= 0) ? Ubar_all[fr.nbr] : Ubar_all[i];
 
       Vector dmn(num_eq), dpn(num_eq);
-      dg_igr::limiters_detail::Subtract(Ui, Uo, dmn);
+      igrlab::limiters_detail::Subtract(Ui, Uo, dmn);
       dmn /= dn; // "minus" (this - other) / dn
-      dg_igr::limiters_detail::Subtract(Uo, Ui, dpn);
+      igrlab::limiters_detail::Subtract(Uo, Ui, dpn);
       dpn /= dn; // "plus"  (other - this) / dn
 
       // Characteristics along n (approximate)
@@ -177,7 +178,7 @@ void ApplyCharacteristicVenkatFaceNormal(ParFiniteElementSpace& vfes,
     Vector Xc(3);
     Tr->Transform(ipc, Xc);
     Array2D<double> dof_xy;
-    dg_igr::limiters_detail::ElementDofXY(*fe, *Tr, dof_xy);
+    igrlab::limiters_detail::ElementDofXY(*fe, *Tr, dof_xy);
 
     Vector rowv(num_eq);
     for (int j = 0; j < dof; ++j)
@@ -217,8 +218,8 @@ void ApplyCharacteristicVenkatXY(ParFiniteElementSpace& vfes,
   const int qord_slope =
     (opt.slope_qord > 0) ? opt.slope_qord : (2 * order + 2);
 
-  Array<dg_igr::limiters_detail::Nbr4> nbr;
-  dg_igr::limiters_detail::Build4Nbrs(mesh, nbr);
+  Array<igrlab::limiters_detail::Nbr4> nbr;
+  igrlab::limiters_detail::Build4Nbrs(mesh, nbr);
 
   // Precompute cell averages
   std::vector<Vector> Ubar_all(NE, Vector(num_eq));
@@ -236,14 +237,14 @@ void ApplyCharacteristicVenkatXY(ParFiniteElementSpace& vfes,
     vfes.GetElementVDofs(i, vdofs);
     U.GetSubVector(vdofs, elvec);
     elmat.UseExternalData(elvec.GetData(), dof, num_eq);
-    dg_igr::limiters_detail::ElementAverage(*fe,
+    igrlab::limiters_detail::ElementAverage(*fe,
                                             *Tr,
                                             elmat,
                                             num_eq,
                                             qord_avg,
                                             Ubar);
     Ubar_all[i] = Ubar;
-    dxy_all[i] = dg_igr::limiters_detail::ElementDXDYFromArea(*Tr, qord_avg);
+    dxy_all[i] = igrlab::limiters_detail::ElementDXDYFromArea(*Tr, qord_avg);
   }
 
   // Main loop
@@ -265,7 +266,7 @@ void ApplyCharacteristicVenkatXY(ParFiniteElementSpace& vfes,
 
     // Candidate DG slopes
     double area = 0.0;
-    dg_igr::limiters_detail::SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
+    igrlab::limiters_detail::SlopeWeights(*fe, *Tr, qord_slope, wx, wy, area);
     Vector sDGx(num_eq);
     sDGx = 0.0;
     Vector sDGy(num_eq);
@@ -350,7 +351,7 @@ void ApplyCharacteristicVenkatXY(ParFiniteElementSpace& vfes,
     Vector Xc(3);
     Tr->Transform(ipc, Xc);
     Array2D<double> dof_xy;
-    dg_igr::limiters_detail::ElementDofXY(*fe, *Tr, dof_xy);
+    igrlab::limiters_detail::ElementDofXY(*fe, *Tr, dof_xy);
 
     Vector rowv(num_eq);
     for (int j = 0; j < dof; ++j)

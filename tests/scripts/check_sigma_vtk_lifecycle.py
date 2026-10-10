@@ -204,6 +204,32 @@ def verify_solve_purposes(
         )
 
 
+def verify_final_closure_certificate(log: str, linear_rtol: float) -> None:
+    certificates = re.findall(
+        r"\[igr-closure-certificate\] event=accepted-state .*?"
+        r"solved=(\d+) supported=(\d+) certified=(\d+) .*?"
+        r"residual_rel_rhs=([0-9.eE+-]+) run_success=(\d+)",
+        log,
+    )
+    if len(certificates) != 1:
+        raise RuntimeError(
+            "expected exactly one final accepted-state closure certificate, "
+            f"found {len(certificates)}"
+        )
+    solved, supported, certified, residual, run_success = certificates[0]
+    residual_value = float(residual)
+    if (solved, supported, certified, run_success) != ("1", "1", "1", "1"):
+        raise RuntimeError(
+            "unexpected final closure certificate flags: "
+            f"{certificates[0]}"
+        )
+    if not math.isfinite(residual_value) or residual_value > 5.0 * linear_rtol:
+        raise RuntimeError(
+            "final closure certificate exceeds its independent residual bound: "
+            f"residual={residual_value} rtol={linear_rtol}"
+        )
+
+
 def grid_function_values(path: Path) -> list[float]:
     text = path.read_text(encoding="utf-8")
     try:
@@ -341,6 +367,7 @@ def main() -> int:
         ]
     log = run_case(command, env, output_root / "vtk.log")
     verify_solve_purposes(log, linear_rtol, args.igr_stage_rtol_scale)
+    verify_final_closure_certificate(log, linear_rtol)
 
     lifecycle = require(
         r"\[igr-sigma-lifecycle\] event=run-summary "
@@ -375,6 +402,7 @@ def main() -> int:
     control_log = run_case(
         control_command, control_env, output_root / "control.log"
     )
+    verify_final_closure_certificate(control_log, linear_rtol)
     control_summary = require(
         r"\[igr-linear\] event=run-summary calls=(\d+) converged_calls=(\d+) "
         r"production_calls=(\d+) production_converged_calls=(\d+) "
@@ -383,7 +411,7 @@ def main() -> int:
         "matched-schedule control accounting",
     )
     control_counts = tuple(int(value) for value in control_summary.groups())
-    if control_counts != (6, 6, 6, 6, 0, 0):
+    if control_counts != (7, 7, 6, 6, 1, 1):
         raise RuntimeError(f"unexpected control accounting: {control_counts}")
     max_abs, rel_l2 = verify_matched_final_state(vtk_root, control_root)
 

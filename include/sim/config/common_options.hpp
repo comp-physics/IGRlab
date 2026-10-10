@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/config/common_options.hpp
  * @brief Shared CLI options for sim-layer examples.
@@ -8,6 +10,7 @@
 #include <string>
 
 #include "mfem.hpp"
+#include "utils/config/env_flags.hpp"
 
 namespace dg_sim
 {
@@ -24,8 +27,28 @@ struct CommonOptions
   int order = 3;                 ///< DG polynomial order.
   std::string device = "cpu";    ///< Runtime device backend: "cpu" or "cuda".
   std::string dg_backend = "dg"; ///< DG backend: "dg" or "dgsem".
+  std::string discretization;
+  ///< General discretization selector; empty retains the per-case default.
+  std::string regularization;
+  ///< Regularization selector: none | igr; empty retains the case default.
+  std::string hdg_cuda_engine = "ordinary";
+  ///< CUDA HDG engine: ordinary | tensor; ordinary remains the default.
+  double hdg_igr_alpha = 1.0;
+  ///< Dimensionless HDG IGR C_alpha, mesh-scaled by the case length policy.
+  double hdg_igr_beta = 1.0;
+  ///< Numerical Euler U4 trace penalty used by HDG IGR; not a physical scalar.
+  std::string time_integrator;
+  ///< Time-integrator selector; empty selects the discretization default.
+  mfem::real_t time_atol = 1.0e-8;
+  ///< Differential-state absolute tolerance for embedded adaptive stepping.
+  mfem::real_t time_rtol = 1.0e-5;
+  ///< Differential-state relative tolerance for embedded adaptive stepping.
+  std::string positivity_limiter = "case";
+  ///< Positivity limiter selector: case | none | zhang-shu.
   std::string zhang_shu_points =
     "consumer"; ///< Zhang-Shu point set: "consumer" or "quadrature".
+  bool zhang_shu_vtk_points = false;
+  ///< Also enforce positivity at the refined points used for VTK output.
   std::string dgsem_stab =
     "none"; ///< DGSEM stabilization: "none", "split", or "filter".
   std::string dgsem_volume_flux =
@@ -36,10 +59,15 @@ struct CommonOptions
     "rusanov"; ///< DGSEM surface flux: "rusanov", "es-winters", or "es-lf-entropy".
   std::string dgsem_entropy_jacobian =
     "fd"; ///< DGSEM ES-LF entropy Jacobian: "fd" or "analytic".
+  mfem::real_t modal_damping_rate = 0.0;
+  ///< Conservative modal RHS damping rate in inverse model time; zero disables.
   mfem::real_t t_final = 1.0; ///< Final time.
-  mfem::real_t dt = -0.01;    ///< Time step (positive skips CFL computation).
+  /// Fixed explicit step when cfl is zero; HDG also uses its sign to select
+  /// fixed, CFL-controlled, or adaptive stepping.
+  mfem::real_t dt = -0.01;
   mfem::real_t dt_min = 1.0e-12; ///< Minimum allowed dt before aborting.
-  mfem::real_t cfl = 0.3;        ///< CFL number for time step computation.
+  /// Explicit SSPRK safety factor, or the legacy HDG stable-step multiplier.
+  mfem::real_t cfl = 0.3;
   bool glvis = false;            ///< Enable GLVis visualization.
   bool vtk_save = true;          ///< Enable ParaView/VTK output.
   bool vtk_h1_diagnostics =
@@ -61,9 +89,15 @@ struct CommonOptions
   bool nan_scan = false; ///< Enable NaN/inf scanning during the time loop.
   bool admissibility_scan =
     false; ///< Enable Euler density/pressure admissibility scans during the time loop.
+  bool conservation_balance =
+    false; ///< Enable bounded accepted-step Euler conservation diagnostics.
   std::string restart_vtk; ///< PVD file or dataset directory to restart from.
   int restart_cycle = -1;  ///< Selected PVD cycle; -1 selects the latest cycle.
   int restart_step = -1;   ///< Completed global step for legacy VTK cycles.
+  std::string hdg_checkpoint;
+  ///< Optional rolling committed-boundary HDG checkpoint artifact.
+  std::string hdg_restart_checkpoint;
+  ///< Optional HDG checkpoint artifact to restore before time integration.
 };
 
 /**
@@ -77,6 +111,11 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                              CommonOptions& opts,
                              const std::string& mesh_help)
 {
+  // Preserve the historical environment-only control as a default seed.
+  // Either typed CLI spelling registered below remains authoritative.
+  opts.zhang_shu_vtk_points = ::igrlab::EnvFlagEnabledDefault(
+    "DG_IGR_LIMITER_ENFORCE_VTK_POINTS", opts.zhang_shu_vtk_points);
+
   args.AddOption(&opts.mesh_file, "-m", "--mesh", mesh_help.c_str());
   args.AddOption(&opts.ser_ref_levels,
                  "-rs",
@@ -98,10 +137,60 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-dg",
                  "--dg-backend",
                  "DG backend: dg | dgsem (default set per case).");
+  args.AddOption(&opts.discretization,
+                 "-disc",
+                 "--discretization",
+                 "Discretization: dg | dgsem | hdg (case support required).");
+  args.AddOption(&opts.regularization,
+                 "-reg",
+                 "--regularization",
+                 "Regularization: none | igr (case support required).");
+  args.AddOption(&opts.hdg_cuda_engine,
+                 "-hce",
+                 "--hdg-cuda-engine",
+                 "CUDA HDG engine: ordinary | tensor (ordinary is the default; "
+                 "tensor requires --discretization hdg --device cuda).");
+  args.AddOption(&opts.hdg_igr_alpha,
+                 "-hia",
+                 "--hdg-igr-alpha",
+                 "Dimensionless HDG IGR C_alpha; the case mesh-length policy "
+                 "sets the physical alpha=C_alpha*h_eff^2 (default 1.0).");
+  args.AddOption(&opts.hdg_igr_beta,
+                 "-hib",
+                 "--hdg-igr-beta",
+                 "HDG numerical Euler U4 trace penalty (finite and positive; "
+                 "not a second physical IGR scalar; default 1.0).");
+  args.AddOption(&opts.time_integrator,
+                 "-ti",
+                 "--time-integrator",
+                 "Time integrator: rk3ssp | ssprk104 | rk4 | dopri5 | radau-picard5 | "
+                 "backward-euler | partitioned-backward-euler | rodas3 "
+                 "(discretization support required).");
+  args.AddOption(&opts.time_atol,
+                 "-tatol",
+                 "--time-atol",
+                 "Absolute differential-state tolerance for adaptive RODAS3.");
+  args.AddOption(&opts.time_rtol,
+                 "-trtol",
+                 "--time-rtol",
+                 "Relative differential-state tolerance for adaptive RODAS3.");
+  args.AddOption(&opts.positivity_limiter,
+                 "-pl",
+                 "--positivity-limiter",
+                 "Positivity limiter: case | none | zhang-shu. 'case' "
+                 "preserves the case default when the selected integrator "
+                 "supports limiting; HDG limiting is RODAS3-only.");
   args.AddOption(&opts.zhang_shu_points,
                  "-zsp",
                  "--zhang-shu-points",
                  "Zhang-Shu positivity points: consumer | quadrature.");
+  args.AddOption(&opts.zhang_shu_vtk_points,
+                 "-zsvtk",
+                 "--zhang-shu-vtk-points",
+                 "-no-zsvtk",
+                 "--no-zhang-shu-vtk-points",
+                 "Enable or disable Zhang-Shu enforcement at the refined "
+                 "points used for VTK output (default off).");
   args.AddOption(
     &opts.dgsem_stab,
     "-ds",
@@ -125,6 +214,13 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
     "-dej",
     "--dgsem-entropy-jacobian",
     "DGSEM entropy Jacobian: fd | analytic (ES LF entropy variables).");
+  args.AddOption(
+    &opts.modal_damping_rate,
+    "-mdr",
+    "--modal-damping-rate",
+    "Conservative modal RHS damping rate in inverse model time (0 disables; "
+    "80000 is M16). Uses a quartic ramp above 29/39 of the polynomial degree; "
+    "requires affine tensor elements and every-stage closure with active IGR.");
   args.AddOption(&opts.t_final,
                  "-tf",
                  "--t-final",
@@ -132,7 +228,11 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.dt,
                  "-dt",
                  "--time-step",
-                 "Time step. Positive number skips CFL timestep calculation.");
+                 "Time-step input. For explicit SSPRK, it is used only when "
+                 "--cfl-number is zero; a positive CFL safety factor takes "
+                 "precedence. For HDG, positive selects fixed stepping, "
+                 "nonpositive selects CFL for Backward Euler, and negative "
+                 "supplies the initial adaptive RODAS3 step magnitude.");
   args.AddOption(&opts.dt_min,
                  "-dtmin",
                  "--dt-min",
@@ -141,7 +241,12 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
   args.AddOption(&opts.cfl,
                  "-c",
                  "--cfl-number",
-                 "CFL number for timestep calculation.");
+                 "Explicit SSPRK CFL safety factor theta in (0,1], applied as "
+                 "dt=theta*C_SSP*h_min/((2p+1)*lambda_max); zero selects the "
+                 "fixed --time-step. This normalization does not certify a "
+                 "case's spatial stability limit. For CFL-controlled HDG "
+                 "Backward Euler, this remains the backend stable-step "
+                 "multiplier.");
   args.AddOption(&opts.glvis,
                  "-glvis",
                  "--glvis",
@@ -221,6 +326,15 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "--no-admissibility-scan",
                  "Enable or disable Euler density/pressure admissibility "
                  "scans during time integration.");
+  args.AddOption(&opts.conservation_balance,
+                 "-conservation-balance",
+                 "--conservation-balance",
+                 "-no-conservation-balance",
+                 "--no-conservation-balance",
+                 "Enable or disable bounded accepted-step Euler physical-"
+                 "boundary conservation diagnostics. This qualification "
+                 "mode adds reductions and is excluded from performance "
+                 "timings.");
   args.AddOption(&opts.restart_vtk,
                  "-restart-vtk",
                  "--restart-vtk",
@@ -233,6 +347,16 @@ inline void AddCommonOptions(mfem::OptionsParser& args,
                  "-restart-step",
                  "--restart-step",
                  "Completed global RK step for legacy cycles without a manifest.");
+  args.AddOption(&opts.hdg_checkpoint,
+                 "-hdg-checkpoint",
+                 "--hdg-checkpoint",
+                 "Rolling committed-boundary HDG checkpoint artifact path; "
+                 "empty disables checkpoint publication.");
+  args.AddOption(&opts.hdg_restart_checkpoint,
+                 "-hdg-restart-checkpoint",
+                 "--hdg-restart-checkpoint",
+                 "Restore a committed HDG checkpoint artifact before time "
+                 "integration; empty disables checkpoint restore.");
 }
 
 /**

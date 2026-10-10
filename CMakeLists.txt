@@ -1,28 +1,79 @@
 cmake_minimum_required(VERSION 3.14)
-project(my_mfem_stuff LANGUAGES CXX)
+project(IGRlab LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(CTest)
 include(CheckLanguage)
-option(DG_IGR_BUILD_TESTS "Build dg_igr unit tests" ON)
-option(DG_IGR_REQUIRE_MFEM_CUDA
-       "Fail configure unless the discovered MFEM package has CUDA enabled."
-       OFF)
-option(DG_IGR_ENABLE_ACCELERATOR_LANGUAGE
-       "Enable local CUDA/HIP language support when MFEM backend requires it."
-       ON)
-set(DG_IGR_EXPECT_CUDA_ARCH
-    ""
-    CACHE STRING
-    "Expected concrete CUDA dependency/device arch for CUDA builds (e.g. 61, sm_61, 120).")
+include(cmake/IGRlabCompatibility.cmake)
+igrlab_cache_alias(IGRLAB_BUILD_TESTS DG_IGR_BUILD_TESTS
+                   BOOL ON "Build IGRlab correctness tests")
+igrlab_cache_alias(IGRLAB_ENABLE_HDG_EULER_EXPERIMENT DG_IGR_ENABLE_HDG_EULER_EXPERIMENT
+                   BOOL OFF "Build the serial smooth-Euler HDG experiment.")
+igrlab_cache_alias(IGRLAB_ENABLE_HDG_EULER_DEVICE_EXPERIMENT DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT
+                   BOOL OFF "Build the default-off smooth-Euler HDG CPU-fallback/device experiment.")
+igrlab_cache_alias(IGRLAB_ENABLE_HDG_RUNTIME DG_IGR_ENABLE_HDG_RUNTIME
+                   BOOL OFF "Build the default-off persistent HDG runtime component seam.")
+igrlab_cache_alias(IGRLAB_ENABLE_HDG_AUXILIARY_EXPERIMENT DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT
+                   BOOL OFF "Build the default-off CPU-only HDG auxiliary experiment seam.")
+igrlab_cache_alias(IGRLAB_ENABLE_OBSERVABILITY DG_IGR_ENABLE_OBSERVABILITY
+                   BOOL OFF "Compile the core observability contract (runtime remains default-off).")
+igrlab_cache_alias(IGRLAB_OBSERVABILITY_USE_NVTX DG_IGR_OBSERVABILITY_USE_NVTX
+                   BOOL OFF "Use the NVTX adapter for compiled observability regions.")
+igrlab_cache_alias(IGRLAB_OBSERVABILITY_USE_CALIPER DG_IGR_OBSERVABILITY_USE_CALIPER
+                   BOOL OFF "Use the Caliper adapter for compiled observability regions.")
+if((DG_IGR_OBSERVABILITY_USE_NVTX OR DG_IGR_OBSERVABILITY_USE_CALIPER) AND
+   NOT DG_IGR_ENABLE_OBSERVABILITY)
+    message(FATAL_ERROR
+            "An observability backend requires DG_IGR_ENABLE_OBSERVABILITY=ON.")
+endif()
+if(DG_IGR_OBSERVABILITY_USE_NVTX AND DG_IGR_OBSERVABILITY_USE_CALIPER)
+    message(FATAL_ERROR
+            "DG_IGR_OBSERVABILITY_USE_NVTX and DG_IGR_OBSERVABILITY_USE_CALIPER are mutually exclusive.")
+endif()
+if(DG_IGR_OBSERVABILITY_USE_CALIPER)
+    # Caliper documents this package and imported target as `caliper`.
+    find_package(caliper REQUIRED)
+    if(NOT TARGET caliper)
+        message(FATAL_ERROR
+                "The discovered Caliper package does not export the required 'caliper' target.")
+    endif()
+endif()
+igrlab_cache_alias(IGRLAB_REQUIRE_MFEM_CUDA DG_IGR_REQUIRE_MFEM_CUDA
+                   BOOL OFF "Fail configure unless the discovered MFEM package has CUDA enabled.")
+igrlab_cache_alias(IGRLAB_ENABLE_ACCELERATOR_LANGUAGE DG_IGR_ENABLE_ACCELERATOR_LANGUAGE
+                   BOOL ON "Enable local CUDA/HIP language support when MFEM backend requires it.")
+igrlab_cache_alias(IGRLAB_EXPECT_CUDA_ARCH DG_IGR_EXPECT_CUDA_ARCH
+                   STRING ""
+                   "Expected concrete CUDA dependency/device arch for CUDA builds (e.g. 80, sm_80, 120).")
+igrlab_cache_alias(IGRLAB_BUILD_RESEARCH_TESTS DG_IGR_BUILD_RESEARCH_TESTS
+                   BOOL OFF
+                   "Build standalone numerical-investigation and campaign probes.")
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
 find_package(MFEM REQUIRED CONFIG)
+if(DG_IGR_ENABLE_HDG_EULER_EXPERIMENT AND
+   (MFEM_USE_CUDA OR MFEM_USE_HIP))
+    message(FATAL_ERROR
+            "DG_IGR_ENABLE_HDG_EULER_EXPERIMENT=ON requires a non-CUDA, non-HIP MFEM.")
+endif()
+if(DG_IGR_ENABLE_HDG_RUNTIME AND NOT MFEM_USE_MPI)
+    message(FATAL_ERROR
+            "DG_IGR_ENABLE_HDG_RUNTIME=ON requires an MPI/HYPRE-enabled MFEM profile.")
+endif()
+if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_HIP)
+    message(FATAL_ERROR
+            "DG_IGR_ENABLE_HDG_RUNTIME=ON has no HIP backend; use the CPU or CUDA profile.")
+endif()
+if(DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT AND
+   (MFEM_USE_CUDA OR MFEM_USE_HIP))
+    message(FATAL_ERROR
+            "DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT=ON requires a CPU-only MFEM profile.")
+endif()
 find_package(ZLIB REQUIRED)
 
 if(MFEM_USE_UMPIRE)
@@ -48,7 +99,7 @@ endif()
 if(MFEM_USE_CUDA AND MFEM_USE_HIP)
     message(FATAL_ERROR
             "MFEM reports both CUDA and HIP enabled for this target; "
-            "dg_igr_miniapp expects one accelerator backend at a time.")
+            "IGRlab expects one accelerator backend at a time.")
 endif()
 
 set(_dg_igr_expected_arch "")
@@ -66,11 +117,6 @@ if(DG_IGR_ENABLE_ACCELERATOR_LANGUAGE)
     if(MFEM_USE_CUDA)
         if(_dg_igr_expected_arch AND NOT CMAKE_CUDA_ARCHITECTURES)
             set(_dg_igr_default_cuda_arch "${_dg_igr_expected_arch}")
-            if(_dg_igr_expected_arch STREQUAL "120")
-                # Current local sm120 workflow relies on CUDA 80 virtual PTX;
-                # native sm120 codegen is intentionally avoided for now.
-                set(_dg_igr_default_cuda_arch "80-virtual")
-            endif()
             set(CMAKE_CUDA_ARCHITECTURES
                 "${_dg_igr_default_cuda_arch}"
                 CACHE STRING
@@ -172,28 +218,17 @@ if(DG_IGR_EXPECT_CUDA_ARCH AND MFEM_USE_CUDA)
     if(CMAKE_CUDA_ARCHITECTURES)
         string(REPLACE ";" "," _dg_igr_arches "${CMAKE_CUDA_ARCHITECTURES}")
         set(_dg_igr_cuda_arch_ok OFF)
-        set(_dg_igr_cuda_arch_compat OFF)
         foreach(_dg_igr_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
             if(_dg_igr_arch STREQUAL "${_dg_igr_expected_arch}" OR
-               _dg_igr_arch STREQUAL "${_dg_igr_expected_arch}-real" OR
-               _dg_igr_arch STREQUAL "${_dg_igr_expected_arch}-virtual")
+               _dg_igr_arch STREQUAL "${_dg_igr_expected_arch}-real")
                 set(_dg_igr_cuda_arch_ok ON)
-            endif()
-            if(_dg_igr_expected_arch STREQUAL "120" AND
-               _dg_igr_arch STREQUAL "80-virtual")
-                set(_dg_igr_cuda_arch_ok ON)
-                set(_dg_igr_cuda_arch_compat ON)
             endif()
         endforeach()
         if(NOT _dg_igr_cuda_arch_ok)
             message(FATAL_ERROR
                     "CUDA arch policy mismatch: expected concrete profile ${_dg_igr_expected_arch}, "
                     "configured CMAKE_CUDA_ARCHITECTURES=${_dg_igr_arches}. "
-                    "For the current sm120 workflow, use CMAKE_CUDA_ARCHITECTURES=80-virtual.")
-        elseif(_dg_igr_cuda_arch_compat)
-            message(STATUS
-                    "CUDA arch policy: expected concrete profile ${_dg_igr_expected_arch}; "
-                    "using compatibility codegen CMAKE_CUDA_ARCHITECTURES=${_dg_igr_arches}.")
+                    "Application CUDA sources must target the selected native profile.")
         endif()
     else()
         message(STATUS
@@ -201,6 +236,17 @@ if(DG_IGR_EXPECT_CUDA_ARCH AND MFEM_USE_CUDA)
                 "or imported MFEM package does not export architecture metadata; "
                 "validate arch during local MFEM configure/build.")
     endif()
+endif()
+
+if(DG_IGR_ENABLE_HDG_RUNTIME AND MFEM_USE_CUDA)
+    if(NOT _dg_igr_expected_arch STREQUAL "80" AND
+       NOT _dg_igr_expected_arch STREQUAL "120")
+        message(FATAL_ERROR
+                "HDG CUDA components require native architecture 80 or 120.")
+    endif()
+    # Share the normalized, validated profile with every CUDA component and
+    # final executable, including tests in sibling directories.
+    set(DG_IGR_HDG_NATIVE_CUDA_ARCH "${_dg_igr_expected_arch}")
 endif()
 
 add_subdirectory(src)
@@ -217,6 +263,8 @@ add_subdirectory(examples/inoue_hattori_stationary_shock_1dy)
 add_subdirectory(examples/double_mach_ref)
 add_subdirectory(examples/dgsem_smooth_advection)
 add_subdirectory(examples/dgsem_smooth_advection_periodic)
+add_subdirectory(examples/hdg_smooth_transition_research)
+add_subdirectory(examples/hdg_smooth_periodic)
 add_subdirectory(examples/dgsem_stationary_shock)
 add_subdirectory(examples/dgsem_shock_vortex_interaction)
 add_subdirectory(examples/dgsem_forward_facing_step)

@@ -1,6 +1,5 @@
 #include "physics/bc/boundary_state.hpp"
 
-#include <algorithm>
 #include <cmath>
 
 namespace mfem
@@ -8,10 +7,6 @@ namespace mfem
 
 namespace
 {
-
-constexpr double kRhoFloor = 1.0e-12;
-constexpr double kPFloor = 1.0e-12;
-
 struct PrimitiveNormalState
 {
   double rho = 1.0;
@@ -61,13 +56,15 @@ PrimitiveNormalState ConservativeToPrimitiveNormal(const mfem::Vector& U,
                                                    int dim,
                                                    double gamma,
                                                    const mfem::Vector& nhat,
-                                                   const mfem::Vector& that)
+                                                   const mfem::Vector& that,
+                                                   double density_floor,
+                                                   double pressure_floor)
 {
   PrimitiveNormalState out;
   MFEM_VERIFY(U.Size() >= dim + 2,
               "Conservative state has insufficient size for Euler variables.");
 
-  const double rho = std::max(U(0), kRhoFloor);
+  const double rho = std::fmax(U(0), density_floor);
   mfem::Vector vel(dim);
   double vel2 = 0.0;
   for (int d = 0; d < dim; ++d)
@@ -78,8 +75,9 @@ PrimitiveNormalState ConservativeToPrimitiveNormal(const mfem::Vector& U,
 
   const double E = U(1 + dim) / rho;
   const double kinetic = 0.5 * vel2;
-  const double p = std::max((gamma - 1.0) * rho * (E - kinetic), kPFloor);
-  const double c = std::sqrt(std::max(gamma * p / rho, 0.0));
+  const double p =
+    std::fmax((gamma - 1.0) * rho * (E - kinetic), pressure_floor);
+  const double c = std::sqrt(std::fmax(gamma * p / rho, 0.0));
 
   out.rho = rho;
   out.p = p;
@@ -129,14 +127,17 @@ void PrimitiveNormalToConservative(const PrimitiveNormalState& prim,
   U(1 + dim) = prim.rho * E;
 }
 
-inline double EntropyLike(double p, double rho, double gamma)
+inline double
+EntropyLike(double p, double rho, double gamma, double density_floor)
 {
-  return p / std::pow(std::max(rho, kRhoFloor), gamma);
+  return p / std::pow(std::fmax(rho, density_floor), gamma);
 }
 
 PrimitiveNormalState SubsonicOutletPressureClosure(const PrimitiveNormalState& inner,
                                                    double gamma,
-                                                   double p_out)
+                                                   double p_out,
+                                                   double density_floor,
+                                                   double pressure_floor)
 {
   PrimitiveNormalState out = inner;
   if (inner.un >= inner.c || inner.un <= -inner.c)
@@ -145,14 +146,14 @@ PrimitiveNormalState SubsonicOutletPressureClosure(const PrimitiveNormalState& i
   }
 
   const double g1 = gamma - 1.0;
-  const double s = EntropyLike(inner.p, inner.rho, gamma);
-  const double p = std::max(p_out, kPFloor);
+  const double s = EntropyLike(inner.p, inner.rho, gamma, density_floor);
+  const double p = std::fmax(p_out, pressure_floor);
   const double rho = std::pow(p / s, 1.0 / gamma);
-  const double c = std::sqrt(std::max(gamma * p / rho, 0.0));
+  const double c = std::sqrt(std::fmax(gamma * p / rho, 0.0));
   const double j_plus = inner.un + 2.0 * inner.c / g1;
   const double un = j_plus - 2.0 * c / g1;
 
-  out.rho = std::max(rho, kRhoFloor);
+  out.rho = std::fmax(rho, density_floor);
   out.p = p;
   out.c = c;
   out.un = un;
@@ -162,7 +163,9 @@ PrimitiveNormalState SubsonicOutletPressureClosure(const PrimitiveNormalState& i
 
 PrimitiveNormalState NonReflectingOutletClosure(const PrimitiveNormalState& inner,
                                                 const PrimitiveNormalState& ref,
-                                                double gamma)
+                                                double gamma,
+                                                double density_floor,
+                                                double pressure_floor)
 {
   PrimitiveNormalState out = inner;
   if (inner.un >= inner.c || inner.un <= -inner.c)
@@ -180,13 +183,27 @@ PrimitiveNormalState NonReflectingOutletClosure(const PrimitiveNormalState& inne
     return out;
   }
 
-  const double s_ref = EntropyLike(ref.p, ref.rho, gamma);
-  const double rho =
-    std::pow((c * c) / std::max(gamma * s_ref, kPFloor), 1.0 / g1);
-  const double p = s_ref * std::pow(std::max(rho, kRhoFloor), gamma);
+  const double s_ref = EntropyLike(ref.p, ref.rho, gamma, density_floor);
+  const double entropy_scale = gamma * s_ref;
+  if (!std::isfinite(s_ref) || !(s_ref > 0.0) ||
+      !std::isfinite(entropy_scale) || !(entropy_scale > 0.0))
+  {
+    return out;
+  }
+  const double rho = std::pow((c * c) / entropy_scale, 1.0 / g1);
+  if (!std::isfinite(rho) || !(rho > 0.0))
+  {
+    return out;
+  }
+  const double admitted_rho = std::fmax(rho, density_floor);
+  const double p = s_ref * std::pow(admitted_rho, gamma);
+  if (!std::isfinite(p) || p < 0.0)
+  {
+    return out;
+  }
 
-  out.rho = std::max(rho, kRhoFloor);
-  out.p = std::max(p, kPFloor);
+  out.rho = admitted_rho;
+  out.p = std::fmax(p, pressure_floor);
   out.c = c;
   out.un = un;
   out.ut = inner.ut;
@@ -195,7 +212,9 @@ PrimitiveNormalState NonReflectingOutletClosure(const PrimitiveNormalState& inne
 
 PrimitiveNormalState SubsonicInletClosure(const PrimitiveNormalState& inner,
                                           const PrimitiveNormalState& target,
-                                          double gamma)
+                                          double gamma,
+                                          double density_floor,
+                                          double pressure_floor)
 {
   PrimitiveNormalState out = target;
   if (inner.un <= -inner.c)
@@ -217,13 +236,27 @@ PrimitiveNormalState SubsonicInletClosure(const PrimitiveNormalState& inner,
     return target;
   }
 
-  const double s_in = EntropyLike(target.p, target.rho, gamma);
-  const double rho =
-    std::pow((c * c) / std::max(gamma * s_in, kPFloor), 1.0 / g1);
-  const double p = s_in * std::pow(std::max(rho, kRhoFloor), gamma);
+  const double s_in = EntropyLike(target.p, target.rho, gamma, density_floor);
+  const double entropy_scale = gamma * s_in;
+  if (!std::isfinite(s_in) || !(s_in > 0.0) ||
+      !std::isfinite(entropy_scale) || !(entropy_scale > 0.0))
+  {
+    return target;
+  }
+  const double rho = std::pow((c * c) / entropy_scale, 1.0 / g1);
+  if (!std::isfinite(rho) || !(rho > 0.0))
+  {
+    return target;
+  }
+  const double admitted_rho = std::fmax(rho, density_floor);
+  const double p = s_in * std::pow(admitted_rho, gamma);
+  if (!std::isfinite(p) || p < 0.0)
+  {
+    return target;
+  }
 
-  out.rho = std::max(rho, kRhoFloor);
-  out.p = std::max(p, kPFloor);
+  out.rho = admitted_rho;
+  out.p = std::fmax(p, pressure_floor);
   out.c = c;
   out.un = un;
   out.ut = target.ut;
@@ -232,6 +265,120 @@ PrimitiveNormalState SubsonicInletClosure(const PrimitiveNormalState& inner,
 
 } // namespace
 
+void EvaluateEulerExteriorState(const EulerExteriorStateKind kind,
+                                const Vector& Uminus,
+                                const Vector& nor,
+                                const int dim,
+                                const double gamma,
+                                const Vector* const reference_state,
+                                const double pressure_out,
+                                Vector& Uplus,
+                                const double density_floor,
+                                const double pressure_floor)
+{
+  switch (kind)
+  {
+  case EulerExteriorStateKind::SupersonicInlet:
+    MFEM_VERIFY(reference_state != nullptr,
+                "Supersonic inlet exterior state requires a reference state.");
+    Uplus = *reference_state;
+    return;
+  case EulerExteriorStateKind::SupersonicOutlet:
+    Uplus = Uminus;
+    return;
+  case EulerExteriorStateKind::SlipWall:
+  {
+    Uplus = Uminus;
+    const double rho = std::fmax(Uminus(0), density_floor);
+    Vector nhat(nor);
+    const double nrm = nhat.Norml2();
+    if (nrm > 0.0)
+    {
+      nhat /= nrm;
+    }
+    Vector velocity(dim);
+    for (int d = 0; d < dim; ++d)
+    {
+      velocity(d) = Uminus(1 + d) / rho;
+    }
+    const double normal_velocity = InnerProduct(velocity, nhat);
+    Uplus(0) = rho;
+    for (int d = 0; d < dim; ++d)
+    {
+      Uplus(1 + d) = rho * (velocity(d) - 2.0 * normal_velocity * nhat(d));
+    }
+    return;
+  }
+  case EulerExteriorStateKind::SubsonicInlet:
+  case EulerExteriorStateKind::SubsonicOutletPressure:
+  case EulerExteriorStateKind::FarField:
+  case EulerExteriorStateKind::NonReflectingOutlet:
+    break;
+  }
+
+  mfem::Vector nhat, that;
+  BuildNormalTangential(nor, dim, nhat, that);
+  const PrimitiveNormalState inner =
+    ConservativeToPrimitiveNormal(Uminus,
+                                  dim,
+                                  gamma,
+                                  nhat,
+                                  that,
+                                  density_floor,
+                                  pressure_floor);
+
+  if (kind == EulerExteriorStateKind::SubsonicOutletPressure)
+  {
+    const PrimitiveNormalState bnd =
+      SubsonicOutletPressureClosure(
+        inner, gamma, pressure_out, density_floor, pressure_floor);
+    PrimitiveNormalToConservative(bnd, dim, gamma, nhat, that, Uplus);
+    return;
+  }
+
+  MFEM_VERIFY(reference_state != nullptr,
+              "Characteristic exterior state requires a reference state.");
+  const PrimitiveNormalState reference = ConservativeToPrimitiveNormal(
+    *reference_state,
+    dim,
+    gamma,
+    nhat,
+    that,
+    density_floor,
+    pressure_floor);
+  if (kind == EulerExteriorStateKind::NonReflectingOutlet)
+  {
+    const PrimitiveNormalState bnd = NonReflectingOutletClosure(
+      inner, reference, gamma, density_floor, pressure_floor);
+    PrimitiveNormalToConservative(bnd, dim, gamma, nhat, that, Uplus);
+    return;
+  }
+  if (kind == EulerExteriorStateKind::SubsonicInlet)
+  {
+    const PrimitiveNormalState bnd = SubsonicInletClosure(
+      inner, reference, gamma, density_floor, pressure_floor);
+    PrimitiveNormalToConservative(bnd, dim, gamma, nhat, that, Uplus);
+    return;
+  }
+
+  if (inner.un <= -inner.c)
+  {
+    Uplus = *reference_state;
+    return;
+  }
+  if (inner.un >= inner.c)
+  {
+    Uplus = Uminus;
+    return;
+  }
+  const PrimitiveNormalState bnd = inner.un < 0.0
+      ? SubsonicInletClosure(
+          inner, reference, gamma, density_floor, pressure_floor)
+      : NonReflectingOutletClosure(
+          inner, reference, gamma, density_floor, pressure_floor);
+  PrimitiveNormalToConservative(bnd, dim, gamma, nhat, that, Uplus);
+}
+
 // ---------- SupersonicInletState ----------
 
 SupersonicInletState::SupersonicInletState(const Vector& Uin)
@@ -239,32 +386,38 @@ SupersonicInletState::SupersonicInletState(const Vector& Uin)
 {
 }
 
-void SupersonicInletState::Eval(const Vector&,
-                                const Vector&,
+void SupersonicInletState::Eval(const Vector& Uminus,
+                                const Vector& nor,
                                 FaceElementTransformations&,
                                 Vector& Uplus) const
 {
-  Uplus = Uin_;
+  EvaluateEulerExteriorState(EulerExteriorStateKind::SupersonicInlet,
+                             Uminus, nor, 1, 1.4, &Uin_, 0.0, Uplus);
 }
 
 // ---------- SupersonicOutletState ----------
 
 void SupersonicOutletState::Eval(const Vector& Uminus,
-                                 const Vector&,
+                                 const Vector& nor,
                                  FaceElementTransformations&,
                                  Vector& Uplus) const
 {
-  Uplus = Uminus;
+  EvaluateEulerExteriorState(EulerExteriorStateKind::SupersonicOutlet,
+                             Uminus, nor, 1, 1.4, nullptr, 0.0, Uplus);
 }
 
 // ---------- SubsonicOutletPressureState ----------
 
 SubsonicOutletPressureState::SubsonicOutletPressureState(int dim,
                                                          double gamma,
-                                                         double pressure_out)
+                                                         double pressure_out,
+                                                         double density_floor,
+                                                         double pressure_floor)
   : dim_(dim),
     gamma_(gamma),
-    p_out_(pressure_out)
+    p_out_(pressure_out),
+    density_floor_(density_floor),
+    pressure_floor_(pressure_floor)
 {
 }
 
@@ -273,23 +426,30 @@ void SubsonicOutletPressureState::Eval(const Vector& Uminus,
                                        FaceElementTransformations&,
                                        Vector& Uplus) const
 {
-  mfem::Vector nhat, that;
-  BuildNormalTangential(nor, dim_, nhat, that);
-  const PrimitiveNormalState inner =
-    ConservativeToPrimitiveNormal(Uminus, dim_, gamma_, nhat, that);
-  const PrimitiveNormalState bnd =
-    SubsonicOutletPressureClosure(inner, gamma_, p_out_);
-  PrimitiveNormalToConservative(bnd, dim_, gamma_, nhat, that, Uplus);
+  EvaluateEulerExteriorState(EulerExteriorStateKind::SubsonicOutletPressure,
+                             Uminus,
+                             nor,
+                             dim_,
+                             gamma_,
+                             nullptr,
+                             p_out_,
+                             Uplus,
+                             density_floor_,
+                             pressure_floor_);
 }
 
 // ---------- NonReflectingOutletState ----------
 
 NonReflectingOutletState::NonReflectingOutletState(const Vector& Uref,
                                                    int dim,
-                                                   double gamma)
+                                                   double gamma,
+                                                   double density_floor,
+                                                   double pressure_floor)
   : Uref_(Uref),
     dim_(dim),
-    gamma_(gamma)
+    gamma_(gamma),
+    density_floor_(density_floor),
+    pressure_floor_(pressure_floor)
 {
 }
 
@@ -298,22 +458,30 @@ void NonReflectingOutletState::Eval(const Vector& Uminus,
                                     FaceElementTransformations&,
                                     Vector& Uplus) const
 {
-  mfem::Vector nhat, that;
-  BuildNormalTangential(nor, dim_, nhat, that);
-  const PrimitiveNormalState inner =
-    ConservativeToPrimitiveNormal(Uminus, dim_, gamma_, nhat, that);
-  const PrimitiveNormalState ref =
-    ConservativeToPrimitiveNormal(Uref_, dim_, gamma_, nhat, that);
-  const PrimitiveNormalState bnd = NonReflectingOutletClosure(inner, ref, gamma_);
-  PrimitiveNormalToConservative(bnd, dim_, gamma_, nhat, that, Uplus);
+  EvaluateEulerExteriorState(EulerExteriorStateKind::NonReflectingOutlet,
+                             Uminus,
+                             nor,
+                             dim_,
+                             gamma_,
+                             &Uref_,
+                             0.0,
+                             Uplus,
+                             density_floor_,
+                             pressure_floor_);
 }
 
 // ---------- SubsonicInletState ----------
 
-SubsonicInletState::SubsonicInletState(const Vector& Uin, int dim, double gamma)
+SubsonicInletState::SubsonicInletState(const Vector& Uin,
+                                       int dim,
+                                       double gamma,
+                                       double density_floor,
+                                       double pressure_floor)
   : Uin_(Uin),
     dim_(dim),
-    gamma_(gamma)
+    gamma_(gamma),
+    density_floor_(density_floor),
+    pressure_floor_(pressure_floor)
 {
 }
 
@@ -322,22 +490,30 @@ void SubsonicInletState::Eval(const Vector& Uminus,
                               FaceElementTransformations&,
                               Vector& Uplus) const
 {
-  mfem::Vector nhat, that;
-  BuildNormalTangential(nor, dim_, nhat, that);
-  const PrimitiveNormalState inner =
-    ConservativeToPrimitiveNormal(Uminus, dim_, gamma_, nhat, that);
-  const PrimitiveNormalState target =
-    ConservativeToPrimitiveNormal(Uin_, dim_, gamma_, nhat, that);
-  const PrimitiveNormalState bnd = SubsonicInletClosure(inner, target, gamma_);
-  PrimitiveNormalToConservative(bnd, dim_, gamma_, nhat, that, Uplus);
+  EvaluateEulerExteriorState(EulerExteriorStateKind::SubsonicInlet,
+                             Uminus,
+                             nor,
+                             dim_,
+                             gamma_,
+                             &Uin_,
+                             0.0,
+                             Uplus,
+                             density_floor_,
+                             pressure_floor_);
 }
 
 // ---------- FarFieldState ----------
 
-FarFieldState::FarFieldState(const Vector& Ufar, int dim, double gamma)
+FarFieldState::FarFieldState(const Vector& Ufar,
+                             int dim,
+                             double gamma,
+                             double density_floor,
+                             double pressure_floor)
   : Ufar_(Ufar),
     dim_(dim),
-    gamma_(gamma)
+    gamma_(gamma),
+    density_floor_(density_floor),
+    pressure_floor_(pressure_floor)
 {
 }
 
@@ -346,40 +522,26 @@ void FarFieldState::Eval(const Vector& Uminus,
                          FaceElementTransformations&,
                          Vector& Uplus) const
 {
-  mfem::Vector nhat, that;
-  BuildNormalTangential(nor, dim_, nhat, that);
-  const PrimitiveNormalState inner =
-    ConservativeToPrimitiveNormal(Uminus, dim_, gamma_, nhat, that);
-  const PrimitiveNormalState far =
-    ConservativeToPrimitiveNormal(Ufar_, dim_, gamma_, nhat, that);
-
-  if (inner.un <= -inner.c)
-  {
-    Uplus = Ufar_;
-    return;
-  }
-  if (inner.un >= inner.c)
-  {
-    Uplus = Uminus;
-    return;
-  }
-
-  PrimitiveNormalState bnd;
-  if (inner.un < 0.0)
-  {
-    bnd = SubsonicInletClosure(inner, far, gamma_);
-  }
-  else
-  {
-    bnd = NonReflectingOutletClosure(inner, far, gamma_);
-  }
-  PrimitiveNormalToConservative(bnd, dim_, gamma_, nhat, that, Uplus);
+  EvaluateEulerExteriorState(EulerExteriorStateKind::FarField,
+                             Uminus,
+                             nor,
+                             dim_,
+                             gamma_,
+                             &Ufar_,
+                             0.0,
+                             Uplus,
+                             density_floor_,
+                             pressure_floor_);
 }
 
 // ---------- SlipWallState ----------
 
-SlipWallState::SlipWallState(int dim)
-  : dim_(dim)
+SlipWallState::SlipWallState(int dim,
+                             double density_floor,
+                             double pressure_floor)
+  : dim_(dim),
+    density_floor_(density_floor),
+    pressure_floor_(pressure_floor)
 {
 }
 
@@ -388,36 +550,16 @@ void SlipWallState::Eval(const Vector& Uminus,
                          FaceElementTransformations&,
                          Vector& Uplus) const
 {
-  // Copy conservative state
-  Uplus = Uminus;
-
-  const double rho_raw = Uminus(0);
-  const double rho = std::max(rho_raw, kRhoFloor);
-
-  // Unit normal from scaled normal
-  Vector nhat(nor);
-  const double nrm = nhat.Norml2();
-  if (nrm > 0.0)
-  {
-    nhat /= nrm;
-  }
-
-  // Reconstruct velocity u^- from momentum
-  Vector u(dim_);
-  for (int d = 0; d < dim_; ++d)
-  {
-    u(d) = Uminus(1 + d) / rho;
-  }
-
-  // Reflect normal component
-  const double un = InnerProduct(u, nhat);
-  Uplus(0) = rho;
-  for (int d = 0; d < dim_; ++d)
-  {
-    const double uprime_d = u(d) - 2.0 * un * nhat(d);
-    Uplus(1 + d) = rho * uprime_d; // new momentum
-  }
-  // rho (index 0) and E (index 1+dim_) remain unchanged (adiabatic slip wall)
+  EvaluateEulerExteriorState(EulerExteriorStateKind::SlipWall,
+                             Uminus,
+                             nor,
+                             dim_,
+                             1.4,
+                             nullptr,
+                             0.0,
+                             Uplus,
+                             density_floor_,
+                             pressure_floor_);
 }
 
 } // namespace mfem

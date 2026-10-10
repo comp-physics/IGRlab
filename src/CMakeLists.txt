@@ -1,8 +1,83 @@
 # Collect all source files (including module subdirectories)
+igrlab_cache_alias(IGRLAB_MFEM_SOURCE_ROOT DG_IGR_MFEM_SOURCE_ROOT
+                   PATH "${CMAKE_SOURCE_DIR}/tpl/mfem"
+                   "Exact MFEM source checkout supplying source-internal headers.")
+foreach(_dg_igr_mfem_source_header IN ITEMS
+        fem/picojson.h
+        general/tinyxml2.h)
+    if(NOT EXISTS
+       "${DG_IGR_MFEM_SOURCE_ROOT}/${_dg_igr_mfem_source_header}" OR
+       IS_DIRECTORY
+       "${DG_IGR_MFEM_SOURCE_ROOT}/${_dg_igr_mfem_source_header}")
+        message(FATAL_ERROR
+                "Required MFEM source header is missing: "
+                "${DG_IGR_MFEM_SOURCE_ROOT}/${_dg_igr_mfem_source_header}")
+    endif()
+endforeach()
+
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "*.cpp")
+
+# W8 runtime and auxiliary sources are owned by strict named component targets.
+# Exclude their complete C++ roots unconditionally so neither default-OFF nor
+# feature-ON configurations can double-compile them through igr_mfem's glob.
+file(GLOB_RECURSE _dg_igr_hdg_named_component_cpp CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/runtime/*.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/auxiliary/*.cpp")
+if(_dg_igr_hdg_named_component_cpp)
+    list(REMOVE_ITEM SOURCES ${_dg_igr_hdg_named_component_cpp})
+endif()
+
+# The opt-in main-application HDG runner is compiled only by its named CPU
+# component.  Keeping it out of igr_mfem preserves default-OFF examples and
+# prevents a second copy of its generic runtime entry.
+list(REMOVE_ITEM SOURCES
+     "${CMAKE_CURRENT_SOURCE_DIR}/sim/hdg/main_backend.cpp")
+
+if(NOT DG_IGR_ENABLE_HDG_EULER_EXPERIMENT)
+    list(REMOVE_ITEM SOURCES
+         "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/euler/smooth_euler_mpi.cpp")
+endif()
+if(NOT DG_IGR_ENABLE_HDG_EULER_EXPERIMENT AND
+   NOT DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT)
+    list(REMOVE_ITEM SOURCES
+         "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/euler/smooth_euler.cpp")
+endif()
+if(NOT DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT)
+    list(REMOVE_ITEM SOURCES
+         "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/euler/smooth_euler_device.cpp")
+endif()
+
+set(_dg_igr_hdg_euler_full_device_enabled OFF)
+if(DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT AND
+   DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND
+   MFEM_USE_CUDA AND MFEM_USE_MPI AND MFEM_USE_UMPIRE AND TARGET umpire)
+    get_target_property(_dg_igr_mfem_link_dependencies mfem
+                        INTERFACE_LINK_LIBRARIES)
+    if(_dg_igr_mfem_link_dependencies MATCHES "HYPRE")
+        set(_dg_igr_hdg_euler_full_device_enabled ON)
+        list(APPEND SOURCES
+             "${CMAKE_CURRENT_SOURCE_DIR}/numerics/hdg/euler/smooth_euler_device_full.cu")
+    endif()
+endif()
 
 # Create library
 add_library(igr_mfem STATIC ${SOURCES})
+# Keep the existing archive/link target while callers adopt the IGRlab name.
+add_library(IGRlab::core ALIAS igr_mfem)
+
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+    target_link_libraries(igr_mfem PRIVATE CUDA::cusolver)
+    target_sources(igr_mfem PRIVATE physics/igr/IGR_dense_inverse_cuda.cu
+                                  physics/igr/IGR_two_level_inverse_cuda.cu
+                                  physics/igr/IGR_screened_patch_inverse_cuda.cu
+                                  physics/igr/IGR_face_density_cuda.cu
+                                  physics/igr/IGR_stationary_correction_cuda.cu)
+    target_compile_definitions(igr_mfem PRIVATE DG_IGR_HAS_DENSE_INVERSE_CUDA=1
+                                              DG_IGR_HAS_TWO_LEVEL_INVERSE_CUDA=1
+                                              DG_IGR_HAS_SCREENED_PATCH_CUDA=1
+                                              DG_IGR_HAS_FACE_DENSITY_CUDA=1
+                                              DG_IGR_HAS_STATIONARY_CORRECTION_CUDA=1)
+endif()
 
 set(_dg_igr_default_accel_sources "")
 if(DG_IGR_ACCELERATOR_LANGUAGE)
@@ -11,15 +86,40 @@ if(DG_IGR_ACCELERATOR_LANGUAGE)
          "src/numerics/dg/DGHyperbolicConservationLaws_face.cpp"
          "src/numerics/dg/DGHyperbolicConservationLaws_mass.cpp"
          "src/numerics/dg/DGHyperbolicConservationLaws_weakdiv.cpp"
+         "src/numerics/dg/modal_damping.cpp"
          "src/numerics/dg/DGFaceQuadratureKernels.cpp"
+         "src/numerics/dgsem/dgsem_device.cpp"
+         "src/numerics/hdg/device/device_core.cpp"
+         "src/numerics/hdg/scalar_hdg_oracle.cpp"
          "src/numerics/limiters/zhang_shu.cpp"
          "src/physics/igr/IGR_device_coefficients.cpp")
+    # CUDA-enabled MFEM conditionally extends mfem::SparseMatrix under NVCC.
+    # Keep every enabled HDG owner of that type ABI-compatible with MFEM.
+    if(DG_IGR_ENABLE_HDG_EULER_EXPERIMENT OR
+       DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT)
+        list(APPEND _dg_igr_default_accel_sources
+             "src/numerics/hdg/euler/smooth_euler.cpp")
+    endif()
+    if(DG_IGR_ENABLE_HDG_EULER_EXPERIMENT)
+        list(APPEND _dg_igr_default_accel_sources
+             "src/numerics/hdg/euler/smooth_euler_mpi.cpp")
+    endif()
+    if(DG_IGR_ENABLE_HDG_EULER_DEVICE_EXPERIMENT)
+        list(APPEND _dg_igr_default_accel_sources
+             "src/numerics/hdg/euler/smooth_euler_device.cpp")
+    endif()
+    if(_dg_igr_hdg_euler_full_device_enabled)
+        list(APPEND _dg_igr_default_accel_sources
+             "src/numerics/hdg/euler/smooth_euler_device_full.cu")
+    endif()
 endif()
 
-set(DG_IGR_AUTO_DG_ACCELERATOR_SOURCE
-    ON
-    CACHE BOOL
-    "When ON, automatically compile DGHyperbolicConservationLaws.cpp with the accelerator language in CUDA/HIP builds.")
+igrlab_cache_alias(IGRLAB_AUTO_DG_ACCELERATOR_SOURCE DG_IGR_AUTO_DG_ACCELERATOR_SOURCE
+                   BOOL ON
+                   "Automatically compile DG kernels with the accelerator language in CUDA/HIP builds.")
+igrlab_cache_alias(IGRLAB_ACCELERATOR_KERNEL_SOURCES DG_IGR_ACCELERATOR_KERNEL_SOURCES
+                   STRING "${_dg_igr_default_accel_sources}"
+                   "Semicolon-separated source files to compile with the accelerator language.")
 
 if(NOT DEFINED DG_IGR_ACCELERATOR_KERNEL_SOURCES)
     set(DG_IGR_ACCELERATOR_KERNEL_SOURCES
@@ -55,22 +155,38 @@ if(DG_IGR_AUTO_DG_ACCELERATOR_SOURCE AND
         FORCE)
 endif()
 
+# Reflect any automatically required accelerator sources in both spellings.
+igrlab_cache_alias(IGRLAB_ACCELERATOR_KERNEL_SOURCES DG_IGR_ACCELERATOR_KERNEL_SOURCES
+                   STRING "${_dg_igr_default_accel_sources}"
+                   "Semicolon-separated source files to compile with the accelerator language.")
+
 # Include directories  
 target_include_directories(igr_mfem PUBLIC 
     ${CMAKE_SOURCE_DIR}/include
 )
 target_include_directories(igr_mfem PRIVATE
-    ${CMAKE_SOURCE_DIR}/tpl/mfem/fem
-    ${CMAKE_SOURCE_DIR}/tpl/mfem/general
+    ${DG_IGR_MFEM_SOURCE_ROOT}/fem
+    ${DG_IGR_MFEM_SOURCE_ROOT}/general
+)
+target_compile_definitions(igr_mfem PUBLIC
+    DG_IGR_ENABLE_OBSERVABILITY=$<BOOL:${DG_IGR_ENABLE_OBSERVABILITY}>
+    DG_IGR_OBSERVABILITY_USE_NVTX=$<BOOL:${DG_IGR_OBSERVABILITY_USE_NVTX}>
+    DG_IGR_OBSERVABILITY_USE_CALIPER=$<BOOL:${DG_IGR_OBSERVABILITY_USE_CALIPER}>
 )
 
 # Link MFEM
 target_link_libraries(igr_mfem PUBLIC mfem ZLIB::ZLIB)
+if(DG_IGR_OBSERVABILITY_USE_CALIPER)
+    target_link_libraries(igr_mfem PUBLIC caliper)
+endif()
 if(MFEM_USE_MPI)
     target_link_libraries(igr_mfem PUBLIC MPI::MPI_CXX)
     if(DG_IGR_MPI_INCLUDE_DIRS)
         target_include_directories(igr_mfem PUBLIC ${DG_IGR_MPI_INCLUDE_DIRS})
     endif()
+endif()
+if(_dg_igr_hdg_euler_full_device_enabled)
+    target_link_libraries(igr_mfem PRIVATE umpire)
 endif()
 
 if(MFEM_USE_CUDA)
@@ -107,6 +223,9 @@ if(DG_IGR_ACCELERATOR_KERNEL_SOURCES)
     if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA")
         set_target_properties(igr_mfem
                               PROPERTIES
+                              CUDA_STANDARD 17
+                              CUDA_STANDARD_REQUIRED ON
+                              CUDA_EXTENSIONS OFF
                               CUDA_SEPARABLE_COMPILATION ON)
         target_compile_options(igr_mfem PRIVATE
                                $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
@@ -120,4 +239,9 @@ if(DG_IGR_ACCELERATOR_KERNEL_SOURCES)
     message(STATUS
             "DG_IGR accelerator kernel sources (${DG_IGR_ACCELERATOR_LANGUAGE}): "
             "${_dg_igr_accel_sources_abs}")
+endif()
+
+if(DG_IGR_ENABLE_HDG_RUNTIME OR
+   DG_IGR_ENABLE_HDG_AUXILIARY_EXPERIMENT)
+    add_subdirectory(numerics/hdg/runtime)
 endif()

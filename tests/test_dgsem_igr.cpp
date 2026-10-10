@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "numerics/dgsem/dgsem_entropy_flux.hpp"
@@ -8,6 +9,7 @@
 
 #include "mfem.hpp"
 #include "test_utils.hpp"
+#include "test_dgsem_reference_igr.hpp"
 
 #include <cstdlib>
 #include <string>
@@ -259,7 +261,7 @@ int RunDGSEMIGRTests(TestContext& ctx)
     const double expected_lf = -5.74081e-4;
     const double tol_prod = 1.0e-2;
 
-    if (std::getenv("DG_IGR_PRINT_ENTROPY"))
+    if (::igrlab::GetEnv("DG_IGR_PRINT_ENTROPY"))
     {
       std::cout << "igr_entropy_prod_winters=" << prod_winters << "\n";
       std::cout << "igr_entropy_prod_lf_fd=" << prod_lf_fd << "\n";
@@ -289,7 +291,9 @@ int RunDGSEMIGRTests(TestContext& ctx)
       "IGR entropy production (LF entropy vars, analytic) regression");
   }
 
+  RunDGSEMScalarIGRScopeFixture(ctx);
+
   return ctx.failures;
 }
 
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

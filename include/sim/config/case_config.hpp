@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/environment.hpp"
+
 /**
  * @file sim/config/case_config.hpp
  * @brief Case/Run configuration structures for the sim-layer.
@@ -8,13 +10,17 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 
 #include "mfem.hpp"
 #include "numerics/limiters/limiter_pipeline.hpp"
+#include "numerics/timestepping/ssprk_coefficients.hpp"
 #include "utils/config/igr_config.hpp"
 #include "utils/config/io_config.hpp"
 #include "utils/config/timestepping_config.hpp"
@@ -49,6 +55,7 @@ struct IGROptions
   int amg_max_levels = -1;
   double amg_strong_threshold = -1.0;
   bool exact_dg_face_operator = false;
+  bool igr_invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
 };
@@ -60,11 +67,118 @@ enum class DGBackend
   DGSEM
 };
 
+/// @brief General discretization selection, including unavailable seams.
+enum class Discretization
+{
+  DG,
+  DGSEM,
+  HDG
+};
+
 /// @brief Runtime compute device selection.
 enum class DeviceBackend
 {
   CPU,
   CUDA
+};
+
+/// @brief Explicit CUDA execution engine for the generic HDG lifecycle.
+enum class HdgCudaEngine
+{
+  Ordinary,
+  TensorCore
+};
+
+/// @brief Regularization selection for the Euler solver request.
+enum class Regularization
+{
+  None,
+  IGR
+};
+
+/// @brief Time-integrator selection for the Euler solver request.
+enum class TimeIntegrator
+{
+  RK3SSP = 0,
+  BackwardEuler = 1,
+  PartitionedBackwardEuler = 2,
+  Rodas3 = 3,
+  SSPRK104 = 4,
+  ResearchRK4 = 5,
+  ResearchDOPRI5 = 6,
+  ResearchRadauPicard5 = 7
+};
+
+/// @brief Source of the effective general discretization selection.
+enum class DiscretizationProvenance
+{
+  CaseDefault,
+  DiscretizationOption,
+  DGBackendOption,
+  BothOptions
+};
+
+/// @brief Outcome of reconciling the general and legacy CLI selectors.
+enum class DiscretizationResolutionStatus
+{
+  Resolved,
+  InvalidDiscretization,
+  InvalidDGBackend,
+  Conflict,
+  Unavailable
+};
+
+struct DiscretizationResolution
+{
+  Discretization discretization = Discretization::DG;
+  DiscretizationProvenance provenance =
+    DiscretizationProvenance::CaseDefault;
+  std::optional<DGBackend> dg_backend = DGBackend::DG;
+  DiscretizationResolutionStatus status =
+    DiscretizationResolutionStatus::Resolved;
+  std::string message;
+
+  bool IsResolved() const
+  {
+    return status == DiscretizationResolutionStatus::Resolved;
+  }
+};
+
+/// @brief Resolution status for the complete CLI/case solver request.
+enum class SolverRequestResolutionStatus
+{
+  Resolved,
+  InvalidDiscretization,
+  InvalidDGBackend,
+  InvalidDeviceBackend,
+  InvalidHdgCudaEngine,
+  Conflict,
+  InvalidRegularization,
+  InvalidTimeIntegrator,
+  UnsupportedHdgCudaEngine,
+  UnsupportedRegularization,
+  UnsupportedTimeIntegrator
+};
+
+/// @brief Pure resolved request consumed before runtime construction begins.
+struct SolverRequestResolution
+{
+  Discretization discretization = Discretization::DG;
+  DiscretizationProvenance discretization_provenance =
+    DiscretizationProvenance::CaseDefault;
+  std::optional<DGBackend> dg_backend = DGBackend::DG;
+  DeviceBackend device_backend = DeviceBackend::CPU;
+  HdgCudaEngine hdg_cuda_engine = HdgCudaEngine::Ordinary;
+  Regularization regularization = Regularization::None;
+  TimeIntegrator time_integrator = TimeIntegrator::RK3SSP;
+  SolverRequestResolutionStatus status =
+    SolverRequestResolutionStatus::Resolved;
+  std::string message;
+
+  bool IsResolved() const
+  {
+    return status == SolverRequestResolutionStatus::Resolved;
+  }
 };
 
 /// @brief Optional DGSEM stabilization hook selection.
@@ -117,7 +231,7 @@ struct CaseConfig
   mfem::real_t gamma = 1.4;
   CommonOptions defaults;
   mfem::RK3Config rk3_config;
-  dg_igr::IGRConfig igr_config;
+  ::igrlab::IGRConfig igr_config;
   mfem::LimiterPipelineConfig limiter_pipeline;
   mfem::io::VTKOutputConfig vtk_config;
 };
@@ -129,7 +243,13 @@ struct RunConfig
   CommonOptions opts;
   IGROptions igr_opts;
   DeviceBackend device_backend = DeviceBackend::CPU;
+  Discretization discretization = Discretization::DG;
+  DiscretizationProvenance discretization_provenance =
+    DiscretizationProvenance::CaseDefault;
   DGBackend dg_backend = DGBackend::DG;
+  HdgCudaEngine hdg_cuda_engine = HdgCudaEngine::Ordinary;
+  Regularization regularization = Regularization::IGR;
+  TimeIntegrator time_integrator = TimeIntegrator::RK3SSP;
   DGSEMStabilization dgsem_stab = DGSEMStabilization::None;
   DGSEMVolumeFlux dgsem_volume_flux = DGSEMVolumeFlux::Central;
   DGSEMVolumeDissipation dgsem_volume_dissipation =
@@ -148,6 +268,74 @@ inline std::string ToLowerCopy(std::string value)
                  [](unsigned char c)
                  { return static_cast<char>(std::tolower(c)); });
   return value;
+}
+
+/// @brief Typed command-line override for the case Zhang--Shu policy.
+enum class PositivityLimiterSelection
+{
+  Case,
+  None,
+  ZhangShu
+};
+
+inline PositivityLimiterSelection
+ParsePositivityLimiterSelection(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower.empty() || lower == "case")
+  {
+    return PositivityLimiterSelection::Case;
+  }
+  if (lower == "none")
+  {
+    return PositivityLimiterSelection::None;
+  }
+  if (lower == "zhang-shu" || lower == "zhang_shu" || lower == "zhangshu")
+  {
+    return PositivityLimiterSelection::ZhangShu;
+  }
+  MFEM_VERIFY(false,
+              "Invalid positivity limiter '"
+                << value << "'. Use 'case', 'none', or 'zhang-shu'.");
+  return PositivityLimiterSelection::Case;
+}
+
+inline const char* PositivityLimiterSelectionToString(
+  const PositivityLimiterSelection selection)
+{
+  switch (selection)
+  {
+  case PositivityLimiterSelection::Case:
+    return "case";
+  case PositivityLimiterSelection::None:
+    return "none";
+  case PositivityLimiterSelection::ZhangShu:
+    return "zhang-shu";
+  }
+  return "case";
+}
+
+inline bool ResolveZhangShuPositivityLimiter(
+  const PositivityLimiterSelection selection,
+  const bool case_default) noexcept
+{
+  switch (selection)
+  {
+  case PositivityLimiterSelection::Case:
+    return case_default;
+  case PositivityLimiterSelection::None:
+    return false;
+  case PositivityLimiterSelection::ZhangShu:
+    return true;
+  }
+  return case_default;
+}
+
+inline bool ResolveZhangShuPositivityLimiter(
+  const std::string& selection, const bool case_default)
+{
+  return ResolveZhangShuPositivityLimiter(
+    ParsePositivityLimiterSelection(selection), case_default);
 }
 
 inline mfem::ZhangShuPointSet
@@ -181,297 +369,305 @@ ZhangShuPointSetToString(mfem::ZhangShuPointSet point_set)
   return "consumer";
 }
 
-inline dg_igr::IGRIPKind ParseIGRIPKind(const std::string& value)
+inline ::igrlab::IGRIPKind ParseIGRIPKind(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "sipg")
   {
-    return dg_igr::IGRIPKind::SIPG;
+    return ::igrlab::IGRIPKind::SIPG;
   }
   if (lower == "iipg")
   {
-    return dg_igr::IGRIPKind::IIPG;
+    return ::igrlab::IGRIPKind::IIPG;
   }
   if (lower == "nipg")
   {
-    return dg_igr::IGRIPKind::NIPG;
+    return ::igrlab::IGRIPKind::NIPG;
   }
   MFEM_VERIFY(false,
               "Invalid IGR IP kind '" << value
                                       << "'. Use 'sipg', 'iipg', or 'nipg'.");
-  return dg_igr::IGRIPKind::SIPG;
+  return ::igrlab::IGRIPKind::SIPG;
 }
 
-inline dg_igr::IGRSolveMode ParseIGRSolveMode(const std::string& value)
+inline ::igrlab::IGRSolveMode ParseIGRSolveMode(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "smoother" || lower == "smoother-sweeps" || lower == "sweeps")
   {
-    return dg_igr::IGRSolveMode::SmootherSweeps;
+    return ::igrlab::IGRSolveMode::SmootherSweeps;
   }
   if (lower == "krylov")
   {
-    return dg_igr::IGRSolveMode::Krylov;
+    return ::igrlab::IGRSolveMode::Krylov;
   }
   MFEM_VERIFY(false,
               "Invalid IGR solve mode '" << value
                                          << "'. Use 'smoother' or 'krylov'.");
-  return dg_igr::IGRSolveMode::Krylov;
+  return ::igrlab::IGRSolveMode::Krylov;
 }
 
-inline dg_igr::IGRLinearSolverType
+inline ::igrlab::IGRLinearSolverType
 ParseIGRLinearSolverType(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "auto")
   {
-    return dg_igr::IGRLinearSolverType::Auto;
+    return ::igrlab::IGRLinearSolverType::Auto;
   }
   if (lower == "cg")
   {
-    return dg_igr::IGRLinearSolverType::CG;
+    return ::igrlab::IGRLinearSolverType::CG;
   }
   if (lower == "gmres")
   {
-    return dg_igr::IGRLinearSolverType::GMRES;
+    return ::igrlab::IGRLinearSolverType::GMRES;
   }
   if (lower == "fgmres")
   {
-    return dg_igr::IGRLinearSolverType::FGMRES;
+    return ::igrlab::IGRLinearSolverType::FGMRES;
   }
   if (lower == "bicgstab")
   {
-    return dg_igr::IGRLinearSolverType::BiCGSTAB;
+    return ::igrlab::IGRLinearSolverType::BiCGSTAB;
   }
   if (lower == "minres")
   {
-    return dg_igr::IGRLinearSolverType::MINRES;
+    return ::igrlab::IGRLinearSolverType::MINRES;
   }
   MFEM_VERIFY(false,
               "Invalid IGR linear solver '"
                 << value << "'. Use 'auto', 'cg', 'gmres', 'fgmres', "
                 << "'bicgstab', or 'minres'.");
-  return dg_igr::IGRLinearSolverType::Auto;
+  return ::igrlab::IGRLinearSolverType::Auto;
 }
 
-inline dg_igr::IGRPrecondType ParseIGRPrecondType(const std::string& value)
+inline ::igrlab::IGRPrecondType ParseIGRPrecondType(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "auto")
   {
-    return dg_igr::IGRPrecondType::Auto;
+    return ::igrlab::IGRPrecondType::Auto;
   }
   if (lower == "boomeramg" || lower == "amg")
   {
-    return dg_igr::IGRPrecondType::BoomerAMG;
+    return ::igrlab::IGRPrecondType::BoomerAMG;
   }
   if (lower == "hypreilu" || lower == "ilu")
   {
-    return dg_igr::IGRPrecondType::HypreILU;
+    return ::igrlab::IGRPrecondType::HypreILU;
   }
   if (lower == "hypreeuclid" || lower == "euclid")
   {
-    return dg_igr::IGRPrecondType::HypreEuclid;
+    return ::igrlab::IGRPrecondType::HypreEuclid;
   }
   if (lower == "parasails" || lower == "hypreparasails")
   {
-    return dg_igr::IGRPrecondType::ParaSails;
+    return ::igrlab::IGRPrecondType::ParaSails;
   }
   if (lower == "hypresmoother" || lower == "smoother")
   {
-    return dg_igr::IGRPrecondType::HypreSmoother;
+    return ::igrlab::IGRPrecondType::HypreSmoother;
   }
   if (lower == "chebyshev" || lower == "operatorchebyshev" ||
       lower == "operator-chebyshev")
   {
-    return dg_igr::IGRPrecondType::OperatorChebyshev;
+    return ::igrlab::IGRPrecondType::OperatorChebyshev;
   }
   if (lower == "none")
   {
-    return dg_igr::IGRPrecondType::None;
+    return ::igrlab::IGRPrecondType::None;
   }
   MFEM_VERIFY(false,
               "Invalid IGR preconditioner '"
                 << value << "'. Use 'auto', 'boomeramg', 'hypreilu', "
                 << "'hypreeuclid', 'parasails', "
                 << "'hypresmoother', 'chebyshev', or 'none'.");
-  return dg_igr::IGRPrecondType::Auto;
+  return ::igrlab::IGRPrecondType::Auto;
 }
 
-inline dg_igr::IGRNonconvergencePolicy
+inline ::igrlab::IGRNonconvergencePolicy
 ParseIGRNonconvergencePolicy(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "error" || lower == "fail")
   {
-    return dg_igr::IGRNonconvergencePolicy::Error;
+    return ::igrlab::IGRNonconvergencePolicy::Error;
   }
   if (lower == "accept" || lower == "legacy")
   {
-    return dg_igr::IGRNonconvergencePolicy::Accept;
+    return ::igrlab::IGRNonconvergencePolicy::Accept;
   }
   MFEM_VERIFY(false,
               "Invalid IGR nonconvergence policy '"
                 << value << "'. Use 'error' or 'accept'.");
-  return dg_igr::IGRNonconvergencePolicy::Error;
+  return ::igrlab::IGRNonconvergencePolicy::Error;
 }
 
-inline dg_igr::IGRSigmaUpdateCadence
+inline ::igrlab::IGRSigmaUpdateCadence
 ParseIGRSigmaUpdateCadence(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "every-stage" || lower == "every_stage" || lower == "stage")
   {
-    return dg_igr::IGRSigmaUpdateCadence::EveryStage;
+    return ::igrlab::IGRSigmaUpdateCadence::EveryStage;
   }
   if (lower == "every-step" || lower == "every_step" || lower == "step")
   {
-    return dg_igr::IGRSigmaUpdateCadence::EveryStep;
+    return ::igrlab::IGRSigmaUpdateCadence::EveryStep;
+  }
+  if (lower == "extrapolated-every-step" ||
+      lower == "extrapolated_every_step" || lower == "extrapolated-step")
+  {
+    return ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
   }
   if (lower == "every-n-steps" || lower == "every_n_steps" ||
       lower == "every-n" || lower == "nsteps")
   {
-    return dg_igr::IGRSigmaUpdateCadence::EveryNSteps;
+    return ::igrlab::IGRSigmaUpdateCadence::EveryNSteps;
   }
   MFEM_VERIFY(false,
               "Invalid IGR sigma cadence '"
                 << value
-                << "'. Use 'every-stage', 'every-step', or "
+                << "'. Use 'every-stage', 'every-step', "
+                   "'extrapolated-every-step', or "
                    "'every-n-steps'.");
-  return dg_igr::IGRSigmaUpdateCadence::EveryStage;
+  return ::igrlab::IGRSigmaUpdateCadence::EveryStage;
 }
 
-inline dg_igr::IGRAlphaLengthScalePolicy
+inline ::igrlab::IGRAlphaLengthScalePolicy
 ParseIGRAlphaLengthScalePolicy(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "min" || lower == "minimum")
   {
-    return dg_igr::IGRAlphaLengthScalePolicy::Min;
+    return ::igrlab::IGRAlphaLengthScalePolicy::Min;
   }
   if (lower == "avg" || lower == "average" || lower == "mean")
   {
-    return dg_igr::IGRAlphaLengthScalePolicy::Average;
+    return ::igrlab::IGRAlphaLengthScalePolicy::Average;
   }
   if (lower == "max" || lower == "maximum")
   {
-    return dg_igr::IGRAlphaLengthScalePolicy::Max;
+    return ::igrlab::IGRAlphaLengthScalePolicy::Max;
   }
   if (lower == "local" || lower == "local-dx" || lower == "element-local")
   {
-    return dg_igr::IGRAlphaLengthScalePolicy::Local;
+    return ::igrlab::IGRAlphaLengthScalePolicy::Local;
   }
   MFEM_VERIFY(false,
               "Invalid IGR alpha length-scale policy '"
                 << value
                 << "'. Use 'min', 'average', 'max', or 'local'.");
-  return dg_igr::IGRAlphaLengthScalePolicy::Average;
+  return ::igrlab::IGRAlphaLengthScalePolicy::Average;
 }
 
-inline const char* IGRIPKindToString(dg_igr::IGRIPKind value)
+inline const char* IGRIPKindToString(::igrlab::IGRIPKind value)
 {
   switch (value)
   {
-  case dg_igr::IGRIPKind::SIPG:
+  case ::igrlab::IGRIPKind::SIPG:
     return "sipg";
-  case dg_igr::IGRIPKind::IIPG:
+  case ::igrlab::IGRIPKind::IIPG:
     return "iipg";
-  case dg_igr::IGRIPKind::NIPG:
+  case ::igrlab::IGRIPKind::NIPG:
     return "nipg";
   }
   return "sipg";
 }
 
-inline const char* IGRSolveModeToString(dg_igr::IGRSolveMode value)
+inline const char* IGRSolveModeToString(::igrlab::IGRSolveMode value)
 {
   switch (value)
   {
-  case dg_igr::IGRSolveMode::SmootherSweeps:
+  case ::igrlab::IGRSolveMode::SmootherSweeps:
     return "smoother";
-  case dg_igr::IGRSolveMode::Krylov:
+  case ::igrlab::IGRSolveMode::Krylov:
     return "krylov";
   }
   return "krylov";
 }
 
 inline const char*
-IGRLinearSolverTypeToString(dg_igr::IGRLinearSolverType value)
+IGRLinearSolverTypeToString(::igrlab::IGRLinearSolverType value)
 {
   switch (value)
   {
-  case dg_igr::IGRLinearSolverType::Auto:
+  case ::igrlab::IGRLinearSolverType::Auto:
     return "auto";
-  case dg_igr::IGRLinearSolverType::CG:
+  case ::igrlab::IGRLinearSolverType::CG:
     return "cg";
-  case dg_igr::IGRLinearSolverType::GMRES:
+  case ::igrlab::IGRLinearSolverType::GMRES:
     return "gmres";
-  case dg_igr::IGRLinearSolverType::FGMRES:
+  case ::igrlab::IGRLinearSolverType::FGMRES:
     return "fgmres";
-  case dg_igr::IGRLinearSolverType::BiCGSTAB:
+  case ::igrlab::IGRLinearSolverType::BiCGSTAB:
     return "bicgstab";
-  case dg_igr::IGRLinearSolverType::MINRES:
+  case ::igrlab::IGRLinearSolverType::MINRES:
     return "minres";
   }
   return "auto";
 }
 
-inline const char* IGRPrecondTypeToString(dg_igr::IGRPrecondType value)
+inline const char* IGRPrecondTypeToString(::igrlab::IGRPrecondType value)
 {
   switch (value)
   {
-  case dg_igr::IGRPrecondType::Auto:
+  case ::igrlab::IGRPrecondType::Auto:
     return "auto";
-  case dg_igr::IGRPrecondType::BoomerAMG:
+  case ::igrlab::IGRPrecondType::BoomerAMG:
     return "boomeramg";
-  case dg_igr::IGRPrecondType::HypreILU:
+  case ::igrlab::IGRPrecondType::HypreILU:
     return "hypreilu";
-  case dg_igr::IGRPrecondType::HypreEuclid:
+  case ::igrlab::IGRPrecondType::HypreEuclid:
     return "hypreeuclid";
-  case dg_igr::IGRPrecondType::ParaSails:
+  case ::igrlab::IGRPrecondType::ParaSails:
     return "parasails";
-  case dg_igr::IGRPrecondType::HypreSmoother:
+  case ::igrlab::IGRPrecondType::HypreSmoother:
     return "hypresmoother";
-  case dg_igr::IGRPrecondType::OperatorChebyshev:
+  case ::igrlab::IGRPrecondType::OperatorChebyshev:
     return "chebyshev";
-  case dg_igr::IGRPrecondType::None:
+  case ::igrlab::IGRPrecondType::None:
     return "none";
   }
   return "auto";
 }
 
 inline const char*
-IGRSigmaUpdateCadenceToString(dg_igr::IGRSigmaUpdateCadence value)
+IGRSigmaUpdateCadenceToString(::igrlab::IGRSigmaUpdateCadence value)
 {
   switch (value)
   {
-  case dg_igr::IGRSigmaUpdateCadence::EveryStage:
+  case ::igrlab::IGRSigmaUpdateCadence::EveryStage:
     return "every-stage";
-  case dg_igr::IGRSigmaUpdateCadence::EveryStep:
+  case ::igrlab::IGRSigmaUpdateCadence::EveryStep:
     return "every-step";
-  case dg_igr::IGRSigmaUpdateCadence::EveryNSteps:
+  case ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep:
+    return "extrapolated-every-step";
+  case ::igrlab::IGRSigmaUpdateCadence::EveryNSteps:
     return "every-n-steps";
   }
   return "every-stage";
 }
 
 inline const char*
-IGRAlphaLengthScalePolicyToString(dg_igr::IGRAlphaLengthScalePolicy value)
+IGRAlphaLengthScalePolicyToString(::igrlab::IGRAlphaLengthScalePolicy value)
 {
   switch (value)
   {
-  case dg_igr::IGRAlphaLengthScalePolicy::Min:
+  case ::igrlab::IGRAlphaLengthScalePolicy::Min:
     return "min";
-  case dg_igr::IGRAlphaLengthScalePolicy::Average:
+  case ::igrlab::IGRAlphaLengthScalePolicy::Average:
     return "average";
-  case dg_igr::IGRAlphaLengthScalePolicy::Max:
+  case ::igrlab::IGRAlphaLengthScalePolicy::Max:
     return "max";
-  case dg_igr::IGRAlphaLengthScalePolicy::Local:
+  case ::igrlab::IGRAlphaLengthScalePolicy::Local:
     return "local";
   }
   return "average";
 }
 
-inline DGBackend ParseDGBackend(const std::string& value)
+inline std::optional<DGBackend> TryParseDGBackend(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "dg")
@@ -482,12 +678,345 @@ inline DGBackend ParseDGBackend(const std::string& value)
   {
     return DGBackend::DGSEM;
   }
+  return std::nullopt;
+}
+
+inline DGBackend ParseDGBackend(const std::string& value)
+{
+  if (const std::optional<DGBackend> backend = TryParseDGBackend(value))
+  {
+    return *backend;
+  }
   MFEM_VERIFY(false,
               "Invalid DG backend '" << value << "'. Use 'dg' or 'dgsem'.");
   return DGBackend::DG;
 }
 
-inline DeviceBackend ParseDeviceBackend(const std::string& value)
+inline std::optional<Discretization>
+TryParseDiscretization(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "dg")
+  {
+    return Discretization::DG;
+  }
+  if (lower == "dgsem")
+  {
+    return Discretization::DGSEM;
+  }
+  if (lower == "hdg")
+  {
+    return Discretization::HDG;
+  }
+  return std::nullopt;
+}
+
+inline Discretization ParseDiscretization(const std::string& value)
+{
+  if (const std::optional<Discretization> discretization =
+        TryParseDiscretization(value))
+  {
+    return *discretization;
+  }
+  MFEM_VERIFY(false,
+              "Invalid discretization '" << value
+                                          << "'. Use 'dg', 'dgsem', or 'hdg'.");
+  return Discretization::DG;
+}
+
+inline std::optional<DGBackend>
+DGBackendForDiscretization(Discretization discretization)
+{
+  switch (discretization)
+  {
+  case Discretization::DG:
+    return DGBackend::DG;
+  case Discretization::DGSEM:
+    return DGBackend::DGSEM;
+  case Discretization::HDG:
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+inline Discretization DiscretizationForDGBackend(DGBackend backend)
+{
+  switch (backend)
+  {
+  case DGBackend::DG:
+    return Discretization::DG;
+  case DGBackend::DGSEM:
+    return Discretization::DGSEM;
+  }
+  return Discretization::DG;
+}
+
+inline const char* DiscretizationToString(Discretization discretization)
+{
+  switch (discretization)
+  {
+  case Discretization::DG:
+    return "dg";
+  case Discretization::DGSEM:
+    return "dgsem";
+  case Discretization::HDG:
+    return "hdg";
+  }
+  return "dg";
+}
+
+inline std::optional<Regularization>
+TryParseRegularization(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "none")
+  {
+    return Regularization::None;
+  }
+  if (lower == "igr")
+  {
+    return Regularization::IGR;
+  }
+  return std::nullopt;
+}
+
+inline const char* RegularizationToString(Regularization regularization)
+{
+  switch (regularization)
+  {
+  case Regularization::None:
+    return "none";
+  case Regularization::IGR:
+    return "igr";
+  }
+  return "none";
+}
+
+inline std::optional<TimeIntegrator>
+TryParseTimeIntegrator(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "rk3ssp")
+  {
+    return TimeIntegrator::RK3SSP;
+  }
+  if (lower == "ssprk104")
+  {
+    return TimeIntegrator::SSPRK104;
+  }
+  if (lower == "rk4") { return TimeIntegrator::ResearchRK4; }
+  if (lower == "dopri5") { return TimeIntegrator::ResearchDOPRI5; }
+  if (lower == "radau-picard5")
+  {
+    return TimeIntegrator::ResearchRadauPicard5;
+  }
+  if (lower == "backward-euler")
+  {
+    return TimeIntegrator::BackwardEuler;
+  }
+  if (lower == "partitioned-backward-euler")
+  {
+    return TimeIntegrator::PartitionedBackwardEuler;
+  }
+  if (lower == "rodas3")
+  {
+    return TimeIntegrator::Rodas3;
+  }
+  return std::nullopt;
+}
+
+inline const char* TimeIntegratorToString(TimeIntegrator time_integrator)
+{
+  switch (time_integrator)
+  {
+  case TimeIntegrator::RK3SSP:
+    return "rk3ssp";
+  case TimeIntegrator::SSPRK104:
+    return "ssprk104";
+  case TimeIntegrator::ResearchRK4:
+    return "rk4";
+  case TimeIntegrator::ResearchDOPRI5:
+    return "dopri5";
+  case TimeIntegrator::ResearchRadauPicard5:
+    return "radau-picard5";
+  case TimeIntegrator::BackwardEuler:
+    return "backward-euler";
+  case TimeIntegrator::PartitionedBackwardEuler:
+    return "partitioned-backward-euler";
+  case TimeIntegrator::Rodas3:
+    return "rodas3";
+  }
+  return "rk3ssp";
+}
+
+inline bool IsExplicitSSPRKTimeIntegrator(TimeIntegrator time_integrator)
+{
+  return time_integrator == TimeIntegrator::RK3SSP ||
+         time_integrator == TimeIntegrator::SSPRK104;
+}
+
+inline bool IsResearchExplicitRKTimeIntegrator(TimeIntegrator integrator)
+{
+  return integrator == TimeIntegrator::ResearchRK4 ||
+         integrator == TimeIntegrator::ResearchDOPRI5 ||
+         integrator == TimeIntegrator::ResearchRadauPicard5;
+}
+
+inline bool IsExplicitRKTimeIntegrator(TimeIntegrator integrator)
+{
+  return IsExplicitSSPRKTimeIntegrator(integrator) ||
+         IsResearchExplicitRKTimeIntegrator(integrator);
+}
+
+/// SSP coefficient used to scale the user-facing explicit CFL safety factor.
+inline std::optional<mfem::real_t>
+SSPCoefficientForTimeIntegrator(TimeIntegrator time_integrator)
+{
+  switch (time_integrator)
+  {
+  case TimeIntegrator::RK3SSP:
+    return mfem::SSPRK33Coefficients::ssp_coefficient;
+  case TimeIntegrator::SSPRK104:
+    return mfem::SSPRK104Coefficients::ssp_coefficient;
+  case TimeIntegrator::ResearchRK4:
+  case TimeIntegrator::ResearchDOPRI5:
+  case TimeIntegrator::ResearchRadauPicard5:
+  case TimeIntegrator::BackwardEuler:
+  case TimeIntegrator::PartitionedBackwardEuler:
+  case TimeIntegrator::Rodas3:
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+inline const char*
+SolverRequestResolutionStatusToString(SolverRequestResolutionStatus status)
+{
+  switch (status)
+  {
+  case SolverRequestResolutionStatus::Resolved:
+    return "resolved";
+  case SolverRequestResolutionStatus::InvalidDiscretization:
+    return "invalid-discretization";
+  case SolverRequestResolutionStatus::InvalidDGBackend:
+    return "invalid-dg-backend";
+  case SolverRequestResolutionStatus::InvalidDeviceBackend:
+    return "invalid-device-backend";
+  case SolverRequestResolutionStatus::InvalidHdgCudaEngine:
+    return "invalid-hdg-cuda-engine";
+  case SolverRequestResolutionStatus::Conflict:
+    return "conflict";
+  case SolverRequestResolutionStatus::InvalidRegularization:
+    return "invalid-regularization";
+  case SolverRequestResolutionStatus::InvalidTimeIntegrator:
+    return "invalid-time-integrator";
+  case SolverRequestResolutionStatus::UnsupportedHdgCudaEngine:
+    return "unsupported-hdg-cuda-engine";
+  case SolverRequestResolutionStatus::UnsupportedRegularization:
+    return "unsupported-regularization";
+  case SolverRequestResolutionStatus::UnsupportedTimeIntegrator:
+    return "unsupported-time-integrator";
+  }
+  return "invalid-request";
+}
+
+inline const char*
+DiscretizationProvenanceToString(DiscretizationProvenance provenance)
+{
+  switch (provenance)
+  {
+  case DiscretizationProvenance::CaseDefault:
+    return "case-default";
+  case DiscretizationProvenance::DiscretizationOption:
+    return "discretization-option";
+  case DiscretizationProvenance::DGBackendOption:
+    return "dg-backend-option";
+  case DiscretizationProvenance::BothOptions:
+    return "both-options";
+  }
+  return "case-default";
+}
+
+inline DiscretizationResolution
+ResolveDiscretization(const std::string& case_default_dg_backend,
+                      const std::string& discretization_value,
+                      const std::string& dg_backend_value,
+                      bool discretization_overridden,
+                      bool dg_backend_overridden)
+{
+  DiscretizationResolution result;
+  if (!discretization_overridden && !dg_backend_overridden)
+  {
+    const std::optional<DGBackend> backend =
+      TryParseDGBackend(case_default_dg_backend);
+    if (!backend)
+    {
+      result.status = DiscretizationResolutionStatus::InvalidDGBackend;
+      result.dg_backend.reset();
+      result.message = "Invalid per-case DG backend '" +
+                       case_default_dg_backend +
+                       "'. Use 'dg' or 'dgsem'.";
+      return result;
+    }
+    result.discretization = DiscretizationForDGBackend(*backend);
+    result.dg_backend = backend;
+    return result;
+  }
+
+  std::optional<Discretization> selected;
+  if (discretization_overridden)
+  {
+    selected = TryParseDiscretization(discretization_value);
+    if (!selected)
+    {
+      result.status = DiscretizationResolutionStatus::InvalidDiscretization;
+      result.dg_backend.reset();
+      result.message = "Invalid discretization '" + discretization_value +
+                       "'. Use 'dg', 'dgsem', or 'hdg'.";
+      return result;
+    }
+    result.provenance = dg_backend_overridden
+                          ? DiscretizationProvenance::BothOptions
+                          : DiscretizationProvenance::DiscretizationOption;
+  }
+
+  if (dg_backend_overridden)
+  {
+    const std::optional<DGBackend> legacy_backend =
+      TryParseDGBackend(dg_backend_value);
+    if (!legacy_backend)
+    {
+      result.status = DiscretizationResolutionStatus::InvalidDGBackend;
+      result.dg_backend.reset();
+      result.message = "Invalid DG backend '" + dg_backend_value +
+                       "'. Use 'dg' or 'dgsem'.";
+      return result;
+    }
+    const Discretization legacy_discretization =
+      DiscretizationForDGBackend(*legacy_backend);
+    if (selected && *selected != legacy_discretization)
+    {
+      result.status = DiscretizationResolutionStatus::Conflict;
+      result.dg_backend.reset();
+      result.message = "Conflicting '--discretization " +
+                       discretization_value + "' and '--dg-backend " +
+                       dg_backend_value + "' selections.";
+      return result;
+    }
+    selected = legacy_discretization;
+    if (!discretization_overridden)
+    {
+      result.provenance = DiscretizationProvenance::DGBackendOption;
+    }
+  }
+
+  result.discretization = *selected;
+  result.dg_backend = DGBackendForDiscretization(result.discretization);
+  return result;
+}
+
+inline std::optional<DeviceBackend>
+TryParseDeviceBackend(const std::string& value)
 {
   const std::string lower = ToLowerCopy(value);
   if (lower == "cpu")
@@ -498,10 +1027,178 @@ inline DeviceBackend ParseDeviceBackend(const std::string& value)
   {
     return DeviceBackend::CUDA;
   }
+  return std::nullopt;
+}
+
+inline std::optional<HdgCudaEngine>
+TryParseHdgCudaEngine(const std::string& value)
+{
+  const std::string lower = ToLowerCopy(value);
+  if (lower == "ordinary")
+  {
+    return HdgCudaEngine::Ordinary;
+  }
+  if (lower == "tensor")
+  {
+    return HdgCudaEngine::TensorCore;
+  }
+  return std::nullopt;
+}
+
+/// @brief Resolve every solver selector without constructing runtime state.
+inline SolverRequestResolution
+ResolveSolverRequest(const std::string& case_default_dg_backend,
+                     bool case_default_use_igr,
+                     const std::string& discretization_value,
+                     const std::string& dg_backend_value,
+                     const std::string& regularization_value,
+                     const std::string& time_integrator_value,
+                     bool discretization_overridden,
+                     bool dg_backend_overridden,
+                     bool regularization_overridden,
+                     bool time_integrator_overridden,
+                     const std::string& device_value = "cpu",
+                     const std::string& hdg_cuda_engine_value = "ordinary")
+{
+  SolverRequestResolution result;
+  const DiscretizationResolution discretization =
+    ResolveDiscretization(case_default_dg_backend,
+                          discretization_value,
+                          dg_backend_value,
+                          discretization_overridden,
+                          dg_backend_overridden);
+  result.discretization = discretization.discretization;
+  result.discretization_provenance = discretization.provenance;
+  result.dg_backend = discretization.dg_backend;
+  if (!discretization.IsResolved())
+  {
+    result.status =
+      discretization.status == DiscretizationResolutionStatus::InvalidDiscretization
+        ? SolverRequestResolutionStatus::InvalidDiscretization
+        : discretization.status == DiscretizationResolutionStatus::InvalidDGBackend
+            ? SolverRequestResolutionStatus::InvalidDGBackend
+            : SolverRequestResolutionStatus::Conflict;
+    result.message = discretization.message;
+    return result;
+  }
+
+  const std::optional<DeviceBackend> device =
+    TryParseDeviceBackend(device_value);
+  if (!device)
+  {
+    result.status = SolverRequestResolutionStatus::InvalidDeviceBackend;
+    result.message = "Invalid device backend '" + device_value +
+                     "'. Use 'cpu' or 'cuda'.";
+    return result;
+  }
+  result.device_backend = *device;
+
+  const std::optional<HdgCudaEngine> hdg_cuda_engine =
+    TryParseHdgCudaEngine(hdg_cuda_engine_value);
+  if (!hdg_cuda_engine)
+  {
+    result.status = SolverRequestResolutionStatus::InvalidHdgCudaEngine;
+    result.message = "Invalid HDG CUDA engine '" + hdg_cuda_engine_value +
+                     "'. Use 'ordinary' or 'tensor'.";
+    return result;
+  }
+  result.hdg_cuda_engine = *hdg_cuda_engine;
+  if (result.hdg_cuda_engine == HdgCudaEngine::TensorCore &&
+      (result.discretization != Discretization::HDG ||
+       result.device_backend != DeviceBackend::CUDA))
+  {
+    result.status = SolverRequestResolutionStatus::UnsupportedHdgCudaEngine;
+    result.message = "HDG CUDA engine 'tensor' requires '--discretization hdg "
+                     "--device cuda'.";
+    return result;
+  }
+
+  result.regularization = case_default_use_igr ? Regularization::IGR
+                                                : Regularization::None;
+  if (regularization_overridden)
+  {
+    const std::optional<Regularization> regularization =
+      TryParseRegularization(regularization_value);
+    if (!regularization)
+    {
+      result.status = SolverRequestResolutionStatus::InvalidRegularization;
+      result.message = "Invalid regularization '" + regularization_value +
+                       "'. Use 'none' or 'igr'.";
+      return result;
+    }
+    result.regularization = *regularization;
+  }
+
+  result.time_integrator =
+    result.discretization == Discretization::HDG
+      ? TimeIntegrator::BackwardEuler
+      : TimeIntegrator::RK3SSP;
+  if (time_integrator_overridden)
+  {
+    const std::optional<TimeIntegrator> time_integrator =
+      TryParseTimeIntegrator(time_integrator_value);
+    if (!time_integrator)
+    {
+      result.status = SolverRequestResolutionStatus::InvalidTimeIntegrator;
+      result.message = "Invalid time integrator '" + time_integrator_value +
+                       "'. Use 'rk3ssp', 'ssprk104', 'rk4', 'dopri5', "
+                       "'radau-picard5', "
+                       "'backward-euler', 'partitioned-backward-euler', or "
+                       "'rodas3'.";
+      return result;
+    }
+    result.time_integrator = *time_integrator;
+  }
+
+  if (result.discretization != Discretization::HDG &&
+      !IsExplicitRKTimeIntegrator(result.time_integrator))
+  {
+    result.status = SolverRequestResolutionStatus::UnsupportedTimeIntegrator;
+    result.message = "Time integrator '" +
+                     std::string(TimeIntegratorToString(
+                       result.time_integrator)) +
+                     "' is unavailable for DG/DGSEM; use 'rk3ssp' or "
+                     "'ssprk104', or a research explicit RK method.";
+    return result;
+  }
+  if (result.discretization == Discretization::HDG &&
+      IsExplicitRKTimeIntegrator(result.time_integrator))
+  {
+    result.status = SolverRequestResolutionStatus::UnsupportedTimeIntegrator;
+    result.message = "Time integrator '" +
+                     std::string(TimeIntegratorToString(
+                       result.time_integrator)) +
+                     "' is unavailable for HDG; use 'backward-euler', "
+                     "'partitioned-backward-euler', or 'rodas3'.";
+    return result;
+  }
+  return result;
+}
+
+inline DeviceBackend ParseDeviceBackend(const std::string& value)
+{
+  if (const std::optional<DeviceBackend> backend =
+        TryParseDeviceBackend(value))
+  {
+    return *backend;
+  }
   MFEM_VERIFY(false,
               "Invalid device backend '" << value
                                          << "'. Use 'cpu' or 'cuda'.");
   return DeviceBackend::CPU;
+}
+
+inline HdgCudaEngine ParseHdgCudaEngine(const std::string& value)
+{
+  if (const std::optional<HdgCudaEngine> engine =
+        TryParseHdgCudaEngine(value))
+  {
+    return *engine;
+  }
+  MFEM_VERIFY(false,
+              "Invalid HDG CUDA engine '"
+                << value << "'. Use 'ordinary' or 'tensor'.");
+  return HdgCudaEngine::Ordinary;
 }
 
 inline bool IsL2IGRSpaceName(const std::string& value)
@@ -523,11 +1220,113 @@ inline bool IsExactDGFaceOptionName(const std::string& value)
          value == "-ino-exface" || value == "--no-igr-exact-dg-face";
 }
 
+inline bool IsCAlphaOptionName(const std::string& value)
+{
+  return value == "-ca" || value == "--c-alpha";
+}
+
+inline bool IsHdgIgrAlphaOptionName(const std::string& value)
+{
+  return value == "-hia" || value == "--hdg-igr-alpha";
+}
+
 inline bool HasExactDGFaceOptionOverride(int argc, char** argv)
 {
   for (int i = 1; i < argc; ++i)
   {
     if (IsExactDGFaceOptionName(argv[i]))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool HasCAlphaOptionOverride(int argc, char** argv)
+{
+  for (int i = 1; i < argc; ++i)
+  {
+    if (IsCAlphaOptionName(argv[i]))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool HasHdgIgrAlphaOptionOverride(int argc, char** argv)
+{
+  for (int i = 1; i < argc; ++i)
+  {
+    if (IsHdgIgrAlphaOptionName(argv[i]))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool IsDiscretizationOptionName(const std::string& value)
+{
+  return value == "-disc" || value == "--discretization";
+}
+
+inline bool IsDGBackendOptionName(const std::string& value)
+{
+  return value == "-dg" || value == "--dg-backend";
+}
+
+inline bool IsRegularizationOptionName(const std::string& value)
+{
+  return value == "-reg" || value == "--regularization";
+}
+
+inline bool IsTimeIntegratorOptionName(const std::string& value)
+{
+  return value == "-ti" || value == "--time-integrator";
+}
+
+inline bool HasDiscretizationOptionOverride(int argc, char** argv)
+{
+  for (int i = 1; i < argc; ++i)
+  {
+    if (IsDiscretizationOptionName(argv[i]))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool HasDGBackendOptionOverride(int argc, char** argv)
+{
+  for (int i = 1; i < argc; ++i)
+  {
+    if (IsDGBackendOptionName(argv[i]))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool HasRegularizationOptionOverride(int argc, char** argv)
+{
+  for (int i = 1; i < argc; ++i)
+  {
+    if (IsRegularizationOptionName(argv[i]))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool HasTimeIntegratorOptionOverride(int argc, char** argv)
+{
+  for (int i = 1; i < argc; ++i)
+  {
+    if (IsTimeIntegratorOptionName(argv[i]))
     {
       return true;
     }
@@ -830,6 +1629,18 @@ inline const char* DeviceBackendToString(DeviceBackend backend)
   return "cpu";
 }
 
+inline const char* HdgCudaEngineToString(HdgCudaEngine engine)
+{
+  switch (engine)
+  {
+  case HdgCudaEngine::Ordinary:
+    return "ordinary";
+  case HdgCudaEngine::TensorCore:
+    return "tensor";
+  }
+  return "unknown";
+}
+
 inline std::string CaseDirFromFile(const char* file)
 {
   return std::filesystem::path(file).parent_path().string();
@@ -871,7 +1682,7 @@ inline void ApplyExampleDefaults(CaseConfig& cfg)
 {
   cfg.defaults = CommonOptions{};
   cfg.rk3_config = mfem::RK3Config{};
-  cfg.igr_config = dg_igr::IGRConfig{};
+  cfg.igr_config = ::igrlab::IGRConfig{};
   cfg.limiter_pipeline = mfem::LimiterPipelineConfig{};
   cfg.vtk_config = mfem::io::VTKOutputConfig{};
 
@@ -890,8 +1701,8 @@ inline void ApplyExampleDefaults(CaseConfig& cfg)
   cfg.igr_config.lin_maxit = 1000;
   cfg.igr_config.lin_print = 0;
   cfg.igr_config.alpha_length_scale_policy =
-    dg_igr::IGRAlphaLengthScalePolicy::Average;
-  cfg.igr_config.sigma_cadence = dg_igr::IGRSigmaUpdateCadence::EveryStage;
+    ::igrlab::IGRAlphaLengthScalePolicy::Average;
+  cfg.igr_config.sigma_cadence = ::igrlab::IGRSigmaUpdateCadence::EveryStage;
   cfg.igr_config.sigma_update_interval = 1;
   cfg.igr_config.stage_rtol_scale = 1.0;
   cfg.igr_config.amg_coarsen_type = -1;
@@ -905,7 +1716,7 @@ inline CaseConfig
 MakeCaseConfig(const std::string& case_name,
                const std::string& default_mesh_file,
                const char* case_file,
-               mfem::real_t gamma = mfem::dg_igr::EulerDefaults::kGamma)
+               mfem::real_t gamma = mfem::igrlab::EulerDefaults::kGamma)
 {
   CaseConfig cfg;
   cfg.case_name = case_name;
@@ -921,7 +1732,8 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
   args.AddOption(&igr_opts.c_alpha_user,
                  "-ca",
                  "--c-alpha",
-                 "Forward scaling constant C_alpha (default 1.0).");
+                 "Forward scaling constant C_alpha (default 1.0); for HDG "
+                 "this aliases --hdg-igr-alpha when that option is absent.");
   args.AddOption(&igr_opts.alpha_length_policy,
                  "-ial",
                  "--igr-alpha-length",
@@ -958,7 +1770,8 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
     &igr_opts.sigma_cadence,
     "-iscad",
     "--igr-sigma-cadence",
-    "IGR sigma update cadence: every-stage | every-step | every-n-steps.");
+    "IGR sigma update cadence: every-stage | every-step | "
+    "extrapolated-every-step | every-n-steps.");
   args.AddOption(&igr_opts.sigma_update_interval,
                  "-isn",
                  "--igr-sigma-update-interval",
@@ -1029,22 +1842,59 @@ inline void AddIGROptions(mfem::OptionsParser& args, IGROptions& igr_opts)
     "--no-igr-sigma-rusanov",
     "Include or exclude the IGR sigma speed in Rusanov dissipation "
     "(default off).");
+  args.AddOption(
+    &igr_opts.igr_invariant_domain_flux,
+    "-iidflux",
+    "--igr-invariant-domain-flux",
+    "-ino-iidflux",
+    "--no-igr-invariant-domain-flux",
+    "Use or disable the exact frozen-stage LF split threshold together with "
+    "the frozen-sigma characteristic-modulus bound for both CFL accounting "
+    "and Rusanov dissipation (default off).");
 }
 
-inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,
-                               const CommonOptions& opts,
-                               const IGROptions& igr_opts)
+inline RunConfig MakeRunConfig(
+  const CaseConfig& case_cfg,
+  const CommonOptions& opts,
+  const IGROptions& igr_opts,
+  DiscretizationProvenance discretization_provenance =
+    DiscretizationProvenance::CaseDefault,
+  Regularization regularization = Regularization::IGR,
+  TimeIntegrator time_integrator = TimeIntegrator::RK3SSP)
 {
   RunConfig run_cfg;
   run_cfg.case_config = case_cfg;
+  const PositivityLimiterSelection positivity_limiter =
+    ParsePositivityLimiterSelection(opts.positivity_limiter);
   const mfem::ZhangShuPointSet zhang_shu_points =
     ParseZhangShuPointSet(opts.zhang_shu_points);
+  run_cfg.case_config.limiter_pipeline.zhang_shu =
+    ResolveZhangShuPositivityLimiter(
+      positivity_limiter, case_cfg.limiter_pipeline.zhang_shu);
   run_cfg.case_config.limiter_pipeline.zhang_shu_points = zhang_shu_points;
+  run_cfg.case_config.limiter_pipeline.zhang_shu_vtk_points =
+    opts.zhang_shu_vtk_points;
   run_cfg.opts = opts;
+  run_cfg.opts.positivity_limiter =
+    PositivityLimiterSelectionToString(positivity_limiter);
   run_cfg.opts.zhang_shu_points = ZhangShuPointSetToString(zhang_shu_points);
   run_cfg.igr_opts = igr_opts;
   run_cfg.device_backend = ParseDeviceBackend(opts.device);
-  run_cfg.dg_backend = ParseDGBackend(opts.dg_backend);
+  run_cfg.hdg_cuda_engine = ParseHdgCudaEngine(opts.hdg_cuda_engine);
+  run_cfg.discretization = opts.discretization.empty()
+                              ? DiscretizationForDGBackend(
+                                  ParseDGBackend(opts.dg_backend))
+                              : ParseDiscretization(opts.discretization);
+  run_cfg.discretization_provenance = discretization_provenance;
+  run_cfg.regularization = regularization;
+  run_cfg.time_integrator = time_integrator;
+  const std::optional<DGBackend> dg_backend =
+    DGBackendForDiscretization(run_cfg.discretization);
+  MFEM_VERIFY(dg_backend,
+              "Discretization '"
+                << DiscretizationToString(run_cfg.discretization)
+                << "' is recognized but unavailable in this executable.");
+  run_cfg.dg_backend = dg_backend.value_or(DGBackend::DG);
   run_cfg.dgsem_stab = ParseDGSEMStabilization(opts.dgsem_stab);
   run_cfg.dgsem_volume_flux = ParseDGSEMVolumeFlux(opts.dgsem_volume_flux);
   run_cfg.dgsem_volume_dissipation =
@@ -1056,7 +1906,110 @@ inline RunConfig MakeRunConfig(const CaseConfig& case_cfg,
   return run_cfg;
 }
 
-inline dg_igr::IGRAlphaLengthScalePolicy
+/** Reject damping selections that cannot retain the requested stage RHS.
+ *
+ * This runs before HDG dispatch, where a DG-only option would otherwise be
+ * silently ignored. Active IGR must recompute stress from each stage state,
+ * as in the modal-damping research baseline.
+ */
+inline std::string ValidateModalDampingSelection(
+  Discretization discretization,
+  Regularization regularization,
+  const CaseConfig& case_cfg,
+  const CommonOptions& opts,
+  const IGROptions& igr_opts)
+{
+  if (!std::isfinite(opts.modal_damping_rate) || opts.modal_damping_rate < 0.0)
+  {
+    return "--modal-damping-rate must be finite and nonnegative (0 disables).";
+  }
+  if (opts.modal_damping_rate == 0.0)
+  {
+    return {};
+  }
+  if (discretization == Discretization::HDG)
+  {
+    return "Positive --modal-damping-rate is supported by DG and DGSEM only; "
+           "the HDG backend has no modal damping implementation.";
+  }
+  if (regularization == Regularization::IGR)
+  {
+    const ::igrlab::IGRSigmaUpdateCadence cadence =
+      igr_opts.sigma_cadence.empty()
+        ? case_cfg.igr_config.sigma_cadence
+        : ParseIGRSigmaUpdateCadence(igr_opts.sigma_cadence);
+    if (cadence != ::igrlab::IGRSigmaUpdateCadence::EveryStage)
+    {
+      return "Positive --modal-damping-rate with active IGR requires "
+             "--igr-sigma-cadence every-stage.";
+    }
+  }
+  return {};
+}
+
+/** Validate the user-facing explicit SSPRK CFL convention.
+ *
+ * A positive value is a safety fraction of the selected method's SSP
+ * coefficient.  Zero explicitly disables CFL control and selects opts.dt.
+ * Keep the upper bound fail-closed: values above one would otherwise look
+ * like ordinary safety factors while silently exceeding the selected SSP
+ * normalization. This validation alone is not a spatial positivity theorem.
+ */
+inline std::string
+ValidateExplicitSSPRKCFLSelection(const RunConfig& run_cfg)
+{
+  if (IsResearchExplicitRKTimeIntegrator(run_cfg.time_integrator))
+  {
+    if (run_cfg.opts.cfl != 0.0 || !std::isfinite(run_cfg.opts.dt) ||
+        run_cfg.opts.dt <= 0.0)
+    {
+      return "Research rk4/dopri5/radau-picard5 require --cfl-number 0 and "
+             "a finite positive --time-step; no SSP coefficient or adaptive "
+             "error controller is supplied.";
+    }
+    const mfem::LimiterPipelineConfig& limiter =
+      run_cfg.case_config.limiter_pipeline;
+    if (limiter.zhang_shu || limiter.bj_mode != mfem::BJLimiterMode::kNone ||
+        limiter.tvb_mode != mfem::TVBLimiterMode::kNone ||
+        limiter.venkat_mode != mfem::VenkatLimiterMode::kNone ||
+        limiter.krivodonova)
+    {
+      return "Research rk4/dopri5/radau-picard5 currently require an inactive "
+             "limiter pipeline (--positivity-limiter none).";
+    }
+    const ::igrlab::IGRSigmaUpdateCadence cadence =
+      run_cfg.igr_opts.sigma_cadence.empty()
+        ? run_cfg.case_config.igr_config.sigma_cadence
+        : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
+    if (run_cfg.regularization == Regularization::IGR &&
+        cadence != ::igrlab::IGRSigmaUpdateCadence::EveryStage)
+    {
+      return "Research rk4/dopri5/radau-picard5 with active IGR require "
+             "--igr-sigma-cadence every-stage.";
+    }
+    return {};
+  }
+  if (!IsExplicitSSPRKTimeIntegrator(run_cfg.time_integrator))
+  {
+    return {};
+  }
+  const mfem::real_t safety_factor = run_cfg.opts.cfl;
+  if (!std::isfinite(safety_factor) || safety_factor < 0.0 ||
+      safety_factor > 1.0)
+  {
+    return "Explicit SSPRK --cfl-number is a finite safety factor in [0,1]; "
+           "the selected method's SSP coefficient is applied automatically.";
+  }
+  if (safety_factor == 0.0 &&
+      (!std::isfinite(run_cfg.opts.dt) || run_cfg.opts.dt <= 0.0))
+  {
+    return "Explicit SSPRK --cfl-number 0 requires a finite positive "
+           "--time-step.";
+  }
+  return {};
+}
+
+inline ::igrlab::IGRAlphaLengthScalePolicy
 ResolveIGRAlphaLengthScalePolicy(const RunConfig& run_cfg)
 {
   if (!run_cfg.igr_opts.alpha_length_policy.empty())
@@ -1066,6 +2019,177 @@ ResolveIGRAlphaLengthScalePolicy(const RunConfig& run_cfg)
   return run_cfg.case_config.igr_config.alpha_length_scale_policy;
 }
 
+/// Exact frozen-sigma acoustic speeds belong to the typed extrapolated route.
+/// A bounded research override gives every-stage temporal references exactly
+/// the same spatial dissipation, while retaining current-equation sigma solves.
+inline bool UsesFrozenSigmaSpectralSpeed(const RunConfig& run_cfg)
+{
+  const ::igrlab::IGRSigmaUpdateCadence cadence =
+    run_cfg.igr_opts.sigma_cadence.empty()
+      ? run_cfg.case_config.igr_config.sigma_cadence
+      : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
+  if (const char* reference =
+        ::igrlab::GetEnv("DG_IGR_IGR_FROZEN_SIGMA_REFERENCE"))
+  {
+    if (std::string(reference) != "1" ||
+        run_cfg.regularization != Regularization::IGR ||
+        run_cfg.discretization != Discretization::DGSEM ||
+        cadence != ::igrlab::IGRSigmaUpdateCadence::EveryStage)
+    {
+      throw std::invalid_argument(
+        "DG_IGR_IGR_FROZEN_SIGMA_REFERENCE requires value exactly 1 and "
+        "active IGR with DGSEM and every-stage sigma cadence.");
+    }
+    return true;
+  }
+  return run_cfg.regularization == Regularization::IGR &&
+         run_cfg.discretization == Discretization::DGSEM &&
+         cadence == ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep;
+}
+
+/** Reject cadence requests that the existing HDG DAE backend cannot honor.
+ *
+ * The HDG adapter reconstructs its algebraic variables inside the implicit
+ * stage solve and has no implementation of frozen/extrapolated sigma stages.
+ * Validate this before the adapter's early return so a DG-only cadence is
+ * never accepted and then silently ignored.
+ */
+inline std::string ValidateHdgIGRSigmaCadence(
+  Discretization discretization,
+  Regularization regularization,
+  const CaseConfig& case_cfg,
+  const IGROptions& igr_opts)
+{
+  if (discretization != Discretization::HDG)
+  {
+    return {};
+  }
+  // A conventional HDG run has no sigma state, but an explicit cadence flag
+  // is still a user request and must not disappear at the adapter boundary.
+  // Only active IGR inherits the case default when no flag was supplied.
+  if (igr_opts.sigma_cadence.empty() &&
+      regularization != Regularization::IGR)
+  {
+    return {};
+  }
+  const ::igrlab::IGRSigmaUpdateCadence cadence =
+    igr_opts.sigma_cadence.empty()
+      ? case_cfg.igr_config.sigma_cadence
+      : ParseIGRSigmaUpdateCadence(igr_opts.sigma_cadence);
+  if (cadence == ::igrlab::IGRSigmaUpdateCadence::EveryStage)
+  {
+    return {};
+  }
+  return "The HDG instantaneous-IGR backend supports only "
+         "--igr-sigma-cadence every-stage; split and extrapolated cadences "
+         "are qualified only on their explicitly supported DG/DGSEM routes.";
+}
+
+/** Validate the production-qualified extrapolated instantaneous-IGR tuple.
+ *
+ * Extrapolating the algebraic closure is a distinct temporal discretization,
+ * not a generic cadence optimization.  Keep it an explicit typed selection:
+ * every other DG/IGR configuration retains its established every-stage or
+ * every-step behavior instead of silently inheriting an unqualified split.
+ */
+inline std::string
+ValidateExtrapolatedEveryStepIGRSelection(const RunConfig& run_cfg)
+{
+  const ::igrlab::IGRSigmaUpdateCadence cadence =
+    run_cfg.igr_opts.sigma_cadence.empty()
+      ? run_cfg.case_config.igr_config.sigma_cadence
+      : ParseIGRSigmaUpdateCadence(run_cfg.igr_opts.sigma_cadence);
+  if (cadence != ::igrlab::IGRSigmaUpdateCadence::ExtrapolatedEveryStep)
+  {
+    return {};
+  }
+
+  const char* prefix =
+    "--igr-sigma-cadence extrapolated-every-step requires ";
+  if (run_cfg.regularization != Regularization::IGR)
+  {
+    return std::string(prefix) + "active IGR.";
+  }
+  if (run_cfg.discretization != Discretization::DGSEM ||
+      run_cfg.dg_backend != DGBackend::DGSEM)
+  {
+    return std::string(prefix) + "the DGSEM discretization.";
+  }
+  if (run_cfg.time_integrator != TimeIntegrator::SSPRK104)
+  {
+    return std::string(prefix) + "the SSPRK(10,4) time integrator.";
+  }
+  if (!run_cfg.case_config.limiter_pipeline.zhang_shu ||
+      run_cfg.case_config.limiter_pipeline.zhang_shu_points !=
+        mfem::ZhangShuPointSet::kConsumer)
+  {
+    return std::string(prefix) +
+           "the stagewise Zhang-Shu limiter on consumer points.";
+  }
+  const mfem::LimiterPipelineConfig& limiter =
+    run_cfg.case_config.limiter_pipeline;
+  if (limiter.bj_mode != mfem::BJLimiterMode::kNone ||
+      limiter.tvb_mode != mfem::TVBLimiterMode::kNone ||
+      limiter.venkat_mode != mfem::VenkatLimiterMode::kNone ||
+      limiter.krivodonova)
+  {
+    return std::string(prefix) +
+           "the qualified Zhang-Shu-only limiter pipeline.";
+  }
+  if (run_cfg.dgsem_stab != DGSEMStabilization::None ||
+      run_cfg.dgsem_volume_flux != DGSEMVolumeFlux::Central ||
+      run_cfg.dgsem_volume_dissipation != DGSEMVolumeDissipation::LLF ||
+      run_cfg.dgsem_surface_flux != DGSEMSurfaceFlux::Rusanov)
+  {
+    return std::string(prefix) +
+           "DGSEM central volume flux, LLF volume dissipation, Rusanov "
+           "surface flux, and no additional DGSEM stabilization.";
+  }
+  if (!IsL2IGRSpaceName(run_cfg.igr_opts.space) ||
+      !IsBrokenDGIGRGradName(run_cfg.igr_opts.grad) ||
+      ParseIGRIPKind(run_cfg.igr_opts.ip_kind) != ::igrlab::IGRIPKind::SIPG ||
+      !run_cfg.igr_opts.exact_dg_face_operator)
+  {
+    return std::string(prefix) +
+           "the L2/BrokenL2 SIPG closure with exact DG faces.";
+  }
+  if (ParseIGRSolveMode(run_cfg.igr_opts.solve_mode) !=
+        ::igrlab::IGRSolveMode::Krylov ||
+      ParseIGRLinearSolverType(run_cfg.igr_opts.linear_solver) !=
+        ::igrlab::IGRLinearSolverType::CG ||
+      ParseIGRPrecondType(run_cfg.igr_opts.preconditioner) !=
+        ::igrlab::IGRPrecondType::OperatorChebyshev)
+  {
+    return std::string(prefix) +
+           "Krylov CG with the full-system operator-Chebyshev preconditioner "
+           "so every exact algebraic anchor can receive an independent FP64 "
+           "residual certificate.";
+  }
+  if (ResolveIGRAlphaLengthScalePolicy(run_cfg) !=
+      ::igrlab::IGRAlphaLengthScalePolicy::Local)
+  {
+    return std::string(prefix) +
+           "the local alpha=C_alpha*h_eff^2 policy.";
+  }
+  if (run_cfg.igr_opts.igr_invariant_domain_flux ||
+      run_cfg.igr_opts.sigma_aware_cfl ||
+      run_cfg.igr_opts.sigma_aware_rusanov)
+  {
+    return std::string(prefix) +
+           "its intrinsic frozen-sigma spectral speed policy (legacy "
+           "invariant-domain, sigma-CFL, and sigma-Rusanov toggles off).";
+  }
+  if (run_cfg.igr_opts.nonconvergence_policy.empty() ||
+      ParseIGRNonconvergencePolicy(
+        run_cfg.igr_opts.nonconvergence_policy) !=
+      ::igrlab::IGRNonconvergencePolicy::Error)
+  {
+    return std::string(prefix) +
+           "--igr-nonconvergence-policy error.";
+  }
+  return {};
+}
+
 inline TimeLoopConfig MakeTimeLoopConfig(const RunConfig& run_cfg)
 {
   const CommonOptions& opts = run_cfg.opts;
@@ -1073,6 +2197,8 @@ inline TimeLoopConfig MakeTimeLoopConfig(const RunConfig& run_cfg)
   cfg.t_final = opts.t_final;
   cfg.dt = opts.dt;
   cfg.dt_min = opts.dt_min;
+  // Preserve the user safety factor here. RunTimeLoop obtains the selected
+  // stepper's SSP coefficient and applies it exactly once.
   cfg.cfl = opts.cfl;
   cfg.order = opts.order;
   cfg.vis_steps = opts.vis_steps;

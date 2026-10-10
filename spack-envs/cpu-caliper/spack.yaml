@@ -1,0 +1,14 @@
+spack:
+  specs:
+    # CPU-only dependencies for MPI-enabled MFEM and Caliper observability.
+  - caliper +mpi ~cuda
+  - cmake
+  - doxygen
+  - hypre +mpi ~cuda
+  - metis
+  - openmpi ~cuda
+  packages:
+    all:
+      providers:
+        mpi: [openmpi]
+  view: true

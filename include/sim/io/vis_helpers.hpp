@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/io/vis_helpers.hpp
  * @brief GLVis/VTK field helpers for Euler visualization.
@@ -16,7 +18,7 @@
 
 #include "sim/state/state_views.hpp"
 
-namespace dg_igr
+namespace igrlab
 {
 class IGRSolver;
 }
@@ -35,7 +37,7 @@ struct EulerFieldList
   EulerStateViews* state = nullptr;
   EulerPressureView* pressure = nullptr;
   EulerVelocityView* velocity = nullptr;
-  dg_igr::IGRSolver* igr = nullptr;
+  ::igrlab::IGRSolver* igr = nullptr;
   const mfem::ParGridFunction* sigma = nullptr;
   H1Diagnostics* h1_diag = nullptr;
   L2Diagnostics* l2_diag = nullptr;
@@ -159,7 +161,9 @@ struct MPIRankField
       fes0(std::make_unique<mfem::ParFiniteElementSpace>(&mesh, fec0.get())),
       rank(fes0.get())
   {
-    rank = static_cast<double>(mfem::Mpi::WorldRank());
+    int communicator_rank = 0;
+    MPI_Comm_rank(mesh.GetComm(), &communicator_rank);
+    rank = static_cast<double>(communicator_rank);
   }
 };
 

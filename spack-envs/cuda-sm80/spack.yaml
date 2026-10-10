@@ -1,0 +1,22 @@
+spack:
+  specs:
+    # Portable A100 dependency template. Configure site compilers and external
+    # CUDA/MPI packages in a site environment selected with DG_IGR_SPACK_ENV.
+  - cmake
+  - doxygen
+  - cuda@12.9.1
+  - hypre@2.32.0 ~shared +mpi +cuda +umpire cuda_arch=80
+  - umpire@2024.07.0 +cuda cuda_arch=80
+  - metis
+  - openblas@0.3.23 +shared threads=none
+  - zlib
+  - openmpi +cuda
+  concretizer:
+    unify: true
+  packages:
+    all:
+      providers:
+        mpi: [openmpi]
+        blas: [openblas]
+        lapack: [openblas]
+  view: true

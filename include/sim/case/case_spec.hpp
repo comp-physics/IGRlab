@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 /**
  * @file sim/case/case_spec.hpp
  * @brief Case specification types for the sim-layer solver.
@@ -14,6 +16,7 @@
 
 #include "sim/config/case_config.hpp"
 #include "sim/context/example_context.hpp"
+#include "sim/hdg/main_backend.hpp"
 #include "sim/state/euler_state_bundle.hpp"
 #include "sim/wiring/bc_wiring.hpp"
 #include "sim/time/time_callbacks.hpp"
@@ -63,11 +66,12 @@ template <typename CaseOptions, typename NumericalFlux> struct CaseSpec
   std::string case_name;
   std::string default_mesh_path;
   const char* case_file = nullptr;
-  double gamma = mfem::dg_igr::EulerDefaults::kGamma;
+  double gamma = mfem::igrlab::EulerDefaults::kGamma;
   DGBackend dg_backend_default = DGBackend::DG;
+  /// Default regularization when --regularization is omitted.
   bool use_igr = true;
   /// Optional sigma-space allocation when IGR coupling is disabled.
-  /// When use_igr=true, sigma space is always allocated.
+  /// The resolved regularization selector independently requests IGR storage.
   bool need_sigma = false;
   bool need_h1 = false;
 
@@ -86,12 +90,28 @@ template <typename CaseOptions, typename NumericalFlux> struct CaseSpec
                                                          const ExampleContext&,
                                                          double gamma)>
     make_ic;
+  /// Optional time-independent four-component Euler source. Returning null
+  /// selects the source-free production path.
+  std::function<std::unique_ptr<mfem::VectorCoefficient>(const CaseOptions&,
+                                                         const ExampleContext&,
+                                                         double gamma)>
+    make_static_source;
   std::function<BoundaryMarkerMap(ExampleContext&)> build_markers;
   std::function<void(const CaseOptions&,
                      const ExampleContext&,
                      EulerBoundaryWiring<NumericalFlux>&,
                      const BoundaryMarkerMap&)>
     apply_bc;
+  /**
+   * Optional physics-only HDG factory.  The generic HDG main adapter owns
+   * mesh construction, field projection, boundary lowering, and time-driver
+   * wiring; this callback supplies only case physics after that mesh exists.
+   */
+  std::function<hdg::HdgEulerCaseData(const CaseOptions&,
+                                      const CaseConfig&,
+                                      const CommonOptions&,
+                                      const CaseContext&)>
+    make_hdg_case_data;
   std::function<void(const CaseOptions&, ExampleContext&, EulerStateBundle&)>
     after_init;
   std::function<int(const CaseOptions&,

@@ -1,3 +1,4 @@
+#include "igrlab/environment.hpp"
 #include "numerics/dgsem/dgsem_basis.hpp"
 #include "numerics/dgsem/dgsem_entropy_flux.hpp"
 #include "numerics/dgsem/dgsem_flux.hpp"
@@ -16,6 +17,7 @@
 
 #include "mfem.hpp"
 #include "test_utils.hpp"
+#include "test_dgsem_reference_fixtures.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -625,10 +627,9 @@ int RunDGSEMFluxTests(TestContext& ctx)
     mfem::Vector y(vfes.GetTrueVSize());
     U.GetTrueDofs(x);
     y = 0.0;
-    if (vfes.GetNE() > 0)
-    {
-      oper.Mult(x, y);
-    }
+    // Production Mult owns communicator-wide selection and CFL state;
+    // empty partitions must participate in the same call.
+    oper.Mult(x, y);
 
     const double resid_norm = GlobalL2Norm(y);
     const double resid_max = GlobalMax(MaxAbsEntry(y));
@@ -711,10 +712,9 @@ int RunDGSEMFluxTests(TestContext& ctx)
     mfem::Vector y(vfes.GetTrueVSize());
     U.GetTrueDofs(x);
     y = 0.0;
-    if (vfes.GetNE() > 0)
-    {
-      oper.Mult(x, y);
-    }
+    // Production Mult owns communicator-wide selection and CFL state;
+    // empty partitions must participate in the same call.
+    oper.Mult(x, y);
 
     const double resid_norm = GlobalL2Norm(y);
     const double resid_max = GlobalMax(MaxAbsEntry(y));
@@ -799,10 +799,9 @@ int RunDGSEMFluxTests(TestContext& ctx)
     mfem::Vector y(vfes.GetTrueVSize());
     U.GetTrueDofs(x);
     y = 0.0;
-    if (vfes.GetNE() > 0)
-    {
-      oper.Mult(x, y);
-    }
+    // Production Mult owns communicator-wide selection and CFL state;
+    // empty partitions must participate in the same call.
+    oper.Mult(x, y);
 
     const double resid_norm = GlobalL2Norm(y);
     const double resid_max = GlobalMax(MaxAbsEntry(y));
@@ -1294,7 +1293,7 @@ int RunDGSEMFluxTests(TestContext& ctx)
     const double expected_lf = -7.91901e-4;
     const double tol_prod = 1.0e-2;
 
-    if (std::getenv("DG_IGR_PRINT_ENTROPY"))
+    if (::igrlab::GetEnv("DG_IGR_PRINT_ENTROPY"))
     {
       std::cout << "entropy_prod_winters=" << prod_winters << "\n";
       std::cout << "entropy_prod_lf_fd=" << prod_lf_fd << "\n";
@@ -1327,7 +1326,9 @@ int RunDGSEMFluxTests(TestContext& ctx)
                   "LF entropy production FD vs analytic close");
   }
 
+  RunDGSEMDeterministicFluxFixtures(ctx);
+
   return ctx.failures;
 }
 
-} // namespace dg_igr_tests
+} // namespace igrlab_tests

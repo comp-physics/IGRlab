@@ -1,3 +1,4 @@
+#include "igrlab/compat.hpp"
 #include "physics/igr/igr_flux.hpp"
 
 #include <algorithm>
@@ -6,42 +7,111 @@
 namespace mfem
 {
 
-namespace
+void FluxWithIGR::RecordFrozenSigmaSample(real_t pressure,
+                                          real_t sigma) const
 {
-
-double AverageUnOverRhoAlongSegment(const Vector& U1,
-                                    const Vector& U2,
-                                    const Vector& n,
-                                    int dim)
-{
-  const double rho1 = U1(0);
-  const double rho2 = U2(0);
-  MFEM_VERIFY(rho1 > 0.0 && rho2 > 0.0,
-              "FluxWithIGR::ComputeAvgFluxDotNAtSide requires positive "
-              "density endpoints for exact averaged sigma correction.");
-
-  double mn1 = 0.0;
-  double mn2 = 0.0;
-  for (int d = 0; d < dim; ++d)
+  IGRFrozenSigmaTelemetry& telemetry = frozen_sigma_telemetry_;
+  telemetry.enabled = true;
+  ++telemetry.sample_count;
+  const double q_sigma = static_cast<double>(gamma_) * pressure +
+                         (static_cast<double>(gamma_) - 1.0) * sigma;
+  const double ratio =
+    q_sigma / (static_cast<double>(gamma_) * pressure);
+  const bool q_finite = std::isfinite(q_sigma);
+  const bool ratio_finite = std::isfinite(ratio);
+  if (!q_finite || !ratio_finite)
   {
-    mn1 += U1(1 + d) * n(d);
-    mn2 += U2(1 + d) * n(d);
+    ++telemetry.nonfinite_count;
   }
-  const double dmn = mn2 - mn1;
-  const double drho = rho2 - rho1;
-  const double eps = 1.0e-14 * std::max(1.0, std::abs(rho1));
-  if (std::abs(drho) <= eps)
+  if (q_finite)
   {
-    return (mn1 + 0.5 * dmn) / rho1;
+    if (q_sigma <= 0.0)
+    {
+      ++telemetry.nonpositive_count;
+    }
+    telemetry.minimum_raw_q_sigma =
+      std::min(telemetry.minimum_raw_q_sigma, q_sigma);
   }
-
-  const double inv_drho = 1.0 / drho;
-  const double inv_drho2 = inv_drho * inv_drho;
-  const double log_ratio = std::log1p(drho / rho1);
-  return dmn * inv_drho + (mn1 * drho - dmn * rho1) * inv_drho2 * log_ratio;
+  if (ratio_finite)
+  {
+    telemetry.minimum_q_sigma_over_gamma_p =
+      std::min(telemetry.minimum_q_sigma_over_gamma_p, ratio);
+  }
 }
 
-} // namespace
+real_t FluxWithIGR::InvariantDomainSpeed(const Vector& U,
+                                         const Vector* normal,
+                                         real_t sigma,
+                                         real_t base_speed) const
+{
+  const real_t density = U(0);
+  const real_t safe_density = std::max(density, rho_vel_floor_);
+  real_t momentum_sq = 0.0;
+  real_t momentum_dot_normal = 0.0;
+  for (int d = 0; d < dim; ++d)
+  {
+    const real_t momentum = U(1 + d);
+    momentum_sq += momentum * momentum;
+    if (normal)
+    {
+      momentum_dot_normal += momentum * (*normal)(d);
+    }
+  }
+  const real_t pressure =
+    (gamma_ - 1.0) * (U(1 + dim) - 0.5 * momentum_sq / safe_density);
+  RecordFrozenSigmaSample(pressure, sigma);
+  const real_t normal_norm = normal ? normal->Norml2() : 0.0;
+  const real_t transport_speed = normal
+                                   ? (normal_norm > 0.0
+                                        ? std::abs(momentum_dot_normal) /
+                                            (safe_density * normal_norm)
+                                        : 0.0)
+                                   : std::sqrt(momentum_sq) / safe_density;
+  return IGRFluxInvariantDomainSpeed(base_speed,
+                                     density,
+                                     pressure,
+                                     transport_speed,
+                                     sigma,
+                                     gamma_,
+                                     rho_vel_floor_,
+                                     invariant_domain_pressure_floor_);
+}
+
+real_t FluxWithIGR::FrozenSigmaSpectralSpeed(const Vector& U,
+                                             const Vector* normal,
+                                             real_t sigma) const
+{
+  const real_t density = U(0);
+  const real_t safe_density = std::max(density, rho_vel_floor_);
+  real_t momentum_sq = 0.0;
+  real_t momentum_dot_normal = 0.0;
+  for (int d = 0; d < dim; ++d)
+  {
+    const real_t momentum = U(1 + d);
+    momentum_sq += momentum * momentum;
+    if (normal)
+    {
+      momentum_dot_normal += momentum * (*normal)(d);
+    }
+  }
+  const real_t pressure =
+    (gamma_ - 1.0) * (U(1 + dim) - 0.5 * momentum_sq / safe_density);
+  RecordFrozenSigmaSample(pressure, sigma);
+  const real_t normal_norm = normal ? normal->Norml2() : 0.0;
+  const real_t transport_speed = normal
+                                   ? (normal_norm > 0.0
+                                        ? std::abs(momentum_dot_normal) /
+                                            (safe_density * normal_norm)
+                                        : 0.0)
+                                   : std::sqrt(momentum_sq) / safe_density;
+  return ::igrlab::frozen_scalar_igr_algebra::
+    FrozenSigmaCharacteristicModulusBound(density,
+                                          pressure,
+                                          transport_speed,
+                                          sigma,
+                                          gamma_,
+                                          rho_vel_floor_);
+}
 
 real_t FluxWithIGR::ComputeFlux(const Vector& U,
                                 ElementTransformation& Tr,
@@ -55,6 +125,14 @@ real_t FluxWithIGR::ComputeFlux(const Vector& U,
   const double sigma = sigma_->GetValue(Tr, ip);
 
   AddTensorSigmaTerms(U, sigma, F);
+  if (invariant_domain_flux_)
+  {
+    return InvariantDomainSpeed(U, nullptr, sigma, mcs);
+  }
+  if (frozen_sigma_spectral_speed_)
+  {
+    return FrozenSigmaSpectralSpeed(U, nullptr, sigma);
+  }
   return sigma_aware_cfl_
            ? IGRFluxCharacteristicSpeed(mcs, U(0), sigma, rho_vel_floor_)
            : mcs;
@@ -82,6 +160,14 @@ real_t FluxWithIGR::ComputeFluxDotNAtSide(const Vector& U,
 
   const double sigma_face = GetSigmaAtSide(Tr, side);
   AddDotNSigmaTerms(U, n, sigma_face, Fn);
+  if (invariant_domain_flux_)
+  {
+    return InvariantDomainSpeed(U, &n, sigma_face, mcs);
+  }
+  if (frozen_sigma_spectral_speed_)
+  {
+    return FrozenSigmaSpectralSpeed(U, &n, sigma_face);
+  }
   return sigma_aware_cfl_
            ? IGRFluxCharacteristicSpeed(
                mcs, U(0), sigma_face, rho_vel_floor_)
@@ -102,11 +188,30 @@ real_t FluxWithIGR::ComputeAvgFluxDotNAtSide(const Vector& U1,
   }
 
   const double sigma_face = GetSigmaAtSide(Tr, side);
-  for (int d = 0; d < dim; ++d)
+  MFEM_VERIFY(U1(0) > 0.0 && U2(0) > 0.0,
+              "FluxWithIGR::ComputeAvgFluxDotNAtSide requires positive "
+              "density endpoints for exact averaged sigma correction.");
+  ::igrlab::frozen_scalar_igr_algebra::AddTwoStateAverageNormalSigmaFlux(
+    dim,
+    U1.GetData(),
+    1,
+    U2.GetData(),
+    1,
+    n.GetData(),
+    1,
+    sigma_face,
+    Fn.GetData(),
+    1);
+  if (invariant_domain_flux_)
   {
-    Fn(1 + d) += sigma_face * n(d);
+    return std::max(InvariantDomainSpeed(U1, &n, sigma_face, mcs),
+                    InvariantDomainSpeed(U2, &n, sigma_face, mcs));
   }
-  Fn(1 + dim) += sigma_face * AverageUnOverRhoAlongSegment(U1, U2, n, dim);
+  if (frozen_sigma_spectral_speed_)
+  {
+    return std::max(FrozenSigmaSpectralSpeed(U1, &n, sigma_face),
+                    FrozenSigmaSpectralSpeed(U2, &n, sigma_face));
+  }
   return sigma_aware_cfl_
            ? IGRFluxCharacteristicSpeed(
                mcs, std::min(U1(0), U2(0)), sigma_face, rho_vel_floor_)

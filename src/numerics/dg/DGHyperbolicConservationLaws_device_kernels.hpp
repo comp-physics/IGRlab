@@ -3,353 +3,126 @@
 // `DGHyperbolicConservationLaws.cpp` after MFEM/CUDA/HIP backend headers.
 #pragma once
 
+#include "igrlab/compat.hpp"
+
 namespace
 {
 
-enum class DeviceBoundaryType : int
-{
-  Unsupported = 0,
-  SupersonicInlet = 1,
-  SupersonicOutlet = 2,
-  SubsonicOutletPressure = 3,
-  NonReflectingOutlet = 4,
-  SubsonicInlet = 5,
-  FarField = 6,
-  SlipWall = 7
-};
+using DeviceBoundaryType = detail::EulerBoundaryStateKind;
+
+constexpr int kFrozenSigmaTelemetryWidth_ = 5;
+constexpr int kFrozenSigmaSampleCount_ = 0;
+constexpr int kFrozenSigmaNonpositiveCount_ = 1;
+constexpr int kFrozenSigmaNonfiniteCount_ = 2;
+constexpr int kFrozenSigmaMinimumRaw_ = 3;
+constexpr int kFrozenSigmaMinimumRatio_ = 4;
 
 #ifdef DG_IGR_HAS_ACCEL_FORALL
-constexpr real_t kBoundaryRhoFloor = 1.0e-12;
-constexpr real_t kBoundaryPFloor = 1.0e-12;
-
-struct PrimitiveNormalState_
+MFEM_HOST_DEVICE inline bool FiniteTelemetryValue_(const double value)
 {
-  real_t rho = 1.0;
-  real_t p = 1.0;
-  real_t un = 0.0;
-  real_t ut = 0.0;
-  real_t c = 1.0;
-};
+  return value == value &&
+         fabs(value) <= std::numeric_limits<double>::max();
+}
 
-MFEM_HOST_DEVICE inline void BuildNormalTangential_(const real_t* normal,
-                                                     int dim,
-                                                     real_t* nhat,
-                                                     real_t* that)
+/** Accumulate one actual invariant-speed sample into a uniquely owned slot.
+ *
+ * Packed kernels assign exactly one thread to each slot, so no atomics are
+ * required.  The slot persists across Mult() calls and is read only when the
+ * application requests the final bounded aggregate.
+ */
+MFEM_HOST_DEVICE inline void AccumulateFrozenSigmaTelemetry_(
+  const real_t pressure,
+  const real_t sigma,
+  const real_t gamma,
+  double* const slot)
 {
-  real_t nrm2 = 0.0;
-  for (int d = 0; d < dim; ++d)
+  if (!slot)
   {
-    nhat[d] = normal[d];
-    nrm2 += normal[d] * normal[d];
-    that[d] = 0.0;
+    return;
   }
-  const real_t nrm = sqrt(nrm2);
-  if (nrm > 0.0)
+  const double gamma64 = static_cast<double>(gamma);
+  const double pressure64 = static_cast<double>(pressure);
+  const double sigma64 = static_cast<double>(sigma);
+  const double q_sigma =
+    gamma64 * pressure64 + (gamma64 - 1.0) * sigma64;
+  const double ratio = q_sigma / (gamma64 * pressure64);
+  slot[kFrozenSigmaSampleCount_] += 1.0;
+  const bool q_finite = FiniteTelemetryValue_(q_sigma);
+  const bool ratio_finite = FiniteTelemetryValue_(ratio);
+  if (!q_finite || !ratio_finite)
   {
-    const real_t inv_nrm = 1.0 / nrm;
-    for (int d = 0; d < dim; ++d)
+    slot[kFrozenSigmaNonfiniteCount_] += 1.0;
+  }
+  if (q_finite)
+  {
+    if (q_sigma <= 0.0)
     {
-      nhat[d] *= inv_nrm;
+      slot[kFrozenSigmaNonpositiveCount_] += 1.0;
     }
+    slot[kFrozenSigmaMinimumRaw_] =
+      fmin(slot[kFrozenSigmaMinimumRaw_], q_sigma);
   }
-  else
+  if (ratio_finite)
   {
-    for (int d = 0; d < dim; ++d)
-    {
-      nhat[d] = 0.0;
-    }
-    nhat[0] = 1.0;
-  }
-
-  if (dim == 2)
-  {
-    that[0] = -nhat[1];
-    that[1] = nhat[0];
+    slot[kFrozenSigmaMinimumRatio_] =
+      fmin(slot[kFrozenSigmaMinimumRatio_], ratio);
   }
 }
 
-MFEM_HOST_DEVICE inline PrimitiveNormalState_ ConservativeToPrimitiveNormal_(
-  const real_t* U,
-  int dim,
-  real_t gamma,
-  const real_t* nhat,
-  const real_t* that)
+MFEM_HOST_DEVICE inline bool EvalBoundaryGhostEuler_(
+  const int boundary_type,
+  const int dimension,
+  const int equations,
+  const real_t gamma,
+  const real_t pressure_out,
+  const real_t* reference_state,
+  const real_t* normal,
+  const real_t* interior,
+  real_t* exterior,
+  const bool invariant_domain_flux,
+  const real_t invariant_domain_density_floor,
+  const real_t invariant_domain_pressure_floor)
 {
-  PrimitiveNormalState_ out;
-  const real_t rho = fmax(U[0], kBoundaryRhoFloor);
-  real_t vel[3] = {0.0, 0.0, 0.0};
-  real_t vel2 = 0.0;
-  for (int d = 0; d < dim; ++d)
+  if (invariant_domain_flux)
   {
-    vel[d] = U[1 + d] / rho;
-    vel2 += vel[d] * vel[d];
+    if (!detail::EulerConservativeStateMeetsContract(
+          interior,
+          dimension,
+          equations,
+          gamma,
+          invariant_domain_density_floor,
+          invariant_domain_pressure_floor))
+      return false;
+    const bool evaluated = detail::EvaluateEulerBoundaryState(
+      static_cast<DeviceBoundaryType>(boundary_type),
+      dimension,
+      equations,
+      gamma,
+      pressure_out,
+      reference_state,
+      normal,
+      interior,
+      exterior,
+      invariant_domain_density_floor,
+      invariant_domain_pressure_floor);
+    return evaluated && detail::EulerConservativeStateMeetsContract(
+      exterior,
+      dimension,
+      equations,
+      gamma,
+      invariant_domain_density_floor,
+      invariant_domain_pressure_floor);
   }
-
-  const real_t E = U[1 + dim] / rho;
-  const real_t kinetic = 0.5 * vel2;
-  const real_t p = fmax((gamma - 1.0) * rho * (E - kinetic), kBoundaryPFloor);
-  const real_t c = sqrt(fmax(gamma * p / rho, 0.0));
-
-  out.rho = rho;
-  out.p = p;
-  out.c = c;
-  out.un = 0.0;
-  out.ut = 0.0;
-  for (int d = 0; d < dim; ++d)
-  {
-    out.un += vel[d] * nhat[d];
-  }
-  if (dim == 2)
-  {
-    out.ut = vel[0] * that[0] + vel[1] * that[1];
-  }
-  return out;
-}
-
-MFEM_HOST_DEVICE inline void PrimitiveNormalToConservative_(
-  const PrimitiveNormalState_& prim,
-  int dim,
-  real_t gamma,
-  const real_t* nhat,
-  const real_t* that,
-  real_t* U)
-{
-  real_t vel[3] = {0.0, 0.0, 0.0};
-  if (dim == 1)
-  {
-    vel[0] = prim.un;
-  }
-  else
-  {
-    vel[0] = prim.un * nhat[0] + prim.ut * that[0];
-    vel[1] = prim.un * nhat[1] + prim.ut * that[1];
-  }
-
-  U[0] = prim.rho;
-  real_t vel2 = 0.0;
-  for (int d = 0; d < dim; ++d)
-  {
-    U[1 + d] = prim.rho * vel[d];
-    vel2 += vel[d] * vel[d];
-  }
-  const real_t E = prim.p / ((gamma - 1.0) * prim.rho) + 0.5 * vel2;
-  U[1 + dim] = prim.rho * E;
-}
-
-MFEM_HOST_DEVICE inline real_t EntropyLike_(real_t p, real_t rho, real_t gamma)
-{
-  return p / pow(fmax(rho, kBoundaryRhoFloor), gamma);
-}
-
-MFEM_HOST_DEVICE inline PrimitiveNormalState_ SubsonicOutletPressureClosure_(
-  const PrimitiveNormalState_& inner,
-  real_t gamma,
-  real_t p_out)
-{
-  PrimitiveNormalState_ out = inner;
-  if (inner.un >= inner.c || inner.un <= -inner.c)
-  {
-    return out;
-  }
-
-  const real_t g1 = gamma - 1.0;
-  const real_t s = EntropyLike_(inner.p, inner.rho, gamma);
-  const real_t p = fmax(p_out, kBoundaryPFloor);
-  const real_t rho = pow(p / s, 1.0 / gamma);
-  const real_t c = sqrt(fmax(gamma * p / rho, 0.0));
-  const real_t j_plus = inner.un + 2.0 * inner.c / g1;
-  const real_t un = j_plus - 2.0 * c / g1;
-
-  out.rho = fmax(rho, kBoundaryRhoFloor);
-  out.p = p;
-  out.c = c;
-  out.un = un;
-  out.ut = inner.ut;
-  return out;
-}
-
-MFEM_HOST_DEVICE inline PrimitiveNormalState_ NonReflectingOutletClosure_(
-  const PrimitiveNormalState_& inner,
-  const PrimitiveNormalState_& ref,
-  real_t gamma)
-{
-  PrimitiveNormalState_ out = inner;
-  if (inner.un >= inner.c || inner.un <= -inner.c)
-  {
-    return out;
-  }
-
-  const real_t g1 = gamma - 1.0;
-  const real_t j_plus = inner.un + 2.0 * inner.c / g1;
-  const real_t j_minus_ref = ref.un - 2.0 * ref.c / g1;
-  const real_t un = 0.5 * (j_plus + j_minus_ref);
-  const real_t c = 0.25 * g1 * (j_plus - j_minus_ref);
-  if (!(c > 0.0))
-  {
-    return out;
-  }
-
-  const real_t s_ref = EntropyLike_(ref.p, ref.rho, gamma);
-  const real_t rho =
-    pow((c * c) / fmax(gamma * s_ref, kBoundaryPFloor), 1.0 / g1);
-  const real_t p = s_ref * pow(fmax(rho, kBoundaryRhoFloor), gamma);
-
-  out.rho = fmax(rho, kBoundaryRhoFloor);
-  out.p = fmax(p, kBoundaryPFloor);
-  out.c = c;
-  out.un = un;
-  out.ut = inner.ut;
-  return out;
-}
-
-MFEM_HOST_DEVICE inline PrimitiveNormalState_ SubsonicInletClosure_(
-  const PrimitiveNormalState_& inner,
-  const PrimitiveNormalState_& target,
-  real_t gamma)
-{
-  PrimitiveNormalState_ out = target;
-  if (inner.un <= -inner.c)
-  {
-    return out;
-  }
-  if (inner.un >= inner.c)
-  {
-    return inner;
-  }
-
-  const real_t g1 = gamma - 1.0;
-  const real_t j_plus_inner = inner.un + 2.0 * inner.c / g1;
-  const real_t j_minus_target = target.un - 2.0 * target.c / g1;
-  const real_t un = 0.5 * (j_plus_inner + j_minus_target);
-  const real_t c = 0.25 * g1 * (j_plus_inner - j_minus_target);
-  if (!(c > 0.0))
-  {
-    return target;
-  }
-
-  const real_t s_target = EntropyLike_(target.p, target.rho, gamma);
-  const real_t rho =
-    pow((c * c) / fmax(gamma * s_target, kBoundaryPFloor), 1.0 / g1);
-  const real_t p = s_target * pow(fmax(rho, kBoundaryRhoFloor), gamma);
-
-  out.rho = fmax(rho, kBoundaryRhoFloor);
-  out.p = fmax(p, kBoundaryPFloor);
-  out.c = c;
-  out.un = un;
-  out.ut = target.ut;
-  return out;
-}
-
-MFEM_HOST_DEVICE inline bool EvalBoundaryGhostEuler_(int bdr_type,
-                                                      int dim,
-                                                      int neq,
-                                                      real_t gamma,
-                                                      real_t p_out,
-                                                      const real_t* state_ref,
-                                                      const real_t* normal,
-                                                      const real_t* u_minus,
-                                                      real_t* u_plus)
-{
-  if (neq != dim + 2)
-  {
-    return false;
-  }
-
-  if (bdr_type == static_cast<int>(DeviceBoundaryType::SupersonicInlet))
-  {
-    for (int eq = 0; eq < neq; ++eq)
-    {
-      u_plus[eq] = state_ref[eq];
-    }
-    return true;
-  }
-  if (bdr_type == static_cast<int>(DeviceBoundaryType::SupersonicOutlet))
-  {
-    for (int eq = 0; eq < neq; ++eq)
-    {
-      u_plus[eq] = u_minus[eq];
-    }
-    return true;
-  }
-  if (bdr_type == static_cast<int>(DeviceBoundaryType::SlipWall))
-  {
-    for (int eq = 0; eq < neq; ++eq)
-    {
-      u_plus[eq] = u_minus[eq];
-    }
-    const real_t rho = fmax(u_minus[0], kBoundaryRhoFloor);
-    real_t nhat[3] = {0.0, 0.0, 0.0};
-    real_t that[3] = {0.0, 0.0, 0.0};
-    BuildNormalTangential_(normal, dim, nhat, that);
-    real_t un = 0.0;
-    for (int d = 0; d < dim; ++d)
-    {
-      un += (u_minus[1 + d] / rho) * nhat[d];
-    }
-    for (int d = 0; d < dim; ++d)
-    {
-      const real_t uprime = (u_minus[1 + d] / rho) - 2.0 * un * nhat[d];
-      u_plus[1 + d] = rho * uprime;
-    }
-    return true;
-  }
-
-  real_t nhat[3] = {0.0, 0.0, 0.0};
-  real_t that[3] = {0.0, 0.0, 0.0};
-  BuildNormalTangential_(normal, dim, nhat, that);
-
-  const PrimitiveNormalState_ inner =
-    ConservativeToPrimitiveNormal_(u_minus, dim, gamma, nhat, that);
-
-  PrimitiveNormalState_ bnd = inner;
-  if (bdr_type ==
-      static_cast<int>(DeviceBoundaryType::SubsonicOutletPressure))
-  {
-    bnd = SubsonicOutletPressureClosure_(inner, gamma, p_out);
-  }
-  else if (bdr_type ==
-           static_cast<int>(DeviceBoundaryType::NonReflectingOutlet))
-  {
-    const PrimitiveNormalState_ ref =
-      ConservativeToPrimitiveNormal_(state_ref, dim, gamma, nhat, that);
-    bnd = NonReflectingOutletClosure_(inner, ref, gamma);
-  }
-  else if (bdr_type == static_cast<int>(DeviceBoundaryType::SubsonicInlet))
-  {
-    const PrimitiveNormalState_ target =
-      ConservativeToPrimitiveNormal_(state_ref, dim, gamma, nhat, that);
-    bnd = SubsonicInletClosure_(inner, target, gamma);
-  }
-  else if (bdr_type == static_cast<int>(DeviceBoundaryType::FarField))
-  {
-    const PrimitiveNormalState_ far =
-      ConservativeToPrimitiveNormal_(state_ref, dim, gamma, nhat, that);
-    if (inner.un <= -inner.c)
-    {
-      for (int eq = 0; eq < neq; ++eq)
-      {
-        u_plus[eq] = state_ref[eq];
-      }
-      return true;
-    }
-    if (inner.un >= inner.c)
-    {
-      for (int eq = 0; eq < neq; ++eq)
-      {
-        u_plus[eq] = u_minus[eq];
-      }
-      return true;
-    }
-    bnd = (inner.un < 0.0) ? SubsonicInletClosure_(inner, far, gamma)
-                           : NonReflectingOutletClosure_(inner, far, gamma);
-  }
-  else
-  {
-    return false;
-  }
-
-  PrimitiveNormalToConservative_(bnd, dim, gamma, nhat, that, u_plus);
-  return true;
+  return detail::EvaluateEulerBoundaryState(
+      static_cast<DeviceBoundaryType>(boundary_type),
+      dimension,
+      equations,
+      gamma,
+      pressure_out,
+      reference_state,
+      normal,
+      interior,
+      exterior);
 }
 
 MFEM_HOST_DEVICE inline void ComputeEulerFluxDotN_(const real_t* state,
@@ -395,18 +168,95 @@ MFEM_HOST_DEVICE inline void AddSigmaDotNTerms_(const real_t* state,
                                                  real_t rho_floor,
                                                  real_t* flux_dot_n)
 {
-  const int energy_eq = 1 + dim;
+  ::igrlab::frozen_scalar_igr_algebra::AddNormalSigmaFlux(dim,
+                                                          state,
+                                                          1,
+                                                          normal,
+                                                          1,
+                                                          sigma,
+                                                          rho_floor,
+                                                          flux_dot_n,
+                                                          1);
+}
+
+MFEM_HOST_DEVICE inline real_t IGRInvariantDomainFaceSpeed_(
+  const real_t* state,
+  const real_t* normal,
+  int dim,
+  real_t gamma,
+  real_t base_speed,
+  real_t sigma,
+  real_t rho_floor,
+  real_t pressure_floor,
+  double* const telemetry_slot)
+{
+  const real_t density = state[0];
+  const real_t safe_density = fmax(density, rho_floor);
+  real_t momentum2 = 0.0;
+  real_t normal_momentum = 0.0;
+  real_t normal_norm2 = 0.0;
   for (int d = 0; d < dim; ++d)
   {
-    flux_dot_n[1 + d] += sigma * normal[d];
+    const real_t momentum_d = state[1 + d];
+    momentum2 += momentum_d * momentum_d;
+    normal_momentum += momentum_d * normal[d];
+    normal_norm2 += normal[d] * normal[d];
   }
-  const real_t rho = fmax(state[0], rho_floor);
-  real_t un = 0.0;
-  for (int d = 0; d < dim; ++d)
+  const real_t pressure =
+    (gamma - 1.0) * (state[1 + dim] - 0.5 * momentum2 / safe_density);
+  AccumulateFrozenSigmaTelemetry_(
+    pressure, sigma, gamma, telemetry_slot);
+  const real_t normal_norm = sqrt(normal_norm2);
+  const real_t transport_speed =
+    normal_norm > 0.0
+      ? fabs(normal_momentum) / (safe_density * normal_norm)
+      : 0.0;
+  return IGRFluxInvariantDomainSpeed(base_speed,
+                                     density,
+                                     pressure,
+                                     transport_speed,
+                                     sigma,
+                                     gamma,
+                                     rho_floor,
+                                     pressure_floor);
+}
+
+MFEM_HOST_DEVICE inline void SelectIGRFaceSpeeds_(
+  const real_t* state,
+  const real_t* normal,
+  int dim,
+  real_t gamma,
+  real_t base_speed,
+  real_t sigma,
+  real_t rho_floor,
+  real_t pressure_floor,
+  bool invariant_domain_flux,
+  bool sigma_aware_cfl,
+  bool sigma_aware_rusanov,
+  double* const q_sigma_telemetry_slot,
+  real_t& cfl_speed,
+  real_t& dissipation_speed)
+{
+  if (invariant_domain_flux)
   {
-    un += state[1 + d] * normal[d];
+    const real_t bound = IGRInvariantDomainFaceSpeed_(state,
+                                                      normal,
+                                                      dim,
+                                                      gamma,
+                                                      base_speed,
+                                                      sigma,
+                                                      rho_floor,
+                                                      pressure_floor,
+                                                      q_sigma_telemetry_slot);
+    cfl_speed = bound;
+    dissipation_speed = bound;
+    return;
   }
-  flux_dot_n[energy_eq] += sigma * (un / rho);
+
+  const real_t heuristic_speed =
+    IGRFluxCharacteristicSpeed(base_speed, state[0], sigma, rho_floor);
+  cfl_speed = sigma_aware_cfl ? heuristic_speed : base_speed;
+  dissipation_speed = sigma_aware_rusanov ? heuristic_speed : base_speed;
 }
 
 struct PackedInverseMassKernel
@@ -449,11 +299,16 @@ struct PackedWeakDivEulerKernel
   int sigma_ldof = 0;
   real_t gamma = 1.4;
   real_t sigma_rho_floor = 1.0e-12;
+  real_t invariant_domain_pressure_floor = 1.0e-12;
   bool use_sigma = false;
+  bool invariant_domain_flux = false;
+  bool track_volume_speed = false;
   const int* state_map = nullptr;
   const real_t* weakdiv = nullptr;
   const real_t* x = nullptr;
   real_t* z = nullptr;
+  real_t* volume_speed = nullptr;
+  double* q_sigma_telemetry = nullptr;
   const int* sigma_map = nullptr;
   const real_t* sigma_interp = nullptr;
   const real_t* sigma_vals = nullptr;
@@ -467,6 +322,7 @@ struct PackedWeakDivEulerKernel
 
     const int energy_eq = 1 + dim;
     const real_t gm1 = gamma - 1.0;
+    real_t element_max_speed = 0.0;
 
     for (int j = 0; j < dof; ++j)
     {
@@ -497,8 +353,33 @@ struct PackedWeakDivEulerKernel
           sigma_j += sigma_interp[interp_row_off + k] * sigma_vals[sk];
         }
       }
+      if (use_sigma && invariant_domain_flux)
+      {
+        AccumulateFrozenSigmaTelemetry_(
+          pressure,
+          sigma_j,
+          gamma,
+          q_sigma_telemetry +
+            (e * dof + j) * kFrozenSigmaTelemetryWidth_);
+      }
       const real_t inv_rho_sigma =
         (use_sigma ? 1.0 / fmax(rho, sigma_rho_floor) : 0.0);
+      if (track_volume_speed)
+      {
+        const real_t transport_speed = sqrt(mom2) * inv_rho;
+        const real_t base_speed =
+          transport_speed + sqrt(gamma * pressure * inv_rho);
+        const real_t nodal_speed =
+          IGRFluxInvariantDomainSpeed(base_speed,
+                                      rho,
+                                      pressure,
+                                      transport_speed,
+                                      sigma_j,
+                                      gamma,
+                                      sigma_rho_floor,
+                                      invariant_domain_pressure_floor);
+        element_max_speed = fmax(element_max_speed, nodal_speed);
+      }
 
       for (int i = 0; i < dof; ++i)
       {
@@ -524,7 +405,8 @@ struct PackedWeakDivEulerKernel
               flux_md += pressure;
               if (use_sigma)
               {
-                flux_md += sigma_j;
+                flux_md += ::igrlab::frozen_scalar_igr_algebra::
+                  TensorSigmaMomentumDiagonalTerm(sigma_j);
               }
             }
             sum_m += weakdiv[wbase + d] * flux_md;
@@ -539,12 +421,18 @@ struct PackedWeakDivEulerKernel
           real_t flux_ed = mom[d] * H;
           if (use_sigma)
           {
-            flux_ed += sigma_j * mom[d] * inv_rho_sigma;
+            flux_ed += ::igrlab::frozen_scalar_igr_algebra::
+              TensorSigmaEnergyTermFromInverseDensity(
+                sigma_j, mom[d], inv_rho_sigma);
           }
           sum_e += weakdiv[wbase + d] * flux_ed;
         }
         z[state_map[state_off + i * neq + energy_eq]] += sum_e;
       }
+    }
+    if (track_volume_speed)
+    {
+      volume_speed[e] = element_max_speed;
     }
   }
 };
@@ -559,7 +447,9 @@ struct PackedInteriorFaceEulerRusanovKernel
   int sigma_ldof = 0;
   real_t gamma = 1.4;
   real_t sigma_rho_floor = 1.0e-12;
+  real_t invariant_domain_pressure_floor = 1.0e-12;
   bool use_sigma = false;
+  bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
   const int* state_map = nullptr;
@@ -570,8 +460,12 @@ struct PackedInteriorFaceEulerRusanovKernel
   const real_t* normals = nullptr;
   const real_t* weights = nullptr;
   const real_t* x = nullptr;
+  const real_t* reference_x_slopes = nullptr;
+  const real_t* ip1_ref = nullptr;
+  const real_t* ip2_ref = nullptr;
   real_t* z = nullptr;
   real_t* face_speed = nullptr;
+  double* q_sigma_telemetry = nullptr;
   const int* sigma_map = nullptr;
   const real_t* sigma_vals = nullptr;
   const real_t* sigma_shape1 = nullptr;
@@ -614,6 +508,11 @@ struct PackedInteriorFaceEulerRusanovKernel
           lhs += s1 * x[state_map[state_off_1 + i * neq + eq]];
           rhs += s2 * x[state_map[state_off_2 + i * neq + eq]];
         }
+        if (reference_x_slopes)
+        {
+          lhs += (ip1_ref[normal_off]-.5) * reference_x_slopes[state_map[state_off_1+eq]];
+          rhs += (ip2_ref[normal_off]-.5) * reference_x_slopes[state_map[state_off_2+eq]];
+        }
         u1[eq] = lhs;
         u2[eq] = rhs;
       }
@@ -649,14 +548,38 @@ struct PackedInteriorFaceEulerRusanovKernel
           u1, normal, dim, sigma_1, sigma_rho_floor, flux1);
         AddSigmaDotNTerms_(
           u2, normal, dim, sigma_2, sigma_rho_floor, flux2);
-        const real_t igr_speed1 = IGRFluxCharacteristicSpeed(
-          speed1, u1[0], sigma_1, sigma_rho_floor);
-        const real_t igr_speed2 = IGRFluxCharacteristicSpeed(
-          speed2, u2[0], sigma_2, sigma_rho_floor);
-        cfl_speed1 = sigma_aware_cfl ? igr_speed1 : speed1;
-        cfl_speed2 = sigma_aware_cfl ? igr_speed2 : speed2;
-        dissipation_speed1 = sigma_aware_rusanov ? igr_speed1 : speed1;
-        dissipation_speed2 = sigma_aware_rusanov ? igr_speed2 : speed2;
+        double* const telemetry_slot =
+          invariant_domain_flux
+            ? q_sigma_telemetry + face_q * kFrozenSigmaTelemetryWidth_
+            : nullptr;
+        SelectIGRFaceSpeeds_(u1,
+                             normal,
+                             dim,
+                             gamma,
+                             speed1,
+                             sigma_1,
+                             sigma_rho_floor,
+                             invariant_domain_pressure_floor,
+                             invariant_domain_flux,
+                             sigma_aware_cfl,
+                             sigma_aware_rusanov,
+                             telemetry_slot,
+                             cfl_speed1,
+                             dissipation_speed1);
+        SelectIGRFaceSpeeds_(u2,
+                             normal,
+                             dim,
+                             gamma,
+                             speed2,
+                             sigma_2,
+                             sigma_rho_floor,
+                             invariant_domain_pressure_floor,
+                             invariant_domain_flux,
+                             sigma_aware_cfl,
+                             sigma_aware_rusanov,
+                             telemetry_slot,
+                             cfl_speed2,
+                             dissipation_speed2);
       }
 
       real_t normal_norm2 = 0.0;
@@ -702,7 +625,9 @@ struct PackedSharedFaceEulerRusanovKernel
   int sigma_ldof = 0;
   real_t gamma = 1.4;
   real_t sigma_rho_floor = 1.0e-12;
+  real_t invariant_domain_pressure_floor = 1.0e-12;
   bool use_sigma = false;
+  bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
   const int* state_map = nullptr;
@@ -716,6 +641,7 @@ struct PackedSharedFaceEulerRusanovKernel
   const real_t* x_nbr = nullptr;
   real_t* z = nullptr;
   real_t* face_speed = nullptr;
+  double* q_sigma_telemetry = nullptr;
   const int* sigma_map = nullptr;
   const real_t* sigma_vals = nullptr;
   const int* sigma_nbr_dof_map = nullptr;
@@ -801,14 +727,38 @@ struct PackedSharedFaceEulerRusanovKernel
           u1, normal, dim, sigma_1, sigma_rho_floor, flux1);
         AddSigmaDotNTerms_(
           u2, normal, dim, sigma_2, sigma_rho_floor, flux2);
-        const real_t igr_speed1 = IGRFluxCharacteristicSpeed(
-          speed1, u1[0], sigma_1, sigma_rho_floor);
-        const real_t igr_speed2 = IGRFluxCharacteristicSpeed(
-          speed2, u2[0], sigma_2, sigma_rho_floor);
-        cfl_speed1 = sigma_aware_cfl ? igr_speed1 : speed1;
-        cfl_speed2 = sigma_aware_cfl ? igr_speed2 : speed2;
-        dissipation_speed1 = sigma_aware_rusanov ? igr_speed1 : speed1;
-        dissipation_speed2 = sigma_aware_rusanov ? igr_speed2 : speed2;
+        double* const telemetry_slot =
+          invariant_domain_flux
+            ? q_sigma_telemetry + face_q * kFrozenSigmaTelemetryWidth_
+            : nullptr;
+        SelectIGRFaceSpeeds_(u1,
+                             normal,
+                             dim,
+                             gamma,
+                             speed1,
+                             sigma_1,
+                             sigma_rho_floor,
+                             invariant_domain_pressure_floor,
+                             invariant_domain_flux,
+                             sigma_aware_cfl,
+                             sigma_aware_rusanov,
+                             telemetry_slot,
+                             cfl_speed1,
+                             dissipation_speed1);
+        SelectIGRFaceSpeeds_(u2,
+                             normal,
+                             dim,
+                             gamma,
+                             speed2,
+                             sigma_2,
+                             sigma_rho_floor,
+                             invariant_domain_pressure_floor,
+                             invariant_domain_flux,
+                             sigma_aware_cfl,
+                             sigma_aware_rusanov,
+                             telemetry_slot,
+                             cfl_speed2,
+                             dissipation_speed2);
       }
 
       real_t normal_norm2 = 0.0;
@@ -852,7 +802,9 @@ struct PackedBoundaryFaceEulerRusanovKernel
   int sigma_ldof = 0;
   real_t gamma_default = 1.4;
   real_t sigma_rho_floor = 1.0e-12;
+  real_t invariant_domain_pressure_floor = 1.0e-12;
   bool use_sigma = false;
+  bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
   int bdr_max_attr = 0;
@@ -863,8 +815,12 @@ struct PackedBoundaryFaceEulerRusanovKernel
   const real_t* normals = nullptr;
   const real_t* weights = nullptr;
   const real_t* x = nullptr;
+  const real_t* reference_x_slopes = nullptr;
+  const real_t* ip1_ref = nullptr;
   real_t* z = nullptr;
   real_t* face_speed = nullptr;
+  double* q_sigma_telemetry = nullptr;
+  real_t* boundary_flux_integral = nullptr;
   const int* bdr_type_by_attr = nullptr;
   const real_t* bdr_gamma_by_attr = nullptr;
   const real_t* bdr_pressure_by_attr = nullptr;
@@ -885,7 +841,7 @@ struct PackedBoundaryFaceEulerRusanovKernel
     }
 
     const int bdr_type = bdr_type_by_attr[attr];
-    if (bdr_type == static_cast<int>(DeviceBoundaryType::Unsupported))
+    if (bdr_type == static_cast<int>(DeviceBoundaryType::unsupported))
     {
       face_speed[f] = 0.0;
       return;
@@ -928,6 +884,8 @@ struct PackedBoundaryFaceEulerRusanovKernel
           const real_t s1 = shape1[shape_off + i];
           lhs += s1 * x[state_map[state_off + i * neq + eq]];
         }
+        if (reference_x_slopes)
+          lhs += (ip1_ref[normal_off]-.5) * reference_x_slopes[state_map[state_off+eq]];
         u1[eq] = lhs;
       }
 
@@ -939,9 +897,29 @@ struct PackedBoundaryFaceEulerRusanovKernel
                                    state_ref,
                                    normal,
                                    u1,
-                                   u2))
+                                   u2,
+                                   invariant_domain_flux,
+                                   sigma_rho_floor,
+                                   invariant_domain_pressure_floor))
       {
-        face_speed[f] = 0.0;
+        const real_t infinity = std::numeric_limits<real_t>::infinity();
+        const real_t invalid = std::numeric_limits<real_t>::quiet_NaN();
+        face_speed[f] = infinity;
+        if (boundary_flux_integral)
+        {
+          for (int eq = 0; eq < neq; ++eq)
+          {
+            AtomicAdd(boundary_flux_integral[eq], invalid);
+          }
+        }
+        for (int i = 0; i < dof; ++i)
+        {
+          for (int eq = 0; eq < neq; ++eq)
+          {
+            const int zi = state_map[state_off + i * neq + eq];
+            AtomicAdd(z[zi], invalid);
+          }
+        }
         return;
       }
 
@@ -973,14 +951,38 @@ struct PackedBoundaryFaceEulerRusanovKernel
         // for both evaluations (Elem2 is null); mirror that behavior.
         AddSigmaDotNTerms_(
           u2, normal, dim, sigma_1, sigma_rho_floor, flux2);
-        const real_t igr_speed1 = IGRFluxCharacteristicSpeed(
-          speed1, u1[0], sigma_1, sigma_rho_floor);
-        const real_t igr_speed2 = IGRFluxCharacteristicSpeed(
-          speed2, u2[0], sigma_1, sigma_rho_floor);
-        cfl_speed1 = sigma_aware_cfl ? igr_speed1 : speed1;
-        cfl_speed2 = sigma_aware_cfl ? igr_speed2 : speed2;
-        dissipation_speed1 = sigma_aware_rusanov ? igr_speed1 : speed1;
-        dissipation_speed2 = sigma_aware_rusanov ? igr_speed2 : speed2;
+        double* const telemetry_slot =
+          invariant_domain_flux
+            ? q_sigma_telemetry + face_q * kFrozenSigmaTelemetryWidth_
+            : nullptr;
+        SelectIGRFaceSpeeds_(u1,
+                             normal,
+                             dim,
+                             gamma,
+                             speed1,
+                             sigma_1,
+                             sigma_rho_floor,
+                             invariant_domain_pressure_floor,
+                             invariant_domain_flux,
+                             sigma_aware_cfl,
+                             sigma_aware_rusanov,
+                             telemetry_slot,
+                             cfl_speed1,
+                             dissipation_speed1);
+        SelectIGRFaceSpeeds_(u2,
+                             normal,
+                             dim,
+                             gamma,
+                             speed2,
+                             sigma_1,
+                             sigma_rho_floor,
+                             invariant_domain_pressure_floor,
+                             invariant_domain_flux,
+                             sigma_aware_cfl,
+                             sigma_aware_rusanov,
+                             telemetry_slot,
+                             cfl_speed2,
+                             dissipation_speed2);
       }
 
       real_t normal_norm2 = 0.0;
@@ -991,14 +993,19 @@ struct PackedBoundaryFaceEulerRusanovKernel
       const real_t scaled_max_speed =
         fmax(dissipation_speed1, dissipation_speed2) * sqrt(normal_norm2);
       speed_max = fmax(speed_max, fmax(cfl_speed1, cfl_speed2));
+      const real_t wq = weights[face_q];
 
       for (int eq = 0; eq < neq; ++eq)
       {
         flux_hat[eq] = 0.5 * (scaled_max_speed * (u1[eq] - u2[eq]) + flux1[eq] +
                               flux2[eq]);
+        // Record the outward flux before the residual's leading minus sign.
+        if (boundary_flux_integral)
+        {
+          AtomicAdd(boundary_flux_integral[eq], wq * flux_hat[eq]);
+        }
       }
 
-      const real_t wq = weights[face_q];
       for (int i = 0; i < dof; ++i)
       {
         const real_t c1 = -wq * shape1[shape_off + i];
@@ -1026,7 +1033,9 @@ struct PackedInteriorFaceEulerRusanovQKernel
   int sigma_ldof = 0;
   real_t gamma = 1.4;
   real_t sigma_rho_floor = 1.0e-12;
+  real_t invariant_domain_pressure_floor = 1.0e-12;
   bool use_sigma = false;
+  bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
   const int* state_map = nullptr;
@@ -1037,8 +1046,12 @@ struct PackedInteriorFaceEulerRusanovQKernel
   const real_t* normals = nullptr;
   const real_t* weights = nullptr;
   const real_t* x = nullptr;
+  const real_t* reference_x_slopes = nullptr;
+  const real_t* ip1_ref = nullptr;
+  const real_t* ip2_ref = nullptr;
   real_t* z = nullptr;
   real_t* face_speed_q = nullptr;
+  double* q_sigma_telemetry = nullptr;
   const int* sigma_map = nullptr;
   const real_t* sigma_vals = nullptr;
   const real_t* sigma_shape1 = nullptr;
@@ -1079,6 +1092,11 @@ struct PackedInteriorFaceEulerRusanovQKernel
         lhs += s1 * x[state_map[state_off_1 + i * neq + eq]];
         rhs += s2 * x[state_map[state_off_2 + i * neq + eq]];
       }
+      if (reference_x_slopes)
+      {
+        lhs += (ip1_ref[normal_off]-.5) * reference_x_slopes[state_map[state_off_1+eq]];
+        rhs += (ip2_ref[normal_off]-.5) * reference_x_slopes[state_map[state_off_2+eq]];
+      }
       u1[eq] = lhs;
       u2[eq] = rhs;
     }
@@ -1114,14 +1132,38 @@ struct PackedInteriorFaceEulerRusanovQKernel
         u1, normal, dim, sigma_1, sigma_rho_floor, flux1);
       AddSigmaDotNTerms_(
         u2, normal, dim, sigma_2, sigma_rho_floor, flux2);
-      const real_t igr_speed1 = IGRFluxCharacteristicSpeed(
-        speed1, u1[0], sigma_1, sigma_rho_floor);
-      const real_t igr_speed2 = IGRFluxCharacteristicSpeed(
-        speed2, u2[0], sigma_2, sigma_rho_floor);
-      cfl_speed1 = sigma_aware_cfl ? igr_speed1 : speed1;
-      cfl_speed2 = sigma_aware_cfl ? igr_speed2 : speed2;
-      dissipation_speed1 = sigma_aware_rusanov ? igr_speed1 : speed1;
-      dissipation_speed2 = sigma_aware_rusanov ? igr_speed2 : speed2;
+      double* const telemetry_slot =
+        invariant_domain_flux
+          ? q_sigma_telemetry + face_q * kFrozenSigmaTelemetryWidth_
+          : nullptr;
+      SelectIGRFaceSpeeds_(u1,
+                           normal,
+                           dim,
+                           gamma,
+                           speed1,
+                           sigma_1,
+                           sigma_rho_floor,
+                           invariant_domain_pressure_floor,
+                           invariant_domain_flux,
+                           sigma_aware_cfl,
+                           sigma_aware_rusanov,
+                           telemetry_slot,
+                           cfl_speed1,
+                           dissipation_speed1);
+      SelectIGRFaceSpeeds_(u2,
+                           normal,
+                           dim,
+                           gamma,
+                           speed2,
+                           sigma_2,
+                           sigma_rho_floor,
+                           invariant_domain_pressure_floor,
+                           invariant_domain_flux,
+                           sigma_aware_cfl,
+                           sigma_aware_rusanov,
+                           telemetry_slot,
+                           cfl_speed2,
+                           dissipation_speed2);
     }
 
     real_t normal_norm2 = 0.0;
@@ -1165,7 +1207,9 @@ struct PackedSharedFaceEulerRusanovQKernel
   int sigma_ldof = 0;
   real_t gamma = 1.4;
   real_t sigma_rho_floor = 1.0e-12;
+  real_t invariant_domain_pressure_floor = 1.0e-12;
   bool use_sigma = false;
+  bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
   const int* state_map = nullptr;
@@ -1179,6 +1223,7 @@ struct PackedSharedFaceEulerRusanovQKernel
   const real_t* x_nbr = nullptr;
   real_t* z = nullptr;
   real_t* face_speed_q = nullptr;
+  double* q_sigma_telemetry = nullptr;
   const int* sigma_map = nullptr;
   const real_t* sigma_vals = nullptr;
   const int* sigma_nbr_dof_map = nullptr;
@@ -1260,14 +1305,38 @@ struct PackedSharedFaceEulerRusanovQKernel
         u1, normal, dim, sigma_1, sigma_rho_floor, flux1);
       AddSigmaDotNTerms_(
         u2, normal, dim, sigma_2, sigma_rho_floor, flux2);
-      const real_t igr_speed1 = IGRFluxCharacteristicSpeed(
-        speed1, u1[0], sigma_1, sigma_rho_floor);
-      const real_t igr_speed2 = IGRFluxCharacteristicSpeed(
-        speed2, u2[0], sigma_2, sigma_rho_floor);
-      cfl_speed1 = sigma_aware_cfl ? igr_speed1 : speed1;
-      cfl_speed2 = sigma_aware_cfl ? igr_speed2 : speed2;
-      dissipation_speed1 = sigma_aware_rusanov ? igr_speed1 : speed1;
-      dissipation_speed2 = sigma_aware_rusanov ? igr_speed2 : speed2;
+      double* const telemetry_slot =
+        invariant_domain_flux
+          ? q_sigma_telemetry + face_q * kFrozenSigmaTelemetryWidth_
+          : nullptr;
+      SelectIGRFaceSpeeds_(u1,
+                           normal,
+                           dim,
+                           gamma,
+                           speed1,
+                           sigma_1,
+                           sigma_rho_floor,
+                           invariant_domain_pressure_floor,
+                           invariant_domain_flux,
+                           sigma_aware_cfl,
+                           sigma_aware_rusanov,
+                           telemetry_slot,
+                           cfl_speed1,
+                           dissipation_speed1);
+      SelectIGRFaceSpeeds_(u2,
+                           normal,
+                           dim,
+                           gamma,
+                           speed2,
+                           sigma_2,
+                           sigma_rho_floor,
+                           invariant_domain_pressure_floor,
+                           invariant_domain_flux,
+                           sigma_aware_cfl,
+                           sigma_aware_rusanov,
+                           telemetry_slot,
+                           cfl_speed2,
+                           dissipation_speed2);
     }
 
     real_t normal_norm2 = 0.0;
@@ -1308,7 +1377,9 @@ struct PackedBoundaryFaceEulerRusanovQKernel
   int sigma_ldof = 0;
   real_t gamma_default = 1.4;
   real_t sigma_rho_floor = 1.0e-12;
+  real_t invariant_domain_pressure_floor = 1.0e-12;
   bool use_sigma = false;
+  bool invariant_domain_flux = false;
   bool sigma_aware_cfl = false;
   bool sigma_aware_rusanov = false;
   int bdr_max_attr = 0;
@@ -1319,8 +1390,12 @@ struct PackedBoundaryFaceEulerRusanovQKernel
   const real_t* normals = nullptr;
   const real_t* weights = nullptr;
   const real_t* x = nullptr;
+  const real_t* reference_x_slopes = nullptr;
+  const real_t* ip1_ref = nullptr;
   real_t* z = nullptr;
   real_t* face_speed_q = nullptr;
+  double* q_sigma_telemetry = nullptr;
+  real_t* boundary_flux_integral = nullptr;
   const int* bdr_type_by_attr = nullptr;
   const real_t* bdr_gamma_by_attr = nullptr;
   const real_t* bdr_pressure_by_attr = nullptr;
@@ -1343,7 +1418,7 @@ struct PackedBoundaryFaceEulerRusanovQKernel
     }
 
     const int bdr_type = bdr_type_by_attr[attr];
-    if (bdr_type == static_cast<int>(DeviceBoundaryType::Unsupported))
+    if (bdr_type == static_cast<int>(DeviceBoundaryType::unsupported))
     {
       face_speed_q[fq] = 0.0;
       return;
@@ -1382,6 +1457,8 @@ struct PackedBoundaryFaceEulerRusanovQKernel
         const real_t s1 = shape1[shape_off + i];
         lhs += s1 * x[state_map[state_off + i * neq + eq]];
       }
+      if (reference_x_slopes)
+        lhs += (ip1_ref[normal_off]-.5) * reference_x_slopes[state_map[state_off+eq]];
       u1[eq] = lhs;
     }
 
@@ -1393,9 +1470,27 @@ struct PackedBoundaryFaceEulerRusanovQKernel
                                  state_ref,
                                  normal,
                                  u1,
-                                 u2))
+                                 u2,
+                                 invariant_domain_flux,
+                                 sigma_rho_floor,
+                                 invariant_domain_pressure_floor))
     {
-      face_speed_q[fq] = 0.0;
+      const real_t infinity = std::numeric_limits<real_t>::infinity();
+      const real_t invalid = std::numeric_limits<real_t>::quiet_NaN();
+      face_speed_q[fq] = infinity;
+      if (boundary_flux_integral)
+      {
+        for (int eq = 0; eq < neq; ++eq)
+          AtomicAdd(boundary_flux_integral[eq], invalid);
+      }
+      for (int i = 0; i < dof; ++i)
+      {
+        for (int eq = 0; eq < neq; ++eq)
+        {
+          const int zi = state_map[state_off + i * neq + eq];
+          AtomicAdd(z[zi], invalid);
+        }
+      }
       return;
     }
 
@@ -1425,14 +1520,38 @@ struct PackedBoundaryFaceEulerRusanovQKernel
         u1, normal, dim, sigma_1, sigma_rho_floor, flux1);
       AddSigmaDotNTerms_(
         u2, normal, dim, sigma_1, sigma_rho_floor, flux2);
-      const real_t igr_speed1 = IGRFluxCharacteristicSpeed(
-        speed1, u1[0], sigma_1, sigma_rho_floor);
-      const real_t igr_speed2 = IGRFluxCharacteristicSpeed(
-        speed2, u2[0], sigma_1, sigma_rho_floor);
-      cfl_speed1 = sigma_aware_cfl ? igr_speed1 : speed1;
-      cfl_speed2 = sigma_aware_cfl ? igr_speed2 : speed2;
-      dissipation_speed1 = sigma_aware_rusanov ? igr_speed1 : speed1;
-      dissipation_speed2 = sigma_aware_rusanov ? igr_speed2 : speed2;
+      double* const telemetry_slot =
+        invariant_domain_flux
+          ? q_sigma_telemetry + face_q * kFrozenSigmaTelemetryWidth_
+          : nullptr;
+      SelectIGRFaceSpeeds_(u1,
+                           normal,
+                           dim,
+                           gamma,
+                           speed1,
+                           sigma_1,
+                           sigma_rho_floor,
+                           invariant_domain_pressure_floor,
+                           invariant_domain_flux,
+                           sigma_aware_cfl,
+                           sigma_aware_rusanov,
+                           telemetry_slot,
+                           cfl_speed1,
+                           dissipation_speed1);
+      SelectIGRFaceSpeeds_(u2,
+                           normal,
+                           dim,
+                           gamma,
+                           speed2,
+                           sigma_1,
+                           sigma_rho_floor,
+                           invariant_domain_pressure_floor,
+                           invariant_domain_flux,
+                           sigma_aware_cfl,
+                           sigma_aware_rusanov,
+                           telemetry_slot,
+                           cfl_speed2,
+                           dissipation_speed2);
     }
 
     real_t normal_norm2 = 0.0;
@@ -1443,14 +1562,19 @@ struct PackedBoundaryFaceEulerRusanovQKernel
     const real_t scaled_max_speed =
       fmax(dissipation_speed1, dissipation_speed2) * sqrt(normal_norm2);
     face_speed_q[fq] = fmax(cfl_speed1, cfl_speed2);
+    const real_t wq = weights[face_q];
 
     for (int eq = 0; eq < neq; ++eq)
     {
       flux_hat[eq] = 0.5 * (scaled_max_speed * (u1[eq] - u2[eq]) + flux1[eq] +
                             flux2[eq]);
+      // Record the outward flux before the residual's leading minus sign.
+      if (boundary_flux_integral)
+      {
+        AtomicAdd(boundary_flux_integral[eq], wq * flux_hat[eq]);
+      }
     }
 
-    const real_t wq = weights[face_q];
     for (int i = 0; i < dof; ++i)
     {
       const real_t c1 = -wq * shape1[shape_off + i];

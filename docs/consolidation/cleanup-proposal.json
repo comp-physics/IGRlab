@@ -1,0 +1,2619 @@
+{
+  "captured_at": "2026-10-10T22:44:18.395712+00:00",
+  "scope": "Reviewable first cleanup batch only. No destructive or publication action executed.",
+  "source_review_candidate": "0a34f84625a52a33cc73905c0708475e0551a743",
+  "cleanup_candidate_counts": {
+    "local_branches": 39,
+    "remote_branches": 61
+  },
+  "cleanup_candidates": {
+    "local_branches": [
+      {
+        "name": "codex/adaptive-dae-reusable-trace",
+        "refname": "refs/heads/codex/adaptive-dae-reusable-trace",
+        "expected_sha": "901c6f8bf6326b5bafb962bd48d8db9307a8872c",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "901c6f8bf6326b5bafb962bd48d8db9307a8872c"
+      },
+      {
+        "name": "codex/hdg-alignment-armijo-state-tests",
+        "refname": "refs/heads/codex/hdg-alignment-armijo-state-tests",
+        "expected_sha": "274cfe3ff81366be39301682da935c6090c176c7",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "274cfe3ff81366be39301682da935c6090c176c7"
+      },
+      {
+        "name": "codex/hdg-alignment-policy-parameters",
+        "refname": "refs/heads/codex/hdg-alignment-policy-parameters",
+        "expected_sha": "73306e62eb0fc45d2fbfc7e45e238e96b8b5c826",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "73306e62eb0fc45d2fbfc7e45e238e96b8b5c826"
+      },
+      {
+        "name": "codex/hdg-case-context-v1",
+        "refname": "refs/heads/codex/hdg-case-context-v1",
+        "expected_sha": "e75f3cbd9428b7b044b4400186336153909f1ac6",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "e75f3cbd9428b7b044b4400186336153909f1ac6"
+      },
+      {
+        "name": "codex/hdg-generic-contract-v1",
+        "refname": "refs/heads/codex/hdg-generic-contract-v1",
+        "expected_sha": "c5444f34bd4eb1d8cc59f70f8832109b1a031b41",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "c5444f34bd4eb1d8cc59f70f8832109b1a031b41"
+      },
+      {
+        "name": "codex/hdg-hash-strength-reduction",
+        "refname": "refs/heads/codex/hdg-hash-strength-reduction",
+        "expected_sha": "e029eac85b1468885c4da0624b6387c6c9de20c1",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "e029eac85b1468885c4da0624b6387c6c9de20c1"
+      },
+      {
+        "name": "codex/hdg-igr-fieldsplit-v1",
+        "refname": "refs/heads/codex/hdg-igr-fieldsplit-v1",
+        "expected_sha": "0fda3a56e7c08811afd6377f586d8c9b15a4a9f8",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "0fda3a56e7c08811afd6377f586d8c9b15a4a9f8"
+      },
+      {
+        "name": "codex/hdg-igr-linear-policy-v1",
+        "refname": "refs/heads/codex/hdg-igr-linear-policy-v1",
+        "expected_sha": "b2b54b9a59c292d679b0443fe70d508dfae6a8f9",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "b2b54b9a59c292d679b0443fe70d508dfae6a8f9"
+      },
+      {
+        "name": "codex/hdg-igr-matrix-free-equilibrated-field-split",
+        "refname": "refs/heads/codex/hdg-igr-matrix-free-equilibrated-field-split",
+        "expected_sha": "c139d39547f0ed0ac2bea355885035093bf156f9",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "c139d39547f0ed0ac2bea355885035093bf156f9"
+      },
+      {
+        "name": "codex/hdg-igr-matrix-free-stage2",
+        "refname": "refs/heads/codex/hdg-igr-matrix-free-stage2",
+        "expected_sha": "332dfaa992f1f46cf69a1fe1b6692be1a44e740c",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "332dfaa992f1f46cf69a1fe1b6692be1a44e740c"
+      },
+      {
+        "name": "codex/hdg-igr-symmetric-field-split",
+        "refname": "refs/heads/codex/hdg-igr-symmetric-field-split",
+        "expected_sha": "4a61c382b03ffce33eb44bb311e1cf92a5682dd9",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "4a61c382b03ffce33eb44bb311e1cf92a5682dd9"
+      },
+      {
+        "name": "codex/hdg-igr-warp-field-split",
+        "refname": "refs/heads/codex/hdg-igr-warp-field-split",
+        "expected_sha": "3f10eaf9667f38ca5287f8121b5025db560f52ed",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "3f10eaf9667f38ca5287f8121b5025db560f52ed"
+      },
+      {
+        "name": "codex/hdg-native-cgs2-experiment",
+        "refname": "refs/heads/codex/hdg-native-cgs2-experiment",
+        "expected_sha": "b7e28434b63256dca5e909206fa08a344e52403f",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "b7e28434b63256dca5e909206fa08a344e52403f"
+      },
+      {
+        "name": "codex/hdg-native-schwarz-fp64",
+        "refname": "refs/heads/codex/hdg-native-schwarz-fp64",
+        "expected_sha": "9e8948f3dd77a82aa85ee9738d02e80f9f2ec004",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "9e8948f3dd77a82aa85ee9738d02e80f9f2ec004"
+      },
+      {
+        "name": "codex/hdg-native-trace-fixtures",
+        "refname": "refs/heads/codex/hdg-native-trace-fixtures",
+        "expected_sha": "b379e3cebc1469420a6900236b2b12c1c09b442d",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "b379e3cebc1469420a6900236b2b12c1c09b442d"
+      },
+      {
+        "name": "codex/hdg-p123-cfl-refinement-tests",
+        "refname": "refs/heads/codex/hdg-p123-cfl-refinement-tests",
+        "expected_sha": "0488918eb37924fb5c8b5d7f631a222a6bf06d03",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "0488918eb37924fb5c8b5d7f631a222a6bf06d03"
+      },
+      {
+        "name": "codex/hdg-paraview-output-v1",
+        "refname": "refs/heads/codex/hdg-paraview-output-v1",
+        "expected_sha": "b856c67e9a3491b77cc86fa1304df4517cff6efe",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "b856c67e9a3491b77cc86fa1304df4517cff6efe"
+      },
+      {
+        "name": "codex/hdg-production-trace-policy",
+        "refname": "refs/heads/codex/hdg-production-trace-policy",
+        "expected_sha": "a735c5bf221b1c593a97d2054a8f750a73c9e16f",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "a735c5bf221b1c593a97d2054a8f750a73c9e16f"
+      },
+      {
+        "name": "codex/hdg-schwarz-campaign-metadata",
+        "refname": "refs/heads/codex/hdg-schwarz-campaign-metadata",
+        "expected_sha": "77b7ae8b1f6f464b7dd6d2bd59075b33da48e4ed",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "77b7ae8b1f6f464b7dd6d2bd59075b33da48e4ed"
+      },
+      {
+        "name": "codex/hdg-tensor-assembly-fusion",
+        "refname": "refs/heads/codex/hdg-tensor-assembly-fusion",
+        "expected_sha": "d8200a1ac403045e2694611bb3a4cc12e42af39a",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "d8200a1ac403045e2694611bb3a4cc12e42af39a"
+      },
+      {
+        "name": "codex/hdg-tensor-blocked-local-v1",
+        "refname": "refs/heads/codex/hdg-tensor-blocked-local-v1",
+        "expected_sha": "d67afd2faa9b895d7deefaea1d1ad63d6ef2e76c",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "d67afd2faa9b895d7deefaea1d1ad63d6ef2e76c"
+      },
+      {
+        "name": "codex/hdg-tensor-core-backend-v1",
+        "refname": "refs/heads/codex/hdg-tensor-core-backend-v1",
+        "expected_sha": "df5f9c121400a4740e8bc8a4955a5c712af3a9b6",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "df5f9c121400a4740e8bc8a4955a5c712af3a9b6"
+      },
+      {
+        "name": "codex/hdg-tensor-dmma-exact",
+        "refname": "refs/heads/codex/hdg-tensor-dmma-exact",
+        "expected_sha": "3307734ea4ae707e5cdc30b65bbd7d977d9adc9e",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "3307734ea4ae707e5cdc30b65bbd7d977d9adc9e"
+      },
+      {
+        "name": "codex/hdg-tensor-hash-fast",
+        "refname": "refs/heads/codex/hdg-tensor-hash-fast",
+        "expected_sha": "ebe03fdb2ddcc55dc7b61859f4bb127e9ff3d54e",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "ebe03fdb2ddcc55dc7b61859f4bb127e9ff3d54e"
+      },
+      {
+        "name": "codex/hdg-tensor-hash-jump",
+        "refname": "refs/heads/codex/hdg-tensor-hash-jump",
+        "expected_sha": "8f90a2dc70c0910cbb12e7f693946a641e76556f",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "8f90a2dc70c0910cbb12e7f693946a641e76556f"
+      },
+      {
+        "name": "codex/hdg-tensor-igr-cfl-allocation",
+        "refname": "refs/heads/codex/hdg-tensor-igr-cfl-allocation",
+        "expected_sha": "d000cc99131ff7c65d98ac772d8f3e9ab3618b49",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "d000cc99131ff7c65d98ac772d8f3e9ab3618b49"
+      },
+      {
+        "name": "codex/hdg-tensor-native-trace-v1",
+        "refname": "refs/heads/codex/hdg-tensor-native-trace-v1",
+        "expected_sha": "7f6f9e753750a287e4dd178485b7d5161cddba6d",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "7f6f9e753750a287e4dd178485b7d5161cddba6d"
+      },
+      {
+        "name": "codex/hdg-tensor-policy-ablation-v2",
+        "refname": "refs/heads/codex/hdg-tensor-policy-ablation-v2",
+        "expected_sha": "1c79c81fe4107717a490e948e9dc00e9d82dda1e",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "1c79c81fe4107717a490e948e9dc00e9d82dda1e"
+      },
+      {
+        "name": "codex/hdg-tensor-recovery-fusion",
+        "refname": "refs/heads/codex/hdg-tensor-recovery-fusion",
+        "expected_sha": "1af2069819932c41a285dddc31a5d7264986a38c",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "1af2069819932c41a285dddc31a5d7264986a38c"
+      },
+      {
+        "name": "codex/hdg-tensor-sass-profile-evidence",
+        "refname": "refs/heads/codex/hdg-tensor-sass-profile-evidence",
+        "expected_sha": "c0fe0eb58161ed9b318e66e8cd70d38b3d9c22da",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "c0fe0eb58161ed9b318e66e8cd70d38b3d9c22da"
+      },
+      {
+        "name": "codex/hdg-tensor-trace-routing-tests",
+        "refname": "refs/heads/codex/hdg-tensor-trace-routing-tests",
+        "expected_sha": "80982ba8cfa6b7ae8a1a1dd7cb19f6edffc6de00",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "80982ba8cfa6b7ae8a1a1dd7cb19f6edffc6de00"
+      },
+      {
+        "name": "codex/hdg-tensor-volume-conventional-q12-parity",
+        "refname": "refs/heads/codex/hdg-tensor-volume-conventional-q12-parity",
+        "expected_sha": "04d543128ab338fc62aae34e0d34afb1eda25ad9",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "04d543128ab338fc62aae34e0d34afb1eda25ad9"
+      },
+      {
+        "name": "codex/hdg-time-to-solution-v1",
+        "refname": "refs/heads/codex/hdg-time-to-solution-v1",
+        "expected_sha": "c9213c25071d4e9c3fe9e1ebd2b6469c0fd30606",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "c9213c25071d4e9c3fe9e1ebd2b6469c0fd30606"
+      },
+      {
+        "name": "codex/hdg-zhang-shu-limiter",
+        "refname": "refs/heads/codex/hdg-zhang-shu-limiter",
+        "expected_sha": "eae4e3f77484ff046099f57a50628c352fc6ef3a",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "eae4e3f77484ff046099f57a50628c352fc6ef3a"
+      },
+      {
+        "name": "codex/igr-ilu-refresh-f646a03",
+        "refname": "refs/heads/codex/igr-ilu-refresh-f646a03",
+        "expected_sha": "29e6a9ba2305dc754c5293379037f5f57544208d",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "29e6a9ba2305dc754c5293379037f5f57544208d"
+      },
+      {
+        "name": "codex/igr-quadrature-equivalence-v1",
+        "refname": "refs/heads/codex/igr-quadrature-equivalence-v1",
+        "expected_sha": "8f252494c6db935789c7eb7b5cb62e362dfdffd0",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "8f252494c6db935789c7eb7b5cb62e362dfdffd0"
+      },
+      {
+        "name": "codex/qualification-tolerance-parameterization",
+        "refname": "refs/heads/codex/qualification-tolerance-parameterization",
+        "expected_sha": "dc67aa69a2279ece53b611b15fd917f6f638bcd9",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "dc67aa69a2279ece53b611b15fd917f6f638bcd9"
+      },
+      {
+        "name": "codex/shock-regime-explicit-imex",
+        "refname": "refs/heads/codex/shock-regime-explicit-imex",
+        "expected_sha": "1ec72eb7ca29806055b8bbf72c8bdd9aadae32b8",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "1ec72eb7ca29806055b8bbf72c8bdd9aadae32b8"
+      },
+      {
+        "name": "codex/tensor-dg-igr-breakthrough",
+        "refname": "refs/heads/codex/tensor-dg-igr-breakthrough",
+        "expected_sha": "f95ee67e4bfdc62ccfc50890400f8b843de53797",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "f95ee67e4bfdc62ccfc50890400f8b843de53797"
+      }
+    ],
+    "remote_branches": [
+      {
+        "name": "codex/adaptive-dae-reusable-trace",
+        "refname": "refs/heads/codex/adaptive-dae-reusable-trace",
+        "expected_sha": "eae4e3f77484ff046099f57a50628c352fc6ef3a",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "eae4e3f77484ff046099f57a50628c352fc6ef3a"
+      },
+      {
+        "name": "codex/hdg-case-context-v1",
+        "refname": "refs/heads/codex/hdg-case-context-v1",
+        "expected_sha": "e75f3cbd9428b7b044b4400186336153909f1ac6",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "e75f3cbd9428b7b044b4400186336153909f1ac6"
+      },
+      {
+        "name": "codex/hdg-cuda-borrowed-llf-v1",
+        "refname": "refs/heads/codex/hdg-cuda-borrowed-llf-v1",
+        "expected_sha": "18bec20e1b189127dfb1148f8c7bdd538c081e54",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "18bec20e1b189127dfb1148f8c7bdd538c081e54"
+      },
+      {
+        "name": "codex/hdg-cuda-igr-extension-v1",
+        "refname": "refs/heads/codex/hdg-cuda-igr-extension-v1",
+        "expected_sha": "1086eff358da003ecf455d578271afd065981d55",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "1086eff358da003ecf455d578271afd065981d55"
+      },
+      {
+        "name": "codex/hdg-cuda-numerical-alignment-fp64-perf-v3",
+        "refname": "refs/heads/codex/hdg-cuda-numerical-alignment-fp64-perf-v3",
+        "expected_sha": "55d9a33e689be5a4087d6d3afde84102ea7e4870",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "55d9a33e689be5a4087d6d3afde84102ea7e4870"
+      },
+      {
+        "name": "codex/hdg-generic-boundary-lowering-v1",
+        "refname": "refs/heads/codex/hdg-generic-boundary-lowering-v1",
+        "expected_sha": "95c65b558a48e80a21511caf3324efb8f2ee83bc",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "95c65b558a48e80a21511caf3324efb8f2ee83bc"
+      },
+      {
+        "name": "codex/hdg-generic-contract-v1",
+        "refname": "refs/heads/codex/hdg-generic-contract-v1",
+        "expected_sha": "c5444f34bd4eb1d8cc59f70f8832109b1a031b41",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "c5444f34bd4eb1d8cc59f70f8832109b1a031b41"
+      },
+      {
+        "name": "codex/hdg-generic-cpu-engine-v1",
+        "refname": "refs/heads/codex/hdg-generic-cpu-engine-v1",
+        "expected_sha": "da077f7ebd78177821c4cb84f81c5b8257d8dd53",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "da077f7ebd78177821c4cb84f81c5b8257d8dd53"
+      },
+      {
+        "name": "codex/hdg-generic-cuda-data-v1",
+        "refname": "refs/heads/codex/hdg-generic-cuda-data-v1",
+        "expected_sha": "69a1f35583f23d87c2d6a9ac3852b1dc04f1bb7c",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "69a1f35583f23d87c2d6a9ac3852b1dc04f1bb7c"
+      },
+      {
+        "name": "codex/hdg-generic-cuda-main-adapter-v1",
+        "refname": "refs/heads/codex/hdg-generic-cuda-main-adapter-v1",
+        "expected_sha": "fd896f9126f151f7175d27ce4eaddaedd62008c6",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "fd896f9126f151f7175d27ce4eaddaedd62008c6"
+      },
+      {
+        "name": "codex/hdg-generic-cuda-session-v2",
+        "refname": "refs/heads/codex/hdg-generic-cuda-session-v2",
+        "expected_sha": "fdb1a2b9a831d6845f8778b826e233cefa3a4fdd",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "fdb1a2b9a831d6845f8778b826e233cefa3a4fdd"
+      },
+      {
+        "name": "codex/hdg-generic-cuda-topology-v1",
+        "refname": "refs/heads/codex/hdg-generic-cuda-topology-v1",
+        "expected_sha": "e970222e0cb3d411c3356b3b2db49ab485c70ad8",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "e970222e0cb3d411c3356b3b2db49ab485c70ad8"
+      },
+      {
+        "name": "codex/hdg-igr-extension-boundary-v1",
+        "refname": "refs/heads/codex/hdg-igr-extension-boundary-v1",
+        "expected_sha": "cdc1dfaacb2cc9f2c6a213b54f17b722e188813e",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "cdc1dfaacb2cc9f2c6a213b54f17b722e188813e"
+      },
+      {
+        "name": "codex/hdg-igr-symmetric-field-split",
+        "refname": "refs/heads/codex/hdg-igr-symmetric-field-split",
+        "expected_sha": "4a61c382b03ffce33eb44bb311e1cf92a5682dd9",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "4a61c382b03ffce33eb44bb311e1cf92a5682dd9"
+      },
+      {
+        "name": "codex/hdg-main-case-session-contract-v2",
+        "refname": "refs/heads/codex/hdg-main-case-session-contract-v2",
+        "expected_sha": "c4d1a5d3deaf8197f042822e0f070fac0fc260a9",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "c4d1a5d3deaf8197f042822e0f070fac0fc260a9"
+      },
+      {
+        "name": "codex/hdg-main-config-adapter-v1",
+        "refname": "refs/heads/codex/hdg-main-config-adapter-v1",
+        "expected_sha": "6fe286e751014d28b6b783f8283b15a1a2c383c0",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "6fe286e751014d28b6b783f8283b15a1a2c383c0"
+      },
+      {
+        "name": "codex/hdg-main-cpu-mfem-partition-v1",
+        "refname": "refs/heads/codex/hdg-main-cpu-mfem-partition-v1",
+        "expected_sha": "f5c7ab42a8808df9e9323a5c5ddf331b7f84cf96",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "f5c7ab42a8808df9e9323a5c5ddf331b7f84cf96"
+      },
+      {
+        "name": "codex/hdg-main-cpu-rank2-adapter-v1",
+        "refname": "refs/heads/codex/hdg-main-cpu-rank2-adapter-v1",
+        "expected_sha": "9227b359a143d184172cade27876dad97679204e",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "9227b359a143d184172cade27876dad97679204e"
+      },
+      {
+        "name": "codex/hdg-main-cpu-serial-adapter-v1",
+        "refname": "refs/heads/codex/hdg-main-cpu-serial-adapter-v1",
+        "expected_sha": "fd6d178bb508db8c64b00b697b556b9902f44a63",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "fd6d178bb508db8c64b00b697b556b9902f44a63"
+      },
+      {
+        "name": "codex/hdg-main-cuda-adapter-v1",
+        "refname": "refs/heads/codex/hdg-main-cuda-adapter-v1",
+        "expected_sha": "85ecd8c6dba1ec77b9f1c7bcc88e5a00418432dd",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "85ecd8c6dba1ec77b9f1c7bcc88e5a00418432dd"
+      },
+      {
+        "name": "codex/hdg-paraview-output-v1",
+        "refname": "refs/heads/codex/hdg-paraview-output-v1",
+        "expected_sha": "b856c67e9a3491b77cc86fa1304df4517cff6efe",
+        "current_guard_matches": true,
+        "disposition": "retire_patch_equivalent",
+        "basis": "Stable patch equivalence to recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "b856c67e9a3491b77cc86fa1304df4517cff6efe"
+      },
+      {
+        "name": "codex/hdg-rank2-build-output-layout",
+        "refname": "refs/heads/codex/hdg-rank2-build-output-layout",
+        "expected_sha": "f91dab85f61e136edfd91496030910bd70abe4ef",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "f91dab85f61e136edfd91496030910bd70abe4ef"
+      },
+      {
+        "name": "codex/hdg-rank2-campaign-integration-seam",
+        "refname": "refs/heads/codex/hdg-rank2-campaign-integration-seam",
+        "expected_sha": "6f4bf1f051a96411438fc41b29c91080e5495fe8",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "6f4bf1f051a96411438fc41b29c91080e5495fe8"
+      },
+      {
+        "name": "codex/hdg-standalone-cpu-domain-v1",
+        "refname": "refs/heads/codex/hdg-standalone-cpu-domain-v1",
+        "expected_sha": "972ad0f4ecf36fafd02fb31d909fcf703d313b61",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "972ad0f4ecf36fafd02fb31d909fcf703d313b61"
+      },
+      {
+        "name": "codex/hdg-standalone-cuda-domain-v1",
+        "refname": "refs/heads/codex/hdg-standalone-cuda-domain-v1",
+        "expected_sha": "972ad0f4ecf36fafd02fb31d909fcf703d313b61",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "972ad0f4ecf36fafd02fb31d909fcf703d313b61"
+      },
+      {
+        "name": "codex/hdg-standalone-manifest-retirement-v1",
+        "refname": "refs/heads/codex/hdg-standalone-manifest-retirement-v1",
+        "expected_sha": "7fe32c7baa67f3ff1d7955f14ca351f01d85e87d",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "7fe32c7baa67f3ff1d7955f14ca351f01d85e87d"
+      },
+      {
+        "name": "codex/hdg-standalone-sc25-oracle-seam-v1",
+        "refname": "refs/heads/codex/hdg-standalone-sc25-oracle-seam-v1",
+        "expected_sha": "e3fa7fe7e121ef1124c147b21912fd97acab7f74",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "e3fa7fe7e121ef1124c147b21912fd97acab7f74"
+      },
+      {
+        "name": "codex/hdg-standalone-shared-seam-v1",
+        "refname": "refs/heads/codex/hdg-standalone-shared-seam-v1",
+        "expected_sha": "924f8c96403d001998e21e083789292adf00105a",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "924f8c96403d001998e21e083789292adf00105a"
+      },
+      {
+        "name": "codex/hdg-standalone-typed-dispatch-v1",
+        "refname": "refs/heads/codex/hdg-standalone-typed-dispatch-v1",
+        "expected_sha": "eb0a8e8aebed9a618a56c640fcd88e6efd9ab6fa",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "eb0a8e8aebed9a618a56c640fcd88e6efd9ab6fa"
+      },
+      {
+        "name": "codex/hdg-tensor-core-backend-v1",
+        "refname": "refs/heads/codex/hdg-tensor-core-backend-v1",
+        "expected_sha": "df5f9c121400a4740e8bc8a4955a5c712af3a9b6",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "df5f9c121400a4740e8bc8a4955a5c712af3a9b6"
+      },
+      {
+        "name": "codex/hdg-time-output-v1",
+        "refname": "refs/heads/codex/hdg-time-output-v1",
+        "expected_sha": "35c9e45ac036257e4c3761ec3c6694c5a1177f3d",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "35c9e45ac036257e4c3761ec3c6694c5a1177f3d"
+      },
+      {
+        "name": "codex/hdg-time-to-solution-v1",
+        "refname": "refs/heads/codex/hdg-time-to-solution-v1",
+        "expected_sha": "c9213c25071d4e9c3fe9e1ebd2b6469c0fd30606",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "c9213c25071d4e9c3fe9e1ebd2b6469c0fd30606"
+      },
+      {
+        "name": "codex/hdg-time-validation-v2",
+        "refname": "refs/heads/codex/hdg-time-validation-v2",
+        "expected_sha": "283d8ee7d573c225c40bd76490ce5a89535590c4",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "283d8ee7d573c225c40bd76490ce5a89535590c4"
+      },
+      {
+        "name": "codex/hdg-traced-igr-smooth-transition-cpu-rank2",
+        "refname": "refs/heads/codex/hdg-traced-igr-smooth-transition-cpu-rank2",
+        "expected_sha": "a393ba6920c07bd43e487d8d37d5561364605d29",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "a393ba6920c07bd43e487d8d37d5561364605d29"
+      },
+      {
+        "name": "codex/hdg-traced-igr-smooth-transition-cuda-rank2",
+        "refname": "refs/heads/codex/hdg-traced-igr-smooth-transition-cuda-rank2",
+        "expected_sha": "c2c6f89f11bcc07e59bdadee812a321b7ec8c908",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "c2c6f89f11bcc07e59bdadee812a321b7ec8c908"
+      },
+      {
+        "name": "codex/shock-regime-explicit-imex",
+        "refname": "refs/heads/codex/shock-regime-explicit-imex",
+        "expected_sha": "1ec72eb7ca29806055b8bbf72c8bdd9aadae32b8",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "1ec72eb7ca29806055b8bbf72c8bdd9aadae32b8"
+      },
+      {
+        "name": "codex/tensor-dg-igr-breakthrough",
+        "refname": "refs/heads/codex/tensor-dg-igr-breakthrough",
+        "expected_sha": "f95ee67e4bfdc62ccfc50890400f8b843de53797",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "f95ee67e4bfdc62ccfc50890400f8b843de53797"
+      },
+      {
+        "name": "contract/hdg-euler-device-build-seam",
+        "refname": "refs/heads/contract/hdg-euler-device-build-seam",
+        "expected_sha": "0d40f33f00ab0a69e4ed6f53aacbd9ae6953920e",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "0d40f33f00ab0a69e4ed6f53aacbd9ae6953920e"
+      },
+      {
+        "name": "contract/hdg-run-lifecycle-w8",
+        "refname": "refs/heads/contract/hdg-run-lifecycle-w8",
+        "expected_sha": "ab2e08b3c4e6a9755983abd61fb53af8faf2dda9",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "ab2e08b3c4e6a9755983abd61fb53af8faf2dda9"
+      },
+      {
+        "name": "contract/hdg-two-phase-w8a",
+        "refname": "refs/heads/contract/hdg-two-phase-w8a",
+        "expected_sha": "20dd44058e04156cce8551c3e310f48d667cc96e",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "20dd44058e04156cce8551c3e310f48d667cc96e"
+      },
+      {
+        "name": "feature/hdg-euler-device-full",
+        "refname": "refs/heads/feature/hdg-euler-device-full",
+        "expected_sha": "f217e46ce3a851abcdcd7eaa645eb3d63b832ef0",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "f217e46ce3a851abcdcd7eaa645eb3d63b832ef0"
+      },
+      {
+        "name": "feature/hdg-euler-device-v2",
+        "refname": "refs/heads/feature/hdg-euler-device-v2",
+        "expected_sha": "ce91f26936808544afe8346f873431d16f820865",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "ce91f26936808544afe8346f873431d16f820865"
+      },
+      {
+        "name": "feature/hdg-euler-mpi",
+        "refname": "refs/heads/feature/hdg-euler-mpi",
+        "expected_sha": "dbbd35faa0e233df394a9c67a05a1fd395a2e004",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "dbbd35faa0e233df394a9c67a05a1fd395a2e004"
+      },
+      {
+        "name": "feature/hdg-euler-mpi-device",
+        "refname": "refs/heads/feature/hdg-euler-mpi-device",
+        "expected_sha": "f53fc4d55e698eace0939da599a5b41f19a51b9c",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "f53fc4d55e698eace0939da599a5b41f19a51b9c"
+      },
+      {
+        "name": "feature/hdg-trace-dg-mpi",
+        "refname": "refs/heads/feature/hdg-trace-dg-mpi",
+        "expected_sha": "6f6e9c359d7bb9f21e82af6d25dc15ae8d841f2a",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "6f6e9c359d7bb9f21e82af6d25dc15ae8d841f2a"
+      },
+      {
+        "name": "gpu",
+        "refname": "refs/heads/gpu",
+        "expected_sha": "7b7a8e2c8c813672f6e20d005860c7b36765865a",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "7b7a8e2c8c813672f6e20d005860c7b36765865a"
+      },
+      {
+        "name": "integration/hdg-cpu-w5c",
+        "refname": "refs/heads/integration/hdg-cpu-w5c",
+        "expected_sha": "4f70d39ac23f9e35b0953a49d20bed86f459fb96",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "4f70d39ac23f9e35b0953a49d20bed86f459fb96"
+      },
+      {
+        "name": "integration/hdg-functional-gpu-w7",
+        "refname": "refs/heads/integration/hdg-functional-gpu-w7",
+        "expected_sha": "ac271a038c9d26648fce8f2ebf6afb0113a92495",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "ac271a038c9d26648fce8f2ebf6afb0113a92495"
+      },
+      {
+        "name": "integration/hdg-generic-backend-v1",
+        "refname": "refs/heads/integration/hdg-generic-backend-v1",
+        "expected_sha": "4f7e763dc774ba53a2e2ff4888c2a7ea65294a61",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "4f7e763dc774ba53a2e2ff4888c2a7ea65294a61"
+      },
+      {
+        "name": "integration/hdg-generic-cpu-reference-closure-v1",
+        "refname": "refs/heads/integration/hdg-generic-cpu-reference-closure-v1",
+        "expected_sha": "4acfa881dd21d35c9d3e6e8b76cd382c1c23c30c",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "4acfa881dd21d35c9d3e6e8b76cd382c1c23c30c"
+      },
+      {
+        "name": "integration/hdg-generic-cuda-main-v1",
+        "refname": "refs/heads/integration/hdg-generic-cuda-main-v1",
+        "expected_sha": "10c5a6efa92a6ceb667f01e11602855126d1e6cb",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "10c5a6efa92a6ceb667f01e11602855126d1e6cb"
+      },
+      {
+        "name": "integration/hdg-gpu-w6",
+        "refname": "refs/heads/integration/hdg-gpu-w6",
+        "expected_sha": "88cd3e218610e8acadfe9d7a30484ae4c04ee581",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "88cd3e218610e8acadfe9d7a30484ae4c04ee581"
+      },
+      {
+        "name": "integration/hdg-main-application-v1",
+        "refname": "refs/heads/integration/hdg-main-application-v1",
+        "expected_sha": "8b5df469e427642c0c15f485720ca3a2e58d2982",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "8b5df469e427642c0c15f485720ca3a2e58d2982"
+      },
+      {
+        "name": "integration/hdg-main-backend-v2",
+        "refname": "refs/heads/integration/hdg-main-backend-v2",
+        "expected_sha": "fdb1a2b9a831d6845f8778b826e233cefa3a4fdd",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "fdb1a2b9a831d6845f8778b826e233cefa3a4fdd"
+      },
+      {
+        "name": "integration/hdg-runtime-igr-w8",
+        "refname": "refs/heads/integration/hdg-runtime-igr-w8",
+        "expected_sha": "b0e45bfc5b789879d4f19a1d04bb96e949c38261",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "b0e45bfc5b789879d4f19a1d04bb96e949c38261"
+      },
+      {
+        "name": "integration/hdg-runtime-w8a-shared",
+        "refname": "refs/heads/integration/hdg-runtime-w8a-shared",
+        "expected_sha": "7f0812cfc96c6d0288ed1e6126ba2cf223af64ab",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "7f0812cfc96c6d0288ed1e6126ba2cf223af64ab"
+      },
+      {
+        "name": "integration/hdg-standalone-closure-v1",
+        "refname": "refs/heads/integration/hdg-standalone-closure-v1",
+        "expected_sha": "972ad0f4ecf36fafd02fb31d909fcf703d313b61",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "972ad0f4ecf36fafd02fb31d909fcf703d313b61"
+      },
+      {
+        "name": "integration/hdg-traced-igr-smooth-transition-rank2-v4",
+        "refname": "refs/heads/integration/hdg-traced-igr-smooth-transition-rank2-v4",
+        "expected_sha": "db3da20e6ad4e6bf635efd91960b751438c1258e",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "db3da20e6ad4e6bf635efd91960b751438c1258e"
+      },
+      {
+        "name": "integration/hdg-w5c-device-sm120",
+        "refname": "refs/heads/integration/hdg-w5c-device-sm120",
+        "expected_sha": "c53fa8101c27d81e4043d9484af2ead50c4ab4fb",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "c53fa8101c27d81e4043d9484af2ead50c4ab4fb"
+      },
+      {
+        "name": "new_dgsem",
+        "refname": "refs/heads/new_dgsem",
+        "expected_sha": "4a149ac453908e87d8fefd8ba9a75f341accd635",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "4a149ac453908e87d8fefd8ba9a75f341accd635"
+      },
+      {
+        "name": "recovery/hdg-euler-cpu-03c-continuous-recovery",
+        "refname": "refs/heads/recovery/hdg-euler-cpu-03c-continuous-recovery",
+        "expected_sha": "51b669f5e18148468d200d9e3afc2bea461346c6",
+        "current_guard_matches": true,
+        "disposition": "retire_ancestry_contained",
+        "basis": "Exact ancestor of recovered primary history",
+        "recovery_archive_required": true,
+        "approval_required": true,
+        "current_observed_sha": "51b669f5e18148468d200d9e3afc2bea461346c6"
+      }
+    ]
+  },
+  "local_refs_to_retain": [
+    {
+      "name": "main",
+      "refname": "refs/heads/main",
+      "observed_sha": "b04f8e2d7dbdff8947302e387912041aa656e746",
+      "decision": "retain",
+      "note": "Original primary/main/dev ref retained."
+    },
+    {
+      "name": "dev",
+      "refname": "refs/heads/dev",
+      "observed_sha": "30afa08f8ad19a3ad37e627463ef63c40da1ae91",
+      "decision": "retain",
+      "note": "Original primary/main/dev ref retained."
+    },
+    {
+      "name": "codex/tensor-precision-investigation",
+      "refname": "refs/heads/codex/tensor-precision-investigation",
+      "observed_sha": "1c75579a94bca0d067aedd44c26aff13c5831b26",
+      "decision": "retain",
+      "note": "Original primary/main/dev ref retained."
+    },
+    {
+      "name": "codex/igrlab-consolidation",
+      "refname": "refs/heads/codex/igrlab-consolidation",
+      "observed_sha": "0e4d578b0b3bd1acf99f3b30a05cfda5d0d47e8d",
+      "decision": "retain",
+      "note": "Retained numerical-source snapshot; final docs-only approval HEAD recorded externally after root signal."
+    }
+  ],
+  "existing_archive_refs_to_preserve": [
+    {
+      "name": "archive/worktree-cleanup-20260823/dgsem-production-baseline",
+      "refname": "refs/heads/archive/worktree-cleanup-20260823/dgsem-production-baseline",
+      "expected_sha": "c46b258870921af0a3e568162c211acf6ae2c6d8",
+      "decision": "preserve archive ref"
+    },
+    {
+      "name": "archive/worktree-cleanup-20260823/hdg-auxiliary-cpu-e2-recovery",
+      "refname": "refs/heads/archive/worktree-cleanup-20260823/hdg-auxiliary-cpu-e2-recovery",
+      "expected_sha": "20e30aa4733a05a1aaa8baf482dbb3c0b18bac1d",
+      "decision": "preserve archive ref"
+    },
+    {
+      "name": "archive/worktree-cleanup-20260823/hdg-cuda-traced-igr-private-topology-v1",
+      "refname": "refs/heads/archive/worktree-cleanup-20260823/hdg-cuda-traced-igr-private-topology-v1",
+      "expected_sha": "49fbc27d1fa5a4861a8bb5b018b4fb7fef6c2f5f",
+      "decision": "preserve archive ref"
+    },
+    {
+      "name": "archive/worktree-cleanup-20260823/hdg-generic-traced-igr-private-v2",
+      "refname": "refs/heads/archive/worktree-cleanup-20260823/hdg-generic-traced-igr-private-v2",
+      "expected_sha": "8126b0fc4990ce8d18e758d8d4b25038b2aedbb9",
+      "decision": "preserve archive ref"
+    },
+    {
+      "name": "archive/worktree-cleanup-20260823/hdg-w8c-conventional-cpu",
+      "refname": "refs/heads/archive/worktree-cleanup-20260823/hdg-w8c-conventional-cpu",
+      "expected_sha": "6bb849f7d6aff57f265aa80c7509f8e777cd2050",
+      "decision": "preserve archive ref"
+    },
+    {
+      "name": "archive/worktree-cleanup-20260823/hdg-w8c-scalar-igr-cpu",
+      "refname": "refs/heads/archive/worktree-cleanup-20260823/hdg-w8c-scalar-igr-cpu",
+      "expected_sha": "dbf65c76c783bf9d58458709922ea8a7a5b4580d",
+      "decision": "preserve archive ref"
+    }
+  ],
+  "unmatched_experiment_refs_retained_this_batch": [
+    {
+      "name": "codex/hdg-default-numerical-policy",
+      "refname": "refs/heads/codex/hdg-default-numerical-policy",
+      "expected_sha": "b7f8115910172c3275da211c5b15ff067c00f2b9",
+      "decision": "retain in this cleanup batch; preserve experimental source externally; later retirement needs separate approval"
+    },
+    {
+      "name": "codex/hdg-igr-combine-tf32-matrix-free",
+      "refname": "refs/heads/codex/hdg-igr-combine-tf32-matrix-free",
+      "expected_sha": "45822f9cba238884ccd45d9f04a26c34d6a6a47d",
+      "decision": "retain in this cleanup batch; preserve experimental source externally; later retirement needs separate approval"
+    },
+    {
+      "name": "codex/hdg-igr-equilibrated-field-split",
+      "refname": "refs/heads/codex/hdg-igr-equilibrated-field-split",
+      "expected_sha": "119d6d9196b03f4b6ebe3625465bd47d2abfd820",
+      "decision": "retain in this cleanup batch; preserve experimental source externally; later retirement needs separate approval"
+    },
+    {
+      "name": "codex/hdg-igr-fixed-sweep-preconditioner",
+      "refname": "refs/heads/codex/hdg-igr-fixed-sweep-preconditioner",
+      "expected_sha": "786c02d2370fd221502493391d8748ff5af330d6",
+      "decision": "retain in this cleanup batch; preserve experimental source externally; later retirement needs separate approval"
+    },
+    {
+      "name": "codex/hdg-igr-fixed-sweep-specialized",
+      "refname": "refs/heads/codex/hdg-igr-fixed-sweep-specialized",
+      "expected_sha": "2aa498470f4e22126206787dbb9768513c39d2d2",
+      "decision": "retain in this cleanup batch; preserve experimental source externally; later retirement needs separate approval"
+    },
+    {
+      "name": "codex/hdg-igr-schwarz-tf32-ir",
+      "refname": "refs/heads/codex/hdg-igr-schwarz-tf32-ir",
+      "expected_sha": "16b36728049a7b8606a6e1c9ccff1ee1d5d1bca3",
+      "decision": "retain in this cleanup batch; preserve experimental source externally; later retirement needs separate approval"
+    },
+    {
+      "name": "codex/hdg-igr-trace-optimization-v2",
+      "refname": "refs/heads/codex/hdg-igr-trace-optimization-v2",
+      "expected_sha": "69c78187dccbc7fb376e916bcd1939decbb32b30",
+      "decision": "retain in this cleanup batch; preserve experimental source externally; later retirement needs separate approval"
+    },
+    {
+      "name": "codex/hdg-q12-three-way-control",
+      "refname": "refs/heads/codex/hdg-q12-three-way-control",
+      "expected_sha": "19afa688ef7ab74e85140074fa942542f0609562",
+      "decision": "retain in this cleanup batch; preserve experimental source externally; later retirement needs separate approval"
+    },
+    {
+      "name": "codex/hdg-tensor-campaign-doc-refresh",
+      "refname": "refs/heads/codex/hdg-tensor-campaign-doc-refresh",
+      "expected_sha": "54dc928e5a98079e6b0aca7ef7644dc5a501d069",
+      "decision": "retain in this cleanup batch; preserve experimental source externally; later retirement needs separate approval"
+    },
+    {
+      "name": "codex/hdg-tensor-cylinder-smoke",
+      "refname": "refs/heads/codex/hdg-tensor-cylinder-smoke",
+      "expected_sha": "69c78187dccbc7fb376e916bcd1939decbb32b30",
+      "decision": "retain in this cleanup batch; preserve experimental source externally; later retirement needs separate approval"
+    },
+    {
+      "name": "codex/hdg-tensor-cylinder-smoke-dev",
+      "refname": "refs/heads/codex/hdg-tensor-cylinder-smoke-dev",
+      "expected_sha": "d19e02f2eabea39b31448b103eb1ae841351b56d",
+      "decision": "retain in this cleanup batch; preserve experimental source externally; later retirement needs separate approval"
+    },
+    {
+      "name": "codex/hdg-tensor-volume-assembly",
+      "refname": "refs/heads/codex/hdg-tensor-volume-assembly",
+      "expected_sha": "e0193821ff04884a7070deefd30ca61bbd4ca62c",
+      "decision": "retain in this cleanup batch; preserve experimental source externally; later retirement needs separate approval"
+    }
+  ],
+  "remote_refs_to_retain": [
+    {
+      "name": "main",
+      "refname": "refs/heads/main",
+      "observed_sha": "b04f8e2d7dbdff8947302e387912041aa656e746",
+      "decision": "retain"
+    },
+    {
+      "name": "dev",
+      "refname": "refs/heads/dev",
+      "observed_sha": "db4d2ae1af3f55fe87f3b0360804d4834169a691",
+      "decision": "retain"
+    },
+    {
+      "name": "dgsem",
+      "refname": "refs/heads/dgsem",
+      "observed_sha": "20b120ff3fe54ece5863793d58a7df29b3da2e87",
+      "decision": "preserve unique legacy reference; no integration proposed"
+    }
+  ],
+  "stashes_to_preserve": [
+    {
+      "name": "stash@{0}",
+      "sha": "2c8cf736fa2d18acf2e5aae39d735239b6cac48a",
+      "date": "2026-06-21",
+      "subject": "WIP on main: 4e4dba4 Update test suite",
+      "parents": [
+        "4e4dba409786bb56c24a9b2850c1e35dd8d70cee",
+        "ed2149a583381693f6b37cbe4a97df21a403742e"
+      ],
+      "tracked_changed_paths": [
+        ".gitignore",
+        "README.md",
+        "spack.yaml"
+      ],
+      "proposed_disposition": "preserve_durable_recovery; retain stash until explicit retirement review"
+    },
+    {
+      "name": "stash@{1}",
+      "sha": "44eab0a52c052b69803306fe0c8f3a29f1523056",
+      "date": "2026-02-17",
+      "subject": "On new_dgsem: wip before moving commits to gpu",
+      "parents": [
+        "84ea08b73d1714422817f0675449b676d5515309",
+        "8373caab41514a07a8d4773529b1ba93a2c1e5b3",
+        "a58c601c6c51b2a3a1cb7948c893c4b18fded0cd"
+      ],
+      "tracked_changed_paths": [
+        ".gitignore",
+        "build_script.sh",
+        "include/numerics/dg/DGHyperbolicConservationLaws.hpp",
+        "include/physics/igr/IGR.hpp",
+        "spack.yaml",
+        "src/numerics/dg/DGHyperbolicConservationLaws_device_kernels.hpp",
+        "src/numerics/dg/DGHyperbolicConservationLaws_face.cpp",
+        "src/physics/igr/IGR.cpp",
+        "src/physics/igr/IGR_linear_solve.cpp"
+      ],
+      "untracked_parent_path_count": 31,
+      "untracked_parent_roots": {
+        "spack.lock": 1,
+        "tests": 30
+      },
+      "untracked_parent_paths": [
+        "spack.lock",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T154843Z.log",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T154843Z.nsys-rep",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T154843Z.qdstrm",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T154843Z.sqlite",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T154846Z.log",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T154953Z.log",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T154953Z.nsys-rep",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T154953Z.qdstrm",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T154953Z.sqlite",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T155053Z.log",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T155054Z.log",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T160525Z.log",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T160613Z.log",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T161536Z.log",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T161557Z.log",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T161609Z.log",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T161609Z.nsys-rep",
+        "tests/perf/nsight/inoue_dg_igr_cuda_20260217T161609Z.sqlite",
+        "tests/perf_refs/dgsem_operator_inoue_cpu.json",
+        "tests/perf_refs/dgsem_operator_inoue_cuda.json",
+        "tests/scripts/__pycache__/check_dgsem_perf_regression.cpython-312.pyc",
+        "tests/scripts/__pycache__/dgsem_perf_harness.cpython-312.pyc",
+        "tests/scripts/check_cpu_cuda_parity.sh",
+        "tests/scripts/check_dg_cuda_speedup.sh",
+        "tests/scripts/check_dgsem_perf_regression.py",
+        "tests/scripts/collect_igr_cuda_regression.py",
+        "tests/scripts/dgsem_perf_harness.py",
+        "tests/scripts/profile_dg_igr_hotspots.py",
+        "tests/scripts/profile_dg_igr_ncu.sh",
+        "tests/scripts/profile_dg_igr_nsys.sh"
+      ],
+      "proposed_disposition": "preserve_durable_recovery; retain stash until explicit retirement review"
+    }
+  ],
+  "old_worktree_removal_candidates": [
+    {
+      "path": "/home/jarias9/.codex/worktrees/cigmo-overnight/dg_igr_miniapp",
+      "head": "06c3f0d1cd7393c5fa3bfdcb5b518842cbb22731",
+      "branch_ref": null,
+      "tracked_dirty_count": 0,
+      "tracked_status_counts": {},
+      "untracked_file_count": 0,
+      "ignored_file_count": 0,
+      "status_porcelain_z_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "unstaged_binary_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "staged_binary_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tracked_dirty_paths": [],
+      "untracked_paths": [],
+      "ignored_roots": {},
+      "initialized_mfem_git_marker": false,
+      "proposal": "remove registered worktree through Git only after verified archive and restore proof; approval required",
+      "expected_detached": true,
+      "guard_requirements": [
+        "Exact registered canonical path and expected HEAD",
+        "Status/patch digests unchanged or archive refreshed",
+        "All tracked/untracked/valuable ignored contents preserved in verified archive",
+        "No active writer or process using checkout",
+        "Archive restoration demonstrated before any force removal"
+      ],
+      "cache_cleanup": "No ignored cache files observed; no separate cache deletion proposed",
+      "label": "cigmo-overnight",
+      "untracked_paths_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "ignored_paths_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "untracked_content_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "ignored_content_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "source_manifest": "/home/jarias9/archives/igrlab/consolidation-20261010/cigmo-overnight.manifest.json",
+      "source_manifest_sha256": "74685af2875cf5a67e4183a6a010b8a390913ff9c988d0d6a5d91212f1faf961",
+      "archived_metadata_matches": {
+        "status.z": true,
+        "unstaged.patch": true,
+        "staged.patch": true
+      },
+      "archive_content_match": {
+        "matched": true,
+        "files_checked": 614,
+        "bytes_checked": 17391121,
+        "mismatches": []
+      }
+    },
+    {
+      "path": "/home/jarias9/.codex/worktrees/pace-a100/dg_igr_miniapp",
+      "head": "06c3f0d1cd7393c5fa3bfdcb5b518842cbb22731",
+      "branch_ref": null,
+      "tracked_dirty_count": 38,
+      "tracked_status_counts": {
+        " M": 35,
+        " A": 3
+      },
+      "untracked_file_count": 3,
+      "ignored_file_count": 0,
+      "status_porcelain_z_sha256": "8035aa5b53a9154fa5d602a884c20b30ceb70e722edb734f65f9d7f14b156485",
+      "unstaged_binary_patch_sha256": "a70f0c12c99f0f9b9699a264df3b5efbe78fa356864978155bc4646c4e41a8ef",
+      "staged_binary_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tracked_dirty_paths": [
+        "CMakeLists.txt",
+        "README.md",
+        "build.sh",
+        "build_mfem_tpl.sh",
+        "cmake/DgIgrHdgComponents.cmake",
+        "examples/dgsem_smooth_advection_periodic/CMakeLists.txt",
+        "examples/hdg_smooth_transition_research/CMakeLists.txt",
+        "examples/sedov_taylor_blast/sedov_taylor_blast.cpp",
+        "include/numerics/hdg/generic/contract.hpp",
+        "include/numerics/hdg/runtime/cuda/generic_euler.cuh",
+        "include/numerics/hdg/runtime/cuda/native_cuda_architecture.hpp",
+        "include/numerics/hdg/runtime/cuda/native_element_schwarz_plan.hpp",
+        "include/numerics/hdg/runtime/cuda/native_rank1_trace_solver.cuh",
+        "include/numerics/hdg/runtime/cuda/persistent_sc25_scalar_igr.cuh",
+        "include/numerics/hdg/runtime/cuda/persistent_sc25_scalar_igr_rank2.cuh",
+        "include/numerics/hdg/runtime/cuda/persistent_smooth_euler.cuh",
+        "include/numerics/hdg/runtime/cuda/persistent_smooth_euler_impl.cuh",
+        "include/numerics/hdg/runtime/cuda/persistent_smooth_euler_methods.cuh",
+        "include/numerics/hdg/runtime/cuda/persistent_smooth_euler_types.cuh",
+        "spack-envs/cuda-sm80/spack.yaml",
+        "src/numerics/hdg/runtime/CMakeLists.txt",
+        "src/numerics/hdg/runtime/cuda/native_rank1_trace_solver.cu",
+        "src/numerics/hdg/runtime/cuda/persistent_smooth_euler.cu",
+        "src/sim/hdg/main_backend_cuda.cu",
+        "tests/hdg/generic_contract/test_contract.cpp",
+        "tests/hdg/main_backend/CMakeLists.txt",
+        "tests/hdg/runtime/CMakeLists.txt",
+        "tests/hdg/runtime/cpu/test_native_element_schwarz_plan.cpp",
+        "tests/hdg/runtime/cpu/test_tensor_volume_layout.cpp",
+        "tests/hdg/runtime/cuda/CMakeLists.txt",
+        "tests/hdg/runtime/cuda/benchmark_dgsem_tensor_volume.cu",
+        "tests/hdg/runtime/cuda/test_generic_euler_extension.cu",
+        "tests/hdg/runtime/cuda/test_hash_exact.cu",
+        "tests/hdg/runtime/cuda/test_persistent_sc25_scalar_igr.cu",
+        "tests/hdg/runtime/cuda/test_persistent_sc25_scalar_igr_rank2.cu",
+        "tests/hdg/runtime/cuda/test_persistent_smooth_euler.cu",
+        "tests/scripts/check_cuda_build_policy.sh",
+        "tests/scripts/check_spack_external_artifacts.sh"
+      ],
+      "untracked_paths": [
+        "include/numerics/hdg/runtime/cuda/generic_euler_app.cuh",
+        "include/numerics/hdg/runtime/cuda/generic_euler_types.cuh",
+        "src/numerics/hdg/runtime/cuda/generic_euler_app.cu"
+      ],
+      "ignored_roots": {},
+      "initialized_mfem_git_marker": false,
+      "proposal": "remove registered worktree through Git only after verified archive and restore proof; approval required",
+      "expected_detached": true,
+      "guard_requirements": [
+        "Exact registered canonical path and expected HEAD",
+        "Status/patch digests unchanged or archive refreshed",
+        "All tracked/untracked/valuable ignored contents preserved in verified archive",
+        "No active writer or process using checkout",
+        "Archive restoration demonstrated before any force removal"
+      ],
+      "cache_cleanup": "No ignored cache files observed; no separate cache deletion proposed",
+      "label": "pace-a100",
+      "untracked_paths_sha256": "6774628b2f191bb8eb76017a525a725553be02a986bfa0c5658818ea008c633f",
+      "ignored_paths_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "untracked_content_sha256": "cad2029065adc3c9081d410fe186bbe5b3b81821e596c274c25749857e6a218f",
+      "ignored_content_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "source_manifest": "/home/jarias9/archives/igrlab/consolidation-20261010/pace-a100.manifest.json",
+      "source_manifest_sha256": "217dfcf29c006df84d4663de4549b1115b713b22fb09c8ae01c9a5098743937b",
+      "archived_metadata_matches": {
+        "status.z": true,
+        "unstaged.patch": true,
+        "staged.patch": true
+      },
+      "archive_content_match": {
+        "matched": true,
+        "files_checked": 620,
+        "bytes_checked": 17472503,
+        "mismatches": []
+      }
+    },
+    {
+      "path": "/home/jarias9/.codex/worktrees/sedov-fp32-comparison/dg_igr_miniapp",
+      "head": "06c3f0d1cd7393c5fa3bfdcb5b518842cbb22731",
+      "branch_ref": null,
+      "tracked_dirty_count": 6,
+      "tracked_status_counts": {
+        " M": 6
+      },
+      "untracked_file_count": 0,
+      "ignored_file_count": 0,
+      "status_porcelain_z_sha256": "1aae2016cc9194defb37ef53868359906d2058593d7acbb63bf44d1d5419b0ca",
+      "unstaged_binary_patch_sha256": "f08f376adb105e4986c91142d34298db5fcb86f1976b0c16c11df3f8197d0734",
+      "staged_binary_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tracked_dirty_paths": [
+        "examples/sedov_taylor_blast/sedov_taylor_blast.cpp",
+        "include/numerics/hdg/runtime/cuda/persistent_smooth_euler_impl.cuh",
+        "include/numerics/hdg/runtime/cuda/persistent_smooth_euler_methods.cuh",
+        "include/numerics/hdg/runtime/cuda/persistent_smooth_euler_types.cuh",
+        "src/numerics/hdg/runtime/cuda/persistent_smooth_euler.cu",
+        "tests/hdg/runtime/cuda/test_generic_euler_extension.cu"
+      ],
+      "untracked_paths": [],
+      "ignored_roots": {},
+      "initialized_mfem_git_marker": false,
+      "proposal": "remove registered worktree through Git only after verified archive and restore proof; approval required",
+      "expected_detached": true,
+      "guard_requirements": [
+        "Exact registered canonical path and expected HEAD",
+        "Status/patch digests unchanged or archive refreshed",
+        "All tracked/untracked/valuable ignored contents preserved in verified archive",
+        "No active writer or process using checkout",
+        "Archive restoration demonstrated before any force removal"
+      ],
+      "cache_cleanup": "No ignored cache files observed; no separate cache deletion proposed",
+      "label": "sedov-fp32-comparison",
+      "untracked_paths_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "ignored_paths_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "untracked_content_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "ignored_content_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "source_manifest": "/home/jarias9/archives/igrlab/consolidation-20261010/sedov-fp32-comparison.manifest.json",
+      "source_manifest_sha256": "34a3b1678b42ddcae7a35f80357a0d874782578e86cf02e241d06bba82772ca2",
+      "archived_metadata_matches": {
+        "status.z": true,
+        "unstaged.patch": true,
+        "staged.patch": true
+      },
+      "archive_content_match": {
+        "matched": true,
+        "files_checked": 614,
+        "bytes_checked": 17415233,
+        "mismatches": []
+      }
+    }
+  ],
+  "pull_request_closure_candidates": [
+    {
+      "number": 37,
+      "url": "https://github.com/comp-physics/dg_igr_miniapp/pull/37",
+      "expected_state": "open",
+      "expected_head_ref": "codex/hdg-case-context-v1",
+      "expected_head_sha": "e75f3cbd9428b7b044b4400186336153909f1ac6",
+      "expected_base_ref": "integration/hdg-generic-backend-v1",
+      "expected_base_sha": "72212509a2fdebb8f44eb3a72e39257866c40a01",
+      "proposal": "close as superseded after current validation; do not merge",
+      "retained_equivalent_commit_shas": [
+        "c12f26a78c37973a9792c4c23da36e52bb12477e"
+      ],
+      "required_validation": "Build and test current CaseContext communicator identity on preserved source; inspect post-cherry-pick evolution.",
+      "approval_required": true,
+      "current_guard_matches": true,
+      "validation_status": "passed on numerical source 0e4d578",
+      "current_validation_evidence": {
+        "status": "passed",
+        "tests": [
+          "dg_igr_bc_tests",
+          "dg_igr_case_context_compile"
+        ],
+        "evidence": "/tmp/igrlab-consolidation-tools/cpu-hdg-on-final/LastTest.log",
+        "assertion": "CaseContext communicator is the owned mesh communicator",
+        "source_sha": "0e4d578b0b3bd1acf99f3b30a05cfda5d0d47e8d"
+      }
+    },
+    {
+      "number": 38,
+      "url": "https://github.com/comp-physics/dg_igr_miniapp/pull/38",
+      "expected_state": "open",
+      "expected_head_ref": "codex/hdg-generic-contract-v1",
+      "expected_head_sha": "c5444f34bd4eb1d8cc59f70f8832109b1a031b41",
+      "expected_base_ref": "integration/hdg-generic-backend-v1",
+      "expected_base_sha": "72212509a2fdebb8f44eb3a72e39257866c40a01",
+      "proposal": "close as superseded after current validation; do not merge",
+      "retained_equivalent_commit_shas": [
+        "b22826565622dc2f880426d61a8fa6c57dac229d",
+        "93539e656507afe2c4b8e63406c448fb0dad68dd"
+      ],
+      "required_validation": "Confirm current two-rank empty-local-rank admission fixture is registered and passes with the initialized MFEM tuple.",
+      "approval_required": true,
+      "current_guard_matches": true,
+      "validation_status": "passed on numerical source 0e4d578",
+      "current_validation_evidence": {
+        "status": "passed",
+        "test": "dg_igr_hdg_main_backend_collective_projection_rejected_rank2",
+        "evidence": "/tmp/igrlab-consolidation-tools/cpu-hdg-on-final/LastTest.log",
+        "source_sha": "0e4d578b0b3bd1acf99f3b30a05cfda5d0d47e8d"
+      }
+    }
+  ],
+  "guards_currently_match": true,
+  "guard_mismatches": [],
+  "recovery_gate": {
+    "archive_root": "/home/jarias9/archives/igrlab/consolidation-20261010",
+    "required_state_file": "/home/jarias9/archives/igrlab/consolidation-20261010/recovery_state.json",
+    "required_phase": "verified",
+    "required_checksums": "/home/jarias9/archives/igrlab/consolidation-20261010/SHA256SUMS",
+    "required_scope": [
+      "git-common.tar and git-common.manifest.json preserve exact raw Git bytes/refs/reflogs/stashes/unreachable objects, including pre-existing empty loose files; this does not establish complete restoration of old reflog object graphs.",
+      "primary.tar.gz and primary.manifest.json (source/untracked research/valuable ignored output)",
+      "cigmo-overnight, pace-a100, sedov-fp32-comparison tar.gz archives and manifests",
+      "metadata refs/reflogs/stashes/submodules/worktrees and per-worktree status/binary patches"
+    ],
+    "required_restore_demonstration": "Verified exact raw snapshot restoration, original worktree contents and named refs/stashes/100 retirement-root connectivity, with historical reflog missing-object limitations separately and explicitly disclosed.",
+    "observed_status": "Raw volumes and full supplemented isolated recovery proof verified. Root bounded original 210 object repair completed; independent installed/displaced and full original physical-worktree/status/patch/content checks pass. All 100 retirement guards and archive provenance remain unchanged.",
+    "observed_phase": "verified",
+    "restore_proof_path": "/home/jarias9/archives/igrlab/consolidation-20261010/restore_proof.json",
+    "metadata_sha256_guards": {
+      "SHA256SUMS": "d91029641f7c51b05b008300a72b9d3fd9bbfd88b81d47900435fa492f5d9aef",
+      "cigmo-overnight.manifest.json": "74685af2875cf5a67e4183a6a010b8a390913ff9c988d0d6a5d91212f1faf961",
+      "git-common.manifest.json": "611449148ecdbce0689c271985f832635897fb112f95a8a3dd01567f5d83ab42",
+      "metadata/cigmo-overnight.staged.patch": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "metadata/cigmo-overnight.status.z": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "metadata/cigmo-overnight.unstaged.patch": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "metadata/pace-a100.staged.patch": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "metadata/pace-a100.status.z": "8035aa5b53a9154fa5d602a884c20b30ceb70e722edb734f65f9d7f14b156485",
+      "metadata/pace-a100.unstaged.patch": "a70f0c12c99f0f9b9699a264df3b5efbe78fa356864978155bc4646c4e41a8ef",
+      "metadata/primary.staged.patch": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "metadata/primary.status.z": "bcf11276eca441fb28a5c737054a9f7971806ee209ea95d34f5135bc1faa9bb5",
+      "metadata/primary.unstaged.patch": "f60848e707f001293d55b119b500fdaa14e32f17ff7942791725502ad9d64f33",
+      "metadata/reflogs.txt": "d36a7d2fc24d7dbe723f6ac6dd2c46fd6988a063b25fcfa5996892e257e0d059",
+      "metadata/refs.txt": "f26bd88471c23b595686a7642c042ca9d45727167e518f11eb819ea8f2d5a4f0",
+      "metadata/sedov-fp32-comparison.staged.patch": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "metadata/sedov-fp32-comparison.status.z": "1aae2016cc9194defb37ef53868359906d2058593d7acbb63bf44d1d5419b0ca",
+      "metadata/sedov-fp32-comparison.unstaged.patch": "f08f376adb105e4986c91142d34298db5fcb86f1976b0c16c11df3f8197d0734",
+      "metadata/stashes.txt": "b92ef0be8fa1bc0a4532709c8dcfaf1243a3190d14bb1cc9326ad185f537e25b",
+      "metadata/submodules.txt": "25f15210cd33a82100c0804afc307d1b4faa04824c3a02deff419c3b15ffbe11",
+      "metadata/worktrees.txt": "50e37b3ca057805fffebe49610f7bac7a771c21dcc925413c5e9ac2f1efb77b8",
+      "pace-a100.manifest.json": "217dfcf29c006df84d4663de4549b1115b713b22fb09c8ae01c9a5098743937b",
+      "primary.manifest.json": "e759a24086d47cc882740f44c66b4d551760e0459a01fbeee72d885bccce5990",
+      "recovery_state.json": "988ae1e996ee6be3c0233d9ef8390135d3ac26309a93cf123cc5bd46d6adf06e",
+      "sedov-fp32-comparison.manifest.json": "34a3b1678b42ddcae7a35f80357a0d874782578e86cf02e241d06bba82772ca2"
+    },
+    "verification": {
+      "git-common.tar": {
+        "files": 22639,
+        "bytes": 13049843580,
+        "verified": true,
+        "archive_sha256": "4150fb5f1b22181ead6886b4f4d3841531b51a6e757ffbb56be0d4fe3f87f73d"
+      },
+      "primary.tar.gz": {
+        "files": 72102,
+        "bytes": 34804970073,
+        "verified": true,
+        "archive_sha256": "28747f7797bec7a7df55d309c30856123b10b030ffb48bb1412738c122769f3a"
+      },
+      "cigmo-overnight.tar.gz": {
+        "files": 614,
+        "bytes": 17391121,
+        "verified": true,
+        "archive_sha256": "602328681a069439ed3cc8eae58ba0a20962467df85ea2edf030544a7b287381"
+      },
+      "pace-a100.tar.gz": {
+        "files": 620,
+        "bytes": 17472503,
+        "verified": true,
+        "archive_sha256": "dc0d1a12c6089364a3c7d4feddb17d21003e4c33505528e088b3097222c6f0b3"
+      },
+      "sedov-fp32-comparison.tar.gz": {
+        "files": 614,
+        "bytes": 17415233,
+        "verified": true,
+        "archive_sha256": "625a21c66b19195a07071c985d7e86381742cd2d6bfc458d9fd01e4581e426f1"
+      }
+    },
+    "restore_proof_status": "verified named refs/stashes/100 retirement roots and full historical reflog closure using the separately validated210-object supplement",
+    "recovery_scope": {
+      "raw_git_bytes": "Exact preserved raw Git bytes, including 210 pre-existing zero-byte loose files; byte preservation does not create missing historical object bodies.",
+      "physical_worktrees": "All four original worktrees exactly match every archived manifest entry, patch and status.",
+      "named_refs_stashes_retirement_roots": "Independently verified 132 named refs/stashes and100 retirement records/88 unique SHAs; both stashes and stash1untracked third-parent tree preserved.",
+      "historical_reflog_snapshots": "All archived named/ref/reflog/retirement graph roots are verified complete in isolated restoration with the210-object supplement:28141reachable objects, zero missing. Raw archive alone retains the pre-existing empty files; preserve the supplement as part of the recovery bundle."
+    },
+    "historical_reflog_limitation": {
+      "status": "Resolved: all 210 exact bodies recovered in supplementary bundle and installed in original DB. Full original physical/source preservation independently verified after repair; no residual missing-object limitation in verified recovery.",
+      "preexisting_zero_byte_loose_files": 210,
+      "all_history_restorable_claim": false,
+      "explicit_acknowledgment_required_before_cleanup": false,
+      "source": "Root and damping_audit restore drill; exact residual missing IDs will be recorded in restore_proof.json.",
+      "reconstructed_body_bytes": 314743563,
+      "acknowledgment_required_if_residual_missing_objects": true,
+      "residual_missing_objects": []
+    },
+    "supplement_paths": {
+      "archive": "/home/jarias9/archives/igrlab/consolidation-20261010/audit/reflog-object-supplement.tar.gz",
+      "manifest": "/home/jarias9/archives/igrlab/consolidation-20261010/audit/reflog-object-reconstruction.json"
+    },
+    "original_database_repair": {
+      "status": "Completed by root. Independent checks confirm all 210 installed objects and retained displaced originals, all original physical worktrees/patches/metadata, and retirement guards are preserved.",
+      "scope": "Exactly210 known empty loose blob files; preserve changed/nonzero files and retain displaced originals; no GC/prune/ref edits",
+      "preflight": "/tmp/igrlab-consolidation-git/object_repair_preflight.py",
+      "plan": "/tmp/igrlab-consolidation-git/object_repair_plan.md",
+      "guards": "/tmp/igrlab-consolidation-git/original_zero_object_guards.json",
+      "execution_owner": "root after isolated proof and independent review",
+      "verification_result": "/tmp/igrlab-consolidation-git/object_repair_preflight_result.json",
+      "verified_objects": 210,
+      "verified_body_bytes": 314743563,
+      "receipt": "/home/jarias9/archives/igrlab/consolidation-20261010/audit/original-object-repair/receipt.json",
+      "receipt_verified": true,
+      "installed_objects": 210,
+      "independent_installed_displaced_check": "/tmp/igrlab-consolidation-git/post_repair_object_guard_check.json",
+      "independent_physical_check": "/tmp/igrlab-consolidation-git/post_repair_physical_preservation.json"
+    },
+    "restore_proof_check": {
+      "path": "/home/jarias9/archives/igrlab/consolidation-20261010/restore_proof.json",
+      "available": true,
+      "verified": true,
+      "scope": "Exact physical snapshots and named refs/stashes/retirement roots; historical reflogs reported separately",
+      "schema": "igrlab-recovery-drill-v1",
+      "captured_proposal_sha256": "5bedf2415b63a37497d24de56e0edc832dba073ba566cd0b110ed855b052ce78",
+      "current_retirement_refs_match": true,
+      "records_checked": 100,
+      "proof_sha256": "0829bbb7807d6aacb98e7f72e8fcbacd778f16082bcde2d5700f0ba4686a14af",
+      "named_ref_connectivity": {
+        "verified": true,
+        "includes_all_named_refs_and_stashes": true,
+        "exit_code": 0,
+        "missing_objects": [],
+        "reachable_object_count": 27557,
+        "stderr": ""
+      },
+      "historical_reflog_recovery": {
+        "verified": true,
+        "missing_objects": [],
+        "preexisting_empty_bodies_reconstructed": 210
+      },
+      "all_historical_reflog_snapshots_verified": true,
+      "historical_reflog_limitation_requires_explicit_acknowledgment": false
+    }
+  },
+  "validation_gate": {
+    "status": "passed required current-source checks at 0e4d578",
+    "requirements": [
+      "Retained backend matrix source/build routing review",
+      "Numerical ringing regression on accepted source",
+      "Proportionate CPU/GPU/manual tensor validation on authorized resources",
+      "Current CaseContext communicator and collective empty-local-rank regression gates for PR closures"
+    ],
+    "tested_source_sha": "0e4d578b0b3bd1acf99f3b30a05cfda5d0d47e8d",
+    "results_owner": "root",
+    "results_not_yet_claimed": false,
+    "selected_suite_results": [
+      {
+        "name": "cpu-hdg-on-final",
+        "selected_tests_passed": 68,
+        "selected_tests_total": 68,
+        "status": "passed",
+        "configuration": {
+          "mode": "cpu",
+          "hdg_runtime": "ON",
+          "research_tests": "OFF",
+          "build_type": "Release",
+          "jobs": 4
+        },
+        "source_sha": "0e4d578b0b3bd1acf99f3b30a05cfda5d0d47e8d",
+        "mfem_pin": "d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec",
+        "result_json": "/tmp/igrlab-consolidation-tools/cpu-hdg-on-final/result.json",
+        "result_sha256": "7b3a971679e7d71563e5280f5f1e1063fd82b255326e47a9acee5cd8d4954b8d",
+        "logs_directory": "/tmp/igrlab-consolidation-tools/cpu-hdg-on-final"
+      },
+      {
+        "name": "cpu-hdg-off-final",
+        "selected_tests_passed": 18,
+        "selected_tests_total": 18,
+        "status": "passed",
+        "configuration": {
+          "mode": "cpu",
+          "hdg_runtime": "OFF",
+          "research_tests": "ON",
+          "build_type": "Release",
+          "jobs": 4
+        },
+        "source_sha": "0e4d578b0b3bd1acf99f3b30a05cfda5d0d47e8d",
+        "mfem_pin": "d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec",
+        "result_json": "/tmp/igrlab-consolidation-tools/cpu-hdg-off-final/result.json",
+        "result_sha256": "8c26edeef17461c6ddb876a0bd261277b0e6dfbdac0613a4558fe2162b28e998",
+        "logs_directory": "/tmp/igrlab-consolidation-tools/cpu-hdg-off-final"
+      },
+      {
+        "name": "cuda-hdg-on-final",
+        "selected_tests_passed": 31,
+        "selected_tests_total": 31,
+        "status": "passed",
+        "configuration": {
+          "mode": "cuda-sm120",
+          "hdg_runtime": "ON",
+          "research_tests": "OFF",
+          "build_type": "Release",
+          "jobs": 2,
+          "dependency_arch": "120",
+          "mfem_arch": "80-virtual",
+          "app_arch": "120",
+          "ctest_parallel": 1,
+          "gpu_locks": [
+            "/tmp/dg-igr-gpu0.lock",
+            "/tmp/dg_igr-sm120.lock"
+          ]
+        },
+        "source_sha": "0e4d578b0b3bd1acf99f3b30a05cfda5d0d47e8d",
+        "mfem_pin": "d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec",
+        "result_json": "/tmp/igrlab-consolidation-tools/cuda-hdg-on-final/result.json",
+        "result_sha256": "95127e55d5c45a7c7a252cdef897f3392595f9d5c2f68a247f01ccbd3c706c3c",
+        "logs_directory": "/tmp/igrlab-consolidation-tools/cuda-hdg-on-final"
+      },
+      {
+        "name": "cuda-hdg-off-final",
+        "selected_tests_passed": 18,
+        "selected_tests_total": 18,
+        "status": "passed",
+        "configuration": {
+          "mode": "cuda-sm120",
+          "hdg_runtime": "OFF",
+          "research_tests": "OFF",
+          "build_type": "Release",
+          "jobs": 2,
+          "dependency_arch": "120",
+          "mfem_arch": "80-virtual",
+          "app_arch": "120",
+          "ctest_parallel": 1
+        },
+        "source_sha": "0e4d578b0b3bd1acf99f3b30a05cfda5d0d47e8d",
+        "mfem_pin": "d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec",
+        "result_json": "/tmp/igrlab-consolidation-tools/cuda-hdg-off-final/result.json",
+        "result_sha256": "a1e73f92533f7fae28840e3b10083213cb0a183146b6fa6d703bcb8328cf0be7",
+        "logs_directory": "/tmp/igrlab-consolidation-tools/cuda-hdg-off-final"
+      }
+    ],
+    "scope": "Selected canonical CPU/CUDA suites on current source, not all registered tests or historical campaigns.",
+    "cuda_hdg_off_exclusion": "Screened tensor patch test belongs to opted-in HDG subdirectory and is absent with HDG OFF.",
+    "cuda_modal_memcheck": {
+      "status": "passed",
+      "errors": 0,
+      "options": [
+        "--tool",
+        "memcheck",
+        "--report-api-errors",
+        "no",
+        "--error-exitcode",
+        "99"
+      ],
+      "api_probe_messages_excluded": true,
+      "device_memory_checks_enabled": true,
+      "result_json": "/tmp/igrlab-consolidation-tools/modal-cuda-memcheck-result.json",
+      "source_sha": "0e4d578b0b3bd1acf99f3b30a05cfda5d0d47e8d",
+      "result_sha256": "754875ba3a14e75208a3a80086ab9bb85fd3764a2113e8f0ceb4777cf398295e"
+    },
+    "bounded_m16_application": {
+      "status": "passed",
+      "source_sha": "0e4d578b0b3bd1acf99f3b30a05cfda5d0d47e8d",
+      "result_json": "/tmp/igrlab-consolidation-backends/m16-application/current-assembled-L2/summary.json",
+      "result_sha256": "06cfeff2defe7ed172b613760843cb42c88052b9fabee82e335726bbdd0c302d",
+      "configuration": "Canonical-built CPU Release profile, HDG ON, research OFF; p3 DGSEM shared solver on 3x3 affine periodic quadrilateral mesh; central volume, Rusanov surface, no positivity limiter; active IGR wave; L2/BrokenL2 assembled SIPG closure (coefficient QFunctions and PA explicitly disabled) every RK3SSP stage; C_alpha=.01 local alpha; rates 0 / 80000; dt=2^-20, tf=128dt, save every64dt. Existing runtime only; no app capture/source changes.",
+      "claim_scope": "Bounded current-source assembled L2/BrokenL2 DGSEM pair; original 1D p39 fine-step study and universal accuracy claims not asserted."
+    },
+    "pr37_communicator_gate": {
+      "status": "passed",
+      "tests": [
+        "dg_igr_bc_tests",
+        "dg_igr_case_context_compile"
+      ],
+      "evidence": "/tmp/igrlab-consolidation-tools/cpu-hdg-on-final/LastTest.log",
+      "assertion": "CaseContext communicator is the owned mesh communicator",
+      "source_sha": "0e4d578b0b3bd1acf99f3b30a05cfda5d0d47e8d"
+    },
+    "pr38_zero_owned_rank_gate": {
+      "status": "passed",
+      "test": "dg_igr_hdg_main_backend_collective_projection_rejected_rank2",
+      "evidence": "/tmp/igrlab-consolidation-tools/cpu-hdg-on-final/LastTest.log",
+      "source_sha": "0e4d578b0b3bd1acf99f3b30a05cfda5d0d47e8d"
+    },
+    "validation_summary": "/tmp/igrlab-consolidation-tools/validation.md"
+  },
+  "execution_guards": [
+    "Explicit user approval of concrete final candidate, exact deletion/closure lists, and worktree removals",
+    "Re-read every local/remote ref immediately before mutation; stop on expected-SHA mismatch",
+    "Use expected-old-SHA local deletion and per-ref expected-SHA remote lease guards",
+    "Never delete refs attached to retained/active worktrees",
+    "Never alter retained primary/main/dev/consolidation refs or six archive refs in this batch",
+    "Preserve both stashes until separate explicit review",
+    "Do not rename repository/default branch/checkout or publish/merge as part of this batch",
+    "No primary research/output cleanup in this proposal; root handles its separate concrete artifact disposition",
+    "Explicitly disclose and obtain acknowledgment of any historical reflog missing-object limitation; never claim all old history is restorable from exact raw bytes alone."
+  ],
+  "experiment_import_decision": "No selected imports among 18 unmatched experimental patches; archive with exact source evidence and preserve 12 experiment refs in this batch.",
+  "supporting_files": [
+    "/tmp/igrlab-consolidation-git/experiment_review.md",
+    "/tmp/igrlab-consolidation-git/experiment_review.json",
+    "/tmp/igrlab-consolidation-git/branch_disposition.md",
+    "/tmp/igrlab-consolidation-git/branch_analysis.json",
+    "/tmp/igrlab-consolidation-git/cleanup_worktree_states.json",
+    "/tmp/igrlab-consolidation-git/cleanup_preflight.py",
+    "/tmp/igrlab-consolidation-git/cleanup_preflight_result.json",
+    "/tmp/igrlab-consolidation-git/cleanup_preflight_summary.json",
+    "/tmp/igrlab-consolidation-git/preflight_utility_selfcheck.json",
+    "/tmp/igrlab-consolidation-git/cleanup_restore_proof_check.json",
+    "/tmp/igrlab-consolidation-git/object_repair_plan.md",
+    "/tmp/igrlab-consolidation-git/object_repair_preflight.py",
+    "/tmp/igrlab-consolidation-git/object_repair_preflight_result.json",
+    "/tmp/igrlab-consolidation-git/post_repair_physical_preservation.json",
+    "/tmp/igrlab-consolidation-git/post_repair_object_guard_check.json"
+  ],
+  "proposed_execution_order": [
+    "Complete archive member/checksum verification and successful restore demonstration.",
+    "Finalize current candidate validation and obtain explicit approval of the exact cleanup/closure batch.",
+    "Refresh all expected local/remote SHA and worktree-state guards; stop/review mismatches.",
+    "Close PRs #37 and #38 as superseded before deleting their head/base remote refs, with retained candidate and current gate evidence.",
+    "Remove the three old registered worktrees through Git after restoration/state/writer checks.",
+    "Delete the 39 approved local refs with expected-old-SHA guards.",
+    "Delete the 61 approved remote refs with per-ref expected-SHA leases, rechecking retained/default refs.",
+    "Record action results and preserve recovery archives, retained refs/stashes, and unresolved experiment refs."
+  ],
+  "repository_root": "/home/jarias9/projects/dg_igr_miniapp",
+  "candidate_worktree": "/home/jarias9/.codex/worktrees/igrlab-consolidation/dg_igr_miniapp",
+  "current_candidate_sha": "0e4d578b0b3bd1acf99f3b30a05cfda5d0d47e8d",
+  "source_review_note": "Ancestry/patch-equivalence and 18 unmatched experiment classifications remain pinned to 0a34f84. Numerical-source snapshot 0e4d578 includes authorized validation repairs; canonical CPU/GPU retests are pending root results.",
+  "preserved_worktree_guards": [
+    {
+      "path": "/home/jarias9/projects/dg_igr_miniapp",
+      "label": "primary",
+      "head": "1c75579a94bca0d067aedd44c26aff13c5831b26",
+      "branch_ref": "refs/heads/codex/tensor-precision-investigation",
+      "tracked_dirty_count": 67,
+      "tracked_status_counts": {
+        " M": 67
+      },
+      "untracked_file_count": 31425,
+      "ignored_file_count": 40030,
+      "status_porcelain_z_sha256": "bcf11276eca441fb28a5c737054a9f7971806ee209ea95d34f5135bc1faa9bb5",
+      "unstaged_binary_patch_sha256": "f60848e707f001293d55b119b500fdaa14e32f17ff7942791725502ad9d64f33",
+      "staged_binary_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "untracked_paths_sha256": "71cfb89c140b496ab480001389a2f7193579f8b83f1a21d5beb676be36545786",
+      "ignored_paths_sha256": "afe8de3df0afa545a44192d65a546bc265e4fab05166ddbd5cef61eb4ce18133",
+      "untracked_content_sha256": "d794986675f3ec9a8500f9ba256f912f29664298d968f2ae9107f4dfa537717e",
+      "ignored_content_sha256": "f5b07797b307a603c246559c3c5eccb1143672488bc1345b67f311effe371b2e",
+      "source_manifest": "/home/jarias9/archives/igrlab/consolidation-20261010/primary.manifest.json",
+      "source_manifest_sha256": "e759a24086d47cc882740f44c66b4d551760e0459a01fbeee72d885bccce5990",
+      "archived_metadata_matches": {
+        "status.z": true,
+        "unstaged.patch": true,
+        "staged.patch": true
+      },
+      "archive_content_match": {
+        "matched": true,
+        "files_checked": 72102,
+        "bytes_checked": 34804970073,
+        "mismatches": []
+      }
+    },
+    {
+      "path": "/home/jarias9/.codex/worktrees/cigmo-overnight/dg_igr_miniapp",
+      "label": "cigmo-overnight",
+      "head": "06c3f0d1cd7393c5fa3bfdcb5b518842cbb22731",
+      "branch_ref": null,
+      "tracked_dirty_count": 0,
+      "tracked_status_counts": {},
+      "untracked_file_count": 0,
+      "ignored_file_count": 0,
+      "status_porcelain_z_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "unstaged_binary_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "staged_binary_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "untracked_paths_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "ignored_paths_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "untracked_content_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "ignored_content_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "source_manifest": "/home/jarias9/archives/igrlab/consolidation-20261010/cigmo-overnight.manifest.json",
+      "source_manifest_sha256": "74685af2875cf5a67e4183a6a010b8a390913ff9c988d0d6a5d91212f1faf961",
+      "archived_metadata_matches": {
+        "status.z": true,
+        "unstaged.patch": true,
+        "staged.patch": true
+      },
+      "archive_content_match": {
+        "matched": true,
+        "files_checked": 614,
+        "bytes_checked": 17391121,
+        "mismatches": []
+      }
+    },
+    {
+      "path": "/home/jarias9/.codex/worktrees/pace-a100/dg_igr_miniapp",
+      "label": "pace-a100",
+      "head": "06c3f0d1cd7393c5fa3bfdcb5b518842cbb22731",
+      "branch_ref": null,
+      "tracked_dirty_count": 38,
+      "tracked_status_counts": {
+        " M": 35,
+        " A": 3
+      },
+      "untracked_file_count": 3,
+      "ignored_file_count": 0,
+      "status_porcelain_z_sha256": "8035aa5b53a9154fa5d602a884c20b30ceb70e722edb734f65f9d7f14b156485",
+      "unstaged_binary_patch_sha256": "a70f0c12c99f0f9b9699a264df3b5efbe78fa356864978155bc4646c4e41a8ef",
+      "staged_binary_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "untracked_paths_sha256": "6774628b2f191bb8eb76017a525a725553be02a986bfa0c5658818ea008c633f",
+      "ignored_paths_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "untracked_content_sha256": "cad2029065adc3c9081d410fe186bbe5b3b81821e596c274c25749857e6a218f",
+      "ignored_content_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "source_manifest": "/home/jarias9/archives/igrlab/consolidation-20261010/pace-a100.manifest.json",
+      "source_manifest_sha256": "217dfcf29c006df84d4663de4549b1115b713b22fb09c8ae01c9a5098743937b",
+      "archived_metadata_matches": {
+        "status.z": true,
+        "unstaged.patch": true,
+        "staged.patch": true
+      },
+      "archive_content_match": {
+        "matched": true,
+        "files_checked": 620,
+        "bytes_checked": 17472503,
+        "mismatches": []
+      }
+    },
+    {
+      "path": "/home/jarias9/.codex/worktrees/sedov-fp32-comparison/dg_igr_miniapp",
+      "label": "sedov-fp32-comparison",
+      "head": "06c3f0d1cd7393c5fa3bfdcb5b518842cbb22731",
+      "branch_ref": null,
+      "tracked_dirty_count": 6,
+      "tracked_status_counts": {
+        " M": 6
+      },
+      "untracked_file_count": 0,
+      "ignored_file_count": 0,
+      "status_porcelain_z_sha256": "1aae2016cc9194defb37ef53868359906d2058593d7acbb63bf44d1d5419b0ca",
+      "unstaged_binary_patch_sha256": "f08f376adb105e4986c91142d34298db5fcb86f1976b0c16c11df3f8197d0734",
+      "staged_binary_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "untracked_paths_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "ignored_paths_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "untracked_content_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "ignored_content_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "source_manifest": "/home/jarias9/archives/igrlab/consolidation-20261010/sedov-fp32-comparison.manifest.json",
+      "source_manifest_sha256": "34a3b1678b42ddcae7a35f80357a0d874782578e86cf02e241d06bba82772ca2",
+      "archived_metadata_matches": {
+        "status.z": true,
+        "unstaged.patch": true,
+        "staged.patch": true
+      },
+      "archive_content_match": {
+        "matched": true,
+        "files_checked": 614,
+        "bytes_checked": 17415233,
+        "mismatches": []
+      }
+    }
+  ],
+  "primary_preservation": {
+    "path": "/home/jarias9/projects/dg_igr_miniapp",
+    "head": "1c75579a94bca0d067aedd44c26aff13c5831b26",
+    "proposal": "Retain primary checkout and all source/research/ignored content. No primary artifact retirement in this batch.",
+    "metadata_exactly_matches_archive": true,
+    "content_match": {
+      "matched": true,
+      "files_checked": 72102,
+      "bytes_checked": 34804970073,
+      "mismatches": []
+    },
+    "post_repair_exact_content_verified_at": "2026-10-10T22:40:20.872344+00:00",
+    "post_repair_evidence": "/tmp/igrlab-consolidation-git/post_repair_physical_preservation.json"
+  },
+  "preflight_utility": "/tmp/igrlab-consolidation-git/cleanup_preflight.py",
+  "preflight_run": "python3 /tmp/igrlab-consolidation-git/cleanup_preflight.py --json",
+  "proposed_actions": [
+    {
+      "action": "close superseded PR subject to approval and current gates",
+      "number": 37,
+      "expected_head_sha": "e75f3cbd9428b7b044b4400186336153909f1ac6",
+      "expected_base_sha": "72212509a2fdebb8f44eb3a72e39257866c40a01"
+    },
+    {
+      "action": "close superseded PR subject to approval and current gates",
+      "number": 38,
+      "expected_head_sha": "c5444f34bd4eb1d8cc59f70f8832109b1a031b41",
+      "expected_base_sha": "72212509a2fdebb8f44eb3a72e39257866c40a01"
+    },
+    {
+      "action": "remove registered worktree through Git after approval and recovery/state/writer gates",
+      "path": "/home/jarias9/.codex/worktrees/cigmo-overnight/dg_igr_miniapp",
+      "expected_head_sha": "06c3f0d1cd7393c5fa3bfdcb5b518842cbb22731"
+    },
+    {
+      "action": "remove registered worktree through Git after approval and recovery/state/writer gates",
+      "path": "/home/jarias9/.codex/worktrees/pace-a100/dg_igr_miniapp",
+      "expected_head_sha": "06c3f0d1cd7393c5fa3bfdcb5b518842cbb22731"
+    },
+    {
+      "action": "remove registered worktree through Git after approval and recovery/state/writer gates",
+      "path": "/home/jarias9/.codex/worktrees/sedov-fp32-comparison/dg_igr_miniapp",
+      "expected_head_sha": "06c3f0d1cd7393c5fa3bfdcb5b518842cbb22731"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/adaptive-dae-reusable-trace",
+      "expected_sha": "901c6f8bf6326b5bafb962bd48d8db9307a8872c"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-alignment-armijo-state-tests",
+      "expected_sha": "274cfe3ff81366be39301682da935c6090c176c7"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-alignment-policy-parameters",
+      "expected_sha": "73306e62eb0fc45d2fbfc7e45e238e96b8b5c826"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-case-context-v1",
+      "expected_sha": "e75f3cbd9428b7b044b4400186336153909f1ac6"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-generic-contract-v1",
+      "expected_sha": "c5444f34bd4eb1d8cc59f70f8832109b1a031b41"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-hash-strength-reduction",
+      "expected_sha": "e029eac85b1468885c4da0624b6387c6c9de20c1"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-igr-fieldsplit-v1",
+      "expected_sha": "0fda3a56e7c08811afd6377f586d8c9b15a4a9f8"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-igr-linear-policy-v1",
+      "expected_sha": "b2b54b9a59c292d679b0443fe70d508dfae6a8f9"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-igr-matrix-free-equilibrated-field-split",
+      "expected_sha": "c139d39547f0ed0ac2bea355885035093bf156f9"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-igr-matrix-free-stage2",
+      "expected_sha": "332dfaa992f1f46cf69a1fe1b6692be1a44e740c"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-igr-symmetric-field-split",
+      "expected_sha": "4a61c382b03ffce33eb44bb311e1cf92a5682dd9"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-igr-warp-field-split",
+      "expected_sha": "3f10eaf9667f38ca5287f8121b5025db560f52ed"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-native-cgs2-experiment",
+      "expected_sha": "b7e28434b63256dca5e909206fa08a344e52403f"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-native-schwarz-fp64",
+      "expected_sha": "9e8948f3dd77a82aa85ee9738d02e80f9f2ec004"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-native-trace-fixtures",
+      "expected_sha": "b379e3cebc1469420a6900236b2b12c1c09b442d"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-p123-cfl-refinement-tests",
+      "expected_sha": "0488918eb37924fb5c8b5d7f631a222a6bf06d03"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-paraview-output-v1",
+      "expected_sha": "b856c67e9a3491b77cc86fa1304df4517cff6efe"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-production-trace-policy",
+      "expected_sha": "a735c5bf221b1c593a97d2054a8f750a73c9e16f"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-schwarz-campaign-metadata",
+      "expected_sha": "77b7ae8b1f6f464b7dd6d2bd59075b33da48e4ed"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-tensor-assembly-fusion",
+      "expected_sha": "d8200a1ac403045e2694611bb3a4cc12e42af39a"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-tensor-blocked-local-v1",
+      "expected_sha": "d67afd2faa9b895d7deefaea1d1ad63d6ef2e76c"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-tensor-core-backend-v1",
+      "expected_sha": "df5f9c121400a4740e8bc8a4955a5c712af3a9b6"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-tensor-dmma-exact",
+      "expected_sha": "3307734ea4ae707e5cdc30b65bbd7d977d9adc9e"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-tensor-hash-fast",
+      "expected_sha": "ebe03fdb2ddcc55dc7b61859f4bb127e9ff3d54e"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-tensor-hash-jump",
+      "expected_sha": "8f90a2dc70c0910cbb12e7f693946a641e76556f"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-tensor-igr-cfl-allocation",
+      "expected_sha": "d000cc99131ff7c65d98ac772d8f3e9ab3618b49"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-tensor-native-trace-v1",
+      "expected_sha": "7f6f9e753750a287e4dd178485b7d5161cddba6d"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-tensor-policy-ablation-v2",
+      "expected_sha": "1c79c81fe4107717a490e948e9dc00e9d82dda1e"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-tensor-recovery-fusion",
+      "expected_sha": "1af2069819932c41a285dddc31a5d7264986a38c"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-tensor-sass-profile-evidence",
+      "expected_sha": "c0fe0eb58161ed9b318e66e8cd70d38b3d9c22da"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-tensor-trace-routing-tests",
+      "expected_sha": "80982ba8cfa6b7ae8a1a1dd7cb19f6edffc6de00"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-tensor-volume-conventional-q12-parity",
+      "expected_sha": "04d543128ab338fc62aae34e0d34afb1eda25ad9"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-time-to-solution-v1",
+      "expected_sha": "c9213c25071d4e9c3fe9e1ebd2b6469c0fd30606"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-zhang-shu-limiter",
+      "expected_sha": "eae4e3f77484ff046099f57a50628c352fc6ef3a"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/igr-ilu-refresh-f646a03",
+      "expected_sha": "29e6a9ba2305dc754c5293379037f5f57544208d"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/igr-quadrature-equivalence-v1",
+      "expected_sha": "8f252494c6db935789c7eb7b5cb62e362dfdffd0"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/qualification-tolerance-parameterization",
+      "expected_sha": "dc67aa69a2279ece53b611b15fd917f6f638bcd9"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/shock-regime-explicit-imex",
+      "expected_sha": "1ec72eb7ca29806055b8bbf72c8bdd9aadae32b8"
+    },
+    {
+      "action": "retire approved local ref with expected-SHA guard",
+      "refname": "refs/heads/codex/tensor-dg-igr-breakthrough",
+      "expected_sha": "f95ee67e4bfdc62ccfc50890400f8b843de53797"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/adaptive-dae-reusable-trace",
+      "expected_sha": "eae4e3f77484ff046099f57a50628c352fc6ef3a"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-case-context-v1",
+      "expected_sha": "e75f3cbd9428b7b044b4400186336153909f1ac6"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-cuda-borrowed-llf-v1",
+      "expected_sha": "18bec20e1b189127dfb1148f8c7bdd538c081e54"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-cuda-igr-extension-v1",
+      "expected_sha": "1086eff358da003ecf455d578271afd065981d55"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-cuda-numerical-alignment-fp64-perf-v3",
+      "expected_sha": "55d9a33e689be5a4087d6d3afde84102ea7e4870"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-generic-boundary-lowering-v1",
+      "expected_sha": "95c65b558a48e80a21511caf3324efb8f2ee83bc"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-generic-contract-v1",
+      "expected_sha": "c5444f34bd4eb1d8cc59f70f8832109b1a031b41"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-generic-cpu-engine-v1",
+      "expected_sha": "da077f7ebd78177821c4cb84f81c5b8257d8dd53"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-generic-cuda-data-v1",
+      "expected_sha": "69a1f35583f23d87c2d6a9ac3852b1dc04f1bb7c"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-generic-cuda-main-adapter-v1",
+      "expected_sha": "fd896f9126f151f7175d27ce4eaddaedd62008c6"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-generic-cuda-session-v2",
+      "expected_sha": "fdb1a2b9a831d6845f8778b826e233cefa3a4fdd"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-generic-cuda-topology-v1",
+      "expected_sha": "e970222e0cb3d411c3356b3b2db49ab485c70ad8"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-igr-extension-boundary-v1",
+      "expected_sha": "cdc1dfaacb2cc9f2c6a213b54f17b722e188813e"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-igr-symmetric-field-split",
+      "expected_sha": "4a61c382b03ffce33eb44bb311e1cf92a5682dd9"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-main-case-session-contract-v2",
+      "expected_sha": "c4d1a5d3deaf8197f042822e0f070fac0fc260a9"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-main-config-adapter-v1",
+      "expected_sha": "6fe286e751014d28b6b783f8283b15a1a2c383c0"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-main-cpu-mfem-partition-v1",
+      "expected_sha": "f5c7ab42a8808df9e9323a5c5ddf331b7f84cf96"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-main-cpu-rank2-adapter-v1",
+      "expected_sha": "9227b359a143d184172cade27876dad97679204e"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-main-cpu-serial-adapter-v1",
+      "expected_sha": "fd6d178bb508db8c64b00b697b556b9902f44a63"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-main-cuda-adapter-v1",
+      "expected_sha": "85ecd8c6dba1ec77b9f1c7bcc88e5a00418432dd"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-paraview-output-v1",
+      "expected_sha": "b856c67e9a3491b77cc86fa1304df4517cff6efe"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-rank2-build-output-layout",
+      "expected_sha": "f91dab85f61e136edfd91496030910bd70abe4ef"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-rank2-campaign-integration-seam",
+      "expected_sha": "6f4bf1f051a96411438fc41b29c91080e5495fe8"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-standalone-cpu-domain-v1",
+      "expected_sha": "972ad0f4ecf36fafd02fb31d909fcf703d313b61"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-standalone-cuda-domain-v1",
+      "expected_sha": "972ad0f4ecf36fafd02fb31d909fcf703d313b61"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-standalone-manifest-retirement-v1",
+      "expected_sha": "7fe32c7baa67f3ff1d7955f14ca351f01d85e87d"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-standalone-sc25-oracle-seam-v1",
+      "expected_sha": "e3fa7fe7e121ef1124c147b21912fd97acab7f74"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-standalone-shared-seam-v1",
+      "expected_sha": "924f8c96403d001998e21e083789292adf00105a"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-standalone-typed-dispatch-v1",
+      "expected_sha": "eb0a8e8aebed9a618a56c640fcd88e6efd9ab6fa"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-tensor-core-backend-v1",
+      "expected_sha": "df5f9c121400a4740e8bc8a4955a5c712af3a9b6"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-time-output-v1",
+      "expected_sha": "35c9e45ac036257e4c3761ec3c6694c5a1177f3d"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-time-to-solution-v1",
+      "expected_sha": "c9213c25071d4e9c3fe9e1ebd2b6469c0fd30606"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-time-validation-v2",
+      "expected_sha": "283d8ee7d573c225c40bd76490ce5a89535590c4"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-traced-igr-smooth-transition-cpu-rank2",
+      "expected_sha": "a393ba6920c07bd43e487d8d37d5561364605d29"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/hdg-traced-igr-smooth-transition-cuda-rank2",
+      "expected_sha": "c2c6f89f11bcc07e59bdadee812a321b7ec8c908"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/shock-regime-explicit-imex",
+      "expected_sha": "1ec72eb7ca29806055b8bbf72c8bdd9aadae32b8"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/codex/tensor-dg-igr-breakthrough",
+      "expected_sha": "f95ee67e4bfdc62ccfc50890400f8b843de53797"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/contract/hdg-euler-device-build-seam",
+      "expected_sha": "0d40f33f00ab0a69e4ed6f53aacbd9ae6953920e"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/contract/hdg-run-lifecycle-w8",
+      "expected_sha": "ab2e08b3c4e6a9755983abd61fb53af8faf2dda9"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/contract/hdg-two-phase-w8a",
+      "expected_sha": "20dd44058e04156cce8551c3e310f48d667cc96e"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/feature/hdg-euler-device-full",
+      "expected_sha": "f217e46ce3a851abcdcd7eaa645eb3d63b832ef0"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/feature/hdg-euler-device-v2",
+      "expected_sha": "ce91f26936808544afe8346f873431d16f820865"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/feature/hdg-euler-mpi",
+      "expected_sha": "dbbd35faa0e233df394a9c67a05a1fd395a2e004"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/feature/hdg-euler-mpi-device",
+      "expected_sha": "f53fc4d55e698eace0939da599a5b41f19a51b9c"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/feature/hdg-trace-dg-mpi",
+      "expected_sha": "6f6e9c359d7bb9f21e82af6d25dc15ae8d841f2a"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/gpu",
+      "expected_sha": "7b7a8e2c8c813672f6e20d005860c7b36765865a"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/integration/hdg-cpu-w5c",
+      "expected_sha": "4f70d39ac23f9e35b0953a49d20bed86f459fb96"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/integration/hdg-functional-gpu-w7",
+      "expected_sha": "ac271a038c9d26648fce8f2ebf6afb0113a92495"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/integration/hdg-generic-backend-v1",
+      "expected_sha": "4f7e763dc774ba53a2e2ff4888c2a7ea65294a61"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/integration/hdg-generic-cpu-reference-closure-v1",
+      "expected_sha": "4acfa881dd21d35c9d3e6e8b76cd382c1c23c30c"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/integration/hdg-generic-cuda-main-v1",
+      "expected_sha": "10c5a6efa92a6ceb667f01e11602855126d1e6cb"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/integration/hdg-gpu-w6",
+      "expected_sha": "88cd3e218610e8acadfe9d7a30484ae4c04ee581"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/integration/hdg-main-application-v1",
+      "expected_sha": "8b5df469e427642c0c15f485720ca3a2e58d2982"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/integration/hdg-main-backend-v2",
+      "expected_sha": "fdb1a2b9a831d6845f8778b826e233cefa3a4fdd"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/integration/hdg-runtime-igr-w8",
+      "expected_sha": "b0e45bfc5b789879d4f19a1d04bb96e949c38261"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/integration/hdg-runtime-w8a-shared",
+      "expected_sha": "7f0812cfc96c6d0288ed1e6126ba2cf223af64ab"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/integration/hdg-standalone-closure-v1",
+      "expected_sha": "972ad0f4ecf36fafd02fb31d909fcf703d313b61"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/integration/hdg-traced-igr-smooth-transition-rank2-v4",
+      "expected_sha": "db3da20e6ad4e6bf635efd91960b751438c1258e"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/integration/hdg-w5c-device-sm120",
+      "expected_sha": "c53fa8101c27d81e4043d9484af2ead50c4ab4fb"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/new_dgsem",
+      "expected_sha": "4a149ac453908e87d8fefd8ba9a75f341accd635"
+    },
+    {
+      "action": "retire approved remote ref with expected-SHA guard",
+      "refname": "refs/heads/recovery/hdg-euler-cpu-03c-continuous-recovery",
+      "expected_sha": "51b669f5e18148468d200d9e3afc2bea461346c6"
+    }
+  ],
+  "preflight_snapshot_summary": {
+    "captured_at": "2026-10-10T22:22:19.901488+00:00",
+    "all_archive_byte_checksums_pass": true,
+    "all_archive_metadata_guards_pass": true,
+    "all_original_worktrees_exactly_match_archive": true,
+    "all_retirement_retained_ref_stash_and_pr_guards_pass": true,
+    "pending_restore_proof": false,
+    "root_validation_results": "Passed selected CPU HDG ON 68/68, CPU HDG OFF research ON 18/18, CUDA HDG ON 31/31, CUDA HDG OFF 18/18; modal memcheck 0 errors; bounded current assembled M16 pair passed.",
+    "later_standalone_restore_proof_verification": "/tmp/igrlab-consolidation-git/cleanup_restore_proof_check.json",
+    "comprehensive_final_preflight": "Pending final docs-only HEAD signal; source validation passed. External/durable approval manifest and full preflight will be refreshed to final HEAD.",
+    "post_repair_full_preservation_check": "/tmp/igrlab-consolidation-git/post_repair_physical_preservation.json",
+    "post_repair_full_preservation_pass": true
+  },
+  "candidate_source_logic_sha": "0e4d578b0b3bd1acf99f3b30a05cfda5d0d47e8d",
+  "preflight_utility_selfcheck": "/tmp/igrlab-consolidation-git/preflight_utility_selfcheck.json",
+  "candidate_sha_tracking_status": "Numerical-source review snapshot 0e4d578 with all required selected checks passed. Final docs-only HEAD is intentionally pending root signal and will be recorded externally.",
+  "snapshot_vs_final_approval": {
+    "committed_snapshot_sha": "0e4d578b0b3bd1acf99f3b30a05cfda5d0d47e8d",
+    "committed_snapshot_scope": "Reviewed numerical source and unchanged 100 retirement guards/classifications; verified recovery/preservation and passed current-source validation. Later docs-only final HEAD recorded externally.",
+    "final_docs_only_head": "pending root signal; external manifest only",
+    "external_approval_manifest": "/tmp/igrlab-consolidation-git/cleanup_proposal.json",
+    "self_reference_avoided": true
+  }
+}
