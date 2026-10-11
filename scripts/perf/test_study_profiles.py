@@ -232,6 +232,8 @@ class CaptureTests(unittest.TestCase):
             ncu = next(argv for label, argv, timeout in runner.commands if label == 'profiles/ncu')
             self.assertEqual(ncu[ncu.index('--profile-from-start') + 1], 'off')
             self.assertEqual(ncu[ncu.index('--launch-count') + 1], '2')
+            self.assertEqual(ncu[ncu.index('--kernel-name') + 1], 'regex:PackedInverseMassKernel')
+            self.assertNotIn('--kernel-id', ncu)
             self.assertIn(profiles.DMMA, ncu[ncu.index('--metrics') + 1])
             self.assertTrue(all(timeout <= 240 for label, argv, timeout in runner.commands))
             self.assertEqual(len(value['application_logs']), 2)
@@ -254,10 +256,40 @@ class CaptureTests(unittest.TestCase):
             with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU):
                 value = profiles.capture(case, ['app', '--profile-measured-step', '0'], runner, directory, GPU)
             ncu = next(argv for label, argv, timeout in runner.commands if label == 'profiles/ncu')
-            self.assertEqual(ncu[ncu.index('--kernel-id') + 1], ':::1')
+            self.assertEqual(ncu[ncu.index('--kernel-id') + 1],
+                             '::regex:' + case['profile']['kernel_regex'] + ':1')
+            self.assertNotIn('--kernel-name', ncu)
             self.assertNotIn('--launch-count', ncu)
             self.assertNotIn('--launch-skip', ncu)
             self.assertEqual(value['captures']['ncu']['metrics']['observed_kernel_groups'], ['face', 'mass'])
+
+    def test_single_selector_preserves_namespaces_and_regex_without_weaker_import_filter(self):
+        class NamespacedRunner(FakeRunner):
+            def run(self, label, argv, **kwargs):
+                directory = super().run(label, argv, **kwargs)
+                if label.endswith('ncu-import'):
+                    rows = list(csv.reader(io.StringIO(wide_complete())))
+                    rows[-2][2] = 'void BorrowedCondenseKernel(DeviceView, MeshShape)'
+                    rows[-1][2] = 'void cusparse::spsm_v2_kernel<int, double>(int, double*)'
+                    (directory / 'stdout.log').write_text(csv_text(rows))
+                return directory
+        regex = '.*(?:BorrowedCondenseKernel|cusparse::spsm_v2_kernel).*'
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, previous, directory = self.setup_capture(temporary)
+            runner = NamespacedRunner(previous.output)
+            case = {'adapter': 'hdg', 'profile': {'kernel_regex': regex, 'launch_count': 2,
+                'selection': 'first-per-kernel', 'kernel_groups': {
+                    'condensation': 'BorrowedCondenseKernel', 'triangular': 'cusparse::spsm_v2_kernel'}}}
+            with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU):
+                result = profiles.capture(case, ['app', '--profile-measured-step', '0'], runner, directory, GPU)
+            ncu = next(argv for label, argv, timeout in runner.commands if label == 'profiles/ncu')
+            self.assertEqual(ncu[ncu.index('--kernel-id') + 1], '::regex:' + regex + ':1')
+            self.assertNotIn('--kernel-name', ncu)
+            self.assertEqual(result['captures']['ncu']['metrics']['observed_kernel_groups'],
+                             ['condensation', 'triangular'])
+        text = long_csv([['1', 'void UnrequestedZeroKernel()', profiles.DURATION, 'us', '1']])
+        with self.assertRaisesRegex(profiles.ProfileError, r'launch=1, kernel=.*UnrequestedZeroKernel'):
+            profiles.parse_ncu(text, 'PackedInverseMassKernel')
 
     def test_all_ncu_commands_disable_ambient_configuration(self):
         with tempfile.TemporaryDirectory() as temporary:

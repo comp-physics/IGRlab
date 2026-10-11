@@ -189,7 +189,8 @@ def parse_ncu(text, kernel_regex, maximum_launches=3, metric_limit=120):
     format_name, observations = _ncu_observations(text)
     seen, metrics = {}, {}
     for launch, kernel, name, unit, raw in observations:
-        require(pattern.search(kernel) is not None, 'native NCU kernel outside requested filter')
+        require(pattern.search(kernel) is not None,
+                f'native NCU kernel outside requested filter: launch={launch}, kernel={kernel[:512]!r}')
         key = launch, kernel, name
         kind = metric_category(name)
         # Unknown/textual metrics stay only in the native CSV, but duplicate
@@ -434,12 +435,14 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
             require(not any(Path(str(prefix) + suffix).exists() for suffix in ('.ncu-rep', '.ncu-repz')),
                     'native NCU report already exists')
             command = [*tool_command, '--target-processes', 'application-only', '--profile-from-start',
-                'off' if adapter == 'hdg' else 'on', '--kernel-name-base', 'demangled',
-                '--kernel-name', 'regex:' + regex]
+                'off' if adapter == 'hdg' else 'on', '--kernel-name-base', 'demangled']
             if selection == 'first-per-kernel':
-                command += ['--kernel-id', ':::1']
+                # Express both constraints in the documented single selector;
+                # an empty-name kernel-id must not replace the name filter.
+                command += ['--kernel-id', '::regex:' + regex + ':1']
             else:
-                command += ['--launch-skip', str(skip), '--launch-count', str(count)]
+                command += ['--kernel-name', 'regex:' + regex,
+                            '--launch-skip', str(skip), '--launch-count', str(count)]
             command += ['--rename-kernels', 'off', '--metrics', ','.join(queried)]
             command += [argument for section in selected for argument in ('--section', section)]
             log = run('ncu', [*command, '--export', str(prefix), *argv])
