@@ -83,6 +83,56 @@ tests continue to control any subprocess launches themselves. The three VTK
 restart/lifecycle script families receive a PACE-only opt-in to use the selected
 MPI launcher for one rank; other configurations retain their direct launches.
 
+For interactive CUDA debugging, first submit compilation of the CUDA profile
+to CPU compute. Export the chosen paths so they remain available in the later
+interactive shell:
+
+```bash
+export SOURCE_ROOT=/absolute/path/to/IGRlab
+export SITE_ROOT=/absolute/scratch/igrlab-site
+export SPACK_TOOL_ROOT=/absolute/path/to/spack/core
+export OUTPUT_ROOT=/absolute/scratch/igrlab-build
+export MFEM_ROOT=/absolute/scratch/igrlab-mfem-sm80
+
+"$SOURCE_ROOT/build.sh" --site pace --a100 --hdg-runtime --submit --no-tests \
+  --site-root "$SITE_ROOT" --spack-root "$SPACK_TOOL_ROOT" \
+  --output-root "$OUTPUT_ROOT" --mfem-output-root "$MFEM_ROOT" --no-clean
+```
+
+After that build job completes successfully, request one A100, one rank,
+eight CPUs and 48 GiB for a bounded interactive session:
+
+```bash
+srun --account=gts-sbryngelson3 --qos=embers --partition=gpu-a100 \
+  --nodes=1 --ntasks=1 --cpus-per-task=8 --mem=48G --gres=gpu:a100:1 \
+  --time=00:30:00 --mpi=none --pty bash -l
+```
+
+`--mpi=none` starts a shell without Slurm's MPI plugin; the shell is not an MPI
+application. This avoids passing a shell-step PMIx context to later tests.
+CTest launches MPI tests through the selected site's `mpiexec`, which supplies
+their MPI process manager within the allocation. See
+[Slurm's MPI option](https://slurm.schedmd.com/srun.html#OPT_mpi) and
+[Open MPI's Slurm launch guidance](https://docs.open-mpi.org/en/v5.0.9/launching-apps/slurm.html).
+
+Inside that allocated shell, run a focused selection through the saved build
+receipt:
+
+```bash
+"$SOURCE_ROOT/build.sh" --site pace --a100 --hdg-runtime --tests-only --no-clean \
+  --site-root "$SITE_ROOT" --spack-root "$SPACK_TOOL_ROOT" \
+  --output-root "$OUTPUT_ROOT" --mfem-output-root "$MFEM_ROOT" \
+  --test-regex '^igrlab_numerical_(conservation_cpu|conservation_cuda|backend_parity_cuda)$' \
+  --test-label '^numerical-smoke$'
+```
+
+Keep the source, build flags and root paths identical to the completed build;
+repeat any additional feature flags, such as `--nvtx-profile`. Compilation stays
+in the CPU submission, while the GPU shell performs run-only validation. Choose
+a longer allocation for larger convergence or HDG alignment selections. An
+interactive `srun` step may expose `SLURM_STEP_GPUS` without `SLURM_JOB_GPUS`;
+the driver accepts that assignment and retains Slurm's CUDA-visible mapping.
+
 Inspect a plan without submitting or changing output directories:
 
 ```bash

@@ -8,6 +8,12 @@ study_plan=$1 study_stage=$2 study_executor=$3
    ${SLURM_NTASKS:-} == 1 && -n ${SLURM_JOB_GPUS:-${SLURM_STEP_GPUS:-}} ]] || {
   echo 'GPU study requires one rank in a free PACE embers A100 allocation' >&2; exit 2;
 }
+for study_mpi_variable in PMIX_NAMESPACE PMIX_RANK PMI_RANK PMI_SIZE; do
+  [[ -z ${!study_mpi_variable:-} ]] || {
+    echo "GPU study direct launches cannot inherit $study_mpi_variable; start the interactive shell with srun --mpi=none --pty bash -l" >&2
+    exit 2
+  }
+done
 [[ $(hostname -f) != *login* ]] || { echo 'GPU studies require a compute node' >&2; exit 2; }
 python3 "$study_executor/gpu_study.py" verify --run-dir "$(dirname -- "$study_plan")"
 mapfile -t study_paths < <(python3 - "$study_plan" <<'PY'

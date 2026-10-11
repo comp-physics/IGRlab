@@ -199,6 +199,35 @@ plan unless explicitly overridden, including when its jobs were later shortened
 through the scheduler. The old run remains unchanged; partial submission receipts
 belong to the new run and prevent an unnoticed duplicate retry.
 
+For interactive debugging, prepare the retry on the PACE login node without
+submitting workers:
+
+```bash
+./perf.sh retry --from-run /absolute/scratch/studies/old-run \
+  --run-dir /absolute/scratch/studies/interactive-retry \
+  --prepare-only --timings-time 00:15:00 --profiles-time 00:30:00
+```
+
+This freezes the current executor and preserves the old run, source/build
+identities and completed correctness results. In one free `gts-sbryngelson3` /
+`embers` allocation on `gpu-a100`, with one rank and one allocated A100, invoke
+the prepared run's frozen wrapper directly. Allow enough allocation time for
+both stages; the workers still enforce their saved budgets and Slurm deadline.
+Run profiles after timings succeeds:
+
+```bash
+run_dir=/absolute/scratch/studies/interactive-retry
+bash "$run_dir/executor/pace_runtime.sh" "$run_dir/plan.json" timings "$run_dir/executor"
+bash "$run_dir/executor/pace_runtime.sh" "$run_dir/plan.json" profiles "$run_dir/executor"
+```
+
+These commands submit no jobs. They use the same environment setup, allocation
+and GPU checks, completed correctness checks, live dependency admission,
+numerical/work gates and immutable attempt records as batch workers. Both stages
+collect fresh observations; profiler replay does not replace timing samples.
+Keep native captures and all trace processing on the compute node, retrieve only
+the compact `collect` export, and release the interactive allocation when finished.
+
 `plan.json` freezes the experiment, `admission.json` binds binaries, CMake/MFEM
 artifacts, Spack locks and loader libraries, and `state.json` retains attempts.
 `report.json` and `report.md` summarize accepted results. Logs, fields, native

@@ -510,6 +510,29 @@ print(json.dumps({'seconds': 10.0 if member == 'baseline' else 9.0,
                                         capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, expected, result.stderr)
 
+    def test_runtime_rejects_inherited_mpi_client_context_before_verification(self):
+        runtime = Path(study.__file__).with_name('pace_runtime.sh')
+        environment = {'PATH': os.defpath, 'SLURM_JOB_ID': '1', 'SLURM_STEP_GPUS': '5',
+                       'CUDA_VISIBLE_DEVICES': '0', 'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3',
+                       'SLURM_JOB_QOS': 'embers', 'SLURM_JOB_PARTITION': 'gpu-a100',
+                       'SLURM_NTASKS': '1'}
+        command = ['bash', '-c', 'hostname() { printf "compute\\n"; }; '
+                   'python3() { printf "verifier reached\\n"; exit 77; }; '
+                   'source "$1" plan timings executor', 'fixture', str(runtime)]
+        for variable, value in (('PMIX_NAMESPACE', 'inherited-client'), ('PMIX_RANK', '0'),
+                                ('PMI_RANK', '0'), ('PMI_SIZE', '1')):
+            with self.subTest(variable=variable):
+                result = subprocess.run(command, env={**environment, variable: value},
+                                        text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(variable, result.stderr)
+                self.assertIn('srun --mpi=none --pty bash -l', result.stderr)
+                self.assertNotIn('verifier reached', result.stdout)
+                self.assertNotIn(value, result.stderr)
+        result = subprocess.run(command, env=environment, text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 77)
+        self.assertIn('verifier reached', result.stdout)
+
     def test_correctness_jobs_are_required(self):
         self.state['builds'] = {m: {'validation_job_id': str(i + 1)} for i, m in enumerate(study.MEMBERS)}
         study.write_json(self.root / 'state.json', self.state)
