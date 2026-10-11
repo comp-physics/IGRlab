@@ -128,5 +128,40 @@ CPU build job `13957931` completed in 2m34s; native-SM80 HDG/NVTX build job
 `13957935` completed in 4m14s. Both used the free CPU queue. CPU validation job
 `13957934` passed all three selected tests: `igrlab_mpi_test_launcher`,
 `dg_igr_dg_operator_tests`, and `dg_igr_sigma_vtk_lifecycle_cpu`.
-The A100 result covers compilation and library binding checks; device execution
-requires the separate GPU validation allocation described above.
+The A100 build result covers compilation and library binding checks. Subsequent
+free-queue A100 job `13955960` passed all nine selected device correctness tests,
+including DG/DGSEM operators, ordinary/tensor HDG sessions and p3 extensions,
+p1/p3 CPU/CUDA numerical alignment, and the exact-face cylinder physical drift
+comparison. CPU timing job `13955959` passed five selected correctness tests.
+Both jobs completed their paired timing and separate physical-output runs on
+compute nodes. A later profiler-report filename check failed in the A100 timing
+harness after Nsight Compute successfully wrote a compressed `.ncu-repz` report;
+this did not require an application or dependency rebuild.
+
+For performance studies, use unprofiled solver or accepted-step elapsed time as
+the primary result. Retain independent paired runs, warmup, useful-work counts,
+iteration/retry counts, residual/error and physical-field gates, source and
+binary identities, compiler/dependency versions, rank/thread placement, and GPU
+identity. Define DOF or element updates explicitly when reporting throughput.
+
+On allocated PACE compute nodes, use Nsight Systems to attribute kernel,
+launch, synchronization and transfer costs, and inspect idle gaps in the native
+timeline. Use bounded Nsight Compute captures of changed and expensive kernels
+for theoretical/achieved occupancy, registers/shared-memory limits, grid waves,
+compute/memory throughput, memory traffic/cache behavior, scheduler issue
+activity, eligible warps, aggregate stall reasons and roofline inputs. Record
+unavailable branch/divergence or direct spilling counters as unavailable; local
+memory traffic alone does not establish register spilling. Interpret stalls
+alongside issue activity and weight kernel findings by their contribution to
+solver time. High occupancy alone is not a performance objective.
+
+Keep native traces and all trace processing on PACE compute nodes. Retrieve
+compact summaries and provenance only. Record profiler replay, cache and clock
+policies separately from normal solver timing, and retain GPU clock/power/thermal
+snapshots with their sampling limits. NVIDIA documents these distinctions in
+the [Nsight Compute profiling guide](https://docs.nvidia.com/nsight-compute/ProfilingGuide/)
+and [Nsight Systems guide](https://docs.nvidia.com/nsight-systems/UserGuide/index.html).
+CPU studies should also measure instructions per cycle, SIMD use, cache misses
+and memory bandwidth on allocated CPU nodes. Multi-rank communication, load
+imbalance and strong/weak scaling require separate workloads; the paired timing
+campaign above used one rank.
