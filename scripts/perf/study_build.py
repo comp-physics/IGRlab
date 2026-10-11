@@ -22,6 +22,14 @@ MFEM_ORIGIN = 'https://github.com/mfem/mfem.git'
 REQUIRED_FILES = ('build.sh', 'cmake/sites/pace.json', 'scripts/build/pace.sh')
 BUILD_ENV = {'IGRLAB_BUILD_TYPE': 'Release', 'OMP_NUM_THREADS': '1',
              'OPENBLAS_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1'}
+BUILD_FLAG_ENV = ('CFLAGS', 'CXXFLAGS', 'CPPFLAGS', 'LDFLAGS', 'CUDAFLAGS')
+# These files own MFEM configuration, dependency selection and admission. App
+# sources, workload selection and study/profiler implementation are excluded.
+MFEM_POLICY_FILES = ('build.sh', 'build_mfem_tpl.sh',
+                     'scripts/build/mfem_cache.sh',
+                     'scripts/build/check_dependency_bindings.py',
+                     'scripts/build/pace.sh', 'scripts/build/pace_manifest.py',
+                     'scripts/build/pace_discover.py', 'cmake/sites/pace.json')
 
 
 class StudyBuildError(ValueError):
@@ -300,6 +308,49 @@ def _validation_seconds(value: str) -> int:
     return seconds
 
 
+def _dependency_configuration(identity: dict[str, Any], site_root: Path,
+                              spack_root: Path, environment: dict[str, str]) -> dict[str, Any]:
+    """Select a cache; the canonical driver still proves the concrete ABI/hit.
+
+    A site root owns an immutable concrete graph and discovered externals. Its
+    lock may be created by the first queued build, so existence of that lock is
+    deliberately not a planning input. Actual lock, compiler and artifact
+    identities are checked by build.sh under the shared MFEM writer lock.
+    """
+    snapshot = Path(identity['source_snapshot'])
+    mfem = snapshot / MFEM_PATH
+    policy = {}
+    for name in MFEM_POLICY_FILES:
+        path = snapshot / name
+        if path.exists():
+            _no_symlink_ancestors(path)
+            _require(path.is_file(), f'MFEM policy input is not a regular file: {name}')
+            policy[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            policy[name] = None  # Historical drivers retain their own route.
+    tools = {}
+    for relative in ('bin/spack', 'lib/spack/spack/__init__.py'):
+        path = spack_root / relative
+        if path.exists():
+            _no_symlink_ancestors(path)
+            _require(path.is_file(), f'Spack tool identity is not a regular file: {path}')
+            tools[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            tools[relative] = None
+    mfem_inventory = _inventory(mfem, allow_mfem=False)
+    mfem_content = {'revision': mfem_inventory['revision'], 'tree': mfem_inventory['tree'],
+                    'contents_sha256': _json_hash(mfem_inventory)}
+    return {'schema_version': 1, 'mfem': mfem_content,
+            'mfem_origin': identity['mfem_origin'], 'mfem_tag': identity['mfem_tag'],
+            'mfem_tag_object': identity['mfem_tag_object'],
+            'profile': 'cuda-sm80', 'build_type': BUILD_ENV['IGRLAB_BUILD_TYPE'],
+            'build_flags': {name: environment[name] for name in BUILD_FLAG_ENV},
+            'mfem_cuda_archs': '80', 'mfem_use_openmp': False,
+            'mfem_use_caliper': False, 'policy_sha256': policy,
+            'site_root': str(site_root), 'spack_root': str(spack_root),
+            'spack_tool_sha256': tools}
+
+
 def build_plan(identity: dict[str, Any], output_root: Path, site_root: Path,
                spack_root: Path, correctness_regex: str, *,
                validation_time: str | None = None) -> dict[str, Any]:
@@ -312,48 +363,74 @@ def build_plan(identity: dict[str, Any], output_root: Path, site_root: Path,
     roots = [p.resolve() for p in roots]
     requested_output, site_root, spack_root = roots
     snapshot = Path(identity['source_snapshot'])
+    environment = {**BUILD_ENV, **{name: os.environ.get(name, '') for name in BUILD_FLAG_ENV}}
+    # Never overlay a new driver onto a historical source. Capability comes
+    # from that frozen checkout's public entry point, with a retained receipt.
+    help_result = _run([str(snapshot / 'build.sh'), '--site', 'pace', '--help'], env=_environment(environment))
+    help_text = help_result.stdout.decode(errors='replace')
+    help_receipt = {'argv': help_result.args, 'returncode': help_result.returncode,
+                    'stdout_sha256': hashlib.sha256(help_result.stdout).hexdigest()}
+    shared_mfem = bool(re.search(r'(?m)^\s*--mfem-output-root(?:\s|$)', help_text))
+    run_only_validation = bool(re.search(r'(?m)^\s*--tests-only(?:\s|$)', help_text))
     validation_mode, capability = None, None
     if validation_time is not None:
         _validation_seconds(validation_time)
-        help_result = _run([str(snapshot / 'build.sh'), '--site', 'pace', '--help'], env=_environment(BUILD_ENV))
-        help_text = help_result.stdout.decode(errors='replace')
         validation_mode = 'canonical' if re.search(r'(?m)^\s*--validation-time(?:\s|$)', help_text) else 'scheduler-update'
-        capability = {'argv': help_result.args, 'returncode': help_result.returncode,
-                      'stdout_sha256': hashlib.sha256(help_result.stdout).hexdigest()}
+        capability = help_receipt
     flags = ['--site', 'pace', '--a100', '--hdg-runtime', '--nvtx-profile',
              '--no-clean', '--no-research-tests', '--submit', '-j', '4',
              '--mfem-jobs', '4', '--test-regex', correctness_regex]
-    config = {'source_fingerprint': identity['source_fingerprint'], 'flags': flags,
+    dependency_config = _dependency_configuration(identity, site_root, spack_root, environment)
+    dependency_key = _json_hash(dependency_config)
+    mfem_output = requested_output / 'mfem' / ('config-' + dependency_key[:20]) if shared_mfem else None
+    config = {'source_fingerprint': identity['source_fingerprint'], 'flags': flags[:-2],
               'site_config_sha256': hashlib.sha256((snapshot / 'cmake/sites/pace.json').read_bytes()).hexdigest(),
-              'environment': BUILD_ENV}
+              'environment': environment,
+              'dependency_configuration_key': dependency_key}
     config_key = _json_hash(config)
     output_root = requested_output / ('config-' + config_key[:20])
     argv = [str(snapshot / 'build.sh'), *flags, '--output-root', str(output_root),
             '--site-root', str(site_root), '--spack-root', str(spack_root)]
+    if shared_mfem:
+        argv += ['--mfem-output-root', str(mfem_output)]
     # Scheduling limits do not change compiled artifacts or the cache key.
     if validation_mode == 'canonical':
         argv += ['--validation-time', validation_time]
-    result = _run([*argv, '--print-plan'], env=_environment(BUILD_ENV))
+    result = _run([*argv, '--print-plan'], env=_environment(environment))
     stdout, stderr = result.stdout.decode(errors='replace'), result.stderr.decode(errors='replace')
     wt = 'wt-' + hashlib.sha256(os.fsencode(snapshot)).hexdigest()[:16]
     scope = output_root / 'worktrees' / wt / 'cuda-sm80'
     app_build, app_install = scope / 'app/build', scope / 'app/install'
-    mfem_build, mfem_install = scope / 'mfem/build', scope / 'mfem/install'
+    mfem_source = mfem_output / 'source' if shared_mfem else snapshot / MFEM_PATH
+    mfem_build = mfem_output / 'build' if shared_mfem else scope / 'mfem/build'
+    mfem_install = mfem_output / 'install' if shared_mfem else scope / 'mfem/install'
     env_path = site_root / 'site/pace/spack-envs/cuda-sm80'
     # Match complete known records instead of splitting paths/regexes on spaces.
     _require(f'[build-plan] output_root={output_root} worktree_id={wt} scope={scope}' in stdout and
              f'[build-plan] env={env_path} app_build={app_build} app_install={app_install}' in stdout,
              'canonical build plan did not admit the expected source/configuration paths')
+    if shared_mfem:
+        _require(f'[build-plan] mfem_source={mfem_source} mfem_build={mfem_build} mfem_install={mfem_install} ' in stdout,
+                 'canonical build plan did not admit the expected shared MFEM tuple')
     verify_source(identity)
     return {'schema_version': 1, 'source': identity, 'configuration_key': config_key,
             'configuration': config, 'requested_output_root': str(requested_output),
+            'correctness_regex': correctness_regex,
+            'dependency_configuration_key': dependency_key,
+            'dependency_configuration': dependency_config,
+            'mfem_cache': {'mode': 'shared-canonical' if shared_mfem else 'historical-source-scoped',
+                           'output_root': str(mfem_output) if shared_mfem else None,
+                           'lock': str(mfem_output / '.lock') if shared_mfem else None,
+                           'capability': help_receipt},
             'output_root': str(output_root), 'site_root': str(site_root), 'spack_root': str(spack_root),
-            'argv': argv, 'env': dict(BUILD_ENV), 'spack_env': str(env_path),
+            'argv': argv, 'env': environment, 'spack_env': str(env_path),
             'app_build': str(app_build), 'app_install': str(app_install),
+            'mfem_source': str(mfem_source),
             'mfem_build': str(mfem_build), 'mfem_install': str(mfem_install),
             'mfem_identity': str(mfem_build / 'dg-igr-mfem-identity-v1.txt'),
             'mfem_config': str(mfem_install / 'lib/cmake/mfem/MFEMConfig.cmake'),
             'mfem_targets': str(mfem_install / 'lib/cmake/mfem/MFEMTargets.cmake'),
+            'run_only_validation': run_only_validation,
             'validation_time': validation_time, 'validation_time_mode': validation_mode,
             'validation_time_capability': capability,
             'plan_stdout': stdout, 'plan_stderr': stderr}
@@ -443,9 +520,13 @@ def submit_build(plan: dict[str, Any]) -> dict[str, Any]:
     verify_source(plan['source'])
     expected = build_plan(plan['source'], Path(plan['requested_output_root']),
                           Path(plan['site_root']), Path(plan['spack_root']),
+                          plan['correctness_regex'] if 'correctness_regex' in plan else
                           plan['configuration']['flags'][plan['configuration']['flags'].index('--test-regex') + 1],
                           validation_time=plan.get('validation_time'))
-    for key in ('argv', 'env', 'configuration_key', 'app_build', 'spack_env', 'validation_time', 'validation_time_mode'):
+    for key in ('argv', 'env', 'configuration_key', 'correctness_regex', 'dependency_configuration_key',
+                'dependency_configuration', 'mfem_cache', 'mfem_source', 'mfem_build',
+                'mfem_install', 'run_only_validation', 'app_build', 'spack_env',
+                'validation_time', 'validation_time_mode'):
         _require(plan.get(key) == expected[key], f'build submission plan changed: {key}')
     result = _run(plan['argv'], env=_environment(plan['env']), check=False)
     stdout, stderr = result.stdout.decode(errors='replace'), result.stderr.decode(errors='replace')

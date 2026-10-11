@@ -35,6 +35,25 @@ pace_prepare_dependency_lock() {
   export IGRLAB_PACE_ENV_LOCK_FD="$pace_environment_lock"
 }
 
+pace_admit_prebuilt_site() {
+  python3 -B - "$pace_script_dir" "$pace_dependency_root" "$pace_profile" "$pace_recipe_root" "$pace_discovered" <<'PYCODE'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import pace_manifest
+root, profile, recipes = Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
+config = pace_manifest.resolved_config(json.loads(sys.argv[5]), profile)
+expected = {
+    root / 'site/pace/spack-envs' / profile / 'spack.yaml': pace_manifest.manifest(root, profile, recipes, config),
+    root / 'site/pace/spack-envs' / profile / 'site-packages.json': config,
+    root / 'site/pace/spack-user/repos.yaml': {'repos': {'builtin': str(recipes)}},
+}
+for path, document in expected.items():
+    if not path.is_file() or path.is_symlink() or path != path.resolve(strict=True) or path.read_text() != json.dumps(document, indent=2) + '\n':
+        raise SystemExit(f'ERROR: PACE: missing or changed retained configuration for --tests-only: {path}')
+PYCODE
+}
+
 # sbatch executes the tracked helper, with the original argv kept as JSON.
 if [[ ${1:-} == --worker ]]; then
   [[ $# == 3 && ($2 == build || $2 == validation) ]] || pace_fail "invalid worker arguments"
@@ -71,8 +90,8 @@ PY
       --no-clean|--clean|--no-deps)
         [[ $pace_stage == validation ]] || pace_worker_args+=("$pace_arg") ;;
       --smoke) [[ $pace_stage == build ]] || pace_worker_args+=("$pace_arg") ;;
-      --test-regex)
-        ((${#pace_original[@]})) || pace_fail "missing test regex in request"
+      --test-regex|--test-label)
+        ((${#pace_original[@]})) || pace_fail "missing test filter in request"
         [[ $pace_stage == build ]] || pace_worker_args+=("$pace_arg" "${pace_original[0]}")
         pace_original=("${pace_original[@]:1}") ;;
       *) pace_worker_args+=("$pace_arg") ;;
@@ -81,13 +100,13 @@ PY
   if [[ $pace_stage == build ]]; then
     pace_worker_args+=(--no-tests)
   else
-    pace_worker_args+=(--no-clean --no-deps)
+    pace_worker_args+=(--tests-only --no-clean --no-deps)
   fi
   exec "${pace_source}/build.sh" "${pace_worker_args[@]}"
 fi
 
 pace_args=()
-pace_submit=0 pace_plan=0 pace_tests=1 pace_smoke=0 pace_mode=cpu pace_arch="" pace_clean_set=0 pace_help=0
+pace_submit=0 pace_plan=0 pace_tests_only=0 pace_tests=1 pace_smoke=0 pace_mode=cpu pace_arch="" pace_clean_set=0 pace_help=0
 pace_root="" pace_dependency_root="" pace_spack_root=${IGRLAB_PACE_SPACK_ROOT:-}
 pace_jobs=${IGRLAB_BUILD_JOBS:-4} pace_mfem_jobs=""
 pace_build_time=08:00:00 pace_validation_time=02:00:00
@@ -107,6 +126,7 @@ while (($#)); do
     --mfem-jobs) [[ $# -ge 2 ]] || pace_fail "$1 requires a value"; pace_mfem_jobs=$2; pace_args+=("$1" "$2"); shift ;;
     --print-plan) pace_plan=1; pace_args+=("$1") ;;
     --no-tests) pace_tests=0; pace_args+=("$1") ;;
+    --tests-only) pace_tests_only=1; pace_args+=("$1") ;;
     --smoke) pace_smoke=1; pace_args+=("$1") ;;
     --clean|--no-clean) pace_clean_set=1; pace_args+=("$1") ;;
     --caliper) pace_fail "the validated site profiles are cpu and cuda-sm80; Caliper has no PACE profile yet" ;;
@@ -170,23 +190,27 @@ with open(sys.argv[1], 'w') as f:
     json.dump({'source': sys.argv[2], 'argv': sys.argv[3:]}, f, indent=2)
     f.write('\n')
 PY
+  pace_validation_dependency=()
+  if [[ $pace_tests_only == 0 ]]; then
   pace_job=$(sbatch --parsable --account=gts-sbryngelson3 --qos=embers --partition=cpu-small \
     --nodes=1 --ntasks=1 --cpus-per-task=8 --mem=48G --time="$pace_build_time" --no-requeue \
     --job-name=IGRlab-build --output="$pace_dependency_root/site/pace/logs/build-%j.out" \
     --error="$pace_dependency_root/site/pace/logs/build-%j.err" "$0" --worker build "$pace_request")
   pace_job=${pace_job%%;*}
   printf 'PACE build submitted: %s (embers, cpu-small)\n' "$pace_job"
+    pace_validation_dependency=(--dependency="afterok:$pace_job")
+  fi
   if [[ $pace_tests == 1 || $pace_smoke == 1 ]]; then
     pace_partition=cpu-small pace_resources=()
     if [[ $pace_profile == cuda-sm80 ]]; then
       pace_partition=gpu-a100; pace_resources+=(--gres=gpu:a100:1)
     fi
-    pace_validation=$(sbatch --parsable --dependency="afterok:$pace_job" --kill-on-invalid-dep=yes --account=gts-sbryngelson3 \
+    pace_validation=$(sbatch --parsable "${pace_validation_dependency[@]}" --kill-on-invalid-dep=yes --account=gts-sbryngelson3 \
       --qos=embers --partition="$pace_partition" "${pace_resources[@]}" --nodes=1 --ntasks=4 \
       --cpus-per-task=2 --mem=48G --time="$pace_validation_time" --no-requeue --job-name=IGRlab-check \
       --output="$pace_dependency_root/site/pace/logs/check-%j.out" \
       --error="$pace_dependency_root/site/pace/logs/check-%j.err" "$0" --worker validation "$pace_request")
-    printf 'PACE validation submitted: %s (after build, embers, %s)\n' "${pace_validation%%;*}" "$pace_partition"
+    printf 'PACE validation submitted: %s (prebuilt validation, embers, %s)\n' "${pace_validation%%;*}" "$pace_partition"
   fi
   printf 'Logs: %s/site/pace/logs; request: %s\n' "$pace_dependency_root" "$pace_request"
   exit 0
@@ -248,11 +272,26 @@ if [[ $pace_dependency_root != "$pace_root" ]]; then
 fi
 # Worktrees can share a dependency root. The driver releases this profile lock
 # after preparing dependencies, so independent compilation can run concurrently.
-pace_prepare_dependency_lock
-python3 "$pace_script_dir/pace_manifest.py" --root "$pace_dependency_root" \
-  --profile "$pace_profile" --recipe-root "$pace_recipe_root" --site-config - <<<"$pace_discovered"
+if [[ $pace_tests_only == 1 ]]; then
+  # Run-only validation neither creates nor rewrites dependency configuration.
+
+  pace_existing_lock="$pace_dependency_root/site/pace/locks/$pace_profile.lock"
+  [[ -f $pace_existing_lock && ! -L $pace_existing_lock ]] || pace_fail "missing retained dependency lock for --tests-only"
+  exec {pace_environment_lock}<"$pace_existing_lock"
+  flock -s "$pace_environment_lock"
+  export IGRLAB_PACE_ENV_LOCK_FD="$pace_environment_lock"
+  pace_admit_prebuilt_site
+else
+  pace_prepare_dependency_lock
+  python3 "$pace_script_dir/pace_manifest.py" --root "$pace_dependency_root" \
+    --profile "$pace_profile" --recipe-root "$pace_recipe_root" --site-config - <<<"$pace_discovered"
+fi
 export TMPDIR="$pace_dependency_root/tmp" OMP_NUM_THREADS=1 CTEST_PARALLEL_LEVEL=1
-mkdir -p "$TMPDIR" "$SPACK_SYSTEM_CONFIG_PATH"
+if [[ $pace_tests_only == 1 ]]; then
+  [[ -d $TMPDIR && -d $SPACK_SYSTEM_CONFIG_PATH ]] || pace_fail "missing retained runtime directories for --tests-only"
+else
+  mkdir -p "$TMPDIR" "$SPACK_SYSTEM_CONFIG_PATH"
+fi
 printf '[site] PACE profile=%s target=x86_64_v3 MPI=%s account=%s qos=%s\n' \
   "$pace_profile" "$pace_mpi" "$SLURM_JOB_ACCOUNT" "$SLURM_JOB_QOS"
 exec "${pace_source}/build.sh" "${pace_args[@]}"

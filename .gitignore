@@ -79,6 +79,8 @@ tests/scripts/*
 !tests/scripts/test_pace_discovery.py
 !tests/scripts/test_dependency_bindings.py
 !tests/scripts/test_mpi_test_launcher.py
+!tests/scripts/test_prebuilt_validation.py
+!tests/scripts/test_mfem_cache.py
 !scripts/build/
 !scripts/build/**
 out/

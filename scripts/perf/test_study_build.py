@@ -16,6 +16,8 @@ import hashlib,json,os,pathlib,sys
 args=sys.argv[1:]
 if '--help' in args:
  print('--validation-time HH:MM:SS')
+ print('--mfem-output-root DIR')
+ print('--tests-only')
  raise SystemExit(0)
 value=lambda flag: args[args.index(flag)+1]
 source=pathlib.Path(__file__).resolve().parent
@@ -26,10 +28,16 @@ scope=output/'worktrees'/wt/'cuda-sm80'
 if '--print-plan' in args:
  print(f'[build-plan] output_root={output} worktree_id={wt} scope={scope}')
  print(f'[build-plan] env={site}/site/pace/spack-envs/cuda-sm80 app_build={scope}/app/build app_install={scope}/app/install')
+ if '--mfem-output-root' in args:
+  mfem=pathlib.Path(value('--mfem-output-root'))
+  print(f'[build-plan] mfem_source={mfem}/source mfem_build={mfem}/build mfem_install={mfem}/install mfem_tuple_state=shared-planned')
 else:
  if os.environ.get('SLURM_JOB_ID'):
   print('inside-allocation submission rejected',file=sys.stderr)
   raise SystemExit(2)
+ if os.environ.get('FAKE_SHARED_CACHE_REJECT'):
+  print('canonical MFEM cache identity rejected',file=sys.stderr)
+  raise SystemExit(3)
  print('PACE build submitted: 987123 (embers, cpu-small)')
  if os.environ.get('FAKE_PARTIAL'):
   print('validation submission failed',file=sys.stderr)
@@ -274,7 +282,119 @@ class StudyBuildTests(unittest.TestCase):
         self.assertFalse(Path(plan['output_root']).exists())
         self.assertEqual(plan['spack_env'], str(self.root / 'shared-site/site/pace/spack-envs/cuda-sm80'))
         self.assertEqual(plan['configuration_key'], self.plan(identity, regex)['configuration_key'])
-        self.assertNotEqual(plan['output_root'], self.plan(identity, '^another$')['output_root'])
+        other = self.plan(identity, '^another$')
+        self.assertEqual(plan['output_root'], other['output_root'])
+        self.assertEqual(plan['app_build'], other['app_build'])
+        self.assertEqual(plan['configuration_key'], other['configuration_key'])
+        self.assertNotEqual(plan['argv'], other['argv'])
+        self.assertEqual(other['correctness_regex'], '^another$')
+        self.assertNotIn('--test-regex', plan['configuration']['flags'])
+        self.assertEqual(plan['dependency_configuration_key'], self.plan(identity, '^another$')['dependency_configuration_key'])
+        self.assertEqual(plan['mfem_build'], self.plan(identity, '^another$')['mfem_build'])
+        self.assertEqual(plan['mfem_cache']['mode'], 'shared-canonical')
+        self.assertTrue(plan['run_only_validation'])
+        self.assertFalse(Path(plan['mfem_cache']['output_root']).exists())
+
+    def test_application_only_change_and_validation_selection_reuse_dependency_tuple(self):
+        first = self.plan(self.freeze())
+        self.write('bytes.bin', b'application change\x00')
+        second = self.plan(study.freeze(self.source, 'working-tree', self.root / 'snapshot2'), '^different$')
+        self.assertNotEqual(first['configuration_key'], second['configuration_key'])
+        self.assertNotEqual(first['app_build'], second['app_build'])
+        for key in ('dependency_configuration_key', 'mfem_source', 'mfem_build', 'mfem_install', 'mfem_identity'):
+            self.assertEqual(first[key], second[key], key)
+        self.assertEqual(first['mfem_cache']['lock'], second['mfem_cache']['lock'])
+
+    def test_dependency_key_changes_with_mfem_source_and_release_identity(self):
+        first = self.plan(self.freeze())
+        mfem = self.source / study.MFEM_PATH
+        self.configure(mfem)
+        (mfem / 'mfem.hpp').write_text('next clean MFEM source\n')
+        self.git(mfem, 'add', '.')
+        self.git(mfem, 'commit', '-qm', 'new source')
+        self.git(mfem, 'tag', '-d', 'v4.9')
+        self.git(mfem, 'tag', '-a', 'v4.9', '-m', 'new annotated fixture release')
+        self.git(self.source, 'add', study.MFEM_PATH)
+        self.git(self.source, 'commit', '-qm', 'new MFEM pin')
+        second = self.plan(study.freeze(self.source, 'HEAD', self.root / 'snapshot2'))
+        self.assertNotEqual(first['dependency_configuration_key'], second['dependency_configuration_key'])
+        self.assertNotEqual(first['mfem_build'], second['mfem_build'])
+
+    def test_site_compiler_configuration_and_canonical_policy_change_dependency_key(self):
+        first = self.plan(self.freeze())
+        for number, name, data in ((2, 'cmake/sites/pace.json', '{"compiler":{"version":"next"}}\n'),
+                                    (3, 'build_mfem_tpl.sh', '# changed canonical MFEM policy\n'),
+                                    (4, 'scripts/build/mfem_cache.sh', '# changed cache admission\n')):
+            with self.subTest(name=name):
+                self.write(name, data)
+                frozen = study.freeze(self.source, 'working-tree', self.root / f'snapshot{number}')
+                changed = self.plan(frozen)
+                self.assertNotEqual(first['dependency_configuration_key'], changed['dependency_configuration_key'])
+                self.assertNotEqual(first['mfem_build'], changed['mfem_build'])
+
+    def test_spack_tool_root_bytes_and_site_graph_namespace_change_dependency_key(self):
+        identity = self.freeze()
+        spack = self.root / 'spack-tool'
+        (spack / 'bin').mkdir(parents=True)
+        (spack / 'bin/spack').write_text('selected Spack tool\n')
+        first = self.plan(identity)
+        (spack / 'bin/spack').write_text('updated selected Spack tool\n')
+        second = self.plan(identity)
+        third = study.build_plan(identity, self.root / 'output with $HOME `literal`',
+                                 self.root / 'another-site', spack, '^(dg_operator|sigma)$')
+        fourth = study.build_plan(identity, self.root / 'output with $HOME `literal`',
+                                  self.root / 'shared-site', self.root / 'another-spack', '^(dg_operator|sigma)$')
+        self.assertEqual(len({plan['dependency_configuration_key'] for plan in (first, second, third, fourth)}), 4)
+
+    def test_first_site_lock_creation_does_not_change_planned_dependency_identity(self):
+        identity = self.freeze()
+        first = self.plan(identity)
+        environment = Path(first['spack_env'])
+        environment.mkdir(parents=True)
+        (environment / 'spack.lock').write_text('first build creates the concrete graph')
+        second = self.plan(identity)
+        self.assertEqual(first['dependency_configuration_key'], second['dependency_configuration_key'])
+        self.assertEqual(first['mfem_build'], second['mfem_build'])
+
+    def test_effective_compile_flags_are_frozen_and_change_app_and_mfem_keys(self):
+        identity = self.freeze()
+        with patch.dict(os.environ, {name: '' for name in study.BUILD_FLAG_ENV}):
+            first = self.plan(identity)
+            self.assertTrue(all(first['env'][name] == '' for name in study.BUILD_FLAG_ENV))
+            with patch.dict(os.environ, {'CXXFLAGS': '-fno-omit-frame-pointer', 'CUDAFLAGS': '-lineinfo'}):
+                changed = self.plan(identity)
+                self.assertNotEqual(first['dependency_configuration_key'], changed['dependency_configuration_key'])
+                self.assertNotEqual(first['configuration_key'], changed['configuration_key'])
+                self.assertEqual(changed['env']['CUDAFLAGS'], '-lineinfo')
+                with self.assertRaisesRegex(study.StudyBuildError, 'plan changed'):
+                    study.submit_build(first)
+
+    def test_historical_driver_uses_its_original_mfem_scope_without_overlay(self):
+        old = DRIVER.replace(" print('--mfem-output-root DIR')\n", '').replace(" print('--tests-only')\n", '')
+        self.write('build.sh', old, executable=True)
+        self.git(self.source, 'add', 'build.sh')
+        self.git(self.source, 'commit', '-qm', 'historical cache capability')
+        plan = self.plan(self.freeze())
+        self.assertNotIn('--mfem-output-root', plan['argv'])
+        self.assertEqual(plan['mfem_cache']['mode'], 'historical-source-scoped')
+        self.assertFalse(plan['run_only_validation'])
+        self.assertEqual(Path(plan['mfem_build']).parents[1], Path(plan['app_build']).parents[1])
+
+    def test_corrupt_or_incomplete_shared_cache_canonical_rejection_has_no_local_fallback(self):
+        plan = self.plan(self.freeze())
+        with patch.dict(os.environ, {'FAKE_SHARED_CACHE_REJECT': '1'}):
+            result = study.submit_build(plan)
+        self.assertFalse(result['success'])
+        self.assertEqual(result['returncode'], 3)
+        self.assertIsNone(result['build_job_id'])
+        self.assertIn('canonical MFEM cache identity rejected', result['stderr'])
+        self.assertEqual(result['argv'], plan['argv'])
+
+    def test_shared_dependency_plan_fields_are_verified_before_submission(self):
+        plan = self.plan(self.freeze())
+        plan['mfem_build'] = str(self.root / 'unrelated-build')
+        with self.assertRaisesRegex(study.StudyBuildError, 'plan changed: mfem_build'):
+            study.submit_build(plan)
 
     def test_public_submission_preserves_ids_stdout_and_literal_argv(self):
         plan = self.plan(self.freeze(), '^literal $HOME `never run`$')

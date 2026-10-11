@@ -22,7 +22,9 @@ Initialize the tested build Spack once. The driver queries its root with
 
 For a CPU build, replace `--a100` with `--cpu-only`. Add `--nvtx-profile` for CUDA
 profiler binaries. Add `--test-regex REGEX` to select a focused validation suite,
-or `--no-tests` to compile only. `--no-tests` is a build result, not a validation
+and optionally `--test-label REGEX` to require matching CTest labels as well.
+Their intersection must select at least one test. Use
+`--no-tests` to compile only. `--no-tests` is a build result, not a validation
 result. Use the same command without `--submit` inside an existing free compute
 allocation. Builds and timings must run on compute nodes.
 
@@ -61,8 +63,15 @@ Use `--build-time HH:MM:SS` and `--validation-time HH:MM:SS` to request shorter
 allocations, up to those defaults. The submission plan and request receipt retain
 the chosen limits. For a focused correctness selection, for example, add
 `--validation-time 00:15:00`; choose sufficient time for the selected tests.
-Compilation therefore does not occupy a GPU. The validation stage reruns the
-canonical driver with installed dependencies and existing build outputs.
+Compilation therefore does not occupy a GPU. The validation stage invokes
+`--tests-only` through the canonical driver. It verifies the successful build's
+source, configuration, locked dependencies, MFEM identity, test graph and runtime
+artifact hashes before running tests, with no configure, build or install step.
+It also requires unchanged retained site configuration; it does not concretize
+or install dependencies. Missing or changed artifacts require a canonical build.
+To validate an existing build again, add `--tests-only --submit` to the same
+source, build options and output-root command; only a validation job is submitted.
+Test selection and wall-time options can change without rebuilding.
 MPI tests use the selected site's `mpiexec` directly from the batch shell.
 Direct CTest executable tests linked to MFEM or MPI also use that launcher with
 one rank. The CPU OpenMPI 4 stack failed singleton MPI initialization in the
@@ -82,7 +91,14 @@ Inspect a plan without submitting or changing output directories:
 ```
 
 The default is incremental reuse. `--clean` explicitly rebuilds the selected
-application and MFEM caches. Dependencies, Spack scopes and submission requests
+application and MFEM caches. An optional `--mfem-output-root /absolute/cache/path`
+shares MFEM independently of application outputs. Its `source`, `build` and
+`install` directories are protected by a separate writer lock; matching partial
+fills resume, and completed stamped caches are admitted without rebuilding.
+Changed source, compiler, dependency graph or MFEM policy rejects that cache
+without deleting it. `--clean` affects only application outputs when this shared
+cache is selected. The MFEM lock is released before application compilation.
+Dependencies, Spack scopes and submission requests
 live under the output root; application and MFEM artifacts retain the driver's
 worktree/profile layout. `--site-root DIR` optionally shares a dependency root
 across distinct output roots. A changed site manifest is rejected with an

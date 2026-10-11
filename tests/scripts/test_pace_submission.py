@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise submission/worker argument handling without Slurm or a GPU."""
 import json
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -233,7 +234,23 @@ print(9000 + count)
         self.assertIn('--smoke', check_args)
         self.assertIn('--no-clean', check_args)
         self.assertIn('--no-deps', check_args)
+        self.assertIn('--tests-only', check_args)
         self.assertNotIn('--clean', check_args)
+
+    def test_tests_only_submission_requests_validation_without_a_build_job(self):
+        result = self.submit('--a100', '--tests-only', '--test-label', '^numerical-acceptance$')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls('sbatch')
+        self.assertEqual(len(calls), 1)
+        self.assertIn('--job-name=IGRlab-check', calls[0])
+        self.assertIn('--gres=gpu:a100:1', calls[0])
+        self.assertFalse(any(a.startswith('--dependency=') for a in calls[0]))
+        result = self.run_helper(*calls[0][-3:], env=self.env | {
+            'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3', 'SLURM_JOB_QOS': 'embers', 'SLURM_NTASKS': '4'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = self.calls('build')[-1]
+        self.assertIn('--tests-only', argv)
+        self.assertEqual(argv[argv.index('--test-label') + 1], '^numerical-acceptance$')
 
     def test_worker_rejects_paid_queue(self):
         request = self.root / 'request.json'
@@ -244,6 +261,46 @@ print(9000 + count)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('free', result.stderr)
         self.assertEqual(self.calls('build'), [])
+
+    def prebuilt_site_fixture(self):
+        spec = importlib.util.spec_from_file_location('pace_manifest_fixture', SOURCE / 'scripts/build/pace_manifest.py')
+        manifest = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(manifest)
+        config = manifest.load_config()
+        for name in ('compiler', 'cmake', 'metis', 'openblas'):
+            config[name]['prefix'] = '/fixture-site/' + name
+        config['profiles']['cpu']['mpi_prefix'] = '/fixture-site/openmpi'
+        recipes = self.root / 'retained-recipes'
+        return manifest, config, recipes
+
+    def admit_prebuilt_site(self, config, recipes):
+        text = self.helper.read_text()
+        function = re.search(r'^pace_admit_prebuilt_site\(\) \{.*?^\}(?=\n\n# sbatch)', text, re.M | re.S).group(0)
+        command = function + '\npace_script_dir="$1"; pace_dependency_root="$2"; pace_profile=cpu; pace_recipe_root="$3"; pace_discovered="$4"; pace_admit_prebuilt_site'
+        return subprocess.run(['bash', '-eu', '-c', command, 'fixture',
+                               str(SOURCE / 'scripts/build'), str(self.output), str(recipes), json.dumps(config)],
+                              env=self.env | {'PYTHONDONTWRITEBYTECODE': '1'}, capture_output=True, text=True, timeout=10)
+
+    def test_run_only_site_admission_is_read_only_and_missing_state_rejects(self):
+        manifest, config, recipes = self.prebuilt_site_fixture()
+        result = self.admit_prebuilt_site(config, recipes)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('retained configuration', result.stderr)
+        self.assertFalse(self.output.exists())
+        paths = manifest.write_environment(self.output, 'cpu', recipes, config)
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in paths}
+        result = self.admit_prebuilt_site(config, recipes)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in paths})
+
+    def test_run_only_site_drift_is_rejected_without_repair(self):
+        manifest, config, recipes = self.prebuilt_site_fixture()
+        paths = manifest.write_environment(self.output, 'cpu', recipes, config)
+        paths[0].write_text('preserve conflicting manifest')
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in paths}
+        result = self.admit_prebuilt_site(config, recipes)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in paths})
 
     def test_slurm_spool_copy_uses_original_checkout(self):
         result = self.submit('--a100', '--no-tests')

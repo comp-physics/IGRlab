@@ -82,7 +82,7 @@ assert_stamped_reuse_scope_policy() {
     capture && /^CMAKE_BIN=/ { exit }
   ' "${driver}")"
   [[ "${init_body}" == *'application build scope'* &&
-     "${init_body}" == *'if [[ "${MFEM_REUSE_STATE}" != "validated-read-only" ]]; then'* &&
+     "${init_body}" == *'if [[ "${MFEM_REUSE_STATE}" != "validated-read-only" && -z "${MFEM_OUTPUT_ROOT_REQUEST}" ]]; then'* &&
      "${init_body}" == *'MFEM build scope'* ]] || {
     fail "stamped reuse scope policy no longer separates app and MFEM paths"
   }
@@ -301,6 +301,9 @@ fixture_mfem_entry="$(git -C "${fixture_root}" ls-tree HEAD -- tpl/mfem)"
 }
 
 cp "${BUILD_DRIVER}" "${fixture_root}/build.sh"
+mkdir -p "${fixture_root}/scripts/build"
+cp "${REPO_ROOT}/scripts/build/prebuilt_validation.py" \
+  "${REPO_ROOT}/scripts/build/mfem_cache.sh" "${fixture_root}/scripts/build/"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
@@ -710,6 +713,9 @@ git -C "${external_mfem}" remote set-url origin \
   https://github.com/mfem/mfem.git
 cp "${fixture_root}/build.sh" "${fixture_root}/build_mfem_tpl.sh" \
   "${external_app}/"
+mkdir -p "${external_app}/scripts/build"
+cp "${fixture_root}/scripts/build/prebuilt_validation.py" \
+  "${fixture_root}/scripts/build/mfem_cache.sh" "${external_app}/scripts/build/"
 mkdir -p "${external_app}/spack-envs/cpu/.spack-env/view"
 cp "${REPO_ROOT}/spack-envs/cpu/spack.yaml" \
   "${external_app}/spack-envs/cpu/spack.yaml"

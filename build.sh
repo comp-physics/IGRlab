@@ -45,8 +45,11 @@ MFEM_JOBS=""
 CLEAN=1
 INSTALL_DEPS=1
 RUN_TESTS=1
+TESTS_ONLY=0
+CLEAN_WAS_SET=0
 BUILD_RESEARCH_TESTS="${IGRLAB_BUILD_RESEARCH_TESTS:-${DG_IGR_BUILD_RESEARCH_TESTS:-OFF}}"
 TEST_REGEX=""
+TEST_LABEL=""
 RUN_SMOKE=0
 CALIPER=0
 NVTX_PROFILE=0
@@ -66,6 +69,7 @@ OUTPUT_LOCK_FD=""
 TEMP_ROOT=""
 TEMP_ROOT_SOURCE=""
 MFEM_REUSE_REQUEST=""
+MFEM_OUTPUT_ROOT_REQUEST=""
 MFEM_REUSE_STAMP=""
 MFEM_REUSE_STATE="disabled"
 MFEM_FRESH_FROM_SEED=0
@@ -186,6 +190,10 @@ Options:
                     Reuse a strictly stamped MFEM tuple rooted at DIR.  An
                     unstamped pinned clean checkout is a read-only seed for a
                     external fresh MFEM build, never an in-place reuse.
+  --mfem-output-root DIR
+                    Share a separately locked, stamped MFEM source/build/install
+                    cache across application checkouts. Existing stamped caches
+                    are immutable; --clean cleans application outputs only.
   --output-root DIR  Store build outputs in DIR (default: IGRLAB_OUTPUT_ROOT,
                     then DG_IGR_OUTPUT_ROOT, then
                     ${XDG_CACHE_HOME:-$HOME/.cache}/igrlab-build).
@@ -194,12 +202,16 @@ Options:
   --no-clean        Reuse existing build and install directories.
   --no-deps         Do not run `spack install`.
   --no-tests        Do not run CTest.
+  --tests-only      Validate an existing successful canonical build receipt and
+                    run tests without configuring, building, or installing.
   --research-tests  Build research-only tests and experiments (default: off).
   --no-research-tests
                     Exclude research-only targets, overriding the environment.
   --test-regex REGEX
                     Require REGEX to select one or more CTest tests, then run
                     only that selection.  Requires tests to remain enabled.
+  --test-label REGEX Select CTest labels, intersected with --test-regex if given.
+                    Reject an empty selection before running any test.
   --smoke           Run a short two-rank Sedov smoke test after tests.
   -h, --help        Show this help.
 
@@ -265,6 +277,11 @@ while (($#)); do
       MFEM_REUSE_REQUEST="$2"
       shift
       ;;
+    --mfem-output-root)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "ERROR: $1 requires a path" >&2; exit 2; }
+      MFEM_OUTPUT_ROOT_REQUEST="$2"
+      shift
+      ;;
     --output-root)
       [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 2; }
       [[ -n "$2" ]] || {
@@ -275,10 +292,11 @@ while (($#)); do
       shift
       ;;
     --print-plan) PRINT_PLAN=1 ;;
-    --clean) CLEAN=1 ;;
+    --clean) CLEAN=1; CLEAN_WAS_SET=1 ;;
     --no-clean) CLEAN=0 ;;
     --no-deps) INSTALL_DEPS=0 ;;
     --no-tests) RUN_TESTS=0 ;;
+    --tests-only) TESTS_ONLY=1 ;;
     --research-tests) BUILD_RESEARCH_TESTS="ON" ;;
     --no-research-tests) BUILD_RESEARCH_TESTS="OFF" ;;
     --test-regex)
@@ -288,6 +306,13 @@ while (($#)); do
         exit 2
       }
       TEST_REGEX="$2"
+      shift
+      ;;
+    --test-label)
+      [[ $# -ge 2 && -n "$2" && "$2" != *$'\n'* && "$2" != *$'\r'* ]] || {
+        echo "ERROR: --test-label requires one non-empty single-line CTest regex." >&2; exit 2;
+      }
+      TEST_LABEL="$2"
       shift
       ;;
     --smoke) RUN_SMOKE=1 ;;
@@ -316,9 +341,17 @@ case "${BUILD_RESEARCH_TESTS^^}" in
     ;;
 esac
 
-if [[ -n "${TEST_REGEX}" && "${RUN_TESTS}" != "1" ]]; then
-  echo "ERROR: --test-regex requires CTest; do not combine it with --no-tests." >&2
+if [[ ( -n "${TEST_REGEX}" || -n "${TEST_LABEL}" ) && "${RUN_TESTS}" != "1" ]]; then
+  echo "ERROR: --test-regex/--test-label require CTest; do not combine them with --no-tests." >&2
   exit 2
+fi
+if ((TESTS_ONLY)); then
+  if ((CLEAN_WAS_SET || (!RUN_TESTS && !RUN_SMOKE))); then
+    echo "ERROR: --tests-only requires tests or smoke and cannot be combined with --clean." >&2
+    exit 2
+  fi
+  CLEAN=0
+  INSTALL_DEPS=0
 fi
 
 cache_value() {
@@ -469,7 +502,7 @@ initialize_scoped_output_layout() {
     echo "ERROR: resolved build paths escaped the scoped output layout." >&2
     exit 3
   }
-  if [[ "${MFEM_REUSE_STATE}" != "validated-read-only" ]]; then
+  if [[ "${MFEM_REUSE_STATE}" != "validated-read-only" && -z "${MFEM_OUTPUT_ROOT_REQUEST}" ]]; then
     validate_directory_components "${OUTPUT_SCOPE}/mfem" "MFEM output scope" 1
     validate_directory_components "${MFEM_BUILD}" "MFEM build scope" 1
     validate_directory_components "${MFEM_INSTALL}" "MFEM install scope" 1
@@ -487,7 +520,7 @@ revalidate_scoped_output_layout() {
   validate_directory_components "${OUTPUT_SCOPE}/app" "application output scope"
   validate_directory_components "${APP_BUILD}" "application build scope"
   validate_directory_components "${APP_INSTALL}" "application install scope"
-  if [[ "${MFEM_REUSE_STATE}" != "validated-read-only" ]]; then
+  if [[ "${MFEM_REUSE_STATE}" != "validated-read-only" && -z "${MFEM_OUTPUT_ROOT_REQUEST}" ]]; then
     validate_directory_components "${OUTPUT_SCOPE}/mfem" "MFEM output scope"
     validate_directory_components "${MFEM_BUILD}" "MFEM build scope"
     validate_directory_components "${MFEM_INSTALL}" "MFEM install scope"
@@ -2438,6 +2471,101 @@ revalidate_reused_mfem_after_dependencies() {
   echo "[reuse-transaction] spack_post_manifest_sha256=${MFEM_REUSE_POST_MANIFEST_SHA256} spack_post_lock_sha256=${MFEM_REUSE_POST_LOCK_SHA256}"
 }
 
+run_canonical_checks() {
+if ((RUN_TESTS)); then
+  CTEST_BIN="$(dirname -- "${CMAKE_BIN}")/ctest"
+  local -a test_filters=()
+  [[ -z "${TEST_REGEX}" ]] || test_filters+=(-R "${TEST_REGEX}")
+  [[ -z "${TEST_LABEL}" ]] || test_filters+=(-L "${TEST_LABEL}")
+  if ((${#test_filters[@]})); then
+    selected_tests="$("${CTEST_BIN}" --test-dir "${APP_BUILD}" --show-only=json-v1 "${test_filters[@]}")" || {
+      echo "ERROR: CTest rejected the test regex/label selection." >&2
+      exit 2
+    }
+    if ! python3 -c 'import json,sys; tests=json.load(sys.stdin).get("tests"); sys.exit(0 if isinstance(tests,list) and tests else 1)' <<< "${selected_tests}"; then
+      echo "ERROR: test regex/label selected no tests: regex=${TEST_REGEX} label=${TEST_LABEL}" >&2
+      exit 2
+    fi
+    "${CTEST_BIN}" --test-dir "${APP_BUILD}" --output-on-failure \
+      "${test_filters[@]}"
+  else
+    "${CTEST_BIN}" --test-dir "${APP_BUILD}" --output-on-failure
+  fi
+fi
+
+if ((RUN_SMOKE)); then
+  smoke_exe="${APP_BUILD}/examples/sedov_taylor_blast/sedov_taylor_blast"
+  smoke_args=(--t-final 0.001 -rs 0 -rp 1 -o 1 -c 0.25
+              -vs 10 -ca 5.0 -is H1 -ig H1 -dt_save 0.1)
+  if [[ "${MODE}" == "gpu" ]]; then
+    if ! "${smoke_exe}" --help 2>&1 | grep -q -- '--device'; then
+      echo "ERROR: this branch does not expose the CUDA runtime device option." >&2
+      echo "       Rebase the GPU runtime support before using --gpu --smoke." >&2
+      exit 4
+    fi
+    smoke_args=(--device cuda "${smoke_args[@]}")
+  fi
+  "${MPI_PREFIX}/bin/mpirun" -np 2 \
+    "${smoke_exe}" "${smoke_args[@]}"
+fi
+
+}
+
+prebuilt_receipt_args() {
+  PREBUILT_ARGS=(--source "${SCRIPT_DIR}" --app-build "${APP_BUILD}"
+    --app-install "${APP_INSTALL}" --spack-env "${SPACK_ENV}"
+    --cmake "${CMAKE_BIN}" --mpi "${MPI_PREFIX}" --hypre "${HYPRE_PREFIX}")
+  local item
+  for item in "mode=${MODE}" "profile=${PROFILE}" "build_type=${CMAKE_BUILD_TYPE}" \
+    "site=${IGRLAB_BUILD_SITE:-}" "caliper=${CALIPER}" "nvtx_profile=${NVTX_PROFILE}" \
+    "hdg_runtime=${HDG_RUNTIME}" "hdg_auxiliary=${HDG_AUXILIARY_EXPERIMENT}" \
+    "hdg_euler=${HDG_EULER_EXPERIMENT}" "hdg_euler_device=${HDG_EULER_DEVICE_EXPERIMENT}" \
+    "research_tests=${BUILD_RESEARCH_TESTS}" "dependency_cuda_arch=${DEPENDENCY_CUDA_ARCH}" \
+    "mfem_cuda_archs=${MFEM_CUDA_ARCHS}" "app_cuda_archs=${APP_CUDA_ARCHS}" \
+    "kernel_sources=${IGRLAB_ACCELERATOR_KERNEL_SOURCES:-${DG_IGR_ACCELERATOR_KERNEL_SOURCES:-}}" \
+    "mfem_seed=${MFEM_REUSE_REQUEST}" "mfem_output_root=${MFEM_OUTPUT_ROOT_REQUEST}"; do
+    PREBUILT_ARGS+=(--policy "${item}")
+  done
+}
+
+run_prebuilt_validation() {
+  local admitted_paths
+  validate_directory_components "${APP_BUILD}" "prebuilt application build"
+  validate_directory_components "${APP_INSTALL}" "prebuilt application install"
+  initialize_output_lock_path
+  acquire_output_lock
+  command -v spack >/dev/null 2>&1 || {
+    echo "ERROR: --tests-only requires the selected Spack environment." >&2; exit 3;
+  }
+  CMAKE_BIN="$(spack -e "${SPACK_ENV}" location -i cmake)/bin/cmake"
+  MPI_PREFIX="$(spack -e "${SPACK_ENV}" location -i openmpi)"
+  HYPRE_PREFIX="$(spack -e "${SPACK_ENV}" location -i hypre)"
+  prebuilt_receipt_args
+  admitted_paths="$(python3 "${SCRIPT_DIR}/scripts/build/prebuilt_validation.py" verify "${PREBUILT_ARGS[@]}")"
+  MFEM_SOURCE_ROOT="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["mfem_source"])' <<<"${admitted_paths}")"
+  MFEM_BUILD="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["mfem_build"])' <<<"${admitted_paths}")"
+  MFEM_INSTALL="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["mfem_install"])' <<<"${admitted_paths}")"
+  if [[ "${IGRLAB_BUILD_SITE:-}" == "pace" ]]; then
+    python3 "${SCRIPT_DIR}/scripts/build/pace_manifest.py" --profile "${PROFILE}" \
+      --check-lock "${SPACK_ENV}/spack.lock"
+  fi
+  [[ -d "${SPACK_ENV}/.spack-env/view" ]] || {
+    echo "ERROR: prebuilt Spack view is missing." >&2; exit 3;
+  }
+  # Runtime search paths match the build route; this does not prepare dependencies.
+  export PATH="${SPACK_ENV}/.spack-env/view/bin:${PATH}"
+  export LD_LIBRARY_PATH="${SPACK_ENV}/.spack-env/view/lib:${SPACK_ENV}/.spack-env/view/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  export IGRLAB_TEST_MFEM_SOURCE_ROOT="${MFEM_SOURCE_ROOT}"
+  python3 "${SCRIPT_DIR}/scripts/build/check_dependency_bindings.py" \
+    --hypre-prefix "${HYPRE_PREFIX}" --mpi-prefix "${MPI_PREFIX}" \
+    --mfem-cache "${MFEM_BUILD}/CMakeCache.txt" \
+    --mfem-config "${MFEM_INSTALL}/lib/cmake/mfem/MFEMConfig.cmake" \
+    --mfem-targets "${MFEM_INSTALL}/lib/cmake/mfem/MFEMTargets.cmake" \
+    --app-build "${APP_BUILD}"
+  echo "[validation] prebuilt receipt admitted: profile=${PROFILE} build=${APP_BUILD}; no configure/build/install"
+  run_canonical_checks
+}
+
 if [[ -z "${MFEM_JOBS}" ]]; then
   MFEM_JOBS="${JOBS}"
 fi
@@ -2531,7 +2659,22 @@ fi
 configure_output_layout
 preflight_temp_root
 
-if [[ -n "${MFEM_REUSE_REQUEST}" ]]; then
+if ((TESTS_ONLY)); then
+  MFEM_SOURCE_ROOT="${SCRIPT_DIR}/tpl/mfem"
+  MFEM_TUPLE_STATE="prebuilt-receipt-required"
+elif [[ -n "${MFEM_OUTPUT_ROOT_REQUEST}" ]]; then
+  MFEM_OUTPUT_ROOT_REQUEST="$(canonicalize_external_path "${MFEM_OUTPUT_ROOT_REQUEST}")"
+  case "${MFEM_OUTPUT_ROOT_REQUEST}" in
+    "${OUTPUT_SCOPE}"|"${OUTPUT_SCOPE}"/*)
+      echo "ERROR: shared MFEM cache must be outside the application output scope." >&2; exit 3 ;;
+  esac
+  source "${SCRIPT_DIR}/scripts/build/mfem_cache.sh"
+  validate_mfem_source_checkout "${MFEM_REUSE_REQUEST:-${SCRIPT_DIR}/tpl/mfem}" "shared cache seed"
+  validate_mfem_origin "${MFEM_SOURCE_ROOT}" "shared cache seed"
+  mfem_cache_plan "${MFEM_OUTPUT_ROOT_REQUEST}" "${MFEM_SOURCE_ROOT}" "${MFEM_SOURCE_PIN}"
+  MFEM_SOURCE_ROOT="${MFEM_CACHE_SOURCE}" MFEM_BUILD="${MFEM_CACHE_BUILD}" MFEM_INSTALL="${MFEM_CACHE_INSTALL}"
+  MFEM_TUPLE_STATE="shared-cache-planned"
+elif [[ -n "${MFEM_REUSE_REQUEST}" ]]; then
   MFEM_REUSE_STAMP="${MFEM_REUSE_REQUEST}/${MFEM_BUILD_NAME}/${MFEM_IDENTITY_STAMP_NAME}"
   if [[ -e "${MFEM_REUSE_STAMP}" || -L "${MFEM_REUSE_STAMP}" ]]; then
     # A stamped legacy tuple is an explicit read-only reuse request.  Do not
@@ -2580,9 +2723,18 @@ if ((PRINT_PLAN)); then
   exit 0
 fi
 
+if ((TESTS_ONLY)); then
+  run_prebuilt_validation
+  exit 0
+fi
+
 initialize_output_lock_path
 acquire_output_lock
 initialize_scoped_output_layout
+PREBUILD_SOURCE_IDENTITY="$(python3 "${SCRIPT_DIR}/scripts/build/prebuilt_validation.py" source --source "${SCRIPT_DIR}")"
+prebuilt_receipt="${APP_BUILD}/igrlab-prebuilt-validation-v1.json"
+[[ ! -L "${prebuilt_receipt}" ]] || { echo "ERROR: prebuilt receipt is symlinked." >&2; exit 3; }
+rm -f -- "${prebuilt_receipt}"
 
 command -v spack >/dev/null 2>&1 || {
   echo "ERROR: spack is not available; source Spack's setup-env.sh first." >&2
@@ -2625,6 +2777,42 @@ if [[ "${IGRLAB_BUILD_SITE:-}" == "pace" &&
   unset IGRLAB_PACE_ENV_LOCK_FD
 fi
 
+if [[ -n "${MFEM_OUTPUT_ROOT_REQUEST}" ]]; then
+  mfem_cache_acquire
+  mfem_cache_prepare_source
+  MFEM_SOURCE_ROOT="${MFEM_CACHE_SOURCE}" MFEM_BUILD="${MFEM_CACHE_BUILD}" MFEM_INSTALL="${MFEM_CACHE_INSTALL}"
+  validate_mfem_source_checkout "${MFEM_SOURCE_ROOT}" "shared cache"
+  MFEM_INTENT_CUDA_COMPILER="none" MFEM_INTENT_CUDA_COMPILER_SHA="none"
+  if [[ "${MODE}" == "gpu" ]]; then
+    MFEM_INTENT_CUDA_COMPILER="$(spack -e "${SPACK_ENV}" location -i cuda)/bin/nvcc"
+    MFEM_INTENT_CUDA_COMPILER="$(realpath -e -- "${MFEM_INTENT_CUDA_COMPILER}")"
+    MFEM_INTENT_CUDA_COMPILER_SHA="$(sha256sum "${MFEM_INTENT_CUDA_COMPILER}" | cut -d' ' -f1)"
+  fi
+  mfem_cache_admit_intent "$(printf '%s\n' 'schema=igrlab-mfem-cache-intent-v1' \
+    "source=${MFEM_SOURCE_ROOT}" "pin=${MFEM_SOURCE_PIN}" \
+    "release_tag=$(git -C "${MFEM_SOURCE_ROOT}" rev-parse refs/tags/v4.9)" \
+    "build=${MFEM_BUILD}" "install=${MFEM_INSTALL}" "mode=${MODE}" "profile=${PROFILE}" \
+    "build_type=${CMAKE_BUILD_TYPE}" "caliper=${CALIPER}" "cuda_archs=${MFEM_CUDA_ARCHS}" \
+    "manifest=$(sha256sum "${SPACK_ENV}/spack.yaml" | cut -d' ' -f1)" \
+    "driver_policy=$(sha256sum "${SCRIPT_DIR}/build.sh" | cut -d' ' -f1)" \
+    "helper_policy=$(sha256sum "${SCRIPT_DIR}/build_mfem_tpl.sh" | cut -d' ' -f1)" \
+    "cache_policy=$(sha256sum "${SCRIPT_DIR}/scripts/build/mfem_cache.sh" | cut -d' ' -f1)" \
+    "compiler=$(realpath -e -- "$(command -v g++)")" \
+    "compiler_sha=$(sha256sum "$(command -v g++)" | cut -d' ' -f1)" \
+    "mpi_wrapper=$(spack -e "${SPACK_ENV}" location -i openmpi)/bin/mpicxx" \
+    "mpi_wrapper_sha=$(sha256sum "$(spack -e "${SPACK_ENV}" location -i openmpi)/bin/mpicxx" | cut -d' ' -f1)" \
+    "cmake_sha=$(sha256sum "$(spack -e "${SPACK_ENV}" location -i cmake)/bin/cmake" | cut -d' ' -f1)" \
+    "cuda_compiler=${MFEM_INTENT_CUDA_COMPILER}" "cuda_compiler_sha=${MFEM_INTENT_CUDA_COMPILER_SHA}" \
+    "cflags=${CFLAGS:-}" "cxxflags=${CXXFLAGS:-}" "cppflags=${CPPFLAGS:-}" "ldflags=${LDFLAGS:-}" "cudaflags=${CUDAFLAGS:-}" \
+    "lock=$(sha256sum "${SPACK_ENV}/spack.lock" | cut -d' ' -f1)")"
+  if [[ -e "${MFEM_BUILD}/${MFEM_IDENTITY_STAMP_NAME}" || -L "${MFEM_BUILD}/${MFEM_IDENTITY_STAMP_NAME}" ]]; then
+    validate_reused_mfem "${MFEM_SOURCE_ROOT}"
+    echo "[mfem-cache] admitted immutable hit: ${MFEM_OUTPUT_ROOT_REQUEST}"
+  else
+    echo "[mfem-cache] filling matching cache: ${MFEM_OUTPUT_ROOT_REQUEST}"
+  fi
+fi
+
 mfem_args=("--${MODE}" --jobs "${MFEM_JOBS}")
 if ((CALIPER)); then
   mfem_args+=(--caliper)
@@ -2646,7 +2834,7 @@ if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
   export DG_IGR_TEST_REUSE_CUDA_ARCH="${DEPENDENCY_CUDA_ARCH}"
 else
   prepare_external_fresh_mfem
-  if ((CLEAN)); then
+  if ((CLEAN)) && [[ -z "${MFEM_OUTPUT_ROOT_REQUEST}" ]]; then
     revalidate_scoped_output_layout
     rm -rf "${MFEM_BUILD}" "${MFEM_INSTALL}"
   fi
@@ -2658,6 +2846,9 @@ else
     MFEM_INSTALL="${MFEM_INSTALL}" \
     "${SCRIPT_DIR}/build_mfem_tpl.sh" "${mfem_args[@]}"
   validate_local_mfem_artifacts
+fi
+if [[ -n "${MFEM_OUTPUT_ROOT_REQUEST}" ]]; then
+  mfem_cache_release
 fi
 
 CMAKE_BIN="$(spack -e "${SPACK_ENV}" location -i cmake)/bin/cmake"
@@ -2753,38 +2944,12 @@ python3 "${SCRIPT_DIR}/scripts/build/check_dependency_bindings.py" \
   --mfem-targets "${MFEM_INSTALL}/lib/cmake/mfem/MFEMTargets.cmake" \
   --app-build "${APP_BUILD}"
 
-if ((RUN_TESTS)); then
-  CTEST_BIN="$(dirname -- "${CMAKE_BIN}")/ctest"
-  if [[ -n "${TEST_REGEX}" ]]; then
-    selected_tests="$("${CTEST_BIN}" --test-dir "${APP_BUILD}" -N -R "${TEST_REGEX}")" || {
-      echo "ERROR: --test-regex is not accepted by CTest: ${TEST_REGEX}" >&2
-      exit 2
-    }
-    if ! grep -Eq '^  Test #[0-9]+:' <<< "${selected_tests}"; then
-      echo "ERROR: --test-regex selected no tests: ${TEST_REGEX}" >&2
-      exit 2
-    fi
-    "${CTEST_BIN}" --test-dir "${APP_BUILD}" --output-on-failure \
-      -R "${TEST_REGEX}"
-  else
-    "${CTEST_BIN}" --test-dir "${APP_BUILD}" --output-on-failure
-  fi
-fi
+prebuilt_receipt_args
+python3 "${SCRIPT_DIR}/scripts/build/prebuilt_validation.py" write "${PREBUILT_ARGS[@]}" \
+  --mfem-source "${MFEM_SOURCE_ROOT}" --mfem-build "${MFEM_BUILD}" --mfem-install "${MFEM_INSTALL}" \
+  --expected-source "${PREBUILD_SOURCE_IDENTITY}"
+echo "[build] prebuilt validation receipt published: ${APP_BUILD}/igrlab-prebuilt-validation-v1.json"
 
-if ((RUN_SMOKE)); then
-  smoke_exe="${APP_BUILD}/examples/sedov_taylor_blast/sedov_taylor_blast"
-  smoke_args=(--t-final 0.001 -rs 0 -rp 1 -o 1 -c 0.25
-              -vs 10 -ca 5.0 -is H1 -ig H1 -dt_save 0.1)
-  if [[ "${MODE}" == "gpu" ]]; then
-    if ! "${smoke_exe}" --help 2>&1 | grep -q -- '--device'; then
-      echo "ERROR: this branch does not expose the CUDA runtime device option." >&2
-      echo "       Rebase the GPU runtime support before using --gpu --smoke." >&2
-      exit 4
-    fi
-    smoke_args=(--device cuda "${smoke_args[@]}")
-  fi
-  "${MPI_PREFIX}/bin/mpirun" -np 2 \
-    "${smoke_exe}" "${smoke_args[@]}"
-fi
+run_canonical_checks
 
 echo "[build] complete: profile=${PROFILE} hdg_runtime=${HDG_RUNTIME} hdg_auxiliary_experiment=${HDG_AUXILIARY_EXPERIMENT} hdg_euler_experiment=${HDG_EULER_EXPERIMENT} hdg_euler_device_experiment=${HDG_EULER_DEVICE_EXPERIMENT} nvtx_profile=${NVTX_PROFILE} build=${APP_BUILD} install=${APP_INSTALL}"
