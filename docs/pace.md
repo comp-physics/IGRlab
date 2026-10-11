@@ -118,3 +118,15 @@ Prefixes come from Spack's
 The generated `site-packages.json` records discovery for each profile. A changed
 site installation requires a new dependency root, preserving the existing lock
 and binaries until their replacements have been validated.
+
+The public submission route was verified on PACE on 2026-10-11 at build-driver
+commit `30390d8`, with the working tree's DG/HDG numerical edits and pinned MFEM
+`d9d6526` (`v4.9`). Both profiles ran with dependency installation enabled:
+ordinary concretization retained the exact manifest and lock, and the final
+checks admitted the installed MFEM interfaces and application library bindings.
+CPU build job `13957931` completed in 2m34s; native-SM80 HDG/NVTX build job
+`13957935` completed in 4m14s. Both used the free CPU queue. CPU validation job
+`13957934` passed all three selected tests: `igrlab_mpi_test_launcher`,
+`dg_igr_dg_operator_tests`, and `dg_igr_sigma_vtk_lifecycle_cpu`.
+The A100 result covers compilation and library binding checks; device execution
+requires the separate GPU validation allocation described above.
