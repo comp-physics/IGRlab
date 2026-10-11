@@ -18,7 +18,8 @@ set_tests_properties(dg_igr_cuda_build_policy PROPERTIES
   TIMEOUT 30
 )
 
-foreach(build_check pace_submission pace_manifest pace_discovery dependency_bindings)
+foreach(build_check pace_submission pace_manifest pace_discovery dependency_bindings
+                    prebuilt_validation mfem_cache)
   add_test(NAME igrlab_${build_check}
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/test_${build_check}.py)
@@ -288,6 +289,42 @@ target_link_libraries(dg_igr_unit_tests PRIVATE igr_mfem mfem)
 target_include_directories(dg_igr_unit_tests PRIVATE
   ${CMAKE_SOURCE_DIR}/include
 )
+
+# Small evolution gates use the production DG/DGSEM Mult and SSPRK(3,3)
+# implementations.  Longer convergence ladders remain separately selectable.
+add_executable(igrlab_numerical_evolution_test test_numerical_evolution.cpp)
+target_link_libraries(igrlab_numerical_evolution_test PRIVATE igr_mfem mfem)
+target_include_directories(igrlab_numerical_evolution_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include)
+target_compile_features(igrlab_numerical_evolution_test PRIVATE cxx_std_17)
+target_compile_options(igrlab_numerical_evolution_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+add_test(NAME igrlab_numerical_conservation_cpu
+  COMMAND igrlab_numerical_evolution_test --conservation cpu)
+set_tests_properties(igrlab_numerical_conservation_cpu PROPERTIES
+  LABELS "numerical-acceptance;numerical-smoke;conservation;dg;dgsem;production;cpu"
+  PROCESSORS 1 TIMEOUT 180)
+add_test(NAME igrlab_numerical_dg_convergence_cpu
+  COMMAND igrlab_numerical_evolution_test --convergence cpu)
+set_tests_properties(igrlab_numerical_dg_convergence_cpu PROPERTIES
+  LABELS "numerical-acceptance;numerical-convergence;convergence;spatial;dg;production;cpu"
+  PROCESSORS 1 TIMEOUT 300)
+if(MFEM_USE_CUDA)
+  # The source stays ordinary C++; final device-symbol resolution reaches the
+  # production CUDA kernels in igr_mfem through the same link closure as units.
+  set_target_properties(igrlab_numerical_evolution_test PROPERTIES
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  add_test(NAME igrlab_numerical_conservation_cuda
+    COMMAND igrlab_numerical_evolution_test --conservation cuda)
+  add_test(NAME igrlab_numerical_backend_parity_cuda
+    COMMAND igrlab_numerical_evolution_test --backend-parity cuda)
+  set_tests_properties(igrlab_numerical_conservation_cuda
+                       igrlab_numerical_backend_parity_cuda PROPERTIES
+    LABELS "numerical-acceptance;numerical-smoke;conservation;dg;dgsem;production;cuda"
+    PROCESSORS 1 TIMEOUT 240 RUN_SERIAL TRUE)
+  set_property(TEST igrlab_numerical_backend_parity_cuda APPEND PROPERTY
+    LABELS "backend-parity;cpu")
+endif()
 
 if(MFEM_USE_MPI AND MPIEXEC_EXECUTABLE AND MPIEXEC_NUMPROC_FLAG)
   if(IGRLAB_BUILD_RESEARCH_TESTS)
@@ -624,6 +661,8 @@ if(MFEM_USE_CUDA)
   )
 endif()
 add_test(NAME dg_igr_dgsem_advection_tests COMMAND dg_igr_unit_tests --dgsem-advection)
+set_tests_properties(dg_igr_dgsem_advection_tests PROPERTIES
+  LABELS "numerical-acceptance;numerical-convergence;convergence;spatial;dgsem;production;cpu")
 add_test(NAME dg_igr_dgsem_igr_tests COMMAND dg_igr_unit_tests --dgsem-igr)
 add_test(NAME dg_igr_dgsem_portability_refactor_tests
          COMMAND dg_igr_unit_tests --dgsem-operator --dgsem-igr)

@@ -457,6 +457,10 @@ foreach(_order IN ITEMS 1 2 3)
       PROCESSORS 1
       RESOURCE_LOCK dg_igr_sm120
       TIMEOUT 7200)
+  if(_order EQUAL 1 OR _order EQUAL 3)
+    set_property(TEST dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p${_order}_rank1
+      APPEND PROPERTY LABELS "numerical-acceptance;numerical-smoke;backend-parity")
+  endif()
 endforeach()
 
 # RODAS3 reuses the complete CPU/ordinary-CUDA/tensor-CUDA alignment fixture,
@@ -823,6 +827,10 @@ foreach(_regularization IN ITEMS conventional igr)
         PROCESSORS 1
         RESOURCE_LOCK dg_igr_sm120
         TIMEOUT 7200)
+    if(_order EQUAL 1 OR _order EQUAL 3)
+      set_property(TEST dg_igr_hdg_runtime_cuda_generic_euler_convergence_${_regularization}_p${_order}_rank1
+        APPEND PROPERTY LABELS "numerical-acceptance;numerical-convergence")
+    endif()
   endforeach()
 endforeach()
 
