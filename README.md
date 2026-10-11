@@ -43,6 +43,15 @@ Then use the unified build driver:
 ./build.sh --a100 --hdg-runtime -j 16
 ```
 
+On PACE, use the checked-in site profile to submit compilation and validation to
+the free background queue. See [the one-command PACE build](docs/pace.md) for
+the scratch output path and Spack setup:
+
+```bash
+./build.sh --site pace --a100 --hdg-runtime --submit \
+  --output-root /absolute/scratch/igrlab-build --spack-root /path/to/spack/core
+```
+
 Application and locally built MFEM outputs live outside the checkout. By default they are scoped under
 `${XDG_CACHE_HOME:-$HOME/.cache}/igrlab-build` by canonical worktree and
 profile; choose another external location with `--output-root DIR` or

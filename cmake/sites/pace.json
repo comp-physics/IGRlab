@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "target": "x86_64_v3",
+  "compiler": {
+    "version": "12.3.0",
+    "prefix": "/storage/pace-apps/spack/packages/linux-rhel9-x86_64_v3/gcc-11.3.1/gcc-12.3.0-ukkkutsxfl5kpnnaxflpkq2jtliwthfz"
+  },
+  "cmake": {
+    "version": "3.30.2",
+    "prefix": "/storage/pace-apps/spack/packages/linux-rhel9-x86_64_v3/gcc-12.3.0/cmake-3.30.2-yzfwrncmyizuujyat2tsx3j7gkcfheib"
+  },
+  "metis": {
+    "version": "5.1.0",
+    "prefix": "/storage/pace-apps/spack/packages/linux-rhel9-x86_64_v3/gcc-12.3.0/metis-5.1.0-hao7535gpfkbrcmfj47jidrlxoat7y62"
+  },
+  "openblas": {
+    "version": "0.3.23",
+    "prefix": "/storage/pace-apps/spack/packages/linux-rhel9-x86_64_v3/gcc-12.3.0/openblas-0.3.23-5yio6b23mudqpzcp5vo7myqjlm2cai53"
+  },
+  "cuda_version": "12.9.1",
+  "cuda_prefix": "/storage/pace-apps/spack/packages/linux-rhel9-x86_64_v3/none-none/cuda-12.9.1-leytg2766xv4h3xx3vg4rkxawtyj5qvl",
+  "hypre_version": "3.1.0",
+  "umpire_version": "2025.12.0",
+  "zlib_version": "1.3.1",
+  "profiles": {
+    "cpu": {
+      "modules": ["gcc/12.3.0", "cmake/3.30.2", "metis/5.1.0", "openblas/0.3.23"],
+      "mpi_version": "4.1.5",
+      "mpi_prefix": "/storage/pace-apps/spack/packages/linux-rhel9-x86_64_v3/gcc-12.3.0/openmpi-4.1.5-ahgvv7r3aju6cty4nlmcd5hihsckie7j",
+      "mpi_spec": "openmpi@4.1.5 ~cuda ~cxx ~cxx_exceptions ~openshmem +rsh +romio fabrics=none schedulers=none target=x86_64_v3 %gcc@12.3.0",
+      "mpi_parameters": {
+        "cuda": false, "cxx": false, "cxx_exceptions": false,
+        "openshmem": false, "rsh": true, "romio": true,
+        "fabrics": "none", "schedulers": "none"
+      }
+    },
+    "cuda-sm80": {
+      "modules": ["gcc/12.3.0", "openmpi/5.0.9-cuda", "cmake/3.30.2", "metis/5.1.0", "openblas/0.3.23"],
+      "mpi_version": "5.0.9",
+      "mpi_prefix": "/storage/pace-apps/spack/packages/linux-rhel9-x86_64_v3/gcc-12.3.0/openmpi-5.0.9-wlh7wq6vac7tt6ebougukqbmopqefucy",
+      "mpi_spec": "openmpi@5.0.9 +cuda +fortran ~openshmem ~rsh ~romio fabrics=ucx schedulers=slurm ~internal-pmix ~internal-hwloc ~internal-libevent target=x86_64_v3 %gcc@12.3.0",
+      "mpi_parameters": {
+        "cuda": true, "fortran": true, "openshmem": false,
+        "rsh": false, "romio": false, "fabrics": "ucx", "schedulers": "slurm",
+        "internal-pmix": false, "internal-hwloc": false, "internal-libevent": false
+      }
+    }
+  }
+}

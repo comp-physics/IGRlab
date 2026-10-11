@@ -11,6 +11,15 @@ set_tests_properties(dg_igr_cuda_build_policy PROPERTIES
   TIMEOUT 30
 )
 
+foreach(build_check pace_submission pace_manifest dependency_bindings)
+  add_test(NAME igrlab_${build_check}
+    COMMAND /usr/bin/env python3
+            ${CMAKE_SOURCE_DIR}/tests/scripts/test_${build_check}.py)
+  set_tests_properties(igrlab_${build_check} PROPERTIES
+    LABELS "build;contract;python;no-gpu"
+    TIMEOUT 30)
+endforeach()
+
 add_test(NAME dg_igr_hdg_tensor_campaign_python
   COMMAND /usr/bin/env python3
           ${CMAKE_SOURCE_DIR}/scripts/perf/test_hdg_tensor_campaign.py

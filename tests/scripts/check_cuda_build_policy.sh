@@ -823,6 +823,45 @@ for driver_and_variable in "${BUILD_DRIVER}:hypre_spec" "${MFEM_DRIVER}:HYPRE_SP
   done
 done
 
+# CPU and GPU configure share the full FindHYPRE refresh. Check the production
+# argument array without invoking CMake; changing HYPRE_DIR must also replace
+# its singular discovery paths and rerun version/backend probes.
+(
+  base_arguments="$(awk '
+    /^cmake_args=\(/ { capture = 1 }
+    capture { print }
+    capture && /^\)$/ { exit }
+  ' "${MFEM_DRIVER}")"
+  [[ -n "${base_arguments}" ]] || fail "missing shared MFEM configure arguments"
+  CMAKE_BUILD_TYPE=Release
+  MFEM_INSTALL="${tmp_root}/mfem-install"
+  MPI_PREFIX="${tmp_root}/mpi"
+  METIS_PREFIX="${tmp_root}/metis"
+  for hypre_revision in old current; do
+    HYPRE_PREFIX="${tmp_root}/${hypre_revision}-hypre"
+    HYPRE_HEADER="${HYPRE_PREFIX}/include/HYPRE.h"
+    HYPRE_LIBRARY="${HYPRE_PREFIX}/lib/libHYPRE.so"
+    eval "${base_arguments}"
+    for expected_arg in \
+        -UHYPRE_FOUND -UHYPRE_INCLUDE_DIR -UHYPRE_INCLUDE_DIRS \
+        -UHYPRE_LIBRARY -UHYPRE_LIBRARIES -UHYPRE_VERSION '-UHYPRE_VERSION_*' \
+        -UHYPRE_USING_CUDA -UHYPRE_USING_HIP \
+        -UTPL_HYPRE_INCLUDE_DIRS -UTPL_HYPRE_LIBRARIES; do
+      [[ " ${cmake_args[*]} " == *" ${expected_arg} "* ]] || \
+        fail "shared HYPRE refresh omits ${expected_arg}"
+    done
+    for actual_arg in "${cmake_args[@]}"; do
+      case "${actual_arg}" in
+        -UHYPRE_*|-UTPL_HYPRE_*) ;;
+        -U*) fail "shared HYPRE refresh clears an unrelated cache entry: ${actual_arg}" ;;
+      esac
+    done
+    assert_contains " ${cmake_args[*]} " " -DHYPRE_DIR=${HYPRE_PREFIX} "
+    assert_contains " ${cmake_args[*]} " " -DHYPRE_INCLUDE_DIR:PATH=${HYPRE_PREFIX}/include "
+    assert_contains " ${cmake_args[*]} " " -DHYPRE_LIBRARY:FILEPATH=${HYPRE_LIBRARY} "
+  done
+)
+
 # Exercise the production SM80 static-HYPRE linkage selector without invoking
 # a compiler. SM120 must not query OpenBLAS or gain host LAPACK dependencies.
 (
@@ -852,19 +891,15 @@ done
   configure_sm80_hypre_linalg
   for expected_arg in \
       '-DHYPRE_REQUIRED_PACKAGES:STRING=BLAS;LAPACK;UMPIRE' \
-      -DUMPIRE_TARGET_NAMES:STRING=umpire -DUMPIRE_TARGET_FORCE:BOOL=OFF \
-      -UHYPRE_FOUND -UHYPRE_LIBRARIES -UHYPRE_INCLUDE_DIRS; do
+      -DUMPIRE_TARGET_NAMES:STRING=umpire -DUMPIRE_TARGET_FORCE:BOOL=OFF; do
     [[ " ${cmake_args[*]} " == *" ${expected_arg} "* ]] || \
       fail "SM80 static-HYPRE dependency arguments omit ${expected_arg}"
   done
-  unset_count=0
   for actual_arg in "${cmake_args[@]}"; do
     case "${actual_arg}" in
-      -UHYPRE_FOUND|-UHYPRE_LIBRARIES|-UHYPRE_INCLUDE_DIRS) unset_count=$((unset_count + 1)) ;;
-      -U*) fail "SM80 clears an unrelated or broad CMake cache entry: ${actual_arg}" ;;
+      -U*) fail "SM80 linkage selector duplicates the shared HYPRE cache refresh: ${actual_arg}" ;;
     esac
   done
-  [[ ${unset_count} -eq 3 ]] || fail "SM80 HYPRE rediscovery must clear exactly three cache entries"
   assert_contains "${cmake_args[*]}" '-DBLA_VENDOR:STRING=OpenBLAS'
   assert_contains "${cmake_args[*]}" "-DBLAS_openblas_LIBRARY:FILEPATH=${openblas_fixture}/lib64/libopenblas.so"
   assert_contains "${cmake_args[*]}" "-DLAPACK_openblas_LIBRARY:FILEPATH=${openblas_fixture}/lib64/libopenblas.so"

@@ -3,6 +3,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
+# Site setup remains a thin front end to this driver. It prepares the site's
+# dependency scope and then invokes this same file without the site arguments.
+for build_argument in "$@"; do
+  if [[ "${build_argument}" == "--site" ]]; then
+    exec "${SCRIPT_DIR}/scripts/build/pace.sh" "$@"
+  fi
+done
+
 # OpenMPI consults HOME even for serial CTest children.  The supervised
 # controller intentionally supplies a closed environment, so recover only the
 # effective user's passwd home when HOME is absent; an ambiguous or unusable
@@ -157,6 +165,10 @@ Modes:
   --a100            Select the A100 profile (equivalent to --gpu --cuda-arch 80).
 
 Options:
+  --site pace       Load the checked-in PACE toolchain/dependency profile.
+                    Requires an external --output-root and initialized Spack
+                    or IGRLAB_PACE_SPACK_ROOT; see docs/pace.md.
+  --submit          With --site pace, submit to the free embers background queue.
   --caliper         Build the CPU-only Caliper observability profile.
   --nvtx-profile    Compile GPU profiler binaries with runtime-default-off
                     NVTX observability regions.
@@ -1061,6 +1073,21 @@ validate_mfem_source_checkout() {
     echo "ERROR: ${source_kind} MFEM pin mismatch: expected=${expected_pin} actual=${root_head}" >&2
     exit 3
   }
+
+  # The HDG face oracle binds MFEM's release description as well as its commit.
+  # A commit-only Git bundle can otherwise compile MFEM for many minutes before
+  # the application notices its missing release tag.
+  if [[ "${HDG_RUNTIME}" == "ON" &&
+        "${expected_pin}" == "d9d6526cc1749980a2ba1da16e2c1ca1e07d82ec" ]]; then
+    local mfem_release_description
+    mfem_release_description="$(git -C "${root}" describe --all --long --abbrev=40 2>/dev/null)" || true
+    [[ "${mfem_release_description}" == "tags/v4.9-0-g${expected_pin}" ]] || {
+      echo "ERROR: HDG requires the pinned MFEM v4.9 release tag before building dependencies." >&2
+      echo "       Restore it with: git -C '${root}' fetch origin tag v4.9" >&2
+      echo "       Include refs/tags/v4.9 when transporting MFEM in a Git bundle." >&2
+      exit 3
+    }
+  fi
 
   for header in fem/picojson.h general/tinyxml2.h; do
     header_blob="$(git -C "${root}" rev-parse \
@@ -1993,6 +2020,12 @@ validate_reused_mfem() {
       exit 3
       ;;
   esac
+  # HYPRE_DIR alone does not identify FindHYPRE's cached artifacts. Admit the
+  # actual headers/libraries and the interface exported to application builds.
+  python3 "${SCRIPT_DIR}/scripts/build/check_dependency_bindings.py" \
+    --hypre-prefix "${hypre_prefix}" --mpi-prefix "${mpi_prefix}" \
+    --mfem-cache "${cache}" --mfem-config "${config}" \
+    --mfem-targets "${targets}" || exit 3
   view_metis_header="$(canonical_existing_path \
     "${metis_artifact_root}/include/metis.h")" || {
     echo "ERROR: selected Spack artifact root has no usable METIS header." >&2
@@ -2558,15 +2591,24 @@ command -v spack >/dev/null 2>&1 || {
 
 if ((INSTALL_DEPS)); then
   echo "[build] installing ${MODE} dependencies from ${SPACK_ENV}"
-  if ((CALIPER)); then
+  if ((CALIPER)) || [[ "${IGRLAB_BUILD_SITE:-}" == "pace" ]]; then
     spack -e "${SPACK_ENV}" concretize
   else
     spack -e "${SPACK_ENV}" concretize -f
+  fi
+  if [[ "${IGRLAB_BUILD_SITE:-}" == "pace" ]]; then
+    python3 "${SCRIPT_DIR}/scripts/build/pace_manifest.py" --profile "${PROFILE}" \
+      --check-lock "${SPACK_ENV}/spack.lock"
   fi
   spack -e "${SPACK_ENV}" install
   if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
     revalidate_reused_mfem_after_dependencies
   fi
+fi
+
+if [[ "${IGRLAB_BUILD_SITE:-}" == "pace" ]]; then
+  python3 "${SCRIPT_DIR}/scripts/build/pace_manifest.py" --profile "${PROFILE}" \
+    --check-lock "${SPACK_ENV}/spack.lock"
 fi
 
 SPACK_VIEW="${SPACK_ENV}/.spack-env/view"
@@ -2577,6 +2619,13 @@ SPACK_VIEW="${SPACK_ENV}/.spack-env/view"
 }
 export PATH="${SPACK_VIEW}/bin:${PATH}"
 export LD_LIBRARY_PATH="${SPACK_VIEW}/lib:${SPACK_VIEW}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
+if [[ "${IGRLAB_BUILD_SITE:-}" == "pace" &&
+      "${IGRLAB_PACE_ENV_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
+  flock -u "${IGRLAB_PACE_ENV_LOCK_FD}"
+  exec {IGRLAB_PACE_ENV_LOCK_FD}>&-
+  unset IGRLAB_PACE_ENV_LOCK_FD
+fi
 
 mfem_args=("--${MODE}" --jobs "${MFEM_JOBS}")
 if ((CALIPER)); then
@@ -2692,6 +2741,14 @@ if [[ "${MODE}" == "gpu" ]]; then
 fi
 "${CMAKE_BIN}" --build "${APP_BUILD}" -j"${JOBS}"
 "${CMAKE_BIN}" --install "${APP_BUILD}"
+
+HYPRE_PREFIX="$(spack -e "${SPACK_ENV}" location -i hypre)"
+python3 "${SCRIPT_DIR}/scripts/build/check_dependency_bindings.py" \
+  --hypre-prefix "${HYPRE_PREFIX}" --mpi-prefix "${MPI_PREFIX}" \
+  --mfem-cache "${MFEM_BUILD}/CMakeCache.txt" \
+  --mfem-config "${MFEM_INSTALL}/lib/cmake/mfem/MFEMConfig.cmake" \
+  --mfem-targets "${MFEM_INSTALL}/lib/cmake/mfem/MFEMTargets.cmake" \
+  --app-build "${APP_BUILD}"
 
 if ((RUN_TESTS)); then
   CTEST_BIN="$(dirname -- "${CMAKE_BIN}")/ctest"
