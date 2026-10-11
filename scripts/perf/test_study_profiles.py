@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -257,7 +258,7 @@ class CaptureTests(unittest.TestCase):
                 value = profiles.capture(case, ['app', '--profile-measured-step', '0'], runner, directory, GPU)
             ncu = next(argv for label, argv, timeout in runner.commands if label == 'profiles/ncu')
             self.assertEqual(ncu[ncu.index('--kernel-id') + 1],
-                             '::regex:' + case['profile']['kernel_regex'] + ':1')
+                             '::regex:(PackedInverseMassKernel|BorrowedEulerFaceKernel):1')
             self.assertNotIn('--kernel-name', ncu)
             self.assertNotIn('--launch-count', ncu)
             self.assertNotIn('--launch-skip', ncu)
@@ -283,13 +284,33 @@ class CaptureTests(unittest.TestCase):
             with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU):
                 result = profiles.capture(case, ['app', '--profile-measured-step', '0'], runner, directory, GPU)
             ncu = next(argv for label, argv, timeout in runner.commands if label == 'profiles/ncu')
-            self.assertEqual(ncu[ncu.index('--kernel-id') + 1], '::regex:' + regex + ':1')
+            encoded = r'.*(BorrowedCondenseKernel|cusparse\x3a\x3aspsm_v2_kernel).*'
+            self.assertEqual(ncu[ncu.index('--kernel-id') + 1], '::regex:' + encoded + ':1')
             self.assertNotIn('--kernel-name', ncu)
+            self.assertEqual(result['selected_kernel_regex'], regex)
+            self.assertEqual(result['ncu_kernel_id_regex'], encoded)
             self.assertEqual(result['captures']['ncu']['metrics']['observed_kernel_groups'],
                              ['condensation', 'triangular'])
         text = long_csv([['1', 'void UnrequestedZeroKernel()', profiles.DURATION, 'us', '1']])
         with self.assertRaisesRegex(profiles.ProfileError, r'launch=1, kernel=.*UnrequestedZeroKernel'):
             profiles.parse_ncu(text, 'PackedInverseMassKernel')
+
+    def test_colon_free_selector_preserves_search_membership_and_escaped_literals(self):
+        patterns = [r'.*(?:foo|ns::bar).*', r'[:](?:foo|bar)', r'foo\:bar',
+                    r'\(\?:literal', r'[(?:]+foo', r'[]:(]+foo', r'(foo)::\1']
+        names = ['foo', 'bar', 'ns::bar', 'void ns::bar(int)', 'void baz()',
+                 ':foo', 'foo:bar', '(?:literal', '(:foo', ']foo', 'foo::foo']
+        for pattern in patterns:
+            with self.subTest(pattern=pattern):
+                encoded = profiles._kernel_id_regex(pattern)
+                self.assertNotIn(':', encoded)
+                self.assertEqual([bool(re.search(pattern, name)) for name in names],
+                                 [bool(re.search(encoded, name)) for name in names])
+
+    def test_colon_free_selector_rejects_matching_changing_group_conversions(self):
+        for pattern in (r'(?:foo)(bar)\1', r'(foo)(?:bar)(?(1)yes|no)', r'(?i:foo)'):
+            with self.subTest(pattern=pattern), self.assertRaises(profiles.ProfileError):
+                profiles._kernel_id_regex(pattern)
 
     def test_all_ncu_commands_disable_ambient_configuration(self):
         with tempfile.TemporaryDirectory() as temporary:

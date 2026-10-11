@@ -333,6 +333,47 @@ def _available_names(text, names):
     return [name for name in names if re.search(r'(?<![A-Za-z0-9_])' + re.escape(name) + r'(?![A-Za-z0-9_])', text)]
 
 
+def _kernel_id_regex(expression):
+    """Encode a regex without colons, which delimit NCU kernel-id fields.
+
+    Capturing versus noncapturing groups does not change search membership
+    unless group numbering is referenced; reject that conversion explicitly.
+    The original expression remains the independent imported-name gate.
+    """
+    output, index, in_class, class_first = [], 0, False, -1
+    converted, references = False, False
+    while index < len(expression):
+        character = expression[index]
+        if character == '\\':
+            following = expression[index + 1]
+            references |= not in_class and following in '123456789'
+            output.append(r'\x3a' if following == ':' else expression[index:index + 2])
+            index += 2
+            continue
+        if not in_class:
+            if expression.startswith('(?:', index):
+                output.append('(')
+                converted = True
+                index += 3
+                continue
+            require(re.match(r'\(\?[aiLmsux-]+:', expression[index:]) is None,
+                    'NCU kernel-id cannot encode scoped regex flags without changing matching')
+            references |= expression.startswith('(?(', index)
+            if character == '[':
+                in_class = True
+                class_first = index + 1 + (expression[index + 1:index + 2] == '^')
+        elif character == ']' and index > class_first:
+            in_class = False
+        output.append(r'\x3a' if character == ':' else character)
+        index += 1
+    require(not (converted and references),
+            'NCU kernel-id cannot convert noncapturing groups with numbered references or conditionals')
+    encoded = ''.join(output)
+    require(':' not in encoded, 'NCU kernel-id regex must not contain field delimiters')
+    re.compile(encoded)
+    return encoded
+
+
 def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: dict) -> dict:
     """Capture a bounded selection; caller validates returned application logs."""
     adapter = case.get('adapter')
@@ -358,6 +399,7 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
     for value in groups.values():
         re.compile(value)
     require(selection != 'first-per-kernel' or skip == 0, 'first-per-kernel selection requires zero launch skip')
+    selector_regex = _kernel_id_regex(regex) if selection == 'first-per-kernel' else None
     for preferred, alias in (('launch_skip', 'skip'), ('launch_count', 'count')):
         require(preferred not in profile or alias not in profile or profile[preferred] == profile[alias],
                 'conflicting profiler selection aliases')
@@ -386,6 +428,7 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
               'scope': 'selected measured step zero' if adapter == 'hdg' else 'whole application capture with bounded NCU selection',
               'primary_timing': False, 'selected_kernel_regex': regex, 'launch_skip': skip,
               'launch_count': count, 'selection': selection, 'required_kernel_groups': groups,
+              'ncu_kernel_id_regex': selector_regex,
               'tools': {}, 'captures': {}, 'application_logs': []}
     tools = {name: _tool(profile.get(name, name)) for name in ('nsys', 'ncu')}
     for name, tool in tools.items():
@@ -439,7 +482,7 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
             if selection == 'first-per-kernel':
                 # Express both constraints in the documented single selector;
                 # an empty-name kernel-id must not replace the name filter.
-                command += ['--kernel-id', '::regex:' + regex + ':1']
+                command += ['--kernel-id', '::regex:' + selector_regex + ':1']
             else:
                 command += ['--kernel-name', 'regex:' + regex,
                             '--launch-skip', str(skip), '--launch-count', str(count)]
