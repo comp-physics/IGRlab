@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -111,6 +112,43 @@ print(9000 + count)
         result = self.submit('--site-root', 'relative')
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.calls('sbatch'), [])
+
+    def test_submission_rejects_symlinked_site_directory(self):
+        elsewhere = self.root / 'elsewhere'
+        elsewhere.mkdir()
+        self.output.mkdir()
+        (self.output / 'site').symlink_to(elsewhere, target_is_directory=True)
+        result = self.submit('--a100', '--no-tests')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(list(elsewhere.iterdir()), [])
+        self.assertEqual(self.calls('sbatch'), [])
+
+    def prepare_lock(self):
+        # Exercise the real path guard/open logic without needing PACE modules.
+        text = self.helper.read_text()
+        functions = '\n'.join(re.search(r'^' + name + r'\(\) \{\n.*?^\}', text,
+                                         flags=re.M | re.S).group(0)
+                              for name in ('pace_prepare_site_directory', 'pace_prepare_dependency_lock'))
+        script = ('pace_fail() { echo "$*" >&2; exit 2; };\n' + functions +
+                  '\npace_dependency_root=$1; pace_profile=cpu; pace_prepare_dependency_lock\n')
+        return subprocess.run(['bash', '-c', script, 'fixture', str(self.output)],
+                              text=True, capture_output=True, timeout=10)
+
+    def test_dependency_lock_preserves_contents_and_rejects_symlink(self):
+        locks = self.output / 'site/pace/locks'
+        locks.mkdir(parents=True)
+        lock = locks / 'cpu.lock'
+        lock.write_text('preserved metadata')
+        result = self.prepare_lock()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lock.read_text(), 'preserved metadata')
+        lock.unlink()
+        victim = self.root / 'unrelated'
+        victim.write_text('unrelated content')
+        lock.symlink_to(victim)
+        result = self.prepare_lock()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(victim.read_text(), 'unrelated content')
 
     def test_worker_preserves_literal_arguments_and_separates_tests(self):
         regex = '^(one|two) $HOME `literal`\nthird$'

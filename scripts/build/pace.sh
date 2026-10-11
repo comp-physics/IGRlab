@@ -7,6 +7,25 @@ pace_config="${pace_source}/cmake/sites/pace.json"
 
 pace_fail() { echo "ERROR: PACE: $*" >&2; exit 2; }
 
+pace_prepare_site_directory() {
+  local target="$1" component
+  for component in "$pace_dependency_root/site" "$pace_dependency_root/site/pace" "$target"; do
+    [[ ! -L $component && (! -e $component || -d $component) ]] || \
+      pace_fail "site directory is symlinked or not a directory: $component"
+  done
+  mkdir -p -- "$target"
+}
+
+pace_prepare_dependency_lock() {
+  pace_prepare_site_directory "$pace_dependency_root/site/pace/locks"
+  local lock_path="$pace_dependency_root/site/pace/locks/$pace_profile.lock"
+  [[ ! -L $lock_path && (! -e $lock_path || -f $lock_path) ]] || \
+    pace_fail "dependency lock is symlinked or not a regular file: $lock_path"
+  exec {pace_environment_lock}>>"$lock_path"
+  flock "$pace_environment_lock"
+  export IGRLAB_PACE_ENV_LOCK_FD="$pace_environment_lock"
+}
+
 # sbatch executes the tracked helper, with the original argv kept as JSON.
 if [[ ${1:-} == --worker ]]; then
   [[ $# == 3 && ($2 == build || $2 == validation) ]] || pace_fail "invalid worker arguments"
@@ -127,7 +146,8 @@ if [[ $pace_submit == 1 ]]; then
   if [[ $pace_dependency_root != "$pace_root" ]]; then
     "${pace_source}/build.sh" "${pace_args[@]}" --output-root "$pace_dependency_root" --print-plan
   fi
-  mkdir -p "$pace_dependency_root/site/pace/requests" "$pace_dependency_root/site/pace/logs"
+  pace_prepare_site_directory "$pace_dependency_root/site/pace/requests"
+  pace_prepare_site_directory "$pace_dependency_root/site/pace/logs"
   pace_request=$(mktemp "$pace_dependency_root/site/pace/requests/build.XXXXXXXX.json")
   python3 - "$pace_request" "$pace_source" --site pace --site-root "$pace_dependency_root" --spack-root "$pace_spack_root" "${pace_args[@]}" <<'PY'
 import json, sys
@@ -201,12 +221,9 @@ export IGRLAB_PACE_RECIPE_ROOT="$pace_recipe_root"
 if [[ $pace_dependency_root != "$pace_root" ]]; then
   "${pace_source}/build.sh" "${pace_args[@]}" --output-root "$pace_dependency_root" --print-plan
 fi
-mkdir -p "$pace_dependency_root/site/pace/locks"
 # Worktrees can share a dependency root. The driver releases this profile lock
 # after preparing dependencies, so independent compilation can run concurrently.
-exec {pace_environment_lock}>"$pace_dependency_root/site/pace/locks/$pace_profile.lock"
-flock "$pace_environment_lock"
-export IGRLAB_PACE_ENV_LOCK_FD="$pace_environment_lock"
+pace_prepare_dependency_lock
 python3 "$pace_script_dir/pace_manifest.py" --root "$pace_dependency_root" \
   --profile "$pace_profile" --recipe-root "$pace_recipe_root"
 export TMPDIR="$pace_dependency_root/tmp" OMP_NUM_THREADS=1 CTEST_PARALLEL_LEVEL=1
