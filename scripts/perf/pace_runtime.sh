@@ -5,7 +5,7 @@ set -euo pipefail
 study_plan=$1 study_stage=$2 study_executor=$3
 [[ -n ${SLURM_JOB_ID:-} && ${SLURM_JOB_ACCOUNT:-} == gts-sbryngelson3 &&
    ${SLURM_JOB_QOS:-} == embers && ${SLURM_JOB_PARTITION:-} == gpu-a100 &&
-   ${SLURM_NTASKS:-} == 1 && -n ${SLURM_JOB_GPUS:-} ]] || {
+   ${SLURM_NTASKS:-} == 1 && -n ${SLURM_JOB_GPUS:-${SLURM_STEP_GPUS:-}} ]] || {
   echo 'GPU study requires one rank in a free PACE embers A100 allocation' >&2; exit 2;
 }
 [[ $(hostname -f) != *login* ]] || { echo 'GPU studies require a compute node' >&2; exit 2; }

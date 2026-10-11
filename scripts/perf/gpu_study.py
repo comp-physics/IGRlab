@@ -475,7 +475,8 @@ def submit_pipeline(root, plan):
 def allocation():
     required = {'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3', 'SLURM_JOB_QOS': 'embers',
                 'SLURM_JOB_PARTITION': 'gpu-a100', 'SLURM_NTASKS': '1'}
-    if not os.environ.get('SLURM_JOB_ID') or not os.environ.get('SLURM_JOB_GPUS') or any(
+    if not os.environ.get('SLURM_JOB_ID') or not (
+            os.environ.get('SLURM_JOB_GPUS') or os.environ.get('SLURM_STEP_GPUS')) or any(
             os.environ.get(key) != value for key, value in required.items()):
         raise RuntimeError('GPU study requires the free, single-rank PACE A100 allocation')
     if 'login' in socket.getfqdn():

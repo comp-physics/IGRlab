@@ -458,6 +458,58 @@ print(json.dumps({'seconds': 10.0 if member == 'baseline' else 9.0,
                 study.allocation()
             gpu.assert_not_called()
 
+    def test_allocation_accepts_step_gpu_metadata_without_mapping_visible_index(self):
+        environment = {'SLURM_JOB_ID': '1', 'SLURM_STEP_GPUS': '5',
+                       'CUDA_VISIBLE_DEVICES': '0', 'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3',
+                       'SLURM_JOB_QOS': 'embers', 'SLURM_JOB_PARTITION': 'gpu-a100',
+                       'SLURM_NTASKS': '1'}
+        identity = {'uuid': 'allocation-exposed-gpu', 'compute_capability': 80}
+        for job_gpus in (None, '', '5'):
+            values = dict(environment)
+            if job_gpus is not None:
+                values['SLURM_JOB_GPUS'] = job_gpus
+            with self.subTest(job_gpus=job_gpus), patch.dict(os.environ, values, clear=True), \
+                    patch.object(study.socket, 'getfqdn', return_value='compute'), \
+                    patch.object(study.study_profiles, 'gpu_identity', return_value=identity) as gpu:
+                self.assertEqual(study.allocation(), identity)
+                gpu.assert_called_once_with()
+        uuid = 'GPU-12345678-1234-1234-1234-123456789abc'
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(study.socket, 'getfqdn', return_value='compute'), \
+                patch.object(study.study_profiles.subprocess, 'run', return_value=
+                    subprocess.CompletedProcess([], 0, f'{uuid}, A100-SXM4-80GB, 8.0\n', '')) as query:
+            actual = study.allocation()
+            self.assertEqual(actual['uuid'], uuid)
+            self.assertEqual(actual['allocation_environment'],
+                             {'CUDA_VISIBLE_DEVICES': '0', 'SLURM_STEP_GPUS': '5'})
+            self.assertFalse(any(value.startswith('--id') for value in query.call_args.args[0]))
+        for changes in ({'SLURM_STEP_GPUS': ''}, {'SLURM_NTASKS': '2'},
+                        {'SLURM_JOB_QOS': 'inferno'}, {'SLURM_JOB_PARTITION': 'cpu-small'}):
+            with self.subTest(changes=changes), patch.dict(os.environ, {**environment, **changes}, clear=True), \
+                    patch.object(study.study_profiles, 'gpu_identity') as gpu:
+                with self.assertRaisesRegex(RuntimeError, 'free, single-rank'):
+                    study.allocation()
+                gpu.assert_not_called()
+
+    def test_runtime_shell_accepts_step_gpu_fallback_before_frozen_verification(self):
+        runtime = Path(study.__file__).with_name('pace_runtime.sh')
+        environment = {'PATH': os.defpath, 'SLURM_JOB_ID': '1', 'SLURM_STEP_GPUS': '5',
+                       'CUDA_VISIBLE_DEVICES': '0', 'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3',
+                       'SLURM_JOB_QOS': 'embers', 'SLURM_JOB_PARTITION': 'gpu-a100',
+                       'SLURM_NTASKS': '1'}
+        # Intercept the first metadata verifier; no modules, executors, or GPU commands run.
+        command = ['bash', '-c', 'hostname() { printf "compute\\n"; }; '
+                   'python3() { exit 77; }; source "$1" plan timings executor',
+                   'fixture', str(runtime)]
+        for changes, expected in (({}, 77), ({'SLURM_JOB_GPUS': ''}, 77),
+                                  ({'SLURM_JOB_GPUS': '5', 'SLURM_STEP_GPUS': ''}, 77),
+                                  ({'SLURM_STEP_GPUS': ''}, 2), ({'SLURM_NTASKS': '2'}, 2),
+                                  ({'SLURM_JOB_QOS': 'inferno'}, 2)):
+            with self.subTest(changes=changes):
+                result = subprocess.run(command, env={**environment, **changes}, text=True,
+                                        capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, expected, result.stderr)
+
     def test_correctness_jobs_are_required(self):
         self.state['builds'] = {m: {'validation_job_id': str(i + 1)} for i, m in enumerate(study.MEMBERS)}
         study.write_json(self.root / 'state.json', self.state)

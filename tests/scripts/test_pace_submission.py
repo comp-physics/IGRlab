@@ -171,6 +171,33 @@ print(9000 + count)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.calls('sbatch'), [])
 
+    def test_interactive_step_gpu_assignment_is_admitted_without_job_gpu_variable(self):
+        self.write_executable(self.fake_bin / 'hostname', '#!/bin/sh\necho atl1-compute.pace.gatech.edu\n')
+        allocated = self.env | {'SLURM_JOB_ID': '13963258',
+                               'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3', 'SLURM_JOB_QOS': 'embers',
+                               'SLURM_JOB_PARTITION': 'gpu-a100', 'SLURM_STEP_GPUS': '5',
+                               'CUDA_VISIBLE_DEVICES': '0'}
+        args = ('--site', 'pace', '--a100', '--tests-only', '--output-root', str(self.output),
+                '--spack-root', str(self.spack))
+        for assignment in ({}, {'SLURM_JOB_GPUS': ''}, {'SLURM_JOB_GPUS': '5', 'SLURM_STEP_GPUS': ''}):
+            with self.subTest(assignment=assignment):
+                result = self.run_helper(*args, env=allocated | assignment)
+                # Reach the next independent gate, without mocking site modules
+                # or launching a build/application.
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('environment modules are unavailable', result.stderr)
+                self.assertNotIn('requires an allocated A100', result.stderr)
+        for invalid, message in (({'SLURM_STEP_GPUS': ''}, 'requires an allocated A100'),
+                                 ({'SLURM_JOB_PARTITION': 'cpu-small'}, 'requires an allocated A100'),
+                                 ({'SLURM_JOB_ACCOUNT': 'unrelated'}, 'free embers'),
+                                 ({'SLURM_JOB_QOS': 'inferno'}, 'free embers')):
+            with self.subTest(invalid=invalid):
+                result = self.run_helper(*args, env=allocated | invalid)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+        self.assertEqual(self.calls('sbatch'), [])
+        self.assertEqual(self.calls('build'), [])
+
     def test_relative_dependency_root_rejected(self):
         result = self.submit('--site-root', 'relative')
         self.assertNotEqual(result.returncode, 0)

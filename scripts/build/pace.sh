@@ -219,7 +219,8 @@ fi
    ${SLURM_JOB_QOS:-} == embers ]] || pace_fail "use --submit or a free embers compute allocation"
 [[ $(hostname -f) != *login* ]] || pace_fail "compilation requires a compute node"
 if [[ $pace_profile == cuda-sm80 && ($pace_tests == 1 || $pace_smoke == 1) ]]; then
-  [[ ${SLURM_JOB_PARTITION:-} == gpu-a100 && -n ${SLURM_JOB_GPUS:-} ]] || \
+  # Interactive srun steps can expose only the step's assigned GPU IDs.
+  [[ ${SLURM_JOB_PARTITION:-} == gpu-a100 && -n ${SLURM_JOB_GPUS:-${SLURM_STEP_GPUS:-}} ]] || \
     pace_fail "CUDA validation requires an allocated A100; use --submit or --no-tests for compilation"
   export DG_IGR_TEST_DEVICE=cuda
 fi
