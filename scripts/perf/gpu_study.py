@@ -212,6 +212,10 @@ def verify(root, *, binaries=False):
         study_build.verify_source(identity)
     if sha(root / 'suite.json') != plan['suite_sha256']:
         raise RuntimeError('frozen workload suite changed')
+    for path, expected in plan.get('retry_origin', {}).get('build_artifact_sha256', {}).items():
+        artifact = absolute(path)
+        if not artifact.is_file() or sha(artifact) != expected:
+            raise RuntimeError(f'retried completed build artifact changed: {artifact}')
     if binaries:
         admission = read_json(root / 'admission.json')
         if admission['plan_sha256'] != plan['plan_sha256']:
@@ -510,11 +514,15 @@ def admit(root, plan, suite):
         build = plan['builds'][member]
         app_build = Path(build['app_build'])
         cache = app_build / 'CMakeCache.txt'
-        cache_values = dict(re.findall(r'^([^/#][^:]*):[^=]*=(.*)$', cache.read_text(), re.M))
+        # CMake caches contain blank lines and comments. Parse one line at a
+        # time with the canonical reader; a multiline negated character class
+        # can consume newlines/comments into the next key.
+        cache_values = checker.cache_values(cache)
         for key, expected in {'CMAKE_BUILD_TYPE': 'Release', 'CMAKE_CUDA_ARCHITECTURES': '80',
                               'DG_IGR_OBSERVABILITY_USE_NVTX': 'ON'}.items():
             if cache_values.get(key) != expected:
-                raise RuntimeError(f'build is not Release/native SM80: {cache}')
+                raise RuntimeError(f'build configuration mismatch: {key}={cache_values.get(key)!r}, '
+                                   f'expected {expected!r}: {cache}')
         paths = [cache, Path(build['mfem_build']) / 'dg-igr-mfem-identity-v1.txt']
         paths += [Path(build['spack_env']) / name for name in ('spack.yaml', 'spack.lock')]
         # Retain the actual MFEM configuration and library artifacts too.
@@ -794,6 +802,130 @@ def resume(args):
             submit_stage(root, 'profiles', [job])
 
 
+def retry_build_artifacts(plan, suite, old_admission=None):
+    """Freeze completed build bytes; compute admission still proves live bindings."""
+    paths = set((old_admission or {}).get('artifact_sha256', {}))
+    for build in plan['builds'].values():
+        app, mfem, install, env = map(Path, (build['app_build'], build['mfem_build'],
+                                           build['mfem_install'], build['spack_env']))
+        paths.update(map(str, (app / 'CMakeCache.txt', mfem / 'CMakeCache.txt',
+                              mfem / 'dg-igr-mfem-identity-v1.txt',
+                              env / 'spack.yaml', env / 'spack.lock')))
+        for name in ('MFEMConfig.cmake', 'MFEMTargets.cmake'):
+            matches = list(install.rglob(name))
+            if len(matches) != 1:
+                raise RuntimeError(f'missing or ambiguous completed MFEM configuration: {name}')
+            paths.add(str(matches[0]))
+        libraries = [p for p in install.rglob('libmfem*') if p.is_file()]
+        if not libraries:
+            raise RuntimeError('completed MFEM library is missing')
+        paths.update(map(str, libraries))
+        paths.update(str(p) for p in install.rglob('MFEMTargets-*.cmake'))
+        for name in {case['binary'] for case in selected_cases(suite)}:
+            matches = [p for p in app.rglob(name) if p.is_file() and os.access(p, os.X_OK)]
+            if len(matches) != 1:
+                raise RuntimeError(f'missing or ambiguous completed executable: {name}')
+            paths.add(str(matches[0]))
+    result = {}
+    for value in sorted(paths):
+        path = absolute(value)
+        if not path.is_file():
+            raise RuntimeError(f'missing regular completed build artifact: {path}')
+        result[value] = sha(path)
+    return result
+
+
+def retry(args):
+    """A fresh executor/cohort may reuse only inactive, verified completed builds."""
+    if os.environ.get('SLURM_JOB_ID'):
+        raise RuntimeError('prepare or submit a retry from the PACE login node')
+    old, root = absolute(args.from_run).resolve(strict=True), absolute(args.run_dir).resolve()
+    with locked(old):
+        plan = verify(old, binaries=(old / 'admission.json').exists())
+        state = read_json(old / 'state.json')
+        if set(plan['executor_sha256']) != set(EXECUTOR_FILES):
+            raise RuntimeError('old run lacks the complete frozen executor identity')
+        suite = study_workloads.load_suite(old / 'suite.json')
+        protected = [old, Path(plan['cache_root']), Path(__file__).resolve().parents[2]]
+        protected += [Path(s['source_snapshot']) for s in plan['sources'].values()]
+        protected += [Path(b[key]) for b in plan['builds'].values() for key in
+                      ('app_build', 'app_install', 'mfem_build', 'mfem_install', 'spack_env')]
+        if any(root.resolve().is_relative_to(p.resolve()) for p in protected):
+            raise ValueError('retry destination is inside an old run, source, or protected cache')
+        if root.exists():
+            raise ValueError('retry run directory must be new')
+        for member in MEMBERS:
+            receipt, build = state['builds'][member], plan['builds'][member]
+            if (receipt.get('success') is not True or receipt.get('returncode') != 0 or
+                    receipt.get('source_fingerprint') != plan['sources'][member]['source_fingerprint'] or
+                    receipt.get('configuration_key') != build['configuration_key'] or
+                    receipt.get('argv') != build['argv'] or not receipt.get('build_job_id')):
+                raise RuntimeError('retry requires matching successful canonical build receipts')
+        ids = set()
+        def collect_ids(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in ('job_id', 'build_job_id', 'validation_job_id',
+                               'build_job_ids', 'validation_job_ids') and item is not None:
+                        for job in item if isinstance(item, list) else [item]:
+                            if not isinstance(job, str) or not re.fullmatch(r'[0-9]+', job):
+                                raise RuntimeError('invalid recorded scheduler job identity')
+                            ids.add(job)
+                    else:
+                        collect_ids(item)
+            elif isinstance(value, list):
+                for item in value: collect_ids(item)
+        collect_ids(state)
+        if not ids or len(ids) > 128:
+            raise RuntimeError('missing or excessive recorded scheduler jobs')
+        # Completed IDs can disappear from squeue while remaining in sacct.
+        queue = subprocess.run(['squeue', '-h', '-u', getpass.getuser(), '-o', '%i|%T'],
+                               text=True, capture_output=True, timeout=30)
+        if queue.returncode:
+            raise RuntimeError('retry withheld: could not prove every recorded job inactive')
+        for row in queue.stdout.splitlines():
+            match = re.fullmatch(r'([0-9]+)(?:[_+][^|]+)?\|[^|]+', row.strip())
+            if not match or match[1] in ids:
+                raise RuntimeError('retry withheld: could not prove every recorded job inactive')
+        outcomes = {job: job_state(job) for job in sorted(ids)}
+        terminal = {'COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY',
+                    'NODE_FAIL', 'BOOT_FAIL', 'DEADLINE', 'PREEMPTED'}
+        if any(status.split()[0] not in terminal for status, _ in outcomes.values()):
+            raise RuntimeError('retry withheld: recorded scheduler state is not terminal')
+        checked_builds(old)
+        if any(outcomes[state['builds'][m]['build_job_id']] != ('COMPLETED', '0:0') for m in MEMBERS):
+            raise RuntimeError('retry requires completed successful canonical builds')
+        artifacts = retry_build_artifacts(plan, suite, read_json(old / 'admission.json')
+                                         if (old / 'admission.json').exists() else None)
+        limits = {stage: wall_time(getattr(args, stage + '_time', None) or stage_wall_time(plan, stage))
+                  for stage in ('timings', 'profiles')}
+        new_plan = {k: v for k, v in plan.items() if k != 'plan_sha256'}
+        new_plan.update(run_dir=str(root), created_unix_seconds=time.time(), wall_time_limits=limits,
+                        retry_origin={'run_dir': str(old), 'plan_sha256': plan['plan_sha256'],
+                                      'state_sha256': sha(old / 'state.json'),
+                                      'executor_sha256': plan['executor_sha256'],
+                                      'suite_sha256': plan['suite_sha256'], 'scheduler_outcomes': outcomes,
+                                      'build_artifact_sha256': artifacts,
+                                      'binding_scope': 'fresh compute admission required'})
+        root.mkdir(parents=True, exist_ok=False)
+        (root / 'executor').mkdir()
+        for name in EXECUTOR_FILES:
+            shutil.copy2(Path(__file__).parent / name, root / 'executor' / name)
+        shutil.copy2(old / 'suite.json', root / 'suite.json')
+        new_plan['executor_sha256'] = {name: sha(root / 'executor' / name) for name in EXECUTOR_FILES}
+        new_plan['plan_sha256'] = digest(new_plan)
+        write_json(root / 'plan.json', new_plan, exclusive=True)
+        write_json(root / 'state.json', {'schema_version': SCHEMA, 'builds': state['builds'],
+                   'build_attempts': [{'member': m, **state['builds'][m]} for m in MEMBERS],
+                   'jobs': [], 'attempts': []}, exclusive=True)
+    with locked(root):
+        verify(root)
+        if not args.prepare_only:
+            timing = submit_stage(root, 'timings')
+            submit_stage(root, 'profiles', [timing])
+    print(f'Prepared retry: {root}\nFresh timing/profile samples; completed builds reused from {old}')
+
+
 def comparison_description(plan):
     fingerprints = [plan['sources'][member].get('source_fingerprint') for member in MEMBERS]
     if all(isinstance(value, str) and value for value in fingerprints):
@@ -802,6 +934,30 @@ def comparison_description(plan):
                     'identical-source workflow/repeatability control; paired variation does not measure an optimization change')
         return 'baseline-candidate', 'baseline/candidate source comparison'
     return 'identity-unavailable', 'source fingerprints unavailable in the retained plan'
+
+
+def control_repeatability(timing):
+    """Describe the observed control pairs without inventing a noise threshold."""
+    result = {'status': 'timings_pending' if timing is None else 'timings_complete',
+              'scope': 'observed variation within this allocation; not a confidence interval or a portable acceptance threshold',
+              'cases': {}}
+    if timing is None:
+        return result
+    for name, case in timing['cases'].items():
+        # Recompute from independent process observations, never accepted steps
+        # or a profiler duration. Retained summaries already contain these arrays.
+        values = case['statistics']
+        stats = sample_statistics(values['baseline_seconds'], values['candidate_seconds'])
+        changes = stats['paired_percent_less_time']
+        result['cases'][name] = {
+            'independent_pairs': len(changes),
+            'paired_median_offset_percent': stats['paired_median_percent_less_time'],
+            'paired_range_percent': stats['paired_range_percent_less_time'],
+            'median_absolute_paired_offset_percent': statistics.median(map(abs, changes)),
+            'maximum_absolute_paired_offset_percent': max(map(abs, changes)),
+            'baseline_coefficient_of_variation_percent': 100 * stats['baseline_relative_stdev'],
+            'candidate_coefficient_of_variation_percent': 100 * stats['candidate_relative_stdev']}
+    return result
 
 
 def report(root):
@@ -813,6 +969,10 @@ def report(root):
               'sources': {m: {k: v for k, v in plan['sources'][m].items() if k in
                              ('source_revision', 'source_tree', 'source_status', 'source_fingerprint')}
                           for m in MEMBERS}, 'attempts': state['attempts'], 'timings': None, 'profiles': None}
+    result['validation_execution'] = {
+        member: ('run-only' if plan.get('builds', {}).get(member, {}).get('run_only_validation') is True
+                 else 'legacy-driver' if plan.get('builds', {}).get(member, {}).get('run_only_validation') is False
+                 else 'not-recorded') for member in MEMBERS}
     for stage in ('timings', 'profiles'):
         attempt = completed(state, stage)
         if attempt:
@@ -825,9 +985,15 @@ def report(root):
                 partial = Path(latest['directory']) / 'partial.json'
                 if partial.exists():
                     result['profile_partial'] = read_json(partial)
+    if comparison_kind == 'identical-source-control':
+        result['repeatability'] = control_repeatability(result['timings'])
     lines = ['# PACE A100 GPU study', '', f"Plan: `{plan['plan_sha256']}`", '',
              'Comparison: ' + comparison_text + '.', '',
              'Timing authority: independent unprofiled process pairs. Positive percentages mean less time.', '']
+    lines += ['Validation execution: ' + ', '.join(
+        f'{member}={mode}' for member, mode in result['validation_execution'].items()) + '.', '']
+    if 'legacy-driver' in result['validation_execution'].values():
+        lines += ['A historical source uses its original validation driver, which may configure/build in the validation allocation.', '']
     if result['timings']:
         lines += ['| Case | Baseline median (s) | Candidate median (s) | Paired median less time | Paired range |',
                   '|---|---:|---:|---:|---:|']
@@ -837,6 +1003,18 @@ def report(root):
             lines.append(f"| {name} | {stats['baseline_median_seconds']:.6g} | {stats['candidate_median_seconds']:.6g} | {stats['paired_median_percent_less_time']:.3f}% | {low:.3f}% to {high:.3f}% |")
     else:
         lines.append('Timings have not completed.')
+    if comparison_kind == 'identical-source-control' and result['timings']:
+        lines += ['', 'Observed control repeatability (same source, same allocation):', '',
+                  '| Case | Independent pairs | Median absolute paired offset | Maximum absolute paired offset | Baseline / candidate CV |',
+                  '|---|---:|---:|---:|---:|']
+        for name, stats in result['repeatability']['cases'].items():
+            lines.append(f"| {name} | {stats['independent_pairs']} | "
+                         f"{stats['median_absolute_paired_offset_percent']:.3f}% | "
+                         f"{stats['maximum_absolute_paired_offset_percent']:.3f}% | "
+                         f"{stats['baseline_coefficient_of_variation_percent']:.3f}% / "
+                         f"{stats['candidate_coefficient_of_variation_percent']:.3f}% |")
+        lines += ['', 'These are descriptive observations, not a confidence interval or a portable acceptance threshold. '
+                  'Small changes need more independent pairs and a fresh allocation; always remeasure the baseline alongside the candidate.']
     latest_profile = next((attempt for attempt in reversed(state['attempts'])
                            if attempt['stage'] == 'profiles'), None)
     lines += ['', 'Profile state: ' + ('analysis_complete' if result['profiles'] else
@@ -917,6 +1095,12 @@ def main(argv=None):
     submit_parser.add_argument('--validation-time', type=lambda value: wall_time(value, maximum_hours=2, minimum_minutes=1),
                                help='optional canonical correctness allocation HH:MM:SS, 1 minute to 2 hours')
     submit_parser.add_argument('--prepare-only', action='store_true', help='freeze and inspect plans without submitting jobs')
+    p = sub.add_parser('retry', help='freeze a new measurement executor using verified completed builds/correctness')
+    p.add_argument('--from-run', required=True)
+    p.add_argument('--run-dir', required=True, help='new absolute scratch directory')
+    p.add_argument('--timings-time', type=wall_time, help='override inherited timing allocation limit')
+    p.add_argument('--profiles-time', type=wall_time, help='override inherited profiling allocation limit')
+    p.add_argument('--prepare-only', action='store_true', help='prepare without submitting measurement jobs')
     for name in ('worker', 'resume'):
         p = sub.add_parser(name, help='run or resubmit an incomplete stage without replacing completed measurements')
         p.add_argument('--run-dir', required=True)
@@ -930,6 +1114,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == 'submit':
         submit(args)
+    elif args.command == 'retry':
+        retry(args)
     elif args.command == 'worker':
         worker(args)
     elif args.command == 'resume':

@@ -195,6 +195,57 @@ class StudyProtocol(unittest.TestCase):
             study.status(self.root)
         self.assertIn('identical-source workflow/repeatability control', output.getvalue())
 
+    def test_control_report_waits_for_timings_and_preserves_independent_pair_scope(self):
+        self.plan['sources'] = {member: {'source_fingerprint': 'a' * 64}
+                                for member in study.MEMBERS}
+        self.save_plan()
+        pending = study.report(self.root)
+        self.assertEqual(pending['repeatability']['status'], 'timings_pending')
+        self.assertEqual(pending['repeatability']['cases'], {})
+        output = self.finish_timings()
+        summary = study.read_json(output / 'summary.json')
+        summary['cases']['fixture'] = {'statistics': study.sample_statistics(
+            [10., 10., 10.], [9., 10., 11.]),
+            'observations': [{'accepted_steps': 5}] * 6}
+        study.write_json(output / 'summary.json', summary)
+        self.state['attempts'][-1]['summary_sha256'] = study.sha(output / 'summary.json')
+        study.write_json(self.root / 'state.json', self.state)
+        report = study.report(self.root)
+        values = report['repeatability']['cases']['fixture']
+        self.assertEqual(values['independent_pairs'], 3)
+        self.assertEqual(values['paired_median_offset_percent'], 0.)
+        self.assertAlmostEqual(values['median_absolute_paired_offset_percent'], 10.)
+        self.assertAlmostEqual(values['maximum_absolute_paired_offset_percent'], 10.)
+        self.assertEqual(values['baseline_coefficient_of_variation_percent'], 0.)
+        self.assertEqual(values['candidate_coefficient_of_variation_percent'], 10.)
+        self.assertIn('not a confidence interval', report['repeatability']['scope'])
+        self.assertIn('Observed control repeatability', (self.root / 'report.md').read_text())
+        # Derived reporting does not rewrite the admitted observations.
+        self.assertEqual(study.read_json(output / 'summary.json'), summary)
+
+    def test_control_repeatability_rejects_insufficient_or_nonfinite_samples(self):
+        for baseline, candidate in (([1.], [1.]), ([1., 2., 3.], [1., 2.]),
+                                    ([1., 2., 3.], [1., float('nan'), 3.]),
+                                    ([1., 2., 3.], [1., float('inf'), 3.]),
+                                    ([1., 0., 3.], [1., 2., 3.])):
+            with self.subTest(baseline=baseline, candidate=candidate):
+                timing = {'cases': {'fixture': {'statistics': {
+                    'baseline_seconds': baseline, 'candidate_seconds': candidate}}}}
+                with self.assertRaisesRegex(RuntimeError, 'independent positive process pairs'):
+                    study.control_repeatability(timing)
+
+    def test_report_distinguishes_run_only_legacy_and_unrecorded_validation(self):
+        self.assertEqual(study.report(self.root)['validation_execution'],
+                         dict.fromkeys(study.MEMBERS, 'not-recorded'))
+        self.plan['builds'] = {'baseline': {'run_only_validation': False},
+                               'candidate': {'run_only_validation': True}}
+        self.save_plan()
+        result = study.report(self.root)
+        self.assertEqual(result['validation_execution'],
+                         {'baseline': 'legacy-driver', 'candidate': 'run-only'})
+        self.assertIn('may configure/build in the validation allocation',
+                      (self.root / 'report.md').read_text())
+
     def test_dirty_source_comparison_uses_content_fingerprints_and_profile_attempt_state(self):
         self.plan['sources'] = {member: {'source_fingerprint': fingerprint,
                                         'source_revision': 'same-head', 'source_status': 'dirty'}
@@ -208,6 +259,7 @@ class StudyProtocol(unittest.TestCase):
         study.write_json(self.root / 'state.json', self.state)
         report = study.report(self.root)
         self.assertEqual(report['comparison_kind'], 'baseline-candidate')
+        self.assertNotIn('repeatability', report)
         text = (self.root / 'report.md').read_text()
         self.assertIn('Comparison: baseline/candidate source comparison.', text)
         self.assertIn('Profile state: profiles_partial', text)
@@ -412,6 +464,41 @@ print(json.dumps({'seconds': 10.0 if member == 'baseline' else 9.0,
         with patch.object(study.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '1|COMPLETED|0:0\n2|FAILED|1:0\n', '')):
             with self.assertRaisesRegex(RuntimeError, 'correctness jobs'):
                 study.checked_builds(self.root)
+
+    def test_admission_reads_commented_cmake_cache_by_line_and_reports_actual_mismatch(self):
+        build = self.root / 'app-build'
+        build.mkdir()
+        cache = build / 'CMakeCache.txt'
+        text = ('# This is the CMakeCache file.\n\n'
+                '//Choose the type of build, options are: Debug Release\n'
+                'CMAKE_BUILD_TYPE:STRING=Release\n\n'
+                '//No help, variable specified on the command line.\n'
+                'CMAKE_CUDA_ARCHITECTURES:UNINITIALIZED=80\n\n'
+                '//Compile optional NVTX observability\n'
+                'DG_IGR_OBSERVABILITY_USE_NVTX:BOOL=ON\n')
+        cache.write_text(text)
+        plan = {'spack_root': '/spack',
+                'sources': {'candidate': {'source_snapshot': str(Path(study.__file__).resolve().parents[2])}},
+                'builds': {member: {'app_build': str(build), 'spack_env': '/environment',
+                                     'mfem_build': str(self.root / 'mfem-build'),
+                                     'mfem_install': str(self.root / 'mfem-install')}
+                           for member in study.MEMBERS}}
+        with patch.object(study.subprocess, 'check_output', return_value='/selected/package\n'):
+            # Passing the real cache parser reaches the next independent gate;
+            # this fixture deliberately has no installed MFEM or binaries.
+            with self.assertRaisesRegex(RuntimeError, 'installed MFEM library is missing'):
+                study.admit(self.root, plan, {})
+            for key, previous, changed in (('CMAKE_BUILD_TYPE', 'Release', 'Debug'),
+                                             ('CMAKE_CUDA_ARCHITECTURES', '80', '120'),
+                                             ('DG_IGR_OBSERVABILITY_USE_NVTX', 'ON', 'OFF')):
+                with self.subTest(key=key):
+                    cache.write_text(text.replace('=' + previous + '\n', '=' + changed + '\n'))
+                    with self.assertRaisesRegex(RuntimeError, key + '=' + repr(changed)):
+                        study.admit(self.root, plan, {})
+            cache.write_text(text.replace('CMAKE_BUILD_TYPE:STRING=Release\n', ''))
+            with self.assertRaisesRegex(RuntimeError, 'CMAKE_BUILD_TYPE=None'):
+                study.admit(self.root, plan, {})
+        self.assertFalse((self.root / 'admission.json').exists())
 
     def test_independent_pairs_do_not_count_accepted_steps_as_repetitions(self):
         stats = study.sample_statistics([10., 12., 11.], [9., 10., 10.])

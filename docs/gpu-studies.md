@@ -35,12 +35,24 @@ support is not initialized. Package installation paths come from
 
 Source snapshots and incremental builds live in retained
 `SITE_ROOT/study-cache` by default; `--cache-root DIR` selects another absolute
-cache root. The key binds exact source/MFEM content, build flags, and site
-configuration. Identical inputs reuse the same snapshot and canonical build
-directory across studies. Differing configurations share dependencies.
+cache root. Application keys bind exact source content, build flags, and the
+dependency identity. Changing only the correctness selection reuses the
+application build directory. MFEM has a separate key covering its clean source
+and release tag, build policy, site configuration and Spack tool identity.
+Application-only changes therefore share MFEM, while the canonical driver
+checks the concrete dependency/compiler ABI and immutable artifact stamp under
+an independent cache lock. Interrupted matching cache fills can resume; foreign
+partials or changed identities fail without replacing their files.
 Identical baseline/candidate builds are submitted once. Leave cache entries in
 place while their studies are retained; the coordinator never silently cleans
 or replaces them.
+
+These capabilities come from each frozen source's public driver. New drivers
+run dependent validation with `--tests-only`, checking a successful build's
+receipt before executing tests. Historical drivers keep their original cache
+and validation behavior, which can include build steps in the validation job;
+their capability is recorded in the plan and report. The coordinator applies no
+driver overlay. Already queued studies retain their frozen implementation.
 
 Add `--prepare-only` to freeze inputs and inspect saved build plans without
 submitting jobs. Submit that prepared study with `resume --stage builds`.
@@ -75,6 +87,9 @@ Choose larger limits when adding cases or expensive profiler sections.
 
 1. Choose a baseline and an unchanged numerical workload. An identical-source
    control can quantify repeatability.
+   Run the selected [numerical acceptance checks](numerical-validation.md) for
+   changes to discretization, solver tolerances, precision, or kernel arithmetic;
+   use the convergence selection when the change could affect accuracy order.
 2. Use Nsight Systems attribution to choose expensive kernels or launch/sync
    overhead. Inspect those kernels with Nsight Compute.
 3. Make one focused application/library change. Compare with the same suite,
@@ -88,6 +103,8 @@ Choose larger limits when adding cases or expensive profiler sections.
 The maintained suite is [pace-a100.json](../scripts/perf/suites/pace-a100.json):
 six default DG/HDG cases, three independent process pairs, separate process
 warmup, a focused correctness selection, and bounded kernel filters.
+The study's name-based correctness selection remains a quick regression gate;
+the broader numerical acceptance labels are explicit canonical-driver selections.
 Use `--cases dg-p1,dg-p3` for a targeted study, or `--suite FILE` for a saved,
 versioned workload variant. An explicit case selection enables optional cases.
 Do not change suite parameters between comparison members.
@@ -105,6 +122,16 @@ standard deviations. There is no automatic speed threshold or significance
 claim. Ordinary and tensor engines have different trace policies: each case
 compares the same engine across source versions. DGSEM establishes neither
 full-solver accuracy nor full-solver speedup.
+
+For an identical-source control, the report also lists each case's independent
+pair count, median and maximum absolute paired offset, and each member's
+coefficient of variation. These describe the observations in that allocation;
+the largest observed offset is not a statistical noise floor or a threshold
+that transfers to another workload or allocation. Pending timings produce no
+repeatability estimate. If a candidate's apparent gain is comparable to the
+observed variation, collect more independent pairs on another allocation and
+remeasure both members. A saved baseline build can be reused; its old timings
+cannot replace the paired baseline measurements.
 
 Nsight Compute records achieved/theoretical occupancy, register/shared-memory
 limits, grid waves, compute/memory throughput, scheduler issue/eligible warps,
@@ -151,6 +178,27 @@ matching user/account/name/command, and a proven failed recorded predecessor.
 The cancellation receipt is retained; running or unrelated jobs are protected.
 Timing retries automatically enqueue a fresh dependent profiling job.
 
+If a frozen measurement executor needs a fix, preserve that run and create a new
+measurement run:
+
+```bash
+./perf.sh retry --from-run /absolute/scratch/studies/old-run \
+  --run-dir /absolute/scratch/studies/retry-run \
+  --timings-time 00:15:00 --profiles-time 00:30:00
+```
+
+Retry verifies the old immutable source/executor/suite,
+matching completed build receipts and successful correctness jobs, and requires
+every recorded job to be inactive. It retains the exact source/build paths and
+suite, freezes the current measurement executor and build-artifact hashes, and
+records the old plan as its origin. Fresh compute admission still checks live
+dependency bindings. No old timing/profile samples or admission are copied;
+both members are measured again. `--prepare-only` creates the new plan without
+submitting; use `resume --stage timings` afterward. Limits inherit the old frozen
+plan unless explicitly overridden, including when its jobs were later shortened
+through the scheduler. The old run remains unchanged; partial submission receipts
+belong to the new run and prevent an unnoticed duplicate retry.
+
 `plan.json` freezes the experiment, `admission.json` binds binaries, CMake/MFEM
 artifacts, Spack locks and loader libraries, and `state.json` retains attempts.
 `report.json` and `report.md` summarize accepted results. Logs, fields, native
@@ -162,7 +210,7 @@ checksums. Transfer only that export directory to the local machine.
 ## Validation scope
 
 Host contract tests are registered as
-`igrlab_{gpu_study,study_build,study_workloads,study_profiles}_python`. They
+`igrlab_{gpu_study,study_build,study_workloads,study_profiles,study_retry}_python`. They
 exercise real Git/MFEM snapshots, exact dirty bytes, cache relocation, canonical
 submission, queue dependencies, literal argv, numerical/field gates, both Nsight
 CSV layouts, compressed reports, unavailable metrics, timeouts, immutable
