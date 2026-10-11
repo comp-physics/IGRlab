@@ -723,10 +723,22 @@ def resume(args):
             submit_stage(root, 'profiles', [job])
 
 
+def comparison_description(plan):
+    fingerprints = [plan['sources'][member].get('source_fingerprint') for member in MEMBERS]
+    if all(isinstance(value, str) and value for value in fingerprints):
+        if fingerprints[0] == fingerprints[1]:
+            return ('identical-source-control',
+                    'identical-source workflow/repeatability control; paired variation does not measure an optimization change')
+        return 'baseline-candidate', 'baseline/candidate source comparison'
+    return 'identity-unavailable', 'source fingerprints unavailable in the retained plan'
+
+
 def report(root):
     plan = load_plan(root)
     state = read_json(root / 'state.json')
+    comparison_kind, comparison_text = comparison_description(plan)
     result = {'schema_version': SCHEMA, 'plan_sha256': plan['plan_sha256'],
+              'comparison_kind': comparison_kind,
               'sources': {m: {k: v for k, v in plan['sources'][m].items() if k in
                              ('source_revision', 'source_tree', 'source_status', 'source_fingerprint')}
                           for m in MEMBERS}, 'attempts': state['attempts'], 'timings': None, 'profiles': None}
@@ -743,6 +755,7 @@ def report(root):
                 if partial.exists():
                     result['profile_partial'] = read_json(partial)
     lines = ['# PACE A100 GPU study', '', f"Plan: `{plan['plan_sha256']}`", '',
+             'Comparison: ' + comparison_text + '.', '',
              'Timing authority: independent unprofiled process pairs. Positive percentages mean less time.', '']
     if result['timings']:
         lines += ['| Case | Baseline median (s) | Candidate median (s) | Paired median less time | Paired range |',
@@ -753,8 +766,10 @@ def report(root):
             lines.append(f"| {name} | {stats['baseline_median_seconds']:.6g} | {stats['candidate_median_seconds']:.6g} | {stats['paired_median_percent_less_time']:.3f}% | {low:.3f}% to {high:.3f}% |")
     else:
         lines.append('Timings have not completed.')
+    latest_profile = next((attempt for attempt in reversed(state['attempts'])
+                           if attempt['stage'] == 'profiles'), None)
     lines += ['', 'Profile state: ' + ('analysis_complete' if result['profiles'] else
-               (state['attempts'][-1]['status'] if state['attempts'] else 'not_started')),
+               (latest_profile['status'] if latest_profile else 'not_started')),
               '', 'Native reports and trace import remain on PACE compute nodes. GPU API, kernel and copy durations overlap and are reported separately.',
               'Occupancy and counters diagnose the selected kernels; they do not establish a full-solver speedup.', '']
     write_json(root / 'report.json', result)
@@ -789,7 +804,8 @@ def collect(args):
 
 
 def status(root):
-    verify(root)
+    plan = verify(root)
+    print('Comparison: ' + comparison_description(plan)[1] + '.')
     state = read_json(root / 'state.json')
     jobs = [str(build[key]) for build in state.get('build_attempts', list(state['builds'].values()))
             for key in ('build_job_id', 'validation_job_id') if build.get(key)]

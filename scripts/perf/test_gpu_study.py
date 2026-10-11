@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Host-only study protocol tests; no application builds or GPU commands."""
 import argparse
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -72,6 +74,47 @@ class StudyProtocol(unittest.TestCase):
         (output / 'stdout.log').write_text('modified measurement')
         with self.assertRaisesRegex(RuntimeError, 'completed measurement artifact'):
             study.verify(self.root)
+
+    def test_identical_source_report_and_status_label_control_without_claiming_optimization(self):
+        self.plan['sources'] = {member: {'source_fingerprint': 'a' * 64, 'source_status': 'dirty'}
+                                for member in study.MEMBERS}
+        self.plan.pop('plan_sha256')
+        self.plan['plan_sha256'] = study.digest(self.plan)
+        study.write_json(self.root / 'plan.json', self.plan)
+        self.finish_timings()
+        report = study.report(self.root)
+        self.assertEqual(report['comparison_kind'], 'identical-source-control')
+        text = (self.root / 'report.md').read_text()
+        self.assertIn('identical-source workflow/repeatability control', text)
+        self.assertIn('paired variation does not measure an optimization change', text)
+        self.assertIn('Profile state: not_started', text)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            study.status(self.root)
+        self.assertIn('identical-source workflow/repeatability control', output.getvalue())
+
+    def test_dirty_source_comparison_uses_content_fingerprints_and_profile_attempt_state(self):
+        self.plan['sources'] = {member: {'source_fingerprint': fingerprint,
+                                        'source_revision': 'same-head', 'source_status': 'dirty'}
+                                for member, fingerprint in zip(study.MEMBERS, ('a' * 64, 'b' * 64))}
+        self.plan.pop('plan_sha256')
+        self.plan['plan_sha256'] = study.digest(self.plan)
+        study.write_json(self.root / 'plan.json', self.plan)
+        self.finish_timings()
+        self.state['attempts'].insert(0, {'stage': 'profiles', 'status': 'profiles_partial',
+                                         'id': 'retained-profile', 'directory': str(self.root)})
+        study.write_json(self.root / 'state.json', self.state)
+        report = study.report(self.root)
+        self.assertEqual(report['comparison_kind'], 'baseline-candidate')
+        text = (self.root / 'report.md').read_text()
+        self.assertIn('Comparison: baseline/candidate source comparison.', text)
+        self.assertIn('Profile state: profiles_partial', text)
+        self.assertNotIn('identical-source workflow', text)
+
+    def test_retained_plan_without_fingerprints_reports_unknown_identity(self):
+        report = study.report(self.root)
+        self.assertEqual(report['comparison_kind'], 'identity-unavailable')
+        self.assertIn('source fingerprints unavailable', (self.root / 'report.md').read_text())
 
     def test_profile_resume_preserves_timings_and_rejects_duplicate_job(self):
         output = self.finish_timings()
