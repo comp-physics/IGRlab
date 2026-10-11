@@ -1,4 +1,10 @@
-# IGRlab
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/igrlab-logo-vector-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/igrlab-logo-vector.svg">
+    <img src="docs/assets/igrlab-logo-vector.svg" alt="IGRlab" width="500">
+  </picture>
+</p>
 
 IGRlab develops Euler and information-geometric regularization methods with
 MFEM, retaining DG, DGSEM, and HDG implementations on CPU and GPU.
