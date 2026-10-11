@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2080 420" width="2080" height="420" role="img" aria-labelledby="logo-title logo-description">
+  <title id="logo-title">IGRlab</title>
+  <desc id="logo-description">A smooth grid-and-shock diagram beside IGRlab lettering, with a single-storey a and an orange curved R leg.</desc>
+  <g id="emblem">
+    <defs>
+      <clipPath id="emblem-igrlab-emblem-grid-clip">
+        <path d="M 145 63 L 574 49 L 481 380 L 22 381 Z" />
+      </clipPath>
+    </defs>
+    <g id="emblem-igrlab-emblem" fill="none">
+      <g class="ink-orange" data-ink="orange" stroke="#ed6b0d" stroke-width="17.5" stroke-linecap="butt" clip-path="url(#emblem-igrlab-emblem-grid-clip)">
+        <path id="emblem-shock-transition" d="M 57 298 L 186 298 C 245.781818 298 269.290909 284.432432 295 242 C 320.709091 199.567568 343.890909 164.486486 382 151 C 420.109091 137.513514 474.418182 148.864865 542 149" />
+      </g>
+      <g class="ink-navy" data-ink="navy" stroke="#ffffff" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#emblem-igrlab-emblem-grid-clip)">
+        <path id="emblem-upper-cell-curve" stroke-width="6.2" d="M 111 155 C 155.036364 154.981818 192.618182 151.690909 218 152 C 243.381818 152.309091 276.018182 128.490909 299 109 C 321.981818 89.509091 332.763636 85.618182 351 80 L 359 56" />
+        <path id="emblem-upper-flow" stroke-width="8.4" d="M 84 225 L 194 224 C 253.226439 223.461578 255.30046 206.950008 288 164 C 320.69954 121.049992 349.590505 82.999877 395 84 C 440.409495 85.000123 480.635599 88.334576 539 86 L 564 85" />
+        <path id="emblem-upper-inner-flow" stroke-width="8.9" d="M 69 264 L 191 263 C 247.279527 262.538692 269.268328 237.154258 297 196 C 324.731672 154.845742 344.661737 121.950048 389 113 C 433.338263 104.049952 481.496302 114.712536 553 116" />
+        <path id="emblem-lower-inner-flow" stroke-width="8.9" d="M 47 326 L 195 326 C 251.072727 326 274.236364 314.952703 302 278 C 329.763636 241.047297 352.036364 206.540541 391 193 C 429.963636 179.459459 470.527273 186.155405 532 189" />
+        <path id="emblem-lower-flow" stroke-width="8.4" d="M 37 353 L 208 353 C 262.472727 353 285.036364 342.912162 315 314 C 344.963636 285.087838 357.236364 262.432432 386 240 C 414.763636 217.567568 455.927273 225.574324 521 227" />
+        <path id="emblem-lower-cell-curve" stroke-width="6.2" d="M 278 379 C 305.375 360.217391 330.5 333.043478 355 312 C 379.5 290.956522 388.375 290 418 290 L 505 290" />
+        <path id="emblem-upper-left-divider" stroke-width="6.2" d="M 259 60 L 213 222" />
+        <path id="emblem-upper-center-divider" stroke-width="6.2" d="M 359 56 L 351 80" />
+        <path id="emblem-upper-right-divider" stroke-width="6.2" d="M 460 53 L 450 84" />
+        <path id="emblem-lower-left-divider" stroke-width="6.2" d="M 160 381 L 170 353" />
+        <path id="emblem-lower-right-divider" stroke-width="6.2" d="M 386 380 L 428 187" />
+      </g>
+      <path id="emblem-grid-perimeter" class="ink-navy" data-ink="navy" fill="none" stroke="#ffffff" stroke-width="8.8" stroke-linejoin="miter" d="M 145 63 L 574 49 L 481 380 L 22 381 Z" />
+    </g>
+  </g>
+  <g id="wordmark">
+    <g id="wordmark-wordmark-navy" data-ink="navy" fill="#ffffff" fill-rule="evenodd">
+      <path id="wordmark-letter-I" d="M 615 33 H 710 V 384 H 615 Z" />
+      <path id="wordmark-letter-G" d="M 1044 101 H 892 C 837 101 802 144 802 210 C 802 272 838 313 891 313 C 929 313 959 287 970 244 H 894 V 178 H 1047 V 232 C 1047 322 982 385 891 385 C 795 385 728 311 728 210 C 728 107 794 33 888 33 H 1044 Z" />
+      <path id="wordmark-letter-R" d="M 1079 33 H 1282 C 1346 33 1385 75 1385 137 C 1385 195 1347 232 1278 235 H 1162 V 384 H 1079 Z M 1162 98 H 1263 C 1289 98 1306 114 1306 138 C 1306 163 1289 180 1263 180 H 1162 Z" />
+      <path id="wordmark-letter-l" d="M 1423 30 H 1465 C 1487 30 1497 42 1497 65 V 313 C 1497 329 1503 338 1520 338 V 384 H 1493 C 1448 384 1423 361 1423 317 Z" />
+      <path id="wordmark-letter-a" d="M 1713 170 V 147 H 1758 C 1769 147 1773 150 1773 158 V 384 H 1713 V 362 C 1691 379 1667 388 1640 388 C 1570 388 1525 337 1525 265 C 1525 195 1572 142 1645 142 C 1674 142 1695 151 1713 170 Z M 1645 207 C 1610 207 1585 232 1585 265 C 1585 300 1610 322 1645 322 C 1681 322 1706 298 1706 265 C 1706 231 1682 207 1645 207 Z" />
+      <path id="wordmark-letter-b" d="M 1798 30 H 1839 C 1863 30 1873 42 1873 65 V 163 C 1894 147 1919 142 1948 142 C 2019 142 2065 194 2065 263 C 2065 336 2018 388 1943 388 C 1909 388 1886 379 1864 363 C 1859 377 1846 384 1827 384 H 1798 Z M 1873 234 C 1873 212 1895 199 1927 199 C 1967 199 1991 224 1991 262 C 1991 302 1966 329 1929 329 C 1896 329 1873 318 1873 298 Z" />
+    </g>
+    <g id="wordmark-wordmark-orange" data-ink="orange" fill="#e06215">
+      <path id="wordmark-R-smooth-leg" d="M 1162 180 C 1218 180 1254 201 1277 233 C 1295.4 258.6 1306 289 1330 311 C 1354 333 1377 333 1403 333 V 384 H 1350 C 1309 384 1283 367 1262 339 C 1236.8 305.4 1236 276 1210 254 C 1194.4 240.8 1179 237 1162 237 Z" />
+    </g>
+  </g>
+</svg>
