@@ -503,7 +503,7 @@ private:
 
   /// Per-element scalar dof count used by packed inverse-mass apply.
   int invmass_elem_dof_ = 0;
-  /// Flattened per-element inverse mass blocks (column-major dof x dof).
+  /// Exact diagonal entries (ne*dof), or column-major dense blocks (ne*dof*dof).
   Vector invmass_data_flat_;
   /// Per-element vector-dof map in node-major, equation-minor layout.
   Array<int> invmass_elem_vdof_map_;

@@ -1,6 +1,7 @@
 #include "igrlab/environment.hpp"
 #include "numerics/dg/BdrHyperbolicFluxIntegrator.hpp"
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
+#include "numerics/dgsem/dgsem_operator.hpp"
 #include "numerics/riemann/rusanov.hpp"
 #include "physics/bc/boundary_state.hpp"
 
@@ -117,6 +118,125 @@ int RunDGOperatorTests(TestContext& ctx)
   ctx.Check(resid_norm < tol,
             "DG operator residual is near zero for a constant state (norm=" +
               FormatSci(resid_norm) + ")");
+
+  // Compare the ordinary DG apply with the unchanged dense inverse-mass
+  // oracle on nonconstant residuals. GL/LGL affine elements start diagonal;
+  // curved GL geometry requires dense blocks. Updates must refresh both the
+  // representation and its element/dof maps, including after refinement.
+  for (int basis : {mfem::BasisType::GaussLegendre,
+                    mfem::BasisType::GaussLobatto})
+  {
+    for (int mass_order : {1, 3})
+    {
+      mfem::Mesh mass_mesh = mfem::Mesh::MakeCartesian2D(
+        2, 2, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+      mfem::ParMesh mass_pmesh(MPI_COMM_SELF, mass_mesh);
+      mfem::DG_FECollection mass_fec(mass_order, dim, basis);
+      mfem::ParFiniteElementSpace mass_fes(
+        &mass_pmesh, &mass_fec, num_eq, mfem::Ordering::byNODES);
+      mfem::ParGridFunction mass_state(&mass_fes);
+      mfem::VectorFunctionCoefficient mass_state_coefficient(
+        num_eq,
+        [&](const mfem::Vector& point, mfem::Vector& state)
+        {
+          state = EulerConsFromPrim2D(
+            1.0 + 0.1 * point(0) + 0.07 * point(1),
+            0.2 + 0.05 * point(0),
+            -0.1 + 0.025 * point(1),
+            1.0 + 0.03 * point(0) * point(1),
+            gamma);
+        });
+      mfem::DGHyperbolicConservationLaws mass_oper(
+        mass_fes,
+        std::make_unique<mfem::HyperbolicFormIntegrator>(num_flux,
+                                                       int_order_offset),
+        /*preassembleWeakDivergence=*/false);
+      mfem::HyperbolicFormIntegrator reference_integrator(
+        num_flux, int_order_offset);
+      mfem::ParNonlinearForm reference_form(&mass_fes);
+      reference_form.AddDomainIntegrator(&reference_integrator);
+      reference_form.AddInteriorFaceIntegrator(&reference_integrator);
+      reference_form.UseExternalIntegrators();
+
+      const auto compare_inverse_mass = [&](const std::string& geometry,
+                                            bool expect_diagonal)
+      {
+        // Independently verify the fixture's assembled inverse structure.
+        // In particular, test dense fallback on inverses with nonzero
+        // off-diagonals rather than assuming a geometry implies that branch.
+        mfem::InverseIntegrator inverse(new mfem::MassIntegrator());
+        mfem::IntegrationRules lgl_rules(0, mfem::Quadrature1D::GaussLobatto);
+        bool all_diagonal = true;
+        for (int element = 0; element < mass_fes.GetNE(); ++element)
+        {
+          const mfem::FiniteElement& fe = *mass_fes.GetFE(element);
+          inverse.SetIntRule(
+            basis == mfem::BasisType::GaussLobatto
+              ? &lgl_rules.Get(fe.GetGeomType(),
+                               std::max(1, 2 * fe.GetOrder() - 1))
+              : nullptr);
+          mfem::DenseMatrix inverse_block;
+          inverse.AssembleElementMatrix(
+            fe, *mass_fes.GetElementTransformation(element), inverse_block);
+          for (int column = 0; column < fe.GetDof(); ++column)
+          {
+            for (int row = 0; row < fe.GetDof(); ++row)
+            {
+              all_diagonal = all_diagonal &&
+                             (row == column ||
+                              inverse_block(row, column) == 0.0);
+            }
+          }
+        }
+        const std::string label =
+          "DG inverse mass " + geometry + " p" + std::to_string(mass_order) +
+          (basis == mfem::BasisType::GaussLobatto ? " LGL" : " GL");
+        ctx.Check(all_diagonal == expect_diagonal,
+                  label + " exercises the expected exact matrix structure");
+
+        mass_state.ProjectCoefficient(mass_state_coefficient);
+        mfem::Vector mass_x;
+        mass_state.GetTrueDofs(mass_x);
+        mfem::Vector weak_rhs(mass_fes.GetTrueVSize());
+        reference_form.Mult(mass_x, weak_rhs);
+        mfem::Vector expected(mass_fes.GetTrueVSize());
+        mfem::dgsem::DGSEMOperator dense_oracle(mass_oper);
+        dense_oracle.ApplyInverseMass(weak_rhs, expected);
+        mfem::Vector actual(mass_fes.GetTrueVSize());
+        mass_oper.Mult(mass_x, actual);
+        ctx.Check(expected.Normlinf() > 1.0e-3,
+                  label + " has a nonzero residual");
+        actual -= expected;
+        const double relative_error =
+          actual.Normlinf() / std::max(1.0, expected.Normlinf());
+        ctx.Check(relative_error < 3.0e-12,
+                  label + " matches the dense inverse-mass oracle (error=" +
+                    FormatSci(relative_error) + ")");
+      };
+
+      compare_inverse_mass("affine", /*expect_diagonal=*/true);
+      mass_pmesh.SetCurvature(2, false, dim, mfem::Ordering::byNODES);
+      mass_pmesh.Transform([](const mfem::Vector& reference,
+                              mfem::Vector& physical)
+      {
+        physical.SetSize(2);
+        physical(0) = reference(0) +
+                      0.08 * reference(0) * reference(0) * reference(1);
+        physical(1) = reference(1);
+      });
+      mass_oper.Update();
+      reference_form.Update();
+      const bool curved_diagonal = basis == mfem::BasisType::GaussLobatto;
+      compare_inverse_mass("curved update", curved_diagonal);
+
+      mass_pmesh.UniformRefinement();
+      mass_fes.Update();
+      mass_state.Update();
+      mass_oper.Update();
+      reference_form.Update();
+      compare_inverse_mass("refined update", curved_diagonal);
+    }
+  }
 
   // A prescribed physical-boundary state can dominate all volume and
   // interior-face samples. Its Rusanov speed must reach the operator CFL

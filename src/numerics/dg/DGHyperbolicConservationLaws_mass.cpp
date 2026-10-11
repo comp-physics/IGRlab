@@ -6,6 +6,26 @@ namespace mfem
 
 #include "DGHyperbolicConservationLaws_device_kernels.hpp"
 
+namespace
+{
+
+struct PackedDiagonalInverseMassKernel
+{
+  int neq = 0;
+  const int* map = nullptr;
+  const real_t* diagonal = nullptr;
+  const real_t* zin = nullptr;
+  real_t* yout = nullptr;
+
+  MFEM_HOST_DEVICE void operator()(int entry) const
+  {
+    const int vdof = map[entry];
+    yout[vdof] = diagonal[entry / neq] * zin[vdof];
+  }
+};
+
+} // namespace
+
 // -----------------------------------------------------------------------------
 // Compute inverse mass matrices
 // -----------------------------------------------------------------------------
@@ -109,10 +129,37 @@ void DGHyperbolicConservationLaws::BuildInvMassApplyData_()
     }
   }
 
-  invmass_data_flat_.SetSize(ne * dof * dof);
+  // Inspect the assembled inverses themselves: compress only exact diagonal
+  // blocks, without a tolerance or a change to mass quadrature/inversion.
+  // Any nonzero off-diagonal entry retains the existing dense apply.
+  bool diagonal = true;
+  for (int e = 0; diagonal && e < ne; ++e)
+  {
+    for (int c = 0; diagonal && c < dof; ++c)
+    {
+      for (int r = 0; r < dof; ++r)
+      {
+        if (r != c && invmass[e](r, c) != 0.0)
+        {
+          diagonal = false;
+          break;
+        }
+      }
+    }
+  }
+
+  invmass_data_flat_.SetSize(ne * dof * (diagonal ? 1 : dof));
   real_t* minv_flat = invmass_data_flat_.HostWrite();
   for (int e = 0; e < ne; ++e)
   {
+    if (diagonal)
+    {
+      for (int i = 0; i < dof; ++i)
+      {
+        minv_flat[e * dof + i] = invmass[e](i, i);
+      }
+      continue;
+    }
     const int m_off = e * dof * dof;
     for (int c = 0; c < dof; ++c)
     {
@@ -234,6 +281,25 @@ void DGHyperbolicConservationLaws::ApplyInverseMassPacked_(
   auto zin = z_in.Read();
   auto yout = y_out.Write();
 
+  if (invmass_data_flat_.Size() == ne * dof)
+  {
+    PackedDiagonalInverseMassKernel kernel;
+    kernel.neq = neq;
+    kernel.map = map;
+    kernel.diagonal = minv;
+    kernel.zin = zin;
+    kernel.yout = yout;
+#ifdef DG_IGR_HAS_ACCEL_FORALL
+    mfem::forall(ne * ldof, kernel);
+#else
+    for (int entry = 0; entry < ne * ldof; ++entry)
+    {
+      kernel(entry);
+    }
+#endif
+    return;
+  }
+
 #ifdef DG_IGR_HAS_ACCEL_FORALL
   // invmass_data_flat_ stores each local inverse mass in column-major order:
   // entry (row=i, col=j) is minv[moff + j*dof + i].
@@ -284,6 +350,16 @@ void DGHyperbolicConservationLaws::ApplyInverseMassHost_(
     auto minv = invmass_data_flat_.HostRead();
     auto zin = z_in.HostRead();
     auto yout = y_out.HostWrite();
+
+    if (invmass_data_flat_.Size() == ne * dof)
+    {
+      for (int entry = 0; entry < ne * ldof; ++entry)
+      {
+        const int vdof = map[entry];
+        yout[vdof] = minv[entry / neq] * zin[vdof];
+      }
+      return;
+    }
 
     for (int e = 0; e < ne; ++e)
     {
