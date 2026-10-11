@@ -6479,6 +6479,36 @@ ExperimentalCondensationArithmetic SelectedExperimentalCondensationArithmetic() 
   return selected;
 }
 
+constexpr int borrowed_condense_block_threads=128;
+static_assert(borrowed_condense_block_threads%32==0,
+              "borrowed condensation requires complete CUDA warps");
+
+// Both cooperative condensation kernels launch exactly this many threads.
+// fmax starts from zero and ignores NaNs exactly as the former serial scan;
+// fabs makes every retained operand nonnegative, including positive infinity.
+// Only thread zero consumes the returned block maximum.
+static __device__ __forceinline__ double BorrowedCondenseBlockScale(
+    double local_scale)
+{
+  constexpr int warps=borrowed_condense_block_threads/32;
+  __shared__ double warp_scale[warps];
+  const int lane=threadIdx.x%32,warp=threadIdx.x/32;
+#pragma unroll
+  for(int delta=16;delta>0;delta/=2)
+    local_scale=fmax(local_scale,
+        __shfl_down_sync(0xffffffffu,local_scale,delta));
+  if(lane==0)warp_scale[warp]=local_scale;
+  __syncthreads();
+  if(threadIdx.x==0)
+  {
+    local_scale=0.0;
+#pragma unroll
+    for(int index=0;index<warps;++index)
+      local_scale=fmax(local_scale,warp_scale[index]);
+  }
+  return local_scale;
+}
+
 __global__ void CondenseKernel(CudaDeviceView v,CudaMeshShape s)
 {
   const int e=blockIdx.x*blockDim.x+threadIdx.x;if(e>=s.elements)return;
@@ -6513,18 +6543,20 @@ __global__ void BorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
   __shared__ double scale;
   __shared__ int pivot_row;
   __shared__ int failed;
-  for(int i=threadIdx.x;i<ni*ni;i+=blockDim.x)lu[i]=v.a[ao+i];
+  double local_scale=0.0;
+  for(int i=threadIdx.x;i<ni*ni;i+=blockDim.x)
+  {
+    const double value=v.a[ao+i];
+    lu[i]=value;
+    local_scale=fmax(local_scale,fabs(value));
+  }
   for(int i=threadIdx.x;i<ni*cols;i+=blockDim.x)
   {
     const int row=i/cols,column=i-row*cols;
     w[i]=column<nt?v.b[bo+row*nt+column]:v.f[e*ni+row];
   }
-  __syncthreads();
-  if(threadIdx.x==0)
-  {
-    scale=0.0;failed=0;
-    for(int i=0;i<ni*ni;++i)scale=fmax(scale,fabs(lu[i]));
-  }
+  const double block_scale=BorrowedCondenseBlockScale(local_scale);
+  if(threadIdx.x==0){scale=block_scale;failed=0;}
   __syncthreads();
   for(int column=0;column<ni;++column)
   {
@@ -6857,6 +6889,8 @@ __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   constexpr int lu_panel_columns=8;
   constexpr int tensor_warps_per_block=4;
+  static_assert(borrowed_condense_block_threads==32*tensor_warps_per_block,
+                "tensor condensation requires exactly four CUDA warps");
   constexpr int tensor_column_batch_tiles=2;
   const int e=blockIdx.x;if(e>=s.elements)return;
   const int ni=s.interior_dofs,nt=s.trace_dofs,cols=nt+1;
@@ -6875,18 +6909,20 @@ __global__ void TensorBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
       tensor_b[tensor_warps_per_block][tensor_column_batch_tiles][4*8];
   __shared__ __align__(32) double
       tensor_product[tensor_warps_per_block][8*8];
-  for(int i=threadIdx.x;i<ni*ni;i+=blockDim.x)lu[i]=v.a[ao+i];
+  double local_scale=0.0;
+  for(int i=threadIdx.x;i<ni*ni;i+=blockDim.x)
+  {
+    const double value=v.a[ao+i];
+    lu[i]=value;
+    local_scale=fmax(local_scale,fabs(value));
+  }
   for(int i=threadIdx.x;i<ni*cols;i+=blockDim.x)
   {
     const int row=i/cols,column=i-row*cols;
     w[i]=column<nt?v.b[bo+row*nt+column]:v.f[e*ni+row];
   }
-  __syncthreads();
-  if(threadIdx.x==0)
-  {
-    scale=0.0;failed=0;
-    for(int i=0;i<ni*ni;++i)scale=fmax(scale,fabs(lu[i]));
-  }
+  const double block_scale=BorrowedCondenseBlockScale(local_scale);
+  if(threadIdx.x==0){scale=block_scale;failed=0;}
   __syncthreads();
   for(int panel_start=0;panel_start<ni;panel_start+=lu_panel_columns)
   {
@@ -9601,7 +9637,7 @@ bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
   tensor_mma_tiles=0;
   if(engine==generic::CudaEngineKind::ordinary)
   {
-    if(s.borrowed_host_inputs)BorrowedCondenseKernel<<<s.elements,128>>>(v,s);
+    if(s.borrowed_host_inputs)BorrowedCondenseKernel<<<s.elements,borrowed_condense_block_threads>>>(v,s);
     else CondenseKernel<<<Blocks(s.elements),128>>>(v,s);
     return LaunchOk();
   }
@@ -9660,9 +9696,9 @@ bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
   const auto arithmetic=SelectedExperimentalCondensationArithmetic();
   if(arithmetic==ExperimentalCondensationArithmetic::invalid)return false;
   if(arithmetic==ExperimentalCondensationArithmetic::fp64_wmma)
-    TensorBorrowedCondenseKernel<true><<<s.elements,128>>>(v,s);
+    TensorBorrowedCondenseKernel<true><<<s.elements,borrowed_condense_block_threads>>>(v,s);
   else
-    TensorBorrowedCondenseKernel<false><<<s.elements,128>>>(v,s);
+    TensorBorrowedCondenseKernel<false><<<s.elements,borrowed_condense_block_threads>>>(v,s);
   if(!LaunchOk())return false;
   if(arithmetic==ExperimentalCondensationArithmetic::fp64_wmma)
     tensor_mma_tiles=per_element*elements;
