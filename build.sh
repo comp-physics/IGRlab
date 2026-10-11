@@ -2591,11 +2591,9 @@ command -v spack >/dev/null 2>&1 || {
 
 if ((INSTALL_DEPS)); then
   echo "[build] installing ${MODE} dependencies from ${SPACK_ENV}"
-  if ((CALIPER)) || [[ "${IGRLAB_BUILD_SITE:-}" == "pace" ]]; then
-    spack -e "${SPACK_ENV}" concretize
-  else
-    spack -e "${SPACK_ENV}" concretize -f
-  fi
+  # Repeat builds retain the selected environment's concrete dependency graph.
+  # Dependency upgrades are an explicit Spack environment operation.
+  spack -e "${SPACK_ENV}" concretize
   if [[ "${IGRLAB_BUILD_SITE:-}" == "pace" ]]; then
     python3 "${SCRIPT_DIR}/scripts/build/pace_manifest.py" --profile "${PROFILE}" \
       --check-lock "${SPACK_ENV}/spack.lock"

@@ -181,12 +181,13 @@ if [[ $pace_profile == cuda-sm80 && ($pace_tests == 1 || $pace_smoke == 1) ]]; t
   export DG_IGR_TEST_DEVICE=cuda
 fi
 type module >/dev/null 2>&1 || pace_fail "PACE environment modules are unavailable"
-# Query the selected build tool; do not assume a recipe checkout layout.
-pace_recipe_root=${IGRLAB_PACE_RECIPE_ROOT:-}
-if [[ -z $pace_recipe_root ]]; then
-  pace_recipe_root=$(SPACK_ROOT="$pace_spack_root" python3 "$pace_script_dir/pace_discover.py" \
-    --spack "$pace_spack_root/bin/spack" --recipe-root)
+# Retained environments own their recipes; fresh roots query the selected tool.
+pace_recipe_args=(--site-root "$pace_dependency_root" --recipe-profile "$pace_profile")
+if [[ -n ${IGRLAB_PACE_RECIPE_ROOT:-} ]]; then
+  pace_recipe_args+=(--recipe-override "$IGRLAB_PACE_RECIPE_ROOT")
 fi
+pace_recipe_root=$(SPACK_ROOT="$pace_spack_root" python3 "$pace_script_dir/pace_discover.py" \
+  --spack "$pace_spack_root/bin/spack" --recipe-root "${pace_recipe_args[@]}")
 [[ -d $pace_recipe_root ]] || pace_fail "Spack's builtin recipe repository is unavailable; configure it with spack repo add"
 pace_recipe_root=$(realpath -e -- "$pace_recipe_root")
 module purge

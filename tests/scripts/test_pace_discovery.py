@@ -57,6 +57,8 @@ class PaceDiscovery(unittest.TestCase):
         self.calls = []
         self.version = "1.3.0.dev0\n"
         self.recipe_output = str(self.recipe) + "\n"
+        self.scoped_recipe_output = None
+        self.site_root = self.root / "dependency root"
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -78,7 +80,15 @@ class PaceDiscovery(unittest.TestCase):
         self.calls.append((str(spack), list(arguments), dict(environment)))
         if arguments == ["--version"]:
             return self.version
-        if arguments == ["location", "--repo", "builtin"]:
+        if arguments[-3:] == ["location", "--repo", "builtin"]:
+            if self.scoped_recipe_output is not None:
+                return self.scoped_recipe_output
+            if arguments[:1] == ["-e"]:
+                document = json.loads((Path(arguments[1]) / "spack.yaml").read_text())
+                return document["spack"]["repos"]["builtin"] + "\n"
+            repos = Path(environment.get("SPACK_USER_CONFIG_PATH", "")) / "repos.yaml"
+            if repos.is_file():
+                return json.loads(repos.read_text())["repos"]["builtin"] + "\n"
             return self.recipe_output
         self.assertEqual(arguments[:2], ["-c", f"config:install_tree:root:{self.store}"])
         if arguments[2:4] == ["find", "--json"]:
@@ -278,6 +288,124 @@ class PaceDiscovery(unittest.TestCase):
         with patch.object(PACE, "query", self.query), self.assertRaisesRegex(PACE.DiscoveryError, "lacks repo.yaml"):
             PACE.discover_recipe_root(self.tool, self.environment)
 
+    def retain(self, profile="cpu", shared=True, recipe=None):
+        recipe = str(recipe or self.recipe)
+        environment = self.site_root / "site/pace/spack-envs" / profile
+        environment.mkdir(parents=True, exist_ok=True)
+        (environment / "spack.yaml").write_text(json.dumps({"spack": {"repos": {"builtin": recipe}}}))
+        if shared:
+            metadata = self.site_root / "site/pace/spack-user/repos.yaml"
+            metadata.parent.mkdir(parents=True, exist_ok=True)
+            metadata.write_text(json.dumps({"repos": {"builtin": recipe}}))
+        return environment
+
+    def discover_recipe(self, profile="cpu", override=None):
+        with patch.object(PACE, "query", self.query):
+            return PACE.discover_recipe_root(self.tool, self.environment,
+                                            self.site_root, profile, override)
+
+    def test_retained_profile_wins_over_ambient_recipe_drift(self):
+        self.recipe_output = str(self.root) + "\n"
+        for profile in PACE.PROFILES:
+            with self.subTest(profile=profile):
+                selected = self.retain(profile)
+                self.assertEqual(self.discover_recipe(profile), str(self.recipe))
+                self.assertEqual(self.calls[-1][1], ["-e", str(selected), "location", "--repo", "builtin"])
+
+    def test_retained_queries_clear_ambient_scopes_and_bind_private_scopes(self):
+        self.retain()
+        self.discover_recipe()
+        environment = self.calls[-1][2]
+        self.assertNotIn("SPACK_ENV", environment)
+        self.assertNotIn("SPACK_DISABLE_LOCAL_CONFIG", environment)
+        self.assertEqual(environment["SPACK_ROOT"], str(self.tool.parent.parent))
+        self.assertEqual(environment["SPACK_USER_CONFIG_PATH"], str(self.site_root / "site/pace/spack-user"))
+        self.assertEqual(environment["SPACK_SYSTEM_CONFIG_PATH"], str(self.site_root / "site/pace/spack-system"))
+        self.assertEqual(environment["SPACK_USER_CACHE_PATH"], str(self.site_root / "spack-cache"))
+        self.assertEqual(environment["PATH"], self.environment["PATH"])
+
+    def test_new_second_profile_uses_retained_shared_user_scope(self):
+        self.retain("cpu")
+        self.recipe_output = str(self.root) + "\n"
+        self.assertEqual(self.discover_recipe("cuda-sm80"), str(self.recipe))
+        self.assertEqual(self.calls[-1][1], ["location", "--repo", "builtin"])
+        self.assertFalse((self.site_root / "site/pace/spack-envs/cuda-sm80").exists())
+
+    def test_other_profile_environment_supplies_authority_without_shared_scope(self):
+        selected = self.retain("cuda-sm80", shared=False)
+        self.assertEqual(self.discover_recipe(), str(self.recipe))
+        self.assertEqual(self.calls[-1][1][:2], ["-e", str(selected)])
+
+    def test_retained_shared_scope_can_supply_authority_without_profile(self):
+        selected = self.retain()
+        (selected / "spack.yaml").unlink()
+        selected.rmdir()
+        self.assertEqual(self.discover_recipe("cuda-sm80"), str(self.recipe))
+        self.assertEqual(self.calls[-1][1], ["location", "--repo", "builtin"])
+
+    def test_initial_root_keeps_current_public_discovery(self):
+        self.assertEqual(self.discover_recipe(), str(self.recipe))
+        self.assertEqual(self.calls[-1][1], ["location", "--repo", "builtin"])
+        self.assertEqual(self.calls[-1][2]["SPACK_ENV"], self.environment["SPACK_ENV"])
+        self.assertFalse(self.site_root.exists())
+
+    def test_explicit_override_admits_initial_or_matching_retained_authority(self):
+        self.assertEqual(self.discover_recipe(override=str(self.recipe)), str(self.recipe))
+        self.assertEqual(self.calls, [])
+        self.retain()
+        self.assertEqual(self.discover_recipe(override=str(self.recipe)), str(self.recipe))
+        self.assertIn("-e", self.calls[-1][1])
+
+    def test_explicit_override_conflict_rejects_before_spack_queries(self):
+        self.retain()
+        other = self.root / "other recipes"
+        (other / "packages").mkdir(parents=True)
+        (other / "repo.yaml").write_text("repo:\n  namespace: builtin\n")
+        with self.assertRaisesRegex(PACE.DiscoveryError, "explicit.*conflicts"):
+            self.discover_recipe(override=str(other))
+        self.assertEqual(self.calls, [])
+
+    def test_retained_profiles_and_shared_scope_must_agree(self):
+        self.retain()
+        other = self.root / "other recipes"
+        (other / "packages").mkdir(parents=True)
+        (other / "repo.yaml").write_text("repo:\n  namespace: builtin\n")
+        self.retain("cuda-sm80", shared=False, recipe=other)
+        with self.assertRaisesRegex(PACE.DiscoveryError, "profile/shared.*conflict"):
+            self.discover_recipe()
+        self.assertEqual(self.calls, [])
+
+    def test_missing_malformed_and_incomplete_retained_metadata_do_not_fallback(self):
+        selected = self.retain(shared=False)
+        metadata = selected / "spack.yaml"
+        for content in (None, "not JSON", '{"spack":{}}', '{"spack":{"repos":{"builtin":null}}}'):
+            with self.subTest(content=content):
+                if content is None:
+                    metadata.unlink()
+                else:
+                    metadata.write_text(content)
+                with self.assertRaises(PACE.DiscoveryError):
+                    self.discover_recipe()
+                self.assertEqual(self.calls, [])
+        metadata.write_text(json.dumps({"spack": {"repos": {"builtin": str(self.recipe)}}}))
+        user_scope = self.site_root / "site/pace/spack-user"
+        user_scope.mkdir()
+        with self.assertRaisesRegex(PACE.DiscoveryError, "metadata is missing"):
+            self.discover_recipe()
+
+    def test_missing_retained_repository_and_query_mismatch_do_not_fallback(self):
+        self.retain()
+        (self.recipe / "repo.yaml").unlink()
+        with self.assertRaisesRegex(PACE.DiscoveryError, "lacks repo.yaml"):
+            self.discover_recipe()
+        self.assertEqual(self.calls, [])
+        (self.recipe / "repo.yaml").write_text("repo:\n  namespace: builtin\n")
+        self.scoped_recipe_output = str(self.store) + "\n"
+        (self.store / "packages").mkdir()
+        (self.store / "repo.yaml").write_text("repo:\n  namespace: builtin\n")
+        with self.assertRaisesRegex(PACE.DiscoveryError, "refusing ambient fallback"):
+            self.discover_recipe()
+
     def test_subprocess_failure_and_timeout_are_bounded_actionable_errors(self):
         failed = subprocess.CompletedProcess([], 1, "", "No package matches")
         with patch.object(PACE.subprocess, "run", return_value=failed), self.assertRaisesRegex(PACE.DiscoveryError, "No package matches"):
@@ -290,6 +418,17 @@ class PaceDiscovery(unittest.TestCase):
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 2)
         self.assertIn("--profile requires --anchor", result.stderr)
+
+    def test_cli_recipe_scope_arguments_are_paired_and_recipe_only(self):
+        for arguments in (("--recipe-root", "--site-root", str(self.site_root)),
+                          ("--recipe-root", "--recipe-profile", "cpu"),
+                          ("--profile", "cpu", "--anchor", str(self.anchor), "--recipe-override", str(self.recipe))):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([sys.executable, str(SCRIPT), "--spack", str(self.tool), *arguments],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("recipe", result.stderr)
+                self.assertNotIn("Spack metadata query", result.stderr)
 
 
 if __name__ == "__main__":

@@ -28,9 +28,17 @@ allocation. Builds and timings must run on compute nodes.
 
 For a shell without initialized build Spack, provide
 `--spack-root /absolute/path/to/spack/core` or set `IGRLAB_PACE_SPACK_ROOT`.
-The driver queries that tool's configured builtin recipes with
-`spack location --repo builtin`; it does not assume a recipe checkout layout.
-`IGRLAB_PACE_RECIPE_ROOT` remains an explicit override.
+For a fresh site root, the driver queries that tool's configured builtin recipes
+with `spack location --repo builtin`; it does not assume a recipe checkout layout.
+An existing profile retains the repository recorded in its generated manifest
+and queries it with `spack -e <environment> location --repo builtin`, isolated from
+ambient Spack environment and configuration variables. A new second profile
+uses the site's retained shared repository scope (or the existing profile if
+that shared scope is absent). Conflicting, malformed, or missing retained
+repository metadata fails before dependency preparation.
+`IGRLAB_PACE_RECIPE_ROOT` remains an explicit override for fresh roots; an override
+on an existing site must match its retained repository. Use a new `--site-root`
+to select a different recipe authority without replacing the existing graph.
 The tested build tool is Spack `1.3.0.dev0`; the dependency environment retains
 its concrete lock between runs.
 

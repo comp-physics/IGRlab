@@ -44,13 +44,31 @@ Then use the unified build driver:
 ```
 
 On PACE, use the checked-in site profile to submit compilation and validation to
-the free background queue. See [the one-command PACE build](docs/pace.md) for
-the scratch output path and Spack setup:
+the free background queue. CPU and A100 builds use separate Spack environments,
+dependency stores, and build caches. See [the PACE build](docs/pace.md) for the
+scratch output path and Spack setup:
 
 ```bash
+./build.sh --site pace --cpu-only --hdg-runtime --submit \
+  --output-root /absolute/scratch/igrlab-build
 ./build.sh --site pace --a100 --hdg-runtime --submit \
   --output-root /absolute/scratch/igrlab-build
 ```
+
+| Target | Selected Spack environment |
+|---|---|
+| PACE CPU | `SITE_ROOT/site/pace/spack-envs/cpu` |
+| PACE A100 | `SITE_ROOT/site/pace/spack-envs/cuda-sm80` |
+| Other systems | A site environment selected with `IGRLAB_SPACK_ENV` |
+
+`SITE_ROOT` defaults to `OUTPUT_ROOT`; `--site-root` selects a separate dependency
+root when needed.
+Each environment retains its own `spack.yaml` and `spack.lock`. Keep dependency
+roots separate across machines; select compilers, MPI and CUDA through the
+machine's Spack configuration. The PACE profile discovers installation paths
+through Spack rather than embedding them in the repository.
+Ordinary builds retain the selected lock; intentional dependency upgrades use
+Spack's explicit environment re-concretization workflow.
 
 Application and locally built MFEM outputs live outside the checkout. By default they are scoped under
 `${XDG_CACHE_HOME:-$HOME/.cache}/igrlab-build` by canonical worktree and
@@ -68,7 +86,7 @@ and resolved app/MFEM paths without creating output-root content or acquiring
 the output lock. `build_mfem_tpl.sh` is an internal helper; invoke `build.sh`
 for all builds.
 
-Spack environments live under `spack-envs/`. The CUDA profiles are
+The generic Spack environment templates live under `spack-envs/`. Their CUDA profiles are
 `cuda-sm120` (Blackwell, CUDA 13 and HYPRE `develop`) and `cuda-sm80`
 (A100, CUDA 12.9.1, HYPRE 2.32.0 and Umpire 2024.07.0). The A100 manifest
 uses static HYPRE with CUDA/Umpire, as supported by older site Spack recipes. It is a portable template: configure site compilers and
@@ -77,6 +95,8 @@ then concretize/install through the driver. For a shared x86 CPU build and
 A100 GPU allocation, constrain the site environment to a CPU target supported
 by both nodes (for example `target=x86_64_v3`), rather than the build node
 architecture.
+The PACE site profile generates its own environments with HYPRE 3.1.0 and
+Umpire 2025.12.0; its settings are recorded in [the site definition](cmake/sites/pace.json).
 
 GPU architecture selection has three deliberately separate roles. For the
 checked-in Blackwell profile, `--cuda-arch 120` selects Spack dependencies and

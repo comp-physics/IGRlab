@@ -197,15 +197,74 @@ def discover_config(profile, spack, anchor, config=None, environ=None):
     return config
 
 
-def discover_recipe_root(spack, environ=None):
-    # Repository configuration belongs to the selected build tool. Preserve its
-    # current user/system/environment scopes instead of using site-query scopes.
-    spack, environment = admitted_reader(spack, environ, isolated=False)
-    location = query(spack, ["location", "--repo", "builtin"], environment)
-    require(len(location.strip().splitlines()) == 1, "builtin repository query must return one path")
-    root = existing_path(location.strip(), "builtin recipe root", directory=True)
+def recipe_path(value, label):
+    require(isinstance(value, str) and bool(value), f"{label} must identify the builtin repository")
+    try:
+        root = existing_path(value, label, directory=True)
+    except OSError as error:
+        raise DiscoveryError(f"{label} is unavailable: {value}") from error
     require((root / "repo.yaml").is_file() and (root / "packages").is_dir(),
-            f"builtin recipe root lacks repo.yaml or packages: {root}")
+            f"{label} lacks repo.yaml or packages: {root}")
+    return root
+
+
+def retained_recipe_scope(site_root, profile):
+    """Inspect only the JSON/YAML-subset metadata written by pace_manifest.py."""
+    require(profile in PROFILES, "retained recipe discovery requires a supported --recipe-profile")
+    root = Path(site_root)
+    require(root.is_absolute(), "--site-root must be absolute")
+    site = root.resolve() / "site/pace"
+    authorities, environments = [], {}
+    for selected in PROFILES:
+        environment = site / "spack-envs" / selected
+        if environment.exists() or environment.is_symlink():
+            environments[selected] = environment
+            authorities.append((environment / "spack.yaml", "spack"))
+    user_scope = site / "spack-user"
+    if user_scope.exists() or user_scope.is_symlink():
+        authorities.append((user_scope / "repos.yaml", None))
+    repositories = []
+    for metadata, section in authorities:
+        require(metadata.is_file() and not metadata.is_symlink(),
+                f"retained repository metadata is missing or not a regular file: {metadata}")
+        try:
+            document = json.loads(metadata.read_text())
+            config = document[section] if section else document
+            value = config["repos"]["builtin"]
+        except (ValueError, KeyError, TypeError) as error:
+            raise DiscoveryError(f"malformed retained repository metadata: {metadata}") from error
+        repositories.append(recipe_path(value, f"retained builtin repository in {metadata}"))
+    require(len(set(repositories)) <= 1,
+            "retained profile/shared builtin repositories conflict; choose a new --site-root")
+    environment = environments.get(profile)
+    if environment is None and not user_scope.exists() and environments:
+        environment = next(iter(environments.values()))
+    return (repositories[0] if repositories else None), environment, site
+
+
+def discover_recipe_root(spack, environ=None, site_root=None, profile=None, override=None):
+    retained, selected, site = retained_recipe_scope(site_root, profile) if site_root else (None, None, None)
+    if override:
+        explicit = recipe_path(override, "explicit builtin recipe root")
+        require(retained is None or explicit == retained,
+                "explicit builtin recipe root conflicts with retained repository metadata; choose a new --site-root")
+        if retained is None:
+            return str(explicit)
+    # A retained graph owns its repository scope; inherited scopes must not
+    # select ambient recipes. Fresh roots still query the tool's current scopes.
+    spack, environment = admitted_reader(spack, environ, isolated=retained is not None)
+    arguments = ["location", "--repo", "builtin"]
+    if retained is not None:
+        environment.update(SPACK_USER_CONFIG_PATH=str(site / "spack-user"),
+                           SPACK_SYSTEM_CONFIG_PATH=str(site / "spack-system"),
+                           SPACK_USER_CACHE_PATH=str(site.parent.parent / "spack-cache"))
+        if selected is not None:
+            arguments = ["-e", str(selected), *arguments]
+    location = query(spack, arguments, environment)
+    require(len(location.strip().splitlines()) == 1, "builtin repository query must return one path")
+    root = recipe_path(location.strip(), "builtin recipe root")
+    require(retained is None or root == retained,
+            "Spack builtin repository query differs from retained repository metadata; refusing ambient fallback")
     return str(root)
 
 
@@ -216,14 +275,22 @@ def main():
     mode.add_argument("--profile", choices=PROFILES)
     mode.add_argument("--recipe-root", action="store_true")
     parser.add_argument("--anchor", help="absolute gcc executable from the loaded PACE module")
+    parser.add_argument("--site-root", help="dependency root whose recipe authority must be retained")
+    parser.add_argument("--recipe-profile", choices=PROFILES)
+    parser.add_argument("--recipe-override", help="explicit builtin repository, subject to retained conflicts")
     args = parser.parse_args()
     if args.profile and not args.anchor:
         parser.error("--profile requires --anchor from the loaded GCC module")
     if args.recipe_root and args.anchor:
         parser.error("--anchor belongs to --profile discovery")
+    if (args.site_root or args.recipe_profile or args.recipe_override) and not args.recipe_root:
+        parser.error("recipe scope arguments belong to --recipe-root discovery")
+    if bool(args.site_root) != bool(args.recipe_profile):
+        parser.error("--site-root and --recipe-profile must be supplied together")
     try:
         if args.recipe_root:
-            print(discover_recipe_root(args.spack))
+            print(discover_recipe_root(args.spack, site_root=args.site_root,
+                                      profile=args.recipe_profile, override=args.recipe_override))
         else:
             print(json.dumps(discover_config(args.profile, args.spack, args.anchor), indent=2))
     except (DiscoveryError, OSError, ValueError, KeyError, TypeError) as error:
