@@ -930,14 +930,57 @@ StateHash HashPair(const StateHash& left, const StateHash& right) noexcept
   return HashBytes(bytes.data(), bytes.size());
 }
 
+template <typename Record>
+const Record* GatherWorldRecords(
+    const Record& local, std::array<Record, 2>& small_records,
+    std::vector<Record>& large_records, int& ranks) noexcept
+{
+  static_assert(std::is_trivially_copyable<Record>::value,
+                "collective records must be trivially copyable");
+  static_assert(sizeof(Record) <=
+                    static_cast<std::size_t>(std::numeric_limits<int>::max()),
+                "collective records must fit an MPI byte count");
+  ranks = 0;
+  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS ||
+      ranks < 1)
+  {
+    return nullptr;
+  }
+
+  Record* records = small_records.data();
+  if (ranks > 2)
+  {
+    int local_ready = 0;
+    try
+    {
+      large_records.resize(static_cast<std::size_t>(ranks));
+      local_ready = 1;
+    }
+    catch (...)
+    {
+      local_ready = 0;
+    }
+    // No rank may enter the gather if another rank could not allocate its
+    // destination. Keep the original allocation-free path for ranks 1/2.
+    int all_ready = 0;
+    if (MPI_Allreduce(&local_ready, &all_ready, 1, MPI_INT, MPI_MIN,
+                      MPI_COMM_WORLD) != MPI_SUCCESS || all_ready != 1)
+    {
+      return nullptr;
+    }
+    records = large_records.data();
+  }
+  if (MPI_Allgather(&local, static_cast<int>(sizeof(Record)), MPI_BYTE,
+                    records, static_cast<int>(sizeof(Record)), MPI_BYTE,
+                    MPI_COMM_WORLD) != MPI_SUCCESS)
+  {
+    return nullptr;
+  }
+  return records;
+}
+
 StateHash RankCommonHash(const std::vector<double>& values) noexcept
 {
-  int ranks = 0;
-  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS ||
-      (ranks != 1 && ranks != 2))
-  {
-    return {};
-  }
   std::array<std::uint8_t, 40> local{};
   const std::uint64_t size = static_cast<std::uint64_t>(values.size());
   for (unsigned int byte = 0; byte < 8; ++byte)
@@ -947,14 +990,16 @@ StateHash RankCommonHash(const std::vector<double>& values) noexcept
   const StateHash local_hash = HashDoubles(values);
   std::copy(local_hash.bytes.begin(), local_hash.bytes.end(),
             local.begin() + 8);
-  std::array<std::array<std::uint8_t, 40>, 2> rank_ordered{};
-  if (MPI_Allgather(local.data(), static_cast<int>(local.size()), MPI_BYTE,
-                    rank_ordered.data(), static_cast<int>(local.size()),
-                    MPI_BYTE, MPI_COMM_WORLD) != MPI_SUCCESS)
+  std::array<std::array<std::uint8_t, 40>, 2> small_records{};
+  std::vector<std::array<std::uint8_t, 40>> large_records;
+  int ranks = 0;
+  const auto* rank_ordered = GatherWorldRecords(
+      local, small_records, large_records, ranks);
+  if (!rank_ordered)
   {
     return {};
   }
-  return HashBytes(rank_ordered.data(),
+  return HashBytes(rank_ordered,
                    static_cast<std::size_t>(ranks) * local.size());
 }
 
@@ -1004,18 +1049,11 @@ template <typename Context, typename Same>
 bool ContextsEqual(const Context& context, Same&& same,
                    int& ranks) noexcept
 {
-  static_assert(std::is_trivially_copyable<Context>::value,
-                "collective contexts must be trivially copyable");
-  ranks = 0;
-  if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS ||
-      (ranks != 1 && ranks != 2))
-  {
-    return false;
-  }
-  std::array<Context, 2> gathered{};
-  if (MPI_Allgather(&context, static_cast<int>(sizeof(Context)), MPI_BYTE,
-                    gathered.data(), static_cast<int>(sizeof(Context)),
-                    MPI_BYTE, MPI_COMM_WORLD) != MPI_SUCCESS)
+  std::array<Context, 2> small_records{};
+  std::vector<Context> large_records;
+  const Context* gathered = GatherWorldRecords(
+      context, small_records, large_records, ranks);
+  if (!gathered)
   {
     return false;
   }
@@ -1537,6 +1575,8 @@ bool ImportCpuCheckpoint(const CheckpointDescriptor& descriptor,
   const StateHash imported_interior_hash = RankCommonHash(storage->interior);
   const StateHash imported_trace_hash = RankCommonHash(storage->trace);
   const bool local_hashes_match =
+      imported_interior_hash != StateHash{} &&
+      imported_trace_hash != StateHash{} &&
       imported_interior_hash == descriptor.interior_hash &&
       imported_trace_hash == descriptor.trace_hash;
   // Phase 6 follows the ordered interior/trace hash collectives (phases 4/5).

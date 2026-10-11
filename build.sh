@@ -1107,6 +1107,7 @@ validate_mfem_source_checkout() {
 
   MFEM_SOURCE_ROOT="${root}"
   MFEM_SOURCE_PIN="${expected_pin}"
+  export IGRLAB_TEST_MFEM_SOURCE_ROOT="${MFEM_SOURCE_ROOT}"
 }
 
 capture_mfem_seed_status() {
@@ -2634,6 +2635,7 @@ echo "[build] configuring app (${MODE}, hdg_runtime=${HDG_RUNTIME}, hdg_auxiliar
 app_cmake_args=(
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   -DCMAKE_CXX_COMPILER="${MPI_PREFIX}/bin/mpicxx"
+  -DMPIEXEC_EXECUTABLE:FILEPATH="${MPI_PREFIX}/bin/mpiexec"
   -DCMAKE_INSTALL_PREFIX="${APP_INSTALL}"
   -DMFEM_DIR="${MFEM_INSTALL}/lib/cmake/mfem"
   -DDG_IGR_MFEM_SOURCE_ROOT:PATH="${MFEM_SOURCE_ROOT}"

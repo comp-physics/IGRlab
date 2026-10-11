@@ -229,7 +229,9 @@ assert_reuse_identity_policy() {
 [[ -f "${BUILD_DRIVER}" ]] || fail "missing build driver: ${BUILD_DRIVER}"
 [[ -f "${MFEM_DRIVER}" ]] || fail "missing MFEM driver: ${MFEM_DRIVER}"
 
-if [[ -n "${DG_IGR_TEST_REUSE_MFEM_ROOT:-}" ]]; then
+if [[ -n "${IGRLAB_TEST_MFEM_SOURCE_ROOT:-}" ]]; then
+  mfem_source="${IGRLAB_TEST_MFEM_SOURCE_ROOT}"
+elif [[ -n "${DG_IGR_TEST_REUSE_MFEM_ROOT:-}" ]]; then
   mfem_source="${DG_IGR_TEST_REUSE_MFEM_ROOT}"
 else
   mfem_source="${REPO_ROOT}/tpl/mfem"
@@ -306,6 +308,10 @@ printf '%s\n' \
   '  printf "MFEM_SRC=%s\\n" "${MFEM_SRC:?}"' \
   '  printf "MFEM_BUILD=%s\\n" "${MFEM_BUILD:?}"' \
   '  printf "MFEM_INSTALL=%s\\n" "${MFEM_INSTALL:?}"' \
+  '  printf "IGRLAB_TEST_MFEM_SOURCE_ROOT=%s\\n" "${IGRLAB_TEST_MFEM_SOURCE_ROOT:-}"' \
+  '  for name in DG_IGR_TEST_REUSE_MFEM_ROOT DG_IGR_TEST_REUSE_SPACK_ENV DG_IGR_TEST_REUSE_MODE DG_IGR_TEST_REUSE_PROFILE DG_IGR_TEST_REUSE_CALIPER DG_IGR_TEST_REUSE_CUDA_ARCH; do' \
+  '    printf "%s=%s\\n" "$name" "${!name-}"' \
+  '  done' \
   '  printf "%s\\n" "$@"' \
   '} >"${FAKE_HELPER_LOG:?}"' \
   'exit 77' >"${fixture_root}/build_mfem_tpl.sh"
@@ -690,6 +696,55 @@ assert_adjacent_args "${tmp_root}/forwarded-args.log" "--cuda-arch" "120"
 assert_adjacent_args "${tmp_root}/forwarded-args.log" "--cuda-codegen" "80-virtual"
 assert_not_exists "${tmp_root}/forwarded-spack.log"
 assert_not_exists "${fixture_root}/build-deps"
+
+# Fresh external MFEM sources must reach the policy fixture without admitting
+# the unrelated full build/install reuse fixtures.
+external_app="${tmp_root}/external-app"
+external_mfem="${tmp_root}/external-mfem"
+git clone --quiet --shared "${fixture_root}" "${external_app}"
+git -c advice.detachedHead=false clone --quiet --shared --no-checkout \
+  "${mfem_source}" "${external_mfem}"
+git -c advice.detachedHead=false -C "${external_mfem}" checkout --quiet \
+  --detach "${real_mfem_gitlink}"
+git -C "${external_mfem}" remote set-url origin \
+  https://github.com/mfem/mfem.git
+cp "${fixture_root}/build.sh" "${fixture_root}/build_mfem_tpl.sh" \
+  "${external_app}/"
+mkdir -p "${external_app}/spack-envs/cpu/.spack-env/view"
+cp "${REPO_ROOT}/spack-envs/cpu/spack.yaml" \
+  "${external_app}/spack-envs/cpu/spack.yaml"
+[[ ! -e "${external_app}/tpl/mfem/.git" ]] || \
+  fail "external-source fixture initialized its local submodule"
+set +e
+env -u IGRLAB_TEST_MFEM_SOURCE_ROOT \
+  -u DG_IGR_RUN_REUSE_FIXTURES \
+  -u DG_IGR_TEST_REUSE_MFEM_ROOT -u DG_IGR_TEST_REUSE_SPACK_ENV \
+  -u DG_IGR_TEST_REUSE_MODE -u DG_IGR_TEST_REUSE_PROFILE \
+  -u DG_IGR_TEST_REUSE_CALIPER -u DG_IGR_TEST_REUSE_CUDA_ARCH \
+  -u IGRLAB_SPACK_ENV -u DG_IGR_SPACK_ENV \
+  PATH="${fake_bin}:/usr/bin:/bin" \
+  FAKE_HELPER_LOG="${tmp_root}/external-source.log" \
+  FAKE_SPACK_LOG="${tmp_root}/external-spack.log" \
+  bash "${external_app}/build.sh" --cpu-only \
+  --reuse-mfem-root "${external_mfem}" \
+  --output-root "${tmp_root}/external-output" \
+  --no-clean --no-deps --no-tests \
+  >"${tmp_root}/external-source-output.log" 2>&1
+external_rc=$?
+set -e
+[[ ${external_rc} -eq 77 ]] || \
+  fail "external source forwarding exited ${external_rc}, expected 77"
+external_log="$(<"${tmp_root}/external-source.log")"
+assert_contains "${external_log}" "MFEM_SRC=${external_mfem}"
+assert_contains "${external_log}" \
+  "IGRLAB_TEST_MFEM_SOURCE_ROOT=${external_mfem}"
+for name in DG_IGR_TEST_REUSE_MFEM_ROOT DG_IGR_TEST_REUSE_SPACK_ENV \
+  DG_IGR_TEST_REUSE_MODE DG_IGR_TEST_REUSE_PROFILE \
+  DG_IGR_TEST_REUSE_CALIPER DG_IGR_TEST_REUSE_CUDA_ARCH; do
+  grep -Fxq "${name}=" "${tmp_root}/external-source.log" || \
+    fail "external source forwarding enabled full reuse metadata: ${name}"
+done
+assert_not_exists "${tmp_root}/external-spack.log"
 
 # Distinct profiles may race to create a fresh shared output root; each owns a
 # separate scope and reaches the fake helper without a spurious mkdir failure.

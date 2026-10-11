@@ -2060,7 +2060,14 @@ int RunEulerMainBackend(const HdgEulerMainRequest& request)
       if (!adaptive_rodas3)
       {
         time_driver->RecordFailure(HdgStepFailurePhase::NonlinearSolve);
-        return Reject(request, "generic CUDA prepared step failed");
+        const auto reported_failure_class =
+            prepare_failure_class ==
+                GenericEulerCudaPrepareFailureClass::not_failed
+            ? GenericEulerCudaPrepareFailureClass::unavailable
+            : prepare_failure_class;
+        return Reject(request,
+            std::string("generic CUDA prepared step failed: ") +
+                PrepareFailureClassName(reported_failure_class));
       }
       local_ok = session.RejectFailedPrepare().status ==
           HdgEulerSessionStatus::aborted;
