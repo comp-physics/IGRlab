@@ -54,9 +54,13 @@ Application and MFEM configuration then query `spack -e ENV location -i PACKAGE`
 Missing or ambiguous site packages stop the build before compilation.
 
 `--submit` prints job IDs and log paths. Compilation uses `cpu-small`, one task,
-eight CPUs, 48 GiB and an eight-hour limit. When tests are enabled, a dependent
-validation job uses two hours, four MPI slots with two CPUs each, and 48 GiB. GPU
+eight CPUs, 48 GiB and a default eight-hour limit. When tests are enabled, a dependent
+validation job defaults to two hours, four MPI slots with two CPUs each, and 48 GiB. GPU
 validation requests one A100 on `gpu-a100`; CPU validation uses `cpu-small`.
+Use `--build-time HH:MM:SS` and `--validation-time HH:MM:SS` to request shorter
+allocations, up to those defaults. The submission plan and request receipt retain
+the chosen limits. For a focused correctness selection, for example, add
+`--validation-time 00:15:00`; choose sufficient time for the selected tests.
 Compilation therefore does not occupy a GPU. The validation stage reruns the
 canonical driver with installed dependencies and existing build outputs.
 MPI tests use the selected site's `mpiexec` directly from the batch shell.

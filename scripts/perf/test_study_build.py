@@ -14,6 +14,9 @@ import study_build as study
 DRIVER = '''#!/usr/bin/env python3
 import hashlib,json,os,pathlib,sys
 args=sys.argv[1:]
+if '--help' in args:
+ print('--validation-time HH:MM:SS')
+ raise SystemExit(0)
 value=lambda flag: args[args.index(flag)+1]
 source=pathlib.Path(__file__).resolve().parent
 output=pathlib.Path(value('--output-root'))
@@ -227,9 +230,39 @@ class StudyBuildTests(unittest.TestCase):
         with self.assertRaisesRegex(study.StudyBuildError, 'symlinked'):
             study.freeze(self.source, 'HEAD', link / 'snapshot3')
 
-    def plan(self, identity, regex='^(dg_operator|sigma)$'):
+    def plan(self, identity, regex='^(dg_operator|sigma)$', *, validation_time=None):
         return study.build_plan(identity, self.root / 'output with $HOME `literal`',
-                                self.root / 'shared-site', self.root / 'spack-tool', regex)
+                                self.root / 'shared-site', self.root / 'spack-tool', regex,
+                                validation_time=validation_time)
+
+    def legacy_plan(self):
+        self.write('build.sh', DRIVER.replace("print('--validation-time HH:MM:SS')", "print('legacy site helper')"), executable=True)
+        self.git(self.source, 'add', 'build.sh')
+        self.git(self.source, 'commit', '-qm', 'legacy fixture')
+        return self.plan(self.freeze(), validation_time='00:15:00')
+
+    def receipt(self, plan):
+        return {'success': True, 'build_job_id': '987123', 'validation_job_id': '567890',
+                'stdout': 'canonical queued receipt', 'stderr': '',
+                'source_fingerprint': plan['source']['source_fingerprint'],
+                'configuration_key': plan['configuration_key']}
+
+    def control(self, plan, state='PENDING', limit='02:00:00'):
+        return (f'JobId=567890 JobName=IGRlab-check UserId=fixture({os.getuid()}) '
+                f'Account=gts-sbryngelson3 QOS=embers JobState={state} TimeLimit={limit} '
+                f'Command={plan["source"]["source_snapshot"]}/scripts/build/pace.sh WorkDir=/fixture')
+
+    def scheduler(self, responses, calls):
+        original = study._run
+        iterator = iter(responses)
+        def run(argv, **kwargs):
+            if argv[0] != 'scontrol':
+                return original(argv, **kwargs)
+            calls.append(argv)
+            response = next(iterator)
+            code, stdout, stderr = response if isinstance(response, tuple) else (0, response, '')
+            return subprocess.CompletedProcess(argv, code, stdout.encode(), stderr.encode())
+        return run
 
     def test_plan_is_source_configuration_scoped_and_has_no_build_side_effect(self):
         identity = self.freeze()
@@ -271,6 +304,128 @@ class StudyBuildTests(unittest.TestCase):
         plan['argv'].append('--clean')
         with self.assertRaisesRegex(study.StudyBuildError, 'plan changed'):
             study.submit_build(plan)
+
+    def test_validation_schedule_does_not_change_build_cache_and_capability_is_explicit(self):
+        identity = self.freeze()
+        ordinary = self.plan(identity)
+        short = self.plan(identity, validation_time='00:15:00')
+        shorter = self.plan(identity, validation_time='00:05:00')
+        self.assertEqual(ordinary['configuration_key'], short['configuration_key'])
+        self.assertEqual(short['app_build'], shorter['app_build'])
+        self.assertEqual(ordinary['app_build'], short['app_build'])
+        self.assertEqual(short['validation_time_mode'], 'canonical')
+        self.assertEqual(short['argv'][-2:], ['--validation-time', '00:15:00'])
+
+    def test_legacy_pending_validation_is_shortened_and_observed_readback_retained(self):
+        plan = self.legacy_plan()
+        self.assertEqual(plan['validation_time_mode'], 'scheduler-update')
+        self.assertNotIn('--validation-time', plan['argv'])
+        calls = []
+        with patch.object(study, '_run', side_effect=self.scheduler(
+                [self.control(plan), '', self.control(plan, limit='00:15:00')], calls)):
+            result = study.submit_build(plan)
+        self.assertTrue(result['success'])
+        self.assertEqual(result['validation_job_id'], '567890')
+        self.assertEqual(result['validation_time']['status'], 'updated')
+        self.assertEqual(result['validation_time']['actual'], '00:15:00')
+        self.assertEqual(calls[1], ['scontrol', 'update', 'JobId=567890', 'TimeLimit=00:15:00'])
+        self.assertEqual(len(result['validation_time']['commands']), 3)
+
+    def test_native_limit_and_completed_validation_are_guarded_noops(self):
+        plan = self.plan(self.freeze(), validation_time='00:15:00')
+        for state, limit, wanted in (('PENDING', '00:15:00', 'within-limit-noop'),
+                                      ('RUNNING', '00:10:00', 'within-limit-noop'),
+                                      ('COMPLETED', '02:00:00', 'completed-noop')):
+            calls = []
+            with self.subTest(state=state), patch.object(study, '_run', side_effect=self.scheduler(
+                    [self.control(plan, state, limit)], calls)):
+                result = study.ensure_validation_time(plan, self.receipt(plan))
+            self.assertTrue(result['success'])
+            self.assertEqual(result['validation_time']['status'], wanted)
+            self.assertEqual(len(calls), 1)
+
+    def test_unrelated_or_running_incompatible_validation_rejects_without_mutation(self):
+        plan = self.legacy_plan()
+        valid = self.control(plan)
+        wrong = [valid.replace(f'fixture({os.getuid()})', f'fixture({os.getuid() + 1})'),
+                 valid.replace('Account=gts-sbryngelson3', 'Account=unrelated'),
+                 valid.replace('QOS=embers', 'QOS=inferno'),
+                 valid.replace('JobName=IGRlab-check', 'JobName=unrelated'),
+                 valid.replace('Command=', 'Command=/unrelated'),
+                 valid.replace('JobId=567890', 'JobId=999'),
+                 self.control(plan, limit='00:00:00'),
+                 self.control(plan, 'RUNNING')]
+        for text in wrong:
+            calls = []
+            with self.subTest(text=text), patch.object(study, '_run', side_effect=self.scheduler([text], calls)):
+                result = study.ensure_validation_time(plan, self.receipt(plan))
+            self.assertFalse(result['success'])
+            self.assertEqual(result['validation_job_id'], '567890')
+            self.assertEqual(result['stdout'], 'canonical queued receipt')
+            self.assertIn('error', result)
+            self.assertEqual(len(calls), 1)
+
+    def test_failed_limit_update_preserves_ids_and_retries_existing_receipt(self):
+        plan = self.legacy_plan()
+        calls = []
+        with patch.object(study, '_run', side_effect=self.scheduler(
+                [self.control(plan), (1, '', 'update rejected')], calls)):
+            failed = study.ensure_validation_time(plan, self.receipt(plan))
+        self.assertFalse(failed['success'])
+        self.assertTrue(failed['canonical_submission_success'])
+        self.assertEqual(failed['validation_time']['commands'][-1]['returncode'], 1)
+        calls = []
+        with patch.object(study, '_run', side_effect=self.scheduler(
+                [self.control(plan, limit='00:15:00')], calls)):
+            retried = study.ensure_validation_time(plan, failed)
+        self.assertTrue(retried['success'])
+        self.assertNotIn('error', retried)
+        self.assertEqual(retried['build_job_id'], '987123')
+        self.assertEqual(retried['validation_job_id'], '567890')
+        self.assertEqual(len(calls), 1)
+
+    def test_successful_update_with_wrong_readback_is_not_admitted(self):
+        plan = self.legacy_plan()
+        calls = []
+        with patch.object(study, '_run', side_effect=self.scheduler(
+                [self.control(plan), '', self.control(plan)], calls)):
+            result = study.ensure_validation_time(plan, self.receipt(plan))
+        self.assertFalse(result['success'])
+        self.assertEqual(result['validation_time']['actual'], '02:00:00')
+        self.assertIn('readback exceeds', result['error'])
+        self.assertEqual(result['validation_job_id'], '567890')
+
+    def test_invalid_validation_limits_and_mode_tampering_reject_before_submission(self):
+        identity = self.freeze()
+        for value in ('00:00:00', '00:15:01', '00:60:00', '2:00:00', '02:01:00', False):
+            with self.subTest(value=value), self.assertRaises(study.StudyBuildError):
+                self.plan(identity, validation_time=value)
+        plan = self.plan(identity, validation_time='00:15:00')
+        plan['validation_time_mode'] = 'scheduler-update'
+        with self.assertRaisesRegex(study.StudyBuildError, 'plan changed'):
+            study.submit_build(plan)
+
+    def test_no_requested_limit_leaves_legacy_receipt_unchanged(self):
+        plan = self.plan(self.freeze())
+        receipt = self.receipt(plan)
+        with patch.object(study, '_run') as run:
+            self.assertEqual(study.ensure_validation_time(plan, receipt), receipt)
+            run.assert_not_called()
+
+    def test_submission_timeout_preserves_job_ids_from_partial_stdout(self):
+        plan = self.plan(self.freeze())
+        original = study.subprocess.run
+        def run(argv, **kwargs):
+            if argv == plan['argv']:
+                raise subprocess.TimeoutExpired(argv, 300,
+                    output=b'PACE build submitted: 123 (embers)\nPACE validation submitted: 456 (embers)\n')
+            return original(argv, **kwargs)
+        with patch.object(study.subprocess, 'run', side_effect=run):
+            result = study.submit_build(plan)
+        self.assertFalse(result['success'])
+        self.assertEqual(result['returncode'], 124)
+        self.assertEqual((result['build_job_id'], result['validation_job_id']), ('123', '456'))
+        self.assertIn('timed out', result['stderr'])
 
 
 if __name__ == '__main__':

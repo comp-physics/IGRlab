@@ -83,6 +83,8 @@ print(9000 + count)
         self.assertIn('--ntasks=4', check)
         self.assertIn('--cpus-per-task=2', check)
         self.assertIn('--partition=cpu-small', build)
+        self.assertIn('--time=08:00:00', build)
+        self.assertIn('--time=02:00:00', check)
         self.assertFalse(any(arg.startswith('--gres=') for arg in build))
         self.assertIn('--partition=gpu-a100', check)
         self.assertIn('--gres=gpu:a100:1', check)
@@ -103,6 +105,54 @@ print(9000 + count)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.output.exists())
         self.assertEqual(self.calls('sbatch'), [])
+
+    def test_focused_wall_times_are_site_options_and_retained_in_worker_request(self):
+        result = self.submit('--a100', '--build-time', '00:30:00',
+                             '--validation-time', '00:15:00', '--test-regex', '^focused$')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        build, check = self.calls('sbatch')
+        self.assertIn('--time=00:30:00', build)
+        self.assertIn('--time=00:15:00', check)
+        # The site wrapper owns these options; its generic offline plan does not.
+        for args in self.calls('build'):
+            self.assertNotIn('--build-time', args)
+            self.assertNotIn('--validation-time', args)
+        request = json.loads(Path(build[-1]).read_text())
+        for option, wanted in (('--build-time', '00:30:00'), ('--validation-time', '00:15:00')):
+            self.assertEqual(request['argv'][request['argv'].index(option) + 1], wanted)
+        for call, tasks in ((build, '1'), (check, '4')):
+            result = self.run_helper(*call[-3:], env=self.env | {
+                'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3', 'SLURM_JOB_QOS': 'embers', 'SLURM_NTASKS': tasks})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            worker = self.calls('build')[-1]
+            self.assertEqual(worker[worker.index('--validation-time') + 1], '00:15:00')
+
+    def test_wall_time_plan_and_help_are_explicit_without_submitting(self):
+        result = self.submit('--build-time', '00:00:01', '--validation-time', '00:15:00', '--print-plan')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('build_time=00:00:01 validation_time=00:15:00', result.stdout)
+        self.assertEqual(self.calls('sbatch'), [])
+        self.assertFalse(self.output.exists())
+        result = self.run_helper('--site', 'pace', '--help')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--build-time HH:MM:SS', result.stdout)
+        self.assertIn('--validation-time HH:MM:SS', result.stdout)
+
+    def test_invalid_wall_times_fail_before_plan_or_submission(self):
+        for option, value in (('--build-time', '00:00:00'), ('--validation-time', '00:60:00'),
+                              ('--validation-time', '00:00:60'), ('--build-time', '8:00:00'),
+                              ('--build-time', '08:00:01'), ('--validation-time', '02:00:01'),
+                              ('--build-time', '-1:00:00'), ('--validation-time', '00:15:00;false')):
+            with self.subTest(option=option, value=value):
+                result = self.submit(option, value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(option, result.stderr)
+                self.assertEqual(self.calls('build'), [])
+                self.assertEqual(self.calls('sbatch'), [])
+                self.assertFalse(self.output.exists())
+        result = self.submit('--validation-time')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('requires HH:MM:SS', result.stderr)
 
     def test_login_node_refuses_compilation_before_discovery(self):
         for allocation in ({}, {'SLURM_JOB_ID': '9000', 'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3',

@@ -47,6 +47,30 @@ submitting jobs. Submit that prepared study with `resume --stage builds`.
 Preparation performs Git/file operations and `build.sh --print-plan`; it does
 not compile on the login node.
 
+For a focused two-case study, shorter allocations can fit smaller scheduler
+windows:
+
+```bash
+./perf.sh submit --site pace \
+  --baseline BASELINE_REF --candidate HEAD \
+  --run-dir /absolute/scratch/studies/focused-change-01 \
+  --site-root /absolute/scratch/igrlab-dependencies \
+  --cases dg-p1,hdg-igr-ordinary-p3 \
+  --validation-time 00:15:00 --timings-time 00:15:00 --profiles-time 00:30:00
+```
+
+These limits are explicit choices for a small study; the defaults remain two
+hours for correctness and one hour each for timings and profiles. Study limits
+use whole minutes, with a one-minute minimum for correctness, a five-minute
+minimum for timing/profiling stages, and those defaults as maxima.
+The frozen plan records the limits. They do not change the compiled-artifact
+cache key. For a baseline whose canonical driver predates `--validation-time`,
+the coordinator verifies the recorded validation job and shortens its pending
+allocation through Slurm; failures retain job IDs for a safe retry.
+Timing and profiling workers subtract setup time and reserve two minutes for
+writing results, also respecting Slurm's reported allocation deadline.
+Choose larger limits when adding cases or expensive profiler sections.
+
 ## The optimization loop
 
 1. Choose a baseline and an unchanged numerical workload. An identical-source

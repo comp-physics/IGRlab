@@ -7,6 +7,15 @@ pace_config="${pace_source}/cmake/sites/pace.json"
 
 pace_fail() { echo "ERROR: PACE: $*" >&2; exit 2; }
 
+pace_validate_wall_time() {
+  local value="$1" maximum="$2" option="$3" seconds
+  [[ $value =~ ^([0-9]{2}):([0-5][0-9]):([0-5][0-9])$ ]] || \
+    pace_fail "$option requires HH:MM:SS with minutes/seconds below 60"
+  seconds=$((10#${BASH_REMATCH[1]} * 3600 + 10#${BASH_REMATCH[2]} * 60 + 10#${BASH_REMATCH[3]}))
+  ((seconds > 0 && seconds <= maximum)) || \
+    pace_fail "$option must be positive and no greater than $((maximum / 3600)) hours"
+}
+
 pace_prepare_site_directory() {
   local target="$1" component
   for component in "$pace_dependency_root/site" "$pace_dependency_root/site/pace" "$target"; do
@@ -81,10 +90,13 @@ pace_args=()
 pace_submit=0 pace_plan=0 pace_tests=1 pace_smoke=0 pace_mode=cpu pace_arch="" pace_clean_set=0 pace_help=0
 pace_root="" pace_dependency_root="" pace_spack_root=${IGRLAB_PACE_SPACK_ROOT:-}
 pace_jobs=${IGRLAB_BUILD_JOBS:-4} pace_mfem_jobs=""
+pace_build_time=08:00:00 pace_validation_time=02:00:00
 while (($#)); do
   case "$1" in
     --site) [[ $# -ge 2 && $2 == pace ]] || pace_fail "supported site is pace"; shift ;;
     --submit) pace_submit=1 ;;
+    --build-time) [[ $# -ge 2 ]] || pace_fail "--build-time requires HH:MM:SS"; pace_build_time=$2; shift ;;
+    --validation-time) [[ $# -ge 2 ]] || pace_fail "--validation-time requires HH:MM:SS"; pace_validation_time=$2; shift ;;
     --site-root) [[ $# -ge 2 ]] || pace_fail "--site-root requires a path"; pace_dependency_root=$2; shift ;;
     --spack-root) [[ $# -ge 2 ]] || pace_fail "--spack-root requires a path"; pace_spack_root=$2; shift ;;
     --output-root) [[ $# -ge 2 ]] || pace_fail "--output-root requires a path"; pace_root=$2; pace_args+=("$1" "$2"); shift ;;
@@ -103,7 +115,12 @@ while (($#)); do
   esac
   shift
 done
-[[ $pace_help == 0 ]] || exec "${pace_source}/build.sh" --help
+if [[ $pace_help == 1 ]]; then
+  printf 'PACE submission limits (site wrapper options):\n  --build-time HH:MM:SS       Positive build limit up to 08:00:00 (default).\n  --validation-time HH:MM:SS  Positive validation limit up to 02:00:00 (default).\n\n'
+  exec "${pace_source}/build.sh" --help
+fi
+pace_validate_wall_time "$pace_build_time" 28800 --build-time
+pace_validate_wall_time "$pace_validation_time" 7200 --validation-time
 [[ -n $pace_root && $pace_root == /* ]] || pace_fail "provide an absolute --output-root on scratch"
 pace_root=$(realpath -m -- "$pace_root")
 [[ -z $pace_dependency_root || $pace_dependency_root == /* ]] || pace_fail "--site-root must be absolute"
@@ -126,6 +143,7 @@ export IGRLAB_CUDA_ARCH=80 IGRLAB_MFEM_CUDA_ARCHS=80 IGRLAB_APP_CUDA_ARCHS=80
 if [[ $pace_plan == 1 ]]; then
   printf '[site-plan] site=pace profile=%s target=x86_64_v3 account=gts-sbryngelson3 qos=embers submit=%s\n' "$pace_profile" "$pace_submit"
   printf '[site-plan] dependency_root=%s spack_env=%s\n' "$pace_dependency_root" "$IGRLAB_SPACK_ENV"
+  printf '[site-plan] build_time=%s validation_time=%s\n' "$pace_build_time" "$pace_validation_time"
   exec "${pace_source}/build.sh" "${pace_args[@]}"
 fi
 [[ $(hostname -f) == *.pace.gatech.edu || -d /storage/pace-apps ]] || pace_fail "this profile requires PACE; use --print-plan for an offline plan"
@@ -145,14 +163,15 @@ if [[ $pace_submit == 1 ]]; then
   pace_prepare_site_directory "$pace_dependency_root/site/pace/requests"
   pace_prepare_site_directory "$pace_dependency_root/site/pace/logs"
   pace_request=$(mktemp "$pace_dependency_root/site/pace/requests/build.XXXXXXXX.json")
-  python3 - "$pace_request" "$pace_source" --site pace --site-root "$pace_dependency_root" --spack-root "$pace_spack_root" "${pace_args[@]}" <<'PY'
+  python3 - "$pace_request" "$pace_source" --site pace --site-root "$pace_dependency_root" --spack-root "$pace_spack_root" \
+    --build-time "$pace_build_time" --validation-time "$pace_validation_time" "${pace_args[@]}" <<'PY'
 import json, sys
 with open(sys.argv[1], 'w') as f:
     json.dump({'source': sys.argv[2], 'argv': sys.argv[3:]}, f, indent=2)
     f.write('\n')
 PY
   pace_job=$(sbatch --parsable --account=gts-sbryngelson3 --qos=embers --partition=cpu-small \
-    --nodes=1 --ntasks=1 --cpus-per-task=8 --mem=48G --time=08:00:00 --no-requeue \
+    --nodes=1 --ntasks=1 --cpus-per-task=8 --mem=48G --time="$pace_build_time" --no-requeue \
     --job-name=IGRlab-build --output="$pace_dependency_root/site/pace/logs/build-%j.out" \
     --error="$pace_dependency_root/site/pace/logs/build-%j.err" "$0" --worker build "$pace_request")
   pace_job=${pace_job%%;*}
@@ -164,7 +183,7 @@ PY
     fi
     pace_validation=$(sbatch --parsable --dependency="afterok:$pace_job" --kill-on-invalid-dep=yes --account=gts-sbryngelson3 \
       --qos=embers --partition="$pace_partition" "${pace_resources[@]}" --nodes=1 --ntasks=4 \
-      --cpus-per-task=2 --mem=48G --time=02:00:00 --no-requeue --job-name=IGRlab-check \
+      --cpus-per-task=2 --mem=48G --time="$pace_validation_time" --no-requeue --job-name=IGRlab-check \
       --output="$pace_dependency_root/site/pace/logs/check-%j.out" \
       --error="$pace_dependency_root/site/pace/logs/check-%j.err" "$0" --worker validation "$pace_request")
     printf 'PACE validation submitted: %s (after build, embers, %s)\n' "${pace_validation%%;*}" "$pace_partition"

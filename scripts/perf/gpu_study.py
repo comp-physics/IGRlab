@@ -37,8 +37,56 @@ EXECUTOR_FILES = ('gpu_study.py', 'study_build.py', 'study_profiles.py',
                   'study_workloads.py', 'pace_runtime.sh')
 SAFE_ENV = ('CUDA_VISIBLE_DEVICES', 'SLURM_JOB_ID', 'SLURM_JOB_ACCOUNT',
             'SLURM_JOB_QOS', 'SLURM_JOB_PARTITION', 'SLURM_JOB_GPUS',
-            'SLURM_STEP_GPUS', 'SLURM_NTASKS', 'OMP_NUM_THREADS',
+            'SLURM_STEP_GPUS', 'SLURM_NTASKS', 'SLURM_JOB_END_TIME', 'OMP_NUM_THREADS',
             'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')
+CLEANUP_RESERVE_SECONDS = 120
+
+
+def wall_time(value, *, maximum_hours=1, minimum_minutes=5):
+    """Admit canonical minute-aligned limits before preparing/submitting work."""
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9]{2}:[0-9]{2}:00', value):
+        raise ValueError('wall time must be minute-aligned HH:MM:SS')
+    hours, minutes, _ = map(int, value.split(':'))
+    if minutes >= 60 or not minimum_minutes * 60 <= 3600 * hours + 60 * minutes <= maximum_hours * 3600:
+        raise ValueError(f'wall time must be between 00:{minimum_minutes:02d}:00 and {maximum_hours:02d}:00:00')
+    return value
+
+
+def stage_wall_time(plan, stage):
+    if stage not in ('timings', 'profiles'):
+        raise ValueError('unknown GPU study stage')
+    if 'wall_time_limits' not in plan:
+        return '01:00:00'  # Retained plans predate explicit limits.
+    limits = plan['wall_time_limits']
+    if not isinstance(limits, dict) or set(limits) != {'timings', 'profiles'}:
+        raise ValueError('plan wall_time_limits must specify timings and profiles')
+    return wall_time(limits[stage])
+
+
+def worker_budget(plan, suite, stage, entered):
+    """Bound commands by suite and allocation time, preserving cleanup time."""
+    hours, minutes, seconds = map(int, stage_wall_time(plan, stage).split(':'))
+    elapsed = time.monotonic() - entered
+    requested = suite.get(stage + '_budget_seconds', 3000)
+    if not math.isfinite(elapsed) or elapsed < 0 or type(requested) not in (int, float) or not 0 < requested <= 3000:
+        raise ValueError('invalid worker elapsed time or suite budget')
+    remaining = hours * 3600 + minutes * 60 + seconds - elapsed - CLEANUP_RESERVE_SECONDS
+    if 'SLURM_JOB_END_TIME' in os.environ:
+        raw = os.environ['SLURM_JOB_END_TIME']
+        if not re.fullmatch(r'[0-9]+', raw):
+            raise ValueError('SLURM_JOB_END_TIME must be an integer UNIX timestamp')
+        try:
+            end = float(int(raw))
+        except (ValueError, OverflowError) as exc:
+            raise ValueError('SLURM_JOB_END_TIME must be finite') from exc
+        now = time.time()
+        if not math.isfinite(end) or end <= now:
+            raise RuntimeError('SLURM_JOB_END_TIME is not a finite future timestamp')
+        remaining = min(remaining, end - now - CLEANUP_RESERVE_SECONDS)
+    budget = min(requested, remaining)
+    if budget < 1:
+        raise RuntimeError('worker budget exhausted after reserving cleanup time')
+    return budget
 
 
 def sha(path):
@@ -205,6 +253,11 @@ def cached_source(identity, cache):
 
 
 def create(args):
+    limits = {stage: wall_time(getattr(args, stage + '_time', '01:00:00'))
+              for stage in ('timings', 'profiles')}
+    validation_time = getattr(args, 'validation_time', None)
+    if validation_time is not None:
+        validation_time = wall_time(validation_time, maximum_hours=2, minimum_minutes=1)
     root = absolute(args.run_dir)
     source = absolute(args.source).resolve()
     site_root = absolute(args.site_root)
@@ -233,7 +286,8 @@ def create(args):
         frozen = study_build.freeze(source, getattr(args, member), root / 'sources' / member)
         sources[member] = cached_source(frozen, cache)
         builds[member] = study_build.build_plan(sources[member], cache / 'builds',
-                                              site_root, Path(spack_root), suite['correctness_regex'])
+                                              site_root, Path(spack_root), suite['correctness_regex'],
+                                              validation_time=validation_time)
     # Same site environment policy is necessary for matched compiler/dependency comparisons.
     configs = [sha(Path(s['source_snapshot']) / 'cmake/sites/pace.json') for s in sources.values()]
     if configs[0] != configs[1]:
@@ -241,6 +295,7 @@ def create(args):
     plan = {'schema_version': SCHEMA, 'site': 'pace', 'run_dir': str(root),
             'site_root': str(site_root), 'spack_root': spack_root, 'cache_root': str(cache),
             'sources': sources, 'builds': builds, 'suite_sha256': sha(root / 'suite.json'),
+            'wall_time_limits': limits,
             'executor_sha256': {name: sha(root / 'executor' / name) for name in EXECUTOR_FILES},
             'created_unix_seconds': time.time()}
     plan['plan_sha256'] = digest(plan)
@@ -251,11 +306,12 @@ def create(args):
 
 
 def submit_stage(root, stage, dependencies=()):
-    load_plan(root)
+    plan = load_plan(root)
+    limit = stage_wall_time(plan, stage)
     (root / 'logs').mkdir(exist_ok=True)
     command = ['sbatch', '--parsable', '--account=gts-sbryngelson3', '--qos=embers',
                '--partition=gpu-a100', '--gres=gpu:a100:1', '--nodes=1', '--ntasks=1',
-               '--cpus-per-task=8', '--mem=48G', '--time=01:00:00', '--no-requeue',
+               '--cpus-per-task=8', '--mem=48G', '--time=' + limit, '--no-requeue',
                '--kill-on-invalid-dep=yes',
                '--job-name=IGRlab-' + stage, '--output=' + str(root / 'logs' / (stage + '-%j.out')),
                '--error=' + str(root / 'logs' / (stage + '-%j.err'))]
@@ -355,6 +411,19 @@ def recorded_orphans(root, plan):
 def submit_pipeline(root, plan):
     """Build retries use the same verified cache; public submission receipts stay."""
     reused = {}
+    def retain(member, result):
+        state = read_json(root / 'state.json')
+        state['builds'][member] = result
+        state.setdefault('build_attempts', []).append({'member': member, **result})
+        write_json(root / 'state.json', state)
+
+    def admit_existing(member, existing):
+        result = study_build.ensure_validation_time(plan['builds'][member], existing)
+        retain(member, result)
+        if not result.get('success') or not result.get('validation_job_id'):
+            raise RuntimeError('requested correctness limit not admitted; receipts retained; resume builds')
+        return result
+
     for member in MEMBERS:
         state = read_json(root / 'state.json')
         key = plan['builds'][member]['app_build']
@@ -373,18 +442,15 @@ def submit_pipeline(root, plan):
                         if status != 'PENDING' or not recover_orphan(
                                 root, job, 'IGRlab-check', [existing['build_job_id']],
                                 Path(plan['sources'][member]['source_snapshot']) / 'scripts/build/pace.sh'):
-                            reused[plan['builds'][member]['app_build']] = existing
+                            reused[key] = admit_existing(member, existing)
                             continue
                     else:
                         raise RuntimeError(f'partial build submission {job} is active; retry after it finishes')
                 if existing.get('validation_job_id') and (status, exit_code) == ('COMPLETED', '0:0'):
-                    reused[plan['builds'][member]['app_build']] = existing
+                    reused[key] = admit_existing(member, existing)
                     continue
         result = reused.get(key) or study_build.submit_build(plan['builds'][member])
-        state = read_json(root / 'state.json')
-        state['builds'][member] = result
-        state.setdefault('build_attempts', []).append({'member': member, **result})
-        write_json(root / 'state.json', state)
+        retain(member, result)
         if not result.get('success') or not result.get('validation_job_id'):
             raise RuntimeError('canonical build submission incomplete; receipts retained; resume builds')
         reused[key] = result
@@ -647,6 +713,7 @@ def completed(state, stage):
 
 
 def worker(args):
+    entered = time.monotonic()
     root = absolute(args.run_dir)
     with locked(root):
         plan = verify(root)
@@ -656,6 +723,7 @@ def worker(args):
             raise RuntimeError('stage already complete; create a new study for new measurements')
         if args.stage == 'profiles' and not completed(state, 'timings'):
             raise RuntimeError('complete and admit unprofiled timings before profiling')
+        worker_budget(plan, suite, args.stage, entered)  # Fail before queries/captures if time is exhausted.
         gpu = allocation()
         checked_builds(root)
         admission = admit(root, plan, suite)
@@ -669,7 +737,10 @@ def worker(args):
         state['attempts'].append(attempt)
         write_json(root / 'state.json', state)
         try:
-            runner = Runner(output, suite.get(args.stage + '_budget_seconds', 3000),
+            budget = worker_budget(plan, suite, args.stage, entered)
+            attempt.update(worker_budget_seconds=budget, cleanup_reserve_seconds=CLEANUP_RESERVE_SECONDS,
+                           requested_wall_time=stage_wall_time(plan, args.stage))
+            runner = Runner(output, budget,
                             suite.get('command_timeout_seconds', 300))
             attempt['hardware_before'] = hardware_snapshot(runner, 'before', gpu)
             function = timings if args.stage == 'timings' else profiles
@@ -839,6 +910,12 @@ def main(argv=None):
     submit_parser.add_argument('--spack-root', help='optional tool root; otherwise query spack location -r')
     submit_parser.add_argument('--suite', default=str(Path(__file__).parent / 'suites/pace-a100.json'))
     submit_parser.add_argument('--cases', help='comma-separated case ids; explicit selection enables optional cases')
+    submit_parser.add_argument('--timings-time', type=wall_time, default='01:00:00',
+                               help='timing allocation HH:MM:SS, 5 minutes to 1 hour (default: 01:00:00)')
+    submit_parser.add_argument('--profiles-time', type=wall_time, default='01:00:00',
+                               help='profiling allocation HH:MM:SS, 5 minutes to 1 hour (default: 01:00:00)')
+    submit_parser.add_argument('--validation-time', type=lambda value: wall_time(value, maximum_hours=2, minimum_minutes=1),
+                               help='optional canonical correctness allocation HH:MM:SS, 1 minute to 2 hours')
     submit_parser.add_argument('--prepare-only', action='store_true', help='freeze and inspect plans without submitting jobs')
     for name in ('worker', 'resume'):
         p = sub.add_parser(name, help='run or resubmit an incomplete stage without replacing completed measurements')

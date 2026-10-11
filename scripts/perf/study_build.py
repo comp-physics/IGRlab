@@ -48,11 +48,19 @@ def _environment(extra: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def _run(argv: list[str], *, input: bytes | None = None,
-         env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+         env: dict[str, str] | None = None, check: bool = True,
+         timeout: int = 300) -> subprocess.CompletedProcess[bytes]:
     try:
         result = subprocess.run(argv, input=input, capture_output=True,
-                                env=env or _environment(), timeout=300)
-    except (OSError, subprocess.TimeoutExpired) as error:
+                                env=env or _environment(), timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        if not check:
+            return subprocess.CompletedProcess(argv, 124, error.stdout or b'',
+                                               (error.stderr or b'') + b'\ncommand timed out')
+        raise StudyBuildError(f'command could not complete: {argv[0]}: {error}') from error
+    except OSError as error:
+        if not check:
+            return subprocess.CompletedProcess(argv, 127, b'', str(error).encode())
         raise StudyBuildError(f'command could not complete: {argv[0]}: {error}') from error
     _require(not check or result.returncode == 0,
              f'command failed ({result.returncode}): {argv[0]}: '
@@ -283,8 +291,18 @@ def verify_source(identity: dict[str, Any]) -> None:
     _require(actual['mfem_origin'] == MFEM_ORIGIN, 'snapshot MFEM origin changed')
 
 
+def _validation_seconds(value: str) -> int:
+    _require(isinstance(value, str) and re.fullmatch(r'[0-9]{2}:[0-5][0-9]:00', value),
+             'validation_time requires minute-aligned HH:MM:00')
+    hours, minutes, _ = map(int, value.split(':'))
+    seconds = 3600 * hours + 60 * minutes
+    _require(0 < seconds <= 7200, 'validation_time must be positive and no greater than 02:00:00')
+    return seconds
+
+
 def build_plan(identity: dict[str, Any], output_root: Path, site_root: Path,
-               spack_root: Path, correctness_regex: str) -> dict[str, Any]:
+               spack_root: Path, correctness_regex: str, *,
+               validation_time: str | None = None) -> dict[str, Any]:
     """Inspect only the canonical --print-plan; never build on the login node."""
     verify_source(identity)
     _require(bool(correctness_regex), 'a nonempty focused correctness regex is required')
@@ -294,6 +312,14 @@ def build_plan(identity: dict[str, Any], output_root: Path, site_root: Path,
     roots = [p.resolve() for p in roots]
     requested_output, site_root, spack_root = roots
     snapshot = Path(identity['source_snapshot'])
+    validation_mode, capability = None, None
+    if validation_time is not None:
+        _validation_seconds(validation_time)
+        help_result = _run([str(snapshot / 'build.sh'), '--site', 'pace', '--help'], env=_environment(BUILD_ENV))
+        help_text = help_result.stdout.decode(errors='replace')
+        validation_mode = 'canonical' if re.search(r'(?m)^\s*--validation-time(?:\s|$)', help_text) else 'scheduler-update'
+        capability = {'argv': help_result.args, 'returncode': help_result.returncode,
+                      'stdout_sha256': hashlib.sha256(help_result.stdout).hexdigest()}
     flags = ['--site', 'pace', '--a100', '--hdg-runtime', '--nvtx-profile',
              '--no-clean', '--no-research-tests', '--submit', '-j', '4',
              '--mfem-jobs', '4', '--test-regex', correctness_regex]
@@ -304,6 +330,9 @@ def build_plan(identity: dict[str, Any], output_root: Path, site_root: Path,
     output_root = requested_output / ('config-' + config_key[:20])
     argv = [str(snapshot / 'build.sh'), *flags, '--output-root', str(output_root),
             '--site-root', str(site_root), '--spack-root', str(spack_root)]
+    # Scheduling limits do not change compiled artifacts or the cache key.
+    if validation_mode == 'canonical':
+        argv += ['--validation-time', validation_time]
     result = _run([*argv, '--print-plan'], env=_environment(BUILD_ENV))
     stdout, stderr = result.stdout.decode(errors='replace'), result.stderr.decode(errors='replace')
     wt = 'wt-' + hashlib.sha256(os.fsencode(snapshot)).hexdigest()[:16]
@@ -325,7 +354,88 @@ def build_plan(identity: dict[str, Any], output_root: Path, site_root: Path,
             'mfem_identity': str(mfem_build / 'dg-igr-mfem-identity-v1.txt'),
             'mfem_config': str(mfem_install / 'lib/cmake/mfem/MFEMConfig.cmake'),
             'mfem_targets': str(mfem_install / 'lib/cmake/mfem/MFEMTargets.cmake'),
+            'validation_time': validation_time, 'validation_time_mode': validation_mode,
+            'validation_time_capability': capability,
             'plan_stdout': stdout, 'plan_stderr': stderr}
+
+
+def ensure_validation_time(plan: dict[str, Any], receipt: dict[str, Any]) -> dict[str, Any]:
+    """Admit a recorded validation job and shorten only a pending owned job."""
+    if plan.get('validation_time') is None:
+        return dict(receipt)
+    result = dict(receipt)
+    canonical_success = result.get('canonical_submission_success', result.get('success', False))
+    result['canonical_submission_success'] = canonical_success
+    metadata = {'requested': plan['validation_time'], 'mode': plan.get('validation_time_mode'),
+                'commands': [], 'status': 'withheld'}
+    result['validation_time'] = metadata
+
+    def command(argv):
+        completed = _run(argv, check=False, timeout=30)
+        observation = {'argv': argv, 'returncode': completed.returncode,
+                       'stdout': completed.stdout.decode(errors='replace'),
+                       'stderr': completed.stderr.decode(errors='replace')}
+        metadata['commands'].append(observation)
+        _require(completed.returncode == 0, f'validation limit command failed ({completed.returncode}): {observation["stderr"]}')
+        return observation['stdout']
+
+    def inspect(job):
+        text = command(['scontrol', 'show', 'job', '-o', job])
+        values = dict(re.findall(r'(?:^|\s)([A-Za-z][A-Za-z0-9_]*)=([^\s]+)', text))
+        executable = re.search(r'(?:^|\s)Command=(.*?)(?=\s+[A-Z][A-Za-z0-9_]*=|$)', text)
+        uid = re.search(r'\(([0-9]+)\)$', values.get('UserId', ''))
+        _require(values.get('JobId') == job and values.get('JobName') == 'IGRlab-check' and
+                 values.get('Account') == 'gts-sbryngelson3' and values.get('QOS') == 'embers' and
+                 uid is not None and int(uid[1]) == os.getuid() and executable is not None and
+                 executable[1] == str(Path(plan['source']['source_snapshot']) / 'scripts/build/pace.sh'),
+                 'validation limit withheld: scheduler job identity changed')
+        return values
+
+    def limit_seconds(value):
+        limit = re.fullmatch(r'(?:(\d+)-)?(\d+):([0-5][0-9]):([0-5][0-9])', value or '')
+        _require(limit is not None, 'unknown validation job time limit')
+        seconds = int(limit[1] or 0) * 86400 + int(limit[2]) * 3600 + int(limit[3]) * 60 + int(limit[4])
+        _require(seconds > 0, 'validation job time limit must be positive')
+        return seconds
+
+    try:
+        wanted = _validation_seconds(plan['validation_time'])
+        _require(metadata['mode'] in ('canonical', 'scheduler-update'), 'invalid validation limit mode')
+        _require(canonical_success, 'canonical build submission was incomplete')
+        for key, expected in (('source_fingerprint', plan['source']['source_fingerprint']),
+                              ('configuration_key', plan['configuration_key'])):
+            _require(result.get(key) == expected, f'validation receipt identity changed: {key}')
+        verify_source(plan['source'])
+        job = result.get('validation_job_id')
+        _require(isinstance(job, str) and re.fullmatch(r'[0-9]+', job), 'missing/invalid validation job ID')
+        values = inspect(job)
+        metadata['observed_state'] = values.get('JobState')
+        metadata['actual'] = values.get('TimeLimit')
+        if values.get('JobState') == 'COMPLETED':
+            metadata['status'] = 'completed-noop'
+        else:
+            actual = limit_seconds(values.get('TimeLimit'))
+            _require(values.get('JobState') in ('PENDING', 'RUNNING', 'CONFIGURING', 'COMPLETING'),
+                     'validation job is not pending, active, or completed')
+            if actual <= wanted:
+                metadata['status'] = 'within-limit-noop'
+            else:
+                _require(values.get('JobState') == 'PENDING', 'running validation job exceeds requested limit; update withheld')
+                metadata['update_attempted'] = True
+                command(['scontrol', 'update', 'JobId=' + job, 'TimeLimit=' + plan['validation_time']])
+                readback = inspect(job)
+                metadata['actual'] = readback.get('TimeLimit')
+                metadata['readback_state'] = readback.get('JobState')
+                _require(limit_seconds(metadata['actual']) <= wanted, 'validation limit readback exceeds requested limit')
+                metadata['status'] = 'updated'
+        result['success'] = True
+        result.pop('error', None)
+    except (StudyBuildError, OSError, KeyError, TypeError, ValueError) as error:
+        result['success'] = False
+        result['error'] = str(error)
+        metadata['status'] = 'failed'
+        metadata['error'] = str(error)
+    return result
 
 
 def submit_build(plan: dict[str, Any]) -> dict[str, Any]:
@@ -333,19 +443,25 @@ def submit_build(plan: dict[str, Any]) -> dict[str, Any]:
     verify_source(plan['source'])
     expected = build_plan(plan['source'], Path(plan['requested_output_root']),
                           Path(plan['site_root']), Path(plan['spack_root']),
-                          plan['configuration']['flags'][plan['configuration']['flags'].index('--test-regex') + 1])
-    for key in ('argv', 'env', 'configuration_key', 'app_build', 'spack_env'):
+                          plan['configuration']['flags'][plan['configuration']['flags'].index('--test-regex') + 1],
+                          validation_time=plan.get('validation_time'))
+    for key in ('argv', 'env', 'configuration_key', 'app_build', 'spack_env', 'validation_time', 'validation_time_mode'):
         _require(plan.get(key) == expected[key], f'build submission plan changed: {key}')
     result = _run(plan['argv'], env=_environment(plan['env']), check=False)
     stdout, stderr = result.stdout.decode(errors='replace'), result.stderr.decode(errors='replace')
     build = re.findall(r'^PACE build submitted: ([0-9]+) \(', stdout, re.M)
     validation = re.findall(r'^PACE validation submitted: ([0-9]+) \(', stdout, re.M)
-    _require(len(build) <= 1 and len(validation) <= 1, 'public submission returned ambiguous job IDs')
-    verify_source(plan['source'])
-    return {'schema_version': 1, 'success': result.returncode == 0 and len(build) == len(validation) == 1,
+    receipt = {'schema_version': 1, 'success': result.returncode == 0 and len(build) == len(validation) == 1,
             'returncode': result.returncode,
-            'build_job_id': build[0] if build else None,
-            'validation_job_id': validation[0] if validation else None,
+            'build_job_id': build[0] if len(build) == 1 else None,
+            'validation_job_id': validation[0] if len(validation) == 1 else None,
+            'build_job_ids': build, 'validation_job_ids': validation,
             'stdout': stdout, 'stderr': stderr, 'argv': plan['argv'],
             'source_fingerprint': plan['source']['source_fingerprint'],
             'configuration_key': plan['configuration_key']}
+    try:
+        _require(len(build) <= 1 and len(validation) <= 1, 'public submission returned ambiguous job IDs')
+        verify_source(plan['source'])
+    except (StudyBuildError, OSError, KeyError, TypeError, ValueError) as error:
+        receipt.update(success=False, error=str(error))
+    return ensure_validation_time(plan, receipt)

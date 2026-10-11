@@ -43,6 +43,108 @@ class StudyProtocol(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def save_plan(self):
+        self.plan.pop('plan_sha256', None)
+        self.plan['plan_sha256'] = study.digest(self.plan)
+        study.write_json(self.root / 'plan.json', self.plan)
+
+    def test_submit_cli_wall_times_defaults_overrides_and_invalid_limits(self):
+        argv = ['submit', '--baseline', 'HEAD', '--run-dir', str(self.root), '--site-root', str(self.root)]
+        with patch.object(study, 'submit') as submit:
+            study.main(argv)
+            args = submit.call_args.args[0]
+            self.assertEqual((args.timings_time, args.profiles_time, args.validation_time),
+                             ('01:00:00', '01:00:00', None))
+            study.main(argv + ['--timings-time', '00:15:00', '--profiles-time', '00:30:00',
+                              '--validation-time', '02:00:00'])
+            args = submit.call_args.args[0]
+            self.assertEqual((args.timings_time, args.profiles_time, args.validation_time),
+                             ('00:15:00', '00:30:00', '02:00:00'))
+            study.main(argv + ['--validation-time', '00:01:00'])
+            self.assertEqual(submit.call_args.args[0].validation_time, '00:01:00')
+        for flag, value in (('--timings-time', '15'), ('--timings-time', '00:04:00'),
+                            ('--profiles-time', '01:01:00'), ('--profiles-time', '00:15:01'),
+                            ('--profiles-time', '00:60:00'), ('--validation-time', '02:01:00'),
+                            ('--validation-time', '00:00:00')):
+            with self.subTest(flag=flag, value=value), contextlib.redirect_stderr(io.StringIO()), \
+                    patch.object(study, 'submit') as submit:
+                with self.assertRaises(SystemExit): study.main(argv + [flag, value])
+                submit.assert_not_called()
+
+    def test_create_freezes_stage_limits_and_passes_validation_to_canonical_plan(self):
+        source = Path(self.temp.name) / 'source'
+        (source / 'cmake/sites').mkdir(parents=True)
+        (source / 'cmake/sites/pace.json').write_text('{"site":"pace"}')
+        destination = Path(self.temp.name) / 'new-study'
+        args = argparse.Namespace(run_dir=str(destination), source=str(source), site_root=str(self.root),
+                                  cache_root=None, spack_root=str(self.root / 'spack'),
+                                  suite=str(Path(study.__file__).parent / 'suites/pace-a100.json'),
+                                  cases='dg-p1', baseline='HEAD', candidate='HEAD',
+                                  timings_time='00:15:00', profiles_time='00:30:00', validation_time='00:15:00')
+        with patch.object(study.study_build, 'freeze', return_value={'source_snapshot': str(source)}), \
+                patch.object(study, 'cached_source', side_effect=lambda identity, cache: identity), \
+                patch.object(study.study_build, 'build_plan', return_value={'app_build': '/fixture'}) as build:
+            root, plan = study.create(args)
+        self.assertEqual(plan['wall_time_limits'], {'timings': '00:15:00', 'profiles': '00:30:00'})
+        self.assertEqual(study.load_plan(root)['wall_time_limits'], plan['wall_time_limits'])
+        self.assertEqual(build.call_count, 2)
+        self.assertTrue(all(call.kwargs == {'validation_time': '00:15:00'} for call in build.call_args_list))
+        args.run_dir = str(Path(self.temp.name) / 'invalid-study')
+        args.timings_time = '03:00:00'
+        with patch.object(study.study_build, 'freeze') as freeze:
+            with self.assertRaises(ValueError): study.create(args)
+            freeze.assert_not_called()
+        self.assertFalse(Path(args.run_dir).exists())
+
+    def test_worker_budget_uses_suite_setup_elapsed_and_actual_scheduler_end(self):
+        plan = {'wall_time_limits': {'timings': '00:15:00', 'profiles': '00:30:00'}}
+        with patch.dict(os.environ, {}, clear=True), patch.object(study.time, 'monotonic', return_value=160):
+            self.assertEqual(study.worker_budget({}, {}, 'timings', 100), 3000)
+            self.assertEqual(study.worker_budget(plan, {}, 'timings', 100), 720)
+            self.assertEqual(study.worker_budget(plan, {}, 'profiles', 100), 1620)
+            self.assertEqual(study.worker_budget(plan, {'timings_budget_seconds': 500}, 'timings', 100), 500)
+            with self.assertRaisesRegex(RuntimeError, 'cleanup'):
+                study.worker_budget(plan, {}, 'timings', -620)
+        with patch.dict(os.environ, {'SLURM_JOB_END_TIME': '1100'}, clear=True), \
+                patch.object(study.time, 'monotonic', return_value=160), patch.object(study.time, 'time', return_value=500):
+            self.assertEqual(study.worker_budget(plan, {}, 'timings', 100), 480)
+        for value in ('', '1100.0', '-1100', 'nan', 'inf', '9' * 400, '500', '600'):
+            with self.subTest(value=value), patch.dict(os.environ, {'SLURM_JOB_END_TIME': value}, clear=True), \
+                    patch.object(study.time, 'monotonic', return_value=160), patch.object(study.time, 'time', return_value=500):
+                with self.assertRaises((ValueError, RuntimeError)):
+                    study.worker_budget(plan, {}, 'timings', 100)
+
+    def test_worker_exhaustion_rejects_before_gpu_queries(self):
+        with patch.object(study, 'verify', return_value=self.plan), \
+                patch.object(study.study_workloads, 'load_suite', return_value={}), \
+                patch.dict(os.environ, {'SLURM_JOB_END_TIME': '500'}, clear=True), \
+                patch.object(study.time, 'time', return_value=500), patch.object(study, 'allocation') as allocation:
+            with self.assertRaisesRegex(RuntimeError, 'future timestamp'):
+                study.worker(argparse.Namespace(run_dir=str(self.root), stage='timings'))
+            allocation.assert_not_called()
+        self.assertEqual(study.read_json(self.root / 'state.json')['attempts'], [])
+
+    def test_worker_runner_budget_subtracts_admission_setup_time(self):
+        self.plan['wall_time_limits'] = {'timings': '00:15:00', 'profiles': '00:30:00'}
+        self.save_plan()
+        clock = [100]
+        def admit(*args):
+            clock[0] = 160
+            return {}
+        with patch.dict(os.environ, {'SLURM_JOB_ID': '123'}, clear=True), \
+                patch.object(study.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(study, 'verify', return_value=self.plan), \
+                patch.object(study.study_workloads, 'load_suite', return_value={}), \
+                patch.object(study, 'allocation', return_value={}), patch.object(study, 'checked_builds'), \
+                patch.object(study, 'admit', side_effect=admit), patch.object(study, 'Runner') as runner, \
+                patch.object(study, 'hardware_snapshot', return_value={}), patch.object(study, 'report'), \
+                patch.object(study, 'timings', return_value={'status': 'timings_complete', 'cases': {}}):
+            study.worker(argparse.Namespace(run_dir=str(self.root), stage='timings'))
+        self.assertEqual(runner.call_args.args[1:], (720, 300))
+        attempt = study.read_json(self.root / 'state.json')['attempts'][-1]
+        self.assertEqual((attempt['worker_budget_seconds'], attempt['cleanup_reserve_seconds'], attempt['requested_wall_time']),
+                         (720, 120, '00:15:00'))
+
     def finish_timings(self):
         output = self.root / 'attempts' / 'timings-fixture'
         output.mkdir(parents=True)
@@ -158,9 +260,56 @@ class StudyProtocol(unittest.TestCase):
             self.assertEqual(study.submit_stage(self.root, 'profiles', ['123']), '456')
         command = run.call_args.args[0]
         for arg in ('--qos=embers', '--account=gts-sbryngelson3', '--partition=gpu-a100',
-                    '--ntasks=1', '--dependency=afterok:123', '--gres=gpu:a100:1'):
+                    '--ntasks=1', '--dependency=afterok:123', '--gres=gpu:a100:1', '--time=01:00:00'):
             self.assertIn(arg, command)
         self.assertEqual(command[-1], str(self.root / 'executor'))
+
+    def test_stage_submission_uses_frozen_limits_and_rejects_invalid_plan(self):
+        self.plan['wall_time_limits'] = {'timings': '00:15:00', 'profiles': '00:30:00'}
+        self.save_plan()
+        with patch.object(study.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '456\n', '')) as run:
+            study.submit_stage(self.root, 'timings', ['123'])
+            self.assertIn('--time=00:15:00', run.call_args.args[0])
+            study.submit_stage(self.root, 'profiles', ['456'])
+            self.assertIn('--time=00:30:00', run.call_args.args[0])
+        self.plan['wall_time_limits']['profiles'] = '02:00:00'
+        self.save_plan()
+        with patch.object(study.subprocess, 'run') as run:
+            with self.assertRaises(ValueError): study.submit_stage(self.root, 'profiles')
+            run.assert_not_called()
+
+    def test_failed_validation_limit_retry_reuses_jobs_and_retains_error_receipt(self):
+        self.plan['builds'] = {member: {'app_build': '/shared/identical-build', 'validation_time': '00:15:00'}
+                              for member in study.MEMBERS}
+        self.plan['sources'] = {member: {'source_snapshot': str(self.root)} for member in study.MEMBERS}
+        existing = {'success': False, 'build_job_id': '100', 'validation_job_id': '101',
+                    'validation_time_error': 'scheduler update failed'}
+        self.state['builds']['baseline'] = existing
+        study.write_json(self.root / 'state.json', self.state)
+        with patch.object(study, 'job_state', return_value=('PENDING', '0:0')), \
+                patch.object(study, 'recover_orphan', return_value=False), \
+                patch.object(study.study_build, 'ensure_validation_time', return_value=existing, create=True) as ensure, \
+                patch.object(study.study_build, 'submit_build') as build, patch.object(study, 'submit_stage') as stages:
+            with self.assertRaisesRegex(RuntimeError, 'correctness limit not admitted'):
+                study.submit_pipeline(self.root, self.plan)
+            ensure.assert_called_once_with(self.plan['builds']['baseline'], existing)
+            build.assert_not_called()
+            stages.assert_not_called()
+        state = study.read_json(self.root / 'state.json')
+        self.assertEqual(state['build_attempts'][-1]['validation_job_id'], '101')
+        self.assertEqual(state['build_attempts'][-1]['validation_time_error'], 'scheduler update failed')
+        fixed = {**existing, 'success': True, 'validation_time_error': None}
+        with patch.object(study, 'job_state', return_value=('PENDING', '0:0')), \
+                patch.object(study, 'recover_orphan', return_value=False), patch.object(study, 'recorded_orphans'), \
+                patch.object(study.study_build, 'ensure_validation_time', return_value=fixed, create=True), \
+                patch.object(study.study_build, 'submit_build') as build, \
+                patch.object(study, 'submit_stage', side_effect=['102', '103']) as stages:
+            study.submit_pipeline(self.root, self.plan)
+            build.assert_not_called()
+            self.assertEqual(stages.call_count, 2)
+        state = study.read_json(self.root / 'state.json')
+        self.assertEqual(state['builds']['baseline'], state['builds']['candidate'])
+        self.assertTrue(state['builds']['baseline']['success'])
 
     def test_pipeline_deduplicates_identical_build_and_preserves_failed_submission(self):
         self.plan['builds'] = {m: {'app_build': '/shared/identical-build'} for m in study.MEMBERS}
