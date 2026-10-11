@@ -27,6 +27,14 @@ foreach(build_check pace_submission pace_manifest pace_discovery dependency_bind
     TIMEOUT 30)
 endforeach()
 
+foreach(study_check gpu_study study_build study_workloads study_profiles)
+  add_test(NAME igrlab_${study_check}_python
+    COMMAND /usr/bin/env python3
+            ${CMAKE_SOURCE_DIR}/scripts/perf/test_${study_check}.py)
+  set_tests_properties(igrlab_${study_check}_python PROPERTIES
+    LABELS "profiling;study;contract;python;no-gpu" TIMEOUT 120)
+endforeach()
+
 add_test(NAME igrlab_mpi_test_launcher
   COMMAND /usr/bin/env python3
           ${CMAKE_SOURCE_DIR}/tests/scripts/test_mpi_test_launcher.py

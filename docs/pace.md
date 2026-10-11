@@ -106,6 +106,10 @@ may verify compilation and correctness, but local RTX 5080 timings do not guide
 these optimizations. The site profile uses ordinary batch children and the
 validated MPI installation without overriding MPI transport components.
 
+Use the maintained [GPU study workflow](gpu-studies.md) to compare source
+versions with one command, retained source/build caches, separate timing and
+profiling stages, and summary-only retrieval.
+
 The dependency setup follows Spack's documented environment model: retain
 `spack.yaml` and `spack.lock`, use ordinary `spack concretize` rather than forcing
 a fresh resolution on each build, and install the selected environment. See

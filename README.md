@@ -116,6 +116,10 @@ architecture. The SM80 route still requires compilation and device validation on
 system; a successful `--print-plan` only validates the build policy. Existing
 SM120 disassembly qualification checks remain specific to that profile.
 
+For repeatable A100 optimization studies, use [the GPU study workflow](docs/gpu-studies.md).
+Its `perf.sh` command freezes sources, reuses canonical builds, schedules paired
+timings and profiling in PACE's free queue, and exports compact results.
+
 The application and MFEM builds both use `-j 16` in the example above. Use
 `--mfem-jobs N` only when MFEM needs different concurrency, such as:
 

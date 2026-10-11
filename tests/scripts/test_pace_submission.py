@@ -87,6 +87,7 @@ print(9000 + count)
         self.assertIn('--partition=gpu-a100', check)
         self.assertIn('--gres=gpu:a100:1', check)
         self.assertIn('--dependency=afterok:9000', check)
+        self.assertIn('--kill-on-invalid-dep=yes', check)
 
     def test_cpu_validation_and_compile_only(self):
         result = self.submit('--cpu-only')

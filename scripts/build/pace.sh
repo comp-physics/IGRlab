@@ -162,7 +162,7 @@ PY
     if [[ $pace_profile == cuda-sm80 ]]; then
       pace_partition=gpu-a100; pace_resources+=(--gres=gpu:a100:1)
     fi
-    pace_validation=$(sbatch --parsable --dependency="afterok:$pace_job" --account=gts-sbryngelson3 \
+    pace_validation=$(sbatch --parsable --dependency="afterok:$pace_job" --kill-on-invalid-dep=yes --account=gts-sbryngelson3 \
       --qos=embers --partition="$pace_partition" "${pace_resources[@]}" --nodes=1 --ntasks=4 \
       --cpus-per-task=2 --mem=48G --time=02:00:00 --no-requeue --job-name=IGRlab-check \
       --output="$pace_dependency_root/site/pace/logs/check-%j.out" \

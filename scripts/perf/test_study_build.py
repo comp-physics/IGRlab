@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""Host fixtures use tiny local Git repos and a fake public build driver."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import study_build as study
+
+
+DRIVER = '''#!/usr/bin/env python3
+import hashlib,json,os,pathlib,sys
+args=sys.argv[1:]
+value=lambda flag: args[args.index(flag)+1]
+source=pathlib.Path(__file__).resolve().parent
+output=pathlib.Path(value('--output-root'))
+site=pathlib.Path(value('--site-root'))
+wt='wt-'+hashlib.sha256(os.fsencode(source)).hexdigest()[:16]
+scope=output/'worktrees'/wt/'cuda-sm80'
+if '--print-plan' in args:
+ print(f'[build-plan] output_root={output} worktree_id={wt} scope={scope}')
+ print(f'[build-plan] env={site}/site/pace/spack-envs/cuda-sm80 app_build={scope}/app/build app_install={scope}/app/install')
+else:
+ if os.environ.get('SLURM_JOB_ID'):
+  print('inside-allocation submission rejected',file=sys.stderr)
+  raise SystemExit(2)
+ print('PACE build submitted: 987123 (embers, cpu-small)')
+ if os.environ.get('FAKE_PARTIAL'):
+  print('validation submission failed',file=sys.stderr)
+  raise SystemExit(1)
+ print('PACE validation submitted: 567890 (after build, embers, gpu-a100)')
+ print('literal regex='+value('--test-regex'))
+'''
+
+
+class StudyBuildTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.seed = self.root / 'mfem-seed'
+        self.seed.mkdir()
+        self.git(self.seed, 'init', '-q')
+        self.configure(self.seed)
+        (self.seed / 'mfem.hpp').write_text('tiny mfem\n')
+        self.git(self.seed, 'add', '.')
+        self.git(self.seed, 'commit', '-qm', 'mfem fixture')
+        self.git(self.seed, 'tag', '-a', 'v4.9', '-m', 'annotated release')
+        self.git(self.seed, 'remote', 'add', 'origin', study.MFEM_ORIGIN)
+        self.source = self.root / 'source'
+        self.source.mkdir()
+        self.git(self.source, 'init', '-q')
+        self.configure(self.source)
+        self.write('build.sh', DRIVER, executable=True)
+        self.write('cmake/sites/pace.json', '{"site":"pace"}\n')
+        self.write('scripts/build/pace.sh', '# tracked fixture\n')
+        self.write('bytes.bin', b'\x00\xfforiginal\n')
+        self.write('delete-me', 'keep\n')
+        self.write('.gitignore', 'ignored*\n')
+        self.write('mesh-real.msh', 'mesh\n')
+        (self.source / 'mesh-link.msh').symlink_to('mesh-real.msh')
+        self.git(self.source, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', str(self.seed), study.MFEM_PATH)
+        self.git(self.source / study.MFEM_PATH, 'remote', 'set-url', 'origin', study.MFEM_ORIGIN)
+        self.git(self.source, 'config', '-f', '.gitmodules', 'submodule.tpl/mfem.url', study.MFEM_ORIGIN)
+        self.git(self.source, 'add', '.')
+        self.git(self.source, 'commit', '-qm', 'source fixture')
+        self.dest = self.root / 'snapshot'
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def configure(self, root):
+        self.git(root, 'config', 'user.name', 'Fixture')
+        self.git(root, 'config', 'user.email', 'fixture@example.invalid')
+
+    def git(self, root, *args):
+        result = subprocess.run(['git', '-C', str(root), *args], capture_output=True, check=True)
+        return result.stdout.decode().strip()
+
+    def write(self, name, data, executable=False):
+        path = self.source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data if isinstance(data, bytes) else data.encode())
+        if executable:
+            path.chmod(0o755)
+
+    def freeze(self, ref='HEAD'):
+        return study.freeze(self.source, ref, self.dest)
+
+    def test_clean_standalone_detached_snapshot_with_annotated_mfem_tag(self):
+        identity = self.freeze()
+        self.assertEqual(identity['source_status'], 'clean')
+        study.verify_source(identity)
+        for root in (self.dest, self.dest / study.MFEM_PATH):
+            self.assertFalse((root / '.git/objects/info/alternates').exists())
+            self.assertEqual(self.git(root, 'rev-parse', '--abbrev-ref', 'HEAD'), 'HEAD')
+        self.assertEqual(self.git(self.dest / study.MFEM_PATH, 'cat-file', '-t', 'v4.9'), 'tag')
+        self.assertEqual(self.git(self.dest / study.MFEM_PATH, 'remote', 'get-url', 'origin'), study.MFEM_ORIGIN)
+        original = self.source / '.git/objects'
+        for path in original.rglob('*'):
+            if path.is_file() and (copied := self.dest / '.git/objects' / path.relative_to(original)).exists():
+                self.assertNotEqual(path.stat().st_ino, copied.stat().st_ino)
+
+    def test_working_tree_preserves_binary_deleted_staged_and_literal_untracked_bytes(self):
+        dirty = b'\xff\x00candidate\n'
+        self.write('bytes.bin', dirty)
+        (self.source / 'delete-me').unlink()
+        self.write('added-to-index', b'\x01staged\x00')
+        self.git(self.source, 'add', 'added-to-index')
+        literal = 'literal $HOME `echo unsafe`\n space.bin'
+        self.write(literal, b'\x00\x80literal')
+        self.write('ignored-output', 'ignored bytes')
+        before = self.git(self.source, 'status', '--porcelain')
+        identity = self.freeze('working-tree')
+        self.assertEqual((self.dest / 'bytes.bin').read_bytes(), dirty)
+        self.assertEqual((self.dest / literal).read_bytes(), b'\x00\x80literal')
+        self.assertEqual((self.dest / 'added-to-index').read_bytes(), b'\x01staged\x00')
+        self.assertFalse((self.dest / 'delete-me').exists())
+        self.assertFalse((self.dest / 'ignored-output').exists())
+        self.assertEqual(identity['source_status'], 'dirty')
+        self.assertEqual(self.git(self.source, 'status', '--porcelain'), before)
+        study.verify_source(identity)
+
+    def test_standalone_snapshot_can_publish_at_stable_content_cache_path(self):
+        self.write('bytes.bin', b'dirty candidate\x00')
+        identity = self.freeze('working-tree')
+        before = self.plan(identity)
+        published = self.root / 'cache/sources' / identity['source_fingerprint']
+        published.parent.mkdir(parents=True)
+        self.dest.rename(published)
+        reused = dict(identity, source_snapshot=str(published))
+        study.verify_source(reused)
+        after = self.plan(reused)
+        self.assertEqual(before['configuration_key'], after['configuration_key'])
+        self.assertNotEqual(before['app_build'], after['app_build'])
+        self.assertEqual(after['app_build'], self.plan(reused)['app_build'])
+        self.assertEqual(os.readlink(published / 'mesh-link.msh'), 'mesh-real.msh')
+        self.assertEqual((published / study.MFEM_PATH / 'mfem.hpp').read_text(), 'tiny mfem\n')
+        self.assertFalse((published / '.git/objects/info/alternates').exists())
+        self.assertFalse((published / study.MFEM_PATH / '.git/objects/info/alternates').exists())
+
+    def test_literal_working_bytes_change_content_fingerprint(self):
+        first = self.freeze('working-tree')
+        self.write('bytes.bin', b'new binary\x00')
+        second = study.freeze(self.source, 'working-tree', self.root / 'snapshot2')
+        self.assertEqual(first['source_revision'], second['source_revision'])
+        self.assertNotEqual(first['source_fingerprint'], second['source_fingerprint'])
+
+    def test_ordinary_ref_excludes_dirty_source_without_changing_it(self):
+        self.write('bytes.bin', b'dirty')
+        identity = self.freeze('HEAD')
+        self.assertEqual((self.dest / 'bytes.bin').read_bytes(), b'\x00\xfforiginal\n')
+        self.assertEqual((self.source / 'bytes.bin').read_bytes(), b'dirty')
+        self.assertEqual(identity['source_status'], 'clean')
+
+    def test_tracked_confined_symlink_is_preserved_exactly(self):
+        identity = self.freeze('working-tree')
+        self.assertEqual(os.readlink(self.dest / 'mesh-link.msh'), 'mesh-real.msh')
+        study.verify_source(identity)
+
+    def test_untracked_and_modified_symlinks_reject(self):
+        (self.source / 'untracked-link').symlink_to('bytes.bin')
+        with self.assertRaisesRegex(study.StudyBuildError, 'symlink'):
+            self.freeze('working-tree')
+        (self.source / 'untracked-link').unlink()
+        (self.source / 'mesh-link.msh').unlink()
+        (self.source / 'mesh-link.msh').symlink_to('delete-me')
+        with self.assertRaisesRegex(study.StudyBuildError, 'modified tracked symlink'):
+            self.freeze('working-tree')
+
+    def test_tracked_escape_symlink_rejects(self):
+        (self.source / 'mesh-link.msh').unlink()
+        (self.source / 'mesh-link.msh').symlink_to('../mfem-seed/mfem.hpp')
+        self.git(self.source, 'add', 'mesh-link.msh')
+        self.git(self.source, 'commit', '-qm', 'escaping link')
+        with self.assertRaisesRegex(study.StudyBuildError, 'escapes snapshot'):
+            self.freeze()
+
+    def test_dirty_mfem_rejects_and_original_is_preserved(self):
+        path = self.source / study.MFEM_PATH / 'mfem.hpp'
+        path.write_text('dirty mfem')
+        with self.assertRaisesRegex(study.StudyBuildError, 'dirty'):
+            self.freeze('working-tree')
+        self.assertEqual(path.read_text(), 'dirty mfem')
+
+    def test_missing_annotated_tag_rejects(self):
+        self.git(self.source / study.MFEM_PATH, 'tag', '-d', 'v4.9')
+        with self.assertRaises(study.StudyBuildError):
+            self.freeze()
+
+    def test_annotated_tag_metadata_drift_rejects(self):
+        identity = self.freeze()
+        mfem = self.dest / study.MFEM_PATH
+        self.configure(mfem)
+        self.git(mfem, 'tag', '-fa', 'v4.9', '-m', 'changed annotated metadata')
+        self.assertEqual(self.git(mfem, 'rev-parse', 'v4.9^{commit}'), identity['mfem_revision'])
+        with self.assertRaisesRegex(study.StudyBuildError, 'identity changed'):
+            study.verify_source(identity)
+
+    def test_unsupported_historical_driver_rejects_before_creating_snapshot(self):
+        self.git(self.source, 'rm', 'cmake/sites/pace.json')
+        self.git(self.source, 'commit', '-qm', 'old unsupported source')
+        with self.assertRaisesRegex(study.StudyBuildError, 'unsupported historical source'):
+            self.freeze()
+        self.assertFalse(self.dest.exists())
+
+    def test_source_and_mfem_drift_reject_before_planning(self):
+        identity = self.freeze()
+        (self.dest / 'bytes.bin').write_bytes(b'altered')
+        with self.assertRaisesRegex(study.StudyBuildError, 'identity changed'):
+            study.verify_source(identity)
+        (self.dest / 'bytes.bin').write_bytes(b'\x00\xfforiginal\n')
+        (self.dest / study.MFEM_PATH / 'mfem.hpp').write_text('altered')
+        with self.assertRaisesRegex(study.StudyBuildError, 'dirty'):
+            study.verify_source(identity)
+
+    def test_existing_or_symlinked_destination_rejects(self):
+        self.dest.mkdir()
+        (self.dest / 'unrelated').write_text('preserved')
+        with self.assertRaisesRegex(study.StudyBuildError, 'already exists'):
+            self.freeze()
+        self.assertEqual((self.dest / 'unrelated').read_text(), 'preserved')
+        link = self.root / 'parent-link'
+        link.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(study.StudyBuildError, 'symlinked'):
+            study.freeze(self.source, 'HEAD', link / 'snapshot3')
+
+    def plan(self, identity, regex='^(dg_operator|sigma)$'):
+        return study.build_plan(identity, self.root / 'output with $HOME `literal`',
+                                self.root / 'shared-site', self.root / 'spack-tool', regex)
+
+    def test_plan_is_source_configuration_scoped_and_has_no_build_side_effect(self):
+        identity = self.freeze()
+        regex = '^(one|two) $HOME `literal`\nlast$'
+        plan = self.plan(identity, regex)
+        self.assertEqual(plan['argv'][plan['argv'].index('--test-regex') + 1], regex)
+        self.assertIn('--submit', plan['argv'])
+        self.assertIn('--no-clean', plan['argv'])
+        self.assertFalse(Path(plan['output_root']).exists())
+        self.assertEqual(plan['spack_env'], str(self.root / 'shared-site/site/pace/spack-envs/cuda-sm80'))
+        self.assertEqual(plan['configuration_key'], self.plan(identity, regex)['configuration_key'])
+        self.assertNotEqual(plan['output_root'], self.plan(identity, '^another$')['output_root'])
+
+    def test_public_submission_preserves_ids_stdout_and_literal_argv(self):
+        plan = self.plan(self.freeze(), '^literal $HOME `never run`$')
+        result = study.submit_build(plan)
+        self.assertTrue(result['success'])
+        self.assertEqual((result['build_job_id'], result['validation_job_id']), ('987123', '567890'))
+        self.assertIn('literal $HOME `never run`', result['stdout'])
+
+    def test_partial_public_submission_retains_existing_job_and_failure(self):
+        plan = self.plan(self.freeze())
+        with patch.dict(os.environ, {'FAKE_PARTIAL':'1'}):
+            result = study.submit_build(plan)
+        self.assertFalse(result['success'])
+        self.assertEqual(result['build_job_id'], '987123')
+        self.assertIsNone(result['validation_job_id'])
+        self.assertIn('validation submission failed', result['stderr'])
+
+    def test_public_allocation_guard_is_preserved(self):
+        plan = self.plan(self.freeze())
+        with patch.dict(os.environ, {'SLURM_JOB_ID':'123'}):
+            result = study.submit_build(plan)
+        self.assertFalse(result['success'])
+        self.assertIn('inside-allocation', result['stderr'])
+
+    def test_plan_tampering_rejects_before_submission(self):
+        plan = self.plan(self.freeze())
+        plan['argv'].append('--clean')
+        with self.assertRaisesRegex(study.StudyBuildError, 'plan changed'):
+            study.submit_build(plan)
+
+
+if __name__ == '__main__':
+    unittest.main()
