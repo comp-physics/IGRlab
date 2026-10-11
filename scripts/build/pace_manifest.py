@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Render a stable PACE Spack environment or inspect its concrete lock, without building."""
 import argparse
+import copy
 import json
 from pathlib import Path
 import sys
@@ -17,6 +18,23 @@ def load_config():
     return json.loads(CONFIG_PATH.read_text())
 
 
+def resolved_config(config, profile):
+    """Accept discovered paths only; the repository still owns constraints."""
+    policy = load_config()
+    candidate = copy.deepcopy(config)
+    fields = [(candidate[name], "prefix") for name in ("compiler", "cmake", "metis", "openblas")]
+    fields.append((candidate["profiles"][profile], "mpi_prefix"))
+    if profile == "cuda-sm80":
+        fields.append((candidate, "cuda_prefix"))
+    for owner, key in fields:
+        if not owner.get(key):
+            raise PaceError("site prefixes must be discovered with pace_discover.py inside a compute allocation")
+        absolute_path(owner.pop(key), f"discovered {key}")
+    if candidate != policy:
+        raise PaceError("discovered site configuration changes the checked-in PACE constraints")
+    return config
+
+
 def absolute_path(path, label):
     path = Path(path)
     if not path.is_absolute() or path != path.resolve():
@@ -30,7 +48,7 @@ def external(spec, prefix, **extra):
 
 def manifest(root, profile, recipe_root, config=None):
     """Pure rendering: paths may refer to another host and need not exist."""
-    config = load_config() if config is None else config
+    config = resolved_config(load_config() if config is None else config, profile)
     root = absolute_path(root, "--root")
     recipe_root = absolute_path(recipe_root, "--recipe-root")
     if profile not in PROFILES:
@@ -50,7 +68,6 @@ def manifest(root, profile, recipe_root, config=None):
                         extra_attributes={"compilers": {"c": f'{gcc["prefix"]}/bin/gcc',
                             "cxx": f'{gcc["prefix"]}/bin/g++', "fortran": f'{gcc["prefix"]}/bin/gfortran'}}),
         "openmpi": external(selected["mpi_spec"], selected["mpi_prefix"]),
-        "cuda": external(f'cuda@{config["cuda_version"]}', config["cuda_prefix"]),
         # A package-specific require list replaces the all fallback. Keep its
         # target explicit so a host-specific descendant cannot enter HYPRE.
         "hypre": {"buildable": True, "externals": [], "require": [f"target={target}",
@@ -62,11 +79,14 @@ def manifest(root, profile, recipe_root, config=None):
     for name in ("cmake", "metis", "openblas"):
         package = config[name]
         variants = "threads=none +shared ~ilp64 " if name == "openblas" else ""
+        if name == "metis":
+            variants = "~int64 ~real64 +shared "
         packages[name] = external(f'{name}@{package["version"]} {variants}{common}', package["prefix"])
     specs = [packages[name]["externals"][0]["spec"] for name in ("cmake", "openmpi", "metis", "openblas")]
     specs.append(f'zlib@{config["zlib_version"]} {common}')
     hypre = f'hypre@{config["hypre_version"]} precision=double ~complex +shared +mpi cxxstd=17 '
     if gpu:
+        packages["cuda"] = external(f'cuda@{config["cuda_version"]}', config["cuda_prefix"])
         specs.extend([f'cuda@{config["cuda_version"]} target={target}',
             hypre + f'+cuda +umpire +gpu-aware-mpi ~unified-memory cuda_arch=80 {common}',
             f'umpire@{config["umpire_version"]} +shared +c +cuda ~fortran ~examples cuda_arch=80 {common}'])
@@ -88,12 +108,14 @@ def manifest(root, profile, recipe_root, config=None):
     }}
 
 
-def write_environment(root, profile, recipe_root):
+def write_environment(root, profile, recipe_root, config=None):
     root = absolute_path(root, "--root")
     recipe_root = absolute_path(recipe_root, "--recipe-root")
+    config = resolved_config(load_config() if config is None else config, profile)
     documents = {
-        root / "site/pace/spack-envs" / profile / "spack.yaml": manifest(root, profile, recipe_root),
+        root / "site/pace/spack-envs" / profile / "spack.yaml": manifest(root, profile, recipe_root, config),
         root / "site/pace/spack-user/repos.yaml": {"repos": {"builtin": str(recipe_root)}},
+        root / "site/pace/spack-envs" / profile / "site-packages.json": config,
     }
     rendered = {path: json.dumps(document, indent=2) + "\n" for path, document in documents.items()}
     # Check every destination before creating anything. Existing differing
@@ -120,7 +142,7 @@ def write_environment(root, profile, recipe_root):
 
 def check_lock(lock, profile, config=None):
     """Inspect concrete records only; never concretize, install, rewrite or execute."""
-    config = load_config() if config is None else config
+    config = resolved_config(load_config() if config is None else config, profile)
     if profile not in PROFILES:
         raise PaceError(f"unsupported PACE profile: {profile}")
     selected = config["profiles"][profile]
@@ -182,6 +204,8 @@ def check_lock(lock, profile, config=None):
     for name in ("cmake", "metis"):
         _, node = one(name, config[name]["version"], rooted=True)
         prefix(node, config[name]["prefix"])
+        if name == "metis":
+            parameters(node, config["metis"]["parameters"])
     prefix(gcc, config["compiler"]["prefix"])
     prefix(mpi, selected["mpi_prefix"])
     prefix(blas, config["openblas"]["prefix"])
@@ -217,21 +241,28 @@ def main(argv=None):
     parser.add_argument("--profile", choices=PROFILES, required=True)
     parser.add_argument("--root", type=Path)
     parser.add_argument("--recipe-root", type=Path)
+    parser.add_argument("--site-config", help="discovered site JSON, or - for stdin; defaults to lock's sibling site-packages.json")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--dry-run", action="store_true", help="print the manifest without creating files")
     modes.add_argument("--check-lock", type=Path, help="inspect an existing lock without modifying it")
     args = parser.parse_args(argv)
     try:
+        site_config = args.site_config
+        if site_config is None and args.check_lock:
+            site_config = args.check_lock.parent / "site-packages.json"
+        if site_config is None:
+            raise PaceError("provide --site-config from pace_discover.py; installation prefixes are not hard-coded")
+        config = json.load(sys.stdin) if site_config == "-" else json.loads(Path(site_config).read_text())
         if args.check_lock:
-            result = check_lock(json.loads(args.check_lock.read_text()), args.profile)
+            result = check_lock(json.loads(args.check_lock.read_text()), args.profile, config)
             print(json.dumps(result, sort_keys=True))
         else:
             if args.root is None or args.recipe_root is None:
                 parser.error("rendering requires --root ABS and --recipe-root ABS")
             if args.dry_run:
-                print(json.dumps(manifest(args.root, args.profile, args.recipe_root), indent=2))
+                print(json.dumps(manifest(args.root, args.profile, args.recipe_root, config), indent=2))
             else:
-                for path in write_environment(args.root, args.profile, args.recipe_root):
+                for path in write_environment(args.root, args.profile, args.recipe_root, config):
                     print(path)
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         print(f"ERROR: PACE manifest: {error}", file=sys.stderr)

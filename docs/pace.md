@@ -12,12 +12,12 @@ Initialize the pinned MFEM submodule after cloning:
 git submodule update --init tpl/mfem
 ```
 
-Use an absolute scratch output path and the installed Spack core checkout:
+Initialize the tested build Spack once. The driver queries its root with
+`spack location -r`; then use an absolute scratch output path:
 
 ```bash
 ./build.sh --site pace --a100 --hdg-runtime --submit \
-  --output-root /absolute/scratch/igrlab-build \
-  --spack-root /absolute/path/to/spack/core
+  --output-root /absolute/scratch/igrlab-build
 ```
 
 For a CPU build, replace `--a100` with `--cpu-only`. Add `--nvtx-profile` for CUDA
@@ -26,12 +26,24 @@ or `--no-tests` to compile only. `--no-tests` is a build result, not a validatio
 result. Use the same command without `--submit` inside an existing free compute
 allocation. Builds and timings must run on compute nodes.
 
-Spack can also be initialized in the login shell once; then `--spack-root` is
-optional. Alternatively set `IGRLAB_PACE_SPACK_ROOT`. The profile expects the
-separate builtin recipe checkout at `../packages/repos/spack_repo/builtin`
-relative to the Spack core directory; set `IGRLAB_PACE_RECIPE_ROOT` when the
-installation uses another layout. The tested tool is Spack `1.3.0.dev0`; the
-dependency environment retains its concrete lock between runs.
+For a shell without initialized build Spack, provide
+`--spack-root /absolute/path/to/spack/core` or set `IGRLAB_PACE_SPACK_ROOT`.
+The driver queries that tool's configured builtin recipes with
+`spack location --repo builtin`; it does not assume a recipe checkout layout.
+`IGRLAB_PACE_RECIPE_ROOT` remains an explicit override.
+The tested build tool is Spack `1.3.0.dev0`; the dependency environment retains
+its concrete lock between runs.
+
+The worker loads the selected compiler module inside the compute allocation,
+locates the shared Spack store from that compiler's resolved executable path,
+and queries it with the selected build Spack. This avoids PACE's `spack/latest`
+user store, which is separate from the shared store and uses an older database
+reader. The site definition contains version, variant, module and target
+constraints, with no installation prefixes or package hashes. The worker queries
+`spack find --json` and `spack location -i` for each selected external, verifies
+an unambiguous match, and writes the discovered paths into its local environment.
+Application and MFEM configuration then query `spack -e ENV location -i PACKAGE`.
+Missing or ambiguous site packages stop the build before compilation.
 
 `--submit` prints job IDs and log paths. Compilation uses `cpu-small`, one task,
 eight CPUs, 48 GiB and an eight-hour limit. When tests are enabled, a dependent
@@ -76,3 +88,16 @@ PACE CPU/A100 runs are the performance authority for this work. Local builds
 may verify compilation and correctness, but local RTX 5080 timings do not guide
 these optimizations. The site profile uses ordinary batch children and the
 validated MPI installation without overriding MPI transport components.
+
+The dependency setup follows Spack's documented environment model: retain
+`spack.yaml` and `spack.lock`, use ordinary `spack concretize` rather than forcing
+a fresh resolution on each build, and install the selected environment. See
+[Spack environments](https://spack.readthedocs.io/en/latest/environments.html#concretizing).
+Site packages use explicit external specs with `buildable: false`, so Spack
+cannot silently replace site MPI with another build; see
+[external packages](https://spack.readthedocs.io/en/latest/packages_yaml.html#external-packages).
+Prefixes come from Spack's
+[location command](https://spack.readthedocs.io/en/latest/command_index.html#spack-location).
+The generated `site-packages.json` records discovery for each profile. A changed
+site installation requires a new dependency root, preserving the existing lock
+and binaries until their replacements have been validated.

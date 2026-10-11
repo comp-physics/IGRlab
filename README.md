@@ -49,7 +49,7 @@ the scratch output path and Spack setup:
 
 ```bash
 ./build.sh --site pace --a100 --hdg-runtime --submit \
-  --output-root /absolute/scratch/igrlab-build --spack-root /path/to/spack/core
+  --output-root /absolute/scratch/igrlab-build
 ```
 
 Application and locally built MFEM outputs live outside the checkout. By default they are scoped under

@@ -103,6 +103,17 @@ print(9000 + count)
         self.assertFalse(self.output.exists())
         self.assertEqual(self.calls('sbatch'), [])
 
+    def test_login_node_refuses_compilation_before_discovery(self):
+        for allocation in ({}, {'SLURM_JOB_ID': '9000', 'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3',
+                                'SLURM_JOB_QOS': 'embers', 'SLURM_NTASKS': '1'}):
+            result = self.run_helper('--site', 'pace', '--cpu-only', '--no-tests',
+                                     '--output-root', str(self.output), '--spack-root', str(self.spack),
+                                     env=self.env | allocation)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('compute', result.stderr)
+            self.assertEqual(self.calls('build'), [])
+            self.assertFalse(self.output.exists())
+
     def test_other_gpu_architecture_rejected_before_submission(self):
         result = self.submit('--gpu', '--cuda-arch', '120')
         self.assertNotEqual(result.returncode, 0)
@@ -174,10 +185,13 @@ print(9000 + count)
         self.assertNotIn('--clean', check_args)
 
     def test_worker_rejects_paid_queue(self):
+        request = self.root / 'request.json'
+        request.write_text(json.dumps({'source': str(self.repo.resolve()), 'argv': ['--cpu-only']}))
         allocated = self.env | {'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3',
                                 'SLURM_JOB_QOS': 'inferno', 'SLURM_NTASKS': '1'}
-        result = self.run_helper('--worker', 'build', str(self.root / 'none'), env=allocated)
+        result = self.run_helper('--worker', 'build', str(request), env=allocated)
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn('free', result.stderr)
         self.assertEqual(self.calls('build'), [])
 
     def test_slurm_spool_copy_uses_original_checkout(self):

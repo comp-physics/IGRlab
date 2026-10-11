@@ -135,10 +135,6 @@ if [[ -z $pace_spack_root ]]; then
 fi
 pace_spack_root=$(realpath -e -- "$pace_spack_root")
 [[ -f $pace_spack_root/share/spack/setup-env.sh ]] || pace_fail "Spack shell setup is missing"
-pace_recipe_root=${IGRLAB_PACE_RECIPE_ROOT:-$(dirname -- "$pace_spack_root")/packages/repos/spack_repo/builtin}
-[[ -d $pace_recipe_root ]] || pace_fail "set IGRLAB_PACE_RECIPE_ROOT to the Spack builtin recipe repository"
-pace_recipe_root=$(realpath -e -- "$pace_recipe_root")
-
 if [[ $pace_submit == 1 ]]; then
   [[ -z ${SLURM_JOB_ID:-} ]] || pace_fail "--submit is for the login node; omit it inside an allocation"
   # Reject source/flag errors before occupying a queued compute allocation.
@@ -185,6 +181,14 @@ if [[ $pace_profile == cuda-sm80 && ($pace_tests == 1 || $pace_smoke == 1) ]]; t
   export DG_IGR_TEST_DEVICE=cuda
 fi
 type module >/dev/null 2>&1 || pace_fail "PACE environment modules are unavailable"
+# Query the selected build tool; do not assume a recipe checkout layout.
+pace_recipe_root=${IGRLAB_PACE_RECIPE_ROOT:-}
+if [[ -z $pace_recipe_root ]]; then
+  pace_recipe_root=$(SPACK_ROOT="$pace_spack_root" python3 "$pace_script_dir/pace_discover.py" \
+    --spack "$pace_spack_root/bin/spack" --recipe-root)
+fi
+[[ -d $pace_recipe_root ]] || pace_fail "Spack's builtin recipe repository is unavailable; configure it with spack repo add"
+pace_recipe_root=$(realpath -e -- "$pace_recipe_root")
 module purge
 mapfile -t pace_modules < <(python3 - "$pace_config" "$pace_profile" <<'PY'
 import json, sys
@@ -192,13 +196,14 @@ print('\n'.join(json.load(open(sys.argv[1]))['profiles'][sys.argv[2]]['modules']
 PY
 )
 module load "${pace_modules[@]}"
-mapfile -t pace_prefixes < <(python3 - "$pace_config" "$pace_profile" <<'PY'
-import json, sys
-c = json.load(open(sys.argv[1]))
-print(c['profiles'][sys.argv[2]]['mpi_prefix'])
-print(c['cuda_prefix'])
-PY
-)
+# The loaded compiler anchors discovery of the shared site store. Spack owns
+# its layout and package identities; no package prefixes are embedded here.
+pace_anchor=$(type -P gcc)
+[[ -x $pace_anchor ]] || pace_fail "compiler module did not expose GCC"
+pace_discovered=$(python3 "$pace_script_dir/pace_discover.py" --profile "$pace_profile" \
+  --spack "$pace_spack_root/bin/spack" --anchor "$pace_anchor")
+mapfile -t pace_prefixes < <(python3 -c 'import json, sys; c=json.load(sys.stdin); print(c["profiles"][sys.argv[1]]["mpi_prefix"]); print(c.get("cuda_prefix", ""))' \
+  "$pace_profile" <<<"$pace_discovered")
 pace_mpi=${pace_prefixes[0]} pace_cuda=${pace_prefixes[1]}
 export PATH="$pace_mpi/bin:$PATH" LD_LIBRARY_PATH="$pace_mpi/lib:${LD_LIBRARY_PATH:-}"
 [[ $(readlink -f "$(command -v mpicc)") == $(readlink -f "$pace_mpi/bin/mpicc") ]] || pace_fail "selected MPI wrapper mismatch"
@@ -225,7 +230,7 @@ fi
 # after preparing dependencies, so independent compilation can run concurrently.
 pace_prepare_dependency_lock
 python3 "$pace_script_dir/pace_manifest.py" --root "$pace_dependency_root" \
-  --profile "$pace_profile" --recipe-root "$pace_recipe_root"
+  --profile "$pace_profile" --recipe-root "$pace_recipe_root" --site-config - <<<"$pace_discovered"
 export TMPDIR="$pace_dependency_root/tmp" OMP_NUM_THREADS=1 CTEST_PARALLEL_LEVEL=1
 mkdir -p "$TMPDIR" "$SPACK_SYSTEM_CONFIG_PATH"
 printf '[site] PACE profile=%s target=x86_64_v3 MPI=%s account=%s qos=%s\n' \
