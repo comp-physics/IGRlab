@@ -224,6 +224,88 @@ else:
         with self.assertRaisesRegex(ValueError, 'changed'):
             prebuilt.verify(self.args)
 
+    def source_mesh_fixture(self, alias=False):
+        relative = Path('examples/dgsem_sedov_taylor_blast/sedov_taylor.msh')
+        mesh = self.repo / ('examples/sedov_taylor_blast/sedov_taylor.msh' if alias else relative)
+        self.put(mesh, '$MeshFormat\n2.2 0 8\n$EndMeshFormat\n')
+        source_mesh = self.repo / relative
+        if alias:
+            source_mesh.parent.mkdir(parents=True, exist_ok=True)
+            source_mesh.symlink_to('../sedov_taylor_blast/sedov_taylor.msh')
+        subprocess.run(['git', '-C', str(self.repo), 'add', '--', 'examples'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), '-c', 'user.name=Fixture',
+                        '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'tracked meshes'], check=True)
+        link = self.build / relative
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(mesh)
+        return mesh, source_mesh, link
+
+    def test_tracked_source_mesh_links_and_source_aliases_are_pinned(self):
+        for alias in (False, True):
+            with self.subTest(alias=alias):
+                mesh, source_mesh, link = self.source_mesh_fixture(alias)
+                receipt = prebuilt.write(self.args)
+                self.assertEqual(receipt['artifacts']['links'][str(link)],
+                                 {'link': str(mesh), 'target': str(mesh)})
+                self.assertEqual(receipt['artifacts']['files'][str(mesh)]['sha256'],
+                                 prebuilt.digest(mesh.read_bytes()))
+                prebuilt.verify(self.args)
+                result = self.run_driver('--test-regex', '^numerical$')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                link.unlink()
+                source_mesh.unlink()
+
+    def test_source_mesh_bytes_and_literal_link_mapping_cannot_drift(self):
+        mesh, _, link = self.source_mesh_fixture()
+        prebuilt.write(self.args)
+        original = mesh.read_bytes()
+        mesh.write_bytes(original + b'changed mesh')
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            prebuilt.verify(self.args)
+        mesh.write_bytes(original)
+        link.unlink()
+        link.symlink_to(os.path.relpath(mesh, link.parent))
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            prebuilt.verify(self.args)
+
+    def test_wrong_tracked_mesh_target_is_rejected_before_publication(self):
+        mesh, _, link = self.source_mesh_fixture()
+        other = self.repo / 'examples/other/other.msh'
+        self.put(other, mesh.read_bytes())
+        subprocess.run(['git', '-C', str(self.repo), 'add', '--', str(other)], check=True)
+        link.unlink()
+        link.symlink_to(other)
+        with self.assertRaisesRegex(ValueError, 'retargeted source mesh'):
+            prebuilt.write(self.args)
+
+    def test_unknown_untracked_and_outside_source_mesh_links_reject(self):
+        mesh, _, link = self.source_mesh_fixture()
+        for target in (self.repo / 'examples/unknown/unknown.msh', self.root / 'outside.msh'):
+            self.put(target, mesh.read_bytes())
+            link.unlink()
+            link.symlink_to(target)
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, 'source mesh'):
+                prebuilt.write(self.args)
+        link.unlink()
+        link.symlink_to(mesh)
+        subprocess.run(['git', '-C', str(self.repo), 'rm', '--cached', '--', str(mesh)], check=True, capture_output=True)
+        with self.assertRaisesRegex(ValueError, 'source mesh'):
+            prebuilt.write(self.args)
+
+    def test_runtime_executable_library_and_disguised_mesh_escapes_reject(self):
+        for name in ('external-executable', 'libexternal.so'):
+            external = self.root / name
+            self.put(external, 'external runtime bytes', executable=True)
+            link = self.build / name
+            link.symlink_to(external)
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'escapes its root'):
+                prebuilt.write(self.args)
+            link.unlink()
+        mesh, _, _ = self.source_mesh_fixture()
+        mesh.write_bytes(b'\x7fELF' + b'fake executable in mesh path')
+        with self.assertRaisesRegex(ValueError, 'runtime artifact'):
+            prebuilt.write(self.args)
+
     def test_source_drift_during_build_prevents_receipt_publication(self):
         self.args.expected_source = json.dumps(prebuilt.source_identity(self.repo))
         (self.repo / 'solver.cpp').write_text('changed during build')

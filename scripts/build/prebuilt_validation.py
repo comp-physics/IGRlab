@@ -95,10 +95,27 @@ def source_identity(root):
     return {'revision': head, 'fingerprint': digest(json.dumps(content, sort_keys=True).encode())}
 
 
-def artifacts(app_build, app_install, mfem_build, mfem_install, spack_env, cmake, mpi, hypre):
+def source_mesh_link(path, resolved, app_build, source, tracked):
+    """Admit the existing example mesh layout, preserving its exact mapping."""
+    relative = path.relative_to(app_build)
+    expected = source / relative
+    require(relative.parts[0] == 'examples' and relative.suffix == '.msh' and
+            relative.as_posix() in tracked and resolved.is_relative_to(source) and
+            resolved.suffix == '.msh' and resolved.relative_to(source).as_posix() in tracked and
+            expected.resolve(strict=True) == resolved and resolved.is_file() and
+            not resolved.stat().st_mode & 0o111,
+            f'unknown or retargeted source mesh link: {path}')
+    with resolved.open('rb') as stream:
+        require(not stream.read(8).startswith((b'\x7fELF', b'!<arch>\n')),
+                f'source mesh link targets a runtime artifact: {path}')
+
+
+def artifacts(app_build, app_install, mfem_build, mfem_install, spack_env, cmake, mpi, hypre, source):
     """Hash runtime bytes and configuration, excluding mutable test-result files."""
     roots = [exact_directory(p) for p in (app_build, app_install, mfem_build, mfem_install, spack_env)]
     app_build, app_install, mfem_build, mfem_install, spack_env = roots
+    source = exact_directory(source)
+    tracked = {os.fsdecode(name) for name in git(source, 'ls-files', '-z', '--cached').split(b'\0') if name}
     required = [app_build / 'CMakeCache.txt', app_build / 'CTestTestfile.cmake',
                 mfem_build / 'CMakeCache.txt', mfem_build / 'dg-igr-mfem-identity-v1.txt',
                 mfem_install / 'lib/libmfem.a',
@@ -115,7 +132,10 @@ def artifacts(app_build, app_install, mfem_build, mfem_install, spack_env, cmake
                 path = Path(directory) / name
                 if path.is_symlink():
                     resolved = path.resolve(strict=True)
-                    require(resolved.is_relative_to(root), f'artifact symlink escapes its root: {path}')
+                    if not resolved.is_relative_to(root):
+                        require(root == app_build and path.suffix == '.msh',
+                                f'artifact symlink escapes its root: {path}')
+                        source_mesh_link(path, resolved, app_build, source, tracked)
                     require(resolved.is_file(), f'artifact symlink does not resolve to a file: {path}')
                     links[str(path)] = {'link': os.readlink(path), 'target': str(resolved)}
                     selected.add(resolved)
@@ -185,7 +205,7 @@ def collect(args, mfem_paths=None):
             'mfem_source': source_identity(paths['mfem_source']),
             'artifacts': artifacts(paths['app_build'], paths['app_install'], paths['mfem_build'],
                                    paths['mfem_install'], paths['spack_env'], paths['cmake'],
-                                   paths['mpi'], paths['hypre'])}
+                                   paths['mpi'], paths['hypre'], paths['source'])}
 
 
 def write(args):
