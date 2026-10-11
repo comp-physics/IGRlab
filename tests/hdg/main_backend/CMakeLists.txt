@@ -492,7 +492,7 @@ set_tests_properties(
 
 if(TARGET sedov_taylor_blast)
   add_test(NAME dg_igr_hdg_main_backend_cpu_rodas3_igr_sedov_p1_rank1_fixed
-    COMMAND $<TARGET_FILE:sedov_taylor_blast>
+    COMMAND sedov_taylor_blast
       --discretization hdg
       --device cpu
       --regularization igr
@@ -1272,7 +1272,7 @@ if(MFEM_USE_CUDA)
   if(TARGET supersonic_cylinder_w_igr)
     add_test(
       NAME dg_igr_hdg_main_backend_cuda_tensor_backward_euler_cylinder_p2_rank1
-      COMMAND $<TARGET_FILE:supersonic_cylinder_w_igr>
+      COMMAND supersonic_cylinder_w_igr
         --discretization hdg
         --device cuda
         --hdg-cuda-engine tensor
@@ -1298,7 +1298,7 @@ if(MFEM_USE_CUDA)
 
     add_test(
       NAME dg_igr_hdg_main_backend_cuda_tensor_partitioned_backward_euler_cylinder_p2_rank1
-      COMMAND $<TARGET_FILE:supersonic_cylinder_w_igr>
+      COMMAND supersonic_cylinder_w_igr
         --discretization hdg
         --device cuda
         --hdg-cuda-engine tensor
@@ -1324,7 +1324,7 @@ if(MFEM_USE_CUDA)
 
     add_test(
       NAME dg_igr_hdg_main_backend_cuda_tensor_rodas3_cylinder_p2_rank1
-      COMMAND $<TARGET_FILE:supersonic_cylinder_w_igr>
+      COMMAND supersonic_cylinder_w_igr
         --discretization hdg
         --device cuda
         --hdg-cuda-engine tensor
@@ -1352,7 +1352,7 @@ if(MFEM_USE_CUDA)
   if(TARGET sedov_taylor_blast)
     add_test(
       NAME dg_igr_hdg_main_backend_cuda_tensor_rodas3_igr_sedov_p1_rank1_fixed
-      COMMAND $<TARGET_FILE:sedov_taylor_blast>
+      COMMAND sedov_taylor_blast
         --discretization hdg
         --device cuda
         --hdg-cuda-engine tensor

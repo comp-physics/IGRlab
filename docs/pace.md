@@ -52,6 +52,15 @@ validation requests one A100 on `gpu-a100`; CPU validation uses `cpu-small`.
 Compilation therefore does not occupy a GPU. The validation stage reruns the
 canonical driver with installed dependencies and existing build outputs.
 MPI tests use the selected site's `mpiexec` directly from the batch shell.
+Direct CTest executable tests linked to MFEM or MPI also use that launcher with
+one rank. The CPU OpenMPI 4 stack failed singleton MPI initialization in the
+observed Slurm batch runs; this launch rule also gives target tests a consistent
+MPI process manager in the GPU profile. Existing tests with explicit rank counts
+keep their commands.
+This uses CMake's `TEST_LAUNCHER` target property (CMake 3.29 or newer); script
+tests continue to control any subprocess launches themselves. The three VTK
+restart/lifecycle script families receive a PACE-only opt-in to use the selected
+MPI launcher for one rank; other configurations retain their direct launches.
 
 Inspect a plan without submitting or changing output directories:
 

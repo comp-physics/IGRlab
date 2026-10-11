@@ -1,6 +1,13 @@
 # IGRlab correctness tests. Historical dg_igr target/CTest names remain
 # transitional interfaces for existing scripts and retained evidence.
 
+set(_igrlab_serial_mpi_args "")
+if(IGRLAB_MPI_TEST_LAUNCHER)
+  set(_igrlab_serial_mpi_args --mpi-single-rank --mpi-ranks 1
+      --mpiexec "${MPIEXEC_EXECUTABLE}"
+      "--mpi-numproc-flag=${MPIEXEC_NUMPROC_FLAG}")
+endif()
+
 add_test(NAME dg_igr_cuda_build_policy
   COMMAND /usr/bin/env bash
           ${CMAKE_SOURCE_DIR}/tests/scripts/check_cuda_build_policy.sh
@@ -19,6 +26,13 @@ foreach(build_check pace_submission pace_manifest pace_discovery dependency_bind
     LABELS "build;contract;python;no-gpu"
     TIMEOUT 30)
 endforeach()
+
+add_test(NAME igrlab_mpi_test_launcher
+  COMMAND /usr/bin/env python3
+          ${CMAKE_SOURCE_DIR}/tests/scripts/test_mpi_test_launcher.py
+          --cmake ${CMAKE_COMMAND})
+set_tests_properties(igrlab_mpi_test_launcher PROPERTIES
+  LABELS "build;contract;python;no-gpu" TIMEOUT 30)
 
 add_test(NAME dg_igr_hdg_tensor_campaign_python
   COMMAND /usr/bin/env python3
@@ -562,7 +576,7 @@ if (MFEM_USE_CUDA)
   set(DG_IGR_EXACT_IID_DEVICE_PARITY_REF
       "${CMAKE_CURRENT_BINARY_DIR}/exact-iid-device-parity-reference.txt")
   add_test(NAME dg_igr_exact_iid_device_parity_cpu_reference
-    COMMAND $<TARGET_FILE:dg_igr_exact_iid_device_parity_test>
+    COMMAND dg_igr_exact_iid_device_parity_test
             cpu --write-reference ${DG_IGR_EXACT_IID_DEVICE_PARITY_REF}
   )
   set_tests_properties(dg_igr_exact_iid_device_parity_cpu_reference PROPERTIES
@@ -572,7 +586,7 @@ if (MFEM_USE_CUDA)
     RUN_SERIAL TRUE
   )
   add_test(NAME dg_igr_exact_iid_device_parity_cuda
-    COMMAND $<TARGET_FILE:dg_igr_exact_iid_device_parity_test>
+    COMMAND dg_igr_exact_iid_device_parity_test
             cuda --compare ${DG_IGR_EXACT_IID_DEVICE_PARITY_REF}
   )
   set_tests_properties(dg_igr_exact_iid_device_parity_cuda PROPERTIES
@@ -592,12 +606,10 @@ add_test(NAME dg_igr_dgsem_flux_tests COMMAND dg_igr_unit_tests --dgsem-flux)
 add_test(NAME dg_igr_dgsem_operator_tests COMMAND dg_igr_unit_tests --dgsem-operator)
 if(MFEM_USE_CUDA)
   add_test(NAME dg_igr_dgsem_operator_cuda
-    COMMAND ${CMAKE_COMMAND} -E env
-            DG_IGR_TEST_DEVICE=cuda
-            DG_IGR_DGSEM_DEVICE=cuda
-            $<TARGET_FILE:dg_igr_unit_tests> --dgsem-operator
+    COMMAND dg_igr_unit_tests --dgsem-operator
   )
   set_tests_properties(dg_igr_dgsem_operator_cuda PROPERTIES
+    ENVIRONMENT "DG_IGR_TEST_DEVICE=cuda;DG_IGR_DGSEM_DEVICE=cuda"
     LABELS "cuda;dgsem;production;llf"
     TIMEOUT 180
     RUN_SERIAL TRUE
@@ -614,7 +626,7 @@ add_test(NAME dg_igr_diagnostics_tests COMMAND dg_igr_unit_tests --diagnostics)
 
 if(TARGET dgsem_smooth_advection_periodic)
   add_test(NAME dg_igr_hdg_static_source_legacy_ignored_by_dgsem
-    COMMAND $<TARGET_FILE:dgsem_smooth_advection_periodic>
+    COMMAND dgsem_smooth_advection_periodic
             -dev cpu -rs 0 -rp 0 -o 1 -tf 1.0e-4 -dt 1.0e-4 -c 0.0
             -no-glvis -no-vtk -no-save-state -iprint 0
             --hdg-static-source 0.01
@@ -626,7 +638,7 @@ if(TARGET dgsem_smooth_advection_periodic)
   )
 
   add_test(NAME dg_igr_static_source_ordinary_dg_smoke
-    COMMAND $<TARGET_FILE:dgsem_smooth_advection_periodic>
+    COMMAND dgsem_smooth_advection_periodic
             -dev cpu -rs 0 -rp 0 -o 1 -tf 1.0e-4 -dt 1.0e-4 -c 0.0
             -no-glvis -no-vtk -no-save-state -iprint 0
             --dg-backend dg --static-source 0.01
@@ -642,6 +654,7 @@ if (TARGET supersonic_cylinder_w_igr)
   add_test(NAME dg_igr_sigma_vtk_lifecycle_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_sigma_vtk_lifecycle.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
             --device cpu
             --out-dir ${CMAKE_BINARY_DIR}/tests/sigma-vtk-lifecycle-cpu
@@ -657,6 +670,7 @@ if (TARGET supersonic_cylinder_w_igr)
   add_test(NAME dg_igr_vtk_restart_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
             --device cpu
             --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-cpu
@@ -672,6 +686,7 @@ if (TARGET supersonic_cylinder_w_igr)
   add_test(NAME dg_igr_vtk_restart_ssprk104_iidflux_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
             --device cpu
             --time-integrator ssprk104
@@ -690,6 +705,7 @@ if (TARGET supersonic_cylinder_w_igr)
     add_test(NAME dg_igr_vtk_restart_order${restart_order}_cpu
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
               --device cpu
               --order ${restart_order}
@@ -705,6 +721,7 @@ if (TARGET supersonic_cylinder_w_igr)
   add_test(NAME dg_igr_vtk_restart_cfl_save_boundary_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
             --device cpu
             --cfl-driven
@@ -720,6 +737,7 @@ if (TARGET supersonic_cylinder_w_igr)
     add_test(NAME dg_vtk_restart_no_igr_cpu
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:supersonic_cylinder>
               --device cpu
               --no-igr
@@ -734,6 +752,7 @@ if (TARGET supersonic_cylinder_w_igr)
     add_test(NAME dg_vtk_restart_ssprk104_no_igr_cpu
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:supersonic_cylinder>
               --device cpu
               --no-igr
@@ -790,6 +809,7 @@ if (TARGET supersonic_cylinder_w_igr)
     add_test(NAME dg_igr_sigma_vtk_lifecycle_cuda
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_sigma_vtk_lifecycle.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
               --device cuda
               --out-dir ${CMAKE_BINARY_DIR}/tests/sigma-vtk-lifecycle-cuda
@@ -803,6 +823,7 @@ if (TARGET supersonic_cylinder_w_igr)
     add_test(NAME dg_igr_vtk_restart_cuda
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
               --device cuda
               --out-dir ${CMAKE_BINARY_DIR}/tests/vtk-restart-cuda
@@ -816,6 +837,7 @@ if (TARGET supersonic_cylinder_w_igr)
     add_test(NAME dg_igr_vtk_restart_ssprk104_iidflux_cuda
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:supersonic_cylinder_w_igr>
               --device cuda
               --time-integrator ssprk104
@@ -833,6 +855,7 @@ if (TARGET supersonic_cylinder_w_igr)
       add_test(NAME dg_vtk_restart_ssprk104_no_igr_cuda
         COMMAND /usr/bin/env python3
                 ${CMAKE_SOURCE_DIR}/tests/scripts/check_vtk_restart.py
+                ${_igrlab_serial_mpi_args}
                 --exe $<TARGET_FILE:supersonic_cylinder>
                 --device cuda
                 --no-igr
@@ -908,6 +931,7 @@ if (TARGET dgsem_sedov_taylor_blast)
   add_test(NAME dgsem_vtk_restart_p1_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
             --device cpu
             --order 1
@@ -923,6 +947,7 @@ if (TARGET dgsem_sedov_taylor_blast)
   add_test(NAME dgsem_vtk_restart_p4_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
             --device cpu
             --order 4
@@ -937,6 +962,7 @@ if (TARGET dgsem_sedov_taylor_blast)
   add_test(NAME dgsem_vtk_restart_p3_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
             --device cpu
             --order 3
@@ -951,6 +977,7 @@ if (TARGET dgsem_sedov_taylor_blast)
   add_test(NAME dgsem_vtk_restart_extrapolated_llf_p1_cpu
     COMMAND /usr/bin/env python3
             ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+            ${_igrlab_serial_mpi_args}
             --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
             --device cpu
             --order 1
@@ -1010,6 +1037,7 @@ if (TARGET dgsem_sedov_taylor_blast)
     add_test(NAME dgsem_vtk_restart_p2_cuda
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
               --device cuda
               --order 2
@@ -1025,6 +1053,7 @@ if (TARGET dgsem_sedov_taylor_blast)
     add_test(NAME dgsem_vtk_restart_extrapolated_llf_p1_cuda
       COMMAND /usr/bin/env python3
               ${CMAKE_SOURCE_DIR}/tests/scripts/check_dgsem_vtk_restart.py
+              ${_igrlab_serial_mpi_args}
               --exe $<TARGET_FILE:dgsem_sedov_taylor_blast>
               --device cuda
               --order 1
@@ -1601,7 +1630,7 @@ function(add_example_regression test_name target mesh_path_rel)
     endif()
 
     add_test(NAME ${test_name}
-      COMMAND $<TARGET_FILE:${target}>
+      COMMAND ${target}
               -m ${CMAKE_SOURCE_DIR}/${mesh_path_rel}
               -rs 0 -rp 0 -o 1 -tf ${reg_tf} -dt ${reg_dt} -c 0.0
               -no-glvis -vs 1000000 -nan-scan

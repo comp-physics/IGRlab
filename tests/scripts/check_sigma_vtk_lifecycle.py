@@ -289,6 +289,8 @@ def main() -> int:
     parser.add_argument("--mpi-ranks", type=int, default=1)
     parser.add_argument("--mpiexec", default="mpirun")
     parser.add_argument("--mpi-numproc-flag", default="-np")
+    parser.add_argument("--mpi-single-rank", action="store_true",
+                        help="Use the selected MPI launcher even for one rank")
     parser.add_argument("--failure-control", action="store_true")
     parser.add_argument("--igr-stage-rtol-scale", type=float, default=1.0)
     args = parser.parse_args()
@@ -358,7 +360,7 @@ def main() -> int:
         "-save-state",
     ]
     command = app_command
-    if args.mpi_ranks > 1:
+    if args.mpi_ranks > 1 or args.mpi_single_rank:
         command = [
             args.mpiexec,
             args.mpi_numproc_flag,
