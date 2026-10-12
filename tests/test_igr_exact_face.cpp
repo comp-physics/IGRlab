@@ -13,8 +13,38 @@
 
 namespace
 {
-using namespace mfem;
-using namespace ::igrlab::dg_face;
+// Keep namespace directives out of this CUDA translation unit: NVCC's
+// generated global launch stubs spell igrlab unqualified, and importing mfem
+// also exposes its legacy mfem::igrlab extension namespace.
+using mfem::Array;
+using mfem::DenseMatrix;
+using mfem::DG_FECollection;
+using mfem::DGDiffusionIntegrator;
+using mfem::Element;
+using mfem::FaceQuadratureSpace;
+using mfem::FaceType;
+using mfem::FiniteElementSpace;
+using mfem::FunctionCoefficient;
+using mfem::Geometry;
+using mfem::IntegrationRule;
+using mfem::IntRules;
+using mfem::Mesh;
+using mfem::Ordering;
+using mfem::ParFiniteElementSpace;
+using mfem::ParGridFunction;
+using mfem::ParMesh;
+using mfem::Reshape;
+using mfem::Vector;
+using mfem::forall;
+using mfem::real_t;
+using ::igrlab::dg_face::AddInteriorFaceDGDiffusionApplyDevice2D;
+using ::igrlab::dg_face::BuildInteriorFaceDGDiffusionApplyData2D;
+using ::igrlab::dg_face::DGDiffusionFaceScaling;
+using ::igrlab::dg_face::InteriorFaceDGDiffusionApplyInfo;
+using ::igrlab::dg_face::InteriorFaceDGDiffusionApplyScratch;
+using ::igrlab::dg_face::InteriorFaceDGDiffusionGather2D;
+using ::igrlab::dg_face::InteriorFaceDGDiffusionRecord2D;
+using ::igrlab::dg_face::LaunchInteriorFaceDGDiffusionCoefficientUpdate2D;
 
 bool SameBits(const Vector& a, const Vector& b)
 {
