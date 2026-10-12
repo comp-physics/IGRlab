@@ -1569,6 +1569,81 @@ struct InteriorFaceDGDiffusionRecord2D
   }
 };
 
+// Native CUDA p3/Q4 specialization.  Each z slice in the (32,1,4) block is
+// one whole warp and owns one face, including the final incomplete batch.
+// Only independent side/q projections are parallelized: each projection
+// retains the original ascending-d sum, and each output retains its ascending-q
+// sum.  The subsequent deterministic element incidence gather is unchanged.
+struct InteriorFaceDGDiffusionRecord2DWarp
+{
+  InteriorFaceDGDiffusionRecord2D record;
+
+  MFEM_HOST_DEVICE void operator()(int face) const
+  {
+#if defined(MFEM_USE_CUDA) && defined(__CUDA_ARCH__)
+    const int lane = threadIdx.x;
+    auto S = mfem::Reshape(record.shape, 2, record.nq, record.dof, record.nf);
+    auto N = mfem::Reshape(record.weighted_normal_dshape,
+                           2, record.nq, record.dof, record.nf);
+    auto P = mfem::Reshape(record.penalty, record.nq, record.nf);
+    auto F = mfem::Reshape(record.face_elements, 2, record.nf);
+    auto D = mfem::Reshape(record.element_vdof_map,
+                           record.dof, record.vdim, record.ne);
+    auto C = mfem::Reshape(record.contribution, record.dof, 2, record.nf);
+
+    // Lanes 0..7 own the two sides at four quadrature points.  Initialize all
+    // lanes because every lane participates in each full-warp broadcast.
+    mfem::real_t value = 0.0;
+    mfem::real_t normal_flux = 0.0;
+    if (lane < 8)
+    {
+      const int side = lane / 4;
+      const int q = lane % 4;
+      const int e = F(side, face);
+      for (int d = 0; d < record.dof; ++d)
+      {
+        const mfem::real_t dof_value = record.x[D(d, 0, e)];
+        value += S(side, q, d, face) * dof_value;
+        normal_flux += N(side, q, d, face) * dof_value;
+      }
+    }
+
+    const int side = lane / 16;
+    const int d = lane % 16;
+    mfem::real_t sum = 0.0;
+    for (int q = 0; q < record.nq; ++q)
+    {
+      const mfem::real_t value0 = __shfl_sync(0xffffffffu, value, q);
+      const mfem::real_t value1 = __shfl_sync(0xffffffffu, value, q + 4);
+      const mfem::real_t normal0 = __shfl_sync(0xffffffffu, normal_flux, q);
+      const mfem::real_t normal1 = __shfl_sync(0xffffffffu, normal_flux, q + 4);
+      const mfem::real_t jump = value0 - value1;
+      const mfem::real_t avg_flux = normal0 + normal1;
+      const mfem::real_t penalty_jump = P(q, face) * jump;
+      if (side == 0)
+      {
+        const mfem::real_t y0 =
+          -S(0, q, d, face) * avg_flux +
+          record.ip_sigma * N(0, q, d, face) * jump +
+          S(0, q, d, face) * penalty_jump;
+        sum += y0;
+      }
+      else
+      {
+        const mfem::real_t y1 =
+          S(1, q, d, face) * avg_flux +
+          record.ip_sigma * N(1, q, d, face) * jump -
+          S(1, q, d, face) * penalty_jump;
+        sum += y1;
+      }
+    }
+    C(d, side, face) = sum;
+#else
+    record(face);
+#endif
+  }
+};
+
 struct InteriorFaceDGDiffusionGather2D
 {
   int dof = 0;
@@ -1730,7 +1805,19 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
   record.element_vdof_map = work.element_vdof_map.Read();
   record.x = scalar.Read();
   record.contribution = work.face_contribution.Write();
-  mfem::forall(info.nf, record);
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+  if (info.dof == 16 && info.nq == 4 &&
+      mfem::Device::Allows(mfem::Backend::CUDA) &&
+      !mfem::Device::Allows(mfem::Backend::RAJA_CUDA))
+  {
+    mfem::forall_2D_batch(
+      info.nf, 32, 1, 4, InteriorFaceDGDiffusionRecord2DWarp{record});
+  }
+  else
+#endif
+  {
+    mfem::forall(info.nf, record);
+  }
 
   InteriorFaceDGDiffusionGather2D gather;
   gather.dof = info.dof;

@@ -191,6 +191,30 @@ add_executable(dg_igr_unit_tests
   test_diagnostics.cpp
 )
 
+add_executable(dg_igr_exact_face_test test_igr_exact_face.cpp)
+target_link_libraries(dg_igr_exact_face_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_exact_face_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+set(_igrlab_exact_face_command dg_igr_exact_face_test)
+if(MPIEXEC_EXECUTABLE)
+  if(NOT MPIEXEC_NUMPROC_FLAG)
+    message(FATAL_ERROR "Exact face MPI test launcher requires MPIEXEC_NUMPROC_FLAG.")
+  endif()
+  set(_igrlab_exact_face_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_exact_face_test> ${MPIEXEC_POSTFLAGS})
+endif()
+add_test(NAME dg_igr_exact_face_cpu COMMAND ${_igrlab_exact_face_command} cpu)
+set_tests_properties(dg_igr_exact_face_cpu PROPERTIES
+  LABELS "igr;exact-face;parity;cpu" TIMEOUT 120)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  set_source_files_properties(test_igr_exact_face.cpp PROPERTIES LANGUAGE CUDA)
+  target_compile_options(dg_igr_exact_face_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  add_test(NAME dg_igr_exact_face_cuda COMMAND ${_igrlab_exact_face_command} cuda)
+  set_tests_properties(dg_igr_exact_face_cuda PROPERTIES
+    LABELS "igr;exact-face;parity;cuda" TIMEOUT 120 RUN_SERIAL TRUE)
+endif()
+
 add_executable(dg_igr_nodal_source_test test_igr_nodal_source.cpp)
 target_link_libraries(dg_igr_nodal_source_test PRIVATE igr_mfem mfem)
 target_include_directories(dg_igr_nodal_source_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
