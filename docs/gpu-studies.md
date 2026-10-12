@@ -182,8 +182,8 @@ closure launches about 128 blocks, enough to reach each A100 SM, but this alone
 does not establish efficient occupancy or saturation. HDG uses dense element
 blocks and a different trace solve, so its size must be assessed separately.
 Ten steps are an initial calibration horizon; check startup share and increase
-the horizon in a versioned suite when necessary. The active-IGR adapter
-currently admits CUDA only, so this ladder does not supply CPU IGR parity.
+the horizon in a versioned suite when necessary. This GPU size ladder does
+not itself supply CPU IGR parity.
 Native captures and their processing stay on PACE compute nodes. A larger
 trace can exceed the compact GPU activity export bound; retain that explicit
 unavailability rather than interpreting it as zero activity.
@@ -196,6 +196,18 @@ or suite does not rebuild the application. After a production change, build
 and validate that source through the canonical driver before comparing it
 with a freshly measured baseline. Commit each validated solver revision batch
 locally on the optimization branch; saved timings alone cannot admit a speedup.
+
+The [pace-igr-cpu-parity.json](../scripts/perf/suites/pace-igr-cpu-parity.json)
+companion pairs CPU and CUDA active IGR for ordinary DG and unfused DGSEM.
+Start with its four default 36-cell cases; the matching 1024-cell cases are
+optional selections with the `-n32` suffix. Both sizes retain order three and
+the same ten-step horizon, exact-face CG/Chebyshev policy, final closure
+certificate and five physical fields plus nonzero sigma. CPU and CUDA may
+need different Krylov iteration counts; accepted work, numerical policy and
+physical outputs must still agree. CPU execution uses one thread on the A100
+node's host. This is a paired backend comparison, not a CPU scaling study.
+The adapter excludes CPU HDG and CPU fused/tensor routes. Host fixtures cover
+the contract; successful native runs are still required to establish parity.
 
 Reports list every enabled frozen-suite case with its discretization, device,
 engine, DGSEM residual, timing scope, and individual timing/profile state.

@@ -139,6 +139,43 @@ class BackendStudyTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'ambiguous CPU reference'):
             self.run_timings(cases)
 
+    def test_cpu_active_igr_references_compare_sigma_with_independent_iteration_counts(self):
+        suite = study.study_workloads.load_suite(
+            Path(__file__).parent / 'suites/pace-igr-cpu-parity.json')
+        cases = study.selected_cases(suite)
+
+        def observe(runner, root, plan, admission, case, member, label, gpu, *, fields=False):
+            cpu = case['parameters']['device'] == 'cpu'
+            signature = {'parameters': case['parameters'],
+                         'work': {'steps': 10, 'accepted_attempts': 10, 'rejected_attempts': 0,
+                                  'rhs_evaluations': 30}, 'final_time': 1e-4,
+                         'igr': {'policy': 'same-fixed-cg-chebyshev', 'production_calls': 30,
+                                 'production_converged_calls': 30}}
+            return {'signature': signature, 'seconds': 1., 'scope': 'fixture',
+                    'igr_evidence': {'linear_counts': {'total_iters': 60 if cpu else 61}}}, self.root / label
+
+        def fields(case, left, right, source):
+            self.assertEqual(case['parameters']['regularization'], 'igr')
+            self.assertEqual((case['parameters']['rtol'], case['parameters']['atol']), (5e-8, 5e-9))
+            return {'passed': True, 'nontrivial_sigma': True,
+                    'arrays': {name: {'passed': True} for name in (*study.study_workloads.FIELDS, 'sigma')}}
+
+        with patch.object(study, 'observe', side_effect=observe), \
+                patch.object(study.study_workloads, 'compare_fields', side_effect=fields) as compare:
+            result = study.timings(self.root, self.plan, suite, {}, self.runner, {})
+        expected = {(f'{d}-igr-cpu-p3-n6', f'{d}-igr-cuda-p3-n6', m)
+                    for d in ('dg', 'dgsem') for m in study.MEMBERS}
+        actual = {(r['reference_case'], r['case'], r['member']) for r in result['backend_comparisons']}
+        self.assertEqual(actual, expected)
+        self.assertEqual(compare.call_count, 8)  # Four source pairs and four CPU/CUDA comparisons.
+        for comparison in result['backend_comparisons']:
+            self.assertTrue(comparison['accepted_work_equal'])
+            self.assertTrue(comparison['physical_fields']['nontrivial_sigma'])
+        for case in cases:
+            observation = result['cases'][case['id']]['exported_observations']['baseline']
+            self.assertEqual(observation['igr_evidence']['linear_counts']['total_iters'],
+                             60 if case['parameters']['device'] == 'cpu' else 61)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -16,6 +16,7 @@ SUITE = ROOT / 'scripts/perf/suites/pace-a100.json'
 BACKEND_SUITE = ROOT / 'scripts/perf/suites/pace-full-backends.json'
 GPU_SOLVER_SUITE = ROOT / 'scripts/perf/suites/pace-full-gpu-solvers.json'
 IGR_SUITE = ROOT / 'scripts/perf/suites/pace-full-gpu-igr.json'
+IGR_CPU_SUITE = ROOT / 'scripts/perf/suites/pace-igr-cpu-parity.json'
 GPU = {'uuid': 'GPU-00112233-4455-6677-8899-aabbccddeeff', 'name': 'NVIDIA A100-SXM4-80GB',
        'compute_capability': 80}
 
@@ -409,11 +410,90 @@ class WorkloadTests(unittest.TestCase):
         for changed in ({'regularization': 'none'}, {'regularization': 'igr', 'active_igr_wave': False},
                         {'regularization': 'igr', 'active_igr_wave': 1},
                         {'regularization': 'igr', 'c_alpha': 0}, {'regularization': 'igr', 'c_alpha': 2},
-                        {'regularization': 'igr', 'igr_alpha_length': 'average'},
-                        {'regularization': 'igr', 'device': 'cpu'}):
+                        {'regularization': 'igr', 'igr_alpha_length': 'average'}):
             case = copy.deepcopy(self.dg)
             case['parameters'].update(changed)
             with self.subTest(changed=changed), self.assertRaises(ValueError): workloads.parameters(case)
+
+    def test_cpu_active_igr_admits_only_ordinary_dg_and_unfused_dgsem(self):
+        for discretization in ('dg', 'dgsem'):
+            case = self.igr_case(discretization)
+            case['parameters']['device'] = 'cpu'
+            self.assertEqual(workloads.parameters(case)['device'], 'cpu')
+        for change in ({'discretization': 'hdg'}, {'engine': 'tensor'},
+                       {'discretization': 'dgsem', 'dgsem_residual': 'fused-simt'},
+                       {'discretization': 'dgsem', 'dgsem_residual': 'fused-dmma'},
+                       {'dgsem_residual': 'fused-simt'}, {'device': 'other'}):
+            case = self.igr_case()
+            case['parameters'].update({'device': 'cpu', **change})
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                workloads.parameters(case)
+
+    def test_cpu_igr_parity_suite_freezes_same_mesh_horizon_and_closure_policy(self):
+        suite = workloads.load_suite(IGR_CPU_SUITE)
+        base = workloads.load_suite(IGR_SUITE)
+        self.assertEqual((suite['repetitions'], suite['warmups']), (3, 1))
+        self.assertEqual(suite['correctness_regex'], base['correctness_regex'])
+        self.assertEqual(len(suite['cases']), 8)
+        self.assertEqual(sum(case['enabled'] for case in suite['cases']), 4)
+        self.assertEqual(sum(case['optional'] for case in suite['cases']), 4)
+        for point in (6, 32):
+            for discretization in ('dg', 'dgsem'):
+                cases = [next(case for case in suite['cases']
+                              if case['id'] == f'{discretization}-igr-{device}-p3-n{point}')
+                         for device in ('cpu', 'cuda')]
+                cpu, cuda = cases
+                self.assertEqual({key: value for key, value in cpu['parameters'].items() if key != 'device'},
+                                 {key: value for key, value in cuda['parameters'].items() if key != 'device'})
+                self.assertEqual(cpu['profile'], cuda['profile'])
+                source_case = next(case for case in base['cases']
+                                   if case['id'] == f'{discretization}-igr-cuda-p3')
+                self.assertEqual(cuda['profile'], source_case['profile'])
+                p = cpu['parameters']
+                self.assertEqual((p['order'], p['dt'], p['final_time'], p['serial_refine']),
+                                 (3, 1e-5, 1e-4, 0))
+                self.assertEqual((p['engine'], p['dgsem_residual']), ('ordinary', 'unfused'))
+                lines = (ROOT / p['mesh']).read_text().splitlines()
+                self.assertEqual(int(lines[lines.index('elements') + 1]), point * point)
+                self.assertEqual((cpu['enabled'], cpu['optional']), (point == 6, point == 32))
+                cpu_argv = workloads.command(cpu, Path('/binary'), ROOT, self.work)
+                cuda_argv = workloads.command(cuda, Path('/binary'), ROOT, self.work)
+                cpu_argv[cpu_argv.index('--device') + 1] = 'cuda'
+                self.assertEqual(cpu_argv, cuda_argv)
+                with mock.patch.dict(workloads.os.environ, {}, clear=True):
+                    cpu_env = workloads.environment(cpu, self.work)
+                    cuda_env = workloads.environment(cuda, self.work)
+                self.assertEqual(cpu_env.pop('OMP_NUM_THREADS'), '1')
+                self.assertEqual(cpu_env, cuda_env)
+
+    def test_cpu_active_igr_native_record_pattern_keeps_certificate_and_backend_gates(self):
+        # Native CPU/GPU closure records share this grammar. These are parser
+        # fixtures, not an assertion that the selected CPU workload has run.
+        suite = workloads.load_suite(IGR_CPU_SUITE)
+        closure = self.igr_log(output_calls=1).replace('601', '31').replace('600', '30').replace(
+            'total_iters=2401', 'total_iters=60').replace('time=0.002', 'time=0.0001')
+        for discretization in ('dg', 'dgsem'):
+            case = next(case for case in suite['cases'] if case['id'] == f'{discretization}-igr-cpu-p3-n6')
+            native = ('[dgsem-production] selected=mfem-native-packed strict=1 backend=cpu '
+                      'order=3 dim=2 volume_dissipation=none\n') if discretization == 'dgsem' else ''
+            log = ('[device] requested=cpu\n' + native +
+                   self.dg_log(steps=10, final=1e-4).replace('rhs_evaluations=800', 'rhs_evaluations=30') + closure)
+            self.stdout.write_text(log)
+            result = workloads.parse(case, self.stdout, self.stderr, None)
+            self.assertIn('CPU', result['scope'])
+            self.assertIsNone(result['gpu_uuid'])
+            self.assertEqual(result['igr_evidence']['production_converged_calls'], 30)
+            self.assertEqual(result['igr_evidence']['linear_counts']['output_only_calls'], 1)
+            for before, after in (('requested=cpu', 'requested=cuda'),
+                                  ('certified=1', 'certified=0'), ('supported=1', 'supported=0'),
+                                  ('production_converged_calls=30', 'production_converged_calls=29')):
+                self.stdout.write_text(log.replace(before, after))
+                with self.subTest(discretization=discretization, before=before), self.assertRaises(ValueError):
+                    workloads.parse(case, self.stdout, self.stderr, None)
+            if discretization == 'dgsem':
+                self.stdout.write_text(log.replace('backend=cpu', 'backend=cuda'))
+                with self.assertRaisesRegex(ValueError, 'production selection'):
+                    workloads.parse(case, self.stdout, self.stderr, None)
 
     def test_active_igr_environment_pins_reference_and_rejects_unowned_experiments(self):
         case = self.igr_case('dgsem')
@@ -455,10 +535,14 @@ class WorkloadTests(unittest.TestCase):
                    ('q_sigma_admitted=1', 'q_sigma_admitted=0'),
                    ('q_sigma_nonfinite_samples=0', 'q_sigma_nonfinite_samples=1'),
                    ('reason=active-igr-wave', 'reason=nonzero-static-source')]
-        for before, after in invalid:
-            self.stdout.write_text(self.dg_log() + self.igr_log().replace(before, after))
-            with self.subTest(before=before), self.assertRaises(ValueError):
-                workloads.parse(case, self.stdout, self.stderr, GPU)
+        for device in ('cuda', 'cpu'):
+            case['parameters']['device'] = device
+            prefix = '[device] requested=cpu\n' if device == 'cpu' else ''
+            for before, after in invalid:
+                self.stdout.write_text(prefix + self.dg_log() + self.igr_log().replace(before, after))
+                with self.subTest(device=device, before=before), self.assertRaises(ValueError):
+                    workloads.parse(case, self.stdout, self.stderr, GPU if device == 'cuda' else None)
+        case['parameters']['device'] = 'cuda'
         self.stdout.write_text(self.dg_log())
         with self.assertRaisesRegex(ValueError, 'missing/duplicate'):
             workloads.parse(case, self.stdout, self.stderr, GPU)
@@ -484,14 +568,18 @@ class WorkloadTests(unittest.TestCase):
         write_fields(left, sigma=0.01)
         right = self.work / 'right'
         write_fields(right, sigma=0.01)
-        result = workloads.compare_fields(case, left, right, ROOT)
-        self.assertTrue(result['nontrivial_sigma'])
-        self.assertEqual(set(result['arrays']), set(workloads.FIELDS) | {'sigma'})
+        for device in ('cuda', 'cpu'):
+            case['parameters']['device'] = device
+            result = workloads.compare_fields(case, left, right, ROOT)
+            self.assertTrue(result['nontrivial_sigma'])
+            self.assertEqual(set(result['arrays']), set(workloads.FIELDS) | {'sigma'})
         for name, sigma in (('missing', None), ('zero', 0), ('nonfinite', float('nan')), ('different', 0.02)):
             directory = self.work / name
             write_fields(directory, sigma=sigma)
-            with self.subTest(name=name), self.assertRaises(ValueError):
-                workloads.compare_fields(case, left, directory, ROOT)
+            for device in ('cuda', 'cpu'):
+                case['parameters']['device'] = device
+                with self.subTest(device=device, name=name), self.assertRaises(ValueError):
+                    workloads.compare_fields(case, left, directory, ROOT)
 
     def test_cpu_dg_admission_does_not_require_gpu_identity(self):
         case = copy.deepcopy(self.dg)
