@@ -343,6 +343,102 @@ class MetricTests(unittest.TestCase):
 
 
 class CaptureTests(unittest.TestCase):
+    def test_requested_ncu_does_not_discover_or_execute_nsys(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary)
+            directory.mkdir()
+            retained = directory / 'capture-nsys.nsys-rep'
+            retained.write_bytes(b'previous completed Nsys stays untouched')
+            snapshots = []
+            case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+            with patch.object(profiles, '_tool', return_value=tool) as discover, \
+                    patch.object(profiles, 'gpu_identity', return_value=GPU):
+                value = profiles.capture(case, ['app'], runner, directory, GPU,
+                                         requested_tools=('ncu',), checkpoint=snapshots.append)
+            self.assertEqual(discover.call_args_list[0].args, ('ncu',))
+            self.assertEqual(discover.call_count, 1)
+            self.assertTrue(runner.commands)
+            self.assertFalse(any('nsys' in label for label, argv, timeout in runner.commands))
+            self.assertEqual(value['requested_tools'], ['ncu'])
+            self.assertEqual(set(value['captures']), {'ncu'})
+            self.assertEqual(set(value['tools']), {'ncu'})
+            self.assertEqual(value['status'], 'complete')
+            self.assertEqual([row['captures']['ncu']['status'] for row in snapshots], ['pending', 'complete'])
+            self.assertEqual(retained.read_bytes(), b'previous completed Nsys stays untouched')
+
+    def test_requested_nsys_does_not_discover_or_execute_ncu(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary)
+            directory.mkdir()
+            retained = directory / 'capture-ncu.ncu-repz'
+            retained.write_bytes(b'previous completed NCU stays untouched')
+            case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+            with patch.object(profiles, '_tool', return_value=tool) as discover, \
+                    patch.object(profiles, 'gpu_identity', return_value=GPU):
+                value = profiles.capture(case, ['app'], runner, directory, GPU, requested_tools=['nsys'])
+            self.assertEqual(discover.call_args_list[0].args, ('nsys',))
+            self.assertEqual(discover.call_count, 1)
+            self.assertFalse(any('ncu' in label for label, argv, timeout in runner.commands))
+            self.assertEqual(value['requested_tools'], ['nsys'])
+            self.assertEqual(set(value['captures']), {'nsys'})
+            self.assertEqual(set(value['tools']), {'nsys'})
+            self.assertEqual(value['status'], 'complete')
+            self.assertEqual(retained.read_bytes(), b'previous completed NCU stays untouched')
+
+    def test_tool_logs_bind_each_completed_application_receipt_and_gpu(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary)
+            case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+            with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU):
+                value = profiles.capture(case, ['app'], runner, directory, GPU)
+            self.assertEqual(value['requested_tools'], ['nsys', 'ncu'])
+            self.assertEqual({logs['tool'] for logs in value['application_logs']}, {'nsys', 'ncu'})
+            for name in ('nsys', 'ncu'):
+                capture = value['captures'][name]
+                self.assertEqual(capture['gpu_uuid'], UUID)
+                self.assertEqual(len(capture['application_logs']), 1)
+                logs = capture['application_logs'][0]
+                self.assertEqual(logs['tool'], name)
+                self.assertIn(logs, value['application_logs'])
+                for key in ('stdout', 'stderr', 'receipt'):
+                    self.assertEqual(logs[key + '_sha256'], profiles.sha256(logs[key]))
+                Path(logs['stderr']).write_text('changed retained application error')
+                self.assertNotEqual(logs['stderr_sha256'], profiles.sha256(logs['stderr']))
+
+    def test_invalid_requested_tools_reject_before_queries_or_output(self):
+        for requested in ((), [], 'ncu', ('nsys', 'nsys'), ('other',), (True,), {'ncu'}):
+            with self.subTest(requested=requested), patch.object(profiles, '_tool') as discover, \
+                    patch.object(profiles, 'gpu_identity') as identity, self.assertRaises(profiles.ProfileError):
+                profiles.capture({}, ['app'], None, Path('/not-used'), GPU, requested_tools=requested)
+            discover.assert_not_called()
+            identity.assert_not_called()
+
+    def test_requested_missing_tool_remains_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary)
+            with patch.object(profiles, '_tool', return_value=None), patch.object(profiles, 'gpu_identity', return_value=GPU):
+                value = profiles.capture({'adapter': 'dg', 'profile': {'kernel_regex': 'Mass'}},
+                                         ['app'], runner, directory, GPU, requested_tools=('ncu',))
+            self.assertEqual(value['status'], 'unavailable')
+            self.assertEqual(set(value['captures']), {'ncu'})
+            self.assertEqual(value['captures']['ncu']['status'], 'unavailable')
+            self.assertEqual(value['captures']['ncu']['gpu_uuid'], UUID)
+            self.assertFalse(runner.commands)
+
+    def test_requested_nsys_failure_checkpoints_honest_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary, fail='profiles/nsys')
+            snapshots = []
+            with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU), \
+                    self.assertRaises(profiles.ProfileError):
+                profiles.capture({'adapter': 'dg', 'profile': {'kernel_regex': 'Mass'}}, ['app'], runner,
+                                 directory, GPU, requested_tools=('nsys',), checkpoint=snapshots.append)
+            self.assertEqual(len(snapshots), 1)
+            self.assertEqual(snapshots[0]['captures']['nsys']['status'], 'failed')
+            self.assertEqual(snapshots[0]['captures']['nsys']['gpu_uuid'], UUID)
+            self.assertEqual(snapshots[0]['application_logs'], [])
+            self.assertNotIn('ncu', snapshots[0]['captures'])
+
     def test_completed_nsys_checkpoint_precedes_ncu_and_is_independent(self):
         with tempfile.TemporaryDirectory() as temporary:
             tool, runner, directory = self.setup_capture(temporary)

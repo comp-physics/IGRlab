@@ -575,13 +575,21 @@ def _kernel_id_regex(expression):
 
 
 def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: dict,
-            *, environment=None, checkpoint=None) -> dict:
+            *, environment=None, checkpoint=None, requested_tools=None) -> dict:
     """Capture a bounded selection; caller validates application logs.
 
     An optional checkpoint receives independent partial snapshots before NCU
     starts and if it fails, so completed Nsys analysis survives that failure.
+    An explicit requested_tools selection runs only those native tools; omitted
+    tools are absent from the result and are never counted as completed.
     """
     require(checkpoint is None or callable(checkpoint), 'capture checkpoint must be callable')
+    if requested_tools is None:
+        requested_tools = ('nsys', 'ncu')
+    require(isinstance(requested_tools, (tuple, list)) and requested_tools and
+            all(isinstance(name, str) and name in {'nsys', 'ncu'} for name in requested_tools) and
+            len(set(requested_tools)) == len(requested_tools), 'invalid requested profiler tools')
+    requested_tools = tuple(name for name in ('nsys', 'ncu') if name in requested_tools)
     adapter = case.get('adapter')
     profile = case.get('profile', {})
     require(adapter in {'hdg', 'dg', 'dgsem'} and isinstance(profile, dict), 'unsupported study profiler adapter')
@@ -653,15 +661,20 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
     require(observed['uuid'] == expected_gpu.get('uuid') and observed['compute_capability'] == 80,
             'capture GPU differs from admitted allocation')
     result = {'status': 'partial', 'adapter': adapter, 'gpu_uuid': observed['uuid'],
+              'requested_tools': list(requested_tools),
               'scope': 'selected measured step zero' if adapter == 'hdg' else 'whole application capture with bounded NCU selection',
               'primary_timing': False, 'selected_kernel_regex': regex, 'launch_skip': skip,
               'launch_count': count, 'selection': selection, 'required_kernel_groups': groups,
               'ncu_kernel_id_regex': selector_regex,
               'tools': {}, 'captures': {}, 'application_logs': []}
-    tools = {name: _tool(profile.get(name, name)) for name in ('nsys', 'ncu')}
+    tools = {name: _tool(profile.get(name, name)) if name in requested_tools else None
+             for name in ('nsys', 'ncu')}
     for name, tool in tools.items():
+        if name not in requested_tools:
+            continue
         if tool is None:
-            result['captures'][name] = {'status': 'unavailable', 'reason': 'profiler executable unavailable'}
+            result['captures'][name] = {'status': 'unavailable', 'gpu_uuid': observed['uuid'],
+                                        'reason': 'profiler executable unavailable'}
             continue
         # NCU otherwise composes sections from config.ncu-cfg in cwd/home with
         # explicit CLI sections, which can silently expand this bounded study.
@@ -672,7 +685,14 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
                                 'help_stdout': artifact(help_log / 'stdout.log')}
         if name == 'ncu':
             result['tools'][name]['config_file'] = 'off (explicit)'
-    if tools['nsys']:
+    def application_log(name, log):
+        return {'tool': name, 'stdout': str(log / 'stdout.log'), 'stderr': str(log / 'stderr.log'),
+                'receipt': str(log / 'result.json'),
+                'stdout_sha256': artifact(log / 'stdout.log', allow_empty=True)['sha256'],
+                'stderr_sha256': artifact(log / 'stderr.log', allow_empty=True)['sha256'],
+                'receipt_sha256': artifact(log / 'result.json')['sha256']}
+
+    def capture_nsys():
         tool = tools['nsys']
         capability_log = run('tools/nsys-environment', [str(tool), 'status', '--environment'], 20, allow_failure=True)
         capability_exit = json.loads((capability_log / 'result.json').read_text())['returncode']
@@ -729,7 +749,9 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
             with trace.open(newline='') as stream:
                 activity = parse_nsys_gpu_activity(stream, expected_events)
             activity['statistics_csv'] = artifact(trace)
-        result['captures']['nsys'] = {'status': 'complete', 'native': native,
+        logs = application_log('nsys', log)
+        result['captures']['nsys'] = {'status': 'complete', 'gpu_uuid': observed['uuid'], 'native': native,
+            'application_logs': [logs],
             'application_stdout': str(log / 'stdout.log'), 'application_stderr': str(log / 'stderr.log'),
             'application_stdout_sha256': sha256(log / 'stdout.log'),
             'statistics': statistics, 'host_summaries': host_summaries, 'gpu_activity': activity,
@@ -743,8 +765,7 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
                 'CPU sampling is disabled; uninstrumented CPU work has no sampled stack attribution',
                 'NVTX and projected ranges may overlap and do not define startup/solve phases unless source annotates them',
                 'CUDA API, GPU kernel, memory, OSRT and NVTX durations overlap; never sum them into solver wall time']}
-        result['application_logs'].append({'stdout': str(log / 'stdout.log'), 'stderr': str(log / 'stderr.log'),
-                                           'receipt': str(log / 'result.json')})
+        result['application_logs'].append(logs)
     def save_checkpoint():
         for name, identity in result['tools'].items():
             require(sha256(identity['executable']['path']) == identity['executable']['sha256'],
@@ -754,7 +775,14 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
             checkpoint(deepcopy(result))
 
     if tools['ncu']:
-        result['captures']['ncu'] = {'status': 'pending'}
+        result['captures']['ncu'] = {'status': 'pending', 'gpu_uuid': observed['uuid']}
+    if tools['nsys']:
+        try:
+            capture_nsys()
+        except Exception as error:
+            result['captures']['nsys'] = {'status': 'failed', 'gpu_uuid': observed['uuid'], 'error': str(error)}
+            save_checkpoint()
+            raise
     save_checkpoint()
 
     def capture_ncu():
@@ -767,7 +795,8 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
         metrics_log = run('tools/ncu-metrics', [*tool_command, '--query-metrics', '--query-metrics-mode', 'all', '--devices', '0'], 30)
         queried = _available_names((metrics_log / 'stdout.log').read_text(), (DURATION, DMMA))
         if missing or DURATION not in queried:
-            result['captures']['ncu'] = {'status': 'unavailable', 'reason': 'required NCU diagnostics unavailable',
+            result['captures']['ncu'] = {'status': 'unavailable', 'gpu_uuid': observed['uuid'],
+                'reason': 'required NCU diagnostics unavailable',
                 'missing_sections': missing, 'duration_metric_available': DURATION in queried}
         else:
             prefix = directory / 'capture-ncu'
@@ -805,7 +834,9 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
                             for row in normalized['launches']]
             missing_core = [row for row in missing_core if row['missing']]
             count_complete = selection == 'first-per-kernel' or normalized['observed_launches'] == count
-            result['captures']['ncu'] = {'status': 'partial' if missing_core or not count_complete else 'complete', 'native': native,
+            logs = application_log('ncu', log)
+            result['captures']['ncu'] = {'status': 'partial' if missing_core or not count_complete else 'complete',
+                'gpu_uuid': observed['uuid'], 'native': native, 'application_logs': [logs],
                 'application_stdout': str(log / 'stdout.log'), 'application_stderr': str(log / 'stderr.log'),
                 'application_stdout_sha256': sha256(log / 'stdout.log'), 'sections': selected,
                 'unavailable_optional_sections': [name for name in OPTIONAL_SECTIONS if name not in selected],
@@ -824,15 +855,15 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
                     'cache_control': 'native default; unspecified by command',
                     'default_authority': result['tools']['ncu']['help_stdout'],
                     'observed_solver_clocks': False}}
-            result['application_logs'].append({'stdout': str(log / 'stdout.log'), 'stderr': str(log / 'stderr.log'),
-                                               'receipt': str(log / 'result.json')})
+            result['application_logs'].append(logs)
     if tools['ncu']:
         try:
             capture_ncu()
         except Exception as error:
-            result['captures']['ncu'] = {'status': 'failed', 'error': str(error)}
+            result['captures']['ncu'] = {'status': 'failed', 'gpu_uuid': observed['uuid'], 'error': str(error)}
             save_checkpoint()
             raise
+        save_checkpoint()
     for name, identity in result['tools'].items():
         require(sha256(identity['executable']['path']) == identity['executable']['sha256'],
                 f'{name} executable changed during capture')
