@@ -458,7 +458,10 @@ class StudyImportTests(unittest.TestCase):
     def test_historical_executor_sets_remain_explicit(self):
         self.assertEqual(len(gpu_study.LEGACY_EXECUTOR_FILES), 5)
         self.assertEqual(len(gpu_study.PRE_IMPORT_EXECUTOR_FILES), 6)
-        self.assertEqual(len(gpu_study.EXECUTOR_FILES), 8)
+        self.assertEqual(len(gpu_study.PRE_CPU_CONTINUATION_EXECUTOR_FILES), 8)
+        self.assertEqual(len(gpu_study.EXECUTOR_FILES), 9)
+        self.assertEqual(gpu_study.EXECUTOR_FILES,
+                         gpu_study.PRE_CPU_CONTINUATION_EXECUTOR_FILES + ('study_cpu_continuation.py',))
 
     def test_current_changed_production_source_cannot_be_bound_to_old_build(self):
         (self.source / 'production.cpp').write_text('new-unbuilt-source')

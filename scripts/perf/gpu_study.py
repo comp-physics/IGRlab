@@ -35,6 +35,7 @@ import study_admit
 import study_import
 import study_profiles
 import study_workloads
+import study_cpu_continuation
 
 SCHEMA = 1
 MEMBERS = ('baseline', 'candidate')
@@ -42,6 +43,8 @@ PRE_IMPORT_EXECUTOR_FILES = ('gpu_study.py', 'study_build.py', 'study_profiles.p
                   'study_workloads.py', 'pace_runtime.sh', 'study_admit.py')
 LEGACY_EXECUTOR_FILES = tuple(name for name in PRE_IMPORT_EXECUTOR_FILES if name != 'study_admit.py')
 EXECUTOR_FILES = PRE_IMPORT_EXECUTOR_FILES + ('study_import.py', 'canonical_test_result_receipt.py')
+PRE_CPU_CONTINUATION_EXECUTOR_FILES = EXECUTOR_FILES
+EXECUTOR_FILES += ('study_cpu_continuation.py',)
 CPU_CORRECTNESS_REGEX = ('^(hdg_generic_euler_cpu_rank1|'
                         'dg_igr_hdg_main_backend_cpu_igr_p(1|3)_rank1_cfl|'
                         'dg_igr_hdg_main_backend_igr_vtk_cpu_rank1|'
@@ -247,6 +250,10 @@ def verify(root, *, binaries=False):
         artifact = absolute(path)
         if not artifact.is_file() or sha(artifact) != expected:
             raise RuntimeError(f'retained profile metadata changed: {artifact}')
+    for path, expected in plan.get('cpu_timing_continuation', {}).get('artifact_sha256', {}).items():
+        artifact = absolute(path)
+        if artifact.is_symlink() or not artifact.is_file() or sha(artifact) != expected:
+            raise RuntimeError(f'retained CPU timing evidence changed: {artifact}')
     if binaries:
         admission = read_json(root / 'admission.json')
         if admission['plan_sha256'] != plan['plan_sha256']:
@@ -1195,6 +1202,8 @@ def worker(args):
             if args.stage != 'timings':
                 raise RuntimeError('CPU-only studies have no GPU profiling stage')
         state = read_json(root / 'state.json')
+        if plan.get('cpu_timing_continuation') and state['attempts']:
+            raise RuntimeError('CPU continuation has already attempted work; continue missing labels into a new run')
         if completed(state, args.stage):
             raise RuntimeError('stage already complete; create a new study for new measurements')
         if args.stage == 'profiles' and not completed(state, 'timings'):
@@ -1216,6 +1225,8 @@ def worker(args):
                    'plan_sha256': plan['plan_sha256'], 'directory': str(output)}
         if cpu:
             attempt['cpu_allocation'] = cpu
+            if plan.get('cpu_timing_continuation'):
+                attempt['cpu_host'] = study_cpu_continuation.host()
         state['attempts'].append(attempt)
         write_json(root / 'state.json', state)
         try:
@@ -1226,8 +1237,11 @@ def worker(args):
             runner = Runner(output, budget,
                             suite.get('command_timeout_seconds', 300))
             attempt['hardware_before'] = hardware_snapshot(runner, 'before', gpu)
-            function = timings if args.stage == 'timings' else profiles
-            summary = function(root, plan, suite, admission, runner, gpu)
+            if plan.get('cpu_timing_continuation'):
+                summary = study_cpu_continuation.execute(sys.modules[__name__], root, plan, suite, admission, runner)
+            else:
+                function = timings if args.stage == 'timings' else profiles
+                summary = function(root, plan, suite, admission, runner, gpu)
             attempt['hardware_after'] = hardware_snapshot(runner, 'after', gpu)
             summary['hardware_snapshots'] = {'before': attempt['hardware_before'],
                                              'after': attempt['hardware_after']}
@@ -1253,6 +1267,8 @@ def resume(args):
     root = absolute(args.run_dir)
     with locked(root):
         plan = verify(root, binaries=(root / 'admission.json').exists())
+        if plan.get('cpu_timing_continuation') and read_json(root / 'state.json')['attempts']:
+            raise RuntimeError('CPU continuation cannot resume in place; use continue-timings in a new run')
         if cpu_only(plan) and args.stage != 'timings':
             raise RuntimeError('CPU-only imported studies can resume timings only')
         if args.stage == 'builds':
@@ -1611,7 +1627,7 @@ def retry(args):
         if cpu_only(plan):
             raise ValueError('CPU-only studies use a fresh import for new measurements; resume retains incomplete timings')
         state = read_json(old / 'state.json')
-        if set(plan['executor_sha256']) not in (set(EXECUTOR_FILES), set(PRE_IMPORT_EXECUTOR_FILES),
+        if set(plan['executor_sha256']) not in (set(EXECUTOR_FILES), set(PRE_CPU_CONTINUATION_EXECUTOR_FILES), set(PRE_IMPORT_EXECUTOR_FILES),
                                                set(LEGACY_EXECUTOR_FILES)):
             raise RuntimeError('old run lacks the complete frozen executor identity')
         old_suite = study_workloads.load_suite(old / 'suite.json')
@@ -1826,6 +1842,8 @@ def report(root):
     if plan.get('import_origin'):
         result['canonical_import'] = plan['import_origin']
     result['timing_provenance'] = plan.get('timing_reuse', {'scope': 'fresh timing observations in this run'})
+    if plan.get('cpu_timing_continuation'):
+        result['timing_provenance'] = plan['cpu_timing_continuation']
     if plan.get('profile_continuation'):
         result['profile_provenance'] = {'scope': plan['profile_continuation']['scope'],
             'original_run_dir': plan['profile_continuation']['run_dir'],
@@ -1890,6 +1908,10 @@ def report(root):
         lines += ['Timings reused byte-for-byte from `' + plan['timing_reuse']['run_dir'] +
                   '`; this retry collects ' + ('only missing profiler tools' if plan.get('profile_continuation') else 'fresh profiles') +
                   ' and no new timing measurements.', '']
+    if plan.get('cpu_timing_continuation'):
+        lines += ['Successful CPU process observations are retained from the immutable original run; only missing labels execute. '
+                  'Pairs have individual allocation provenance. This is not a homogeneous single-host cohort; split-allocation pairs are not matched hardware. '
+                  'Original warmups are retained; no new-allocation warmup is added.', '']
     if plan.get('profile_continuation'):
         lines += ['Completed tool captures are retained with their original GPU identities. '
                   'Continuation captures have their own GPU identities; these diagnostics do not claim matched profiler timing or speedup.', '']
@@ -1920,7 +1942,8 @@ def report(root):
     else:
         lines.append('Timings have not completed.')
     if comparison_kind == 'identical-source-control' and result['timings']:
-        lines += ['', 'Observed control repeatability (same source, same allocation):', '',
+        lines += ['', ('Observed control repeatability (same source; allocation cohorts recorded):'
+                      if plan.get('cpu_timing_continuation') else 'Observed control repeatability (same source, same allocation):'), '',
                   '| Case | Independent pairs | Median absolute paired offset | Maximum absolute paired offset | Baseline / candidate CV |',
                   '|---|---:|---:|---:|---:|']
         for name, stats in result['repeatability']['cases'].items():
@@ -2028,6 +2051,13 @@ def main(argv=None):
                    help='verify sealed canonical artifacts and Passed receipts without querying historical job accounting; live compute and numerical admission remain required')
     p.add_argument('--cpu-only', action='store_true',
                    help='import CPU-profile builds for CPU full-application cases; submit only one free cpu-small timing job, without GPU/profiling jobs')
+    p = sub.add_parser('continue-timings', help='continue only missing imported CPU timing processes in a new immutable run')
+    p.add_argument('--from-run', required=True)
+    p.add_argument('--run-dir', required=True)
+    p.add_argument('--prepare-only', action='store_true')
+    p.add_argument('--reuse-validated-artifacts', action='store_true',
+                   help='required: retain sealed Passed canonical artifacts without querying historical accounting')
+    p.add_argument('--timings-time', type=wall_time)
     p = sub.add_parser('retry', help='freeze a new measurement executor using verified completed builds/correctness')
     p.add_argument('--from-run', required=True)
     p.add_argument('--run-dir', required=True, help='new absolute scratch directory')
@@ -2057,6 +2087,8 @@ def main(argv=None):
         import_existing(args)
     elif args.command == 'retry':
         retry(args)
+    elif args.command == 'continue-timings':
+        study_cpu_continuation.prepare(sys.modules[__name__], args)
     elif args.command == 'worker':
         worker(args)
     elif args.command == 'resume':
