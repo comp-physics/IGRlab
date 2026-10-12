@@ -269,9 +269,15 @@ def command(case, binary: Path, source: Path, workdir: Path, *, profile=False, f
     return [str(binary), '--n', str(p['n']), '--elements', str(p['elements']), '--iterations', str(p['iterations'])]
 
 
-def environment(case, workdir, fields=False):
+def environment(case, workdir, fields=False, *, profile=False):
+    require(not (profile and fields), 'profile and field export are separate calls')
     p = parameters(case)
     result = {'DG_IGR_VTK_PREFIX_PATH': str(Path(workdir) / 'vtk')} if case['adapter'] == 'dg' and fields else {}
+    if case['adapter'] == 'dg':
+        # Keep primary timings and field exports free of instrumentation even
+        # when the interactive shell inherited a profiling opt-in.
+        enabled = '1' if profile and p['device'] == 'cuda' else '0'
+        result.update(IGRLAB_PROFILE_NVTX=enabled, DG_IGR_PROFILE_NVTX=enabled)
     if case['adapter'] == 'dg' and p['device'] == 'cpu':
         result['OMP_NUM_THREADS'] = '1'
     if case['adapter'] == 'dg' and p.get('regularization') == 'igr':

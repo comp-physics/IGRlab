@@ -39,6 +39,7 @@ SAFE_ENV = ('CUDA_VISIBLE_DEVICES', 'SLURM_JOB_ID', 'SLURM_JOB_ACCOUNT',
             'SLURM_JOB_QOS', 'SLURM_JOB_PARTITION', 'SLURM_JOB_GPUS',
             'SLURM_STEP_GPUS', 'SLURM_NTASKS', 'SLURM_JOB_END_TIME', 'OMP_NUM_THREADS',
             'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+            'IGRLAB_PROFILE_NVTX', 'DG_IGR_PROFILE_NVTX',
             'DG_IGR_DGSEM_FUSED_RESIDUAL', 'DG_IGR_DGSEM_FUSED_DMMA',
             'IGRLAB_DGSEM_FUSED_RESIDUAL', 'IGRLAB_DGSEM_FUSED_DMMA') + tuple(
                 prefix + name for prefix in ('IGRLAB_', 'DG_IGR_')
@@ -779,7 +780,7 @@ def profiles(root, plan, suite, admission, runner, gpu):
             source = Path(plan['sources'][member]['source_snapshot'])
             argv = study_workloads.command(case, binary, source, directory, profile=True)
             environment = os.environ.copy()
-            environment.update(study_workloads.environment(case, directory))
+            environment.update(study_workloads.environment(case, directory, profile=True))
             captures[member] = study_profiles.capture(case, argv, runner, directory, gpu,
                                                        environment=environment)
             if captures[member]['status'] != 'complete':

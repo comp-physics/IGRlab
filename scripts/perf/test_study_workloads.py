@@ -169,7 +169,8 @@ class WorkloadTests(unittest.TestCase):
         dg = workloads.command(self.dg, Path('/binary'), ROOT, self.work, fields=True)
         self.assertIn('-vtk', dg)
         self.assertEqual(workloads.environment(self.dg, self.work, fields=True),
-                         {'DG_IGR_VTK_PREFIX_PATH': str(self.work / 'vtk')})
+                         {'DG_IGR_VTK_PREFIX_PATH': str(self.work / 'vtk'),
+                          'IGRLAB_PROFILE_NVTX': '0', 'DG_IGR_PROFILE_NVTX': '0'})
         with self.assertRaises(ValueError):
             workloads.command(self.hdg, Path('/binary'), ROOT, self.work, profile=True, fields=True)
 
@@ -198,6 +199,23 @@ class WorkloadTests(unittest.TestCase):
             case['parameters'].update(override)
             with self.subTest(override=override), self.assertRaises(ValueError):
                 workloads.command(case, Path('/binary'), ROOT, self.work)
+
+    def test_application_nvtx_is_enabled_only_for_cuda_profile_calls(self):
+        for discretization in ('dg', 'dgsem', 'hdg'):
+            case = copy.deepcopy(self.dg)
+            case['parameters']['discretization'] = discretization
+            with mock.patch.dict(workloads.os.environ,
+                                 {'IGRLAB_PROFILE_NVTX': '1', 'DG_IGR_PROFILE_NVTX': '1'}):
+                for options in ({}, {'fields': True}, {'profile': True}):
+                    env = workloads.environment(case, self.work, **options)
+                    expected = '1' if options.get('profile') else '0'
+                    self.assertEqual(env['IGRLAB_PROFILE_NVTX'], expected)
+                    self.assertEqual(env['DG_IGR_PROFILE_NVTX'], expected)
+            case['parameters']['device'] = 'cpu'
+            self.assertEqual(workloads.environment(case, self.work, profile=True)
+                             ['IGRLAB_PROFILE_NVTX'], '0')
+        with self.assertRaises(ValueError):
+            workloads.environment(self.dg, self.work, fields=True, profile=True)
 
     def test_hdg_complete_finite_record_and_configurable_measured_steps(self):
         self.hdg['parameters']['measured_steps'] = 3
@@ -271,7 +289,8 @@ class WorkloadTests(unittest.TestCase):
             ['/binary', '-m', str(ROOT / workloads.DG_MESH), '--dg-backend', 'dg', '-o', '1',
              '-rs', '0', '-rp', '0', '-tf', '0.002', '-dt', '1e-05', '-c', '0', '-no-glvis',
              '-vs', '1000000', '-nan-scan', '--device', 'cuda', '-no-save-state', '-no-vtk'])
-        self.assertEqual(workloads.environment(self.dg, self.work), {})
+        self.assertEqual(workloads.environment(self.dg, self.work),
+                         {'IGRLAB_PROFILE_NVTX': '0', 'DG_IGR_PROFILE_NVTX': '0'})
 
     def test_serial_refine_is_bounded_and_repeated_for_every_application_call(self):
         for refinement in (0, 1, 2):

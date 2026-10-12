@@ -43,6 +43,17 @@ class StudyProtocol(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_command_receipts_retain_nvtx_policy_without_unrelated_environment(self):
+        runner = study.Runner(self.root / 'nvtx-receipts', 10)
+        for enabled in ('0', '1'):
+            env = {**os.environ, 'IGRLAB_PROFILE_NVTX': enabled,
+                   'DG_IGR_PROFILE_NVTX': enabled, 'UNRELATED_SECRET': 'omit-me'}
+            directory = runner.run('nvtx-' + enabled, [sys.executable, '-c', 'pass'], env=env)
+            receipt = study.read_json(directory / 'command.json')
+            self.assertEqual(receipt['environment']['IGRLAB_PROFILE_NVTX'], enabled)
+            self.assertEqual(receipt['environment']['DG_IGR_PROFILE_NVTX'], enabled)
+            self.assertNotIn('UNRELATED_SECRET', receipt['environment'])
+
     def save_plan(self):
         self.plan.pop('plan_sha256', None)
         self.plan['plan_sha256'] = study.digest(self.plan)

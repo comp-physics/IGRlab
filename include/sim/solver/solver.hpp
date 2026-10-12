@@ -42,6 +42,7 @@
 #include "sim/wiring/dg_operator.hpp"
 #include "sim/wiring/dgsem_flux_config.hpp"
 #include "sim/wiring/igr_physics.hpp"
+#include "utils/profiling/observability.hpp"
 
 namespace dg_sim
 {
@@ -1309,6 +1310,13 @@ struct Solver
   solve(const CaseSpec<CaseOptions, NumericalFlux>& spec, int argc, char** argv)
   {
     mfem::Mpi::Init(argc, argv);
+    if (::igrlab::observability::configure_nvtx_from_environment() &&
+        mfem::Mpi::Root())
+    {
+      std::cout << "[profiling] nvtx_requested=1 nvtx_enabled="
+                << (::igrlab::observability::nvtx_backend_enabled ? 1 : 0)
+                << " scope=full-solver" << std::endl;
+    }
     mfem::Hypre::Init();
 
     CaseConfig case_cfg = MakeCaseConfig(spec.case_name,

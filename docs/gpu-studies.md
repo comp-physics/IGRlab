@@ -142,7 +142,14 @@ gates between source versions; it has no same-work CPU reference and therefore
 makes no larger-grid CPU equivalence claim. Full applications frozen at
 `d735f57` compile named DG/HDG NVTX ranges but leave their runtime gate disabled.
 CUDA/API/OSRT timelines remain available; absent named phase ranges must not be
-reported as measured phase attribution. The accepted-step benchmark enables
+reported as measured phase attribution. New full-solver builds support
+`IGRLAB_PROFILE_NVTX=1` (legacy `DG_IGR_PROFILE_NVTX`) to enable their existing
+regions when compiled with `--nvtx-profile`. The study runner sets both flags
+only for CUDA profiler calls and pins them to zero for unprofiled timings and
+field exports, recording the setting in each command receipt. Verify actual
+DG/IGR regions in the resulting trace before claiming phase attribution;
+the switch cannot add instrumentation to older or compiled-out binaries.
+The accepted-step benchmark enables
 NVTX only around its selected step. The companion's NCU selections use the
 first invocation of each selected kernel name, which diagnoses those launches
 without establishing steady-state kernel cost or full-solver speedup.
