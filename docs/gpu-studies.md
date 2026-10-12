@@ -165,6 +165,38 @@ trace-solve selections. Each selection remains bounded to the first invocation
 of each matching kernel name. Use a profile-only suite override to refine
 these diagnostics from a new timeline without repeating admitted timings.
 
+The [pace-igr-scaling.json](../scripts/perf/suites/pace-igr-scaling.json)
+suite provides a larger active-IGR size ladder. DG and all three DGSEM CUDA
+routes use the tracked 1024-cell mesh with zero, one or two refinements:
+1024, 4096 and 16384 cells. Ordinary and tensor HDG use 256 and 1024 cells.
+Every point retains order three, ten fixed steps (`dt=1e-5`), the same strict
+IGR controls, three independent process pairs, one warmup and the full
+closure-inclusive profiler selections. The default calibration selection is
+DG at 1024 cells and both HDG engines at 256 cells; select other points with
+`--cases`, for example `dg-igr-cuda-p3-n128` or
+`dgsem-igr-fused-dmma-p3-n128`.
+
+Calibrate runtime, convergence and memory before promoting a point to the
+optimization workload. At 16384 cells the current one-thread-per-face DG
+closure launches about 128 blocks, enough to reach each A100 SM, but this alone
+does not establish efficient occupancy or saturation. HDG uses dense element
+blocks and a different trace solve, so its size must be assessed separately.
+Ten steps are an initial calibration horizon; check startup share and increase
+the horizon in a versioned suite when necessary. The active-IGR adapter
+currently admits CUDA only, so this ladder does not supply CPU IGR parity.
+Native captures and their processing stay on PACE compute nodes. A larger
+trace can exceed the compact GPU activity export bound; retain that explicit
+unavailability rather than interpreting it as zero activity.
+
+Use one focused immutable run per size/backend when working in a one-hour
+interactive allocation. An ordinary `retry --prepare-only --suite ... --cases
+...` can reuse completed build/correctness receipts while collecting fresh
+paired timings. Preserve the baseline source identity: changing the executor
+or suite does not rebuild the application. After a production change, build
+and validate that source through the canonical driver before comparing it
+with a freshly measured baseline. Commit each validated solver revision batch
+locally on the optimization branch; saved timings alone cannot admit a speedup.
+
 Reports list every enabled frozen-suite case with its discretization, device,
 engine, DGSEM residual, timing scope, and individual timing/profile state.
 A two-case selection cannot establish coverage of every backend. CPU cases use
