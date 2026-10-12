@@ -156,9 +156,14 @@ HDG checks its coupled production configuration, successful accepted horizon
 and sigma fields; it does not emit the DG/DGSEM closure certificate. The active
 wave has no analytic error reference. This is a small closure diagnostic, with
 no CPU IGR or larger-grid scaling claim. Whole-application Nsight Systems
-captures include closure work; the initial Nsight Compute filters select
-transport kernels. Use the timeline's expensive closure families to choose a
-separate bounded NCU selection before claiming closure stall coverage.
+captures include closure work. Nsight Compute requires transport and the
+observed DG/DGSEM closure families: diffusion-face record/gather, PA mass and
+diffusion, Chebyshev application, and reductions. The selection also includes
+common vector kernels; those names alone do not establish exclusive closure
+attribution. HDG retains its coupled volume, face, condensation, recovery and
+trace-solve selections. Each selection remains bounded to the first invocation
+of each matching kernel name. Use a profile-only suite override to refine
+these diagnostics from a new timeline without repeating admitted timings.
 
 Reports list every enabled frozen-suite case with its discretization, device,
 engine, DGSEM residual, timing scope, and individual timing/profile state.
