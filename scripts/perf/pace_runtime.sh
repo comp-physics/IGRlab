@@ -61,7 +61,7 @@ source "$study_spack/share/spack/setup-env.sh"
 [[ -f $study_env/spack.lock ]] || { echo 'retained selected Spack environment is missing' >&2; exit 2; }
 # Query the concretized environment; installation prefixes are never embedded.
 study_packages=(openmpi hypre openblas metis)
-[[ $study_profile == cpu ]] || study_packages+=(cuda umpire)
+[[ $study_profile == cpu ]] || study_packages=(openmpi cuda hypre umpire openblas metis)
 for study_package in "${study_packages[@]}"; do
   study_prefix=$(spack -e "$study_env" location -i "$study_package")
   [[ -d $study_prefix ]] || { echo "missing selected package: $study_package" >&2; exit 2; }
