@@ -46,7 +46,7 @@ IGR_CONTROLS = {'IGR_PARTIAL_ASSEMBLY': '1', 'IGR_DEVICE_QF': '1',
                 'IGR_EXTRAPOLATION_DEGREE': '', 'IGR_SIGMA_BASIS': '',
                 'IGR_CHEB_ORDER': '3', 'IGR_CHEB_POWER_ITERATIONS': '10',
                 'IGR_CHEB_POWER_TOLERANCE': '1e-8', 'IGR_CHEB_POWER_SEED': '12345',
-                'IGR_CHEB_BASE_OPERATOR': '0',
+                'IGR_CHEB_BASE_OPERATOR': '0', 'IGR_DIRECT_IDENTITY_SYSTEM': '1',
                 'IGR_IPDG_PENALTY_SCALE': '1', 'IGR_OPERATOR_PROBE_EVERY': '0',
                 'IGR_PRECONDITIONER_PROBE': '0'}
 
@@ -345,10 +345,19 @@ def active_igr_evidence(p, text):
                 for key in ('calls', 'production_calls', 'output_only_calls')),
             'IGR production solve missing or did not converge')
     require(linear.get('last_solver') == 'cg' and linear.get('last_precond') == 'operatorchebyshev' and
-            linear.get('direct_identity_system') == '0' and linear.get('direct_identity_uses') == '0' and
             linear.get('exact_face_requested') == '1' and linear.get('exact_face_effective') == '1' and
             integer(int(linear['exact_face_operator_uses']), 'exact face uses', 1) > 0,
             'IGR exact-face Krylov closure was not used')
+    # Identity here describes DOF prolongation, not the physical closure
+    # operator. The direct setup path still performs the recorded CG solves.
+    identity_flag = linear.get('direct_identity_system')
+    identity_uses = integer(int(linear['direct_identity_uses']), 'identity prolongation uses')
+    identity_reason = linear.get('direct_identity_reason')
+    require(identity_flag in ('0', '1') and bool(identity_reason) and
+            ((identity_flag == '0' and identity_reason != 'active') or
+             (identity_flag == '1' and identity_reason == 'active' and identity_uses > 0)),
+            'invalid IGR identity-prolongation setup policy')
+    fixed.update(direct_identity_system=identity_flag, direct_identity_reason=identity_reason)
     certificate = log_row(text, '[igr-closure-certificate] event=accepted-state ')
     require(all(certificate.get(key) == value for key, value in
                 {'scope': 'final-committed-accepted-state', 'precision': 'fp64', 'supported': '1',
@@ -373,6 +382,7 @@ def active_igr_evidence(p, text):
             'alpha_policy': alpha, 'production_calls': counts['production_calls'],
             'production_converged_calls': counts['production_converged_calls'],
             'certificate': certificate, 'linear_counts': counts,
+            'direct_identity_uses': identity_uses,
             'scope': 'native production convergence and final closure certificate; no analytic error reference'}
 
 

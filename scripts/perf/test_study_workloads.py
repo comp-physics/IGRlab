@@ -354,7 +354,8 @@ class WorkloadTests(unittest.TestCase):
                 f'calls={600 + output_calls} converged_calls={600 + output_calls} production_calls=600 '
                 f'production_converged_calls=600 output_only_calls={output_calls} '
                 f'output_only_converged_calls={output_calls} total_iters={2400 + output_calls} '
-                'last_solver=cg last_precond=operatorchebyshev direct_identity_system=0 direct_identity_uses=0 '
+                'last_solver=cg last_precond=operatorchebyshev direct_identity_system=1 direct_identity_reason=active '
+                f'direct_identity_uses={600 + output_calls} '
                 'exact_face_requested=1 exact_face_effective=1 exact_face_operator_uses=600\n'
                 '[igr-closure-certificate] event=accepted-state scope=final-committed-accepted-state '
                 'precision=fp64 time=0.002 state_generation=200 solved=0 supported=1 certified=1 '
@@ -362,6 +363,17 @@ class WorkloadTests(unittest.TestCase):
                 'absolute_limit=0 skipped_nonfinite=0 q_sigma_admitted=1 '
                 'q_sigma_nonpositive_samples=0 q_sigma_nonfinite_samples=0\n'
                 '[smooth-error] status=skipped reason=active-igr-wave exact_reference=unavailable\n')
+
+    def test_native_identity_prolongation_shortcut_still_admits_nontrivial_cg(self):
+        case = self.igr_case()
+        case['parameters']['final_time'] = 0.0001
+        text = self.igr_log(output_calls=1).replace('601', '31').replace('600', '30').replace(
+            'total_iters=2401', 'total_iters=4262').replace('time=0.002', 'time=0.0001')
+        evidence = workloads.active_igr_evidence(workloads.parameters(case), text)
+        self.assertEqual(evidence['production_calls'], 30)
+        self.assertEqual(evidence['direct_identity_uses'], 31)
+        self.assertEqual(evidence['policy']['direct_identity_system'], '1')
+        self.assertEqual(evidence['linear_counts']['total_iters'], 4262)
 
     def test_active_igr_suite_six_gpu_variants_and_bounded_same_wave(self):
         suite = workloads.load_suite(IGR_SUITE)
@@ -433,7 +445,9 @@ class WorkloadTests(unittest.TestCase):
                    ('production_calls=600', 'production_calls=0'), ('total_iters=2400', 'total_iters=0'),
                    ('solver=cg', 'solver=fgmres'), ('lin_rtol=1e-10', 'lin_rtol=1e-8'),
                    ('exact_face_effective=1', 'exact_face_effective=0'),
-                   ('direct_identity_uses=0', 'direct_identity_uses=1'),
+                   ('direct_identity_uses=600', 'direct_identity_uses=0'),
+                   ('direct_identity_system=1', 'direct_identity_system=2'),
+                   ('direct_identity_reason=active', 'direct_identity_reason=disabled'),
                    ('certified=1', 'certified=0'), ('supported=1', 'supported=0'),
                    ('residual_rel_rhs=1e-11', 'residual_rel_rhs=1e-8'),
                    ('relative_limit=5e-10', 'relative_limit=5e-8'),

@@ -319,6 +319,7 @@ def parse_nsys(text, row_limit=30):
 
 
 NSYS_OPTIONAL_REPORTS = ('nvtx_sum', 'osrt_sum', 'nvtx_gpu_proj_sum', 'cuda_gpu_trace')
+NSYS_CORE_REPORTS = ('cuda_api_sum', 'cuda_gpu_kern_sum', 'cuda_gpu_mem_time_sum')
 NSYS_TRACE_MAX_EVENTS = 250000
 NSYS_TRACE_MAX_BYTES = 128 * 1024 * 1024
 
@@ -495,6 +496,37 @@ def _available_names(text, names):
     return [name for name in names if re.search(r'(?<![A-Za-z0-9_])' + re.escape(name) + r'(?![A-Za-z0-9_])', text)]
 
 
+def nsys_report_names(stdout, stderr, returncode):
+    """Some native releases exit 1 for valid --help-reports output."""
+    text = stdout + '\n' + stderr
+    require(returncode in (0, 1) and
+            re.search(r'^\s*The following built-in reports are available:\s*$', text, re.M),
+            'invalid native Nsys report help status/listing')
+    names = re.findall(r'^\s{2,}([a-z][a-z0-9_]*)(?:\[[^\r\n]*\])?\s+--\s+\S[^\r\n]*$', text, re.M)
+    require(len(names) == len(set(names)) and set(NSYS_CORE_REPORTS) <= set(names),
+            'native Nsys report help lacks explicit core report entries')
+    return [name for name in NSYS_OPTIONAL_REPORTS if name in names]
+
+
+def nsys_profile_help(stdout, stderr, returncode):
+    text = stdout + '\n' + stderr
+    require(returncode in (0, 1) and re.search(r'^\s*(?:usage:\s*)?nsys\s+profile\s+\[', text, re.M | re.I) and
+            all(re.search(r'(?<![\w-])' + flag + r'(?![\w-])', text)
+                for flag in ('--trace', '--sample', '--output', '--capture-range')),
+            'invalid native Nsys profile help status/options')
+
+
+def nsys_no_data(stdout, stderr, report, returncode):
+    """Only an explicit native optional-report no-data skip is unavailable."""
+    text = stdout + '\n' + stderr
+    label = r'(?:NV Tools Extension \(NVTX\)|NVTX)' if report.startswith('nvtx_') else r'(?:OS Runtime|OSRT)'
+    require(returncode == 1 and not re.search(r'\b(?:ERROR|FAILED|Traceback)\b', text, re.I) and
+            re.search(r'^\s*SKIPPED:\s+[^\r\n]*does not contain\s+' + label + r'\s+data\.?\s*$',
+                      text, re.M | re.I), 'optional native Nsys report failed without an explicit no-data skip')
+    return {'availability': 'unavailable', 'reason': 'native report explicitly skipped: no matching trace data',
+            'duration_seconds': None, 'instances': None, 'rows': [], 'omitted_rows': 0, 'report': report}
+
+
 def _kernel_id_regex(expression):
     """Encode a regex without colons, which delimit NCU kernel-id fields.
 
@@ -638,11 +670,18 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
             'stdout': artifact(capability_log / 'stdout.log', allow_empty=True),
             'stderr': artifact(capability_log / 'stderr.log', allow_empty=True),
             'scope': 'native environment capability query; CPU sampling remains disabled'}
-        reports_log = run('tools/nsys-reports', [str(tool), 'stats', '--help-reports'], 30)
-        available_reports = _available_names((reports_log / 'stdout.log').read_text(), NSYS_OPTIONAL_REPORTS)
-        result['tools']['nsys']['report_query'] = artifact(reports_log / 'stdout.log')
-        profile_help = run('tools/nsys-profile-help', [str(tool), 'profile', '--help'], 20)
-        result['tools']['nsys']['profile_help_stdout'] = artifact(profile_help / 'stdout.log')
+        reports_log = run('tools/nsys-reports', [str(tool), 'stats', '--help-reports'], 30, allow_failure=True)
+        reports_exit = json.loads((reports_log / 'result.json').read_text())['returncode']
+        available_reports = nsys_report_names((reports_log / 'stdout.log').read_text(),
+                                              (reports_log / 'stderr.log').read_text(), reports_exit)
+        result['tools']['nsys'].update(report_query=artifact(reports_log / 'stdout.log', allow_empty=True),
+            report_query_stderr=artifact(reports_log / 'stderr.log', allow_empty=True),
+            report_query_returncode=reports_exit, available_optional_reports=available_reports)
+        profile_help = run('tools/nsys-profile-help', [str(tool), 'profile', '--help'], 20, allow_failure=True)
+        profile_exit = json.loads((profile_help / 'result.json').read_text())['returncode']
+        nsys_profile_help((profile_help / 'stdout.log').read_text(), (profile_help / 'stderr.log').read_text(), profile_exit)
+        result['tools']['nsys'].update(profile_help_stdout=artifact(profile_help / 'stdout.log', allow_empty=True),
+            profile_help_stderr=artifact(profile_help / 'stderr.log', allow_empty=True), profile_help_returncode=profile_exit)
         prefix = directory / 'capture-nsys'
         require(not Path(str(prefix) + '.nsys-rep').exists(), 'native Nsys report already exists')
         command = [str(tool), 'profile', '--trace=cuda,nvtx,osrt', '--sample=none']
@@ -659,9 +698,14 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
                 host_summaries[report] = {'availability': 'unavailable', 'reason': 'not listed by native Nsys report help'}
                 continue
             exported = run('nsys-' + report, [str(tool), 'stats', '--report', report,
-                                            '--format', 'csv', native['path']], 120)
-            host_summaries[report] = parse_nsys_host_summary((exported / 'stdout.log').read_text(), report)
+                                            '--format', 'csv', native['path']], 120, allow_failure=True)
+            export_exit = json.loads((exported / 'result.json').read_text())['returncode']
+            stdout, stderr = [(exported / name).read_text() for name in ('stdout.log', 'stderr.log')]
+            host_summaries[report] = (parse_nsys_host_summary(stdout, report) if export_exit == 0 else
+                                      nsys_no_data(stdout, stderr, report, export_exit))
             host_summaries[report]['statistics_csv'] = artifact(exported / 'stdout.log', allow_empty=True)
+            host_summaries[report]['statistics_stderr'] = artifact(exported / 'stderr.log', allow_empty=True)
+            host_summaries[report]['returncode'] = export_exit
         expected_events = statistics['gpu_kernel']['instances'] + (statistics['gpu_memory']['instances'] or 0)
         activity = {'availability': 'unavailable', 'reason': 'not listed by native Nsys report help'}
         if 'cuda_gpu_trace' in available_reports:

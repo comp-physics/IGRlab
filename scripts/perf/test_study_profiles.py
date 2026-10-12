@@ -81,6 +81,16 @@ def gpu_trace(rows=None):
                                 ['3000', '2', 'GPU 0', '1', '2', '[CUDA memcpy DtoH]']])])
 
 
+def reports_help(optional=True):
+    names = (*profiles.NSYS_CORE_REPORTS, *(profiles.NSYS_OPTIONAL_REPORTS if optional else ()))
+    return '\nThe following built-in reports are available:\n\n' + '\n'.join(
+        '  ' + name + ('[:nvtx-name][:base|:mangled]' if name.endswith('kern_sum') else '') +
+        ' -- Native report description' for name in names) + '\n'
+
+
+PROFILE_HELP = 'usage: nsys profile [<args>] [application ...]\n  --trace --sample --output --capture-range\n'
+
+
 class FakeRunner:
     def __init__(self, output, *, missing_sections=False, missing_reports=False, fail=None):
         self.output = output
@@ -105,7 +115,9 @@ class FakeRunner:
         elif label.endswith('nsys-stats'):
             text = nsys_csv()
         elif label.endswith('nsys-reports'):
-            text = 'no optional reports supported' if self.missing_reports else ' '.join(profiles.NSYS_OPTIONAL_REPORTS)
+            text = reports_help(not self.missing_reports)
+        elif label.endswith('nsys-profile-help'):
+            text = PROFILE_HELP
         elif any(label.endswith('nsys-' + report) for report in profiles.NSYS_OPTIONAL_REPORTS[:3]):
             text = host_summary(label.rsplit('nsys-', 1)[1])
         elif label.endswith('nsys-cuda_gpu_trace'):
@@ -313,6 +325,107 @@ class MetricTests(unittest.TestCase):
 
 
 class CaptureTests(unittest.TestCase):
+    def test_nsys_native_help_exit_one_requires_explicit_listing_and_options(self):
+        for code in (0, 1):
+            for stdout, stderr in ((reports_help(), ''), ('', reports_help()),
+                                   (reports_help(False), '\n  nvtx_sum -- Native report description\n')):
+                with self.subTest(code=code, stdout=bool(stdout)):
+                    names = profiles.nsys_report_names(stdout, stderr, code)
+                    self.assertIn('nvtx_sum', names)
+            profiles.nsys_profile_help(PROFILE_HELP, '', code)
+            profiles.nsys_profile_help('', PROFILE_HELP, code)
+        for text, code in ((reports_help(), 2), (reports_help(), 124),
+                           ('ERROR: ' + ' '.join((*profiles.NSYS_CORE_REPORTS, *profiles.NSYS_OPTIONAL_REPORTS)), 1),
+                           (reports_help().replace('  cuda_api_sum --', '  cuda_api_trace --'), 1),
+                           (reports_help() + '  cuda_api_sum -- duplicate\n', 1), ('', 1)):
+            with self.subTest(text=text, code=code), self.assertRaises(profiles.ProfileError):
+                profiles.nsys_report_names(text, '', code)
+        for text, code in ((PROFILE_HELP, 2), (PROFILE_HELP, 124),
+                           (PROFILE_HELP.replace('--trace', '--trace-other'), 1),
+                           (PROFILE_HELP.replace('usage: nsys profile [', 'ERROR nsys profile '), 1)):
+            with self.subTest(text=text, code=code), self.assertRaises(profiles.ProfileError):
+                profiles.nsys_profile_help('', text, code)
+
+    def test_help_exit_one_preserves_both_streams_and_real_runner_receipts(self):
+        from gpu_study import Runner
+        for stream in ('stdout', 'stderr'):
+            with self.subTest(stream=stream), tempfile.TemporaryDirectory() as temporary:
+                tool, runner, directory = self.setup_capture(temporary)
+                real_runner, original = Runner(runner.output, 30), runner.run
+                def real_query(label, argv, **kwargs):
+                    if label.endswith(('nsys-reports', 'nsys-profile-help')):
+                        return real_runner.run(label, argv, **kwargs)
+                    return original(label, argv, **kwargs)
+                tool.write_text('#!' + sys.executable + '\nimport sys\n' +
+                    'text = ' + repr(reports_help()) + ' if "--help-reports" in sys.argv else ' + repr(PROFILE_HELP) + '\n' +
+                    'print(text, file=sys.' + stream + ')\nsys.exit(1)\n')
+                case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+                with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU), \
+                        patch.object(runner, 'run', side_effect=real_query):
+                    value = profiles.capture(case, ['app'], runner, directory, GPU)
+                self.assertEqual(value['status'], 'complete')
+                native = value['tools']['nsys']
+                self.assertEqual(native['report_query_returncode'], 1)
+                self.assertEqual(native['profile_help_returncode'], 1)
+                for key in ('report_query', 'report_query_stderr', 'profile_help_stdout', 'profile_help_stderr'):
+                    self.assertEqual(native[key]['sha256'], profiles.sha256(native[key]['path']))
+                self.assertGreater(native['report_query' if stream == 'stdout' else 'report_query_stderr']['bytes'], 0)
+
+    def test_malformed_or_timeout_help_does_not_reach_capture(self):
+        for code, text in ((1, 'no report help available'), (2, reports_help()), (124, reports_help())):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as temporary:
+                tool, runner, directory = self.setup_capture(temporary)
+                original = runner.run
+                def bad_query(label, argv, **kwargs):
+                    path = original(label, argv, **kwargs)
+                    if label.endswith('nsys-reports'):
+                        (path / 'stdout.log').write_text(text)
+                        (path / 'result.json').write_text(json.dumps({'returncode': code}))
+                    return path
+                case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+                with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU), \
+                        patch.object(runner, 'run', side_effect=bad_query), self.assertRaises(profiles.ProfileError):
+                    profiles.capture(case, ['app'], runner, directory, GPU)
+                self.assertFalse(any(label.endswith('/nsys') for label, argv, timeout in runner.commands))
+
+    def test_optional_native_no_data_skip_is_explicit_and_nonzero_errors_reject(self):
+        for report, description in (('nvtx_sum', 'NV Tools Extension (NVTX)'),
+                                    ('nvtx_gpu_proj_sum', 'NVTX'), ('osrt_sum', 'OS Runtime')):
+            text = f'SKIPPED: report.sqlite does not contain {description} data.\n'
+            row = profiles.nsys_no_data('', text, report, 1)
+            self.assertEqual(row['availability'], 'unavailable')
+            self.assertIsNone(row['duration_seconds'])
+            for invalid, code in ((text, 2), (text, 124), (text + 'ERROR: cannot read trace\n', 1),
+                                  ('SKIPPED: report failed\n', 1), (text.replace(description, 'other'), 1)):
+                with self.subTest(report=report, code=code), self.assertRaises(profiles.ProfileError):
+                    profiles.nsys_no_data(invalid, '', report, code)
+
+    def test_empty_nvtx_exit_one_retains_core_and_skip_receipts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary)
+            original = runner.run
+            def absent_nvtx(label, argv, **kwargs):
+                path = original(label, argv, **kwargs)
+                if label.endswith(('nsys-nvtx_sum', 'nsys-nvtx_gpu_proj_sum')):
+                    (path / 'stdout.log').write_text('')
+                    (path / 'stderr.log').write_text('SKIPPED: trace.sqlite does not contain NV Tools Extension (NVTX) data.\n')
+                    (path / 'result.json').write_text(json.dumps({'returncode': 1, 'status': 'failed',
+                        'argv': argv, 'cwd': str(path), 'stdout_sha256': profiles.sha256(path / 'stdout.log'),
+                        'stderr_sha256': profiles.sha256(path / 'stderr.log')}))
+                    raise RuntimeError('native optional report exited1')
+                return path
+            case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+            with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU), \
+                    patch.object(runner, 'run', side_effect=absent_nvtx):
+                value = profiles.capture(case, ['app'], runner, directory, GPU)
+            self.assertEqual(value['status'], 'complete')
+            for report in ('nvtx_sum', 'nvtx_gpu_proj_sum'):
+                row = value['captures']['nsys']['host_summaries'][report]
+                self.assertEqual(row['availability'], 'unavailable')
+                self.assertEqual(row['returncode'], 1)
+                self.assertEqual(row['statistics_csv']['bytes'], 0)
+                self.assertGreater(row['statistics_stderr']['bytes'], 0)
+
     def test_host_reports_and_timestamp_processing_keep_compact_results(self):
         with tempfile.TemporaryDirectory() as temporary:
             tool, runner, directory = self.setup_capture(temporary)
