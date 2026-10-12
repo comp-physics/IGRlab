@@ -109,7 +109,13 @@ Vector OriginalRecordAndGather(const InteriorFaceDGDiffusionApplyInfo& info,
 
 Mesh MakeMesh(int geometry)
 {
-  Mesh mesh = Mesh::MakeCartesian2D(3, 2, Element::QUADRILATERAL,
+  // Periodic vertex identification needs at least three cells in each
+  // direction to retain distinct topological edges. Four by three also
+  // covers full four-face batches; the nonperiodic meshes retain a 7-face
+  // tail fixture below.
+  const bool periodic = geometry == 2;
+  Mesh mesh = Mesh::MakeCartesian2D(periodic ? 4 : 3,
+                                    periodic ? 3 : 2, Element::QUADRILATERAL,
                                     true, 1.0, 0.7);
   if (geometry == 2)
   {
@@ -188,7 +194,7 @@ void CheckCase(int order, int face_order, int basis, int geometry,
       fes, fqs, side_q, kappa, work.shape, work.weighted_normal_dshape,
       work.penalty, work.face_elements, work.element_vdof_map, scaling,
       &work.normal_dshape_base, &work.penalty_metric);
-    MFEM_VERIFY(info.nf == (geometry == 2 ? 12 : 7),
+    MFEM_VERIFY(info.nf == (geometry == 2 ? 24 : 7),
                 "Fixture must cover whole batches and a three-face tail.");
     MFEM_VERIFY(info.dof == (order + 1) * (order + 1) &&
                 info.nq == ir.GetNPoints(), "Unexpected packed dimensions.");
