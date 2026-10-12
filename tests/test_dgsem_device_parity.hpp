@@ -1119,6 +1119,13 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
       mfem::DenseMatrix inverse_mass(inverse_rows, dof);
       inverse_mass = 0.0;
       mfem::DenseMatrix weak(inverse_rows, num_equations);
+      const bool mass_consistent_fixture = order > 4;
+      mfem::DenseMatrix strong_target;
+      if (mass_consistent_fixture)
+      {
+        strong_target.SetSize(inverse_rows, num_equations);
+      }
+      bool valid_mass_consistent_fixture = true;
       for (int element = 0; element < inverse_ne; ++element)
       {
         for (int local = 0; local < dof; ++local)
@@ -1135,12 +1142,37 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
           }
           inverse_mass(element * dof + local, local) =
             (1.0 + 0.125 * element) / tensor_weight;
+          const mfem::real_t diagonal =
+              inverse_mass(element * dof + local, local);
+          if (mass_consistent_fixture)
+          {
+            valid_mass_consistent_fixture =
+                valid_mass_consistent_fixture &&
+                std::isfinite(static_cast<double>(diagonal)) && diagonal >= 1.0;
+          }
           for (int equation = 0; equation < num_equations; ++equation)
           {
-            weak(element * dof + local, equation) =
+            const mfem::real_t target =
               0.1 * (1 + element) + 0.03 * local - 0.02 * equation;
+            // Retain the original p1-p4 data exactly. At higher orders use
+            // weak = M*f for a bounded nodal target f: inverse LGL endpoint
+            // weights otherwise amplify this artificial residual as p^4.
+            // This rule depends only on the quadrature mass, not a measured
+            // error or a device's multiply/add contraction policy.
+            weak(element * dof + local, equation) =
+                mass_consistent_fixture ? target / diagonal : target;
+            if (mass_consistent_fixture)
+            {
+              strong_target(element * dof + local, equation) = target;
+            }
           }
         }
+      }
+      if (mass_consistent_fixture)
+      {
+        ctx.Check(valid_mass_consistent_fixture,
+                  "High-order inverse-mass fixture has finite positive LGL mass");
+        if (!valid_mass_consistent_fixture) { return; }
       }
       mfem::DenseMatrix device_strong;
       mfem::DenseMatrix host_strong(inverse_rows, num_equations);
@@ -1179,6 +1211,14 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
         }
       }
       record_inverse_mass_error("dense-diagonal", device_strong, host_strong);
+      if (mass_consistent_fixture)
+      {
+        ctx.Check(MaxDifference(device_strong, strong_target) <=
+                      mfem::dgsem::DGSEMReferenceTolerances::inverse_mass,
+                  "DGSEM " + std::to_string(dim) + "D p" +
+                      std::to_string(order) +
+                      " inverse mass reconstructs the mass-consistent nodal target");
+      }
 
       // The collocated mass has an exact compact representation. Exercise
       // both device branches on identical data before introducing a truly
@@ -1213,20 +1253,47 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
                                           inverse_mass,
                                           weak,
                                           device_strong);
+      long double maximum_absolute_dot = 0.0L;
       for (int row = 0; row < inverse_rows; ++row)
       {
         for (int equation = 0; equation < num_equations; ++equation)
         {
           double value = 0.0;
+          long double absolute_dot = 0.0L;
           for (int j = 0; j < dof; ++j)
           {
             value += inverse_mass(row, j) *
                      weak((row / dof) * dof + j, equation);
+            if (mass_consistent_fixture)
+            {
+              absolute_dot +=
+                  std::abs(static_cast<long double>(inverse_mass(row, j)) *
+                           static_cast<long double>(
+                               weak((row / dof) * dof + j, equation)));
+            }
           }
           host_strong(row, equation) = value;
+          maximum_absolute_dot = std::max(maximum_absolute_dot, absolute_dot);
         }
       }
       record_inverse_mass_error("dense-full", device_strong, host_strong);
+      if (mass_consistent_fixture)
+      {
+        // Each unfused n-term dot has forward error <= gamma_(2n)*sum|a*b|;
+        // FMA is covered by that same bound. Two such FP64 evaluations stay
+        // within the frozen absolute gate without changing that gate.
+        const long double roundoff =
+            0.5L * std::numeric_limits<double>::epsilon();
+        const long double operations = 2.0L * dof;
+        const long double gamma_n =
+            operations * roundoff / (1.0L - operations * roundoff);
+        ctx.Check(2.0L * gamma_n * maximum_absolute_dot <=
+                      mfem::dgsem::DGSEMReferenceTolerances::inverse_mass,
+                  "High-order inverse-mass fixture roundoff bound fits the frozen gate");
+        ctx.Check(MaxDifference(host_strong, diagonal_strong) >
+                      100.0 * mfem::dgsem::DGSEMReferenceTolerances::inverse_mass,
+                  "High-order inverse-mass dense perturbation remains nontrivial");
+      }
     }
 
     for (int face_order = 1; face_order <= 10; ++face_order)
