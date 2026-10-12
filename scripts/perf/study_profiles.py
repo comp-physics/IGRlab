@@ -320,8 +320,6 @@ def parse_nsys(text, row_limit=30):
 
 NSYS_OPTIONAL_REPORTS = ('nvtx_sum', 'osrt_sum', 'nvtx_gpu_proj_sum', 'cuda_gpu_trace')
 NSYS_CORE_REPORTS = ('cuda_api_sum', 'cuda_gpu_kern_sum', 'cuda_gpu_mem_time_sum')
-NSYS_TRACE_MAX_EVENTS = 250000
-NSYS_TRACE_MAX_BYTES = 128 * 1024 * 1024
 
 
 def parse_nsys_host_summary(text, report, row_limit=30):
@@ -381,10 +379,17 @@ def parse_nsys_host_summary(text, report, row_limit=30):
             'report': report}
 
 
-def parse_nsys_gpu_activity(lines, expected_events, maximum_events=NSYS_TRACE_MAX_EVENTS):
+def parse_nsys_gpu_activity(lines, expected_events, maximum_events=None):
     """Stream sorted native CUDA intervals, returning no event-level records."""
-    require(type(expected_events) is int and expected_events > 0 and type(maximum_events) is int and
-            0 < maximum_events <= NSYS_TRACE_MAX_EVENTS, 'invalid CUDA timestamp coverage bound')
+    require(type(expected_events) is int and expected_events > 0,
+            'invalid CUDA timestamp coverage bound')
+    # The independent kernel/copy summaries bound the exact expected export.
+    # Large realistic solves do not need an arbitrary event or file-size cap:
+    # this parser retains only the current interval and ten largest gaps.
+    if maximum_events is None:
+        maximum_events = expected_events
+    require(type(maximum_events) is int and maximum_events > 0,
+            'invalid CUDA timestamp coverage bound')
     header, start_key, duration_key, factors = None, None, None, None
     first, segment_start, previous_start, merged_end = None, None, None, None
     active, gaps, largest, devices, count, zero = Decimal(0), 0, [], set(), 0, 0
@@ -713,16 +718,11 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
         expected_events = statistics['gpu_kernel']['instances'] + (statistics['gpu_memory']['instances'] or 0)
         activity = {'availability': 'unavailable', 'reason': 'not listed by native Nsys report help'}
         if 'cuda_gpu_trace' in available_reports:
-            activity['reason'] = 'CUDA timestamp event bound exceeded before export'
-            if expected_events <= NSYS_TRACE_MAX_EVENTS:
-                exported = run('nsys-cuda_gpu_trace', stats_command('cuda_gpu_trace'), 120)
-                trace = exported / 'stdout.log'
-                activity = {'availability': 'unavailable', 'reason': 'CUDA timestamp byte bound exceeded',
-                            'statistics_csv': artifact(trace)}
-                if trace.stat().st_size <= NSYS_TRACE_MAX_BYTES:
-                    with trace.open(newline='') as stream:
-                        activity = parse_nsys_gpu_activity(stream, expected_events)
-                    activity['statistics_csv'] = artifact(trace)
+            exported = run('nsys-cuda_gpu_trace', stats_command('cuda_gpu_trace'), 120)
+            trace = exported / 'stdout.log'
+            with trace.open(newline='') as stream:
+                activity = parse_nsys_gpu_activity(stream, expected_events)
+            activity['statistics_csv'] = artifact(trace)
         result['captures']['nsys'] = {'status': 'complete', 'native': native,
             'application_stdout': str(log / 'stdout.log'), 'application_stderr': str(log / 'stderr.log'),
             'application_stdout_sha256': sha256(log / 'stdout.log'),

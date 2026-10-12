@@ -81,6 +81,13 @@ def gpu_trace(rows=None):
                                 ['3000', '2', 'GPU 0', '1', '2', '[CUDA memcpy DtoH]']])])
 
 
+def large_gpu_trace(count):
+    yield 'Start (ns),Duration (ns),Device,Ctx,Strm,Name\n'
+    for index in range(count):
+        name = KERNEL if index + 1 < count else '[CUDA memcpy DtoH]'
+        yield f'{index * 2000},1000,GPU 0,1,1,{name}\n'
+
+
 def reports_help(optional=True):
     names = (*profiles.NSYS_CORE_REPORTS, *(profiles.NSYS_OPTIONAL_REPORTS if optional else ()))
     return '\nThe following built-in reports are available:\n\n' + '\n'.join(
@@ -291,6 +298,17 @@ class MetricTests(unittest.TestCase):
         for text, count, bound in examples:
             with self.subTest(text=text), self.assertRaises(profiles.ProfileError):
                 profiles.parse_nsys_gpu_activity(io.StringIO(text), count, bound)
+
+    def test_large_cuda_activity_streams_with_summary_derived_coverage(self):
+        count = 250001
+        value = profiles.parse_nsys_gpu_activity(large_gpu_trace(count), count)
+        self.assertEqual(value['event_count'], count)
+        self.assertAlmostEqual(value['active_union_seconds'], count * 1e-6)
+        self.assertEqual(value['internal_gap_count'], count - 1)
+        self.assertEqual(len(value['largest_internal_gaps_seconds']), 10)
+        self.assertNotIn('events', value)
+        with self.assertRaisesRegex(profiles.ProfileError, 'event bound exceeded'):
+            profiles.parse_nsys_gpu_activity(large_gpu_trace(3), 2)
 
     def test_tensor_instruction_evidence_observed_zero_and_unavailable(self):
         for case, kernel in (({'adapter': 'dg', 'parameters': {'dgsem_residual': 'fused-dmma'}},
@@ -571,20 +589,32 @@ class CaptureTests(unittest.TestCase):
                 self.assertIsNone(rows['duration_seconds'])
                 self.assertEqual(rows['statistics_csv']['bytes'], 0)
 
-    def test_timestamp_bounds_retain_core_without_unbounded_exports(self):
-        for bound in ('NSYS_TRACE_MAX_EVENTS', 'NSYS_TRACE_MAX_BYTES'):
-            with self.subTest(bound=bound), tempfile.TemporaryDirectory() as temporary:
-                tool, runner, directory = self.setup_capture(temporary)
-                case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
-                with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU), \
-                        patch.object(profiles, bound, 1):
-                    value = profiles.capture(case, ['app'], runner, directory, GPU)
-                self.assertEqual(value['status'], 'complete')
-                activity = value['captures']['nsys']['gpu_activity']
-                self.assertEqual(activity['availability'], 'unavailable')
-                self.assertIn('bound exceeded', activity['reason'])
-                if bound == 'NSYS_TRACE_MAX_EVENTS':
-                    self.assertFalse(any(label.endswith('nsys-cuda_gpu_trace') for label, argv, timeout in runner.commands))
+    def test_large_timestamp_export_is_streamed_on_compute(self):
+        count = 250001
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary)
+            original = runner.run
+            def large_trace(label, argv, **kwargs):
+                result = original(label, argv, **kwargs)
+                if label.endswith('nsys-stats'):
+                    text = (result / 'stdout.log').read_text()
+                    text = text.replace(f'3,1,{KERNEL}', f'3,{count - 1},{KERNEL}')
+                    (result / 'stdout.log').write_text(text)
+                elif label.endswith('nsys-cuda_gpu_trace'):
+                    with (result / 'stdout.log').open('w') as stream:
+                        stream.writelines(large_gpu_trace(count))
+                return result
+            case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+            with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU), \
+                    patch.object(runner, 'run', side_effect=large_trace):
+                value = profiles.capture(case, ['app'], runner, directory, GPU)
+            self.assertEqual(value['status'], 'complete')
+            activity = value['captures']['nsys']['gpu_activity']
+            self.assertEqual(activity['event_count'], count)
+            self.assertNotIn('events', activity)
+            self.assertTrue(any(label.endswith('nsys-cuda_gpu_trace') and timeout == 120
+                                for label, argv, timeout in runner.commands))
+
     def test_tensor_dispatch_environment_reaches_both_capture_children(self):
         with tempfile.TemporaryDirectory() as temporary:
             tool, runner, directory = self.setup_capture(temporary)
