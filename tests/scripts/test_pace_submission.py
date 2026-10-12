@@ -29,6 +29,10 @@ class PaceSubmission(unittest.TestCase):
 import json, os, sys
 with open(os.environ['BUILD_CALLS'], 'a') as f:
     f.write(json.dumps(sys.argv[1:]) + '\\n')
+with open(os.environ['BUILD_ENV_CALLS'], 'a') as f:
+    f.write(json.dumps({key: os.environ.get(key) for key in (
+        'IGRLAB_CUDA_ARCH', 'IGRLAB_MFEM_CUDA_ARCHS', 'IGRLAB_APP_CUDA_ARCHS',
+        'IGRLAB_SPACK_ENV')}) + '\\n')
 ''')
         self.write_executable(self.fake_bin / 'sbatch', '''#!/usr/bin/env python3
 import json, os, sys
@@ -52,6 +56,7 @@ print(9000 + count)
                 del self.env[key]
         self.env.update(PATH=str(self.fake_bin) + ':' + self.env['PATH'],
                         BUILD_CALLS=str(self.root / 'build.calls'),
+                        BUILD_ENV_CALLS=str(self.root / 'build_env.calls'),
                         SBATCH_CALLS=str(self.root / 'sbatch.calls'))
 
     def tearDown(self):
@@ -100,6 +105,77 @@ print(9000 + count)
         result = self.submit('--a100', '--no-tests')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.calls('sbatch')), 1)
+
+    def test_v100_compiles_on_cpu_then_validates_on_v100_free_queue(self):
+        result = self.submit('--gpu', '--cuda-arch', '70', '--test-regex', '^dgsem$')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        build, check = self.calls('sbatch')
+        for call in (build, check):
+            self.assertIn('--account=gts-sbryngelson3', call)
+            self.assertIn('--qos=embers', call)
+        self.assertIn('--partition=cpu-small', build)
+        self.assertIn('--ntasks=1', build)
+        self.assertFalse(any(arg.startswith('--gres=') for arg in build))
+        self.assertIn('--partition=gpu-v100', check)
+        self.assertIn('--gres=gpu:v100:1', check)
+        self.assertIn('--ntasks=4', check)
+        self.assertIn('--dependency=afterok:9000', check)
+        request = json.loads(Path(build[-1]).read_text())
+        self.assertIn('--gpu', request['argv'])
+        self.assertEqual(request['argv'][request['argv'].index('--cuda-arch') + 1], '70')
+        self.assertNotIn('--a100', request['argv'])
+        for call, tasks in ((build, '1'), (check, '4')):
+            result = self.run_helper(*call[-3:], env=self.env | {
+                'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3', 'SLURM_JOB_QOS': 'embers',
+                'SLURM_NTASKS': tasks})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = self.calls('build')[-1]
+            self.assertIn('--gpu', args)
+            self.assertEqual(args[args.index('--cuda-arch') + 1], '70')
+            self.assertNotIn('--a100', args)
+        self.assertIn('--tests-only', self.calls('build')[-1])
+        self.assertEqual(self.calls('build')[-1][self.calls('build')[-1].index('--test-regex') + 1], '^dgsem$')
+
+    def test_v100_and_default_a100_plans_pin_separate_native_profiles(self):
+        for args, arch, partition, model in (
+                (('--gpu', '--cuda-arch', '70'), '70', 'gpu-v100', 'v100'),
+                (('--gpu',), '80', 'gpu-a100', 'a100'),
+                (('--a100', '--cuda-arch', '80'), '80', 'gpu-a100', 'a100')):
+            with self.subTest(args=args):
+                result = self.submit(*args, '--print-plan')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('profile=cuda-sm' + arch, result.stdout)
+                self.assertIn('validation_partition=' + partition, result.stdout)
+                self.assertIn('validation_gres=gpu:' + model + ':1', result.stdout)
+                expected = {key: arch for key in (
+                    'IGRLAB_CUDA_ARCH', 'IGRLAB_MFEM_CUDA_ARCHS', 'IGRLAB_APP_CUDA_ARCHS')}
+                expected['IGRLAB_SPACK_ENV'] = str(self.output / 'site/pace/spack-envs' / ('cuda-sm' + arch))
+                self.assertEqual(self.calls('build_env')[-1], expected)
+                self.assertEqual('--a100' in self.calls('build')[-1], arch == '80')
+                self.assertEqual(self.calls('sbatch'), [])
+                self.assertFalse(self.output.exists())
+
+    def test_a100_conflicts_and_unsupported_gpu_profiles_reject_before_plan(self):
+        for args in (('--a100', '--cuda-arch', '70'), ('--cuda-arch', '70', '--a100'),
+                     ('--a100', '--cpu-only'), ('--cpu-only', '--a100'),
+                     ('--gpu', '--cuda-arch', '60'), ('--gpu', '--cuda-arch', '90'),
+                     ('--gpu', '--cuda-arch', ''), ('--gpu', '--cuda-arch', '70;false'),
+                     ('--cpu-only', '--cuda-arch', '70')):
+            with self.subTest(args=args):
+                result = self.submit(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.calls('build'), [])
+                self.assertEqual(self.calls('sbatch'), [])
+                self.assertFalse(self.output.exists())
+
+    def test_v100_tests_only_submission_needs_no_build_dependency(self):
+        result = self.submit('--gpu', '--cuda-arch', '70', '--tests-only')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls('sbatch')
+        self.assertEqual(len(calls), 1)
+        self.assertIn('--partition=gpu-v100', calls[0])
+        self.assertIn('--gres=gpu:v100:1', calls[0])
+        self.assertFalse(any(arg.startswith('--dependency=') for arg in calls[0]))
 
     def test_offline_plan_does_not_submit_or_create_output(self):
         result = self.submit('--a100', '--print-plan')
@@ -189,6 +265,30 @@ print(9000 + count)
                 self.assertNotIn('requires an allocated A100', result.stderr)
         for invalid, message in (({'SLURM_STEP_GPUS': ''}, 'requires an allocated A100'),
                                  ({'SLURM_JOB_PARTITION': 'cpu-small'}, 'requires an allocated A100'),
+                                 ({'SLURM_JOB_ACCOUNT': 'unrelated'}, 'free embers'),
+                                 ({'SLURM_JOB_QOS': 'inferno'}, 'free embers')):
+            with self.subTest(invalid=invalid):
+                result = self.run_helper(*args, env=allocated | invalid)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+        self.assertEqual(self.calls('sbatch'), [])
+        self.assertEqual(self.calls('build'), [])
+
+    def test_v100_interactive_guard_requires_matching_partition_and_assignment(self):
+        self.write_executable(self.fake_bin / 'hostname', '#!/bin/sh\necho atl1-compute.pace.gatech.edu\n')
+        allocated = self.env | {'SLURM_JOB_ID': '1', 'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3',
+                               'SLURM_JOB_QOS': 'embers', 'SLURM_JOB_PARTITION': 'gpu-v100',
+                               'SLURM_STEP_GPUS': '5', 'CUDA_VISIBLE_DEVICES': '0'}
+        args = ('--site', 'pace', '--gpu', '--cuda-arch', '70', '--tests-only',
+                '--output-root', str(self.output), '--spack-root', str(self.spack))
+        for assignment in ({}, {'SLURM_JOB_GPUS': '', 'SLURM_STEP_GPUS': '5'},
+                           {'SLURM_JOB_GPUS': '5', 'SLURM_STEP_GPUS': ''}):
+            with self.subTest(assignment=assignment):
+                result = self.run_helper(*args, env=allocated | assignment)
+                self.assertIn('environment modules are unavailable', result.stderr)
+                self.assertNotIn('requires an allocated V100', result.stderr)
+        for invalid, message in (({'SLURM_JOB_PARTITION': 'gpu-a100'}, 'requires an allocated V100'),
+                                 ({'SLURM_STEP_GPUS': ''}, 'requires an allocated V100'),
                                  ({'SLURM_JOB_ACCOUNT': 'unrelated'}, 'free embers'),
                                  ({'SLURM_JOB_QOS': 'inferno'}, 'free embers')):
             with self.subTest(invalid=invalid):

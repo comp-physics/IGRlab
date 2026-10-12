@@ -107,6 +107,7 @@ fi
 
 pace_args=()
 pace_submit=0 pace_plan=0 pace_tests_only=0 pace_tests=1 pace_smoke=0 pace_mode=cpu pace_arch="" pace_clean_set=0 pace_help=0
+pace_a100=0 pace_cpu_set=0 pace_arch_set=0 pace_a100_arch_conflict=0
 pace_root="" pace_dependency_root="" pace_spack_root=${IGRLAB_PACE_SPACK_ROOT:-}
 pace_jobs=${IGRLAB_BUILD_JOBS:-4} pace_mfem_jobs=""
 pace_build_time=08:00:00 pace_validation_time=02:00:00
@@ -119,9 +120,14 @@ while (($#)); do
     --site-root) [[ $# -ge 2 ]] || pace_fail "--site-root requires a path"; pace_dependency_root=$2; shift ;;
     --spack-root) [[ $# -ge 2 ]] || pace_fail "--spack-root requires a path"; pace_spack_root=$2; shift ;;
     --output-root) [[ $# -ge 2 ]] || pace_fail "--output-root requires a path"; pace_root=$2; pace_args+=("$1" "$2"); shift ;;
-    --a100|--gpu) pace_mode=gpu; pace_args+=("$1") ;;
-    --cpu|--cpu-only) pace_mode=cpu; pace_args+=("$1") ;;
-    --cuda-arch) [[ $# -ge 2 ]] || pace_fail "--cuda-arch requires a value"; pace_arch=$2; pace_args+=("$1" "$2"); shift ;;
+    --a100) pace_mode=gpu; pace_a100=1; pace_args+=("$1") ;;
+    --gpu) pace_mode=gpu; pace_args+=("$1") ;;
+    --cpu|--cpu-only) pace_mode=cpu; pace_cpu_set=1; pace_args+=("$1") ;;
+    --cuda-arch)
+      [[ $# -ge 2 ]] || pace_fail "--cuda-arch requires a value"
+      pace_arch=$2; pace_arch_set=1
+      [[ $pace_arch == 80 ]] || pace_a100_arch_conflict=1
+      pace_args+=("$1" "$2"); shift ;;
     -j|--jobs) [[ $# -ge 2 ]] || pace_fail "$1 requires a value"; pace_jobs=$2; pace_args+=("$1" "$2"); shift ;;
     --mfem-jobs) [[ $# -ge 2 ]] || pace_fail "$1 requires a value"; pace_mfem_jobs=$2; pace_args+=("$1" "$2"); shift ;;
     --print-plan) pace_plan=1; pace_args+=("$1") ;;
@@ -129,14 +135,14 @@ while (($#)); do
     --tests-only) pace_tests_only=1; pace_args+=("$1") ;;
     --smoke) pace_smoke=1; pace_args+=("$1") ;;
     --clean|--no-clean) pace_clean_set=1; pace_args+=("$1") ;;
-    --caliper) pace_fail "the validated site profiles are cpu and cuda-sm80; Caliper has no PACE profile yet" ;;
+    --caliper) pace_fail "the site profiles are cpu, cuda-sm70 and cuda-sm80; Caliper has no PACE profile yet" ;;
     --help|-h) pace_help=1; pace_args+=("$1") ;;
     *) pace_args+=("$1") ;;
   esac
   shift
 done
 if [[ $pace_help == 1 ]]; then
-  printf 'PACE submission limits (site wrapper options):\n  --build-time HH:MM:SS       Positive build limit up to 08:00:00 (default).\n  --validation-time HH:MM:SS  Positive validation limit up to 02:00:00 (default).\n\n'
+  printf 'PACE GPU profiles:\n  --gpu --cuda-arch 70       Native V100 workflow debugging (gpu-v100).\n  --a100 / --gpu            Native A100 architecture 80 (gpu-a100 default).\n\nPACE submission limits (site wrapper options):\n  --build-time HH:MM:SS       Positive build limit up to 08:00:00 (default).\n  --validation-time HH:MM:SS  Positive validation limit up to 02:00:00 (default).\n\n'
   exec "${pace_source}/build.sh" --help
 fi
 pace_validate_wall_time "$pace_build_time" 28800 --build-time
@@ -152,18 +158,33 @@ pace_cpu_limit=$(( ${SLURM_CPUS_PER_TASK:-8} * ${SLURM_NTASKS:-1} ))
   pace_fail "build jobs exceed the $pace_cpu_limit allocated CPUs"
 export IGRLAB_BUILD_JOBS="$pace_jobs"
 pace_profile=cpu
+pace_native_arch=80 pace_gpu_partition="" pace_gpu_gres="" pace_gpu_model=""
+if [[ $pace_a100 == 1 ]]; then
+  [[ $pace_cpu_set == 0 && $pace_a100_arch_conflict == 0 ]] || \
+    pace_fail "--a100 conflicts with --cpu-only/--cpu or --cuda-arch other than 80"
+fi
 if [[ $pace_mode == gpu ]]; then
-  [[ -z $pace_arch || $pace_arch == 80 ]] || pace_fail "the PACE GPU profile requires native A100 architecture 80"
-  pace_profile=cuda-sm80
-  pace_args+=(--a100)
+  if [[ $pace_arch_set == 1 ]]; then
+    [[ $pace_arch == 70 || $pace_arch == 80 ]] || pace_fail "PACE GPU profiles require native V100 architecture 70 or A100 architecture 80"
+    pace_native_arch=$pace_arch
+  fi
+  pace_profile=cuda-sm${pace_native_arch}
+  case "$pace_native_arch" in
+    70) pace_gpu_partition=gpu-v100; pace_gpu_gres=gpu:v100:1; pace_gpu_model=V100 ;;
+    80) pace_gpu_partition=gpu-a100; pace_gpu_gres=gpu:a100:1; pace_gpu_model=A100
+        pace_args+=(--a100) ;;
+  esac
+elif [[ $pace_arch_set == 1 ]]; then
+  pace_fail "--cuda-arch is only valid with --gpu"
 fi
 export IGRLAB_BUILD_SITE=pace IGRLAB_PACE_DEPENDENCY_ROOT="$pace_dependency_root"
 export IGRLAB_SPACK_ENV="$pace_dependency_root/site/pace/spack-envs/$pace_profile"
-export IGRLAB_CUDA_ARCH=80 IGRLAB_MFEM_CUDA_ARCHS=80 IGRLAB_APP_CUDA_ARCHS=80
+export IGRLAB_CUDA_ARCH="$pace_native_arch" IGRLAB_MFEM_CUDA_ARCHS="$pace_native_arch" IGRLAB_APP_CUDA_ARCHS="$pace_native_arch"
 if [[ $pace_plan == 1 ]]; then
   printf '[site-plan] site=pace profile=%s target=x86_64_v3 account=gts-sbryngelson3 qos=embers submit=%s\n' "$pace_profile" "$pace_submit"
   printf '[site-plan] dependency_root=%s spack_env=%s\n' "$pace_dependency_root" "$IGRLAB_SPACK_ENV"
   printf '[site-plan] build_time=%s validation_time=%s\n' "$pace_build_time" "$pace_validation_time"
+  [[ $pace_mode != gpu ]] || printf '[site-plan] validation_partition=%s validation_gres=%s\n' "$pace_gpu_partition" "$pace_gpu_gres"
   exec "${pace_source}/build.sh" "${pace_args[@]}"
 fi
 [[ $(hostname -f) == *.pace.gatech.edu || -d /storage/pace-apps ]] || pace_fail "this profile requires PACE; use --print-plan for an offline plan"
@@ -202,8 +223,8 @@ PY
   fi
   if [[ $pace_tests == 1 || $pace_smoke == 1 ]]; then
     pace_partition=cpu-small pace_resources=()
-    if [[ $pace_profile == cuda-sm80 ]]; then
-      pace_partition=gpu-a100; pace_resources+=(--gres=gpu:a100:1)
+    if [[ $pace_mode == gpu ]]; then
+      pace_partition=$pace_gpu_partition; pace_resources+=(--gres="$pace_gpu_gres")
     fi
     pace_validation=$(sbatch --parsable "${pace_validation_dependency[@]}" --kill-on-invalid-dep=yes --account=gts-sbryngelson3 \
       --qos=embers --partition="$pace_partition" "${pace_resources[@]}" --nodes=1 --ntasks=4 \
@@ -218,10 +239,10 @@ fi
 [[ -n ${SLURM_JOB_ID:-} && ${SLURM_JOB_ACCOUNT:-} == gts-sbryngelson3 &&
    ${SLURM_JOB_QOS:-} == embers ]] || pace_fail "use --submit or a free embers compute allocation"
 [[ $(hostname -f) != *login* ]] || pace_fail "compilation requires a compute node"
-if [[ $pace_profile == cuda-sm80 && ($pace_tests == 1 || $pace_smoke == 1) ]]; then
+if [[ $pace_mode == gpu && ($pace_tests == 1 || $pace_smoke == 1) ]]; then
   # Interactive srun steps can expose only the step's assigned GPU IDs.
-  [[ ${SLURM_JOB_PARTITION:-} == gpu-a100 && -n ${SLURM_JOB_GPUS:-${SLURM_STEP_GPUS:-}} ]] || \
-    pace_fail "CUDA validation requires an allocated A100; use --submit or --no-tests for compilation"
+  [[ ${SLURM_JOB_PARTITION:-} == "$pace_gpu_partition" && -n ${SLURM_JOB_GPUS:-${SLURM_STEP_GPUS:-}} ]] || \
+    pace_fail "CUDA validation requires an allocated $pace_gpu_model; use --submit or --no-tests for compilation"
   export DG_IGR_TEST_DEVICE=cuda
 fi
 type module >/dev/null 2>&1 || pace_fail "PACE environment modules are unavailable"
@@ -252,13 +273,13 @@ mapfile -t pace_prefixes < <(python3 -c 'import json, sys; c=json.load(sys.stdin
 pace_mpi=${pace_prefixes[0]} pace_cuda=${pace_prefixes[1]}
 export PATH="$pace_mpi/bin:$PATH" LD_LIBRARY_PATH="$pace_mpi/lib:${LD_LIBRARY_PATH:-}"
 [[ $(readlink -f "$(command -v mpicc)") == $(readlink -f "$pace_mpi/bin/mpicc") ]] || pace_fail "selected MPI wrapper mismatch"
-if [[ $pace_profile == cuda-sm80 ]]; then
+if [[ $pace_mode == gpu ]]; then
   [[ $(readlink -f "$(command -v nvcc)") == $(readlink -f "$pace_cuda/bin/nvcc") ]] || pace_fail "selected CUDA compiler mismatch"
 fi
 unset OMPI_MCA_plm OMPI_MCA_ras OMPI_MCA_pml OMPI_MCA_btl OMPI_MCA_ess OMPI_MCA_ess_singleton_isolated
 unset SPACK_ENV SPACK_ROOT CUDA_ARCHS MFEM_CUDA_ARCHS APP_CUDA_ARCHS SPACK_CUDA_ARCH
 unset NVCC_PREPEND_FLAGS NVCC_APPEND_FLAGS
-export IGRLAB_CUDA_ARCH=80 IGRLAB_MFEM_CUDA_ARCHS=80 IGRLAB_APP_CUDA_ARCHS=80
+export IGRLAB_CUDA_ARCH="$pace_native_arch" IGRLAB_MFEM_CUDA_ARCHS="$pace_native_arch" IGRLAB_APP_CUDA_ARCHS="$pace_native_arch"
 export SPACK_USER_CONFIG_PATH="$pace_dependency_root/site/pace/spack-user"
 export SPACK_SYSTEM_CONFIG_PATH="$pace_dependency_root/site/pace/spack-system"
 export SPACK_USER_CACHE_PATH="$pace_dependency_root/spack-cache"

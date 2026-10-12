@@ -123,9 +123,12 @@ class PaceDiscovery(unittest.TestCase):
                     self.assertEqual(stripped[key].pop("prefix"), str(expected))
                 mpi = "openmpi-cpu" if profile == "cpu" else "openmpi-gpu"
                 self.assertEqual(stripped["profiles"][profile].pop("mpi_prefix"), str(self.prefixes[mpi]))
-                if profile == "cuda-sm80":
+                if profile != "cpu":
                     self.assertEqual(stripped.pop("cuda_prefix"), str(self.prefixes["cuda"]))
-                self.assertEqual(stripped, self.config)
+                expected = copy.deepcopy(self.config)
+                if profile in ("cpu", "cuda-sm80"):
+                    expected["profiles"].pop("cuda-sm70")
+                self.assertEqual(stripped, expected)
                 self.assertEqual(self.index.read_text(), json.dumps({"database": {"version": "8", "installs": {}}}))
 
     def test_loaded_metis_module_resolves_three_actual_dag_shapes(self):
@@ -180,7 +183,8 @@ class PaceDiscovery(unittest.TestCase):
 
     def test_required_precision_abi_and_mpi_variants_reject(self):
         cases = (("metis", "int64", True, "cpu"), ("metis", "real64", True, "cpu"),
-                 ("openblas", "threads", "openmp", "cpu"), ("openmpi-gpu", "cuda", False, "cuda-sm80"))
+                 ("openblas", "threads", "openmp", "cpu"), ("openmpi-gpu", "cuda", False, "cuda-sm80"),
+                 ("openmpi-gpu", "cuda", False, "cuda-sm70"))
         for key, variant, value, profile in cases:
             with self.subTest(key=key, variant=variant):
                 saved = self.records[key][0]["parameters"][variant]
@@ -330,6 +334,17 @@ class PaceDiscovery(unittest.TestCase):
         self.assertEqual(self.discover_recipe("cuda-sm80"), str(self.recipe))
         self.assertEqual(self.calls[-1][1], ["location", "--repo", "builtin"])
         self.assertFalse((self.site_root / "site/pace/spack-envs/cuda-sm80").exists())
+
+    def test_v100_uses_same_exact_cuda_mpi_stack_without_installing_or_touching_a100(self):
+        selected = self.retain("cuda-sm80")
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in selected.iterdir()}
+        discovered = self.discover("cuda-sm70")
+        self.assertEqual(discovered["profiles"]["cuda-sm70"]["mpi_prefix"], str(self.prefixes["openmpi-gpu"]))
+        self.assertEqual(discovered["cuda_prefix"], str(self.prefixes["cuda"]))
+        self.assertEqual(self.discover_recipe("cuda-sm70"), str(self.recipe))
+        self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in selected.iterdir()})
+        self.assertFalse((self.site_root / "site/pace/spack-envs/cuda-sm70").exists())
+        self.assertFalse(any("install" in arguments for _, arguments, _ in self.calls))
 
     def test_other_profile_environment_supplies_authority_without_shared_scope(self):
         selected = self.retain("cuda-sm80", shared=False)

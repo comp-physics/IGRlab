@@ -152,8 +152,8 @@ if [[ "${MODE}" == "gpu" ]]; then
     exit 2
   fi
   HYPRE_SPEC="hypre@develop+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
-  if [[ "${SPACK_CUDA_ARCH}" == "80" ]]; then
-    # The SM80 manifest pins a compatible release; identity still binds its DAG hash.
+  if [[ "${SPACK_CUDA_ARCH}" == "70" || "${SPACK_CUDA_ARCH}" == "80" ]]; then
+    # The SM70/SM80 manifests pin compatible releases; identity still binds the DAG hash.
     HYPRE_SPEC="hypre+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
   fi
   MPI_SPEC="openmpi+cuda"
@@ -201,8 +201,8 @@ spack_location() {
   spack -e "${SPACK_ENV}" location -i "$1"
 }
 
-configure_sm80_hypre_linalg() {
-  [[ "${SPACK_CUDA_ARCH}" == "80" ]] || return 0
+configure_cuda_hypre_linalg() {
+  [[ "${SPACK_CUDA_ARCH}" == "70" || "${SPACK_CUDA_ARCH}" == "80" ]] || return 0
   local prefix hash dependencies library="" candidate
   prefix="$(spack_location openblas)"
   prefix="$(realpath -e -- "${prefix}")" || exit 3
@@ -210,7 +210,7 @@ configure_sm80_hypre_linalg() {
   dependencies="$(SPACK_COLOR=never spack -e "${SPACK_ENV}" find \
     --format '{^blas.hash}|{^lapack.hash}' "${HYPRE_SPEC}")"
   [[ "${hash}" =~ ^[a-z0-9]{32}$ && "${dependencies}" == "${hash}|${hash}" ]] || {
-    echo "ERROR: SM80 HYPRE BLAS/LAPACK must match the selected Spack OpenBLAS identity." >&2
+    echo "ERROR: SM${SPACK_CUDA_ARCH} HYPRE BLAS/LAPACK must match the selected Spack OpenBLAS identity." >&2
     exit 3
   }
   for candidate in "${prefix}/lib/libopenblas.so" "${prefix}/lib64/libopenblas.so"; do
@@ -222,7 +222,7 @@ configure_sm80_hypre_linalg() {
   case "${library}" in
     "${prefix}"/*) ;;
     *)
-      echo "ERROR: SM80 requires a shared OpenBLAS library inside its concrete prefix: ${prefix}" >&2
+      echo "ERROR: SM${SPACK_CUDA_ARCH} requires a shared OpenBLAS library inside its concrete prefix: ${prefix}" >&2
       exit 3
       ;;
   esac
@@ -300,7 +300,7 @@ if [[ "${MODE}" == "gpu" ]]; then
     -DCUDAToolkit_ROOT="${CUDA_PREFIX}"
     -DUMPIRE_DIR="${UMPIRE_PREFIX}"
   )
-  configure_sm80_hypre_linalg
+  configure_cuda_hypre_linalg
 else
   cmake_args+=(
     -DMFEM_USE_CUDA=OFF

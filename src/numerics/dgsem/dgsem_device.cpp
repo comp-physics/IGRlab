@@ -1705,6 +1705,13 @@ struct FusedResidualData
 template<int N, bool LLF, bool Tensor>
 __global__ void FusedEulerResidualKernel(FusedResidualData data)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  if constexpr (Tensor)
+  {
+    asm volatile("trap;");
+    return;
+  }
+#endif
   constexpr int dof = N * N;
   constexpr int pairs_per_line = N * (N - 1) / 2;
   constexpr int pairs = 2 * N * pairs_per_line;
@@ -1816,6 +1823,7 @@ __global__ void FusedEulerResidualKernel(FusedResidualData data)
 
   if constexpr (Tensor)
   {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     // The four conserved fields supply real columns, not duplicated right-
     // hand sides. Directional lines remain on chip with their nodal physics.
     // The 8-row extent, final 8-column tile, and final inner chunk are padded.
@@ -1871,6 +1879,7 @@ __global__ void FusedEulerResidualKernel(FusedResidualData data)
       __syncwarp();
     }
     __syncthreads();
+#endif
   }
 
   for (int entry = thread; entry < 4 * dof; entry += blockDim.x)
@@ -2080,6 +2089,24 @@ void ApplyFusedEulerResidualDevice(
 #if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
   MFEM_VERIFY(Device::Allows(Backend::CUDA_MASK),
               "Fused DGSEM residual requires the CUDA backend.");
+  if (tensor_contraction)
+  {
+    // MFEM configures one device for the process lifetime. Cache its capability
+    // once so tensor residual evaluations do not add CUDA host queries.
+    static const int configured_device = Device::GetId();
+    MFEM_VERIFY(Device::GetId() == configured_device,
+        "The configured CUDA device changed after FP64 DGSEM tensor initialization.");
+    static const int compute_major = []
+    {
+      int major = 0;
+      MFEM_VERIFY(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                                        configured_device) == cudaSuccess,
+          "Failed to query the CUDA device for FP64 DGSEM tensor contraction.");
+      return major;
+    }();
+    MFEM_VERIFY(compute_major >= 8,
+        "FP64 DGSEM tensor contraction requires CUDA compute capability 8.0 or newer.");
+  }
   FusedResidualData data;
   data.rows = rows;
   data.face_rows = face_flux.Height();

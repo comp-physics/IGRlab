@@ -18,11 +18,12 @@ CONFIG = PACE.load_config()
 
 
 def discovered_fixture(profile):
-    config = copy.deepcopy(CONFIG)
+    config = PACE.profile_config(CONFIG, profile)
     for name in ("compiler", "cmake", "metis", "openblas"):
         config[name]["prefix"] = f"/site-fixture/{name}"
-    config["profiles"][profile]["mpi_prefix"] = f"/site-fixture/{profile}/openmpi"
-    if profile == "cuda-sm80":
+    mpi_profile = "cuda-sm80" if profile == "cuda-sm70" else profile
+    config["profiles"][profile]["mpi_prefix"] = f"/site-fixture/{mpi_profile}/openmpi"
+    if profile != "cpu":
         config["cuda_prefix"] = "/site-fixture/cuda"
     return config
 
@@ -31,7 +32,8 @@ def concrete_fixture(profile):
     """Minimal concrete lock with the real site's declared external identities."""
     config = discovered_fixture(profile)
     selected = config["profiles"][profile]
-    gpu = profile == "cuda-sm80"
+    gpu = profile != "cpu"
+    cuda_arch = profile.removeprefix("cuda-sm") if gpu else None
     nodes, identities = {}, {}
 
     def add(name, version, parameters=None, prefix=None, rooted=True):
@@ -55,9 +57,9 @@ def concrete_fixture(profile):
     if gpu:
         add("cuda", config["cuda_version"], prefix=config["cuda_prefix"])
         umpire = add("umpire", config["umpire_version"], {"shared": True, "c": True, "cuda": True,
-                     "cuda_arch": ["80"], "fortran": False, "examples": False})
+                     "cuda_arch": [cuda_arch], "fortran": False, "examples": False})
         umpire["dependencies"] = [{"name": "cuda", "hash": identities["cuda"]}]
-        hypre["parameters"].update(cuda_arch=["80"], **{"gpu-aware-mpi": True, "unified-memory": False})
+        hypre["parameters"].update(cuda_arch=[cuda_arch], **{"gpu-aware-mpi": True, "unified-memory": False})
         dependencies.extend(("cuda", "umpire"))
     hypre["dependencies"] = [{"name": name, "hash": identities[name]} for name in dependencies]
     roots = [{"hash": identity, "spec": node["name"]} for identity, node in nodes.items() if node["name"] != "gcc"]
@@ -147,6 +149,47 @@ class PaceManifest(unittest.TestCase):
         self.assertEqual(before, {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths})
         PACE.write_environment(self.root, "cuda-sm80", self.recipes, discovered_fixture("cuda-sm80"))
         self.assertEqual(before, {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths})
+
+    def test_v100_profile_uses_native_separate_graph_and_preserves_legacy_documents(self):
+        retained = []
+        for profile in ("cpu", "cuda-sm80"):
+            config = discovered_fixture(profile)
+            self.assertNotIn("cuda-sm70", config["profiles"])
+            retained.extend(PACE.write_environment(self.root, profile, self.recipes, config))
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in retained}
+        paths = PACE.write_environment(self.root, "cuda-sm70", self.recipes, discovered_fixture("cuda-sm70"))
+        rendered = json.loads(paths[0].read_text())["spack"]
+        self.assertEqual(rendered["config"]["install_tree"]["root"], str(self.root / "spack-store/cuda-sm70"))
+        for name in ("hypre", "umpire"):
+            spec = next(spec for spec in rendered["specs"] if spec.startswith(name + "@"))
+            self.assertIn("cuda_arch=70", spec)
+            self.assertNotIn("cuda_arch=80", spec)
+        for profile in ("cpu", "cuda-sm80"):
+            # Full policy discovery and an already-retained two-profile receipt
+            # must normalize to exactly the same existing documents.
+            config = discovered_fixture(profile)
+            config["profiles"]["cuda-sm70"] = copy.deepcopy(CONFIG["profiles"]["cuda-sm70"])
+            PACE.write_environment(self.root, profile, self.recipes, config)
+        self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in retained})
+
+    def test_v100_requires_native_architecture_in_every_gpu_dependency(self):
+        for name in ("hypre", "umpire"):
+            for value in (["80"], ["70", "80"], ["120"], "none"):
+                with self.subTest(name=name, value=value):
+                    lock = concrete_fixture("cuda-sm70")
+                    node(lock, name)["parameters"]["cuda_arch"] = value
+                    with self.assertRaisesRegex(PACE.PaceError, "cuda_arch"):
+                        PACE.check_lock(lock, "cuda-sm70", discovered_fixture("cuda-sm70"))
+        for profile, other in (("cuda-sm70", "cuda-sm80"), ("cuda-sm80", "cuda-sm70")):
+            with self.assertRaisesRegex(PACE.PaceError, "cuda_arch"):
+                PACE.check_lock(concrete_fixture(other), profile, discovered_fixture(profile))
+
+    def test_v100_retained_policy_cannot_change_modules_or_mpi_variants(self):
+        for key, value in (("modules", ["unrelated/module"]), ("mpi_version", "4.1.5")):
+            config = discovered_fixture("cuda-sm70")
+            config["profiles"]["cuda-sm70"][key] = value
+            with self.assertRaisesRegex(PACE.PaceError, "constraints"):
+                PACE.manifest(self.root, "cuda-sm70", self.recipes, config)
 
     def test_changed_manifest_is_preserved_and_new_root_is_requested(self):
         path = PACE.write_environment(self.root, "cpu", self.recipes, discovered_fixture("cpu"))[0]

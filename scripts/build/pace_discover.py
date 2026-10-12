@@ -15,7 +15,7 @@ import subprocess
 import sys
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "cmake/sites/pace.json"
-PROFILES = ("cpu", "cuda-sm80")
+PROFILES = ("cpu", "cuda-sm80", "cuda-sm70")
 ISOLATED_VARIABLES = ("SPACK_ENV", "SPACK_USER_CONFIG_PATH", "SPACK_SYSTEM_CONFIG_PATH",
                       "SPACK_USER_CACHE_PATH", "SPACK_DISABLE_LOCAL_CONFIG", "SPACK_ROOT")
 
@@ -167,6 +167,10 @@ def installed_package(spack, environment, store, specification, name, version, t
 def discover_config(profile, spack, anchor, config=None, environ=None):
     require(profile in PROFILES, f"unsupported PACE profile: {profile}")
     config = copy.deepcopy(json.loads(CONFIG_PATH.read_text()) if config is None else config)
+    # Existing CPU/SM80 site-packages.json receipts contain the original two
+    # profiles. A new independent V100 profile must not rewrite those records.
+    if profile in ("cpu", "cuda-sm80"):
+        config["profiles"].pop("cuda-sm70", None)
     spack, environment = admitted_reader(spack, environ)
     store, compiler_anchor = discover_store(anchor)
     target, gcc = config["target"], config["compiler"]["version"]
@@ -190,7 +194,7 @@ def discover_config(profile, spack, anchor, config=None, environ=None):
         f'openmpi@={selected["mpi_version"]} ', 1).replace(f"%gcc@{gcc}", f"%gcc@={gcc}")
     selected["mpi_prefix"], _ = installed_package(spack, environment, store, mpi_spec,
         "openmpi", selected["mpi_version"], target, selected["mpi_parameters"], gcc, gcc_hash)
-    if profile == "cuda-sm80":
+    if profile != "cpu":
         version = config["cuda_version"]
         config["cuda_prefix"], _ = installed_package(spack, environment, store,
             f"cuda@={version} target={target}", "cuda", version, target)

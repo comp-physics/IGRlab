@@ -58,7 +58,8 @@ Missing or ambiguous site packages stop the build before compilation.
 `--submit` prints job IDs and log paths. Compilation uses `cpu-small`, one task,
 eight CPUs, 48 GiB and a default eight-hour limit. When tests are enabled, a dependent
 validation job defaults to two hours, four MPI slots with two CPUs each, and 48 GiB. GPU
-validation requests one A100 on `gpu-a100`; CPU validation uses `cpu-small`.
+validation requests one A100 on `gpu-a100`, or one V100 on `gpu-v100` for
+`--gpu --cuda-arch 70`; CPU validation uses `cpu-small`.
 Use `--build-time HH:MM:SS` and `--validation-time HH:MM:SS` to request shorter
 allocations, up to those defaults. The submission plan and request receipt retain
 the chosen limits. For a focused correctness selection, for example, add
@@ -133,6 +134,78 @@ a longer allocation for larger convergence or HDG alignment selections. An
 interactive `srun` step may expose `SLURM_STEP_GPUS` without `SLURM_JOB_GPUS`;
 the driver accepts that assignment and retains Slurm's CUDA-visible mapping.
 
+The one-task, eight-CPU shell can expose only one MPI launch slot. The CUDA
+DGSEM checks `dg_igr_dgsem_operator_mpi_2rank_cuda` and
+`dg_igr_dgsem_operator_split_mpi_4rank_cuda` require two and four ranks. If MPI
+reports insufficient slots, apply the selected Open MPI 5 mapping and binding
+settings only to this canonical correctness command:
+
+```bash
+PRTE_MCA_rmaps_default_mapping_policy=:oversubscribe \
+PRTE_MCA_hwloc_default_binding_policy=none \
+"$SOURCE_ROOT/build.sh" --site pace --a100 --hdg-runtime --tests-only --no-clean \
+  --site-root "$SITE_ROOT" --spack-root "$SPACK_TOOL_ROOT" \
+  --output-root "$OUTPUT_ROOT" --mfem-output-root "$MFEM_ROOT" \
+  --test-regex '^dg_igr_dgsem_operator_(mpi_2rank_cuda|split_mpi_4rank_cuda)$' </dev/null
+```
+
+Repeat any feature flags from the completed build, including `--nvtx-profile`
+when enabled. Redirect standard input so MPI children cannot consume pasted
+interactive shell input. Keep Slurm's allocation variables unchanged. These
+settings let the existing MPI launchers run within the allocated eight CPUs and one GPU;
+they request no extra resources and establish no timing result. See
+[Open MPI 5 mapping parameters](https://docs.open-mpi.org/en/v5.0.9/mca.html#converting-mapping-parameters).
+The regular `--submit` validation route requests four Slurm tasks.
+
+V100 workflow debugging uses `--gpu --cuda-arch 70`, with a separate native
+`cuda-sm70` environment, application outputs and MFEM cache. It uses the same
+GCC 12.3 / CUDA 12.9.1 / CUDA-aware OpenMPI 5.0.9 site stack, discovered through
+Spack. The SM70 profile has host-fixture coverage; native compilation and V100
+execution have not yet been validated. Existing CPU/SM80 environment documents
+remain unchanged. With
+`SOURCE_ROOT` and `SPACK_TOOL_ROOT` set as above, choose fresh V100 roots and
+submit compilation to CPU compute:
+
+```bash
+export V100_SITE_ROOT=/absolute/scratch/igrlab-site-v100
+export V100_OUTPUT_ROOT=/absolute/scratch/igrlab-build-v100
+export V100_MFEM_ROOT=/absolute/scratch/igrlab-mfem-sm70
+
+"$SOURCE_ROOT/build.sh" --site pace --gpu --cuda-arch 70 --submit --no-tests \
+  --site-root "$V100_SITE_ROOT" --spack-root "$SPACK_TOOL_ROOT" \
+  --output-root "$V100_OUTPUT_ROOT" --mfem-output-root "$V100_MFEM_ROOT" --no-clean
+```
+
+After successful build receipt publication, enter a free V100 allocation with
+the same shell-launch rule, then run the four DG/DGSEM numerical checks:
+
+```bash
+srun --account=gts-sbryngelson3 --qos=embers --partition=gpu-v100 \
+  --nodes=1 --ntasks=1 --cpus-per-task=8 --mem=48G --gres=gpu:v100:1 \
+  --time=00:30:00 --mpi=none --pty bash -l
+
+"$SOURCE_ROOT/build.sh" --site pace --gpu --cuda-arch 70 --tests-only --no-clean \
+  --site-root "$V100_SITE_ROOT" --spack-root "$SPACK_TOOL_ROOT" \
+  --output-root "$V100_OUTPUT_ROOT" --mfem-output-root "$V100_MFEM_ROOT" \
+  --test-regex '^igrlab_numerical_(conservation_cpu|conservation_cuda|backend_parity_cuda|dg_convergence_cpu)$'
+```
+
+This selection exercises conservation, spatial convergence and direct CPU/CUDA
+agreement in production DG/DGSEM. SM70 does not enable HDG or its tensor route.
+Release the allocation when finished. Final HDG/tensor acceptance and hardware
+performance comparisons still require A100; the maintained `perf.sh` measurement
+provider admits A100 only. V100 workflow results do not establish A100 speedups.
+
+Profiler versions also limit V100 debugging. The observed Nsight Compute
+2026.3 does not support Volta/V100; see NVIDIA's
+[GPU support table](https://docs.nvidia.com/nsight-compute/ReleaseNotes/index.html#gpu-support).
+Nsight Systems 2025.1.3 predates the documented removal of Volta support in
+2025.4; see the [release notes](https://docs.nvidia.com/nsight-systems/ReleaseNotes/index.html#deprecated-features).
+An older Nsight Compute with documented Volta support still needs its local
+availability and an actual capture verified. This build path establishes no
+V100 profiler readiness. Keep any native captures and trace processing on PACE
+compute nodes.
+
 Inspect a plan without submitting or changing output directories:
 
 ```bash
@@ -159,8 +232,8 @@ The checked-in [site definition](../cmake/sites/pace.json) selects GCC 12.3.0,
 CMake 3.30.2, METIS 5.1.0, OpenBLAS 0.3.23 and HYPRE 3.1.0 in double precision.
 CPU uses site OpenMPI 4.1.5 without CUDA. A100 uses site OpenMPI 5.0.9 with CUDA
 12.9.1 and Umpire 2025.12.0. Every dependency uses the portable `x86_64_v3`
-target, suitable for PACE's AMD A100 hosts. Dependency, MFEM and application CUDA
-code generation all target native SM80. The site profile checks the concrete
+target, suitable for PACE's AMD A100 hosts. A100 dependency, MFEM and application
+CUDA code generation all target native SM80. The site profile checks the concrete
 graph before installing dependencies or compiling MFEM.
 
 The canonical driver refreshes HYPRE discovery and checks the actual cached

@@ -65,6 +65,29 @@
         "internal-hwloc": false,
         "internal-libevent": false
       }
+    },
+    "cuda-sm70": {
+      "modules": [
+        "gcc/12.3.0",
+        "openmpi/5.0.9-cuda",
+        "cmake/3.30.2",
+        "metis/5.1.0",
+        "openblas/0.3.23"
+      ],
+      "mpi_version": "5.0.9",
+      "mpi_spec": "openmpi@5.0.9 +cuda +fortran ~openshmem ~rsh ~romio fabrics=ucx schedulers=slurm ~internal-pmix ~internal-hwloc ~internal-libevent target=x86_64_v3 %gcc@12.3.0",
+      "mpi_parameters": {
+        "cuda": true,
+        "fortran": true,
+        "openshmem": false,
+        "rsh": false,
+        "romio": false,
+        "fabrics": "ucx",
+        "schedulers": "slurm",
+        "internal-pmix": false,
+        "internal-hwloc": false,
+        "internal-libevent": false
+      }
     }
   }
 }

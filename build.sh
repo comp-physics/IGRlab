@@ -1921,8 +1921,8 @@ validate_reused_mfem() {
   if [[ "${MODE}" == "gpu" ]]; then
     mpi_spec="openmpi+cuda"
     hypre_spec="hypre@develop+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
-    if [[ "${SPACK_CUDA_ARCH}" == "80" ]]; then
-      # The SM80 manifest pins a compatible release; identity still binds its DAG hash.
+    if [[ "${SPACK_CUDA_ARCH}" == "70" || "${SPACK_CUDA_ARCH}" == "80" ]]; then
+      # The SM70/SM80 manifests pin compatible releases; identity still binds the DAG hash.
       hypre_spec="hypre+mpi+cuda cuda_arch=${SPACK_CUDA_ARCH}"
     fi
   else

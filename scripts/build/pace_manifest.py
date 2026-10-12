@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "cmake/sites/pace.json"
-PROFILES = ("cpu", "cuda-sm80")
+PROFILES = ("cpu", "cuda-sm80", "cuda-sm70")
 
 
 class PaceError(ValueError):
@@ -18,13 +18,24 @@ def load_config():
     return json.loads(CONFIG_PATH.read_text())
 
 
+def profile_config(config, profile):
+    """Keep retained CPU/SM80 documents unchanged when adding V100 policy."""
+    if profile not in PROFILES:
+        raise PaceError(f"unsupported PACE profile: {profile}")
+    config = copy.deepcopy(config)
+    if profile in ("cpu", "cuda-sm80"):
+        config["profiles"].pop("cuda-sm70", None)
+    return config
+
+
 def resolved_config(config, profile):
     """Accept discovered paths only; the repository still owns constraints."""
-    policy = load_config()
+    policy = profile_config(load_config(), profile)
+    config = profile_config(config, profile)
     candidate = copy.deepcopy(config)
     fields = [(candidate[name], "prefix") for name in ("compiler", "cmake", "metis", "openblas")]
     fields.append((candidate["profiles"][profile], "mpi_prefix"))
-    if profile == "cuda-sm80":
+    if profile != "cpu":
         fields.append((candidate, "cuda_prefix"))
     for owner, key in fields:
         if not owner.get(key):
@@ -53,7 +64,8 @@ def manifest(root, profile, recipe_root, config=None):
     recipe_root = absolute_path(recipe_root, "--recipe-root")
     if profile not in PROFILES:
         raise PaceError(f"unsupported PACE profile: {profile}")
-    gpu = profile == "cuda-sm80"
+    gpu = profile != "cpu"
+    cuda_arch = profile.removeprefix("cuda-sm") if gpu else None
     selected = config["profiles"][profile]
     target = config["target"]
     gcc = config["compiler"]
@@ -88,8 +100,8 @@ def manifest(root, profile, recipe_root, config=None):
     if gpu:
         packages["cuda"] = external(f'cuda@{config["cuda_version"]}', config["cuda_prefix"])
         specs.extend([f'cuda@{config["cuda_version"]} target={target}',
-            hypre + f'+cuda +umpire +gpu-aware-mpi ~unified-memory cuda_arch=80 {common}',
-            f'umpire@{config["umpire_version"]} +shared +c +cuda ~fortran ~examples cuda_arch=80 {common}'])
+            hypre + f'+cuda +umpire +gpu-aware-mpi ~unified-memory cuda_arch={cuda_arch} {common}',
+            f'umpire@{config["umpire_version"]} +shared +c +cuda ~fortran ~examples cuda_arch={cuda_arch} {common}'])
     else:
         specs.append(hypre + f'~cuda ~umpire {common}')
     return {"spack": {
@@ -146,7 +158,8 @@ def check_lock(lock, profile, config=None):
     if profile not in PROFILES:
         raise PaceError(f"unsupported PACE profile: {profile}")
     selected = config["profiles"][profile]
-    gpu = profile == "cuda-sm80"
+    gpu = profile != "cpu"
+    cuda_arch = profile.removeprefix("cuda-sm") if gpu else None
     nodes = lock.get("concrete_specs", {})
     if not isinstance(nodes, dict) or not nodes:
         raise PaceError("lock must contain a nonempty concrete dependency graph")
@@ -222,8 +235,8 @@ def check_lock(lock, profile, config=None):
         cuda_id, cuda = one("cuda", config["cuda_version"], rooted=True)
         umpire_id, umpire = one("umpire", config["umpire_version"], rooted=True)
         prefix(cuda, config["cuda_prefix"])
-        parameters(hypre, {"cuda_arch": "80", "gpu-aware-mpi": True, "unified-memory": False})
-        parameters(umpire, {"cuda": True, "cuda_arch": "80", "shared": True,
+        parameters(hypre, {"cuda_arch": cuda_arch, "gpu-aware-mpi": True, "unified-memory": False})
+        parameters(umpire, {"cuda": True, "cuda_arch": cuda_arch, "shared": True,
                             "c": True, "fortran": False, "examples": False})
         if umpire.get("external"):
             raise PaceError("Umpire must belong to this profile's built dependency graph")

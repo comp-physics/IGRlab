@@ -10,12 +10,17 @@
 #include "mfem.hpp"
 #include "test_utils.hpp"
 
+#ifdef MFEM_USE_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <limits>
 #include <string>
@@ -404,6 +409,28 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
   const std::string requested = RequestedDevice();
   EnsureDeviceConfigured(ctx, requested);
   const auto runtime = mfem::dgsem::GetDGSEMDeviceRuntimeInfo();
+  bool fp64_tensor_supported = false;
+  if (runtime.cuda)
+  {
+#ifdef MFEM_USE_CUDA
+    int compute_major = 0;
+    const cudaError_t status = cudaDeviceGetAttribute(
+        &compute_major, cudaDevAttrComputeCapabilityMajor, mfem::Device::GetId());
+    ctx.Check(status == cudaSuccess && compute_major > 0,
+              "DGSEM CUDA tensor parity capability query succeeds");
+    if (status != cudaSuccess || compute_major <= 0) { return; }
+    fp64_tensor_supported = compute_major >= 8;
+    if (!fp64_tensor_supported)
+    {
+      std::cout << "[SKIP] DGSEM FP64 DMMA tensor parity subcases require CUDA "
+                   "compute capability major 8 or newer; configured major="
+                << compute_major << ". Ordinary SIMT parity remains enabled.\n";
+    }
+#else
+    ctx.Check(false, "DGSEM CUDA tensor parity requires CUDA compilation");
+    return;
+#endif
+  }
 
   double max_basis_error = 0.0;
   std::array<DimensionalKernelErrors, 2> dimension_errors;
@@ -868,6 +895,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
           for (bool frozen_speed : {false, true})
           for (bool tensor_contraction : {false, true})
           {
+            if (tensor_contraction && !fp64_tensor_supported) { continue; }
             mfem::DenseMatrix fused;
             mfem::Vector fused_speeds, ordinary_speeds;
             mfem::dgsem::ApplyFusedEulerResidualDevice(1, n1d, gamma,
@@ -952,6 +980,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
           for (double factor : {0.0, 0.37, 1.0})
             for (bool tensor : {false, true})
             {
+              if (tensor && !fp64_tensor_supported) { continue; }
               blend = factor;
               mfem::dgsem::ApplyFusedEulerResidualDevice(1, n1d, gamma, rho_floor,
                   false, true, lex_to_local, basis.Dsplit, basis.weights, states,
@@ -1057,6 +1086,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
           }
         for (bool tensor_contraction : {false, true})
         {
+          if (tensor_contraction && !fp64_tensor_supported) { continue; }
           mfem::DenseMatrix fused;
           mfem::Vector fused_speeds;
           mfem::dgsem::ApplyFusedEulerResidualDevice(1, n1d, gamma, rho_floor,
