@@ -209,6 +209,26 @@ node's host. This is a paired backend comparison, not a CPU scaling study.
 The adapter excludes CPU HDG and CPU fused/tensor routes. Host fixtures cover
 the contract; successful native runs are still required to establish parity.
 
+The [pace-igr-dg-orders.json](../scripts/perf/suites/pace-igr-dg-orders.json)
+research sweep selects ordinary DG orders one through ten on 1024 cells.
+The additional `(p, cells)` points `(1, 16384)`, `(3, 4096)`, `(7, 1024)` and
+`(10, 576)` have 65536, 65536, 65536 and 69696 scalar polynomial DOFs,
+respectively. These complement the fixed-mesh sweep with approximately
+constant work size; they are not equal-accuracy discretizations. CPU endpoint
+cases at orders one and ten support same-order CPU/CUDA field comparisons.
+Only the familiar p3 point is enabled by default; select research points
+explicitly and establish native convergence, backend identity and memory use
+before treating their times as admitted performance results.
+
+All order points initially use the same ten fixed steps and `dt=1e-5`.
+Record Krylov work and numerical acceptance at each order. If stability or
+convergence requires a different timestep, preserve the failed attempt and
+declare a new workload; never silently shorten the horizon or loosen the
+closure tolerances. Compare physical arrays only between matching meshes and
+orders. This ordinary-DG suite does not establish high-order support for the
+separate DGSEM or HDG implementations; their actual kernel/storage paths must
+be extended and validated rather than merely changing study admission.
+
 Reports list every enabled frozen-suite case with its discretization, device,
 engine, DGSEM residual, timing scope, and individual timing/profile state.
 A two-case selection cannot establish coverage of every backend. CPU cases use

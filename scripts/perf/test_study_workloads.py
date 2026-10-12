@@ -173,6 +173,26 @@ class WorkloadTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             workloads.command(self.hdg, Path('/binary'), ROOT, self.work, profile=True, fields=True)
 
+    def test_dg_order_ten_preserves_closure_policy_and_other_backend_limits(self):
+        original = workloads.load_suite(IGR_SUITE)['cases'][0]
+        for device in ('cpu', 'cuda'):
+            high = copy.deepcopy(original)
+            high['parameters'].update(order=10, device=device)
+            argv = workloads.command(high, Path('/binary'), ROOT, self.work)
+            self.assertEqual(argv[argv.index('-o') + 1], '10')
+            self.assertIn('--igr-exact-dg-face', argv)
+            self.assertEqual(argv[argv.index('--igr-lin-rtol') + 1], '1e-10')
+            low = copy.deepcopy(high)
+            low['parameters']['order'] = 3
+            self.assertEqual(workloads.environment(high, self.work), workloads.environment(low, self.work))
+        for override in ({'order': 11}, {'order': True}, {'order': 10.0},
+                         {'discretization': 'dgsem', 'order': 5},
+                         {'discretization': 'hdg', 'order': 4}):
+            case = copy.deepcopy(original)
+            case['parameters'].update(override)
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                workloads.command(case, Path('/binary'), ROOT, self.work)
+
     def test_hdg_complete_finite_record_and_configurable_measured_steps(self):
         self.hdg['parameters']['measured_steps'] = 3
         value = self.parse_hdg(hdg_record(self.hdg))

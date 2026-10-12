@@ -93,7 +93,7 @@ def parameters(case):
     require(set(supplied) <= allowed, f'unknown {adapter} parameter')
     result = {**defaults[adapter], **supplied}
     if adapter in ('dg', 'hdg'):
-        require(integer(result['order'], 'order', 1) <= (8 if adapter == 'dg' else 3), 'unsupported order')
+        require(integer(result['order'], 'order', 1) <= (10 if adapter == 'dg' else 3), 'unsupported order')
         number(result['dt'], 'dt', positive=True)
     if adapter == 'dg':
         if IGR_PARAMETERS & set(supplied):
