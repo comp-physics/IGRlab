@@ -25,10 +25,16 @@
         "selection": "first-per-kernel",
         "launch_skip": 0,
         "launch_count": 32,
-        "kernel_regex": ".*(?:PackedWeakDivEulerKernel|PackedDiagonalInverseMassKernel|PackedInverseMassKernel|Packed.*FaceEulerRusanov.*Kernel).*",
+        "kernel_regex": "(?:.*(?:PackedWeakDivEulerKernel|PackedDiagonalInverseMassKernel|PackedInverseMassKernel|Packed.*FaceEulerRusanov.*Kernel).*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
         "kernel_groups": {
           "volume": "PackedWeakDivEulerKernel",
-          "inverse_mass": "Packed(?:Diagonal)?InverseMassKernel"
+          "inverse_mass": "Packed(?:Diagonal)?InverseMassKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
         },
         "timeout": 240
       }
@@ -53,11 +59,17 @@
         "selection": "first-per-kernel",
         "launch_skip": 0,
         "launch_count": 32,
-        "kernel_regex": ".*(?:ApplyCentralVolumeDevice|ApplyInverseMassDevice|BuildEulerContravariantFluxDevice).*",
+        "kernel_regex": "(?:.*(?:ApplyCentralVolumeDevice|ApplyInverseMassDevice|BuildEulerContravariantFluxDevice).*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
         "kernel_groups": {
           "volume": "ApplyCentralVolumeDevice",
           "inverse_mass": "ApplyInverseMassDevice",
-          "flux": "BuildEulerContravariantFluxDevice"
+          "flux": "BuildEulerContravariantFluxDevice",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
         },
         "timeout": 240
       }
@@ -83,9 +95,15 @@
         "selection": "first-per-kernel",
         "launch_skip": 0,
         "launch_count": 32,
-        "kernel_regex": ".*FusedEulerResidualKernel.*",
+        "kernel_regex": "(?:.*FusedEulerResidualKernel.*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
         "kernel_groups": {
-          "fused_residual": "FusedEulerResidualKernel"
+          "fused_residual": "FusedEulerResidualKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
         },
         "timeout": 240
       }
@@ -111,9 +129,15 @@
         "selection": "first-per-kernel",
         "launch_skip": 0,
         "launch_count": 32,
-        "kernel_regex": ".*FusedEulerResidualKernel.*",
+        "kernel_regex": "(?:.*FusedEulerResidualKernel.*|.*(?:InteriorFaceDGDiffusionRecord2D|InteriorFaceDGDiffusionGather2D|SmemPADiffusionApply2D|SmemPAMassApply2D|OperatorChebyshevSmoother::Mult|mfem::internal::reduction_kernel|mfem::Vector::operator [+=]|mfem::add\\().*)",
         "kernel_groups": {
-          "fused_residual": "FusedEulerResidualKernel"
+          "fused_residual": "FusedEulerResidualKernel",
+          "closure_face_record": "InteriorFaceDGDiffusionRecord2D",
+          "closure_face_gather": "InteriorFaceDGDiffusionGather2D",
+          "closure_pa_diffusion": "SmemPADiffusionApply2D",
+          "closure_pa_mass": "SmemPAMassApply2D",
+          "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
+          "closure_reduction": "mfem::internal::reduction_kernel"
         },
         "timeout": 240
       }
