@@ -474,6 +474,35 @@ stage, and all build and correctness jobs completed successfully. The original
 run's lock excludes concurrent workers during retry preparation. Ordinary retry
 continues to require every recorded job to be inactive.
 
+To keep successful tools after a partial profiling attempt, use a new immutable
+continuation instead of recapturing them:
+
+```bash
+./perf.sh retry --from-run /absolute/scratch/studies/partial-profiles \
+  --run-dir /absolute/scratch/studies/profiles-continuation \
+  --profiles-only --continue-profiles --prepare-only --profiles-time 00:30:00
+```
+
+This mode preserves the exact suite and timing bytes and rejects `--suite` and
+`--cases`. It seals each completed tool's checkpoint, application command/log
+receipts and profiler identity; failed, pending or partial tools are collected
+again. The worker checks retained native-report and export hashes on compute and
+validates every retained application log against the original unprofiled work
+before launching any missing tool. A completed Nsys checkpoint can therefore be
+retained even when NCU failed before the old application gate. A member is complete
+only when both Nsys and NCU are complete and its application logs pass.
+
+The continuation may use another A100. Each tool retains its actual GPU UUID,
+origin job and profiler version. Reports label these as independent diagnostic
+captures, with no matched profiler timing or speedup claim; original unprofiled
+paired timings remain the timing authority. Keep all referenced runs and files.
+Without `--prepare-only`, only the missing-tool profiling stage is submitted;
+otherwise use the new run's `resume --stage profiles` or frozen interactive
+wrapper. Preparation requires inactive scheduler jobs and a closed attempt.
+A hard scheduler kill that leaves the old attempt marked `running` is rejected;
+this command does not repair old state. Ordinary profile-only retry retains its
+original-GPU rule and recaptures both members.
+
 Use `retry --cases` to measure additional cases already present in the old
 suite, including optional DGSEM probes, without submitting compilation or
 correctness jobs:

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -645,6 +646,288 @@ class RetryTests(unittest.TestCase):
             with self.subTest(wrong=wrong), self.assertRaisesRegex(RuntimeError, 'owned free one-A100'):
                 self.retry(profiles_only=True)
         self.assertFalse(self.new.exists())
+
+    def profile_record(self, case, directory, gpu, job, names=('nsys', 'ncu')):
+        profile = case['profile']
+        record = {'status': 'complete', 'adapter': case['adapter'], 'gpu_uuid': gpu['uuid'],
+            'selected_kernel_regex': profile['kernel_regex'], 'selection': profile.get('selection', 'launches'),
+            'launch_skip': profile['launch_skip'], 'launch_count': profile['launch_count'],
+            'required_kernel_groups': profile.get('kernel_groups', {}), 'captures': {}, 'tools': {},
+            'application_logs': []}
+        def artifact(path):
+            return {'path': str(path), 'sha256': study.sha(path), 'bytes': path.stat().st_size}
+        for name in names:
+            log = directory / name
+            log.mkdir(parents=True)
+            (log / 'stdout.log').write_text('admitted numerical output fixture\n')
+            (log / 'stderr.log').write_text('')
+            native = directory / ('capture-' + name + ('.nsys-rep' if name == 'nsys' else '.ncu-repz'))
+            native.write_text('synthetic native bytes; no profiler execution\n')
+            identity = {'executable': {'path': '/selected/' + name, 'sha256': 'a' * 64, 'bytes': 1}}
+            for key in ('version_stdout', 'help_stdout'):
+                path = log / (key + '.log')
+                path.write_text('synthetic tool identity\n')
+                identity[key] = artifact(path)
+            app = study.study_workloads.command(case, self.binary, self.source, directory, profile=True)
+            if name == 'nsys':
+                prefix = ['/selected/nsys', 'profile', '--trace=cuda,nvtx,osrt', '--sample=none',
+                          '--output', str(directory / 'capture-nsys')]
+            else:
+                prefix = ['/selected/ncu', '--config-file', 'off', '--target-processes', 'application-only',
+                          '--profile-from-start', 'on', '--kernel-name-base', 'demangled']
+                if profile.get('selection') == 'first-per-kernel':
+                    prefix += ['--kernel-id', '::regex:' + study.study_profiles._kernel_id_regex(profile['kernel_regex']) + ':1']
+                else:
+                    prefix += ['--kernel-name', 'regex:' + profile['kernel_regex'], '--launch-skip',
+                               str(profile['launch_skip']), '--launch-count', str(profile['launch_count'])]
+                prefix += ['--rename-kernels', 'off', '--metrics', 'gpu__time_duration.avg',
+                           '--section', 'LaunchStats', '--export', str(directory / 'capture-ncu')]
+            env = {'SLURM_JOB_ID': job, 'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3', 'SLURM_JOB_QOS': 'embers',
+                   'SLURM_JOB_PARTITION': 'gpu-a100', 'SLURM_NTASKS': '1', 'CUDA_VISIBLE_DEVICES': '0'}
+            env.update({key: value for key, value in study.study_workloads.environment(case, directory, profile=True).items()
+                        if key in study.SAFE_ENV})
+            command = {'argv': prefix + app, 'cwd': str(log), 'environment': env, 'status': 'running'}
+            study.write_json(log / 'command.json', command)
+            study.write_json(log / 'result.json', {**command, 'status': 'complete', 'returncode': 0,
+                'stdout_sha256': study.sha(log / 'stdout.log'), 'stderr_sha256': study.sha(log / 'stderr.log'),
+                'process_wall_seconds': 3.})
+            logs = {'stdout': str(log / 'stdout.log'), 'stderr': str(log / 'stderr.log'),
+                    'receipt': str(log / 'result.json')}
+            capture = {'status': 'complete', 'native': artifact(native),
+                       'application_stdout': logs['stdout'], 'application_stderr': logs['stderr'],
+                       'application_stdout_sha256': study.sha(log / 'stdout.log')}
+            if name == 'ncu':
+                capture.update(queried_metrics=['gpu__time_duration.avg'], sections=['LaunchStats'])
+            record['captures'][name] = capture
+            record['tools'][name] = identity
+            record['application_logs'].append(logs)
+        return record
+
+    def prepare_continuation(self, names=('nsys', 'ncu')):
+        gpu, summary, _ = self.prepare_profile_timing()
+        timing = study.read_json(summary)
+        for item in timing['cases'].values():
+            item['observations'] = [{'signature': {'work': 10}}]
+        study.write_json(summary, timing)
+        attempt = self.state['attempts'][0]
+        attempt['summary_sha256'] = study.sha(summary)
+        attempt['artifact_sha256'][str(summary.relative_to(self.old))] = study.sha(summary)
+        for name, source in [('gpu_study.py', study.__file__), ('study_workloads.py', study.study_workloads.__file__)]:
+            (self.old / 'executor' / name).write_bytes(Path(source).read_bytes())
+            self.plan['executor_sha256'][name] = study.sha(self.old / 'executor' / name)
+        self.save_plan()
+        case = study.selected_cases(study.study_workloads.load_suite(self.old / 'suite.json'))[0]
+        directory = self.old / 'attempts' / 'profiles-old'
+        baseline = self.profile_record(case, directory / case['id'] / 'baseline', gpu, '34', names)
+        checkpoint = directory / 'partial.json'
+        study.write_json(checkpoint, {'schema_version': 1, 'status': 'profiles_partial', 'gpu': gpu,
+            'cases': {case['id']: {'baseline': baseline, 'candidate': {'status': 'failed', 'captures': {}}}}})
+        self.state['attempts'].append({'id': 'profiles-old', 'stage': 'profiles', 'status': 'profiles_partial',
+            'job_id': '34', 'directory': str(directory), 'gpu': gpu})
+        self.save_state()
+        return gpu, case, checkpoint
+
+    def run_continuation(self, plan, case, gpu, *, fail_ncu=False, wrong_signature=False):
+        output = self.new / 'attempts' / 'profiles-new'
+        output.mkdir()
+        runner = SimpleNamespace(output=output)
+        admission = {'binaries': {member: {case['binary']: str(self.binary)} for member in study.MEMBERS}}
+        calls = []
+        def capture(case, argv, runner, directory, expected_gpu, **kwargs):
+            names = kwargs['requested_tools']
+            calls.append((directory.name, names))
+            record = self.profile_record(case, directory, expected_gpu, '35',
+                                         tuple(name for name in names if not fail_ncu or name != 'ncu'))
+            for name, item in record['captures'].items():
+                item.update(gpu_uuid=expected_gpu['uuid'], application_logs=[
+                    log for log in record['application_logs'] if Path(log['stdout']).parent.name == name])
+            if fail_ncu:
+                record['captures']['ncu'] = {'status': 'failed', 'gpu_uuid': expected_gpu['uuid']}
+                record['status'] = 'partial'
+                kwargs['checkpoint'](record)
+                raise RuntimeError('synthetic NCU timeout')
+            return record
+        observed = {'signature': {'work': 11 if wrong_signature else 10}}
+        with patch.object(study.study_profiles, 'capture', side_effect=capture), \
+                patch.object(study.study_workloads, 'parse', return_value=observed) as parse:
+            if fail_ncu or wrong_signature:
+                with self.assertRaises(RuntimeError):
+                    study.profiles(self.new, plan, {'cases': [case]}, admission, runner, gpu)
+                result = study.read_json(output / 'partial.json') if (output / 'partial.json').exists() else None
+            else:
+                result = study.profiles(self.new, plan, {'cases': [case]}, admission, runner, gpu)
+        return result, calls, parse.call_args_list, output
+
+    def test_continue_profiles_freezes_successful_baseline_without_timing_or_original_mutation(self):
+        gpu, case, checkpoint = self.prepare_continuation()
+        before = self.snapshot()
+        plan = self.retry(profiles_only=True, continue_profiles=True, prepare=False)
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(plan['profile_continuation']['checkpoint_sha256'], study.sha(checkpoint))
+        self.assertEqual(set(plan['profile_continuation']['captures'][case['id']]['baseline']), {'nsys', 'ncu'})
+        self.assertNotIn('candidate', plan['profile_continuation']['captures'][case['id']])
+        state = study.read_json(self.new / 'state.json')
+        self.assertEqual([job['stage'] for job in state['jobs']], ['profiles'])
+        different = {**gpu, 'uuid': 'GPU-11112233-4455-6677-8899-aabbccddeeff'}
+        study.admit_reused_timing_gpu(plan, different)
+        result, calls, parses, _ = self.run_continuation(plan, case, different)
+        self.assertEqual(calls, [('candidate', ['nsys', 'ncu'])])
+        self.assertEqual(result['status'], 'analysis_complete')
+        self.assertTrue(all(not row['matched_gpu_identity'] for row in result['tool_cohorts'][case['id']].values()))
+        self.assertEqual([item.args[3]['uuid'] for item in parses], [gpu['uuid']] * 2 + [different['uuid']] * 2)
+        for name in ('nsys', 'ncu'):
+            self.assertEqual(result['cases'][case['id']]['baseline']['captures'][name]['gpu_uuid'], gpu['uuid'])
+        study.report(self.new)
+        self.assertIn('do not claim matched profiler timing', (self.new / 'report.md').read_text())
+
+    def test_continue_profiles_only_nsys_success_requires_baseline_ncu_and_both_candidate_tools(self):
+        gpu, case, _ = self.prepare_continuation(names=('nsys',))
+        plan = self.retry(profiles_only=True, continue_profiles=True)
+        result, calls, _, _ = self.run_continuation(plan, case, gpu)
+        self.assertEqual(calls, [('baseline', ['ncu']), ('candidate', ['nsys', 'ncu'])])
+        self.assertEqual(set(result['cases'][case['id']]['baseline']['captures']), {'nsys', 'ncu'})
+
+    def test_continue_profiles_pre_checkpoint_failure_still_preserves_retained_tool(self):
+        gpu, case, _ = self.prepare_continuation(names=('nsys',))
+        plan = self.retry(profiles_only=True, continue_profiles=True)
+        output = self.new / 'attempts' / 'early-failure'
+        output.mkdir()
+        admission = {'binaries': {member: {case['binary']: str(self.binary)} for member in study.MEMBERS}}
+        with patch.object(study.study_workloads, 'parse', return_value={'signature': {'work': 10}}), \
+                patch.object(study.study_profiles, 'capture', side_effect=RuntimeError('tool discovery failure')) as capture:
+            with self.assertRaisesRegex(RuntimeError, 'tool discovery'):
+                study.profiles(self.new, plan, {'cases': [case]}, admission, SimpleNamespace(output=output), gpu)
+        self.assertEqual(capture.call_args.kwargs['requested_tools'], ['ncu'])
+        partial = study.read_json(output / 'partial.json')['cases'][case['id']]['baseline']
+        self.assertEqual(set(partial['captures']), {'nsys'})
+        self.assertEqual(partial['captures']['nsys']['status'], 'complete')
+        self.assertEqual(partial['status'], 'partial')
+
+    def test_continue_profiles_requires_exact_mode_and_suite(self):
+        self.prepare_continuation()
+        for kwargs in ({'continue_profiles': True}, {'profiles_only': True, 'continue_profiles': True, 'suite': 'x'},
+                       {'profiles_only': True, 'continue_profiles': True, 'cases': 'dg-p1'}):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, 'requires --profiles-only'):
+                self.retry(**kwargs)
+        self.assertFalse(self.new.exists())
+
+    def test_continue_profiles_wrong_retained_application_fails_before_fresh_capture(self):
+        gpu, case, _ = self.prepare_continuation()
+        plan = self.retry(profiles_only=True, continue_profiles=True)
+        _, calls, _, _ = self.run_continuation(plan, case, gpu, wrong_signature=True)
+        self.assertEqual(calls, [])
+
+    def test_continue_profiles_checks_native_bytes_only_on_compute_before_capture(self):
+        gpu, case, _ = self.prepare_continuation()
+        plan = self.retry(profiles_only=True, continue_profiles=True)
+        native = Path(plan['profile_continuation']['captures'][case['id']]['baseline']['nsys']['capture']['native']['path'])
+        native.write_text('changed native bytes')
+        study.verify(self.new)  # Login-side verify does not read native reports.
+        runner = SimpleNamespace(output=self.new / 'attempts')
+        with patch.object(study.study_profiles, 'capture') as capture, self.assertRaisesRegex(RuntimeError, 'native profile artifact changed'):
+            study.profiles(self.new, plan, {'cases': [case]}, {}, runner, gpu)
+        capture.assert_not_called()
+
+    def test_continue_profiles_receipt_command_control_and_gpu_drift_reject(self):
+        _, case, checkpoint = self.prepare_continuation()
+        original = study.read_json(checkpoint)
+        logs = original['cases'][case['id']]['baseline']['application_logs'][0]
+        result_path, command_path = Path(logs['receipt']), Path(logs['receipt']).with_name('command.json')
+        result, command = study.read_json(result_path), study.read_json(command_path)
+        for field in ('argv', 'environment'):
+            changed_result, changed_command = json.loads(json.dumps(result)), json.loads(json.dumps(command))
+            if field == 'argv':
+                changed_result[field][-1] = 'wrong-workload'
+                changed_command[field] = changed_result[field]
+            else:
+                changed_result[field]['IGRLAB_PROFILE_NVTX'] = '0'
+                changed_command[field] = changed_result[field]
+            study.write_json(result_path, changed_result)
+            study.write_json(command_path, changed_command)
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, 'argv differs|environment differs'):
+                self.retry(profiles_only=True, continue_profiles=True)
+        study.write_json(result_path, result)
+        study.write_json(command_path, command)
+        original['cases'][case['id']]['baseline']['gpu_uuid'] = 'GPU-11112233-4455-6677-8899-aabbccddeeff'
+        study.write_json(checkpoint, original)
+        with self.assertRaisesRegex(RuntimeError, 'GPU identities differ'):
+            self.retry(profiles_only=True, continue_profiles=True)
+
+    def test_continue_profiles_empty_identity_changed_log_and_active_jobs_reject(self):
+        _, case, checkpoint = self.prepare_continuation()
+        original = study.read_json(checkpoint)
+        altered = json.loads(json.dumps(original))
+        altered['cases'][case['id']]['baseline']['tools']['nsys'] = {}
+        study.write_json(checkpoint, altered)
+        with self.assertRaisesRegex(RuntimeError, 'profiler identity'):
+            self.retry(profiles_only=True, continue_profiles=True)
+        study.write_json(checkpoint, original)
+        log = Path(original['cases'][case['id']]['baseline']['application_logs'][0]['stdout'])
+        content = log.read_bytes()
+        log.write_text('changed stdout')
+        with self.assertRaisesRegex(RuntimeError, 'matching logs'):
+            self.retry(profiles_only=True, continue_profiles=True)
+        log.write_bytes(content)
+        self.queue_stdout, self.outcomes['34'] = '34|RUNNING\n', ('RUNNING', '0:0')
+        with self.assertRaisesRegex(RuntimeError, 'inactive'):
+            self.retry(profiles_only=True, continue_profiles=True)
+        self.assertFalse(self.new.exists())
+
+    def test_continue_profiles_missing_receipt_and_changed_profiler_help_reject_before_capture(self):
+        gpu, case, checkpoint = self.prepare_continuation()
+        record = study.read_json(checkpoint)['cases'][case['id']]['baseline']
+        receipt = Path(record['application_logs'][0]['receipt'])
+        content = receipt.read_bytes()
+        receipt.unlink()
+        with self.assertRaisesRegex(RuntimeError, 'artifact is missing'):
+            self.retry(profiles_only=True, continue_profiles=True)
+        receipt.write_bytes(content)
+        plan = self.retry(profiles_only=True, continue_profiles=True)
+        help_file = Path(record['tools']['nsys']['help_stdout']['path'])
+        help_file.write_text('changed help provenance')
+        runner = SimpleNamespace(output=self.new / 'attempts')
+        with patch.object(study.study_profiles, 'capture') as capture, self.assertRaisesRegex(RuntimeError, 'native profile artifact changed'):
+            study.profiles(self.new, plan, {'cases': [case]}, {}, runner, gpu)
+        capture.assert_not_called()
+
+    def test_continue_profiles_no_success_or_no_missing_tools_reject(self):
+        _, case, checkpoint = self.prepare_continuation()
+        original = study.read_json(checkpoint)
+        empty = json.loads(json.dumps(original))
+        empty['cases'][case['id']]['baseline']['captures'] = {}
+        study.write_json(checkpoint, empty)
+        with self.assertRaisesRegex(RuntimeError, 'both retained completed tools and missing'):
+            self.retry(profiles_only=True, continue_profiles=True)
+        original['cases'][case['id']]['candidate'] = self.profile_record(case,
+            checkpoint.parent / case['id'] / 'candidate', original['gpu'], '34')
+        study.write_json(checkpoint, original)
+        with self.assertRaisesRegex(RuntimeError, 'both retained completed tools and missing'):
+            self.retry(profiles_only=True, continue_profiles=True)
+
+    def test_chained_continuation_retains_original_gpu_and_only_missing_candidate_ncu(self):
+        gpu, case, _ = self.prepare_continuation()
+        plan = self.retry(profiles_only=True, continue_profiles=True)
+        different = {**gpu, 'uuid': 'GPU-11112233-4455-6677-8899-aabbccddeeff'}
+        partial, calls, _, output = self.run_continuation(plan, case, different, fail_ncu=True)
+        self.assertEqual(calls, [('candidate', ['nsys', 'ncu'])])
+        self.assertEqual(partial['cases'][case['id']]['candidate']['status'], 'partial')
+        state = study.read_json(self.new / 'state.json')
+        state['attempts'].append({'id': 'profiles-new', 'stage': 'profiles', 'status': 'profiles_partial',
+            'directory': str(output), 'job_id': '35', 'gpu': different})
+        study.write_json(self.new / 'state.json', state)
+        self.outcomes['35'] = ('FAILED', '1:0')
+        self.old, self.new = self.new, self.base / 'third'
+        next_plan = self.retry(profiles_only=True, continue_profiles=True)
+        captures = next_plan['profile_continuation']['captures'][case['id']]
+        self.assertEqual(captures['baseline']['nsys']['gpu']['uuid'], gpu['uuid'])
+        self.assertEqual(captures['candidate']['nsys']['gpu']['uuid'], different['uuid'])
+        newest = {**gpu, 'uuid': 'GPU-22112233-4455-6677-8899-aabbccddeeff'}
+        result, calls, _, _ = self.run_continuation(next_plan, case, newest)
+        self.assertEqual(calls, [('candidate', ['ncu'])])
+        self.assertEqual(result['status'], 'analysis_complete')
+        self.assertIsNone(result['cases'][case['id']]['candidate']['gpu_uuid'])
+        self.assertFalse(result['tool_cohorts'][case['id']]['nsys']['matched_gpu_identity'])
+        self.assertFalse(result['tool_cohorts'][case['id']]['ncu']['matched_gpu_identity'])
 
 
 if __name__ == '__main__':

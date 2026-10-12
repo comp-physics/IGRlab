@@ -5,6 +5,7 @@ This coordinator deliberately has no application-side instrumentation or replay.
 Raw measurements and unsuccessful attempts are retained in their own directories.
 """
 import argparse
+import ast
 import contextlib
 import csv
 import fcntl
@@ -236,6 +237,10 @@ def verify(root, *, binaries=False):
         artifact = absolute(path)
         if not artifact.is_file() or sha(artifact) != expected:
             raise RuntimeError(f'reused timing artifact changed: {artifact}')
+    for path, expected in plan.get('profile_continuation', {}).get('artifact_sha256', {}).items():
+        artifact = absolute(path)
+        if not artifact.is_file() or sha(artifact) != expected:
+            raise RuntimeError(f'retained profile metadata changed: {artifact}')
     if binaries:
         admission = read_json(root / 'admission.json')
         if admission['plan_sha256'] != plan['plan_sha256']:
@@ -907,6 +912,10 @@ def timings(root, plan, suite, admission, runner, gpu):
 
 
 def admit_reused_timing_gpu(plan, gpu):
+    if plan.get('profile_continuation'):
+        # Only the explicit continuation path permits independently identified
+        # diagnostic captures on another allocation. Ordinary retries stay strict.
+        return
     expected = plan.get('timing_reuse', {}).get('gpu')
     if expected and any(gpu.get(key) != expected.get(key)
                         for key in ('uuid', 'name', 'compute_capability')):
@@ -922,7 +931,7 @@ def profiles(root, plan, suite, admission, runner, gpu):
     def save_partial():
         write_json(runner.output / 'partial.json', {**value, 'status': 'profiles_partial'})
 
-    def validate_application(case, member, record):
+    def validate_application(case, member, record, capture_gpu=None):
         # Native capture exit zero alone is insufficient for application admission.
         logs_to_validate = record.get('application_logs', [])
         if not logs_to_validate:
@@ -931,7 +940,7 @@ def profiles(root, plan, suite, admission, runner, gpu):
             timing_metadata = {}
             if case['adapter'] == 'dg' and case['parameters'].get('discretization') == 'hdg':
                 timing_metadata['wall_seconds'] = read_json(logs['receipt'])['process_wall_seconds']
-            observation = study_workloads.parse(case, Path(logs['stdout']), Path(logs['stderr']), gpu,
+            observation = study_workloads.parse(case, Path(logs['stdout']), Path(logs['stderr']), capture_gpu or gpu,
                                                **timing_metadata)
             check_observation_identity(observation, plan, member)
             if case['adapter'] == 'hdg' and (observation['host_export'] or
@@ -941,6 +950,26 @@ def profiles(root, plan, suite, admission, runner, gpu):
             if observation['signature'] != reference:
                 raise RuntimeError('profiled numerical policy/work differs from unprofiled timing')
         return len(logs_to_validate)
+
+    continuation = plan.get('profile_continuation')
+    retained = json.loads(json.dumps((continuation or {}).get('captures', {})))
+    if continuation:
+        value.update(scope='continued per-tool diagnostics; per-capture GPU identity; no matched profiler timing claim',
+                     profile_continuation=continuation)
+        # These files include native reports/full CSV: verify only here on compute,
+        # never during login-side preparation, status, or compact collection.
+        for path, expected in continuation['compute_artifact_sha256'].items():
+            artifact = absolute(path)
+            if not artifact.is_file() or sha(artifact) != expected:
+                raise RuntimeError(f'retained native profile artifact changed: {artifact}')
+        # A completed native tool checkpoint can precede the old coordinator's
+        # application gate. Admit every retained log before any new application.
+        for case in selected_cases(suite):
+            for member, tools in retained.get(case['id'], {}).items():
+                for item in tools.values():
+                    count = validate_application(case, member, item['capture'], item['gpu'])
+                    item['capture']['application_validation'] = {'status': 'complete',
+                        'validated_log_count': count, 'scope': 'retained capture matches original unprofiled policy/work'}
 
     for case in selected_cases(suite):
         captures = {}
@@ -953,6 +982,45 @@ def profiles(root, plan, suite, admission, runner, gpu):
             continue
         value['cases'][case['id']] = captures
         for member in MEMBERS:
+            retained_tools = retained.get(case['id'], {}).get(member, {})
+            missing = [name for name in ('nsys', 'ncu') if name not in retained_tools]
+            def merge(record):
+                if not continuation:
+                    return record
+                record = json.loads(json.dumps(record))
+                record.setdefault('captures', {})
+                record.setdefault('tools', {})
+                record.setdefault('application_logs', [])
+                record.setdefault('adapter', case['adapter'])
+                record.setdefault('selected_kernel_regex', case['profile']['kernel_regex'])
+                record.setdefault('selection', case['profile'].get('selection', 'launches'))
+                record.setdefault('launch_skip', case['profile']['launch_skip'])
+                record.setdefault('launch_count', case['profile']['launch_count'])
+                record.setdefault('required_kernel_groups', case['profile'].get('kernel_groups', {}))
+                for name, item in retained_tools.items():
+                    record['captures'][name] = item['capture']
+                    record['tools'][name] = item['tool_identity']
+                    record['application_logs'].extend(item['capture']['application_logs'])
+                identities = {tool.get('gpu_uuid') for tool in record['captures'].values()}
+                record['gpu_uuid'] = next(iter(identities)) if len(identities) == 1 else None
+                record['status'] = ('complete' if all(record['captures'].get(name, {}).get('status') == 'complete'
+                                                     for name in ('nsys', 'ncu')) else 'partial')
+                record['tensor_instruction_evidence'] = study_profiles.tensor_instruction_evidence(
+                    case, record['captures'].get('ncu', {}))
+                record['scope'] = 'individual tool captures retained or fresh; profiler durations are diagnostic'
+                return record
+            if continuation and not missing:
+                captures[member] = merge({'requested_tools': [], 'captures': {}, 'tools': {}, 'application_logs': []})
+                captures[member]['application_validation'] = {'status': 'complete',
+                    'validated_log_count': len(captures[member]['application_logs']), 'scope': 'retained logs admitted before capture'}
+                save_partial()
+                continue
+            if continuation:
+                # Preserve already admitted tools even if a new tool fails during
+                # discovery/identity checks before the provider's first checkpoint.
+                captures[member] = merge({'requested_tools': missing, 'captures': {}, 'tools': {}, 'application_logs': []})
+                captures[member]['application_validation'] = {'status': 'pending', 'reason': 'missing tools not yet captured'}
+                save_partial()
             directory = runner.output / case['id'] / member
             directory.mkdir(parents=True)
             binary = Path(admission['binaries'][member][case['binary']])
@@ -961,14 +1029,16 @@ def profiles(root, plan, suite, admission, runner, gpu):
             environment = os.environ.copy()
             environment.update(study_workloads.environment(case, directory, profile=True))
             def checkpoint(record):
+                record = merge(record)
                 record['application_validation'] = {'status': 'pending',
                     'reason': 'capture logs must still match admitted unprofiled numerical policy/work'}
                 captures[member] = record
                 save_partial()
 
             try:
-                captures[member] = study_profiles.capture(case, argv, runner, directory, gpu,
-                    environment=environment, checkpoint=checkpoint)
+                options = {'requested_tools': missing} if continuation else {}
+                captures[member] = merge(study_profiles.capture(case, argv, runner, directory, gpu,
+                    environment=environment, checkpoint=checkpoint, **options))
             except Exception as error:
                 captures.setdefault(member, {'status': 'failed', 'application_validation': {'status': 'pending'}})
                 captures[member]['error'] = str(error)
@@ -980,7 +1050,12 @@ def profiles(root, plan, suite, admission, runner, gpu):
                     'reason': 'incomplete profiler capture; application admission not established'}
             else:
                 try:
-                    log_count = validate_application(case, member, captures[member])
+                    if continuation:
+                        log_count = sum(validate_application(case, member, tool,
+                            retained_tools[name]['gpu'] if name in retained_tools else gpu)
+                            for name, tool in captures[member]['captures'].items())
+                    else:
+                        log_count = validate_application(case, member, captures[member])
                 except Exception as error:
                     captures[member]['status'] = 'partial'
                     captures[member]['application_validation'] = {'status': 'failed', 'error': str(error)}
@@ -989,6 +1064,14 @@ def profiles(root, plan, suite, admission, runner, gpu):
                 captures[member]['application_validation'] = {'status': 'complete',
                     'validated_log_count': log_count, 'scope': 'same numerical policy/work as unprofiled timing'}
             save_partial()
+        if continuation:
+            value.setdefault('tool_cohorts', {})[case['id']] = {
+                name: {'gpu_uuid': {member: captures[member]['captures'].get(name, {}).get('gpu_uuid')
+                                    for member in MEMBERS},
+                       'matched_gpu_identity': (bool(captures['baseline']['captures'].get(name, {}).get('gpu_uuid')) and
+                           captures['baseline']['captures'].get(name, {}).get('gpu_uuid') ==
+                           captures['candidate']['captures'].get(name, {}).get('gpu_uuid')),
+                       'scope': 'diagnostic only; no profiler speedup inference'} for name in ('nsys', 'ncu')}
     return value
 
 
@@ -1192,6 +1275,218 @@ def profile_only_overrides(original, replacement):
             if digest(before['profile']) != digest(after['profile'])}
 
 
+def retained_profile_tools(plan, state, old, suite):
+    """Seal completed tool checkpoints; application/native admission stays compute-only."""
+    attempt = next((item for item in reversed(state['attempts']) if item['stage'] == 'profiles'), None)
+    if not attempt or attempt.get('status') == 'running':
+        raise RuntimeError('continuation requires an inactive original profile attempt')
+    checkpoint = absolute(attempt.get('summary') or str(Path(attempt['directory']) / 'partial.json'))
+    if not checkpoint.is_relative_to(old) or not checkpoint.is_file() or checkpoint.stat().st_size > 8 * 1024 * 1024:
+        raise RuntimeError('missing, escaped, or oversized original profile checkpoint')
+    data = read_json(checkpoint)
+    if data.get('schema_version') != SCHEMA or data.get('status') not in ('profiles_partial', 'analysis_complete'):
+        raise RuntimeError('invalid original profile checkpoint')
+    cases = {case['id']: case for case in selected_cases(suite)}
+    if not set(data.get('cases', {})) <= set(cases):
+        raise RuntimeError('profile checkpoint contains an unselected case')
+    prior = plan.get('profile_continuation', {})
+    artifacts = {str(checkpoint): sha(checkpoint)}
+    compute = {}
+    retained = {}
+    if attempt.get('gpu') and any(attempt['gpu'].get(key) != data.get('gpu', {}).get(key)
+                                  for key in ('uuid', 'name', 'compute_capability')):
+        raise RuntimeError('profile attempt and checkpoint GPU identities differ')
+
+    def recording_keys():
+        nodes = ast.parse((old / 'executor/gpu_study.py').read_text()).body
+        values = [node.value for node in nodes if isinstance(node, ast.Assign) and
+                  any(isinstance(target, ast.Name) and target.id == 'SAFE_ENV' for target in node.targets)]
+        if len(values) != 1:
+            raise RuntimeError('missing frozen environment recording policy')
+        value = values[0]
+        if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
+            expected = ast.parse("tuple(prefix + name for prefix in ('IGRLAB_', 'DG_IGR_') "
+                                 "for name in study_workloads.IGR_CONTROLS)", mode='eval').body
+            if ast.dump(value.right) != ast.dump(expected):
+                raise RuntimeError('unsupported frozen environment recording policy')
+            nodes = ast.parse((old / 'executor/study_workloads.py').read_text()).body
+            controls = [ast.literal_eval(node.value) for node in nodes if isinstance(node, ast.Assign) and
+                        any(isinstance(target, ast.Name) and target.id == 'IGR_CONTROLS' for target in node.targets)]
+            if len(controls) != 1 or not isinstance(controls[0], dict):
+                raise RuntimeError('missing frozen IGR environment recording policy')
+            return list(ast.literal_eval(value.left)) + [prefix + name for prefix in ('IGRLAB_', 'DG_IGR_')
+                                                        for name in controls[0]]
+        return list(ast.literal_eval(value))
+
+    def confined(path):
+        path = absolute(path)
+        if not path.is_relative_to(old) and str(path) not in {
+                *prior.get('artifact_sha256', {}), *prior.get('compute_artifact_sha256', {})}:
+            raise RuntimeError('retained profile artifact escaped its recorded run')
+        if not path.is_file():
+            raise RuntimeError('retained profile artifact is missing')
+        return path
+
+    def seal_log(log, name, capture):
+        result = {'tool': name}
+        for key in ('stdout', 'stderr', 'receipt'):
+            path = confined(log[key])
+            expected = sha(path)
+            if log.get(key + '_sha256', expected) != expected:
+                raise RuntimeError('retained application log changed')
+            result.update({key: str(path), key + '_sha256': expected})
+            artifacts[str(path)] = expected
+        receipt = read_json(result['receipt'])
+        if (receipt.get('returncode') != 0 or receipt.get('status') != 'complete' or
+                any(receipt.get(key + '_sha256') != result[key + '_sha256'] for key in ('stdout', 'stderr')) or
+                capture.get('application_stdout_sha256') != result['stdout_sha256']):
+            raise RuntimeError('retained application process did not complete with matching logs')
+        command = confined(str(Path(result['receipt']).with_name('command.json')))
+        metadata = read_json(command)
+        if metadata.get('argv') != receipt.get('argv') or metadata.get('cwd') != receipt.get('cwd'):
+            raise RuntimeError('retained application command/result identities differ')
+        binaries = [path for path in Path(plan['builds'][member]['app_build']).rglob(case['binary'])
+                    if path.is_file() and os.access(path, os.X_OK)]
+        if len(binaries) != 1:
+            raise RuntimeError('retained capture binary is missing or ambiguous')
+        expected_argv = study_workloads.command(case, binaries[0],
+            Path(plan['sources'][member]['source_snapshot']), Path(result['stdout']).parent.parent, profile=True)
+        if receipt.get('argv', [])[-len(expected_argv):] != expected_argv:
+            raise RuntimeError('retained application argv differs from the frozen workload/build')
+        identity = record['tools'][name]
+        prefix = receipt['argv'][:-len(expected_argv)]
+        if name == 'nsys':
+            expected_prefix = [identity['executable']['path'], 'profile', '--trace=cuda,nvtx,osrt', '--sample=none']
+            if case['adapter'] == 'hdg':
+                expected_prefix += ['--capture-range=cudaProfilerApi', '--capture-range-end=stop']
+            expected_prefix += ['--output', str(Path(result['stdout']).parent.parent / 'capture-nsys')]
+        else:
+            expected_prefix = [identity['executable']['path'], '--config-file', 'off', '--target-processes',
+                'application-only', '--profile-from-start', 'off' if case['adapter'] == 'hdg' else 'on',
+                '--kernel-name-base', 'demangled']
+            if profile.get('selection', 'launches') == 'first-per-kernel':
+                expected_prefix += ['--kernel-id', '::regex:' + study_profiles._kernel_id_regex(profile['kernel_regex']) + ':1']
+            else:
+                expected_prefix += ['--kernel-name', 'regex:' + profile['kernel_regex'], '--launch-skip',
+                                    str(profile['launch_skip']), '--launch-count', str(profile['launch_count'])]
+            expected_prefix += ['--rename-kernels', 'off', '--metrics', ','.join(capture['queried_metrics'])]
+            expected_prefix += [part for section in capture['sections'] for part in ('--section', section)]
+            expected_prefix += ['--export', str(Path(result['stdout']).parent.parent / 'capture-ncu')]
+        if prefix != expected_prefix:
+            raise RuntimeError('retained profiler invocation differs from its admitted selection')
+        env = receipt.get('environment', {})
+        if metadata.get('environment') != env or any(env.get(key) != expected for key, expected in
+                {'SLURM_JOB_ID': origin['job_id'], 'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3',
+                 'SLURM_JOB_QOS': 'embers', 'SLURM_JOB_PARTITION': 'gpu-a100', 'SLURM_NTASKS': '1'}.items()):
+            raise RuntimeError('retained capture allocation/environment differs')
+        visibility = origin['gpu'].get('allocation_environment', {}).get('CUDA_VISIBLE_DEVICES')
+        if not env.get('CUDA_VISIBLE_DEVICES') or visibility is not None and env['CUDA_VISIBLE_DEVICES'] != visibility:
+            raise RuntimeError('retained capture CUDA visibility differs')
+        keys = capture.get('recorded_environment_keys') or recording_keys()
+        expected_controls = study_workloads.environment(case, Path(result['stdout']).parent.parent, profile=True)
+        for key, wanted in expected_controls.items():
+            if key in keys or key in env:
+                if env.get(key) != wanted:
+                    raise RuntimeError('retained workload environment differs: ' + key)
+        capture['recorded_environment_keys'] = keys
+        capture['unrecorded_workload_environment'] = {key: {'availability': 'unavailable',
+            'frozen_executor_expected': wanted, 'reason': 'excluded from original Runner environment recording policy'}
+            for key, wanted in expected_controls.items() if key not in keys and key not in env}
+        artifacts[str(command)] = sha(command)
+        return result
+
+    def native_hashes(value):
+        if isinstance(value, dict):
+            if 'path' in value and 'sha256' in value:
+                path = confined(value['path'])
+                expected = value['sha256']
+                if not isinstance(expected, str) or not re.fullmatch('[0-9a-f]{64}', expected):
+                    raise RuntimeError('invalid retained native artifact digest')
+                if str(path) in prior.get('compute_artifact_sha256', {}) and prior['compute_artifact_sha256'][str(path)] != expected:
+                    raise RuntimeError('retained native artifact digest differs from its prior frozen manifest')
+                if str(path) in compute and compute[str(path)] != expected:
+                    raise RuntimeError('conflicting retained native artifact digests')
+                compute[str(path)] = expected  # Only the compute worker reads these bytes.
+            for item in value.values():
+                native_hashes(item)
+        elif isinstance(value, list):
+            for item in value:
+                native_hashes(item)
+
+    for case_id, members in data.get('cases', {}).items():
+        if not set(members) <= set(MEMBERS):
+            raise RuntimeError('invalid retained profile member')
+        case = cases[case_id]
+        for member, record in members.items():
+            for name, captured in record.get('captures', {}).items():
+                if name not in ('nsys', 'ncu'):
+                    raise RuntimeError('unknown retained profiler tool')
+                if captured.get('status') != 'complete':
+                    continue
+                profile = case['profile']
+                if (record.get('selected_kernel_regex') != profile['kernel_regex'] or
+                        record.get('selection') != profile.get('selection', 'launches') or
+                        record.get('launch_skip') != profile['launch_skip'] or
+                        record.get('launch_count') != profile['launch_count'] or
+                        record.get('required_kernel_groups', {}) != profile.get('kernel_groups', {})):
+                    raise RuntimeError('retained profile selection differs from the frozen suite')
+                capture = json.loads(json.dumps(captured))
+                uuid_value = capture.get('gpu_uuid') or record.get('gpu_uuid')
+                identity = {**data['gpu'], 'uuid': uuid_value}
+                if (not isinstance(uuid_value, str) or not re.fullmatch(r'GPU-[0-9a-fA-F-]{36}', uuid_value) or
+                        'A100' not in identity.get('name', '') or identity.get('compute_capability') != 80):
+                    raise RuntimeError('retained profile lacks its actual A100 identity')
+                if capture.get('retained_from'):
+                    previous = prior.get('captures', {}).get(case_id, {}).get(member, {}).get(name)
+                    if (not previous or capture['retained_from'] != previous['capture'].get('retained_from') or
+                            digest({key: value for key, value in capture.items() if key != 'application_validation'}) !=
+                            digest({key: value for key, value in previous['capture'].items() if key != 'application_validation'}) or
+                            record.get('tools', {}).get(name) != previous['tool_identity']):
+                        raise RuntimeError('retained capture origin differs from the prior frozen continuation')
+                    identity = previous['gpu']
+                    if identity.get('uuid') != uuid_value:
+                        raise RuntimeError('retained profile GPU provenance differs')
+                elif (uuid_value != data.get('gpu', {}).get('uuid') or
+                      record.get('gpu_uuid') not in (None, uuid_value)):
+                    raise RuntimeError('fresh tool and original checkpoint GPU identities differ')
+                native = capture.get('native', {})
+                suffixes = ('.nsys-rep',) if name == 'nsys' else ('.ncu-rep', '.ncu-repz')
+                if (not str(native.get('path', '')).endswith(suffixes) or
+                        type(native.get('bytes')) is not int or native['bytes'] <= 0 or not native.get('sha256')):
+                    raise RuntimeError('completed tool lacks its native capture fingerprint')
+                logs = capture.get('application_logs') or [item for item in record.get('application_logs', [])
+                    if item.get('stdout') == capture.get('application_stdout') and
+                       item.get('stderr') == capture.get('application_stderr')]
+                if len(logs) != 1:
+                    raise RuntimeError('completed tool lacks unambiguous application logs')
+                origin = capture.get('retained_from') or {'run_dir': str(old),
+                    'plan_sha256': plan['plan_sha256'], 'attempt_id': attempt['id'],
+                    'job_id': attempt['job_id'], 'checkpoint': str(checkpoint), 'gpu': identity}
+                tool_identity = record.get('tools', {}).get(name, {})
+                if any(not isinstance(tool_identity.get(key), dict) or not tool_identity[key].get('sha256')
+                       for key in ('executable', 'version_stdout', 'help_stdout')):
+                    raise RuntimeError('completed tool lacks its profiler identity/version/help fingerprints')
+                capture['application_logs'] = [seal_log(logs[0], name, capture)]
+                capture['gpu_uuid'] = uuid_value
+                capture['retained_from'] = origin
+                native_hashes(capture)
+                for key, entry in tool_identity.items():
+                    if key != 'executable':
+                        native_hashes(entry)
+                retained.setdefault(case_id, {}).setdefault(member, {})[name] = {
+                    'capture': capture, 'gpu': identity, 'tool_identity': tool_identity}
+    total = sum(len(tools) for members in retained.values() for tools in members.values())
+    expected = 2 * len(MEMBERS) * sum(case.get('parameters', {}).get('device') != 'cpu' for case in cases.values())
+    if not 0 < total < expected:
+        raise RuntimeError('continuation requires both retained completed tools and missing captures')
+    return {'run_dir': str(old), 'plan_sha256': plan['plan_sha256'], 'suite_sha256': plan['suite_sha256'],
+            'checkpoint': str(checkpoint), 'checkpoint_sha256': artifacts[str(checkpoint)],
+            'captures': retained, 'artifact_sha256': artifacts, 'compute_artifact_sha256': compute,
+            'scope': 'successful tool checkpoints retained; missing tools only; independent per-capture GPU provenance',
+            'native_integrity_scope': 'stored capture-time digests rechecked on compute before new application execution',
+            'matched_profiler_timing_claim': False}
+
+
 def retry(args):
     """A fresh executor/cohort may reuse only inactive, verified completed builds."""
     if os.environ.get('SLURM_JOB_ID'):
@@ -1207,9 +1502,13 @@ def retry(args):
         suite_path = getattr(args, 'suite', None)
         cases = getattr(args, 'cases', None)
         profiles_only = bool(getattr(args, 'profiles_only', False))
+        continue_profiles = bool(getattr(args, 'continue_profiles', False))
+        if continue_profiles and (not profiles_only or suite_path is not None or cases is not None):
+            raise ValueError('--continue-profiles requires --profiles-only and forbids --suite/--cases')
         if profiles_only and cases is not None:
             raise ValueError('profiles-only retry forbids --cases; timing workload selection must match')
         retained = retained_timing(plan, state, old) if profiles_only else None
+        retained_profiles = retained_profile_tools(plan, state, old, old_suite) if continue_profiles else None
         supplied_profile_suite_sha256 = (sha(suite_path)
                                         if profiles_only and suite_path is not None else None)
         suite = study_workloads.load_suite(suite_path) if suite_path is not None else old_suite
@@ -1274,7 +1573,7 @@ def retry(args):
                 raise RuntimeError('retry withheld: could not prove every recorded job inactive')
             if match[1] in ids:
                 active.add(match[1])
-        if active and not profiles_only:
+        if active and (not profiles_only or continue_profiles):
             raise RuntimeError('retry withheld: could not prove every recorded job inactive')
         outcomes = {job: job_state(job) for job in sorted(ids)}
         terminal = {'COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY',
@@ -1282,7 +1581,7 @@ def retry(args):
         interactive = {}
         for job, (status, _) in outcomes.items():
             if status.split()[0] not in terminal:
-                if not profiles_only or status != 'RUNNING' or job not in active:
+                if not profiles_only or continue_profiles or status != 'RUNNING' or job not in active:
                     raise RuntimeError('retry withheld: recorded scheduler state is not terminal')
                 interactive[job] = admit_interactive_timing_job(job, state, retained)
             elif job in active:
@@ -1297,6 +1596,7 @@ def retry(args):
                   for stage in ('timings', 'profiles')}
         new_plan = {k: v for k, v in plan.items() if k != 'plan_sha256'}
         new_plan.pop('timing_reuse', None)
+        new_plan.pop('profile_continuation', None)
         new_plan.update(run_dir=str(root), created_unix_seconds=time.time(), wall_time_limits=limits,
                         retry_origin={'run_dir': str(old), 'plan_sha256': plan['plan_sha256'],
                                       'state_sha256': sha(old / 'state.json'),
@@ -1306,6 +1606,8 @@ def retry(args):
                                       'binding_scope': 'fresh compute admission required'})
         if profiles_only:
             new_plan['timing_reuse'] = {**retained, 'interactive_scheduler_admission': interactive}
+        if continue_profiles:
+            new_plan['profile_continuation'] = retained_profiles
         root.mkdir(parents=True, exist_ok=False)
         freeze_executor(root)
         if profiles_only or suite_path is None and cases is None:
@@ -1347,7 +1649,8 @@ def retry(args):
             else:
                 timing = submit_stage(root, 'timings')
                 submit_stage(root, 'profiles', [timing])
-    scope = 'Original timings reused; fresh profiles only' if profiles_only else 'Fresh timing/profile samples'
+    scope = ('Original timings and completed tools retained; missing tools only' if continue_profiles else
+             'Original timings reused; fresh profiles only' if profiles_only else 'Fresh timing/profile samples')
     print(f'Prepared retry: {root}\n{scope}; completed builds reused from {old}')
 
 
@@ -1406,6 +1709,11 @@ def report(root):
     if plan.get('import_origin'):
         result['canonical_import'] = plan['import_origin']
     result['timing_provenance'] = plan.get('timing_reuse', {'scope': 'fresh timing observations in this run'})
+    if plan.get('profile_continuation'):
+        result['profile_provenance'] = {'scope': plan['profile_continuation']['scope'],
+            'original_run_dir': plan['profile_continuation']['run_dir'],
+            'original_plan_sha256': plan['profile_continuation']['plan_sha256'],
+            'matched_profiler_timing_claim': False}
     for stage in ('timings', 'profiles'):
         attempt = completed(state, stage)
         if attempt:
@@ -1460,7 +1768,11 @@ def report(root):
              'Timing authority: independent unprofiled process pairs. Positive percentages mean less time.', '']
     if plan.get('timing_reuse'):
         lines += ['Timings reused byte-for-byte from `' + plan['timing_reuse']['run_dir'] +
-                  '`; this retry collects fresh profiles and no new timing measurements.', '']
+                  '`; this retry collects ' + ('only missing profiler tools' if plan.get('profile_continuation') else 'fresh profiles') +
+                  ' and no new timing measurements.', '']
+    if plan.get('profile_continuation'):
+        lines += ['Completed tool captures are retained with their original GPU identities. '
+                  'Continuation captures have their own GPU identities; these diagnostics do not claim matched profiler timing or speedup.', '']
     lines += ['Validation execution: ' + ', '.join(
         f'{member}={mode}' for member, mode in result['validation_execution'].items()) + '.', '']
     if 'legacy-driver' in result['validation_execution'].values():
@@ -1541,7 +1853,8 @@ def status(root):
     if 'cpu_builds' in plan:
         print('Build profiles: CUDA SM80 and separately validated CPU artifacts; CPU children use CPU MPI.')
     if plan.get('timing_reuse'):
-        print('Timings reused from ' + plan['timing_reuse']['run_dir'] + '; fresh profiles only.')
+        print('Timings reused from ' + plan['timing_reuse']['run_dir'] + '; ' +
+              ('missing profiler tools only; independent GPU provenance.' if plan.get('profile_continuation') else 'fresh profiles only.'))
     state = read_json(root / 'state.json')
     jobs = [str(build[key]) for build in state.get('build_attempts', list(state['builds'].values()))
             for key in ('build_job_id', 'validation_job_id') if build.get(key)]
@@ -1596,6 +1909,8 @@ def main(argv=None):
     p.add_argument('--cases', help='comma-separated case IDs from the selected suite; enables optional cases')
     p.add_argument('--profiles-only', action='store_true',
                    help='reuse completed timings on the same GPU; --suite may change only case.profile; no --cases')
+    p.add_argument('--continue-profiles', action='store_true',
+                   help='with --profiles-only, retain completed tools and capture only missing tools; per-capture GPUs, no --suite/--cases')
     p.add_argument('--timings-time', type=wall_time, help='override inherited timing allocation limit')
     p.add_argument('--profiles-time', type=wall_time, help='override inherited profiling allocation limit')
     p.add_argument('--prepare-only', action='store_true', help='prepare without submitting measurement jobs')
