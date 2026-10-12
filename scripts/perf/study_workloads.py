@@ -70,7 +70,7 @@ def parameters(case):
     defaults = {
         'dg': {'order': 1, 'mesh': DG_MESH, 'final_time': 0.002, 'dt': 1e-5,
                'rtol': RTOL, 'atol': ATOL, 'discretization': 'dg', 'device': 'cuda',
-               'engine': 'ordinary', 'dgsem_residual': 'unfused'},
+               'engine': 'ordinary', 'dgsem_residual': 'unfused', 'serial_refine': 0},
         'hdg': {'mode': 'igr', 'engine': 'ordinary', 'order': 3, 'mesh_n': 16,
                 'domain_periods': 1, 'dt': 1e-5, 'measured_steps': 5, 'trace_policy': 'engine-default'},
         'dgsem': {'n': 4, 'elements': 1024, 'iterations': 100, 'method': 'existing-fp64'},
@@ -82,6 +82,8 @@ def parameters(case):
         require(integer(result['order'], 'order', 1) <= (8 if adapter == 'dg' else 3), 'unsupported order')
         number(result['dt'], 'dt', positive=True)
     if adapter == 'dg':
+        require(integer(result['serial_refine'], 'serial_refine') <= 2,
+                'application study serial_refine must be an integer in 0..2')
         require(result['discretization'] in ('dg', 'dgsem', 'hdg') and
                 result['device'] in ('cpu', 'cuda') and result['engine'] in ('ordinary', 'tensor'),
                 'unsupported application discretization/device/engine')
@@ -207,7 +209,7 @@ def command(case, binary: Path, source: Path, workdir: Path, *, profile=False, f
                           '--dgsem-stab', 'none', '--dgsem-volume-flux', 'central',
                           '--dgsem-volume-dissipation', 'none', '--dgsem-surface-flux', 'rusanov']
         argv = [str(binary), '-m', str(source / p['mesh']), *selection, '-o', str(p['order']),
-                '-rs', '0', '-rp', '0', '-tf', str(p['final_time']), '-dt', str(p['dt']), '-c', '0',
+                '-rs', str(p['serial_refine']), '-rp', '0', '-tf', str(p['final_time']), '-dt', str(p['dt']), '-c', '0',
                 '-no-glvis', '-vs', '1000000', '-nan-scan', '--device', p['device'], '-no-save-state',
                 '-vtk' if fields else '-no-vtk']
         if fields:

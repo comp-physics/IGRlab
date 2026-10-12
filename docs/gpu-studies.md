@@ -109,6 +109,37 @@ Use `--cases dg-p1,dg-p3` for a targeted study, or `--suite FILE` for a saved,
 versioned workload variant. An explicit case selection enables optional cases.
 Do not change suite parameters between comparison members.
 
+The [pace-full-backends.json](../scripts/perf/suites/pace-full-backends.json)
+matrix checks CPU, CUDA and tensor routes and physical fields on 36 periodic
+cells for ten steps. Its small grid validates execution and equivalence; it
+does not establish representative GPU efficiency. The separate
+[pace-full-gpu-solvers.json](../scripts/perf/suites/pace-full-gpu-solvers.json)
+companion runs six CUDA full-application cases with three measured process
+pairs and one warmup:
+
+| Cases | Periodic cells | Order | Fixed horizon / timestep |
+|---|---:|---:|---|
+| DG ordinary; DGSEM unfused, fused SIMT and fused FP64 tensor | 1024 | 3 | `0.002 / 1e-5` (200 steps) |
+| HDG ordinary and tensor | 256 | 3 | `5e-5 / 1e-5` (five steps) |
+
+These use tracked meshes already available in `d735f57`. HDG uses the 64-cell
+`hdg_smooth_transition_periodic_n8.mesh` with `serial_refine: 1`; the application
+adapter accepts integer refinement levels 0..2 and defaults to zero. The
+companion captures whole-application Nsight Systems timelines and bounded
+Nsight Compute kernel selections. Command and allocation deadlines still
+apply; completion within an hour is not established by host fixtures.
+
+CPU equivalence belongs to the small matrix's own mesh and horizon. The GPU
+companion retains accepted-work, finite-state and separate physical-field
+gates between source versions; it has no same-work CPU reference and therefore
+makes no larger-grid CPU equivalence claim. Full applications frozen at
+`d735f57` compile named DG/HDG NVTX ranges but leave their runtime gate disabled.
+CUDA/API/OSRT timelines remain available; absent named phase ranges must not be
+reported as measured phase attribution. The accepted-step benchmark enables
+NVTX only around its selected step. The companion's NCU selections use the
+first invocation of each selected kernel name, which diagnoses those launches
+without establishing steady-state kernel cost or full-solver speedup.
+
 Reports list every enabled frozen-suite case with its discretization, device,
 engine, DGSEM residual, timing scope, and individual timing/profile state.
 A two-case selection cannot establish coverage of every backend. CPU cases use
@@ -122,7 +153,7 @@ DG/DGSEM solver elapsed time, HDG accepted-step timing, or DGSEM kernel timing.
 | Adapter | Primary timing | Numerical/work gate | Diagnostic scope |
 |---|---|---|---|
 | DG/DGSEM application | Fixed-horizon full-solver time | Accepted steps/RHS work, zero rejects, NaN scan, geometry and five physical fields | CPU, ordinary CUDA, and selected DGSEM fused arithmetic |
-| Generic HDG application | Whole-process wall time | Production success, fixed accepted horizon, matching physical fields against CPU | CPU, ordinary CUDA, tensor CUDA; whole-run timeline |
+| Generic HDG application | Whole-process wall time | Production success, fixed accepted horizon, field comparison; same-work CPU reference when selected | CPU, ordinary CUDA, tensor CUDA; whole-run timeline |
 | HDG | Accepted-step median per process | Schema-2 policies/gates, zero retries/fallback, same work, separate exported checksums | Measured step zero; volume, condensation, face, recovery and trace-solve families |
 | DGSEM, optional | Selected volume method time | Complete method/error observations against the existing long-double reference | Prescribed-sigma central-volume probe only |
 

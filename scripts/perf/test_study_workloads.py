@@ -13,6 +13,7 @@ import study_workloads as workloads
 ROOT = Path(__file__).resolve().parents[2]
 SUITE = ROOT / 'scripts/perf/suites/pace-a100.json'
 BACKEND_SUITE = ROOT / 'scripts/perf/suites/pace-full-backends.json'
+GPU_SOLVER_SUITE = ROOT / 'scripts/perf/suites/pace-full-gpu-solvers.json'
 GPU = {'uuid': 'GPU-00112233-4455-6677-8899-aabbccddeeff', 'name': 'NVIDIA A100-SXM4-80GB',
        'compute_capability': 80}
 
@@ -240,6 +241,62 @@ class WorkloadTests(unittest.TestCase):
              '-rs', '0', '-rp', '0', '-tf', '0.002', '-dt', '1e-05', '-c', '0', '-no-glvis',
              '-vs', '1000000', '-nan-scan', '--device', 'cuda', '-no-save-state', '-no-vtk'])
         self.assertEqual(workloads.environment(self.dg, self.work), {})
+
+    def test_serial_refine_is_bounded_and_repeated_for_every_application_call(self):
+        for refinement in (0, 1, 2):
+            case = copy.deepcopy(self.dg)
+            case['parameters']['serial_refine'] = refinement
+            for options in ({}, {'profile': True}, {'fields': True}):
+                argv = workloads.command(case, Path('/binary'), ROOT, self.work, **options)
+                with self.subTest(refinement=refinement, options=options):
+                    self.assertEqual(argv[argv.index('-rs') + 1], str(refinement))
+                    self.assertEqual(argv[argv.index('-rp') + 1], '0')
+                    self.assertEqual(argv[argv.index('-tf') + 1], '0.002')
+                    self.assertEqual(argv[argv.index('-dt') + 1], '1e-05')
+                    self.assertIn('-nan-scan', argv)
+        for refinement in (-1, 3, True, False, 1.0, '1', float('nan')):
+            case = copy.deepcopy(self.dg)
+            case['parameters']['serial_refine'] = refinement
+            with self.subTest(refinement=refinement), self.assertRaises(ValueError):
+                workloads.command(case, Path('/binary'), ROOT, self.work)
+
+    def test_refinement_changes_work_signature_and_mesh_still_has_field_gate(self):
+        self.stdout.write_text(self.dg_log())
+        original = workloads.parse(self.dg, self.stdout, self.stderr, GPU)['signature']
+        refined = copy.deepcopy(self.dg)
+        refined['parameters']['serial_refine'] = 1
+        self.assertNotEqual(original, workloads.parse(refined, self.stdout, self.stderr, GPU)['signature'])
+        left, right = self.work / 'left', self.work / 'right'
+        write_fields(left)
+        write_fields(right, x=0.25)
+        with self.assertRaisesRegex(ValueError, 'geometry/topology differs'):
+            workloads.compare_fields(refined, left, right, ROOT)
+
+    def test_gpu_solver_companion_has_six_full_application_cases_and_larger_meshes(self):
+        suite = workloads.load_suite(GPU_SOLVER_SUITE)
+        small = workloads.load_suite(BACKEND_SUITE)
+        self.assertEqual(suite['correctness_regex'], small['correctness_regex'])
+        self.assertEqual((suite['repetitions'], suite['warmups']), (3, 1))
+        self.assertEqual(len(suite['cases']), 6)
+        self.assertEqual({case['id'] for case in suite['cases']},
+                         {'dg-cuda-p3', 'dgsem-cuda-p3', 'dgsem-fused-simt-p3',
+                          'dgsem-fused-dmma-p3', 'hdg-cuda-p3', 'hdg-tensor-p3'})
+        for case in suite['cases']:
+            p = case['parameters']
+            with self.subTest(case=case['id']):
+                self.assertEqual(case['adapter'], 'dg')
+                self.assertTrue(case['enabled'])
+                self.assertEqual((p['order'], p['device'], p['dt']), (3, 'cuda', 1e-5))
+                lines = [line.strip() for line in (ROOT / p['mesh']).read_text().splitlines()]
+                cells = int(lines[lines.index('elements') + 1]) * 4 ** p['serial_refine']
+                self.assertEqual(cells, 256 if p['discretization'] == 'hdg' else 1024)
+                self.assertEqual(p['final_time'], 5e-5 if p['discretization'] == 'hdg' else 0.002)
+                self.assertEqual(case['profile']['selection'], 'first-per-kernel')
+                self.assertEqual(case['profile']['timeout'], 240)
+                self.assertTrue(case['profile']['kernel_groups'])
+                argv = workloads.command(case, Path('/binary'), ROOT, self.work, profile=True)
+                self.assertNotIn('--profile-measured-step', argv)
+                self.assertEqual(argv[argv.index('-rs') + 1], str(p['serial_refine']))
 
     def test_full_backend_suite_pins_small_same_mesh_horizon(self):
         suite = workloads.load_suite(BACKEND_SUITE)
