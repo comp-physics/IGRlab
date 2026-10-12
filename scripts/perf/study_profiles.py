@@ -9,6 +9,7 @@ Historical profile_harness qualification is intentionally independent.
 from __future__ import annotations
 
 import csv
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 import hashlib
 import io
@@ -574,8 +575,13 @@ def _kernel_id_regex(expression):
 
 
 def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: dict,
-            *, environment=None) -> dict:
-    """Capture a bounded selection; caller validates returned application logs."""
+            *, environment=None, checkpoint=None) -> dict:
+    """Capture a bounded selection; caller validates application logs.
+
+    An optional checkpoint receives independent partial snapshots before NCU
+    starts and if it fails, so completed Nsys analysis survives that failure.
+    """
+    require(checkpoint is None or callable(checkpoint), 'capture checkpoint must be callable')
     adapter = case.get('adapter')
     profile = case.get('profile', {})
     require(adapter in {'hdg', 'dg', 'dgsem'} and isinstance(profile, dict), 'unsupported study profiler adapter')
@@ -646,7 +652,7 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
     observed = gpu_identity()
     require(observed['uuid'] == expected_gpu.get('uuid') and observed['compute_capability'] == 80,
             'capture GPU differs from admitted allocation')
-    result = {'status': 'complete', 'adapter': adapter, 'gpu_uuid': observed['uuid'],
+    result = {'status': 'partial', 'adapter': adapter, 'gpu_uuid': observed['uuid'],
               'scope': 'selected measured step zero' if adapter == 'hdg' else 'whole application capture with bounded NCU selection',
               'primary_timing': False, 'selected_kernel_regex': regex, 'launch_skip': skip,
               'launch_count': count, 'selection': selection, 'required_kernel_groups': groups,
@@ -739,7 +745,19 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
                 'CUDA API, GPU kernel, memory, OSRT and NVTX durations overlap; never sum them into solver wall time']}
         result['application_logs'].append({'stdout': str(log / 'stdout.log'), 'stderr': str(log / 'stderr.log'),
                                            'receipt': str(log / 'result.json')})
+    def save_checkpoint():
+        for name, identity in result['tools'].items():
+            require(sha256(identity['executable']['path']) == identity['executable']['sha256'],
+                    f'{name} executable changed during capture')
+        result['tensor_instruction_evidence'] = tensor_instruction_evidence(case, result['captures'].get('ncu', {}))
+        if checkpoint is not None:
+            checkpoint(deepcopy(result))
+
     if tools['ncu']:
+        result['captures']['ncu'] = {'status': 'pending'}
+    save_checkpoint()
+
+    def capture_ncu():
         tool = tools['ncu']
         tool_command = [str(tool), '--config-file', 'off']
         listed = run('tools/ncu-sections', [*tool_command, '--list-sections'], 30)
@@ -808,6 +826,13 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
                     'observed_solver_clocks': False}}
             result['application_logs'].append({'stdout': str(log / 'stdout.log'), 'stderr': str(log / 'stderr.log'),
                                                'receipt': str(log / 'result.json')})
+    if tools['ncu']:
+        try:
+            capture_ncu()
+        except Exception as error:
+            result['captures']['ncu'] = {'status': 'failed', 'error': str(error)}
+            save_checkpoint()
+            raise
     for name, identity in result['tools'].items():
         require(sha256(identity['executable']['path']) == identity['executable']['sha256'],
                 f'{name} executable changed during capture')

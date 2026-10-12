@@ -822,6 +822,29 @@ def profiles(root, plan, suite, admission, runner, gpu):
              'scope': 'fresh matched profile cohort; profiled durations are diagnostic', 'cases': {}}
     timing_attempt = completed(read_json(root / 'state.json'), 'timings')
     timing_reference = read_json(timing_attempt['summary'])
+    def save_partial():
+        write_json(runner.output / 'partial.json', {**value, 'status': 'profiles_partial'})
+
+    def validate_application(case, member, record):
+        # Native capture exit zero alone is insufficient for application admission.
+        logs_to_validate = record.get('application_logs', [])
+        if not logs_to_validate:
+            raise RuntimeError('complete profiler capture has no application validation logs')
+        for logs in logs_to_validate:
+            timing_metadata = {}
+            if case['adapter'] == 'dg' and case['parameters'].get('discretization') == 'hdg':
+                timing_metadata['wall_seconds'] = read_json(logs['receipt'])['process_wall_seconds']
+            observation = study_workloads.parse(case, Path(logs['stdout']), Path(logs['stderr']), gpu,
+                                               **timing_metadata)
+            check_observation_identity(observation, plan, member)
+            if case['adapter'] == 'hdg' and (observation['host_export'] or
+                    not observation['profile']['enabled'] or observation['profile']['measured_step'] != 0):
+                raise RuntimeError('HDG capture did not retain selected measured step zero')
+            reference = timing_reference['cases'][case['id']]['observations'][0]['signature']
+            if observation['signature'] != reference:
+                raise RuntimeError('profiled numerical policy/work differs from unprofiled timing')
+        return len(logs_to_validate)
+
     for case in selected_cases(suite):
         captures = {}
         if case['adapter'] == 'dg' and case['parameters'].get('device') == 'cpu':
@@ -829,8 +852,9 @@ def profiles(root, plan, suite, admission, runner, gpu):
                 'status': 'not_applicable', 'reason': 'CPU execution; CUDA occupancy and counters do not apply',
                 'scope': 'CPU timings and physical fields retained; CPU hardware counters not collected'}
                 for member in MEMBERS}
-            write_json(runner.output / 'partial.json', value)
+            save_partial()
             continue
+        value['cases'][case['id']] = captures
         for member in MEMBERS:
             directory = runner.output / case['id'] / member
             directory.mkdir(parents=True)
@@ -839,30 +863,35 @@ def profiles(root, plan, suite, admission, runner, gpu):
             argv = study_workloads.command(case, binary, source, directory, profile=True)
             environment = os.environ.copy()
             environment.update(study_workloads.environment(case, directory, profile=True))
-            captures[member] = study_profiles.capture(case, argv, runner, directory, gpu,
-                                                       environment=environment)
+            def checkpoint(record):
+                record['application_validation'] = {'status': 'pending',
+                    'reason': 'capture logs must still match admitted unprofiled numerical policy/work'}
+                captures[member] = record
+                save_partial()
+
+            try:
+                captures[member] = study_profiles.capture(case, argv, runner, directory, gpu,
+                    environment=environment, checkpoint=checkpoint)
+            except Exception as error:
+                captures.setdefault(member, {'status': 'failed', 'application_validation': {'status': 'pending'}})
+                captures[member]['error'] = str(error)
+                save_partial()
+                raise
             if captures[member]['status'] != 'complete':
                 value['status'] = 'profiles_partial'
+                captures[member]['application_validation'] = {'status': 'pending',
+                    'reason': 'incomplete profiler capture; application admission not established'}
             else:
-                # Native capture exit zero alone is insufficient for application admission.
-                logs_to_validate = captures[member].get('application_logs', [])
-                if not logs_to_validate:
-                    raise RuntimeError('complete profiler capture has no application validation logs')
-                for logs in logs_to_validate:
-                    timing_metadata = {}
-                    if case['adapter'] == 'dg' and case['parameters'].get('discretization') == 'hdg':
-                        timing_metadata['wall_seconds'] = read_json(logs['receipt'])['process_wall_seconds']
-                    observation = study_workloads.parse(case, Path(logs['stdout']), Path(logs['stderr']), gpu,
-                                                       **timing_metadata)
-                    check_observation_identity(observation, plan, member)
-                    if case['adapter'] == 'hdg' and (observation['host_export'] or
-                            not observation['profile']['enabled'] or observation['profile']['measured_step'] != 0):
-                        raise RuntimeError('HDG capture did not retain selected measured step zero')
-                    reference = timing_reference['cases'][case['id']]['observations'][0]['signature']
-                    if observation['signature'] != reference:
-                        raise RuntimeError('profiled numerical policy/work differs from unprofiled timing')
-        value['cases'][case['id']] = captures
-        write_json(runner.output / 'partial.json', value)
+                try:
+                    log_count = validate_application(case, member, captures[member])
+                except Exception as error:
+                    captures[member]['status'] = 'partial'
+                    captures[member]['application_validation'] = {'status': 'failed', 'error': str(error)}
+                    save_partial()
+                    raise
+                captures[member]['application_validation'] = {'status': 'complete',
+                    'validated_log_count': log_count, 'scope': 'same numerical policy/work as unprofiled timing'}
+            save_partial()
     return value
 
 

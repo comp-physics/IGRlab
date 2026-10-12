@@ -343,6 +343,62 @@ class MetricTests(unittest.TestCase):
 
 
 class CaptureTests(unittest.TestCase):
+    def test_completed_nsys_checkpoint_precedes_ncu_and_is_independent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary)
+            original = runner.run
+            snapshots = []
+
+            def check_before_ncu(label, argv, **kwargs):
+                if label.endswith('ncu-sections'):
+                    self.assertEqual(len(snapshots), 1)
+                    self.assertEqual(snapshots[0]['status'], 'partial')
+                    self.assertEqual(snapshots[0]['captures']['nsys']['status'], 'complete')
+                    self.assertEqual(snapshots[0]['captures']['ncu']['status'], 'pending')
+                    self.assertEqual(len(snapshots[0]['application_logs']), 1)
+                return original(label, argv, **kwargs)
+
+            case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+            with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU), \
+                    patch.object(runner, 'run', side_effect=check_before_ncu):
+                value = profiles.capture(case, ['app'], runner, directory, GPU, checkpoint=snapshots.append)
+            self.assertEqual(value['status'], 'complete')
+            self.assertEqual(snapshots[0]['captures']['ncu']['status'], 'pending')
+            self.assertEqual(len(snapshots[0]['application_logs']), 1)
+            native = snapshots[0]['captures']['nsys']['native']
+            self.assertEqual(native['sha256'], profiles.sha256(native['path']))
+
+    def test_real_runner_ncu_timeout_preserves_finished_nsys_and_still_fails(self):
+        from gpu_study import Runner
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary)
+            tool.write_text('#!' + sys.executable + '\nimport time\ntime.sleep(2)\n')
+            real_runner, original = Runner(runner.output, 30), runner.run
+            snapshots = []
+
+            def real_ncu(label, argv, **kwargs):
+                if label.endswith('/ncu'):
+                    return real_runner.run(label, argv, **kwargs)
+                return original(label, argv, **kwargs)
+
+            case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel',
+                                               'launch_count': 2, 'timeout': 0.05}}
+            with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU), \
+                    patch.object(runner, 'run', side_effect=real_ncu), self.assertRaises(profiles.ProfileError):
+                profiles.capture(case, ['app'], runner, directory, GPU, checkpoint=snapshots.append)
+            self.assertEqual([row['captures']['ncu']['status'] for row in snapshots], ['pending', 'failed'])
+            self.assertEqual(snapshots[-1]['status'], 'partial')
+            self.assertEqual(snapshots[-1]['captures']['nsys']['status'], 'complete')
+            self.assertEqual(len(snapshots[-1]['application_logs']), 1)
+            receipt = json.loads((directory / 'ncu/result.json').read_text())
+            self.assertEqual((receipt['status'], receipt['returncode']), ('failed', 124))
+            self.assertFalse(any(label.endswith('ncu-import') for label, argv, timeout in runner.commands))
+
+    def test_invalid_checkpoint_rejects_before_any_query(self):
+        with patch.object(profiles, 'gpu_identity') as identity, self.assertRaises(profiles.ProfileError):
+            profiles.capture({}, ['app'], None, Path('/not-used'), GPU, checkpoint=True)
+        identity.assert_not_called()
+
     def test_all_native_stats_queries_force_matching_export_before_optional_and_trace_reports(self):
         with tempfile.TemporaryDirectory() as temporary:
             tool, runner, directory = self.setup_capture(temporary)

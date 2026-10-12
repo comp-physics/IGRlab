@@ -94,7 +94,7 @@ class BackendStudyTests(unittest.TestCase):
         study.write_json(self.root / 'state.json', {'attempts': [
             {'stage': 'timings', 'status': 'timings_complete', 'summary': str(summary)}]})
         admission = {'binaries': {m: {'app': '/saved/app'} for m in study.MEMBERS}}
-        def capture(case, argv, runner, directory, gpu, *, environment):
+        def capture(case, argv, runner, directory, gpu, *, environment, checkpoint):
             receipt = directory / 'result.json'
             study.write_json(receipt, {'returncode': 0, 'process_wall_seconds': 99.})
             return {'status': 'complete', 'application_logs': [{
@@ -105,6 +105,71 @@ class BackendStudyTests(unittest.TestCase):
             result = study.profiles(self.root, self.plan, {'cases': [case]}, admission, self.runner, {})
         self.assertEqual([c.kwargs for c in parse.call_args_list], [{'wall_seconds': 99.}] * 2)
         self.assertNotIn('statistics', result['cases']['hdg-cuda']['baseline'])
+
+    def profile_inputs(self):
+        case = self.cases()[1]
+        summary = self.root / 'timings.json'
+        study.write_json(summary, {'cases': {case['id']: {'observations': [{'signature': {'work': 10}}]}}})
+        study.write_json(self.root / 'state.json', {'attempts': [
+            {'stage': 'timings', 'status': 'timings_complete', 'summary': str(summary)}]})
+        admission = {'binaries': {member: {'app': '/saved/app'} for member in study.MEMBERS}}
+        return case, admission
+
+    def test_ncu_failure_keeps_current_member_nsys_without_inventing_application_admission(self):
+        case, admission = self.profile_inputs()
+
+        def capture(case, argv, runner, directory, gpu, *, environment, checkpoint):
+            record = {'status': 'partial', 'captures': {'nsys': {'status': 'complete', 'statistics': {'gpu': 1}},
+                                                       'ncu': {'status': 'pending'}}, 'application_logs': []}
+            checkpoint(record)
+            record['captures']['ncu'] = {'status': 'failed', 'error': 'NCU timeout'}
+            checkpoint(record)
+            raise RuntimeError('NCU timeout')
+
+        with patch.object(study.study_profiles, 'capture', side_effect=capture), \
+                patch.object(study.study_workloads, 'parse') as parse, self.assertRaisesRegex(RuntimeError, 'NCU timeout'):
+            study.profiles(self.root, self.plan, {'cases': [case]}, admission, self.runner, {})
+        parse.assert_not_called()
+        partial = study.read_json(self.runner.output / 'partial.json')
+        self.assertEqual(partial['status'], 'profiles_partial')
+        baseline = partial['cases'][case['id']]['baseline']
+        self.assertEqual(baseline['captures']['nsys']['status'], 'complete')
+        self.assertEqual(baseline['captures']['ncu']['status'], 'failed')
+        self.assertEqual(baseline['application_validation']['status'], 'pending')
+        self.assertNotIn('candidate', partial['cases'][case['id']])
+
+    def test_finished_baseline_survives_candidate_failure_before_checkpoint(self):
+        case, admission = self.profile_inputs()
+
+        def capture(case, argv, runner, directory, gpu, **kwargs):
+            if directory.name == 'candidate':
+                raise RuntimeError('candidate capture failed before Nsys')
+            return {'status': 'complete', 'application_logs': [{
+                'stdout': str(directory / 'stdout.log'), 'stderr': str(directory / 'stderr.log')}]}
+
+        with patch.object(study.study_profiles, 'capture', side_effect=capture), \
+                patch.object(study.study_workloads, 'parse', return_value={'signature': {'work': 10}}) as parse, \
+                self.assertRaisesRegex(RuntimeError, 'candidate capture failed'):
+            study.profiles(self.root, self.plan, {'cases': [case]}, admission, self.runner, {})
+        self.assertEqual(parse.call_count, 1)
+        partial = study.read_json(self.runner.output / 'partial.json')
+        self.assertEqual(partial['status'], 'profiles_partial')
+        captures = partial['cases'][case['id']]
+        self.assertEqual(captures['baseline']['application_validation']['status'], 'complete')
+        self.assertEqual(captures['candidate']['status'], 'failed')
+
+    def test_native_completion_with_bad_application_signature_stays_partial(self):
+        case, admission = self.profile_inputs()
+        record = {'status': 'complete', 'application_logs': [{'stdout': '/stdout', 'stderr': '/stderr'}]}
+        with patch.object(study.study_profiles, 'capture', return_value=record), \
+                patch.object(study.study_workloads, 'parse', return_value={'signature': {'work': 11}}), \
+                self.assertRaisesRegex(RuntimeError, 'numerical policy/work differs'):
+            study.profiles(self.root, self.plan, {'cases': [case]}, admission, self.runner, {})
+        partial = study.read_json(self.runner.output / 'partial.json')
+        self.assertEqual(partial['status'], 'profiles_partial')
+        baseline = partial['cases'][case['id']]['baseline']
+        self.assertEqual(baseline['status'], 'partial')
+        self.assertEqual(baseline['application_validation']['status'], 'failed')
 
     def run_timings(self, cases, failure=False):
         def observe(runner, root, plan, admission, case, member, label, gpu, *, fields=False):
