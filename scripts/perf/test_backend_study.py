@@ -29,6 +29,19 @@ class BackendStudyTests(unittest.TestCase):
                 'dt': 1e-5, 'final_time': 1e-4, 'atol': 5e-9, 'rtol': 5e-8}})
         return result
 
+    def test_reused_timing_gpu_must_match_before_any_profile_capture(self):
+        expected = {'uuid': 'GPU-00112233-4455-6677-8899-aabbccddeeff',
+                    'name': 'NVIDIA A100-SXM4-80GB', 'compute_capability': 80}
+        self.plan['timing_reuse'] = {'gpu': expected}
+        study.admit_reused_timing_gpu(self.plan, dict(expected))
+        for key, wrong in (('uuid', 'GPU-10112233-4455-6677-8899-aabbccddeeff'),
+                           ('name', 'NVIDIA A100-PCIE-40GB'), ('compute_capability', 70)):
+            with self.subTest(key=key), patch.object(study.study_profiles, 'capture') as capture:
+                with self.assertRaisesRegex(RuntimeError, 'original timing GPU UUID/model'):
+                    study.profiles(self.root, self.plan, {'cases': []}, {}, self.runner,
+                                   {**expected, key: wrong})
+                capture.assert_not_called()
+
     def test_runner_receipt_retains_pinned_igr_controls_including_empty_overrides(self):
         import sys
         environment = {'IGRLAB_IGR_DENSE_INVERSE': '', 'IGRLAB_IGR_CHEB_BASE_OPERATOR': '0',

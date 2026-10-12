@@ -261,6 +261,32 @@ plan unless explicitly overridden, including when its jobs were later shortened
 through the scheduler. The old run remains unchanged; partial submission receipts
 belong to the new run and prevent an unnoticed duplicate retry.
 
+When timings completed successfully and only the profiler executor needs a fix,
+reuse those observations in a new profile-only run:
+
+```bash
+./perf.sh retry --from-run /absolute/scratch/studies/completed-timings \
+  --run-dir /absolute/scratch/studies/profiles-retry \
+  --profiles-only --prepare-only --profiles-time 00:30:00
+```
+
+This mode preserves the exact suite bytes and rejects `--suite` and `--cases`.
+It copies the completed timing summary unchanged, binds every original timing
+artifact by path and hash, and verifies the retained source, binaries, build
+receipts and successful correctness jobs. Keep the original run and its
+artifacts available. Reports and status label these timings as reused; the new
+run adds fresh profiles and cannot submit or execute a timing stage.
+
+Without `--prepare-only`, retry submits only profiles. A prepared run can use
+`resume --stage profiles`, or its frozen interactive wrapper with the `profiles`
+stage. Capture admission requires the original physical A100 UUID and model;
+a newly scheduled allocation on another GPU fails before capture. The original
+timing allocation may remain active only when it is the owned free one-A100,
+single-rank interactive shell, has no running attempt or recorded active batch
+stage, and all build and correctness jobs completed successfully. The original
+run's lock excludes concurrent workers during retry preparation. Ordinary retry
+continues to require every recorded job to be inactive.
+
 Use `retry --cases` to measure additional cases already present in the old
 suite, including optional DGSEM probes, without submitting compilation or
 correctness jobs:

@@ -111,6 +111,8 @@ class RetryTests(unittest.TestCase):
             profiles = '--job-name=IGRlab-profiles' in argv
             return subprocess.CompletedProcess(argv, self.profile_code if profiles else 0,
                                                '102\n' if profiles else '101\n', 'profile submit error' if profiles else '')
+        if argv[0] == 'scontrol':
+            return subprocess.CompletedProcess(argv, 0, self.interactive_info, '')
         self.fail(f'unexpected external command: {argv}')
 
     def retry(self, *, prepare=True, **changes):
@@ -333,8 +335,116 @@ class RetryTests(unittest.TestCase):
             self.assertEqual((args.timings_time, args.profiles_time, args.prepare_only),
                              ('00:15:00', '00:30:00', True))
             self.assertEqual((args.suite, args.cases), ('suite.json', 'dgsem-n4,dgsem-n8'))
+            study.main(argv + ['--profiles-only'])
+            self.assertTrue(retry.call_args.args[0].profiles_only)
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 study.main(argv + ['--timings-time', '00:04:00'])
+
+    def prepare_profile_timing(self):
+        gpu = {'uuid': 'GPU-00112233-4455-6677-8899-aabbccddeeff',
+               'name': 'NVIDIA A100-SXM4-80GB', 'compute_capability': 80}
+        attempt = self.state['attempts'][0]
+        summary = Path(attempt['summary'])
+        study.write_json(summary, {'status': 'timings_complete', 'gpu': gpu,
+            'cases': {'dg-p1': {'statistics': study.sample_statistics([1, 2, 3], [1, 2, 3]),
+                                'observations': []}}})
+        other = summary.parent / 'field.vtu'
+        other.write_text('existing field bytes, not a trace\n')
+        attempt.update(summary_sha256=study.sha(summary), gpu=gpu,
+            artifact_sha256={str(path.relative_to(self.old)): study.sha(path) for path in (summary, other)})
+        self.save_state()
+        return gpu, summary, other
+
+    def test_profiles_only_preserves_timing_bytes_and_submits_only_profiles(self):
+        gpu, summary, other = self.prepare_profile_timing()
+        before = self.snapshot()
+        plan = self.retry(profiles_only=True, prepare=False)
+        self.assertEqual(before, self.snapshot())
+        state = study.read_json(self.new / 'state.json')
+        attempt = study.completed(state, 'timings')
+        self.assertTrue(attempt['timings_reused'])
+        self.assertEqual(Path(attempt['summary']).read_bytes(), summary.read_bytes())
+        self.assertEqual(plan['timing_reuse']['gpu'], gpu)
+        self.assertEqual(plan['timing_reuse']['artifact_sha256'][str(other)], study.sha(other))
+        self.assertEqual([job['stage'] for job in state['jobs']], ['profiles'])
+        self.assertFalse(any('--dependency' in value for value in state['jobs'][0]['argv']))
+        with self.assertRaisesRegex(RuntimeError, 'cannot submit new timings'):
+            study.submit_stage(self.new, 'timings')
+        report = study.report(self.new)
+        self.assertEqual(report['timing_provenance']['summary_sha256'], study.sha(summary))
+        self.assertIn('no new timing measurements', (self.new / 'report.md').read_text())
+        other.write_text('modified retained field')
+        with self.assertRaisesRegex(RuntimeError, 'reused timing artifact changed'):
+            study.verify(self.new)
+
+    def test_profiles_only_requires_exact_suite_and_completed_fingerprinted_timing(self):
+        for change in ({'cases': 'dg-p1'}, {'suite': str(self.old / 'suite.json')}):
+            with self.assertRaisesRegex(ValueError, 'forbids --suite/--cases'):
+                self.retry(profiles_only=True, **change)
+        with self.assertRaisesRegex(RuntimeError, 'fingerprinted timings'):
+            self.retry(profiles_only=True)
+        gpu, summary, _ = self.prepare_profile_timing()
+        summary.write_text('changed completed summary')
+        with self.assertRaisesRegex(RuntimeError, 'completed measurement artifact changed'):
+            self.retry(profiles_only=True)
+        self.assertFalse(self.new.exists())
+
+    def test_profiles_only_rejects_missing_case_and_mismatched_timing_gpu(self):
+        gpu, summary, _ = self.prepare_profile_timing()
+        for mutation in ('case', 'gpu'):
+            value = study.read_json(summary)
+            if mutation == 'case': value['cases'] = {}
+            else: value['gpu'] = {**gpu, 'uuid': 'GPU-10112233-4455-6677-8899-aabbccddeeff'}
+            study.write_json(summary, value)
+            attempt = self.state['attempts'][0]
+            attempt['summary_sha256'] = study.sha(summary)
+            attempt['artifact_sha256'][str(summary.relative_to(self.old))] = study.sha(summary)
+            self.save_state()
+            with self.assertRaisesRegex(RuntimeError, 'cases differ|GPU identities differ'):
+                self.retry(profiles_only=True)
+            self.prepare_profile_timing()
+        self.assertFalse(self.new.exists())
+
+    def test_profiles_only_admits_only_original_owned_interactive_allocation(self):
+        self.prepare_profile_timing()
+        self.state['jobs'] = []
+        self.save_state()
+        self.queue_stdout = '33|RUNNING\n'
+        self.outcomes['33'] = ('RUNNING', '0:0')
+        self.interactive_info = (f'JobId=33 UserId={study.getpass.getuser()}({os.getuid()}) '
+            'JobState=RUNNING BatchFlag=0 Account=gts-sbryngelson3 QOS=embers Partition=gpu-a100 '
+            'NumTasks=1 AllocTRES=cpu=8,mem=48G,node=1,gres/gpu=1')
+        before = self.snapshot()
+        plan = self.retry(profiles_only=True)
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(plan['timing_reuse']['interactive_scheduler_admission']['33']['BatchFlag'], '0')
+        self.assertEqual(study.read_json(self.new / 'state.json')['jobs'], [])
+
+    def test_profiles_only_rejects_running_workers_active_batch_and_wrong_allocation(self):
+        self.prepare_profile_timing()
+        self.state['attempts'].append({'stage': 'profiles', 'status': 'running', 'job_id': '33'})
+        self.save_state()
+        with self.assertRaisesRegex(RuntimeError, 'worker is running'):
+            self.retry(profiles_only=True)
+        self.state['attempts'].pop()
+        self.save_state()
+        self.queue_stdout = '33|RUNNING\n'
+        self.outcomes['33'] = ('RUNNING', '0:0')
+        with self.assertRaisesRegex(RuntimeError, 'batch stage is active'):
+            self.retry(profiles_only=True)
+        self.state['jobs'] = []
+        self.save_state()
+        valid = (f'JobId=33 UserId={study.getpass.getuser()}({os.getuid()}) '
+            'JobState=RUNNING BatchFlag=0 Account=gts-sbryngelson3 QOS=embers Partition=gpu-a100 '
+            'NumTasks=1 AllocTRES=cpu=8,gres/gpu=1')
+        for previous, wrong in (('BatchFlag=0', 'BatchFlag=1'), ('QOS=embers', 'QOS=paid'),
+                                ('Partition=gpu-a100', 'Partition=gpu-v100'),
+                                ('gres/gpu=1', 'gres/gpu=2'),
+                                (f'UserId={study.getpass.getuser()}', 'UserId=unrelated')):
+            self.interactive_info = valid.replace(previous, wrong)
+            with self.subTest(wrong=wrong), self.assertRaisesRegex(RuntimeError, 'owned free one-A100'):
+                self.retry(profiles_only=True)
+        self.assertFalse(self.new.exists())
 
 
 if __name__ == '__main__':

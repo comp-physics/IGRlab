@@ -220,6 +220,10 @@ def verify(root, *, binaries=False):
         artifact = absolute(path)
         if not artifact.is_file() or sha(artifact) != expected:
             raise RuntimeError(f'retried completed build artifact changed: {artifact}')
+    for path, expected in plan.get('timing_reuse', {}).get('artifact_sha256', {}).items():
+        artifact = absolute(path)
+        if not artifact.is_file() or sha(artifact) != expected:
+            raise RuntimeError(f'reused timing artifact changed: {artifact}')
     if binaries:
         admission = read_json(root / 'admission.json')
         if admission['plan_sha256'] != plan['plan_sha256']:
@@ -326,6 +330,8 @@ def create(args):
 
 def submit_stage(root, stage, dependencies=()):
     plan = load_plan(root)
+    if stage == 'timings' and plan.get('timing_reuse'):
+        raise RuntimeError('profiles-only retry cannot submit new timings')
     limit = stage_wall_time(plan, stage)
     (root / 'logs').mkdir(exist_ok=True)
     command = ['sbatch', '--parsable', '--account=gts-sbryngelson3', '--qos=embers',
@@ -744,7 +750,15 @@ def timings(root, plan, suite, admission, runner, gpu):
     return result
 
 
+def admit_reused_timing_gpu(plan, gpu):
+    expected = plan.get('timing_reuse', {}).get('gpu')
+    if expected and any(gpu.get(key) != expected.get(key)
+                        for key in ('uuid', 'name', 'compute_capability')):
+        raise RuntimeError('profiles-only retry requires the original timing GPU UUID/model')
+
+
 def profiles(root, plan, suite, admission, runner, gpu):
+    admit_reused_timing_gpu(plan, gpu)
     value = {'schema_version': SCHEMA, 'status': 'analysis_complete', 'gpu': gpu,
              'scope': 'fresh matched profile cohort; profiled durations are diagnostic', 'cases': {}}
     timing_attempt = completed(read_json(root / 'state.json'), 'timings')
@@ -811,6 +825,9 @@ def worker(args):
             raise RuntimeError('complete and admit unprofiled timings before profiling')
         worker_budget(plan, suite, args.stage, entered)  # Fail before queries/captures if time is exhausted.
         gpu = allocation()
+        if args.stage == 'timings' and plan.get('timing_reuse'):
+            raise RuntimeError('profiles-only retry cannot run new timings')
+        admit_reused_timing_gpu(plan, gpu)
         checked_builds(root)
         admission = admit(root, plan, suite)
         verify(root, binaries=True)
@@ -913,6 +930,64 @@ def retry_build_artifacts(plan, suite, old_admission=None):
     return result
 
 
+def retained_timing(plan, state, old):
+    if any(attempt.get('status') == 'running' for attempt in state['attempts']):
+        raise RuntimeError('profiles-only retry withheld: original worker is running')
+    attempt = completed(state, 'timings')
+    if not attempt or not attempt.get('summary_sha256') or not attempt.get('artifact_sha256'):
+        raise RuntimeError('profiles-only retry requires completed, fingerprinted timings')
+    summary = absolute(attempt['summary'])
+    if not summary.resolve().is_relative_to(old) or sha(summary) != attempt['summary_sha256']:
+        raise RuntimeError('completed timing summary changed')
+    timing = read_json(summary)
+    original_suite = study_workloads.load_suite(old / 'suite.json')
+    if set(timing.get('cases', {})) != {case['id'] for case in selected_cases(original_suite)}:
+        raise RuntimeError('completed timing cases differ from the exact original suite')
+    gpu = timing.get('gpu', {})
+    if (timing.get('status') != 'timings_complete' or not isinstance(gpu.get('uuid'), str) or
+            not re.fullmatch(r'GPU-[0-9a-fA-F-]{36}', gpu['uuid']) or
+            'A100' not in gpu.get('name', '') or gpu.get('compute_capability') != 80):
+        raise RuntimeError('completed timings lack the original A100 identity')
+    if attempt.get('gpu') and any(attempt['gpu'].get(key) != gpu.get(key)
+                                  for key in ('uuid', 'name', 'compute_capability')):
+        raise RuntimeError('timing attempt and summary GPU identities differ')
+    artifacts = {}
+    if len(attempt['artifact_sha256']) > 10000:
+        raise RuntimeError('timing artifact manifest exceeds bound')
+    for relative, expected in attempt['artifact_sha256'].items():
+        path = absolute(old / relative)
+        if not path.resolve().is_relative_to(old) or not path.is_file() or sha(path) != expected:
+            raise RuntimeError('completed timing artifact changed or escaped')
+        artifacts[str(path)] = expected
+    if artifacts.get(str(summary)) != attempt['summary_sha256']:
+        raise RuntimeError('timing artifact manifest does not bind the summary')
+    artifacts.update(plan.get('timing_reuse', {}).get('artifact_sha256', {}))
+    return {'run_dir': str(old), 'plan_sha256': plan['plan_sha256'],
+            'suite_sha256': plan['suite_sha256'], 'attempt': attempt,
+            'summary': str(summary), 'summary_sha256': attempt['summary_sha256'],
+            'artifact_sha256': artifacts, 'gpu': gpu,
+            'scope': 'original unprofiled timings reused byte-for-byte; no new timing observations'}
+
+
+def admit_interactive_timing_job(job, state, retained):
+    """A live user-owned shell may retain finished measurements, never a batch worker."""
+    if (job != str(retained['attempt'].get('job_id')) or
+            any(str(record.get('job_id')) == job for record in state.get('jobs', []))):
+        raise RuntimeError('profiles-only retry withheld: recorded batch stage is active')
+    query = subprocess.run(['scontrol', 'show', 'job', '-o', job], text=True,
+                           capture_output=True, timeout=30)
+    info = dict(re.findall(r'(\w+)=([^\s]+)', query.stdout))
+    user = re.fullmatch(r'([^()]+)\(([0-9]+)\)', info.get('UserId', ''))
+    gpu_tres = re.findall(r'(?:^|,)gres/gpu=([0-9]+)(?:,|$)', info.get('AllocTRES', ''))
+    if (query.returncode or not user or user[1] != getpass.getuser() or int(user[2]) != os.getuid() or
+            info.get('JobId') != job or info.get('JobState') != 'RUNNING' or
+            info.get('BatchFlag') != '0' or info.get('Account') != 'gts-sbryngelson3' or
+            info.get('QOS') != 'embers' or info.get('Partition') != 'gpu-a100' or
+            info.get('NumTasks') != '1' or gpu_tres != ['1']):
+        raise RuntimeError('profiles-only retry withheld: active job is not the owned free one-A100 interactive allocation')
+    return info
+
+
 def retry(args):
     """A fresh executor/cohort may reuse only inactive, verified completed builds."""
     if os.environ.get('SLURM_JOB_ID'):
@@ -926,6 +1001,10 @@ def retry(args):
         old_suite = study_workloads.load_suite(old / 'suite.json')
         suite_path = getattr(args, 'suite', None)
         cases = getattr(args, 'cases', None)
+        profiles_only = bool(getattr(args, 'profiles_only', False))
+        if profiles_only and (suite_path is not None or cases is not None):
+            raise ValueError('profiles-only retry forbids --suite/--cases; timings require exact suite bytes')
+        retained = retained_timing(plan, state, old) if profiles_only else None
         suite = study_workloads.load_suite(suite_path) if suite_path is not None else old_suite
         if suite['correctness_regex'] != old_suite['correctness_regex']:
             raise ValueError('retry cannot change correctness_regex; completed validation must match')
@@ -977,15 +1056,26 @@ def retry(args):
                                text=True, capture_output=True, timeout=30)
         if queue.returncode:
             raise RuntimeError('retry withheld: could not prove every recorded job inactive')
+        active = set()
         for row in queue.stdout.splitlines():
             match = re.fullmatch(r'([0-9]+)(?:[_+][^|]+)?\|[^|]+', row.strip())
-            if not match or match[1] in ids:
+            if not match:
                 raise RuntimeError('retry withheld: could not prove every recorded job inactive')
+            if match[1] in ids:
+                active.add(match[1])
+        if active and not profiles_only:
+            raise RuntimeError('retry withheld: could not prove every recorded job inactive')
         outcomes = {job: job_state(job) for job in sorted(ids)}
         terminal = {'COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY',
                     'NODE_FAIL', 'BOOT_FAIL', 'DEADLINE', 'PREEMPTED'}
-        if any(status.split()[0] not in terminal for status, _ in outcomes.values()):
-            raise RuntimeError('retry withheld: recorded scheduler state is not terminal')
+        interactive = {}
+        for job, (status, _) in outcomes.items():
+            if status.split()[0] not in terminal:
+                if not profiles_only or status != 'RUNNING' or job not in active:
+                    raise RuntimeError('retry withheld: recorded scheduler state is not terminal')
+                interactive[job] = admit_interactive_timing_job(job, state, retained)
+            elif job in active:
+                raise RuntimeError('retry withheld: scheduler active/accounting states disagree')
         checked_builds(old)
         if any(outcomes[state['builds'][m]['build_job_id']] != ('COMPLETED', '0:0') for m in MEMBERS):
             raise RuntimeError('retry requires completed successful canonical builds')
@@ -994,6 +1084,7 @@ def retry(args):
         limits = {stage: wall_time(getattr(args, stage + '_time', None) or stage_wall_time(plan, stage))
                   for stage in ('timings', 'profiles')}
         new_plan = {k: v for k, v in plan.items() if k != 'plan_sha256'}
+        new_plan.pop('timing_reuse', None)
         new_plan.update(run_dir=str(root), created_unix_seconds=time.time(), wall_time_limits=limits,
                         retry_origin={'run_dir': str(old), 'plan_sha256': plan['plan_sha256'],
                                       'state_sha256': sha(old / 'state.json'),
@@ -1001,6 +1092,8 @@ def retry(args):
                                       'suite_sha256': plan['suite_sha256'], 'scheduler_outcomes': outcomes,
                                       'build_artifact_sha256': artifacts,
                                       'binding_scope': 'fresh compute admission required'})
+        if profiles_only:
+            new_plan['timing_reuse'] = {**retained, 'interactive_scheduler_admission': interactive}
         root.mkdir(parents=True, exist_ok=False)
         (root / 'executor').mkdir()
         for name in EXECUTOR_FILES:
@@ -1013,15 +1106,29 @@ def retry(args):
         new_plan['executor_sha256'] = {name: sha(root / 'executor' / name) for name in EXECUTOR_FILES}
         new_plan['plan_sha256'] = digest(new_plan)
         write_json(root / 'plan.json', new_plan, exclusive=True)
+        attempts = []
+        if profiles_only:
+            directory = root / 'attempts' / 'timings-reused'
+            directory.mkdir(parents=True)
+            shutil.copy2(retained['summary'], directory / 'summary.json')
+            attempts = [{**retained['attempt'], 'id': 'timings-reused', 'directory': str(directory),
+                         'summary': str(directory / 'summary.json'), 'plan_sha256': new_plan['plan_sha256'],
+                         'artifact_sha256': {'attempts/timings-reused/summary.json': retained['summary_sha256']},
+                         'timings_reused': True, 'reused_from': {'run_dir': str(old),
+                             'summary': retained['summary'], 'summary_sha256': retained['summary_sha256']}}]
         write_json(root / 'state.json', {'schema_version': SCHEMA, 'builds': state['builds'],
                    'build_attempts': [{'member': m, **state['builds'][m]} for m in MEMBERS],
-                   'jobs': [], 'attempts': []}, exclusive=True)
+                   'jobs': [], 'attempts': attempts}, exclusive=True)
     with locked(root):
         verify(root)
         if not args.prepare_only:
-            timing = submit_stage(root, 'timings')
-            submit_stage(root, 'profiles', [timing])
-    print(f'Prepared retry: {root}\nFresh timing/profile samples; completed builds reused from {old}')
+            if profiles_only:
+                submit_stage(root, 'profiles')
+            else:
+                timing = submit_stage(root, 'timings')
+                submit_stage(root, 'profiles', [timing])
+    scope = 'Original timings reused; fresh profiles only' if profiles_only else 'Fresh timing/profile samples'
+    print(f'Prepared retry: {root}\n{scope}; completed builds reused from {old}')
 
 
 def comparison_description(plan):
@@ -1071,6 +1178,7 @@ def report(root):
         member: ('run-only' if plan.get('builds', {}).get(member, {}).get('run_only_validation') is True
                  else 'legacy-driver' if plan.get('builds', {}).get(member, {}).get('run_only_validation') is False
                  else 'not-recorded') for member in MEMBERS}
+    result['timing_provenance'] = plan.get('timing_reuse', {'scope': 'fresh timing observations in this run'})
     for stage in ('timings', 'profiles'):
         attempt = completed(state, stage)
         if attempt:
@@ -1123,6 +1231,9 @@ def report(root):
     lines = ['# PACE A100 GPU study', '', f"Plan: `{plan['plan_sha256']}`", '',
              'Comparison: ' + comparison_text + '.', '',
              'Timing authority: independent unprofiled process pairs. Positive percentages mean less time.', '']
+    if plan.get('timing_reuse'):
+        lines += ['Timings reused byte-for-byte from `' + plan['timing_reuse']['run_dir'] +
+                  '`; this retry collects fresh profiles and no new timing measurements.', '']
     lines += ['Validation execution: ' + ', '.join(
         f'{member}={mode}' for member, mode in result['validation_execution'].items()) + '.', '']
     if 'legacy-driver' in result['validation_execution'].values():
@@ -1200,6 +1311,8 @@ def collect(args):
 def status(root):
     plan = verify(root)
     print('Comparison: ' + comparison_description(plan)[1] + '.')
+    if plan.get('timing_reuse'):
+        print('Timings reused from ' + plan['timing_reuse']['run_dir'] + '; fresh profiles only.')
     state = read_json(root / 'state.json')
     jobs = [str(build[key]) for build in state.get('build_attempts', list(state['builds'].values()))
             for key in ('build_job_id', 'validation_job_id') if build.get(key)]
@@ -1245,6 +1358,8 @@ def main(argv=None):
     p.add_argument('--run-dir', required=True, help='new absolute scratch directory')
     p.add_argument('--suite', help='validated replacement suite; correctness_regex must match the old run')
     p.add_argument('--cases', help='comma-separated case IDs from the selected suite; enables optional cases')
+    p.add_argument('--profiles-only', action='store_true',
+                   help='reuse exact completed timings; fresh profiles on the same GPU UUID/model; no suite/case overrides')
     p.add_argument('--timings-time', type=wall_time, help='override inherited timing allocation limit')
     p.add_argument('--profiles-time', type=wall_time, help='override inherited profiling allocation limit')
     p.add_argument('--prepare-only', action='store_true', help='prepare without submitting measurement jobs')
