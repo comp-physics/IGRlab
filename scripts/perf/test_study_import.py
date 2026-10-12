@@ -5,6 +5,7 @@ import contextlib
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import pwd
@@ -104,6 +105,7 @@ class StudyImportTests(unittest.TestCase):
         self.record = {'build_request': str(self.request), 'build_job_id': '101', 'test_result': str(self.result_path)}
         self.build_state = 'COMPLETED'
         self.test_state = 'TIMEOUT'
+        self.test_end = 1700000300
         self.calls = []
         self.patches = [patch.object(study.study_build, '_identity', return_value=self.identity),
                         patch.object(study.study_build, 'verify_source', side_effect=self.verify_source),
@@ -163,7 +165,7 @@ class StudyImportTests(unittest.TestCase):
             else:
                 row = [job, self.test_state, '0:0' if self.test_state == 'RUNNING' else '0:1', self.user,
                        'gts-sbryngelson3', 'embers', 'bash', self.date(1700000000),
-                       self.date(1700000300) if self.test_state != 'RUNNING' else 'Unknown', 'compute-1', 'srun --pty bash -l']
+                       self.date(self.test_end) if self.test_state != 'RUNNING' else 'Unknown', 'compute-1', 'srun --pty bash -l']
             output = '|'.join(row)
         elif argv == ['scontrol', 'show', 'hostnames', 'compute-1']:
             output = 'compute-1\n'
@@ -278,6 +280,27 @@ class StudyImportTests(unittest.TestCase):
         plan = self.plan()
         with self.assertRaisesRegex(ValueError, 'outside the recorded compute'):
             study.completed_records(plan, study.receipt(plan))
+
+    def test_sacct_end_second_interval_accepts_fraction_but_not_next_second(self):
+        # Observed native receipt: finish 05:25:53.7302136Z, sacct End05:25:53.
+        self.test_state = 'COMPLETED'
+        self.test_end = 1791782753
+        self.result['started_unix_seconds'] = 1791782667.1940846
+        for finish in (float(self.test_end), 1791782753.7302136,
+                       math.nextafter(float(self.test_end + 1), float(self.test_end))):
+            with self.subTest(accepted_finish=finish):
+                self.result['finished_unix_seconds'] = finish
+                self.publish_result()
+                plan = self.plan()
+                record = study.completed_records(plan, study.receipt(plan))
+                self.assertEqual(record['test_allocation_accounting']['row'][8], '2026-10-12T05:25:53')
+        for finish in (float(self.test_end + 1), self.test_end + 1.25):
+            with self.subTest(rejected_finish=finish):
+                self.result['finished_unix_seconds'] = finish
+                self.publish_result()
+                plan = self.plan()
+                with self.assertRaisesRegex(ValueError, 'final accounting covering'):
+                    study.completed_records(plan, study.receipt(plan))
 
     def test_full_worker_admission_reuses_canonical_verifier(self):
         plan = self.plan()

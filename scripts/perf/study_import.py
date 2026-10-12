@@ -310,8 +310,10 @@ def completed_records(plan, receipt, *, full=False):
                 (not os.environ.get('SLURM_JOB_ID') or os.environ['SLURM_JOB_ID'] == job),
                 'only the same owned running interactive allocation may reuse its sealed tests')
     else:
+        # Standard sacct End omits fractional seconds. It denotes that second's
+        # interval; the sealed result must finish strictly before the next one.
         require(row[1].split()[0] in {'COMPLETED', 'FAILED', 'TIMEOUT', 'CANCELLED', 'OUT_OF_MEMORY', 'NODE_FAIL', 'PREEMPTED'} and
-                finish <= timestamp(row[8]), 'validation allocation has no final accounting covering its sealed tests')
+                finish < timestamp(row[8]) + 1, 'validation allocation has no final accounting covering its sealed tests')
     command = fields.get('Command', '')
     require(command and command not in ('(null)', 'Unknown') and
             any(token == command or Path(token).name == Path(command).name
