@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Workload contracts for bounded studies of existing rank-one CUDA binaries.
+"""Workload contracts for bounded studies of existing rank-one binaries.
 
 This module builds argv and validates existing application output. Scheduling,
 dependency builds, timing pairs, profiler execution and stage recovery belong
@@ -69,7 +69,8 @@ def parameters(case):
     adapter, supplied = case['adapter'], case['parameters']
     defaults = {
         'dg': {'order': 1, 'mesh': DG_MESH, 'final_time': 0.002, 'dt': 1e-5,
-               'rtol': RTOL, 'atol': ATOL},
+               'rtol': RTOL, 'atol': ATOL, 'discretization': 'dg', 'device': 'cuda',
+               'engine': 'ordinary', 'dgsem_residual': 'unfused'},
         'hdg': {'mode': 'igr', 'engine': 'ordinary', 'order': 3, 'mesh_n': 16,
                 'domain_periods': 1, 'dt': 1e-5, 'measured_steps': 5, 'trace_policy': 'engine-default'},
         'dgsem': {'n': 4, 'elements': 1024, 'iterations': 100, 'method': 'existing-fp64'},
@@ -81,6 +82,20 @@ def parameters(case):
         require(integer(result['order'], 'order', 1) <= (8 if adapter == 'dg' else 3), 'unsupported order')
         number(result['dt'], 'dt', positive=True)
     if adapter == 'dg':
+        require(result['discretization'] in ('dg', 'dgsem', 'hdg') and
+                result['device'] in ('cpu', 'cuda') and result['engine'] in ('ordinary', 'tensor'),
+                'unsupported application discretization/device/engine')
+        require(result['engine'] == 'ordinary' or
+                (result['discretization'] == 'hdg' and result['device'] == 'cuda'),
+                'tensor engine requires CUDA HDG; DGSEM uses its explicit residual selection')
+        require(result['dgsem_residual'] in ('unfused', 'fused-simt', 'fused-dmma') and
+                (result['dgsem_residual'] == 'unfused' or
+                 (result['discretization'] == 'dgsem' and result['device'] == 'cuda')),
+                'fused residual requires CUDA DGSEM')
+        require(result['discretization'] != 'dgsem' or result['order'] <= 4,
+                'application study uses qualified DGSEM orders p1..p4')
+        require(result['discretization'] != 'hdg' or result['order'] <= 3,
+                'application study uses supported HDG orders p1..p3')
         number(result['final_time'], 'final_time', positive=True)
         require(result['dt'] <= result['final_time'], 'dt exceeds DG horizon')
         number(result['rtol'], 'rtol')
@@ -183,9 +198,17 @@ def command(case, binary: Path, source: Path, workdir: Path, *, profile=False, f
     p, adapter = parameters(case), case['adapter']
     require(not (profile and fields), 'profile and field export are separate calls')
     if adapter == 'dg':
-        argv = [str(binary), '-m', str(source / p['mesh']), '--dg-backend', 'dg', '-o', str(p['order']),
+        selection = (['--discretization', 'hdg', '--hdg-cuda-engine', p['engine'],
+                      '--time-integrator', 'backward-euler', '--regularization', 'none',
+                      '--positivity-limiter', 'none'] if p['discretization'] == 'hdg' else
+                     ['--dg-backend', p['discretization']])
+        if p['discretization'] == 'dgsem':
+            selection += ['--discretization', 'dgsem', '--regularization', 'none',
+                          '--dgsem-stab', 'none', '--dgsem-volume-flux', 'central',
+                          '--dgsem-volume-dissipation', 'none', '--dgsem-surface-flux', 'rusanov']
+        argv = [str(binary), '-m', str(source / p['mesh']), *selection, '-o', str(p['order']),
                 '-rs', '0', '-rp', '0', '-tf', str(p['final_time']), '-dt', str(p['dt']), '-c', '0',
-                '-no-glvis', '-vs', '1000000', '-nan-scan', '--device', 'cuda', '-no-save-state',
+                '-no-glvis', '-vs', '1000000', '-nan-scan', '--device', p['device'], '-no-save-state',
                 '-vtk' if fields else '-no-vtk']
         if fields:
             argv += ['-dt_save', str(p['final_time']), '-no-vtk-h1', '-no-vtk-l2', '-no-vtk-rank', '-no-vtk-zs']
@@ -200,8 +223,20 @@ def command(case, binary: Path, source: Path, workdir: Path, *, profile=False, f
 
 
 def environment(case, workdir, fields=False):
-    parameters(case)
-    return {'DG_IGR_VTK_PREFIX_PATH': str(Path(workdir) / 'vtk')} if case['adapter'] == 'dg' and fields else {}
+    p = parameters(case)
+    result = {'DG_IGR_VTK_PREFIX_PATH': str(Path(workdir) / 'vtk')} if case['adapter'] == 'dg' and fields else {}
+    if case['adapter'] == 'dg' and p['device'] == 'cpu':
+        result['OMP_NUM_THREADS'] = '1'
+    if case['adapter'] == 'dg' and p['discretization'] == 'dgsem':
+        controls = {'DGSEM_PRODUCTION_STRICT': '1', 'DGSEM_HIGH_ORDER_RESEARCH': '0',
+                    'DGSEM_VOLUME_QUADRATURE_MIN_ORDER': '0', 'DGSEM_SUBCELL_BLEND': '0',
+                    'DGSEM_FUSED_RESIDUAL': '0' if p['dgsem_residual'] == 'unfused' else '1',
+                    'DGSEM_FUSED_DMMA': '1' if p['dgsem_residual'] == 'fused-dmma' else '0'}
+        # Canonical names take precedence, including inherited values. Pin both
+        # aliases so the same frozen case works with historical application code.
+        result.update({prefix + name: value for name, value in controls.items()
+                       for prefix in ('IGRLAB_', 'DG_IGR_')})
+    return result
 
 
 def expected_device(expected_gpu):
@@ -224,11 +259,77 @@ def json_rows(text):
     return rows
 
 
-def parse(case, stdout: Path, stderr: Path, expected_gpu: dict):
+def parse_hdg_application(p, text, wall_seconds):
+    """Admit the existing generic application summary, not benchmark schema 2."""
+    require('[hdg-main] status=Rejected' not in text, 'HDG application rejected the workload')
+    rows = [dict(re.findall(r'(\w+)=([^ ]+)', line)) for line in text.splitlines()
+            if line.startswith('[hdg-main] status=Success ')]
+    require(len(rows) == 1, 'expected one successful HDG application summary')
+    row = rows[0]
+    steps = integer(int(row['step']), 'HDG application steps', 1)
+    nominal = math.ceil(p['final_time'] / p['dt'] - 1e-10)
+    final = number(float(row['time']), 'HDG application final time')
+    require(steps == nominal and abs(final - p['final_time']) <= max(1e-14, p['final_time'] * 1e-12),
+            'HDG application accepted horizon differs')
+    require(row.get('time_treatment') == 'backward-euler' and row.get('regularization') == 'none' and
+            row.get('positivity_limiter') == 'none' and int(row.get('rejected_attempts', '0')) == 0,
+            'HDG application numerical policy differs')
+    for name in ('minimum_accepted_dt', 'maximum_accepted_dt'):
+        dt = number(float(row[name]), name, positive=True)
+        require(abs(dt - p['dt']) <= max(1e-15, p['dt'] * 1e-12), 'HDG accepted timestep differs')
+    if p['device'] == 'cuda':
+        require(re.findall(r'^\[device\] requested=([^\s]+)', text, re.M) == ['cuda'] and
+                row.get('cuda_engine') == p['engine'] and row.get('fallback_count') == '0',
+                'HDG application CUDA engine/fallback differs')
+        require(all(row.get(key) for key in ('requested_trace_policy', 'resolved_trace_policy',
+                                            'trace_solver', 'trace_preconditioner')),
+                'HDG application trace policy missing')
+    else:
+        require('cuda_engine' not in row and not re.search(r'^\[device\] requested=cuda\b', text, re.M),
+                'CPU HDG application selected CUDA')
+    seconds = number(wall_seconds, 'HDG application runner wall seconds', positive=True)
+    policy = {key: value for key, value in row.items() if key.startswith('trace_') or key in
+              ('requested_trace_policy', 'resolved_trace_policy', 'time_treatment', 'regularization',
+               'positivity_limiter', 'zhang_shu_points', 'cuda_engine', 'fallback_count',
+               'minimum_accepted_dt', 'maximum_accepted_dt')}
+    return {'seconds': seconds, 'signature': {'adapter': 'dg', 'parameters': p,
+                'work': {'steps': steps, 'final_time': final}, 'application_policy': policy},
+            'checksums': None, 'gpu_uuid': None, 'precision': {'state': 'fp64'},
+            'errors': {'horizon_error': abs(final - p['final_time'])},
+            'gpu_identity_scope': ('CPU execution; host hardware recorded by coordinator' if p['device'] == 'cpu'
+                                   else 'allocation checked by coordinator; application log has no GPU UUID'),
+            'scope': f"rank-one {p['device'].upper()} HDG {p['engine']} full application process wall time, "
+                     'including startup/setup/shutdown; production success and fixed accepted horizon',
+            'gate_scope': 'existing application success contract; no benchmark per-step gate records'}
+
+
+def parse(case, stdout: Path, stderr: Path, expected_gpu: dict, *, wall_seconds=None):
     p, adapter = parameters(case), case['adapter']
-    uuid = expected_device(expected_gpu)
+    cpu_application = adapter == 'dg' and p['device'] == 'cpu'
+    uuid = None if cpu_application else expected_device(expected_gpu)
     text = Path(stdout).read_text(errors='replace') + '\n' + Path(stderr).read_text(errors='replace')
     if adapter == 'dg':
+        if p['discretization'] == 'hdg':
+            return parse_hdg_application(p, text, wall_seconds)
+        if p['device'] == 'cpu' or p['discretization'] == 'dgsem':
+            require(re.findall(r'^\[device\] requested=([^\s]+)', text, re.M) == [p['device']],
+                    'application selected device differs')
+        if p['discretization'] == 'dgsem':
+            native = [dict(re.findall(r'(\w+)=([^ ]+)', line)) for line in text.splitlines()
+                      if line.startswith('[dgsem-production] ')]
+            require(len(native) == 1 and native[0].get('selected') == 'mfem-native-packed' and
+                    native[0].get('strict') == '1' and native[0].get('backend') == p['device'] and
+                    native[0].get('order') == str(p['order']) and native[0].get('dim') == '2' and
+                    native[0].get('volume_dissipation') == 'none', 'DGSEM production selection differs')
+            fused = [dict(re.findall(r'(\w+)=([^ ]+)', line)) for line in text.splitlines()
+                     if line.startswith('[dgsem-fused-residual] ')]
+            if p['dgsem_residual'] == 'unfused':
+                require(not fused, 'unexpected fused DGSEM residual')
+            else:
+                contraction = 'dmma8x8x4' if p['dgsem_residual'] == 'fused-dmma' else 'simt'
+                require(len(fused) == 1 and fused[0].get('enabled') == '1' and
+                        fused[0].get('precision') == 'fp64' and fused[0].get('contraction') == contraction and
+                        fused[0].get('order') == str(p['order']), 'DGSEM fused arithmetic selection differs')
         summaries = [line for line in text.splitlines() if line.startswith('[explicit-time] event=run-summary ')]
         require(len(summaries) == 1, 'missing/duplicate DG run-summary')
         row = dict(re.findall(r'(\w+)=([^ ]+)', summaries[0]))
@@ -245,11 +346,14 @@ def parse(case, stdout: Path, stderr: Path, expected_gpu: dict):
         elapsed = re.findall(r'\bdone,\s+([0-9.eE+\-]+)s\.', text)
         require(len(elapsed) == 1, 'missing/duplicate DG solver elapsed time')
         seconds = number(float(elapsed[0]), 'DG solver seconds', positive=True)
+        scope = f"rank-one {p['device'].upper()} {p['discretization'].upper()} {p['dgsem_residual']} full solver, fixed horizon, NaN scans enabled"
         return {'seconds': seconds, 'signature': {'adapter': adapter, 'parameters': p, 'work': counts,
                     'final_time': final, 'cfl_control_enabled': False}, 'checksums': None, 'gpu_uuid': None,
-                'gpu_identity_scope': 'allocation checked by coordinator; application log has no GPU UUID',
+                'gpu_identity_scope': ('CPU execution; host hardware recorded by coordinator' if cpu_application else
+                                       'allocation checked by coordinator; application log has no GPU UUID'),
                 'precision': {'state': 'fp64'}, 'errors': {'horizon_error': abs(final - p['final_time'])},
-                'scope': 'rank-one CUDA ordinary DG full solver, fixed horizon, NaN scans enabled'}
+                'scope': ('rank-one CUDA ordinary DG full solver, fixed horizon, NaN scans enabled'
+                          if p['discretization'] == 'dg' and p['device'] == 'cuda' else scope)}
     rows = json_rows(text)
     if adapter == 'hdg':
         require(not any(row.get('schema') == 2 and row.get('success') is False for row in rows),

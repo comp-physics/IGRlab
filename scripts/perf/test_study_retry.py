@@ -131,6 +131,8 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(plan['builds'], self.plan['builds'])
         self.assertEqual((self.new / 'suite.json').read_bytes(), (self.old / 'suite.json').read_bytes())
         self.assertEqual(plan['retry_origin']['plan_sha256'], self.plan['plan_sha256'])
+        self.assertEqual(plan['retry_origin']['suite_sha256'], self.plan['suite_sha256'])
+        self.assertEqual(plan['suite_sha256'], self.plan['suite_sha256'])
         self.assertEqual(plan['retry_origin']['binding_scope'], 'fresh compute admission required')
         self.assertNotEqual(plan['plan_sha256'], self.plan['plan_sha256'])
         self.assertNotEqual(plan['executor_sha256'], self.plan['executor_sha256'])
@@ -139,6 +141,83 @@ class RetryTests(unittest.TestCase):
         self.assertEqual((state['jobs'], state['attempts']), ([], []))
         self.assertFalse((self.new / 'admission.json').exists())
         self.assertFalse((self.new / 'attempts').exists())
+        self.assertTrue(all(command[0] in ('squeue', 'sacct') for command in self.calls))
+
+    def test_selected_optional_cases_reuse_builds_and_pin_new_benchmark_without_compilation(self):
+        benchmark = self.app / study.study_workloads.BINARY_NAMES['dgsem']
+        benchmark.write_text('previously unmeasured built benchmark\n')
+        benchmark.chmod(0o755)
+        before = self.snapshot()
+        with patch.object(study.study_build, 'submit_build', side_effect=AssertionError('must not build')):
+            plan = self.retry(cases='dgsem-n4,dgsem-n8')
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(plan['builds'], self.plan['builds'])
+        self.assertEqual(plan['sources'], self.plan['sources'])
+        suite = study.study_workloads.load_suite(self.new / 'suite.json')
+        self.assertEqual([case['id'] for case in study.selected_cases(suite)], ['dgsem-n4', 'dgsem-n8'])
+        self.assertEqual(plan['suite_sha256'], study.sha(self.new / 'suite.json'))
+        self.assertNotEqual(plan['suite_sha256'], self.plan['suite_sha256'])
+        self.assertEqual(plan['retry_origin']['suite_sha256'], self.plan['suite_sha256'])
+        self.assertEqual(plan['retry_origin']['build_artifact_sha256'][str(benchmark)], study.sha(benchmark))
+        study.verify(self.new)
+        benchmark.write_text('changed after retry freeze\n')
+        with self.assertRaisesRegex(RuntimeError, 'completed build artifact changed'):
+            study.verify(self.new)
+
+    def test_replacement_suite_and_selection_are_frozen_with_same_correctness(self):
+        suite = study.read_json(self.old / 'suite.json')
+        suite['name'] = 'new-measurement-parameters'
+        suite['repetitions'] = 5
+        suite['cases'][0]['parameters']['final_time'] = 0.004
+        path = self.base / 'new-suite.json'
+        study.write_json(path, suite)
+        before = self.snapshot()
+        plan = self.retry(suite=str(path), cases='dg-p1')
+        self.assertEqual(before, self.snapshot())
+        frozen = study.study_workloads.load_suite(self.new / 'suite.json')
+        self.assertEqual(frozen['repetitions'], 5)
+        self.assertEqual(frozen['cases'][0]['parameters']['final_time'], 0.004)
+        self.assertEqual(frozen['correctness_regex'], suite['correctness_regex'])
+        self.assertEqual(plan['builds'], self.plan['builds'])
+        path.write_text('changed outside the frozen run')
+        study.verify(self.new)
+
+    def test_changed_correctness_malformed_suite_and_unknown_selection_reject_before_creation(self):
+        suite = study.read_json(self.old / 'suite.json')
+        suite['correctness_regex'] = '^new-test$'
+        path = self.base / 'new-suite.json'
+        study.write_json(path, suite)
+        with self.assertRaisesRegex(ValueError, 'cannot change correctness_regex'):
+            self.retry(suite=str(path))
+        self.assertFalse(self.new.exists())
+        self.assertEqual(self.calls, [])
+        path.write_text('{}')
+        with self.assertRaises(ValueError):
+            self.retry(suite=str(path))
+        for cases in ('', 'unknown', 'dg-p1,', 'dg-p1,dg-p1'):
+            with self.assertRaisesRegex(ValueError, 'unique known case IDs'):
+                self.retry(cases=cases)
+        self.assertFalse(self.new.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_newly_selected_missing_ambiguous_and_symlinked_executable_reject_without_build(self):
+        benchmark = self.app / study.study_workloads.BINARY_NAMES['dgsem']
+        with self.assertRaisesRegex(RuntimeError, 'missing or ambiguous completed executable'):
+            self.retry(cases='dgsem-n4')
+        benchmark.write_text('benchmark\n')
+        benchmark.chmod(0o755)
+        duplicate = self.app / 'duplicate' / benchmark.name
+        duplicate.parent.mkdir()
+        duplicate.write_text('duplicate benchmark\n')
+        duplicate.chmod(0o755)
+        with self.assertRaisesRegex(RuntimeError, 'missing or ambiguous completed executable'):
+            self.retry(cases='dgsem-n4')
+        duplicate.unlink()
+        benchmark.unlink()
+        benchmark.symlink_to(self.binary)
+        with self.assertRaisesRegex(ValueError, 'symlinked path'):
+            self.retry(cases='dgsem-n4')
+        self.assertFalse(self.new.exists())
         self.assertTrue(all(command[0] in ('squeue', 'sacct') for command in self.calls))
 
     def test_limits_inherit_or_explicitly_override_frozen_plan(self):
@@ -239,10 +318,12 @@ class RetryTests(unittest.TestCase):
     def test_retry_cli_overrides_and_invalid_limits(self):
         argv = ['retry', '--from-run', str(self.old), '--run-dir', str(self.new), '--prepare-only']
         with patch.object(study, 'retry') as retry:
-            study.main(argv + ['--timings-time', '00:15:00', '--profiles-time', '00:30:00'])
+            study.main(argv + ['--timings-time', '00:15:00', '--profiles-time', '00:30:00',
+                               '--suite', 'suite.json', '--cases', 'dgsem-n4,dgsem-n8'])
             args = retry.call_args.args[0]
             self.assertEqual((args.timings_time, args.profiles_time, args.prepare_only),
                              ('00:15:00', '00:30:00', True))
+            self.assertEqual((args.suite, args.cases), ('suite.json', 'dgsem-n4,dgsem-n8'))
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 study.main(argv + ['--timings-time', '00:04:00'])
 

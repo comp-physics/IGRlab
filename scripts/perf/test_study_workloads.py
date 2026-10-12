@@ -12,6 +12,7 @@ import study_workloads as workloads
 
 ROOT = Path(__file__).resolve().parents[2]
 SUITE = ROOT / 'scripts/perf/suites/pace-a100.json'
+BACKEND_SUITE = ROOT / 'scripts/perf/suites/pace-full-backends.json'
 GPU = {'uuid': 'GPU-00112233-4455-6677-8899-aabbccddeeff', 'name': 'NVIDIA A100-SXM4-80GB',
        'compute_capability': 80}
 
@@ -232,6 +233,119 @@ class WorkloadTests(unittest.TestCase):
         for log in (self.dg_log(steps=20), self.dg_log(final=0.001), self.dg_log(success=0)):
             self.stdout.write_text(log)
             with self.assertRaises(ValueError): workloads.parse(self.dg, self.stdout, self.stderr, GPU)
+
+    def test_legacy_dg_command_and_environment_preserved(self):
+        self.assertEqual(workloads.command(self.dg, Path('/binary'), ROOT, self.work),
+            ['/binary', '-m', str(ROOT / workloads.DG_MESH), '--dg-backend', 'dg', '-o', '1',
+             '-rs', '0', '-rp', '0', '-tf', '0.002', '-dt', '1e-05', '-c', '0', '-no-glvis',
+             '-vs', '1000000', '-nan-scan', '--device', 'cuda', '-no-save-state', '-no-vtk'])
+        self.assertEqual(workloads.environment(self.dg, self.work), {})
+
+    def test_full_backend_suite_pins_small_same_mesh_horizon(self):
+        suite = workloads.load_suite(BACKEND_SUITE)
+        self.assertEqual(len(suite['cases']), 9)
+        self.assertEqual(suite['correctness_regex'], self.suite['correctness_regex'])
+        shared = {(case['parameters']['order'], case['parameters']['mesh'],
+                   case['parameters']['dt'], case['parameters']['final_time']) for case in suite['cases']}
+        self.assertEqual(len(shared), 1)
+        self.assertEqual(sum(c['parameters']['device'] == 'cpu' for c in suite['cases']), 3)
+        for case in suite['cases']:
+            p = case['parameters']
+            self.assertTrue((ROOT / p['mesh']).is_file())
+            argv = workloads.command(case, Path('/binary'), ROOT, self.work)
+            self.assertEqual(argv[argv.index('--device') + 1], p['device'])
+            if p['discretization'] == 'hdg':
+                self.assertNotIn('--dg-backend', argv)
+                self.assertIn('backward-euler', argv)
+            if p['device'] == 'cuda':
+                self.assertEqual(case['profile']['selection'], 'first-per-kernel')
+                self.assertTrue(case['profile']['kernel_groups'])
+
+    def test_application_unsupported_backend_combinations_rejected(self):
+        for change in ({'engine': 'tensor'}, {'discretization': 'hdg', 'device': 'cpu', 'engine': 'tensor'},
+                       {'dgsem_residual': 'fused-dmma'},
+                       {'discretization': 'dgsem', 'device': 'cpu', 'dgsem_residual': 'fused-simt'},
+                       {'discretization': 'dgsem', 'order': 5}, {'discretization': 'hdg', 'order': 4}):
+            case = copy.deepcopy(self.dg)
+            case['parameters'].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError): workloads.parameters(case)
+
+    def test_cpu_dg_admission_does_not_require_gpu_identity(self):
+        case = copy.deepcopy(self.dg)
+        case['parameters']['device'] = 'cpu'
+        self.stdout.write_text('[device] requested=cpu\n' + self.dg_log())
+        result = workloads.parse(case, self.stdout, self.stderr, None)
+        self.assertIn('CPU', result['scope'])
+        self.assertEqual(workloads.environment(case, self.work)['OMP_NUM_THREADS'], '1')
+        self.stdout.write_text('[device] requested=cuda\n' + self.dg_log())
+        with self.assertRaisesRegex(ValueError, 'device'): workloads.parse(case, self.stdout, self.stderr, None)
+
+    def test_full_dgsem_native_selection_and_fused_precision(self):
+        case = copy.deepcopy(self.dg)
+        case['parameters'].update(discretization='dgsem', dgsem_residual='fused-dmma')
+        ordinary = ('[device] requested=cuda\n'
+                    '[dgsem-production] selected=mfem-native-packed strict=1 backend=cuda order=1 dim=2 volume_dissipation=none\n')
+        fused = '[dgsem-fused-residual] enabled=1 precision=fp64 contraction=dmma8x8x4 order=1\n'
+        self.stdout.write_text(ordinary + fused + self.dg_log())
+        self.assertIn('fused-dmma', workloads.parse(case, self.stdout, self.stderr, GPU)['scope'])
+        env = workloads.environment(case, self.work)
+        for prefix in ('IGRLAB_', 'DG_IGR_'):
+            self.assertEqual(env[prefix + 'DGSEM_FUSED_DMMA'], '1')
+            self.assertEqual(env[prefix + 'DGSEM_SUBCELL_BLEND'], '0')
+            self.assertEqual(env[prefix + 'DGSEM_VOLUME_QUADRATURE_MIN_ORDER'], '0')
+        for invalid in (ordinary.replace('strict=1', 'strict=0') + fused,
+                        ordinary.replace('backend=cuda', 'backend=cpu') + fused,
+                        ordinary + fused.replace('dmma8x8x4', 'simt'), ordinary + fused * 2, ordinary):
+            self.stdout.write_text(invalid + self.dg_log())
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                workloads.parse(case, self.stdout, self.stderr, GPU)
+        case['parameters'].update(device='cpu', dgsem_residual='unfused')
+        self.stdout.write_text(ordinary.replace('cuda', 'cpu') + self.dg_log())
+        self.assertIn('CPU DGSEM', workloads.parse(case, self.stdout, self.stderr, None)['scope'])
+        self.stdout.write_text(ordinary.replace('cuda', 'cpu') + fused + self.dg_log())
+        with self.assertRaisesRegex(ValueError, 'unexpected fused'):
+            workloads.parse(case, self.stdout, self.stderr, None)
+
+    def hdg_application_log(self, device='cuda', engine='tensor', *, step=200, final=0.002, cycle=0):
+        selected = '[device] requested=cuda hdg_cuda_engine=' + engine + '\n' if device == 'cuda' else ''
+        engine_fields = (' cuda_engine=' + engine + ' fallback_count=0 requested_trace_policy=engine-default'
+                         ' resolved_trace_policy=engine-default trace_solver=native trace_preconditioner=ilu0'
+                         ' trace_ilu_type=0') if device == 'cuda' else ''
+        return (selected + f'[hdg-main] status=Success step={step} time={final} output_cycle={cycle}' +
+                engine_fields + ' time_treatment=backward-euler regularization=none positivity_limiter=none'
+                ' minimum_accepted_dt=1e-05 maximum_accepted_dt=1e-05\n')
+
+    def test_generic_hdg_application_wall_horizon_engine_and_export_signature(self):
+        case = copy.deepcopy(self.dg)
+        case['parameters'].update(discretization='hdg', engine='tensor')
+        self.stdout.write_text(self.hdg_application_log())
+        result = workloads.parse(case, self.stdout, self.stderr, GPU, wall_seconds=0.75)
+        self.assertEqual(result['seconds'], 0.75)
+        self.assertIn('startup', result['scope'])
+        self.assertIn('no benchmark per-step', result['gate_scope'])
+        self.stdout.write_text(self.hdg_application_log(cycle=1))
+        self.assertEqual(result['signature'], workloads.parse(case, self.stdout, self.stderr, GPU,
+                                                             wall_seconds=1.25)['signature'])
+        for invalid in (self.hdg_application_log(step=199), self.hdg_application_log(final=0.001),
+                        self.hdg_application_log(engine='ordinary'), self.hdg_application_log() * 2,
+                        self.hdg_application_log().replace('fallback_count=0', 'fallback_count=1'),
+                        self.hdg_application_log().replace('maximum_accepted_dt=1e-05', 'maximum_accepted_dt=2e-05'),
+                        self.hdg_application_log().replace('regularization=none', 'regularization=igr'),
+                        self.hdg_application_log() + '[hdg-main] status=Rejected reason=test\n'):
+            self.stdout.write_text(invalid)
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                workloads.parse(case, self.stdout, self.stderr, GPU, wall_seconds=0.75)
+        self.stdout.write_text(self.hdg_application_log())
+        for seconds in (None, 0, float('nan'), -1):
+            with self.subTest(seconds=seconds), self.assertRaises(ValueError):
+                workloads.parse(case, self.stdout, self.stderr, GPU, wall_seconds=seconds)
+        case['parameters'].update(device='cpu', engine='ordinary')
+        self.stdout.write_text(self.hdg_application_log(device='cpu'))
+        self.assertIn('CPU HDG', workloads.parse(case, self.stdout, self.stderr, None,
+                                                wall_seconds=0.5)['scope'])
+        self.stdout.write_text(self.hdg_application_log())
+        with self.assertRaisesRegex(ValueError, 'CPU HDG'):
+            workloads.parse(case, self.stdout, self.stderr, None, wall_seconds=0.5)
 
     def test_dgsem_complete_methods_errors_are_observations(self):
         rows = [{'device': GPU['name'], 'compute_major': 8, 'compute_minor': 0}]

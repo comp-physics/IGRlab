@@ -374,7 +374,8 @@ def _kernel_id_regex(expression):
     return encoded
 
 
-def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: dict) -> dict:
+def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: dict,
+            *, environment=None) -> dict:
     """Capture a bounded selection; caller validates returned application logs."""
     adapter = case.get('adapter')
     profile = case.get('profile', {})
@@ -414,7 +415,7 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
     base = directory.relative_to(root).as_posix()
     def run(label, command, command_timeout=timeout):
         try:
-            result = Path(runner.run(base + '/' + label, command, cwd=None, env=None, timeout=command_timeout))
+            result = Path(runner.run(base + '/' + label, command, cwd=None, env=environment, timeout=command_timeout))
             require(result.resolve() == root / (base + '/' + label), 'runner returned an unexpected command directory')
             receipt = json.loads((result / 'result.json').read_text())
             require(receipt.get('returncode') == 0, f'profiler command failed; logs retained at {result}')
@@ -460,7 +461,8 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
             'application_stdout_sha256': sha256(log / 'stdout.log'),
             'statistics': parse_nsys((stats / 'stdout.log').read_text()),
             'statistics_csv': artifact(stats / 'stdout.log')}
-        result['application_logs'].append({'stdout': str(log / 'stdout.log'), 'stderr': str(log / 'stderr.log')})
+        result['application_logs'].append({'stdout': str(log / 'stdout.log'), 'stderr': str(log / 'stderr.log'),
+                                           'receipt': str(log / 'result.json')})
     if tools['ncu']:
         tool = tools['ncu']
         tool_command = [str(tool), '--config-file', 'off']
@@ -528,7 +530,8 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
                     'cache_control': 'native default; unspecified by command',
                     'default_authority': result['tools']['ncu']['help_stdout'],
                     'observed_solver_clocks': False}}
-            result['application_logs'].append({'stdout': str(log / 'stdout.log'), 'stderr': str(log / 'stderr.log')})
+            result['application_logs'].append({'stdout': str(log / 'stdout.log'), 'stderr': str(log / 'stderr.log'),
+                                               'receipt': str(log / 'result.json')})
     for name, identity in result['tools'].items():
         require(sha256(identity['executable']['path']) == identity['executable']['sha256'],
                 f'{name} executable changed during capture')

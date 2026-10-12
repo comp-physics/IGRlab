@@ -270,6 +270,62 @@ class StudyProtocol(unittest.TestCase):
         self.assertEqual(report['comparison_kind'], 'identity-unavailable')
         self.assertIn('source fingerprints unavailable', (self.root / 'report.md').read_text())
 
+    def test_report_lists_only_enabled_cases_and_individual_backend_timing_profile_scope(self):
+        suite = {'cases': [
+            {'id': 'cpu', 'adapter': 'dg', 'parameters': {'discretization': 'dgsem', 'device': 'cpu'}},
+            {'id': 'tensor', 'adapter': 'dg', 'parameters': {'discretization': 'dgsem', 'device': 'cuda',
+                                                          'dgsem_residual': 'fused-dmma'}},
+            {'id': 'hdg', 'adapter': 'dg', 'parameters': {'discretization': 'hdg', 'device': 'cuda',
+                                                       'engine': 'ordinary'}},
+            {'id': 'disabled-probe', 'adapter': 'dgsem', 'enabled': False, 'parameters': {'n': 4}}]}
+        study.write_json(self.root / 'suite.json', suite)
+        self.plan['suite_sha256'] = study.sha(self.root / 'suite.json')
+        self.save_plan()
+        output = self.finish_timings()
+        statistics = study.sample_statistics([1., 1., 1.], [1., 1., 1.])
+        summary = {'cases': {'cpu': {'statistics': statistics, 'scope': 'CPU solver elapsed time'},
+                             'hdg': {'statistics': statistics}}}
+        study.write_json(output / 'summary.json', summary)
+        self.state['attempts'][-1]['summary_sha256'] = study.sha(output / 'summary.json')
+        partial = self.root / 'profile-attempt'
+        partial.mkdir()
+        study.write_json(partial / 'partial.json', {'cases': {
+            'tensor': {'baseline': {'status': 'complete'}, 'candidate': {'status': 'partial'}}}})
+        self.state['attempts'].append({'stage': 'profiles', 'status': 'profiles_partial',
+                                       'directory': str(partial)})
+        study.write_json(self.root / 'state.json', self.state)
+        before = (output / 'summary.json').read_bytes()
+        with patch.object(study.study_workloads, 'load_suite', side_effect=AssertionError('report must read retained cases')):
+            result = study.report(self.root)
+        coverage = result['coverage']
+        self.assertEqual(coverage['enabled_case_count'], 3)
+        cases = {case['case_id']: case for case in coverage['cases']}
+        self.assertEqual(set(cases), {'cpu', 'tensor', 'hdg'})
+        self.assertEqual((cases['cpu']['timing_status'], cases['cpu']['profile_status']),
+                         ('measured', 'not_applicable'))
+        self.assertEqual(cases['cpu']['timing_scope'], 'CPU solver elapsed time')
+        self.assertEqual(cases['cpu']['timing_scope_source'], 'observation')
+        self.assertEqual((cases['tensor']['timing_status'], cases['tensor']['profile_status']), ('pending', 'partial'))
+        self.assertEqual(cases['tensor']['dgsem_residual'], 'fused-dmma')
+        self.assertEqual(cases['hdg']['timing_scope'], 'whole-process wall time including startup/setup/shutdown')
+        self.assertEqual(cases['hdg']['timing_scope_source'], 'adapter-contract')
+        self.assertEqual(before, (output / 'summary.json').read_bytes())
+        text = (self.root / 'report.md').read_text()
+        self.assertIn('3 cases; selections do not imply all-backend coverage', text)
+        self.assertNotIn('disabled-probe', text)
+        self.assertIn('CPU hardware counters are not collected', text)
+
+    def test_report_keeps_historical_parameter_free_cases_and_pending_profiles_visible(self):
+        suite = {'cases': [{'id': 'historical', 'adapter': 'hdg'}]}
+        study.write_json(self.root / 'suite.json', suite)
+        self.plan['suite_sha256'] = study.sha(self.root / 'suite.json')
+        self.save_plan()
+        case = study.report(self.root)['coverage']['cases'][0]
+        self.assertEqual(case['case_id'], 'historical')
+        self.assertEqual((case['timing_status'], case['profile_status']), ('pending', 'pending'))
+        self.assertEqual(case['engine'], 'not-recorded')
+        self.assertEqual(case['timing_scope'], 'accepted-step median per process')
+
     def test_profile_resume_preserves_timings_and_rejects_duplicate_job(self):
         output = self.finish_timings()
         before = (output / 'summary.json').read_bytes()

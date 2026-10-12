@@ -66,11 +66,13 @@ class FakeRunner:
     def __init__(self, output, *, missing_sections=False, fail=None):
         self.output = output
         self.commands = []
+        self.environments = {}
         self.missing_sections = missing_sections
         self.fail = fail
 
     def run(self, label, argv, *, cwd=None, env=None, timeout=None):
         self.commands.append((label, argv, timeout))
+        self.environments[label] = env
         directory = self.output / label
         directory.mkdir(parents=True, exist_ok=False)
         (directory / 'stderr.log').write_text('')
@@ -213,6 +215,19 @@ class MetricTests(unittest.TestCase):
 
 
 class CaptureTests(unittest.TestCase):
+    def test_tensor_dispatch_environment_reaches_both_capture_children(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary)
+            case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+            environment = {'DG_IGR_DGSEM_FUSED_RESIDUAL': '1', 'DG_IGR_DGSEM_FUSED_DMMA': '1'}
+            with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU):
+                value = profiles.capture(case, ['app'], runner, directory, GPU, environment=environment)
+            self.assertEqual(value['status'], 'complete')
+            for tool_name in ('nsys', 'ncu'):
+                self.assertEqual(runner.environments['profiles/' + tool_name], environment)
+            for logs in value['application_logs']:
+                self.assertEqual(json.loads(Path(logs['receipt']).read_text())['returncode'], 0)
+
     def setup_capture(self, temporary, **runner_options):
         root = Path(temporary)
         tool = root / 'native-tool'

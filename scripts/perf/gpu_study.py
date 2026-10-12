@@ -38,7 +38,9 @@ EXECUTOR_FILES = ('gpu_study.py', 'study_build.py', 'study_profiles.py',
 SAFE_ENV = ('CUDA_VISIBLE_DEVICES', 'SLURM_JOB_ID', 'SLURM_JOB_ACCOUNT',
             'SLURM_JOB_QOS', 'SLURM_JOB_PARTITION', 'SLURM_JOB_GPUS',
             'SLURM_STEP_GPUS', 'SLURM_NTASKS', 'SLURM_JOB_END_TIME', 'OMP_NUM_THREADS',
-            'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')
+            'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+            'DG_IGR_DGSEM_FUSED_RESIDUAL', 'DG_IGR_DGSEM_FUSED_DMMA',
+            'IGRLAB_DGSEM_FUSED_RESIDUAL', 'IGRLAB_DGSEM_FUSED_DMMA')
 CLEANUP_RESERVE_SECONDS = 120
 
 
@@ -581,7 +583,11 @@ def observe(runner, root, plan, admission, case, member, label, gpu, *, fields=F
     environment = os.environ.copy()
     environment.update(study_workloads.environment(case, workdir, fields=fields))
     directory = runner.run(label, command, cwd=workdir, env=environment)
-    observation = study_workloads.parse(case, directory / 'stdout.log', directory / 'stderr.log', gpu)
+    timing_metadata = {}
+    if case['adapter'] == 'dg' and case['parameters'].get('discretization') == 'hdg':
+        timing_metadata['wall_seconds'] = read_json(directory / 'result.json')['process_wall_seconds']
+    observation = study_workloads.parse(case, directory / 'stdout.log', directory / 'stderr.log', gpu,
+                                       **timing_metadata)
     check_observation_identity(observation, plan, member)
     if case['adapter'] == 'hdg' and (observation['host_export'] != fields or
             observation['profile']['enabled'] or observation['profile']['measured_step'] != -1):
@@ -638,6 +644,14 @@ def hardware_snapshot(runner, label, gpu):
 
 def timings(root, plan, suite, admission, runner, gpu):
     result = {'schema_version': SCHEMA, 'status': 'timings_complete', 'gpu': gpu, 'cases': {}}
+    cpu_info = Path('/proc/cpuinfo').read_text() if Path('/proc/cpuinfo').is_file() else ''
+    cpu_models = sorted(set(re.findall(r'^model name\s*:\s*(.+)$', cpu_info, re.M)))
+    result['host'] = {'hostname': socket.getfqdn(), 'cpu_models': cpu_models,
+                      'allowed_logical_cpus': sorted(os.sched_getaffinity(0)),
+                      'thread_environment': {k: os.environ.get(k) for k in
+                          ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')},
+                      'scope': 'host CPUs of this A100 allocation; process affinity inherited'}
+    field_directories = {}
     for case in selected_cases(suite):
         identifier = case['id']
         reference = None
@@ -678,6 +692,42 @@ def timings(root, plan, suite, admission, runner, gpu):
                                       'statistics': sample_statistics(values['baseline'], values['candidate']),
                                       'observations': observations, 'fields': field_gate,
                                       'exported_observations': exported}
+        if case['adapter'] == 'dg':
+            field_directories[identifier] = directories
+    # Compare backends only within the same discretization and numerical workload.
+    # The source-pair comparison above remains independent of these CPU references.
+    groups = {}
+    for case in selected_cases(suite):
+        if case['adapter'] != 'dg' or 'device' not in case['parameters']:
+            continue
+        policy = {k: v for k, v in case['parameters'].items()
+                  if k not in ('device', 'engine', 'dgsem_residual')}
+        groups.setdefault(digest(policy), []).append(case)
+    comparisons = []
+    for cases in groups.values():
+        references = [c for c in cases if c['parameters']['device'] == 'cpu']
+        if len(references) > 1:
+            raise RuntimeError('ambiguous CPU reference for backend comparison')
+        if not references:
+            continue
+        reference_case = references[0]
+        for case in cases:
+            if case is reference_case:
+                continue
+            for member in MEMBERS:
+                reference_signature = result['cases'][reference_case['id']]['exported_observations'][member]['signature']
+                signature = result['cases'][case['id']]['exported_observations'][member]['signature']
+                if (reference_signature['work'] != signature['work'] or
+                        reference_signature.get('final_time') != signature.get('final_time')):
+                    raise RuntimeError(f"accepted work/horizon differs across CPU and {case['id']}")
+                gate = study_workloads.compare_fields(case,
+                    field_directories[reference_case['id']][member], field_directories[case['id']][member],
+                    Path(plan['sources'][member]['source_snapshot']))
+                comparisons.append({'reference_case': reference_case['id'], 'case': case['id'],
+                                    'member': member, 'accepted_work_equal': True, 'physical_fields': gate,
+                                    'scope': 'same accepted horizon; internal HDG solver iteration counts may differ'})
+    if groups:
+        result['backend_comparisons'] = comparisons
     return result
 
 
@@ -688,13 +738,23 @@ def profiles(root, plan, suite, admission, runner, gpu):
     timing_reference = read_json(timing_attempt['summary'])
     for case in selected_cases(suite):
         captures = {}
+        if case['adapter'] == 'dg' and case['parameters'].get('device') == 'cpu':
+            value['cases'][case['id']] = {member: {
+                'status': 'not_applicable', 'reason': 'CPU execution; CUDA occupancy and counters do not apply',
+                'scope': 'CPU timings and physical fields retained; CPU hardware counters not collected'}
+                for member in MEMBERS}
+            write_json(runner.output / 'partial.json', value)
+            continue
         for member in MEMBERS:
             directory = runner.output / case['id'] / member
             directory.mkdir(parents=True)
             binary = Path(admission['binaries'][member][case['binary']])
             source = Path(plan['sources'][member]['source_snapshot'])
             argv = study_workloads.command(case, binary, source, directory, profile=True)
-            captures[member] = study_profiles.capture(case, argv, runner, directory, gpu)
+            environment = os.environ.copy()
+            environment.update(study_workloads.environment(case, directory))
+            captures[member] = study_profiles.capture(case, argv, runner, directory, gpu,
+                                                       environment=environment)
             if captures[member]['status'] != 'complete':
                 value['status'] = 'profiles_partial'
             else:
@@ -703,7 +763,11 @@ def profiles(root, plan, suite, admission, runner, gpu):
                 if not logs_to_validate:
                     raise RuntimeError('complete profiler capture has no application validation logs')
                 for logs in logs_to_validate:
-                    observation = study_workloads.parse(case, Path(logs['stdout']), Path(logs['stderr']), gpu)
+                    timing_metadata = {}
+                    if case['adapter'] == 'dg' and case['parameters'].get('discretization') == 'hdg':
+                        timing_metadata['wall_seconds'] = read_json(logs['receipt'])['process_wall_seconds']
+                    observation = study_workloads.parse(case, Path(logs['stdout']), Path(logs['stderr']), gpu,
+                                                       **timing_metadata)
                     check_observation_identity(observation, plan, member)
                     if case['adapter'] == 'hdg' and (observation['host_export'] or
                             not observation['profile']['enabled'] or observation['profile']['measured_step'] != 0):
@@ -846,7 +910,22 @@ def retry(args):
         state = read_json(old / 'state.json')
         if set(plan['executor_sha256']) != set(EXECUTOR_FILES):
             raise RuntimeError('old run lacks the complete frozen executor identity')
-        suite = study_workloads.load_suite(old / 'suite.json')
+        old_suite = study_workloads.load_suite(old / 'suite.json')
+        suite_path = getattr(args, 'suite', None)
+        cases = getattr(args, 'cases', None)
+        suite = study_workloads.load_suite(suite_path) if suite_path is not None else old_suite
+        if suite['correctness_regex'] != old_suite['correctness_regex']:
+            raise ValueError('retry cannot change correctness_regex; completed validation must match')
+        if cases is not None:
+            names = cases.split(',')
+            ids = set(names)
+            if not names or any(not name for name in names) or len(ids) != len(names) or not ids <= {
+                    case['id'] for case in suite['cases']}:
+                raise ValueError('retry --cases requires unique known case IDs')
+            for case in suite['cases']:
+                case['enabled'] = case['id'] in ids
+        if not selected_cases(suite):
+            raise ValueError('retry requires at least one enabled workload')
         protected = [old, Path(plan['cache_root']), Path(__file__).resolve().parents[2]]
         protected += [Path(s['source_snapshot']) for s in plan['sources'].values()]
         protected += [Path(b[key]) for b in plan['builds'].values() for key in
@@ -912,7 +991,11 @@ def retry(args):
         (root / 'executor').mkdir()
         for name in EXECUTOR_FILES:
             shutil.copy2(Path(__file__).parent / name, root / 'executor' / name)
-        shutil.copy2(old / 'suite.json', root / 'suite.json')
+        if suite_path is None and cases is None:
+            shutil.copy2(old / 'suite.json', root / 'suite.json')
+        else:
+            write_json(root / 'suite.json', suite, exclusive=True)
+        new_plan['suite_sha256'] = sha(root / 'suite.json')
         new_plan['executor_sha256'] = {name: sha(root / 'executor' / name) for name in EXECUTOR_FILES}
         new_plan['plan_sha256'] = digest(new_plan)
         write_json(root / 'plan.json', new_plan, exclusive=True)
@@ -986,6 +1069,37 @@ def report(root):
                 partial = Path(latest['directory']) / 'partial.json'
                 if partial.exists():
                     result['profile_partial'] = read_json(partial)
+    suite = read_json(root / 'suite.json')
+    timing_cases = (result['timings'] or {}).get('cases', {})
+    profile_cases = (result['profiles'] or result.get('profile_partial') or {}).get('cases', {})
+    coverage = []
+    for case in selected_cases(suite):
+        name, adapter, parameters = case['id'], case.get('adapter'), case.get('parameters', {})
+        discretization = parameters.get('discretization', 'hdg' if adapter == 'hdg' else
+                                        'dgsem-volume-probe' if adapter == 'dgsem' else
+                                        'dg' if adapter == 'dg' else 'not-recorded')
+        device = parameters.get('device', 'cuda' if adapter in ('dg', 'hdg', 'dgsem') else 'not-recorded')
+        declared_scope = ('whole-process wall time including startup/setup/shutdown'
+                          if adapter == 'dg' and discretization == 'hdg' else
+                          'full-solver elapsed time' if adapter == 'dg' else
+                          'accepted-step median per process' if adapter == 'hdg' else
+                          'central-volume per-call GPU duration' if adapter == 'dgsem' else 'not-recorded')
+        timing = timing_cases.get(name, {})
+        captured = profile_cases.get(name, {})
+        member_profiles = {member: captured.get(member, {}).get('status', 'pending') for member in MEMBERS}
+        profile_status = ('not_applicable' if device == 'cpu' else
+                          'complete' if all(value == 'complete' for value in member_profiles.values()) else
+                          'partial' if captured else 'pending')
+        coverage.append({'case_id': name, 'adapter': adapter, 'discretization': discretization,
+                         'device': device, 'engine': parameters.get('engine', 'not-recorded'),
+                         'dgsem_residual': parameters.get('dgsem_residual', 'not-recorded'),
+                         'method': parameters.get('method', 'not-recorded'),
+                         'timing_scope': timing.get('scope', declared_scope),
+                         'timing_scope_source': 'observation' if 'scope' in timing else 'adapter-contract',
+                         'timing_status': 'measured' if name in timing_cases else 'pending',
+                         'profile_status': profile_status, 'member_profile_status': member_profiles})
+    result['coverage'] = {'enabled_case_count': len(coverage), 'cases': coverage,
+                          'scope': 'enabled frozen-suite cases only; this does not imply all-backend coverage'}
     if comparison_kind == 'identical-source-control':
         result['repeatability'] = control_repeatability(result['timings'])
     lines = ['# PACE A100 GPU study', '', f"Plan: `{plan['plan_sha256']}`", '',
@@ -995,6 +1109,18 @@ def report(root):
         f'{member}={mode}' for member, mode in result['validation_execution'].items()) + '.', '']
     if 'legacy-driver' in result['validation_execution'].values():
         lines += ['A historical source uses its original validation driver, which may configure/build in the validation allocation.', '']
+    lines += [f"Enabled workload coverage: {len(coverage)} cases; selections do not imply all-backend coverage.", '',
+              '| Case | Discretization | Device | Engine / DGSEM residual | Timing scope | Timing | Profiles |',
+              '|---|---|---|---|---|---|---|']
+    for case in coverage:
+        lines.append(f"| {case['case_id']} | {case['discretization']} | {case['device']} | "
+                     f"{case['engine']} / {case['dgsem_residual']} | {case['timing_scope']} | "
+                     f"{case['timing_status']} | {case['profile_status']} |")
+    lines += ['', 'Compare timing values only within the same numerical workload and timing scope; '
+              'HDG whole-process wall time is distinct from DG/DGSEM solver elapsed time and accepted-step or volume-kernel timings.', '']
+    if any(case['device'] == 'cpu' for case in coverage):
+        lines += ['CPU cases use one thread on the host CPUs of this A100 allocation. '
+                  'CUDA occupancy does not apply; CPU hardware counters are not collected.', '']
     if result['timings']:
         lines += ['| Case | Baseline median (s) | Candidate median (s) | Paired median less time | Paired range |',
                   '|---|---:|---:|---:|---:|']
@@ -1099,6 +1225,8 @@ def main(argv=None):
     p = sub.add_parser('retry', help='freeze a new measurement executor using verified completed builds/correctness')
     p.add_argument('--from-run', required=True)
     p.add_argument('--run-dir', required=True, help='new absolute scratch directory')
+    p.add_argument('--suite', help='validated replacement suite; correctness_regex must match the old run')
+    p.add_argument('--cases', help='comma-separated case IDs from the selected suite; enables optional cases')
     p.add_argument('--timings-time', type=wall_time, help='override inherited timing allocation limit')
     p.add_argument('--profiles-time', type=wall_time, help='override inherited profiling allocation limit')
     p.add_argument('--prepare-only', action='store_true', help='prepare without submitting measurement jobs')

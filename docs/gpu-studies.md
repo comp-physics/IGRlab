@@ -109,9 +109,20 @@ Use `--cases dg-p1,dg-p3` for a targeted study, or `--suite FILE` for a saved,
 versioned workload variant. An explicit case selection enables optional cases.
 Do not change suite parameters between comparison members.
 
+Reports list every enabled frozen-suite case with its discretization, device,
+engine, DGSEM residual, timing scope, and individual timing/profile state.
+A two-case selection cannot establish coverage of every backend. CPU cases use
+one thread on the host CPUs of the A100 allocation; their hardware/affinity and
+thread settings are retained. CUDA occupancy does not apply to CPU execution,
+and CPU hardware counters are not collected. Generic HDG application cases
+measure whole-process wall time including startup, setup and shutdown. Compare
+their CPU/CUDA/tensor results within that scope; do not compare those values to
+DG/DGSEM solver elapsed time, HDG accepted-step timing, or DGSEM kernel timing.
+
 | Adapter | Primary timing | Numerical/work gate | Diagnostic scope |
 |---|---|---|---|
-| DG | Fixed-horizon full-solver time | Accepted steps/RHS work, zero rejects, NaN scan, geometry and five physical fields | Changed mass kernels and whole-run timeline |
+| DG/DGSEM application | Fixed-horizon full-solver time | Accepted steps/RHS work, zero rejects, NaN scan, geometry and five physical fields | CPU, ordinary CUDA, and selected DGSEM fused arithmetic |
+| Generic HDG application | Whole-process wall time | Production success, fixed accepted horizon, matching physical fields against CPU | CPU, ordinary CUDA, tensor CUDA; whole-run timeline |
 | HDG | Accepted-step median per process | Schema-2 policies/gates, zero retries/fallback, same work, separate exported checksums | Measured step zero; volume, condensation, face, recovery and trace-solve families |
 | DGSEM, optional | Selected volume method time | Complete method/error observations against the existing long-double reference | Prescribed-sigma central-volume probe only |
 
@@ -120,7 +131,7 @@ independent repetitions. Baseline/candidate process order alternates. Reports
 retain raw observations, medians, paired percentage changes/ranges and relative
 standard deviations. There is no automatic speed threshold or significance
 claim. Ordinary and tensor engines have different trace policies: each case
-compares the same engine across source versions. DGSEM establishes neither
+compares the same engine across source versions. DGSEM volume probes establish neither
 full-solver accuracy nor full-solver speedup.
 
 For an identical-source control, the report also lists each case's independent
@@ -190,7 +201,7 @@ measurement run:
 Retry verifies the old immutable source/executor/suite,
 matching completed build receipts and successful correctness jobs, and requires
 every recorded job to be inactive. It retains the exact source/build paths and
-suite, freezes the current measurement executor and build-artifact hashes, and
+suite by default, freezes the current measurement executor and build-artifact hashes, and
 records the old plan as its origin. Fresh compute admission still checks live
 dependency bindings. No old timing/profile samples or admission are copied;
 both members are measured again. `--prepare-only` creates the new plan without
@@ -198,6 +209,32 @@ submitting; use `resume --stage timings` afterward. Limits inherit the old froze
 plan unless explicitly overridden, including when its jobs were later shortened
 through the scheduler. The old run remains unchanged; partial submission receipts
 belong to the new run and prevent an unnoticed duplicate retry.
+
+Use `retry --cases` to measure additional cases already present in the old
+suite, including optional DGSEM probes, without submitting compilation or
+correctness jobs:
+
+```bash
+./perf.sh retry --from-run /absolute/scratch/studies/old-run \
+  --run-dir /absolute/scratch/studies/dgsem-volume-01 \
+  --cases dgsem-n4,dgsem-n8 --prepare-only \
+  --timings-time 00:15:00 --profiles-time 00:30:00
+```
+
+`retry --suite FILE` freezes a validated replacement suite; `--cases` then
+selects from that suite. Its `correctness_regex` must exactly match the old
+suite, because retry reuses those completed correctness results. Every selected
+executable must already exist uniquely in each retained build and is newly
+fingerprinted before any measurement submission. Missing or changed artifacts
+fail without a build fallback. The new plan records both suite identities;
+omitting both options preserves the old suite bytes exactly. Fresh compute
+admission checks the selected binaries and dependency bindings again.
+
+The DGSEM probe measures all ordinary GPU and tensor methods against an untimed
+host long-double reference. Its selected GPU method and representative kernel
+profiles do not supply CPU performance or full DGSEM time to solution. A study
+claiming a CPU/GPU/tensor matrix must include explicit supported workload cases
+and timing scopes for those backends; enabling these two probes alone is insufficient.
 
 For interactive debugging, prepare the retry on the PACE login node without
 submitting workers:
