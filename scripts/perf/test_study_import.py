@@ -473,7 +473,7 @@ class StudyImportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'executable changed'):
             study.selected_binaries(plan, [self.binary.name])
 
-    def test_real_cpu_request_is_admitted_without_cuda_or_fake_validation_job(self):
+    def cpu_request(self):
         request = json.loads(self.request.read_text())
         request['argv'] = [arg for arg in request['argv'] if arg not in ('--a100', '--nvtx-profile')]
         request['argv'].append('--cpu-only')
@@ -491,6 +491,9 @@ class StudyImportTests(unittest.TestCase):
         self.result['argv'] = [arg for arg in self.result['argv'] if arg not in ('--a100', '--nvtx-profile')]
         self.result['argv'].append('--cpu-only')
         self.publish_result()
+
+    def test_real_cpu_request_is_admitted_without_cuda_or_fake_validation_job(self):
+        self.cpu_request()
         plan = self.plan()
         receipt = study.receipt(plan)
         admitted = study_admit.completed_jobs(plan, receipt)
@@ -503,6 +506,42 @@ class StudyImportTests(unittest.TestCase):
             reused = study_admit.completed_jobs(reuse_plan, study.receipt(reuse_plan))
         self.assertEqual(reused['test_allocation_accounting']['query_status'], 'not_queried')
         self.assertEqual(reused['build_accounting']['historical_job_id'], '101')
+
+    def test_explicit_cpu_only_manifest_uses_cpu_seals_and_selected_regex(self):
+        self.cpu_request()
+        manifest = self.root / 'cpu-only.json'
+        self.write(manifest, json.dumps({'schema_version': 1,
+                                       'builds': dict.fromkeys(study.MEMBERS, self.record)}))
+        with patch.object(study, 'run', side_effect=AssertionError('historical query')):
+            plans, receipts, records, hashes = study.inspect_manifest(
+                manifest, '^accept-', '^unrelated-', cpu_only=True,
+                reuse_validated_artifacts=True)
+        self.assertEqual(set(plans), {'builds'})
+        self.assertEqual(hashes, {str(manifest): study.sha(manifest)})
+        for member in study.MEMBERS:
+            self.assertEqual(plans['builds'][member]['profile'], 'cpu')
+            self.assertEqual(plans['builds'][member]['correctness_regex'], '^accept-')
+            self.assertNotIn('validation_job_id', receipts['builds'][member])
+            self.assertEqual(records['builds/' + member]['build_accounting']['query_status'], 'not_queried')
+        with self.assertRaisesRegex(ValueError, 'profile differs'):
+            study.inspect_manifest(manifest, '^accept-', '^unrelated-')
+        with self.assertRaisesRegex(ValueError, 'cover the suite'):
+            study.inspect_manifest(manifest, '^other$', '^accept-', cpu_only=True,
+                                   reuse_validated_artifacts=True)
+
+    def test_cpu_only_rejects_cuda_extra_cohort_and_nonboolean_mode(self):
+        manifest = self.root / 'cpu-only.json'
+        value = {'schema_version': 1, 'builds': dict.fromkeys(study.MEMBERS, self.record)}
+        self.write(manifest, json.dumps(value))
+        with self.assertRaisesRegex(ValueError, 'profile differs'):
+            study.inspect_manifest(manifest, '^accept-', '^accept-', cpu_only=True)
+        value['cpu_builds'] = value['builds']
+        self.write(manifest, json.dumps(value))
+        with self.assertRaisesRegex(ValueError, 'one CPU builds cohort'):
+            study.inspect_manifest(manifest, '^accept-', '^accept-', cpu_only=True)
+        for mode in (1, 'true', None):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, 'explicit boolean'):
+                study.inspect_manifest(manifest, '^accept-', '^accept-', cpu_only=mode)
 
     def test_cpu_group_cannot_import_cuda_facade_records(self):
         manifest = self.root / 'mixed.json'

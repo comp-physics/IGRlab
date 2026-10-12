@@ -8,6 +8,7 @@ import argparse
 import ast
 import contextlib
 import csv
+from datetime import datetime, timezone
 import fcntl
 import getpass
 import hashlib
@@ -16,6 +17,7 @@ import json
 import math
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import signal
@@ -77,7 +79,7 @@ def stage_wall_time(plan, stage):
     return wall_time(limits[stage])
 
 
-def worker_budget(plan, suite, stage, entered):
+def worker_budget(plan, suite, stage, entered, *, end_epoch=None):
     """Bound commands by suite and allocation time, preserving cleanup time."""
     hours, minutes, seconds = map(int, stage_wall_time(plan, stage).split(':'))
     elapsed = time.monotonic() - entered
@@ -85,6 +87,10 @@ def worker_budget(plan, suite, stage, entered):
     if not math.isfinite(elapsed) or elapsed < 0 or type(requested) not in (int, float) or not 0 < requested <= 3000:
         raise ValueError('invalid worker elapsed time or suite budget')
     remaining = hours * 3600 + minutes * 60 + seconds - elapsed - CLEANUP_RESERVE_SECONDS
+    if end_epoch is not None:
+        if type(end_epoch) not in (int, float) or not math.isfinite(end_epoch):
+            raise ValueError('invalid admitted allocation end time')
+        remaining = min(remaining, end_epoch - time.time() - CLEANUP_RESERVE_SECONDS)
     if 'SLURM_JOB_END_TIME' in os.environ:
         raw = os.environ['SLURM_JOB_END_TIME']
         if not re.fullmatch(r'[0-9]+', raw):
@@ -272,6 +278,19 @@ def selected_cases(suite):
     return [case for case in suite['cases'] if case.get('enabled', True)]
 
 
+def cpu_only(plan):
+    profile = plan.get('execution_profile', 'cuda-sm80')
+    if profile not in ('cpu', 'cuda-sm80'):
+        raise ValueError('unsupported study execution profile')
+    return profile == 'cpu'
+
+
+def validate_cpu_cases(suite):
+    if not selected_cases(suite) or any(case['adapter'] != 'dg' or
+            case.get('parameters', {}).get('device') != 'cpu' for case in selected_cases(suite)):
+        raise ValueError('CPU-only studies require CPU full-application cases; GPU benchmarks/profiles are unsupported')
+
+
 def needs_cpu_build(suite):
     return any(case['adapter'] == 'dg' and case.get('parameters', {}).get('discretization') == 'hdg'
                and case['parameters'].get('device') == 'cpu' for case in selected_cases(suite))
@@ -327,10 +346,17 @@ def import_existing(args):
     suite = study_workloads.load_suite(args.suite)
     if not selected_cases(suite):
         raise ValueError('select at least one workload')
+    only_cpu = getattr(args, 'cpu_only', False)
+    if only_cpu:
+        validate_cpu_cases(suite)
+    import_options = {'reuse_validated_artifacts': getattr(args, 'reuse_validated_artifacts', False)}
+    if only_cpu:
+        import_options['cpu_only'] = True
     plans, receipts, records, artifacts = study_import.inspect_manifest(
         args.artifacts, suite['correctness_regex'], CPU_CORRECTNESS_REGEX,
-        reuse_validated_artifacts=getattr(args, 'reuse_validated_artifacts', False))
-    validate_cuda_profile_cases(suite, cpu_available='cpu_builds' in plans)
+        **import_options)
+    if not only_cpu:
+        validate_cuda_profile_cases(suite, cpu_available='cpu_builds' in plans)
     builds = plans['builds']
     sources = {member: builds[member]['source'] for member in MEMBERS}
     configs = [sha(Path(identity['source_snapshot']) / 'cmake/sites/pace.json') for identity in sources.values()]
@@ -369,6 +395,8 @@ def import_existing(args):
                                                    ('build_accounting', 'test_allocation_accounting', 'test_execution_scope')}
                                                     for key, record in records.items()}},
             'created_unix_seconds': time.time()}
+    if only_cpu:
+        plan['execution_profile'] = 'cpu'
     plan['plan_sha256'] = digest(plan)
     write_json(root / 'plan.json', plan, exclusive=True)
     state = {'schema_version': SCHEMA, **receipts, 'build_attempts': [value for group in receipts.values()
@@ -379,7 +407,8 @@ def import_existing(args):
     if not args.prepare_only:
         with locked(root):
             job = submit_stage(root, 'timings')
-            submit_stage(root, 'profiles', [job])
+            if not only_cpu:
+                submit_stage(root, 'profiles', [job])
     return root, plan
 
 
@@ -445,16 +474,21 @@ def create(args):
 
 def submit_stage(root, stage, dependencies=()):
     plan = load_plan(root)
+    only_cpu = cpu_only(plan)
+    if only_cpu and stage != 'timings':
+        raise RuntimeError('CPU-only studies submit timing jobs only; CUDA profiling does not apply')
     if stage == 'timings' and plan.get('timing_reuse'):
         raise RuntimeError('profiles-only retry cannot submit new timings')
     limit = stage_wall_time(plan, stage)
     (root / 'logs').mkdir(exist_ok=True)
     command = ['sbatch', '--parsable', '--account=gts-sbryngelson3', '--qos=embers',
-               '--partition=gpu-a100', '--gres=gpu:a100:1', '--nodes=1', '--ntasks=1',
+               '--partition=' + ('cpu-small' if only_cpu else 'gpu-a100'), '--nodes=1', '--ntasks=1',
                '--cpus-per-task=8', '--mem=48G', '--time=' + limit, '--no-requeue',
                '--kill-on-invalid-dep=yes',
                '--job-name=IGRlab-' + stage, '--output=' + str(root / 'logs' / (stage + '-%j.out')),
                '--error=' + str(root / 'logs' / (stage + '-%j.err'))]
+    if not only_cpu:
+        command.insert(5, '--gres=gpu:a100:1')
     if dependencies:
         command += ['--dependency=afterok:' + ':'.join(str(x) for x in dependencies)]
     command += [str(root / 'executor' / 'pace_runtime.sh'), str(root / 'plan.json'),
@@ -470,7 +504,7 @@ def submit_stage(root, stage, dependencies=()):
     write_json(root / 'state.json', state)
     if 'job_id' not in record:
         raise RuntimeError(f'{stage} submission failed: {result.stderr or result.stdout}')
-    print(f'PACE {stage} submitted: {job_id} (embers, gpu-a100)')
+    print(f"PACE {stage} submitted: {job_id} (embers, {'cpu-small' if only_cpu else 'gpu-a100'})")
     return job_id
 
 
@@ -621,6 +655,45 @@ def allocation():
     return study_profiles.gpu_identity()
 
 
+def cpu_allocation():
+    """Admit the live owned CPU job, independently of imported historical jobs."""
+    required = {'SLURM_JOB_ACCOUNT': 'gts-sbryngelson3', 'SLURM_JOB_QOS': 'embers',
+                'SLURM_JOB_PARTITION': 'cpu-small', 'SLURM_NTASKS': '1',
+                'SLURM_CPUS_PER_TASK': '8'}
+    job = os.environ.get('SLURM_JOB_ID', '')
+    host = socket.getfqdn()
+    if not re.fullmatch(r'[1-9][0-9]*', job) or 'login' in host or any(
+            os.environ.get(key) != value for key, value in required.items()):
+        raise RuntimeError('CPU study requires the owned free cpu-small allocation: one rank, eight CPUs')
+    env = {**os.environ, 'TZ': 'UTC', 'SLURM_TIME_FORMAT': 'standard'}
+    command = ['scontrol', 'show', 'job', '-o', job]
+    queried = subprocess.run(command, text=True, capture_output=True, timeout=30, env=env)
+    fields = dict(re.findall(r'(?:^|\s)([A-Za-z][A-Za-z0-9_]*)=([^\s]+)', queried.stdout))
+    tres = dict(item.split('=', 1) for item in fields.get('AllocTRES', '').split(',') if '=' in item)
+    if (queried.returncode or fields.get('JobId') != job or fields.get('JobState') != 'RUNNING' or any(
+            fields.get(key) != value for key, value in {
+                'UserId': f'{pwd.getpwuid(os.getuid()).pw_name}({os.getuid()})', 'Account': 'gts-sbryngelson3',
+                'QOS': 'embers', 'Partition': 'cpu-small', 'NumNodes': '1',
+                'NumCPUs': '8', 'NumTasks': '1'}.items()) or tres.get('cpu') != '8' or
+            tres.get('mem') not in ('48G', '49152M') or any(key.startswith('gres/gpu') for key in tres)):
+        raise RuntimeError('live scheduler identity/resources do not match the owned free CPU study')
+    nodes_command = ['scontrol', 'show', 'hostnames', fields.get('NodeList', '')]
+    nodes = subprocess.run(nodes_command, text=True, capture_output=True, timeout=30, env=env)
+    if nodes.returncode or nodes.stdout.split() != [host.split('.')[0]]:
+        raise RuntimeError('CPU study is not running on its actual allocated node')
+    try:
+        end = datetime.fromisoformat(fields['EndTime']).replace(tzinfo=timezone.utc).timestamp()
+        limit = fields['TimeLimit'].split(':')
+        limit_seconds = sum(int(value) * factor for value, factor in zip(limit, (3600, 60, 1)))
+    except (KeyError, ValueError, OverflowError) as exc:
+        raise RuntimeError('live CPU allocation has no bounded end/time limit') from exc
+    if len(limit) != 3 or not 0 < limit_seconds <= 3600 or end - time.time() <= CLEANUP_RESERVE_SECONDS:
+        raise RuntimeError('live CPU allocation is exhausted or exceeds the one-hour limit')
+    return {'profile': 'cpu', 'job_id': job, 'hostname': host, 'uid': os.getuid(),
+            'end_epoch': end, 'scheduler': fields, 'query_argv': [command, nodes_command],
+            'scope': 'live owned free CPU allocation; one application/MPI rank and one BLAS/OpenMP thread'}
+
+
 def checked_builds(root):
     state = read_json(root / 'state.json')
     plan = load_plan(root)
@@ -643,6 +716,30 @@ def checked_builds(root):
 
 
 def admit(root, plan, suite):
+    if cpu_only(plan):
+        validate_cpu_cases(suite)
+        state = read_json(root / 'state.json')
+        names = sorted({case['binary'] for case in selected_cases(suite)})
+        cpus, artifacts = {}, {}
+        for member in MEMBERS:
+            cpus[member] = study_admit.admit_build(plan['builds'][member], names, state['builds'][member])
+            for artifact, expected in cpus[member]['artifact_sha256'].items():
+                if artifact in artifacts and artifacts[artifact] != expected:
+                    raise RuntimeError('CPU artifact receipts disagree')
+                artifacts[artifact] = expected
+        value = {'schema_version': SCHEMA, 'plan_sha256': plan['plan_sha256'],
+                 'execution_profile': 'cpu', 'cpu_artifacts': cpus,
+                 'binaries': {member: cpus[member]['binaries'] for member in MEMBERS},
+                 'artifact_sha256': artifacts,
+                 'spack_locations': cpus['candidate']['spack_locations'],
+                 'dependency_bindings': {member: cpus[member]['dependency_bindings'] for member in MEMBERS}}
+        path = root / 'admission.json'
+        if path.exists():
+            if read_json(path) != value:
+                raise RuntimeError('study build identity changed after admission')
+        else:
+            write_json(path, value, exclusive=True)
+        return value
     artifacts = {}
     binaries = {}
     locations = {}
@@ -809,6 +906,9 @@ def sample_statistics(baseline, candidate):
 
 
 def hardware_snapshot(runner, label, gpu):
+    if gpu is None:
+        return {'status': 'not_applicable', 'gpu': None,
+                'reason': 'CPU-only allocation; CPU model/affinity recorded in host metadata; hardware counters not collected'}
     fields = ('uuid', 'driver_version', 'pstate', 'clocks.sm', 'clocks.mem',
               'power.draw', 'power.limit', 'temperature.gpu', 'ecc.mode.current')
     try:
@@ -832,7 +932,8 @@ def timings(root, plan, suite, admission, runner, gpu):
                       'allowed_logical_cpus': sorted(os.sched_getaffinity(0)),
                       'thread_environment': {k: os.environ.get(k) for k in
                           ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')},
-                      'scope': 'host CPUs of this A100 allocation; process affinity inherited'}
+                      'scope': ('free cpu-small allocation; one application/MPI rank, one BLAS/OpenMP thread; process affinity inherited'
+                                if cpu_only(plan) else 'host CPUs of this A100 allocation; process affinity inherited')}
     field_directories = {}
     for case in selected_cases(suite):
         identifier = case['id']
@@ -1088,13 +1189,19 @@ def worker(args):
     with locked(root):
         plan = verify(root)
         suite = study_workloads.load_suite(root / 'suite.json')
+        only_cpu = cpu_only(plan)
+        if only_cpu:
+            validate_cpu_cases(suite)
+            if args.stage != 'timings':
+                raise RuntimeError('CPU-only studies have no GPU profiling stage')
         state = read_json(root / 'state.json')
         if completed(state, args.stage):
             raise RuntimeError('stage already complete; create a new study for new measurements')
         if args.stage == 'profiles' and not completed(state, 'timings'):
             raise RuntimeError('complete and admit unprofiled timings before profiling')
         worker_budget(plan, suite, args.stage, entered)  # Fail before queries/captures if time is exhausted.
-        gpu = allocation()
+        cpu = cpu_allocation() if only_cpu else None
+        gpu = None if only_cpu else allocation()
         if args.stage == 'timings' and plan.get('timing_reuse'):
             raise RuntimeError('profiles-only retry cannot run new timings')
         admit_reused_timing_gpu(plan, gpu)
@@ -1107,10 +1214,13 @@ def worker(args):
         attempt = {'id': attempt_id, 'stage': args.stage, 'status': 'running',
                    'job_id': os.environ['SLURM_JOB_ID'], 'gpu': gpu,
                    'plan_sha256': plan['plan_sha256'], 'directory': str(output)}
+        if cpu:
+            attempt['cpu_allocation'] = cpu
         state['attempts'].append(attempt)
         write_json(root / 'state.json', state)
         try:
-            budget = worker_budget(plan, suite, args.stage, entered)
+            budget = worker_budget(plan, suite, args.stage, entered,
+                                   end_epoch=cpu['end_epoch'] if cpu else None)
             attempt.update(worker_budget_seconds=budget, cleanup_reserve_seconds=CLEANUP_RESERVE_SECONDS,
                            requested_wall_time=stage_wall_time(plan, args.stage))
             runner = Runner(output, budget,
@@ -1143,6 +1253,8 @@ def resume(args):
     root = absolute(args.run_dir)
     with locked(root):
         plan = verify(root, binaries=(root / 'admission.json').exists())
+        if cpu_only(plan) and args.stage != 'timings':
+            raise RuntimeError('CPU-only imported studies can resume timings only')
         if args.stage == 'builds':
             if plan.get('import_origin'):
                 raise RuntimeError('imported studies never submit builds; import fresh genuine records instead')
@@ -1165,7 +1277,7 @@ def resume(args):
                 if result.stdout.strip():
                     raise RuntimeError(f"stage has active Slurm job {job['job_id']}")
         job = submit_stage(root, args.stage)
-        if args.stage == 'timings':
+        if args.stage == 'timings' and not cpu_only(plan):
             submit_stage(root, 'profiles', [job])
 
 
@@ -1496,6 +1608,8 @@ def retry(args):
     old, root = absolute(args.from_run).resolve(strict=True), absolute(args.run_dir).resolve()
     with locked(old):
         plan = verify(old, binaries=(old / 'admission.json').exists())
+        if cpu_only(plan):
+            raise ValueError('CPU-only studies use a fresh import for new measurements; resume retains incomplete timings')
         state = read_json(old / 'state.json')
         if set(plan['executor_sha256']) not in (set(EXECUTOR_FILES), set(PRE_IMPORT_EXECUTOR_FILES),
                                                set(LEGACY_EXECUTOR_FILES)):
@@ -1692,6 +1806,7 @@ def control_repeatability(timing):
 
 def report(root):
     plan = load_plan(root)
+    only_cpu = cpu_only(plan)
     state = read_json(root / 'state.json')
     comparison_kind, comparison_text = comparison_description(plan)
     result = {'schema_version': SCHEMA, 'plan_sha256': plan['plan_sha256'],
@@ -1765,7 +1880,10 @@ def report(root):
                           'scope': 'enabled frozen-suite cases only; this does not imply all-backend coverage'}
     if comparison_kind == 'identical-source-control':
         result['repeatability'] = control_repeatability(result['timings'])
-    lines = ['# PACE A100 GPU study', '', f"Plan: `{plan['plan_sha256']}`", '',
+    result['execution_profile'] = 'cpu' if only_cpu else 'cuda-sm80'
+    if only_cpu:
+        result['profiling_status'] = 'not_applicable'
+    lines = ['# PACE CPU study' if only_cpu else '# PACE A100 GPU study', '', f"Plan: `{plan['plan_sha256']}`", '',
              'Comparison: ' + comparison_text + '.', '',
              'Timing authority: independent unprofiled process pairs. Positive percentages mean less time.', '']
     if plan.get('timing_reuse'):
@@ -1789,7 +1907,8 @@ def report(root):
     lines += ['', 'Compare timing values only within the same numerical workload and timing scope; '
               'HDG whole-process wall time is distinct from DG/DGSEM solver elapsed time and accepted-step or volume-kernel timings.', '']
     if any(case['device'] == 'cpu' for case in coverage):
-        lines += ['CPU cases use one thread on the host CPUs of this A100 allocation. '
+        lines += [('CPU cases use one application/MPI rank and one BLAS/OpenMP thread in the free cpu-small allocation. '
+                   if only_cpu else 'CPU cases use one thread on the host CPUs of this A100 allocation. ') +
                   'CUDA occupancy does not apply; CPU hardware counters are not collected.', '']
     if result['timings']:
         lines += ['| Case | Baseline median (s) | Candidate median (s) | Paired median less time | Paired range |',
@@ -1814,10 +1933,11 @@ def report(root):
                   'Small changes need more independent pairs and a fresh allocation; always remeasure the baseline alongside the candidate.']
     latest_profile = next((attempt for attempt in reversed(state['attempts'])
                            if attempt['stage'] == 'profiles'), None)
-    lines += ['', 'Profile state: ' + ('analysis_complete' if result['profiles'] else
-               (latest_profile['status'] if latest_profile else 'not_started')),
-              '', 'Native reports and trace import remain on PACE compute nodes. GPU API, kernel and copy durations overlap and are reported separately.',
-              'Occupancy and counters diagnose the selected kernels; they do not establish a full-solver speedup.', '']
+    lines += ['', 'Profile state: ' + ('not_applicable (CPU-only study)' if only_cpu else 'analysis_complete' if result['profiles'] else
+               (latest_profile['status'] if latest_profile else 'not_started')), '']
+    if not only_cpu:
+        lines += ['Native reports and trace import remain on PACE compute nodes. GPU API, kernel and copy durations overlap and are reported separately.',
+                  'Occupancy and counters diagnose the selected kernels; they do not establish a full-solver speedup.', '']
     write_json(root / 'report.json', result)
     (root / 'report.md').write_text('\n'.join(lines))
     return result
@@ -1858,7 +1978,7 @@ def status(root):
         print('Timings reused from ' + plan['timing_reuse']['run_dir'] + '; ' +
               ('missing profiler tools only; independent GPU provenance.' if plan.get('profile_continuation') else 'fresh profiles only.'))
     state = read_json(root / 'state.json')
-    jobs = [str(build[key]) for build in state.get('build_attempts', list(state['builds'].values()))
+    jobs = [str(build[key]) for build in ([] if cpu_only(plan) else state.get('build_attempts', list(state['builds'].values())))
             for key in ('build_job_id', 'validation_job_id') if build.get(key)]
     jobs += [v['job_id'] for v in state['jobs'] if 'job_id' in v]
     jobs = list(dict.fromkeys(jobs))
@@ -1906,6 +2026,8 @@ def main(argv=None):
     p.add_argument('--prepare-only', action='store_true', help='freeze records without submitting timing/profiling jobs')
     p.add_argument('--reuse-validated-artifacts', action='store_true',
                    help='verify sealed canonical artifacts and Passed receipts without querying historical job accounting; live compute and numerical admission remain required')
+    p.add_argument('--cpu-only', action='store_true',
+                   help='import CPU-profile builds for CPU full-application cases; submit only one free cpu-small timing job, without GPU/profiling jobs')
     p = sub.add_parser('retry', help='freeze a new measurement executor using verified completed builds/correctness')
     p.add_argument('--from-run', required=True)
     p.add_argument('--run-dir', required=True, help='new absolute scratch directory')

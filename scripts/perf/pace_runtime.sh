@@ -4,9 +4,11 @@ set -euo pipefail
 [[ $# == 3 ]] || { echo 'usage: pace_runtime.sh PLAN STAGE EXECUTOR' >&2; exit 2; }
 study_plan=$1 study_stage=$2 study_executor=$3
 [[ -n ${SLURM_JOB_ID:-} && ${SLURM_JOB_ACCOUNT:-} == gts-sbryngelson3 &&
-   ${SLURM_JOB_QOS:-} == embers && ${SLURM_JOB_PARTITION:-} == gpu-a100 &&
-   ${SLURM_NTASKS:-} == 1 && -n ${SLURM_JOB_GPUS:-${SLURM_STEP_GPUS:-}} ]] || {
-  echo 'GPU study requires one rank in a free PACE embers A100 allocation' >&2; exit 2;
+   ${SLURM_JOB_QOS:-} == embers && ${SLURM_NTASKS:-} == 1 ]] && {
+  [[ ${SLURM_JOB_PARTITION:-} == cpu-small ]] ||
+  [[ ${SLURM_JOB_PARTITION:-} == gpu-a100 && -n ${SLURM_JOB_GPUS:-${SLURM_STEP_GPUS:-}} ]]
+} || {
+  echo 'study requires one rank in a free PACE embers CPU or A100 allocation' >&2; exit 2;
 }
 for study_mpi_variable in PMIX_NAMESPACE PMIX_RANK PMI_RANK PMI_SIZE; do
   [[ -z ${!study_mpi_variable:-} ]] || {
@@ -20,14 +22,29 @@ mapfile -t study_paths < <(python3 - "$study_plan" <<'PY'
 import json, sys
 p=json.load(open(sys.argv[1]))
 print(p['site_root']); print(p['spack_root']); print(p['sources']['candidate']['source_snapshot'])
+print(p.get('execution_profile', 'cuda-sm80')); print(p['builds']['candidate']['spack_env'])
 PY
 )
 study_site=${study_paths[0]} study_spack=${study_paths[1]} study_source=${study_paths[2]}
+study_profile=${study_paths[3]} study_env=${study_paths[4]}
+case "$study_profile" in
+  cpu)
+    [[ ${SLURM_JOB_PARTITION:-} == cpu-small && ${SLURM_CPUS_PER_TASK:-} == 8 && $study_stage == timings ]] || {
+      echo 'CPU-only study requires cpu-small with eight CPUs and the timing stage' >&2; exit 2;
+    }
+    ;;
+  cuda-sm80)
+    [[ ${SLURM_JOB_PARTITION:-} == gpu-a100 && -n ${SLURM_JOB_GPUS:-${SLURM_STEP_GPUS:-}} ]] || {
+      echo 'GPU study requires the free A100 allocation' >&2; exit 2;
+    }
+    ;;
+  *) echo 'unsupported frozen execution profile' >&2; exit 2;;
+esac
 type module >/dev/null 2>&1 || { echo 'PACE modules are unavailable' >&2; exit 2; }
 module purge
-mapfile -t study_modules < <(python3 - "$study_source/cmake/sites/pace.json" <<'PY'
+mapfile -t study_modules < <(python3 - "$study_source/cmake/sites/pace.json" "$study_profile" <<'PY'
 import json, sys
-print('\n'.join(json.load(open(sys.argv[1]))['profiles']['cuda-sm80']['modules']))
+print('\n'.join(json.load(open(sys.argv[1]))['profiles'][sys.argv[2]]['modules']))
 PY
 )
 module load "${study_modules[@]}"
@@ -41,10 +58,11 @@ export SPACK_USER_CONFIG_PATH="$study_site/site/pace/spack-user"
 export SPACK_SYSTEM_CONFIG_PATH="$study_site/site/pace/spack-system"
 export SPACK_USER_CACHE_PATH="$study_site/spack-cache"
 source "$study_spack/share/spack/setup-env.sh"
-study_env="$study_site/site/pace/spack-envs/cuda-sm80"
-[[ -f $study_env/spack.lock ]] || { echo 'retained A100 Spack environment is missing' >&2; exit 2; }
+[[ -f $study_env/spack.lock ]] || { echo 'retained selected Spack environment is missing' >&2; exit 2; }
 # Query the concretized environment; installation prefixes are never embedded.
-for study_package in openmpi cuda hypre umpire openblas metis; do
+study_packages=(openmpi hypre openblas metis)
+[[ $study_profile == cpu ]] || study_packages+=(cuda umpire)
+for study_package in "${study_packages[@]}"; do
   study_prefix=$(spack -e "$study_env" location -i "$study_package")
   [[ -d $study_prefix ]] || { echo "missing selected package: $study_package" >&2; exit 2; }
   [[ ! -d $study_prefix/bin ]] || export PATH="$study_prefix/bin:$PATH"

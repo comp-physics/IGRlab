@@ -384,7 +384,9 @@ def receipt(plan):
             'configuration_key': plan['configuration_key']}
 
 
-def inspect_manifest(path, correctness_regex, cpu_regex, *, reuse_validated_artifacts=False):
+def inspect_manifest(path, correctness_regex, cpu_regex, *, reuse_validated_artifacts=False,
+                     cpu_only=False):
+    require(type(cpu_only) is bool, 'cpu_only must be an explicit boolean')
     path = exact(path)
     expected_sha = sha(path)
     manifest = json.loads(path.read_text())
@@ -392,6 +394,8 @@ def inspect_manifest(path, correctness_regex, cpu_regex, *, reuse_validated_arti
             ({'schema_version', 'builds'}, {'schema_version', 'builds', 'cpu_builds'}) and
             type(manifest.get('schema_version')) is int and manifest['schema_version'] == 1,
             'unsupported artifact import manifest')
+    require(not cpu_only or set(manifest) == {'schema_version', 'builds'},
+            'CPU-only import requires one CPU builds cohort without cpu_builds')
     plans, receipts, records = {}, {}, {}
     for group in ('builds', 'cpu_builds'):
         if group not in manifest:
@@ -401,7 +405,7 @@ def inspect_manifest(path, correctness_regex, cpu_regex, *, reuse_validated_arti
         for member in MEMBERS:
             plan = existing_plan(manifest[group][member], correctness_regex if group == 'builds' else cpu_regex,
                                  reuse_validated_artifacts=reuse_validated_artifacts)
-            require(plan['profile'] == ('cuda-sm80' if group == 'builds' else 'cpu'),
+            require(plan['profile'] == ('cpu' if cpu_only or group == 'cpu_builds' else 'cuda-sm80'),
                     'import artifact profile differs from its CUDA/CPU group')
             plans[group][member] = plan
             receipts[group][member] = receipt(plan)
