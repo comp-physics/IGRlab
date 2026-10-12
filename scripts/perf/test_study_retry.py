@@ -182,6 +182,15 @@ class RetryTests(unittest.TestCase):
         path.write_text('changed outside the frozen run')
         study.verify(self.new)
 
+    def test_cpu_hdg_selection_rejects_before_scheduler_or_destination(self):
+        suite = study.read_json(Path(study.__file__).parent / 'suites/pace-full-backends.json')
+        path = self.base / 'backend-suite.json'
+        study.write_json(path, suite)
+        with self.assertRaisesRegex(ValueError, 'separately admitted CPU-profile'):
+            self.retry(suite=str(path), cases='hdg-cpu-p3')
+        self.assertFalse(self.new.exists())
+        self.assertEqual(self.calls, [])
+
     def test_changed_correctness_malformed_suite_and_unknown_selection_reject_before_creation(self):
         suite = study.read_json(self.old / 'suite.json')
         suite['correctness_regex'] = '^new-test$'

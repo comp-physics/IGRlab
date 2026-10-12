@@ -240,6 +240,16 @@ def selected_cases(suite):
     return [case for case in suite['cases'] if case.get('enabled', True)]
 
 
+def validate_cuda_profile_cases(suite):
+    """The study builds one CUDA profile, whose HDG facade cannot run on CPU."""
+    for case in selected_cases(suite):
+        parameters = case.get('parameters', {})
+        if (case['adapter'] == 'dg' and parameters.get('discretization') == 'hdg' and
+                parameters.get('device') == 'cpu'):
+            raise ValueError('CPU HDG requires a separately admitted CPU-profile executable; '
+                             'this study uses CUDA-profile builds')
+
+
 def cached_source(identity, cache):
     """Publish a standalone immutable snapshot at a content-addressed path."""
     cache.mkdir(parents=True, exist_ok=True)
@@ -281,6 +291,7 @@ def create(args):
             case['enabled'] = case['id'] in ids
     if not selected_cases(suite):
         raise ValueError('select at least one workload')
+    validate_cuda_profile_cases(suite)
     root.mkdir(parents=True, exist_ok=False)
     (root / 'executor').mkdir()
     for name in EXECUTOR_FILES:
@@ -926,6 +937,7 @@ def retry(args):
                 case['enabled'] = case['id'] in ids
         if not selected_cases(suite):
             raise ValueError('retry requires at least one enabled workload')
+        validate_cuda_profile_cases(suite)
         protected = [old, Path(plan['cache_root']), Path(__file__).resolve().parents[2]]
         protected += [Path(s['source_snapshot']) for s in plan['sources'].values()]
         protected += [Path(b[key]) for b in plan['builds'].values() for key in
