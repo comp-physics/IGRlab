@@ -93,7 +93,10 @@ def parameters(case):
     require(set(supplied) <= allowed, f'unknown {adapter} parameter')
     result = {**defaults[adapter], **supplied}
     if adapter in ('dg', 'hdg'):
-        require(integer(result['order'], 'order', 1) <= 10, 'unsupported order')
+        # The sweep endpoint is not a backend capability limit. The native
+        # executable checks its kernel/storage constraints; argv uses a C++ int.
+        require(integer(result['order'], 'order', 1) <= 2**31 - 1,
+                'order exceeds the native CLI integer range')
         number(result['dt'], 'dt', positive=True)
     if adapter == 'dg':
         if IGR_PARAMETERS & set(supplied):

@@ -173,21 +173,27 @@ class WorkloadTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             workloads.command(self.hdg, Path('/binary'), ROOT, self.work, profile=True, fields=True)
 
-    def test_dg_order_ten_preserves_closure_policy_and_other_backend_limits(self):
+    def test_research_order_preserves_closure_policy_without_sweep_ceiling(self):
         original = workloads.load_suite(IGR_SUITE)['cases'][0]
         for device in ('cpu', 'cuda'):
             high = copy.deepcopy(original)
-            high['parameters'].update(order=10, device=device)
+            high['parameters'].update(order=12, device=device)
             argv = workloads.command(high, Path('/binary'), ROOT, self.work)
-            self.assertEqual(argv[argv.index('-o') + 1], '10')
+            self.assertEqual(argv[argv.index('-o') + 1], '12')
             self.assertIn('--igr-exact-dg-face', argv)
             self.assertEqual(argv[argv.index('--igr-lin-rtol') + 1], '1e-10')
             low = copy.deepcopy(high)
             low['parameters']['order'] = 3
             self.assertEqual(workloads.environment(high, self.work), workloads.environment(low, self.work))
-        for override in ({'order': 11}, {'order': True}, {'order': 10.0},
-                         {'discretization': 'dgsem', 'order': 11},
-                         {'discretization': 'hdg', 'order': 11}):
+        for discretization in ('dgsem', 'hdg'):
+            case = copy.deepcopy(self.dg)
+            case['parameters'].update(discretization=discretization, order=12)
+            self.assertEqual(workloads.parameters(case)['order'], 12)
+        high = copy.deepcopy(self.hdg)
+        high['parameters']['order'] = 12
+        self.assertEqual(workloads.parameters(high)['order'], 12)
+        for override in ({'order': 0}, {'order': -1}, {'order': True},
+                         {'order': 10.0}, {'order': 2**31}):
             case = copy.deepcopy(original)
             case['parameters'].update(override)
             with self.subTest(override=override), self.assertRaises(ValueError):
@@ -350,8 +356,7 @@ class WorkloadTests(unittest.TestCase):
     def test_application_unsupported_backend_combinations_rejected(self):
         for change in ({'engine': 'tensor'}, {'discretization': 'hdg', 'device': 'cpu', 'engine': 'tensor'},
                        {'dgsem_residual': 'fused-dmma'},
-                       {'discretization': 'dgsem', 'device': 'cpu', 'dgsem_residual': 'fused-simt'},
-                       {'discretization': 'dgsem', 'order': 11}, {'discretization': 'hdg', 'order': 11}):
+                       {'discretization': 'dgsem', 'device': 'cpu', 'dgsem_residual': 'fused-simt'}):
             case = copy.deepcopy(self.dg)
             case['parameters'].update(change)
             with self.subTest(change=change), self.assertRaises(ValueError): workloads.parameters(case)

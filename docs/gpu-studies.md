@@ -220,6 +220,14 @@ Only the familiar p3 point is enabled by default; select research points
 explicitly and establish native convergence, backend identity and memory use
 before treating their times as admitted performance results.
 
+Ten is this sweep's endpoint, not a study-runner order ceiling. The runner
+accepts positive orders representable by the native command-line integer.
+The selected executable enforces its actual kernel and storage constraints;
+unsupported orders remain failed attempts, never successful CPU fallbacks.
+In particular, the current fused DGSEM dispatch covers p1 through p10 and
+has a concrete shared-memory bound. Admitting a study above p10 does not
+claim that this dispatch implements it.
+
 All order points initially use the same ten fixed steps and `dt=1e-5`.
 Record Krylov work and numerical acceptance at each order. If stability or
 convergence requires a different timestep, preserve the failed attempt and
