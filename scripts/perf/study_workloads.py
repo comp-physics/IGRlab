@@ -13,6 +13,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import re
 import statistics
@@ -36,6 +37,18 @@ METHODS = ('existing-fp64', 'cooperative-fp64', 'cooperative-fp32',
            'factorized-lines-tf32', 'factorized-lines-tf32x3', 'dense2d-tf32', 'dense2d-tf32x3')
 DG_MESH = 'examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh'
 RTOL, ATOL = 5e-8, 5e-9
+IGR_PARAMETERS = {'regularization', 'active_igr_wave', 'c_alpha', 'igr_alpha_length'}
+# Match the documented FP64 CG/Chebyshev production reference, and suppress
+# optional inverse/probe experiments inherited from an interactive shell.
+IGR_CONTROLS = {'IGR_PARTIAL_ASSEMBLY': '1', 'IGR_DEVICE_QF': '1',
+                'IGR_DENSE_INVERSE': '', 'IGR_TWO_LEVEL_INVERSE': '',
+                'IGR_PATCH_RADIUS': '', 'IGR_STATIONARY_SWEEPS': '',
+                'IGR_EXTRAPOLATION_DEGREE': '', 'IGR_SIGMA_BASIS': '',
+                'IGR_CHEB_ORDER': '3', 'IGR_CHEB_POWER_ITERATIONS': '10',
+                'IGR_CHEB_POWER_TOLERANCE': '1e-8', 'IGR_CHEB_POWER_SEED': '12345',
+                'IGR_CHEB_BASE_OPERATOR': '0',
+                'IGR_IPDG_PENALTY_SCALE': '1', 'IGR_OPERATOR_PROBE_EVERY': '0',
+                'IGR_PRECONDITIONER_PROBE': '0'}
 
 
 def require(condition, message):
@@ -76,12 +89,25 @@ def parameters(case):
         'dgsem': {'n': 4, 'elements': 1024, 'iterations': 100, 'method': 'existing-fp64'},
     }
     require(adapter in defaults and isinstance(supplied, dict), 'unknown adapter or invalid parameters')
-    require(set(supplied) <= set(defaults[adapter]), f'unknown {adapter} parameter')
+    allowed = set(defaults[adapter]) | (IGR_PARAMETERS if adapter == 'dg' else set())
+    require(set(supplied) <= allowed, f'unknown {adapter} parameter')
     result = {**defaults[adapter], **supplied}
     if adapter in ('dg', 'hdg'):
         require(integer(result['order'], 'order', 1) <= (8 if adapter == 'dg' else 3), 'unsupported order')
         number(result['dt'], 'dt', positive=True)
     if adapter == 'dg':
+        if IGR_PARAMETERS & set(supplied):
+            require(supplied.get('regularization') == 'igr', 'explicit IGR mode requires regularization=igr')
+            result.update(regularization='igr', active_igr_wave=supplied.get('active_igr_wave', True),
+                          c_alpha=supplied.get('c_alpha', 1.0),
+                          igr_alpha_length=supplied.get('igr_alpha_length',
+                              'min' if result['discretization'] == 'hdg' else 'local'))
+            require(result['active_igr_wave'] is True and result['device'] == 'cuda',
+                    'active IGR study requires the active wave and CUDA')
+            require(number(result['c_alpha'], 'c_alpha', positive=True) == 1,
+                    'active IGR reference requires c_alpha=1')
+            require(result['igr_alpha_length'] == ('min' if result['discretization'] == 'hdg' else 'local'),
+                    'active IGR reference alpha policy differs')
         require(integer(result['serial_refine'], 'serial_refine') <= 2,
                 'application study serial_refine must be an integer in 0..2')
         require(result['discretization'] in ('dg', 'dgsem', 'hdg') and
@@ -200,18 +226,35 @@ def command(case, binary: Path, source: Path, workdir: Path, *, profile=False, f
     p, adapter = parameters(case), case['adapter']
     require(not (profile and fields), 'profile and field export are separate calls')
     if adapter == 'dg':
+        regularization = p.get('regularization', 'none')
         selection = (['--discretization', 'hdg', '--hdg-cuda-engine', p['engine'],
-                      '--time-integrator', 'backward-euler', '--regularization', 'none',
+                      '--time-integrator', 'backward-euler', '--regularization', regularization,
                       '--positivity-limiter', 'none'] if p['discretization'] == 'hdg' else
                      ['--dg-backend', p['discretization']])
         if p['discretization'] == 'dgsem':
-            selection += ['--discretization', 'dgsem', '--regularization', 'none',
+            selection += ['--discretization', 'dgsem', '--regularization', regularization,
                           '--dgsem-stab', 'none', '--dgsem-volume-flux', 'central',
                           '--dgsem-volume-dissipation', 'none', '--dgsem-surface-flux', 'rusanov']
         argv = [str(binary), '-m', str(source / p['mesh']), *selection, '-o', str(p['order']),
                 '-rs', str(p['serial_refine']), '-rp', '0', '-tf', str(p['final_time']), '-dt', str(p['dt']), '-c', '0',
                 '-no-glvis', '-vs', '1000000', '-nan-scan', '--device', p['device'], '-no-save-state',
                 '-vtk' if fields else '-no-vtk']
+        if regularization == 'igr':
+            argv += ['--active-igr-wave', '--c-alpha', '1', '--igr-alpha-length', p['igr_alpha_length'],
+                     '--admissibility-scan', '--igr-sigma-cadence', 'every-stage']
+            if p['discretization'] == 'hdg':
+                argv += ['--hdg-igr-beta', '1']
+            else:
+                if p['discretization'] == 'dg':
+                    argv += ['--regularization', 'igr']
+                argv += ['--time-integrator', 'rk3ssp', '--igr-space', 'L2', '--igr-grad', 'BrokenL2',
+                         '--igr-solve-mode', 'krylov', '--igr-ip-kind', 'sipg', '--igr-exact-dg-face',
+                         '--igr-stage-rtol-scale', '1', '--igr-linear-solver', 'cg',
+                         '--igr-preconditioner', 'chebyshev', '--igr-lin-rtol', '1e-10',
+                         '--igr-lin-atol', '0', '--igr-lin-maxit', '2000',
+                         '--igr-nonconvergence-policy', 'error', '--igr-lin-print', '0',
+                         '--no-igr-sigma-cfl', '--no-igr-sigma-rusanov',
+                         '--no-igr-invariant-domain-flux', '--positivity-limiter', 'none']
         if fields:
             argv += ['-dt_save', str(p['final_time']), '-no-vtk-h1', '-no-vtk-l2', '-no-vtk-rank', '-no-vtk-zs']
         return argv
@@ -229,6 +272,14 @@ def environment(case, workdir, fields=False):
     result = {'DG_IGR_VTK_PREFIX_PATH': str(Path(workdir) / 'vtk')} if case['adapter'] == 'dg' and fields else {}
     if case['adapter'] == 'dg' and p['device'] == 'cpu':
         result['OMP_NUM_THREADS'] = '1'
+    if case['adapter'] == 'dg' and p.get('regularization') == 'igr':
+        unexpected = [key for key in os.environ if
+                      any(key.startswith(prefix + 'IGR_') and key[len(prefix):] not in IGR_CONTROLS
+                          for prefix in ('IGRLAB_', 'DG_IGR_'))]
+        require(not unexpected, 'active IGR reference forbids inherited experimental controls: ' +
+                ', '.join(sorted(unexpected)))
+        result.update({prefix + name: value for name, value in IGR_CONTROLS.items()
+                       for prefix in ('IGRLAB_', 'DG_IGR_')})
     if case['adapter'] == 'dg' and p['discretization'] == 'dgsem':
         controls = {'DGSEM_PRODUCTION_STRICT': '1', 'DGSEM_HIGH_ORDER_RESEARCH': '0',
                     'DGSEM_VOLUME_QUADRATURE_MIN_ORDER': '0', 'DGSEM_SUBCELL_BLEND': '0',
@@ -261,6 +312,70 @@ def json_rows(text):
     return rows
 
 
+def log_row(text, prefix):
+    rows = [dict(re.findall(r'(\w+)=([^\s]+)', line)) for line in text.splitlines()
+            if line.startswith(prefix)]
+    require(len(rows) == 1, 'missing/duplicate ' + prefix)
+    return rows[0]
+
+
+def active_igr_evidence(p, text):
+    """Admit existing production convergence and the final native certificate."""
+    options = log_row(text, '[igr-options] event=effective ')
+    fixed = {'exact_dg_face': 'on', 'solver': 'cg', 'preconditioner': 'chebyshev',
+             'nonconvergence_policy': 'error', 'sigma_cfl': 'off', 'sigma_rusanov': 'off',
+             'frozen_sigma_spectral_speed': 'off', 'invariant_domain_flux': 'off'}
+    require(all(options.get(key) == value for key, value in fixed.items()), 'IGR production policy differs')
+    for key, value in (('stage_rtol_scale', 1), ('lin_rtol', 1e-10), ('lin_atol', 0), ('lin_maxit', 2000)):
+        require(number(float(options[key]), key) == value, 'IGR strict linear policy differs: ' + key)
+    alpha = log_row(text, '[igr-regularization] event=resolved ')
+    require(alpha.get('h_eff_policy') == p['igr_alpha_length'] and
+            number(float(alpha['c_alpha']), 'resolved c_alpha', positive=True) == p['c_alpha'],
+            'IGR alpha policy differs')
+    for key in ('h_min', 'h_average', 'h_max', 'h_eff_reference',
+                'alpha_effective_min', 'alpha_effective_max'):
+        number(float(alpha[key]), key, positive=True)
+    linear = log_row(text, '[igr-linear] event=run-summary ')
+    counts = {key: integer(int(linear[key]), key) for key in
+              ('calls', 'converged_calls', 'production_calls', 'production_converged_calls',
+               'output_only_calls', 'output_only_converged_calls', 'total_iters')}
+    require(counts['production_calls'] > 0 and counts['total_iters'] > 0 and
+            counts['calls'] == counts['production_calls'] + counts['output_only_calls'] and
+            all(counts[key] == counts[key.replace('calls', 'converged_calls')]
+                for key in ('calls', 'production_calls', 'output_only_calls')),
+            'IGR production solve missing or did not converge')
+    require(linear.get('last_solver') == 'cg' and linear.get('last_precond') == 'operatorchebyshev' and
+            linear.get('direct_identity_system') == '0' and linear.get('direct_identity_uses') == '0' and
+            linear.get('exact_face_requested') == '1' and linear.get('exact_face_effective') == '1' and
+            integer(int(linear['exact_face_operator_uses']), 'exact face uses', 1) > 0,
+            'IGR exact-face Krylov closure was not used')
+    certificate = log_row(text, '[igr-closure-certificate] event=accepted-state ')
+    require(all(certificate.get(key) == value for key, value in
+                {'scope': 'final-committed-accepted-state', 'precision': 'fp64', 'supported': '1',
+                 'certified': '1', 'run_success': '1', 'skipped_nonfinite': '0', 'q_sigma_admitted': '1',
+                 'q_sigma_nonpositive_samples': '0', 'q_sigma_nonfinite_samples': '0'}.items()),
+            'IGR final closure certificate failed')
+    final = number(float(certificate['time']), 'IGR certified final time')
+    require(abs(final - p['final_time']) <= max(1e-14, p['final_time'] * 1e-12),
+            'IGR certificate horizon differs')
+    residual = {key: number(float(certificate[key]), key) for key in
+                ('residual_rel_rhs', 'residual_abs', 'relative_limit', 'absolute_limit')}
+    # The production caller uses its fixed 5*rtol / 5*atol certificate, with
+    # relative OR absolute acceptance. This is the native method's gate.
+    require(residual['relative_limit'] == 5e-10 and residual['absolute_limit'] == 0 and
+            (residual['residual_rel_rhs'] <= residual['relative_limit'] or
+             residual['residual_abs'] <= residual['absolute_limit']), 'IGR independent residual certificate differs')
+    wave = log_row(text, '[smooth-error] status=skipped ')
+    require(wave.get('reason') == 'active-igr-wave' and wave.get('exact_reference') == 'unavailable',
+            'active IGR wave was not selected')
+    return {'policy': fixed | {key: options[key] for key in
+                ('stage_rtol_scale', 'lin_rtol', 'lin_atol', 'lin_maxit')},
+            'alpha_policy': alpha, 'production_calls': counts['production_calls'],
+            'production_converged_calls': counts['production_converged_calls'],
+            'certificate': certificate, 'linear_counts': counts,
+            'scope': 'native production convergence and final closure certificate; no analytic error reference'}
+
+
 def parse_hdg_application(p, text, wall_seconds):
     """Admit the existing generic application summary, not benchmark schema 2."""
     require('[hdg-main] status=Rejected' not in text, 'HDG application rejected the workload')
@@ -273,9 +388,17 @@ def parse_hdg_application(p, text, wall_seconds):
     final = number(float(row['time']), 'HDG application final time')
     require(steps == nominal and abs(final - p['final_time']) <= max(1e-14, p['final_time'] * 1e-12),
             'HDG application accepted horizon differs')
-    require(row.get('time_treatment') == 'backward-euler' and row.get('regularization') == 'none' and
+    require(row.get('time_treatment') == 'backward-euler' and
+            row.get('regularization') == p.get('regularization', 'none') and
             row.get('positivity_limiter') == 'none' and int(row.get('rejected_attempts', '0')) == 0,
             'HDG application numerical policy differs')
+    if p.get('regularization') == 'igr':
+        require(row.get('alpha_length_policy') == p['igr_alpha_length'] and
+                number(float(row['c_alpha']), 'HDG c_alpha', positive=True) == p['c_alpha'] and
+                number(float(row['euler_trace_penalty']), 'HDG Euler trace penalty', positive=True) == 1,
+                'HDG IGR production policy differs')
+        for key in ('alpha_effective', 'h_eff'):
+            number(float(row[key]), 'HDG ' + key, positive=True)
     for name in ('minimum_accepted_dt', 'maximum_accepted_dt'):
         dt = number(float(row[name]), name, positive=True)
         require(abs(dt - p['dt']) <= max(1e-15, p['dt'] * 1e-12), 'HDG accepted timestep differs')
@@ -294,6 +417,9 @@ def parse_hdg_application(p, text, wall_seconds):
               ('requested_trace_policy', 'resolved_trace_policy', 'time_treatment', 'regularization',
                'positivity_limiter', 'zhang_shu_points', 'cuda_engine', 'fallback_count',
                'minimum_accepted_dt', 'maximum_accepted_dt')}
+    if p.get('regularization') == 'igr':
+        policy.update({key: row[key] for key in
+                       ('c_alpha', 'alpha_effective', 'alpha_length_policy', 'h_eff', 'euler_trace_penalty')})
     return {'seconds': seconds, 'signature': {'adapter': 'dg', 'parameters': p,
                 'work': {'steps': steps, 'final_time': final}, 'application_policy': policy},
             'checksums': None, 'gpu_uuid': None, 'precision': {'state': 'fp64'},
@@ -349,13 +475,22 @@ def parse(case, stdout: Path, stderr: Path, expected_gpu: dict, *, wall_seconds=
         require(len(elapsed) == 1, 'missing/duplicate DG solver elapsed time')
         seconds = number(float(elapsed[0]), 'DG solver seconds', positive=True)
         scope = f"rank-one {p['device'].upper()} {p['discretization'].upper()} {p['dgsem_residual']} full solver, fixed horizon, NaN scans enabled"
-        return {'seconds': seconds, 'signature': {'adapter': adapter, 'parameters': p, 'work': counts,
+        result = {'seconds': seconds, 'signature': {'adapter': adapter, 'parameters': p, 'work': counts,
                     'final_time': final, 'cfl_control_enabled': False}, 'checksums': None, 'gpu_uuid': None,
                 'gpu_identity_scope': ('CPU execution; host hardware recorded by coordinator' if cpu_application else
                                        'allocation checked by coordinator; application log has no GPU UUID'),
                 'precision': {'state': 'fp64'}, 'errors': {'horizon_error': abs(final - p['final_time'])},
                 'scope': ('rank-one CUDA ordinary DG full solver, fixed horizon, NaN scans enabled'
                           if p['discretization'] == 'dg' and p['device'] == 'cuda' else scope)}
+        if p.get('regularization') == 'igr':
+            evidence = active_igr_evidence(p, text)
+            # Export-only closure accounting and residual values are observations,
+            # while production solve work and numerical policy must match pairs.
+            result['signature']['igr'] = {key: evidence[key] for key in
+                ('policy', 'alpha_policy', 'production_calls', 'production_converged_calls')}
+            result['igr_evidence'] = evidence
+            result['scope'] += '; active IGR wave, FP64 CG/Chebyshev closure with final certificate'
+        return result
     rows = json_rows(text)
     if adapter == 'hdg':
         require(not any(row.get('schema') == 2 and row.get('success') is False for row in rows),
@@ -466,6 +601,7 @@ def parse(case, stdout: Path, stderr: Path, expected_gpu: dict, *, wall_seconds=
 def compare_fields(case, baseline_dir, candidate_dir, source):
     """DG field gate uses the existing reader with explicit encoding checks."""
     p = parameters(case)
+    fields = FIELDS + (('sigma',) if p.get('regularization') == 'igr' else ())
     require(case['adapter'] == 'dg', 'physical VTK comparison is supported by the DG adapter only')
     require(sys.byteorder == 'little', 'existing VTK geometry reader requires little-endian host')
     reader_path = Path(source) / 'tests/scripts/compare_vtk_pvd_fields.py'
@@ -500,11 +636,11 @@ def compare_fields(case, baseline_dir, candidate_dir, source):
             header, payload = base64.b64decode(compact[:8], validate=True), base64.b64decode(compact[8:], validate=True)
             require(len(header) == 4 and int.from_bytes(header, 'little') == len(payload), 'VTK payload length differs')
         field_nodes = piece.findall('./PointData/DataArray')
-        for name in FIELDS:
+        for name in fields:
             require(sum(node.get('Name') == name for node in field_nodes) == 1, f'missing/duplicate physical field: {name}')
         frames.append(frame)
         pieces.append(piece)
-        arrays.append(reader.load_point_arrays(dataset, FIELDS))
+        arrays.append(reader.load_point_arrays(dataset, fields))
     for location in ('./Points/DataArray', './Cells/DataArray'):
         left, right = [piece.findall(location) for piece in pieces]
         require(left and len(left) == len(right), 'geometry arrays missing/different')
@@ -516,12 +652,18 @@ def compare_fields(case, baseline_dir, candidate_dir, source):
     result = {'passed': True, 'rtol': p['rtol'], 'atol': p['atol'], 'final_time': p['final_time'], 'arrays': {},
               'scope': 'same ordered mesh, five finite physical fields, positive density/pressure',
               'reader_sha256': hashlib.sha256(reader_path.read_bytes()).hexdigest()}
-    for name in FIELDS:
+    for name in fields:
         a, b = [values[name] for values in arrays]
         require(a and len(a) == len(b) and all(math.isfinite(float(x)) for x in a) and
                 all(math.isfinite(float(x)) for x in b), f'empty/mismatched/nonfinite physical field: {name}')
         if name in ('density', 'pressure'):
             require(min(a) > 0 and min(b) > 0, f'nonpositive physical field: {name}')
+        if name == 'sigma':
+            require(max(abs(float(x)) for x in a) > 0 and max(abs(float(x)) for x in b) > 0,
+                    'active IGR closure sigma is identically zero')
         require(all(abs(y - x) <= p['atol'] + p['rtol'] * abs(x) for x, y in zip(a, b)), f'physical tolerance failed: {name}')
         result['arrays'][name] = {'passed': True, **reader.diff_stats(a, b)}
+    if p.get('regularization') == 'igr':
+        result['scope'] += '; finite nonzero closure sigma; consistency, not analytic-solution accuracy'
+        result['nontrivial_sigma'] = True
     return result

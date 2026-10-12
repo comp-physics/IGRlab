@@ -29,6 +29,15 @@ class BackendStudyTests(unittest.TestCase):
                 'dt': 1e-5, 'final_time': 1e-4, 'atol': 5e-9, 'rtol': 5e-8}})
         return result
 
+    def test_runner_receipt_retains_pinned_igr_controls_including_empty_overrides(self):
+        import sys
+        environment = {'IGRLAB_IGR_DENSE_INVERSE': '', 'IGRLAB_IGR_CHEB_BASE_OPERATOR': '0',
+                       'DG_IGR_IGR_CHEB_ORDER': '3'}
+        runner = study.Runner(self.runner.output, 10)
+        directory = runner.run('igr-policy-receipt', [sys.executable, '-c', 'pass'], env=environment)
+        receipt = study.read_json(directory / 'result.json')
+        self.assertEqual(receipt['environment'], environment)
+
     def test_cpu_case_never_calls_cuda_profiler_and_is_explicitly_not_applicable(self):
         summary = self.root / 'timings.json'
         study.write_json(summary, {'cases': {}})

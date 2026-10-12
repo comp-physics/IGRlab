@@ -147,6 +147,19 @@ NVTX only around its selected step. The companion's NCU selections use the
 first invocation of each selected kernel name, which diagnoses those launches
 without establishing steady-state kernel cost or full-solver speedup.
 
+The [pace-full-gpu-igr.json](../scripts/perf/suites/pace-full-gpu-igr.json)
+suite exercises active IGR through the same six GPU application routes, using
+36 cells and ten steps. DG/DGSEM pin the FP64 exact-face CG/Chebyshev closure,
+require converged production solves and the native final closure certificate,
+and compare finite, nonzero exported sigma with the existing field tolerances.
+HDG checks its coupled production configuration, successful accepted horizon
+and sigma fields; it does not emit the DG/DGSEM closure certificate. The active
+wave has no analytic error reference. This is a small closure diagnostic, with
+no CPU IGR or larger-grid scaling claim. Whole-application Nsight Systems
+captures include closure work; the initial Nsight Compute filters select
+transport kernels. Use the timeline's expensive closure families to choose a
+separate bounded NCU selection before claiming closure stall coverage.
+
 Reports list every enabled frozen-suite case with its discretization, device,
 engine, DGSEM residual, timing scope, and individual timing/profile state.
 A two-case selection cannot establish coverage of every backend. CPU cases use

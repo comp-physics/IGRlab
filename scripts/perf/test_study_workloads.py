@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import study_workloads as workloads
 
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SUITE = ROOT / 'scripts/perf/suites/pace-a100.json'
 BACKEND_SUITE = ROOT / 'scripts/perf/suites/pace-full-backends.json'
 GPU_SOLVER_SUITE = ROOT / 'scripts/perf/suites/pace-full-gpu-solvers.json'
+IGR_SUITE = ROOT / 'scripts/perf/suites/pace-full-gpu-igr.json'
 GPU = {'uuid': 'GPU-00112233-4455-6677-8899-aabbccddeeff', 'name': 'NVIDIA A100-SXM4-80GB',
        'compute_capability': 80}
 
@@ -61,10 +63,12 @@ def vtk_array(name, values, vtk_type='Float64', components=1):
     return f'<DataArray Name="{name}" type="{vtk_type}" NumberOfComponents="{components}" format="binary">{encoded}</DataArray>'
 
 
-def write_fields(directory, *, density=1.0, x=0.0, horizon=0.002, compressor=False):
+def write_fields(directory, *, density=1.0, x=0.0, horizon=0.002, compressor=False, sigma=None):
     directory = directory / 'vtk'
     directory.mkdir(parents=True)
     fields = ''.join(vtk_array(name, [density if name == 'density' else 1.0]) for name in workloads.FIELDS)
+    if sigma is not None:
+        fields += vtk_array('sigma', [sigma])
     geometry = '<Points>' + vtk_array('points', [x, 0.0, 0.0], components=3) + '</Points><Cells>' + \
         vtk_array('connectivity', [0], 'Int32') + vtk_array('offsets', [1], 'Int32') + vtk_array('types', [1], 'UInt8') + '</Cells>'
     attr = ' compressor="vtkZLibDataCompressor"' if compressor else ''
@@ -301,6 +305,10 @@ class WorkloadTests(unittest.TestCase):
     def test_full_backend_suite_pins_small_same_mesh_horizon(self):
         suite = workloads.load_suite(BACKEND_SUITE)
         self.assertEqual(len(suite['cases']), 9)
+        self.assertEqual(sum(case['enabled'] for case in suite['cases']), 8)
+        cpu_hdg = next(case for case in suite['cases'] if case['id'] == 'hdg-cpu-p3')
+        self.assertFalse(cpu_hdg['enabled'])
+        self.assertTrue(cpu_hdg['optional'])
         self.assertEqual(suite['correctness_regex'], self.suite['correctness_regex'])
         shared = {(case['parameters']['order'], case['parameters']['mesh'],
                    case['parameters']['dt'], case['parameters']['final_time']) for case in suite['cases']}
@@ -326,6 +334,150 @@ class WorkloadTests(unittest.TestCase):
             case = copy.deepcopy(self.dg)
             case['parameters'].update(change)
             with self.subTest(change=change), self.assertRaises(ValueError): workloads.parameters(case)
+
+    def igr_case(self, discretization='dg'):
+        case = copy.deepcopy(self.dg)
+        case['parameters'].update(regularization='igr', active_igr_wave=True,
+                                  discretization=discretization)
+        return case
+
+    def igr_log(self, *, output_calls=0):
+        # Existing solver.hpp record spelling, including export-only accounting.
+        return ('[igr-options] event=effective exact_dg_face=on solver=cg preconditioner=chebyshev '
+                'nonconvergence_policy=error sigma_cfl=off sigma_rusanov=off '
+                'frozen_sigma_spectral_speed=off invariant_domain_flux=off stage_rtol_scale=1 '
+                'lin_rtol=1e-10 lin_atol=0 lin_maxit=2000\n'
+                '[igr-regularization] event=resolved c_alpha=1 h_eff_policy=local h_min=0.1 '
+                'h_average=0.1 h_max=0.1 h_eff_reference=0.1 '
+                'alpha_effective_min=0.01 alpha_effective_max=0.01\n'
+                '[igr-linear] event=run-summary '
+                f'calls={600 + output_calls} converged_calls={600 + output_calls} production_calls=600 '
+                f'production_converged_calls=600 output_only_calls={output_calls} '
+                f'output_only_converged_calls={output_calls} total_iters={2400 + output_calls} '
+                'last_solver=cg last_precond=operatorchebyshev direct_identity_system=0 direct_identity_uses=0 '
+                'exact_face_requested=1 exact_face_effective=1 exact_face_operator_uses=600\n'
+                '[igr-closure-certificate] event=accepted-state scope=final-committed-accepted-state '
+                'precision=fp64 time=0.002 state_generation=200 solved=0 supported=1 certified=1 '
+                'residual_rel_rhs=1e-11 run_success=1 residual_abs=1e-13 relative_limit=5e-10 '
+                'absolute_limit=0 skipped_nonfinite=0 q_sigma_admitted=1 '
+                'q_sigma_nonpositive_samples=0 q_sigma_nonfinite_samples=0\n'
+                '[smooth-error] status=skipped reason=active-igr-wave exact_reference=unavailable\n')
+
+    def test_active_igr_suite_six_gpu_variants_and_bounded_same_wave(self):
+        suite = workloads.load_suite(IGR_SUITE)
+        self.assertEqual(suite['correctness_regex'], self.suite['correctness_regex'])
+        self.assertEqual(len(suite['cases']), 6)
+        self.assertEqual({case['id'] for case in suite['cases']},
+                         {'dg-igr-cuda-p3', 'dgsem-igr-cuda-p3', 'dgsem-igr-fused-simt-p3',
+                          'dgsem-igr-fused-dmma-p3', 'hdg-igr-cuda-p3', 'hdg-igr-tensor-p3'})
+        for case in suite['cases']:
+            p = case['parameters']
+            self.assertEqual((p['order'], p['dt'], p['final_time'], p['device'], p['serial_refine']),
+                             (3, 1e-5, 1e-4, 'cuda', 0))
+            self.assertEqual(p['regularization'], 'igr')
+            self.assertTrue(p['active_igr_wave'])
+            lines = [line.strip() for line in (ROOT / p['mesh']).read_text().splitlines()]
+            self.assertEqual(int(lines[lines.index('elements') + 1]), 36)
+            argv = workloads.command(case, Path('/binary'), ROOT, self.work, profile=True)
+            self.assertIn('--active-igr-wave', argv)
+            self.assertEqual(argv[argv.index('--regularization') + 1], 'igr')
+            self.assertNotIn('--profile-measured-step', argv)
+            self.assertIn('--admissibility-scan', argv)
+            if p['discretization'] == 'hdg':
+                self.assertEqual(argv[argv.index('--igr-alpha-length') + 1], 'min')
+                self.assertEqual(argv[argv.index('--hdg-igr-beta') + 1], '1')
+                self.assertIn('backward-euler', argv)
+            else:
+                for flag, value in (('--igr-space', 'L2'), ('--igr-grad', 'BrokenL2'),
+                                    ('--igr-sigma-cadence', 'every-stage'), ('--igr-lin-rtol', '1e-10'),
+                                    ('--igr-nonconvergence-policy', 'error'), ('--time-integrator', 'rk3ssp')):
+                    self.assertEqual(argv[argv.index(flag) + 1], value)
+
+    def test_active_igr_requires_explicit_qualified_policy(self):
+        for changed in ({'regularization': 'none'}, {'regularization': 'igr', 'active_igr_wave': False},
+                        {'regularization': 'igr', 'active_igr_wave': 1},
+                        {'regularization': 'igr', 'c_alpha': 0}, {'regularization': 'igr', 'c_alpha': 2},
+                        {'regularization': 'igr', 'igr_alpha_length': 'average'},
+                        {'regularization': 'igr', 'device': 'cpu'}):
+            case = copy.deepcopy(self.dg)
+            case['parameters'].update(changed)
+            with self.subTest(changed=changed), self.assertRaises(ValueError): workloads.parameters(case)
+
+    def test_active_igr_environment_pins_reference_and_rejects_unowned_experiments(self):
+        case = self.igr_case('dgsem')
+        with mock.patch.dict(workloads.os.environ, {}, clear=True):
+            env = workloads.environment(case, self.work)
+        for prefix in ('IGRLAB_', 'DG_IGR_'):
+            self.assertEqual(env[prefix + 'IGR_DENSE_INVERSE'], '')
+            self.assertEqual(env[prefix + 'IGR_PARTIAL_ASSEMBLY'], '1')
+            self.assertEqual(env[prefix + 'IGR_CHEB_ORDER'], '3')
+            self.assertEqual(env[prefix + 'DGSEM_FUSED_DMMA'], '0')
+        for key in ('IGRLAB_IGR_FROZEN_SIGMA_REFERENCE', 'DG_IGR_IGR_NODAL_SOURCE_QUADRATURE_MIN_ORDER'):
+            with mock.patch.dict(workloads.os.environ, {key: '1'}, clear=True), self.assertRaisesRegex(
+                    ValueError, 'inherited experimental controls'):
+                workloads.environment(case, self.work)
+
+    def test_active_igr_production_and_certificate_gates_keep_export_work_separate(self):
+        case = self.igr_case()
+        self.stdout.write_text(self.dg_log() + self.igr_log())
+        original = workloads.parse(case, self.stdout, self.stderr, GPU)
+        self.stdout.write_text(self.dg_log() + self.igr_log(output_calls=2))
+        exported = workloads.parse(case, self.stdout, self.stderr, GPU)
+        self.assertEqual(original['signature'], exported['signature'])
+        self.assertEqual(exported['igr_evidence']['linear_counts']['output_only_calls'], 2)
+        # Native certificate is relative OR absolute, including an exact zero residual.
+        self.stdout.write_text(self.dg_log() + self.igr_log().replace('residual_rel_rhs=1e-11',
+                              'residual_rel_rhs=1').replace('residual_abs=1e-13', 'residual_abs=0'))
+        workloads.parse(case, self.stdout, self.stderr, GPU)
+        invalid = [('production_converged_calls=600', 'production_converged_calls=599'),
+                   ('production_calls=600', 'production_calls=0'), ('total_iters=2400', 'total_iters=0'),
+                   ('solver=cg', 'solver=fgmres'), ('lin_rtol=1e-10', 'lin_rtol=1e-8'),
+                   ('exact_face_effective=1', 'exact_face_effective=0'),
+                   ('direct_identity_uses=0', 'direct_identity_uses=1'),
+                   ('certified=1', 'certified=0'), ('supported=1', 'supported=0'),
+                   ('residual_rel_rhs=1e-11', 'residual_rel_rhs=1e-8'),
+                   ('relative_limit=5e-10', 'relative_limit=5e-8'),
+                   ('residual_abs=1e-13', 'residual_abs=nan'), ('time=0.002', 'time=0.001'),
+                   ('q_sigma_admitted=1', 'q_sigma_admitted=0'),
+                   ('q_sigma_nonfinite_samples=0', 'q_sigma_nonfinite_samples=1'),
+                   ('reason=active-igr-wave', 'reason=nonzero-static-source')]
+        for before, after in invalid:
+            self.stdout.write_text(self.dg_log() + self.igr_log().replace(before, after))
+            with self.subTest(before=before), self.assertRaises(ValueError):
+                workloads.parse(case, self.stdout, self.stderr, GPU)
+        self.stdout.write_text(self.dg_log())
+        with self.assertRaisesRegex(ValueError, 'missing/duplicate'):
+            workloads.parse(case, self.stdout, self.stderr, GPU)
+
+    def test_active_hdg_pins_coupled_production_policy_without_dg_certificate_claim(self):
+        case = self.igr_case('hdg')
+        policy = ' c_alpha=1 alpha_effective=0.01 alpha_length_policy=min h_eff=0.1 euler_trace_penalty=1'
+        text = self.hdg_application_log(engine='ordinary').replace('regularization=none', 'regularization=igr')
+        self.stdout.write_text(text.strip() + policy + '\n')
+        result = workloads.parse(case, self.stdout, self.stderr, GPU, wall_seconds=0.5)
+        self.assertEqual(result['signature']['application_policy']['alpha_length_policy'], 'min')
+        self.assertNotIn('igr_evidence', result)
+        for before, after in (('c_alpha=1', 'c_alpha=2'), ('alpha_effective=0.01', 'alpha_effective=nan'),
+                              ('h_eff=0.1', 'h_eff=0'), ('alpha_length_policy=min', 'alpha_length_policy=local'),
+                              ('euler_trace_penalty=1', 'euler_trace_penalty=0')):
+            self.stdout.write_text((text.strip() + policy + '\n').replace(before, after))
+            with self.subTest(before=before), self.assertRaises(ValueError):
+                workloads.parse(case, self.stdout, self.stderr, GPU, wall_seconds=0.5)
+
+    def test_active_igr_fields_require_finite_nonzero_sigma_at_existing_tolerance(self):
+        case = self.igr_case()
+        left = self.work / 'left'
+        write_fields(left, sigma=0.01)
+        right = self.work / 'right'
+        write_fields(right, sigma=0.01)
+        result = workloads.compare_fields(case, left, right, ROOT)
+        self.assertTrue(result['nontrivial_sigma'])
+        self.assertEqual(set(result['arrays']), set(workloads.FIELDS) | {'sigma'})
+        for name, sigma in (('missing', None), ('zero', 0), ('nonfinite', float('nan')), ('different', 0.02)):
+            directory = self.work / name
+            write_fields(directory, sigma=sigma)
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                workloads.compare_fields(case, left, directory, ROOT)
 
     def test_cpu_dg_admission_does_not_require_gpu_identity(self):
         case = copy.deepcopy(self.dg)
