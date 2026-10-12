@@ -110,8 +110,15 @@ versioned workload variant. An explicit case selection enables optional cases.
 Do not change suite parameters between comparison members.
 
 The [pace-full-backends.json](../scripts/perf/suites/pace-full-backends.json)
-matrix checks CPU, CUDA and tensor routes and physical fields on 36 periodic
-cells for ten steps. Its small grid validates execution and equivalence; it
+matrix enables eight cases on the saved CUDA build: CPU and CUDA DG/DGSEM,
+fused SIMT and FP64 tensor DGSEM, and ordinary/tensor CUDA HDG. They use 36
+periodic cells for ten steps. CPU field equivalence covers DG and DGSEM;
+HDG retains comparisons between source versions. The optional `hdg-cpu-p3`
+entry is disabled because the CUDA build links only the CUDA HDG entry point,
+which rejects `--device cpu`. CPU HDG requires a separately admitted CPU-profile
+build; enabling this entry with `--cases` against CUDA artifacts does not supply
+one. This is an eight-case default, not a complete CPU/CUDA/tensor matrix for
+every discretization. Its small grid validates execution and equivalence; it
 does not establish representative GPU efficiency. The separate
 [pace-full-gpu-solvers.json](../scripts/perf/suites/pace-full-gpu-solvers.json)
 companion runs six CUDA full-application cases with three measured process

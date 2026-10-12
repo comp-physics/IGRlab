@@ -131,6 +131,8 @@
     {
       "id": "hdg-cpu-p3",
       "adapter": "dg",
+      "enabled": false,
+      "optional": true,
       "parameters": {
         "order": 3,
         "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n6.mesh",
