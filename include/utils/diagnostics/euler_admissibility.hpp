@@ -547,29 +547,37 @@ ScanEulerAdmissibilityImpl(const mfem::ParFiniteElementSpace& vfes,
               "Euler admissibility scan expects Euler state layout.");
 
   mfem::Mesh& mesh = *vfes.GetMesh();
-  const auto& elem_faces = detail::GetElementFacesForAdmissibility(mesh);
+  const auto* elem_faces = cached_elements ? nullptr
+    : &detail::GetElementFacesForAdmissibility(mesh);
   const int NE = vfes.GetNE();
 
-  const int base_qord =
-    (quad_order > 0) ? quad_order : (2 * vfes.GetFE(0)->GetOrder() + 2);
-  const int output_qord = std::max(base_qord + 2, 2 * vfes.GetFE(0)->GetOrder() + 4);
-  const int scan_qord =
-    (point_set == EulerAdmissibilityPointSet::Output) ? output_qord : base_qord;
-
-  std::vector<int> scan_face_qords =
-    detail::BuildFaceQuadratureOrdersForAdmissibility(vfes,
-                                                      scan_qord,
-                                                      face_quad_orders);
-  if (point_set == EulerAdmissibilityPointSet::Output)
+  int scan_qord = 0;
+  std::vector<int> scan_face_qords;
+  if (!cached_elements)
   {
-    for (int& qord : scan_face_qords)
+    // Prepared scans retain these occurrences in their reference shape plans.
+    // Keep the original setup and getter order for the generic fallback.
+    const int base_qord =
+      (quad_order > 0) ? quad_order : (2 * vfes.GetFE(0)->GetOrder() + 2);
+    const int output_qord = std::max(base_qord + 2, 2 * vfes.GetFE(0)->GetOrder() + 4);
+    scan_qord =
+      (point_set == EulerAdmissibilityPointSet::Output) ? output_qord : base_qord;
+
+    scan_face_qords =
+      detail::BuildFaceQuadratureOrdersForAdmissibility(vfes,
+                                                        scan_qord,
+                                                        face_quad_orders);
+    if (point_set == EulerAdmissibilityPointSet::Output)
     {
-      qord = std::max(qord + 2, 2 * vfes.GetFE(0)->GetOrder() + 3);
+      for (int& qord : scan_face_qords)
+      {
+        qord = std::max(qord + 2, 2 * vfes.GetFE(0)->GetOrder() + 3);
+      }
+      std::sort(scan_face_qords.begin(), scan_face_qords.end());
+      scan_face_qords.erase(
+        std::unique(scan_face_qords.begin(), scan_face_qords.end()),
+        scan_face_qords.end());
     }
-    std::sort(scan_face_qords.begin(), scan_face_qords.end());
-    scan_face_qords.erase(
-      std::unique(scan_face_qords.begin(), scan_face_qords.end()),
-      scan_face_qords.end());
   }
 
   double local_min_rho = std::numeric_limits<double>::infinity();
@@ -643,9 +651,11 @@ ScanEulerAdmissibilityImpl(const mfem::ParFiniteElementSpace& vfes,
 
   for (int i = 0; i < NE; ++i)
   {
-    const mfem::FiniteElement* fe = vfes.GetFE(i);
-    mfem::ElementTransformation* Tr = vfes.GetElementTransformation(i);
-    const int dof = fe->GetDof();
+    const mfem::FiniteElement* fe = cached_elements ? (*cached_elements)[i].fe
+      : vfes.GetFE(i);
+    mfem::ElementTransformation* Tr = cached_elements ? nullptr
+      : vfes.GetElementTransformation(i);
+    const int dof = cached_elements ? (*cached_elements)[i].dof : fe->GetDof();
     const auto* fec_l2 = cached_elements ? nullptr
       : dynamic_cast<const mfem::L2_FECollection*>(vfes.FEColl());
     const bool enforce_nodes = cached_elements ? (*cached_elements)[i].enforce_nodes
@@ -659,7 +669,7 @@ ScanEulerAdmissibilityImpl(const mfem::ParFiniteElementSpace& vfes,
       v.GetSubVector(vdofs, elvec);
     }
     elmat.UseExternalData(elvec.GetData(), dof, num_eq);
-    shape.SetSize(dof);
+    if (!cached_elements) { shape.SetSize(dof); }
 
     const bool do_dof_scan = (point_set == EulerAdmissibilityPointSet::Dof);
     if (do_dof_scan || enforce_nodes)
@@ -707,7 +717,7 @@ ScanEulerAdmissibilityImpl(const mfem::ParFiniteElementSpace& vfes,
       inspect_state(state, i, -1, q, false, -1);
     }
 
-    for (const int face : elem_faces[i])
+    for (const int face : (*elem_faces)[i])
     {
       mfem::FaceElementTransformations* FTr =
         mesh.GetFaceElementTransformations(face);
