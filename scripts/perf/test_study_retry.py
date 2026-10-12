@@ -346,8 +346,9 @@ class RetryTests(unittest.TestCase):
         attempt = self.state['attempts'][0]
         summary = Path(attempt['summary'])
         study.write_json(summary, {'status': 'timings_complete', 'gpu': gpu,
-            'cases': {'dg-p1': {'statistics': study.sample_statistics([1, 2, 3], [1, 2, 3]),
-                                'observations': []}}})
+            'cases': {case['id']: {'statistics': study.sample_statistics([1, 2, 3], [1, 2, 3]),
+                                  'observations': []} for case in study.selected_cases(
+                                      study.study_workloads.load_suite(self.old / 'suite.json'))}})
         other = summary.parent / 'field.vtu'
         other.write_text('existing field bytes, not a trace\n')
         attempt.update(summary_sha256=study.sha(summary), gpu=gpu,
@@ -409,6 +410,43 @@ class RetryTests(unittest.TestCase):
         self.assertNotEqual(plan['suite_sha256'], plan['retry_origin']['suite_sha256'])
         self.assertEqual(self.calls[0][0], 'squeue')
         self.assertFalse(any(call[0] == 'sbatch' for call in self.calls))
+
+    def test_profiles_only_sparse_tracked_suite_matches_explicit_frozen_defaults(self):
+        tracked = Path(study.__file__).parent / 'suites/pace-full-gpu-igr.json'
+        sparse = study.read_json(tracked)
+        frozen = study.study_workloads.load_suite(tracked)
+        self.assertNotIn('binary', sparse['cases'][0])
+        self.assertIn('binary', frozen['cases'][0])
+        self.assertNotIn('atol', sparse['cases'][0]['parameters'])
+        study.write_json(self.old / 'suite.json', frozen)
+        self.plan['suite_sha256'] = study.sha(self.old / 'suite.json')
+        self.save_plan()
+        _, summary, _ = self.prepare_profile_timing()
+        sparse['cases'][0]['profile']['kernel_regex'] = 'MeasuredClosureKernel'
+        replacement = self.base / 'sparse-closure-suite.json'
+        study.write_json(replacement, sparse)
+        plan = self.retry(profiles_only=True, suite=str(replacement))
+        self.assertEqual((self.new / 'suite.json').read_bytes(), replacement.read_bytes())
+        self.assertEqual(set(plan['timing_reuse']['profile_overrides']), {sparse['cases'][0]['id']})
+        shadow = study.completed(study.read_json(self.new / 'state.json'), 'timings')
+        self.assertEqual(Path(shadow['summary']).read_bytes(), summary.read_bytes())
+
+    def test_profiles_only_canonical_defaults_reject_tolerance_and_changed_default_drift(self):
+        tracked = Path(study.__file__).parent / 'suites/pace-full-gpu-igr.json'
+        sparse = study.read_json(tracked)
+        frozen_path = self.base / 'explicit-frozen-suite.json'
+        study.write_json(frozen_path, study.study_workloads.load_suite(tracked))
+        replacement = self.base / 'sparse-suite.json'
+        for field, value in (('atol', 1e-4), ('rtol', 1e-3), ('dt', 2e-5), ('engine', 'tensor')):
+            changed = json.loads(json.dumps(sparse))
+            changed['cases'][0]['parameters'][field] = value
+            study.write_json(replacement, changed)
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                study.profile_only_overrides(frozen_path, replacement)
+        study.write_json(replacement, sparse)
+        with patch.object(study.study_workloads, 'ATOL', 1e-4):
+            with self.assertRaisesRegex(ValueError, 'case.profile'):
+                study.profile_only_overrides(frozen_path, replacement)
 
     def test_profiles_only_suite_rejects_physics_selection_environment_and_limit_drift(self):
         self.prepare_profile_timing()

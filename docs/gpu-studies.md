@@ -274,7 +274,10 @@ Without a suite override, this mode preserves the exact suite bytes. It always
 rejects `--cases`. To profile different kernels from the same measured workload,
 add `--suite FILE`; only each existing case's `profile` subtree may change.
 Case IDs, order, selection, parameters, suite name, repetitions, budgets and
-correctness settings must remain identical. The replacement suite is validated
+correctness settings must remain identical after canonical suite validation
+supplies omitted defaults. Explicit defaults in the frozen timing suite remain
+authoritative, so changed tolerances or nondefault physics still reject.
+The replacement suite is validated
 and frozen byte-for-byte, and the plan records the original timing suite hash,
 new profile suite hash and each changed profile setting.
 It copies the completed timing summary unchanged, binds every original timing

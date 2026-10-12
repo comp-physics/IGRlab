@@ -991,7 +991,8 @@ def admit_interactive_timing_job(job, state, retained):
 
 def profile_only_overrides(original, replacement):
     """Profile selection may change; every other frozen suite field must match."""
-    old, new = read_json(original), read_json(replacement)
+    old = study_workloads.load_suite(original)
+    new = study_workloads.load_suite(replacement)
     def without_profiles(suite):
         return {**suite, 'cases': [{key: value for key, value in case.items() if key != 'profile'}
                                    for case in suite['cases']]}
