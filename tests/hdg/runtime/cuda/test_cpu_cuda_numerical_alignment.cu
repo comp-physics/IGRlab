@@ -177,6 +177,22 @@ constexpr bool CudaPreparedIluAccountingValid(
           tensor.ilu_inner_iterations_upper_bound*factor_spmv_multiplier;
 }
 
+constexpr bool CudaPreparedElementSchwarzPatchRowsValid(
+    const int patch_rows, const int polynomial_order,
+    const bool igr_active) noexcept
+{
+  const int expected_rows =
+      NativeElementSchwarzPatchRows(polynomial_order, igr_active);
+  return expected_rows > 0 && patch_rows == expected_rows;
+}
+
+static_assert(CudaPreparedElementSchwarzPatchRowsValid(40, 1, true));
+static_assert(CudaPreparedElementSchwarzPatchRowsValid(220, 10, true));
+static_assert(CudaPreparedElementSchwarzPatchRowsValid(176, 10, false));
+static_assert(!CudaPreparedElementSchwarzPatchRowsValid(80, 10, true));
+static_assert(!CudaPreparedElementSchwarzPatchRowsValid(220, 10, false));
+static_assert(!CudaPreparedElementSchwarzPatchRowsValid(0, 0, true));
+
 bool CudaPreparedTracePolicyValid(
     const CudaTensorCoreEvidence& tensor, const int trace_solves,
     const int linear_iterations, const int linear_solve_attempts,
@@ -256,9 +272,9 @@ bool CudaPreparedTracePolicyValid(
             tensor.element_schwarz_patch_setups == solves &&
             (linear_iterations == 0 ||
              tensor.element_schwarz_preconditioner_applications > 0) &&
-            (tensor.element_schwarz_patch_rows == 40 ||
-             tensor.element_schwarz_patch_rows == 60 ||
-             tensor.element_schwarz_patch_rows == 80) &&
+            CudaPreparedElementSchwarzPatchRowsValid(
+                tensor.element_schwarz_patch_rows, polynomial_order,
+                igr_active) &&
             tensor.element_schwarz_minimum_multiplicity >= 1 &&
             tensor.element_schwarz_maximum_multiplicity >=
                 tensor.element_schwarz_minimum_multiplicity &&

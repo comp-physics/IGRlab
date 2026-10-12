@@ -20,9 +20,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -362,6 +364,9 @@ struct DimensionalKernelErrors
   double volume = 0.0;
   double surface = 0.0;
   double inverse_mass = 0.0;
+  int inverse_mass_order = 0;
+  std::string inverse_mass_representation;
+  double inverse_mass_reference_scale = 0.0;
   double constant_residual = 0.0;
   double local_conservation = 0.0;
   double reduction = 0.0;
@@ -1139,6 +1144,19 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
       }
       mfem::DenseMatrix device_strong;
       mfem::DenseMatrix host_strong(inverse_rows, num_equations);
+      const auto record_inverse_mass_error =
+          [&](const char* representation, const mfem::DenseMatrix& actual,
+              const mfem::DenseMatrix& reference)
+          {
+            const double error = MaxDifference(actual, reference);
+            if (error > max_inverse_mass_error)
+            {
+              max_inverse_mass_error = error;
+              errors.inverse_mass_order = order;
+              errors.inverse_mass_representation = representation;
+              errors.inverse_mass_reference_scale = MaxAbs(reference);
+            }
+          };
       mfem::dgsem::ApplyInverseMassDevice(inverse_ne,
                                           dof,
                                           inverse_mass,
@@ -1160,9 +1178,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
           }
         }
       }
-      max_inverse_mass_error =
-        std::max(max_inverse_mass_error,
-                 MaxDifference(device_strong, host_strong));
+      record_inverse_mass_error("dense-diagonal", device_strong, host_strong);
 
       // The collocated mass has an exact compact representation. Exercise
       // both device branches on identical data before introducing a truly
@@ -1178,9 +1194,8 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
                                           diagonal_mass,
                                           weak,
                                           diagonal_strong);
-      max_inverse_mass_error =
-        std::max(max_inverse_mass_error,
-                 MaxDifference(diagonal_strong, device_strong));
+      record_inverse_mass_error("compact-vs-dense", diagonal_strong,
+                                device_strong);
 
       inverse_mass.HostReadWrite();
       for (int row = 0; row < inverse_rows; ++row)
@@ -1211,9 +1226,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
           host_strong(row, equation) = value;
         }
       }
-      max_inverse_mass_error =
-        std::max(max_inverse_mass_error,
-                 MaxDifference(device_strong, host_strong));
+      record_inverse_mass_error("dense-full", device_strong, host_strong);
     }
 
     for (int face_order = 1; face_order <= 10; ++face_order)
@@ -1483,10 +1496,22 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
     ctx.Check(errors.surface <= pointwise_tol,
               "DGSEM MFEM device direct p1-p10 " + dimension +
                 " local/shared/boundary surface parity");
+    std::ostringstream inverse_mass_details;
+    if (errors.inverse_mass >
+        mfem::dgsem::DGSEMReferenceTolerances::inverse_mass)
+    {
+      inverse_mass_details << std::setprecision(17)
+          << "; worst_order=" << errors.inverse_mass_order
+          << " representation=" << errors.inverse_mass_representation
+          << " max_abs_error=" << errors.inverse_mass
+          << " reference_scale=" << errors.inverse_mass_reference_scale
+          << " tolerance="
+          << mfem::dgsem::DGSEMReferenceTolerances::inverse_mass;
+    }
     ctx.Check(errors.inverse_mass <=
                 mfem::dgsem::DGSEMReferenceTolerances::inverse_mass,
               "DGSEM MFEM device direct p1-p10 " + dimension +
-                " inverse-mass parity");
+                " inverse-mass parity" + inverse_mass_details.str());
     ctx.Check(errors.constant_residual <=
                 mfem::dgsem::DGSEMReferenceTolerances::constant_affine,
               "DGSEM MFEM device direct p1-p10 " + dimension +
