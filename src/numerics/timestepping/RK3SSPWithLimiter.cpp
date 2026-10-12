@@ -4,6 +4,7 @@
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "utils/diagnostics/euler_admissibility.hpp"
 #include "utils/diagnostics/non_finite.hpp"
+#include "utils/profiling/observability.hpp"
 #include "numerics/limiters/limiters.hpp" // ApplyZhangShuPositivityLimiter, etc.
 #include <algorithm>
 #include <cmath>
@@ -410,6 +411,7 @@ void RK3SSPWithLimiter::MaybeScanVector(Vector& v, double t, const char* label)
     return;
   }
 
+  ::igrlab::NVTXRange range("RK/nonfinite-scan");
   ParGridFunction stage(&vfes_, v);
   const MPI_Comm comm = vfes_.GetComm();
   const int vdim = stage.VectorDim();
@@ -475,9 +477,16 @@ void RK3SSPWithLimiter::MaybeScanAdmissibility(Vector& v,
     return;
   }
 
+  ::igrlab::NVTXRange range("RK/admissibility-scans");
   const auto report_scan =
     [&](mfem::igrlab::EulerAdmissibilityPointSet point_set)
   {
+    ::igrlab::NVTXRange point_set_range(
+      point_set == mfem::igrlab::EulerAdmissibilityPointSet::Dof
+        ? "RK/admissibility-dof"
+        : (point_set == mfem::igrlab::EulerAdmissibilityPointSet::Limiter
+             ? "RK/admissibility-limiter"
+             : "RK/admissibility-output"));
     const auto scan = mfem::igrlab::ScanEulerAdmissibility(vfes_,
                                                            v,
                                                            dim_,
@@ -608,6 +617,7 @@ void RK3SSPWithLimiter::MaybeCaptureStagePair(Vector& v,
 
 void RK3SSPWithLimiter::Step(Vector& x, real_t& t, real_t& dt)
 {
+  ::igrlab::NVTXRange range("RK/Step");
   stage_nan_detected_ = false;
   zhang_shu_diagnostics_pending_ = false;
   const int stage_count = GetStageCount();

@@ -785,6 +785,7 @@ RunEulerCase(ExampleContext& ctx,
       }
       if (is_final)
       {
+        ::igrlab::NVTXRange range("Solver/final-state-nonfinite-scan");
         const mfem::igrlab::NonFiniteSummary final_nonfinite =
           mfem::igrlab::ScanNonFinite(bundle.sol);
         if (final_nonfinite.global_non_finite != 0)
@@ -794,6 +795,8 @@ RunEulerCase(ExampleContext& ctx,
         }
       }
       const auto prepare_start = std::chrono::steady_clock::now();
+      ::igrlab::NVTXRange range(is_final ? "Solver/final-sigma-preparation"
+                                       : "Solver/sigma-output-preparation");
       const mfem::IGRSigmaPreparationResult preparation =
         sigma_provider->PrepareSigmaForOutput(
           bundle.sol,
@@ -929,6 +932,7 @@ RunEulerCase(ExampleContext& ctx,
   if (sigma_provider && !final_sigma_prepared &&
       !final_sigma_certification_skipped_nonfinite)
   {
+    ::igrlab::NVTXRange range("Solver/final-state-nonfinite-scan");
     const mfem::igrlab::NonFiniteSummary final_nonfinite =
       mfem::igrlab::ScanNonFinite(bundle.sol);
     final_state_finite = final_nonfinite.global_non_finite == 0;
@@ -940,6 +944,7 @@ RunEulerCase(ExampleContext& ctx,
   if (sigma_provider && !final_sigma_prepared && final_state_finite &&
       !final_sigma_certification_skipped_nonfinite)
   {
+    ::igrlab::NVTXRange range("Solver/final-sigma-preparation");
     final_sigma_preparation = sigma_provider->PrepareSigmaForOutput(
       bundle.sol,
       rk3.GetStateGeneration(),
