@@ -662,7 +662,7 @@ std::string Validate(const HdgEulerMainRequest& request,
   if (request.options.order < dg::hdg::generic::minimum_polynomial_order ||
       request.options.order > dg::hdg::generic::maximum_polynomial_order)
   {
-    return "generic HDG supports polynomial orders one through three";
+    return "generic HDG supports polynomial orders one through ten";
   }
   if (request.options.ser_ref_levels < 0 ||
       request.options.par_ref_levels < 0)

@@ -463,6 +463,35 @@ foreach(_order IN ITEMS 1 2 3)
   endif()
 endforeach()
 
+# Opt-in high-order validation uses the existing numerical gates on one
+# physical element and nine periodic IGR elements. One committed dt=1e-5
+# step checks CPU/ordinary/tensor parity; each engine lifecycle also checks
+# prepare/abort/retry/commit and copied input ownership at this order.
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p10_rank1
+  COMMAND dg_igr_hdg_runtime_cuda_cpu_numerical_alignment
+    --order 10 --high-order-smoke)
+set_tests_properties(
+  dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p10_rank1
+  PROPERTIES
+    LABELS "hdg;runtime;cpu;cuda;generic-euler;alignment;ordinary;tensor;igr;conventional;physical;periodic;conservation;backend-parity;p10;research-order;numerical-acceptance;numerical-high-order"
+    PROCESSORS 1
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 900)
+foreach(_engine IN ITEMS ordinary tensor)
+  add_test(
+    NAME dg_igr_hdg_runtime_cuda_generic_euler_extension_p10_${_engine}_rank1
+    COMMAND dg_igr_hdg_runtime_cuda_generic_euler_extension
+      --order 10 --engine ${_engine} --high-order-smoke)
+  set_tests_properties(
+    dg_igr_hdg_runtime_cuda_generic_euler_extension_p10_${_engine}_rank1
+    PROPERTIES
+      LABELS "hdg;runtime;cuda;generic-euler;extension;${_engine};igr;conventional;physical;periodic;source;ownership;lifecycle;p10;research-order;numerical-acceptance;numerical-high-order"
+      PROCESSORS 1
+      RESOURCE_LOCK dg_igr_sm120
+      TIMEOUT 900)
+endforeach()
+
 # RODAS3 reuses the complete CPU/ordinary-CUDA/tensor-CUDA alignment fixture,
 # including conventional and IGR trajectories, prepared assessment, and exact
 # committed-state agreement at every supported polynomial order.

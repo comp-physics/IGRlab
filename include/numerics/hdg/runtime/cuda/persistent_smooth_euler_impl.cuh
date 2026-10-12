@@ -5294,8 +5294,9 @@ private:
         trace_dofs <= (generic
             ? generic_maximum_trace_dofs_per_element
             : maximum_trace_dofs_per_element) &&
-        volume_points <= maximum_volume_points &&
-        face_points <= maximum_face_points;
+        volume_points > 0 && face_points > 0 &&
+        (generic || (volume_points <= maximum_volume_points &&
+                     face_points <= maximum_face_points));
     if (generic) return common_shape;
     return common_shape && trace.GetVSize() <= maximum_local_trace_dofs &&
         trace.GetTrueVSize() <= maximum_true_trace_dofs &&
@@ -5791,8 +5792,10 @@ private:
         fe->GetGeomType(), shape_.volume_assembly_order).GetNPoints();
     shape_.face_points = mfem::IntRules.Get(
         face_fe->GetGeomType(), shape_.face_assembly_order).GetNPoints();
-    if (shape_.volume_points > maximum_volume_points ||
-        shape_.face_points > maximum_face_points)
+    const bool generic = borrowed_topology_ && shape_.borrowed_host_inputs;
+    if (shape_.volume_points <= 0 || shape_.face_points <= 0 ||
+        (!generic && (shape_.volume_points > maximum_volume_points ||
+                      shape_.face_points > maximum_face_points)))
       return false;
     return true;
   }

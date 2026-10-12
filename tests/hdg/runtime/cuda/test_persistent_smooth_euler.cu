@@ -790,17 +790,18 @@ bool NativeWorkspaceRequirementsPolicy() noexcept
 bool NativeElementSchwarzPatchRowsPolicy() noexcept
 {
   using namespace dg::hdg::runtime::cuda_w8a::detail;
-  constexpr std::array<int, 3> conventional{{32, 48, 64}};
-  constexpr std::array<int, 3> igr{{40, 60, 80}};
-  for (const int rows : conventional)
-    if (!NativeTraceElementSchwarzPatchRowsSupported(rows)) return false;
-  for (const int rows : igr)
-    if (!NativeTraceElementSchwarzPatchRowsSupported(rows)) return false;
+  for (int order = 1; order <= dg::hdg::generic::maximum_polynomial_order;
+       ++order)
+    if (!NativeTraceElementSchwarzPatchRowsSupported(16 * (order + 1)) ||
+        !NativeTraceElementSchwarzPatchRowsSupported(20 * (order + 1)))
+      return false;
   return !NativeTraceElementSchwarzPatchRowsSupported(0) &&
       !NativeTraceElementSchwarzPatchRowsSupported(24) &&
       !NativeTraceElementSchwarzPatchRowsSupported(36) &&
       !NativeTraceElementSchwarzPatchRowsSupported(72) &&
-      !NativeTraceElementSchwarzPatchRowsSupported(96);
+      !NativeTraceElementSchwarzPatchRowsSupported(192) &&
+      !NativeTraceElementSchwarzPatchRowsSupported(240) &&
+      !NativeTraceElementSchwarzPatchRowsSupported(219);
 }
 
 template <typename T>

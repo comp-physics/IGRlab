@@ -9,6 +9,8 @@
  * history, replay data, or observability callbacks are retained.
  */
 
+#include "numerics/hdg/generic/polynomial_order.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <limits>
@@ -20,8 +22,10 @@ namespace dg::hdg::runtime::cuda_w8a::detail
 inline constexpr int native_element_schwarz_faces = 4;
 inline constexpr int native_element_schwarz_igr_trace_components = 5;
 inline constexpr int native_element_schwarz_euler_trace_components = 4;
-inline constexpr int native_element_schwarz_minimum_order = 1;
-inline constexpr int native_element_schwarz_maximum_order = 3;
+inline constexpr int native_element_schwarz_minimum_order =
+    generic::minimum_polynomial_order;
+inline constexpr int native_element_schwarz_maximum_order =
+    generic::maximum_polynomial_order;
 inline constexpr int native_element_schwarz_maximum_contributors = 2;
 inline constexpr int native_element_schwarz_equilibration_passes = 2;
 
@@ -48,7 +52,7 @@ constexpr int NativeElementSchwarzIgrPatchRows(const int order) noexcept
  * The exact unfactored principal patch remains in its existing n-by-n arena.
  * The equally large factor arena stores the Euler and sigma diagonal-block
  * factors, the scaled lower coupling, and two-sided FP64 scales.  This is
- * strictly smaller than n-by-n for every admitted p1--p3 IGR patch, so no
+ * strictly smaller than n-by-n for every admitted IGR patch, so no
  * persistent allocation or alternate application lifecycle is required.
  */
 struct NativeElementSchwarzFieldSplitLayout final

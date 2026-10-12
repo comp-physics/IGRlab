@@ -6108,9 +6108,11 @@ bool CheckLifecycle(const int order, const bool physical,
                     const SourceMode source_mode,
                     const InitialMode initial_mode,
                     std::vector<double>& committed_result,
-                    long double* source_only_response = nullptr)
+                    long double* source_only_response = nullptr,
+                    const int physical_elements_per_direction = 3)
 {
-  mfem::ParMesh mesh = physical ? MakePhysicalMesh() : MakePeriodicMesh();
+  mfem::ParMesh mesh = physical
+      ? MakePhysicalMesh(physical_elements_per_direction) : MakePeriodicMesh();
   BorrowedFields fields = MakeBorrowedFields(
       mesh, order, source_mode, initial_mode);
   const std::vector<double> expected_initial = fields.initial;
@@ -8588,6 +8590,7 @@ struct Options
       EulerHdgTimeTreatment::backward_euler;
   bool assembly_arithmetic_only = false;
   bool partitioned_smoke = false;
+  bool high_order_smoke = false;
   bool rodas3_screen = false;
   bool rodas3_rank2_screen = false;
 };
@@ -8641,6 +8644,12 @@ bool ParseOptions(const int argc, char* argv[], Options& options)
       options.partitioned_smoke = true;
       continue;
     }
+    if (argument == "--high-order-smoke")
+    {
+      if (options.high_order_smoke) return false;
+      options.high_order_smoke = true;
+      continue;
+    }
     if (argument == "--rodas3-screen")
     {
       options.rodas3_screen = true;
@@ -8664,6 +8673,9 @@ bool ParseOptions(const int argc, char* argv[], Options& options)
       options.partitioned_smoke == partitioned_selected &&
       any_rodas3_screen == rodas3_selected &&
       !(options.rodas3_screen && options.rodas3_rank2_screen) &&
+      (!options.high_order_smoke ||
+       (options.order > 3 && !options.partitioned_smoke &&
+        !any_rodas3_screen && !options.assembly_arithmetic_only)) &&
       (!options.assembly_arithmetic_only ||
        (options.engine == CudaEngineKind::tensor_core &&
         !options.partitioned_smoke && !any_rodas3_screen));
@@ -8704,14 +8716,20 @@ int main(int argc, char* argv[])
   {
     if (rank == 0)
       std::cerr << "Usage: " << argv[0]
-                << " --order 1|2|3 [--engine ordinary|tensor]"
+                << " --order 1..10 [--engine ordinary|tensor]"
                    " [--time-treatment backward-euler|"
                    "partitioned-backward-euler|rodas3]"
-                   " [--partitioned-smoke|--rodas3-screen|"
+                   " [--high-order-smoke|--partitioned-smoke|--rodas3-screen|"
                    "--rodas3-rank2-screen|--assembly-arithmetic-only]\n";
     return 2;
   }
   const int order = options.order;
+  if (options.high_order_smoke && ranks != 1)
+  {
+    if (rank == 0)
+      std::cerr << "--high-order-smoke requires exactly one MPI rank\n";
+    return 2;
+  }
   selected_cuda_engine = options.engine;
   selected_time_treatment = options.time_treatment;
   const bool admission = options.rodas3_screen ||
@@ -8722,6 +8740,28 @@ int main(int argc, char* argv[])
   if (options.assembly_arithmetic_only)
     return ranks == 1 && admission && MeasureAssemblyArithmetic(order,rank)
         ? EXIT_SUCCESS : EXIT_FAILURE;
+  if (options.high_order_smoke)
+  {
+    std::vector<double> conventional;
+    std::vector<double> igr;
+    const bool conventional_passed = CheckLifecycle(
+        order, true, RegularizationKind::none, SourceMode::nonzero,
+        InitialMode::smooth_periodic, conventional, nullptr, 1);
+    const bool igr_passed = CheckLifecycle(
+        order, false, RegularizationKind::igr, SourceMode::empty,
+        InitialMode::smooth_periodic, igr);
+    const bool passed = All(ranks == 1 && admission &&
+        conventional_passed && igr_passed);
+    if (rank == 0)
+      std::cout << "HDG high-order CUDA lifecycle smoke order=" << order
+                << " engine="
+                << (options.engine == CudaEngineKind::tensor_core
+                        ? "tensor" : "ordinary")
+                << " physical_elements=1 periodic_igr_elements=9"
+                << " dt=1e-5 conventional=" << conventional_passed
+                << " igr=" << igr_passed << " passed=" << passed << '\n';
+    return passed ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (options.rodas3_screen)
     return ranks == 1 && CheckRodas3RankOneScreen(rank)
         ? EXIT_SUCCESS : EXIT_FAILURE;

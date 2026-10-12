@@ -868,9 +868,9 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     {
       if (++index >= argc ||
           !ParsePositiveInt(argv[index], 1, options.order) ||
-          options.order > 3)
+          options.order > dg::hdg::generic::maximum_polynomial_order)
       {
-        error = "--order requires 1, 2, or 3";
+        error = "--order requires a supported order from 1 through 10";
         return false;
       }
       continue;
@@ -1173,7 +1173,7 @@ void PrintUsage(const char* executable)
                "free-warp-coupled-sigma-jacobi10-fp64|native-element-"
                "schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-"
                "fp64]"
-               " [--order 1|2|3] [--mesh-n N]"
+               " [--order 1..10] [--mesh-n N]"
                " [--domain-periods K] [--dt DT]"
                " [--time-atol ATOL --time-rtol RTOL]"
                " [--linear-rtol RTOL]"
@@ -1193,7 +1193,7 @@ void PrintUsage(const char* executable)
                "free-warp-coupled-sigma-jacobi10-fp64|native-element-"
                "schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-"
                "fp64]"
-               " [--order 1|2|3] [--mesh-n N]"
+               " [--order 1..10] [--mesh-n N]"
                " [--domain-periods K] [--dt DT]"
                " [--time-atol ATOL --time-rtol RTOL]"
                " [--linear-rtol RTOL]"

@@ -187,7 +187,7 @@ class WorkloadTests(unittest.TestCase):
             self.assertEqual(workloads.environment(high, self.work), workloads.environment(low, self.work))
         for override in ({'order': 11}, {'order': True}, {'order': 10.0},
                          {'discretization': 'dgsem', 'order': 11},
-                         {'discretization': 'hdg', 'order': 4}):
+                         {'discretization': 'hdg', 'order': 11}):
             case = copy.deepcopy(original)
             case['parameters'].update(override)
             with self.subTest(override=override), self.assertRaises(ValueError):
@@ -351,7 +351,7 @@ class WorkloadTests(unittest.TestCase):
         for change in ({'engine': 'tensor'}, {'discretization': 'hdg', 'device': 'cpu', 'engine': 'tensor'},
                        {'dgsem_residual': 'fused-dmma'},
                        {'discretization': 'dgsem', 'device': 'cpu', 'dgsem_residual': 'fused-simt'},
-                       {'discretization': 'dgsem', 'order': 11}, {'discretization': 'hdg', 'order': 4}):
+                       {'discretization': 'dgsem', 'order': 11}, {'discretization': 'hdg', 'order': 11}):
             case = copy.deepcopy(self.dg)
             case['parameters'].update(change)
             with self.subTest(change=change), self.assertRaises(ValueError): workloads.parameters(case)

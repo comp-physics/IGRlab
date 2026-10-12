@@ -9,6 +9,8 @@
  * restart are outside this contract.
  */
 
+#include "numerics/hdg/generic/polynomial_order.hpp"
+
 #include <mfem.hpp>
 
 #include <algorithm>
@@ -26,8 +28,6 @@ namespace dg::hdg::generic
 {
 
 inline constexpr int euler_2d_conserved_components = 4;
-inline constexpr int minimum_polynomial_order = 1;
-inline constexpr int maximum_polynomial_order = 3;
 
 enum class BackendKind : std::uint8_t
 {
@@ -195,9 +195,11 @@ constexpr EulerHdgNumericalPolicy DefaultEulerHdgNumericalPolicy(
     const int p) noexcept
 {
   const int quadrature = 2 * p + 2;
-  // Keep the inactive default IGR quadrature field stable for conventional
-  // requests; the order-general extension deliberately overintegrates at 12.
-  return {quadrature, quadrature, quadrature, {12, 12}, 80, 0, 13,
+  // Preserve the established low-order IGR rule, and integrate products of
+  // the higher-order basis without reducing the local mass matrix's rank.
+  const int igr_quadrature = std::max(12, quadrature);
+  return {quadrature, quadrature, quadrature,
+          {igr_quadrature, igr_quadrature}, 80, 0, 13,
           1.0e-10, 1.0e-12, 1.0e-12, 1.0e-12, 1.0e-10,
           1.0e-10, 1.0e-4, {RegularizationKind::none, 0.0, 0.0}, {}};
 }
@@ -290,7 +292,9 @@ enum class ContractStatus : std::uint8_t
 enum class Capability : std::uint32_t
 {
   conforming_quadrilateral_mesh = 1u << 0,
-  polynomial_order_one_to_three = 1u << 1,
+  polynomial_order_one_to_ten = 1u << 1,
+  // Retain the old spelling and bit for callers of the earlier contract.
+  polynomial_order_one_to_three = polynomial_order_one_to_ten,
   cpu = 1u << 2,
   cuda = 1u << 3,
   external_initial_state = 1u << 4,
@@ -838,7 +842,7 @@ constexpr std::uint32_t RequiredCapabilities(
 {
   const std::uint32_t common =
       CapabilityBit(Capability::conforming_quadrilateral_mesh) |
-      CapabilityBit(Capability::polynomial_order_one_to_three) |
+      CapabilityBit(Capability::polynomial_order_one_to_ten) |
       CapabilityBit(Capability::external_initial_state) |
       CapabilityBit(Capability::external_source) |
       CapabilityBit(Capability::numerical_boundary_operator);

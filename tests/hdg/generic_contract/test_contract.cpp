@@ -27,6 +27,17 @@ using dg::hdg::generic::EulerHdgZhangShuPointSet;
 using dg::hdg::generic::RegularizationKind;
 using dg::hdg::generic::ValidateEulerHdgRequest;
 
+static_assert(dg::hdg::generic::DefaultEulerHdgNumericalPolicy(1)
+                  .igr_assembly_quadrature_orders.volume_order == 12);
+static_assert(dg::hdg::generic::DefaultEulerHdgNumericalPolicy(3)
+                  .igr_assembly_quadrature_orders.face_order == 12);
+static_assert(dg::hdg::generic::DefaultEulerHdgNumericalPolicy(10)
+                  .conventional_assembly_quadrature_order == 22);
+static_assert(dg::hdg::generic::DefaultEulerHdgNumericalPolicy(10)
+                  .igr_assembly_quadrature_orders.volume_order == 22);
+static_assert(dg::hdg::generic::DefaultEulerHdgNumericalPolicy(10)
+                  .igr_assembly_quadrature_orders.face_order == 22);
+
 constexpr std::uint32_t all_cpu_capabilities =
     CapabilityBit(Capability::conforming_quadrilateral_mesh) |
     CapabilityBit(Capability::polynomial_order_one_to_three) |
@@ -200,12 +211,32 @@ bool CheckAcceptAndReject()
   {
     return false;
   }
-  request.polynomial_order = 4;
+  request.polynomial_order = dg::hdg::generic::maximum_polynomial_order + 1;
   if (ValidateEulerHdgRequest(request) !=
       ContractStatus::unsupported_polynomial_order)
   {
     return false;
   }
+  // Admission is metadata-only here. Numerical p10 evolution and backend
+  // agreement are exercised by the focused runtime fixtures.
+  for (int order = dg::hdg::generic::minimum_polynomial_order;
+       order <= dg::hdg::generic::maximum_polynomial_order; ++order)
+  {
+    request = ValidRequest(mesh, initial);
+    request.polynomial_order = order;
+    request.numerical_policy =
+        dg::hdg::generic::DefaultEulerHdgNumericalPolicy(order);
+    if (ValidateEulerHdgRequest(request) != ContractStatus::accepted)
+      return false;
+    request.backend = {BackendKind::cuda, 0, CudaEngineKind::ordinary};
+    request.capabilities = all_cuda_capabilities;
+    if (ValidateEulerHdgRequest(request) != ContractStatus::accepted)
+      return false;
+    request.backend.cuda_engine = CudaEngineKind::tensor_core;
+    if (ValidateEulerHdgRequest(request) != ContractStatus::accepted)
+      return false;
+  }
+  request = ValidRequest(mesh, initial);
   request.polynomial_order = 1;
   request.capabilities &= ~CapabilityBit(Capability::cpu);
   if (ValidateEulerHdgRequest(request) != ContractStatus::missing_capability)
@@ -468,6 +499,7 @@ bool CheckIgrSelectionAdmission()
   const ContractStatus periodic_p1 = admit_igr(mesh, 1);
   const ContractStatus periodic_p2 = admit_igr(mesh, 2);
   const ContractStatus periodic_p3 = admit_igr(mesh, 3);
+  const ContractStatus periodic_p10 = admit_igr(mesh, 10);
 
   EulerHdgRequest present_empty_periodic = ValidRequest(mesh, initial);
   present_empty_periodic.boundary.policies = {nullptr, 0, 2, 1.4};
@@ -514,6 +546,19 @@ bool CheckIgrSelectionAdmission()
   const ContractStatus physical_p1 = admit_igr(physical_mesh, 1);
   const ContractStatus physical_p2 = admit_igr(physical_mesh, 2);
   const ContractStatus physical_p3 = admit_igr(physical_mesh, 3);
+  const ContractStatus physical_p10 = admit_igr(physical_mesh, 10);
+
+  EulerHdgRequest high_order_cuda = ValidRequest(mesh, initial);
+  high_order_cuda.polynomial_order = 10;
+  high_order_cuda.numerical_policy =
+      dg::hdg::generic::DefaultEulerHdgNumericalPolicy(10);
+  high_order_cuda.numerical_policy.stabilization =
+      {RegularizationKind::igr, 0.25, 0.5};
+  high_order_cuda.backend = {BackendKind::cuda, 0, CudaEngineKind::ordinary};
+  high_order_cuda.capabilities = all_cuda_capabilities;
+  const ContractStatus cuda_p10 = ValidateEulerHdgRequest(high_order_cuda);
+  high_order_cuda.backend.cuda_engine = CudaEngineKind::tensor_core;
+  const ContractStatus tensor_p10 = ValidateEulerHdgRequest(high_order_cuda);
 
   EulerHdgRequest request = ValidRequest(mesh, initial);
   request.polynomial_order = 1;
@@ -543,6 +588,7 @@ bool CheckIgrSelectionAdmission()
   return periodic_p1 == ContractStatus::accepted &&
       periodic_p2 == ContractStatus::accepted &&
       periodic_p3 == ContractStatus::accepted &&
+      periodic_p10 == ContractStatus::accepted &&
       present_empty_periodic_status == ContractStatus::accepted &&
       !retained_periodic_policies.empty() &&
       retained_periodic_status == ContractStatus::accepted &&
@@ -554,6 +600,9 @@ bool CheckIgrSelectionAdmission()
       physical_p1 == ContractStatus::accepted &&
       physical_p2 == ContractStatus::accepted &&
       physical_p3 == ContractStatus::accepted &&
+      physical_p10 == ContractStatus::accepted &&
+      cuda_p10 == ContractStatus::accepted &&
+      tensor_p10 == ContractStatus::accepted &&
       cuda == ContractStatus::accepted &&
       quadrature_mismatch ==
           (ranks == 1 ? ContractStatus::accepted
@@ -786,7 +835,8 @@ bool CheckCollectiveFailureConvergence()
       MakeRankZeroOwnedParallelMesh(mfem::Element::QUADRILATERAL);
   const std::array<double, 4> initial{{1.0, 0.1, 0.0, 2.5}};
   EulerHdgRequest request = ValidRequest(mesh, initial);
-  request.polynomial_order = rank == 0 ? 4 : 2;
+  request.polynomial_order = rank == 0
+      ? dg::hdg::generic::maximum_polynomial_order + 1 : 2;
   const int local_status = static_cast<int>(ValidateEulerHdgRequest(request));
   int minimum_status = local_status;
   int maximum_status = local_status;

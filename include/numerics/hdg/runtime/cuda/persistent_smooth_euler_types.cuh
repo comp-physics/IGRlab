@@ -70,15 +70,17 @@ inline constexpr int interior_dofs_per_element =
 inline constexpr int trace_dofs_per_element =
     faces_per_element * conserved_components * scalar_dofs_per_face;
 // Frozen W8A DTO/oracle maxima remain p1/p2.  Generic borrowed mode uses its
-// checked dynamic arena and the separate p3/IGR per-element bounds below.
+// checked dynamic arena and the separate order-general IGR bounds below.
 inline constexpr int maximum_scalar_dofs_per_element = 9;
 inline constexpr int maximum_scalar_dofs_per_face = 3;
 inline constexpr int maximum_interior_dofs_per_element =
     conserved_components * maximum_scalar_dofs_per_element;
 inline constexpr int maximum_trace_dofs_per_element =
     faces_per_element * conserved_components * maximum_scalar_dofs_per_face;
-inline constexpr int generic_maximum_scalar_dofs_per_element = 16;
-inline constexpr int generic_maximum_scalar_dofs_per_face = 4;
+inline constexpr int generic_maximum_scalar_dofs_per_face =
+    generic::maximum_polynomial_order + 1;
+inline constexpr int generic_maximum_scalar_dofs_per_element =
+    generic_maximum_scalar_dofs_per_face * generic_maximum_scalar_dofs_per_face;
 inline constexpr int generic_maximum_interior_dofs_per_element =
     igr_interior_components * generic_maximum_scalar_dofs_per_element;
 inline constexpr int generic_maximum_trace_dofs_per_element =
@@ -1927,7 +1929,7 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
 
   // Production selection is deliberately deterministic and fail closed.  A
   // rank-one tensor-IGR request resolves engine-default before consensus or
-  // allocation to the robust cooperative J10 policy for p1--p3.  That policy
+  // allocation to the robust cooperative J10 policy at admitted orders. It
   // attempts the fast equilibrated lower field split on every new matrix and
   // selects its fully coupled tensor-native leaf only for an exact structural
   // applicability rejection.  Rank two retains the explicitly reported
@@ -1961,7 +1963,7 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
   }
 
   // Benchmark-only native Schwarz admission. Rank, topology, and exact
-  // p1--p3 patch-shape checks are completed by the private solver router and
+  // order-dependent patch-shape checks are completed by the private solver and
   // initialization plan before any device setup is allowed.
   if (selection == CudaTracePolicyKind::native_element_schwarz_fp64 ||
       selection ==

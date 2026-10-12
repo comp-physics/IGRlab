@@ -7846,6 +7846,7 @@ __global__ void NormReduceKernel(const double* partials,int partial_count,
 __device__ double EulerWave(const double rho,const double mx,const double my,
                             const double energy)
 {if(!(rho>0.0)||!isfinite(rho)||!isfinite(mx)||!isfinite(my)||!isfinite(energy))return nan("");const double u=mx/rho,v=my/rho;const double p=0.4*(energy-0.5*(mx*mx+my*my)/rho);return p>0.0&&isfinite(p)?sqrt(u*u+v*v)+sqrt(1.4*p/rho):nan("");}
+template<bool StridedSites>
 __global__ void MaximumWaveElementsKernel(CudaDeviceView v,CudaMeshShape s,
                                           const double* interior,
                                           const double* trace)
@@ -7856,52 +7857,119 @@ __global__ void MaximumWaveElementsKernel(CudaDeviceView v,CudaMeshShape s,
   const int ib=e*s.interior_dofs,tb=e*s.trace_dofs;
   const int face_sites=faces_per_element*s.face_points;
   const int sites=s.volume_points+2*face_sites;
-  double value=0.0;
-  if(thread<s.volume_points)
+  if constexpr(StridedSites)
   {
-    const int qp=e*s.volume_points+thread;
-    double state[conserved_components]={};
-    for(int scalar=0;scalar<s.scalar_interior_dofs;++scalar)
-      for(int component=0;component<conserved_components;++component)
-        state[component]+=v.volume_shape[
-            qp*s.scalar_interior_dofs+scalar]*
-            interior[ib+ByNodes(scalar,s.scalar_interior_dofs,component)];
-    value=EulerWave(state[0],state[1],state[2],state[3]);
-  }
-  else if(thread<sites)
-  {
-    const int face_value=thread-s.volume_points;
-    const int face_site=face_value/2;
-    const bool trace_site=(face_value&1)!=0;
-    const int face=face_site/s.face_points;
-    const int q=face_site-face*s.face_points;
-    const int qp=(e*faces_per_element+face)*s.face_points+q;
-    const int face_offset=face*s.trace_components*s.scalar_face_dofs;
-    double state[conserved_components]={};
-    if(trace_site)
+    double maximum=0.0;
+    bool valid=true;
+    bool first=true;
+    // Stride quadrature sites rather than growing the shared reduction tree.
+    // Every previously admitted low-order site still maps to the same lane.
+    for(long long index=thread;index<sites;index+=blockDim.x)
     {
-      for(int scalar=0;scalar<s.scalar_face_dofs;++scalar)
-        for(int component=0;component<conserved_components;++component)
-          state[component]+=v.face_trace_shape[
-              qp*s.scalar_face_dofs+scalar]*
-              trace[tb+face_offset+ByNodes(
-                  scalar,s.scalar_face_dofs,component)];
+      const int site=static_cast<int>(index);
+      double value=0.0;
+      if(site<s.volume_points)
+      {
+        const int qp=e*s.volume_points+site;
+        double state[conserved_components]={};
+        for(int scalar=0;scalar<s.scalar_interior_dofs;++scalar)
+          for(int component=0;component<conserved_components;++component)
+            state[component]+=v.volume_shape[
+                qp*s.scalar_interior_dofs+scalar]*
+                interior[ib+ByNodes(scalar,s.scalar_interior_dofs,component)];
+        value=EulerWave(state[0],state[1],state[2],state[3]);
+      }
+      else if(site<sites)
+      {
+        const int face_value=site-s.volume_points;
+        const int face_site=face_value/2;
+        const bool trace_site=(face_value&1)!=0;
+        const int face=face_site/s.face_points;
+        const int q=face_site-face*s.face_points;
+        const int qp=(e*faces_per_element+face)*s.face_points+q;
+        const int face_offset=face*s.trace_components*s.scalar_face_dofs;
+        double state[conserved_components]={};
+        if(trace_site)
+        {
+          for(int scalar=0;scalar<s.scalar_face_dofs;++scalar)
+            for(int component=0;component<conserved_components;++component)
+              state[component]+=v.face_trace_shape[
+                  qp*s.scalar_face_dofs+scalar]*
+                  trace[tb+face_offset+ByNodes(
+                      scalar,s.scalar_face_dofs,component)];
+        }
+        else
+        {
+          for(int scalar=0;scalar<s.scalar_interior_dofs;++scalar)
+            for(int component=0;component<conserved_components;++component)
+              state[component]+=v.face_interior_shape[
+                  qp*s.scalar_interior_dofs+scalar]*
+                  interior[ib+ByNodes(
+                      scalar,s.scalar_interior_dofs,component)];
+        }
+        value=EulerWave(state[0],state[1],state[2],state[3]);
+      }
+      if(!isfinite(value)||value<0.0)
+      {
+        valid=false;
+        break;
+      }
+      maximum=first?value:fmax(maximum,value);
+      first=false;
     }
-    else
+    // Valid wave speeds are nonnegative.  The finite sentinel propagates
+    // invalidity independently of NaN comparison behavior.
+    wave[thread]=valid?maximum:-1.0;
+  }
+  else
+  {
+    double value=0.0;
+    if(thread<s.volume_points)
     {
+      const int qp=e*s.volume_points+thread;
+      double state[conserved_components]={};
       for(int scalar=0;scalar<s.scalar_interior_dofs;++scalar)
         for(int component=0;component<conserved_components;++component)
-          state[component]+=v.face_interior_shape[
+          state[component]+=v.volume_shape[
               qp*s.scalar_interior_dofs+scalar]*
-              interior[ib+ByNodes(
-                  scalar,s.scalar_interior_dofs,component)];
+              interior[ib+ByNodes(scalar,s.scalar_interior_dofs,component)];
+      value=EulerWave(state[0],state[1],state[2],state[3]);
     }
-    value=EulerWave(state[0],state[1],state[2],state[3]);
+    else if(thread<sites)
+    {
+      const int face_value=thread-s.volume_points;
+      const int face_site=face_value/2;
+      const bool trace_site=(face_value&1)!=0;
+      const int face=face_site/s.face_points;
+      const int q=face_site-face*s.face_points;
+      const int qp=(e*faces_per_element+face)*s.face_points+q;
+      const int face_offset=face*s.trace_components*s.scalar_face_dofs;
+      double state[conserved_components]={};
+      if(trace_site)
+      {
+        for(int scalar=0;scalar<s.scalar_face_dofs;++scalar)
+          for(int component=0;component<conserved_components;++component)
+            state[component]+=v.face_trace_shape[
+                qp*s.scalar_face_dofs+scalar]*
+                trace[tb+face_offset+ByNodes(
+                    scalar,s.scalar_face_dofs,component)];
+      }
+      else
+      {
+        for(int scalar=0;scalar<s.scalar_interior_dofs;++scalar)
+          for(int component=0;component<conserved_components;++component)
+            state[component]+=v.face_interior_shape[
+                qp*s.scalar_interior_dofs+scalar]*
+                interior[ib+ByNodes(
+                    scalar,s.scalar_interior_dofs,component)];
+      }
+      value=EulerWave(state[0],state[1],state[2],state[3]);
+    }
+    // Valid wave speeds are nonnegative.  Convert every invalid site to the
+    // existing finite sentinel before the fixed tree so validity propagation is
+    // independent of NaN comparison behavior.
+    wave[thread]=thread<sites&&(!isfinite(value)||value<0.0)?-1.0:value;
   }
-  // Valid wave speeds are nonnegative.  Convert every invalid site to the
-  // existing finite sentinel before the fixed tree so validity propagation is
-  // independent of NaN comparison behavior.
-  wave[thread]=thread<sites&&(!isfinite(value)||value<0.0)?-1.0:value;
   __syncthreads();
   for(int offset=cooperative_wave_threads/2;offset>0;offset/=2)
   {
@@ -7955,6 +8023,24 @@ struct EulerConservationSite
   double scale[igr_trace_components];
   double measure;
 };
+
+__device__ __forceinline__ void AccumulateConservationSite(
+    EulerConservationSite& total, const EulerConservationSite& site,
+    bool& first)
+{
+  if(first)
+  {
+    total=site;
+    first=false;
+    return;
+  }
+  for(int component=0;component<igr_trace_components;++component)
+  {
+    total.balance[component]+=site.balance[component];
+    total.scale[component]+=site.scale[component];
+  }
+  total.measure+=site.measure;
+}
 
 __device__ __forceinline__ bool EulerConservationVolumeSite(
     CudaDeviceView v, CudaMeshShape s, const int element, const int q,
@@ -8653,6 +8739,7 @@ __device__ __forceinline__ bool RodasAdmittedConservationFaceSite(
 // nonnegative stage selects one admitted stage's boundary term; -1 selects
 // only the endpoint volume/source term.  Each launch reduces to the same
 // bounded twelve-scalar result as the established complete witness.
+template<bool StridedSites>
 __global__ void RodasAdmittedConservationElementsKernel(
     CudaDeviceView v, CudaMeshShape s, const double dt,
     const int admitted_stage)
@@ -8668,27 +8755,50 @@ __global__ void RodasAdmittedConservationElementsKernel(
   const bool volume_only = admitted_stage < 0;
   const int sites = volume_only
       ? s.volume_points : faces_per_element * s.face_points;
-  EulerConservationSite site{};
+  EulerConservationSite total{};
   bool valid = s.borrowed_host_inputs && isfinite(dt) && dt > 0.0;
-  if (valid && thread < sites)
+  if constexpr(StridedSites)
   {
-    if (volume_only)
-      valid = RodasConservationVolumeSite(
-          v, s, element, thread, dt, site);
-    else
+    bool first=true;
+    for(long long index=thread;valid&&index<sites;index+=blockDim.x)
     {
-      const int face = thread / s.face_points;
-      const int q = thread - face * s.face_points;
-      valid = RodasAdmittedConservationFaceSite(
-          v, s, element, face, q, dt, admitted_stage, site);
+      const int site_index=static_cast<int>(index);
+      EulerConservationSite site{};
+      if (volume_only)
+        valid = RodasConservationVolumeSite(
+            v, s, element, site_index, dt, site);
+      else
+      {
+        const int face = site_index / s.face_points;
+        const int q = site_index - face * s.face_points;
+        valid = RodasAdmittedConservationFaceSite(
+            v, s, element, face, q, dt, admitted_stage, site);
+      }
+      if(valid)AccumulateConservationSite(total,site,first);
+    }
+  }
+  else
+  {
+    if (valid && thread < sites)
+    {
+      if (volume_only)
+        valid = RodasConservationVolumeSite(
+            v, s, element, thread, dt, total);
+      else
+      {
+        const int face = thread / s.face_points;
+        const int q = thread - face * s.face_points;
+        valid = RodasAdmittedConservationFaceSite(
+            v, s, element, face, q, dt, admitted_stage, total);
+      }
     }
   }
   for (int component = 0; component < components; ++component)
   {
-    balance[component][thread] = valid ? site.balance[component] : 0.0;
-    scale[component][thread] = valid ? site.scale[component] : 0.0;
+    balance[component][thread] = valid ? total.balance[component] : 0.0;
+    scale[component][thread] = valid ? total.scale[component] : 0.0;
   }
-  measure[thread] = valid ? site.measure : 0.0;
+  measure[thread] = valid ? total.measure : 0.0;
   validity[thread] = valid ? 1 : 0;
   __syncthreads();
   for (int offset = cooperative_conservation_threads / 2;
@@ -8726,6 +8836,7 @@ __global__ void RodasAdmittedConservationElementsKernel(
   }
 }
 
+template<bool StridedSites>
 __global__ void RodasConservationElementsKernel(
     CudaDeviceView v, CudaMeshShape s, const double dt)
 {
@@ -8739,23 +8850,46 @@ __global__ void RodasConservationElementsKernel(
   const int thread = threadIdx.x;
   const int face_sites = faces_per_element * s.face_points;
   const int sites = s.volume_points + face_sites;
-  EulerConservationSite site{};
+  EulerConservationSite total{};
   bool valid = s.borrowed_host_inputs && isfinite(dt) && dt > 0.0;
-  if (valid && thread < s.volume_points)
-    valid = RodasConservationVolumeSite(v, s, element, thread, dt, site);
-  else if (valid && thread < sites)
+  if constexpr(StridedSites)
   {
-    const int face_site = thread - s.volume_points;
-    const int face = face_site / s.face_points;
-    const int q = face_site - face * s.face_points;
-    valid = RodasConservationFaceSite(v, s, element, face, q, dt, site);
+    bool first=true;
+    for(long long index=thread;valid&&index<sites;index+=blockDim.x)
+    {
+      const int site_index=static_cast<int>(index);
+      EulerConservationSite site{};
+      if (site_index < s.volume_points)
+        valid = RodasConservationVolumeSite(
+            v, s, element, site_index, dt, site);
+      else
+      {
+        const int face_site = site_index - s.volume_points;
+        const int face = face_site / s.face_points;
+        const int q = face_site - face * s.face_points;
+        valid = RodasConservationFaceSite(v, s, element, face, q, dt, site);
+      }
+      if(valid)AccumulateConservationSite(total,site,first);
+    }
+  }
+  else
+  {
+    if (valid && thread < s.volume_points)
+      valid = RodasConservationVolumeSite(v, s, element, thread, dt, total);
+    else if (valid && thread < sites)
+    {
+      const int face_site = thread - s.volume_points;
+      const int face = face_site / s.face_points;
+      const int q = face_site - face * s.face_points;
+      valid = RodasConservationFaceSite(v, s, element, face, q, dt, total);
+    }
   }
   for (int component = 0; component < components; ++component)
   {
-    balance[component][thread] = valid ? site.balance[component] : 0.0;
-    scale[component][thread] = valid ? site.scale[component] : 0.0;
+    balance[component][thread] = valid ? total.balance[component] : 0.0;
+    scale[component][thread] = valid ? total.scale[component] : 0.0;
   }
-  measure[thread] = valid ? site.measure : 0.0;
+  measure[thread] = valid ? total.measure : 0.0;
   validity[thread] = valid ? 1 : 0;
   __syncthreads();
   for (int offset = cooperative_conservation_threads / 2;
@@ -8799,6 +8933,7 @@ __global__ void RodasConservationElementsKernel(
 // exact zeros.  The fixed pairwise tree is deterministic and uses no atomics.
 // The first twelve entries of each element's f vector are temporary scratch;
 // the second stage restores their exact assembly invariant f=-residual_r.
+template<bool StridedSites>
 __global__ void EulerConservationElementsKernel(
     CudaDeviceView v, CudaMeshShape s, const double dt)
 {
@@ -8812,24 +8947,47 @@ __global__ void EulerConservationElementsKernel(
   const int thread = threadIdx.x;
   const int face_sites = faces_per_element * s.face_points;
   const int sites = s.volume_points + face_sites;
-  EulerConservationSite site{};
+  EulerConservationSite total{};
   bool valid = s.borrowed_host_inputs && isfinite(dt) && dt > 0.0 &&
       (!s.igr_active || v.face_h != nullptr);
-  if (valid && thread < s.volume_points)
-    valid = EulerConservationVolumeSite(v, s, element, thread, dt, site);
-  else if (valid && thread < sites)
+  if constexpr(StridedSites)
   {
-    const int face_site = thread - s.volume_points;
-    const int face = face_site / s.face_points;
-    const int q = face_site - face * s.face_points;
-    valid = EulerConservationFaceSite(v, s, element, face, q, dt, site);
+    bool first=true;
+    for(long long index=thread;valid&&index<sites;index+=blockDim.x)
+    {
+      const int site_index=static_cast<int>(index);
+      EulerConservationSite site{};
+      if (site_index < s.volume_points)
+        valid = EulerConservationVolumeSite(
+            v, s, element, site_index, dt, site);
+      else
+      {
+        const int face_site = site_index - s.volume_points;
+        const int face = face_site / s.face_points;
+        const int q = face_site - face * s.face_points;
+        valid = EulerConservationFaceSite(v, s, element, face, q, dt, site);
+      }
+      if(valid)AccumulateConservationSite(total,site,first);
+    }
+  }
+  else
+  {
+    if (valid && thread < s.volume_points)
+      valid = EulerConservationVolumeSite(v, s, element, thread, dt, total);
+    else if (valid && thread < sites)
+    {
+      const int face_site = thread - s.volume_points;
+      const int face = face_site / s.face_points;
+      const int q = face_site - face * s.face_points;
+      valid = EulerConservationFaceSite(v, s, element, face, q, dt, total);
+    }
   }
   for (int component = 0; component < components; ++component)
   {
-    balance[component][thread] = valid ? site.balance[component] : 0.0;
-    scale[component][thread] = valid ? site.scale[component] : 0.0;
+    balance[component][thread] = valid ? total.balance[component] : 0.0;
+    scale[component][thread] = valid ? total.scale[component] : 0.0;
   }
-  measure[thread] = valid ? site.measure : 0.0;
+  measure[thread] = valid ? total.measure : 0.0;
   validity[thread] = valid ? 1 : 0;
   __syncthreads();
   for (int offset = cooperative_conservation_threads / 2;
@@ -9071,7 +9229,8 @@ bool LaunchTensorBorrowedEulerAssembly(const CudaDeviceView& v,
   if(arithmetic==ExperimentalVolumeArithmetic::invalid||
      residual_arithmetic==ExperimentalVolumeResidual::invalid)return false;
   const bool fp64_residual=residual_arithmetic==ExperimentalVolumeResidual::fp64;
-  if(s.elements<=0||s.order<1||s.order>3)return false;
+  if(s.elements<=0||s.order<generic::minimum_polynomial_order||
+     s.order>generic::maximum_polynomial_order)return false;
   const int expected_components=s.igr_active?igr_interior_components:
       conserved_components;
   const int expected_trace_components=s.igr_active?igr_trace_components:
@@ -9096,8 +9255,7 @@ bool LaunchTensorBorrowedEulerAssembly(const CudaDeviceView& v,
      s.interior_dofs!=expected_components*s.scalar_interior_dofs||
      s.trace_dofs!=faces_per_element*expected_trace_components*
          s.scalar_face_dofs||
-     s.volume_points<=0||s.volume_points>maximum_volume_points||
-     s.face_points<=0||s.face_points>maximum_face_points||
+     s.volume_points<=0||s.face_points<=0||
      v.work_interior==nullptr||v.old_interior==nullptr||
      v.current_local_trace==nullptr||v.residual_r==nullptr||
      v.residual_g==nullptr||v.a==nullptr||v.b==nullptr||v.c==nullptr||
@@ -9939,7 +10097,22 @@ bool CudaLaunchPartitionedAuxiliarySquaredNorm(
 bool CudaLaunchMaximumWave(const CudaDeviceView& v,const CudaMeshShape& s,
                            const double* interior,const double* trace,
                            double* out) noexcept
-{const int sites=s.volume_points+2*faces_per_element*s.face_points;if(s.elements<=0||sites<=0||sites>cooperative_wave_threads)return false;MaximumWaveElementsKernel<<<s.elements,cooperative_wave_threads>>>(v,s,interior,trace);if(!LaunchOk())return false;MaximumWaveReduceKernel<<<1,cooperative_reduction_threads>>>(v.status,s.elements,out);return LaunchOk();}
+{
+  if(s.elements<=0||s.volume_points<=0||s.face_points<=0||
+     s.face_points>(std::numeric_limits<int>::max()-s.volume_points)/
+         (2*faces_per_element))return false;
+  const int sites=s.volume_points+2*faces_per_element*s.face_points;
+  if(sites<=cooperative_wave_threads)
+    MaximumWaveElementsKernel<false><<<s.elements,cooperative_wave_threads>>>(
+        v,s,interior,trace);
+  else
+    MaximumWaveElementsKernel<true><<<s.elements,cooperative_wave_threads>>>(
+        v,s,interior,trace);
+  if(!LaunchOk())return false;
+  MaximumWaveReduceKernel<<<1,cooperative_reduction_threads>>>(
+      v.status,s.elements,out);
+  return LaunchOk();
+}
 bool CudaLaunchEulerConservation(const CudaDeviceView& v,
                                  const CudaMeshShape& s,
                                  const double dt, double* out) noexcept
@@ -9948,13 +10121,18 @@ bool CudaLaunchEulerConservation(const CudaDeviceView& v,
      v.f==nullptr||v.residual_r==nullptr||s.elements<=0||
      s.interior_dofs<euler_conservation_result_scalars||
      s.interior_count<=0||s.elements>s.interior_count/s.interior_dofs||
-     s.volume_points<=0||s.volume_points>cooperative_conservation_threads||
+     s.volume_points<=0||
      s.face_points<=0||
-     s.face_points>(cooperative_conservation_threads-s.volume_points)/
+     s.face_points>(std::numeric_limits<int>::max()-s.volume_points)/
          faces_per_element||
      (s.igr_active&&v.face_h==nullptr))return false;
-  EulerConservationElementsKernel<<<
-      s.elements,cooperative_conservation_threads>>>(v,s,dt);
+  const int sites=s.volume_points+faces_per_element*s.face_points;
+  if(sites<=cooperative_conservation_threads)
+    EulerConservationElementsKernel<false><<<
+        s.elements,cooperative_conservation_threads>>>(v,s,dt);
+  else
+    EulerConservationElementsKernel<true><<<
+        s.elements,cooperative_conservation_threads>>>(v,s,dt);
   if(!LaunchOk())return false;
   EulerConservationReduceKernel<<<
       1,cooperative_conservation_threads>>>(v,s,out);
@@ -9987,9 +10165,8 @@ bool CudaLaunchRodasConservation(const CudaDeviceView& v,
      s.global_true_trace_count<s.true_trace_count||
      s.true_trace_count%s.trace_components!=0||
      s.volume_points<=0||
-     s.volume_points>cooperative_conservation_threads||
      s.face_points<=0||
-     s.face_points>(cooperative_conservation_threads-s.volume_points)/
+     s.face_points>(std::numeric_limits<int>::max()-s.volume_points)/
          faces_per_element||
      !isfinite(s.igr_beta)||v.f==nullptr||v.residual_r==nullptr||
      v.static_source==nullptr||v.volume_shape==nullptr||
@@ -10006,8 +10183,13 @@ bool CudaLaunchRodasConservation(const CudaDeviceView& v,
        v.rodas_stage_true_trace[stage]==nullptr||
        (s.global_true_trace_count!=s.true_trace_count&&
         v.rodas_stage_local_trace[stage]==nullptr))return false;
-  RodasConservationElementsKernel<<<
-      s.elements,cooperative_conservation_threads>>>(v,s,dt);
+  const int sites=s.volume_points+faces_per_element*s.face_points;
+  if(sites<=cooperative_conservation_threads)
+    RodasConservationElementsKernel<false><<<
+        s.elements,cooperative_conservation_threads>>>(v,s,dt);
+  else
+    RodasConservationElementsKernel<true><<<
+        s.elements,cooperative_conservation_threads>>>(v,s,dt);
   if(!LaunchOk())return false;
   EulerConservationReduceKernel<<<
       1,cooperative_conservation_threads>>>(v,s,out);
@@ -10040,7 +10222,7 @@ bool CudaLaunchRodasAdmittedStageConservation(
      s.local_trace_count<=0||s.true_trace_count<=0||
      s.global_true_trace_count<s.true_trace_count||
      s.true_trace_count%s.trace_components!=0||s.face_points<=0||
-     s.face_points>cooperative_conservation_threads/faces_per_element||
+     s.face_points>std::numeric_limits<int>::max()/faces_per_element||
      !isfinite(s.igr_beta)||v.f==nullptr||v.residual_r==nullptr||
      v.work_interior==nullptr||v.base_interior==nullptr||
      v.current_local_trace==nullptr||v.base_local_trace==nullptr||
@@ -10054,9 +10236,15 @@ bool CudaLaunchRodasAdmittedStageConservation(
        v.rodas_stage_true_trace[term]==nullptr||
        (s.global_true_trace_count!=s.true_trace_count&&
         v.rodas_stage_local_trace[term]==nullptr))return false;
-  RodasAdmittedConservationElementsKernel<<<
-      s.elements,cooperative_conservation_threads>>>(
-          v,s,dt,static_cast<int>(stage));
+  const int sites=faces_per_element*s.face_points;
+  if(sites<=cooperative_conservation_threads)
+    RodasAdmittedConservationElementsKernel<false><<<
+        s.elements,cooperative_conservation_threads>>>(
+            v,s,dt,static_cast<int>(stage));
+  else
+    RodasAdmittedConservationElementsKernel<true><<<
+        s.elements,cooperative_conservation_threads>>>(
+            v,s,dt,static_cast<int>(stage));
   if(!LaunchOk())return false;
   EulerConservationReduceKernel<<<
       1,cooperative_conservation_threads>>>(v,s,out);
@@ -10075,13 +10263,16 @@ bool CudaLaunchRodasConservationVolume(
      s.interior_dofs<euler_conservation_result_scalars||
      s.interior_count<=0||
      s.elements>s.interior_count/s.interior_dofs||s.volume_points<=0||
-     s.volume_points>cooperative_conservation_threads||
      v.f==nullptr||v.residual_r==nullptr||v.static_source==nullptr||
      v.volume_shape==nullptr||v.volume_weight==nullptr||
      v.rodas_residual_f==nullptr||
      v.rodas_combination_interior==nullptr)return false;
-  RodasAdmittedConservationElementsKernel<<<
-      s.elements,cooperative_conservation_threads>>>(v,s,dt,-1);
+  if(s.volume_points<=cooperative_conservation_threads)
+    RodasAdmittedConservationElementsKernel<false><<<
+        s.elements,cooperative_conservation_threads>>>(v,s,dt,-1);
+  else
+    RodasAdmittedConservationElementsKernel<true><<<
+        s.elements,cooperative_conservation_threads>>>(v,s,dt,-1);
   if(!LaunchOk())return false;
   EulerConservationReduceKernel<<<
       1,cooperative_conservation_threads>>>(v,s,out);

@@ -3,6 +3,7 @@
 
 #include <array>
 #include <iostream>
+#include <vector>
 
 namespace
 {
@@ -12,7 +13,9 @@ static_assert(NativeElementSchwarzIgrPatchRows(1) == 40);
 static_assert(NativeElementSchwarzIgrPatchRows(2) == 60);
 static_assert(NativeElementSchwarzIgrPatchRows(3) == 80);
 static_assert(NativeElementSchwarzIgrPatchRows(0) == 0);
-static_assert(NativeElementSchwarzIgrPatchRows(4) == 0);
+static_assert(NativeElementSchwarzIgrPatchRows(10) == 220);
+static_assert(NativeElementSchwarzPatchRows(10, false) == 176);
+static_assert(NativeElementSchwarzIgrPatchRows(11) == 0);
 static_assert(NativeElementSchwarzIgrFieldSplitLayout(1).valid);
 static_assert(NativeElementSchwarzIgrFieldSplitLayout(1).euler_rows == 32);
 static_assert(NativeElementSchwarzIgrFieldSplitLayout(1).sigma_rows == 8);
@@ -36,13 +39,19 @@ static_assert(NativeElementSchwarzIgrFieldSplitLayout(3).warp_valid);
 static_assert(
     NativeElementSchwarzIgrFieldSplitLayout(3).warp_required_doubles == 5696);
 static_assert(!NativeElementSchwarzIgrFieldSplitLayout(0).valid);
-static_assert(!NativeElementSchwarzIgrFieldSplitLayout(4).valid);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(10).euler_rows == 176);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(10).sigma_rows == 44);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(10).required_doubles ==
+              41096);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(10).warp_required_doubles ==
+              41536);
+static_assert(!NativeElementSchwarzIgrFieldSplitLayout(11).valid);
 static_assert(NativeElementSchwarzEncodeDof(7, -1) == -8);
 static_assert(NativeElementSchwarzDecodedDof(-8) == 7);
 
 bool CheckFieldSplitLayout()
 {
-  for (int order = 1; order <= 3; ++order)
+  for (int order = 1; order <= native_element_schwarz_maximum_order; ++order)
   {
     const NativeElementSchwarzFieldSplitLayout layout =
         NativeElementSchwarzIgrFieldSplitLayout(order);
@@ -73,7 +82,7 @@ bool CheckFieldSplitLayout()
 
     int euler_rows = 0;
     int sigma_rows = 0;
-    std::array<bool, 80> visited{};
+    std::vector<bool> visited(static_cast<std::size_t>(layout.patch_rows));
     for (int row = 0; row < layout.patch_rows; ++row)
     {
       const int packed = NativeElementSchwarzIgrFieldSplitPackedRow(
@@ -95,6 +104,13 @@ bool CheckFieldSplitLayout()
       }
     }
     if (euler_rows != layout.euler_rows || sigma_rows != layout.sigma_rows)
+      return false;
+    if (NativeElementSchwarzIgrFieldSplitPackedRow(order, -1) != -1 ||
+        NativeElementSchwarzIgrFieldSplitPackedRow(order, layout.patch_rows) !=
+            -1 ||
+        NativeElementSchwarzIgrFieldSplitPatchRow(order, -1) != -1 ||
+        NativeElementSchwarzIgrFieldSplitPatchRow(order, layout.patch_rows) !=
+            -1)
       return false;
   }
   return true;
@@ -127,6 +143,55 @@ bool CheckExactTwoElementPlan()
       plan.second_element_sources[3] == 4 &&
       plan.first_element_sources[4] == 3 &&
       plan.second_element_sources[4] == 4;
+}
+
+bool CheckP10OrientedFaceOverlap()
+{
+  // Two p10 IGR elements share one complete 5-component, 11-node face.
+  // Reverse its ordering and orientation on the second element. This probes
+  // the high row indices and two-contributor entries without a CUDA runtime.
+  constexpr int rows = 220;
+  constexpr int face_rows = 55;
+  constexpr int unique_rows = rows - face_rows;
+  constexpr int true_rows = 2 * rows - face_rows;
+  std::vector<int> signed_local(2 * rows);
+  std::vector<int> local_true(true_rows);
+  for (int row = 0; row < true_rows; ++row) local_true[row] = row;
+  for (int row = 0; row < rows; ++row) signed_local[row] = row;
+  for (int row = 0; row < rows; ++row)
+    signed_local[rows + row] = row < face_rows
+        ? NativeElementSchwarzEncodeDof(rows - 1 - row, -1)
+        : rows + row - face_rows;
+  const NativeElementSchwarzPlan plan =
+      BuildDirectNativeElementSchwarzPlan({
+          2, rows, true_rows, true_rows,
+          signed_local.data(), signed_local.size(),
+          local_true.data(), local_true.size()});
+  if (!plan.valid || plan.patch_rows != rows ||
+      plan.minimum_multiplicity != 1 || plan.maximum_multiplicity != 2 ||
+      plan.maximum_contributors != 2 ||
+      plan.signed_element_true_dofs != signed_local)
+    return false;
+  for (int truth = 0; truth < true_rows; ++truth)
+    if (plan.true_multiplicity[truth] !=
+        (truth >= unique_rows && truth < rows ? 2 : 1))
+      return false;
+  for (int row = 0; row < rows; ++row)
+    for (int column = 0; column < rows; ++column)
+    {
+      const std::size_t entry = static_cast<std::size_t>(row) * rows + column;
+      const bool shared_entry = row >= unique_rows && column >= unique_rows;
+      const int second_source = rows * rows +
+          (rows - 1 - row) * rows + (rows - 1 - column);
+      if (plan.first_element_sources[entry] != static_cast<int>(entry) ||
+          plan.second_element_sources[entry] !=
+              (shared_entry ? second_source : -1))
+        return false;
+    }
+  // The second element's reversed shared corner must reference the same
+  // assembled principal-patch entry, including its first-element source.
+  return plan.first_element_sources[rows * rows] == rows * rows - 1 &&
+      plan.second_element_sources[rows * rows] == rows * rows;
 }
 
 bool SamePlan(const NativeElementSchwarzPlan& left,
@@ -485,6 +550,7 @@ bool CheckMatrixFreeActionAndRhsModel()
 int main()
 {
   if (!CheckFieldSplitLayout() || !CheckExactTwoElementPlan() ||
+      !CheckP10OrientedFaceOverlap() ||
       !CheckDirectPlanMatchesCsrDerivedPlan() ||
       !CheckDirectPlanFailsClosed() ||
       !CheckDirectTraceCsrGraph() ||

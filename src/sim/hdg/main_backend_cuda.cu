@@ -1352,7 +1352,7 @@ std::string Validate(const HdgEulerMainRequest& request,
     return "CUDA HDG ParaView output requires a positive --time-step-save";
   if (request.options.order < dg::hdg::generic::minimum_polynomial_order ||
       request.options.order > dg::hdg::generic::maximum_polynomial_order)
-    return "generic CUDA HDG supports polynomial orders one through three";
+    return "generic CUDA HDG supports polynomial orders one through ten";
   if (request.options.ser_ref_levels < 0 || request.options.par_ref_levels < 0)
     return "generic CUDA HDG refinement levels must be nonnegative";
   if (!std::isfinite(request.case_config.gamma) ||

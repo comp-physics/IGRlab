@@ -694,6 +694,7 @@ struct AlignmentSelection
   CudaTracePolicyKind tensor_igr_trace_policy =
       CudaTracePolicyKind::engine_default;
   bool validate_options_only = false;
+  bool high_order_smoke = false;
 };
 
 constexpr std::uint32_t common_capabilities =
@@ -720,6 +721,8 @@ struct Case
   bool require_localized_sigma = false;
   double static_source_scale = 0.0;
   bool supply_initial_true_trace = false;
+  int elements_per_direction = 4;
+  bool require_nonzero_sigma = false;
 };
 
 struct BoundaryContext
@@ -809,10 +812,11 @@ bool All(const bool local, const MPI_Comm communicator = MPI_COMM_WORLD)
                        communicator) == MPI_SUCCESS && output == 1;
 }
 
-mfem::ParMesh MakeMesh(const bool physical)
+mfem::ParMesh MakeMesh(const bool physical, const int elements_per_direction)
 {
   mfem::Mesh serial = mfem::Mesh::MakeCartesian2D(
-      4, 4, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+      elements_per_direction, elements_per_direction,
+      mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
   if (physical) return mfem::ParMesh(MPI_COMM_WORLD, serial);
   std::vector<mfem::Vector> translations(2, mfem::Vector(2));
   translations[0] = 0.0;
@@ -1782,7 +1786,8 @@ Trajectory RunCuda(const EulerHdgRequest& request,
 bool CompareTrajectory(const Case& specification,
                        const std::string_view comparison,
                        const Trajectory& left, const Trajectory& right,
-                       const bool require_rodas3_assessment)
+                       const bool require_rodas3_assessment,
+                       const bool require_full_interior = false)
 {
   if (!left.passed || !right.passed ||
       left.states.size() != right.states.size())
@@ -1851,6 +1856,8 @@ bool CompareTrajectory(const Case& specification,
     const bool sigma_localization = !require_localization ||
         (reference.sigma.nonzero && reference.sigma.localized &&
          device.sigma.nonzero && device.sigma.localized);
+    const bool sigma_nonzero = !specification.require_nonzero_sigma ||
+        index == 0 || (reference.sigma.nonzero && device.sigma.nonzero);
     const bool assessment = !require_rodas3_assessment ||
         (index == 0
              ? !reference.assessment_available &&
@@ -1870,8 +1877,10 @@ bool CompareTrajectory(const Case& specification,
                    reference.common_shift_trace_solves == 4 &&
                    device.common_shift_trace_solves == 4);
     const bool state_passed = interior.passed &&
-        (!require_rodas3_assessment || full_interior.passed) &&
+        (!(require_rodas3_assessment || require_full_interior) ||
+         full_interior.passed) &&
         trace.passed && assessment && sigma_metrics && sigma_localization &&
+        sigma_nonzero &&
         reference.interior_components == device.interior_components &&
         reference.trace_components == device.trace_components &&
         reference.step == device.step &&
@@ -1972,7 +1981,8 @@ Trajectory RunCase(const Case& specification, const BackendKind backend,
                        CudaEngineKind::ordinary)
 {
   const int order = selection.order;
-  mfem::ParMesh mesh = MakeMesh(specification.physical);
+  mfem::ParMesh mesh = MakeMesh(
+      specification.physical, specification.elements_per_direction);
   BorrowedFields fields = MakeFields(
       mesh, specification.initial_mode, order,
       specification.static_source_scale,
@@ -2009,7 +2019,9 @@ bool ParseOrder(const std::string_view text, int& order) noexcept
   const auto result = std::from_chars(
       text.data(), text.data() + text.size(), order);
   return result.ec == std::errc{} &&
-      result.ptr == text.data() + text.size() && order >= 1 && order <= 3;
+      result.ptr == text.data() + text.size() &&
+      order >= dg::hdg::generic::minimum_polynomial_order &&
+      order <= dg::hdg::generic::maximum_polynomial_order;
 }
 
 bool ParseQuadratureOrder(const std::string_view text, int& order) noexcept
@@ -2018,7 +2030,8 @@ bool ParseQuadratureOrder(const std::string_view text, int& order) noexcept
   const auto result = std::from_chars(
       text.data(), text.data() + text.size(), order);
   return result.ec == std::errc{} &&
-      result.ptr == text.data() + text.size() && order >= 1 && order <= 14;
+      result.ptr == text.data() + text.size() && order >= 1 &&
+      order <= 2 * dg::hdg::generic::maximum_polynomial_order + 2;
 }
 
 bool ParsePositiveDouble(
@@ -2101,6 +2114,7 @@ bool ParseSelection(const int argc, char* argv[],
   bool have_tensor_igr_trace_policy = false;
   bool have_time_treatment = false;
   bool have_validate_options_only = false;
+  bool have_high_order_smoke = false;
   for (int argument = 1; argument < argc; ++argument)
   {
     const std::string_view option{argv[argument]};
@@ -2171,6 +2185,11 @@ bool ParseSelection(const int argc, char* argv[],
       else
         return false;
     }
+    else if (option == "--high-order-smoke" && !have_high_order_smoke)
+    {
+      selection.high_order_smoke = true;
+      have_high_order_smoke = true;
+    }
     else if (option == "--validate-options-only" &&
              !have_validate_options_only)
     {
@@ -2183,6 +2202,10 @@ bool ParseSelection(const int argc, char* argv[],
     }
   }
   if (have_igr_volume_order != have_igr_face_order) return false;
+  if (selection.high_order_smoke &&
+      (selection.order <= 3 || selection.time_treatment !=
+          EulerHdgTimeTreatment::backward_euler))
+    return false;
   return ValidAlignmentSelection(selection);
 }
 
@@ -2190,7 +2213,7 @@ void PrintUsage(const char* const executable)
 {
   std::cerr
       << "Usage: " << executable
-      << " [--order 1|2|3]"
+      << " [--order 1..10] [--high-order-smoke]"
          " [--time-treatment backward-euler|partitioned-backward-euler|rodas3]"
          " [--igr-volume-quadrature-order Q"
          " --igr-face-quadrature-order Q]"
@@ -2265,8 +2288,17 @@ int main(int argc, char* argv[])
   const int smooth_steps = rodas3 ? 1 : 3;
   const int short_steps = rodas3 ? 1 : 2;
   const double fixed_dt = rodas3 ? 1.0e-6 : 1.0e-5;
-  constexpr std::size_t case_count = 6;
-  const std::array<Case, case_count> cases{{
+  // Keep the established p1-p3 trajectories intact. The opt-in high-order
+  // gate uses one fixed step, one physical element and nine periodic IGR
+  // elements; every numerical/engine/field gate below remains the same.
+  const std::vector<Case> cases = selection.high_order_smoke
+      ? std::vector<Case>{
+          {"conventional-high-order-physical-one-step", InitialMode::smooth_periodic,
+           RegularizationKind::none, true, 1, 1.0e-5, false, 1.0, false, 1},
+          {"igr-high-order-periodic-one-step", InitialMode::smooth_periodic,
+           RegularizationKind::igr, false, 1, 1.0e-5, false, 0.0, false, 3,
+           true}}
+      : std::vector<Case>{
       {"conventional-smooth-short-trajectory", InitialMode::smooth_periodic,
        RegularizationKind::none, false, smooth_steps, fixed_dt, false, 0.0,
        false},
@@ -2287,13 +2319,13 @@ int main(int argc, char* argv[])
       {"igr-slip-boundary-localized-contact",
        InitialMode::localized_igr_contact,
        RegularizationKind::igr, true, short_steps, fixed_dt, true, 0.0,
-       false}}};
+       false}};
 
   // MFEM and HYPRE device selection is process-global.  Form every CPU
   // reference trajectory under the default host policy first, then select
   // CUDA once and form all device trajectories.  Interleaving the policies
   // in one process would make backend agreement depend on global setup order.
-  std::array<Trajectory, case_count> cpu_trajectories{};
+  std::vector<Trajectory> cpu_trajectories(cases.size());
   for (std::size_t index = 0; index < cases.size(); ++index)
     cpu_trajectories[index] = RunCase(
         cases[index], BackendKind::cpu, selection);
@@ -2325,8 +2357,8 @@ int main(int argc, char* argv[])
   }
 
   mfem::Device device("cuda");
-  std::array<Trajectory, case_count> ordinary_trajectories{};
-  std::array<Trajectory, case_count> tensor_trajectories{};
+  std::vector<Trajectory> ordinary_trajectories(cases.size());
+  std::vector<Trajectory> tensor_trajectories(cases.size());
   for (std::size_t index = 0; index < cases.size(); ++index)
     ordinary_trajectories[index] = RunCase(
         cases[index], BackendKind::cuda, selection,
@@ -2376,13 +2408,13 @@ int main(int argc, char* argv[])
   {
     const bool cpu_ordinary = CompareTrajectory(
         cases[index], "cpu-vs-ordinary", cpu_trajectories[index],
-        ordinary_trajectories[index], rodas3);
+        ordinary_trajectories[index], rodas3, selection.high_order_smoke);
     const bool cpu_tensor = CompareTrajectory(
         cases[index], "cpu-vs-tensor", cpu_trajectories[index],
-        tensor_trajectories[index], rodas3);
+        tensor_trajectories[index], rodas3, selection.high_order_smoke);
     const bool ordinary_tensor = CompareTrajectory(
         cases[index], "ordinary-vs-tensor", ordinary_trajectories[index],
-        tensor_trajectories[index], rodas3);
+        tensor_trajectories[index], rodas3, selection.high_order_smoke);
     const bool case_passed =
         cpu_ordinary && cpu_tensor && ordinary_tensor;
     if (!case_passed)
@@ -2409,11 +2441,14 @@ int main(int argc, char* argv[])
         dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
             CudaEngineKind::tensor_core, true, 1, order,
             selection.tensor_igr_trace_policy);
-    std::cout << "HDG CPU/ordinary-CUDA/tensor-CUDA numerical alignment and "
-                 "IGR discontinuity qualification passed order="
+    std::cout << (selection.high_order_smoke
+        ? "HDG CPU/ordinary-CUDA/tensor-CUDA high-order numerical alignment passed order="
+        : "HDG CPU/ordinary-CUDA/tensor-CUDA numerical alignment and IGR discontinuity qualification passed order=")
               << order << " time_treatment="
               << dg::hdg::generic::EulerHdgTimeTreatmentName(
                      selection.time_treatment)
+              << " high_order_smoke=" << selection.high_order_smoke
+              << " cases=" << cases.size()
               << " igr_quadrature="
               << igr.igr_assembly_quadrature_orders.volume_order << '/'
               << igr.igr_assembly_quadrature_orders.face_order

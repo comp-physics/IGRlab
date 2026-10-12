@@ -229,6 +229,27 @@ orders. This ordinary-DG suite does not establish high-order support for the
 separate DGSEM or HDG implementations; their actual kernel/storage paths must
 be extended and validated rather than merely changing study admission.
 
+The order-ten implementation extends DGSEM's packed and fused paths, including
+WMMA row tiling and bounded shared storage, and the dynamic generic HDG CPU,
+ordinary CUDA and tensor paths. The previous DGSEM research switch is no
+longer required. HDG's default IGR quadrature grows as `max(12, 2*p+2)` so its
+high-order element matrices are not built from an underresolved rule.
+Existing low-order quadrature and single-site reduction paths are retained.
+The source changes and host checks do not establish native p10 readiness;
+run the extended DGSEM parity and overintegration tests and these HDG checks
+through the canonical build driver before promoting larger cases:
+
+- `dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p10_rank1`
+- `dg_igr_hdg_runtime_cuda_generic_euler_extension_p10_ordinary_rank1`
+- `dg_igr_hdg_runtime_cuda_generic_euler_extension_p10_tensor_rank1`
+
+The p10 HDG checks use one physical element and nine periodic IGR elements,
+with a single committed step and the existing numerical gates. High-order
+HDG dense storage grows rapidly; its checked arena index capacity and device
+memory remain real constraints. Calibrate size by order rather than applying
+the p3 cell count blindly. Preserve failures and distinguish source support,
+native numerical acceptance and measured performance.
+
 Reports list every enabled frozen-suite case with its discretization, device,
 engine, DGSEM residual, timing scope, and individual timing/profile state.
 A two-case selection cannot establish coverage of every backend. CPU cases use

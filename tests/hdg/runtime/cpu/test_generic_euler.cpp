@@ -3961,7 +3961,8 @@ bool CheckCollectiveMismatchAndAtomicFailure()
   int rank = 0;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   BoundaryContext boundary{};
-  const int order = rank == 0 ? 4 : 2;
+  const int order = rank == 0
+      ? dg::hdg::generic::maximum_polynomial_order + 1 : 2;
   ExactBorrowedEulerFields fields(mesh, order, initial, source);
   EulerHdgRequest request = Request(mesh, order, boundary, fields);
   const bool rejected = !ExecuteGenericEulerHdgCpu(request);

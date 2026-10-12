@@ -93,7 +93,7 @@ def parameters(case):
     require(set(supplied) <= allowed, f'unknown {adapter} parameter')
     result = {**defaults[adapter], **supplied}
     if adapter in ('dg', 'hdg'):
-        require(integer(result['order'], 'order', 1) <= (10 if adapter == 'dg' else 3), 'unsupported order')
+        require(integer(result['order'], 'order', 1) <= 10, 'unsupported order')
         number(result['dt'], 'dt', positive=True)
     if adapter == 'dg':
         if IGR_PARAMETERS & set(supplied):
@@ -123,10 +123,6 @@ def parameters(case):
                 (result['dgsem_residual'] == 'unfused' or
                  (result['discretization'] == 'dgsem' and result['device'] == 'cuda')),
                 'fused residual requires CUDA DGSEM')
-        require(result['discretization'] != 'dgsem' or result['order'] <= 10,
-                'application study supports DGSEM orders p1..p10')
-        require(result['discretization'] != 'hdg' or result['order'] <= 3,
-                'application study uses supported HDG orders p1..p3')
         number(result['final_time'], 'final_time', positive=True)
         require(result['dt'] <= result['final_time'], 'dt exceeds DG horizon')
         number(result['rtol'], 'rtol')
