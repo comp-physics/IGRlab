@@ -377,7 +377,36 @@ print(9000 + count)
         self.assertEqual(result.returncode, 0, result.stderr)
         argv = self.calls('build')[-1]
         self.assertIn('--tests-only', argv)
+        self.assertEqual(argv.count('--tests-only'), 1)
         self.assertEqual(argv[argv.index('--test-label') + 1], '^numerical-acceptance$')
+
+    def test_run_only_receipt_hook_wraps_exact_canonical_argv_and_preserves_smoke_only(self):
+        # Intercept only the final execs. Admission/result semantics are tested
+        # with the real driver by test_prebuilt_validation.py.
+        receipt_calls = self.root / 'receipt.calls'
+        self.write_executable(self.repo / 'scripts/build/test_result_receipt.py', '''import json, os, sys
+with open(os.environ['RECEIPT_CALLS'], 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')
+''')
+        hook = self.helper.read_text().split('if [[ $pace_tests_only == 1 && $pace_tests == 1 ]]; then', 1)[1]
+        script = ('pace_tests_only=$1; pace_tests=$2; pace_source=$3; pace_script_dir=$3/scripts/build; '
+                  'pace_root=$4; pace_dependency_root=$4; pace_profile=cuda-sm80; '
+                  'pace_args=(--a100 --tests-only --output-root "$4" --test-regex "^literal $HOME$");\n'
+                  'if [[ $pace_tests_only == 1 && $pace_tests == 1 ]]; then' + hook)
+        for tests in ('1', '0'):
+            result = subprocess.run(['bash', '-eu', '-c', script, 'fixture', '1', tests,
+                                     str(self.repo), str(self.output)], env=self.env | {
+                                         'RECEIPT_CALLS': str(receipt_calls)}, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in receipt_calls.read_text().splitlines()]
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]
+        worktree = 'wt-' + __import__('hashlib').sha256(os.fsencode(self.repo)).hexdigest()[:16]
+        self.assertEqual(argv[argv.index('--prebuilt-receipt') + 1], str(
+            self.output / 'worktrees' / worktree / 'cuda-sm80/app/build/igrlab-prebuilt-validation-v1.json'))
+        self.assertEqual(argv[argv.index('--result-root') + 1], str(self.output / 'site/pace/validation-results'))
+        self.assertEqual(argv[argv.index('--') + 1], str(self.repo / 'build.sh'))
+        self.assertEqual(argv.count('--tests-only'), 1)
+        self.assertEqual(len(self.calls('build')), 1)
 
     def test_worker_rejects_paid_queue(self):
         request = self.root / 'request.json'

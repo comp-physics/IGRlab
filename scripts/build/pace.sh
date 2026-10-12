@@ -87,6 +87,7 @@ PY
     pace_arg=${pace_original[0]}; pace_original=("${pace_original[@]:1}")
     case "$pace_arg" in
       --no-tests) [[ $pace_stage == build ]] || pace_worker_args+=("$pace_arg") ;;
+      --tests-only) [[ $pace_stage == validation ]] || pace_worker_args+=("$pace_arg") ;;
       --no-clean|--clean|--no-deps)
         [[ $pace_stage == validation ]] || pace_worker_args+=("$pace_arg") ;;
       --smoke) [[ $pace_stage == build ]] || pace_worker_args+=("$pace_arg") ;;
@@ -316,4 +317,12 @@ else
 fi
 printf '[site] PACE profile=%s target=x86_64_v3 MPI=%s account=%s qos=%s\n' \
   "$pace_profile" "$pace_mpi" "$SLURM_JOB_ACCOUNT" "$SLURM_JOB_QOS"
+if [[ $pace_tests_only == 1 && $pace_tests == 1 ]]; then
+  pace_worktree="wt-$(printf '%s' "$pace_source" | sha256sum | cut -c1-16)"
+  pace_prebuilt="$pace_root/worktrees/$pace_worktree/$pace_profile/app/build/igrlab-prebuilt-validation-v1.json"
+  exec python3 -B "$pace_script_dir/test_result_receipt.py" \
+    --prebuilt-receipt "$pace_prebuilt" \
+    --result-root "$pace_dependency_root/site/pace/validation-results" \
+    -- "$pace_source/build.sh" "${pace_args[@]}"
+fi
 exec "${pace_source}/build.sh" "${pace_args[@]}"
