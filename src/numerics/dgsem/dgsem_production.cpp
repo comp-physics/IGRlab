@@ -79,12 +79,12 @@ int RequestedVolumeQuadratureOrder()
   return static_cast<int>(value);
 }
 
-// Explicit research extension; default qualification remains p1--p4.
-// Generic packed kernels and the fused path are independently checked to p7.
+// Packed and fused kernels share the supported LGL extent. Higher orders do
+// not require a separate policy switch; their arithmetic is checked by the
+// same production and device parity fixtures.
 inline int MaximumDGSEMProductionOrder()
 {
-  return ::igrlab::EnvFlagEnabledDefault("DG_IGR_DGSEM_HIGH_ORDER_RESEARCH", false)
-      ? 7 : 4;
+  return 10;
 }
 
 inline int AbsoluteDof(int vdof)
@@ -1233,7 +1233,8 @@ void PrepareOverintegratedVolume(DGSEMProductionCache& c,
                 mesh->SpaceDimension()==2&&!mesh->Nonconforming(),
               "Overintegrated DGSEM volume currently requires conforming affine FP64 2D quadrilaterals.");
   const auto& fe=*vfes.GetFE(0);const int p=fe.GetOrder();
-  MFEM_VERIFY(p>=1&&p<=7,"Overintegrated DGSEM volume supports p1 through p7.");
+  MFEM_VERIFY(p>=1&&p<=MaximumDGSEMProductionOrder(),
+              "Overintegrated DGSEM volume supports p1 through p10.");
   if(c.sigma_field)
   {
     MFEM_VERIFY(c.sigma_fes&&dynamic_cast<const L2_FECollection*>(c.sigma_fes->FEColl())&&
@@ -3585,14 +3586,14 @@ DGSEMProductionResult DGSEMOperator::AssembleProductionResidual(
   const bool subcell_blend = ::igrlab::EnvFlagEnabledDefault(
       "DG_IGR_DGSEM_SUBCELL_BLEND", false);
   MFEM_VERIFY(!subcell_blend || (fused_residual && c.n1d >= 4),
-      "DG_IGR_DGSEM_SUBCELL_BLEND requires the fused CUDA p3--p7 path.");
+      "DG_IGR_DGSEM_SUBCELL_BLEND requires the fused CUDA p3--p10 path.");
   MFEM_VERIFY(!fused_dmma || fused_residual,
               "DG_IGR_DGSEM_FUSED_DMMA requires DG_IGR_DGSEM_FUSED_RESIDUAL.");
   if (fused_residual)
   {
-    MFEM_VERIFY(op_->dim == 2 && c.n1d >= 2 && c.n1d <= 8 &&
+    MFEM_VERIFY(op_->dim == 2 && c.n1d >= 2 && c.n1d <= 11 &&
         c.inverse_mass.Width() == 1 && Device::Allows(Backend::CUDA_MASK),
-        "DG_IGR_DGSEM_FUSED_RESIDUAL requires CUDA 2D p1--p7 with "
+        "DG_IGR_DGSEM_FUSED_RESIDUAL requires CUDA 2D p1--p10 with "
         "compact diagonal mass.");
     if (!c.fused_residual_logged)
     {

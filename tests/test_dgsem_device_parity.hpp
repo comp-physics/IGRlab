@@ -448,7 +448,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
     double& max_local_conservation = errors.local_conservation;
     double& max_reduction_error = errors.reduction;
 
-    for (int order = 1; order <= 7; ++order)
+    for (int order = 1; order <= 10; ++order)
     {
       const auto& basis = mfem::dgsem::GetLGLBasis1D(order);
       const int n1d = basis.n;
@@ -896,7 +896,8 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
           for (bool tensor_contraction : {false, true})
           {
             if (tensor_contraction && !fp64_tensor_supported) { continue; }
-            mfem::DenseMatrix fused;
+            mfem::DenseMatrix fused(dof, 4);
+            fused = std::numeric_limits<mfem::real_t>::quiet_NaN();
             mfem::Vector fused_speeds, ordinary_speeds;
             mfem::dgsem::ApplyFusedEulerResidualDevice(1, n1d, gamma,
                 rho_floor, llf, frozen_speed, lex_to_local, basis.Dsplit,
@@ -908,8 +909,10 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
                 rho_floor, states, sigma, ordinary_speeds, frozen_speed);
             ctx.Check(MaxDifference(fused, expected) < 32.0 * pointwise_tol,
                       tensor_contraction
-                        ? "Fused FP64 DMMA residual matches central/LLF host algebra"
-                        : "Fused FP64 SIMT residual matches central/LLF host algebra");
+                        ? "Fused FP64 DMMA residual matches central/LLF host algebra p" +
+                            std::to_string(order)
+                        : "Fused FP64 SIMT residual matches central/LLF host algebra p" +
+                            std::to_string(order));
             fused_speeds.HostRead(); ordinary_speeds.HostRead();
             double speed_error = 0.0;
             for (int row = 0; row < dof; ++row)
@@ -1213,7 +1216,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
                  MaxDifference(device_strong, host_strong));
     }
 
-    for (int face_order = 1; face_order <= 4; ++face_order)
+    for (int face_order = 1; face_order <= 10; ++face_order)
     {
       const auto& face_basis = mfem::dgsem::GetLGLBasis1D(face_order);
       const int face_n1d = face_basis.n;
@@ -1461,7 +1464,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
     std::max(dimension_errors[0].reduction, dimension_errors[1].reduction);
 
   ctx.Check(max_basis_error <= mfem::dgsem::DGSEMReferenceTolerances::sbp,
-            "DGSEM MFEM device p1-p4 basis parity uses frozen SBP gate");
+            "DGSEM MFEM device p1-p10 basis parity uses frozen SBP gate");
   for (int dim = 1; dim <= 2; ++dim)
   {
     const auto& errors = dimension_errors[static_cast<std::size_t>(dim - 1)];
@@ -1469,31 +1472,31 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
     if (dim == 2)
     {
       ctx.Check(errors.metric <= metric_tol,
-                "DGSEM MFEM device direct p1-p4 2D sheared metric parity");
+                "DGSEM MFEM device direct p1-p10 2D sheared metric parity");
     }
     ctx.Check(errors.sigma_flux <= pointwise_tol,
-              "DGSEM MFEM device direct p1-p4 " + dimension +
+              "DGSEM MFEM device direct p1-p10 " + dimension +
                 " frozen scalar-sigma tensor-flux parity");
     ctx.Check(errors.volume <= pointwise_tol,
-              "DGSEM MFEM device direct p1-p4 " + dimension +
+              "DGSEM MFEM device direct p1-p10 " + dimension +
                 " central volume parity");
     ctx.Check(errors.surface <= pointwise_tol,
-              "DGSEM MFEM device direct p1-p4 " + dimension +
+              "DGSEM MFEM device direct p1-p10 " + dimension +
                 " local/shared/boundary surface parity");
     ctx.Check(errors.inverse_mass <=
                 mfem::dgsem::DGSEMReferenceTolerances::inverse_mass,
-              "DGSEM MFEM device direct p1-p4 " + dimension +
+              "DGSEM MFEM device direct p1-p10 " + dimension +
                 " inverse-mass parity");
     ctx.Check(errors.constant_residual <=
                 mfem::dgsem::DGSEMReferenceTolerances::constant_affine,
-              "DGSEM MFEM device direct p1-p4 " + dimension +
+              "DGSEM MFEM device direct p1-p10 " + dimension +
                 " constant-state cancellation");
     ctx.Check(errors.local_conservation <=
                 mfem::dgsem::DGSEMReferenceTolerances::conservation,
-              "DGSEM MFEM device direct p1-p4 " + dimension +
+              "DGSEM MFEM device direct p1-p10 " + dimension +
                 " component-wise local-face conservation");
     ctx.Check(errors.reduction <= pointwise_tol,
-              "DGSEM MFEM device direct p1-p4 " + dimension +
+              "DGSEM MFEM device direct p1-p10 " + dimension +
                 " deterministic speed reduction parity");
   }
   ctx.Check(
@@ -1539,7 +1542,7 @@ inline void RunDGSEMDeviceParityTests(TestContext& ctx)
         << mfem::MemoryTypeName[static_cast<int>(runtime.device_memory_type)]
         << "\",\n"
         << "  \"dimensions\": [1,2],\n"
-        << "  \"orders\": [1,2,3,4,5,6,7],\n"
+        << "  \"orders\": [1,2,3,4,5,6,7,8,9,10],\n"
         << "  \"direct_kernel_dimensions\": {\"basis\":[1,2],"
            "\"metric\":[2],\"euler_sigma_flux\":[1,2],"
            "\"volume\":[1,2],\"surface\":[1,2],"

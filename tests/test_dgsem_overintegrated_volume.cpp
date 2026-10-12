@@ -90,7 +90,7 @@ int main(int argc,char**argv)
   MFEM_VERIFY(backend=="cpu"||backend=="cuda","Use cpu or cuda.");Device device(backend.c_str());
   MFEM_VERIFY(backend!="cuda"||Device::Allows(Backend::CUDA),"CUDA backend inactive.");
   double parity=0.,lgl_parity=0.,alias_difference=0.,budget=0.;int cases=0;
-  for(int p:{3,5,7})
+  for(int p:{3,5,7,10})
   {
     Mesh serial=Mesh::MakeCartesian2D(2,2,Element::QUADRILATERAL,true,1.,1.);
     serial.Transform([](const Vector& x,Vector& y)

@@ -123,8 +123,8 @@ def parameters(case):
                 (result['dgsem_residual'] == 'unfused' or
                  (result['discretization'] == 'dgsem' and result['device'] == 'cuda')),
                 'fused residual requires CUDA DGSEM')
-        require(result['discretization'] != 'dgsem' or result['order'] <= 4,
-                'application study uses qualified DGSEM orders p1..p4')
+        require(result['discretization'] != 'dgsem' or result['order'] <= 10,
+                'application study supports DGSEM orders p1..p10')
         require(result['discretization'] != 'hdg' or result['order'] <= 3,
                 'application study uses supported HDG orders p1..p3')
         number(result['final_time'], 'final_time', positive=True)
