@@ -2020,8 +2020,7 @@ bool ParseOrder(const std::string_view text, int& order) noexcept
       text.data(), text.data() + text.size(), order);
   return result.ec == std::errc{} &&
       result.ptr == text.data() + text.size() &&
-      order >= dg::hdg::generic::minimum_polynomial_order &&
-      order <= dg::hdg::generic::maximum_polynomial_order;
+      dg::hdg::generic::PlanPolynomialShape(order, true).valid;
 }
 
 bool ParseQuadratureOrder(const std::string_view text, int& order) noexcept
@@ -2030,8 +2029,8 @@ bool ParseQuadratureOrder(const std::string_view text, int& order) noexcept
   const auto result = std::from_chars(
       text.data(), text.data() + text.size(), order);
   return result.ec == std::errc{} &&
-      result.ptr == text.data() + text.size() && order >= 1 &&
-      order <= 2 * dg::hdg::generic::maximum_polynomial_order + 2;
+      result.ptr == text.data() + text.size() &&
+      dg::hdg::generic::ValidAssemblyQuadratureOrder(order);
 }
 
 bool ParsePositiveDouble(
@@ -2213,7 +2212,7 @@ void PrintUsage(const char* const executable)
 {
   std::cerr
       << "Usage: " << executable
-      << " [--order 1..10] [--high-order-smoke]"
+      << " [--order P] [--high-order-smoke]"
          " [--time-treatment backward-euler|partitioned-backward-euler|rodas3]"
          " [--igr-volume-quadrature-order Q"
          " --igr-face-quadrature-order Q]"

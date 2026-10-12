@@ -1331,8 +1331,9 @@ bool CheckNegatives(const int ranks)
       periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction);
   invalid_mesh_n.mesh_n = -1;
   CudaConfig unsupported_order = BorrowedConfig(
-      periodic, ranks, dg::hdg::generic::maximum_polynomial_order + 1,
+      periodic, ranks, smoke_polynomial_order,
       smoke_elements_per_direction);
+  unsupported_order.order = std::numeric_limits<int>::max();
   CudaConfig wrong_device = BorrowedConfig(
       periodic, ranks, smoke_polynomial_order, smoke_elements_per_direction);
   wrong_device.requested_device = 1;

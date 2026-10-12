@@ -1725,12 +1725,20 @@ struct LocalSystem
   bool Allocate(const int batch_count, const int ni, const int nt,
                 CpuOwnedAllocationLedger& ledger)
   {
+    if (batch_count < 0 || !generic::DenseLocalDimensionsFitInt(ni, nt))
+      return false;
+    const std::size_t batches = static_cast<std::size_t>(batch_count);
+    const std::size_t interior = static_cast<std::size_t>(ni);
+    const std::size_t trace = static_cast<std::size_t>(nt);
+    const std::size_t maximum = std::min({a.max_size(), b.max_size(),
+        c.max_size(), d.max_size(), residual_interior.max_size(),
+        residual_trace.max_size(), f.max_size(), g.max_size()});
+    if (batches > maximum / (interior * interior) ||
+        batches > maximum / (interior * trace) ||
+        batches > maximum / (trace * trace)) return false;
     elements = batch_count;
     interior_dofs = ni;
     trace_dofs = nt;
-    const std::size_t batches = static_cast<std::size_t>(elements);
-    const std::size_t interior = static_cast<std::size_t>(ni);
-    const std::size_t trace = static_cast<std::size_t>(nt);
     return ResizeOwned(residual_interior, batches * interior,
                        CpuOwnedAllocationSite::local_system_vector, ledger) &&
         ResizeOwned(residual_trace, batches * trace,
@@ -3141,13 +3149,15 @@ struct detail::CpuNumericsCore::Implementation
   {
     try
     {
-      const int expected_interior_dofs =
-          (config.polynomial_order + 1) * (config.polynomial_order + 1);
+      const auto order_shape = generic::PlanPolynomialShape(
+          config.polynomial_order, igr_active);
+      if (!generic::PolynomialRankIndicesFitInt(
+              order_shape, mesh->GetNE(), mesh->GetNumFaces())) return false;
+      const int expected_interior_dofs = order_shape.scalar_interior_dofs;
       scalar_interior_dofs = expected_interior_dofs;
-      local_interior = scalar_interior_dofs * interior_components;
-      scalar_trace_dofs = config.polynomial_order + 1;
-      local_trace = 4 * scalar_trace_dofs *
-          trace_components;
+      local_interior = order_shape.interior_dofs;
+      scalar_trace_dofs = order_shape.scalar_face_dofs;
+      local_trace = order_shape.trace_dofs;
       if (mesh->GetNE() > 0)
       {
         const mfem::FiniteElement* interior = interior_space->GetFE(0);
@@ -11430,9 +11440,15 @@ bool detail::CpuNumericsCore::InitializeInternal(
       ? igr_interior_components : cpu_conserved_components;
   state.trace_components = state.igr_active
       ? igr_trace_components : cpu_conserved_components;
+  const auto order_shape = generic::PlanPolynomialShape(
+      config.polynomial_order, state.igr_active);
+  const auto assembly_orders = EffectiveAssemblyQuadratureOrders(config);
   const bool config_consensus = !generic && mpi_initialized != 0 && mpi_finalized == 0
       ? ExactConfigConsensus(config) : false;
-  bool local_ok = mpi_initialized != 0 && mpi_finalized == 0 &&
+  bool local_ok = order_shape.valid &&
+      generic::ValidAssemblyQuadratureOrder(assembly_orders.volume_order) &&
+      generic::ValidAssemblyQuadratureOrder(assembly_orders.face_order) &&
+      mpi_initialized != 0 && mpi_finalized == 0 &&
       MPI_Comm_rank(state.communicator, &state.rank) == MPI_SUCCESS &&
       MPI_Comm_size(state.communicator, &state.ranks) == MPI_SUCCESS &&
       (!generic || borrowed_request->time_treatment ==
@@ -11503,6 +11519,10 @@ bool detail::CpuNumericsCore::InitializeInternal(
   if (!state.CollectiveAll(local_ok)) { return false; }
 
   local_ok = generic || state.ObserveParentCellIds();
+  if (!state.CollectiveAll(local_ok)) { return false; }
+
+  local_ok = generic::PolynomialRankIndicesFitInt(
+      order_shape, state.mesh->GetNE(), state.mesh->GetNumFaces());
   if (!state.CollectiveAll(local_ok)) { return false; }
 
   try

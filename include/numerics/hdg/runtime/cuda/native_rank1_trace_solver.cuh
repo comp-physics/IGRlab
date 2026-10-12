@@ -42,8 +42,8 @@ constexpr bool NativeTraceConventionalElementSchwarzPatchRowsSupported(
   constexpr int face_components = native_element_schwarz_faces *
       native_element_schwarz_euler_trace_components;
   return rows >= face_components * (generic::minimum_polynomial_order + 1) &&
-      rows <= face_components * (generic::maximum_polynomial_order + 1) &&
-      rows % face_components == 0;
+      rows % face_components == 0 &&
+      generic::PlanPolynomialShape(rows / face_components - 1).valid;
 }
 
 /** Exact IGR-Uhat4/sigmahat quadrilateral patches at the admitted orders. */
@@ -53,8 +53,8 @@ constexpr bool NativeTraceIgrElementSchwarzPatchRowsSupported(
   constexpr int face_components = native_element_schwarz_faces *
       native_element_schwarz_igr_trace_components;
   return rows >= face_components * (generic::minimum_polynomial_order + 1) &&
-      rows <= face_components * (generic::maximum_polynomial_order + 1) &&
-      rows % face_components == 0;
+      rows % face_components == 0 &&
+      generic::PlanPolynomialShape(rows / face_components - 1, true).valid;
 }
 
 /** Exact conventional and IGR quadrilateral patch union. */
@@ -73,8 +73,8 @@ static_assert(NativeTraceElementSchwarzPatchRowsSupported(64));
 static_assert(NativeTraceElementSchwarzPatchRowsSupported(80));
 static_assert(NativeTraceConventionalElementSchwarzPatchRowsSupported(176));
 static_assert(NativeTraceIgrElementSchwarzPatchRowsSupported(220));
-static_assert(!NativeTraceConventionalElementSchwarzPatchRowsSupported(192));
-static_assert(!NativeTraceIgrElementSchwarzPatchRowsSupported(240));
+static_assert(NativeTraceConventionalElementSchwarzPatchRowsSupported(192));
+static_assert(NativeTraceIgrElementSchwarzPatchRowsSupported(240));
 static_assert(!NativeTraceElementSchwarzPatchRowsSupported(24));
 static_assert(!NativeTraceElementSchwarzPatchRowsSupported(72));
 static_assert(!NativeTraceIgrElementSchwarzPatchRowsSupported(32));

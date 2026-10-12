@@ -8668,8 +8668,7 @@ bool ParseOptions(const int argc, char* argv[], Options& options)
       EulerHdgTimeTreatment::rodas3;
   const bool any_rodas3_screen = options.rodas3_screen ||
       options.rodas3_rank2_screen;
-  return options.order >= dg::hdg::generic::minimum_polynomial_order &&
-      options.order <= dg::hdg::generic::maximum_polynomial_order &&
+  return dg::hdg::generic::PlanPolynomialShape(options.order, true).valid &&
       options.partitioned_smoke == partitioned_selected &&
       any_rodas3_screen == rodas3_selected &&
       !(options.rodas3_screen && options.rodas3_rank2_screen) &&
@@ -8716,7 +8715,7 @@ int main(int argc, char* argv[])
   {
     if (rank == 0)
       std::cerr << "Usage: " << argv[0]
-                << " --order 1..10 [--engine ordinary|tensor]"
+                << " --order P [--engine ordinary|tensor]"
                    " [--time-treatment backward-euler|"
                    "partitioned-backward-euler|rodas3]"
                    " [--high-order-smoke|--partitioned-smoke|--rodas3-screen|"

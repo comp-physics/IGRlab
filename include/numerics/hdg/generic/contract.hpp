@@ -194,7 +194,7 @@ struct EulerHdgNumericalPolicy
 constexpr EulerHdgNumericalPolicy DefaultEulerHdgNumericalPolicy(
     const int p) noexcept
 {
-  const int quadrature = 2 * p + 2;
+  const int quadrature = PlanPolynomialShape(p).default_quadrature_order;
   // Preserve the established low-order IGR rule, and integrate products of
   // the higher-order basis without reducing the local mass matrix's rank.
   const int igr_quadrature = std::max(12, quadrature);
@@ -292,9 +292,10 @@ enum class ContractStatus : std::uint8_t
 enum class Capability : std::uint32_t
 {
   conforming_quadrilateral_mesh = 1u << 0,
-  polynomial_order_one_to_ten = 1u << 1,
-  // Retain the old spelling and bit for callers of the earlier contract.
-  polynomial_order_one_to_three = polynomial_order_one_to_ten,
+  representable_positive_polynomial_order = 1u << 1,
+  // Retain the spellings and bit for callers of the earlier contract.
+  polynomial_order_one_to_ten = representable_positive_polynomial_order,
+  polynomial_order_one_to_three = representable_positive_polynomial_order,
   cpu = 1u << 2,
   cuda = 1u << 3,
   external_initial_state = 1u << 4,
@@ -662,18 +663,16 @@ inline bool ValidEulerHdgPositivityLimiterPolicy(
 inline bool ValidEulerHdgNumericalPolicy(
     const EulerHdgNumericalPolicy& policy) noexcept
 {
-  const int positive_integers[] = {
+  const int quadrature_orders[] = {
       policy.volume_projection_quadrature_order,
       policy.true_trace_projection_quadrature_order,
       policy.conventional_assembly_quadrature_order,
       policy.igr_assembly_quadrature_orders.volume_order,
-      policy.igr_assembly_quadrature_orders.face_order,
-      policy.maximum_nonlinear_updates,
-      policy.maximum_line_search_trials};
-  for (const int value : positive_integers)
-  {
-    if (value <= 0) { return false; }
-  }
+      policy.igr_assembly_quadrature_orders.face_order};
+  for (const int value : quadrature_orders)
+    if (!ValidAssemblyQuadratureOrder(value)) return false;
+  if (policy.maximum_nonlinear_updates <= 0 ||
+      policy.maximum_line_search_trials <= 0) return false;
   if (policy.maximum_linear_iterations < 0) { return false; }
   const double positive_reals[] = {policy.nonlinear_relative_tolerance,
                                    policy.newton_correction_linear_relative_tolerance,
@@ -842,7 +841,7 @@ constexpr std::uint32_t RequiredCapabilities(
 {
   const std::uint32_t common =
       CapabilityBit(Capability::conforming_quadrilateral_mesh) |
-      CapabilityBit(Capability::polynomial_order_one_to_ten) |
+      CapabilityBit(Capability::representable_positive_polynomial_order) |
       CapabilityBit(Capability::external_initial_state) |
       CapabilityBit(Capability::external_source) |
       CapabilityBit(Capability::numerical_boundary_operator);
@@ -1095,8 +1094,9 @@ inline ContractStatus ValidateEulerHdgRequest(
       break;
     }
   }
-  if (request.polynomial_order < minimum_polynomial_order ||
-      request.polynomial_order > maximum_polynomial_order)
+  if (!PlanPolynomialShape(request.polynomial_order,
+          request.numerical_policy.stabilization.kind ==
+              RegularizationKind::igr).valid)
   {
     RecordFailure(local_status, ContractStatus::unsupported_polynomial_order);
   }

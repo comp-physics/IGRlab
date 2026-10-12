@@ -24,21 +24,14 @@ inline constexpr int native_element_schwarz_igr_trace_components = 5;
 inline constexpr int native_element_schwarz_euler_trace_components = 4;
 inline constexpr int native_element_schwarz_minimum_order =
     generic::minimum_polynomial_order;
-inline constexpr int native_element_schwarz_maximum_order =
-    generic::maximum_polynomial_order;
 inline constexpr int native_element_schwarz_maximum_contributors = 2;
 inline constexpr int native_element_schwarz_equilibration_passes = 2;
 
 constexpr int NativeElementSchwarzPatchRows(
     const int order, const bool igr_active) noexcept
 {
-  return order >= native_element_schwarz_minimum_order &&
-          order <= native_element_schwarz_maximum_order
-      ? native_element_schwarz_faces *
-            (igr_active ? native_element_schwarz_igr_trace_components
-                        : native_element_schwarz_euler_trace_components) *
-            (order + 1)
-      : 0;
+  const auto shape = generic::PlanPolynomialShape(order, igr_active);
+  return shape.valid ? shape.trace_dofs : 0;
 }
 
 constexpr int NativeElementSchwarzIgrPatchRows(const int order) noexcept

@@ -46,6 +46,12 @@ constexpr TensorVolumeScratchPlan igr_p10 =
 // point. It checks padding/storage only; it is not a numerical quadrature.
 constexpr TensorVolumeScratchPlan igr_p10_tail =
     PlanTensorVolumeScratch(847, 220, 2837, true);
+// Metadata-only plans beyond the numerical p10 cohort exercise generic row
+// padding and larger default quadrature without allocating matrix arenas.
+constexpr TensorVolumeScratchPlan igr_p11 =
+    PlanTensorVolumeScratch(1008, 240, 169, true);
+constexpr TensorVolumeScratchPlan igr_p12 =
+    PlanTensorVolumeScratch(1183, 260, 196, true);
 static_assert(conventional_p1.valid && conventional_p1.capacity_points == 12 &&
               conventional_p1.chunk_points == 9);
 static_assert(conventional_p1_q12.valid &&
@@ -66,6 +72,10 @@ static_assert(igr_p10.valid && igr_p10.workspace_doubles == 187187 &&
               igr_p10.capacity_points == 2836 &&
               igr_p10.chunk_points == 144);
 static_assert(igr_p10_tail.valid && igr_p10_tail.chunk_points == 2836);
+static_assert(igr_p11.valid && igr_p11.workspace_doubles == 242928 &&
+              igr_p11.capacity_points == 3680 && igr_p11.chunk_points == 169);
+static_assert(igr_p12.valid && igr_p12.workspace_doubles == 308763 &&
+              igr_p12.capacity_points == 4678 && igr_p12.chunk_points == 196);
 static_assert(!PlanTensorVolumeScratch(4, 1, 4, true).valid);
 
 constexpr TensorVolumeMmaWorkPlan conventional_p1_q12_work =
@@ -82,6 +92,10 @@ constexpr TensorVolumeMmaWorkPlan igr_p10_work =
     PlanTensorVolumeMmaWork(1, 7, 121, 847, 220, 144, true);
 constexpr TensorVolumeMmaWorkPlan igr_p10_tail_work =
     PlanTensorVolumeMmaWork(1, 7, 121, 847, 220, 2837, true);
+constexpr TensorVolumeMmaWorkPlan igr_p11_work =
+    PlanTensorVolumeMmaWork(1, 7, 144, 1008, 240, 169, true);
+constexpr TensorVolumeMmaWorkPlan igr_p12_work =
+    PlanTensorVolumeMmaWork(1, 7, 169, 1183, 260, 196, true);
 static_assert(conventional_p1_q12_work.valid &&
               conventional_p1_q12_work.contraction_launches == 5 &&
               conventional_p1_q12_work.mma_tiles == 468);
@@ -103,6 +117,10 @@ static_assert(igr_p10_work.valid &&
 static_assert(igr_p10_tail_work.valid &&
               igr_p10_tail_work.contraction_launches == 2 &&
               igr_p10_tail_work.mma_tiles == 25287360);
+static_assert(igr_p11_work.valid && igr_p11_work.contraction_launches == 1 &&
+              igr_p11_work.mma_tiles == 2064258);
+static_assert(igr_p12_work.valid && igr_p12_work.contraction_launches == 1 &&
+              igr_p12_work.mma_tiles == 3350424);
 static_assert(!PlanTensorVolumeMmaWork(
     std::numeric_limits<int>::max(), std::numeric_limits<int>::max(),
     std::numeric_limits<int>::max(), std::numeric_limits<int>::max(),
@@ -246,6 +264,8 @@ int main()
       CheckChunkCoverage(conventional_p10, 144) &&
       CheckChunkCoverage(igr_p10, 144) &&
       CheckChunkCoverage(igr_p10_tail, 2837) &&
+      CheckChunkCoverage(igr_p11, 169) &&
+      CheckChunkCoverage(igr_p12, 196) &&
       CheckChunkSequence(igr_p10_tail, 2837,
                          std::array<int, 2>{{2836, 1}}) &&
       CheckChunkSequence(conventional_p1_q12, 49,

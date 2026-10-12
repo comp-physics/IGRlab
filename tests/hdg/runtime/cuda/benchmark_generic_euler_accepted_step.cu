@@ -432,6 +432,19 @@ bool ParsePositiveInt(const std::string_view text, const int minimum,
   return true;
 }
 
+bool ParseAssemblyQuadratureOrder(const std::string_view text,
+                                  int& value) noexcept
+{
+  int parsed = 0;
+  const auto result = std::from_chars(
+      text.data(), text.data() + text.size(), parsed);
+  if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
+      !dg::hdg::generic::ValidAssemblyQuadratureOrder(parsed))
+    return false;
+  value = parsed;
+  return true;
+}
+
 bool ParsePositiveDouble(const std::string_view text, double& value) noexcept
 {
   double parsed = 0.0;
@@ -868,9 +881,9 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     {
       if (++index >= argc ||
           !ParsePositiveInt(argv[index], 1, options.order) ||
-          options.order > dg::hdg::generic::maximum_polynomial_order)
+          !dg::hdg::generic::PlanPolynomialShape(options.order).valid)
       {
-        error = "--order requires a supported order from 1 through 10";
+        error = "--order requires a positive order with representable local dimensions";
         return false;
       }
       continue;
@@ -1000,12 +1013,11 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     if (argument == "--igr-volume-quadrature-order")
     {
       if (++index >= argc ||
-          !ParsePositiveInt(argv[index], 1,
-                            options.igr_volume_assembly_quadrature_order) ||
-          options.igr_volume_assembly_quadrature_order > 14)
+          !ParseAssemblyQuadratureOrder(argv[index],
+                            options.igr_volume_assembly_quadrature_order))
       {
         error =
-            "--igr-volume-quadrature-order requires an integer in [1,14]";
+            "--igr-volume-quadrature-order requires a positive representable rule";
         return false;
       }
       continue;
@@ -1013,12 +1025,11 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     if (argument == "--igr-face-quadrature-order")
     {
       if (++index >= argc ||
-          !ParsePositiveInt(argv[index], 1,
-                            options.igr_face_assembly_quadrature_order) ||
-          options.igr_face_assembly_quadrature_order > 14)
+          !ParseAssemblyQuadratureOrder(argv[index],
+                            options.igr_face_assembly_quadrature_order))
       {
         error =
-            "--igr-face-quadrature-order requires an integer in [1,14]";
+            "--igr-face-quadrature-order requires a positive representable rule";
         return false;
       }
       continue;
@@ -1120,6 +1131,12 @@ bool ParseOptions(const int argc, char* argv[], Options& options,
     error = "the IGR quadrature options require --mode igr";
     return false;
   }
+  if (!dg::hdg::generic::PlanPolynomialShape(options.order,
+          options.regularization == RegularizationKind::igr).valid)
+  {
+    error = "--order exceeds the selected system's local index representation";
+    return false;
+  }
   if ((options.trace_policy ==
            CudaTracePolicyKind::native_element_schwarz_fp64 ||
        CudaTracePolicyUsesNativeElementMatrixFreeOperator(
@@ -1173,7 +1190,7 @@ void PrintUsage(const char* executable)
                "free-warp-coupled-sigma-jacobi10-fp64|native-element-"
                "schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-"
                "fp64]"
-               " [--order 1..10] [--mesh-n N]"
+               " [--order P] [--mesh-n N]"
                " [--domain-periods K] [--dt DT]"
                " [--time-atol ATOL --time-rtol RTOL]"
                " [--linear-rtol RTOL]"
@@ -1193,7 +1210,7 @@ void PrintUsage(const char* executable)
                "free-warp-coupled-sigma-jacobi10-fp64|native-element-"
                "schwarz-matrix-free-warp-robust-coupled-sigma-jacobi10-"
                "fp64]"
-               " [--order 1..10] [--mesh-n N]"
+               " [--order P] [--mesh-n N]"
                " [--domain-periods K] [--dt DT]"
                " [--time-atol ATOL --time-rtol RTOL]"
                " [--linear-rtol RTOL]"

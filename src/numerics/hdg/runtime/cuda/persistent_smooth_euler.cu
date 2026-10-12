@@ -6347,9 +6347,9 @@ __global__ void BorrowedEulerMatchedVolumeContractionKernel(
   // Each scalar test row has one owner, reusing the existing FP64 coefficient
   // stream.  These reads and products remain inside the timed volume kernel;
   // no extra launch, scratch allocation, or synchronization is required.
-  if(fp64_residual&&threadIdx.x<si)
+  if(fp64_residual)
+  for(int row=threadIdx.x;row<si;row+=blockDim.x)
   {
-    const int row=threadIdx.x;
     double value=0.0;
     for(int local_q=0;local_q<q_count;++local_q)
     {
@@ -9229,14 +9229,14 @@ bool LaunchTensorBorrowedEulerAssembly(const CudaDeviceView& v,
   if(arithmetic==ExperimentalVolumeArithmetic::invalid||
      residual_arithmetic==ExperimentalVolumeResidual::invalid)return false;
   const bool fp64_residual=residual_arithmetic==ExperimentalVolumeResidual::fp64;
-  if(s.elements<=0||s.order<generic::minimum_polynomial_order||
-     s.order>generic::maximum_polynomial_order)return false;
+  const auto order_shape=generic::PlanPolynomialShape(s.order,s.igr_active);
+  if(s.elements<=0||!order_shape.valid)return false;
   const int expected_components=s.igr_active?igr_interior_components:
       conserved_components;
   const int expected_trace_components=s.igr_active?igr_trace_components:
       conserved_components;
-  const int expected_scalar_dofs=(s.order+1)*(s.order+1);
-  const int expected_face_dofs=s.order+1;
+  const int expected_scalar_dofs=order_shape.scalar_interior_dofs;
+  const int expected_face_dofs=order_shape.scalar_face_dofs;
   const auto scratch=detail::PlanTensorVolumeScratch(
       s.interior_dofs,s.trace_dofs,s.volume_points,s.igr_active);
   const auto mma_work=detail::PlanTensorVolumeMmaWork(
@@ -9802,8 +9802,7 @@ bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
   if(engine!=generic::CudaEngineKind::tensor_core||
      !s.borrowed_host_inputs||s.elements<=0||s.interior_dofs<=0||
      s.trace_dofs<=0||
-     s.interior_dofs>generic_maximum_interior_dofs_per_element||
-     s.trace_dofs>generic_maximum_trace_dofs_per_element)
+     !generic::DenseLocalDimensionsFitInt(s.interior_dofs,s.trace_dofs))
     return false;
   constexpr int lu_panel_columns=8;
   const auto tiles8=[](const int count) noexcept
@@ -9867,8 +9866,7 @@ bool CudaLaunchCondenseRetainedLuRhs(
 {
   if(!s.borrowed_host_inputs||s.elements<=0||s.interior_dofs<=0||
      s.trace_dofs<=0||
-     s.interior_dofs>generic_maximum_interior_dofs_per_element||
-     s.trace_dofs>generic_maximum_trace_dofs_per_element||
+     !generic::DenseLocalDimensionsFitInt(s.interior_dofs,s.trace_dofs)||
      v.c==nullptr||v.f==nullptr||v.g==nullptr||v.lu==nullptr||
      v.pivots==nullptr||v.recovered_interior==nullptr||
      v.condensed_rhs==nullptr||v.status==nullptr)
@@ -10028,8 +10026,7 @@ bool CudaLaunchRecoverFromRetainedLu(
 {
   if(!s.borrowed_host_inputs||s.elements<=0||s.interior_dofs<=0||
      s.trace_dofs<=0||
-     s.interior_dofs>generic_maximum_interior_dofs_per_element||
-     s.trace_dofs>generic_maximum_trace_dofs_per_element||
+     !generic::DenseLocalDimensionsFitInt(s.interior_dofs,s.trace_dofs)||
      v.b==nullptr||v.f==nullptr||v.lu==nullptr||v.pivots==nullptr||
      v.trace_increment_local==nullptr||v.recovered_interior==nullptr||
      v.status==nullptr)

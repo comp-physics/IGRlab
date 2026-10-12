@@ -237,10 +237,11 @@ orders. This ordinary-DG suite does not establish high-order support for the
 separate DGSEM or HDG implementations; their actual kernel/storage paths must
 be extended and validated rather than merely changing study admission.
 
-The order-ten implementation extends DGSEM's packed and fused paths, including
-WMMA row tiling and bounded shared storage, and the dynamic generic HDG CPU,
-ordinary CUDA and tensor paths. The previous DGSEM research switch is no
-longer required. HDG's default IGR quadrature grows as `max(12, 2*p+2)` so its
+The order-ten implementation extends DGSEM's fused path with WMMA row tiling
+and bounded shared storage. Packed/unfused DGSEM and dynamic generic HDG
+use checked dimensions and allocation sizes rather than a chosen order
+ceiling. The previous DGSEM research switch is no longer required.
+HDG's default IGR quadrature grows as `max(12, 2*p+2)` so its
 high-order element matrices are not built from an underresolved rule.
 Existing low-order quadrature and single-site reduction paths are retained.
 The source changes and host checks do not establish native p10 readiness;

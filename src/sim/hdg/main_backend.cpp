@@ -659,10 +659,10 @@ std::string Validate(const HdgEulerMainRequest& request,
   {
     return "adaptive RODAS3 --dt-min must not exceed the final-time horizon";
   }
-  if (request.options.order < dg::hdg::generic::minimum_polynomial_order ||
-      request.options.order > dg::hdg::generic::maximum_polynomial_order)
+  if (!dg::hdg::generic::PlanPolynomialShape(request.options.order,
+          regularization.kind == RegularizationKind::igr).valid)
   {
-    return "generic HDG supports polynomial orders one through ten";
+    return "generic HDG requires a positive order with representable dense local dimensions";
   }
   if (request.options.ser_ref_levels < 0 ||
       request.options.par_ref_levels < 0)

@@ -790,8 +790,8 @@ bool NativeWorkspaceRequirementsPolicy() noexcept
 bool NativeElementSchwarzPatchRowsPolicy() noexcept
 {
   using namespace dg::hdg::runtime::cuda_w8a::detail;
-  for (int order = 1; order <= dg::hdg::generic::maximum_polynomial_order;
-       ++order)
+  // Shape-policy checks extend beyond the bounded numerical p10 fixtures.
+  for (int order = 1; order <= 12; ++order)
     if (!NativeTraceElementSchwarzPatchRowsSupported(16 * (order + 1)) ||
         !NativeTraceElementSchwarzPatchRowsSupported(20 * (order + 1)))
       return false;
@@ -799,8 +799,8 @@ bool NativeElementSchwarzPatchRowsPolicy() noexcept
       !NativeTraceElementSchwarzPatchRowsSupported(24) &&
       !NativeTraceElementSchwarzPatchRowsSupported(36) &&
       !NativeTraceElementSchwarzPatchRowsSupported(72) &&
-      !NativeTraceElementSchwarzPatchRowsSupported(192) &&
-      !NativeTraceElementSchwarzPatchRowsSupported(240) &&
+      !NativeTraceElementSchwarzPatchRowsSupported(
+          std::numeric_limits<int>::max()) &&
       !NativeTraceElementSchwarzPatchRowsSupported(219);
 }
 
@@ -3963,8 +3963,7 @@ constexpr bool ProductionTracePolicyResolutionPolicy() noexcept
   using dg::hdg::generic::CudaEngineKind;
   using dg::hdg::runtime::cuda_w8a::detail::CudaTraceSolverKind;
   using dg::hdg::runtime::cuda_w8a::detail::ResolveCudaTraceSolverKind;
-  for (int order = dg::hdg::generic::minimum_polynomial_order;
-       order <= dg::hdg::generic::maximum_polynomial_order; ++order)
+  for (int order = 1; order <= 12; ++order)
   {
     constexpr CudaTracePolicyKind expected_policy =
         CudaTracePolicyKind::
@@ -4061,7 +4060,11 @@ constexpr bool ProductionTracePolicyResolutionPolicy() noexcept
               CudaEngineKind::tensor_core, true, 0, 1,
               CudaTracePolicyKind::engine_default).valid &&
       !dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
-              CudaEngineKind::tensor_core, true, 1, 4,
+              CudaEngineKind::tensor_core, true, 1, 0,
+              CudaTracePolicyKind::engine_default).valid &&
+      !dg::hdg::runtime::cuda_w8a::ResolveCudaTracePolicy(
+              CudaEngineKind::tensor_core, true, 1,
+              std::numeric_limits<int>::max(),
               CudaTracePolicyKind::engine_default).valid;
 }
 

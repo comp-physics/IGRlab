@@ -247,8 +247,9 @@ int main(int argc, char* argv[])
 
   bool conventional = true;
   bool igr = true;
-  for (int order = dg::hdg::generic::minimum_polynomial_order;
-       order <= dg::hdg::generic::maximum_polynomial_order; ++order)
+  // Preserve the finite p1..p10 numerical regression cohort. This does not
+  // define the facade's admitted research orders.
+  for (int order = 1; order <= 10; ++order)
   {
     // Do not short-circuit collective runs after a prior failure: every rank
     // must enter the complete qualification matrix in the same order.

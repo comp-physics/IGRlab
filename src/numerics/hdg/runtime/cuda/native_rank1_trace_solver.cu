@@ -3100,7 +3100,7 @@ extern "C" bool LaunchNativeRankOneTraceSolve(
              schwarz.patch_rows)) ||
         (field_split &&
          (scalar_face_rows < generic::minimum_polynomial_order + 1 ||
-          scalar_face_rows > generic::maximum_polynomial_order + 1 ||
+          !generic::PlanPolynomialShape(scalar_face_rows - 1, true).valid ||
           euler_rows != 4 * schwarz.patch_rows / 5 ||
           selected_field_split_required > patch_capacity)) ||
         schwarz.true_rows != system.matrix.rows ||

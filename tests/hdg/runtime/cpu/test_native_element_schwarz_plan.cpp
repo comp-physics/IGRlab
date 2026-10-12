@@ -3,6 +3,7 @@
 
 #include <array>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 namespace
@@ -15,7 +16,11 @@ static_assert(NativeElementSchwarzIgrPatchRows(3) == 80);
 static_assert(NativeElementSchwarzIgrPatchRows(0) == 0);
 static_assert(NativeElementSchwarzIgrPatchRows(10) == 220);
 static_assert(NativeElementSchwarzPatchRows(10, false) == 176);
-static_assert(NativeElementSchwarzIgrPatchRows(11) == 0);
+static_assert(NativeElementSchwarzIgrPatchRows(11) == 240);
+static_assert(NativeElementSchwarzPatchRows(11, false) == 192);
+static_assert(NativeElementSchwarzIgrPatchRows(12) == 260);
+static_assert(NativeElementSchwarzIgrPatchRows(
+    std::numeric_limits<int>::max()) == 0);
 static_assert(NativeElementSchwarzIgrFieldSplitLayout(1).valid);
 static_assert(NativeElementSchwarzIgrFieldSplitLayout(1).euler_rows == 32);
 static_assert(NativeElementSchwarzIgrFieldSplitLayout(1).sigma_rows == 8);
@@ -45,13 +50,28 @@ static_assert(NativeElementSchwarzIgrFieldSplitLayout(10).required_doubles ==
               41096);
 static_assert(NativeElementSchwarzIgrFieldSplitLayout(10).warp_required_doubles ==
               41536);
-static_assert(!NativeElementSchwarzIgrFieldSplitLayout(11).valid);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(11).euler_rows == 192);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(11).sigma_rows == 48);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(11).required_doubles ==
+              48864);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(11).warp_required_doubles ==
+              49344);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(12).valid);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(12).euler_rows == 208);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(12).sigma_rows == 52);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(12).required_doubles ==
+              57304);
+static_assert(NativeElementSchwarzIgrFieldSplitLayout(12).warp_required_doubles ==
+              57824);
+static_assert(!NativeElementSchwarzIgrFieldSplitLayout(
+    std::numeric_limits<int>::max()).valid);
 static_assert(NativeElementSchwarzEncodeDof(7, -1) == -8);
 static_assert(NativeElementSchwarzDecodedDof(-8) == 7);
 
 bool CheckFieldSplitLayout()
 {
-  for (int order = 1; order <= native_element_schwarz_maximum_order; ++order)
+  // A bounded metadata cohort exercises padding and permutations beyond p10.
+  for (int order = 1; order <= 12; ++order)
   {
     const NativeElementSchwarzFieldSplitLayout layout =
         NativeElementSchwarzIgrFieldSplitLayout(order);

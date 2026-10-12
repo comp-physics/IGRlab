@@ -3961,10 +3961,11 @@ bool CheckCollectiveMismatchAndAtomicFailure()
   int rank = 0;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   BoundaryContext boundary{};
-  const int order = rank == 0
-      ? dg::hdg::generic::maximum_polynomial_order + 1 : 2;
-  ExactBorrowedEulerFields fields(mesh, order, initial, source);
-  EulerHdgRequest request = Request(mesh, order, boundary, fields);
+  // Construct only the valid p2 fixture. The unrepresentable request must be
+  // rejected collectively before any order-dependent FE space is allocated.
+  ExactBorrowedEulerFields fields(mesh, 2, initial, source);
+  EulerHdgRequest request = Request(mesh, 2, boundary, fields);
+  request.polynomial_order = rank == 0 ? std::numeric_limits<int>::max() : 2;
   const bool rejected = !ExecuteGenericEulerHdgCpu(request);
   const bool restart_rejected = !RestartGenericEulerHdgCpu(request);
   return All(rejected && restart_rejected);

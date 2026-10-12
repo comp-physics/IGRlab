@@ -70,22 +70,13 @@ inline constexpr int interior_dofs_per_element =
 inline constexpr int trace_dofs_per_element =
     faces_per_element * conserved_components * scalar_dofs_per_face;
 // Frozen W8A DTO/oracle maxima remain p1/p2.  Generic borrowed mode uses its
-// checked dynamic arena and the separate order-general IGR bounds below.
+// checked dynamic arena and the requested polynomial shape.
 inline constexpr int maximum_scalar_dofs_per_element = 9;
 inline constexpr int maximum_scalar_dofs_per_face = 3;
 inline constexpr int maximum_interior_dofs_per_element =
     conserved_components * maximum_scalar_dofs_per_element;
 inline constexpr int maximum_trace_dofs_per_element =
     faces_per_element * conserved_components * maximum_scalar_dofs_per_face;
-inline constexpr int generic_maximum_scalar_dofs_per_face =
-    generic::maximum_polynomial_order + 1;
-inline constexpr int generic_maximum_scalar_dofs_per_element =
-    generic_maximum_scalar_dofs_per_face * generic_maximum_scalar_dofs_per_face;
-inline constexpr int generic_maximum_interior_dofs_per_element =
-    igr_interior_components * generic_maximum_scalar_dofs_per_element;
-inline constexpr int generic_maximum_trace_dofs_per_element =
-    faces_per_element * igr_trace_components *
-        generic_maximum_scalar_dofs_per_face;
 inline constexpr int maximum_rank_elements = 36;
 inline constexpr int maximum_local_trace_dofs = 864;
 inline constexpr int maximum_true_trace_dofs = 864;
@@ -1923,8 +1914,7 @@ constexpr CudaTracePolicyDescriptor ResolveCudaTracePolicy(
   if (!generic::IsKnownCudaEngineKind(engine) ||
       !IsKnownCudaTracePolicyKind(requested_selection) ||
       (rank_count != 1 && rank_count != 2) ||
-      polynomial_order < generic::minimum_polynomial_order ||
-      polynomial_order > generic::maximum_polynomial_order)
+      !generic::PlanPolynomialShape(polynomial_order, igr_active).valid)
     return result;
 
   // Production selection is deliberately deterministic and fail closed.  A

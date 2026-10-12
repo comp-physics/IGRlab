@@ -1639,8 +1639,10 @@ private:
         std::isfinite(config.dt) && config.dt > 0.0 &&
         (config.use_borrowed_host_inputs ||
          std::memcmp(&config.dt, &cuda_w8a::fixed_dt, sizeof(double)) == 0) &&
-        config.order >= generic::minimum_polynomial_order &&
-        config.order <= generic::maximum_polynomial_order &&
+        generic::PlanPolynomialShape(config.order,
+            config.use_generic_numerical_policy &&
+            config.numerical_policy.stabilization.kind ==
+                generic::RegularizationKind::igr).valid &&
         config.mesh_n >= 0;
     long long local_face_measure = 0;
     long long local_physical_faces = 0;
