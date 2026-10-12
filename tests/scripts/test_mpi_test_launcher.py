@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify generated test commands without compiling or running executables."""
+"""Verify test launch commands with metadata and host-only process shims."""
 import argparse
 from contextlib import ExitStack
 import importlib.util
@@ -270,6 +270,131 @@ class ScriptSingleRankLauncher(unittest.TestCase):
                     self.assertEqual(opted_in, before)
                     self.assertEqual(before[:3], ['/selected MPI/bin/mpiexec', '-n', '2'])
                     self.assertEqual(before.count('/selected MPI/bin/mpiexec'), 1)
+
+
+class HDGProcessMPILauncher(unittest.TestCase):
+    """Run only Python stand-ins through the real CMake process fixture."""
+
+    def setUp(self):
+        if not ARGS.cmake:
+            self.skipTest('CMake is unavailable')
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.receipt = self.root / 'launcher.jsonl'
+        self.launcher = self.root / 'selected MPI/bin/mpiexec'
+        self.launcher.parent.mkdir(parents=True)
+        self.launcher.write_text('#!' + sys.executable + '\n' + '''
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+with Path(os.environ['FIXTURE_RECEIPT']).open('a') as stream:
+    stream.write(json.dumps({'argv': sys.argv[1:],
+                            'output': os.environ['DG_IGR_VTK_PREFIX_PATH'],
+                            'slurm_job_id': os.environ.get('SLURM_JOB_ID')}) + '\\n')
+if os.environ.get('FIXTURE_LAUNCHER_FAIL'):
+    print('fixture MPI launcher failed', file=sys.stderr)
+    sys.exit(9)
+assert sys.argv[1:3] == ['-n', os.environ['FIXTURE_RANKS']]
+assert sys.argv[3] == '--fixture-pref'
+assert sys.argv[5] == '--fixture-post'
+sys.exit(subprocess.run([sys.argv[4], *sys.argv[6:]]).returncode)
+''')
+        self.launcher.chmod(0o755)
+        self.application = self.root / 'application stand-in'
+        self.application.write_text('#!' + sys.executable + '\n' + '''
+import os
+import sys
+if os.environ.get('FIXTURE_REJECTION'):
+    print('fixture selected rejection')
+    sys.exit(7)
+print('[hdg-main] status=Success step=2 time=0.1 time_treatment=backward-euler')
+''')
+        self.application.chmod(0o755)
+        self.output = self.root / 'output with spaces'
+        self.mesh = self.root / 'mesh with spaces.mesh'
+        self.mesh.touch()
+
+    def invoke(self, *, ranks=1, device='cpu', repeat=False, rejection=False,
+               launcher_failure=False):
+        self.receipt.unlink(missing_ok=True)
+        definitions = {
+            'HDG_MAIN_EXECUTABLE': self.application,
+            'HDG_MAIN_OUTPUT': self.output,
+            'HDG_MAIN_MESH': self.mesh,
+            'HDG_MAIN_RANKS': ranks,
+            'HDG_MAIN_DEVICE': device,
+            'HDG_MAIN_MPIEXEC': self.launcher,
+            'HDG_MAIN_NUMPROC_FLAG': '-n',
+            'HDG_MAIN_MPIEXEC_PREFLAGS': '--fixture-pref',
+            'HDG_MAIN_MPIEXEC_POSTFLAGS': '--fixture-post',
+            'HDG_MAIN_NO_VTK': 'OFF' if repeat else 'ON',
+            'HDG_MAIN_VERIFY_REPEATABLE_OUTPUT': 'ON' if repeat else 'OFF',
+        }
+        if rejection:
+            definitions['HDG_MAIN_EXPECT_REJECTION_PATTERN'] = 'fixture selected rejection'
+        env = os.environ.copy()
+        env.update(FIXTURE_RECEIPT=str(self.receipt), FIXTURE_RANKS=str(ranks),
+                   SLURM_JOB_ID='fixture-allocation')
+        for key in ('FIXTURE_REJECTION', 'FIXTURE_LAUNCHER_FAIL'):
+            env.pop(key, None)
+        if rejection:
+            env['FIXTURE_REJECTION'] = '1'
+        if launcher_failure:
+            env['FIXTURE_LAUNCHER_FAIL'] = '1'
+        result = subprocess.run(
+            [ARGS.cmake, *[f'-D{key}={value}' for key, value in definitions.items()],
+             '-P', str(SOURCE / 'tests/hdg/main_backend/test_cuda_generic_process.cmake')],
+            env=env, text=True, capture_output=True, timeout=10)
+        records = [json.loads(line) for line in self.receipt.read_text().splitlines()]
+        return result, records
+
+    def assert_command(self, record, *, ranks=1, device='cpu', repeat=False):
+        self.assertEqual(record['argv'], [
+            '-n', str(ranks), '--fixture-pref', str(self.application), '--fixture-post',
+            '--discretization', 'hdg', '--device', device,
+            '--regularization', 'none', '--mesh', str(self.mesh), '--order', '1',
+            '--serial-refine', '0', '--parallel-refine', '0',
+            '--time-step', '0.05', '--t-final', '0.10', '--no-glvis',
+            '--hdg-cuda-engine', 'ordinary', '--time-integrator', 'backward-euler',
+            *(['--time-step-save', '0.05', '--vtk_save'] if repeat else ['--no-vtk_save'])])
+        self.assertEqual(record['slurm_job_id'], 'fixture-allocation')
+
+    def test_rank_one_cpu_uses_selected_mpi_and_preserves_arguments(self):
+        result, records = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(records), 1)
+        self.assert_command(records[0])
+        self.assertEqual(records[0]['output'], str(self.output))
+
+    def test_cuda_and_multi_rank_rejection_paths_use_one_launcher(self):
+        for device, ranks in (('cuda', 1), ('cpu', 2), ('cuda', 2)):
+            with self.subTest(device=device, ranks=ranks):
+                result, records = self.invoke(device=device, ranks=ranks, rejection=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assert_command(records[0], device=device, ranks=ranks)
+
+    def test_exact_repeat_uses_same_mpi_command_and_separate_output(self):
+        result, records = self.invoke(repeat=True)
+        # The stand-in deliberately publishes no fields. Both launch checks
+        # succeed before the unchanged numerical-output gate rejects it.
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('missing CUDA HDG PVD series', result.stderr)
+        self.assertEqual(len(records), 2)
+        for record in records:
+            self.assert_command(record, repeat=True)
+        self.assertEqual([record['output'] for record in records],
+                         [str(self.output), str(self.output) + '-exact-repeat'])
+
+    def test_mpi_launcher_failure_propagates(self):
+        result, records = self.invoke(launcher_failure=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('generic HDG main execution failed: 9', result.stderr)
+        self.assertIn('fixture MPI launcher failed', result.stderr)
+        self.assertEqual(len(records), 1)
 
 
 if __name__ == '__main__':
