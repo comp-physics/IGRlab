@@ -546,7 +546,9 @@ inline void EntropyConservativeFluxDotN(const Vector& ul,
   flux.SetSize(num_eq);
   flux = 0.0;
 
-  Vector f_dir(num_eq);
+  real_t f_dir_data[4];
+  Vector f_dir(f_dir_data, std::min(num_eq, 4));
+  f_dir.SetSize(num_eq);
   for (int d = 0; d < dim; ++d)
   {
     EntropyConservativeFlux(ul, ur, d, gamma, type, f_dir, sigma_l, sigma_r);
@@ -592,10 +594,11 @@ inline void WintersDissipation1D(const Vector& ul,
   const double v_minus_c = v_avg - c_bar * n1;
   const double v_plus_c = v_avg + c_bar * n1;
 
-  Vector w_l(3), w_r(3);
+  real_t w_l_data[3], w_r_data[3], w_jump_data[3];
+  Vector w_l(w_l_data, 3), w_r(w_r_data, 3);
   EulerEntropyVariables(ul, /*dim=*/1, gamma, sigma_l, w_l);
   EulerEntropyVariables(ur, /*dim=*/1, gamma, sigma_r, w_r);
-  Vector w_jump(3);
+  Vector w_jump(w_jump_data, 3);
   w_jump = w_r;
   w_jump -= w_l;
 
@@ -681,10 +684,11 @@ inline void WintersDissipation2D(const Vector& ul,
   const double v1_tan = v1_avg - v_avg_normal * nx;
   const double v2_tan = v2_avg - v_avg_normal * ny;
 
-  Vector w_l(4), w_r(4);
+  real_t w_l_data[4], w_r_data[4], w_jump_data[4];
+  Vector w_l(w_l_data, 4), w_r(w_r_data, 4);
   EulerEntropyVariables(ul, /*dim=*/2, gamma, sigma_l, w_l);
   EulerEntropyVariables(ur, /*dim=*/2, gamma, sigma_r, w_r);
-  Vector w_jump(4);
+  Vector w_jump(w_jump_data, 4);
   w_jump = w_r;
   w_jump -= w_l;
 
