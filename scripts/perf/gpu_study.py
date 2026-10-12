@@ -1070,6 +1070,8 @@ def report(root):
                 if partial.exists():
                     result['profile_partial'] = read_json(partial)
     suite = read_json(root / 'suite.json')
+    if sha(root / 'suite.json') != plan['suite_sha256']:
+        raise RuntimeError('frozen workload suite changed')
     timing_cases = (result['timings'] or {}).get('cases', {})
     profile_cases = (result['profiles'] or result.get('profile_partial') or {}).get('cases', {})
     coverage = []
@@ -1087,6 +1089,8 @@ def report(root):
         timing = timing_cases.get(name, {})
         captured = profile_cases.get(name, {})
         member_profiles = {member: captured.get(member, {}).get('status', 'pending') for member in MEMBERS}
+        if device == 'cpu':
+            member_profiles = dict.fromkeys(MEMBERS, 'not_applicable')
         profile_status = ('not_applicable' if device == 'cpu' else
                           'complete' if all(value == 'complete' for value in member_profiles.values()) else
                           'partial' if captured else 'pending')

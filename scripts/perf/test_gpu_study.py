@@ -303,6 +303,7 @@ class StudyProtocol(unittest.TestCase):
         self.assertEqual(set(cases), {'cpu', 'tensor', 'hdg'})
         self.assertEqual((cases['cpu']['timing_status'], cases['cpu']['profile_status']),
                          ('measured', 'not_applicable'))
+        self.assertEqual(cases['cpu']['member_profile_status'], dict.fromkeys(study.MEMBERS, 'not_applicable'))
         self.assertEqual(cases['cpu']['timing_scope'], 'CPU solver elapsed time')
         self.assertEqual(cases['cpu']['timing_scope_source'], 'observation')
         self.assertEqual((cases['tensor']['timing_status'], cases['tensor']['profile_status']), ('pending', 'partial'))
@@ -325,6 +326,9 @@ class StudyProtocol(unittest.TestCase):
         self.assertEqual((case['timing_status'], case['profile_status']), ('pending', 'pending'))
         self.assertEqual(case['engine'], 'not-recorded')
         self.assertEqual(case['timing_scope'], 'accepted-step median per process')
+        study.write_json(self.root / 'suite.json', {'cases': []})
+        with self.assertRaisesRegex(RuntimeError, 'frozen workload suite changed'):
+            study.report(self.root)
 
     def test_profile_resume_preserves_timings_and_rejects_duplicate_job(self):
         output = self.finish_timings()
