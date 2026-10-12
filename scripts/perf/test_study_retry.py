@@ -146,13 +146,41 @@ class RetryTests(unittest.TestCase):
         self.assertTrue(all(command[0] in ('squeue', 'sacct') for command in self.calls))
 
     def test_legacy_cuda_executor_set_remains_eligible_for_fresh_retry(self):
-        self.plan['executor_sha256'].pop('study_admit.py')
-        (self.old / 'executor/study_admit.py').unlink()
+        for name in set(study.EXECUTOR_FILES) - set(study.LEGACY_EXECUTOR_FILES):
+            self.plan['executor_sha256'].pop(name)
+            (self.old / 'executor' / name).unlink()
         self.save_plan()
         plan = self.retry()
         self.assertEqual(set(plan['executor_sha256']), set(study.EXECUTOR_FILES))
         self.assertEqual(plan['retry_origin']['executor_sha256'], self.plan['executor_sha256'])
         self.assertNotIn('cpu_builds', plan)
+
+    def test_pre_import_cpu_capable_executor_remains_eligible_for_retry(self):
+        for name in set(study.EXECUTOR_FILES) - set(study.PRE_IMPORT_EXECUTOR_FILES):
+            self.plan['executor_sha256'].pop(name)
+            (self.old / 'executor' / name).unlink()
+        self.save_plan()
+        plan = self.retry()
+        self.assertEqual(set(plan['executor_sha256']), set(study.EXECUTOR_FILES))
+        self.assertEqual(plan['retry_origin']['executor_sha256'], self.plan['executor_sha256'])
+
+    def test_imported_canonical_test_receipts_retry_without_validation_job_substitution(self):
+        record = self.old / 'actual-test-result.json'
+        record.write_text('sealed original canonical outcome')
+        self.plan['import_origin'] = {'artifact_sha256': {str(record): study.sha(record)}}
+        for member in study.MEMBERS:
+            self.plan['builds'][member].update(origin=study.study_import.ORIGIN,
+                                              build_job_id='11', test_result=str(record))
+            receipt = self.state['builds'][member]
+            receipt.pop('validation_job_id', None)
+            receipt.update(origin=study.study_import.ORIGIN, test_result=str(record))
+        self.save_plan()
+        self.save_state()
+        with patch.object(study.study_import, 'completed_records') as imported:
+            plan = self.retry()
+        self.assertEqual(imported.call_count, 2)
+        self.assertEqual(plan['import_origin'], self.plan['import_origin'])
+        self.assertNotIn('validation_job_id', study.read_json(self.new / 'state.json')['builds']['baseline'])
 
     def test_retry_retains_cpu_build_receipts_and_new_cpu_binary_hash_without_recompiling(self):
         cpu_app = self.cache / 'cpu-app'

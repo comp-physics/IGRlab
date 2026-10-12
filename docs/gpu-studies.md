@@ -59,6 +59,67 @@ submitting jobs. Submit that prepared study with `resume --stage builds`.
 Preparation performs Git/file operations and `build.sh --print-plan`; it does
 not compile on the login node.
 
+Existing canonical builds can be imported without rebuilding or moving their
+source/output directories. First run the original source's canonical
+`--tests-only` command through `scripts/build/test_result_receipt.py` in the
+owned compute allocation, using the prebuilt receipt at
+`APP_BUILD/igrlab-prebuilt-validation-v1.json`. The wrapper retains the actual
+command, selected CTest graph, individual Passed outcomes, exact logs,
+pre/post artifact identity and live allocation identity. A prebuilt receipt or
+a successful scheduler exit alone is insufficient.
+
+Create an absolute-path artifact manifest:
+
+```json
+{
+  "schema_version": 1,
+  "builds": {
+    "baseline": {
+      "build_request": "/absolute/site/pace/requests/build.BASELINE.json",
+      "build_job_id": "REAL_BUILD_JOB_ID",
+      "test_result": "/absolute/validation-results/BASELINE_ATTEMPT/result.json"
+    },
+    "candidate": {
+      "build_request": "/absolute/site/pace/requests/build.CANDIDATE.json",
+      "build_job_id": "REAL_BUILD_JOB_ID",
+      "test_result": "/absolute/validation-results/CANDIDATE_ATTEMPT/result.json"
+    }
+  }
+}
+```
+
+```bash
+./perf.sh import --artifacts /absolute/artifacts.json \
+  --suite scripts/perf/suites/pace-full-gpu-solvers.json \
+  --run-dir /absolute/scratch/studies/imported-pair-01 --prepare-only
+```
+
+Import derives the exact roots/features from the real public requests and each
+frozen source's `--print-plan`. Sources must already be standalone Git checkouts
+with the clean pinned MFEM submodule; shared clones with alternates are rejected.
+It pins selected executable bytes and the original test records. The measured
+worker repeats canonical prebuilt and dependency-binding admission before
+using those artifacts. Passed tests must cover the suite's correctness regex;
+filtered graph backtrace numbering does not affect test command identity.
+No validation job ID is invented and no build/test command is rerun by import.
+
+`--prepare-only` is allowed inside the interactive allocation. Run the new
+frozen executor's `worker --stage timings --run-dir NEW_RUN`, then
+`worker --stage profiles --run-dir NEW_RUN` in that same owned free A100 shell.
+Otherwise import schedules only timing/profiling stages from the login node;
+prepared imports use `resume --stage timings`, never `resume --stage builds`.
+A live test allocation must be the same owned interactive job at measurement.
+A later terminal allocation state, including TIMEOUT after the sealed tests,
+is retained honestly and is separate from the earlier Passed test outcomes.
+Missing, interrupted or modified final receipts never qualify. Retain all
+referenced source, artifact and result paths for the life of the study.
+
+For CPU HDG, add a `cpu_builds` object with the same baseline/candidate record
+shape, pointing to genuine CPU-only builds and their actual passed test
+results. Each CPU member must use the exact same source snapshot as its CUDA
+member. The existing CPU admission selects its concrete MPI/runtime prefixes;
+the CUDA HDG facade is never substituted for a CPU build.
+
 For a focused two-case study, shorter allocations can fit smaller scheduler
 windows:
 

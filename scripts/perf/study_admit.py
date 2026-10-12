@@ -46,6 +46,12 @@ def run(argv, env=None):
 
 def completed_jobs(plan, receipt):
     """Bind successful owned accounting rows to the real public submission."""
+    if plan.get('origin') == 'existing-canonical-test-result':
+        import study_import
+        observed = study_import.completed_records(plan, receipt)
+        return {key: observed[key] for key in ('job_ids', 'request', 'request_sha256')} | {
+            'test_result': plan['test_result'], 'test_result_sha256': plan['test_result_sha256'],
+            'scope': observed['test_execution_scope']}
     require(receipt.get('success') is True and receipt.get('returncode') == 0,
             'a successful real canonical submission receipt is required')
     if plan.get('origin') != 'existing-canonical-request':

@@ -29,14 +29,16 @@ import uuid
 sys.dont_write_bytecode = True
 import study_build
 import study_admit
+import study_import
 import study_profiles
 import study_workloads
 
 SCHEMA = 1
 MEMBERS = ('baseline', 'candidate')
-EXECUTOR_FILES = ('gpu_study.py', 'study_build.py', 'study_profiles.py',
+PRE_IMPORT_EXECUTOR_FILES = ('gpu_study.py', 'study_build.py', 'study_profiles.py',
                   'study_workloads.py', 'pace_runtime.sh', 'study_admit.py')
-LEGACY_EXECUTOR_FILES = tuple(name for name in EXECUTOR_FILES if name != 'study_admit.py')
+LEGACY_EXECUTOR_FILES = tuple(name for name in PRE_IMPORT_EXECUTOR_FILES if name != 'study_admit.py')
+EXECUTOR_FILES = PRE_IMPORT_EXECUTOR_FILES + ('study_import.py', 'canonical_test_result_receipt.py')
 CPU_CORRECTNESS_REGEX = ('^(hdg_generic_euler_cpu_rank1|'
                         'dg_igr_hdg_main_backend_cpu_igr_p(1|3)_rank1_cfl|'
                         'dg_igr_hdg_main_backend_igr_vtk_cpu_rank1|'
@@ -223,6 +225,9 @@ def verify(root, *, binaries=False):
         study_build.verify_source(identity)
     if sha(root / 'suite.json') != plan['suite_sha256']:
         raise RuntimeError('frozen workload suite changed')
+    for path, expected in plan.get('import_origin', {}).get('artifact_sha256', {}).items():
+        if study_import.sha(path) != expected:
+            raise RuntimeError(f'imported canonical record changed: {path}')
     for path, expected in plan.get('retry_origin', {}).get('build_artifact_sha256', {}).items():
         artifact = absolute(path)
         if not artifact.is_file() or sha(artifact) != expected:
@@ -243,6 +248,10 @@ def verify(root, *, binaries=False):
                 if (not Path(path).is_symlink() or os.readlink(path) != expected['link'] or
                         str(Path(path).resolve(strict=True)) != expected['target']):
                     raise RuntimeError(f'admitted CPU artifact link changed: {path}')
+        for path, expected in admission.get('import_artifact_links', {}).items():
+            if (not Path(path).is_symlink() or os.readlink(path) != expected['link'] or
+                    str(Path(path).resolve(strict=True)) != expected['target']):
+                raise RuntimeError(f'imported canonical artifact link changed: {path}')
     if (root / 'state.json').exists():
         for attempt in read_json(root / 'state.json')['attempts']:
             if attempt['status'] not in ('timings_complete', 'analysis_complete'):
@@ -297,6 +306,76 @@ def cached_source(identity, cache):
     return reused
 
 
+def freeze_executor(root):
+    (root / 'executor').mkdir()
+    for name in EXECUTOR_FILES:
+        path = Path(__file__).parent / name
+        if name == 'canonical_test_result_receipt.py' and not path.exists():
+            path = Path(__file__).parents[1] / 'build/test_result_receipt.py'
+        shutil.copy2(path, root / 'executor' / name)
+
+
+def import_existing(args):
+    """Freeze a study around genuine same-path builds and actual passed tests."""
+    if not args.prepare_only and os.environ.get('SLURM_JOB_ID'):
+        raise RuntimeError('use import --prepare-only inside an interactive allocation; submit stages from the login node')
+    suite = study_workloads.load_suite(args.suite)
+    if not selected_cases(suite):
+        raise ValueError('select at least one workload')
+    plans, receipts, records, artifacts = study_import.inspect_manifest(
+        args.artifacts, suite['correctness_regex'], CPU_CORRECTNESS_REGEX)
+    validate_cuda_profile_cases(suite, cpu_available='cpu_builds' in plans)
+    builds = plans['builds']
+    sources = {member: builds[member]['source'] for member in MEMBERS}
+    configs = [sha(Path(identity['source_snapshot']) / 'cmake/sites/pace.json') for identity in sources.values()]
+    if configs[0] != configs[1]:
+        raise ValueError('imported members must use the same PACE dependency policy')
+    root = absolute(args.run_dir).resolve()
+    protected = [Path(__file__).resolve().parents[2]]
+    protected += [Path(identity['source_snapshot']) for identity in sources.values()]
+    protected += [Path(build[key]) for group in plans.values() for build in group.values()
+                  for key in ('app_build', 'app_install', 'mfem_source', 'mfem_build', 'mfem_install', 'spack_env')]
+    protected += [Path(build['test_result']).parent for group in plans.values() for build in group.values()]
+    if root.exists() or any(root.is_relative_to(path.resolve()) for path in protected):
+        raise ValueError('import requires a new study directory outside existing source/build/result paths')
+    for group in plans.values():
+        for build in group.values():
+            artifacts.update(build['import_artifact_sha256'])
+    for group, builds_in_group in plans.items():
+        names = sorted({case['binary'] for case in selected_cases(suite)
+                        if group == 'builds' or case.get('parameters', {}).get('device') == 'cpu'})
+        for build in builds_in_group.values():
+            artifacts.update(study_import.selected_binaries(build, names))
+    root.mkdir(parents=True, exist_ok=False)
+    freeze_executor(root)
+    write_json(root / 'suite.json', suite, exclusive=True)
+    plan = {'schema_version': SCHEMA, 'site': 'pace', 'run_dir': str(root),
+            'site_root': builds['candidate']['site_root'], 'spack_root': builds['candidate']['spack_root'],
+            'cache_root': str(root / 'unused-cache'), 'sources': sources, **plans,
+            'suite_sha256': sha(root / 'suite.json'),
+            'wall_time_limits': {stage: wall_time(getattr(args, stage + '_time', '01:00:00'))
+                                 for stage in ('timings', 'profiles')},
+            'executor_sha256': {name: sha(root / 'executor' / name) for name in EXECUTOR_FILES},
+            'import_origin': {'scope': 'existing canonical artifacts and sealed Passed test outcomes; no build or test rerun',
+                              'artifact_sha256': artifacts,
+                              'scheduler_records': {key: {name: value for name, value in record.items() if name in
+                                                   ('build_accounting', 'test_allocation_accounting', 'test_execution_scope')}
+                                                    for key, record in records.items()}},
+            'created_unix_seconds': time.time()}
+    plan['plan_sha256'] = digest(plan)
+    write_json(root / 'plan.json', plan, exclusive=True)
+    state = {'schema_version': SCHEMA, **receipts, 'build_attempts': [value for group in receipts.values()
+                                                                 for value in group.values()],
+             'jobs': [], 'attempts': []}
+    write_json(root / 'state.json', state, exclusive=True)
+    print(root / 'plan.json')
+    if not args.prepare_only:
+        with locked(root):
+            job = submit_stage(root, 'timings')
+            submit_stage(root, 'profiles', [job])
+    return root, plan
+
+
 def create(args):
     limits = {stage: wall_time(getattr(args, stage + '_time', '01:00:00'))
               for stage in ('timings', 'profiles')}
@@ -323,9 +402,7 @@ def create(args):
     cpu_required = needs_cpu_build(suite)
     validate_cuda_profile_cases(suite, cpu_available=cpu_required)
     root.mkdir(parents=True, exist_ok=False)
-    (root / 'executor').mkdir()
-    for name in EXECUTOR_FILES:
-        shutil.copy2(Path(__file__).parent / name, root / 'executor' / name)
+    freeze_executor(root)
     write_json(root / 'suite.json', suite, exclusive=True)
     sources = {}
     builds = {}
@@ -539,8 +616,12 @@ def allocation():
 
 def checked_builds(root):
     state = read_json(root / 'state.json')
-    ids = [str(state['builds'][member]['validation_job_id']) for member in MEMBERS]
     plan = load_plan(root)
+    if plan.get('import_origin'):
+        for group, member, build in build_entries(plan):
+            study_import.completed_records(build, state[group][member])
+        return
+    ids = [str(state['builds'][member]['validation_job_id']) for member in MEMBERS]
     if 'cpu_builds' in plan:
         if set(state.get('cpu_builds', {})) != set(MEMBERS):
             raise RuntimeError('both canonical CPU correctness jobs must be recorded before measurement')
@@ -569,6 +650,16 @@ def admit(root, plan, suite):
     checker = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(checker)
     binding_records = {}
+    imported = {}
+    imported_links = {}
+    if plan.get('import_origin'):
+        state = read_json(root / 'state.json')
+        for member in MEMBERS:
+            record = study_import.completed_records(plan['builds'][member], state['builds'][member], full=True)
+            artifacts.update(record['artifact_sha256'])
+            imported_links.update(record['artifact_links'])
+            imported[member] = {name: record[name] for name in
+                                ('build_accounting', 'test_allocation_accounting', 'test_execution_scope')}
     for member in MEMBERS:
         build = plan['builds'][member]
         app_build = Path(build['app_build'])
@@ -622,6 +713,12 @@ def admit(root, plan, suite):
     value = {'schema_version': SCHEMA, 'plan_sha256': plan['plan_sha256'],
              'binaries': binaries, 'artifact_sha256': artifacts,
              'spack_locations': locations, 'dependency_bindings': binding_records}
+    if imported:
+        # Runtime accounting changes after tests do not change admitted bytes.
+        value['imported_test_results'] = {member: {'path': plan['builds'][member]['test_result'],
+                                          'sha256': plan['builds'][member]['test_result_sha256']}
+                                         for member in MEMBERS}
+        value['import_artifact_links'] = imported_links
     if 'cpu_builds' in plan:
         state = read_json(root / 'state.json')
         names = sorted({case['binary'] for case in selected_cases(suite)
@@ -962,6 +1059,8 @@ def resume(args):
     with locked(root):
         plan = verify(root, binaries=(root / 'admission.json').exists())
         if args.stage == 'builds':
+            if plan.get('import_origin'):
+                raise RuntimeError('imported studies never submit builds; import fresh genuine records instead')
             submit_pipeline(root, plan)
             return
         state = read_json(root / 'state.json')
@@ -1101,7 +1200,8 @@ def retry(args):
     with locked(old):
         plan = verify(old, binaries=(old / 'admission.json').exists())
         state = read_json(old / 'state.json')
-        if set(plan['executor_sha256']) not in (set(EXECUTOR_FILES), set(LEGACY_EXECUTOR_FILES)):
+        if set(plan['executor_sha256']) not in (set(EXECUTOR_FILES), set(PRE_IMPORT_EXECUTOR_FILES),
+                                               set(LEGACY_EXECUTOR_FILES)):
             raise RuntimeError('old run lacks the complete frozen executor identity')
         old_suite = study_workloads.load_suite(old / 'suite.json')
         suite_path = getattr(args, 'suite', None)
@@ -1207,9 +1307,7 @@ def retry(args):
         if profiles_only:
             new_plan['timing_reuse'] = {**retained, 'interactive_scheduler_admission': interactive}
         root.mkdir(parents=True, exist_ok=False)
-        (root / 'executor').mkdir()
-        for name in EXECUTOR_FILES:
-            shutil.copy2(Path(__file__).parent / name, root / 'executor' / name)
+        freeze_executor(root)
         if profiles_only or suite_path is None and cases is None:
             shutil.copy2(suite_path if suite_path is not None else old / 'suite.json', root / 'suite.json')
         else:
@@ -1297,13 +1395,16 @@ def report(root):
                              ('source_revision', 'source_tree', 'source_status', 'source_fingerprint')}
                           for m in MEMBERS}, 'attempts': state['attempts'], 'timings': None, 'profiles': None}
     result['validation_execution'] = {
-        member: ('run-only' if plan.get('builds', {}).get(member, {}).get('run_only_validation') is True
+        member: ('imported-sealed-Passed-outcomes' if plan.get('import_origin') else
+                 'run-only' if plan.get('builds', {}).get(member, {}).get('run_only_validation') is True
                  else 'legacy-driver' if plan.get('builds', {}).get(member, {}).get('run_only_validation') is False
                  else 'not-recorded') for member in MEMBERS}
     if 'cpu_builds' in plan:
         result['validation_execution'].update({
             'cpu-' + member: ('run-only-prebuilt' if plan['cpu_builds'][member].get('run_only_validation')
                               else 'not-recorded') for member in MEMBERS})
+    if plan.get('import_origin'):
+        result['canonical_import'] = plan['import_origin']
     result['timing_provenance'] = plan.get('timing_reuse', {'scope': 'fresh timing observations in this run'})
     for stage in ('timings', 'profiles'):
         attempt = completed(state, stage)
@@ -1481,6 +1582,13 @@ def main(argv=None):
     submit_parser.add_argument('--validation-time', type=lambda value: wall_time(value, maximum_hours=2, minimum_minutes=1),
                                help='optional canonical correctness allocation HH:MM:SS, 1 minute to 2 hours')
     submit_parser.add_argument('--prepare-only', action='store_true', help='freeze and inspect plans without submitting jobs')
+    p = sub.add_parser('import', help='admit existing canonical builds and real sealed test outcomes without rebuilds')
+    p.add_argument('--artifacts', required=True, help='absolute JSON manifest of canonical requests, build IDs and test results')
+    p.add_argument('--suite', required=True)
+    p.add_argument('--run-dir', required=True, help='new absolute scratch directory; original artifacts stay in place')
+    p.add_argument('--timings-time', type=wall_time, default='01:00:00')
+    p.add_argument('--profiles-time', type=wall_time, default='01:00:00')
+    p.add_argument('--prepare-only', action='store_true', help='freeze records without submitting timing/profiling jobs')
     p = sub.add_parser('retry', help='freeze a new measurement executor using verified completed builds/correctness')
     p.add_argument('--from-run', required=True)
     p.add_argument('--run-dir', required=True, help='new absolute scratch directory')
@@ -1504,6 +1612,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == 'submit':
         submit(args)
+    elif args.command == 'import':
+        import_existing(args)
     elif args.command == 'retry':
         retry(args)
     elif args.command == 'worker':
