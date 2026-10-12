@@ -23,7 +23,7 @@
 #include "numerics/limiters/zhang_shu.hpp"
 #include "numerics/timestepping/stage_aware_operator.hpp"
 #include "utils/diagnostics/non_finite.hpp"
-#include "utils/profiling/observability.hpp"
+#include "utils/profiling/nvtx.hpp"
 
 namespace dg_sim
 {

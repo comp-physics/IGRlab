@@ -4,7 +4,7 @@
 #include "numerics/dg/DGHyperbolicConservationLaws.hpp"
 #include "utils/diagnostics/euler_admissibility.hpp"
 #include "utils/diagnostics/non_finite.hpp"
-#include "utils/profiling/observability.hpp"
+#include "utils/profiling/nvtx.hpp"
 #include "numerics/limiters/limiters.hpp" // ApplyZhangShuPositivityLimiter, etc.
 #include <algorithm>
 #include <cmath>

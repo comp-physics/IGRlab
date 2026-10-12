@@ -43,6 +43,7 @@
 #include "sim/wiring/dgsem_flux_config.hpp"
 #include "sim/wiring/igr_physics.hpp"
 #include "utils/profiling/observability.hpp"
+#include "utils/profiling/nvtx.hpp"
 
 namespace dg_sim
 {
