@@ -215,6 +215,40 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
     LABELS "igr;exact-face;parity;cuda" TIMEOUT 120 RUN_SERIAL TRUE)
 endif()
 
+add_executable(dg_igr_face_density_host_cache_test
+  test_igr_face_density_host_cache.cpp)
+target_link_libraries(dg_igr_face_density_host_cache_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_face_density_host_cache_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include)
+# Keep CXX in CUDA builds: __CUDACC__ would change the original host oracle.
+set_source_files_properties(test_igr_face_density_host_cache.cpp PROPERTIES
+  LANGUAGE CXX)
+set(_igrlab_host_face_cache_command dg_igr_face_density_host_cache_test)
+if(MPIEXEC_EXECUTABLE)
+  if(NOT MPIEXEC_NUMPROC_FLAG)
+    message(FATAL_ERROR "Host face-density MPI launcher requires MPIEXEC_NUMPROC_FLAG.")
+  endif()
+  set(_igrlab_host_face_cache_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_face_density_host_cache_test> ${MPIEXEC_POSTFLAGS})
+  add_test(NAME dg_igr_face_density_host_cache_cpu_mpi4
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_face_density_host_cache_test> ${MPIEXEC_POSTFLAGS} cpu)
+  set_tests_properties(dg_igr_face_density_host_cache_cpu_mpi4 PROPERTIES
+    LABELS "igr;exact-face;cache;parity;cpu;mpi" TIMEOUT 180
+    RUN_SERIAL TRUE PROCESSORS 4)
+endif()
+add_test(NAME dg_igr_face_density_host_cache_cpu
+  COMMAND ${_igrlab_host_face_cache_command} cpu)
+set_tests_properties(dg_igr_face_density_host_cache_cpu PROPERTIES
+  LABELS "igr;exact-face;cache;parity;cpu" TIMEOUT 120)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  add_test(NAME dg_igr_face_density_host_cache_cuda
+    COMMAND ${_igrlab_host_face_cache_command} cuda)
+  set_tests_properties(dg_igr_face_density_host_cache_cuda PROPERTIES
+    LABELS "igr;exact-face;cache;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
+
 add_executable(dg_igr_euler_admissibility_cache_test
   test_euler_admissibility_cache.cpp)
 target_link_libraries(dg_igr_euler_admissibility_cache_test PRIVATE igr_mfem mfem)

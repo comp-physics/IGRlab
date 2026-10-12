@@ -10,12 +10,15 @@
 #include "IGR_two_level_inverse.hpp"
 #include "IGR_screened_patch_inverse.hpp"
 #include "IGR_face_density_cuda.hpp"
+#include "IGR_face_density_host_cache.hpp"
 #include "IGR_stationary_correction.hpp"
 #include "../../numerics/dg/DGFaceQuadratureKernels.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -963,8 +966,12 @@ public:
       face_scaling_(face_scaling),
       sfes_sequence_(sfes.GetSequence()),
       mesh_sequence_(sfes.GetMesh() ? sfes.GetMesh()->GetSequence() : -1),
+      nodes_sequence_(sfes.GetMesh() ? sfes.GetMesh()->GetNodesSequence() : -1),
+      rule_order_(shared_ir.GetOrder()),
       local_x_gf_(const_cast<mfem::ParFiniteElementSpace*>(&sfes))
   {
+    for (int q = 0; q < shared_ir.GetNPoints(); ++q)
+      rule_points_.push_back({{shared_ir.IntPoint(q).x, shared_ir.IntPoint(q).weight}});
     info_ = dg_face::BuildInteriorFaceDGDiffusionApplyData2D(
       sfes_,
       fqs,
@@ -1002,14 +1009,20 @@ public:
   }
 
   bool CanRefresh(const mfem::ParFiniteElementSpace& sfes,
+                  const mfem::FaceQuadratureSpace& fqs,
+                  const mfem::IntegrationRule& shared_ir,
                   const mfem::Vector& side_q,
                   const mfem::Vector& shared_side_q,
+                  mfem::real_t ip_sigma,
                   mfem::real_t kappa,
                   dg_face::DGDiffusionFaceScaling face_scaling) const
   {
     const mfem::Mesh* mesh = sfes.GetMesh();
     return &sfes == &sfes_ && sfes.GetSequence() == sfes_sequence_ && mesh &&
-           mesh->GetSequence() == mesh_sequence_ && kappa == kappa_ &&
+           mesh->GetSequence() == mesh_sequence_ &&
+           mesh->GetNodesSequence() == nodes_sequence_ &&
+           RuleMatches(fqs.GetIntRule(0)) && RuleMatches(shared_ir) &&
+           ip_sigma == ip_sigma_ && kappa == kappa_ &&
            face_scaling == face_scaling_ &&
            side_q.Size() == 2 * info_.nq * info_.nf &&
            shared_side_q.Size() == 2 * shared_info_.nq * shared_info_.nf &&
@@ -1184,6 +1197,19 @@ public:
   }
 
 private:
+  bool RuleMatches(const mfem::IntegrationRule& ir) const
+  {
+    if (ir.GetOrder() != rule_order_ ||
+        ir.GetNPoints() != static_cast<int>(rule_points_.size())) { return false; }
+    for (int q = 0; q < ir.GetNPoints(); ++q)
+    {
+      const auto& ip = ir.IntPoint(q);
+      if (std::memcmp(&ip.x, &rule_points_[q][0], sizeof(ip.x)) ||
+          std::memcmp(&ip.weight, &rule_points_[q][1], sizeof(ip.weight))) return false;
+    }
+    return true;
+  }
+
   const mfem::ParFiniteElementSpace& sfes_;
   const mfem::Operator* prolong_ = nullptr;
   const mfem::Operator* restrict_ = nullptr;
@@ -1193,6 +1219,9 @@ private:
     dg_face::DGDiffusionFaceScaling::Arithmetic;
   long sfes_sequence_ = -1;
   long mesh_sequence_ = -1;
+  long nodes_sequence_ = -1;
+  int rule_order_ = -1;
+  std::vector<std::array<mfem::real_t, 2>> rule_points_;
   dg_face::InteriorFaceDGDiffusionApplyInfo info_;
   dg_face::InteriorFaceDGDiffusionApplyScratch scratch_;
   bool has_shared_ = false;
@@ -1860,18 +1889,28 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
     MFEM_VERIFY(!cache_face_density || use_cuda_face_density,
                 "Face-density geometry caching requires the CUDA projection option.");
     std::unique_ptr<mfem::FaceQuadratureSpace> uncached_fqs;
+    const mfem::FaceQuadratureSpace* prepared_host_fqs = nullptr;
+    bool host_geometry_changed = false;
     if (cache_face_density)
     {
       if (!face_density_cuda_cache_)
         face_density_cuda_cache_ = std::make_shared<FaceDensityCUDAProjectionCache>();
     }
-    else
+    else if (!use_cuda_face_density)
+    {
+      if (!face_density_host_cache_)
+        face_density_host_cache_ = std::make_shared<HostFaceDensityPreparationCache>();
+      prepared_host_fqs = face_density_host_cache_->Prepare(
+        vfes_, sfes_, exact_face_ir, &host_geometry_changed);
+    }
+    if (!cache_face_density && !prepared_host_fqs)
       uncached_fqs = std::make_unique<mfem::FaceQuadratureSpace>(
         *mesh, exact_face_ir, mfem::FaceType::Interior);
     const mfem::FaceQuadratureSpace& exact_fqs = cache_face_density
-      ? face_density_cuda_cache_->Prepare(vfes_, sfes_, exact_face_ir) : *uncached_fqs;
+      ? face_density_cuda_cache_->Prepare(vfes_, sfes_, exact_face_ir)
+      : (prepared_host_fqs ? *prepared_host_fqs : *uncached_fqs);
     std::string reason;
-    if (!cache_face_density && !dg_face::SupportsInteriorFaceSideDensityProjection2D(vfes_,
+    if (!cache_face_density && !prepared_host_fqs && !dg_face::SupportsInteriorFaceSideDensityProjection2D(vfes_,
                                                               exact_fqs,
                                                               &reason))
     {
@@ -1880,7 +1919,7 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
                   "Unsupported exact IGR side-density face operator: "
                     << reason);
     }
-    if (!cache_face_density && !dg_face::SupportsInteriorFaceScalarTraceProjection2D(sfes_,
+    if (!cache_face_density && !prepared_host_fqs && !dg_face::SupportsInteriorFaceScalarTraceProjection2D(sfes_,
                                                               exact_fqs,
                                                               &reason))
     {
@@ -1913,6 +1952,10 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
       MFEM_ABORT("CUDA face-density projection requires a CUDA build.");
 #endif
     }
+    else if (prepared_host_fqs)
+      side_info = face_density_host_cache_->Project(
+        vfes_, U, alpha_, local_alpha ? &device_element_alpha_ : nullptr,
+        rho_floor_, side_q);
     else
       side_info = local_alpha
       ? dg_face::ProjectInteriorFaceDensityCoefficient2D(vfes_,
@@ -1933,7 +1976,8 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
       std::cout << "[igr-linear] event=face-density-path arithmetic="
                 << (use_cuda_face_density ? "cuda" : "host")
                 << " scope=local-interior-faces geometry_cache="
-                << (cache_face_density ? "per-solver" : "none") << std::endl;
+                << (cache_face_density ? "per-solver"
+                    : prepared_host_fqs ? "host-per-solver" : "none") << std::endl;
     if (cache_face_density &&
         (face_density_cuda_cache_->hits == 0 || debug_qf))
       std::cout << "[igr-linear] event=face-density-cache rebuilds="
@@ -1946,15 +1990,16 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
       ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_INGESTION_AUDIT", false);
     if (ingestion_audit)
     {
+      const mfem::Vector* audited_side_alpha = local_alpha
+        ? (prepared_host_fqs ? &face_density_host_cache_->CurrentSideAlpha()
+                             : &side_scratch.side_alpha) : nullptr;
       LogFaceCoefficientAudit("local",
                               side_q,
                               alpha_,
                               rho_floor_,
                               linear_solve_calls_ + 1,
                               vfes_.GetComm(),
-                              local_alpha
-                                ? &side_scratch.side_alpha
-                                : nullptr,
+                              audited_side_alpha,
                               side_info.nq);
     }
 
@@ -2033,9 +2078,12 @@ void IGRSolver::AssembleSystem(const mfem::ParGridFunction& U)
     face_op = dynamic_cast<ExactL2DGFaceOperator*>(
       exact_face_operator_.get());
     const bool reused_face_geometry =
-      face_op && face_op->CanRefresh(sfes_,
+      !host_geometry_changed && face_op && face_op->CanRefresh(sfes_,
+                                     exact_fqs,
+                                     exact_face_ir,
                                      side_q,
                                      shared_side_q,
+                                     static_cast<mfem::real_t>(ip_kind_),
                                      face_kappa,
                                      face_scaling);
     if (reused_face_geometry)

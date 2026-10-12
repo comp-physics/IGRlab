@@ -1890,19 +1890,21 @@ ProjectInteriorFaceDensityCoefficient2DImpl(
   const mfem::Vector* element_alpha,
   mfem::real_t rho_floor,
   mfem::Vector& side_q,
-  InteriorFaceSideDensityProjectionScratch* scratch)
+  InteriorFaceSideDensityProjectionScratch* scratch,
+  const InteriorFaceSideDensityProjectionInfo* prepared_geometry = nullptr)
 {
   MFEM_VERIFY(state.ParFESpace() == &vfes,
               "Side-density projection state/FESpace mismatch.");
   InteriorFaceSideDensityProjectionScratch local_scratch;
   InteriorFaceSideDensityProjectionScratch& work =
     scratch ? *scratch : local_scratch;
-  const auto info = BuildInteriorFaceSideDensityProjectionData2D(
-    vfes,
-    fqs,
-    work.shape,
-    work.face_elements,
-    work.element_vdof_map);
+  const auto info = prepared_geometry ? *prepared_geometry :
+    BuildInteriorFaceSideDensityProjectionData2D(
+      vfes,
+      fqs,
+      work.shape,
+      work.face_elements,
+      work.element_vdof_map);
 
   side_q.SetSize(2 * info.nq * info.nf);
   side_q.UseDevice(true);
