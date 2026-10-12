@@ -689,16 +689,20 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
             command += ['--capture-range=cudaProfilerApi', '--capture-range-end=stop']
         log = run('nsys', [*command, '--output', str(prefix), *argv])
         native = artifact(Path(str(prefix) + '.nsys-rep'))
-        stats = run('nsys-stats', [str(tool), 'stats', '--report',
-            'cuda_api_sum,cuda_gpu_kern_sum,cuda_gpu_mem_time_sum', '--format', 'csv', native['path']], 120)
+        # Native report/export timestamps can disagree even immediately after
+        # the first query. Never allow an older SQLite cache to substitute for
+        # this capture; every bounded query regenerates its export explicitly.
+        def stats_command(report):
+            return [str(tool), 'stats', '--report', report, '--format', 'csv',
+                    '--force-export=true', native['path']]
+        stats = run('nsys-stats', stats_command(','.join(NSYS_CORE_REPORTS)), 120)
         statistics = parse_nsys((stats / 'stdout.log').read_text())
         host_summaries = {}
         for report in NSYS_OPTIONAL_REPORTS[:3]:
             if report not in available_reports:
                 host_summaries[report] = {'availability': 'unavailable', 'reason': 'not listed by native Nsys report help'}
                 continue
-            exported = run('nsys-' + report, [str(tool), 'stats', '--report', report,
-                                            '--format', 'csv', native['path']], 120, allow_failure=True)
+            exported = run('nsys-' + report, stats_command(report), 120, allow_failure=True)
             export_exit = json.loads((exported / 'result.json').read_text())['returncode']
             stdout, stderr = [(exported / name).read_text() for name in ('stdout.log', 'stderr.log')]
             host_summaries[report] = (parse_nsys_host_summary(stdout, report) if export_exit == 0 else
@@ -711,8 +715,7 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
         if 'cuda_gpu_trace' in available_reports:
             activity['reason'] = 'CUDA timestamp event bound exceeded before export'
             if expected_events <= NSYS_TRACE_MAX_EVENTS:
-                exported = run('nsys-cuda_gpu_trace', [str(tool), 'stats', '--report', 'cuda_gpu_trace',
-                                                      '--format', 'csv', native['path']], 120)
+                exported = run('nsys-cuda_gpu_trace', stats_command('cuda_gpu_trace'), 120)
                 trace = exported / 'stdout.log'
                 activity = {'availability': 'unavailable', 'reason': 'CUDA timestamp byte bound exceeded',
                             'statistics_csv': artifact(trace)}
@@ -726,6 +729,7 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
             'statistics': statistics, 'host_summaries': host_summaries, 'gpu_activity': activity,
             'statistics_csv': artifact(stats / 'stdout.log'),
             'profiler_policies': {'trace': 'cuda,nvtx,osrt', 'cpu_sampling': 'none (explicit)',
+                'statistics_export': '--force-export=true for every native-report stats query (explicit)',
                 'osrt_threshold': 'native default; unspecified by command',
                 'default_authority': result['tools']['nsys']['profile_help_stdout'],
                 'sampled_cpu_stack_attribution_available': False},

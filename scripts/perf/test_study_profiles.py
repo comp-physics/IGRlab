@@ -325,6 +325,45 @@ class MetricTests(unittest.TestCase):
 
 
 class CaptureTests(unittest.TestCase):
+    def test_all_native_stats_queries_force_matching_export_before_optional_and_trace_reports(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary)
+            original = runner.run
+            def stale_guard(label, argv, **kwargs):
+                path = original(label, argv, **kwargs)
+                if argv[1:2] == ['stats'] and '--report' in argv and '--force-export=true' not in argv:
+                    (path / 'stdout.log').write_text('')
+                    (path / 'stderr.log').write_text('WARNING: Existing SQLite export found: capture-nsys.sqlite\n'
+                        ' File is older than input file: capture-nsys.nsys-rep\n'
+                        ' Use --force-export=true to update export file.\n usage: nsys stats ...\n')
+                    (path / 'result.json').write_text(json.dumps({'returncode': 1, 'status': 'failed',
+                        'argv': argv, 'cwd': str(path), 'stdout_sha256': profiles.sha256(path / 'stdout.log'),
+                        'stderr_sha256': profiles.sha256(path / 'stderr.log')}))
+                    raise RuntimeError('stale native SQLite export')
+                return path
+            case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+            with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU), \
+                    patch.object(runner, 'run', side_effect=stale_guard):
+                value = profiles.capture(case, ['app'], runner, directory, GPU)
+            self.assertEqual(value['status'], 'complete')
+            queries = [argv for label, argv, timeout in runner.commands if argv[1:2] == ['stats'] and '--report' in argv]
+            self.assertEqual(len(queries), 5)
+            self.assertEqual({argv[argv.index('--report') + 1] for argv in queries},
+                             {','.join(profiles.NSYS_CORE_REPORTS), *profiles.NSYS_OPTIONAL_REPORTS})
+            for argv in queries:
+                self.assertEqual(argv.count('--force-export=true'), 1)
+                self.assertEqual(argv[-1], value['captures']['nsys']['native']['path'])
+            self.assertIn('--force-export=true', value['captures']['nsys']['profiler_policies']['statistics_export'])
+            self.assertFalse(any('--force-export=true' in argv for label, argv, timeout in runner.commands
+                                 if '--help-reports' in argv))
+
+    def test_stale_export_warning_is_not_an_optional_no_data_skip(self):
+        warning = ('WARNING: Existing SQLite export found: capture-nsys.sqlite\n'
+                   ' File is older than input file: capture-nsys.nsys-rep\n'
+                   ' Use --force-export=true to update export file.\n usage: nsys stats ...\n')
+        with self.assertRaises(profiles.ProfileError):
+            profiles.nsys_no_data('', warning, 'nvtx_sum', 1)
+
     def test_nsys_native_help_exit_one_requires_explicit_listing_and_options(self):
         for code in (0, 1):
             for stdout, stderr in ((reports_help(), ''), ('', reports_help()),

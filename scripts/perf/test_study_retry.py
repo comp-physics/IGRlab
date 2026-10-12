@@ -378,9 +378,8 @@ class RetryTests(unittest.TestCase):
             study.verify(self.new)
 
     def test_profiles_only_requires_exact_suite_and_completed_fingerprinted_timing(self):
-        for change in ({'cases': 'dg-p1'}, {'suite': str(self.old / 'suite.json')}):
-            with self.assertRaisesRegex(ValueError, 'forbids --suite/--cases'):
-                self.retry(profiles_only=True, **change)
+        with self.assertRaisesRegex(ValueError, 'forbids --cases'):
+            self.retry(profiles_only=True, cases='dg-p1')
         with self.assertRaisesRegex(RuntimeError, 'fingerprinted timings'):
             self.retry(profiles_only=True)
         gpu, summary, _ = self.prepare_profile_timing()
@@ -388,6 +387,100 @@ class RetryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'completed measurement artifact changed'):
             self.retry(profiles_only=True)
         self.assertFalse(self.new.exists())
+
+    def test_profiles_only_suite_changes_only_capture_selection_and_retains_exact_timing(self):
+        _, summary, _ = self.prepare_profile_timing()
+        suite = study.read_json(self.old / 'suite.json')
+        original_profile = dict(suite['cases'][0]['profile'])
+        suite['cases'][0]['profile'].update(kernel_regex='ClosureKernel', launch_count=2)
+        replacement = self.base / 'closure-suite.json'
+        replacement.write_text(json.dumps(suite, separators=(',', ':')))
+        before = self.snapshot()
+        plan = self.retry(profiles_only=True, suite=str(replacement))
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual((self.new / 'suite.json').read_bytes(), replacement.read_bytes())
+        reuse = plan['timing_reuse']
+        self.assertEqual(reuse['suite_sha256'], study.sha(self.old / 'suite.json'))
+        self.assertEqual(reuse['profile_suite_sha256'], plan['suite_sha256'])
+        self.assertEqual(reuse['profile_overrides'], {suite['cases'][0]['id']: {
+            'original': original_profile, 'replacement': suite['cases'][0]['profile']}})
+        attempt = study.completed(study.read_json(self.new / 'state.json'), 'timings')
+        self.assertEqual(Path(attempt['summary']).read_bytes(), summary.read_bytes())
+        self.assertNotEqual(plan['suite_sha256'], plan['retry_origin']['suite_sha256'])
+        self.assertEqual(self.calls[0][0], 'squeue')
+        self.assertFalse(any(call[0] == 'sbatch' for call in self.calls))
+
+    def test_profiles_only_suite_rejects_physics_selection_environment_and_limit_drift(self):
+        self.prepare_profile_timing()
+        original = study.read_json(self.old / 'suite.json')
+        replacement = self.base / 'different-suite.json'
+        mutations = [
+            lambda suite: suite['cases'][0]['parameters'].update(dt=2e-5),
+            lambda suite: suite['cases'][0].update(environment={'IGRLAB_IGR_DENSE_INVERSE': '1'}),
+            lambda suite: suite['cases'][0].update(enabled=False),
+            lambda suite: suite['cases'][1].update(enabled=True),
+            lambda suite: suite['cases'][0].update(optional=True),
+            lambda suite: suite['cases'][0].update(id='renamed-case'),
+            lambda suite: suite['cases'].append({**suite['cases'][0], 'id': 'added-case'}),
+            lambda suite: suite['cases'].pop(),
+            lambda suite: suite['cases'].reverse(),
+            lambda suite: suite.update(repetitions=4),
+            lambda suite: suite.update(warmups=2),
+            lambda suite: suite.update(command_timeout_seconds=42),
+            lambda suite: suite.update(profiles_budget_seconds=42),
+            lambda suite: suite.update(correctness_regex='^another-test$'),
+            lambda suite: suite.update(name='another-name'),
+        ]
+        for mutate in mutations:
+            value = json.loads(json.dumps(original))
+            mutate(value)
+            replacement.write_text(json.dumps(value))
+            with self.subTest(mutation=mutate), self.assertRaises(ValueError):
+                self.retry(profiles_only=True, suite=str(replacement))
+            self.assertFalse(self.new.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_profiles_only_suite_mutation_between_admission_and_copy_rejects_before_plan(self):
+        self.prepare_profile_timing()
+        replacement = self.base / 'mutable-suite.json'
+        value = study.read_json(self.old / 'suite.json')
+        value['cases'][0]['profile']['kernel_regex'] = 'ClosureKernel'
+        study.write_json(replacement, value)
+        before = self.snapshot()
+        copy = study.shutil.copy2
+        def replace_then_copy(source, destination):
+            if Path(source) == replacement:
+                value['cases'][0]['parameters']['dt'] = 2e-5
+                study.write_json(replacement, value)
+            return copy(source, destination)
+        with patch.object(study.shutil, 'copy2', side_effect=replace_then_copy):
+            with self.assertRaisesRegex(ValueError, 'changed before freezing'):
+                self.retry(profiles_only=True, suite=str(replacement), prepare=False)
+        self.assertEqual(before, self.snapshot())
+        self.assertFalse((self.new / 'plan.json').exists())
+        self.assertFalse(any(call[0] == 'sbatch' for call in self.calls))
+
+    def test_chained_profile_overrides_retain_original_timing_suite_hash(self):
+        self.prepare_profile_timing()
+        replacement = self.base / 'closure-suite.json'
+        value = study.read_json(self.old / 'suite.json')
+        value['cases'][0]['profile']['kernel_regex'] = 'ClosureKernel'
+        study.write_json(replacement, value)
+        intermediate = self.retry(profiles_only=True, suite=str(replacement))
+        final = self.base / 'third'
+        value['cases'][0]['profile']['kernel_regex'] = 'AnotherClosureKernel'
+        study.write_json(replacement, value)
+        before = self.snapshot()
+        args = argparse.Namespace(from_run=str(self.new), run_dir=str(final), profiles_only=True,
+            suite=str(replacement), cases=None, prepare_only=True, timings_time=None, profiles_time=None)
+        with contextlib.redirect_stdout(io.StringIO()):
+            study.retry(args)
+        plan = study.load_plan(final)
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(plan['timing_reuse']['suite_sha256'], self.plan['suite_sha256'])
+        self.assertEqual(plan['retry_origin']['suite_sha256'], intermediate['suite_sha256'])
+        self.assertEqual(plan['timing_reuse']['profile_suite_sha256'], study.sha(replacement))
+        study.verify(final)
 
     def test_profiles_only_rejects_missing_case_and_mismatched_timing_gpu(self):
         gpu, summary, _ = self.prepare_profile_timing()

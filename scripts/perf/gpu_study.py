@@ -963,7 +963,8 @@ def retained_timing(plan, state, old):
         raise RuntimeError('timing artifact manifest does not bind the summary')
     artifacts.update(plan.get('timing_reuse', {}).get('artifact_sha256', {}))
     return {'run_dir': str(old), 'plan_sha256': plan['plan_sha256'],
-            'suite_sha256': plan['suite_sha256'], 'attempt': attempt,
+            'suite_sha256': plan.get('timing_reuse', {}).get('suite_sha256', plan['suite_sha256']),
+            'attempt': attempt,
             'summary': str(summary), 'summary_sha256': attempt['summary_sha256'],
             'artifact_sha256': artifacts, 'gpu': gpu,
             'scope': 'original unprofiled timings reused byte-for-byte; no new timing observations'}
@@ -988,6 +989,19 @@ def admit_interactive_timing_job(job, state, retained):
     return info
 
 
+def profile_only_overrides(original, replacement):
+    """Profile selection may change; every other frozen suite field must match."""
+    old, new = read_json(original), read_json(replacement)
+    def without_profiles(suite):
+        return {**suite, 'cases': [{key: value for key, value in case.items() if key != 'profile'}
+                                   for case in suite['cases']]}
+    if digest(without_profiles(old)) != digest(without_profiles(new)):
+        raise ValueError('profiles-only --suite may change only existing case.profile subtrees')
+    return {before['id']: {'original': before['profile'], 'replacement': after['profile']}
+            for before, after in zip(old['cases'], new['cases'])
+            if digest(before['profile']) != digest(after['profile'])}
+
+
 def retry(args):
     """A fresh executor/cohort may reuse only inactive, verified completed builds."""
     if os.environ.get('SLURM_JOB_ID'):
@@ -1002,10 +1016,16 @@ def retry(args):
         suite_path = getattr(args, 'suite', None)
         cases = getattr(args, 'cases', None)
         profiles_only = bool(getattr(args, 'profiles_only', False))
-        if profiles_only and (suite_path is not None or cases is not None):
-            raise ValueError('profiles-only retry forbids --suite/--cases; timings require exact suite bytes')
+        if profiles_only and cases is not None:
+            raise ValueError('profiles-only retry forbids --cases; timing workload selection must match')
         retained = retained_timing(plan, state, old) if profiles_only else None
+        supplied_profile_suite_sha256 = (sha(suite_path)
+                                        if profiles_only and suite_path is not None else None)
         suite = study_workloads.load_suite(suite_path) if suite_path is not None else old_suite
+        profile_overrides = (profile_only_overrides(old / 'suite.json', suite_path)
+                             if profiles_only and suite_path is not None else {})
+        if supplied_profile_suite_sha256 is not None and sha(suite_path) != supplied_profile_suite_sha256:
+            raise ValueError('supplied profile suite changed during validation')
         if suite['correctness_regex'] != old_suite['correctness_regex']:
             raise ValueError('retry cannot change correctness_regex; completed validation must match')
         if cases is not None:
@@ -1098,11 +1118,17 @@ def retry(args):
         (root / 'executor').mkdir()
         for name in EXECUTOR_FILES:
             shutil.copy2(Path(__file__).parent / name, root / 'executor' / name)
-        if suite_path is None and cases is None:
-            shutil.copy2(old / 'suite.json', root / 'suite.json')
+        if profiles_only or suite_path is None and cases is None:
+            shutil.copy2(suite_path if suite_path is not None else old / 'suite.json', root / 'suite.json')
         else:
             write_json(root / 'suite.json', suite, exclusive=True)
         new_plan['suite_sha256'] = sha(root / 'suite.json')
+        if (supplied_profile_suite_sha256 is not None and
+                new_plan['suite_sha256'] != supplied_profile_suite_sha256):
+            raise ValueError('supplied profile suite changed before freezing')
+        if profiles_only:
+            new_plan['timing_reuse'].update(profile_suite_sha256=new_plan['suite_sha256'],
+                                            profile_overrides=profile_overrides)
         new_plan['executor_sha256'] = {name: sha(root / 'executor' / name) for name in EXECUTOR_FILES}
         new_plan['plan_sha256'] = digest(new_plan)
         write_json(root / 'plan.json', new_plan, exclusive=True)
@@ -1359,7 +1385,7 @@ def main(argv=None):
     p.add_argument('--suite', help='validated replacement suite; correctness_regex must match the old run')
     p.add_argument('--cases', help='comma-separated case IDs from the selected suite; enables optional cases')
     p.add_argument('--profiles-only', action='store_true',
-                   help='reuse exact completed timings; fresh profiles on the same GPU UUID/model; no suite/case overrides')
+                   help='reuse completed timings on the same GPU; --suite may change only case.profile; no --cases')
     p.add_argument('--timings-time', type=wall_time, help='override inherited timing allocation limit')
     p.add_argument('--profiles-time', type=wall_time, help='override inherited profiling allocation limit')
     p.add_argument('--prepare-only', action='store_true', help='prepare without submitting measurement jobs')
