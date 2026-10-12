@@ -114,10 +114,14 @@ matrix enables eight cases on the saved CUDA build: CPU and CUDA DG/DGSEM,
 fused SIMT and FP64 tensor DGSEM, and ordinary/tensor CUDA HDG. They use 36
 periodic cells for ten steps. CPU field equivalence covers DG and DGSEM;
 HDG retains comparisons between source versions. The optional `hdg-cpu-p3`
-entry is disabled because the CUDA build links only the CUDA HDG entry point,
-which rejects `--device cpu`. CPU HDG requires a separately admitted CPU-profile
-build; enabling this entry with `--cases` against CUDA artifacts does not supply
-one. This is an eight-case default, not a complete CPU/CUDA/tensor matrix for
+entry requires a CPU-profile executable; the CUDA HDG entry point rejects
+`--device cpu`. A new submission enabling CPU HDG automatically creates separate
+canonical CPU build and correctness jobs for both source versions. Measurement
+waits for CPU and CUDA validation, verifies their prebuilt receipts and actual
+dependency bindings, and launches CPU children with that profile's MPI executable
+and library paths. CPU DG/DGSEM share the CPU artifact when it is present.
+A retry of a CUDA-only study cannot add CPU HDG without a prior admitted CPU
+build; use a new submission. This is an eight-case default, not a complete CPU/CUDA/tensor matrix for
 every discretization. Its small grid validates execution and equivalence; it
 does not establish representative GPU efficiency. The separate
 [pace-full-gpu-solvers.json](../scripts/perf/suites/pace-full-gpu-solvers.json)
@@ -213,8 +217,15 @@ certificate and five physical fields plus nonzero sigma. CPU and CUDA may
 need different Krylov iteration counts; accepted work, numerical policy and
 physical outputs must still agree. CPU execution uses one thread on the A100
 node's host. This is a paired backend comparison, not a CPU scaling study.
-The adapter excludes CPU HDG and CPU fused/tensor routes. Host fixtures cover
-the contract; successful native runs are still required to establish parity.
+Three optional `hdg-igr-{cpu,cuda,tensor}-p3-n6` cases add matched 36-cell HDG
+work. For example, submit this suite with
+`--cases hdg-igr-cpu-p3-n6,hdg-igr-cuda-p3-n6,hdg-igr-tensor-p3-n6` to request
+the independent CPU artifact automatically. Both frozen sources must support
+canonical shared-MFEM caches and prebuilt validation. CPU HDG process wall time
+includes its rank-one MPI launcher, startup and shutdown; it is not a kernel
+time. CPU counters and CUDA occupancy are not collected for CPU cases.
+CPU fused/tensor routes remain unsupported. Host fixtures cover these contracts;
+successful native runs are still required to establish HDG timing and parity.
 
 The [pace-igr-dg-orders.json](../scripts/perf/suites/pace-igr-dg-orders.json)
 research sweep selects ordinary DG orders one through ten on 1024 cells.

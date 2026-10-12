@@ -299,6 +299,107 @@
       },
       "enabled": false,
       "optional": true
+    },
+    {
+      "id": "hdg-igr-cpu-p3-n6",
+      "adapter": "dg",
+      "parameters": {
+        "order": 3,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n6.mesh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "hdg",
+        "device": "cpu",
+        "serial_refine": 0,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "min"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": ".*(?:BorrowedEulerVolumeKernel|BorrowedCondenseKernel|BorrowedEulerFaceKernel|BorrowedRetainedLuRecoverKernel|cusparse::spsm_v2_kernel).*",
+        "kernel_groups": {
+          "volume": "BorrowedEulerVolumeKernel",
+          "condensation": "BorrowedCondenseKernel",
+          "face": "BorrowedEulerFaceKernel",
+          "recovery": "BorrowedRetainedLuRecoverKernel",
+          "triangular_solve": "cusparse::spsm_v2_kernel"
+        },
+        "timeout": 240
+      },
+      "enabled": false,
+      "optional": true
+    },
+    {
+      "id": "hdg-igr-cuda-p3-n6",
+      "adapter": "dg",
+      "parameters": {
+        "order": 3,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n6.mesh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "hdg",
+        "device": "cuda",
+        "serial_refine": 0,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "min"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": ".*(?:BorrowedEulerVolumeKernel|BorrowedCondenseKernel|BorrowedEulerFaceKernel|BorrowedRetainedLuRecoverKernel|cusparse::spsm_v2_kernel).*",
+        "kernel_groups": {
+          "volume": "BorrowedEulerVolumeKernel",
+          "condensation": "BorrowedCondenseKernel",
+          "face": "BorrowedEulerFaceKernel",
+          "recovery": "BorrowedRetainedLuRecoverKernel",
+          "triangular_solve": "cusparse::spsm_v2_kernel"
+        },
+        "timeout": 240
+      },
+      "enabled": false,
+      "optional": true
+    },
+    {
+      "id": "hdg-igr-tensor-p3-n6",
+      "adapter": "dg",
+      "parameters": {
+        "order": 3,
+        "mesh": "examples/dgsem_smooth_advection_periodic/smooth_advection_periodic_n6.mesh",
+        "final_time": 0.0001,
+        "dt": 1e-05,
+        "discretization": "hdg",
+        "device": "cuda",
+        "engine": "tensor",
+        "serial_refine": 0,
+        "regularization": "igr",
+        "active_igr_wave": true,
+        "c_alpha": 1,
+        "igr_alpha_length": "min"
+      },
+      "profile": {
+        "selection": "first-per-kernel",
+        "launch_skip": 0,
+        "launch_count": 32,
+        "kernel_regex": ".*(?:BorrowedEulerTensorVolumeCoefficientKernel|BorrowedEulerTensorVolumeContractionKernel|BorrowedCondenseKernel|BorrowedEulerFaceKernel|TensorBorrowedRecoverKernel|BorrowedRetainedLuRecoverKernel|NativeRankOneTraceSolveKernel|ElementSchwarz).*",
+        "kernel_groups": {
+          "volume_coefficients": "BorrowedEulerTensorVolumeCoefficientKernel",
+          "volume_contraction": "BorrowedEulerTensorVolumeContractionKernel",
+          "condensation": "BorrowedCondenseKernel",
+          "face": "BorrowedEulerFaceKernel",
+          "recovery": "(?:TensorBorrowedRecoverKernel|BorrowedRetainedLuRecoverKernel)",
+          "trace_solve": "NativeRankOneTraceSolveKernel"
+        },
+        "timeout": 240
+      },
+      "enabled": false,
+      "optional": true
     }
   ]
 }

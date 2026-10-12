@@ -24,10 +24,11 @@ source=pathlib.Path(__file__).resolve().parent
 output=pathlib.Path(value('--output-root'))
 site=pathlib.Path(value('--site-root'))
 wt='wt-'+hashlib.sha256(os.fsencode(source)).hexdigest()[:16]
-scope=output/'worktrees'/wt/'cuda-sm80'
+profile='cpu' if '--cpu-only' in args or '--cpu' in args else 'cuda-sm80'
+scope=output/'worktrees'/wt/profile
 if '--print-plan' in args:
  print(f'[build-plan] output_root={output} worktree_id={wt} scope={scope}')
- print(f'[build-plan] env={site}/site/pace/spack-envs/cuda-sm80 app_build={scope}/app/build app_install={scope}/app/install')
+ print(f'[build-plan] env={site}/site/pace/spack-envs/{profile} app_build={scope}/app/build app_install={scope}/app/install')
  if '--mfem-output-root' in args:
   mfem=pathlib.Path(value('--mfem-output-root'))
   print(f'[build-plan] mfem_source={mfem}/source mfem_build={mfem}/build mfem_install={mfem}/install mfem_tuple_state=shared-planned')
@@ -238,10 +239,81 @@ class StudyBuildTests(unittest.TestCase):
         with self.assertRaisesRegex(study.StudyBuildError, 'symlinked'):
             study.freeze(self.source, 'HEAD', link / 'snapshot3')
 
-    def plan(self, identity, regex='^(dg_operator|sigma)$', *, validation_time=None):
+    def plan(self, identity, regex='^(dg_operator|sigma)$', *, validation_time=None, profile='cuda-sm80'):
         return study.build_plan(identity, self.root / 'output with $HOME `literal`',
                                 self.root / 'shared-site', self.root / 'spack-tool', regex,
-                                validation_time=validation_time)
+                                validation_time=validation_time, profile=profile)
+
+    def test_cpu_plan_uses_independent_cpu_cache_and_public_cpu_only_route(self):
+        identity = self.freeze()
+        default = self.plan(identity)
+        cuda = self.plan(identity, profile='cuda-sm80')
+        cpu = self.plan(identity, profile='cpu')
+        self.assertEqual(default, cuda)
+        self.assertEqual(cpu['profile'], 'cpu')
+        self.assertIn('--cpu-only', cpu['argv'])
+        self.assertNotIn('--a100', cpu['argv'])
+        self.assertNotIn('--nvtx-profile', cpu['argv'])
+        self.assertNotEqual(cpu['dependency_configuration_key'], cuda['dependency_configuration_key'])
+        self.assertNotEqual(cpu['app_build'], cuda['app_build'])
+        self.assertTrue(cpu['spack_env'].endswith('/cpu'))
+        self.assertEqual(cpu['dependency_configuration']['mfem_cuda_archs'], 'none')
+        self.assertFalse(Path(cpu['mfem_build']).exists())
+        self.assertTrue(study.submit_build(cpu)['success'])
+        with self.assertRaisesRegex(study.StudyBuildError, 'support cpu'):
+            self.plan(identity, profile='cuda-sm70')
+
+    def cpu_request(self, identity):
+        request = self.root / 'literal request $HOME.json'
+        argv = ['--site', 'pace', '--cpu-only', '--hdg-runtime', '--no-clean',
+                '--no-research-tests', '--no-deps', '--output-root', str(self.root / 'already-built'),
+                '--site-root', str(self.root / 'site'), '--spack-root', str(self.root / 'spack'),
+                '--mfem-output-root', str(self.root / 'already-built-mfem'), '--jobs', '8',
+                '--test-regex', '^(cpu-igr|cpu-fields)$']
+        request.write_text(json.dumps({'source': identity['source_snapshot'], 'argv': argv}))
+        return request
+
+    def test_existing_cpu_request_uses_exact_public_paths_without_submission(self):
+        identity = self.freeze()
+        request = self.cpu_request(identity)
+        before = request.read_bytes()
+        plan = study.existing_cpu_plan(identity, request)
+        self.assertEqual(plan['request_sha256'], study.hashlib.sha256(before).hexdigest())
+        self.assertTrue(plan['app_build'].startswith(str(self.root / 'already-built')))
+        self.assertEqual(plan['mfem_build'], str(self.root / 'already-built-mfem/build'))
+        self.assertEqual(plan['correctness_regex'], '^(cpu-igr|cpu-fields)$')
+        self.assertEqual(request.read_bytes(), before)
+        self.assertFalse(Path(plan['app_build']).exists())
+        with self.assertRaisesRegex(study.StudyBuildError, 'cannot be resubmitted'):
+            study.submit_build(plan)
+
+    def test_existing_cpu_request_rejects_cuda_source_and_option_drift(self):
+        identity = self.freeze()
+        request = self.cpu_request(identity)
+        original = json.loads(request.read_text())
+        variants = [{**original, 'source': str(self.source)},
+                    {**original, 'argv': original['argv'] + ['--a100']},
+                    {**original, 'argv': original['argv'] + ['--no-tests']},
+                    {**original, 'argv': original['argv'] + ['--nvtx-profile']},
+                    {**original, 'argv': original['argv'] + ['--test-regex', 'different']}]
+        for value in variants:
+            with self.subTest(value=value):
+                request.write_text(json.dumps(value))
+                with self.assertRaises(study.StudyBuildError):
+                    study.existing_cpu_plan(identity, request)
+
+    def test_existing_cpu_request_change_during_print_plan_rejects(self):
+        identity = self.freeze()
+        request = self.cpu_request(identity)
+        original = study._run
+        def mutate(argv, **kwargs):
+            result = original(argv, **kwargs)
+            if '--print-plan' in argv:
+                request.write_text(request.read_text() + '\n')
+            return result
+        with patch.object(study, '_run', side_effect=mutate):
+            with self.assertRaisesRegex(study.StudyBuildError, 'request changed'):
+                study.existing_cpu_plan(identity, request)
 
     def legacy_plan(self):
         self.write('build.sh', DRIVER.replace("print('--validation-time HH:MM:SS')", "print('legacy site helper')"), executable=True)

@@ -145,6 +145,47 @@ class RetryTests(unittest.TestCase):
         self.assertFalse((self.new / 'attempts').exists())
         self.assertTrue(all(command[0] in ('squeue', 'sacct') for command in self.calls))
 
+    def test_legacy_cuda_executor_set_remains_eligible_for_fresh_retry(self):
+        self.plan['executor_sha256'].pop('study_admit.py')
+        (self.old / 'executor/study_admit.py').unlink()
+        self.save_plan()
+        plan = self.retry()
+        self.assertEqual(set(plan['executor_sha256']), set(study.EXECUTOR_FILES))
+        self.assertEqual(plan['retry_origin']['executor_sha256'], self.plan['executor_sha256'])
+        self.assertNotIn('cpu_builds', plan)
+
+    def test_retry_retains_cpu_build_receipts_and_new_cpu_binary_hash_without_recompiling(self):
+        cpu_app = self.cache / 'cpu-app'
+        cpu_app.mkdir()
+        (cpu_app / 'CMakeCache.txt').write_text('completed CPU build metadata\n')
+        cpu_binary = cpu_app / self.binary.name
+        cpu_binary.write_text('CPU executable bytes, never executed\n')
+        cpu_binary.chmod(0o755)
+        cpu_build = {**self.plan['builds']['baseline'], 'profile': 'cpu', 'app_build': str(cpu_app),
+                     'configuration_key': 'cpu-key', 'argv': ['canonical', '--cpu-only']}
+        cpu_receipt = {**self.state['builds']['baseline'], 'configuration_key': 'cpu-key',
+                       'argv': cpu_build['argv'], 'build_job_id': '21', 'validation_job_id': '22',
+                       'build_job_ids': ['21'], 'validation_job_ids': ['22']}
+        self.plan['cpu_builds'] = {member: dict(cpu_build) for member in study.MEMBERS}
+        self.state['cpu_builds'] = {member: dict(cpu_receipt) for member in study.MEMBERS}
+        self.outcomes.update({'21': ('COMPLETED', '0:0'), '22': ('COMPLETED', '0:0')})
+        suite = study.read_json(self.old / 'suite.json')
+        # A CPU DG case can share a separately validated CPU artifact, even if
+        # this fixture does not itself provide a native CPU admission receipt.
+        case = next(case for case in suite['cases'] if case['enabled'])
+        case['parameters']['device'] = 'cpu'
+        study.write_json(self.old / 'suite.json', suite)
+        self.plan['suite_sha256'] = study.sha(self.old / 'suite.json')
+        self.save_plan()
+        self.save_state()
+        plan = self.retry()
+        state = study.read_json(self.new / 'state.json')
+        self.assertEqual(plan['cpu_builds'], self.plan['cpu_builds'])
+        self.assertEqual(state['cpu_builds'], self.state['cpu_builds'])
+        self.assertEqual(plan['retry_origin']['build_artifact_sha256'][str(cpu_binary)], study.sha(cpu_binary))
+        self.assertTrue(all(command[0] in ('squeue', 'sacct') for command in self.calls))
+        self.assertFalse((self.new / 'admission.json').exists())
+
     def test_selected_optional_cases_reuse_builds_and_pin_new_benchmark_without_compilation(self):
         benchmark = self.app / study.study_workloads.BINARY_NAMES['dgsem']
         benchmark.write_text('previously unmeasured built benchmark\n')

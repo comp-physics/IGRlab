@@ -75,11 +75,15 @@ class BackendStudyTests(unittest.TestCase):
             study.write_json(directory / 'result.json', {'returncode': 0, 'process_wall_seconds': 7.25})
             return directory
         self.runner.run = run
-        admission = {'binaries': {'baseline': {'app': '/saved/app'}}}
-        with patch.object(study.study_workloads, 'parse', return_value={'seconds': 7.25}) as parse:
+        admission = {'binaries': {'baseline': {'app': '/saved/cuda-app'}},
+                     'cpu_artifacts': {'baseline': {'binaries': {'app': '/saved/cpu-app'}}}}
+        with patch.object(study.study_workloads, 'parse', return_value={'seconds': 7.25}) as parse, \
+                patch.object(study.study_admit, 'runtime_command', side_effect=lambda cpu, argv, env:
+                             (['/selected/cpu/mpiexec', '-n', '1', *argv], env)) as launch:
             observation, _ = study.observe(self.runner, self.root, self.plan, admission, case,
                                            'baseline', 'hdg', {})
         self.assertEqual(parse.call_args.kwargs, {'wall_seconds': 7.25})
+        self.assertEqual(launch.call_args.args[1][0], '/saved/cpu-app')
         self.assertEqual(observation['seconds'], 7.25)
 
     def test_profiled_hdg_receipt_is_only_admission_metadata(self):

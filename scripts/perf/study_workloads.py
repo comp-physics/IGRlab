@@ -107,9 +107,9 @@ def parameters(case):
                               'min' if result['discretization'] == 'hdg' else 'local'))
             require(result['active_igr_wave'] is True, 'active IGR study requires the active wave')
             require(result['device'] == 'cuda' or
-                    (result['device'] == 'cpu' and result['discretization'] in ('dg', 'dgsem') and
+                    (result['device'] == 'cpu' and result['discretization'] in ('dg', 'dgsem', 'hdg') and
                      result['engine'] == 'ordinary' and result['dgsem_residual'] == 'unfused'),
-                    'CPU active IGR study supports only ordinary DG and unfused DGSEM')
+                    'CPU active IGR study supports only ordinary DG/HDG and unfused DGSEM')
             require(number(result['c_alpha'], 'c_alpha', positive=True) == 1,
                     'active IGR reference requires c_alpha=1')
             require(result['igr_alpha_length'] == ('min' if result['discretization'] == 'hdg' else 'local'),

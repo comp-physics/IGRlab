@@ -28,13 +28,19 @@ import uuid
 # Frozen source readers must not gain interpreter-generated files at runtime.
 sys.dont_write_bytecode = True
 import study_build
+import study_admit
 import study_profiles
 import study_workloads
 
 SCHEMA = 1
 MEMBERS = ('baseline', 'candidate')
 EXECUTOR_FILES = ('gpu_study.py', 'study_build.py', 'study_profiles.py',
-                  'study_workloads.py', 'pace_runtime.sh')
+                  'study_workloads.py', 'pace_runtime.sh', 'study_admit.py')
+LEGACY_EXECUTOR_FILES = tuple(name for name in EXECUTOR_FILES if name != 'study_admit.py')
+CPU_CORRECTNESS_REGEX = ('^(hdg_generic_euler_cpu_rank1|'
+                        'dg_igr_hdg_main_backend_cpu_igr_p(1|3)_rank1_cfl|'
+                        'dg_igr_hdg_main_backend_igr_vtk_cpu_rank1|'
+                        'dg_igr_dg_operator_tests|dg_igr_dgsem_operator_tests)$')
 SAFE_ENV = ('CUDA_VISIBLE_DEVICES', 'SLURM_JOB_ID', 'SLURM_JOB_ACCOUNT',
             'SLURM_JOB_QOS', 'SLURM_JOB_PARTITION', 'SLURM_JOB_GPUS',
             'SLURM_STEP_GPUS', 'SLURM_NTASKS', 'SLURM_JOB_END_TIME', 'OMP_NUM_THREADS',
@@ -232,6 +238,11 @@ def verify(root, *, binaries=False):
         for path, expected in admission['artifact_sha256'].items():
             if sha(path) != expected:
                 raise RuntimeError(f'admitted build/dependency artifact changed: {path}')
+        for cpu in admission.get('cpu_artifacts', {}).values():
+            for path, expected in cpu.get('artifact_links', {}).items():
+                if (not Path(path).is_symlink() or os.readlink(path) != expected['link'] or
+                        str(Path(path).resolve(strict=True)) != expected['target']):
+                    raise RuntimeError(f'admitted CPU artifact link changed: {path}')
     if (root / 'state.json').exists():
         for attempt in read_json(root / 'state.json')['attempts']:
             if attempt['status'] not in ('timings_complete', 'analysis_complete'):
@@ -247,12 +258,23 @@ def selected_cases(suite):
     return [case for case in suite['cases'] if case.get('enabled', True)]
 
 
-def validate_cuda_profile_cases(suite):
-    """The study builds one CUDA profile, whose HDG facade cannot run on CPU."""
+def needs_cpu_build(suite):
+    return any(case['adapter'] == 'dg' and case.get('parameters', {}).get('discretization') == 'hdg'
+               and case['parameters'].get('device') == 'cpu' for case in selected_cases(suite))
+
+
+def build_entries(plan):
+    """CUDA plans stay unchanged; CPU artifacts are optional and independently admitted."""
+    return [(group, member, plan[group][member]) for group in ('builds', 'cpu_builds')
+            if group in plan for member in MEMBERS]
+
+
+def validate_cuda_profile_cases(suite, *, cpu_available=False):
+    """A CUDA facade cannot stand in for an enabled CPU HDG workload."""
     for case in selected_cases(suite):
         parameters = case.get('parameters', {})
         if (case['adapter'] == 'dg' and parameters.get('discretization') == 'hdg' and
-                parameters.get('device') == 'cpu'):
+                parameters.get('device') == 'cpu' and not cpu_available):
             raise ValueError('CPU HDG requires a separately admitted CPU-profile executable; '
                              'this study uses CUDA-profile builds')
 
@@ -298,7 +320,8 @@ def create(args):
             case['enabled'] = case['id'] in ids
     if not selected_cases(suite):
         raise ValueError('select at least one workload')
-    validate_cuda_profile_cases(suite)
+    cpu_required = needs_cpu_build(suite)
+    validate_cuda_profile_cases(suite, cpu_available=cpu_required)
     root.mkdir(parents=True, exist_ok=False)
     (root / 'executor').mkdir()
     for name in EXECUTOR_FILES:
@@ -306,12 +329,17 @@ def create(args):
     write_json(root / 'suite.json', suite, exclusive=True)
     sources = {}
     builds = {}
+    cpu_builds = {}
     for member in MEMBERS:
         frozen = study_build.freeze(source, getattr(args, member), root / 'sources' / member)
         sources[member] = cached_source(frozen, cache)
         builds[member] = study_build.build_plan(sources[member], cache / 'builds',
                                               site_root, Path(spack_root), suite['correctness_regex'],
                                               validation_time=validation_time)
+        if cpu_required:
+            cpu_builds[member] = study_build.build_plan(sources[member], cache / 'builds',
+                                                      site_root, Path(spack_root), CPU_CORRECTNESS_REGEX,
+                                                      validation_time=validation_time, profile='cpu')
     # Same site environment policy is necessary for matched compiler/dependency comparisons.
     configs = [sha(Path(s['source_snapshot']) / 'cmake/sites/pace.json') for s in sources.values()]
     if configs[0] != configs[1]:
@@ -322,6 +350,8 @@ def create(args):
             'wall_time_limits': limits,
             'executor_sha256': {name: sha(root / 'executor' / name) for name in EXECUTOR_FILES},
             'created_unix_seconds': time.time()}
+    if cpu_builds:
+        plan['cpu_builds'] = cpu_builds
     plan['plan_sha256'] = digest(plan)
     write_json(root / 'plan.json', plan, exclusive=True)
     write_json(root / 'state.json', {'schema_version': SCHEMA, 'builds': {}, 'build_attempts': [], 'jobs': [],
@@ -437,28 +467,28 @@ def recorded_orphans(root, plan):
 def submit_pipeline(root, plan):
     """Build retries use the same verified cache; public submission receipts stay."""
     reused = {}
-    def retain(member, result):
+    def retain(group, member, result):
         state = read_json(root / 'state.json')
-        state['builds'][member] = result
-        state.setdefault('build_attempts', []).append({'member': member, **result})
+        state.setdefault(group, {})[member] = result
+        state.setdefault('build_attempts', []).append({'member': member, 'group': group, **result})
         write_json(root / 'state.json', state)
 
-    def admit_existing(member, existing):
-        result = study_build.ensure_validation_time(plan['builds'][member], existing)
-        retain(member, result)
+    def admit_existing(group, member, existing):
+        result = study_build.ensure_validation_time(plan[group][member], existing)
+        retain(group, member, result)
         if not result.get('success') or not result.get('validation_job_id'):
             raise RuntimeError('requested correctness limit not admitted; receipts retained; resume builds')
         return result
 
-    for member in MEMBERS:
+    for group, member, build in build_entries(plan):
         state = read_json(root / 'state.json')
-        key = plan['builds'][member]['app_build']
+        key = build['app_build']
         if key in reused:
-            state['builds'][member] = reused[key]
-            state.setdefault('build_attempts', []).append({'member': member, **reused[key]})
+            state.setdefault(group, {})[member] = reused[key]
+            state.setdefault('build_attempts', []).append({'member': member, 'group': group, **reused[key]})
             write_json(root / 'state.json', state)
             continue
-        existing = state['builds'].get(member)
+        existing = state.get(group, {}).get(member)
         if existing:
             job = existing.get('validation_job_id') or existing.get('build_job_id')
             if job:
@@ -468,15 +498,15 @@ def submit_pipeline(root, plan):
                         if status != 'PENDING' or not recover_orphan(
                                 root, job, 'IGRlab-check', [existing['build_job_id']],
                                 Path(plan['sources'][member]['source_snapshot']) / 'scripts/build/pace.sh'):
-                            reused[key] = admit_existing(member, existing)
+                            reused[key] = admit_existing(group, member, existing)
                             continue
                     else:
                         raise RuntimeError(f'partial build submission {job} is active; retry after it finishes')
                 if existing.get('validation_job_id') and (status, exit_code) == ('COMPLETED', '0:0'):
-                    reused[key] = admit_existing(member, existing)
+                    reused[key] = admit_existing(group, member, existing)
                     continue
-        result = reused.get(key) or study_build.submit_build(plan['builds'][member])
-        retain(member, result)
+        result = reused.get(key) or study_build.submit_build(build)
+        retain(group, member, result)
         if not result.get('success') or not result.get('validation_job_id'):
             raise RuntimeError('canonical build submission incomplete; receipts retained; resume builds')
         reused[key] = result
@@ -489,7 +519,8 @@ def submit_pipeline(root, plan):
             status, _ = job_state(job['job_id'])
             if status in ('PENDING', 'RUNNING', 'CONFIGURING', 'COMPLETING'):
                 raise RuntimeError(f"study stage job {job['job_id']} is active; inspect status")
-    dependencies = [state['builds'][m]['validation_job_id'] for m in MEMBERS]
+    dependencies = list(dict.fromkeys(state[group][member]['validation_job_id']
+                                     for group, member, _ in build_entries(plan)))
     timing_job = submit_stage(root, 'timings', dependencies)
     submit_stage(root, 'profiles', [timing_job])
 
@@ -509,13 +540,18 @@ def allocation():
 def checked_builds(root):
     state = read_json(root / 'state.json')
     ids = [str(state['builds'][member]['validation_job_id']) for member in MEMBERS]
+    plan = load_plan(root)
+    if 'cpu_builds' in plan:
+        if set(state.get('cpu_builds', {})) != set(MEMBERS):
+            raise RuntimeError('both canonical CPU correctness jobs must be recorded before measurement')
+        ids += [str(state['cpu_builds'][member]['validation_job_id']) for member in MEMBERS]
     result = subprocess.run(['sacct', '-n', '-P', '-j', ','.join(ids),
                              '--format=JobID,State,ExitCode'],
                             text=True, capture_output=True, timeout=30)
     states = {row[0]: row[1:] for line in result.stdout.splitlines()
               if len(row := line.split('|')) >= 3 and row[0] in ids}
     if result.returncode or any(states.get(job, [])[:2] != ['COMPLETED', '0:0'] for job in ids):
-        raise RuntimeError('both canonical correctness jobs must complete successfully before measurement')
+        raise RuntimeError('all canonical correctness jobs must complete successfully before measurement')
 
 
 def admit(root, plan, suite):
@@ -586,6 +622,19 @@ def admit(root, plan, suite):
     value = {'schema_version': SCHEMA, 'plan_sha256': plan['plan_sha256'],
              'binaries': binaries, 'artifact_sha256': artifacts,
              'spack_locations': locations, 'dependency_bindings': binding_records}
+    if 'cpu_builds' in plan:
+        state = read_json(root / 'state.json')
+        names = sorted({case['binary'] for case in selected_cases(suite)
+                        if case.get('parameters', {}).get('device') == 'cpu'})
+        value['cpu_artifacts'] = {}
+        for member in MEMBERS:
+            cpu = study_admit.admit_build(plan['cpu_builds'][member], names,
+                                          state['cpu_builds'][member])
+            for artifact, expected in cpu['artifact_sha256'].items():
+                if artifact in artifacts and artifacts[artifact] != expected:
+                    raise RuntimeError('CPU and CUDA artifact receipts disagree')
+                artifacts[artifact] = expected
+            value['cpu_artifacts'][member] = cpu
     path = root / 'admission.json'
     if path.exists():
         if read_json(path) != value:
@@ -597,11 +646,20 @@ def admit(root, plan, suite):
 
 def observe(runner, root, plan, admission, case, member, label, gpu, *, fields=False):
     workdir = runner.output / label
-    binary = Path(admission['binaries'][member][case['binary']])
+    cpu = (admission.get('cpu_artifacts', {}).get(member)
+           if case.get('parameters', {}).get('device') == 'cpu' else None)
+    if (case.get('parameters', {}).get('device') == 'cpu' and
+            case.get('parameters', {}).get('discretization') == 'hdg' and cpu is None):
+        raise RuntimeError('CPU HDG requires its independently admitted CPU artifact')
+    binary = Path(cpu['binaries'][case['binary']] if cpu else
+                  admission['binaries'][member][case['binary']])
     source = Path(plan['sources'][member]['source_snapshot'])
     command = study_workloads.command(case, binary, source, workdir, fields=fields)
     environment = os.environ.copy()
     environment.update(study_workloads.environment(case, workdir, fields=fields))
+    if cpu:
+        command, overrides = study_admit.runtime_command(cpu, command, environment)
+        environment.update(overrides)
     directory = runner.run(label, command, cwd=workdir, env=environment)
     timing_metadata = {}
     if case['adapter'] == 'dg' and case['parameters'].get('discretization') == 'hdg':
@@ -901,7 +959,7 @@ def resume(args):
 def retry_build_artifacts(plan, suite, old_admission=None):
     """Freeze completed build bytes; compute admission still proves live bindings."""
     paths = set((old_admission or {}).get('artifact_sha256', {}))
-    for build in plan['builds'].values():
+    for group, _, build in build_entries(plan):
         app, mfem, install, env = map(Path, (build['app_build'], build['mfem_build'],
                                            build['mfem_install'], build['spack_env']))
         paths.update(map(str, (app / 'CMakeCache.txt', mfem / 'CMakeCache.txt',
@@ -917,7 +975,9 @@ def retry_build_artifacts(plan, suite, old_admission=None):
             raise RuntimeError('completed MFEM library is missing')
         paths.update(map(str, libraries))
         paths.update(str(p) for p in install.rglob('MFEMTargets-*.cmake'))
-        for name in {case['binary'] for case in selected_cases(suite)}:
+        cases = [case for case in selected_cases(suite) if group == 'builds' or
+                 case.get('parameters', {}).get('device') == 'cpu']
+        for name in {case['binary'] for case in cases}:
             matches = [p for p in app.rglob(name) if p.is_file() and os.access(p, os.X_OK)]
             if len(matches) != 1:
                 raise RuntimeError(f'missing or ambiguous completed executable: {name}')
@@ -1012,7 +1072,7 @@ def retry(args):
     with locked(old):
         plan = verify(old, binaries=(old / 'admission.json').exists())
         state = read_json(old / 'state.json')
-        if set(plan['executor_sha256']) != set(EXECUTOR_FILES):
+        if set(plan['executor_sha256']) not in (set(EXECUTOR_FILES), set(LEGACY_EXECUTOR_FILES)):
             raise RuntimeError('old run lacks the complete frozen executor identity')
         old_suite = study_workloads.load_suite(old / 'suite.json')
         suite_path = getattr(args, 'suite', None)
@@ -1040,17 +1100,17 @@ def retry(args):
                 case['enabled'] = case['id'] in ids
         if not selected_cases(suite):
             raise ValueError('retry requires at least one enabled workload')
-        validate_cuda_profile_cases(suite)
+        validate_cuda_profile_cases(suite, cpu_available='cpu_builds' in plan)
         protected = [old, Path(plan['cache_root']), Path(__file__).resolve().parents[2]]
         protected += [Path(s['source_snapshot']) for s in plan['sources'].values()]
-        protected += [Path(b[key]) for b in plan['builds'].values() for key in
+        protected += [Path(b[key]) for _, _, b in build_entries(plan) for key in
                       ('app_build', 'app_install', 'mfem_build', 'mfem_install', 'spack_env')]
         if any(root.resolve().is_relative_to(p.resolve()) for p in protected):
             raise ValueError('retry destination is inside an old run, source, or protected cache')
         if root.exists():
             raise ValueError('retry run directory must be new')
-        for member in MEMBERS:
-            receipt, build = state['builds'][member], plan['builds'][member]
+        for group, member, build in build_entries(plan):
+            receipt = state.get(group, {}).get(member, {})
             if (receipt.get('success') is not True or receipt.get('returncode') != 0 or
                     receipt.get('source_fingerprint') != plan['sources'][member]['source_fingerprint'] or
                     receipt.get('configuration_key') != build['configuration_key'] or
@@ -1099,7 +1159,8 @@ def retry(args):
             elif job in active:
                 raise RuntimeError('retry withheld: scheduler active/accounting states disagree')
         checked_builds(old)
-        if any(outcomes[state['builds'][m]['build_job_id']] != ('COMPLETED', '0:0') for m in MEMBERS):
+        if any(outcomes[state[group][member]['build_job_id']] != ('COMPLETED', '0:0')
+               for group, member, _ in build_entries(plan)):
             raise RuntimeError('retry requires completed successful canonical builds')
         artifacts = retry_build_artifacts(plan, suite, read_json(old / 'admission.json')
                                          if (old / 'admission.json').exists() else None)
@@ -1144,9 +1205,13 @@ def retry(args):
                          'artifact_sha256': {'attempts/timings-reused/summary.json': retained['summary_sha256']},
                          'timings_reused': True, 'reused_from': {'run_dir': str(old),
                              'summary': retained['summary'], 'summary_sha256': retained['summary_sha256']}}]
-        write_json(root / 'state.json', {'schema_version': SCHEMA, 'builds': state['builds'],
-                   'build_attempts': [{'member': m, **state['builds'][m]} for m in MEMBERS],
-                   'jobs': [], 'attempts': attempts}, exclusive=True)
+        new_state = {'schema_version': SCHEMA, 'builds': state['builds'],
+                     'build_attempts': [{'member': member, 'group': group, **state[group][member]}
+                                        for group, member, _ in build_entries(plan)],
+                     'jobs': [], 'attempts': attempts}
+        if 'cpu_builds' in plan:
+            new_state['cpu_builds'] = state['cpu_builds']
+        write_json(root / 'state.json', new_state, exclusive=True)
     with locked(root):
         verify(root)
         if not args.prepare_only:
@@ -1206,6 +1271,10 @@ def report(root):
         member: ('run-only' if plan.get('builds', {}).get(member, {}).get('run_only_validation') is True
                  else 'legacy-driver' if plan.get('builds', {}).get(member, {}).get('run_only_validation') is False
                  else 'not-recorded') for member in MEMBERS}
+    if 'cpu_builds' in plan:
+        result['validation_execution'].update({
+            'cpu-' + member: ('run-only-prebuilt' if plan['cpu_builds'][member].get('run_only_validation')
+                              else 'not-recorded') for member in MEMBERS})
     result['timing_provenance'] = plan.get('timing_reuse', {'scope': 'fresh timing observations in this run'})
     for stage in ('timings', 'profiles'):
         attempt = completed(state, stage)
@@ -1339,6 +1408,8 @@ def collect(args):
 def status(root):
     plan = verify(root)
     print('Comparison: ' + comparison_description(plan)[1] + '.')
+    if 'cpu_builds' in plan:
+        print('Build profiles: CUDA SM80 and separately validated CPU artifacts; CPU children use CPU MPI.')
     if plan.get('timing_reuse'):
         print('Timings reused from ' + plan['timing_reuse']['run_dir'] + '; fresh profiles only.')
     state = read_json(root / 'state.json')

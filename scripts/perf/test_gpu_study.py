@@ -441,7 +441,7 @@ class StudyProtocol(unittest.TestCase):
                 patch.object(study, 'submit_stage', side_effect=['102', '103']) as stages:
             study.submit_pipeline(self.root, self.plan)
         self.assertEqual(build.call_count, 1)
-        self.assertEqual(stages.call_args_list[0].args, (self.root, 'timings', ['101', '101']))
+        self.assertEqual(stages.call_args_list[0].args, (self.root, 'timings', ['101']))
         state = study.read_json(self.root / 'state.json')
         self.assertEqual(state['builds']['baseline'], state['builds']['candidate'])
         state['builds'] = {}

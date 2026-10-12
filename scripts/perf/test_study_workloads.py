@@ -459,12 +459,12 @@ class WorkloadTests(unittest.TestCase):
             case['parameters'].update(changed)
             with self.subTest(changed=changed), self.assertRaises(ValueError): workloads.parameters(case)
 
-    def test_cpu_active_igr_admits_only_ordinary_dg_and_unfused_dgsem(self):
-        for discretization in ('dg', 'dgsem'):
+    def test_cpu_active_igr_admits_ordinary_dg_hdg_and_unfused_dgsem(self):
+        for discretization in ('dg', 'dgsem', 'hdg'):
             case = self.igr_case(discretization)
             case['parameters']['device'] = 'cpu'
             self.assertEqual(workloads.parameters(case)['device'], 'cpu')
-        for change in ({'discretization': 'hdg'}, {'engine': 'tensor'},
+        for change in ({'discretization': 'hdg', 'engine': 'tensor'}, {'engine': 'tensor'},
                        {'discretization': 'dgsem', 'dgsem_residual': 'fused-simt'},
                        {'discretization': 'dgsem', 'dgsem_residual': 'fused-dmma'},
                        {'dgsem_residual': 'fused-simt'}, {'device': 'other'}):
@@ -478,9 +478,9 @@ class WorkloadTests(unittest.TestCase):
         base = workloads.load_suite(IGR_SUITE)
         self.assertEqual((suite['repetitions'], suite['warmups']), (3, 1))
         self.assertEqual(suite['correctness_regex'], base['correctness_regex'])
-        self.assertEqual(len(suite['cases']), 8)
+        self.assertEqual(len(suite['cases']), 11)
         self.assertEqual(sum(case['enabled'] for case in suite['cases']), 4)
-        self.assertEqual(sum(case['optional'] for case in suite['cases']), 4)
+        self.assertEqual(sum(case['optional'] for case in suite['cases']), 7)
         for point in (6, 32):
             for discretization in ('dg', 'dgsem'):
                 cases = [next(case for case in suite['cases']
@@ -509,6 +509,27 @@ class WorkloadTests(unittest.TestCase):
                     cuda_env = workloads.environment(cuda, self.work)
                 self.assertEqual(cpu_env.pop('OMP_NUM_THREADS'), '1')
                 self.assertEqual(cpu_env, cuda_env)
+
+    def test_optional_hdg_cpu_cuda_tensor_cases_pin_same_small_active_igr_work(self):
+        suite = workloads.load_suite(IGR_CPU_SUITE)
+        cases = [next(case for case in suite['cases'] if case['id'] == identifier) for identifier in
+                 ('hdg-igr-cpu-p3-n6', 'hdg-igr-cuda-p3-n6', 'hdg-igr-tensor-p3-n6')]
+        reference = {key: value for key, value in cases[0]['parameters'].items()
+                     if key not in ('device', 'engine')}
+        for case in cases:
+            self.assertFalse(case['enabled'])
+            self.assertTrue(case['optional'])
+            p = workloads.parameters(case)
+            self.assertEqual({key: value for key, value in p.items() if key not in ('device', 'engine')}, reference)
+            self.assertEqual((p['order'], p['final_time'], p['dt']), (3, 1e-4, 1e-5))
+            self.assertEqual((p['regularization'], p['c_alpha'], p['igr_alpha_length']), ('igr', 1, 'min'))
+            lines = (ROOT / p['mesh']).read_text().splitlines()
+            self.assertEqual(int(lines[lines.index('elements') + 1]), 36)
+            for options in ({}, {'fields': True}, {'profile': True}):
+                argv = workloads.command(case, Path('/admitted/app'), ROOT, self.work, **options)
+                self.assertEqual(argv[argv.index('--device') + 1], p['device'])
+                self.assertEqual(argv[argv.index('--regularization') + 1], 'igr')
+                self.assertEqual(argv[argv.index('--igr-alpha-length') + 1], 'min')
 
     def test_cpu_active_igr_native_record_pattern_keeps_certificate_and_backend_gates(self):
         # Native CPU/GPU closure records share this grammar. These are parser
@@ -594,17 +615,19 @@ class WorkloadTests(unittest.TestCase):
     def test_active_hdg_pins_coupled_production_policy_without_dg_certificate_claim(self):
         case = self.igr_case('hdg')
         policy = ' c_alpha=1 alpha_effective=0.01 alpha_length_policy=min h_eff=0.1 euler_trace_penalty=1'
-        text = self.hdg_application_log(engine='ordinary').replace('regularization=none', 'regularization=igr')
-        self.stdout.write_text(text.strip() + policy + '\n')
-        result = workloads.parse(case, self.stdout, self.stderr, GPU, wall_seconds=0.5)
-        self.assertEqual(result['signature']['application_policy']['alpha_length_policy'], 'min')
-        self.assertNotIn('igr_evidence', result)
-        for before, after in (('c_alpha=1', 'c_alpha=2'), ('alpha_effective=0.01', 'alpha_effective=nan'),
-                              ('h_eff=0.1', 'h_eff=0'), ('alpha_length_policy=min', 'alpha_length_policy=local'),
-                              ('euler_trace_penalty=1', 'euler_trace_penalty=0')):
-            self.stdout.write_text((text.strip() + policy + '\n').replace(before, after))
-            with self.subTest(before=before), self.assertRaises(ValueError):
-                workloads.parse(case, self.stdout, self.stderr, GPU, wall_seconds=0.5)
+        for device in ('cuda', 'cpu'):
+            case['parameters']['device'] = device
+            text = self.hdg_application_log(device=device, engine='ordinary').replace('regularization=none', 'regularization=igr')
+            self.stdout.write_text(text.strip() + policy + '\n')
+            result = workloads.parse(case, self.stdout, self.stderr, GPU if device == 'cuda' else None, wall_seconds=0.5)
+            self.assertEqual(result['signature']['application_policy']['alpha_length_policy'], 'min')
+            self.assertNotIn('igr_evidence', result)
+            for before, after in (('c_alpha=1', 'c_alpha=2'), ('alpha_effective=0.01', 'alpha_effective=nan'),
+                                  ('h_eff=0.1', 'h_eff=0'), ('alpha_length_policy=min', 'alpha_length_policy=local'),
+                                  ('euler_trace_penalty=1', 'euler_trace_penalty=0')):
+                self.stdout.write_text((text.strip() + policy + '\n').replace(before, after))
+                with self.subTest(device=device, before=before), self.assertRaises(ValueError):
+                    workloads.parse(case, self.stdout, self.stderr, GPU if device == 'cuda' else None, wall_seconds=0.5)
 
     def test_active_igr_fields_require_finite_nonzero_sigma_at_existing_tolerance(self):
         case = self.igr_case()
