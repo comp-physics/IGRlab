@@ -262,9 +262,18 @@ inline void CheckMetadataNegativeGates(TestContext& ctx,
   metadata.dimension = 3;
   expect_metadata(DGSEMProductionReason::UnsupportedDimension, "dimension");
   metadata.dimension = 1;
-  metadata.order = 11;
+  metadata.order = std::numeric_limits<int>::max();
   expect_metadata(DGSEMProductionReason::UnsupportedOrder, "order");
+  metadata.order = 46340;
+  expect_metadata(DGSEMProductionReason::UnsupportedOrder,
+                  "derivative-matrix-index-overflow");
+  metadata.order = 0;
+  expect_metadata(DGSEMProductionReason::UnsupportedOrder, "zero-order");
   metadata.order = 1;
+  metadata.elements = std::numeric_limits<int>::max();
+  expect_metadata(DGSEMProductionReason::UnsupportedTensorElement,
+                  "packed-row-index-overflow");
+  metadata.elements = 1;
 
   lex[1] = 0;
   expect_metadata(DGSEMProductionReason::InvalidLexicographicMap,
@@ -452,7 +461,7 @@ inline void CheckUnsupportedDimensionOrderNoMutation(TestContext& ctx,
   };
 
   check(3, 1, DGSEMProductionReason::UnsupportedDimension, "dimension");
-  check(1, 11, DGSEMProductionReason::UnsupportedOrder, "order");
+  check(1, 0, DGSEMProductionReason::UnsupportedOrder, "zero-order");
 }
 
 inline void CheckPolicyFingerprintNegatives(TestContext& ctx,
@@ -1903,6 +1912,10 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
   RunDGSEMProductionMultStrictRejectionProbe(ctx);
   ScopedEnvironment strict_production_mult(
     "DG_IGR_DGSEM_PRODUCTION_STRICT", "1");
+  // This fixture covers runtime-sized packed kernels, including an order
+  // beyond the separately compiled fused dispatch.
+  ScopedEnvironment fused_residual("DG_IGR_DGSEM_FUSED_RESIDUAL", "0");
+  ScopedEnvironment fused_dmma("DG_IGR_DGSEM_FUSED_DMMA", "0");
   CheckDGSEMProductionMultSerialIdentityAndMove(ctx);
   CheckDGSEMProductionMixedEulerBoundaries(ctx);
   CheckDGSEMProductionEulerBoundaryCatalog(ctx);
@@ -1913,7 +1926,7 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
   constexpr double constant_tolerance = 3.0e-10;
   const int world_size = mfem::Mpi::WorldSize();
   constexpr int validation_control_cases = 3;
-  constexpr int direct_validation_rejection_cases = 18;
+  constexpr int direct_validation_rejection_cases = 21;
   ctx.Check(world_size == 1 || world_size == 2,
             "DGSEM production fixture is bounded to one/two ranks");
 
@@ -1976,7 +1989,7 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
     for (int geometry_mode = 0; geometry_mode < geometry_modes;
          ++geometry_mode)
     {
-      for (int order = 1; order <= 10; ++order)
+      for (int order : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12})
       {
         ScopedEnvironment high_order_research(
           "DG_IGR_DGSEM_HIGH_ORDER_RESEARCH", nullptr);
@@ -3057,11 +3070,11 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
     }
   }
 
-  ctx.Check(executed_cases == 60,
-            "DGSEM production executes affine/sheared p1-p10 1D/2D "
+  ctx.Check(executed_cases == 66,
+            "DGSEM production executes affine/sheared p1-p10/p12 1D/2D "
             "zero/frozen-sigma cases");
-  ctx.Check(production_mult_cases == 60,
-            "DGSEM production Mult executes all focused p1-p10 1D/2D cases");
+  ctx.Check(production_mult_cases == 66,
+            "DGSEM production Mult executes all focused p1-p10/p12 1D/2D cases");
   ctx.Check(production_mult_mapping_cases > 0,
             "DGSEM production Mult executes true/local P and P^T mapping");
   ctx.Check(max_mult_true_residual_difference < residual_tolerance &&
@@ -3166,7 +3179,7 @@ inline void RunDGSEMProductionOperatorTests(TestContext& ctx)
     out << "{\n"
         << "  \"schema\": \"dgsem-production-operator-v2\",\n"
         << "  \"dimensions\": [1, 2],\n"
-        << "  \"orders\": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],\n"
+        << "  \"orders\": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12],\n"
         << "  \"sigma_modes\": [\"zero\", \"stage-frozen\"],\n"
         << "  \"ranks\": " << world_size << ",\n"
         << "  \"executed_cases\": " << executed_cases << ",\n"

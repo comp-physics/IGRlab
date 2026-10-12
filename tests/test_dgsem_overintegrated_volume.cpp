@@ -90,7 +90,7 @@ int main(int argc,char**argv)
   MFEM_VERIFY(backend=="cpu"||backend=="cuda","Use cpu or cuda.");Device device(backend.c_str());
   MFEM_VERIFY(backend!="cuda"||Device::Allows(Backend::CUDA),"CUDA backend inactive.");
   double parity=0.,lgl_parity=0.,alias_difference=0.,budget=0.;int cases=0;
-  for(int p:{3,5,7,10})
+  for(int p:{3,5,7,10,12})
   {
     Mesh serial=Mesh::MakeCartesian2D(2,2,Element::QUADRILATERAL,true,1.,1.);
     serial.Transform([](const Vector& x,Vector& y)
@@ -134,7 +134,7 @@ int main(int argc,char**argv)
       DenseMatrix native_flux,native_weak;Vector native_speed;
       BuildEulerContravariantFluxDevice(2,1.4,1e-12,states,sigma_nodes,metrics,native_flux,native_speed);
       ApplyCentralVolumeDevice(2,p+1,map,basis.Dsplit,basis.weights,native_flux,native_weak);
-      for(int quadrature:{-1,2*p,22})
+      for(int quadrature:{-1,2*p,p>10?28:22})
       {
         const auto& ir=quadrature<0?lgl_ir:IntRules.Get(Geometry::SQUARE,quadrature);
         DenseMatrix b,g,qstate,qmetric(ne*ir.GetNPoints(),4),qflux,actual;Vector qsigma,qspeed;
