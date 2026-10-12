@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 import study_admit as study
+import study_import
 
 
 class StudyAdmitTests(unittest.TestCase):
@@ -185,6 +186,30 @@ MPI_CXX_COMPILER:FILEPATH={mpi}/bin/mpicxx
         self.verifier.verify = reject
         with self.assertRaisesRegex(ValueError, 'canonical artifacts changed'):
             self.admission()
+
+    def test_imported_reuse_audit_is_preserved_with_full_cpu_artifact_checks(self):
+        self.plan.update(origin=study_import.ORIGIN, reuse_validated_artifacts=True,
+                         test_result='/retained/passed/result.json', test_result_sha256='sealed-result')
+        authority = {'query_performed': False, 'query_status': 'not_queried',
+                     'authority': 'canonical prebuilt receipt and sealed actual Passed test outcomes'}
+        observed = {'job_ids': {'build': '123'}, 'request': str(self.request),
+                    'request_sha256': study.sha(self.request),
+                    'build_accounting': {**authority, 'historical_job_id': '123'},
+                    'test_allocation_accounting': {**authority, 'historical_job_id': '789'},
+                    'test_execution_scope': 'sealed outcomes; historical accounting not queried'}
+        with patch.object(study_import, 'completed_records', return_value=observed) as retained:
+            admission = self.admission()
+            retained.assert_called_once_with(self.plan, self.receipt)
+            audit = admission['canonical_jobs']
+            self.assertEqual(audit['build_accounting'], observed['build_accounting'])
+            self.assertEqual(audit['test_allocation_accounting'], observed['test_allocation_accounting'])
+            self.assertNotIn('accounting', audit)
+            self.assertNotIn('sacct', [argv[0] for argv, _ in self.calls])
+            self.assertIn('loader', admission['dependency_bindings'])
+            self.assertEqual(admission['artifact_sha256'][str(self.binary)], study.sha(self.binary))
+            self.verifier.verify = lambda args: (_ for _ in ()).throw(ValueError('canonical artifacts changed'))
+            with self.assertRaisesRegex(ValueError, 'canonical artifacts changed'):
+                self.admission()
 
     def test_stale_loader_or_cuda_link_rejects(self):
         self.ldd = self.ldd.replace(self.locations['openmpi'], str(self.root / 'other-mpi'))

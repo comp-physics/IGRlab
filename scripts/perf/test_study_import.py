@@ -174,8 +174,105 @@ class StudyImportTests(unittest.TestCase):
             output = ' '.join(key + '=' + value for key, value in self.fields.items())
         return subprocess.CompletedProcess(argv, 0, output, '')
 
-    def plan(self):
-        return study.existing_plan(self.record, '^accept-')
+    def plan(self, *, reuse_validated_artifacts=False):
+        return study.existing_plan(self.record, '^accept-',
+                                   reuse_validated_artifacts=reuse_validated_artifacts)
+
+    def test_explicit_artifact_reuse_retains_seals_without_historical_queries(self):
+        # Neither expired accounting nor the later state of the old allocation
+        # is an authority in this mode; the sealed real outcomes remain so.
+        with patch.object(study, 'run', side_effect=AssertionError('historical query')), \
+                patch.object(study, 'accounting', side_effect=AssertionError('historical accounting')):
+            plan = self.plan(reuse_validated_artifacts=True)
+            result = study.completed_records(plan, study.receipt(plan), full=True)
+        self.assertTrue(plan['reuse_validated_artifacts'])
+        self.assertTrue(study.receipt(plan)['reuse_validated_artifacts'])
+        self.assertEqual(result['artifact_sha256'][str(self.binary)], study.sha(self.binary))
+        for key, job in (('build_accounting', '101'), ('test_allocation_accounting', '202')):
+            audit = result[key]
+            self.assertFalse(audit['query_performed'])
+            self.assertEqual(audit['query_status'], 'not_queried')
+            self.assertEqual(audit['historical_job_id'], job)
+            self.assertEqual(audit['test_result_sha256'], study.sha(self.result_path))
+            self.assertEqual(audit['prebuilt_receipt_sha256'], study.sha(self.prebuilt))
+            self.assertNotIn('row', audit)
+        self.assertEqual(result['job_ids'], {'build': '101'})
+        self.assertIn('no historical job completion claim', result['test_execution_scope'])
+
+    def test_default_and_legacy_imports_keep_strict_accounting(self):
+        plan = self.plan()
+        receipt = study.receipt(plan)
+        del plan['reuse_validated_artifacts']
+        del receipt['reuse_validated_artifacts']
+        self.build_state = 'FAILED'
+        with self.assertRaisesRegex(ValueError, 'build did not complete'):
+            study.completed_records(plan, receipt)
+        self.assertEqual(self.calls[-1][0], 'sacct')
+
+    def test_artifact_reuse_requires_exact_boolean_plan_and_receipt_mode(self):
+        for mode in (1, 'yes', None):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, 'explicit boolean'):
+                self.plan(reuse_validated_artifacts=mode)
+        plan = self.plan(reuse_validated_artifacts=True)
+        for mode in (False, 1, None):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, 'reuse mode differs'):
+                study.completed_records(plan, {**study.receipt(plan), 'reuse_validated_artifacts': mode})
+
+    def test_artifact_reuse_rejects_changed_seals_and_canonical_verifier_failure(self):
+        plan = self.plan(reuse_validated_artifacts=True)
+        with patch.object(study, 'run', side_effect=AssertionError('historical query')):
+            for path in (self.request, self.result_path, self.stdout, self.prebuilt,
+                         self.source / 'scripts/build/prebuilt_validation.py', self.source / 'production.cpp'):
+                original = path.read_bytes()
+                with self.subTest(path=path):
+                    path.write_bytes(original + b' ')
+                    with self.assertRaises(ValueError):
+                        study.completed_records(plan, study.receipt(plan))
+                    path.write_bytes(original)
+            with patch.object(self.receipt_module, 'admission',
+                              side_effect=ValueError('canonical artifact bytes changed')):
+                with self.assertRaisesRegex(ValueError, 'canonical artifact bytes changed'):
+                    study.completed_records(plan, study.receipt(plan), full=True)
+
+    def test_artifact_reuse_still_requires_passed_coverage_and_native_free_allocation(self):
+        original = deepcopy(self.result)
+        for change in ({'success': False}, {'returncode': 8}, {'test_outcomes': []},
+                       {'identity_verified_before_and_after': False}):
+            with self.subTest(change=change):
+                self.result = {**deepcopy(original), **change}
+                self.publish_result()
+                with self.assertRaises(ValueError):
+                    self.plan(reuse_validated_artifacts=True)
+        for field, value in (('QOS', 'paid'), ('Account', 'unrelated')):
+            with self.subTest(field=field):
+                self.result = deepcopy(original)
+                self.result['allocation_before']['scheduler']['fields'][field] = value
+                self.result['allocation_after']['scheduler']['fields'][field] = value
+                self.publish_result()
+                with self.assertRaises(ValueError):
+                    self.plan(reuse_validated_artifacts=True)
+        self.result = deepcopy(original)
+        self.result['allocation_before']['gpu']['compute_capability'] = '7.0'
+        self.result['allocation_after']['gpu']['compute_capability'] = '7.0'
+        self.publish_result()
+        with self.assertRaises(ValueError):
+            self.plan(reuse_validated_artifacts=True)
+        self.result = deepcopy(original)
+        self.result['selected_ctest']['graph']['tests'] = self.tests[:1]
+        self.publish_result()
+        with self.assertRaisesRegex(ValueError, 'cover the suite'):
+            self.plan(reuse_validated_artifacts=True)
+
+    def test_manifest_applies_explicit_reuse_to_each_imported_member(self):
+        manifest = self.root / 'reuse-import.json'
+        self.write(manifest, json.dumps({'schema_version': 1, 'builds': dict.fromkeys(study.MEMBERS, self.record)}))
+        with patch.object(study, 'run', side_effect=AssertionError('historical query')):
+            plans, receipts, records, _ = study.inspect_manifest(
+                manifest, '^accept-', '^cpu-', reuse_validated_artifacts=True)
+        for member in study.MEMBERS:
+            self.assertTrue(plans['builds'][member]['reuse_validated_artifacts'])
+            self.assertTrue(receipts['builds'][member]['reuse_validated_artifacts'])
+            self.assertEqual(records['builds/' + member]['build_accounting']['query_status'], 'not_queried')
 
     def test_actual_build_only_duplicate_a100_and_filtered_backtrace_import(self):
         plan = self.plan()
@@ -401,6 +498,11 @@ class StudyImportTests(unittest.TestCase):
         self.assertNotIn('validation_job_id', receipt)
         self.assertEqual(admitted['test_result'], str(self.result_path))
         self.assertEqual(admitted['job_ids'], {'build': '101'})
+        with patch.object(study, 'run', side_effect=AssertionError('historical query')):
+            reuse_plan = self.plan(reuse_validated_artifacts=True)
+            reused = study_admit.completed_jobs(reuse_plan, study.receipt(reuse_plan))
+        self.assertEqual(reused['test_allocation_accounting']['query_status'], 'not_queried')
+        self.assertEqual(reused['build_accounting']['historical_job_id'], '101')
 
     def test_cpu_group_cannot_import_cuda_facade_records(self):
         manifest = self.root / 'mixed.json'

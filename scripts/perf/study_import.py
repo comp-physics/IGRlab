@@ -92,9 +92,11 @@ def options(argv):
     return values, switches
 
 
-def existing_plan(record, correctness_regex):
+def existing_plan(record, correctness_regex, *, reuse_validated_artifacts=False):
+    require(type(reuse_validated_artifacts) is bool, 'artifact reuse mode must be an explicit boolean')
     require(isinstance(record, dict) and set(record) == {'build_request', 'build_job_id', 'test_result'},
             'import member requires build_request, build_job_id and test_result only')
+    require(re.fullmatch(r'[1-9][0-9]*', str(record['build_job_id'])), 'invalid real scheduler job ID')
     request_path, result_path = exact(record['build_request']), exact(record['test_result'])
     request_sha, result_sha = sha(request_path), sha(result_path)
     request = json.loads(request_path.read_text())
@@ -129,6 +131,7 @@ def existing_plan(record, correctness_regex):
     configuration = {'source_fingerprint': identity['source_fingerprint'], 'profile': profile,
                      'request_sha256': request_sha}
     plan = {'schema_version': 1, 'origin': ORIGIN, 'profile': profile, 'source': identity,
+            'reuse_validated_artifacts': reuse_validated_artifacts,
             'configuration': configuration, 'configuration_key': study_build._json_hash(configuration),
             'request_path': str(request_path), 'request_sha256': request_sha,
             'request_argv': request['argv'], 'argv': command[:-1], 'env': environment,
@@ -269,12 +272,38 @@ def accounting(job):
 
 
 def completed_records(plan, receipt, *, full=False):
-    require(receipt.get('origin') == ORIGIN and receipt.get('success') is True and
+    reuse = plan.get('reuse_validated_artifacts', False)
+    require(type(reuse) is bool and type(receipt.get('reuse_validated_artifacts', False)) is bool and
+            receipt.get('reuse_validated_artifacts', False) == reuse,
+            'imported artifact reuse mode differs from its receipt')
+    require(plan.get('origin') == ORIGIN and receipt.get('origin') == ORIGIN and receipt.get('success') is True and
             receipt.get('build_job_id') == plan['build_job_id'] and
             receipt.get('test_result') == plan['test_result'] and 'validation_job_id' not in receipt,
             'import must retain real build and test-result records without a validation job substitute')
     study_build.verify_source(plan['source'])
     validation = validate_result(plan, full=full)
+    if reuse:
+        # This explicit mode uses the actual canonical build/test seals. It
+        # makes no claim about the later state of their historical Slurm jobs.
+        result = validation['result']
+        start, finish = result['started_unix_seconds'], result['finished_unix_seconds']
+        job = result['allocation_before']['scheduler']['fields']['JobId']
+        require(all(re.fullmatch(r'[1-9][0-9]*', str(value)) for value in (plan['build_job_id'], job)) and
+                type(start) in (int, float) and type(finish) in (int, float) and
+                math.isfinite(start) and math.isfinite(finish) and start <= finish,
+                'invalid retained build/test allocation identity or sealed interval')
+        authority = {'query_performed': False, 'query_status': 'not_queried',
+                     'mode': 'reuse_validated_artifacts',
+                     'authority': 'canonical prebuilt receipt and sealed actual Passed test outcomes',
+                     'prebuilt_receipt': result['prebuilt_receipt'],
+                     'prebuilt_receipt_sha256': result['prebuilt_receipt_sha256'],
+                     'test_result': plan['test_result'], 'test_result_sha256': plan['test_result_sha256']}
+        validation.update(job_ids={'build': plan['build_job_id']}, request=plan['request_path'],
+                          request_sha256=plan['request_sha256'],
+                          build_accounting={**authority, 'historical_job_id': plan['build_job_id']},
+                          test_allocation_accounting={**authority, 'historical_job_id': job},
+                          test_execution_scope='sealed Passed outcomes; historical accounting not queried by explicit opt-in; no historical job completion claim')
+        return validation
     build = accounting(plan['build_job_id'])
     row = build['row']
     require(row[1:3] == ['COMPLETED', '0:0'] and row[6] == 'IGRlab-build',
@@ -347,6 +376,7 @@ def selected_binaries(plan, names):
 
 def receipt(plan):
     return {'origin': ORIGIN, 'success': True, 'returncode': 0,
+            'reuse_validated_artifacts': plan.get('reuse_validated_artifacts', False),
             'build_job_id': plan['build_job_id'], 'test_result': plan['test_result'],
             'test_result_sha256': plan['test_result_sha256'],
             'argv': plan['argv'],
@@ -354,7 +384,7 @@ def receipt(plan):
             'configuration_key': plan['configuration_key']}
 
 
-def inspect_manifest(path, correctness_regex, cpu_regex):
+def inspect_manifest(path, correctness_regex, cpu_regex, *, reuse_validated_artifacts=False):
     path = exact(path)
     expected_sha = sha(path)
     manifest = json.loads(path.read_text())
@@ -369,7 +399,8 @@ def inspect_manifest(path, correctness_regex, cpu_regex):
         require(set(manifest[group]) == set(MEMBERS), 'import requires exactly baseline and candidate members')
         plans[group], receipts[group] = {}, {}
         for member in MEMBERS:
-            plan = existing_plan(manifest[group][member], correctness_regex if group == 'builds' else cpu_regex)
+            plan = existing_plan(manifest[group][member], correctness_regex if group == 'builds' else cpu_regex,
+                                 reuse_validated_artifacts=reuse_validated_artifacts)
             require(plan['profile'] == ('cuda-sm80' if group == 'builds' else 'cpu'),
                     'import artifact profile differs from its CUDA/CPU group')
             plans[group][member] = plan

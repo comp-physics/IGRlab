@@ -51,6 +51,8 @@ def completed_jobs(plan, receipt):
         observed = study_import.completed_records(plan, receipt)
         return {key: observed[key] for key in ('job_ids', 'request', 'request_sha256')} | {
             'test_result': plan['test_result'], 'test_result_sha256': plan['test_result_sha256'],
+            'build_accounting': observed['build_accounting'],
+            'test_allocation_accounting': observed['test_allocation_accounting'],
             'scope': observed['test_execution_scope']}
     require(receipt.get('success') is True and receipt.get('returncode') == 0,
             'a successful real canonical submission receipt is required')

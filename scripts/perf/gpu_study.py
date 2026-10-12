@@ -328,7 +328,8 @@ def import_existing(args):
     if not selected_cases(suite):
         raise ValueError('select at least one workload')
     plans, receipts, records, artifacts = study_import.inspect_manifest(
-        args.artifacts, suite['correctness_regex'], CPU_CORRECTNESS_REGEX)
+        args.artifacts, suite['correctness_regex'], CPU_CORRECTNESS_REGEX,
+        reuse_validated_artifacts=getattr(args, 'reuse_validated_artifacts', False))
     validate_cuda_profile_cases(suite, cpu_available='cpu_builds' in plans)
     builds = plans['builds']
     sources = {member: builds[member]['source'] for member in MEMBERS}
@@ -362,6 +363,7 @@ def import_existing(args):
                                  for stage in ('timings', 'profiles')},
             'executor_sha256': {name: sha(root / 'executor' / name) for name in EXECUTOR_FILES},
             'import_origin': {'scope': 'existing canonical artifacts and sealed Passed test outcomes; no build or test rerun',
+                              'reuse_validated_artifacts': getattr(args, 'reuse_validated_artifacts', False),
                               'artifact_sha256': artifacts,
                               'scheduler_records': {key: {name: value for name, value in record.items() if name in
                                                    ('build_accounting', 'test_allocation_accounting', 'test_execution_scope')}
@@ -1902,6 +1904,8 @@ def main(argv=None):
     p.add_argument('--timings-time', type=wall_time, default='01:00:00')
     p.add_argument('--profiles-time', type=wall_time, default='01:00:00')
     p.add_argument('--prepare-only', action='store_true', help='freeze records without submitting timing/profiling jobs')
+    p.add_argument('--reuse-validated-artifacts', action='store_true',
+                   help='verify sealed canonical artifacts and Passed receipts without querying historical job accounting; live compute and numerical admission remain required')
     p = sub.add_parser('retry', help='freeze a new measurement executor using verified completed builds/correctness')
     p.add_argument('--from-run', required=True)
     p.add_argument('--run-dir', required=True, help='new absolute scratch directory')
