@@ -487,7 +487,7 @@ void RK3SSPWithLimiter::MaybeScanAdmissibility(Vector& v,
         : (point_set == mfem::igrlab::EulerAdmissibilityPointSet::Limiter
              ? "RK/admissibility-limiter"
              : "RK/admissibility-output"));
-    const auto scan = mfem::igrlab::ScanEulerAdmissibility(vfes_,
+    const auto scan = admissibility_cache_.Scan(vfes_,
                                                            v,
                                                            dim_,
                                                            gamma_,

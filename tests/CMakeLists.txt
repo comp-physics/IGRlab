@@ -215,6 +215,41 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
     LABELS "igr;exact-face;parity;cuda" TIMEOUT 120 RUN_SERIAL TRUE)
 endif()
 
+add_executable(dg_igr_euler_admissibility_cache_test
+  test_euler_admissibility_cache.cpp)
+target_link_libraries(dg_igr_euler_admissibility_cache_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_euler_admissibility_cache_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include)
+set(_igrlab_admissibility_command dg_igr_euler_admissibility_cache_test)
+if(MPIEXEC_EXECUTABLE)
+  if(NOT MPIEXEC_NUMPROC_FLAG)
+    message(FATAL_ERROR "Admissibility MPI test launcher requires MPIEXEC_NUMPROC_FLAG.")
+  endif()
+  set(_igrlab_admissibility_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_euler_admissibility_cache_test> ${MPIEXEC_POSTFLAGS})
+  add_test(NAME dg_igr_euler_admissibility_cache_cpu_mpi4
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+      $<TARGET_FILE:dg_igr_euler_admissibility_cache_test> ${MPIEXEC_POSTFLAGS} cpu)
+  set_tests_properties(dg_igr_euler_admissibility_cache_cpu_mpi4 PROPERTIES
+    LABELS "admissibility;cache;parity;cpu;mpi;subcommunicator"
+    TIMEOUT 180 RUN_SERIAL TRUE PROCESSORS 4)
+endif()
+add_test(NAME dg_igr_euler_admissibility_cache_cpu
+  COMMAND ${_igrlab_admissibility_command} cpu)
+set_tests_properties(dg_igr_euler_admissibility_cache_cpu PROPERTIES
+  LABELS "admissibility;cache;parity;cpu" TIMEOUT 120)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  set_source_files_properties(test_euler_admissibility_cache.cpp PROPERTIES
+    LANGUAGE CUDA)
+  target_compile_options(dg_igr_euler_admissibility_cache_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  add_test(NAME dg_igr_euler_admissibility_cache_cuda
+    COMMAND ${_igrlab_admissibility_command} cuda)
+  set_tests_properties(dg_igr_euler_admissibility_cache_cuda PROPERTIES
+    LABELS "admissibility;cache;parity;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
+
 add_executable(dg_igr_nodal_source_test test_igr_nodal_source.cpp)
 target_link_libraries(dg_igr_nodal_source_test PRIVATE igr_mfem mfem)
 target_include_directories(dg_igr_nodal_source_test PRIVATE ${CMAKE_SOURCE_DIR}/include)

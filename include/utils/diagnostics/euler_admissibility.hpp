@@ -3,9 +3,16 @@
 #include "igrlab/compat.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <cmath>
 #include <limits>
+#include <new>
+#include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "mfem.hpp"
@@ -146,10 +153,379 @@ inline int FindFirstBadRank(bool found, MPI_Comm comm)
   return first_bad_rank;
 }
 
-} // namespace detail
+// These plans contain only invariant reference interpolation and connectivity.
+// State values, diagnostic results and MPI reductions are never cached.
+struct AdmissibilityShapeTable
+{
+  int dof = 0;
+  int points = 0;
+  std::vector<mfem::real_t> values;
+};
+
+struct AdmissibilityElementMap
+{
+  const mfem::FiniteElement* fe = nullptr;
+  mfem::Array<int> vdofs;
+  int dof = 0;
+  int order = 0;
+  bool enforce_nodes = false;
+};
+
+struct AdmissibilityFaceRule
+{
+  int face = -1;
+  int shape_table = -1;
+};
+
+struct AdmissibilityElementSamples
+{
+  int volume_shape_table = -1;
+  std::vector<AdmissibilityFaceRule> face_rules;
+};
+
+struct AdmissibilityReferenceRule
+{
+  int geometry = -1;
+  int order = -1;
+  std::vector<std::array<mfem::real_t, 2>> points;
+};
+
+class EulerAdmissibilityCache
+{
+public:
+  EulerAdmissibilitySummary Scan(
+    const mfem::ParFiniteElementSpace& vfes,
+    const mfem::Vector& v,
+    int dim,
+    double gamma,
+    double rho_min,
+    double p_min,
+    int quad_order,
+    const std::vector<int>& face_quad_orders,
+    EulerAdmissibilityPointSet point_set);
+
+private:
+  // An optional acceleration budget, not a restriction on supported orders.
+  // Larger or unusual spaces keep the original scanner without a cache.
+  static constexpr std::size_t byte_budget = 64u * 1024u * 1024u;
+  struct BudgetExceeded {};
+
+  void Charge(std::size_t bytes)
+  {
+    if (bytes > byte_budget - bytes_used_) { throw BudgetExceeded{}; }
+    bytes_used_ += bytes;
+  }
+
+  void ChargeProduct(std::size_t count, std::size_t bytes)
+  {
+    if (bytes != 0 && count > (byte_budget - bytes_used_) / bytes)
+    { throw BudgetExceeded{}; }
+    Charge(count * bytes);
+  }
+
+  bool Matches(const mfem::ParFiniteElementSpace& vfes,
+               int dim,
+               int quad_order,
+               const std::vector<int>& face_quad_orders) const
+  {
+    const mfem::Mesh* mesh = vfes.GetMesh();
+    if (&vfes != vfes_ || mesh != mesh_ || !mesh ||
+        vfes.GetSequence() != fes_sequence_ ||
+        mesh->GetSequence() != mesh_sequence_ || vfes.FEColl() != fec_ ||
+        vfes.GetNE() != ne_ || vfes.GetVDim() != num_eq_ || dim != dim_ ||
+        vfes.GetOrdering() != ordering_ || quad_order != quad_order_ ||
+        face_quad_orders != face_quad_orders_)
+    { return false; }
+    if (eligible_)
+    {
+      const auto* l2 = dynamic_cast<const mfem::L2_FECollection*>(vfes.FEColl());
+      if (!l2 || l2->GetBasisType() != basis_) { return false; }
+      for (int e = 0; e < ne_; ++e)
+      {
+        const auto* fe = vfes.GetFE(e);
+        if (fe != elements_[e].fe || fe->GetDof() != elements_[e].dof ||
+            fe->GetOrder() != elements_[e].order ||
+            fe->GetGeomType() != mfem::Geometry::SQUARE ||
+            fe->GetMapType() != mfem::FiniteElement::VALUE)
+        { return false; }
+      }
+      // Public MFEM rules can be replaced in place without a mesh update.
+      // Check their reference coordinates as well as the selected orders.
+      for (const auto& saved : reference_rules_)
+      {
+        const auto& rule = mfem::IntRules.Get(saved.geometry, saved.order);
+        if (rule.GetNPoints() != static_cast<int>(saved.points.size()))
+        { return false; }
+        for (int q = 0; q < rule.GetNPoints(); ++q)
+        {
+          const auto& point = rule.IntPoint(q);
+          if (std::memcmp(&point.x, &saved.points[q][0], sizeof(point.x)) ||
+              (saved.geometry == mfem::Geometry::SQUARE &&
+               std::memcmp(&point.y, &saved.points[q][1], sizeof(point.y))))
+          { return false; }
+        }
+      }
+    }
+    return true;
+  }
+
+  void Reset(const mfem::ParFiniteElementSpace& vfes,
+             int dim,
+             int quad_order,
+             const std::vector<int>& face_quad_orders)
+  {
+    // Release prior generations, including capacities, before charging the
+    // next bounded plan. Nothing here owns device work or conservative data.
+    std::vector<AdmissibilityElementMap>().swap(elements_);
+    std::vector<AdmissibilityShapeTable>().swap(shape_tables_);
+    std::unordered_map<std::string, int>().swap(shape_indices_);
+    std::vector<AdmissibilityReferenceRule>().swap(reference_rules_);
+    for (auto& plan : plans_)
+    { std::vector<AdmissibilityElementSamples>().swap(plan); }
+    ready_.fill(false);
+    declined_.fill(false);
+    bytes_used_ = 0;
+    eligible_ = false;
+    vfes_ = &vfes;
+    mesh_ = vfes.GetMesh();
+    fes_sequence_ = vfes.GetSequence();
+    mesh_sequence_ = mesh_ ? mesh_->GetSequence() : -1;
+    fec_ = vfes.FEColl();
+    ne_ = vfes.GetNE();
+    num_eq_ = vfes.GetVDim();
+    ordering_ = vfes.GetOrdering();
+    dim_ = dim;
+    quad_order_ = quad_order;
+    face_quad_orders_ = face_quad_orders;
+
+    const auto* l2 = dynamic_cast<const mfem::L2_FECollection*>(fec_);
+    if (!mesh_ || !l2 || dim != 2 || ne_ <= 0 || num_eq_ != 4 ||
+        ordering_ != mfem::Ordering::byNODES || mesh_->Nonconforming() ||
+        vfes.Nonconforming())
+    { return; }
+    basis_ = l2->GetBasisType();
+    const auto* first_fe = vfes.GetFE(0);
+    if (first_fe->GetGeomType() != mfem::Geometry::SQUARE ||
+        first_fe->GetMapType() != mfem::FiniteElement::VALUE) { return; }
+    for (int e = 1; e < ne_; ++e)
+    {
+      // A conservative initial fast path; mixed/variable spaces retain the
+      // original exact element-by-element implementation.
+      if (vfes.GetFE(e) != first_fe) { return; }
+    }
+
+    try
+    {
+      ChargeProduct(static_cast<std::size_t>(ne_),
+                    sizeof(AdmissibilityElementMap));
+      elements_.resize(ne_);
+      for (int e = 0; e < ne_; ++e)
+      {
+        auto& element = elements_[e];
+        element.fe = vfes.GetFE(e);
+        element.dof = element.fe->GetDof();
+        element.order = element.fe->GetOrder();
+        element.enforce_nodes = basis_ == mfem::BasisType::GaussLobatto;
+        ChargeProduct(static_cast<std::size_t>(element.dof),
+                      static_cast<std::size_t>(num_eq_) * sizeof(int));
+        vfes.GetElementVDofs(e, element.vdofs);
+      }
+      eligible_ = true;
+    }
+    catch (const BudgetExceeded&)
+    { std::vector<AdmissibilityElementMap>().swap(elements_); }
+    catch (const std::bad_alloc&)
+    { std::vector<AdmissibilityElementMap>().swap(elements_); }
+  }
+
+  void RememberRule(int geometry, int order, const mfem::IntegrationRule& rule)
+  {
+    for (const auto& saved : reference_rules_)
+    {
+      if (saved.geometry == geometry && saved.order == order) { return; }
+    }
+    ChargeProduct(static_cast<std::size_t>(rule.GetNPoints()),
+                  sizeof(std::array<mfem::real_t, 2>));
+    Charge(2 * sizeof(AdmissibilityReferenceRule));
+    AdmissibilityReferenceRule saved;
+    saved.geometry = geometry;
+    saved.order = order;
+    saved.points.resize(rule.GetNPoints());
+    for (int q = 0; q < rule.GetNPoints(); ++q)
+    {
+      saved.points[q] = {rule.IntPoint(q).x,
+        geometry == mfem::Geometry::SQUARE ? rule.IntPoint(q).y : 0.0};
+    }
+    reference_rules_.push_back(std::move(saved));
+  }
+
+  int ShapeTable(const mfem::FiniteElement& fe,
+                 const std::vector<mfem::IntegrationPoint>& points)
+  {
+    // CalcShape for the admitted scalar 2D L2 basis depends on reference x/y.
+    // Exact coordinate bytes retain signed zero and do not merge nearby points.
+    const auto identity = reinterpret_cast<std::uintptr_t>(&fe);
+    std::string key(reinterpret_cast<const char*>(&identity), sizeof(identity));
+    if (points.size() > byte_budget / (2 * sizeof(mfem::real_t)))
+    { throw BudgetExceeded{}; }
+    key.reserve(sizeof(identity) + points.size() * 2 * sizeof(mfem::real_t));
+    for (const auto& point : points)
+    {
+      key.append(reinterpret_cast<const char*>(&point.x), sizeof(point.x));
+      key.append(reinterpret_cast<const char*>(&point.y), sizeof(point.y));
+    }
+    const auto existing = shape_indices_.find(key);
+    if (existing != shape_indices_.end()) { return existing->second; }
+
+    const int dof = fe.GetDof();
+    ChargeProduct(points.size(), static_cast<std::size_t>(dof) *
+                                  sizeof(mfem::real_t));
+    // Account conservatively for vector/map nodes and capacity growth.
+    Charge(key.size() + 2 * sizeof(AdmissibilityShapeTable) + 128);
+    AdmissibilityShapeTable table;
+    table.dof = dof;
+    table.points = static_cast<int>(points.size());
+    table.values.resize(points.size() * static_cast<std::size_t>(dof));
+    mfem::Vector shape(dof);
+    for (std::size_t q = 0; q < points.size(); ++q)
+    {
+      fe.CalcShape(points[q], shape);
+      std::copy_n(shape.GetData(), dof,
+                  table.values.data() + q * static_cast<std::size_t>(dof));
+    }
+    const int index = static_cast<int>(shape_tables_.size());
+    shape_tables_.push_back(std::move(table));
+    shape_indices_.emplace(std::move(key), index);
+    return index;
+  }
+
+  bool Prepare(const mfem::ParFiniteElementSpace& vfes,
+               int dim,
+               int quad_order,
+               const std::vector<int>& face_quad_orders,
+               EulerAdmissibilityPointSet point_set)
+  {
+    const int slot = static_cast<int>(point_set);
+    if (slot < 0 || slot >= static_cast<int>(plans_.size())) { return false; }
+    if (!Matches(vfes, dim, quad_order, face_quad_orders))
+    { Reset(vfes, dim, quad_order, face_quad_orders); }
+    if (!eligible_) { return false; }
+    if (ready_[slot]) { return true; }
+    if (declined_[slot]) { return false; }
+    auto& plan = plans_[slot];
+    if (point_set == EulerAdmissibilityPointSet::Dof)
+    {
+      ready_[slot] = true;
+      return true;
+    }
+
+    try
+    {
+      const int order = elements_[0].order;
+      const int base_qord = quad_order > 0 ? quad_order : 2 * order + 2;
+      const int output_qord = std::max(base_qord + 2, 2 * order + 4);
+      const int scan_qord = point_set == EulerAdmissibilityPointSet::Output
+                              ? output_qord : base_qord;
+      auto scan_face_qords = BuildFaceQuadratureOrdersForAdmissibility(
+        vfes, scan_qord, face_quad_orders);
+      if (point_set == EulerAdmissibilityPointSet::Output)
+      {
+        for (int& qord : scan_face_qords)
+        { qord = std::max(qord + 2, 2 * order + 3); }
+        std::sort(scan_face_qords.begin(), scan_face_qords.end());
+        scan_face_qords.erase(
+          std::unique(scan_face_qords.begin(), scan_face_qords.end()),
+          scan_face_qords.end());
+      }
+      const auto& elem_faces = GetElementFacesForAdmissibility(*mesh_);
+      ChargeProduct(static_cast<std::size_t>(ne_),
+                    sizeof(AdmissibilityElementSamples));
+      plan.resize(ne_);
+      for (int e = 0; e < ne_; ++e)
+      {
+        const auto& fe = *elements_[e].fe;
+        auto* transformation = vfes.GetElementTransformation(e);
+        const auto& rule = mfem::IntRules.Get(
+          transformation->GetGeometryType(), scan_qord);
+        RememberRule(transformation->GetGeometryType(), scan_qord, rule);
+        if (rule.GetNPoints() > static_cast<int>(byte_budget /
+                                                sizeof(mfem::IntegrationPoint)))
+        { throw BudgetExceeded{}; }
+        std::vector<mfem::IntegrationPoint> points(rule.GetNPoints());
+        for (int q = 0; q < rule.GetNPoints(); ++q)
+        {
+          points[q].Init(q);
+          points[q].Set2(rule.IntPoint(q).x, rule.IntPoint(q).y);
+        }
+        plan[e].volume_shape_table = ShapeTable(fe, points);
+        for (const int face : elem_faces[e])
+        {
+          auto* face_transformation = mesh_->GetFaceElementTransformations(face);
+          if (!face_transformation) { continue; }
+          int e1 = -1, e2 = -1;
+          mesh_->GetFaceElements(face, &e1, &e2);
+          const bool first = e1 == e;
+          if (!first && e2 != e) { continue; }
+          for (const int qord : scan_face_qords)
+          {
+            const auto& face_rule = mfem::IntRules.Get(
+              face_transformation->GetGeometryType(), qord);
+            RememberRule(face_transformation->GetGeometryType(), qord, face_rule);
+            if (face_rule.GetNPoints() > static_cast<int>(byte_budget /
+                                                   sizeof(mfem::IntegrationPoint)))
+            { throw BudgetExceeded{}; }
+            points.resize(face_rule.GetNPoints());
+            for (int q = 0; q < face_rule.GetNPoints(); ++q)
+            {
+              face_transformation->SetAllIntPoints(&face_rule.IntPoint(q));
+              const auto& reference_point = first
+                ? face_transformation->GetElement1IntPoint()
+                : face_transformation->GetElement2IntPoint();
+              points[q].Init(q);
+              points[q].Set2(reference_point.x, reference_point.y);
+            }
+            const int table = ShapeTable(fe, points);
+            Charge(2 * sizeof(AdmissibilityFaceRule));
+            plan[e].face_rules.push_back({face, table});
+          }
+        }
+      }
+      ready_[slot] = true;
+      return true;
+    }
+    catch (const BudgetExceeded&)
+    { std::vector<AdmissibilityElementSamples>().swap(plan); }
+    catch (const std::bad_alloc&)
+    { std::vector<AdmissibilityElementSamples>().swap(plan); }
+    declined_[slot] = true;
+    return false;
+  }
+
+  const mfem::ParFiniteElementSpace* vfes_ = nullptr;
+  mfem::Mesh* mesh_ = nullptr;
+  const mfem::FiniteElementCollection* fec_ = nullptr;
+  long fes_sequence_ = -1;
+  long mesh_sequence_ = -1;
+  int ne_ = -1;
+  int num_eq_ = -1;
+  int dim_ = -1;
+  int ordering_ = -1;
+  int basis_ = -1;
+  int quad_order_ = -1;
+  std::vector<int> face_quad_orders_;
+  bool eligible_ = false;
+  std::size_t bytes_used_ = 0;
+  std::vector<AdmissibilityElementMap> elements_;
+  std::vector<AdmissibilityShapeTable> shape_tables_;
+  std::unordered_map<std::string, int> shape_indices_;
+  std::vector<AdmissibilityReferenceRule> reference_rules_;
+  std::array<std::vector<AdmissibilityElementSamples>, 3> plans_;
+  std::array<bool, 3> ready_{};
+  std::array<bool, 3> declined_{};
+};
 
 inline EulerAdmissibilitySummary
-ScanEulerAdmissibility(const mfem::ParFiniteElementSpace& vfes,
+ScanEulerAdmissibilityImpl(const mfem::ParFiniteElementSpace& vfes,
                        const mfem::Vector& v,
                        int dim,
                        double gamma,
@@ -157,7 +533,10 @@ ScanEulerAdmissibility(const mfem::ParFiniteElementSpace& vfes,
                        double p_min,
                        int quad_order,
                        const std::vector<int>& face_quad_orders,
-                       EulerAdmissibilityPointSet point_set)
+                       EulerAdmissibilityPointSet point_set,
+                       const std::vector<AdmissibilityElementMap>* cached_elements,
+                       const std::vector<AdmissibilityShapeTable>* cached_shapes,
+                       const std::vector<AdmissibilityElementSamples>* cached_samples)
 {
   EulerAdmissibilitySummary out;
   MFEM_VERIFY(vfes.GetOrdering() == mfem::Ordering::byNODES,
@@ -267,12 +646,18 @@ ScanEulerAdmissibility(const mfem::ParFiniteElementSpace& vfes,
     const mfem::FiniteElement* fe = vfes.GetFE(i);
     mfem::ElementTransformation* Tr = vfes.GetElementTransformation(i);
     const int dof = fe->GetDof();
-    const auto* fec_l2 = dynamic_cast<const mfem::L2_FECollection*>(vfes.FEColl());
-    const bool enforce_nodes =
-      (fec_l2 != nullptr && fec_l2->GetBasisType() == mfem::BasisType::GaussLobatto);
+    const auto* fec_l2 = cached_elements ? nullptr
+      : dynamic_cast<const mfem::L2_FECollection*>(vfes.FEColl());
+    const bool enforce_nodes = cached_elements ? (*cached_elements)[i].enforce_nodes
+      : (fec_l2 != nullptr && fec_l2->GetBasisType() == mfem::BasisType::GaussLobatto);
 
-    vfes.GetElementVDofs(i, vdofs);
-    v.GetSubVector(vdofs, elvec);
+    if (cached_elements)
+    { v.GetSubVector((*cached_elements)[i].vdofs, elvec); }
+    else
+    {
+      vfes.GetElementVDofs(i, vdofs);
+      v.GetSubVector(vdofs, elvec);
+    }
     elmat.UseExternalData(elvec.GetData(), dof, num_eq);
     shape.SetSize(dof);
 
@@ -288,6 +673,27 @@ ScanEulerAdmissibility(const mfem::ParFiniteElementSpace& vfes,
       {
         continue;
       }
+    }
+
+    if (cached_samples)
+    {
+      const auto inspect_table = [&](int table_index, int face)
+      {
+        const auto& table = (*cached_shapes)[table_index];
+        for (int q = 0; q < table.points; ++q)
+        {
+          // Same native shape values and MFEM summation as the reference scan.
+          elmat.MultTranspose(
+            table.values.data() + static_cast<std::size_t>(q) * dof,
+            state);
+          inspect_state(state, i, face, q, face >= 0, -1);
+        }
+      };
+      const auto& samples = (*cached_samples)[i];
+      inspect_table(samples.volume_shape_table, -1);
+      for (const auto& face_rule : samples.face_rules)
+      { inspect_table(face_rule.shape_table, face_rule.face); }
+      continue;
     }
 
     const mfem::IntegrationRule& ir =
@@ -366,6 +772,45 @@ ScanEulerAdmissibility(const mfem::ParFiniteElementSpace& vfes,
     detail::FindFirstBadRank(out.first_local_issue.found, vfes.GetComm());
 
   return out;
+}
+
+inline EulerAdmissibilitySummary EulerAdmissibilityCache::Scan(
+  const mfem::ParFiniteElementSpace& vfes,
+  const mfem::Vector& v,
+  int dim,
+  double gamma,
+  double rho_min,
+  double p_min,
+  int quad_order,
+  const std::vector<int>& face_quad_orders,
+  EulerAdmissibilityPointSet point_set)
+{
+  const bool prepared = Prepare(vfes, dim, quad_order, face_quad_orders, point_set);
+  const bool dof_scan = point_set == EulerAdmissibilityPointSet::Dof;
+  return ScanEulerAdmissibilityImpl(
+    vfes, v, dim, gamma, rho_min, p_min, quad_order, face_quad_orders, point_set,
+    prepared ? &elements_ : nullptr,
+    prepared && !dof_scan ? &shape_tables_ : nullptr,
+    prepared && !dof_scan ? &plans_[static_cast<int>(point_set)] : nullptr);
+}
+
+} // namespace detail
+
+// Keep the original scanner as the generic path and numerical reference.
+inline EulerAdmissibilitySummary
+ScanEulerAdmissibility(const mfem::ParFiniteElementSpace& vfes,
+                       const mfem::Vector& v,
+                       int dim,
+                       double gamma,
+                       double rho_min,
+                       double p_min,
+                       int quad_order,
+                       const std::vector<int>& face_quad_orders,
+                       EulerAdmissibilityPointSet point_set)
+{
+  return detail::ScanEulerAdmissibilityImpl(
+    vfes, v, dim, gamma, rho_min, p_min, quad_order, face_quad_orders, point_set,
+    nullptr, nullptr, nullptr);
 }
 
 } // namespace igrlab
