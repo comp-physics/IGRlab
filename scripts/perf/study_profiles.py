@@ -9,6 +9,7 @@ Historical profile_harness qualification is intentionally independent.
 from __future__ import annotations
 
 import csv
+from decimal import Decimal, InvalidOperation
 import hashlib
 import io
 import json
@@ -58,9 +59,9 @@ def sha256(path):
     return result.hexdigest()
 
 
-def artifact(path):
+def artifact(path, *, allow_empty=False):
     path = Path(path)
-    require(not path.is_symlink() and path.is_file() and path.stat().st_size > 0,
+    require(not path.is_symlink() and path.is_file() and (allow_empty or path.stat().st_size > 0),
             f'missing/nonregular native artifact: {path}')
     return {'path': str(path), 'sha256': sha256(path), 'bytes': path.stat().st_size}
 
@@ -257,6 +258,7 @@ def parse_ncu(text, kernel_regex, maximum_launches=3, metric_limit=120):
             'replay_duration_seconds': seconds(duration['value'], duration['unit']),
             'metric_rows': compact[:metric_limit], 'omitted_metric_count': max(0, len(compact) - metric_limit),
             'metric_limit': metric_limit, 'diagnostic_availability': coverage,
+            'tensor_dmma_instructions': values.get(DMMA),
             'missing_diagnostics': [name for name, present in coverage.items() if not present],
             'availability_scope': 'all imported native rows; compact rows may omit breakdowns'})
     return {'format': format_name, 'observed_launches': len(result), 'launches': result,
@@ -314,6 +316,166 @@ def parse_nsys(text, row_limit=30):
             'rows': rows[:row_limit], 'omitted_rows': max(0, len(rows) - row_limit)}
     result['scope'] = 'separate overlapping API, kernel and copy sums; not additive elapsed time'
     return result
+
+
+NSYS_OPTIONAL_REPORTS = ('nvtx_sum', 'osrt_sum', 'nvtx_gpu_proj_sum', 'cuda_gpu_trace')
+NSYS_TRACE_MAX_EVENTS = 250000
+NSYS_TRACE_MAX_BYTES = 128 * 1024 * 1024
+
+
+def parse_nsys_host_summary(text, report, row_limit=30):
+    """Parse one named report; OSRT and CUDA APIs have identical headers."""
+    require(report in NSYS_OPTIONAL_REPORTS[:3] and type(row_limit) is int and
+            1 <= row_limit <= 50, 'invalid optional Nsys summary selection')
+    header, rows = None, []
+    projection = report == 'nvtx_gpu_proj_sum'
+    time_name = 'Total Proj Time' if projection else 'Total Time'
+    count_name = 'Range Instances' if projection else ('Num Calls' if report == 'osrt_sum' else 'Instances')
+    label = 'Name' if report == 'osrt_sum' else 'Range'
+    duration_keys = {}
+    for row in csv.reader(io.StringIO(text)):
+        if any(value.startswith(time_name + ' (') for value in row):
+            require(len(set(row)) == len(row) and count_name in row and label in row,
+                    'unsupported optional Nsys summary header')
+            duration_keys = {}
+            for name in (time_name, 'Total Range Time') if projection else (time_name,):
+                keys = [value for value in row if value.startswith(name + ' (') and value.endswith(')')]
+                require(len(keys) == 1, 'ambiguous optional Nsys duration column')
+                unit = keys[0][len(name) + 2:-1]
+                seconds(1., unit)
+                duration_keys[name] = keys[0], unit
+            header = row
+            continue
+        if not row:
+            header = None
+        if header is None or len(row) != len(header):
+            continue
+        item = dict(zip(header, row))
+        count = item[count_name].replace(',', '')
+        require(re.fullmatch(r'[0-9]+', count) is not None and int(count) > 0 and bool(item[label]),
+                'invalid optional Nsys range/call count')
+        value = {'name': item[label], 'instances': int(count)}
+        for name, (key, unit) in duration_keys.items():
+            number = _number(item[key])
+            require(number is not None, 'missing optional Nsys duration')
+            value['range_duration_seconds' if name == 'Total Range Time' else 'duration_seconds'] = seconds(number, unit)
+        if report != 'osrt_sum':
+            require(bool(item.get('Style')), 'missing NVTX range style')
+            value['style'] = item['Style']
+        if projection:
+            count = item.get('Total GPU Ops', '').replace(',', '')
+            require(re.fullmatch(r'[0-9]+', count) is not None, 'missing projected GPU operation count')
+            value['gpu_operations'] = int(count)
+        rows.append(value)
+        require(len(rows) <= 10000, 'unbounded optional Nsys summary rows')
+    rows.sort(key=lambda value: (-value['duration_seconds'], value['name']))
+    return {'availability': 'available' if rows else 'unavailable',
+            'reason': None if rows else 'supported report emitted no matching trace data',
+            'duration_seconds': sum(value['duration_seconds'] for value in rows) if rows else None,
+            'instances': sum(value['instances'] for value in rows) if rows else None,
+            'rows': rows[:row_limit], 'omitted_rows': max(0, len(rows) - row_limit),
+            'scope': 'separate overlapping traced OS runtime calls' if report == 'osrt_sum' else
+                ('GPU span projected from operations launched inside each same-thread NVTX range; nested ranges overlap'
+                 if projection else 'host NVTX range durations; nested ranges overlap'),
+            'report': report}
+
+
+def parse_nsys_gpu_activity(lines, expected_events, maximum_events=NSYS_TRACE_MAX_EVENTS):
+    """Stream sorted native CUDA intervals, returning no event-level records."""
+    require(type(expected_events) is int and expected_events > 0 and type(maximum_events) is int and
+            0 < maximum_events <= NSYS_TRACE_MAX_EVENTS, 'invalid CUDA timestamp coverage bound')
+    header, start_key, duration_key, factors = None, None, None, None
+    first, segment_start, previous_start, merged_end = None, None, None, None
+    active, gaps, largest, devices, count, zero = Decimal(0), 0, [], set(), 0, 0
+    for row in csv.reader(lines):
+        if any(value.startswith('Start (') for value in row):
+            require(header is None and len(set(row)) == len(row) and {'Device', 'Name'} <= set(row),
+                    'unsupported CUDA GPU timestamp header')
+            keys = [[key for key in row if key.startswith(name + ' (') and key.endswith(')')]
+                    for name in ('Start', 'Duration')]
+            require(all(len(values) == 1 for values in keys), 'missing explicit CUDA timestamp units')
+            start_key, duration_key = (values[0] for values in keys)
+            units = (start_key[len('Start ('):-1], duration_key[len('Duration ('):-1])
+            for unit in units:
+                seconds(1., unit)
+            factors = tuple(Decimal(str(TIME_FACTORS[unit])) for unit in units)
+            header = row
+            continue
+        if header is None or not row:
+            continue
+        require(len(row) == len(header), 'malformed CUDA GPU timestamp row')
+        item = dict(zip(header, row))
+        require(bool(item['Device']) and bool(item['Name']), 'missing CUDA timestamp device/operation')
+        try:
+            start, duration = (Decimal(item[key].replace(',', '')) * factor
+                               for key, factor in zip((start_key, duration_key), factors))
+        except InvalidOperation as error:
+            raise ProfileError('invalid CUDA GPU timestamp number') from error
+        require(start.is_finite() and duration.is_finite() and start >= 0 and duration >= 0 and
+                (previous_start is None or start >= previous_start), 'invalid/unsorted CUDA GPU timestamps')
+        previous_start = start
+        count += 1
+        require(count <= maximum_events, 'CUDA timestamp event bound exceeded')
+        devices.add(item['Device'])
+        require(len(devices) == 1, 'CUDA timestamp export includes multiple GPU devices')
+        if duration == 0:
+            zero += 1
+            continue
+        end = start + duration
+        if first is None:
+            first, segment_start, merged_end = start, start, end
+        elif start > merged_end:
+            active += merged_end - segment_start
+            gap = start - merged_end
+            gaps += 1
+            largest.append(float(gap))
+            largest = sorted(largest, reverse=True)[:10]
+            segment_start, merged_end = start, end
+        else:
+            merged_end = max(merged_end, end)
+    require(header is not None and count == expected_events and first is not None,
+            'CUDA timestamp coverage does not match kernel/copy summaries')
+    active += merged_end - segment_start
+    span = merged_end - first
+    require(span > 0 and 0 < active <= span and math.isfinite(float(span)),
+            'invalid CUDA interval-union duration')
+    return {'availability': 'available', 'event_count': count, 'zero_duration_events': zero,
+            'device': next(iter(devices)), 'active_union_seconds': float(active),
+            'first_to_last_operation_seconds': float(span), 'internal_gap_seconds': float(span - active),
+            'active_fraction_of_operation_span': float(active / span), 'internal_gap_count': gaps,
+            'largest_internal_gaps_seconds': largest,
+            'scope': 'union of traced CUDA kernel/memory intervals between first and last positive-duration operation',
+            'limitations': ['Excludes startup before first GPU operation and shutdown after last GPU operation',
+                           'No traced CUDA operation is not proof of hardware idle or its cause',
+                           'Activity fraction is not SM utilization, occupancy, or whole-application GPU utilization',
+                           'Profiler tracing overhead applies; primary unprofiled timings remain authoritative']}
+
+
+def tensor_instruction_evidence(case, ncu):
+    """Assess emitted DMMA on selected tensor launches, independently of status."""
+    parameters = case.get('parameters', {})
+    if case.get('adapter') == 'dg' and parameters.get('dgsem_residual') == 'fused-dmma':
+        target = 'DGSEM fused FP64 residual'
+        matching = lambda row: 'FusedEulerResidualKernel' in row['kernel']
+    elif parameters.get('engine') == 'tensor' and (case.get('adapter') == 'hdg' or
+            case.get('adapter') == 'dg' and parameters.get('discretization') == 'hdg'):
+        target = 'HDG FP64 tensor volume contraction'
+        matching = lambda row: row.get('kernel_group') == 'volume_contraction' or 'BorrowedEulerTensorVolumeContractionKernel' in row['kernel']
+    else:
+        return {'status': 'not_applicable', 'reason': 'case does not request full-solver FP64 tensor execution'}
+    launches = [row for row in ncu.get('metrics', {}).get('launches', []) if matching(row)]
+    counters = [row.get('tensor_dmma_instructions') for row in launches]
+    available = [row['value'] for row in counters if row is not None and row['value'] is not None]
+    return {'status': 'observed' if any(value > 0 for value in available) else
+                     ('not_observed' if available else 'unavailable'),
+            'target': target, 'metric': DMMA, 'unit': 'inst',
+            'selected_tensor_launch_count': len(launches), 'available_counter_launch_count': len(available),
+            'unavailable_counter_launch_count': len(launches) - len(available),
+            'positive_counter_launch_count': sum(value > 0 for value in available),
+            'selected_replay_dmma_instruction_sum': sum(available) if available else None,
+            'scope': 'emitted native DMMA counter on selected NCU replay launches; not full-solver tensor throughput',
+            'limitations': ['Unavailable counters are not zero',
+                           'Zero selected counter values do not establish that the whole solver avoided tensor operations']}
 
 
 def native_ncu(prefix):
@@ -413,12 +575,34 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
     require(directory.resolve() == directory and root in directory.parents, 'capture directory must be confined below runner output')
     directory.mkdir(parents=True, exist_ok=True)
     base = directory.relative_to(root).as_posix()
-    def run(label, command, command_timeout=timeout):
+    def run(label, command, command_timeout=timeout, *, allow_failure=False):
         try:
-            result = Path(runner.run(base + '/' + label, command, cwd=None, env=environment, timeout=command_timeout))
-            require(result.resolve() == root / (base + '/' + label), 'runner returned an unexpected command directory')
+            expected = root / (base + '/' + label)
+            try:
+                result = Path(runner.run(base + '/' + label, command, cwd=None, env=environment, timeout=command_timeout))
+            except RuntimeError:
+                # The real study Runner raises after preserving nonzero exits.
+                # Recover only this optional query's completed command receipt;
+                # exhausted budgets, launch failures and timeouts still fail.
+                require(allow_failure and expected.resolve() == expected,
+                        'profiler query failed without an admissible optional receipt')
+                receipt_path = expected / 'result.json'
+                require(not receipt_path.is_symlink() and receipt_path.is_file(), 'missing optional query result receipt')
+                receipt = json.loads(receipt_path.read_text())
+                code = receipt.get('returncode')
+                require(type(code) is int and 0 < code <= 255 and code != 124 and
+                        receipt.get('status') == 'failed' and receipt.get('argv') == command and
+                        receipt.get('cwd') == str(expected), 'invalid/timeout optional query result receipt')
+                for name in ('stdout', 'stderr'):
+                    observed_log = artifact(expected / (name + '.log'), allow_empty=True)
+                    require(observed_log['sha256'] == receipt.get(name + '_sha256'),
+                            'optional query output differs from retained result receipt')
+                result = expected
+            require(result.resolve() == expected, 'runner returned an unexpected command directory')
             receipt = json.loads((result / 'result.json').read_text())
-            require(receipt.get('returncode') == 0, f'profiler command failed; logs retained at {result}')
+            code = receipt.get('returncode')
+            require(type(code) is int and (code == 0 or allow_failure and 0 < code <= 255 and code != 124),
+                    f'profiler command failed; logs retained at {result}')
             return result
         except (OSError, ValueError, RuntimeError) as error:
             raise ProfileError(f'{base}/{label}: {error}; command logs retained') from error
@@ -447,6 +631,18 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
             result['tools'][name]['config_file'] = 'off (explicit)'
     if tools['nsys']:
         tool = tools['nsys']
+        capability_log = run('tools/nsys-environment', [str(tool), 'status', '--environment'], 20, allow_failure=True)
+        capability_exit = json.loads((capability_log / 'result.json').read_text())['returncode']
+        result['tools']['nsys']['environment_capability'] = {
+            'availability': 'available' if capability_exit == 0 else 'unavailable', 'returncode': capability_exit,
+            'stdout': artifact(capability_log / 'stdout.log', allow_empty=True),
+            'stderr': artifact(capability_log / 'stderr.log', allow_empty=True),
+            'scope': 'native environment capability query; CPU sampling remains disabled'}
+        reports_log = run('tools/nsys-reports', [str(tool), 'stats', '--help-reports'], 30)
+        available_reports = _available_names((reports_log / 'stdout.log').read_text(), NSYS_OPTIONAL_REPORTS)
+        result['tools']['nsys']['report_query'] = artifact(reports_log / 'stdout.log')
+        profile_help = run('tools/nsys-profile-help', [str(tool), 'profile', '--help'], 20)
+        result['tools']['nsys']['profile_help_stdout'] = artifact(profile_help / 'stdout.log')
         prefix = directory / 'capture-nsys'
         require(not Path(str(prefix) + '.nsys-rep').exists(), 'native Nsys report already exists')
         command = [str(tool), 'profile', '--trace=cuda,nvtx,osrt', '--sample=none']
@@ -456,11 +652,43 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
         native = artifact(Path(str(prefix) + '.nsys-rep'))
         stats = run('nsys-stats', [str(tool), 'stats', '--report',
             'cuda_api_sum,cuda_gpu_kern_sum,cuda_gpu_mem_time_sum', '--format', 'csv', native['path']], 120)
+        statistics = parse_nsys((stats / 'stdout.log').read_text())
+        host_summaries = {}
+        for report in NSYS_OPTIONAL_REPORTS[:3]:
+            if report not in available_reports:
+                host_summaries[report] = {'availability': 'unavailable', 'reason': 'not listed by native Nsys report help'}
+                continue
+            exported = run('nsys-' + report, [str(tool), 'stats', '--report', report,
+                                            '--format', 'csv', native['path']], 120)
+            host_summaries[report] = parse_nsys_host_summary((exported / 'stdout.log').read_text(), report)
+            host_summaries[report]['statistics_csv'] = artifact(exported / 'stdout.log', allow_empty=True)
+        expected_events = statistics['gpu_kernel']['instances'] + (statistics['gpu_memory']['instances'] or 0)
+        activity = {'availability': 'unavailable', 'reason': 'not listed by native Nsys report help'}
+        if 'cuda_gpu_trace' in available_reports:
+            activity['reason'] = 'CUDA timestamp event bound exceeded before export'
+            if expected_events <= NSYS_TRACE_MAX_EVENTS:
+                exported = run('nsys-cuda_gpu_trace', [str(tool), 'stats', '--report', 'cuda_gpu_trace',
+                                                      '--format', 'csv', native['path']], 120)
+                trace = exported / 'stdout.log'
+                activity = {'availability': 'unavailable', 'reason': 'CUDA timestamp byte bound exceeded',
+                            'statistics_csv': artifact(trace)}
+                if trace.stat().st_size <= NSYS_TRACE_MAX_BYTES:
+                    with trace.open(newline='') as stream:
+                        activity = parse_nsys_gpu_activity(stream, expected_events)
+                    activity['statistics_csv'] = artifact(trace)
         result['captures']['nsys'] = {'status': 'complete', 'native': native,
             'application_stdout': str(log / 'stdout.log'), 'application_stderr': str(log / 'stderr.log'),
             'application_stdout_sha256': sha256(log / 'stdout.log'),
-            'statistics': parse_nsys((stats / 'stdout.log').read_text()),
-            'statistics_csv': artifact(stats / 'stdout.log')}
+            'statistics': statistics, 'host_summaries': host_summaries, 'gpu_activity': activity,
+            'statistics_csv': artifact(stats / 'stdout.log'),
+            'profiler_policies': {'trace': 'cuda,nvtx,osrt', 'cpu_sampling': 'none (explicit)',
+                'osrt_threshold': 'native default; unspecified by command',
+                'default_authority': result['tools']['nsys']['profile_help_stdout'],
+                'sampled_cpu_stack_attribution_available': False},
+            'limitations': ['OSRT covers traced library calls above the native threshold, not all host computation',
+                'CPU sampling is disabled; uninstrumented CPU work has no sampled stack attribution',
+                'NVTX and projected ranges may overlap and do not define startup/solve phases unless source annotates them',
+                'CUDA API, GPU kernel, memory, OSRT and NVTX durations overlap; never sum them into solver wall time']}
         result['application_logs'].append({'stdout': str(log / 'stdout.log'), 'stderr': str(log / 'stderr.log'),
                                            'receipt': str(log / 'result.json')})
     if tools['ncu']:
@@ -535,6 +763,7 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
     for name, identity in result['tools'].items():
         require(sha256(identity['executable']['path']) == identity['executable']['sha256'],
                 f'{name} executable changed during capture')
+    result['tensor_instruction_evidence'] = tensor_instruction_evidence(case, result['captures'].get('ncu', {}))
     states = [value['status'] for value in result['captures'].values()]
     result['status'] = 'complete' if all(state == 'complete' for state in states) else (
         'unavailable' if all(state == 'unavailable' for state in states) else 'partial')

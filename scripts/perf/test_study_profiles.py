@@ -7,6 +7,7 @@ import os
 import re
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -62,12 +63,31 @@ def nsys_csv():
         ['Time (%)', 'Total Time (ms)', 'Count', 'Operation'], ['100', '0.002', '1', '[CUDA memcpy Device-to-Host]']])
 
 
+def host_summary(report):
+    if report == 'osrt_sum':
+        return csv_text([['Time (%)', 'Total Time (us)', 'Num Calls', 'Name'],
+                         ['100', '8', '2', 'poll']])
+    if report == 'nvtx_gpu_proj_sum':
+        return csv_text([['Range', 'Style', 'Total Proj Time (ns)', 'Total Range Time (ns)',
+                          'Range Instances', 'Total GPU Ops'],
+                         ['DG/Mult', 'PushPop', '4000', '6000', '1', '2']])
+    return csv_text([['Time (%)', 'Total Time (ms)', 'Instances', 'Style', 'Range'],
+                     ['100', '0.006', '1', 'PushPop', 'DG/Mult']])
+
+
+def gpu_trace(rows=None):
+    return csv_text([['Start (ns)', 'Duration (us)', 'Device', 'Ctx', 'Strm', 'Name'],
+                     *(rows or [['1000', '3', 'GPU 0', '1', '1', KERNEL],
+                                ['3000', '2', 'GPU 0', '1', '2', '[CUDA memcpy DtoH]']])])
+
+
 class FakeRunner:
-    def __init__(self, output, *, missing_sections=False, fail=None):
+    def __init__(self, output, *, missing_sections=False, missing_reports=False, fail=None):
         self.output = output
         self.commands = []
         self.environments = {}
         self.missing_sections = missing_sections
+        self.missing_reports = missing_reports
         self.fail = fail
 
     def run(self, label, argv, *, cwd=None, env=None, timeout=None):
@@ -84,6 +104,12 @@ class FakeRunner:
             text = profiles.DURATION + '\n' + profiles.DMMA
         elif label.endswith('nsys-stats'):
             text = nsys_csv()
+        elif label.endswith('nsys-reports'):
+            text = 'no optional reports supported' if self.missing_reports else ' '.join(profiles.NSYS_OPTIONAL_REPORTS)
+        elif any(label.endswith('nsys-' + report) for report in profiles.NSYS_OPTIONAL_REPORTS[:3]):
+            text = host_summary(label.rsplit('nsys-', 1)[1])
+        elif label.endswith('nsys-cuda_gpu_trace'):
+            text = gpu_trace()
         elif label.endswith('ncu-import'):
             text = wide_complete()
         elif label.endswith('/nsys'):
@@ -204,6 +230,78 @@ class MetricTests(unittest.TestCase):
         self.assertAlmostEqual(value['gpu_memory']['duration_seconds'], 2e-6)
         self.assertNotIn('total_seconds', value)
 
+    def test_nsys_host_reports_disambiguate_identical_api_headers(self):
+        osrt = profiles.parse_nsys_host_summary(host_summary('osrt_sum'), 'osrt_sum')
+        nvtx = profiles.parse_nsys_host_summary(host_summary('nvtx_sum'), 'nvtx_sum')
+        projected = profiles.parse_nsys_host_summary(host_summary('nvtx_gpu_proj_sum'), 'nvtx_gpu_proj_sum')
+        self.assertEqual(osrt['rows'][0]['name'], 'poll')
+        self.assertAlmostEqual(osrt['duration_seconds'], 8e-6)
+        self.assertAlmostEqual(nvtx['duration_seconds'], 6e-6)
+        self.assertAlmostEqual(projected['duration_seconds'], 4e-6)
+        self.assertAlmostEqual(projected['rows'][0]['range_duration_seconds'], 6e-6)
+        self.assertEqual(projected['rows'][0]['gpu_operations'], 2)
+        self.assertEqual(profiles.parse_nsys_host_summary('SKIPPED: no NVTX data', 'nvtx_sum')['availability'], 'unavailable')
+        for text in (host_summary('nvtx_sum').replace('(ms)', '(ticks)'),
+                     host_summary('osrt_sum').replace(',2,', ',0,')):
+            with self.assertRaises(profiles.ProfileError):
+                profiles.parse_nsys_host_summary(text, 'nvtx_sum' if 'Instances' in text else 'osrt_sum')
+
+    def test_cuda_activity_union_avoids_overlapping_sums(self):
+        value = profiles.parse_nsys_gpu_activity(io.StringIO(gpu_trace()), 2)
+        self.assertAlmostEqual(value['active_union_seconds'], 4e-6)
+        self.assertAlmostEqual(value['first_to_last_operation_seconds'], 4e-6)
+        self.assertEqual(value['internal_gap_seconds'], 0)
+        self.assertEqual(value['internal_gap_count'], 0)
+        self.assertEqual(value['active_fraction_of_operation_span'], 1)
+        self.assertNotIn('total_seconds', value)
+
+    def test_cuda_activity_gaps_and_large_timestamp_precision(self):
+        base = 9000000000000000000
+        rows = [[str(base), '0', 'GPU 0', '1', '1', 'zero'],
+                [str(base + 1000), '1', 'GPU 0', '1', '1', 'a'],
+                [str(base + 3000), '2', 'GPU 0', '1', '2', 'b'],
+                [str(base + 8000), '1', 'GPU 0', '1', '1', 'c']]
+        value = profiles.parse_nsys_gpu_activity(io.StringIO(gpu_trace(rows)), 4)
+        self.assertAlmostEqual(value['active_union_seconds'], 4e-6)
+        self.assertAlmostEqual(value['first_to_last_operation_seconds'], 8e-6)
+        self.assertAlmostEqual(value['internal_gap_seconds'], 4e-6)
+        self.assertEqual(value['internal_gap_count'], 2)
+        self.assertEqual(value['zero_duration_events'], 1)
+        self.assertEqual(value['largest_internal_gaps_seconds'], [3e-6, 1e-6])
+
+    def test_cuda_activity_bad_coverage_units_device_and_bounds_reject(self):
+        examples = [(gpu_trace(), 3, 4), (gpu_trace(), 2, 1),
+                    (gpu_trace().replace('Start (ns)', 'Start'), 2, 4),
+                    (gpu_trace().replace('Duration (us)', 'Duration (tick)'), 2, 4),
+                    (gpu_trace().replace('3000', '500'), 2, 4),
+                    (gpu_trace().replace('3000,2,GPU 0', '3000,2,GPU 1'), 2, 4),
+                    (gpu_trace().replace('1000,3', '1000,nan'), 2, 4)]
+        for text, count, bound in examples:
+            with self.subTest(text=text), self.assertRaises(profiles.ProfileError):
+                profiles.parse_nsys_gpu_activity(io.StringIO(text), count, bound)
+
+    def test_tensor_instruction_evidence_observed_zero_and_unavailable(self):
+        for case, kernel in (({'adapter': 'dg', 'parameters': {'dgsem_residual': 'fused-dmma'}},
+                              'void FusedEulerResidualKernel<double, true>()'),
+                             ({'adapter': 'hdg', 'parameters': {'engine': 'tensor'}},
+                              'void BorrowedEulerTensorVolumeContractionKernel()'),
+                             ({'adapter': 'dg', 'parameters': {'discretization': 'hdg', 'engine': 'tensor'}},
+                              'void BorrowedEulerTensorVolumeContractionKernel()')):
+            for number, status in (('12', 'observed'), ('0', 'not_observed'), ('N/A', 'unavailable')):
+                row = ['0', kernel, profiles.DMMA, 'inst', number]
+                text = csv_text([['ID', 'Kernel Name', 'Metric Name', 'Metric Unit', 'Metric Value'],
+                                 ['0', kernel, profiles.DURATION, 'us', '2'], row])
+                parsed = profiles.parse_ncu(text, 'Kernel', metric_limit=1)
+                evidence = profiles.tensor_instruction_evidence(case, {'metrics': parsed})
+                self.assertEqual(evidence['status'], status)
+                self.assertEqual(evidence['selected_tensor_launch_count'], 1)
+                self.assertEqual(evidence['positive_counter_launch_count'], int(number == '12'))
+                self.assertNotIn('tensor_throughput', evidence)
+        evidence = profiles.tensor_instruction_evidence(case, {'status': 'unavailable'})
+        self.assertEqual(evidence['status'], 'unavailable')
+        self.assertIsNone(evidence['selected_replay_dmma_instruction_sum'])
+        self.assertEqual(profiles.tensor_instruction_evidence({'adapter': 'dgsem'}, {})['status'], 'not_applicable')
+
     def test_native_report_repz_and_ambiguous_encodings(self):
         with tempfile.TemporaryDirectory() as temporary:
             prefix = Path(temporary) / 'capture'
@@ -215,6 +313,126 @@ class MetricTests(unittest.TestCase):
 
 
 class CaptureTests(unittest.TestCase):
+    def test_host_reports_and_timestamp_processing_keep_compact_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary)
+            case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+            with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU):
+                value = profiles.capture(case, ['app'], runner, directory, GPU)
+            nsys = value['captures']['nsys']
+            self.assertEqual(value['status'], 'complete')
+            self.assertEqual(set(nsys['host_summaries']), set(profiles.NSYS_OPTIONAL_REPORTS[:3]))
+            self.assertEqual(nsys['gpu_activity']['event_count'], 2)
+            self.assertFalse(nsys['profiler_policies']['sampled_cpu_stack_attribution_available'])
+            self.assertEqual(value['tools']['nsys']['environment_capability']['availability'], 'available')
+            self.assertNotIn('events', nsys['gpu_activity'])
+            self.assertLess(len(json.dumps(nsys)), 12000)
+            commands = {label: argv for label, argv, timeout in runner.commands}
+            for report in profiles.NSYS_OPTIONAL_REPORTS:
+                self.assertEqual(commands['profiles/nsys-' + report][3], report)
+            self.assertIn('--sample=none', commands['profiles/nsys'])
+
+    def test_capability_query_failure_preserves_receipt_without_enabling_sampling(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary, fail='profiles/tools/nsys-environment')
+            case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+            with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU):
+                value = profiles.capture(case, ['app'], runner, directory, GPU)
+            self.assertEqual(value['status'], 'complete')
+            capability = value['tools']['nsys']['environment_capability']
+            self.assertEqual(capability['availability'], 'unavailable')
+            self.assertEqual(capability['returncode'], 1)
+            self.assertTrue(Path(capability['stderr']['path']).is_file())
+            nsys = next(argv for label, argv, timeout in runner.commands if label == 'profiles/nsys')
+            self.assertIn('--sample=none', nsys)
+
+    def test_real_runner_optional_query_nonzero_recovers_exact_receipt(self):
+        from gpu_study import Runner
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary)
+            real_runner = Runner(runner.output, 30)
+            original = runner.run
+            def real_query(label, argv, **kwargs):
+                if label.endswith('nsys-environment'):
+                    # Substitute only the fake profiler, retaining the exact
+                    # provider argv in the receipt produced by the real Runner.
+                    return real_runner.run(label, argv, **kwargs)
+                return original(label, argv, **kwargs)
+            case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+            # The tool identity is frozen before capability queries, so write
+            # the intercepted executable before entering capture.
+            tool.write_text('#!' + sys.executable + '\nimport sys\nsys.exit(2)\n')
+            with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU), \
+                    patch.object(runner, 'run', side_effect=real_query):
+                value = profiles.capture(case, ['app'], runner, directory, GPU)
+            self.assertEqual(value['status'], 'complete')
+            self.assertEqual(value['tools']['nsys']['environment_capability']['returncode'], 2)
+
+    def test_optional_query_does_not_swallow_missing_receipt_or_timeout(self):
+        for timeout in (False, True):
+            with self.subTest(timeout=timeout), tempfile.TemporaryDirectory() as temporary:
+                tool, runner, directory = self.setup_capture(temporary)
+                original = runner.run
+                def broken_query(label, argv, **kwargs):
+                    if not label.endswith('nsys-environment'):
+                        return original(label, argv, **kwargs)
+                    if timeout:
+                        path = original(label, argv, **kwargs)
+                        (path / 'result.json').write_text(json.dumps({'status': 'failed', 'returncode': 124,
+                            'argv': argv, 'cwd': str(path)}))
+                    raise RuntimeError('bounded query failed')
+                case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+                with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU), \
+                        patch.object(runner, 'run', side_effect=broken_query), self.assertRaises(profiles.ProfileError):
+                    profiles.capture(case, ['app'], runner, directory, GPU)
+
+    def test_optional_reports_unavailable_do_not_invent_activity_or_fail_core(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary, missing_reports=True)
+            case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+            with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU):
+                value = profiles.capture(case, ['app'], runner, directory, GPU)
+            self.assertEqual(value['status'], 'complete')
+            nsys = value['captures']['nsys']
+            self.assertEqual(nsys['gpu_activity']['availability'], 'unavailable')
+            self.assertNotIn('active_union_seconds', nsys['gpu_activity'])
+            self.assertTrue(all(row['availability'] == 'unavailable' for row in nsys['host_summaries'].values()))
+            self.assertFalse(any(label.endswith('nsys-cuda_gpu_trace') for label, argv, timeout in runner.commands))
+
+    def test_empty_nvtx_exports_keep_zero_byte_receipts_and_no_range_claim(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tool, runner, directory = self.setup_capture(temporary)
+            original = runner.run
+            def empty_nvtx(label, argv, **kwargs):
+                result = original(label, argv, **kwargs)
+                if label.endswith(('nsys-nvtx_sum', 'nsys-nvtx_gpu_proj_sum')):
+                    (result / 'stdout.log').write_text('')
+                return result
+            case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+            with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU), \
+                    patch.object(runner, 'run', side_effect=empty_nvtx):
+                value = profiles.capture(case, ['app'], runner, directory, GPU)
+            self.assertEqual(value['status'], 'complete')
+            for report in ('nvtx_sum', 'nvtx_gpu_proj_sum'):
+                rows = value['captures']['nsys']['host_summaries'][report]
+                self.assertEqual(rows['availability'], 'unavailable')
+                self.assertIsNone(rows['duration_seconds'])
+                self.assertEqual(rows['statistics_csv']['bytes'], 0)
+
+    def test_timestamp_bounds_retain_core_without_unbounded_exports(self):
+        for bound in ('NSYS_TRACE_MAX_EVENTS', 'NSYS_TRACE_MAX_BYTES'):
+            with self.subTest(bound=bound), tempfile.TemporaryDirectory() as temporary:
+                tool, runner, directory = self.setup_capture(temporary)
+                case = {'adapter': 'dg', 'profile': {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}}
+                with patch.object(profiles, '_tool', return_value=tool), patch.object(profiles, 'gpu_identity', return_value=GPU), \
+                        patch.object(profiles, bound, 1):
+                    value = profiles.capture(case, ['app'], runner, directory, GPU)
+                self.assertEqual(value['status'], 'complete')
+                activity = value['captures']['nsys']['gpu_activity']
+                self.assertEqual(activity['availability'], 'unavailable')
+                self.assertIn('bound exceeded', activity['reason'])
+                if bound == 'NSYS_TRACE_MAX_EVENTS':
+                    self.assertFalse(any(label.endswith('nsys-cuda_gpu_trace') for label, argv, timeout in runner.commands))
     def test_tensor_dispatch_environment_reaches_both_capture_children(self):
         with tempfile.TemporaryDirectory() as temporary:
             tool, runner, directory = self.setup_capture(temporary)
