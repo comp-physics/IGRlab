@@ -7,6 +7,7 @@ not install dependencies, build, submit jobs, or execute an application.
 from __future__ import annotations
 
 import hashlib
+import copy
 import importlib.util
 import json
 import os
@@ -185,21 +186,54 @@ def admit_build(plan, binary_names, receipt):
             'artifact_sha256': artifacts, 'artifact_links': verified['artifacts']['links'],
             'canonical_jobs': jobs, 'spack_locations': locations, 'dependency_bindings': bindings,
             'runtime': {'launcher': str(launcher), 'ranks': 1,
-                        'environment': runtime_environment(locations, {})}}
+                        'environment_policy': runtime_policy(locations)}}
+
+
+def runtime_policy(locations):
+    """Build identity binds selected prefixes and threads, not shell history."""
+    return {'path_prefix': [str(Path(locations[name]) / 'bin')
+                            for name in ('openmpi', 'hypre', 'openblas', 'metis')],
+            'library_path_prefix': [str(Path(locations[name]) / directory)
+                                    for name in ('openmpi', 'hypre', 'openblas', 'metis')
+                                    for directory in ('lib', 'lib64')],
+            'threads': {'OMP_NUM_THREADS': '1', 'OPENBLAS_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1'}}
+
+
+def artifact_identity(admission):
+    """Normalize only recognized legacy ambient tails; all other fields stay bound."""
+    value = copy.deepcopy(admission)
+    runtime = value['runtime']
+    policy = runtime_policy(value['spack_locations'])
+    if 'environment' in runtime:
+        env = runtime['environment']
+        require(isinstance(env, dict) and set(env) == {'PATH', 'LD_LIBRARY_PATH', *policy['threads']},
+                'legacy CPU runtime environment has an unrecognized policy')
+        for key, prefixes in (('PATH', policy['path_prefix']),
+                              ('LD_LIBRARY_PATH', policy['library_path_prefix'])):
+            prefix = os.pathsep.join(prefixes)
+            require(isinstance(env[key], str) and (env[key] == prefix or env[key].startswith(prefix + os.pathsep)),
+                    f'legacy CPU runtime selected prefix policy changed: {key}')
+        require(all(env[key] == expected for key, expected in policy['threads'].items()),
+                'legacy CPU runtime thread policy changed')
+        runtime.pop('environment')
+        require('environment_policy' not in runtime or runtime['environment_policy'] == policy,
+                'CPU runtime contains conflicting environment policies')
+        runtime['environment_policy'] = policy
+    require(runtime.get('environment_policy') == policy, 'CPU runtime environment policy changed')
+    return value
 
 
 def runtime_environment(locations, overrides):
     # Return only explicit per-child overrides, never a receipt of unrelated
     # inherited variables (which can include credentials).
     env = dict(overrides)
-    bins = [str(Path(locations[name]) / 'bin') for name in ('openmpi', 'hypre', 'openblas', 'metis')]
-    libs = [str(Path(locations[name]) / directory) for name in ('openmpi', 'hypre', 'openblas', 'metis')
-            for directory in ('lib', 'lib64')]
+    policy = runtime_policy(locations)
+    bins, libs = policy['path_prefix'], policy['library_path_prefix']
     inherited_path = env.get('PATH', os.environ.get('PATH', ''))
     inherited_libs = env.get('LD_LIBRARY_PATH', os.environ.get('LD_LIBRARY_PATH', ''))
     env['PATH'] = os.pathsep.join(bins + ([inherited_path] if inherited_path else []))
     env['LD_LIBRARY_PATH'] = os.pathsep.join(libs + ([inherited_libs] if inherited_libs else []))
-    env.update(OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1')
+    env.update(policy['threads'])
     return env
 
 

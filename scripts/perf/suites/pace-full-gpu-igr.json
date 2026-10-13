@@ -36,7 +36,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       }
     },
     {
@@ -71,7 +71,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       }
     },
     {
@@ -105,7 +105,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       }
     },
     {
@@ -139,7 +139,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       }
     },
     {
@@ -170,7 +170,7 @@
           "recovery": "BorrowedRetainedLuRecoverKernel",
           "triangular_solve": "cusparse::spsm_v2_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       }
     },
     {
@@ -203,11 +203,11 @@
           "recovery": "(?:TensorBorrowedRecoverKernel|BorrowedRetainedLuRecoverKernel)",
           "trace_solve": "NativeRankOneTraceSolveKernel"
         },
-        "timeout": 240
+        "timeout": 3600
       }
     }
   ],
-  "timings_budget_seconds": 3000,
-  "profiles_budget_seconds": 3000,
-  "command_timeout_seconds": 300
+  "timings_budget_seconds": 3600,
+  "profiles_budget_seconds": 3600,
+  "command_timeout_seconds": 3600
 }

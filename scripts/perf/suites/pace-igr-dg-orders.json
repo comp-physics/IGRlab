@@ -4,9 +4,9 @@
   "repetitions": 3,
   "warmups": 1,
   "correctness_regex": "^(dg_igr_dg_operator_tests|dg_igr_dgsem_operator_cuda|dg_igr_hdg_runtime_cuda_generic_euler_session_rank1|dg_igr_hdg_runtime_cuda_generic_euler_session_tensor_rank1|dg_igr_hdg_runtime_cuda_generic_euler_extension_p3_rank1|dg_igr_hdg_runtime_cuda_generic_euler_extension_tensor_p3_rank1|dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p1_rank1|dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p3_rank1|dg_igr_cylinder_l2_cpu_cuda_pvd_drift_exact_face)$",
-  "timings_budget_seconds": 3000,
-  "profiles_budget_seconds": 3000,
-  "command_timeout_seconds": 600,
+  "timings_budget_seconds": 3600,
+  "profiles_budget_seconds": 3600,
+  "command_timeout_seconds": 3600,
   "cases": [
     {
       "id": "dg-igr-cuda-p1-n32",
@@ -39,7 +39,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       },
       "enabled": false,
       "optional": true
@@ -75,7 +75,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       },
       "enabled": false,
       "optional": true
@@ -111,7 +111,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       },
       "enabled": true,
       "optional": false
@@ -147,7 +147,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       },
       "enabled": false,
       "optional": true
@@ -183,7 +183,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       },
       "enabled": false,
       "optional": true
@@ -219,7 +219,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       },
       "enabled": false,
       "optional": true
@@ -255,7 +255,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       },
       "enabled": false,
       "optional": true
@@ -291,7 +291,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       },
       "enabled": false,
       "optional": true
@@ -327,7 +327,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       },
       "enabled": false,
       "optional": true
@@ -363,7 +363,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       },
       "enabled": false,
       "optional": true
@@ -399,7 +399,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       },
       "enabled": false,
       "optional": true
@@ -435,7 +435,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       },
       "enabled": false,
       "optional": true
@@ -471,7 +471,7 @@
           "closure_chebyshev": "OperatorChebyshevSmoother::Mult",
           "closure_reduction": "mfem::internal::reduction_kernel"
         },
-        "timeout": 240
+        "timeout": 3600
       },
       "enabled": false,
       "optional": true
@@ -493,6 +493,7 @@
         "igr_alpha_length": "local"
       },
       "profile": {
+        "timeout": 3600,
         "kernel_regex": "not-applicable-cpu",
         "launch_skip": 0,
         "launch_count": 1
@@ -517,6 +518,7 @@
         "igr_alpha_length": "local"
       },
       "profile": {
+        "timeout": 3600,
         "kernel_regex": "not-applicable-cpu",
         "launch_skip": 0,
         "launch_count": 1

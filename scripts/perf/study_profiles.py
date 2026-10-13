@@ -600,9 +600,13 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
     skip = profile.get('launch_skip', profile.get('skip', 0))
     count = profile.get('launch_count', profile.get('count', 1))
     limit = profile.get('max_metric_rows', 120)
-    timeout = profile.get('timeout', 240)
+    timeout = profile.get('timeout', 3600)
+    try:
+        valid_timeout = type(timeout) in (int, float) and math.isfinite(timeout) and timeout > 0
+    except OverflowError:
+        valid_timeout = False
     require(type(skip) is int and 0 <= skip <= 10000 and type(count) is int and 1 <= count <= 32 and
-            type(limit) is int and 1 <= limit <= 120 and type(timeout) in (int, float) and math.isfinite(timeout) and 0 < timeout <= 240,
+            type(limit) is int and 1 <= limit <= 120 and valid_timeout,
             'invalid bounded profiler selection')
     selection = profile.get('selection', 'launches')
     groups = profile.get('kernel_groups', {})
@@ -726,14 +730,14 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
         def stats_command(report):
             return [str(tool), 'stats', '--report', report, '--format', 'csv',
                     '--force-export=true', native['path']]
-        stats = run('nsys-stats', stats_command(','.join(NSYS_CORE_REPORTS)), 120)
+        stats = run('nsys-stats', stats_command(','.join(NSYS_CORE_REPORTS)))
         statistics = parse_nsys((stats / 'stdout.log').read_text())
         host_summaries = {}
         for report in NSYS_OPTIONAL_REPORTS[:3]:
             if report not in available_reports:
                 host_summaries[report] = {'availability': 'unavailable', 'reason': 'not listed by native Nsys report help'}
                 continue
-            exported = run('nsys-' + report, stats_command(report), 120, allow_failure=True)
+            exported = run('nsys-' + report, stats_command(report), allow_failure=True)
             export_exit = json.loads((exported / 'result.json').read_text())['returncode']
             stdout, stderr = [(exported / name).read_text() for name in ('stdout.log', 'stderr.log')]
             host_summaries[report] = (parse_nsys_host_summary(stdout, report) if export_exit == 0 else
@@ -744,7 +748,7 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
         expected_events = statistics['gpu_kernel']['instances'] + (statistics['gpu_memory']['instances'] or 0)
         activity = {'availability': 'unavailable', 'reason': 'not listed by native Nsys report help'}
         if 'cuda_gpu_trace' in available_reports:
-            exported = run('nsys-cuda_gpu_trace', stats_command('cuda_gpu_trace'), 120)
+            exported = run('nsys-cuda_gpu_trace', stats_command('cuda_gpu_trace'))
             trace = exported / 'stdout.log'
             with trace.open(newline='') as stream:
                 activity = parse_nsys_gpu_activity(stream, expected_events)
@@ -816,7 +820,7 @@ def capture(case: dict, argv: list[str], runner, directory: Path, expected_gpu: 
             log = run('ncu', [*command, '--export', str(prefix), *argv])
             native = artifact(native_ncu(prefix))
             imported = run('ncu-import', [*tool_command, '--import', native['path'], '--csv', '--page', 'raw',
-                                        '--print-units', 'base', '--rename-kernels', 'off'], 120)
+                                        '--print-units', 'base', '--rename-kernels', 'off'])
             normalized = parse_ncu((imported / 'stdout.log').read_text(), regex, count, limit)
             if selection == 'first-per-kernel':
                 require(len({row['kernel'] for row in normalized['launches']}) == normalized['observed_launches'],

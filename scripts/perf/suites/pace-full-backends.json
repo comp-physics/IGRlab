@@ -3,6 +3,9 @@
   "name": "pace-full-backends",
   "repetitions": 3,
   "warmups": 1,
+  "timings_budget_seconds": 3600,
+  "profiles_budget_seconds": 3600,
+  "command_timeout_seconds": 3600,
   "correctness_regex": "^(dg_igr_dg_operator_tests|dg_igr_dgsem_operator_cuda|dg_igr_hdg_runtime_cuda_generic_euler_session_rank1|dg_igr_hdg_runtime_cuda_generic_euler_session_tensor_rank1|dg_igr_hdg_runtime_cuda_generic_euler_extension_p3_rank1|dg_igr_hdg_runtime_cuda_generic_euler_extension_tensor_p3_rank1|dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p1_rank1|dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p3_rank1|dg_igr_cylinder_l2_cpu_cuda_pvd_drift_exact_face)$",
   "cases": [
     {
@@ -17,6 +20,7 @@
         "device": "cpu"
       },
       "profile": {
+        "timeout": 3600,
         "kernel_regex": "not-applicable-cpu",
         "launch_skip": 0,
         "launch_count": 1
@@ -34,6 +38,7 @@
         "device": "cuda"
       },
       "profile": {
+        "timeout": 3600,
         "selection": "first-per-kernel",
         "launch_skip": 0,
         "launch_count": 32,
@@ -56,6 +61,7 @@
         "device": "cpu"
       },
       "profile": {
+        "timeout": 3600,
         "kernel_regex": "not-applicable-cpu",
         "launch_skip": 0,
         "launch_count": 1
@@ -73,6 +79,7 @@
         "device": "cuda"
       },
       "profile": {
+        "timeout": 3600,
         "selection": "first-per-kernel",
         "launch_skip": 0,
         "launch_count": 32,
@@ -97,6 +104,7 @@
         "dgsem_residual": "fused-simt"
       },
       "profile": {
+        "timeout": 3600,
         "selection": "first-per-kernel",
         "launch_skip": 0,
         "launch_count": 32,
@@ -119,6 +127,7 @@
         "dgsem_residual": "fused-dmma"
       },
       "profile": {
+        "timeout": 3600,
         "selection": "first-per-kernel",
         "launch_skip": 0,
         "launch_count": 32,
@@ -142,6 +151,7 @@
         "device": "cpu"
       },
       "profile": {
+        "timeout": 3600,
         "kernel_regex": "not-applicable-cpu",
         "launch_skip": 0,
         "launch_count": 1
@@ -159,6 +169,7 @@
         "device": "cuda"
       },
       "profile": {
+        "timeout": 3600,
         "selection": "first-per-kernel",
         "launch_skip": 0,
         "launch_count": 32,
@@ -185,6 +196,7 @@
         "engine": "tensor"
       },
       "profile": {
+        "timeout": 3600,
         "selection": "first-per-kernel",
         "launch_skip": 0,
         "launch_count": 32,

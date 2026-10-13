@@ -37,6 +37,7 @@ METHODS = ('existing-fp64', 'cooperative-fp64', 'cooperative-fp32',
            'factorized-lines-tf32', 'factorized-lines-tf32x3', 'dense2d-tf32', 'dense2d-tf32x3')
 DG_MESH = 'examples/dgsem_smooth_advection_periodic/smooth_advection_periodic.msh'
 RTOL, ATOL = 5e-8, 5e-9
+DEFAULT_EXECUTION_BUDGET_SECONDS = 3600
 IGR_PARAMETERS = {'regularization', 'active_igr_wave', 'c_alpha', 'igr_alpha_length'}
 # Match the documented FP64 CG/Chebyshev production reference, and suppress
 # optional inverse/probe experiments inherited from an interactive shell.
@@ -64,6 +65,16 @@ def number(value, name, *, positive=False):
 
 def integer(value, name, minimum=0):
     require(type(value) is int and value >= minimum, f'invalid {name}')
+    return value
+
+
+def execution_seconds(value, name):
+    """Validate a requested duration; allocation deadlines bound execution."""
+    try:
+        valid = type(value) in (int, float) and math.isfinite(value) and value > 0
+    except OverflowError:
+        valid = False
+    require(valid, f'invalid {name}')
     return value
 
 
@@ -162,11 +173,8 @@ def load_suite(path):
                 '\r' not in suite['name'], 'invalid suite name')
     require(integer(suite.get('repetitions'), 'repetitions', 3) <= 31, 'suite repetitions must be 3..31')
     require(integer(suite.get('warmups'), 'warmups', 1) <= 5, 'suite warmups must be 1..5')
-    for field, maximum in (('timings_budget_seconds', 3000), ('profiles_budget_seconds', 3000),
-                           ('command_timeout_seconds', 600)):
-        if field in suite:
-            require(number(suite[field], field, positive=True) <= maximum,
-                    f'{field} exceeds {maximum} seconds')
+    for field in ('timings_budget_seconds', 'profiles_budget_seconds', 'command_timeout_seconds'):
+        suite[field] = execution_seconds(suite.get(field, DEFAULT_EXECUTION_BUDGET_SECONDS), field)
     regex = suite.get('correctness_regex')
     require(isinstance(regex, str) and regex and '\n' not in regex and '\r' not in regex,
             'suite requires a single-line correctness_regex')
@@ -213,8 +221,8 @@ def load_suite(path):
                     isinstance(regex, str) and 0 < len(regex) <= 2048 and '\n' not in regex and '\r' not in regex,
                     'invalid profile kernel group')
             re.compile(regex)
-        if 'timeout' in profile:
-            require(number(profile['timeout'], 'profile timeout', positive=True) <= 240, 'unbounded profile timeout')
+        profile['timeout'] = execution_seconds(profile.get('timeout', DEFAULT_EXECUTION_BUDGET_SECONDS),
+                                               'profile timeout')
         if 'max_metric_rows' in profile:
             require(integer(profile['max_metric_rows'], 'max_metric_rows', 1) <= 120, 'unbounded profile metric rows')
         for field in ('ncu', 'nsys'):

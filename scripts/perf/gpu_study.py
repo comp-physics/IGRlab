@@ -86,8 +86,8 @@ def worker_budget(plan, suite, stage, entered, *, end_epoch=None):
     """Bound commands by suite and allocation time, preserving cleanup time."""
     hours, minutes, seconds = map(int, stage_wall_time(plan, stage).split(':'))
     elapsed = time.monotonic() - entered
-    requested = suite.get(stage + '_budget_seconds', 3000)
-    if not math.isfinite(elapsed) or elapsed < 0 or type(requested) not in (int, float) or not 0 < requested <= 3000:
+    requested = suite.get(stage + '_budget_seconds', 3600)
+    if not math.isfinite(elapsed) or elapsed < 0 or not finite_positive(requested):
         raise ValueError('invalid worker elapsed time or suite budget')
     remaining = hours * 3600 + minutes * 60 + seconds - elapsed - CLEANUP_RESERVE_SECONDS
     if end_epoch is not None:
@@ -123,6 +123,139 @@ def sha(path):
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
                                      allow_nan=False).encode()).hexdigest()
+
+
+def finite_positive(value):
+    try:
+        return type(value) in (int, float) and value > 0 and math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def first_difference(expected, observed, path=''):
+    """Report one exact JSON field with bounded, nonsecret value fingerprints."""
+    missing = object()
+    def walk(before, after, location):
+        if type(before) is type(after) and isinstance(before, dict):
+            for key in sorted(set(before) | set(after)):
+                token = str(key).replace('~', '~0').replace('/', '~1')
+                result = walk(before.get(key, missing), after.get(key, missing), location + '/' + token)
+                if result:
+                    return result
+            return None
+        if type(before) is type(after) and isinstance(before, list):
+            for index in range(max(len(before), len(after))):
+                result = walk(before[index] if index < len(before) else missing,
+                              after[index] if index < len(after) else missing, location + '/' + str(index))
+                if result:
+                    return result
+            return None
+        if type(before) is type(after) and before == after:
+            return None
+        return {'path': (location or '/')[:512], 'path_sha256': hashlib.sha256(location.encode()).hexdigest(),
+                'expected_type': 'missing' if before is missing else type(before).__name__,
+                'observed_type': 'missing' if after is missing else type(after).__name__,
+                'expected_sha256': None if before is missing else digest(before),
+                'observed_sha256': None if after is missing else digest(after)}
+    return walk(expected, observed, path)
+
+
+def admission_identity(value):
+    result = dict(value)
+    if 'cpu_artifacts' in result:
+        result['cpu_artifacts'] = {member: study_admit.artifact_identity(cpu)
+                                   for member, cpu in result['cpu_artifacts'].items()}
+    return result
+
+
+def publish_admission(path, value, *, publish=True):
+    if not publish:
+        return value
+    if path.exists():
+        difference = first_difference(admission_identity(read_json(path)), admission_identity(value))
+        if difference:
+            raise RuntimeError('study build identity changed after admission: ' +
+                               json.dumps(difference, sort_keys=True, separators=(',', ':')))
+    else:
+        write_json(path, value, exclusive=True)
+    return value
+
+
+def frozen_admission_value(root, plan):
+    """Recompute the exact frozen checker without allowing any study writes."""
+    names = {Path(name).stem for name in plan['executor_sha256'] if name.endswith('.py')}
+    saved = {name: sys.modules.get(name) for name in names}
+    original_path = sys.path[:]
+    try:
+        for name in names:
+            sys.modules.pop(name, None)
+        sys.path.insert(0, str(root / 'executor'))
+        spec = importlib.util.spec_from_file_location('_study_admission_diagnostic', root / 'executor/gpu_study.py')
+        frozen = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(frozen)
+        def reject_write(*args, **kwargs):
+            raise RuntimeError('read-only admission diagnostic refused a study write')
+        frozen.write_json = reject_write
+        suite = frozen.study_workloads.load_suite(root / 'suite.json')
+        try:
+            return frozen.admit(root, plan, suite)
+        except RuntimeError as error:
+            if not str(error).startswith('study build identity changed after admission'):
+                raise
+            traceback = error.__traceback__
+            while traceback is not None:
+                frame = traceback.tb_frame
+                if frame.f_code is frozen.admit.__code__ and isinstance(frame.f_locals.get('value'), dict):
+                    return frame.f_locals['value']
+                traceback = traceback.tb_next
+            raise RuntimeError('frozen checker did not retain its recomputed admission') from error
+    finally:
+        sys.path[:] = original_path
+        for name in names:
+            sys.modules.pop(name, None)
+            if saved[name] is not None:
+                sys.modules[name] = saved[name]
+
+
+def diagnose_admission(args):
+    """Owned-compute, read-only diagnosis; no application/profiler/build execution."""
+    job = os.environ.get('SLURM_JOB_ID', '')
+    if not re.fullmatch(r'[1-9][0-9]*', job) or 'login' in socket.getfqdn():
+        raise RuntimeError('admission diagnosis requires an owned free compute allocation')
+    query = subprocess.run(['scontrol', 'show', 'job', '-o', job], text=True,
+                           capture_output=True, timeout=30)
+    info = dict(re.findall(r'(\w+)=([^\s]+)', query.stdout))
+    owner = pwd.getpwuid(os.getuid()).pw_name + '(' + str(os.getuid()) + ')'
+    if (query.returncode or info.get('JobId') != job or info.get('UserId') != owner or
+            info.get('JobState') != 'RUNNING' or info.get('Account') != 'gts-sbryngelson3' or
+            info.get('QOS') != 'embers' or info.get('Partition') not in ('cpu-small', 'gpu-a100') or
+            info.get('NumNodes') != '1' or info.get('NumTasks') != '1'):
+        raise RuntimeError('admission diagnosis requires the live owned one-node free allocation')
+    nodes = subprocess.run(['scontrol', 'show', 'hostnames', info.get('NodeList', '')],
+                           text=True, capture_output=True, timeout=15)
+    node_names = nodes.stdout.split()
+    if (nodes.returncode or len(node_names) != 1 or
+            node_names[0].split('.')[0] != socket.gethostname().split('.')[0]):
+        raise RuntimeError('admission diagnosis is not running on its owned compute node')
+    root = absolute(args.run_dir).resolve(strict=True)
+    with locked(root):
+        path = root / 'admission.json'
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError('read-only admission diagnosis requires an existing regular admission')
+        plan = verify(root, binaries=True)
+        before = sha(path)
+        expected = read_json(path)
+        checked_builds(root)
+        observed = frozen_admission_value(root, plan)
+        if sha(path) != before:
+            raise RuntimeError('original admission changed during read-only diagnosis')
+        result = {'schema_version': SCHEMA, 'run_dir': str(root), 'plan_sha256': plan['plan_sha256'],
+                  'admission_sha256': before, 'job_id': job, 'node': socket.gethostname(),
+                  'scope': 'current compute environment; exact frozen checker; not proof of historical failing-node environment',
+                  'legacy_exact_difference': first_difference(expected, observed),
+                  'immutable_artifact_difference': first_difference(admission_identity(expected), admission_identity(observed)),
+                  'application_execution': False, 'study_writes': False}
+        print(json.dumps(result, sort_keys=True, allow_nan=False))
 
 
 def write_json(path, value, *, exclusive=False):
@@ -168,12 +301,16 @@ def locked(root):
 
 class Runner:
     """Each subprocess has an exclusive receipt and a bounded process group."""
-    def __init__(self, output, max_seconds, command_timeout=300):
+    def __init__(self, output, max_seconds, command_timeout=3600):
+        if not finite_positive(max_seconds) or not finite_positive(command_timeout):
+            raise ValueError('runner budgets must be positive and finite')
         self.output = Path(output)
         self.deadline = time.monotonic() + max_seconds
         self.command_timeout = command_timeout
 
     def run(self, label, argv, *, cwd=None, env=None, timeout=None):
+        if timeout is not None and not finite_positive(timeout):
+            raise ValueError('command timeout must be positive and finite')
         relative = Path(label)
         if relative.is_absolute() or '..' in relative.parts:
             raise ValueError('command label must be confined to this attempt')
@@ -722,7 +859,7 @@ def checked_builds(root):
         raise RuntimeError('all canonical correctness jobs must complete successfully before measurement')
 
 
-def admit(root, plan, suite):
+def admit(root, plan, suite, *, publish=True):
     if cpu_only(plan):
         validate_cpu_cases(suite)
         state = read_json(root / 'state.json')
@@ -740,13 +877,7 @@ def admit(root, plan, suite):
                  'artifact_sha256': artifacts,
                  'spack_locations': cpus['candidate']['spack_locations'],
                  'dependency_bindings': {member: cpus[member]['dependency_bindings'] for member in MEMBERS}}
-        path = root / 'admission.json'
-        if path.exists():
-            if read_json(path) != value:
-                raise RuntimeError('study build identity changed after admission')
-        else:
-            write_json(path, value, exclusive=True)
-        return value
+        return publish_admission(root / 'admission.json', value, publish=publish)
     artifacts = {}
     binaries = {}
     locations = {}
@@ -843,13 +974,7 @@ def admit(root, plan, suite):
                     raise RuntimeError('CPU and CUDA artifact receipts disagree')
                 artifacts[artifact] = expected
             value['cpu_artifacts'][member] = cpu
-    path = root / 'admission.json'
-    if path.exists():
-        if read_json(path) != value:
-            raise RuntimeError('study build identity changed after admission')
-    else:
-        write_json(path, value, exclusive=True)
-    return value
+    return publish_admission(root / 'admission.json', value, publish=publish)
 
 
 def observe(runner, root, plan, admission, case, member, label, gpu, *, fields=False):
@@ -1235,7 +1360,7 @@ def worker(args):
             attempt.update(worker_budget_seconds=budget, cleanup_reserve_seconds=CLEANUP_RESERVE_SECONDS,
                            requested_wall_time=stage_wall_time(plan, args.stage))
             runner = Runner(output, budget,
-                            suite.get('command_timeout_seconds', 300))
+                            suite.get('command_timeout_seconds', 3600))
             attempt['hardware_before'] = hardware_snapshot(runner, 'before', gpu)
             if plan.get('cpu_timing_continuation'):
                 summary = study_cpu_continuation.execute(sys.modules[__name__], root, plan, suite, admission, runner)
@@ -1408,7 +1533,24 @@ def profile_only_overrides(original, replacement):
 def retained_profile_tools(plan, state, old, suite):
     """Seal completed tool checkpoints; application/native admission stays compute-only."""
     attempt = next((item for item in reversed(state['attempts']) if item['stage'] == 'profiles'), None)
-    if not attempt or attempt.get('status') == 'running':
+    if attempt is None:
+        # A failed admission occurs before attempt creation. Explicit continuation
+        # may collect its first diagnostics on another GPU without repeating timings.
+        if plan.get('profile_continuation', {}).get('captures'):
+            raise RuntimeError('unstarted continuation already retains tools; preserve its existing plan')
+        directory = old / 'attempts'
+        if directory.exists() and any(path.name.startswith('profiles') for path in directory.iterdir()):
+            raise RuntimeError('unrecorded profile directory prevents zero-capture continuation')
+        if not any(case.get('parameters', {}).get('device') != 'cpu' for case in selected_cases(suite)):
+            raise RuntimeError('continuation requires an enabled GPU workload')
+        return {'run_dir': str(old), 'plan_sha256': plan['plan_sha256'], 'suite_sha256': plan['suite_sha256'],
+                'origin_kind': 'no-profile-attempt', 'checkpoint': None, 'checkpoint_sha256': None,
+                'captures': {}, 'artifact_sha256': {str(old / 'state.json'): sha(old / 'state.json')},
+                'compute_artifact_sha256': {},
+                'scope': 'no original profile attempt or retained captures; all tools missing; independent GPU diagnostics',
+                'native_integrity_scope': 'no retained native reports; fresh compute capture and application admission required',
+                'matched_profiler_timing_claim': False}
+    if attempt.get('status') == 'running':
         raise RuntimeError('continuation requires an inactive original profile attempt')
     checkpoint = absolute(attempt.get('summary') or str(Path(attempt['directory']) / 'partial.json'))
     if not checkpoint.is_relative_to(old) or not checkpoint.is_file() or checkpoint.stat().st_size > 8 * 1024 * 1024:
@@ -1619,8 +1761,15 @@ def retained_profile_tools(plan, state, old, suite):
 
 def retry(args):
     """A fresh executor/cohort may reuse only inactive, verified completed builds."""
+    preparation_allocation = None
     if os.environ.get('SLURM_JOB_ID'):
-        raise RuntimeError('prepare or submit a retry from the PACE login node')
+        if not (args.prepare_only and getattr(args, 'profiles_only', False) and
+                getattr(args, 'continue_profiles', False)):
+            raise RuntimeError('compute retry permits only --prepare-only --profiles-only --continue-profiles')
+        # Preparation reads immutable metadata and scheduler state only. It may
+        # run in the same owned free CPU job as diagnose-admission, never submit
+        # measurement work or use an unverified ambient allocation identity.
+        preparation_allocation = cpu_allocation()
     old, root = absolute(args.from_run).resolve(strict=True), absolute(args.run_dir).resolve()
     with locked(old):
         plan = verify(old, binaries=(old / 'admission.json').exists())
@@ -1641,6 +1790,14 @@ def retry(args):
             raise ValueError('profiles-only retry forbids --cases; timing workload selection must match')
         retained = retained_timing(plan, state, old) if profiles_only else None
         retained_profiles = retained_profile_tools(plan, state, old, old_suite) if continue_profiles else None
+        profile_timeout = getattr(args, 'profile_timeout_seconds', None)
+        if profile_timeout is not None and (not finite_positive(profile_timeout) or not continue_profiles or
+                retained_profiles.get('origin_kind') != 'no-profile-attempt'):
+            raise ValueError('--profile-timeout-seconds requires a positive finite zero-attempt profile continuation')
+        profile_budget = getattr(args, 'profiles_budget_seconds', None)
+        if profile_budget is not None and (not finite_positive(profile_budget) or not continue_profiles or
+                retained_profiles.get('origin_kind') != 'no-profile-attempt'):
+            raise ValueError('--profiles-budget-seconds requires a positive finite zero-attempt profile continuation')
         supplied_profile_suite_sha256 = (sha(suite_path)
                                         if profiles_only and suite_path is not None else None)
         suite = study_workloads.load_suite(suite_path) if suite_path is not None else old_suite
@@ -1660,6 +1817,18 @@ def retry(args):
                 case['enabled'] = case['id'] in ids
         if not selected_cases(suite):
             raise ValueError('retry requires at least one enabled workload')
+        timeout_suite = None
+        if profile_timeout is not None or profile_budget is not None:
+            timeout_suite = read_json(old / 'suite.json')
+            if profile_budget is not None:
+                timeout_suite['profiles_budget_seconds'] = profile_budget
+            selected_gpu = {case['id'] for case in selected_cases(suite)
+                            if case.get('parameters', {}).get('device') != 'cpu'}
+            for case in timeout_suite['cases']:
+                if profile_timeout is not None and case['id'] in selected_gpu:
+                    profile_overrides[case['id']] = {'original': dict(case['profile']),
+                        'replacement': {**case['profile'], 'timeout': profile_timeout}}
+                    case['profile']['timeout'] = profile_timeout
         validate_cuda_profile_cases(suite, cpu_available='cpu_builds' in plan)
         protected = [old, Path(plan['cache_root']), Path(__file__).resolve().parents[2]]
         protected += [Path(s['source_snapshot']) for s in plan['sources'].values()]
@@ -1736,13 +1905,17 @@ def retry(args):
                                       'suite_sha256': plan['suite_sha256'], 'scheduler_outcomes': outcomes,
                                       'build_artifact_sha256': artifacts,
                                       'binding_scope': 'fresh compute admission required'})
+        if preparation_allocation is not None:
+            new_plan['retry_origin']['preparation_allocation'] = preparation_allocation
         if profiles_only:
             new_plan['timing_reuse'] = {**retained, 'interactive_scheduler_admission': interactive}
         if continue_profiles:
             new_plan['profile_continuation'] = retained_profiles
         root.mkdir(parents=True, exist_ok=False)
         freeze_executor(root)
-        if profiles_only or suite_path is None and cases is None:
+        if timeout_suite is not None:
+            write_json(root / 'suite.json', timeout_suite, exclusive=True)
+        elif profiles_only or suite_path is None and cases is None:
             shutil.copy2(suite_path if suite_path is not None else old / 'suite.json', root / 'suite.json')
         else:
             write_json(root / 'suite.json', suite, exclusive=True)
@@ -1753,6 +1926,9 @@ def retry(args):
         if profiles_only:
             new_plan['timing_reuse'].update(profile_suite_sha256=new_plan['suite_sha256'],
                                             profile_overrides=profile_overrides)
+            if profile_budget is not None:
+                new_plan['timing_reuse']['profiles_budget_override'] = {
+                    'original': old_suite['profiles_budget_seconds'], 'replacement': profile_budget}
         new_plan['executor_sha256'] = {name: sha(root / 'executor' / name) for name in EXECUTOR_FILES}
         new_plan['plan_sha256'] = digest(new_plan)
         write_json(root / 'plan.json', new_plan, exclusive=True)
@@ -1913,7 +2089,9 @@ def report(root):
                   'Pairs have individual allocation provenance. This is not a homogeneous single-host cohort; split-allocation pairs are not matched hardware. '
                   'Original warmups are retained; no new-allocation warmup is added.', '']
     if plan.get('profile_continuation'):
-        lines += ['Completed tool captures are retained with their original GPU identities. '
+        lines += [('No old profile attempt or capture exists; all tools are collected on the new diagnostic allocation. '
+                   if plan['profile_continuation'].get('origin_kind') == 'no-profile-attempt' else
+                   'Completed tool captures are retained with their original GPU identities. ') +
                   'Continuation captures have their own GPU identities; these diagnostics do not claim matched profiler timing or speedup.', '']
     lines += ['Validation execution: ' + ', '.join(
         f'{member}={mode}' for member, mode in result['validation_execution'].items()) + '.', '']
@@ -2066,10 +2244,16 @@ def main(argv=None):
     p.add_argument('--profiles-only', action='store_true',
                    help='reuse completed timings on the same GPU; --suite may change only case.profile; no --cases')
     p.add_argument('--continue-profiles', action='store_true',
-                   help='with --profiles-only, retain completed tools and capture only missing tools; per-capture GPUs, no --suite/--cases')
+                   help='with --profiles-only, retain completed tools or recover a zero-attempt admission failure; capture missing tools with independent GPU identities, no --suite/--cases')
+    p.add_argument('--profile-timeout-seconds', type=float,
+                   help='positive finite timeout for fresh captures in a zero-attempt continuation; original suite/timings stay immutable')
+    p.add_argument('--profiles-budget-seconds', type=float,
+                   help='positive finite stage budget for a zero-attempt continuation, still bounded by allocation end minus cleanup')
     p.add_argument('--timings-time', type=wall_time, help='override inherited timing allocation limit')
     p.add_argument('--profiles-time', type=wall_time, help='override inherited profiling allocation limit')
     p.add_argument('--prepare-only', action='store_true', help='prepare without submitting measurement jobs')
+    p = sub.add_parser('diagnose-admission', help='owned-compute read-only comparison using the exact frozen checker; no applications')
+    p.add_argument('--run-dir', required=True)
     for name in ('worker', 'resume'):
         p = sub.add_parser(name, help='run or resubmit an incomplete stage without replacing completed measurements')
         p.add_argument('--run-dir', required=True)
@@ -2089,6 +2273,8 @@ def main(argv=None):
         retry(args)
     elif args.command == 'continue-timings':
         study_cpu_continuation.prepare(sys.modules[__name__], args)
+    elif args.command == 'diagnose-admission':
+        diagnose_admission(args)
     elif args.command == 'worker':
         worker(args)
     elif args.command == 'resume':

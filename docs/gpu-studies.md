@@ -17,6 +17,20 @@ Initialize the pinned MFEM submodule and the tested build Spack as described in
   --site-root /absolute/scratch/igrlab-dependencies
 ```
 
+New suites default to 3600 seconds for `timings_budget_seconds`,
+`profiles_budget_seconds`, `command_timeout_seconds`, and each case's
+`profile.timeout`. Each accepts any positive finite number, so a focused run
+can request a shorter budget or a long application can request more than one
+hour. These values do not extend an allocation: the worker also enforces the
+actual Slurm end time and its 120-second cleanup reserve. A command stops at
+the earliest applicable deadline.
+
+Explicit limits in existing frozen suites and executors remain unchanged.
+Changing an execution budget requires a new immutable run; it does not change
+the mesh, steps, precision, tolerances, numerical gates, or paired protocol.
+Retain successful partial processes through `continue-timings` when supported,
+rather than repeating them. The free one-hour allocation policy still applies.
+
 `BASELINE_REF` is an existing Git commit, branch, or tag. Both versions must
 contain the supported portable build driver and use the same PACE dependency
 policy. For the DG/HDG optimizations first tested in October 2026, `bef3361`
@@ -502,6 +516,22 @@ wrapper. Preparation requires inactive scheduler jobs and a closed attempt.
 A hard scheduler kill that leaves the old attempt marked `running` is rejected;
 this command does not repair old state. Ordinary profile-only retry retains its
 original-GPU rule and recaptures both members.
+
+The same explicit continuation can recover a run whose profiling admission
+failed before any capture. It requires completed timings and no orphan profile
+outputs. For this zero-capture case, optional `--profile-timeout-seconds 3600`
+and `--profiles-budget-seconds 3600` set the new capture and stage budgets;
+the original run and timing bytes remain unchanged. The new worker still
+reserves 120 seconds before its actual allocation ends.
+
+To inspect an admission mismatch, run
+`./perf.sh diagnose-admission --run-dir /absolute/scratch/studies/old-run`
+inside an owned compute allocation. It recomputes the frozen admission without
+running applications or changing the study, and reports the first difference
+separately for the legacy record and immutable artifact identity. Inherited
+shell search-path tails are excluded from identity only when the selected
+dependency prefixes and thread policy match; executable, library, source,
+configuration and dependency changes still fail admission.
 
 Use `retry --cases` to measure additional cases already present in the old
 suite, including optional DGSEM probes, without submitting compilation or

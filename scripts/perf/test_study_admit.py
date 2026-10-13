@@ -249,6 +249,44 @@ MPI_CXX_COMPILER:FILEPATH={mpi}/bin/mpicxx
         self.assertNotIn('SECRET_FIXTURE', env)
         self.assertTrue(env['LD_LIBRARY_PATH'].endswith('/gpu/runtime'))
 
+    def test_ambient_paths_are_runtime_metadata_not_artifact_identity(self):
+        with patch.dict(os.environ, {'PATH': '/shell/a', 'LD_LIBRARY_PATH': '/shell/a/lib'}):
+            first = self.admission()
+            first_env = study.runtime_environment(self.locations, {})
+        with patch.dict(os.environ, {'PATH': '/shell/b', 'LD_LIBRARY_PATH': '/shell/b/lib'}):
+            second = self.admission()
+            second_env = study.runtime_environment(self.locations, {})
+        self.assertEqual(first, second)
+        self.assertNotEqual(first_env['PATH'], second_env['PATH'])
+        self.assertNotEqual(first_env['LD_LIBRARY_PATH'], second_env['LD_LIBRARY_PATH'])
+        self.assertNotIn('environment', first['runtime'])
+        self.assertEqual(first['runtime']['environment_policy'], study.runtime_policy(self.locations))
+
+    def test_legacy_ambient_normalization_requires_exact_selected_policy(self):
+        admitted = self.admission()
+        legacy = json.loads(json.dumps(admitted))
+        legacy['runtime'].pop('environment_policy')
+        with patch.dict(os.environ, {'PATH': '/old/shell', 'LD_LIBRARY_PATH': '/old/shell/lib'}):
+            legacy['runtime']['environment'] = study.runtime_environment(self.locations, {})
+        self.assertEqual(study.artifact_identity(legacy), admitted)
+        before = json.loads(json.dumps(legacy))
+        study.artifact_identity(legacy)
+        self.assertEqual(legacy, before)
+        for key, value in [('OMP_NUM_THREADS', '2'), ('PATH', '/wrong/bin'),
+                           ('LD_LIBRARY_PATH', '/wrong/lib'), ('UNRECOGNIZED_POLICY', 'extra')]:
+            changed = json.loads(json.dumps(legacy))
+            changed['runtime']['environment'][key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'policy'):
+                study.artifact_identity(changed)
+
+    def test_stable_runtime_policy_does_not_hide_changed_library_bytes(self):
+        first = self.admission()
+        library = Path(self.locations['hypre']) / 'lib/libHYPRE.so'
+        library.write_bytes(b'changed library contents')
+        second = self.admission()
+        self.assertNotEqual(study.artifact_identity(first), study.artifact_identity(second))
+        self.assertNotEqual(first['artifact_sha256'][str(library)], second['artifact_sha256'][str(library)])
+
 
 if __name__ == '__main__':
     unittest.main()

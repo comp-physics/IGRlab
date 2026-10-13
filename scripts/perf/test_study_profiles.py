@@ -413,6 +413,34 @@ class CaptureTests(unittest.TestCase):
             discover.assert_not_called()
             identity.assert_not_called()
 
+    def test_capture_timeout_defaults_to_hour_and_accepts_explicit_longer_limit(self):
+        for configured in (None, 7200, 17.5):
+            with self.subTest(configured=configured), tempfile.TemporaryDirectory() as temporary:
+                tool, runner, directory = self.setup_capture(temporary)
+                profile = {'kernel_regex': 'PackedInverseMassKernel', 'launch_count': 2}
+                if configured is not None:
+                    profile['timeout'] = configured
+                with patch.object(profiles, '_tool', return_value=tool), \
+                        patch.object(profiles, 'gpu_identity', return_value=GPU):
+                    profiles.capture({'adapter': 'dg', 'profile': profile}, ['app'], runner, directory, GPU)
+                capture_limits = {label: timeout for label, argv, timeout in runner.commands
+                                  if label in ('profiles/nsys', 'profiles/ncu', 'profiles/ncu-import', 'profiles/nsys-stats',
+                                               'profiles/nsys-cuda_gpu_trace')}
+                expected = 3600 if configured is None else configured
+                self.assertEqual(capture_limits, {'profiles/nsys': expected, 'profiles/ncu': expected,
+                                                 'profiles/ncu-import': expected,
+                                                 'profiles/nsys-stats': expected,
+                                                 'profiles/nsys-cuda_gpu_trace': expected})
+
+    def test_invalid_capture_timeout_rejects_before_native_queries(self):
+        for configured in (True, 0, -1, float('inf'), float('nan'), '3600', 10 ** 400):
+            with self.subTest(configured=configured), patch.object(profiles, '_tool') as discover, \
+                    patch.object(profiles, 'gpu_identity') as identity, self.assertRaises(profiles.ProfileError):
+                profiles.capture({'adapter': 'dg', 'profile': {'kernel_regex': 'Mass', 'timeout': configured}},
+                                 ['app'], None, Path('/not-used'), GPU)
+            discover.assert_not_called()
+            identity.assert_not_called()
+
     def test_requested_missing_tool_remains_unavailable(self):
         with tempfile.TemporaryDirectory() as temporary:
             tool, runner, directory = self.setup_capture(temporary)
@@ -764,7 +792,7 @@ class CaptureTests(unittest.TestCase):
             activity = value['captures']['nsys']['gpu_activity']
             self.assertEqual(activity['event_count'], count)
             self.assertNotIn('events', activity)
-            self.assertTrue(any(label.endswith('nsys-cuda_gpu_trace') and timeout == 120
+            self.assertTrue(any(label.endswith('nsys-cuda_gpu_trace') and timeout == 3600
                                 for label, argv, timeout in runner.commands))
 
     def test_tensor_dispatch_environment_reaches_both_capture_children(self):
@@ -803,7 +831,7 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(ncu[ncu.index('--kernel-name') + 1], 'regex:PackedInverseMassKernel')
             self.assertNotIn('--kernel-id', ncu)
             self.assertIn(profiles.DMMA, ncu[ncu.index('--metrics') + 1])
-            self.assertTrue(all(timeout <= 240 for label, argv, timeout in runner.commands))
+            self.assertTrue(all(timeout <= 3600 for label, argv, timeout in runner.commands))
             self.assertEqual(len(value['application_logs']), 2)
 
     def test_unique_kernel_selection_has_no_shared_launch_cap(self):

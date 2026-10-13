@@ -3,25 +3,29 @@
   "name": "pace-a100",
   "repetitions": 3,
   "warmups": 1,
+  "timings_budget_seconds": 3600,
+  "profiles_budget_seconds": 3600,
+  "command_timeout_seconds": 3600,
   "correctness_regex": "^(dg_igr_dg_operator_tests|dg_igr_dgsem_operator_cuda|dg_igr_hdg_runtime_cuda_generic_euler_session_rank1|dg_igr_hdg_runtime_cuda_generic_euler_session_tensor_rank1|dg_igr_hdg_runtime_cuda_generic_euler_extension_p3_rank1|dg_igr_hdg_runtime_cuda_generic_euler_extension_tensor_p3_rank1|dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p1_rank1|dg_igr_hdg_runtime_cuda_cpu_numerical_alignment_p3_rank1|dg_igr_cylinder_l2_cpu_cuda_pvd_drift_exact_face)$",
   "cases": [
     {
       "id": "dg-p1",
       "adapter": "dg",
       "parameters": {"order": 1, "final_time": 0.002, "dt": 1e-5},
-      "profile": {"kernel_regex": ".*(?:PackedDiagonalInverseMassKernel|PackedInverseMassKernel).*", "launch_skip": 20, "launch_count": 3}
+      "profile": {"kernel_regex": ".*(?:PackedDiagonalInverseMassKernel|PackedInverseMassKernel).*", "launch_skip": 20, "launch_count": 3, "timeout": 3600}
     },
     {
       "id": "dg-p3",
       "adapter": "dg",
       "parameters": {"order": 3, "final_time": 0.002, "dt": 1e-5},
-      "profile": {"kernel_regex": ".*(?:PackedDiagonalInverseMassKernel|PackedInverseMassKernel).*", "launch_skip": 20, "launch_count": 3}
+      "profile": {"kernel_regex": ".*(?:PackedDiagonalInverseMassKernel|PackedInverseMassKernel).*", "launch_skip": 20, "launch_count": 3, "timeout": 3600}
     },
     {
       "id": "hdg-conventional-ordinary-p3",
       "adapter": "hdg",
       "parameters": {"mode": "conventional", "engine": "ordinary", "order": 3, "mesh_n": 16},
       "profile": {
+        "timeout": 3600,
         "selection": "first-per-kernel", "launch_skip": 0, "launch_count": 32,
         "kernel_regex": ".*(?:BorrowedEulerVolumeKernel|BorrowedCondenseKernel|BorrowedEulerFaceKernel|BorrowedRetainedLuRecoverKernel|cusparse::spsm_v2_kernel).*",
         "kernel_groups": {
@@ -36,6 +40,7 @@
       "adapter": "hdg",
       "parameters": {"mode": "conventional", "engine": "tensor", "order": 3, "mesh_n": 16},
       "profile": {
+        "timeout": 3600,
         "selection": "first-per-kernel", "launch_skip": 0, "launch_count": 32,
         "kernel_regex": ".*(?:BorrowedEulerTensorVolumeCoefficientKernel|BorrowedEulerTensorVolumeContractionKernel|BorrowedCondenseKernel|BorrowedEulerFaceKernel|TensorBorrowedRecoverKernel|BorrowedRetainedLuRecoverKernel|NativeRankOneTraceSolveKernel|ElementSchwarz).*",
         "kernel_groups": {
@@ -51,6 +56,7 @@
       "adapter": "hdg",
       "parameters": {"mode": "igr", "engine": "ordinary", "order": 3, "mesh_n": 16},
       "profile": {
+        "timeout": 3600,
         "selection": "first-per-kernel", "launch_skip": 0, "launch_count": 32,
         "kernel_regex": ".*(?:BorrowedEulerVolumeKernel|BorrowedCondenseKernel|BorrowedEulerFaceKernel|BorrowedRetainedLuRecoverKernel|cusparse::spsm_v2_kernel).*",
         "kernel_groups": {
@@ -65,6 +71,7 @@
       "adapter": "hdg",
       "parameters": {"mode": "igr", "engine": "tensor", "order": 3, "mesh_n": 16},
       "profile": {
+        "timeout": 3600,
         "selection": "first-per-kernel", "launch_skip": 0, "launch_count": 32,
         "kernel_regex": ".*(?:BorrowedEulerTensorVolumeCoefficientKernel|BorrowedEulerTensorVolumeContractionKernel|BorrowedCondenseKernel|BorrowedEulerFaceKernel|TensorBorrowedRecoverKernel|BorrowedRetainedLuRecoverKernel|NativeRankOneTraceSolveKernel|ElementSchwarz).*",
         "kernel_groups": {
@@ -81,7 +88,7 @@
       "optional": true,
       "enabled": false,
       "parameters": {"n": 4, "elements": 1024, "iterations": 100, "method": "cooperative-fp64"},
-      "profile": {"kernel_regex": ".*Ordinary<[^>]*double>.*", "launch_skip": 0, "launch_count": 1}
+      "profile": {"kernel_regex": ".*Ordinary<[^>]*double>.*", "launch_skip": 0, "launch_count": 1, "timeout": 3600}
     },
     {
       "id": "dgsem-n8",
@@ -89,7 +96,7 @@
       "optional": true,
       "enabled": false,
       "parameters": {"n": 8, "elements": 1024, "iterations": 100, "method": "cooperative-fp64"},
-      "profile": {"kernel_regex": ".*Ordinary<[^>]*double>.*", "launch_skip": 0, "launch_count": 1}
+      "profile": {"kernel_regex": ".*Ordinary<[^>]*double>.*", "launch_skip": 0, "launch_count": 1, "timeout": 3600}
     }
   ]
 }

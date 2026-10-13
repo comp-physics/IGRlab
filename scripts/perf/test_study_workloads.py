@@ -121,7 +121,7 @@ class WorkloadTests(unittest.TestCase):
             with self.subTest(mutation=mutation), self.assertRaises((ValueError, workloads.re.error)):
                 workloads.load_suite(path)
 
-    def test_suite_physical_budgets_and_work_count_limits(self):
+    def test_suite_execution_budgets_and_work_count_limits(self):
         suite = json.loads(SUITE.read_text())
         suite.update(repetitions=31, warmups=5, timings_budget_seconds=3000,
                      profiles_budget_seconds=0.25, command_timeout_seconds=600.0)
@@ -132,8 +132,7 @@ class WorkloadTests(unittest.TestCase):
         self.assertEqual(len(admitted['cases']), 16)
         self.assertEqual(admitted['profiles_budget_seconds'], 0.25)
         invalid = [('repetitions', 32), ('repetitions', 3.0), ('warmups', 6), ('warmups', True),
-                   ('timings_budget_seconds', 3001), ('profiles_budget_seconds', 3000.1),
-                   ('command_timeout_seconds', 600.01), ('timings_budget_seconds', 0),
+                   ('timings_budget_seconds', 0),
                    ('profiles_budget_seconds', -1), ('command_timeout_seconds', True),
                    ('timings_budget_seconds', '30'), ('profiles_budget_seconds', float('inf')),
                    ('command_timeout_seconds', float('nan')), ('unknown_budget', 100)]
@@ -147,6 +146,79 @@ class WorkloadTests(unittest.TestCase):
         path.write_text(json.dumps(suite))
         with self.assertRaisesRegex(ValueError, '1..16 cases'):
             workloads.load_suite(path)
+
+    def test_execution_budgets_default_to_one_hour_without_mutating_input(self):
+        suite = json.loads(SUITE.read_text())
+        fields = ('timings_budget_seconds', 'profiles_budget_seconds', 'command_timeout_seconds')
+        for field in fields:
+            suite.pop(field, None)
+        for case in suite['cases']:
+            case['profile'].pop('timeout', None)
+        path = self.work / 'default-budget-suite.json'
+        path.write_text(json.dumps(suite))
+        original_bytes = path.read_bytes()
+        admitted = workloads.load_suite(path)
+        self.assertEqual({field: admitted[field] for field in fields},
+                         {field: 3600 for field in fields})
+        self.assertTrue(all(case['profile']['timeout'] == 3600 for case in admitted['cases']))
+        self.assertEqual(path.read_bytes(), original_bytes)
+
+    def test_explicit_execution_budgets_have_no_fixed_ceiling_and_preserve_work(self):
+        original = workloads.load_suite(SUITE)
+        fields = ('timings_budget_seconds', 'profiles_budget_seconds', 'command_timeout_seconds')
+        for value in (0.25, 600, 601.5, 3600, 7200.25):
+            suite = copy.deepcopy(original)
+            suite.update({field: value for field in fields})
+            for case in suite['cases']:
+                case['profile']['timeout'] = value
+            path = self.work / 'explicit-budget-suite.json'
+            path.write_text(json.dumps(suite))
+            with self.subTest(value=value):
+                admitted = workloads.load_suite(path)
+                self.assertEqual({field: admitted[field] for field in fields},
+                                 {field: value for field in fields})
+                for before, after in zip(original['cases'], admitted['cases']):
+                    self.assertEqual(after['profile']['timeout'], value)
+                    self.assertEqual(after['parameters'], before['parameters'])
+                    modes = ({}, {'profile': True}) if before['adapter'] == 'dgsem' else \
+                        ({}, {'fields': True}, {'profile': True})
+                    for mode in modes:
+                        self.assertEqual(workloads.command(after, Path('/binary'), ROOT, self.work, **mode),
+                                         workloads.command(before, Path('/binary'), ROOT, self.work, **mode))
+                        self.assertEqual(workloads.environment(after, self.work, **mode),
+                                         workloads.environment(before, self.work, **mode))
+
+    def test_explicit_frozen_execution_limits_remain_unchanged(self):
+        suite = json.loads(SUITE.read_text())
+        suite.update(timings_budget_seconds=3000, profiles_budget_seconds=3000,
+                     command_timeout_seconds=600)
+        for case in suite['cases']:
+            case['profile']['timeout'] = 240
+        path = self.work / 'historical-budget-suite.json'
+        path.write_text(json.dumps(suite))
+        original_bytes = path.read_bytes()
+        admitted = workloads.load_suite(path)
+        self.assertEqual(admitted['timings_budget_seconds'], 3000)
+        self.assertEqual(admitted['profiles_budget_seconds'], 3000)
+        self.assertEqual(admitted['command_timeout_seconds'], 600)
+        self.assertTrue(all(case['profile']['timeout'] == 240 for case in admitted['cases']))
+        self.assertEqual(path.read_bytes(), original_bytes)
+
+    def test_execution_budgets_reject_nonpositive_nonfinite_and_wrong_types(self):
+        fields = ('timings_budget_seconds', 'profiles_budget_seconds', 'command_timeout_seconds',
+                  'profile.timeout')
+        for field in fields:
+            for value in (0, -1, True, False, None, '3600', float('nan'), float('inf'),
+                          float('-inf'), 10**1000):
+                suite = json.loads(SUITE.read_text())
+                if field == 'profile.timeout':
+                    suite['cases'][0]['profile']['timeout'] = value
+                else:
+                    suite[field] = value
+                path = self.work / 'invalid-budget-suite.json'
+                path.write_text(json.dumps(suite))
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    workloads.load_suite(path)
 
     def test_invalid_suite_ids_repetitions_and_profile_overrides(self):
         for mutation in ('duplicate', 'escape', 'repetitions', 'sections', 'bool_count'):
@@ -342,7 +414,7 @@ class WorkloadTests(unittest.TestCase):
                 self.assertEqual(cells, 256 if p['discretization'] == 'hdg' else 1024)
                 self.assertEqual(p['final_time'], 5e-5 if p['discretization'] == 'hdg' else 0.002)
                 self.assertEqual(case['profile']['selection'], 'first-per-kernel')
-                self.assertEqual(case['profile']['timeout'], 240)
+                self.assertEqual(case['profile']['timeout'], 3600)
                 self.assertTrue(case['profile']['kernel_groups'])
                 argv = workloads.command(case, Path('/binary'), ROOT, self.work, profile=True)
                 self.assertNotIn('--profile-measured-step', argv)

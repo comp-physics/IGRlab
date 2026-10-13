@@ -426,6 +426,261 @@ class RetryTests(unittest.TestCase):
         self.save_state()
         return gpu, summary, other
 
+    def prepare_unstarted_profiles(self):
+        gpu, summary, _ = self.prepare_profile_timing()
+        timing = study.read_json(summary)
+        for item in timing['cases'].values():
+            item['observations'] = [{'signature': {'work': 10}}]
+        study.write_json(summary, timing)
+        attempt = self.state['attempts'][0]
+        attempt['summary_sha256'] = study.sha(summary)
+        attempt['artifact_sha256'][str(summary.relative_to(self.old))] = study.sha(summary)
+        self.save_state()
+        case = study.selected_cases(study.study_workloads.load_suite(self.old / 'suite.json'))[0]
+        return gpu, case, summary
+
+    def test_zero_attempt_continuation_preserves_timings_and_collects_only_new_diagnostics(self):
+        gpu, case, summary = self.prepare_unstarted_profiles()
+        before = self.snapshot()
+        plan = self.retry(profiles_only=True, continue_profiles=True, prepare=False)
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(plan['profile_continuation']['origin_kind'], 'no-profile-attempt')
+        self.assertEqual(plan['profile_continuation']['captures'], {})
+        self.assertEqual(Path(plan['timing_reuse']['summary']).read_bytes(), summary.read_bytes())
+        self.assertFalse((self.new / 'admission.json').exists())
+        self.assertEqual([j['stage'] for j in study.read_json(self.new / 'state.json')['jobs']], ['profiles'])
+        different = {**gpu, 'uuid': 'GPU-11223344-5566-7788-99aa-bbccddeeff00'}
+        result, calls, _, _ = self.run_continuation(plan, case, different)
+        self.assertEqual(calls, [('baseline', ['nsys', 'ncu']), ('candidate', ['nsys', 'ncu'])])
+        self.assertEqual(result['status'], 'analysis_complete')
+        self.assertIn('no matched profiler timing', result['scope'])
+        for member in study.MEMBERS:
+            self.assertEqual(result['cases'][case['id']][member]['gpu_uuid'], different['uuid'])
+        self.assertEqual(plan['timing_reuse']['gpu'], gpu)
+
+    def test_zero_attempt_continuation_rejects_unrecorded_profile_tree(self):
+        self.prepare_unstarted_profiles()
+        orphan = self.old / 'attempts/profiles-unrecorded'
+        orphan.mkdir()
+        with self.assertRaisesRegex(RuntimeError, 'unrecorded profile directory'):
+            self.retry(profiles_only=True, continue_profiles=True)
+        self.assertFalse(self.new.exists())
+
+    def test_zero_attempt_continuation_rejects_active_recorded_jobs(self):
+        self.prepare_unstarted_profiles()
+        self.queue_stdout = '34|RUNNING\n'
+        with self.assertRaisesRegex(RuntimeError, 'inactive'):
+            self.retry(profiles_only=True, continue_profiles=True)
+        self.assertFalse(self.new.exists())
+
+    def test_owned_cpu_compute_can_prepare_only_profile_continuation_without_submission(self):
+        self.prepare_unstarted_profiles()
+        before = self.snapshot()
+        proof = {'profile': 'cpu', 'job_id': '55', 'hostname': 'owned-compute', 'uid': os.getuid(),
+                 'scope': 'live owned free CPU allocation'}
+        with patch.dict(os.environ, {'SLURM_JOB_ID': '55'}), \
+             patch.object(study, 'cpu_allocation', return_value=proof) as allocation:
+            plan = self.retry(profiles_only=True, continue_profiles=True)
+        allocation.assert_called_once_with()
+        self.assertEqual(plan['retry_origin']['preparation_allocation'], proof)
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(study.read_json(self.new / 'state.json')['jobs'], [])
+        self.assertFalse(any(command[0] == 'sbatch' for command in self.calls))
+
+    def test_compute_retry_rejects_other_modes_before_any_evidence_read(self):
+        for options in ({}, {'profiles_only': True}, {'continue_profiles': True},
+                        {'profiles_only': True, 'continue_profiles': True, 'prepare': False}):
+            with self.subTest(options=options), patch.dict(os.environ, {'SLURM_JOB_ID': '55'}), \
+                 patch.object(study, 'verify') as verify, patch.object(study, 'cpu_allocation') as allocation:
+                with self.assertRaisesRegex(RuntimeError, 'compute retry permits only'):
+                    self.retry(**options)
+                verify.assert_not_called()
+                allocation.assert_not_called()
+            self.assertFalse(self.new.exists())
+
+    def test_compute_prepare_requires_actual_owned_allocation_before_evidence_read(self):
+        with patch.dict(os.environ, {'SLURM_JOB_ID': '55'}), \
+             patch.object(study, 'cpu_allocation', side_effect=RuntimeError('live scheduler resources differ')), \
+             patch.object(study, 'verify') as verify:
+            with self.assertRaisesRegex(RuntimeError, 'live scheduler resources differ'):
+                self.retry(profiles_only=True, continue_profiles=True)
+            verify.assert_not_called()
+        self.assertFalse(self.new.exists())
+
+    def test_zero_attempt_continuation_seals_old_state_before_new_capture(self):
+        self.prepare_unstarted_profiles()
+        plan = self.retry(profiles_only=True, continue_profiles=True)
+        self.assertIn(str(self.old / 'state.json'), plan['profile_continuation']['artifact_sha256'])
+        self.state['unexpected_change'] = True
+        self.save_state()
+        with self.assertRaisesRegex(RuntimeError, 'retained profile metadata changed'):
+            study.verify(self.new)
+
+    def test_zero_attempt_timeout_override_changes_only_new_profile_recipes(self):
+        raw = study.read_json(self.old / 'suite.json')
+        for case in raw['cases']:
+            case['profile']['timeout'] = 240
+        study.write_json(self.old / 'suite.json', raw)
+        self.plan['suite_sha256'] = study.sha(self.old / 'suite.json')
+        self.save_plan()
+        self.prepare_unstarted_profiles()
+        before = self.snapshot()
+        plan = self.retry(profiles_only=True, continue_profiles=True, profile_timeout_seconds=3600,
+                          profiles_budget_seconds=3600)
+        self.assertEqual(before, self.snapshot())
+        original = study.read_json(self.old / 'suite.json')
+        fresh = study.read_json(self.new / 'suite.json')
+        for case in fresh['cases']:
+            old = next(item for item in original['cases'] if item['id'] == case['id'])
+            if case.get('enabled', True) and case.get('parameters', {}).get('device') != 'cpu':
+                self.assertEqual(case['profile']['timeout'], 3600)
+                restored = {**case, 'profile': dict(old['profile'])}
+                self.assertEqual(restored, old)
+            else:
+                self.assertEqual(case, old)
+        self.assertEqual(plan['timing_reuse']['suite_sha256'], study.sha(self.old / 'suite.json'))
+        self.assertNotEqual(plan['suite_sha256'], self.plan['suite_sha256'])
+        self.assertEqual(fresh['profiles_budget_seconds'], 3600)
+        self.assertEqual({**fresh, 'profiles_budget_seconds': original['profiles_budget_seconds'],
+                          'cases': original['cases']}, original)
+        self.assertEqual(plan['timing_reuse']['profiles_budget_override'],
+                         {'original': original['profiles_budget_seconds'], 'replacement': 3600})
+
+    def test_zero_attempt_budget_only_override_preserves_recipes_and_timing_policy(self):
+        self.prepare_unstarted_profiles()
+        before = self.snapshot()
+        self.retry(profiles_only=True, continue_profiles=True, profiles_budget_seconds=7200)
+        self.assertEqual(before, self.snapshot())
+        old = study.read_json(self.old / 'suite.json')
+        new = study.read_json(self.new / 'suite.json')
+        self.assertEqual(new['profiles_budget_seconds'], 7200)
+        self.assertEqual({**new, 'profiles_budget_seconds': old['profiles_budget_seconds']}, old)
+
+    def test_budget_override_rejects_nonfinite_and_retained_tool_changes(self):
+        self.prepare_unstarted_profiles()
+        for budget in (0, -1, True, float('inf'), float('nan'), 10 ** 1000):
+            with self.subTest(budget=type(budget).__name__), self.assertRaisesRegex(ValueError, 'positive finite'):
+                self.retry(profiles_only=True, continue_profiles=True, profiles_budget_seconds=budget)
+            self.assertFalse(self.new.exists())
+        self.prepare_continuation()
+        with self.assertRaisesRegex(ValueError, 'zero-attempt'):
+            self.retry(profiles_only=True, continue_profiles=True, profiles_budget_seconds=3600)
+
+    def test_timeout_override_rejects_nonfinite_and_retained_tool_changes(self):
+        self.prepare_unstarted_profiles()
+        for timeout in (0, -1, True, float('inf'), float('nan')):
+            with self.subTest(timeout=timeout), self.assertRaisesRegex(ValueError, 'positive finite'):
+                self.retry(profiles_only=True, continue_profiles=True, profile_timeout_seconds=timeout)
+            self.assertFalse(self.new.exists())
+        self.prepare_continuation()
+        with self.assertRaisesRegex(ValueError, 'zero-attempt'):
+            self.retry(profiles_only=True, continue_profiles=True, profile_timeout_seconds=3600)
+
+    def test_first_difference_is_exact_bounded_and_contains_no_values(self):
+        before = {'cpu_artifacts': {'baseline': {'runtime': {'PATH': 'SECRET-old'}}}}
+        after = {'cpu_artifacts': {'baseline': {'runtime': {'PATH': 'SECRET-new'}}}}
+        difference = study.first_difference(before, after)
+        self.assertEqual(difference['path'], '/cpu_artifacts/baseline/runtime/PATH')
+        self.assertEqual(difference['expected_sha256'], study.digest('SECRET-old'))
+        self.assertNotIn('SECRET', json.dumps(difference))
+        self.assertIsNone(study.first_difference(before, before))
+        self.assertEqual(study.first_difference({'a': [1]}, {'a': [1, 2]})['path'], '/a/1')
+        self.assertEqual(study.first_difference({'a': 1}, {'a': True})['observed_type'], 'bool')
+        self.assertLessEqual(len(study.first_difference({'x' * 2000: 1}, {})['path']), 512)
+
+    def test_admission_difference_does_not_overwrite_existing_artifact_evidence(self):
+        path = self.base / 'diagnostic-admission.json'
+        value = {'artifact_sha256': {'library': 'original'}, 'configuration_key': 'release'}
+        study.write_json(path, value)
+        before = path.read_bytes()
+        changed = {**value, 'artifact_sha256': {'library': 'changed'}}
+        with self.assertRaisesRegex(RuntimeError, '/artifact_sha256/library'):
+            study.publish_admission(path, changed)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(study.publish_admission(path, changed, publish=False), changed)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_hour_defaults_remain_bounded_by_actual_allocation(self):
+        with patch.object(study.time, 'monotonic', return_value=100), \
+                patch.object(study.time, 'time', return_value=1000):
+            self.assertEqual(study.worker_budget({}, {}, 'profiles', 100), 3480)
+            self.assertEqual(study.worker_budget({}, {'profiles_budget_seconds': 7200}, 'profiles', 100,
+                                                 end_epoch=1400), 280)
+            for invalid in (True, 0, -1, float('inf'), float('nan')):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    study.worker_budget({}, {'profiles_budget_seconds': invalid}, 'profiles', 100)
+        runner = study.Runner(self.base / 'default-runner', 5000)
+        self.assertEqual(runner.command_timeout, 3600)
+        self.assertEqual(study.Runner(self.base / 'long-runner', 8000, 7200).command_timeout, 7200)
+
+    def test_frozen_diagnostic_recovers_legacy_value_without_writing(self):
+        frozen = self.old / 'executor/gpu_study.py'
+        frozen.write_text('''from types import SimpleNamespace
+study_workloads=SimpleNamespace(load_suite=lambda path: {})
+def admit(root,plan,suite):
+    value={"cpu_artifacts":{},"ambient_fixture":"secret-current-shell"}
+    raise RuntimeError("study build identity changed after admission")
+''')
+        before = self.snapshot()
+        module_before = study.sys.modules['study_workloads']
+        observed = study.frozen_admission_value(self.old, self.plan)
+        self.assertEqual(observed['ambient_fixture'], 'secret-current-shell')
+        self.assertEqual(before, self.snapshot())
+        self.assertIs(study.sys.modules['study_workloads'], module_before)
+
+    def test_frozen_diagnostic_refuses_earlier_failure_and_any_write(self):
+        frozen = self.old / 'executor/gpu_study.py'
+        for statement, message in [('raise RuntimeError("canonical binding changed")', 'canonical binding'),
+                                   ('write_json(root/"admission.json",{})', 'refused a study write')]:
+            frozen.write_text('from types import SimpleNamespace\n'
+                'study_workloads=SimpleNamespace(load_suite=lambda path: {})\n'
+                'def admit(root,plan,suite):\n    ' + statement + '\n')
+            before = self.snapshot()
+            with self.subTest(statement=statement), self.assertRaisesRegex(RuntimeError, message):
+                study.frozen_admission_value(self.old, self.plan)
+            self.assertEqual(before, self.snapshot())
+
+    def test_owned_cpu_diagnostic_reports_actual_legacy_field_without_execution(self):
+        owner = study.pwd.getpwuid(os.getuid()).pw_name + '(' + str(os.getuid()) + ')'
+        controller = ('JobId=55 UserId=' + owner + ' JobState=RUNNING Account=gts-sbryngelson3 '
+                      'QOS=embers Partition=cpu-small NumNodes=1 NumTasks=1 NodeList=cpu-fixture')
+        expected = {'plan_sha256': self.plan['plan_sha256'], 'artifact_sha256': {}, 'runtime': {'PATH': 'secret-old'}}
+        observed = {**expected, 'runtime': {'PATH': 'secret-new'}}
+        study.write_json(self.old / 'admission.json', expected)
+        before = self.snapshot()
+        commands = []
+        def metadata(argv, **kwargs):
+            commands.append(argv)
+            return subprocess.CompletedProcess(argv, 0, controller if 'job' in argv else 'cpu-fixture\n', '')
+        with patch.dict(os.environ, {'SLURM_JOB_ID': '55'}), \
+             patch.object(study.socket, 'getfqdn', return_value='cpu-fixture.pace'), \
+             patch.object(study.socket, 'gethostname', return_value='cpu-fixture'), \
+             patch.object(study.subprocess, 'run', side_effect=metadata), \
+             patch.object(study, 'verify', return_value=self.plan), \
+             patch.object(study, 'checked_builds'), \
+             patch.object(study, 'frozen_admission_value', return_value=observed), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            study.diagnose_admission(argparse.Namespace(run_dir=str(self.old)))
+        record = json.loads(output.getvalue())
+        self.assertEqual(record['legacy_exact_difference']['path'], '/runtime/PATH')
+        self.assertFalse(record['application_execution'])
+        self.assertFalse(record['study_writes'])
+        self.assertNotIn('secret-', output.getvalue())
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual([command[0] for command in commands], ['scontrol', 'scontrol'])
+
+    def test_diagnostic_requires_owned_compute_and_an_existing_admission(self):
+        with self.assertRaisesRegex(RuntimeError, 'owned free compute'):
+            study.diagnose_admission(argparse.Namespace(run_dir=str(self.old)))
+        with patch.dict(os.environ, {'SLURM_JOB_ID': '55'}), \
+             patch.object(study.socket, 'getfqdn', return_value='compute'), \
+             patch.object(study.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0,
+                 'JobId=55 UserId=unrelated(0) JobState=RUNNING Account=paid', '')), \
+             patch.object(study, 'verify') as verify:
+            with self.assertRaisesRegex(RuntimeError, 'live owned'):
+                study.diagnose_admission(argparse.Namespace(run_dir=str(self.old)))
+            verify.assert_not_called()
+
     def test_profiles_only_preserves_timing_bytes_and_submits_only_profiles(self):
         gpu, summary, other = self.prepare_profile_timing()
         before = self.snapshot()

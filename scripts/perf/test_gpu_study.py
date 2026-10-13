@@ -110,7 +110,7 @@ class StudyProtocol(unittest.TestCase):
     def test_worker_budget_uses_suite_setup_elapsed_and_actual_scheduler_end(self):
         plan = {'wall_time_limits': {'timings': '00:15:00', 'profiles': '00:30:00'}}
         with patch.dict(os.environ, {}, clear=True), patch.object(study.time, 'monotonic', return_value=160):
-            self.assertEqual(study.worker_budget({}, {}, 'timings', 100), 3000)
+            self.assertEqual(study.worker_budget({}, {}, 'timings', 100), 3420)
             self.assertEqual(study.worker_budget(plan, {}, 'timings', 100), 720)
             self.assertEqual(study.worker_budget(plan, {}, 'profiles', 100), 1620)
             self.assertEqual(study.worker_budget(plan, {'timings_budget_seconds': 500}, 'timings', 100), 500)
@@ -151,7 +151,7 @@ class StudyProtocol(unittest.TestCase):
                 patch.object(study, 'hardware_snapshot', return_value={}), patch.object(study, 'report'), \
                 patch.object(study, 'timings', return_value={'status': 'timings_complete', 'cases': {}}):
             study.worker(argparse.Namespace(run_dir=str(self.root), stage='timings'))
-        self.assertEqual(runner.call_args.args[1:], (720, 300))
+        self.assertEqual(runner.call_args.args[1:], (720, 3600))
         attempt = study.read_json(self.root / 'state.json')['attempts'][-1]
         self.assertEqual((attempt['worker_budget_seconds'], attempt['cleanup_reserve_seconds'], attempt['requested_wall_time']),
                          (720, 120, '00:15:00'))
