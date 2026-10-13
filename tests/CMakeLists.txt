@@ -215,6 +215,33 @@ if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
     LABELS "igr;exact-face;parity;cuda" TIMEOUT 120 RUN_SERIAL TRUE)
 endif()
 
+add_executable(dg_igr_dgsem_maximum_test test_dgsem_maximum.cpp)
+target_link_libraries(dg_igr_dgsem_maximum_test PRIVATE igr_mfem mfem)
+target_include_directories(dg_igr_dgsem_maximum_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include)
+set(_igrlab_dgsem_maximum_command dg_igr_dgsem_maximum_test)
+if(MPIEXEC_EXECUTABLE)
+  if(NOT MPIEXEC_NUMPROC_FLAG)
+    message(FATAL_ERROR "Maximum parity MPI launcher requires MPIEXEC_NUMPROC_FLAG.")
+  endif()
+  set(_igrlab_dgsem_maximum_command
+    ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1 ${MPIEXEC_PREFLAGS}
+    $<TARGET_FILE:dg_igr_dgsem_maximum_test> ${MPIEXEC_POSTFLAGS})
+endif()
+add_test(NAME dg_igr_dgsem_maximum_cpu
+  COMMAND ${_igrlab_dgsem_maximum_command} cpu)
+set_tests_properties(dg_igr_dgsem_maximum_cpu PROPERTIES
+  LABELS "dgsem;maximum;parity;cpu" TIMEOUT 120 RUN_SERIAL TRUE)
+if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
+  set_source_files_properties(test_dgsem_maximum.cpp PROPERTIES LANGUAGE CUDA)
+  target_compile_options(dg_igr_dgsem_maximum_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
+  add_test(NAME dg_igr_dgsem_maximum_cuda
+    COMMAND ${_igrlab_dgsem_maximum_command} cuda)
+  set_tests_properties(dg_igr_dgsem_maximum_cuda PROPERTIES
+    LABELS "dgsem;maximum;parity;cuda" TIMEOUT 120 RUN_SERIAL TRUE)
+endif()
+
 add_executable(dg_igr_face_density_host_cache_test
   test_igr_face_density_host_cache.cpp)
 target_link_libraries(dg_igr_face_density_host_cache_test PRIVATE igr_mfem mfem)

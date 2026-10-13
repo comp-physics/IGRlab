@@ -2248,6 +2248,53 @@ void ComponentSumsDevice(const DenseMatrix& values, Vector& sums)
                });
 }
 
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+namespace
+{
+constexpr int kMaximumReductionThreads = 256;
+
+__global__ void DeterministicMaximumKernel(const real_t* value,
+                                           unsigned int size,
+                                           real_t* result)
+{
+  __shared__ real_t partial[kMaximumReductionThreads];
+  real_t current = 0.0;
+  // Vector sizes fit int, so the last unsigned stride cannot wrap around.
+  for (unsigned int i = threadIdx.x; i < size; i += blockDim.x)
+  {
+    current = fmax(current, value[i]);
+  }
+  partial[threadIdx.x] = current;
+  __syncthreads();
+  for (int stride = kMaximumReductionThreads / 2; stride > 0; stride /= 2)
+  {
+    if (threadIdx.x < stride)
+    {
+      partial[threadIdx.x] =
+        fmax(partial[threadIdx.x], partial[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+  {
+    current = partial[0];
+    // Positive maxima (including +Inf) have one exact representation. A
+    // zero maximum may depend on fmax's signed-zero tie behavior: preserve
+    // the literal original traversal for this exceptional, nonpositive case.
+    if (current == 0.0)
+    {
+      current = 0.0;
+      for (unsigned int i = 0; i < size; ++i)
+      {
+        current = fmax(current, value[i]);
+      }
+    }
+    result[0] = current;
+  }
+}
+} // namespace
+#endif
+
 void DeterministicMaximumDevice(const Vector& values, Vector& maximum)
 {
   if (maximum.Size() != 1)
@@ -2258,6 +2305,15 @@ void DeterministicMaximumDevice(const Vector& values, Vector& maximum)
   const int size = values.Size();
   const real_t* value = values.Read();
   real_t* result = maximum.Write();
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+  if (Device::Allows(Backend::CUDA) && !Device::Allows(Backend::RAJA_CUDA))
+  {
+    DeterministicMaximumKernel<<<1, kMaximumReductionThreads>>>(
+      value, static_cast<unsigned int>(size), result);
+    MFEM_GPU_CHECK(cudaGetLastError());
+    return;
+  }
+#endif
   mfem::forall(1,
                [=] MFEM_HOST_DEVICE(int)
                {
