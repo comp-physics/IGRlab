@@ -838,6 +838,46 @@ def cpu_allocation():
             'scope': 'live owned free CPU allocation; one application/MPI rank and one BLAS/OpenMP thread'}
 
 
+def gpu_preparation_allocation():
+    """Prove an owned interactive A100 before read-only continuation preparation."""
+    gpu = allocation()
+    job, host = os.environ['SLURM_JOB_ID'], socket.getfqdn()
+    if not re.fullmatch(r'[1-9][0-9]*', job) or any(os.environ.get(key) for key in
+            ('PMIX_NAMESPACE', 'PMIX_RANK', 'PMI_RANK', 'PMI_SIZE')):
+        raise RuntimeError('GPU continuation preparation requires the owned MPI-none allocation')
+    env = {**os.environ, 'TZ': 'UTC', 'SLURM_TIME_FORMAT': 'standard'}
+    command = ['scontrol', 'show', 'job', '-o', job]
+    queried = subprocess.run(command, text=True, capture_output=True, timeout=30, env=env)
+    fields = dict(re.findall(r'(?:^|\s)([A-Za-z][A-Za-z0-9_]*)=([^\s]+)', queried.stdout))
+    entries = fields.get('AllocTRES', '').split(',')
+    tres = dict(item.split('=', 1) for item in entries if '=' in item)
+    if (queried.returncode or len(tres) != len(entries) or any(
+            fields.get(key) != value for key, value in {
+                'JobId': job, 'JobState': 'RUNNING', 'BatchFlag': '0',
+                'UserId': f'{pwd.getpwuid(os.getuid()).pw_name}({os.getuid()})',
+                'Account': 'gts-sbryngelson3', 'QOS': 'embers', 'Partition': 'gpu-a100',
+                'NumNodes': '1', 'NumCPUs': '8', 'NumTasks': '1'}.items()) or
+            tres.get('cpu') != '8' or tres.get('mem') not in ('48G', '49152M') or
+            tres.get('gres/gpu') != '1' or tres.get('gres/gpu:a100') != '1' or
+            any(key.startswith('gres/gpu:') and key != 'gres/gpu:a100' for key in tres)):
+        raise RuntimeError('live scheduler identity/resources differ from the owned free interactive A100')
+    nodes_command = ['scontrol', 'show', 'hostnames', fields.get('NodeList', '')]
+    nodes = subprocess.run(nodes_command, text=True, capture_output=True, timeout=30, env=env)
+    if nodes.returncode or nodes.stdout.split() != [host.split('.')[0]]:
+        raise RuntimeError('GPU continuation preparation is outside its actual allocated node')
+    try:
+        end = datetime.fromisoformat(fields['EndTime']).replace(tzinfo=timezone.utc).timestamp()
+        limit = wall_time(fields['TimeLimit'])
+    except (KeyError, ValueError, OverflowError) as exc:
+        raise RuntimeError('live GPU preparation allocation has no bounded end/time limit') from exc
+    if end - time.time() <= CLEANUP_RESERVE_SECONDS:
+        raise RuntimeError('live GPU preparation allocation has reached cleanup')
+    return {'profile': 'cuda-sm80', 'job_id': job, 'hostname': host, 'uid': os.getuid(),
+            'end_epoch': end, 'time_limit': limit, 'scheduler': fields, 'gpu': gpu,
+            'query_argv': [command, nodes_command],
+            'scope': 'live owned free interactive A100; metadata preparation only, no applications or submissions'}
+
+
 def checked_builds(root):
     state = read_json(root / 'state.json')
     plan = load_plan(root)
@@ -1759,17 +1799,95 @@ def retained_profile_tools(plan, state, old, suite):
             'matched_profiler_timing_claim': False}
 
 
+def retry_validated_artifacts(plan, state):
+    """Re-admit sealed imports into copies; never rewrite historical authority."""
+    if not plan.get('import_origin'):
+        raise RuntimeError('artifact reuse requires genuine imported canonical Passed receipts')
+    records = {}
+    promoted_plan, promoted_state = dict(plan), dict(state)
+    for group in ('builds', 'cpu_builds'):
+        if group not in plan:
+            continue
+        promoted_plan[group], promoted_state[group] = {}, {}
+        for member in MEMBERS:
+            old_build, old_receipt = plan[group][member], state[group][member]
+            if (type(old_build.get('reuse_validated_artifacts', False)) is not bool or
+                    type(old_receipt.get('reuse_validated_artifacts', False)) is not bool or
+                    old_receipt.get('reuse_validated_artifacts', False) != old_build.get('reuse_validated_artifacts', False)):
+                raise RuntimeError('original imported artifact reuse mode differs from its receipt')
+            build = {**plan[group][member], 'reuse_validated_artifacts': True}
+            receipt = {**state[group][member], 'reuse_validated_artifacts': True}
+            record = study_import.completed_records(build, receipt, full=True)
+            records[group + '/' + member] = {key: record[key] for key in
+                ('build_accounting', 'test_allocation_accounting', 'test_execution_scope')}
+            promoted_plan[group][member], promoted_state[group][member] = build, receipt
+    promoted_plan['import_origin'] = {**plan['import_origin'], 'reuse_validated_artifacts': True,
+        'scheduler_records': records,
+        'scope': 'canonical artifact bytes and sealed actual Passed outcomes revalidated; historical accounting not queried'}
+    return promoted_plan, promoted_state
+
+
+def retry_profile_stage_outcomes(state, *, reconcile_running=False):
+    """Query actual stage owners only, and reconcile stale status in memory."""
+    attempts = state['attempts']
+    ids = {str(item.get('job_id', '')) for item in state.get('jobs', [])
+           if item.get('stage') in ('timings', 'profiles')}
+    ids.update(str(item.get('job_id', '')) for item in attempts
+               if item.get('stage') in ('timings', 'profiles') and not item.get('timings_reused'))
+    if len(ids) > 128 or any(not re.fullmatch(r'[1-9][0-9]*', job) for job in ids):
+        raise RuntimeError('missing or invalid original stage job identity')
+    outcomes = {}
+    if ids:
+        # A completed stage ID can disappear from squeue. Query this user's
+        # live owners once, then consult accounting only for recorded stages.
+        queue = subprocess.run(['squeue', '-h', '-u', getpass.getuser(), '-o', '%i|%T'],
+                               text=True, capture_output=True, timeout=30)
+        if queue.returncode:
+            raise RuntimeError('retry withheld: could not prove original stage jobs inactive')
+        for row in queue.stdout.splitlines():
+            match = re.fullmatch(r'([0-9]+)(?:[_+][^|]+)?\|[^|]+', row.strip())
+            if not match or match[1] in ids:
+                raise RuntimeError('retry withheld: original stage job is active or ambiguous')
+        terminal = {'COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY',
+                    'NODE_FAIL', 'BOOT_FAIL', 'DEADLINE', 'PREEMPTED'}
+        outcomes = {job: job_state(job) for job in sorted(ids)}
+        if any(not status.split() or status.split()[0] not in terminal for status, _ in outcomes.values()):
+            raise RuntimeError('retry withheld: original stage scheduler state is not terminal')
+    running = [attempt for attempt in attempts if attempt.get('status') == 'running']
+    reconciled = []
+    copied = {**state, 'attempts': [dict(attempt) for attempt in attempts]}
+    latest_profile = next((attempt for attempt in reversed(attempts) if attempt.get('stage') == 'profiles'), None)
+    for attempt in running:
+        if (not reconcile_running or attempt is not latest_profile or attempt.get('stage') != 'profiles' or
+                str(attempt.get('job_id', '')) not in outcomes):
+            raise RuntimeError('retry withheld: running attempt requires explicit terminal profile reconciliation')
+        replacement = copied['attempts'][attempts.index(attempt)]
+        replacement['status'] = 'profiles_partial'
+        reconciled.append({'attempt_id': attempt.get('id'), 'job_id': str(attempt['job_id']),
+                           'original_status': 'running', 'scheduler_outcome': outcomes[str(attempt['job_id'])],
+                           'scope': 'terminal worker status reconciled in memory only; checkpoint must prove completed tools'})
+    return copied, outcomes, reconciled
+
+
 def retry(args):
     """A fresh executor/cohort may reuse only inactive, verified completed builds."""
     preparation_allocation = None
+    reuse_artifacts = bool(getattr(args, 'reuse_validated_artifacts', False))
+    reconcile_running = bool(getattr(args, 'reconcile_terminal_profile_attempt', False))
+    if (reuse_artifacts or reconcile_running) and not (args.prepare_only and
+            getattr(args, 'profiles_only', False) and getattr(args, 'continue_profiles', False)):
+        raise ValueError('artifact reuse and terminal reconciliation require --prepare-only --profiles-only --continue-profiles')
+    if reconcile_running and not reuse_artifacts:
+        raise ValueError('terminal profile reconciliation requires explicit --reuse-validated-artifacts')
     if os.environ.get('SLURM_JOB_ID'):
         if not (args.prepare_only and getattr(args, 'profiles_only', False) and
                 getattr(args, 'continue_profiles', False)):
             raise RuntimeError('compute retry permits only --prepare-only --profiles-only --continue-profiles')
         # Preparation reads immutable metadata and scheduler state only. It may
-        # run in the same owned free CPU job as diagnose-admission, never submit
+        # run in a verified owned free CPU or interactive A100 job, never submit
         # measurement work or use an unverified ambient allocation identity.
-        preparation_allocation = cpu_allocation()
+        preparation_allocation = (gpu_preparation_allocation() if os.environ.get('SLURM_JOB_PARTITION') == 'gpu-a100'
+                                  else cpu_allocation())
     old, root = absolute(args.from_run).resolve(strict=True), absolute(args.run_dir).resolve()
     with locked(old):
         plan = verify(old, binaries=(old / 'admission.json').exists())
@@ -1788,6 +1906,11 @@ def retry(args):
             raise ValueError('--continue-profiles requires --profiles-only and forbids --suite/--cases')
         if profiles_only and cases is not None:
             raise ValueError('profiles-only retry forbids --cases; timing workload selection must match')
+        reconciled_attempts = []
+        if reuse_artifacts:
+            plan, state = retry_validated_artifacts(plan, state)
+            state, outcomes, reconciled_attempts = retry_profile_stage_outcomes(
+                state, reconcile_running=reconcile_running)
         retained = retained_timing(plan, state, old) if profiles_only else None
         retained_profiles = retained_profile_tools(plan, state, old, old_suite) if continue_profiles else None
         profile_timeout = getattr(args, 'profile_timeout_seconds', None)
@@ -1859,38 +1982,39 @@ def retry(args):
                         collect_ids(item)
             elif isinstance(value, list):
                 for item in value: collect_ids(item)
-        collect_ids(state)
-        if not ids or len(ids) > 128:
-            raise RuntimeError('missing or excessive recorded scheduler jobs')
-        # Completed IDs can disappear from squeue while remaining in sacct.
-        queue = subprocess.run(['squeue', '-h', '-u', getpass.getuser(), '-o', '%i|%T'],
-                               text=True, capture_output=True, timeout=30)
-        if queue.returncode:
-            raise RuntimeError('retry withheld: could not prove every recorded job inactive')
-        active = set()
-        for row in queue.stdout.splitlines():
-            match = re.fullmatch(r'([0-9]+)(?:[_+][^|]+)?\|[^|]+', row.strip())
-            if not match:
-                raise RuntimeError('retry withheld: could not prove every recorded job inactive')
-            if match[1] in ids:
-                active.add(match[1])
-        if active and (not profiles_only or continue_profiles):
-            raise RuntimeError('retry withheld: could not prove every recorded job inactive')
-        outcomes = {job: job_state(job) for job in sorted(ids)}
-        terminal = {'COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY',
-                    'NODE_FAIL', 'BOOT_FAIL', 'DEADLINE', 'PREEMPTED'}
         interactive = {}
-        for job, (status, _) in outcomes.items():
-            if status.split()[0] not in terminal:
-                if not profiles_only or continue_profiles or status != 'RUNNING' or job not in active:
-                    raise RuntimeError('retry withheld: recorded scheduler state is not terminal')
-                interactive[job] = admit_interactive_timing_job(job, state, retained)
-            elif job in active:
-                raise RuntimeError('retry withheld: scheduler active/accounting states disagree')
-        checked_builds(old)
-        if any(outcomes[state[group][member]['build_job_id']] != ('COMPLETED', '0:0')
-               for group, member, _ in build_entries(plan)):
-            raise RuntimeError('retry requires completed successful canonical builds')
+        if not reuse_artifacts:
+            collect_ids(state)
+            if not ids or len(ids) > 128:
+                raise RuntimeError('missing or excessive recorded scheduler jobs')
+            # Completed IDs can disappear from squeue while remaining in sacct.
+            queue = subprocess.run(['squeue', '-h', '-u', getpass.getuser(), '-o', '%i|%T'],
+                                   text=True, capture_output=True, timeout=30)
+            if queue.returncode:
+                raise RuntimeError('retry withheld: could not prove every recorded job inactive')
+            active = set()
+            for row in queue.stdout.splitlines():
+                match = re.fullmatch(r'([0-9]+)(?:[_+][^|]+)?\|[^|]+', row.strip())
+                if not match:
+                    raise RuntimeError('retry withheld: could not prove every recorded job inactive')
+                if match[1] in ids:
+                    active.add(match[1])
+            if active and (not profiles_only or continue_profiles):
+                raise RuntimeError('retry withheld: could not prove every recorded job inactive')
+            outcomes = {job: job_state(job) for job in sorted(ids)}
+            terminal = {'COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY',
+                        'NODE_FAIL', 'BOOT_FAIL', 'DEADLINE', 'PREEMPTED'}
+            for job, (status, _) in outcomes.items():
+                if status.split()[0] not in terminal:
+                    if not profiles_only or continue_profiles or status != 'RUNNING' or job not in active:
+                        raise RuntimeError('retry withheld: recorded scheduler state is not terminal')
+                    interactive[job] = admit_interactive_timing_job(job, state, retained)
+                elif job in active:
+                    raise RuntimeError('retry withheld: scheduler active/accounting states disagree')
+            checked_builds(old)
+            if any(outcomes[state[group][member]['build_job_id']] != ('COMPLETED', '0:0')
+                   for group, member, _ in build_entries(plan)):
+                raise RuntimeError('retry requires completed successful canonical builds')
         artifacts = retry_build_artifacts(plan, suite, read_json(old / 'admission.json')
                                          if (old / 'admission.json').exists() else None)
         limits = {stage: wall_time(getattr(args, stage + '_time', None) or stage_wall_time(plan, stage))
@@ -1907,6 +2031,10 @@ def retry(args):
                                       'binding_scope': 'fresh compute admission required'})
         if preparation_allocation is not None:
             new_plan['retry_origin']['preparation_allocation'] = preparation_allocation
+        if reuse_artifacts:
+            new_plan['retry_origin'].update(reuse_validated_artifacts=True,
+                scheduler_scope='original measurement stage owners only; canonical build/test seals revalidated without historical accounting',
+                reconciled_terminal_profile_attempts=reconciled_attempts)
         if profiles_only:
             new_plan['timing_reuse'] = {**retained, 'interactive_scheduler_admission': interactive}
         if continue_profiles:
@@ -2245,6 +2373,10 @@ def main(argv=None):
                    help='reuse completed timings on the same GPU; --suite may change only case.profile; no --cases')
     p.add_argument('--continue-profiles', action='store_true',
                    help='with --profiles-only, retain completed tools or recover a zero-attempt admission failure; capture missing tools with independent GPU identities, no --suite/--cases')
+    p.add_argument('--reuse-validated-artifacts', action='store_true',
+                   help='prepare-only profile continuation: revalidate canonical artifact/Passed seals, query original measurement owners only')
+    p.add_argument('--reconcile-terminal-profile-attempt', action='store_true',
+                   help='with artifact reuse, reconcile a stale running profile status only after its exact job is inactive and terminal; original state is never rewritten')
     p.add_argument('--profile-timeout-seconds', type=float,
                    help='positive finite timeout for fresh captures in a zero-attempt continuation; original suite/timings stay immutable')
     p.add_argument('--profiles-budget-seconds', type=float,

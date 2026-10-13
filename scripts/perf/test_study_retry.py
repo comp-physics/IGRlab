@@ -507,6 +507,155 @@ class RetryTests(unittest.TestCase):
             verify.assert_not_called()
         self.assertFalse(self.new.exists())
 
+    def imported_profile_fixture(self, *, running=False):
+        if not any(attempt.get('stage') == 'profiles' for attempt in self.state['attempts']):
+            _, _, checkpoint = self.prepare_continuation(names=('nsys',))
+        else:
+            checkpoint = Path(self.state['attempts'][-1]['directory']) / 'partial.json'
+        self.plan['import_origin'] = {'artifact_sha256': {}, 'scope': 'saved actual imports'}
+        for member in study.MEMBERS:
+            self.plan['builds'][member] = {**self.plan['builds'][member],
+                'origin': study.study_import.ORIGIN, 'test_result': '/actual/sealed/result.json',
+                'reuse_validated_artifacts': False}
+            receipt = {**self.state['builds'][member], 'origin': study.study_import.ORIGIN,
+                       'test_result': '/actual/sealed/result.json', 'reuse_validated_artifacts': False}
+            receipt.pop('validation_job_id', None)
+            self.state['builds'][member] = receipt
+        if running:
+            self.state['attempts'][-1]['status'] = 'running'
+        self.save_plan()
+        self.save_state()
+        def prove(build, receipt, *, full=False):
+            self.assertTrue(full)
+            self.assertTrue(build['reuse_validated_artifacts'])
+            self.assertTrue(receipt['reuse_validated_artifacts'])
+            self.assertEqual(build['test_result'], '/actual/sealed/result.json')
+            self.assertEqual(receipt['test_result'], build['test_result'])
+            return {'build_accounting': {'query_performed': False},
+                    'test_allocation_accounting': {'query_performed': False},
+                    'test_execution_scope': 'actual Passed seals revalidated'}
+        return checkpoint, prove
+
+    def test_opt_in_profile_reuse_queries_only_measurement_jobs_and_keeps_original_bytes(self):
+        _, prove = self.imported_profile_fixture()
+        before = self.snapshot()
+        with patch.object(study.study_import, 'completed_records', side_effect=prove) as admission:
+            plan = self.retry(profiles_only=True, continue_profiles=True, reuse_validated_artifacts=True)
+        self.assertEqual(admission.call_count, 2)
+        self.assertEqual(before, self.snapshot())
+        queried = {job for argv in self.calls if argv[0] == 'sacct'
+                   for job in argv[argv.index('-j') + 1].split(',')}
+        self.assertEqual(queried, {'33', '34'})
+        self.assertTrue(plan['import_origin']['reuse_validated_artifacts'])
+        self.assertTrue(all(build['reuse_validated_artifacts'] for build in plan['builds'].values()))
+        self.assertTrue(all(receipt['reuse_validated_artifacts'] for receipt in
+                            study.read_json(self.new / 'state.json')['builds'].values()))
+        self.assertEqual(set(plan['profile_continuation']['captures']['dg-p1']['baseline']), {'nsys'})
+        self.assertFalse(any(argv[0] == 'sbatch' for argv in self.calls))
+
+    def test_terminal_profile_reconciliation_is_explicit_and_read_only(self):
+        checkpoint, prove = self.imported_profile_fixture(running=True)
+        before = self.snapshot()
+        with patch.object(study.study_import, 'completed_records', side_effect=prove):
+            with self.assertRaisesRegex(RuntimeError, 'explicit terminal profile reconciliation'):
+                self.retry(profiles_only=True, continue_profiles=True, reuse_validated_artifacts=True)
+            plan = self.retry(profiles_only=True, continue_profiles=True, reuse_validated_artifacts=True,
+                              reconcile_terminal_profile_attempt=True)
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(study.read_json(self.old / 'state.json')['attempts'][-1]['status'], 'running')
+        self.assertEqual(plan['profile_continuation']['checkpoint_sha256'], study.sha(checkpoint))
+        proof = plan['retry_origin']['reconciled_terminal_profile_attempts']
+        self.assertEqual(proof[0]['job_id'], '34')
+        self.assertEqual(proof[0]['original_status'], 'running')
+        self.assertEqual(proof[0]['scheduler_outcome'], ['CANCELLED', '0:0'])
+        self.assertFalse(any(a.get('stage') == 'profiles' for a in study.read_json(self.new / 'state.json')['attempts']))
+
+    def test_terminal_reconciliation_rejects_active_unknown_and_running_timing_attempts(self):
+        for failure in ('active', 'unknown', 'timings'):
+            with self.subTest(failure=failure):
+                _, prove = self.imported_profile_fixture(running=True)
+                self.queue_stdout = '34|RUNNING\n' if failure == 'active' else ''
+                self.outcomes['34'] = ('UNKNOWN', '') if failure == 'unknown' else ('CANCELLED', '0:0')
+                if failure == 'timings':
+                    self.state['attempts'][0]['status'] = 'running'
+                    self.save_state()
+                before = self.snapshot()
+                with patch.object(study.study_import, 'completed_records', side_effect=prove):
+                    with self.assertRaises(RuntimeError):
+                        self.retry(profiles_only=True, continue_profiles=True, reuse_validated_artifacts=True,
+                                   reconcile_terminal_profile_attempt=True)
+                self.assertEqual(before, self.snapshot())
+                self.assertFalse(self.new.exists())
+
+    def test_artifact_reuse_requires_actual_imports_and_does_not_swallow_receipt_failure(self):
+        self.prepare_continuation(names=('nsys',))
+        with self.assertRaisesRegex(RuntimeError, 'genuine imported canonical Passed'):
+            self.retry(profiles_only=True, continue_profiles=True, reuse_validated_artifacts=True)
+        _, _ = self.imported_profile_fixture()
+        with patch.object(study.study_import, 'completed_records', side_effect=RuntimeError('sealed artifact changed')):
+            with self.assertRaisesRegex(RuntimeError, 'sealed artifact changed'):
+                self.retry(profiles_only=True, continue_profiles=True, reuse_validated_artifacts=True)
+        self.assertFalse(self.new.exists())
+
+    def test_reuse_and_reconciliation_flags_reject_other_modes_before_reads(self):
+        for options in ({'reuse_validated_artifacts': True},
+                        {'profiles_only': True, 'reuse_validated_artifacts': True},
+                        {'profiles_only': True, 'continue_profiles': True, 'prepare': False,
+                         'reuse_validated_artifacts': True},
+                        {'profiles_only': True, 'continue_profiles': True,
+                         'reconcile_terminal_profile_attempt': True}):
+            with self.subTest(options=options), patch.object(study, 'verify') as verify:
+                with self.assertRaises(ValueError):
+                    self.retry(**options)
+                verify.assert_not_called()
+
+    def test_owned_a100_can_prepare_missing_profile_continuation_without_submitting(self):
+        _, prove = self.imported_profile_fixture()
+        before = self.snapshot()
+        proof = {'profile': 'cuda-sm80', 'job_id': '55', 'hostname': 'owned-compute',
+                 'gpu': {'uuid': 'GPU-fixture'}, 'scope': 'live owned A100 metadata preparation'}
+        with patch.dict(os.environ, {'SLURM_JOB_ID': '55', 'SLURM_JOB_PARTITION': 'gpu-a100'}), \
+             patch.object(study, 'gpu_preparation_allocation', return_value=proof) as allocation, \
+             patch.object(study.study_import, 'completed_records', side_effect=prove):
+            plan = self.retry(profiles_only=True, continue_profiles=True, reuse_validated_artifacts=True)
+        allocation.assert_called_once_with()
+        self.assertEqual(plan['retry_origin']['preparation_allocation'], proof)
+        self.assertEqual(before, self.snapshot())
+        self.assertFalse(any(argv[0] == 'sbatch' for argv in self.calls))
+
+    def test_gpu_preparation_proves_live_scheduler_resources_node_gpu_and_mpi_none(self):
+        fields = (f'JobId=55 JobState=RUNNING BatchFlag=0 UserId={study.getpass.getuser()}({os.getuid()}) '
+                  'Account=gts-sbryngelson3 QOS=embers Partition=gpu-a100 NumNodes=1 NumCPUs=8 NumTasks=1 '
+                  'AllocTRES=cpu=8,mem=48G,gres/gpu=1,gres/gpu:a100=1 NodeList=owned-compute '
+                  'TimeLimit=01:00:00 EndTime=2030-01-01T01:00:00')
+        gpu = {'uuid': 'GPU-fixture', 'name': 'NVIDIA A100', 'compute_capability': 80}
+        def query(argv, **kwargs):
+            self.assertEqual(argv[0], 'scontrol')
+            self.assertEqual(kwargs['env']['TZ'], 'UTC')
+            return subprocess.CompletedProcess(argv, 0, 'owned-compute\n' if 'hostnames' in argv else fields, '')
+        with patch.dict(os.environ, {'SLURM_JOB_ID': '55'}), \
+             patch.object(study, 'allocation', return_value=gpu), \
+             patch.object(study.socket, 'getfqdn', return_value='owned-compute.example'), \
+             patch.object(study.subprocess, 'run', side_effect=query) as queried:
+            admitted = study.gpu_preparation_allocation()
+            self.assertEqual(admitted['gpu'], gpu)
+            self.assertEqual(admitted['scheduler']['JobId'], '55')
+            self.assertEqual(queried.call_count, 2)
+            for original, wrong in [('mem=48G', 'mem=96G'), ('QOS=embers', 'QOS=paid'),
+                                    ('BatchFlag=0', 'BatchFlag=1'), ('gres/gpu=1', 'gres/gpu=2'),
+                                    ('NumCPUs=8', 'NumCPUs=16')]:
+                valid = fields
+                fields = fields.replace(original, wrong)
+                with self.subTest(wrong=wrong), self.assertRaisesRegex(RuntimeError, 'identity/resources differ'):
+                    study.gpu_preparation_allocation()
+                fields = valid
+            with patch.dict(os.environ, {'PMIX_NAMESPACE': 'inherited'}):
+                with self.assertRaisesRegex(RuntimeError, 'MPI-none'):
+                    study.gpu_preparation_allocation()
+            with patch.object(study.socket, 'getfqdn', return_value='different-node.example'):
+                with self.assertRaisesRegex(RuntimeError, 'actual allocated node'):
+                    study.gpu_preparation_allocation()
+
     def test_zero_attempt_continuation_seals_old_state_before_new_capture(self):
         self.prepare_unstarted_profiles()
         plan = self.retry(profiles_only=True, continue_profiles=True)
