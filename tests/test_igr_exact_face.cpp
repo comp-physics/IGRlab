@@ -316,10 +316,23 @@ int main(int argc, char** argv)
     for (int geometry = 0; geometry < 3; ++geometry)
     { CheckCase(3, 7, basis, geometry, cases, max_assembled_error); }
   }
-  // Unchanged generic dispatch on either side of p3, or with Q5 at p3.
+  // Smaller output tails and quadrature counts differing from p3/Q4.
   for (const int order : {2, 4})
   { CheckCase(order, 7, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error); }
   CheckCase(3, 9, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
+  // Native p4/p5/p6 quadrature exercises multiple output tiles, including
+  // tiles that span the two sides and partially filled final output tiles.
+  for (const int order : {4, 5, 6})
+  {
+    for (const int basis : {mfem::BasisType::GaussLegendre,
+                            mfem::BasisType::GaussLobatto})
+    { CheckCase(order, 2 * order + 1, basis, 0, cases, max_assembled_error); }
+  }
+  CheckCase(5, 11, mfem::BasisType::GaussLegendre, 2, cases, max_assembled_error);
+  CheckCase(6, 13, mfem::BasisType::GaussLegendre, 1, cases, max_assembled_error);
+  // Q16 fills all projection lanes; Q17 exercises the generic fallback.
+  CheckCase(4, 31, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
+  CheckCase(4, 33, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
   std::cout << "Exact face record/gather parity: backend=" << backend
             << " cases=" << cases << " max_assembled_error="
             << max_assembled_error << '\n';
