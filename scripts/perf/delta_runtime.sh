@@ -76,4 +76,10 @@ for study_package in "${study_packages[@]}"; do
   done
 done
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+# Open MPI 4 otherwise interprets an inherited srun step as direct PMI launch.
+# Keep the real allocation/GPU identity; the worker still performs full live
+# admission before applications. Only its rank-one launch selectors are removed.
+if [[ $study_profile == cuda-sm80 ]]; then
+  unset SLURM_STEP_ID SLURM_STEPID
+fi
 exec python3 -B "$study_executor/gpu_study.py" worker --run-dir "$(dirname -- "$study_plan")" --stage "$study_stage"

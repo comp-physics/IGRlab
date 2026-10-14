@@ -55,10 +55,24 @@ concrete dependency identities and writes a genuine canonical result receipt;
 it does not configure, install or compile. Validate each changed source and
 configuration once before benchmarking it.
 
+For direct rank-one GPU programs under an MPI-none interactive step, the Delta
+runtime removes only `SLURM_STEP_ID` and `SLURM_STEPID` from descendants.
+Open MPI 4 otherwise treats the inherited step as a direct PMI launch; without
+that selector it uses a managed singleton within the real allocation. Job ID,
+account, partition, node list, task count, assigned step GPUs and CUDA visibility
+stay intact. The worker still verifies live ownership, resources, node, end time
+and GPU before running applications. This does not change the parent owner or
+fake a Slurm allocation. [Open MPI routing source](https://github.com/open-mpi/ompi/blob/v4.1.8/orte/mca/schizo/slurm/schizo_slurm.c)
+
 Keep useful GPU allocations running through prepared sequential work. Nsight
 Systems full-solver traces and closure-inclusive Nsight Compute captures stay
 on Delta and are processed on compute. Request the documented
-`--constraint=perf,nvperf` when hardware counters are required. Retrieve compact
+`--constraint=perf,nvperf` when hardware counters are required. Delta Slurm
+currently makes that request node-exclusive even when one GPU is requested;
+on `gpuA100x4` this reserves the whole node and charges 4 GPU SUs per hour.
+Use ordinary one-GPU allocations for qualification and timings, and agree on
+the counter allocation cost before requesting it. [NCSA accounting](https://docs.ncsa.illinois.edu/systems/delta/en/latest/user_guide/job_accounting.html)
+Retrieve compact
 results, report cold process wall time separately from solver time, and compare
 baseline/candidate builds on the same allocated GPU. PACE build/test results do
 not qualify a new Delta binary or establish a cross-cluster speedup.
