@@ -397,24 +397,102 @@ void CheckInvalidStates(int& failures)
 
 void CheckDeviceAuthority(int& failures)
 {
+  for (const int basis : {mfem::BasisType::GaussLegendre,
+                          mfem::BasisType::GaussLobatto})
+  {
+    auto mesh = MakeMesh(2, mfem::Mpi::WorldSize());
+    mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
+    mfem::DG_FECollection fec(5, 2, basis);
+    mfem::ParFiniteElementSpace fes(&pmesh, &fec, 4, mfem::Ordering::byNODES);
+    mfem::Vector state(fes.GetVSize());
+    state.UseDevice(true);
+    SetConstant(fes, state);
+    Cache cache;
+    CompareAll(cache, fes, state, failures);
+    const int ndofs = fes.GetNDofs();
+    int global_dofs = ndofs;
+    MPI_Allreduce(MPI_IN_PLACE, &global_dofs, 1, MPI_INT, MPI_SUM, fes.GetComm());
+    for (const auto points : {PointSet::Dof, PointSet::Limiter, PointSet::Output})
+    {
+      for (int update = 0; update < 3; ++update)
+      {
+        const double rho = update == 0 ? 0.125 : 1.0;
+        const double invalid = std::numeric_limits<double>::quiet_NaN();
+        double* data = state.Write();
+        mfem::forall(ndofs, [=] MFEM_HOST_DEVICE(int d)
+        {
+          data[d] = rho;
+          data[d + ndofs] = update == 2 && d == 0 ? invalid : 0.0;
+          data[d + 2 * ndofs] = -0.0;
+          data[d + 3 * ndofs] = 2.5;
+        });
+        if (mfem::Device::Allows(mfem::Backend::CUDA))
+        {
+          Check(!state.GetMemory().HostIsValid(),
+                "candidate-first scan starts with fresh device authority", fes.GetComm(), failures);
+        }
+        // The candidate must perform the first synchronization. Calling the
+        // original first would hide an invalid host pointer or stale gather.
+        const auto scan = cache.Scan(fes, state, 2, 1.4, 0.25, 1.0e-10, 0, {}, points);
+        const auto expected = mfem::igrlab::ScanEulerAdmissibility(
+          fes, state, 2, 1.4, 0.25, 1.0e-10, 0, {}, points);
+        Check(SameSummary(scan, expected),
+              "candidate-first changed same-vector scan retains original bits/diagnostics",
+              fes.GetComm(), failures);
+        if (update == 0 && points == PointSet::Dof)
+        {
+          Check(scan.global_bad_rho == global_dofs && scan.global_min_rho == 0.125,
+                "fresh device-authoritative Dof density retains exact count and minimum",
+                fes.GetComm(), failures);
+        }
+        Check(update == 0 ? scan.global_bad_rho > 0 :
+              (update == 1 ? scan.global_bad_rho == 0 && scan.global_bad_pressure == 0 :
+                             scan.global_bad_pressure > 0),
+              "fresh density/signed-zero/nonfinite updates reach every point set",
+              fes.GetComm(), failures);
+      }
+    }
+  }
+}
+
+void CheckSignedHostGather(int& failures)
+{
   auto mesh = MakeMesh(2, mfem::Mpi::WorldSize());
   mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
-  mfem::DG_FECollection fec(3, 2, mfem::BasisType::GaussLegendre);
+  mfem::DG_FECollection fec(3, 2, mfem::BasisType::GaussLobatto);
   mfem::ParFiniteElementSpace fes(&pmesh, &fec, 4, mfem::Ordering::byNODES);
   mfem::Vector state(fes.GetVSize());
-  state.UseDevice(true);
   SetConstant(fes, state);
-  Cache cache;
-  CompareAll(cache, fes, state, failures);
-  const int ndofs = fes.GetNDofs();
-  double* data = state.ReadWrite();
-  mfem::forall(ndofs, [=] MFEM_HOST_DEVICE(int d) { data[d] = 0.125; });
-  const auto scan = Compare(cache, fes, state, PointSet::Dof, failures,
-                            0, {}, 1.4, 0.25);
-  int global_dofs = ndofs;
-  MPI_Allreduce(MPI_IN_PLACE, &global_dofs, 1, MPI_INT, MPI_SUM, fes.GetComm());
-  Check(scan.global_bad_rho == global_dofs && scan.global_min_rho == 0.125,
-        "warm cache reads the current device-authoritative state",
+  state.HostReadWrite()[fes.GetNDofs()] = -0.0;
+  state.HostReadWrite()[2 * fes.GetNDofs()] = std::numeric_limits<double>::quiet_NaN();
+  mfem::Array<int> signs(state.Size());
+  for (int i = 0; i < signs.Size(); ++i) { signs[i] = i; }
+  std::vector<mfem::igrlab::detail::AdmissibilityElementMap> maps(fes.GetNE());
+  for (int e = 0; e < fes.GetNE(); ++e)
+  {
+    auto& map = maps[e];
+    map.fe = fes.GetFE(e); map.dof = map.fe->GetDof();
+    map.order = map.fe->GetOrder(); map.enforce_nodes = true;
+    fes.GetElementVDofs(e, map.vdofs);
+    for (int j = 0; j < map.vdofs.Size(); ++j)
+    {
+      const int index = map.vdofs[j];
+      MFEM_VERIFY(index >= 0, "Directed signed fixture starts from ordinary L2 maps.");
+      if (j % 2 == 0) { map.vdofs[j] = signs[index] = -1 - index; }
+    }
+  }
+  // Exercise the existing private scan entry with directed encoded maps. The
+  // reference uses MFEM's original signed gather to transform the input, then
+  // its original scanner and GetRow; no production test hook is introduced.
+  const auto actual = mfem::igrlab::detail::ScanEulerAdmissibilityImpl(
+    fes, state, 2, 1.4, 1.0e-10, 1.0e-10, 0, {}, PointSet::Dof,
+    &maps, nullptr, nullptr);
+  mfem::Vector signed_state;
+  state.GetSubVector(signs, signed_state);
+  const auto expected = mfem::igrlab::ScanEulerAdmissibility(
+    fes, signed_state, 2, 1.4, 1.0e-10, 1.0e-10, 0, {}, PointSet::Dof);
+  Check(SameSummary(actual, expected) && actual.global_bad_rho > 0,
+        "cached host gather preserves encoded signs, signed zero and nonfinite diagnostics",
         fes.GetComm(), failures);
 }
 
@@ -471,6 +549,7 @@ int main(int argc, char** argv)
   CheckSampleContract(failures);
   CheckInvalidStates(failures);
   CheckDeviceAuthority(failures);
+  CheckSignedHostGather(failures);
   CheckCommunicators(failures);
   MPI_Allreduce(MPI_IN_PLACE, &failures, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
   if (mfem::Mpi::Root())

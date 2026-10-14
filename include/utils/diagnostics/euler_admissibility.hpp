@@ -589,6 +589,10 @@ ScanEulerAdmissibilityImpl(const mfem::ParFiniteElementSpace& vfes,
   mfem::Vector elvec;
   mfem::DenseMatrix elmat;
   mfem::Vector shape, state(num_eq);
+  // Prepared maps and the local element buffer are host-only in the original
+  // GetSubVector dispatch. Acquire this scan's current input once; no values
+  // or results are retained by the cache.
+  const mfem::real_t* cached_input = cached_elements ? v.Read(false) : nullptr;
 
   auto inspect_state = [&](const mfem::Vector& U,
                            int elem,
@@ -662,7 +666,17 @@ ScanEulerAdmissibilityImpl(const mfem::ParFiniteElementSpace& vfes,
       : (fec_l2 != nullptr && fec_l2->GetBasisType() == mfem::BasisType::GaussLobatto);
 
     if (cached_elements)
-    { v.GetSubVector((*cached_elements)[i].vdofs, elvec); }
+    {
+      const auto& map = (*cached_elements)[i].vdofs;
+      elvec.SetSize(map.Size());
+      mfem::real_t* element_data = elvec.HostWrite();
+      const int* indices = map.HostRead();
+      for (int j = 0; j < map.Size(); ++j)
+      {
+        const int index = indices[j];
+        element_data[j] = index >= 0 ? cached_input[index] : -cached_input[-index-1];
+      }
+    }
     else
     {
       vfes.GetElementVDofs(i, vdofs);
@@ -670,13 +684,20 @@ ScanEulerAdmissibilityImpl(const mfem::ParFiniteElementSpace& vfes,
     }
     elmat.UseExternalData(elvec.GetData(), dof, num_eq);
     if (!cached_elements) { shape.SetSize(dof); }
+    mfem::real_t* cached_state_data = cached_elements ? state.HostWrite() : nullptr;
 
     const bool do_dof_scan = (point_set == EulerAdmissibilityPointSet::Dof);
     if (do_dof_scan || enforce_nodes)
     {
       for (int j = 0; j < dof; ++j)
       {
-        elmat.GetRow(j, state);
+        if (cached_elements)
+        {
+          const mfem::real_t* element_data = elvec.GetData();
+          for (int eq = 0; eq < num_eq; ++eq)
+          { cached_state_data[eq] = element_data[j + eq * dof]; }
+        }
+        else { elmat.GetRow(j, state); }
         inspect_state(state, i, -1, j, false, j);
       }
       if (do_dof_scan)
@@ -687,10 +708,9 @@ ScanEulerAdmissibilityImpl(const mfem::ParFiniteElementSpace& vfes,
 
     if (cached_samples)
     {
-      // Node scans can resize/write state. Acquire its output storage only
-      // afterwards, then reuse it for this element's cached quadrature points.
-      // The pointer overload keeps the dot product in the same MFEM routine.
-      mfem::real_t* state_data = state.HostWrite();
+      // Prepared node copies preserve state size, so the same output storage
+      // remains valid. Keep the compiled MFEM pointer-overload dot unchanged.
+      mfem::real_t* state_data = cached_elements ? cached_state_data : state.HostWrite();
       const auto inspect_table = [&](int table_index, int face)
       {
         const auto& table = (*cached_shapes)[table_index];
