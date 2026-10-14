@@ -15,6 +15,7 @@ import shutil
 import stat
 import subprocess
 from typing import Any
+import study_site
 
 
 MFEM_PATH = 'tpl/mfem'
@@ -310,7 +311,7 @@ def _validation_seconds(value: str) -> int:
 
 def _dependency_configuration(identity: dict[str, Any], site_root: Path,
                               spack_root: Path, environment: dict[str, str],
-                              profile: str = 'cuda-sm80') -> dict[str, Any]:
+                              profile: str = 'cuda-sm80', site: str = 'pace') -> dict[str, Any]:
     """Select a cache; the canonical driver still proves the concrete ABI/hit.
 
     A site root owns an immutable concrete graph and discovered externals. Its
@@ -321,7 +322,10 @@ def _dependency_configuration(identity: dict[str, Any], site_root: Path,
     snapshot = Path(identity['source_snapshot'])
     mfem = snapshot / MFEM_PATH
     policy = {}
-    for name in MFEM_POLICY_FILES:
+    study_site.policy(site)
+    policy_files = MFEM_POLICY_FILES if site == 'pace' else tuple(
+        name.replace('/pace', '/delta') for name in MFEM_POLICY_FILES)
+    for name in policy_files:
         path = snapshot / name
         if path.exists():
             _no_symlink_ancestors(path)
@@ -355,9 +359,10 @@ def _dependency_configuration(identity: dict[str, Any], site_root: Path,
 def build_plan(identity: dict[str, Any], output_root: Path, site_root: Path,
                spack_root: Path, correctness_regex: str, *,
                validation_time: str | None = None,
-               profile: str = 'cuda-sm80') -> dict[str, Any]:
+               profile: str = 'cuda-sm80', site: str = 'pace') -> dict[str, Any]:
     """Inspect only the canonical --print-plan; never build on the login node."""
     verify_source(identity)
+    study_site.policy(site)
     _require(profile in ('cpu', 'cuda-sm80'), 'study builds support cpu or cuda-sm80')
     _require(bool(correctness_regex), 'a nonempty focused correctness regex is required')
     roots = [Path(p).absolute() for p in (output_root, site_root, spack_root)]
@@ -369,7 +374,7 @@ def build_plan(identity: dict[str, Any], output_root: Path, site_root: Path,
     environment = {**BUILD_ENV, **{name: os.environ.get(name, '') for name in BUILD_FLAG_ENV}}
     # Never overlay a new driver onto a historical source. Capability comes
     # from that frozen checkout's public entry point, with a retained receipt.
-    help_result = _run([str(snapshot / 'build.sh'), '--site', 'pace', '--help'], env=_environment(environment))
+    help_result = _run([str(snapshot / 'build.sh'), '--site', site, '--help'], env=_environment(environment))
     help_text = help_result.stdout.decode(errors='replace')
     help_receipt = {'argv': help_result.args, 'returncode': help_result.returncode,
                     'stdout_sha256': hashlib.sha256(help_result.stdout).hexdigest()}
@@ -382,18 +387,19 @@ def build_plan(identity: dict[str, Any], output_root: Path, site_root: Path,
         _validation_seconds(validation_time)
         validation_mode = 'canonical' if re.search(r'(?m)^\s*--validation-time(?:\s|$)', help_text) else 'scheduler-update'
         capability = help_receipt
-    flags = ['--site', 'pace', '--a100', '--hdg-runtime', '--nvtx-profile',
+    flags = ['--site', site, '--a100', '--hdg-runtime', '--nvtx-profile',
              '--no-clean', '--no-research-tests', '--submit', '-j', '4',
              '--mfem-jobs', '4', '--test-regex', correctness_regex]
     if profile == 'cpu':
-        flags = ['--site', 'pace', '--cpu-only', '--hdg-runtime', '--no-clean',
+        flags = ['--site', site, '--cpu-only', '--hdg-runtime', '--no-clean',
                  '--no-research-tests', '--submit', '-j', '4', '--mfem-jobs', '4',
                  '--test-regex', correctness_regex]
-    dependency_config = _dependency_configuration(identity, site_root, spack_root, environment, profile)
+    dependency_config = (_dependency_configuration(identity, site_root, spack_root, environment, profile)
+                         if site == 'pace' else _dependency_configuration(identity, site_root, spack_root, environment, profile, site))
     dependency_key = _json_hash(dependency_config)
     mfem_output = requested_output / 'mfem' / ('config-' + dependency_key[:20]) if shared_mfem else None
     config = {'source_fingerprint': identity['source_fingerprint'], 'flags': flags[:-2],
-              'site_config_sha256': hashlib.sha256((snapshot / 'cmake/sites/pace.json').read_bytes()).hexdigest(),
+              'site_config_sha256': hashlib.sha256((snapshot / 'cmake/sites' / (site + '.json')).read_bytes()).hexdigest(),
               'environment': environment,
               'dependency_configuration_key': dependency_key}
     config_key = _json_hash(config)
@@ -413,7 +419,7 @@ def build_plan(identity: dict[str, Any], output_root: Path, site_root: Path,
     mfem_source = mfem_output / 'source' if shared_mfem else snapshot / MFEM_PATH
     mfem_build = mfem_output / 'build' if shared_mfem else scope / 'mfem/build'
     mfem_install = mfem_output / 'install' if shared_mfem else scope / 'mfem/install'
-    env_path = site_root / 'site/pace/spack-envs' / profile
+    env_path = site_root / 'site' / site / 'spack-envs' / profile
     # Match complete known records instead of splitting paths/regexes on spaces.
     _require(f'[build-plan] output_root={output_root} worktree_id={wt} scope={scope}' in stdout and
              f'[build-plan] env={env_path} app_build={app_build} app_install={app_install}' in stdout,
@@ -422,7 +428,8 @@ def build_plan(identity: dict[str, Any], output_root: Path, site_root: Path,
         _require(f'[build-plan] mfem_source={mfem_source} mfem_build={mfem_build} mfem_install={mfem_install} ' in stdout,
                  'canonical build plan did not admit the expected shared MFEM tuple')
     verify_source(identity)
-    return {'schema_version': 1, 'profile': profile, 'source': identity, 'configuration_key': config_key,
+    return {**({'site': site} if site != 'pace' else {}),
+            'schema_version': 1, 'profile': profile, 'source': identity, 'configuration_key': config_key,
             'configuration': config, 'requested_output_root': str(requested_output),
             'correctness_regex': correctness_regex,
             'dependency_configuration_key': dependency_key,
@@ -550,10 +557,12 @@ def ensure_validation_time(plan: dict[str, Any], receipt: dict[str, Any]) -> dic
         values = dict(re.findall(r'(?:^|\s)([A-Za-z][A-Za-z0-9_]*)=([^\s]+)', text))
         executable = re.search(r'(?:^|\s)Command=(.*?)(?=\s+[A-Z][A-Za-z0-9_]*=|$)', text)
         uid = re.search(r'\(([0-9]+)\)$', values.get('UserId', ''))
+        site = study_site.name(plan)
+        account = study_site.policy(site)['cpu_account' if plan.get('profile') == 'cpu' else 'gpu_account']
         _require(values.get('JobId') == job and values.get('JobName') == 'IGRlab-check' and
-                 values.get('Account') == 'gts-sbryngelson3' and values.get('QOS') == 'embers' and
+                 values.get('Account') == account and (site != 'pace' or values.get('QOS') == 'embers') and
                  uid is not None and int(uid[1]) == os.getuid() and executable is not None and
-                 executable[1] == str(Path(plan['source']['source_snapshot']) / 'scripts/build/pace.sh'),
+                 executable[1] == str(Path(plan['source']['source_snapshot']) / 'scripts/build' / (site + '.sh')),
                  'validation limit withheld: scheduler job identity changed')
         return values
 
@@ -614,7 +623,8 @@ def submit_build(plan: dict[str, Any]) -> dict[str, Any]:
                           plan['correctness_regex'] if 'correctness_regex' in plan else
                           plan['configuration']['flags'][plan['configuration']['flags'].index('--test-regex') + 1],
                           validation_time=plan.get('validation_time'),
-                          profile=plan.get('profile', 'cuda-sm80'))
+                          profile=plan.get('profile', 'cuda-sm80'),
+                          **({'site': study_site.name(plan)} if study_site.name(plan) != 'pace' else {}))
     for key in ('argv', 'env', 'configuration_key', 'correctness_regex', 'dependency_configuration_key',
                 'dependency_configuration', 'mfem_cache', 'mfem_source', 'mfem_build',
                 'mfem_install', 'run_only_validation', 'app_build', 'spack_env',
@@ -622,8 +632,9 @@ def submit_build(plan: dict[str, Any]) -> dict[str, Any]:
         _require(plan.get(key) == expected[key], f'build submission plan changed: {key}')
     result = _run(plan['argv'], env=_environment(plan['env']), check=False)
     stdout, stderr = result.stdout.decode(errors='replace'), result.stderr.decode(errors='replace')
-    build = re.findall(r'^PACE build submitted: ([0-9]+) \(', stdout, re.M)
-    validation = re.findall(r'^PACE validation submitted: ([0-9]+) \(', stdout, re.M)
+    title = study_site.policy(study_site.name(plan))['title']
+    build = re.findall(r'^' + title + r' build submitted: ([0-9]+) \(', stdout, re.M)
+    validation = re.findall(r'^' + title + r' validation submitted: ([0-9]+) \(', stdout, re.M)
     receipt = {'schema_version': 1, 'success': result.returncode == 0 and len(build) == len(validation) == 1,
             'returncode': result.returncode,
             'build_job_id': build[0] if len(build) == 1 else None,

@@ -19,6 +19,7 @@ import subprocess
 from types import SimpleNamespace
 
 import study_build
+import study_site
 
 
 def require(value, message):
@@ -132,7 +133,7 @@ def admit_build(plan, binary_names, receipt):
         locations[package] = str(path.resolve(strict=True))
     saved_path = Path(plan['app_build']) / verifier.RECEIPT
     saved = json.loads(saved_path.read_text())
-    expected_policy = {'mode': 'cpu', 'profile': 'cpu', 'build_type': 'Release', 'site': 'pace',
+    expected_policy = {'mode': 'cpu', 'profile': 'cpu', 'build_type': 'Release', 'site': study_site.name(plan),
                        'caliper': '0', 'nvtx_profile': '0', 'hdg_runtime': 'ON',
                        'hdg_auxiliary': 'OFF', 'hdg_euler': 'OFF', 'hdg_euler_device': 'OFF',
                        'research_tests': 'OFF', 'dependency_cuda_arch': 'none',

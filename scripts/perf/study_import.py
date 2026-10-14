@@ -21,6 +21,7 @@ import shlex
 import subprocess
 
 import study_build
+import study_site
 
 ORIGIN = 'existing-canonical-test-result'
 MEMBERS = ('baseline', 'candidate')
@@ -105,8 +106,10 @@ def existing_plan(record, correctness_regex, *, reuse_validated_artifacts=False)
     identity = study_build._identity(source)
     study_build.verify_source(identity)
     values, switches = options(request['argv'])
-    require(values.get('--site') == 'pace' and '--hdg-runtime' in switches and
-            '--no-research-tests' in switches, 'import requires canonical PACE HDG/runtime builds')
+    site = values.get('--site')
+    study_site.policy(site)
+    require('--hdg-runtime' in switches and '--no-research-tests' in switches,
+            'import requires canonical site HDG/runtime builds')
     cpu = bool(switches & {'--cpu', '--cpu-only'})
     require((cpu and len(switches & {'--cpu', '--cpu-only'}) == 1 and '--a100' not in switches and
              '--nvtx-profile' not in switches) or
@@ -123,7 +126,7 @@ def existing_plan(record, correctness_regex, *, reuse_validated_artifacts=False)
     wt = 'wt-' + hashlib.sha256(os.fsencode(source)).hexdigest()[:16]
     scope = roots['--output-root'] / 'worktrees' / wt / profile
     mfem = roots['--mfem-output-root']
-    env_path = roots['--site-root'] / 'site/pace/spack-envs' / profile
+    env_path = roots['--site-root'] / 'site' / site / 'spack-envs' / profile
     expected = (f'[build-plan] output_root={roots["--output-root"]} worktree_id={wt} scope={scope}',
                 f'[build-plan] env={env_path} app_build={scope}/app/build app_install={scope}/app/install',
                 f'[build-plan] mfem_source={mfem}/source mfem_build={mfem}/build mfem_install={mfem}/install ')
@@ -149,6 +152,8 @@ def existing_plan(record, correctness_regex, *, reuse_validated_artifacts=False)
             'test_result': str(result_path), 'test_result_sha256': result_sha,
             'test_result_runner_sha256': sha(result_module()[1]),
             'build_job_id': str(record['build_job_id'])}
+    if site != 'pace':
+        plan['site'] = site
     validation = validate_result(plan)
     plan['import_artifact_sha256'] = validation['artifact_sha256']
     require(sha(request_path) == request_sha and sha(result_path) == result_sha,
@@ -178,7 +183,7 @@ def validate_result(plan, *, full=False):
         expected = plan['source']['source_snapshot'] if key == 'source' else plan[key]
         require(saved['paths'].get(key) == expected, f'prebuilt import path differs: {key}')
     require(result['source'] == saved['source'] and result['policy'] == saved['policy'] and
-            saved['policy']['profile'] == plan['profile'] and saved['policy']['site'] == 'pace',
+            saved['policy']['profile'] == plan['profile'] and saved['policy']['site'] == study_site.name(plan),
             'test result source/policy differs from the canonical build')
     require(sha(Path(plan['source']['source_snapshot']) / 'scripts/build/prebuilt_validation.py') ==
             result.get('prebuilt_checker_sha256'), 'canonical prebuilt checker changed')
@@ -231,14 +236,18 @@ def validate_result(plan, *, full=False):
             before.get('gpu') == after.get('gpu'), 'actual test allocation/device identity changed')
     for snapshot in (before, after):
         fields = snapshot['scheduler']['fields']
-        require(snapshot.get('authority') == 'live PACE allocation' and
+        site = study_site.name(plan)
+        site_match = (fields.get('Account') == 'gts-sbryngelson3' and fields.get('QOS') == 'embers'
+                      if site == 'pace' else study_site.scheduler_matches(fields, site, plan['profile']))
+        require(snapshot.get('authority') == study_site.policy(study_site.name(plan))['authority'] and
                 snapshot['scheduler']['returncode'] == 0 and fields.get('JobState') == 'RUNNING' and
-                fields.get('Account') == 'gts-sbryngelson3' and fields.get('QOS') == 'embers' and
+                site_match and
                 fields.get('UserId') == f'{pwd.getpwuid(os.getuid()).pw_name}({os.getuid()})' and
                 fields.get('JobId') == snapshot['environment'].get('SLURM_JOB_ID'),
                 'test result is not from an owned live free compute allocation')
     if plan['profile'] == 'cuda-sm80':
-        require(before['scheduler']['fields'].get('Partition') == 'gpu-a100' and
+        require(before['scheduler']['fields'].get('Partition') ==
+                study_site.policy(study_site.name(plan))['gpu_partition'] and
                 'A100' in before.get('gpu', {}).get('name', '') and
                 before.get('gpu', {}).get('compute_capability') == '8.0' and
                 re.fullmatch(r'GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}',
@@ -258,7 +267,7 @@ def timestamp(value):
     return datetime.fromisoformat(value).replace(tzinfo=timezone.utc).timestamp()
 
 
-def accounting(job):
+def accounting(job, site='pace', profile='cuda-sm80'):
     require(re.fullmatch(r'[1-9][0-9]*', str(job)), 'invalid real scheduler job ID')
     command = ['sacct', '-n', '-P', '-j', str(job), '--format=JobID,State%64,ExitCode,User%64,Account%64,QOS%64,JobName%64,Start,End,NodeList%1024,SubmitLine%4096']
     result = run(command)
@@ -266,8 +275,9 @@ def accounting(job):
     rows = [line.split('|', 10) for line in result.stdout.splitlines() if line.split('|', 1)[0] == str(job)]
     require(len(rows) == 1 and len(rows[0]) == 11, 'missing or ambiguous imported job accounting')
     row = rows[0]
-    require(row[3:6] == [pwd.getpwuid(os.getuid()).pw_name, 'gts-sbryngelson3', 'embers'],
-            'imported job is not the current user in the free PACE queue')
+    require(row[3] == pwd.getpwuid(os.getuid()).pw_name and
+            study_site.accounting_matches(row, site, profile),
+            'imported job is not the current user in the selected site account/QOS')
     return {'argv': command, 'returncode': result.returncode, 'row': row}
 
 
@@ -304,11 +314,13 @@ def completed_records(plan, receipt, *, full=False):
                           test_allocation_accounting={**authority, 'historical_job_id': job},
                           test_execution_scope='sealed Passed outcomes; historical accounting not queried by explicit opt-in; no historical job completion claim')
         return validation
-    build = accounting(plan['build_job_id'])
+    site = study_site.name(plan)
+    build = (accounting(plan['build_job_id']) if site == 'pace' else
+             accounting(plan['build_job_id'], site, 'cpu'))
     row = build['row']
     require(row[1:3] == ['COMPLETED', '0:0'] and row[6] == 'IGRlab-build',
             'existing canonical build did not complete successfully')
-    worker = [str(Path(plan['source']['source_snapshot']) / 'scripts/build/pace.sh'),
+    worker = [str(Path(plan['source']['source_snapshot']) / 'scripts/build' / (site + '.sh')),
               '--worker', 'build', plan['request_path']]
     tokens = shlex.split(row[10])
     require(sum(tokens[index:index + 4] == worker for index in range(len(tokens))) == 1,
@@ -317,7 +329,7 @@ def completed_records(plan, receipt, *, full=False):
     snapshot = result['allocation_before']
     fields = snapshot['scheduler']['fields']
     job = fields['JobId']
-    observed = accounting(job)
+    observed = accounting(job) if site == 'pace' else accounting(job, site, plan['profile'])
     row = observed['row']
     start, finish = result['started_unix_seconds'], result['finished_unix_seconds']
     require(type(start) in (int, float) and type(finish) in (int, float) and
@@ -415,6 +427,7 @@ def inspect_manifest(path, correctness_regex, cpu_regex, *, reuse_validated_arti
             require(plans['cpu_builds'][member]['source'] == plans['builds'][member]['source'],
                     'CPU and CUDA member sources must be the exact same standalone snapshot')
     require(len({plan['site_root'] for group in plans.values() for plan in group.values()}) == 1 and
+            len({study_site.name(plan) for group in plans.values() for plan in group.values()}) == 1 and
             len({plan['spack_root'] for group in plans.values() for plan in group.values()}) == 1,
             'imported cohorts require the same site and buildtool roots')
     require(sha(path) == expected_sha, 'artifact import manifest changed during preparation')
