@@ -4,7 +4,9 @@ import array
 import base64
 import copy
 import json
+import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -242,6 +244,8 @@ class WorkloadTests(unittest.TestCase):
         self.assertIn('-vtk', dg)
         self.assertEqual(workloads.environment(self.dg, self.work, fields=True),
                          {'DG_IGR_VTK_PREFIX_PATH': str(self.work / 'vtk'),
+                          'DG_IGR_EULER_ADMISSIBILITY_CUDA': '0',
+                          'IGRLAB_EULER_ADMISSIBILITY_CUDA': '0',
                           'IGRLAB_PROFILE_NVTX': '0', 'DG_IGR_PROFILE_NVTX': '0'})
         with self.assertRaises(ValueError):
             workloads.command(self.hdg, Path('/binary'), ROOT, self.work, profile=True, fields=True)
@@ -362,7 +366,9 @@ class WorkloadTests(unittest.TestCase):
              '-rs', '0', '-rp', '0', '-tf', '0.002', '-dt', '1e-05', '-c', '0', '-no-glvis',
              '-vs', '1000000', '-nan-scan', '--device', 'cuda', '-no-save-state', '-no-vtk'])
         self.assertEqual(workloads.environment(self.dg, self.work),
-                         {'IGRLAB_PROFILE_NVTX': '0', 'DG_IGR_PROFILE_NVTX': '0'})
+                         {'IGRLAB_PROFILE_NVTX': '0', 'DG_IGR_PROFILE_NVTX': '0',
+                          'IGRLAB_EULER_ADMISSIBILITY_CUDA': '0',
+                          'DG_IGR_EULER_ADMISSIBILITY_CUDA': '0'})
 
     def test_serial_refine_is_bounded_and_repeated_for_every_application_call(self):
         for refinement in (0, 1, 2):
@@ -457,6 +463,89 @@ class WorkloadTests(unittest.TestCase):
         case['parameters'].update(regularization='igr', active_igr_wave=True,
                                   discretization=discretization)
         return case
+
+    def test_cuda_admissibility_optional_boolean_preserves_historical_parameters(self):
+        for suite in (SUITE, BACKEND_SUITE, GPU_SOLVER_SUITE, IGR_SUITE, IGR_CPU_SUITE):
+            for case in workloads.load_suite(suite)['cases']:
+                self.assertNotIn('cuda_admissibility', case['parameters'])
+        for discretization in ('dg', 'dgsem'):
+            case = self.igr_case(discretization)
+            for enabled in (False, True):
+                changed = copy.deepcopy(case)
+                changed['parameters']['cuda_admissibility'] = enabled
+                self.assertIs(workloads.parameters(changed)['cuda_admissibility'], enabled)
+            for invalid in (0, 1, 0.0, '0', '1', 'true', None, [], {}):
+                case['parameters']['cuda_admissibility'] = invalid
+                with self.subTest(discretization=discretization, invalid=invalid), \
+                        self.assertRaisesRegex(ValueError, 'must be a boolean'):
+                    workloads.parameters(case)
+
+    def test_cuda_admissibility_requires_ordinary_active_igr_cuda_dg_or_dgsem(self):
+        for changed in ({'device': 'cpu'}, {'discretization': 'hdg'},
+                        {'discretization': 'hdg', 'engine': 'tensor'},
+                        {'discretization': 'dgsem', 'dgsem_residual': 'fused-simt'},
+                        {'discretization': 'dgsem', 'dgsem_residual': 'fused-dmma'}):
+            case = self.igr_case()
+            case['parameters'].update(changed, cuda_admissibility=True)
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                workloads.parameters(case)
+        inactive = copy.deepcopy(self.dg)
+        inactive['parameters']['cuda_admissibility'] = True
+        with self.assertRaisesRegex(ValueError, 'ordinary CUDA active IGR'):
+            workloads.parameters(inactive)
+        inactive['parameters']['cuda_admissibility'] = False
+        self.assertFalse(workloads.parameters(inactive)['cuda_admissibility'])
+        for original in (self.hdg, self.volume):
+            case = copy.deepcopy(original)
+            case['parameters']['cuda_admissibility'] = True
+            with self.assertRaisesRegex(ValueError, 'unknown .* parameter'):
+                workloads.parameters(case)
+
+    def test_cuda_admissibility_pins_each_application_mode_and_blocks_ambient_opt_in(self):
+        aliases = ('IGRLAB_EULER_ADMISSIBILITY_CUDA', 'DG_IGR_EULER_ADMISSIBILITY_CUDA')
+        for discretization in ('dg', 'dgsem'):
+            original = self.igr_case(discretization)
+            for enabled in (None, False, True):
+                case = copy.deepcopy(original)
+                if enabled is not None:
+                    case['parameters']['cuda_admissibility'] = enabled
+                for options in ({}, {'fields': True}, {'profile': True}):
+                    for inherited in (('1', '0'), ('0', '1'), ('1', '1')):
+                        with self.subTest(discretization=discretization, enabled=enabled, options=options, inherited=inherited), \
+                             mock.patch.dict(os.environ, dict(zip(aliases, inherited))):
+                            environment = {**os.environ, **workloads.environment(case, self.work, **options)}
+                            self.assertEqual([environment[flag] for flag in aliases],
+                                             ['1' if enabled is True else '0'] * 2)
+                            self.assertEqual(workloads.command(case, Path('/binary'), ROOT, self.work, **options),
+                                             workloads.command(original, Path('/binary'), ROOT, self.work, **options))
+        for original in (self.dg, self.hdg, self.volume):
+            with mock.patch.dict(os.environ, dict.fromkeys(aliases, '1')):
+                environment = workloads.environment(original, self.work)
+                self.assertEqual([environment[flag] for flag in aliases], ['0', '0'])
+
+    def test_cuda_admissibility_process_receipts_record_the_actual_pinned_value(self):
+        import gpu_study as study
+        aliases = ('IGRLAB_EULER_ADMISSIBILITY_CUDA', 'DG_IGR_EULER_ADMISSIBILITY_CUDA')
+        for flag in aliases:
+            self.assertIn(flag, study.SAFE_ENV)
+        runner = study.Runner(self.work / 'receipts', 30)
+        for enabled in (False, True):
+            case = self.igr_case()
+            case['parameters']['cuda_admissibility'] = enabled
+            inherited = {aliases[0]: '0' if enabled else '1', aliases[1]: '1' if enabled else '0',
+                         'UNRELATED_SECRET': 'fixture-private'}
+            with mock.patch.dict(os.environ, inherited):
+                environment = {**os.environ, **workloads.environment(case, self.work)}
+                directory = runner.run('enabled-' + str(enabled),
+                    [sys.executable, '-c', 'import os; print("/".join(os.environ[k] for k in ' + repr(aliases) + '))'],
+                    env=environment)
+            command = json.loads((directory / 'command.json').read_text())
+            result = json.loads((directory / 'result.json').read_text())
+            for flag in aliases:
+                self.assertEqual(command['environment'][flag], '1' if enabled else '0')
+                self.assertEqual(result['environment'][flag], command['environment'][flag])
+            self.assertEqual((directory / 'stdout.log').read_text().strip(), '1/1' if enabled else '0/0')
+            self.assertNotIn('UNRELATED_SECRET', result['environment'])
 
     def igr_log(self, *, output_calls=0):
         # Existing solver.hpp record spelling, including export-only accounting.

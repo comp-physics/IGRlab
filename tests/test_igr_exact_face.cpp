@@ -3,6 +3,7 @@
 #include "mfem/general/forall.hpp"
 #include "physics/igr/IGR.hpp"
 #include "../src/numerics/dg/DGFaceQuadratureKernels.hpp"
+#include "../src/physics/igr/IGR_chebyshev.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -494,6 +495,216 @@ public:
   mutable int reads = 0;
 };
 
+// Inspect allocation addresses without transferring intermediate results to
+// the host or inserting a synchronization between polynomial stages.
+class ChebyshevOperatorWitness final : public mfem::Operator
+{
+public:
+  explicit ChebyshevOperatorWitness(const mfem::Operator& op)
+    : mfem::Operator(op.Height(), op.Width()), op_(op) { }
+  void Mult(const Vector& x, Vector& y) const override
+  {
+    input_addresses.push_back(x.Read());
+    op_.Mult(x, y);
+  }
+  mfem::MemoryClass GetMemoryClass() const override
+  { return op_.GetMemoryClass(); }
+  mutable std::vector<const real_t*> input_addresses;
+private:
+  const mfem::Operator& op_;
+};
+
+class ChebyshevDiagonalOracle final : public mfem::Operator
+{
+public:
+  explicit ChebyshevDiagonalOracle(int n) : mfem::Operator(n) { }
+  void Mult(const Vector& x, Vector& y) const override
+  {
+    const auto X = x.Read();
+    const auto Y = y.Write();
+    const real_t scale = scale_;
+    forall(height, [=] MFEM_HOST_DEVICE (int i)
+    { Y[i] = (scale + 0.0625 * (i % 3)) * X[i]; });
+  }
+  real_t scale_ = 0.75;
+};
+
+void CheckChebyshevOracle(const mfem::Operator& op, const Vector& diagonal,
+                          const Array<int>& essential, real_t eigenvalue,
+                          bool exceptional = false)
+{
+  if (mfem::Device::Allows(mfem::Backend::CUDA_MASK) &&
+      !::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA())
+  { return; } // Unsupported accelerator/local-CXX routes test factory fallback below.
+  const int n = diagonal.Size();
+  for (int degree = 1; degree <= 5; ++degree)
+  {
+    ChebyshevOperatorWitness native_op(op), owned_op(op);
+    mfem::OperatorChebyshevSmoother native(
+      native_op, diagonal, essential, degree, eigenvalue);
+    ::igrlab::igr_internal::OwnedScratchChebyshev owned(
+      owned_op, diagonal, essential, degree, eigenvalue);
+    Vector x(n), native_y(n), owned_y(n);
+    x.UseDevice(true); native_y.UseDevice(true); owned_y.UseDevice(true);
+    std::vector<Vector> native_results, owned_results;
+    native_results.reserve(4); owned_results.reserve(4);
+    for (int call = 0; call < 4; ++call)
+    {
+      native_results.emplace_back(n);
+      owned_results.emplace_back(n);
+      native_results.back().UseDevice(true);
+      owned_results.back().UseDevice(true);
+    }
+    for (int call = 0; call < 4; ++call)
+    {
+      // Alternate current device and host authority. Preserve each output
+      // without a host read so repeated applications exercise queued reuse.
+      auto fill = [=] MFEM_HOST_DEVICE (int i)
+      {
+        if (call == 0) { return real_t(i % 2 ? 0.0 : -0.0); }
+        return real_t((i % 2 ? -1.0 : 1.0) *
+                      (0.03125 * (i + 1) + 0.0078125 * call));
+      };
+      if (call % 2)
+      {
+        real_t* data = x.HostWrite();
+        for (int i = 0; i < n; ++i) { data[i] = fill(i); }
+      }
+      else
+      {
+        real_t* data = x.Write();
+        forall(n, [=] MFEM_HOST_DEVICE (int i) { data[i] = fill(i); });
+      }
+      if (exceptional && n >= 6)
+      {
+        real_t* data = x.HostReadWrite();
+        data[0] = std::numeric_limits<real_t>::infinity();
+        data[1] = -std::numeric_limits<real_t>::infinity();
+        data[2] = std::numeric_limits<real_t>::quiet_NaN();
+        data[3] = std::numeric_limits<real_t>::max();
+        data[4] = std::numeric_limits<real_t>::denorm_min();
+        data[5] = -std::numeric_limits<real_t>::denorm_min();
+      }
+      auto& native_result = native_results[call];
+      auto& owned_result = owned_results[call];
+      native_result = 19.0;
+      owned_result = -23.0;
+      if (call % 2)
+      { native.MultTranspose(x, native_result); owned.MultTranspose(x, owned_result); }
+      else
+      { native.Mult(x, native_result); owned.Mult(x, owned_result); }
+    }
+    MFEM_VERIFY(native_op.input_addresses.size() == std::size_t(4 * (degree - 1)) &&
+                  owned_op.input_addresses.size() == native_op.input_addresses.size(),
+                "Chebyshev changed the prescribed operator call count.");
+    if (degree > 1 && n > 0)
+    {
+      const auto& addresses = owned_op.input_addresses;
+      MFEM_VERIFY(std::find_if(addresses.begin() + 1, addresses.end(),
+                      [&](const real_t* p) { return p != addresses.front(); }) !=
+                      addresses.end(),
+                  "Owned Chebyshev must actually alternate scratch allocations.");
+      MFEM_VERIFY(std::all_of(native_op.input_addresses.begin(),
+                              native_op.input_addresses.end(),
+                      [&](const real_t* p)
+                      { return p == native_op.input_addresses.front(); }),
+                  "Pinned MFEM oracle must retain its original copied residual.");
+    }
+    for (int call = 0; call < 4; ++call)
+    {
+      MFEM_VERIFY(SameBits(native_results[call], owned_results[call]),
+                  "Owned Chebyshev changed pinned MFEM output bits: degree="
+                  << degree << " call=" << call << " exceptional=" << exceptional);
+      if (!exceptional && std::isfinite(eigenvalue) && eigenvalue > 0)
+      { RequireFinite(owned_results[call]); }
+    }
+
+    // The initial residual copy must precede clearing y for all caller aliases.
+    Vector native_in_place(x), owned_in_place(x);
+    native.Mult(native_in_place, native_in_place);
+    owned.Mult(owned_in_place, owned_in_place);
+    MFEM_VERIFY(SameBits(native_in_place, owned_in_place),
+                "Owned Chebyshev changed in-place input/output semantics.");
+    Vector native_backing(n + 1), owned_backing(n + 1);
+    native_backing.UseDevice(true); owned_backing.UseDevice(true);
+    const real_t* input = x.HostRead();
+    real_t* native_data = native_backing.HostWrite();
+    real_t* owned_data = owned_backing.HostWrite();
+    if (n > 0)
+    {
+      std::copy(input, input + n, native_data);
+      std::copy(input, input + n, owned_data);
+    }
+    native_data[n] = owned_data[n] = 29.0;
+    Vector native_view, owned_view, native_output, owned_output;
+    native_view.MakeRef(native_backing, 0, n);
+    native_output.MakeRef(native_backing, 1, n);
+    owned_view.MakeRef(owned_backing, 0, n);
+    owned_output.MakeRef(owned_backing, 1, n);
+    native.Mult(native_view, native_output);
+    owned.Mult(owned_view, owned_output);
+    MFEM_VERIFY(SameBits(native_output, owned_output),
+                "Owned Chebyshev changed overlapping caller-view semantics.");
+
+    // Unknown subsequent operator bindings take the original copy sequence.
+    ChebyshevOperatorWitness rebound(op);
+    owned.SetOperator(rebound);
+    native.SetOperator(rebound);
+    owned.Mult(x, owned_y);
+    native.Mult(x, native_y);
+    MFEM_VERIFY(SameBits(native_y, owned_y),
+                "Chebyshev operator rebinding changed original behavior.");
+    if (degree > 2 && n > 0)
+    {
+      MFEM_VERIFY(rebound.input_addresses[0] == rebound.input_addresses[1],
+                  "Unknown rebound operator must retain the copied-residual path.");
+    }
+  }
+}
+
+void CheckChebyshevOwnedScratch()
+{
+  for (int n : {0, 1, 7, 255, 257})
+  {
+    ChebyshevDiagonalOracle op(n);
+    Vector diagonal(n);
+    diagonal.UseDevice(true);
+    real_t* d = diagonal.HostWrite();
+    for (int i = 0; i < n; ++i) { d[i] = 1.0 + 0.125 * (i % 5); }
+    Array<int> essential;
+    if (n > 1)
+    {
+      essential.SetSize(1);
+      essential[0] = n / 2;
+      d[n / 2] = 0.0; // Original essential inverse is overwritten with one.
+    }
+    CheckChebyshevOracle(op, diagonal, essential, 2.125);
+    // A new coefficient/diagonal setup uses the current values rather than
+    // retaining an old action or preconditioner result.
+    op.scale_ = 1.125;
+    d = diagonal.HostWrite();
+    for (int i = 0; i < n; ++i) { d[i] = 1.25 + 0.0625 * (i % 7); }
+    CheckChebyshevOracle(op, diagonal, essential, 3.375);
+    if (n == 7)
+    {
+      CheckChebyshevOracle(op, diagonal, essential, 2.125, true);
+      CheckChebyshevOracle(op, diagonal, essential, 0.0, true);
+      CheckChebyshevOracle(op, diagonal, essential, -2.0, true);
+    }
+    auto fallback = ::igrlab::igr_internal::MakeIGRChebyshevSmoother(
+      op, diagonal, essential, 3, 2.125, false);
+    MFEM_VERIFY(dynamic_cast<mfem::OperatorChebyshevSmoother*>(fallback.get()),
+                "Unsupported production route must retain original MFEM.");
+    if (!::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA())
+    {
+      auto cpu_fallback = ::igrlab::igr_internal::MakeIGRChebyshevSmoother(
+        op, diagonal, essential, 3, 2.125, true);
+      MFEM_VERIFY(dynamic_cast<mfem::OperatorChebyshevSmoother*>(cpu_fallback.get()),
+                  "Unsupported backend must retain MFEM even if an eligibility flag is supplied.");
+    }
+  }
+}
+
 void CheckProductionIdentityCopies()
 {
   for (const int order : {3, 5})
@@ -581,6 +792,35 @@ void CheckProductionIdentityCopies()
         full->Mult(input, actual);
         MFEM_VERIFY(SameBits(expected, actual), "Production sum changed base + face bits.");
 
+        Vector diagonal(full->Height());
+        full->AssembleDiagonal(diagonal);
+        Array<int> essential;
+        CheckChebyshevOracle(*full, diagonal, essential, 4.125);
+        const bool admitted_cuda_layout =
+          ::igrlab::igr_internal::OwnedScratchChebyshev::UsesOrdinaryCUDA() &&
+          solver.GetLastDirectIdentitySystem() && scalar_fes.Conforming() &&
+          scalar_fes.GetNRanks() == 1 &&
+          solver.GetLastExactFaceSharedFaceCount() == 0;
+        auto selected = ::igrlab::igr_internal::MakeIGRChebyshevSmoother(
+          *full, diagonal, essential, 3, 4.125, admitted_cuda_layout);
+        const bool owned_selected = dynamic_cast<
+          ::igrlab::igr_internal::OwnedScratchChebyshev*>(selected.get()) != nullptr;
+        MFEM_VERIFY(owned_selected ==
+                      (admitted_cuda_layout &&
+                       ::igrlab::igr_internal::OwnedScratchChebyshev::HasCUDAKernels()),
+                    "Qualified CUDA production must select owned Chebyshev scratch.");
+        mfem::OperatorChebyshevSmoother reference(*full, diagonal, essential, 3, 4.125);
+        Vector selected_y(full->Height()), reference_y(full->Height());
+        selected->Mult(input, selected_y);
+        reference.Mult(input, reference_y);
+        MFEM_VERIFY(SameBits(selected_y, reference_y),
+                    "Production Chebyshev selection changed the original full operator action.");
+        if (!admitted_cuda_layout)
+        {
+          MFEM_VERIFY(dynamic_cast<mfem::OperatorChebyshevSmoother*>(selected.get()),
+                      "Non-admitted production layout must retain MFEM.");
+        }
+
         ObservedInput in_place(n);
         in_place.UseDevice(true);
         in_place = static_cast<const Vector&>(input);
@@ -621,6 +861,7 @@ int main(int argc, char** argv)
   CheckDictionaryAdmission();
   CheckDictionaryGeometryRebuild();
   CheckProductionIdentityCopies();
+  CheckChebyshevOwnedScratch();
   int cases = 0;
   double max_assembled_error = 0.0;
   for (const int basis : {mfem::BasisType::GaussLegendre,

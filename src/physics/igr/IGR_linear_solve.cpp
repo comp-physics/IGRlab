@@ -12,6 +12,7 @@
 #include "IGR_face_density_cuda.hpp"
 #include "IGR_face_density_host_cache.hpp"
 #include "IGR_stationary_correction.hpp"
+#include "IGR_chebyshev.hpp"
 #include "../../numerics/dg/DGFaceQuadratureKernels.hpp"
 
 #include <algorithm>
@@ -1057,6 +1058,9 @@ public:
 
   bool TimingEnabled() const { return timing_enabled_; }
 
+  bool HasDirectIdentityLayout() const
+  { return direct_identity_layout_ && sfes_.GetSequence() == sfes_sequence_; }
+
   void ResetTiming() const { timing_ = ExactFaceTimingStats{}; }
 
   const ExactFaceTimingStats& Timing() const { return timing_; }
@@ -1310,6 +1314,9 @@ public:
 
   mfem::Operator& BaseOperator() const { return *base_; }
   mfem::Operator& FaceOperator() const { return *face_; }
+
+  bool HasDirectIdentityFaceLayout() const
+  { return exact_face_ && exact_face_->HasDirectIdentityLayout(); }
 
   void ResetTiming() const
   {
@@ -2772,12 +2779,23 @@ void IGRSolver::SolveEllipticSystem_(bool warm_start)
                                                     cheb_power_seed);
       last_chebyshev_eigenvalue_estimate_ =
         static_cast<double>(max_eig_estimate);
-      auto cheb = std::make_unique<mfem::OperatorChebyshevSmoother>(
+      // Only this known rank-one ordinary-CUDA PA/exact-face pipeline has
+      // the stream and stable-output-storage contract needed by owned swaps.
+      // All generic, MPI, nonidentity and constrained routes retain MFEM.
+      const bool owned_cheb_scratch =
+        OwnedScratchChebyshev::UsesOrdinaryCUDA() && direct_identity_system_ &&
+        exact_face_sum_op && !use_base_operator &&
+        sfes_.GetNRanks() == 1 && sfes_.Conforming() &&
+        exact_face_sum_op->HasDirectIdentityFaceLayout() &&
+        &exact_face_sum_op->BaseOperator() == a_.get() &&
+        a_->GetAssemblyLevel() == mfem::AssemblyLevel::PARTIAL;
+      auto cheb = MakeIGRChebyshevSmoother(
         *cheb_smoother_op,
         diag,
         ess_tdof_list_,
         cheb_order,
-        max_eig_estimate);
+        max_eig_estimate,
+        owned_cheb_scratch);
       last_chebyshev_setup_seconds_ = ElapsedSeconds(cheb_setup_start);
       total_chebyshev_setup_seconds_ += last_chebyshev_setup_seconds_;
       ++total_chebyshev_smoother_builds_;

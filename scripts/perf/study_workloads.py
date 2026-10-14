@@ -100,7 +100,7 @@ def parameters(case):
         'dgsem': {'n': 4, 'elements': 1024, 'iterations': 100, 'method': 'existing-fp64'},
     }
     require(adapter in defaults and isinstance(supplied, dict), 'unknown adapter or invalid parameters')
-    allowed = set(defaults[adapter]) | (IGR_PARAMETERS if adapter == 'dg' else set())
+    allowed = set(defaults[adapter]) | ((IGR_PARAMETERS | {'cuda_admissibility'}) if adapter == 'dg' else set())
     require(set(supplied) <= allowed, f'unknown {adapter} parameter')
     result = {**defaults[adapter], **supplied}
     if adapter in ('dg', 'hdg'):
@@ -137,6 +137,13 @@ def parameters(case):
                 (result['dgsem_residual'] == 'unfused' or
                  (result['discretization'] == 'dgsem' and result['device'] == 'cuda')),
                 'fused residual requires CUDA DGSEM')
+        if 'cuda_admissibility' in supplied:
+            require(type(supplied['cuda_admissibility']) is bool, 'cuda_admissibility must be a boolean')
+            require(not supplied['cuda_admissibility'] or
+                    (result['device'] == 'cuda' and result['discretization'] in ('dg', 'dgsem') and
+                     result['engine'] == 'ordinary' and result['dgsem_residual'] == 'unfused' and
+                     result.get('regularization') == 'igr' and result.get('active_igr_wave') is True),
+                    'CUDA admissibility requires ordinary CUDA active IGR DG/DGSEM')
         number(result['final_time'], 'final_time', positive=True)
         require(result['dt'] <= result['final_time'], 'dt exceeds DG horizon')
         number(result['rtol'], 'rtol')
@@ -281,6 +288,11 @@ def environment(case, workdir, fields=False, *, profile=False):
     require(not (profile and fields), 'profile and field export are separate calls')
     p = parameters(case)
     result = {'DG_IGR_VTK_PREFIX_PATH': str(Path(workdir) / 'vtk')} if case['adapter'] == 'dg' and fields else {}
+    # Pin both members and every application mode; ambient opt-ins cannot leak
+    # into historical workloads. Keep absent parameters absent in their signatures.
+    enabled_admissibility = '1' if p.get('cuda_admissibility', False) else '0'
+    result.update({prefix + 'EULER_ADMISSIBILITY_CUDA': enabled_admissibility
+                   for prefix in ('IGRLAB_', 'DG_IGR_')})
     if case['adapter'] == 'dg':
         # Keep primary timings and field exports free of instrumentation even
         # when the interactive shell inherited a profiling opt-in.

@@ -9,6 +9,7 @@
 #include <cfenv>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -557,6 +558,27 @@ void CheckCommunicators(int& failures)
 #if defined(IGRLAB_ADMISSIBILITY_CUDA_PROBE)
 namespace probe = admissibility_cuda_probe;
 
+class ScopedProductionCudaFlag
+{
+public:
+  explicit ScopedProductionCudaFlag(const char* value)
+  {
+    const char* previous = std::getenv("IGRLAB_EULER_ADMISSIBILITY_CUDA");
+    present_ = previous != nullptr;
+    if (previous) { value_ = previous; }
+    MFEM_VERIFY(setenv("IGRLAB_EULER_ADMISSIBILITY_CUDA", value, 1) == 0,
+                "Cannot select the test-only device scan contract.");
+  }
+  ~ScopedProductionCudaFlag()
+  {
+    if (present_) { setenv("IGRLAB_EULER_ADMISSIBILITY_CUDA", value_.c_str(), 1); }
+    else { unsetenv("IGRLAB_EULER_ADMISSIBILITY_CUDA"); }
+  }
+private:
+  bool present_ = false;
+  std::string value_;
+};
+
 bool ProbeEnvironmentSupported()
 {
 #if defined(__SSE2__) && !defined(__FAST_MATH__)
@@ -939,6 +961,223 @@ void CheckCudaArithmeticPrototype(int& failures)
               << " sticky_exception_equivalence=unsupported\n";
   }
 }
+
+void CheckProductionCudaBudget(int& failures)
+{
+  namespace detail = mfem::igrlab::detail;
+  std::vector<detail::AdmissibilityElementMap> elements(1);
+  elements[0].dof = 1;
+  elements[0].vdofs.SetSize(4);
+  for (int j = 0; j < 4; ++j) { elements[0].vdofs[j] = j; }
+  std::vector<detail::AdmissibilityShapeTable> shapes(2);
+  for (auto& shape : shapes)
+  { shape.dof = 1; shape.points = 1; shape.values = {1.0}; }
+  std::vector<detail::AdmissibilityElementSamples> samples(1);
+  samples[0].volume_shape_table = 0;
+  samples[0].face_rules.push_back({0, 0}); // Repeated table, distinct occurrence.
+  constexpr std::size_t budget = 64u * 1024u * 1024u;
+  for (const auto points : {PointSet::Dof, PointSet::Limiter})
+  {
+    std::size_t charged = 0;
+    auto plan = detail::MakeAdmissibilityDevicePlan(
+      elements, shapes, samples, points, 4, budget, charged);
+    Check(plan && charged > 0 && charged <= budget,
+          "CUDA plan reports a bounded peak construction charge", MPI_COMM_WORLD, failures);
+    if (!plan || charged == 0 || charged > budget) { continue; }
+    plan.reset();
+    std::size_t offered_charge = 123;
+    plan = detail::MakeAdmissibilityDevicePlan(
+      elements, shapes, samples, points, 4, charged - 1, offered_charge);
+    Check(!plan && offered_charge == 0,
+          "CUDA plan declines one byte below its peak budget without charging",
+          MPI_COMM_WORLD, failures);
+    plan = detail::MakeAdmissibilityDevicePlan(
+      elements, shapes, samples, points, 4, charged, offered_charge);
+    Check(plan && offered_charge == charged,
+          "CUDA plan accepts its exact peak budget", MPI_COMM_WORLD, failures);
+    plan.reset();
+    if (points == PointSet::Dof)
+    {
+      plan = detail::MakeAdmissibilityDevicePlan(
+        elements, {}, {}, points, 4, charged, offered_charge);
+      Check(plan && offered_charge == charged,
+            "Dof plan peak budget excludes unrelated cached shape tables",
+            MPI_COMM_WORLD, failures);
+    }
+  }
+}
+
+void CheckProductionCudaScan(int& failures)
+{
+  if (!mfem::igrlab::detail::AdmissibilityOrdinaryCuda() ||
+      mfem::Mpi::WorldSize() != 1) { return; }
+  // The existing CXX/MFEM dot/EOS experiment is the prerequisite, rather than
+  // trusting a CUDA implementation that merely agrees with another CUDA one.
+  if (failures != 0 || !ProbeEnvironmentSupported()) { return; }
+  ScopedProductionCudaFlag enabled("1");
+  CheckProductionCudaBudget(failures);
+  int native_calls = 0;
+  Cache cache;
+  for (const int basis : {mfem::BasisType::GaussLegendre,
+                          mfem::BasisType::GaussLobatto})
+  {
+    for (const int order : {4, 5})
+    {
+      auto mesh = MakeMesh(2, 1);
+      mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
+      mfem::DG_FECollection fec(order, 2, basis);
+      mfem::ParFiniteElementSpace fes(&pmesh, &fec, 4, mfem::Ordering::byNODES);
+      mfem::Vector state(fes.GetVSize()); state.UseDevice(true);
+      for (const auto points : {PointSet::Dof, PointSet::Limiter, PointSet::Output})
+      {
+        for (int update = 0; update < 3; ++update)
+        {
+          const int n = fes.GetNDofs();
+          std::vector<double> input(state.Size());
+          for (int j = 0; j < n; ++j)
+          {
+            input[j] = update == 1 ? -0.125 :
+              (update == 2 ? 0.125 : 1.0 + 0.001 * (j + 1));
+            input[j + n] = update == 2 ? -0.0 : 0.02 + 0.0003 * j;
+            input[j + 2 * n] = update == 2 ? 0.0 : -0.015 - 0.0002 * j;
+            input[j + 3 * n] = update == 2 ? 2.0 : 2.5 + 0.002 * j;
+          }
+          probe::WriteDeviceState(state, input);
+          const double gamma = update == 2 ? 1.5 : 1.4;
+          const double rho_min = update == 2 ? 0.125 : 1.0e-10;
+          const double p_min = update == 2 ? 1.0 : 1.0e-10;
+          const std::vector<int> face_orders{2 * order + 1, 2 * order + 1,
+                                             -1, 2 * order + 3};
+          const auto actual = cache.Scan(fes, state, 2, gamma, rho_min, p_min,
+                                         0, face_orders, points);
+          Check(!state.GetMemory().HostIsValid(),
+                "production current-call CUDA summary avoids conservative HostRead",
+                fes.GetComm(), failures);
+          const auto expected = mfem::igrlab::ScanEulerAdmissibility(
+            fes, state, 2, gamma, rho_min, p_min, 0, face_orders, points);
+          Check(SameSummary(actual, expected),
+                "production compact CUDA p4/p5 summary preserves original bits/counts/order",
+                fes.GetComm(), failures);
+          ++native_calls;
+        }
+      }
+      // Unsupported arithmetic discards the whole provisional device result,
+      // before executing the original host scan on this same fresh state.
+      for (const double exceptional : {std::numeric_limits<double>::quiet_NaN(),
+          std::numeric_limits<double>::infinity(),
+          std::numeric_limits<double>::denorm_min(),
+          std::numeric_limits<double>::max(), std::numeric_limits<double>::min()})
+      {
+        const int n = fes.GetNDofs();
+        std::vector<double> input(state.Size(), 0.0);
+        for (int j = 0; j < n; ++j) { input[j] = 1.0; input[j + 3 * n] = 2.5; }
+        input[n] = exceptional; // min^2 rounds to zero; max^2 overflows.
+        for (const auto points : {PointSet::Dof, PointSet::Limiter, PointSet::Output})
+        {
+          probe::WriteDeviceState(state, input);
+          const auto actual = cache.Scan(fes, state, 2, 1.4, 1.0e-10, 1.0e-10,
+                                         0, {}, points);
+          Check(state.GetMemory().HostIsValid(),
+                "unsupported current arithmetic declines to complete original host scan",
+                fes.GetComm(), failures);
+          const auto expected = mfem::igrlab::ScanEulerAdmissibility(
+            fes, state, 2, 1.4, 1.0e-10, 1.0e-10, 0, {}, points);
+          Check(SameSummary(actual, expected),
+                "whole-call production fallback retains original exceptional diagnostics",
+                fes.GetComm(), failures);
+        }
+      }
+      // First signed-zero minima must come from the original earliest sample.
+      const int n = fes.GetNDofs();
+      std::vector<double> zeros(state.Size(), 0.0);
+      for (int j = 0; j < n; ++j)
+      { zeros[j] = j % 2 == 0 ? -0.0 : 0.0; zeros[j + 3 * n] = 2.5; }
+      probe::WriteDeviceState(state, zeros);
+      const auto actual_zero = cache.Scan(fes, state, 2, 1.0, 0.1, 0.1, 0, {}, PointSet::Dof);
+      Check(!state.GetMemory().HostIsValid(), "signed-zero Dof summary uses CUDA", fes.GetComm(), failures);
+      const auto expected_zero = mfem::igrlab::ScanEulerAdmissibility(
+        fes, state, 2, 1.0, 0.1, 0.1, 0, {}, PointSet::Dof);
+      Check(SameSummary(actual_zero, expected_zero),
+            "parallel compact min ties retain first signed zero and density-priority issue",
+            fes.GetComm(), failures);
+      ++native_calls;
+    }
+  }
+  // Reuse the original independent occurrence, rule-mutation, face-only issue,
+  // FES/mesh invalidation and generic-fallback fixtures under the new route.
+  CheckSpaces(failures);
+  CheckSampleContract(failures);
+  CheckDeviceAuthority(failures);
+
+  auto mesh = MakeMesh(2, 1);
+  mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
+  mfem::DG_FECollection fec(5, 2, mfem::BasisType::GaussLobatto);
+  mfem::ParFiniteElementSpace fes(&pmesh, &fec, 4, mfem::Ordering::byNODES);
+  mfem::Vector state(fes.GetVSize()); state.UseDevice(true);
+  Cache guarded;
+  std::fenv_t environment;
+  MFEM_VERIFY(std::fegetenv(&environment) == 0, "Cannot save test floating environment.");
+#if defined(__SSE2__)
+  const unsigned int csr = _mm_getcsr();
+#endif
+  MFEM_VERIFY(std::fesetround(FE_DOWNWARD) == 0, "Cannot select test rounding.");
+  probe::FillDeviceState(state, fes.GetNDofs(), 1.0, false);
+  const auto rounded = guarded.Scan(fes, state, 2, 1.4, 1.0e-10, 1.0e-10,
+                                    0, {}, PointSet::Dof);
+  const bool host_rounding = state.GetMemory().HostIsValid();
+  const auto original_rounded = mfem::igrlab::ScanEulerAdmissibility(
+    fes, state, 2, 1.4, 1.0e-10, 1.0e-10, 0, {}, PointSet::Dof);
+  const bool rounding_equal = SameSummary(rounded, original_rounded);
+  Cache unsupported_shapes;
+  probe::FillDeviceState(state, fes.GetNDofs(), 1.0, false);
+  unsupported_shapes.Scan(fes, state, 2, 1.4, 1.0e-10, 1.0e-10,
+                          0, {}, PointSet::Limiter);
+  std::fesetenv(&environment);
+  probe::FillDeviceState(state, fes.GetNDofs(), 1.0, false);
+  const auto unqualified = unsupported_shapes.Scan(fes, state, 2, 1.4,
+    1.0e-10, 1.0e-10, 0, {}, PointSet::Output);
+  const bool unqualified_host = state.GetMemory().HostIsValid();
+  Summary original_cached;
+  {
+    ScopedProductionCudaFlag disabled("0");
+    original_cached = unsupported_shapes.Scan(fes, state, 2, 1.4,
+      1.0e-10, 1.0e-10, 0, {}, PointSet::Output);
+  }
+  Check(unqualified_host && SameSummary(unqualified, original_cached),
+        "restored rounding does not qualify shared tables built in unsupported context",
+        fes.GetComm(), failures);
+#if defined(__SSE2__)
+  _mm_setcsr(csr | 0x8040u);
+  probe::FillDeviceState(state, fes.GetNDofs(), 1.0, false);
+  const auto flushed = guarded.Scan(fes, state, 2, 1.4, 1.0e-10, 1.0e-10,
+                                    0, {}, PointSet::Dof);
+  const bool host_flushing = state.GetMemory().HostIsValid();
+  const auto original_flushed = mfem::igrlab::ScanEulerAdmissibility(
+    fes, state, 2, 1.4, 1.0e-10, 1.0e-10, 0, {}, PointSet::Dof);
+  const bool flushing_equal = SameSummary(flushed, original_flushed);
+  _mm_setcsr(csr & ~(0x3fu | 0x80u));
+  probe::FillDeviceState(state, fes.GetNDofs(), 1.0, false);
+  const auto trapping = guarded.Scan(fes, state, 2, 1.4, 1.0e-10, 1.0e-10,
+                                     0, {}, PointSet::Dof);
+  const bool host_trapping = state.GetMemory().HostIsValid();
+  const auto original_trapping = mfem::igrlab::ScanEulerAdmissibility(
+    fes, state, 2, 1.4, 1.0e-10, 1.0e-10, 0, {}, PointSet::Dof);
+  const bool trapping_equal = SameSummary(trapping, original_trapping);
+  _mm_setcsr(csr);
+  Check(host_flushing && flushing_equal && host_trapping && trapping_equal,
+        "production FTZ/DAZ/trap contexts keep original host arithmetic",
+        fes.GetComm(), failures);
+#endif
+  Check(host_rounding && rounding_equal && ProbeEnvironmentSupported(),
+        "production non-nearest environment declines and caller context is restored",
+        fes.GetComm(), failures);
+  if (mfem::Mpi::Root())
+  {
+    std::cout << "[admissibility-cuda-production-proof] native_calls=" << native_calls
+              << " state_host_readback=0 original_summary_bitwise=required"
+              << " default_enabled=0 sticky_exception_equivalence=unsupported\n";
+  }
+}
 #endif
 } // namespace
 
@@ -950,6 +1189,9 @@ int main(int argc, char** argv)
   MFEM_VERIFY(backend == "cpu" || backend == "cuda", "Expected cpu or cuda.");
   mfem::Device device(backend.c_str());
   int failures = 0;
+#if defined(IGRLAB_ADMISSIBILITY_CUDA_PROBE)
+  ScopedProductionCudaFlag original_host_path("0");
+#endif
   CheckSpaces(failures);
   CheckSampleContract(failures);
   CheckInvalidStates(failures);
@@ -958,6 +1200,7 @@ int main(int argc, char** argv)
   CheckCommunicators(failures);
 #if defined(IGRLAB_ADMISSIBILITY_CUDA_PROBE)
   CheckCudaArithmeticPrototype(failures);
+  CheckProductionCudaScan(failures);
 #endif
   MPI_Allreduce(MPI_IN_PLACE, &failures, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
   if (mfem::Mpi::Root())

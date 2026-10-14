@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cfenv>
 #include <cmath>
 #include <limits>
 #include <new>
@@ -17,6 +18,11 @@
 
 #include "mfem.hpp"
 #include "physics/euler/eos.hpp"
+#include "utils/config/env_flags.hpp"
+#include "utils/diagnostics/detail/euler_admissibility_device.hpp"
+#if defined(__SSE2__)
+#include <xmmintrin.h>
+#endif
 
 /**
  * @file utils/diagnostics/euler_admissibility.hpp
@@ -190,6 +196,19 @@ struct AdmissibilityReferenceRule
   std::vector<std::array<mfem::real_t, 2>> points;
 };
 
+inline bool AdmissibilityNativeHostEnvironment()
+{
+#if defined(__SSE2__) && !defined(__FAST_MATH__)
+  const unsigned int csr = _mm_getcsr();
+  return std::numeric_limits<mfem::real_t>::is_iec559 &&
+    sizeof(mfem::real_t) == sizeof(double) &&
+    std::fegetround() == FE_TONEAREST && (csr & 0xe040u) == 0 &&
+    (csr & 0x1f80u) == 0x1f80u;
+#else
+  return false;
+#endif
+}
+
 class EulerAdmissibilityCache
 {
 public:
@@ -282,6 +301,10 @@ private:
     std::vector<AdmissibilityReferenceRule>().swap(reference_rules_);
     for (auto& plan : plans_)
     { std::vector<AdmissibilityElementSamples>().swap(plan); }
+    for (auto& plan : device_plans_) { plan.reset(); }
+    device_declined_.fill(false);
+    device_shape_environment_.fill(false);
+    device_shape_values_qualified_ = true;
     ready_.fill(false);
     declined_.fill(false);
     bytes_used_ = 0;
@@ -376,6 +399,11 @@ private:
     }
     const auto existing = shape_indices_.find(key);
     if (existing != shape_indices_.end()) { return existing->second; }
+    // Tables may be shared between point sets. One unsupported construction
+    // context conservatively keeps all interpolated scans on the host until
+    // the original cache generation is invalidated.
+    device_shape_values_qualified_ = device_shape_values_qualified_ &&
+                                      AdmissibilityNativeHostEnvironment();
 
     const int dof = fe.GetDof();
     ChargeProduct(points.size(), static_cast<std::size_t>(dof) *
@@ -415,6 +443,7 @@ private:
     auto& plan = plans_[slot];
     if (point_set == EulerAdmissibilityPointSet::Dof)
     {
+      device_shape_environment_[slot] = true; // No constructed shape arithmetic.
       ready_[slot] = true;
       return true;
     }
@@ -490,6 +519,9 @@ private:
           }
         }
       }
+      // A later change back to nearest rounding must not bless shape constants
+      // constructed in an unsupported caller environment.
+      device_shape_environment_[slot] = AdmissibilityNativeHostEnvironment();
       ready_[slot] = true;
       return true;
     }
@@ -522,6 +554,10 @@ private:
   std::array<std::vector<AdmissibilityElementSamples>, 3> plans_;
   std::array<bool, 3> ready_{};
   std::array<bool, 3> declined_{};
+  std::array<std::shared_ptr<AdmissibilityDevicePlan>, 3> device_plans_;
+  std::array<bool, 3> device_declined_{};
+  std::array<bool, 3> device_shape_environment_{};
+  bool device_shape_values_qualified_ = true;
 };
 
 inline EulerAdmissibilitySummary
@@ -821,6 +857,54 @@ inline EulerAdmissibilitySummary EulerAdmissibilityCache::Scan(
 {
   const bool prepared = Prepare(vfes, dim, quad_order, face_quad_orders, point_set);
   const bool dof_scan = point_set == EulerAdmissibilityPointSet::Dof;
+  // Explicit opt-in is a native compiled-arithmetic qualification contract,
+  // not a portable promise for an arbitrary MFEM binary or observable sticky
+  // exception flags. The original CXX/MFEM implementation remains the oracle.
+  if (prepared && AdmissibilityNativeHostEnvironment() &&
+      device_shape_environment_[static_cast<int>(point_set)] &&
+      (dof_scan || device_shape_values_qualified_) &&
+      v.Size() == vfes.GetVSize() &&
+      v.GetMemory().DeviceIsValid() &&
+      (basis_ == mfem::BasisType::GaussLegendre ||
+       basis_ == mfem::BasisType::GaussLobatto) &&
+      AdmissibilityOrdinaryCuda() &&
+      ::igrlab::EnvFlagEnabled("DG_IGR_EULER_ADMISSIBILITY_CUDA"))
+  {
+    int ranks = 0;
+    MPI_Comm_size(vfes.GetComm(), &ranks);
+    const int slot = static_cast<int>(point_set);
+    if (ranks == 1 && !device_declined_[slot])
+    {
+      if (!device_plans_[slot])
+      {
+        std::size_t charged = 0;
+        device_plans_[slot] = MakeAdmissibilityDevicePlan(
+          elements_, shape_tables_, plans_[slot], point_set, v.Size(),
+          byte_budget - bytes_used_, charged);
+        if (device_plans_[slot]) { Charge(charged); }
+        else { device_declined_[slot] = true; }
+      }
+      EulerAdmissibilitySummary local;
+      if (device_plans_[slot] && EvaluateAdmissibilityDevice(
+            *device_plans_[slot], v, gamma, rho_min, p_min, local))
+      {
+        EulerAdmissibilitySummary out;
+        out.first_local_issue = local.first_local_issue;
+        // Retain all five original communicator operations and their types.
+        MPI_Allreduce(&local.global_min_rho, &out.global_min_rho, 1,
+          mfem::MPITypeMap<double>::mpi_type, MPI_MIN, vfes.GetComm());
+        MPI_Allreduce(&local.global_min_pressure, &out.global_min_pressure, 1,
+          mfem::MPITypeMap<double>::mpi_type, MPI_MIN, vfes.GetComm());
+        MPI_Allreduce(&local.global_bad_rho, &out.global_bad_rho, 1,
+          mfem::MPITypeMap<int>::mpi_type, MPI_SUM, vfes.GetComm());
+        MPI_Allreduce(&local.global_bad_pressure, &out.global_bad_pressure, 1,
+          mfem::MPITypeMap<int>::mpi_type, MPI_SUM, vfes.GetComm());
+        out.first_bad_rank = FindFirstBadRank(out.first_local_issue.found,
+                                             vfes.GetComm());
+        return out;
+      }
+    }
+  }
   return ScanEulerAdmissibilityImpl(
     vfes, v, dim, gamma, rho_min, p_min, quad_order, face_quad_orders, point_set,
     prepared ? &elements_ : nullptr,
