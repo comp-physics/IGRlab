@@ -113,12 +113,17 @@ def discover_config(profile, spack=None, anchor=None, config=None, environ=None,
                   binary_build_provenance={key: node[key] for key in ("arch", "compiler", "annotations") if key in node})
     mpi_wrapper = executable(mpi, "mpicxx")
     ompi = executable(str(mpi_wrapper.parent / "ompi_info"), "ompi_info")
-    version = query([ompi, "--version"], run, environment)
+    # OPAL_BINDIR routes HPC-X's runtime daemon to its native binary.  It is
+    # not an installation change: omit it only from static ompi_info queries
+    # so runtime startup settings do not alter the retained package identity.
+    mpi_install_environment = dict(environment)
+    mpi_install_environment.pop("OPAL_BINDIR", None)
+    version = query([ompi, "--version"], run, mpi_install_environment)
     selected = config["profiles"][profile]
     match = re.search(r"Open MPI v?([0-9][0-9A-Za-z.]+)", version)
     require(match and match[1] == selected["mpi_version"],
             f"system OpenMPI must be {selected['mpi_version']}")
-    mpi_prefix = query([ompi, "--parsable", "--path", "prefix"], run, environment)
+    mpi_prefix = query([ompi, "--parsable", "--path", "prefix"], run, mpi_install_environment)
     match = re.search(r"^path:prefix:(.+)$", mpi_prefix, re.MULTILINE)
     require(match, "ompi_info must identify its real installation prefix")
     prefix = Path(match[1]).resolve(strict=True)
@@ -134,7 +139,7 @@ def discover_config(profile, spack=None, anchor=None, config=None, environ=None,
         require(actual and Path(actual).resolve() == compiler_tools[key].resolve(),
                 f"{name} must select the admitted GCC compiler; set OMPI_CC/CXX/FC")
         commands[name] = command
-    metadata = query([ompi, "--parsable", "--all"], run, environment)
+    metadata = query([ompi, "--parsable", "--all"], run, mpi_install_environment)
     require(re.search(r"mpi_built_with_cuda_support:value:(true|yes|1)$", metadata,
                       re.MULTILINE | re.IGNORECASE), "system OpenMPI does not report CUDA support")
     selected.update(mpi_prefix=str(prefix), mpi_wrapper=str(mpi_wrapper),

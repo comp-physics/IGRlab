@@ -355,6 +355,48 @@ class DeltaDiscovery(unittest.TestCase):
                 self.assertEqual(len(selected["mpi_metadata_sha256"]), 64)
         self.assertFalse(any(Path(c[0]).name == "spack" for c in self.queries))
 
+    def test_runtime_opal_bindir_does_not_change_static_installation_identity(self):
+        for profile in ("cpu", "cuda-sm80"):
+            with self.subTest(profile=profile):
+                environment = {"PATH": str(self.root / "gcc/bin"),
+                    "OPENBLAS_HOME": str(self.root / "openblas"),
+                    "OPAL_BINDIR": str(self.root / "mpi/bin/.bin"),
+                    "OMPI_CXX": str(self.tools["g++"])}
+                original_environment = dict(environment)
+                observed = []
+
+                def contextual_query(command, **kwargs):
+                    result = self.fake_query(command, **kwargs)
+                    observed.append((Path(command[0]).name, tuple(command[1:]),
+                                     dict(kwargs["env"])))
+                    if Path(command[0]).name == "ompi_info" and "--all" in command:
+                        # The real SDK reports its runtime override here.
+                        bindir = kwargs["env"].get("OPAL_BINDIR", str(self.root / "mpi/bin"))
+                        result.stdout += "\npath:bindir:" + bindir
+                    return result
+
+                def detect(env):
+                    return self.helper.discover_config(
+                        profile, anchor=self.tools["gcc"], cmake=self.tools["cmake"],
+                        cuda=self.tools["nvcc"], mpi=self.tools["mpicxx"],
+                        environ=env, run=contextual_query)
+
+                installed_environment = dict(environment)
+                installed_environment.pop("OPAL_BINDIR")
+                runtime_configuration = detect(environment)
+                runtime_observed = list(observed)
+                self.assertEqual(runtime_configuration, detect(installed_environment))
+                self.assertEqual(environment, original_environment)
+                static_queries = [env for name, args, env in observed if name == "ompi_info"]
+                self.assertEqual(len(static_queries), 6)
+                self.assertTrue(all("OPAL_BINDIR" not in env for env in static_queries))
+                wrapper_queries = [env for name, args, env in runtime_observed
+                                   if name in ("mpicc", "mpicxx", "mpifort")]
+                self.assertEqual(len(wrapper_queries), 3)
+                self.assertTrue(all(env.get("OPAL_BINDIR") == environment["OPAL_BINDIR"] and
+                                    env.get("OMPI_CXX") == environment["OMPI_CXX"]
+                                    for env in wrapper_queries))
+
     def test_wrong_versions_wrappers_and_unavailable_cuda_capability_reject(self):
         cases = [("gcc", ("-dumpfullversion", "-dumpversion"), "12.2.0"),
                  ("cmake", ("--version",), "cmake version 3.31.9"),
