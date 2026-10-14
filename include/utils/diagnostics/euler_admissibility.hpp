@@ -687,6 +687,10 @@ ScanEulerAdmissibilityImpl(const mfem::ParFiniteElementSpace& vfes,
 
     if (cached_samples)
     {
+      // Node scans can resize/write state. Acquire its output storage only
+      // afterwards, then reuse it for this element's cached quadrature points.
+      // The pointer overload keeps the dot product in the same MFEM routine.
+      mfem::real_t* state_data = state.HostWrite();
       const auto inspect_table = [&](int table_index, int face)
       {
         const auto& table = (*cached_shapes)[table_index];
@@ -695,7 +699,7 @@ ScanEulerAdmissibilityImpl(const mfem::ParFiniteElementSpace& vfes,
           // Same native shape values and MFEM summation as the reference scan.
           elmat.MultTranspose(
             table.values.data() + static_cast<std::size_t>(q) * dof,
-            state);
+            state_data);
           inspect_state(state, i, face, q, face >= 0, -1);
         }
       };

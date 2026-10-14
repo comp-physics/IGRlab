@@ -136,7 +136,7 @@ void CheckSpaces(int& failures)
   for (const int basis : {mfem::BasisType::GaussLegendre,
                           mfem::BasisType::GaussLobatto})
   {
-    for (const int order : {1, 3, 10})
+    for (const int order : {1, 3, 5, 10})
     {
       auto mesh = MakeMesh(2, ranks);
       mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
