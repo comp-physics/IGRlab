@@ -9,6 +9,23 @@ namespace igrlab
 namespace igr_internal
 {
 
+namespace
+{
+// NVCC extended lambdas need an addressable enclosing function.
+void SetupInverseDiagonal(int size,
+                          const mfem::Vector& diagonal,
+                          const mfem::Array<int>& essential_tdofs,
+                          mfem::Vector& inverse_diagonal)
+{
+  const auto D = diagonal.Read();
+  const auto X = inverse_diagonal.Write();
+  mfem::forall(size, [=] MFEM_HOST_DEVICE (int i) { X[i] = 1.0 / D[i]; });
+  const auto I = essential_tdofs.Read();
+  mfem::forall(essential_tdofs.Size(), [=] MFEM_HOST_DEVICE (int i)
+  { X[I[i]] = 1.0; });
+}
+} // namespace
+
 bool OwnedScratchChebyshev::HasCUDAKernels()
 {
 #if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
@@ -54,12 +71,7 @@ OwnedScratchChebyshev::OwnedScratchChebyshev(
   // across the application's changing closure operators.
   residual_.UseDevice(true);
   helper_.UseDevice(true);
-  const auto D = diagonal.Read();
-  const auto X = inverse_diagonal_.Write();
-  mfem::forall(size_, [=] MFEM_HOST_DEVICE (int i) { X[i] = 1.0 / D[i]; });
-  const auto I = essential_tdofs.Read();
-  mfem::forall(essential_tdofs.Size(), [=] MFEM_HOST_DEVICE (int i)
-  { X[I[i]] = 1.0; });
+  SetupInverseDiagonal(size_, diagonal, essential_tdofs, inverse_diagonal_);
 
   mfem::real_t upper_bound = 1.2 * max_eigenvalue;
   mfem::real_t lower_bound = 0.3 * max_eigenvalue;
