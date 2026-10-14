@@ -19,6 +19,10 @@ The same CUDA-aware system MPI serves both application profiles. CPU
 HYPRE/MFEM/application settings still disable CUDA. Spack must reuse these
 externals and builds the missing numerical dependencies in a private graph.
 It never writes the NCSA installation or queries/upgrades its shared database.
+Temporary Git clones use a private node-local directory under `SLURM_TMPDIR`
+or `/tmp`. This avoids copying Lustre ACL/stripe attributes from read-only Git
+pack files. Set `IGRLAB_DELTA_TMPDIR` to override the temporary base; dependency
+stages, caches and installations still stay in the selected site root.
 
 Install private Spack 1.2.2 and its pinned package repository under approved
 project/work storage. Git/Python source staging can happen on the login node;

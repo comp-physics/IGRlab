@@ -346,7 +346,16 @@ else
   python3 "$delta_script_dir/delta_manifest.py" --root "$delta_dependency_root" \
     --profile "$delta_profile" --recipe-root "$delta_recipe_root" --site-config - <<<"$delta_discovered"
 fi
-export TMPDIR="$delta_dependency_root/tmp" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 CTEST_PARALLEL_LEVEL=1
+delta_temp_base=${IGRLAB_DELTA_TMPDIR:-${SLURM_TMPDIR:-/tmp}}
+[[ $delta_temp_base == /* && -d $delta_temp_base && -w $delta_temp_base ]] || \
+  delta_fail "temporary root must be an existing writable absolute directory"
+# Python copy2 preserves extended attributes. Git's read-only pack files on
+# Lustre carry ACL/stripe attributes that cannot be copied back to Lustre.
+# Clone temporary Git sources on node-local storage; retain the dependency
+# stage, cache, installation and concrete graph under the selected site root.
+export TMPDIR
+TMPDIR=$(mktemp -d "$delta_temp_base/igrlab-delta-${SLURM_JOB_ID}-${delta_profile}.XXXXXXXX")
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 CTEST_PARALLEL_LEVEL=1
 if [[ $delta_tests_only == 1 ]]; then
   [[ -d $TMPDIR && -d $SPACK_SYSTEM_CONFIG_PATH ]] || delta_fail "missing retained runtime directories for --tests-only"
 else
