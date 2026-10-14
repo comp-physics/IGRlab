@@ -1,15 +1,21 @@
 #include "igrlab/compat.hpp"
 #include "mfem.hpp"
-#include "mfem/general/forall.hpp"
 #include "utils/diagnostics/euler_admissibility.hpp"
+#if defined(IGRLAB_ADMISSIBILITY_CUDA_PROBE)
+#include "test_euler_admissibility_cache_cuda.hpp"
+#endif
 
 #include <algorithm>
+#include <cfenv>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <string>
 #include <vector>
+#if defined(__SSE2__)
+#include <xmmintrin.h>
+#endif
 
 namespace
 {
@@ -418,14 +424,26 @@ void CheckDeviceAuthority(int& failures)
       {
         const double rho = update == 0 ? 0.125 : 1.0;
         const double invalid = std::numeric_limits<double>::quiet_NaN();
-        double* data = state.Write();
-        mfem::forall(ndofs, [=] MFEM_HOST_DEVICE(int d)
+        if (mfem::Device::Allows(mfem::Backend::CUDA))
         {
-          data[d] = rho;
-          data[d + ndofs] = update == 2 && d == 0 ? invalid : 0.0;
-          data[d + 2 * ndofs] = -0.0;
-          data[d + 3 * ndofs] = 2.5;
-        });
+#if defined(IGRLAB_ADMISSIBILITY_CUDA_PROBE)
+          admissibility_cuda_probe::FillDeviceState(state, ndofs, rho,
+                                                    update == 2);
+#else
+          MFEM_ABORT("CUDA authority fixture requires its CUDA helper.");
+#endif
+        }
+        else
+        {
+          double* data = state.HostWrite();
+          for (int d = 0; d < ndofs; ++d)
+          {
+            data[d] = rho;
+            data[d + ndofs] = update == 2 && d == 0 ? invalid : 0.0;
+            data[d + 2 * ndofs] = -0.0;
+            data[d + 3 * ndofs] = 2.5;
+          }
+        }
         if (mfem::Device::Allows(mfem::Backend::CUDA))
         {
           Check(!state.GetMemory().HostIsValid(),
@@ -535,6 +553,393 @@ void CheckCommunicators(int& failures)
   }
   MPI_Comm_free(&subcomm);
 }
+
+#if defined(IGRLAB_ADMISSIBILITY_CUDA_PROBE)
+namespace probe = admissibility_cuda_probe;
+
+bool ProbeEnvironmentSupported()
+{
+#if defined(__SSE2__) && !defined(__FAST_MATH__)
+  const unsigned int csr = _mm_getcsr();
+  return std::numeric_limits<double>::is_iec559 && sizeof(double) == 8 &&
+    std::fegetround() == FE_TONEAREST && (csr & 0xe040u) == 0 &&
+    (csr & 0x1f80u) == 0x1f80u;
+#else
+  return false;
+#endif
+}
+
+struct ProbePlan
+{
+  std::vector<int> maps;
+  std::vector<double> shapes;
+  std::vector<probe::Sample> samples;
+};
+
+ProbePlan MakeProbePlan(mfem::ParFiniteElementSpace& fes, PointSet points,
+                        int qorder = 0,
+                        const std::vector<int>& face_orders = {})
+{
+  ProbePlan plan;
+  const int order = fes.GetFE(0)->GetOrder();
+  const int base = qorder > 0 ? qorder : 2 * order + 2;
+  const int scan_order = points == PointSet::Output ?
+    std::max(base + 2, 2 * order + 4) : base;
+  auto face_qorders = mfem::igrlab::detail::BuildFaceQuadratureOrdersForAdmissibility(
+    fes, scan_order, face_orders);
+  if (points == PointSet::Output)
+  {
+    for (int& q : face_qorders) { q = std::max(q + 2, 2 * order + 3); }
+    std::sort(face_qorders.begin(), face_qorders.end());
+    face_qorders.erase(std::unique(face_qorders.begin(), face_qorders.end()),
+                      face_qorders.end());
+  }
+  const auto& faces = mfem::igrlab::detail::GetElementFacesForAdmissibility(
+    *fes.GetMesh());
+  const auto* l2 = dynamic_cast<const mfem::L2_FECollection*>(fes.FEColl());
+  MFEM_VERIFY(l2 && fes.GetVDim() == 4 && fes.GetMesh()->Dimension() == 2,
+              "The test prototype expects a 2D Euler L2 space.");
+  const bool nodes = l2->GetBasisType() == mfem::BasisType::GaussLobatto;
+  for (int e = 0; e < fes.GetNE(); ++e)
+  {
+    const auto* fe = fes.GetFE(e);
+    const int dof = fe->GetDof();
+    const int map_offset = static_cast<int>(plan.maps.size());
+    mfem::Array<int> vdofs;
+    fes.GetElementVDofs(e, vdofs);
+    plan.maps.insert(plan.maps.end(), vdofs.HostRead(),
+                     vdofs.HostRead() + vdofs.Size());
+    if (points == PointSet::Dof || nodes)
+    {
+      for (int j = 0; j < dof; ++j)
+      { plan.samples.push_back({dof, map_offset, -1, j, e, -1, j}); }
+    }
+    if (points == PointSet::Dof) { continue; }
+    const auto append = [&](const mfem::IntegrationPoint& point, int face, int q)
+    {
+      mfem::Vector shape(dof);
+      fe->CalcShape(point, shape);
+      const int offset = static_cast<int>(plan.shapes.size());
+      plan.shapes.insert(plan.shapes.end(), shape.HostRead(),
+                        shape.HostRead() + dof);
+      plan.samples.push_back({dof, map_offset, offset, -1, e, face, q});
+    };
+    auto* transform = fes.GetElementTransformation(e);
+    const auto& volume = mfem::IntRules.Get(transform->GetGeometryType(), scan_order);
+    for (int q = 0; q < volume.GetNPoints(); ++q)
+    { append(volume.IntPoint(q), -1, q); }
+    for (int face : faces[e])
+    {
+      auto* ft = fes.GetMesh()->GetFaceElementTransformations(face);
+      if (!ft) { continue; }
+      int e1 = -1, e2 = -1;
+      fes.GetMesh()->GetFaceElements(face, &e1, &e2);
+      const bool first = e1 == e;
+      if (!first && e2 != e) { continue; }
+      for (int face_order : face_qorders)
+      {
+        const auto& rule = mfem::IntRules.Get(ft->GetGeometryType(), face_order);
+        for (int q = 0; q < rule.GetNPoints(); ++q)
+        {
+          ft->SetAllIntPoints(&rule.IntPoint(q));
+          append(first ? ft->GetElement1IntPoint() : ft->GetElement2IntPoint(),
+                 face, q);
+        }
+      }
+    }
+  }
+  return plan;
+}
+
+probe::Value OriginalSample(const ProbePlan& plan, const probe::Sample& sample,
+                            const mfem::Vector& state, double gamma,
+                            double rho_min, double p_min)
+{
+  mfem::Array<int> map(4 * sample.dof);
+  std::copy_n(plan.maps.data() + sample.map_offset, map.Size(), map.HostWrite());
+  mfem::Vector element;
+  state.GetSubVector(map, element);
+  mfem::DenseMatrix matrix(element.GetData(), sample.dof, 4);
+  mfem::Vector value(4);
+  if (sample.shape_offset < 0) { matrix.GetRow(sample.node, value); }
+  else
+  {
+    // This calls the original compiled MFEM host pointer/pointer routine.
+    matrix.MultTranspose(plan.shapes.data() + sample.shape_offset, value.HostWrite());
+  }
+  probe::Value out{};
+  std::copy_n(value.HostRead(), 4, out.state);
+  bool finite = true;
+  for (int eq = 0; eq < 4; ++eq) { finite = finite && std::isfinite(value(eq)); }
+  double momentum_squared = 0.0;
+  for (int d = 0; d < 2; ++d)
+  { momentum_squared += value(1 + d) * value(1 + d); }
+  out.kinetic = 0.5 * momentum_squared / std::max(value(0), 1.0e-16);
+  out.pressure = mfem::EulerPressureFromConservative(value, 2, gamma, 1.0e-16);
+  out.bad_rho = !std::isfinite(value(0)) || value(0) < rho_min;
+  out.bad_pressure = !finite || !std::isfinite(out.kinetic) ||
+    !std::isfinite(out.pressure) || out.pressure < p_min;
+  return out;
+}
+
+Summary ProbeGlobalSummary(const ProbePlan& plan, const probe::Result& result,
+                           MPI_Comm comm)
+{
+  MFEM_VERIFY(!result.summary.declined && !result.environment_declined &&
+                !result.sticky_flags_declined,
+              "A declined prototype cannot publish partial summaries.");
+  Summary out;
+  double rho = result.summary.min_rho, pressure = result.summary.min_pressure;
+  int bad_rho = result.summary.bad_rho, bad_pressure = result.summary.bad_pressure;
+  MPI_Allreduce(&rho, &out.global_min_rho, 1, MPI_DOUBLE, MPI_MIN, comm);
+  MPI_Allreduce(&pressure, &out.global_min_pressure, 1, MPI_DOUBLE, MPI_MIN, comm);
+  MPI_Allreduce(&bad_rho, &out.global_bad_rho, 1, MPI_INT, MPI_SUM, comm);
+  MPI_Allreduce(&bad_pressure, &out.global_bad_pressure, 1, MPI_INT, MPI_SUM, comm);
+  if (result.summary.first_sample >= 0)
+  {
+    const int index = result.summary.first_sample;
+    const auto& sample = plan.samples[index];
+    const auto& value = result.values[index];
+    out.first_local_issue = {true, !value.bad_rho && value.bad_pressure,
+      sample.face >= 0, sample.element, sample.face, sample.point,
+      sample.shape_offset < 0 ? sample.node : -1, value.state[0], value.pressure};
+  }
+  out.first_bad_rank = mfem::igrlab::detail::FindFirstBadRank(
+    out.first_local_issue.found, comm);
+  return out;
+}
+
+void CheckCudaArithmeticPrototype(int& failures)
+{
+  if (!mfem::Device::Allows(mfem::Backend::CUDA)) { return; }
+  Check(ProbeEnvironmentSupported(),
+        "native thread admits the bounded nearest-even prototype", MPI_COMM_WORLD,
+        failures);
+  if (!ProbeEnvironmentSupported()) { return; }
+  int admitted_cases = 0, decline_cases = 0;
+  for (int basis : {mfem::BasisType::GaussLegendre, mfem::BasisType::GaussLobatto})
+  {
+    for (int order : {4, 5}) // Odd/even original dot lengths, not a performance sweep.
+    {
+      auto mesh = MakeMesh(2, mfem::Mpi::WorldSize());
+      mfem::ParMesh pmesh(MPI_COMM_WORLD, mesh);
+      mfem::DG_FECollection fec(order, 2, basis);
+      mfem::ParFiniteElementSpace fes(&pmesh, &fec, 4, mfem::Ordering::byNODES);
+      mfem::Vector state(fes.GetVSize()); state.UseDevice(true);
+      for (auto points : {PointSet::Dof, PointSet::Limiter, PointSet::Output})
+      {
+        // Distinct rule occurrences must not disappear when points coincide.
+        const std::vector<int> face_orders{7, 7, -3, 9, 10};
+        const auto plan = MakeProbePlan(fes, points, 0, face_orders);
+        for (int update = 0; update < 3; ++update)
+        {
+          std::vector<double> input(state.Size());
+          const int n = fes.GetNDofs();
+          for (int j = 0; j < n; ++j)
+          {
+            input[j] = update == 1 ? -0.125 :
+              (update == 2 ? 0.125 : 1.0 + 0.001 * (j + 1));
+            input[j + n] = update == 2 ? -0.0 : 0.02 + 0.0003 * j;
+            input[j + 2 * n] = update == 2 ? 0.0 : -0.015 - 0.0002 * j;
+            input[j + 3 * n] = update == 2 ? 2.0 : 2.5 + 0.002 * j;
+          }
+          probe::WriteDeviceState(state, input);
+          Check(!state.GetMemory().HostIsValid(),
+                "prototype begins before original host synchronization", fes.GetComm(), failures);
+          const double gamma = update == 2 ? 1.5 : 1.4;
+          const double rho_min = update == 2 ? 0.125 : 1.0e-10;
+          const double p_min = update == 2 ? 1.0 : 1.0e-10;
+          const auto actual = probe::Evaluate(state, plan.maps, plan.shapes, plan.samples,
+            gamma, rho_min, p_min, ProbeEnvironmentSupported());
+          Check(!state.GetMemory().HostIsValid(),
+                "test CUDA evaluator leaves conservative state device-authoritative",
+                fes.GetComm(), failures);
+          const auto expected = mfem::igrlab::ScanEulerAdmissibility(
+            fes, state, 2, gamma, rho_min, p_min, 0, face_orders, points);
+          Check(!actual.summary.declined, "ordinary p4/p5 proof cases are evaluated",
+                fes.GetComm(), failures);
+          if (actual.summary.declined) { ++decline_cases; continue; }
+          bool same_values = actual.values.size() == plan.samples.size();
+          for (std::size_t i = 0; i < actual.values.size(); ++i)
+          {
+            const auto reference = OriginalSample(plan, plan.samples[i], state,
+                                                  gamma, rho_min, p_min);
+            const auto& candidate = actual.values[i];
+            same_values = same_values &&
+              std::memcmp(reference.state, candidate.state, sizeof(reference.state)) == 0 &&
+              SameDouble(reference.kinetic, candidate.kinetic) &&
+              SameDouble(reference.pressure, candidate.pressure) &&
+              reference.bad_rho == candidate.bad_rho &&
+              reference.bad_pressure == candidate.bad_pressure;
+          }
+          Check(same_values, "CUDA samplewise original dot/EOS bits: p=" +
+            std::to_string(order) + " update=" + std::to_string(update),
+            fes.GetComm(), failures);
+          Check(SameSummary(ProbeGlobalSummary(plan, actual, fes.GetComm()), expected),
+                "ordered CUDA summary retains original counts/minima/first issue",
+                fes.GetComm(), failures);
+          ++admitted_cases;
+        }
+
+        // Mixed exceptional data must discard every provisional GPU summary.
+        // The unchanged host routine then retains its complete issue/minimum
+        // semantics; the ordinary host cache is an independent parity check.
+        for (double exceptional : {std::numeric_limits<double>::quiet_NaN(),
+                                    std::numeric_limits<double>::max()})
+        {
+          std::vector<double> input(state.Size(), 0.0);
+          const int n = fes.GetNDofs();
+          for (int j = 0; j < n; ++j)
+          { input[j] = 1.0; input[j + 3 * n] = 2.5; }
+          input[n] = exceptional;
+          probe::WriteDeviceState(state, input);
+          const auto rejected = probe::Evaluate(state, plan.maps, plan.shapes,
+            plan.samples, 1.4, 1.0e-10, 1.0e-10, ProbeEnvironmentSupported());
+          Check(rejected.summary.declined != 0,
+                "mixed exceptional state declines the whole test call",
+                fes.GetComm(), failures);
+          const auto fallback = mfem::igrlab::ScanEulerAdmissibility(
+            fes, state, 2, 1.4, 1.0e-10, 1.0e-10, 0, face_orders, points);
+          Cache host_cache;
+          const auto cached = host_cache.Scan(fes, state, 2, 1.4, 1.0e-10,
+                                              1.0e-10, 0, face_orders, points);
+          Check(SameSummary(fallback, cached),
+                "discarded prototype uses the original complete host summary",
+                fes.GetComm(), failures);
+          ++decline_cases;
+        }
+      }
+    }
+  }
+
+  // Directed arithmetic fixtures do not assume normal inputs imply normal
+  // products, ordered partial sums, or EOS intermediates.
+  ProbePlan directed;
+  directed.maps = {0, 1, 2, 3, 4, 5, 6, 7};
+  directed.shapes = {1.0, 1.0};
+  directed.samples = {{2, 0, 0, -1, 0, -1, 0}};
+  mfem::Vector state(8); state.UseDevice(true);
+  const auto expect_decline = [&](std::vector<double> input,
+                                   std::vector<double> shapes,
+                                   const std::string& label)
+  {
+    probe::WriteDeviceState(state, input);
+    const auto actual = probe::Evaluate(state, directed.maps, shapes, directed.samples,
+                                        1.4, 1.0e-10, 1.0e-10, true);
+    Check(actual.summary.declined != 0, label, MPI_COMM_WORLD, failures);
+    ++decline_cases;
+  };
+  expect_decline({0x1p-1022, 1.0, 0.0, 0.0, 0.0, 0.0, 2.5, 0.0},
+                 {0.5, 0.0}, "normal operands/subnormal product decline");
+  expect_decline({0x1p-1022, 1.0, 0.0, 0.0, 0.0, 0.0, 2.5, 0.0},
+                 {0x1p-1022, 0.0}, "normal operands/product rounded to zero decline");
+  expect_decline({0x1.0000000000001p-1022, -0x1p-1022, 0.0, 0.0,
+                  0.0, 0.0, 2.5, 0.0}, {1.0, 1.0},
+                 "normal operands/subnormal ordered sum decline");
+  expect_decline({std::numeric_limits<double>::max(), 1.0, 0.0, 0.0,
+                  0.0, 0.0, 2.5, 0.0}, {2.0, 0.0},
+                 "normal operands/overflow decline");
+  expect_decline({1.0, 0.0, 0x1p-1022, 0.0, 0.0, 0.0, 2.5, 0.0},
+                 {1.0, 0.0}, "normal momentum/EOS product rounded to zero decline");
+  expect_decline({1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0x1p-1022, 0.0},
+                 {1.0, 0.0}, "normal energy/subnormal EOS pressure decline");
+  expect_decline({std::numeric_limits<double>::max(), 0.0, 1.0, 0.0,
+                  0.0, 0.0, 2.5, 0.0}, {1.0, 0.0},
+                 "normal state/subnormal EOS division decline");
+  for (double exceptional : {std::numeric_limits<double>::denorm_min(),
+                              std::numeric_limits<double>::infinity(),
+                              std::numeric_limits<double>::quiet_NaN()})
+  {
+    expect_decline({exceptional, 1.0, 0.0, 0.0, 0.0, 0.0, 2.5, 0.0},
+                   {1.0, 0.0}, "subnormal/nonfinite input decline");
+  }
+  // Unlike an FMA, the original -1 + round(a*b) is exactly +0.
+  std::vector<double> cancellation{-1.0, 0x1.0000002p0, 0.0, 0.0,
+                                    0.0, 0.0, 3.0, 0.0};
+  directed.shapes = {1.0, 0x1.ffffffcp-1};
+  probe::WriteDeviceState(state, cancellation);
+  const auto separate = probe::Evaluate(state, directed.maps, directed.shapes,
+    directed.samples, 1.4, 1.0e-10, 1.0e-10, true);
+  const auto host_value = OriginalSample(directed, directed.samples[0], state,
+                                          1.4, 1.0e-10, 1.0e-10);
+  Check(!separate.summary.declined && SameDouble(separate.values[0].state[0],
+        host_value.state[0]) && SameDouble(host_value.state[0], 0.0),
+        "FMA-sensitive cancellation follows original separate products/adds",
+        MPI_COMM_WORLD, failures);
+  ++admitted_cases;
+
+  ProbePlan signed_nodes = directed;
+  signed_nodes.maps[0] = -1; // Encode negation of an input +0, not abs(index).
+  signed_nodes.samples = {{2, 0, -1, 0, 0, -1, 0},
+                           {2, 0, -1, 1, 0, -1, 1}};
+  probe::WriteDeviceState(state, {0.0, 0.0, -0.0, 0.0, 0.0, -0.0, 2.5, 2.5});
+  const auto signed_result = probe::Evaluate(state, signed_nodes.maps,
+    signed_nodes.shapes, signed_nodes.samples, 1.4, 1.0e-10, 1.0e-10, true);
+  bool signed_same = !signed_result.summary.declined &&
+    SameDouble(signed_result.summary.min_rho, -0.0) &&
+    signed_result.summary.first_sample == 0 && signed_result.summary.bad_rho == 2;
+  for (std::size_t i = 0; i < signed_nodes.samples.size(); ++i)
+  {
+    const auto expected = OriginalSample(signed_nodes, signed_nodes.samples[i],
+                                          state, 1.4, 1.0e-10, 1.0e-10);
+    const auto& actual = signed_result.values[i];
+    signed_same = signed_same &&
+      std::memcmp(expected.state, actual.state, sizeof(expected.state)) == 0 &&
+      SameDouble(expected.pressure, actual.pressure);
+  }
+  Check(signed_same, "signed maps and first signed-zero minimum retain original bits",
+        MPI_COMM_WORLD, failures);
+  ++admitted_cases;
+
+  const auto sticky = probe::Evaluate(state, directed.maps, directed.shapes,
+    directed.samples, 1.4, 1.0e-10, 1.0e-10, true, true);
+  Check(sticky.sticky_flags_declined && sticky.values.empty(),
+        "arbitrary sticky exception equivalence is explicitly unsupported",
+        MPI_COMM_WORLD, failures);
+  ++decline_cases;
+  std::fenv_t environment;
+  MFEM_VERIFY(std::fegetenv(&environment) == 0,
+              "Cannot save the native test floating environment.");
+#if defined(__SSE2__)
+  const unsigned int original_csr = _mm_getcsr();
+#endif
+  MFEM_VERIFY(std::fesetround(FE_DOWNWARD) == 0,
+              "Cannot select the directed test rounding mode.");
+  const auto rounded = probe::Evaluate(state, directed.maps, directed.shapes,
+    directed.samples, 1.4, 1.0e-10, 1.0e-10, ProbeEnvironmentSupported());
+  const bool rounding_declined = rounded.environment_declined && rounded.values.empty();
+  std::fesetenv(&environment);
+#if defined(__SSE2__)
+  _mm_setcsr(original_csr | 0x8040u); // Test-only FTZ/DAZ change, restored below.
+  const auto flushed = probe::Evaluate(state, directed.maps, directed.shapes,
+    directed.samples, 1.4, 1.0e-10, 1.0e-10, ProbeEnvironmentSupported());
+  const bool flushing_declined = flushed.environment_declined && flushed.values.empty();
+  // Earlier exceptional host oracles may have set sticky status bits. Clear
+  // those only in this temporary fixture before unmasking invalid traps.
+  _mm_setcsr(original_csr & ~(0x3fu | 0x80u));
+  const auto trapping = probe::Evaluate(state, directed.maps, directed.shapes,
+    directed.samples, 1.4, 1.0e-10, 1.0e-10, ProbeEnvironmentSupported());
+  const bool trapping_declined = trapping.environment_declined && trapping.values.empty();
+  _mm_setcsr(original_csr);
+  Check(flushing_declined && trapping_declined,
+        "FTZ/DAZ and unmasked trap environments decline before CUDA arithmetic",
+        MPI_COMM_WORLD, failures);
+  decline_cases += 2;
+#endif
+  Check(rounding_declined && ProbeEnvironmentSupported(),
+        "non-nearest environment declines and caller environment is restored",
+        MPI_COMM_WORLD, failures);
+  ++decline_cases;
+  if (mfem::Mpi::Root())
+  {
+    std::cout << "[admissibility-cuda-prototype] scope=test-only"
+              << " admitted_cases=" << admitted_cases
+              << " decline_cases=" << decline_cases
+              << " production_enabled=0 portable_arithmetic_claim=0"
+              << " sticky_exception_equivalence=unsupported\n";
+  }
+}
+#endif
 } // namespace
 
 int main(int argc, char** argv)
@@ -551,6 +956,9 @@ int main(int argc, char** argv)
   CheckDeviceAuthority(failures);
   CheckSignedHostGather(failures);
   CheckCommunicators(failures);
+#if defined(IGRLAB_ADMISSIBILITY_CUDA_PROBE)
+  CheckCudaArithmeticPrototype(failures);
+#endif
   MPI_Allreduce(MPI_IN_PLACE, &failures, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
   if (mfem::Mpi::Root())
   {

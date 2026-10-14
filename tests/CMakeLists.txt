@@ -278,6 +278,9 @@ endif()
 
 add_executable(dg_igr_euler_admissibility_cache_test
   test_euler_admissibility_cache.cpp)
+# Keep the original MFEM/EOS oracle and the actual helper caller in CXX.
+set_source_files_properties(test_euler_admissibility_cache.cpp PROPERTIES
+  LANGUAGE CXX)
 target_link_libraries(dg_igr_euler_admissibility_cache_test PRIVATE igr_mfem mfem)
 target_include_directories(dg_igr_euler_admissibility_cache_test PRIVATE
   ${CMAKE_SOURCE_DIR}/include)
@@ -301,8 +304,10 @@ add_test(NAME dg_igr_euler_admissibility_cache_cpu
 set_tests_properties(dg_igr_euler_admissibility_cache_cpu PROPERTIES
   LABELS "admissibility;cache;parity;cpu" TIMEOUT 120)
 if(DG_IGR_ACCELERATOR_LANGUAGE STREQUAL "CUDA" AND MFEM_USE_CUDA)
-  set_source_files_properties(test_euler_admissibility_cache.cpp PROPERTIES
-    LANGUAGE CUDA)
+  target_sources(dg_igr_euler_admissibility_cache_test PRIVATE
+    test_euler_admissibility_cache_cuda.cu)
+  target_compile_definitions(dg_igr_euler_admissibility_cache_test PRIVATE
+    IGRLAB_ADMISSIBILITY_CUDA_PROBE=1)
   target_compile_options(dg_igr_euler_admissibility_cache_test PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda;--expt-relaxed-constexpr>)
   add_test(NAME dg_igr_euler_admissibility_cache_cuda
