@@ -621,5 +621,121 @@ class DeltaTestReceipt(unittest.TestCase):
                 helper.test_outcomes(stdout, graph)
 
 
+class DeltaCounterTestReceipt(unittest.TestCase):
+    """Actual scheduler-shaped replies; no allocations or native tests run."""
+
+    def allocation(self, *, parent=None, step=None, environment=None, host=None,
+                   nodes=None, gpu_row=None, step_returncode=0):
+        helper = load_helper("test_result_receipt")
+        fields = {"JobId": "7001", "JobState": "RUNNING", "Account": "bdiy-delta-gpu",
+            "Partition": "gpuA100x4", "BatchFlag": "0", "NumCPUs": "64",
+            "NumTasks": "1", "NumNodes": "1", "NodeList": "gpua075",
+            "UserId": f"{pwd.getpwuid(os.getuid()).pw_name}({os.getuid()})",
+            "AllocTRES": "cpu=64,mem=48G,node=1,billing=4000,gres/gpu=4",
+            "ReqTRES": "cpu=8,mem=48G,node=1,billing=1000,gres/gpu=1",
+            "Features": "perf&nvperf"}
+        fields.update(parent or {})
+        actual_step = {"StepId": "7001.3", "UserId": str(os.getuid()), "State": "RUNNING",
+            "Partition": "gpuA100x4", "Nodes": "1", "CPUs": "8", "Tasks": "1",
+            "NodeList": "gpua075", "TRES": "cpu=8,mem=48G,node=1,gres/gpu=1"}
+        actual_step.update(step or {})
+        env = {"SLURM_JOB_ID": "7001", "SLURM_JOB_ACCOUNT": "bdiy-delta-gpu",
+            "SLURM_JOB_PARTITION": "gpuA100x4", "SLURM_JOB_GPUS": "0,1,2,3",
+            "SLURM_STEP_GPUS": "3", "CUDA_VISIBLE_DEVICES": "0",
+            "DELTA_OWNED_STEP_ID": "3"}
+        env.update(environment or {})
+        render = lambda value: " ".join(f"{key}={item}" for key, item in value.items())
+        def query(argv, **kwargs):
+            if argv == ["scontrol", "show", "job", "-o", "7001"]:
+                stdout, code = render(fields), 0
+            elif argv == ["scontrol", "show", "step", "-o", "7001.3"]:
+                stdout, code = render(actual_step), step_returncode
+            elif argv == ["scontrol", "show", "hostnames", fields["NodeList"]]:
+                stdout, code = "gpua075\n" if nodes is None else nodes, 0
+            elif argv == ["nvidia-smi", "--query-gpu=uuid,name,compute_cap", "--format=csv,noheader"]:
+                stdout, code = gpu_row or "GPU-12345678-abcd-abcd-abcd-123456789abc, NVIDIA A100-SXM4-40GB, 8.0\n", 0
+            else:
+                self.fail(f"unexpected query: {argv}")
+            return SimpleNamespace(returncode=code, stdout=stdout, stderr="")
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch("socket.getfqdn", return_value=host or "gpua075.delta.ncsa.illinois.edu"), \
+             mock.patch.object(helper.subprocess, "run", side_effect=query) as calls:
+            value = helper.allocation({"policy": {"site": "delta", "profile": "cuda-sm80"}})
+        return value, calls.call_args_list
+
+    def test_counter_parent_and_actual_single_gpu_step_remain_separate(self):
+        value, calls = self.allocation()
+        self.assertIn("gres/gpu=4", value["scheduler"]["fields"]["AllocTRES"])
+        self.assertEqual(value["scheduler"]["fields"]["NumCPUs"], "64")
+        self.assertEqual(value["step"]["step_id"], "7001.3")
+        self.assertEqual(value["step"]["scheduler"]["fields"]["CPUs"], "8")
+        self.assertIn("gres/gpu=1", value["step"]["scheduler"]["fields"]["TRES"])
+        self.assertEqual(value["step"]["selector_environment"]["DELTA_OWNED_STEP_ID"], "3")
+        self.assertEqual(value["environment"]["SLURM_JOB_GPUS"], "0,1,2,3")
+        self.assertEqual(value["environment"]["SLURM_STEP_GPUS"], "3")
+        self.assertEqual(len(calls), 4)
+
+    def test_actual_native_step_id_also_admitted_before_mpi_routing_unset(self):
+        for env in ({"DELTA_OWNED_STEP_ID": "", "SLURM_STEP_ID": "3"},
+                    {"DELTA_OWNED_STEP_ID": "", "SLURM_STEPID": "3"},
+                    {"SLURM_STEP_ID": "3", "SLURM_STEPID": "3"}):
+            with self.subTest(environment=env):
+                value, _ = self.allocation(environment=env)
+                self.assertEqual(value["step"]["step_id"], "7001.3")
+
+    def test_counter_parent_requires_exact_request_reservation_and_features(self):
+        for parent in ({"AllocTRES": "cpu=64,mem=48G,gres/gpu=2"},
+                       {"AllocTRES": "cpu=64,mem=48G,gres/gpu=4,gres/gpu=4"},
+                       {"AllocTRES": "cpu=64,mem=48G,gres/gpu=4,gres/gpu:h100=4"},
+                       {"ReqTRES": "cpu=64,mem=48G,gres/gpu=4"},
+                       {"ReqTRES": "cpu=8,mem=96G,gres/gpu=1"},
+                       {"NumCPUs": "32"}, {"NumTasks": "4"}, {"NumNodes": "2"},
+                       {"Features": "perf"}, {"Features": "nvperf"},
+                       {"UserId": "unowned(999)"}, {"Account": "other"},
+                       {"JobState": "COMPLETED"}):
+            with self.subTest(parent=parent), self.assertRaises(ValueError):
+                self.allocation(parent=parent)
+
+    def test_actual_step_rejects_foreign_ended_missing_or_wrong_resources(self):
+        for step in ({"StepId": "7002.3"}, {"UserId": "999"}, {"State": "COMPLETED"},
+                     {"Partition": "gpuA40x4"}, {"Nodes": "2"}, {"CPUs": "64"},
+                     {"Tasks": "4"}, {"NodeList": "gpua076"},
+                     {"TRES": "cpu=8,mem=48G,gres/gpu=4"},
+                     {"TRES": "cpu=8,mem=48G,gres/gpu=1,gres/gpu=1"},
+                     {"TRES": "cpu=8,mem=48G,gres/gpu=1,gres/gpu:a100=4"}):
+            with self.subTest(step=step), self.assertRaises(ValueError):
+                self.allocation(step=step)
+        with self.assertRaises(ValueError):
+            self.allocation(step_returncode=1)
+
+    def test_step_aliases_cannot_replace_a_real_scheduler_step(self):
+        for env in ({"DELTA_OWNED_STEP_ID": ""}, {"DELTA_OWNED_STEP_ID": "batch"},
+                    {"SLURM_STEP_ID": "4"}, {"SLURM_STEPID": "4"},
+                    {"SLURM_STEP_ID": "3", "SLURM_STEPID": "4"},
+                    {"SLURM_STEP_GPUS": ""}, {"SLURM_STEP_GPUS": "0,1"},
+                    {"CUDA_VISIBLE_DEVICES": "0,1"}):
+            with self.subTest(environment=env), self.assertRaises(ValueError):
+                self.allocation(environment=env)
+
+    def test_parent_node_and_native_visible_gpu_admission_are_still_required(self):
+        for nodes in ("gpua076\n", "gpua075\ngpua076\n", ""):
+            with self.subTest(nodes=nodes), self.assertRaises(ValueError):
+                self.allocation(nodes=nodes)
+        for host in ("gpua075.other.edu", "login.delta.ncsa.illinois.edu"):
+            with self.subTest(host=host), self.assertRaises(ValueError):
+                self.allocation(host=host)
+        valid = "GPU-12345678-abcd-abcd-abcd-123456789abc, NVIDIA A100-SXM4-40GB, 8.0\n"
+        for row in (valid * 2, valid.replace("A100", "H100"), valid.replace("8.0", "9.0")):
+            with self.subTest(gpu_row=row), self.assertRaises(ValueError):
+                self.allocation(gpu_row=row)
+
+    def test_typed_a100_and_mebibyte_memory_records_are_equivalent(self):
+        value, _ = self.allocation(
+            parent={"AllocTRES": "cpu=64,mem=49152M,gres/gpu=4,gres/gpu:nvidia_a100=4",
+                    "ReqTRES": "cpu=8,mem=49152M,gres/gpu=1,gres/gpu:a100=1", "Features": "perf,nvperf"},
+            step={"TRES": "cpu=8,mem=49152M,gres/gpu=1,gres/gpu:a100=1"})
+        self.assertEqual(value["step"]["step_id"], "7001.3")
+
+
 if __name__ == "__main__":
     unittest.main()

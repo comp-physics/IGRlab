@@ -155,6 +155,52 @@ def test_outcomes(stdout, graph):
     return [observed[test['name']] for test in graph['tests']]
 
 
+def delta_counter_step(fields, job, host):
+    """Record a real single-GPU step within Delta's counter reservation."""
+    def resources(value, cpus, gpus):
+        entries = value.split(',')
+        tres = dict(item.split('=', 1) for item in entries if '=' in item)
+        return (len(entries) == len(tres) and tres.get('cpu') == cpus and
+                tres.get('mem') in ('48G', '49152M') and tres.get('gres/gpu') == gpus and
+                all(key in ('gres/gpu:a100', 'gres/gpu:nvidia_a100') and count == gpus
+                    for key, count in tres.items() if key.startswith('gres/gpu:')))
+
+    require(host.endswith('.delta.ncsa.illinois.edu') and
+            fields.get('Partition') == 'gpuA100x4' and fields.get('NumNodes') == '1' and
+            fields.get('NumTasks') == '1' and fields.get('NumCPUs') == '64' and
+            resources(fields.get('AllocTRES', ''), '64', '4') and
+            resources(fields.get('ReqTRES', ''), '8', '1') and
+            set(re.split('[,&]', fields.get('Features', ''))) >= {'perf', 'nvperf'},
+            'Delta counter parent must reserve four GPUs/64 CPUs for the requested one-GPU/eight-CPU step')
+    selectors = {name: os.environ.get(name, '') for name in
+                 ('DELTA_OWNED_STEP_ID', 'SLURM_STEP_ID', 'SLURM_STEPID')}
+    original = selectors['SLURM_STEP_ID'] or selectors['SLURM_STEPID']
+    selector = selectors['DELTA_OWNED_STEP_ID'] or original
+    require(re.fullmatch(r'[0-9]+', selector) and
+            all(not value or value == selector for value in selectors.values()),
+            'Delta counter validation requires its preserved actual numeric step ID')
+    command = ['scontrol', 'show', 'step', '-o', job + '.' + selector]
+    query = subprocess.run(command, text=True, capture_output=True, timeout=30)
+    step = dict(re.findall(r'(?:^|\s)([A-Za-z][A-Za-z0-9_]*)=(\S+)', query.stdout))
+    expected = {'StepId': job + '.' + selector, 'UserId': str(os.getuid()), 'State': 'RUNNING',
+                'Partition': 'gpuA100x4', 'Nodes': '1', 'CPUs': '8', 'Tasks': '1'}
+    require(query.returncode == 0 and all(step.get(key) == value for key, value in expected.items()) and
+            step.get('NodeList', '').split('.')[0] == host.split('.')[0] and
+            resources(step.get('TRES', ''), '8', '1'),
+            'actual Delta counter step is not the owned running eight-CPU single-GPU step')
+    node_command = ['scontrol', 'show', 'hostnames', fields.get('NodeList', '')]
+    nodes = subprocess.run(node_command, text=True, capture_output=True, timeout=30)
+    require(nodes.returncode == 0 and
+            [node.split('.')[0] for node in nodes.stdout.split()] == [host.split('.')[0]],
+            'Delta validation is outside its actual counter reservation node')
+    return {'step_id': step['StepId'], 'selector_environment': selectors,
+            'scheduler': {'argv': command, 'returncode': query.returncode,
+                          'stdout': query.stdout, 'fields': step},
+            'node_query': {'argv': node_command, 'returncode': nodes.returncode,
+                           'stdout': nodes.stdout},
+            'scope': 'single-GPU execution step inside actual four-GPU counter-exclusive parent allocation'}
+
+
 def allocation(saved):
     """Record actual live scheduler/device identity, never a completion claim."""
     environment = {name: os.environ.get(name, '') for name in SLURM_KEYS}
@@ -192,9 +238,13 @@ def allocation(saved):
         if site == 'delta':
             require(profile == 'cuda-sm80', 'Delta site currently supports native A100 validation')
             partition = 'gpuA100x4'
+            if 'gres/gpu=1' not in fields.get('AllocTRES', '').split(','):
+                value['step'] = delta_counter_step(fields, job, value['hostname'])
+                require(re.fullmatch(r'(?:[0-9]+|GPU-[0-9a-fA-F-]+)', environment['SLURM_STEP_GPUS']),
+                        'Delta counter validation requires one assigned execution-step GPU')
         visible = environment['CUDA_VISIBLE_DEVICES']
         require(fields.get('Partition') == partition and
-                'gres/gpu=1' in fields.get('AllocTRES', '').split(',') and
+                ('gres/gpu=1' in fields.get('AllocTRES', '').split(',') or 'step' in value) and
                 (environment['SLURM_JOB_GPUS'] or environment['SLURM_STEP_GPUS']) and
                 re.fullmatch(r'(?:[0-9]+|GPU-[0-9a-fA-F-]+)', visible),
                 'CUDA validation requires one assigned GPU in the selected partition')
@@ -269,7 +319,9 @@ def run(receipt, result_root, command):
         before, after = result['allocation_before'], result['allocation_after']
         require(before['uid'] == after['uid'] and before['hostname'] == after['hostname'] and
                 before['environment'] == after['environment'] and
-                before.get('gpu') == after.get('gpu'), 'validation allocation/device identity changed')
+                before.get('gpu') == after.get('gpu') and
+                before.get('step', {}).get('step_id') == after.get('step', {}).get('step_id'),
+                'validation allocation/device identity changed')
         result['identity_verified_before_and_after'] = True
         result['success'] = completed.returncode == 0
         result['status'] = 'passed' if result['success'] else 'failed'
