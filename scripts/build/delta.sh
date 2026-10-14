@@ -306,9 +306,13 @@ delta_discovery_args=(--profile "$delta_profile" --spack "$delta_spack_root/bin/
   --anchor "$delta_anchor" --cmake "$(type -P cmake)" --mpi "$(type -P mpicxx)"
   --cuda "$(type -P nvcc)")
 delta_discovered=$(python3 "$delta_script_dir/delta_discover.py" "${delta_discovery_args[@]}")
-mapfile -t delta_prefixes < <(python3 -c 'import json, sys; c=json.load(sys.stdin); print(c["profiles"][sys.argv[1]]["mpi_prefix"]); print(c.get("cuda_prefix", ""))' \
+mapfile -t delta_prefixes < <(python3 -c 'import json, sys; c=json.load(sys.stdin); print(c["profiles"][sys.argv[1]]["mpi_prefix"]); print(c.get("cuda_prefix", "")); print("\n".join(c["compiler"]["executables"][key] for key in ("c", "cxx", "fortran")))' \
   "$delta_profile" <<<"$delta_discovered")
 delta_mpi=${delta_prefixes[0]} delta_cuda=${delta_prefixes[1]}
+# The system wrappers accept bare GNU names for discovery. Canonical MFEM
+# admission requires executable paths, so use the same discovered and verified
+# compiler files for builds and validation without changing the retained graph.
+export OMPI_CC="${delta_prefixes[2]}" OMPI_CXX="${delta_prefixes[3]}" OMPI_FC="${delta_prefixes[4]}"
 export PATH="$delta_mpi/bin:$PATH" LD_LIBRARY_PATH="$delta_mpi/lib:$delta_mpi/lib64:${LD_LIBRARY_PATH:-}"
 [[ $(readlink -f "$(command -v mpicc)") == $(readlink -f "$delta_mpi/bin/mpicc") ]] || delta_fail "selected MPI wrapper mismatch"
 if [[ $delta_mode == gpu ]]; then

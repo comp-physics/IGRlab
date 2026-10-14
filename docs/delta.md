@@ -13,7 +13,9 @@ paired end-to-end timing/profiling.
 The site policy in `cmake/sites/delta.json` selects installed NCSA GCC, CMake,
 OpenMPI/HPC-X, CUDA and OpenBLAS modules. Discovery records their actual
 prefixes, versions and tool/metadata hashes. `OMPI_CC=gcc`, `OMPI_CXX=g++` and
-`OMPI_FC=gfortran` select GNU compilers through the vendor MPI wrappers; this
+`OMPI_FC=gfortran` select GNU compilers through the vendor MPI wrappers during
+discovery. The driver then passes those verified compiler files by absolute
+path so canonical MFEM admission can check the executables and versions. This
 does not assert that the vendor MPI binary itself was built with GCC.
 The same CUDA-aware system MPI serves both application profiles. CPU
 HYPRE/MFEM/application settings still disable CUDA. Spack must reuse these
