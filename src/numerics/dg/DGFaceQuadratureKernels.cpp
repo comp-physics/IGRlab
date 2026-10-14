@@ -21,7 +21,8 @@ void LaunchDGDiffusionCoefficientUpdate2D(
   mfem::Vector& weighted_normal_dshape,
   mfem::Vector& penalty,
   mfem::real_t kappa,
-  DGDiffusionFaceScaling face_scaling)
+  DGDiffusionFaceScaling face_scaling,
+  mfem::real_t* rounded_normal_scales = nullptr)
 {
   const int side_q_size = 2 * nq * nf;
   const int normal_size = 2 * nq * dof * nf;
@@ -68,6 +69,11 @@ void LaunchDGDiffusionCoefficientUpdate2D(
       {
         normal_scale0 *= 2.0 * metric1 / metric_sum;
         normal_scale1 *= 2.0 * metric0 / metric_sum;
+      }
+      if (rounded_normal_scales)
+      {
+        rounded_normal_scales[qbase] = normal_scale0;
+        rounded_normal_scales[qbase + 1] = normal_scale1;
       }
       for (int d = 0; d < dof; ++d)
       {
@@ -132,6 +138,18 @@ void LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
   mfem::real_t kappa,
   DGDiffusionFaceScaling face_scaling)
 {
+  work.normal_dictionary.scale_revision = 0;
+  mfem::real_t* rounded_normal_scales = nullptr;
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+  if (std::is_same<mfem::real_t, double>::value && info.nq > 0 && info.nq <= 16 &&
+      mfem::Device::Allows(mfem::Backend::CUDA) &&
+      !mfem::Device::Allows(mfem::Backend::RAJA_CUDA) &&
+      work.normal_dictionary.geometry.Matches(info) &&
+      work.normal_dictionary.scales.Size() == 2 * info.nq * info.nf)
+  {
+    rounded_normal_scales = work.normal_dictionary.scales.Write();
+  }
+#endif
   LaunchDGDiffusionCoefficientUpdate2D(info.dof,
                                        info.nq,
                                        info.nf,
@@ -142,7 +160,10 @@ void LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
                                        work.weighted_normal_dshape,
                                        work.penalty,
                                        kappa,
-                                       face_scaling);
+                                       face_scaling,
+                                       rounded_normal_scales);
+  if (rounded_normal_scales)
+  { work.normal_dictionary.scale_revision = info.connectivity_revision; }
 }
 
 void LaunchSharedFaceDGDiffusionCoefficientUpdate2D(

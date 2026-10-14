@@ -985,7 +985,8 @@ public:
       face_scaling,
       &scratch_.normal_dshape_base,
       &scratch_.penalty_metric,
-      &scratch_.shape_dictionary);
+      &scratch_.shape_dictionary,
+      &scratch_.normal_dictionary);
     timing_enabled_ =
       ::igrlab::EnvFlagEnabledDefault("DG_IGR_IGR_EXACT_FACE_TIMING",
                                       false);

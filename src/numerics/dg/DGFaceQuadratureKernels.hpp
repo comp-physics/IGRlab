@@ -14,6 +14,7 @@
 #include <limits>
 #include <new>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace igrlab
@@ -148,10 +149,34 @@ struct InteriorFaceShapeDictionary2D
   }
 };
 
+struct InteriorFaceNormalDictionary2D
+{
+  InteriorFaceShapeDictionary2D geometry;
+  // Current rounded scales from the original native coefficient update,
+  // indexed by physical [side][q][face], never by a geometry slot.
+  mfem::Vector scales;
+  std::uint64_t scale_revision = 0;
+
+  void Reset()
+  {
+    geometry.Reset();
+    scales.Destroy();
+    scale_revision = 0;
+  }
+
+  bool Ready(const InteriorFaceDGDiffusionApplyInfo& info) const
+  {
+    return scale_revision != 0 && scale_revision == info.connectivity_revision &&
+      geometry.Matches(info) &&
+      std::size_t(scales.Size()) == 2u * std::size_t(info.nq) * std::size_t(info.nf);
+  }
+};
+
 struct InteriorFaceDGDiffusionApplyScratch
 {
   mfem::Vector shape;
   InteriorFaceShapeDictionary2D shape_dictionary;
+  InteriorFaceNormalDictionary2D normal_dictionary;
   mfem::Vector weighted_normal_dshape;
   mfem::Vector penalty;
   /// Geometry-only normal derivative used to refresh state-dependent qdata.
@@ -274,6 +299,55 @@ inline void PrepareInteriorFaceShapeDictionary2D(
   {
     dictionary.Reset(); // Optional geometry storage never changes admission.
   }
+}
+
+inline void PrepareInteriorFaceNormalDictionary2D(
+  const InteriorFaceDGDiffusionApplyInfo& info,
+  const mfem::Vector& normal_base,
+  const InteriorFaceShapeDictionary2D* shape_dictionary,
+  InteriorFaceNormalDictionary2D& dictionary,
+  std::size_t memory_budget = 64u * 1024u * 1024u)
+{
+  dictionary.Reset();
+  memory_budget = std::min(memory_budget, std::size_t(64u * 1024u * 1024u));
+  if (!std::is_same<mfem::real_t, double>::value ||
+      info.dof <= 0 || info.nq <= 0 || info.nf <= 1) { return; }
+  const std::size_t max_entries = std::size_t(std::numeric_limits<int>::max());
+  if (std::size_t(info.nq) > max_entries / 2u / std::size_t(info.nf)) { return; }
+  const std::size_t scale_entries = 2u * std::size_t(info.nq) * std::size_t(info.nf);
+  if (scale_entries > memory_budget / 2u / sizeof(mfem::real_t)) { return; }
+  const std::size_t scale_bytes = scale_entries * sizeof(mfem::real_t);
+  // Reserve both final host/device copies of S and current scales before the
+  // shared byte-dedup builder charges N, its slot map and temporary staging.
+  std::size_t reserved = 2u * scale_bytes;
+  if (shape_dictionary)
+  {
+    const std::size_t values = std::size_t(shape_dictionary->values.Size());
+    const std::size_t slots = std::size_t(shape_dictionary->face_slots.Size());
+    if (values > (memory_budget - reserved) / 2u / sizeof(mfem::real_t)) { return; }
+    reserved += 2u * values * sizeof(mfem::real_t);
+    if (slots > (memory_budget - reserved) / 2u / sizeof(int)) { return; }
+    reserved += 2u * slots * sizeof(int);
+  }
+  PrepareInteriorFaceShapeDictionary2D(info, normal_base, dictionary.geometry,
+                                       memory_budget - reserved);
+  if (!dictionary.geometry.Matches(info)) { return; }
+  const std::size_t compact_bytes =
+    std::size_t(dictionary.geometry.values.Size()) * sizeof(mfem::real_t) +
+    std::size_t(dictionary.geometry.face_slots.Size()) * sizeof(int) + scale_bytes;
+  if (compact_bytes >= std::size_t(normal_base.Size()) * sizeof(mfem::real_t))
+  {
+    dictionary.Reset();
+    return;
+  }
+  try
+  {
+    dictionary.scales.SetSize(int(scale_entries));
+    dictionary.scales.UseDevice(true);
+  }
+  catch (const std::bad_alloc&) { dictionary.Reset(); }
+  // No constructor coefficient may authorize reconstruction: its rounded
+  // harmonic expression differs from the native refresh. Readiness remains 0.
 }
 
 struct SharedFaceDGDiffusionApplyInfo
@@ -1010,9 +1084,11 @@ BuildInteriorFaceDGDiffusionApplyData2D(
   DGDiffusionFaceScaling face_scaling = DGDiffusionFaceScaling::Arithmetic,
   mfem::Vector* normal_dshape_base = nullptr,
   mfem::Vector* side_penalty_metric = nullptr,
-  InteriorFaceShapeDictionary2D* shape_dictionary = nullptr)
+  InteriorFaceShapeDictionary2D* shape_dictionary = nullptr,
+  InteriorFaceNormalDictionary2D* normal_dictionary = nullptr)
 {
   if (shape_dictionary) { shape_dictionary->Reset(); }
+  if (normal_dictionary) { normal_dictionary->Reset(); }
   std::string reason;
   MFEM_VERIFY(SupportsInteriorFaceScalarTraceProjection2D(sfes, fqs, &reason),
               "Unsupported exact DG diffusion face apply: " << reason);
@@ -1195,6 +1271,11 @@ BuildInteriorFaceDGDiffusionApplyData2D(
   BuildNativeElementVDofMap(sfes, element_vdof_map);
   if (shape_dictionary)
   { PrepareInteriorFaceShapeDictionary2D(info, shape, *shape_dictionary); }
+  if (normal_dictionary && normal_dshape_base)
+  {
+    PrepareInteriorFaceNormalDictionary2D(info, *normal_dshape_base,
+                                          shape_dictionary, *normal_dictionary);
+  }
   return info;
 }
 
@@ -1723,6 +1804,32 @@ struct InteriorFaceDGDiffusionRecord2DWarp
   InteriorFaceDGDiffusionRecord2D record;
   const int* shape_face_slots = nullptr;
   int shape_face_count = 0;
+  const mfem::real_t* normal_base = nullptr;
+  const int* normal_face_slots = nullptr;
+  int normal_face_count = 0;
+  const mfem::real_t* normal_scales = nullptr;
+
+  MFEM_HOST_DEVICE mfem::real_t Normal(int side, int q, int d, int face) const
+  {
+#if defined(MFEM_USE_CUDA) && defined(__CUDA_ARCH__)
+    if constexpr (std::is_same<mfem::real_t, double>::value)
+    {
+      if (normal_face_slots)
+      {
+        const auto B = mfem::Reshape(normal_base, 2, record.nq, record.dof,
+                                      normal_face_count);
+        const auto scale = mfem::Reshape(normal_scales, 2, record.nq, record.nf);
+        // Recreate the refresh's stored FP64 product. Explicit rounding keeps
+        // it materialized before the unchanged state/output arithmetic below.
+        return __dmul_rn(scale(side, q, face),
+                          B(side, q, d, normal_face_slots[face]));
+      }
+    }
+#endif
+    const auto N = mfem::Reshape(record.weighted_normal_dshape,
+                                  2, record.nq, record.dof, record.nf);
+    return N(side, q, d, face);
+  }
 
   MFEM_HOST_DEVICE void operator()(int face) const
   {
@@ -1731,8 +1838,6 @@ struct InteriorFaceDGDiffusionRecord2DWarp
     const int shape_face = shape_face_slots ? shape_face_slots[face] : face;
     auto S = mfem::Reshape(record.shape, 2, record.nq, record.dof,
                            shape_face_slots ? shape_face_count : record.nf);
-    auto N = mfem::Reshape(record.weighted_normal_dshape,
-                           2, record.nq, record.dof, record.nf);
     auto P = mfem::Reshape(record.penalty, record.nq, record.nf);
     auto F = mfem::Reshape(record.face_elements, 2, record.nf);
     auto D = mfem::Reshape(record.element_vdof_map,
@@ -1752,7 +1857,7 @@ struct InteriorFaceDGDiffusionRecord2DWarp
       {
         const mfem::real_t dof_value = record.x[D(d, 0, e)];
         value += S(side, q, d, shape_face) * dof_value;
-        normal_flux += N(side, q, d, face) * dof_value;
+        normal_flux += Normal(side, q, d, face) * dof_value;
       }
     }
 
@@ -1812,7 +1917,7 @@ struct InteriorFaceDGDiffusionRecord2DWarp
             {
               const mfem::real_t y0 =
                 -S(0, q, d, shape_face) * avg_flux +
-                record.ip_sigma * N(0, q, d, face) * jump +
+                record.ip_sigma * Normal(0, q, d, face) * jump +
                 S(0, q, d, shape_face) * penalty_jump;
               sums[i] += y0;
             }
@@ -1820,7 +1925,7 @@ struct InteriorFaceDGDiffusionRecord2DWarp
             {
               const mfem::real_t y1 =
                 S(1, q, d, shape_face) * avg_flux +
-                record.ip_sigma * N(1, q, d, face) * jump -
+                record.ip_sigma * Normal(1, q, d, face) * jump -
                 S(1, q, d, shape_face) * penalty_jump;
               sums[i] += y1;
             }
@@ -1993,7 +2098,6 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
   record.nf = info.nf;
   record.ne = info.ne;
   record.ip_sigma = ip_sigma;
-  record.weighted_normal_dshape = work.weighted_normal_dshape.Read();
   record.penalty = work.penalty.Read();
   record.face_elements = work.face_elements.Read();
   record.element_vdof_map = work.element_vdof_map.Read();
@@ -2005,18 +2109,27 @@ inline void AddInteriorFaceDGDiffusionApplyDevice2D(
       !mfem::Device::Allows(mfem::Backend::RAJA_CUDA))
   {
     const bool compact_shape = work.shape_dictionary.Matches(info);
+    const bool compact_normal = std::is_same<mfem::real_t, double>::value &&
+      work.normal_dictionary.Ready(info);
     record.shape = compact_shape ? work.shape_dictionary.values.Read()
                                  : work.shape.Read();
+    record.weighted_normal_dshape = compact_normal ? nullptr
+      : work.weighted_normal_dshape.Read();
     mfem::forall_2D_batch(
       info.nf, 32, 1, 4, InteriorFaceDGDiffusionRecord2DWarp{
         record,
         compact_shape ? work.shape_dictionary.face_slots.Read() : nullptr,
-        compact_shape ? work.shape_dictionary.slot_count : info.nf});
+        compact_shape ? work.shape_dictionary.slot_count : info.nf,
+        compact_normal ? work.normal_dictionary.geometry.values.Read() : nullptr,
+        compact_normal ? work.normal_dictionary.geometry.face_slots.Read() : nullptr,
+        compact_normal ? work.normal_dictionary.geometry.slot_count : 0,
+        compact_normal ? work.normal_dictionary.scales.Read() : nullptr});
   }
   else
 #endif
   {
     record.shape = work.shape.Read();
+    record.weighted_normal_dshape = work.weighted_normal_dshape.Read();
     mfem::forall(info.nf, record);
   }
 
@@ -2416,7 +2529,8 @@ AddInteriorFaceDGDiffusionApply2D(
     DGDiffusionFaceScaling::Arithmetic,
     &work.normal_dshape_base,
     &work.penalty_metric,
-    &work.shape_dictionary);
+    &work.shape_dictionary,
+    &work.normal_dictionary);
 
 #if (defined(MFEM_USE_CUDA) && !defined(__CUDACC__)) || \
     (defined(MFEM_USE_HIP) && !defined(__HIPCC__))
