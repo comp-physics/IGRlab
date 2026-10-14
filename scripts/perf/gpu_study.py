@@ -7,6 +7,8 @@ Raw measurements and unsuccessful attempts are retained in their own directories
 import argparse
 import ast
 import contextlib
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import csv
 from datetime import datetime, timezone
 import fcntl
@@ -124,6 +126,48 @@ def sha(path):
         for block in iter(lambda: stream.read(1024 * 1024), b''):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _artifact_hash_threads():
+    raw = os.environ.get('IGRLAB_STUDY_HASH_THREADS', '4')
+    if not re.fullmatch(r'[1-9][0-9]*', raw):
+        raise ValueError('IGRLAB_STUDY_HASH_THREADS must be a positive integer')
+    requested = int(raw)
+    try:
+        allowed = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        allowed = 1  # No affinity proof: retain the sequential path.
+    if allowed < 1:
+        raise RuntimeError('artifact hashing has no allowed CPUs')
+    return min(requested, allowed)
+
+
+def _verify_admitted_artifacts(artifacts):
+    """Fresh full-byte hashes, bounded by affinity, with manifest-order errors."""
+    workers = _artifact_hash_threads()
+    items = tuple(artifacts.items())
+    if not items:
+        return
+    if workers == 1:
+        for path, expected in items:
+            if sha(path) != expected:
+                raise RuntimeError(f'admitted build/dependency artifact changed: {path}')
+        return
+    workers = min(workers, len(items))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='igr-study-hash') as pool:
+        pending = deque(pool.submit(sha, path) for path, _ in items[:workers])
+        try:
+            for index, (path, expected) in enumerate(items):
+                if pending.popleft().result() != expected:
+                    raise RuntimeError(f'admitted build/dependency artifact changed: {path}')
+                next_index = index + workers
+                if next_index < len(items):
+                    pending.append(pool.submit(sha, items[next_index][0]))
+        finally:
+            # Do not enqueue the rest of the manifest after a failed gate.
+            # Already-running reads finish before verification returns.
+            for future in pending:
+                future.cancel()
 
 
 def digest(value):
@@ -403,9 +447,7 @@ def verify(root, *, binaries=False):
         admission = read_json(root / 'admission.json')
         if admission['plan_sha256'] != plan['plan_sha256']:
             raise RuntimeError('binary admission belongs to a different study')
-        for path, expected in admission['artifact_sha256'].items():
-            if sha(path) != expected:
-                raise RuntimeError(f'admitted build/dependency artifact changed: {path}')
+        _verify_admitted_artifacts(admission['artifact_sha256'])
         for cpu in admission.get('cpu_artifacts', {}).values():
             for path, expected in cpu.get('artifact_links', {}).items():
                 if (not Path(path).is_symlink() or os.readlink(path) != expected['link'] or

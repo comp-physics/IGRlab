@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -187,6 +188,34 @@ class StudyProtocol(unittest.TestCase):
         (output / 'stdout.log').write_text('modified measurement')
         with self.assertRaisesRegex(RuntimeError, 'completed measurement artifact'):
             study.verify(self.root)
+
+    def test_binary_verification_rehashes_mutated_bytes_even_with_restored_mtime(self):
+        binary = self.root / 'admitted-binary'
+        binary.write_bytes(b'original executable bytes')
+        study.write_json(self.root / 'admission.json', {
+            'plan_sha256': self.plan['plan_sha256'],
+            'artifact_sha256': {str(binary): study.sha(binary)}})
+        before = binary.stat()
+        with patch.dict(os.environ, {'IGRLAB_STUDY_HASH_THREADS': '2'}):
+            study.verify(self.root, binaries=True)
+            binary.write_bytes(b'modified executable bytes')
+            os.utime(binary, ns=(before.st_atime_ns, before.st_mtime_ns))
+            with self.assertRaisesRegex(RuntimeError, 'admitted build/dependency artifact changed'):
+                study.verify(self.root, binaries=True)
+
+    def test_parallel_binary_hashes_do_not_replace_import_link_identity_checks(self):
+        first, second, link = (self.root / name for name in ('first-target','second-target','library-link'))
+        first.write_bytes(b'compatible bytes'); second.write_bytes(first.read_bytes())
+        link.symlink_to(first)
+        study.write_json(self.root / 'admission.json', {
+            'plan_sha256': self.plan['plan_sha256'],
+            'artifact_sha256': {str(first): study.sha(first), str(second): study.sha(second)},
+            'import_artifact_links': {str(link): {'link': str(first),'target': str(first)}}})
+        with patch.dict(os.environ, {'IGRLAB_STUDY_HASH_THREADS': '2'}):
+            study.verify(self.root, binaries=True)
+            link.unlink(); link.symlink_to(second)
+            with self.assertRaisesRegex(RuntimeError, 'imported canonical artifact link changed'):
+                study.verify(self.root, binaries=True)
 
     def test_identical_source_report_and_status_label_control_without_claiming_optimization(self):
         self.plan['sources'] = {member: {'source_fingerprint': 'a' * 64, 'source_status': 'dirty'}
@@ -673,6 +702,126 @@ print(json.dumps({'seconds': 10.0 if member == 'baseline' else 9.0,
         with self.assertRaisesRegex(RuntimeError, 'exit=124'):
             runner.run('timeout', [sys.executable, '-c', 'import time; time.sleep(20)'])
         self.assertEqual(study.read_json(self.root / 'timeout/result.json')['returncode'], 124)
+
+
+class ArtifactHashVerification(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.paths = [self.root / f'artifact-{index}' for index in range(7)]
+        for index, path in enumerate(self.paths):
+            path.write_bytes((b'content-' + bytes([index])) * (index + 1))
+        self.artifacts = {str(path): study.sha(path) for path in self.paths}
+
+    def test_all_files_get_real_full_hashes_once_per_invocation(self):
+        original = study.sha
+        with patch.dict(os.environ, {'IGRLAB_STUDY_HASH_THREADS': '3'}), \
+                patch.object(study.os, 'sched_getaffinity', return_value={1, 3, 5}), \
+                patch.object(study, 'sha', wraps=original) as hashing:
+            study._verify_admitted_artifacts(self.artifacts)
+            self.assertCountEqual([call.args[0] for call in hashing.call_args_list], list(self.artifacts))
+            hashing.reset_mock()
+            study._verify_admitted_artifacts(self.artifacts)
+            self.assertEqual(hashing.call_count, len(self.artifacts))
+
+    def test_tamper_precedes_later_read_error_despite_reverse_completion(self):
+        first, second = map(str, self.paths[:2])
+        later_finished = threading.Event()
+        original = study.sha
+        def hash_out_of_order(path):
+            if path == first:
+                if not later_finished.wait(3): raise AssertionError('parallel read did not start')
+                return original(path)
+            later_finished.set()
+            raise PermissionError('later unreadable artifact')
+        artifacts = {first: '0' * 64, second: self.artifacts[second]}
+        with patch.dict(os.environ, {'IGRLAB_STUDY_HASH_THREADS': '2'}), \
+                patch.object(study.os, 'sched_getaffinity', return_value={0, 1}), \
+                patch.object(study, 'sha', side_effect=hash_out_of_order):
+            with self.assertRaisesRegex(RuntimeError, first):
+                study._verify_admitted_artifacts(artifacts)
+
+    def test_earlier_missing_file_precedes_later_mismatch(self):
+        first, second = map(str, self.paths[:2])
+        self.paths[0].unlink()
+        later_finished = threading.Event()
+        original = study.sha
+        def hash_out_of_order(path):
+            if path == first:
+                if not later_finished.wait(3): raise AssertionError('parallel read did not start')
+            else:
+                later_finished.set()
+            return original(path)
+        with patch.dict(os.environ, {'IGRLAB_STUDY_HASH_THREADS': '2'}), \
+                patch.object(study.os, 'sched_getaffinity', return_value={0, 1}), \
+                patch.object(study, 'sha', side_effect=hash_out_of_order):
+            with self.assertRaises(FileNotFoundError) as failure:
+                study._verify_admitted_artifacts({first: self.artifacts[first], second: '0' * 64})
+        self.assertEqual(failure.exception.filename, first)
+
+    def test_real_parallel_reads_are_bounded_by_allowed_affinity(self):
+        lock = threading.Lock()
+        both_started = threading.Event()
+        counts = {'active': 0, 'peak': 0, 'calls': 0}
+        original = study.sha
+        def controlled_hash(path):
+            with lock:
+                counts['active'] += 1; counts['calls'] += 1
+                counts['peak'] = max(counts['peak'], counts['active'])
+                first_pair = counts['calls'] <= 2
+                if counts['active'] == 2: both_started.set()
+            try:
+                if first_pair and not both_started.wait(3): raise AssertionError('second worker absent')
+                return original(path)
+            finally:
+                with lock: counts['active'] -= 1
+        with patch.dict(os.environ, {'IGRLAB_STUDY_HASH_THREADS': '99'}), \
+                patch.object(study.os, 'sched_getaffinity', return_value={2, 7}), \
+                patch.object(study, 'sha', side_effect=controlled_hash):
+            study._verify_admitted_artifacts(self.artifacts)
+        self.assertEqual(counts, {'active': 0, 'peak': 2, 'calls': len(self.artifacts)})
+
+    def test_rejected_gate_never_enqueues_entire_remaining_manifest(self):
+        first = str(self.paths[0])
+        original = study.sha
+        with patch.dict(os.environ, {'IGRLAB_STUDY_HASH_THREADS': '2'}), \
+                patch.object(study.os, 'sched_getaffinity', return_value={0, 1}), \
+                patch.object(study, 'sha', wraps=original) as hashing:
+            with self.assertRaisesRegex(RuntimeError, first):
+                study._verify_admitted_artifacts({**self.artifacts, first: '0' * 64})
+        self.assertLessEqual(hashing.call_count, 2)
+        self.assertTrue({call.args[0] for call in hashing.call_args_list} <= set(map(str, self.paths[:2])))
+
+    def test_single_worker_is_original_sequential_path_without_executor(self):
+        with patch.dict(os.environ, {'IGRLAB_STUDY_HASH_THREADS': '1'}), \
+                patch.object(study, 'ThreadPoolExecutor') as pool:
+            study._verify_admitted_artifacts(self.artifacts)
+            with self.assertRaisesRegex(RuntimeError, str(self.paths[0])):
+                study._verify_admitted_artifacts({**self.artifacts, str(self.paths[0]): '0' * 64})
+            pool.assert_not_called()
+
+    def test_positive_override_default_and_missing_affinity_are_conservative(self):
+        for raw, cpus, expected in ((None, 8, 4), (None, 2, 2), ('2', 8, 2), ('50', 3, 3)):
+            values = {} if raw is None else {'IGRLAB_STUDY_HASH_THREADS': raw}
+            with self.subTest(raw=raw, cpus=cpus), patch.dict(os.environ, values, clear=True), \
+                    patch.object(study.os, 'sched_getaffinity', return_value=set(range(cpus))):
+                self.assertEqual(study._artifact_hash_threads(), expected)
+        for error in (AttributeError('unavailable'), OSError('unavailable')):
+            with patch.dict(os.environ, {}, clear=True), \
+                    patch.object(study.os, 'sched_getaffinity', side_effect=error):
+                self.assertEqual(study._artifact_hash_threads(), 1)
+        with patch.object(study.os, 'sched_getaffinity', return_value=set()):
+            with self.assertRaisesRegex(RuntimeError, 'no allowed CPUs'):
+                study._artifact_hash_threads()
+
+    def test_invalid_override_fails_before_any_artifact_read(self):
+        for raw in ('', '0', '-1', '1.5', '+2', ' 2', 'four', '01'):
+            with self.subTest(raw=raw), patch.dict(os.environ, {'IGRLAB_STUDY_HASH_THREADS': raw}), \
+                    patch.object(study, 'sha') as hashing, patch.object(study, 'ThreadPoolExecutor') as pool:
+                with self.assertRaisesRegex(ValueError, 'positive integer'):
+                    study._verify_admitted_artifacts(self.artifacts)
+                hashing.assert_not_called(); pool.assert_not_called()
 
 
 if __name__ == '__main__':
