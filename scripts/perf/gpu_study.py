@@ -862,7 +862,31 @@ def submit_pipeline(root, plan):
     submit_stage(root, 'profiles', [timing_job])
 
 
-def delta_gpu_resources(fields, job, host, env):
+def _delta_profile_pool_parent(fields):
+    """Separate admission for a real whole-node, four-role profiling parent."""
+    def tres(value):
+        entries = value.split(',')
+        result = dict(item.split('=', 1) for item in entries if '=' in item)
+        if len(entries) != len(result):
+            return None
+        if result.get('gres/gpu') != '4' or any(
+                key not in study_site.policy('delta')['gpu_tres_types'] or count != '4'
+                for key, count in result.items() if key.startswith('gres/gpu:')):
+            return None
+        memory = re.fullmatch(r'([1-9][0-9]*)([MG])', result.get('mem', ''))
+        if not memory or not re.fullmatch(r'[1-9][0-9]*', result.get('cpu', '')):
+            return None
+        return int(result['cpu']), int(memory[1]) * (1024 if memory[2] == 'G' else 1)
+
+    requested, allocated = tres(fields.get('ReqTRES', '')), tres(fields.get('AllocTRES', ''))
+    return bool(fields.get('BatchFlag') == '1' and fields.get('NumCPUs') == '64' and
+                fields.get('OverSubscribe') == 'NO' and requested and allocated and
+                33 <= requested[0] <= 64 and allocated[0] == 64 and
+                192 * 1024 <= requested[1] <= allocated[1] and
+                set(re.split('[,&]', fields.get('Features', ''))) >= {'perf', 'nvperf'})
+
+
+def delta_gpu_resources(fields, job, host, env, *, profile_pool=False):
     """Distinguish an ordinary job from Delta's counter-exclusive parent job."""
     def resources(value, cpus, gpus):
         entries = value.split(',')
@@ -874,9 +898,10 @@ def delta_gpu_resources(fields, job, host, env):
 
     if fields.get('NumCPUs') == '8' and resources(fields.get('AllocTRES', ''), '8', '1'):
         return None
-    if (fields.get('NumCPUs') != '64' or not resources(fields.get('AllocTRES', ''), '64', '4') or
+    legacy_counter = not (fields.get('NumCPUs') != '64' or not resources(fields.get('AllocTRES', ''), '64', '4') or
             not resources(fields.get('ReqTRES', ''), '8', '1') or
-            not set(re.split('[,&]', fields.get('Features', ''))) >= {'perf', 'nvperf'}):
+            not set(re.split('[,&]', fields.get('Features', ''))) >= {'perf', 'nvperf'})
+    if not legacy_counter and not (profile_pool and _delta_profile_pool_parent(fields)):
         raise RuntimeError('Delta GPU job resources do not match ordinary or counter-exclusive policy')
     original = os.environ.get('SLURM_STEP_ID') or os.environ.get('SLURM_STEPID')
     selector = os.environ.get('DELTA_OWNED_STEP_ID') or original or ''
@@ -895,7 +920,7 @@ def delta_gpu_resources(fields, job, host, env):
             'scope': 'single-GPU execution step inside genuine four-GPU counter-exclusive parent allocation'}
 
 
-def delta_allocation(*, interactive=False):
+def delta_allocation(*, interactive=False, profile_pool=False):
     """Prove actual Delta custody/resources/end time before any native workload."""
     job, host = os.environ.get('SLURM_JOB_ID', ''), socket.getfqdn()
     if (not re.fullmatch(r'[1-9][0-9]*', job) or 'login' in host or
@@ -915,7 +940,7 @@ def delta_allocation(*, interactive=False):
         expected['BatchFlag'] = '0'
     if (query.returncode or any(fields.get(key) != value for key, value in expected.items())):
         raise RuntimeError('actual Delta allocation owner/account/partition/resources differ from the study')
-    step = delta_gpu_resources(fields, job, host, env)
+    step = delta_gpu_resources(fields, job, host, env, profile_pool=profile_pool)
     nodes_command = ['scontrol', 'show', 'hostnames', fields.get('NodeList', '')]
     nodes = subprocess.run(nodes_command, text=True, capture_output=True, timeout=30, env=env)
     if nodes.returncode or [name.split('.')[0] for name in nodes.stdout.split()] != [host.split('.')[0]]:
@@ -1525,7 +1550,7 @@ def worker(args):
         worker_budget(plan, suite, args.stage, entered)  # Fail before queries/captures if time is exhausted.
         site = study_site.name(plan)
         cpu = (cpu_allocation() if site == 'pace' else cpu_allocation(site)) if only_cpu else None
-        delta = delta_allocation() if site == 'delta' and not only_cpu else None
+        delta = delta_allocation(profile_pool=args.stage == 'profiles') if site == 'delta' and not only_cpu else None
         gpu = None if only_cpu else (delta['gpu'] if delta else allocation())
         if args.stage == 'timings' and plan.get('timing_reuse'):
             raise RuntimeError('profiles-only retry cannot run new timings')
