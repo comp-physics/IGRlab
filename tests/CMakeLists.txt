@@ -18,7 +18,7 @@ set_tests_properties(dg_igr_cuda_build_policy PROPERTIES
   TIMEOUT 30
 )
 
-foreach(build_check pace_submission pace_manifest pace_discovery dependency_bindings
+foreach(build_check pace_submission pace_manifest pace_discovery delta_site dependency_bindings
                     prebuilt_validation mfem_cache)
   add_test(NAME igrlab_${build_check}
     COMMAND /usr/bin/env python3

@@ -5,11 +5,25 @@ SCRIPT_DIR="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 # Site setup remains a thin front end to this driver. It prepares the site's
 # dependency scope and then invokes this same file without the site arguments.
-for build_argument in "$@"; do
-  if [[ "${build_argument}" == "--site" ]]; then
-    exec "${SCRIPT_DIR}/scripts/build/pace.sh" "$@"
+build_arguments=("$@")
+for ((build_argument_index=0; build_argument_index < ${#build_arguments[@]}; ++build_argument_index)); do
+  if [[ "${build_arguments[build_argument_index]}" == "--site" ]]; then
+    build_site="${build_arguments[build_argument_index+1]:-}"
+    case "${build_site}" in
+      pace|delta) exec "${SCRIPT_DIR}/scripts/build/${build_site}.sh" "$@" ;;
+      *) echo "ERROR: --site requires pace or delta." >&2; exit 2 ;;
+    esac
   fi
 done
+
+check_site_dependency_lock() {
+  case "${IGRLAB_BUILD_SITE:-}" in
+    pace|delta)
+      python3 "${SCRIPT_DIR}/scripts/build/${IGRLAB_BUILD_SITE}_manifest.py" \
+        --profile "${PROFILE}" --check-lock "${SPACK_ENV}/spack.lock"
+      ;;
+  esac
+}
 
 # OpenMPI consults HOME even for serial CTest children.  The supervised
 # controller intentionally supplies a closed environment, so recover only the
@@ -169,10 +183,11 @@ Modes:
   --a100            Select the A100 profile (equivalent to --gpu --cuda-arch 80).
 
 Options:
-  --site pace       Load the checked-in PACE toolchain/dependency profile.
+  --site SITE       Load the checked-in pace or delta toolchain/dependency profile.
                     Requires an external --output-root and initialized Spack
-                    or IGRLAB_PACE_SPACK_ROOT; see docs/pace.md.
-  --submit          With --site pace, submit to the free embers background queue.
+                    or the selected site's Spack root; see docs/pace.md
+                    and docs/delta.md.
+  --submit          Submit through the selected site's configured Slurm accounts.
   --caliper         Build the CPU-only Caliper observability profile.
   --nvtx-profile    Compile GPU profiler binaries with runtime-default-off
                     NVTX observability regions.
@@ -1929,6 +1944,11 @@ validate_reused_mfem() {
     mpi_spec="openmpi~cuda"
     hypre_spec="hypre+mpi~cuda"
   fi
+  # Delta's installed MPI has CUDA support in both application profiles.
+  # CPU HYPRE/MFEM still use their original CUDA-disabled configurations.
+  if [[ "${IGRLAB_BUILD_SITE:-}" == "delta" ]]; then
+    mpi_spec="openmpi+cuda"
+  fi
   spack_identity "${mpi_spec}" mpi_prefix mpi_hash mpi_compiler
   spack_identity "${hypre_spec}" hypre_prefix hypre_hash hypre_compiler
   spack_identity "${metis_spec}" metis_prefix metis_hash metis_compiler
@@ -2545,10 +2565,7 @@ run_prebuilt_validation() {
   MFEM_SOURCE_ROOT="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["mfem_source"])' <<<"${admitted_paths}")"
   MFEM_BUILD="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["mfem_build"])' <<<"${admitted_paths}")"
   MFEM_INSTALL="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["mfem_install"])' <<<"${admitted_paths}")"
-  if [[ "${IGRLAB_BUILD_SITE:-}" == "pace" ]]; then
-    python3 "${SCRIPT_DIR}/scripts/build/pace_manifest.py" --profile "${PROFILE}" \
-      --check-lock "${SPACK_ENV}/spack.lock"
-  fi
+  check_site_dependency_lock
   [[ -d "${SPACK_ENV}/.spack-env/view" ]] || {
     echo "ERROR: prebuilt Spack view is missing." >&2; exit 3;
   }
@@ -2746,20 +2763,14 @@ if ((INSTALL_DEPS)); then
   # Repeat builds retain the selected environment's concrete dependency graph.
   # Dependency upgrades are an explicit Spack environment operation.
   spack -e "${SPACK_ENV}" concretize
-  if [[ "${IGRLAB_BUILD_SITE:-}" == "pace" ]]; then
-    python3 "${SCRIPT_DIR}/scripts/build/pace_manifest.py" --profile "${PROFILE}" \
-      --check-lock "${SPACK_ENV}/spack.lock"
-  fi
+  check_site_dependency_lock
   spack -e "${SPACK_ENV}" install
   if [[ "${MFEM_REUSE_STATE}" == "validated-read-only" ]]; then
     revalidate_reused_mfem_after_dependencies
   fi
 fi
 
-if [[ "${IGRLAB_BUILD_SITE:-}" == "pace" ]]; then
-  python3 "${SCRIPT_DIR}/scripts/build/pace_manifest.py" --profile "${PROFILE}" \
-    --check-lock "${SPACK_ENV}/spack.lock"
-fi
+check_site_dependency_lock
 
 SPACK_VIEW="${SPACK_ENV}/.spack-env/view"
 [[ -d "${SPACK_VIEW}" ]] || {
@@ -2770,11 +2781,15 @@ SPACK_VIEW="${SPACK_ENV}/.spack-env/view"
 export PATH="${SPACK_VIEW}/bin:${PATH}"
 export LD_LIBRARY_PATH="${SPACK_VIEW}/lib:${SPACK_VIEW}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-if [[ "${IGRLAB_BUILD_SITE:-}" == "pace" &&
-      "${IGRLAB_PACE_ENV_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
-  flock -u "${IGRLAB_PACE_ENV_LOCK_FD}"
-  exec {IGRLAB_PACE_ENV_LOCK_FD}>&-
-  unset IGRLAB_PACE_ENV_LOCK_FD
+case "${IGRLAB_BUILD_SITE:-}" in
+  pace) site_environment_lock_fd="${IGRLAB_PACE_ENV_LOCK_FD:-}" ;;
+  delta) site_environment_lock_fd="${IGRLAB_DELTA_ENV_LOCK_FD:-}" ;;
+  *) site_environment_lock_fd="" ;;
+esac
+if [[ "${site_environment_lock_fd}" =~ ^[0-9]+$ ]]; then
+  flock -u "${site_environment_lock_fd}"
+  exec {site_environment_lock_fd}>&-
+  unset IGRLAB_PACE_ENV_LOCK_FD IGRLAB_DELTA_ENV_LOCK_FD
 fi
 
 if [[ -n "${MFEM_OUTPUT_ROOT_REQUEST}" ]]; then
@@ -2862,7 +2877,7 @@ APP_OBSERVABILITY="OFF"
 APP_OBSERVABILITY_NVTX="OFF"
 APP_OBSERVABILITY_CALIPER="OFF"
 APP_MPI_TEST_LAUNCHER="OFF"
-if [[ "${IGRLAB_BUILD_SITE:-}" == "pace" ]]; then
+if [[ "${IGRLAB_BUILD_SITE:-}" == "pace" || "${IGRLAB_BUILD_SITE:-}" == "delta" ]]; then
   APP_MPI_TEST_LAUNCHER="ON"
 fi
 if ((CALIPER)); then

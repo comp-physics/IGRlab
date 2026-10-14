@@ -159,31 +159,39 @@ def allocation(saved):
     """Record actual live scheduler/device identity, never a completion claim."""
     environment = {name: os.environ.get(name, '') for name in SLURM_KEYS}
     value = {'hostname': socket.getfqdn(), 'uid': os.getuid(), 'environment': environment}
-    if saved['policy'].get('site') != 'pace':
+    site = saved['policy'].get('site')
+    if site not in ('pace', 'delta'):
         value['authority'] = 'non-PACE; no scheduler or GPU admission'
         return value
     job = environment['SLURM_JOB_ID']
     require(re.fullmatch(r'[1-9][0-9]*', job) and 'login' not in value['hostname'],
-            'PACE test receipt requires a live compute allocation')
+            f'{site} test receipt requires a live compute allocation')
     command = ['scontrol', 'show', 'job', '-o', job]
     result = subprocess.run(command, text=True, capture_output=True, timeout=30)
     require(result.returncode == 0, f'allocation identity query failed: {result.stderr}')
     fields = dict(re.findall(r'(?:^|\s)([A-Za-z][A-Za-z0-9_]*)=(\S+)', result.stdout))
+    profile = saved['policy']['profile']
+    account = 'gts-sbryngelson3' if site == 'pace' else (
+        'bdiy-delta-gpu' if profile.startswith('cuda-sm') else 'bdiy-delta-cpu')
     require(fields.get('JobId') == job and fields.get('JobState') == 'RUNNING' and
-            fields.get('Account') == 'gts-sbryngelson3' and fields.get('QOS') == 'embers' and
+            fields.get('Account') == account and (site != 'pace' or fields.get('QOS') == 'embers') and
             fields.get('UserId') == f'{pwd.getpwuid(os.getuid()).pw_name}({os.getuid()})' and
             fields.get('BatchFlag') in ('0', '1'),
-            'test allocation is not the current owned running free PACE job')
+            f'test allocation is not the current owned running {site} job')
     require(all(environment[key] == fields[field] for key, field in (
-                ('SLURM_JOB_ACCOUNT', 'Account'), ('SLURM_JOB_QOS', 'QOS'),
-                ('SLURM_JOB_PARTITION', 'Partition'))),
+                ('SLURM_JOB_ACCOUNT', 'Account'), ('SLURM_JOB_PARTITION', 'Partition'))) and
+            (site != 'pace' or environment['SLURM_JOB_QOS'] == fields.get('QOS')),
             'Slurm test environment differs from live allocation identity')
-    value.update(authority='live PACE allocation', scheduler={'argv': command,
+    value.update(authority=f'live {"PACE" if site == "pace" else "Delta"} allocation', scheduler={'argv': command,
                  'returncode': result.returncode, 'stdout': result.stdout, 'fields': fields})
-    profile = saved['policy']['profile']
+    if site == 'delta' and profile == 'cpu':
+        require(fields.get('Partition') == 'cpu', 'Delta CPU validation requires the CPU partition')
     if profile.startswith('cuda-sm'):
         model, capability, partition = {'cuda-sm80': ('A100', '8.0', 'gpu-a100'),
                                         'cuda-sm70': ('V100', '7.0', 'gpu-v100')}[profile]
+        if site == 'delta':
+            require(profile == 'cuda-sm80', 'Delta site currently supports native A100 validation')
+            partition = 'gpuA100x4'
         visible = environment['CUDA_VISIBLE_DEVICES']
         require(fields.get('Partition') == partition and
                 'gres/gpu=1' in fields.get('AllocTRES', '').split(',') and

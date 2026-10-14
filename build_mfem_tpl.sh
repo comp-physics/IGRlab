@@ -169,6 +169,12 @@ else
   CUDA_CODEGEN="none"
 fi
 
+# Delta uses the installed CUDA-aware MPI for CPU and GPU applications.
+# This changes MPI selection only; CPU MFEM and HYPRE keep CUDA disabled.
+if [[ "${IGRLAB_BUILD_SITE:-}" == "delta" ]]; then
+  MPI_SPEC="openmpi+cuda"
+fi
+
 echo "[mfem-plan] mode=${MODE} profile=${PROFILE} dependency_cuda_arch=${DEPENDENCY_CUDA_ARCH} cuda_codegen_archs=${CUDA_CODEGEN} jobs=${JOBS}"
 echo "[mfem-plan] env=${SPACK_ENV} source=${MFEM_SRC} build=${MFEM_BUILD} install=${MFEM_INSTALL}"
 
