@@ -4,7 +4,9 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import struct
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import subprocess
 import tempfile
@@ -42,7 +44,35 @@ def file_identity(path):
     path = Path(path)
     require(path.is_absolute() and path.is_file() and not path.is_symlink() and
             path == path.resolve(strict=True), f'missing, moved, or symlinked artifact: {path}')
-    return {'sha256': digest(path.read_bytes()), 'mode': path.stat().st_mode & 0o777}
+    checksum = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            checksum.update(block)
+    return {'sha256': checksum.hexdigest(), 'mode': path.stat().st_mode & 0o777}
+
+
+def _artifact_hash_workers(path_count):
+    raw = os.environ.get('IGRLAB_VALIDATION_HASH_THREADS', '4')
+    require(re.fullmatch(r'[1-9][0-9]*', raw) is not None,
+            'IGRLAB_VALIDATION_HASH_THREADS must be a positive integer')
+    requested = int(raw)
+    try:
+        allowed = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        allowed = os.cpu_count() or 1
+    require(allowed > 0, 'artifact hashing has no allowed CPUs')
+    return min(requested, allowed, path_count)
+
+
+def _artifact_file_identities(paths):
+    """Fresh runtime-byte identities with sorted results and first-error order."""
+    paths = tuple(sorted(paths))
+    workers = _artifact_hash_workers(len(paths))
+    if workers <= 1:
+        return {str(path): file_identity(path) for path in paths}
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='igr-validation-hash') as pool:
+        # map yields in input order even if later files finish or fail first.
+        return {str(path): identity for path, identity in zip(paths, pool.map(file_identity, paths))}
 
 
 def source_identity(root):
@@ -181,7 +211,7 @@ def artifacts(app_build, app_install, mfem_build, mfem_install, spack_env, cmake
     graph = json.loads(subprocess.run(graph_command, check=True, capture_output=True,
                                      text=True, timeout=60).stdout)
     require(isinstance(graph.get('tests'), list) and graph['tests'], 'prebuilt CTest graph contains no tests')
-    return {'files': {str(path): file_identity(path) for path in sorted(selected)},
+    return {'files': _artifact_file_identities(selected),
             'links': links, 'test_graph': graph}
 
 

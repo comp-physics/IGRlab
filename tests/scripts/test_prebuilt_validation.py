@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Host-only run-only admission contracts; no application is compiled or run."""
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -9,6 +10,7 @@ import pwd
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -20,6 +22,136 @@ spec.loader.exec_module(prebuilt)
 result_spec = importlib.util.spec_from_file_location('test_results', SOURCE / 'scripts/build/test_result_receipt.py')
 test_results = importlib.util.module_from_spec(result_spec)
 result_spec.loader.exec_module(test_results)
+
+
+class ArtifactHashing(unittest.TestCase):
+    def test_streaming_hash_retains_mode_and_bounds_reads(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / 'library.a'
+            data = b'x' * (3 * 1024 * 1024) + b'final bytes'
+            path.write_bytes(data)
+            path.chmod(0o750)
+            reads = []
+            real_open = Path.open
+            class TrackedStream:
+                def __enter__(self):
+                    self.stream = real_open(path, 'rb')
+                    return self
+                def __exit__(self, *args):
+                    self.stream.close()
+                def read(self, size):
+                    reads.append(size)
+                    self.assert_bounded(size)
+                    return self.stream.read(size)
+                def assert_bounded(self, size):
+                    if not 0 < size <= 1024 * 1024:
+                        raise AssertionError('unbounded artifact read')
+            with mock.patch.object(Path, 'open', return_value=TrackedStream()), \
+                    mock.patch.object(Path, 'read_bytes', side_effect=AssertionError('whole-file read')):
+                result = prebuilt.file_identity(path)
+            self.assertEqual(result, {'sha256': hashlib.sha256(data).hexdigest(), 'mode': 0o750})
+            self.assertGreater(len(reads), 3)
+
+    def test_fresh_byte_mutation_is_seen_even_with_same_size_and_mtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / 'library.a'
+            path.write_bytes(b'original runtime bytes')
+            before = path.stat()
+            with mock.patch.dict(os.environ, {'IGRLAB_VALIDATION_HASH_THREADS': '4'}):
+                first = prebuilt._artifact_file_identities([path])
+                path.write_bytes(b'changed! runtime bytes')
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+                second = prebuilt._artifact_file_identities([path])
+            self.assertEqual(path.stat().st_size, before.st_size)
+            self.assertEqual(path.stat().st_mtime_ns, before.st_mtime_ns)
+            self.assertNotEqual(first[str(path)]['sha256'], second[str(path)]['sha256'])
+
+    def test_parallel_reads_overlap_with_affinity_bound_and_equal_sorted_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            paths = [root / str(index) for index in range(6)]
+            for index, path in enumerate(paths):
+                path.write_bytes(bytes([index]) * 23)
+            with mock.patch.dict(os.environ, {'IGRLAB_VALIDATION_HASH_THREADS': '1'}), \
+                    mock.patch.object(prebuilt, 'ThreadPoolExecutor', side_effect=AssertionError('sequential pool')):
+                sequential = prebuilt._artifact_file_identities(reversed(paths))
+            original = prebuilt.file_identity
+            lock, barrier = threading.Lock(), threading.Barrier(2)
+            active = peak = 0
+            calls = []
+            def tracked(path):
+                nonlocal active, peak
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                    calls.append(path)
+                try:
+                    barrier.wait(timeout=3)
+                    return original(path)
+                finally:
+                    with lock:
+                        active -= 1
+            with mock.patch.dict(os.environ, {'IGRLAB_VALIDATION_HASH_THREADS': '20'}), \
+                    mock.patch.object(prebuilt.os, 'sched_getaffinity', return_value={3, 7}), \
+                    mock.patch.object(prebuilt, 'file_identity', side_effect=tracked):
+                parallel = prebuilt._artifact_file_identities(reversed(paths))
+            self.assertEqual(peak, 2)
+            self.assertCountEqual(calls, paths)
+            self.assertEqual(parallel, sequential)
+            self.assertEqual(list(parallel), [str(path) for path in sorted(paths)])
+
+    def test_parallel_first_error_is_sorted_even_when_later_error_finishes_first(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            target = root / 'target'
+            target.write_bytes(b'real artifact')
+            first, second = root / 'a-symlink', root / 'b-missing'
+            first.symlink_to(target)
+            later_failed = threading.Event()
+            original = prebuilt.file_identity
+            def ordered_failure(path):
+                if path == first:
+                    self.assertTrue(later_failed.wait(timeout=3))
+                    return original(path)
+                try:
+                    return original(path)
+                finally:
+                    later_failed.set()
+            with mock.patch.dict(os.environ, {'IGRLAB_VALIDATION_HASH_THREADS': '2'}), \
+                    mock.patch.object(prebuilt.os, 'sched_getaffinity', return_value={1, 2}), \
+                    mock.patch.object(prebuilt, 'file_identity', side_effect=ordered_failure), \
+                    self.assertRaisesRegex(ValueError, 'a-symlink'):
+                prebuilt._artifact_file_identities([second, first])
+            self.assertTrue(later_failed.is_set())
+
+    def test_default_override_cpu_fallback_and_path_count_bound(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(prebuilt.os, 'sched_getaffinity', return_value=set(range(8))):
+            self.assertEqual(prebuilt._artifact_hash_workers(20), 4)
+            self.assertEqual(prebuilt._artifact_hash_workers(2), 2)
+            self.assertEqual(prebuilt._artifact_hash_workers(0), 0)
+            with mock.patch.dict(os.environ, {'IGRLAB_VALIDATION_HASH_THREADS': '1'}):
+                self.assertEqual(prebuilt._artifact_hash_workers(20), 1)
+        with mock.patch.dict(os.environ, {'IGRLAB_VALIDATION_HASH_THREADS': '20'}), \
+                mock.patch.object(prebuilt.os, 'sched_getaffinity', side_effect=OSError()), \
+                mock.patch.object(prebuilt.os, 'cpu_count', return_value=3):
+            self.assertEqual(prebuilt._artifact_hash_workers(20), 3)
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(prebuilt.os, 'sched_getaffinity', side_effect=AttributeError()), \
+                mock.patch.object(prebuilt.os, 'cpu_count', return_value=None):
+            self.assertEqual(prebuilt._artifact_hash_workers(20), 1)
+        with mock.patch.object(prebuilt.os, 'sched_getaffinity', return_value=set()), \
+                self.assertRaisesRegex(ValueError, 'no allowed CPUs'):
+            prebuilt._artifact_hash_workers(20)
+
+    def test_malformed_option_rejects_before_reading_any_artifact(self):
+        for raw in ('', '0', '-1', '+1', '1.0', 'true', ' 1', '1 ', '1\n'):
+            with self.subTest(raw=raw), \
+                    mock.patch.dict(os.environ, {'IGRLAB_VALIDATION_HASH_THREADS': raw}), \
+                    mock.patch.object(prebuilt, 'file_identity') as identity, \
+                    self.assertRaisesRegex(ValueError, 'positive integer'):
+                prebuilt._artifact_file_identities([Path('/unused')])
+            identity.assert_not_called()
 
 
 class CTestGraphSelection(unittest.TestCase):
@@ -437,6 +569,25 @@ else:
         self.put(self.repo / '__pycache__/fake.pyc', 'ignored bytecode')
         self.put(self.build / 'Testing/Temporary/LastTest.log', 'mutable CTest result')
         prebuilt.verify(self.args)
+
+    def test_full_receipt_sequential_parallel_equivalence_and_fresh_library_rejection(self):
+        with mock.patch.dict(os.environ, {'IGRLAB_VALIDATION_HASH_THREADS': '1'}):
+            sequential = prebuilt.verify(self.args)
+        with mock.patch.dict(os.environ, {'IGRLAB_VALIDATION_HASH_THREADS': '4'}), \
+                mock.patch.object(prebuilt.os, 'sched_getaffinity', return_value=set(range(4))):
+            parallel = prebuilt.verify(self.args)
+        self.assertEqual(parallel, sequential)
+        self.assertEqual(list(parallel['artifacts']['files']), sorted(parallel['artifacts']['files']))
+        library = self.minstall / 'lib/libmfem.a'
+        original = library.read_bytes()
+        before = library.stat()
+        library.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        os.utime(library, ns=(before.st_atime_ns, before.st_mtime_ns))
+        for workers in ('1', '4'):
+            with self.subTest(workers=workers), \
+                    mock.patch.dict(os.environ, {'IGRLAB_VALIDATION_HASH_THREADS': workers}), \
+                    self.assertRaisesRegex(ValueError, 'artifacts changed'):
+                prebuilt.verify(self.args)
 
     def test_nonignored_untracked_source_is_pinned(self):
         self.put(self.repo / 'new.cpp', 'new source')
