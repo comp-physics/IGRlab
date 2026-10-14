@@ -1,11 +1,13 @@
 #include "igrlab/compat.hpp"
 #include "mfem.hpp"
 #include "mfem/general/forall.hpp"
+#include "physics/igr/IGR.hpp"
 #include "../src/numerics/dg/DGFaceQuadratureKernels.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -458,6 +460,154 @@ void CheckDictionaryGeometryRebuild()
   PrepareInteriorFaceShapeDictionary2D(info, work.shape, work.shape_dictionary, 1);
   parity(info); // A budget decline follows the original full-S warp path.
 }
+
+class ScopedEnvironment
+{
+public:
+  ScopedEnvironment(const char* name, const char* value) : name_(name)
+  {
+    if (const char* old = std::getenv(name))
+    { had_value_ = true; value_ = old; }
+    setenv(name, value, 1);
+  }
+  ~ScopedEnvironment()
+  {
+    if (had_value_) { setenv(name_.c_str(), value_.c_str(), 1); }
+    else { unsetenv(name_.c_str()); }
+  }
+private:
+  std::string name_, value_;
+  bool had_value_ = false;
+};
+
+// A test-only virtual-access witness distinguishes the production direct
+// read from the old identity-copy path, without adding a production counter.
+class ObservedInput final : public Vector
+{
+public:
+  using Vector::Vector;
+  using Vector::operator=;
+  const real_t* Read(bool on_device = true) const override
+  { ++reads; return Vector::Read(on_device); }
+  const real_t* HostRead() const override
+  { ++reads; return Vector::HostRead(); }
+  mutable int reads = 0;
+};
+
+void CheckProductionIdentityCopies()
+{
+  for (const int order : {3, 5})
+  {
+    for (const bool timed : {false, true})
+    {
+      ScopedEnvironment timing("IGRLAB_IGR_EXACT_FACE_TIMING", timed ? "1" : "0");
+      Mesh serial = MakeMesh(1);
+      ParMesh mesh(MPI_COMM_SELF, serial);
+      DG_FECollection fec(order, 2, mfem::BasisType::GaussLegendre);
+      ParFiniteElementSpace scalar_fes(&mesh, &fec, 1, Ordering::byNODES);
+      ParFiniteElementSpace state_fes(&mesh, &fec, 4, Ordering::byNODES);
+      MFEM_VERIFY(scalar_fes.Conforming() && scalar_fes.GetNRanks() == 1 &&
+                    mfem::IsIdentityProlongation(scalar_fes.GetProlongationMatrix()) &&
+                    mfem::IsIdentityProlongation(
+                      scalar_fes.GetRestrictionTransposeOperator()) &&
+                    !mfem::IsIdentityProlongation(scalar_fes.GetRestrictionOperator()),
+                  "Production fixture needs the actual wrapped identity restriction.");
+      ParGridFunction state(&state_fes);
+      state.UseDevice(true);
+      ::igrlab::IGRSolver solver(scalar_fes, state_fes, 2, 4, 0.07);
+      solver.SetGradBackend(::igrlab::IGRGradBackend::BrokenDG);
+      solver.SetIPKind(::igrlab::IGRIPKind::SIPG);
+      solver.SetExactDGFaceOperator(true);
+      // Assemble the real production operator without an unrelated Krylov
+      // solve: the comparisons below apply its public existing components.
+      solver.SetSolveMode(::igrlab::IGRSolveMode::SmootherSweeps);
+      solver.SetSweeps(0, 0);
+      Vector previous_face;
+      for (int refresh = 0; refresh < 2; ++refresh)
+      {
+        const int ndofs = state_fes.GetNDofs();
+        real_t* u = state.HostWrite();
+        for (int d = 0; d < ndofs; ++d)
+        {
+          const real_t rho = (refresh ? 1.19 : 1.0) *
+            (1.0 + 0.03 * std::sin(0.17 * (d + 1)));
+          u[d] = rho;
+          u[d + ndofs] = 0.04 * rho;
+          u[d + 2 * ndofs] = -0.02 * rho;
+          u[d + 3 * ndofs] = 2.5 + 0.001 * rho;
+        }
+        solver.UpdateFromState(state, false);
+        const auto* face = solver.GetLinearFaceOperator();
+        const auto* base = solver.GetLinearBaseOperator();
+        const auto* full = solver.GetLinearOperator();
+        MFEM_VERIFY(face && base && full && solver.GetLastExactFaceEffective() &&
+                      solver.GetLastExactFaceSharedFaceCount() == 0,
+                    "Fixture must use the real no-shared production exact face.");
+        ObservedInput input(face->Width());
+        input.UseDevice(true);
+        real_t* x = input.Write();
+        const int n = input.Size();
+        forall(n, [=] MFEM_HOST_DEVICE(int i)
+        { x[i] = i == 0 ? -0.0 : 0.01 * std::sin(0.13 * (i + 1)); });
+        Vector direct(face->Height());
+        direct.UseDevice(true);
+        MFEM_VERIFY(input.OwnsData() && direct.OwnsData(),
+                    "Direct fixture requires distinct owned allocations.");
+        if (mfem::Device::Allows(mfem::Backend::CUDA))
+        { MFEM_VERIFY(!input.GetMemory().HostIsValid(), "Fresh device input required."); }
+        face->Mult(input, direct);
+        MFEM_VERIFY(input.reads > 0,
+                    "Production identity path must read the current input directly.");
+
+        // A nonowning input forces the unchanged original staging path. Both
+        // paths use the same original face kernels/current coefficients.
+        ObservedInput view;
+        view.MakeRef(input, 0, n);
+        Vector original(face->Height());
+        original.UseDevice(true);
+        face->Mult(view, original);
+        MFEM_VERIFY(view.reads == 0 && SameBits(direct, original),
+                    "Direct action must match the original alias fallback bitwise.");
+        RequireFinite(direct);
+        MFEM_VERIFY(direct.Normlinf() > 1.0e-6,
+                    "Production fixture needs a nontrivial face action.");
+
+        // Preserve the complete original base + face addition, rather than
+        // accumulating individual face contributions into the base output.
+        Vector expected(full->Height()), actual(full->Height());
+        expected.UseDevice(true); actual.UseDevice(true);
+        base->Mult(input, expected);
+        expected += original;
+        full->Mult(input, actual);
+        MFEM_VERIFY(SameBits(expected, actual), "Production sum changed base + face bits.");
+
+        ObservedInput in_place(n);
+        in_place.UseDevice(true);
+        in_place = static_cast<const Vector&>(input);
+        face->Mult(in_place, in_place);
+        MFEM_VERIFY(in_place.reads == 0 && SameBits(in_place, original),
+                    "In-place action must retain the original staging fallback.");
+
+        Vector backing(n + 1);
+        backing.UseDevice(true);
+        const real_t* original_input = input.HostRead();
+        real_t* backing_input = backing.HostWrite();
+        std::copy(original_input, original_input + n, backing_input);
+        backing_input[n] = 0.0;
+        ObservedInput overlap_input;
+        overlap_input.MakeRef(backing, 0, n);
+        Vector overlap_output;
+        overlap_output.MakeRef(backing, 1, n);
+        face->Mult(overlap_input, overlap_output);
+        MFEM_VERIFY(overlap_input.reads == 0 && SameBits(overlap_output, original),
+                    "Partially overlapping views must retain the original staging fallback.");
+        if (refresh)
+        { MFEM_VERIFY(!SameBits(previous_face, original), "Coefficient refresh must change action."); }
+        previous_face = original;
+      }
+    }
+  }
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -470,6 +620,7 @@ int main(int argc, char** argv)
   MFEM_VERIFY(mfem::Mpi::WorldSize() == 1, "Exact face fixture is single rank.");
   CheckDictionaryAdmission();
   CheckDictionaryGeometryRebuild();
+  CheckProductionIdentityCopies();
   int cases = 0;
   double max_assembled_error = 0.0;
   for (const int basis : {mfem::BasisType::GaussLegendre,

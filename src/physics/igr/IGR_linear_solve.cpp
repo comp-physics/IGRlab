@@ -1007,6 +1007,15 @@ public:
         &shared_scratch_.penalty_metric);
       has_shared_ = (shared_info_.nf > 0);
     }
+    // Rank-one conforming MFEM spaces expose P as an IdentityOperator and
+    // R as a TransposeOperator over an IdentityOperator. Prove both actions;
+    // equal true/local dimensions alone do not establish an identity layout.
+    direct_identity_layout_ = sfes_.Conforming() && sfes_.GetNRanks() == 1 &&
+      !has_shared_ && mfem::IsIdentityProlongation(prolong_) &&
+      mfem::IsIdentityProlongation(sfes_.GetRestrictionTransposeOperator()) &&
+      info_.vdim == 1 && info_.ne > 0 && info_.dof > 0 &&
+      static_cast<long long>(info_.ne) * info_.dof == sfes_.GetVSize() &&
+      sfes_.GetTrueVSize() == sfes_.GetVSize();
   }
 
   bool CanRefresh(const mfem::ParFiniteElementSpace& sfes,
@@ -1060,6 +1069,30 @@ public:
   void Mult(const mfem::Vector& x, mfem::Vector& y) const override
   {
     ::igrlab::NVTXRange range("IGR/exact-face/Mult");
+    // Admit only distinct owning vectors. MFEM aliases and external wrappers
+    // can overlap even when their starting pointers differ; keep the original
+    // staging path for those calls, including in-place Mult.
+    if (direct_identity_layout_ && sfes_.GetSequence() == sfes_sequence_ &&
+        x.Size() == Width() && y.Size() == Height() && &x != &y &&
+        x.OwnsData() && y.OwnsData())
+    {
+      const auto setup_start = timing_enabled_ ? Clock::now() : Clock::time_point{};
+      y = 0.0;
+      if (timing_enabled_)
+      { timing_.face_setup_seconds += ElapsedSeconds(setup_start); }
+      const auto apply_start = timing_enabled_ ? Clock::now() : Clock::time_point{};
+      {
+        ::igrlab::NVTXRange apply_range("IGR/exact-face/local-apply");
+        dg_face::LaunchInteriorFaceDGDiffusionApply2D(info_, scratch_, x,
+                                                     ip_sigma_, y);
+      }
+      if (timing_enabled_)
+      {
+        timing_.local_apply_seconds += ElapsedSeconds(apply_start);
+        ++timing_.mult_calls;
+      }
+      return;
+    }
     if (!timing_enabled_)
     {
       local_y_.SetSize(sfes_.GetVSize(), y);
@@ -1226,6 +1259,7 @@ private:
   dg_face::InteriorFaceDGDiffusionApplyInfo info_;
   dg_face::InteriorFaceDGDiffusionApplyScratch scratch_;
   bool has_shared_ = false;
+  bool direct_identity_layout_ = false;
   dg_face::SharedFaceDGDiffusionApplyInfo shared_info_;
   dg_face::SharedFaceDGDiffusionApplyScratch shared_scratch_;
   mutable mfem::Vector local_y_;
