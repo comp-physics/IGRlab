@@ -67,9 +67,11 @@ PY
 export OMPI_CC="${study_compilers[0]}" OMPI_CXX="${study_compilers[1]}" OMPI_FC="${study_compilers[2]}"
 study_packages=(openmpi hypre openblas metis)
 [[ $study_profile == cpu ]] || study_packages=(openmpi cuda hypre umpire openblas metis)
+study_mpi_prefix=
 for study_package in "${study_packages[@]}"; do
   study_prefix=$(spack -e "$study_env" location -i "$study_package")
   [[ -d $study_prefix ]] || { echo "missing selected package: $study_package" >&2; exit 2; }
+  [[ $study_package != openmpi ]] || study_mpi_prefix=$study_prefix
   [[ ! -d $study_prefix/bin ]] || export PATH="$study_prefix/bin:$PATH"
   for study_lib in lib lib64; do
     [[ ! -d $study_prefix/$study_lib ]] || export LD_LIBRARY_PATH="$study_prefix/$study_lib:${LD_LIBRARY_PATH:-}"
@@ -81,5 +83,11 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 # admission before applications. Only its rank-one launch selectors are removed.
 if [[ $study_profile == cuda-sm80 ]]; then
   unset SLURM_STEP_ID SLURM_STEPID
+  # HPC-X's non-exec orted shell wrapper retains the singleton report pipe.
+  # Select its own native daemon while keeping the admitted MPI libraries/setup.
+  [[ -x $study_mpi_prefix/bin/.bin/orted && -x $study_mpi_prefix/bin/.bin/ompi_info ]] || {
+    echo 'selected HPC-X native daemon/tool directory is unavailable' >&2; exit 2;
+  }
+  export OPAL_BINDIR="$study_mpi_prefix/bin/.bin"
 fi
 exec python3 -B "$study_executor/gpu_study.py" worker --run-dir "$(dirname -- "$study_plan")" --stage "$study_stage"

@@ -64,6 +64,14 @@ stay intact. The worker still verifies live ownership, resources, node, end time
 and GPU before running applications. This does not change the parent owner or
 fake a Slurm allocation. [Open MPI routing source](https://github.com/open-mpi/ompi/blob/v4.1.8/orte/mca/schizo/slurm/schizo_slurm.c)
 
+The installed HPC-X `orted` shell wrapper retains the singleton report-pipe
+writer while waiting for its daemon, so MPI initialization can wait indefinitely
+for EOF. The runtime derives `OPAL_BINDIR` from the selected system MPI prefix
+and requires executable `bin/.bin/orted` and `bin/.bin/ompi_info` before selecting
+that native directory. MPI libraries, compiler wrappers and loader setup stay
+unchanged. [Open MPI directory override](https://github.com/open-mpi/ompi/blob/v4.1.8/opal/mca/installdirs/env/opal_installdirs_env.c),
+[singleton report-pipe handling](https://github.com/open-mpi/ompi/blob/v4.1.8/orte/mca/ess/singleton/ess_singleton_module.c)
+
 Keep useful GPU allocations running through prepared sequential work. Nsight
 Systems full-solver traces and closure-inclusive Nsight Compute captures stay
 on Delta and are processed on compute. Request the documented
