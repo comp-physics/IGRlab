@@ -150,7 +150,7 @@ def existing_plan(record, correctness_regex, *, reuse_validated_artifacts=False)
             'mfem_cache': {'mode': 'shared-canonical', 'output_root': str(mfem), 'lock': str(mfem / '.lock')},
             'plan_stdout': stdout, 'plan_stderr': response.stderr.decode(errors='replace'),
             'test_result': str(result_path), 'test_result_sha256': result_sha,
-            'test_result_runner_sha256': sha(result_module()[1]),
+            'test_result_runner_sha256': sha(source / 'scripts/build/test_result_receipt.py'),
             'build_job_id': str(record['build_job_id'])}
     if site != 'pace':
         plan['site'] = site
@@ -172,7 +172,10 @@ def validate_result(plan, *, full=False):
             result.get('success') is True and result.get('returncode') == 0 and
             result.get('identity_verified_before_and_after') is True,
             'import requires a final successful actual canonical test-result receipt')
-    require(result.get('runner_sha256') == plan.get('test_result_runner_sha256', sha(runner_path)),
+    source_runner = Path(plan['source']['source_snapshot']) / 'scripts/build/test_result_receipt.py'
+    source_runner_sha = sha(source_runner)
+    require(result.get('runner_sha256') ==
+            plan.get('test_result_runner_sha256', sha(runner_path)) == source_runner_sha,
             'unsupported test-result runner identity')
     saved_path = exact(result['prebuilt_receipt'])
     require(saved_path == Path(plan['app_build']) / 'igrlab-prebuilt-validation-v1.json' and
@@ -221,7 +224,7 @@ def validate_result(plan, *, full=False):
             'disabled tests are not executed acceptance')
     required = {name for name in full_tests if re.search(plan['correctness_regex'], name)}
     require(required and required <= set(names), 'passed test set does not cover the suite correctness regex')
-    artifacts = {str(result_path): plan['test_result_sha256'], plan['request_path']: plan['request_sha256'],
+    artifacts = {str(source_runner): source_runner_sha, str(result_path): plan['test_result_sha256'], plan['request_path']: plan['request_sha256'],
                  str(saved_path): result['prebuilt_receipt_sha256']}
     require(set(result.get('logs', {})) == {'stdout.log', 'stderr.log'}, 'actual test logs are missing')
     for name, log in result['logs'].items():

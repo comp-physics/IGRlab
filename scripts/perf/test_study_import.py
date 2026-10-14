@@ -71,6 +71,7 @@ class StudyImportTests(unittest.TestCase):
                                 '2/2 Test #9: accept-b ........ Passed 0.30 sec\n')
         self.write(self.stderr, '')
         _, runner_path = study.result_module()
+        self.write(self.source / 'scripts/build/test_result_receipt.py', runner_path.read_text())
         self.user = pwd.getpwuid(os.getuid()).pw_name
         self.fields = {'JobId': '202', 'JobState': 'RUNNING', 'UserId': f'{self.user}({os.getuid()})',
                        'Account': 'gts-sbryngelson3', 'QOS': 'embers', 'Partition': 'gpu-a100',
@@ -177,6 +178,40 @@ class StudyImportTests(unittest.TestCase):
     def plan(self, *, reuse_validated_artifacts=False):
         return study.existing_plan(self.record, '^accept-',
                                    reuse_validated_artifacts=reuse_validated_artifacts)
+
+    def test_distinct_baseline_and_candidate_source_runners_import(self):
+        identities = []
+        for member in ('baseline', 'candidate'):
+            with self.subTest(member=member):
+                runner = self.source / 'scripts/build/test_result_receipt.py'
+                self.write(runner, self.runner_path.read_text() + '\n# frozen ' + member + ' revision\n')
+                self.result['runner_sha256'] = study.sha(runner)
+                self.publish_result()
+                plan = self.plan()
+                self.assertEqual(plan['test_result_runner_sha256'], study.sha(runner))
+                study.validate_result(plan, full=True)
+                identities.append(plan['test_result_runner_sha256'])
+        self.assertNotEqual(*identities)
+
+    def test_forged_runner_and_changed_source_runner_rejected(self):
+        runner = self.source / 'scripts/build/test_result_receipt.py'
+        plan = self.plan()
+        self.result['runner_sha256'] = '0' * 64
+        self.publish_result()
+        plan['test_result_sha256'] = study.sha(self.result_path)
+        with self.assertRaisesRegex(ValueError, 'runner identity'):
+            study.validate_result(plan)
+        self.result['runner_sha256'] = study.sha(runner)
+        self.publish_result()
+        plan['test_result_sha256'] = study.sha(self.result_path)
+        runner.write_text(runner.read_text() + '\n# changed\n')
+        with self.assertRaisesRegex(ValueError, 'runner identity'):
+            study.validate_result(plan)
+
+    def test_legacy_plan_without_explicit_runner_pin_still_imports(self):
+        plan = self.plan()
+        del plan['test_result_runner_sha256']
+        study.validate_result(plan, full=True)
 
     def test_explicit_artifact_reuse_retains_seals_without_historical_queries(self):
         # Neither expired accounting nor the later state of the old allocation
