@@ -44,7 +44,9 @@ using ::igrlab::dg_face::InteriorFaceDGDiffusionApplyInfo;
 using ::igrlab::dg_face::InteriorFaceDGDiffusionApplyScratch;
 using ::igrlab::dg_face::InteriorFaceDGDiffusionGather2D;
 using ::igrlab::dg_face::InteriorFaceDGDiffusionRecord2D;
+using ::igrlab::dg_face::InteriorFaceShapeDictionary2D;
 using ::igrlab::dg_face::LaunchInteriorFaceDGDiffusionCoefficientUpdate2D;
+using ::igrlab::dg_face::PrepareInteriorFaceShapeDictionary2D;
 
 bool SameBits(const Vector& a, const Vector& b)
 {
@@ -60,6 +62,70 @@ void RequireFinite(const Vector& v)
   {
     MFEM_VERIFY(std::isfinite(data[i]), "Exact face output was not written.");
   }
+}
+
+void CheckDictionaryCopies(const InteriorFaceDGDiffusionApplyInfo& info,
+                           const InteriorFaceDGDiffusionApplyScratch& work)
+{
+  if (!work.shape_dictionary.Matches(info)) { return; }
+  const int block = 2 * info.nq * info.dof;
+  const real_t* full = work.shape.HostRead();
+  const real_t* compact = work.shape_dictionary.values.HostRead();
+  const int* slots = work.shape_dictionary.face_slots.HostRead();
+  for (int face = 0; face < info.nf; ++face)
+  {
+    MFEM_VERIFY(slots[face] >= 0 && slots[face] < work.shape_dictionary.slot_count &&
+                  std::memcmp(full + block * face, compact + block * slots[face],
+                              std::size_t(block) * sizeof(real_t)) == 0,
+                "Shape dictionary must copy every original bit pattern.");
+  }
+}
+
+void CheckDictionaryAdmission()
+{
+  InteriorFaceDGDiffusionApplyInfo info;
+  info.dof = 2; info.nq = 1; info.nf = 6;
+  info.connectivity_revision = ::igrlab::dg_face::NextDGFaceConnectivityRevision();
+  Vector shape(2 * info.dof * info.nq * info.nf);
+  real_t* s = shape.HostWrite();
+  for (int face = 0; face < info.nf; ++face)
+  {
+    s[4 * face] = face < 2 ? 0.0 : -0.0;
+    s[4 * face + 1] = 1.0;
+    s[4 * face + 2] = -1.0;
+    s[4 * face + 3] = 2.0;
+    if (face >= 4)
+    {
+      static_assert(sizeof(real_t) == sizeof(std::uint64_t), "FP64 fixture required.");
+      const std::uint64_t payload = UINT64_C(0x7ff8000000000042);
+      std::memcpy(s + 4 * face, &payload, sizeof(payload));
+    }
+  }
+  InteriorFaceShapeDictionary2D dictionary;
+  PrepareInteriorFaceShapeDictionary2D(info, shape, dictionary);
+  MFEM_VERIFY(dictionary.Matches(info) && dictionary.slot_count == 3,
+              "Exact dictionary must distinguish signed zero and copy NaN payloads.");
+  const int* slots = dictionary.face_slots.HostRead();
+  MFEM_VERIFY(slots[0] == slots[1] && slots[2] == slots[3] && slots[4] == slots[5] &&
+                slots[0] != slots[2] && slots[0] != slots[4] && slots[2] != slots[4],
+              "Only byte-identical face blocks may share a slot.");
+  for (int face = 0; face < info.nf; ++face)
+  {
+    MFEM_VERIFY(std::memcmp(shape.HostRead() + 4 * face,
+                            dictionary.values.HostRead() + 4 * slots[face],
+                            4 * sizeof(real_t)) == 0, "Dictionary bytes changed.");
+  }
+  PrepareInteriorFaceShapeDictionary2D(info, shape, dictionary, 1);
+  MFEM_VERIFY(!dictionary.Matches(info) && dictionary.values.Size() == 0 &&
+                dictionary.face_slots.Size() == 0, "Budget miss must discard old geometry.");
+  s = shape.HostWrite();
+  for (int i = 0; i < shape.Size(); ++i) { s[i] = real_t(i + 1); }
+  PrepareInteriorFaceShapeDictionary2D(info, shape, dictionary);
+  MFEM_VERIFY(dictionary.values.Size() == 0 && dictionary.face_slots.Size() == 0,
+              "An all-unique dictionary must use the original table.");
+  info.dof = info.nq = std::numeric_limits<int>::max();
+  PrepareInteriorFaceShapeDictionary2D(info, shape, dictionary);
+  MFEM_VERIFY(dictionary.values.Size() == 0, "Overflowing optional dimensions must decline.");
 }
 
 // Test-only use of the unchanged one-thread/face device functor.  Compiling
@@ -193,11 +259,22 @@ void CheckCase(int order, int face_order, int basis, int geometry,
     const auto info = BuildInteriorFaceDGDiffusionApplyData2D(
       fes, fqs, side_q, kappa, work.shape, work.weighted_normal_dshape,
       work.penalty, work.face_elements, work.element_vdof_map, scaling,
-      &work.normal_dshape_base, &work.penalty_metric);
+      &work.normal_dshape_base, &work.penalty_metric, &work.shape_dictionary);
     MFEM_VERIFY(info.nf == (geometry == 2 ? 24 : 7),
                 "Fixture must cover whole batches and a three-face tail.");
     MFEM_VERIFY(info.dof == (order + 1) * (order + 1) &&
                 info.nq == ir.GetNPoints(), "Unexpected packed dimensions.");
+    CheckDictionaryCopies(info, work);
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+    if (geometry == 0 && info.nq <= 16 &&
+        mfem::Device::Allows(mfem::Backend::CUDA))
+    {
+      MFEM_VERIFY(work.shape_dictionary.Matches(info),
+                  "Repeating Cartesian geometry must exercise compact CUDA S loads.");
+    }
+#endif
+    const Vector compact_before(work.shape_dictionary.values);
+    const auto dictionary_revision = work.shape_dictionary.geometry_revision;
     for (const real_t ip_sigma : {-1.0, 1.0})
     {
       // A second coefficient pack exercises the persistent geometry refresh.
@@ -217,15 +294,37 @@ void CheckCase(int order, int face_order, int basis, int geometry,
           LaunchInteriorFaceDGDiffusionCoefficientUpdate2D(
             info, work, side_q, kappa, scaling);
         }
+        MFEM_VERIFY(work.shape_dictionary.geometry_revision == dictionary_revision &&
+                      SameBits(compact_before, work.shape_dictionary.values),
+                    "Current coefficients must not change the immutable shape dictionary.");
         work.face_contribution.SetSize(2 * info.dof * info.nf);
         work.face_contribution.UseDevice(true);
         work.face_contribution = std::numeric_limits<real_t>::quiet_NaN();
         Vector actual(x.Size());
         actual.UseDevice(true);
         actual = 0.03125;
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+        const bool first_compact_apply = ip_sigma == -1.0 && refresh == 0 &&
+          info.nq <= 16 && work.shape_dictionary.Matches(info) &&
+          mfem::Device::Allows(mfem::Backend::CUDA);
+        if (first_compact_apply)
+        {
+          MFEM_VERIFY(!work.shape.GetMemory().DeviceIsValid(),
+                      "Compact fixture must start with the full S table on host only.");
+        }
+#endif
         // This internal entry point also exercises the record/gather CPU
         // fallback when this source is compiled without CUDA support.
         AddInteriorFaceDGDiffusionApplyDevice2D(info, work, x, ip_sigma, actual);
+#if defined(MFEM_USE_CUDA) && defined(__CUDACC__)
+        if (first_compact_apply)
+        {
+          MFEM_VERIFY(!work.shape.GetMemory().DeviceIsValid() &&
+                        work.shape_dictionary.values.GetMemory().DeviceIsValid() &&
+                        work.shape_dictionary.face_slots.GetMemory().DeviceIsValid(),
+                      "Native compact apply must read its dictionary without migrating full S.");
+        }
+#endif
         Vector original_contribution;
         Vector original = OriginalRecordAndGather(
           info, work, x, ip_sigma, original_contribution);
@@ -298,6 +397,67 @@ void CheckCase(int order, int face_order, int basis, int geometry,
     }
   }
 }
+
+void CheckDictionaryGeometryRebuild()
+{
+  Mesh serial = MakeMesh(0);
+  ParMesh mesh(MPI_COMM_SELF, serial);
+  DG_FECollection fec(5, 2, mfem::BasisType::GaussLegendre);
+  ParFiniteElementSpace fes(&mesh, &fec);
+  IntegrationRule rule(IntRules.Get(Geometry::SEGMENT, 11));
+  Vector side_q(2 * rule.GetNPoints() * 7);
+  side_q = 0.07;
+  Vector x(fes.GetVSize());
+  x.UseDevice(true);
+  real_t* input = x.HostWrite();
+  for (int i = 0; i < x.Size(); ++i) { input[i] = 0.01 * std::sin(0.07 * (i + 1)); }
+  InteriorFaceDGDiffusionApplyScratch work;
+  auto build = [&](bool compact)
+  {
+    FaceQuadratureSpace fqs(mesh, rule, FaceType::Interior);
+    return BuildInteriorFaceDGDiffusionApplyData2D(
+      fes, fqs, side_q, 2.75, work.shape, work.weighted_normal_dshape,
+      work.penalty, work.face_elements, work.element_vdof_map,
+      DGDiffusionFaceScaling::Arithmetic, &work.normal_dshape_base,
+      &work.penalty_metric, compact ? &work.shape_dictionary : nullptr);
+  };
+  auto parity = [&](const InteriorFaceDGDiffusionApplyInfo& info)
+  {
+    Vector actual(x.Size());
+    actual.UseDevice(true);
+    actual = 0.03125;
+    AddInteriorFaceDGDiffusionApplyDevice2D(info, work, x, -1.0, actual);
+    Vector original_contribution;
+    const Vector original = OriginalRecordAndGather(info, work, x, -1.0,
+                                                   original_contribution);
+    RequireFinite(actual);
+    MFEM_VERIFY(SameBits(actual, original) &&
+                  SameBits(work.face_contribution, original_contribution),
+                "Rebuilt or declined dictionary changed the original action.");
+  };
+  auto info = build(true);
+  MFEM_VERIFY(work.shape_dictionary.Matches(info), "Rebuild fixture must admit compression.");
+  const auto first_revision = info.connectivity_revision;
+  const Vector old_shape(work.shape);
+  parity(info);
+  // Legacy vector-only builders can reuse the same allocations; an epoch miss
+  // must reject the old dictionary rather than lazily accepting its pointers.
+  info = build(false);
+  MFEM_VERIFY(info.connectivity_revision != first_revision &&
+                !work.shape_dictionary.Matches(info), "Fresh geometry must reject stale slots.");
+  parity(info);
+  mesh.Transform([](const Vector& point, Vector& out)
+  { out.SetSize(2); out[0] = 1.03 * point[0]; out[1] = 0.97 * point[1]; });
+  rule.IntPoint(0).x += 0.001;
+  info = build(true);
+  MFEM_VERIFY(work.shape_dictionary.Matches(info) && !SameBits(old_shape, work.shape) &&
+                info.connectivity_revision != first_revision,
+              "Same-size changed geometry/rule must rebuild immutable slots.");
+  CheckDictionaryCopies(info, work);
+  parity(info);
+  PrepareInteriorFaceShapeDictionary2D(info, work.shape, work.shape_dictionary, 1);
+  parity(info); // A budget decline follows the original full-S warp path.
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -308,6 +468,8 @@ int main(int argc, char** argv)
   MFEM_VERIFY(backend == "cpu" || backend == "cuda", "Expected cpu or cuda.");
   mfem::Device device(backend.c_str());
   MFEM_VERIFY(mfem::Mpi::WorldSize() == 1, "Exact face fixture is single rank.");
+  CheckDictionaryAdmission();
+  CheckDictionaryGeometryRebuild();
   int cases = 0;
   double max_assembled_error = 0.0;
   for (const int basis : {mfem::BasisType::GaussLegendre,
