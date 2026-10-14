@@ -820,6 +820,39 @@ def submit_pipeline(root, plan):
     submit_stage(root, 'profiles', [timing_job])
 
 
+def delta_gpu_resources(fields, job, host, env):
+    """Distinguish an ordinary job from Delta's counter-exclusive parent job."""
+    def resources(value, cpus, gpus):
+        entries = value.split(',')
+        tres = dict(item.split('=', 1) for item in entries if '=' in item)
+        return (len(entries) == len(tres) and tres.get('cpu') == cpus and
+                tres.get('mem') in ('48G', '49152M') and tres.get('gres/gpu') == gpus and
+                all(key in study_site.policy('delta')['gpu_tres_types'] and count == gpus
+                    for key, count in tres.items() if key.startswith('gres/gpu:')))
+
+    if fields.get('NumCPUs') == '8' and resources(fields.get('AllocTRES', ''), '8', '1'):
+        return None
+    if (fields.get('NumCPUs') != '64' or not resources(fields.get('AllocTRES', ''), '64', '4') or
+            not resources(fields.get('ReqTRES', ''), '8', '1') or
+            not set(re.split('[,&]', fields.get('Features', ''))) >= {'perf', 'nvperf'}):
+        raise RuntimeError('Delta GPU job resources do not match ordinary or counter-exclusive policy')
+    original = os.environ.get('SLURM_STEP_ID') or os.environ.get('SLURM_STEPID')
+    selector = os.environ.get('DELTA_OWNED_STEP_ID') or original or ''
+    if (not re.fullmatch(r'[0-9]+', selector) or original and selector != original):
+        raise RuntimeError('counter-exclusive Delta work requires its preserved actual numeric step ID')
+    command = ['scontrol', 'show', 'step', '-o', job + '.' + selector]
+    query = subprocess.run(command, text=True, capture_output=True, timeout=30, env=env)
+    step = dict(re.findall(r'(?:^|\s)([A-Za-z][A-Za-z0-9_]*)=([^\s]+)', query.stdout))
+    expected = {'StepId': job + '.' + selector, 'UserId': str(os.getuid()), 'State': 'RUNNING',
+                'Partition': 'gpuA100x4', 'Nodes': '1', 'CPUs': '8', 'Tasks': '1'}
+    if (query.returncode or any(step.get(key) != value for key, value in expected.items()) or
+            step.get('NodeList', '').split('.')[0] != host.split('.')[0] or
+            not resources(step.get('TRES', ''), '8', '1')):
+        raise RuntimeError('actual Delta counter step is not the owned eight-CPU single-GPU step')
+    return {'step_id': step['StepId'], 'scheduler': step, 'query_argv': command,
+            'scope': 'single-GPU execution step inside genuine four-GPU counter-exclusive parent allocation'}
+
+
 def delta_allocation(*, interactive=False):
     """Prove actual Delta custody/resources/end time before any native workload."""
     job, host = os.environ.get('SLURM_JOB_ID', ''), socket.getfqdn()
@@ -833,20 +866,14 @@ def delta_allocation(*, interactive=False):
     command = ['scontrol', 'show', 'job', '-o', job]
     query = subprocess.run(command, text=True, capture_output=True, timeout=30, env=env)
     fields = dict(re.findall(r'(?:^|\s)([A-Za-z][A-Za-z0-9_]*)=([^\s]+)', query.stdout))
-    entries = fields.get('AllocTRES', '').split(',')
-    tres = dict(item.split('=', 1) for item in entries if '=' in item)
     expected = {'JobId': job, 'JobState': 'RUNNING', 'NumNodes': '1', 'NumTasks': '1',
-                'NumCPUs': '8', 'UserId': f'{pwd.getpwuid(os.getuid()).pw_name}({os.getuid()})',
+                'UserId': f'{pwd.getpwuid(os.getuid()).pw_name}({os.getuid()})',
                 **study_site.scheduler_fields('delta')}
     if interactive:
         expected['BatchFlag'] = '0'
-    typed = {key: value for key, value in tres.items() if key.startswith('gres/gpu:')}
-    if (query.returncode or len(entries) != len(tres) or
-            any(fields.get(key) != value for key, value in expected.items()) or
-            tres.get('cpu') != '8' or tres.get('mem') not in ('48G', '49152M') or
-            tres.get('gres/gpu') != '1' or any(key not in study_site.policy('delta')['gpu_tres_types'] or
-                                                     value != '1' for key, value in typed.items())):
+    if (query.returncode or any(fields.get(key) != value for key, value in expected.items())):
         raise RuntimeError('actual Delta allocation owner/account/partition/resources differ from the study')
+    step = delta_gpu_resources(fields, job, host, env)
     nodes_command = ['scontrol', 'show', 'hostnames', fields.get('NodeList', '')]
     nodes = subprocess.run(nodes_command, text=True, capture_output=True, timeout=30, env=env)
     if nodes.returncode or [name.split('.')[0] for name in nodes.stdout.split()] != [host.split('.')[0]]:
@@ -860,7 +887,8 @@ def delta_allocation(*, interactive=False):
     gpu = study_profiles.gpu_identity()
     return {'profile': 'cuda-sm80', 'job_id': job, 'hostname': host, 'uid': os.getuid(),
             'end_epoch': end, 'scheduler': fields, 'gpu': gpu, 'query_argv': [command, nodes_command],
-            'scope': 'live owned Delta one-A100 allocation; numerical/native-artifact gates are separate'}
+            'step': step,
+            'scope': 'live owned Delta single-A100 execution; parent job and step resources are recorded separately'}
 
 
 def allocation(site='pace'):

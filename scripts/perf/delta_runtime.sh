@@ -82,6 +82,15 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 # Keep the real allocation/GPU identity; the worker still performs full live
 # admission before applications. Only its rank-one launch selectors are removed.
 if [[ $study_profile == cuda-sm80 ]]; then
+  # Keep the genuine step selector for counter-exclusive controller admission;
+  # Open MPI must not see it as a direct PMI launch selector.
+  study_step=${SLURM_STEP_ID:-${SLURM_STEPID:-}}
+  if [[ -n $study_step ]]; then
+    [[ -z ${DELTA_OWNED_STEP_ID:-} || $DELTA_OWNED_STEP_ID == "$study_step" ]] || {
+      echo 'conflicting actual Delta step selectors' >&2; exit 2;
+    }
+    export DELTA_OWNED_STEP_ID="$study_step"
+  fi
   unset SLURM_STEP_ID SLURM_STEPID
   # HPC-X's non-exec orted shell wrapper retains the singleton report pipe.
   # Select its own native daemon while keeping the admitted MPI libraries/setup.

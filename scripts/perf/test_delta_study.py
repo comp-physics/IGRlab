@@ -122,14 +122,17 @@ class DeltaAllocation(unittest.TestCase):
         self.gpu = {'uuid': 'GPU-11111111-2222-3333-4444-555555555555', 'name': 'NVIDIA A100',
                     'compute_capability': 80}
 
-    def admit(self, *, fields=None, env=None, node='gpua022'):
+    def admit(self, *, fields=None, env=None, node='gpua022', step=None):
         fields = self.fields if fields is None else fields
         answer = ' '.join(key + '=' + value for key, value in fields.items())
+        answers = [subprocess.CompletedProcess([], 0, answer, '')]
+        if step is not None:
+            answers.append(subprocess.CompletedProcess([], 0,
+                ' '.join(key + '=' + value for key, value in step.items()), ''))
+        answers.append(subprocess.CompletedProcess([], 0, node + '\n', ''))
         with patch.dict(os.environ, self.environment if env is None else env, clear=True), \
              patch.object(study.socket, 'getfqdn', return_value='gpua022.delta.ncsa.illinois.edu'), \
-             patch.object(study.subprocess, 'run', side_effect=[
-                 subprocess.CompletedProcess([], 0, answer, ''),
-                 subprocess.CompletedProcess([], 0, node + '\n', '')]), \
+             patch.object(study.subprocess, 'run', side_effect=answers), \
              patch.object(study.study_profiles, 'gpu_identity', return_value=self.gpu):
             return study.delta_allocation(interactive=True)
 
@@ -138,6 +141,41 @@ class DeltaAllocation(unittest.TestCase):
         self.assertEqual(result['gpu'], self.gpu)
         self.assertEqual(result['scheduler']['Account'], 'bdiy-delta-gpu')
         self.assertAlmostEqual(result['end_epoch'], self.end, places=5)
+
+    def counter(self):
+        fields = {**self.fields, 'NumCPUs': '64', 'Features': 'perf,nvperf',
+            'AllocTRES': 'billing=4000,cpu=64,gres/gpu=4,mem=48G,node=1',
+            'ReqTRES': 'billing=1000,cpu=8,gres/gpu=1,mem=48G,node=1'}
+        step = {'StepId': '900.0', 'UserId': str(os.getuid()), 'State': 'RUNNING',
+            'Partition': 'gpuA100x4', 'NodeList': 'gpua022', 'Nodes': '1', 'CPUs': '8',
+            'Tasks': '1', 'TRES': 'cpu=8,gres/gpu=1,mem=48G,node=1'}
+        return fields, step, {**self.environment, 'SLURM_JOB_GPUS': '0,1,2,3',
+                             'SLURM_STEP_GPUS': '0', 'DELTA_OWNED_STEP_ID': '0'}
+
+    def test_counter_parent_preserved_and_actual_single_gpu_step_admitted_after_mpi_mask(self):
+        fields, step, env = self.counter()
+        observed = self.admit(fields=fields, step=step, env=env)
+        self.assertEqual(observed['scheduler']['AllocTRES'], fields['AllocTRES'])
+        self.assertEqual(observed['step']['scheduler'], step)
+        self.assertEqual(observed['step']['step_id'], '900.0')
+        self.assertEqual(observed['step']['query_argv'], ['scontrol', 'show', 'step', '-o', '900.0'])
+
+    def test_counter_step_rejects_wrong_owner_identity_resources_node_and_running_state(self):
+        fields, step, env = self.counter()
+        for key, value in [('StepId', '901.0'), ('UserId', 'other'), ('State', 'COMPLETED'),
+                ('Partition', 'gpuA100x8'), ('NodeList', 'gpua099'), ('CPUs', '64'),
+                ('Tasks', '2'), ('TRES', 'cpu=8,gres/gpu=2,mem=48G,node=1')]:
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                self.admit(fields=fields, step={**step, key: value}, env=env)
+        for changed in ({key: value for key, value in env.items() if key != 'DELTA_OWNED_STEP_ID'},
+                        {**env, 'DELTA_OWNED_STEP_ID': 'extern'},
+                        {**env, 'SLURM_STEP_ID': '1'}):
+            with self.subTest(env=changed), self.assertRaises(RuntimeError):
+                self.admit(fields=fields, step=step, env=changed)
+        for key, value in [('ReqTRES', 'cpu=64,gres/gpu=4,mem=48G,node=1'),
+                           ('Features', 'perf'), ('NumCPUs', '32')]:
+            with self.subTest(parent=key), self.assertRaises(RuntimeError):
+                self.admit(fields={**fields, key: value}, step=step, env=env)
 
     def test_wrong_owner_account_partition_gpu_count_node_or_cleanup_reject(self):
         changes = [('UserId', 'somebody(123)'), ('Account', 'bdiy-delta-cpu'),
