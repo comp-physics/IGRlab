@@ -334,6 +334,11 @@ int main(int argc, char** argv)
   for (const int basis : {mfem::BasisType::GaussLegendre,
                           mfem::BasisType::GaussLobatto})
   { CheckCase(10, 21, basis, 0, cases, max_assembled_error); }
+  // Q1 tests valid side-one sources for all inactive warp lanes while P5
+  // still exercises multiple output groups and a partially filled tail.
+  MFEM_VERIFY(IntRules.Get(Geometry::SEGMENT, 0).GetNPoints() == 1,
+              "Lower-bound shuffle fixture must contain one quadrature point.");
+  CheckCase(5, 0, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
   // Q16 fills all projection lanes; Q17 exercises the generic fallback.
   CheckCase(4, 31, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);
   CheckCase(4, 33, mfem::BasisType::GaussLegendre, 0, cases, max_assembled_error);

@@ -1573,8 +1573,8 @@ struct InteriorFaceDGDiffusionRecord2D
 // one whole warp and owns one face, including the final incomplete batch.
 // The two sides' quadrature projections must fit in the 32 lanes; output
 // rows are tiled so their count does not limit the supported polynomial order.
-// Only independent side/q projections are parallelized: each projection
-// retains the original ascending-d sum, and each output retains its ascending-q
+// Each side/q projection retains the original ascending-d sum, the side-pair
+// terms retain their operation order, and each output retains its ascending-q
 // sum.  The subsequent deterministic element incidence gather is unchanged.
 struct InteriorFaceDGDiffusionRecord2DWarp
 {
@@ -1610,7 +1610,25 @@ struct InteriorFaceDGDiffusionRecord2DWarp
       }
     }
 
-    // Keep two independent output sums per lane.  A quadrature projection is
+    // Form the side-pair terms once on each side-zero quadrature lane.
+    // Every lane participates in both full-mask broadcasts; inactive lanes
+    // select the last valid side-one projection even for the Q1 boundary.
+    const int other_q = lane < record.nq ? lane : record.nq - 1;
+    const mfem::real_t other_value =
+      __shfl_sync(0xffffffffu, value, other_q + record.nq);
+    const mfem::real_t other_normal_flux =
+      __shfl_sync(0xffffffffu, normal_flux, other_q + record.nq);
+    mfem::real_t projected_jump = 0.0;
+    mfem::real_t projected_avg_flux = 0.0;
+    mfem::real_t projected_penalty_jump = 0.0;
+    if (lane < record.nq)
+    {
+      projected_jump = value - other_value;
+      projected_avg_flux = normal_flux + other_normal_flux;
+      projected_penalty_jump = P(lane, face) * projected_jump;
+    }
+
+    // Keep two independent output sums per lane.  The side-pair terms are
     // broadcast once for both rows, exposing independent table loads without
     // growing the register working set with polynomial order.  Each output
     // still accumulates in ascending q, including the final incomplete group.
@@ -1632,15 +1650,12 @@ struct InteriorFaceDGDiffusionRecord2DWarp
       }
       for (int q = 0; q < record.nq; ++q)
       {
-        const mfem::real_t value0 = __shfl_sync(0xffffffffu, value, q);
-        const mfem::real_t value1 =
-          __shfl_sync(0xffffffffu, value, q + record.nq);
-        const mfem::real_t normal0 = __shfl_sync(0xffffffffu, normal_flux, q);
-        const mfem::real_t normal1 =
-          __shfl_sync(0xffffffffu, normal_flux, q + record.nq);
-        const mfem::real_t jump = value0 - value1;
-        const mfem::real_t avg_flux = normal0 + normal1;
-        const mfem::real_t penalty_jump = P(q, face) * jump;
+        const mfem::real_t jump =
+          __shfl_sync(0xffffffffu, projected_jump, q);
+        const mfem::real_t avg_flux =
+          __shfl_sync(0xffffffffu, projected_avg_flux, q);
+        const mfem::real_t penalty_jump =
+          __shfl_sync(0xffffffffu, projected_penalty_jump, q);
 #pragma unroll
         for (int i = 0; i < rows_per_lane; ++i)
         {
