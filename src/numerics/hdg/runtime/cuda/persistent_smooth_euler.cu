@@ -6508,8 +6508,8 @@ ExperimentalVolumeArithmetic SelectedExperimentalVolumeArithmetic() noexcept
           "fp64-wmma, simt-fp64, simt-fp32, tf32, or tf32x3.\n",mode);
     else
       std::fprintf(stderr,"HDG experimental volume arithmetic=%s; nonlinear "
-          "coefficients, storage, faces, condensation, and trace remain FP64.\n",
-          mode);
+          "coefficients, storage, and faces remain FP64; local and trace "
+          "solvers retain their separately selected policies.\n",mode);
     return result;
   }();
   return selected;
