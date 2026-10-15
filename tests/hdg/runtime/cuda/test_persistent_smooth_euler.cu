@@ -3462,22 +3462,32 @@ bool NativeFixedSigmaJacobiOrderFixture(
 
 bool NativeFixedSigmaJacobiDeviceFixtures()
 {
+  const auto run = [](const int order, const NativeFixedSigmaPatchKind kind,
+                      const int sweeps)
+  {
+    const bool pass = NativeFixedSigmaJacobiOrderFixture(order, kind, sweeps);
+    if (!pass)
+      std::cerr << "native trace fixed-sigma fixture failed order=" << order
+                << " patch_kind=" << static_cast<int>(kind)
+                << " sweeps=" << sweeps << '\n';
+    return pass;
+  };
   for (int order = 1; order <= 3; ++order)
     for (int sweeps = 1;
          sweeps <= dg::hdg::runtime::cuda_w8a::detail::
              native_trace_sigma_jacobi_maximum_sweeps;
          ++sweeps)
-      if (!NativeFixedSigmaJacobiOrderFixture(
+      if (!run(
               order, NativeFixedSigmaPatchKind::scalar_field_split,
               sweeps) ||
-          !NativeFixedSigmaJacobiOrderFixture(
+          !run(
               order, NativeFixedSigmaPatchKind::warp_field_split,
               sweeps))
         return false;
   for (int order = 1; order <= 3; ++order)
-    if (!NativeFixedSigmaJacobiOrderFixture(
+    if (!run(
             order, NativeFixedSigmaPatchKind::warp_coupled, 2) ||
-        !NativeFixedSigmaJacobiOrderFixture(
+        !run(
             order, NativeFixedSigmaPatchKind::warp_coupled,
             dg::hdg::runtime::cuda_w8a::detail::
                 native_trace_sigma_jacobi_maximum_sweeps))
