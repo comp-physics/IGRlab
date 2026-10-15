@@ -1324,9 +1324,11 @@ __device__ void SparseMatrixVector(
   grid.sync();
 }
 
+// Keep these immutable views in the kernel's grid-constant parameter storage
+// through the residual helper chain instead of copying them into local frames.
 __device__ void ApplyTraceOperator(
-    const NativeTraceSystemView system,
-    const NativeTracePreconditionerView preconditioner,
+    const NativeTraceSystemView& system,
+    const NativeTracePreconditionerView& preconditioner,
     const double* input, double* output,
     NativeTraceSolveControl* control,
     const cg::grid_group& grid) noexcept
@@ -1343,7 +1345,7 @@ __device__ void ApplyTraceOperator(
     return;
   }
 
-  const NativeTraceElementSchwarzView schwarz =
+  const NativeTraceElementSchwarzView& schwarz =
       preconditioner.element_schwarz;
   const int patch_rows = schwarz.patch_rows;
   const int element_slots = schwarz.elements * patch_rows;
@@ -1464,8 +1466,8 @@ __device__ void ApplyTraceOperator(
 }
 
 __device__ void ComputeActualResidual(
-    const NativeTraceSystemView system,
-    const NativeTracePreconditionerView preconditioner, double* residual,
+    const NativeTraceSystemView& system,
+    const NativeTracePreconditionerView& preconditioner, double* residual,
     NativeTraceSolveControl* control,
     const cg::grid_group& grid) noexcept
 {
