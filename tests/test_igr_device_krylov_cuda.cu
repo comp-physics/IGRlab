@@ -160,6 +160,60 @@ int main(int argc, char** argv)
   MFEM_VERIFY(mfem_gmres.GetConverged() && Norm(reference) / Norm(exact) < 3.0e-11,
               "Device FGMRES disagrees with MFEM on a flexible restarted solve.");
 
+  // Successive RK stages reuse a nearly converged solution while A and b
+  // change slightly. MFEM scales the recurrence by ||b-A*x0||, but accepts its
+  // estimate before recomputing b-A*x. The independent FP64 gate must retain
+  // the configured RHS-relative tolerance instead of multiplying the small
+  // warm residual by rtol a second time.
+  PositiveDiagonal warm_preconditioner(n), warm_reference_preconditioner(n);
+  auto warm_gmres = ::igrlab::igr_internal::MakeDeviceFGMRESSolver(MPI_COMM_WORLD);
+  mfem_gmres.SetKDim(50); // use the production restart size for the stage sequence
+  mfem::Vector nearby_rhs(n);
+  constexpr double warm_rtol = 1.0e-10;
+  for (int stage = 1; stage <= 3; ++stage)
+  {
+    Stencil current_operator(n, -0.8 - stage * 1.0e-12, 0.3);
+    current_operator.Mult(exact, nearby_rhs);
+    double* nearby = nearby_rhs.HostReadWrite();
+    for (int i = 0; i < n; ++i)
+    { nearby[i] += stage * 1.0e-12 * (1 + i % 7); }
+    reference = x;
+    const double rhs_norm = Norm(nearby_rhs);
+    const double warm_initial = Residual(current_operator, nearby_rhs, x);
+    MFEM_VERIFY(warm_initial > 0.0 && warm_initial < 1.0e-8 * rhs_norm,
+                "Repeated FGMRES test did not use a near-solution warm start.");
+    Configure(*warm_gmres, current_operator);
+    warm_gmres->SetPreconditioner(warm_preconditioner);
+    warm_gmres->SetRelTol(warm_rtol);
+    warm_gmres->Mult(nearby_rhs, x);
+    const double true_final = Residual(current_operator, nearby_rhs, x);
+    MFEM_VERIFY(warm_gmres->GetConverged() && warm_gmres->GetNumIterations() > 0 &&
+                  warm_gmres->GetNumIterations() < 200 && true_final <= warm_rtol * rhs_norm &&
+                  std::abs(warm_gmres->GetInitialNorm() - warm_initial) <= 1.0e-13 * warm_initial &&
+                  std::abs(warm_gmres->GetFinalNorm() - true_final) <= 1.0e-13 * rhs_norm,
+                "Repeated warm FGMRES violated its current-A RHS-relative true-residual gate.");
+    Configure(mfem_gmres, current_operator);
+    mfem_gmres.SetPreconditioner(warm_reference_preconditioner);
+    mfem_gmres.SetRelTol(warm_rtol);
+    mfem_gmres.Mult(nearby_rhs, reference);
+    MFEM_VERIFY(mfem_gmres.GetConverged() &&
+                  Residual(current_operator, nearby_rhs, reference) <= warm_rtol * rhs_norm,
+                "MFEM near-solution reference failed its true-residual gate.");
+    reference -= x;
+    MFEM_VERIFY(Norm(reference) / Norm(exact) < 3.0e-10,
+                "Repeated warm device FGMRES disagrees with MFEM.");
+  }
+
+  // A zero operator with nonzero RHS has no solution. Happy Arnoldi breakdown
+  // and a zero recurrence estimate must not bypass the original-A certificate.
+  Stencil zero_operator(n, 0.0, 0.0, 0.0);
+  Configure(*gmres, zero_operator, false, 5);
+  rhs = exact;
+  gmres->Mult(rhs, x);
+  MFEM_VERIFY(!gmres->GetConverged() && gmres->GetNumIterations() == 1 &&
+                Norm(x) == 0.0 && Residual(zero_operator, rhs, x) == Norm(rhs),
+              "Device FGMRES accepted an inconsistent zero-operator system.");
+
   // Reconfigure the retained workspace, removing the previous preconditioner.
   // Identity produces happy Arnoldi breakdown; no 0/0 normalization is allowed.
   Configure(*gmres, identity, false);
@@ -227,7 +281,8 @@ int main(int argc, char** argv)
   MFEM_VERIFY(!cg->GetConverged() && Norm(x) == 0.0,
               "Device CG accepted nonfinite curvature.");
   std::cout << "device_krylov_test passed restarted_flexible_mgs=true"
-               " true_residual=true cached_reconfigure=true happy_breakdown=true"
+               " true_residual=true cached_reconfigure=true repeated_near_warm=true"
+               " inconsistent_operator_rejected=true happy_breakdown=true"
                " zero_rhs=true iteration_cap=true cg_mfem_parity=true preconditioned_cg=true nonpositive_curvature=true nonfinite_curvature=true\n";
   return 0;
 }

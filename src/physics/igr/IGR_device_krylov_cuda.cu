@@ -231,12 +231,20 @@ public:
     double* control = control_.Write();
     CheckCUDA(cudaMemset(control, 0, 2 * sizeof(double)));
     Norm(residual_, control);
+    // The second slot temporarily holds ||b||; StartArnoldi resets its flag.
+    Norm(b, control + 1);
     double status[2];
     ReadControl(status, control, 2);
     initial_norm = final_norm = status[0];
+    // Preserve pinned MFEM's initial-residual-scaled recurrence criterion.
+    // Its recurrence estimate can pass below the attainable FP64 b-A*x
+    // cancellation floor for a near-solution warm start. Certify the corrected
+    // iterate separately against the original RHS at the same configured rtol.
     const double tolerance = std::max(abs_tol, rel_tol * initial_norm);
-    if (!std::isfinite(initial_norm)) { return; }
-    if (final_norm <= tolerance) { converged = true; return; }
+    const double true_tolerance = std::max(abs_tol, rel_tol * status[1]);
+    if (!std::isfinite(initial_norm) || !std::isfinite(status[1])) { return; }
+    if (final_norm <= tolerance && final_norm <= true_tolerance)
+    { converged = true; return; }
     const int blocks = (height + threads - 1) / threads;
     double* h = h_.Write();
     double* cs = cs_.Write();
@@ -280,20 +288,25 @@ public:
         { break; }
       }
       if (status[1] == 2.0 || !std::isfinite(final_norm)) { return; }
+      const bool recurrence_converged = final_norm <= tolerance;
       BackSolve<<<1, 1>>>(used, m_ + 1, h, g, coefficients, control);
       for (int j = 0; j < used; ++j)
       {
         AddCorrection<<<blocks, threads>>>(height, directions_[j].Read(),
                                             coefficients + j, control, x.ReadWrite());
       }
-      // Certify against the current, original FP64 operator before acceptance.
-      // A failed residual estimate restarts within the same iteration budget.
+      // Require both MFEM's recurrence/restart criterion and the independent
+      // current-A, RHS-relative true residual. A failed certificate restarts
+      // within the same iteration budget, without shrinking the true target
+      // to the preceding warm-start residual.
       TrueResidual(b, x);
       Norm(residual_, control);
       ReadControl(status, control, 2);
       final_norm = status[0];
       if (status[1] == 2.0 || !std::isfinite(final_norm)) { return; }
-      if (final_norm <= tolerance) { converged = true; return; }
+      if ((recurrence_converged || final_norm <= tolerance) &&
+          final_norm <= true_tolerance)
+      { converged = true; return; }
       if (status[1] == 1.0) { return; } // Arnoldi breakdown without a true solution
     }
   }

@@ -84,8 +84,14 @@ ordered modified Gram–Schmidt, Givens rotations and the small backsolve on the
 GPU. FGMRES uses the existing restart dimension of 50. There is still one host
 convergence read per Krylov iteration, and called operators/preconditioners
 may have their own synchronization. This is not fully device-controlled
-execution. The original FP64 operator certifies convergence; a failed residual
-estimate restarts within the unchanged iteration budget. Compare iterations and
+execution. FGMRES retains MFEM's recurrence target
+`max(atol, rtol*||b-A*x0||)`, including warm starts. Before accepting an iterate,
+it also recomputes the original FP64 residual and requires
+`||b-A*x|| <= max(atol, rtol*||b||)`. These are separate gates: a near-solution
+warm start must not shrink the true-residual target below attainable FP64
+cancellation. `GetInitialNorm()` reports the initial residual and
+`GetFinalNorm()` reports the recomputed true residual. A failed certificate
+restarts within the unchanged iteration budget. Compare iterations and
 end-to-end timing: different reductions and final certification need not match
 MFEM bit for bit or perform exactly the same work.
 
@@ -101,7 +107,8 @@ gate.
 Build the focused algebra fixtures incrementally before reserving a GPU:
 `--target dg_igr_device_krylov_test` and, with HDG runtime tests configured,
 `--target dg_igr_igr_two_level_inverse_cuda_test`. The first fixture checks
-restarted flexible solves against MFEM, warm starts, happy breakdown, zero RHS,
+restarted flexible solves against MFEM, repeated near-solution warm starts,
+inconsistent-operator rejection, happy breakdown, zero RHS,
 iteration limits, preconditioned CG norms and invalid curvature. The second
 checks the two-level construction/current operator, IEEE FP32 action errors
 and extreme-value recovery. Run it with
