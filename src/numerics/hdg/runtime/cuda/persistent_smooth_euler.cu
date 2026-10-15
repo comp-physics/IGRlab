@@ -6596,6 +6596,223 @@ static __device__ __forceinline__ double BorrowedCondenseBlockScale(
   return local_scale;
 }
 
+// Experimental rank-one local solves. Original matrices and accumulated W
+// stay FP64; only factors and triangular-solve workspace use Scalar. One
+// block owns an element, and each RHS retains its ordered scalar recurrence.
+template <typename Scalar>
+__device__ bool RefinedLocalFactor(const double* original, Scalar* lu,
+                                  double* pivots, const int n)
+{
+  __shared__ int pivot, failed;
+  __shared__ double scale;
+  if(threadIdx.x==0)failed=0;
+  __syncthreads();
+  double local_scale=0.0;
+  for(int i=threadIdx.x;i<n*n;i+=blockDim.x)
+  {
+    const double value=original[i];
+    lu[i]=static_cast<Scalar>(value);
+    if(!isfinite(value)||!isfinite(static_cast<double>(lu[i])))
+      atomicExch(&failed,1);
+    local_scale=fmax(local_scale,fabs(value));
+  }
+  const double block_scale=BorrowedCondenseBlockScale(local_scale);
+  if(threadIdx.x==0)scale=block_scale;
+  __syncthreads();
+  for(int column=0;column<n;++column)
+  {
+    if(threadIdx.x==0)
+    {
+      pivot=column;
+      for(int row=column+1;row<n;++row)
+        if(fabs(static_cast<double>(lu[row*n+column]))>
+           fabs(static_cast<double>(lu[pivot*n+column])))pivot=row;
+      pivots[column]=pivot;
+      const double diagonal=static_cast<double>(lu[pivot*n+column]);
+      // Keep the established FP64 singularity policy. Rounded singular or
+      // overflowing FP32 factors escalate; refinement decides usefulness.
+      if(!isfinite(diagonal)||!(fabs(diagonal)>64.0*DBL_EPSILON*scale))
+        failed=1;
+    }
+    __syncthreads();
+    if(failed)return false;
+    if(pivot!=column)
+      for(int j=threadIdx.x;j<n;j+=blockDim.x)
+      {
+        const Scalar value=lu[column*n+j];
+        lu[column*n+j]=lu[pivot*n+j];lu[pivot*n+j]=value;
+      }
+    __syncthreads();
+    for(int row=column+1+threadIdx.x;row<n;row+=blockDim.x)
+      lu[row*n+column]/=lu[column*n+column];
+    __syncthreads();
+    const int trailing=n-column-1;
+    for(int i=threadIdx.x;i<trailing*trailing;i+=blockDim.x)
+    {
+      const int row=column+1+i/trailing,j=column+1+i%trailing;
+      lu[row*n+j]-=lu[row*n+column]*lu[column*n+j];
+      if(!isfinite(static_cast<double>(lu[row*n+j])))atomicExch(&failed,1);
+    }
+    __syncthreads();
+  }
+  return !failed;
+}
+
+template <typename Scalar>
+__device__ void RefinedLocalTriangularSolve(const Scalar* lu,
+    const double* pivots, Scalar* rhs, const int n, const int columns)
+{
+  for(int c=threadIdx.x;c<columns;c+=blockDim.x)
+  {
+    for(int row=0;row<n;++row)
+    {
+      const int pivot=static_cast<int>(pivots[row]);
+      const Scalar value=rhs[row*columns+c];
+      rhs[row*columns+c]=rhs[pivot*columns+c];
+      rhs[pivot*columns+c]=value;
+    }
+    for(int row=0;row<n;++row)
+    {
+      Scalar value=rhs[row*columns+c];
+      for(int j=0;j<row;++j)value-=lu[row*n+j]*rhs[j*columns+c];
+      rhs[row*columns+c]=value;
+    }
+    for(int row=n-1;row>=0;--row)
+    {
+      Scalar value=rhs[row*columns+c];
+      for(int j=row+1;j<n;++j)value-=lu[row*n+j]*rhs[j*columns+c];
+      rhs[row*columns+c]=value/lu[row*n+row];
+    }
+  }
+  __syncthreads();
+}
+
+template <typename Scalar>
+__device__ bool RefinedLocalSolve(CudaDeviceView v,CudaMeshShape s,const int e,
+                                 int& corrections)
+{
+  const int n=s.interior_dofs,nt=s.trace_dofs,cols=nt+1;
+  const double* a=v.a+static_cast<std::size_t>(e)*n*n;
+  const double* b=v.b+static_cast<std::size_t>(e)*n*nt;
+  const double* f=v.f+e*n;
+  Scalar* lu=reinterpret_cast<Scalar*>(v.lu+static_cast<std::size_t>(e)*n*n);
+  Scalar* rhs=reinterpret_cast<Scalar*>(
+      v.local_solve_workspace+static_cast<std::size_t>(e)*n*cols);
+  double* x=v.solve_workspace+static_cast<std::size_t>(e)*n*cols;
+  double* pivots=v.pivots+e*n;
+  __shared__ int failed,needs_correction;
+  corrections=0;
+  if(!RefinedLocalFactor(a,lu,pivots,n))return false;
+  for(int i=threadIdx.x;i<n*cols;i+=blockDim.x)
+    rhs[i]=static_cast<Scalar>(i%cols<nt?b[(i/cols)*nt+i%cols]:f[i/cols]);
+  __syncthreads();
+  RefinedLocalTriangularSolve(lu,pivots,rhs,n,cols);
+  for(int i=threadIdx.x;i<n*cols;i+=blockDim.x)x[i]=static_cast<double>(rhs[i]);
+  __syncthreads();
+  // The FP64 control executes the same residual authority and bounded
+  // correction loop. No tolerance is relaxed after a failed FP32 attempt.
+  for(int step=0;step<=4;++step)
+  {
+    if(threadIdx.x==0){failed=0;needs_correction=0;}
+    __syncthreads();
+    for(int i=threadIdx.x;i<n*cols;i+=blockDim.x)
+    {
+      const int row=i/cols,c=i%cols;
+      const double original_rhs=c<nt?b[row*nt+c]:f[row];
+      double residual=original_rhs,magnitude=fabs(original_rhs);
+      for(int j=0;j<n;++j)
+      {
+        const double term=a[row*n+j]*x[j*cols+c];
+        residual-=term;magnitude+=fabs(term);
+      }
+      if(!isfinite(residual)||!isfinite(magnitude)||!isfinite(x[i]))
+        atomicExch(&failed,1);
+      // A componentwise backward-error criterion against the unrounded A.
+      // Zero RHS/solution is accepted exactly, without an absolute floor.
+      const bool converged=fabs(residual)<=1.0e-13*magnitude;
+      if(!converged)atomicExch(&needs_correction,1);
+      rhs[i]=static_cast<Scalar>(residual);
+      if(!isfinite(static_cast<double>(rhs[i])))atomicExch(&failed,1);
+    }
+    __syncthreads();
+    if(failed)return false;
+    if(!needs_correction)return true;
+    if(step==4)return false;
+    RefinedLocalTriangularSolve(lu,pivots,rhs,n,cols);
+    for(int i=threadIdx.x;i<n*cols;i+=blockDim.x)x[i]+=static_cast<double>(rhs[i]);
+    __syncthreads();
+    ++corrections;
+  }
+  return false;
+}
+
+template <bool Mixed>
+__global__ void RefinedBorrowedCondenseKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;if(e>=s.elements)return;
+  int corrections=0,fp64_corrections=0;
+  bool success;
+  bool fallback=false;
+  if constexpr(Mixed)
+  {
+    success=RefinedLocalSolve<float>(v,s,e,corrections);
+    if(!success)
+    {
+      fallback=true;
+      // Recopy and refactor the original FP64 A, including original RHS;
+      // never certify or recover from the rounded failed factor.
+      success=RefinedLocalSolve<double>(v,s,e,fp64_corrections);
+    }
+  }
+  else success=RefinedLocalSolve<double>(v,s,e,corrections);
+  if(threadIdx.x==0)
+  {
+    v.local_solve_work[3*e]=corrections+fp64_corrections;
+    v.local_solve_work[3*e+1]=fallback?1.0:0.0;
+    v.local_solve_work[3*e+2]=success?1.0:0.0;
+  }
+  if(!success){if(threadIdx.x==0)v.status[e]=-1;return;}
+  const int n=s.interior_dofs,nt=s.trace_dofs,cols=nt+1;
+  const double* w=v.solve_workspace+static_cast<std::size_t>(e)*n*cols;
+  const double* c=v.c+static_cast<std::size_t>(e)*nt*n;
+  const double* d=v.d+static_cast<std::size_t>(e)*nt*nt;
+  __shared__ int failed;
+  if(threadIdx.x==0)failed=0;
+  __syncthreads();
+  for(int i=threadIdx.x;i<nt*cols;i+=blockDim.x)
+  {
+    const int row=i/cols,column=i%cols;
+    double value=column<nt?d[row*nt+column]:v.g[e*nt+row];
+    for(int j=0;j<n;++j)value-=c[row*n+j]*w[j*cols+column];
+    if(!isfinite(value))atomicExch(&failed,1);
+    if(column<nt)v.schur[(static_cast<std::size_t>(e)*nt+row)*nt+column]=value;
+    else v.condensed_rhs[e*nt+row]=value;
+  }
+  __syncthreads();
+  if(threadIdx.x==0)v.status[e]=failed?-1:1;
+}
+
+__global__ void RefinedLocalWorkSummaryKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  __shared__ double partial[3][128];
+  for(int kind=0;kind<3;++kind)
+  {
+    double sum=0.0;
+    for(int e=threadIdx.x;e<s.elements;e+=blockDim.x)
+      sum+=v.local_solve_work[3*e+kind];
+    partial[kind][threadIdx.x]=sum;
+  }
+  __syncthreads();
+  for(int stride=64;stride>0;stride/=2)
+  {
+    if(threadIdx.x<stride)
+      for(int kind=0;kind<3;++kind)
+        partial[kind][threadIdx.x]+=partial[kind][threadIdx.x+stride];
+    __syncthreads();
+  }
+  if(threadIdx.x<3)v.scalar[threadIdx.x]=partial[threadIdx.x][0];
+}
+
 __global__ void CondenseKernel(CudaDeviceView v,CudaMeshShape s)
 {
   const int e=blockIdx.x*blockDim.x+threadIdx.x;if(e>=s.elements)return;
@@ -7826,6 +8043,34 @@ __global__ void TensorBorrowedRecoverKernel(CudaDeviceView v,CudaMeshShape s)
   __syncthreads();
   if(threadIdx.x==0)v.status[e]=1;
 }
+// Verify the original coupled system after trace distribution and recovery.
+// Trace rows are assembled globally by the owner before evaluating their norm.
+__global__ void RefinedOriginalCoupledResidualKernel(CudaDeviceView v,CudaMeshShape s)
+{
+  const int e=blockIdx.x;if(e>=s.elements)return;
+  const int n=s.interior_dofs,nt=s.trace_dofs;
+  const double* x=v.recovered_interior+e*n;
+  const double* t=v.trace_increment_local+e*nt;
+  // Triangular-solve scratch is dead after corrected W has been recovered.
+  // Reuse it without overwriting the retained nonlinear residual or trace RHS.
+  double* residual_r=v.local_solve_workspace;
+  double* residual_g=residual_r+s.interior_count;
+  for(int row=threadIdx.x;row<n;row+=blockDim.x)
+  {
+    double value=v.f[e*n+row];
+    for(int j=0;j<n;++j)value-=v.a[(static_cast<std::size_t>(e)*n+row)*n+j]*x[j];
+    for(int j=0;j<nt;++j)value-=v.b[(static_cast<std::size_t>(e)*n+row)*nt+j]*t[j];
+    residual_r[e*n+row]=value;
+  }
+  for(int row=threadIdx.x;row<nt;row+=blockDim.x)
+  {
+    double value=v.g[e*nt+row];
+    for(int j=0;j<n;++j)value-=v.c[(static_cast<std::size_t>(e)*nt+row)*n+j]*x[j];
+    for(int j=0;j<nt;++j)value-=v.d[(static_cast<std::size_t>(e)*nt+row)*nt+j]*t[j];
+    residual_g[e*nt+row]=value;
+  }
+}
+
 __global__ void TrialKernel(CudaDeviceView v,CudaMeshShape s,double alpha)
 {const int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<s.interior_count)v.work_interior[i]=v.base_interior[i]+alpha*v.recovered_interior[i];if(i<s.true_trace_count)v.work_true_trace[i]=v.base_true_trace[i]+alpha*v.true_solution[i];}
 
@@ -9900,6 +10145,22 @@ bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
                             std::uint64_t& tensor_mma_tiles) noexcept
 {
   tensor_mma_tiles=0;
+  if(s.local_solve!=CudaLocalSolveKind::current)
+  {
+    if(!s.borrowed_host_inputs||s.elements<=0||s.interior_dofs<=0||
+       s.trace_dofs<=0||v.local_solve_workspace==nullptr||
+       v.local_solve_work==nullptr||
+       !generic::DenseLocalDimensionsFitInt(s.interior_dofs,s.trace_dofs)||
+       (engine!=generic::CudaEngineKind::ordinary&&
+        engine!=generic::CudaEngineKind::tensor_core))return false;
+    if(s.local_solve==CudaLocalSolveKind::fp32_refine)
+      RefinedBorrowedCondenseKernel<true><<<s.elements,128>>>(v,s);
+    else if(s.local_solve==CudaLocalSolveKind::fp64_refine)
+      RefinedBorrowedCondenseKernel<false><<<s.elements,128>>>(v,s);
+    else return false;
+    RefinedLocalWorkSummaryKernel<<<1,128>>>(v,s);
+    return LaunchOk();
+  }
   if(engine==generic::CudaEngineKind::ordinary)
   {
     if(s.borrowed_host_inputs)BorrowedCondenseKernel<<<s.elements,borrowed_condense_block_threads>>>(v,s);
@@ -9971,6 +10232,7 @@ bool CudaLaunchCondensation(const CudaDeviceView& v,const CudaMeshShape& s,
 bool CudaLaunchCondenseRetainedLuRhs(
     const CudaDeviceView& v,const CudaMeshShape& s) noexcept
 {
+  if(s.local_solve!=CudaLocalSolveKind::current)return false;
   if(!s.borrowed_host_inputs||s.elements<=0||s.interior_dofs<=0||
      s.trace_dofs<=0||
      !generic::DenseLocalDimensionsFitInt(s.interior_dofs,s.trace_dofs)||
@@ -10115,6 +10377,16 @@ bool CudaLaunchRecover(const CudaDeviceView& v,const CudaMeshShape& s,
   if(!CudaRecoveryRouteSupported(engine,s.borrowed_host_inputs))return false;
   if(s.borrowed_host_inputs)
   {
+    if(s.local_solve!=CudaLocalSolveKind::current)
+    {
+      if(s.interior_dofs<2||s.interior_count!=s.elements*s.interior_dofs||
+         v.local_solve_workspace==nullptr||
+         (s.local_solve!=CudaLocalSolveKind::fp32_refine&&
+          s.local_solve!=CudaLocalSolveKind::fp64_refine))return false;
+      TensorBorrowedRecoverKernel<<<s.elements,128>>>(v,s);
+      RefinedOriginalCoupledResidualKernel<<<s.elements,128>>>(v,s);
+      return LaunchOk();
+    }
     const auto recovery=CudaBorrowedRecoveryForEngine(engine);
     if(recovery==CudaBorrowedRecoveryKind::ordinary_direct_lu)
       BorrowedRetainedLuRecoverKernel<<<s.elements,128>>>(v,s);
@@ -10131,6 +10403,7 @@ bool CudaLaunchRecover(const CudaDeviceView& v,const CudaMeshShape& s,
 bool CudaLaunchRecoverFromRetainedLu(
     const CudaDeviceView& v,const CudaMeshShape& s) noexcept
 {
+  if(s.local_solve!=CudaLocalSolveKind::current)return false;
   if(!s.borrowed_host_inputs||s.elements<=0||s.interior_dofs<=0||
      s.trace_dofs<=0||
      !generic::DenseLocalDimensionsFitInt(s.interior_dofs,s.trace_dofs)||

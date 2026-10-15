@@ -1179,6 +1179,11 @@ BindArenaViews() noexcept
   view_.solve_workspace = take_d(generic ? generic_arena_layout_.solve_workspace :
       static_cast<std::size_t>(maximum_rank_elements) *
       maximum_interior_dofs_per_element * (maximum_trace_dofs_per_element + 1));
+  if (shape_.local_solve != CudaLocalSolveKind::current)
+  {
+    view_.local_solve_workspace = take_d(generic_arena_layout_.local_solve_workspace);
+    view_.local_solve_work = take_d(generic_arena_layout_.local_solve_work);
+  }
   view_.schur = take_d(max_d);
   view_.condensed_rhs = take_d(max_er);
   view_.true_residual = take_d(max_tt);
@@ -2728,6 +2733,59 @@ StatusPassed() noexcept
       !TransportPolicy::Synchronize(CudaTransferSite::scalar_status))
     return false;
   return failure == 0;
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+ObserveLocalSolveWork() noexcept
+{
+  if (shape_.local_solve == CudaLocalSolveKind::current) return true;
+  double counts[3]{};
+  if (!TransportPolicy::DeviceToHost(counts, view_.scalar, sizeof(counts),
+          CudaTransferCategory::scalar_diagnostic, CudaTransferSite::scalar_status) ||
+      !TransportPolicy::Synchronize(CudaTransferSite::scalar_status)) return false;
+  for (double value : counts) if (!std::isfinite(value) || value < 0.0) return false;
+  local_solve_elements_ += shape_.elements;
+  local_solve_corrections_ += counts[0];
+  local_solve_fallbacks_ += counts[1];
+  local_solve_failures_ += shape_.elements - counts[2];
+  return counts[2] == shape_.elements;
+}
+
+template <typename AllocatorPolicy, typename TransportPolicy>
+bool CudaPersistentNumerics<AllocatorPolicy, TransportPolicy>::
+OriginalCoupledResidualPassed() noexcept
+{
+  if (shape_.local_solve == CudaLocalSolveKind::current) return true;
+  // Rank-one-only admission makes these reductions local. Preserve the same
+  // original-equation relative tolerance used by the existing true trace gate.
+  double* residual_r = view_.local_solve_workspace;
+  double* residual_g = residual_r + shape_.interior_count;
+  double* assembled = residual_g + shape_.elements * shape_.trace_dofs;
+  // For the admitted local dimensions n >= 2, n*(nt+1) can hold n+2*nt
+  // doubles per element; true-trace count is bounded by element-trace count.
+  // Reuse this dead solve scratch and preserve the coherent condensed RHS,
+  // original nonlinear residuals, and true-residual product for their callers.
+  if (!AssembleTrueVector(residual_g, assembled, false) ||
+      !CudaLaunchLocalSquaredNorm(residual_r, shape_.interior_count,
+          assembled, shape_.true_trace_count, view_.status,
+          shape_.elements, view_.scalar) ||
+      !AssembleTrueVector(view_.g, assembled, false) ||
+      !CudaLaunchLocalSquaredNorm(view_.f, shape_.interior_count,
+          assembled, shape_.true_trace_count, view_.status,
+          shape_.elements, view_.scalar + 1)) return false;
+  double norms[2]{};
+  if (!TransportPolicy::DeviceToHost(norms, view_.scalar, sizeof(norms),
+          CudaTransferCategory::scalar_diagnostic, CudaTransferSite::scalar_status) ||
+      !TransportPolicy::Synchronize(CudaTransferSite::scalar_status) ||
+      !std::isfinite(norms[0]) || !std::isfinite(norms[1]) ||
+      norms[0] < 0.0 || norms[1] < 0.0) return false;
+  const double relative = norms[1] > 0.0
+      ? std::sqrt(norms[0]) / std::sqrt(norms[1])
+      : norms[0] == 0.0 ? 0.0 : std::numeric_limits<double>::infinity();
+  local_solve_maximum_coupled_residual_ = std::max(
+      local_solve_maximum_coupled_residual_, relative);
+  return std::isfinite(relative) && relative <= true_residual_relative_tolerance_;
 }
 
 template <typename AllocatorPolicy, typename TransportPolicy>
@@ -5914,7 +5972,7 @@ SolvePartitionedScalarClosure(
     condensed = CopyBase(workspace) && Ticket(CudaFailurePhase::condensation) &&
         CudaLaunchCondensation(
             view_, shape_, cuda_engine_, condensation_tiles) &&
-        StatusPassed();
+        ObserveLocalSolveWork() && StatusPassed();
   }
   if (cuda_engine_ == generic::CudaEngineKind::tensor_core && condensed)
   {
@@ -5997,7 +6055,7 @@ SolvePartitionedScalarClosure(
     ::igrlab::NVTXRange profile_region(
         ::igrlab::observability::RegionId::hdg_interior_recovery);
     recovered = CudaLaunchRecover(view_, shape_, cuda_engine_) &&
-        StatusPassed();
+        StatusPassed() && OriginalCoupledResidualPassed();
   }
   const bool frozen_euler_increments = recovered &&
       CudaLaunchPartitionedScalarClosureFreezeEulerIncrements(view_, shape_);

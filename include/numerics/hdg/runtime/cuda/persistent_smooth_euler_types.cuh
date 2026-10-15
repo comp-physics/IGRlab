@@ -2336,6 +2336,18 @@ struct CudaTensorCoreEvidence
 namespace detail
 {
 
+enum class CudaLocalSolveKind { current, fp64_refine, fp32_refine, invalid };
+
+inline CudaLocalSolveKind SelectedCudaLocalSolve() noexcept
+{
+  const char* value = ::igrlab::GetEnv("DG_IGR_HDG_LOCAL_SOLVE");
+  if (value == nullptr || *value == '\0' || std::string_view(value) == "current")
+    return CudaLocalSolveKind::current;
+  if (std::string_view(value) == "fp64-refine") return CudaLocalSolveKind::fp64_refine;
+  if (std::string_view(value) == "fp32-refine") return CudaLocalSolveKind::fp32_refine;
+  return CudaLocalSolveKind::invalid;
+}
+
 // Research-only volume arithmetic is selected before launching the process.
 // FP64 state, faces, condensation, trace solves, and time advancement remain
 // unchanged. Do not describe a reduced-precision volume contraction as an

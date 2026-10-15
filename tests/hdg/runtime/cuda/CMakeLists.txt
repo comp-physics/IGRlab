@@ -74,6 +74,41 @@ set_tests_properties(dg_igr_hdg_runtime_cuda_hash_exact
     RESOURCE_LOCK dg_igr_sm120
     TIMEOUT 300)
 
+add_executable(dg_igr_hdg_runtime_cuda_refined_local_solve
+  test_refined_local_solve.cu)
+target_include_directories(dg_igr_hdg_runtime_cuda_refined_local_solve
+  PRIVATE
+    "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(dg_igr_hdg_runtime_cuda_refined_local_solve
+  PRIVATE
+    dg_igr_hdg_runtime_cuda
+    mfem
+    MPI::MPI_CXX)
+target_compile_options(dg_igr_hdg_runtime_cuda_refined_local_solve
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+set_target_properties(dg_igr_hdg_runtime_cuda_refined_local_solve
+  PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_EXTENSIONS OFF
+    CUDA_ARCHITECTURES "${DG_IGR_HDG_NATIVE_CUDA_ARCH}"
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_test(
+  NAME dg_igr_hdg_runtime_cuda_refined_local_solve
+  COMMAND dg_igr_hdg_runtime_cuda_refined_local_solve)
+set_tests_properties(dg_igr_hdg_runtime_cuda_refined_local_solve
+  PROPERTIES
+    LABELS "hdg;runtime;cuda;mixed-precision;local-solve"
+    PROCESSORS 1
+    RESOURCE_LOCK dg_igr_sm120
+    TIMEOUT 300)
+
 add_executable(dg_igr_hdg_runtime_cuda_generic_external_topology
   test_generic_external_topology.cu)
 target_include_directories(dg_igr_hdg_runtime_cuda_generic_external_topology
